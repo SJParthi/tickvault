@@ -11,20 +11,29 @@
 //!
 //! This watchdog closes that gap. Every [`MID_SESSION_CHECK_INTERVAL_SECS`]
 //! during market hours, it calls [`TokenManager::pre_market_check`]
-//! (same validation the boot-time HALT uses). On failure during market
-//! hours it fires CRITICAL Telegram via
-//! [`NotificationEvent::PreMarketProfileCheckFailed`] — but does NOT HALT
-//! the running process. A mid-session HALT would terminate the live
-//! WebSocket feed, and reconnecting after systemd restart would take
-//! >30 seconds of lost ticks. Paging the operator is strictly better.
+//! (same validation the boot-time HALT uses) and — since AUTH-GAP-05 —
+//! self-heals a sustained REAL auth failure with a forced re-mint.
+//!
+//! # SILENT since 2026-07-14 (operator Dhan noise lock)
+//!
+//! Per `dhan-rest-only-noise-lock-2026-07-14.md`: the probe + the
+//! AUTH-GAP-05 forced re-mint run SILENTLY (coded `error!` + counters
+//! only — the `MidSessionProfileInvalidated` Critical and
+//! `TokenForcedRemintTriggered` High Telegram pages are DELETED). The
+//! ONLY Telegram from this module is the family-(3) token-unobtainable
+//! Critical (`NotificationEvent::AuthenticationFailed`) when a forced
+//! re-mint fails TERMINALLY — i.e. the token could not be obtained at
+//! all. Everything else self-heals: the GAP-04 latch re-arm retries the
+//! re-mint every [`REMINT_REARM_FAILING_CYCLES`] failing cycles
+//! (~30 min) while the episode persists.
 //!
 //! # Design
 //!
 //! - **Background tokio task** spawned at boot, runs forever.
 //! - **Market-hours gated** (Rule 3 — `tickvault_common::market_hours`).
 //! - **Edge-triggered** (Rule 4 — `currently_failing: bool`). Rising
-//!   edge fires CRITICAL. Falling edge fires INFO (recovery), no
-//!   Telegram on recovery.
+//!   edge fires one coded `error!` (no Telegram — 2026-07-14 noise
+//!   lock). Falling edge fires INFO (recovery).
 //! - **Interval**: 15 minutes. Tight enough to catch a mid-session
 //!   `dataPlan` invalidation within one check window; loose enough to
 //!   not pound Dhan's `/v2/profile` endpoint (1 req/sec Quote rate
@@ -36,11 +45,9 @@
 //!
 //! The pre-market HALT (PR #309) is intentional — booting into a known-
 //! bad state is a no-op that costs nothing. A MID-SESSION HALT would
-//! cost live ticks. The product requirement (operator must be paged,
-//! boot must not continue into silent failure) is satisfied by the
-//! CRITICAL Telegram alert alone. Any remediation (token rotation,
-//! Dhan account fix, manual restart) is an operator decision, not an
-//! automatic one.
+//! cost the retained Dhan REST legs (spot-1m / option-chain) for
+//! nothing. Remediation is automatic (AUTH-GAP-05 + GAP-04 + the
+//! renewal loop); only a token that cannot be obtained at all pages.
 //!
 //! # Tests
 //!
@@ -86,6 +93,28 @@ pub const MID_SESSION_CHECK_INTERVAL_SECS: u64 = 900;
 /// risks the ~125s cooldown ping-pong the operator lock forbids.
 pub const CONSECUTIVE_INVALID_REMINT_THRESHOLD: u32 = 2;
 
+/// GAP-04 (2026-07-14, Dhan noise lock): while a failing episode
+/// PERSISTS past the first forced re-mint, the retry-once latch is
+/// re-armed every this-many additional REAL failing cycles (2 × 900s ≈
+/// 30 min retry cadence) — so a token that stays dead re-mints roughly
+/// every half hour instead of exactly once per episode. The ~125s Dhan
+/// mint cooldown + the RESILIENCE-03 lock refusal still gate every
+/// attempt; a clean `Ok` cycle resets everything. SILENT by design —
+/// no Telegram from this path (`dhan-rest-only-noise-lock-2026-07-14.md`).
+pub const REMINT_REARM_FAILING_CYCLES: u32 = 2;
+
+/// GAP-04. Pure. True iff the consecutive-REAL-failure counter sits on a
+/// re-arm boundary STRICTLY past the first-trigger threshold — i.e.
+/// `n > threshold` and `(n - threshold)` is a positive multiple of
+/// [`REMINT_REARM_FAILING_CYCLES`]. With threshold 2 and cadence 2 the
+/// re-mints fire at consecutive counts 2 (the normal trigger), 4, 6, …
+#[must_use]
+pub fn should_rearm_remint_latch(consecutive_invalid: u32) -> bool {
+    consecutive_invalid > CONSECUTIVE_INVALID_REMINT_THRESHOLD
+        && (consecutive_invalid - CONSECUTIVE_INVALID_REMINT_THRESHOLD)
+            .is_multiple_of(REMINT_REARM_FAILING_CYCLES)
+}
+
 /// Spawns the mid-session profile watchdog as an independent tokio task.
 ///
 /// Consumers should keep the returned [`tokio::task::JoinHandle`] around
@@ -95,9 +124,10 @@ pub const CONSECUTIVE_INVALID_REMINT_THRESHOLD: u32 = 2;
 /// * `token_manager` — shared `TokenManager` (uses `pre_market_check`;
 ///   AUTH-GAP-05 additionally uses `dual_instance_lock_held` +
 ///   `force_renewal` for the once-per-episode forced re-mint).
-/// * `notifier` — `NotificationService` for CRITICAL Telegram on the
-///   rising edge (and the ONE HIGH re-mint event per episode). `None`
-///   disables Telegram; logs still fire.
+/// * `notifier` — `NotificationService` for the family-(3)
+///   token-unobtainable Critical on a TERMINAL forced-re-mint failure
+///   (the ONLY Telegram this module may send — 2026-07-14 noise lock).
+///   `None` disables Telegram; logs still fire.
 /// * `profile_valid` — shared flag written every in-session cycle
 ///   (`true` on a clean check, `false` on a REAL auth failure) and read
 ///   by the token-health gauge poller for the `tv_token_valid` composite.
@@ -162,9 +192,11 @@ async fn run_watchdog_loop(
         // AUTH-GAP-05: counter + episode latch + shared profile-truth flag.
         apply_cycle_outcome(&mut state, outcome, &profile_valid);
 
-        // Existing CRITICAL MidSessionProfileInvalidated edge — UNCHANGED.
+        // Rising/falling edge bookkeeping — SILENT since 2026-07-14 (the
+        // MidSessionProfileInvalidated Critical page is deleted per the
+        // Dhan noise lock; the coded error! + counter remain).
         let transition = evaluate_transition(&state, is_real_auth_failing);
-        apply_transition(transition, &mut state, reason, notifier.as_ref());
+        apply_transition(transition, &mut state, reason);
 
         // AUTH-GAP-05: forced re-mint decision (pure) + action (bounded —
         // once per failing episode, NEVER while the dual-instance lock is
@@ -187,8 +219,10 @@ async fn run_watchdog_loop(
         match decision {
             RemintDecision::Trigger => {
                 // Retry-once + edge latch (applied above via
-                // `apply_remint_decision`): exactly ONE mint (and ONE HIGH
-                // Telegram) per failing episode; a clean Ok cycle re-arms.
+                // `apply_remint_decision`; the GAP-04 re-arm retries a
+                // persisting episode every ~30 min): SILENT self-heal —
+                // coded error! + counters only, no Telegram
+                // (dhan-rest-only-noise-lock-2026-07-14.md).
                 error!(
                     code = ErrorCode::AuthGap05ForcedRemintTriggered.code_str(),
                     consecutive = state.consecutive_invalid,
@@ -196,12 +230,6 @@ async fn run_watchdog_loop(
                 );
                 metrics::counter!("tv_token_forced_remint_total", "outcome" => "triggered")
                     .increment(1);
-                if let Some(n) = notifier.as_ref() {
-                    n.notify(NotificationEvent::TokenForcedRemintTriggered {
-                        consecutive_checks: state.consecutive_invalid,
-                        check_interval_secs: MID_SESSION_CHECK_INTERVAL_SECS,
-                    });
-                }
                 match token_manager.force_renewal().await {
                     Ok(()) => {
                         info!(
@@ -234,13 +262,27 @@ async fn run_watchdog_loop(
                             code = ErrorCode::AuthGap05ForcedRemintTriggered.code_str(),
                             permanent,
                             error = %e,
-                            "AUTH-GAP-05 forced re-mint failed — no local retry (episode latch holds)"
+                            "AUTH-GAP-05 forced re-mint failed — no local retry (episode latch holds; GAP-04 re-arms in ~30 min)"
                         );
                         metrics::counter!(
                             "tv_token_forced_remint_total",
                             "outcome" => if permanent { "refused_lock_lost_inflight" } else { "failed" }
                         )
                         .increment(1);
+                        // 2026-07-14 Dhan noise lock, family-(3): a forced
+                        // re-mint that FAILED means the token could not be
+                        // obtained — the ONE Dhan token condition that still
+                        // pages. The RESILIENCE-03 in-flight lock refusal is
+                        // deliberately NOT paged here (a peer owns the
+                        // session; its token is alive — not "unobtainable").
+                        if !permanent && let Some(n) = notifier.as_ref() {
+                            n.notify(NotificationEvent::AuthenticationFailed {
+                                reason: format!(
+                                    "the automatic Dhan token re-mint failed after ~30 minutes \
+                                     of the broker rejecting our login ({rendered})"
+                                ),
+                            });
+                        }
                     }
                 }
             }
@@ -279,24 +321,24 @@ async fn run_watchdog_loop(
 ///
 /// * **Transient network failure** (DNS lookup failed, connect refused,
 ///   connection reset, request timeout, no route to host) → log WARN,
-///   increment `tv_mid_session_profile_transient_failure_total`, do NOT
-///   page Telegram. The next 15-minute cycle will re-check.
+///   increment `tv_mid_session_profile_transient_failure_total`, no
+///   rising edge. The next 15-minute cycle will re-check.
 /// * **REST-surface degradation** (HTTP 400/429/5xx/WAF responses, or a
-///   200 with an unparseable body) → log WARN + counter, PRESERVE the
-///   pre-existing CRITICAL rising-edge page (the 2026-06-10 all-400s
-///   incident class must stay operator-visible) — but this is NOT
-///   evidence the token is invalid, so it NEVER escalates toward the
-///   AUTH-GAP-05 forced re-mint (see [`CycleOutcome::RestSurfaceDegraded`]).
+///   200 with an unparseable body) → log WARN + counter, DRIVE the
+///   rising edge (since 2026-07-14 a coded `error!` + counter, no
+///   Telegram) — but this is NOT evidence the token is invalid, so it
+///   NEVER escalates toward the AUTH-GAP-05 forced re-mint (see
+///   [`CycleOutcome::RestSurfaceDegraded`]).
 /// * **Real auth failure** (HTTP 401/403, dataPlan inactive,
 ///   activeSegment missing Derivative, token expiry < 4h) →
-///   page CRITICAL Telegram via the existing rising-edge logic AND
-///   count toward the forced re-mint threshold.
+///   drive the rising edge AND count toward the forced re-mint
+///   threshold (the self-heal path).
 ///
 /// Returns `(is_real_auth_failing, reason)`. The boolean drives the
 /// state machine; transient failures return `false` so they never
 /// touch `state.currently_failing`. This means a transient blip
-/// followed by a real auth failure on the NEXT cycle still fires
-/// CRITICAL on the rising edge — which is the property we want.
+/// followed by a real auth failure on the NEXT cycle still fires the
+/// rising edge — which is the property we want.
 #[cfg(test)]
 fn classify_check_result(
     result: &Result<(), tickvault_common::error::ApplicationError>,
@@ -351,7 +393,7 @@ fn report_cycle(outcome: CycleOutcome, reason: Option<String>) -> (bool, Option<
             // of OUR login.
             warn!(
                 reason = %reason.as_deref().unwrap_or_default(),
-                "mid-session profile check hit a non-auth REST failure (5xx/429/400/parse) — paging via rising edge, NOT counting toward re-mint"
+                "mid-session profile check hit a non-auth REST failure (5xx/429/400/parse) — rising edge (silent), NOT counting toward re-mint"
             );
             metrics::counter!("tv_mid_session_profile_rest_degraded_total").increment(1);
             (true, reason)
@@ -376,7 +418,8 @@ enum CycleOutcome {
     /// a 200 whose body failed to parse. The 2026-06-10 incident class
     /// (`dhan-rest-canary-error-codes.md` §0: every api.dhan.co REST call
     /// returned 400 for a full day while the live WS was HEALTHY) lands
-    /// here: it keeps the pre-existing CRITICAL page but must NEVER trigger
+    /// here: it keeps driving the rising edge (a coded error!, silent since
+    /// the 2026-07-14 noise lock) but must NEVER trigger
     /// a `generateAccessToken` mint — the mint (via the likely-healthy
     /// auth.dhan.co) would invalidate the token the healthy live main-feed
     /// WS is riding (Dhan: one active token at a time).
@@ -530,7 +573,7 @@ fn next_consecutive_failures(prev: u32, outcome: CycleOutcome) -> u32 {
 /// * `RestSurfaceDegraded` — state AND flag untouched (a 5xx/429/400/parse
 ///   failure is not evidence the token is invalid — it must neither flip
 ///   `tv_token_valid` to a false 0.0 nor escalate/clear the re-mint
-///   episode; the pre-existing CRITICAL page still fires via
+///   episode; the rising-edge coded error! still fires via
 ///   `classify_check_result`).
 /// * `Transient` — state AND flag untouched (a blip never flips
 ///   `tv_token_valid` to a false 0.0, and never clears a real episode).
@@ -549,6 +592,15 @@ fn apply_cycle_outcome(
             state.consecutive_invalid =
                 next_consecutive_failures(state.consecutive_invalid, outcome);
             profile_valid.store(false, Ordering::Release);
+            // GAP-04 (2026-07-14): a PERSISTING episode re-arms the
+            // retry-once latch every REMINT_REARM_FAILING_CYCLES failing
+            // cycles (~30 min), so a still-dead token keeps re-minting
+            // (silently) instead of stalling after the single attempt.
+            if state.remint_attempted_this_episode
+                && should_rearm_remint_latch(state.consecutive_invalid)
+            {
+                state.remint_attempted_this_episode = false;
+            }
         }
         CycleOutcome::RestSurfaceDegraded | CycleOutcome::Transient => {}
     }
@@ -725,8 +777,10 @@ struct WatchdogState {
     /// [`next_consecutive_failures`]).
     consecutive_invalid: u32,
     /// AUTH-GAP-05: DH-901 retry-once latch — set on Trigger OR
-    /// RefuseLockLost so at most ONE re-mint (and ONE HIGH Telegram) fires
-    /// per failing episode; a clean Ok cycle re-arms.
+    /// RefuseLockLost so at most ONE re-mint fires per re-arm window; a
+    /// clean Ok cycle resets it, and GAP-04 re-arms it every
+    /// [`REMINT_REARM_FAILING_CYCLES`] failing cycles of a persisting
+    /// episode (~30 min retry cadence, silent).
     remint_attempted_this_episode: bool,
 }
 
@@ -736,7 +790,8 @@ struct WatchdogState {
 enum Transition {
     /// No-op — state unchanged (steady ok or steady fail).
     NoOp,
-    /// Rising edge — first failure detected. Fire CRITICAL Telegram.
+    /// Rising edge — first failure detected. One coded `error!` +
+    /// counter (silent — no Telegram since the 2026-07-14 noise lock).
     FirstFailure,
     /// Falling edge — recovery after a failing episode. Fire INFO
     /// (no Telegram — operator already knows from the rising edge).
@@ -751,29 +806,21 @@ fn evaluate_transition(state: &WatchdogState, is_failing_now: bool) -> Transitio
     }
 }
 
-fn apply_transition(
-    transition: Transition,
-    state: &mut WatchdogState,
-    reason: Option<String>,
-    notifier: Option<&Arc<NotificationService>>,
-) {
+fn apply_transition(transition: Transition, state: &mut WatchdogState, reason: Option<String>) {
     match transition {
         Transition::NoOp => {}
         Transition::FirstFailure => {
             let reason = reason.unwrap_or_else(|| "no reason provided".to_string());
+            // SILENT since 2026-07-14 (Dhan noise lock): coded error! +
+            // counter only — the MidSessionProfileInvalidated Critical
+            // Telegram page is DELETED. The AUTH-GAP-05 re-mint machinery
+            // self-heals; only a TERMINAL re-mint failure pages (the
+            // family-(3) AuthenticationFailed arm in the loop above).
             error!(
                 reason = %reason,
-                "CRITICAL: mid-session profile check FAILED — dataPlan / activeSegment / token may be invalid"
+                "mid-session profile check FAILED — dataPlan / activeSegment / token may be invalid (silent; AUTH-GAP-05 self-heal engaged)"
             );
             metrics::counter!("tv_mid_session_profile_alert_fired_total").increment(1);
-            if let Some(n) = notifier {
-                // Dedicated event variant so Telegram message can carry
-                // mid-session-specific guidance (restart the app so the
-                // boot-time HALT gate triggers — as opposed to the
-                // pre-market `PreMarketProfileCheckFailed` which
-                // already fires that HALT automatically).
-                n.notify(NotificationEvent::MidSessionProfileInvalidated { reason });
-            }
             state.currently_failing = true;
         }
         Transition::Recovery => {
@@ -835,10 +882,9 @@ mod tests {
             Transition::FirstFailure,
             &mut state,
             Some("test failure".to_string()),
-            None,
         );
         assert!(state.currently_failing);
-        apply_transition(Transition::Recovery, &mut state, None, None);
+        apply_transition(Transition::Recovery, &mut state, None);
         assert!(!state.currently_failing);
     }
 
@@ -914,7 +960,7 @@ mod tests {
 
     #[test]
     fn real_auth_http_401_is_not_transient() {
-        // Genuine auth failure — must page CRITICAL.
+        // Genuine auth failure — must drive the rising edge.
         let reason = "profile request HTTP 401 Unauthorized — see server logs for details";
         assert!(!is_transient_network_failure(reason));
     }
@@ -1006,7 +1052,7 @@ mod tests {
     }
 
     /// Round-trip property: a transient blip followed by a real auth
-    /// failure on the very next cycle MUST still page CRITICAL.
+    /// failure on the very next cycle MUST still fire the rising edge.
     /// This is the headline property the 2026-04-26 hotfix preserves.
     #[test]
     fn transient_blip_then_real_failure_still_pages_critical() {
@@ -1025,16 +1071,16 @@ mod tests {
         assert_eq!(
             t1,
             Transition::NoOp,
-            "transient must NOT trigger CRITICAL transition"
+            "transient must NOT trigger the FirstFailure transition"
         );
-        apply_transition(t1, &mut state, None, None);
+        apply_transition(t1, &mut state, None);
         assert!(
             !state.currently_failing,
             "state must stay clean after a transient"
         );
 
         // Cycle 2: real auth failure — MUST trigger FirstFailure
-        // (rising edge → CRITICAL Telegram).
+        // (rising edge → coded error!).
         let r2: Result<(), ApplicationError> = Err(ApplicationError::AuthenticationFailed {
             reason: "data plan is 'Inactive', must be 'Active' for market data \
                      access"
@@ -1045,7 +1091,7 @@ mod tests {
         assert_eq!(
             t2,
             Transition::FirstFailure,
-            "real auth failure after transient must page CRITICAL"
+            "real auth failure after transient must fire the rising edge"
         );
     }
 
@@ -1325,7 +1371,7 @@ mod tests {
     }
 
     /// Headline AG5-R1-3 / EDGE-3 property: a 30-min pure REST outage
-    /// (two consecutive 503 cycles) still pages (pre-existing CRITICAL)
+    /// (two consecutive 503 cycles) still drives the rising edge (coded error!)
     /// but NEVER reaches the forced re-mint threshold — the healthy live
     /// WS token is never destroyed by a REST-surface-only failure.
     #[test]
@@ -1337,7 +1383,7 @@ mod tests {
             let outcome = cycle_outcome(&r);
             apply_cycle_outcome(&mut state, outcome, &flag);
             let (is_failing, _) = classify_check_result(&r);
-            assert!(is_failing, "REST outage must still page via rising edge");
+            assert!(is_failing, "REST outage must still drive the rising edge");
         }
         assert_eq!(state.consecutive_invalid, 0);
         assert_eq!(
@@ -1349,7 +1395,7 @@ mod tests {
 
     #[test]
     fn classify_check_result_rest_degraded_still_counts_as_failing() {
-        // Preserves the pre-existing CRITICAL page for the 2026-06-10
+        // Preserves the rising-edge detection for the 2026-06-10
         // all-400s incident class — detection stays, destruction goes.
         let (is_failing, reason) = classify_check_result(&http_status_err("400 Bad Request"));
         assert!(is_failing);
@@ -1837,5 +1883,106 @@ mod tests {
         assert!(failing, "REST degradation must page via rising edge");
         let (failing, _) = report_cycle(CycleOutcome::RealAuthFail, Some("401".to_string()));
         assert!(failing, "real auth failure must count as failing");
+    }
+
+    // ---------------------------------------------------------------
+    // GAP-04 (2026-07-14, Dhan noise lock) — silent latch re-arm every
+    // REMINT_REARM_FAILING_CYCLES failing cycles of a persisting episode.
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn should_rearm_remint_latch_truth_table() {
+        // At/below the first-trigger threshold: never a re-arm (the normal
+        // decide_remint path owns the FIRST attempt).
+        assert!(!should_rearm_remint_latch(0));
+        assert!(!should_rearm_remint_latch(1));
+        assert!(!should_rearm_remint_latch(
+            CONSECUTIVE_INVALID_REMINT_THRESHOLD
+        ));
+        // Odd offsets past the threshold: hold.
+        assert!(!should_rearm_remint_latch(
+            CONSECUTIVE_INVALID_REMINT_THRESHOLD + 1
+        ));
+        assert!(!should_rearm_remint_latch(
+            CONSECUTIVE_INVALID_REMINT_THRESHOLD + 3
+        ));
+        // Every REMINT_REARM_FAILING_CYCLES-th failing cycle: re-arm.
+        assert!(should_rearm_remint_latch(
+            CONSECUTIVE_INVALID_REMINT_THRESHOLD + REMINT_REARM_FAILING_CYCLES
+        ));
+        assert!(should_rearm_remint_latch(
+            CONSECUTIVE_INVALID_REMINT_THRESHOLD + 2 * REMINT_REARM_FAILING_CYCLES
+        ));
+    }
+
+    /// The headline GAP-04 property: a PERSISTING dead-token episode
+    /// re-mints every 2nd failing cycle (~30 min) instead of exactly once
+    /// — mints at consecutive counts 2, 4, 6 with the latch re-armed by
+    /// `apply_cycle_outcome` between them. Silent by design (no Telegram
+    /// exists on any of these arms).
+    #[test]
+    fn gap04_persisting_episode_remints_every_second_failing_cycle() {
+        let flag = AtomicBool::new(true);
+        let mut state = WatchdogState::default();
+        let mut last_remint_at: Option<Instant> = None;
+        let mut mints = Vec::new();
+        for cycle in 1..=6u32 {
+            apply_cycle_outcome(&mut state, CycleOutcome::RealAuthFail, &flag);
+            let decision = decide_remint(
+                state.consecutive_invalid,
+                state.remint_attempted_this_episode,
+                true, // cooldown structurally moot at the 900s cadence
+                Some(true),
+            );
+            apply_remint_decision(&mut state, &mut last_remint_at, decision);
+            if decision == RemintDecision::Trigger {
+                mints.push(cycle);
+            }
+        }
+        assert_eq!(
+            mints,
+            vec![2, 4, 6],
+            "a persisting episode must re-mint every REMINT_REARM_FAILING_CYCLES \
+             (= {REMINT_REARM_FAILING_CYCLES}) failing cycles — got mints at {mints:?}"
+        );
+        // A clean Ok cycle still resets everything (episode over).
+        apply_cycle_outcome(&mut state, CycleOutcome::Ok, &flag);
+        assert_eq!(state.consecutive_invalid, 0);
+        assert!(!state.remint_attempted_this_episode);
+    }
+
+    /// GAP-04 must not disturb the toward-mint safety rails: transient /
+    /// REST-degraded cycles neither advance the counter nor re-arm, so a
+    /// pure REST outage still never mints.
+    #[test]
+    fn gap04_rearm_never_fires_on_non_real_failures() {
+        let flag = AtomicBool::new(true);
+        let mut state = WatchdogState {
+            currently_failing: true,
+            consecutive_invalid: CONSECUTIVE_INVALID_REMINT_THRESHOLD,
+            remint_attempted_this_episode: true,
+        };
+        for _ in 0..4 {
+            apply_cycle_outcome(&mut state, CycleOutcome::RestSurfaceDegraded, &flag);
+            apply_cycle_outcome(&mut state, CycleOutcome::Transient, &flag);
+        }
+        assert!(
+            state.remint_attempted_this_episode,
+            "non-REAL cycles must never re-arm the latch (GAP-04 counts only \
+             REAL failing cycles)"
+        );
+        assert_eq!(
+            state.consecutive_invalid,
+            CONSECUTIVE_INVALID_REMINT_THRESHOLD
+        );
+    }
+
+    #[test]
+    fn gap04_rearm_cadence_constant_is_sane() {
+        // At least 2 (never a per-cycle mint storm — the ~125s Dhan cooldown
+        // + the 900s cadence make 2 ≈ a 30-min retry)…
+        const _: () = assert!(REMINT_REARM_FAILING_CYCLES >= 2);
+        // …at most 4 so a genuinely dead token keeps retrying within the hour.
+        const _: () = assert!(REMINT_REARM_FAILING_CYCLES <= 4);
     }
 }

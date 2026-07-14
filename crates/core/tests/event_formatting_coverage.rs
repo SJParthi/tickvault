@@ -49,13 +49,9 @@ fn test_auth_and_profile_event_messages() {
     });
     assert!(m.contains("investigate before 09:15 IST"), "{m}");
 
-    let m = render(&NotificationEvent::MidSessionProfileInvalidated {
-        reason: "RSN-PROFILE-773".to_string(),
-    });
-    assert!(
-        m.contains("RSN-PROFILE-773") && m.contains("INVALIDATED"),
-        "{m}"
-    );
+    // MidSessionProfileInvalidated render coverage DELETED 2026-07-14 with
+    // the variant (Dhan noise lock) — the watchdog runs silently; a
+    // terminal re-mint failure routes through AuthenticationFailed.
 }
 
 #[test]

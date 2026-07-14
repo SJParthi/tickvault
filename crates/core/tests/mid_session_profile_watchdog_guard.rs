@@ -75,45 +75,41 @@ fn main_rs_spawns_mid_session_watchdog() {
 }
 
 // ---------------------------------------------------------------------------
-// (3) Event variant declared with Critical severity + clear message
+// (3) SILENT since 2026-07-14 (operator Dhan noise lock,
+//     dhan-rest-only-noise-lock-2026-07-14.md): the watchdog's
+//     MidSessionProfileInvalidated Critical + TokenForcedRemintTriggered
+//     High Telegram pages are DELETED — the probe + the AUTH-GAP-05
+//     forced re-mint self-heal silently, and ONLY a TERMINAL re-mint
+//     failure pages via the family-(3) AuthenticationFailed Critical.
+//     The negative ratchet below blocks the pages from creeping back.
 // ---------------------------------------------------------------------------
 
 #[test]
-fn mid_session_profile_event_declared_critical() {
-    let src = read("crates/core/src/notification/events.rs");
+fn mid_session_watchdog_is_silent_except_terminal_auth_failure() {
+    let src = read("crates/core/src/auth/mid_session_watchdog.rs");
+    for banned in ["MidSessionProfileInvalidated", "TokenForcedRemintTriggered"] {
+        // Grep the SOURCE for constructor sites (`NotificationEvent::X`)
+        // — the doc-comment mentions of the deleted variants are fine.
+        assert!(
+            !src.contains(&format!("NotificationEvent::{banned}")),
+            "mid_session_watchdog.rs must NOT re-introduce the deleted \
+             {banned} Telegram page (dhan-rest-only-noise-lock-2026-07-14.md \
+             — a fresh dated operator quote is required first)."
+        );
+    }
+    // The ONE allowed Telegram: the family-(3) token-unobtainable Critical
+    // on a terminal forced-re-mint failure.
     assert!(
-        src.contains("MidSessionProfileInvalidated"),
-        "events.rs must declare MidSessionProfileInvalidated variant."
+        src.contains("NotificationEvent::AuthenticationFailed"),
+        "the terminal forced-re-mint failure must page the family-(3) \
+         AuthenticationFailed Critical — silent terminal failure is a \
+         Rule-11 false-OK."
     );
+    // GAP-04: the silent latch re-arm must stay wired.
     assert!(
-        src.contains("Self::MidSessionProfileInvalidated { .. } => Severity::Critical"),
-        "MidSessionProfileInvalidated must be Critical severity — operator \
-         MUST be paged immediately. Downgrading risks silent mid-session \
-         data loss."
-    );
-}
-
-#[test]
-fn mid_session_profile_event_message_carries_diagnostics() {
-    let src = read("crates/core/src/notification/events.rs");
-    // Telegram text must tell the operator EXACTLY what to do next.
-    assert!(
-        src.contains("CRITICAL: Mid-session profile INVALIDATED"),
-        "event message header must clearly identify this as a mid-session \
-         failure (distinct from boot-time HALT)."
-    );
-    assert!(
-        src.contains("dataPlan == \\\"Active\\\""),
-        "message must tell the operator to verify dataPlan."
-    );
-    assert!(
-        src.contains("Derivative"),
-        "message must call out the Derivative segment check."
-    );
-    assert!(
-        src.contains("Live WS still running"),
-        "message must clarify that the app did NOT HALT mid-session — \
-         operator must understand that the fix is manual."
+        src.contains("should_rearm_remint_latch"),
+        "the GAP-04 latch re-arm (~30-min silent retry cadence) must stay \
+         wired — deleting it stalls the self-heal after one attempt."
     );
 }
 
