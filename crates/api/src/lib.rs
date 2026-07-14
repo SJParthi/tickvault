@@ -293,6 +293,14 @@ pub fn build_router_with_auth(
             "/api/board/data",
             axum::routing::get(handlers::board::board_data),
         )
+        // BruteX cross-verify report page (public read-only, same tier as
+        // the /feeds page + GET /api/feeds read precedent). QuestDB-backed
+        // (up to 2 /exec queries per hit), so it joins the rate-limited
+        // public sub-router per the 2026-07-09 hardening above.
+        .route(
+            "/crossverify",
+            axum::routing::get(handlers::brutex_crossverify::crossverify_page),
+        )
         .route_layer(axum::middleware::from_fn_with_state(
             public_limiter,
             public_rate_limit,

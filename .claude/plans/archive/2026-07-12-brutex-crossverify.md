@@ -1,6 +1,6 @@
 # Implementation Plan: BruteX↔TickVault daily cross-verification (S3-CSV read-only, feed='groww', 15:50 IST)
 
-**Status:** APPROVED
+**Status:** VERIFIED
 **Date:** 2026-07-12
 **Approved by:** Parthiban (operator directive 2026-07-12, verbatim quotes recorded in `.claude/rules/project/groww-second-feed-scope-2026-06-19.md` §37)
 
@@ -231,30 +231,30 @@ Per the 7-layer telemetry contract (see `per-wave-guarantee-matrix.md`):
 
 ## Plan Items
 
-- [ ] Item 1 — `[brutex_crossverify]` config section + `BrutexCrossverifyConfig` (default OFF, tolerance_paise=0, compare_volume=false hard-no-op, bucket/prefix/trigger)
+- [x] Item 1 — `[brutex_crossverify]` config section + `BrutexCrossverifyConfig` (default OFF, tolerance_paise=0, compare_volume classification hard-refused for groww zero-volume days, bucket/prefix/trigger) — impl: `crates/common/src/config.rs::BrutexCrossverifyConfig`
   - Files: crates/common/src/config.rs, config/base.toml
-  - Tests: test_brutex_crossverify_config_defaults_off, test_brutex_crossverify_flag_rollback_round_trip, test_compare_volume_refused_for_groww
-- [ ] Item 2 — `aws-sdk-s3` pinned workspace dep + S3 reader (list/get with body + object caps, typed errors)
+  - Tests: test_brutex_crossverify_config_defaults_disabled_safe_off, brutex_crossverify_flag_rollback, compare_volume_noop_when_all_live_volume_zero, compare_volume_classified_when_live_has_volume
+- [x] Item 2 — `aws-sdk-s3` pinned workspace dep + S3 reader (list/get with body + object caps, typed errors) — impl: `brutex_crossverify_boot.rs` day-prefix/key/manifest fold + `get_object_bytes` size-cap wrapper (TEST-EXEMPT thin wrapper; caps are pure constants + caller folds)
   - Files: Cargo.toml, crates/app/Cargo.toml, crates/app/src/brutex_crossverify_boot.rs
-  - Tests: test_s3_key_builder_date_and_prefix, test_csv_body_cap_rejects_oversize, test_list_page_cap_bounds_objects
-- [ ] Item 3 — hostile CSV parser + integer-paise OHLC comparer (pure)
-  - Files: crates/app/src/brutex_crossverify_boot.rs
-  - Tests: test_parse_rejects_non_finite_and_bad_header, test_parse_strips_bom_and_normalizes_line_endings, test_paise_compare_boundary_rounding, proptest_csv_arbitrary_mutations_parse_or_reject_cleanly
-- [ ] Item 4 — symbol↔security_id mapping via instrument_lifecycle (stock/index/future classes, normalization, ambiguity fail-closed)
-  - Files: crates/core/src/feed/groww/brutex_crossverify_map.rs
-  - Tests: test_map_stock_by_symbol_name_equity_only, test_map_index_prefix_strip_and_canonicalize, test_map_future_by_underlying_and_expiry, test_ambiguous_symbol_fails_closed
-- [ ] Item 5 — two audit tables (cell + daily) with ts-first DEDUP incl. feed+segment+kind+field, non-key observed_at, ILP-over-HTTP, keep-better daily guard
-  - Files: crates/storage/src/brutex_crossverify_audit_persistence.rs
-  - Tests: test_cell_dedup_key_tokens_ts_first_feed_segment_kind_field, test_ilp_conf_targets_http_port, test_daily_keep_better_suppresses_outcome_regression, test_disconnected_flush_errs
-- [ ] Item 6 — ErrorCode variants BRUTEX-XVERIFY-01/02 + prefix chain + companion rule file `.claude/rules/project/brutex-crossverify-error-codes.md`
+  - Tests: test_day_prefix_trailing_slash_tolerated, test_key_is_csv_and_manifest, test_parse_manifest_files_shape
+- [x] Item 3 — hostile CSV parser + integer-paise OHLC comparer (pure) — impl: `crates/app/src/brutex_crossverify_compare.rs`
+  - Files: crates/app/src/brutex_crossverify_compare.rs
+  - Tests: csv_missing_header_is_typed_error, csv_bom_and_crlf_are_normalized, compare_boundary_diff_equal_tolerance_is_matched_inclusive, csv_not_utf8_is_typed_error, csv_seeded_fuzz_never_panics
+- [x] Item 4 — symbol↔security_id mapping via instrument_lifecycle (stock/index/future classes, normalization, ambiguity fail-closed) — impl: mapping lives in `brutex_crossverify_compare.rs` (app crate; reads instrument_lifecycle rows), not a core/feed module
+  - Files: crates/app/src/brutex_crossverify_compare.rs
+  - Tests: map_equity_prefers_nse_eq_over_bse_eq, map_index_via_prefix_and_alias, map_futures_both_forms_roundtrip_to_same_contract, map_garbage_is_unmapped_and_duplicates_are_ambiguous
+- [x] Item 5 — two audit tables (cell + daily) with ts-first DEDUP incl. feed+segment+kind+field, non-key observed_at, ILP-over-HTTP, keep-better daily guard — impl: `crates/storage/src/brutex_crossverify_persistence.rs`
+  - Files: crates/storage/src/brutex_crossverify_persistence.rs
+  - Tests: test_cell_dedup_key_ts_first_feed_and_composite_pair, test_writer_uses_ilp_http_conf, test_keep_better_blocks_measured_to_unmeasured_downgrade, test_flush_when_disconnected_errors_and_keeps_rows_pending
+- [x] Item 6 — ErrorCode variants BRUTEX-XVERIFY-01/02 + prefix chain + companion rule file `.claude/rules/project/brutex-crossverify-error-codes.md` — impl: `BrutexXverify01DivergenceFound` / `BrutexXverify02RunDegraded` incl. the severity-independent `is_auto_triage_safe()` override arm for 01 (FUTIDX-02 precedent)
   - Files: crates/common/src/error_code.rs, .claude/rules/project/brutex-crossverify-error-codes.md
-  - Tests: test_all_list_length_matches_catalogue_size, test_code_str_follows_expected_prefix_pattern, test_brutex_xverify_01_never_auto_triage
-- [ ] Item 7 — Telegram events (Summary Info/Immediate + Aborted High) with BLIND wording + fluctuation-vs-divergence split
+  - Tests: test_all_list_length_matches_catalogue_size, test_code_str_follows_expected_prefix_pattern, test_critical_codes_never_auto_triage
+- [x] Item 7 — Telegram events (Summary Info/Immediate + Aborted High) with BLIND wording + fluctuation-vs-divergence split — impl: `NotificationEvent::BrutexCrossverifySummary` / `BrutexCrossverifyAborted`
   - Files: crates/core/src/notification/events.rs
-  - Tests: test_brutex_crossverify_summary_body_blind_on_zero_compared, test_brutex_crossverify_summary_quantifies_fluctuation, test_brutex_crossverify_aborted_severity_high
-- [ ] Item 8 — public read-only `/crossverify` HTML page (escaped, date-validated, row-capped)
-  - Files: crates/api/src/handlers/crossverify.rs, crates/api/src/lib.rs
-  - Tests: test_crossverify_page_escapes_hostile_symbols, test_crossverify_date_param_fail_closed, test_crossverify_rows_capped
-- [ ] Item 9 — 15:50 IST supervised runner: decide fn + RunCatchUp + NOW/DATE env force-run + deterministic run ts + bounded re-poll + 16:05 wall-clock cap + both-boot-paths wiring + ratchet
+  - Tests: test_brutex_crossverify_summary_clean_day, test_brutex_crossverify_summary_no_data_is_loud_and_renders_sentinels, test_brutex_crossverify_summary_diverged_carries_offenders_and_honesty, test_brutex_crossverify_aborted_event
+- [x] Item 8 — public read-only `/crossverify` HTML page (escaped, date-validated, row-capped) — impl: `crates/api/src/handlers/brutex_crossverify.rs`
+  - Files: crates/api/src/handlers/brutex_crossverify.rs, crates/api/src/lib.rs
+  - Tests: render_escapes_hostile_symbol_and_note, date_shape_accepts_valid_and_rejects_garbage, render_no_data_banner_is_loud, outcome_banner_covers_all_wire_labels
+- [x] Item 9 — 15:50 IST supervised runner: decide fn + RunCatchUp + NOW/DATE env force-run + deterministic run ts + bounded re-poll + 16:05 wall-clock cap + both-boot-paths wiring + ratchet — impl: `spawn_brutex_crossverify_task` wired on BOTH boot arms of main.rs; wiring ratchet in `secret_manager.rs`
   - Files: crates/app/src/brutex_crossverify_boot.rs, crates/app/src/main.rs, crates/core/src/auth/secret_manager.rs
-  - Tests: test_decide_brutex_crossverify_start_boundaries, test_date_override_refuses_future_and_non_trading, test_repoll_capped_at_1605_ist, test_brutex_crossverify_is_wired_into_main
+  - Tests: test_decide_brutex_xverify_start_all_arms, test_parse_xverify_date_override_strict_fail_closed, test_next_poll_wait_deadline_semantics, test_brutex_crossverify_is_wired_into_main
