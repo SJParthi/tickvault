@@ -162,7 +162,24 @@ pg_port = 8812
 ilp_port = 9009
 
 [partition_retention]
+# STANDARD class (audit / daily-data tables) hot window.
 retention_days = 90
+# HIGH-VOLUME market-data class (ticks + 21 candles_* tables, ~1.2-2 GB/day).
+# 90d of ticks (~135+ GB) can never fit the 30 GB volume; 14d hot on EBS with
+# the verified S3 archive as the durable long-term store (SEBI retention is
+# satisfied by the S3 copy — aws-budget hot-window doctrine).
+market_data_hot_days = 14
+# Archive->verify->drop leg ON (2026-07-13 disk-pressure remediation).
+# Fail-closed: a partition is dropped ONLY after its S3 copy is row-count-
+# and size-verified. ROLLBACK: set false (or delete the key) to restore the
+# legacy detach-only behaviour instantly.
+archive_enabled = true
+# Empty = derive tv-<TV_ENVIRONMENT>-cold (prod -> tv-prod-cold; the instance
+# role already has Put/Get/List on it — no IAM change).
+archive_bucket = ""
+# Oldest-first per-run bound so the first catch-up sweep converges over a few
+# post-market runs instead of overrunning the 16:30 IST box stop.
+max_partitions_per_run = 200
 
 # [valkey] section DELETED in #O4 (2026-05-24). Valkey removed from
 # the runtime; the dual-instance lock moved to AWS SSM Parameter Store

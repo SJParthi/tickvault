@@ -112,6 +112,12 @@ pub(crate) const DAY_PARTITIONED_TABLES: &[&str] = &[
     // operator retention follow-up in option_chain_1m_persistence.rs);
     // same DAY partitioning + retention class; `feed` is in the DEDUP key.
     "option_chain_1m",
+    // Partition archive→verify→drop forensic chain (2026-07-13, disk-pressure
+    // remediation): one row per archive attempt outcome — same SEBI-audit
+    // class + DAY partitioning as the audit tables above; `feed` is in the
+    // DEDUP key (label `all`: an archived partition contains EVERY feed's
+    // rows). Tiny (≤ a few hundred rows/day) — the 90d standard class.
+    "partition_archive_audit",
     // SPOT1M-01/02 leg=contract_1m (2026-07-13, Groww REST plan PR-4 — the
     // fill-model leg): one row per fetched (minute, contract) — bounded by
     // the per-minute selection cap (~30 contracts × 375 min ≈ ~11K rows/day,
@@ -387,12 +393,12 @@ impl PartitionManager {
 /// A single row from QuestDB's `table_partitions('<table>')` result that the
 /// retention sweep needs to decide whether to detach.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct PartitionRow {
+pub(crate) struct PartitionRow {
     /// Partition name (e.g. `2026-04-01` for DAY, `2026-04-01T09` for HOUR).
-    name: String,
+    pub(crate) name: String,
     /// `true` for the single currently-written partition. QuestDB refuses to
     /// detach the active partition, so it is NEVER selected for detach.
-    active: bool,
+    pub(crate) active: bool,
 }
 
 /// Builds the partition-list SQL for a single table.
@@ -410,7 +416,7 @@ struct PartitionRow {
 /// `candle_table_names()`) — never external input — so it is not
 /// injection-validated here; the untrusted `name` values are validated by
 /// [`is_valid_partition_name`] before they reach a DETACH statement.
-fn build_detach_list_sql(table: &str, cutoff_days: u32) -> String {
+pub(crate) fn build_detach_list_sql(table: &str, cutoff_days: u32) -> String {
     format!(
         "SELECT name, active FROM table_partitions('{}') \
          WHERE minTimestamp < dateadd('d', -{}, now())",
@@ -429,7 +435,7 @@ fn build_detach_list_sql(table: &str, cutoff_days: u32) -> String {
 /// This fail-closed allowlist — digits, `-`, and a single `T` only — makes such
 /// a name impossible to inject: it is rejected here and never selected for
 /// detach.
-fn is_valid_partition_name(name: &str) -> bool {
+pub(crate) fn is_valid_partition_name(name: &str) -> bool {
     // DAY: "2026-04-01" (10) or HOUR: "2026-04-01T09" (13). Allow the small
     // range rather than a strict length so future QuestDB partition-by widths
     // still pass, while a quote / space / DDL keyword can never appear.
@@ -454,7 +460,7 @@ fn is_valid_partition_name(name: &str) -> bool {
 /// current-day partition, in the common case AND in the edge case where a table
 /// has not been written for more than `retention_days` (its active partition
 /// would pass the SQL cutoff but is still excluded here).
-fn select_partitions_to_detach(rows: &[PartitionRow]) -> Vec<String> {
+pub(crate) fn select_partitions_to_detach(rows: &[PartitionRow]) -> Vec<String> {
     rows.iter()
         .filter(|row| !row.active && is_valid_partition_name(&row.name))
         .map(|row| row.name.clone())
@@ -469,7 +475,7 @@ fn select_partitions_to_detach(rows: &[PartitionRow]) -> Vec<String> {
 /// Columns are located BY NAME (robust to projection reordering). A row missing
 /// the `name` or `active` field is skipped (fail-closed — never selected for
 /// detach), so a malformed response can never panic or detach the wrong set.
-fn parse_partition_rows(json: &str) -> Vec<PartitionRow> {
+pub(crate) fn parse_partition_rows(json: &str) -> Vec<PartitionRow> {
     // O(1) EXEMPT: begin — JSON parsing for DDL response (cold path, not hot)
     let parsed: serde_json::Value = match serde_json::from_str(json) {
         Ok(v) => v,
