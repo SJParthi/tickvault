@@ -168,6 +168,12 @@ impl SidecarLineClass {
     /// child line — so no runtime/credential text can reach Telegram
     /// (defense-in-depth). `None` for the non-alert classes.
     ///
+    /// 2026-07-14 note: this fixed prose is now the CLASS EXPLANATION line of
+    /// the `GrowwSidecarRejected` Telegram; the SPECIFIC sanitized cause is
+    /// additionally threaded as the event's `detail` field via
+    /// [`sidecar_reject_detail`] (never the raw line — see §1c.1 of
+    /// `feed-stall-watchdog-error-codes.md`).
+    ///
     /// Wording note (exam-fix 2026-07-06): the `EntitlementRejected` prose
     /// previously asserted "account lacks a live market-data feed
     /// entitlement" — a CLAIM about the account that the classifier cannot
@@ -834,6 +840,30 @@ pub fn sidecar_line_signature(line: &str) -> String {
         .collect()
 }
 
+/// The SANITIZED reject-cause detail threaded into the operator-facing
+/// `GrowwSidecarRejected` Telegram body (operator demand 2026-07-14 — the
+/// 14:59 IST rejection page said only "the feed reported an error" with no
+/// WHY; the actual cause was already captured as the FEED-REJECT-01
+/// signature but never reached the phone).
+///
+/// EXACTLY the [`sidecar_line_signature`] choke-point output (control-char +
+/// BiDi strip, credential/JWT redaction, UTF-8-safe
+/// [`SIDECAR_LINE_SIGNATURE_MAX_CHARS`] cap) — NEVER the raw child line.
+/// `None` when the sanitized signature is empty/whitespace, so the Telegram
+/// body degrades to the generic wording instead of rendering a hollow
+/// "rejected:  — retrying". Pure, cold path (once per reject episode).
+/// Dated commandment-2 override recorded in
+/// `.claude/rules/project/feed-stall-watchdog-error-codes.md` §1c.1.
+#[must_use]
+pub fn sidecar_reject_detail(line: &str) -> Option<String> {
+    let sig = sidecar_line_signature(line);
+    if sig.trim().is_empty() {
+        None
+    } else {
+        Some(sig)
+    }
+}
+
 /// Outcome of a supervised feed-supervisor task, used by [`should_respawn_supervisor`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SupervisorJoinOutcome {
@@ -1247,9 +1277,11 @@ where
                     // FEED-REJECT-01 (2026-07-09 reject-loop hardening): capture
                     // a BOUNDED, secret-redacted signature of the triggering
                     // line into the CODED error stream so errors.jsonl /
-                    // CloudWatch can answer "WHY does the feed loop?" — the
-                    // Telegram wording stays the FIXED per-class reason (10
-                    // commandments; raw child text never reaches Telegram).
+                    // CloudWatch can answer "WHY does the feed loop?". Since
+                    // 2026-07-14 the SAME sanitized signature ALSO rides the
+                    // Telegram body via `sidecar_reject_detail` (dated
+                    // commandment-2 override, §1c.1 of the runbook) — raw
+                    // child text still NEVER reaches Telegram.
                     // Bounded by its OWN per-child latch (review fix: the fleet
                     // Suppress arm re-arms `alerted`, which would have made
                     // this emit per-line on the fleet path) — once per child
@@ -1261,7 +1293,8 @@ where
                             class = ?class,
                             signature = %sidecar_line_signature(&line),
                             "[feeds] FEED-REJECT-01: sidecar reject/error episode opened — \
-                             bounded cause signature captured (Telegram wording unchanged)"
+                             bounded cause signature captured (the sanitized signature also \
+                             rides the Telegram body since 2026-07-14)"
                         );
                     }
                     // Latch the actionable auth-rejected RED ONLY for a CONFIRMED
@@ -1318,9 +1351,19 @@ where
                                     )
                                     .is_ok()
                                 {
+                                    // 2026-07-14 operator demand (the 14:59
+                                    // IST page carried no WHY): thread the
+                                    // SANITIZED signature — the same
+                                    // sidecar_line_signature choke point the
+                                    // FEED-REJECT-01 emit uses, never raw
+                                    // child text — into the Telegram body.
+                                    // Dated commandment-2 override:
+                                    // feed-stall-watchdog-error-codes.md
+                                    // §1c.1.
                                     notifier.notify(NotificationEvent::GrowwSidecarRejected {
                                         reason: reason.to_string(),
                                         fleet_summary: false,
+                                        detail: sidecar_reject_detail(&line),
                                     });
                                 } else {
                                     metrics::counter!(
@@ -1339,6 +1382,12 @@ where
                                         affected, fleet_size, label,
                                     ),
                                     fleet_summary: true,
+                                    // The fleet summary coalesces N children;
+                                    // ONE child's line must not be presented
+                                    // as the cause for all of them — the
+                                    // per-child cause stays queryable via the
+                                    // FEED-REJECT-01 coded signatures.
+                                    detail: None,
                                 });
                             }
                             FleetAlertDecision::Suppress => {
@@ -3445,6 +3494,77 @@ mod tests {
         // (d) A clean short line passes through recognizably.
         let clean = "groww sidecar error [auth]: RuntimeError: SSM parameter holds no usable token";
         assert_eq!(sidecar_line_signature(clean), clean);
+    }
+
+    // ── 2026-07-14 operator demand: the reject page carries the WHY ─────────
+
+    #[test]
+    fn test_sidecar_reject_detail_is_sanitized_signature_or_none() {
+        // (a) The detail is EXACTLY the sidecar_line_signature choke-point
+        // output for a real reject line (the 14:59 IST incident line).
+        let incident = "ERROR growwapi.groww.nats_client: Error: nats: unexpected EOF";
+        assert_eq!(
+            sidecar_reject_detail(incident).as_deref(),
+            Some(sidecar_line_signature(incident).as_str()),
+            "detail must be the choke-point output, nothing else"
+        );
+        assert_eq!(sidecar_reject_detail(incident).as_deref(), Some(incident));
+
+        // (b) A hostile line (embedded JWT + control chars + overlong) only
+        // ever reaches the detail in sanitized, truncated form.
+        let hostile = format!(
+            "groww sidecar error [consume]: bearer \
+             eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJncm93dyJ9.abcdefghijklmnop \u{0}\r{}",
+            "x".repeat(400)
+        );
+        let detail = sidecar_reject_detail(&hostile).expect("non-empty hostile line");
+        assert!(!detail.contains("eyJhbGciOiJIUzI1NiJ9"), "{detail}");
+        assert!(detail.contains("[REDACTED-JWT]"), "{detail}");
+        assert!(!detail.chars().any(char::is_control), "{detail}");
+        assert!(detail.chars().count() <= SIDECAR_LINE_SIGNATURE_MAX_CHARS);
+
+        // (c) Empty / whitespace / control-only lines degrade to None so the
+        // Telegram body never renders a hollow "rejected:  — retrying".
+        for hollow in ["", "   ", "\u{0}\u{1}\r", "\u{202e}\u{200b}"] {
+            assert_eq!(
+                sidecar_reject_detail(hollow),
+                None,
+                "hollow line {hollow:?} must yield None"
+            );
+        }
+    }
+
+    #[test]
+    fn test_reject_page_carries_sanitized_detail() {
+        // SEAM GUARD (operator demand 2026-07-14): the single-conn
+        // Passthrough Telegram page must thread the SANITIZED signature —
+        // and ONLY via the sidecar_reject_detail choke point — into the
+        // GrowwSidecarRejected event, while the fleet-coalesced summary arm
+        // deliberately passes None (one child's line is not the cause for N
+        // connections). Regressing either re-opens the 14:59 IST
+        // "reported an error with no WHY" incident class.
+        // Needles are assembled at runtime (concat!) so this test's OWN
+        // source can never satisfy the scan (the whole-file include_str!
+        // self-match vacuous false-OK class — the 2026-07-06 shadow-writer
+        // lesson).
+        let src = include_str!("groww_sidecar_supervisor.rs");
+        let threaded = concat!("detail: ", "sidecar_reject_detail(&line)");
+        assert!(
+            src.contains(threaded),
+            "the Passthrough notify arm must thread the sanitized detail"
+        );
+        let fleet_none = concat!("detail: ", "None");
+        assert!(
+            src.contains(fleet_none),
+            "the fleet EmitSummary arm must pass detail: None"
+        );
+        // No raw-line bypass: the detail must never be built from `line`
+        // without the sanitize choke point.
+        let raw_bypass = concat!("detail: ", "Some(line");
+        assert!(
+            !src.contains(raw_bypass),
+            "raw child text must never ride the Telegram detail"
+        );
     }
 
     #[test]

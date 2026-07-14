@@ -94,14 +94,19 @@ use tickvault_core::auth::token_manager::TokenHandle;
 use tickvault_core::notification::{NotificationEvent, NotificationService};
 use tickvault_storage::disk_health_watcher::classify_join_exit;
 use tickvault_storage::option_chain_1m_persistence::{
-    OPTION_CHAIN_1M_LEG_CE, OPTION_CHAIN_1M_LEG_PE, OPTION_CHAIN_1M_SEGMENT_IDX_I,
-    OptionChain1mRow, OptionChain1mWriter, ensure_option_chain_1m_table,
+    OPTION_CHAIN_1M_FEED_DHAN, OPTION_CHAIN_1M_LEG_CE, OPTION_CHAIN_1M_LEG_PE,
+    OPTION_CHAIN_1M_SEGMENT_IDX_I, OptionChain1mRow, OptionChain1mWriter,
+    ensure_option_chain_1m_table,
+};
+use tickvault_storage::rest_fetch_audit_persistence::{
+    REST_FETCH_LEG_CHAIN_1M, RestFetchAuditRow, RestFetchAuditWriter, RestFetchOutcome,
+    ensure_rest_fetch_audit_table,
 };
 
 use crate::spot_1m_rest_boot::{
     EdgeAction, FailureEdge, accumulation_within_cap, count_missed_boundaries,
     declared_len_within_cap, fire_is_fresh, format_minute_ist_12h, minute_open_ist_nanos,
-    next_fire_after, spot_1m_day_is_over,
+    next_fire_after, spot_1m_day_is_over, stamp_held_ok_rows,
 };
 
 /// Backoff before the supervisor respawns a dead/failed scheduler run.
@@ -1194,6 +1199,92 @@ struct ChainServingHealth {
     ladders: [LadderWatermark; CHAIN_1M_UNDERLYINGS.len()],
 }
 
+// ---------------------------------------------------------------------------
+// GAP-11 forensics helpers (rest_fetch_audit, leg='chain_1m', feed='dhan')
+// ---------------------------------------------------------------------------
+
+/// Build one `rest_fetch_audit` row for a Dhan chain fetch — `leg =
+/// chain_1m`, `attempts = 1` for a ran fetch (live-snapshot semantics: the
+/// chain has no in-minute re-poll ladder), keyed on the UNDERLYING's
+/// stable identity + plain symbol (the Groww chain precedent). The Dhan
+/// chain fetch surfaces no per-attempt forensics struct
+/// (`fetch_chain_bounded` returns a typed outcome only), so
+/// `final_http_status` carries 200 for the 2xx-proven arms (Found/Empty)
+/// and the 0 sentinel otherwise, and `fetch_latency_ms` stays the -1
+/// sentinel (measured only into the `tv_chain1m_fetch_duration_ms`
+/// histogram — threading it out of the ladder is out of scope, stated
+/// honestly). Pure.
+#[allow(clippy::too_many_arguments)] // APPROVED: private forensics builder — a struct would be pure ceremony
+fn build_dhan_chain_audit_row(
+    target_minute_ist_nanos: i64,
+    trading_date_nanos: i64,
+    security_id: u64,
+    symbol: &'static str,
+    attempts: i64,
+    final_http_status: i64,
+    close_to_data_ms: i64,
+    outcome: RestFetchOutcome,
+    error_class: &'static str,
+) -> RestFetchAuditRow {
+    RestFetchAuditRow {
+        ts_ist_nanos: target_minute_ist_nanos,
+        trading_date_ist_nanos: trading_date_nanos,
+        feed: OPTION_CHAIN_1M_FEED_DHAN,
+        leg: REST_FETCH_LEG_CHAIN_1M,
+        // Unreachable overflow for the pinned 13/25/51 set — a visible
+        // sentinel, never a silent sid=0 (the spot-leg precedent).
+        security_id: i64::try_from(security_id).unwrap_or(i64::MAX),
+        exchange_segment: OPTION_CHAIN_1M_SEGMENT_IDX_I,
+        symbol,
+        attempts,
+        final_http_status,
+        fetch_latency_ms: -1,
+        close_to_data_ms,
+        close_to_persist_ms: -1,
+        rate_limited_count: 0,
+        outcome,
+        error_class,
+    }
+}
+
+/// Best-effort forensics append: a failure logs (coded, CHAIN-03
+/// `audit_append` stage) + counts and RETURNS — the fetch loop, the
+/// verdict and the failure edge are never affected by the forensics leg.
+/// Dhan emit sites stay field-less on the CHAIN codes per the rule-file
+/// convention (grep-split by `feed="groww"`).
+fn chain_audit_append_best_effort(
+    audit_writer: &mut RestFetchAuditWriter,
+    row: &RestFetchAuditRow,
+) {
+    if let Err(err) = audit_writer.append_row(row) {
+        metrics::counter!("tv_rest_fetch_audit_persist_errors_total", "stage" => "audit_append")
+            .increment(1);
+        error!(
+            code = ErrorCode::Chain03PersistFailed.code_str(),
+            stage = "audit_append",
+            ?err,
+            "CHAIN-03: rest_fetch_audit (chain_1m) row append failed \
+             (forensics only — the fetch loop is unaffected)"
+        );
+    }
+}
+
+/// Best-effort forensics flush (same never-affects-the-loop contract).
+fn chain_audit_flush_best_effort(audit_writer: &mut RestFetchAuditWriter) {
+    if let Err(err) = audit_writer.flush() {
+        metrics::counter!("tv_rest_fetch_audit_persist_errors_total", "stage" => "audit_flush")
+            .increment(1);
+        error!(
+            code = ErrorCode::Chain03PersistFailed.code_str(),
+            stage = "audit_flush",
+            ?err,
+            "CHAIN-03: rest_fetch_audit (chain_1m) ILP flush failed — \
+             pending forensics rows discarded (best-effort; the fetch loop \
+             is unaffected)"
+        );
+    }
+}
+
 /// What the run loop does after one fired minute.
 enum MinuteVerdict {
     Continue,
@@ -1212,6 +1303,7 @@ async fn fire_one_chain_minute(
     targets: &[ResolvedUnderlying],
     last_request_ms: &mut [Option<i64>],
     writer: &mut OptionChain1mWriter,
+    audit_writer: &mut RestFetchAuditWriter,
     edge: &mut FailureEdge,
     health: &mut ChainServingHealth,
     fire_secs_of_day: u32,
@@ -1241,10 +1333,15 @@ async fn fire_one_chain_minute(
     // outcomes, so the verdicts stay EMPTY → the sink records nothing —
     // a whole-fire tracker HOLD (the #1537 auth-abort mirror).
     let mut served_verdicts: Vec<(&'static str, bool)> = Vec::with_capacity(targets.len());
+    // GAP-11 forensics: one row per (fired minute, underlying); `ok` rows
+    // are HELD here until the data flush ACK, then stamped with the real
+    // close_to_persist_ms (a failed flush converts them to flush_failed
+    // named-gap rows — never a false ok row).
+    let mut held_ok_rows: Vec<RestFetchAuditRow> = Vec::new();
+    let target_minute_nanos = minute_open_ist_nanos(trading_date, minute_open_secs);
+    let trading_date_nanos = minute_open_ist_nanos(trading_date, 0);
 
     if let Some(jwt) = jwt {
-        let target_minute_nanos = minute_open_ist_nanos(trading_date, minute_open_secs);
-        let trading_date_nanos = minute_open_ist_nanos(trading_date, 0);
         let minute_close_ms = i64::from(fire_secs_of_day).saturating_mul(MILLIS_PER_SEC);
 
         // 2026-07-14 pacing decision (runbook
@@ -1422,6 +1519,10 @@ async fn fire_one_chain_minute(
                     }
                     let expiry_nanos = minute_open_ist_nanos(target.expiry, 0);
                     let fetched_at = fetched_at_ist_nanos_now();
+                    // GAP-11: per-underlying append verdict — a poisoned
+                    // batch means the minute is a persist_failed named
+                    // gap for this underlying, never an ok row.
+                    let mut underlying_append_failed = false;
                     let underlying_sid = i64::try_from(target.security_id).unwrap_or_else(|_| {
                         // Unreachable for the pinned 13/25/51 set; loud +
                         // visible sentinel, never a silent sid=0.
@@ -1458,6 +1559,7 @@ async fn fire_one_chain_minute(
                         };
                         if let Err(err) = writer.append_row(&row) {
                             persist_failed = true;
+                            underlying_append_failed = true;
                             metrics::counter!(
                                 "tv_chain1m_persist_errors_total", "stage" => "append"
                             )
@@ -1478,6 +1580,39 @@ async fn fire_one_chain_minute(
                             break;
                         }
                     }
+                    if underlying_append_failed {
+                        // GAP-11: fetched-but-lost — a persist failure,
+                        // never dressed as vendor absence (the spot-leg
+                        // round-2 LOW precedent).
+                        chain_audit_append_best_effort(
+                            audit_writer,
+                            &build_dhan_chain_audit_row(
+                                target_minute_nanos,
+                                trading_date_nanos,
+                                target.security_id,
+                                target.symbol,
+                                1,
+                                200,
+                                -1,
+                                RestFetchOutcome::NamedGap,
+                                "persist_failed",
+                            ),
+                        );
+                    } else {
+                        // GAP-11: HOLD the ok row until the data flush ACK
+                        // (close_to_persist_ms stamped post-flush).
+                        held_ok_rows.push(build_dhan_chain_audit_row(
+                            target_minute_nanos,
+                            trading_date_nanos,
+                            target.security_id,
+                            target.symbol,
+                            1,
+                            200,
+                            close_to_data_ms,
+                            RestFetchOutcome::Ok,
+                            "none",
+                        ));
+                    }
                 }
                 ChainFetchOutcome::Empty => {
                     empty_count = empty_count.saturating_add(1);
@@ -1488,6 +1623,21 @@ async fn fire_one_chain_minute(
                             target.symbol
                         ));
                     }
+                    // GAP-11 forensics: 2xx-proven, zero strikes.
+                    chain_audit_append_best_effort(
+                        audit_writer,
+                        &build_dhan_chain_audit_row(
+                            target_minute_nanos,
+                            trading_date_nanos,
+                            target.security_id,
+                            target.symbol,
+                            1,
+                            200,
+                            -1,
+                            RestFetchOutcome::Empty,
+                            "empty_chain",
+                        ),
+                    );
                 }
                 ChainFetchOutcome::Entitlement(detail) => {
                     error_count = error_count.saturating_add(1);
@@ -1496,6 +1646,22 @@ async fn fire_one_chain_minute(
                     if entitlement.is_none() {
                         entitlement = Some(detail);
                     }
+                    // GAP-11 forensics: the entitlement class (no status
+                    // surfaced by the ladder — 0 sentinel).
+                    chain_audit_append_best_effort(
+                        audit_writer,
+                        &build_dhan_chain_audit_row(
+                            target_minute_nanos,
+                            trading_date_nanos,
+                            target.security_id,
+                            target.symbol,
+                            1,
+                            0,
+                            -1,
+                            RestFetchOutcome::Error,
+                            "entitlement",
+                        ),
+                    );
                 }
                 ChainFetchOutcome::Failed(reason) => {
                     error_count = error_count.saturating_add(1);
@@ -1503,10 +1669,28 @@ async fn fire_one_chain_minute(
                     if sample_failure.is_none() {
                         sample_failure = Some(format!("{}: {reason}", target.symbol));
                     }
+                    // GAP-11 forensics: transport / non-2xx / parse /
+                    // budget — the ladder surfaces no status (0 sentinel);
+                    // the coalesced verdict log carries the reason text.
+                    chain_audit_append_best_effort(
+                        audit_writer,
+                        &build_dhan_chain_audit_row(
+                            target_minute_nanos,
+                            trading_date_nanos,
+                            target.security_id,
+                            target.symbol,
+                            1,
+                            0,
+                            -1,
+                            RestFetchOutcome::Error,
+                            "error",
+                        ),
+                    );
                 }
             }
         }
-        if let Err(err) = writer.flush() {
+        let flush_result = writer.flush();
+        if let Err(err) = &flush_result {
             persist_failed = true;
             metrics::counter!("tv_chain1m_persist_errors_total", "stage" => "flush").increment(1);
             error!(
@@ -1520,16 +1704,58 @@ async fn fire_one_chain_minute(
             if sample_failure.is_none() {
                 sample_failure = Some(format!("persist flush failed: {err:#}"));
             }
+            // GAP-11: the underlyings whose legs were staged-but-lost at
+            // the flush become flush_failed named-gap rows (the fetch
+            // itself answered 200); the held ok rows are discarded below
+            // — never a false ok row.
+            for held in &held_ok_rows {
+                chain_audit_append_best_effort(
+                    audit_writer,
+                    &RestFetchAuditRow {
+                        close_to_data_ms: -1,
+                        outcome: RestFetchOutcome::NamedGap,
+                        error_class: "flush_failed",
+                        ..held.clone()
+                    },
+                );
+            }
+        }
+        // GAP-11: the ok rows land ONLY after (and stamped with) the data
+        // flush ACK — discarded on a failed flush.
+        for row in stamp_held_ok_rows(
+            held_ok_rows,
+            flush_result.is_ok(),
+            trading_date_nanos,
+            ist_millis_of_day_now(),
+        ) {
+            chain_audit_append_best_effort(audit_writer, &row);
         }
     } else {
         // No token at fire time — REST cannot succeed; the whole minute is
-        // a full miss (counted per underlying for honest rate math).
+        // a full miss (counted per underlying for honest rate math) + one
+        // no_token forensics row per underlying.
         error_count = targets.len();
         sample_failure = Some("no access token available at fire time".to_string());
-        for _ in 0..error_count {
+        for target in targets {
             metrics::counter!("tv_chain1m_fetch_total", "outcome" => "error").increment(1);
+            chain_audit_append_best_effort(
+                audit_writer,
+                &build_dhan_chain_audit_row(
+                    target_minute_nanos,
+                    trading_date_nanos,
+                    target.security_id,
+                    target.symbol,
+                    0,
+                    0,
+                    -1,
+                    RestFetchOutcome::NoToken,
+                    "no_token",
+                ),
+            );
         }
     }
+    // GAP-11 forensics: flush ONCE per fire (best-effort).
+    chain_audit_flush_best_effort(audit_writer);
 
     // An entitlement stop pages CHAIN-01 (once, day-scoped) at the caller
     // — skip the CHAIN-02 edge accounting for the same minute so one
@@ -1696,18 +1922,25 @@ fn record_chain_underlying_verdicts(
 
 /// Loud accounting for minute boundaries that elapsed UNFETCHED (fire
 /// overrun / suspend / clock step) — the spot leg's H2 pattern with the
-/// chain's own counter + edge.
+/// chain's own counter + edge. GAP-11: each missed (boundary, underlying)
+/// pair also gets a `skipped` forensics row (the Groww chain precedent) —
+/// `first_missed_boundary_secs` is the FIRST missed fire boundary, so the
+/// rows key on the real missed minutes.
+#[allow(clippy::too_many_arguments)] // APPROVED: private accounting sink — a struct would be pure ceremony (Groww chain precedent)
 fn record_chain_skipped_boundaries(
     params: &OptionChain1mTaskParams,
     edge: &mut FailureEdge,
+    audit_writer: &mut RestFetchAuditWriter,
+    targets: &[ResolvedUnderlying],
     skipped: u32,
-    context_secs_of_day: u32,
+    first_missed_boundary_secs: u32,
+    iter_date: NaiveDate,
 ) {
     if skipped == 0 {
         return;
     }
     metrics::counter!("tv_chain1m_boundary_skipped_total").increment(u64::from(skipped));
-    let around = format_minute_ist_12h(context_secs_of_day);
+    let around = format_minute_ist_12h(first_missed_boundary_secs);
     error!(
         code = ErrorCode::Chain02FetchDegraded.code_str(),
         stage = "boundary_skipped",
@@ -1716,7 +1949,50 @@ fn record_chain_skipped_boundaries(
         "CHAIN-02: minute boundaries elapsed unfetched (fire overrun / \
          suspend) — those minutes stay absent (re-fetchable via backfill)"
     );
-    for _ in 0..skipped {
+    // GAP-11 (the Groww chain item-7 precedent): a wake that crossed IST
+    // midnight would stamp the missed PRE-SUSPEND session seconds onto the
+    // POST-WAKE date — wrong trading date on every row. The counter + the
+    // coalesced log already fired; skip the (mis-dated) forensics rows +
+    // edge accounting — the day is over for this run.
+    //
+    // DELIBERATE edge-accounting change (review MEDIUM 3, 2026-07-14):
+    // pre-GAP-11 this fn fed `edge.record_minute(true)` UNCONDITIONALLY for
+    // every missed boundary; post-guard a midnight-crossing wake feeds the
+    // edge NOTHING for those boundaries. Defensible by design: the trading
+    // day those boundaries belonged to is over, and an escalation page for
+    // yesterday's tail on the post-wake day would be noise, not signal.
+    let trading_date = today_ist();
+    if trading_date != iter_date {
+        warn!(
+            %iter_date,
+            %trading_date,
+            "option_chain_1m: wake crossed IST midnight — skipping the \
+             boundary-skip forensics rows (wrong trading date); the day is \
+             over for this run"
+        );
+        return;
+    }
+    let trading_date_nanos = minute_open_ist_nanos(trading_date, 0);
+    for i in 0..skipped {
+        let boundary = first_missed_boundary_secs.saturating_add(i.saturating_mul(60));
+        let minute_open_secs = boundary.saturating_sub(60);
+        let target_nanos = minute_open_ist_nanos(trading_date, minute_open_secs);
+        for target in targets {
+            chain_audit_append_best_effort(
+                audit_writer,
+                &build_dhan_chain_audit_row(
+                    target_nanos,
+                    trading_date_nanos,
+                    target.security_id,
+                    target.symbol,
+                    0,
+                    0,
+                    -1,
+                    RestFetchOutcome::Skipped,
+                    "boundary_skipped",
+                ),
+            );
+        }
         if let EdgeAction::Page { consecutive } = edge.record_minute(true) {
             error!(
                 code = ErrorCode::Chain02FetchDegraded.code_str(),
@@ -1734,6 +2010,7 @@ fn record_chain_skipped_boundaries(
                 });
         }
     }
+    chain_audit_flush_best_effort(audit_writer);
 }
 
 // ---------------------------------------------------------------------------
@@ -1809,6 +2086,9 @@ pub async fn run_option_chain_1m(
     // Idempotent DDL first (CREATE → ADD COLUMN self-heal → DEDUP ENABLE);
     // failures degrade loudly inside (CHAIN-03) and never block the run.
     ensure_option_chain_1m_table(&params.questdb).await;
+    // GAP-11 forensics: the shared rest_fetch_audit table (idempotent —
+    // the spot + Groww legs also ensure it; a second call is harmless).
+    ensure_rest_fetch_audit_table(&params.questdb).await;
 
     if !params.calendar.is_trading_day_today() {
         info!("option_chain_1m: non-trading day — skipping all minute fires");
@@ -1911,6 +2191,9 @@ pub async fn run_option_chain_1m(
     }
 
     let mut writer = OptionChain1mWriter::new(&params.questdb);
+    // GAP-11 forensics: best-effort per-fetch audit rows (never on the
+    // fetch/verdict/edge path).
+    let mut audit_writer = RestFetchAuditWriter::new(&params.questdb);
     let mut edge = FailureEdge::default();
     // Per-underlying not-served tracker + ladder watermarks (2026-07-14)
     // — same lifetime as the FailureEdge: this run, which is per trading
@@ -1945,6 +2228,10 @@ pub async fn run_option_chain_1m(
             );
             return;
         }
+        // GAP-11: the date this iteration's minute math is stamped with —
+        // the boundary-skip forensics guard compares it against a
+        // post-wake re-read (the Groww chain midnight-cross precedent).
+        let iter_date = today_ist();
         let now = ist_secs_of_day_now();
         let Some(fire) = next_fire_after(now, last_fired) else {
             info!("option_chain_1m: past 15:30 IST — today's minute fires complete");
@@ -1963,7 +2250,15 @@ pub async fn run_option_chain_1m(
                  (suspend/clock step?) — skipping this minute"
             );
             let missed = count_missed_boundaries(fire.saturating_sub(60), woke.saturating_sub(1));
-            record_chain_skipped_boundaries(&params, &mut edge, missed, fire);
+            record_chain_skipped_boundaries(
+                &params,
+                &mut edge,
+                &mut audit_writer,
+                &targets,
+                missed,
+                fire,
+                iter_date,
+            );
             if woke > fire {
                 last_fired = Some(
                     (woke.min(tickvault_common::constants::SPOT_1M_REST_LAST_FIRE_SECS_OF_DAY_IST)
@@ -1990,6 +2285,7 @@ pub async fn run_option_chain_1m(
             &targets,
             &mut last_request_ms,
             &mut writer,
+            &mut audit_writer,
             &mut edge,
             &mut health,
             fire,
@@ -2017,7 +2313,15 @@ pub async fn run_option_chain_1m(
         // fire can never be fetched — count them loudly + feed the edge.
         let after = ist_secs_of_day_now();
         let missed = count_missed_boundaries(fire, after.saturating_sub(1));
-        record_chain_skipped_boundaries(&params, &mut edge, missed, fire);
+        record_chain_skipped_boundaries(
+            &params,
+            &mut edge,
+            &mut audit_writer,
+            &targets,
+            missed,
+            fire + 60,
+            iter_date,
+        );
         if missed > 0 {
             last_fired = Some(
                 (after.min(tickvault_common::constants::SPOT_1M_REST_LAST_FIRE_SECS_OF_DAY_IST)
@@ -2592,6 +2896,52 @@ mod tests {
         // Fetched but the persist leg failed → STILL failed for the edge.
         assert!(chain_minute_fully_failed(3, true));
         assert!(chain_minute_fully_failed(0, true));
+    }
+
+    // ---- GAP-11 forensics row builder (rest_fetch_audit, leg='chain_1m') ----
+
+    #[test]
+    fn test_chain_audit_row_attempts_is_one_and_leg_chain_1m() {
+        let row = build_dhan_chain_audit_row(
+            1_000,
+            0,
+            13,
+            "NIFTY",
+            1,
+            200,
+            1_042,
+            RestFetchOutcome::Ok,
+            "none",
+        );
+        assert_eq!(row.leg, "chain_1m");
+        assert_eq!(row.feed, "dhan");
+        assert_eq!(row.exchange_segment, "IDX_I");
+        // Live-snapshot semantics: ONE request per (minute, underlying) —
+        // the chain has no in-minute re-poll ladder.
+        assert_eq!(row.attempts, 1);
+        assert_eq!(row.security_id, 13);
+        assert_eq!(row.close_to_data_ms, 1_042);
+        // Held-until-flush semantics: the builder always starts at the -1
+        // persist sentinel — `stamp_held_ok_rows` fills the real value
+        // post-flush-ACK (GAP-11).
+        assert_eq!(row.close_to_persist_ms, -1);
+        // The Dhan chain ladder surfaces no per-attempt latency — honest
+        // -1 sentinel (never a fabricated number).
+        assert_eq!(row.fetch_latency_ms, -1);
+        // sid overflow → visible i64::MAX sentinel, never a silent 0.
+        let overflow = build_dhan_chain_audit_row(
+            0,
+            0,
+            u64::MAX,
+            "X",
+            1,
+            0,
+            -1,
+            RestFetchOutcome::Error,
+            "error",
+        );
+        assert_eq!(overflow.security_id, i64::MAX);
+        assert_eq!(overflow.final_http_status, 0);
     }
 
     /// The expirylist warmup fail-closed contract: with every attempt

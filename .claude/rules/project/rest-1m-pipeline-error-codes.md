@@ -404,8 +404,35 @@ collide. ADDITIONALLY (operator scope addition 2026-07-13): the NEW
 `(ts, trading_date_ist, feed, leg, security_id, exchange_segment, outcome)`
 — `outcome` in-key per phase-0 DEDUP rule 3 so TRANSITION rows BOTH
 survive: a sweep gap row never overwrites the minute's original ladder
-row; hostile round 1 item 5) is written BEST-EFFORT by the Groww leg (the
-Dhan leg's emit sites are a fast FOLLOW-UP after #1499 merges); its
+row; hostile round 1 item 5) is written BEST-EFFORT by the Groww leg —
+AND, since 2026-07-14 (GAP-11), by the DHAN legs too: the Dhan spot leg
+emits one row per (minute, SID) at every verdict/backfill/sweep/no-token
+point AND per skipped boundary (`outcome=skipped`/`boundary_skipped`,
+with the Groww midnight-cross date guard — review MEDIUM 1). Own-fire
+`ok` rows carry the MEASURED `close_to_data_ms` from the ladder verdict;
+since the same-day review HIGH fix the Dhan ladder threads a REAL
+per-ladder forensics struct (`DhanLadderForensics`), so `attempts` and
+`rate_limited_count` are the TRUE rung/429 counts and a terminal-429
+ladder classifies `outcome=rate_limited` (the Groww last-status rule) —
+a Dhan 429 storm can no longer read 0 on the scoreboard digest while
+`tv_spot1m_rate_limited_total` climbs. The REMAINING named sentinels:
+`final_http_status`/`fetch_latency_ms` stay 0/-1 (the Dhan
+`FetchFailure` carries no status/latency fields — that narrower
+follow-up stays flagged), and the budget-overrun arm honestly reads
+`attempts=0` (the timed-out ladder's partial state drops with its
+future). The Dhan CHAIN leg emits per (minute, underlying) with
+`leg='chain_1m'` (see the §2d 2026-07-14 note). NEW COLUMN `close_to_persist_ms` (2026-07-14):
+minute close → the DATA-table ILP flush-ACK instant in ms, stamped via
+the hold-then-stamp pattern (`stamp_held_ok_rows` in
+`spot_1m_rest_boot.rs`, shared by the Dhan spot/sweep, Groww spot fire
+and Dhan chain legs) — `ok` rows are HELD until the data flush ACK and
+stamped there; a FAILED flush DISCARDS the held ok rows (`outcome` is
+in the DEDUP key, so a pre-flush ok append would land ALONGSIDE the
+`flush_failed` named-gap rows and lie about the ok path). `-1` = not
+persisted / not measured (every non-ok row, pre-2026-07-14 rows, the
+Groww chain/contract legs pending their own stamping). Honest bound:
+the stamp is the ILP flush ACK of an async-batched write, NOT a per-row
+commit — QuestDB WAL apply can lag it. Its
 ensure/append/flush failures reuse SPOT1M-02 with stages
 `audit_ensure_client_build` / `audit_ensure_ddl` / `audit_append` /
 `audit_flush` + `tv_rest_fetch_audit_persist_errors_total{stage}` — a
@@ -419,7 +446,16 @@ fetch happened, 0 sentinel when none) and class slugs `named_gap` /
 AUDIT-ONLY — §38/§9 forbid a bulk backfill fetch) / `persist_failed`
 (fetched OK but the ILP APPEND failed — a persist failure, never dressed
 as vendor absence; round-2 LOW) / `flush_failed` (swept minutes lost at
-the ILP flush) / `no_token` — never a silent hole.
+the ILP flush) / `no_token` — never a silent hole. DEDUP honesty
+(2026-07-14 review LOW): `error_class` is NOT in the audit DEDUP key, so
+two named-gap rows sharing `(minute, SID, outcome)` with different
+class slugs (e.g. a fire's `persist_failed` then the sweep's
+`named_gap`) UPSERT in place — the LAST-written error_class wins for
+that key; the outcome-level truth is unaffected (`outcome` IS in-key).
+Also since 2026-07-14 (review MEDIUM 2, cross-feed symmetry): the GROWW
+spot backfill-Ok arm holds an `ok` row for the repaired minute (the Dhan
+backfill-row semantics — a backfill-repaired Groww minute no longer
+reads "failed, never recovered" in the digest).
 
 **2026-07-13 — the GROWW CONTRACT leg emits SPOT1M-02 with
 `leg = "contract_1m"` for the NEW `option_contract_1m_rest` table:** the
@@ -662,11 +698,31 @@ ensure-DDL stages are shared — one table, one DDL), with a **`feed =
 ALTER-ADD self-heal for the Groww leg: `rho` (Groww supplies it; Dhan
 does not) and `close_to_data_ms` (per-row latency stamp — the ONLY
 freshness signal, since Groww's chain response carries NO timestamp).
-Dhan rows leave both NULL (the Dhan emit path is untouched). The Groww
+Dhan rows leave both NULL (the Dhan `option_chain_1m` emit path is
+untouched — `rho`/`close_to_data_ms` are Groww-leg columns). The Groww
 leg's `rest_fetch_audit` forensics failures reuse the SPOT1M-02 stage
 names `audit_append` / `audit_flush` but are coded CHAIN-03 with
 `leg='chain_1m'` context — a forensics write failure NEVER affects the
 fetch loop or the failure edge.
+
+**2026-07-14 — the DHAN chain leg now emits `rest_fetch_audit` rows too
+(GAP-11):** one row per (fired minute, underlying), `feed='dhan'`,
+`leg='chain_1m'`, `attempts=1` (live-snapshot semantics — no re-poll
+ladder), keyed on the underlying's SID/plain symbol (the Groww chain
+precedent): `ok` (real `close_to_data_ms`, held-until-flush-ACK
+`close_to_persist_ms` per the §2 hold-then-stamp contract) / `empty`
+(`empty_chain`, 200) / `error` (`error` or `entitlement` class; the
+Dhan chain ladder surfaces no HTTP status — 0 sentinel, honest) /
+`no_token` / `skipped` (`boundary_skipped`, per missed boundary, with
+the Groww midnight-cross date guard) / `named_gap`
+(`persist_failed`/`flush_failed` for fetched-but-lost minutes). Its
+forensics-write failures are coded CHAIN-03 `audit_append`/`audit_flush`
+(Dhan emit sites stay field-less — grep-split by `feed="groww"`).
+Deliberate edge-accounting change riding the midnight guard (review
+MEDIUM 3, same day): on a midnight-crossing wake the guard now also
+skips the per-boundary `edge.record_minute(true)` calls that pre-GAP-11
+ran unconditionally — the trading day those boundaries belonged to is
+over, so an escalation page for yesterday's tail would be noise.
 
 ## §2e. CHAIN-04 — day-start expirylist warmup failed (pipeline down for the day)
 
@@ -836,8 +892,10 @@ scope.
 PR-5):** the 15:45 IST dual-feed scorecard now carries one plain-English
 "Official minute candles — how fast after each minute closed" line per
 (feed, leg), aggregated from the day's `rest_fetch_audit` rows (+ the
-`spot_1m_rest` latency-fallback column for the Dhan spot leg, whose
-forensics emits remain the flagged follow-up) — prompt-pull p50/p99/max
+`spot_1m_rest` latency-fallback column for the Dhan spot leg — the
+fallback is HISTORICAL/defensive since 2026-07-14: the Dhan spot + chain
+forensics rows are LIVE per the §2/§2d GAP-11 notes, so the digest's
+primary source now covers all four feed/leg pairs) — prompt-pull p50/p99/max
 seconds-after-close, ok/failed counts, rate-limit hits, late recoveries
 and never-recovered gaps, all MEASURED, `-1` sentinels rendering "not
 measured yet". Degrade stages `rest_leg_*` live under SCOREBOARD-01; full
