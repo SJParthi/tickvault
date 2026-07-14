@@ -79,3 +79,22 @@ Headers: access-token
 ```
 
 Key fields: `tradedQuantity`, `tradedPrice`, `exchangeTime` (IST string), all tax/charge breakdowns (`sebiTax`, `stt`, `brokerageCharges`, `serviceTax`, `exchangeTransactionCharges`, `stampDuty`).
+
+---
+
+## 2026-07-14 Upstream Update (runner-crawled live page)
+
+**Evidence tier: Verified-live.** Raw HTML of `https://dhanhq.co/docs/v2/statements/`
+(runs 1–3, sha256 `f25a5deb` content-identical, latest 2026-07-14T07:58:26Z). Ledger
+endpoint + date params, the 0-indexed trade-history paging, and string debit/credit all
+re-confirmed verbatim. Full manifest: `00-COVERAGE-MANIFEST.md`.
+
+1. **Charge fields are typed `string` in the live param table** (`sebiTax | string`,
+   `stt | string`, `brokerageCharges | string`, `serviceTax | string`,
+   `exchangeTransactionCharges | string`, `stampDuty | string`) while the JSON example shows
+   bare numbers (0.0004, 0, 0.0025, 0.0135). Parse defensively — dual-format (accept number
+   OR numeric string) for every charge field.
+2. Live-only sentinels/typos recorded: the trade-history example carries
+   `"tradingSymbol": null` (with `customSymbol` = "Trading Symbol as per Dhan") and
+   `"createTime": "NA", "updateTime": "NA"` NA-sentinels; `drvExpiryDate` is table-typed
+   "int" while the example shows "NA" (live typo).

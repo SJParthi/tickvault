@@ -210,3 +210,36 @@ pub struct Position {
     pub cross_currency: bool,
 }
 ```
+
+---
+
+## 2026-07-14 Upstream Update (runner-crawled live pages)
+
+**Evidence tier: Verified-live.** Raw HTML of `https://dhanhq.co/docs/v2/portfolio/` (runs 1–3,
+sha256 `afbf4321` content-identical, latest 2026-07-14T07:58:21Z) + the NEW portal's markdown
+exports `docs.dhanhq.co/markdown/api/v2/portfolio/exit-all-positions.md` and
+`convert-position.md` (2026-07-14T08:02Z) + the portal OpenAPI yaml. Comment-aware.
+Full manifest: `00-COVERAGE-MANIFEST.md`.
+
+1. **Exit-all (§5) — the ambiguity is RESOLVED on BOTH surfaces: it DOES cancel open orders.**
+   Classic page VERBATIM: "Exit all active positions and cancel all open orders for the
+   current trading day." The portal export carries the same sentence. The old "only squares
+   off … does not cancel pending orders" wording has ZERO rendered hits on the live page.
+   The §5 ambiguity banner's conservative treatment is vindicated and is now documented fact.
+2. **convertQty (§4) — documented as INTEGER everywhere; string survives only in the classic
+   example.** Classic param table: `convertQty | int`; portal export table: `int`; OpenAPI
+   yaml `ConvertPositionRequest.convertQty: type: integer` (and in the `required` list). The
+   classic page's own example still shows `"convertQty":"40"` (string), and the SDK
+   historically sent int. The §4 SDK note's "use the string format per official
+   documentation" is SUPERSEDED: the documented type is int on all three schema/table
+   statements — send int; parse tolerantly (accept both).
+3. **Holdings extras (§2) — `mtf_tq_qty` / `mtf_qty` / `lastTradedPrice` are wire/SDK-observed,
+   NOT on the live doc page** (the live holdings example + param table carry exactly 10 fields
+   ending at `avgCostPrice`). Keep them (observed in live responses); annotate their source as
+   wire observation, not the doc page — so a future differ doesn't flag them as hallucination.
+4. Live-only notes: the positions + convert enums still list `NSE_CURRENCY`/`BSE_CURRENCY`
+   (classic surfaces consistently retain currency — see `08-annexure-enums.md` "2026-07-14
+   Upstream Update" two-surface story); the convert `fromProductType`/`toProductType` enums
+   list `CNC INTRADAY MARGIN CO BO` with **MTF absent from both** (live-internal
+   inconsistency; the create-order side has MTF). Portal exit-all export internal wobble:
+   prose says "No response body … 202 Accepted" while its own Status Codes table says 200.
