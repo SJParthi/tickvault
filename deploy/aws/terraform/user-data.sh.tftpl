@@ -54,12 +54,54 @@ timedatectl set-timezone Asia/Kolkata
 # AL2023 minor version), add Docker's official CE repo (which manages the plugin
 # version — no hard-coded version to drift) and install from there.
 dnf install -y docker git jq
-if ! dnf install -y docker-compose-plugin; then
+if docker compose version >/dev/null 2>&1; then
+    echo "user-data: docker compose plugin already present — skipping install"
+elif ! dnf install -y docker-compose-plugin; then
     echo "user-data: docker-compose-plugin not in default repo — adding Docker CE repo and retrying"
-    curl -fsSL https://download.docker.com/linux/centos/docker-ce.repo \
+    curl -fsSL --max-time 120 https://download.docker.com/linux/centos/docker-ce.repo \
         -o /etc/yum.repos.d/docker-ce.repo || true
     dnf install -y docker-compose-plugin \
-        || echo "user-data: WARNING — docker-compose-plugin install failed; 'docker compose' will be unavailable"
+        || echo "user-data: docker-compose-plugin not installable from any repo — falling back to the pinned static plugin binary"
+fi
+
+# Pinned static-binary fallback (2026-07-14, PR #1523 companion — closes the
+# fresh-instance residual): a FRESH / re-provisioned / nuked-and-rebuilt
+# instance boots at 08:30 IST BEFORE any deploy has ever run, so the
+# deploy-script ensure ladder (.github/workflows/deploy-aws.yml SSM block)
+# cannot be its safety net — without this fallback, first boot on an AL2023
+# minor whose repos lack docker-compose-plugin has NO compose at all:
+# ensure-questdb.sh (service-user) PROBES for compose but never installs,
+# and the boot lands on the docker-run last resort or BOOT-02.
+# Same pin + official sha256 constants as the deploy-script copy — BUMP IN
+# LOCKSTEP (both recorded 2026-07-14 from the official docker/compose
+# release checksums.txt; box is r8g.large = aarch64, x86_64 kept for
+# dev/DR parity). Download lands in /tmp first; ONLY a checksum-verified
+# file is installed (atomic install -m 0755, root). Bounded + fail-loud in
+# this provision log, but NON-fatal: provisioning must not brick on a
+# transient download failure — the every-deploy ladder is the second chance.
+COMPOSE_PIN=v2.29.7
+COMPOSE_SHA256_AARCH64=6e9fbd5daa20dca5d7d89145081ae8155d68ef2928b497d9f85b54fe0f9dbb2c
+COMPOSE_SHA256_X86_64=383ce6698cd5d5bbf958d2c8489ed75094e34a77d340404d9f32c4ae9e12baf0
+if ! docker compose version >/dev/null 2>&1; then
+    COMPOSE_ARCH=$(uname -m)
+    case "$COMPOSE_ARCH" in
+        aarch64) COMPOSE_SHA256="$COMPOSE_SHA256_AARCH64" ;;
+        x86_64)  COMPOSE_SHA256="$COMPOSE_SHA256_X86_64" ;;
+        *)       COMPOSE_SHA256="" ;;
+    esac
+    if [ -z "$COMPOSE_SHA256" ]; then
+        echo "user-data: WARNING — no pinned compose sha256 for arch $COMPOSE_ARCH; skipping static install"
+    elif timeout 150 curl -fsSL --max-time 120 \
+            "https://github.com/docker/compose/releases/download/$COMPOSE_PIN/docker-compose-linux-$COMPOSE_ARCH" \
+            -o /tmp/docker-compose.dl \
+        && echo "$COMPOSE_SHA256  /tmp/docker-compose.dl" | sha256sum -c - \
+        && mkdir -p /usr/local/lib/docker/cli-plugins \
+        && install -m 0755 -o root -g root /tmp/docker-compose.dl /usr/local/lib/docker/cli-plugins/docker-compose; then
+        echo "user-data: pinned compose plugin $COMPOSE_PIN installed (sha256 verified)"
+    else
+        echo "user-data: WARNING — pinned compose plugin download/verify FAILED; nothing installed (the deploy-time ensure ladder is the second chance)"
+    fi
+    rm -f /tmp/docker-compose.dl
 fi
 systemctl enable --now docker
 usermod -aG docker ec2-user
