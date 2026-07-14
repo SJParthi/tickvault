@@ -3466,7 +3466,18 @@ pub async fn run_groww_bridge(
             // the sub-second remainder creeps a reconstruction forward every
             // poll, so OPEN could never latch during a real gap).
             let gap_last_tick = feed_health.last_tick_ist_nanos(Feed::Groww);
-            let in_session = tickvault_common::market_hours::is_trading_session_now();
+            // Episode-OPEN gate (review HIGH 2026-07-14): BOTH the
+            // calendar-aware trading-session gate AND the exchange-session
+            // gate ([09:15, 15:30) IST via g1_exchange_gate_accepts — the
+            // §1b never-streamed precedent). Without the second gate the
+            // 09:08–09:15 pre-open auction-window silence would page a
+            // false gap most mornings. The unconditional gap-seconds
+            // counter is NOT gated (it accumulates in the advanced branch
+            // regardless) — only pages/episodes are ≥09:15.
+            let in_session = tickvault_common::market_hours::is_trading_session_now()
+                && tickvault_common::constants::g1_exchange_gate_accepts(
+                    gap_now_nanos.rem_euclid(86_400 * 1_000_000_000),
+                );
             let (edge, counter_add_secs) =
                 gap_tracker.poll(gap_last_tick, gap_now_nanos, in_session);
             if counter_add_secs > 0 {
