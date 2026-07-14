@@ -322,7 +322,7 @@ fn test_deployed_emf_source_labels_match_a_real_series_label() {
 }
 
 #[test]
-fn test_emf_metric_selectors_name_count_is_twenty_six() {
+fn test_emf_metric_selectors_name_count_is_twenty_nine() {
     // Pin the MAIN (host-only) EMF publish list: 19 alarm-backing signals
     // + 2 memory-measurement gauges added 2026-07-02 for the 2K-universe RAM
     // measurement (tv_process_rss_bytes — crates/storage/src/resource_monitor.rs;
@@ -355,15 +355,22 @@ fn test_emf_metric_selectors_name_count_is_twenty_six() {
     // (scope-lock §A.1), so the gauge has zero reachable writers; shipping
     // a dead name in the EMF list would publish nothing while implying
     // coverage. Cost: -1 custom metric (~-$0.30/mo).
+    // 29 (was 26) since 2026-07-14 (DHAN order-side alerting): +
+    // tv_circuit_breaker_state, tv_daily_pnl, tv_order_placement_last_ms.
+    // tv_orders_placed_total publishes ONLY via the THIRD [host,mode]
+    // declaration (host-only folding would blend paper/live modes). Cost:
+    // +3 series ≈ +$0.90/mo when order flow is live; $0 while dormant.
     let user_data = read("deploy/aws/terraform/user-data.sh.tftpl");
     let names = emf_declared_names(&user_data, "metric_selectors");
     assert_eq!(
         names.len(),
-        26,
-        "Z+ L2 VERIFY ratchet: expected exactly 26 names in the MAIN EMF \
+        29,
+        "Z+ L2 VERIFY ratchet: expected exactly 29 names in the MAIN EMF \
          metric_selectors list (24 post-#1437 groww feed-down alerting + 2 \
          silent-feed lag names 2026-07-06 + 1 groww lag gauge 2026-07-11 \
-         scoreboard PR-C - 1 order-update gauge removed 2026-07-14 M4); \
+         scoreboard PR-C - 1 order-update gauge removed 2026-07-14 M4 + 3 \
+         order-side names 2026-07-14: tv_circuit_breaker_state, \
+         tv_daily_pnl, tv_order_placement_last_ms); \
          found {}: {names:?}",
         names.len()
     );
@@ -494,6 +501,71 @@ fn test_second_emf_declaration_publishes_boundary_catchup_per_feed() {
              must ITSELF carry dimensions [[\"host\", \"feed\"]] + the anchored single-name \
              selector (the boundary_catchup_storm_dhan alarm keys on {{ host, feed = dhan }}):\n{}",
             catchup[0]
+        );
+    }
+}
+
+#[test]
+fn test_third_emf_declaration_publishes_orders_placed_per_mode() {
+    // 2026-07-14 (DHAN order-side alerting): tv_orders_placed_total MUST be
+    // published under dimensions [host, mode] via a THIRD metric_declaration
+    // in BOTH agent configs — the orders_placed_live tripwire alarm keys on
+    // { host, mode = "live" }. Per-mode is Rule-11-mandatory: a host-only
+    // folded series would blend paper+live and page on paper-order storms
+    // (or mask a live order under paper volume). Same reshuffle-vacuity
+    // hardening as the boundary-catchup round-2 fix: selector ↔ dimensions
+    // are bound WITHIN one declaration object.
+    for rel in [
+        "deploy/aws/terraform/user-data.sh.tftpl",
+        "deploy/aws/cloudwatch-agent.json",
+    ] {
+        let body = read(rel);
+        assert!(
+            body.contains("\"dimensions\": [[\"host\", \"mode\"]]"),
+            "Z+ L2 VERIFY ratchet: {rel} must carry the THIRD metric_declaration with \
+             dimensions [[\"host\", \"mode\"]] — the per-mode orders-placed export."
+        );
+        assert!(
+            body.contains("\"metric_selectors\": [\"^tv_orders_placed_total$\"]"),
+            "Z+ L2 VERIFY ratchet: {rel} must select ^tv_orders_placed_total$ in the \
+             per-mode declaration — without it the orders-placed-live alarm evaluates \
+             against a permanently-empty metric."
+        );
+        // Must NOT also fold host-only (double-publish + mode blending).
+        let main_names = emf_declared_names(&body, "metric_selectors");
+        assert!(
+            !main_names.iter().any(|n| n == "tv_orders_placed_total"),
+            "Z+ L2 VERIFY ratchet: {rel} must NOT list tv_orders_placed_total in the \
+             MAIN host-only declaration — it publishes ONLY under [host, mode]."
+        );
+        // Bind selector ↔ dimensions within ONE declaration object, and
+        // require the declaration array to actually carry >= 3 objects.
+        let decls = emf_declaration_objects(&body);
+        assert!(
+            decls.len() >= 3,
+            "parser self-check: expected >= 3 metric_declaration objects in {rel}, found {} — \
+             the [host, mode] third declaration is missing or the array collapsed",
+            decls.len()
+        );
+        let placed: Vec<&String> = decls
+            .iter()
+            .filter(|d| d.contains("tv_orders_placed_total"))
+            .collect();
+        assert_eq!(
+            placed.len(),
+            1,
+            "Z+ L2 VERIFY ratchet: {rel} must have EXACTLY ONE metric_declaration selecting \
+             tv_orders_placed_total (found {}) — a second declaration (e.g. host-only) \
+             would double-publish or fold the per-mode series",
+            placed.len()
+        );
+        assert!(
+            placed[0].contains("\"dimensions\": [[\"host\", \"mode\"]]")
+                && placed[0].contains("\"metric_selectors\": [\"^tv_orders_placed_total$\"]"),
+            "Z+ L2 VERIFY ratchet: {rel} — the declaration selecting tv_orders_placed_total \
+             must ITSELF carry dimensions [[\"host\", \"mode\"]] + the anchored single-name \
+             selector (the orders_placed_live alarm keys on {{ host, mode = live }}):\n{}",
+            placed[0]
         );
     }
 }
@@ -1181,7 +1253,36 @@ fn test_boundary_catchup_alarm_uses_per_feed_dimensions() {
 }
 
 #[test]
-fn test_app_alarms_count_is_twenty_two() {
+fn test_orders_placed_live_alarm_uses_per_mode_dimensions() {
+    // 2026-07-14 (DHAN order-side alerting) — Rule-11 pin, the
+    // boundary-catchup per-feed precedent: the live-order tripwire must key
+    // on the EXPLICIT { host, mode = "live" } dimensions map — NOT
+    // local.app_dimensions (host-only). A host-only series folds paper +
+    // live: paper-order storms would page, and a single live order (the
+    // sandbox-breach signal this alarm exists for) could hide under paper
+    // volume.
+    let tf = read("deploy/aws/terraform/app-alarms.tf");
+    let block = alarm_resource_block(&tf, "orders_placed_live");
+    assert!(
+        block_has_attr(&block, "host", "\"tickvault-prod\"")
+            && block_has_attr(&block, "mode", "\"live\""),
+        "orders_placed_live must carry the explicit {{ host, mode = live }} \
+         dimensions map:\n{block}"
+    );
+    assert!(
+        !block.contains("local.app_dimensions"),
+        "orders_placed_live must NOT use local.app_dimensions (host-only folding \
+         blends paper+live order modes)"
+    );
+    assert!(
+        block_has_attr(&block, "statistic", "\"Sum\"") && block_has_attr(&block, "period", "300"),
+        "orders_placed_live must evaluate Sum/300s — the CW agent ships counters \
+         as per-scrape DELTAS, so Sum over 5m IS increase(5m) (Rule 12)"
+    );
+}
+
+#[test]
+fn test_app_alarms_count_is_twenty_six() {
     // Pin the count so future PRs that delete an alarm without updating
     // the rule files / PR body fail this guard. Cost note (aws-budget.md)
     // depends on this number — keeping the budget honest means keeping
@@ -1235,10 +1336,20 @@ fn test_app_alarms_count_is_twenty_two() {
     // — deleted with the order-update WS spawn; the alarm was
     // missing-data-blind on dhan-off boots). Cost: -1 alarm (~-$0.10/mo)
     // — dated note in app-alarms.tf output description.
+    // 26 (was 22) since 2026-07-14 (DHAN order-side alerting, noise-lock
+    // §2.1 grant): added `tv_orders_placed_total` (alarm
+    // tv-<env>-orders-placed-live — the mode="live" sandbox-breach
+    // tripwire), `tv_circuit_breaker_state` (tv-<env>-circuit-breaker-open,
+    // dual-route with the OMS-GAP-03 errcode alarm), `tv_daily_pnl`
+    // (tv-<env>-daily-pnl-breach, ≤ -20000 Minimum/300s — the RISK-GAP-01
+    // backstop) and `tv_order_placement_last_ms`
+    // (tv-<env>-order-latency-high, >5000ms Maximum). All 4 PLAIN alarms
+    // (R1 killed the metric-math variant), all dormant/notBreaching. Cost:
+    // +4 alarms (~+$0.40/mo) — dated COST NOTE in aws-budget.md.
     let count = alarm_metric_names().len();
     assert_eq!(
-        count, 22,
-        "Z+ L2 VERIFY ratchet: expected exactly 22 app-level CloudWatch alarm \
+        count, 26,
+        "Z+ L2 VERIFY ratchet: expected exactly 26 app-level CloudWatch alarm \
          metric_name entries across app-alarms.tf + silent-feed-alarms.tf \
          (one per critical app signal; tv_realtime_guarantee_score counts twice — \
          critical + degraded). Found {count}. If you intentionally added \

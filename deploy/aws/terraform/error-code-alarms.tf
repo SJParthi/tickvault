@@ -45,6 +45,13 @@
 #
 # 2026-07-14 UPDATE (operator Dhan noise lock): -1 entry (REST-CANARY-01
 # retired with the canary module) -> 9 filters + 9 alarms (~-$0.10/mo).
+#
+# 2026-07-14 UPDATE (order-side alerting): +3 entries (OMS-GAP-03/04,
+# RISK-GAP-01) -> 12 filters + 12 alarms (~+$0.30/mo). All three are
+# STRUCTURALLY DORMANT today (the OMS is never instantiated with
+# dhan_enabled=false + dry_run=true) — sparse metrics, notBreaching,
+# zero pages until Cluster A revives order flow. Grant: noise-lock §2.1
+# (dhan-rest-only-noise-lock-2026-07-14.md).
 # =============================================================================
 
 locals {
@@ -83,6 +90,12 @@ locals {
   # (operator Dhan noise lock - dhan-rest-only-noise-lock-2026-07-14.md):
   # the retained spot-1m + option-chain legs self-detect a dead Dhan REST
   # surface within ~3-4 min via their own escalation edges.
+  # 2026-07-14 order-side additions: oms-gap-03 (ok_recovery=false —
+  # CAS-gated once-per-episode CB-open edge; real recovery =
+  # tv_circuit_breaker_state->0 + the CircuitBreakerClosed Telegram),
+  # oms-gap-04 (ok_recovery=true — fires per denied order, repeat-emitter
+  # during a storm), risk-gap-01 (ok_recovery=false — the halt persists
+  # until reset_daily/manual reset; once-per-trigger emit).
   error_code_alerts = {
     "dh-901" = {
       pattern     = "{ $.code = \"DH-901\" && $.level = \"ERROR\" }"
@@ -220,6 +233,41 @@ locals {
       ok_recovery = false # 2026-07-10: once-per-episode emitter - the auto-OK ~15 min later only means the datapoint aged out while the table may still be suspended (Rule-11 false-recovery; ws-reinject-01 precedent)
       desc        = "WAL-SUSPEND-01: a QuestDB table's WAL apply is SUSPENDED - ingestion keeps ACKing rows while they silently stop becoming visible/applied (silent data-visibility loss; typical cause = a disk-full episode or a WAL apply error). Operator action: read the table/error_tag/error_message fields in the errors-jsonl stream, fix the underlying cause (df -h /data, QuestDB logs), then run ALTER TABLE <table> RESUME WAL in the QuestDB console - NEVER auto-executed (resuming into a still-broken disk replays the failure). NO recovered/OK page: the code fires once per suspension episode; recovery signal = the falling-edge recovery log + tv_questdb_wal_suspended_tables returning to 0. Runbook: .claude/rules/project/wal-suspension-error-codes.md"
     }
+    # OMS-GAP-03 / OMS-GAP-04 / RISK-GAP-01 (added 2026-07-14 — the DHAN
+    # order-side alert family, noise-lock §2.1 grant): all three dormant
+    # today (the OMS is never instantiated with dhan_enabled=false +
+    # dry_run=true). Emit sites: OMS-GAP-03 =
+    # crates/trading/src/oms/circuit_breaker.rs:148 (pre-existing);
+    # OMS-GAP-04 + RISK-GAP-01 = the app-side alert bridge
+    # crates/app/src/oms_alert_bridge.rs (this PR). Runbook for all
+    # three: .claude/rules/project/gap-enforcement.md.
+    "oms-gap-03" = {
+      pattern     = "{ $.code = \"OMS-GAP-03\" && $.level = \"ERROR\" }"
+      period      = 300
+      threshold   = 1
+      eval        = 3
+      dta         = 1
+      ok_recovery = false # CB-open is a CAS-gated once-per-episode edge (circuit_breaker.rs:145-148); auto-OK != breaker closed - real recovery = tv_circuit_breaker_state->0 + the CircuitBreakerClosed Telegram (Rule-11)
+      desc        = "OMS-GAP-03: circuit breaker OPEN — Dhan API failures exceeded threshold; ALL order submissions blocked. Dual-routed with the tv_circuit_breaker_state metric alarm. Runbook: .claude/rules/project/gap-enforcement.md"
+    }
+    "oms-gap-04" = {
+      pattern     = "{ $.code = \"OMS-GAP-04\" && $.level = \"ERROR\" }"
+      period      = 300
+      threshold   = 1
+      eval        = 3
+      dta         = 1
+      ok_recovery = true # fires per denied order = repeat-emitter during a storm; OK genuinely ~= storm stopped (dh-901/ws-gap-07 class)
+      desc        = "OMS-GAP-04: SEBI order rate limit exhausted — order denied, NEVER auto-retried (regulatory). Emitted by the app-side alert bridge. Runbook: .claude/rules/project/gap-enforcement.md"
+    }
+    "risk-gap-01" = {
+      pattern     = "{ $.code = \"RISK-GAP-01\" && $.level = \"ERROR\" }"
+      period      = 300
+      threshold   = 1
+      eval        = 3
+      dta         = 1
+      ok_recovery = false # halt persists until reset_daily/manual reset; once-per-trigger emit; auto-OK while halted = Rule-11 false recovery
+      desc        = "RISK-GAP-01: risk engine HALTED trading (daily-loss breach / manual halt) — all orders rejected until operator/daily reset. Dual-routed with the tv_daily_pnl backstop alarm. Runbook: .claude/rules/project/gap-enforcement.md"
+    }
   }
 }
 
@@ -256,7 +304,8 @@ resource "aws_cloudwatch_metric_alarm" "error_code" {
   # deliberately NO dimensions (see filter comment)
   alarm_actions = local.app_alarm_actions
   # ok_recovery = false (ws-reinject-01, proc-01, dh-906,
-  # aggregator-drop-01 [2026-07-09], wal-suspend-01 [2026-07-10];
+  # aggregator-drop-01 [2026-07-09], wal-suspend-01 [2026-07-10],
+  # oms-gap-03 + risk-gap-01 [2026-07-14 order-side];
   # rest-canary-01 retired 2026-07-14 -
   # the one-shot/discrete emitters) suppresses the OK page: their auto-OK
   # ~15 min after the datapoint ages out would be a Rule-11 false
@@ -269,9 +318,10 @@ resource "aws_cloudwatch_metric_alarm" "error_code" {
   # INSUFFICIENT_DATA -> OK on its first evaluation. CloudWatch invokes
   # ok_actions on ANY transition into OK, and the telegram-webhook Lambda
   # formats every OK as a green message (it reads only NewStateValue - no
-  # OldStateValue filter). Expect up to ~5 one-time green "recovered" pages
-  # the apply evening (canonical count, round-14): the 4 ok_recovery=true
-  # codes here (dh-901, auth-gap-04, ws-gap-07, feed-stall-01) +
+  # OldStateValue filter). Expect up to ~6 one-time green "recovered" pages
+  # the apply evening (canonical count, round-14; +1 on 2026-07-14 for the
+  # order-side oms-gap-04 repeat-emitter): the 5 ok_recovery=true
+  # codes here (dh-901, auth-gap-04, ws-gap-07, feed-stall-01, oms-gap-04) +
   # feed-stall-restarts. Exempt: the reconnect-storm alarm via
   # actions_enabled=false, and BOTH AWS/Lambda Errors watchman alarms
   # (readiness-errors + market-hours-gate-errors) via ok_actions=[]

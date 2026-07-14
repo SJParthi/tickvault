@@ -61,6 +61,27 @@ effective contract lives in `daily-universe-scope-expansion-2026-05-27.md` §7
 --ebs-size 50` (online) — terraform's `ebs_gp3_size_gb=50` documents
 fresh-provision intent only (`volume_size` is in `lifecycle.ignore_changes`).
 
+## COST NOTE 2026-07-14 — DHAN order-side alerting (dormant; +$0.70/mo now, ~$2.20/mo once live)
+
+The order-side alert surface (order-alerting PR, cluster B of the Dhan order
+build) added, per `deploy/aws/terraform/error-code-alarms.tf` (+3 entries:
+OMS-GAP-03 / OMS-GAP-04 / RISK-GAP-01) + `app-alarms.tf` (+4 alarms:
+orders-placed-live tripwire {host,mode="live"}, circuit-breaker-open,
+daily-pnl-breach ≤ −₹20,000, order-latency-high >5s):
+
+- **+7 alarms ≈ $0.70/mo — bills unconditionally now.**
+- **+5 custom-metric series — $0/mo while dormant** (an unemitted series never
+  bills; OMS is never instantiated with dhan_enabled=false + dry_run=true):
+  decl-1 +3 (tv_circuit_breaker_state, tv_daily_pnl, tv_order_placement_last_ms)
+  + decl-3 ×2 (tv_orders_placed_total mode=paper/live) ≈ **$1.50/mo once
+  Cluster A revives order flow**; the tv_errcode_* filter metrics are sparse ≈ $0.
+- Dashboard #3 (tv-<env>-orders) = ₹0 (3rd and last free-tier slot).
+
+Total ≈ **$0.70/mo pre-GST now (~₹60/mo incl. 18% GST @ ₹85/$) → ~$2.20/mo
+once live (~₹190/mo)** — inside the budget alarm ceiling and the ~₹3,101/mo
+envelope. All 7 alarms treat_missing_data = notBreaching (dormant ⇒ OK, no
+deploy pages).
+
 ## OPERATOR DECISION 2026-05-20 — Observability stack → CloudWatch-only
 
 > **Operator (Parthiban), 2026-05-20:** "except questdb app and cloud

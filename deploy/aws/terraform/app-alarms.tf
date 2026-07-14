@@ -1,11 +1,14 @@
 # App-level CloudWatch alarms — Z+ L2 VERIFY layer.
 #
 # The 5 alarms in alarms.tf cover infrastructure (EC2 status, CPU, EBS,
-# network). The 20 alarms in THIS file (21 until the 2026-07-14 Dhan noise
-# lock retired order_update_ws_inactive) cover application signals: WebSocket
+# network). The 24 alarms in THIS file (20 until the 2026-07-14 order-side
+# alerting added 4; 21 until the 2026-07-14 Dhan noise lock retired
+# order_update_ws_inactive) cover application signals: WebSocket
 # health, QuestDB connectivity, token lifecycle, tick freshness, order
 # rejection, aggregator liveness, backpressure, clock drift, composite SLO
-# score. 4 more silent-feed alarms live in silent-feed-alarms.tf
+# score, and the DHAN order-side family (live-order tripwire, circuit
+# breaker, daily P&L, order latency — all dormant behind the OFF switch).
+# 4 more silent-feed alarms live in silent-feed-alarms.tf
 # (2026-07-06 incident hardening + scoreboard PR-C S4).
 #
 # Charter authority: operator-charter-forever.md §C row "100% monitoring"
@@ -48,6 +51,14 @@
 #     free) × $0.30 = $5.70/mo ⇒ ~$7.60/mo ≈ ₹650/mo total (matches the
 #     app_cloudwatch_alarms output below + aws-budget.md's 2026-07-06
 #     note). Operator MUST acknowledge before terraform apply.
+#   - 2026-07-14 (order-side alerting, noise-lock §2.1): +4 alarms in THIS
+#     file (orders-placed-live tripwire {host,mode="live"},
+#     circuit-breaker-open, daily-pnl-breach, order-latency-high) + 3
+#     errcode alarms in error-code-alarms.tf ≈ +$0.70/mo billed now; EMF
+#     decl-1 grows 26 -> 29 names + a THIRD [host,mode] declaration for
+#     tv_orders_placed_total (paper/live) — all 5 new series DORMANT
+#     (unemitted = $0) until Cluster A revives order flow (~+$1.50/mo
+#     then). Dated COST NOTE in aws-budget.md.
 
 locals {
   # All alarms publish to the same SNS topic. Single source of truth so
@@ -451,6 +462,103 @@ resource "aws_cloudwatch_metric_alarm" "orders_rejected" {
 }
 
 # ---------------------------------------------------------------------------
+# 10b-10e. DHAN order-side alerting (2026-07-14, noise-lock §2.1 grant).
+# All 4 DORMANT today (the OMS is never instantiated with dhan_enabled=false
+# + dry_run=true): treat_missing_data = notBreaching means they sit OK on
+# missing data — zero deploy pages, zero cost while unemitted. ALWAYS ARMED
+# (not window-gated): a 5 AM order event is MORE alarming, not less — the
+# orders_rejected precedent above.
+# ---------------------------------------------------------------------------
+
+# 10b. Live-order tripwire — ANY mode="live" order placement pages. While
+# dry_run should be true, a live order is a sandbox-breach signal (the
+# DH-906 pre-armed-tripwire class). Reads the per-mode series from the
+# THIRD [host,mode] EMF declaration — NOT local.app_dimensions (host-only
+# folding would blend paper+live and page on paper storms).
+resource "aws_cloudwatch_metric_alarm" "orders_placed_live" {
+  alarm_name          = "tv-${var.environment}-orders-placed-live"
+  alarm_description   = "A LIVE-mode order was placed (mode=live series of tv_orders_placed_total). While the paper-trading lock is on, ANY live order is a sandbox-breach tripwire — investigate immediately. Paper-order volume is dashboard-visible, never paged. NO recovered/OK page: an order placement is a discrete event (Rule-11)."
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  evaluation_periods  = 1
+  metric_name         = "tv_orders_placed_total"
+  namespace           = local.app_namespace
+  period              = 300
+  statistic           = "Sum"
+  threshold           = 1
+  treat_missing_data  = "notBreaching"
+  dimensions = {
+    host = "tickvault-prod"
+    mode = "live"
+  }
+  alarm_actions = local.app_alarm_actions
+  # No ok_actions — a discrete event; auto-OK would be a Rule-11 false page.
+}
+
+# 10c. Circuit breaker OPEN — dual-route with the OMS-GAP-03 errcode
+# log-filter alarm (error-code-alarms.tf; the AGGREGATOR-DROP-01
+# dual-route precedent). The gauge genuinely returns to 0=Closed
+# (circuit_breaker.rs sets 0/1/2 at :90/:145/:94), so ok_actions is the
+# honest recovery signal here.
+resource "aws_cloudwatch_metric_alarm" "circuit_breaker_open" {
+  alarm_name          = "tv-${var.environment}-circuit-breaker-open"
+  alarm_description   = "OMS circuit breaker is OPEN (tv_circuit_breaker_state >= 1: 1=Open, 2=HalfOpen) — consecutive Dhan API failures; ALL order submissions blocked. Dual-routed with the tv-<env>-errcode-oms-gap-03 log-filter alarm. Recovery = the gauge returning to 0 (Closed)."
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  evaluation_periods  = 1
+  metric_name         = "tv_circuit_breaker_state"
+  namespace           = local.app_namespace
+  period              = 300
+  statistic           = "Maximum"
+  threshold           = 1
+  treat_missing_data  = "notBreaching"
+  dimensions          = local.app_dimensions
+  alarm_actions       = local.app_alarm_actions
+  ok_actions          = local.app_alarm_ok
+}
+
+# 10d. Daily P&L breach backstop — a PLAIN alarm on the tv_daily_pnl gauge
+# (risk/engine.rs::total_unrealized_pnl emits realized + unrealized, the
+# exact check_order halt comparand). Independent backstop for the
+# RISK-GAP-01 halt page.
+# -20000 = -(config/base.toml [risk] max_daily_loss_percent 2.0% ×
+# [strategy] capital 1_000_000) = RiskEngine::max_daily_loss_amount(); a
+# base.toml change without a tf edit silently drifts this backstop (the
+# app-side RISK-GAP-01 halt keeps tracking config).
+resource "aws_cloudwatch_metric_alarm" "daily_pnl_breach" {
+  alarm_name          = "tv-${var.environment}-daily-pnl-breach"
+  alarm_description   = "Daily P&L (realized + unrealized) breached the -20,000 rupee daily-loss threshold. The app-side risk engine halts trading independently (RISK-GAP-01); this is the CloudWatch backstop. NO recovered/OK page: a loss does not recover because the datapoint aged out (Rule-11)."
+  comparison_operator = "LessThanOrEqualToThreshold"
+  evaluation_periods  = 1
+  metric_name         = "tv_daily_pnl"
+  namespace           = local.app_namespace
+  period              = 300
+  statistic           = "Minimum"
+  threshold           = -20000
+  treat_missing_data  = "notBreaching"
+  dimensions          = local.app_dimensions
+  alarm_actions       = local.app_alarm_actions
+  # No ok_actions — a realized loss is not undone by datapoint aging.
+}
+
+# 10e. Order placement latency — last-sample ms gauge beside the ns
+# histogram (the histogram stays /metrics-only forensic truth). 5s =
+# HTTP-timeout class (the clock_skew_high gauge-alarm precedent).
+resource "aws_cloudwatch_metric_alarm" "order_latency_high" {
+  alarm_name          = "tv-${var.environment}-order-latency-high"
+  alarm_description   = "Last order placement took > 5s (tv_order_placement_last_ms) — HTTP-timeout class; Dhan REST or the network path is degraded. Last-sample gauge: a fast order after a slow one hides the slow one within a scrape — the /metrics ns histogram is the forensic truth."
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 1
+  metric_name         = "tv_order_placement_last_ms"
+  namespace           = local.app_namespace
+  period              = 300
+  statistic           = "Maximum"
+  threshold           = 5000
+  treat_missing_data  = "notBreaching"
+  dimensions          = local.app_dimensions
+  alarm_actions       = local.app_alarm_actions
+  ok_actions          = local.app_alarm_ok
+}
+
+# ---------------------------------------------------------------------------
 # 11. Composite real-time guarantee score critical (< 0.80)
 #
 # MARKET-HOURS-GATED (2026-07-03, 5 AM false-SOS fix): the SLO score is
@@ -710,7 +818,7 @@ resource "aws_cloudwatch_metric_alarm" "mem_used_high" {
 # ---------------------------------------------------------------------------
 
 output "app_cloudwatch_alarms" {
-  description = "20 application-level alarms in THIS file (18 Prometheus-via-CW-agent incl. #1437's 2 groww alarms + 1 disk-used + 1 mem-used Metrics-Insights; order-update-ws-inactive RETIRED 2026-07-14 per dhan-rest-only-noise-lock-2026-07-14.md); 4 more silent-feed alarms live in silent-feed-alarms.tf (2026-07-06 incident hardening + scoreboard PR-C S4). tick-gap-instruments-silent was RETUNED 2026-07-06 (threshold 100 -> 40 PROVISIONAL, 10-of-12 min, market-hours-gated). Cost note (2026-07-06 groww feed-down alerting adds 2 alarms + 3 selected metrics; silent-feed hardening adds 3 alarms + 4 selected series; scoreboard PR-C S4 adds 1 lag alarm; 2026-07-14 removes order-update-ws-inactive + the reconnect-storm alarm ≈ -$0.20/mo): overage above the 10 free-tier alarms ≈ $1.70/mo + 29 selected custom-metric series ≈ $5.70/mo overage above the 10 free-tier metrics (≈ $8.70/mo absolute at ~$0.30 each; EMF name count pinned by cloudwatch_app_alarms_wiring.rs) ≈ $7.40/mo ≈ ₹630/mo total — well inside the $55 budget cap."
+  description = "24 application-level alarms in THIS file (22 Prometheus-via-CW-agent incl. #1437's 2 groww alarms + the 2026-07-14 order-side 4 [orders-placed-live tripwire, circuit-breaker-open, daily-pnl-breach, order-latency-high — dormant, notBreaching] + 1 disk-used + 1 mem-used Metrics-Insights; order-update-ws-inactive RETIRED 2026-07-14 per dhan-rest-only-noise-lock-2026-07-14.md); 4 more silent-feed alarms live in silent-feed-alarms.tf (2026-07-06 incident hardening + scoreboard PR-C S4). tick-gap-instruments-silent was RETUNED 2026-07-06 (threshold 100 -> 40 PROVISIONAL, 10-of-12 min, market-hours-gated). Cost note (2026-07-06 groww feed-down alerting adds 2 alarms + 3 selected metrics; silent-feed hardening adds 3 alarms + 4 selected series; scoreboard PR-C S4 adds 1 lag alarm; 2026-07-14 removes order-update-ws-inactive + the reconnect-storm alarm ≈ -$0.20/mo; 2026-07-14 order-side alerting adds 4 metric alarms here + 3 errcode alarms in error-code-alarms.tf ≈ +$0.70/mo now, +5 custom-metric series ≈ +$1.50/mo once order flow is live — dormant series bill $0): overage above the 10 free-tier alarms ≈ $2.40/mo + 29 selected custom-metric series ≈ $5.70/mo overage above the 10 free-tier metrics (≈ $8.70/mo absolute at ~$0.30 each; EMF name count pinned by cloudwatch_app_alarms_wiring.rs — 32 declared incl. the 3 dormant order-side names + the 2 [host,mode] series, of which the dormant 5 bill $0 today) ≈ $8.10/mo ≈ ₹690/mo total — well inside the $55 budget cap."
   value = [
     aws_cloudwatch_metric_alarm.disk_used_high.alarm_name,
     aws_cloudwatch_metric_alarm.mem_used_high.alarm_name,
@@ -731,5 +839,9 @@ output "app_cloudwatch_alarms" {
     aws_cloudwatch_metric_alarm.ws_reconnect_gap_high.alarm_name,
     aws_cloudwatch_metric_alarm.disk_watcher_respawn.alarm_name,
     aws_cloudwatch_metric_alarm.late_tick_after_boundary.alarm_name,
+    aws_cloudwatch_metric_alarm.orders_placed_live.alarm_name,
+    aws_cloudwatch_metric_alarm.circuit_breaker_open.alarm_name,
+    aws_cloudwatch_metric_alarm.daily_pnl_breach.alarm_name,
+    aws_cloudwatch_metric_alarm.order_latency_high.alarm_name,
   ]
 }

@@ -248,7 +248,9 @@ resource "aws_cloudwatch_dashboard" "operator" {
 # CloudWatch Dashboard #2 — dual-feed scoreboard live trends (scoreboard PR-C)
 # =============================================================================
 # Free tier: 3 dashboards; this is dashboard #2 of 3 (slot verified free
-# 2026-07-10, dual-feed scoreboard design §6). LIVE TRENDS ONLY — coverage,
+# 2026-07-10, dual-feed scoreboard design §6; slot #3 taken 2026-07-14 by
+# the orders dashboard below — still ₹0, all 3 free-tier slots used).
+# LIVE TRENDS ONLY — coverage,
 # blame and the daily verdict live in the 3:45 PM IST Telegram scorecard +
 # the QuestDB scoreboard tables (feed_scoreboard_daily / feed_episode_audit);
 # no fake CW series is charted for QuestDB-side data.
@@ -391,6 +393,178 @@ resource "aws_cloudwatch_dashboard" "scoreboard" {
         height = 2
         properties = {
           markdown = "**Coverage, blame and the daily verdict** live in the 3:45 PM IST Telegram scorecard + the QuestDB tables (`feed_scoreboard_daily` / `feed_coverage_daily` / `feed_episode_audit`) — per-instrument coverage is QuestDB-side data and is deliberately NOT re-published as CloudWatch series (zero extra EMF cost). This page is live trends only."
+        }
+      }
+    ]
+  })
+}
+
+# =============================================================================
+# CloudWatch Dashboard #3 — DHAN order desk (order-side alerting, 2026-07-14)
+# =============================================================================
+# Free tier: 3 dashboards; this is dashboard #3 of 3 (the LAST free slot —
+# still ₹0). EVERYTHING here is DORMANT today by design: the order engine is
+# never instantiated while dry_run=true + dhan_enabled=false, so every widget
+# is empty until Cluster A revives order flow. The text widget states that
+# honestly (Rule 11 — an empty chart must never read as a broken dashboard).
+#
+# Row 1: orders placed per-mode (the decl-3 [host,mode] series) | orders
+#        rejected | circuit-breaker state (annotations at 1=Open, 2=HalfOpen).
+# Row 2: tv_daily_pnl (Minimum, annotation at -20,000) | order latency
+#        last-sample (Maximum).
+# Row 3: the 3 errcode filter metrics (dimensionless, Sum) — OMS-GAP-03 /
+#        OMS-GAP-04 / RISK-GAP-01.
+# =============================================================================
+resource "aws_cloudwatch_dashboard" "orders" {
+  dashboard_name = "tv-${var.environment}-orders"
+
+  dashboard_body = jsonencode({
+    widgets = [
+      # ----- Row 0: headline honesty text -----
+      {
+        type   = "text"
+        x      = 0
+        y      = 0
+        width  = 24
+        height = 2
+        properties = {
+          markdown = "# 🔷 DHAN order desk (${var.environment})\nEverything here is OFF today by design: the order engine is behind the safety switch (paper-trading lock + Dhan feed off). Empty charts mean NO orders exist, not a broken dashboard. The first datapoint appears only when order flow is switched on."
+        }
+      },
+
+      # ----- Row 1: order flow + circuit breaker -----
+      {
+        type   = "metric"
+        x      = 0
+        y      = 2
+        width  = 8
+        height = 6
+        properties = {
+          title  = "Orders placed per mode (paper vs live)"
+          region = local.dash_region
+          view   = "timeSeries"
+          metrics = [
+            [local.dash_namespace, "tv_orders_placed_total", "host", "tickvault-prod", "mode", "paper"],
+            [local.dash_namespace, "tv_orders_placed_total", "host", "tickvault-prod", "mode", "live"]
+          ]
+          period = 300
+          stat   = "Sum"
+        }
+      },
+      {
+        type   = "metric"
+        x      = 8
+        y      = 2
+        width  = 8
+        height = 6
+        properties = {
+          title   = "Orders rejected (0 = none)"
+          region  = local.dash_region
+          view    = "timeSeries"
+          metrics = [[local.dash_namespace, "tv_orders_rejected_total", { stat = "Sum" }]]
+          period  = 300
+        }
+      },
+      {
+        type   = "metric"
+        x      = 16
+        y      = 2
+        width  = 8
+        height = 6
+        properties = {
+          title   = "Circuit breaker state (0=Closed 1=Open 2=HalfOpen)"
+          region  = local.dash_region
+          view    = "timeSeries"
+          metrics = [[local.dash_namespace, "tv_circuit_breaker_state"]]
+          period  = 60
+          stat    = "Maximum"
+          annotations = {
+            horizontal = [
+              { label = "Open (all orders blocked)", value = 1 },
+              { label = "Half-open (one probe allowed)", value = 2 }
+            ]
+          }
+        }
+      },
+
+      # ----- Row 2: P&L + latency -----
+      {
+        type   = "metric"
+        x      = 0
+        y      = 8
+        width  = 12
+        height = 6
+        properties = {
+          title   = "Daily P&L, rupees (realized + unrealized — halts trading at -20,000)"
+          region  = local.dash_region
+          view    = "timeSeries"
+          metrics = [[local.dash_namespace, "tv_daily_pnl"]]
+          period  = 300
+          stat    = "Minimum"
+          annotations = {
+            horizontal = [
+              { label = "daily-loss halt threshold", value = -20000 }
+            ]
+          }
+        }
+      },
+      {
+        type   = "metric"
+        x      = 12
+        y      = 8
+        width  = 12
+        height = 6
+        properties = {
+          title   = "Order placement time, last sample (ms — alarm at 5,000)"
+          region  = local.dash_region
+          view    = "timeSeries"
+          metrics = [[local.dash_namespace, "tv_order_placement_last_ms"]]
+          period  = 300
+          stat    = "Maximum"
+        }
+      },
+
+      # ----- Row 3: errcode pager activity (dimensionless filter metrics) -----
+      {
+        type   = "metric"
+        x      = 0
+        y      = 14
+        width  = 8
+        height = 6
+        properties = {
+          title   = "Circuit-breaker OPEN pages (OMS-GAP-03)"
+          region  = local.dash_region
+          view    = "timeSeries"
+          metrics = [[local.dash_namespace, "tv_errcode_oms_gap_03", { stat = "Sum" }]]
+          period  = 300
+        }
+      },
+      {
+        type   = "metric"
+        x      = 8
+        y      = 14
+        width  = 8
+        height = 6
+        properties = {
+          title   = "Rate-limit denial pages (OMS-GAP-04)"
+          region  = local.dash_region
+          view    = "timeSeries"
+          metrics = [[local.dash_namespace, "tv_errcode_oms_gap_04", { stat = "Sum" }]]
+          period  = 300
+        }
+      },
+      {
+        type   = "metric"
+        x      = 16
+        y      = 14
+        width  = 8
+        height = 6
+        properties = {
+          title   = "Risk-halt pages (RISK-GAP-01)"
+          region  = local.dash_region
+          view    = "timeSeries"
+          metrics = [[local.dash_namespace, "tv_errcode_risk_gap_01", { stat = "Sum" }]]
+          period  = 300
         }
       }
     ]

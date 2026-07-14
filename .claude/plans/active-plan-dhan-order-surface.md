@@ -235,10 +235,10 @@ Cluster B (the order-alerting PR; ticked progressively in its own diff):
 - [x] B3 — tv_daily_pnl (ONE line in total_unrealized_pnl after risk/engine.rs:300 — the :197 record_fill site is a borrow conflict, judged out) + tv_order_placement_last_ms beside both place_order histogram sites
   - Files: crates/trading/src/risk/engine.rs, crates/trading/src/oms/engine.rs
   - Tests: test_daily_pnl_gauge_is_realized_plus_unrealized, test_order_placement_last_ms_set_on_place
-- [ ] B4 — terraform: +3 error_code_alerts entries (OMS-GAP-03/04, RISK-GAP-01), +4 app-alarms (orders-placed-live {host,mode="live"}, circuit-breaker-open, daily-pnl-breach ≤ −20000, order-latency-high >5000ms), EMF decl-1 26→29 + NEW decl-3 [host,mode] in BOTH lockstep files, wiring.rs pins 26→29 / 22→26 + the 2 new mirror tests
+- [x] B4 — terraform: +3 error_code_alerts entries (OMS-GAP-03/04, RISK-GAP-01), +4 app-alarms (orders-placed-live {host,mode="live"}, circuit-breaker-open, daily-pnl-breach ≤ −20000, order-latency-high >5000ms), EMF decl-1 26→29 + NEW decl-3 [host,mode] in BOTH lockstep files, wiring.rs pins 26→29 / 22→26 + the 2 new mirror tests
   - Files: deploy/aws/terraform/error-code-alarms.tf, deploy/aws/terraform/app-alarms.tf, deploy/aws/terraform/user-data.sh.tftpl, deploy/aws/cloudwatch-agent.json, crates/common/tests/cloudwatch_app_alarms_wiring.rs
   - Tests: test_emf_metric_selectors_name_count_is_twenty_nine, test_app_alarms_count_is_twenty_six, test_third_emf_declaration_publishes_orders_placed_per_mode, test_orders_placed_live_alarm_uses_per_mode_dimensions
-- [ ] B5 — dashboard #3 (tv-<env>-orders) + rule/doc edits (noise-lock §2.1 dated amendment, observability-architecture.md paging paragraph, gap-enforcement.md dated notes, aws-budget.md COST NOTE)
+- [x] B5 — dashboard #3 (tv-<env>-orders) + rule/doc edits (noise-lock §2.1 dated amendment, observability-architecture.md paging paragraph, gap-enforcement.md dated notes, aws-budget.md COST NOTE)
   - Files: deploy/aws/terraform/dashboard.tf, .claude/rules/project/dhan-rest-only-noise-lock-2026-07-14.md, .claude/rules/project/gap-enforcement.md, .claude/rules/project/observability-architecture.md, .claude/rules/project/aws-budget.md
   - Tests: error_code_paging_filter_drift_guard (tf ⇔ doc ⇔ emit, bidirectional), error_code_rule_file_crossref
 
