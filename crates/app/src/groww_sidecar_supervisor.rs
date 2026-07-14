@@ -560,13 +560,24 @@ pub const SIDECAR_LINE_SIGNATURE_MAX_CHARS: usize = 160;
 /// a persistently-rejected child every ~5 minutes, and each fresh child gets a
 /// fresh latch, so a reject day would page ~12×/hour (~70 HIGH pages/session:
 /// pager fatigue, audit Rule 4). The page gate (a supervisor-lifetime
-/// last-page timestamp shared across children) bounds the SAME-condition page
-/// to at most one per this window; every suppressed episode still fires its
-/// per-line `error!` forwards, its FEED-REJECT-01 signature, and its
-/// feed-health marking — only the Telegram fan-out is cooled down. The
+/// last-page timestamp shared across children) bounds the SAME-condition
+/// notify() to at most one per this window; every suppressed episode still
+/// fires its per-line `error!` forwards, its FEED-REJECT-01 signature, and
+/// its feed-health marking — only the Telegram fan-out is cooled down. The
 /// ≥3-per-15-min restart-counter pager independently covers "it keeps
 /// failing".
-pub const GROWW_REJECT_PAGE_COOLDOWN_SECS: u64 = 1800;
+///
+/// 2026-07-14 (operator noise directive): reduced 1800 → 60s, aligned with
+/// the fleet 60s coalescer window. Page dedup is now OWNED by the
+/// `EpisodeFamily::GrowwFeed` one-bubble fold (`GrowwSidecarRejected`
+/// carries an `episode_key`, so recurrences become in-place edits — no
+/// push, no SMS); this gate remains ONLY as the transport-failure bound:
+/// if the episode's first page never lands (`message_id = None`), every
+/// subsequent reject takes `SendNewFallback` (a fresh send), and without
+/// an upstream bound that failure path would restore the storm. 60s caps
+/// notify() volume to ≤1/min regardless. NOT removed — ratcheted ≤60 by
+/// `test_should_page_reject_rising_edge_and_cooldown`.
+pub const GROWW_REJECT_PAGE_COOLDOWN_SECS: u64 = 60;
 
 /// Pure page-cooldown decision for the reject Telegram (2026-07-09 HIGH fix).
 /// `last_page_epoch_secs == 0` means no page has fired this supervisor
@@ -3422,10 +3433,16 @@ mod tests {
             1_000,
             GROWW_REJECT_PAGE_COOLDOWN_SECS
         ));
-        // Cooldown bound sanity: strictly above the never-streamed cadence so
-        // the fix actually bounds the storm, and at most one page per 30 min.
-        assert!(GROWW_REJECT_PAGE_COOLDOWN_SECS > FEED_NEVER_STREAMED_RESTART_SECS);
-        assert!(GROWW_REJECT_PAGE_COOLDOWN_SECS <= 3_600);
+        // Cooldown bound pin (2026-07-14 operator noise directive): the
+        // GrowwFeed episode fold now owns page dedup (recurrences are
+        // in-place bubble edits), so this gate is ONLY the transport-failure
+        // bound on the SendNewFallback path. It must stay ≤ 60s (aligned
+        // with the fleet 60s coalescer) so the bubble's occurrence counter
+        // keeps advancing — a future edit back toward the 30-min gap would
+        // silently starve the fold. And it must stay > 0 (the mechanism is
+        // KEPT, never removed).
+        assert!(GROWW_REJECT_PAGE_COOLDOWN_SECS <= 60);
+        assert!(GROWW_REJECT_PAGE_COOLDOWN_SECS > 0);
     }
 
     #[test]
