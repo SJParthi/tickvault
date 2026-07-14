@@ -304,3 +304,39 @@ pub struct LoginReq {
 7. **`Remarks: "Super Order"`** — indicates the order belongs to a Super Order group.
 
 8. **For tickvault monitoring phase**: Connect this WebSocket alongside market feed. Log all order updates for debugging without executing any orders.
+
+---
+
+## 2026-07-14 Upstream Update (runner-crawled live page) — dual-casing sample cluster + parser-note correction
+
+**Evidence tier: Verified-live.** Raw HTML of `https://dhanhq.co/docs/v2/order-update/`
+(runs 1–3, sha256 `424a29f2` content-identical, latest 2026-07-14T07:58:15Z), comment-aware.
+Full manifest: `00-COVERAGE-MANIFEST.md`.
+
+1. **The live sample JSON (§3's upstream counterpart) now OPENS with a camelCase DUPLICATE
+   cluster** ahead of the PascalCase fields — verbatim, rendered (not a comment):
+   `"series": "EQ", "goodTillDaysDate": "2024-09-11", "instrumentType": "EQ",
+   "refLtp": 13.21, "tickSize": 0.01, "algoId": "0", "multiplier": 1` — with Dhan's own
+   missing comma after `"multiplier": 1` — followed later by the PascalCase forms
+   (`"Series"`, `"GoodTillDaysDate"`, `"RefLtp"`, `"TickSize"`, `"AlgoId"`, `"Multiplier"`).
+   The documented PARAMETER TABLE remains PascalCase-only (incl. `RefLtp | float`,
+   `TickSize | float`). `instrumentType` appears ONLY in the camelCase cluster (no table row
+   anywhere) — likely the camelCase twin of `Instrument`. Real wire frames may carry
+   EITHER/BOTH casings.
+2. **Correction to the §5 struct note + the rule file's 2026-07-02 parenthetical:** the
+   PRODUCTION struct (`crates/common/src/order_types.rs:306-310`) parses `refLtp`/`tickSize`
+   with camelCase-ONLY `#[serde(rename)]` — the rule file's "our parser ignores both fields"
+   wording was factually WRONG about the parser (it parses the camelCase forms;
+   `#[serde(default)]` degrades the PascalCase-only case to None). The zero-IMPACT half
+   survives only because no consumer reads `ref_ltp`/`tick_size` for decisions. The §5 doc
+   struct here mirrors production. **Code follow-up (NOT this docs PR):** add
+   `#[serde(alias)]` for both casings on refLtp/tickSize (and audit
+   series/goodTillDaysDate/algoId/multiplier casing) in `order_types.rs` + the §5 doc struct.
+3. **`AlgoOrdNo` is typed `float` in the live table** (stable since the 2026-07-03 snapshot;
+   the sample value is empty) vs the repo/rule "string" — near-certainly an upstream typing
+   error (order numbers elsewhere are strings). Keep tolerant `Option<String>` parsing.
+4. Upstream sample malformations recorded so nobody "fixes" them into the repo: the missing
+   comma after `"multiplier": 1`; empty `"AlgoOrdNo": ,` / `"StrikePrice": ,`; the partner
+   auth sample's `"UserType: "PARTNER"` missing quote; the correlationId charset rendered
+   `[^a-zA-Z0-9 _-]` (the caret really is on the page — an upstream typo for the allowed
+   set; same literal across orders/slicing/super/forever/postback pages).

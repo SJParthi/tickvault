@@ -32,11 +32,6 @@ fn main_rs() -> String {
     std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {} failed: {e}", path.display()))
 }
 
-fn dhan_rest_stack_rs() -> String {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/dhan_rest_stack.rs");
-    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {} failed: {e}", path.display()))
-}
-
 /// Section A — `confirm_replayed` must be CALLED from at least two sites
 /// (the slow-boot tail + the fast-boot path). The function is defined in the
 /// storage crate, so every occurrence in `main.rs` is a call site.
@@ -75,58 +70,11 @@ fn both_paths_gate_confirm_on_a_reinjection_clean_flag() {
     );
 }
 
-/// Section C — order-runtime dry-run PR (2026-07-14): the dhan-OFF REST
-/// stack is the THIRD confirm site (the two main.rs sites above are both
-/// dhan-gated and dead on a dhan-off boot — the exact Phase-A residual the
-/// runtime's WAL drain closes). Its confirm MUST stay CONDITIONAL: gated by
-/// the pure `confirm_decision` verdict (parse-clean AND zero stale live-feed
-/// frames staged), with a loud coalesced defer arm — an UNCONDITIONAL
-/// whole-dir confirm would archive un-reinjected stale live-feed frames
-/// (silent tick loss, design F6).
-#[test]
-fn rest_stack_confirm_is_gated_on_confirm_decision() {
-    let body = dhan_rest_stack_rs();
-    let prod = tickvault_common::source_scan::production_region(&body)
-        .expect("dhan_rest_stack.rs must keep its test module"); // APPROVED: test
-    // M1 (fix-round 2026-07-14): textual PRECEDENCE is not GATING — the
-    // regression `let v = confirm_decision(..); confirm_replayed(..);
-    // if let Defer{..} = v { … }` (an UNCONDITIONAL confirm) passed the old
-    // precedence check. Pin CONTAINMENT instead: confirm_replayed occurs
-    // EXACTLY ONCE in production code, strictly INSIDE the slice between
-    // the `ConfirmVerdict::Confirm =>` match arm and the
-    // `ConfirmVerdict::Defer` arm.
-    let confirm_calls = prod
-        .matches("tickvault_storage::ws_frame_spill::confirm_replayed(")
-        .count();
-    assert_eq!(
-        confirm_calls, 1,
-        "dhan_rest_stack.rs production region must contain EXACTLY ONE \
-         confirm_replayed call (inside the Confirm verdict arm); found \
-         {confirm_calls}"
-    );
-    let decision = prod
-        .find("crate::order_runtime::confirm_decision(")
-        .expect("rest stack must route its confirm through confirm_decision (F6)"); // APPROVED: test
-    let confirm_arm = prod
-        .find("ConfirmVerdict::Confirm =>")
-        .expect("the Confirm match arm must exist"); // APPROVED: test
-    let defer_arm = prod
-        .find("ConfirmVerdict::Defer")
-        .expect("the Defer match arm must exist"); // APPROVED: test
-    let confirm_call = prod
-        .find("tickvault_storage::ws_frame_spill::confirm_replayed(")
-        .expect("confirm_replayed call present (counted above)"); // APPROVED: test
-    assert!(
-        decision < confirm_arm && confirm_arm < confirm_call && confirm_call < defer_arm,
-        "confirm_replayed @{confirm_call} must sit INSIDE the Confirm arm \
-         (decision @{decision} < Confirm-arm @{confirm_arm} < call < \
-         Defer-arm @{defer_arm}) — an unconditional confirm archives \
-         un-reinjected stale live-feed frames (silent tick loss)"
-    );
-    assert!(
-        prod.contains("metrics::counter!(\"tv_wal_confirm_deferred_total\")"),
-        "the defer counter disappeared — deferred confirms must be visible \
-         (warn-level by design: WS-REINJECT-01 has an ERROR-level CloudWatch \
-         alarm and a per-boot page for expected stale residue is pager noise)"
-    );
-}
+// Section C (the order-runtime dry-run PR's rest-stack conditional-confirm
+// pin) was REMOVED 2026-07-14 on the merge with main's #1532 Dhan noise
+// lock: the dhan-OFF REST stack no longer drains or confirms order-update
+// WAL segments at all (socket-free shape — the whole capture/drain/confirm
+// surface is gated behind a fresh dated operator quote per
+// dhan-rest-only-noise-lock-2026-07-14 §3). The two main.rs sites above are
+// the complete confirm surface again; the stack's WAL-free shape is pinned
+// by `test_rest_stack_wires_order_runtime` in dhan_rest_stack.rs.

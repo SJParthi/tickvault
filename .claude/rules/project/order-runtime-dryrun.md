@@ -1,21 +1,28 @@
-# Dry-Run Order Runtime — Error Codes, WAL Confirm Semantics & Pre-Live Follow-Ups
+# Dry-Run Order Runtime — Error Codes, Socket-Free Shape & Pre-Live Follow-Ups
 
 > **Authority:** CLAUDE.md > `operator-charter-forever.md` §C/§F >
-> `websocket-connection-scope-lock.md` (the 2026-07-13 Amendment — the
-> order-update WS stays inside `dhan_rest_stack`) > this file.
+> `websocket-connection-scope-lock.md` §A.1 +
+> `dhan-rest-only-noise-lock-2026-07-14.md` (the order-update spawn is
+> RETIRED; socket + WAL re-arm gated on a fresh dated quote) > this file.
 > **Operator authorization:** coordinator directive 2026-07-14 (cluster A —
 > order-side readiness audit): revive the dormant order machinery DRY-RUN
-> ONLY — fill bridge, unrealized-P&L lot_size fix, WAL drain + conditional
-> confirm, Groww mark tap, alert sinks. NO live orders.
+> ONLY — fill bridge, unrealized-P&L lot_size fix, Groww mark tap, alert
+> sinks. NO live orders. **SOCKET-FREE re-scope (same day):** the merge with
+> the operator Dhan noise lock (`dhan-rest-only-noise-lock-2026-07-14.md`)
+> CUT the order-update WS spawn and the order-update WAL capture/drain/
+> confirm from this PR — both are gated behind a fresh dated operator quote
+> (§2 below is the retained live re-arm spec).
 > **Companion code:** `crates/app/src/order_runtime.rs` (the single-owner
 > actor), `crates/app/src/oms_wiring.rs`, `crates/app/src/dhan_rest_stack.rs`
-> Phase 5a, the `groww_bridge.rs` mark tap,
+> Phase 5b, the `groww_bridge.rs` mark tap,
 > `crates/trading/src/oms/{engine,types}.rs` (`FillEvent`),
 > `crates/trading/src/risk/engine.rs` (`evaluate_daily_loss_halt`).
 > **Companion plan:** `.claude/plans/active-plan-order-runtime-dryrun.md`.
 > **Ratchets:** `crates/app/tests/order_runtime_spawn_site_guard.rs`,
-> `dhan_rest_stack.rs::test_rest_stack_wires_order_runtime`,
-> `crates/app/tests/wal_replay_confirm_symmetry_guard.rs` §C,
+> `dhan_rest_stack.rs::test_rest_stack_wires_order_runtime` (socket-free /
+> WAL-free positive pins) +
+> `test_rest_stack_spawns_no_order_update_ws_and_no_canary` (main's #1532
+> negative ratchet — the socket ban),
 > `crates/app/tests/dhat_mark_forward.rs`, `crates/app/benches/order_gate.rs`
 > (+ `order_gate_mark_forward` in `quality/benchmark-budgets.toml`).
 
@@ -24,10 +31,14 @@
 ## §0. What this is (one paragraph)
 
 With `[order_runtime].enabled = true` (base.toml ON; serde DEFAULT stays
-OFF — an absent section boots byte-identical to Phase A), the dhan-OFF REST
-stack's Phase 5a replaces the PR-C1 discard drain with a supervised
+OFF — an absent section boots byte-identical to the post-#1532 noise-lock
+shape), the dhan-OFF REST stack's Phase 5b spawns a supervised
 SINGLE-OWNER actor that owns an `OrderManagementSystem` (**dry_run
-hard-true — no HTTP order call can exist**) + a `RiskEngine`. It consumes
+hard-true — no HTTP order call can exist**) + a `RiskEngine`. SOCKET-FREE:
+no Dhan WebSocket is opened and no order-update WAL is captured/drained —
+the runtime's order-update broadcast has ZERO producers today (paper fills
+are synthesized in-actor; the gated live re-arm attaches the socket + WAL
+producers to this same channel). It consumes
 the order-update broadcast (Source=P filter), bridges fills into the risk
 book via the widened `handle_order_update → Result<Option<FillEvent>, _>`,
 consumes Groww marks through a bounded mpsc fed by an
@@ -44,14 +55,13 @@ new NotificationEvent variants.
 | Emit site | Level + code |
 |---|---|
 | Reconcile mismatch / local Σfills≠net_lots divergence / severe receiver lag / mark-apply anomaly (reconcile class) | `error!` OMS-GAP-02 |
-| Orphan fill-carrying update on an empty (fresh) book — the WAL-replay-across-restart shape | `warn!` OMS-GAP-02 + `tv_oms_orphan_fill_updates_total` |
+| Orphan fill-carrying update on an empty (fresh) book (unreachable until the live re-arm attaches producers; kept for the replay-across-restart shape) | `warn!` OMS-GAP-02 + `tv_oms_orphan_fill_updates_total` |
 | Order rejected (OMS alert sink) / partial-lot fill remainder floored (engine) | `error!` OMS-GAP-01 |
 | Circuit breaker opened (sink) | `error!` OMS-GAP-03 |
 | Rate-limit exhausted (sink) | `error!` OMS-GAP-04 |
 | Self-test failure / non-PAPER order id in dry-run / runtime respawn | `error!` OMS-GAP-06 |
 | Risk halt (sink + the `trigger_halt` code fix) | `error!` RISK-GAP-01 |
 | Sid-segment TRIPWIRE collision (see §3) / sid parse failure | `error!` RISK-GAP-02 |
-| WAL confirm DEFERRED (stale live-feed segments staged) | `warn!` WS-REINJECT-01, reason=`confirm_deferred_stale_livefeed` (NON-PAGING — see §2) |
 
 Telegram: the alert sinks map onto the 5 EXISTING NotificationEvent
 variants (OrderRejected, CircuitBreakerOpened/Closed, RateLimitExhausted,
@@ -61,40 +71,44 @@ RiskHalt). Metrics (all static labels): `tv_order_runtime_up`,
 `tv_paper_fills_synthesized_total`, `tv_paper_fills_deferred_total`,
 `tv_oms_reconcile_runs_total{mode}`,
 `tv_oms_local_reconcile_divergence_total`,
-`tv_paper_selftest_total{outcome}`, `tv_wal_confirm_deferred_total`,
-`tv_wal_replay_burst_total`, `tv_order_runtime_respawn_total{reason}`,
+`tv_paper_selftest_total{outcome}`, `tv_order_runtime_respawn_total{reason}`,
 `tv_order_update_receiver_lagged_total`.
 
-## §2. WAL confirm-defer semantics + the one-time stale-segment archive runbook
+## §2. GATED — the live re-arm follow-up spec (order-update socket + WAL + alarms)
 
-The order-update WAL frames staged by main.rs's STAGE-C boot replay were a
-Phase-A residual on every dhan-off boot: both drain sites (fast arm + lane)
-are dhan-gated, so segments sat in `replaying/` forever, re-globbed each
-boot. Phase 5a now drains them into the stack broadcast BEFORE the WS
-spawns (FIFO law F4; the runtime subscribed BEFORE the drain, law F5) and
-**conditionally** confirms:
+**NOT SHIPPED in this PR.** The merge with the 2026-07-14 operator Dhan
+noise lock (`dhan-rest-only-noise-lock-2026-07-14.md` §3 + scope-lock §A.1)
+cut the order-update WS spawn and the order-update WAL capture/drain/
+confirm from cluster A. This section is the retained spec so the live
+re-arm lands as ONE quoted follow-up unit — a single PR, gated on a fresh
+dated operator quote in the noise-lock file FIRST, re-arming together:
 
-- **Confirm** (`ws_frame_spill::confirm_replayed`, WHOLE-DIR) fires iff the
-  drain was parse-clean AND `livefeed_frames_replayed == 0`. A whole-dir
-  confirm while stale LIVE-FEED frames sit staged would archive them
-  un-reinjected — silent tick loss (design F6).
-- **Defer** fires ONE coalesced
-  `warn!(code = WS-REINJECT-01, reason = "confirm_deferred_stale_livefeed",
-  live_feed_frames, parse_errors)` + `tv_wal_confirm_deferred_total`.
-  `warn!` DELIBERATELY: WS-REINJECT-01 carries an ERROR-level CloudWatch
-  log-filter alarm, and a per-boot page for EXPECTED stale residue is pager
-  noise. The frames stay staged — re-replayed next boot, never lost.
-- Per-record-type confirm is IMPOSSIBLE (segment files mix record types);
-  documented, not worked around.
+1. **The order-update WS spawn** (`run_order_update_connection` from the
+   REST stack) with the runtime's broadcast sender wired as the consumer —
+   the runtime must subscribe BEFORE any producer starts (ordering law F5),
+   and the socket gets an explicit frame-size cap (~1 MiB) via
+   `WebSocketConfig` (tungstenite's None-config default is 64 MiB).
+2. **Durable WAL frame capture** (`wal_spill = Some(ws_frame_spill)`) + the
+   boot-staged order-update WAL drain into the broadcast BEFORE the socket
+   spawns (FIFO law F4), with the CONDITIONAL whole-dir confirm: confirm
+   iff the drain was parse-clean AND zero stale live-feed frames sit staged
+   (design F6 — a whole-dir confirm with stale live-feed segments staged
+   would archive them un-reinjected = silent tick loss); else ONE coalesced
+   non-paging `warn!(code = WS-REINJECT-01,
+   reason = "confirm_deferred_stale_livefeed")` + counter. Per-record-type
+   confirm is IMPOSSIBLE (segment files mix record types).
+3. **The two CloudWatch order-update alarms #1532 deleted** —
+   `tv-<env>-order-update-ws-inactive` +
+   `tv-<env>-order-update-reconnect-storm` (with its
+   `order_update_reconnections_fallback` log metric filter).
 
-**One-time operator archive procedure (clears a permanent Defer):** stop
-the app off-market; inspect `data/ws_wal/replaying/` — the stale live-feed
-segments predate the Dhan retirement (2026-07-13) and their ticks are
-already in QuestDB (DEDUP-idempotent replays); move the segment files to
-`data/ws_wal/archive/` manually (`mv data/ws_wal/replaying/*.wal
-data/ws_wal/archive/`); restart. Every subsequent boot confirms cleanly and
-`replaying/` stays empty. (A dhan-ON boot's live-feed re-injection would
-also clear them — not applicable while the lane is retired.)
+Until then: the boot-staged order-update WAL segments remain the documented
+Phase-A residual on dhan-off boots — undrained in `replaying/`, re-globbed
+each boot, zero loss. **One-time operator archive procedure (optional
+cleanup):** stop the app off-market; the stale segments in
+`data/ws_wal/replaying/` predate the Dhan retirement (2026-07-13) and their
+ticks are already in QuestDB (DEDUP-idempotent replays); move them aside
+(`mv data/ws_wal/replaying/*.wal data/ws_wal/archive/`); restart.
 
 ## §3. I-P1-11 tripwire deferral (dated justification, 2026-07-14)
 
@@ -163,11 +177,10 @@ MUST therefore include a cross-feed id MAPPING leg (contract identity per
 
 This rule activates when editing:
 - `crates/app/src/order_runtime.rs` or `crates/app/src/oms_wiring.rs`
-- `crates/app/src/dhan_rest_stack.rs` (Phase 5a)
+- `crates/app/src/dhan_rest_stack.rs` (Phase 5b)
 - `crates/trading/src/oms/engine.rs` / `types.rs` (FillEvent),
   `crates/trading/src/risk/engine.rs`
 - `crates/common/src/config.rs` (`OrderRuntimeConfig`) or `config/base.toml`
   `[order_runtime]`
 - Any file containing `spawn_order_runtime`, `MarkForwarder`, `FillEvent`,
-  `confirm_decision`, `tv_order_runtime_up`, or
-  `tv_wal_confirm_deferred_total`
+  or `tv_order_runtime_up`

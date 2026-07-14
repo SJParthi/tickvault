@@ -161,29 +161,21 @@ consumer-side acknowledgement watermark).
 
 ---
 
-## §1.5. 2026-07-14 Update — `reason = "confirm_deferred_stale_livefeed"` (warn-level, NON-PAGING)
+## §1.5. 2026-07-14 Update — the planned `confirm_deferred_stale_livefeed` defer arm was CUT (socket-free re-scope)
 
-The dry-run order runtime (order-runtime-dryrun PR, 2026-07-14 —
-`.claude/rules/project/order-runtime-dryrun.md`) added a THIRD confirm site:
-the dhan-OFF REST stack's Phase 5a drains the boot-staged ORDER-UPDATE WAL
-frames into the stack broadcast and then conditionally confirms via the pure
-`order_runtime::confirm_decision(parse_errors, livefeed_frames_replayed)`.
-When the verdict is Defer — the drain hit parse errors OR stale LIVE-FEED
-frames sit staged (the Phase-A dhan-off residual class, where a whole-dir
-confirm would archive them un-reinjected = silent tick loss) — the site
-emits ONE coalesced **`warn!`** carrying this code with
-`reason = "confirm_deferred_stale_livefeed"` + the
-`tv_wal_confirm_deferred_total` counter.
-
-**`warn!` DELIBERATELY, never `error!`:** WS-REINJECT-01 has an ERROR-level
-CloudWatch log-filter alarm (`tv-<env>-errcode-ws-reinject-01`), and a
-stale live-feed residual on a dhan-off boot is EXPECTED — a per-boot page
-for it is pager noise. The staged segments stay in `replaying/` (re-replayed
-next boot, zero loss); the one-time operator archive procedure in
-`order-runtime-dryrun.md` §2 clears them permanently. The §1 abort
-semantics (`channel_closed` / `send_timeout`, error-level, paging) are
-UNCHANGED. Ratchet:
-`crates/app/tests/wal_replay_confirm_symmetry_guard.rs::rest_stack_confirm_is_gated_on_confirm_decision`.
+The dry-run order runtime PR originally added a THIRD confirm site — the
+dhan-OFF REST stack draining boot-staged ORDER-UPDATE WAL frames into its
+broadcast with a conditional confirm (defer reason
+`confirm_deferred_stale_livefeed`, warn-level). That whole drain/confirm leg
+was CUT at the merge with the same-day operator Dhan noise lock
+(`dhan-rest-only-noise-lock-2026-07-14.md` §3 — the stack opens no
+order-update socket and touches no order-update WAL). The boot-staged
+order-update segments therefore remain the documented Phase-A residual on
+dhan-off boots (undrained in `replaying/`, zero loss, re-globbed each boot)
+until the gated live re-arm restores the socket + WAL capture + drain in
+one quoted follow-up unit. The §1 abort semantics (`channel_closed` /
+`send_timeout`, error-level, paging) are UNCHANGED; no new reason string
+exists in code today.
 
 ---
 

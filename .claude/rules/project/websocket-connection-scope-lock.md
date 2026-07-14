@@ -175,7 +175,7 @@ To add a new WS type or instrument class in a future phase:
 | Connection | State (2026-07-13) | Detail |
 |---|---|---|
 | **Dhan main-feed live WS** (`wss://api-feed.dhan.co`) | **RETIRED — deletion authorized** | Phase A (PR #1496) flipped `dhan_enabled = false` (base + production), revoked the PR-E runtime ON-half (API-side 409), and brought up the REST-only stack (`crates/app/src/dhan_rest_stack.rs`). The Phase C code PRs DELETE the lane: WS pool, subscription planner, `SubscriptionScope` enum, daily-universe fetch chain, tick-gap detector. Re-introduction requires a fresh dated operator quote HERE first (§D). |
-| **Dhan order-update WS** (`wss://api-order-update.dhan.co`) | **KEPT — functional-dormant inside `dhan_rest_stack`** (Q4-i) | Rewired in Phase C: spawned from `dhan_rest_stack` (which owns the TokenManager — JWT + dhanClientId are its only needs; MsgCode-42 JSON auth per `live-order-update.md`; zero instrument/universe/registry dependency, map §6 Verified). "Functional-dormant" = connected + authenticated, receiving order events for any order placed via REST; it carries NO market data and is NOT a live price feed. Its WAL replay staging (`ws_type=order_update`) is process-global and unaffected. |
+| **Dhan order-update WS** (`wss://api-order-update.dhan.co`) | **SPAWN RETIRED 2026-07-14 (module RETAINED DORMANT)** — supersedes the Q4-i functional-dormant KEEP | Per the §A.1 2026-07-14 subsection below: the `dhan_rest_stack` Phase 5a spawn is DELETED — no process opens this socket anymore. The core module `crates/core/src/websocket/order_update_connection.rs` (+ its unit tests) is RETAINED DORMANT for the future live-trading re-wire: re-spawning it OR deleting the module each requires a fresh dated operator quote HERE first. Historical Q4-i context: it was rewired into `dhan_rest_stack` by PR-C1 (2026-07-13), connected + authenticated, events counted-then-DISCARDED (no WAL, no OMS) — a daily socket to a demonstrably RST-flaky Dhan endpoint that protected nothing while dry_run=true, and the stack's ONLY HIGH-page noise source (WS-GAP-10). Its WAL replay staging (`ws_type=order_update`) is process-global and unaffected. |
 | **Groww live feed** (native NATS-over-WS, 1 connection) | **THE SOLE LIVE MARKET-DATA FEED** | Per `groww-second-feed-scope-2026-06-19.md` (contract unchanged) + `groww-scale-aws-lockout-2026-07-06.md` (1 connection). Same WAL→ring→spill→DLQ→aggregator chain, rows tagged `feed='groww'`. |
 | **Dhan REST retained surface** | KEPT (not a WS) | Token/auth stack + per-minute `spot_1m_rest` + per-minute `option_chain_1m` (+ probe) + historical, per `no-rest-except-live-feed-2026-06-27.md` §8; SIDs are the HARDCODED `SPOT_1M_REST_INDICES` (NIFTY=13, BANKNIFTY=25, SENSEX=51 — `constants.rs`), per Q3 verbatim intent. Lock semantics: `dual-instance-lock-2026-07-04.md` §3.5. |
 | **GDF (feed #3)** | Separate lock — NOT governed here | `gdf-third-feed-scope-2026-07-13.md` (default OFF, trial-first). This amendment deliberately leaves the pluggable seam clean for it: `FeedsConfig`, feed-in-key shared tables, WAL/ring/spill/aggregator are all UNTOUCHED by the Dhan deletions. |
@@ -201,19 +201,50 @@ as historical audit; THIS table is the effective contract.
 > boot-staged order-update WAL segments remain undrained on dhan-off boots (pre-existing
 > Phase A residual, C2 target).
 >
-> **2026-07-14 Amendment (order-runtime dry-run PR — SUPERSEDES the dormancy-honesty
-> wording above for `[order_runtime].enabled = true`, the base.toml default):** the
-> Phase 5a discard drain is replaced by the DRY-RUN ORDER RUNTIME
-> (`.claude/rules/project/order-runtime-dryrun.md`): incoming order-update frames are now
-> CONSUMED by the runtime's paper OMS + RiskEngine (Source=P filtered; dry_run hard-true
-> — still ZERO live orders, the WS carries no market data, the connection count is
-> unchanged at ≤1 Dhan WS), durable WAL frame capture is RESTORED (`wal_spill = Some`),
-> and the boot-staged order-update WAL segments are DRAINED into the stack broadcast +
-> conditionally confirmed (parse-clean AND zero stale live-feed frames — else a
-> non-paging WS-REINJECT-01 `warn!` defer; the Phase-A residual is thereby closed for
-> order-update segments). With `enabled = false` (the serde default — an absent config
-> section) the PR-C1 dormant shape above remains byte-identical, ratcheted by
-> `test_rest_stack_wires_order_runtime`'s disabled-branch pins.
+> **2026-07-14 Amendment (order-runtime dry-run PR — SOCKET-FREE under the same-day
+> §A.1 noise lock):** with `[order_runtime].enabled = true` (base.toml ON; the serde
+> default stays OFF) the dhan-OFF REST stack spawns the DRY-RUN ORDER RUNTIME
+> (`.claude/rules/project/order-runtime-dryrun.md`) — a paper OMS + RiskEngine fed by
+> paper fills and Groww marks, `dry_run` hard-true, ZERO live orders. It opens NO Dhan
+> WebSocket and performs NO order-update WAL capture/drain: the runtime's order-update
+> broadcast channel is created with ZERO producers, honoring the §A.1 spawn retirement.
+> The LIVE RE-ARM is one quoted follow-up unit — (1) the order-update socket spawn with
+> the runtime consumer wired, (2) durable WAL frame capture + the boot drain/conditional
+> confirm, (3) the two CloudWatch order-update alarms §A.1 deleted — re-armed together
+> only after a fresh dated operator quote lands in
+> `dhan-rest-only-noise-lock-2026-07-14.md` §3 + §A.1 here. Ratchets:
+> `test_rest_stack_spawns_no_order_update_ws_and_no_canary` (the socket ban) +
+> `test_rest_stack_wires_order_runtime` (the socket-free/WAL-free runtime shape).
+
+### §A.1 — 2026-07-14 subsection: Dhan REST-only NOISE lock (order-update spawn retired; Dhan alert surface narrowed to 4)
+
+**The verbatim operator demand (2026-07-14, relayed verbatim via the coordinator
+session — preserve exactly, expletives included):**
+
+> "for Dhan except spot 1m and option chain nothing else should work… these fucking
+> issues of mid profile and all other fucking issues of Dhan should be entirely
+> removed… always make the telegram messages/notifications cleaner, always mention
+> precisely which broker."
+
+This quote is exactly the class of fresh dated quote the pre-2026-07-14 §D REJECT row
+("Removes the order-update WS instead of rewiring it…") demanded — it SUPERSEDES the
+Q4-i functional-dormant ruling for the SPAWN:
+
+1. **The `dhan_rest_stack` Phase 5a order-update spawn is RETIRED** (with its dormant
+   drain task, auth-Telegram listener, ws_event_audit consumer wiring, and the two
+   CloudWatch alarms `tv-<env>-order-update-ws-inactive` +
+   `tv-<env>-order-update-reconnect-storm`). Zero Dhan WebSocket connections exist on
+   any boot path until live trading re-wires it.
+2. **The core module `order_update_connection.rs` is RETAINED DORMANT** (its unit
+   tests stay) — the live-trading re-wire restores the spawn from git history. A fresh
+   dated quote is required HERE first to re-spawn it OR to delete the module.
+3. The full Dhan noise contract (the 4-item alert set, the profile/canary/no-tick/
+   fast-boot-validation/token-gauge deletions) lives in
+   `.claude/rules/project/dhan-rest-only-noise-lock-2026-07-14.md`.
+
+The §A table's order-update row above is edited in place per house style; the
+"AFTER the Phase C rewire: ≤1" total in the paragraph below the table reads **0**
+as of 2026-07-14 (the rewire's spawn is retired; the module is dormant code).
 
 ### §B. What the Phase C deletion PRs MAY remove (authorized by Q1/Q3/Q4; consumer map Verified 2026-07-13)
 
@@ -293,6 +324,13 @@ constants `INDEX_CONSTITUENCY_BASE_URL` / `GROWW_INSTRUMENT_CSV_URL` /
   canonicalizer, the SEBI tables, the ts-pin migration, `parse_intraday_1m_candles`).
 - Removes the order-update WS instead of rewiring it into `dhan_rest_stack` (Q4-i keeps
   it functional-dormant), or spawns it anywhere OTHER than `dhan_rest_stack`.
+  *(2026-07-14 note — PARTIALLY SUPERSEDED by §A.1, the house §37.6-precedent in-place
+  annotation: the operator's 2026-07-14 Dhan noise directive RETIRED the functional-dormant
+  SPAWN itself — `dhan_rest_stack` Phase 5a no longer opens the socket, so "spawns it
+  anywhere OTHER than dhan_rest_stack" now reads "spawns it ANYWHERE at all" pending the
+  live-trading re-wire quote. The MODULE-DELETION half of this row STANDS unchanged:
+  deleting `order_update_connection.rs` remains REJECT — the dormant module is the
+  live-trading re-wire target.)*
 - Deletes `FeedsConfig` / feed-in-key columns / the WAL-ring-aggregator seam "because only
   one feed remains" — the pluggable contract must stay clean for GDF
   (`gdf-third-feed-scope-2026-07-13.md`).

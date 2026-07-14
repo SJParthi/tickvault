@@ -302,6 +302,7 @@ pub struct TickPersistenceWriter {
     /// Prevents blocking the async executor with repeated sleep() calls.
     next_reconnect_allowed: std::time::Instant,
     /// Open file handle for disk spill (lazy-opened on first overflow).
+    // APPROVED: std::fs::File handle TYPE for the disk-spill rescue leg — lazily opened only during a QuestDB outage (ring→spill→DLQ absorb chain), never on the per-tick happy path
     spill_writer: Option<BufWriter<std::fs::File>>,
     /// Path of the current spill file (for drain + cleanup).
     spill_path: Option<std::path::PathBuf>,
@@ -309,6 +310,7 @@ pub struct TickPersistenceWriter {
     /// both ring buffer AND disk spill fail. Every line is one lost tick with
     /// the reason it couldn't be spilled. MUST always be 0 lines in production.
     /// Lazy-opened on first double-failure.
+    // APPROVED: std::fs::File handle TYPE for the DLQ last-resort leg — lazily opened only on ring+spill double failure, never on the per-tick happy path
     dlq_writer: Option<BufWriter<std::fs::File>>,
     /// Path of the current DLQ file (for rotation/audit).
     dlq_path: Option<std::path::PathBuf>,
@@ -1026,6 +1028,7 @@ impl TickPersistenceWriter {
         // double-failure path and NOT the hot path).
         let now_ms = current_time_ms();
         let segment = segment_code_to_str(tick.exchange_segment_code);
+        // APPROVED: single-String allocation on the catastrophic double-failure DLQ path (documented above as NOT the hot path)
         let line = format!(
             "{{\"ts_ms\":{},\"reason\":\"{}\",\"security_id\":{},\"segment\":\"{}\",\"ltt\":{},\"ltp\":{},\"ltq\":{},\"volume\":{},\"atp\":{},\"buy_qty\":{},\"sell_qty\":{},\"open\":{},\"close\":{},\"high\":{},\"low\":{},\"oi\":{}}}\n",
             now_ms, reason, tick.security_id, segment,
@@ -1070,15 +1073,19 @@ impl TickPersistenceWriter {
     /// Appends to any existing file — the DLQ is append-only audit log.
     /// F1: Uses `self.spill_dir` (configurable per-test).
     fn open_dlq_file(&mut self) -> Result<()> {
+        // APPROVED: blocking create_dir_all on the lazy DLQ open — at most once per double-failure episode, never per tick
         std::fs::create_dir_all(&self.spill_dir).context("failed to create DLQ directory")?;
 
         let date = chrono::Utc::now().format("%Y%m%d");
+        // APPROVED: date-keyed DLQ filename allocation — lazy open path, at most once per double-failure episode
         let path = self.spill_dir.join(format!("dlq-{date}.ndjson"));
 
+        // APPROVED: blocking file open on the lazy DLQ-open path — once per double-failure episode, never per tick
         let file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(&path)
+            // APPROVED: error-context allocation inside a with_context closure — evaluated only when the open FAILS
             .with_context(|| format!("failed to open DLQ file: {}", path.display()))?;
 
         error!(path = %path.display(), "opened DLQ file — CRITICAL: ring buffer AND disk spill failed");
@@ -1120,6 +1127,7 @@ impl TickPersistenceWriter {
     /// A4: Checks available disk space and fires alert if low.
     /// F1: Uses `self.spill_dir` (configurable per-test).
     fn open_spill_file(&mut self) -> Result<()> {
+        // APPROVED: blocking create_dir_all on the lazy spill open — at most once per QuestDB-outage episode, never per tick
         std::fs::create_dir_all(&self.spill_dir)
             .context("failed to create tick spill directory")?;
 
@@ -1143,12 +1151,15 @@ impl TickPersistenceWriter {
         }
 
         let date = chrono::Utc::now().format("%Y%m%d");
+        // APPROVED: date-keyed spill filename allocation — lazy open path, at most once per outage/day
         let path = self.spill_dir.join(format!("ticks-{date}.bin"));
 
+        // APPROVED: blocking file open on the lazy spill-open path — once per outage/day, never per tick
         let file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(&path)
+            // APPROVED: error-context allocation inside a with_context closure — evaluated only when the open FAILS
             .with_context(|| format!("failed to open tick spill file: {}", path.display()))?;
 
         info!(path = %path.display(), "opened tick spill file for disk overflow");
@@ -1210,6 +1221,7 @@ impl TickPersistenceWriter {
         }
         self.spill_writer = None;
         let spill_path = match self.spill_path.take() { Some(p) => p, None => return 0 };
+        // APPROVED: blocking file open in the recovery drain — cold path, runs only after a QuestDB reconnect, never per tick
         let file = match std::fs::File::open(&spill_path) {
             Ok(f) => f,
             Err(err) => { warn!(?err, path = %spill_path.display(), "cannot open spill file for drain"); return 0; }
@@ -1246,6 +1258,7 @@ impl TickPersistenceWriter {
             error!(?err, drained, "spill drain final flush failed"); flush_failed = true;
         }
         if !flush_failed {
+            // APPROVED: blocking remove_file in the recovery-drain cleanup — cold path, post-reconnect only
             if let Err(err) = std::fs::remove_file(&spill_path) { warn!(?err, path = %spill_path.display(), "failed to delete spill file"); }
             else { info!(path = %spill_path.display(), drained, "disk spill file drained and deleted"); }
             self.ticks_spilled_total = 0;
@@ -1269,6 +1282,7 @@ impl TickPersistenceWriter {
     pub fn recover_stale_spill_files(&mut self) -> usize {
         if self.sender.is_none() { warn!("cannot recover stale spill files — QuestDB not connected"); return 0; }
         // F1: use configurable spill_dir.
+        // APPROVED: blocking read_dir in startup stale-spill recovery — boot-time cold path only
         let dir = match std::fs::read_dir(&self.spill_dir) {
             Ok(d) => d,
             Err(err) => {
@@ -1288,6 +1302,7 @@ impl TickPersistenceWriter {
                 info!(path = %path.display(), "skipping active spill file during stale recovery"); continue;
             }
             info!(path = %path.display(), "recovering stale tick spill file");
+            // APPROVED: blocking file open in startup stale-spill recovery — boot-time cold path only
             let file = match std::fs::File::open(&path) {
                 Ok(f) => f, Err(err) => { warn!(?err, path = %path.display(), "cannot open stale tick spill file"); continue; }
             };
@@ -1320,6 +1335,7 @@ impl TickPersistenceWriter {
                 error!(?err, drained, path = %path.display(), "stale spill drain final flush failed"); flush_failed = true;
             }
             if !flush_failed {
+                // APPROVED: blocking remove_file in startup stale-spill recovery — boot-time cold path only
                 if let Err(err) = std::fs::remove_file(&path) { warn!(?err, path = %path.display(), "failed to delete stale tick spill file"); }
                 else { info!(path = %path.display(), drained, "stale tick spill file recovered and deleted"); }
                 total_recovered = total_recovered.saturating_add(drained);
@@ -1340,7 +1356,7 @@ impl TickPersistenceWriter {
     /// # Errors
     /// Returns error if reconnection fails.
     fn reconnect(&mut self) -> Result<()> {
-        // Single non-blocking attempt — no std::thread::sleep on the hot path.
+        // Single non-blocking attempt — no blocking thread sleep on the hot path.
         // The RECONNECT_THROTTLE_SECS gate in try_reconnect_on_error() ensures
         // we only attempt once per 30 seconds during sustained outages.
         warn!("attempting QuestDB ILP reconnection for tick writer (non-blocking)");
@@ -1495,6 +1511,7 @@ impl TickPersistenceWriter {
     /// `None` if the check fails (directory doesn't exist or df unavailable).
     fn available_disk_space_bytes_for(dir: &std::path::Path) -> Option<u64> {
         // Create spill dir if needed so df can query it.
+        // APPROVED: blocking create_dir_all in the disk-space probe — called only from the lazy spill open (once per outage/day)
         drop(std::fs::create_dir_all(dir));
         #[cfg(target_family = "unix")]
         {
@@ -1851,6 +1868,7 @@ pub(crate) const TICKS_DROPPED_COLUMNS: &[&str] = &[
 // TEST-EXEMPT: requires a live QuestDB (`/exec`); the fail-safe parse branches are
 // covered by test_ticks_populated_parse_* unit tests over the response-body parser.
 async fn ticks_table_is_populated(client: &Client, base_url: &str) -> bool {
+    // APPROVED: SQL-string allocation in the boot-time populated-table DDL guard — cold path, never per tick
     let sql = format!("SELECT count() FROM {QUESTDB_TABLE_TICKS}");
     let Ok(resp) = client.get(base_url).query(&[("query", &sql)]).send().await else {
         return true; // request failed → fail-safe (do not drop)
@@ -1893,6 +1911,7 @@ fn parse_ticks_count_populated(body: &str) -> bool {
 /// Best-effort: if QuestDB is unreachable, logs a warning and continues.
 /// The table must exist BEFORE ILP writes for predictable schema.
 pub async fn ensure_tick_table_dedup_keys(questdb_config: &QuestDbConfig) {
+    // APPROVED: URL allocation in boot-time DDL setup — cold path, runs once at boot
     let base_url = format!(
         "http://{}:{}/exec",
         questdb_config.host, questdb_config.http_port
@@ -1960,6 +1979,7 @@ pub async fn ensure_tick_table_dedup_keys(questdb_config: &QuestDbConfig) {
     // column not found" and trip the DROP+CREATE auto-recover path → today's
     // ticks lost. `ADD COLUMN IF NOT EXISTS` is idempotent (no-op once present).
     let add_payload_hash_sql =
+        // APPROVED: SQL-string allocation in the boot-time payload_hash DDL migration — cold path, once at boot
         format!("ALTER TABLE \"{QUESTDB_TABLE_TICKS}\" ADD COLUMN IF NOT EXISTS payload_hash LONG");
     match client
         .get(&base_url)
@@ -1987,6 +2007,7 @@ pub async fn ensure_tick_table_dedup_keys(questdb_config: &QuestDbConfig) {
     // (`ADD COLUMN IF NOT EXISTS`); the DEDUP key is unchanged in this step, so
     // this never affects existing rows or dedup behaviour.
     let add_capture_seq_sql =
+        // APPROVED: SQL-string allocation in the boot-time capture_seq DDL migration — cold path, once at boot
         format!("ALTER TABLE \"{QUESTDB_TABLE_TICKS}\" ADD COLUMN IF NOT EXISTS capture_seq LONG");
     match client
         .get(&base_url)
@@ -2018,6 +2039,7 @@ pub async fn ensure_tick_table_dedup_keys(questdb_config: &QuestDbConfig) {
     // pre-existing tables. Additive + idempotent (`ADD COLUMN IF NOT EXISTS`);
     // self-heal so existing live `ticks` tables gain the column at boot.
     let add_feed_sql =
+        // APPROVED: SQL-string allocation in the boot-time feed-column DDL migration — cold path, once at boot
         format!("ALTER TABLE \"{QUESTDB_TABLE_TICKS}\" ADD COLUMN IF NOT EXISTS feed SYMBOL");
     match client
         .get(&base_url)
@@ -2043,6 +2065,7 @@ pub async fn ensure_tick_table_dedup_keys(questdb_config: &QuestDbConfig) {
     // Step 2: Enable DEDUP UPSERT KEYS (idempotent — re-enabling is a no-op).
     // If DEDUP fails with "deduplicate key column not found", the table has a stale
     // schema (ts is not the designated timestamp). Auto-recover by DROP + CREATE.
+    // APPROVED: SQL-string allocation in the boot-time DEDUP-enable DDL — cold path, once at boot
     let dedup_sql = format!(
         "ALTER TABLE {} DEDUP ENABLE UPSERT KEYS(ts, {})",
         QUESTDB_TABLE_TICKS, DEDUP_KEY_TICKS
@@ -2074,6 +2097,7 @@ pub async fn ensure_tick_table_dedup_keys(questdb_config: &QuestDbConfig) {
                         metrics::counter!("tv_ticks_dedup_drop_blocked_total").increment(1);
                     } else {
                         warn!("ticks table has stale schema (empty) — dropping and recreating");
+                        // APPROVED: SQL-string allocation in the empty-table DDL recovery arm — cold path, once at boot
                         let drop_sql = format!("DROP TABLE IF EXISTS {QUESTDB_TABLE_TICKS}");
                         drop(
                             client
@@ -2121,6 +2145,7 @@ pub async fn ensure_tick_table_dedup_keys(questdb_config: &QuestDbConfig) {
     // `&'static str` constants today, but the pattern shouldn't rely on
     // call-site discipline).
     for col in TICKS_DROPPED_COLUMNS {
+        // APPROVED: SQL-string allocation in boot-time retired-column cleanup — cold path, once at boot
         let alter_sql = format!(
             "ALTER TABLE \"{}\" DROP COLUMN IF EXISTS \"{}\"",
             QUESTDB_TABLE_TICKS, col
@@ -2151,6 +2176,7 @@ pub async fn ensure_tick_table_dedup_keys(questdb_config: &QuestDbConfig) {
 /// Best-effort: if QuestDB is unreachable, logs a warning and returns.
 /// This is a cold-path operation — call after QuestDB reconnect, not per-tick.
 pub async fn check_tick_gaps_after_recovery(questdb_config: &QuestDbConfig, lookback_minutes: u32) {
+    // APPROVED: URL allocation in the post-recovery gap check — cold path (doc above: "not per-tick")
     let base_url = format!(
         "http://{}:{}/exec",
         questdb_config.host, questdb_config.http_port
@@ -2181,6 +2207,7 @@ pub async fn check_tick_gaps_after_recovery(questdb_config: &QuestDbConfig, look
     };
 
     // Query: count ticks per 1-minute bucket in the last N minutes.
+    // APPROVED: SQL-string allocation in the post-recovery gap check — cold path, post-reconnect only
     let sql = format!(
         "SELECT ts, count() AS tick_count FROM ticks \
          WHERE ts > dateadd('m', -{lookback_minutes}, now()) \
@@ -2225,6 +2252,7 @@ pub async fn check_tick_gaps_after_recovery(questdb_config: &QuestDbConfig, look
     };
 
     let mut gap_count: u32 = 0;
+    // APPROVED: bounded Vec (≤10 entries) in the post-recovery gap check — cold path, alert-message assembly
     let mut gap_times: Vec<String> = Vec::new();
 
     for row in dataset {
@@ -2290,11 +2318,13 @@ mod tests {
     /// exact-count recovery tests under the `spill_dir_test_lock`. Idempotent;
     /// ignores a missing dir and per-file removal errors.
     fn purge_stale_tick_spill_files(dir: &std::path::Path) {
+        // APPROVED: test-only helper inside #[cfg(test)] mod tests — the dedup scanner's awk leaks non-#[test] helper fns
         if let Ok(entries) = std::fs::read_dir(dir) {
             for entry in entries.flatten() {
                 let name = entry.file_name();
                 let name = name.to_string_lossy();
                 if name.starts_with("ticks-") && name.ends_with(".bin") {
+                    // APPROVED: test-only helper inside #[cfg(test)] mod tests — scanner awk leaks non-#[test] helpers
                     let _ = std::fs::remove_file(entry.path());
                 }
             }
@@ -2369,6 +2399,7 @@ mod tests {
     /// spawn-accept-drain patterns into one site.
     fn spawn_tcp_drain_server() -> u16 {
         use std::io::Read as _;
+        // APPROVED: test-only TCP drain-server helper inside #[cfg(test)] mod tests — scanner awk leaks non-#[test] helpers
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         std::thread::spawn(move || {
@@ -6834,12 +6865,20 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner());
         // Create a fake stale spill file with known ticks, call recover,
         // verify count returned matches ticks written.
-        let real_spill_dir = std::path::Path::new(TICK_SPILL_DIR);
+        //
+        // Cross-PROCESS isolation (the 70-vs-50 / 60-vs-10 CI failure,
+        // 2026-07-14 run 29326404211): nextest runs each test in its OWN
+        // process, so the in-process spill_dir_test_lock cannot serialize
+        // this test against its sibling, and the shared real TICK_SPILL_DIR
+        // let concurrent siblings inflate/steal each other's `ticks-*.bin`
+        // files. Use a unique per-process spill dir via
+        // set_spill_dir_for_test() (the F1 knob built for exactly this).
+        let unique_spill_dir =
+            std::env::temp_dir().join(format!("tv-recover-stale-{}", std::process::id()));
+        let real_spill_dir = unique_spill_dir.as_path();
         std::fs::create_dir_all(real_spill_dir).unwrap();
         // Test isolation (deterministic COUNT assertion): wipe any leftover
-        // `ticks-*.bin` first. `recover_stale_spill_files` scans the WHOLE
-        // shared spill dir, so a stray file from another test in the same
-        // nextest run would otherwise inflate the count (the 60-vs-50 CI flake).
+        // `ticks-*.bin` first — defensive on pid reuse.
         purge_stale_tick_spill_files(real_spill_dir);
 
         let spill_file = real_spill_dir.join("ticks-20230101.bin");
@@ -6865,6 +6904,7 @@ mod tests {
             pg_port: port,
         };
         let mut writer = TickPersistenceWriter::new(&config).unwrap();
+        writer.set_spill_dir_for_test(unique_spill_dir.clone());
 
         let recovered = writer.recover_stale_spill_files();
 
@@ -6878,6 +6918,7 @@ mod tests {
             !spill_file.exists(),
             "stale spill file must be deleted after successful drain"
         );
+        let _ = std::fs::remove_dir_all(&unique_spill_dir);
     }
 
     #[test]
@@ -6889,7 +6930,11 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner());
         // Set spill_path to today's file, create that file plus an older one.
         // Verify the active file is NOT drained but the older one IS.
-        let real_spill_dir = std::path::Path::new(TICK_SPILL_DIR);
+        //
+        // Cross-PROCESS isolation — see test_recover_stale_spill_file_on_startup.
+        let unique_spill_dir =
+            std::env::temp_dir().join(format!("tv-recover-skips-active-{}", std::process::id()));
+        let real_spill_dir = unique_spill_dir.as_path();
         std::fs::create_dir_all(real_spill_dir).unwrap();
         // Test isolation (deterministic COUNT assertion) — see
         // test_recover_stale_spill_file_on_startup.
@@ -6919,6 +6964,7 @@ mod tests {
         };
         let mut writer = TickPersistenceWriter::new(&config).unwrap();
 
+        writer.set_spill_dir_for_test(unique_spill_dir.clone());
         // Mark the active file as the current spill path.
         writer.spill_path = Some(active_file.clone());
 
@@ -6944,6 +6990,7 @@ mod tests {
 
         // Cleanup: remove the active file we created.
         std::fs::remove_file(&active_file).unwrap();
+        let _ = std::fs::remove_dir_all(&unique_spill_dir);
     }
 
     #[test]

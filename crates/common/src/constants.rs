@@ -524,7 +524,7 @@ pub const TICK_GAP_ALERT_THRESHOLD_SECS: u32 = 30;
 /// showed 988 ERROR entries in 15 minutes for illiquid F&O options that
 /// legitimately don't trade for 2-5 minutes at a time. A real feed
 /// disconnect is detected by WS ping/pong within 40s (Dhan server
-/// timeout) plus the `no_tick_watchdog` in `crates/core/src/pipeline/`;
+/// timeout) plus the feed-level stall watchdogs;
 /// a 5-minute silence on ONE instrument while others keep ticking is
 /// illiquidity, not disconnect. The WARN band (30s threshold) still
 /// surfaces illiquidity to the aggregated 30s summary log.
@@ -1725,6 +1725,74 @@ const _: () = assert!(
 );
 
 // ---------------------------------------------------------------------------
+// Shared Dhan Data-API rate limiter + self-tuning (operator pacing directive
+// 2026-07-14, relayed via the coordinator session: pace Dhan to 3 requests/
+// sec — tunable DOWN to 2 — spread overflow into the next second(s), route
+// the option-chain API through the SAME limiter, with incremental/
+// decremental self-tuning: "if it accepts max 3 or 2, stick to that and
+// split it up"). Consumed by `crates/app/src/dhan_data_api_limiter.rs`.
+// Dhan-ONLY — the Groww legs have their own vendor budgets.
+// ---------------------------------------------------------------------------
+
+/// Hard FLOOR of the self-tuning ladder — the limiter never paces Dhan
+/// Data-API traffic below 2 requests/sec (the operator's "3 or 2" bound).
+pub const DHAN_DATA_API_RPS_FLOOR: u32 = 2;
+
+/// Hard CEILING of the config-legal `[dhan_data_api] target_rps` range —
+/// deliberately BELOW Dhan's published Data-API 5/sec budget so this
+/// process can never claim the whole account budget for the per-minute
+/// REST legs.
+pub const DHAN_DATA_API_RPS_CEILING: u32 = 4;
+
+/// Serde default for `[dhan_data_api] target_rps` — the operator-directed
+/// 3 requests/sec pacing (2026-07-14).
+pub const DHAN_DATA_API_DEFAULT_TARGET_RPS: u32 = 3;
+
+/// Rolling window (minutes) over which observed HTTP-429s accumulate
+/// toward a step-down decision.
+pub const DHAN_DATA_API_TUNER_429_WINDOW_MINUTES: u64 = 2;
+
+/// 429 count within the rolling window that trips ONE step-down to the
+/// [`DHAN_DATA_API_RPS_FLOOR`] (edge-logged once; window cleared on the
+/// transition so a single burst can never cascade).
+pub const DHAN_DATA_API_TUNER_429_STEP_DOWN_THRESHOLD: u32 = 3;
+
+/// Consecutive CLEAN minutes (zero 429s observed) at a reduced rate before
+/// ONE step back UP one level toward the config target.
+pub const DHAN_DATA_API_TUNER_CLEAN_MINUTES_FOR_STEP_UP: u32 = 10;
+
+/// Adaptive-degrade threshold for the spot-1m ladder (2026-07-14 retry
+/// shaping): after this many CONSECUTIVE no-data minutes (zero SIDs served
+/// their own just-closed candle), the ladder drops to a single attempt per
+/// minute (no re-polls) until ANY success re-arms the full ladder. The
+/// 2026-07-14 live regime (0/980 served, ~244 wasted 429s from ladder
+/// re-fires against all-empty responses) is the incident this bounds.
+pub const SPOT_1M_REST_DEGRADE_AFTER_CONSECUTIVE_NO_DATA_MINUTES: u32 = 5;
+
+// Compile-time consistency for the tuning ladder.
+const _: () = assert!(
+    DHAN_DATA_API_RPS_FLOOR >= 1
+        && DHAN_DATA_API_RPS_FLOOR <= DHAN_DATA_API_DEFAULT_TARGET_RPS
+        && DHAN_DATA_API_DEFAULT_TARGET_RPS <= DHAN_DATA_API_RPS_CEILING,
+    "Dhan Data-API rps ladder must satisfy 1 <= floor <= default <= ceiling"
+);
+const _: () = assert!(
+    DHAN_DATA_API_RPS_CEILING < 5,
+    "Dhan Data-API ceiling must stay below the published 5/sec account budget"
+);
+const _: () = assert!(
+    DHAN_DATA_API_TUNER_429_STEP_DOWN_THRESHOLD >= 1
+        && DHAN_DATA_API_TUNER_429_WINDOW_MINUTES >= 1
+        && DHAN_DATA_API_TUNER_CLEAN_MINUTES_FOR_STEP_UP >= 1,
+    "Dhan Data-API tuner thresholds must be non-degenerate"
+);
+const _: () = assert!(
+    SPOT_1M_REST_DEGRADE_AFTER_CONSECUTIVE_NO_DATA_MINUTES
+        >= SPOT_1M_REST_CONSECUTIVE_FAIL_PAGE_THRESHOLD,
+    "adaptive degrade must not pre-empt the SPOT1M-01 escalation edge"
+);
+
+// ---------------------------------------------------------------------------
 // Option-chain 1m REST pipeline (operator grant 2026-07-12 — PR-3, the
 // OPTION-CHAIN half). The 3 underlyings are the [`CHAIN_1M_UNDERLYINGS`]
 // subset below (NOT the full [`SPOT_1M_REST_INDICES`] set since the
@@ -2774,6 +2842,22 @@ pub const TOKEN_SWEEP_INTERVAL_SECS: u64 = 4 * 3600;
 /// (main feed, depth, order update) so behaviour is uniform across all
 /// renewal triggers.
 pub const TOKEN_SWEEP_STALENESS_THRESHOLD_SECS: i64 = 4 * 3600;
+
+/// GAP-02 (2026-07-14, Dhan noise lock backstop): the Dhan REST-only
+/// stack's stale-token sweep cadence.
+///
+/// The lane's 4h token sweep dies with the lane (#1522); the REST-only
+/// stack (`dhan_rest_stack.rs` Phase 3) runs its OWN sweep every this
+/// many seconds, calling
+/// `force_renewal_if_stale(TOKEN_SWEEP_STALENESS_THRESHOLD_SECS)` —
+/// the renewal-loop-circuit-breaker-halt backstop. 900s (matching the
+/// mid-session watchdog cadence) instead of the lane's 4h: the stack's
+/// spot/chain legs die within minutes of a stale token, so the backstop
+/// must react on the same timescale. Silent on no-op/success; a failure
+/// logs via the renewal machinery's own paths. NOT market-hours gated
+/// (a token that goes stale overnight must heal before the 09:16 first
+/// fetch).
+pub const DHAN_REST_STACK_TOKEN_SWEEP_INTERVAL_SECS: u64 = 900;
 
 // DELETED: FRAME_SEND_TIMEOUT_SECS and FRAME_BACKPRESSURE_TIMEOUT_SECS
 // Removed per P1.3 — WS readers use non-blocking try_send() + WAL spill,

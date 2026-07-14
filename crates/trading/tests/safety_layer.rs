@@ -380,13 +380,24 @@ mod alert_routing {
     }
 
     /// SAFETY-B3-03: Alert messages include actionable information.
+    ///
+    /// 2026-07-14 (operator Dhan noise lock,
+    /// `dhan-rest-only-noise-lock-2026-07-14.md`): the body was reworded to
+    /// plain English naming the BROKER + the CONSEQUENCE ("Dhan login could
+    /// not be obtained" / "pulls will stop") — the old shouty "FAILED"
+    /// literal is gone by design, so this pin follows the reworded
+    /// contract: failure indication + broker name + the error detail.
     #[test]
     fn test_alert_messages_include_context() {
         let event = NotificationEvent::AuthenticationFailed {
             reason: "HTTP 401".to_string(),
         };
         let msg = event.to_message();
-        assert!(msg.contains("FAILED"), "must indicate failure");
+        assert!(
+            msg.contains("could not be obtained"),
+            "must indicate failure in plain English (the 2026-07-14 reword)"
+        );
+        assert!(msg.contains("Dhan"), "must name the broker");
         assert!(msg.contains("401"), "must include error details");
     }
 

@@ -13,7 +13,11 @@
 //! ONE supervised tokio task owning:
 //! - the paper OMS (`dry_run` hard-true — no live-order path exists) fed by
 //!   the rest-stack's order-update broadcast (Source=="P" filtered at this
-//!   consumer boundary; the WAL keeps capturing ALL frames upstream),
+//!   consumer boundary). SOCKET-FREE shape (2026-07-14 operator Dhan noise
+//!   lock): the broadcast has ZERO producers today — no order-update WS is
+//!   spawned and no order-event frames are WAL-captured; the gated live
+//!   re-arm (fresh dated quote per dhan-rest-only-noise-lock-2026-07-14 §3)
+//!   re-attaches the socket + WAL producers to this SAME channel,
 //! - the RiskEngine fed by [`FillEvent`]s (the widened `handle_order_update`
 //!   return) and by Groww marks (the zero-alloc [`MarkForwarder`] tap at the
 //!   groww_bridge consume seam → bounded mpsc → `update_market_price`),
@@ -29,7 +33,7 @@
 //!   close → flat) proving the chain end-to-end.
 //!
 //! # Safety rails
-//! - Spawned ONLY from `dhan_rest_stack` Phase 5a (the dhan-OFF arm) — the
+//! - Spawned ONLY from `dhan_rest_stack` Phase 5b (the dhan-OFF arm) — the
 //!   dhan-ON trading_pipeline owns its own OMS, so a second runtime there
 //!   would be a dual-OMS split-brain (ratcheted: zero `spawn_order_runtime(`
 //!   in main.rs).
@@ -245,43 +249,10 @@ impl RiskAlertSink for NotifierAlertSink {
 }
 
 // ---------------------------------------------------------------------------
-// WAL confirm decision (pure — consumed by dhan_rest_stack Phase 5a)
-// ---------------------------------------------------------------------------
-
-/// Verdict for the whole-dir `confirm_replayed` after the rest-stack's
-/// order-update WAL drain.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ConfirmVerdict {
-    /// Drain was parse-clean AND no stale live-feed frames were staged —
-    /// safe to archive `replaying/`.
-    Confirm,
-    /// Defer: either the drain hit parse errors, or stale live-feed frames
-    /// sit staged (a whole-dir confirm would archive them UN-reinjected —
-    /// silent tick loss, F6). Segments re-replay next boot; zero loss.
-    Defer {
-        /// Staged live-feed frame count (0 when the defer is parse-driven).
-        live_feed_frames: usize,
-    },
-}
-
-/// F6/F7: confirm iff the order-update drain was parse-clean AND zero
-/// live-feed frames were staged this boot (the dhan-off residual class).
-#[must_use]
-pub fn confirm_decision(parse_errors: u64, livefeed_frames: usize) -> ConfirmVerdict {
-    if parse_errors == 0 && livefeed_frames == 0 {
-        ConfirmVerdict::Confirm
-    } else {
-        ConfirmVerdict::Defer {
-            live_feed_frames: livefeed_frames,
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Runtime params + spawn
 // ---------------------------------------------------------------------------
 
-/// Everything the runtime needs — assembled by `dhan_rest_stack` Phase 5a.
+/// Everything the runtime needs — assembled by `dhan_rest_stack` Phase 5b.
 pub struct OrderRuntimeParams {
     /// Immutable boot config snapshot.
     pub config: Arc<ApplicationConfig>,
@@ -292,8 +263,9 @@ pub struct OrderRuntimeParams {
     /// The stack-local order-update broadcast sender — held for the process
     /// lifetime (keeps the WS send arm quiet, M1) + respawn re-subscribe.
     pub order_update_sender: broadcast::Sender<OrderUpdate>,
-    /// The FIRST receiver, subscribed BEFORE the WAL drain (ordering law
-    /// F5 — replayed frames must reach this runtime).
+    /// The FIRST receiver (the channel-construction receiver — no earlier
+    /// producer exists in the socket-free shape; the gated live re-arm's
+    /// socket/WAL drain must keep subscribing BEFORE any producer starts).
     pub first_order_update_rx: broadcast::Receiver<OrderUpdate>,
     /// Bounded mark channel (Groww bridge tap → this runtime).
     pub mark_rx: mpsc::Receiver<MarkUpdate>,
@@ -382,9 +354,10 @@ pub fn spawn_order_runtime(params: OrderRuntimeParams) -> tokio::task::JoinHandl
                 .saturating_mul(1_u64 << consecutive_abnormal_exits.saturating_sub(1).min(8))
                 .min(ORDER_RUNTIME_RESPAWN_BACKOFF_CAP_SECS);
             // E2 honesty: PAPER fills / self-test orders never traverse the
-            // WAL or the broadcast — a respawn (or process restart) SILENTLY
-            // zeroes the paper book + day P&L. Only REAL-account fill frames
-            // replay from the WAL and surface as loud orphan warns.
+            // broadcast — a respawn (or process restart) SILENTLY zeroes the
+            // paper book + day P&L. In the socket-free shape NOTHING replays
+            // (no WAL capture); once the gated live re-arm lands, replayed
+            // REAL-account fill frames surface as loud orphan warns.
             error!(
                 code = ErrorCode::OmsGapDryRunSafety.code_str(),
                 reason,
@@ -871,7 +844,7 @@ async fn run_order_runtime(
         "order runtime started (paper book live — order updates + Groww marks now \
          reach the OMS/RiskEngine; alert sinks wired). Paper book starts EMPTY: \
          paper fills are in-RAM only, so a restart zeroes paper positions + day \
-         P&L (only REAL-account fill frames replay from the WAL)"
+         P&L (socket-free shape: no order-event frames are captured or replayed)"
     );
 
     loop {
@@ -1048,8 +1021,9 @@ async fn handle_order_update_event(
                     traded_qty = update.traded_qty,
                     reason = "orphan_fill_update",
                     "OMS-GAP-02: fill-carrying update for an order this (fresh) book \
-                     does not track — likely a WAL replay across a restart; the fill \
-                     is NOT applied"
+                     does not track — an externally injected event (e.g. a future \
+                     live re-arm's WAL replay across a restart); the fill is NOT \
+                     applied"
                 );
                 metrics::counter!("tv_oms_orphan_fill_updates_total").increment(1);
             }
@@ -1614,38 +1588,6 @@ mod tests {
         })
         .await
         .expect("paper placement never fails") // APPROVED: test
-    }
-
-    // -------------------------------------------------------------------
-    // confirm_decision (F6/F7)
-    // -------------------------------------------------------------------
-
-    #[test]
-    fn test_confirm_decision_matrix() {
-        // Clean drain + no stale live-feed frames → Confirm.
-        assert_eq!(confirm_decision(0, 0), ConfirmVerdict::Confirm);
-        // Parse errors → Defer (segments re-replay next boot).
-        assert_eq!(
-            confirm_decision(1, 0),
-            ConfirmVerdict::Defer {
-                live_feed_frames: 0
-            }
-        );
-        // Stale live-feed frames → Defer (whole-dir confirm would archive
-        // them UN-reinjected — silent tick loss).
-        assert_eq!(
-            confirm_decision(0, 7),
-            ConfirmVerdict::Defer {
-                live_feed_frames: 7
-            }
-        );
-        // Both → Defer.
-        assert_eq!(
-            confirm_decision(3, 7),
-            ConfirmVerdict::Defer {
-                live_feed_frames: 7
-            }
-        );
     }
 
     // -------------------------------------------------------------------
