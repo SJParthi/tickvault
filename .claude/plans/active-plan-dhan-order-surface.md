@@ -273,6 +273,19 @@ Other clusters (checked off by their owning sessions' PRs, all referencing THIS 
     test_build_multi_order_request_correlation_id_boundary_30_max_31_rejected_and_charset,
     proptest_build_multi_order_request_never_panics_on_arbitrary_spec
 
+Cluster B (branch claude/dhan-order-error-taxonomy; MINIMAL ADDITION — this
+cluster was absent from the original umbrella; flagged in the PR body):
+
+- [x] B1 — order-path DH/DATA error taxonomy + per-endpoint retry matrix + 805 STOP-ALL latch + DH-904 ladder wiring
+  - Files: crates/trading/src/oms/error_taxonomy.rs, api_client.rs, mod.rs, crates/common/src/constants.rs
+  - Tests: ratchet_dh904_ladder_constants_and_wiring, ratchet_stop_all_cooldown_is_60s_per_annexure_rule_12, prop_classify_never_panics_and_is_deterministic_on_arbitrary_status_and_body
+- [x] B2 — order-readiness gate (profile/token headroom, fail-closed, live-path-only) + probe refresher (boot spawn = seam handoff)
+  - Files: crates/trading/src/oms/order_readiness.rs, engine.rs, types.rs
+  - Tests: test_place_order_live_refused_when_no_readiness_installed_zero_http_zero_token_fetch, test_place_order_dry_run_ignores_readiness_gate_byte_identical, test_evaluate_order_readiness_stale_boundary_2100_passes_2101_refuses
+- [x] B3 — ORDER-READY-01 ErrorCode + rule file + OmsAlert DHAN attribution
+  - Files: crates/common/src/error_code.rs, .claude/rules/project/order-readiness-error-codes.md, engine.rs
+  - Tests: test_order_ready_01_contract, test_all_oms_alert_operator_messages_start_with_dhan_badge
+
 ## Hard invariants (every Dhan-order PR states these)
 
 1. **4-lock OFF switch**: `dry_run` stays `true`, hardcoded in
@@ -440,7 +453,7 @@ adding one records the cost note per `aws-budget.md`.
 | `crates/trading/src/risk/engine.rs` | Cluster A this round (lot_size fix + halt extraction); E2's margin gate REBASES after A merges | `check_order` gains OrderIntent in E2 only |
 | `crates/app/src/groww_bridge.rs` tick seam | Cluster A | marks tap (one guarded try_send block) |
 | Storage order-audit writers (`crates/storage/src/`) | Cluster C | A emits via a seam C fills in; A ships without tables (flagged follow-up) |
-| `crates/trading/src/oms/conditional.rs` (+ the api_client.rs conditional-family block :575-780 and the types.rs conditional/multi sections) | Cluster CT (this item) | New module — no other cluster touches it; api_client edits confined to the /alerts family block + end-appends; mod.rs gains one additive line |
+| `oms/{api_client.rs error/ladder additions, error_taxonomy.rs, order_readiness.rs}` + engine gate wiring (outside :256-277 / :549-660) | Cluster B (branch claude/dhan-order-error-taxonomy) | consumption-side classifier; SANDBOX + handle_order_update regions untouched; ~35 legacy api_client error sites byte-identical |
 
 Build-lead: the cluster A session. Conflicts on any seam: the
 non-owner rebases; never a force-merge over an owner's in-flight PR.

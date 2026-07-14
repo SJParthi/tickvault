@@ -446,6 +446,13 @@ pub enum ErrorCode {
     /// 814: Invalid request.
     Data814InvalidRequest,
 
+    /// ORDER-READY-01 — a live order was refused by the order-readiness gate:
+    /// fail-closed on never-probed / stale / invalid profile / token headroom /
+    /// OMS halt. Pre-live plumbing while `dry_run` is hardcoded true — the
+    /// refusal IS the protection; unreachable in prod today (WS-GAP-10 /
+    /// DHAN-LANE-03 class of fail-closed gate). Severity::High.
+    OrderReady01GateRefused,
+
     /// Wave 5 Item 26 L1 — volume monotonicity breach at runtime. The Dhan
     /// volume field at bytes 22-25 of the Quote/Full packet is cumulative
     /// since session open per Ticket #5525125 (verified via the live Mon
@@ -1132,6 +1139,8 @@ impl ErrorCode {
             Self::Data812InvalidDateFormat => "DATA-812",
             Self::Data813InvalidSecurityId => "DATA-813",
             Self::Data814InvalidRequest => "DATA-814",
+            // Cluster B (2026-07-14) — order-readiness gate
+            Self::OrderReady01GateRefused => "ORDER-READY-01",
             // Wave 5 Item 13 — prev-close routing
             Self::PrevClose03BootRoutingAssertion => "PREVCLOSE-03",
             // F2 (Wave-5 #504e follow-up) — PrevDayCache boot loader
@@ -1284,6 +1293,11 @@ impl ErrorCode {
             | Self::RiskGapPositionPnl
             | Self::InstrumentP0ExpiryAtGate4
             | Self::Data807TokenExpired
+            // ORDER-READY-01 (2026-07-14): High, not Critical — the refusal IS
+            // the protection (no live order is sent), the path is unreachable
+            // today (dry_run hardcoded true), and it self-heals on the next OK
+            // profile probe. Same class as WS-GAP-10 / DHAN-LANE-03.
+            | Self::OrderReady01GateRefused
             | Self::Boot01QuestDbSlow
             | Self::Volume01MonotonicityBreach
             | Self::AggregatorLate01
@@ -1594,6 +1608,9 @@ impl ErrorCode {
             | Self::Data812InvalidDateFormat
             | Self::Data813InvalidSecurityId
             | Self::Data814InvalidRequest => ".claude/rules/dhan/annexure-enums.md",
+            Self::OrderReady01GateRefused => {
+                ".claude/rules/project/order-readiness-error-codes.md"
+            }
             Self::PrevClose03BootRoutingAssertion
             | Self::Volume01MonotonicityBreach => ".claude/rules/project/wave-5-error-codes.md",
             Self::AggregatorDrop01
@@ -1766,6 +1783,11 @@ impl ErrorCode {
                 // would re-stamp rows and could mask the evidence (the
                 // Futidx02 precedent).
                 | Self::TfVerify01MismatchFound
+                // ORDER-READY-01 (Cluster B, 2026-07-14): restoring
+                // dataPlan/segment/token is an operator/broker ACCOUNT decision
+                // (CHAIN-01 precedent); no auto-triage action may ever touch the
+                // ORDER path, so this is severity-independently operator-only.
+                | Self::OrderReady01GateRefused
         ) {
             return false;
         }
@@ -1829,6 +1851,7 @@ impl ErrorCode {
             Self::Data812InvalidDateFormat,
             Self::Data813InvalidSecurityId,
             Self::Data814InvalidRequest,
+            Self::OrderReady01GateRefused,
             Self::HotPath01SyncFsFailed,
             Self::HotPath02WriterQueueDrop,
             // PR #5 (2026-05-19): Phase201DispatchFailed + Phase202EmitGuardDropped retired.
@@ -2320,7 +2343,8 @@ mod tests {
         // recomputed-from-1m value — coalesced per (feed, date) pass,
         // manual triage) + TF-VERIFY-02 (the daily run degraded —
         // client/query/truncation/flush/budget stage taxonomy) => 148.
-        assert_eq!(ErrorCode::all().len(), 148);
+        // 2026-07-14 (Cluster B): ORDER-READY-01 (order-readiness gate) => 149.
+        assert_eq!(ErrorCode::all().len(), 149);
     }
 
     #[test]
@@ -2483,6 +2507,23 @@ mod tests {
     }
 
     #[test]
+    fn test_order_ready_01_contract() {
+        let c = ErrorCode::OrderReady01GateRefused;
+        assert_eq!(c.code_str(), "ORDER-READY-01");
+        assert_eq!("ORDER-READY-01".parse::<ErrorCode>(), Ok(c));
+        assert_eq!(c.severity(), Severity::High);
+        assert!(
+            !c.is_auto_triage_safe(),
+            "operator-only: account/order-path decision"
+        );
+        assert_eq!(
+            c.runbook_path(),
+            ".claude/rules/project/order-readiness-error-codes.md"
+        );
+        assert!(ErrorCode::all().contains(&c));
+    }
+
+    #[test]
     fn test_ws_reinject_01_aborted_contract() {
         let code = ErrorCode::WsReinject01Aborted;
         // Wire-format string + roundtrip via FromStr.
@@ -2524,6 +2565,8 @@ mod tests {
                 || s.starts_with("STORAGE-GAP-")
                 || s.starts_with("DH-")
                 || s.starts_with("DATA-")
+                // Cluster B (2026-07-14): order-readiness gate
+                || s.starts_with("ORDER-READY-")
                 // Wave 1 (PR #393): hot-path / phase2 / prev-close / movers prefixes
                 || s.starts_with("HOT-PATH-")
                 || s.starts_with("PHASE2-")
