@@ -46,7 +46,7 @@ now exists (`deploy/aws/terraform/error-code-alarms.tf`).
 
 Filtered+alarmed codes (each = one `error_code_alerts` map entry):
 DH-901, DH-906 (term-match tripwire — no coded emit site
-exists yet), AUTH-GAP-04, WS-GAP-07, FEED-STALL-01 (ERROR lines = the
+exists yet), AUTH-GAP-04, FEED-STALL-01 (ERROR lines = the
 sidecar's own >5-restarts-per-5-min STORM escalation ONLY; per-restart lines
 are warn!-level and invisible here — the ≥3-restarts-per-15-min restart pager
 is the separate `tv_feed_sidecar_stall_restart_total` counter alarm,

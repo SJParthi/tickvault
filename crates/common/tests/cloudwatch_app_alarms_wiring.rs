@@ -322,7 +322,7 @@ fn test_deployed_emf_source_labels_match_a_real_series_label() {
 }
 
 #[test]
-fn test_emf_metric_selectors_name_count_is_twenty_six() {
+fn test_emf_metric_selectors_name_count_is_pinned() {
     // Pin the MAIN (host-only) EMF publish list: 19 alarm-backing signals
     // + 2 memory-measurement gauges added 2026-07-02 for the 2K-universe RAM
     // measurement (tv_process_rss_bytes — crates/storage/src/resource_monitor.rs;
@@ -350,7 +350,15 @@ fn test_emf_metric_selectors_name_count_is_twenty_six() {
     // `tv_feed_sidecar_stall_restart_total` (FEED-STALL-01 stall-kill
     // counter — crates/app/src/groww_sidecar_supervisor.rs). Cost: +3
     // custom metrics ≈ +$0.90/mo per the app-alarms.tf header cost note.
-    // 26 (was 27) since 2026-07-14 (Dhan noise lock fix round, M4): REMOVED
+    // 22 (was 27) since 2026-07-13 (PR-C2 — Dhan live-WS lane deletion):
+    // RETIRED the 5 names whose emitters died with the lane —
+    // tv_websocket_pool_all_dead, tv_websocket_failed_connections_count,
+    // tv_realtime_guarantee_score (SLO publisher PARKED per the wave-3-d
+    // banner), tv_ws_frame_dropped_no_wal_total and
+    // tv_ws_reconnect_gap_seconds_total. Cost: -5 selected series
+    // (~-$1.50/mo) vs the pre-C2 bill.
+    // 21 (was 22 on this branch / 26 on main) since 2026-07-14 (Dhan noise
+    // lock fix round, M4, reconciled through the PR-C2 merge): REMOVED
     // `tv_order_update_ws_active` — the order-update WS spawn is retired
     // (scope-lock §A.1), so the gauge has zero reachable writers; shipping
     // a dead name in the EMF list would publish nothing while implying
@@ -359,12 +367,11 @@ fn test_emf_metric_selectors_name_count_is_twenty_six() {
     let names = emf_declared_names(&user_data, "metric_selectors");
     assert_eq!(
         names.len(),
-        26,
-        "Z+ L2 VERIFY ratchet: expected exactly 26 names in the MAIN EMF \
-         metric_selectors list (24 post-#1437 groww feed-down alerting + 2 \
-         silent-feed lag names 2026-07-06 + 1 groww lag gauge 2026-07-11 \
-         scoreboard PR-C - 1 order-update gauge removed 2026-07-14 M4); \
-         found {}: {names:?}",
+        21,
+        "Z+ L2 VERIFY ratchet: expected exactly 21 names in the MAIN EMF \
+         metric_selectors list (27 pre-PR-C2 minus the 5 Dhan-lane names \
+         retired 2026-07-13 minus the order-update gauge removed 2026-07-14 \
+         M4); found {}: {names:?}",
         names.len()
     );
     for required in [
@@ -1172,16 +1179,26 @@ fn test_app_alarms_count_is_twenty_two() {
     // lag signal at Groww's millisecond resolution, threshold 5s x10min,
     // window-gated). Cost: +1 custom metric series (~$0.30/mo) + 1 alarm
     // (~$0.10/mo) — dated note in aws-budget.md.
-    // 22 (was 23) since 2026-07-14 (operator Dhan noise lock,
-    // dhan-rest-only-noise-lock-2026-07-14.md): REMOVED
-    // `tv_order_update_ws_active` (alarm tv-<env>-order-update-ws-inactive
-    // — deleted with the order-update WS spawn; the alarm was
-    // missing-data-blind on dhan-off boots). Cost: -1 alarm (~-$0.10/mo)
-    // — dated note in app-alarms.tf output description.
+    // 17 (was 23) since 2026-07-13 (PR-C2 — Dhan live-WS lane deletion,
+    // operator retirement directive): RETIRED the 6 entries whose emitters
+    // died with the lane — tv_websocket_pool_all_dead,
+    // tv_websocket_failed_connections_count, tv_realtime_guarantee_score
+    // (BOTH the critical + degraded alarms; the SLO publisher is PARKED per
+    // the wave-3-d banner), tv_ws_frame_dropped_no_wal_total and
+    // tv_ws_reconnect_gap_seconds_total. Cost: -6 alarms / -5 selected
+    // series vs the pre-C2 bill (dated notes in app-alarms.tf +
+    // silent-feed-alarms.tf).
+    // 16 (was 17 on this branch / 22 on main) since 2026-07-14 (operator
+    // Dhan noise lock, dhan-rest-only-noise-lock-2026-07-14.md, reconciled
+    // through the PR-C2 merge): REMOVED `tv_order_update_ws_active` (alarm
+    // tv-<env>-order-update-ws-inactive — deleted with the order-update WS
+    // spawn; the alarm was missing-data-blind on dhan-off boots). Cost:
+    // -1 alarm (~-$0.10/mo) — dated note in app-alarms.tf output
+    // description.
     let count = alarm_metric_names().len();
     assert_eq!(
-        count, 22,
-        "Z+ L2 VERIFY ratchet: expected exactly 22 app-level CloudWatch alarm \
+        count, 16,
+        "Z+ L2 VERIFY ratchet: expected exactly 16 app-level CloudWatch alarm \
          metric_name entries across app-alarms.tf + silent-feed-alarms.tf \
          (one per critical app signal). Found {count}. If you intentionally \
          added or removed one, update aws-budget.md custom-metric cost line \

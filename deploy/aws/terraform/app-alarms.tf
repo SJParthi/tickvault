@@ -551,12 +551,10 @@ resource "aws_cloudwatch_metric_alarm" "mem_used_high" {
 # ---------------------------------------------------------------------------
 
 output "app_cloudwatch_alarms" {
-  description = "20 application-level alarms in THIS file (18 Prometheus-via-CW-agent incl. #1437's 2 groww alarms + 1 disk-used + 1 mem-used Metrics-Insights; order-update-ws-inactive RETIRED 2026-07-14 per dhan-rest-only-noise-lock-2026-07-14.md); 4 more silent-feed alarms live in silent-feed-alarms.tf (2026-07-06 incident hardening + scoreboard PR-C S4). tick-gap-instruments-silent was RETUNED 2026-07-06 (threshold 100 -> 40 PROVISIONAL, 10-of-12 min, market-hours-gated). Cost note (2026-07-06 groww feed-down alerting adds 2 alarms + 3 selected metrics; silent-feed hardening adds 3 alarms + 4 selected series; scoreboard PR-C S4 adds 1 lag alarm; 2026-07-14 removes order-update-ws-inactive + the reconnect-storm alarm ≈ -$0.20/mo): overage above the 10 free-tier alarms ≈ $1.70/mo + 29 selected custom-metric series ≈ $5.70/mo overage above the 10 free-tier metrics (≈ $8.70/mo absolute at ~$0.30 each; EMF name count pinned by cloudwatch_app_alarms_wiring.rs) ≈ $7.40/mo ≈ ₹630/mo total — well inside the $55 budget cap."
+  description = "15 application-level alarms in THIS file (13 Prometheus-via-CW-agent + 1 disk-used + 1 mem-used Metrics-Insights; PR-C2 2026-07-13 retired 5 Dhan-lane alarms — ws-pool-all-dead, ws-failed-connections, realtime-guarantee-critical, ws-frame-dropped-no-wal, ws-reconnect-gap-high — their emitters died with the Dhan live-WS lane; order-update-ws-inactive RETIRED 2026-07-14 per dhan-rest-only-noise-lock-2026-07-14.md, reconciled through the PR-C2 merge); 3 more silent-feed alarms live in silent-feed-alarms.tf (realtime-guarantee-degraded also retired PR-C2). tick-gap-instruments-silent was RETUNED 2026-07-06 (threshold 100 -> 40 PROVISIONAL, 10-of-12 min, market-hours-gated). Cost note: the PR-C2 retirement REMOVES 6 alarms + 5 selected custom-metric series and the 2026-07-14 noise lock a further alarm + the order-update gauge series from the pre-C2 bill (was ~$7.60/mo overage) — still well inside the $55 budget cap."
   value = [
     aws_cloudwatch_metric_alarm.disk_used_high.alarm_name,
     aws_cloudwatch_metric_alarm.mem_used_high.alarm_name,
-    aws_cloudwatch_metric_alarm.ws_pool_all_dead.alarm_name,
-    aws_cloudwatch_metric_alarm.ws_failed_connections.alarm_name,
     aws_cloudwatch_metric_alarm.groww_ws_inactive.alarm_name,
     aws_cloudwatch_metric_alarm.groww_stall_restart_storm.alarm_name,
     aws_cloudwatch_metric_alarm.questdb_disconnected.alarm_name,

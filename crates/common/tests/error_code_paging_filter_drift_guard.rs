@@ -608,9 +608,12 @@ fn live_tf_entries() -> Vec<AlertEntry> {
 #[test]
 fn every_tf_pattern_extracts_a_valid_known_code_with_pinned_shape() {
     let entries = live_tf_entries();
+    // Floor 10 -> 9 -> 8: ws-gap-07 retired PR-C2 2026-07-13 (emit site died
+    // with the Dhan live-WS lane) AND rest-canary-01 retired 2026-07-14
+    // (operator Dhan noise lock) — both landed through the PR-C2 merge.
     assert!(
-        entries.len() >= 9,
-        "parser self-check: expected >= 9 error_code_alerts entries, got {} — \
+        entries.len() >= 8,
+        "parser self-check: expected >= 8 error_code_alerts entries, got {} — \
          either entries were removed (update this ratchet with a dated note) or \
          the parser broke on a formatting change: {entries:?}",
         entries.len()
@@ -722,9 +725,11 @@ fn tf_map_and_doc_paging_list_agree_bidirectionally() {
     let mut doc_codes =
         parse_doc_paging_codes(&read(".claude/rules/project/observability-architecture.md"));
     doc_codes.sort();
+    // Floor 9 -> 8 (PR-C2 merge, 2026-07-14): ws-gap-07 + rest-canary-01 both
+    // left the paging list (see the tf-entries floor note above).
     assert!(
-        doc_codes.len() >= 9,
-        "doc parser self-check: expected >= 9 codes in the 'Filtered+alarmed \
+        doc_codes.len() >= 8,
+        "doc parser self-check: expected >= 8 codes in the 'Filtered+alarmed \
          codes' paragraph, got {doc_codes:?} — the section moved or the parser broke"
     );
     let missing_in_doc: Vec<&String> = tf_codes.iter().filter(|c| !doc_codes.contains(c)).collect();
