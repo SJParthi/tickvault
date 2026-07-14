@@ -1,5 +1,16 @@
 //! Fast-boot cached-token validation (AUTH-GAP-06, 2026-07-08).
 //!
+//! **RETAINED-DORMANT since PR-C2 (2026-07-14, Dhan live-WS lane
+//! deletion):** the FAST crash-recovery boot arm — this module's ONLY
+//! production caller — was deleted with the lane, so
+//! `validate_cached_token_at_fast_boot` has ZERO runtime call sites (unit
+//! tests only). The pure `classify_probe_result` verdict machinery is kept
+//! as a contract stub: its fate is a C3/C4 dependency-evidence call —
+//! either deletion with the AUTH-GAP-06 variant cleanup, or a re-wire into
+//! whatever boot path a future live-trading re-enable (fresh dated operator
+//! quote per `websocket-connection-scope-lock.md` "2026-07-13 Amendment"
+//! §D) brings back.
+//!
 //! # Why this exists (operator incident 2026-07-07 — third occurrence)
 //!
 //! The FAST crash-recovery boot arm (`crates/app/src/main.rs`) restarts

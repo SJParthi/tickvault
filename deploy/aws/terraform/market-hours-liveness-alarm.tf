@@ -56,12 +56,13 @@
 #   reset + 5-period evaluation give it headroom on a healthy day, same
 #   timing budget the score signal had; (b) unlike the score, this gauge has
 #   NO fallback log-metric-filter (metrics-log-metric-filters.tf covers
-#   tv_boot_completed + tv_realtime_guarantee_score only) — a degraded
-#   metrics-shipping leg (the 2026-07-06 collect_list class) false-pages
-#   here, with app-log-ingestion-silent as the co-firing diagnostic;
-#   (c) tv_realtime_guarantee_score stays in the CW allowlist + the
-#   realtime-guarantee-critical/degraded alarms (both notBreaching-on-missing,
-#   so they are correctly silent while the lane is retired);
+#   tv_boot_completed only since PR-C2 retired the score's filter) — a
+#   degraded metrics-shipping leg (the 2026-07-06 collect_list class)
+#   false-pages here, with app-log-ingestion-silent as the co-firing
+#   diagnostic; (c) PR-C2 (2026-07-14) RETIRED the score surface entirely:
+#   tv_realtime_guarantee_score left the CW allowlist and the
+#   realtime-guarantee-critical/-degraded alarms were REMOVED (the SLO
+#   publisher died with the Dhan lane — wave-3-d-error-codes.md banner);
 #   (d) this alarm does NOT cover the Dhan REST-only stack: a stack wedged in
 #   its lock/auth retry loops — or PARKED after the bounded AlreadyHeld
 #   patience window (a live dual-instance peer) — is log-visible only
@@ -133,8 +134,9 @@
 # =============================================================================
 
 # ---------------------------------------------------------------------------
-# The market-hours liveness alarm — pages when tv_realtime_guarantee_score is
-# MISSING (app wedged / crash-looped / dead). Actions gated to market hours.
+# The market-hours liveness alarm — pages when tv_groww_exchange_lag_p99_seconds
+# is MISSING (app wedged / crash-looped / dead OR Groww never streamed; signal
+# moved off the retired SLO score 2026-07-13). Actions gated to market hours.
 # ---------------------------------------------------------------------------
 resource "aws_cloudwatch_metric_alarm" "market_hours_liveness_missing" {
   alarm_name        = "tv-${var.environment}-market-hours-liveness-missing"
@@ -176,7 +178,8 @@ resource "aws_cloudwatch_metric_alarm" "market_hours_liveness_missing" {
 # comma-separated ALARM_NAMES list so the SAME window Lambda also gates the
 # two value-based off-hours false-pagers in app-alarms.tf:
 #   - tv-<env>-realtime-guarantee-critical (score legitimately 0 off-hours —
-#     VERIFIED SOS page at 05:40 IST 2026-07-03 on a healthy pre-market box)
+#     VERIFIED SOS page at 05:40 IST 2026-07-03 on a healthy pre-market box;
+#     alarm RETIRED in PR-C2 2026-07-14 with the SLO publisher — historical)
 #   - tv-<env>-aggregator-no-seals (zero seals off-hours is by design)
 # ---------------------------------------------------------------------------
 data "archive_file" "tv_market_hours_liveness_gate_zip" {
@@ -401,9 +404,11 @@ resource "aws_cloudwatch_log_group" "tv_market_hours_liveness_gate" {
 
 # ---------------------------------------------------------------------------
 # Watch the watchman (round-13, 2026-07-06): the gate Lambda's 09:20 IST open
-# invocation is the ONLY path that arms the 12 gated alarms (the ALARM_NAMES
+# invocation is the ONLY path that arms the 8 gated alarms (the ALARM_NAMES
 # env list above — incl. the leg-3 order-update reconnect-storm pager + the
-# 2026-07-06 silent-feed set + the 2026-07-10 ws-pool pair). A gate failure
+# surviving 2026-07-06 silent-feed set; count 12 → 8 in PR-C2 2026-07-14:
+# realtime-guarantee-critical/-degraded + ws-pool-all-dead +
+# ws-failed-connections retired with the Dhan lane). A gate failure
 # previously re-opened
 # the 2026-07-06 zero-page gap SILENTLY — the gated alarms simply stayed
 # disarmed all session with nothing watching the gate itself. Same shape as
@@ -415,7 +420,7 @@ resource "aws_cloudwatch_log_group" "tv_market_hours_liveness_gate" {
 # ---------------------------------------------------------------------------
 resource "aws_cloudwatch_metric_alarm" "market_hours_gate_lambda_errors" {
   alarm_name          = "tv-${var.environment}-market-hours-gate-errors"
-  alarm_description   = "The market-hours gate Lambda FAILED - its 09:20 IST open invocation is the ONLY path that arms the 12 gated alarms (market-hours-liveness-missing, realtime-guarantee-critical, aggregator-no-seals, order-update-reconnect-storm, app-log-ingestion-silent, tick-gap-instruments-silent, realtime-guarantee-degraded, boundary-catchup-storm-dhan, dhan-exchange-lag-p99-high, groww-exchange-lag-p99-high, ws-pool-all-dead, ws-failed-connections - the Lambda's ALARM_NAMES env is the authoritative list). A failed open leaves all 12 disarmed for the session (the 2026-07-06 leg-3 zero-page class); a failed close leaves them armed overnight (false-page risk). NO green OK page ever follows this alarm (ok_actions suppressed - the Lambda runs 2x/day, so an auto-OK is aged-out, never a fix): manually re-arm/verify the 12 gated alarms (enable_alarm_actions / disable_alarm_actions) REGARDLESS, after reading the gate Lambda's log group."
+  alarm_description   = "The market-hours gate Lambda FAILED - its 09:20 IST open invocation is the ONLY path that arms the 8 gated alarms (market-hours-liveness-missing, aggregator-no-seals, order-update-reconnect-storm, app-log-ingestion-silent, tick-gap-instruments-silent, boundary-catchup-storm-dhan, dhan-exchange-lag-p99-high, groww-exchange-lag-p99-high - the Lambda's ALARM_NAMES env is the authoritative list; count 12 -> 8 in PR-C2 2026-07-14, the 4 Dhan-lane alarms retired). A failed open leaves all 8 disarmed for the session (the 2026-07-06 leg-3 zero-page class); a failed close leaves them armed overnight (false-page risk). NO green OK page ever follows this alarm (ok_actions suppressed - the Lambda runs 2x/day, so an auto-OK is aged-out, never a fix): manually re-arm/verify the 8 gated alarms (enable_alarm_actions / disable_alarm_actions) REGARDLESS, after reading the gate Lambda's log group."
   comparison_operator = "GreaterThanOrEqualToThreshold"
   evaluation_periods  = 1
   metric_name         = "Errors"
@@ -432,14 +437,15 @@ resource "aws_cloudwatch_metric_alarm" "market_hours_gate_lambda_errors" {
   # close), so the post-ALARM auto-OK is always AGED-OUT, never a fix — a
   # recurring Rule-11 false-recovery green per failure episode. Worse, for
   # THIS watchman the green also invited skipping the manual re-arm of the
-  # 12 gated alarms (incl. the leg-3 reconnect-storm pager) — the
+  # 8 gated alarms (incl. the leg-3 reconnect-storm pager) — the
   # description above says: re-arm manually REGARDLESS.
   ok_actions = []
 }
 
 # Open the liveness window at 09:20 IST (03:50 UTC) Mon-Fri — 5 min after the
-# 09:15 IST market open, giving the post-boot SLO loop time to publish its first
-# tv_realtime_guarantee_score sample on a healthy session.
+# 09:15 IST market open, giving the in-session Groww lag publisher time to reach
+# its >= 50-sample floor and publish its first tv_groww_exchange_lag_p99_seconds
+# sample on a healthy session (was the SLO score's budget pre-2026-07-13).
 resource "aws_cloudwatch_event_rule" "tv_market_hours_liveness_open" {
   name                = "tv-${var.environment}-market-hours-liveness-open"
   description         = "Enable market-hours liveness alarm actions at 09:20 IST (Mon-Fri)"
@@ -490,6 +496,6 @@ resource "aws_lambda_permission" "tv_market_hours_liveness_close" {
 }
 
 output "market_hours_liveness_alarm_name" {
-  description = "Market-hours liveness alarm (pages on a wedged/crash-looped/dead app OR a never-streamed Groww feed in the 09:20-15:35 IST window). Signal: the tv_groww_exchange_lag_p99_seconds gauge MISSING (treat_missing_data=breaching) — emitted every 10s in-session by the process-global Groww lag publisher in crates/app/src/main.rs, in the CW-agent filter (user-data.sh.tftpl). Moved off the Dhan-lane-owned tv_realtime_guarantee_score on 2026-07-13 (Phase A — the Dhan live WS lane, the score's only publisher, is retired per the operator directive). Takes over from the boot-heartbeat window at exactly 09:20 IST (2026-07-09 — the boot window close moved 09:10→09:20, so there is no seam over the 09:15 market open). The same gate Lambda also window-gates realtime-guarantee-critical + aggregator-no-seals (2026-07-03 5 AM false-SOS fix)."
+  description = "Market-hours liveness alarm (pages on a wedged/crash-looped/dead app OR a never-streamed Groww feed in the 09:20-15:35 IST window). Signal: the tv_groww_exchange_lag_p99_seconds gauge MISSING (treat_missing_data=breaching) — emitted every 10s in-session by the process-global Groww lag publisher in crates/app/src/main.rs, in the CW-agent filter (user-data.sh.tftpl). Moved off the Dhan-lane-owned tv_realtime_guarantee_score on 2026-07-13 (Phase A — the Dhan live WS lane, the score's only publisher, is retired per the operator directive). Takes over from the boot-heartbeat window at exactly 09:20 IST (2026-07-09 — the boot window close moved 09:10→09:20, so there is no seam over the 09:15 market open). The same gate Lambda also window-gates the other 7 ALARM_NAMES entries (aggregator-no-seals et al — the 2026-07-03 5 AM false-SOS fix, list trimmed to 8 in PR-C2 2026-07-14)."
   value       = aws_cloudwatch_metric_alarm.market_hours_liveness_missing.alarm_name
 }

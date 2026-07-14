@@ -14,16 +14,19 @@
 //! restart loop.
 //!
 //! Pins (comment lines are stripped before matching so a doc-comment
-//! mention can never vacuously satisfy a pin):
-//! 1. `infra::notify_systemd_ready();` appears on ALL THREE boot paths —
-//!    ≥3 real code sites, one of them inside the Dhan-OFF arm's
-//!    `if !config.feeds.dhan_enabled` block between the lane gate's
-//!    else-arm and the process run-loop.
+//! mention can never vacuously satisfy a pin). PR-C2 (2026-07-14, Dhan
+//! live-WS lane deletion) collapsed the three boot paths (fast
+//! crash-recovery / slow lane / Dhan-OFF) into ONE — the assertions below
+//! were re-pointed at the single-path reality in the same PR; an earlier
+//! revision of this header still said "ALL THREE boot paths / ≥3 real code
+//! sites" (stale — corrected here):
+//! 1. `infra::notify_systemd_ready();` appears EXACTLY ONCE — the single
+//!    unconditional READY site on the single boot path, between the REST
+//!    stack spawn and the process run-loop.
 //! 2. The PROCESS-GLOBAL `WATCHDOG=1` pinger spawn lives in the SHARED
-//!    boot prefix — in source order BEFORE the fast/slow arm split, BEFORE
-//!    the Dhan lane gate, and BEFORE every READY site — and is NOT gated
-//!    on `config.feeds.dhan_enabled` (no ON-gate exists anywhere above
-//!    it inside `main()`).
+//!    boot prefix — in source order BEFORE the READY site — and is NOT
+//!    gated on `config.feeds.dhan_enabled` (no ON-gate exists anywhere
+//!    above it inside `main()`).
 //! 3. The pinger body really pings (`infra::notify_systemd_watchdog();` on
 //!    a `WATCHDOG_INTERVAL_SECS` interval) — never a stub (Rule 14).
 //! 4. The code cadence honors the unit file: `WATCHDOG_INTERVAL_SECS × 2 ≤
