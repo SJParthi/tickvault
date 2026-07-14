@@ -35,6 +35,7 @@ pub mod feed_parity;
 pub mod formulas;
 pub mod instrument_registry;
 pub mod instrument_types;
+pub mod live_bar_freshness;
 pub mod locked_universe;
 pub mod market_hours;
 pub mod muhurat;

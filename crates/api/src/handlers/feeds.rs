@@ -283,6 +283,11 @@ pub struct FeedHealthRow {
     pub auth_rejected: bool,
     /// Seconds since the last tick; `null` = none yet.
     pub last_tick_age_secs: Option<u64>,
+    /// Additive read-only freshness verdict: `true` when the feed's last tick
+    /// is within the 60s decision-freshness bound (the §38.8 gate primitive,
+    /// `tickvault_common::live_bar_freshness::live_bar_is_fresh`). `None` age
+    /// (no tick seen) reads `false` — fail-closed, never a false-OK.
+    pub fresh_within_60s: bool,
     pub ticks_total: u64,
     pub candles_total: u64,
     pub drops_total: u64,
@@ -362,6 +367,19 @@ pub async fn get_feeds_health(State(state): State<SharedAppState>) -> Json<Feeds
                 lane_running: report.input.lane_running,
                 connected: report.input.connected,
                 last_tick_age_secs: report.input.last_tick_age_secs,
+                // Age → freshness via the shared primitive: an age of A secs is
+                // a bar stamped A secs ago, so fresh ⇔ live_bar_is_fresh(0, A, T).
+                // `None` (no tick yet) reads false — fail-closed (Rule 11).
+                fresh_within_60s: report.input.last_tick_age_secs.is_some_and(|age| {
+                    /// Read-only display bound for the /api/feeds/health page
+                    /// (mirrors the §38.8 ~60s decision-freshness threshold).
+                    const FEEDS_HEALTH_FRESH_SECS: u64 = 60;
+                    tickvault_common::live_bar_freshness::live_bar_is_fresh(
+                        0,
+                        age,
+                        FEEDS_HEALTH_FRESH_SECS,
+                    )
+                }),
                 ticks_total: report.input.ticks_total,
                 candles_total: report.input.candles_total,
                 drops_total: report.input.drops_total,
