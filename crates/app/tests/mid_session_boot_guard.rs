@@ -95,7 +95,7 @@ fn test_tick_gap_error_threshold_is_raised_to_300s() {
         src.contains("pub const TICK_GAP_ERROR_THRESHOLD_SECS: u32 = 300"),
         "2026-04-24 regression: TICK_GAP_ERROR_THRESHOLD_SECS reverted below 300s. \
          120s was too aggressive for illiquid F&O and produced 988 false ERRORs in 15min. \
-         Real disconnects are caught by WS ping/pong within 40s + no_tick_watchdog."
+         Real disconnects are caught by WS ping/pong within 40s + the feed-level stall watchdogs."
     );
 }
 
@@ -147,7 +147,7 @@ fn test_per_instrument_stall_poller_is_wired() {
     // 2026-04-24 audit finding #2: TickGapTracker::detect_stale_instruments()
     // existed in the tracker but was NEVER called in production. Per-instrument
     // stall (Dhan silently drops a subscription OR an ATM strike stops trading
-    // mid-session) stayed invisible until the global no_tick_watchdog fired
+    // mid-session) stayed invisible until the (since-retired 2026-07-14) global no-tick watchdog fired
     // on TOTAL silence. This guard ensures the 30s periodic poller stays
     // wired in run_slow_boot_observability.
     let src = read_file("crates/app/src/main.rs");

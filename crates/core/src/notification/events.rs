@@ -202,7 +202,11 @@ pub enum NotificationEvent {
     /// Dhan authentication token acquired at boot.
     AuthenticationSuccess,
 
-    /// Dhan authentication failed at boot — system started in offline mode.
+    /// Dhan login could not be obtained (family-(3) of the 2026-07-14
+    /// Dhan noise lock — the ONE Dhan token condition that pages).
+    /// Emitters: the boot-time auth failure AND the mid-session
+    /// watchdog's TERMINAL forced-re-mint failure. Body names the broker
+    /// + the consequence (the spot-1m / option-chain pulls stop).
     AuthenticationFailed { reason: String },
 
     /// Dhan authentication attempt failed transiently (network blip, DNS
@@ -237,14 +241,11 @@ pub enum NotificationEvent {
         within_market_hours: bool,
     },
 
-    /// Mid-session profile check failed during market hours (queue item
-    /// I7, 2026-04-21). Fires CRITICAL on the rising edge only — if
-    /// the profile recovers on a subsequent check, an INFO log is
-    /// emitted (no Telegram). The app does NOT HALT mid-session — a
-    /// mid-session HALT would drop the live WS feed, which costs more
-    /// than the silent-failure risk. Operator remediation is manual.
-    MidSessionProfileInvalidated { reason: String },
-
+    // `MidSessionProfileInvalidated` DELETED 2026-07-14 (operator Dhan
+    // noise lock — dhan-rest-only-noise-lock-2026-07-14.md): the 900s
+    // profile probe runs SILENTLY (coded error! + counters); a terminal
+    // forced-re-mint failure routes to the family-(3)
+    // `AuthenticationFailed` Critical instead.
     /// JWT token renewed successfully by background task.
     TokenRenewed,
 
@@ -793,6 +794,60 @@ pub enum NotificationEvent {
         detail: String,
     },
 
+    /// Daily BruteX↔TickVault 1-minute cross-verify summary
+    /// (BRUTEX-XVERIFY, 2026-07-12). One Info digest per trading day after
+    /// the 15:50 IST run — compares BruteX-produced 1-minute candles against
+    /// our live capture, minute by minute. Counts carry `-1` sentinels when
+    /// a leg could not be measured (rendered as "?", never fabricated zeros
+    /// — audit Rule 11).
+    BrutexCrossverifySummary {
+        /// Trading date in `YYYY-MM-DD` IST format.
+        trading_date_ist: String,
+        /// Fixed daily outcome slug:
+        /// `clean|diverged|partial|no_data|blind|degraded`.
+        outcome: String,
+        /// BruteX files fetched and read for the day (`-1` = unknown).
+        files_read: i64,
+        /// Symbols paired and compared across both sides (`-1` = unknown).
+        symbols_compared: i64,
+        /// Compared minutes where every field agreed within tolerance.
+        matched: i64,
+        /// Compared minutes with a beyond-tolerance difference.
+        diverged: i64,
+        /// Minutes we have live but BruteX's files do not.
+        missing_brutex: i64,
+        /// Minutes BruteX has but our live capture does not.
+        missing_live: i64,
+        /// 15:28/15:29 minutes absent live only due to close-seal timing —
+        /// informational, never counted as missing.
+        tail_unsealed: i64,
+        /// BruteX symbols that could not be paired to a live instrument.
+        unmapped: i64,
+        /// 95th-percentile absolute price difference across compared
+        /// minutes, in paise (`-1` = not measured).
+        noise_p95_paise: i64,
+        /// Maximum absolute price difference observed, in paise
+        /// (`-1` = not measured).
+        noise_max_paise: i64,
+        /// Pre-formatted worst-offender lines (plain English, one per
+        /// line); empty when there is nothing noteworthy.
+        top_offenders: String,
+        /// Optional plain-English context line (e.g. a same-day feed stall
+        /// that explains a gap); empty when there is none.
+        hint: String,
+    },
+
+    /// The daily BruteX cross-verify TASK died (panicked / errored) before
+    /// producing its summary. High so the ABSENCE of the daily check is
+    /// impossible to miss (mirrors `DualFeedScorecardAborted`). NOT fired
+    /// on graceful shutdown/cancellation.
+    BrutexCrossverifyAborted {
+        /// Trading date in `YYYY-MM-DD` IST format.
+        trading_date_ist: String,
+        /// Short FIXED failure classification (never raw external text).
+        reason: String,
+    },
+
     // PR #4 (2026-05-19): DepthSpotPriceStale variant retired alongside
     // the deleted depth-20/200 infrastructure (operator lock 2026-05-15).
     // PR #5 (2026-05-19): 7 Phase2* variants retired alongside the
@@ -883,19 +938,10 @@ pub enum NotificationEvent {
         threshold_secs: i64,
     },
 
-    /// AUTH-GAP-05 (2026-07-06) — the mid-session profile watchdog forced
-    /// a token re-mint after N consecutive REAL Dhan token rejections
-    /// during market hours. Severity::High; edge-triggered exactly once
-    /// per failing episode (the watchdog's retry-once latch). Fields are
-    /// label-only counts — never the JWT or any user data.
-    TokenForcedRemintTriggered {
-        /// Consecutive REAL `/v2/profile` auth failures observed.
-        consecutive_checks: u32,
-        /// The watchdog cadence (seconds) — used to render the human
-        /// "about N minutes" duration in the Telegram body.
-        check_interval_secs: u64,
-    },
-
+    // `TokenForcedRemintTriggered` DELETED 2026-07-14 (operator Dhan
+    // noise lock): the AUTH-GAP-05 forced re-mint is a SILENT self-heal
+    // (coded error! + tv_token_forced_remint_total counters); only a
+    // TERMINAL re-mint failure pages, via `AuthenticationFailed`.
     /// Order update WebSocket connected.
     OrderUpdateConnected,
 
@@ -935,19 +981,11 @@ pub enum NotificationEvent {
     /// disconnect leg (unchanged: `test_order_update_reconnected_severity_is_low`).
     OrderUpdateReconnected { consecutive_failures: u32 },
 
-    /// CRITICAL: zero live ticks received during market hours past the
-    /// configured silence threshold. Fires edge-triggered (once on rising
-    /// edge — when ticks resume, an INFO recovery log fires but no
-    /// Telegram). This event would have caught the 2026-04-21 morning
-    /// failure where the WS was connected but Dhan stopped streaming
-    /// (likely data-plan issue).
-    NoLiveTicksDuringMarketHours {
-        /// How long the heartbeat has been stale, in seconds.
-        silent_for_secs: u64,
-        /// Threshold that triggered the alert, in seconds.
-        threshold_secs: u64,
-    },
-
+    // 2026-07-14 operator Dhan noise lock: `NoLiveTicksDuringMarketHours`
+    // (Critical) DELETED with the no-tick watchdog — its heartbeat was fed
+    // ONLY by the Dhan tick pipeline; Groww stall detection is
+    // FEED-STALL-01 + the market-hours-liveness alarm. See
+    // .claude/rules/project/dhan-rest-only-noise-lock-2026-07-14.md.
     /// Graceful shutdown initiated.
     ShutdownInitiated,
 
@@ -1974,7 +2012,6 @@ impl NotificationEvent {
             | Self::AuthenticationFailed { .. }
             | Self::AuthenticationTransientFailure { .. }
             | Self::PreMarketProfileCheckFailed { .. }
-            | Self::MidSessionProfileInvalidated { .. }
             | Self::TokenRenewed
             | Self::TokenRenewalFailed { .. }
             // ── Dhan-scoped: main-feed WebSocket lifecycle ──
@@ -1991,7 +2028,6 @@ impl NotificationEvent {
             | Self::WebSocketSleepEntered { .. }
             | Self::WebSocketSleepResumed { .. }
             | Self::WebSocketTokenForceRenewedOnWake { .. }
-            | Self::TokenForcedRemintTriggered { .. }
             | Self::WebSocketReconnectionExhausted { .. }
             // ── Dhan-scoped: order-update WebSocket ──
             | Self::OrderUpdateConnected
@@ -2069,8 +2105,13 @@ impl NotificationEvent {
             }
             Self::AuthenticationSuccess => "<b>Auth OK</b> — Dhan JWT acquired".to_string(),
             Self::AuthenticationFailed { reason } => {
+                // 2026-07-14 Dhan noise lock reword: name the broker + the
+                // consequence in plain English (family-(3) — the ONE Dhan
+                // token condition that still pages).
                 format!(
-                    "<b>Auth FAILED</b> — offline mode\n{}",
+                    "🆘 <b>Dhan login could not be obtained</b>\n\
+                     The Dhan spot-1m and option-chain pulls will stop until this is fixed.\n\
+                     {}",
                     html_escape(&redact_url_params(reason))
                 )
             }
@@ -2108,21 +2149,13 @@ impl NotificationEvent {
                      Check: dataPlan == \"Active\", activeSegment contains \"Derivative\", tokenValidity > 4h."
                 )
             }
-            Self::MidSessionProfileInvalidated { reason } => {
-                let reason = html_escape(reason);
-                format!(
-                    "<b>CRITICAL: Mid-session profile INVALIDATED</b>\n{reason}\n\
-                     Live WS still running — operator action required.\n\
-                     Run:\n  curl -H \"access-token: $TOKEN\" https://api.dhan.co/v2/profile\n\
-                     Check: dataPlan == \"Active\", activeSegment contains \"Derivative\", tokenValidity > 4h.\n\
-                     If the profile is confirmed bad, restart the app so the boot-time HALT gate triggers \
-                     (the no-tick watchdog will then page again if ticks stop)."
-                )
-            }
             Self::TokenRenewed => "<b>Token renewed</b>".to_string(),
             Self::TokenRenewalFailed { attempts, reason } => {
+                // 2026-07-14 Dhan noise lock reword: broker + consequence.
                 format!(
-                    "<b>Token renewal FAILED</b> (attempt {attempts})\n{}",
+                    "🆘 <b>Dhan login renewal FAILED</b> (attempt {attempts})\n\
+                     If this keeps failing the Dhan spot-1m and option-chain pulls will stop.\n\
+                     {}",
                     html_escape(&redact_url_params(reason))
                 )
             }
@@ -2985,6 +3018,119 @@ impl NotificationEvent {
                      2. Restart the app to re-arm tomorrow's scorecard."
                 )
             }
+            Self::BrutexCrossverifySummary {
+                trading_date_ist,
+                outcome,
+                files_read,
+                symbols_compared,
+                matched,
+                diverged,
+                missing_brutex,
+                missing_live,
+                tail_unsealed,
+                unmapped,
+                noise_p95_paise,
+                noise_max_paise,
+                top_offenders,
+                hint,
+            } => {
+                // Verdict word from the FIXED outcome slug — a future
+                // unknown slug degrades to "UNKNOWN", never a panic.
+                let verdict: &str = match outcome.as_str() {
+                    "clean" => "CLEAN",
+                    "diverged" => "DIVERGED",
+                    "partial" => "PARTIAL DATA",
+                    "no_data" => "NO DATA",
+                    "blind" => "BLIND",
+                    "degraded" => "DEGRADED",
+                    _ => "UNKNOWN",
+                };
+                // LOUD first line for the days where the comparison could
+                // not vouch for anything (audit Rule 11 — never a quiet
+                // false-OK on an empty/partial compare set).
+                let loud: &str = match outcome.as_str() {
+                    "no_data" => {
+                        "\u{26a0}\u{fe0f} No files arrived from BruteX \
+                         today — nothing was compared.\n"
+                    }
+                    "blind" => {
+                        "\u{26a0}\u{fe0f} Nothing arrived on our own side \
+                         today — the check had nothing to compare against.\n"
+                    }
+                    "partial" => {
+                        "\u{26a0}\u{fe0f} PARTIAL DATA — only part of the \
+                         day could be compared; treat today's counts as a \
+                         floor.\n"
+                    }
+                    _ => "",
+                };
+                let offenders = if top_offenders.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        "Biggest differences today:\n{}\n",
+                        html_escape(top_offenders)
+                    )
+                };
+                let hint_line = if hint.is_empty() {
+                    String::new()
+                } else {
+                    format!("{}\n", html_escape(hint))
+                };
+                // Commandment 10: severity emoji at the START of the
+                // subject, from the canonical set — ✅ only on a
+                // fully-measured clean day; every other outcome
+                // (diverged/partial/blind/no_data/degraded/unknown)
+                // leads with ⚠️.
+                let lead: &str = if outcome.as_str() == "clean" {
+                    "\u{2705}"
+                } else {
+                    "\u{26a0}\u{fe0f}"
+                };
+                format!(
+                    "{lead} <b>BruteX vs live 1-minute check — \
+                     {trading_date_ist}: {verdict}</b>\n\
+                     {loud}\
+                     Files read from BruteX: {} | Symbols compared: {}\n\
+                     Minutes matched: {} | Diverged: {}\n\
+                     Missing on BruteX side: {} | Missing on our side: {}\n\
+                     Last minutes still sealing (not counted): {} | \
+                     Symbols we could not pair: {}\n\
+                     Typical wiggle: within {} paise on 95% of compared \
+                     minutes (max {}).\n\
+                     {offenders}\
+                     {hint_line}\
+                     Neither side is the ground truth — small wiggle is \
+                     expected; only beyond-tolerance rows are real \
+                     divergence.",
+                    render_count(*files_read),
+                    render_count(*symbols_compared),
+                    render_count(*matched),
+                    render_count(*diverged),
+                    render_count(*missing_brutex),
+                    render_count(*missing_live),
+                    render_count(*tail_unsealed),
+                    render_count(*unmapped),
+                    render_count(*noise_p95_paise),
+                    render_count(*noise_max_paise),
+                )
+            }
+            Self::BrutexCrossverifyAborted {
+                trading_date_ist,
+                reason,
+            } => {
+                let reason = html_escape(reason);
+                format!(
+                    "\u{1f198} <b>BruteX cross-verify run FAILED — \
+                     {trading_date_ist}</b>\n\
+                     The 3:50 PM IST BruteX-vs-live 1-minute check died \
+                     before finishing.\n\
+                     Reason: {reason}\n\
+                     What to do RIGHT NOW:\n\
+                     1. Check the app is still running.\n\
+                     2. Restart the app to re-arm tomorrow's check."
+                )
+            }
             // PR #4/#5 (2026-05-19): DepthSpotPriceStale + 7 Phase2*
             // Display arms retired with their variants.
             // PR #6a (2026-05-19): NseBhavcopyCheck* Display arms retired.
@@ -3099,23 +3245,6 @@ impl NotificationEvent {
                     connection_index.saturating_add(1)
                 )
             }
-            Self::TokenForcedRemintTriggered {
-                consecutive_checks,
-                check_interval_secs,
-            } => {
-                // Plain English per the 10 Telegram commandments: status
-                // emoji first, specific numbers, one decision, no library
-                // names / file paths / token material.
-                let minutes =
-                    u64::from(*consecutive_checks).saturating_mul(*check_interval_secs) / 60;
-                format!(
-                    "⚠️ <b>AUTH-GAP-05: broker login looks invalid — auto re-login started</b>\n\
-                     The broker rejected our login check {consecutive_checks} times in a row \
-                     (about {minutes} minutes). We are fetching a fresh login automatically.\n\
-                     If it clears you'll hear nothing more; if it fails again you'll get a red \
-                     alert — keep only ONE copy of the app running and restart it."
-                )
-            }
             Self::OrderUpdateConnected => "<b>Order Update WS connected</b>".to_string(),
             Self::OrderUpdateAuthenticated => {
                 "<b>Order Update WS authenticated</b>\nDhan accepted token — streaming live."
@@ -3126,17 +3255,6 @@ impl NotificationEvent {
             } => {
                 format!(
                     "<b>Order Update WS reconnected</b>\nRecovered after {consecutive_failures} consecutive failures"
-                )
-            }
-            Self::NoLiveTicksDuringMarketHours {
-                silent_for_secs,
-                threshold_secs,
-            } => {
-                format!(
-                    "<b>CRITICAL: zero live ticks during market hours</b>\n\
-                     Silent for {silent_for_secs}s (threshold {threshold_secs}s).\n\
-                     WebSockets may be connected but NO data streaming. \
-                     Check Dhan dataPlan + IP allowlist + token validity."
                 )
             }
             Self::OrderUpdateDisconnected { reason } => {
@@ -3672,7 +3790,6 @@ impl NotificationEvent {
             Self::AuthenticationFailed { .. } => "AuthenticationFailed",
             Self::AuthenticationTransientFailure { .. } => "AuthenticationTransientFailure",
             Self::PreMarketProfileCheckFailed { .. } => "PreMarketProfileCheckFailed",
-            Self::MidSessionProfileInvalidated { .. } => "MidSessionProfileInvalidated",
             Self::TokenRenewed => "TokenRenewed",
             Self::TokenRenewalFailed { .. } => "TokenRenewalFailed",
             Self::WebSocketConnected { .. } => "WebSocketConnected",
@@ -3710,6 +3827,8 @@ impl NotificationEvent {
             Self::ChainExpirylistFailed { .. } => "ChainExpirylistFailed",
             Self::DualFeedDailyScorecard { .. } => "DualFeedDailyScorecard",
             Self::DualFeedScorecardAborted { .. } => "DualFeedScorecardAborted",
+            Self::BrutexCrossverifySummary { .. } => "BrutexCrossverifySummary",
+            Self::BrutexCrossverifyAborted { .. } => "BrutexCrossverifyAborted",
             // PR #4/#5 (2026-05-19): DepthSpotPriceStale + 7 Phase2*
             // name arms retired.
             // PR #6a (2026-05-19): NseBhavcopyCheck* name arms retired.
@@ -3719,12 +3838,10 @@ impl NotificationEvent {
             Self::WebSocketSleepEntered { .. } => "WebSocketSleepEntered",
             Self::WebSocketSleepResumed { .. } => "WebSocketSleepResumed",
             Self::WebSocketTokenForceRenewedOnWake { .. } => "WebSocketTokenForceRenewedOnWake",
-            Self::TokenForcedRemintTriggered { .. } => "TokenForcedRemintTriggered",
             Self::OrderUpdateConnected => "OrderUpdateConnected",
             Self::OrderUpdateAuthenticated => "OrderUpdateAuthenticated",
             Self::OrderUpdateDisconnected { .. } => "OrderUpdateDisconnected",
             Self::OrderUpdateReconnected { .. } => "OrderUpdateReconnected",
-            Self::NoLiveTicksDuringMarketHours { .. } => "NoLiveTicksDuringMarketHours",
             Self::ShutdownInitiated => "ShutdownInitiated",
             Self::ShutdownComplete => "ShutdownComplete",
             Self::InstrumentBuildSuccess { .. } => "InstrumentBuildSuccess",
@@ -3918,7 +4035,6 @@ impl NotificationEvent {
             // Critical instead.
             Self::AuthenticationTransientFailure { .. } => Severity::Low,
             Self::PreMarketProfileCheckFailed { .. } => Severity::Critical,
-            Self::MidSessionProfileInvalidated { .. } => Severity::Critical,
             Self::TokenRenewalFailed { .. } => Severity::Critical,
             Self::InstrumentBuildFailed { .. } => Severity::High,
             Self::WebSocketDisconnected { .. } => Severity::High,
@@ -3936,11 +4052,6 @@ impl NotificationEvent {
                 Severity::Low
             }
             Self::WebSocketTokenForceRenewedOnWake { .. } => Severity::Low,
-            // AUTH-GAP-05 (2026-07-06): the forced re-mint IS the
-            // self-remediation, but the operator must see every trigger —
-            // High (pages Telegram), not Critical (the standing
-            // MidSessionProfileInvalidated page covers the unrecovered case).
-            Self::TokenForcedRemintTriggered { .. } => Severity::High,
             // Routine zero-disconnect drift swap — green by design. Prior
             // `Custom` routing made every 60s drift fire [HIGH] amber; see
             // Fix #9 in .claude/plans/active-plan.md and .claude/rules/project/
@@ -3948,7 +4059,6 @@ impl NotificationEvent {
             // Swap itself failed — depth quality degraded until next rebalance.
             Self::OrderUpdateDisconnected { .. } => Severity::High,
             Self::OrderUpdateReconnected { .. } => Severity::Low,
-            Self::NoLiveTicksDuringMarketHours { .. } => Severity::Critical,
             Self::ShutdownInitiated => Severity::Medium,
             Self::CircuitBreakerClosed => Severity::Medium,
             Self::WebSocketConnected { .. } => Severity::Low,
@@ -4047,6 +4157,12 @@ impl NotificationEvent {
             // death fires the High Aborted variant below instead.
             Self::DualFeedDailyScorecard { .. } => Severity::Info,
             Self::DualFeedScorecardAborted { .. } => Severity::High,
+            // BruteX cross-verify (2026-07-12): Info per the contract — the
+            // daily digest is a positive signal; the LOUD body lines carry
+            // degraded/no-data days, and a task death fires the High
+            // Aborted variant below instead.
+            Self::BrutexCrossverifySummary { .. } => Severity::Info,
+            Self::BrutexCrossverifyAborted { .. } => Severity::High,
             Self::SelfTestPassed { .. } => Severity::Info,
             Self::SelfTestDegraded { .. } => Severity::High,
             Self::RealtimeGuaranteeHealthy { .. } => Severity::Info,
@@ -4206,6 +4322,11 @@ impl NotificationEvent {
             // default Info routing would coalesce it) — same rationale as
             // CrossVerify1mSummary above.
             Self::DualFeedDailyScorecard { .. } => DispatchPolicy::Immediate,
+            // BruteX cross-verify (2026-07-12): the once-per-day 15:50 IST
+            // digest must arrive AT 15:50 (post-close = off-hours, so the
+            // default Info routing would coalesce it) — same rationale as
+            // CrossVerify1mSummary / DualFeedDailyScorecard above.
+            Self::BrutexCrossverifySummary { .. } => DispatchPolicy::Immediate,
             // 2026-07-08 (verified incident, operator complaint "why every
             // telegram notification is very late"): PR #1439's in-market
             // digest (900s window) swept the three once-per-trading-day
@@ -5159,7 +5280,15 @@ mod tests {
         };
         let msg = event.to_message();
         assert!(msg.contains("HTTP 401 Unauthorized"));
-        assert!(msg.contains("FAILED"));
+        // 2026-07-14 noise-lock reword pins: broker named + consequence.
+        assert!(
+            msg.contains("Dhan login could not be obtained"),
+            "got: {msg}"
+        );
+        assert!(
+            msg.contains("spot-1m and option-chain pulls will stop"),
+            "consequence line missing: {msg}"
+        );
     }
 
     #[test]
@@ -5171,7 +5300,7 @@ mod tests {
         assert!(!msg.contains("0000000000"), "client ID leaked: {msg}");
         assert!(!msg.contains("pin=000000"), "PIN leaked: {msg}");
         assert!(!msg.contains("totp=000000"), "TOTP leaked: {msg}");
-        assert!(msg.contains("FAILED"));
+        assert!(msg.contains("Dhan login could not be obtained"));
         assert!(msg.contains("[REDACTED]"));
     }
 
@@ -6685,13 +6814,10 @@ mod tests {
         assert_external_text_escaped(&ev.to_message());
     }
 
-    #[test]
-    fn test_mid_session_profile_invalidated_escapes_external_reason() {
-        let ev = NotificationEvent::MidSessionProfileInvalidated {
-            reason: HOSTILE.to_string(),
-        };
-        assert_external_text_escaped(&ev.to_message());
-    }
+    // test_mid_session_profile_invalidated_escapes_external_reason DELETED
+    // 2026-07-14 with the MidSessionProfileInvalidated variant (Dhan noise
+    // lock) — the terminal arm routes through AuthenticationFailed, whose
+    // escape test is directly above.
 
     #[test]
     fn test_cross_verify_1m_aborted_escapes_external_detail() {
@@ -8572,6 +8698,185 @@ mod tests {
         assert!(msg.contains("What to do RIGHT NOW"), "{msg}");
     }
 
+    // -----------------------------------------------------------------------
+    // BrutexCrossverifySummary + BrutexCrossverifyAborted
+    // (BRUTEX-XVERIFY, 2026-07-12)
+    // -----------------------------------------------------------------------
+
+    #[allow(clippy::too_many_arguments)]
+    fn brutex_summary(
+        outcome: &str,
+        diverged: i64,
+        noise_p95_paise: i64,
+        noise_max_paise: i64,
+        top_offenders: &str,
+        hint: &str,
+    ) -> NotificationEvent {
+        NotificationEvent::BrutexCrossverifySummary {
+            trading_date_ist: "2026-07-12".to_string(),
+            outcome: outcome.to_string(),
+            files_read: 5,
+            symbols_compared: 742,
+            matched: 276_490,
+            diverged,
+            missing_brutex: 12,
+            missing_live: 3,
+            tail_unsealed: 742,
+            unmapped: 6,
+            noise_p95_paise,
+            noise_max_paise,
+            top_offenders: top_offenders.to_string(),
+            hint: hint.to_string(),
+        }
+    }
+
+    #[test]
+    fn test_brutex_crossverify_summary_clean_day() {
+        let ev = brutex_summary("clean", 0, 5, 40, "", "");
+        assert_eq!(ev.topic(), "BrutexCrossverifySummary");
+        assert_eq!(ev.severity(), Severity::Info);
+        // The once-per-day 15:50 digest must arrive AT 15:50 — post-close
+        // is off-hours, so the default Info routing would coalesce it
+        // (CrossVerify1mSummary / DualFeedDailyScorecard precedent).
+        assert_eq!(ev.dispatch_policy(), DispatchPolicy::Immediate);
+        let msg = ev.to_message();
+        assert!(
+            msg.starts_with("\u{2705}"),
+            "clean day leads with the canonical OK emoji: {msg}"
+        );
+        assert!(
+            msg.contains("BruteX vs live 1-minute check — 2026-07-12: CLEAN"),
+            "{msg}"
+        );
+        assert!(msg.contains("Files read from BruteX: 5"), "{msg}");
+        assert!(msg.contains("Symbols compared: 742"), "{msg}");
+        // Commandment 6: big counts carry thousands separators.
+        assert!(
+            msg.contains("Minutes matched: 276,490 | Diverged: 0"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("Typical wiggle: within 5 paise on 95% of compared minutes (max 40)."),
+            "noise band line missing: {msg}"
+        );
+        // The honesty line is ALWAYS present.
+        assert!(
+            msg.contains(
+                "Neither side is the ground truth — small wiggle is expected; \
+                 only beyond-tolerance rows are real divergence."
+            ),
+            "honesty line missing: {msg}"
+        );
+        // No loud warning line and no offenders block on a clean day.
+        assert!(!msg.contains('\u{26a0}'), "{msg}");
+        assert!(!msg.contains("Biggest differences today"), "{msg}");
+        // 10-commandments litmus: no file paths / library / infra names.
+        for banned in ["data/", "QuestDB", "ILP", "DEDUP", ".rs", "SQL", "S3"] {
+            assert!(
+                !msg.contains(banned),
+                "operator text must not carry {banned:?}: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_brutex_crossverify_summary_no_data_is_loud_and_renders_sentinels() {
+        let ev = NotificationEvent::BrutexCrossverifySummary {
+            trading_date_ist: "2026-07-12".to_string(),
+            outcome: "no_data".to_string(),
+            files_read: 0,
+            symbols_compared: 0,
+            matched: 0,
+            diverged: 0,
+            missing_brutex: 0,
+            missing_live: 0,
+            tail_unsealed: 0,
+            unmapped: 0,
+            noise_p95_paise: -1,
+            noise_max_paise: -1,
+            top_offenders: String::new(),
+            hint: String::new(),
+        };
+        let msg = ev.to_message();
+        assert!(msg.contains(": NO DATA"), "{msg}");
+        // The LOUD line: an empty compare set must never read quiet
+        // (audit Rule 11 — no false-OK on nothing).
+        assert!(
+            msg.contains(
+                "\u{26a0}\u{fe0f} No files arrived from BruteX today — \
+                 nothing was compared."
+            ),
+            "loud no-data line missing: {msg}"
+        );
+        // -1 sentinels render as "?" — never fabricated zeros.
+        assert!(
+            msg.contains("Typical wiggle: within ? paise on 95% of compared minutes (max ?)."),
+            "sentinel rendering wrong: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_brutex_crossverify_summary_diverged_carries_offenders_and_honesty() {
+        let ev = brutex_summary(
+            "diverged",
+            42,
+            5,
+            180,
+            "RELIANCE 10:15 AM high off by 15 paise\n\
+             INFY 11:30 AM close off by 9 paise",
+            "Our feed had a stall episode at 10:14 AM — the gap lines up.",
+        );
+        let msg = ev.to_message();
+        assert!(
+            msg.starts_with("\u{26a0}\u{fe0f}"),
+            "diverged day leads with the canonical warning emoji: {msg}"
+        );
+        assert!(
+            msg.contains("BruteX vs live 1-minute check — 2026-07-12: DIVERGED"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("Minutes matched: 276,490 | Diverged: 42"),
+            "{msg}"
+        );
+        assert!(msg.contains("Biggest differences today:"), "{msg}");
+        assert!(
+            msg.contains("RELIANCE 10:15 AM high off by 15 paise"),
+            "offender line missing: {msg}"
+        );
+        assert!(
+            msg.contains("Our feed had a stall episode at 10:14 AM"),
+            "hint line missing: {msg}"
+        );
+        // The honesty line survives on a diverged day too.
+        assert!(
+            msg.contains(
+                "Neither side is the ground truth — small wiggle is expected; \
+                 only beyond-tolerance rows are real divergence."
+            ),
+            "honesty line missing: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_brutex_crossverify_aborted_event() {
+        let ev = NotificationEvent::BrutexCrossverifyAborted {
+            trading_date_ist: "2026-07-12".to_string(),
+            reason: "task_panicked".to_string(),
+        };
+        assert_eq!(ev.topic(), "BrutexCrossverifyAborted");
+        assert_eq!(ev.severity(), Severity::High);
+        let msg = ev.to_message();
+        assert!(msg.contains("\u{1f198}"), "leads with 🆘: {msg}");
+        assert!(
+            msg.contains("BruteX cross-verify run FAILED — 2026-07-12"),
+            "{msg}"
+        );
+        assert!(msg.contains("3:50 PM IST"), "{msg}");
+        assert!(msg.contains("Reason: task_panicked"), "{msg}");
+        assert!(msg.contains("What to do RIGHT NOW"), "{msg}");
+    }
+
     #[test]
     fn test_scorecard_render_helpers() {
         // render_ms: sentinel / sub-second / ≥1s bands.
@@ -8762,51 +9067,12 @@ mod tests {
             reconnected.contains("reconnected") && reconnected.contains('3'),
             "got: {reconnected}"
         );
-        let silent = NotificationEvent::NoLiveTicksDuringMarketHours {
-            silent_for_secs: 120,
-            threshold_secs: 60,
-        }
-        .to_message();
-        assert!(
-            silent.contains("zero live ticks") && silent.contains("120"),
-            "got: {silent}"
-        );
     }
 
-    /// AUTH-GAP-05 (2026-07-06) — the ONE HIGH forced-re-mint event:
-    /// severity / event_kind / Dhan badge / 10-commandments body (status
-    /// emoji, code id, specific numbers, NO token material, NO file paths).
-    #[test]
-    fn test_token_forced_remint_triggered_event() {
-        let ev = NotificationEvent::TokenForcedRemintTriggered {
-            consecutive_checks: 2,
-            check_interval_secs: 900,
-        };
-        assert_eq!(ev.severity(), Severity::High);
-        assert_eq!(ev.topic(), "TokenForcedRemintTriggered");
-        assert_eq!(
-            ev.feed_badge(),
-            Some(super::super::feed_badge::FeedBadge::Dhan.badge()),
-            "forced re-mint is Dhan-scoped — must lead with the Dhan badge"
-        );
-        let msg = ev.to_message();
-        assert!(msg.contains("AUTH-GAP-05"), "got: {msg}");
-        assert!(msg.contains("⚠️"), "status emoji missing: {msg}");
-        assert!(
-            msg.contains("2 times") && msg.contains("30 minutes"),
-            "specific numbers missing (2 checks × 900s = 30 min): {msg}"
-        );
-        // 10-commandments: never the JWT, never a file path or lib name.
-        assert!(
-            !msg.contains("eyJ"),
-            "JWT material must never appear: {msg}"
-        );
-        assert!(!msg.contains(".rs"), "file paths must never appear: {msg}");
-        assert!(
-            !msg.contains("force_renewal") && !msg.contains("arc-swap"),
-            "library/function names must never appear: {msg}"
-        );
-    }
+    // test_token_forced_remint_triggered_event DELETED 2026-07-14 with the
+    // TokenForcedRemintTriggered variant (Dhan noise lock) — the forced
+    // re-mint self-heals silently; only a terminal failure pages via the
+    // AuthenticationFailed family-(3) Critical.
 
     // -----------------------------------------------------------------
     // W2 PR#5 (2026-07-10) — HolidayCalendarCoverageLow

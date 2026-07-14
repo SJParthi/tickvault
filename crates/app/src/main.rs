@@ -2158,34 +2158,12 @@ async fn main() -> Result<()> {
             );
         }
 
-        // AUTH-GAP-06 (2026-07-08 — operator incident, THIRD morning
-        // cached-token outage, 08:32–09:06 IST on 2026-07-07): the fast arm
-        // previously trusted yesterday's cached token blindly — Dhan had
-        // killed it (one active token at a time), so the WS pool spawned
-        // dead and stayed dead until the ~30-min AUTH-GAP-05 watchdog /
-        // manual intervention. Validate the cached token with ONE
-        // GET /v2/profile BEFORE any WebSocket spawn: a prefix-anchored
-        // 401/403 rejection forces a re-mint through the EXISTING
-        // TokenManager machinery (RESILIENCE-03 in-flight tripwire +
-        // Dhan mint semantics preserved; this arm passes None for the
-        // dual-instance lock flag per dual-instance-lock-2026-07-04.md §3
-        // — documented residual, deliberately UNCHANGED). Transient /
-        // REST-surface failures retry once, then proceed LOUDLY with the
-        // cached token — boot never hangs, never gains a mint-on-ambiguity
-        // path. Returns Some(manager) on the remint path so the deferred
-        // background arm below reuses it (no duplicate SSM fetch). Ordering
-        // (validation → cooldown wait → create_websocket_pool) is pinned by
-        // crates/app/tests/fast_boot_token_validation_wiring_guard.rs.
-        let fast_boot_prevalidated_token_manager =
-            tickvault_core::auth::fast_boot_validation::validate_cached_token_at_fast_boot(
-                &token_handle,
-                &client_id,
-                &config.dhan,
-                &config.token,
-                &config.network,
-                &fast_notifier,
-            )
-            .await;
+        // AUTH-GAP-06 fast-boot cached-token validation DELETED 2026-07-14
+        // (operator Dhan noise lock — dhan-rest-only-noise-lock-2026-07-14.md):
+        // this Dhan-gated fast arm is dead with `dhan_enabled = false` and is
+        // deleted wholesale by the Phase C-2 lane PR; a stale cached token on
+        // a REST-only boot is covered by dhan_rest_stack Phase 2's full
+        // TokenManager::initialize (which owns cache/mint logic itself).
 
         // WS-GAP-08 (2026-07-06 audit fix): the FAST crash-recovery arm must
         // ALSO honour a persisted Dhan 429 rate-limit cooldown BEFORE its
@@ -2274,17 +2252,11 @@ async fn main() -> Result<()> {
             // multi-TF aggregator (Engine B) is the only candle engine.
             let tick_broadcast_for_processor = Some(fast_tick_broadcast_sender.clone());
 
-            // Parthiban directive (2026-04-21): no-tick-during-market-hours
-            // watchdog. The tick processor updates this atomic on every
-            // parsed tick; the watchdog fires CRITICAL + Telegram if it
-            // stays stale > NO_TICK_THRESHOLD_SECS during market hours.
-            let fast_tick_heartbeat =
-                tickvault_core::pipeline::no_tick_watchdog::new_tick_heartbeat();
-            let _no_tick_watchdog_handle =
-                tickvault_core::pipeline::no_tick_watchdog::spawn_no_tick_watchdog(
-                    std::sync::Arc::clone(&fast_tick_heartbeat),
-                    Some(std::sync::Arc::clone(&fast_notifier)),
-                );
+            // 2026-07-14 operator Dhan noise lock: the no-tick watchdog
+            // (NoLiveTicksDuringMarketHours Critical) is DELETED — its
+            // heartbeat was fed ONLY by the Dhan tick pipeline; Groww stall
+            // detection is FEED-STALL-01 + the market-hours-liveness alarm.
+            // See .claude/rules/project/dhan-rest-only-noise-lock-2026-07-14.md.
 
             // O(1) EXEMPT: cold path — build inline Greeks computer once at startup.
             let greeks_enricher = build_inline_greeks_enricher(&config, &subscription_plan);
@@ -2318,7 +2290,7 @@ async fn main() -> Result<()> {
                     fast_tick_writer,
                     tick_broadcast_for_processor,
                     greeks_enricher,
-                    Some(fast_tick_heartbeat),
+                    None, // tick_heartbeat — no-tick watchdog retired 2026-07-14 (Dhan noise lock)
                     None, // tick_enricher — Phase 2.5 wiring deferred until prev_oi_cache + boot ordering gate land in slow boot
                     tickvault_common::always_on::current(), // §30 GIFT exemption
                     Some(feed_health_for_processor), // SP5: Dhan live-feed health
@@ -2610,17 +2582,8 @@ async fn main() -> Result<()> {
             },
             // SSM validation + TokenManager for renewal
             async {
-                // AUTH-GAP-06 (2026-07-08): the fast-boot cached-token
-                // validation may already have constructed (and re-minted
-                // through) a TokenManager on its Remint path — reuse it
-                // instead of a duplicate SSM fetch + duplicate manager.
-                if let Some(manager) = fast_boot_prevalidated_token_manager {
-                    info!(
-                        "deferred auth: reusing the AUTH-GAP-06 fast-boot validation \
-                         TokenManager (re-mint path) — skipping duplicate initialize_deferred"
-                    );
-                    return Ok(Ok(manager));
-                }
+                // (The AUTH-GAP-06 prevalidated-manager reuse branch was
+                // deleted 2026-07-14 with fast_boot_validation.rs.)
                 let timeout = std::time::Duration::from_secs(
                     tickvault_common::constants::TOKEN_INIT_TIMEOUT_SECS,
                 );
@@ -2964,28 +2927,11 @@ async fn main() -> Result<()> {
             handle
         });
 
-        // EDGE-2 fix (2026-07-06): AUTH-GAP-05 live token-health gauge
-        // poller on the FAST arm too. Without it, a market-hours
-        // crash-recovery boot (the path MOST correlated with token trouble)
-        // regressed `tv_token_remaining_seconds` to the frozen mint-time
-        // renewal-loop snapshots and `tv_token_valid` never existed (an
-        // alarm on it would go missing-data). The FAST arm runs NO
-        // mid-session profile watchdog, so the profile flag is a fresh
-        // inert `true` — honest envelope: on this arm the composite gauge
-        // reflects has_token AND local expiry only (the local-expiry gate
-        // still forces 0 for a locally-dead token). Handle rides into
-        // `DhanLaneRunHandles` via `run_shutdown_fast` so the H8 Drop floor
-        // owns it.
-        let token_health_gauge_handle = token_manager.as_ref().map(|tm| {
-            tickvault_core::auth::token_health_gauge::spawn_token_health_gauge_poller(
-                std::sync::Arc::clone(tm),
-                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
-            )
-        });
-        info!(
-            spawned = token_health_gauge_handle.is_some(),
-            "live token-health gauge poller (fast boot — profile watchdog not running on this arm)"
-        );
+        // GAP-06 (2026-07-14, Dhan noise lock): the fast-arm token-health
+        // gauge poller spawn is DELETED — the poller is RE-HOMED into
+        // `dhan_rest_stack` Phase 3 (which runs on every dhan-enabled
+        // boot mode and shares the watchdog's profile-truth flag). This
+        // fast crash-recovery arm is Dhan-lane-gated dead code post-#1522.
 
         // PR-C (2026-05-26): Dhan historical fetch chain DELETED entirely
         // per operator directive — pre-market buffer + gap_fill +
@@ -3093,6 +3039,16 @@ async fn main() -> Result<()> {
             &feed_runtime,
         );
 
+        // BruteX↔TickVault daily cross-verify (BRUTEX-XVERIFY, 2026-07-12) —
+        // the 15:50 IST runner must exist on BOTH boot paths (mirror of the
+        // scoreboard spawn above). Config-gated ([brutex_crossverify] enabled,
+        // default OFF); disabled = one info! + return, nothing spawned.
+        tickvault_app::brutex_crossverify_boot::spawn_brutex_crossverify_task(
+            &config,
+            &trading_calendar,
+            &notifier,
+        );
+
         // Groww per-minute spot 1m REST leg on the FAST crash-recovery arm
         // too (hostile round 1 item 1 — the scoreboard dual-site pattern):
         // this arm `return run_shutdown_fast`s and never reaches the
@@ -3121,7 +3077,8 @@ async fn main() -> Result<()> {
             Some(order_update_handle),
             Some(api_handle),
             trading_handle,
-            token_health_gauge_handle,
+            // GAP-06 (2026-07-14): gauge poller re-homed to dhan_rest_stack.
+            None,
             fast_pool_watchdog_handle,
             otel_provider,
             &notifier,
@@ -3315,6 +3272,16 @@ async fn main() -> Result<()> {
         &notifier,
         process_start_ist_nanos,
         &feed_runtime,
+    );
+
+    // BruteX↔TickVault daily cross-verify (BRUTEX-XVERIFY, 2026-07-12) —
+    // PROCESS-GLOBAL spawn like the scoreboard above: the 15:50 IST runner
+    // + supervisor. Config-gated ([brutex_crossverify] enabled, default OFF);
+    // disabled = one info! + return, nothing spawned.
+    tickvault_app::brutex_crossverify_boot::spawn_brutex_crossverify_task(
+        &config,
+        &trading_calendar,
+        &notifier,
     );
 
     // Groww per-minute spot 1m REST leg (operator grant 2026-07-13 — PR-2 of
@@ -5304,7 +5271,7 @@ async fn run_slow_boot_observability(
     // to a 30s periodic poller. The method existed in the tracker but was never
     // called in production, so per-instrument stall detection (Dhan silently drops
     // a subscription OR an ATM strike stops trading mid-session) stayed invisible
-    // until the global `no_tick_watchdog` fired on total silence — up to 120s
+    // until the global no-tick watchdog (retired 2026-07-14) fired on total silence — up to 120s
     // of missed signals on a single underlying. The 30s cadence is the sweet
     // spot: fast enough to catch stalls before operators manually notice them,
     // slow enough to stay off the hot path (O(n) scan of tracked securities,
@@ -7742,14 +7709,8 @@ async fn start_dhan_lane(
         // volume_nse_audit QuestDB table is KEPT on disk per SEBI 5-year
         // retention pending operator-triggered DROP TABLE migration.
 
-        // Parthiban directive (2026-04-21): no-tick-during-market-hours
-        // watchdog (slow boot path). Same pattern as fast boot above.
-        let slow_tick_heartbeat = tickvault_core::pipeline::no_tick_watchdog::new_tick_heartbeat();
-        let _slow_no_tick_watchdog_handle =
-            tickvault_core::pipeline::no_tick_watchdog::spawn_no_tick_watchdog(
-                std::sync::Arc::clone(&slow_tick_heartbeat),
-                Some(std::sync::Arc::clone(&notifier)),
-            );
+        // 2026-07-14 operator Dhan noise lock: the no-tick watchdog (slow
+        // boot path) is DELETED — see the fast-arm note above.
 
         // 29-tf engine plan Phase 2.6 — Phase 2 lifecycle enricher.
         //
@@ -7975,7 +7936,7 @@ async fn start_dhan_lane(
                 tick_writer,
                 tick_broadcast_for_processor,
                 greeks_enricher,
-                Some(slow_tick_heartbeat),
+                None, // tick_heartbeat — no-tick watchdog retired 2026-07-14 (Dhan noise lock)
                 // 29-tf engine Phase 2.6 — production-attach the
                 // lifecycle enricher. The prev_oi_cache was loaded
                 // synchronously above (or skipped on QuestDB error
@@ -9112,10 +9073,10 @@ async fn start_dhan_lane(
     // -----------------------------------------------------------------------
     // Every 15 minutes during market hours, re-runs `pre_market_check`
     // (dataPlan == "Active", activeSegment contains "Derivative", token
-    // expires > 4h). On rising-edge failure fires CRITICAL Telegram via
-    // NotificationEvent::MidSessionProfileInvalidated. Does NOT HALT —
-    // dropping the live WS feed mid-session costs more than the
-    // silent-failure risk we're monitoring.
+    // expires > 4h). SILENT since 2026-07-14 (Dhan noise lock): rising-edge
+    // failure is a coded error! + counter; the AUTH-GAP-05 re-mint
+    // self-heals, and only a TERMINAL re-mint failure pages (the
+    // family-(3) AuthenticationFailed Critical). Does NOT HALT.
     // Lane-owned (AG5-R1 fix, 2026-07-06): registered in `DhanLaneRunHandles`
     // below so a runtime Dhan disable aborts it. An unregistered spawn would
     // survive the lane teardown holding the DEAD lane's `Arc<TokenManager>`
@@ -9131,27 +9092,11 @@ async fn start_dhan_lane(
         );
     info!("mid-session profile watchdog spawned (15-min cadence, market-hours only)");
 
-    // AUTH-GAP-05: live token-health gauge poller — makes
-    // `tv_token_remaining_seconds` LIVE (was the frozen mint-time snapshot)
-    // and publishes the honest AND-composed `tv_token_valid` 0/1 gauge.
-    // NOT market-hours gated (a killed/expired token must read 0 24/7);
-    // the first interval tick fires immediately, so both gauges are live
-    // at spawn (no separate boot seed needed).
-    // Lane-owned (AG5-R1 fix, 2026-07-06): registered in `DhanLaneRunHandles`
-    // below, mirroring `token_health_handle` — an unregistered spawn would
-    // survive the lane teardown, keep the dead lane's `Arc<TokenManager>`
-    // alive, and publish `tv_token_valid=1.0` for up to ~24h while Dhan is
-    // deliberately OFF (false-OK, audit Rule 11) — then interleave with the
-    // re-enabled lane's fresh poller (gauge flapping every ≤15s).
-    let token_health_gauge_handle =
-        tickvault_core::auth::token_health_gauge::spawn_token_health_gauge_poller(
-            std::sync::Arc::clone(&token_manager),
-            std::sync::Arc::clone(&token_profile_valid),
-        );
-    info!(
-        poll_secs = tickvault_core::auth::token_health_gauge::TOKEN_HEALTH_GAUGE_POLL_SECS,
-        "live token-health gauge poller spawned (tv_token_remaining_seconds + tv_token_valid)"
-    );
+    // GAP-06 (2026-07-14, Dhan noise lock): the lane's token-health gauge
+    // poller spawn is DELETED — the poller is RE-HOMED into
+    // `dhan_rest_stack` Phase 3 (shares the stack watchdog's profile-truth
+    // flag), so the gauges stay live on dhan-off boots. This lane path is
+    // dead code post-#1522.
 
     // -----------------------------------------------------------------------
     // Step 12b: Spawn periodic token-sweep (Audit Finding #6, 2026-05-03)
@@ -9458,11 +9403,11 @@ async fn start_dhan_lane(
         // B3 round-2 (MEDIUM-1): lane-owned so teardown aborts it + resets
         // the shared token block to the honest lane-off state.
         token_health_handle: Some(token_health_handle),
-        // AG5-R1 fix (2026-07-06): the AUTH-GAP-05 gauge poller + the
-        // remint-capable mid-session watchdog are lane-owned too — teardown
-        // aborts them and publishes the honest 0/0.0 gauge state so a
-        // deliberately-OFF lane can never keep reporting tv_token_valid=1.0.
-        token_health_gauge_handle: Some(token_health_gauge_handle),
+        // GAP-06 (2026-07-14): the gauge poller is re-homed to
+        // dhan_rest_stack Phase 3 — no lane spawn exists any more, so the
+        // lane registers None (the teardown's honest 0/0.0 reset still
+        // runs; the stack's poller is process-lifetime by design).
+        token_health_gauge_handle: None,
         mid_session_watchdog_handle: Some(mid_session_watchdog_handle),
         // SEC-R4-1 / R4-CPLX-1 (2026-07-06): the mint-capable 4h token sweep
         // is lane-owned — a detached copy per lane cold-start cycle kept a
@@ -11148,12 +11093,11 @@ pub async fn run_dhan_lane_runtime_supervisor(
                 // AG5-R3-1 early-constructed `DhanLaneRunHandles` H8 floor —
                 // so dropping the cancelled future ABORTS-or-RELEASES (never
                 // detaches) the lane's registered tasks. Honest residual
-                // (COV-C4-2, deliberately NOT lane-owned): the
-                // market-hours-gated no-tick watchdog and the one-shot
-                // sleep-then-notify close/reset timers — the timers
-                // self-terminate at their fire time (bounded ≤ ~24h) and the
-                // watchdog is heartbeat-driven + session-gated, so neither
-                // pins lane data-path state nor pages from a dead lane.
+                // (COV-C4-2, deliberately NOT lane-owned): the one-shot
+                // sleep-then-notify close/reset timers — they self-terminate
+                // at their fire time (bounded ≤ ~24h), so they pin no lane
+                // data-path state. (The formerly-listed no-tick watchdog was
+                // retired 2026-07-14 per the Dhan noise lock.)
                 if let Some(task) = active_task.take() {
                     info!(
                         "[dhan-lane] Dhan disabled mid-cold-start (Starting→Off won) — aborting \
@@ -14968,36 +14912,11 @@ fn spawn_post_market_tasks(
         info!("cross_verify_1m: post-market verification task spawned");
     }
 
-    // Operator task DHAN-REST-400 (2026-06-10): REST-health canary — one
-    // cheap GET /v2/profile at 09:05 / 12:00 / 15:25 IST on trading days.
-    // On non-2xx it pages HIGH (REST-CANARY-01) with the HTTP status, the
-    // exact final URL (token-redacted) and the bounded secret-redacted
-    // response body — so an 08:45-class REST death is known by 09:05, not
-    // discovered at 15:33 by the cross-verify. Spawned from BOTH boot paths
-    // (this fn is the shared site); self-skips on non-trading days and when
-    // booted past 15:25 IST (audit Rule 3).
-    {
-        let canary_token = std::sync::Arc::clone(&token_handle);
-        let canary_base = config.dhan.rest_api_base_url.clone();
-        let canary_calendar = std::sync::Arc::clone(&trading_calendar);
-        tokio::spawn(async move {
-            use chrono::{FixedOffset, TimeZone, Timelike, Utc};
-            use tickvault_common::constants::IST_UTC_OFFSET_SECONDS;
-            let Some(ist_offset) = FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS) else {
-                return;
-            };
-            let now_ist = ist_offset.from_utc_datetime(&Utc::now().naive_utc());
-            let is_trading_day = canary_calendar.is_trading_day(now_ist.date_naive());
-            tickvault_app::rest_canary_boot::run_rest_canary(
-                canary_token,
-                canary_base,
-                is_trading_day,
-                now_ist.time().num_seconds_from_midnight(),
-            )
-            .await;
-        });
-        info!("rest_canary: REST-health probe task spawned (09:05 / 12:00 / 15:25 IST)");
-    }
+    // REST-health canary (DHAN-REST-400) DELETED 2026-07-14 (operator Dhan
+    // noise lock — dhan-rest-only-noise-lock-2026-07-14.md): the retained
+    // spot-1m + option-chain legs self-detect a dead Dhan REST surface
+    // within ~3-4 minutes via their own persist-gated escalation edges —
+    // strictly better coverage than 3 fixed daily probe slots.
 
     // Operator grant 2026-07-12 (PR-2, the SPOT half): per-minute spot 1m
     // REST pipeline — every trading-day minute close in [09:16:00, 15:30:00]
@@ -15019,6 +14938,14 @@ fn spawn_post_market_tasks(
             (None, None)
         };
 
+    // 2026-07-14 operator pacing directive: configure the shared Dhan
+    // Data-API limiter cap from `[dhan_data_api] target_rps` BEFORE any
+    // REST task spawns (idempotent; validate() already rejected an
+    // out-of-range value at boot).
+    tickvault_app::dhan_data_api_limiter::configure_shared_dhan_data_api_limiter(
+        config.dhan_data_api.target_rps,
+    );
+
     if config.spot_1m_rest.enabled {
         let _spot1m_supervisor = tickvault_app::spot_1m_rest_boot::spawn_supervised_spot_1m_rest(
             tickvault_app::spot_1m_rest_boot::Spot1mRestTaskParams {
@@ -15032,6 +14959,8 @@ fn spawn_post_market_tasks(
                 diagnostics_second_probe_secs_of_day_ist: config
                     .spot_1m_rest
                     .diagnostics_second_probe_secs_of_day_ist,
+                fetch_mode: config.spot_1m_rest.fetch_mode,
+                batch_interval_minutes: config.spot_1m_rest.batch_interval_minutes,
             },
         );
         info!(
