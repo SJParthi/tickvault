@@ -258,3 +258,48 @@ pub struct TradeEntry {
 5. **Timestamps are IST strings** (`YYYY-MM-DD HH:MM:SS`), not epoch.
 6. **`PART_TRADED`** status — check `filledQty` and `remainingQuantity`.
 7. **Order slicing** — use for F&O when quantity exceeds exchange freeze limit.
+
+---
+
+## 2026-07-14 Upstream Update (runner-crawled live pages)
+
+**Evidence tier: Verified-live.** Raw HTML of `https://dhanhq.co/docs/v2/orders/` (runs 1–3,
+sha256 `e09e187d` content-identical, latest 2026-07-14T07:57:50Z) + `/docs/v2/releases/` +
+the NEW portal's markdown export `docs.dhanhq.co/markdown/api/v2/orders/modify-order.md`
+(2026-07-14T08:02Z) + the portal OpenAPI yaml. Comment-aware grep.
+Full manifest: `00-COVERAGE-MANIFEST.md`.
+
+1. **MPP + April-1 static-IP-rejection provenance (the §1 boxes above):** grep of the whole
+   191-page crawl (comments included) finds ZERO hits for "MPP" / "Market Price Protection" /
+   "March 21" / an April-1 rejection framing — the MPP section and the exchange-rejection
+   wording are exchange-circular/SDK/comms-sourced, NOT on any live Dhan doc surface as of
+   2026-07-14. NOT contradicted (the live pages are simply silent); operational force KEPT.
+   The live orders page itself still says "Order Placement, Modification and Cancellation
+   APIs requires Static IP whitelisting".
+2. **`legName` is OFFICIAL in plain order-modify** (the §3 SDK Note is understated): the live
+   modify request shows `"legName":""` with param "conditionally required | enum string | In
+   case of BO & CO, which leg is modified ENTRY_LEG TARGET_LEG STOP_LOSS_LEG". The portal
+   export + OpenAPI yaml carry it too, with enum `ENTRY_LEG, STOP_LOSS_LEG, TARGET_LEG, NA`
+   (default `NA`).
+3. **Place-order `productType` enum in §2 is incomplete vs live:** the live table lists
+   `CNC INTRADAY MARGIN MTF CO BO` (CO/BO now first-class — cf. the annexure's new
+   "CO & BO product types will be valid only for Intraday" note in `08-annexure-enums.md`
+   "2026-07-14 Upstream Update").
+4. **Portal modify-order response status enum adds `MODIFIED` and `INACTIVE`** (verbatim:
+   TRANSIT, PENDING, REJECTED, CANCELLED, PART_TRADED, TRADED, EXPIRED, MODIFIED, TRIGGERED,
+   INACTIVE) — new values vs the repo's OrderStatus set; portal-only so far (the classic book
+   enums are unchanged). Decode defensively — the no-panic-on-unknown contract already covers
+   this.
+5. **correlationId charset literal:** the live classic pages render "Allowed:
+   `[^a-zA-Z0-9 _-]`" — with a caret INSIDE the class (systematic across
+   orders/slicing/super/forever/postback; taken literally it is a negated class — an upstream
+   typo for the allowed set). The portal place-order export gives `a-zA-Z0-9-_.` (adds `.`,
+   omits the space). The repo/rule reading `[a-zA-Z0-9 _-]` remains the sane interpretation;
+   the 30-char cap agrees on every surface.
+6. **`price: 0` for MARKET (§2 table) is inference/practice, not live-doc text:** the live
+   place example uses `"price": ""` (empty string) for a MARKET order and the table says only
+   "price required | float". Keep the 0-for-MARKET practice note; do not cite it as doc text.
+7. **quantity-on-modify = TOTAL (placed) quantity — re-confirmed VERBATIM** on the live
+   releases page ("quantity field needs to be placed order quantity instead of pending order
+   quantity"); the new portal endpoint page is silent ("Quantity to be modified"). §3's note
+   stands, now Verified-live.
