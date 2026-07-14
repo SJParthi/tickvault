@@ -238,6 +238,32 @@ re-appends UPSERT in place. Release-build panics abort the process
 (`panic = "abort"`) — the respawn arms are unwind-build/self-heal paths,
 the same honesty note as TICK-FLUSH-01.
 
+**2026-07-14 — once-per-day RAW-BODY SAMPLE (`stage="raw_body_sample"`) —
+the account-condition vs envelope-drift discriminator:** for ≥14 days BOTH
+`/v2/charts/intraday` AND `/v2/charts/historical` returned 2xx with ZERO
+parseable candles for ALL SIDs (the 2026-07-14 session ended
+`swept=0, still_missing=1500` — the ENTIRE day absent for all 4 spot
+indices) while the option-chain leg and the WS feed on the SAME
+token/account worked — the account-wide 200-empty verdict. No 2xx body was
+ever logged anywhere, so "Dhan serves an empty-but-well-formed columnar
+envelope" (account/data-plan condition — Dhan-support territory) was
+indistinguishable from "the envelope shape drifted and our parser sees
+nothing" (our bug). The FIRST `empty_no_rows`/`empty_stale` classification
+of each IST day now logs ONE structured `error!` (`SPOT1M-01`,
+`stage="raw_body_sample"`) carrying a bounded 600-char SECRET-REDACTED
+sample of the 2xx body (`capture_rest_raw_body_sample` — the
+`capture_rest_error_body` pipeline with the widened
+`REST_RAW_BODY_SAMPLE_MAX_CHARS` bound), the total body byte length, and
+the `Content-Type` header value. Edge-latched (CAS on an IST-day key —
+exactly one line per day per process, unconditional); the #1524
+diagnostics probes additionally carry `content_type`/`body_bytes`/
+`body_sample` per probe entry (diagnostics-gated by construction); the
+15:31 cross-verify's `dhan_intraday_fetch` mirrors the capture once per
+RUN under `CROSS-VERIFY-1M-02` `stage="raw_body_sample"` (dormant while
+the Dhan lane is retired — the 15:31 spawn is lane-only per the
+2026-07-13 retirement, so it rides any forced/re-enabled run). This line
+is the verbatim evidence block for the Dhan support ticket.
+
 **2026-07-13 — the GROWW spot leg emits this SAME code (no new variant):**
 the Groww per-minute spot 1m REST leg
 (`crates/app/src/groww_spot_1m_boot.rs`, operator grant 2026-07-13 —
