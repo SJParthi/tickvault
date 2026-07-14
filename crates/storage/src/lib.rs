@@ -199,6 +199,10 @@ pub mod partition_archive;
 // audit — rebuild of the table deleted in #T4 (2026-05-20) on the modern
 // ILP-over-HTTP template with event-in-key DEDUP (AUDIT-06).
 pub mod order_audit_persistence;
+// Cluster-C order-side observability (2026-07-14): daily P&L snapshot
+// audit — rebuild of the Phase-0 Item-25 table deleted in #T4 (2026-05-20);
+// the OnEod row is the daily heartbeat/denominator (STORAGE-GAP-03).
+pub mod pnl_audit_persistence;
 pub mod prev_day_ohlcv_persistence;
 pub mod questdb_health;
 pub mod seal_absorption;
