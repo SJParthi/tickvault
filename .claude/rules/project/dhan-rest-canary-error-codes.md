@@ -1,5 +1,19 @@
 # Dhan REST-Health Canary — Error Codes (REST-CANARY-01)
 
+> **⚠ RETIRED 2026-07-14 (operator Dhan noise lock —
+> `dhan-rest-only-noise-lock-2026-07-14.md` §0 verbatim quote: "for Dhan
+> except spot 1m and option chain nothing else should work…").** The canary
+> module `crates/app/src/rest_canary_boot.rs`, its two spawn sites
+> (`dhan_rest_stack.rs` Phase 5b + the dead lane site in main.rs), and the
+> `rest-canary-01` CloudWatch log-filter/alarm entry
+> (`deploy/aws/terraform/error-code-alarms.tf`) are DELETED. Rationale: the
+> retained spot-1m + option-chain legs self-detect a dead REST surface within
+> ~3-4 minutes via their own persist-gated escalation edges
+> (`Spot1mFetchDegraded` / `ChainFetchDegraded`) — strictly better coverage
+> than 3 fixed daily probe slots. The `ErrorCode::RestCanary01ProbeFailed`
+> variant is RETAINED until the C4 variant sweep (this file keeps satisfying
+> the cross-ref test). Content below retained as historical audit.
+
 > **Authority:** CLAUDE.md > `operator-charter-forever.md` §C > this file.
 > **Operator directive (2026-06-10, task DHAN-REST-400):** *"one cheap GET
 > /v2/profile at 09:05 + 12:00 + 15:25 IST; on non-200, page HIGH immediately
