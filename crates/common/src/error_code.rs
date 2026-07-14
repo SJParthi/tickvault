@@ -1139,7 +1139,7 @@ impl ErrorCode {
             Self::Data812InvalidDateFormat => "DATA-812",
             Self::Data813InvalidSecurityId => "DATA-813",
             Self::Data814InvalidRequest => "DATA-814",
-            // Cluster B (2026-07-14) — order-readiness gate
+            // Cluster F (2026-07-14) — order-readiness gate
             Self::OrderReady01GateRefused => "ORDER-READY-01",
             // Wave 5 Item 13 — prev-close routing
             Self::PrevClose03BootRoutingAssertion => "PREVCLOSE-03",
@@ -1783,7 +1783,7 @@ impl ErrorCode {
                 // would re-stamp rows and could mask the evidence (the
                 // Futidx02 precedent).
                 | Self::TfVerify01MismatchFound
-                // ORDER-READY-01 (Cluster B, 2026-07-14): restoring
+                // ORDER-READY-01 (Cluster F, 2026-07-14): restoring
                 // dataPlan/segment/token is an operator/broker ACCOUNT decision
                 // (CHAIN-01 precedent); no auto-triage action may ever touch the
                 // ORDER path, so this is severity-independently operator-only.
@@ -2343,7 +2343,7 @@ mod tests {
         // recomputed-from-1m value — coalesced per (feed, date) pass,
         // manual triage) + TF-VERIFY-02 (the daily run degraded —
         // client/query/truncation/flush/budget stage taxonomy) => 148.
-        // 2026-07-14 (Cluster B): ORDER-READY-01 (order-readiness gate) => 149.
+        // 2026-07-14 (Cluster F): ORDER-READY-01 (order-readiness gate) => 149.
         assert_eq!(ErrorCode::all().len(), 149);
     }
 
@@ -2565,7 +2565,7 @@ mod tests {
                 || s.starts_with("STORAGE-GAP-")
                 || s.starts_with("DH-")
                 || s.starts_with("DATA-")
-                // Cluster B (2026-07-14): order-readiness gate
+                // Cluster F (2026-07-14): order-readiness gate
                 || s.starts_with("ORDER-READY-")
                 // Wave 1 (PR #393): hot-path / phase2 / prev-close / movers prefixes
                 || s.starts_with("HOT-PATH-")
