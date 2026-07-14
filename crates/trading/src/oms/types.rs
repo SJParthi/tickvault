@@ -535,47 +535,147 @@ pub struct MarginScript {
 }
 
 /// Request body for `POST /v2/margincalculator/multi`.
+///
+/// 2026-07-14 note: the multi-margin request naming is a Dhan-side
+/// THREE-artifact split (classic page vs portal markdown vs portal
+/// OpenAPI yaml disagree — see `docs/dhan-ref/13-funds-margin.md`
+/// "2026-07-14 Upstream Update"). We send the shape the official SDK
+/// 2.3.0rc1 + the classic curl + the portal markdown CONVERGE on:
+/// `{dhanClientId, includePosition, includeOrder, scripList}`. This is
+/// UNVERIFIED-LIVE — live-probe the endpoint before the first production
+/// multi-margin caller trusts either naming.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MultiMarginRequest {
+    /// Dhan client ID (present in the SDK/classic-curl wire body; absent
+    /// from the yaml's request schema — part of the unresolved split).
+    pub dhan_client_id: String,
     /// Whether to include existing positions in calculation.
     pub include_position: bool,
-    /// Whether to include pending orders in calculation.
-    pub include_orders: bool,
+    /// Whether to include pending orders in calculation. SINGULAR
+    /// `includeOrder` on the wire (the SDK-converged shape) — the yaml's
+    /// plural `includeOrders` is the LESS-supported reading.
+    pub include_order: bool,
     /// Array of scripts (instruments) to calculate margin for.
-    pub scripts: Vec<MarginScript>,
+    /// Serializes as `scripList` (the SDK-converged name; the yaml says
+    /// `scripts` — unresolved Dhan-side).
+    pub scrip_list: Vec<MarginScript>,
 }
 
 /// Response from `POST /v2/margincalculator/multi`.
 ///
-/// CRITICAL: ALL values are STRINGS, not floats.
-/// Uses snake_case (inconsistent with other Dhan APIs).
+/// 2026-07-14 note: Dhan's own artifacts DISAGREE on the response shape
+/// (`docs/dhan-ref/13-funds-margin.md` "2026-07-14 Upstream Update"): the
+/// classic page + OpenAPI yaml show snake_case ALL-STRING values
+/// (`"total_margin": "150000.00"`), while the portal markdown shows
+/// camelCase floats (`"totalMargin": 150000.0`). We tolerant-parse BOTH —
+/// each margin field accepts a JSON number OR a numeric string, under
+/// either casing (snake_case native name + camelCase `alias`), normalized
+/// to `f64`. A NON-numeric string is a hard deserialize error (fail-closed
+/// — a garbage margin value must never silently become 0.0). Absent
+/// fields default to 0.0.
 #[derive(Debug, Clone, Deserialize)]
 pub struct MultiMarginResponse {
-    /// Total margin required (STRING).
-    #[serde(default)]
-    pub total_margin: String,
-    /// SPAN margin (STRING).
-    #[serde(default)]
-    pub span_margin: String,
-    /// Exposure margin (STRING).
-    #[serde(default)]
-    pub exposure_margin: String,
-    /// Equity margin (STRING).
-    #[serde(default)]
-    pub equity_margin: String,
-    /// F&O margin (STRING).
-    #[serde(default)]
-    pub fo_margin: String,
-    /// Commodity margin (STRING).
-    #[serde(default)]
-    pub commodity_margin: String,
-    /// Currency margin (STRING).
+    /// Total margin required (normalized to f64).
+    #[serde(
+        default,
+        alias = "totalMargin",
+        deserialize_with = "de_f64_from_string_or_number"
+    )]
+    pub total_margin: f64,
+    /// SPAN margin (normalized to f64).
+    #[serde(
+        default,
+        alias = "spanMargin",
+        deserialize_with = "de_f64_from_string_or_number"
+    )]
+    pub span_margin: f64,
+    /// Exposure margin (normalized to f64).
+    #[serde(
+        default,
+        alias = "exposureMargin",
+        deserialize_with = "de_f64_from_string_or_number"
+    )]
+    pub exposure_margin: f64,
+    /// Equity margin (normalized to f64).
+    #[serde(
+        default,
+        alias = "equityMargin",
+        deserialize_with = "de_f64_from_string_or_number"
+    )]
+    pub equity_margin: f64,
+    /// F&O margin (normalized to f64).
+    #[serde(
+        default,
+        alias = "foMargin",
+        deserialize_with = "de_f64_from_string_or_number"
+    )]
+    pub fo_margin: f64,
+    /// Commodity margin (normalized to f64).
+    #[serde(
+        default,
+        alias = "commodityMargin",
+        deserialize_with = "de_f64_from_string_or_number"
+    )]
+    pub commodity_margin: f64,
+    /// Currency field — kept as a RAW string. The classic live example
+    /// shows `"INR"` (a currency CODE) while the portal markdown types it
+    /// as a float margin amount — semantics Unknown until live-probed
+    /// (2026-07-14 split, ground-truth doc item 3). Snake_case and
+    /// camelCase are the same word here, so no alias is needed.
     #[serde(default)]
     pub currency: String,
-    /// Hedge benefit from offsetting positions (STRING).
-    #[serde(default)]
-    pub hedge_benefit: String,
+    /// Hedge benefit from offsetting positions (normalized to f64;
+    /// absent from the portal markdown's response → defaults to 0.0).
+    #[serde(
+        default,
+        alias = "hedgeBenefit",
+        deserialize_with = "de_f64_from_string_or_number"
+    )]
+    pub hedge_benefit: f64,
+}
+
+/// Tolerant f64 deserializer for the multi-margin response's split wire
+/// shapes (2026-07-14): accepts a JSON number (the portal-markdown
+/// camelCase-float shape) OR a numeric string (the classic/yaml
+/// snake_case-string shape like `"150000.00"`). A NON-numeric string is a
+/// hard deserialize error — fail-closed, a garbage margin value must never
+/// silently become 0.0.
+fn de_f64_from_string_or_number<'de, D>(de: D) -> Result<f64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum NumOrStr {
+        F64(f64),
+        Str(String),
+    }
+    match NumOrStr::deserialize(de)? {
+        NumOrStr::F64(value) => Ok(value),
+        NumOrStr::Str(text) => text.parse::<f64>().map_err(|_| {
+            serde::de::Error::custom(format!(
+                "non-numeric margin value {text:?} — refusing to coerce to 0.0"
+            ))
+        }),
+    }
+}
+
+/// Order intent for the pre-trade margin gate (umbrella plan cluster E2).
+///
+/// `Entry` carries the margin the gate computed for the order (integer
+/// paise); `Exit` is never margin-gated — an exit must always be
+/// placeable. The future `RiskEngine::check_order` integration takes this
+/// type (rebases after cluster A's risk-engine round merges).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrderIntent {
+    /// Opens or increases exposure — margin-gated.
+    Entry {
+        /// Margin required for the entry, in integer paise.
+        required_paise: i64,
+    },
+    /// Closes or reduces exposure — NEVER margin-gated.
+    Exit,
 }
 
 // ---------------------------------------------------------------------------
@@ -1812,9 +1912,10 @@ mod tests {
     #[test]
     fn test_multi_margin_request_serializes() {
         let req = MultiMarginRequest {
+            dhan_client_id: "TEST-100".to_owned(),
             include_position: true,
-            include_orders: false,
-            scripts: vec![MarginScript {
+            include_order: false,
+            scrip_list: vec![MarginScript {
                 exchange_segment: "NSE_FNO".to_owned(),
                 transaction_type: "BUY".to_owned(),
                 quantity: 50,
@@ -1825,13 +1926,19 @@ mod tests {
             }],
         };
         let json = serde_json::to_string(&req).unwrap();
+        // The 2026-07-14 SDK/classic-curl-converged wire shape.
+        assert!(json.contains("dhanClientId"));
         assert!(json.contains("includePosition"));
-        assert!(json.contains("includeOrders"));
-        assert!(json.contains("scripts"));
+        assert!(json.contains("includeOrder"));
+        assert!(json.contains("scripList"));
+        // The yaml's LESS-supported reading must NOT be emitted.
+        assert!(!json.contains("includeOrders"));
+        assert!(!json.contains("\"scripts\""));
     }
 
     #[test]
-    fn test_multi_margin_response_all_strings() {
+    fn test_multi_margin_response_snake_case_strings_normalize() {
+        // The classic/yaml shape: snake_case, all-string values.
         let json = r#"{
             "total_margin": "12500.00",
             "span_margin": "10000.00",
@@ -1844,12 +1951,50 @@ mod tests {
         }"#;
 
         let resp: MultiMarginResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(resp.total_margin, "12500.00");
-        assert_eq!(resp.span_margin, "10000.00");
-        assert_eq!(resp.hedge_benefit, "500.00");
-        // All fields are strings
-        assert_eq!(resp.fo_margin, "12500.00");
-        assert_eq!(resp.commodity_margin, "0.00");
+        assert!((resp.total_margin - 12500.00).abs() < 1e-9);
+        assert!((resp.span_margin - 10000.00).abs() < 1e-9);
+        assert!((resp.exposure_margin - 2500.00).abs() < 1e-9);
+        assert!((resp.fo_margin - 12500.00).abs() < 1e-9);
+        assert!(resp.commodity_margin.abs() < 1e-9);
+        assert!((resp.hedge_benefit - 500.00).abs() < 1e-9);
+        // `currency` stays RAW (semantics Unknown — 2026-07-14 split).
+        assert_eq!(resp.currency, "0.00");
+    }
+
+    #[test]
+    fn test_multi_margin_response_camel_case_floats_normalize() {
+        // The portal-markdown shape: camelCase, float values, no
+        // hedge_benefit field (absent → 0.0 via serde default).
+        let json = r#"{
+            "totalMargin": 150000.0,
+            "spanMargin": 50000.0,
+            "exposureMargin": 45000.0
+        }"#;
+
+        let resp: MultiMarginResponse = serde_json::from_str(json).unwrap();
+        assert!((resp.total_margin - 150000.0).abs() < 1e-9);
+        assert!((resp.span_margin - 50000.0).abs() < 1e-9);
+        assert!((resp.exposure_margin - 45000.0).abs() < 1e-9);
+        assert!(resp.hedge_benefit.abs() < 1e-9);
+        assert!(resp.equity_margin.abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_multi_margin_response_rejects_garbage_string() {
+        // Fail-closed: a non-numeric margin string is a hard deserialize
+        // error — never silently coerced to 0.0.
+        let json = r#"{"total_margin": "abc"}"#;
+        let result: Result<MultiMarginResponse, _> = serde_json::from_str(json);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_multi_margin_response_currency_inr_raw() {
+        // The classic live example shows a currency CODE — must parse and
+        // survive verbatim (kept raw; semantics Unknown until live-probed).
+        let json = r#"{"currency": "INR"}"#;
+        let resp: MultiMarginResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.currency, "INR");
     }
 
     // --- FundLimitResponse (C4) ---
@@ -2155,14 +2300,14 @@ mod tests {
     fn multi_margin_response_defaults_for_missing_fields() {
         let json = r#"{}"#;
         let resp: MultiMarginResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(resp.total_margin, "");
-        assert_eq!(resp.span_margin, "");
-        assert_eq!(resp.exposure_margin, "");
-        assert_eq!(resp.equity_margin, "");
-        assert_eq!(resp.fo_margin, "");
-        assert_eq!(resp.commodity_margin, "");
+        assert!(resp.total_margin.abs() < 1e-9);
+        assert!(resp.span_margin.abs() < 1e-9);
+        assert!(resp.exposure_margin.abs() < 1e-9);
+        assert!(resp.equity_margin.abs() < 1e-9);
+        assert!(resp.fo_margin.abs() < 1e-9);
+        assert!(resp.commodity_margin.abs() < 1e-9);
         assert_eq!(resp.currency, "");
-        assert_eq!(resp.hedge_benefit, "");
+        assert!(resp.hedge_benefit.abs() < 1e-9);
     }
 
     #[test]
