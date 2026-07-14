@@ -1,59 +1,13 @@
-# GDF crawl list — from the GDF docs session (PR #1511), 2026-07-14
-# All were HTTP-403 from sandbox+Anthropic egress on 2026-07-13.
-# SEED pages carry the docs sidebar / are section indexes — link-extract them: hunting 5 slug-unknown pages:
-#   SubscribeSnapshot, GetLimitation (WS), GetServerInfo (WS), StreamAllSnapshots, GetHolidays
-https://globaldatafeeds.in/authorised-data-vendors/
-SEED https://globaldatafeeds.in/apis/
-https://globaldatafeeds.in/nimbledatapro/
-https://globaldatafeeds.in/global-datafeeds-apis/global-datafeeds-apis/introduction/type-of-data-available/
-https://globaldatafeeds.in/global-datafeeds-apis/global-datafeeds-apis/introduction/type-of-apis-available/
-https://globaldatafeeds.in/global-datafeeds-apis/global-datafeeds-apis/introduction/introduction-to-apis/
-https://globaldatafeeds.in/global-datafeeds-apis/global-datafeeds-apis/pricing-sales/api-pricing/
-https://globaldatafeeds.in/global-datafeeds-apis/global-datafeeds-apis/pricing-sales/who-can-purchase/
-https://globaldatafeeds.in/global-datafeeds-apis/global-datafeeds-apis/faqs/faqs/
-SEED https://globaldatafeeds.in/global-datafeeds-apis/global-datafeeds-apis/websockets-api-documentation/how-to-connect-using-websockets-api/
-https://globaldatafeeds.in/global-datafeeds-apis/global-datafeeds-apis/websockets-api-documentation/authenticate/
-https://globaldatafeeds.in/global-datafeeds-apis/global-datafeeds-apis/websockets-api-documentation/function-subscriberealtime/
-https://globaldatafeeds.in/global-datafeeds-apis/global-datafeeds-apis/websockets-api-documentation/function-getsnapshot-2/
-https://globaldatafeeds.in/global-datafeeds-apis/global-datafeeds-apis/websockets-api-documentation/function-getlastquote-2/
-https://globaldatafeeds.in/global-datafeeds-apis/global-datafeeds-apis/websockets-api-documentation/getinstruments/
-https://globaldatafeeds.in/global-datafeeds-apis/global-datafeeds-apis/websockets-api-documentation/getstrikeprices-2/
-https://globaldatafeeds.in/global-datafeeds-apis/global-datafeeds-apis/websockets-api-documentation/function-gethistory-2/
-https://globaldatafeeds.in/global-datafeeds-apis/global-datafeeds-apis/websockets-api-documentation/gethistoryaftermarket-3/
-SEED https://globaldatafeeds.in/global-datafeeds-apis/global-datafeeds-apis/rest-api-documentation/how-to-connect-using-rest-api/
-https://globaldatafeeds.in/global-datafeeds-apis/global-datafeeds-apis/rest-api-documentation/function-gethistory/
-https://globaldatafeeds.in/global-datafeeds-apis/global-datafeeds-apis/rest-api-documentation/gethistoryaftermarket-2/
-https://globaldatafeeds.in/global-datafeeds-apis/global-datafeeds-apis/rest-api-documentation/function-getlastquotearray/
-https://globaldatafeeds.in/global-datafeeds-apis/global-datafeeds-apis/rest-api-documentation/function-getsnapshot/
-https://globaldatafeeds.in/global-datafeeds-apis/global-datafeeds-apis/rest-api-documentation/getexchangesnapshot/
-https://globaldatafeeds.in/global-datafeeds-apis/global-datafeeds-apis/rest-api-documentation/getlastquoteoptionchain/
-https://globaldatafeeds.in/global-datafeeds-apis/global-datafeeds-apis/rest-api-documentation/handling-special-characters/
-https://globaldatafeeds.in/global-datafeeds-apis/global-datafeeds-apis/greeks-api/subscriberealtimegreeks/
-https://globaldatafeeds.in/global-datafeeds-apis/global-datafeeds-apis/greeks-api/getlastquoteoptiongreeks/
-https://globaldatafeeds.in/global-datafeeds-apis/global-datafeeds-apis/greeks-api/getlastquotearrayoptiongreeks/
-https://globaldatafeeds.in/global-datafeeds-apis/global-datafeeds-apis/greeks-api/getlastquoteoptiongreekschain/
-https://globaldatafeeds.in/global-datafeeds-apis/global-datafeeds-apis/greeks-api/gethistorygreeks-2/
-https://globaldatafeeds.in/global-datafeeds-apis/global-datafeeds-apis/optionchain-api/subscribeoptionchain/
-SEED https://globaldatafeeds.in/global-datafeeds-apis/global-datafeeds-apis/advanced_streaming_api/
-https://globaldatafeeds.in/global-datafeeds-apis/global-datafeeds-apis/advanced_streaming_api/subscribeoptionchain/
-SEED https://globaldatafeeds.in/global-datafeeds-apis/global-datafeeds-apis/streaming_api/
-https://globaldatafeeds.in/global-datafeeds-apis/global-datafeeds-apis/streaming_api/stream-all-symbols/
-https://globaldatafeeds.in/global-datafeeds-apis/global-datafeeds-apis/delayed-api/getexchangesnapshot-delayed/
-https://globaldatafeeds.in/global-datafeeds-apis/global-datafeeds-apis/documentation-support/diagnostic-api-responses/
-https://globaldatafeeds.in/global-datafeeds-apis/global-datafeeds-apis/documentation-support/api-fields-description/
-https://globaldatafeeds.in/global-datafeeds-apis/global-datafeeds-apis/documentation-support/symbol-naming-conventions/
-SEED https://globaldatafeeds.in/global-datafeeds-apis/documentation-support/documentation/websockets-api-documentation/
-SEED https://globaldatafeeds.in/global-datafeeds-apis/documentation-support/documentation/rest-api-documentation/
-SEED https://globaldatafeeds.in/global-datafeeds-apis/documentation-support/api-code-samples/
-https://globaldatafeeds.in/global-datafeeds-apis/global-datafeeds-apis/api-code-samples/websockets-python/
-https://globaldatafeeds.in/global-datafeeds-apis/global-datafeeds-apis/api-code-samples/websockets-java/
-https://globaldatafeeds.in/global-datafeeds-apis/global-datafeeds-apis/api-code-samples/websockets-nodejs/
-https://globaldatafeeds.in/global-datafeeds-apis/global-datafeeds-apis/api-code-samples/websockets-javascript-sample/
-https://globaldatafeeds.in/global-datafeeds-apis/global-datafeeds-apis/api-code-samples/rest-python/
-https://globaldatafeeds.in/global-datafeeds-apis/global-datafeeds-apis/api-code-samples/download-code-samples-2/
-https://globaldatafeeds.in/wp-content/uploads/2024/07/GFDL_Websocket_Python_Sample_AllFunctions.pdf
-https://globaldatafeeds.in/robots.txt
-SEED https://globaldatafeeds.in/sitemap.xml
-SEED https://globaldatafeeds.in/wp-sitemap.xml
-SEED https://docs.globaldatafeeds.in/
-https://docs.globaldatafeeds.in/getserverinfo-15575607e0
+# GDF crawl ROUND 2 — 2026-07-14 (run 29316509037 resolved the 5 unknown slugs
+# via SEED link-extraction but the 150-URL discovery cap left the canonical
+# pages unfetched; this round fetches exactly those. No SEEDs — no nav crawl.
+https://globaldatafeeds.in/global-datafeeds-apis/global-datafeeds-apis/websockets-api-documentation/function-subscribesnapshot/
+https://globaldatafeeds.in/global-datafeeds-apis/global-datafeeds-apis/websockets-api-documentation/function-getlimitation-2/
+https://globaldatafeeds.in/global-datafeeds-apis/global-datafeeds-apis/websockets-api-documentation/function-getserverinfo-2/
+https://globaldatafeeds.in/global-datafeeds-apis/global-datafeeds-apis/websockets-api-documentation/getholidays/
+https://globaldatafeeds.in/global-datafeeds-apis/global-datafeeds-apis/streaming_api/streamallsnapshots/
+https://globaldatafeeds.in/global-datafeeds-apis/global-datafeeds-apis/rest-api-documentation/function-getlimitation/
+https://globaldatafeeds.in/global-datafeeds-apis/global-datafeeds-apis/rest-api-documentation/function-getserverinfo/
+https://globaldatafeeds.in/global-datafeeds-apis/global-datafeeds-apis/rest-api-documentation/getholidays-2/
+https://globaldatafeeds.in/global-datafeeds-apis/global-datafeeds-apis/greeks-api/subscribesnapshotgreeks/
+https://docs.globaldatafeeds.in/llms-full.txt
