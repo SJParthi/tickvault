@@ -15365,19 +15365,20 @@ fn spawn_groww_spot_1m_leg(
         info!("groww_chain_1m: disabled by config (probe off) — nothing spawned");
     }
     // 2026-07-14 off-hours rate probe (env-gated, DEFAULT OFF): arm with
-    // TICKVAULT_GROWW_RATE_PROBE=1 on an off-hours / non-trading-day run
-    // to measure Groww's real burst tolerance (4→6→8→11 req/s steps).
-    // Refused during the in-session blackout window; results are
-    // structured logs + counters only — NO data tables.
+    // TICKVAULT_GROWW_RATE_PROBE=1 on an off-hours run to measure
+    // Groww's real burst tolerance (4→6→8→11 req/s steps). Refused
+    // inside the [08:30, 16:00) IST wall-clock blackout on ANY day
+    // (SECURITY-MEDIUM 2026-07-14 — no calendar dependency, so a stale
+    // holiday list can never fire the burst mid-session); the operator
+    // must also coordinate the run with BruteX's nightly bulk window
+    // (§9.7). Results are structured logs + counters only — NO data
+    // tables.
     if std::env::var(tickvault_app::groww_rate_probe::GROWW_RATE_PROBE_ENV).as_deref() == Ok("1") {
-        let probe_calendar = std::sync::Arc::clone(trading_calendar);
-        tokio::spawn(tickvault_app::groww_rate_probe::run_groww_rate_probe(
-            probe_calendar,
-        ));
+        tokio::spawn(tickvault_app::groww_rate_probe::run_groww_rate_probe());
         info!(
             "groww_rate_probe: armed via TICKVAULT_GROWW_RATE_PROBE=1 — \
              escalating off-hours burst probe spawned (refuses to run \
-             inside the in-session blackout window)"
+             inside the [08:30, 16:00) IST wall-clock blackout window)"
         );
     }
 }

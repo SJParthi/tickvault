@@ -125,7 +125,9 @@ use crate::groww_spot_1m_boot::GrowwTokenCache;
 // feeds).
 // The 2026-07-14 burst auto-ladder: shared tier/demotion state, the
 // intra-wave stagger schedule, and the pre-boundary warm-up sender.
-use crate::groww_rest_burst::{GrowwRestBurstState, intra_wave_stagger_ms, send_warmup_get};
+use crate::groww_rest_burst::{
+    GrowwRestBurstState, intra_wave_stagger_ms, send_warmup_get, wave_sleep_from_now_ms,
+};
 use crate::option_chain_1m_boot::{
     MAX_PLAUSIBLE_STRIKE, MAX_STRIKES_PER_CHAIN, chain_minute_fully_failed,
 };
@@ -862,7 +864,10 @@ async fn fire_one_groww_chain_minute(
             let wave_token = token.clone();
             let url = target.url.clone();
             let expiry_str = target.expiry_str.clone();
-            let stagger_ms = intra_wave_stagger_ms(tier, idx);
+            // The sequential floor spans a whole per-underlying budget
+            // per slot (review MEDIUM-1 2026-07-14).
+            let stagger_ms =
+                intra_wave_stagger_ms(tier, idx, GROWW_CHAIN_1M_UNDERLYING_BUDGET_SECS * 1_000);
             wave.spawn(async move {
                 if stagger_ms > 0 {
                     tokio::time::sleep(Duration::from_millis(stagger_ms)).await;
@@ -1595,28 +1600,33 @@ async fn run_groww_chain_minute_loop(
         // no min-gap). The optional pre-boundary warm-up GET (boundary−4 s,
         // 3 s-bounded, unauthenticated — no expiry param; the 400/401
         // reply still warms the connection) re-establishes an idle-closed
-        // TLS session before the critical window; the remaining sleep to
-        // the wave instant is recomputed from a fresh clock so the warm-up
-        // can never push the fire late.
-        let boundary_gap_ms = u64::from(fire.saturating_sub(now)).saturating_mul(1_000);
+        // TLS session before the critical window.
+        // CRITICAL-1 (2026-07-14 fix round): EVERY wake instant — the
+        // warm-up lead AND the wave itself — is computed from the
+        // MILLISECOND clock (`wave_sleep_from_now_ms`), never by summing
+        // a whole-second boundary gap with the delay: the pre-fix else
+        // branch woke at `fire + frac(now) + 300 ms`, and the two legs'
+        // independent fractional offsets could collapse the load-bearing
+        // 1,050 ms wave separation to ~51 ms.
         let warmup_lead_ms = GROWW_REST_WARMUP_LEAD_SECS.saturating_mul(1_000);
-        if params.burst.warm_up_enabled() && boundary_gap_ms > warmup_lead_ms {
-            tokio::time::sleep(Duration::from_millis(boundary_gap_ms - warmup_lead_ms)).await;
+        let warmup_sleep_ms = wave_sleep_from_now_ms(
+            fire,
+            -i64::try_from(warmup_lead_ms).unwrap_or(0),
+            ist_millis_of_day_now(),
+        );
+        if params.burst.warm_up_enabled() && warmup_sleep_ms > 0 {
+            tokio::time::sleep(Duration::from_millis(warmup_sleep_ms)).await;
             if let Some(first) = targets.first() {
                 send_warmup_get(client, &first.url, &[], "chain_1m").await;
             }
-            let target_ms = i64::from(fire)
-                .saturating_mul(MILLIS_PER_SEC)
-                .saturating_add(i64::try_from(GROWW_CHAIN_1M_FIRE_DELAY_MS).unwrap_or(0));
-            let remaining_ms = target_ms.saturating_sub(ist_millis_of_day_now());
-            if remaining_ms > 0 {
-                tokio::time::sleep(Duration::from_millis(remaining_ms.unsigned_abs())).await;
-            }
-        } else {
-            tokio::time::sleep(Duration::from_millis(
-                boundary_gap_ms + GROWW_CHAIN_1M_FIRE_DELAY_MS,
-            ))
-            .await;
+        }
+        let remaining_ms = wave_sleep_from_now_ms(
+            fire,
+            i64::try_from(GROWW_CHAIN_1M_FIRE_DELAY_MS).unwrap_or(0),
+            ist_millis_of_day_now(),
+        );
+        if remaining_ms > 0 {
+            tokio::time::sleep(Duration::from_millis(remaining_ms)).await;
         }
 
         // Staleness gate (suspend / clock-step defense): skip + recompute,

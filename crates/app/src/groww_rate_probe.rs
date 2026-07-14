@@ -10,15 +10,27 @@
 //! class — NIFTY, 1-day window; no new endpoint), with a
 //! [`GROWW_RATE_PROBE_PAUSE_SECS`] pause between steps and at most
 //! [`GROWW_RATE_PROBE_ROUNDS`] rounds — 58 requests total, bounded by
-//! construction. The 11 rps top step deliberately tests the
-//! `seven_concurrent` vendor-lag worst shape (initial 7 + first rung
-//! wave 4 = 11 in one rolling second).
+//! construction. The 11 rps top step was sized for the PRE-jitter
+//! `seven_concurrent` vendor-lag worst shape (initial 7 + a lockstep
+//! first rung wave of 4 = 11 in one rolling second); with the
+//! 2026-07-14 HIGH-1 per-target rung jitter that worst shape is 9 —
+//! the 11 step is KEPT as deliberate over-test margin.
 //!
-//! REFUSED inside the in-session blackout window on trading days
-//! ([`GROWW_RATE_PROBE_BLACKOUT_START_SECS_OF_DAY_IST`],
+//! REFUSED inside the [08:30, 16:00) IST wall-clock blackout window on
+//! ANY day ([`GROWW_RATE_PROBE_BLACKOUT_START_SECS_OF_DAY_IST`],
 //! [`GROWW_RATE_PROBE_BLACKOUT_END_SECS_OF_DAY_IST`]) so probe bursts can
 //! never share the pooled Live-Data bucket with live capture (incl. the
-//! 15:31–15:33 sweep/cross-verify window).
+//! 15:31–15:33 sweep/cross-verify window). SECURITY-MEDIUM fix
+//! 2026-07-14: the gate deliberately takes NO trading-calendar input —
+//! the pre-fix `trading_day && [09:00, 15:35)` gate could fire the
+//! 58-request burst mid-session off a stale holiday list; a pure
+//! wall-clock window on every day has nothing to fail-open on.
+//! CO-TENANCY (MEDIUM-2, §9.7): the probe is OPERATOR-TRIGGERED
+//! (env var) and shares the pooled Live-Data bucket with BruteX, whose
+//! bulk pulls are nightly/post-market (§9.3) — the operator MUST
+//! coordinate the probe run with BruteX's nightly window; the blackout
+//! only protects OUR in-session capture, it cannot see BruteX's
+//! schedule.
 //!
 //! OUTPUT: structured `info!` lines per step (rps, sent, ok, 429s,
 //! latency min/avg/max ms) + counters
@@ -40,7 +52,6 @@ use tickvault_common::constants::{
     GROWW_RATE_PROBE_PAUSE_SECS, GROWW_RATE_PROBE_ROUNDS, GROWW_RATE_PROBE_STEPS_RPS,
     GROWW_SPOT_1M_REQUEST_TIMEOUT_MS, IST_UTC_OFFSET_SECONDS, SECONDS_PER_DAY,
 };
-use tickvault_common::trading_calendar::TradingCalendar;
 use tickvault_core::auth::secret_manager::fetch_groww_access_token;
 
 use crate::groww_spot_1m_boot::groww_candles_query;
@@ -51,14 +62,16 @@ pub const GROWW_RATE_PROBE_ENV: &str = "TICKVAULT_GROWW_RATE_PROBE";
 /// Milliseconds per second (spacing math).
 const MILLIS_PER_SEC: u64 = 1_000;
 
-/// Is the probe REFUSED right now? True inside the in-session blackout
-/// window on a trading day; off-hours / weekends / holidays run. Pure.
+/// Is the probe REFUSED right now? True inside the [08:30, 16:00) IST
+/// wall-clock blackout window on ANY day — trading day or not
+/// (SECURITY-MEDIUM fix 2026-07-14: no calendar input means a stale
+/// holiday list can never fire the burst mid-session; the cost is that
+/// weekend/holiday probes must also run outside the window — acceptable
+/// for an operator-triggered off-hours tool). Pure.
 #[must_use]
-pub fn rate_probe_refused(is_trading_day: bool, secs_of_day_ist: u32) -> bool {
-    is_trading_day
-        && (GROWW_RATE_PROBE_BLACKOUT_START_SECS_OF_DAY_IST
-            ..GROWW_RATE_PROBE_BLACKOUT_END_SECS_OF_DAY_IST)
-            .contains(&secs_of_day_ist)
+pub fn rate_probe_refused(secs_of_day_ist: u32) -> bool {
+    (GROWW_RATE_PROBE_BLACKOUT_START_SECS_OF_DAY_IST..GROWW_RATE_PROBE_BLACKOUT_END_SECS_OF_DAY_IST)
+        .contains(&secs_of_day_ist)
 }
 
 /// Intra-burst spacing (ms) for a `rps`-requests-in-one-second step:
@@ -160,13 +173,14 @@ async fn probe_request_once(
 /// [`GROWW_RATE_PROBE_ENV`] env var is `1`; re-checks the blackout window
 /// before EVERY step (a probe started at 08:58 must stop at 09:00).
 // TEST-EXEMPT: live-network async runner — the schedule (probe_request_offset_ms), the refusal gate (rate_probe_refused) and the verdict fold (fold_step_verdict) are the unit-tested pure parts; the spawn site is env-gated in main.rs.
-pub async fn run_groww_rate_probe(calendar: std::sync::Arc<TradingCalendar>) {
-    if rate_probe_refused(calendar.is_trading_day_today(), ist_secs_of_day_now()) {
+pub async fn run_groww_rate_probe() {
+    if rate_probe_refused(ist_secs_of_day_now()) {
         warn!(
-            "groww_rate_probe: refused — inside the in-session blackout \
-             window on a trading day (run it off-hours / on a non-trading \
-             day; probe bursts must never share the pooled bucket with \
-             live capture)"
+            "groww_rate_probe: refused — inside the [08:30, 16:00) IST \
+             wall-clock blackout window (ANY day — no calendar \
+             dependency; run it outside the window; probe bursts must \
+             never share the pooled bucket with live capture, and the \
+             operator must coordinate with BruteX's nightly bulk window)"
         );
         return;
     }
@@ -206,7 +220,7 @@ pub async fn run_groww_rate_probe(calendar: std::sync::Arc<TradingCalendar>) {
         for &rps in &GROWW_RATE_PROBE_STEPS_RPS {
             // Re-check the gate before every step: a probe started just
             // before the blackout opens must stop at its edge.
-            if rate_probe_refused(calendar.is_trading_day_today(), ist_secs_of_day_now()) {
+            if rate_probe_refused(ist_secs_of_day_now()) {
                 warn!(
                     round,
                     rps,
@@ -269,20 +283,23 @@ pub async fn run_groww_rate_probe(calendar: std::sync::Arc<TradingCalendar>) {
 mod tests {
     use super::*;
 
-    /// The blackout gate: trading-day in-session refused; off-hours and
-    /// non-trading days allowed; window edges honored (half-open).
+    /// The blackout gate (SECURITY-MEDIUM 2026-07-14): [08:30, 16:00)
+    /// IST refused on ANY day — no calendar input, so a stale holiday
+    /// list can never open the gate mid-session; window edges honored
+    /// (half-open).
     #[test]
     fn test_rate_probe_blackout_window() {
-        // In-session on a trading day → refused.
-        assert!(rate_probe_refused(true, 9 * 3600));
-        assert!(rate_probe_refused(true, 12 * 3600));
-        assert!(rate_probe_refused(true, 15 * 3600 + 34 * 60));
-        // Window edges: end is exclusive, pre-open allowed.
-        assert!(!rate_probe_refused(true, 15 * 3600 + 35 * 60));
-        assert!(!rate_probe_refused(true, 8 * 3600 + 59 * 60));
-        assert!(!rate_probe_refused(true, 23 * 3600));
-        // Non-trading day: always allowed.
-        assert!(!rate_probe_refused(false, 12 * 3600));
+        // Inside the window → refused, session or not.
+        assert!(rate_probe_refused(8 * 3600 + 30 * 60));
+        assert!(rate_probe_refused(9 * 3600));
+        assert!(rate_probe_refused(12 * 3600));
+        assert!(rate_probe_refused(15 * 3600 + 34 * 60));
+        assert!(rate_probe_refused(15 * 3600 + 59 * 60 + 59));
+        // Window edges: end is exclusive, pre-window allowed.
+        assert!(!rate_probe_refused(16 * 3600));
+        assert!(!rate_probe_refused(8 * 3600 + 29 * 60));
+        assert!(!rate_probe_refused(23 * 3600));
+        assert!(!rate_probe_refused(0));
     }
 
     /// The step plan is bounded by construction: 4/6/8/11 × 2 rounds = 58

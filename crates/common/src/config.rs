@@ -149,7 +149,12 @@ pub struct ApplicationConfig {
     /// `no-rest-except-live-feed-2026-06-27.md` §9.7): which burst tier the
     /// per-minute Groww REST legs fire in (`two_wave` default /
     /// `seven_concurrent` probe-gated) + the pre-boundary TLS warm-up
-    /// toggle. Absent section ⇒ `two_wave` + warm-up OFF (fail-safe).
+    /// toggle. Absent section ⇒ `two_wave` + warm-up off — rate-safe
+    /// because the wave instants are computed from the millisecond clock
+    /// (`wave_sleep_from_now_ms`), so the > 1 s two_wave separation holds
+    /// with or without the warm-up recompute (LOW-1 wording fix
+    /// 2026-07-14; the pre-CRITICAL-1 whole-second else-branch could
+    /// collapse it).
     #[serde(default)]
     pub groww_rest_burst: GrowwRestBurstConfig,
 }

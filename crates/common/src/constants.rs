@@ -1987,10 +1987,15 @@ const _: () = assert!(
         < 60_000,
     "GROWW_SPOT_1M concurrent fire (two_wave delay + demoted stagger + one ladder budget) must finish inside the minute"
 );
+// The ladder budget also absorbs the worst-case per-target rung jitter
+// ((targets − 1) × step = 3 × 150 = 450 ms — HIGH-1 fix 2026-07-14):
+// 6,000 + 450 + 3,500 = 9,950 ms < 11 s.
 const _: () = assert!(
-    GROWW_SPOT_1M_RETRY_OFFSETS_MS[3] + GROWW_SPOT_1M_REQUEST_TIMEOUT_MS
+    GROWW_SPOT_1M_RETRY_OFFSETS_MS[3]
+        + (GROWW_SPOT_1M_SYMBOLS.len() as u64) * GROWW_REST_RUNG_JITTER_STEP_MS
+        + GROWW_SPOT_1M_REQUEST_TIMEOUT_MS
         < GROWW_SPOT_1M_SYMBOL_BUDGET_SECS * 1_000,
-    "GROWW_SPOT_1M ladder schedule (last offset + one request timeout) must fit the budget"
+    "GROWW_SPOT_1M ladder schedule (last offset + max rung jitter + one request timeout) must fit the budget"
 );
 // The two_wave separation is the load-bearing rate-safety fact: STRICTLY
 // more than 1,000 ms between the chain wave and the spot wave means no
@@ -2120,12 +2125,92 @@ const _: () = assert!(
 
 /// Intra-wave stagger (ms) applied per request slot when a `two_wave`
 /// session has been DEMOTED by a live 429 (`seven_concurrent` demotes to
-/// plain `two_wave` first): request k of a wave starts k × this many ms
-/// into the wave. Because each spot target's re-poll ladder offsets are
-/// measured from ITS OWN first attempt, the stagger propagates into every
-/// rung wave too — the demoted vendor-lag rung worst case drops from
-/// 8 req/s to ≤ 5 req/s in any rolling second.
+/// plain `two_wave` first; a further 429 drops to the fully-sequential
+/// floor — review MEDIUM-1 2026-07-14): request k of a wave starts
+/// k × this many ms into the wave. Because each spot target's re-poll
+/// ladder offsets are measured from ITS OWN first attempt, the stagger
+/// propagates into every rung wave too — combined with the per-target
+/// rung jitter below, the demoted vendor-lag rung worst case drops from
+/// 6 req/s (jittered undemoted) to ≤ 4 req/s in any rolling second
+/// (rung instant = 350j stagger + offset_k + 150j jitter = offset_k
+/// + 500j; hand-checked worst window holds 4).
 pub const GROWW_REST_BURST_INTRA_WAVE_STAGGER_MS: u64 = 350;
+
+/// Deterministic per-target RUNG jitter step (ms) — HIGH-1 fix
+/// 2026-07-14, the Dhan-leg [`SPOT_1M_REST_LADDER_JITTER_STEP_MS`]
+/// precedent applied to the Groww spot wave: target slot j shifts its
+/// ENTIRE re-poll rung schedule by j × this step, in ALL tiers
+/// (undemoted included — the pre-fix rungs fired in 4-target lockstep,
+/// an 8 req/s rung burst on a correlated vendor-lag minute whose 429
+/// could land on the co-tenant BruteX so our auto-demote never fired).
+/// With the jitter the undemoted rung worst rolling second is 6
+/// (const-computed below), and the seven_concurrent lag-worst drops
+/// 11 → 9 req/s solo. NO randomness — slot × step, same as the Dhan leg.
+pub const GROWW_REST_RUNG_JITTER_STEP_MS: u64 = 150;
+
+/// Compile-time worst-case count of spot RUNG requests — across the 4
+/// concurrent targets (3 core + the runtime VIX), each rung schedule
+/// jittered by slot × [`GROWW_REST_RUNG_JITTER_STEP_MS`] — inside any
+/// rolling 1,000 ms window (UNDEMOTED tiers; the demoted shapes only
+/// spread further). Evaluates to 6 with the shipped offsets/jitter; the
+/// const fn keeps the ceiling assert honest if either ever changes.
+const fn groww_spot_rung_worst_rolling_second() -> u64 {
+    const RUNGS: usize = GROWW_SPOT_1M_RETRY_OFFSETS_MS.len();
+    const TARGETS: usize = GROWW_SPOT_1M_SYMBOLS.len() + 1; // + runtime VIX
+    let mut instants = [0u64; RUNGS * TARGETS];
+    let mut k = 0;
+    while k < RUNGS {
+        let mut j = 0;
+        while j < TARGETS {
+            instants[k * TARGETS + j] =
+                GROWW_SPOT_1M_RETRY_OFFSETS_MS[k] + (j as u64) * GROWW_REST_RUNG_JITTER_STEP_MS;
+            j += 1;
+        }
+        k += 1;
+    }
+    let mut worst = 0u64;
+    let mut a = 0;
+    while a < RUNGS * TARGETS {
+        let mut count = 0u64;
+        let mut b = 0;
+        while b < RUNGS * TARGETS {
+            if instants[b] >= instants[a] && instants[b] < instants[a] + 1_000 {
+                count += 1;
+            }
+            b += 1;
+        }
+        if count > worst {
+            worst = count;
+        }
+        a += 1;
+    }
+    worst
+}
+
+/// Compile-time count of jittered spot rung requests landing inside the
+/// FIRST rolling second after the wave instant (rung instant < 1,000 ms
+/// from the wave) — the `seven_concurrent` vendor-lag addend on top of
+/// the 7 initial requests. Evaluates to 2 with the shipped
+/// offsets/jitter (rungs at 700 and 850 ms).
+const fn groww_spot_rungs_in_first_second() -> u64 {
+    const RUNGS: usize = GROWW_SPOT_1M_RETRY_OFFSETS_MS.len();
+    const TARGETS: usize = GROWW_SPOT_1M_SYMBOLS.len() + 1; // + runtime VIX
+    let mut count = 0u64;
+    let mut k = 0;
+    while k < RUNGS {
+        let mut j = 0;
+        while j < TARGETS {
+            if GROWW_SPOT_1M_RETRY_OFFSETS_MS[k] + (j as u64) * GROWW_REST_RUNG_JITTER_STEP_MS
+                < 1_000
+            {
+                count += 1;
+            }
+            j += 1;
+        }
+        k += 1;
+    }
+    count
+}
 
 /// WARM-UP lead (secs): at minute boundary − this lead, each enabled
 /// Groww REST leg sends ONE lightweight UNAUTHENTICATED GET on its own
@@ -2145,11 +2230,13 @@ pub const GROWW_REST_WARMUP_LEAD_SECS: u64 = 4;
 pub const GROWW_REST_WARMUP_TIMEOUT_SECS: u64 = 3;
 
 /// Off-hours rate-probe escalation steps (requests per second, one
-/// 1-second burst per step): 4 → 6 → 8 → 11. The 11 top step exists
-/// precisely to test the `seven_concurrent` vendor-lag worst shape
-/// (initial 7 + first rung wave 4 = 11 in one rolling second) — the
-/// probe's 429 verdict is the ONLY gate that can promote
-/// `seven_concurrent` (§9.7(5)).
+/// 1-second burst per step): 4 → 6 → 8 → 11. The 11 top step was sized
+/// for the PRE-jitter `seven_concurrent` vendor-lag worst shape
+/// (initial 7 + a lockstep first rung wave of 4 = 11 in one rolling
+/// second); with the 2026-07-14 HIGH-1 rung jitter that worst shape is
+/// 9 — the 11 step is KEPT as deliberate over-test margin. The probe's
+/// 429 verdict is the ONLY gate that can promote `seven_concurrent`
+/// (§9.7(5)).
 pub const GROWW_RATE_PROBE_STEPS_RPS: [u32; 4] = [4, 6, 8, 11];
 
 /// Off-hours rate-probe rounds (max) — 2 × (4+6+8+11) = 58 requests
@@ -2160,12 +2247,18 @@ pub const GROWW_RATE_PROBE_ROUNDS: u32 = 2;
 /// drain so each step measures a clean burst.
 pub const GROWW_RATE_PROBE_PAUSE_SECS: u64 = 10;
 
-/// Rate-probe in-session blackout window (IST seconds-of-day, trading
-/// days only): [09:00, 15:35) — the probe is REFUSED inside it so probe
-/// bursts can never share the pooled bucket with live capture (incl. the
-/// 15:31-15:33 sweep/cross-verify window).
-pub const GROWW_RATE_PROBE_BLACKOUT_START_SECS_OF_DAY_IST: u32 = 9 * 3600;
-pub const GROWW_RATE_PROBE_BLACKOUT_END_SECS_OF_DAY_IST: u32 = 15 * 3600 + 35 * 60;
+/// Rate-probe blackout window (IST seconds-of-day) — [08:30, 16:00),
+/// enforced on ANY day, trading day or not (SECURITY-MEDIUM fix
+/// 2026-07-14): the pre-fix gate was `trading_day && [09:00, 15:35)`,
+/// keyed solely on `TradingCalendar` — a stale holiday list could fire
+/// the 58-request probe burst mid-session. The widened unconditional
+/// wall-clock window needs NO calendar lookup at all (nothing to
+/// fail-open on), covers the whole session + the 15:31–15:33
+/// sweep/cross-verify window + boot/deploy margins, and costs only that
+/// a weekend/holiday probe must also run outside [08:30, 16:00) IST —
+/// acceptable for an operator-triggered off-hours tool.
+pub const GROWW_RATE_PROBE_BLACKOUT_START_SECS_OF_DAY_IST: u32 = 8 * 3600 + 30 * 60;
+pub const GROWW_RATE_PROBE_BLACKOUT_END_SECS_OF_DAY_IST: u32 = 16 * 3600;
 
 const _: () = assert!(
     GROWW_REST_WARMUP_TIMEOUT_SECS < GROWW_REST_WARMUP_LEAD_SECS,
@@ -2180,29 +2273,62 @@ const _: () = assert!(
 );
 // seven_concurrent initial wave: 4 spot (3 core + runtime VIX) + 3 chain
 // = 7 concurrent ≤ the documented 10/s broker ceiling SOLO. HONEST
-// vendor-lag caveat (stated, not hidden): a lag minute adds the first
-// spot rung wave 700 ms later — 7 + 4 = 11 in one rolling second, ABOVE
-// the ceiling; that is exactly the shape the probe's 11 rps top step
-// tests, and a live 429 auto-demotes to two_wave within the session.
-// With the assumed BruteX ~3/s co-tenancy anchor the seven tier has ZERO
-// margin even on a healthy minute (7 + 3 = 10) — the reason it is
-// probe-gated, never the default.
+// vendor-lag math (recomputed 2026-07-14 with the HIGH-1 rung jitter): a
+// lag minute adds the jittered first-rung stragglers inside the wave's
+// rolling second — 7 + 2 = 9 SOLO (const-asserted below; pre-jitter this
+// was 7 + 4 = 11, ABOVE the ceiling). The probe's 11 rps top step is
+// KEPT — it over-tests the retired pre-jitter shape as deliberate
+// margin. HONEST residual (hot-path review 2026-07-14): the static
+// asserts cover SOLO shapes only — with the assumed BruteX ~3/s
+// co-tenancy anchor the seven lag-worst is 9 + 3 = 12 and even the
+// healthy wave is 7 + 3 = 10 with ZERO margin; co-tenancy safety has NO
+// static assert and relies on the probe gate + the runtime 429
+// demotion ladder — the reason seven_concurrent is probe-gated, never
+// the default.
 const _: () = assert!(
     (GROWW_SPOT_1M_SYMBOLS.len() as u64 + 1) + (GROWW_CHAIN_1M_UNDERLYINGS.len() as u64) <= 10,
     "seven_concurrent initial wave (4 spot + 3 chain) must not exceed the documented 10/s ceiling"
 );
-// two_wave vendor-lag worst rolling second (UNDEMOTED): the spot re-poll
-// rung offsets [700, 1500, ...] put two adjacent rung waves 800 ms apart,
-// so all-4-targets-lagging = 2 × 4 = 8 requests in one rolling second
-// SOLO; the config-OFF contract leg adds ≤ 1000/min-gap = 2 more when
-// enabled — 10 total, AT the documented ceiling with zero margin over the
-// assumed BruteX ~3/s anchor. A resulting 429 auto-demotes, and the
-// demoted 350 ms stagger (inherited by the rungs) drops the spot rung
-// worst case to ≤ 5/s. Initial waves stay ≤ 4/s by the wave-separation
-// assert above.
+// seven_concurrent vendor-lag worst rolling second SOLO (2026-07-14
+// jitter fix): the initial 7 + the jittered rung stragglers inside the
+// wave's first second (const-computed: 2) = 9 ≤ 10.
 const _: () = assert!(
-    2 * (GROWW_SPOT_1M_SYMBOLS.len() as u64 + 1) + 1_000 / GROWW_CONTRACT_1M_MIN_GAP_MS <= 10,
-    "two_wave vendor-lag worst rolling second (2 spot rung waves + the contract leg) must not exceed the 10/s ceiling"
+    (GROWW_SPOT_1M_SYMBOLS.len() as u64 + 1)
+        + (GROWW_CHAIN_1M_UNDERLYINGS.len() as u64)
+        + groww_spot_rungs_in_first_second()
+        <= 10,
+    "seven_concurrent vendor-lag worst rolling second (initial 7 + jittered first-second rungs) must not exceed the 10/s ceiling SOLO"
+);
+// two_wave vendor-lag worst rolling second (UNDEMOTED, recomputed
+// 2026-07-14 with the HIGH-1 rung jitter): the jittered rung schedule's
+// const-computed worst window holds 6 requests (pre-jitter: two aligned
+// 4-target rung waves 800 ms apart = 8); the config-OFF contract leg
+// adds ≤ 1000/min-gap = 2 more when enabled — 8 total, 2 under the
+// documented 10/s ceiling SOLO (pre-jitter this sat AT the ceiling with
+// zero margin over the assumed BruteX ~3/s anchor; with the anchor the
+// jittered worst is 11 — still above, which is why the 429 auto-demote
+// ladder exists: staggered drops the rung worst to ≤ 4/s, sequential
+// removes overlap entirely). Initial waves stay ≤ 4/s by the
+// wave-separation assert above.
+const _: () = assert!(
+    groww_spot_rung_worst_rolling_second() + 1_000 / GROWW_CONTRACT_1M_MIN_GAP_MS <= 10,
+    "two_wave vendor-lag worst rolling second (jittered spot rungs + the contract leg) must not exceed the 10/s ceiling"
+);
+// The demotion ladder's SEQUENTIAL floor (review MEDIUM-1 2026-07-14):
+// slot j of a wave starts j × the leg's whole per-slot budget into the
+// wave, so requests never overlap — the fire must still finish inside
+// the minute on both legs.
+const _: () = assert!(
+    GROWW_SPOT_1M_TWO_WAVE_FIRE_DELAY_MS
+        + (GROWW_SPOT_1M_SYMBOLS.len() as u64 + 1) * GROWW_SPOT_1M_SYMBOL_BUDGET_SECS * 1_000
+        < 60_000,
+    "sequential-floor spot fire (two_wave delay + 4 whole per-target budgets) must finish inside the minute"
+);
+const _: () = assert!(
+    GROWW_CHAIN_1M_FIRE_DELAY_MS
+        + (GROWW_CHAIN_1M_UNDERLYINGS.len() as u64) * GROWW_CHAIN_1M_UNDERLYING_BUDGET_SECS * 1_000
+        < 60_000,
+    "sequential-floor chain fire (wave delay + 3 whole per-underlying budgets) must finish inside the minute"
 );
 
 // ---------------------------------------------------------------------------
@@ -4584,18 +4710,31 @@ mod tests {
         assert_eq!(GROWW_RATE_PROBE_PAUSE_SECS, 10);
         let per_round: u32 = GROWW_RATE_PROBE_STEPS_RPS.iter().sum();
         assert_eq!(per_round * GROWW_RATE_PROBE_ROUNDS, 58);
-        // In-session blackout window covers the whole capture session
-        // incl. the 15:31-15:33 sweep/cross-verify burst window.
-        assert_eq!(GROWW_RATE_PROBE_BLACKOUT_START_SECS_OF_DAY_IST, 9 * 3600);
+        // Blackout window (SECURITY-MEDIUM 2026-07-14): [08:30, 16:00)
+        // IST on ANY day — no calendar dependency; covers the whole
+        // capture session incl. the 15:31-15:33 sweep/cross-verify
+        // burst window plus boot/deploy margins.
         assert_eq!(
-            GROWW_RATE_PROBE_BLACKOUT_END_SECS_OF_DAY_IST,
-            15 * 3600 + 35 * 60
+            GROWW_RATE_PROBE_BLACKOUT_START_SECS_OF_DAY_IST,
+            8 * 3600 + 30 * 60
         );
+        assert_eq!(GROWW_RATE_PROBE_BLACKOUT_END_SECS_OF_DAY_IST, 16 * 3600);
         // seven_concurrent initial wave: 4 spot + 3 chain = 7 <= 10.
         assert_eq!(
             (GROWW_SPOT_1M_SYMBOLS.len() + 1) + GROWW_CHAIN_1M_UNDERLYINGS.len(),
             7
         );
+        // HIGH-1 (2026-07-14): per-target rung jitter — 150 ms step, the
+        // Dhan-leg precedent; the jittered rung schedule's worst rolling
+        // second is 6 (was a lockstep 8) and the seven-tier lag addend
+        // inside the wave second is 2 (was 4).
+        assert_eq!(GROWW_REST_RUNG_JITTER_STEP_MS, 150);
+        assert_eq!(
+            GROWW_REST_RUNG_JITTER_STEP_MS,
+            SPOT_1M_REST_LADDER_JITTER_STEP_MS
+        );
+        assert_eq!(groww_spot_rung_worst_rolling_second(), 6);
+        assert_eq!(groww_spot_rungs_in_first_second(), 2);
     }
 
     /// PR-4 (Groww contract leg): the fill-model leg's pacing + envelope
@@ -4627,14 +4766,17 @@ mod tests {
                 < 60_000
         );
         // Worst-overlap rolling second — REWRITTEN 2026-07-14 for the
-        // auto-ladder: two adjacent spot rung waves (800 ms apart, 4
-        // targets each) + the contract leg's 1000/500 = 2 req/s = 10,
-        // AT the documented 10/s ceiling (the min-gap cross-multiplication
-        // math retired with the chain min-gap; a live 429 auto-demotes and
-        // the demoted stagger drops the spot rung worst to <= 5/s).
+        // auto-ladder, RECOMPUTED same day with the HIGH-1 rung jitter:
+        // the jittered spot rung schedule's worst window holds 6 (was a
+        // lockstep 8) + the contract leg's 1000/500 = 2 req/s = 8, two
+        // under the documented 10/s ceiling SOLO (a live 429 still
+        // auto-demotes: staggered <= 4/s rungs, sequential no overlap).
+        // LOW-2 honest note (2026-07-14): the contract leg starts ~2-6 s
+        // earlier than pre-Stage-1 (chain completes faster), so its 2/s
+        // stream stacks INSIDE the spot rung windows — counted in this
+        // assert; zero co-tenant margin beyond it, accepted by design.
         assert!(
-            2 * (GROWW_SPOT_1M_SYMBOLS.len() as u64 + 1) + 1_000 / GROWW_CONTRACT_1M_MIN_GAP_MS
-                <= 10
+            groww_spot_rung_worst_rolling_second() + 1_000 / GROWW_CONTRACT_1M_MIN_GAP_MS <= 10
         );
         // Per-minute request math (the capacity envelope, 2026-07-14): 30
         // contracts + the spot leg's worst 20 (3 core + the runtime VIX

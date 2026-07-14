@@ -128,8 +128,8 @@ use tracing::{error, info, warn};
 use tickvault_common::config::QuestDbConfig;
 use tickvault_common::constants::{
     GROWW_API_VERSION_HEADER, GROWW_API_VERSION_VALUE, GROWW_CANDLE_INTERVAL_1MIN, GROWW_DATA_DIR,
-    GROWW_HISTORICAL_CANDLES_URL, GROWW_REST_WARMUP_LEAD_SECS, GROWW_SPOT_1M_MAX_BODY_BYTES,
-    GROWW_SPOT_1M_REQUEST_TIMEOUT_MS, GROWW_SPOT_1M_RETRY_OFFSETS_MS,
+    GROWW_HISTORICAL_CANDLES_URL, GROWW_REST_RUNG_JITTER_STEP_MS, GROWW_REST_WARMUP_LEAD_SECS,
+    GROWW_SPOT_1M_MAX_BODY_BYTES, GROWW_SPOT_1M_REQUEST_TIMEOUT_MS, GROWW_SPOT_1M_RETRY_OFFSETS_MS,
     GROWW_SPOT_1M_SYMBOL_BUDGET_SECS, GROWW_SPOT_1M_SYMBOLS, GROWW_SPOT_1M_TOKEN_REREAD_FLOOR_SECS,
     GROWW_SPOT_1M_VIX_SYMBOL, IST_UTC_OFFSET_SECONDS, SECONDS_PER_DAY,
     SPOT_1M_REST_FIRST_FIRE_SECS_OF_DAY_IST, SPOT_1M_REST_LAST_FIRE_SECS_OF_DAY_IST,
@@ -160,6 +160,7 @@ use crate::dhan_intraday_parse::MinuteCandle;
 // warm-up sender.
 use crate::groww_rest_burst::{
     GrowwRestBurstState, intra_wave_stagger_ms, send_warmup_get, spot_wave_fire_delay_ms,
+    wave_sleep_from_now_ms,
 };
 // The session-boundary scheduling primitives + edge tracker + body-cap
 // helpers are REUSED from the Dhan spot leg (they are NSE-session facts and
@@ -824,6 +825,22 @@ fn groww_retry_sleep_deltas_ms() -> [u64; 4] {
     ]
 }
 
+/// The sleep before ladder attempt `attempt` (1-based rung index), with
+/// the HIGH-1 (2026-07-14) per-target rung jitter folded in: the jitter
+/// is added ONCE, before the FIRST rung, which shifts the target's
+/// ENTIRE rung schedule by `rung_jitter_ms` (rung k lands at
+/// `offset_k + jitter` — the Dhan-leg slot-jitter precedent), so the 4
+/// concurrent targets never re-poll in lockstep on a correlated
+/// vendor-lag minute. Applied in ALL tiers. Pure.
+fn rung_sleep_delta_ms(deltas: &[u64; 4], attempt: usize, rung_jitter_ms: u64) -> u64 {
+    let base = deltas[attempt - 1];
+    if attempt == 1 {
+        base.saturating_add(rung_jitter_ms)
+    } else {
+        base
+    }
+}
+
 /// `true` when an SSM re-read of the shared token is allowed — the
 /// token-minter lock's ≥60 s pacing (never hammer SSM on a 401 storm;
 /// NEVER mint). A never-read cache is always allowed. Pure.
@@ -1210,6 +1227,7 @@ async fn fetch_minute_with_ladder(
     target_minute_ist_nanos: i64,
     backfill_minute_ist_nanos: Option<i64>,
     minute_close_ms_of_day: i64,
+    rung_jitter_ms: u64,
 ) -> (SymbolFetchOutcome, LadderForensics) {
     let deltas = groww_retry_sleep_deltas_ms();
     let mut last_error: Option<String> = None;
@@ -1220,7 +1238,12 @@ async fn fetch_minute_with_ladder(
     };
     for attempt in 0..=deltas.len() {
         if attempt > 0 {
-            tokio::time::sleep(Duration::from_millis(deltas[attempt - 1])).await;
+            tokio::time::sleep(Duration::from_millis(rung_sleep_delta_ms(
+                &deltas,
+                attempt,
+                rung_jitter_ms,
+            )))
+            .await;
         }
         let started = std::time::Instant::now();
         let result = groww_fetch_once(client, url, query, token).await;
@@ -1322,6 +1345,7 @@ async fn fetch_minute_bounded(
     target_minute_ist_nanos: i64,
     backfill_minute_ist_nanos: Option<i64>,
     minute_close_ms_of_day: i64,
+    rung_jitter_ms: u64,
 ) -> (SymbolFetchOutcome, LadderForensics) {
     match tokio::time::timeout(
         Duration::from_secs(GROWW_SPOT_1M_SYMBOL_BUDGET_SECS),
@@ -1333,6 +1357,7 @@ async fn fetch_minute_bounded(
             target_minute_ist_nanos,
             backfill_minute_ist_nanos,
             minute_close_ms_of_day,
+            rung_jitter_ms,
         ),
     )
     .await
@@ -1588,14 +1613,23 @@ pub async fn run_groww_spot_1m(params: GrowwSpot1mTaskParams) {
         // chain wave; seven_concurrent: close+300 ms). The optional
         // pre-boundary warm-up GET (boundary−4 s, 3 s-bounded,
         // unauthenticated — see `send_warmup_get`) re-establishes an
-        // idle-closed TLS connection before the critical window; the
-        // remaining sleep to the wave instant is recomputed from a fresh
-        // clock so the warm-up can never push the fire late.
+        // idle-closed TLS connection before the critical window.
+        // CRITICAL-1 (2026-07-14 fix round): EVERY wake instant — the
+        // warm-up lead AND the wave itself — is computed from the
+        // MILLISECOND clock (`wave_sleep_from_now_ms`), never by summing
+        // a whole-second boundary gap with the delay: the pre-fix else
+        // branch woke at `fire + frac(now) + delay`, and the two legs'
+        // independent fractional offsets could collapse the load-bearing
+        // 1,050 ms wave separation to ~51 ms.
         let wave_delay_ms = spot_wave_fire_delay_ms(params.burst.effective_tier());
-        let boundary_gap_ms = u64::from(fire.saturating_sub(now)).saturating_mul(1_000);
         let warmup_lead_ms = GROWW_REST_WARMUP_LEAD_SECS.saturating_mul(1_000);
-        if params.burst.warm_up_enabled() && boundary_gap_ms > warmup_lead_ms {
-            tokio::time::sleep(Duration::from_millis(boundary_gap_ms - warmup_lead_ms)).await;
+        let warmup_sleep_ms = wave_sleep_from_now_ms(
+            fire,
+            -i64::try_from(warmup_lead_ms).unwrap_or(0),
+            ist_millis_of_day_now(),
+        );
+        if params.burst.warm_up_enabled() && warmup_sleep_ms > 0 {
+            tokio::time::sleep(Duration::from_millis(warmup_sleep_ms)).await;
             if let Some(first) = targets.first() {
                 let warmup_query = groww_candles_query(
                     &first.groww_symbol,
@@ -1611,15 +1645,14 @@ pub async fn run_groww_spot_1m(params: GrowwSpot1mTaskParams) {
                 )
                 .await;
             }
-            let target_ms = i64::from(fire)
-                .saturating_mul(MILLIS_PER_SEC)
-                .saturating_add(i64::try_from(wave_delay_ms).unwrap_or(0));
-            let remaining_ms = target_ms.saturating_sub(ist_millis_of_day_now());
-            if remaining_ms > 0 {
-                tokio::time::sleep(Duration::from_millis(remaining_ms.unsigned_abs())).await;
-            }
-        } else {
-            tokio::time::sleep(Duration::from_millis(boundary_gap_ms + wave_delay_ms)).await;
+        }
+        let remaining_ms = wave_sleep_from_now_ms(
+            fire,
+            i64::try_from(wave_delay_ms).unwrap_or(0),
+            ist_millis_of_day_now(),
+        );
+        if remaining_ms > 0 {
+            tokio::time::sleep(Duration::from_millis(remaining_ms)).await;
         }
 
         // Staleness gate: a suspend / clock step can wake us far past the
@@ -1856,7 +1889,14 @@ async fn fire_one_minute(
             );
             let wave_client = client.clone();
             let wave_token = token.clone();
-            let stagger_ms = intra_wave_stagger_ms(tier, idx);
+            // The sequential floor spans a whole per-target budget per
+            // slot (review MEDIUM-1 2026-07-14).
+            let stagger_ms =
+                intra_wave_stagger_ms(tier, idx, GROWW_SPOT_1M_SYMBOL_BUDGET_SECS * 1_000);
+            // HIGH-1 (2026-07-14): deterministic per-target rung jitter
+            // in ALL tiers — slot j shifts its rung schedule by j×150 ms
+            // so correlated vendor-lag re-polls never fire in lockstep.
+            let rung_jitter_ms = (idx as u64).saturating_mul(GROWW_REST_RUNG_JITTER_STEP_MS);
             wave.spawn(async move {
                 if stagger_ms > 0 {
                     tokio::time::sleep(Duration::from_millis(stagger_ms)).await;
@@ -1869,6 +1909,7 @@ async fn fire_one_minute(
                     target_nanos,
                     backfill_nanos,
                     minute_close_ms,
+                    rung_jitter_ms,
                 )
                 .await;
                 (idx, outcome, forensics)
@@ -3173,6 +3214,27 @@ mod tests {
         }
     }
 
+    /// HIGH-1 (2026-07-14): the per-target rung jitter is added ONCE,
+    /// before the first rung, shifting the target's whole rung schedule
+    /// by `slot × 150 ms` — rung k reconstructs to `offset_k + jitter`
+    /// for every slot, and slot 0 is byte-identical to the unjittered
+    /// schedule.
+    #[test]
+    fn test_rung_sleep_delta_applies_slot_jitter_to_whole_schedule() {
+        let deltas = groww_retry_sleep_deltas_ms();
+        for slot in 0..GROWW_SPOT_1M_SYMBOLS.len() as u64 + 1 {
+            let jitter = slot * GROWW_REST_RUNG_JITTER_STEP_MS;
+            let mut cumulative = 0u64;
+            for (attempt, offset) in (1..=deltas.len()).zip(GROWW_SPOT_1M_RETRY_OFFSETS_MS.iter()) {
+                cumulative += rung_sleep_delta_ms(&deltas, attempt, jitter);
+                assert_eq!(cumulative, *offset + jitter);
+            }
+        }
+        // Slot 0 (jitter 0) reproduces the raw deltas exactly.
+        assert_eq!(rung_sleep_delta_ms(&deltas, 1, 0), deltas[0]);
+        assert_eq!(rung_sleep_delta_ms(&deltas, 2, 0), deltas[1]);
+    }
+
     #[test]
     fn test_should_reread_token_respects_60s_floor() {
         // Never read → always allowed.
@@ -3507,7 +3569,7 @@ mod tests {
         let query = groww_candles_query("NSE-NIFTY", "NSE", "CASH", date);
         let token = SecretString::from("test-token");
         let (outcome, forensics) =
-            fetch_minute_with_ladder(&client, &url, &query, &token, 900, None, 0).await;
+            fetch_minute_with_ladder(&client, &url, &query, &token, 900, None, 0, 0).await;
         assert_eq!(
             forensics.attempts, 1,
             "auth reject must abort the ladder on the first rung"
@@ -3764,6 +3826,7 @@ mod tests {
             target_nanos,
             Some(backfill_nanos),
             0,
+            0,
         )
         .await;
         assert_eq!(forensics.attempts, 1, "found on the first rung");
@@ -3789,6 +3852,7 @@ mod tests {
             &token,
             target_nanos,
             Some(backfill_nanos),
+            0,
             0,
         )
         .await;
