@@ -59,3 +59,53 @@ each exit landed before NSE close).
 - `orphan_position_watchdog::tests::*` — pure-function evaluator + clock helpers
 - Source-scan guard `secret_manager.rs::test_orphan_position_watchdog_is_wired_into_main`
   pins boot spawn site so future refactors can't silently remove the watchdog.
+
+## 2026-07-14 Update — spawn re-homed process-global + stale-source corrections
+
+The sections above are retained as history; the CURRENT state:
+
+- **Source moved:** the pure logic lives in
+  `crates/trading/src/orphan_position_watchdog.rs`
+  (`evaluate_orphan_positions` + clock helpers, no I/O); the supervised async
+  runner lives in `crates/app/src/orphan_position_watchdog_boot.rs` (NOT
+  `crates/core/src/instrument/orphan_position_watchdog.rs` as the header
+  above says).
+- **`orphan_position_audit` table + persistence were DELETED 2026-05-20**
+  (the QuestDB table cleanup — see the removed-guard marker in
+  `crates/core/src/auth/secret_manager.rs`). The `questdb_sql ... from
+  orphan_position_audit` triage step above is HISTORICAL — the table does
+  not exist. Current signals: the Telegram events
+  (`OrphanPositionsClean` / `OrphanPositionDetected` / the degraded
+  Custom-Critical arms), `error!(code = ORPHAN-POSITION-01)` on detection,
+  and the counters `tv_orphan_position_watchdog_runs_total` /
+  `tv_orphan_position_watchdog_fetch_failures_total` /
+  `tv_orphan_position_watchdog_respawns_total`.
+- **Spawn re-homed (2026-07-14):** the spawn previously lived ONLY inside the
+  Dhan-gated `spawn_post_market_tasks` family in `crates/app/src/main.rs` —
+  dead on `dhan_enabled = false` boots (the production default since the
+  2026-07-13 Dhan live-WS retirement), so the daily 15:25 IST broker-position
+  cross-check never ran. The PRIMARY spawn now lives in the main.rs
+  PROCESS-GLOBAL prefix (next to the tick-conservation hoist) using
+  `WatchdogAuth::GlobalAtFireTime` — at each 15:25 fire it resolves the
+  session PREFERRING the live lane-owned `TokenManager`
+  (`FeedRuntimeState::live_token_manager()`, the D2c gauge pattern — fresh
+  across a runtime lane stop→re-start) and falling back to the global
+  `TokenManager` (registered by the Dhan lane or the Dhan REST stack's
+  Phase 2); no manager anywhere = LOUD degraded Critical page, never a
+  clean signal. The fast crash-recovery arm keeps its `WatchdogAuth::Static`
+  spawn via `spawn_post_market_tasks`; a module-level once-guard
+  (`ORPHAN_WATCHDOG_CLAIMED`) makes a duplicate spawn a no-op.
+- **Known daily page in the dormant config shape (deliberate — review
+  round 1, 2026-07-14):** a config-ON boot held under the runtime-disabled
+  overlay (no Dhan lane starts, no Dhan REST stack starts) never registers
+  ANY token manager — live or global — so the watchdog fires ONE degraded
+  Critical Telegram per trading day at 15:25 IST. This is Rule-11 loudness
+  by design (an un-runnable broker-position check must never look clean),
+  NOT a bug. Triage: re-enable the Dhan feed (config or runtime), or accept
+  the daily page while that shape is deliberately held.
+- **Live wiring ratchet:** `crates/app/tests/orphan_position_watchdog_wiring_guard.rs`
+  (the `secret_manager.rs::test_orphan_position_watchdog_is_wired_into_main`
+  guard named above was removed 2026-05-20 with the audit table) — pins the
+  process-global-prefix-first topology, the exactly-2 spawn count, the
+  fire-time live-first-then-global session resolution (code-shaped
+  needles), and the degraded-arm wording (stub-guard).
