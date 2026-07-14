@@ -1486,6 +1486,16 @@ pub const DHAN_MARGIN_CALCULATOR_MULTI_PATH: &str = "/margincalculator/multi";
 /// Endpoint: GET <https://api.dhan.co/v2/fundlimit>
 pub const DHAN_FUND_LIMIT_PATH: &str = "/fundlimit";
 
+/// Master code-change lock for the 🔷 DHAN margin-gate REST legs (fundlimit
+/// + margincalculator). The order-surface umbrella plan (cluster E2) holds
+/// the live funds/margin REST call for an explicit operator grant; until a
+/// fresh dated quote is recorded in `.claude/rules/dhan/funds-margin.md`,
+/// this stays `false` and `MarginGate` can never issue a REST call even if
+/// `[dhan_margin_gate] enabled = true` — config flips alone can never turn
+/// the REST legs on (the hardcoded-dry_run / GROWW_ORDER_LIVE_FIRE
+/// precedent). Change ONLY with explicit approval from Parthiban.
+pub const DHAN_MARGIN_GATE_REST_ALLOWED: bool = false;
+
 /// Path for kill switch activate/deactivate (appended to rest_api_base_url).
 /// Endpoint: POST <https://api.dhan.co/v2/killswitch?killSwitchStatus=ACTIVATE|DEACTIVATE>
 pub const DHAN_KILL_SWITCH_PATH: &str = "/killswitch";
