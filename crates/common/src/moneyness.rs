@@ -46,9 +46,11 @@
 //! round-half-UP (a paise-exact midway spot rounds to the HIGHER strike).
 //! Proof in [`atm_strike_paise`]. The step influences ONLY the ATM label;
 //! the ITM/OTM direction is a pure strike-vs-spot inequality and is immune
-//! to any step error — the worst wrong-step failure is a misplaced/absent
-//! ATM label, made loud by the call sites' step-drift + atm-absent
-//! counters, never a swapped direction.
+//! to any wrong-but-VALID (positive, even) step — the worst such failure
+//! is a misplaced/absent ATM label, made loud by the call sites'
+//! step-drift + atm-absent counters, never a swapped direction. A
+//! missing/odd/zero step is NOT in that envelope: it fail-closes the
+//! whole minute to UNKNOWN (no direction is emitted at all).
 //!
 //! ## Integer paise everywhere (house convention)
 //! All price comparison is integer paise — never f64 `==`/epsilon (mirrors
@@ -266,7 +268,12 @@ pub fn atm_strike_paise(spot_paise: i64, step_paise: i64) -> Option<i64> {
     if spot_paise < 1 || step_paise <= 0 || step_paise % 2 != 0 {
         return None;
     }
-    let atm = ((spot_paise + step_paise / 2) / step_paise) * step_paise;
+    // checked_add makes the fn structurally TOTAL for any i64 pair —
+    // unreachable via the guarded conversion (spot ≤ 1e9 paise) + the const
+    // step table, but a future caller with a raw i64 can never overflow-
+    // panic here; overflow fail-closes to None like every other guard.
+    let half_up = spot_paise.checked_add(step_paise / 2)?;
+    let atm = (half_up / step_paise) * step_paise;
     // A spot below half a step grid-rounds to 0 — not a tradable strike
     // (grid strikes are positive multiples of the step). Fail closed:
     // unresolvable ATM → callers classify UNKNOWN (never a bogus Some(0)).
@@ -535,6 +542,24 @@ mod tests {
             atm_strike_paise(2_500, 5_000),
             Some(5_000),
             "exact half-step rounds UP to the first positive strike"
+        );
+        // Structural totality: a raw i64::MAX spot (unreachable via the
+        // guarded conversion — defense-in-depth for future raw callers)
+        // fail-closes to None via checked_add instead of overflowing.
+        assert_eq!(
+            atm_strike_paise(i64::MAX, 5_000),
+            None,
+            "checked_add overflow must fail closed, never panic"
+        );
+        assert_eq!(
+            atm_strike_paise(i64::MAX - 2_499, 5_000),
+            None,
+            "one paise past the checked_add boundary still fails closed"
+        );
+        assert!(
+            atm_strike_paise(i64::MAX - 2_500, 5_000).is_some(),
+            "the exact checked_add boundary (spot + step/2 == i64::MAX) \
+             still computes — the guard rejects only genuine overflow"
         );
     }
 

@@ -518,7 +518,9 @@ pub fn classify_chain_legs<'a>(
 /// coalesced warn per (feed instance, underlying slot, trading day) per
 /// kind (the contract leg's `anchor_stale` episode-latch precedent; a new
 /// trading day re-arms). Each chain run loop owns one instance, so the
-/// Dhan and Groww feeds latch independently.
+/// Dhan and Groww feeds latch independently. Bounded residual (accepted):
+/// the latches are task-local state, so a supervisor RESPAWN of the run
+/// loop resets them — at most one extra warn pair per respawn per day.
 #[derive(Default)]
 pub struct MoneynessWarnLatches {
     step_drift: [Option<NaiveDate>; CHAIN_1M_UNDERLYINGS.len()],
@@ -609,7 +611,9 @@ pub fn record_chain_moneyness_observability(
                 "CHAIN-02: observed finest adjacent strike step diverges \
                  from the directive const step — ATM labels may be \
                  misplaced until the const table is reviewed (ITM/OTM are \
-                 immune; a single off-grid stray strike also fires this — \
+                 immune to a wrong-but-VALID positive even step; a \
+                 missing/odd/zero step fail-closes the minute to UNKNOWN \
+                 instead; a single off-grid stray strike also fires this — \
                  vendor-data-weirdness signal, documented)"
             );
         }

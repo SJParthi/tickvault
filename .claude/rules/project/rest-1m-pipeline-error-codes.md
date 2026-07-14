@@ -811,9 +811,13 @@ log-sink-only per §3 anyway).
 (2 feeds × NIFTY/BANKNIFTY/SENSEX) lock-free arc-swap registry; each chain
 leg PUBLISHES one `ChainMoneynessSnapshot` per fetched minute (minute ts,
 spot + spot_paise, atm_strike_paise, spot_missing, expiry, per-row
-strike/leg/moneyness/ltp) after classification, BEFORE/independent of the
-persist outcome. Reads are one arc-swap load (~16ns measured, zero-alloc,
-DHAT-ratcheted by `dhat_moneyness.rs`; budget key `moneyness = 50` ns).
+strike/leg/moneyness/ltp) after classification — the publish happens
+AFTER the persist loop and independent of the persist outcome (a DB flush
+failure never blocks or degrades the RAM surface). Reads are one arc-swap
+load — budgeted ≤50 ns (the token_handle arc-swap-load class), zero-alloc
+(DHAT-ratcheted by `dhat_moneyness.rs`; budget key `moneyness = 50` ns);
+live Criterion numbers land post-merge via the bench lane — unmeasured
+pre-merge.
 Any future strategy consumer reads THIS snapshot — never the table — and
 remains bound by the §38.8 decision-freshness gate (`age_secs` is the
 staleness input) and the §28 indicators/strategies boundary (no strategy

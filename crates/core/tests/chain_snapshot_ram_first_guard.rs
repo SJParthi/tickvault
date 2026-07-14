@@ -188,9 +188,20 @@ fn banned_pattern_scanner_keeps_ram_first_category() {
     );
 }
 
+/// The PRODUCTION region of a source file: everything before the first
+/// `#[cfg(test)]` marker (the shadow-writer ratchet precedent). Scanning
+/// the whole file would let a `#[cfg(test)]` module's own call to
+/// `classify_chain_legs(` satisfy the wiring assertion while the
+/// production call site was deleted — a vacuous pass (audit Rule 11).
+fn production_region(content: &str) -> &str {
+    content.split("#[cfg(test)]").next().unwrap_or(content)
+}
+
 /// Wiring half: all three boot legs must keep CALLING the classification
 /// surface, both chain legs must keep PUBLISHING the RAM snapshot, and the
-/// contract leg (DB-audit-only by design) must NOT publish one.
+/// contract leg (DB-audit-only by design) must NOT publish one. Scans the
+/// PRODUCTION region only — test-only code can neither satisfy the
+/// positive assertions nor trip the negative one.
 #[test]
 fn boot_legs_keep_moneyness_wiring() {
     let app_src = repo_root().join("crates/app/src");
@@ -206,26 +217,58 @@ fn boot_legs_keep_moneyness_wiring() {
         ("option_chain_1m_boot.rs", &dhan_chain),
         ("groww_option_chain_1m_boot.rs", &groww_chain),
     ] {
+        let prod = production_region(content);
         assert!(
-            content.contains("classify_chain_legs("),
+            prod.contains("classify_chain_legs("),
             "{name} must classify every chain leg via \
-             classify_chain_legs() — the shared common-math glue"
+             classify_chain_legs() in PRODUCTION code (the #[cfg(test)] \
+             region cannot satisfy this) — the shared common-math glue"
         );
         assert!(
-            content.contains("publish_chain_moneyness_snapshot("),
+            prod.contains("publish_chain_moneyness_snapshot("),
             "{name} must publish the RAM chain snapshot after classification \
-             — the decision surface future strategy consumers read"
+             in PRODUCTION code — the decision surface future strategy \
+             consumers read"
         );
     }
 
+    let contract_prod = production_region(&groww_contract);
     assert!(
-        groww_contract.contains("classify_moneyness_for("),
+        contract_prod.contains("classify_moneyness_for("),
         "groww_contract_1m_boot.rs must classify each contract row via \
-         classify_moneyness_for() (chain-anchor spot + parsed strike + leg)"
+         classify_moneyness_for() in PRODUCTION code (chain-anchor spot + \
+         parsed strike + leg)"
     );
     assert!(
-        !groww_contract.contains("publish_chain_moneyness_snapshot("),
-        "the contract leg is DB-audit-only by design — it must NOT publish \
-         a chain snapshot (the chain legs own the RAM surface)"
+        !contract_prod.contains("publish_chain_moneyness_snapshot("),
+        "the contract leg is DB-audit-only by design — its PRODUCTION code \
+         must NOT publish a chain snapshot (the chain legs own the RAM \
+         surface)"
+    );
+}
+
+/// Self-test for the production-region split: a needle that appears ONLY
+/// inside a `#[cfg(test)]` module must NOT be visible to the scan, and a
+/// needle in production code must be — so the wiring assertions above can
+/// never be satisfied (or tripped) by test-only code.
+#[test]
+fn production_region_split_excludes_test_only_code() {
+    let test_only =
+        "fn real() {}\n#[cfg(test)]\nmod tests {\n    fn t() { classify_chain_legs(); }\n}\n";
+    assert!(
+        !production_region(test_only).contains("classify_chain_legs("),
+        "a test-module-only call must be invisible to the production scan"
+    );
+
+    let prod_call = "fn real() { classify_chain_legs(); }\n#[cfg(test)]\nmod tests {}\n";
+    assert!(
+        production_region(prod_call).contains("classify_chain_legs("),
+        "a production call must remain visible to the scan"
+    );
+
+    let no_test_module = "fn real() { classify_chain_legs(); }\n";
+    assert!(
+        production_region(no_test_module).contains("classify_chain_legs("),
+        "a file with no #[cfg(test)] marker scans in full"
     );
 }
