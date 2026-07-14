@@ -180,6 +180,16 @@ pub struct ApplicationConfig {
     /// (discard drain, no WAL capture). `config/base.toml` opts in.
     #[serde(default)]
     pub order_runtime: OrderRuntimeConfig,
+    /// `[dhan_margin_gate]` — 🔷 DHAN pre-trade margin gate (operator
+    /// directive 2026-07-14, relayed via the coordinator session — the
+    /// Funds & Margin surface runs as its own dedicated build; umbrella
+    /// plan cluster E2). Code-ready DEFAULT-OFF: even with
+    /// `enabled = true` the REST legs stay dark until the code-change
+    /// master lock `DHAN_MARGIN_GATE_REST_ALLOWED` (constants.rs) flips
+    /// with a fresh dated operator quote. Absent section ⇒ DISABLED
+    /// (fail-safe default off).
+    #[serde(default)]
+    pub dhan_margin_gate: DhanMarginGateConfig,
 }
 
 /// `[order_runtime]` — dry-run order-runtime configuration (2026-07-14).
@@ -2720,9 +2730,10 @@ impl ApplicationConfig {
         self.dhan_data_api.validate()?;
         self.spot_1m_rest.validate()?;
 
-        // 2026-07-14: scheduled OMS reconcile cadence must stay inside the
-        // 60..=3600s envelope — rejected at boot, BEFORE the pipeline spawns.
-        self.oms_reconcile.validate()?;
+        // 2026-07-14 Dhan margin gate: the shared-account budget/self-cap
+        // envelope (≤50% of the pooled balance, ≤10 req/sec) is rejected at
+        // boot, BEFORE any gate could consult it.
+        self.dhan_margin_gate.validate()?;
 
         Ok(())
     }
@@ -3299,6 +3310,7 @@ mod tests {
             tf_consistency: TfConsistencyConfig::default(),
             groww_contract_1m: GrowwContract1mConfig::default(),
             order_runtime: OrderRuntimeConfig::default(),
+            dhan_margin_gate: DhanMarginGateConfig::default(),
         }
     }
 
