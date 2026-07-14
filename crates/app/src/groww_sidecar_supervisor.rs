@@ -560,13 +560,49 @@ pub const SIDECAR_LINE_SIGNATURE_MAX_CHARS: usize = 160;
 /// a persistently-rejected child every ~5 minutes, and each fresh child gets a
 /// fresh latch, so a reject day would page ~12×/hour (~70 HIGH pages/session:
 /// pager fatigue, audit Rule 4). The page gate (a supervisor-lifetime
-/// last-page timestamp shared across children) bounds the SAME-condition page
-/// to at most one per this window; every suppressed episode still fires its
-/// per-line `error!` forwards, its FEED-REJECT-01 signature, and its
-/// feed-health marking — only the Telegram fan-out is cooled down. The
+/// last-page timestamp shared across children) bounds the SAME-condition
+/// notify() to at most one per this window; every suppressed episode still
+/// fires its per-line `error!` forwards, its FEED-REJECT-01 signature, and
+/// its feed-health marking — only the Telegram fan-out is cooled down. The
 /// ≥3-per-15-min restart-counter pager independently covers "it keeps
 /// failing".
-pub const GROWW_REJECT_PAGE_COOLDOWN_SECS: u64 = 1800;
+///
+/// 2026-07-14 (operator noise directive): reduced 1800 → 60s, aligned with
+/// the fleet 60s coalescer window. Page dedup is now OWNED by the
+/// `EpisodeFamily::GrowwFeed` one-bubble fold (`GrowwSidecarRejected`
+/// carries an `episode_key`, so recurrences become in-place edits — no
+/// push, no SMS); this gate remains ONLY as the transport-failure bound:
+/// if the episode's first page never lands (`message_id = None`), every
+/// subsequent reject takes `SendNewFallback` (a fresh send), and without
+/// an upstream bound that failure path would restore the storm. 60s caps
+/// notify() volume to ≤1/min regardless. NOT removed — ratcheted ==60 by
+/// `test_should_page_reject_rising_edge_and_cooldown`.
+///
+/// APPLIES ONLY while the episode fold is ON — see
+/// [`reject_page_cooldown_secs`] and the legacy constant below (FIX-B,
+/// hostile review 2026-07-14).
+pub const GROWW_REJECT_PAGE_COOLDOWN_SECS: u64 = 60;
+
+/// The pre-2026-07-14 cooldown, still used when `[notification]
+/// episode_mode = false` (the documented episode kill switch): with the
+/// fold rolled back, every GrowwSidecarRejected takes the legacy
+/// Immediate+SMS lane, so a 60s gate would page up to ~60×/hr — 30×
+/// noisier than the 2026-07-09 contract. The legacy 1800s bound (at most
+/// one page per 30 min) is restored for that mode. Ratcheted ==1800.
+pub const GROWW_REJECT_PAGE_COOLDOWN_LEGACY_SECS: u64 = 1800;
+
+/// The effective reject-page cooldown for this process (FIX-B, hostile
+/// review 2026-07-14). `episode_mode` is the BOOT-TIME value of
+/// `[notification] episode_mode` — consistent with how episode_mode
+/// itself is consumed, a runtime config flip needs a restart. Pure, O(1).
+#[must_use]
+pub const fn reject_page_cooldown_secs(episode_mode: bool) -> u64 {
+    if episode_mode {
+        GROWW_REJECT_PAGE_COOLDOWN_SECS
+    } else {
+        GROWW_REJECT_PAGE_COOLDOWN_LEGACY_SECS
+    }
+}
 
 /// Pure page-cooldown decision for the reject Telegram (2026-07-09 HIGH fix).
 /// `last_page_epoch_secs == 0` means no page has fired this supervisor
@@ -670,6 +706,15 @@ pub struct GrowwSidecarOptions {
     /// Key prefix inside the archive bucket, injected as
     /// `TICKVAULT_GROWW_ARCHIVE_S3_PREFIX`.
     pub archive_s3_prefix: String,
+    /// BOOT-TIME value of `[notification] episode_mode` (FIX-B, hostile
+    /// review 2026-07-14): selects the reject-page cooldown —
+    /// [`GROWW_REJECT_PAGE_COOLDOWN_SECS`] (60s) while the GrowwFeed
+    /// episode fold owns page dedup, the legacy
+    /// [`GROWW_REJECT_PAGE_COOLDOWN_LEGACY_SECS`] (1800s) when the
+    /// episode kill switch is OFF (every reject would otherwise page
+    /// Immediate+SMS at ~1/min). A runtime config flip needs a restart,
+    /// consistent with how episode_mode itself is read.
+    pub episode_mode: bool,
 }
 
 impl Default for GrowwSidecarOptions {
@@ -686,6 +731,9 @@ impl Default for GrowwSidecarOptions {
             shard_spec: None,
             archive_s3_bucket: String::new(),
             archive_s3_prefix: String::new(),
+            // Matches `default_notification_episode_mode()` (config.rs) —
+            // the fold is ON by default; main.rs overrides from config.
+            episode_mode: true,
         }
     }
 }
@@ -712,6 +760,9 @@ pub fn shard_sidecar_options(
         shard_spec: Some(shard_spec),
         archive_s3_bucket: base.archive_s3_bucket.clone(),
         archive_s3_prefix: base.archive_s3_prefix.clone(),
+        // FIX-B (2026-07-14): fleet children inherit the boot-time
+        // episode-mode so every child uses the same reject-page cooldown.
+        episode_mode: base.episode_mode,
     }
 }
 
@@ -1179,6 +1230,9 @@ fn spawn_pipe_drain<R>(
     // supervisor-lifetime epoch-seconds of the last GrowwSidecarRejected
     // page. See [`GROWW_REJECT_PAGE_COOLDOWN_SECS`].
     reject_page_gate: Arc<std::sync::atomic::AtomicU64>,
+    // Episode-mode-aware cooldown window (FIX-B, 2026-07-14) — computed
+    // ONCE at supervisor spawn via [`reject_page_cooldown_secs`].
+    reject_page_cooldown_secs: u64,
     // Stall-cause latch (scoreboard PR-B, 2026-07-10): the drains record the
     // child's last CONFIRMED reject class (auth/entitlement — the
     // `sets_auth_rejected` split) so a later stall-watchdog kill stamps the
@@ -1338,18 +1392,15 @@ where
                                     u64::try_from(chrono::Utc::now().timestamp()).unwrap_or(0);
                                 let last =
                                     reject_page_gate.load(std::sync::atomic::Ordering::Relaxed);
-                                if should_page_reject(
-                                    now_secs,
-                                    last,
-                                    GROWW_REJECT_PAGE_COOLDOWN_SECS,
-                                ) && reject_page_gate
-                                    .compare_exchange(
-                                        last,
-                                        now_secs.max(1),
-                                        std::sync::atomic::Ordering::Relaxed,
-                                        std::sync::atomic::Ordering::Relaxed,
-                                    )
-                                    .is_ok()
+                                if should_page_reject(now_secs, last, reject_page_cooldown_secs)
+                                    && reject_page_gate
+                                        .compare_exchange(
+                                            last,
+                                            now_secs.max(1),
+                                            std::sync::atomic::Ordering::Relaxed,
+                                            std::sync::atomic::Ordering::Relaxed,
+                                        )
+                                        .is_ok()
                                 {
                                     // 2026-07-14 operator demand (the 14:59
                                     // IST page carried no WHY): thread the
@@ -1464,6 +1515,9 @@ async fn supervise_child(
     // lifetime, so a fresh child's fresh `alerted` latch can no longer page
     // every ~5-min never-streamed relaunch.
     reject_page_gate: &Arc<std::sync::atomic::AtomicU64>,
+    // Episode-mode-aware page-cooldown window (FIX-B, 2026-07-14) —
+    // computed once at supervisor spawn via [`reject_page_cooldown_secs`].
+    reject_page_cooldown_secs: u64,
     // Forensic `ws_event_audit` sender (scoreboard PR-B, 2026-07-10): a
     // stall-watchdog kill+relaunch stamps ONE `stall_restarted` row so the
     // 15:45 IST scorecard counts stall episodes with a cause slug. `None`
@@ -1492,6 +1546,7 @@ async fn supervise_child(
             conn_id,
             Arc::clone(&detail_logged),
             Arc::clone(reject_page_gate),
+            reject_page_cooldown_secs,
             Arc::clone(&stall_cause),
         ));
     }
@@ -1505,6 +1560,7 @@ async fn supervise_child(
             conn_id,
             Arc::clone(&detail_logged),
             Arc::clone(reject_page_gate),
+            reject_page_cooldown_secs,
             Arc::clone(&stall_cause),
         ));
     }
@@ -1795,6 +1851,11 @@ pub async fn run_groww_sidecar_supervisor(
     // of the last GrowwSidecarRejected Telegram page, shared across every
     // child this supervisor launches. 0 = never paged.
     let reject_page_gate = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    // Episode-mode-aware cooldown window (FIX-B, 2026-07-14): 60s while the
+    // GrowwFeed episode fold owns page dedup, the legacy 1800s when the
+    // `[notification] episode_mode` kill switch is OFF (boot-time value; a
+    // runtime config flip needs a restart, like episode_mode itself).
+    let reject_cooldown_secs = reject_page_cooldown_secs(opts.episode_mode);
     loop {
         if !feed_runtime.is_enabled(Feed::Groww) {
             sleep(SIDECAR_DISABLE_POLL).await;
@@ -1935,6 +1996,7 @@ pub async fn run_groww_sidecar_supervisor(
             &mut storm,
             opts.conn_id,
             &reject_page_gate,
+            reject_cooldown_secs,
             &ws_audit_tx,
         )
         .await;
@@ -3422,10 +3484,29 @@ mod tests {
             1_000,
             GROWW_REJECT_PAGE_COOLDOWN_SECS
         ));
-        // Cooldown bound sanity: strictly above the never-streamed cadence so
-        // the fix actually bounds the storm, and at most one page per 30 min.
-        assert!(GROWW_REJECT_PAGE_COOLDOWN_SECS > FEED_NEVER_STREAMED_RESTART_SECS);
-        assert!(GROWW_REJECT_PAGE_COOLDOWN_SECS <= 3_600);
+        // Cooldown pins (2026-07-14 operator noise directive + FIX-B/FIX-C
+        // hostile review): the GrowwFeed episode fold owns page dedup, so
+        // the episode-mode-ON gate is ONLY the transport-failure bound on
+        // the SendNewFallback path — EXACTLY 60s (aligned with the fleet
+        // 60s coalescer; drift DOWN would weaken the fallback storm cap
+        // 60×, drift UP would starve the bubble's occurrence counter).
+        // With `[notification] episode_mode = false` (the documented
+        // rollback kill switch) every reject takes the legacy
+        // Immediate+SMS lane, so the LEGACY 1800s bound (one page per
+        // 30 min, the 2026-07-09 contract) is restored — EXACTLY 1800.
+        assert_eq!(GROWW_REJECT_PAGE_COOLDOWN_SECS, 60);
+        assert_eq!(GROWW_REJECT_PAGE_COOLDOWN_LEGACY_SECS, 1_800);
+        assert_eq!(
+            reject_page_cooldown_secs(true),
+            GROWW_REJECT_PAGE_COOLDOWN_SECS
+        );
+        assert_eq!(
+            reject_page_cooldown_secs(false),
+            GROWW_REJECT_PAGE_COOLDOWN_LEGACY_SECS
+        );
+        // Default options carry the fold-ON default (matches config.rs
+        // `default_notification_episode_mode`).
+        assert!(GrowwSidecarOptions::default().episode_mode);
     }
 
     #[test]
