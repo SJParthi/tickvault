@@ -1432,6 +1432,13 @@ fn record_chain_skipped_boundaries(
     // POST-WAKE date — wrong trading date on every row. The counter + the
     // coalesced log already fired; skip the (mis-dated) forensics rows +
     // edge accounting — the day is over for this run.
+    //
+    // DELIBERATE edge-accounting change (review MEDIUM 3, 2026-07-14):
+    // pre-GAP-11 this fn fed `edge.record_minute(true)` UNCONDITIONALLY for
+    // every missed boundary; post-guard a midnight-crossing wake feeds the
+    // edge NOTHING for those boundaries. Defensible by design: the trading
+    // day those boundaries belonged to is over, and an escalation page for
+    // yesterday's tail on the post-wake day would be noise, not signal.
     let trading_date = today_ist();
     if trading_date != iter_date {
         warn!(

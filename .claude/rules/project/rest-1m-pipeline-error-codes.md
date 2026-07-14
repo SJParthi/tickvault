@@ -400,12 +400,21 @@ survive: a sweep gap row never overwrites the minute's original ladder
 row; hostile round 1 item 5) is written BEST-EFFORT by the Groww leg —
 AND, since 2026-07-14 (GAP-11), by the DHAN legs too: the Dhan spot leg
 emits one row per (minute, SID) at every verdict/backfill/sweep/no-token
-point (own-fire `ok` rows carry the MEASURED `close_to_data_ms` from the
-ladder verdict; `final_http_status`/`fetch_latency_ms` stay the 0/-1
-honest sentinels — the Dhan ladder surfaces no per-request forensics
-struct, threading one through is a flagged follow-up), and the Dhan
-CHAIN leg emits per (minute, underlying) with `leg='chain_1m'` (see the
-§2d 2026-07-14 note). NEW COLUMN `close_to_persist_ms` (2026-07-14):
+point AND per skipped boundary (`outcome=skipped`/`boundary_skipped`,
+with the Groww midnight-cross date guard — review MEDIUM 1). Own-fire
+`ok` rows carry the MEASURED `close_to_data_ms` from the ladder verdict;
+since the same-day review HIGH fix the Dhan ladder threads a REAL
+per-ladder forensics struct (`DhanLadderForensics`), so `attempts` and
+`rate_limited_count` are the TRUE rung/429 counts and a terminal-429
+ladder classifies `outcome=rate_limited` (the Groww last-status rule) —
+a Dhan 429 storm can no longer read 0 on the scoreboard digest while
+`tv_spot1m_rate_limited_total` climbs. The REMAINING named sentinels:
+`final_http_status`/`fetch_latency_ms` stay 0/-1 (the Dhan
+`FetchFailure` carries no status/latency fields — that narrower
+follow-up stays flagged), and the budget-overrun arm honestly reads
+`attempts=0` (the timed-out ladder's partial state drops with its
+future). The Dhan CHAIN leg emits per (minute, underlying) with
+`leg='chain_1m'` (see the §2d 2026-07-14 note). NEW COLUMN `close_to_persist_ms` (2026-07-14):
 minute close → the DATA-table ILP flush-ACK instant in ms, stamped via
 the hold-then-stamp pattern (`stamp_held_ok_rows` in
 `spot_1m_rest_boot.rs`, shared by the Dhan spot/sweep, Groww spot fire
@@ -430,7 +439,16 @@ fetch happened, 0 sentinel when none) and class slugs `named_gap` /
 AUDIT-ONLY — §38/§9 forbid a bulk backfill fetch) / `persist_failed`
 (fetched OK but the ILP APPEND failed — a persist failure, never dressed
 as vendor absence; round-2 LOW) / `flush_failed` (swept minutes lost at
-the ILP flush) / `no_token` — never a silent hole.
+the ILP flush) / `no_token` — never a silent hole. DEDUP honesty
+(2026-07-14 review LOW): `error_class` is NOT in the audit DEDUP key, so
+two named-gap rows sharing `(minute, SID, outcome)` with different
+class slugs (e.g. a fire's `persist_failed` then the sweep's
+`named_gap`) UPSERT in place — the LAST-written error_class wins for
+that key; the outcome-level truth is unaffected (`outcome` IS in-key).
+Also since 2026-07-14 (review MEDIUM 2, cross-feed symmetry): the GROWW
+spot backfill-Ok arm holds an `ok` row for the repaired minute (the Dhan
+backfill-row semantics — a backfill-repaired Groww minute no longer
+reads "failed, never recovered" in the digest).
 
 **2026-07-13 — the GROWW CONTRACT leg emits SPOT1M-02 with
 `leg = "contract_1m"` for the NEW `option_contract_1m_rest` table:** the
@@ -720,6 +738,11 @@ the Groww midnight-cross date guard) / `named_gap`
 (`persist_failed`/`flush_failed` for fetched-but-lost minutes). Its
 forensics-write failures are coded CHAIN-03 `audit_append`/`audit_flush`
 (Dhan emit sites stay field-less — grep-split by `feed="groww"`).
+Deliberate edge-accounting change riding the midnight guard (review
+MEDIUM 3, same day): on a midnight-crossing wake the guard now also
+skips the per-boundary `edge.record_minute(true)` calls that pre-GAP-11
+ran unconditionally — the trading day those boundaries belonged to is
+over, so an escalation page for yesterday's tail would be noise.
 
 ## §2e. CHAIN-04 — day-start expirylist warmup failed (pipeline down for the day)
 

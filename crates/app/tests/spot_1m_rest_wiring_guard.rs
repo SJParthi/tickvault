@@ -240,6 +240,22 @@ fn ratchet_ok_audit_rows_stamp_after_data_flush_ack() {
                  must follow the data flush (byte {flush_pos}) in source order \
                  — close_to_persist_ms is a post-flush-ACK measurement"
             );
+            // Review LOW (2026-07-14): source ORDER alone would still pass
+            // if a regression stamped with a literal `true` — the stamp
+            // call must consume the REAL flush verdict binding.
+            assert!(
+                region.contains("let flush_result = writer.flush()"),
+                "{rel} `{marker}`: the data flush must be BOUND as \
+                 `let flush_result = writer.flush()` — the stamp gate reads \
+                 that verdict, never a literal"
+            );
+            let stamp_window = &region[stamp_pos..region.len().min(stamp_pos + 400)];
+            assert!(
+                stamp_window.contains("flush_result.is_ok()"),
+                "{rel} `{marker}`: the stamp_held_ok_rows call must gate on \
+                 `flush_result.is_ok()` (the real flush verdict) — a literal \
+                 `true` would fabricate ok rows for lost minutes"
+            );
             assert!(
                 region.contains("held_ok_rows.push("),
                 "{rel} `{marker}`: lost the `held_ok_rows.push(` hold site — \
@@ -253,4 +269,52 @@ fn ratchet_ok_audit_rows_stamp_after_data_flush_ack() {
             );
         }
     }
+}
+
+/// GAP-11 adversarial-review fixes (2026-07-14) stay wired:
+/// - HIGH: the Dhan spot ladder threads REAL attempt/429 forensics and a
+///   terminal-429 ladder classifies `rate_limited` (never a generic
+///   `error` while the scoreboard digest sums 0 rate-limit hits).
+/// - MEDIUM 1: Dhan spot missed boundaries land queryable
+///   `outcome=skipped` forensics rows (the Groww spot / Dhan chain shape).
+/// - MEDIUM 2: the Groww spot BACKFILL recovery holds an `ok` audit row
+///   (cross-feed symmetry — a backfill-repaired Groww minute must not
+///   read "failed, never recovered" in the digest forever).
+#[test]
+fn ratchet_gap11_review_fixes_stay_wired() {
+    let spot_src = read_app_src("src/spot_1m_rest_boot.rs");
+    let spot = production_region(&spot_src);
+    for needle in [
+        // HIGH — real ladder forensics + terminal-429 classification.
+        "struct DhanLadderForensics",
+        "dhan_failed_audit_class(",
+        "RestFetchOutcome::RateLimited",
+        // MEDIUM 1 — skipped-boundary forensics rows + midnight guard.
+        "RestFetchOutcome::Skipped",
+        "\"boundary_skipped\"",
+    ] {
+        assert!(
+            spot.contains(needle),
+            "spot_1m_rest_boot.rs production region lost its `{needle}` \
+             wiring — the GAP-11 review HIGH/MEDIUM-1 fixes must stay \
+             (real rate-limit facts + queryable skipped boundaries)"
+        );
+    }
+    let groww_src = read_app_src("src/groww_spot_1m_boot.rs");
+    let groww = production_region(&groww_src);
+    let fire = fn_region(
+        groww,
+        "async fn fire_one_minute(",
+        "src/groww_spot_1m_boot.rs",
+    );
+    let backfill_pos = fire
+        .find("tv_groww_spot1m_backfilled_total")
+        .expect("groww fire_one_minute lost its backfill-Ok arm");
+    assert!(
+        fire[backfill_pos..].contains("held_ok_rows.push(build_fetch_audit_row("),
+        "groww_spot_1m_boot.rs fire_one_minute: the backfill-Ok arm must \
+         HOLD an ok audit row for the repaired minute (GAP-11 review \
+         MEDIUM 2) — without it a backfill-repaired Groww minute reads \
+         'failed, never recovered' in the digest forever"
+    );
 }
