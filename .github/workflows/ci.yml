@@ -602,6 +602,7 @@ jobs:
           expected=$(LC_ALL=C sort <<'EOF'
           crates/app/tests/dhat_mark_forward.rs
           crates/core/tests/dhat_allocation.rs
+          crates/core/tests/dhat_cadence_decide.rs
           crates/core/tests/dhat_feed_consumer.rs
           crates/core/tests/dhat_feed_lag_groww.rs
           crates/core/tests/dhat_feed_lag_ring.rs
@@ -658,6 +659,7 @@ jobs:
           set -euo pipefail
           cargo test -p tickvault-core --features dhat \
             --test dhat_allocation \
+            --test dhat_cadence_decide \
             --test dhat_feed_consumer \
             --test dhat_feed_lag_groww \
             --test dhat_feed_lag_ring \
@@ -680,8 +682,8 @@ jobs:
           # CI while all 9 tests passed (first live run of this lane,
           # 2026-07-09, job 86196056113).
           ran=$(grep -c 'Running.*tests/dhat_' /tmp/dhat-core.log || true)
-          if [ "$ran" -ne 12 ]; then
-            echo "::error::core DHAT step executed $ran targets, expected 12 — a --test flag was dropped from this step (drift list vs run step mismatch)."
+          if [ "$ran" -ne 13 ]; then
+            echo "::error::core DHAT step executed $ran targets, expected 13 — a --test flag was dropped from this step (drift list vs run step mismatch)."
             exit 1
           fi
 
