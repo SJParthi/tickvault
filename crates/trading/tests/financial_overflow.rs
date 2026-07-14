@@ -64,37 +64,48 @@ fn overflow_record_fill_max_f64_price() {
     assert!(pos.is_some());
 }
 
+// Contract update 2026-07-14 (order-runtime dry-run PR, S1 fill-price guard):
+// `record_fill` now REJECTS non-finite / non-positive fill prices LOUDLY
+// (RISK-GAP-02 error! + counter) instead of folding poison values into the
+// position book — a NaN `total_pnl` silently BYPASSES the daily-loss halt
+// (`NaN < 0.0` is false), so folding was a financial-safety hole. The four
+// tests below previously asserted the old fold-it-in behaviour; they now
+// assert the STRONGER contract: no panic AND no position is created.
+
 #[test]
 fn overflow_record_fill_zero_price() {
     let mut engine = make_engine();
     engine.record_fill(1001, 10, 0.0, 25);
-    let pos = engine.position(1001).unwrap();
-    assert_eq!(pos.avg_entry_price, 0.0);
+    // S1: zero price rejected — no position booked, accumulators untouched.
+    assert!(engine.position(1001).is_none());
+    assert_eq!(engine.total_realized_pnl(), 0.0);
 }
 
 #[test]
 fn overflow_record_fill_negative_price() {
     let mut engine = make_engine();
-    // Negative prices shouldn't happen in practice but must not panic
+    // Negative prices shouldn't happen in practice — rejected, never folded.
     engine.record_fill(1001, 10, -100.0, 25);
-    let pos = engine.position(1001).unwrap();
-    assert_eq!(pos.avg_entry_price, -100.0);
+    assert!(engine.position(1001).is_none());
+    assert_eq!(engine.total_realized_pnl(), 0.0);
 }
 
 #[test]
 fn overflow_record_fill_nan_price() {
     let mut engine = make_engine();
     engine.record_fill(1001, 10, f64::NAN, 25);
-    let pos = engine.position(1001).unwrap();
-    assert!(pos.avg_entry_price.is_nan());
+    // S1: a NaN avg_entry would make total_pnl NaN and silently disarm the
+    // daily-loss halt comparison — rejected instead.
+    assert!(engine.position(1001).is_none());
+    assert!(engine.total_realized_pnl().is_finite());
 }
 
 #[test]
 fn overflow_record_fill_infinity_price() {
     let mut engine = make_engine();
     engine.record_fill(1001, 10, f64::INFINITY, 25);
-    let pos = engine.position(1001).unwrap();
-    assert!(pos.avg_entry_price.is_infinite());
+    assert!(engine.position(1001).is_none());
+    assert!(engine.total_realized_pnl().is_finite());
 }
 
 // ---------------------------------------------------------------------------
@@ -104,11 +115,13 @@ fn overflow_record_fill_infinity_price() {
 #[test]
 fn overflow_record_fill_zero_lot_size() {
     let mut engine = make_engine();
-    // Zero lot size — P&L calculation multiplies by lot_size
+    // Contract update 2026-07-14 (C12): lot_size 0 is normalized to 1 at
+    // record time — a zero multiplier silently ZEROED realized P&L on a
+    // close (a real-money accounting hole). New contract:
+    // P&L = (110-100) * 10 lots * max(0,1) lot_size = 100.0 — never 0.
     engine.record_fill(1001, 10, 100.0, 0);
     engine.record_fill(1001, -10, 110.0, 0);
-    // P&L = (110-100) * 10 * 0 = 0
-    assert_eq!(engine.total_realized_pnl(), 0.0);
+    assert!((engine.total_realized_pnl() - 100.0).abs() < f64::EPSILON);
 }
 
 #[test]
