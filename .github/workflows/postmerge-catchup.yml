@@ -113,15 +113,27 @@ jobs:
           # for non-terraform merges, the existence check alone would dispatch
           # an apply run on EVERY merge; the guard below therefore dispatches
           # ONLY when the HEAD commit actually touched the filtered paths.
-          # Envelope: the commit-files API returns up to 300 files — a >300-file
-          # merge whose terraform change sits past the cap is missed here and
-          # covered by the existing post-close crons (fail-safe direction: a
-          # missed dispatch defers the apply, never doubles it; terraform-apply
-          # is plan-gated + DynamoDB-locked, so extras are free no-ops anyway).
-          tf_touched=$(gh api "repos/${GH_REPO}/commits/${head_sha}"             --jq '[.files[].filename
-                   | select(startswith("deploy/aws/terraform/")
-                            or . == ".github/workflows/terraform-apply.yml")]
-                  | length')
+          # Envelope: (a) the commit-files API returns up to 300 files — a
+          # >300-file merge whose terraform change sits past the cap is missed
+          # here; (b) HEAD-only coverage — a tf-touching bot merge that is
+          # SUPERSEDED by a non-tf merge inside one 30-min window is never
+          # backfilled by this lane (the new HEAD reads tf_touched=0 and old
+          # SHAs are never rechecked). Both cases fall back to terraform-apply's
+          # own post-close crons (fail-safe direction: a missed dispatch DEFERS
+          # the apply, never doubles it; the apply is plan-gated +
+          # DynamoDB-locked, so extras are free no-ops anyway).
+          # Fail-safe (hostile review 2026-07-14, HIGH): `.files` can be null/
+          # absent (truncated large-diff responses) and `gh api` can fail
+          # transiently — under `set -euo pipefail` a bare failure here would
+          # kill the WHOLE step and skip the ci/bench/deploy-aws backfills too
+          # (recreating the 2026-07-09 outage class). `(.files // [])` +
+          # `|| echo ""` + the numeric check degrade ONLY the terraform lane
+          # (tf_touched=0 → skip), never the other three.
+          tf_touched=$(gh api "repos/${GH_REPO}/commits/${head_sha}"             --jq '[ (.files // [])[].filename
+                    | select(startswith("deploy/aws/terraform/")
+                             or . == ".github/workflows/terraform-apply.yml") ]
+                  | length' 2>/dev/null || echo "")
+          [[ "${tf_touched}" =~ ^[0-9]+$ ]] || tf_touched=0
           echo "terraform-filtered files in HEAD commit: ${tf_touched}"
 
           for wf in ci.yml bench.yml deploy-aws.yml terraform-apply.yml; do
@@ -140,8 +152,14 @@ jobs:
               --jq .total_count)
             if [ "${count}" -eq 0 ]; then
               echo "::warning::${wf} has ZERO runs for main HEAD ${head_sha} — a GITHUB_TOKEN bot merge (or a scheduler-dropped morning deploy cron) left it uncovered. Dispatching catch-up run on main."
-              gh workflow run "${wf}" --ref main
-              dispatched=$((dispatched + 1))
+              # A transient dispatch failure must not abort the REMAINING
+              # lanes (hostile review 2026-07-14, MEDIUM) — the next 30-min
+              # firing retries any lane still uncovered.
+              if gh workflow run "${wf}" --ref main; then
+                dispatched=$((dispatched + 1))
+              else
+                echo "::error::dispatch of ${wf} failed — the next 30-min firing retries"
+              fi
             else
               echo "${wf}: ${count} run(s) already exist for ${head_sha} — nothing to do"
             fi
