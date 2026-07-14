@@ -1160,13 +1160,22 @@ async fn run_serving_delay_probe(
             tokio::time::sleep(Duration::from_millis(PROBE_REQUEST_SPACING_MS)).await;
         }
         let entry = match spot_1m_fetch_once(client, url, jwt.expose_secret(), body).await {
-            Ok(text) => {
-                let candles = parse_intraday_1m_candles(&text);
+            Ok(fetched) => {
+                let candles = parse_intraday_1m_candles(&fetched.text);
                 let s = summarize_probe_candles(&candles, *target_nanos);
                 serde_json::json!({
                     "probe": name,
                     "request": body.to_string(),
                     "status": "2xx",
+                    // 2026-07-14 raw-body discriminator (diagnostics-gated
+                    // by construction — probes only run under
+                    // `[spot_1m_rest] diagnostics_enabled`): bounded
+                    // 600-char secret-redacted body sample + shape stats.
+                    "content_type": fetched.content_type,
+                    "body_bytes": fetched.text.len(),
+                    "body_sample": tickvault_common::sanitize::capture_rest_raw_body_sample(
+                        &fetched.text,
+                    ),
                     "rows": s.rows,
                     "first_candle_ist": s
                         .first_candle_ist_nanos
@@ -1286,39 +1295,57 @@ struct FetchFailure {
     msg: String,
 }
 
-/// Per-ladder forensics for the Dhan `rest_fetch_audit` row (GAP-11
-/// review HIGH, 2026-07-14): the REAL rung count + 429 count + whether
-/// the TERMINAL failure was an HTTP 429 — so a Dhan 429 storm can never
-/// again read 0 on the scoreboard digest while
-/// `tv_spot1m_rate_limited_total` climbs. `final_http_status` /
-/// `fetch_latency_ms` REMAIN the storage crate's 0/-1 named sentinels
-/// (the Dhan [`FetchFailure`] carries no status/latency fields — that
-/// residual is the remaining flagged follow-up).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct DhanLadderForensics {
-    /// Requests actually sent by the ladder (0 = the budget-overrun arm —
-    /// the timed-out ladder's partial state is dropped with its future,
-    /// the Groww `budget_exceeded` honesty note).
-    attempts: u32,
-    /// How many of those attempts were HTTP 429 (derived from the REAL
-    /// `StatusCode`, never a substring scan).
-    rate_limited_count: u32,
-    /// The FINAL attempt was an HTTP 429 — drives the terminal
-    /// [`RestFetchOutcome::RateLimited`] classification (mirrors the
-    /// Groww `error_class == "rate_limited"` rule: the LAST attempt's
-    /// status decides).
-    terminal_rate_limited: bool,
+/// A 2xx response body + its `Content-Type` header value (2026-07-14
+/// raw-body discriminator: the header names WHAT Dhan is serving when the
+/// body carries zero candles — JSON envelope vs HTML shell vs empty).
+struct FetchedBody {
+    text: String,
+    content_type: String,
 }
 
-/// GAP-11 review HIGH (2026-07-14): terminal-failure classification for
-/// the Dhan audit row — mirrors the Groww `audit_outcome_for` rule
-/// (`RateLimited` keys on the LAST attempt being an HTTP 429). Pure.
-fn dhan_failed_audit_class(forensics: &DhanLadderForensics) -> (RestFetchOutcome, &'static str) {
-    if forensics.terminal_rate_limited {
-        (RestFetchOutcome::RateLimited, "rate_limited")
-    } else {
-        (RestFetchOutcome::Error, "error")
-    }
+// ---------------------------------------------------------------------------
+// 2026-07-14 once-per-day raw-body sample (the account-condition vs
+// envelope-drift discriminator + Dhan-support evidence). For ≥14 days BOTH
+// /v2/charts/intraday and /v2/charts/historical returned 2xx with zero
+// parseable candles for ALL SIDs while option-chain + WS worked — and no
+// 2xx body was ever logged anywhere. On the FIRST empty_no_rows/empty_stale
+// classification of each IST day, ONE structured line captures a bounded
+// (600-char, secret-redacted) sample of the last parsed 2xx body + its
+// total byte length + Content-Type. Edge-latched: exactly one line per
+// day per process, unconditional (not diagnostics-gated — it is one log
+// line per day).
+// ---------------------------------------------------------------------------
+
+/// Process-global latch: the IST day key (nanos / day) whose raw-body
+/// sample has already been captured. 0 = never.
+static RAW_BODY_CAPTURE_DAY_KEY: std::sync::atomic::AtomicI64 =
+    std::sync::atomic::AtomicI64::new(0);
+
+/// Nanoseconds per day — the day-key divisor for the once-per-day latch.
+const NANOS_PER_DAY_I64: i64 = 86_400 * 1_000_000_000;
+
+/// Pure: the once-per-day latch key for a minute inside the trading day.
+#[must_use]
+pub fn raw_body_capture_day_key(minute_ist_nanos: i64) -> i64 {
+    minute_ist_nanos.div_euclid(NANOS_PER_DAY_I64)
+}
+
+/// Pure: whether a capture is still due for `day_key` given the latched
+/// value (`0` = never captured).
+#[must_use]
+pub fn raw_body_capture_due(latched_day_key: i64, day_key: i64) -> bool {
+    latched_day_key != day_key
+}
+
+/// Claim today's capture slot. `true` exactly once per day key per
+/// process (CAS — the 4 concurrent per-SID ladders can never double-log).
+fn try_claim_raw_body_capture(day_key: i64) -> bool {
+    use std::sync::atomic::Ordering;
+    let prev = RAW_BODY_CAPTURE_DAY_KEY.load(Ordering::Relaxed);
+    raw_body_capture_due(prev, day_key)
+        && RAW_BODY_CAPTURE_DAY_KEY
+            .compare_exchange(prev, day_key, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
 }
 
 /// `true` when a DECLARED `Content-Length` fits the body cap (an absent
@@ -1370,7 +1397,7 @@ async fn spot_1m_fetch_once(
     url: &str,
     jwt: &str,
     body: &serde_json::Value,
-) -> Result<String, FetchFailure> {
+) -> Result<FetchedBody, FetchFailure> {
     // 2026-07-14 operator pacing directive: EVERY spot-1m Data-API request
     // (per-minute fires, ladder re-polls, the 15:33:30 sweep, the #1524
     // diagnostic probes — they all funnel through this fn) waits for a
@@ -1409,10 +1436,20 @@ async fn spot_1m_fetch_once(
             ),
         });
     }
-    read_body_capped(resp).await.map_err(|msg| FetchFailure {
+    // Content-Type BEFORE the body read consumes the response (2026-07-14
+    // raw-body discriminator — the header value rides the once-per-day
+    // sample line + the diagnostics probe entries).
+    let content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    let text = read_body_capped(resp).await.map_err(|msg| FetchFailure {
         rate_limited: false,
         msg,
-    })
+    })?;
+    Ok(FetchedBody { text, content_type })
 }
 
 /// Bounded in-minute re-poll ladder for ONE index: first attempt at the
@@ -1459,6 +1496,12 @@ async fn fetch_minute_with_ladder(
     // 2026-07-14 stale-watermark cutoff: the previous PARSED attempt's
     // last-candle watermark (`Some(None)` = a parsed zero-row payload).
     let mut prev_parsed_watermark: Option<Option<i64>> = None;
+    // 2026-07-14 raw-body discriminator: the last target-less 2xx body's
+    // bounded redacted sample + Content-Type + total byte length. Stashed
+    // ONLY while today's once-per-day capture is still due (zero work on
+    // every later minute of the day).
+    let capture_day_key = raw_body_capture_day_key(target_minute_ist_nanos);
+    let mut empty_body_sample: Option<(String, String, usize)> = None;
     for attempt in 0..attempts {
         if attempt > 0 {
             let sleep_ms = ladder_sleep_ms(
@@ -1475,7 +1518,8 @@ async fn fetch_minute_with_ladder(
             .record(started.elapsed().as_secs_f64() * 1_000.0);
         forensics.attempts = forensics.attempts.saturating_add(1);
         match result {
-            Ok(body_text) => {
+            Ok(fetched) => {
+                let body_text = fetched.text;
                 let (target, backfill, stats) = parse_intraday_columnar_for_minutes(
                     &body_text,
                     target_minute_ist_nanos,
@@ -1499,9 +1543,22 @@ async fn fetch_minute_with_ladder(
                         forensics,
                     );
                 }
-                // 2xx without the target minute — the seal may not have
-                // landed yet; the next ladder rung re-polls UNLESS the
-                // watermark provably did not move between two polls
+                // 2xx without the target minute — stash the bounded
+                // redacted sample for the once-per-day raw-body capture
+                // (only while today's slot is unclaimed; cold path).
+                if raw_body_capture_due(
+                    RAW_BODY_CAPTURE_DAY_KEY.load(std::sync::atomic::Ordering::Relaxed),
+                    capture_day_key,
+                ) {
+                    empty_body_sample = Some((
+                        tickvault_common::sanitize::capture_rest_raw_body_sample(&body_text),
+                        fetched.content_type,
+                        body_text.len(),
+                    ));
+                }
+                // The seal may not have landed yet; the next ladder rung
+                // re-polls UNLESS the watermark provably did not move
+                // between two polls
                 // (stale-watermark cutoff, 2026-07-14 — re-polling cannot
                 // outrun a serving delay; the saved rungs were today's
                 // wasted-429 fuel).
@@ -1533,12 +1590,34 @@ async fn fetch_minute_with_ladder(
             reason,
             backfill_candle: backfill_found,
         },
-        None => SidFetchOutcome::Empty {
-            class: classify_empty_body(freshest_body, target_minute_ist_nanos),
-            backfill_candle: backfill_found,
-        },
-    };
-    (outcome, forensics)
+        None => {
+            let class = classify_empty_body(freshest_body, target_minute_ist_nanos);
+            // 2026-07-14 once-per-day raw-body capture: the FIRST
+            // empty_no_rows/empty_stale classification of the IST day logs
+            // ONE bounded structured line — the account-condition vs
+            // envelope-drift discriminator (Dhan-support evidence). CAS
+            // claim: the concurrent per-SID ladders can never double-log.
+            if let Some((sample, content_type, body_bytes)) = empty_body_sample
+                && try_claim_raw_body_capture(capture_day_key)
+            {
+                error!(
+                    code = ErrorCode::Spot1m01FetchDegraded.code_str(),
+                    stage = "raw_body_sample",
+                    class = ?class,
+                    body_bytes,
+                    content_type = %content_type,
+                    body_sample = %sample,
+                    "spot_1m_rest: FIRST empty classification of the day — bounded \
+                     600-char secret-redacted sample of the 2xx charts body (the \
+                     account-condition vs envelope-drift discriminator; once per day)"
+                );
+            }
+            SidFetchOutcome::Empty {
+                class,
+                backfill_candle: backfill_found,
+            }
+        }
+    }
 }
 
 /// The ladder wrapped in the HARD per-SID wall-clock budget
@@ -2614,7 +2693,7 @@ async fn sweep_sids_above_watermark(
         stats.missing_before = stats.missing_before.saturating_add(missing.len() as u64);
         let body = spot_1m_day_request_body(&security_id.to_string(), trading_date);
         let candles = match spot_1m_fetch_once(client, url, jwt.expose_secret(), &body).await {
-            Ok(body_text) => parse_intraday_1m_candles(&body_text),
+            Ok(fetched) => parse_intraday_1m_candles(&fetched.text),
             Err(failure) => {
                 if failure.rate_limited {
                     metrics::counter!("tv_spot1m_rate_limited_total").increment(1);
@@ -4341,6 +4420,46 @@ mod tests {
 
     /// The per-fire aggregate folds both classes: counts, max rows, max
     /// lag, and the NEWEST candle across stale SIDs.
+    #[test]
+    fn test_raw_body_capture_day_key_is_stable_within_a_day() {
+        // Two minutes of the same IST day share the key; the next day's
+        // first minute gets a NEW key (the once-per-day boundary).
+        let t0 = 1_783_934_100_000_000_000_i64; // some session minute
+        let t1 = t0 + 5 * NANOS_PER_MINUTE;
+        let next_day = t0 + NANOS_PER_DAY_I64;
+        assert_eq!(raw_body_capture_day_key(t0), raw_body_capture_day_key(t1));
+        assert_ne!(
+            raw_body_capture_day_key(t0),
+            raw_body_capture_day_key(next_day)
+        );
+    }
+
+    #[test]
+    fn test_raw_body_capture_due_pure_semantics() {
+        // Unlatched (0) → due; same day latched → not due; a NEW day is
+        // due again even after yesterday's capture.
+        assert!(raw_body_capture_due(0, 20_650));
+        assert!(!raw_body_capture_due(20_650, 20_650));
+        assert!(raw_body_capture_due(20_650, 20_651));
+    }
+
+    #[test]
+    fn test_try_claim_raw_body_capture_fires_exactly_once_per_day_key() {
+        // Distinct key space (negative — no real IST nanos map here) so the
+        // process-global latch never races the other tests / day keys.
+        let key = -777_001_i64;
+        assert!(try_claim_raw_body_capture(key), "first claim must win");
+        assert!(
+            !try_claim_raw_body_capture(key),
+            "second claim same day must be latched out"
+        );
+        let next_day = key + 1;
+        assert!(
+            try_claim_raw_body_capture(next_day),
+            "a new day key re-arms the capture"
+        );
+    }
+
     #[test]
     fn test_empty_diagnostics_aggregate_folds_max() {
         let target = 1_783_934_100_000_000_000;

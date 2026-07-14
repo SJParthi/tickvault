@@ -1495,6 +1495,18 @@ pub const DHAN_KILL_SWITCH_PATH: &str = "/killswitch";
 pub const DHAN_PNL_EXIT_PATH: &str = "/pnlExit";
 
 // ---------------------------------------------------------------------------
+// Conditional & Multi Order — REST API Endpoint Paths
+// ---------------------------------------------------------------------------
+
+/// Path for Place Multi Order (appended to rest_api_base_url).
+/// Endpoint: POST <https://api.dhan.co/v2/alerts/multi/orders> — Place Multi
+/// Order (Conditional & Multi Order family; max 15 sequence-keyed orders).
+/// PORTAL-only page; response schema is OpenAPI-yaml-only — UNVERIFIED-LIVE.
+/// Equities-only fail-closed policy enforced in
+/// `tickvault_trading::oms::conditional`.
+pub const DHAN_ALERTS_MULTI_ORDERS_PATH: &str = "/alerts/multi/orders";
+
+// ---------------------------------------------------------------------------
 // Full Market Depth — WebSocket Base URLs
 // ---------------------------------------------------------------------------
 
@@ -4289,6 +4301,7 @@ mod tests {
             DHAN_MARGIN_CALCULATOR_PATH,
             DHAN_MARGIN_CALCULATOR_MULTI_PATH,
             DHAN_FUND_LIMIT_PATH,
+            DHAN_ALERTS_MULTI_ORDERS_PATH,
         ];
         for path in paths {
             assert!(

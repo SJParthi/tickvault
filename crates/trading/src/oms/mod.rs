@@ -30,6 +30,7 @@
 
 pub mod api_client;
 pub mod circuit_breaker;
+pub mod conditional;
 pub mod dh904_backoff;
 pub mod engine;
 pub mod idempotency;

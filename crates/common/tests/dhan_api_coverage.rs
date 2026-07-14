@@ -1,6 +1,6 @@
 //! Dhan API endpoint coverage tests.
 //!
-//! Verifies that all 54 Dhan API endpoints have URL constants or are
+//! Verifies that all 55 Dhan API endpoints have URL constants or are
 //! documented as intentionally skipped. Prevents endpoint drift where
 //! new endpoints are added to api_client.rs using inline strings without
 //! corresponding constants in constants.rs.
@@ -8,6 +8,8 @@
 //! Reference: docs/dhan-ref/*.md (21 reference files)
 
 use tickvault_common::constants::{
+    // Conditional & Multi Order (1) — 2026-07-14
+    DHAN_ALERTS_MULTI_ORDERS_PATH,
     // Historical data (2)
     DHAN_CHARTS_HISTORICAL_PATH,
     DHAN_CHARTS_INTRADAY_PATH,
@@ -42,7 +44,7 @@ use tickvault_common::constants::{
 // Test: All Dhan REST endpoint constants are defined and have correct paths
 // ---------------------------------------------------------------------------
 
-/// Verifies that constants exist for all 16 implemented Dhan REST endpoints
+/// Verifies that constants exist for all 17 implemented Dhan REST endpoints
 /// in constants.rs, and that each constant maps to the correct v2 API path.
 ///
 /// Endpoint groups covered:
@@ -53,6 +55,7 @@ use tickvault_common::constants::{
 /// - Portfolio: holdings, positions, positions/convert
 /// - Funds & margin: margincalculator, margincalculator/multi, fundlimit
 /// - Trader's control: killswitch, pnlExit
+/// - Conditional & Multi Order: alerts/multi/orders (2026-07-14)
 #[test]
 fn test_all_dhan_rest_endpoint_constants_defined() {
     // --- Authentication (docs/dhan-ref/02-authentication.md) ---
@@ -130,8 +133,15 @@ fn test_all_dhan_rest_endpoint_constants_defined() {
         "POST/DELETE/GET api.dhan.co/v2/pnlExit"
     );
 
+    // --- Conditional & Multi Order (docs/dhan-ref/07c-conditional-trigger.md) ---
+    assert_eq!(
+        DHAN_ALERTS_MULTI_ORDERS_PATH, "/alerts/multi/orders",
+        "POST api.dhan.co/v2/alerts/multi/orders"
+    );
+
     // --- Count verification ---
-    // 16 REST endpoint path constants in constants.rs
+    // 17 REST endpoint path constants in constants.rs
+    // (2026-07-14: +1 /alerts/multi/orders — Conditional & Multi Order family)
     let rest_paths: &[&str] = &[
         DHAN_GENERATE_TOKEN_PATH,
         DHAN_RENEW_TOKEN_PATH,
@@ -149,11 +159,12 @@ fn test_all_dhan_rest_endpoint_constants_defined() {
         DHAN_FUND_LIMIT_PATH,
         DHAN_KILL_SWITCH_PATH,
         DHAN_PNL_EXIT_PATH,
+        DHAN_ALERTS_MULTI_ORDERS_PATH,
     ];
     assert_eq!(
         rest_paths.len(),
-        16,
-        "Expected 16 REST endpoint path constants in constants.rs"
+        17,
+        "Expected 17 REST endpoint path constants in constants.rs"
     );
 
     // All paths must start with '/'
@@ -313,17 +324,17 @@ fn test_skipped_endpoints_documented() {
 // Test: OMS endpoints that use inline paths in api_client.rs
 // ---------------------------------------------------------------------------
 
-/// Verifies the complete set of 34 OMS endpoint paths used in api_client.rs.
+/// Verifies the complete set of 35 OMS endpoint paths used in api_client.rs.
 ///
 /// These are currently constructed inline (e.g., `format!("{}/orders", base_url)`)
 /// rather than using named constants. This test documents and verifies the
 /// expected inline paths to detect accidental changes or omissions.
 ///
-/// The 34 endpoints break down as:
+/// The 35 endpoints break down as:
 /// - Orders (9): place, modify, cancel, order-book, single-order, by-correlation, trade-book, trades-by-order, slicing
 /// - Super orders (4): place, modify, cancel, list
 /// - Forever orders (4): create, modify, delete, list
-/// - Conditional triggers (5): create, modify, delete, get-one, get-all
+/// - Conditional & Multi Order (6): create, modify, delete, get-one, get-all, place-multi (2026-07-14; place-multi is constants-backed)
 /// - EDIS (3): tpin, form, inquire
 /// - Statements (2): ledger, trade-history
 /// - Option chain: REMOVED 2026-06-28 (option_chain client deleted)
@@ -332,10 +343,10 @@ fn test_skipped_endpoints_documented() {
 /// - Trader's control via constant (2): killswitch, pnl-exit
 /// - Exit-all (DELETE /positions) shares DHAN_POSITIONS_PATH (1, counted above)
 ///
-/// Total unique paths: 16 (constants) + 16 (inline in api_client) = 32 (option_chain's 2 removed 2026-06-28)
-/// Plus 4 WebSocket URLs = 40 endpoint URLs
+/// Total unique paths: 17 (constants) + 16 (inline in api_client) = 33 (option_chain's 2 removed 2026-06-28; +1 constants-backed /alerts/multi/orders 2026-07-14)
+/// Plus 4 WebSocket URLs = 41 endpoint URLs
 /// Plus 14 parameterized variants (e.g., /orders/{id}) that share base paths
-/// Grand total of distinct API operations: 54
+/// Grand total of distinct API operations: 55
 #[test]
 fn test_oms_inline_endpoint_paths_documented() {
     // --- Orders (docs/dhan-ref/07-orders.md) ---
@@ -388,18 +399,25 @@ fn test_oms_inline_endpoint_paths_documented() {
         "Forever orders: 4 endpoint operations"
     );
 
-    // --- Conditional triggers (docs/dhan-ref/07c-conditional-trigger.md) ---
+    // --- Conditional & Multi Order (docs/dhan-ref/07c-conditional-trigger.md) ---
+    // 2026-07-14: /alerts/multi/orders added (constants-backed via
+    // DHAN_ALERTS_MULTI_ORDERS_PATH — the 5 legacy /alerts/orders paths stay
+    // inline in api_client.rs; retrofit is a flagged follow-up).
     let conditional_paths: &[(&str, &str)] = &[
         ("/alerts/orders", "POST — create conditional trigger"),
         ("/alerts/orders/{alertId}", "PUT — modify trigger"),
         ("/alerts/orders/{alertId}", "DELETE — delete trigger"),
         ("/alerts/orders/{alertId}", "GET — get single trigger"),
         ("/alerts/orders", "GET — list all triggers"),
+        (
+            "/alerts/multi/orders",
+            "POST — place multi order (up to 15 sequence-keyed legs)",
+        ),
     ];
     assert_eq!(
         conditional_paths.len(),
-        5,
-        "Conditional triggers: 5 endpoint operations"
+        6,
+        "Conditional & Multi Order: 6 endpoint operations"
     );
 
     // --- EDIS (docs/dhan-ref/07d-edis.md) ---
@@ -439,13 +457,14 @@ fn test_oms_inline_endpoint_paths_documented() {
     );
 
     // --- Grand total (2026-06-28: option_chain client removed, −2) ---
-    // 16 constants-backed REST endpoints
+    // 17 constants-backed REST endpoints
+    // 2026-07-14: +1 /alerts/multi/orders (Conditional & Multi Order family)
     // + 16 inline base paths in api_client.rs (was 18 = the OMS inline set +
     //   the 2 option_chain/client.rs local-constant paths; the option_chain
     //   client was deleted 2026-06-28, so the 2 option-chain paths are gone → 16)
     // + 14 parameterized variants ({order-id}, {correlation-id}, {alertId}, {isin}, {leg}, {dates})
     // + 4 WebSocket endpoints
-    let constants_rest_count: usize = 16;
+    let constants_rest_count: usize = 17;
     let inline_base_paths: usize = 16; // unique base paths in api_client.rs (option_chain removed 2026-06-28)
     let parameterized_variants: usize = 14; // {id} variants
     let websocket_count: usize = 4;
@@ -454,15 +473,15 @@ fn test_oms_inline_endpoint_paths_documented() {
     let total_implemented =
         constants_rest_count + inline_base_paths + parameterized_variants + websocket_count;
     assert_eq!(
-        total_implemented, 50,
-        "50 implemented endpoint operations (option_chain's 2 removed 2026-06-28)"
+        total_implemented, 51,
+        "51 implemented endpoint operations (option_chain's 2 removed 2026-06-28; /alerts/multi/orders added 2026-07-14)"
     );
 
     // Plus the 4 intentionally skipped = total Dhan API endpoints known
     let total_known = total_implemented + skipped_count;
     assert_eq!(
-        total_known, 54,
-        "54 total known Dhan API endpoints (50 implemented + 4 skipped)"
+        total_known, 55,
+        "55 total known Dhan API endpoints (51 implemented + 4 skipped)"
     );
 }
 
@@ -526,6 +545,7 @@ fn test_path_constants_are_paths_not_full_urls() {
         DHAN_FUND_LIMIT_PATH,
         DHAN_KILL_SWITCH_PATH,
         DHAN_PNL_EXIT_PATH,
+        DHAN_ALERTS_MULTI_ORDERS_PATH,
     ];
     for path in paths {
         assert!(

@@ -751,8 +751,14 @@ pub struct DhanConditionalTriggerRequest {
     pub dhan_client_id: String,
     /// Trigger condition.
     pub condition: TriggerCondition,
-    /// Orders to execute when condition fires (can be multiple).
+    /// Orders to execute when condition fires (up to 15 per the 2026-07-14
+    /// live portal callout).
     pub orders: Vec<TriggerOrder>,
+    /// Alert ID echo — documented OPTIONAL body field on Modify only
+    /// (PORTAL modify page, 2026-07-14 crawl). Always `None` on Place;
+    /// `skip_serializing_if` keeps Place bodies byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alert_id: Option<String>,
 }
 
 /// Conditional trigger response.
@@ -766,6 +772,24 @@ pub struct DhanConditionalTriggerResponse {
     /// Alert status: "ACTIVE", "TRIGGERED", "EXPIRED", "CANCELLED".
     #[serde(default)]
     pub alert_status: String,
+    /// Creation time — ISO-8601 **UTC `Z`** format ("2019-08-24T14:15:22Z").
+    /// The ONLY UTC timestamps in the trading-API family (everything else is
+    /// IST strings). Convert; NEVER assume IST. GET responses only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_time: Option<String>,
+    /// Trigger time — ISO-8601 UTC `Z`; `null` until the alert triggers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub triggered_time: Option<String>,
+    /// Last traded price — STRING in the doc example ("245.50"), number in
+    /// the OpenAPI yaml. Tolerant either way via [`DhanNumeric`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_price: Option<DhanNumeric>,
+    /// Condition echo on GET responses (string `comparingValue` safe).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub condition: Option<TriggerConditionDetail>,
+    /// Order-leg echo on GET responses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orders: Option<Vec<TriggerOrder>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1393,6 +1417,12 @@ pub enum OmsError {
     /// Maximum modifications per order exceeded.
     #[error("max modifications ({max}) exceeded for order {order_id}")]
     MaxModificationsExceeded { order_id: String, max: u32 },
+
+    /// The /alerts/* client surface is DISARMED (hardcoded default). No HTTP was
+    /// attempted. Arming is #[cfg(test)]-only until a dated operator-quote
+    /// activation PR exists.
+    #[error("alerts surface disarmed: /alerts request '{operation}' refused (dormant surface)")]
+    AlertsSurfaceDisarmed { operation: &'static str },
 }
 
 // ---------------------------------------------------------------------------
@@ -1420,6 +1450,155 @@ pub struct ReconciliationReport {
 
 /// Exchange segment for NSE F&O (the only segment this system trades).
 pub const EXCHANGE_SEGMENT_NSE_FNO: &str = "NSE_FNO";
+
+// ---------------------------------------------------------------------------
+// Multi Order + Conditional Detail Types — 2026-07-14 (07c §multi + portal/yaml)
+// ---------------------------------------------------------------------------
+
+/// Tolerant Dhan numeric: bare number OR quoted decimal string on the wire
+/// (comparingValue is number-in-request / string-in-response; lastPrice is
+/// string-in-example / number-in-yaml). Round-trips verbatim; never panics.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(untagged)]
+pub enum DhanNumeric {
+    /// Bare JSON number (e.g. `245.5`).
+    Num(f64),
+    /// Quoted decimal string (e.g. `"245.50"`), preserved verbatim.
+    Text(String),
+}
+
+impl DhanNumeric {
+    /// Best-effort f64 view; `None` for unparsable text.
+    pub fn as_f64(&self) -> Option<f64> {
+        match self {
+            Self::Num(value) => Some(*value),
+            Self::Text(text) => text.trim().parse().ok(),
+        }
+    }
+}
+
+/// Response-only mirror of [`TriggerCondition`] — every field defaulted /
+/// optional, `comparing_value` tolerant (the GET response carries
+/// `"comparingValue": "250.00"` as a STRING; parsing it into the request
+/// struct's `Option<f64>` would fail).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TriggerConditionDetail {
+    /// Comparison type echo.
+    #[serde(default)]
+    pub comparison_type: String,
+    /// Exchange segment echo.
+    #[serde(default)]
+    pub exchange_segment: String,
+    /// Security ID echo.
+    #[serde(default)]
+    pub security_id: String,
+    /// Indicator name echo (TECHNICAL_WITH_* only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub indicator_name: Option<String>,
+    /// Timeframe echo (TECHNICAL_WITH_* only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time_frame: Option<String>,
+    /// Operator echo.
+    #[serde(default)]
+    pub operator: String,
+    /// Comparing value — number in the request, STRING in the GET response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comparing_value: Option<DhanNumeric>,
+    /// Second indicator echo (TECHNICAL_WITH_INDICATOR only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comparing_indicator_name: Option<String>,
+    /// Expiry date echo (YYYY-MM-DD).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exp_date: Option<String>,
+    /// Frequency: "ONCE" | yaml-only "ALWAYS" | anything — String tolerates all.
+    #[serde(default)]
+    pub frequency: String,
+    /// User note echo.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_note: Option<String>,
+}
+
+/// Multi-order WIRE leg — DISTINCT schema from [`TriggerOrder`] (07c §9.1
+/// traps): `disclosedQuantity` INT (vs `discQuantity` STRING), `price` /
+/// `triggerPrice` FLOAT (vs STRING), plus `sequence` / `correlationId` /
+/// `afterMarketOrder` / `amoTime`. NEVER merge the two structs.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MultiOrderLeg {
+    /// Sequence number "1".."15" — constructor-assigned (STRING on the wire).
+    pub sequence: String,
+    /// User-generated tracking ID (<= 30 chars, `[a-zA-Z0-9 _-]`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub correlation_id: Option<String>,
+    /// "BUY" or "SELL".
+    pub transaction_type: String,
+    /// Exchange segment — constructor-locked to "NSE_EQ"/"BSE_EQ".
+    pub exchange_segment: String,
+    /// Product type.
+    pub product_type: String,
+    /// Order type.
+    pub order_type: String,
+    /// Validity: "DAY" or "IOC".
+    pub validity: String,
+    /// Dhan security ID (STRING).
+    pub security_id: String,
+    /// Quantity.
+    pub quantity: i64,
+    /// After-market-order flag — coupled with `amo_time` by the builder.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_market_order: Option<bool>,
+    /// AMO timing (`AmoTime::as_str()`); coupled with the flag by the builder.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub amo_time: Option<String>,
+    /// Price — FLOAT here, vs STRING on conditional legs.
+    pub price: f64,
+    /// Trigger price — FLOAT here, vs STRING on conditional legs.
+    pub trigger_price: f64,
+    /// Disclosed quantity — INT `disclosedQuantity`, vs STRING `discQuantity`.
+    pub disclosed_quantity: i64,
+}
+// NOTE: yaml marks only sequence/transactionType/exchangeSegment required; our
+// builder always emits full legs, so the remaining fields are concrete (not
+// Option). Documented divergence, request-side only.
+
+/// Place Multi Order request. Endpoint: `POST /v2/alerts/multi/orders`
+/// (PORTAL-only page). Order legs: Equities ONLY, fail-closed (see
+/// `oms::conditional`).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DhanMultiOrderRequest {
+    /// Dhan client ID.
+    pub dhan_client_id: String,
+    /// Order legs (1..=15, builder-enforced).
+    pub orders: Vec<MultiOrderLeg>,
+}
+
+/// Multi-order response — YAML-ONLY schema, UNVERIFIED-LIVE. Parse tolerantly.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DhanMultiOrderResponse {
+    /// Per-leg order results.
+    #[serde(default)]
+    pub orders: Vec<MultiOrderLegResult>,
+}
+
+/// One per-leg result in the multi-order response.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MultiOrderLegResult {
+    /// Dhan order ID for this leg.
+    #[serde(default)]
+    pub order_id: String,
+    /// Sequence number echo.
+    #[serde(default)]
+    pub sequence: String,
+    /// 10-value yaml enum (TRANSIT PENDING REJECTED CANCELLED PART_TRADED
+    /// TRADED EXPIRED MODIFIED TRIGGERED INACTIVE) — UNVERIFIED-LIVE; kept a
+    /// plain String so unknown values NEVER panic (annexure rule 15).
+    #[serde(default)]
+    pub order_status: String,
+}
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -2674,11 +2853,66 @@ mod tests {
                 disc_quantity: "0".to_string(),
                 trigger_price: "0".to_string(),
             }],
+            alert_id: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("SMA_5"));
         assert!(json.contains("CROSSING_UP"));
         assert!(json.contains("ONCE"));
+        // Place semantics: the optional Modify-only alertId echo must be
+        // ABSENT — Place bodies stay byte-identical to the pre-2026-07-14 shape.
+        assert!(!json.contains("alertId"));
+    }
+
+    #[test]
+    fn test_modify_request_alert_id_absent_when_none() {
+        let req = DhanConditionalTriggerRequest {
+            dhan_client_id: "1".to_string(),
+            condition: TriggerCondition {
+                comparison_type: "PRICE_WITH_VALUE".to_string(),
+                exchange_segment: "NSE_EQ".to_string(),
+                security_id: "1333".to_string(),
+                indicator_name: None,
+                time_frame: None,
+                operator: "GREATER_THAN".to_string(),
+                comparing_value: Some(250.0),
+                comparing_indicator_name: None,
+                exp_date: None,
+                frequency: "ONCE".to_string(),
+                user_note: None,
+            },
+            orders: vec![],
+            alert_id: None,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(
+            !json.contains("alertId"),
+            "None alert_id must serialize away"
+        );
+    }
+
+    #[test]
+    fn test_modify_request_alert_id_present_when_set() {
+        let req = DhanConditionalTriggerRequest {
+            dhan_client_id: "1".to_string(),
+            condition: TriggerCondition {
+                comparison_type: "PRICE_WITH_VALUE".to_string(),
+                exchange_segment: "NSE_EQ".to_string(),
+                security_id: "1333".to_string(),
+                indicator_name: None,
+                time_frame: None,
+                operator: "GREATER_THAN".to_string(),
+                comparing_value: Some(250.0),
+                comparing_indicator_name: None,
+                exp_date: None,
+                frequency: "ONCE".to_string(),
+                user_note: None,
+            },
+            orders: vec![],
+            alert_id: Some("12345".to_string()),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("\"alertId\":\"12345\""));
     }
 
     // -----------------------------------------------------------------------
@@ -2755,5 +2989,169 @@ mod tests {
         let resp: DhanCancelOrderResponse = serde_json::from_str(json).unwrap();
         assert_eq!(resp.order_id, "ORD-123");
         assert_eq!(resp.order_status, "CANCELLED");
+    }
+
+    // -----------------------------------------------------------------------
+    // Multi Order + Conditional Detail Types Tests (2026-07-14)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_multi_order_request_serializes_camel_case_exact() {
+        let req = DhanMultiOrderRequest {
+            dhan_client_id: "100".to_string(),
+            orders: vec![MultiOrderLeg {
+                sequence: "1".to_string(),
+                correlation_id: Some("corr-1".to_string()),
+                transaction_type: "BUY".to_string(),
+                exchange_segment: "NSE_EQ".to_string(),
+                product_type: "CNC".to_string(),
+                order_type: "LIMIT".to_string(),
+                validity: "DAY".to_string(),
+                security_id: "1333".to_string(),
+                quantity: 10,
+                after_market_order: Some(true),
+                amo_time: Some("OPEN".to_string()),
+                price: 250.0,
+                trigger_price: 0.0,
+                disclosed_quantity: 0,
+            }],
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("\"dhanClientId\":\"100\""));
+        assert!(json.contains("\"sequence\":\"1\""));
+        assert!(json.contains("\"correlationId\":\"corr-1\""));
+        assert!(json.contains("\"afterMarketOrder\":true"));
+        assert!(json.contains("\"amoTime\":\"OPEN\""));
+        // disclosedQuantity is an INT here (multi wire), never the conditional
+        // leg's STRING `discQuantity` — the §9.1 trap pinned both ways.
+        assert!(json.contains("\"disclosedQuantity\":0"));
+        assert!(!json.contains("discQuantity"));
+        assert!(!json.contains("disc_quantity"));
+        // Prices are bare FLOATS on the multi wire.
+        assert!(json.contains("\"price\":250.0"));
+        assert!(json.contains("\"triggerPrice\":0.0"));
+    }
+
+    #[test]
+    fn test_conditional_vs_multi_price_type_split() {
+        // Same leg data: TriggerOrder emits a STRING price, MultiOrderLeg a number.
+        let conditional_leg = TriggerOrder {
+            transaction_type: "BUY".to_string(),
+            exchange_segment: "NSE_EQ".to_string(),
+            product_type: "CNC".to_string(),
+            order_type: "LIMIT".to_string(),
+            security_id: "1333".to_string(),
+            quantity: 10,
+            validity: "DAY".to_string(),
+            price: "250.00".to_string(),
+            disc_quantity: "0".to_string(),
+            trigger_price: "0".to_string(),
+        };
+        let multi_leg = MultiOrderLeg {
+            sequence: "1".to_string(),
+            correlation_id: None,
+            transaction_type: "BUY".to_string(),
+            exchange_segment: "NSE_EQ".to_string(),
+            product_type: "CNC".to_string(),
+            order_type: "LIMIT".to_string(),
+            validity: "DAY".to_string(),
+            security_id: "1333".to_string(),
+            quantity: 10,
+            after_market_order: None,
+            amo_time: None,
+            price: 250.0,
+            trigger_price: 0.0,
+            disclosed_quantity: 0,
+        };
+        let conditional_json = serde_json::to_string(&conditional_leg).unwrap();
+        let multi_json = serde_json::to_string(&multi_leg).unwrap();
+        assert!(conditional_json.contains("\"price\":\"250.00\"")); // STRING
+        assert!(multi_json.contains("\"price\":250.0")); // FLOAT
+        // AMO fields absent when None (never fabricated).
+        assert!(!multi_json.contains("afterMarketOrder"));
+        assert!(!multi_json.contains("amoTime"));
+    }
+
+    #[test]
+    fn test_multi_order_response_parses_unknown_order_status_modified_inactive_no_panic() {
+        // yaml sample statuses beyond the repo's 9-variant OrderStatus, plus
+        // a fabricated garbage value — all must parse (annexure rule 15).
+        let json = r#"{"orders":[
+            {"orderId":"O1","sequence":"1","orderStatus":"MODIFIED"},
+            {"orderId":"O2","sequence":"2","orderStatus":"INACTIVE"},
+            {"orderId":"O3","sequence":"3","orderStatus":"FROZEN"}
+        ]}"#;
+        let resp: DhanMultiOrderResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.orders.len(), 3);
+        assert_eq!(resp.orders[0].order_status, "MODIFIED");
+        assert_eq!(resp.orders[1].order_status, "INACTIVE");
+        assert_eq!(resp.orders[2].order_status, "FROZEN");
+    }
+
+    #[test]
+    fn test_multi_order_response_empty_body_defaults() {
+        let resp: DhanMultiOrderResponse = serde_json::from_str("{}").unwrap();
+        assert!(resp.orders.is_empty());
+    }
+
+    #[test]
+    fn test_trigger_response_detail_fields_roundtrip() {
+        // Full GET-by-ID doc example verbatim (PORTAL export 2026-06-30):
+        // createdTime UTC-Z, triggeredTime null, lastPrice STRING,
+        // condition with STRING comparingValue, orders echo.
+        let json = r#"{
+            "alertId": "12345",
+            "alertStatus": "ACTIVE",
+            "createdTime": "2019-08-24T14:15:22Z",
+            "triggeredTime": null,
+            "lastPrice": "245.50",
+            "condition": { "comparisonType": "TECHNICAL_WITH_VALUE", "exchangeSegment": "NSE_EQ", "securityId": "12345", "indicatorName": "SMA_5", "timeFrame": "DAY", "operator": "CROSSING_UP", "comparingValue": "250.00", "expDate": "2019-08-24", "frequency": "ONCE", "userNote": "Price crossing SMA" },
+            "orders": [ { "transactionType": "BUY", "exchangeSegment": "NSE_EQ", "productType": "CNC", "orderType": "LIMIT", "securityId": "12345", "quantity": 10, "validity": "DAY", "price": "250.00", "discQuantity": "0", "triggerPrice": "0" } ]
+        }"#;
+        let resp: DhanConditionalTriggerResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.alert_id, "12345");
+        assert_eq!(
+            resp.created_time.as_deref(),
+            Some("2019-08-24T14:15:22Z") // UTC-Z — the ONLY UTC in the family
+        );
+        assert!(resp.triggered_time.is_none()); // null until triggered
+        let last_price = resp.last_price.expect("lastPrice present");
+        assert_eq!(last_price, DhanNumeric::Text("245.50".to_string()));
+        let condition = resp.condition.expect("condition echo present");
+        assert_eq!(
+            condition.comparing_value,
+            Some(DhanNumeric::Text("250.00".to_string())) // STRING in response
+        );
+        let orders = resp.orders.expect("orders echo present");
+        assert_eq!(orders.len(), 1);
+        assert_eq!(orders[0].price, "250.00");
+
+        // Place/Modify 2-field responses stay byte-identical: the five
+        // additive detail fields serialize away when None (golden check).
+        let place: DhanConditionalTriggerResponse =
+            serde_json::from_str(r#"{"alertId":"12345","alertStatus":"ACTIVE"}"#).unwrap();
+        let place_json = serde_json::to_string(&place).unwrap();
+        assert_eq!(place_json, r#"{"alertId":"12345","alertStatus":"ACTIVE"}"#);
+        assert!(!place_json.contains("createdTime"));
+    }
+
+    #[test]
+    fn test_dhan_numeric_accepts_number_and_string() {
+        let num: DhanNumeric = serde_json::from_str("245.5").unwrap();
+        assert_eq!(num, DhanNumeric::Num(245.5));
+        assert_eq!(num.as_f64(), Some(245.5));
+        let text: DhanNumeric = serde_json::from_str("\"245.50\"").unwrap();
+        assert_eq!(text, DhanNumeric::Text("245.50".to_string()));
+        assert_eq!(text.as_f64(), Some(245.5));
+        // Round-trips verbatim (string stays a string).
+        assert_eq!(serde_json::to_string(&text).unwrap(), "\"245.50\"");
+    }
+
+    #[test]
+    fn test_dhan_numeric_as_f64_unparsable_is_none() {
+        let garbage = DhanNumeric::Text("not-a-number".to_string());
+        assert_eq!(garbage.as_f64(), None);
+        let padded = DhanNumeric::Text("  250.00  ".to_string());
+        assert_eq!(padded.as_f64(), Some(250.0));
     }
 }
