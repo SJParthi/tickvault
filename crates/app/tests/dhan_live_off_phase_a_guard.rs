@@ -202,8 +202,9 @@ fn test_rest_stack_module_is_not_a_stub() {
         // Renewal + mid-session watchdog.
         "spawn_renewal_task()",
         "spawn_mid_session_profile_watchdog(",
-        // The three retained REST subsystems.
-        "run_rest_canary(",
+        // The retained REST subsystems (the REST canary was deleted
+        // 2026-07-14 per the operator Dhan noise lock — the legs
+        // self-detect REST death via their own escalation edges).
         "spawn_supervised_spot_1m_rest(",
         "spawn_supervised_option_chain_1m(",
         "run_option_chain_1m_probe(",

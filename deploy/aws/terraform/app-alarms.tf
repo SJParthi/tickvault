@@ -1,7 +1,8 @@
 # App-level CloudWatch alarms — Z+ L2 VERIFY layer.
 #
 # The 5 alarms in alarms.tf cover infrastructure (EC2 status, CPU, EBS,
-# network). The 21 alarms in THIS file cover application signals: WebSocket
+# network). The 20 alarms in THIS file (21 until the 2026-07-14 Dhan noise
+# lock retired order_update_ws_inactive) cover application signals: WebSocket
 # health, QuestDB connectivity, token lifecycle, tick freshness, order
 # rejection, aggregator liveness, backpressure, clock drift, composite SLO
 # score. 4 more silent-feed alarms live in silent-feed-alarms.tf
@@ -39,7 +40,8 @@
 #   - Post-PR (historical): 18 alarms, 12 custom metrics.
 #     Overage then: 8 alarms × $0.10 = $0.80/mo + 2 custom metrics × $0.30
 #     = $0.60/mo ≈ ₹120/mo extra.
-#   - Current (2026-07-11, scoreboard PR-C groww lag gauge): 21 app alarms
+#   - Current (2026-07-14, Dhan noise lock: order_update_ws_inactive
+#     retired, ~-$0.10/mo): 20 app alarms
 #     in THIS file + 4 in silent-feed-alarms.tf; 29 selected custom-metric
 #     series (27 main EMF names + the 2 [host,feed] boundary-catchup
 #     declarations). Overage now: alarms ≈ $1.90/mo + metrics (29 − 10
@@ -68,27 +70,13 @@ locals {
 # the Groww lag gauge in Phase A).
 # ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
-# 3. Order-update WebSocket down — orders fly blind
-# treat_missing_data = notBreaching (was "breaching", 2026-06-02): same
-# stale-FIRING fix as ws_pool_all_dead — the metric is missing whenever the box
-# is intentionally stopped (16:30 IST / weekends) or during a deploy gap, and
-# "breaching" held this alarm stuck FIRING across that gap.
+# 3. Order-update WebSocket down — RETIRED 2026-07-14 (operator Dhan noise
+# lock, dhan-rest-only-noise-lock-2026-07-14.md): the order-update WS spawn
+# itself is retired (no process opens the socket until live trading), and
+# the alarm was already blind on dhan-off boots — tv_order_update_ws_active
+# was written ONLY by the dead lane spawn sites (missing-data-silent both
+# ways). Deleted together with order-update-reconnect-storm-alarm.tf.
 # ---------------------------------------------------------------------------
-resource "aws_cloudwatch_metric_alarm" "order_update_ws_inactive" {
-  alarm_name          = "tv-${var.environment}-order-update-ws-inactive"
-  alarm_description   = "Order-update WebSocket is inactive. New orders will not receive fill confirmations via WS (postback fallback only)."
-  comparison_operator = "LessThanThreshold"
-  evaluation_periods  = 2
-  metric_name         = "tv_order_update_ws_active"
-  namespace           = local.app_namespace
-  period              = 60
-  statistic           = "Minimum"
-  threshold           = 1
-  treat_missing_data  = "notBreaching"
-  dimensions          = local.app_dimensions
-  alarm_actions       = local.app_alarm_actions
-  ok_actions          = local.app_alarm_ok
-}
 
 # ---------------------------------------------------------------------------
 # 3b. Groww feed inactive (operator 2026-07-06 — Groww feed-down alerting).
@@ -563,11 +551,10 @@ resource "aws_cloudwatch_metric_alarm" "mem_used_high" {
 # ---------------------------------------------------------------------------
 
 output "app_cloudwatch_alarms" {
-  description = "16 application-level alarms in THIS file (14 Prometheus-via-CW-agent + 1 disk-used + 1 mem-used Metrics-Insights; PR-C2 2026-07-13 retired 5 Dhan-lane alarms — ws-pool-all-dead, ws-failed-connections, realtime-guarantee-critical, ws-frame-dropped-no-wal, ws-reconnect-gap-high — their emitters died with the Dhan live-WS lane); 3 more silent-feed alarms live in silent-feed-alarms.tf (realtime-guarantee-degraded also retired PR-C2). tick-gap-instruments-silent was RETUNED 2026-07-06 (threshold 100 -> 40 PROVISIONAL, 10-of-12 min, market-hours-gated). Cost note: the PR-C2 retirement REMOVES 6 alarms + 5 selected custom-metric series from the pre-C2 bill (was ~$7.60/mo overage) — still well inside the $55 budget cap."
+  description = "15 application-level alarms in THIS file (13 Prometheus-via-CW-agent + 1 disk-used + 1 mem-used Metrics-Insights; PR-C2 2026-07-13 retired 5 Dhan-lane alarms — ws-pool-all-dead, ws-failed-connections, realtime-guarantee-critical, ws-frame-dropped-no-wal, ws-reconnect-gap-high — their emitters died with the Dhan live-WS lane; order-update-ws-inactive RETIRED 2026-07-14 per dhan-rest-only-noise-lock-2026-07-14.md, reconciled through the PR-C2 merge); 3 more silent-feed alarms live in silent-feed-alarms.tf (realtime-guarantee-degraded also retired PR-C2). tick-gap-instruments-silent was RETUNED 2026-07-06 (threshold 100 -> 40 PROVISIONAL, 10-of-12 min, market-hours-gated). Cost note: the PR-C2 retirement REMOVES 6 alarms + 5 selected custom-metric series and the 2026-07-14 noise lock a further alarm + the order-update gauge series from the pre-C2 bill (was ~$7.60/mo overage) — still well inside the $55 budget cap."
   value = [
     aws_cloudwatch_metric_alarm.disk_used_high.alarm_name,
     aws_cloudwatch_metric_alarm.mem_used_high.alarm_name,
-    aws_cloudwatch_metric_alarm.order_update_ws_inactive.alarm_name,
     aws_cloudwatch_metric_alarm.groww_ws_inactive.alarm_name,
     aws_cloudwatch_metric_alarm.groww_stall_restart_storm.alarm_name,
     aws_cloudwatch_metric_alarm.questdb_disconnected.alarm_name,

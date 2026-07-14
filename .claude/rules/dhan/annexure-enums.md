@@ -20,10 +20,26 @@
      no subscription path uses currency, and keeping them honors the no-panic-on-unknown
      contract. Do NOT delete the variants; do NOT add currency subscriptions. See
      `docs/dhan-ref/08-annexure-enums.md` "2026-07-03 Upstream Update" §(a).
+   - **2026-07-14 correction (runner-crawled, Verified-live):** the 2026-07-03 note above read
+     the NEW-PORTAL export, not "the live annexure". Dhan runs TWO official doc surfaces that
+     DISAGREE: the classic `dhanhq.co/docs/v2/annexure/` RETAINS `NSE_CURRENCY=3` +
+     `BSE_CURRENCY=7` (verbatim-stable 2026-06-02 → 2026-07-14); the portal export
+     (`docs.dhanhq.co/markdown/api/v2/guides/annexure.md`) omits them (stable since
+     2026-06-30). Cross-SURFACE divergence, not cross-time drift. Posture UNCHANGED: keep the
+     defensive 3/7 decode arms, never add currency subscriptions. See
+     `docs/dhan-ref/08-annexure-enums.md` "2026-07-14 Upstream Update".
 
 3. **FeedRequestCode — exact numeric codes.**
    - `11`=Connect, `12`=Disconnect, `15`=SubscribeTicker, `16`=UnsubscribeTicker, `17`=SubscribeQuote, `18`=UnsubscribeQuote, `21`=SubscribeFull, `22`=UnsubscribeFull, `23`=SubscribeFullDepth, `25`=UnsubscribeFullDepth
    - **UnsubscribeFullDepth is 25, NOT 24.**
+   - **2026-07-14 note (cross-surface split — UNVERIFIED-LIVE both ways):** the "25, NOT 24"
+     line above is no longer assertable as doc fact. The classic annexure says **24**
+     (verbatim-stable 2026-06-02 → 2026-07-14); the portal export says **25** (stable since
+     2026-06-30); SDK evidence is contested (generic `subscribe_code+1` ⇒ 24 vs the
+     `constants.rs:395` comment citing `fulldepth.py` ⇒ 25 — the latter needs re-verification,
+     code-comment follow-up in a separate PR). Zero runtime impact — depth is FORBIDDEN
+     FOREVER; any future (re-authorized) depth work MUST live-probe both codes first. See
+     `docs/dhan-ref/08-annexure-enums.md` "2026-07-14 Upstream Update" §(b).
 
 4. **FeedResponseCode — exact numeric codes.**
    - `1`=Index, `2`=Ticker, `3`=MarketDepth (v1 legacy, deprecated in v2 — replaced by Full code 8; Python SDK still handles for backward compat), `4`=Quote, `5`=OI, `6`=PrevClose, `7`=MarketStatus (8 bytes, header only), `8`=Full, `50`=Disconnect
@@ -45,6 +61,10 @@
      dropped with the currency-segment removal. Our enum variants are KEPT (CSV back-compat;
      in crates they appear only in exclusion filters + `types.rs`). See
      `docs/dhan-ref/08-annexure-enums.md` "2026-07-03 Upstream Update" §(c).
+   - **2026-07-14 correction (runner-crawled, Verified-live):** the "8 types" reading is the
+     PORTAL export's; the classic annexure still lists all 10 incl. FUTCUR/OPTCUR
+     (verbatim-stable 2026-06-02 → 2026-07-14). Cross-surface divergence, not time drift.
+     Variants stay KEPT — posture unchanged.
 
 8. **ExpiryCode — exactly 3 values.**
    - `0`=Current/Near, `1`=Next, `2`=Far
@@ -55,6 +75,13 @@
      FUTURE consumer MUST live-probe `/v2/charts/historical` with BOTH conventions before
      trusting either numbering. See `docs/dhan-ref/08-annexure-enums.md` "2026-07-03
      Upstream Update" §(b).
+   - **2026-07-14 correction (runner-crawled, Verified-live for the DOCS):** only the PORTAL
+     annexure says 1/2/3 (stable since 2026-06-30); the classic annexure still says 0/1/2
+     (verbatim-stable 2026-06-02 → 2026-07-14) — an intra-Dhan cross-surface contradiction,
+     not a renumber-in-time. Endpoint samples split the same way: the classic
+     `/charts/historical` sample sends `"expiryCode": 0`; the expired-options page
+     (`/charts/rollingoption`, a DIFFERENT API) samples `1` — do not conflate. The
+     live-probe-BOTH-conventions mandate STANDS unchanged.
 
 9. **AfterMarketOrder — exactly 4 values.**
    - `PRE_OPEN`, `OPEN`, `OPEN_30`, `OPEN_60`

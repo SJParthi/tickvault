@@ -100,6 +100,11 @@ pub mod http_client;
 // Groww — both DELETED in SP5). Both feeds write here. See live-feed-purity.md
 // rule 11 + docs/design/sp5-unified-parity-audit-design.md. The two old physical
 // QuestDB tables are RETAINED on disk (SEBI 5y) but no longer written.
+/// BruteX↔TickVault daily cross-verification (operator 2026-07-11): the two
+/// forensic tables — one row per divergent CELL + one per-day summary row
+/// with a keep-better outcome guard — written via ILP-over-HTTP (per-flush
+/// server ACK). See `.claude/rules/project/brutex-crossverify-error-codes.md`.
+pub mod brutex_crossverify_persistence;
 /// Dual-feed scoreboard (operator 2026-07-10): one classified row per feed
 /// EPISODE (disconnect / stall / process death) with the blame verdict
 /// persisted — the month-end "who caused it" system-of-record.
@@ -184,6 +189,12 @@ pub mod lifecycle_reconciler;
 // `movers_*` matviews + `movers_1s` base table are no longer recreated
 // either (the old `drop_bug3_retired_views` lived in this module).
 pub mod partition_manager;
+// 2026-07-13 disk-pressure remediation: partition archive→verify→drop —
+// the S3-archival leg partition_manager's honest boundary documented as
+// missing. Fail-closed: a partition is dropped ONLY after its S3 copy is
+// row-count- and size-verified; gated on [partition_retention]
+// archive_enabled (serde default false).
+pub mod partition_archive;
 pub mod prev_day_ohlcv_persistence;
 pub mod questdb_health;
 pub mod seal_absorption;
@@ -206,6 +217,11 @@ pub mod spot_1m_rest_persistence;
 // the OPTION-CHAIN half; CHAIN-03): the `option_chain_1m` table DDL +
 // ILP-over-HTTP writer.
 pub mod option_chain_1m_persistence;
+// Per-contract 1m candle leg of the Groww per-minute REST pipeline
+// (operator grant 2026-07-13, PR-4 — the fill-model leg): the
+// `option_contract_1m_rest` table DDL + ILP-over-HTTP writer (feed in the
+// DEDUP key; retention registered in partition_manager.rs).
+pub mod option_contract_1m_rest_persistence;
 // Per-fetch forensics for the per-minute REST legs (operator scope addition
 // 2026-07-13, Groww REST plan PR-2): the `rest_fetch_audit` table DDL +
 // ILP-over-HTTP writer — one row per (target minute, symbol, feed, leg).

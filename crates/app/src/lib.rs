@@ -26,13 +26,20 @@ pub mod calendar_staleness;
 // Operator directive 2026-06-02: post-market (15:31 IST) 1-minute
 // cross-verification of live candles_1m vs Dhan intraday — CSV + audit + count.
 pub mod cross_verify_1m_boot;
+// BruteX↔TickVault daily cross-verify (BRUTEX-XVERIFY, 2026-07-12): PURE
+// comparison core — CSV parse, symbol mapping, day compare. No I/O; the
+// boot/runner shell lives in brutex_crossverify_boot (Unit 5).
+pub mod brutex_crossverify_compare;
+// BruteX↔TickVault daily cross-verify (BRUTEX-XVERIFY, 2026-07-12): the
+// 15:50 IST I/O shell — S3 CSV fetch, QuestDB reads, compare orchestration,
+// persistence, Telegram summary + supervised spawn (Unit 7).
+pub mod brutex_crossverify_boot;
 // Phase 0 Item 20 (wired 2026-06-13): supervised 15:25 IST orphan-position
 // watchdog — daily open-position safety gate (alert-only in sandbox/dry-run).
 pub mod orphan_position_watchdog_boot;
 // Operator task DHAN-REST-400 (2026-06-10): scheduled REST-health canary —
 // GET /v2/profile at 09:05 / 12:00 / 15:25 IST, pages HIGH with the captured
 // (bounded, secret-redacted) body + final URL on any non-2xx.
-pub mod rest_canary_boot;
 // Per-minute spot 1m REST pipeline (operator grant 2026-07-12, PR-2 — the
 // SPOT half): fetch each just-closed session minute's official 1m OHLCV
 // for the 3 IDX_I spot indices via POST /v2/charts/intraday and persist to
@@ -55,6 +62,13 @@ pub mod groww_spot_1m_boot;
 // underlyings, sequenced after the Groww spot leg → `option_chain_1m`
 // feed='groww' + `rest_fetch_audit` leg='chain_1m' forensics rows.
 pub mod groww_option_chain_1m_boot;
+// Groww per-minute PER-CONTRACT 1m candle REST leg (operator grant
+// 2026-07-13 — PR-4 of the Groww per-minute REST plan, the fill-model
+// leg): the just-closed minute's 1m candle for a bounded ATM-window
+// contract selection, sequenced after the Groww chain leg →
+// `option_contract_1m_rest` feed='groww' + `rest_fetch_audit`
+// leg='contract_1m' forensics rows.
+pub mod groww_contract_1m_boot;
 // Dual-feed scoreboard PR-A (operator 2026-07-10): boot-time process-death
 // reconciler + the 15:45 IST daily Dhan-vs-Groww aggregation + the Telegram
 // scorecard summary (SCOREBOARD-01 family).
@@ -76,6 +90,15 @@ pub mod boot_helpers;
 /// Dhan runtime activation watcher (PR-2) — dormant supervisor that keeps the
 /// Dhan lane's running flag honest across runtime toggles and enforces the
 /// Dhan-disable safety gate at the supervisor layer (operator 2026-06-21/24).
+/// Shared self-tuning Dhan Data-API rate limiter (operator pacing
+/// directive 2026-07-14): ONE process-wide token-bucket gate every
+/// per-minute Dhan Data-API REST fire passes through — spot-1m fires +
+/// ladder re-polls + the 15:33:30 sweep + the #1524 diagnostic probes +
+/// the option-chain fires — 3 rps default, self-tuning down to the 2 rps
+/// floor on observed 429 bursts. Dhan-ONLY; Groww untouched.
+/// (`dhan_activation` — the lane cold-start watcher that preceded this
+/// decl — was deleted in PR-C2 with the Dhan live-WS lane.)
+pub mod dhan_data_api_limiter;
 /// Shared Dhan `/v2/charts/intraday` 1m request/response primitives —
 /// relocated from `cross_verify_1m_boot.rs` in Phase C1 of the 2026-07-13
 /// Dhan live-WS retirement (the spot-1m legs must outlive the cross-verify

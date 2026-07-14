@@ -132,9 +132,12 @@ resource "aws_cloudwatch_dashboard" "operator" {
           region = local.dash_region
           view   = "timeSeries"
           metrics = [
+            # tv_order_update_ws_active panel row REMOVED 2026-07-14 (Dhan
+            # noise lock fix round M4): the order-update WS spawn is retired,
+            # so the gauge has zero reachable writers — a dead-metric panel
+            # would render as missing data and mislead triage.
             [local.dash_namespace, "tv_websocket_pool_all_dead", { label = "pool all dead (1=bad)" }],
-            [local.dash_namespace, "tv_websocket_failed_connections_count", { label = "failed conns" }],
-            [local.dash_namespace, "tv_order_update_ws_active", { label = "order-update WS active (1=good)" }]
+            [local.dash_namespace, "tv_websocket_failed_connections_count", { label = "failed conns" }]
           ]
           period = 60
           stat   = "Maximum"

@@ -4,7 +4,7 @@
 //! Pins (house pattern: `spot_1m_rest_wiring_guard.rs`):
 //! 1. main.rs carries exactly ONE `spawn_supervised_option_chain_1m(` call
 //!    site + exactly ONE `run_option_chain_1m_probe(` spawn, BOTH inside
-//!    `spawn_post_market_tasks` (the rest_canary seam — invoked from BOTH
+//!    `spawn_post_market_tasks` (the shared post-market seam; the rest_canary itself was retired 2026-07-14 — invoked from BOTH
 //!    boot paths, once-guarded), gated on `config.option_chain_1m.enabled`
 //!    (pipeline) / `probe_and_report` (probe-only arm) — the DEFAULT-OFF
 //!    entitlement contract: the pipeline NEVER auto-runs while disabled.

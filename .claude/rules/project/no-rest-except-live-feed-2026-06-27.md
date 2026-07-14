@@ -165,6 +165,8 @@ Per that relayed directive (rooted in the operator's standing 2026-07-12 §8.0 g
 
 **Same-day spot-window hotfix (recorded for §8.2 accuracy):** the spot half's FIRST live session (2026-07-13) failed every minute (`SPOT1M-01`, `ok=0/errors=0/empty=3` from 09:16 IST — Dhan answered `2xx` without the target candle) because the fetcher used a same-date `[minute open, open+60s]` request window, a shape never live-proven. The fix (same PR) switches each per-minute fire to the ONLY live-proven window shape — day-granular `fromDate = D 00:00:00, toDate = D+1 00:00:00` (the exact body the 15:31 cross-verify + prev-day fetchers use) — with client-side filtering to the exact minute, plus a previous-minute backfill on every fire AND one bounded post-session sweep (~15:33:30 IST since the same-day 429-coordination follow-up — it clears the 15:31–15:33 cross-verify 429 burst window) that repairs any session minute still missing above the per-SID persisted watermark (DEDUP-idempotent re-appends; the sweep is what gives the final 15:29 candle a repair path). Cadence, SIDs, table, and budget are UNCHANGED (still 3 requests per minute close; a full-day body is ~20 KB, far inside the 2 MiB cap and the Data-API budget) — this is a request-SHAPE correction inside the existing §8 grant, not a scope change.
 
+**2026-07-14 pacing pointer:** the §8 legs (spot-1m + option-chain, incl. ladder/sweep/probes) now pass through the shared self-tuning Dhan Data-API rate limiter (3 rps cap, 2 rps floor — operator pacing directive 2026-07-14; design + honesty envelope in `rest-1m-pipeline-error-codes.md` §2f); the §8 grant's scope, cadence, tables and budgets are UNCHANGED.
+
 ---
 
 # §9. Groww per-minute REST pipeline — scheduled-pull KEEP class (operator authorization 2026-07-13)
@@ -239,6 +241,17 @@ patterns (the Dhan PR #1499 pattern, pending merge).
 - Cold-path only; zero hot-path involvement; zero new WebSocket; token READ-ONLY from SSM
   (never minted — `groww-shared-token-minter-2026-07-02.md`); §28 indicators/strategies
   boundary untouched.
+- **Decision-freshness gate (2026-07-13, recorded with PR-4 — the operator's verbatim
+  intent: "we cannot rely on backfill — within the particular second or few seconds it
+  should definitely be pulled for TRADING DECISIONS; we need precise filling"):**
+  backfill/sweep-repaired rows in `spot_1m_rest` / `option_chain_1m` /
+  `option_contract_1m_rest` are RECORD-COMPLETENESS data (backtest parity, cross-verify,
+  audit) — NEVER trading-decision inputs. Any future strategy consumer MUST fail closed on
+  staleness (a row older than a configured freshness threshold ⇒ no trade that minute);
+  stale rows are mechanically distinguishable today (`close_to_data_ms ≥ 60000` on
+  backfilled rows vs ~1-2 s own-fire; the `rest_fetch_audit` outcome names the recovery
+  path). No strategy code without its own dated operator scope (§28 boundary). Full rule:
+  `groww-second-feed-scope-2026-06-19.md` §38.8.
 
 ## §9.4 What a PR that violates this grant looks like (REJECT)
 

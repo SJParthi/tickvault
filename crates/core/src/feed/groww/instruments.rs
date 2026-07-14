@@ -693,6 +693,45 @@ pub fn select_current_option_expiry(
         .min()
 }
 
+/// Selects the OPTION CONTRACT rows (`CE`/`PE`, `segment == "FNO"`) of one
+/// index underlying at ONE expiry from the daily Groww instruments master
+/// — the per-contract 1m leg's contract-book source (operator grant
+/// 2026-07-13, Groww per-minute REST plan PR-4: the master carries every
+/// contract's `groww_symbol` + `exchange_token` + `expiry_date`, so the
+/// fill-model leg needs NO extra endpoint).
+///
+/// Uses the SAME canonical-underlying matcher as
+/// [`select_current_option_expiry`] (alias drift resolves identically on
+/// both selectors — one matcher, never a parallel one). Rows whose
+/// `expiry_date` does not parse to exactly `expiry` are excluded;
+/// malformed dates skip silently here (the expiry selector already
+/// counted/decided the day's expiry — this is the row extraction for it).
+/// Pure.
+///
+/// UNGATED by design: `test_futidx_selector_is_not_feature_gated` pins this
+/// whole file to ZERO feature gates (daily-universe 2026-07-13 banner §(d));
+/// every dependency here (`canonicalize_index_symbol`, the row struct) is
+/// itself unconditional.
+#[must_use]
+pub fn select_option_contract_rows<'a>(
+    rows: &'a [GrowwInstrumentRow],
+    exchange: &str,
+    canonical_underlying: &str,
+    expiry: chrono::NaiveDate,
+) -> Vec<&'a GrowwInstrumentRow> {
+    use crate::instrument::index_extractor::canonicalize_index_symbol;
+    rows.iter()
+        .filter(|r| {
+            r.segment == "FNO"
+                && (r.instrument_type == "CE" || r.instrument_type == "PE")
+                && r.exchange == exchange
+                && canonicalize_index_symbol(&r.underlying_symbol) == canonical_underlying
+                && chrono::NaiveDate::parse_from_str(r.expiry_date.trim(), "%Y-%m-%d").ok()
+                    == Some(expiry)
+        })
+        .collect()
+}
+
 /// Download + parse the Groww master instrument CSV into rows — the SAME
 /// hardened fetch (redirects refused, body-capped, content-type
 /// allowlisted) + header-name parser the daily watch build uses. Cold
@@ -2360,6 +2399,35 @@ mod tests {
             select_current_option_expiry(&[], "NSE", "NIFTY", d("2026-07-13")),
             None
         );
+    }
+
+    /// The contract leg's row extraction (PR-4): CE/PE FNO rows of one
+    /// (exchange, canonical underlying) at EXACTLY the given expiry — FUT
+    /// rows, other expiries, other exchanges and malformed dates never
+    /// leak in; the canonical matcher is shared with the expiry selector.
+    #[test]
+    fn test_select_option_contract_rows_exact_expiry_ce_pe_only() {
+        let expiry = chrono::NaiveDate::from_ymd_opt(2026, 7, 16).expect("date");
+        let rows = vec![
+            option_row("NSE", "NIFTY", "CE", "2026-07-16"),
+            option_row("NSE", "NIFTY", "PE", "2026-07-16"),
+            option_row("NSE", "NIFTY", "CE", "2026-07-23"), // next expiry — excluded
+            option_row("NSE", "BANKNIFTY", "CE", "2026-07-16"), // other underlying
+            option_row("BSE", "NIFTY", "CE", "2026-07-16"), // other exchange
+            option_row("NSE", "NIFTY", "FUT", "2026-07-16"), // futures never leak
+            option_row("NSE", "NIFTY", "CE", "not-a-date"), // malformed — skipped
+        ];
+        let selected = select_option_contract_rows(&rows, "NSE", "NIFTY", expiry);
+        assert_eq!(selected.len(), 2, "exactly the CE+PE at the expiry");
+        assert!(
+            selected
+                .iter()
+                .all(|r| r.expiry_date == "2026-07-16" && r.exchange == "NSE")
+        );
+        assert!(selected.iter().any(|r| r.instrument_type == "CE"));
+        assert!(selected.iter().any(|r| r.instrument_type == "PE"));
+        // Empty master → empty selection, never a panic.
+        assert!(select_option_contract_rows(&[], "NSE", "NIFTY", expiry).is_empty());
     }
 
     #[test]

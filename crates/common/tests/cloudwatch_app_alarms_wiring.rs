@@ -357,14 +357,21 @@ fn test_emf_metric_selectors_name_count_is_pinned() {
     // banner), tv_ws_frame_dropped_no_wal_total and
     // tv_ws_reconnect_gap_seconds_total. Cost: -5 selected series
     // (~-$1.50/mo) vs the pre-C2 bill.
+    // 21 (was 22 on this branch / 26 on main) since 2026-07-14 (Dhan noise
+    // lock fix round, M4, reconciled through the PR-C2 merge): REMOVED
+    // `tv_order_update_ws_active` — the order-update WS spawn is retired
+    // (scope-lock §A.1), so the gauge has zero reachable writers; shipping
+    // a dead name in the EMF list would publish nothing while implying
+    // coverage. Cost: -1 custom metric (~-$0.30/mo).
     let user_data = read("deploy/aws/terraform/user-data.sh.tftpl");
     let names = emf_declared_names(&user_data, "metric_selectors");
     assert_eq!(
         names.len(),
-        22,
-        "Z+ L2 VERIFY ratchet: expected exactly 22 names in the MAIN EMF \
+        21,
+        "Z+ L2 VERIFY ratchet: expected exactly 21 names in the MAIN EMF \
          metric_selectors list (27 pre-PR-C2 minus the 5 Dhan-lane names \
-         retired 2026-07-13); found {}: {names:?}",
+         retired 2026-07-13 minus the order-update gauge removed 2026-07-14 \
+         M4); found {}: {names:?}",
         names.len()
     );
     for required in [
@@ -1090,7 +1097,7 @@ fn test_boundary_catchup_alarm_uses_per_feed_dimensions() {
 }
 
 #[test]
-fn test_app_alarms_count_is_twenty_three() {
+fn test_app_alarms_count_is_twenty_two() {
     // Pin the count so future PRs that delete an alarm without updating
     // the rule files / PR body fail this guard. Cost note (aws-budget.md)
     // depends on this number — keeping the budget honest means keeping
@@ -1147,10 +1154,17 @@ fn test_app_alarms_count_is_twenty_three() {
     // tv_ws_reconnect_gap_seconds_total. Cost: -6 alarms / -5 selected
     // series vs the pre-C2 bill (dated notes in app-alarms.tf +
     // silent-feed-alarms.tf).
+    // 16 (was 17 on this branch / 22 on main) since 2026-07-14 (operator
+    // Dhan noise lock, dhan-rest-only-noise-lock-2026-07-14.md, reconciled
+    // through the PR-C2 merge): REMOVED `tv_order_update_ws_active` (alarm
+    // tv-<env>-order-update-ws-inactive — deleted with the order-update WS
+    // spawn; the alarm was missing-data-blind on dhan-off boots). Cost:
+    // -1 alarm (~-$0.10/mo) — dated note in app-alarms.tf output
+    // description.
     let count = alarm_metric_names().len();
     assert_eq!(
-        count, 17,
-        "Z+ L2 VERIFY ratchet: expected exactly 17 app-level CloudWatch alarm \
+        count, 16,
+        "Z+ L2 VERIFY ratchet: expected exactly 16 app-level CloudWatch alarm \
          metric_name entries across app-alarms.tf + silent-feed-alarms.tf \
          (one per critical app signal). Found {count}. If you intentionally \
          added or removed one, update aws-budget.md custom-metric cost line \

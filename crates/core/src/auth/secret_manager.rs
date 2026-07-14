@@ -1345,6 +1345,63 @@ mod tests {
         );
     }
 
+    /// BRUTEX-XVERIFY (2026-07-12): `main.rs` MUST spawn the BruteX↔TickVault
+    /// daily cross-verify runner
+    /// (`brutex_crossverify_boot::spawn_brutex_crossverify_task`) from the
+    /// process-global boot prefix. PR-C2 (2026-07-13, merged 2026-07-14): the
+    /// FAST crash-recovery arm — this guard's original SECOND spawn path —
+    /// was DELETED with the Dhan live-WS lane, so main.rs has a SINGLE boot
+    /// path and the guard pins EXACTLY 1 call site (the scoreboard-guard
+    /// precedent): a mid-market crash-restart now boots through the same
+    /// prefix, so the day's 15:50 IST cross-verify still fires. The spawn is
+    /// config-gated (`[brutex_crossverify] enabled`, default OFF).
+    /// The boot module must also keep its Telegram emit sites
+    /// (`BrutexCrossverifySummary` on success, `BrutexCrossverifyAborted` on
+    /// the Err/panic arms) — the daily signal must never be silently dropped
+    /// (audit Rule 11).
+    #[test]
+    fn test_brutex_crossverify_is_wired_into_main() {
+        let main_rs = std::fs::read_to_string("../app/src/main.rs")
+            .or_else(|_| std::fs::read_to_string("crates/app/src/main.rs"))
+            .expect("main.rs must be readable");
+        assert!(
+            main_rs.contains("brutex_crossverify_boot"),
+            "main.rs MUST reference the brutex_crossverify_boot module — \
+             without it the BruteX cross-verify runner is dead code."
+        );
+        // Call sites (call head only), excluding any fn definition.
+        let spawn_sites: Vec<usize> = main_rs
+            .match_indices("spawn_brutex_crossverify_task(")
+            .map(|(i, _)| i)
+            .filter(|&i| !main_rs[..i].ends_with("fn "))
+            .collect();
+        assert_eq!(
+            spawn_sites.len(),
+            1,
+            "main.rs must call spawn_brutex_crossverify_task( at EXACTLY 1 \
+             site (the process-global boot prefix — single boot path since \
+             PR-C2); found {} call site(s). Without it the runner is dead \
+             code on every boot.",
+            spawn_sites.len()
+        );
+        // The boot module keeps its Telegram emit sites (never a silent day).
+        let boot_rs = std::fs::read_to_string("../app/src/brutex_crossverify_boot.rs")
+            .or_else(|_| std::fs::read_to_string("crates/app/src/brutex_crossverify_boot.rs"))
+            .expect("brutex_crossverify_boot.rs must be readable");
+        assert!(
+            boot_rs.contains("NotificationEvent::BrutexCrossverifySummary {"),
+            "brutex_crossverify_boot.rs MUST emit \
+             `NotificationEvent::BrutexCrossverifySummary` — the daily \
+             operator digest per the 2026-07-12 BRUTEX-XVERIFY directive."
+        );
+        assert!(
+            boot_rs.contains("NotificationEvent::BrutexCrossverifyAborted {"),
+            "brutex_crossverify_boot.rs MUST emit `BrutexCrossverifyAborted` \
+             on the Err/panic arms — the daily signal must never be silently \
+             dropped (audit Rule 11)."
+        );
+    }
+
     /// W2 PR#6 (WAL-SUSPEND-01, 2026-07-10, audit follow-up row 10):
     /// `main.rs` MUST spawn the supervised per-table QuestDB WAL-suspension
     /// probe from the process-global monitor block. Without this wire, a
@@ -1696,33 +1753,76 @@ mod tests {
         );
     }
 
-    /// AUTH-GAP-05 (2026-07-06): the live token-health gauge poller MUST be
-    /// spawned — without it `tv_token_remaining_seconds` regresses to the
-    /// frozen mint-time snapshot and the honest AND-composed `tv_token_valid`
-    /// gauge never exists (audit Rule 11).
+    /// AUTH-GAP-05 (2026-07-06) / GAP-06 re-home (2026-07-14, Dhan noise
+    /// lock): the live token-health gauge poller keeps
+    /// `tv_token_remaining_seconds` LIVE and publishes the AND-composed
+    /// `tv_token_valid` — without it both regress to the frozen mint-time
+    /// snapshots (false-OK, audit Rule 11) and the family-(4)
+    /// `tv-<env>-token-remaining-low` alarm goes blind.
     ///
-    /// RE-POINTED (PR-C2, 2026-07-13): the spawn moved from the deleted
-    /// `start_dhan_lane` / FAST-arm dual wiring (main.rs) into
-    /// `dhan_rest_stack.rs` — the SINGLE surviving Dhan boot path (the lane
-    /// + fast arm were deleted with the live-WS retirement, so the old
-    /// two-site / lane-ownership assertions retired with them; the stack owns
-    /// its handles directly for the process lifetime). The mid-session
-    /// profile watchdog (AUTH-GAP-05's self-heal driver) must ride along.
+    /// GAP-06 (2026-07-14): the poller's HOME is `dhan_rest_stack.rs`
+    /// Phase 3 — the one Dhan bring-up path (sharing the stack watchdog's
+    /// profile-truth flag). PR-C2 (2026-07-13, merged 2026-07-14): the lane
+    /// + fast arm — the poller's original two main.rs spawn sites — are
+    /// DELETED, so the old lane-handle registration assertions retired with
+    /// them. Surviving pins: (a) the stack spawn EXISTS exactly once in the
+    /// production region, (b) main.rs's production region has ZERO
+    /// gauge-poller spawn sites (a re-added spawn would interleave with the
+    /// stack's poller — gauge flapping every ≤15s), (c) the mid-session
+    /// profile watchdog (AUTH-GAP-05's self-heal driver) rides along in the
+    /// stack.
     #[test]
     fn test_token_health_gauge_poller_wired_into_main() {
+        let main_rs = std::fs::read_to_string("../app/src/main.rs")
+            .or_else(|_| std::fs::read_to_string("crates/app/src/main.rs"))
+            .expect("main.rs must be readable");
+        let production = tickvault_common::source_scan::production_region(&main_rs).expect(
+            "main.rs must contain a #[cfg(test)]-gated top-level `mod tests` \
+             module — without it this production-region split would scan the \
+             whole file (vacuous)",
+        );
+        let spawn_count = production
+            .matches("spawn_token_health_gauge_poller(")
+            .count();
+        assert_eq!(
+            spawn_count, 0,
+            "main.rs (production region) must have ZERO token-health \
+             gauge-poller spawn sites — GAP-06 (2026-07-14) homes the \
+             poller in dhan_rest_stack.rs Phase 3; a re-added main.rs \
+             spawn would interleave with the stack's poller (gauge \
+             flapping every ≤15s). Found {spawn_count}."
+        );
         let stack_rs = std::fs::read_to_string("../app/src/dhan_rest_stack.rs")
             .or_else(|_| std::fs::read_to_string("crates/app/src/dhan_rest_stack.rs"))
-            .expect("dhan_rest_stack.rs must be readable from the test working dir");
-        assert!(
-            stack_rs.contains("spawn_token_health_gauge_poller("),
-            "dhan_rest_stack.rs MUST spawn the live token-health gauge poller \
-             (AUTH-GAP-05) — without it tv_token_remaining_seconds freezes at \
-             the mint-time snapshot and tv_token_valid never exists."
+            .expect("dhan_rest_stack.rs must be readable");
+        let stack_production = tickvault_common::source_scan::production_region(&stack_rs).expect(
+            "dhan_rest_stack.rs must contain a #[cfg(test)]-gated top-level \
+                 `mod tests` module — without it this production-region split \
+                 would scan the whole file (vacuous)",
+        );
+        assert_eq!(
+            stack_production
+                .matches("spawn_token_health_gauge_poller(")
+                .count(),
+            1,
+            "dhan_rest_stack.rs (production region) MUST spawn the live \
+             token-health gauge poller exactly once (GAP-06 re-home) — \
+             deleting it blinds the tv-<env>-token-remaining-low alarm \
+             (family-(4)) after a renewal-loop circuit-breaker halt."
         );
         assert!(
-            stack_rs.contains("spawn_mid_session_profile_watchdog("),
-            "dhan_rest_stack.rs MUST spawn the mid-session profile watchdog \
-             (AUTH-GAP-05 forced-remint self-heal) alongside the gauge poller."
+            stack_production.contains("spawn_mid_session_profile_watchdog("),
+            "dhan_rest_stack.rs (production region) MUST spawn the \
+             mid-session profile watchdog (AUTH-GAP-05 forced-remint \
+             self-heal) alongside the gauge poller."
+        );
+        // Non-vacuity self-check: the shared helper only returns Some when
+        // it found a #[cfg(test)]-gated `mod tests` block to excise.
+        assert!(
+            !production.contains("\nmod tests {"),
+            "main.rs production region must have its #[cfg(test)] mod tests \
+             block excised (blanked) — the split found no test module \
+             (vacuous whole-file scan)"
         );
     }
 

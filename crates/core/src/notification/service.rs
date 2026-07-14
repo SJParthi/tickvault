@@ -2614,7 +2614,13 @@ mod tests {
     fn test_disabled_service_notify_does_not_panic() {
         let service = NotificationService::disabled();
         // Fire-and-forget on a no-op service must not panic.
-        service.notify(NotificationEvent::StartupComplete { mode: "LIVE" });
+        service.notify(NotificationEvent::StartupComplete {
+            mode: "LIVE",
+            spot_1m_enabled: true,
+            spot_1m_indices: 4,
+            chain_1m_enabled: true,
+            chain_1m_underlyings: 3,
+        });
         service.notify(NotificationEvent::ShutdownComplete);
         service.notify(NotificationEvent::Custom {
             message: "test".to_string(),
@@ -2654,7 +2660,13 @@ mod tests {
     async fn test_active_service_notify_does_not_panic() {
         let service = make_active_service();
 
-        service.notify(NotificationEvent::StartupComplete { mode: "LIVE" });
+        service.notify(NotificationEvent::StartupComplete {
+            mode: "LIVE",
+            spot_1m_enabled: true,
+            spot_1m_indices: 4,
+            chain_1m_enabled: true,
+            chain_1m_underlyings: 3,
+        });
         service.notify(NotificationEvent::ShutdownComplete);
         service.notify(NotificationEvent::AuthenticationSuccess);
         service.notify(NotificationEvent::Custom {
@@ -3109,7 +3121,13 @@ mod tests {
     fn test_severity_low_does_not_trigger_sms_path() {
         // StartupComplete is Low severity — it should NOT trigger the
         // SNS SMS code path. We verify this by checking severity.
-        let event = NotificationEvent::StartupComplete { mode: "PAPER" };
+        let event = NotificationEvent::StartupComplete {
+            mode: "PAPER",
+            spot_1m_enabled: true,
+            spot_1m_indices: 4,
+            chain_1m_enabled: true,
+            chain_1m_underlyings: 3,
+        };
         assert!(
             event.severity() < Severity::High,
             "Low-severity events must not reach SMS path (< High)"
@@ -3320,7 +3338,13 @@ mod tests {
             "AuthenticationFailed must be High+ severity"
         );
 
-        let low_event = NotificationEvent::StartupComplete { mode: "PAPER" };
+        let low_event = NotificationEvent::StartupComplete {
+            mode: "PAPER",
+            spot_1m_enabled: true,
+            spot_1m_indices: 4,
+            chain_1m_enabled: true,
+            chain_1m_underlyings: 3,
+        };
         assert!(
             low_event.severity() < Severity::High,
             "StartupComplete must be below High severity"
@@ -3504,7 +3528,13 @@ mod tests {
     async fn test_active_service_low_severity_events_no_sms() {
         let service = make_active_service();
         // Low-severity events should NOT trigger SNS SMS path
-        service.notify(NotificationEvent::StartupComplete { mode: "PAPER" });
+        service.notify(NotificationEvent::StartupComplete {
+            mode: "PAPER",
+            spot_1m_enabled: true,
+            spot_1m_indices: 4,
+            chain_1m_enabled: true,
+            chain_1m_underlyings: 3,
+        });
         service.notify(NotificationEvent::ShutdownComplete);
         service.notify(NotificationEvent::TokenRenewed);
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -3712,7 +3742,13 @@ mod tests {
         let service = make_active_service_with_sns();
 
         // StartupComplete is Low severity — only Telegram, not SNS
-        service.notify(NotificationEvent::StartupComplete { mode: "PAPER" });
+        service.notify(NotificationEvent::StartupComplete {
+            mode: "PAPER",
+            spot_1m_enabled: true,
+            spot_1m_indices: 4,
+            chain_1m_enabled: true,
+            chain_1m_underlyings: 3,
+        });
 
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
@@ -4494,7 +4530,13 @@ mod tests {
             .dispatch_boot_episode_event(NotificationEvent::AuthenticationSuccess)
             .await;
         Arc::clone(&service)
-            .dispatch_boot_episode_event(NotificationEvent::StartupComplete { mode: "sandbox" })
+            .dispatch_boot_episode_event(NotificationEvent::StartupComplete {
+                mode: "sandbox",
+                spot_1m_enabled: true,
+                spot_1m_indices: 4,
+                chain_1m_enabled: true,
+                chain_1m_underlyings: 3,
+            })
             .await;
         assert_eq!(
             log.lock().unwrap().as_slice(),
