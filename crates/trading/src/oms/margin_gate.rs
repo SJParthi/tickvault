@@ -190,7 +190,7 @@ impl ImplausibleReason {
 }
 
 /// The margin gate's verdict for one order intent.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MarginVerdict {
     /// The intent is an exit — NEVER margin-gated, always allowed.
     ExitAlwaysAllowed,
@@ -474,6 +474,10 @@ impl MarginGate {
     /// fail closed (there is no real account to validate against); the
     /// disabled check still runs first, so a disabled gate reports
     /// `SkippedDisabled` as usual.
+    ///
+    /// Cancel-safety: dropping this future mid-await leaves the reserved
+    /// self-cap permits consumed (fail-safe direction — the budget
+    /// under-counts nothing; no shared state is left inconsistent).
     pub async fn check_entry(&self, request: &MarginCalculatorRequest) -> MarginVerdict {
         // (1) The OFF-switch lattice: config AND the code master lock.
         if !self.is_enabled() {

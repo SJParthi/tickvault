@@ -113,6 +113,9 @@
 - **The REST self-cap is PER-GATE-INSTANCE:** the OMS-wiring PR must construct exactly
   ONE gate per process and pin that with its own ratchet; until then, multi-instance
   construction could exceed the intended process-wide self-cap budget (rule 9).
+- **Metrics delivery boundary:** the `tv_margin_gate_*` counters are metrics-local today —
+  no CloudWatch alarm and no Telegram event consumes them; the operator-facing signal
+  lands with the OMS-wiring PR's typed events.
 
 ## What This Prevents
 
