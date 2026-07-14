@@ -45,8 +45,37 @@
 # ceiling carries no standing charge; Lambda still bills per-invocation
 # exactly as today.
 #
-# Provider support: aws_servicequotas_service_quota has existed since
-# provider v3.x; the workspace pin is hashicorp/aws ~> 5.80 (versions.tf).
+# PROVIDER FACTS (verified 2026-07-14 against hashicorp/aws v5.80.0 docs +
+# source, internal/service/servicequotas/service_quota.go):
+#   - quota_code / service_code / value are the only arguments (all
+#     required) — schema matches the workspace pin ~> 5.80 (versions.tf).
+#   - While the increase request is Pending/CaseOpened, the provider READS
+#     the REQUESTED value, so subsequent plans show no diff and no error.
+#   - A Denied/CaseClosed request re-surfaces as drift (value 10 vs 1000)
+#     and the next apply re-submits; if AWS approves a DIFFERENT value,
+#     same drift-and-resubmit behaviour.
+#   - `terraform destroy` is a provider NO-OP (DeleteWithoutTimeout =
+#     schema.NoopContext) — quotas cannot be lowered; the resource just
+#     leaves state.
+#
+# QUOTA FACTS (verified LIVE 2026-07-14, ap-south-1, get-service-quota):
+# L-B99A9384 = "Concurrent executions" (lambda), Adjustable = true,
+# applied value = 10, AWS default = 1000, and NO open increase request
+# exists (a pre-existing open request would make the provider's
+# RequestServiceQuotaIncrease collide with ResourceAlreadyExists; none).
+#
+# CI IAM (verified LIVE 2026-07-14): terraform-apply.yml's ACTIVE
+# principal is the AdministratorAccess bootstrap identity (IAM user
+# dlt-admin, active key last used 2026-07-14; the tv-prod-github-deploy
+# OIDC role shows RoleLastUsed = never and carries only the narrow
+# deploy-aws inline policy), so the servicequotas actions this resource
+# needs — GetServiceQuota, RequestServiceQuotaIncrease,
+# ListRequestedServiceQuotaChangeHistoryByQuota — are covered today. IF
+# the account ever completes the BOOTSTRAP-ONE-TIME.md step-5 migration to
+# the least-privilege OIDC role, that role's policy (oidc.tf) must gain
+# those three actions — alongside the far larger terraform-wide grant that
+# migration already requires (the narrow policy cannot run terraform at
+# all; pre-existing gap, not introduced here).
 
 resource "aws_servicequotas_service_quota" "lambda_concurrent_executions" {
   service_code = "lambda"

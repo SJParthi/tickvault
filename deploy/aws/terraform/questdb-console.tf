@@ -248,16 +248,26 @@ resource "aws_apigatewayv2_stage" "questdb_console" {
   # PUBLIC — auth lives inside the front handler — so an unauthenticated
   # runaway/abusive client can still burn Lambda invocations before the
   # handler rejects it; this bounds that invocation spend at the gateway.
-  # The observed LEGITIMATE console SPA burst was ~11 req/s (2026-07-14
-  # incident traffic), which fits inside burst 20 / rate 10. HONEST
+  # SIZING (token bucket: burst = bucket size, rate = refill/s): the
+  # observed LEGITIMATE console SPA burst was ~11 req/s (2026-07-14
+  # incident traffic), so the sustained rate MUST sit above 11 — at the
+  # originally-proposed rate 10 a sustained legit 11 req/s starts shedding
+  # 429s after ~20s (bucket 20 / net drain 1 req/s), throttling the exact
+  # traffic that motivated this fix. rate 20 / burst 40 keeps ~2x headroom
+  # over observed-legit while still bounding abuse to ~40 in-flight
+  # (x 2 Lambda slots each = 80, trivial against the 1000-slot quota raise
+  # in lambda-concurrency-quota.tf). The terraform-apply.yml console smoke
+  # gate (12 single GETs, 10s apart, ~0.1 req/s) sits far below either
+  # limit. This is an in-place UpdateStage (api_id/name are the only
+  # ForceNew arguments) — no stage replacement, no interruption. HONEST
   # ENVELOPE: at the CURRENT 10-slot account concurrency cap this does NOT
-  # fully protect the shared Lambda pool — 20 in-flight requests × 2 slots
-  # each (front synchronously invokes the VPC back relay) > 10 — so the
-  # account-quota raise in lambda-concurrency-quota.tf is the actual fix;
-  # this block is defense-in-depth hygiene, not the remedy.
+  # protect the shared Lambda pool — 40 in-flight requests x 2 slots each
+  # (front synchronously invokes the VPC back relay) >> 10 — so the
+  # account-quota raise is the actual fix; this block is defense-in-depth
+  # hygiene, not the remedy.
   default_route_settings {
-    throttling_burst_limit = 20
-    throttling_rate_limit  = 10
+    throttling_burst_limit = 40
+    throttling_rate_limit  = 20
   }
 }
 
