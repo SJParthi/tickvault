@@ -298,6 +298,12 @@ impl RiskEngine {
             // Conservative: skip securities without a market price
         }
         metrics::gauge!("tv_unrealized_pnl").set(total);
+        // tv_daily_pnl = the check_order halt comparand (total_realized_pnl
+        // + unrealized) — the CloudWatch daily-pnl-breach backstop alarm
+        // reads this gauge. Emitted HERE only: record_fill:197 holds a live
+        // `&mut` entry borrow, so it cannot call this method (borrow
+        // conflict). Updates on risk checks, not on fills (honest envelope).
+        metrics::gauge!("tv_daily_pnl").set(self.total_realized_pnl + total);
         total
     }
 
@@ -544,6 +550,32 @@ mod tests {
     fn max_daily_loss_amount_correct() {
         let engine = make_engine();
         assert_eq!(engine.max_daily_loss_amount(), 20_000.0); // 2% of 1M
+    }
+
+    #[test]
+    fn test_daily_pnl_gauge_is_realized_plus_unrealized() {
+        // Source-scan pin (2026-07-14, order-side alerting): the tv_daily_pnl
+        // gauge must be set inside total_unrealized_pnl to EXACTLY the
+        // check_order halt comparand — self.total_realized_pnl + total.
+        // The CloudWatch daily-pnl-breach backstop alarm reads this gauge;
+        // any other formula silently drifts it from the halt decision.
+        let src = include_str!("engine.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap_or(src);
+        let compact: String = prod.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            compact.contains("gauge!(\"tv_daily_pnl\").set(self.total_realized_pnl+total)"),
+            "tv_daily_pnl must be set to self.total_realized_pnl + total \
+             inside total_unrealized_pnl (the halt comparand)"
+        );
+        // Smoke exercise: the gauge path must not panic with realized +
+        // unrealized state present.
+        let mut engine = make_engine();
+        engine.record_fill(1001, 100, 100.0, 25);
+        engine.record_fill(1001, -100, 92.0, 25); // realized -20_000
+        engine.record_fill(1002, 10, 100.0, 25);
+        engine.update_market_price(1002, 110.0);
+        let unrealized = engine.total_unrealized_pnl();
+        assert!((unrealized - 100.0).abs() < f64::EPSILON);
     }
 
     #[test]

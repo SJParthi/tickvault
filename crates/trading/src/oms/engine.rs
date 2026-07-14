@@ -238,6 +238,9 @@ impl OrderManagementSystem {
             counter!("tv_orders_placed_total", "mode" => "paper").increment(1);
             metrics::histogram!("tv_order_placement_duration_ns")
                 .record(start.elapsed().as_nanos() as f64);
+            // Last-sample ms gauge for the CloudWatch order-latency alarm
+            // (the ns histogram stays /metrics-only forensic truth).
+            metrics::gauge!("tv_order_placement_last_ms").set(start.elapsed().as_millis() as f64);
 
             info!(
                 order_id = %paper_order_id,
@@ -358,6 +361,9 @@ impl OrderManagementSystem {
         counter!("tv_orders_placed_total", "mode" => "live").increment(1);
         metrics::histogram!("tv_order_placement_duration_ns")
             .record(start.elapsed().as_nanos() as f64);
+        // Last-sample ms gauge for the CloudWatch order-latency alarm
+        // (the ns histogram stays /metrics-only forensic truth).
+        metrics::gauge!("tv_order_placement_last_ms").set(start.elapsed().as_millis() as f64);
 
         info!(
             order_id = %response.order_id,
@@ -3186,6 +3192,27 @@ mod tests {
         // Verify histogram macro compiles and doesn't panic when invoked.
         // O(1) atomic call — safe for cold path (order placement).
         metrics::histogram!("tv_order_placement_duration_ns").record(1000.0_f64);
+    }
+
+    #[test]
+    fn test_order_placement_last_ms_set_on_place() {
+        // Source-scan pin (2026-07-14, order-side alerting): BOTH place_order
+        // paths (paper + live) must set the tv_order_placement_last_ms
+        // last-sample gauge beside their tv_order_placement_duration_ns
+        // histogram record — the CloudWatch order-latency-high alarm reads
+        // the gauge (the ns histogram stays /metrics-only forensic truth).
+        let src = include_str!("engine.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap_or(src);
+        let compact: String = prod.chars().filter(|c| !c.is_whitespace()).collect();
+        let needle = "gauge!(\"tv_order_placement_last_ms\").set(start.elapsed().as_millis()asf64)";
+        assert_eq!(
+            compact.matches(needle).count(),
+            2,
+            "tv_order_placement_last_ms must be set at BOTH place_order \
+             histogram sites (paper + live)"
+        );
+        // Smoke: the gauge macro compiles and doesn't panic when invoked.
+        metrics::gauge!("tv_order_placement_last_ms").set(1.0_f64);
     }
 
     // -----------------------------------------------------------------------
