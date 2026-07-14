@@ -2535,6 +2535,7 @@ fn expired_live_gates(
     if let Ok(cutoff) = chrono::NaiveDate::parse_from_str(&default_sandbox_only_until(), "%Y-%m-%d")
         && cutoff < today_ist
     {
+        // NOTE: this label covers BOTH shapes — default-by-absence AND a CONFIGURED value explicitly equal to the (expired) default (gate 4's `!= default` dedup routes that shape here; pinned by test_expired_live_gates_all_at_2100).
         expired.push("sandbox_only_until_default");
     }
 

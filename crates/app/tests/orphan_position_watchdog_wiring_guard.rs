@@ -163,6 +163,49 @@ fn test_watchdog_boot_module_resolves_global_token_manager_at_fire_time() {
         src.contains("tv_orphan_position_watchdog_fetch_failures_total"),
         "the degraded arms must keep incrementing the fetch-failures counter."
     );
+
+    // Refuter round 1 (2026-07-14, LOW): the wording needles above pin the
+    // pure message fns, NOT the Telegram DELIVERY — deleting the None arm's
+    // `notifier.notify` (or cross-wiring it to degraded_no_token_message())
+    // previously failed no test. Pin the DELIVERY with code-shaped needles
+    // scoped to the None-arm REGION of the run loop: from the resolver
+    // CALL SITE's `None => {` arm up to the non-trading-day else branch —
+    // so neither of the other two degraded arms (the no-token arm inside
+    // run_orphan_check_once, nor the fetch-failure arm) can satisfy it.
+    let call_site = src
+        .find("match resolve_watchdog_session(")
+        .expect("the run loop must resolve the session via match resolve_watchdog_session(...)");
+    let after_call = &src[call_site..];
+    let none_arm_start = after_call
+        .find("None => {")
+        .expect("the resolver match must carry a None (no-session) degraded arm");
+    let none_arm_end = after_call
+        .find("non-trading day")
+        .expect("the non-trading-day else branch must follow the resolver match");
+    assert!(
+        none_arm_start < none_arm_end,
+        "the None arm must come before the non-trading-day else branch"
+    );
+    let none_arm = &after_call[none_arm_start..none_arm_end];
+    assert!(
+        none_arm.contains("notifier.notify(NotificationEvent::Custom {"),
+        "the no-session None arm must DELIVER a Telegram event via \
+         notifier.notify(NotificationEvent::Custom {{ .. }}) — the degraded \
+         page must actually be sent, not just have its wording survive as a \
+         dead pure fn (audit Rule 11)."
+    );
+    assert!(
+        none_arm.contains("message: degraded_no_session_message(),"),
+        "the no-session None arm's notify must pass degraded_no_session_message() \
+         as the event message (code-shaped needle — deleting the notify or \
+         swapping in a different degraded message fails this)."
+    );
+    assert!(
+        !none_arm.contains("degraded_no_token_message"),
+        "the no-session None arm must NOT be cross-wired to \
+         degraded_no_token_message() — that wording tells the operator the \
+         wrong failure class (a token problem instead of a missing session)."
+    );
 }
 
 #[test]
