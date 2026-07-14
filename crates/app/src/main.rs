@@ -3079,6 +3079,17 @@ async fn main() -> Result<()> {
             &notifier,
         );
 
+        // Judge-locked cadence scheduler on the FAST crash-recovery arm too
+        // (2026-07-14; the tf_consistency dual-spawn pattern directly
+        // above): config-gated (`[cadence] enabled`, ships false), dry-run
+        // executors both lanes, once-per-process guarded inside. See
+        // `cadence_boot::spawn_cadence_scheduler`.
+        let _cadence_shutdown = tickvault_app::cadence_boot::spawn_cadence_scheduler(
+            &config,
+            &trading_calendar,
+            &feed_runtime,
+        );
+
         // --- Await shutdown ---
         return run_shutdown_fast(
             ws_handles,
@@ -3316,6 +3327,19 @@ async fn main() -> Result<()> {
         &config,
         &trading_calendar,
         &notifier,
+    );
+
+    // Judge-locked cadence scheduler — PROCESS-GLOBAL like the verifier
+    // above (2026-07-14): per-minute chain + spot fire timing with
+    // structural zero-429 gates, failure ladder, and event-driven dry-run
+    // decisions (CADENCE-01/02/03). Config-gated (`[cadence] enabled`,
+    // ships false); dry-run executors both lanes — NO REST caller in this
+    // PR; the once-per-process AtomicBool inside makes the fast-arm +
+    // prefix dual-spawn safe. See `cadence_boot::spawn_cadence_scheduler`.
+    let _cadence_shutdown = tickvault_app::cadence_boot::spawn_cadence_scheduler(
+        &config,
+        &trading_calendar,
+        &feed_runtime,
     );
 
     // -----------------------------------------------------------------------

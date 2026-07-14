@@ -642,3 +642,40 @@ strikes_each_side = 2
 # ===========================================================================
 [tf_consistency]
 enabled = true
+
+# Judge-locked cadence scheduler (2026-07-14): per-minute chain + spot fire
+# timing with structural zero-429 gates (pure CAS min-spacing, monotonic
+# domain), backward failure ladder, and event-driven per-(lane, minute)
+# moneyness decisions. SHIPS DISABLED: day 1 both lanes run the dry-run
+# logging executor (fires logged, Empty returned, NO REST call — decisions
+# honest-skip). Flipping `enabled = true` needs the real broker executors
+# (a later PR) + the dated rule-file note per
+# `.claude/rules/project/cadence-error-codes.md`.
+[cadence]
+enabled = false
+# Dhan chain fire offsets vs each minute close T, ms (the operator's
+# :55/:58/:02 — exactly 3, one per underlying, pairwise gaps validated
+# >= chain_min_spacing_ms).
+dhan_chain_offsets_ms = [-5000, -2000, 2000]
+# Dhan spot singles start at T+3000 (:03) spaced 400ms (2.5 rps — strictly
+# under the shared limiter's 3 rps so the cadence gate binds; >= 334).
+dhan_spot_start_offset_ms = 3000
+dhan_spot_spacing_ms = 400
+# Ladder rung clamp: spots never fire earlier than T + this (house 300ms).
+spot_min_post_close_ms = 300
+# Failure ladder: chains shift wholesale -1000ms per rung, max 5 rungs.
+dhan_ladder_step_ms = 1000
+dhan_ladder_max_rungs = 5
+# At most one in-cycle retry per failed request (RateLimited never retried).
+in_cycle_retry_max = 1
+recovery_mode = "step_back_one"
+# Lane staleness cutoffs past T: older data is stale for a next-minute fill.
+dhan_lane_cutoff_ms = 15000
+groww_lane_cutoff_ms = 6000
+# Groww burst: all 7 requests at T+0, verdict at T+800, 1500ms per request
+# on the sequential fallback.
+groww_anchor_offset_ms = 0
+groww_burst_timeout_ms = 800
+groww_request_timeout_ms = 1500
+# The structural zero-429 floor: per-underlying AND global chain gates.
+chain_min_spacing_ms = 3000
