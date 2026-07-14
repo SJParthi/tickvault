@@ -44,10 +44,9 @@ pub mod types;
 
 // Re-export key types for ergonomic use.
 pub use api_client::OrderApiClient;
-pub use engine::{OrderManagementSystem, TokenProvider};
-pub use margin_gate::{MarginGate, MarginSnapshot, MarginVerdict};
+pub use engine::{OmsAlert, OmsAlertSink, OrderManagementSystem, TokenProvider};
 pub use rate_limiter::OrderRateLimiter;
 pub use types::{
-    ManagedOrder, ModifyOrderRequest, OmsError, OrderIntent, PlaceOrderRequest,
-    ReconciliationReport,
+    FillEvent, ManagedOrder, ModifyOrderRequest, OmsError, PlaceOrderRequest, ReconciliationReport,
+    SEGMENT_CODE_UNKNOWN, parse_segment_chars,
 };

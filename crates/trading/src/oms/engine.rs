@@ -18,11 +18,8 @@ use metrics::counter;
 use secrecy::{ExposeSecret, SecretString};
 use tracing::{debug, error, info, instrument, warn};
 
-use tickvault_common::constants::{
-    DATA_805_STOP_ALL_COOLDOWN_SECS, DH901_ROTATE_RETRY_DELAY_SECS, DH904_MAX_RETRY_ATTEMPTS,
-};
 use tickvault_common::error_code::ErrorCode;
-use tickvault_common::order_types::{OrderStatus, OrderUpdate};
+use tickvault_common::order_types::{OrderStatus, OrderUpdate, TransactionType};
 
 use super::api_client::OrderApiClient;
 use super::circuit_breaker::OrderCircuitBreaker;
@@ -33,9 +30,9 @@ use super::rate_limiter::OrderRateLimiter;
 use super::reconciliation::reconcile_orders;
 use super::state_machine::{is_valid_transition, parse_order_status};
 use super::types::{
-    DhanModifyOrderRequest, DhanPlaceOrderRequest, EXCHANGE_SEGMENT_NSE_FNO,
+    DhanModifyOrderRequest, DhanPlaceOrderRequest, EXCHANGE_SEGMENT_NSE_FNO, FillEvent,
     MAX_MODIFICATIONS_PER_ORDER, ManagedOrder, ModifyOrderRequest, OmsError, PlaceOrderRequest,
-    ReconciliationReport,
+    ReconciliationReport, SEGMENT_CODE_UNKNOWN, parse_segment_chars,
 };
 
 // ---------------------------------------------------------------------------
@@ -895,8 +892,17 @@ impl OrderManagementSystem {
     /// Invalid transitions are logged at ERROR level (triggers Telegram alert).
     ///
     /// # Returns
-    /// `Ok(())` if the update was processed (even if the order is unknown).
-    pub fn handle_order_update(&mut self, update: &OrderUpdate) -> Result<(), OmsError> {
+    /// `Ok(Some(FillEvent))` when the update carried a POSITIVE executed-
+    /// quantity delta on a tracked order (the OMS → RiskEngine fill bridge,
+    /// order-runtime dry-run PR 2026-07-14 — the delta is computed HERE where
+    /// old and new `traded_qty` are adjacent, so duplicate / same-status
+    /// re-deliveries yield delta 0 → `Ok(None)`, double-count-safe).
+    /// `Ok(None)` when the update was processed without a new fill (unknown
+    /// order, unknown status, zero/negative delta).
+    pub fn handle_order_update(
+        &mut self,
+        update: &OrderUpdate,
+    ) -> Result<Option<FillEvent>, OmsError> {
         self.total_updates = self.total_updates.saturating_add(1);
 
         let order_id = &update.order_no;
@@ -920,7 +926,7 @@ impl OrderManagementSystem {
                     status = %update.status,
                     "order update for unknown order — ignoring"
                 );
-                return Ok(());
+                return Ok(None);
             }
         };
 
@@ -946,24 +952,46 @@ impl OrderManagementSystem {
                     status = %update.status,
                     "unknown order status in WebSocket update"
                 );
-                return Ok(());
+                return Ok(None);
             }
         };
 
         // Get mutable reference to order
         let order = match self.orders.get_mut(&order_id) {
             Some(o) => o,
-            None => return Ok(()),
+            None => return Ok(None),
         };
 
         // Validate transition
         let old_status = order.status;
         if old_status == new_status {
-            // Same status — just update fields (e.g., partial fill qty update)
-            order.traded_qty = update.traded_qty;
-            order.avg_traded_price = update.avg_traded_price;
-            order.updated_at_us = now_epoch_us();
-            return Ok(());
+            // C3 (fix-round 2026-07-14): a TERMINAL order must never re-fill
+            // via the same-status arm — a second TRADED update with a HIGHER
+            // traded_qty would otherwise emit a second FillEvent (the pinned
+            // terminal-never-refills test only covered byte-identical
+            // redeliveries). Terminal state is final: no copy, no fill.
+            if order.is_terminal() {
+                if update.traded_qty > order.traded_qty {
+                    warn!(
+                        code = ErrorCode::OmsGapStateMachine.code_str(),
+                        order_id = %order_id,
+                        status = %old_status.as_str(),
+                        tracked_qty = order.traded_qty,
+                        update_qty = update.traded_qty,
+                        "OMS-GAP-01: same-status update on a TERMINAL order with a \
+                         HIGHER traded_qty — refused (terminal orders never re-fill); \
+                         flagging for reconciliation"
+                    );
+                    order.needs_reconciliation = true;
+                }
+                return Ok(None);
+            }
+            // Same status — just update fields (e.g., partial fill qty update).
+            // Fill delta is computed BEFORE the copy so incremental
+            // PART_TRADED quantity refreshes still produce a FillEvent.
+            let fill = Self::extract_fill_delta(order, update);
+            Self::apply_fill_fields(order, update);
+            return Ok(fill);
         }
 
         if !is_valid_transition(old_status, new_status) {
@@ -981,11 +1009,12 @@ impl OrderManagementSystem {
             });
         }
 
+        // Fill delta BEFORE the copy overwrites the previous traded_qty.
+        let fill = Self::extract_fill_delta(order, update);
+
         // Apply transition
         order.status = new_status;
-        order.traded_qty = update.traded_qty;
-        order.avg_traded_price = update.avg_traded_price;
-        order.updated_at_us = now_epoch_us();
+        Self::apply_fill_fields(order, update);
 
         // Emit metrics for terminal states
         match new_status {
@@ -1006,7 +1035,134 @@ impl OrderManagementSystem {
             "order state transition applied"
         );
 
-        Ok(())
+        Ok(fill)
+    }
+
+    /// Applies the fill-field copy from an update onto the tracked order
+    /// (both fill paths — same-status refresh + valid transition).
+    ///
+    /// C2 (fix-round 2026-07-14): the copy is MONOTONE — a REGRESSING (or
+    /// negative garbage) `traded_qty` is refused with a `warn!` so an
+    /// out-of-order/garbage update can never lower the delta baseline and
+    /// inflate the next fill (the `reconcile()` path stays the only
+    /// sanctioned downward correction). The avg-price copy is guarded the
+    /// same way: a non-finite / non-positive wire `avg_traded_price` (the
+    /// serde-default reality on non-fill updates) never poisons the tracked
+    /// cumulative VWAP the delta-price math depends on.
+    fn apply_fill_fields(order: &mut ManagedOrder, update: &OrderUpdate) {
+        if update.traded_qty >= order.traded_qty {
+            order.traded_qty = update.traded_qty;
+            if update.avg_traded_price.is_finite() && update.avg_traded_price > 0.0 {
+                order.avg_traded_price = update.avg_traded_price;
+            }
+        } else {
+            warn!(
+                code = ErrorCode::OmsGapStateMachine.code_str(),
+                order_id = %order.order_id,
+                tracked_qty = order.traded_qty,
+                update_qty = update.traded_qty,
+                "OMS-GAP-01: REGRESSING traded_qty on a fill path — copy refused \
+                 (out-of-order/garbage update; reconcile() is the only sanctioned \
+                 downward correction)"
+            );
+        }
+        order.updated_at_us = now_epoch_us();
+    }
+
+    /// Computes the executed-quantity DELTA between the tracked order and an
+    /// incoming update, converted to signed lots for `RiskEngine::record_fill`.
+    ///
+    /// - Delta = `update.traded_qty − order.traded_qty` (units). ≤ 0 → `None`
+    ///   (duplicate / regressing update — never a fill; a reconcile-class
+    ///   traded_qty DECREASE is corrected by `reconcile()`, not by a fill
+    ///   event).
+    /// - Lots = `floor(new_cum/lot) − floor(old_cum/lot)` (C4 fix-round
+    ///   2026-07-14: remainder-CARRYING by construction — sequential off-lot
+    ///   partials 30→50→75 @lot 25 credit 1+1+1 lots, never 1+0+1). A
+    ///   cumulative qty that is not a lot multiple is reported loudly
+    ///   (`OMS-GAP-01`) — Dhan fills arrive in lot multiples, so a remainder
+    ///   means a wire/lot-size anomaly.
+    /// - Price = the DELTA slice price, NOT the wire `avg_traded_price` (C1
+    ///   fix-round 2026-07-14: Dhan's `avg_traded_price` is the order-level
+    ///   CUMULATIVE VWAP; stamping it on a delta fill mis-prices every
+    ///   multi-partial slice — 1@100 then 1@110 arrives as cum-avg 105, but
+    ///   the second slice traded at 110). `delta_price = (new_qty·new_avg −
+    ///   old_qty·old_avg) / qty_delta`; a non-finite or non-positive result
+    ///   (garbage wire data) REJECTS the fill event loudly — never a
+    ///   poisoned price into `record_fill` (C5).
+    /// - Sign from the tracked order's `transaction_type` (authoritative —
+    ///   the wire `TxnType` is serde-default and may be empty).
+    fn extract_fill_delta(order: &ManagedOrder, update: &OrderUpdate) -> Option<FillEvent> {
+        let old_qty = order.traded_qty.max(0);
+        let new_qty = update.traded_qty;
+        let qty_delta = new_qty.saturating_sub(old_qty);
+        if qty_delta <= 0 {
+            return None;
+        }
+        let lot_size = order.lot_size.max(1);
+        // C4: remainder-carrying lot delta (floor of cumulatives, not of the
+        // per-update delta) — units are never permanently dropped across
+        // sequential off-lot partial slices.
+        let lots_abs =
+            (new_qty / i64::from(lot_size)).saturating_sub(old_qty / i64::from(lot_size));
+        let remainder = new_qty % i64::from(lot_size);
+        if remainder != 0 {
+            error!(
+                code = ErrorCode::OmsGapStateMachine.code_str(),
+                order_id = %order.order_id,
+                cumulative_qty = new_qty,
+                lot_size,
+                remainder,
+                "OMS-GAP-01: cumulative traded_qty is not a lot multiple — lots \
+                 are floored (the remainder CARRIES to the next slice); \
+                 wire/lot-size anomaly"
+            );
+        }
+        if lots_abs <= 0 {
+            return None;
+        }
+        // C1/C5: delta-slice price from the cumulative VWAPs; reject garbage.
+        let old_avg = if order.avg_traded_price.is_finite() && order.avg_traded_price > 0.0 {
+            order.avg_traded_price
+        } else {
+            0.0
+        };
+        let delta_value = (new_qty as f64) * update.avg_traded_price - (old_qty as f64) * old_avg;
+        let delta_price = delta_value / (qty_delta as f64);
+        if !delta_price.is_finite() || delta_price <= 0.0 {
+            error!(
+                code = ErrorCode::OmsGapStateMachine.code_str(),
+                order_id = %order.order_id,
+                qty_delta,
+                wire_avg_price = update.avg_traded_price,
+                delta_price,
+                "OMS-GAP-01: fill delta price is non-finite or non-positive — \
+                 REJECTING the fill event (never a poisoned price into the risk \
+                 book; the qty copy still advances — reconcile() corrects the \
+                 QTY only, and the NEXT valid slice's delta over-attributes the \
+                 rejected slice's value: pre-live doc note, paper fills are \
+                 always finite>0)"
+            );
+            counter!("tv_oms_fill_price_rejected_total").increment(1);
+            return None;
+        }
+        // i64 → i32 clamp: a real fill can never approach i32::MAX lots;
+        // saturate defensively instead of panicking (annexure rule 15 class).
+        let lots = i32::try_from(lots_abs).unwrap_or(i32::MAX);
+        let fill_lots = match order.transaction_type {
+            TransactionType::Buy => lots,
+            TransactionType::Sell => lots.saturating_neg(),
+        };
+        let segment_code = parse_segment_chars(&update.exchange, &update.segment)
+            .map_or(SEGMENT_CODE_UNKNOWN, |seg| seg.binary_code());
+        Some(FillEvent {
+            security_id: order.security_id,
+            segment_code,
+            fill_lots,
+            avg_price: delta_price,
+            lot_size,
+            order_id: order.order_id.clone(),
+        })
     }
 
     /// Runs reconciliation against the Dhan REST API.
@@ -1031,6 +1187,25 @@ impl OrderManagementSystem {
         // Apply corrections (status + fill data)
         for update in updates {
             if let Some(order) = self.orders.get_mut(&update.order_id) {
+                // C8 (fix-round 2026-07-14, honest envelope): an UPWARD
+                // traded_qty correction here raises the delta baseline
+                // WITHOUT emitting a FillEvent — the missed fill can never
+                // reach `record_fill` afterwards (any later WS redelivery
+                // computes delta 0). Loud until the pre-live follow-up
+                // (reconcile-emitted FillEvents) lands — see
+                // `.claude/rules/project/order-runtime-dryrun.md` §3.
+                if update.traded_qty > order.traded_qty {
+                    error!(
+                        code = ErrorCode::OmsGapReconciliation.code_str(),
+                        order_id = %update.order_id,
+                        local_qty = order.traded_qty,
+                        broker_qty = update.traded_qty,
+                        "OMS-GAP-02: reconcile corrected traded_qty UPWARD — the \
+                         missed fill delta is SWALLOWED (no FillEvent); the risk \
+                         book diverges from the broker until manually corrected \
+                         (pre-live follow-up: reconcile-emitted fills)"
+                    );
+                }
                 order.status = update.status;
                 order.traded_qty = update.traded_qty;
                 order.avg_traded_price = update.avg_traded_price;
@@ -1048,8 +1223,23 @@ impl OrderManagementSystem {
     }
 
     /// Returns all active (non-terminal) orders.
+    ///
+    /// # Performance
+    /// O(N_all_orders) + a `Vec` heap alloc per call (terminal orders
+    /// accumulate until the daily reset) — COLD-PATH ONLY. Per-mark callers
+    /// use the runtime's sid-keyed pending index instead (HP-2).
     pub fn active_orders(&self) -> Vec<&ManagedOrder> {
         self.orders.values().filter(|o| !o.is_terminal()).collect()
+    }
+
+    /// Returns the number of active (non-terminal) orders WITHOUT the
+    /// `Vec` allocation `active_orders()` pays (HP-2 fix-round 2026-07-14
+    /// — the marks-gate republish runs per event arm).
+    ///
+    /// # Performance
+    /// O(N_all_orders) scan, zero allocation.
+    pub fn active_order_count(&self) -> usize {
+        self.orders.values().filter(|o| !o.is_terminal()).count()
     }
 
     /// Returns all orders (active + terminal).
@@ -1511,6 +1701,350 @@ mod tests {
         assert_eq!(order.status, OrderStatus::Traded);
         assert_eq!(order.traded_qty, 50);
         assert!(order.is_terminal());
+    }
+
+    // -----------------------------------------------------------------------
+    // FillEvent bridge (order-runtime dry-run PR, 2026-07-14) — the delta is
+    // computed in-engine, so re-deliveries can never double-count.
+    // -----------------------------------------------------------------------
+
+    /// A full-fill transition returns a FillEvent whose lots = delta/lot_size.
+    #[test]
+    fn handle_order_update_returns_fill_event_on_traded() {
+        let mut oms = make_oms_with_order("1", OrderStatus::Pending);
+        let mut update = make_order_update("1", "TRADED");
+        update.traded_qty = 50; // 50 units / lot_size 25 = 2 lots
+        update.avg_traded_price = 245.50;
+        update.exchange = "NSE".to_owned();
+        update.segment = "D".to_owned();
+
+        let fill = oms
+            .handle_order_update(&update)
+            .ok()
+            .flatten()
+            .expect("TRADED update with positive delta must yield a FillEvent"); // APPROVED: test
+        assert_eq!(fill.security_id, 52432);
+        assert_eq!(fill.fill_lots, 2, "Buy order → positive lots");
+        assert_eq!(fill.lot_size, 25);
+        assert!((fill.avg_price - 245.50).abs() < f64::EPSILON);
+        assert_eq!(
+            fill.segment_code,
+            tickvault_common::types::ExchangeSegment::NseFno.binary_code()
+        );
+        assert_eq!(fill.order_id, "1");
+    }
+
+    /// Same-status refresh (incremental PART_TRADED) yields the DELTA, not
+    /// the cumulative quantity (F2 double-count safety).
+    #[test]
+    fn test_same_status_refresh_applies_delta_not_cumulative() {
+        let mut oms = make_oms_with_order("1", OrderStatus::Pending);
+
+        // First partial: PENDING → PART_TRADED with 25 units filled.
+        let mut update = make_order_update("1", "PART_TRADED");
+        update.traded_qty = 25;
+        update.avg_traded_price = 100.0;
+        let fill = oms.handle_order_update(&update).ok().flatten();
+        assert_eq!(fill.map(|f| f.fill_lots), Some(1), "first 25 units = 1 lot");
+
+        // Same-status refresh: cumulative traded_qty rises 25 → 50.
+        let mut update2 = make_order_update("1", "PART_TRADED");
+        update2.traded_qty = 50;
+        update2.avg_traded_price = 101.0;
+        let fill2 = oms
+            .handle_order_update(&update2)
+            .ok()
+            .flatten()
+            .expect("second slice must fill"); // APPROVED: test
+        assert_eq!(
+            fill2.fill_lots, 1,
+            "delta = 50-25 = 25 units = 1 lot — NOT the cumulative 2 lots"
+        );
+        // C1: the slice PRICE is the delta price, not the cumulative VWAP —
+        // (50·101 − 25·100) / 25 = 102.0.
+        assert!(
+            (fill2.avg_price - 102.0).abs() < f64::EPSILON,
+            "second slice must carry the DELTA price 102.0, got {}",
+            fill2.avg_price
+        );
+    }
+
+    /// C1 (fix-round 2026-07-14): the two-slice canonical case — 1@100 then
+    /// 1@110 arrives on the wire as cumulative avg 105; the second FillEvent
+    /// must carry 110, and the risk-side avg_entry must land at 105.
+    #[test]
+    fn test_two_slice_fill_delta_price_and_risk_avg_entry() {
+        let mut oms = make_oms_with_order("1", OrderStatus::Pending);
+        let mut risk = crate::risk::engine::RiskEngine::new(2.0, 100, 1_000_000.0);
+
+        // Slice 1: 1 lot (25 units) at 100 — cum avg 100.
+        let mut u1 = make_order_update("1", "PART_TRADED");
+        u1.traded_qty = 25;
+        u1.avg_traded_price = 100.0;
+        let f1 = oms
+            .handle_order_update(&u1)
+            .ok()
+            .flatten()
+            .expect("slice 1 fills"); // APPROVED: test
+        assert!((f1.avg_price - 100.0).abs() < f64::EPSILON);
+        risk.record_fill(f1.security_id, f1.fill_lots, f1.avg_price, f1.lot_size);
+
+        // Slice 2: 1 more lot at 110 — the wire reports CUMULATIVE avg 105.
+        let mut u2 = make_order_update("1", "PART_TRADED");
+        u2.traded_qty = 50;
+        u2.avg_traded_price = 105.0;
+        let f2 = oms
+            .handle_order_update(&u2)
+            .ok()
+            .flatten()
+            .expect("slice 2 fills"); // APPROVED: test
+        assert!(
+            (f2.avg_price - 110.0).abs() < f64::EPSILON,
+            "second FillEvent must carry the true slice price 110, not the \
+             cumulative VWAP 105 — got {}",
+            f2.avg_price
+        );
+        risk.record_fill(f2.security_id, f2.fill_lots, f2.avg_price, f2.lot_size);
+
+        let pos = risk.position(f2.security_id).expect("position exists"); // APPROVED: test
+        assert_eq!(pos.net_lots, 2);
+        assert!(
+            (pos.avg_entry_price - 105.0).abs() < f64::EPSILON,
+            "avg_entry must be (100 + 110) / 2 = 105, got {}",
+            pos.avg_entry_price
+        );
+    }
+
+    /// A byte-identical re-delivery (same cumulative traded_qty) yields
+    /// delta 0 → no FillEvent (WAL replay / broadcast duplicate safety).
+    #[test]
+    fn test_duplicate_update_zero_delta_skipped() {
+        let mut oms = make_oms_with_order("1", OrderStatus::Pending);
+        let mut update = make_order_update("1", "PART_TRADED");
+        update.traded_qty = 25;
+        update.avg_traded_price = 100.0;
+        assert!(oms.handle_order_update(&update).ok().flatten().is_some());
+        // Re-deliver the SAME update (same status, same cumulative qty).
+        let dup = oms.handle_order_update(&update).ok().flatten();
+        assert!(dup.is_none(), "duplicate re-delivery must yield NO fill");
+        // And a REGRESSING traded_qty (reconcile-class correction) too.
+        let mut regress = make_order_update("1", "PART_TRADED");
+        regress.traded_qty = 10;
+        let r = oms.handle_order_update(&regress).ok().flatten();
+        assert!(r.is_none(), "regressing traded_qty must never yield a fill");
+    }
+
+    /// A delta that is not a lot multiple is FLOORED (loud OMS-GAP-01 error
+    /// at the emit site); a sub-lot delta floors to zero lots → no event.
+    #[test]
+    fn test_partial_lot_remainder_floors_and_errors() {
+        let mut oms = make_oms_with_order("1", OrderStatus::Pending);
+        // 30 units on a 25-unit lot = 1 lot + remainder 5 → floored to 1.
+        let mut update = make_order_update("1", "PART_TRADED");
+        update.traded_qty = 30;
+        update.avg_traded_price = 100.0;
+        let fill = oms.handle_order_update(&update).ok().flatten();
+        assert_eq!(fill.map(|f| f.fill_lots), Some(1), "30/25 floors to 1 lot");
+
+        // Sub-lot delta: 30 → 40 (floor(40/25) − floor(30/25) = 1−1 = 0) → None.
+        let mut update2 = make_order_update("1", "PART_TRADED");
+        update2.traded_qty = 40;
+        update2.avg_traded_price = 100.0;
+        let fill2 = oms.handle_order_update(&update2).ok().flatten();
+        assert!(fill2.is_none(), "sub-lot delta floors to zero → no event");
+
+        // C4 (fix-round 2026-07-14): the remainder CARRIES — 40 → 75 credits
+        // floor(75/25) − floor(40/25) = 3 − 1 = 2 lots, so the total across
+        // 30→40→75 is 1+0+2 = 3 lots for 75 units (never 2).
+        let mut update3 = make_order_update("1", "PART_TRADED");
+        update3.traded_qty = 75;
+        update3.avg_traded_price = 100.0;
+        let fill3 = oms.handle_order_update(&update3).ok().flatten();
+        assert_eq!(
+            fill3.map(|f| f.fill_lots),
+            Some(2),
+            "remainder units must carry into later slices (floor-of-cumulatives)"
+        );
+    }
+
+    /// C2 (fix-round 2026-07-14): a regressing (or garbage NEGATIVE)
+    /// traded_qty must never lower the delta baseline — the next legit
+    /// cumulative would otherwise inflate the fill.
+    #[test]
+    fn test_regressing_and_negative_traded_qty_never_lower_baseline() {
+        let mut oms = make_oms_with_order("1", OrderStatus::Pending);
+        let mut u1 = make_order_update("1", "PART_TRADED");
+        u1.traded_qty = 50;
+        u1.avg_traded_price = 100.0;
+        assert_eq!(
+            oms.handle_order_update(&u1)
+                .ok()
+                .flatten()
+                .map(|f| f.fill_lots),
+            Some(2)
+        );
+        // Garbage NEGATIVE cumulative (serde-default wire) — no fill, and the
+        // baseline must NOT drop.
+        let mut garbage = make_order_update("1", "PART_TRADED");
+        garbage.traded_qty = -50;
+        garbage.avg_traded_price = 100.0;
+        assert!(oms.handle_order_update(&garbage).ok().flatten().is_none());
+        assert_eq!(
+            oms.order("1").map(|o| o.traded_qty),
+            Some(50),
+            "regressing copy must be refused — baseline preserved"
+        );
+        // Next legit cumulative 75: delta = 25 units = 1 lot (with the old
+        // unconditional copy this computed 75−(−50) = 125 units = 5 lots).
+        let mut u2 = make_order_update("1", "PART_TRADED");
+        u2.traded_qty = 75;
+        u2.avg_traded_price = 100.0;
+        assert_eq!(
+            oms.handle_order_update(&u2)
+                .ok()
+                .flatten()
+                .map(|f| f.fill_lots),
+            Some(1),
+            "a garbage regressing update must not inflate the next fill"
+        );
+    }
+
+    /// C3 (fix-round 2026-07-14): a terminal order must never re-fill via
+    /// the same-status arm — even with a HIGHER traded_qty redelivery.
+    #[test]
+    fn test_terminal_order_higher_qty_redelivery_never_refills() {
+        let mut oms = make_oms_with_order("1", OrderStatus::Pending);
+        let mut traded = make_order_update("1", "TRADED");
+        traded.traded_qty = 50;
+        traded.avg_traded_price = 100.0;
+        assert!(oms.handle_order_update(&traded).ok().flatten().is_some());
+
+        // Same-status TRADED redelivery with a HIGHER cumulative qty.
+        let mut refill = make_order_update("1", "TRADED");
+        refill.traded_qty = 75;
+        refill.avg_traded_price = 100.0;
+        let second = oms.handle_order_update(&refill);
+        assert!(
+            !matches!(second, Ok(Some(_))),
+            "a terminal order must never emit a second FillEvent"
+        );
+        let order = oms.order("1").expect("tracked"); // APPROVED: test
+        assert_eq!(order.traded_qty, 50, "terminal state is final — no copy");
+        assert!(
+            order.needs_reconciliation,
+            "the anomaly must be flagged for reconciliation"
+        );
+    }
+
+    /// C5 (fix-round 2026-07-14): a zero / NaN wire avg price never reaches
+    /// the risk book — the fill event is rejected (qty copy still advances).
+    #[test]
+    fn test_fill_price_guard_rejects_zero_and_nan_avg_price() {
+        for bad in [0.0, f64::NAN, f64::NEG_INFINITY, -5.0] {
+            let mut oms = make_oms_with_order("1", OrderStatus::Pending);
+            let mut update = make_order_update("1", "TRADED");
+            update.traded_qty = 25;
+            update.avg_traded_price = bad;
+            let fill = oms.handle_order_update(&update).ok().flatten();
+            assert!(
+                fill.is_none(),
+                "avg_traded_price {bad} must reject the fill event"
+            );
+            assert_eq!(
+                oms.order("1").map(|o| o.traded_qty),
+                Some(25),
+                "the qty copy still advances (reconcile-class correction)"
+            );
+        }
+    }
+
+    /// L4 (fix-round 2026-07-14): the i64→i32 lots clamp saturates instead
+    /// of panicking, and a zero lot_size is normalized to 1.
+    #[test]
+    fn test_fill_lots_i32_clamp_and_lot_size_zero_normalized() {
+        // Clamp: an absurd cumulative qty saturates to i32::MAX lots.
+        let mut oms = make_oms_with_order("1", OrderStatus::Pending);
+        if let Some(order) = oms.orders.get_mut("1") {
+            order.lot_size = 1;
+        }
+        let mut update = make_order_update("1", "TRADED");
+        update.traded_qty = i64::from(i32::MAX) + 10;
+        update.avg_traded_price = 1.0;
+        let fill = oms
+            .handle_order_update(&update)
+            .ok()
+            .flatten()
+            .expect("fill expected"); // APPROVED: test
+        assert_eq!(fill.fill_lots, i32::MAX, "lots must saturate, never panic");
+
+        // lot_size 0 → normalized to 1 (3 units = 3 lots).
+        let mut oms2 = make_oms_with_order("2", OrderStatus::Pending);
+        if let Some(order) = oms2.orders.get_mut("2") {
+            order.lot_size = 0;
+        }
+        let mut u2 = make_order_update("2", "TRADED");
+        u2.traded_qty = 3;
+        u2.avg_traded_price = 10.0;
+        let f2 = oms2
+            .handle_order_update(&u2)
+            .ok()
+            .flatten()
+            .expect("fill expected"); // APPROVED: test
+        assert_eq!(f2.fill_lots, 3);
+        assert_eq!(f2.lot_size, 1, "lot_size 0 must normalize to 1");
+    }
+
+    /// HP-2 companion: the alloc-free active-order counter agrees with
+    /// `active_orders()`.
+    #[test]
+    fn test_active_order_count_matches_active_orders_len() {
+        let mut oms = make_oms_with_order("1", OrderStatus::Pending);
+        assert_eq!(oms.active_order_count(), oms.active_orders().len());
+        assert_eq!(oms.active_order_count(), 1);
+        let mut traded = make_order_update("1", "TRADED");
+        traded.traded_qty = 50;
+        traded.avg_traded_price = 100.0;
+        let _ = oms.handle_order_update(&traded);
+        assert_eq!(oms.active_order_count(), 0, "terminal orders excluded");
+        assert_eq!(oms.active_order_count(), oms.active_orders().len());
+    }
+
+    /// Fill sign comes from the tracked ManagedOrder's transaction_type
+    /// (authoritative), never the serde-default wire TxnType.
+    #[test]
+    fn test_fill_sign_from_managed_order_transaction_type() {
+        // Sell order: positive traded_qty delta must yield NEGATIVE lots.
+        let mut oms = make_oms_with_order("1", OrderStatus::Pending);
+        if let Some(order) = oms.orders.get_mut("1") {
+            order.transaction_type = TransactionType::Sell;
+        }
+        let mut update = make_order_update("1", "TRADED");
+        update.traded_qty = 50;
+        update.avg_traded_price = 200.0;
+        // Wire TxnType left EMPTY (serde-default reality) — must not matter.
+        assert!(update.txn_type.is_empty());
+        let fill = oms
+            .handle_order_update(&update)
+            .ok()
+            .flatten()
+            .expect("fill expected"); // APPROVED: test
+        assert_eq!(fill.fill_lots, -2, "Sell order → negative lots");
+    }
+
+    /// Unknown exchange/segment chars map to the sentinel, never a panic.
+    #[test]
+    fn test_fill_event_unknown_segment_uses_sentinel() {
+        let mut oms = make_oms_with_order("1", OrderStatus::Pending);
+        let mut update = make_order_update("1", "TRADED");
+        update.traded_qty = 25;
+        update.avg_traded_price = 100.0;
+        // exchange/segment left empty by make_order_update.
+        let fill = oms
+            .handle_order_update(&update)
+            .ok()
+            .flatten()
+            .expect("fill expected"); // APPROVED: test
+        assert_eq!(fill.segment_code, SEGMENT_CODE_UNKNOWN);
     }
 
     #[test]

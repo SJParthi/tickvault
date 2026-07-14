@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use tickvault_common::order_types::{
     OrderStatus, OrderType, OrderValidity, ProductType, TransactionType,
 };
+use tickvault_common::types::ExchangeSegment;
 
 // ---------------------------------------------------------------------------
 // Managed Order — internal OMS representation
@@ -75,6 +76,61 @@ impl ManagedOrder {
                 | OrderStatus::Expired
                 | OrderStatus::Closed
         )
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Fill Event — the OMS → RiskEngine fill bridge (order-runtime dry-run PR,
+// 2026-07-14). Returned by `handle_order_update` when an update carries a
+// POSITIVE executed-quantity delta, so the caller can feed
+// `RiskEngine::record_fill` — closing the silent-stuck-position hole
+// (record_fill previously had ZERO production callers; audit Rule 13).
+// ---------------------------------------------------------------------------
+
+/// Sentinel `segment_code` used when the update's exchange/segment characters
+/// do not map to a known [`ExchangeSegment`] (annexure rule 15 — never panic
+/// on unknown codes). Consumers treat this as "segment unknown".
+pub const SEGMENT_CODE_UNKNOWN: u8 = u8::MAX;
+
+/// A fill delta extracted from a WebSocket order update.
+///
+/// `fill_lots` is SIGNED: positive = buy, negative = sell — the sign comes
+/// from the tracked [`ManagedOrder::transaction_type`] (authoritative; the
+/// wire `TxnType` is serde-default and may be empty). The delta is computed
+/// INSIDE the engine from old vs new `traded_qty`, so a duplicate /
+/// same-status re-delivery yields delta 0 → no event (double-count-safe).
+#[derive(Debug, Clone, PartialEq)]
+pub struct FillEvent {
+    /// Instrument the fill belongs to (from the tracked `ManagedOrder`).
+    pub security_id: u64,
+    /// Numeric `ExchangeSegment` code (I-P1-11 composite-identity carrier);
+    /// [`SEGMENT_CODE_UNKNOWN`] when the update's chars are unmappable.
+    pub segment_code: u8,
+    /// Executed lots in this delta. Positive = buy, negative = sell.
+    pub fill_lots: i32,
+    /// Volume-weighted average fill price from the update
+    /// (`AvgTradedPrice`) — the same field the engine copies into the
+    /// tracked order.
+    pub avg_price: f64,
+    /// Contract lot size (from the tracked order; 0 is normalized to 1).
+    pub lot_size: u32,
+    /// The tracked order id (`PAPER-n` in dry-run, Dhan order id live).
+    pub order_id: String,
+}
+
+/// Maps the order-update wire `(Exchange, Segment)` character pair to a
+/// typed [`ExchangeSegment`] (live-order-update.md rule 6: `Segment` is a
+/// single char — `E`=Equity, `D`=Derivatives, `I`=Index). Unknown pairs
+/// return `None` — never panic (annexure rule 15).
+#[must_use]
+pub fn parse_segment_chars(exchange: &str, segment: &str) -> Option<ExchangeSegment> {
+    match (exchange, segment) {
+        ("NSE", "D") => Some(ExchangeSegment::NseFno),
+        ("BSE", "D") => Some(ExchangeSegment::BseFno),
+        ("NSE", "E") => Some(ExchangeSegment::NseEquity),
+        ("BSE", "E") => Some(ExchangeSegment::BseEquity),
+        (_, "I") => Some(ExchangeSegment::IdxI),
+        _ => None,
     }
 }
 
@@ -3217,166 +3273,54 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Multi Order + Conditional Detail Types Tests (2026-07-14)
+    // FillEvent + segment-char mapping (order-runtime dry-run PR, 2026-07-14)
     // -----------------------------------------------------------------------
 
+    /// The full wire-char → segment matrix from live-order-update.md rule 6,
+    /// plus the fail-closed unknown arms (annexure rule 15 — None, no panic).
     #[test]
-    fn test_multi_order_request_serializes_camel_case_exact() {
-        let req = DhanMultiOrderRequest {
-            dhan_client_id: "100".to_string(),
-            orders: vec![MultiOrderLeg {
-                sequence: "1".to_string(),
-                correlation_id: Some("corr-1".to_string()),
-                transaction_type: "BUY".to_string(),
-                exchange_segment: "NSE_EQ".to_string(),
-                product_type: "CNC".to_string(),
-                order_type: "LIMIT".to_string(),
-                validity: "DAY".to_string(),
-                security_id: "1333".to_string(),
-                quantity: 10,
-                after_market_order: Some(true),
-                amo_time: Some("OPEN".to_string()),
-                price: 250.0,
-                trigger_price: 0.0,
-                disclosed_quantity: 0,
-            }],
-        };
-        let json = serde_json::to_string(&req).unwrap();
-        assert!(json.contains("\"dhanClientId\":\"100\""));
-        assert!(json.contains("\"sequence\":\"1\""));
-        assert!(json.contains("\"correlationId\":\"corr-1\""));
-        assert!(json.contains("\"afterMarketOrder\":true"));
-        assert!(json.contains("\"amoTime\":\"OPEN\""));
-        // disclosedQuantity is an INT here (multi wire), never the conditional
-        // leg's STRING `discQuantity` — the §9.1 trap pinned both ways.
-        assert!(json.contains("\"disclosedQuantity\":0"));
-        assert!(!json.contains("discQuantity"));
-        assert!(!json.contains("disc_quantity"));
-        // Prices are bare FLOATS on the multi wire.
-        assert!(json.contains("\"price\":250.0"));
-        assert!(json.contains("\"triggerPrice\":0.0"));
-    }
-
-    #[test]
-    fn test_conditional_vs_multi_price_type_split() {
-        // Same leg data: TriggerOrder emits a STRING price, MultiOrderLeg a number.
-        let conditional_leg = TriggerOrder {
-            transaction_type: "BUY".to_string(),
-            exchange_segment: "NSE_EQ".to_string(),
-            product_type: "CNC".to_string(),
-            order_type: "LIMIT".to_string(),
-            security_id: "1333".to_string(),
-            quantity: 10,
-            validity: "DAY".to_string(),
-            price: "250.00".to_string(),
-            disc_quantity: "0".to_string(),
-            trigger_price: "0".to_string(),
-        };
-        let multi_leg = MultiOrderLeg {
-            sequence: "1".to_string(),
-            correlation_id: None,
-            transaction_type: "BUY".to_string(),
-            exchange_segment: "NSE_EQ".to_string(),
-            product_type: "CNC".to_string(),
-            order_type: "LIMIT".to_string(),
-            validity: "DAY".to_string(),
-            security_id: "1333".to_string(),
-            quantity: 10,
-            after_market_order: None,
-            amo_time: None,
-            price: 250.0,
-            trigger_price: 0.0,
-            disclosed_quantity: 0,
-        };
-        let conditional_json = serde_json::to_string(&conditional_leg).unwrap();
-        let multi_json = serde_json::to_string(&multi_leg).unwrap();
-        assert!(conditional_json.contains("\"price\":\"250.00\"")); // STRING
-        assert!(multi_json.contains("\"price\":250.0")); // FLOAT
-        // AMO fields absent when None (never fabricated).
-        assert!(!multi_json.contains("afterMarketOrder"));
-        assert!(!multi_json.contains("amoTime"));
-    }
-
-    #[test]
-    fn test_multi_order_response_parses_unknown_order_status_modified_inactive_no_panic() {
-        // yaml sample statuses beyond the repo's 9-variant OrderStatus, plus
-        // a fabricated garbage value — all must parse (annexure rule 15).
-        let json = r#"{"orders":[
-            {"orderId":"O1","sequence":"1","orderStatus":"MODIFIED"},
-            {"orderId":"O2","sequence":"2","orderStatus":"INACTIVE"},
-            {"orderId":"O3","sequence":"3","orderStatus":"FROZEN"}
-        ]}"#;
-        let resp: DhanMultiOrderResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(resp.orders.len(), 3);
-        assert_eq!(resp.orders[0].order_status, "MODIFIED");
-        assert_eq!(resp.orders[1].order_status, "INACTIVE");
-        assert_eq!(resp.orders[2].order_status, "FROZEN");
-    }
-
-    #[test]
-    fn test_multi_order_response_empty_body_defaults() {
-        let resp: DhanMultiOrderResponse = serde_json::from_str("{}").unwrap();
-        assert!(resp.orders.is_empty());
-    }
-
-    #[test]
-    fn test_trigger_response_detail_fields_roundtrip() {
-        // Full GET-by-ID doc example verbatim (PORTAL export 2026-06-30):
-        // createdTime UTC-Z, triggeredTime null, lastPrice STRING,
-        // condition with STRING comparingValue, orders echo.
-        let json = r#"{
-            "alertId": "12345",
-            "alertStatus": "ACTIVE",
-            "createdTime": "2019-08-24T14:15:22Z",
-            "triggeredTime": null,
-            "lastPrice": "245.50",
-            "condition": { "comparisonType": "TECHNICAL_WITH_VALUE", "exchangeSegment": "NSE_EQ", "securityId": "12345", "indicatorName": "SMA_5", "timeFrame": "DAY", "operator": "CROSSING_UP", "comparingValue": "250.00", "expDate": "2019-08-24", "frequency": "ONCE", "userNote": "Price crossing SMA" },
-            "orders": [ { "transactionType": "BUY", "exchangeSegment": "NSE_EQ", "productType": "CNC", "orderType": "LIMIT", "securityId": "12345", "quantity": 10, "validity": "DAY", "price": "250.00", "discQuantity": "0", "triggerPrice": "0" } ]
-        }"#;
-        let resp: DhanConditionalTriggerResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(resp.alert_id, "12345");
+    fn test_parse_segment_chars_matrix() {
         assert_eq!(
-            resp.created_time.as_deref(),
-            Some("2019-08-24T14:15:22Z") // UTC-Z — the ONLY UTC in the family
+            parse_segment_chars("NSE", "D"),
+            Some(ExchangeSegment::NseFno)
         );
-        assert!(resp.triggered_time.is_none()); // null until triggered
-        let last_price = resp.last_price.expect("lastPrice present");
-        assert_eq!(last_price, DhanNumeric::Text("245.50".to_string()));
-        let condition = resp.condition.expect("condition echo present");
         assert_eq!(
-            condition.comparing_value,
-            Some(DhanNumeric::Text("250.00".to_string())) // STRING in response
+            parse_segment_chars("BSE", "D"),
+            Some(ExchangeSegment::BseFno)
         );
-        let orders = resp.orders.expect("orders echo present");
-        assert_eq!(orders.len(), 1);
-        assert_eq!(orders[0].price, "250.00");
-
-        // Place/Modify 2-field responses stay byte-identical: the five
-        // additive detail fields serialize away when None (golden check).
-        let place: DhanConditionalTriggerResponse =
-            serde_json::from_str(r#"{"alertId":"12345","alertStatus":"ACTIVE"}"#).unwrap();
-        let place_json = serde_json::to_string(&place).unwrap();
-        assert_eq!(place_json, r#"{"alertId":"12345","alertStatus":"ACTIVE"}"#);
-        assert!(!place_json.contains("createdTime"));
+        assert_eq!(
+            parse_segment_chars("NSE", "E"),
+            Some(ExchangeSegment::NseEquity)
+        );
+        assert_eq!(
+            parse_segment_chars("BSE", "E"),
+            Some(ExchangeSegment::BseEquity)
+        );
+        // Indices: any exchange with segment "I" maps to IDX_I (both NSE and
+        // BSE indices live in the IDX_I segment per annexure rule 2).
+        assert_eq!(parse_segment_chars("NSE", "I"), Some(ExchangeSegment::IdxI));
+        assert_eq!(parse_segment_chars("BSE", "I"), Some(ExchangeSegment::IdxI));
+        // Unknown / empty / currency / commodity → None, never panic.
+        assert_eq!(parse_segment_chars("", ""), None);
+        assert_eq!(parse_segment_chars("NSE", "C"), None);
+        assert_eq!(parse_segment_chars("MCX", "M"), None);
+        assert_eq!(parse_segment_chars("NSE", "X"), None);
     }
 
     #[test]
-    fn test_dhan_numeric_accepts_number_and_string() {
-        let num: DhanNumeric = serde_json::from_str("245.5").unwrap();
-        assert_eq!(num, DhanNumeric::Num(245.5));
-        assert_eq!(num.as_f64(), Some(245.5));
-        let text: DhanNumeric = serde_json::from_str("\"245.50\"").unwrap();
-        assert_eq!(text, DhanNumeric::Text("245.50".to_string()));
-        assert_eq!(text.as_f64(), Some(245.5));
-        // Round-trips verbatim (string stays a string).
-        assert_eq!(serde_json::to_string(&text).unwrap(), "\"245.50\"");
-    }
-
-    #[test]
-    fn test_dhan_numeric_as_f64_unparsable_is_none() {
-        let garbage = DhanNumeric::Text("not-a-number".to_string());
-        assert_eq!(garbage.as_f64(), None);
-        let padded = DhanNumeric::Text("  250.00  ".to_string());
-        assert_eq!(padded.as_f64(), Some(250.0));
+    fn test_fill_event_carries_segment_sentinel_for_unknown() {
+        // The engine maps a None from parse_segment_chars to the sentinel;
+        // pin the sentinel value so downstream consumers can rely on it.
+        assert_eq!(SEGMENT_CODE_UNKNOWN, u8::MAX);
+        let fill = FillEvent {
+            security_id: 13,
+            segment_code: SEGMENT_CODE_UNKNOWN,
+            fill_lots: 1,
+            avg_price: 100.0,
+            lot_size: 1,
+            order_id: "PAPER-1".to_string(),
+        };
+        assert_eq!(fill.segment_code, SEGMENT_CODE_UNKNOWN);
+        assert_eq!(fill.fill_lots, 1);
     }
 }

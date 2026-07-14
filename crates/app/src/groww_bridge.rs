@@ -890,6 +890,13 @@ pub(crate) struct GrowwBridgeState {
     /// to the file end (everything after that is live). Affects ONLY the
     /// lag-sample classification — persist/fold/dedup are untouched.
     replay_window: bool,
+    /// Order-runtime mark tap (dry-run PR, 2026-07-14): `Some` ONLY when
+    /// `[order_runtime].enabled` — forwards each validated tick's LTP to the
+    /// dry-run runtime's mark arm. Cost when armed: one `Relaxed` load +
+    /// one bounded `try_send` of a 16-byte `Copy` struct; when the runtime
+    /// wants no marks (the dominant path) the load alone short-circuits.
+    /// Zero alloc, zero lock, zero await — hot-path safe by construction.
+    mark_forwarder: Option<crate::order_runtime::MarkForwarder>,
 }
 
 impl GrowwBridgeState {
@@ -936,6 +943,9 @@ impl GrowwBridgeState {
             // preserved offset or a drain fully catches up — replayed
             // lines must not double-count in the day lag histogram.
             replay_window: true,
+            // Armed post-construction by `run_groww_bridge` (single-conn
+            // path only) when the dry-run order runtime is enabled.
+            mark_forwarder: None,
         }
     }
 
@@ -1408,6 +1418,7 @@ impl GrowwBridgeState {
             let live_writer = &mut self.live_writer;
             let seeded = &mut self.seeded;
             let aggregator = &self.aggregator;
+            let mark_forwarder = &self.mark_forwarder;
             tickvault_core::pipeline::feed_consumer::consume_feed_tick(
                 Feed::Groww,
                 &mut parsed,
@@ -1448,6 +1459,21 @@ impl GrowwBridgeState {
                         );
                         return;
                     };
+                    // Order-runtime mark tap (dry-run PR, 2026-07-14): after
+                    // full validation, forward the LTP to the dry-run runtime.
+                    // Cost: one Relaxed load when disarmed (the dominant path);
+                    // armed = one bounded try_send of a Copy struct — no lock,
+                    // no await; disarmed + drop arms are strictly zero-alloc
+                    // (DHAT-proven), accepted sends carry tokio mpsc's
+                    // AMORTIZED block-reuse alloc (Criterion-budgeted) — HP-1
+                    // honesty, mirrors dhat_mark_forward.rs. A full channel
+                    // DROPS the mark (counted; the next tick supersedes it).
+                    // C11: gated OFF during the byte-0 re-tail replay window —
+                    // replayed capture lines are hours-old prices; forwarding
+                    // them could fill a paper order at a stale price.
+                    if !wake_replay_window && let Some(forwarder) = mark_forwarder {
+                        forwarder.mark_forward(pt.security_id, seg_code, pt.last_traded_price);
+                    }
                     // First sight: register + seed the cumulative baseline (idempotent).
                     if seeded.insert(key) {
                         aggregator.pre_populate(std::iter::once(key));
@@ -2064,6 +2090,7 @@ pub fn rotate_stale_groww_capture_at_open_at(
     tick_file_path: &Path,
     today_ist_day: i64,
 ) -> Option<PathBuf> {
+    // O(1) EXEMPT: cold boot path — runs ONCE per process, strictly before the bridge + sidecar spawn.
     let meta = std::fs::metadata(tick_file_path).ok()?;
     if meta.len() == 0 {
         return None; // empty file — nothing worth archiving
@@ -2076,6 +2103,7 @@ pub fn rotate_stale_groww_capture_at_open_at(
     // APPROVED: mtime seconds fit i64 for any realistic wall clock; cold boot path.
     let mtime_ist_day = ist_day_from_unix_secs(mtime_secs.as_secs() as i64);
     // Best-effort snapshot read (sync — cold boot path, before any spawn).
+    // O(1) EXEMPT: cold boot path — once per process, pre-spawn.
     let snapshot_ist_day = std::fs::read_to_string(offset_snapshot_path(tick_file_path))
         .ok()
         .and_then(|raw| serde_json::from_str::<GrowwOffsetSnapshot>(&raw).ok())
@@ -2117,6 +2145,7 @@ pub fn rotate_stale_groww_capture_at_open_at(
                      (first-boot edge)"
                 );
             }
+            // O(1) EXEMPT: cold boot path — one rename per boot, pre-spawn.
             match std::fs::rename(tick_file_path, &target) {
                 Ok(()) => {
                     info!(
@@ -2350,6 +2379,10 @@ pub fn spawn_supervised_groww_bridge(
         Arc<arc_swap::ArcSwapOption<tickvault_core::notification::NotificationService>>,
     >,
     trading_calendar: Arc<tickvault_common::trading_calendar::TradingCalendar>,
+    // Order-runtime mark tap (dry-run PR, 2026-07-14): `Some` ONLY when
+    // `[order_runtime].enabled` — the per-tick LTP forwarder into the
+    // dry-run runtime's mark arm. `None` = byte-identical prior behavior.
+    mark_forwarder: Option<crate::order_runtime::MarkForwarder>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         // Process-lifetime state: ONE aggregator (shared papaya map) + ONE
@@ -2392,6 +2425,7 @@ pub fn spawn_supervised_groww_bridge(
             audit_latches,
             capture_seq,
             None,
+            mark_forwarder,
         )
         .await;
     })
@@ -2419,6 +2453,10 @@ async fn supervise_groww_bridge_loop(
     audit_latches: Arc<GrowwAuditLatches>,
     capture_seq: Arc<AtomicI64>,
     conn_id: Option<usize>,
+    // Order-runtime mark tap (dry-run PR, 2026-07-14). The shard fleet
+    // (§34, main-locked-out) passes `None` — marks flow from the
+    // single-conn path only.
+    mark_forwarder: Option<crate::order_runtime::MarkForwarder>,
 ) {
     {
         let mut consecutive_respawns: u32 = 0;
@@ -2439,6 +2477,8 @@ async fn supervise_groww_bridge_loop(
                 Arc::clone(&audit_latches),
                 Arc::clone(&capture_seq),
                 conn_id,
+                // O(1) EXEMPT: respawn wiring (cold path) — Arc+Sender clone.
+                mark_forwarder.clone(),
             ));
             let reason = match handle.await {
                 // PANIC HONESTY (house standard: tick-flush-worker-error-codes.md
@@ -2682,6 +2722,9 @@ pub fn spawn_supervised_groww_shard_bridges(
                 audit_latches,
                 Arc::clone(&capture_seq),
                 Some(conn_id),
+                // Shard fleet (§34, main-locked-out): no mark tap — marks
+                // flow from the single-conn path only.
+                None,
             )));
         }
         info!(
@@ -2761,6 +2804,11 @@ pub async fn run_groww_bridge(
     // keeps today's semantics byte-identical. ws_event_audit rows, logs and
     // feed-health stay per-connection either way — only Telegram coalesces.
     conn_id: Option<usize>,
+    // Order-runtime mark tap (dry-run PR, 2026-07-14): `Some` ONLY when
+    // `[order_runtime].enabled` on the single-conn path — installed on the
+    // bridge state so the per-tick fold forwards validated LTPs to the
+    // dry-run runtime. `None` = byte-identical prior behavior.
+    mark_forwarder: Option<crate::order_runtime::MarkForwarder>,
 ) {
     info!(
         path = %tick_file_path.display(),
@@ -2774,6 +2822,9 @@ pub async fn run_groww_bridge(
     // (in-memory bars survive a bridge panic) and never leaks a duplicate
     // force-seal task. Parity with the Dhan IST-midnight force-seal (`main.rs`).
     let mut state = GrowwBridgeState::with_aggregator_and_seq(&qdb, aggregator, capture_seq);
+    // Order-runtime mark tap: installed post-construction (single-conn path
+    // only; `None` keeps the pre-2026-07-14 per-tick path byte-identical).
+    state.mark_forwarder = mark_forwarder;
     // PR-3 (2026-07-02): resume from the persisted flushed-offset when it
     // provably belongs to the current capture file — otherwise byte-0 re-tail
     // (DEDUP-idempotent, the pre-PR-3 behavior).

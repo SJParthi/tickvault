@@ -148,7 +148,6 @@ const DHAN_REST_STACK_ALREADYHELD_PATIENCE_SECS: u64 = 300;
 /// ~125s generateAccessToken cooldown — see
 /// [`dhan_rest_token_backoff_secs`].
 const DHAN_REST_STACK_TOKEN_RETRY_FLOOR_SECS: u64 = 130;
-
 /// Process-global once-guard: the REST-only stack must never be brought up
 /// twice (N stacks = N heartbeats + N renewal loops + N spot/chain
 /// families). First caller wins; later calls log INFO and return `None`.
@@ -191,11 +190,15 @@ pub struct DhanRestStackParams {
     /// Runtime feed-state — receives `set_live_token_manager` so the token
     /// gauges read this stack's manager.
     pub feed_runtime: Arc<FeedRuntimeState>,
-    /// Shared /health state (PR-C2, 2026-07-13): the stack owns the token
-    /// block writer (`token_remaining_secs` + `token_valid`) — the lane's
-    /// `spawn_token_health_writer` died with the lane, and without a writer
-    /// GET /health would report the token invalid forever.
-    pub health: tickvault_api::state::SharedHealthStatus,
+    /// The runtime's mark receiver, stashed by main.rs and taken ONCE at
+    /// spawn (a `Receiver` is not `Clone`; the slot keeps the params struct
+    /// constructible on every boot arm). `None` inside = already taken or
+    /// runtime disabled.
+    pub mark_rx_slot: Arc<
+        std::sync::Mutex<Option<tokio::sync::mpsc::Receiver<crate::order_runtime::MarkUpdate>>>,
+    >,
+    /// Shared mark-gate flag (the Groww bridge's per-tick `Relaxed` load).
+    pub marks_wanted: Arc<AtomicBool>,
 }
 
 /// Cadence (seconds) of the /health token-block writer (PR-C2 re-home of
@@ -754,6 +757,79 @@ async fn run_dhan_rest_stack(params: DhanRestStackParams) {
     // `order_update_connection.rs` stays DORMANT for the live-trading
     // re-wire (fresh dated quote required in the scope-lock file first).
     // -----------------------------------------------------------------------
+    // Phase 5b (order-runtime dry-run PR, 2026-07-14 — SOCKET-FREE shape):
+    // the config-gated DRY-RUN ORDER RUNTIME. Under the noise lock this
+    // stack opens NO Dhan WebSocket and performs NO order-update frame
+    // capture or boot drain — the runtime's order-update broadcast channel
+    // is created locally with ZERO producers (paper fills are synthesized
+    // INSIDE the runtime via `oms.handle_order_update`, never through this
+    // channel), and its auth-notify seam never fires (the timer-driven
+    // reconcile scheduler covers the boot reconcile). The live re-arm
+    // follow-up — the socket spawn + durable frame capture/drain + the two
+    // CloudWatch order-update alarms #1532 deleted — re-attaches producers
+    // to EXACTLY this seam, and requires the operator's fresh dated quote
+    // in dhan-rest-only-noise-lock-2026-07-14 §3 / scope-lock §A.1 FIRST.
+    // Placed AFTER the family claim above so a broken lane/stack
+    // mutual-exclusion invariant can never produce a SECOND runtime
+    // (dual-OMS split-brain, design F8; the spawn-site guard pins this as
+    // the sole call site). DISABLED (default): nothing spawns — the stack
+    // is byte-identical to the post-#1532 noise-lock shape.
+    // -----------------------------------------------------------------------
+    if config.order_runtime.enabled {
+        // Stack-local broadcast channel (capacity mirrors the legacy 256).
+        // The construction receiver IS the runtime's first receiver — there
+        // is no earlier producer to order against (no socket, no drain).
+        let (order_update_sender, first_order_update_rx) =
+            tokio::sync::broadcast::channel::<tickvault_common::order_types::OrderUpdate>(256);
+        // The auth seam: never notified today (no socket) — the runtime's
+        // one-shot reconcile-on-auth arm idles by construction; kept so the
+        // gated live re-arm wires the socket's auth signal into the SAME
+        // params field instead of growing a second seam.
+        let auth_signal = Arc::new(tokio::sync::Notify::new());
+        // Take the mark receiver ONCE from the boot slot (poisoning-safe
+        // — the slot is written once by main.rs before this task spawns).
+        let mark_rx = params
+            .mark_rx_slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        let mark_rx = match mark_rx {
+            Some(rx) => rx,
+            None => {
+                // Structurally unreachable (once-guarded spawn + the slot
+                // is filled on every enabled boot): degrade to a mark-less
+                // runtime — the leaked sender keeps the dummy channel open
+                // so the mark arm just idles.
+                error!(
+                    "order runtime: mark receiver slot was EMPTY at spawn — running \
+                     mark-less (paper fills defer until marks return; investigate the \
+                     boot wiring)"
+                );
+                let (dummy_tx, rx) = tokio::sync::mpsc::channel(1);
+                std::mem::forget(dummy_tx);
+                rx
+            }
+        };
+        let _order_runtime_supervisor =
+            crate::order_runtime::spawn_order_runtime(crate::order_runtime::OrderRuntimeParams {
+                config: Arc::clone(&params.config),
+                notifier: params.notifier.clone(),
+                calendar: Arc::clone(&params.calendar),
+                order_update_sender,
+                first_order_update_rx,
+                mark_rx,
+                marks_wanted: Arc::clone(&params.marks_wanted),
+                token_handle: Arc::clone(&token_handle),
+                client_id: client_id.clone(),
+                auth_notify: auth_signal,
+            });
+        info!(
+            "Dhan REST-only stack: DRY-RUN order runtime spawned (socket-free — \
+             paper fills + Groww marks + daily-loss halt + reconcile heartbeat; \
+             NO Dhan WebSocket and NO order-event frame capture, per the \
+             2026-07-14 operator Dhan noise lock)"
+        );
+    }
 
     // REST-health canary (DHAN-REST-400) DELETED 2026-07-14 (operator Dhan
     // noise lock): the spot-1m + option-chain legs self-detect a dead REST
@@ -1246,9 +1322,12 @@ mod tests {
     #[test]
     fn test_rest_stack_spawns_no_order_update_ws_and_no_canary() {
         let own_src = include_str!("dhan_rest_stack.rs");
-        let (prod, _) = own_src
-            .split_once("#[cfg(test)]")
-            .expect("dhan_rest_stack.rs must keep its test module marker");
+        // H1 fix-round 2026-07-14: the canonical production-region helper
+        // (blanks the test MODULE only — robust to future mid-file
+        // #[cfg(test)] attrs, unlike a naive split_once).
+        let prod = tickvault_common::source_scan::production_region(own_src)
+            .expect("dhan_rest_stack.rs must keep its test module"); // APPROVED: test
+        let prod = prod.as_str();
         for needle in [
             // The retired Q4-i order-update spawn (module stays dormant in
             // core; only the SPAWN is banned here).
@@ -1266,6 +1345,94 @@ mod tests {
                  (dhan-rest-only-noise-lock-2026-07-14.md §3)"
             );
         }
+    }
+
+    /// Order-runtime dry-run PR (2026-07-14, SOCKET-FREE shape after the
+    /// same-day operator Dhan noise lock): the stack wires the config-gated
+    /// DRY-RUN ORDER RUNTIME in Phase 5b — WITHOUT any Dhan WebSocket and
+    /// WITHOUT order-update frame capture/drain (both gated behind a fresh
+    /// dated operator quote per dhan-rest-only-noise-lock-2026-07-14 §3 /
+    /// scope-lock §A.1; the negative ratchet above owns the socket ban).
+    /// Positive pins (production-region split so the needle literals can
+    /// never satisfy themselves):
+    ///   - the runtime spawn exists, EXACTLY once, inside the
+    ///     `[order_runtime].enabled` gate (disabled boots stay byte-identical
+    ///     to the post-#1532 noise-lock shape);
+    ///   - ordering: family-claim (lane/stack exclusion tripwire) < the
+    ///     enabled gate < the runtime spawn;
+    ///   - the mark receiver is taken from the boot slot (the Groww-bridge
+    ///     tap feeds the runtime through main.rs's take-once slot);
+    ///   - WAL-free shape: no `wal_spill:` argument, no confirm/drain
+    ///     helpers — the stack must stay out of the frame-capture business
+    ///     until the live re-arm quote lands.
+    #[test]
+    fn test_rest_stack_wires_order_runtime() {
+        let own_src = include_str!("dhan_rest_stack.rs");
+        let prod = tickvault_common::source_scan::production_region(own_src)
+            .expect("dhan_rest_stack.rs must keep its test module"); // APPROVED: test
+        let prod = prod.as_str();
+        // Positive pins.
+        for needle in [
+            // The config gate the spawn must live behind.
+            "if config.order_runtime.enabled {",
+            // Stack-local broadcast channel (the runtime's only order-update
+            // seam; zero producers until the gated live re-arm).
+            "broadcast::channel::<tickvault_common::order_types::OrderUpdate>",
+            // The runtime spawn itself.
+            "crate::order_runtime::spawn_order_runtime(",
+            // The mark bridge: taken ONCE from main.rs's boot slot.
+            ".mark_rx_slot",
+        ] {
+            assert!(
+                prod.contains(needle),
+                "dhan_rest_stack.rs production region lost `{needle}` — the \
+                 socket-free order-runtime Phase 5b wiring regressed"
+            );
+        }
+        // WAL-free shape pins: the stack must NOT touch the frame-capture /
+        // drain / confirm surface (gated live re-arm territory).
+        for banned in [
+            "wal_spill:",
+            "ws_frame_spill",
+            "confirm_replayed(",
+            "drain_replayed_order_updates_to_broadcast(",
+        ] {
+            assert!(
+                !prod.contains(banned),
+                "dhan_rest_stack.rs production region REGAINED `{banned}` — \
+                 order-update frame capture/drain is gated behind a fresh dated \
+                 operator quote (dhan-rest-only-noise-lock-2026-07-14 §3); the \
+                 socket-free stack must stay WAL-free"
+            );
+        }
+        // Runtime spawn is EXACTLY once (the spawn-site guard pins the rest
+        // of the workspace; this pins the stack itself).
+        let spawns = prod
+            .matches("crate::order_runtime::spawn_order_runtime(")
+            .count();
+        assert_eq!(
+            spawns, 1,
+            "dhan_rest_stack.rs production region must contain EXACTLY ONE \
+             spawn_order_runtime call (Phase 5b); found {spawns}"
+        );
+        // Ordering law: family-claim (lane/stack exclusion tripwire) < the
+        // enabled gate < the runtime spawn — a runtime spawned before the
+        // claim could double-run against the lane's OMS.
+        let claim_call = prod
+            .find("if !claim_post_market_task_family_once()")
+            .expect("family-claim call present"); // APPROVED: test
+        let gate = prod
+            .find("if config.order_runtime.enabled {")
+            .expect("enabled gate present (asserted above)"); // APPROVED: test
+        let runtime_spawn = prod
+            .find("crate::order_runtime::spawn_order_runtime(")
+            .expect("order-runtime spawn present (asserted above)"); // APPROVED: test
+        assert!(
+            claim_call < gate && gate < runtime_spawn,
+            "Phase 5b ordering law broken (claim@{claim_call} < gate@{gate} < \
+             runtime@{runtime_spawn} required) — the runtime must spawn AFTER \
+             the lane/stack family claim, inside the enabled gate"
+        );
     }
 
     /// Source-scan pin of the #1499-mirrored spot→chain contract

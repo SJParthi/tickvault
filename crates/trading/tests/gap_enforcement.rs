@@ -944,10 +944,11 @@ mod risk_pnl_tracking {
         engine.record_fill(1001, 2, 100.0, 25); // buy 2 at 100
         engine.update_market_price(1001, 110.0);
 
-        // RISK-GAP-02: unrealized = net_lots * (market_price - avg_entry)
-        // 2 lots * (110.0 - 100.0) = 20.0
+        // RISK-GAP-02: unrealized = net_lots * (market_price - avg_entry) * lot_size
+        // (2026-07-14 lot_size fix — symmetric with realized P&L; was 20.0
+        // per-lot pre-fix): 2 lots * (110.0 - 100.0) * 25 = 500.0
         let unrealized = engine.total_unrealized_pnl();
-        assert!((unrealized - 20.0).abs() < f64::EPSILON);
+        assert!((unrealized - 500.0).abs() < f64::EPSILON);
     }
 
     #[test]

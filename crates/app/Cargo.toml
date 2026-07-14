@@ -75,5 +75,16 @@ daily_universe_fetcher = [
     "tickvault-storage/daily_universe_fetcher",
 ]
 
+[dev-dependencies]
+# Order-runtime dry-run PR (2026-07-14): DHAT zero-alloc ratchet + Criterion
+# budget evidence for the Groww-bridge mark-forward hot-path tap. Both are
+# existing workspace pins (no new dependency roots).
+criterion = { workspace = true }
+dhat = { workspace = true }
+
+[[bench]]
+name = "order_gate"
+harness = false
+
 [package.metadata.cargo-machete]
 ignored = ["chrono-tz", "clap", "signal-hook"]

@@ -52,20 +52,26 @@ tables deleted 2026-05-20, both date-based live-order gates expired
 One supervised single-owner tokio task (NEW
 `crates/app/src/order_runtime.rs`, ~600 prod LoC) owning
 `OrderManagementSystem` (dry_run hard-true) + `RiskEngine`, spawned
-ONLY from `crates/app/src/dhan_rest_stack.rs` Phase 5a (the dhan-OFF
-arm) replacing the discard drain — structural dual-OMS exclusion: the
-rest stack is the dhan-off arm; `trading_pipeline` (which owns its own
-OMS+Risk) is dhan-ON only. Config-gated `[order_runtime]` (serde
-default OFF = byte-identical boot; `config/base.toml` opts in). The 12
-normative resolutions from the judge synthesis:
+ONLY from `crates/app/src/dhan_rest_stack.rs` Phase 5b (the dhan-OFF
+arm) — structural dual-OMS exclusion: the rest stack is the dhan-off
+arm; `trading_pipeline` (which owns its own OMS+Risk) is dhan-ON only.
+Config-gated `[order_runtime]` (serde default OFF = byte-identical
+boot; `config/base.toml` opts in). **SOCKET-FREE re-scope (2026-07-14,
+merged with main's #1532 operator Dhan noise lock —
+`dhan-rest-only-noise-lock-2026-07-14.md`):** cluster A ships WITHOUT
+the order-update WS spawn and WITHOUT the order-update WAL
+capture/drain/confirm — the runtime's broadcast has ZERO producers
+(paper fills are synthesized in-actor); the socket + WAL + the two
+deleted CloudWatch order-update alarms re-arm as ONE quoted follow-up
+unit (item A4 below). The 12 normative resolutions from the judge
+synthesis (1 and 5 amended by the re-scope):
 
-1. **Module + spawn ordering law** (dhan_rest_stack Phase 5a):
-   `broadcast::channel` → `order_update_sender.subscribe()` →
-   `spawn_order_runtime(..)` →
-   `drain_replayed_order_updates_to_broadcast(..)` → conditional
-   `confirm_replayed` → `run_order_update_connection(.., wal_spill:
-   Some(..))`. NOT spawned from `crates/app/src/main.rs`, NOT on the
-   fast arm.
+1. **Module + spawn ordering law** (dhan_rest_stack Phase 5b,
+   socket-free shape): family-claim → `[order_runtime].enabled` gate →
+   `broadcast::channel` → `spawn_order_runtime(..)`. NOT spawned from
+   `crates/app/src/main.rs`, NOT on the fast arm. The original
+   subscribe→drain→confirm→WS-spawn law is retained in
+   `order-runtime-dryrun.md` §2 as the gated live re-arm spec.
 2. **Fill delta = return-widening**: `handle_order_update` in
    `crates/trading/src/oms/engine.rs` returns
    `Result<Option<FillEvent>, OmsError>`; delta computed in-engine from
@@ -81,12 +87,11 @@ normative resolutions from the judge synthesis:
    deferred + counted), `PAPER-` prefix assertion; plus a once-daily
    gated end-to-end self-test (calendar + [09:20, 15:00) IST +
    once-per-day latch + `is_dry_run` assertion).
-5. **WAL drain + conditional confirm**: order-update frames drained
-   FIFO to the stack broadcast BEFORE the WS spawns; `confirm_replayed`
-   fires iff drain parse-clean AND `livefeed_frames_replayed == 0`;
-   else ONE coalesced `warn!(code = WS-REINJECT-01,
-   reason="confirm_deferred_stale_livefeed")` + counter (warn-level
-   deliberately — non-paging; segments stay staged, zero silent loss).
+5. **WAL drain + conditional confirm — GATED (not shipped)**: cut at
+   the merge with the noise lock; the full semantics (FIFO drain before
+   the WS spawn, confirm iff parse-clean AND zero staged live-feed
+   frames, non-paging coalesced defer) are the retained spec in
+   `order-runtime-dryrun.md` §2, re-armed with the socket in item A4.
 6. **Reconcile scheduler**: 300s market-hours-gated + boot+60s + on
    `ou_reconnect_notifier`. Dry-run = HEARTBEAT wording ("broker
    reconcile SKIPPED") + a REAL local invariant check (Σ FillEvent
@@ -111,9 +116,10 @@ normative resolutions from the judge synthesis:
    `evaluate_daily_loss_halt()` extracted so mark-to-market drawdown
    halts between signals; `trigger_halt` `error!` gains its missing
    `code =` field.
-10. **Ratchets**: the dormant-shape ratchet is REPLACED by
-    `test_rest_stack_wires_order_runtime` (source-order pins);
-    `wal_replay_confirm_symmetry_guard` extended, never weakened;
+10. **Ratchets**: main's #1532 negative ratchet
+    `test_rest_stack_spawns_no_order_update_ws_and_no_canary` kept
+    verbatim (the socket ban); `test_rest_stack_wires_order_runtime`
+    pins the socket-free/WAL-free runtime shape;
     `dhan_live_off_phase_a_guard` untouched; NEW
     `ratchet_order_runtime_spawned_only_from_rest_stack`.
 11. **Config**: `[order_runtime]` — `enabled`, `paper_fill`,
@@ -151,7 +157,7 @@ date-based live-order gates. Files: `crates/app/src/main.rs`
 (LIVE_TRADING_EARLIEST). Owned by the cluster D session; PR #1545 in
 flight.
 
-### Cluster E1 (exit-order layer) / E2 (portfolio + margin) — coarse placeholders (sessions being spun up)
+### Clusters B / E1 / E2 / E3 / OU1 / CT1 / U1 — coarse placeholders (sessions being spun up; restructured 2026-07-14)
 
 E1: the exchange-resident exit layer — Super Order (3-leg
 entry/TP/SL + trailingJump) / OCO wiring of the already-complete but
@@ -159,40 +165,45 @@ caller-less `crates/trading/src/oms/api_client.rs` typed wrappers,
 MPP-aware execution verification, slicing; serial after cluster A;
 must resolve the hostile-review ladder holes (post-fill ENTRY_LEG
 cancel race, ghost-order re-entry block, SL-leg-REJECT rung, batched
-`GET /super/orders`). E2: portfolio + funds/margin surface. Margin
+`GET /super/orders`). E2 is narrowed to the POSITIONS/HOLDINGS-only
+portfolio surface. E3 (NEW, own session) carries the funds & margin
 gate contract (design-only, held for the operator's REST grant —
 `/v2/margincalculator` is a Dhan REST call needing a
 `no-rest-except-live-feed-2026-06-27.md` dated edit first):
 `OrderIntent{Entry{required_paise}, Exit}` appended inside
 `RiskEngine::check_order` (`crates/trading/src/risk/engine.rs`);
 **exits are never margin-gated** — an exit must always be placeable.
+B (order-alerting), OU1 (the live order-update consumer — gated with
+A4 on the noise-lock quote), CT1 (conditional/multi-order, reserved)
+and U1 (user/profile) are one-line reservations in the item list so
+no session claims them without this plan's seam table.
 
 ## Plan Items
 
-Cluster A (this session's PR; Files/Tests per the judge-approved final design):
+Cluster A (this session's PR — SOCKET-FREE shape; Files/Tests per the judge-approved final design as amended by the 2026-07-14 noise-lock merge):
 
-- [ ] A1 — order_runtime.rs actor: supervised single-owner task, select! arms (order-update / marks / reconcile / 16:00 reset / 15:30 sweep / self-test), NotifierAlertSink
+- [x] A1 — order_runtime.rs actor: supervised single-owner task, select! arms (order-update / marks / reconcile / 16:00 reset / 15:30 sweep / self-test), NotifierAlertSink
   - Files: crates/app/src/order_runtime.rs, crates/app/src/oms_wiring.rs
   - Tests: test_traded_update_reaches_risk_engine_net_lots_nonzero, test_alert_sink_event_mapping, test_halt_fires_risk_halt_once_per_episode, prop_fill_mirror_matches_risk_net_lots
-- [ ] A2 — FillEvent widening of handle_order_update (+ 4-line trading_pipeline graft)
+- [x] A2 — FillEvent widening of handle_order_update (+ 4-line trading_pipeline graft) — the fills→P&L MACHINERY (consumed today by paper fills; live order-update SOCKET ingestion is gated, see A4)
   - Files: crates/trading/src/oms/engine.rs, crates/trading/src/oms/types.rs, crates/trading/src/oms/mod.rs, crates/app/src/trading_pipeline.rs
   - Tests: test_same_status_refresh_applies_delta_not_cumulative, test_duplicate_update_zero_delta_skipped, test_partial_lot_remainder_floors_and_errors, test_fill_sign_from_managed_order_transaction_type, test_segment_char_parse_matrix
-- [ ] A3 — ticks→update_market_price gate (marks_wanted AtomicBool + MarkUpdate try_send tap at the groww_bridge seam; channel plumbed in main.rs)
+- [x] A3 — ticks→update_market_price gate (marks_wanted AtomicBool + MarkUpdate try_send tap at the groww_bridge seam; channel plumbed in main.rs)
   - Files: crates/app/src/groww_bridge.rs, crates/app/src/main.rs
   - Tests: test_marks_wanted_false_skips_send, test_mark_channel_full_drops_counted_never_blocks, dhat_mark_forward (0 alloc / 10K), Criterion order_gate/mark_forward ≤ 50ns
-- [ ] A4 — WAL drain + conditional confirm in dhan_rest_stack Phase 5a (ordering law; wal_spill capture restored)
-  - Files: crates/app/src/dhan_rest_stack.rs, crates/app/tests/wal_replay_confirm_symmetry_guard.rs
-  - Tests: test_confirm_decision_matrix (4 arms), test_rest_stack_wires_order_runtime, ratchet_order_runtime_spawned_only_from_rest_stack
-- [ ] A5 — reconcile scheduler with honest dry-run heartbeat + local Σfills==net_lots invariant
+- [ ] A4 — live order-update consumer: socket spawn + WAL drain/confirm + the 2 CloudWatch order-update alarms — **GATED, blocked by dhan-rest-only-noise-lock-2026-07-14 §3 + scope-lock §A.1; requires a fresh dated operator quote FIRST.** The consuming machinery exists in the trading crate (handle_order_update→FillEvent) and the runtime's broadcast seam is live — only the socket + WAL wiring is withheld; the retained re-arm spec (ordering laws F4/F5/F6, ~1 MiB WebSocketConfig frame cap, alarm names) is order-runtime-dryrun.md §2. One PR re-arms all three pieces together.
+  - Files (when re-armed): crates/app/src/dhan_rest_stack.rs, deploy/aws/terraform/app-alarms.tf
+  - Tests (when re-armed): confirm-decision matrix + a rewritten conditional-confirm containment pin; the negative ratchet test_rest_stack_spawns_no_order_update_ws_and_no_canary is REPLACED only in that quoted PR
+- [x] A5 — reconcile scheduler with honest dry-run heartbeat + local Σfills==net_lots invariant. Two shipped shapes exist: (a) THIS PR's actor-side reconcile heartbeat + Σfills==net_lots invariant (dry-run, inside order_runtime.rs); (b) the order-update-ingestion session's config-gated broker-reconcile select!-arm in trading_pipeline (their PR, default-OFF). Consolidation: the broker reconcile tick moves into the order_runtime actor on that session's rebase once this PR lands.
   - Files: crates/app/src/order_runtime.rs
   - Tests: test_dry_run_reconcile_classified_heartbeat_not_ok, test_local_reconcile_divergence_errors
-- [ ] A6 — paper filler + once-daily gated self-test + orphan-fill loudness
+- [x] A6 — paper filler + once-daily gated self-test + orphan-fill loudness
   - Files: crates/app/src/order_runtime.rs
   - Tests: test_paper_fill_deferred_until_finite_positive_mark, test_terminal_order_never_refilled, test_selftest_single_cycle_latched, test_selftest_refused_on_holiday_and_off_hours, test_orphan_fill_update_warns_and_counts, test_source_n_filtered_empty_tolerated, order_runtime_e2e (crates/app/tests/)
-- [ ] A7 — risk P&L lot_size fix + evaluate_daily_loss_halt + trigger_halt code field + sid-segment tripwire
+- [x] A7 — risk P&L lot_size fix + evaluate_daily_loss_halt + trigger_halt code field + sid-segment tripwire
   - Files: crates/trading/src/risk/engine.rs, crates/app/src/order_runtime.rs
   - Tests: test_unrealized_pnl_multiplies_lot_size, test_evaluate_daily_loss_halt_boundary, test_sid_segment_collision_skips_and_errors, test_daily_reset_clears_book_mirror_tripwire_flag_atomically
-- [ ] A8 — config section + rule files (order-runtime-dryrun.md; dated notes in ws-reinject-error-codes.md + websocket-connection-scope-lock.md)
+- [x] A8 — config section + rule files (order-runtime-dryrun.md; dated notes in ws-reinject-error-codes.md + websocket-connection-scope-lock.md)
   - Files: crates/common/src/config.rs, config/base.toml, .claude/rules/project/order-runtime-dryrun.md, .claude/rules/project/ws-reinject-error-codes.md
   - Tests: config validation unit tests (interval ≥ 60, capacity bounds), serde-default-off test
 
@@ -204,12 +215,27 @@ Other clusters (checked off by their owning sessions' PRs, all referencing THIS 
 - [ ] D1 — orphan-watchdog re-homing + expired date-gate re-arm (PR #1545)
   - Files: crates/app/src/main.rs, crates/trading/src/oms/engine.rs, crates/common/src/constants.rs
   - Tests: TBD by cluster D session (watchdog wiring source-scan guard)
+- [ ] B1 — order-alerting surface (cluster B session): broker-attributed order-side Telegram routing; NOTE — if cluster B's `crates/app/src/oms_alert_bridge.rs` merges, it SUPERSEDES cluster A's NotifierAlertSink (A rebases to reuse the shared sink type per the seam contract; not on main as of this PR's merge base)
+  - Files: crates/app/src/oms_alert_bridge.rs (theirs)
+  - Tests: TBD by owning session
 - [ ] E1 — exit-order layer (Super Order/OCO wiring, MPP verify, slicing) — serial after A
   - Files: crates/trading/src/oms/ (engine.rs, api_client.rs call sites), crates/app/src/order_runtime.rs
   - Tests: TBD by owning session
-- [ ] E2 — portfolio + margin gate (OrderIntent in RiskEngine::check_order; design-only until the operator REST grant)
+- [ ] E2 — portfolio surface: POSITIONS / HOLDINGS ONLY (funds & margin moved to E3)
+  - Files: crates/trading/src/oms/api_client.rs call sites, read-only api status surface at most
+  - Tests: TBD by owning session
+- [ ] E3 — funds & margin (own session): the OrderIntent { Entry { required_paise }, Exit } contract appended inside RiskEngine::check_order — **exits are never margin-gated** (an exit must always be placeable); design-only, held for the operator's REST grant (`/v2/margincalculator` needs a `no-rest-except-live-feed-2026-06-27.md` dated edit first)
   - Files: crates/trading/src/risk/engine.rs, crates/trading/src/oms/api_client.rs
   - Tests: TBD by owning session (exit-never-gated invariant test mandatory)
+- [ ] OU1 — order-update consumer (extends cluster A's runtime): wire the live order-update stream into the runtime's broadcast seam — NOW ALSO gated on the dhan-rest-only-noise-lock-2026-07-14 §3 quote (same follow-up unit as A4)
+  - Files: crates/app/src/dhan_rest_stack.rs, crates/app/src/order_runtime.rs
+  - Tests: TBD by owning session (subscribe-before-producer ordering pin)
+- [ ] CT1 — conditional / multi-order surface (RESERVED; own session + dated scope before any code)
+  - Files: TBD
+  - Tests: TBD
+- [ ] U1 — user/profile surface (own session; read-only)
+  - Files: crates/trading/src/oms/api_client.rs
+  - Tests: TBD by owning session
 
 ## Hard invariants (every Dhan-order PR states these)
 
@@ -262,18 +288,19 @@ Other clusters (checked off by their owning sessions' PRs, all referencing THIS 
 Duplicate/same-status cumulative order updates (delta = 0); replayed
 WAL frames hitting an empty book after restart (loud orphan warn, never
 silent fill loss); empty `Source` tolerated / `Source=N` (manual Dhan
-app) filtered at the runtime consumer while the WAL keeps capturing ALL
-frames (SEBI); partial-lot fill remainder floored + coded; 0/NaN mark
+app) filtered at the runtime consumer (WAL capture of ALL frames
+returns with the gated A4 re-arm — SEBI); partial-lot fill remainder
+floored + coded; 0/NaN mark
 defers the paper fill (never fabricate a price); mark channel full
 (counted drop, next tick supersedes — positions exact, marks
-best-effort); >200 replayed frames vs broadcast(256) (warn + counter
-envelope); sid-segment collision tripwire (loud skip, never a merged
+best-effort); sid-segment collision tripwire (loud skip, never a merged
 P&L); 16:00 IST daily reset racing an in-flight fill (single-task
 serialization — one reset block); holiday/off-hours self-test refusal
 (calendar + window + once-per-day latch); disabled `[order_runtime]`
-config = byte-identical dormant boot; stale live-feed WAL segments on a
-dhan-off boot (confirm deferred, segments re-staged, operator archive
-runbook ends the deferral); cluster D's watchdog on a dhan-off boot
+config = byte-identical noise-lock boot; stale order-update WAL
+segments on a dhan-off boot (UNDRAINED — the documented Phase-A
+residual until the gated A4 re-arm; optional operator archive runbook
+in order-runtime-dryrun.md §2); cluster D's watchdog on a dhan-off boot
 with zero positions (clean `no_orphans` row, no page); cluster C ILP
 flush reject (discard-pending poisoned-buffer defense, DEDUP-idempotent
 re-append).
@@ -288,7 +315,9 @@ I-P1-11 sid merge, paper-fill feedback loop, halt flapping, dry-run
 reconcile false-OK, live reconcile storm, reset race, foreign-source
 corruption, sink stall, zero-mark fabrication, WAL replay burst,
 understated daily-loss halt) — each with a named countermeasure and a
-named test. Cluster-level failure modes: C — audit ILP outage loses
+named test (the WAL-class rows — ordering/confirm loss, never-confirm
+growth, replay burst — moved to the gated A4 re-arm with their spec in
+order-runtime-dryrun.md §2). Cluster-level failure modes: C — audit ILP outage loses
 forensic rows only (never order state; best-effort + typed error +
 counter, the AUDIT-WS-01 pattern); D — watchdog REST failure at 15:25
 IST degrades loudly (ORPHAN-POSITION-01 semantics preserved), date-gate
@@ -309,9 +338,11 @@ C; workspace escalation whenever `crates/common/` is touched — A8/D1
 touch config.rs/constants.rs, so those PRs run `cargo test
 --workspace`). Cluster A: the ~24 named unit tests + proptest invariant
 + `order_runtime_e2e` integration + DHAT/Criterion perf evidence listed
-per item above; ratchet replacements (dormant-shape →
-`test_rest_stack_wires_order_runtime`; `wal_replay_confirm_symmetry_guard`
-extended; `dhan_live_off_phase_a_guard` verified untouched; new
+per item above; ratchets: main's negative
+`test_rest_stack_spawns_no_order_update_ws_and_no_canary` kept verbatim
++ `test_rest_stack_wires_order_runtime` (socket-free/WAL-free pins);
+`wal_replay_confirm_symmetry_guard` re-scoped to the two main.rs sites;
+`dhan_live_off_phase_a_guard` verified untouched; new
 spawn-site ratchet). Cluster C: the 8-element audit-table template
 ratchets + `dedup_segment_meta_guard.rs`. Cluster D: watchdog wiring
 source-scan guard + date-gate re-arm pin tests. Cluster E: named by the
@@ -324,8 +355,8 @@ only via All Green (`merge-gate-lock-2026-07-04.md`).
 ## Rollback
 
 Cluster A: `[order_runtime] enabled = false` (or deleting the section —
-serde default OFF) restores the exact current dormant shape (discard
-drain, `wal_spill: None`), pinned by the disabled-branch ratchet; full
+serde default OFF) restores the exact post-#1532 noise-lock shape (no
+runtime, no socket, no WAL), pinned by the ratchet pair; full
 revert = `git revert` (no schema changes, no data migration; WAL
 segments stay replayable either way). Cluster C: audit tables are
 additive — revert removes the writers; tables remain harmless
@@ -348,14 +379,14 @@ Cluster A (all static labels): `tv_order_runtime_up`,
 `tv_paper_fills_synthesized_total`, `tv_paper_fills_deferred_total`,
 `tv_oms_reconcile_runs_total{mode}`,
 `tv_oms_local_reconcile_divergence_total`,
-`tv_paper_selftest_total{outcome}`, `tv_wal_confirm_deferred_total`,
+`tv_paper_selftest_total{outcome}`,
 `tv_order_runtime_respawn_total{reason}`; the existing
 `tv_realized_pnl`/`tv_unrealized_pnl` gauges start moving. Telegram:
 RiskHalt (Critical), CircuitBreakerOpened/Closed, OrderRejected,
 RateLimitExhausted, the self-test heartbeat — every one carrying 🔷
 DHAN attribution. `error!` codes: OMS-GAP-01/02/03/04/06,
-RISK-GAP-01/02; `warn!` WS-REINJECT-01
-(reason=`confirm_deferred_stale_livefeed`, non-paging). Rule files: NEW
+RISK-GAP-01/02 (the WS-REINJECT-01 confirm-defer warn was cut with the
+WAL leg — it returns with the gated A4 re-arm). Rule files: NEW
 `.claude/rules/project/order-runtime-dryrun.md` + dated notes in
 `ws-reinject-error-codes.md` + `websocket-connection-scope-lock.md`.
 Cluster C adds the durable QuestDB forensic layer (order_audit family)
@@ -371,7 +402,7 @@ adding one records the cost note per `aws-budget.md`.
 
 | Seam | Owner | Notes |
 |---|---|---|
-| `crates/app/src/dhan_rest_stack.rs` (Phase 5a + params) | Cluster A session (this round) | Ordering-law rewrite; others rebase on A's merge |
+| `crates/app/src/dhan_rest_stack.rs` (Phase 5b + params) | Cluster A session (this round) | Socket-free runtime spawn; others rebase on A's merge |
 | `crates/app/src/main.rs` process-global prefix | Cluster D | A's main.rs delta is the mark-channel plumbing only (before the groww_bridge spawn) — disjoint region; D owns the prefix task family |
 | `crates/trading/src/oms/engine.rs` — `handle_order_update` + FillEvent region | Cluster A | Return-widening + delta math |
 | `crates/trading/src/oms/engine.rs` — SANDBOX_DEADLINE const region | Cluster D | Date-gate re-arm (PR #1545) |

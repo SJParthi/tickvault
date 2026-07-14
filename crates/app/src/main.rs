@@ -621,6 +621,34 @@ async fn main() -> Result<()> {
     let _rotated_capture = tickvault_app::groww_bridge::rotate_stale_groww_capture_at_open(
         std::path::Path::new(tickvault_app::groww_bridge::GROWW_TICK_FILE_DEFAULT),
     );
+    // ── Order-runtime mark bridge (dry-run PR, 2026-07-14) ──────────────────
+    // Built BEFORE the Groww bridge spawn so the per-tick tap exists from the
+    // first tick. `[order_runtime].enabled = false` → all three slots stay
+    // empty/None and every downstream path is byte-identical. The receiver is
+    // stashed in a take-once slot for the Dhan REST-only stack's Phase 5a
+    // (`spawn_dhan_rest_stack` — the runtime's single spawn site); the
+    // forwarder (flag + bounded sender) rides into the Groww bridge.
+    let (order_runtime_mark_forwarder, order_runtime_mark_rx_slot, order_runtime_marks_wanted) =
+        if config.order_runtime.enabled {
+            let (mark_tx, mark_rx) = tokio::sync::mpsc::channel::<
+                tickvault_app::order_runtime::MarkUpdate,
+            >(config.order_runtime.mark_channel_capacity);
+            let marks_wanted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            (
+                Some(tickvault_app::order_runtime::MarkForwarder {
+                    marks_wanted: std::sync::Arc::clone(&marks_wanted),
+                    tx: mark_tx,
+                }),
+                std::sync::Arc::new(std::sync::Mutex::new(Some(mark_rx))),
+                marks_wanted,
+            )
+        } else {
+            (
+                None,
+                std::sync::Arc::new(std::sync::Mutex::new(None)),
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            )
+        };
     if groww_scale_enabled {
         let _groww_shard_bridges =
             tickvault_app::groww_bridge::spawn_supervised_groww_shard_bridges(
@@ -654,6 +682,9 @@ async fn main() -> Result<()> {
             // boundary task's trading-day gate — built from the SAME `config.trading`
             // the Dhan IST-midnight force-seal calendar uses.
             groww_trading_calendar,
+            // Order-runtime mark tap (dry-run PR, 2026-07-14): per-tick LTP
+            // forwarder into the dry-run runtime; `None` when disabled.
+            order_runtime_mark_forwarder,
         );
     }
     // On a sidecar auth/entitlement/error diagnostic the sidecar supervisor
@@ -3365,17 +3396,79 @@ async fn main() -> Result<()> {
              (operator directive 2026-07-13, deleted in PR-C2) — the flag is IGNORED; \
              fix the config to dhan_enabled=false. The Dhan REST-only stack runs either way."
         );
-    }
-    let _dhan_rest_stack_monitor = tickvault_app::dhan_rest_stack::spawn_dhan_rest_stack(
-        tickvault_app::dhan_rest_stack::DhanRestStackParams {
-            config: std::sync::Arc::new(config.clone()),
-            notifier: std::sync::Arc::clone(&notifier),
-            calendar: std::sync::Arc::clone(&trading_calendar),
-            feed_runtime: std::sync::Arc::clone(&feed_runtime),
-            // PR-C2: the stack owns the /health token-block writer.
-            health: health_status.clone(),
-        },
-    );
+        // ===================================================================
+        // Phase A (operator directive 2026-07-13 — "now remove this entire
+        // Dhan live websocket feed instruments subscription even entire live
+        // websocket feed itself"): the Dhan live WS lane is retired, but the
+        // Dhan REST retained surface (token/auth stack, REST canary,
+        // per-minute spot_1m_rest, per-minute option_chain_1m + entitlement
+        // probe) must KEEP RUNNING. Before Phase A those subsystems lived
+        // exclusively inside the lane / fast-boot arm and died with it. The
+        // REST-only stack brings them up WITHOUT any WebSocket.
+        //
+        // Placement notes (mutual exclusion + reachability):
+        //   - Spawned ONLY here, in the Dhan-OFF branch, and ONLY when the
+        //     RAW boot TOML retires the lane (`is_dhan_config_enabled() ==
+        //     false` — round-2 FIX A, 2026-07-13). The lane (whose
+        //     `spawn_post_market_tasks` seam owns these subsystems on a
+        //     Dhan-ON boot) can never run alongside it: the runtime
+        //     cold-start supervisor REFUSES a lane start on the SAME raw
+        //     gate (see run_dhan_lane_runtime_supervisor).
+        //   - The FAST crash-recovery arm is filtered on
+        //     `config.feeds.dhan_enabled` (its `fast_cache.filter`), so with
+        //     Dhan off it never fires its early return — every Dhan-off boot
+        //     reaches THIS slow-path site. The metrics recorder + notifier +
+        //     shared infra are all installed well above (`build_shared_infra`).
+        //   - Bring-up is a background task with internal retry-forever
+        //     loops: it never blocks boot and never halts the process.
+        // ===================================================================
+        if feed_runtime.is_dhan_config_enabled() {
+            // Round-2 FIX A (2026-07-13): a config-ON boot whose feed-state
+            // overlay (last webpage toggle) left Dhan runtime-OFF — the lane
+            // is DORMANT, not retired. The REST-only stack must NOT spawn
+            // here: it would hold the dual-instance SSM lock + mint the
+            // TokenManager, and the (allowed) runtime re-enable's cold-start
+            // would then collide with our OWN process (AlreadyHeld →
+            // DHAN-LANE-03 retry loop + RESILIENCE-01 pages). The retained
+            // Dhan REST surface comes up WITH the lane on re-enable
+            // (`spawn_post_market_tasks`) — pre-Phase-A behavior; until
+            // then the Dhan REST surface is honestly absent (as it was
+            // pre-Phase-A on every runtime-OFF boot).
+            info!(
+                "Dhan REST-only stack NOT spawned: the boot TOML carries dhan_enabled=true \
+                 (lane dormant via the runtime overlay, not retired) — a runtime re-enable \
+                 cold-starts the full lane, which owns the Dhan REST surface"
+            );
+            // E6 (fix-round 2026-07-14): name the config conflict — the
+            // dry-run order runtime spawns ONLY from the REST stack (the
+            // dhan-OFF arm), so on a dhan-ON boot `[order_runtime]` is
+            // silently inert (the mark forwarder is built but never armed).
+            if config.order_runtime.enabled {
+                warn!(
+                    "[order_runtime] enabled = true is IGNORED on a dhan-ON boot — \
+                     the dry-run order runtime spawns only from the dhan-OFF REST \
+                     stack; dhan-ON boots use the trading_pipeline OMS instead"
+                );
+            }
+        } else {
+            let _dhan_rest_stack_monitor = tickvault_app::dhan_rest_stack::spawn_dhan_rest_stack(
+                tickvault_app::dhan_rest_stack::DhanRestStackParams {
+                    config: std::sync::Arc::new(config.clone()),
+                    notifier: std::sync::Arc::clone(&notifier),
+                    calendar: std::sync::Arc::clone(&trading_calendar),
+                    feed_runtime: std::sync::Arc::clone(&feed_runtime),
+                    // Order-runtime dry-run PR (2026-07-14, SOCKET-FREE per
+                    // the same-day operator Dhan noise lock): only the mark
+                    // bridge rides in — no order-update WS, no WAL capture /
+                    // boot drain (both gated behind a fresh dated operator
+                    // quote in dhan-rest-only-noise-lock-2026-07-14 §3).
+                    mark_rx_slot: std::sync::Arc::clone(&order_runtime_mark_rx_slot),
+                    marks_wanted: std::sync::Arc::clone(&order_runtime_marks_wanted),
+                },
+            );
+        }
+        None
+    };
 
     // =======================================================================
     // Boot completion signals (deploy-hang fix 2026-07-13; unconditional +
