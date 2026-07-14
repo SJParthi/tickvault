@@ -26,7 +26,6 @@ pub mod feed_consumer;
 pub mod feed_lag_monitor;
 pub mod feed_presence;
 pub mod first_seen_set;
-pub mod no_tick_watchdog;
 pub mod prev_close_writer;
 pub mod prev_day_close_stamper;
 pub mod prev_oi_cache;

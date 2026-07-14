@@ -85,6 +85,15 @@ pub struct ApplicationConfig {
     /// off is the whole-subsystem rollback switch (B12).
     #[serde(default)]
     pub scoreboard: ScoreboardConfig,
+    /// `[brutex_crossverify]` — daily BruteX↔TickVault Groww 1-minute
+    /// cross-verification (operator authorization tracked in
+    /// `.claude/rules/project/brutex-crossverify-error-codes.md`). Reads
+    /// BruteX-produced OHLCV CSVs from S3 at 15:50 IST and compares them
+    /// against live `candles_1m` rows tagged `feed='groww'`. Default OFF —
+    /// a missing section keeps today's behaviour byte-identical; flipping
+    /// `enabled = false` is the whole-subsystem rollback switch (B12).
+    #[serde(default)]
+    pub brutex_crossverify: BrutexCrossverifyConfig,
     /// `[spot_1m_rest]` — per-minute spot 1m REST pipeline (operator grant
     /// 2026-07-12, `no-rest-except-live-feed-2026-06-27.md` §8): every
     /// trading-day minute close in session, fetch that just-closed minute's
@@ -409,6 +418,129 @@ impl Default for ScoreboardConfig {
             presence_fold_enabled: default_scoreboard_enabled(),
             groww_lag_enabled: default_scoreboard_enabled(),
             trigger_secs_of_day_ist: default_scoreboard_trigger_secs(),
+        }
+    }
+}
+
+/// `[brutex_crossverify]` — daily BruteX↔TickVault Groww 1-minute
+/// cross-verification. At 15:50 IST the runner lists + downloads the
+/// BruteX-produced OHLCV CSVs from S3 (`s3://<bucket>/<prefix>/<date>/…`)
+/// and compares them cell-by-cell (paise-integer, tolerance INCLUSIVE)
+/// against live `candles_1m` rows tagged `feed='groww'`. All fields
+/// serde-defaulted so a missing section is safe. `enabled = false` is
+/// SAFE-OFF: nothing spawns until the operator flips it — the flip back
+/// to `false` is the whole-subsystem rollback switch (B12; pinned by
+/// `brutex_crossverify_flag_rollback`).
+#[derive(Debug, Clone, Deserialize)]
+pub struct BrutexCrossverifyConfig {
+    /// Master switch for the whole subsystem (15:50 IST daily runner +
+    /// forensic tables + Telegram summary + `/crossverify` page data).
+    /// Default OFF — cold-path S3 reads only begin once enabled.
+    #[serde(default = "default_brutex_xverify_enabled")]
+    pub enabled: bool,
+    /// Send the daily Telegram summary (the comparison + tables still run
+    /// when this is off — forensic record without the ping).
+    #[serde(default = "default_brutex_xverify_telegram_enabled")]
+    pub telegram_enabled: bool,
+    /// S3 bucket carrying the BruteX-produced CSVs. Reuses the existing
+    /// cold-archive bucket (instance role already has read access —
+    /// zero IAM change).
+    #[serde(default = "default_brutex_xverify_bucket")]
+    pub bucket: String,
+    /// Key prefix under the bucket; the runner lists
+    /// `<prefix>/<YYYY-MM-DD>/` for the trading day.
+    #[serde(default = "default_brutex_xverify_prefix")]
+    pub prefix: String,
+    /// IST seconds-of-day for the daily trigger. Default 57_000 =
+    /// 15:50:00 IST (after the 15:31 cross-verify, the 15:40
+    /// tick-conservation audit and the 15:45 scoreboard).
+    #[serde(default = "default_brutex_xverify_trigger_secs")]
+    pub trigger_secs_of_day_ist: u32,
+    /// IST seconds-of-day wall-clock cap. An empty S3 listing re-polls
+    /// every `repoll_interval_secs` until this cap (default 57_900 =
+    /// 16:05:00 IST — well before the AWS 16:30 IST auto-stop), then the
+    /// day records NO_DATA / degraded honestly (stage `wall_clock_cap`).
+    #[serde(default = "default_brutex_xverify_deadline_secs")]
+    pub deadline_secs_of_day_ist: u32,
+    /// Seconds between re-polls while the day's S3 listing is empty.
+    #[serde(default = "default_brutex_xverify_repoll_secs")]
+    pub repoll_interval_secs: u64,
+    /// Per-object size cap (bytes). A CSV larger than this is refused
+    /// (degraded, loud) — bounds memory on a corrupt/hostile object.
+    #[serde(default = "default_brutex_xverify_max_object_bytes")]
+    pub max_object_bytes: u64,
+    /// Cap on the number of listed keys per day (bounds a runaway
+    /// producer; beyond it the run degrades loudly).
+    #[serde(default = "default_brutex_xverify_max_keys")]
+    pub max_keys: u32,
+    /// Bounded download attempts per S3 object (with backoff) before
+    /// that object is counted failed for the day.
+    #[serde(default = "default_brutex_xverify_fetch_attempts")]
+    pub fetch_attempts_per_object: u32,
+    /// INCLUSIVE per-cell price tolerance in paise (integer compare —
+    /// `|live - brutex| <= tolerance` matches). Default 0 = exact match.
+    #[serde(default = "default_brutex_xverify_price_tolerance_paise")]
+    pub price_tolerance_paise: i64,
+    /// Classify volume divergences. Default OFF — Groww live volume is
+    /// always 0 (LTP-only feed), so volume classification for the groww
+    /// feed is hard-refused regardless of this flag; both sides are
+    /// still STORED for forensics.
+    #[serde(default = "default_brutex_xverify_compare_volume")]
+    pub compare_volume: bool,
+}
+
+fn default_brutex_xverify_enabled() -> bool {
+    false
+}
+fn default_brutex_xverify_telegram_enabled() -> bool {
+    true
+}
+fn default_brutex_xverify_bucket() -> String {
+    String::from("tv-prod-cold")
+}
+fn default_brutex_xverify_prefix() -> String {
+    String::from("crossverify/groww")
+}
+fn default_brutex_xverify_trigger_secs() -> u32 {
+    15 * 3600 + 50 * 60 // 57_000 = 15:50:00 IST
+}
+fn default_brutex_xverify_deadline_secs() -> u32 {
+    16 * 3600 + 5 * 60 // 57_900 = 16:05:00 IST
+}
+fn default_brutex_xverify_repoll_secs() -> u64 {
+    120
+}
+fn default_brutex_xverify_max_object_bytes() -> u64 {
+    5 * 1024 * 1024 // 5 MiB per CSV object
+}
+fn default_brutex_xverify_max_keys() -> u32 {
+    2_000
+}
+fn default_brutex_xverify_fetch_attempts() -> u32 {
+    3
+}
+fn default_brutex_xverify_price_tolerance_paise() -> i64 {
+    0
+}
+fn default_brutex_xverify_compare_volume() -> bool {
+    false
+}
+
+impl Default for BrutexCrossverifyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_brutex_xverify_enabled(),
+            telegram_enabled: default_brutex_xverify_telegram_enabled(),
+            bucket: default_brutex_xverify_bucket(),
+            prefix: default_brutex_xverify_prefix(),
+            trigger_secs_of_day_ist: default_brutex_xverify_trigger_secs(),
+            deadline_secs_of_day_ist: default_brutex_xverify_deadline_secs(),
+            repoll_interval_secs: default_brutex_xverify_repoll_secs(),
+            max_object_bytes: default_brutex_xverify_max_object_bytes(),
+            max_keys: default_brutex_xverify_max_keys(),
+            fetch_attempts_per_object: default_brutex_xverify_fetch_attempts(),
+            price_tolerance_paise: default_brutex_xverify_price_tolerance_paise(),
+            compare_volume: default_brutex_xverify_compare_volume(),
         }
     }
 }
@@ -2685,6 +2817,7 @@ mod tests {
             in_mem: InMemConfig::default(),
             feeds: FeedsConfig::default(),
             scoreboard: ScoreboardConfig::default(),
+            brutex_crossverify: BrutexCrossverifyConfig::default(),
             spot_1m_rest: Spot1mRestConfig::default(),
             dhan_data_api: DhanDataApiConfig::default(),
             option_chain_1m: OptionChain1mConfig::default(),
@@ -4073,6 +4206,73 @@ mod tests {
             .extract()
             .expect("missing [scoreboard] must default");
         assert!(missing.scoreboard.enabled);
+    }
+
+    /// BruteX crossverify (2026-07-12): the `[brutex_crossverify]` section
+    /// defaults SAFE-OFF (a NEW subsystem must not activate on deploy day
+    /// without an explicit config flip), trigger at 15:50:00 IST, S3
+    /// wall-clock deadline at 16:05:00 IST, and a missing section must
+    /// default, never error.
+    #[test]
+    fn test_brutex_crossverify_config_defaults_disabled_safe_off() {
+        let bx = BrutexCrossverifyConfig::default();
+        assert!(!bx.enabled, "brutex_crossverify must default OFF");
+        assert!(bx.telegram_enabled);
+        assert_eq!(
+            bx.trigger_secs_of_day_ist, 57_000,
+            "trigger must default to 15:50:00 IST"
+        );
+        assert_eq!(
+            bx.deadline_secs_of_day_ist, 57_900,
+            "S3 wall-clock deadline must default to 16:05:00 IST"
+        );
+        assert!(
+            bx.trigger_secs_of_day_ist < bx.deadline_secs_of_day_ist,
+            "trigger must precede the deadline"
+        );
+        assert_eq!(bx.bucket, "tv-prod-cold");
+        assert_eq!(bx.prefix, "crossverify/groww");
+        assert_eq!(bx.repoll_interval_secs, 120);
+        assert_eq!(bx.max_object_bytes, 5 * 1024 * 1024);
+        assert_eq!(bx.max_keys, 2_000);
+        assert_eq!(bx.fetch_attempts_per_object, 3);
+        assert_eq!(bx.price_tolerance_paise, 0, "exact match by default");
+        assert!(!bx.compare_volume, "volume classification defaults OFF");
+    }
+
+    /// B12 rollback test (`brutex_crossverify_flag_rollback`): flipping
+    /// `[brutex_crossverify] enabled = true` must round-trip through TOML
+    /// (the tested ON-switch path — the subsystem is default-OFF, so the
+    /// rollback IS the default), a partial section must fill every other
+    /// field from serde defaults, and a MISSING section must default to
+    /// the safe-off state, never error.
+    #[test]
+    fn brutex_crossverify_flag_rollback() {
+        use figment::Figment;
+        use figment::providers::{Format, Toml};
+
+        #[derive(Deserialize)]
+        struct Wrapper {
+            #[serde(default)]
+            brutex_crossverify: BrutexCrossverifyConfig,
+        }
+        // ON shape: enabled=true parses and turns the subsystem on.
+        let on: Wrapper = Figment::new()
+            .merge(Toml::string("[brutex_crossverify]\nenabled = true\n"))
+            .extract()
+            .expect("brutex_crossverify enable TOML must parse");
+        assert!(on.brutex_crossverify.enabled, "enable flag must stick");
+        // Partial section: unspecified keys fill from serde defaults.
+        assert!(on.brutex_crossverify.telegram_enabled);
+        assert_eq!(on.brutex_crossverify.trigger_secs_of_day_ist, 57_000);
+        assert_eq!(on.brutex_crossverify.deadline_secs_of_day_ist, 57_900);
+        assert_eq!(on.brutex_crossverify.bucket, "tv-prod-cold");
+        // Missing section entirely → full defaults (OFF), never an error.
+        let missing: Wrapper = Figment::new()
+            .merge(Toml::string("[feeds]\ndhan_enabled = true\n"))
+            .extract()
+            .expect("missing [brutex_crossverify] must default");
+        assert!(!missing.brutex_crossverify.enabled);
     }
 
     /// Per-minute spot 1m REST pipeline (operator grant 2026-07-12): the
