@@ -2664,9 +2664,35 @@ pub const IST_UTC_OFFSET_NANOS: i64 = 19_800_000_000_000;
 /// Earliest date (IST) when `mode = "live"` is permitted.
 /// Before this date, config validation rejects live mode at startup.
 /// Change these constants ONLY with explicit approval from Parthiban.
-pub const LIVE_TRADING_EARLIEST_YEAR: i32 = 2026;
-pub const LIVE_TRADING_EARLIEST_MONTH: u32 = 7;
-pub const LIVE_TRADING_EARLIEST_DAY: u32 = 1;
+///
+/// 2026-07-14 re-arm (operator cluster-D directive via coordinator): the
+/// 2026-07-01 date EXPIRED silently on 2026-07-01 leaving this gate a no-op;
+/// re-armed to the 2099-12-31 sentinel matching production.toml
+/// sandbox_only_until — going live now requires editing this constant with a
+/// fresh dated operator quote.
+pub const LIVE_TRADING_EARLIEST_YEAR: i32 = 2099;
+pub const LIVE_TRADING_EARLIEST_MONTH: u32 = 12;
+pub const LIVE_TRADING_EARLIEST_DAY: u32 = 31;
+
+/// Sandbox deadline for the OMS `place_order` live-mode gate, as UNIX epoch
+/// seconds: **2099-12-31T00:00:00Z** (= `4_102_358_400`; chrono-cross-checked
+/// by `crates/trading/tests/sandbox_enforcement_guard.rs`).
+///
+/// Consumed by `crates/trading/src/oms/engine.rs::place_order` (the
+/// `#[cfg(not(test))]` sandbox-enforcement block): any non-dry-run order
+/// while `Utc::now().timestamp() < SANDBOX_DEADLINE_EPOCH_SECS` returns
+/// `Err(OmsError::SandboxEnforcement)`. This gate is mode-INDEPENDENT — it is
+/// the last line even for hypothetical non-Live paths the config-level gates
+/// (`LIVE_TRADING_EARLIEST_*`, `sandbox_only_until`) never see.
+///
+/// MUST stay aligned with `LIVE_TRADING_EARLIEST_*` above (same 2099-12-31
+/// calendar day; this epoch is midnight UTC while the config gate compares
+/// IST calendar dates — the 5h30m nuance is inside the same day, and the
+/// alignment ratchet compares the UTC calendar date of this epoch against
+/// the `LIVE_TRADING_EARLIEST_*` NaiveDate). 2026-07-14 re-arm: the previous
+/// fn-local 2026-07-01 epoch in engine.rs expired silently; re-armed to the
+/// 2099-12-31 sentinel — going live requires a fresh dated operator quote.
+pub const SANDBOX_DEADLINE_EPOCH_SECS: i64 = 4_102_358_400;
 
 // ---------------------------------------------------------------------------
 // Periodic Health Check

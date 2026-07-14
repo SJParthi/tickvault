@@ -1034,8 +1034,10 @@ pub struct StrategyConfig {
     pub mode: TradingMode,
     /// S6-Step4: Sandbox-only enforcement until this date. If the current
     /// date is BEFORE this value, `mode = Live` is forbidden — the boot
-    /// sequence panics. Format: `YYYY-MM-DD`. Default `2026-06-30` per
-    /// Parthiban's "no real orders until June end" requirement.
+    /// sequence panics. Format: `YYYY-MM-DD`. Default `2099-12-31`
+    /// (2026-07-14 re-arm — the old `2026-06-30` default EXPIRED silently;
+    /// the sentinel matches production.toml, so going live requires an
+    /// explicit config edit with a fresh dated operator quote).
     ///
     /// Set to `1970-01-01` (or any past date) to disable the gate.
     #[serde(default = "default_sandbox_only_until")]
@@ -1043,8 +1045,9 @@ pub struct StrategyConfig {
 }
 
 fn default_sandbox_only_until() -> String {
-    // Per Parthiban — sandbox-only until June end 2026.
-    "2026-06-30".to_string()
+    // 2026-07-14 re-arm: sentinel matching production.toml — an absent key
+    // now means ARMED, never silently expired.
+    "2099-12-31".to_string()
 }
 
 impl Default for StrategyConfig {
@@ -2128,6 +2131,22 @@ impl ApplicationConfig {
             }
         }
 
+        // LOUD-EXPIRY tripwire (2026-07-14 re-arm): every date safety gate
+        // that has silently passed its date is a no-op — the exact class bug
+        // that left all three gates dead between 2026-07-01 and 2026-07-14.
+        // One warn! per expired gate at every boot (runtime-only; no
+        // time-bomb ratchet — unit tests inject dates).
+        {
+            let today = ist_date_from_utc(chrono::Utc::now());
+            for gate in expired_live_gates(today) {
+                tracing::warn!(
+                    gate,
+                    "date safety gate {gate} is in the PAST — it is a silent \
+                     no-op; re-arm it with a dated operator quote"
+                );
+            }
+        }
+
         // Gap 6: URL format validation — fail-fast on invalid URLs.
         // Catches typos and misconfiguration at boot instead of cryptic runtime errors.
         let validate_url = |name: &str, url: &str, required_scheme: &str| -> Result<()> {
@@ -2199,6 +2218,50 @@ fn is_before_live_trading_earliest(
     earliest: chrono::NaiveDate,
 ) -> bool {
     today_ist < earliest
+}
+
+/// LOUD-EXPIRY tripwire (2026-07-14 re-arm): returns the names of the date
+/// safety gates whose date is strictly in the PAST relative to `today_ist` —
+/// i.e. gates that have become silent no-ops. All three gates expired
+/// unnoticed between 2026-07-01 and 2026-07-14; `validate()` now warns once
+/// per expired gate at every boot so that class of drift can never recur
+/// silently. Pure (date injected) so unit tests never depend on the wall
+/// clock — no time-bomb ratchets.
+///
+/// Gates checked (compile-time-known dates — the single sources of truth):
+/// - `LIVE_TRADING_EARLIEST` — the `LIVE_TRADING_EARLIEST_*` constants
+///   (config-level Live-mode boot gate, strict `<` on IST date).
+/// - `SANDBOX_DEADLINE_EPOCH_SECS` — the OMS `place_order` epoch sentinel
+///   (converted to its UTC calendar date).
+/// - `sandbox_only_until_default` — the serde default for
+///   `[strategy] sandbox_only_until` (an environment overriding it is
+///   validated at its own `check_sandbox_window` call site).
+fn expired_live_gates(today_ist: chrono::NaiveDate) -> Vec<&'static str> {
+    let mut expired = Vec::new();
+
+    if let Some(earliest) = chrono::NaiveDate::from_ymd_opt(
+        crate::constants::LIVE_TRADING_EARLIEST_YEAR,
+        crate::constants::LIVE_TRADING_EARLIEST_MONTH,
+        crate::constants::LIVE_TRADING_EARLIEST_DAY,
+    ) && earliest < today_ist
+    {
+        expired.push("LIVE_TRADING_EARLIEST");
+    }
+
+    if let Some(deadline_utc) =
+        chrono::DateTime::from_timestamp(crate::constants::SANDBOX_DEADLINE_EPOCH_SECS, 0)
+        && deadline_utc.date_naive() < today_ist
+    {
+        expired.push("SANDBOX_DEADLINE_EPOCH_SECS");
+    }
+
+    if let Ok(cutoff) = chrono::NaiveDate::parse_from_str(&default_sandbox_only_until(), "%Y-%m-%d")
+        && cutoff < today_ist
+    {
+        expired.push("sandbox_only_until_default");
+    }
+
+    expired
 }
 
 // ---------------------------------------------------------------------------
@@ -2289,9 +2352,10 @@ mod tests {
     }
 
     #[test]
-    fn test_sandbox_default_value_is_2026_06_30() {
-        // The default value is exactly the date Parthiban specified.
-        assert_eq!(default_sandbox_only_until(), "2026-06-30");
+    fn test_sandbox_default_value_is_2099_sentinel() {
+        // 2026-07-14 re-arm: the default is the 2099-12-31 sentinel matching
+        // production.toml — an absent key means ARMED, never silently expired.
+        assert_eq!(default_sandbox_only_until(), "2099-12-31");
     }
 
     #[test]
@@ -2443,6 +2507,56 @@ mod tests {
         assert!(
             !is_before_live_trading_earliest(day_after, earliest),
             "days after earliest must be allowed"
+        );
+    }
+
+    // =======================================================================
+    // LOUD-EXPIRY tripwire tests (2026-07-14 re-arm) — dates injected, never
+    // wall-clock-dependent (no time-bomb tests).
+    // =======================================================================
+
+    #[test]
+    fn test_expired_live_gates_empty_today() {
+        // At the re-arm date (2026-07-14) every gate carries the 2099-12-31
+        // sentinel — nothing is expired.
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 7, 14).unwrap();
+        assert!(
+            expired_live_gates(today).is_empty(),
+            "no gate may read expired at the 2026-07-14 re-arm date"
+        );
+    }
+
+    #[test]
+    fn test_expired_live_gates_all_at_2100() {
+        // Past the sentinel, all three gates are silent no-ops — the tripwire
+        // must name every one of them.
+        let today = chrono::NaiveDate::from_ymd_opt(2100, 1, 1).unwrap();
+        let expired = expired_live_gates(today);
+        assert_eq!(
+            expired,
+            vec![
+                "LIVE_TRADING_EARLIEST",
+                "SANDBOX_DEADLINE_EPOCH_SECS",
+                "sandbox_only_until_default",
+            ],
+            "at 2100-01-01 all three date gates must be reported expired"
+        );
+    }
+
+    #[test]
+    fn test_expired_live_gates_per_gate_granularity() {
+        // The check is strictly-past per gate: ON the sentinel date itself no
+        // gate is expired; the DAY AFTER, every 2099-12-31 gate is.
+        let sentinel = chrono::NaiveDate::from_ymd_opt(2099, 12, 31).unwrap();
+        assert!(
+            expired_live_gates(sentinel).is_empty(),
+            "a gate dated today is NOT expired (strictly-past check)"
+        );
+        let day_after = sentinel.succ_opt().unwrap();
+        assert_eq!(
+            expired_live_gates(day_after).len(),
+            3,
+            "the day after the sentinel every gate reads expired"
         );
     }
 
@@ -3577,7 +3691,10 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_sandbox_guard_blocks_live_before_july() {
+    fn test_sandbox_guard_blocks_live_before_earliest_date() {
+        // Renamed 2026-07-14 (was `..._before_july` — era-named; the earliest
+        // date is now the 2099-12-31 sentinel). Logic is constant-driven and
+        // self-adapts to whichever era "today" is in.
         // Date-robust (2026-07-02 coverage-gate fix): the previous version only
         // called validate() with Live INSIDE `if today < earliest`, so from
         // 2026-07-01 the entire D1 live-mode guard block silently fell out of
