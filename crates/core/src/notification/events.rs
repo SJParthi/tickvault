@@ -202,7 +202,11 @@ pub enum NotificationEvent {
     /// Dhan authentication token acquired at boot.
     AuthenticationSuccess,
 
-    /// Dhan authentication failed at boot — system started in offline mode.
+    /// Dhan login could not be obtained (family-(3) of the 2026-07-14
+    /// Dhan noise lock — the ONE Dhan token condition that pages).
+    /// Emitters: the boot-time auth failure AND the mid-session
+    /// watchdog's TERMINAL forced-re-mint failure. Body names the broker
+    /// + the consequence (the spot-1m / option-chain pulls stop).
     AuthenticationFailed { reason: String },
 
     /// Dhan authentication attempt failed transiently (network blip, DNS
@@ -237,14 +241,11 @@ pub enum NotificationEvent {
         within_market_hours: bool,
     },
 
-    /// Mid-session profile check failed during market hours (queue item
-    /// I7, 2026-04-21). Fires CRITICAL on the rising edge only — if
-    /// the profile recovers on a subsequent check, an INFO log is
-    /// emitted (no Telegram). The app does NOT HALT mid-session — a
-    /// mid-session HALT would drop the live WS feed, which costs more
-    /// than the silent-failure risk. Operator remediation is manual.
-    MidSessionProfileInvalidated { reason: String },
-
+    // `MidSessionProfileInvalidated` DELETED 2026-07-14 (operator Dhan
+    // noise lock — dhan-rest-only-noise-lock-2026-07-14.md): the 900s
+    // profile probe runs SILENTLY (coded error! + counters); a terminal
+    // forced-re-mint failure routes to the family-(3)
+    // `AuthenticationFailed` Critical instead.
     /// JWT token renewed successfully by background task.
     TokenRenewed,
 
@@ -937,19 +938,10 @@ pub enum NotificationEvent {
         threshold_secs: i64,
     },
 
-    /// AUTH-GAP-05 (2026-07-06) — the mid-session profile watchdog forced
-    /// a token re-mint after N consecutive REAL Dhan token rejections
-    /// during market hours. Severity::High; edge-triggered exactly once
-    /// per failing episode (the watchdog's retry-once latch). Fields are
-    /// label-only counts — never the JWT or any user data.
-    TokenForcedRemintTriggered {
-        /// Consecutive REAL `/v2/profile` auth failures observed.
-        consecutive_checks: u32,
-        /// The watchdog cadence (seconds) — used to render the human
-        /// "about N minutes" duration in the Telegram body.
-        check_interval_secs: u64,
-    },
-
+    // `TokenForcedRemintTriggered` DELETED 2026-07-14 (operator Dhan
+    // noise lock): the AUTH-GAP-05 forced re-mint is a SILENT self-heal
+    // (coded error! + tv_token_forced_remint_total counters); only a
+    // TERMINAL re-mint failure pages, via `AuthenticationFailed`.
     /// Order update WebSocket connected.
     OrderUpdateConnected,
 
@@ -989,19 +981,11 @@ pub enum NotificationEvent {
     /// disconnect leg (unchanged: `test_order_update_reconnected_severity_is_low`).
     OrderUpdateReconnected { consecutive_failures: u32 },
 
-    /// CRITICAL: zero live ticks received during market hours past the
-    /// configured silence threshold. Fires edge-triggered (once on rising
-    /// edge — when ticks resume, an INFO recovery log fires but no
-    /// Telegram). This event would have caught the 2026-04-21 morning
-    /// failure where the WS was connected but Dhan stopped streaming
-    /// (likely data-plan issue).
-    NoLiveTicksDuringMarketHours {
-        /// How long the heartbeat has been stale, in seconds.
-        silent_for_secs: u64,
-        /// Threshold that triggered the alert, in seconds.
-        threshold_secs: u64,
-    },
-
+    // 2026-07-14 operator Dhan noise lock: `NoLiveTicksDuringMarketHours`
+    // (Critical) DELETED with the no-tick watchdog — its heartbeat was fed
+    // ONLY by the Dhan tick pipeline; Groww stall detection is
+    // FEED-STALL-01 + the market-hours-liveness alarm. See
+    // .claude/rules/project/dhan-rest-only-noise-lock-2026-07-14.md.
     /// Graceful shutdown initiated.
     ShutdownInitiated,
 
@@ -2028,7 +2012,6 @@ impl NotificationEvent {
             | Self::AuthenticationFailed { .. }
             | Self::AuthenticationTransientFailure { .. }
             | Self::PreMarketProfileCheckFailed { .. }
-            | Self::MidSessionProfileInvalidated { .. }
             | Self::TokenRenewed
             | Self::TokenRenewalFailed { .. }
             // ── Dhan-scoped: main-feed WebSocket lifecycle ──
@@ -2045,7 +2028,6 @@ impl NotificationEvent {
             | Self::WebSocketSleepEntered { .. }
             | Self::WebSocketSleepResumed { .. }
             | Self::WebSocketTokenForceRenewedOnWake { .. }
-            | Self::TokenForcedRemintTriggered { .. }
             | Self::WebSocketReconnectionExhausted { .. }
             // ── Dhan-scoped: order-update WebSocket ──
             | Self::OrderUpdateConnected
@@ -2123,8 +2105,13 @@ impl NotificationEvent {
             }
             Self::AuthenticationSuccess => "<b>Auth OK</b> — Dhan JWT acquired".to_string(),
             Self::AuthenticationFailed { reason } => {
+                // 2026-07-14 Dhan noise lock reword: name the broker + the
+                // consequence in plain English (family-(3) — the ONE Dhan
+                // token condition that still pages).
                 format!(
-                    "<b>Auth FAILED</b> — offline mode\n{}",
+                    "🆘 <b>Dhan login could not be obtained</b>\n\
+                     The Dhan spot-1m and option-chain pulls will stop until this is fixed.\n\
+                     {}",
                     html_escape(&redact_url_params(reason))
                 )
             }
@@ -2162,21 +2149,13 @@ impl NotificationEvent {
                      Check: dataPlan == \"Active\", activeSegment contains \"Derivative\", tokenValidity > 4h."
                 )
             }
-            Self::MidSessionProfileInvalidated { reason } => {
-                let reason = html_escape(reason);
-                format!(
-                    "<b>CRITICAL: Mid-session profile INVALIDATED</b>\n{reason}\n\
-                     Live WS still running — operator action required.\n\
-                     Run:\n  curl -H \"access-token: $TOKEN\" https://api.dhan.co/v2/profile\n\
-                     Check: dataPlan == \"Active\", activeSegment contains \"Derivative\", tokenValidity > 4h.\n\
-                     If the profile is confirmed bad, restart the app so the boot-time HALT gate triggers \
-                     (the no-tick watchdog will then page again if ticks stop)."
-                )
-            }
             Self::TokenRenewed => "<b>Token renewed</b>".to_string(),
             Self::TokenRenewalFailed { attempts, reason } => {
+                // 2026-07-14 Dhan noise lock reword: broker + consequence.
                 format!(
-                    "<b>Token renewal FAILED</b> (attempt {attempts})\n{}",
+                    "🆘 <b>Dhan login renewal FAILED</b> (attempt {attempts})\n\
+                     If this keeps failing the Dhan spot-1m and option-chain pulls will stop.\n\
+                     {}",
                     html_escape(&redact_url_params(reason))
                 )
             }
@@ -3266,23 +3245,6 @@ impl NotificationEvent {
                     connection_index.saturating_add(1)
                 )
             }
-            Self::TokenForcedRemintTriggered {
-                consecutive_checks,
-                check_interval_secs,
-            } => {
-                // Plain English per the 10 Telegram commandments: status
-                // emoji first, specific numbers, one decision, no library
-                // names / file paths / token material.
-                let minutes =
-                    u64::from(*consecutive_checks).saturating_mul(*check_interval_secs) / 60;
-                format!(
-                    "⚠️ <b>AUTH-GAP-05: broker login looks invalid — auto re-login started</b>\n\
-                     The broker rejected our login check {consecutive_checks} times in a row \
-                     (about {minutes} minutes). We are fetching a fresh login automatically.\n\
-                     If it clears you'll hear nothing more; if it fails again you'll get a red \
-                     alert — keep only ONE copy of the app running and restart it."
-                )
-            }
             Self::OrderUpdateConnected => "<b>Order Update WS connected</b>".to_string(),
             Self::OrderUpdateAuthenticated => {
                 "<b>Order Update WS authenticated</b>\nDhan accepted token — streaming live."
@@ -3293,17 +3255,6 @@ impl NotificationEvent {
             } => {
                 format!(
                     "<b>Order Update WS reconnected</b>\nRecovered after {consecutive_failures} consecutive failures"
-                )
-            }
-            Self::NoLiveTicksDuringMarketHours {
-                silent_for_secs,
-                threshold_secs,
-            } => {
-                format!(
-                    "<b>CRITICAL: zero live ticks during market hours</b>\n\
-                     Silent for {silent_for_secs}s (threshold {threshold_secs}s).\n\
-                     WebSockets may be connected but NO data streaming. \
-                     Check Dhan dataPlan + IP allowlist + token validity."
                 )
             }
             Self::OrderUpdateDisconnected { reason } => {
@@ -3839,7 +3790,6 @@ impl NotificationEvent {
             Self::AuthenticationFailed { .. } => "AuthenticationFailed",
             Self::AuthenticationTransientFailure { .. } => "AuthenticationTransientFailure",
             Self::PreMarketProfileCheckFailed { .. } => "PreMarketProfileCheckFailed",
-            Self::MidSessionProfileInvalidated { .. } => "MidSessionProfileInvalidated",
             Self::TokenRenewed => "TokenRenewed",
             Self::TokenRenewalFailed { .. } => "TokenRenewalFailed",
             Self::WebSocketConnected { .. } => "WebSocketConnected",
@@ -3888,12 +3838,10 @@ impl NotificationEvent {
             Self::WebSocketSleepEntered { .. } => "WebSocketSleepEntered",
             Self::WebSocketSleepResumed { .. } => "WebSocketSleepResumed",
             Self::WebSocketTokenForceRenewedOnWake { .. } => "WebSocketTokenForceRenewedOnWake",
-            Self::TokenForcedRemintTriggered { .. } => "TokenForcedRemintTriggered",
             Self::OrderUpdateConnected => "OrderUpdateConnected",
             Self::OrderUpdateAuthenticated => "OrderUpdateAuthenticated",
             Self::OrderUpdateDisconnected { .. } => "OrderUpdateDisconnected",
             Self::OrderUpdateReconnected { .. } => "OrderUpdateReconnected",
-            Self::NoLiveTicksDuringMarketHours { .. } => "NoLiveTicksDuringMarketHours",
             Self::ShutdownInitiated => "ShutdownInitiated",
             Self::ShutdownComplete => "ShutdownComplete",
             Self::InstrumentBuildSuccess { .. } => "InstrumentBuildSuccess",
@@ -4087,7 +4035,6 @@ impl NotificationEvent {
             // Critical instead.
             Self::AuthenticationTransientFailure { .. } => Severity::Low,
             Self::PreMarketProfileCheckFailed { .. } => Severity::Critical,
-            Self::MidSessionProfileInvalidated { .. } => Severity::Critical,
             Self::TokenRenewalFailed { .. } => Severity::Critical,
             Self::InstrumentBuildFailed { .. } => Severity::High,
             Self::WebSocketDisconnected { .. } => Severity::High,
@@ -4105,11 +4052,6 @@ impl NotificationEvent {
                 Severity::Low
             }
             Self::WebSocketTokenForceRenewedOnWake { .. } => Severity::Low,
-            // AUTH-GAP-05 (2026-07-06): the forced re-mint IS the
-            // self-remediation, but the operator must see every trigger —
-            // High (pages Telegram), not Critical (the standing
-            // MidSessionProfileInvalidated page covers the unrecovered case).
-            Self::TokenForcedRemintTriggered { .. } => Severity::High,
             // Routine zero-disconnect drift swap — green by design. Prior
             // `Custom` routing made every 60s drift fire [HIGH] amber; see
             // Fix #9 in .claude/plans/active-plan.md and .claude/rules/project/
@@ -4117,7 +4059,6 @@ impl NotificationEvent {
             // Swap itself failed — depth quality degraded until next rebalance.
             Self::OrderUpdateDisconnected { .. } => Severity::High,
             Self::OrderUpdateReconnected { .. } => Severity::Low,
-            Self::NoLiveTicksDuringMarketHours { .. } => Severity::Critical,
             Self::ShutdownInitiated => Severity::Medium,
             Self::CircuitBreakerClosed => Severity::Medium,
             Self::WebSocketConnected { .. } => Severity::Low,
@@ -5339,7 +5280,15 @@ mod tests {
         };
         let msg = event.to_message();
         assert!(msg.contains("HTTP 401 Unauthorized"));
-        assert!(msg.contains("FAILED"));
+        // 2026-07-14 noise-lock reword pins: broker named + consequence.
+        assert!(
+            msg.contains("Dhan login could not be obtained"),
+            "got: {msg}"
+        );
+        assert!(
+            msg.contains("spot-1m and option-chain pulls will stop"),
+            "consequence line missing: {msg}"
+        );
     }
 
     #[test]
@@ -5351,7 +5300,7 @@ mod tests {
         assert!(!msg.contains("0000000000"), "client ID leaked: {msg}");
         assert!(!msg.contains("pin=000000"), "PIN leaked: {msg}");
         assert!(!msg.contains("totp=000000"), "TOTP leaked: {msg}");
-        assert!(msg.contains("FAILED"));
+        assert!(msg.contains("Dhan login could not be obtained"));
         assert!(msg.contains("[REDACTED]"));
     }
 
@@ -6865,13 +6814,10 @@ mod tests {
         assert_external_text_escaped(&ev.to_message());
     }
 
-    #[test]
-    fn test_mid_session_profile_invalidated_escapes_external_reason() {
-        let ev = NotificationEvent::MidSessionProfileInvalidated {
-            reason: HOSTILE.to_string(),
-        };
-        assert_external_text_escaped(&ev.to_message());
-    }
+    // test_mid_session_profile_invalidated_escapes_external_reason DELETED
+    // 2026-07-14 with the MidSessionProfileInvalidated variant (Dhan noise
+    // lock) — the terminal arm routes through AuthenticationFailed, whose
+    // escape test is directly above.
 
     #[test]
     fn test_cross_verify_1m_aborted_escapes_external_detail() {
@@ -9121,51 +9067,12 @@ mod tests {
             reconnected.contains("reconnected") && reconnected.contains('3'),
             "got: {reconnected}"
         );
-        let silent = NotificationEvent::NoLiveTicksDuringMarketHours {
-            silent_for_secs: 120,
-            threshold_secs: 60,
-        }
-        .to_message();
-        assert!(
-            silent.contains("zero live ticks") && silent.contains("120"),
-            "got: {silent}"
-        );
     }
 
-    /// AUTH-GAP-05 (2026-07-06) — the ONE HIGH forced-re-mint event:
-    /// severity / event_kind / Dhan badge / 10-commandments body (status
-    /// emoji, code id, specific numbers, NO token material, NO file paths).
-    #[test]
-    fn test_token_forced_remint_triggered_event() {
-        let ev = NotificationEvent::TokenForcedRemintTriggered {
-            consecutive_checks: 2,
-            check_interval_secs: 900,
-        };
-        assert_eq!(ev.severity(), Severity::High);
-        assert_eq!(ev.topic(), "TokenForcedRemintTriggered");
-        assert_eq!(
-            ev.feed_badge(),
-            Some(super::super::feed_badge::FeedBadge::Dhan.badge()),
-            "forced re-mint is Dhan-scoped — must lead with the Dhan badge"
-        );
-        let msg = ev.to_message();
-        assert!(msg.contains("AUTH-GAP-05"), "got: {msg}");
-        assert!(msg.contains("⚠️"), "status emoji missing: {msg}");
-        assert!(
-            msg.contains("2 times") && msg.contains("30 minutes"),
-            "specific numbers missing (2 checks × 900s = 30 min): {msg}"
-        );
-        // 10-commandments: never the JWT, never a file path or lib name.
-        assert!(
-            !msg.contains("eyJ"),
-            "JWT material must never appear: {msg}"
-        );
-        assert!(!msg.contains(".rs"), "file paths must never appear: {msg}");
-        assert!(
-            !msg.contains("force_renewal") && !msg.contains("arc-swap"),
-            "library/function names must never appear: {msg}"
-        );
-    }
+    // test_token_forced_remint_triggered_event DELETED 2026-07-14 with the
+    // TokenForcedRemintTriggered variant (Dhan noise lock) — the forced
+    // re-mint self-heals silently; only a terminal failure pages via the
+    // AuthenticationFailed family-(3) Critical.
 
     // -----------------------------------------------------------------
     // W2 PR#5 (2026-07-10) — HolidayCalendarCoverageLow

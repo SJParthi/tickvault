@@ -1953,34 +1953,22 @@ mod tests {
         );
     }
 
-    /// AUTH-GAP-05 (2026-07-06): `main.rs` MUST spawn the live token-health
-    /// gauge poller. Without it, `tv_token_remaining_seconds` regresses to
-    /// the frozen mint-time snapshot (stale ~86,395 for up to 23h after a
-    /// killed token) and the honest AND-composed `tv_token_valid` gauge
-    /// never exists — a false-OK class regression (audit Rule 11).
+    /// AUTH-GAP-05 (2026-07-06) / GAP-06 re-home (2026-07-14, Dhan noise
+    /// lock): the live token-health gauge poller keeps
+    /// `tv_token_remaining_seconds` LIVE and publishes the AND-composed
+    /// `tv_token_valid` — without it both regress to the frozen mint-time
+    /// snapshots (false-OK, audit Rule 11) and the family-(4)
+    /// `tv-<env>-token-remaining-low` alarm goes blind.
     ///
-    /// COV-R2-1 hardening (2026-07-06): the design deliberately has TWO
-    /// production spawn sites — the SLOW lane (`start_dhan_lane`) AND the
-    /// FAST crash-recovery boot arm (EDGE-2) — so the scan (a) covers the
-    /// PRODUCTION region only (a future main.rs test mentioning the fn
-    /// would otherwise make a whole-file `contains` fully vacuous), (b)
-    /// requires BOTH sites (a single `contains` stayed green when either
-    /// one was deleted — in particular the fast-arm spawn, silently
-    /// re-opening the round-1 "single spawn site in the SLOW lane only"
-    /// finding), (c) pins the SLOW lane's AG5-R1 LANE-OWNERSHIP
-    /// registration (`token_health_gauge_handle: Some(` +
-    /// `mid_session_watchdog_handle: Some(`) — a revert to a detached
-    /// `let _ = tokio::spawn` would keep the spawn count green while
-    /// restoring the round-1 leaked-poller false-tv_token_valid=1.0
-    /// finding — and (d) (COV-R3-1, 2026-07-06) pins the FAST arm's
-    /// lane-ownership BINDING (`let token_health_gauge_handle =
-    /// token_manager.as_ref().map(`): the fast arm registers its handle
-    /// positionally via `run_shutdown_fast` shorthand field init (never
-    /// the `: Some(` text), so without this assertion a regression that
-    /// keeps the fast-arm spawn call but discards the handle
-    /// (`let _ = token_manager.as_ref().map(...)` + passing `None`) stayed
-    /// green on (a)-(c) while re-opening the leaked-poller class on the
-    /// fast arm.
+    /// GAP-06 (2026-07-14): the poller's HOME moved from main.rs (the two
+    /// lane/fast-arm spawn sites) into `dhan_rest_stack.rs` Phase 3 — the
+    /// one Dhan bring-up path that runs on every dhan-enabled boot mode,
+    /// sharing the stack watchdog's profile-truth flag. This ratchet now
+    /// pins (a) the stack spawn EXISTS in dhan_rest_stack.rs's production
+    /// region, (b) main.rs's production region has ZERO gauge-poller spawn
+    /// sites (a re-added lane spawn would interleave with the stack's
+    /// poller — gauge flapping every ≤15s), and (c) the surviving lane
+    /// handle registrations (watchdog / sweep / health) stay lane-owned.
     #[test]
     fn test_token_health_gauge_poller_wired_into_main() {
         let main_rs = std::fs::read_to_string("../app/src/main.rs")
@@ -1995,22 +1983,27 @@ mod tests {
         let spawn_count = production
             .matches("spawn_token_health_gauge_poller(")
             .count();
-        assert!(
-            spawn_count >= 2,
-            "main.rs (production region) MUST spawn the live token-health \
-             gauge poller at BOTH boot arms — the slow lane \
-             (start_dhan_lane) AND the FAST crash-recovery arm (EDGE-2). \
-             Found {spawn_count} spawn site(s); removing either re-opens \
-             the round-1 single-spawn-site gap (AUTH-GAP-05)."
+        assert_eq!(
+            spawn_count, 0,
+            "main.rs (production region) must have ZERO token-health \
+             gauge-poller spawn sites — GAP-06 (2026-07-14) re-homed the \
+             poller into dhan_rest_stack.rs Phase 3; a re-added main.rs \
+             spawn would interleave with the stack's poller (gauge \
+             flapping every ≤15s). Found {spawn_count}."
         );
-        assert!(
-            production.contains("token_health_gauge_handle: Some("),
-            "main.rs (production region) MUST register the slow lane's \
-             gauge-poller handle lane-owned \
-             (`token_health_gauge_handle: Some(`) in DhanLaneRunHandles — \
-             a detached spawn survives the lane teardown and publishes \
-             tv_token_valid=1.0 for up to ~24h while Dhan is deliberately \
-             OFF (AG5-R1, audit Rule 11)."
+        let stack_rs = std::fs::read_to_string("../app/src/dhan_rest_stack.rs")
+            .or_else(|_| std::fs::read_to_string("crates/app/src/dhan_rest_stack.rs"))
+            .expect("dhan_rest_stack.rs must be readable");
+        let stack_production = main_rs_production_region(&stack_rs);
+        assert_eq!(
+            stack_production
+                .matches("spawn_token_health_gauge_poller(")
+                .count(),
+            1,
+            "dhan_rest_stack.rs (production region) MUST spawn the live \
+             token-health gauge poller exactly once (GAP-06 re-home) — \
+             deleting it blinds the tv-<env>-token-remaining-low alarm \
+             (family-(4)) after a renewal-loop circuit-breaker halt."
         );
         assert!(
             production.contains("mid_session_watchdog_handle: Some("),
@@ -2019,23 +2012,6 @@ mod tests {
              (`mid_session_watchdog_handle: Some(`) in DhanLaneRunHandles — \
              a leaked watchdog keeps hitting /v2/profile with the dead \
              lane's token and fires false RESILIENCE-01 pages (AG5-R1)."
-        );
-        // COV-R3-1: the FAST arm's handle registration is positional
-        // (shorthand field init into `run_shutdown_fast`), so the `Some(`
-        // pins above cover the SLOW lane only. Pin the fast-arm BINDING —
-        // a `let _ = token_manager.as_ref().map(...)` regression (spawn
-        // kept, handle discarded, `None` passed into run_shutdown_fast)
-        // would otherwise stay green while leaking a non-lane-owned poller
-        // publishing tv_token_valid=1.0 from a torn-down lane's
-        // TokenManager.
-        assert!(
-            production.contains("let token_health_gauge_handle = token_manager.as_ref().map("),
-            "main.rs (production region) MUST bind the FAST crash-recovery \
-             arm's gauge-poller handle \
-             (`let token_health_gauge_handle = token_manager.as_ref().map(`) \
-             so it rides into DhanLaneRunHandles via run_shutdown_fast — \
-             discarding the handle detaches the fast-arm poller from lane \
-             ownership (COV-R3-1, AG5-R1 class)."
         );
         // SEC-R4-1 / R4-CPLX-1/2 (2026-07-06): the last two detached spawns
         // in start_dhan_lane — the MINT-CAPABLE 4h token sweep
