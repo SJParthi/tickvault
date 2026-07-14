@@ -979,6 +979,103 @@ pub fn confirm_replayed<P: AsRef<Path>>(wal_dir: P) {
     );
 }
 
+/// Outcome of one `<wal_dir>/archive/` pruning pass.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ArchivePruneOutcome {
+    /// Archive segments deleted (mtime older than the retention window).
+    pub deleted: usize,
+    /// Segments that SHOULD have been deleted but `remove_file` failed
+    /// (logged at WARN; retried on the next pass).
+    pub failed: usize,
+    /// Files inspected and kept (fresh, or not a `.wal` segment).
+    pub kept: usize,
+}
+
+/// Prunes confirmed-replay WAL segments from `<wal_dir>/archive/` whose
+/// mtime is older than `retention_secs` — pure-testable core over an
+/// injected `now` (2026-07-13 disk-retention hardening).
+///
+/// Why this is safe (the honest rationale):
+/// - Segments land in `archive/` ONLY via [`confirm_replayed`] — i.e. their
+///   frames were already re-injected into the live pipeline and durably
+///   persisted (replay-confirmed). `archive/` is never re-replayed.
+/// - The one remaining reader is the same-day 15:40 IST tick-conservation
+///   audit ([`count_frames_for_ist_day`]), which counts frames for the
+///   CURRENT IST day only; a ≥7-day-old segment carries no current-day
+///   frames, so pruning it cannot change the audit
+///   (`WS_WAL_ARCHIVE_RETENTION_SECS` = 7 days, matching
+///   `SPILL_FILE_MAX_AGE_SECS`, comfortably exceeds that window AND — F3,
+///   review round 1 — preserves the confirm-on-channel residual's only
+///   copy across a long weekend for triage before it ages out).
+/// - Only `*.wal` files are touched; anything else in the dir is kept.
+///   A missing `archive/` dir is a no-op. Deletion failures are NOT
+///   persist/flush failures — they log at WARN (bounded: once per file per
+///   pass, passes run every 6 h) and retry next pass.
+#[must_use]
+pub fn prune_archived_segments_at<P: AsRef<Path>>(
+    wal_dir: P,
+    retention_secs: u64,
+    now: std::time::SystemTime,
+) -> ArchivePruneOutcome {
+    let archive_dir = wal_dir.as_ref().join(ARCHIVE_SUBDIR);
+    let mut outcome = ArchivePruneOutcome::default();
+    let Ok(entries) = std::fs::read_dir(&archive_dir) else {
+        return outcome; // missing archive dir — nothing to prune
+    };
+    let cutoff = std::time::Duration::from_secs(retention_secs);
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("wal") {
+            outcome.kept += 1; // foreign file — never touched
+            continue;
+        }
+        let age = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|mtime| now.duration_since(mtime).ok());
+        match age {
+            Some(age) if age > cutoff => match std::fs::remove_file(&path) {
+                Ok(()) => outcome.deleted += 1,
+                Err(err) => {
+                    outcome.failed += 1;
+                    warn!(
+                        path = %path.display(),
+                        error = %err,
+                        "WAL archive prune: remove_file failed — retried next pass"
+                    );
+                }
+            },
+            // Fresh, unreadable metadata, or a future mtime (clock skew):
+            // keep — deleting on uncertainty would be the wrong default.
+            _ => outcome.kept += 1,
+        }
+    }
+    outcome
+}
+
+/// Wall-clock wrapper over [`prune_archived_segments_at`]. Cold path —
+/// called from the periodic prune task in `main.rs` (once at task start,
+/// then every `WS_WAL_ARCHIVE_PRUNE_INTERVAL_SECS`).
+#[must_use]
+pub fn prune_archived_segments<P: AsRef<Path>>(
+    wal_dir: P,
+    retention_secs: u64,
+) -> ArchivePruneOutcome {
+    let outcome = prune_archived_segments_at(wal_dir, retention_secs, std::time::SystemTime::now());
+    if outcome.deleted > 0 || outcome.failed > 0 {
+        metrics::counter!("tv_ws_wal_archive_pruned_total").increment(outcome.deleted as u64);
+        info!(
+            deleted = outcome.deleted,
+            failed = outcome.failed,
+            kept = outcome.kept,
+            retention_secs,
+            "WAL archive prune pass complete (confirmed-replay segments past retention)"
+        );
+    }
+    outcome
+}
+
 fn replay_segment(path: &Path) -> anyhow::Result<Vec<ReplayedFrame>> {
     let mut f = File::open(path)?;
     let mut buf = Vec::new();
@@ -1837,6 +1934,93 @@ mod tests {
         );
         drop(spill);
         std::thread::sleep(Duration::from_millis(50));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── archive/ pruning (2026-07-13 disk-retention hardening) ──────────────
+
+    /// Writes a file into `<dir>/archive/` and backdates its mtime by
+    /// `age_secs` relative to `now` via a computed FileTimes set.
+    fn plant_archive_file(dir: &Path, name: &str, now: SystemTime, age_secs: u64) -> PathBuf {
+        let archive = dir.join("archive");
+        std::fs::create_dir_all(&archive).unwrap();
+        let path = archive.join(name);
+        std::fs::write(&path, b"segment-bytes").unwrap();
+        let mtime = now - Duration::from_secs(age_secs);
+        let f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        f.set_times(std::fs::FileTimes::new().set_modified(mtime))
+            .unwrap();
+        path
+    }
+
+    #[test]
+    fn test_prune_preserves_fresh_archive_segments() {
+        let dir = tmp_dir("prune-fresh");
+        let now = SystemTime::now();
+        let fresh = plant_archive_file(&dir, "ws-frames-00000000000000000001.wal", now, 3600);
+        let outcome = prune_archived_segments_at(&dir, 604_800, now);
+        assert_eq!(outcome.deleted, 0);
+        assert_eq!(outcome.kept, 1);
+        assert!(fresh.exists(), "a fresh segment must never be pruned");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_prune_deletes_old_archive_segments() {
+        let dir = tmp_dir("prune-old");
+        let now = SystemTime::now();
+        let old = plant_archive_file(
+            &dir,
+            "ws-frames-00000000000000000002.wal",
+            now,
+            604_800 + 3600, // retention + 1h
+        );
+        let fresh = plant_archive_file(&dir, "ws-frames-00000000000000000003.wal", now, 60);
+        let outcome = prune_archived_segments_at(&dir, 604_800, now);
+        assert_eq!(outcome.deleted, 1);
+        assert_eq!(outcome.kept, 1);
+        assert!(!old.exists(), "a past-retention segment must be deleted");
+        assert!(fresh.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_prune_ignores_non_segment_names() {
+        let dir = tmp_dir("prune-foreign");
+        let now = SystemTime::now();
+        let foreign = plant_archive_file(&dir, "notes.txt", now, 999_999_999);
+        let marker = plant_archive_file(&dir, "replay-marker", now, 999_999_999);
+        let outcome = prune_archived_segments_at(&dir, 604_800, now);
+        assert_eq!(outcome.deleted, 0);
+        assert_eq!(outcome.kept, 2);
+        assert!(foreign.exists(), "non-.wal files must never be touched");
+        assert!(marker.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_prune_missing_dir_is_noop() {
+        let dir = tmp_dir("prune-missing");
+        // No archive/ subdir created at all.
+        let outcome = prune_archived_segments_at(&dir, 604_800, SystemTime::now());
+        assert_eq!(outcome, ArchivePruneOutcome::default());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_prune_keeps_future_mtime_clock_skew() {
+        let dir = tmp_dir("prune-skew");
+        let now = SystemTime::now();
+        // Plant with a FUTURE mtime relative to the injected `now` by
+        // evaluating "now" one day in the past.
+        let past_now = now - Duration::from_secs(86_400);
+        let skewed = plant_archive_file(&dir, "ws-frames-00000000000000000004.wal", now, 60);
+        let outcome = prune_archived_segments_at(&dir, 604_800, past_now);
+        assert_eq!(outcome.deleted, 0);
+        assert!(
+            skewed.exists(),
+            "a future-mtime file (clock skew) must be kept — never delete on uncertainty"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -253,6 +253,17 @@ patterns (the Dhan PR #1499 pattern, pending merge).
 - Cold-path only; zero hot-path involvement; zero new WebSocket; token READ-ONLY from SSM
   (never minted — `groww-shared-token-minter-2026-07-02.md`); §28 indicators/strategies
   boundary untouched.
+- **Decision-freshness gate (2026-07-13, recorded with PR-4 — the operator's verbatim
+  intent: "we cannot rely on backfill — within the particular second or few seconds it
+  should definitely be pulled for TRADING DECISIONS; we need precise filling"):**
+  backfill/sweep-repaired rows in `spot_1m_rest` / `option_chain_1m` /
+  `option_contract_1m_rest` are RECORD-COMPLETENESS data (backtest parity, cross-verify,
+  audit) — NEVER trading-decision inputs. Any future strategy consumer MUST fail closed on
+  staleness (a row older than a configured freshness threshold ⇒ no trade that minute);
+  stale rows are mechanically distinguishable today (`close_to_data_ms ≥ 60000` on
+  backfilled rows vs ~1-2 s own-fire; the `rest_fetch_audit` outcome names the recovery
+  path). No strategy code without its own dated operator scope (§28 boundary). Full rule:
+  `groww-second-feed-scope-2026-06-19.md` §38.8.
 
 ## §9.4 What a PR that violates this grant looks like (REJECT)
 

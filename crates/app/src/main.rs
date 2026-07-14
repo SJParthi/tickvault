@@ -606,6 +606,21 @@ async fn main() -> Result<()> {
     let groww_scale_entries: std::sync::Arc<
         arc_swap::ArcSwapOption<Vec<tickvault_core::feed::groww::instruments::WatchEntry>>,
     > = std::sync::Arc::new(arc_swap::ArcSwapOption::empty());
+    // ── Groww capture rotation-at-open — PROCESS-GLOBAL, BEFORE both spawns ──
+    // 2026-07-13 disk-retention hardening (review round 1 redesign, F1+F2):
+    // rotate a stale previous-IST-day capture file HERE, synchronously,
+    // strictly BEFORE the Groww bridge task AND the sidecar supervisor spawn
+    // below — ordering holds by construction on EVERY boot arm (this is the
+    // single shared spawn site; the ratchet in disk_retention_wiring_guard.rs
+    // pins the source order). Only Rust renames at open: the rename completes
+    // before the sidecar process exists (it can never re-open the old inode)
+    // and before the bridge's one-shot archive-drain decision runs (F1), and
+    // the archive is named by the bridge's snapshot day — the exact name
+    // drain_archive_tail_if_needed probes (F2). Scale-lab per-conn shard
+    // captures (main-locked-out, dev only) are not rotated at open.
+    let _rotated_capture = tickvault_app::groww_bridge::rotate_stale_groww_capture_at_open(
+        std::path::Path::new(tickvault_app::groww_bridge::GROWW_TICK_FILE_DEFAULT),
+    );
     if groww_scale_enabled {
         let _groww_shard_bridges =
             tickvault_app::groww_bridge::spawn_supervised_groww_shard_bridges(
@@ -649,13 +664,22 @@ async fn main() -> Result<()> {
     // FEED-SUPERVISOR-01: spawn the feed-agnostic sidecar supervisor under a
     // respawning wrapper so the stall-watchdog (FEED-STALL-01) can never die
     // silently — a panic/return respawns it (WS-GAP-05 / DISK-WATCHER-01 pattern).
+    // Disk-retention hardening (2026-07-13): thread the capture-archive S3
+    // destination from `[feeds.groww]` into the sidecar child env so rotated
+    // capture archives are verified-offloaded to S3 instead of accumulating
+    // unbounded on the 30 GB root EBS. Empty bucket = archival OFF.
+    let groww_sidecar_options = tickvault_app::groww_sidecar_supervisor::GrowwSidecarOptions {
+        archive_s3_bucket: config.feeds.groww.capture_archive_s3_bucket.clone(),
+        archive_s3_prefix: config.feeds.groww.capture_archive_s3_prefix.clone(),
+        ..tickvault_app::groww_sidecar_supervisor::GrowwSidecarOptions::default()
+    };
     if groww_scale_enabled {
         // §34: the ladder publishes desired_conns; the fleet reconciles the
         // per-conn Python children to it (spawn missing / kill newest).
         let scale_runtime = tickvault_app::groww_scale_ladder::GrowwScaleRuntime::default();
         let _groww_fleet = tickvault_app::groww_sidecar_supervisor::spawn_groww_scale_fleet(
             std::sync::Arc::clone(&feed_runtime),
-            tickvault_app::groww_sidecar_supervisor::GrowwSidecarOptions::default(),
+            groww_sidecar_options.clone(),
             groww_shards_root.clone(),
             std::sync::Arc::clone(&scale_runtime.desired_conns),
             std::sync::Arc::clone(&scale_runtime.wake),
@@ -678,7 +702,7 @@ async fn main() -> Result<()> {
     } else {
         tickvault_app::groww_sidecar_supervisor::spawn_supervised_groww_sidecar_supervisor(
             std::sync::Arc::clone(&feed_runtime),
-            tickvault_app::groww_sidecar_supervisor::GrowwSidecarOptions::default(),
+            groww_sidecar_options.clone(),
             std::sync::Arc::clone(&feed_health),
             std::sync::Arc::clone(&groww_sidecar_notifier_slot),
             // Scoreboard PR-B (2026-07-10): every stall-watchdog
@@ -1545,6 +1569,29 @@ async fn main() -> Result<()> {
                     ),
                 }
             }
+            // 2026-07-13 disk-retention hardening: the single-file WARN+
+            // append log is deliberately skipped by every retention sweeper
+            // (the `*.log`-name guard), so it was the one unbounded log
+            // file. Cap it at ERRORS_LOG_MAX_BYTES — the same WARN+ lines
+            // also live in the hourly machine app logs + errors.jsonl, so a
+            // truncation loses nothing uniquely. Hosted here (the existing
+            // hourly sweep task) rather than a new task.
+            match observability::cap_errors_log_size(
+                Path::new(tickvault_app::boot_helpers::ERROR_LOG_FILE_PATH),
+                observability::ERRORS_LOG_MAX_BYTES,
+            ) {
+                Ok(None) => {}
+                Ok(Some(prev_bytes)) => tracing::info!(
+                    prev_bytes,
+                    max_bytes = observability::ERRORS_LOG_MAX_BYTES,
+                    "errors.log exceeded its size cap — reset to 0 (WARN+ lines \
+                     remain in the hourly app logs + errors.jsonl)"
+                ),
+                Err(err) => tracing::warn!(
+                    ?err,
+                    "errors.log size cap check failed — file keeps growing until fixed"
+                ),
+            }
         }
     });
 
@@ -1628,6 +1675,33 @@ async fn main() -> Result<()> {
                     }
                 }
             }
+        }
+    });
+
+    // 2026-07-13 disk-retention hardening: prune confirmed-replay WAL
+    // segments from `<wal_dir>/archive/` older than 7 days (F3: matches
+    // SPILL_FILE_MAX_AGE_SECS and preserves the confirm-on-channel
+    // residual's only copy across a long weekend for triage). Archived
+    // segments are post-confirmed-replay copies (frames re-injected +
+    // durably persisted); the same-day 15:40 IST tick-conservation audit
+    // reads only the CURRENT day's frames, so a 7-day retention can never
+    // change it. Before this task, `archive/` grew ~0.15–0.6 GB/day
+    // unbounded on the prod 30 GB volume. Process-global boot prefix (both
+    // boot arms) — deliberately NOT the Dhan-lane periodic health loop,
+    // which never runs on a Groww-only boot. Prunes once at task start
+    // (each daily prod boot reclaims immediately), then every 6 h.
+    tokio::spawn(async {
+        use std::time::Duration;
+        loop {
+            let wal_dir = tickvault_app::tick_conservation_boot::ws_wal_dir();
+            let _outcome = tickvault_storage::ws_frame_spill::prune_archived_segments(
+                &wal_dir,
+                tickvault_common::constants::WS_WAL_ARCHIVE_RETENTION_SECS,
+            );
+            tokio::time::sleep(Duration::from_secs(
+                tickvault_common::constants::WS_WAL_ARCHIVE_PRUNE_INTERVAL_SECS,
+            ))
+            .await;
         }
     });
 
@@ -3151,7 +3225,20 @@ async fn run_process_runloop(
         "system ready — press Ctrl+C to stop"
     );
 
-    notifier.notify(NotificationEvent::StartupComplete { mode });
+    // 2026-07-13 operator visibility rider: the boot Telegram states what
+    // the per-minute Dhan REST legs will ACTUALLY do today (config truth) —
+    // a midnight boot is otherwise silent about them until 09:16 IST.
+    notifier.notify(NotificationEvent::StartupComplete {
+        mode,
+        spot_1m_enabled: config.spot_1m_rest.enabled,
+        spot_1m_indices: u32::try_from(tickvault_common::constants::SPOT_1M_REST_INDICES.len())
+            .unwrap_or(0),
+        chain_1m_enabled: config.option_chain_1m.enabled,
+        chain_1m_underlyings: u32::try_from(
+            tickvault_common::constants::CHAIN_1M_UNDERLYINGS.len(),
+        )
+        .unwrap_or(0),
+    });
 
     // --- Post-market WebSocket disconnect timer ---
     // Compute sleep duration until market_close_time (15:30 IST).
@@ -3202,8 +3289,79 @@ async fn run_process_runloop(
         );
         tokio::time::sleep(drain).await;
 
+        // Stop real-time market data pipeline (market feed + depth WS only).
+        // Order update WS stays alive until app shutdown (16:00 IST or Ctrl+C)
+        // to capture AMO status updates and post-market order notifications.
+        // Dhan-OFF (`lane` is None) has no feed to disconnect — skip cleanly.
+        if let Some(ref lane) = lane {
+            for handle in &lane.ws_handles {
+                handle.abort();
+            }
+            // Give tick processor time to flush remaining ticks before aborting
+            if lane.processor_handle.is_some() {
+                let flush_timeout = std::time::Duration::from_secs(
+                    tickvault_common::constants::GRACEFUL_SHUTDOWN_TIMEOUT_SECS,
+                );
+                tokio::time::sleep(flush_timeout).await;
+            }
+            if let Some(ref handle) = lane.trading_handle {
+                handle.abort();
+            }
+        }
+
+        // Post-market: archive→verify→drop old QuestDB partitions (2026-07-13
+        // disk-pressure remediation). MUST run BEFORE the legacy detach cycle
+        // so a >retention_days partition is archived+dropped (disk freed, S3
+        // copy verified) rather than detached-unarchived (renamed inside the
+        // same volume, zero bytes freed). Gated on `archive_enabled` (serde
+        // default false) — a config rollback restores detach-only behaviour
+        // byte-identically. Fail-closed: a partition is dropped ONLY after
+        // its S3 copy is row-count- and size-verified; any failure keeps the
+        // partition and retries next run.
+        if config.partition_retention.archive_enabled {
+            match tickvault_storage::partition_archive::PartitionArchiver::new(
+                &config.questdb,
+                &config.partition_retention,
+            )
+            .await
+            {
+                Ok(Some(mut archiver)) => {
+                    let summary = archiver.archive_and_drop_old_partitions().await;
+                    info!(
+                        tables_scanned = summary.tables_scanned,
+                        partitions_considered = summary.partitions_considered,
+                        verified = summary.verified,
+                        dropped = summary.dropped,
+                        failed = summary.failed,
+                        rows_archived = summary.rows_archived,
+                        gzip_bytes_uploaded = summary.gzip_bytes_uploaded,
+                        csv_bytes_exported = summary.csv_bytes_exported,
+                        "post-market partition archive complete (verified S3 copy before every drop)"
+                    );
+                }
+                // Review round 1 F1b (fail-closed): no explicit archive
+                // bucket AND no explicit TV_ENVIRONMENT/ENVIRONMENT env var
+                // — archival skipped rather than guessing the prod bucket.
+                // The constructor already logged the actionable warn.
+                Ok(None) => {}
+                Err(err) => {
+                    error!(
+                        ?err,
+                        code = tickvault_common::error_code::ErrorCode::StorageGap04S3ArchiveFailed
+                            .code_str(),
+                        "partition archiver construction failed — archive cycle skipped \
+                         this run (fail-closed no-op; detach cycle still runs)"
+                    );
+                }
+            }
+        }
+
         // Post-market: detach old QuestDB partitions (Phase B).
         // Runs daily after pipeline stops — keeps hot data bounded to retention_days.
+        // KEPT even with the archive leg enabled: the archive cycle above drops
+        // aged partitions first, so this legacy cycle finds nothing new — but its
+        // `total_detached=…` log lines keep firing so the CloudWatch evidence
+        // trail (the 15:30 IST "partition" filter) continues uninterrupted.
         {
             let retention_days = config.partition_retention.retention_days;
             if retention_days > 0 {
@@ -3658,6 +3816,1438 @@ mod tests {
             "Step C: the no-feed idle branch must exist (idle, not crash)"
         );
     }
+
+    // ---------------------------------------------------------------------
+    // D2b — runtime Dhan-lane cold-start FSM (pure helpers + wiring guards).
+    // The FSM transition function itself is unit-tested in feed_state.rs.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn dhan_lane_retry_backoff_is_groww_capped_ladder() {
+        // min(10 * 2^n, 300) — identical to the Groww watcher.
+        assert_eq!(dhan_lane_retry_backoff_secs(0), 10);
+        assert_eq!(dhan_lane_retry_backoff_secs(1), 20);
+        assert_eq!(dhan_lane_retry_backoff_secs(2), 40);
+        assert_eq!(dhan_lane_retry_backoff_secs(3), 80);
+        assert_eq!(dhan_lane_retry_backoff_secs(4), 160);
+        // Capped at 300 from attempt 5 onward (2^5 = 32 -> 320 -> capped).
+        assert_eq!(dhan_lane_retry_backoff_secs(5), 300);
+        assert_eq!(dhan_lane_retry_backoff_secs(50), 300);
+        assert_eq!(
+            DHAN_LANE_RETRY_BACKOFF_CAP_SECS, 300,
+            "backoff cap pinned to the Groww ladder cap"
+        );
+    }
+
+    #[test]
+    fn classify_start_lane_error_maps_to_typed_codes_with_secret_free_reasons() {
+        use tickvault_common::error_code::ErrorCode;
+        // BootAbortClean (a boot gate refused) -> DHAN-LANE-03 (auth/gate).
+        let (code, reason, stage) = classify_start_lane_error(&StartLaneError::BootAbortClean);
+        assert_eq!(code, ErrorCode::DhanLane03AuthFailed);
+        assert_eq!(code.code_str(), "DHAN-LANE-03");
+        assert_eq!(reason, "auth_or_gate_failed");
+        assert_eq!(stage, "auth");
+        // BootAbortErr (instrument-load failed) -> DHAN-LANE-01 (universe).
+        let (code, reason, stage) =
+            classify_start_lane_error(&StartLaneError::BootAbortErr(anyhow::anyhow!("synthetic")));
+        assert_eq!(code, ErrorCode::DhanLane01UniverseBuildFailed);
+        assert_eq!(code.code_str(), "DHAN-LANE-01");
+        assert_eq!(reason, "universe_build_failed");
+        assert_eq!(stage, "universe");
+        // FTC-14: WsPoolSpawn (WS-pool build/spawn failed on a connect-day) ->
+        // DHAN-LANE-02 with stage='ws_pool' — the CORRECT pool-spawn runbook,
+        // not the wrong universe-build one.
+        let (code, reason, stage) = classify_start_lane_error(&StartLaneError::WsPoolSpawn);
+        assert_eq!(code, ErrorCode::DhanLane02WsPoolSpawnFailed);
+        assert_eq!(code.code_str(), "DHAN-LANE-02");
+        assert_eq!(reason, "ws_pool_spawn_failed");
+        assert_eq!(stage, "ws_pool");
+        // Secret discipline: the reason discriminants are FIXED strings, never
+        // the raw error body (e.g. an auth response). Assert they contain no
+        // dynamic content.
+        for r in [
+            "auth_or_gate_failed",
+            "universe_build_failed",
+            "ws_pool_spawn_failed",
+        ] {
+            assert!(
+                !r.contains("synthetic"),
+                "reason must be a fixed discriminant, not the body"
+            );
+        }
+    }
+
+    #[test]
+    fn should_spawn_cold_start_only_from_confirmed_empty_off() {
+        use tickvault_api::feed_state::LaneState;
+        // Spawn iff desired-ON + Off + no active task.
+        assert!(should_spawn_cold_start(true, LaneState::Off, false));
+        // NOT while a task is active (single-owner invariant).
+        assert!(!should_spawn_cold_start(true, LaneState::Off, true));
+        // NOT while desired-OFF.
+        assert!(!should_spawn_cold_start(false, LaneState::Off, false));
+        // H6: NEVER start from Stopping (no double pool).
+        assert!(!should_spawn_cold_start(true, LaneState::Stopping, false));
+        // Idempotent: NOT while Running or Starting.
+        assert!(!should_spawn_cold_start(true, LaneState::Running, false));
+        assert!(!should_spawn_cold_start(true, LaneState::Starting, false));
+    }
+
+    #[test]
+    fn should_abort_cold_start_only_for_starting_on_disable() {
+        use tickvault_api::feed_state::LaneState;
+        // H8: abort an in-flight Starting cold-start ONLY when desired-OFF.
+        assert!(should_abort_cold_start_on_disable(
+            false,
+            LaneState::Starting
+        ));
+        // Do NOT abort a Running lane on disable — its parked task does the
+        // H5-gated, H6-joined teardown itself.
+        assert!(!should_abort_cold_start_on_disable(
+            false,
+            LaneState::Running
+        ));
+        // Nothing to abort from Off/Stopping.
+        assert!(!should_abort_cold_start_on_disable(false, LaneState::Off));
+        assert!(!should_abort_cold_start_on_disable(
+            false,
+            LaneState::Stopping
+        ));
+        // Never abort while still desired-ON.
+        assert!(!should_abort_cold_start_on_disable(
+            true,
+            LaneState::Starting
+        ));
+    }
+
+    #[test]
+    fn supervisor_only_cancels_a_starting_lane_it_owns() {
+        // Boot-ON race fix (hostile-review): the supervisor must NOT fire
+        // StartCancelled against a `Starting` lane it does NOT own (a boot-ON
+        // inline start also seeds Starting). The abort+cancel block is gated on
+        // `active_task.is_some()` so it never clobbers the inline start.
+        let src = include_str!("main.rs");
+        assert!(
+            src.contains(
+                "if active_task.is_some() && should_abort_cold_start_on_disable(desired_on, lane_state)"
+            ),
+            "the supervisor abort/cancel must be gated on active_task.is_some() (owns the Starting lane)"
+        );
+        // The dead-task respawn reset is also gated on an owned (finished) task.
+        assert!(
+            src.contains("is_some_and(tokio::task::JoinHandle::is_finished)"),
+            "the dead-task reset must be gated on an owned, finished task"
+        );
+    }
+
+    #[test]
+    fn supervisor_cancel_is_cas_first_no_abort_of_a_promoted_running_lane() {
+        // Hostile-review MEDIUM fix: the disable-abort path must drive
+        // advance_dhan_lane(StartCancelled) FIRST and abort + mark-not-running
+        // ONLY when the CAS returns Some(Off). If the owned task already CAS'd
+        // Starting→Running between the snapshot and this block, StartCancelled is
+        // illegal (None) and the supervisor must NOT abort the live pool nor
+        // mark it not-running (the parked task owns its gated teardown).
+        let src = include_str!("main.rs");
+        let region_start = src
+            .find("CRITICAL CAS-FIRST race fix")
+            .expect("the CAS-first race-fix comment must exist");
+        let region_end = src[region_start..]
+            .find("Spawn a fresh cold-start")
+            .map(|o| region_start + o)
+            .expect("the spawn block must follow the cancel block");
+        let region = &src[region_start..region_end];
+        // The cancel block advances the FSM FIRST, then guards the abort +
+        // not-running on the Some(Off) result.
+        assert!(
+            region.contains(
+                "advance_dhan_lane(tickvault_api::feed_state::LaneEvent::StartCancelled)"
+            ) && region.contains("== Some(LaneState::Off)"),
+            "the cancel must be CAS-first (advance to Off) before any side-effect"
+        );
+        // task.abort() + set_dhan_lane_running(false) must be INSIDE the Some(Off)
+        // arm (after the CAS check), not unconditional.
+        let cas_idx = region
+            .find("== Some(LaneState::Off)")
+            .expect("CAS check present");
+        let after_cas = &region[cas_idx..];
+        assert!(
+            after_cas.contains("task.abort()"),
+            "task.abort() must be inside the confirmed-cancel (Some(Off)) arm"
+        );
+        assert!(
+            after_cas.contains("set_dhan_lane_running(false)"),
+            "set_dhan_lane_running(false) must be inside the confirmed-cancel arm"
+        );
+    }
+
+    #[test]
+    fn lane_state_labels_are_stable_static_strings() {
+        use tickvault_api::feed_state::LaneState;
+        assert_eq!(lane_state_label(LaneState::Off), "off");
+        assert_eq!(lane_state_label(LaneState::Starting), "starting");
+        assert_eq!(lane_state_label(LaneState::Running), "running");
+        assert_eq!(lane_state_label(LaneState::Stopping), "stopping");
+    }
+
+    #[test]
+    fn phantom_running_closed_running_set_only_after_start_ok() {
+        // Source-scan: `LaneState::Running` is set ONLY in the Ok arm of a
+        // `start_dhan_lane` call (boot-ON inline + the runtime wrapper), never
+        // before. Guard against a future edit that pre-marks Running.
+        let src = include_str!("main.rs");
+        assert!(
+            src.contains("advance_dhan_lane(LaneEvent::StartSucceeded)"),
+            "the runtime cold-start must advance to Running via StartSucceeded only after Ok"
+        );
+        assert!(
+            src.contains("mark_dhan_pool_present()"),
+            "pool-present must be marked (only) on a successful start"
+        );
+    }
+
+    #[test]
+    fn gate_hold_reasserted_before_runtime_teardown() {
+        // H5 source-scan: the runtime Stop path re-asserts can_disable_dhan()
+        // immediately before the irreversible teardown, and on gate-closed it
+        // bumps the disable-aborted counter + stays Running.
+        let src = include_str!("main.rs");
+        assert!(
+            src.contains("if !ctx.feed_runtime.can_disable_dhan() \u{7b}"),
+            "H5: the runtime Stop must re-assert can_disable_dhan() before teardown"
+        );
+        assert!(
+            src.contains("tv_dhan_lane_disable_aborted_total"),
+            "H5: a gate-closed disable must bump the disable-aborted counter"
+        );
+    }
+
+    #[test]
+    fn double_pool_prevented_stop_join_before_off() {
+        // H6 source-scan: Stopping->Off happens via StopJoined (after teardown
+        // awaits the join), never on a bare Notify-fire; and the runtime wrapper
+        // calls the lane-scoped teardown (C3), never run_process_runloop.
+        let src = include_str!("main.rs");
+        assert!(
+            src.contains("advance_dhan_lane(LaneEvent::StopJoined)"),
+            "H6: Stopping->Off must go through StopJoined (after the handle join)"
+        );
+        assert!(
+            src.contains("teardown_dhan_lane_tasks(owned)"),
+            "C3: the runtime Stop must call the lane-scoped teardown, not the run-loop"
+        );
+    }
+
+    #[test]
+    fn runtime_lane_does_not_spawn_process_shared_infra() {
+        // C2 source-scan: the runtime cold-start wrapper must NOT (re)create the
+        // PROCESS-shared seal-writer / aggregator / API server — those live ONLY
+        // in build_shared_infra. The runtime path calls start_dhan_lane (LANE)
+        // and teardown_dhan_lane_tasks (LANE) only.
+        let src = include_str!("main.rs");
+        // The only spawn_seal_writer_loop / spawn_engine_b_aggregator /
+        // axum::serve call sites must be inside build_shared_infra. We assert
+        // the runtime functions reference start_dhan_lane + teardown only.
+        assert!(
+            src.contains("park_running_dhan_lane(std::sync::Arc::clone(&ctx), handles)"),
+            "the runtime cold-start parks via park_running_dhan_lane on success"
+        );
+        // The runtime supervisor + wrapper must NOT call the PROCESS builders.
+        let runtime_region_start = src
+            .find("async fn run_dhan_lane_cold_start")
+            .expect("run_dhan_lane_cold_start must exist");
+        let runtime_region_end = src
+            .find("async fn run_process_runloop")
+            .expect("run_process_runloop must exist");
+        let runtime_region = &src[runtime_region_start..runtime_region_end];
+        assert!(
+            !runtime_region.contains("spawn_seal_writer_loop"),
+            "C2: the runtime lane must NOT spawn the PROCESS seal-writer"
+        );
+        assert!(
+            !runtime_region.contains("spawn_engine_b_aggregator"),
+            "C2: the runtime lane must NOT spawn the PROCESS 21-TF aggregator"
+        );
+        assert!(
+            !runtime_region.contains("axum::serve"),
+            "C2: the runtime lane must NOT spawn the PROCESS API server"
+        );
+    }
+
+    #[test]
+    fn runtime_supervisor_and_cold_start_are_wired_at_boot() {
+        // Wiring guard (Rule 13 / pub-fn-wiring): the runtime supervisor is
+        // spawned at boot with the OnceCell, and the OnceCell is populated after
+        // build_shared_infra so a boot-OFF Dhan feed is runtime-startable.
+        let src = include_str!("main.rs");
+        assert!(
+            src.contains("tokio::spawn(run_dhan_lane_runtime_supervisor("),
+            "the runtime supervisor must be spawned unconditionally at boot"
+        );
+        assert!(
+            src.contains("dhan_lane_ctx_cell.set(runtime_ctx)"),
+            "the runtime context cell must be populated after build_shared_infra"
+        );
+        // The supervisor spawns the cold-start task (the single owned handle).
+        assert!(
+            src.contains("tokio::spawn(run_dhan_lane_cold_start(std::sync::Arc::clone(ctx)))"),
+            "the supervisor must spawn the cold-start task as the single owned handle"
+        );
+    }
+
+    #[test]
+    fn runtime_toggle_never_enters_fast_arm() {
+        // L10 source-scan: a runtime cold-start ALWAYS uses the slow/canonical
+        // start_dhan_lane (the extracted slow arm), never the fast crash-recovery
+        // boot arm. The runtime wrapper builds its DhanLaneContext with EMPTY
+        // WAL-replay buffers (a fast-arm cache-warmed entry is a boot-only path).
+        let src = include_str!("main.rs");
+        let region_start = src
+            .find("async fn run_dhan_lane_cold_start")
+            .expect("run_dhan_lane_cold_start must exist");
+        let region_end = src
+            .find("async fn park_running_dhan_lane")
+            .expect("park_running_dhan_lane must exist");
+        let region = &src[region_start..region_end];
+        assert!(
+            region.contains("start_dhan_lane(lane_ctx).await"),
+            "the runtime cold-start must call the slow/canonical start_dhan_lane"
+        );
+        assert!(
+            region.contains("ws_wal_replay_live_feed: Vec::new()"),
+            "the runtime cold-start must use EMPTY WAL-replay buffers (no fast-arm cache entry)"
+        );
+    }
+
+    #[test]
+    fn runtime_cold_start_gates_side_effects_on_cas() {
+        // Disable-during-cold-start race source-scan: the `Ok(handles)` arm of
+        // the runtime cold-start MUST gate its success side-effects (mark-present
+        // / set-running / notify / park) on the `advance_dhan_lane(StartSucceeded)`
+        // CAS, and on LOSING that CAS (supervisor won Starting→Off) it MUST tear
+        // down the just-spawned pool via `teardown_dhan_lane_tasks` instead of
+        // parking it (which would leak the WS pool). Guard against a regression
+        // back to the unconditional mark+park.
+        let src = include_str!("main.rs");
+        let region_start = src
+            .find("async fn run_dhan_lane_cold_start")
+            .expect("run_dhan_lane_cold_start must exist");
+        let region_end = src
+            .find("async fn park_running_dhan_lane")
+            .expect("park_running_dhan_lane must exist");
+        let region = &src[region_start..region_end];
+        // The Ok-arm gates on the CAS NOT winning Running, then tears down.
+        assert!(
+            region.contains("advance_dhan_lane(LaneEvent::StartSucceeded)\n                    != Some(LaneState::Running)")
+                || region.contains("!= Some(LaneState::Running)"),
+            "the cold-start Ok arm must branch on the StartSucceeded CAS losing the Running race"
+        );
+        assert!(
+            region.contains("teardown_dhan_lane_tasks(handles)"),
+            "on the lost-CAS branch the cold-start must tear down (join) the just-spawned pool, \
+             not park + leak it"
+        );
+        // And the success side-effects (park + the 'Dhan started' notify) live
+        // AFTER the lost-race teardown's early return, i.e. they are reachable
+        // ONLY on the won-CAS path.
+        let park_idx = region
+            .find("park_running_dhan_lane(std::sync::Arc::clone(&ctx), handles)")
+            .expect("the cold-start must still park on the won-CAS path");
+        let teardown_idx = region
+            .find("teardown_dhan_lane_tasks(handles)")
+            .expect("lost-race teardown must exist");
+        assert!(
+            teardown_idx < park_idx,
+            "the lost-race teardown must precede the park (park is the won-CAS-only path)"
+        );
+    }
+
+    #[test]
+    fn teardown_keeps_ws_handles_in_lane_across_the_graceful_drain_await() {
+        // Cancel-safety (hostile-review CRITICAL) source-scan: the WS handles
+        // MUST be `mem::take`n out of `lane` only AFTER the graceful 2s drain
+        // `.await`, never before. Otherwise a mid-drain cancel of this future
+        // (the cold-start lost-CAS branch is concurrently `.abort()`ed by the
+        // supervisor) would drop the moved-out `ws_handles` un-aborted → the WS
+        // pool DETACHES. Keeping them in `lane` until past the await means a
+        // mid-drain drop runs `lane`'s `Drop` abort-floor instead.
+        let src = include_str!("main.rs");
+        let fn_start = src
+            .find("async fn teardown_dhan_lane_tasks")
+            .expect("teardown_dhan_lane_tasks must exist");
+        let fn_end = src[fn_start..]
+            .find("\n// ===")
+            .map(|i| fn_start + i)
+            .unwrap_or(src.len());
+        let body = &src[fn_start..fn_end];
+        let sleep_idx = body
+            .find(
+                "tokio::time::sleep(std::time::Duration::from_secs(WS_GRACEFUL_DRAIN_SLEEP_SECS)).await",
+            )
+            .expect("the graceful WS drain await must exist");
+        let take_idx = body
+            .find("std::mem::take(&mut lane.ws_handles)")
+            .expect("ws_handles must be taken out of lane (not destructured)");
+        assert!(
+            sleep_idx < take_idx,
+            "ws_handles must be taken out of `lane` ONLY AFTER the graceful drain await, so a \
+             mid-drain cancel triggers lane's Drop abort-floor instead of detaching the pool"
+        );
+    }
+
+    #[test]
+    fn dhan_lane_run_handles_has_drop_impl_aborting_pool() {
+        // H8 no-leak floor source-scan: `DhanLaneRunHandles` MUST implement Drop
+        // and that Drop MUST abort the ws pool handles (so an unexpected drop can
+        // never DETACH a live WS pool). Pins the defense-in-depth guard.
+        let src = include_str!("main.rs");
+        assert!(
+            src.contains("impl Drop for DhanLaneRunHandles"),
+            "DhanLaneRunHandles must implement Drop (the H8 no-leak floor)"
+        );
+        let drop_start = src
+            .find("impl Drop for DhanLaneRunHandles")
+            .expect("Drop impl must exist");
+        let drop_region = &src[drop_start..drop_start + 1200];
+        assert!(
+            drop_region.contains("for handle in &self.ws_handles")
+                && drop_region.contains(".abort()"),
+            "the Drop impl must abort every ws_handle so the WS pool cannot detach"
+        );
+        assert!(
+            drop_region.contains("self.shutdown_notify.notify_waiters()"),
+            "the Drop impl must fire the shutdown notify (stop the pool watchdog)"
+        );
+    }
+
+    #[tokio::test]
+    async fn dhan_lane_run_handles_drop_aborts_handles() {
+        // Behavioural proof of the H8 floor: a never-completing spawned task held
+        // in `ws_handles` is ABORTED (finished) shortly after the
+        // `DhanLaneRunHandles` is dropped — i.e. Drop tears down rather than
+        // detaches. Uses an abort_handle to observe finishedness after the drop.
+        let never = tokio::spawn(async {
+            std::future::pending::<()>().await;
+            Ok(())
+        });
+        let abort_handle = never.abort_handle();
+        assert!(
+            !abort_handle.is_finished(),
+            "task should be running before drop"
+        );
+
+        let handles = super::DhanLaneRunHandles {
+            ws_handles: vec![never],
+            processor_handle: None,
+            renewal_handle: None,
+            order_update_handle: None,
+            order_update_auth_listener_handle: None,
+            trading_handle: None,
+            token_health_handle: None,
+            token_health_gauge_handle: None,
+            mid_session_watchdog_handle: None,
+            token_sweep_handle: None,
+            periodic_health_handle: None,
+            midnight_rollover_handle: None,
+            prev_oi_refresh_handle: None,
+            pool_watchdog_handle: None,
+            ip_monitor_handle: None,
+            ip_monitor_shutdown: None,
+            heartbeat_watchdog_handle: None,
+            health: None,
+            feed_health: None,
+            ws_pool_arc: None,
+            shutdown_notify: std::sync::Arc::new(tokio::sync::Notify::new()),
+            lane_halt_notify: None,
+            instance_lock_heartbeat: None,
+            instance_lock_shutdown: None,
+            heartbeat_bridge_handle: None,
+        };
+        drop(handles);
+
+        // Give the runtime a moment to process the abort.
+        for _ in 0..50 {
+            if abort_handle.is_finished() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(
+            abort_handle.is_finished(),
+            "dropping DhanLaneRunHandles must abort (not detach) the live ws pool task"
+        );
+    }
+
+    /// BUG-1 ratchet (2026-07-05): the graceful teardown must bound-await
+    /// the dual-instance lock heartbeat so the SSM DeleteParameter release
+    /// LANDS before process exit. Live proof this regression class is real:
+    /// the 15:35 IST 2026-07-05 graceful EOD stop left the lock in SSM
+    /// (the 17:59 boot found it stale at age 8622s); a Stop→Start inside
+    /// the 90s TTL HALTs with RESILIENCE-01.
+    #[test]
+    fn ratchet_teardown_bound_awaits_instance_lock_release() {
+        let src = include_str!("main.rs");
+        let teardown_start = src
+            .find("async fn teardown_dhan_lane_tasks(")
+            .expect("teardown_dhan_lane_tasks must exist");
+        let teardown_end = src[teardown_start..]
+            // \u{7d} is a brace-balanced escape for the closing-brace char: the
+            // banned-pattern hook counts raw braces (incl. string literals) to
+            // skip the test module; a bare closing brace in a literal derails it.
+            .find("\n\u{7d}\n")
+            .map(|o| teardown_start + o)
+            .expect("teardown_dhan_lane_tasks must have a body end");
+        let body = &src[teardown_start..teardown_end];
+        // Direct permit-storing wake (Rule 16 lost-wake safe) — never rely
+        // only on the notify_waiters bridge.
+        assert!(
+            body.contains("lane.instance_lock_shutdown.take()")
+                && body.contains("shutdown.notify_one()"),
+            "teardown must directly notify_one() the instance-lock heartbeat's shutdown Notify"
+        );
+        // Bounded await of the heartbeat handle (the release round-trip).
+        assert!(
+            body.contains("lane.instance_lock_heartbeat.take()")
+                && body.contains("INSTANCE_LOCK_RELEASE_TIMEOUT_SECS"),
+            "teardown must bound-await the instance-lock heartbeat JoinHandle \
+             (tokio::time::timeout(INSTANCE_LOCK_RELEASE_TIMEOUT_SECS, handle)) \
+             so the SSM release lands before process exit"
+        );
+        // The handle must actually ride into the lane struct from the
+        // boot-ON construction site (not stay a dropped local).
+        assert!(
+            src.contains("instance_lock_heartbeat: instance_lock_handle"),
+            "start_dhan_lane must thread the heartbeat JoinHandle into DhanLaneRunHandles"
+        );
+        // The old drop-at-spawn binding must never come back. (Needle
+        // assembled at runtime so this test's own source never self-matches.)
+        let dropped_binding = format!("let _instance_lock_handle = {}", "instance_lock_handle;");
+        assert!(
+            !src.contains(&dropped_binding),
+            "the heartbeat JoinHandle must not be silently dropped at spawn time \
+             (that is exactly the race that leaked the SSM lock on graceful stop)"
+        );
+        // Bound sanity: short enough to never hang a Ctrl-C exit.
+        assert!(
+            INSTANCE_LOCK_RELEASE_TIMEOUT_SECS >= 1 && INSTANCE_LOCK_RELEASE_TIMEOUT_SECS <= 10,
+            "the release bound must stay a short, non-hanging shutdown wait"
+        );
+    }
+
+    /// BUG-2 ratchet (2026-07-05): `dhan_lane_running` + the PR-2
+    /// `dhan_pool_present` sentinel are set ONLY at the pool-spawn sites —
+    /// never from the bare `feeds.dhan_enabled` config flag. A
+    /// non-trading-day boot skips the pool and must stay enabled-but-idle
+    /// (live proof: the 2026-07-05 Saturday boot logged "WebSocket pool
+    /// skipped — non-trading day" yet reported dhan_running:true).
+    #[test]
+    fn ratchet_dhan_running_marked_only_at_pool_spawn() {
+        let src = include_str!("main.rs");
+        // The early feeds block (seeding the FSM) must NOT mark the flags.
+        let feeds_block_start = src
+            .find("if feeds.dhan_enabled \u{7b}")
+            .expect("the early dhan_enabled boot block must exist");
+        let feeds_block_end = feeds_block_start
+            + src[feeds_block_start..]
+                .find("\n    \u{7d}\n")
+                .expect("the early dhan_enabled boot block must close");
+        let feeds_block = &src[feeds_block_start..feeds_block_end];
+        assert!(
+            !feeds_block.contains("mark_dhan_lane_running()")
+                && !feeds_block.contains("mark_dhan_pool_present()"),
+            "the early `if feeds.dhan_enabled` block must NOT mark the lane \
+             running / pool present — enabled-at-boot is not pool-built \
+             (non-trading-day boots skip the pool)"
+        );
+        // Both boot-path pool-spawn sites must mark the flags (FAST arm +
+        // slow-arm boot-ON). The distinctive fix-comment marker sits inside
+        // each pool-built branch, right after spawn_websocket_connections;
+        // the runtime cold-start keeps its separate CAS-gated mark.
+        // (Marker assembled at runtime so this test's own source never
+        // self-matches and inflates the count.)
+        let marker = format!(
+            "pool-present sentinel ONLY now that a REAL pool {}",
+            "is spawned"
+        );
+        let mark_sites = src.matches(marker.as_str()).count();
+        assert!(
+            mark_sites >= 2,
+            "both boot-path pool-spawn branches (FAST arm + slow-arm boot-ON) \
+             must mark running/pool-present at the pool-spawn site; found \
+             {mark_sites} marker(s)"
+        );
+        // The alive signal must treat a deliberately pool-less slow boot as
+        // a completed boot (no false boot-heartbeat page on holidays).
+        assert!(
+            src.contains("dhan_poolless_idle: bool") && src.contains("ws_pool_arc.is_none(),"),
+            "emit_boot_completed_when_feed_live must carry the poolless-idle \
+             input, fed from ws_pool_arc.is_none() on the slow boot path"
+        );
+    }
+
+    #[test]
+    fn gauge_token_headroom_falls_back_to_global_when_no_live_lane() {
+        // D2c (C4) behavioural: with no live lane manager installed (boot-OFF /
+        // Groww-only / pre-start), `gauge_token_headroom_secs` falls back to the
+        // global OnceLock. In an isolated test binary the global is unset, so the
+        // helper returns the `0` "no token" sentinel — the same value the gauges
+        // used before this fix. This proves the fallback arm + the sentinel.
+        let feed_runtime =
+            std::sync::Arc::new(tickvault_api::feed_state::FeedRuntimeState::default());
+        assert!(
+            feed_runtime.live_token_manager().is_none(),
+            "fresh state has no live lane manager (fallback path)"
+        );
+        assert_eq!(
+            super::gauge_token_headroom_secs(&feed_runtime),
+            0,
+            "no live lane + no global → 0 (the pre-fix 'no token' sentinel)"
+        );
+    }
+
+    #[test]
+    fn slo_token_gauge_prefers_live_lane_manager() {
+        // D2c (C4) source-scan ratchet: BOTH PROCESS-level token gauges (the
+        // market-open self-test token-headroom AND the SLO token-freshness) MUST
+        // read via `gauge_token_headroom_secs` (which prefers the LIVE lane-owned
+        // manager) and MUST NOT read the global `OnceLock` directly — otherwise a
+        // runtime stop→re-start would show the dead boot-time manager's headroom on
+        // the exact path D2c targets. The ONLY allowed `global_token_manager()` call
+        // is inside the `gauge_token_headroom_secs` fallback arm.
+        let src = include_str!("main.rs");
+
+        // Both gauges call the shared helper.
+        assert!(
+            src.contains("let token_headroom_secs = gauge_token_headroom_secs(&st_feed_runtime);"),
+            "the self-test token-headroom gauge must read via gauge_token_headroom_secs (live lane preferred)"
+        );
+        assert!(
+            src.contains("let token_secs = gauge_token_headroom_secs(&slo_feed_runtime);"),
+            "the SLO token-freshness gauge must read via gauge_token_headroom_secs (live lane preferred)"
+        );
+
+        // The helper prefers the live lane manager before any global fallback.
+        let helper_start = src
+            .find("fn gauge_token_headroom_secs(")
+            .expect("gauge_token_headroom_secs must exist");
+        let helper_end = src[helper_start..]
+            // \u{7d} is a brace-balanced escape for the closing-brace char: the
+            // banned-pattern hook counts raw braces (incl. string literals) to
+            // skip the test module; a bare closing brace in a literal derails it.
+            .find("\n\u{7d}\n")
+            .map(|rel| helper_start + rel)
+            .expect("gauge_token_headroom_secs must have a body");
+        let helper = &src[helper_start..helper_end];
+        let live_pos = helper
+            .find("feed_runtime.live_token_manager()")
+            .expect("helper must read the live lane manager");
+        let global_pos = helper
+            .find("global_token_manager()")
+            .expect("helper must have the global fallback");
+        assert!(
+            live_pos < global_pos,
+            "the helper must PREFER the live lane manager (read it before the global fallback)"
+        );
+
+        // The global OnceLock must be read ONLY inside the helper's fallback —
+        // never again in the closure bodies (which would re-introduce the bug).
+        // Scope the count to the PRODUCTION region via the shared
+        // `source_scan::production_region` helper (F8, 2026-07-08): unlike
+        // the old before-first-`#[cfg(test)]` prefix, it also covers the
+        // production code AFTER the test module, so a direct global read
+        // landing there can no longer hide from this exactly-once count.
+        let prod_region = tickvault_common::source_scan::production_region(src)
+            .expect("main.rs must have a #[cfg(test)]-gated mod tests module");
+        let direct_global_reads = prod_region.matches("global_token_manager()").count();
+        assert_eq!(
+            direct_global_reads, 1,
+            "global_token_manager() must be read exactly once (the helper fallback); \
+             the two gauge closures must NOT read it directly"
+        );
+    }
+
+    #[test]
+    fn every_lane_not_running_site_clears_the_live_token_manager() {
+        // D2c (C4) clear-completeness ratchet: in the lane supervisor / cold-start /
+        // teardown / watchdog-Halt region, EVERY `set_dhan_lane_running(false)` call
+        // (i.e. every "lane is now Off / not-running" site) MUST be immediately
+        // followed — within a small window — by a `clear_live_token_manager()` call.
+        // Otherwise a failure arm that forgets the clear leaves the health gauges
+        // reading a dead lane's TokenManager during the failed-start backoff — the
+        // exact stale-gauge bug D2c fixes. A future failure arm that omits the clear
+        // fails THIS test (not just the happy-path gauge test).
+        let src = include_str!("main.rs");
+
+        // Scope to the lane control-plane region only (supervisor → run-loop). This
+        // excludes the early `set_live_token_manager` install at boot and any
+        // `#[cfg(test)]` string literals (the test module lives far below run_loop).
+        let region_start = src
+            .find("pub async fn run_dhan_lane_runtime_supervisor")
+            .expect("the lane runtime supervisor must exist");
+        let region_end = src
+            .find("async fn run_process_runloop")
+            .filter(|&o| o > region_start)
+            .expect("run_process_runloop must follow the lane region");
+        let region = &src[region_start..region_end];
+
+        // Every not-running marker in this region must be paired with a clear.
+        let marker = "set_dhan_lane_running(false);";
+        let marker_count = region.matches(marker).count();
+        assert!(
+            marker_count >= 6,
+            "expected the 6 lane-Off sites (3 clean paths + 3 failure arms); found {marker_count} \
+             — a site was removed or the region boundary drifted"
+        );
+
+        // The number of `set_dhan_lane_running(false)` sites and the number of
+        // `clear_live_token_manager()` clears in the region must MATCH — one clear
+        // per not-running site. (Both are O(1) substring counts over the region.)
+        let clear_count = region.matches("clear_live_token_manager();").count();
+        assert_eq!(
+            clear_count, marker_count,
+            "every lane-Off / not-running site ({marker_count}) must have a matching \
+             clear_live_token_manager() ({clear_count}) — a failure arm forgot the clear"
+        );
+
+        // Positional check: each not-running marker is followed by a clear within a
+        // short window (no intervening other marker), so the pairing is genuine and
+        // a clear cannot be "borrowed" from a distant unrelated site.
+        let mut search_from = 0usize;
+        let mut paired = 0usize;
+        while let Some(rel) = region[search_from..].find(marker) {
+            let marker_abs = search_from + rel;
+            let after = &region[marker_abs..];
+            let clear_at = after.find("clear_live_token_manager();");
+            let next_marker_at = after[marker.len()..].find(marker).map(|o| o + marker.len());
+            // A clear must exist after this marker AND occur before the next marker.
+            match (clear_at, next_marker_at) {
+                (Some(c), Some(n)) => assert!(
+                    c < n,
+                    "a lane-Off site at byte {marker_abs} is not followed by a clear before the \
+                     next lane-Off site — the failure arm forgot clear_live_token_manager()"
+                ),
+                (Some(_), None) => {}
+                (None, _) => panic!(
+                    "a lane-Off site at byte {marker_abs} has no following \
+                     clear_live_token_manager() in the lane region"
+                ),
+            }
+            paired += 1;
+            search_from = marker_abs + marker.len();
+        }
+        assert_eq!(
+            paired, marker_count,
+            "every lane-Off marker must be positionally paired with a clear"
+        );
+    }
+
+    /// F10 / F2 (2026-07-08): behavioural pin of the
+    /// `InstanceLockHeartbeatGuard` defuse semantics. `into_parts()` must
+    /// TAKE (not clone) the shutdown Notify out of the guard — a
+    /// `.take()`→`.clone()` mutation would leave the husk armed, so its
+    /// Drop right after the lane construction would `notify_one()` the
+    /// heartbeat's shutdown and RELEASE the SSM dual-instance lock while
+    /// the lane is RUNNING (a peer could then acquire it → real
+    /// dual-session). Conversely, a drop WITHOUT defuse (cancel-mid-Starting
+    /// / Err return) MUST notify so the zombie heartbeat releases.
+    #[tokio::test]
+    async fn instance_lock_heartbeat_guard_defuse_and_drop_semantics() {
+        use std::time::Duration;
+        // (a) Drop WITHOUT defuse → the shutdown gets a stored permit.
+        let shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
+        let handle = tokio::spawn(async {});
+        let guard =
+            super::InstanceLockHeartbeatGuard::new(handle, std::sync::Arc::clone(&shutdown));
+        drop(guard);
+        tokio::time::timeout(Duration::from_millis(200), shutdown.notified())
+            .await
+            .expect(
+                "dropping an un-defused guard must notify_one() the heartbeat \
+                 shutdown (permit-storing graceful SSM release — R8-EDGE-1)",
+            );
+
+        // (b) into_parts() DEFUSES: the husk's Drop must NOT notify.
+        let shutdown2 = std::sync::Arc::new(tokio::sync::Notify::new());
+        let handle2 = tokio::spawn(async {});
+        let guard2 =
+            super::InstanceLockHeartbeatGuard::new(handle2, std::sync::Arc::clone(&shutdown2));
+        let (h, n) = guard2.into_parts(); // husk drops here
+        assert!(
+            h.is_some() && n.is_some(),
+            "into_parts must hand out BOTH the heartbeat handle and its \
+             shutdown Notify for the lane struct's BUG-1 fields"
+        );
+        let stray_permit =
+            tokio::time::timeout(Duration::from_millis(100), shutdown2.notified()).await;
+        assert!(
+            stray_permit.is_err(),
+            "into_parts (defuse) must NOT notify the heartbeat shutdown — a \
+             clone-instead-of-take mutation in into_parts would release the \
+             SSM dual-instance lock while the lane is RUNNING (F10)"
+        );
+        if let Some(h) = h {
+            h.abort();
+        }
+    }
+
+    /// F15 (2026-07-08): the /health token_valid derivation must honor the
+    /// profile-truth flag — a Dhan-KILLED (profile-invalid) but
+    /// locally-unexpired token must read INVALID on /health, mirroring
+    /// tv_token_valid. Kills the `secs > 0`-only regression.
+    #[test]
+    fn test_token_health_writer_valid_honors_profile_truth() {
+        assert!(super::token_health_writer_valid(86_400, true));
+        assert!(
+            !super::token_health_writer_valid(86_400, false),
+            "a Dhan-KILLED token (profile flag false) with local headroom \
+             must read INVALID on /health (F15)"
+        );
+        assert!(
+            !super::token_health_writer_valid(0, true),
+            "the expiry instant is invalid — strictly-greater, fail-closed"
+        );
+        assert!(!super::token_health_writer_valid(0, false));
+        assert!(super::token_health_writer_valid(1, true));
+    }
+
+    /// F4 (2026-07-08): the market-open fire-time gate reads the live Dhan
+    /// flag — never a constant.
+    #[test]
+    fn test_market_open_fire_gate_reads_dhan_flag() {
+        let flag = std::sync::atomic::AtomicBool::new(true);
+        assert!(super::market_open_fire_gate_dhan_enabled(&flag));
+        flag.store(false, std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            !super::market_open_fire_gate_dhan_enabled(&flag),
+            "a disabled Dhan flag must gate the one-shot verdict off (F4)"
+        );
+    }
+
+    /// F17 + F9 (2026-07-08): COMMENT-STRIPPED source-order ratchet for the
+    /// teardown's abort → bounded-join → honest-reset chain. The teardown
+    /// body carries doc/comment mentions of the join-timeout const, so a
+    /// raw `contains`/count scan was satisfiable by comments alone —
+    /// reverting any bounded join to a plain abort stayed green. Stripping
+    /// comments first (shared `source_scan` helper) makes each count a CODE
+    /// count.
+    #[test]
+    fn ratchet_teardown_abort_join_reset_ordering_comment_stripped() {
+        let src = include_str!("main.rs");
+        let stripped = tickvault_common::source_scan::strip_rust_comments(src);
+        let fn_start = stripped
+            .find("async fn teardown_dhan_lane_tasks(")
+            .expect("teardown_dhan_lane_tasks must exist");
+        let fn_end = stripped[fn_start..]
+            // \u{7d} is a brace-balanced escape for the closing-brace char: the
+            // banned-pattern hook counts raw braces (incl. string literals) to
+            // skip the test module; a bare closing brace in a literal derails it.
+            .find("\n\u{7d}\n")
+            .map(|o| fn_start + o)
+            .expect("teardown_dhan_lane_tasks must have a body end");
+        let flat: String = stripped[fn_start..fn_end]
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        // (a) exactly FOUR bounded joins on the shared 5s bound, in CODE
+        // (comments stripped): token-health writer, gauge poller, renewal
+        // loop (AG5-R2-3 / R3-1), pool watchdog (F14).
+        let join_needle = "from_secs(LANE_HEALTH_TASK_JOIN_TIMEOUT_SECS)";
+        let join_offsets: Vec<usize> = {
+            let mut offs = Vec::new();
+            let mut from = 0usize;
+            while let Some(rel) = flat[from..].find(join_needle) {
+                offs.push(from + rel);
+                from += rel + join_needle.len();
+            }
+            offs
+        };
+        assert_eq!(
+            join_offsets.len(),
+            4,
+            "teardown_dhan_lane_tasks must bound-join exactly 4 handles on \
+             LANE_HEALTH_TASK_JOIN_TIMEOUT_SECS (token-health writer, gauge \
+             poller, renewal loop, pool watchdog) — a comment mention can \
+             no longer stand in for a reverted join (F9/F17); found {}",
+            join_offsets.len()
+        );
+        // (b) ordering: the three token-side joins precede the honest
+        // 0/0.0 gauge reset; the pool-watchdog join follows it but precedes
+        // the honest websocket/feed-health reset.
+        let gauge_reset = flat
+            .find("gauge!(\"tv_token_remaining_seconds\").set(0.0)")
+            .expect("teardown must publish the honest 0.0 gauge reset");
+        assert!(
+            join_offsets[2] < gauge_reset,
+            "all three token-side bounded joins must PRECEDE the honest \
+             gauge reset — a late writer iteration could otherwise \
+             republish stale values after it (AG5-R2-3/R3-1)"
+        );
+        assert!(
+            join_offsets[3] > gauge_reset,
+            "the 4th bounded join is the step-3 pool-watchdog join and \
+             belongs AFTER the token-block reset (teardown step order)"
+        );
+        let ws_reset = flat
+            .find("health.set_websocket_connections(0)")
+            .expect("teardown must publish the honest lane-off ws count (F14)");
+        assert!(
+            join_offsets[3] < ws_reset,
+            "the pool-watchdog bounded join must PRECEDE the honest \
+             websocket/feed-health reset — an in-flight watchdog tick could \
+             otherwise rewrite the surfaces after the reset (F14)"
+        );
+        // (c) budget honesty (F16): the compile-time worst-case sum counts
+        // FOUR joins.
+        assert!(
+            super::DHAN_LANE_TEARDOWN_INTERNAL_WORST_CASE_SECS
+                >= 4 * super::LANE_HEALTH_TASK_JOIN_TIMEOUT_SECS,
+            "the teardown internal worst-case sum must account for all 4 \
+             bounded joins (F14/F16)"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// I12 (2026-04-21): Auto-diagnostic for pre-market profile HALT.
+//
+// When `pre_market_check` fails, the operator previously had to run two
+// curl commands manually to find out WHY (dataPlan / segment / token /
+// IP allowlist). This helper fetches both endpoints directly and
+// returns a short human-readable summary to embed in the CRITICAL
+// Telegram message. Secrets (token + raw IP) are redacted — the output
+// is safe to stream to Telegram.
+// ---------------------------------------------------------------------------
+
+/// Fetches `/v2/profile` and `/v2/ip/getIP` and formats a summary
+/// suitable for the CRITICAL `PreMarketProfileCheckFailed` Telegram body.
+///
+/// Never panics. Every failure path is captured in the returned String
+/// so the operator always gets back SOMETHING — even if both endpoints
+/// are down. Timeout per endpoint is 5 seconds; total worst case ~10 s
+/// before the boot sequence proceeds to the HALT.
+// TEST-EXEMPT: requires live Dhan `/v2/profile` + `/v2/ip/getIP` HTTP; behaviour exercised by the ratchet test `test_premarket_halt_auto_diagnoses_profile_and_ip` above plus production smoke on the first HALT.
+async fn build_pre_market_diagnostics(
+    token_manager: &std::sync::Arc<tickvault_core::auth::TokenManager>,
+    rest_api_base_url: &str,
+) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+    let _ = writeln!(out, "--- Diagnostic snapshot (auto-fetched) ---");
+
+    match token_manager.get_user_profile().await {
+        Ok(profile) => {
+            let _ = writeln!(
+                out,
+                "/v2/profile: dataPlan={:?}  activeSegment={:?}  tokenValidity={:?}",
+                profile.data_plan, profile.active_segment, profile.token_validity
+            );
+        }
+        Err(e) => {
+            // The error `Display` already redacts query params via the
+            // REST client's own sanitiser, so it's safe to include here.
+            let _ = writeln!(out, "/v2/profile: ERROR {e}");
+        }
+    }
+
+    // For /v2/ip/getIP we need the access token — pull it from the
+    // token handle (O(1) arc-swap read).
+    let token_guard = token_manager.token_handle().load();
+    if let Some(token_state) = token_guard.as_ref().as_ref() {
+        use secrecy::ExposeSecret;
+        let access_token = token_state.access_token().expose_secret().to_string();
+        match tickvault_core::network::ip_verifier::get_ip(rest_api_base_url, &access_token).await {
+            Ok(ip) => {
+                // Redact all but the last octet of the IP for privacy.
+                let redacted_ip = redact_ip_last_octet(&ip.ip);
+                let _ = writeln!(
+                    out,
+                    "/v2/ip/getIP: ip={redacted_ip}  ipFlag={:?}  modifyDatePrimary={:?}",
+                    ip.ip_flag, ip.modify_date_primary
+                );
+            }
+            Err(e) => {
+                let _ = writeln!(out, "/v2/ip/getIP: ERROR {e}");
+            }
+        }
+    } else {
+        let _ = writeln!(
+            out,
+            "/v2/ip/getIP: SKIPPED (no access token available for diagnostic call)"
+        );
+    }
+    out
+}
+
+/// Redacts all but the last octet of an IPv4 address for safe Telegram
+/// embedding. IPv6 just returns a coarse "xxxx:...:last" form.
+// TEST-EXEMPT: trivial redaction wrapper exercised inline by the ratchet
+// test below.
+fn redact_ip_last_octet(raw: &str) -> String {
+    // IPv4 path
+    if let Some((prefix, last)) = raw.rsplit_once('.') {
+        // Replace prefix with "x.x.x"
+        let _ = prefix; // suppress unused-var
+        return format!("x.x.x.{last}");
+    }
+    // IPv6 path — keep only the last group
+    if let Some((_, last)) = raw.rsplit_once(':') {
+        return format!("x:...:{last}");
+    }
+    // Unknown shape — fully redact
+    "[REDACTED]".to_string()
+}
+
+// Process-global once-guard for `spawn_post_market_tasks` (2026-07-02
+// adversarial-sweep fix): the runtime Dhan cold-start path
+// (`run_dhan_lane_cold_start` → `start_dhan_lane`) re-invokes
+// `spawn_post_market_tasks` on EVERY disable→enable cycle, and the spawned
+// tasks are bare `tokio::spawn`s not owned by `DhanLaneRunHandles` — so N
+// enable cycles before the guard accumulated N duplicate task families
+// (N EOD digests, N cross-verifies, N orphan watchdogs). First caller wins;
+// later calls log INFO and return.
+//
+// 2026-07-13 (Phase A FIX 4): the guard static moved into the lib —
+// `tickvault_app::dhan_rest_stack::claim_post_market_task_family_once()` —
+// because the Dhan REST-only stack's Phase 5 spawns the SAME canary/spot/
+// chain family and must claim the SAME guard. INVARIANT: the Dhan-REST
+// scheduled task family is spawned at most once per process, whichever
+// path (lane or REST-only stack) claims first — a future relaxation of the
+// runtime cold-start refusal can never double-spawn canary/spot/chain.
+
+/// Spawn the scheduled daily tasks — the 15:25 IST orphan-position watchdog,
+/// end-of-day digest (15:31:30 IST), the 1-minute cross-verify (15:31:00 IST),
+/// and the REST-health canary (09:05 / 12:00 / 15:25 IST — DHAN-REST-400,
+/// 2026-06-10). Called from BOTH boot paths so a mid-session fast-boot restart
+/// runs them too (boot-symmetry, 2026-06-09); a process-global once-guard makes
+/// repeat calls (runtime Dhan cold-start cycles) no-ops so the family is never
+/// duplicated. Each spawned task self-skips if past its IST trigger(s) or on a
+/// non-trading day, so calling this from a late/non-trading boot is safe
+/// (no-op). NOTE: these tasks are Dhan-REST-dependent (token + client-id); the
+/// feed-agnostic 15:40 tick-conservation audit was HOISTED to the
+/// process-global prefix (`spawn_daily_tick_conservation_task`) on 2026-07-02
+/// so it fires in Groww-only sessions too.
+fn spawn_post_market_tasks(
+    notifier: std::sync::Arc<NotificationService>,
+    health_status: SharedHealthStatus,
+    trading_calendar: std::sync::Arc<TradingCalendar>,
+    token_handle: TokenHandle,
+    client_id: String,
+    config: &ApplicationConfig,
+    // 2026-07-03 feed parity: the end-of-day digest names EVERY enabled
+    // market-data feed, built at fire time (15:31:30 IST) from the same
+    // per-feed health registry the feed-control page reads.
+    feed_runtime: std::sync::Arc<tickvault_api::feed_state::FeedRuntimeState>,
+    feed_health: std::sync::Arc<tickvault_common::feed_health::FeedHealthRegistry>,
+) {
+    if !tickvault_app::dhan_rest_stack::claim_post_market_task_family_once() {
+        info!(
+            "post-market tasks already spawned this process — skipping duplicate \
+             (runtime Dhan cold-start re-entry, or the Dhan REST-only stack \
+             already owns the canary/spot/chain family)"
+        );
+        return;
+    }
+    // Phase 0 Item 20 (wired 2026-06-13): supervised 15:25 IST orphan-position
+    // watchdog — the daily open-position safety gate. Alert-only in
+    // sandbox/dry-run (no order/cancel call exists on any path); pages CRITICAL
+    // every day open positions exist (NOT edge-suppressed — it is a compliance
+    // gate). Supervised respawn + busy-loop floor + secret-redacted REST errors
+    // per the 2026-06-13 3-agent adversarial review. Called from BOTH boot
+    // paths (boot-symmetry) so a mid-session restart re-arms it.
+    let _orphan_watchdog_handle =
+        tickvault_app::orphan_position_watchdog_boot::spawn_supervised_orphan_position_watchdog(
+            token_handle.clone(),
+            notifier.clone(),
+            std::sync::Arc::clone(&trading_calendar),
+            config.dhan.rest_api_base_url.clone(),
+            client_id.clone(),
+            config.strategy.dry_run,
+        );
+    // Phase 0 Item 22d (2026-05-15): End-of-day digest at
+    // 15:31:30 IST — 90s after the 15:30 close so the
+    // market-close shutdown signal has settled. Severity::Info
+    // — never pages, only a daily positive ping that the feed
+    // stayed up + token has overnight headroom.
+    //
+    // Audit-findings Rule 3 (market-hours-aware): trading-day
+    // check + skip silently if past 15:31:30 IST (mid-evening
+    // boot legitimately runs past this point).
+    //
+    // Operator-charter §G: plain-English action line when the
+    // JWT will expire before tomorrow's opening bell.
+    {
+        let eod_notifier = notifier.clone();
+        let eod_health = health_status.clone();
+        let eod_calendar = std::sync::Arc::clone(&trading_calendar);
+        let eod_feed_runtime = std::sync::Arc::clone(&feed_runtime);
+        let eod_feed_health = std::sync::Arc::clone(&feed_health);
+        let eod_main_feed_total = tickvault_common::config::effective_main_feed_pool_size(
+            config.subscription.scope,
+            config.dhan.max_websocket_connections,
+        );
+        tokio::spawn(async move {
+            use chrono::{FixedOffset, NaiveTime, TimeZone, Utc};
+            use tickvault_common::constants::IST_UTC_OFFSET_SECONDS;
+            let Some(ist_offset) = FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS) else {
+                return;
+            };
+            let now_ist = ist_offset.from_utc_datetime(&Utc::now().naive_utc());
+            let today_ist = now_ist.date_naive();
+            if !eod_calendar.is_trading_day(today_ist) {
+                info!("end-of-day digest: skipping (non-trading day)");
+                return;
+            }
+            let Some(target) = NaiveTime::from_hms_opt(15, 31, 30) else {
+                return;
+            };
+            let now_time = now_ist.time();
+            if now_time >= target {
+                // Mid-evening boot past 15:31:30 — skip silently
+                // (audit-findings Rule 3).
+                debug!(
+                    now = %now_time,
+                    "end-of-day digest: skipping (past 15:31:30 — mid-evening boot)"
+                );
+                return;
+            }
+            let secs_until = (target - now_time).num_seconds().max(0) as u64;
+            info!(secs_until, "end-of-day digest: sleeping until 15:31:30 IST");
+            tokio::time::sleep(std::time::Duration::from_secs(secs_until)).await;
+
+            let main_active = eod_health.websocket_connections() as usize;
+            let token_hours = eod_health.token_remaining_secs() / 3600;
+            let trading_date_ist = today_ist.format("%Y-%m-%d").to_string();
+            info!(
+                main_feed = main_active,
+                token_remaining_hours = token_hours,
+                trading_date = %trading_date_ist,
+                "PROOF: end-of-day digest fired @ 15:31:30 IST"
+            );
+            eod_notifier.notify(NotificationEvent::EndOfDayDigest {
+                trading_date_ist,
+                main_feed_active: main_active,
+                main_feed_total: eod_main_feed_total,
+                token_remaining_hours: token_hours,
+                // 2026-07-03 feed parity: one line per enabled feed
+                // (Dhan, Groww, future) built at digest fire time.
+                feeds: build_feed_status_lines(&eod_feed_runtime, &eod_feed_health),
+            });
+        });
+    }
+
+    // Operator directive 2026-06-02: post-market 1-minute
+    // cross-verification at 15:31:00 IST. For every subscribed SPOT
+    // instrument, compare our live `candles_1m` OHLCV against Dhan's
+    // authoritative intraday 1-minute candles, EXACT match, and write
+    // mismatches to the unified `feed_parity_1m_audit` table + a per-day CSV
+    // (`data/cross-verify/`). The per-day mismatch COUNT is the quality
+    // signal. Cold path, fail-soft, market-hours-gated (audit Rule 3).
+    if let Some(cv_universe) = tickvault_app::prev_day_ohlcv_boot::stashed_universe() {
+        // Build owned spot targets HERE (universe Arc in scope) so the
+        // task doesn't hold the Arc. Skip rows with an unparseable SID.
+        let cv_targets: Vec<tickvault_app::cross_verify_1m_boot::CrossVerifyTarget> = cv_universe
+            .subscription_targets
+            .iter()
+            .filter_map(|t| {
+                // §36 (2026-07-08): the 15:31 cross-verify stays SPOT-ONLY by
+                // construction — `instrument_type_for_role` returns None for
+                // IndexFuture targets (Dhan-historical FUTIDX UNVERIFIED-LIVE),
+                // so futures never enter the target list; counted, not silent.
+                let Some(instrument) =
+                    tickvault_app::prev_day_ohlcv_boot::instrument_type_for_role(t.role)
+                else {
+                    metrics::counter!("tv_cross_verify_futidx_skipped_total").increment(1);
+                    return None;
+                };
+                t.csv_row.security_id.trim().parse::<i64>().ok().map(|sid| {
+                    tickvault_app::cross_verify_1m_boot::CrossVerifyTarget {
+                        security_id: sid,
+                        segment: t.csv_row.segment.trim().to_string(),
+                        symbol: t.csv_row.symbol_name.trim().to_string(),
+                        instrument,
+                    }
+                })
+            })
+            .collect();
+        let cv_token = std::sync::Arc::clone(&token_handle);
+        let cv_qcfg = config.questdb.clone();
+        let cv_base = config.dhan.rest_api_base_url.clone();
+        let cv_calendar = std::sync::Arc::clone(&trading_calendar);
+        // Visibility directive 2026-06-10: the INNER task runs the
+        // verification and returns a typed outcome; the OUTER supervisor
+        // turns that outcome into the typed Telegram event so the daily
+        // summary can never be silently dropped. Outcome contract:
+        //   Ok(Some((date, summary))) → the run happened → summary event
+        //   Ok(None)                  → legitimate skip (non-trading day /
+        //                               past-trigger boot / no targets)
+        //   Err(reason)               → internal failure → Aborted event
+        //   JoinError::is_panic()     → task crashed → Aborted event
+        //   JoinError cancelled       → graceful shutdown — no page
+        let cv_inner = tokio::spawn(async move {
+            use chrono::{FixedOffset, TimeZone, Timelike, Utc};
+            use tickvault_app::cross_verify_1m_boot::{
+                CrossVerifyStart, decide_cross_verify_start,
+            };
+            use tickvault_common::constants::IST_UTC_OFFSET_SECONDS;
+            let Some(ist_offset) = FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS) else {
+                // Effectively unreachable (constant offset) — surfaced as
+                // an abort, never a silent skip.
+                return Err("IST offset construction failed");
+            };
+            let now_ist = ist_offset.from_utc_datetime(&Utc::now().naive_utc());
+            let today_ist = now_ist.date_naive();
+            if cv_targets.is_empty() {
+                info!("cross_verify_1m: no spot targets — skipping");
+                return Ok(None);
+            }
+            // Operator on-demand override: `make cross-verify-now` sets
+            // TICKVAULT_CROSS_VERIFY_NOW=1 to run the verification right
+            // now (proving the pipeline without waiting for 15:31 IST on
+            // a live trading day). Fail-soft: a forced run on a quiet day
+            // just yields an empty/degraded report, never fabricated data
+            // (and the summary event renders it honestly as
+            // "nothing could be compared", never a green PASS).
+            let force_now = std::env::var("TICKVAULT_CROSS_VERIFY_NOW")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+            let now_secs_of_day = now_ist.time().num_seconds_from_midnight();
+            let is_trading_day = cv_calendar.is_trading_day(today_ist);
+            match decide_cross_verify_start(now_secs_of_day, is_trading_day, force_now) {
+                CrossVerifyStart::SkipNonTradingDay => {
+                    info!("cross_verify_1m: skipping (non-trading day)");
+                    return Ok(None);
+                }
+                CrossVerifyStart::SkipPastTrigger => {
+                    debug!(
+                        now = %now_ist.time(),
+                        "cross_verify_1m: skipping (past 15:31 — mid-evening boot)"
+                    );
+                    return Ok(None);
+                }
+                CrossVerifyStart::RunNow => {
+                    info!(
+                        "cross_verify_1m: TICKVAULT_CROSS_VERIFY_NOW set — running \
+                                 on-demand NOW (operator dry-run)"
+                    );
+                }
+                CrossVerifyStart::SleepThenRun(secs_until) => {
+                    info!(secs_until, "cross_verify_1m: sleeping until 15:31:00 IST");
+                    tokio::time::sleep(std::time::Duration::from_secs(secs_until)).await;
+                }
+            }
+
+            // IST-midnight-as-epoch nanos (our candles_1m `ts` stores
+            // IST wall-clock as an epoch — data-integrity.md). The day
+            // window for the SELECT is [midnight, midnight+24h).
+            let day_start_secs = today_ist
+                .and_hms_opt(0, 0, 0)
+                .map(|dt| dt.and_utc().timestamp())
+                .unwrap_or(0);
+            let day_start_ist_nanos = day_start_secs.saturating_mul(1_000_000_000);
+            let run_ts_ist_nanos = Utc::now()
+                .timestamp()
+                .saturating_add(i64::from(IST_UTC_OFFSET_SECONDS))
+                .saturating_mul(1_000_000_000);
+
+            let summary = tickvault_app::cross_verify_1m_boot::run_cross_verify_1m(
+                &cv_targets,
+                cv_token,
+                cv_qcfg,
+                cv_base,
+                today_ist,
+                day_start_ist_nanos,
+                run_ts_ist_nanos,
+                tickvault_app::cross_verify_1m_boot::default_csv_dir(),
+            )
+            .await;
+            info!(
+                instruments = summary.instruments_checked,
+                compared = summary.stats.compared,
+                mismatches = summary.stats.mismatches,
+                missing = summary.stats.missing_ours,
+                degraded = summary.degraded,
+                "PROOF: cross_verify_1m fired @ 15:31:00 IST"
+            );
+            Ok(Some((today_ist, summary)))
+        });
+        let cv_notifier = notifier.clone();
+        tokio::spawn(async move {
+            match cv_inner.await {
+                Ok(Ok(Some((cv_date, summary)))) => {
+                    // The once-per-day deliverable (visibility directive
+                    // 2026-06-10). Severity is data-dependent inside the
+                    // event: Info only on a clean compared>0 run.
+                    cv_notifier.notify(NotificationEvent::CrossVerify1mSummary {
+                        trading_date_ist: cv_date.format("%Y-%m-%d").to_string(),
+                        instruments: summary.instruments_checked,
+                        compared: summary.stats.compared,
+                        mismatches: summary.stats.mismatches,
+                        missing: summary.stats.missing_ours,
+                        degraded: summary.degraded,
+                    });
+                }
+                // Legitimate skip — already logged by the inner task.
+                Ok(Ok(None)) => {}
+                Ok(Err(reason)) => {
+                    error!(reason, "cross_verify_1m: task failed before running");
+                    cv_notifier.notify(NotificationEvent::CrossVerify1mAborted {
+                        detail: reason.to_string(),
+                    });
+                }
+                Err(join_err) if join_err.is_panic() => {
+                    error!(
+                        %join_err,
+                        "cross_verify_1m: task crashed before producing the daily summary"
+                    );
+                    cv_notifier.notify(NotificationEvent::CrossVerify1mAborted {
+                        detail: format!("the check task crashed: {join_err}"),
+                    });
+                }
+                Err(_) => {
+                    // Cancellation during graceful shutdown (16:30 IST
+                    // auto-stop, `make stop`) — normal teardown, NOT an
+                    // abort. No page.
+                    info!("cross_verify_1m: task cancelled during shutdown");
+                }
+            }
+        });
+        info!("cross_verify_1m: post-market verification task spawned");
+    }
+
+    // Operator task DHAN-REST-400 (2026-06-10): REST-health canary — one
+    // cheap GET /v2/profile at 09:05 / 12:00 / 15:25 IST on trading days.
+    // On non-2xx it pages HIGH (REST-CANARY-01) with the HTTP status, the
+    // exact final URL (token-redacted) and the bounded secret-redacted
+    // response body — so an 08:45-class REST death is known by 09:05, not
+    // discovered at 15:33 by the cross-verify. Spawned from BOTH boot paths
+    // (this fn is the shared site); self-skips on non-trading days and when
+    // booted past 15:25 IST (audit Rule 3).
+    {
+        let canary_token = std::sync::Arc::clone(&token_handle);
+        let canary_base = config.dhan.rest_api_base_url.clone();
+        let canary_calendar = std::sync::Arc::clone(&trading_calendar);
+        tokio::spawn(async move {
+            use chrono::{FixedOffset, TimeZone, Timelike, Utc};
+            use tickvault_common::constants::IST_UTC_OFFSET_SECONDS;
+            let Some(ist_offset) = FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS) else {
+                return;
+            };
+            let now_ist = ist_offset.from_utc_datetime(&Utc::now().naive_utc());
+            let is_trading_day = canary_calendar.is_trading_day(now_ist.date_naive());
+            tickvault_app::rest_canary_boot::run_rest_canary(
+                canary_token,
+                canary_base,
+                is_trading_day,
+                now_ist.time().num_seconds_from_midnight(),
+            )
+            .await;
+        });
+        info!("rest_canary: REST-health probe task spawned (09:05 / 12:00 / 15:25 IST)");
+    }
+
+    // Operator grant 2026-07-12 (PR-2, the SPOT half): per-minute spot 1m
+    // REST pipeline — every trading-day minute close in [09:16:00, 15:30:00]
+    // IST, fetch the just-closed minute's official 1m OHLCV for the 3 IDX_I
+    // spot indices via POST /v2/charts/intraday and persist to the
+    // `spot_1m_rest` table (SPOT1M-01/02). Spawned from BOTH boot paths via
+    // this shared Dhan-gated site (Dhan-REST-dependent — token; a Groww-only
+    // session correctly runs none). Config-gated fail-safe: an absent
+    // `[spot_1m_rest]` section disables it. Supervised respawn wrapper;
+    // self-skips on non-trading days / past 15:30 IST (audit Rule 3).
+    // PR-3 (2026-07-12): the spot→chain sequencing signal. Created ONLY
+    // when BOTH halves are enabled — with the chain off, the spot leg's
+    // behaviour stays byte-identical to PR-2 (no sender, no publishes).
+    let (spot_minute_done_tx, spot_minute_done_rx) =
+        if config.spot_1m_rest.enabled && config.option_chain_1m.enabled {
+            let (tx, rx) = tokio::sync::watch::channel::<Option<u32>>(None);
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
+
+    if config.spot_1m_rest.enabled {
+        let _spot1m_supervisor = tickvault_app::spot_1m_rest_boot::spawn_supervised_spot_1m_rest(
+            tickvault_app::spot_1m_rest_boot::Spot1mRestTaskParams {
+                token_handle: std::sync::Arc::clone(&token_handle),
+                notifier: notifier.clone(),
+                calendar: std::sync::Arc::clone(&trading_calendar),
+                questdb: config.questdb.clone(),
+                rest_api_base_url: config.dhan.rest_api_base_url.clone(),
+                minute_done_tx: spot_minute_done_tx,
+                diagnostics_enabled: config.spot_1m_rest.diagnostics,
+                diagnostics_second_probe_secs_of_day_ist: config
+                    .spot_1m_rest
+                    .diagnostics_second_probe_secs_of_day_ist,
+            },
+        );
+        info!(
+            "spot_1m_rest: per-minute spot 1m REST pipeline spawned \
+             (fires each minute close 09:16:00–15:30:00 IST)"
+        );
+    } else {
+        info!("spot_1m_rest: disabled by config — per-minute spot fetch not spawned");
+    }
+
+    // Operator grant 2026-07-12 (PR-3, the OPTION-CHAIN half): per-minute
+    // option-chain pipeline — day-start expirylist warmup, then the full
+    // current-expiry chain for the 3 underlyings each session minute,
+    // sequenced right after the spot leg, persisted to `option_chain_1m`
+    // (CHAIN-01..04). Config-gated DEFAULT-OFF pending the live
+    // entitlement probe; while disabled, `probe_and_report` (default ON)
+    // runs ONE boot-time expirylist probe and reports the verdict via
+    // Telegram — the pipeline NEVER auto-runs on a probe pass (the
+    // operator flips `[option_chain_1m].enabled`). Same shared Dhan-gated
+    // seam + once-guard as the spot leg.
+    {
+        let chain_params = tickvault_app::option_chain_1m_boot::OptionChain1mTaskParams {
+            token_handle: std::sync::Arc::clone(&token_handle),
+            notifier: notifier.clone(),
+            calendar: std::sync::Arc::clone(&trading_calendar),
+            questdb: config.questdb.clone(),
+            rest_api_base_url: config.dhan.rest_api_base_url.clone(),
+            client_id: client_id.clone(),
+            spot_minute_done: spot_minute_done_rx,
+        };
+        if config.option_chain_1m.enabled {
+            let _chain1m_supervisor =
+                tickvault_app::option_chain_1m_boot::spawn_supervised_option_chain_1m(chain_params);
+            info!(
+                "option_chain_1m: per-minute option-chain REST pipeline spawned \
+                 (expirylist warmup, then each minute close right after the spot leg)"
+            );
+        } else if config.option_chain_1m.probe_and_report {
+            // Once-only best-effort probe; its exit is MONITORED so an
+            // unwind-build panic is never silent (release aborts anyway).
+            let probe_handle = tokio::spawn(
+                tickvault_app::option_chain_1m_boot::run_option_chain_1m_probe(chain_params),
+            );
+            tokio::spawn(async move {
+                if let Err(join_err) = probe_handle.await
+                    && !join_err.is_cancelled()
+                {
+                    error!(
+                        code = tickvault_common::error_code::ErrorCode::Chain04ExpirylistFailed
+                            .code_str(),
+                        stage = "probe_task_exit",
+                        ?join_err,
+                        "CHAIN-04: the option-chain entitlement probe task \
+                         died (panic) — no verdict today; tomorrow's boot \
+                         re-probes"
+                    );
+                }
+            });
+            info!(
+                "option_chain_1m: pipeline disabled by config — boot-time \
+                 entitlement probe spawned (verdict via Telegram)"
+            );
+        } else {
+            info!(
+                "option_chain_1m: disabled by config (probe_and_report off) — \
+                 no option-chain REST activity"
+            );
+        }
+    }
 }
 
 /// Daily 15:40 IST tick-conservation audit — PROCESS-GLOBAL (2026-07-02
@@ -3833,6 +5423,32 @@ fn spawn_groww_spot_1m_leg(
     } else {
         (None, None)
     };
+    // PR-4 sequencing + selection handoff: the chain→contract channel +
+    // anchor store exist ONLY when BOTH legs are on (contract-off keeps
+    // the chain leg byte-identical to PR-3). The contract leg DEPENDS on
+    // the chain leg's per-minute anchors — enabled-without-chain is
+    // refused loudly, never a silent anchor-less loop.
+    let contract_enabled = config.groww_contract_1m.enabled && chain_enabled;
+    if config.groww_contract_1m.enabled && !chain_enabled {
+        warn!(
+            code = tickvault_common::error_code::ErrorCode::Spot1m01FetchDegraded.code_str(),
+            stage = "enabled_without_chain",
+            feed = "groww",
+            leg = "contract_1m",
+            "SPOT1M-01: [groww_contract_1m] is enabled but the chain leg \
+             ([groww_option_chain_1m]) is OFF — the contract leg needs the \
+             chain's per-minute ATM anchors; NOT spawned (enable the chain \
+             leg first)"
+        );
+    }
+    let (chain_minute_done_tx, chain_minute_done_rx, contract_anchor_store) = if contract_enabled {
+        let (tx, rx) = tokio::sync::watch::channel::<Option<u32>>(None);
+        let store: tickvault_app::groww_option_chain_1m_boot::GrowwChainAnchorStore =
+            std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        (Some(tx), Some(rx), Some(store))
+    } else {
+        (None, None, None)
+    };
     if config.groww_spot_1m.enabled {
         let _groww_spot1m_supervisor =
             tickvault_app::groww_spot_1m_boot::spawn_supervised_groww_spot_1m(
@@ -3863,6 +5479,8 @@ fn spawn_groww_spot_1m_leg(
                     calendar: std::sync::Arc::clone(trading_calendar),
                     questdb: config.questdb.clone(),
                     spot_minute_done,
+                    minute_done_tx: chain_minute_done_tx,
+                    anchor_store: contract_anchor_store.clone(),
                 },
             );
         info!(
@@ -3870,6 +5488,34 @@ fn spawn_groww_spot_1m_leg(
              (fires each minute close right after the Groww spot fetch; \
              sequential underlying pacing)"
         );
+        // Groww per-contract 1m leg (PR-4, the fill-model leg): sequenced
+        // after the chain fire via the watch signal + fallback timer;
+        // selection = ATM window from the chain's in-memory anchors,
+        // hard-capped per minute. DEFAULT-OFF (depends on the chain leg).
+        if contract_enabled {
+            let _groww_contract1m_supervisor =
+                tickvault_app::groww_contract_1m_boot::spawn_supervised_groww_contract_1m(
+                    tickvault_app::groww_contract_1m_boot::GrowwContract1mTaskParams {
+                        notifier: notifier.clone(),
+                        calendar: std::sync::Arc::clone(trading_calendar),
+                        questdb: config.questdb.clone(),
+                        chain_minute_done: chain_minute_done_rx,
+                        anchor_store: contract_anchor_store,
+                        strikes_each_side: config.groww_contract_1m.strikes_each_side,
+                    },
+                );
+            info!(
+                "groww_contract_1m: Groww per-minute contract candle leg \
+                 spawned (fires each minute close right after the Groww \
+                 chain fetch; ATM-window selection, sequential contract \
+                 pacing)"
+            );
+        } else {
+            info!(
+                "groww_contract_1m: disabled by config — Groww per-minute \
+                 contract fetch not spawned"
+            );
+        }
     } else if config.groww_option_chain_1m.probe_and_report {
         let _groww_chain1m_probe = tokio::spawn(
             tickvault_app::groww_option_chain_1m_boot::run_groww_chain_1m_probe(
@@ -3878,6 +5524,8 @@ fn spawn_groww_spot_1m_leg(
                     calendar: std::sync::Arc::clone(trading_calendar),
                     questdb: config.questdb.clone(),
                     spot_minute_done: None,
+                    minute_done_tx: None,
+                    anchor_store: None,
                 },
             ),
         );
@@ -4331,6 +5979,15 @@ fn spawn_feed_scoreboard_tasks(
                     // FASTER than the 30s stall threshold remain invisible
                     // to both columns on both card sides.
                     let groww_line = to_line("Groww", &summary.groww);
+                    // Groww REST plan PR-5 (operator Quote 2, 2026-07-13):
+                    // the official minute-candle pull digest lines — the
+                    // four canonical feed/leg pairs always render (honest
+                    // "not measured yet" when a source is absent); the
+                    // contract leg lights up automatically once its
+                    // forensics rows land.
+                    let rest_legs = tickvault_app::feed_scoreboard_boot::build_rest_leg_score_lines(
+                        &summary.rest_legs,
+                    );
                     sb_notifier.notify(NotificationEvent::DualFeedDailyScorecard {
                         trading_date_ist: summary.trading_date_ist.clone(),
                         dhan: to_line("Dhan", &summary.dhan),
@@ -4342,6 +5999,8 @@ fn spawn_feed_scoreboard_tasks(
                         restart_partial: summary.restart_partial,
                         dhan_feed_off: summary.dhan_feed_off,
                         groww_feed_off: summary.groww_feed_off,
+                        rest_legs,
+                        rest_legs_read_failed: summary.rest_legs_read_failed,
                     });
                 } else {
                     info!("feed_scoreboard: Telegram disabled — daily rows written only");

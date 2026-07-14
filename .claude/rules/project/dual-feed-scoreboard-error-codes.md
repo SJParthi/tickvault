@@ -291,6 +291,44 @@ Blame can NEVER be blank: `BlameClass` is a 3-variant enum (no `Option`),
 the episode writer takes it by value (compile error without one), the
 classifier is total (`_ => Indeterminate`, proptest-pinned never-panic).
 
+## §2b. 2026-07-13 update — REST 1m pull digest rides the daily card (Groww REST plan PR-5)
+
+The 15:45 aggregation gained an ADDITIVE step 6e (operator Quote 2,
+2026-07-13: *"always clearly note within a second — or within how many
+seconds precisely — we are fetching this live real OHLCV, along with the
+option chain API"*): it reads the day's `rest_fetch_audit` per-fetch
+forensics rows (+ a latency-only fallback from the `spot_1m_rest`
+`close_to_data_ms` per-row column for feeds whose forensics emits have not
+landed — the Dhan spot leg today) and renders one plain-English
+"Official minute candles — how fast after each minute closed" line per
+(feed, leg) on the SAME Telegram card (`RestLegScoreLine` on
+`DualFeedDailyScorecard`). Semantics: prompt pulls (< 60s after close,
+`REST_LEG_LATE_RECOVERY_MS`) feed the nearest-rank p50/p99/max
+distribution; ≥ 60s repairs count "recovered late" (never skewing the
+prompt numbers — the #1499 histogram split applied to the digest);
+`named_gap` rows render "never recovered ⚠️"; 429s sum to "rate-limit
+hits". The four canonical feed/leg pairs ALWAYS render — an absent source
+reads "not measured yet", never a fabricated zero (Rule 11) — and the
+PR-4 contract leg lights up automatically once its forensics rows land
+(the aggregation is generic over the `leg` column). Nothing is persisted:
+the aggregates are recomputed from the durable audit table on every run,
+so backfills/reruns are idempotent by construction and no keep-better
+guard is needed (the PR-C −1-sentinel convention applies at render time).
+New SCOREBOARD-01 degrade stages (log-sink-only, additive — a failure
+flags the card's honest footnote and NEVER touches the episode/coverage/
+lag sections or the daily rows): `rest_leg_read` / `rest_leg_parse` /
+`rest_leg_fallback_read` / `rest_leg_fallback_parse`. Dashboard gauge:
+`tv_rest_leg_close_to_data_p99_ms{feed, leg}` — /metrics-local (NOT
+CloudWatch-shipped; zero alarm/cost impact), same-day runs only, static
+label values via a bounded allowlist. Honest bounds: a box whose
+`rest_fetch_audit` / `spot_1m_rest` table does not exist yet reads the
+read-failure footnote (the ensure-DDL belongs to the legs, not the
+scorecard); the Dhan option-chain line stays "not measured yet" until the
+Dhan forensics follow-up lands (its per-fire histogram is not
+day-drainable). Ratchets:
+`crates/app/tests/rest_leg_digest_wiring_guard.rs` (3 tests) + the
+aggregation/render unit suites in `feed_scoreboard_boot.rs` / `events.rs`.
+
 ## §3. Trigger / auto-load
 
 This rule activates when editing:
@@ -305,4 +343,5 @@ This rule activates when editing:
 - Any file containing `SCOREBOARD-01`, `Scoreboard01`, `feed_scoreboard_daily`,
   `feed_episode_audit`, `feed_coverage_daily`, `classify_episode`,
   `BlameClass`, `StallRestarted`, `STALL_SOURCE_`, `FeedPresenceRegistry`,
-  `record_presence`, or `PresenceRegistration`
+  `record_presence`, `PresenceRegistration`, `RestLegScoreLine`,
+  `aggregate_rest_leg_day`, or `tv_rest_leg_close_to_data_p99_ms`

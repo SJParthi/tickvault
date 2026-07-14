@@ -859,6 +859,10 @@ async fn run_dhan_rest_stack(params: DhanRestStackParams) {
                 questdb: config.questdb.clone(),
                 rest_api_base_url: config.dhan.rest_api_base_url.clone(),
                 minute_done_tx: spot_minute_done_tx,
+                diagnostics_enabled: config.spot_1m_rest.diagnostics,
+                diagnostics_second_probe_secs_of_day_ist: config
+                    .spot_1m_rest
+                    .diagnostics_second_probe_secs_of_day_ist,
             },
         );
         info!(
