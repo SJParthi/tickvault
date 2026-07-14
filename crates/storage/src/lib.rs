@@ -190,6 +190,10 @@ pub mod partition_manager;
 // row-count- and size-verified; gated on [partition_retention]
 // archive_enabled (serde default false).
 pub mod partition_archive;
+// Cluster-C order-side observability (2026-07-14): SEBI 5y order-lifecycle
+// audit — rebuild of the table deleted in #T4 (2026-05-20) on the modern
+// ILP-over-HTTP template with event-in-key DEDUP (AUDIT-06).
+pub mod order_audit_persistence;
 pub mod prev_day_ohlcv_persistence;
 pub mod questdb_health;
 pub mod seal_absorption;
