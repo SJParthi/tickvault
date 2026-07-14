@@ -18,7 +18,7 @@
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use tickvault_common::constants::{DHAN_ERROR_BODY_SCAN_CAP_BYTES, DHAN_ERROR_CODE_MAX_LEN};
+use tickvault_common::constants::DHAN_ERROR_BODY_SCAN_CAP_BYTES;
 use tickvault_common::error_code::ErrorCode;
 
 use super::types::OmsError;
@@ -444,14 +444,17 @@ pub fn extract_dhan_error_code(body: &str) -> Option<&str> {
     Some(&after[..end])
 }
 
-/// `[A-Za-z0-9_-]` only, capped at `DHAN_ERROR_CODE_MAX_LEN` — log-injection
-/// defence for a raw code echoed in a structured log field.
+/// Shape-gated extraction of the Dhan `errorCode` token as an owned `String`,
+/// handling BOTH the quoted (`"errorCode":"DH-905"`) and bare-numeric
+/// (`"errorCode":805`) forms. Reused by `record_dh_error_metric` so DATA-8xx
+/// numeric codes (Dhan sends `{"errorCode":805}`) get a proper closed-set
+/// label instead of `"unknown"`. `None` unless the bounded prefix parses as
+/// the Dhan 3-field shape AND carries an `errorCode`.
 #[must_use]
-pub fn sanitize_error_code(raw: &str) -> String {
-    raw.chars()
-        .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
-        .take(DHAN_ERROR_CODE_MAX_LEN)
-        .collect()
+pub fn extract_dhan_error_code_token(body: &str) -> Option<String> {
+    let prefix = safe_prefix(body, DHAN_ERROR_BODY_SCAN_CAP_BYTES);
+    let parsed = serde_json::from_str::<DhanErrorBody>(prefix).ok()?;
+    parsed.error_code.as_ref().and_then(value_to_code_token)
 }
 
 #[cfg(test)]
@@ -501,14 +504,24 @@ mod tests {
     }
 
     #[test]
-    fn test_sanitize_error_code_strips_injection_and_caps_len() {
-        assert_eq!(sanitize_error_code("DH-905"), "DH-905");
+    fn test_extract_dhan_error_code_token_quoted_and_numeric() {
+        // Quoted string form.
         assert_eq!(
-            sanitize_error_code("DH-905\n\"code=INJECT\r evil"),
-            "DH-905codeINJECTevil"
+            extract_dhan_error_code_token(r#"{"errorCode":"DH-905","errorMessage":"bad"}"#)
+                .as_deref(),
+            Some("DH-905")
         );
-        let long = "A".repeat(100);
-        assert_eq!(sanitize_error_code(&long).len(), DHAN_ERROR_CODE_MAX_LEN);
+        // Bare-numeric form (Dhan sends DATA-8xx as `{"errorCode":805}`).
+        assert_eq!(
+            extract_dhan_error_code_token(r#"{"errorType":"x","errorCode":807}"#).as_deref(),
+            Some("807")
+        );
+        // A WAF/HTML page quoting a code in plain text does not parse → None.
+        assert_eq!(
+            extract_dhan_error_code_token("<html>DH-905 blocked</html>"),
+            None
+        );
+        assert_eq!(extract_dhan_error_code_token(""), None);
     }
 
     // --- classification: codes ---
@@ -977,8 +990,8 @@ mod tests {
             if let Some(code) = extract_dhan_error_code(&body) {
                 proptest::prop_assert!(code.len() < DHAN_ERROR_BODY_SCAN_CAP_BYTES);
             }
-            let sanitized = sanitize_error_code(&body);
-            proptest::prop_assert!(sanitized.len() <= DHAN_ERROR_CODE_MAX_LEN);
+            // The shape-gated token extractor never panics on arbitrary input.
+            let _ = extract_dhan_error_code_token(&body);
         }
 
         #[test]

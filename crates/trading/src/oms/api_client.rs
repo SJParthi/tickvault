@@ -63,8 +63,11 @@ const HTTP_TOO_MANY_REQUESTS: u16 = 429;
 /// This prevents an attacker-controllable label-cardinality bomb (R23) — a
 /// hostile error body can no longer inject arbitrary metric-label values.
 fn record_dh_error_metric(body: &str) {
-    let label: &'static str = super::error_taxonomy::extract_dhan_error_code(body)
-        .and_then(super::error_taxonomy::class_for_code_token)
+    // Shape-gated token extraction handles BOTH the quoted (`"errorCode":"DH-905"`)
+    // and bare-numeric (`"errorCode":805`) forms so DATA-8xx codes (Dhan sends
+    // them numeric) get a proper closed-set label instead of "unknown".
+    let label: &'static str = super::error_taxonomy::extract_dhan_error_code_token(body)
+        .and_then(|token| super::error_taxonomy::class_for_code_token(&token))
         .map(|class| super::error_taxonomy::error_code_for(class).code_str())
         .unwrap_or("unknown");
     metrics::counter!("tv_dhan_error_total", "code" => label).increment(1);
@@ -5432,14 +5435,17 @@ mod tests {
 
     #[test]
     fn test_record_dh_error_metric_label_closed_set_and_unknown() {
-        // The label rebase maps a known code to its code_str, junk to "unknown".
+        // Mirrors record_dh_error_metric's production extraction path exactly
+        // (shape-gated token, quoted + numeric).
         let label = |body: &str| -> String {
-            error_taxonomy::extract_dhan_error_code(body)
-                .and_then(error_taxonomy::class_for_code_token)
+            error_taxonomy::extract_dhan_error_code_token(body)
+                .and_then(|t| error_taxonomy::class_for_code_token(&t))
                 .map(|c| error_taxonomy::error_code_for(c).code_str().to_owned())
                 .unwrap_or_else(|| "unknown".to_owned())
         };
         assert_eq!(label(DH905_BODY), "DH-905");
+        // F-H fix: a bare-numeric DATA code now gets its real label, not "unknown".
+        assert_eq!(label(r#"{"errorType":"x","errorCode":807}"#), "DATA-807");
         assert_eq!(label(r#"{"errorCode":"DH-999"}"#), "unknown");
         assert_eq!(label(r#"{"foo":"bar"}"#), "unknown");
         // record_dh_error_metric must never panic on a hostile / empty body.

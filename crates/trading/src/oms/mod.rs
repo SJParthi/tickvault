@@ -44,7 +44,10 @@ pub mod types;
 pub use api_client::OrderApiClient;
 pub use engine::{OrderManagementSystem, TokenProvider};
 pub use error_taxonomy::{BrokerCooldownLatch, DhanErrorClass, OrderEndpoint, OrderErrorPolicy};
-pub use order_readiness::{OrderReadinessState, ProbeOutcome, ReadinessProbe, ReadinessRefusal};
+pub use order_readiness::{
+    OrderReadinessState, ProbeOutcome, ReadinessProbe, ReadinessRefusal, segment_has_derivative,
+    spawn_order_readiness_refresher,
+};
 pub use rate_limiter::OrderRateLimiter;
 pub use types::{
     ManagedOrder, ModifyOrderRequest, OmsError, PlaceOrderRequest, ReconciliationReport,
