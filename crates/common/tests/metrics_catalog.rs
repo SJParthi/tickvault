@@ -185,11 +185,12 @@ const REQUIRED_METRICS: &[(&str, &str)] = &[
     // tv_backfill_ticks_forwarded_total + tv_backfill_ticks_persisted_total
     // removed with the BackfillWorker deletion on 2026-04-17. See above.
     // --- Session 4 S4-T4 (existing subsystem metrics catalogued for lockdown) ---
-    (
-        "tv_order_update_ws_active",
-        "S4-T4: Binary gauge for the order update WebSocket (1.0 = connected, \
-         0.0 = not). Goes to 0 when the reconnect loop is between retries.",
-    ),
+    // tv_order_update_ws_active REMOVED from the catalog 2026-07-14 (Dhan
+    // noise lock fix round M4): the order-update WS spawn is retired
+    // (scope-lock §A.1), so the gauge write site in the dormant
+    // order_update_connection.rs module has zero reachable callers. The
+    // EMF allowlist + dashboard panel + inactive alarm are removed in
+    // lockstep; re-cataloguing requires the live-trading re-wire quote.
     (
         "tv_order_update_reconnections_total",
         "S4-T4: Reconnection attempt counter for the order update WebSocket.",

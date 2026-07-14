@@ -322,7 +322,7 @@ fn test_deployed_emf_source_labels_match_a_real_series_label() {
 }
 
 #[test]
-fn test_emf_metric_selectors_name_count_is_twenty_seven() {
+fn test_emf_metric_selectors_name_count_is_twenty_six() {
     // Pin the MAIN (host-only) EMF publish list: 19 alarm-backing signals
     // + 2 memory-measurement gauges added 2026-07-02 for the 2K-universe RAM
     // measurement (tv_process_rss_bytes — crates/storage/src/resource_monitor.rs;
@@ -350,15 +350,21 @@ fn test_emf_metric_selectors_name_count_is_twenty_seven() {
     // `tv_feed_sidecar_stall_restart_total` (FEED-STALL-01 stall-kill
     // counter — crates/app/src/groww_sidecar_supervisor.rs). Cost: +3
     // custom metrics ≈ +$0.90/mo per the app-alarms.tf header cost note.
+    // 26 (was 27) since 2026-07-14 (Dhan noise lock fix round, M4): REMOVED
+    // `tv_order_update_ws_active` — the order-update WS spawn is retired
+    // (scope-lock §A.1), so the gauge has zero reachable writers; shipping
+    // a dead name in the EMF list would publish nothing while implying
+    // coverage. Cost: -1 custom metric (~-$0.30/mo).
     let user_data = read("deploy/aws/terraform/user-data.sh.tftpl");
     let names = emf_declared_names(&user_data, "metric_selectors");
     assert_eq!(
         names.len(),
-        27,
-        "Z+ L2 VERIFY ratchet: expected exactly 27 names in the MAIN EMF \
+        26,
+        "Z+ L2 VERIFY ratchet: expected exactly 26 names in the MAIN EMF \
          metric_selectors list (24 post-#1437 groww feed-down alerting + 2 \
          silent-feed lag names 2026-07-06 + 1 groww lag gauge 2026-07-11 \
-         scoreboard PR-C); found {}: {names:?}",
+         scoreboard PR-C - 1 order-update gauge removed 2026-07-14 M4); \
+         found {}: {names:?}",
         names.len()
     );
     for required in [
