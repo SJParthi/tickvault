@@ -52,10 +52,13 @@
 # slots + overnight lead time; the box-start watchdog is the AWS-native
 # (scheduler-independent) deterministic catch.
 #
-# Cost: one job, no checkout, 3 API reads + at most 3 dispatches per firing
+# Cost: one job, no checkout, ~5 API reads + at most 4 dispatches per firing
 # (~30s on ubuntu-latest) — negligible against free-tier minutes. Because the
 # check is head_sha-run-EXISTENCE (not deployed-state), each SHA triggers at most
-# ONE deploy-aws run ever — no overnight rebuild spam.
+# ONE deploy-aws run ever — no overnight rebuild spam. terraform-apply.yml
+# joined the backfill list 2026-07-14 (PR-C3 rider; path-guarded — see the
+# inline note) so a bot-merged terraform change is no longer the last
+# push-suppressed lane without dispatcher coverage.
 name: Post-Merge Catch-up Dispatcher
 
 on:
@@ -99,7 +102,33 @@ jobs:
           # start, independent of the scheduler-drop-fragile deploy-aws-after-close
           # crons (2026-07-09 outage — see header). deploy-aws's OWN market-hours
           # guard + off-hours box-state skip are unchanged; this only TRIGGERS.
-          for wf in ci.yml bench.yml deploy-aws.yml; do
+          #
+          # terraform-apply.yml (added 2026-07-14, PR-C3 rider — merge-gate-lock
+          # §3.1 dated edit): its push trigger is PATH-FILTERED
+          # (deploy/aws/terraform/** + its own workflow file), so a bot-merged
+          # terraform change was the LAST push-suppressed lane with no
+          # dispatcher coverage — the 3 post-close crons are the same
+          # scheduler-drop-fragile class as the 2026-07-09 deploy-aws outage.
+          # Because the path filter makes "zero runs for HEAD" the NORMAL state
+          # for non-terraform merges, the existence check alone would dispatch
+          # an apply run on EVERY merge; the guard below therefore dispatches
+          # ONLY when the HEAD commit actually touched the filtered paths.
+          # Envelope: the commit-files API returns up to 300 files — a >300-file
+          # merge whose terraform change sits past the cap is missed here and
+          # covered by the existing post-close crons (fail-safe direction: a
+          # missed dispatch defers the apply, never doubles it; terraform-apply
+          # is plan-gated + DynamoDB-locked, so extras are free no-ops anyway).
+          tf_touched=$(gh api "repos/${GH_REPO}/commits/${head_sha}"             --jq '[.files[].filename
+                   | select(startswith("deploy/aws/terraform/")
+                            or . == ".github/workflows/terraform-apply.yml")]
+                  | length')
+          echo "terraform-filtered files in HEAD commit: ${tf_touched}"
+
+          for wf in ci.yml bench.yml deploy-aws.yml terraform-apply.yml; do
+            if [ "${wf}" = "terraform-apply.yml" ] && [ "${tf_touched}" -eq 0 ]; then
+              echo "terraform-apply.yml: HEAD commit touched no terraform-filtered paths — skipping (path-filtered lane)"
+              continue
+            fi
             # Any run (any event: push, pull_request, workflow_dispatch,
             # schedule; any status — queued/in_progress/success/failed/
             # cancelled) for this exact SHA counts as covered. So a deploy-aws
