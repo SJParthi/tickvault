@@ -153,13 +153,25 @@ aws-lc-rs = "1.17.0"
 aws-config = { version = "1.8.18", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio", "credentials-process", "sso"] }
 aws-sdk-sns = { version = "1.103.0", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
 aws-sdk-ssm = { version = "1.112.0", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
-# 2026-07-13 (QuestDB partition archive→verify→drop, disk-pressure remediation):
-# S3 PutObject/HeadObject for the verified partition archive to the
-# tv-<env>-cold bucket. Authorized as a workspace dep by the 2026-07-12
-# operator quote recorded in groww-second-feed-scope-2026-06-19.md §37
-# ("The new workspace dep `aws-sdk-s3` ... is authorized ... as the read
-# mechanism") — same SDK family + feature set as the sibling aws-sdk-* pins.
-aws-sdk-s3 = { version = "1.136.0", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
+# 2026-07-12 (BruteX crossverify Commit 2, coordinator-approved): read-only
+# S3 GET/List of the BruteX-produced crossverify CSVs on tv-prod-cold.
+# 1.138.0 is the aws-sdk-s3 whose aws-smithy-* requirements (eventstream
+# 0.61.1 / http 0.64.0 / json 0.63.0 / observability 0.3.0 / schema 0.2.0 /
+# xml 0.61.1 / types 1.6.1 / runtime 1.12.0 / runtime-api 1.13.0 +
+# aws-runtime 1.8.1) match origin/main's Cargo.lock aws family EXACTLY, so
+# the resolved tree carries ZERO duplicate aws-smithy-* crates. (The earlier
+# =1.137.0 pin matched this BRANCH's stale lock family instead; against
+# main's newer family it produced 6 aws-smithy duplicates in cargo-deny
+# bans.) Same feature shape as the sibling SDK crates. The `=` prefix is
+# REQUIRED (deviation from the house bare-version style): a bare version is
+# a caret range, so a future fresh resolution could silently move this dep
+# onto a smithy generation that no longer matches the rest of the lock; the
+# exact `=` requirement keeps the family alignment deliberate.
+# 2026-07-13 merge note: main's QuestDB partition archive→verify→drop
+# (#1504) also uses this SDK (PutObject/HeadObject to tv-<env>-cold) with a
+# caret "1.136.0" requirement — the exact =1.138.0 pin satisfies it; ONE
+# workspace entry serves both consumers.
+aws-sdk-s3 = { version = "=1.138.0", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
 
 # ---- Section 11b: Compression (partition archive) ----
 # 2026-07-13: gzip encoder for the streamed QuestDB /exp CSV export before

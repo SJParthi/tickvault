@@ -419,96 +419,10 @@ fn main_feed_responds_to_dhan_ping_with_bounded_pong() {
 }
 
 // ---------------------------------------------------------------------------
-// (8) No-Live-Ticks-During-Market-Hours watchdog wiring (Parthiban
-// directive 2026-04-21). This watchdog catches the "WS connected but
-// Dhan stopped streaming" silent failure that triggered today's
-// investigation. Ratcheted at four points:
-//   (a) module exists,
-//   (b) heartbeat is updated in the tick processor hot path,
-//   (c) main.rs spawns the watchdog in BOTH boot paths,
-//   (d) the alert event variant is declared CRITICAL severity.
+// (8) RETIRED 2026-07-14 (operator Dhan noise lock —
+// dhan-rest-only-noise-lock-2026-07-14.md): the no-tick watchdog + its
+// NoLiveTicksDuringMarketHours Critical page were DELETED. The watchdog's
+// heartbeat was fed ONLY by the Dhan tick pipeline (retired 2026-07-13);
+// Groww stall detection is FEED-STALL-01 + the market-hours-liveness alarm.
+// The four wiring ratchets that lived here died with the feature.
 // ---------------------------------------------------------------------------
-
-#[test]
-fn no_tick_watchdog_module_exists() {
-    let src = read("crates/core/src/pipeline/no_tick_watchdog.rs");
-    assert!(
-        src.contains("pub fn spawn_no_tick_watchdog"),
-        "no_tick_watchdog module must expose spawn_no_tick_watchdog. \
-         Without it, the silent-data-loss failure mode that hit \
-         2026-04-21 morning has no detector."
-    );
-    assert!(
-        src.contains("NO_TICK_THRESHOLD_SECS"),
-        "no_tick_watchdog must expose a tuneable threshold constant."
-    );
-    // PR #523 (2026-05-09 holiday-gate fix) renamed the helper from
-    // `is_within_market_hours_ist` (time-of-day only) to
-    // `is_within_trading_session_ist` (weekday + time-of-day). Accept either
-    // name so older branches continue to pass; production source must use
-    // the trading-session variant per audit-findings Rule 3.
-    assert!(
-        src.contains("is_within_trading_session_ist()")
-            || src.contains("is_within_market_hours_ist()"),
-        "no_tick_watchdog must use the shared market-hours helper \
-         (Rule 3) — never poll alerts post-market."
-    );
-    assert!(
-        src.contains("currently_alerting"),
-        "no_tick_watchdog must be edge-triggered (Rule 4) — \
-         track currently_alerting state to suppress repeat fires."
-    );
-}
-
-#[test]
-fn tick_processor_updates_heartbeat_on_every_tick() {
-    let src = read("crates/core/src/pipeline/tick_processor.rs");
-    assert!(
-        src.contains("tick_heartbeat: Option<std::sync::Arc<std::sync::atomic::AtomicI64>>"),
-        "tick_processor must accept a tick_heartbeat parameter so the \
-         no-tick watchdog can read the latest tick timestamp."
-    );
-    // Heartbeat update must appear in BOTH Tick and TickWithDepth branches.
-    let store_count = src.matches("hb.store(").count();
-    assert!(
-        store_count >= 2,
-        "tick_processor must update tick_heartbeat in BOTH ParsedFrame::Tick \
-         AND ParsedFrame::TickWithDepth branches (got {store_count} hb.store calls). \
-         Missing one branch = blind spot during depth-only tick periods."
-    );
-}
-
-#[test]
-fn main_rs_spawns_watchdog_in_both_boot_paths() {
-    let src = read("crates/app/src/main.rs");
-    assert!(
-        src.contains("fast_tick_heartbeat"),
-        "main.rs FAST BOOT must construct fast_tick_heartbeat."
-    );
-    assert!(
-        src.contains("slow_tick_heartbeat"),
-        "main.rs SLOW BOOT must construct slow_tick_heartbeat."
-    );
-    let spawn_count = src.matches("spawn_no_tick_watchdog(").count();
-    assert!(
-        spawn_count >= 2,
-        "main.rs must spawn the no-tick watchdog from BOTH fast boot AND \
-         slow boot paths (got {spawn_count} spawn calls). Production runs \
-         take exactly ONE path; missing the spawn in either = blind spot."
-    );
-}
-
-#[test]
-fn no_tick_alert_event_is_critical_severity() {
-    let src = read("crates/core/src/notification/events.rs");
-    assert!(
-        src.contains("NoLiveTicksDuringMarketHours"),
-        "events.rs must declare NoLiveTicksDuringMarketHours variant."
-    );
-    assert!(
-        src.contains("Self::NoLiveTicksDuringMarketHours { .. } => Severity::Critical"),
-        "NoLiveTicksDuringMarketHours must be Critical severity (the \
-         operator MUST be paged immediately — silent data loss during \
-         market hours is the worst-case failure for a trading system)."
-    );
-}
