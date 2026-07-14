@@ -479,7 +479,7 @@ impl EmptyDiagnostics {
 pub fn ist_nanos_minute_label(minute_ist_nanos: i64, trading_date_nanos: i64) -> String {
     let secs_of_day = (minute_ist_nanos.saturating_sub(trading_date_nanos) / NANOS_PER_SEC)
         .clamp(0, i64::from(SECONDS_PER_DAY) - 1);
-    // Clamped into [0, SECONDS_PER_DAY); the cast is safe.
+    // APPROVED: clamped into [0, SECONDS_PER_DAY); the cast is safe.
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     format_minute_ist_12h(secs_of_day as u32)
 }
@@ -1733,7 +1733,20 @@ pub async fn run_spot_1m_rest(params: Spot1mRestTaskParams) {
         // Audit Rule 3: re-read the wall clock + trading-day verdict EVERY
         // iteration (a suspend can cross midnight and stale the verdict).
         if !params.calendar.is_trading_day_today() {
-            info!("spot_1m_rest: no longer a trading day — exiting");
+            // 2026-07-14: loud + coded (was a bare info!) — a mid-session
+            // calendar flip silently stopping a capture leg must be
+            // greppable in errors.jsonl. Log-sink-only, NO Telegram (a
+            // calendar flip is not broker failure); a suspend that
+            // crossed IST midnight is a legitimate cause.
+            metrics::counter!("tv_spot1m_trading_day_flip_exit_total").increment(1);
+            error!(
+                code = ErrorCode::Spot1m01FetchDegraded.code_str(),
+                stage = "trading_day_flip_exit",
+                "SPOT1M-01: the trading-day verdict flipped mid-session — \
+                 exiting today's spot fire loop (a suspend that crossed \
+                 IST midnight is a legitimate cause; remaining minutes \
+                 stay absent, re-fetchable via backfill)"
+            );
             return;
         }
         let now = ist_secs_of_day_now();
@@ -2380,7 +2393,17 @@ async fn run_batch_catchup_loop(
         // Audit Rule 3: re-read the wall clock + trading-day verdict every
         // iteration.
         if !params.calendar.is_trading_day_today() {
-            info!("spot_1m_rest: no longer a trading day — exiting batch loop");
+            // 2026-07-14: loud + coded (was a bare info!) — same class as
+            // the per-minute loop's flip exit; this names the BATCH loop.
+            metrics::counter!("tv_spot1m_trading_day_flip_exit_total").increment(1);
+            error!(
+                code = ErrorCode::Spot1m01FetchDegraded.code_str(),
+                stage = "trading_day_flip_exit",
+                "SPOT1M-01: the trading-day verdict flipped mid-session — \
+                 exiting the batch catch-up loop (a suspend that crossed \
+                 IST midnight is a legitimate cause; remaining cycles \
+                 stay absent, re-fetchable via backfill)"
+            );
             return false;
         }
         let now = ist_secs_of_day_now();

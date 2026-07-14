@@ -1929,7 +1929,20 @@ pub async fn run_option_chain_1m(
         // Audit Rule 3: re-read the wall clock + trading-day verdict EVERY
         // iteration (a suspend can cross midnight and stale the verdict).
         if !params.calendar.is_trading_day_today() {
-            info!("option_chain_1m: no longer a trading day — exiting");
+            // 2026-07-14: loud + coded (was a bare info!) — a mid-session
+            // calendar flip silently stopping a capture leg must be
+            // greppable in errors.jsonl. Log-sink-only, NO Telegram (a
+            // calendar flip is not broker failure); a suspend that
+            // crossed IST midnight is a legitimate cause.
+            metrics::counter!("tv_chain1m_trading_day_flip_exit_total").increment(1);
+            error!(
+                code = ErrorCode::Chain02FetchDegraded.code_str(),
+                stage = "trading_day_flip_exit",
+                "CHAIN-02: the trading-day verdict flipped mid-session — \
+                 exiting today's chain fire loop (a suspend that crossed \
+                 IST midnight is a legitimate cause; remaining minutes \
+                 stay absent, re-fetchable via backfill)"
+            );
             return;
         }
         let now = ist_secs_of_day_now();
