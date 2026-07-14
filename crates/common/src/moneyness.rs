@@ -247,10 +247,14 @@ pub fn price_to_paise_guarded(v: f64) -> Option<i64> {
 /// 24550.00 — matches the captured live ATM ("strike gap 50",
 /// 2026-04-21 dhan-support doc).
 ///
-/// Returns `None` when `spot_paise < 1`, `step_paise ≤ 0`, or the step is
+/// Returns `None` when `spot_paise < 1`, `step_paise ≤ 0`, the step is
 /// odd (defensive: real steps are ₹50/₹100 = 5_000/10_000 paise, both
 /// even; an odd step would make "half" ambiguous and indicates a
-/// corrupted table).
+/// corrupted table), or the grid-rounded result would be 0 — a spot
+/// strictly below half a step (`spot_paise < step_paise/2`, e.g. spot
+/// ₹1.00 on a ₹50 grid — the 2026-07-14 proptest counterexample) has no
+/// positive grid strike to label ATM; fail closed to UNKNOWN, never a
+/// bogus `Some(0)`.
 ///
 /// # Performance
 /// O(1) pure integer arithmetic, zero allocation. With the
@@ -262,7 +266,11 @@ pub fn atm_strike_paise(spot_paise: i64, step_paise: i64) -> Option<i64> {
     if spot_paise < 1 || step_paise <= 0 || step_paise % 2 != 0 {
         return None;
     }
-    Some(((spot_paise + step_paise / 2) / step_paise) * step_paise)
+    let atm = ((spot_paise + step_paise / 2) / step_paise) * step_paise;
+    // A spot below half a step grid-rounds to 0 — not a tradable strike
+    // (grid strikes are positive multiples of the step). Fail closed:
+    // unresolvable ATM → callers classify UNKNOWN (never a bogus Some(0)).
+    if atm < 1 { None } else { Some(atm) }
 }
 
 /// Per-row moneyness classification against a PRECOMPUTED ATM — the
@@ -514,6 +522,20 @@ mod tests {
         assert_eq!(atm_strike_paise(2_453_640, 0), None, "zero step");
         assert_eq!(atm_strike_paise(2_453_640, -5_000), None, "negative step");
         assert_eq!(atm_strike_paise(2_453_640, 4_999), None, "odd step");
+        // Sub-half-step spot (the 2026-07-14 proptest counterexample:
+        // spot ₹1.00 on a ₹50 grid) grid-rounds to 0 — not a strike; None.
+        assert_eq!(atm_strike_paise(100, 5_000), None, "sub-half-step spot");
+        assert_eq!(
+            atm_strike_paise(2_499, 5_000),
+            None,
+            "one paise below half-step"
+        );
+        // Exact half-step is the boundary: rounds UP to the first strike.
+        assert_eq!(
+            atm_strike_paise(2_500, 5_000),
+            Some(5_000),
+            "exact half-step rounds UP to the first positive strike"
+        );
     }
 
     // -- The CE/PE direction ratchet (real capture numbers) ----------------
