@@ -200,6 +200,20 @@ as historical audit; THIS table is the effective contract.
 > consumer; durable order-event capture returns with live trading (the OMS wiring), and
 > boot-staged order-update WAL segments remain undrained on dhan-off boots (pre-existing
 > Phase A residual, C2 target).
+>
+> **2026-07-14 Amendment (order-runtime dry-run PR — SUPERSEDES the dormancy-honesty
+> wording above for `[order_runtime].enabled = true`, the base.toml default):** the
+> Phase 5a discard drain is replaced by the DRY-RUN ORDER RUNTIME
+> (`.claude/rules/project/order-runtime-dryrun.md`): incoming order-update frames are now
+> CONSUMED by the runtime's paper OMS + RiskEngine (Source=P filtered; dry_run hard-true
+> — still ZERO live orders, the WS carries no market data, the connection count is
+> unchanged at ≤1 Dhan WS), durable WAL frame capture is RESTORED (`wal_spill = Some`),
+> and the boot-staged order-update WAL segments are DRAINED into the stack broadcast +
+> conditionally confirmed (parse-clean AND zero stale live-feed frames — else a
+> non-paging WS-REINJECT-01 `warn!` defer; the Phase-A residual is thereby closed for
+> order-update segments). With `enabled = false` (the serde default — an absent config
+> section) the PR-C1 dormant shape above remains byte-identical, ratcheted by
+> `test_rest_stack_wires_order_runtime`'s disabled-branch pins.
 
 ### §B. What the Phase C deletion PRs MAY remove (authorized by Q1/Q3/Q4; consumer map Verified 2026-07-13)
 

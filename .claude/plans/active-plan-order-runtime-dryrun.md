@@ -1,6 +1,6 @@
 # Implementation Plan: Order Runtime (dry-run) — revive order machinery, close the silent-stuck-position hole
 
-**Status:** APPROVED
+**Status:** VERIFIED
 **Date:** 2026-07-14
 **Approved by:** Parthiban (operator) via coordinator directive 2026-07-14 (cluster A — order-side readiness audit)
 **Crates:** app (`crates/app/src/order_runtime.rs` NEW, `crates/app/src/oms_wiring.rs` NEW, `crates/app/src/dhan_rest_stack.rs`, `crates/app/src/main.rs`, `crates/app/src/groww_bridge.rs`, `crates/app/src/trading_pipeline.rs`), trading (`crates/trading/src/oms/engine.rs`, `crates/trading/src/oms/types.rs`, `crates/trading/src/oms/mod.rs`, `crates/trading/src/risk/engine.rs`, `crates/trading/src/risk/types.rs`), common (`crates/common/src/config.rs` — `[order_runtime]` section)
@@ -130,20 +130,20 @@ archive runbook + I-P1-11 deferral justification) + dated sections in `ws-reinje
 
 ## Plan Items
 
-- [ ] Item 1 — OMS fill bridge: `handle_order_update` return-widened to `Result<Option<FillEvent>, OmsError>` +
+- [x] Item 1 — OMS fill bridge: `handle_order_update` return-widened to `Result<Option<FillEvent>, OmsError>` +
       `FillEvent` type + `parse_segment_chars` + partial-lot floor + re-exports
   - Files: crates/trading/src/oms/engine.rs, crates/trading/src/oms/types.rs, crates/trading/src/oms/mod.rs
   - Tests: test_same_status_refresh_applies_delta_not_cumulative, test_duplicate_update_zero_delta_skipped,
     test_partial_lot_remainder_floors_and_errors, test_fill_sign_from_managed_order_transaction_type,
     test_segment_char_parse_matrix
-- [ ] Item 2 — Risk engine fixes: `PositionInfo.lot_size` + unrealized-P&L lot_size multiply,
+- [x] Item 2 — Risk engine fixes: `PositionInfo.lot_size` + unrealized-P&L lot_size multiply,
       `evaluate_daily_loss_halt`, coded `trigger_halt`
   - Files: crates/trading/src/risk/engine.rs, crates/trading/src/risk/types.rs
   - Tests: test_unrealized_pnl_multiplies_lot_size, test_evaluate_daily_loss_halt_boundary
-- [ ] Item 3 — trading_pipeline FillEvent graft (4-line consumption of the widened return; dormant dhan-on path)
+- [x] Item 3 — trading_pipeline FillEvent graft (4-line consumption of the widened return; dormant dhan-on path)
   - Files: crates/app/src/trading_pipeline.rs
   - Tests: existing pipeline order-update tests updated (test_pipeline_processes_order_updates)
-- [ ] Item 4 — Order runtime module: single-owner actor (OMS+Risk construction via oms_wiring, order-update consumer
+- [x] Item 4 — Order runtime module: single-owner actor (OMS+Risk construction via oms_wiring, order-update consumer
       with Source=P filter, fill bridge, mark consumer + paper filler, reconcile scheduler + local invariant, daily
       reset/close sweeps, self-test, NotifierAlertSink)
   - Files: crates/app/src/order_runtime.rs, crates/app/src/oms_wiring.rs, crates/app/src/lib.rs
@@ -155,23 +155,23 @@ archive runbook + I-P1-11 deferral justification) + dated sections in `ws-reinje
     test_sid_segment_collision_skips_and_errors, test_alert_sink_event_mapping,
     test_halt_fires_risk_halt_once_per_episode, test_confirm_decision_matrix,
     prop_fill_mirror_matches_risk_net_lots
-- [ ] Item 5 — Config: `[order_runtime]` OrderRuntimeConfig (serde default OFF) + base.toml enabled=true + validation
+- [x] Item 5 — Config: `[order_runtime]` OrderRuntimeConfig (serde default OFF) + base.toml enabled=true + validation
   - Files: crates/common/src/config.rs, config/base.toml
   - Tests: test_order_runtime_config_defaults_off, test_order_runtime_config_validation
-- [ ] Item 6 — dhan_rest_stack Phase 5a rewrite: subscribe → spawn runtime → WAL drain → conditional confirm →
+- [x] Item 6 — dhan_rest_stack Phase 5a rewrite: subscribe → spawn runtime → WAL drain → conditional confirm →
       WS spawn with `wal_spill: Some(..)`; disabled branch byte-identical dormant shape
   - Files: crates/app/src/dhan_rest_stack.rs, crates/app/src/main.rs
   - Tests: test_rest_stack_wires_order_runtime (replaces the dormant-shape ratchet)
-- [ ] Item 7 — groww_bridge mark tap: `marks_wanted` AtomicBool gate + `try_send(MarkUpdate)` (zero alloc/lock/await)
+- [x] Item 7 — groww_bridge mark tap: `marks_wanted` AtomicBool gate + `try_send(MarkUpdate)` (zero alloc/lock/await)
   - Files: crates/app/src/groww_bridge.rs, crates/app/src/main.rs
   - Tests: test_marks_wanted_false_skips_send, test_mark_channel_full_drops_counted_never_blocks
-- [ ] Item 8 — Ratchets + perf evidence: confirm-symmetry guard extension, spawn-site ratchet, DHAT mark-forward,
+- [x] Item 8 — Ratchets + perf evidence: confirm-symmetry guard extension, spawn-site ratchet, DHAT mark-forward,
       Criterion bench + budget entry, e2e integration
   - Files: crates/app/tests/wal_replay_confirm_symmetry_guard.rs,
     crates/app/tests/order_runtime_spawn_site_guard.rs, crates/app/tests/dhat_mark_forward.rs,
     crates/app/benches/order_gate.rs, quality/benchmark-budgets.toml, crates/app/tests/order_runtime_e2e.rs
   - Tests: ratchet_order_runtime_spawned_only_from_rest_stack, order_runtime_e2e, dhat_mark_forward
-- [ ] Item 9 — Rule files: NEW order-runtime-dryrun.md + dated sections in ws-reinject-error-codes.md +
+- [x] Item 9 — Rule files: NEW order-runtime-dryrun.md + dated sections in ws-reinject-error-codes.md +
       websocket-connection-scope-lock.md
   - Files: .claude/rules/project/order-runtime-dryrun.md, .claude/rules/project/ws-reinject-error-codes.md,
     .claude/rules/project/websocket-connection-scope-lock.md

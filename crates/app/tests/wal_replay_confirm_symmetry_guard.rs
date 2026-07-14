@@ -32,6 +32,11 @@ fn main_rs() -> String {
     std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {} failed: {e}", path.display()))
 }
 
+fn dhan_rest_stack_rs() -> String {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/dhan_rest_stack.rs");
+    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {} failed: {e}", path.display()))
+}
+
 /// Section A — `confirm_replayed` must be CALLED from at least two sites
 /// (the slow-boot tail + the fast-boot path). The function is defined in the
 /// storage crate, so every occurrence in `main.rs` is a call site.
@@ -67,5 +72,44 @@ fn both_paths_gate_confirm_on_a_reinjection_clean_flag() {
         "fast-boot confirm must be gated on `fast_ws_wal_replay_reinjection_clean` \
          — confirming when a re-injection dropped frames (or no pool existed) \
          would lose them; un-confirmed segments must re-replay next boot"
+    );
+}
+
+/// Section C — order-runtime dry-run PR (2026-07-14): the dhan-OFF REST
+/// stack is the THIRD confirm site (the two main.rs sites above are both
+/// dhan-gated and dead on a dhan-off boot — the exact Phase-A residual the
+/// runtime's WAL drain closes). Its confirm MUST stay CONDITIONAL: gated by
+/// the pure `confirm_decision` verdict (parse-clean AND zero stale live-feed
+/// frames staged), with a loud coalesced defer arm — an UNCONDITIONAL
+/// whole-dir confirm would archive un-reinjected stale live-feed frames
+/// (silent tick loss, design F6).
+#[test]
+fn rest_stack_confirm_is_gated_on_confirm_decision() {
+    let body = dhan_rest_stack_rs();
+    let (prod, _) = body
+        .split_once("#[cfg(test)]")
+        .expect("dhan_rest_stack.rs must keep its test module marker");
+    let decision = prod
+        .find("crate::order_runtime::confirm_decision(")
+        .expect("rest stack must route its confirm through confirm_decision (F6)"); // APPROVED: test
+    let confirm = prod
+        .find("tickvault_storage::ws_frame_spill::confirm_replayed(")
+        .expect("rest stack must call confirm_replayed on the Confirm verdict"); // APPROVED: test
+    assert!(
+        decision < confirm,
+        "the confirm_decision match @{decision} must precede (gate) the \
+         confirm_replayed call @{confirm} — an unconditional confirm archives \
+         un-reinjected stale live-feed frames (silent tick loss)"
+    );
+    assert!(
+        prod.contains("ConfirmVerdict::Defer"),
+        "the Defer arm disappeared — a stale-livefeed / parse-error boot must \
+         leave staged segments in replaying/ (re-replayed next boot), loudly"
+    );
+    assert!(
+        prod.contains("metrics::counter!(\"tv_wal_confirm_deferred_total\")"),
+        "the defer counter disappeared — deferred confirms must be visible \
+         (warn-level by design: WS-REINJECT-01 has an ERROR-level CloudWatch \
+         alarm and a per-boot page for expected stale residue is pager noise)"
     );
 }

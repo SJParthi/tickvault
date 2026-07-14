@@ -552,6 +552,8 @@ async fn replay_same_ndjson_is_idempotent_no_duplicate_rows() {
             std::sync::Arc::new(tickvault_app::groww_bridge::GrowwAuditLatches::default()),
             std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0)),
             None,
+            // Order-runtime mark tap: not under test here.
+            None,
         ));
         let _ = wait_until_count(&ticks_sql, 3, Duration::from_secs(15)).await;
         bridge.abort();

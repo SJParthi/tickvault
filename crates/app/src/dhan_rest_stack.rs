@@ -1291,30 +1291,44 @@ mod tests {
         assert!(dhan_rest_lock_park_due(u64::MAX), "saturated domain end");
     }
 
-    /// PR-C1 (2026-07-13, operator ruling Q4-i): the stack spawns the Dhan
-    /// order-update WS functional-dormant — production-region source pins
-    /// (the house production-region split so these assertion literals can
-    /// never satisfy themselves), plus the family-claim ordering invariant:
-    /// the spawn must sit AFTER the `claim_post_market_task_family_once()`
-    /// call so a broken lane/stack mutual-exclusion invariant can never
-    /// produce a SECOND order-update WS.
+    /// Order-runtime dry-run PR (2026-07-14) — REPLACES
+    /// `test_rest_stack_spawns_order_update_ws_functional_dormant`: the stack
+    /// now wires the dry-run ORDER RUNTIME in its Phase 5a (config-gated;
+    /// the disabled branch keeps the PR-C1 dormant shape byte-identical).
+    /// Production-region source pins (the house production-region split so
+    /// these assertion literals can never satisfy themselves) + the ordering
+    /// laws:
+    ///   family-claim < subscribe < spawn_order_runtime < WAL drain
+    ///   < confirm arm < run_order_update_connection.
     #[test]
-    fn test_rest_stack_spawns_order_update_ws_functional_dormant() {
+    fn test_rest_stack_wires_order_runtime() {
         let own_src = include_str!("dhan_rest_stack.rs");
         let (prod, _) = own_src
             .split_once("#[cfg(test)]")
             .expect("dhan_rest_stack.rs must keep its test module marker");
         for needle in [
-            // The rewired spawn itself (Q4-i).
+            // The rewired WS spawn itself (Q4-i — kept).
             "run_order_update_connection(",
-            // Stack-local broadcast channel (no OMS consumer — dormant).
+            // Stack-local broadcast channel.
             "broadcast::channel::<tickvault_common::order_types::OrderUpdate>",
-            // 2026-07-13 hostile-review M1: the receiver is HELD + drained —
-            // dropping it makes the connection's send arm spam a per-event
-            // false "subscriber crashed" ERROR on every manual account order.
+            // ENABLED branch: the runtime's early subscribe (ordering law F5).
+            "order_update_sender.subscribe()",
+            // ENABLED branch: the runtime spawn replacing the discard drain.
+            "crate::order_runtime::spawn_order_runtime(",
+            // ENABLED branch: boot-staged WAL frames drained BEFORE the WS
+            // spawns (F4 FIFO).
+            "crate::boot_helpers::drain_replayed_order_updates_to_broadcast(",
+            // ENABLED branch: the CONDITIONAL confirm (F6 — parse-clean AND
+            // zero stale live-feed frames), never an unconditional confirm.
+            "crate::order_runtime::confirm_decision(",
+            "tickvault_storage::ws_frame_spill::confirm_replayed(",
+            // Defer arm loudness: the coalesced counter (warn-level by design).
+            "metrics::counter!(\"tv_wal_confirm_deferred_total\")",
+            // ENABLED branch: durable order-update frame capture restored.
+            "params.ws_frame_spill.clone()",
+            // DISABLED branch: the PR-C1 dormant shape survives byte-identical
+            // — receiver HELD + drained (hostile-review M1) and counted.
             "order_update_receiver.recv()",
-            // The dormant-activity counter is the CODE line, not the comment
-            // (full macro invocation so a comment mention can never satisfy).
             "metrics::counter!(\"tv_order_update_dormant_events_total\")",
             // Lifecycle rows keep flowing to ws_event_audit.
             "ws_audit_consumer::spawn_ws_event_audit_consumer(",
@@ -1323,24 +1337,43 @@ mod tests {
         ] {
             assert!(
                 prod.contains(needle),
-                "dhan_rest_stack.rs production region lost `{needle}` — the Q4-i \
-                 order-update rewire regressed (the WS must be spawned from this \
-                 stack, functional-dormant)"
+                "dhan_rest_stack.rs production region lost `{needle}` — the \
+                 order-runtime Phase 5a wiring (or the PR-C1 dormant fallback) \
+                 regressed"
             );
         }
-        // Ordering: the family-claim CALL (the lane/stack exclusion tripwire)
-        // precedes the order-update spawn.
+        // Ordering law: family-claim (lane/stack exclusion tripwire) <
+        // subscribe (F5) < spawn_order_runtime < WAL drain (F4) < confirm arm
+        // (F6) < the WS spawn.
         let claim_call = prod
             .find("if !claim_post_market_task_family_once()")
             .expect("family-claim call present"); // APPROVED: test
+        let subscribe = prod
+            .find("order_update_sender.subscribe()")
+            .expect("early subscribe present (asserted above)"); // APPROVED: test
+        let runtime_spawn = prod
+            .find("crate::order_runtime::spawn_order_runtime(")
+            .expect("order-runtime spawn present (asserted above)"); // APPROVED: test
+        let wal_drain = prod
+            .find("crate::boot_helpers::drain_replayed_order_updates_to_broadcast(")
+            .expect("WAL drain present (asserted above)"); // APPROVED: test
+        let confirm_arm = prod
+            .find("crate::order_runtime::confirm_decision(")
+            .expect("confirm decision present (asserted above)"); // APPROVED: test
         let ou_spawn = prod
-            .find("run_order_update_connection(")
+            .find("order_update_connection::run_order_update_connection(")
             .expect("order-update spawn present (asserted above)"); // APPROVED: test
         assert!(
-            claim_call < ou_spawn,
-            "the order-update spawn @{ou_spawn} must sit AFTER the family-claim \
-             call @{claim_call} — spawning before the claim would double the \
-             order-update WS when the lane/stack invariant breaks"
+            claim_call < subscribe
+                && subscribe < runtime_spawn
+                && runtime_spawn < wal_drain
+                && wal_drain < confirm_arm
+                && confirm_arm < ou_spawn,
+            "Phase 5a ordering law broken (claim@{claim_call} < subscribe@{subscribe} \
+             < runtime@{runtime_spawn} < drain@{wal_drain} < confirm@{confirm_arm} \
+             < ws@{ou_spawn} required) — a runtime subscribed AFTER the drain misses \
+             replayed fills (F5); a drain AFTER the WS spawn breaks FIFO (F4); an \
+             unconditionally-early confirm archives un-reinjected frames (F6)"
         );
     }
 
