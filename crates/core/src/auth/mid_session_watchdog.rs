@@ -817,6 +817,7 @@ fn apply_transition(transition: Transition, state: &mut WatchdogState, reason: O
             // self-heals; only a TERMINAL re-mint failure pages (the
             // family-(3) AuthenticationFailed arm in the loop above).
             error!(
+                code = ErrorCode::AuthGap05ForcedRemintTriggered.code_str(),
                 reason = %reason,
                 "mid-session profile check FAILED — dataPlan / activeSegment / token may be invalid (silent; AUTH-GAP-05 self-heal engaged)"
             );
@@ -827,7 +828,7 @@ fn apply_transition(transition: Transition, state: &mut WatchdogState, reason: O
             let reason_context = reason.unwrap_or_default();
             info!(
                 last_failure_reason = %reason_context,
-                "mid-session profile check recovered — no Telegram on falling edge (operator already paged)"
+                "mid-session profile check recovered (silent falling edge)"
             );
             metrics::counter!("tv_mid_session_profile_recovery_total").increment(1);
             state.currently_failing = false;
