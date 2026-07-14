@@ -33,6 +33,11 @@
 //! # Consumer contract
 //! - EXITS ARE NEVER MARGIN-GATED: [`MarginGate::check_exit`] is
 //!   structurally REST-free (no token read, no REST call, no limiter touch).
+//!   Misrouting an EXIT through [`MarginGate::check_entry`] would subject it
+//!   to entry gating — a disabled gate + `permits_live_entry` would then
+//!   BLOCK a live exit, the exact hazard the never-gate-exits rule forbids.
+//!   The OMS-wiring PR must route intents at a single choke point
+//!   (exits → `check_exit`) and pin it with its own ratchet.
 //! - Entry-check unavailability fails CLOSED for entries, OPEN for exits.
 //! - LIVE (`dry_run = false`) consumers MUST use
 //!   [`MarginVerdict::permits_live_entry`] — a disabled gate blocks live
@@ -428,6 +433,7 @@ impl MarginGate {
     /// can be exercised against a local mock. NEVER available in
     /// production builds.
     #[cfg(test)]
+    // TEST-EXEMPT: cfg(test)-only helper — not part of the production surface
     pub(crate) fn allow_rest_for_test(&mut self) {
         self.rest_allowed = true;
     }
@@ -458,24 +464,33 @@ impl MarginGate {
     ///
     /// The caller-built request is validated against the gate's expected
     /// client id BEFORE any permit/token/REST work, so a miswired caller
-    /// can never get a verdict computed for the wrong account.
+    /// can never get a verdict computed for the wrong account. A gate
+    /// constructed with an EMPTY expected client id refuses ALL entries —
+    /// fail closed (there is no real account to validate against); the
+    /// disabled check still runs first, so a disabled gate reports
+    /// `SkippedDisabled` as usual.
     pub async fn check_entry(&self, request: &MarginCalculatorRequest) -> MarginVerdict {
         // (1) The OFF-switch lattice: config AND the code master lock.
         if !self.is_enabled() {
             return Self::record(MarginVerdict::SkippedDisabled);
         }
 
-        // (2) Request-side client-id validation — STRICT equality: an
-        // EMPTY request id also refuses (the request must carry the real
-        // client id for the broker anyway). Runs before the self-cap so a
-        // miswired caller never burns a REST permit.
-        if request.dhan_client_id != self.expected_client_id {
+        // (2) Request-side client-id validation — STRICT equality PLUS an
+        // empty-expected-id refusal: an EMPTY request id refuses (the
+        // request must carry the real client id for the broker anyway),
+        // and a gate built WITHOUT a real client id refuses everything
+        // (matching-empty ids must never authorize). Runs before the
+        // self-cap so a miswired caller never burns a REST permit.
+        if self.expected_client_id.is_empty() || request.dhan_client_id != self.expected_client_id {
             // The mismatch FACT only — neither id (nor the request) is
-            // logged.
+            // logged. `reason` distinguishes this request-side arm from
+            // decide_entry's response-side ClientIdMismatch arm.
             warn!(
-                "dhan margin gate: entry request carried a client id different from the \
-                 one this gate was built for — refusing fail-closed (a verdict must \
-                 never be computed for the wrong account)"
+                reason = "request_client_id_mismatch",
+                "dhan margin gate: entry request/gate client-id validation failed \
+                 (mismatched request id, or a gate built without a real client id) — \
+                 refusing fail-closed (a verdict must never be computed for the wrong \
+                 account)"
             );
             return Self::record(MarginVerdict::RefusedImplausible {
                 reason: ImplausibleReason::ClientIdMismatch,
@@ -601,6 +616,7 @@ impl MarginGate {
     /// drain permits deterministically (back-to-back sync calls) without
     /// HTTP round-trips inside the timing-sensitive window.
     #[cfg(test)]
+    // TEST-EXEMPT: cfg(test)-only helper — not part of the production surface
     pub(crate) fn try_reserve_entry_permits_for_test(&self) -> bool {
         self.reserve_entry_permits()
     }
@@ -1159,6 +1175,39 @@ mod tests {
                 reason: ImplausibleReason::ClientIdMismatch
             }
         );
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_check_entry_empty_expected_client_id_refuses_zero_rest_calls() {
+        // A gate constructed WITHOUT a real client id refuses ALL entries
+        // fail-closed — even a MATCHING-empty request id must never
+        // authorize (empty == empty is not account validation). The REST
+        // master lock is bypassed so the refusal is provably the client-id
+        // arm, not the disabled arm.
+        let (base_url, hits, handle) =
+            start_routing_mock(200, HAPPY_MARGIN_BODY, 200, HAPPY_FUNDS_BODY).await;
+        let http = Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+        let api = Arc::new(OrderApiClient::new(
+            http,
+            base_url.clone(),
+            "TEST-100".to_owned(),
+        ));
+        let mut gate = MarginGate::new(api, Arc::new(StaticTokens), String::new(), enabled_cfg());
+        gate.allow_rest_for_test();
+        let mut request = make_calc_request();
+        request.dhan_client_id = String::new();
+        assert_eq!(
+            gate.check_entry(&request).await,
+            MarginVerdict::RefusedImplausible {
+                reason: ImplausibleReason::ClientIdMismatch
+            }
+        );
+        // Refused BEFORE any permit/token/REST work — zero REST hits.
         assert_eq!(hits.load(Ordering::SeqCst), 0);
         handle.abort();
     }

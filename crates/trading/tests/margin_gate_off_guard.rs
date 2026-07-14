@@ -182,6 +182,133 @@ fn test_margin_gate_validate_bounds() {
     assert!(min_ok.validate().is_ok(), "(1, 2) must pass");
 }
 
+/// Recursively collects every `.rs` file under `dir`.
+fn collect_rs_files(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_rs_files(&path, out);
+        } else if path.extension().is_some_and(|ext| ext == "rs") {
+            out.push(path);
+        }
+    }
+}
+
+/// The PRODUCTION region of a source file: everything up to the first
+/// COLUMN-0 `#[cfg(test)]` line (the house split trick — the tests-module
+/// attribute is unindented). Column-0 matters here: margin_gate.rs carries
+/// INDENTED `#[cfg(test)]` method attributes mid-impl that must NOT
+/// truncate the region, or the wrapper-call self-test below would go
+/// vacuous.
+fn production_region(content: &str) -> String {
+    let mut region = String::new();
+    for line in content.lines() {
+        if line.starts_with("#[cfg(test)]") {
+            break;
+        }
+        region.push_str(line);
+        region.push('\n');
+    }
+    region
+}
+
+#[test]
+fn test_margin_gate_and_wrappers_have_no_production_callers() {
+    // Pins the funds-margin.md claim "the funds/margin REST surface has
+    // ZERO production callers" until the OMS-wiring PR INTENTIONALLY
+    // updates this ratchet's allowlist. Leading-dot needles avoid matching
+    // the fn DEFINITIONS (`pub async fn calculate_margin(` carries no
+    // leading dot; `MarginGate::new(` never matches its own `pub fn new(`
+    // declaration).
+    const GATE_NEEDLES: [&str; 3] = ["MarginGate::new(", ".check_entry(", ".check_exit("];
+    const WRAPPER_NEEDLES: [&str; 3] = [
+        ".calculate_margin(",
+        ".calculate_multi_margin(",
+        ".get_fund_limit(",
+    ];
+
+    // Walk EVERY crates/*/src/**/*.rs file in the workspace (this guard
+    // file lives under tests/, so it is never scanned — its own needle
+    // literals cannot vacuously match).
+    let crates_dir = repo_root().join("crates");
+    let mut src_files = Vec::new();
+    for entry in fs::read_dir(&crates_dir)
+        .unwrap_or_else(|err| panic!("guard cannot read crates/: {err}"))
+        .flatten()
+    {
+        let src = entry.path().join("src");
+        if src.is_dir() {
+            collect_rs_files(&src, &mut src_files);
+        }
+    }
+    assert!(
+        src_files.len() > 50,
+        "walker sanity: expected the workspace src walk to find many files, got {}",
+        src_files.len()
+    );
+
+    for path in &src_files {
+        let content = fs::read_to_string(path)
+            .unwrap_or_else(|err| panic!("guard cannot read {}: {err}", path.display()));
+        let region = production_region(&content);
+        // The gate's own module legitimately calls two wrappers on
+        // self.api inside check_entry — the SOLE allowlisted file.
+        let is_margin_gate_module = path.ends_with("oms/margin_gate.rs");
+        for needle in GATE_NEEDLES {
+            assert!(
+                !region.contains(needle),
+                "production caller of the margin gate found ({needle:?} in {}) — the \
+                 OMS-wiring PR must update this ratchet's allowlist DELIBERATELY, \
+                 never as a side effect",
+                path.display()
+            );
+        }
+        if !is_margin_gate_module {
+            for needle in WRAPPER_NEEDLES {
+                assert!(
+                    !region.contains(needle),
+                    "production caller of a funds/margin REST wrapper found \
+                     ({needle:?} in {}) — the OMS-wiring PR must update this \
+                     ratchet's allowlist DELIBERATELY, never as a side effect",
+                    path.display()
+                );
+            }
+        }
+    }
+
+    // Non-vacuity self-test: the scanner must SEE real content — the
+    // allowlisted margin_gate.rs production region genuinely contains the
+    // wrapper calls (check_entry's two REST legs on self.api)...
+    let margin_gate_src = read_repo_file("crates/trading/src/oms/margin_gate.rs");
+    let margin_gate_region = production_region(&margin_gate_src);
+    assert!(
+        margin_gate_region.contains(".calculate_margin("),
+        "scanner self-test: margin_gate.rs's production region must contain the \
+         .calculate_margin( call — an over-eager region truncation would make \
+         every assertion above vacuous"
+    );
+    assert!(
+        margin_gate_region.contains(".get_fund_limit("),
+        "scanner self-test: margin_gate.rs's production region must contain the \
+         .get_fund_limit( call"
+    );
+    // ...and the region split genuinely TRUNCATES: the tests module (which
+    // constructs the gate) is excluded while the full file contains it.
+    assert!(
+        margin_gate_src.contains("MarginGate::new("),
+        "scanner self-test: the full margin_gate.rs file must contain a \
+         MarginGate::new( construction (in its tests module)"
+    );
+    assert!(
+        !margin_gate_region.contains("MarginGate::new("),
+        "scanner self-test: the production region must EXCLUDE the tests \
+         module's MarginGate::new( construction"
+    );
+}
+
 #[test]
 fn test_margin_gate_exit_arm_has_no_rest_reachability() {
     // Exits are NEVER margin-gated: the check_exit body must be

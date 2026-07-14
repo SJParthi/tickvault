@@ -77,6 +77,10 @@
     - LIVE (`dry_run = false`) consumers MUST use `MarginVerdict::permits_live_entry()` — a
       DISABLED gate blocks live entries fail-closed. Paper consumers use
       `permits_paper_entry()` (a disabled gate equals today's paper behaviour).
+    - Misrouting an EXIT through `check_entry` would subject it to entry gating (a
+      disabled gate + `permits_live_entry` would then BLOCK a live exit — the exact hazard
+      this rule forbids); the OMS-wiring PR must route intents at a single choke point
+      (exits → `check_exit`) and pin it with its own ratchet.
 
 11. **The OFF-switch lattice — config AND code lock, both required.** The gate's REST legs
     fire only when `[dhan_margin_gate] enabled` (serde default FALSE) AND the code-change
@@ -137,6 +141,20 @@ This rule activates when editing files matching:
 - The Funds & Margin surface was split into a dedicated session per the operator directive
   relayed via the coordinator session 2026-07-14 (the Dhan order-surface umbrella plan,
   `.claude/plans/active-plan-dhan-order-surface.md`, cluster E2).
-- The margin gate ships CODE-READY and DEFAULT-OFF: zero runtime REST calls until the
-  operator grant flips `DHAN_MARGIN_GATE_REST_ALLOWED` with a fresh dated quote recorded in
-  this file.
+- The margin gate ships CODE-READY and DEFAULT-OFF. Honest scope of that claim:
+  - The `DHAN_MARGIN_GATE_REST_ALLOWED` const lock governs the MARGIN GATE's REST legs —
+    the gate issues zero runtime REST calls until the operator grant flips the const with
+    a fresh dated quote recorded in this file.
+  - The raw typed wrappers on `OrderApiClient` (`calculate_margin` /
+    `calculate_multi_margin` / `get_fund_limit`) are pre-existing public functions NOT
+    gated by the const; they have ZERO production callers today, and the
+    no-production-caller ratchet
+    (`crates/trading/tests/margin_gate_off_guard.rs::test_margin_gate_and_wrappers_have_no_production_callers`)
+    pins that zero until the OMS-wiring PR deliberately updates its allowlist.
+  - "Zero runtime REST calls" is scoped to THIS funds/margin surface only — the spot-1m /
+    option-chain per-minute legs are SEPARATELY granted Dhan REST surfaces that do run
+    (`no-rest-except-live-feed-2026-06-27.md` §8).
+- The `no-rest-except-live-feed-2026-06-27.md` §3 inventory rows for `fundlimit` /
+  `margincalculator` are deliberately NOT added in this PR — that dated edit belongs to
+  the operator's enable-grant moment (the umbrella plan's cluster-E2 hold); recorded here
+  so that trigger-file drift is intentional, not an oversight.
