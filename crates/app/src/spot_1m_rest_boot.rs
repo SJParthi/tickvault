@@ -134,13 +134,13 @@ use chrono::{DateTime, Duration as ChronoDuration, NaiveDate};
 use secrecy::ExposeSecret;
 use tracing::{error, info, warn};
 
-use tickvault_common::config::QuestDbConfig;
+use tickvault_common::config::{QuestDbConfig, SpotFetchMode};
 use tickvault_common::constants::{
     DHAN_CHARTS_INTRADAY_PATH, IST_UTC_OFFSET_SECONDS, SECONDS_PER_DAY,
     SPOT_1M_REST_429_EXTRA_BACKOFF_MS, SPOT_1M_REST_CONSECUTIVE_FAIL_PAGE_THRESHOLD,
-    SPOT_1M_REST_FIRE_DELAY_MS, SPOT_1M_REST_FIRE_STALE_GRACE_SECS,
-    SPOT_1M_REST_FIRST_FIRE_SECS_OF_DAY_IST, SPOT_1M_REST_INDICES,
-    SPOT_1M_REST_LADDER_JITTER_SLOTS, SPOT_1M_REST_LADDER_JITTER_STEP_MS,
+    SPOT_1M_REST_DEGRADE_AFTER_CONSECUTIVE_NO_DATA_MINUTES, SPOT_1M_REST_FIRE_DELAY_MS,
+    SPOT_1M_REST_FIRE_STALE_GRACE_SECS, SPOT_1M_REST_FIRST_FIRE_SECS_OF_DAY_IST,
+    SPOT_1M_REST_INDICES, SPOT_1M_REST_LADDER_JITTER_SLOTS, SPOT_1M_REST_LADDER_JITTER_STEP_MS,
     SPOT_1M_REST_LAST_FIRE_SECS_OF_DAY_IST, SPOT_1M_REST_MAX_BODY_BYTES,
     SPOT_1M_REST_REQUEST_TIMEOUT_SECS, SPOT_1M_REST_RETRY_OFFSETS_MS, SPOT_1M_REST_SID_BUDGET_SECS,
     SPOT_1M_REST_SID_NOT_SERVED_THRESHOLD,
@@ -208,6 +208,16 @@ pub struct Spot1mRestTaskParams {
     /// IST seconds-of-day of the second one-shot probe (default 11:00 IST
     /// from config). Inert while `diagnostics_enabled` is false.
     pub diagnostics_second_probe_secs_of_day_ist: u32,
+    /// 2026-07-14 architecture optionality (`[spot_1m_rest] fetch_mode`,
+    /// pending the ~15:40 IST sweep-discriminator operator ruling):
+    /// `PerMinute` = the shipped behaviour; `BatchCatchup` = a sweep-style
+    /// catch-up every [`Self::batch_interval_minutes`] instead of
+    /// per-minute fires (a thin mode wrapper over the existing sweep
+    /// machinery — NOT new fetch logic).
+    pub fetch_mode: SpotFetchMode,
+    /// Batch catch-up cadence (minutes, validated 1..=60 at boot). Inert
+    /// in `PerMinute` mode.
+    pub batch_interval_minutes: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -622,6 +632,154 @@ pub fn ladder_sleep_ms(
         } else {
             0
         })
+}
+
+// ---------------------------------------------------------------------------
+// 2026-07-14 retry shaping (operator pacing directive) — pure primitives
+// ---------------------------------------------------------------------------
+
+/// STALE-WATERMARK CUTOFF (2026-07-14): `true` when ladder attempt N
+/// returned a parsed day payload whose last-candle watermark equals the
+/// previous attempt's — re-polling cannot outrun a serving delay (the
+/// #1524 serving-lag data: lags measured in minutes/hours, not the
+/// ladder's 0.7–6s reach), so the ladder STOPS for the minute.
+///
+/// Encoding: `prev_parsed` is `None` until an attempt returns a parsed
+/// 2xx; a parsed payload's watermark is `Some(newest_candle_nanos)` or
+/// `None` for a zero-row day payload — two consecutive zero-row payloads
+/// therefore ALSO repeat (today's `empty_no_rows` regime). A transport /
+/// non-2xx attempt records NO observation (never compared).
+///
+/// Honest trade-off (stated in the PR body too): on a healthy-but-
+/// slow-serving day this stops the ladder after two polls ~0.7s apart,
+/// trading the 1.5–6s marginal-appearance window for quota; the
+/// per-minute backfill + the 15:33:30 sweep remain the repair paths.
+/// Pure.
+#[must_use]
+pub fn ladder_watermark_repeated(
+    prev_parsed: Option<Option<i64>>,
+    current_parsed: Option<i64>,
+) -> bool {
+    prev_parsed == Some(current_parsed)
+}
+
+/// ADAPTIVE DEGRADE (2026-07-14): the ladder attempt count for one SID's
+/// fire — 1 (single attempt, no re-polls) while degraded, the full
+/// schedule otherwise. Pure.
+#[must_use]
+pub fn ladder_attempt_count(degraded: bool) -> usize {
+    if degraded {
+        1
+    } else {
+        SPOT_1M_REST_RETRY_OFFSETS_MS.len() + 1
+    }
+}
+
+/// What the run loop must do after feeding one fired minute's verdict to
+/// the [`LadderDegrade`] tracker.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DegradeAction {
+    /// No transition.
+    None,
+    /// RISING edge: enter single-attempt-per-minute mode (one loud log).
+    EnterDegraded { consecutive_no_data: u32 },
+    /// FALLING edge: a real success re-armed the full ladder (one log).
+    ExitDegraded { degraded_minutes: u32 },
+}
+
+/// ADAPTIVE DEGRADE tracker: after
+/// [`SPOT_1M_REST_DEGRADE_AFTER_CONSECUTIVE_NO_DATA_MINUTES`] consecutive
+/// no-data minutes (ZERO SIDs served their own just-closed candle —
+/// empty AND transport/429 failures both count, matching today's mixed
+/// 0/980 + 429 regime), the ladder drops to a single attempt per minute
+/// until ANY success re-arms it. Session-scoped pure state machine (the
+/// [`FailureEdge`] envelope — a task respawn restarts the streak; the
+/// re-learning window is bounded and loud). Pure — unit-tested without a
+/// clock.
+#[derive(Debug, Default)]
+pub struct LadderDegrade {
+    consecutive_no_data: u32,
+    degraded: bool,
+    degraded_minutes: u32,
+}
+
+impl LadderDegrade {
+    /// Whether the NEXT fire should run single-attempt.
+    #[must_use]
+    pub fn is_degraded(&self) -> bool {
+        self.degraded
+    }
+
+    /// Record one fired minute's verdict (`any_sid_served` = at least one
+    /// SID retrieved its own target-minute candle this fire).
+    pub fn record_minute(&mut self, any_sid_served: bool) -> DegradeAction {
+        if any_sid_served {
+            let degraded_minutes = self.degraded_minutes;
+            let was_degraded = self.degraded;
+            self.consecutive_no_data = 0;
+            self.degraded = false;
+            self.degraded_minutes = 0;
+            if was_degraded {
+                return DegradeAction::ExitDegraded { degraded_minutes };
+            }
+            return DegradeAction::None;
+        }
+        self.consecutive_no_data = self.consecutive_no_data.saturating_add(1);
+        if self.degraded {
+            self.degraded_minutes = self.degraded_minutes.saturating_add(1);
+            return DegradeAction::None;
+        }
+        if self.consecutive_no_data >= SPOT_1M_REST_DEGRADE_AFTER_CONSECUTIVE_NO_DATA_MINUTES {
+            self.degraded = true;
+            self.degraded_minutes = 0;
+            return DegradeAction::EnterDegraded {
+                consecutive_no_data: self.consecutive_no_data,
+            };
+        }
+        DegradeAction::None
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 2026-07-14 fetch-mode flag — batch catch-up scheduling (pure)
+// ---------------------------------------------------------------------------
+
+/// The next batch catch-up fire boundary at-or-after `now_secs_of_day`
+/// and strictly after `last_fired`, on the K-minute grid anchored at the
+/// first per-minute boundary: `FIRST + k × (interval × 60)`, clamped to
+/// today's session window. `None` once the grid is past 15:30 IST (the
+/// caller then runs the post-session sweep). `interval_minutes` is
+/// boot-validated to 1..=60; a hostile 0 is treated as 1. Pure.
+#[must_use]
+pub fn next_batch_fire_after(
+    now_secs_of_day: u32,
+    last_fired: Option<u32>,
+    interval_minutes: u32,
+) -> Option<u32> {
+    let step = interval_minutes.max(1).saturating_mul(60);
+    let first = SPOT_1M_REST_FIRST_FIRE_SECS_OF_DAY_IST;
+    let last = SPOT_1M_REST_LAST_FIRE_SECS_OF_DAY_IST;
+    let floor = match last_fired {
+        Some(f) => now_secs_of_day.max(f.saturating_add(1)),
+        None => now_secs_of_day,
+    };
+    if floor <= first {
+        return Some(first);
+    }
+    // Smallest grid point >= floor.
+    let k = (floor - first).div_ceil(step);
+    let fire = first.saturating_add(k.saturating_mul(step));
+    (fire <= last).then_some(fire)
+}
+
+/// Batch-cycle verdict for the [`FailureEdge`]: a cycle is FULLY FAILED
+/// when the persist leg failed, or when minutes were due and NONE landed
+/// (a fetch outage or an all-empty vendor regime — honest, per audit
+/// Rule 11: an idle cycle with nothing due is OK, an empty-handed cycle
+/// is not). Pure.
+#[must_use]
+pub fn batch_cycle_fully_failed(missing_before: u64, swept: u64, persist_failed: bool) -> bool {
+    persist_failed || (missing_before > 0 && swept == 0)
 }
 
 /// IST 12-hour label for a seconds-of-day instant (Telegram commandment 9
@@ -1213,6 +1371,14 @@ async fn spot_1m_fetch_once(
     jwt: &str,
     body: &serde_json::Value,
 ) -> Result<String, FetchFailure> {
+    // 2026-07-14 operator pacing directive: EVERY spot-1m Data-API request
+    // (per-minute fires, ladder re-polls, the 15:33:30 sweep, the #1524
+    // diagnostic probes — they all funnel through this fn) waits for a
+    // permit from the shared process-wide limiter; overflow spills into
+    // the next second(s), never drops.
+    crate::dhan_data_api_limiter::shared_dhan_data_api_limiter()
+        .acquire()
+        .await;
     let resp = client
         .post(url)
         .header("access-token", jwt)
@@ -1226,9 +1392,16 @@ async fn spot_1m_fetch_once(
         })?;
     let status = resp.status();
     if !status.is_success() {
+        let rate_limited = status == reqwest::StatusCode::TOO_MANY_REQUESTS;
+        if rate_limited {
+            // Feed the self-tuner from the REAL StatusCode (never a
+            // substring scan) — enough of these inside the rolling window
+            // steps the shared limiter down to the 2 rps floor.
+            crate::dhan_data_api_limiter::shared_dhan_data_api_limiter().record_429();
+        }
         let error_body = read_body_capped(resp).await.unwrap_or_default();
         return Err(FetchFailure {
-            rate_limited: status == reqwest::StatusCode::TOO_MANY_REQUESTS,
+            rate_limited,
             msg: format!(
                 "http {status} url={} body={}",
                 redact_url_params(url),
@@ -1264,8 +1437,13 @@ async fn fetch_minute_with_ladder(
     backfill_minute_ist_nanos: Option<i64>,
     minute_close_ms_of_day: i64,
     jitter_ms: u64,
+    max_attempts: usize,
 ) -> (SidFetchOutcome, DhanLadderForensics) {
     let deltas = retry_sleep_deltas_ms();
+    // 2026-07-14 adaptive degrade: 1 while degraded (no re-polls), the
+    // full schedule otherwise — clamped so a hostile value can never
+    // extend the ladder.
+    let attempts = max_attempts.clamp(1, deltas.len() + 1);
     let mut last_error: Option<String> = None;
     let mut prev_rate_limited = false;
     // GAP-11 review HIGH (2026-07-14): real attempt/429 facts for the
@@ -1278,7 +1456,10 @@ async fn fetch_minute_with_ladder(
     // body's `(rows, newest candle minute)` — classifies an Empty verdict
     // into `empty_no_rows` vs `empty_stale` + measures the serving lag.
     let mut freshest_body: Option<(usize, i64)> = None;
-    for attempt in 0..=deltas.len() {
+    // 2026-07-14 stale-watermark cutoff: the previous PARSED attempt's
+    // last-candle watermark (`Some(None)` = a parsed zero-row payload).
+    let mut prev_parsed_watermark: Option<Option<i64>> = None;
+    for attempt in 0..attempts {
         if attempt > 0 {
             let sleep_ms = ladder_sleep_ms(
                 deltas[attempt - 1],
@@ -1319,10 +1500,20 @@ async fn fetch_minute_with_ladder(
                     );
                 }
                 // 2xx without the target minute — the seal may not have
-                // landed yet; the next ladder rung re-polls.
+                // landed yet; the next ladder rung re-polls UNLESS the
+                // watermark provably did not move between two polls
+                // (stale-watermark cutoff, 2026-07-14 — re-polling cannot
+                // outrun a serving delay; the saved rungs were today's
+                // wasted-429 fuel).
                 last_error = None;
                 prev_rate_limited = false;
                 forensics.terminal_rate_limited = false;
+                let current_watermark = stats.map(|(_, newest)| newest);
+                if ladder_watermark_repeated(prev_parsed_watermark, current_watermark) {
+                    metrics::counter!("tv_spot1m_ladder_watermark_cutoff_total").increment(1);
+                    break;
+                }
+                prev_parsed_watermark = Some(current_watermark);
             }
             Err(failure) => {
                 if failure.rate_limited {
@@ -1365,6 +1556,7 @@ async fn fetch_minute_bounded(
     backfill_minute_ist_nanos: Option<i64>,
     minute_close_ms_of_day: i64,
     jitter_ms: u64,
+    max_attempts: usize,
 ) -> (SidFetchOutcome, DhanLadderForensics) {
     match tokio::time::timeout(
         Duration::from_secs(SPOT_1M_REST_SID_BUDGET_SECS),
@@ -1377,6 +1569,7 @@ async fn fetch_minute_bounded(
             backfill_minute_ist_nanos,
             minute_close_ms_of_day,
             jitter_ms,
+            max_attempts,
         ),
     )
     .await
@@ -1446,12 +1639,39 @@ pub async fn run_spot_1m_rest(params: Spot1mRestTaskParams) {
     // Gap-11 forensics: best-effort per-fetch audit rows (never on the
     // fetch/verdict/edge path).
     let mut audit_writer = RestFetchAuditWriter::new(&params.questdb);
+    // 2026-07-13 backfill sweep: per-SID latest PERSISTED minute — drives
+    // the previous-minute repair on every fire (and the batch catch-up
+    // ceiling in batch mode).
+    let mut tracker = PersistTracker::default();
+
+    // 2026-07-14 fetch-mode flag (`[spot_1m_rest] fetch_mode`): batch
+    // catch-up replaces the per-minute fires with a sweep-style cycle
+    // every `batch_interval_minutes` — a thin mode wrapper over the SAME
+    // sweep machinery the 15:33:30 post-session sweep uses. Default stays
+    // per_minute pending the ~15:40 IST sweep-discriminator ruling.
+    if params.fetch_mode == SpotFetchMode::BatchCatchup {
+        let session_complete =
+            run_batch_catchup_loop(&params, &client, &url, &mut writer, &mut tracker).await;
+        if session_complete {
+            run_post_session_sweep(
+                &client,
+                &url,
+                &params,
+                &mut writer,
+                &mut audit_writer,
+                &mut tracker,
+            )
+            .await;
+        }
+        return;
+    }
+
     let mut edge = FailureEdge::default();
     // 2026-07-13 VIX companion: per-SID vendor-not-serving detector.
     let mut sid_tracker = SidServedTracker::default();
-    // 2026-07-13 backfill sweep: per-SID latest PERSISTED minute — drives
-    // the previous-minute repair on every fire.
-    let mut tracker = PersistTracker::default();
+    // 2026-07-14 adaptive degrade: consecutive no-data minutes drop the
+    // ladder to a single attempt per minute until ANY success re-arms it.
+    let mut degrade = LadderDegrade::default();
     // H1 (2026-07-12): the last boundary actually HANDLED (fired or
     // skipped-stale) — the next fire is always STRICTLY after it, so a
     // fast-completing fire can never re-fire the same boundary second.
@@ -1461,7 +1681,8 @@ pub async fn run_spot_1m_rest(params: Spot1mRestTaskParams) {
     info!(
         indices = SPOT_1M_REST_INDICES.len(),
         "spot_1m_rest: per-minute fetch loop armed (fires each minute close \
-         09:16:00–15:30:00 IST, ~0.3–1.3s after the boundary)"
+         09:16:00–15:30:00 IST, ~0.3–1.3s after the boundary; every request \
+         paced by the shared Dhan Data-API limiter)"
     );
 
     loop {
@@ -1529,7 +1750,7 @@ pub async fn run_spot_1m_rest(params: Spot1mRestTaskParams) {
             continue;
         }
 
-        fire_one_minute(
+        let ok_count = fire_one_minute(
             &params,
             &client,
             &url,
@@ -1539,8 +1760,35 @@ pub async fn run_spot_1m_rest(params: Spot1mRestTaskParams) {
             &mut sid_tracker,
             &mut tracker,
             fire,
+            degrade.is_degraded(),
         )
         .await;
+        // 2026-07-14 adaptive degrade: edge-triggered transitions only
+        // (one loud log per direction, never per minute).
+        match degrade.record_minute(ok_count > 0) {
+            DegradeAction::EnterDegraded {
+                consecutive_no_data,
+            } => {
+                metrics::gauge!("tv_spot1m_ladder_degraded").set(1.0);
+                warn!(
+                    consecutive_no_data,
+                    "spot_1m_rest: adaptive degrade ENTERED — consecutive \
+                     no-data minutes; dropping to a single attempt per \
+                     minute (no ladder re-polls) until ANY success re-arms \
+                     the full ladder (2026-07-14 retry shaping — re-polling \
+                     an all-empty vendor regime was today's wasted-429 fuel)"
+                );
+            }
+            DegradeAction::ExitDegraded { degraded_minutes } => {
+                metrics::gauge!("tv_spot1m_ladder_degraded").set(0.0);
+                info!(
+                    degraded_minutes,
+                    "spot_1m_rest: adaptive degrade EXITED — a SID served \
+                     again; full ladder re-armed"
+                );
+            }
+            DegradeAction::None => {}
+        }
         // PR-3 sequencing: tell the option-chain leg this minute's spot
         // fire is DONE (success or failure — the chain must never block on
         // a failing spot leg). `send_replace` never errors.
@@ -1867,7 +2115,8 @@ async fn fire_one_minute(
     sid_tracker: &mut SidServedTracker,
     tracker: &mut PersistTracker,
     fire_secs_of_day: u32,
-) {
+    degraded: bool,
+) -> usize {
     let minute_open_secs = fire_secs_of_day.saturating_sub(60);
     let minute_label = format_minute_ist_12h(minute_open_secs);
     let trading_date = today_ist();
@@ -1931,8 +2180,14 @@ async fn fire_one_minute(
                 session_first_nanos,
             );
             // 429-coordination (2026-07-13): deterministic per-SID schedule
-            // shift so the 3 concurrent ladders never re-poll in lockstep.
+            // shift — KEPT under the 2026-07-14 shared limiter as a
+            // harmless schedule de-sync (the limiter is now the actual
+            // pacing authority; removing the jitter would churn the
+            // const-asserts for zero behaviour gain).
             let jitter_ms = ladder_jitter_ms(slot);
+            // 2026-07-14 adaptive degrade: single attempt per minute in
+            // the no-data regime, full ladder otherwise.
+            let max_attempts = ladder_attempt_count(degraded);
             join_set.spawn(async move {
                 let (outcome, forensics) = fetch_minute_bounded(
                     &client,
@@ -1943,6 +2198,7 @@ async fn fire_one_minute(
                     backfill_nanos,
                     minute_close_ms,
                     jitter_ms,
+                    max_attempts,
                 )
                 .await;
                 (security_id, symbol, outcome, forensics)
@@ -2280,6 +2536,10 @@ async fn fire_one_minute(
         trading_date_nanos,
     );
     record_sid_served_verdicts(params, sid_tracker, &sid_verdicts, &minute_label);
+    // 2026-07-14 adaptive degrade: the caller feeds this into the
+    // LadderDegrade tracker (any SID serving its own candle re-arms the
+    // full ladder).
+    ok_count
 }
 
 /// M1 (2026-07-12): the edge's "fully failed" verdict for one fired
@@ -2288,6 +2548,418 @@ async fn fire_one_minute(
 #[must_use]
 pub fn minute_fully_failed(ok_count: usize, persist_failed: bool) -> bool {
     ok_count == 0 || persist_failed
+}
+
+/// One sweep cycle's outcome (shared by the post-session sweep and the
+/// 2026-07-14 batch catch-up mode).
+#[derive(Clone, Copy, Debug, Default)]
+struct SweepCycleStats {
+    /// Session minutes above the watermarks that were DUE at cycle start.
+    missing_before: u64,
+    /// Minutes found + staged + flush-confirmed this cycle.
+    swept: u64,
+    /// Minutes still absent after the cycle.
+    still_missing: u64,
+    /// Any append/flush failure this cycle (poisoned-buffer discard).
+    persist_failed: bool,
+}
+
+/// The SHARED per-SID sweep body (extracted 2026-07-14 so the batch
+/// catch-up mode is a thin wrapper, not new fetch logic): for every
+/// pinned SID with session minutes still missing above its persisted
+/// watermark (bounded to `up_to_last_minute`), fetch the proven day
+/// window ONCE — through the shared Dhan Data-API limiter, inside
+/// `spot_1m_fetch_once` — and persist every missing minute found.
+/// Watermarks advance ONLY after the flush confirms (poisoned-buffer
+/// defense; DEDUP-idempotent re-appends).
+///
+/// Gap-11 forensics (2026-07-14): when `audit` is `Some` (the TERMINAL
+/// 15:33:30 post-session sweep) every still-missing minute lands a NAMED
+/// gap row (`named_gap` / `persist_failed` / `flush_failed`) and every
+/// recovered minute an `ok` row HELD until the data flush ACK then
+/// stamped with its real `close_to_persist_ms`. Mid-session batch
+/// catch-up cycles pass `None` — a minute missing at one cycle may be
+/// recovered by the next, so stamping a terminal `named_gap` there would
+/// be a false verdict (the per-minute fires' own rows + the terminal
+/// sweep remain the forensics truth for a batch-mode day).
+#[allow(clippy::too_many_arguments)] // APPROVED: private shared sweep body — a struct would be pure ceremony
+// TEST-EXEMPT: live-deps async body — the missing-minute selection (sweep_missing_minutes), row/window builders and cycle verdict (batch_cycle_fully_failed) are pure fns unit-tested below; the HTTP+persist legs reuse the tested fire_one_minute pattern.
+async fn sweep_sids_above_watermark(
+    client: &reqwest::Client,
+    url: &str,
+    writer: &mut Spot1mRestWriter,
+    tracker: &mut PersistTracker,
+    jwt: &secrecy::SecretString,
+    trading_date: NaiveDate,
+    trading_date_nanos: i64,
+    session_first: i64,
+    up_to_last_minute: i64,
+    stage: &'static str,
+    mut audit: Option<&mut RestFetchAuditWriter>,
+) -> SweepCycleStats {
+    let mut stats = SweepCycleStats::default();
+    let mut staged: Vec<(SecurityId, i64)> = Vec::new();
+    // GAP-11 persist stamping: swept `ok` forensics rows are HELD until
+    // the data flush ACK (stamped then; discarded on a failed flush).
+    let mut held_ok_rows: Vec<RestFetchAuditRow> = Vec::new();
+    for (security_id, symbol) in SPOT_1M_REST_INDICES {
+        let missing = sweep_missing_minutes(
+            tracker.last_persisted(security_id),
+            session_first,
+            up_to_last_minute,
+        );
+        if missing.is_empty() {
+            continue;
+        }
+        stats.missing_before = stats.missing_before.saturating_add(missing.len() as u64);
+        let body = spot_1m_day_request_body(&security_id.to_string(), trading_date);
+        let candles = match spot_1m_fetch_once(client, url, jwt.expose_secret(), &body).await {
+            Ok(body_text) => parse_intraday_1m_candles(&body_text),
+            Err(failure) => {
+                if failure.rate_limited {
+                    metrics::counter!("tv_spot1m_rate_limited_total").increment(1);
+                }
+                error!(
+                    code = ErrorCode::Spot1m01FetchDegraded.code_str(),
+                    stage,
+                    security_id,
+                    reason = %failure.msg,
+                    "SPOT1M-01: sweep fetch failed for this SID"
+                );
+                stats.still_missing = stats.still_missing.saturating_add(missing.len() as u64);
+                // Gap-11 forensics: the whole-SID sweep fetch failed —
+                // every still-missing minute is a NAMED gap, never silent
+                // (a 429'd sweep fetch keeps its real rate-limit fact —
+                // GAP-11 review HIGH, 2026-07-14).
+                if let Some(w) = audit.as_deref_mut() {
+                    for minute_nanos in &missing {
+                        audit_append_best_effort(
+                            w,
+                            &build_dhan_fetch_audit_row(
+                                *minute_nanos,
+                                trading_date_nanos,
+                                security_id,
+                                symbol,
+                                1,
+                                i64::from(failure.rate_limited),
+                                RestFetchOutcome::NamedGap,
+                                -1,
+                                "named_gap",
+                            ),
+                        );
+                    }
+                }
+                continue;
+            }
+        };
+        let mut found_for_sid: u64 = 0;
+        for minute_nanos in &missing {
+            let Some(candle) = select_minute_candle(&candles, *minute_nanos) else {
+                stats.still_missing = stats.still_missing.saturating_add(1);
+                // Gap-11 forensics: still absent after the sweep — a
+                // NAMED gap row for this exact (minute, SID).
+                if let Some(w) = audit.as_deref_mut() {
+                    audit_append_best_effort(
+                        w,
+                        &build_dhan_fetch_audit_row(
+                            *minute_nanos,
+                            trading_date_nanos,
+                            security_id,
+                            symbol,
+                            1,
+                            0,
+                            RestFetchOutcome::NamedGap,
+                            -1,
+                            "named_gap",
+                        ),
+                    );
+                }
+                continue;
+            };
+            // Honest real retrieval delay for the swept minute.
+            let close_ms_of_day = ((minute_nanos - trading_date_nanos) / NANOS_PER_SEC + 60)
+                .saturating_mul(MILLIS_PER_SEC);
+            let close_to_data_ms = (ist_millis_of_day_now() - close_ms_of_day).max(0);
+            let row = build_spot_1m_row(
+                &candle,
+                security_id,
+                symbol,
+                trading_date_nanos,
+                close_to_data_ms,
+            );
+            if let Err(err) = writer.append_row(&row) {
+                stats.persist_failed = true;
+                metrics::counter!("tv_spot1m_persist_errors_total", "stage" => "append")
+                    .increment(1);
+                error!(
+                    code = ErrorCode::Spot1m02PersistFailed.code_str(),
+                    stage = "append",
+                    security_id,
+                    ?err,
+                    "SPOT1M-02: sweep row append failed"
+                );
+                stats.still_missing = stats.still_missing.saturating_add(1);
+                if let Some(w) = audit.as_deref_mut() {
+                    audit_append_best_effort(
+                        w,
+                        &build_dhan_fetch_audit_row(
+                            *minute_nanos,
+                            trading_date_nanos,
+                            security_id,
+                            symbol,
+                            1,
+                            0,
+                            RestFetchOutcome::NamedGap,
+                            -1,
+                            "persist_failed",
+                        ),
+                    );
+                }
+            } else {
+                found_for_sid = found_for_sid.saturating_add(1);
+                // Gap-11 forensics: sweep recovery — `ok` with the honest
+                // real (big) close_to_data_ms. HELD until the data flush
+                // ACK (GAP-11 persist stamping).
+                if audit.is_some() {
+                    held_ok_rows.push(build_dhan_fetch_audit_row(
+                        *minute_nanos,
+                        trading_date_nanos,
+                        security_id,
+                        symbol,
+                        1,
+                        0,
+                        RestFetchOutcome::Ok,
+                        close_to_data_ms,
+                        "none",
+                    ));
+                }
+                staged.push((security_id, *minute_nanos));
+            }
+        }
+        stats.swept = stats.swept.saturating_add(found_for_sid);
+    }
+    let flush_result = writer.flush();
+    if let Err(err) = &flush_result {
+        stats.persist_failed = true;
+        metrics::counter!("tv_spot1m_persist_errors_total", "stage" => "flush").increment(1);
+        error!(
+            code = ErrorCode::Spot1m02PersistFailed.code_str(),
+            stage = "flush",
+            ?err,
+            "SPOT1M-02: sweep ILP flush failed — pending swept rows \
+             discarded (poisoned-buffer defense)"
+        );
+        stats.still_missing = stats.still_missing.saturating_add(stats.swept);
+        stats.swept = 0;
+        // Gap-11 forensics: the staged swept minutes become flush_failed
+        // rows — captured from `staged` BEFORE the commit arm consumes it.
+        if let Some(w) = audit.as_deref_mut() {
+            for (security_id, minute_nanos) in &staged {
+                audit_append_best_effort(
+                    w,
+                    &build_dhan_fetch_audit_row(
+                        *minute_nanos,
+                        trading_date_nanos,
+                        *security_id,
+                        spot_1m_symbol_for_sid(*security_id),
+                        1,
+                        0,
+                        RestFetchOutcome::NamedGap,
+                        -1,
+                        "flush_failed",
+                    ),
+                );
+            }
+        }
+    } else {
+        for (security_id, minute_nanos) in staged {
+            tracker.commit(security_id, minute_nanos);
+        }
+    }
+    if let Some(w) = audit.as_deref_mut() {
+        // GAP-11: swept ok rows land ONLY after (and stamped with) the data
+        // flush ACK — discarded on a failed flush (the flush_failed rows
+        // above are the truth for those minutes).
+        for row in stamp_held_ok_rows(
+            held_ok_rows,
+            flush_result.is_ok(),
+            trading_date_nanos,
+            ist_millis_of_day_now(),
+        ) {
+            audit_append_best_effort(w, &row);
+        }
+        // Gap-11 forensics: one best-effort flush for the sweep's audit rows.
+        audit_flush_best_effort(w);
+    }
+    stats
+}
+
+/// 2026-07-14 batch catch-up mode (`fetch_mode = "batch_catchup"`): every
+/// `batch_interval_minutes` in session, run ONE sweep cycle — one
+/// day-window fetch per SID (through the shared Dhan Data-API limiter)
+/// persisting every session minute above the per-SID watermark. Returns
+/// `true` when today's grid completed (the caller then runs the
+/// 15:33:30 post-session sweep for the tail), `false` on a trading-day
+/// flip mid-loop. A thin mode wrapper over [`sweep_sids_above_watermark`]
+/// — NOT new fetch logic.
+// TEST-EXEMPT: live-deps async runner — the grid scheduling (next_batch_fire_after) and cycle verdict (batch_cycle_fully_failed) are pure fns unit-tested below; the fetch/persist body is the shared sweep helper.
+async fn run_batch_catchup_loop(
+    params: &Spot1mRestTaskParams,
+    client: &reqwest::Client,
+    url: &str,
+    writer: &mut Spot1mRestWriter,
+    tracker: &mut PersistTracker,
+) -> bool {
+    let mut edge = FailureEdge::default();
+    let mut last_fired: Option<u32> = None;
+    info!(
+        interval_minutes = params.batch_interval_minutes,
+        "spot_1m_rest: BATCH CATCH-UP mode armed (one day-window fetch per \
+         SID per cycle through the shared Dhan Data-API limiter; per-minute \
+         fires disabled by config)"
+    );
+    loop {
+        // Audit Rule 3: re-read the wall clock + trading-day verdict every
+        // iteration.
+        if !params.calendar.is_trading_day_today() {
+            info!("spot_1m_rest: no longer a trading day — exiting batch loop");
+            return false;
+        }
+        let now = ist_secs_of_day_now();
+        let Some(fire) = next_batch_fire_after(now, last_fired, params.batch_interval_minutes)
+        else {
+            info!(
+                "spot_1m_rest: batch grid complete — handing over to the \
+                 post-session sweep"
+            );
+            return true;
+        };
+        let sleep_ms =
+            u64::from(fire.saturating_sub(now)).saturating_mul(1_000) + SPOT_1M_REST_FIRE_DELAY_MS;
+        tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
+        last_fired = Some(fire);
+
+        // A late wake is FINE in batch mode — the cycle's ceiling is
+        // recomputed from the wall clock (catching up is the mode's whole
+        // point); a midnight wrap exits via the trading-day gate above.
+        let woke = ist_secs_of_day_now().min(SPOT_1M_REST_LAST_FIRE_SECS_OF_DAY_IST);
+        let last_closed_minute_open_secs = woke.saturating_sub(60);
+        let trading_date = today_ist();
+        let trading_date_nanos = minute_open_ist_nanos(trading_date, 0);
+        let session_first =
+            minute_open_ist_nanos(trading_date, SPOT_1M_REST_FIRST_FIRE_SECS_OF_DAY_IST - 60);
+        let up_to = minute_open_ist_nanos(trading_date, last_closed_minute_open_secs);
+
+        let jwt: Option<secrecy::SecretString> = {
+            let guard = params.token_handle.load();
+            guard
+                .as_ref()
+                .as_ref()
+                .map(|state| state.access_token().clone())
+        };
+        let Some(jwt) = jwt else {
+            error!(
+                code = ErrorCode::Spot1m01FetchDegraded.code_str(),
+                stage = "batch_cycle_failed",
+                "SPOT1M-01: no access token at batch catch-up time — this \
+                 cycle is a full miss (next cycle retries)"
+            );
+            metrics::counter!("tv_spot1m_batch_cycles_total", "outcome" => "error").increment(1);
+            record_batch_cycle_verdict(params, &mut edge, fire, 0, 0, true);
+            continue;
+        };
+        let stats = sweep_sids_above_watermark(
+            client,
+            url,
+            writer,
+            tracker,
+            &jwt,
+            trading_date,
+            trading_date_nanos,
+            session_first,
+            up_to,
+            "batch_cycle_failed",
+            // Gap-11: NO forensics mid-session — a batch cycle's missing
+            // minute may be recovered by the next cycle; only the terminal
+            // post-session sweep stamps named-gap/ok rows (see the helper
+            // doc note).
+            None,
+        )
+        .await;
+        let fully_failed =
+            batch_cycle_fully_failed(stats.missing_before, stats.swept, stats.persist_failed);
+        let outcome = if fully_failed { "failed" } else { "ok" };
+        metrics::counter!("tv_spot1m_batch_cycles_total", "outcome" => outcome).increment(1);
+        info!(
+            cycle_ist = %format_minute_ist_12h(fire),
+            missing_before = stats.missing_before,
+            swept = stats.swept,
+            still_missing = stats.still_missing,
+            persist_failed = stats.persist_failed,
+            "spot_1m_rest: batch catch-up cycle complete"
+        );
+        record_batch_cycle_verdict(
+            params,
+            &mut edge,
+            fire,
+            stats.missing_before,
+            stats.swept,
+            stats.persist_failed,
+        );
+        // PR-3 sequencing parity: the chain leg's own 2.5s fallback timer
+        // fires it per minute regardless; publishing per cycle keeps the
+        // watch channel warm when both halves are enabled.
+        if let Some(tx) = &params.minute_done_tx {
+            tx.send_replace(Some(fire));
+        }
+    }
+}
+
+/// Batch-mode edge accounting: feeds the SAME [`FailureEdge`] +
+/// SPOT1M-01 escalation/recovery events the per-minute mode uses (3
+/// consecutive fully-failed CYCLES page once; any good cycle recovers).
+fn record_batch_cycle_verdict(
+    params: &Spot1mRestTaskParams,
+    edge: &mut FailureEdge,
+    fire_secs_of_day: u32,
+    missing_before: u64,
+    swept: u64,
+    persist_failed: bool,
+) {
+    let minute_label = format_minute_ist_12h(fire_secs_of_day);
+    let fully_failed = batch_cycle_fully_failed(missing_before, swept, persist_failed);
+    match edge.record_minute(fully_failed) {
+        EdgeAction::Page { consecutive } => {
+            error!(
+                code = ErrorCode::Spot1m01FetchDegraded.code_str(),
+                stage = "escalation",
+                consecutive,
+                minute = %minute_label,
+                "SPOT1M-01: batch catch-up cycles fully failed consecutively \
+                 — paging (edge-triggered)"
+            );
+            params
+                .notifier
+                .notify(NotificationEvent::Spot1mFetchDegraded {
+                    consecutive_failed_minutes: consecutive,
+                    minute_ist: minute_label,
+                });
+        }
+        EdgeAction::Recover { failed_minutes } => {
+            info!(
+                failed_cycles = failed_minutes,
+                minute = %minute_label,
+                "spot_1m_rest: batch catch-up recovered after a paged episode"
+            );
+            params
+                .notifier
+                .notify(NotificationEvent::Spot1mFetchRecovered {
+                    minute_ist: minute_label,
+                    failed_minutes,
+                });
+        }
+        EdgeAction::None => {}
+    }
 }
 
 /// ONE bounded post-session repair sweep (~15:33:30 IST, single fire —
@@ -2359,189 +3031,25 @@ async fn run_post_session_sweep(
         return;
     };
 
-    let mut swept: u64 = 0;
-    let mut still_missing: u64 = 0;
-    let mut staged: Vec<(SecurityId, i64)> = Vec::new();
-    // GAP-11 persist stamping: swept `ok` forensics rows are HELD until
-    // the data flush ACK (stamped then; discarded on a failed flush).
-    let mut held_ok_rows: Vec<RestFetchAuditRow> = Vec::new();
-    let mut persist_failed = false;
-    for (security_id, symbol) in SPOT_1M_REST_INDICES {
-        let missing = sweep_missing_minutes(
-            tracker.last_persisted(security_id),
-            session_first,
-            session_last,
-        );
-        if missing.is_empty() {
-            continue;
-        }
-        let body = spot_1m_day_request_body(&security_id.to_string(), trading_date);
-        let candles = match spot_1m_fetch_once(client, url, jwt.expose_secret(), &body).await {
-            Ok(body_text) => parse_intraday_1m_candles(&body_text),
-            Err(failure) => {
-                if failure.rate_limited {
-                    metrics::counter!("tv_spot1m_rate_limited_total").increment(1);
-                }
-                error!(
-                    code = ErrorCode::Spot1m01FetchDegraded.code_str(),
-                    stage = "sweep_failed",
-                    security_id,
-                    reason = %failure.msg,
-                    "SPOT1M-01: post-session sweep fetch failed for this SID"
-                );
-                still_missing = still_missing.saturating_add(missing.len() as u64);
-                // Gap-11 forensics: the whole-SID sweep fetch failed —
-                // every still-missing minute is a NAMED gap, never silent
-                // (a 429'd sweep fetch keeps its real rate-limit fact —
-                // GAP-11 review HIGH, 2026-07-14).
-                for minute_nanos in &missing {
-                    audit_append_best_effort(
-                        audit_writer,
-                        &build_dhan_fetch_audit_row(
-                            *minute_nanos,
-                            trading_date_nanos,
-                            security_id,
-                            symbol,
-                            1,
-                            i64::from(failure.rate_limited),
-                            RestFetchOutcome::NamedGap,
-                            -1,
-                            "named_gap",
-                        ),
-                    );
-                }
-                continue;
-            }
-        };
-        let mut found_for_sid: u64 = 0;
-        for minute_nanos in &missing {
-            let Some(candle) = select_minute_candle(&candles, *minute_nanos) else {
-                still_missing = still_missing.saturating_add(1);
-                // Gap-11 forensics: still absent after the sweep — a
-                // NAMED gap row for this exact (minute, SID).
-                audit_append_best_effort(
-                    audit_writer,
-                    &build_dhan_fetch_audit_row(
-                        *minute_nanos,
-                        trading_date_nanos,
-                        security_id,
-                        symbol,
-                        1,
-                        0,
-                        RestFetchOutcome::NamedGap,
-                        -1,
-                        "named_gap",
-                    ),
-                );
-                continue;
-            };
-            // Honest real retrieval delay for the swept minute.
-            let close_ms_of_day = ((minute_nanos - trading_date_nanos) / NANOS_PER_SEC + 60)
-                .saturating_mul(MILLIS_PER_SEC);
-            let close_to_data_ms = (ist_millis_of_day_now() - close_ms_of_day).max(0);
-            let row = build_spot_1m_row(
-                &candle,
-                security_id,
-                symbol,
-                trading_date_nanos,
-                close_to_data_ms,
-            );
-            if let Err(err) = writer.append_row(&row) {
-                persist_failed = true;
-                metrics::counter!("tv_spot1m_persist_errors_total", "stage" => "append")
-                    .increment(1);
-                error!(
-                    code = ErrorCode::Spot1m02PersistFailed.code_str(),
-                    stage = "append",
-                    security_id,
-                    ?err,
-                    "SPOT1M-02: post-session sweep row append failed"
-                );
-                still_missing = still_missing.saturating_add(1);
-                audit_append_best_effort(
-                    audit_writer,
-                    &build_dhan_fetch_audit_row(
-                        *minute_nanos,
-                        trading_date_nanos,
-                        security_id,
-                        symbol,
-                        1,
-                        0,
-                        RestFetchOutcome::NamedGap,
-                        -1,
-                        "persist_failed",
-                    ),
-                );
-            } else {
-                found_for_sid = found_for_sid.saturating_add(1);
-                // Gap-11 forensics: sweep recovery — `ok` with the honest
-                // real (big) close_to_data_ms. HELD until the data flush
-                // ACK (GAP-11 persist stamping).
-                held_ok_rows.push(build_dhan_fetch_audit_row(
-                    *minute_nanos,
-                    trading_date_nanos,
-                    security_id,
-                    symbol,
-                    1,
-                    0,
-                    RestFetchOutcome::Ok,
-                    close_to_data_ms,
-                    "none",
-                ));
-                staged.push((security_id, *minute_nanos));
-            }
-        }
-        swept = swept.saturating_add(found_for_sid);
-    }
-    let flush_result = writer.flush();
-    if let Err(err) = &flush_result {
-        persist_failed = true;
-        metrics::counter!("tv_spot1m_persist_errors_total", "stage" => "flush").increment(1);
-        error!(
-            code = ErrorCode::Spot1m02PersistFailed.code_str(),
-            stage = "flush",
-            ?err,
-            "SPOT1M-02: post-session sweep ILP flush failed — pending swept \
-             rows discarded (poisoned-buffer defense)"
-        );
-        still_missing = still_missing.saturating_add(swept);
-        swept = 0;
-        // Gap-11 forensics: the staged swept minutes become flush_failed
-        // rows — captured from `staged` BEFORE the commit arm consumes it.
-        for (security_id, minute_nanos) in &staged {
-            audit_append_best_effort(
-                audit_writer,
-                &build_dhan_fetch_audit_row(
-                    *minute_nanos,
-                    trading_date_nanos,
-                    *security_id,
-                    spot_1m_symbol_for_sid(*security_id),
-                    1,
-                    0,
-                    RestFetchOutcome::NamedGap,
-                    -1,
-                    "flush_failed",
-                ),
-            );
-        }
-    } else {
-        for (security_id, minute_nanos) in staged {
-            tracker.commit(security_id, minute_nanos);
-        }
-    }
-    // GAP-11: swept ok rows land ONLY after (and stamped with) the data
-    // flush ACK — discarded on a failed flush (the flush_failed rows above
-    // are the truth for those minutes).
-    for row in stamp_held_ok_rows(
-        held_ok_rows,
-        flush_result.is_ok(),
+    // Gap-11 forensics ride the SHARED sweep body (`Some(audit_writer)`):
+    // named_gap / persist_failed / flush_failed rows + held-then-stamped
+    // `ok` rows land exactly as the pre-refactor inline sweep emitted them.
+    let stats = sweep_sids_above_watermark(
+        client,
+        url,
+        writer,
+        tracker,
+        &jwt,
+        trading_date,
         trading_date_nanos,
-        ist_millis_of_day_now(),
-    ) {
-        audit_append_best_effort(audit_writer, &row);
-    }
-    // Gap-11 forensics: one best-effort flush for the sweep's audit rows.
-    audit_flush_best_effort(audit_writer);
+        session_first,
+        session_last,
+        "sweep_failed",
+        Some(audit_writer),
+    )
+    .await;
+    let (swept, still_missing, persist_failed) =
+        (stats.swept, stats.still_missing, stats.persist_failed);
     metrics::counter!("tv_spot1m_sweep_backfilled_total").increment(swept);
     metrics::counter!("tv_spot1m_sweep_still_missing_total").increment(still_missing);
     if still_missing > 0 || persist_failed {
@@ -2901,6 +3409,145 @@ mod tests {
         // edge: a day-long QuestDB outage must page (M1).
         assert!(minute_fully_failed(3, true));
         assert!(minute_fully_failed(0, true));
+    }
+
+    // ---- 2026-07-14 stale-watermark cutoff ----------------------------------
+
+    #[test]
+    fn test_ladder_watermark_repeated_stops_on_equal() {
+        // Two parsed payloads with the SAME newest-candle watermark →
+        // stop (re-polling cannot outrun a serving delay).
+        assert!(ladder_watermark_repeated(Some(Some(1_000)), Some(1_000)));
+    }
+
+    #[test]
+    fn test_ladder_watermark_zero_rows_twice_repeats() {
+        // Two consecutive parsed ZERO-ROW day payloads also repeat —
+        // today's empty_no_rows regime is cut at attempt 2.
+        assert!(ladder_watermark_repeated(Some(None), None));
+    }
+
+    #[test]
+    fn test_ladder_watermark_advancing_does_not_stop() {
+        // The vendor served a NEWER candle between polls — keep laddering.
+        assert!(!ladder_watermark_repeated(Some(Some(1_000)), Some(1_060)));
+        // Rows appeared where there were none — keep laddering.
+        assert!(!ladder_watermark_repeated(Some(None), Some(1_000)));
+    }
+
+    #[test]
+    fn test_ladder_watermark_first_observation_never_stops() {
+        // No previous PARSED attempt (first attempt, or every prior
+        // attempt failed transport/non-2xx) → never a cutoff.
+        assert!(!ladder_watermark_repeated(None, Some(1_000)));
+        assert!(!ladder_watermark_repeated(None, None));
+    }
+
+    // ---- 2026-07-14 adaptive degrade ----------------------------------------
+
+    #[test]
+    fn test_degrade_enters_after_five_no_data_minutes() {
+        let mut d = LadderDegrade::default();
+        let threshold = SPOT_1M_REST_DEGRADE_AFTER_CONSECUTIVE_NO_DATA_MINUTES;
+        for _ in 0..threshold - 1 {
+            assert_eq!(d.record_minute(false), DegradeAction::None);
+            assert!(!d.is_degraded());
+        }
+        assert_eq!(
+            d.record_minute(false),
+            DegradeAction::EnterDegraded {
+                consecutive_no_data: threshold
+            },
+            "the threshold-th consecutive no-data minute enters degrade"
+        );
+        assert!(d.is_degraded());
+        // Further no-data minutes never re-log the transition (edge).
+        assert_eq!(d.record_minute(false), DegradeAction::None);
+        assert!(d.is_degraded());
+    }
+
+    #[test]
+    fn test_degrade_any_success_rearms() {
+        let mut d = LadderDegrade::default();
+        for _ in 0..SPOT_1M_REST_DEGRADE_AFTER_CONSECUTIVE_NO_DATA_MINUTES {
+            d.record_minute(false);
+        }
+        assert!(d.is_degraded());
+        d.record_minute(false);
+        d.record_minute(false);
+        assert_eq!(
+            d.record_minute(true),
+            DegradeAction::ExitDegraded {
+                degraded_minutes: 2
+            },
+            "ANY success exits degrade (one falling-edge log)"
+        );
+        assert!(!d.is_degraded());
+        // A pre-threshold success is a plain None (no phantom exit log).
+        assert_eq!(d.record_minute(false), DegradeAction::None);
+        assert_eq!(d.record_minute(true), DegradeAction::None);
+    }
+
+    #[test]
+    fn test_degrade_attempt_count_single() {
+        assert_eq!(
+            ladder_attempt_count(true),
+            1,
+            "degraded = single attempt, no ladder re-polls"
+        );
+        assert_eq!(
+            ladder_attempt_count(false),
+            SPOT_1M_REST_RETRY_OFFSETS_MS.len() + 1,
+            "healthy = the full ladder schedule"
+        );
+    }
+
+    // ---- 2026-07-14 batch catch-up scheduling --------------------------------
+
+    #[test]
+    fn test_next_batch_fire_grid_alignment() {
+        // Before the window → the first per-minute boundary.
+        assert_eq!(next_batch_fire_after(FIRST - 100, None, 5), Some(FIRST));
+        // Mid-session → the next 5-minute grid point after the floor.
+        let fired = FIRST;
+        let next = next_batch_fire_after(FIRST + 1, Some(fired), 5);
+        assert_eq!(next, Some(FIRST + 5 * 60), "grid stays FIRST + k×300s");
+        // A slow cycle that overran one grid point skips to the NEXT one
+        // (never a double-fire of the same boundary).
+        let next = next_batch_fire_after(FIRST + 5 * 60 + 30, Some(FIRST + 5 * 60), 5);
+        assert_eq!(next, Some(FIRST + 10 * 60));
+        // A hostile 0 interval is treated as 1 minute (validate() is the
+        // real gate).
+        assert_eq!(
+            next_batch_fire_after(FIRST + 1, Some(FIRST), 0),
+            Some(FIRST + 60)
+        );
+    }
+
+    #[test]
+    fn test_next_batch_fire_past_window_none() {
+        assert_eq!(
+            next_batch_fire_after(LAST + 1, Some(LAST), 5),
+            None,
+            "past 15:30 IST the batch grid is over (sweep takes over)"
+        );
+        // The grid never emits a point past the session close.
+        let last_grid = next_batch_fire_after(LAST - 30, Some(LAST - 5 * 60), 5);
+        assert!(last_grid.is_none_or(|f| f <= LAST));
+    }
+
+    #[test]
+    fn test_batch_cycle_fully_failed_semantics() {
+        // Minutes were due, none landed → failed (fetch outage OR the
+        // all-empty vendor regime — honest either way).
+        assert!(batch_cycle_fully_failed(10, 0, false));
+        // Persist failure is always a failed cycle (M1 discipline).
+        assert!(batch_cycle_fully_failed(10, 10, true));
+        assert!(batch_cycle_fully_failed(0, 0, true));
+        // Nothing due (idle cycle) → OK.
+        assert!(!batch_cycle_fully_failed(0, 0, false));
+        // Partial progress → OK (the remainder is next cycle's work).
+        assert!(!batch_cycle_fully_failed(10, 3, false));
     }
 
     // ---- body cap (security M — unbounded read) ------------------------------

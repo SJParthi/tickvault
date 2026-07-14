@@ -512,6 +512,14 @@ async fn chain_fetch_once(
     client_id: &str,
     body: &Value,
 ) -> Result<String, ChainFetchFailure> {
+    // 2026-07-14 operator pacing directive: the option-chain API routes
+    // through the SAME shared Dhan Data-API limiter as the spot leg
+    // (per-minute chain fires + expirylist warmup/probe all funnel
+    // through this fn). The 1-unique-per-3s per-underlying min-gap stays
+    // LAYERED ON TOP, unchanged.
+    crate::dhan_data_api_limiter::shared_dhan_data_api_limiter()
+        .acquire()
+        .await;
     let resp = client
         .post(url)
         .header("access-token", jwt)
@@ -530,6 +538,11 @@ async fn chain_fetch_once(
         })?;
     let status = resp.status();
     if !status.is_success() {
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            // Feed the shared self-tuner from the REAL StatusCode — chain
+            // 429s and spot 429s tune ONE pacing decision.
+            crate::dhan_data_api_limiter::shared_dhan_data_api_limiter().record_429();
+        }
         let error_body = read_body_capped(resp).await.unwrap_or_default();
         return Err(ChainFetchFailure {
             entitlement: is_entitlement_reject(status.as_u16(), &error_body),
