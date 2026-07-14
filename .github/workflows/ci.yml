@@ -548,7 +548,7 @@ jobs:
   # DHAT Zero-Alloc — dedicated lane for the hot-path allocation ratchets
   # (added 2026-07-09, PR #4 of the audit-fix sequence).
   #
-  # WHY: the 15 crates/*/tests/dhat_*.rs targets previously ran in NO
+  # WHY: the 16 crates/*/tests/dhat_*.rs targets previously ran in NO
   # complete CI lane. The feature-UNGATED ones ran inside Test (core/
   # storage/trading), but the `#![cfg(feature = "dhat")]`-gated core
   # targets (dhat_prev_close_writer / dhat_telegram_dispatcher / the
@@ -568,7 +568,8 @@ jobs:
   # filesystem disagrees with the list below (a new/renamed file must be
   # added to the list). Side 2 — each cargo test step asserts the EXECUTED
   # target count ("Running tests/dhat_" lines) equals its expected count
-  # (9 core / 3 storage / 3 trading), so a `--test` flag dropped from a
+  # (10 core / 3 storage / 3 trading — PR-C3 2026-07-14 truth-sync; the
+  # deleted dhat_tick_gap_detector left core at 10), so a `--test` flag dropped from a
   # run step (while the file + list entry survive) fails loudly instead of
   # silently un-gating that target (2026-07-09 adversarial-review HIGH).
   #

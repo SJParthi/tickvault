@@ -36,9 +36,9 @@ use super::instruments::{GrowwWatchSet, WatchEntry, WatchKind};
 /// §36 (2026-07-08): `YYYY-MM-DD` → IST-midnight nanos for the FUTIDX master
 /// rows (0 sentinel on empty/unparsable — same semantics as the Dhan-side
 /// `expiry_date_to_ist_nanos`). Cold path, once per daily master build.
-/// Feature-gated 2026-07-14 (PR-C2 r1 hygiene): its sole caller
-/// (`build_groww_lifecycle_rows`) is `daily_universe_fetcher`-gated, so the
-/// un-gated fn was dead code in the default feature mode.
+/// (PR-C3 2026-07-14: the short-lived `daily_universe_fetcher` gate from the
+/// PR-C2 r1 hygiene pass was deleted with the feature itself — this fn and
+/// its sole caller `build_groww_lifecycle_rows` compile unconditionally.)
 fn expiry_str_to_ist_midnight_nanos(expiry: &str) -> i64 {
     let trimmed = expiry.trim();
     if trimmed.is_empty() {
@@ -53,8 +53,9 @@ fn expiry_str_to_ist_midnight_nanos(expiry: &str) -> i64 {
     midnight.and_utc().timestamp_nanos_opt().unwrap_or(0)
 }
 
-// `Feed` / `ErrorCode` / the `error!`+`info!` macros are only used by the feature-gated
-// builders + persist impl (the shared master tables exist only under `daily_universe_fetcher`).
+// `Feed` / `ErrorCode` / the `error!`+`info!` macros are used by the builders +
+// persist impl (all unconditional since PR-C3 2026-07-14 — the
+// `daily_universe_fetcher` feature was deleted with the Dhan instrument chain).
 use tickvault_common::error_code::ErrorCode;
 use tickvault_common::feed::Feed;
 use tracing::{error, info};
@@ -266,8 +267,9 @@ async fn questdb_master_ready(questdb: &QuestDbConfig) -> bool {
 /// Borrows from `set`; the returned rows borrow `&'static` labels + the entry strings, so the
 /// caller keeps `set` alive for the append.
 ///
-/// Feature-gated behind `daily_universe_fetcher` — the storage `InstrumentLifecycleRow` type
-/// (and the whole `instrument_lifecycle` table machinery) only exists under that feature.
+/// PR-C3 (2026-07-14): compiles unconditionally — the storage
+/// `InstrumentLifecycleRow` type (and the whole `instrument_lifecycle` table
+/// machinery) is no longer feature-gated.
 #[must_use]
 pub fn build_groww_lifecycle_rows<'a>(
     set: &'a GrowwWatchSet,
@@ -369,8 +371,8 @@ pub fn build_groww_lifecycle_rows<'a>(
 /// Only stock (Ltp) entries with a retained `symbol_name` are constituents; index values are
 /// not their own constituents. `index_name` is `"NIFTY Total Market"` (the NTM membership all
 /// resolved Groww stocks belong to — the `GrowwWatchSet` stock set IS the NTM-resolved set per
-/// `instruments.rs`). `via_isin` is `true` (the Groww resolver joins by ISIN). Feature-gated
-/// behind `daily_universe_fetcher` (the storage row type lives there).
+/// `instruments.rs`). `via_isin` is `true` (the Groww resolver joins by ISIN).
+/// PR-C3 (2026-07-14): compiles unconditionally (the storage row type is un-gated).
 #[must_use]
 pub fn build_groww_constituency_rows<'a>(
     set: &'a GrowwWatchSet,
@@ -973,10 +975,10 @@ async fn emit_groww_lifecycle_audit(
 ///
 /// `watch_date` is a validated `YYYY-MM-DD` IST date (the caller already validates it).
 ///
-/// Feature-gated impl: both shared master tables (`instrument_lifecycle`,
-/// `index_constituency`) and their row types / append fns live behind the storage
-/// `daily_universe_fetcher` feature. The non-gated stub below keeps the call site compiling
-/// when the feature is off (in which case the master tables themselves do not exist).
+/// PR-C3 (2026-07-14): compiles unconditionally — the `daily_universe_fetcher`
+/// feature (and the no-op stub that used to shadow this fn when it was off)
+/// was deleted with the Dhan instrument chain; the storage row types / append
+/// fns it reuses are unconditional too.
 // TEST-EXEMPT: cold-path ILP I/O orchestration; not unit-testable without live QuestDB. The pure builders (groww_segment_label / build_groww_lifecycle_rows / build_groww_constituency_rows) + the should_skip_master_append / classify_persist_failure gates are unit-tested below; the bulk append fns it reuses are unit-tested + boot-integration-exercised in the storage crate.
 pub async fn persist_groww_instruments(
     questdb: &QuestDbConfig,
@@ -1443,8 +1445,8 @@ mod tests {
     /// Builds a set where the live-subscribe `entries` is CAPPED to `entries`, but
     /// the master `master_entries` is the FULL pre-cap superset — the decoupling the
     /// row builders must honor. Used by the "uses master_entries not capped" tests.
-    /// Feature-gated 2026-07-14 (PR-C2 r1 hygiene): both consuming tests are
-    /// `daily_universe_fetcher`-gated, so the helper was dead in default mode.
+    /// (PR-C3 2026-07-14: the short-lived PR-C2 r1 feature gate on this helper
+    /// and its consuming tests was deleted with the feature — all unconditional.)
     fn capped_set(capped: Vec<WatchEntry>, full: Vec<WatchEntry>) -> GrowwWatchSet {
         let indices = full
             .iter()
@@ -1789,8 +1791,11 @@ mod tests {
         }
         // Source-scan: the persist orchestration only log+count+returns on failure —
         // never aborts the feed. Scope the scan to the PRODUCTION fn body (between its
-        // signature and the `#[cfg(not(...))]` stub) so this test's own assertion
-        // strings — which necessarily NAME the banned tokens — are not self-matched.
+        // signature and the `#[cfg(test)] mod tests` boundary — the persist fn is the
+        // LAST production item in this module; re-anchored in PR-C3 2026-07-14 after
+        // the old `#[cfg(not(feature = ...))]` stub anchor was deleted with the
+        // feature) so this test's own assertion strings — which necessarily NAME the
+        // banned tokens — are not self-matched.
         let file = include_str!("shared_master_writer.rs");
         // NB: the needle is split with `concat!` so this assertion string does not
         // itself trip the pub-fn-test-guard's `pub async fn ` grep (it is a string
@@ -1799,9 +1804,9 @@ mod tests {
             .find(concat!("pub async f", "n persist_groww_instruments("))
             .expect("persist fn present");
         let end = file[start..]
-            .find("#[cfg(not(feature = \"daily_universe_fetcher\"))]")
+            .find("#[cfg(test)]\nmod tests {")
             .map(|o| start + o)
-            .expect("non-gated stub follows the gated impl");
+            .expect("the test module follows the persist impl");
         let persist_body = &file[start..end];
         for banned in [
             "panic!(",
