@@ -1,5 +1,17 @@
 //! Post-market 1-minute cross-verification (operator directive 2026-06-02).
 //!
+//! **RETAINED-DORMANT since PR-C2 (2026-07-14, Dhan live-WS lane
+//! deletion; retirement authorized 2026-07-13 — see the banner in
+//! `cross-verify-1m-error-codes.md`):** the 15:31 IST scheduler SPAWN died
+//! with the deleted `spawn_post_market_tasks` seam, so this module has ZERO
+//! runtime spawn sites (tests + the `CROSS_VERIFY_TRIGGER_SECS_OF_DAY_IST`
+//! const read by `spot_1m_rest_boot`'s sweep-timing assert only). With no
+//! Dhan live candles there is no live side to compare — the FILE deletion
+//! lands in C3. The Phase B relocation obligation is ALREADY met: the
+//! shared `parse_intraday_1m_candles` / `MinuteCandle` primitives moved to
+//! `dhan_intraday_parse.rs` in Phase C1 (pure move), so C3 only needs to
+//! re-home the trigger const.
+//!
 //! At **15:31 IST** each trading day, for every subscribed **spot** instrument
 //! (the daily-universe SIDs — indices + F&O underlyings), fetch Dhan's
 //! authoritative intraday 1-minute candles (`POST /v2/charts/intraday`,

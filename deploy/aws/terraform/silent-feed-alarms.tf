@@ -73,6 +73,16 @@
 # MANDATED FOLLOW-UP: observe the exported per-feed Sum(5m) distribution for
 # one trading week and ratchet the threshold with a dated note if the healthy
 # floor approaches 2000.
+#
+# DORMANT SINCE PR-C2 (2026-07-14, Dhan live-WS lane deletion): the feed=dhan
+# `tv_boundary_catchup_total` series lost ALL writers with the lane — the
+# Dhan Engine-B aggregator instance has zero tick publishers, so its catch-up
+# driver can never seal (and the whole universe chain deletes in C3). The
+# alarm is dormant-SAFE (treat_missing_data=notBreaching + actions off by
+# default under the window gate), never a false page. Its removal-vs-retain
+# decision lands in PR-C3 alongside the detector/aggregator-chain deletion —
+# NOT silently dropped here (merge-gate discipline: writer-less alarms get a
+# dated note or a same-PR retirement; C3 owns this one's fate).
 # ---------------------------------------------------------------------------
 resource "aws_cloudwatch_metric_alarm" "boundary_catchup_storm_dhan" {
   alarm_name          = "tv-${var.environment}-boundary-catchup-storm-dhan"
@@ -129,6 +139,15 @@ resource "aws_cloudwatch_metric_alarm" "boundary_catchup_storm_dhan" {
 # transient decays out of the window within ~60s and cannot hold 10
 # consecutive breaching minutes. The incident's all-day p99 46s pages at
 # minute 10.
+#
+# DORMANT SINCE PR-C2 (2026-07-14, Dhan live-WS lane deletion): the Dhan half
+# of the feed-lag monitor (`run_dhan_lag_publisher` / `record_dhan_tick`)
+# lost its spawn site + tick source with the lane, so
+# `tv_dhan_exchange_lag_p99_seconds` is never published again. The alarm is
+# dormant-SAFE (treat_missing_data=notBreaching + actions off by default
+# under the window gate), never a false page. Its removal-vs-retain decision
+# lands in PR-C3 with the rest of the Dhan-lag detector surface — NOT
+# silently dropped here (dated-note-or-same-PR-retirement discipline).
 # ---------------------------------------------------------------------------
 resource "aws_cloudwatch_metric_alarm" "dhan_exchange_lag_p99_high" {
   alarm_name          = "tv-${var.environment}-dhan-exchange-lag-p99-high"

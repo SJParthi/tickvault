@@ -81,8 +81,16 @@ call site) and Phase A flipped `dhan_enabled=false` + revoked the runtime ON-hal
 - **/feeds Dhan toggle:** with `LaneState` gone the 409-on-enable arm must remain coherent
   (handler + tests) — a Dhan enable is refused; a Dhan disable of an already-off feed stays
   a no-op success.
-- **Ratchet baselines:** test-count + pub-fn baselines DECREASE (deletions) — synced DOWN in
-  their own commit citing the AWS-lifecycle precedent + this deletion PR.
+- **Ratchet baselines:** test-count + pub-fn baselines DECREASE (deletions). 2026-07-14
+  truth-sync: `.claude/hooks/.test-count-baseline` is GITIGNORED (untracked), so the sync
+  is LOCAL-ONLY by design and structurally CANNOT ship "in its own commit" (an earlier
+  revision of this bullet claimed it would — false as written). The real mechanism: each
+  contributor's local pre-push ratchet re-baselines on their box (8985 → 8539 tests on the
+  authoring box for this PR; → 8537 after the r1 review retired 2 more lane-dead guards),
+  and CI is unaffected — per merge-gate-lock-2026-07-04.md §3
+  row 6, ratchet-baseline guards are deliberately local-only (a CI run would establish a
+  fresh baseline and pass vacuously). The numbers are recorded HERE + in the PR body
+  instead of a commit.
 
 ## Failure Modes
 
@@ -126,6 +134,12 @@ Until merge, the branch can be abandoned with zero prod impact (prod already run
 - No new error codes; DHAN-LANE-01..04 / SLO-03 emit sites die with their code (enum-variant
   deletion is C4 per the retirement banners, keeping the crossref tests green both ways —
   variants stay mentioned in rule files until C4).
+- 2026-07-14 (r1 honesty note): the PROCESS-shared tick broadcast is PUBLISHER-LESS post-C2
+  (Groww persists via its own writer + owns its own aggregator instance) — the obs,
+  tick-storage, Dhan-aggregator and day-ohlc subscribers idle forever by design; the shared
+  seal-writer the aggregator install carries IS load-bearing for Groww and stays. The
+  day-ohlc/INDEX-OHLC machinery can therefore never fire — its retain-vs-delete decision is
+  a C3 call (dated note at the main.rs spawn site).
 
 ## Plan Items
 
@@ -135,7 +149,8 @@ Until merge, the branch can be abandoned with zero prod impact (prod already run
 - [x] Delete D2b supervisor + dhan_activation.rs + LaneState (Files: crates/app/src/main.rs, crates/app/src/dhan_activation.rs, crates/api/src/feed_state.rs; Tests: chaos_feed_state, feed handler tests)
 - [x] Delete main-feed WS machinery (Files: crates/core/src/websocket/*; Tests: core suite both feature modes)
 - [x] Delete spawn_post_market_tasks + wire family-claim comment (Files: crates/app/src/main.rs, crates/app/src/dhan_rest_stack.rs; Tests: tick_conservation_wiring_guard adjusted)
-- [x] SLO publisher deletion + rule-file PARK note (Files: crates/app/src/main.rs, .claude/rules/project/wave-3-d-error-codes.md) — publisher deleted per the operator PARK ruling; wave-3-d banner added. Terraform alarm REMOVAL deferred to Phase C follow-up (both realtime-guarantee alarms are dormant-safe: treat_missing_data=notBreaching + actions off by default; the liveness alarm was re-pointed to the Groww lag gauge in Phase A); slo_score.rs retained as a contract stub per the same banner
+- [x] SLO publisher deletion + rule-file PARK note + terraform retirement (Files: crates/app/src/main.rs, .claude/rules/project/wave-3-d-error-codes.md, deploy/aws/terraform/{app-alarms,silent-feed-alarms,market-hours-liveness-alarm,metrics-log-metric-filters}.tf, deploy/aws/terraform/user-data.sh.tftpl) — publisher deleted per the operator PARK ruling; wave-3-d banner added. 2026-07-14 truth-sync: the terraform alarm removal was NOT deferred — this PR itself retired BOTH realtime-guarantee alarms, their window-gate armed-list entries, the score's EMF allowlist rows, and its fallback log-metric-filter (an earlier revision of this item claimed "deferred to Phase C follow-up" — stale wording, corrected). The two remaining writer-less Dhan alarms (dhan-exchange-lag-p99-high + boundary-catchup-storm-dhan) carry dated dormant-safe notes in silent-feed-alarms.tf; their removal decision lands in PR-C3 with the detector. slo_score.rs retained as a contract stub per the same banner
 - [x] Re-home tv_order_update_ws_active (Files: crates/core/src/websocket/order_update_connection.rs; Tests: gauge write pin)
 - [x] Non-blocking Dhan-OFF liveness emit (Files: crates/app/src/main.rs; Tests: boot_completed_metric_guard)
-- [x] New ratchets + baseline syncs (Files: crates/app/tests/*, crates/core/tests/dhan_live_ws_retired_guard.rs, .claude/hooks/.test-count-baseline; Tests: dhan_live_ws_retired_guard [3 new pins], ~25 app guard suites retired/re-pointed with dated PR-C2 notes, orphan-position watchdog + BootHealthCheck re-homed into dhan_rest_stack/build_shared_infra, test-count baseline synced, reinject_wal_frames TEST-EXEMPT)
+- [x] New ratchets + baseline syncs (Files: crates/app/tests/*, crates/core/tests/dhan_live_ws_retired_guard.rs; Tests: dhan_live_ws_retired_guard [3 new pins], ~25 app guard suites retired/re-pointed with dated PR-C2 notes, orphan-position watchdog + BootHealthCheck re-homed into dhan_rest_stack/build_shared_infra, test-count baseline re-synced LOCALLY (gitignored file — see the Edge Cases truth-sync bullet; 8985 → 8539 → 8537 after r1), reinject_wal_frames TEST-EXEMPT)
+- [x] Review-round fixes (2026-07-14, r1): retire the unsynced `boot_timing_proof_is_measured_and_surfaced` storage guard with a dated note (Files: crates/storage/tests/daily_universe_scope_guard.rs); dated dormant-safe notes on the two writer-less Dhan alarms (Files: deploy/aws/terraform/silent-feed-alarms.tf); gate-Lambda "12 gated alarms" text corrected to the real 8 (Files: deploy/aws/terraform/market-hours-liveness-alarm.tf); stale doc-truth rewrites — dhan_rest_stack.rs L2-gauge paragraph (the gauge IS live post-rewire), main.rs deleted-arm boot comments, systemd_boot_notify_guard header (Files: crates/app/src/dhan_rest_stack.rs, crates/app/src/main.rs, crates/app/tests/systemd_boot_notify_guard.rs); dormancy banners on the 4 unbannered retained-dormant modules (Files: crates/core/src/auth/fast_boot_validation.rs, crates/core/src/network/ip_monitor.rs, crates/app/src/cross_verify_1m_boot.rs, crates/core/src/instrument/slo_score.rs); 3 orphaned dead-in-default-mode test helpers removed/feature-gated (Files: crates/core/src/instrument/subscription_planner.rs, crates/core/src/feed/groww/shared_master_writer.rs)

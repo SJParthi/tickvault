@@ -60,35 +60,44 @@
 //!    task consumes the broadcast; the positive "order activity observed
 //!    while dormant" signal) and DISCARDED — no WAL capture, no OMS
 //!    consumer; durable order-event capture returns with live trading (the
-//!    OMS wiring). Boot-staged order-update WAL segments remain UNDRAINED
-//!    on dhan-off boots (pre-existing Phase A residual — C2 settles the
-//!    replay topology).
-//!    **Paging honesty (2026-07-13 hostile-review L2):** there is NO
-//!    CloudWatch dead-socket alarm for this stack's order-update WS —
-//!    `tv_order_update_ws_active` is written ONLY by the (dead) lane spawn
-//!    sites, so the `tv-<env>-order-update-ws-inactive` alarm is
-//!    missing-data-silent both ways on a dhan-off boot; the WS-GAP-10
-//!    in-loop outage page (notifier wired) is the SOLE pager. Re-homing
-//!    the gauge into the connection loop is a C2 target.
+//!    OMS wiring). PR-C2 (2026-07-14) SETTLED the replay topology: boot-
+//!    staged order-update WAL segments now DRAIN into the broadcast on
+//!    every boot (main.rs STAGE-C.2b →
+//!    `drain_replayed_order_updates_to_broadcast`; the dormant drain
+//!    counts them) before `confirm_replayed` archives — the Phase A
+//!    undrained-segments residual is closed.
+//!    **Paging honesty (updated PR-C2, 2026-07-14 — the C1 L2 target
+//!    LANDED):** `tv_order_update_ws_active` is now written INSIDE
+//!    `run_order_update_connection` itself (1.0 on connect, 0.0 on every
+//!    disconnect arm), so the gauge is LIVE via this stack's spawn and the
+//!    `tv-<env>-order-update-ws-inactive` CloudWatch alarm has a real
+//!    writer on every boot. Two pagers therefore exist: the CloudWatch
+//!    dead-socket alarm (gauge-driven, notBreaching-on-missing) + the
+//!    WS-GAP-10 in-loop outage page (notifier wired). An earlier revision
+//!    of this paragraph — written on the C1 branch — said the gauge was
+//!    lane-only-written and re-homing it "is a C2 target"; that target
+//!    shipped in PR-C2 and the stale text is corrected here.
 //!
-//! **Deliberately NOT spawned (stay lane-only; deletion is a later phase):**
-//! the WS pool, universe build / CSV download, prev-day OHLCV, the SLO
-//! publisher, the 15:31 cross-verify, the EOD digest, and the
-//! orphan-position watchdog. (The order-update WS moved OFF this list in
-//! PR-C1 per Q4-i — see item 5 above.)
+//! **Deliberately NOT spawned (PR-C2 truth-sync, 2026-07-14):** the
+//! prev-day OHLCV fetch (retained-dormant module — deletes in C3), the EOD
+//! digest (its `EndOfDayDigest` event variant survives emitterless in core;
+//! the emit died with the lane), and the WS pool / universe build / SLO
+//! publisher / the 15:31 cross-verify SPAWN — all DELETED in PR-C2 with the
+//! lane (the cross_verify_1m_boot.rs FILE deletion is C3). The
+//! orphan-position watchdog moved OFF this list in PR-C2 (RE-HOMED into
+//! this stack — see its spawn below); the order-update WS moved off in
+//! PR-C1 per Q4-i (item 5 above).
 //!
-//! **Mutual exclusion by construction:** this stack is spawned ONLY from the
-//! Dhan-OFF branch of main.rs (the `else` of `if config.feeds.dhan_enabled`)
-//! AND only when the RAW boot TOML retires the lane
-//! (`FeedRuntimeState::is_dhan_config_enabled() == false`, seeded
-//! PRE-overlay — round-2 FIX A, 2026-07-13). The same raw value makes the
-//! /api/feeds handler 409-refuse a Dhan enable and the runtime cold-start
-//! supervisor refuse a lane start — so the lane's own lock / TokenManager /
-//! post-market seam can never run alongside this stack. On a config-ON boot
-//! whose runtime overlay left Dhan off, this stack does NOT spawn (the lane
-//! is dormant, not retired — a runtime re-enable cold-starts the full lane,
-//! which owns the REST surface via `spawn_post_market_tasks`). A
-//! process-global once-guard additionally rejects a double spawn.
+//! **Single Dhan surface by construction (PR-C2, 2026-07-14):** with the
+//! lane DELETED, this stack is spawned UNCONDITIONALLY from main.rs' single
+//! boot path — there is no Dhan-ON branch left to exclude against. A raw
+//! boot TOML still carrying `dhan_enabled = true` is an illegal
+//! post-retirement config: main.rs logs it loudly and IGNORES it (no lane
+//! exists to start), and the /api/feeds handler 409-refuses a Dhan enable
+//! unconditionally. The pre-C2 mutual-exclusion machinery (spawn gated on
+//! the raw-TOML `is_dhan_config_enabled() == false`, the runtime
+//! cold-start supervisor refusal) died with the lane; a process-global
+//! once-guard still rejects a double spawn.
 //!
 //! **Panic honesty (the TICK-FLUSH-01 precedent):** the release profile sets
 //! `panic = "abort"`, so a panicked bring-up task aborts the PROCESS in
@@ -161,25 +170,24 @@ const DHAN_REST_STACK_TOKEN_RETRY_FLOOR_SECS: u64 = 130;
 /// families). First caller wins; later calls log INFO and return `None`.
 static DHAN_REST_STACK_SPAWNED: AtomicBool = AtomicBool::new(false);
 
-/// Process-global once-guard for the Dhan-REST SCHEDULED TASK FAMILY —
-/// SHARED between the lane path (`main.rs::spawn_post_market_tasks`: REST
-/// canary + spot_1m_rest + option_chain_1m + the lane-only orphan watchdog
-/// / EOD digest / 1m cross-verify) and this REST-only stack's Phase 5
-/// (canary + spot + chain).
+/// Process-global once-guard for the Dhan-REST SCHEDULED TASK FAMILY (REST
+/// canary + spot_1m_rest + option_chain_1m). PR-C2 (2026-07-14): the lane's
+/// `main.rs::spawn_post_market_tasks` — the guard's original second claimant
+/// — was DELETED with the lane, so this stack's Phase 5 is the SOLE claimant
+/// today.
 ///
-/// INVARIANT (2026-07-13 hostile-review MEDIUM): the family is spawned AT
-/// MOST ONCE per process, WHICHEVER path claims first — so a future
-/// relaxation of the runtime cold-start refusal (or any new path into
-/// `run_dhan_lane_cold_start` → `spawn_post_market_tasks`) can never
-/// double-spawn the canary/spot/chain schedulers alongside this stack's
-/// (double Data-API pulls per minute close, double Telegram). Mutual
-/// exclusion by construction still holds today; this guard makes it
-/// mechanical instead of situational.
+/// INVARIANT (2026-07-13 hostile-review MEDIUM, still binding): the family
+/// is spawned AT MOST ONCE per process, WHICHEVER path claims first — kept
+/// post-C2 as the mechanical tripwire so any FUTURE second spawn path
+/// (e.g. a live-trading re-wire) can never double-spawn the
+/// canary/spot/chain schedulers (double Data-API pulls per minute close,
+/// double Telegram). Sole-claimant by construction today; this guard makes
+/// it mechanical instead of situational.
 static POST_MARKET_TASK_FAMILY_CLAIMED: AtomicBool = AtomicBool::new(false);
 
 /// Claim the shared Dhan-REST task-family once-guard: `true` exactly once
-/// per process (first caller wins). Called by BOTH spawn paths — the
-/// lane's `spawn_post_market_tasks` (main.rs) and this stack's Phase 5.
+/// per process (first caller wins). Sole caller post-C2: this stack's
+/// Phase 5 (the lane's `spawn_post_market_tasks` claimant is deleted).
 #[must_use]
 pub fn claim_post_market_task_family_once() -> bool {
     !POST_MARKET_TASK_FAMILY_CLAIMED.swap(true, Ordering::SeqCst)
@@ -671,17 +679,18 @@ async fn run_dhan_rest_stack(params: DhanRestStackParams) {
     };
 
     // -----------------------------------------------------------------------
-    // Phase 5: the retained REST subsystems — the EXACT spawn shapes of
-    // main.rs::spawn_post_market_tasks (canary / spot / chain arms only;
-    // orphan watchdog, EOD digest and cross-verify deliberately stay
-    // lane-only per the Phase A scope).
+    // Phase 5: the retained REST subsystems — canary / spot / chain arms
+    // (spawn shapes inherited verbatim from the deleted
+    // main.rs::spawn_post_market_tasks), PLUS the orphan-position watchdog
+    // RE-HOMED here in PR-C2 (below). The EOD digest and the 15:31 1m
+    // cross-verify SPAWNS died with the lane (their retained-dormant
+    // modules delete in C3).
     // -----------------------------------------------------------------------
-    // Shared once-guard (2026-07-13 hostile-review MEDIUM): claim the
-    // Dhan-REST task family BEFORE spawning it, the SAME guard the lane's
-    // spawn_post_market_tasks claims — so a future relaxation of the
-    // runtime cold-start refusal can never run canary/spot/chain TWICE in
-    // one process. Unreachable today (mutual exclusion by construction);
-    // if it ever fires, the invariant is broken — stay down loudly.
+    // Shared once-guard (2026-07-13 hostile-review MEDIUM; sole claimant
+    // post-C2): claim the Dhan-REST task family BEFORE spawning it — so any
+    // FUTURE second spawn path can never run canary/spot/chain TWICE in one
+    // process. Unreachable today (sole claimant by construction); if it
+    // ever fires, the invariant is broken — stay down loudly.
     if !claim_post_market_task_family_once() {
         error!(
             "Dhan REST-only stack: the Dhan-REST scheduled task family is ALREADY \
