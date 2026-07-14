@@ -1393,6 +1393,26 @@ pub enum NotificationEvent {
     /// whole-feed-down claim.
     GrowwSidecarRejected { reason: String, fleet_summary: bool },
 
+    /// W2 PR#5 (2026-07-10, audit follow-up row 15): the configured NSE
+    /// holiday calendar's coverage horizon is running out (or already ran
+    /// out). The holiday list covers one calendar year at a time and the
+    /// trading-day gate has NO year bound — past the newest listed year,
+    /// every un-listed weekday holiday silently reads as a trading day
+    /// (the box starts, feeds connect, a full billable session burns on a
+    /// market-closed day). Fired by the calendar-staleness watchdog
+    /// (`crates/app/src/calendar_staleness.rs`), edge-latched to at most
+    /// one page per process per IST day. Severity::High — demands operator
+    /// action (paste the next official NSE circular into the config).
+    HolidayCalendarCoverageLow {
+        /// Signed days of coverage left (negative = already past the
+        /// cliff); `None` = the configured holiday list is EMPTY
+        /// (pathological — the config guards prevent it in prod, but the
+        /// body renders it honestly instead of a fake number).
+        days_remaining: Option<i64>,
+        /// Human-readable last covered date, e.g. "31 Dec 2026".
+        coverage_end_display: String,
+    },
+
     /// Custom alert from any component. `Severity::High` → pages Telegram +
     /// SNS SMS. Reserve for genuinely operator-actionable conditions; for
     /// informational status pings use [`Self::CustomStatus`] instead.
