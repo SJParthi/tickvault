@@ -62,10 +62,11 @@ stall watchdog, the reconnect ladder, and the capture chain are untouched).
    `feed_gap_audit` ensure-DDL could not run (HTTP-CLIENT-01 class; the
    usual duplicate-row-window consequence until a later boot's ensure
    succeeds).
-2. `stage="append"` / `stage="flush"` — an OPEN/CLOSE row could not be
-   persisted (ILP-over-HTTP down, QuestDB unreachable, server reject on the
-   per-request ACK). The episode still fires its Telegram bubble; only the
-   durable row is missing until the next edge re-appends.
+2. `stage="append_flush"` — an OPEN/CLOSE row could not be persisted
+   (ILP-over-HTTP down, QuestDB unreachable, server reject on the
+   per-request ACK; append + flush share one stage label — they run as one
+   best-effort unit per edge). The episode still fires its Telegram bubble;
+   only the durable row is missing until the next edge re-appends.
 3. `stage="dangling_close"` — the 15:45 IST scoreboard sweep could not
    close a dangling OPEN episode.
 4. Any other degraded machinery arm (tracker/channel) — named in the
