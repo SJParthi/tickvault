@@ -60,8 +60,18 @@
 - Market order assumed filled immediately → MPP conversion may leave order PENDING
 
 18. **Market Price Protection (MPP) — effective March 21, 2026.** Market orders via API are auto-converted to LIMIT orders with MPP by the exchange. `orderType: "MARKET"` is still accepted in the request, but the order book may show `LIMIT`. Systems MUST verify order execution status after placement — a market order may remain `PENDING` if MPP limit price is not immediately executable.
+    - **2026-07-14 provenance note (runner-crawled):** the MPP framing is absent from ALL live
+      Dhan doc surfaces (191-page crawl, grep-zero incl. HTML comments — orders, releases,
+      annexure, portal exports); it is exchange-circular/SDK/comms-sourced. NOT contradicted;
+      operational force KEPT. Do not cite dhanhq.co docs for MPP. See
+      `docs/dhan-ref/07-orders.md` "2026-07-14 Upstream Update".
 
 19. **Static IP enforcement — effective April 1, 2026.** Orders from unregistered IPs are REJECTED by the exchange. No grace period. Verify `ordersAllowed == true` from `GET /v2/ip/getIP` before market open.
+    - **2026-07-14 provenance note (runner-crawled):** the April-1-2026 rejection framing is
+      likewise absent from all live doc surfaces (the docs say only that static-IP
+      whitelisting is required for order APIs); comms-sourced, NOT contradicted. The
+      `ordersAllowed` field it references is WIRE-OBSERVED but doc-unbacked on both surfaces
+      (see `authentication.md` rule 7's 2026-07-14 note). Operational force KEPT.
 
 ## Trigger
 
