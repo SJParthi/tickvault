@@ -44,7 +44,7 @@ jobs:
   crawl:
     name: Fetch docs on runner
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -129,10 +129,8 @@ jobs:
 
           REQUESTED_COUNT=$(wc -l < "$FETCHED_URLS_FILE" | tr -d ' ')
 
-          # --- Sitemaps (best-effort, always attempted) ---
-          for sm in https://dhanhq.co/sitemap.xml https://docs.dhanhq.co/sitemap.xml; do
-            fetch_one "$sm" 0
-          done
+          # (zerodha branch: no vendor sitemap probes — the SEED nav crawl
+          #  below is the completeness source for kite.trade / support portal)
 
           # --- Pass 2: nav crawl from SEED pages ---
           DISCOVERED_FILE=$(mktemp)
@@ -150,16 +148,25 @@ jobs:
                       *\#*) href="${href%%#*}" ;;
                     esac
                     [ -z "$href" ] && continue
+                    # zerodha branch: same-site doc/support links (absolute,
+                    # protocol-relative, root-relative, and page-relative —
+                    # kite docs nav uses ../section/ + child-relative forms).
                     case "$href" in
-                      https://dhanhq.co/docs/v2/*|https://docs.dhanhq.co/*) echo "$href" ;;
-                      //dhanhq.co/docs/v2/*|//docs.dhanhq.co/*) echo "https:${href}" ;;
-                      /docs/v2/*|/api/v2/*) echo "${host}${href}" ;;
+                      https://kite.trade/docs/*|https://support.zerodha.com/category/*) echo "$href" ;;
+                      //kite.trade/docs/*|//support.zerodha.com/category/*) echo "https:${href}" ;;
+                      /*) echo "${host}${href}" ;;
+                      ../*) echo "${seed%/*/}/${href#../}" ;;
+                      *:*|\?*) : ;;
+                      *) echo "${seed%/}/${href}" ;;
                     esac
                   done >> "$DISCOVERED_FILE" || true
             done < "$SEEDS_FILE"
 
-            # normalize + dedupe against already-fetched, cap 150
-            sort -u "$DISCOVERED_FILE" | grep -vxF -f "$FETCHED_URLS_FILE" | head -150 > "${DISCOVERED_FILE}.todo" || true
+            # normalize: keep only the allowed zerodha doc/support prefixes,
+            # dedupe against already-fetched, cap 150
+            sort -u "$DISCOVERED_FILE" \
+              | grep -E '^https://(kite\.trade/docs/|support\.zerodha\.com/category/)' \
+              | grep -vxF -f "$FETCHED_URLS_FILE" | head -150 > "${DISCOVERED_FILE}.todo" || true
             DISCOVERED_COUNT=$(wc -l < "${DISCOVERED_FILE}.todo" | tr -d ' ')
             echo "nav crawl discovered $DISCOVERED_COUNT new URLs"
             cp "${DISCOVERED_FILE}.todo" crawl-out/discovered-urls.txt
@@ -200,7 +207,7 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: docs-crawl-${{ inputs.label || 'dhan' }}-${{ github.run_id }}
+          name: docs-crawl-${{ inputs.label || 'zerodha' }}-${{ github.run_id }}
           path: crawl-out/
           retention-days: 7
 
