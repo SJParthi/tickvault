@@ -67,9 +67,33 @@ fires one edge-latched ERROR per (table, suspension episode) — a merely-DOWN
 QuestDB never fires it, the boot-probe escalation codes own the down-server
 page; recovery = the operator's
 `ALTER TABLE <t> RESUME WAL`, never auto-executed; runbook
-`.claude/rules/project/wal-suspension-error-codes.md`**)**. **Everything else
+`.claude/rules/project/wal-suspension-error-codes.md`**)**, **AUTH-GAP-05
+(added 2026-07-14, REST-audit gap 01** — SCOPED to the mint-FAILURE arm only
+via the `$.permanent` boolean field that exists only on that emission; the
+trigger arm fires on every forced re-mint INCLUDING successful ~30-min
+self-heals and is operator-ruled noise — silent-when-healing,
+loud-only-when-unobtainable**)**, **SPOT1M-01 and CHAIN-02 (added
+2026-07-14, REST-audit gap 03** — SCOPED to the once-per-episode
+`stage="escalation"` edge lines only, covering the Dhan spot + Groww spot +
+Groww contract legs (SPOT1M-01) and both feeds' chain legs (CHAIN-02); the
+per-minute sub-edge lines are deliberately unmatched — a plain code filter
+would over-page every failed minute vs the designed 3-minute escalation;
+the persist-failure codes feed these edges persist-gated, so a persist
+outage still reaches the page**)**, **CHAIN-01 (added 2026-07-14** — plain
+coded filter; both stages are once-per-episode page-worthy and the
+probe-only path never emits it at ERROR**)**, and **CHAIN-04 (added
+2026-07-14** — SCOPED to the down-for-the-day `stage="warmup"` arm only;
+the probe_* / warmup_no_token stages are log-only-by-design
+transient/respawn arms**)**. **Everything else
 is log-sink-only** unless it has its own metric alarm (app-alarms.tf) or a
-typed `NotificationEvent`.
+typed `NotificationEvent`. Counter-side (non-errcode) pager added
+2026-07-14 (REST-audit gap 05): `tv-<env>-telegram-drops`
+(`telegram-drop-alarm.tf` — Sum ≥ 3 drops of `tv_telegram_dropped_total`
+per aligned 900s window via the metrics-log delta-extraction house
+pattern; a broken bot silently killed every typed-event page; honest
+residual: the counter is NOT yet pre-registered at 0 post-recorder-install,
+so the session's first drop per reason-series is eaten as the CW delta
+baseline — flagged crates follow-up).
 
 **Retired paging entries:** the `ws-gap-07` filter+alarm was RETIRED
 PR-C2 2026-07-13 — its only ERROR-level emit site (the main-feed

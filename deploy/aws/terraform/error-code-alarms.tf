@@ -42,6 +42,29 @@
 # 10 alarms (~+$0.10/mo). Audit follow-up row 10: a WAL-suspended QuestDB
 # table silently stopped applying ILP-ACKed writes with zero signal — the
 # new 60s wal_tables() probe pages it here.
+#
+# 2026-07-14 UPDATE (REST-pipeline adversarial audit, GAP-01 + GAP-03 —
+# docs/audits/2026-07-14-rest-pipeline-adversarial-audit.md): +5 entries ->
+# 15 filters + 15 alarms (~+$0.50/mo). The audit's single biggest systemic
+# weakness: REST-leg paging was app-emitted Telegram ONLY — a dead app
+# notifier (or Telegram bot) silenced AUTH-GAP-05 + SPOT1M/CHAIN entirely.
+# SCOPED sub-filters (a 2026-07-14 extension of the pinned coded shape —
+# error_code_paging_filter_drift_guard.rs accepts one extra $.field clause):
+#   - auth-gap-05-remint-failed matches ONLY the mint-FAILURE arm (the
+#     $.permanent bool field exists only on that emission) — the trigger
+#     arm fires on every forced re-mint INCLUDING successful self-heals,
+#     and the operator ruled those pages noise ("silent-when-healing,
+#     loud-only-when-unobtainable").
+#   - spot1m-01-escalation / chain-02-escalation match ONLY the
+#     once-per-episode stage="escalation" edge lines — the per-minute
+#     stage="minute_failed" lines are sub-edge by design (the 3-minute
+#     escalation edge is the page; a plain code filter would over-page
+#     every failed minute).
+#   - chain-04-warmup matches ONLY the down-for-the-day stage="warmup"
+#     arm — the probe_* / warmup_no_token stages are log-only-by-design
+#     respawn-retry arms (rest-1m-pipeline-error-codes.md §2e).
+#   - chain-01 is a plain coded filter (both its stages — warmup +
+#     mid_session — are once-per-episode page-worthy).
 # =============================================================================
 
 locals {
@@ -219,6 +242,96 @@ locals {
       dta         = 1
       ok_recovery = false # 2026-07-10: once-per-episode emitter - the auto-OK ~15 min later only means the datapoint aged out while the table may still be suspended (Rule-11 false-recovery; ws-reinject-01 precedent)
       desc        = "WAL-SUSPEND-01: a QuestDB table's WAL apply is SUSPENDED - ingestion keeps ACKing rows while they silently stop becoming visible/applied (silent data-visibility loss; typical cause = a disk-full episode or a WAL apply error). Operator action: read the table/error_tag/error_message fields in the errors-jsonl stream, fix the underlying cause (df -h /data, QuestDB logs), then run ALTER TABLE <table> RESUME WAL in the QuestDB console - NEVER auto-executed (resuming into a still-broken disk replays the failure). NO recovered/OK page: the code fires once per suspension episode; recovery signal = the falling-edge recovery log + tv_questdb_wal_suspended_tables returning to 0. Runbook: .claude/rules/project/wal-suspension-error-codes.md"
+    }
+    # AUTH-GAP-05 (added 2026-07-14 — REST-audit GAP-01): the mid-session
+    # forced token re-mint previously paged via app Telegram ONLY (no CW
+    # backstop — a dead notifier silenced the token-death page entirely).
+    # SCOPED to the mint-FAILURE arm: the $.permanent boolean field exists
+    # ONLY on the "forced re-mint failed" emission
+    # (crates/core/src/auth/mid_session_watchdog.rs — permanent=true is the
+    # RESILIENCE-03 in-flight lock refusal, permanent=false every other
+    # mint failure; both are the session-dead state per the audit's
+    # GAP-02/GAP-04: the retry-once latch holds and the token stays dead
+    # for the rest of the session). The TRIGGER arm ("forcing re-mint")
+    # fires on every episode INCLUDING successful ~30-min self-heals and
+    # carries NO permanent field — operator-ruled noise
+    # ("silent-when-healing, loud-only-when-unobtainable"), deliberately
+    # NOT matched. ok_recovery = false: once-per-episode emitter (the
+    # ws-reinject-01 precedent) — the token does not come back when the
+    # datapoint ages out; real recovery = tv_token_valid returning to 1 /
+    # the next clean watchdog cycle.
+    "auth-gap-05-remint-failed" = {
+      pattern     = "{ $.code = \"AUTH-GAP-05\" && $.level = \"ERROR\" && ($.permanent IS TRUE || $.permanent IS FALSE) }"
+      period      = 300
+      threshold   = 1
+      eval        = 3
+      dta         = 1
+      ok_recovery = false # 2026-07-14: once-per-episode mint failure - the retry-once latch holds, so the token stays dead for the session; auto-OK ~15 min later would be a Rule-11 false recovery
+      desc        = "AUTH-GAP-05 forced re-mint FAILED: the mid-session watchdog detected a sustained dead Dhan token, issued its ONE forced re-mint for the episode, and the mint FAILED (permanent=true = a peer holds the dual-instance lock in-flight; permanent=false = mint HTTP/TOTP failure) - the token stays DEAD for the rest of the session (the retry-once latch holds; the 4h sweep backstop is lane-only per audit GAP-02). Successful self-heal re-mints deliberately do NOT page (trigger arm unmatched - silent-when-healing). NO recovered/OK page: recovery signal = tv_token_valid back to 1 / the next clean profile cycle. Runbook: .claude/rules/project/wave-4-error-codes.md (AUTH-GAP-05)"
+    }
+    # SPOT1M-01 escalation edge (added 2026-07-14 — REST-audit GAP-03):
+    # the per-minute spot-1m REST legs (Dhan spot + Groww spot + Groww
+    # contract — all emit SPOT1M-01) page HIGH via app Telegram at the
+    # 3-consecutive-fully-failed-minutes edge; this filter is the CW
+    # backstop for exactly that edge. Stage-scoped: stage="escalation" is
+    # the ONCE-per-episode edge line (edge-latched, re-armed only after a
+    # fetch+persist-clean minute); the per-minute stage="minute_failed" /
+    # "boundary_skipped" / etc. lines fire every failed minute and are
+    # sub-edge by design — a plain code filter would over-page vs the
+    # designed 3-minute escalation (rest-1m-pipeline-error-codes.md §1).
+    "spot1m-01-escalation" = {
+      pattern     = "{ $.code = \"SPOT1M-01\" && $.level = \"ERROR\" && $.stage = \"escalation\" }"
+      period      = 300
+      threshold   = 1
+      eval        = 3
+      dta         = 1
+      ok_recovery = false # 2026-07-14: once-per-episode edge - the recovery signal is the leg's own typed Info recovery Telegram / rows landing again, not the datapoint aging out
+      desc        = "SPOT1M-01 escalation: a per-minute REST 1m candle leg (Dhan spot, Groww spot, or Groww contract - read the feed/leg fields in the errors-jsonl stream) fully failed 3+ consecutive minutes (persist-gated: fetch-ok-but-lost rows count as failed). Fires once per episode (edge-latched). Triage: cross-check REST-CANARY-01 + DH-901 (REST surface/token), tv_spot1m_fetch_total outcome rates, QuestDB health for persist-gated episodes. NO recovered/OK page: recovery = the leg's typed recovery Telegram + rows landing again. Runbook: .claude/rules/project/rest-1m-pipeline-error-codes.md"
+    }
+    # CHAIN-02 escalation edge (added 2026-07-14 — REST-audit GAP-03):
+    # same contract as spot1m-01-escalation for the option-chain legs
+    # (Dhan + Groww). stage="escalation" only — per-minute sub-edge lines
+    # deliberately unmatched.
+    "chain-02-escalation" = {
+      pattern     = "{ $.code = \"CHAIN-02\" && $.level = \"ERROR\" && $.stage = \"escalation\" }"
+      period      = 300
+      threshold   = 1
+      eval        = 3
+      dta         = 1
+      ok_recovery = false # 2026-07-14: once-per-episode edge - same rationale as spot1m-01-escalation
+      desc        = "CHAIN-02 escalation: a per-minute option-chain REST leg (Dhan or Groww - read the feed field) fully failed 3+ consecutive minutes (persist-gated). Fires once per episode (edge-latched). Triage: spot leg healthy + chain failing = chain-API-surface problem (entitlement wobble short of CHAIN-01, gateway); both failing = REST/token (AUTH-GAP runbooks). NO recovered/OK page: recovery = the typed ChainFetchRecovered Telegram + rows landing again. Runbook: .claude/rules/project/rest-1m-pipeline-error-codes.md"
+    }
+    # CHAIN-01 (added 2026-07-14 — REST-audit GAP-03): entitlement absent.
+    # Plain coded filter is safe: BOTH stages (warmup = day-down at boot,
+    # mid_session = revoked intra-day) fire ONCE per day/episode and are
+    # page-worthy; the probe-only path never emits CHAIN-01 (info!-level
+    # verdict only — verified 2026-07-14, option_chain_1m_boot.rs).
+    "chain-01" = {
+      pattern     = "{ $.code = \"CHAIN-01\" && $.level = \"ERROR\" }"
+      period      = 300
+      threshold   = 1
+      eval        = 3
+      dta         = 1
+      ok_recovery = false # 2026-07-14: once-per-day emitter - the entitlement stays absent when the datapoint ages out (Rule-11 false-recovery)
+      desc        = "CHAIN-01: Dhan Option Chain Data-API entitlement ABSENT (DH-902/806 class) - the chain pipeline is DOWN for the day (warmup stage) or was revoked mid-session (mid_session stage). Operator action: verify the account's Data-API plan on the Dhan portal; restoring the entitlement auto-resumes at the next trading-day boot. NO recovered/OK page: the entitlement does not return when the episode ages out. Runbook: .claude/rules/project/rest-1m-pipeline-error-codes.md"
+    }
+    # CHAIN-04 warmup arm (added 2026-07-14 — REST-audit GAP-03): the
+    # day-start expirylist warmup exhausted its bounded retries — the
+    # chain pipeline is DOWN FOR THE DAY (expiries are never guessed).
+    # Stage-scoped to "warmup" ONLY: the probe_client_build /
+    # probe_no_token / probe_inconclusive / probe_task_exit /
+    # warmup_no_token stages are log-only-by-design transient/respawn
+    # arms (warmup_no_token REPEATS every ~30s supervisor respawn until a
+    # token exists — the AUTH-GAP runbooks own the token page); a plain
+    # code filter would page on all of them.
+    "chain-04-warmup" = {
+      pattern     = "{ $.code = \"CHAIN-04\" && $.level = \"ERROR\" && $.stage = \"warmup\" }"
+      period      = 300
+      threshold   = 1
+      eval        = 3
+      dta         = 1
+      ok_recovery = false # 2026-07-14: once-per-day emitter - the day stays chain-less when the datapoint ages out; recovery = the next trading-day boot's clean warmup
+      desc        = "CHAIN-04 warmup FAILED: the day-start option-chain expirylist warmup exhausted its bounded retries - the chain pipeline is DOWN FOR THE DAY (expiry dates are never guessed; no mid-day retry by design). Triage: cross-check REST-CANARY-01 + the WS feed; a healthy REST surface with only the expirylist failing points at the option-chain API specifically. Restart the app once the REST surface is healthy to re-run the warmup, else tomorrow's boot re-warms. NO recovered/OK page: the day stays down when the datapoint ages out. Runbook: .claude/rules/project/rest-1m-pipeline-error-codes.md"
     }
   }
 }

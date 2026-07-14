@@ -689,16 +689,36 @@ degrades THAT underlying via CHAIN-02 `stage="expiry_unresolved"`
 
 ## §3. Delivery boundary (honest — no false-OK)
 
-All six codes (SPOT1M-01/02 + CHAIN-01..04) are **log-sink-only today**: NO `error_code_alerts` map entry in
-`deploy/aws/terraform/error-code-alarms.tf` and NO mention in
-`observability-architecture.md`'s paging list (the paging drift guard pins
-those surfaces untouched). The operator page for a failing pipeline is the
-typed HIGH Telegram event at the 3-minute escalation edge (+ the Info
-recovery event) — and, for the chain half, the once-per-day
-`ChainEntitlementAbsent` / `ChainExpirylistFailed` HIGH pages + the
-probe-verdict Infos; the coded `error!` lines are the forensic WHY. Adding a
-CloudWatch filter+alarm is a flagged follow-up (one map entry + the doc
-paragraph + a cost note, per the FEED-REJECT-01 / SCOREBOARD-01 precedent).
+**2026-07-14 UPDATE (REST-audit GAP-03 —
+`docs/audits/2026-07-14-rest-pipeline-adversarial-audit.md`): the flagged
+CloudWatch follow-up below is now PARTIALLY LANDED.** Four SCOPED
+`error_code_alerts` entries exist in
+`deploy/aws/terraform/error-code-alarms.tf` (+ the doc paging list +
+`error_code_paging_filter_drift_guard.rs` pattern-shape extension for one
+extra `$.field` clause, all in lockstep):
+
+| Entry | Filter scope | Why scoped |
+|---|---|---|
+| `spot1m-01-escalation` | `$.stage = "escalation"` only | the per-minute `minute_failed`/`boundary_skipped` lines fire every failed minute — a plain code filter would over-page vs the designed 3-minute edge; covers the Dhan spot + Groww spot + Groww contract legs (same code) |
+| `chain-02-escalation` | `$.stage = "escalation"` only | same rationale, both feeds' chain legs |
+| `chain-01` | plain coded filter | both stages (warmup + mid_session) are once-per-episode page-worthy; the probe-only path never emits CHAIN-01 at ERROR |
+| `chain-04-warmup` | `$.stage = "warmup"` only | the probe_* / warmup_no_token stages are log-only-by-design transient/respawn arms (warmup_no_token repeats every ~30s until a token exists) |
+
+**Still log-sink-only (deliberate):** the persist codes SPOT1M-02 +
+CHAIN-03 have no direct filter — every persist failure feeds the
+persist-gated 3-minute escalation edge (the M1 rule), so a sustained
+persist outage still reaches the `spot1m-01-escalation` /
+`chain-02-escalation` pages; a direct filter on the per-minute persist
+lines would over-page. The Groww-leg CHAIN-04-class degrades
+(`expiry_unresolved` etc.) remain CHAIN-02-stage territory per §2c.
+
+The typed HIGH Telegram event at the 3-minute escalation edge (+ the Info
+recovery event) remains the primary operator page — and, for the chain
+half, the once-per-day `ChainEntitlementAbsent` / `ChainExpirylistFailed`
+HIGH pages + the probe-verdict Infos; the coded `error!` lines are the
+forensic WHY. The CloudWatch entries are the BACKSTOP leg that survives a
+dead app notifier / dropped Telegram (the audit's GAP-05 class — see also
+`telegram-drop-alarm.tf`).
 
 **Contract-leg honest envelope (2026-07-13, PR-4):** UNVERIFIED-LIVE —
 FNO per-contract 1m candle availability latency for the just-sealed

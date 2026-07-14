@@ -4,7 +4,8 @@
 //! The three surfaces:
 //! 1. The `error_code_alerts` map in
 //!    `deploy/aws/terraform/error-code-alarms.tf` (the filters + alarms
-//!    that actually page — 9 entries as of 2026-07-09).
+//!    that actually page — 15 entries as of 2026-07-14: +5 REST-audit
+//!    entries per docs/audits/2026-07-14-rest-pipeline-adversarial-audit.md).
 //! 2. The documented paging list in
 //!    `.claude/rules/project/observability-architecture.md`
 //!    ("Which codes page" → the "Filtered+alarmed codes" paragraph).
@@ -22,7 +23,16 @@
 //! - a coded pattern that deviates from the errors.jsonl line shape
 //!   `{ $.code = "X" && $.level = "ERROR" }` (the tracing JSON layer's
 //!   `flatten_event(true)` top-level fields — a malformed pattern
-//!   silently never matches);
+//!   silently never matches). 2026-07-14 extension (REST-audit
+//!   GAP-01/GAP-03): ONE optional extra `$.field`-referencing scoping
+//!   clause is additionally accepted after the pinned code+level pair —
+//!   `{ $.code = "X" && $.level = "ERROR" && <extra> }` — used by the
+//!   once-per-episode sub-filters (`$.stage = "escalation"` /
+//!   `$.stage = "warmup"` / the AUTH-GAP-05 `$.permanent` failure-arm
+//!   scope). Honest limit: the extra clause's field name/value cannot be
+//!   validated against the enum (stage strings are not derivable from
+//!   `ErrorCode`) — a typo'd stage value silently never matches; the
+//!   emit-site check still guarantees the CODE has a real `error!` emit;
 //! - an ALLOWLISTED no-emit tripwire (DH-906) silently GAINING a coded
 //!   emit site (the allowlist + the "no coded emit site exists yet" doc
 //!   note + the term-match filter would all be stale — retire together).
@@ -408,13 +418,32 @@ enum PatternShape {
 }
 
 fn classify_pattern(pattern: &str) -> PatternShape {
-    // Coded shape, pinned EXACTLY (spacing included — the 9 live entries
-    // and the emit convention both use this byte shape).
+    // Coded shape, pinned EXACTLY (spacing included — the live entries
+    // and the emit convention both use this byte shape), with the
+    // 2026-07-14 extension: ONE optional extra scoping clause after the
+    // pinned code+level pair (` && <extra>` before the closing ` }`),
+    // where <extra> is non-empty, references a JSON field (`$.`), and
+    // does not smuggle a second `$.code` clause (which could shadow the
+    // extracted code and defeat the validity/emit-site checks).
     if let Some(rest) = pattern.strip_prefix("{ $.code = \"")
         && let Some(code_end) = rest.find('"')
     {
         let code = &rest[..code_end];
-        if rest[code_end..] == *"\" && $.level = \"ERROR\" }" && !code.is_empty() {
+        if code.is_empty() {
+            return PatternShape::Malformed;
+        }
+        let Some(tail) = rest[code_end..].strip_prefix("\" && $.level = \"ERROR\"") else {
+            return PatternShape::Malformed;
+        };
+        if tail == " }" {
+            return PatternShape::Coded(code.to_string());
+        }
+        if let Some(extra) = tail.strip_prefix(" && ")
+            && let Some(extra) = extra.strip_suffix(" }")
+            && !extra.is_empty()
+            && extra.contains("$.")
+            && !extra.contains("$.code")
+        {
             return PatternShape::Coded(code.to_string());
         }
         return PatternShape::Malformed;
@@ -799,6 +828,42 @@ fn synthetic_shape_classifier_detects_planted_drift() {
     // reach the ERROR-only errors.jsonl sink).
     assert_eq!(
         classify_pattern(r#"{ $.code = "PROC-01" && $.level = "WARN" }"#),
+        PatternShape::Malformed
+    );
+    // 2026-07-14 extension: ONE extra $.field scoping clause is Coded —
+    // the stage-scoped once-per-episode sub-filters and the AUTH-GAP-05
+    // $.permanent failure-arm scope.
+    assert_eq!(
+        classify_pattern(
+            r#"{ $.code = "SPOT1M-01" && $.level = "ERROR" && $.stage = "escalation" }"#
+        ),
+        PatternShape::Coded("SPOT1M-01".into())
+    );
+    assert_eq!(
+        classify_pattern(
+            r#"{ $.code = "AUTH-GAP-05" && $.level = "ERROR" && ($.permanent IS TRUE || $.permanent IS FALSE) }"#
+        ),
+        PatternShape::Coded("AUTH-GAP-05".into())
+    );
+    // The extra clause must reference a JSON field…
+    assert_eq!(
+        classify_pattern(r#"{ $.code = "PROC-01" && $.level = "ERROR" && true }"#),
+        PatternShape::Malformed
+    );
+    // …must not be empty…
+    assert_eq!(
+        classify_pattern(r#"{ $.code = "PROC-01" && $.level = "ERROR" &&  }"#),
+        PatternShape::Malformed
+    );
+    // …and must not smuggle a SECOND $.code clause (which could shadow
+    // the extracted code and defeat the validity/emit-site checks).
+    assert_eq!(
+        classify_pattern(r#"{ $.code = "PROC-01" && $.level = "ERROR" && $.code = "FAKE-99" }"#),
+        PatternShape::Malformed
+    );
+    // The level clause is still mandatory even with a stage clause:
+    assert_eq!(
+        classify_pattern(r#"{ $.code = "PROC-01" && $.stage = "escalation" }"#),
         PatternShape::Malformed
     );
     // A typo'd code is Coded(...) but must fail validity:
