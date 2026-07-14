@@ -243,6 +243,22 @@ resource "aws_apigatewayv2_stage" "questdb_console" {
   api_id      = aws_apigatewayv2_api.questdb_console[0].id
   name        = "$default"
   auto_deploy = true
+
+  # Stage-level throttle (2026-07-14 incident hardening). The endpoint is
+  # PUBLIC — auth lives inside the front handler — so an unauthenticated
+  # runaway/abusive client can still burn Lambda invocations before the
+  # handler rejects it; this bounds that invocation spend at the gateway.
+  # The observed LEGITIMATE console SPA burst was ~11 req/s (2026-07-14
+  # incident traffic), which fits inside burst 20 / rate 10. HONEST
+  # ENVELOPE: at the CURRENT 10-slot account concurrency cap this does NOT
+  # fully protect the shared Lambda pool — 20 in-flight requests × 2 slots
+  # each (front synchronously invokes the VPC back relay) > 10 — so the
+  # account-quota raise in lambda-concurrency-quota.tf is the actual fix;
+  # this block is defense-in-depth hygiene, not the remedy.
+  default_route_settings {
+    throttling_burst_limit = 20
+    throttling_rate_limit  = 10
+  }
 }
 
 resource "aws_lambda_permission" "questdb_console_apigw" {
