@@ -109,6 +109,7 @@ pub mod brutex_crossverify_persistence;
 /// EPISODE (disconnect / stall / process death) with the blame verdict
 /// persisted — the month-end "who caused it" system-of-record.
 pub mod feed_episode_audit_persistence;
+pub mod feed_gap_audit_persistence;
 pub mod feed_parity_1m_audit_persistence;
 /// Dual-feed scoreboard (operator 2026-07-10): the per-day per-feed
 /// scoreboard row + the per-instrument coverage detail table.
