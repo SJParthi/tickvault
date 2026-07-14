@@ -121,3 +121,204 @@ fn ratchet_spot1m_boot_module_is_not_a_stub() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// GAP-11 (2026-07-14): Dhan REST forensics rows + close_to_persist_ms
+// stamping. The scans below run against the PRODUCTION region only (split
+// at the first `#[cfg(test)]`) so a guard can never match its own
+// assertion literals or a test fixture (the shadow-writer vacuous-scan
+// lesson).
+// ---------------------------------------------------------------------------
+
+/// Everything before the trailing tests module — the production region.
+/// Split at the `#[cfg(test)] mod tests` MODULE marker (a bare
+/// `#[cfg(test)]` also gates mid-file test helpers in these modules).
+fn production_region(src: &str) -> &str {
+    src.split("#[cfg(test)]\nmod tests").next().unwrap_or(src)
+}
+
+/// The body of one fn: from its marker to the next top-level fn item.
+/// Anchored on fn names, never line numbers (robust to reformatting).
+fn fn_region<'a>(src: &'a str, marker: &str, rel: &str) -> &'a str {
+    let start = src.find(marker).unwrap_or_else(|| {
+        panic!("{rel}: fn marker `{marker}` not found in the production region")
+    });
+    let tail = &src[start + marker.len()..];
+    let end = ["\nasync fn ", "\npub async fn ", "\npub fn ", "\nfn "]
+        .iter()
+        .filter_map(|m| tail.find(m))
+        .min()
+        .unwrap_or(tail.len());
+    &tail[..end]
+}
+
+/// GAP-11a: the Dhan spot AND chain legs really emit `rest_fetch_audit`
+/// forensics rows (the rest-1m-pipeline rule file's "fast FOLLOW-UP"
+/// closed) — never a skeleton.
+#[test]
+fn ratchet_dhan_spot_and_chain_legs_emit_rest_fetch_audit() {
+    let spot_src = read_app_src("src/spot_1m_rest_boot.rs");
+    let spot = production_region(&spot_src);
+    for needle in [
+        "RestFetchAuditWriter",
+        "ensure_rest_fetch_audit_table(",
+        "build_dhan_fetch_audit_row(",
+        "audit_append_best_effort(",
+        "RestFetchOutcome::NamedGap",
+        "\"flush_failed\"",
+        "\"persist_failed\"",
+        "\"named_gap\"",
+        "\"no_token\"",
+    ] {
+        assert!(
+            spot.contains(needle),
+            "spot_1m_rest_boot.rs production region lost its `{needle}` \
+             forensics wiring — every Dhan spot verdict/gap must land a \
+             rest_fetch_audit row (GAP-11)"
+        );
+    }
+    let chain_src = read_app_src("src/option_chain_1m_boot.rs");
+    let chain = production_region(&chain_src);
+    for needle in [
+        "RestFetchAuditWriter",
+        "ensure_rest_fetch_audit_table(",
+        "build_dhan_chain_audit_row(",
+        "chain_audit_append_best_effort(",
+        "REST_FETCH_LEG_CHAIN_1M",
+        "RestFetchOutcome::NoToken",
+        "RestFetchOutcome::Skipped",
+        "\"empty_chain\"",
+        "\"persist_failed\"",
+        "\"flush_failed\"",
+    ] {
+        assert!(
+            chain.contains(needle),
+            "option_chain_1m_boot.rs production region lost its `{needle}` \
+             forensics wiring — every Dhan chain (minute, underlying) must \
+             land a rest_fetch_audit row with leg='chain_1m' (GAP-11)"
+        );
+    }
+}
+
+/// GAP-11b: `ok` forensics rows are HELD until the DATA-table flush ACK
+/// and stamped there (`stamp_held_ok_rows` AFTER `writer.flush()` in
+/// source order, per fire/sweep region, all three Dhan/Groww legs) — a
+/// pre-flush ok append would fabricate an ok row for a lost minute.
+#[test]
+fn ratchet_ok_audit_rows_stamp_after_data_flush_ack() {
+    let cases: [(&str, &[&str]); 3] = [
+        (
+            "src/spot_1m_rest_boot.rs",
+            &[
+                "async fn fire_one_minute(",
+                // 2026-07-14 merge with main's batch-catchup refactor: the
+                // sweep's fetch/persist/hold/stamp body moved into the
+                // SHARED `sweep_sids_above_watermark` helper (the
+                // post-session sweep passes `Some(audit_writer)` into it).
+                "async fn sweep_sids_above_watermark(",
+            ],
+        ),
+        ("src/groww_spot_1m_boot.rs", &["async fn fire_one_minute("]),
+        (
+            "src/option_chain_1m_boot.rs",
+            &["async fn fire_one_chain_minute("],
+        ),
+    ];
+    for (rel, markers) in cases {
+        let src = read_app_src(rel);
+        let prod = production_region(&src);
+        for marker in markers {
+            let region = fn_region(prod, marker, rel);
+            let flush_pos = region.find("writer.flush()").unwrap_or_else(|| {
+                panic!("{rel} `{marker}`: data `writer.flush()` call not found")
+            });
+            let stamp_pos = region.find("stamp_held_ok_rows(").unwrap_or_else(|| {
+                panic!(
+                    "{rel} `{marker}`: `stamp_held_ok_rows(` call not found — \
+                     ok rows must be held until the data flush ACK (GAP-11)"
+                )
+            });
+            assert!(
+                stamp_pos > flush_pos,
+                "{rel} `{marker}`: the held-ok stamp+append (byte {stamp_pos}) \
+                 must follow the data flush (byte {flush_pos}) in source order \
+                 — close_to_persist_ms is a post-flush-ACK measurement"
+            );
+            // Review LOW (2026-07-14): source ORDER alone would still pass
+            // if a regression stamped with a literal `true` — the stamp
+            // call must consume the REAL flush verdict binding.
+            assert!(
+                region.contains("let flush_result = writer.flush()"),
+                "{rel} `{marker}`: the data flush must be BOUND as \
+                 `let flush_result = writer.flush()` — the stamp gate reads \
+                 that verdict, never a literal"
+            );
+            let stamp_window = &region[stamp_pos..region.len().min(stamp_pos + 400)];
+            assert!(
+                stamp_window.contains("flush_result.is_ok()"),
+                "{rel} `{marker}`: the stamp_held_ok_rows call must gate on \
+                 `flush_result.is_ok()` (the real flush verdict) — a literal \
+                 `true` would fabricate ok rows for lost minutes"
+            );
+            assert!(
+                region.contains("held_ok_rows.push("),
+                "{rel} `{marker}`: lost the `held_ok_rows.push(` hold site — \
+                 ok rows must not append before the flush verdict"
+            );
+            assert!(
+                !region.contains("close_to_persist_ms: -1"),
+                "{rel} `{marker}`: a hardcoded `close_to_persist_ms: -1` \
+                 reappeared inside the fire/sweep region — ok rows must carry \
+                 the REAL post-flush stamp via stamp_held_ok_rows"
+            );
+        }
+    }
+}
+
+/// GAP-11 adversarial-review fixes (2026-07-14) stay wired:
+/// - HIGH: the Dhan spot ladder threads REAL attempt/429 forensics and a
+///   terminal-429 ladder classifies `rate_limited` (never a generic
+///   `error` while the scoreboard digest sums 0 rate-limit hits).
+/// - MEDIUM 1: Dhan spot missed boundaries land queryable
+///   `outcome=skipped` forensics rows (the Groww spot / Dhan chain shape).
+/// - MEDIUM 2: the Groww spot BACKFILL recovery holds an `ok` audit row
+///   (cross-feed symmetry — a backfill-repaired Groww minute must not
+///   read "failed, never recovered" in the digest forever).
+#[test]
+fn ratchet_gap11_review_fixes_stay_wired() {
+    let spot_src = read_app_src("src/spot_1m_rest_boot.rs");
+    let spot = production_region(&spot_src);
+    for needle in [
+        // HIGH — real ladder forensics + terminal-429 classification.
+        "struct DhanLadderForensics",
+        "dhan_failed_audit_class(",
+        "RestFetchOutcome::RateLimited",
+        // MEDIUM 1 — skipped-boundary forensics rows + midnight guard.
+        "RestFetchOutcome::Skipped",
+        "\"boundary_skipped\"",
+    ] {
+        assert!(
+            spot.contains(needle),
+            "spot_1m_rest_boot.rs production region lost its `{needle}` \
+             wiring — the GAP-11 review HIGH/MEDIUM-1 fixes must stay \
+             (real rate-limit facts + queryable skipped boundaries)"
+        );
+    }
+    let groww_src = read_app_src("src/groww_spot_1m_boot.rs");
+    let groww = production_region(&groww_src);
+    let fire = fn_region(
+        groww,
+        "async fn fire_one_minute(",
+        "src/groww_spot_1m_boot.rs",
+    );
+    let backfill_pos = fire
+        .find("tv_groww_spot1m_backfilled_total")
+        .expect("groww fire_one_minute lost its backfill-Ok arm");
+    assert!(
+        fire[backfill_pos..].contains("held_ok_rows.push(build_fetch_audit_row("),
+        "groww_spot_1m_boot.rs fire_one_minute: the backfill-Ok arm must \
+         HOLD an ok audit row for the repaired minute (GAP-11 review \
+         MEDIUM 2) — without it a backfill-repaired Groww minute reads \
+         'failed, never recovered' in the digest forever"
+    );
+}

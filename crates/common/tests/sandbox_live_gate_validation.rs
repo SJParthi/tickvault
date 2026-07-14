@@ -1,8 +1,9 @@
 //! D1 sandbox-gate validation — date-robust coverage.
 //!
-//! The inline `test_sandbox_guard_blocks_live_before_july` only calls
+//! The inline `test_sandbox_guard_blocks_live_before_earliest_date` (named
+//! `..._before_july` until the 2026-07-14 re-arm) only called
 //! `validate()` with `mode = Live` when today < `LIVE_TRADING_EARLIEST_DATE`
-//! (2026-07-01) — so from 2026-07-01 onward the entire live-mode guard block
+//! (then 2026-07-01) — so from 2026-07-01 onward the entire live-mode guard block
 //! in `ApplicationConfig::validate()` silently fell OUT of coverage (this is
 //! exactly the `common` coverage regression the gate flagged on main).
 //!
