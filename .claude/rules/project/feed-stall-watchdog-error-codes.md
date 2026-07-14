@@ -287,6 +287,29 @@ this emit per-line on the fleet path). Telegram wording is UNCHANGED.
 
 ---
 
+### 2026-07-14 Update — sidecar escalation-exit + reconnect heartbeat (S2) and capture-only warm-up (S3)
+
+**Escalation-exit:** the sidecar now prints ONE coded reconnect-outcome heartbeat line per
+force-close/reconnect cycle (fixed shape, `groww sidecar reconnect-cycle: attempt=N
+outcome=<connected|failed_...>`), and after 2 consecutive failed cycles prints the FIXED
+marker `GROWW SIDECAR ESCALATION-EXIT: repeated reconnect failure — exiting for clean
+relaunch` then exits(1) so the supervisor relaunches it cold (fresh SSM token read + full
+re-subscribe). The Rust pipe drain classifies that marker and maps it into the SAME
+`tv_feed_sidecar_stall_restart_total{feed}` counter + `StallRestartStorm` record as a
+watchdog kill — a sustained self-exit loop therefore keeps BOTH pagers
+(`tv-<env>-feed-stall-restarts`, storm FEED-STALL-01) firing; self-heal can never silence
+the alarms. Honest envelope: bounds the in-process wedge to ~2 failed cycles (~10-25s
+depending on ladder position) WITHOUT lowering the 30s watchdog threshold; the heartbeat
+lines answer WHY a reconnect failed next time; no recovery-time number is claimed until
+live-measured; the exit costs one SSM read + a full cold re-subscribe (no vendor resume
+protocol exists).
+
+**Capture-only warm-up:** immediately after a successful re-subscribe the sidecar performs
+a fail-soft last-known-price snapshot walk (SDK cache reads) appended to the NDJSON capture
+ONLY — it does NOT and CANNOT advance feed liveness (the bridge's liveness gate only
+advances on ts progress; fresh-session SDK caches are empty), it is never a liveness
+source, never recovered prints.
+
 ## §2. FEED-SUPERVISOR-01 — feed supervisor task respawned
 
 **Severity:** High. **Auto-triage safe:** Yes (the respawn already self-healed).
