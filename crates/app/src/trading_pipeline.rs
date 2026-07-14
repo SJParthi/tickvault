@@ -284,11 +284,14 @@ async fn run_trading_pipeline(
     // Static-label outcome counters, pre-registered at 0 (first-sample-
     // baseline discipline; /metrics-local, not CloudWatch-shipped).
     let m_reconcile_ok = metrics::counter!("tv_oms_reconcile_runs_total", "outcome" => "ok");
+    let m_reconcile_ok_dry_run =
+        metrics::counter!("tv_oms_reconcile_runs_total", "outcome" => "ok_dry_run");
     let m_reconcile_failed =
         metrics::counter!("tv_oms_reconcile_runs_total", "outcome" => "failed");
     let m_reconcile_skipped =
         metrics::counter!("tv_oms_reconcile_runs_total", "outcome" => "skipped_gate");
     m_reconcile_ok.absolute(0);
+    m_reconcile_ok_dry_run.absolute(0);
     m_reconcile_failed.absolute(0);
     m_reconcile_skipped.absolute(0);
 
@@ -707,17 +710,45 @@ async fn run_trading_pipeline(
                     // participation: reconcile() bypasses both by design
                     // (no starvation of live cancels, no breaker poisoning)
                     // and dry-run short-circuits before any HTTP.
-                    match oms.reconcile().await {
-                        Ok(report) => {
+                    //
+                    // M2 (flagged follow-up, OMS build lead): the scheduled
+                    // reconcile applies broker-snapshot corrections that can
+                    // race FRESHER local state from the live order-update WS
+                    // — including terminal states — between the GET and the
+                    // apply. The engine-side ordering guard is a follow-up;
+                    // this arm only bounds and counts the run.
+                    //
+                    // E1 honest envelope: in live mode reconcile() performs a
+                    // GET that would otherwise block THIS select! loop —
+                    // tick/fill draining included — for up to the ~5s OMS
+                    // HTTP timeout. The 2s bound + the ≥60s interval floor
+                    // caps the stall duty; the structural home for this call
+                    // moves to the order runtime actor post-rebase. A timeout
+                    // elapse counts as a FAILED run (outcome="failed").
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(RECONCILE_ARM_TIMEOUT_SECS),
+                        oms.reconcile(),
+                    )
+                    .await
+                    {
+                        Ok(Ok(report)) => {
                             reconcile_failure_streak = 0;
-                            m_reconcile_ok.increment(1);
+                            // Cov#3: a dry-run "success" reconciled NOTHING
+                            // (the engine short-circuits pre-HTTP) — count it
+                            // under its own static outcome so the "ok" series
+                            // only ever means a real broker-snapshot compare.
+                            if oms.is_dry_run() {
+                                m_reconcile_ok_dry_run.increment(1);
+                            } else {
+                                m_reconcile_ok.increment(1);
+                            }
                             debug!(
                                 total_checked = report.total_checked,
                                 dry_run = oms.is_dry_run(),
                                 "scheduled OMS reconcile run completed"
                             );
                         }
-                        Err(err) => {
+                        Ok(Err(err)) => {
                             m_reconcile_failed.increment(1);
                             let (next_streak, fire_edge) =
                                 advance_reconcile_failure_streak(reconcile_failure_streak);
@@ -730,6 +761,30 @@ async fn run_trading_pipeline(
                             if fire_edge {
                                 // Edge-latched: fires ONCE at the rising edge of
                                 // 3 consecutive failures; re-armed on success.
+                                error!(
+                                    code = tickvault_common::error_code::ErrorCode::OmsGapReconciliation.code_str(),
+                                    stage = "fetch_failed_streak",
+                                    consecutive = reconcile_failure_streak,
+                                    "OMS-GAP-02: scheduled reconcile failed 3 consecutive runs — \
+                                     OMS state may diverge from the Dhan order book until a run succeeds"
+                                );
+                            }
+                        }
+                        Err(_elapsed) => {
+                            // E1: the run outlived the arm bound — counted as
+                            // a failed run so the streak/edge semantics are
+                            // identical to a typed OMS error.
+                            m_reconcile_failed.increment(1);
+                            let (next_streak, fire_edge) =
+                                advance_reconcile_failure_streak(reconcile_failure_streak);
+                            reconcile_failure_streak = next_streak;
+                            warn!(
+                                timeout_secs = RECONCILE_ARM_TIMEOUT_SECS,
+                                consecutive = reconcile_failure_streak,
+                                "scheduled OMS reconcile timed out — counted as failed; \
+                                 the next interval retries"
+                            );
+                            if fire_edge {
                                 error!(
                                     code = tickvault_common::error_code::ErrorCode::OmsGapReconciliation.code_str(),
                                     stage = "fetch_failed_streak",
@@ -856,6 +911,16 @@ pub fn init_trading_pipeline(
 /// Consecutive scheduled-reconcile failures at which the ONE edge-latched
 /// ERROR (code OMS-GAP-02) fires; the latch re-arms on the next success.
 const RECONCILE_FAILURE_EDGE_THRESHOLD: u32 = 3;
+
+/// Hard bound on a single scheduled reconcile run (E1). Honest envelope: in
+/// live mode `reconcile()` performs a GET against the Dhan REST API and
+/// otherwise blocks the trading-pipeline `select!` loop — tick/fill draining
+/// included — for up to the ~5s OMS HTTP timeout. The 2s bound plus the
+/// ≥60s interval floor caps the stall duty cycle; the structural home for
+/// this call moves to the order runtime actor post-rebase (flagged
+/// follow-up). A timeout elapse counts as a FAILED run (outcome="failed",
+/// streak advanced).
+const RECONCILE_ARM_TIMEOUT_SECS: u64 = 2;
 
 /// Builds the scheduled-reconcile timer, or `None` when the loop is
 /// disabled (the select! arm then awaits `std::future::pending()` — the
@@ -4175,12 +4240,42 @@ threshold = 70.0
     }
 
     #[test]
-    fn test_make_reconcile_interval_disabled_is_none_and_enabled_is_skip() {
+    fn test_make_reconcile_interval_disabled_builds_no_timer() {
+        // (The enabled-timer Skip/interval_at semantics are asserted by
+        // test_timer_first_tick_delayed_and_skip_no_burst below.)
         let disabled = OmsReconcileConfig::default();
         assert!(
             make_reconcile_interval(&disabled).is_none(),
             "default-OFF config must build NO timer (pending() arm)"
         );
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_timeout_elapse_maps_to_failed_streak() {
+        // E1: a run that outlives the arm timeout is a FAILED run — the
+        // Err(Elapsed) arm advances the SAME streak the Err(OmsError) arm
+        // does, so 3 consecutive timeouts fire the OMS-GAP-02 edge.
+        let elapsed = tokio::time::timeout(
+            std::time::Duration::from_millis(10),
+            std::future::pending::<Result<(), ()>>(),
+        )
+        .await;
+        assert!(elapsed.is_err(), "a hung run must map to Err(Elapsed)");
+
+        let mut streak = 0_u32;
+        let mut fired = Vec::new();
+        for _ in 0..3 {
+            let (next, fire) = advance_reconcile_failure_streak(streak);
+            streak = next;
+            fired.push(fire);
+        }
+        assert_eq!(
+            fired,
+            vec![false, false, true],
+            "3 consecutive timeout-mapped failures fire the edge once"
+        );
+        // The production bound: 2s against the ~5s OMS HTTP timeout.
+        assert_eq!(RECONCILE_ARM_TIMEOUT_SECS, 2);
     }
 
     #[tokio::test]

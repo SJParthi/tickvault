@@ -651,4 +651,6 @@ enabled = true
 [oms_reconcile]
 enabled = false
 interval_secs = 300
+# NOTE: `trading_hours_only = false` skips the SESSION-WINDOW gate AND the
+# trading-DAY (calendar/weekday) gate — runs then fire on weekends/holidays too.
 trading_hours_only = true

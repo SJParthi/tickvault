@@ -26,7 +26,24 @@ pub enum OrderUpdateParseError {
     /// JSON deserialization failed.
     #[error("failed to parse order update JSON: {0}")]
     JsonError(#[from] serde_json::Error),
+    /// Frame exceeded [`ORDER_UPDATE_MAX_FRAME_BYTES`] — rejected before any
+    /// `Value` parse to cap allocation amplification from a hostile frame.
+    #[error(
+        "order update frame too large: {len} bytes exceeds the \
+         {ORDER_UPDATE_MAX_FRAME_BYTES}-byte cap"
+    )]
+    FrameTooLarge {
+        /// Byte length of the rejected frame.
+        len: usize,
+    },
 }
+
+/// Maximum accepted order-update frame size (256 KiB).
+///
+/// Real Dhan order events are ~1-2 KB, so 256 KiB is a generous ceiling; the
+/// guard bounds the `serde_json::Value`-tree allocation amplification of an
+/// oversized/hostile frame BEFORE the two-stage parse allocates anything.
+pub const ORDER_UPDATE_MAX_FRAME_BYTES: usize = 262_144;
 
 /// Dual-casing merge pairs: `(accepted-by-struct key, alternate-casing key)`.
 ///
@@ -50,8 +67,9 @@ const CASING_PAIRS: &[(&str, &str)] = &[
 /// upstream), fallback-only, never overrides a present `Instrument`.
 const ASSUMED_TWIN_PAIR: (&str, &str) = ("Instrument", "instrumentType");
 
-/// Quirk counter name — 4 static `kind` label values:
-/// `casing_fallback`, `casing_conflict`, `numeric_algo_ord_no`, `assumed_twin`.
+/// Quirk counter name — 5 static `kind` label values:
+/// `casing_fallback`, `casing_conflict`, `numeric_algo_ord_no`,
+/// `assumed_twin`, `null_alt_dropped`.
 const DECODE_QUIRKS_COUNTER: &str = "tv_order_update_decode_quirks_total";
 
 /// Parses a JSON order update message from the Dhan order update WebSocket.
@@ -74,6 +92,11 @@ const DECODE_QUIRKS_COUNTER: &str = "tv_order_update_decode_quirks_total";
 /// # Errors
 /// Returns `OrderUpdateParseError::JsonError` if deserialization fails.
 pub fn parse_order_update(json_str: &str) -> Result<OrderUpdate, OrderUpdateParseError> {
+    if json_str.len() > ORDER_UPDATE_MAX_FRAME_BYTES {
+        return Err(OrderUpdateParseError::FrameTooLarge {
+            len: json_str.len(),
+        });
+    }
     let mut value: serde_json::Value = serde_json::from_str(json_str)?;
     normalize_order_update_data(&mut value);
     let message: OrderUpdateMessage = serde_json::from_value(value)?;
@@ -104,11 +127,15 @@ fn normalize_order_update_data(value: &mut serde_json::Value) {
     coerce_numeric_algo_ord_no(data);
 }
 
-/// Applies the accepted-key-wins rule for one casing pair.
+/// Applies the accepted-key-wins rule for one casing pair, treating JSON
+/// `null` as ABSENT on both sides:
 ///
-/// - alt present + accepted absent → rename alt→accepted (quirk `fallback_kind`)
-/// - BOTH present → drop alt (accepted wins; if the values differ, quirk
-///   `casing_conflict`)
+/// - alt is `null` → drop alt, no rename (quirk `null_alt_dropped`)
+/// - alt non-null + accepted absent → rename alt→accepted (quirk `fallback_kind`)
+/// - alt non-null + accepted is `null` → alt REPLACES the null accepted value
+///   (quirk `fallback_kind` — the null accepted key counts as absent)
+/// - BOTH present + non-null → drop alt (accepted wins; if the values differ
+///   beyond numeric equivalence, quirk `casing_conflict`)
 /// - accepted only / neither → no-op
 fn merge_casing_pair(
     data: &mut serde_json::Map<String, serde_json::Value>,
@@ -116,20 +143,55 @@ fn merge_casing_pair(
     alt: &str,
     fallback_kind: &'static str,
 ) {
-    if !data.contains_key(alt) {
-        return;
-    }
-    if data.contains_key(accepted) {
-        let removed = data.remove(alt);
-        if removed.as_ref() != data.get(accepted) {
-            metrics::counter!(DECODE_QUIRKS_COUNTER, "kind" => "casing_conflict").increment(1);
+    match data.get(alt) {
+        None => return,
+        Some(serde_json::Value::Null) => {
+            // Null alt is treated as absent — drop it, never rename.
+            data.remove(alt);
+            metrics::counter!(DECODE_QUIRKS_COUNTER, "kind" => "null_alt_dropped").increment(1);
+            return;
         }
-    } else if let Some(alt_value) = data.remove(alt) {
-        // O(1) EXEMPT: begin — cold-path key rename on the order-update frame
-        data.insert(accepted.to_string(), alt_value);
-        // O(1) EXEMPT: end
-        metrics::counter!(DECODE_QUIRKS_COUNTER, "kind" => fallback_kind).increment(1);
+        Some(_) => {}
     }
+    let accepted_is_null = data.get(accepted).map(serde_json::Value::is_null);
+    match accepted_is_null {
+        // Accepted absent, or present-but-null (treated as absent): the
+        // non-null alt value lands under the accepted key.
+        None | Some(true) => {
+            if let Some(alt_value) = data.remove(alt) {
+                // O(1) EXEMPT: begin — cold-path key rename on the order-update frame
+                data.insert(accepted.to_string(), alt_value);
+                // O(1) EXEMPT: end
+                metrics::counter!(DECODE_QUIRKS_COUNTER, "kind" => fallback_kind).increment(1);
+            }
+        }
+        // Both present and non-null: accepted wins; differing values beyond
+        // numeric equivalence count one conflict quirk.
+        Some(false) => {
+            let removed = data.remove(alt);
+            if let (Some(removed), Some(kept)) = (removed.as_ref(), data.get(accepted))
+                && !json_values_equivalent(removed, kept)
+            {
+                metrics::counter!(DECODE_QUIRKS_COUNTER, "kind" => "casing_conflict").increment(1);
+            }
+        }
+    }
+}
+
+/// Structural equality with numeric tolerance: two JSON Numbers whose f64
+/// renderings are equal (e.g. `1` vs `1.0`) are the SAME wire value, not a
+/// casing conflict.
+fn json_values_equivalent(a: &serde_json::Value, b: &serde_json::Value) -> bool {
+    if a == b {
+        return true;
+    }
+    if let (serde_json::Value::Number(x), serde_json::Value::Number(y)) = (a, b)
+        && let (Some(xf), Some(yf)) = (x.as_f64(), y.as_f64())
+    {
+        // Exact f64 equality is intended: same wire value, two renderings.
+        return xf == yf;
+    }
+    false
 }
 
 /// Coerces a JSON Number `AlgoOrdNo` (the live doc table types it `float`)
@@ -849,6 +911,97 @@ mod tests {
         let serialized = serde_json::to_string(&message).unwrap();
         let reparsed = parse_order_update(&serialized).unwrap();
         assert_eq!(reparsed, original);
+    }
+
+    // -----------------------------------------------------------------------
+    // Review round 1: null-merge semantics, numeric tolerance, frame size cap
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_alt_null_dropped_frame_still_parses() {
+        // M1/E2: a null alternate-casing key is treated as ABSENT — dropped,
+        // never renamed onto the accepted key (which would fail the typed
+        // parse). The frame parses with the struct default.
+        let json = r#"{"Data": {"series": null, "OrderNo": "1"}}"#;
+        let update = parse_order_update(json).unwrap();
+        assert_eq!(update.series, "");
+        assert_eq!(update.order_no, "1");
+
+        // Null alt for the assumed twin behaves identically.
+        let json = r#"{"Data": {"instrumentType": null, "OrderNo": "2"}}"#;
+        let update = parse_order_update(json).unwrap();
+        assert_eq!(update.instrument, "");
+        assert_eq!(update.order_no, "2");
+    }
+
+    #[test]
+    fn test_accepted_null_recovered_from_non_null_alt() {
+        // M1/E2: a null accepted key is treated as ABSENT — the non-null
+        // alternate-casing value lands under the accepted key instead of the
+        // null poisoning the typed parse.
+        let json = r#"{"Data": {"Series": null, "series": "EQ", "OrderNo": "3"}}"#;
+        let update = parse_order_update(json).unwrap();
+        assert_eq!(update.series, "EQ");
+        assert_eq!(update.order_no, "3");
+    }
+
+    #[test]
+    fn test_both_null_drops_alt_and_accepted_null_still_errors_where_typed() {
+        // alt null → dropped; accepted stays null. For a String-typed field
+        // an explicit null still errors (behavior unchanged for null
+        // accepted with nothing to recover from).
+        let json = r#"{"Data": {"Series": null, "series": null}}"#;
+        let err = parse_order_update(json).unwrap_err();
+        assert!(matches!(err, OrderUpdateParseError::JsonError(_)));
+    }
+
+    #[test]
+    fn test_numeric_int_vs_float_equal_is_not_a_conflict() {
+        // E6/L2: 1 vs 1.0 are the same wire value in two renderings —
+        // accepted wins, no casing_conflict is counted, and the frame parses.
+        let json = r#"{"Data": {"Multiplier": 1, "multiplier": 1.0, "OrderNo": "4"}}"#;
+        let update = parse_order_update(json).unwrap();
+        assert_eq!(update.multiplier, 1);
+        assert_eq!(update.order_no, "4");
+
+        // The pure helper pins the equivalence rule directly.
+        assert!(json_values_equivalent(
+            &serde_json::json!(1),
+            &serde_json::json!(1.0)
+        ));
+        assert!(json_values_equivalent(
+            &serde_json::json!(0.05),
+            &serde_json::json!(0.05)
+        ));
+        assert!(!json_values_equivalent(
+            &serde_json::json!(1),
+            &serde_json::json!(2.0)
+        ));
+        assert!(!json_values_equivalent(
+            &serde_json::json!("1"),
+            &serde_json::json!(1)
+        ));
+    }
+
+    #[test]
+    fn test_oversize_frame_rejected_before_parse() {
+        // Sec-MEDIUM: frames beyond ORDER_UPDATE_MAX_FRAME_BYTES are refused
+        // with a typed error BEFORE any Value-tree allocation.
+        let padding = "x".repeat(ORDER_UPDATE_MAX_FRAME_BYTES);
+        let json = format!(r#"{{"Data": {{"Remarks": "{padding}"}}}}"#);
+        assert!(json.len() > ORDER_UPDATE_MAX_FRAME_BYTES);
+        let err = parse_order_update(&json).unwrap_err();
+        assert!(matches!(
+            err,
+            OrderUpdateParseError::FrameTooLarge { len } if len == json.len()
+        ));
+        assert!(err.to_string().contains("frame too large"));
+
+        // A frame AT or below the cap passes the size guard (parse outcome
+        // then depends on content as before).
+        let small = r#"{"Data": {"OrderNo": "5"}}"#;
+        assert!(small.len() <= ORDER_UPDATE_MAX_FRAME_BYTES);
+        assert_eq!(parse_order_update(small).unwrap().order_no, "5");
     }
 
     proptest::proptest! {
