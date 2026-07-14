@@ -210,7 +210,7 @@ Other clusters (checked off by their owning sessions' PRs, all referencing THIS 
 - [ ] E2 — portfolio + margin gate (OrderIntent in RiskEngine::check_order; design-only until the operator REST grant)
   - Files: crates/trading/src/risk/engine.rs, crates/trading/src/oms/api_client.rs
   - Tests: TBD by owning session (exit-never-gated invariant test mandatory)
-- [ ] CT1 — Conditional & Multi Order surface (dhanhq v2 /alerts family): typed constructors +
+- [x] CT1 — Conditional & Multi Order surface (dhanhq v2 /alerts family): typed constructors +
       `POST /alerts/multi/orders` wrapper, dormant behind the hardcoded alerts gate,
       Equities/Indices fail-closed segment lock
   - Gate: `alerts_gate_armed: bool = false` inside `OrderApiClient::new()` (house Lock-1 mirror:
