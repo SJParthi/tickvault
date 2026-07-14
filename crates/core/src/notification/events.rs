@@ -202,7 +202,11 @@ pub enum NotificationEvent {
     /// Dhan authentication token acquired at boot.
     AuthenticationSuccess,
 
-    /// Dhan authentication failed at boot — system started in offline mode.
+    /// Dhan login could not be obtained (family-(3) of the 2026-07-14
+    /// Dhan noise lock — the ONE Dhan token condition that pages).
+    /// Emitters: the boot-time auth failure AND the mid-session
+    /// watchdog's TERMINAL forced-re-mint failure. Body names the broker
+    /// + the consequence (the spot-1m / option-chain pulls stop).
     AuthenticationFailed { reason: String },
 
     /// Dhan authentication attempt failed transiently (network blip, DNS
@@ -237,14 +241,11 @@ pub enum NotificationEvent {
         within_market_hours: bool,
     },
 
-    /// Mid-session profile check failed during market hours (queue item
-    /// I7, 2026-04-21). Fires CRITICAL on the rising edge only — if
-    /// the profile recovers on a subsequent check, an INFO log is
-    /// emitted (no Telegram). The app does NOT HALT mid-session — a
-    /// mid-session HALT would drop the live WS feed, which costs more
-    /// than the silent-failure risk. Operator remediation is manual.
-    MidSessionProfileInvalidated { reason: String },
-
+    // `MidSessionProfileInvalidated` DELETED 2026-07-14 (operator Dhan
+    // noise lock — dhan-rest-only-noise-lock-2026-07-14.md): the 900s
+    // profile probe runs SILENTLY (coded error! + counters); a terminal
+    // forced-re-mint failure routes to the family-(3)
+    // `AuthenticationFailed` Critical instead.
     /// JWT token renewed successfully by background task.
     TokenRenewed,
 
@@ -819,6 +820,60 @@ pub enum NotificationEvent {
         detail: String,
     },
 
+    /// Daily BruteX↔TickVault 1-minute cross-verify summary
+    /// (BRUTEX-XVERIFY, 2026-07-12). One Info digest per trading day after
+    /// the 15:50 IST run — compares BruteX-produced 1-minute candles against
+    /// our live capture, minute by minute. Counts carry `-1` sentinels when
+    /// a leg could not be measured (rendered as "?", never fabricated zeros
+    /// — audit Rule 11).
+    BrutexCrossverifySummary {
+        /// Trading date in `YYYY-MM-DD` IST format.
+        trading_date_ist: String,
+        /// Fixed daily outcome slug:
+        /// `clean|diverged|partial|no_data|blind|degraded`.
+        outcome: String,
+        /// BruteX files fetched and read for the day (`-1` = unknown).
+        files_read: i64,
+        /// Symbols paired and compared across both sides (`-1` = unknown).
+        symbols_compared: i64,
+        /// Compared minutes where every field agreed within tolerance.
+        matched: i64,
+        /// Compared minutes with a beyond-tolerance difference.
+        diverged: i64,
+        /// Minutes we have live but BruteX's files do not.
+        missing_brutex: i64,
+        /// Minutes BruteX has but our live capture does not.
+        missing_live: i64,
+        /// 15:28/15:29 minutes absent live only due to close-seal timing —
+        /// informational, never counted as missing.
+        tail_unsealed: i64,
+        /// BruteX symbols that could not be paired to a live instrument.
+        unmapped: i64,
+        /// 95th-percentile absolute price difference across compared
+        /// minutes, in paise (`-1` = not measured).
+        noise_p95_paise: i64,
+        /// Maximum absolute price difference observed, in paise
+        /// (`-1` = not measured).
+        noise_max_paise: i64,
+        /// Pre-formatted worst-offender lines (plain English, one per
+        /// line); empty when there is nothing noteworthy.
+        top_offenders: String,
+        /// Optional plain-English context line (e.g. a same-day feed stall
+        /// that explains a gap); empty when there is none.
+        hint: String,
+    },
+
+    /// The daily BruteX cross-verify TASK died (panicked / errored) before
+    /// producing its summary. High so the ABSENCE of the daily check is
+    /// impossible to miss (mirrors `DualFeedScorecardAborted`). NOT fired
+    /// on graceful shutdown/cancellation.
+    BrutexCrossverifyAborted {
+        /// Trading date in `YYYY-MM-DD` IST format.
+        trading_date_ist: String,
+        /// Short FIXED failure classification (never raw external text).
+        reason: String,
+    },
+
     // PR #4 (2026-05-19): DepthSpotPriceStale variant retired alongside
     // the deleted depth-20/200 infrastructure (operator lock 2026-05-15).
     // PR #5 (2026-05-19): 7 Phase2* variants retired alongside the
@@ -909,19 +964,10 @@ pub enum NotificationEvent {
         threshold_secs: i64,
     },
 
-    /// AUTH-GAP-05 (2026-07-06) — the mid-session profile watchdog forced
-    /// a token re-mint after N consecutive REAL Dhan token rejections
-    /// during market hours. Severity::High; edge-triggered exactly once
-    /// per failing episode (the watchdog's retry-once latch). Fields are
-    /// label-only counts — never the JWT or any user data.
-    TokenForcedRemintTriggered {
-        /// Consecutive REAL `/v2/profile` auth failures observed.
-        consecutive_checks: u32,
-        /// The watchdog cadence (seconds) — used to render the human
-        /// "about N minutes" duration in the Telegram body.
-        check_interval_secs: u64,
-    },
-
+    // `TokenForcedRemintTriggered` DELETED 2026-07-14 (operator Dhan
+    // noise lock): the AUTH-GAP-05 forced re-mint is a SILENT self-heal
+    // (coded error! + tv_token_forced_remint_total counters); only a
+    // TERMINAL re-mint failure pages, via `AuthenticationFailed`.
     /// Order update WebSocket connected.
     OrderUpdateConnected,
 
@@ -961,19 +1007,11 @@ pub enum NotificationEvent {
     /// disconnect leg (unchanged: `test_order_update_reconnected_severity_is_low`).
     OrderUpdateReconnected { consecutive_failures: u32 },
 
-    /// CRITICAL: zero live ticks received during market hours past the
-    /// configured silence threshold. Fires edge-triggered (once on rising
-    /// edge — when ticks resume, an INFO recovery log fires but no
-    /// Telegram). This event would have caught the 2026-04-21 morning
-    /// failure where the WS was connected but Dhan stopped streaming
-    /// (likely data-plan issue).
-    NoLiveTicksDuringMarketHours {
-        /// How long the heartbeat has been stale, in seconds.
-        silent_for_secs: u64,
-        /// Threshold that triggered the alert, in seconds.
-        threshold_secs: u64,
-    },
-
+    // 2026-07-14 operator Dhan noise lock: `NoLiveTicksDuringMarketHours`
+    // (Critical) DELETED with the no-tick watchdog — its heartbeat was fed
+    // ONLY by the Dhan tick pipeline; Groww stall detection is
+    // FEED-STALL-01 + the market-hours-liveness alarm. See
+    // .claude/rules/project/dhan-rest-only-noise-lock-2026-07-14.md.
     /// Graceful shutdown initiated.
     ShutdownInitiated,
 
@@ -1417,7 +1455,26 @@ pub enum NotificationEvent {
     /// total-outage trailer ("receiving nothing … prices will not flow"),
     /// which would contradict a partial summary with a false
     /// whole-feed-down claim.
-    GrowwSidecarRejected { reason: String, fleet_summary: bool },
+    ///
+    /// `detail` (operator demand 2026-07-14 — the 14:59 IST rejection page
+    /// said only "the feed reported an error" with no WHY): the SANITIZED
+    /// reject-cause signature, rendered into the headline as
+    /// "Groww live feed rejected: {detail} — retrying". CONTRACT: the emit
+    /// site MUST pass ONLY the output of the supervisor's
+    /// `sidecar_line_signature` choke point (control-char + BiDi strip,
+    /// credential/JWT redaction, 160-char cap) — NEVER raw child text. A
+    /// `None` / empty / whitespace detail degrades to the pre-2026-07-14
+    /// generic headline. This field is a conscious, dated override of
+    /// Telegram commandment 2 (no library jargon) for the ONE field whose
+    /// payload IS the machine cause — recorded in
+    /// `.claude/rules/project/feed-stall-watchdog-error-codes.md` §1c.1
+    /// (precedent: the B9 "Build:" short-SHA override). The render boundary
+    /// re-caps + html-escapes it anyway (defense-in-depth).
+    GrowwSidecarRejected {
+        reason: String,
+        fleet_summary: bool,
+        detail: Option<String>,
+    },
 
     /// W2 PR#5 (2026-07-10, audit follow-up row 15): the configured NSE
     /// holiday calendar's coverage horizon is running out (or already ran
@@ -1439,8 +1496,27 @@ pub enum NotificationEvent {
         coverage_end_display: String,
     },
 
-    /// Custom alert from any component.
+    /// Custom alert from any component. `Severity::High` → pages Telegram +
+    /// SNS SMS. Reserve for genuinely operator-actionable conditions; for
+    /// informational status pings use [`Self::CustomStatus`] instead.
     Custom { message: String },
+
+    /// Informational, non-actionable status ping from any component
+    /// (`Severity::Low` — batches into the digest / off-hours coalescer, never
+    /// pages SNS SMS). Introduced 2026-07-10 to stop routine status pings
+    /// ("market closed", "recovered saved prices", "service auto-restarted")
+    /// firing as High + SMS. Not episode-routed (`episode_key() == None`), so
+    /// the episode machinery is untouched.
+    CustomStatus { message: String },
+
+    /// Instant informational status ping (`Severity::Low` → NEVER SMS, but
+    /// `DispatchPolicy::Immediate` → delivered instantly as its own message,
+    /// NOT batched). Introduced 2026-07-10 for operator-notable-but-not-
+    /// actionable events that must be SEEN at once without paging: a mid-market
+    /// crash/restart recovery ("fast start") and the feed enable/disable toggle
+    /// acknowledgements. Like [`Self::CustomStatus`] it is NOT episode-routed
+    /// (`episode_key() == None`).
+    CustomStatusUrgent { message: String },
     // RETIRED 2026-06-12: LastTickAfterBoundary deleted — it was defined but
     // NEVER emitted (0 production sites). The post-close-tick anomaly it
     // describes is ALREADY tracked by the `tv_late_tick_after_boundary_total`
@@ -1983,14 +2059,36 @@ impl NotificationEvent {
     ///
     /// `Some` ONLY for events provably scoped to exactly one feed:
     /// - Dhan-scoped (static): Dhan JWT/auth/profile, main-feed +
-    ///   order-update WebSocket lifecycle, Dhan instrument build.
-    /// - Groww-scoped (static): the sidecar reject diagnostic.
+    ///   order-update WebSocket lifecycle, Dhan instrument build, the Dhan
+    ///   per-minute REST legs (spot 1m + option chain), the market-open
+    ///   milestones (they count the Dhan pool), the daily candle
+    ///   cross-check + 09:15 bar cross-check (Dhan REST vs our candles),
+    ///   the Dhan static-IP / IP-verify gates, the dual-instance lock
+    ///   (one Dhan account), and the order-path events (orders, circuit
+    ///   breaker, rate limit, orphan positions — Dhan is the only broker
+    ///   with orders).
+    /// - Groww-scoped (static): the sidecar reject diagnostic + the Groww
+    ///   per-minute REST legs (spot 1m + option chain + option contract).
     /// - Feed-generic (dynamic): the `Feed*` events resolve from their
     ///   `feed` field; an unknown feed name renders un-badged (honest —
-    ///   never a wrong badge).
+    ///   never a wrong badge). The WS sleep/wake events ALSO resolve from
+    ///   their `feed` field but fall back to the DHAN badge for any
+    ///   unrecognized value — the live values are "main"/"order_update"
+    ///   (both Dhan WebSocket types) and the emit sites live in the Dhan
+    ///   connection code. HONEST LIMIT: if a future non-Dhan feed reuses
+    ///   these variants with a feed name the resolver does not know, the
+    ///   fallback would mislabel it Dhan — such a reuse must pass a
+    ///   resolvable name ("groww") or extend `feed_badge_for_name` first.
     ///
-    /// Everything else (QuestDB, boot, risk, orders, self-test, SLO, market
-    /// digests) returns `None` and renders exactly as before.
+    /// # Host/system convention (operator directive 2026-07-14)
+    ///
+    /// Genuinely feed-agnostic events (host disk, box shutdown, process
+    /// death, QuestDB, boot, self-test, the dual-feed scorecard) stay
+    /// UN-badged — never a wrong broker tag — and their titles name the
+    /// system component in plain words ("tickvault", "QuestDB", "the
+    /// server") so they read as host-level at a glance. The CloudWatch
+    /// alarm phrases (Telegram webhook lambda) follow the same convention
+    /// with explicit "🔷 DHAN:" / "🖥️ HOST:" phrase prefixes.
     #[must_use]
     pub fn feed_badge(&self) -> Option<&'static str> {
         use super::feed_badge::{FeedBadge, feed_badge_for_name};
@@ -2000,7 +2098,6 @@ impl NotificationEvent {
             | Self::AuthenticationFailed { .. }
             | Self::AuthenticationTransientFailure { .. }
             | Self::PreMarketProfileCheckFailed { .. }
-            | Self::MidSessionProfileInvalidated { .. }
             | Self::TokenRenewed
             | Self::TokenRenewalFailed { .. }
             // ── Dhan-scoped: main-feed WebSocket lifecycle ──
@@ -2014,10 +2111,6 @@ impl NotificationEvent {
             | Self::WebSocketDisconnected { .. }
             | Self::WebSocketDisconnectedOffHours { .. }
             | Self::WebSocketReconnected { .. }
-            | Self::WebSocketSleepEntered { .. }
-            | Self::WebSocketSleepResumed { .. }
-            | Self::WebSocketTokenForceRenewedOnWake { .. }
-            | Self::TokenForcedRemintTriggered { .. }
             | Self::WebSocketReconnectionExhausted { .. }
             // ── Dhan-scoped: order-update WebSocket ──
             | Self::OrderUpdateConnected
@@ -2026,15 +2119,79 @@ impl NotificationEvent {
             | Self::OrderUpdateReconnected { .. }
             // ── Dhan-scoped: instrument master build ──
             | Self::InstrumentBuildSuccess { .. }
-            | Self::InstrumentBuildFailed { .. } => Some(FeedBadge::Dhan.badge()),
+            | Self::InstrumentBuildFailed { .. }
+            // ── Dhan-scoped: per-minute REST legs (spot 1m + option
+            //    chain) — operator directive 2026-07-14: the pull alerts
+            //    must name the feed AND the leg ──
+            | Self::Spot1mFetchDegraded { .. }
+            | Self::Spot1mFetchRecovered { .. }
+            | Self::Spot1mSidNotServed { .. }
+            | Self::Spot1mSidServedRecovered { .. }
+            | Self::ChainFetchDegraded { .. }
+            | Self::ChainFetchRecovered { .. }
+            | Self::ChainEntitlementAbsent { .. }
+            | Self::ChainEntitlementConfirmed
+            | Self::ChainExpirylistFailed { .. }
+            // ── Dhan-scoped: market-open milestones (count the Dhan pool
+            //    + order-update WS) ──
+            | Self::MarketOpenStreamingConfirmation { .. }
+            | Self::MarketOpenStreamingFailed { .. }
+            | Self::MarketOpenReadinessConfirmation { .. }
+            // ── Dhan-scoped: daily candle cross-check (Dhan REST vs our
+            //    candles) + the 09:15 bar cross-check ──
+            | Self::CrossVerify1mSummary { .. }
+            | Self::CrossVerify1mAborted { .. }
+            | Self::BarMismatchCorrectedFromHistorical { .. }
+            | Self::BarMismatchCrossCheckInconclusive { .. }
+            | Self::BarMismatchCrossCheckFailed { .. }
+            // ── Dhan-scoped: static-IP / IP-verify gates + the
+            //    dual-instance lock (one Dhan account, one token) ──
+            | Self::IpVerificationFailed { .. }
+            | Self::IpVerificationSuccess { .. }
+            | Self::StaticIpBootCheckPassed { .. }
+            | Self::StaticIpBootCheckFailed { .. }
+            | Self::StaticIpBootCheckRetrying { .. }
+            | Self::DualInstanceDetected { .. }
+            // ── Dhan-scoped: order path (Dhan is the only broker with
+            //    orders; RiskHalt joins per cluster-C 2026-07-14 — the
+            //    risk engine halts the Dhan order path) ──
+            | Self::OrderRejected { .. }
+            | Self::CircuitBreakerOpened { .. }
+            | Self::CircuitBreakerClosed
+            | Self::RateLimitExhausted { .. }
+            | Self::RiskHalt { .. }
+            | Self::OrphanPositionDetected { .. }
+            | Self::OrphanPositionsClean => Some(FeedBadge::Dhan.badge()),
             // ── Groww-scoped ──
-            Self::GrowwSidecarRejected { .. } => Some(FeedBadge::Groww.badge()),
+            Self::GrowwSidecarRejected { .. }
+            // ── Groww-scoped: per-minute REST legs (spot 1m + option
+            //    chain + option contract) ──
+            | Self::GrowwSpot1mFetchDegraded { .. }
+            | Self::GrowwSpot1mFetchRecovered { .. }
+            | Self::GrowwChain1mFetchDegraded { .. }
+            | Self::GrowwChain1mFetchRecovered { .. }
+            | Self::GrowwChain1mExpiryUnresolved { .. }
+            | Self::GrowwChain1mProbeVerdict { .. }
+            | Self::GrowwContract1mFetchDegraded { .. }
+            | Self::GrowwContract1mFetchRecovered { .. }
+            | Self::GrowwContract1mBookUnresolved { .. } => Some(FeedBadge::Groww.badge()),
             // ── Feed-generic: badge follows the `feed` field ──
             Self::FeedAuthOk { feed }
             | Self::FeedInstrumentsLoaded { feed, .. }
             | Self::FeedConnectedAwaitingTicks { feed, .. }
             | Self::FeedDown { feed, .. }
             | Self::FeedRecovered { feed, .. } => feed_badge_for_name(feed).map(|b| b.badge()),
+            // ── WS sleep/wake: badge follows the `feed` field, falling
+            //    back to Dhan — the live values are "main"/"order_update"
+            //    (both Dhan WebSocket types); a future feed value like
+            //    "groww" would badge correctly ──
+            Self::WebSocketSleepEntered { feed, .. }
+            | Self::WebSocketSleepResumed { feed, .. }
+            | Self::WebSocketTokenForceRenewedOnWake { feed, .. } => Some(
+                feed_badge_for_name(feed)
+                    .unwrap_or(FeedBadge::Dhan)
+                    .badge(),
+            ),
             _ => None,
         }
     }
@@ -2065,26 +2222,35 @@ impl NotificationEvent {
                 // midnight boot is silent until 9:16 AM and the operator
                 // asked "what happened to it?"). Truthful per-leg wording —
                 // a switched-off leg says so.
+                // 2026-07-14 operator broker-tag directive: the capture
+                // line reports the DHAN per-minute REST legs — say so, and
+                // note the Groww per-minute legs report on their own
+                // alerts (they are config-gated in their own modules).
                 let capture_line = match (spot_1m_enabled, chain_1m_enabled) {
                     (true, true) => format!(
-                        "\u{2705} Per-minute price capture — armed (fires \
-                         9:16 AM to 3:30 PM IST on trading days): spot \
-                         candles for {spot_1m_indices} indices + option \
-                         chain for {chain_1m_underlyings} indices"
+                        "\u{2705} Dhan per-minute price capture — armed \
+                         (fires 9:16 AM to 3:30 PM IST on trading days): \
+                         Dhan spot candles for {spot_1m_indices} indices + \
+                         Dhan option chain for {chain_1m_underlyings} \
+                         indices (Groww per-minute legs report separately)"
                     ),
                     (true, false) => format!(
-                        "\u{2705} Per-minute price capture — armed (fires \
-                         9:16 AM to 3:30 PM IST on trading days): spot \
-                         candles for {spot_1m_indices} indices; option \
-                         chain — switched off"
+                        "\u{2705} Dhan per-minute price capture — armed \
+                         (fires 9:16 AM to 3:30 PM IST on trading days): \
+                         Dhan spot candles for {spot_1m_indices} indices; \
+                         Dhan option chain — switched off (Groww per-minute \
+                         legs report separately)"
                     ),
                     (false, true) => format!(
-                        "\u{2705} Per-minute price capture — armed (fires \
-                         9:16 AM to 3:30 PM IST on trading days): option \
-                         chain for {chain_1m_underlyings} indices; spot \
-                         candles — switched off"
+                        "\u{2705} Dhan per-minute price capture — armed \
+                         (fires 9:16 AM to 3:30 PM IST on trading days): \
+                         Dhan option chain for {chain_1m_underlyings} \
+                         indices; Dhan spot candles — switched off (Groww \
+                         per-minute legs report separately)"
                     ),
-                    (false, false) => "Per-minute price capture — switched off".to_string(),
+                    (false, false) => "Dhan per-minute price capture — switched off \
+                         (Groww per-minute legs report separately)"
+                        .to_string(),
                 };
                 format!(
                     "<b>tickvault started</b>\nMode: {mode}\nBuild: {build}\n\
@@ -2095,8 +2261,13 @@ impl NotificationEvent {
             }
             Self::AuthenticationSuccess => "<b>Auth OK</b> — Dhan JWT acquired".to_string(),
             Self::AuthenticationFailed { reason } => {
+                // 2026-07-14 Dhan noise lock reword: name the broker + the
+                // consequence in plain English (family-(3) — the ONE Dhan
+                // token condition that still pages).
                 format!(
-                    "<b>Auth FAILED</b> — offline mode\n{}",
+                    "🆘 <b>Dhan login could not be obtained</b>\n\
+                     The Dhan spot-1m and option-chain pulls will stop until this is fixed.\n\
+                     {}",
                     html_escape(&redact_url_params(reason))
                 )
             }
@@ -2134,21 +2305,13 @@ impl NotificationEvent {
                      Check: dataPlan == \"Active\", activeSegment contains \"Derivative\", tokenValidity > 4h."
                 )
             }
-            Self::MidSessionProfileInvalidated { reason } => {
-                let reason = html_escape(reason);
-                format!(
-                    "<b>CRITICAL: Mid-session profile INVALIDATED</b>\n{reason}\n\
-                     Live WS still running — operator action required.\n\
-                     Run:\n  curl -H \"access-token: $TOKEN\" https://api.dhan.co/v2/profile\n\
-                     Check: dataPlan == \"Active\", activeSegment contains \"Derivative\", tokenValidity > 4h.\n\
-                     If the profile is confirmed bad, restart the app so the boot-time HALT gate triggers \
-                     (the no-tick watchdog will then page again if ticks stop)."
-                )
-            }
             Self::TokenRenewed => "<b>Token renewed</b>".to_string(),
             Self::TokenRenewalFailed { attempts, reason } => {
+                // 2026-07-14 Dhan noise lock reword: broker + consequence.
                 format!(
-                    "<b>Token renewal FAILED</b> (attempt {attempts})\n{}",
+                    "🆘 <b>Dhan login renewal FAILED</b> (attempt {attempts})\n\
+                     If this keeps failing the Dhan spot-1m and option-chain pulls will stop.\n\
+                     {}",
                     html_escape(&redact_url_params(reason))
                 )
             }
@@ -2303,7 +2466,7 @@ impl NotificationEvent {
                 format!(
                     "<b>End-of-day digest @ 15:31:30 IST</b>\n\
                      Trading date: {trading_date_ist}\n\
-                     Main feed: {main_feed_active}/{main_feed_total}\n\
+                     Dhan main feed: {main_feed_active}/{main_feed_total}\n\
                      Token headroom: {token_remaining_hours}h\n\
                      {feed_block}\
                      {close_status}{token_warning}"
@@ -2501,15 +2664,15 @@ impl NotificationEvent {
                 minute_ist,
             } => {
                 format!(
-                    "\u{1f198} <b>Minute-by-minute index candle pull is FAILING</b>\n\
-                     The per-minute pull of the official 1-minute candle for \
-                     NIFTY, BANKNIFTY and SENSEX has failed \
+                    "\u{1f198} <b>Minute-by-minute spot index candle pull is FAILING</b>\n\
+                     The per-minute pull of Dhan's official 1-minute candle \
+                     for NIFTY, BANKNIFTY and SENSEX has failed \
                      {consecutive_failed_minutes} minutes in a row (latest \
                      failed minute: {minute_ist} IST).\n\
                      Live streaming prices are NOT affected — only the \
                      per-minute official record copy is missing.\n\
                      What to do RIGHT NOW:\n\
-                     1. Check the broker data subscription is still active.\n\
+                     1. Check the Dhan data subscription is still active.\n\
                      2. If live streaming prices ALSO stopped, treat it as a \
                      full data outage.\n\
                      3. Missing minutes fill in safely once the pull recovers."
@@ -2520,7 +2683,7 @@ impl NotificationEvent {
                 failed_minutes,
             } => {
                 format!(
-                    "\u{2705} <b>Minute-by-minute index candle pull recovered</b>\n\
+                    "\u{2705} <b>Minute-by-minute spot index candle pull recovered</b>\n\
                      The per-minute official candle pull is working again as \
                      of {minute_ist} IST, after {failed_minutes} failed \
                      minute(s). The minutes that failed stay blank in the \
@@ -2532,7 +2695,7 @@ impl NotificationEvent {
                 minute_ist,
             } => {
                 format!(
-                    "\u{1f198} <b>Groww minute-by-minute index candle pull is FAILING</b>\n\
+                    "\u{1f198} <b>Groww minute-by-minute spot index candle pull is FAILING</b>\n\
                      The per-minute pull of the official 1-minute candle for \
                      NIFTY, BANKNIFTY and SENSEX from the second broker \
                      (Groww) has failed {consecutive_failed_minutes} minutes \
@@ -2552,7 +2715,7 @@ impl NotificationEvent {
                 failed_minutes,
             } => {
                 format!(
-                    "\u{2705} <b>Groww minute-by-minute index candle pull recovered</b>\n\
+                    "\u{2705} <b>Groww minute-by-minute spot index candle pull recovered</b>\n\
                      The Groww per-minute official candle pull is working \
                      again as of {minute_ist} IST, after {failed_minutes} \
                      failed minute(s). The minutes that failed stay blank in \
@@ -2570,7 +2733,7 @@ impl NotificationEvent {
                      1-minute candle for {symbol} was missing from the \
                      per-minute pull while the other indices came through \
                      fine — the other indices are unaffected, so this looks \
-                     like the broker not serving THIS index, not a general \
+                     like Dhan not serving THIS index, not a general \
                      outage.\n\
                      Live streaming prices are NOT affected — only the \
                      per-minute official record copy for {symbol} is \
@@ -2578,9 +2741,9 @@ impl NotificationEvent {
                      What to do RIGHT NOW:\n\
                      1. Nothing urgent — the other indices keep recording \
                      normally.\n\
-                     2. If this fires every day, ask the broker whether \
+                     2. If this fires every day, ask Dhan whether \
                      1-minute candles exist for this index at all.\n\
-                     3. Missing minutes fill in safely if the broker starts \
+                     3. Missing minutes fill in safely if Dhan starts \
                      serving them."
                 )
             }
@@ -2684,7 +2847,7 @@ impl NotificationEvent {
                      1. Nothing urgent — the affected recording is off for \
                      today only.\n\
                      2. If this repeats daily, the Groww contract list has a \
-                     problem — check with the broker."
+                     problem — check with Groww."
                 )
             }
             Self::GrowwChain1mProbeVerdict { ok, detail } => {
@@ -2756,7 +2919,7 @@ impl NotificationEvent {
                      Live streaming prices are NOT affected. Tomorrow's start \
                      retries automatically.\n\
                      If this repeats for days, the contract list itself has a \
-                     problem — check with the broker."
+                     problem — check with Groww."
                 )
             }
             Self::ChainFetchDegraded {
@@ -2771,7 +2934,7 @@ impl NotificationEvent {
                      Live streaming prices are NOT affected — only the \
                      per-minute option chain record is missing.\n\
                      What to do RIGHT NOW:\n\
-                     1. Check the broker data subscription is still active.\n\
+                     1. Check the Dhan data subscription is still active.\n\
                      2. If live streaming prices ALSO stopped, treat it as a \
                      full data outage.\n\
                      3. Missing minutes stay blank — nothing is made up."
@@ -2798,14 +2961,14 @@ impl NotificationEvent {
                     format!(
                         "\u{1f198} <b>Option chain recording CANNOT run — no data \
                          subscription</b>\n\
-                         The broker refused the option chain data request: this \
+                         Dhan refused the option chain data request: this \
                          account has NO option chain data subscription right now.\n\
-                         Broker said: {detail}\n\
+                         Dhan said: {detail}\n\
                          Option chain recording stays OFF for today. Live \
                          streaming prices are NOT affected.\n\
                          What to do RIGHT NOW:\n\
-                         1. Buy/renew the option chain data subscription with the \
-                         broker, OR\n\
+                         1. Buy/renew the option chain data subscription with \
+                         Dhan, OR\n\
                          2. Turn the option chain recording setting off so this \
                          alert stops."
                     )
@@ -2813,18 +2976,18 @@ impl NotificationEvent {
                     format!(
                         "\u{1f514} <b>Option chain check: NOT available on this \
                          account</b>\n\
-                         Today's one-time check confirmed the broker account has \
-                         NO option chain data subscription (broker said: \
+                         Today's one-time check confirmed the Dhan account has \
+                         NO option chain data subscription (Dhan said: \
                          {detail}).\n\
                          Nothing is broken — option chain recording is switched \
-                         off and stays off. Buy the subscription with the broker \
+                         off and stays off. Buy the subscription with Dhan \
                          if you want this data."
                     )
                 }
             }
             Self::ChainEntitlementConfirmed => "\u{2705} <b>Option chain data IS available on \
                  this account</b>\n\
-                 Today's one-time check confirmed the broker WILL serve option \
+                 Today's one-time check confirmed Dhan WILL serve option \
                  chain data. Recording is currently switched OFF.\n\
                  To start recording it minute-by-minute: turn ON the option \
                  chain setting and restart the app."
@@ -2836,12 +2999,12 @@ impl NotificationEvent {
                      The day-start lookup of option expiry dates failed after \
                      several tries, so option chain recording stays OFF for \
                      today (expiry dates are never guessed).\n\
-                     Broker said: {detail}\n\
+                     Dhan said: {detail}\n\
                      Live streaming prices are NOT affected. Tomorrow's start \
                      retries automatically.\n\
                      What to do RIGHT NOW:\n\
-                     1. Check the broker data connection is healthy.\n\
-                     2. If this repeats daily, contact the broker."
+                     1. Check the Dhan data connection is healthy.\n\
+                     2. If this repeats daily, contact Dhan."
                 )
             }
             Self::DualFeedDailyScorecard {
@@ -3050,6 +3213,119 @@ impl NotificationEvent {
                      2. Restart the app to re-arm tomorrow's scorecard."
                 )
             }
+            Self::BrutexCrossverifySummary {
+                trading_date_ist,
+                outcome,
+                files_read,
+                symbols_compared,
+                matched,
+                diverged,
+                missing_brutex,
+                missing_live,
+                tail_unsealed,
+                unmapped,
+                noise_p95_paise,
+                noise_max_paise,
+                top_offenders,
+                hint,
+            } => {
+                // Verdict word from the FIXED outcome slug — a future
+                // unknown slug degrades to "UNKNOWN", never a panic.
+                let verdict: &str = match outcome.as_str() {
+                    "clean" => "CLEAN",
+                    "diverged" => "DIVERGED",
+                    "partial" => "PARTIAL DATA",
+                    "no_data" => "NO DATA",
+                    "blind" => "BLIND",
+                    "degraded" => "DEGRADED",
+                    _ => "UNKNOWN",
+                };
+                // LOUD first line for the days where the comparison could
+                // not vouch for anything (audit Rule 11 — never a quiet
+                // false-OK on an empty/partial compare set).
+                let loud: &str = match outcome.as_str() {
+                    "no_data" => {
+                        "\u{26a0}\u{fe0f} No files arrived from BruteX \
+                         today — nothing was compared.\n"
+                    }
+                    "blind" => {
+                        "\u{26a0}\u{fe0f} Nothing arrived on our own side \
+                         today — the check had nothing to compare against.\n"
+                    }
+                    "partial" => {
+                        "\u{26a0}\u{fe0f} PARTIAL DATA — only part of the \
+                         day could be compared; treat today's counts as a \
+                         floor.\n"
+                    }
+                    _ => "",
+                };
+                let offenders = if top_offenders.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        "Biggest differences today:\n{}\n",
+                        html_escape(top_offenders)
+                    )
+                };
+                let hint_line = if hint.is_empty() {
+                    String::new()
+                } else {
+                    format!("{}\n", html_escape(hint))
+                };
+                // Commandment 10: severity emoji at the START of the
+                // subject, from the canonical set — ✅ only on a
+                // fully-measured clean day; every other outcome
+                // (diverged/partial/blind/no_data/degraded/unknown)
+                // leads with ⚠️.
+                let lead: &str = if outcome.as_str() == "clean" {
+                    "\u{2705}"
+                } else {
+                    "\u{26a0}\u{fe0f}"
+                };
+                format!(
+                    "{lead} <b>BruteX vs live 1-minute check — \
+                     {trading_date_ist}: {verdict}</b>\n\
+                     {loud}\
+                     Files read from BruteX: {} | Symbols compared: {}\n\
+                     Minutes matched: {} | Diverged: {}\n\
+                     Missing on BruteX side: {} | Missing on our side: {}\n\
+                     Last minutes still sealing (not counted): {} | \
+                     Symbols we could not pair: {}\n\
+                     Typical wiggle: within {} paise on 95% of compared \
+                     minutes (max {}).\n\
+                     {offenders}\
+                     {hint_line}\
+                     Neither side is the ground truth — small wiggle is \
+                     expected; only beyond-tolerance rows are real \
+                     divergence.",
+                    render_count(*files_read),
+                    render_count(*symbols_compared),
+                    render_count(*matched),
+                    render_count(*diverged),
+                    render_count(*missing_brutex),
+                    render_count(*missing_live),
+                    render_count(*tail_unsealed),
+                    render_count(*unmapped),
+                    render_count(*noise_p95_paise),
+                    render_count(*noise_max_paise),
+                )
+            }
+            Self::BrutexCrossverifyAborted {
+                trading_date_ist,
+                reason,
+            } => {
+                let reason = html_escape(reason);
+                format!(
+                    "\u{1f198} <b>BruteX cross-verify run FAILED — \
+                     {trading_date_ist}</b>\n\
+                     The 3:50 PM IST BruteX-vs-live 1-minute check died \
+                     before finishing.\n\
+                     Reason: {reason}\n\
+                     What to do RIGHT NOW:\n\
+                     1. Check the app is still running.\n\
+                     2. Restart the app to re-arm tomorrow's check."
+                )
+            }
             // PR #4/#5 (2026-05-19): DepthSpotPriceStale + 7 Phase2*
             // Display arms retired with their variants.
             // PR #6a (2026-05-19): NseBhavcopyCheck* Display arms retired.
@@ -3164,23 +3440,6 @@ impl NotificationEvent {
                     connection_index.saturating_add(1)
                 )
             }
-            Self::TokenForcedRemintTriggered {
-                consecutive_checks,
-                check_interval_secs,
-            } => {
-                // Plain English per the 10 Telegram commandments: status
-                // emoji first, specific numbers, one decision, no library
-                // names / file paths / token material.
-                let minutes =
-                    u64::from(*consecutive_checks).saturating_mul(*check_interval_secs) / 60;
-                format!(
-                    "⚠️ <b>AUTH-GAP-05: broker login looks invalid — auto re-login started</b>\n\
-                     The broker rejected our login check {consecutive_checks} times in a row \
-                     (about {minutes} minutes). We are fetching a fresh login automatically.\n\
-                     If it clears you'll hear nothing more; if it fails again you'll get a red \
-                     alert — keep only ONE copy of the app running and restart it."
-                )
-            }
             Self::OrderUpdateConnected => "<b>Order Update WS connected</b>".to_string(),
             Self::OrderUpdateAuthenticated => {
                 "<b>Order Update WS authenticated</b>\nDhan accepted token — streaming live."
@@ -3191,17 +3450,6 @@ impl NotificationEvent {
             } => {
                 format!(
                     "<b>Order Update WS reconnected</b>\nRecovered after {consecutive_failures} consecutive failures"
-                )
-            }
-            Self::NoLiveTicksDuringMarketHours {
-                silent_for_secs,
-                threshold_secs,
-            } => {
-                format!(
-                    "<b>CRITICAL: zero live ticks during market hours</b>\n\
-                     Silent for {silent_for_secs}s (threshold {threshold_secs}s).\n\
-                     WebSockets may be connected but NO data streaming. \
-                     Check Dhan dataPlan + IP allowlist + token validity."
                 )
             }
             Self::OrderUpdateDisconnected { reason } => {
@@ -3592,8 +3840,10 @@ impl NotificationEvent {
             Self::CircuitBreakerOpened {
                 consecutive_failures,
             } => {
+                // Cluster-C (2026-07-14): self-heal line appended so the
+                // operator knows no action is needed if a CLOSED follows.
                 format!(
-                    "<b>Circuit breaker OPENED</b>\nConsecutive failures: {consecutive_failures}\nOrder API calls halted"
+                    "<b>Circuit breaker OPENED</b>\nConsecutive failures: {consecutive_failures}\nOrder API calls halted\nThe system retries by itself in about a minute — if a CLOSED message follows, no action needed."
                 )
             }
             Self::CircuitBreakerClosed => {
@@ -3603,7 +3853,14 @@ impl NotificationEvent {
                 format!("<b>Rate limit EXHAUSTED</b>\nLimit: {limit_type}")
             }
             Self::RiskHalt { reason } => {
-                format!("<b>RISK HALT</b>\nTrading stopped: {}", html_escape(reason))
+                // Cluster-C (2026-07-14): APPEND-style action lines
+                // (Telegram commandment 7 — Critical needs "what to do
+                // RIGHT NOW"); the leading "RISK HALT" literal is kept so
+                // the 4 pinning contains()-tests survive.
+                format!(
+                    "<b>RISK HALT</b>\nTrading stopped: {}\nAll new orders are blocked.\nWhat you need to do RIGHT NOW:\n1. Open the broker app and check open positions.\n2. Decide: exit positions now, or accept no trading for the rest of the day.\n3. Trading stays blocked until the daily reset or a restart.",
+                    html_escape(reason)
+                )
             }
             Self::WebSocketReconnectionExhausted {
                 connection_index,
@@ -3654,12 +3911,37 @@ impl NotificationEvent {
             Self::GrowwSidecarRejected {
                 reason,
                 fleet_summary,
+                detail,
             } => {
+                // Defensive render-boundary cap (chars) on `detail` —
+                // mirrors the supervisor's SIDECAR_LINE_SIGNATURE_MAX_CHARS
+                // (core sits BELOW the app crate, so the value is mirrored,
+                // not imported). The emit-site contract already caps; this
+                // is defense-in-depth so a future emit site can never flood
+                // a Telegram headline.
+                const GROWW_REJECT_DETAIL_MAX_CHARS: usize = 160;
                 // `reason` is a fixed per-class &'static str (or the fleet
                 // coalescer's counted summary) mapped to String by the
                 // supervisor (never raw child text), but html_escape it
                 // anyway for defense-in-depth, consistent with every String arm.
                 let reason = html_escape(reason);
+                // 2026-07-14 operator demand (the 14:59 IST page carried no
+                // WHY): when the SANITIZED reject-cause signature is present
+                // the headline names it — "rejected: <cause> — retrying".
+                // Truncate BEFORE html_escape so an escape entity is never
+                // cut mid-sequence; empty/whitespace degrades to the exact
+                // pre-2026-07-14 generic headline (never a hollow
+                // "rejected:  — retrying"). Dated commandment-2 override:
+                // feed-stall-watchdog-error-codes.md §1c.1.
+                let title = match detail.as_deref().map(str::trim).filter(|d| !d.is_empty()) {
+                    Some(d) => {
+                        let capped: String =
+                            d.chars().take(GROWW_REJECT_DETAIL_MAX_CHARS).collect();
+                        let capped = html_escape(&capped);
+                        format!("🆘 <b>Groww live feed rejected: {capped} — retrying</b>")
+                    }
+                    None => "🆘 <b>Groww live feed rejected</b>".to_string(),
+                };
                 if *fleet_summary {
                     // Fleet-coalesced partial summary (hostile-review fix
                     // 2026-07-06): the trailer must NOT claim the whole feed
@@ -3667,13 +3949,13 @@ impl NotificationEvent {
                     // reported a problem, and nothing positive is claimed
                     // about the rest.
                     format!(
-                        "🆘 <b>Groww live feed rejected</b>\n{reason}\n\nThe affected \
+                        "{title}\n{reason}\n\nThe affected \
                          connections keep retrying automatically. Prices from those \
                          connections will not flow until they recover."
                     )
                 } else {
                     format!(
-                        "🆘 <b>Groww live feed rejected</b>\n{reason}\n\nThe Groww feed is \
+                        "{title}\n{reason}\n\nThe Groww feed is \
                          connected but receiving nothing. Until this is fixed, Groww \
                          prices will not flow."
                     )
@@ -3718,6 +4000,8 @@ impl NotificationEvent {
                 )
             }
             Self::Custom { message } => message.clone(),
+            Self::CustomStatus { message } => message.clone(),
+            Self::CustomStatusUrgent { message } => message.clone(),
         }
     }
 
@@ -3737,7 +4021,6 @@ impl NotificationEvent {
             Self::AuthenticationFailed { .. } => "AuthenticationFailed",
             Self::AuthenticationTransientFailure { .. } => "AuthenticationTransientFailure",
             Self::PreMarketProfileCheckFailed { .. } => "PreMarketProfileCheckFailed",
-            Self::MidSessionProfileInvalidated { .. } => "MidSessionProfileInvalidated",
             Self::TokenRenewed => "TokenRenewed",
             Self::TokenRenewalFailed { .. } => "TokenRenewalFailed",
             Self::WebSocketConnected { .. } => "WebSocketConnected",
@@ -3779,6 +4062,8 @@ impl NotificationEvent {
             Self::ChainExpirylistFailed { .. } => "ChainExpirylistFailed",
             Self::DualFeedDailyScorecard { .. } => "DualFeedDailyScorecard",
             Self::DualFeedScorecardAborted { .. } => "DualFeedScorecardAborted",
+            Self::BrutexCrossverifySummary { .. } => "BrutexCrossverifySummary",
+            Self::BrutexCrossverifyAborted { .. } => "BrutexCrossverifyAborted",
             // PR #4/#5 (2026-05-19): DepthSpotPriceStale + 7 Phase2*
             // name arms retired.
             // PR #6a (2026-05-19): NseBhavcopyCheck* name arms retired.
@@ -3788,12 +4073,10 @@ impl NotificationEvent {
             Self::WebSocketSleepEntered { .. } => "WebSocketSleepEntered",
             Self::WebSocketSleepResumed { .. } => "WebSocketSleepResumed",
             Self::WebSocketTokenForceRenewedOnWake { .. } => "WebSocketTokenForceRenewedOnWake",
-            Self::TokenForcedRemintTriggered { .. } => "TokenForcedRemintTriggered",
             Self::OrderUpdateConnected => "OrderUpdateConnected",
             Self::OrderUpdateAuthenticated => "OrderUpdateAuthenticated",
             Self::OrderUpdateDisconnected { .. } => "OrderUpdateDisconnected",
             Self::OrderUpdateReconnected { .. } => "OrderUpdateReconnected",
-            Self::NoLiveTicksDuringMarketHours { .. } => "NoLiveTicksDuringMarketHours",
             Self::ShutdownInitiated => "ShutdownInitiated",
             Self::ShutdownComplete => "ShutdownComplete",
             Self::InstrumentBuildSuccess { .. } => "InstrumentBuildSuccess",
@@ -3834,6 +4117,8 @@ impl NotificationEvent {
             Self::GrowwSidecarRejected { .. } => "GrowwSidecarRejected",
             Self::HolidayCalendarCoverageLow { .. } => "HolidayCalendarCoverageLow",
             Self::Custom { .. } => "Custom",
+            Self::CustomStatus { .. } => "CustomStatus",
+            Self::CustomStatusUrgent { .. } => "CustomStatusUrgent",
         }
     }
 
@@ -3841,9 +4126,12 @@ impl NotificationEvent {
     /// this event folds into.
     ///
     /// `Some` ONLY for the WS lifecycle families that produce the observed
-    /// 40-message disconnect storms; EVERY other variant returns `None` so
-    /// the legacy dispatch path stays byte-identical. Zero-alloc (`Copy`
-    /// match) — DHAT-pinned on the dispatch bypass arm by
+    /// 40-message disconnect storms, the boot-milestone set, and (2026-07-14
+    /// operator noise directive) the Groww runtime incident family
+    /// (`GrowwSidecarRejected` + the Groww `FeedDown`/`FeedRecovered` arms);
+    /// EVERY other variant returns `None` so the legacy dispatch path stays
+    /// byte-identical. Zero-alloc (`Copy` match) — DHAT-pinned on the
+    /// dispatch bypass arm by
     /// `crates/core/tests/dhat_telegram_dispatcher.rs`.
     #[must_use]
     pub fn episode_key(&self) -> Option<super::episode::EpisodeKey> {
@@ -3888,6 +4176,59 @@ impl NotificationEvent {
                 if feed.eq_ignore_ascii_case("groww") {
                     Some(super::episode::BOOT_EPISODE_KEY)
                 } else {
+                    None
+                }
+            }
+            // Groww runtime incident family (2026-07-14 operator noise
+            // directive): the persistent reject storm folds into ONE
+            // live-edited bubble — first page still pages (+ SMS at ≥High);
+            // recurrences become in-place edits. Distinct from the boot
+            // pings above: FeedDown/FeedRecovered are RUNTIME incidents,
+            // never boot milestones. Zero-alloc str compare — the DHAT
+            // bypass-arm pin holds.
+            Self::GrowwSidecarRejected { .. } => Some(EpisodeKey {
+                family: EpisodeFamily::GrowwFeed,
+                conn: 0,
+            }),
+            Self::FeedDown {
+                feed,
+                operator_initiated,
+                ..
+            } => {
+                // FIX-A (hostile review 2026-07-14): a DELIBERATE feeds-page
+                // disable is NEVER episode-routed — the bubble's "retrying
+                // automatically" edit would falsely claim a disabled feed
+                // retries (the 2026-07-06 FeedDown honesty split); the
+                // legacy lane carries the honest "stays OFF until
+                // re-enabled" body.
+                // FIX-D: only a PAGING (≥ High, i.e. in-market) FeedDown
+                // opens/folds the incident bubble; the off-hours Low flavor
+                // keeps its pre-existing legacy 60s-coalescer path.
+                if !*operator_initiated
+                    && self.severity() >= Severity::High
+                    && feed.eq_ignore_ascii_case("groww")
+                {
+                    Some(EpisodeKey {
+                        family: EpisodeFamily::GrowwFeed,
+                        conn: 0,
+                    })
+                } else {
+                    // Non-Groww feeds also keep the legacy immediate lane.
+                    None
+                }
+            }
+            Self::FeedRecovered { feed, .. } => {
+                // Recovery stays episode-routed (Resolve). With no open
+                // episode (e.g. the Down was Low/off-hours and never
+                // opened a bubble) the FSM returns SendLegacy — the
+                // legacy_passthrough arm delivers it, never a drop.
+                if feed.eq_ignore_ascii_case("groww") {
+                    Some(EpisodeKey {
+                        family: EpisodeFamily::GrowwFeed,
+                        conn: 0,
+                    })
+                } else {
+                    // A future feed #3 keeps the legacy immediate lane.
                     None
                 }
             }
@@ -3962,9 +4303,11 @@ impl NotificationEvent {
     pub fn episode_role(&self) -> super::episode::EpisodeRole {
         use super::episode::EpisodeRole;
         match self {
-            Self::WebSocketReconnected { .. } | Self::OrderUpdateReconnected { .. } => {
-                EpisodeRole::Resolve
-            }
+            // FeedRecovered is the Groww episode's recovery edge (2026-07-14
+            // noise fold); role is consulted only when episode_key() is Some.
+            Self::WebSocketReconnected { .. }
+            | Self::OrderUpdateReconnected { .. }
+            | Self::FeedRecovered { .. } => EpisodeRole::Resolve,
             _ => EpisodeRole::Open,
         }
     }
@@ -3987,12 +4330,17 @@ impl NotificationEvent {
             // Critical instead.
             Self::AuthenticationTransientFailure { .. } => Severity::Low,
             Self::PreMarketProfileCheckFailed { .. } => Severity::Critical,
-            Self::MidSessionProfileInvalidated { .. } => Severity::Critical,
             Self::TokenRenewalFailed { .. } => Severity::Critical,
             Self::InstrumentBuildFailed { .. } => Severity::High,
             Self::WebSocketDisconnected { .. } => Severity::High,
             Self::WebSocketDisconnectedOffHours { .. } => Severity::Low,
             Self::Custom { .. } => Severity::High,
+            // Informational status ping — Low so it batches (digest / 60s
+            // coalesce) and never fires SNS SMS (gate is `>= High`).
+            Self::CustomStatus { .. } => Severity::Low,
+            // Instant status ping — Low (never SMS); `dispatch_policy()` forces
+            // Immediate so it ships at once instead of batching.
+            Self::CustomStatusUrgent { .. } => Severity::Low,
             Self::RiskHalt { .. } => Severity::Critical,
             Self::WebSocketReconnectionExhausted { .. } => Severity::Critical,
             Self::CircuitBreakerOpened { .. } => Severity::High,
@@ -4005,11 +4353,6 @@ impl NotificationEvent {
                 Severity::Low
             }
             Self::WebSocketTokenForceRenewedOnWake { .. } => Severity::Low,
-            // AUTH-GAP-05 (2026-07-06): the forced re-mint IS the
-            // self-remediation, but the operator must see every trigger —
-            // High (pages Telegram), not Critical (the standing
-            // MidSessionProfileInvalidated page covers the unrecovered case).
-            Self::TokenForcedRemintTriggered { .. } => Severity::High,
             // Routine zero-disconnect drift swap — green by design. Prior
             // `Custom` routing made every 60s drift fire [HIGH] amber; see
             // Fix #9 in .claude/plans/active-plan.md and .claude/rules/project/
@@ -4017,7 +4360,6 @@ impl NotificationEvent {
             // Swap itself failed — depth quality degraded until next rebalance.
             Self::OrderUpdateDisconnected { .. } => Severity::High,
             Self::OrderUpdateReconnected { .. } => Severity::Low,
-            Self::NoLiveTicksDuringMarketHours { .. } => Severity::Critical,
             Self::ShutdownInitiated => Severity::Medium,
             Self::CircuitBreakerClosed => Severity::Medium,
             Self::WebSocketConnected { .. } => Severity::Low,
@@ -4118,6 +4460,12 @@ impl NotificationEvent {
             // death fires the High Aborted variant below instead.
             Self::DualFeedDailyScorecard { .. } => Severity::Info,
             Self::DualFeedScorecardAborted { .. } => Severity::High,
+            // BruteX cross-verify (2026-07-12): Info per the contract — the
+            // daily digest is a positive signal; the LOUD body lines carry
+            // degraded/no-data days, and a task death fires the High
+            // Aborted variant below instead.
+            Self::BrutexCrossverifySummary { .. } => Severity::Info,
+            Self::BrutexCrossverifyAborted { .. } => Severity::High,
             Self::SelfTestPassed { .. } => Severity::Info,
             Self::SelfTestDegraded { .. } => Severity::High,
             Self::RealtimeGuaranteeHealthy { .. } => Severity::Info,
@@ -4277,6 +4625,11 @@ impl NotificationEvent {
             // default Info routing would coalesce it) — same rationale as
             // CrossVerify1mSummary above.
             Self::DualFeedDailyScorecard { .. } => DispatchPolicy::Immediate,
+            // BruteX cross-verify (2026-07-12): the once-per-day 15:50 IST
+            // digest must arrive AT 15:50 (post-close = off-hours, so the
+            // default Info routing would coalesce it) — same rationale as
+            // CrossVerify1mSummary / DualFeedDailyScorecard above.
+            Self::BrutexCrossverifySummary { .. } => DispatchPolicy::Immediate,
             // 2026-07-08 (verified incident, operator complaint "why every
             // telegram notification is very late"): PR #1439's in-market
             // digest (900s window) swept the three once-per-trading-day
@@ -4290,6 +4643,10 @@ impl NotificationEvent {
             Self::MarketOpenReadinessConfirmation { .. }
             | Self::MarketOpenStreamingConfirmation { .. }
             | Self::SelfTestPassed { .. } => DispatchPolicy::Immediate,
+            // Instant informational status ping (Low severity → never SMS, but
+            // ships immediately as its own message, not batched): a mid-market
+            // crash/restart recovery + the feed on/off toggle acknowledgements.
+            Self::CustomStatusUrgent { .. } => DispatchPolicy::Immediate,
             _ => DispatchPolicy::Default,
         }
     }
@@ -4803,42 +5160,59 @@ mod tests {
             chain_1m_underlyings: 3,
         };
 
+        // 2026-07-14 broker tag: the capture line reports the DHAN REST
+        // legs — it must SAY Dhan and note the Groww legs report on their
+        // own alerts (every arm).
         let both = build(true, true).to_message();
         assert!(
-            both.contains("Per-minute price capture — armed"),
+            both.contains("Dhan per-minute price capture — armed"),
             "got: {both}"
         );
         assert!(both.contains("9:16 AM to 3:30 PM IST"), "got: {both}");
-        assert!(both.contains("spot candles for 4 indices"), "got: {both}");
-        assert!(both.contains("option chain for 3 indices"), "got: {both}");
+        assert!(
+            both.contains("Dhan spot candles for 4 indices"),
+            "got: {both}"
+        );
+        assert!(
+            both.contains("Dhan option chain for 3 indices"),
+            "got: {both}"
+        );
         assert!(!both.contains("switched off"), "got: {both}");
+        assert!(
+            both.contains("Groww per-minute legs report separately"),
+            "got: {both}"
+        );
 
         let chain_off = build(true, false).to_message();
         assert!(
-            chain_off.contains("spot candles for 4 indices"),
+            chain_off.contains("Dhan spot candles for 4 indices"),
             "got: {chain_off}"
         );
         assert!(
-            chain_off.contains("option chain — switched off"),
+            chain_off.contains("Dhan option chain — switched off"),
             "got: {chain_off}"
         );
 
         let spot_off = build(false, true).to_message();
         assert!(
-            spot_off.contains("option chain for 3 indices"),
+            spot_off.contains("Dhan option chain for 3 indices"),
             "got: {spot_off}"
         );
         assert!(
-            spot_off.contains("spot candles — switched off"),
+            spot_off.contains("Dhan spot candles — switched off"),
             "got: {spot_off}"
         );
 
         let both_off = build(false, false).to_message();
         assert!(
-            both_off.contains("Per-minute price capture — switched off"),
+            both_off.contains("Dhan per-minute price capture — switched off"),
             "got: {both_off}"
         );
         assert!(!both_off.contains("armed"), "got: {both_off}");
+        assert!(
+            both_off.contains("Groww per-minute legs report separately"),
+            "got: {both_off}"
+        );
     }
 
     #[test]
@@ -4868,6 +5242,7 @@ mod tests {
         let event = NotificationEvent::GrowwSidecarRejected {
             reason: "account lacks live market-data feed entitlement".to_string(),
             fleet_summary: false,
+            detail: None,
         };
         let msg = event.to_message();
         // The plain-English reason reaches the operator…
@@ -4898,6 +5273,7 @@ mod tests {
                      no reject reported from the other 33 connections"
                 .to_string(),
             fleet_summary: true,
+            detail: None,
         };
         let msg = event.to_message();
         assert!(
@@ -4924,6 +5300,7 @@ mod tests {
         let single = NotificationEvent::GrowwSidecarRejected {
             reason: "access token stale".to_string(),
             fleet_summary: false,
+            detail: None,
         };
         assert!(single.to_message().contains("receiving nothing"));
     }
@@ -4936,12 +5313,108 @@ mod tests {
         let event = NotificationEvent::GrowwSidecarRejected {
             reason: "<script>".to_string(),
             fleet_summary: false,
+            detail: None,
         };
         let msg = event.to_message();
         assert!(!msg.contains("<script>"), "raw HTML not escaped: {msg}");
         assert!(
             msg.contains("&lt;script&gt;"),
             "expected escaped form: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_groww_sidecar_rejected_detail_renders_reason_and_retrying() {
+        // 2026-07-14 operator demand (the 14:59 IST page carried no WHY):
+        // when the SANITIZED reject-cause signature is present, the headline
+        // names it verbatim — "live feed rejected: <cause> — retrying" — and
+        // the class's plain-English explanation line is KEPT beneath it.
+        // The detail legitimately carries SDK/NATS wording (`growwapi`,
+        // `nats:`) per the dated commandment-2 override recorded in
+        // feed-stall-watchdog-error-codes.md §1c.1 — so the no-jargon pin in
+        // test_groww_sidecar_rejected_renders_reason_and_topic_and_severity
+        // applies only to the detail-less form.
+        let event = NotificationEvent::GrowwSidecarRejected {
+            reason: "the feed reported an error and is retrying".to_string(),
+            fleet_summary: false,
+            detail: Some(
+                "ERROR growwapi.groww.nats_client: Error: nats: unexpected EOF".to_string(),
+            ),
+        };
+        let msg = event.to_message();
+        assert!(
+            msg.contains(
+                "Groww live feed rejected: ERROR growwapi.groww.nats_client: \
+                 Error: nats: unexpected EOF — retrying"
+            ),
+            "headline must name the sanitized cause + retrying: {msg}"
+        );
+        // The existing class explanation stays as the body line.
+        assert!(
+            msg.contains("the feed reported an error and is retrying"),
+            "class explanation must be kept: {msg}"
+        );
+        // The single-conn total-outage trailer is unchanged.
+        assert!(msg.contains("receiving nothing"), "trailer lost: {msg}");
+        // Badge ordering untouched (PR #1529 owns the badge arms).
+        assert!(
+            msg.starts_with("🟢 GROWW — "),
+            "badge ordering broke: {msg}"
+        );
+        assert_eq!(event.severity(), Severity::High);
+    }
+
+    #[test]
+    fn test_groww_sidecar_rejected_empty_detail_degrades_to_generic() {
+        // An empty / whitespace / None detail must render the EXACT generic
+        // pre-2026-07-14 headline — never a hollow "rejected:  — retrying".
+        let expected = NotificationEvent::GrowwSidecarRejected {
+            reason: "the feed reported an error and is retrying".to_string(),
+            fleet_summary: false,
+            detail: None,
+        }
+        .to_message();
+        assert!(
+            expected.contains("Groww live feed rejected</b>"),
+            "generic headline missing: {expected}"
+        );
+        for hollow in [Some(String::new()), Some("   ".to_string())] {
+            let msg = NotificationEvent::GrowwSidecarRejected {
+                reason: "the feed reported an error and is retrying".to_string(),
+                fleet_summary: false,
+                detail: hollow,
+            }
+            .to_message();
+            assert_eq!(msg, expected, "empty detail must degrade to generic");
+            assert!(
+                !msg.contains("rejected:"),
+                "hollow 'rejected:' headline leaked: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_groww_sidecar_rejected_detail_html_escaped_and_recapped() {
+        // Defense-in-depth at the render boundary: the emit-site contract
+        // already sanitizes + caps, but a hostile/oversized detail from any
+        // future emit site is re-capped to 160 chars (BEFORE escaping, so an
+        // entity is never cut mid-sequence) and html-escaped.
+        let event = NotificationEvent::GrowwSidecarRejected {
+            reason: "the feed reported an error and is retrying".to_string(),
+            fleet_summary: false,
+            detail: Some(format!("<script>{}", "x".repeat(400))),
+        };
+        let msg = event.to_message();
+        assert!(!msg.contains("<script>"), "raw HTML not escaped: {msg}");
+        assert!(
+            msg.contains("rejected: &lt;script&gt;"),
+            "escaped detail missing from headline: {msg}"
+        );
+        // 160-char cap: the raw detail is 408 chars; after the cap the
+        // headline's x-run is 160 - "<script>".len() = 152 chars long.
+        assert!(
+            msg.contains(&"x".repeat(152)) && !msg.contains(&"x".repeat(153)),
+            "detail must be re-capped to 160 chars at the render boundary: {msg}"
         );
     }
 
@@ -5230,7 +5703,15 @@ mod tests {
         };
         let msg = event.to_message();
         assert!(msg.contains("HTTP 401 Unauthorized"));
-        assert!(msg.contains("FAILED"));
+        // 2026-07-14 noise-lock reword pins: broker named + consequence.
+        assert!(
+            msg.contains("Dhan login could not be obtained"),
+            "got: {msg}"
+        );
+        assert!(
+            msg.contains("spot-1m and option-chain pulls will stop"),
+            "consequence line missing: {msg}"
+        );
     }
 
     #[test]
@@ -5242,7 +5723,7 @@ mod tests {
         assert!(!msg.contains("0000000000"), "client ID leaked: {msg}");
         assert!(!msg.contains("pin=000000"), "PIN leaked: {msg}");
         assert!(!msg.contains("totp=000000"), "TOTP leaked: {msg}");
-        assert!(msg.contains("FAILED"));
+        assert!(msg.contains("Dhan login could not be obtained"));
         assert!(msg.contains("[REDACTED]"));
     }
 
@@ -5566,6 +6047,125 @@ mod tests {
         assert_eq!(event.severity(), Severity::High);
     }
 
+    // -- CustomStatus (2026-07-10 Telegram noise cut, F2) --
+
+    #[test]
+    fn test_custom_status_severity_is_low() {
+        // Informational status pings must be Low so they batch and never SMS.
+        let event = NotificationEvent::CustomStatus {
+            message: "status".to_string(),
+        };
+        assert_eq!(event.severity(), Severity::Low);
+        // Below the SNS-SMS threshold (`service.rs` gates SMS on `>= High`).
+        assert!(event.severity() < Severity::High);
+    }
+
+    #[test]
+    fn test_custom_status_message_passthrough() {
+        let event = NotificationEvent::CustomStatus {
+            message: "status payload".to_string(),
+        };
+        assert_eq!(event.to_message(), "status payload");
+    }
+
+    #[test]
+    fn test_custom_status_topic_is_distinct_from_custom() {
+        let status = NotificationEvent::CustomStatus {
+            message: "x".to_string(),
+        };
+        let custom = NotificationEvent::Custom {
+            message: "x".to_string(),
+        };
+        assert_eq!(status.topic(), "CustomStatus");
+        assert_eq!(custom.topic(), "Custom");
+        assert_ne!(status.topic(), custom.topic());
+    }
+
+    #[test]
+    fn test_custom_status_episode_key_is_none() {
+        // Not episode-routed — the episode machinery stays untouched (F1 deferred).
+        let event = NotificationEvent::CustomStatus {
+            message: "x".to_string(),
+        };
+        assert!(event.episode_key().is_none());
+    }
+
+    #[test]
+    fn test_low_custom_status_never_immediate_or_sms() {
+        use crate::notification::coalescer::{DispatchLane, classify_dispatch};
+        let event = NotificationEvent::CustomStatus {
+            message: "x".to_string(),
+        };
+        // Feed the event's OWN severity() + dispatch_policy() into the real
+        // classifier — so reverting `CustomStatus.severity()` back to High
+        // makes THIS test fail end-to-end (the Immediate lane resolves and the
+        // SMS assertion breaks), not just the sibling severity pin.
+        let severity = event.severity();
+        let policy = event.dispatch_policy();
+        // In-market → Digest, off-hours → Coalesce60. Never Immediate — the
+        // only SMS-carrying lane for a non-episode event. This is the direct
+        // "noise is cut" assertion.
+        let in_market = classify_dispatch(
+            severity,
+            policy,
+            event.episode_key().map(|_| event.episode_role()),
+            true,
+        );
+        let off_hours = classify_dispatch(
+            severity,
+            policy,
+            event.episode_key().map(|_| event.episode_role()),
+            false,
+        );
+        assert_eq!(in_market, DispatchLane::Digest);
+        assert_eq!(off_hours, DispatchLane::Coalesce60);
+        assert_ne!(in_market, DispatchLane::Immediate);
+        assert_ne!(off_hours, DispatchLane::Immediate);
+        // The SMS gate (`service.rs`) is `severity >= High`; Low is below it.
+        assert!(
+            severity < Severity::High,
+            "CustomStatus must be below the SMS threshold"
+        );
+    }
+
+    // -- CustomStatusUrgent (2026-07-10, FIX-5): instant but NEVER SMS --
+
+    #[test]
+    fn test_custom_status_urgent_is_immediate_and_low() {
+        use crate::notification::coalescer::{DispatchLane, classify_dispatch};
+        let event = NotificationEvent::CustomStatusUrgent {
+            message: "x".to_string(),
+        };
+        let severity = event.severity();
+        let policy = event.dispatch_policy();
+        // Instant: ships as its own message regardless of market phase.
+        assert_eq!(policy, DispatchPolicy::Immediate);
+        assert_eq!(
+            classify_dispatch(severity, policy, None, true),
+            DispatchLane::Immediate,
+        );
+        assert_eq!(
+            classify_dispatch(severity, policy, None, false),
+            DispatchLane::Immediate,
+        );
+        // But NEVER SMS: severity is Low, strictly below the `>= High` gate.
+        assert_eq!(severity, Severity::Low);
+        assert!(
+            severity < Severity::High,
+            "CustomStatusUrgent must be instant but below the SMS threshold"
+        );
+    }
+
+    #[test]
+    fn test_custom_status_urgent_episode_key_is_none_and_topic_distinct() {
+        let event = NotificationEvent::CustomStatusUrgent {
+            message: "payload".to_string(),
+        };
+        assert!(event.episode_key().is_none());
+        assert_eq!(event.topic(), "CustomStatusUrgent");
+        assert_eq!(event.to_message(), "payload");
+    }
+
     #[test]
     fn test_startup_complete_is_info() {
         let event = NotificationEvent::StartupComplete {
@@ -5854,6 +6454,9 @@ mod tests {
         let msg = event.to_message();
         assert!(msg.contains("OPENED"));
         assert!(msg.contains("halted"));
+        // Cluster-C (2026-07-14): the self-heal line — a lone OPENED page
+        // must tell the operator the system retries on its own.
+        assert!(msg.contains("retries by itself"));
         assert_eq!(event.severity(), Severity::High);
     }
 
@@ -5865,7 +6468,49 @@ mod tests {
         let msg = event.to_message();
         assert!(msg.contains("RISK HALT"));
         assert!(msg.contains("daily_loss_breach"));
+        // Cluster-C (2026-07-14): Critical bodies carry action lines
+        // (Telegram commandment 7).
+        assert!(msg.contains("What you need to do RIGHT NOW"));
+        assert!(msg.contains("All new orders are blocked"));
         assert_eq!(event.severity(), Severity::Critical);
+    }
+
+    /// Cluster-C (2026-07-14): the 5 OMS/risk events are Dhan-badged —
+    /// orders are Dhan-only today, so their pages must carry the same
+    /// feed badge as the order-update WS lifecycle events.
+    #[test]
+    fn test_oms_risk_events_are_dhan_badged() {
+        let events = [
+            NotificationEvent::OrderRejected {
+                correlation_id: "X".to_string(),
+                reason: "bad".to_string(),
+            },
+            NotificationEvent::CircuitBreakerOpened {
+                consecutive_failures: 3,
+            },
+            NotificationEvent::CircuitBreakerClosed,
+            NotificationEvent::RateLimitExhausted {
+                limit_type: "per_second".to_string(),
+            },
+            NotificationEvent::RiskHalt {
+                reason: "x".to_string(),
+            },
+        ];
+        for event in events {
+            let badge = event
+                .feed_badge()
+                .unwrap_or_else(|| panic!("{} must be feed-badged", event.topic()));
+            assert!(
+                badge.contains("DHAN"),
+                "{} must carry the Dhan badge, got {badge}",
+                event.topic()
+            );
+            assert!(
+                event.to_message().starts_with(badge),
+                "{} message must start with the badge",
+                event.topic()
+            );
+        }
     }
 
     #[test]
@@ -6756,13 +7401,10 @@ mod tests {
         assert_external_text_escaped(&ev.to_message());
     }
 
-    #[test]
-    fn test_mid_session_profile_invalidated_escapes_external_reason() {
-        let ev = NotificationEvent::MidSessionProfileInvalidated {
-            reason: HOSTILE.to_string(),
-        };
-        assert_external_text_escaped(&ev.to_message());
-    }
+    // test_mid_session_profile_invalidated_escapes_external_reason DELETED
+    // 2026-07-14 with the MidSessionProfileInvalidated variant (Dhan noise
+    // lock) — the terminal arm routes through AuthenticationFailed, whose
+    // escape test is directly above.
 
     #[test]
     fn test_cross_verify_1m_aborted_escapes_external_detail() {
@@ -7071,7 +7713,9 @@ mod tests {
         let msg = event.to_message();
         assert!(msg.contains("End-of-day digest @ 15:31:30 IST"));
         assert!(msg.contains("Trading date: 2026-05-15"));
-        assert!(msg.contains("Main feed: 1/1"));
+        // 2026-07-14 broker tag: the digest is a BOTH-feed summary, so the
+        // Dhan connection-count line names Dhan explicitly.
+        assert!(msg.contains("Dhan main feed: 1/1"));
         assert!(msg.contains("Token headroom: 20h"));
         assert!(msg.contains("Feed stayed up through close."));
         // No token warning when headroom is healthy.
@@ -7107,7 +7751,7 @@ mod tests {
             feeds: vec![],
         };
         let msg = event.to_message();
-        assert!(msg.contains("Main feed: 0/1"));
+        assert!(msg.contains("Dhan main feed: 0/1"));
         assert!(msg.contains("check overnight logs"));
         assert!(!msg.contains("stayed up"));
     }
@@ -7325,6 +7969,7 @@ mod tests {
         let sidecar = NotificationEvent::GrowwSidecarRejected {
             reason: "access token stale".to_string(),
             fleet_summary: false,
+            detail: None,
         };
         assert_eq!(sidecar.feed_badge(), Some("🟢 GROWW"));
         assert!(
@@ -7373,8 +8018,11 @@ mod tests {
 
     #[test]
     fn test_non_feed_events_carry_no_feed_badge() {
-        // Non-feed events are byte-identical to before — no badge, no "—"
-        // prefix injected.
+        // Host/system-level events are byte-identical to before — no badge,
+        // no "—" prefix injected (never a wrong broker tag; their titles
+        // already name the system component in plain words).
+        // NOTE (2026-07-14): IpVerificationSuccess moved OUT of this list —
+        // it is Dhan-scoped (static-IP order gate) and now carries 🔷 DHAN.
         let events = [
             NotificationEvent::StartupComplete {
                 mode: "sandbox",
@@ -7387,8 +8035,9 @@ mod tests {
                 writer: "ticks".to_string(),
                 failed_checks_before_recovery: 3,
             },
-            NotificationEvent::IpVerificationSuccess {
-                verified_ip: "1.2.3.4".to_string(),
+            NotificationEvent::BootHealthCheck {
+                services_healthy: 3,
+                services_total: 3,
             },
             NotificationEvent::ShutdownComplete,
         ];
@@ -7400,6 +8049,234 @@ mod tests {
                 "non-feed body must not lead with a feed badge: {msg}"
             );
         }
+    }
+
+    #[test]
+    fn test_dhan_rest_leg_events_carry_dhan_badge() {
+        // Operator directive 2026-07-14: the per-minute REST pull alerts
+        // must name the feed. Every Dhan REST-leg event (spot 1m + option
+        // chain) leads with the Dhan badge — trigger AND recovery pairwise,
+        // so an edge-cleared message can never render un-tagged while its
+        // trigger is tagged. Ratchet: removing any arm fails this test.
+        let events = [
+            NotificationEvent::Spot1mFetchDegraded {
+                consecutive_failed_minutes: 3,
+                minute_ist: "10:15".to_string(),
+            },
+            NotificationEvent::Spot1mFetchRecovered {
+                minute_ist: "10:18".to_string(),
+                failed_minutes: 3,
+            },
+            NotificationEvent::Spot1mSidNotServed {
+                symbol: "INDIA VIX".to_string(),
+                consecutive_minutes: 10,
+            },
+            NotificationEvent::Spot1mSidServedRecovered {
+                symbol: "INDIA VIX".to_string(),
+                not_served_minutes: 10,
+            },
+            NotificationEvent::ChainFetchDegraded {
+                consecutive_failed_minutes: 3,
+                minute_ist: "10:15".to_string(),
+            },
+            NotificationEvent::ChainFetchRecovered {
+                minute_ist: "10:18".to_string(),
+                failed_minutes: 3,
+            },
+            NotificationEvent::ChainEntitlementAbsent {
+                pipeline_enabled: true,
+                detail: "no subscription".to_string(),
+            },
+            NotificationEvent::ChainEntitlementConfirmed,
+            NotificationEvent::ChainExpirylistFailed {
+                detail: "lookup failed".to_string(),
+            },
+        ];
+        for ev in events {
+            assert_eq!(ev.feed_badge(), Some("🔷 DHAN"), "event: {}", ev.topic());
+            let msg = ev.to_message();
+            assert!(
+                msg.starts_with("🔷 DHAN — "),
+                "Dhan REST-leg body must lead with the Dhan badge: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_groww_rest_leg_events_carry_groww_badge() {
+        // The Groww per-minute REST legs (spot 1m + option chain + option
+        // contract) lead with the Groww badge — trigger AND recovery
+        // pairwise. Ratchet: removing any arm fails this test.
+        let events = [
+            NotificationEvent::GrowwSpot1mFetchDegraded {
+                consecutive_failed_minutes: 3,
+                minute_ist: "10:15".to_string(),
+            },
+            NotificationEvent::GrowwSpot1mFetchRecovered {
+                minute_ist: "10:18".to_string(),
+                failed_minutes: 3,
+            },
+            NotificationEvent::GrowwChain1mFetchDegraded {
+                consecutive_failed_minutes: 3,
+                minute_ist: "10:15".to_string(),
+            },
+            NotificationEvent::GrowwChain1mFetchRecovered {
+                minute_ist: "10:18".to_string(),
+                failed_minutes: 3,
+            },
+            NotificationEvent::GrowwChain1mExpiryUnresolved {
+                detail: "no usable expiry".to_string(),
+            },
+            NotificationEvent::GrowwChain1mProbeVerdict {
+                ok: true,
+                detail: "3 chains".to_string(),
+            },
+            NotificationEvent::GrowwContract1mFetchDegraded {
+                consecutive_failed_minutes: 3,
+                minute_ist: "10:15".to_string(),
+            },
+            NotificationEvent::GrowwContract1mFetchRecovered {
+                minute_ist: "10:18".to_string(),
+                failed_minutes: 3,
+            },
+            NotificationEvent::GrowwContract1mBookUnresolved {
+                detail: "no usable contracts".to_string(),
+            },
+        ];
+        for ev in events {
+            assert_eq!(ev.feed_badge(), Some("🟢 GROWW"), "event: {}", ev.topic());
+            let msg = ev.to_message();
+            assert!(
+                msg.starts_with("🟢 GROWW — "),
+                "Groww REST-leg body must lead with the Groww badge: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_dhan_scoped_gate_and_order_events_carry_dhan_badge() {
+        // The market-open milestones (they count the Dhan pool), the daily
+        // candle cross-checks (Dhan REST vs our candles), the static-IP /
+        // IP-verify gates, the dual-instance lock, and the order-path
+        // events are all Dhan-scoped — badge ratchet (2026-07-14).
+        let events = [
+            NotificationEvent::MarketOpenStreamingConfirmation {
+                main_feed_active: 1,
+                main_feed_total: 1,
+                order_update_active: true,
+            },
+            NotificationEvent::MarketOpenStreamingFailed {
+                main_feed_active: 0,
+                main_feed_total: 1,
+                order_update_active: false,
+            },
+            NotificationEvent::MarketOpenReadinessConfirmation {
+                main_feed_active: 1,
+                main_feed_total: 1,
+                order_update_active: true,
+                token_remaining_secs: 8 * 3600,
+            },
+            NotificationEvent::CrossVerify1mSummary {
+                trading_date_ist: "2026-07-14".to_string(),
+                instruments: 4,
+                compared: 1500,
+                mismatches: 0,
+                missing: 0,
+                degraded: false,
+            },
+            NotificationEvent::CrossVerify1mAborted {
+                detail: "task died".to_string(),
+            },
+            NotificationEvent::BarMismatchCrossCheckFailed {
+                reason: "all fetches errored".to_string(),
+            },
+            NotificationEvent::BarMismatchCorrectedFromHistorical {
+                compared_count: 222,
+                mismatches_count: 3,
+                sample_symbols: vec!["NIFTY".to_string()],
+                cross_check_pass: "corrected",
+            },
+            NotificationEvent::BarMismatchCrossCheckInconclusive {
+                compared_count: 150,
+                expected_count: 222,
+            },
+            NotificationEvent::IpVerificationFailed {
+                reason: "mismatch".to_string(),
+            },
+            NotificationEvent::IpVerificationSuccess {
+                verified_ip: "1.2.3.4".to_string(),
+            },
+            NotificationEvent::StaticIpBootCheckPassed {
+                ip_flag: "PRIMARY".to_string(),
+            },
+            NotificationEvent::StaticIpBootCheckFailed {
+                reason: "ordersAllowed false".to_string(),
+                orders_allowed: false,
+                ip_match_status: "MISMATCH".to_string(),
+                attempts_made: 30,
+            },
+            NotificationEvent::StaticIpBootCheckRetrying {
+                attempt: 2,
+                max_attempts: 30,
+            },
+            NotificationEvent::DualInstanceDetected {
+                holder: "local:123:abc".to_string(),
+                lock_key: "instance-lock".to_string(),
+            },
+            NotificationEvent::OrderRejected {
+                correlation_id: "abc".to_string(),
+                reason: "rejected".to_string(),
+            },
+            NotificationEvent::CircuitBreakerOpened {
+                consecutive_failures: 3,
+            },
+            NotificationEvent::CircuitBreakerClosed,
+            NotificationEvent::RateLimitExhausted {
+                limit_type: "per_second".to_string(),
+            },
+            NotificationEvent::OrphanPositionDetected {
+                count: 1,
+                total_abs_net_qty: 50,
+                sample_symbols: vec!["NIFTY-Jun2026-28500-CE".to_string()],
+                dry_run: true,
+            },
+            NotificationEvent::OrphanPositionsClean,
+        ];
+        for ev in events {
+            assert_eq!(ev.feed_badge(), Some("🔷 DHAN"), "event: {}", ev.topic());
+            assert!(
+                ev.to_message().starts_with("🔷 DHAN — "),
+                "Dhan-scoped body must lead with the Dhan badge: {}",
+                ev.to_message()
+            );
+        }
+    }
+
+    #[test]
+    fn test_sleep_events_badge_follows_feed_field_with_dhan_fallback() {
+        // The WS sleep/wake events carry a `feed` field whose live values
+        // are "main"/"order_update" (both Dhan WebSocket types) — those
+        // fall back to the Dhan badge; a future "groww" value badges
+        // Groww. Never un-badged, never a static lie (2026-07-14).
+        let main = NotificationEvent::WebSocketSleepEntered {
+            feed: "main".to_string(),
+            connection_index: 0,
+            sleep_secs: 3600,
+        };
+        assert_eq!(main.feed_badge(), Some("🔷 DHAN"));
+        let order_update = NotificationEvent::WebSocketSleepResumed {
+            feed: "order_update".to_string(),
+            connection_index: 0,
+            slept_for_secs: 3600,
+        };
+        assert_eq!(order_update.feed_badge(), Some("🔷 DHAN"));
+        let groww = NotificationEvent::WebSocketTokenForceRenewedOnWake {
+            feed: "groww".to_string(),
+            connection_index: 0,
+            remaining_secs_before: 100,
+            threshold_secs: 14400,
+        };
+        assert_eq!(groww.feed_badge(), Some("🟢 GROWW"));
     }
 
     #[test]
@@ -7545,7 +8422,12 @@ mod tests {
         // 10-commandments check: emoji-first subject, IST 12-hour time,
         // real numbers, no file paths, no library names.
         let msg = cv_summary(91_230, 0, 0, false).to_message();
-        assert!(msg.starts_with('\u{2705}'), "clean summary leads with ✅");
+        // 2026-07-14 broker tag: the Dhan badge leads the body; the
+        // severity emoji stays first WITHIN the summary line.
+        assert!(
+            msg.starts_with("🔷 DHAN — \u{2705}"),
+            "clean summary leads with the Dhan badge then ✅: {msg}"
+        );
         assert!(msg.contains("3:31 PM IST"), "IST 12-hour time");
         assert!(msg.contains("PASS"));
         assert!(msg.contains("Date: 2026-06-10"));
@@ -7559,7 +8441,10 @@ mod tests {
     #[test]
     fn test_cross_verify_1m_summary_failure_message_has_action_lines() {
         let msg = cv_summary(91_230, 42, 15, false).to_message();
-        assert!(msg.starts_with('\u{26a0}'), "failure summary leads with ⚠️");
+        assert!(
+            msg.starts_with("🔷 DHAN — \u{26a0}"),
+            "failure summary leads with the Dhan badge then ⚠️: {msg}"
+        );
         assert!(msg.contains("NEEDS ATTENTION"));
         assert!(msg.contains("Mismatches: 42 | Missing: 15"));
         assert!(msg.contains("What to do RIGHT NOW"));
@@ -8688,6 +9573,185 @@ mod tests {
         assert!(msg.contains("What to do RIGHT NOW"), "{msg}");
     }
 
+    // -----------------------------------------------------------------------
+    // BrutexCrossverifySummary + BrutexCrossverifyAborted
+    // (BRUTEX-XVERIFY, 2026-07-12)
+    // -----------------------------------------------------------------------
+
+    #[allow(clippy::too_many_arguments)]
+    fn brutex_summary(
+        outcome: &str,
+        diverged: i64,
+        noise_p95_paise: i64,
+        noise_max_paise: i64,
+        top_offenders: &str,
+        hint: &str,
+    ) -> NotificationEvent {
+        NotificationEvent::BrutexCrossverifySummary {
+            trading_date_ist: "2026-07-12".to_string(),
+            outcome: outcome.to_string(),
+            files_read: 5,
+            symbols_compared: 742,
+            matched: 276_490,
+            diverged,
+            missing_brutex: 12,
+            missing_live: 3,
+            tail_unsealed: 742,
+            unmapped: 6,
+            noise_p95_paise,
+            noise_max_paise,
+            top_offenders: top_offenders.to_string(),
+            hint: hint.to_string(),
+        }
+    }
+
+    #[test]
+    fn test_brutex_crossverify_summary_clean_day() {
+        let ev = brutex_summary("clean", 0, 5, 40, "", "");
+        assert_eq!(ev.topic(), "BrutexCrossverifySummary");
+        assert_eq!(ev.severity(), Severity::Info);
+        // The once-per-day 15:50 digest must arrive AT 15:50 — post-close
+        // is off-hours, so the default Info routing would coalesce it
+        // (CrossVerify1mSummary / DualFeedDailyScorecard precedent).
+        assert_eq!(ev.dispatch_policy(), DispatchPolicy::Immediate);
+        let msg = ev.to_message();
+        assert!(
+            msg.starts_with("\u{2705}"),
+            "clean day leads with the canonical OK emoji: {msg}"
+        );
+        assert!(
+            msg.contains("BruteX vs live 1-minute check — 2026-07-12: CLEAN"),
+            "{msg}"
+        );
+        assert!(msg.contains("Files read from BruteX: 5"), "{msg}");
+        assert!(msg.contains("Symbols compared: 742"), "{msg}");
+        // Commandment 6: big counts carry thousands separators.
+        assert!(
+            msg.contains("Minutes matched: 276,490 | Diverged: 0"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("Typical wiggle: within 5 paise on 95% of compared minutes (max 40)."),
+            "noise band line missing: {msg}"
+        );
+        // The honesty line is ALWAYS present.
+        assert!(
+            msg.contains(
+                "Neither side is the ground truth — small wiggle is expected; \
+                 only beyond-tolerance rows are real divergence."
+            ),
+            "honesty line missing: {msg}"
+        );
+        // No loud warning line and no offenders block on a clean day.
+        assert!(!msg.contains('\u{26a0}'), "{msg}");
+        assert!(!msg.contains("Biggest differences today"), "{msg}");
+        // 10-commandments litmus: no file paths / library / infra names.
+        for banned in ["data/", "QuestDB", "ILP", "DEDUP", ".rs", "SQL", "S3"] {
+            assert!(
+                !msg.contains(banned),
+                "operator text must not carry {banned:?}: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_brutex_crossverify_summary_no_data_is_loud_and_renders_sentinels() {
+        let ev = NotificationEvent::BrutexCrossverifySummary {
+            trading_date_ist: "2026-07-12".to_string(),
+            outcome: "no_data".to_string(),
+            files_read: 0,
+            symbols_compared: 0,
+            matched: 0,
+            diverged: 0,
+            missing_brutex: 0,
+            missing_live: 0,
+            tail_unsealed: 0,
+            unmapped: 0,
+            noise_p95_paise: -1,
+            noise_max_paise: -1,
+            top_offenders: String::new(),
+            hint: String::new(),
+        };
+        let msg = ev.to_message();
+        assert!(msg.contains(": NO DATA"), "{msg}");
+        // The LOUD line: an empty compare set must never read quiet
+        // (audit Rule 11 — no false-OK on nothing).
+        assert!(
+            msg.contains(
+                "\u{26a0}\u{fe0f} No files arrived from BruteX today — \
+                 nothing was compared."
+            ),
+            "loud no-data line missing: {msg}"
+        );
+        // -1 sentinels render as "?" — never fabricated zeros.
+        assert!(
+            msg.contains("Typical wiggle: within ? paise on 95% of compared minutes (max ?)."),
+            "sentinel rendering wrong: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_brutex_crossverify_summary_diverged_carries_offenders_and_honesty() {
+        let ev = brutex_summary(
+            "diverged",
+            42,
+            5,
+            180,
+            "RELIANCE 10:15 AM high off by 15 paise\n\
+             INFY 11:30 AM close off by 9 paise",
+            "Our feed had a stall episode at 10:14 AM — the gap lines up.",
+        );
+        let msg = ev.to_message();
+        assert!(
+            msg.starts_with("\u{26a0}\u{fe0f}"),
+            "diverged day leads with the canonical warning emoji: {msg}"
+        );
+        assert!(
+            msg.contains("BruteX vs live 1-minute check — 2026-07-12: DIVERGED"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("Minutes matched: 276,490 | Diverged: 42"),
+            "{msg}"
+        );
+        assert!(msg.contains("Biggest differences today:"), "{msg}");
+        assert!(
+            msg.contains("RELIANCE 10:15 AM high off by 15 paise"),
+            "offender line missing: {msg}"
+        );
+        assert!(
+            msg.contains("Our feed had a stall episode at 10:14 AM"),
+            "hint line missing: {msg}"
+        );
+        // The honesty line survives on a diverged day too.
+        assert!(
+            msg.contains(
+                "Neither side is the ground truth — small wiggle is expected; \
+                 only beyond-tolerance rows are real divergence."
+            ),
+            "honesty line missing: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_brutex_crossverify_aborted_event() {
+        let ev = NotificationEvent::BrutexCrossverifyAborted {
+            trading_date_ist: "2026-07-12".to_string(),
+            reason: "task_panicked".to_string(),
+        };
+        assert_eq!(ev.topic(), "BrutexCrossverifyAborted");
+        assert_eq!(ev.severity(), Severity::High);
+        let msg = ev.to_message();
+        assert!(msg.contains("\u{1f198}"), "leads with 🆘: {msg}");
+        assert!(
+            msg.contains("BruteX cross-verify run FAILED — 2026-07-12"),
+            "{msg}"
+        );
+        assert!(msg.contains("3:50 PM IST"), "{msg}");
+        assert!(msg.contains("Reason: task_panicked"), "{msg}");
+        assert!(msg.contains("What to do RIGHT NOW"), "{msg}");
+    }
+
     #[test]
     fn test_scorecard_render_helpers() {
         // render_ms: sentinel / sub-second / ≥1s bands.
@@ -8878,51 +9942,12 @@ mod tests {
             reconnected.contains("reconnected") && reconnected.contains('3'),
             "got: {reconnected}"
         );
-        let silent = NotificationEvent::NoLiveTicksDuringMarketHours {
-            silent_for_secs: 120,
-            threshold_secs: 60,
-        }
-        .to_message();
-        assert!(
-            silent.contains("zero live ticks") && silent.contains("120"),
-            "got: {silent}"
-        );
     }
 
-    /// AUTH-GAP-05 (2026-07-06) — the ONE HIGH forced-re-mint event:
-    /// severity / event_kind / Dhan badge / 10-commandments body (status
-    /// emoji, code id, specific numbers, NO token material, NO file paths).
-    #[test]
-    fn test_token_forced_remint_triggered_event() {
-        let ev = NotificationEvent::TokenForcedRemintTriggered {
-            consecutive_checks: 2,
-            check_interval_secs: 900,
-        };
-        assert_eq!(ev.severity(), Severity::High);
-        assert_eq!(ev.topic(), "TokenForcedRemintTriggered");
-        assert_eq!(
-            ev.feed_badge(),
-            Some(super::super::feed_badge::FeedBadge::Dhan.badge()),
-            "forced re-mint is Dhan-scoped — must lead with the Dhan badge"
-        );
-        let msg = ev.to_message();
-        assert!(msg.contains("AUTH-GAP-05"), "got: {msg}");
-        assert!(msg.contains("⚠️"), "status emoji missing: {msg}");
-        assert!(
-            msg.contains("2 times") && msg.contains("30 minutes"),
-            "specific numbers missing (2 checks × 900s = 30 min): {msg}"
-        );
-        // 10-commandments: never the JWT, never a file path or lib name.
-        assert!(
-            !msg.contains("eyJ"),
-            "JWT material must never appear: {msg}"
-        );
-        assert!(!msg.contains(".rs"), "file paths must never appear: {msg}");
-        assert!(
-            !msg.contains("force_renewal") && !msg.contains("arc-swap"),
-            "library/function names must never appear: {msg}"
-        );
-    }
+    // test_token_forced_remint_triggered_event DELETED 2026-07-14 with the
+    // TokenForcedRemintTriggered variant (Dhan noise lock) — the forced
+    // re-mint self-heals silently; only a terminal failure pages via the
+    // AuthenticationFailed family-(3) Critical.
 
     // -----------------------------------------------------------------
     // W2 PR#5 (2026-07-10) — HolidayCalendarCoverageLow

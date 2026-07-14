@@ -212,6 +212,40 @@ the operator at the exact SSM parameter to reconcile.
 
 ## AUTH-GAP-05 — sustained mid-session token-invalid: forced re-mint triggered (live 2026-07-06)
 
+> **⚠ 2026-07-14 UPDATE (operator Dhan noise lock —
+> `dhan-rest-only-noise-lock-2026-07-14.md`):** BOTH Telegram pages this
+> section describes are REMOVED — the `TokenForcedRemintTriggered` (High)
+> and `MidSessionProfileInvalidated` (Critical) NotificationEvent variants
+> are DELETED. The SILENT self-heal machinery is RETAINED AND EXTENDED:
+> the 900s `/v2/profile` probe, `decide_remint`, the forced re-mint, and
+> every coded `error!` + `tv_token_forced_remint_total` counter stay;
+> (GAP-04) the retry-once latch now RE-ARMS every 2nd failing 900s cycle
+> (~30-min retry cadence) while an episode persists, still honoring the
+> ~125s mint cooldown + the RESILIENCE-03 lock refusals; (GAP-02) the
+> REST-only stack additionally runs a 900s `force_renewal_if_stale(4h)`
+> sweep (`DHAN_REST_STACK_TOKEN_SWEEP_INTERVAL_SECS`) as the
+> renewal-loop-halt backstop. A TERMINAL re-mint failure now pages the
+> family-(c) Critical directly (`AuthenticationFailed` emitted from the
+> watchdog's terminal arm — `force_renewal`→`acquire_token` pages nothing
+> on a non-RESILIENCE-03 permanent failure, verified 2026-07-14).
+>
+> **2026-07-14 fix round (same day):** the family-(c) page is
+> ONCE-PER-EPISODE (H1a `terminal_paged_this_episode` latch — the GAP-04
+> re-arm previously re-paged the same episode every ~30 min), the re-arm
+> is BOUNDED at `REMINT_MAX_ATTEMPTS_PER_EPISODE` (= 3) mints per episode
+> (H1b — the cap fires the same once-per-episode Critical when the
+> profile stays REAL-invalid after all 3, the dead-dataPlan class), and
+> the AG5-R2-1 "flagged follow-up" below is CLOSED: the ~125s mint
+> cooldown now lives INSIDE `TokenManager::renew_with_fallback` (H3 —
+> shared by ALL re-mint callers; the cooldown skip is a typed non-terminal
+> refusal the watchdog never pages on; `initialize`'s boot loop stays
+> ungated). Cadence note: a PERSISTING lock-lost episode re-logs the
+> RESILIENCE-01 `refused_lock_lost` error every ~30 min (the GAP-04
+> re-arm re-evaluates the refusal) — bounded log noise, no mint, no
+> Telegram from that arm; the IN-FLIGHT RESILIENCE-03 tripwire inside
+> `acquire_token` still pages its own family-(c) refusal (pre-existing).
+> Content below retained as historical audit; page references are stale.
+
 **Status (2026-07-06):** LIVE — defined as
 `ErrorCode::AuthGap05ForcedRemintTriggered` with `code_str() == "AUTH-GAP-05"`.
 Severity::High. Auto-triage safe: YES (the forced re-mint IS the
@@ -296,7 +330,51 @@ live WS feed.
 Trigger/RefuseLockLost arms), `crates/core/src/auth/token_health_gauge.rs`
 (the honest gauges), `crates/core/src/auth/token_manager.rs::dual_instance_lock_held`.
 
+### 2026-07-14 Update — the mint-FAILURE arm now PAGES via CloudWatch (REST-audit GAP-01)
+
+The 2026-07-14 adversarial audit
+(`docs/audits/2026-07-14-rest-pipeline-adversarial-audit.md`, GAP-01 HIGH)
+found AUTH-GAP-05's page was app-emitted Telegram ONLY — a dead app
+notifier (or Telegram bot) silenced the mid-session token-death page
+entirely, and per GAP-02/GAP-04 a FAILED single mint leaves the token dead
+for the rest of the session (retry-once latch; the 4h sweep backstop is
+lane-only). A CloudWatch log-filter alarm now backstops it:
+`tv-<env>-errcode-auth-gap-05-remint-failed`
+(`deploy/aws/terraform/error-code-alarms.tf`) — errors.jsonl → CW Logs
+`/tickvault/<env>/app` → filter
+`{ $.code = "AUTH-GAP-05" && $.level = "ERROR" && $.cooldown_skip IS FALSE }`
+→ alarm (≤5 min) → SNS → Telegram.
+**SCOPED to the mint-FAILURE arm** via the `$.cooldown_skip` boolean field,
+which exists ONLY on the "forced re-mint failed" emission (the
+`flatten_event(true)` JSON layer hoists event fields top-level in
+errors.jsonl; `IS FALSE` additionally excludes the same-day Dhan-noise-lock
+H3 mint-cooldown-skip lines — a TokenManager cooldown skip is NOT terminal,
+the next re-arm window retries, and the app Telegram is equally gated
+`!permanent && !cooldown_skip`): the TRIGGER arm ("forcing re-mint") fires
+on every episode
+INCLUDING successful ~30-min self-heals and is operator-ruled noise —
+silent-when-healing, loud-only-when-unobtainable — so it deliberately does
+NOT page here (the HIGH `TokenForcedRemintTriggered` Telegram remains its
+app-side signal). `ok_recovery = false` (once-per-episode emitter — the
+auto-OK ~15 min after the datapoint ages out can never mean the token came
+back; real recovery = `tv_token_valid` returning to 1 / the next clean
+watchdog cycle). Triage step 1 above ("app Telegram only" era) is
+superseded accordingly: the CloudWatch page names the same errors.jsonl
+line to read.
+
 ## AUTH-GAP-06 — fast-boot cached-token validation (live 2026-07-08)
+
+> **⚠ MODULE DELETED 2026-07-14 (operator Dhan noise lock —
+> `dhan-rest-only-noise-lock-2026-07-14.md`).** The module
+> `crates/core/src/auth/fast_boot_validation.rs`, its sole call site (the
+> Dhan-gated FAST crash-recovery arm in main.rs — dead with
+> `dhan_enabled = false` and deleted wholesale by the Phase C-2 lane PR),
+> and its wiring guard test are DELETED. The
+> `ErrorCode::AuthGap06FastBootCachedTokenValidation` variant is RETAINED
+> until the C4 variant sweep (this file keeps satisfying the cross-ref
+> test). A stale cached token on a REST-only boot is covered by
+> `dhan_rest_stack` Phase 2's full `TokenManager::initialize` (which owns
+> cache/mint logic itself). Content below retained as historical audit.
 
 **Status (2026-07-08):** LIVE — defined as
 `ErrorCode::AuthGap06FastBootCachedTokenValidation` with

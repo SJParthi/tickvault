@@ -1,7 +1,8 @@
 # App-level CloudWatch alarms — Z+ L2 VERIFY layer.
 #
 # The 5 alarms in alarms.tf cover infrastructure (EC2 status, CPU, EBS,
-# network). The 21 alarms in THIS file cover application signals: WebSocket
+# network). The 20 alarms in THIS file (21 until the 2026-07-14 Dhan noise
+# lock retired order_update_ws_inactive) cover application signals: WebSocket
 # health, QuestDB connectivity, token lifecycle, tick freshness, order
 # rejection, aggregator liveness, backpressure, clock drift, composite SLO
 # score. 4 more silent-feed alarms live in silent-feed-alarms.tf
@@ -39,13 +40,24 @@
 #   - Post-PR (historical): 18 alarms, 12 custom metrics.
 #     Overage then: 8 alarms × $0.10 = $0.80/mo + 2 custom metrics × $0.30
 #     = $0.60/mo ≈ ₹120/mo extra.
-#   - Current (2026-07-11, scoreboard PR-C groww lag gauge): 21 app alarms
+#   - Current (2026-07-14, Dhan noise lock: order_update_ws_inactive
+#     retired, ~-$0.10/mo): 20 app alarms
 #     in THIS file + 4 in silent-feed-alarms.tf; 29 selected custom-metric
 #     series (27 main EMF names + the 2 [host,feed] boundary-catchup
 #     declarations). Overage now: alarms ≈ $1.90/mo + metrics (29 − 10
 #     free) × $0.30 = $5.70/mo ⇒ ~$7.60/mo ≈ ₹650/mo total (matches the
 #     app_cloudwatch_alarms output below + aws-budget.md's 2026-07-06
 #     note). Operator MUST acknowledge before terraform apply.
+#   - +3 alarms (order-side-alarms.tf, 2026-07-14): orders-placed-storm
+#     (armed) + daily-loss-breach (armed, dormant-silent in dry-run) +
+#     order-fill-lag-high (disarmed) ≈ +$0.30/mo, +1 derived metric
+#     series (tv_orders_placed_delta_total) ≈ +$0.30/mo; the 2 new EMF
+#     names (tv_daily_pnl, tv_order_fill_lag_seconds) are DORMANT ($0
+#     until cluster A / Phase-1 emits). THIS file's alarm RESOURCE count
+#     stays 21 (the 3 new alarms live standalone in order-side-alarms.tf;
+#     the "twenty_three" wiring test counts METRIC NAMES across
+#     app-alarms.tf + silent-feed-alarms.tf — a different axis, no
+#     conflict). See aws-budget.md COST NOTE 2026-07-14.
 
 locals {
   # All alarms publish to the same SNS topic. Single source of truth so
@@ -57,133 +69,24 @@ locals {
 }
 
 # ---------------------------------------------------------------------------
-# 1. Main-feed WebSocket pool dead — every conn dropped, no live ticks
-# treat_missing_data = notBreaching (was "breaching", 2026-06-02): the metric
-# is emitted ONLY while the app runs, so on the scheduled weekday 16:30 IST
-# stop / weekends / any deploy gap the metric goes missing and "breaching"
-# held this alarm STUCK FIRING across the gap (operator saw it firing while the
-# box was up + ticks flowing). App-death while the box is up is still caught by
-# systemd Restart=always + the in-app tick-gap Telegram + the EC2 status alarm.
-#
-# MARKET-HOURS-GATED (2026-07-10, pre-09:00 deferral false-page fix): the pool
-# watchdog sets `tv_websocket_pool_all_dead` unconditionally every 5s
-# (crates/core/src/websocket/pool_watchdog.rs), while the pool DELIBERATELY
-# opens zero Dhan sockets until 09:00 IST (the by-design pre-open connect
-# deferral in crates/app/src/main.rs). This alarm was the ONLY liveness-class
-# alarm NOT in the market-hours window-gate Lambda's ALARM_NAMES list, so it
-# paged "ALL live market data connections are down" 24/7: every trading
-# morning ~08:34-09:00 during the deferral, and on overnight catch-up-deploy
-# boots (observed 2026-07-10 at 02:45, 03:42 and 08:34 IST). The gauge stays
-# HONEST (no producer change — dashboards / doctor / SLO WS_health unchanged);
-# only the alarm ACTIONS are windowed: OFF by default, armed 09:20-15:35 IST
-# Mon-Fri by the gate Lambda (market-hours-liveness-alarm.tf), whose open
-# mode also set_alarm_state(OK)s the gated alarms — a stale pre-open ALARM
-# from the deferral window is reset at window open (edge-triggered, no
-# false-page carry-over). HONEST COVERAGE ENVELOPE (corrected 2026-07-10
-# review round 1): the boot-heartbeat alarm (tv_boot_completed, 08:50-09:20
-# IST window) + the 08:45 IST readiness pager cover ONLY the app-not-booted
-# class (both key on tv_boot_completed / EC2 state); a pool that connects at
-# 09:00 and dies POST-boot in [09:00, 09:20) with the process alive is
-# caught by NEITHER — its pre-09:22 coverer is the APP-SIDE 09:16:30 IST
-# market-open self-test (main_feed_active check, SELFTEST-02 Critical →
-# Telegram; gated on config features.market_open_self_test = true — if that
-# flag is ever disabled, the first page for this class slips to ~09:22).
-# From 09:20 the market-hours liveness alarm + this re-armed alarm own it —
-# a pool genuinely dead past 09:20 pages within ~2 min of window open
-# (2x60s eval after the OK reset). Residual (honest): the post-boot
-# [09:00, 09:20) death above first pages CloudWatch at ~09:22 — bounded,
-# same class as the boot-heartbeat §19 seam envelope (worst ~9-10 min).
-# GATE-OPEN SKIP-DAY RESIDUAL (2026-07-10 review round 1): the gate
-# Lambda's 09:20 open path returns SUCCESS without enabling when the
-# holiday-stop SSM marker == today OR the box is not up at 09:20 (crash +
-# autopilot race, operator stop/start straddling 09:20, stale marker) — a
-# SUCCESS skip does NOT fire the gate-errors watchman (it catches Lambda
-# ERRORS only), so on such a day BOTH ws-pool alarms stay disarmed for the
-# ENTIRE session even if the box comes up minutes later; a real mid-day
-# pool death then pages no CloudWatch alarm until the next day's open.
-# Before 2026-07-10 these two alarms were always-armed and WOULD have paged
-# that outage. Partial mitigation: the operator is CloudWatch-blind only —
-# the app-side tick-gap Telegram + the 09:16:30 self-test still run from
-# inside the app. FLAGGED FOLLOW-UP (not built in this PR): make the
-# open-path skip observable (custom metric / log-filter alarm on the
-# "leaving actions disabled" log line so a skip on a non-holiday weekday
-# pages), or have the start-watchdog/autopilot re-invoke the gate Lambda
-# with mode=open after a late in-window instance start.
-# Strictly better than the always-armed alarm's daily false-page noise.
-# In-window sensitivity (metric/threshold/eval periods) is UNCHANGED.
+# RETIRED (PR-C2, 2026-07-13 — Dhan live-WS lane deletion, operator
+# retirement directive per websocket-connection-scope-lock.md "2026-07-13
+# Amendment" §B): the alarms `ws_pool_all_dead` (tv_websocket_pool_all_dead)
+# + `ws_failed_connections` (tv_websocket_failed_connections_count) watched
+# the deleted main-feed pool watchdog's gauges — no emit site exists, so the
+# alarms could never fire again (permanent missing-data). Removed with their
+# window-gate entries. Groww feed liveness is owned by groww_ws_inactive +
+# groww_stall_restart_storm + the market-hours liveness alarm (re-pointed to
+# the Groww lag gauge in Phase A).
 # ---------------------------------------------------------------------------
-resource "aws_cloudwatch_metric_alarm" "ws_pool_all_dead" {
-  alarm_name          = "tv-${var.environment}-ws-pool-all-dead"
-  alarm_description   = "Main-feed WebSocket pool reports all conns dead DURING MARKET HOURS — no live ticks reaching the pipeline. Actions gated to 09:20-15:35 IST Mon-Fri by the market-hours gate Lambda (the pool defers Dhan connects until 09:00 IST by design, so the pre-open gauge is legitimately 1 and never pages). See disaster-recovery.md scenario 6."
-  comparison_operator = "GreaterThanThreshold"
-  evaluation_periods  = 2
-  metric_name         = "tv_websocket_pool_all_dead"
-  namespace           = local.app_namespace
-  period              = 60
-  statistic           = "Maximum"
-  threshold           = 0
-  treat_missing_data  = "notBreaching"
-  dimensions          = local.app_dimensions
-  # Actions OFF by default; the market-hours gate Lambda flips them ON
-  # 09:20-15:35 IST Mon-Fri (market-hours-liveness-alarm.tf).
-  actions_enabled = false
-  alarm_actions   = local.app_alarm_actions
-  ok_actions      = local.app_alarm_ok
-}
-
 # ---------------------------------------------------------------------------
-# 2. WS pool partial degradation — some but not all conns failed
-#
-# MARKET-HOURS-GATED (2026-07-10, pre-09:00 deferral false-page fix): written
-# by the SAME unconditional 5s pool-watchdog tick as ws_pool_all_dead above,
-# so it shares the same false class during the by-design pre-09:00 IST Dhan
-# connect deferral and overnight catch-up-deploy boots. Same fix, same
-# honest-coverage envelope as the ws_pool_all_dead comment block above:
-# gauge unchanged, actions windowed 09:20-15:35 IST Mon-Fri by the gate
-# Lambda (market-hours-liveness-alarm.tf), stale pre-open ALARM state reset
-# to OK at window open. In-window sensitivity is UNCHANGED.
+# 3. Order-update WebSocket down — RETIRED 2026-07-14 (operator Dhan noise
+# lock, dhan-rest-only-noise-lock-2026-07-14.md): the order-update WS spawn
+# itself is retired (no process opens the socket until live trading), and
+# the alarm was already blind on dhan-off boots — tv_order_update_ws_active
+# was written ONLY by the dead lane spawn sites (missing-data-silent both
+# ways). Deleted together with order-update-reconnect-storm-alarm.tf.
 # ---------------------------------------------------------------------------
-resource "aws_cloudwatch_metric_alarm" "ws_failed_connections" {
-  alarm_name          = "tv-${var.environment}-ws-failed-connections"
-  alarm_description   = "One or more main-feed conns are in failed state DURING MARKET HOURS. Pool may self-heal via watchdog; investigate if sustained. Actions gated to 09:20-15:35 IST Mon-Fri by the market-hours gate Lambda (pre-09:00 IST the pool defers Dhan connects by design)."
-  comparison_operator = "GreaterThanThreshold"
-  evaluation_periods  = 3
-  metric_name         = "tv_websocket_failed_connections_count"
-  namespace           = local.app_namespace
-  period              = 60
-  statistic           = "Maximum"
-  threshold           = 0
-  treat_missing_data  = "notBreaching"
-  dimensions          = local.app_dimensions
-  # Actions OFF by default; the market-hours gate Lambda flips them ON
-  # 09:20-15:35 IST Mon-Fri (market-hours-liveness-alarm.tf).
-  actions_enabled = false
-  alarm_actions   = local.app_alarm_actions
-  ok_actions      = local.app_alarm_ok
-}
-
-# ---------------------------------------------------------------------------
-# 3. Order-update WebSocket down — orders fly blind
-# treat_missing_data = notBreaching (was "breaching", 2026-06-02): same
-# stale-FIRING fix as ws_pool_all_dead — the metric is missing whenever the box
-# is intentionally stopped (16:30 IST / weekends) or during a deploy gap, and
-# "breaching" held this alarm stuck FIRING across that gap.
-# ---------------------------------------------------------------------------
-resource "aws_cloudwatch_metric_alarm" "order_update_ws_inactive" {
-  alarm_name          = "tv-${var.environment}-order-update-ws-inactive"
-  alarm_description   = "Order-update WebSocket is inactive. New orders will not receive fill confirmations via WS (postback fallback only)."
-  comparison_operator = "LessThanThreshold"
-  evaluation_periods  = 2
-  metric_name         = "tv_order_update_ws_active"
-  namespace           = local.app_namespace
-  period              = 60
-  statistic           = "Minimum"
-  threshold           = 1
-  treat_missing_data  = "notBreaching"
-  dimensions          = local.app_dimensions
-  alarm_actions       = local.app_alarm_actions
-  ok_actions          = local.app_alarm_ok
-}
 
 # ---------------------------------------------------------------------------
 # 3b. Groww feed inactive (operator 2026-07-06 — Groww feed-down alerting).
@@ -446,6 +349,15 @@ resource "aws_cloudwatch_metric_alarm" "aggregator_no_seals" {
 # ---------------------------------------------------------------------------
 # 10. Order rejections — OMS or Dhan-side issue
 # ---------------------------------------------------------------------------
+# REJECTION-CLASS SPLIT (C4, 2026-07-14 hostile review): there are TWO
+# DISJOINT rejection classes. (a) Place-time API errors (DH-905/DH-906
+# at the place_order Err arm) — these fire the OrderRejected Telegram +
+# the `rejected` order_audit row AND (since the C4 fix) increment
+# tv_orders_rejected_total, so they page this alarm. (b) WS-reported
+# REJECTED transitions (process_order_update — the order-update WS is
+# functional-dormant today) — these increment the counter/alarm but
+# produce NO Telegram/audit row (the fire_alert at that transition is a
+# Phase-1 follow-up). The alarm and the Telegram are NOT one signal chain.
 resource "aws_cloudwatch_metric_alarm" "orders_rejected" {
   alarm_name          = "tv-${var.environment}-orders-rejected"
   alarm_description   = "One or more orders rejected in the last 5 minutes. Could be DH-905 (bad input), DH-906 (order error), or risk-gate denial."
@@ -459,44 +371,26 @@ resource "aws_cloudwatch_metric_alarm" "orders_rejected" {
   treat_missing_data  = "notBreaching"
   dimensions          = local.app_dimensions
   alarm_actions       = local.app_alarm_actions
-  ok_actions          = local.app_alarm_ok
+  # 2026-07-14 cluster-C order-side: ok_actions STRIPPED. The rejected
+  # count returning to 0 is not an all-clear (the rejected orders exist;
+  # the rejection cause may persist) — the auto-OK paged a Rule-11 false
+  # recovery on every episode aging out. The counter is now also
+  # pre-registered at 0 in main.rs (first-sample-baseline lesson) so a
+  # single-rejection session (place-time class — the counter emit at the
+  # place_order Err arm, C4) actually pages — see
+  # deploy/aws/terraform/order-side-alarms.tf +
+  # crates/app/tests/order_side_paging_wiring_guard.rs.
+  ok_actions = []
 }
 
 # ---------------------------------------------------------------------------
-# 11. Composite real-time guarantee score critical (< 0.80)
-#
-# MARKET-HOURS-GATED (2026-07-03, 5 AM false-SOS fix): the SLO score is
-# LEGITIMATELY 0 outside market hours — its dimensions (tick freshness,
-# aggregator health, ...) are market-gated in-app, so the metric is PRESENT
-# with value 0.0 whenever the app runs off-hours. treat_missing_data does
-# NOT help (the data is not missing). VERIFIED incident 2026-07-03 05:40
-# IST: operator manually started the box pre-market and got an SOS Telegram
-# ("2 datapoints 0.0 ... less than threshold (0.8)") for a healthy, idle
-# system. Actions are OFF by default; the shared market-hours gate Lambda
-# (market-hours-liveness-alarm.tf) enables them 09:20-15:35 IST Mon-Fri and
-# resets state to OK on open so a stale off-hours ALARM never re-fires. A
-# genuine in-market degradation (score < 0.80 for 2 min) pages exactly as
-# before — in-market sensitivity is UNCHANGED.
+# RETIRED (PR-C2, 2026-07-13): `realtime_guarantee_critical`
+# (tv_realtime_guarantee_score < 0.80) — the SLO evaluator/publisher was
+# deleted per the operator PARK ruling (wave-3-d-error-codes.md banner), so
+# the score is never published again. Removed with its window-gate entry;
+# the market-hours liveness alarm was re-pointed to the Groww lag gauge in
+# Phase A.
 # ---------------------------------------------------------------------------
-resource "aws_cloudwatch_metric_alarm" "realtime_guarantee_critical" {
-  alarm_name          = "tv-${var.environment}-realtime-guarantee-critical"
-  alarm_description   = "Composite real-time guarantee score < 0.80 DURING MARKET HOURS — at least one dimension (WS, QuestDB, tick freshness, token, spill, Phase 2) is severely degraded. Actions gated to 09:20-15:35 IST Mon-Fri by the market-hours gate Lambda — the score is legitimately 0 off-hours (feeds idle by design) and never pages then. See SLO-02 runbook."
-  comparison_operator = "LessThanThreshold"
-  evaluation_periods  = 2
-  metric_name         = "tv_realtime_guarantee_score"
-  namespace           = local.app_namespace
-  period              = 60
-  statistic           = "Minimum"
-  threshold           = 0.80
-  treat_missing_data  = "notBreaching"
-  dimensions          = local.app_dimensions
-  # Actions OFF by default; the market-hours gate Lambda flips them ON
-  # 09:20-15:35 IST Mon-Fri (market-hours-liveness-alarm.tf).
-  actions_enabled = false
-  alarm_actions   = local.app_alarm_actions
-  ok_actions      = local.app_alarm_ok
-}
-
 # ---------------------------------------------------------------------------
 # 12. Wall-clock skew > 1s — IST timestamp math at risk
 # ---------------------------------------------------------------------------
@@ -556,50 +450,13 @@ resource "aws_cloudwatch_metric_alarm" "disk_used_high" {
 }
 
 # ---------------------------------------------------------------------------
-# 14. WS frame dropped with NO WAL — the hard zero-tick-loss breach (G4)
-# `tv_ws_frame_dropped_no_wal_total` increments ONLY when the live frame
-# channel is full AND the WAL spill is not attached — the frame is genuinely
-# lost (not just buffered). Any non-zero value is an irrecoverable tick loss.
+# RETIRED (PR-C2, 2026-07-13): `ws_frame_dropped_no_wal`
+# (tv_ws_frame_dropped_no_wal_total) + `ws_reconnect_gap_high`
+# (tv_ws_reconnect_gap_seconds_total) — both counters were emitted only by
+# the deleted main-feed `connection.rs` read loop. The surviving durable
+# floor is the WAL writer's own WS-SPILL-01/02 codes + the ws_event_audit
+# chain; order-update/Groww reconnects keep their own pagers.
 # ---------------------------------------------------------------------------
-resource "aws_cloudwatch_metric_alarm" "ws_frame_dropped_no_wal" {
-  alarm_name          = "tv-${var.environment}-ws-frame-dropped-no-wal"
-  alarm_description   = "WS live frame LOST — channel full AND no WAL attached. Irrecoverable tick loss. Investigate consumer liveness + re-enable WAL spill immediately."
-  comparison_operator = "GreaterThanThreshold"
-  evaluation_periods  = 1
-  metric_name         = "tv_ws_frame_dropped_no_wal_total"
-  namespace           = local.app_namespace
-  period              = 60
-  statistic           = "Sum"
-  threshold           = 0
-  treat_missing_data  = "notBreaching"
-  dimensions          = local.app_dimensions
-  alarm_actions       = local.app_alarm_actions
-  ok_actions          = local.app_alarm_ok
-}
-
-# ---------------------------------------------------------------------------
-# 15. WS reconnect-gap rate too high (G1) — sustained/excessive reconnect churn
-# `tv_ws_reconnect_gap_seconds_total` accumulates the measured down-time of
-# every reconnect. A rate-alarm (Sum over 5m) flags excessive churn WITHOUT
-# paging on each routine 5-10s reconnect. Threshold 60s of cumulative gap per
-# 5m window = the feed spent >20% of the window reconnecting.
-# ---------------------------------------------------------------------------
-resource "aws_cloudwatch_metric_alarm" "ws_reconnect_gap_high" {
-  alarm_name          = "tv-${var.environment}-ws-reconnect-gap-high"
-  alarm_description   = "WS reconnect churn high — cumulative reconnect-gap > 60s in 5m. Sub-30s reconnects drop ticks invisibly (no Dhan sequence number); investigate network/Dhan stability."
-  comparison_operator = "GreaterThanThreshold"
-  evaluation_periods  = 1
-  metric_name         = "tv_ws_reconnect_gap_seconds_total"
-  namespace           = local.app_namespace
-  period              = 300
-  statistic           = "Sum"
-  threshold           = 60
-  treat_missing_data  = "notBreaching"
-  dimensions          = local.app_dimensions
-  alarm_actions       = local.app_alarm_actions
-  ok_actions          = local.app_alarm_ok
-}
-
 # ---------------------------------------------------------------------------
 # 16. Disk-health watcher respawn churn (G3) — the watcher that guards the
 # "disk full + QuestDB down" gap died and was respawned by its supervisor.
@@ -722,13 +579,10 @@ resource "aws_cloudwatch_metric_alarm" "mem_used_high" {
 # ---------------------------------------------------------------------------
 
 output "app_cloudwatch_alarms" {
-  description = "21 application-level alarms in THIS file (19 Prometheus-via-CW-agent incl. #1437's 2 groww alarms + 1 disk-used + 1 mem-used Metrics-Insights); 4 more silent-feed alarms live in silent-feed-alarms.tf (2026-07-06 incident hardening + scoreboard PR-C S4). tick-gap-instruments-silent was RETUNED 2026-07-06 (threshold 100 -> 40 PROVISIONAL, 10-of-12 min, market-hours-gated). Cost note (2026-07-06 groww feed-down alerting adds 2 alarms + 3 selected metrics; silent-feed hardening adds 3 alarms + 4 selected series; scoreboard PR-C S4 adds 1 lag alarm): overage above the 10 free-tier alarms ≈ $1.90/mo + 29 selected custom-metric series ≈ $5.70/mo overage above the 10 free-tier metrics (≈ $8.70/mo absolute at ~$0.30 each; EMF name count pinned by cloudwatch_app_alarms_wiring.rs) ≈ $7.60/mo ≈ ₹650/mo total — well inside the $55 budget cap."
+  description = "15 application-level alarms in THIS file (13 Prometheus-via-CW-agent + 1 disk-used + 1 mem-used Metrics-Insights; PR-C2 2026-07-13 retired 5 Dhan-lane alarms — ws-pool-all-dead, ws-failed-connections, realtime-guarantee-critical, ws-frame-dropped-no-wal, ws-reconnect-gap-high — their emitters died with the Dhan live-WS lane; order-update-ws-inactive RETIRED 2026-07-14 per dhan-rest-only-noise-lock-2026-07-14.md, reconciled through the PR-C2 merge); 3 more silent-feed alarms live in silent-feed-alarms.tf (realtime-guarantee-degraded also retired PR-C2). tick-gap-instruments-silent was RETUNED 2026-07-06 (threshold 100 -> 40 PROVISIONAL, 10-of-12 min, market-hours-gated). Cost note: the PR-C2 retirement REMOVES 6 alarms + 5 selected custom-metric series and the 2026-07-14 noise lock a further alarm + the order-update gauge series from the pre-C2 bill (was ~$7.60/mo overage) — still well inside the $55 budget cap."
   value = [
     aws_cloudwatch_metric_alarm.disk_used_high.alarm_name,
     aws_cloudwatch_metric_alarm.mem_used_high.alarm_name,
-    aws_cloudwatch_metric_alarm.ws_pool_all_dead.alarm_name,
-    aws_cloudwatch_metric_alarm.ws_failed_connections.alarm_name,
-    aws_cloudwatch_metric_alarm.order_update_ws_inactive.alarm_name,
     aws_cloudwatch_metric_alarm.groww_ws_inactive.alarm_name,
     aws_cloudwatch_metric_alarm.groww_stall_restart_storm.alarm_name,
     aws_cloudwatch_metric_alarm.questdb_disconnected.alarm_name,
@@ -738,10 +592,7 @@ output "app_cloudwatch_alarms" {
     aws_cloudwatch_metric_alarm.dlq_ticks.alarm_name,
     aws_cloudwatch_metric_alarm.aggregator_no_seals.alarm_name,
     aws_cloudwatch_metric_alarm.orders_rejected.alarm_name,
-    aws_cloudwatch_metric_alarm.realtime_guarantee_critical.alarm_name,
     aws_cloudwatch_metric_alarm.clock_skew_high.alarm_name,
-    aws_cloudwatch_metric_alarm.ws_frame_dropped_no_wal.alarm_name,
-    aws_cloudwatch_metric_alarm.ws_reconnect_gap_high.alarm_name,
     aws_cloudwatch_metric_alarm.disk_watcher_respawn.alarm_name,
     aws_cloudwatch_metric_alarm.late_tick_after_boundary.alarm_name,
   ]

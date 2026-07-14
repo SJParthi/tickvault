@@ -36,6 +36,10 @@ use super::instruments::{GrowwWatchSet, WatchEntry, WatchKind};
 /// §36 (2026-07-08): `YYYY-MM-DD` → IST-midnight nanos for the FUTIDX master
 /// rows (0 sentinel on empty/unparsable — same semantics as the Dhan-side
 /// `expiry_date_to_ist_nanos`). Cold path, once per daily master build.
+/// Feature-gated 2026-07-14 (PR-C2 r1 hygiene): its sole caller
+/// (`build_groww_lifecycle_rows`) is `daily_universe_fetcher`-gated, so the
+/// un-gated fn was dead code in the default feature mode.
+#[cfg(feature = "daily_universe_fetcher")]
 fn expiry_str_to_ist_midnight_nanos(expiry: &str) -> i64 {
     let trimmed = expiry.trim();
     if trimmed.is_empty() {
@@ -1489,6 +1493,9 @@ mod tests {
     /// Builds a set where the live-subscribe `entries` is CAPPED to `entries`, but
     /// the master `master_entries` is the FULL pre-cap superset — the decoupling the
     /// row builders must honor. Used by the "uses master_entries not capped" tests.
+    /// Feature-gated 2026-07-14 (PR-C2 r1 hygiene): both consuming tests are
+    /// `daily_universe_fetcher`-gated, so the helper was dead in default mode.
+    #[cfg(feature = "daily_universe_fetcher")]
     fn capped_set(capped: Vec<WatchEntry>, full: Vec<WatchEntry>) -> GrowwWatchSet {
         let indices = full
             .iter()

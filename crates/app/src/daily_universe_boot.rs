@@ -572,52 +572,14 @@ mod tests {
         );
     }
 
-    /// Round 4 source-order ratchet (main.rs scan, style of
-    /// `ratchet_main_rs_uses_bounded_reinject_helper`): BOTH plan-snapshot
-    /// write sites must stamp the boot outcome's `build_trading_date_ist`
-    /// (the date the successful build's FUTIDX selection actually used) —
-    /// never the `today_date` string frozen at `load_daily_universe_plan`
-    /// entry. A midnight-crossing cold build otherwise writes a D-labeled
-    /// snapshot carrying the D+1 selection (internally inconsistent
-    /// forensic artifact).
-    #[test]
-    fn ratchet_main_rs_snapshot_writes_stamp_the_build_date() {
-        let src: String = include_str!("main.rs")
-            .chars()
-            .filter(|c| !c.is_whitespace())
-            .collect();
-        // Needles split via concat! so this test's own source never
-        // satisfies the scan vacuously.
-        // No closing paren in the needles — rustfmt may add a trailing comma
-        // when it breaks the call across lines.
-        let slow_path = concat!(
-            "write_plan_snapshot(&daily_universe,",
-            "&outcome.build_trading_date_ist"
-        );
-        let warm_bg = concat!(
-            "write_plan_snapshot(&fresh_universe,",
-            "&fresh_outcome.build_trading_date_ist"
-        );
-        let frozen_slow = concat!("write_plan_snapshot(&daily_universe,", "&today_date)");
-        let frozen_bg = concat!("date_", "for_bg");
-        assert!(
-            src.contains(slow_path),
-            "slow-path snapshot write must stamp outcome.build_trading_date_ist"
-        );
-        assert!(
-            src.contains(warm_bg),
-            "warm-path background-reconcile snapshot write must stamp \
-             fresh_outcome.build_trading_date_ist"
-        );
-        assert!(
-            !src.contains(frozen_slow),
-            "slow-path snapshot write must not use the frozen boot-entry today_date"
-        );
-        assert!(
-            !src.contains(frozen_bg),
-            "the frozen date_for_bg clone must not be reintroduced"
-        );
-    }
+    // RETIRED (PR-C2, 2026-07-13 — Dhan live-WS lane deletion, operator
+    // retirement directive per websocket-connection-scope-lock.md
+    // "2026-07-13 Amendment" §B):
+    // ratchet_main_rs_snapshot_writes_stamp_the_build_date died with the
+    // wiring it pinned — the daily-universe cold-build / warm-snapshot boot
+    // chain was deleted from main.rs with the lane (Q3: no Dhan instrument
+    // download; hardcoded SIDs feed the retained REST pulls). This module is
+    // retained un-consumed pending the Phase C instrument-chain deletion.
 
     // ---- run_daily_universe_boot ----
 
