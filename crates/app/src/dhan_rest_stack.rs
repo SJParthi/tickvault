@@ -924,24 +924,18 @@ async fn run_dhan_rest_stack(params: DhanRestStackParams) {
         }
     }
 
-    // Phase 0 Item 20 — supervised 15:25 IST orphan-position watchdog: the
-    // daily open-position safety/compliance gate (alert-only in dry-run; no
-    // order/cancel call exists on any path). RE-HOMED here in PR-C2
-    // (2026-07-13, operator retirement directive per
-    // websocket-connection-scope-lock.md "2026-07-13 Amendment"): it was
-    // spawned from the deleted main.rs `spawn_post_market_tasks` seam; it
-    // needs ONLY the Dhan token + REST base URL, which THIS stack owns
-    // (`GET /v2/positions` is the trading-adjacent KEEP class per
-    // no-rest-except-live-feed-2026-06-27.md §3).
-    let _orphan_watchdog_handle =
-        crate::orphan_position_watchdog_boot::spawn_supervised_orphan_position_watchdog(
-            Arc::clone(&token_handle),
-            params.notifier.clone(),
-            Arc::clone(&params.calendar),
-            config.dhan.rest_api_base_url.clone(),
-            client_id.clone(),
-            config.strategy.dry_run,
-        );
+    // Phase 0 Item 20 note (merge resolution, 2026-07-14): the 15:25 IST
+    // orphan-position watchdog is NOT spawned from this stack. The PR-C2
+    // branch briefly re-homed it here (Static auth from this stack's token
+    // handle), but main's 2026-07-14 re-home (#1559-era `WatchdogAuth`) put
+    // the single spawn in main.rs's PROCESS-GLOBAL prefix with
+    // `GlobalAtFireTime` fire-time resolution — which covers every boot
+    // shape INCLUDING a stack that PARKED on AlreadyHeld before its token
+    // phase (a Static-in-stack spawn would silently never run there; the
+    // process-global spawn degrades LOUDLY instead). This stack's Phase 2/3
+    // `set_global_token_manager` + `set_live_token_manager` registrations
+    // are what the fire-time resolver finds. One topology, per the
+    // orphan_position_watchdog_wiring_guard contract.
 
     metrics::gauge!("tv_dhan_rest_stack_up").set(1.0);
     info!(
@@ -950,8 +944,8 @@ async fn run_dhan_rest_stack(params: DhanRestStackParams) {
         option_chain_1m_probe = config.option_chain_1m.probe_and_report,
         "DHAN REST-ONLY STACK UP — lock + token + renewal + silent mid-session watchdog + \
          token sweep + token-health gauge + /health token writer + spot_1m_rest + \
-         option_chain_1m arms + the 15:25 IST orphan-position watchdog spawned \
-         WITHOUT any Dhan WebSocket (operator directives 2026-07-13 + 2026-07-14)"
+         option_chain_1m arms spawned WITHOUT any Dhan WebSocket (operator directives \
+         2026-07-13 + 2026-07-14; the 15:25 orphan watchdog is process-global in main.rs)"
     );
 
     // M3 (2026-07-14 fix round): with BOTH per-minute legs disabled the
