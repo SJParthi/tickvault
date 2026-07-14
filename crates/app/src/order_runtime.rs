@@ -47,7 +47,7 @@
 //! engage in UNWIND (dev/test) builds only; in prod a panic aborts the
 //! process and recovery is the external restart + WAL replay.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -80,9 +80,17 @@ use crate::oms_wiring::{TokenHandleBridge, build_oms_http_client};
 // Constants (module-scoped, named per rust-code.md "no hardcoded values")
 // ---------------------------------------------------------------------------
 
-/// Supervisor respawn backoff after an abnormal inner exit (WS-GAP-05 house
-/// pattern; unwind builds only — see the module panic-honesty note).
+/// Supervisor respawn backoff BASE after an abnormal inner exit (WS-GAP-05
+/// house pattern; unwind builds only — see the module panic-honesty note).
+/// E8 (fix-round 2026-07-14): consecutive abnormal exits DOUBLE the backoff
+/// up to [`ORDER_RUNTIME_RESPAWN_BACKOFF_CAP_SECS`] so a permanently-closed
+/// channel can never become a ~17K-errors/day respawn storm.
 const ORDER_RUNTIME_RESPAWN_BACKOFF_SECS: u64 = 5;
+/// E8 respawn backoff ceiling (the WS-GAP-05 300s cap).
+const ORDER_RUNTIME_RESPAWN_BACKOFF_CAP_SECS: u64 = 300;
+/// E8 stability window: an inner run that survives this long resets the
+/// backoff ladder (the WS-GAP-10 stability-window precedent).
+const ORDER_RUNTIME_RESPAWN_STABILITY_SECS: u64 = 60;
 /// Boot-once reconcile delay: first cycle fires this long after spawn.
 const ORDER_RUNTIME_BOOT_RECONCILE_DELAY_SECS: u64 = 60;
 /// Reconcile scheduler window END (15:35 IST — 5 min past close so the
@@ -111,7 +119,9 @@ const HOUSEKEEPING_TICK_SECS: u64 = 1;
 // ---------------------------------------------------------------------------
 
 /// A mark-to-market price update. `Copy`, 16 bytes — sent from the Groww
-/// bridge per-tick path via a lock-free `try_send` (zero alloc, no await).
+/// bridge per-tick path via a lock-free `try_send` (no await; the disarmed
+/// and drop arms are strictly zero-alloc — accepted sends carry tokio
+/// mpsc's AMORTIZED block-reuse alloc profile, see [`MarkForwarder`]).
 #[derive(Clone, Copy, Debug)]
 pub struct MarkUpdate {
     /// Feed-native security id (Groww exchange_token space; bit-62 indices).
@@ -128,6 +138,13 @@ pub struct MarkUpdate {
 /// atomic load and nothing else. When armed, a bounded `try_send` of a
 /// `Copy` struct — a full channel DROPS the mark (counted; the next tick
 /// supersedes it — prices are idempotent, positions stay exact).
+///
+/// # Alloc honesty (HP-1, mirrors the DHAT file's own wording)
+/// The DISARMED and ARMED+FULL (drop) arms are strictly zero-alloc
+/// (DHAT-proven, `dhat_mark_forward.rs`). ARMED+ACCEPTED sends have an
+/// AMORTIZED block-reuse alloc profile — tokio's mpsc grows/reuses its
+/// 32-slot block list as queue depth changes — budgeted by the Criterion
+/// bench (`order_gate/mark_forward_armed_accept`), never claimed zero.
 #[derive(Clone)]
 pub struct MarkForwarder {
     /// Armed by the runtime whenever a position / pending paper order /
@@ -138,8 +155,9 @@ pub struct MarkForwarder {
 }
 
 impl MarkForwarder {
-    /// Forward one mark if the runtime wants marks. Zero-alloc, lock-free,
-    /// never blocks, never awaits — safe at the per-tick consume seam.
+    /// Forward one mark if the runtime wants marks. Lock-free, never
+    /// blocks, never awaits — safe at the per-tick consume seam (alloc
+    /// profile per the struct-level honesty note).
     #[inline]
     pub fn mark_forward(&self, security_id: u64, segment_code: u8, price: f32) {
         if !self.marks_wanted.load(Ordering::Relaxed) {
@@ -312,6 +330,9 @@ pub fn spawn_order_runtime(params: OrderRuntimeParams) -> tokio::task::JoinHandl
         // death releases it for the respawn.
         let mark_rx = Arc::new(tokio::sync::Mutex::new(mark_rx));
         let mut pending_first_rx = Some(first_order_update_rx);
+        // E8: consecutive-abnormal-exit counter drives an escalating backoff
+        // (5s → 300s cap) so a permanently-broken channel cannot storm.
+        let mut consecutive_abnormal_exits: u32 = 0;
         loop {
             let order_rx = match pending_first_rx.take() {
                 Some(rx) => rx,
@@ -329,6 +350,7 @@ pub fn spawn_order_runtime(params: OrderRuntimeParams) -> tokio::task::JoinHandl
                 auth_notify: Arc::clone(&auth_notify),
             };
             let mark_rx_shared = Arc::clone(&mark_rx);
+            let run_started = std::time::Instant::now();
             let inner =
                 tokio::spawn(async move { run_order_runtime(ctx, order_rx, mark_rx_shared).await });
             let reason = match inner.await {
@@ -348,14 +370,32 @@ pub fn spawn_order_runtime(params: OrderRuntimeParams) -> tokio::task::JoinHandl
             };
             metrics::gauge!("tv_order_runtime_up").set(0.0);
             metrics::counter!("tv_order_runtime_respawn_total", "reason" => reason).increment(1);
+            // E8: a run that survived ≥60s resets the ladder (the WS-GAP-10
+            // stability-window precedent) — only rapid flapping escalates.
+            if run_started.elapsed() >= Duration::from_secs(ORDER_RUNTIME_RESPAWN_STABILITY_SECS) {
+                consecutive_abnormal_exits = 0;
+            }
+            // E8: escalating backoff — doubles per consecutive abnormal exit,
+            // capped at 300s (WS-GAP-05 pattern).
+            consecutive_abnormal_exits = consecutive_abnormal_exits.saturating_add(1);
+            let backoff_secs = ORDER_RUNTIME_RESPAWN_BACKOFF_SECS
+                .saturating_mul(1_u64 << consecutive_abnormal_exits.saturating_sub(1).min(8))
+                .min(ORDER_RUNTIME_RESPAWN_BACKOFF_CAP_SECS);
+            // E2 honesty: PAPER fills / self-test orders never traverse the
+            // WAL or the broadcast — a respawn (or process restart) SILENTLY
+            // zeroes the paper book + day P&L. Only REAL-account fill frames
+            // replay from the WAL and surface as loud orphan warns.
             error!(
                 code = ErrorCode::OmsGapDryRunSafety.code_str(),
                 reason,
-                "OMS-GAP-06: order runtime task died — respawning with a FRESH paper book \
-                 (in-RAM state lost; replayed order updates on the fresh book surface as \
-                 loud orphan warns, never silent fills)"
+                backoff_secs,
+                consecutive_abnormal_exits,
+                "OMS-GAP-06: order runtime task died — respawning with a FRESH paper book. \
+                 PAPER positions + day P&L are in-RAM only and are silently ZEROED by this \
+                 respawn; replayed REAL-account fill frames on the fresh book surface as \
+                 loud orphan warns"
             );
-            tokio::time::sleep(Duration::from_secs(ORDER_RUNTIME_RESPAWN_BACKOFF_SECS)).await;
+            tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
         }
     })
 }
@@ -399,6 +439,20 @@ fn reconcile_window_ok(secs_of_day: u32) -> bool {
 fn self_test_window_ok(secs_of_day: u32) -> bool {
     (SELF_TEST_WINDOW_START_SECS_OF_DAY_IST..SELF_TEST_WINDOW_END_SECS_OF_DAY_IST)
         .contains(&secs_of_day)
+}
+
+/// E1 (fix-round 2026-07-14): the 16:00-IST RESET EPOCH — the IST day
+/// ordinal of the most recent 16:00 boundary already passed. The reset
+/// fires whenever the observed epoch ADVANCES past the last-reset epoch,
+/// so a process suspended across [16:00, midnight) still resets on its
+/// first tick of the new day (the old same-day-keyed gate carried day-1
+/// positions + a latched HALT through day-2's entire session).
+fn reset_epoch(secs_of_day: u32, today: i64) -> i64 {
+    if secs_of_day >= DAILY_RESET_SECS_OF_DAY_IST {
+        today
+    } else {
+        today.saturating_sub(1)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -493,16 +547,57 @@ fn synthesize_paper_fill(order: &ManagedOrder, mark: f64, segment_code: u8) -> O
 struct LocalReconcileReport {
     sids_checked: usize,
     divergences: usize,
+    /// C7 second leg: per-sid Σ signed order `traded_qty` lots vs the risk
+    /// engine — catches a fill LOST between the engine and `record_fill`
+    /// (e.g. a broadcast-lag drop), which the mirror leg structurally
+    /// cannot (mirror + risk are mutated together in `apply_fill`).
+    order_fold_divergences: usize,
 }
 
-/// Compares the runtime's FillEvent-folded net-lots mirror against the risk
-/// engine's positions, per sid, in BOTH directions.
-fn local_reconcile(risk: &RiskEngine, mirror: &HashMap<u64, i64>) -> LocalReconcileReport {
+/// Compares (leg 1) the runtime's FillEvent-folded net-lots mirror against
+/// the risk engine's positions over the UNION of both key sets, and
+/// (leg 2, C7) the per-sid signed fold of every tracked order's cumulative
+/// `traded_qty` lots against the risk engine's net lots.
+///
+/// Leg-2 honesty: valid for the DRY-RUN book (PAPER order ids never
+/// re-index, so `all_orders()` holds one entry per order); the live-mode
+/// correlation re-index keeps a stale clone under the old order_no and
+/// would double-count — the caller only runs this in dry-run.
+fn local_reconcile(
+    oms: &OrderManagementSystem,
+    risk: &RiskEngine,
+    mirror: &HashMap<u64, i64>,
+) -> LocalReconcileReport {
     let mut report = LocalReconcileReport::default();
-    for (&sid, &mirror_lots) in mirror {
+    // Leg 1: mirror vs risk over the UNION of keys (C7 — a risk-side
+    // position absent from the mirror is a divergence too).
+    let mut sids: HashSet<u64> = mirror.keys().copied().collect();
+    sids.extend(risk.position_security_ids());
+    for &sid in &sids {
         report.sids_checked += 1;
+        let mirror_lots = mirror.get(&sid).copied().unwrap_or(0);
         if i64::from(risk.net_lots_for(sid)) != mirror_lots {
             report.divergences += 1;
+        }
+    }
+    // Leg 2: per-sid signed order fold (floor of cumulatives — the same
+    // math the engine's fill delta uses) vs risk net lots.
+    let mut folded: HashMap<u64, i64> = HashMap::with_capacity(mirror.len());
+    for order in oms.all_orders().values() {
+        let lot = i64::from(order.lot_size.max(1));
+        let lots = order.traded_qty.max(0) / lot;
+        let signed = match order.transaction_type {
+            TransactionType::Buy => lots,
+            TransactionType::Sell => -lots,
+        };
+        *folded.entry(order.security_id).or_insert(0) += signed;
+    }
+    let mut fold_sids: HashSet<u64> = folded.keys().copied().collect();
+    fold_sids.extend(risk.position_security_ids());
+    for &sid in &fold_sids {
+        let fold_lots = folded.get(&sid).copied().unwrap_or(0);
+        if i64::from(risk.net_lots_for(sid)) != fold_lots {
+            report.order_fold_divergences += 1;
         }
     }
     report
@@ -569,8 +664,22 @@ struct BookState {
     /// tripwire below makes a cross-segment collision LOUD; the composite
     /// key rewrite is the mandatory pre-live follow-up.
     mirror: HashMap<u64, i64>,
-    /// First-seen segment code per sid (the I-P1-11 tripwire).
+    /// First-seen segment code per sid (the I-P1-11 tripwire). Footprint
+    /// (HP-6): while armed, EVERY sid the tap forwards gets an entry — the
+    /// map is bounded by the Groww watch universe (~770 sids ≈ tens of KB)
+    /// and cleared at the daily reset.
     tripwire: HashMap<u64, u8>,
+    /// HP-3/E3 edge latch: sids whose divergence has already fired the
+    /// coded `error!` this episode (cleared at the daily reset). The
+    /// counter keeps counting per event; the LOG fires once per sid per
+    /// day (audit-findings Rule 4 — edge-triggered alerts only).
+    tripwire_reported: HashSet<u64>,
+    /// HP-2: sid → pending PAPER order ids — the O(1) per-mark filler
+    /// index. REBUILT (O(N_all_orders), cold — order events are low-rate)
+    /// via [`Self::rebuild_pending_paper`] after every order-mutating
+    /// event; per-mark reads are one HashMap lookup, zero alloc on the
+    /// no-pending path.
+    pending_paper: HashMap<u64, Vec<String>>,
 }
 
 impl BookState {
@@ -578,16 +687,44 @@ impl BookState {
         Self {
             mirror: HashMap::with_capacity(64),
             tripwire: HashMap::with_capacity(64),
+            tripwire_reported: HashSet::with_capacity(8),
+            pending_paper: HashMap::with_capacity(8),
         }
     }
 
     fn clear(&mut self) {
         self.mirror.clear();
         self.tripwire.clear();
+        self.tripwire_reported.clear();
+        self.pending_paper.clear();
+    }
+
+    /// Rebuilds the sid → pending-PAPER-order index from the OMS book.
+    /// O(N_all_orders) + per-pending-id clones — COLD path (called on
+    /// order-mutating events only, never per mark). Honest trade-off: a
+    /// full rebuild per order event beats maintaining incremental deltas
+    /// across 6 mutation sites (drift there would silently kill fills).
+    fn rebuild_pending_paper(&mut self, oms: &OrderManagementSystem) {
+        self.pending_paper.clear();
+        for order in oms.all_orders().values() {
+            if !order.is_terminal() && order.order_id.starts_with("PAPER-") {
+                self.pending_paper
+                    .entry(order.security_id)
+                    .or_default()
+                    .push(order.order_id.clone());
+            }
+        }
+    }
+
+    /// O(1) per-mark check: does this sid have a pending paper order?
+    fn has_pending_paper(&self, sid: u64) -> bool {
+        // Entries are inserted non-empty by construction (rebuild).
+        self.pending_paper.contains_key(&sid)
     }
 
     /// Tripwire check: `true` = segment consistent (or unknown), proceed.
-    /// A DIVERGENT segment for a known sid → loud RISK-GAP-02 + `false`.
+    /// A DIVERGENT segment for a known sid → RISK-GAP-02 (edge-latched
+    /// `error!` once per sid per episode; counter per event) + `false`.
     fn tripwire_ok(&mut self, sid: u64, segment_code: u8) -> bool {
         if segment_code == SEGMENT_CODE_UNKNOWN {
             return true;
@@ -599,26 +736,67 @@ impl BookState {
             }
             Some(&first) if first == segment_code => true,
             Some(&first) => {
-                error!(
-                    code = ErrorCode::RiskGapPositionPnl.code_str(),
-                    security_id = sid,
-                    first_seen_segment = first,
-                    conflicting_segment = segment_code,
-                    reason = "sid_segment_collision",
-                    "RISK-GAP-02: cross-segment security_id collision — skipping this \
-                     event to avoid a silent P&L merge (I-P1-11; composite-key rewrite \
-                     is the mandatory pre-live follow-up)"
-                );
+                // HP-3/E3: counter EVERY event; error! on the RISING EDGE
+                // only — a colliding sid ticking 1-4/s for hours must never
+                // become an error-per-event flood (audit Rule 4).
                 metrics::counter!("tv_oms_sid_segment_collisions_total").increment(1);
+                if self.tripwire_reported.insert(sid) {
+                    error!(
+                        code = ErrorCode::RiskGapPositionPnl.code_str(),
+                        security_id = sid,
+                        first_seen_segment = first,
+                        conflicting_segment = segment_code,
+                        reason = "sid_segment_collision",
+                        "RISK-GAP-02: cross-segment security_id collision — skipping \
+                         this and every further divergent event for this sid today \
+                         (counted per event; logged once per episode). I-P1-11; the \
+                         composite-key rewrite is the mandatory pre-live follow-up"
+                    );
+                }
                 false
             }
         }
     }
 }
 
+/// M3: the arm-1 consumer-boundary Source filter (F18) — a PRODUCTION pure
+/// fn so the test exercises the real predicate, never a replica. Manual
+/// Dhan-app events (Source=N) and unknown sources never touch the paper
+/// book; empty Source is tolerated (every wire field is serde-default; our
+/// synthetic paper updates always stamp "P").
+fn is_foreign_source(source: &str) -> bool {
+    !source.is_empty() && source != "P"
+}
+
+/// S3: bounded + sanitized broker string for log interpolation — strips
+/// control/BiDi chars and caps the length so a crafted multi-KB `order_no`
+/// cannot amplify `errors.log` (cold error-path alloc is fine).
+fn log_safe_id(raw: &str) -> String {
+    tickvault_common::sanitize::sanitize_audit_string(raw)
+        .chars()
+        .take(64)
+        .collect()
+}
+
 /// Applies one FillEvent to the risk engine + mirror. Returns whether the
-/// fill was applied (tripwire may refuse).
+/// fill was applied (tripwire / unknown-segment guard may refuse).
 fn apply_fill(risk: &mut RiskEngine, book: &mut BookState, fill: &FillEvent) -> bool {
+    // S2 (fix-round 2026-07-14): a fill whose segment chars were UNMAPPABLE
+    // cannot be partition-checked — treating UNKNOWN as compatible-with-
+    // everything was the exact tripwire bypass. Refuse the fill (loud);
+    // every legitimate dry-run fill round-trips a known segment.
+    if fill.segment_code == SEGMENT_CODE_UNKNOWN {
+        error!(
+            code = ErrorCode::RiskGapPositionPnl.code_str(),
+            security_id = fill.security_id,
+            order_id = %log_safe_id(&fill.order_id),
+            reason = "unknown_segment_fill",
+            "RISK-GAP-02: fill with an UNMAPPABLE exchange/segment refused — \
+             it would bypass the I-P1-11 tripwire partition check"
+        );
+        metrics::counter!("tv_oms_unknown_segment_fills_refused_total").increment(1);
+        return false;
+    }
     if !book.tripwire_ok(fill.security_id, fill.segment_code) {
         return false;
     }
@@ -679,7 +857,7 @@ async fn run_order_runtime(
     let reconcile_interval = config.order_runtime.reconcile_interval_secs.max(60);
     let mut next_reconcile =
         std::time::Instant::now() + Duration::from_secs(ORDER_RUNTIME_BOOT_RECONCILE_DELAY_SECS);
-    let mut last_reset_day: i64 = i64::MIN;
+    let mut last_reset_epoch: i64 = i64::MIN;
     let mut last_close_sweep_day: i64 = i64::MIN;
     let mut housekeeping = tokio::time::interval(Duration::from_secs(HOUSEKEEPING_TICK_SECS));
     housekeeping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -691,7 +869,9 @@ async fn run_order_runtime(
         self_test = config.order_runtime.self_test,
         reconcile_interval_secs = reconcile_interval,
         "order runtime started (paper book live — order updates + Groww marks now \
-         reach the OMS/RiskEngine; alert sinks wired)"
+         reach the OMS/RiskEngine; alert sinks wired). Paper book starts EMPTY: \
+         paper fills are in-RAM only, so a restart zeroes paper positions + day \
+         P&L (only REAL-account fill frames replay from the WAL)"
     );
 
     loop {
@@ -710,12 +890,18 @@ async fn run_order_runtime(
                         metrics::counter!("tv_order_update_receiver_lagged_total")
                             .increment(skipped);
                         if skipped >= ORDER_UPDATE_LAG_ERROR_THRESHOLD {
+                            // C7 honesty: the MIRROR leg cannot see a lagged
+                            // drop (mirror + risk are mutated together); the
+                            // ORDER-FOLD leg of the local reconcile catches
+                            // it for TRACKED orders only — fills for orders
+                            // this book never tracked are lost silently.
                             error!(
                                 code = ErrorCode::OmsGapReconciliation.code_str(),
                                 skipped,
                                 "OMS-GAP-02: order runtime receiver SEVERE lag — fills \
-                                 likely missed; the local reconcile invariant will flag \
-                                 divergence"
+                                 likely missed; the local reconcile's order-fold leg \
+                                 flags divergence for TRACKED orders (untracked fills \
+                                 are lost)"
                             );
                         } else {
                             warn!(skipped, "order runtime receiver lagged — events skipped");
@@ -769,10 +955,13 @@ async fn run_order_runtime(
                 let today = ist_day_number(now_utc);
 
                 // Reconcile scheduler (market-hours gated + boot-once).
+                // E5: trading-day gated too — no weekend/holiday heartbeats.
                 if std::time::Instant::now() >= next_reconcile {
                     next_reconcile = std::time::Instant::now()
                         + Duration::from_secs(reconcile_interval);
-                    if reconcile_window_ok(secs_of_day) {
+                    if reconcile_window_ok(secs_of_day)
+                        && ctx.calendar.is_trading_day_today()
+                    {
                         run_reconcile_cycle(&mut oms, &risk, &book).await;
                     }
                 }
@@ -786,32 +975,35 @@ async fn run_order_runtime(
                     && last_close_sweep_day != today
                 {
                     last_close_sweep_day = today;
-                    market_close_sweep(&mut oms).await;
+                    market_close_sweep(&mut oms, &mut book).await;
                     republish_marks_wanted(&ctx.marks_wanted, &oms, &risk, &self_test);
                 }
 
                 // 16:00 IST daily reset — ONE block clears risk + oms +
                 // mirror + tripwire + the marks gate (F16: single-task
                 // serialization makes this atomic vs in-flight fills).
-                if secs_of_day >= DAILY_RESET_SECS_OF_DAY_IST && last_reset_day != today {
-                    last_reset_day = today;
-                    info!(
-                        orders_placed = oms.total_placed(),
-                        realized_pnl = risk.total_realized_pnl(),
-                        "order runtime daily reset — zeroing paper book + risk state"
+                // E1: EPOCH-keyed — a process suspended across [16:00,
+                // midnight) catches up on its first tick of the new day
+                // instead of carrying day-1 positions + a latched halt
+                // through day-2's whole session.
+                let epoch = reset_epoch(secs_of_day, today);
+                if last_reset_epoch == i64::MIN {
+                    // Boot: initialize the epoch only (empty book — nothing
+                    // to reset; today's 16:00 boundary still fires).
+                    last_reset_epoch = epoch;
+                } else if epoch > last_reset_epoch {
+                    last_reset_epoch = epoch;
+                    perform_daily_reset(
+                        &mut risk, &mut oms, &mut book, &mut self_test, &ctx.marks_wanted,
                     );
-                    risk.reset_daily();
-                    oms.reset_daily();
-                    book.clear();
-                    self_test.phase = SelfTestPhase::Idle;
-                    ctx.marks_wanted.store(false, Ordering::Release);
                 }
 
-                // Self-test arm/start + timeout (F17 gates).
+                // Self-test arm/start + timeout (F17 gates; C6 timeout
+                // cleanup cancels the outstanding self-test order).
                 drive_self_test_timers(
-                    &mut self_test, &ctx, &oms, secs_of_day, today,
+                    &mut self_test, &ctx, &mut oms, &risk, &mut book, secs_of_day, today,
                     config.order_runtime.self_test,
-                );
+                ).await;
                 republish_marks_wanted(&ctx.marks_wanted, &oms, &risk, &self_test);
             }
         }
@@ -831,8 +1023,9 @@ async fn handle_order_update_event(
 ) {
     // F18: manual Dhan-app events (Source=N) never touch the paper book.
     // Empty Source is tolerated (every wire field is serde-default; our
-    // synthetic paper updates always stamp "P").
-    if !update.source.is_empty() && update.source != "P" {
+    // synthetic paper updates always stamp "P"). M3: the predicate is the
+    // production `is_foreign_source` (unit-tested directly, no replica).
+    if is_foreign_source(&update.source) {
         metrics::counter!("tv_order_update_events_total", "outcome" => "foreign_source")
             .increment(1);
         return;
@@ -851,7 +1044,7 @@ async fn handle_order_update_event(
             if update.traded_qty > 0 && oms.order(&update.order_no).is_none() {
                 warn!(
                     code = ErrorCode::OmsGapReconciliation.code_str(),
-                    order_no = %update.order_no,
+                    order_no = %log_safe_id(&update.order_no),
                     traded_qty = update.traded_qty,
                     reason = "orphan_fill_update",
                     "OMS-GAP-02: fill-carrying update for an order this (fresh) book \
@@ -863,9 +1056,13 @@ async fn handle_order_update_event(
         }
         Err(err) => {
             // InvalidTransition is already error!-coded inside the engine.
-            debug!(?err, order_no = %update.order_no, "order update handling error");
+            debug!(?err, order_no = %log_safe_id(&update.order_no), "order update handling error");
         }
     }
+    // HP-2: the update may have created/advanced/terminated an order (and
+    // advance_self_test_on_fill may have placed the close) — refresh the
+    // per-sid pending index (cold path; order events are low-rate).
+    book.rebuild_pending_paper(oms);
 }
 
 /// Arm-2 body: tripwire → self-test sid pick → mark apply → paper filler.
@@ -881,34 +1078,50 @@ async fn process_mark(
     if !book.tripwire_ok(mark.security_id, mark.segment_code) {
         return;
     }
-    let price = f64::from(mark.price);
+    // C14: shortest-decimal widening — plain `f64::from(f32)` carries the
+    // IEEE 754 artifact (10.2f32 → 10.19999980926514) into every paper
+    // fill price and P&L log line. Cold path (the runtime side, not the
+    // bridge tap).
+    let price = tickvault_common::price_precision::f32_to_f64_clean(mark.price);
 
-    // Self-test sid pick: first usable mark starts the cycle.
-    if self_test.phase == SelfTestPhase::AwaitingMark && price.is_finite() && price > 0.0 {
+    // Self-test sid pick: the first usable INDEX-SPOT mark starts the
+    // cycle. E4: restricted to IDX_I (segment 0) — index spots tick ~1/s,
+    // so the close leg's second mark always lands inside the 180s timeout;
+    // an arbitrary sid could be a far-month future with MINUTES of
+    // legitimate silence (daily-universe §36.4) → a daily false FAIL.
+    if self_test.phase == SelfTestPhase::AwaitingMark
+        && mark.segment_code == tickvault_common::types::ExchangeSegment::IdxI.binary_code()
+        && price.is_finite()
+        && price > 0.0
+    {
         start_self_test_entry(oms, self_test, mark.security_id, mark.segment_code).await;
+        // HP-2: the entry placement changed the pending set.
+        book.rebuild_pending_paper(oms);
     }
 
     // Runtime-side filter: only sids with a position or a pending paper
     // order reach the risk engine's market_prices map (keeps it small).
+    // HP-2: both checks are O(1) lookups — NO per-mark scan/alloc over the
+    // whole order book (the pending index is rebuilt on order events).
     let has_position = risk.net_lots_for(mark.security_id) != 0;
-    let has_pending_paper = oms
-        .active_orders()
-        .iter()
-        .any(|o| o.security_id == mark.security_id && o.order_id.starts_with("PAPER-"));
+    let has_pending_paper = book.has_pending_paper(mark.security_id);
     if !(has_position || has_pending_paper) {
         return;
     }
     risk.update_market_price(mark.security_id, price);
 
-    // Next-mark paper filler (F12 fill-once: active_orders() is
-    // non-terminal-only, and a filled order goes terminal Traded).
+    // Next-mark paper filler (F12 fill-once: the pending index holds
+    // non-terminal PAPER orders only, and a filled order goes terminal
+    // Traded + drops out on the rebuild).
     if paper_fill && oms.is_dry_run() && has_pending_paper {
-        let pending: Vec<String> = oms
-            .active_orders()
-            .iter()
-            .filter(|o| o.security_id == mark.security_id && o.order_id.starts_with("PAPER-"))
-            .map(|o| o.order_id.clone())
-            .collect();
+        // Cold branch by construction (only reached when THIS sid has a
+        // pending paper order); the id Vec clone is bounded by that sid's
+        // pending count (1-2 in practice — self-test legs).
+        let pending: Vec<String> = book
+            .pending_paper
+            .get(&mark.security_id)
+            .cloned()
+            .unwrap_or_default();
         for order_id in pending {
             fill_paper_order(
                 oms,
@@ -976,6 +1189,9 @@ async fn fill_paper_order(
             );
         }
     }
+    // HP-2: the fill (and any self-test close placement above) changed the
+    // pending set — refresh the per-sid index.
+    book.rebuild_pending_paper(oms);
 }
 
 /// Republish the hot-path marks gate: marks are wanted while ANY position,
@@ -986,8 +1202,9 @@ fn republish_marks_wanted(
     risk: &RiskEngine,
     self_test: &SelfTestState,
 ) {
+    // HP-2: active_order_count() is alloc-free (per-event cold path).
     let wanted = risk.open_position_count() > 0
-        || !oms.active_orders().is_empty()
+        || oms.active_order_count() > 0
         || self_test.phase != SelfTestPhase::Idle;
     marks_wanted.store(wanted, Ordering::Release);
 }
@@ -997,26 +1214,29 @@ fn republish_marks_wanted(
 async fn run_reconcile_cycle(oms: &mut OrderManagementSystem, risk: &RiskEngine, book: &BookState) {
     if oms.is_dry_run() {
         metrics::counter!("tv_oms_reconcile_runs_total", "mode" => "paper_noop").increment(1);
-        let report = local_reconcile(risk, &book.mirror);
-        if report.divergences > 0 {
+        let report = local_reconcile(oms, risk, &book.mirror);
+        if report.divergences > 0 || report.order_fold_divergences > 0 {
             error!(
                 code = ErrorCode::OmsGapReconciliation.code_str(),
                 divergences = report.divergences,
+                order_fold_divergences = report.order_fold_divergences,
                 sids_checked = report.sids_checked,
                 "OMS-GAP-02: LOCAL reconcile invariant DIVERGED — the FillEvent \
-                 mirror disagrees with the risk engine's net lots (fills were \
-                 double-applied or lost inside this process)"
+                 mirror and/or the per-order traded_qty fold disagree with the \
+                 risk engine's net lots (fills were double-applied, lost, or \
+                 refused inside this process)"
             );
             metrics::counter!("tv_oms_local_reconcile_divergence_total")
-                .increment(report.divergences as u64);
+                .increment((report.divergences + report.order_fold_divergences) as u64);
         } else {
             info!(
-                open_paper_orders = oms.active_orders().len(),
+                open_paper_orders = oms.active_order_count(),
                 open_positions = risk.open_position_count(),
                 sids_checked = report.sids_checked,
                 realized_pnl = risk.total_realized_pnl(),
                 "paper mode — broker reconcile SKIPPED; local Σfills==net_lots \
-                 invariant HELD (heartbeat, not a broker reconciliation)"
+                 invariant HELD on both legs (heartbeat, not a broker \
+                 reconciliation)"
             );
         }
     } else {
@@ -1044,7 +1264,7 @@ async fn run_reconcile_cycle(oms: &mut OrderManagementSystem, risk: &RiskEngine,
 
 /// 15:30 IST sweep: cancel every pending paper order (mirrors the
 /// trading_pipeline market-close sweep).
-async fn market_close_sweep(oms: &mut OrderManagementSystem) {
+async fn market_close_sweep(oms: &mut OrderManagementSystem, book: &mut BookState) {
     let pending: Vec<String> = oms
         .active_orders()
         .iter()
@@ -1062,18 +1282,68 @@ async fn market_close_sweep(oms: &mut OrderManagementSystem) {
             warn!(?err, order_id = %order_id, "market close — paper cancel failed");
         }
     }
+    // HP-2: cancels emptied the pending set.
+    book.rebuild_pending_paper(oms);
+}
+
+/// The 16:00 IST daily reset body — ONE block clears risk + oms + mirror +
+/// tripwire (+ latch + pending index) + the marks gate. Extracted (M7,
+/// fix-round 2026-07-14) so the unit test drives THIS production fn instead
+/// of re-enacting the loop arm; F16 atomicity comes from the single-owner
+/// task serialization at the call site.
+fn perform_daily_reset(
+    risk: &mut RiskEngine,
+    oms: &mut OrderManagementSystem,
+    book: &mut BookState,
+    self_test: &mut SelfTestState,
+    marks_wanted: &AtomicBool,
+) {
+    info!(
+        orders_placed = oms.total_placed(),
+        realized_pnl = risk.total_realized_pnl(),
+        "order runtime daily reset — zeroing paper book + risk state"
+    );
+    risk.reset_daily();
+    oms.reset_daily();
+    book.clear();
+    self_test.phase = SelfTestPhase::Idle;
+    marks_wanted.store(false, Ordering::Release);
 }
 
 // ---------------------------------------------------------------------------
 // Self-test driving
 // ---------------------------------------------------------------------------
 
+/// C6 (fix-round 2026-07-14): a failed/timed-out self-test can leave the
+/// entry position OPEN with nothing watching it (`marks_wanted` stays armed
+/// all day for the ghost). Report it loudly — the position still shows in
+/// every reconcile heartbeat and is cleared by the 16:00 reset.
+fn report_dangling_self_test_position(risk: &RiskEngine, sid: u64, stage: &'static str) {
+    let net = risk.net_lots_for(sid);
+    if net != 0 {
+        error!(
+            code = ErrorCode::OmsGapDryRunSafety.code_str(),
+            security_id = sid,
+            net_lots = net,
+            stage,
+            "OMS-GAP-06: self-test failure left a DANGLING paper position — no \
+             close leg is watching it; it persists until the 16:00 IST reset \
+             (visible in every reconcile heartbeat)"
+        );
+    }
+}
+
 /// Housekeeping-tick half: arm the daily cycle when gates pass; time out a
-/// stuck cycle (F17).
-fn drive_self_test_timers(
+/// stuck cycle (F17). C6 (fix-round 2026-07-14): the timeout path CANCELS
+/// the outstanding self-test order (previously a still-active entry order
+/// could be filled by the paper filler LATER, opening a ghost position no
+/// state machine watched) and loudly reports any dangling position.
+async fn drive_self_test_timers(
     self_test: &mut SelfTestState,
     ctx: &RuntimeCtx,
-    oms: &OrderManagementSystem,
+    oms: &mut OrderManagementSystem,
+    risk: &RiskEngine,
+    book: &mut BookState,
     secs_of_day: u32,
     today: i64,
     enabled: bool,
@@ -1082,6 +1352,22 @@ fn drive_self_test_timers(
     if self_test.phase != SelfTestPhase::Idle
         && self_test.started_at.elapsed() > Duration::from_secs(SELF_TEST_TIMEOUT_SECS)
     {
+        // C6 cleanup: cancel the outstanding self-test order so the filler
+        // can never fill it after the state machine stopped watching.
+        let outstanding = match &self_test.phase {
+            SelfTestPhase::AwaitingEntryFill { order_id, sid }
+            | SelfTestPhase::AwaitingCloseFill { order_id, sid } => Some((order_id.clone(), *sid)),
+            _ => None,
+        };
+        if let Some((order_id, sid)) = outstanding {
+            if let Err(err) = oms.cancel_order(&order_id).await {
+                // Already terminal (e.g. filled just before the timeout) —
+                // benign; the dangling-position check below still fires.
+                debug!(?err, order_id = %order_id, "self-test timeout cancel refused");
+            }
+            book.rebuild_pending_paper(oms);
+            report_dangling_self_test_position(risk, sid, "timeout");
+        }
         self_test.fail(today, "timeout");
         return;
     }
@@ -1185,6 +1471,10 @@ async fn advance_self_test_on_fill(
                 }
                 Err(err) => {
                     warn!(?err, "paper self-test close placement failed");
+                    // C6: the entry already FILLED (+1 lot) — a failed close
+                    // placement leaves that position dangling for the rest
+                    // of the day. Loud, never silent.
+                    report_dangling_self_test_position(risk, sid, "close_placement_failed");
                     self_test.fail(today, "close_placement_failed");
                 }
             }
@@ -1253,6 +1543,56 @@ mod tests {
 
     fn make_risk() -> RiskEngine {
         RiskEngine::new(2.0, 100, 1_000_000.0)
+    }
+
+    /// Real boot config (unit tests run with cwd = the crate dir).
+    fn load_test_config() -> Arc<ApplicationConfig> {
+        use figment::Figment;
+        use figment::providers::{Format, Toml};
+        let path = if std::path::Path::new("config/base.toml").exists() {
+            "config/base.toml"
+        } else {
+            "../../config/base.toml"
+        };
+        Arc::new(
+            Figment::new()
+                .merge(Toml::file(path))
+                .extract()
+                .expect("config/base.toml must parse"), // APPROVED: test
+        )
+    }
+
+    /// A REAL RuntimeCtx (disabled notifier, real calendar, empty token
+    /// handle) so tests drive the actual production arm bodies —
+    /// `process_mark` / `handle_order_update_event` — never replicas.
+    fn make_ctx() -> RuntimeCtx {
+        let config = load_test_config();
+        let calendar = Arc::new(
+            TradingCalendar::from_config(&config.trading).expect("calendar builds"), // APPROVED: test
+        );
+        RuntimeCtx {
+            config,
+            notifier: NotificationService::disabled(),
+            calendar,
+            marks_wanted: Arc::new(AtomicBool::new(false)),
+            token_handle: Arc::new(arc_swap::ArcSwap::from_pointee(None)),
+            client_id: "100".to_string(),
+            auth_notify: Arc::new(Notify::new()),
+        }
+    }
+
+    /// Orphan / wire-shaped OrderUpdate via serde defaults.
+    fn wire_update(order_no: &str, traded_qty: i64, source: &str) -> OrderUpdate {
+        let mut update: OrderUpdate =
+            serde_json::from_str("{}").expect("OrderUpdate fields are serde-default"); // APPROVED: test
+        update.exchange = "NSE".to_string();
+        update.segment = "D".to_string();
+        update.order_no = order_no.to_string();
+        update.status = "TRADED".to_string();
+        update.traded_qty = traded_qty;
+        update.avg_traded_price = 123.45;
+        update.source = source.to_string();
+        update
     }
 
     async fn place_paper(
@@ -1339,8 +1679,11 @@ mod tests {
         assert_eq!(m.segment_code, 0);
     }
 
+    /// L1 (fix-round 2026-07-14): renamed honestly — the drop-arm COUNTER
+    /// increment is not assertable without a metrics recorder in this test
+    /// process; what this pins is the no-block / no-panic overflow contract.
     #[tokio::test]
-    async fn test_mark_forward_channel_full_drops_counted_never_blocks() {
+    async fn test_mark_forward_channel_full_never_blocks_or_panics() {
         let (tx, _rx) = mpsc::channel::<MarkUpdate>(1);
         let fwd = MarkForwarder {
             marks_wanted: Arc::new(AtomicBool::new(true)),
@@ -1485,26 +1828,60 @@ mod tests {
     // Local reconcile invariant (F14)
     // -------------------------------------------------------------------
 
-    #[test]
-    fn test_local_reconcile_invariant_holds_and_diverges() {
+    #[tokio::test]
+    async fn test_local_reconcile_invariant_holds_and_diverges() {
+        let mut oms = make_oms();
         let mut risk = make_risk();
         let mut book = BookState::new();
-        let fill = FillEvent {
-            security_id: 13,
-            segment_code: 0,
-            fill_lots: 3,
-            avg_price: 100.0,
-            lot_size: 25,
-            order_id: "PAPER-1".to_string(),
-        };
+        // A real tracked order + its fill so BOTH legs (mirror + order fold)
+        // hold on the clean path.
+        let order_id = place_paper(&mut oms, 13, TransactionType::Buy).await;
+        let order = oms.order(&order_id).cloned().expect("tracked"); // APPROVED: test
+        let synthetic = synthesize_paper_fill(&order, 100.0, 0).expect("fill"); // APPROVED: test
+        let fill = oms
+            .handle_order_update(&synthetic)
+            .ok()
+            .flatten()
+            .expect("fill event"); // APPROVED: test
         assert!(apply_fill(&mut risk, &mut book, &fill));
-        let ok = local_reconcile(&risk, &book.mirror);
+        let ok = local_reconcile(&oms, &risk, &book.mirror);
         assert_eq!(ok.sids_checked, 1);
         assert_eq!(ok.divergences, 0, "mirror==net_lots after a clean fill");
-        // Poison the mirror → divergence must be detected.
+        assert_eq!(ok.order_fold_divergences, 0, "order fold matches too");
+        // Poison the mirror → the mirror leg must flag it.
         book.mirror.insert(13, 99);
-        let bad = local_reconcile(&risk, &book.mirror);
+        let bad = local_reconcile(&oms, &risk, &book.mirror);
         assert_eq!(bad.divergences, 1, "a poisoned mirror must be flagged");
+    }
+
+    /// C7 second leg: a fill LOST between the engine and `record_fill` (the
+    /// broadcast-lag drop shape — mirror and risk stay consistent at 0) is
+    /// caught by the per-order traded_qty fold, which the mirror leg
+    /// structurally cannot see.
+    #[tokio::test]
+    async fn test_local_reconcile_order_fold_catches_lost_fill() {
+        let mut oms = make_oms();
+        let risk = make_risk();
+        let book = BookState::new();
+        let order_id = place_paper(&mut oms, 13, TransactionType::Buy).await;
+        let order = oms.order(&order_id).cloned().expect("tracked"); // APPROVED: test
+        let synthetic = synthesize_paper_fill(&order, 100.0, 0).expect("fill"); // APPROVED: test
+        // The engine records the fill on the ORDER — but the FillEvent is
+        // "lost" (never applied to risk/mirror), as in a lagged drop.
+        let _lost = oms
+            .handle_order_update(&synthetic)
+            .ok()
+            .flatten()
+            .expect("fill event produced then dropped"); // APPROVED: test
+        let report = local_reconcile(&oms, &risk, &book.mirror);
+        assert_eq!(
+            report.divergences, 0,
+            "mirror leg CANNOT see a lost fill (both sides 0)"
+        );
+        assert_eq!(
+            report.order_fold_divergences, 1,
+            "the order-fold leg MUST flag the lost fill for a tracked order"
+        );
     }
 
     /// Property-style sweep: random signed fill sequences keep the mirror
@@ -1533,7 +1910,10 @@ mod tests {
             };
             assert!(apply_fill(&mut risk, &mut book, &fill));
         }
-        let report = local_reconcile(&risk, &book.mirror);
+        // Leg 1 only: this synthetic walk applies fills WITHOUT tracked
+        // orders, so the order-fold leg legitimately diverges (empty book
+        // vs positions) — it is asserted by its own dedicated test above.
+        let report = local_reconcile(&make_oms(), &risk, &book.mirror);
         assert_eq!(
             report.divergences, 0,
             "after any fill sequence the mirror must equal risk net_lots"
@@ -1559,16 +1939,44 @@ mod tests {
         assert_eq!(risk.net_lots_for(13), 1);
         assert!(!book.mirror.is_empty());
         assert!(!book.tripwire.is_empty());
-        // The 16:00 reset block (mirrors the loop's arm-4 body).
-        risk.reset_daily();
-        oms.reset_daily();
-        book.clear();
-        marks_wanted.store(false, Ordering::Release);
+        // M7 (fix-round 2026-07-14): drive the PRODUCTION reset fn — the
+        // same body arm-4 calls — never a re-enactment.
+        let mut self_test = SelfTestState::new();
+        self_test.phase = SelfTestPhase::AwaitingMark;
+        perform_daily_reset(
+            &mut risk,
+            &mut oms,
+            &mut book,
+            &mut self_test,
+            &marks_wanted,
+        );
         assert_eq!(risk.net_lots_for(13), 0);
         assert!(book.mirror.is_empty());
         assert!(book.tripwire.is_empty());
+        assert!(book.pending_paper.is_empty());
+        assert!(book.tripwire_reported.is_empty());
         assert!(oms.all_orders().is_empty());
+        assert_eq!(self_test.phase, SelfTestPhase::Idle);
         assert!(!marks_wanted.load(Ordering::Acquire));
+    }
+
+    /// E1: the reset-epoch gate — the same-day 16:00 fire AND the new-day
+    /// catch-up (a process suspended across [16:00, midnight) resets on its
+    /// first tick of the new day; day-1 halt/positions never carry).
+    #[test]
+    fn test_reset_epoch_same_day_fire_and_new_day_catch_up() {
+        // Before 16:00 the epoch is YESTERDAY's boundary; at/after, today's.
+        assert_eq!(reset_epoch(DAILY_RESET_SECS_OF_DAY_IST - 1, 100), 99);
+        assert_eq!(reset_epoch(DAILY_RESET_SECS_OF_DAY_IST, 100), 100);
+        assert_eq!(reset_epoch(23 * 3600, 100), 100);
+        // Normal day flow: reset at day-100 16:00 (epoch 100); overnight +
+        // next morning stay epoch 100 (no double reset); day-101 16:00 → 101.
+        assert_eq!(reset_epoch(6 * 3600, 101), 100);
+        assert_eq!(reset_epoch(DAILY_RESET_SECS_OF_DAY_IST, 101), 101);
+        // E1 suspend shape: last reset epoch 99 (day-99 16:00); the process
+        // sleeps through day-100's 16:00; first tick day-101 06:00 → epoch
+        // 100 > 99 → the catch-up arm fires BEFORE the session, never after.
+        assert!(reset_epoch(6 * 3600, 101) > 99);
     }
 
     #[tokio::test]
@@ -1604,18 +2012,128 @@ mod tests {
 
     #[test]
     fn test_selftest_single_cycle_latched() {
+        // fail() latches (no retry storm); the SUCCESS-path latch is driven
+        // through the production advance path by
+        // test_selftest_full_cycle_via_production_advance_latches_day (M6).
         let mut st = SelfTestState::new();
         let today = 20_000_i64;
-        // Success path latches the day.
-        st.phase = SelfTestPhase::Idle;
-        st.last_run_day = today;
-        assert_eq!(st.last_run_day, today, "a completed run must latch the day");
-        // fail() also latches (no retry storm).
-        let mut st2 = SelfTestState::new();
-        st2.phase = SelfTestPhase::AwaitingMark;
-        st2.fail(today, "timeout");
-        assert_eq!(st2.phase, SelfTestPhase::Idle);
-        assert_eq!(st2.last_run_day, today);
+        st.phase = SelfTestPhase::AwaitingMark;
+        st.fail(today, "timeout");
+        assert_eq!(st.phase, SelfTestPhase::Idle);
+        assert_eq!(st.last_run_day, today);
+    }
+
+    /// M6 (fix-round 2026-07-14): the full self-test cycle through the
+    /// PRODUCTION advance path — arm → index-spot mark picks the sid +
+    /// places entry → entry fills → close placed → next mark fills the
+    /// close → flat + PASSED + the day latches; a second arming attempt is
+    /// refused by the latch (deterministic: the latch gate precedes the
+    /// calendar gate in drive_self_test_timers).
+    #[tokio::test]
+    async fn test_selftest_full_cycle_via_production_advance_latches_day() {
+        let ctx = make_ctx();
+        let mut oms = make_oms();
+        let mut risk = make_risk();
+        let mut book = BookState::new();
+        let mut self_test = SelfTestState::new();
+        self_test.phase = SelfTestPhase::AwaitingMark; // the arm step
+        self_test.started_at = std::time::Instant::now();
+        // First INDEX-SPOT mark: picks the sid, places + fills the entry,
+        // places the close (all through the real arm-2 body).
+        process_mark(
+            &mut oms,
+            &mut risk,
+            &mut book,
+            &mut self_test,
+            &ctx,
+            MarkUpdate {
+                security_id: 13,
+                segment_code: 0,
+                price: 100.0,
+            },
+            true,
+        )
+        .await;
+        assert!(
+            matches!(self_test.phase, SelfTestPhase::AwaitingCloseFill { .. }),
+            "entry must fill and the close must be placed, got {:?}",
+            self_test.phase
+        );
+        assert_eq!(risk.net_lots_for(13), 1, "entry fill opened 1 lot");
+        // Second mark fills the close → flat → PASSED → day latched.
+        process_mark(
+            &mut oms,
+            &mut risk,
+            &mut book,
+            &mut self_test,
+            &ctx,
+            MarkUpdate {
+                security_id: 13,
+                segment_code: 0,
+                price: 101.0,
+            },
+            true,
+        )
+        .await;
+        let today = ist_day_number(chrono::Utc::now().timestamp());
+        assert_eq!(self_test.phase, SelfTestPhase::Idle, "cycle completed");
+        assert_eq!(
+            self_test.last_run_day, today,
+            "the SUCCESS path must latch the day"
+        );
+        assert_eq!(risk.net_lots_for(13), 0, "flat after the close fill");
+        assert!(risk.total_realized_pnl().is_finite());
+        // The once-per-day latch refuses a second run (latch gate fires
+        // before the calendar gate — deterministic on any test day).
+        drive_self_test_timers(
+            &mut self_test,
+            &ctx,
+            &mut oms,
+            &risk,
+            &mut book,
+            SELF_TEST_WINDOW_START_SECS_OF_DAY_IST,
+            today,
+            true,
+        )
+        .await;
+        assert_eq!(
+            self_test.phase,
+            SelfTestPhase::Idle,
+            "a second same-day run must be refused by the latch"
+        );
+    }
+
+    /// E4: the self-test sid pick ignores NON-index marks (a far-month
+    /// future with minutes of legitimate silence would false-FAIL the day).
+    #[tokio::test]
+    async fn test_selftest_sid_pick_requires_index_spot_mark() {
+        let ctx = make_ctx();
+        let mut oms = make_oms();
+        let mut risk = make_risk();
+        let mut book = BookState::new();
+        let mut self_test = SelfTestState::new();
+        self_test.phase = SelfTestPhase::AwaitingMark;
+        self_test.started_at = std::time::Instant::now();
+        // An NSE_FNO mark (segment 2) must NOT start the cycle.
+        process_mark(
+            &mut oms,
+            &mut risk,
+            &mut book,
+            &mut self_test,
+            &ctx,
+            MarkUpdate {
+                security_id: 49_081,
+                segment_code: 2,
+                price: 400.0,
+            },
+            true,
+        )
+        .await;
+        assert_eq!(
+            self_test.phase,
+            SelfTestPhase::AwaitingMark,
+            "a non-index mark must not pick the self-test sid (E4)"
+        );
     }
 
     #[test]
@@ -1627,28 +2145,349 @@ mod tests {
         // ist helpers: epoch 0 UTC = 05:30 IST, day 0.
         assert_eq!(ist_secs_of_day(0), 19_800);
         assert_eq!(ist_day_number(0), 0);
-        // 2026-07-14 00:00:00 UTC → 05:30 IST same day.
-        let t = 1_784_073_600_i64; // approx epoch for a 2026 date
-        assert!(ist_secs_of_day(t) < u32::from(u16::MAX) * 2);
+        // L2 (fix-round 2026-07-14): EXACT values — t is a UTC-midnight
+        // instant (1_784_073_600 = 20_649 × 86_400), so IST secs-of-day is
+        // exactly the 05:30 offset and the IST day ordinal is 20_649.
+        let t = 1_784_073_600_i64;
+        assert_eq!(ist_secs_of_day(t), 19_800);
+        assert_eq!(ist_day_number(t), 20_649);
     }
 
     // -------------------------------------------------------------------
     // Source filter (F18) — the consumer-boundary semantics
     // -------------------------------------------------------------------
 
+    #[test]
+    fn test_source_n_filtered_empty_tolerated() {
+        // M3 (fix-round 2026-07-14): the PRODUCTION predicate — the exact fn
+        // handle_order_update_event calls — never a replica.
+        assert!(
+            !is_foreign_source(""),
+            "empty Source tolerated (serde default)"
+        );
+        assert!(!is_foreign_source("P"), "API-sourced events consumed");
+        assert!(is_foreign_source("N"), "manual Dhan-app events filtered");
+        assert!(is_foreign_source("X"), "unknown sources filtered");
+    }
+
+    /// M3 discriminating half: a Source=N fill for a TRACKED order must
+    /// leave the book untouched THROUGH the real arm-1 body; the identical
+    /// P-sourced update fills — deleting the production filter fails this.
     #[tokio::test]
-    async fn test_source_n_filtered_empty_tolerated() {
-        // Pure boundary predicate replicated from handle_order_update_event:
-        let is_foreign = |source: &str| !source.is_empty() && source != "P";
-        assert!(!is_foreign(""), "empty Source tolerated (serde default)");
-        assert!(!is_foreign("P"), "API-sourced events consumed");
-        assert!(is_foreign("N"), "manual Dhan-app events filtered");
-        assert!(is_foreign("X"), "unknown sources filtered");
+    async fn test_source_n_update_for_tracked_order_never_fills() {
+        let ctx = make_ctx();
+        let mut oms = make_oms();
+        let mut risk = make_risk();
+        let mut book = BookState::new();
+        let mut self_test = SelfTestState::new();
+        let order_id = place_paper(&mut oms, 13, TransactionType::Buy).await;
+        book.rebuild_pending_paper(&oms);
+        let order = oms.order(&order_id).cloned().expect("tracked"); // APPROVED: test
+        let mut update = synthesize_paper_fill(&order, 100.0, 0).expect("fill"); // APPROVED: test
+        update.source = "N".to_string();
+        handle_order_update_event(
+            &mut oms,
+            &mut risk,
+            &mut book,
+            &mut self_test,
+            &ctx,
+            &update,
+            true,
+        )
+        .await;
+        assert_eq!(risk.net_lots_for(13), 0, "Source=N must never fill");
+        assert_eq!(oms.order(&order_id).map(|o| o.traded_qty), Some(0));
+        // The identical event with Source=P DOES fill (discriminating arm).
+        update.source = "P".to_string();
+        handle_order_update_event(
+            &mut oms,
+            &mut risk,
+            &mut book,
+            &mut self_test,
+            &ctx,
+            &update,
+            true,
+        )
+        .await;
+        assert_eq!(risk.net_lots_for(13), 1, "Source=P must fill");
+    }
+
+    /// M5 (F3 loudness path): an orphan fill-carrying update through the
+    /// real arm-1 body is tolerated — no panic, no position, book unchanged
+    /// (the warn + counter emission sits on this exact branch; asserting
+    /// the counter needs a metrics recorder the test process does not
+    /// install — state assertions + the S3-sanitized log id cover the rest).
+    #[tokio::test]
+    async fn test_orphan_fill_update_tolerated_book_unchanged() {
+        let ctx = make_ctx();
+        let mut oms = make_oms();
+        let mut risk = make_risk();
+        let mut book = BookState::new();
+        let mut self_test = SelfTestState::new();
+        // Multi-KB hostile order_no exercises the S3 log_safe_id path too.
+        let hostile_id = format!("GHOST-{}\u{202e}{}", "A".repeat(4096), "\u{0007}");
+        let update = wire_update(&hostile_id, 75, "P");
+        handle_order_update_event(
+            &mut oms,
+            &mut risk,
+            &mut book,
+            &mut self_test,
+            &ctx,
+            &update,
+            true,
+        )
+        .await;
+        assert_eq!(risk.position_security_ids().count(), 0, "no position");
+        assert!(book.mirror.is_empty(), "mirror untouched");
+        assert!(oms.all_orders().is_empty(), "orphan never tracked");
+    }
+
+    /// S3: bounded + sanitized log ids — control/BiDi stripped, length capped.
+    #[test]
+    fn test_log_safe_id_truncates_and_strips() {
+        let hostile = format!("evil\u{202e}{}\u{0007}", "B".repeat(500));
+        let safe = log_safe_id(&hostile);
+        assert!(safe.chars().count() <= 64, "must cap at 64 chars");
+        assert!(!safe.contains('\u{202e}'), "BiDi override stripped");
+        assert!(!safe.contains('\u{0007}'), "control char stripped");
+        assert_eq!(log_safe_id("PAPER-1"), "PAPER-1", "normal ids untouched");
     }
 
     // -------------------------------------------------------------------
     // Segment char round-trip for synthetic updates
     // -------------------------------------------------------------------
+
+    // -------------------------------------------------------------------
+    // H3 (fix-round 2026-07-14): the promised end-to-end chain through the
+    // ACTUAL production arm bodies — place → paper fill via a mark →
+    // net_lots ≠ 0 → adverse mark → daily-loss halt → RiskHalt reaches a
+    // test alert sink (the production trigger_halt fires it) → check_order
+    // rejects.
+    // -------------------------------------------------------------------
+
+    struct CapturingRiskSink {
+        fires: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl tickvault_trading::risk::engine::RiskAlertSink for CapturingRiskSink {
+        fn fire_risk_halt(&self, reason: &'static str) {
+            self.fires
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(reason.to_string());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_e2e_place_fill_mark_halt_fires_risk_halt_sink() {
+        let ctx = make_ctx();
+        let mut oms = make_oms();
+        // 2% of 10L capital → 20,000 daily-loss threshold.
+        let mut risk = make_risk();
+        let fires = Arc::new(std::sync::Mutex::new(Vec::new()));
+        risk.set_alert_sink(Box::new(CapturingRiskSink {
+            fires: Arc::clone(&fires),
+        }));
+        let mut book = BookState::new();
+        let mut self_test = SelfTestState::new();
+
+        // 1. PLACE: one paper order — 1 lot of 75 units (lot_size 75).
+        let order_id = oms
+            .place_order(PlaceOrderRequest {
+                security_id: 13,
+                transaction_type: TransactionType::Buy,
+                order_type: OrderType::Market,
+                product_type: ProductType::Intraday,
+                validity: OrderValidity::Day,
+                quantity: 75,
+                price: 0.0,
+                trigger_price: 0.0,
+                lot_size: 75,
+                expiry_date: None,
+            })
+            .await
+            .expect("paper placement never fails"); // APPROVED: test
+        book.rebuild_pending_paper(&oms);
+        assert!(book.has_pending_paper(13));
+
+        // 2. FILL: a mark @400 through the REAL arm-2 body — the paper
+        //    filler synthesizes the fill through the canonical arm-1 path.
+        process_mark(
+            &mut oms,
+            &mut risk,
+            &mut book,
+            &mut self_test,
+            &ctx,
+            MarkUpdate {
+                security_id: 13,
+                segment_code: 0,
+                price: 400.0,
+            },
+            true,
+        )
+        .await;
+        assert_eq!(risk.net_lots_for(13), 1, "paper fill must open 1 lot");
+        assert_eq!(
+            oms.order(&order_id).map(|o| o.traded_qty),
+            Some(75),
+            "the order filled through the production state machine"
+        );
+
+        // 3. ADVERSE MARK: 400 → 100 with lot_size 75 = -22,500 unrealized
+        //    (≥ the 20,000 threshold) via the same production arm body.
+        process_mark(
+            &mut oms,
+            &mut risk,
+            &mut book,
+            &mut self_test,
+            &ctx,
+            MarkUpdate {
+                security_id: 13,
+                segment_code: 0,
+                price: 100.0,
+            },
+            true,
+        )
+        .await;
+
+        // 4. HALT: the ≤1/sec evaluation the loop runs after mark batches.
+        assert!(
+            risk.evaluate_daily_loss_halt(),
+            "the mark-to-market drawdown must halt"
+        );
+        assert!(risk.is_halted());
+        // Idempotent second evaluation — the sink must NOT re-fire.
+        assert!(risk.evaluate_daily_loss_halt());
+        {
+            let fired = fires
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert_eq!(
+                fired.as_slice(),
+                ["MaxDailyLossExceeded".to_string()],
+                "RiskHalt must reach the alert sink EXACTLY once per episode"
+            );
+        }
+
+        // 5. REJECT: the pre-trade gate refuses everything while halted.
+        assert!(
+            !risk.check_order(13, 1).is_approved(),
+            "a halted book must reject new orders"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // S2 + HP-2 + HP-3 fix-round coverage
+    // -------------------------------------------------------------------
+
+    /// S2: a fill with an UNMAPPABLE segment is refused — it can no longer
+    /// bypass the tripwire partition check.
+    #[test]
+    fn test_apply_fill_refuses_unknown_segment() {
+        let mut risk = make_risk();
+        let mut book = BookState::new();
+        let fill = FillEvent {
+            security_id: 27,
+            segment_code: SEGMENT_CODE_UNKNOWN,
+            fill_lots: 1,
+            avg_price: 100.0,
+            lot_size: 1,
+            order_id: "PAPER-1".to_string(),
+        };
+        assert!(
+            !apply_fill(&mut risk, &mut book, &fill),
+            "an unknown-segment fill must be REFUSED (tripwire bypass — S2)"
+        );
+        assert_eq!(risk.net_lots_for(27), 0);
+        assert!(book.mirror.is_empty());
+    }
+
+    /// HP-3/E3: the tripwire error! is edge-latched per sid — the reported
+    /// set records the sid on the first divergence and the skip semantics
+    /// persist per event (the counter keeps counting; the LOG fires once).
+    #[test]
+    fn test_tripwire_divergence_error_latched_per_sid() {
+        let mut book = BookState::new();
+        assert!(book.tripwire_ok(27, 0));
+        assert!(!book.tripwire_ok(27, 2), "first divergence skips");
+        assert!(
+            book.tripwire_reported.contains(&27),
+            "first divergence must latch the reported set (error! fired)"
+        );
+        assert!(!book.tripwire_ok(27, 2), "later divergences still skip");
+        assert_eq!(
+            book.tripwire_reported.len(),
+            1,
+            "one latch entry per sid per episode"
+        );
+        // The daily reset re-arms the latch.
+        book.clear();
+        assert!(book.tripwire_reported.is_empty());
+    }
+
+    /// HP-2: the per-sid pending-paper index tracks placements and fills.
+    #[tokio::test]
+    async fn test_pending_paper_index_tracks_placements_and_fills() {
+        let mut oms = make_oms();
+        let mut book = BookState::new();
+        assert!(!book.has_pending_paper(13));
+        let order_id = place_paper(&mut oms, 13, TransactionType::Buy).await;
+        book.rebuild_pending_paper(&oms);
+        assert!(book.has_pending_paper(13));
+        assert!(!book.has_pending_paper(14), "index is per-sid");
+        // Fill → terminal → drops out on rebuild.
+        let order = oms.order(&order_id).cloned().expect("tracked"); // APPROVED: test
+        let synthetic = synthesize_paper_fill(&order, 100.0, 0).expect("fill"); // APPROVED: test
+        let _ = oms.handle_order_update(&synthetic);
+        book.rebuild_pending_paper(&oms);
+        assert!(
+            !book.has_pending_paper(13),
+            "a terminal order must leave the pending index"
+        );
+    }
+
+    /// C6: a self-test timeout cancels the outstanding order so the filler
+    /// can never fill it afterwards (the ghost-position hole).
+    #[tokio::test]
+    async fn test_selftest_timeout_cancels_outstanding_order() {
+        let ctx = make_ctx();
+        let mut oms = make_oms();
+        let risk = make_risk();
+        let mut book = BookState::new();
+        let mut self_test = SelfTestState::new();
+        let order_id = place_paper(&mut oms, 13, TransactionType::Buy).await;
+        book.rebuild_pending_paper(&oms);
+        self_test.phase = SelfTestPhase::AwaitingEntryFill {
+            order_id: order_id.clone(),
+            sid: 13,
+        };
+        // A started_at far in the past forces the timeout arm.
+        self_test.started_at = std::time::Instant::now()
+            .checked_sub(Duration::from_secs(SELF_TEST_TIMEOUT_SECS + 5))
+            .expect("monotonic clock has > timeout of history"); // APPROVED: test
+        drive_self_test_timers(
+            &mut self_test,
+            &ctx,
+            &mut oms,
+            &risk,
+            &mut book,
+            12 * 3600,
+            ist_day_number(chrono::Utc::now().timestamp()),
+            true,
+        )
+        .await;
+        assert_eq!(self_test.phase, SelfTestPhase::Idle, "timeout latches");
+        assert!(
+            oms.order(&order_id)
+                .is_some_and(tickvault_trading::oms::ManagedOrder::is_terminal),
+            "the outstanding self-test order must be CANCELLED on timeout \
+             (a later paper fill would open a ghost position — C6)"
+        );
+        assert!(
+            !book.has_pending_paper(13),
+            "the pending index must drop the cancelled order"
+        );
+    }
 
     #[test]
     fn test_segment_code_to_chars_round_trips_via_parse() {

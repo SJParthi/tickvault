@@ -1462,10 +1462,16 @@ impl GrowwBridgeState {
                     // Order-runtime mark tap (dry-run PR, 2026-07-14): after
                     // full validation, forward the LTP to the dry-run runtime.
                     // Cost: one Relaxed load when disarmed (the dominant path);
-                    // armed = one bounded try_send of a Copy struct. Zero
-                    // alloc / lock / await — a full channel DROPS the mark
-                    // (counted; the next tick supersedes it).
-                    if let Some(forwarder) = mark_forwarder {
+                    // armed = one bounded try_send of a Copy struct — no lock,
+                    // no await; disarmed + drop arms are strictly zero-alloc
+                    // (DHAT-proven), accepted sends carry tokio mpsc's
+                    // AMORTIZED block-reuse alloc (Criterion-budgeted) — HP-1
+                    // honesty, mirrors dhat_mark_forward.rs. A full channel
+                    // DROPS the mark (counted; the next tick supersedes it).
+                    // C11: gated OFF during the byte-0 re-tail replay window —
+                    // replayed capture lines are hours-old prices; forwarding
+                    // them could fill a paper order at a stale price.
+                    if !wake_replay_window && let Some(forwarder) = mark_forwarder {
                         forwarder.mark_forward(pt.security_id, seg_code, pt.last_traded_price);
                     }
                     // First sight: register + seed the cumulative baseline (idempotent).

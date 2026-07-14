@@ -3549,6 +3549,17 @@ async fn main() -> Result<()> {
                  (lane dormant via the runtime overlay, not retired) — a runtime re-enable \
                  cold-starts the full lane, which owns the Dhan REST surface"
             );
+            // E6 (fix-round 2026-07-14): name the config conflict — the
+            // dry-run order runtime spawns ONLY from the REST stack (the
+            // dhan-OFF arm), so on a dhan-ON boot `[order_runtime]` is
+            // silently inert (the mark forwarder is built but never armed).
+            if config.order_runtime.enabled {
+                warn!(
+                    "[order_runtime] enabled = true is IGNORED on a dhan-ON boot — \
+                     the dry-run order runtime spawns only from the dhan-OFF REST \
+                     stack; dhan-ON boots use the trading_pipeline OMS instead"
+                );
+            }
         } else {
             let _dhan_rest_stack_monitor = tickvault_app::dhan_rest_stack::spawn_dhan_rest_stack(
                 tickvault_app::dhan_rest_stack::DhanRestStackParams {
