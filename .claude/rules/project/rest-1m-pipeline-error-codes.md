@@ -839,6 +839,77 @@ Scope boundary (honest): the boot-time prev-day fetch and the 15:31 bulk
 cross-verify keep their own pacing cells (disjoint windows; not in the
 operator's enumerated scope — unifying them is a flagged follow-up).
 
+## §2g. 2026-07-14 — moneyness audit column + RAM-first classification
+
+**Operator directive (2026-07-14, relayed verbatim via the coordinator
+session):** per-row moneyness (ITM/ATM/OTM) is CRITICAL and MANDATORY —
+O(1) time + O(1) space + zero allocation, computed in the RAM hot path AND
+stored precomputed in the DB. The DB column is audit-only; RAM is the
+decision source of truth.
+
+**The column (both tables, BOTH feeds):** `option_chain_1m` and
+`option_contract_1m_rest` gain a `moneyness` SYMBOL column (values `ITM` /
+`ATM` / `OTM` / `UNKNOWN`), stamped at WRITE time next to `leg` in the ILP
+tag block; `option_contract_1m_rest` additionally gains `underlying_spot`
+DOUBLE (the chain-anchor spot the classification used — `0.0` = no anchor
+resolved that minute). NEITHER column is in ANY DEDUP key (label columns;
+latest-run-wins on a DEDUP re-append, exactly like `close_to_data_ms`).
+Pre-existing rows read NULL forever (ALTER-ADD self-heal; never backfilled
+— the classification is an at-write observation, not a recomputation).
+
+**The math (single source):** `crates/common/src/moneyness.rs` — integer
+paise, grid-rounded ATM (`((spot + step/2) / step) * step`, round-half-up;
+steps NIFTY 5000 / BANKNIFTY 10000 / SENSEX 10000 paise), two-step API
+(ATM once per underlying-minute, per-row classify). ALL strike/price
+arithmetic lives there — the boot legs only call it, so the
+`ratchet_chain1m_strike_is_parse_only_never_computed` ratchet stays green.
+
+**UNKNOWN semantics (never a guess, never a page):** invalid/absent spot
+(the Dhan `val_f64` 0.0-silent shape and the Groww `underlying_ltp_missing`
+minute), invalid strike, unknown underlying (no step-table entry), or an
+unknown leg label all classify `UNKNOWN` — counted, coded, and stored, but
+NEVER fabricated into a direction. On the CONTRACT leg an unresolved chain
+anchor stamps `underlying_spot = 0.0` + `moneyness = 'UNKNOWN'`; there is
+DELIBERATELY no contract-side moneyness counter — the existing
+`anchor_stale` / `selection_unresolved` counters + the `underlying_spot`
+column already name the cause per minute.
+
+**Chain-leg observability (three counters + latched warns, NO new
+ErrorCode):** `tv_moneyness_unknown_total{feed}` (one increment per UNKNOWN
+row), `tv_moneyness_atm_absent_total{feed}` (a classified chain whose
+grid-ATM strike is absent from the vendor's strike list), and
+`tv_moneyness_step_drift_total{feed}` (the observed finest adjacent-strike
+step in the vendor chain disagrees with the const step table). The
+atm-absent / step-drift warns are edge-latched once per (feed, underlying,
+day) — the anchor_stale latch pattern — and emit on the EXISTING
+`ErrorCode::Chain02FetchDegraded` with the new `stage="moneyness_atm_absent"`
+/ `stage="moneyness_step_drift"` fields: classification degrade IS a
+chain-fetch-quality degrade, and a new variant would drag the cross-ref +
+tag-guard + runbook chain for zero routing benefit (all six §2 codes are
+log-sink-only per §3 anyway).
+
+**RAM decision surface (the source of truth):**
+`crates/core/src/pipeline/chain_snapshot.rs` — a process-global 6-slot
+(2 feeds × NIFTY/BANKNIFTY/SENSEX) lock-free arc-swap registry; each chain
+leg PUBLISHES one `ChainMoneynessSnapshot` per fetched minute (minute ts,
+spot + spot_paise, atm_strike_paise, spot_missing, expiry, per-row
+strike/leg/moneyness/ltp) after classification — the publish happens
+AFTER the persist loop and independent of the persist outcome (a DB flush
+failure never blocks or degrades the RAM surface). Reads are one arc-swap
+load — budgeted ≤50 ns (the token_handle arc-swap-load class), zero-alloc
+(DHAT-ratcheted by `dhat_moneyness.rs`; budget key `moneyness = 50` ns);
+live Criterion numbers land post-merge via the bench lane — unmeasured
+pre-merge.
+Any future strategy consumer reads THIS snapshot — never the table — and
+remains bound by the §38.8 decision-freshness gate (`age_secs` is the
+staleness input) and the §28 indicators/strategies boundary (no strategy
+code without its own dated operator scope). Ratchet:
+`crates/core/tests/chain_snapshot_ram_first_guard.rs` — no DB/HTTP read
+machinery may enter `moneyness.rs` / `chain_snapshot.rs`, the
+banned-pattern scanner keeps its RAM-first category, all 3 boot legs keep
+the classify/publish wiring, and the contract leg (DB-audit-only) never
+publishes a snapshot.
+
 ## §3. Delivery boundary (honest — no false-OK)
 
 All six codes (SPOT1M-01/02 + CHAIN-01..04) are **log-sink-only today**: NO `error_code_alerts` map entry in
@@ -928,4 +999,5 @@ This rule activates when editing:
   `tv_chain1m_fetch_total`, `GROWW_SPOT_1M_SYMBOLS`, `rest_fetch_audit`,
   `tv_groww_spot1m_fetch_total`, `GROWW_CHAIN_1M_UNDERLYINGS`,
   `tv_groww_chain1m_fetch_total`, `option_contract_1m_rest`,
-  `GROWW_CONTRACT_1M_MAX_PER_MINUTE`, or `tv_groww_contract1m_fetch_total`
+  `GROWW_CONTRACT_1M_MAX_PER_MINUTE`, `tv_groww_contract1m_fetch_total`,
+  `moneyness`, `classify_moneyness`, `tv_moneyness_`, or `chain_snapshot`
