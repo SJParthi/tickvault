@@ -36,55 +36,30 @@ fn h1_l14_refusal_calls_process_exit() {
     );
 }
 
-#[test]
-fn h1_l14_refusal_logs_typed_error_code() {
-    let src = read_main();
-    // PR #5 (2026-05-19) retagged the L14 refusal from
-    // `Phase2Ready01PreflightFailed` (retired with the Phase 2 dispatcher)
-    // to `PrevClose01IlpFailed`, which matches the "PREVCLOSE-01" message
-    // reference per the error_code_tag_guard meta-test invariant.
-    assert!(
-        src.contains("ErrorCode::PrevClose01IlpFailed"),
-        "main.rs must tag the L14 refusal with a typed ErrorCode (Phase 2.9 H1 fix)"
-    );
-}
+// RETIRED (PR-C2, 2026-07-13 — Dhan live-WS lane deletion, operator
+// retirement directive per websocket-connection-scope-lock.md
+// "2026-07-13 Amendment" §B): h1_l14_refusal_logs_typed_error_code died with the wiring it pinned — the
+// Dhan tick pipeline (frame channel → run_tick_processor → TickEnricher /
+// prev_oi lifecycle enrichment / L14 boot-ordering gate) was deleted from
+// main.rs with the lane; the Groww feed carries its own bridge path.
 
-#[test]
-fn h1_l14_refusal_emits_counter() {
-    let src = read_main();
-    assert!(
-        src.contains("tv_l14_boot_authorization_refused_total"),
-        "main.rs must emit tv_l14_boot_authorization_refused_total when L14 refused"
-    );
-    assert!(
-        src.contains("tv_l14_boot_authorization_total"),
-        "main.rs must emit tv_l14_boot_authorization_total when L14 authorized (positive signal)"
-    );
-}
+// RETIRED (PR-C2, 2026-07-13 — Dhan live-WS lane deletion, operator
+// retirement directive per websocket-connection-scope-lock.md
+// "2026-07-13 Amendment" §B): h1_l14_refusal_emits_counter died with the wiring it pinned — the
+// Dhan tick pipeline (frame channel → run_tick_processor → TickEnricher /
+// prev_oi lifecycle enrichment / L14 boot-ordering gate) was deleted from
+// main.rs with the lane; the Groww feed carries its own bridge path.
 
-#[test]
-fn h1_dry_run_env_var_gate_lets_tests_exercise_path() {
-    let src = read_main();
-    assert!(
-        src.contains("TICKVAULT_BOOT_DRY_RUN"),
-        "main.rs must gate the process::exit on TICKVAULT_BOOT_DRY_RUN env var \
-         so tests can exercise the path without killing the runner"
-    );
-}
+// RETIRED (PR-C2, 2026-07-13 — Dhan live-WS lane deletion, operator
+// retirement directive per websocket-connection-scope-lock.md
+// "2026-07-13 Amendment" §B): h1_dry_run_env_var_gate_lets_tests_exercise_path died with the wiring it pinned — the
+// Dhan tick pipeline (frame channel → run_tick_processor → TickEnricher /
+// prev_oi lifecycle enrichment / L14 boot-ordering gate) was deleted from
+// main.rs with the lane; the Groww feed carries its own bridge path.
 
-#[test]
-fn h1_log_level_is_error_not_warn() {
-    let src = read_main();
-    // The block immediately preceding the process::exit must be a
-    // tracing::error!(...) — Loki routes ERROR to Telegram. WARN would
-    // not page the operator.
-    let needle = "L14 boot-ordering gate refused to authorize subscribe";
-    let idx = src.find(needle).expect("L14 refusal log line must exist");
-    let preceding = &src[..idx];
-    let last_error_idx = preceding.rfind("tracing::error!").unwrap_or(0);
-    let last_warn_idx = preceding.rfind("tracing::warn!").unwrap_or(0);
-    assert!(
-        last_error_idx > last_warn_idx,
-        "the L14 refusal log line must use tracing::error! (not warn!) so Loki → Telegram fires"
-    );
-}
+// RETIRED (PR-C2, 2026-07-13 — Dhan live-WS lane deletion, operator
+// retirement directive per websocket-connection-scope-lock.md
+// "2026-07-13 Amendment" §B): h1_log_level_is_error_not_warn died with the wiring it pinned — the
+// Dhan tick pipeline (frame channel → run_tick_processor → TickEnricher /
+// prev_oi lifecycle enrichment / L14 boot-ordering gate) was deleted from
+// main.rs with the lane; the Groww feed carries its own bridge path.

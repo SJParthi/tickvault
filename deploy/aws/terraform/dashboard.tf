@@ -48,11 +48,14 @@ resource "aws_cloudwatch_dashboard" "operator" {
         width  = 8
         height = 6
         properties = {
-          title   = "Real-time guarantee score (1.0 = all healthy)"
+          # PR-C2 (2026-07-13): was the tv_realtime_guarantee_score gauge —
+          # retired with the PARKed SLO publisher (wave-3-d banner); the
+          # Groww lag p99 is the Phase-A liveness signal.
+          title   = "Groww exchange->capture lag p99 (seconds)"
           region  = local.dash_region
           view    = "gauge"
-          metrics = [[local.dash_namespace, "tv_realtime_guarantee_score"]]
-          yAxis   = { left = { min = 0, max = 1 } }
+          metrics = [[local.dash_namespace, "tv_groww_exchange_lag_p99_seconds"]]
+          yAxis   = { left = { min = 0, max = 10 } }
           period  = 60
           stat    = "Average"
         }
@@ -227,11 +230,9 @@ resource "aws_cloudwatch_dashboard" "operator" {
         properties = {
           title = "Live alarm status (red = firing -> Telegram/Email/SMS already paged)"
           alarms = [
-            aws_cloudwatch_metric_alarm.ws_pool_all_dead.arn,
             aws_cloudwatch_metric_alarm.questdb_disconnected.arn,
             aws_cloudwatch_metric_alarm.token_remaining_low.arn,
             aws_cloudwatch_metric_alarm.tick_gap_instruments_silent.arn,
-            aws_cloudwatch_metric_alarm.realtime_guarantee_critical.arn,
             aws_cloudwatch_metric_alarm.spill_dropped.arn,
             aws_cloudwatch_metric_alarm.dlq_ticks.arn,
             aws_cloudwatch_metric_alarm.clock_skew_high.arn,
@@ -396,12 +397,10 @@ resource "aws_cloudwatch_dashboard" "scoreboard" {
         properties = {
           title = "Feed alarm status (red = firing -> already paged)"
           alarms = [
-            aws_cloudwatch_metric_alarm.ws_pool_all_dead.arn,
             aws_cloudwatch_metric_alarm.feed_stall_restarts.arn,
             aws_cloudwatch_metric_alarm.boundary_catchup_storm_dhan.arn,
             aws_cloudwatch_metric_alarm.dhan_exchange_lag_p99_high.arn,
-            aws_cloudwatch_metric_alarm.groww_exchange_lag_p99_high.arn,
-            aws_cloudwatch_metric_alarm.realtime_guarantee_degraded.arn
+            aws_cloudwatch_metric_alarm.groww_exchange_lag_p99_high.arn
           ]
         }
       },

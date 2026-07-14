@@ -478,6 +478,12 @@ impl TokenManager {
     ///   field doc). The fast-boot arm currently passes `None` — it holds
     ///   no dual-instance lock (documented residual gap, 2026-07-04).
     #[instrument(skip_all)]
+    // Dormant since PR-C2 (2026-07-14): the sole caller was the fast
+    // crash-recovery boot arm in main.rs, deleted with the Dhan live-WS lane
+    // (operator retirement 2026-07-13). Retained for the future live-trading
+    // re-wire; deletion belongs to the C4 dead-surface sweep
+    // (dhan-rest-only-noise-lock-2026-07-14.md), not a merge-reconcile commit.
+    // WIRING-EXEMPT: dormant since PR-C2 — caller (fast boot arm) deleted; kept for the live-trading re-wire, C4 sweep owns deletion.
     pub async fn initialize_deferred(
         token_handle: TokenHandle,
         cached_client_id: &str,

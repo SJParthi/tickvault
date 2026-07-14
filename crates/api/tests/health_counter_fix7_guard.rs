@@ -81,36 +81,28 @@ fn test_active_counter_is_lock_free_atomic() {
     assert_eq!(writes.load(Ordering::Relaxed), 4000);
 }
 
-/// Ratchets that `spawn_pool_watchdog_task` in main.rs takes a
-/// `SharedHealthStatus` parameter, so the watchdog can push counts.
-/// If someone refactors this away without a replacement the main-feed
-/// gauge will silently go dark again.
+/// PR-C2 (2026-07-13): the Fix #7 wiring ratchet is INVERTED. The Dhan
+/// live-WS lane — and with it `spawn_pool_watchdog_task` + the main-feed
+/// `set_websocket_connections` writes — is DELETED per the operator's
+/// 2026-07-13 retirement directive (websocket-connection-scope-lock.md
+/// "2026-07-13 Amendment"). `/health` honestly reports 0 main-feed
+/// connections for the retired feed. This test now pins the DELETION:
+/// a reappearing pool watchdog in main.rs is a scope-lock violation
+/// (re-introducing the Dhan live WS requires a fresh dated operator
+/// quote in the rule file first).
 #[test]
-fn test_pool_watchdog_task_accepts_health_status() {
+fn test_pool_watchdog_task_stays_deleted_with_the_lane() {
     let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     path.pop(); // crates/api -> crates
     path.push("app/src/main.rs");
     let src =
         std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
 
-    // Negative ratchet: the old 3-param signature MUST NOT reappear.
-    // We test by positive match instead to avoid a brittle whitespace
-    // pattern: the definition must include the `health:` parameter.
     assert!(
-        src.contains("fn spawn_pool_watchdog_task(")
-            && src.contains("tickvault_api::state::SharedHealthStatus"),
-        "Fix #7 regression: `spawn_pool_watchdog_task` no longer takes \
-         a `SharedHealthStatus`. Without it the watchdog cannot push \
-         main-feed connection counts to the /health endpoint — the \
-         exact symptom (0/5 forever) Fix #7 was created to close."
-    );
-
-    // And: the body must call `set_websocket_connections` so the counter
-    // is actually written, not just accepted.
-    assert!(
-        src.contains("set_websocket_connections"),
-        "Fix #7 regression: watchdog accepts the health handle but does \
-         not call `set_websocket_connections`. Pass-through with no \
-         write is the same as not wiring it at all."
+        !src.contains("fn spawn_pool_watchdog_task("),
+        "PR-C2 regression: `spawn_pool_watchdog_task` reappeared in main.rs — \
+         the Dhan live-WS lane was deleted 2026-07-13; re-introducing it \
+         requires a fresh dated operator quote in \
+         websocket-connection-scope-lock.md first."
     );
 }

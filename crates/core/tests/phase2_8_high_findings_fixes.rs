@@ -34,57 +34,33 @@ fn read(rel: &str) -> String {
     std::fs::read_to_string(&p).unwrap_or_else(|err| panic!("read {p:?}: {err}"))
 }
 
-#[test]
-fn h4_main_rs_gates_mark_oi_cache_loaded_on_ok_only() {
-    let src = read("app/src/main.rs");
-    assert!(
-        src.contains("oi_cache_load_succeeded"),
-        "main.rs must declare an oi_cache_load_succeeded flag from the load match (H4 fix)"
-    );
-    assert!(
-        src.contains("if oi_cache_load_succeeded {")
-            && src.contains("boot_ordering_gate.mark_oi_cache_loaded();"),
-        "main.rs must conditionally call mark_oi_cache_loaded ONLY when load succeeded — \
-         H4 fix: failure leaves the gate in AwaitingOiCache so try_authorize_subscribe refuses"
-    );
-}
+// RETIRED (PR-C2, 2026-07-13 — Dhan live-WS lane deletion, operator
+// retirement directive per websocket-connection-scope-lock.md
+// "2026-07-13 Amendment" §B): h4_main_rs_gates_mark_oi_cache_loaded_on_ok_only died with the wiring it pinned — the
+// Dhan tick pipeline (frame channel → run_tick_processor → TickEnricher /
+// prev_oi lifecycle enrichment / L14 boot-ordering gate) was deleted from
+// main.rs with the lane; the Groww feed carries its own bridge path.
 
-#[test]
-fn h4_main_rs_logs_load_failure_at_error_level_with_typed_code() {
-    let src = read("app/src/main.rs");
-    assert!(
-        src.contains("tracing::error!"),
-        "main.rs must log prev_oi_cache load failure at ERROR level (H4 fix — Loki → Telegram)"
-    );
-    assert!(
-        src.contains("ErrorCode::PrevClose01IlpFailed"),
-        "main.rs must tag the prev_oi_cache load failure with a typed ErrorCode (H4 fix)"
-    );
-}
+// RETIRED (PR-C2, 2026-07-13 — Dhan live-WS lane deletion, operator
+// retirement directive per websocket-connection-scope-lock.md
+// "2026-07-13 Amendment" §B): h4_main_rs_logs_load_failure_at_error_level_with_typed_code died with the wiring it pinned — the
+// Dhan tick pipeline (frame channel → run_tick_processor → TickEnricher /
+// prev_oi lifecycle enrichment / L14 boot-ordering gate) was deleted from
+// main.rs with the lane; the Groww feed carries its own bridge path.
 
-#[test]
-fn h4_main_rs_emits_outcome_metric() {
-    let src = read("app/src/main.rs");
-    assert!(
-        src.contains("tv_prev_oi_cache_load_total")
-            && src.contains("\"outcome\" => \"ok\"")
-            && src.contains("\"outcome\" => \"err\""),
-        "main.rs must emit tv_prev_oi_cache_load_total with both `outcome=ok` and `outcome=err` labels"
-    );
-}
+// RETIRED (PR-C2, 2026-07-13 — Dhan live-WS lane deletion, operator
+// retirement directive per websocket-connection-scope-lock.md
+// "2026-07-13 Amendment" §B): h4_main_rs_emits_outcome_metric died with the wiring it pinned — the
+// Dhan tick pipeline (frame channel → run_tick_processor → TickEnricher /
+// prev_oi lifecycle enrichment / L14 boot-ordering gate) was deleted from
+// main.rs with the lane; the Groww feed carries its own bridge path.
 
-#[test]
-fn h3_main_rs_emits_empty_cache_diagnostic() {
-    let src = read("app/src/main.rs");
-    assert!(
-        src.contains("tv_prev_oi_cache_empty_total"),
-        "main.rs must emit tv_prev_oi_cache_empty_total counter when count == 0 (H3 False-OK fix)"
-    );
-    assert!(
-        src.contains("prev_oi_cache loaded zero entries"),
-        "main.rs must emit a structured WARN log line when load succeeds but returns zero entries"
-    );
-}
+// RETIRED (PR-C2, 2026-07-13 — Dhan live-WS lane deletion, operator
+// retirement directive per websocket-connection-scope-lock.md
+// "2026-07-13 Amendment" §B): h3_main_rs_emits_empty_cache_diagnostic died with the wiring it pinned — the
+// Dhan tick pipeline (frame channel → run_tick_processor → TickEnricher /
+// prev_oi lifecycle enrichment / L14 boot-ordering gate) was deleted from
+// main.rs with the lane; the Groww feed carries its own bridge path.
 
 // REMOVED 2026-06-02 (CI rot fix): `h2_phase_code_to_str_returns_unknown_for_out_of_range`.
 // The `phase_code_to_str` function + its `tv_phase_code_unknown_total` counter
