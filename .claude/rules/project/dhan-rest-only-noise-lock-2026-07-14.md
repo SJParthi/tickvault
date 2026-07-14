@@ -49,7 +49,7 @@ the §38.0-Context-3 convention): *"make the Dhan option-chain capture complete 
 cross-cover the Groww gaps, and be loud on any empty or partial chain — never a silent gap."*
 The motivating incident is the 2026-07-14 Groww NIFTY expiry-day cutoff (14:54 IST, 2xx/zero
 strikes, `ok=2/empty=1` all afternoon, ZERO pages — PR #1537); the Dhan chain leg carries the
-IDENTICAL blind spot (`chain_minute_fully_failed` requires `ok == 0`). Per this quote the
+IDENTICAL blind spot (`chain_minute_fully_failed` requires `ok == 0`). Per this directive the
 family-(2) row is extended with `Chain1mUnderlyingNotServed` (High, one page per underlying per
 episode, edge-latched, ~10-minute detection latency) + `Chain1mUnderlyingServedRecovered` (Info,
 falling edge). This is a variant EXTENSION of family (2), not a 5th family: it still means

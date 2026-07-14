@@ -29,6 +29,65 @@ fn read_app_src(rel: &str) -> String {
     fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
 }
 
+/// Strip the `//`-comment tail of a line (the `http_client_fallback_guard`
+/// house stripper): a `//` NOT immediately preceded by `:` opens a comment;
+/// a URL scheme separator (`://` inside a string literal) never does — a
+/// naive `split("//")` would truncate the scan mid-line (false negative).
+fn code_portion(line: &str) -> &str {
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        if bytes[i] == b'/' && bytes[i + 1] == b'/' {
+            let preceded_by_colon = i > 0 && bytes[i - 1] == b':';
+            if !preceded_by_colon {
+                return &line[..i];
+            }
+            // `://` — a URL scheme separator inside a string literal, not
+            // a comment. Skip past it and keep scanning.
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    line
+}
+
+/// The PRODUCTION region of a module — everything BEFORE the first
+/// `#[cfg(test)]` — with `//` line comments stripped via [`code_portion`].
+/// The 2026-07-14 hardening needles scan THIS, so a test-module mention or
+/// a doc-comment quote can never vacuously satisfy a ratchet (the
+/// 2026-07-06 comment-scan false-OK class).
+fn production_code(module_src: &str) -> String {
+    let prod = module_src
+        .split("#[cfg(test)]")
+        .next()
+        .expect("split always yields at least one piece");
+    prod.lines()
+        .map(code_portion)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Stripper self-test (the http_client_fallback_guard precedent): a URL
+/// scheme separator inside a string literal must NOT truncate the scan.
+#[test]
+fn code_portion_self_test_url_scheme_is_not_a_comment() {
+    let line = r#"let x = "http://host"; join_set.spawn(async move {"#;
+    assert!(
+        code_portion(line).contains("join_set.spawn("),
+        "stripper must not treat '://' as a comment start: {:?}",
+        code_portion(line)
+    );
+    let mixed = r#"let url = "https://a/b"; // join_set.spawn( explanation"#;
+    let kept = code_portion(mixed);
+    assert!(kept.contains(r#""https://a/b""#), "{kept:?}");
+    assert!(
+        !kept.contains("join_set.spawn("),
+        "the real comment tail must be stripped: {kept:?}"
+    );
+    assert_eq!(code_portion("// pure comment line"), "");
+}
+
 /// The `(` suffix distinguishes CALL sites from doc-comment mentions; the
 /// fn DEFINITIONS live in option_chain_1m_boot.rs, not main.rs, so every
 /// main.rs hit is a call site.
@@ -307,13 +366,20 @@ fn chain_fire_span(module_src: &str) -> &str {
 #[test]
 fn ratchet_chain_fire_keeps_joinset_concurrency() {
     let module_src = read_app_src("src/option_chain_1m_boot.rs");
-    let fire = chain_fire_span(&module_src);
+    // CODE-only scan (comment-stripped production region): the mandated
+    // doc quote below itself contains "JoinSet", so a comment-visible
+    // needle would be self-satisfied by the quote — the spawn CALL
+    // literal in stripped code is the honest pin.
+    let production = production_code(&module_src);
+    let fire_code = chain_fire_span(&production);
     assert!(
-        fire.contains("JoinSet"),
-        "fire_one_chain_minute lost its JoinSet — the Dhan-documented \
-         concurrent-distinct fire must not be silently sequentialized \
-         (cross-source-chain-coverage-2026-07-14.md rule-edit required)"
+        fire_code.contains("join_set.spawn("),
+        "fire_one_chain_minute lost its `join_set.spawn(` call — the \
+         Dhan-documented concurrent-distinct fire must not be silently \
+         sequentialized (cross-source-chain-coverage-2026-07-14.md \
+         rule-edit required)"
     );
+    let fire = chain_fire_span(&module_src);
     // The quote is a wrapped comment block — normalize the wrapping
     // before matching the doc fragment.
     let normalized: String = fire
@@ -333,9 +399,14 @@ fn ratchet_chain_fire_keeps_joinset_concurrency() {
 #[test]
 fn ratchet_chain_retry_pass_is_ceiling_gated() {
     let module_src = read_app_src("src/option_chain_1m_boot.rs");
-    let fire = chain_fire_span(&module_src);
+    // Comment-stripped PRODUCTION region only: the `#[cfg(test)]` module
+    // calls `chain_retry_allowed(` and doc comments quote
+    // `"skipped_ceiling"`, so a whole-file scan would survive deleting
+    // the production wiring (coverage-review mutation #3).
+    let production = production_code(&module_src);
+    let fire_code = chain_fire_span(&production);
     assert!(
-        fire.contains("chain_retry_pass("),
+        fire_code.contains("chain_retry_pass("),
         "fire_one_chain_minute lost its phase-2 retry pass call"
     );
     for needle in [
@@ -343,15 +414,19 @@ fn ratchet_chain_retry_pass_is_ceiling_gated() {
         "chain_retry_allowed(",
         "retry_launch_elapsed_ms(",
         "CHAIN_1M_DECISION_CEILING_SECS",
-        // Refused retries are COUNTED (never silent).
+        // Refused retries are COUNTED (never silent) — the label AND the
+        // exact counter EMISSION line (deleting the metrics::counter!
+        // call must fail the build, not just renaming the label).
         "\"skipped_ceiling\"",
+        r#"metrics::counter!("tv_chain1m_retry_total", "outcome" => "skipped_ceiling")"#,
         "tv_chain1m_retry_total",
         "retry_skipped_ceiling",
     ] {
         assert!(
-            module_src.contains(needle),
-            "option_chain_1m_boot.rs lost its `{needle}` wiring — the \
-             bounded retry must stay ceiling-gated with counted refusals"
+            production.contains(needle),
+            "option_chain_1m_boot.rs lost its `{needle}` wiring in the \
+             PRODUCTION region — the bounded retry must stay ceiling-gated \
+             with counted refusals"
         );
     }
 }
@@ -362,26 +437,31 @@ fn ratchet_chain_retry_pass_is_ceiling_gated() {
 #[test]
 fn ratchet_not_served_counter_labels_static_underlying_symbols() {
     let module_src = read_app_src("src/option_chain_1m_boot.rs");
+    // Comment-stripped PRODUCTION region only — a doc-comment or
+    // test-module mention can never satisfy these needles.
+    let production = production_code(&module_src);
     // The single EMISSION site: the counter-name literal with the STATIC
     // `underlying` binding as its label (a &'static str from the pinned
     // symbols) — never a runtime-built string.
     let macro_literal = r#""tv_chain1m_underlying_not_served_total", "underlying" => underlying"#;
-    let pos = module_src.find(macro_literal).unwrap_or_else(|| {
+    let pos = production.find(macro_literal).unwrap_or_else(|| {
         panic!(
             "the not-served counter emission must label with the static \
-             `underlying` binding — literal `{macro_literal}` not found"
+             `underlying` binding — literal `{macro_literal}` not found \
+             in the production region"
         )
     });
     // No runtime label construction anywhere near the emission.
-    let window = &module_src[pos.saturating_sub(200)..(pos + 200).min(module_src.len())];
+    let window = &production[pos.saturating_sub(200)..(pos + 200).min(production.len())];
     assert!(
         !window.contains("format!"),
         "the not-served counter label must never be runtime-built: {window}"
     );
     // And the verdict tuples feed the pinned static symbols.
     assert!(
-        module_src.contains("served_verdicts.push((") && module_src.contains("target.symbol"),
-        "the verdict line must push the pinned static target.symbol"
+        production.contains("served_verdicts.push((") && production.contains("target.symbol"),
+        "the verdict line must push the pinned static target.symbol \
+         (production region)"
     );
 }
 
@@ -390,8 +470,9 @@ fn ratchet_not_served_counter_labels_static_underlying_symbols() {
 /// info-only exit form is gone.
 #[test]
 fn ratchet_trading_day_flip_exits_are_coded() {
-    let chain_src = read_app_src("src/option_chain_1m_boot.rs");
-    let spot_src = read_app_src("src/spot_1m_rest_boot.rs");
+    // Comment-stripped PRODUCTION regions only.
+    let chain_src = production_code(&read_app_src("src/option_chain_1m_boot.rs"));
+    let spot_src = production_code(&read_app_src("src/spot_1m_rest_boot.rs"));
     assert_eq!(
         chain_src
             .matches("stage = \"trading_day_flip_exit\"")
@@ -423,6 +504,58 @@ fn ratchet_trading_day_flip_exits_are_coded() {
             !src.contains("no longer a trading day — exiting"),
             "{name} regressed to the bare info-only trading-day exit — \
              flip exits must stay coded + counted"
+        );
+    }
+}
+
+/// Behavioral pin on the flip-exit CONSEQUENCE (coverage-review mutation
+/// #2): each coded `trading_day_flip_exit` emission must be followed by a
+/// `return` — deleting the `return;`/`return false;` would keep the loop
+/// firing on a non-trading day with every count/counter needle above
+/// still green. Windowed source-scan (the flip sites live inside a
+/// non-injectable supervised loop, so a real behavioral unit test would
+/// need a full scheduler harness — the scan is the honest pin): within
+/// the 10 non-empty stripped-code lines after the `stage = ...` line
+/// (the multi-line `error!` message body + `);` span ≤ 8 lines today; 10
+/// leaves slack without reaching the next loop arm), one line must START
+/// with `return`.
+#[test]
+fn ratchet_trading_day_flip_exits_return_immediately() {
+    for (name, rel, expected_sites) in [
+        ("option_chain_1m_boot.rs", "src/option_chain_1m_boot.rs", 1),
+        ("spot_1m_rest_boot.rs", "src/spot_1m_rest_boot.rs", 2),
+    ] {
+        let production = production_code(&read_app_src(rel));
+        let mut sites = 0_usize;
+        for (pos, _) in production.match_indices("stage = \"trading_day_flip_exit\"") {
+            sites += 1;
+            let mut non_empty = 0_usize;
+            let mut has_return = false;
+            for line in production[pos..].lines().skip(1) {
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                non_empty += 1;
+                if trimmed.starts_with("return") {
+                    has_return = true;
+                    break;
+                }
+                if non_empty >= 10 {
+                    break;
+                }
+            }
+            assert!(
+                has_return,
+                "{name}: the trading_day_flip_exit emission at byte {pos} \
+                 is no longer followed by a `return` within 10 non-empty \
+                 code lines — the loop would keep firing on a non-trading \
+                 day (the exit IS the behavior, not the log line)"
+            );
+        }
+        assert_eq!(
+            sites, expected_sites,
+            "{name}: expected {expected_sites} flip-exit site(s) to pin"
         );
     }
 }

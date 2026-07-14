@@ -2674,6 +2674,27 @@ mod tests {
         assert!(!chain_retry_allowed(i64::MIN));
     }
 
+    /// The FINAL fire (the 15:29 candle firing at the 15:30:00 boundary)
+    /// retains FULL retry rights: the ceiling is FIRE-relative (elapsed
+    /// since the minute close), never time-of-day-gated — the same math
+    /// as the tests above, derived here from the real last-fire boundary
+    /// so the final-fire edge case is pinned by name (plan Edge Cases,
+    /// 2026-07-14 adversarial review).
+    #[test]
+    fn test_chain_retry_allowed_final_fire_retains_full_rights() {
+        let close_ms =
+            i64::from(tickvault_common::constants::SPOT_1M_REST_LAST_FIRE_SECS_OF_DAY_IST)
+                * MILLIS_PER_SEC;
+        // 15:30:00 IST — the boundary that targets the 15:29 candle.
+        assert_eq!(close_ms, 55_800_000);
+        // A retry launching at 15:30:05.5 (the fast path) is ALLOWED…
+        assert!(chain_retry_allowed((close_ms + 5_500) - close_ms));
+        // …and one at 15:30:12.5 (worst timed-out first attempt) too.
+        assert!(chain_retry_allowed((close_ms + 12_500) - close_ms));
+        // The ceiling still applies fire-relative: 15:30:15.0 is refused.
+        assert!(!chain_retry_allowed((close_ms + 15_000) - close_ms));
+    }
+
     /// The launch gate includes the same-key ≥3s gap wait STILL AHEAD of
     /// the retry: a wall clock inside the ceiling whose pending gap wait
     /// crosses it is REFUSED — the fetch never launches.

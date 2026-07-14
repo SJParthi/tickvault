@@ -1,6 +1,6 @@
 # Implementation Plan: Dhan chain bounded retry + decision ceiling + per-underlying not-served pager + coverage hardening
 
-**Status:** APPROVED
+**Status:** VERIFIED
 **Date:** 2026-07-14
 **Approved by:** Parthiban (operator) — coordinator-relayed directive 2026-07-14
 
@@ -13,7 +13,7 @@
 
 - [x] Item 1 — Bounded same-key retry + 15s decision ceiling on the chain fire (concurrency KEPT per the Dhan doc)
   - Files: crates/app/src/option_chain_1m_boot.rs, crates/common/src/constants.rs
-  - Tests: test_chain_retry_allowed_below_ceiling, test_chain_retry_allowed_refused_at_and_past_ceiling, test_chain_retry_allowed_refused_negative_elapsed, test_retry_gate_includes_min_gap_wait, test_retry_only_for_empty_or_failed_never_entitlement_or_found, test_retry_found_replaces_first_pass_outcome, test_retry_entitlement_outcome_becomes_entitlement_stop, test_at_most_one_retry_per_underlying_per_minute, test_chain_decision_ceiling_constants_pinned
+  - Tests: test_chain_retry_allowed_below_ceiling, test_chain_retry_allowed_refused_at_and_past_ceiling, test_chain_retry_allowed_refused_negative_elapsed, test_chain_retry_allowed_final_fire_retains_full_rights, test_retry_gate_includes_min_gap_wait, test_retry_only_for_empty_or_failed_never_entitlement_or_found, test_retry_found_replaces_first_pass_outcome, test_retry_entitlement_outcome_becomes_entitlement_stop, test_at_most_one_retry_per_underlying_per_minute, test_chain_decision_ceiling_constants_pinned
 
 - [x] Item 2 — Dhan UnderlyingServedTracker + typed HIGH page (mirror #1537) + noise-lock §2/§2.1/§4 edit
   - Files: crates/app/src/option_chain_1m_boot.rs, crates/common/src/constants.rs, crates/core/src/notification/events.rs, .claude/rules/project/dhan-rest-only-noise-lock-2026-07-14.md
@@ -33,7 +33,7 @@
 
 - [x] Item 6 — wiring-guard ratchets
   - Files: crates/app/tests/option_chain_1m_wiring_guard.rs
-  - Tests: ratchet_chain_fire_keeps_joinset_concurrency, ratchet_chain_retry_pass_is_ceiling_gated, ratchet_not_served_counter_labels_static_underlying_symbols, ratchet_trading_day_flip_exits_are_coded
+  - Tests: ratchet_chain_fire_keeps_joinset_concurrency, ratchet_chain_retry_pass_is_ceiling_gated, ratchet_not_served_counter_labels_static_underlying_symbols, ratchet_trading_day_flip_exits_are_coded, ratchet_trading_day_flip_exits_return_immediately
 
 ## Design
 
@@ -59,7 +59,10 @@ failure minutes HOLD inside the tracker (any_served=false); join-failure (unwind
 per-underlying HOLD (missing verdict); persist failures never retried and never flip served=false
 (the M1 escalation gate keeps them); all-3-timeout storm → 1 retry launches at 12.5s, the rest
 ceiling-refused + counted; clock step-back / stale wake unchanged (fire_is_fresh +
-stale_wake_backoff_ms untouched); supervisor respawn resets tracker/watermark streaks (documented
+stale_wake_backoff_ms untouched); the FINAL fire — the 15:29 candle fires at the 15:30:00
+boundary — retains full retry rights because the decision ceiling is fire-relative (elapsed since
+the minute close, never time-of-day-gated), verified by the fire-relative ceiling tests incl.
+test_chain_retry_allowed_final_fire_retains_full_rights; supervisor respawn resets tracker/watermark streaks (documented
 ~10-min re-detection envelope, the #1537/FailureEdge precedent); shrink-to-zero is Empty ⇒ the
 paging edges, never the shrink detector (Found-only input); VIX cannot enter (existing const-assert).
 
