@@ -760,11 +760,20 @@ impl OrderApiClient {
 
     /// Places a Multi Order — up to 15 sequence-keyed legs, NO condition.
     /// Endpoint: `POST /v2/alerts/multi/orders` (PORTAL-only page; response
-    /// wire shape is OpenAPI-yaml-only — UNVERIFIED-LIVE).
+    /// wire shape is OpenAPI-yaml-only — UNVERIFIED-LIVE; the PORTAL page
+    /// itself documents NO response body, "200 Successful operation" only).
     /// Equities ONLY, fail-closed (enforced by
     /// `conditional::build_multi_order_request`).
     /// GATED: refuses with `AlertsSurfaceDisarmed` unless the alerts gate is
     /// armed (#[cfg(test)]-only today).
+    ///
+    /// BODYLESS-200 tolerance: an empty/whitespace 200 body returns
+    /// `DhanMultiOrderResponse::default()` (empty per-leg results) instead
+    /// of a `JsonError` — a 200 means the legs are ALREADY placed at the
+    /// broker, and a parse brick here would push callers toward a
+    /// double-placing retry of up to 15 live legs. A NON-empty
+    /// unparsable 200 body still surfaces as `JsonError` (honest: which
+    /// legs went live is then genuinely unknown).
     ///
     /// Header note: `auth_headers` sends `client-id` on every call; this
     /// family needs only `access-token` — harmless extra header,
@@ -799,6 +808,13 @@ impl OrderApiClient {
                 status_code: status,
                 message: body,
             });
+        }
+        // PORTAL documents NO body for this endpoint — a bodyless 2xx means
+        // the legs are ALREADY placed; degrade to the default (empty
+        // per-leg results) instead of a JsonError that invites a
+        // double-placing retry. Non-empty garbage stays a JsonError.
+        if body.trim().is_empty() {
+            return Ok(DhanMultiOrderResponse::default());
         }
         serde_json::from_str(&body).map_err(|err| OmsError::JsonError(err.to_string()))
     }
@@ -5029,6 +5045,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_place_multi_order_malformed_json_error() {
+        // A NON-empty unparsable 200 body stays a JsonError (honest: which
+        // legs went live is genuinely unknown) — only the bodyless shape
+        // degrades to the default response.
         let (url, h) = start_mock_server(200, "not-json{{").await;
         let mut client = make_test_client(&url);
         client.arm_alerts_gate_for_test();
@@ -5036,6 +5055,29 @@ mod tests {
         let result = client.place_multi_order("jwt", &req).await;
         assert!(matches!(result, Err(OmsError::JsonError(_))));
         h.abort();
+    }
+
+    #[tokio::test]
+    async fn test_place_multi_order_bodyless_200_ok_empty_orders() {
+        // The PORTAL page documents NO response body for this endpoint
+        // ("200 Successful operation" only). A bodyless 200 means the legs
+        // are ALREADY placed — it must return Ok (empty per-leg results),
+        // never a JsonError that invites a double-placing retry.
+        for body in ["", "  \n\t "] {
+            let (url, h) = start_mock_server(200, body).await;
+            let mut client = make_test_client(&url);
+            client.arm_alerts_gate_for_test();
+            let req = sample_multi_order_request();
+            let result = client.place_multi_order("jwt", &req).await;
+            match result {
+                Ok(resp) => assert!(
+                    resp.orders.is_empty(),
+                    "bodyless 200 must default to empty per-leg results"
+                ),
+                other => panic!("bodyless 200 body {body:?} must be Ok, got {other:?}"),
+            }
+            h.abort();
+        }
     }
 
     #[test]

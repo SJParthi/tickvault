@@ -18,26 +18,35 @@
 //!    (`|=`/`&=`/`^=`), zero `&mut` borrows of the field.
 //! 3. Every `/alerts` URL-building sender checks the gate BEFORE any
 //!    URL/socket work. BOTH sides of the census count the SAME
-//!    comment-stripped production text (a commented-out gate call can
-//!    never balance the equality), the URL census is GENERAL (any
-//!    `/alerts` string shape + any `DHAN_ALERTS_`-prefixed constant use),
-//!    and the SENDER SET IS DERIVED from the code (every `pub async fn`
-//!    whose body touches `/alerts` text or a `DHAN_ALERTS_*` constant)
-//!    and pinned equal to `ALERTS_SENDER_FNS` — a NEW 7th sender cannot
-//!    ship without editing this test and thereby entering the
-//!    gate-before-HTTP ordering scan.
+//!    comment-stripped production text — FULL-LINE comments AND trailing
+//!    `//` comments outside string literals are stripped (round-3: a
+//!    trailing-comment decoy `… // self.require_alerts_gate(` could
+//!    previously inflate the gate side and balance a genuinely ungated
+//!    URL site), the URL census is GENERAL (any `/alerts` string shape +
+//!    any `DHAN_ALERTS_`-prefixed constant use), and the SENDER SET IS
+//!    DERIVED from the code (every `pub async fn` whose body touches
+//!    `/alerts` text or a `DHAN_ALERTS_*` constant) and pinned equal to
+//!    `ALERTS_SENDER_FNS` — a NEW 7th sender cannot ship without editing
+//!    this test and thereby entering the gate-before-HTTP ordering scan.
 //! 4. NO production code calls any of the 6 sender fns (dormancy ratchet)
 //!    — api_client.rs' OWN production region INCLUDED (round-2: its
 //!    test-module call sites are excluded by the region split, never by a
-//!    whole-file skip). The activation PR edits THIS test alongside the
-//!    operator quote.
+//!    whole-file skip), and the caller census is CALL-SHAPE GENERAL
+//!    (round-3): method syntax `.name(`, fully-qualified/UFCS path syntax
+//!    `::name` (called OR bound as a fn item / imported), and bare
+//!    `name(` calls all count — only the `fn name(` declaration is
+//!    excluded. The activation PR edits THIS test alongside the operator
+//!    quote.
 //! 5. The order-leg segment enums stay equities-only fail-closed.
 //! 6. The `/alerts` paths have a single choke point (no rogue sender
 //!    files). Within the allowlist: constants.rs is under a
-//!    `DHAN_ALERTS_`-naming ratchet (every code line carrying `/alerts`
-//!    must be a DHAN_ALERTS_*-prefixed constant, so a rogue-named
-//!    constant cannot dodge test 3's census), and types.rs /
-//!    conditional.rs may mention the paths in DOC COMMENTS ONLY.
+//!    `DHAN_ALERTS_`-naming ratchet — every code line carrying `/alerts`
+//!    must DECLARE a `pub const DHAN_ALERTS_*` (the declared IDENTIFIER
+//!    is parsed, round-3: a rogue-named constant with a camouflage
+//!    `// DHAN_ALERTS_ family` trailing comment previously satisfied a
+//!    substring check), so a rogue-named constant cannot dodge test 3's
+//!    census — and types.rs / conditional.rs may mention the paths in
+//!    DOC COMMENTS ONLY.
 //! 7. The scanner itself detects planted violations (vacuous-pass defense
 //!    — the 2026-07-06 lesson).
 //!
@@ -46,12 +55,15 @@
 //! honest evidence surface).
 //!
 //! HONEST ENVELOPE: these are text ratchets. They pin every regression
-//! shape surfaced by the round-1/round-2 adversarial reviews (literal and
-//! non-literal arms, parameterized constructors, compound assignments,
-//! `&mut` borrows, new senders, new constants, comment-inflated counts);
-//! they do NOT claim to stop deliberate obfuscation outside those shapes
-//! (byte-assembled strings, `unsafe` pointer writes) — such code fails
-//! human review + the operator-quote protocol, not this file.
+//! shape surfaced by the round-1/round-2/round-3 adversarial reviews
+//! (literal and non-literal arms, parameterized constructors, compound
+//! assignments, `&mut` borrows, new senders, new constants, full-line AND
+//! trailing comment-inflated counts, rogue-named /alerts constants with
+//! camouflage comments, UFCS/path/bare-call production callers); they do
+//! NOT claim to stop deliberate obfuscation outside those shapes
+//! (byte-assembled strings, raw-string literals — none exist in the
+//! scanned production regions today — `unsafe` pointer writes) — such
+//! code fails human review + the operator-quote protocol, not this file.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -98,18 +110,61 @@ fn count_occurrences(haystack: &str, needle: &str) -> usize {
     haystack.matches(needle).count()
 }
 
-/// Strips FULL-LINE comments (`//` / `///` / `//!` lines) so doc-comment
-/// mentions of `/alerts` never count as URL sites. Deliberately keeps
-/// inline TRAILING comments: a naive `//`-to-EOL strip would corrupt
-/// `://` inside string literals (the http_client_fallback_guard lesson),
-/// and keeping more text is conservative for a violation hunt (an
-/// over-count fails the equality LOUDLY, never silently).
-fn strip_full_line_comments(source: &str) -> String {
+/// Strips comments so a comment mention of a gate/URL token never counts:
+/// FULL-LINE comment lines (`//` / `///` / `//!`) are dropped, and
+/// TRAILING `//` comments are cut OUTSIDE string literals (round-3
+/// hardening — the previous full-line-only strip let a trailing-comment
+/// decoy `let _op = "del"; // self.require_alerts_gate(_op)` inflate the
+/// gate side of the census). The string tracker below keeps `://` inside
+/// string literals intact (the http_client_fallback_guard lesson) and
+/// skips char literals (`'"'`) so a quote CHARACTER can never derail it.
+/// HONEST ENVELOPE: raw-string literals (`r#"…"#`) are not modeled — none
+/// exist in the scanned production regions today; a new one carrying these
+/// tokens would over-count and fail LOUDLY, never pass silently.
+fn strip_comments(source: &str) -> String {
     source
         .lines()
         .filter(|line| !line.trim_start().starts_with("//"))
+        .map(strip_trailing_comment)
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Cuts a trailing `//` comment from `line`, tracking double-quoted string
+/// literals (with `\` escapes) and skipping char literals (`'x'` / `'\x'`,
+/// incl. `'"'`) so `//` inside a string (e.g. `https://`) is never treated
+/// as a comment start. Lifetime ticks (`'static`) have no closing quote at
+/// the char-literal offsets and fall through as ordinary text.
+fn strip_trailing_comment(line: &str) -> &str {
+    let bytes = line.as_bytes();
+    let mut in_string = false;
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\\' if in_string => {
+                index += 2;
+                continue;
+            }
+            b'"' => in_string = !in_string,
+            b'\'' if !in_string => {
+                if index + 3 < bytes.len() && bytes[index + 1] == b'\\' && bytes[index + 3] == b'\''
+                {
+                    index += 4;
+                    continue;
+                }
+                if index + 2 < bytes.len() && bytes[index + 2] == b'\'' {
+                    index += 3;
+                    continue;
+                }
+            }
+            b'/' if !in_string && index + 1 < bytes.len() && bytes[index + 1] == b'/' => {
+                return line[..index].trim_end();
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    line
 }
 
 /// Extracts the body region of a sender fn: from its `pub async fn` token
@@ -126,18 +181,59 @@ fn sender_fn_region<'a>(production: &'a str, fn_name: &str) -> &'a str {
     &after[..end]
 }
 
-/// True when the production region of `source` calls any alerts sender fn
-/// (method-call token `fn_name(`).
+/// True when the production region of `source` uses any alerts sender fn
+/// in a CALL-SHAPED way. Round-3 hardening: the previous `.name(`-only
+/// needle missed a fully-qualified caller
+/// (`OrderApiClient::place_multi_order(&client, ..)`) and a fn-item
+/// binding (`let f = OrderApiClient::place_multi_order;`). Comments are
+/// stripped first (a comment cannot call anything at runtime; doc-comment
+/// intra-links like `[OrderApiClient::place_multi_order]` must not flag).
 fn production_region_calls_alerts_sender(source: &str) -> Option<&'static str> {
-    let production = production_region(source);
+    let production = strip_comments(production_region(source));
     ALERTS_SENDER_FNS.iter().find_map(|fn_name| {
-        let call_token = format!(".{fn_name}(");
-        if production.contains(&call_token) {
+        if code_has_call_shaped_use(&production, fn_name) {
             Some(*fn_name)
         } else {
             None
         }
     })
+}
+
+/// True when `code` contains a CALL-SHAPED use of `fn_name` at identifier
+/// boundaries: method syntax `.name(`, path/UFCS syntax `::name` (called
+/// OR bound as a fn item / imported), or a bare `name(` call. The ONLY
+/// excluded shape is the declaration itself (`fn name(`). A string-literal
+/// mention (`"place_multi_order"` passed to the gate/rate-limit helpers)
+/// is neither preceded by `.`/`::` nor followed by `(`, so it never
+/// counts; an exotic in-string `name(` would OVER-count and fail loudly —
+/// the conservative direction for a violation hunt.
+fn code_has_call_shaped_use(code: &str, fn_name: &str) -> bool {
+    let bytes = code.as_bytes();
+    for (index, _) in code.match_indices(fn_name) {
+        let boundary_before = index == 0 || {
+            let before = bytes[index - 1] as char;
+            !(before.is_ascii_alphanumeric() || before == '_')
+        };
+        let after_index = index + fn_name.len();
+        let boundary_after = after_index >= bytes.len() || {
+            let following = bytes[after_index] as char;
+            !(following.is_ascii_alphanumeric() || following == '_')
+        };
+        if !boundary_before || !boundary_after {
+            continue;
+        }
+        let before_text = &code[..index];
+        if before_text.ends_with("fn ") {
+            continue; // the declaration site — the only allowed shape
+        }
+        if before_text.ends_with('.') || before_text.ends_with("::") {
+            return true; // method call, UFCS/path call, or fn-item binding
+        }
+        if code[after_index..].trim_start().starts_with('(') {
+            return true; // bare call
+        }
+    }
+    false
 }
 
 /// Recursively collects every `.rs` file under `dir` whose path contains
@@ -321,13 +417,23 @@ fn derive_alerts_sender_fns(code: &str) -> Vec<String> {
     names
 }
 
-/// Lines of (comment-stripped) `code` that mention `/alerts` WITHOUT being
-/// a `DHAN_ALERTS_`-prefixed constant — the constants.rs naming ratchet
-/// (a rogue-named constant carrying the path would be invisible to the
-/// api_client.rs census, which counts `DHAN_ALERTS_` by prefix).
+/// Lines of (comment-stripped) `code` that mention `/alerts` WITHOUT
+/// DECLARING a `DHAN_ALERTS_`-prefixed constant — the constants.rs naming
+/// ratchet (a rogue-named constant carrying the path would be invisible to
+/// the api_client.rs census, which counts `DHAN_ALERTS_` by prefix).
+/// Round-3 hardening: the declared IDENTIFIER after `pub const ` is parsed
+/// — a mere same-line MENTION of the prefix (e.g. a camouflage
+/// `// DHAN_ALERTS_ family` trailing comment on a rogue-named constant)
+/// previously satisfied a substring contains-check.
 fn alerts_naming_violations(code: &str) -> Vec<String> {
     code.lines()
-        .filter(|line| line.contains("/alerts") && !line.contains("DHAN_ALERTS_"))
+        .filter(|line| line.contains("/alerts"))
+        .filter(|line| {
+            !line
+                .trim_start()
+                .strip_prefix("pub const ")
+                .is_some_and(|declared| declared.starts_with("DHAN_ALERTS_"))
+        })
         .map(|line| line.trim().to_string())
         .collect()
 }
@@ -481,8 +587,11 @@ fn test_every_alerts_sender_checks_gate_first() {
 
     // BOTH census sides count the SAME comment-stripped text (round-2: a
     // full-line comment containing `self.require_alerts_gate(` must never
-    // inflate the gate side and balance a genuinely ungated URL site).
-    let code = strip_full_line_comments(production);
+    // inflate the gate side and balance a genuinely ungated URL site;
+    // round-3: TRAILING comments are stripped too — outside string
+    // literals — so a `… // self.require_alerts_gate(` decoy cannot
+    // either).
+    let code = strip_comments(production);
 
     let gate_calls = count_occurrences(&code, "self.require_alerts_gate(");
     assert_eq!(
@@ -704,17 +813,18 @@ fn test_alerts_paths_single_choke_point() {
     // api_client.rs census.
     //
     // (a) constants.rs naming ratchet: every CODE line mentioning `/alerts`
-    //     must be a DHAN_ALERTS_*-prefixed constant — the api_client census
-    //     counts alerts constants by the `DHAN_ALERTS_` prefix, so a
-    //     rogue-named `DHAN_COND_ORDERS = "/alerts/orders"` constant would
-    //     otherwise be invisible to it.
+    //     must DECLARE a `pub const DHAN_ALERTS_*` (identifier parsed —
+    //     round-3) — the api_client census counts alerts constants by the
+    //     `DHAN_ALERTS_` prefix, so a rogue-named
+    //     `DHAN_COND_ORDERS = "/alerts/orders"` constant would otherwise
+    //     be invisible to it.
     let constants_source = fs::read_to_string("../common/src/constants.rs")
         .expect("constants.rs must be readable for the alerts naming ratchet");
-    let constants_code = strip_full_line_comments(production_region(&constants_source));
+    let constants_code = strip_comments(production_region(&constants_source));
     let naming_violations = alerts_naming_violations(&constants_code);
     assert!(
         naming_violations.is_empty(),
-        "every constants.rs code line carrying `/alerts` must be a \
+        "every constants.rs code line carrying `/alerts` must DECLARE a \
          DHAN_ALERTS_*-prefixed constant (test 3's census counts that \
          prefix). Violations:\n{}",
         naming_violations.join("\n")
@@ -726,7 +836,7 @@ fn test_alerts_paths_single_choke_point() {
     for path in ["src/oms/types.rs", CONDITIONAL_RS] {
         let source = fs::read_to_string(path)
             .unwrap_or_else(|_| panic!("{path} must be readable for the choke-point guard"));
-        let file_code = strip_full_line_comments(production_region(&source));
+        let file_code = strip_comments(production_region(&source));
         for token in ["alerts/orders", "alerts/multi"] {
             assert_eq!(
                 count_occurrences(&file_code, token),
@@ -766,18 +876,58 @@ fn test_gate_guard_scanner_self_test() {
         "a bare #[cfg(test)] fn attribute must not truncate the production region"
     );
 
-    // A planted production caller IS detected.
+    // A planted production caller IS detected — in EVERY call shape
+    // (round-3: the `.name(`-only needle missed UFCS/path/bare shapes).
     let planted_caller = "fn wire() { client.place_multi_order(token, &req); }";
     assert_eq!(
         production_region_calls_alerts_sender(planted_caller),
         Some("place_multi_order"),
-        "scanner must detect a planted production sender call"
+        "scanner must detect a planted method-syntax sender call"
     );
     let planted_getter = "fn wire() { client.get_all_conditional_triggers(token); }";
     assert_eq!(
         production_region_calls_alerts_sender(planted_getter),
         Some("get_all_conditional_triggers"),
         "scanner must detect every sender token, GETs included"
+    );
+    let planted_ufcs = "async fn wire(c: &OrderApiClient) { OrderApiClient::place_multi_order(c, tok, &req).await; }";
+    assert_eq!(
+        production_region_calls_alerts_sender(planted_ufcs),
+        Some("place_multi_order"),
+        "scanner must detect a fully-qualified (UFCS) sender call"
+    );
+    let planted_binding = "fn wire() { let f = OrderApiClient::place_multi_order; }";
+    assert_eq!(
+        production_region_calls_alerts_sender(planted_binding),
+        Some("place_multi_order"),
+        "scanner must detect a fn-item path binding of a sender"
+    );
+    let planted_bare = "fn wire() { place_multi_order(&client, tok, &req); }";
+    assert_eq!(
+        production_region_calls_alerts_sender(planted_bare),
+        Some("place_multi_order"),
+        "scanner must detect a bare sender call"
+    );
+
+    // The declaration itself, a string-literal mention, and a doc-comment
+    // intra-link are NOT call shapes.
+    let declaration_only = "    pub async fn place_multi_order(&self) {}";
+    assert_eq!(
+        production_region_calls_alerts_sender(declaration_only),
+        None,
+        "the `fn name(` declaration must not count as a caller"
+    );
+    let string_mention = "fn gate() { refuse(\"place_multi_order\"); }";
+    assert_eq!(
+        production_region_calls_alerts_sender(string_mention),
+        None,
+        "a string-literal op label must not count as a caller"
+    );
+    let doc_link = "/// see [OrderApiClient::place_multi_order] for the sender\nfn ok() {}";
+    assert_eq!(
+        production_region_calls_alerts_sender(doc_link),
+        None,
+        "a doc-comment intra-link must not count as a caller"
     );
 
     // A clean source is NOT flagged.
@@ -797,17 +947,17 @@ fn test_gate_guard_scanner_self_test() {
     // inline positional, captured-identifier, and split-argument literals.
     let inline_shape = "let url = format!(\"{}/alerts/orders\", base);";
     assert_eq!(
-        count_occurrences(&strip_full_line_comments(inline_shape), "/alerts"),
+        count_occurrences(&strip_comments(inline_shape), "/alerts"),
         1
     );
     let captured_shape = "let url = format!(\"{base}/alerts/orders\");";
     assert_eq!(
-        count_occurrences(&strip_full_line_comments(captured_shape), "/alerts"),
+        count_occurrences(&strip_comments(captured_shape), "/alerts"),
         1
     );
     let split_arg_shape = "let url = format!(\"{}{}\", base, \"/alerts/orders\");";
     assert_eq!(
-        count_occurrences(&strip_full_line_comments(split_arg_shape), "/alerts"),
+        count_occurrences(&strip_comments(split_arg_shape), "/alerts"),
         1
     );
     // A NEW DHAN_ALERTS_* constant (the flagged inline-path retrofit
@@ -816,16 +966,13 @@ fn test_gate_guard_scanner_self_test() {
         "let url = format!(\"{}{}\", base, constants::DHAN_ALERTS_ORDERS_PATH);";
     assert_eq!(count_occurrences(new_constant_shape, "DHAN_ALERTS_"), 1);
 
-    // strip_full_line_comments removes doc mentions but keeps code —
+    // strip_comments removes doc mentions but keeps code —
     // including string literals carrying `://` (never a comment start).
     let doc_only = "/// POST /v2/alerts/orders doc";
-    assert_eq!(
-        count_occurrences(&strip_full_line_comments(doc_only), "/alerts"),
-        0
-    );
+    assert_eq!(count_occurrences(&strip_comments(doc_only), "/alerts"), 0);
     let doc_plus_code = "/// see /alerts docs\nlet u = \"https://x/alerts\";";
     assert_eq!(
-        count_occurrences(&strip_full_line_comments(doc_plus_code), "/alerts"),
+        count_occurrences(&strip_comments(doc_plus_code), "/alerts"),
         1
     );
 
@@ -955,17 +1102,63 @@ fn test_gate_guard_scanner_self_test() {
     let commented_gate = "// callers must self.require_alerts_gate(..) first\n\
                           let url = \"/alerts/orders\";";
     assert_eq!(
-        count_occurrences(
-            &strip_full_line_comments(commented_gate),
-            "self.require_alerts_gate("
-        ),
+        count_occurrences(&strip_comments(commented_gate), "self.require_alerts_gate("),
         0,
         "a commented-out gate call must not count as a gate site"
     );
 
     // ------------------------------------------------------------------
+    // strip_trailing_comment — the round-3 trailing-decoy fix: a TRAILING
+    // comment carrying the gate token must NOT inflate the census either,
+    // while string literals (incl. `://` and char literals like '"')
+    // survive the cut.
+    // ------------------------------------------------------------------
+    let trailing_decoy = "let _op = \"del\"; // self.require_alerts_gate(_op)";
+    assert_eq!(
+        count_occurrences(&strip_comments(trailing_decoy), "self.require_alerts_gate("),
+        0,
+        "a TRAILING-comment gate decoy must not count as a gate site"
+    );
+    let url_with_trailing = "let u = \"https://x/alerts\"; // note";
+    let stripped_url = strip_comments(url_with_trailing);
+    assert_eq!(
+        count_occurrences(&stripped_url, "/alerts"),
+        1,
+        "a `://` string literal must survive a trailing-comment cut"
+    );
+    assert!(
+        !stripped_url.contains("note"),
+        "the trailing comment itself must be removed"
+    );
+    let char_literal_line = "let q = after.find('\"'); // self.require_alerts_gate(late)";
+    let stripped_char = strip_comments(char_literal_line);
+    assert_eq!(
+        count_occurrences(&stripped_char, "self.require_alerts_gate("),
+        0,
+        "a char literal '\"' must not derail the string tracker"
+    );
+    assert!(
+        stripped_char.contains("after.find"),
+        "code before the trailing comment must be kept"
+    );
+    let escaped_char_literal = "let s = m.strip('\\n'); // self.require_alerts_gate(x)";
+    assert_eq!(
+        count_occurrences(
+            &strip_comments(escaped_char_literal),
+            "self.require_alerts_gate("
+        ),
+        0,
+        "an escaped char literal must not derail the string tracker"
+    );
+    assert_eq!(
+        strip_trailing_comment("let a = &'static str; // gone"),
+        "let a = &'static str;",
+        "a lifetime tick must not open a char literal"
+    );
+
+    // ------------------------------------------------------------------
     // alerts_naming_violations — a rogue-named constant carrying /alerts
-    // is flagged; the DHAN_ALERTS_* spelling is not.
+    // is flagged (camouflaged or not); the DHAN_ALERTS_* DECLARATION is not.
     // ------------------------------------------------------------------
     let rogue_constant = "pub const DHAN_COND_ORDERS: &str = \"/alerts/orders\";";
     assert_eq!(
@@ -973,11 +1166,34 @@ fn test_gate_guard_scanner_self_test() {
         1,
         "a /alerts constant without the DHAN_ALERTS_ prefix must be flagged"
     );
+    // Round-3: a camouflage trailing comment MENTIONING the prefix must not
+    // satisfy the ratchet — the declared identifier is what counts.
+    let camouflaged_rogue =
+        "pub const DHAN_COND_ORDERS: &str = \"/alerts/orders\"; // DHAN_ALERTS_ family";
+    assert_eq!(
+        alerts_naming_violations(camouflaged_rogue).len(),
+        1,
+        "a rogue-named /alerts constant with a DHAN_ALERTS_ camouflage \
+         comment must still be flagged (identifier parse, not substring)"
+    );
+    // A non-declaration code line carrying the path is flagged too.
+    let non_declaration = "let sneaky = \"/alerts/orders\"; // DHAN_ALERTS_";
+    assert_eq!(
+        alerts_naming_violations(non_declaration).len(),
+        1,
+        "a non-`pub const` code line carrying /alerts must be flagged"
+    );
     let proper_constant =
         "pub const DHAN_ALERTS_MULTI_ORDERS_PATH: &str = \"/alerts/multi/orders\";";
     assert!(
         alerts_naming_violations(proper_constant).is_empty(),
         "a DHAN_ALERTS_*-prefixed constant is the allowed spelling"
+    );
+    let proper_with_trailing_comment =
+        "pub const DHAN_ALERTS_ORDERS_PATH: &str = \"/alerts/orders\"; // family path";
+    assert!(
+        alerts_naming_violations(proper_with_trailing_comment).is_empty(),
+        "a trailing comment on a properly-declared constant must not flag"
     );
 
     // enum_body extracts only the first block's body.

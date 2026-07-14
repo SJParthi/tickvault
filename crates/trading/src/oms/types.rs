@@ -1668,8 +1668,14 @@ pub struct DhanMultiOrderRequest {
     pub orders: Vec<MultiOrderLeg>,
 }
 
-/// Multi-order response — YAML-ONLY schema, UNVERIFIED-LIVE. Parse tolerantly.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+/// Multi-order response — YAML-ONLY schema, UNVERIFIED-LIVE. Parse
+/// tolerantly. `Default` (empty `orders`) is the documented-plausible
+/// BODYLESS-200 arm: the PORTAL page documents NO response body at all
+/// ("200 Successful operation" only), and `place_multi_order` degrades an
+/// empty/whitespace 200 body to this default instead of a `JsonError`
+/// brick — a parse error for an already-placed batch would push callers
+/// toward a double-placing retry.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DhanMultiOrderResponse {
     /// Per-leg order results (`null` tolerated → empty — a 200 body means
@@ -3186,9 +3192,15 @@ mod tests {
     }
 
     #[test]
-    fn test_multi_order_response_empty_body_defaults() {
+    fn test_multi_order_response_empty_object_defaults() {
+        // An empty JSON OBJECT (`{}`) defaults every field. (A truly EMPTY
+        // 200 body — the PORTAL-documented no-body shape — never reaches
+        // serde: `place_multi_order` returns `DhanMultiOrderResponse::default()`
+        // for empty/whitespace bodies; see the api_client.rs sender tests.)
         let resp: DhanMultiOrderResponse = serde_json::from_str("{}").unwrap();
         assert!(resp.orders.is_empty());
+        // The bodyless-200 arm's default is the same empty-orders shape.
+        assert!(DhanMultiOrderResponse::default().orders.is_empty());
     }
 
     #[test]

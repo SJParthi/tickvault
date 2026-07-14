@@ -1,11 +1,17 @@
 //! Dhan API endpoint coverage tests.
 //!
-//! Verifies that all 57 Dhan API endpoints have URL constants or are
-//! documented as intentionally skipped. Prevents endpoint drift where
-//! new endpoints are added to api_client.rs using inline strings without
-//! corresponding constants in constants.rs.
+//! Verifies the 43 known Dhan API endpoint URLs/path templates: 19
+//! constants-backed paths, 19 inline path templates in api_client.rs
+//! (MEASURED by a source scan — round-3 fix 2026-07-14: the inline count
+//! was previously a hardcoded scalar nothing reconciled against the actual
+//! file), 1 overlap (`/positions`), 2 WebSocket URLs, and 4 intentionally
+//! skipped endpoints. Prevents endpoint drift where new endpoints are
+//! added to api_client.rs using inline strings without this ledger (and
+//! its constants) being updated.
 //!
 //! Reference: docs/dhan-ref/*.md (21 reference files)
+
+use std::fs;
 
 use tickvault_common::constants::{
     // Conditional & Multi Order (1) — 2026-07-14
@@ -351,24 +357,85 @@ fn test_skipped_endpoints_documented() {
 // Test: OMS endpoints that use inline paths in api_client.rs
 // ---------------------------------------------------------------------------
 
+/// Extracts the unique inline URL path TEMPLATES built in api_client.rs'
+/// production region: every string literal of the `"{}<path>"` URL-build
+/// shape (`format!("{}/orders/{}", self.base_url, order_id)` →
+/// `/orders/{}`). Query strings are cut at `?`; `{}` placeholders are kept
+/// so parameterized templates count distinctly; constants-backed sites
+/// (`format!("{}{}", base, constants::DHAN_*_PATH)`) carry NO literal path
+/// after the base placeholder and are deliberately NOT extracted (they are
+/// the constants side of the ledger). Returns a sorted, deduped set.
+fn extract_inline_url_templates(production: &str) -> Vec<String> {
+    let mut templates = std::collections::BTreeSet::new();
+    let needle = "\"{}/";
+    let mut search_from = 0;
+    while let Some(position) = production[search_from..].find(needle) {
+        // Path starts at the '/' after the `"{}` base placeholder.
+        let path_start = search_from + position + 3;
+        let rest = &production[path_start..];
+        let end = rest.find('"').unwrap_or(rest.len());
+        let raw = &rest[..end];
+        let template = raw.split('?').next().unwrap_or(raw);
+        templates.insert(template.to_string());
+        search_from = path_start + end;
+    }
+    templates.into_iter().collect()
+}
+
+/// Self-test for [`extract_inline_url_templates`] (vacuous-pass defense):
+/// the extractor must see inline templates (incl. parameterized and
+/// query-string shapes), dedup repeats, and skip constants-backed sites.
+#[test]
+fn test_inline_template_extractor_self_test() {
+    let synthetic = concat!(
+        "let a = format!(\"{}/orders\", self.base_url);\n",
+        "let b = format!(\"{}/orders/{}\", self.base_url, order_id);\n",
+        "let c = format!(\"{}/orders\", self.base_url);\n", // dup of a
+        "let d = format!(\"{}/ledger?from-date={}&to-date={}\", self.base_url, f, t);\n",
+        "let e = format!(\"{}{}\", self.base_url, constants::DHAN_HOLDINGS_PATH);\n",
+    );
+    assert_eq!(
+        extract_inline_url_templates(synthetic),
+        vec![
+            "/ledger".to_string(),
+            "/orders".to_string(),
+            "/orders/{}".to_string()
+        ],
+        "extractor must dedup, strip query strings, keep {{}} params, and \
+         skip constants-backed sites"
+    );
+}
+
 /// Verifies the OMS REST endpoint ledger for the trading surface.
 ///
-/// TWO DISTINCT COUNTS, kept honest (2026-07-14 round-2 reconciliation —
-/// the prior header conflated them as "35 endpoints used in api_client.rs"):
+/// TWO DISTINCT COUNTS, kept honest (2026-07-14 round-3 reconciliation —
+/// the round-2 header's "35 unique paths = 16 inline + 19 constants"
+/// arithmetic was irreproducible: its own breakdown tables enumerate 18
+/// unique inline templates, the real api_client.rs carries 19 — incl.
+/// get_positions' inline `/positions`, which the header mislabeled
+/// constants-backed — and `websocket_count = 4` contradicted this file's
+/// own two-WS test):
 ///
-/// * **35 unique endpoint PATHS** = 16 inline base paths built in
-///   api_client.rs (e.g., `format!("{}/orders", base_url)`) + 19
-///   constants-backed `DHAN_*_PATH` paths from constants.rs. The
+/// * **37 unique endpoint path TEMPLATES** = 19 inline templates built in
+///   api_client.rs (MEASURED below by a source scan of its production
+///   region, pinned against an explicit list) + 19 constants-backed
+///   `DHAN_*_PATH` paths from constants.rs − 1 overlap (`/positions` is
+///   BOTH inline in get_positions AND constants-backed in
+///   exit_all_positions; the inline retrofit is a flagged follow-up). The
 ///   constants are consumed ACROSS the workspace — api_client.rs for the
 ///   OMS families, but also core (auth/RenewToken/ip/charts) and app
 ///   (option-chain per-minute pull) — NOT all "in api_client.rs".
 /// * **38 per-method REST OPERATIONS** enumerated in the breakdown below
 ///   (several operations share one path, e.g. PUT/DELETE/GET on
 ///   /orders/{order-id}) — plus exit-all's DELETE reusing the shared
-///   /positions path as a 39th operation on an already-counted path.
+///   /positions path as a 39th operation on an already-counted path. The
+///   operations list scopes the OMS/option-chain/portfolio/funds/control
+///   families; the auth/ip/charts/profile constants are single-operation
+///   paths counted on the constants side.
 ///
-/// The inline paths are documented here to detect accidental changes or
-/// omissions.
+/// The inline templates are MEASURED from the file, so the ledger's
+/// drift-detection purpose is mechanical: a new inline endpoint (or a
+/// template change) fails the pinned-set equality below.
 ///
 /// The 38 listed operations break down as:
 /// - Orders (9): place, modify, cancel, order-book, single-order, by-correlation, trade-book, trades-by-order, slicing
@@ -381,20 +448,24 @@ fn test_skipped_endpoints_documented() {
 ///   deleted 2026-06-28, REBUILT 2026-07-12 as the app-crate per-minute
 ///   scheduled pull (crates/app/src/option_chain_1m_boot.rs; counted in the
 ///   19 constants, NOT in api_client.rs)
-/// - Portfolio via constant (3): holdings, positions, positions/convert
+/// - Portfolio (3): holdings + positions/convert via constants;
+///   get-positions builds INLINE `/positions` (round-3 truth-sync — the
+///   prior "via constant" label was wrong for this one; exit-all is the
+///   consumer of DHAN_POSITIONS_PATH, and the inline retrofit is a flagged
+///   follow-up)
 /// - Funds/margin via constant (3): margin-calc, margin-multi, fund-limit
 /// - Trader's control via constant (2): killswitch, pnl-exit
 /// - Exit-all (DELETE /positions) reuses DHAN_POSITIONS_PATH — a distinct
-///   operation on a path already inside the 35 (asserted below, not part
+///   operation on a path already inside the 37 (asserted below, not part
 ///   of the 38-item list)
 ///
-/// Total unique paths: 19 (constants — incl. /alerts/multi/orders added
-/// 2026-07-14 and the 2 option-chain constants, live since the 2026-07-12
-/// §8 rebuild) + 16 (inline in api_client.rs) = 35
-/// Plus 4 WebSocket URLs = 39 endpoint URLs
-/// Plus 14 parameterized variants (e.g., /orders/{id}) that share base paths
-/// Grand ledger total: 57 = 53 implemented endpoint URLs/variants
-/// (35 paths + 14 variants + 4 WebSocket) + 4 intentionally skipped
+/// Total unique path templates: 19 (constants — incl. /alerts/multi/orders
+/// added 2026-07-14 and the 2 option-chain constants, live since the
+/// 2026-07-12 §8 rebuild) + 19 (inline in api_client.rs, MEASURED) − 1
+/// (the /positions overlap) = 37
+/// Plus 2 WebSocket URLs (the two-WS lock — `test_all_websocket_urls_defined`
+/// in THIS file; the round-2 scalar 4 contradicted it) = 39 implemented
+/// Grand ledger total: 43 = 39 implemented + 4 intentionally skipped
 #[test]
 fn test_oms_inline_endpoint_paths_documented() {
     // --- Orders (docs/dhan-ref/07-orders.md) ---
@@ -508,38 +579,96 @@ fn test_oms_inline_endpoint_paths_documented() {
         "Exit-all shares the /positions path (DELETE method)"
     );
 
-    // --- Grand total ---
-    // 19 constants-backed REST endpoints
-    // 2026-07-14: +1 /alerts/multi/orders (Conditional & Multi Order family)
-    // 2026-07-14 review fix: +2 option-chain constants (LIVE since the
-    //   2026-07-12 §8 rebuild in crates/app — the prior 17/51/55 totals
-    //   undercounted reality by exactly these 2)
-    // + 16 inline base paths in api_client.rs (the OMS inline set; the 2
-    //   option-chain paths moved from the deleted core client's local
-    //   constants to constants.rs, so they count in the 19, never here)
-    // + 14 parameterized variants ({order-id}, {correlation-id}, {alertId}, {isin}, {leg}, {dates})
-    // + 4 WebSocket endpoints
+    // --- Inline template census (MEASURED — round-3 fix 2026-07-14) ---
+    // Nothing previously counted the actual file: the round-2 "16 inline"
+    // scalar was irreproducible narrative (the file carries 19 unique
+    // inline templates, and the breakdown tables enumerated 18). The scan
+    // + pinned-set equality below make inline-endpoint drift mechanical.
+    let api_client_source = fs::read_to_string("../trading/src/oms/api_client.rs")
+        .expect("api_client.rs must be readable for the inline endpoint census");
+    let production = api_client_source
+        .split("#[cfg(test)]\nmod tests")
+        .next()
+        .expect("split always yields a first segment");
+    let inline_templates = extract_inline_url_templates(production);
+    let expected_inline_templates: [&str; 19] = [
+        "/alerts/orders",
+        "/alerts/orders/{}",
+        "/edis/form",
+        "/edis/inquire/{}",
+        "/edis/tpin",
+        "/forever/orders",
+        "/forever/orders/{}",
+        "/ledger",
+        "/orders",
+        "/orders/external/{}",
+        "/orders/slicing",
+        "/orders/{}",
+        "/positions",
+        "/super/orders",
+        "/super/orders/{}",
+        "/super/orders/{}/{}",
+        "/trades",
+        "/trades/{}",
+        "/trades/{}/{}/{}",
+    ];
+    assert_eq!(
+        inline_templates, expected_inline_templates,
+        "the MEASURED api_client.rs inline URL template set must equal the \
+         pinned 19-template ledger — a new/changed inline endpoint updates \
+         this list (and the totals below) in the same PR"
+    );
+    let parameterized_inline = inline_templates
+        .iter()
+        .filter(|template| template.contains("{}"))
+        .count();
+    assert_eq!(
+        parameterized_inline, 9,
+        "9 of the 19 inline templates are parameterized ({{}} path segments)"
+    );
+    // The single constants↔inline overlap: get_positions builds an INLINE
+    // /positions while exit_all_positions consumes DHAN_POSITIONS_PATH
+    // (the inline retrofit is a flagged follow-up).
+    assert!(
+        inline_templates.iter().any(|t| t == "/positions"),
+        "the /positions overlap template must be in the inline set"
+    );
+
+    // --- Grand total (every scalar reproducible from this file) ---
+    // 19 constants-backed REST endpoints (pinned by
+    //   test_all_dhan_rest_endpoint_constants_defined; incl.
+    //   /alerts/multi/orders 2026-07-14 + the 2 option-chain constants,
+    //   live since the 2026-07-12 §8 rebuild)
+    // + 19 inline templates in api_client.rs (MEASURED above)
+    // − 1 overlap (/positions: inline get_positions + constants exit-all)
+    // + 2 WebSocket endpoints (the two-WS lock —
+    //   test_all_websocket_urls_defined; the round-2 scalar 4 contradicted
+    //   that test in this same file)
     let constants_rest_count: usize = 19;
-    let inline_base_paths: usize = 16; // unique base paths in api_client.rs
-    let parameterized_variants: usize = 14; // {id} variants
-    let websocket_count: usize = 4;
+    let inline_template_count = inline_templates.len();
+    let overlap_paths: usize = 1; // "/positions"
+    let websocket_count: usize = 2;
     let skipped_count: usize = 4;
 
-    let total_implemented =
-        constants_rest_count + inline_base_paths + parameterized_variants + websocket_count;
+    let unique_path_templates = constants_rest_count + inline_template_count - overlap_paths;
     assert_eq!(
-        total_implemented, 53,
-        "53 implemented endpoint URLs/variants (35 unique paths + 14 \
-         parameterized variants + 4 WebSocket; /alerts/multi/orders added \
-         2026-07-14; option-chain's 2 constants re-counted 2026-07-14 — \
-         live since the 2026-07-12 §8 rebuild)"
+        unique_path_templates, 37,
+        "37 unique endpoint path templates (19 constants + 19 measured \
+         inline − the /positions overlap)"
+    );
+
+    let total_implemented = unique_path_templates + websocket_count;
+    assert_eq!(
+        total_implemented, 39,
+        "39 implemented endpoint URLs/templates (37 unique path templates \
+         + 2 WebSocket URLs)"
     );
 
     // Plus the 4 intentionally skipped = total Dhan API endpoints known
     let total_known = total_implemented + skipped_count;
     assert_eq!(
-        total_known, 57,
-        "57 total known Dhan API endpoint URLs/variants (53 implemented + 4 skipped)"
+        total_known, 43,
+        "43 total known Dhan API endpoint URLs/templates (39 implemented + 4 skipped)"
     );
 }
 

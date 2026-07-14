@@ -241,9 +241,13 @@ Other clusters (checked off by their owning sessions' PRs, all referencing THIS 
     auto-stamped "1".."N" sequences, paise-integer price inputs — exact string formatting for
     conditional legs, capped paise→f64 for multi legs).
   - Ledger + docs: dhan_api_coverage conditional 5→6, rest_paths/constants 16→17→19, totals
-    50→51→53/54→55→57 + header (lockstep; review round 1 fix 2026-07-14: the 2 LIVE option-chain
-    constants — §8 rebuild, app-crate scheduled pull — were absent and falsely narrated
-    "no longer implemented"); `DHAN_ALERTS_MULTI_ORDERS_PATH` constant + the constants.rs
+    re-derived (review round 1 fix 2026-07-14: the 2 LIVE option-chain constants — §8 rebuild,
+    app-crate scheduled pull — were absent and falsely narrated "no longer implemented";
+    review round 3 fix 2026-07-14: the 53/57 path-side arithmetic was irreproducible — the
+    inline set is now MEASURED by a source scan of api_client.rs' production region and
+    pinned as 19 templates incl. get_positions' inline /positions, websocket_count corrected
+    4→2 per the file's own two-WS test, honest totals 37 unique path templates / 39
+    implemented / 43 known); `DHAN_ALERTS_MULTI_ORDERS_PATH` constant + the constants.rs
     slash-test array; NEW `.claude/rules/dhan/conditional-trigger.md` (closes the CLAUDE.md
     index drift; 18 mechanical rules incl. the multi-order divergence traps, UTC-Z, bare-array
     GET-all, ONCE-vs-ALWAYS, no-CONFIRM); dated `2026-07-14 Upstream Update (2)` append to
