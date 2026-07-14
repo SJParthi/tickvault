@@ -100,8 +100,13 @@ REAL wall clock (including that wait) sits inside
 operator's ≤~15s decision-data window. A refused retry is COUNTED
 (`tv_chain1m_retry_total{outcome="skipped_ceiling"}`) + coded (CHAIN-02
 `stage="retry_skipped_ceiling"` warn), never silent. NEVER retried: `Found`,
-`Entitlement` (a retry RETURNING Entitlement is honored → EntitlementStop,
-CHAIN-01 owns the day), the no-token minute, persist failures (our side).
+`Entitlement` (per-UNDERLYING precision, refuter round 2 LOW-1: an
+entitlement reject is never retried FOR THAT UNDERLYING; sibling
+underlyings' already-eligible `Empty`/`Failed` retries in that same minute
+may still fire once each before the day-stop engages — bounded ≤2 extra
+requests, once per day, each a harmless reject; a retry RETURNING
+Entitlement is honored → EntitlementStop, CHAIN-01 owns the day), the
+no-token minute, persist failures (our side).
 The retry's outcome REPLACES the first pass's for ALL downstream processing —
 `tv_chain1m_fetch_total` counts the minute-FINAL outcome per underlying;
 `tv_chain1m_retry_total{outcome="recovered"|"still_failed"}` counts the retry
@@ -154,6 +159,14 @@ with ok≥1 while a sibling is empty) is two DISTINCT wanted signals (the
 #1537 documented case). A supervisor respawn resets the streak — documented
 ~10-minute worst-case re-detection envelope (~doubled on a mid-episode
 respawn).
+
+**Recovery-ping asymmetry (refuter round 2 LOW-2, honest note):** if a
+paged (not-served-latched) underlying recovers (`Found`) in the SAME minute
+a sibling triggers the entitlement day-stop, the verdict sink is skipped
+for that minute — the falling-edge `Chain1mUnderlyingServedRecovered` Info
+ping is NOT emitted; the day-stop's CHAIN-01 page supersedes it. Cosmetic
+only: the tracker state is run-scoped, so no stale streak carries into the
+next session.
 
 **Delivery boundary (honest):** CHAIN-02 / SPOT1M-01 stay log-sink-only
 (`rest-1m-pipeline-error-codes.md` §3); the typed

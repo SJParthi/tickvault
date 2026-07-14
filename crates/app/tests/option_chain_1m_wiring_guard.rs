@@ -535,6 +535,12 @@ fn ratchet_trading_day_flip_exits_are_coded() {
 /// satisfy the pin (refuter round 1, HIGH). A hard cap of 8 non-empty
 /// lines (the multi-line `error!` message body + `);` span ≤ 5 today)
 /// backstops pathological formatting.
+///
+/// Honest envelope (refuter round 2, F1): this is a SOURCE-scan — it pins
+/// the `return` textually, not behaviorally. A deliberately adversarial
+/// shape (e.g. wrapping the return in `if false { ... }`) defeats a text
+/// scan and clippy alike; the ratchet targets accidental deletion /
+/// refactor drift, not malice.
 #[test]
 fn ratchet_trading_day_flip_exits_return_immediately() {
     for (name, rel, expected_sites) in [
