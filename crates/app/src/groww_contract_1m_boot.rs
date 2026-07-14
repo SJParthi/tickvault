@@ -129,6 +129,7 @@ use tickvault_common::constants::{
     SPOT_1M_REST_LAST_FIRE_SECS_OF_DAY_IST,
 };
 use tickvault_common::error_code::ErrorCode;
+use tickvault_common::moneyness::classify_moneyness_for;
 use tickvault_common::sanitize::capture_rest_error_body;
 use tickvault_common::trading_calendar::TradingCalendar;
 use tickvault_core::feed::groww::instruments::{
@@ -913,7 +914,20 @@ fn build_contract_row(
     contract: &GrowwSelectedContract,
     trading_date_nanos: i64,
     close_to_data_ms: i64,
+    anchor_spot: Option<f64>,
 ) -> OptionContract1mRestRow {
+    // Moneyness (2026-07-14): classified against the CHAIN leg's fresh
+    // anchor LTP (the ≤5-min staleness gate already applied upstream) —
+    // anchor-relative, not candle-minute-exact, and the anchor value is
+    // persisted alongside (`underlying_spot`) so the label is auditable
+    // from the row alone. No fresh anchor → 0.0 → UNKNOWN (the guarded
+    // classifier maps a non-positive spot to UNKNOWN; ALL strike/price
+    // arithmetic lives in tickvault_common::moneyness — this fn only
+    // calls it, the parse-only strike discipline stands). DB-only: the
+    // contract leg deliberately publishes NO RAM snapshot (the chain
+    // snapshot one watch-signal earlier is its strict superset with a
+    // fresher spot — one authoritative RAM source per underlying).
+    let spot = anchor_spot.unwrap_or(0.0);
     OptionContract1mRestRow {
         ts_ist_nanos: candle.minute_ts_ist_nanos,
         trading_date_ist_nanos: trading_date_nanos,
@@ -932,6 +946,9 @@ fn build_contract_row(
         oi: candle.oi,
         close_to_data_ms,
         fetched_at_ist_nanos: fetched_at_ist_nanos_now(),
+        underlying_spot: spot,
+        moneyness: classify_moneyness_for(contract.underlying, contract.leg, contract.strike, spot)
+            .as_str(),
     }
 }
 
@@ -1228,6 +1245,7 @@ async fn fire_one_groww_contract_minute(
                             contract,
                             trading_date_nanos,
                             real_delay,
+                            anchors.get(contract.underlying).copied(),
                         )) {
                             Ok(()) => {
                                 metrics::counter!("tv_groww_contract1m_backfilled_total")
@@ -1310,6 +1328,7 @@ async fn fire_one_groww_contract_minute(
                                 contract,
                                 trading_date_nanos,
                                 close_to_data_ms,
+                                anchors.get(contract.underlying).copied(),
                             )) {
                                 Ok(()) => {
                                     ok_count = ok_count.saturating_add(1);
@@ -2560,13 +2579,28 @@ mod tests {
             volume: 1_000,
             oi: 5_000,
         };
-        let row = build_contract_row(&candle, &contract, 1_769_990_400_000_000_000, 1_842);
+        let row = build_contract_row(
+            &candle,
+            &contract,
+            1_769_990_400_000_000_000,
+            1_842,
+            Some(25_251.10),
+        );
         assert_eq!(row.security_id, 66_825);
         assert_eq!(row.exchange_segment, "NSE_FNO");
         assert_eq!(row.groww_symbol, "NSE-NIFTY-16Jul26-25100-CE");
         assert_eq!(row.oi, 5_000);
         assert_eq!(row.close_to_data_ms, 1_842);
         assert_eq!(row.ts_ist_nanos, candle.minute_ts_ist_nanos);
+        // Moneyness (2026-07-14): 25100 CE vs the 25251.10 anchor spot —
+        // strike < spot → ITM; the anchor value is persisted for audit.
+        assert_eq!(row.underlying_spot, 25_251.10);
+        assert_eq!(row.moneyness, "ITM");
+        // No fresh anchor → 0.0 spot + UNKNOWN (fail-soft, never dropped).
+        let no_anchor =
+            build_contract_row(&candle, &contract, 1_769_990_400_000_000_000, 1_842, None);
+        assert_eq!(no_anchor.underlying_spot, 0.0);
+        assert_eq!(no_anchor.moneyness, "UNKNOWN");
 
         let audit = build_contract_audit_row(
             row.ts_ist_nanos,
