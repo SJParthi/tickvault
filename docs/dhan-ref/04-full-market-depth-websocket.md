@@ -43,6 +43,17 @@ wss://full-depth-api.dhan.co/?token=<TOKEN>&clientId=<CLIENT_ID>&authType=2
 > AWS-lifecycle PR #4). This document is retained as API reference only. If depth is ever
 > re-authorized (rule-file edit + dated operator quote FIRST), live-probe BOTH paths.
 
+> **2026-07-14 update (runner-crawled, Verified-live):** the DOCS side is no longer
+> flip-flopping — the classic page has been STABLE at
+> `wss://full-depth-api.dhan.co/twohundreddepth?token=…&clientId=…&authType=2` across three
+> consecutive captures spanning six weeks (2026-06-02 snapshot → 2026-07-03 → 2026-07-13/14
+> runner runs 1–3, sha256 `6fdc8b09`), AND the NEW portal's full-market-depth guide pins the
+> SAME `/twohundreddepth` URL. Only the (older, 2026-04-06) SDK note above still supports the
+> root path. The primary listing above and the §11 comparison table still present the root
+> path; if this file is ever touched for a (currently-banned) depth re-authorization, stop
+> presenting the root path as the docs URL — and live-probe BOTH paths regardless.
+> Runtime-moot: depth FORBIDDEN FOREVER.
+
 | Parameter   | Required | Value                          |
 |-------------|----------|--------------------------------|
 | `token`     | Yes      | Access Token                   |

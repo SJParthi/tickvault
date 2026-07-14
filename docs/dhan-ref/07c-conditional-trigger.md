@@ -92,3 +92,22 @@ Status: `ACTIVE`, `TRIGGERED`, `EXPIRED`, `CANCELLED`
 3. **`frequency: "ONCE"`** — triggers once then deactivates.
 4. **Multiple orders** can be attached to a single condition.
 5. **Postback** updates sent to webhook URL when triggered.
+
+---
+
+## 2026-07-14 Upstream Update (runner-crawled live page)
+
+**Evidence tier: Verified-live.** Raw HTML of `https://dhanhq.co/docs/v2/conditional-trigger/`
+(runs 1–3, sha256 `f3ddbe28` content-identical, latest 2026-07-14T07:58:00Z). Full manifest:
+`00-COVERAGE-MANIFEST.md`.
+
+1. **Timeframe enum-literal vs example split:** the live param tables list "**DATE** ONE_MIN
+   FIVE_MIN FIFTEEN_MIN" while the Sample Value column and every JSON example use
+   `"timeFrame": "DAY"`. "DATE" is the literal enum text but almost certainly a doc typo —
+   use `DAY` (matches the repo list + the wire examples).
+2. **Field-name case split:** the param tables say `condition.timeframe` (lowercase f); the
+   JSON examples use `timeFrame`. The repo JSON (`timeFrame`) matches the wire examples.
+3. **UTC-Z timestamps (live-only):** get-by-ID/get-all responses carry
+   `createdTime`/`triggeredTime` in ISO-8601 UTC `Z` format ("2019-08-24T14:15:22Z") — the
+   ONLY UTC timestamps in the trading-API family (everything else is IST strings) — plus a
+   `lastPrice` field. Any future consumer must convert; do not assume IST here.
