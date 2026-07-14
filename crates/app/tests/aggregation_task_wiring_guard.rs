@@ -133,16 +133,30 @@ fn production_region(body: &str) -> &str {
     body
 }
 
-/// Slice the RAW window between a start anchor and (when found) an end
-/// anchor; panics with a named message when the start anchor is missing.
+/// Slice the RAW window between a start anchor and an end anchor.
+/// PANICS with a named message when EITHER anchor is missing (2026-07-14
+/// mutation-review LOW residual: a missing END anchor previously fell
+/// back SILENTLY to the open-ended rest of the file — so renaming the
+/// end-anchor marker AND de-spawning the block in one change re-opened
+/// the FIX-1 escape). `end_anchor = None` means deliberately open-ended.
 fn raw_window<'a>(src: &'a str, start_anchor: &str, end_anchor: Option<&str>) -> &'a str {
     let start = src.find(start_anchor).unwrap_or_else(|| {
         panic!("anchor `{start_anchor}` must exist — the task block was removed or renamed")
     }); // APPROVED: test
     let rest = &src[start..];
-    match end_anchor.and_then(|e| rest[start_anchor.len()..].find(e)) {
-        Some(rel_end) => &rest[..start_anchor.len() + rel_end],
+    match end_anchor {
         None => rest,
+        Some(e) => {
+            let rel_end = rest[start_anchor.len()..].find(e).unwrap_or_else(|| {
+                panic!(
+                    "end anchor `{e}` must exist after `{start_anchor}` — the \
+                     window boundary marker was removed or renamed (a silent \
+                     open-ended fallback would let a later needle rescue a \
+                     gutted block)"
+                )
+            }); // APPROVED: test
+            &rest[..start_anchor.len() + rel_end]
+        }
     }
 }
 
@@ -455,6 +469,42 @@ fn test_synthetic_end_anchored_window_catches_de_spawn() {
         Some("D2-pre:"),
     ));
     assert!(window.contains("tokio::spawn("));
+}
+
+/// End-anchor rename pin (2026-07-14 mutation-review LOW residual): a
+/// RENAMED end-anchor marker must PANIC loudly, never silently widen the
+/// window to the rest of the file (which would let a later spawn rescue
+/// a de-spawned block — the FIX-1 escape through the back door).
+#[test]
+fn test_synthetic_missing_end_anchor_panics_instead_of_widening() {
+    let renamed = "// --- Task 4: watermark-aware per-minute catch-up seal ---\n\
+                   let _dead = async move { catch_up_seal_all(cutoff); };\n\
+                   // D2-RENAMED: next section\n\
+                   fn later() { tokio::spawn(async move {}); }\n";
+    let result = std::panic::catch_unwind(|| {
+        raw_window(
+            renamed,
+            "Task 4: watermark-aware per-minute catch-up seal",
+            Some("D2-pre:"),
+        )
+        .len()
+    });
+    assert!(
+        result.is_err(),
+        "a missing/renamed END anchor must panic loudly — a silent \
+         open-ended fallback re-opens the FIX-1 de-spawn escape"
+    );
+    // The healthy shape still slices (no panic, later spawn excluded):
+    let healthy = "// --- Task 4: watermark-aware per-minute catch-up seal ---\n\
+                   tokio::spawn(async move {});\n\
+                   // D2-pre: next section\n\
+                   fn later() { tokio::spawn(async move {}); }\n";
+    let window = raw_window(
+        healthy,
+        "Task 4: watermark-aware per-minute catch-up seal",
+        Some("D2-pre:"),
+    );
+    assert!(window.contains("tokio::spawn(") && !window.contains("fn later()"));
 }
 
 /// FIX-3 synthetic pin (2026-07-14 mutation review): deleting the LIVE
