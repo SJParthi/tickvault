@@ -214,13 +214,13 @@ Other clusters (checked off by their owning sessions' PRs, all referencing THIS 
 Cluster B (branch claude/dhan-order-error-taxonomy; MINIMAL ADDITION — this
 cluster was absent from the original umbrella; flagged in the PR body):
 
-- [ ] B1 — order-path DH/DATA error taxonomy + per-endpoint retry matrix + 805 STOP-ALL latch + DH-904 ladder wiring
+- [x] B1 — order-path DH/DATA error taxonomy + per-endpoint retry matrix + 805 STOP-ALL latch + DH-904 ladder wiring
   - Files: crates/trading/src/oms/error_taxonomy.rs, api_client.rs, mod.rs, crates/common/src/constants.rs
   - Tests: ratchet_dh904_ladder_constants_and_wiring, ratchet_stop_all_cooldown_is_60s_per_annexure_rule_12, prop_classify_never_panics_and_is_deterministic_on_arbitrary_status_and_body
-- [ ] B2 — order-readiness gate (profile/token headroom, fail-closed, live-path-only) + probe refresher (boot spawn = seam handoff)
+- [x] B2 — order-readiness gate (profile/token headroom, fail-closed, live-path-only) + probe refresher (boot spawn = seam handoff)
   - Files: crates/trading/src/oms/order_readiness.rs, engine.rs, types.rs
   - Tests: test_place_order_live_refused_when_no_readiness_installed_zero_http_zero_token_fetch, test_place_order_dry_run_ignores_readiness_gate_byte_identical, test_evaluate_order_readiness_stale_boundary_2100_passes_2101_refuses
-- [ ] B3 — ORDER-READY-01 ErrorCode + rule file + OmsAlert DHAN attribution
+- [x] B3 — ORDER-READY-01 ErrorCode + rule file + OmsAlert DHAN attribution
   - Files: crates/common/src/error_code.rs, .claude/rules/project/order-readiness-error-codes.md, engine.rs
   - Tests: test_order_ready_01_contract, test_all_oms_alert_operator_messages_start_with_dhan_badge
 

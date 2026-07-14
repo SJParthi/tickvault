@@ -3847,7 +3847,8 @@ mod tests {
     /// LIVE place with NO readiness installed is fail-closed refused BEFORE any
     /// HTTP call or token fetch.
     #[tokio::test]
-    async fn test_place_order_live_refused_when_no_readiness_zero_http_zero_token() {
+    async fn test_place_order_live_refused_when_no_readiness_installed_zero_http_zero_token_fetch()
+    {
         let (mut oms, calls, _rot) = make_live_oms_counting("http://127.0.0.1:1");
         let result = oms.place_order(make_place_request()).await;
         assert!(matches!(
