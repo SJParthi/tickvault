@@ -34,6 +34,11 @@ pub mod brutex_crossverify_compare;
 // 15:50 IST I/O shell — S3 CSV fetch, QuestDB reads, compare orchestration,
 // persistence, Telegram summary + supervised spawn (Unit 7).
 pub mod brutex_crossverify_boot;
+// Judge-locked cadence scheduler boot wiring (2026-07-14): config-gated
+// dual-spawn of the supervised per-minute fire scheduler (dry-run
+// executors both lanes day 1 — no REST caller). Runbook:
+// `.claude/rules/project/cadence-error-codes.md`.
+pub mod cadence_boot;
 // Phase 0 Item 20 (wired 2026-06-13): supervised 15:25 IST orphan-position
 // watchdog — daily open-position safety gate (alert-only in sandbox/dry-run).
 pub mod orphan_position_watchdog_boot;

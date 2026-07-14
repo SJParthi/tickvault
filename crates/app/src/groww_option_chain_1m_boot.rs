@@ -106,6 +106,7 @@ use tickvault_common::constants::{
     SECONDS_PER_DAY, SPOT_1M_REST_LAST_FIRE_SECS_OF_DAY_IST,
 };
 use tickvault_common::error_code::ErrorCode;
+use tickvault_common::feed::Feed;
 use tickvault_common::sanitize::capture_rest_error_body;
 use tickvault_common::trading_calendar::TradingCalendar;
 use tickvault_core::feed::groww::instruments::{
@@ -131,8 +132,9 @@ use crate::groww_spot_1m_boot::{GrowwTokenCache, parse_groww_ga_failure};
 // verdict are REUSED from the Dhan chain leg (one implementation, two
 // feeds).
 use crate::option_chain_1m_boot::{
-    MAX_PLAUSIBLE_STRIKE, MAX_STRIKES_PER_CHAIN, chain_minute_fully_failed, stale_wake_backoff_ms,
-    wait_for_signal_or_fallback,
+    MAX_PLAUSIBLE_STRIKE, MAX_STRIKES_PER_CHAIN, MoneynessWarnLatches, chain_minute_fully_failed,
+    classify_chain_legs, publish_chain_moneyness_snapshot, record_chain_moneyness_observability,
+    stale_wake_backoff_ms, wait_for_signal_or_fallback,
 };
 use crate::spot_1m_rest_boot::{
     EdgeAction, FailureEdge, accumulation_within_cap, count_missed_boundaries,
@@ -1047,6 +1049,7 @@ async fn fire_one_groww_chain_minute(
     edge: &mut FailureEdge,
     not_served: &mut UnderlyingServedTracker,
     token_cache: &mut GrowwTokenCache,
+    moneyness_latches: &mut MoneynessWarnLatches,
     fire_secs_of_day: u32,
 ) {
     let minute_open_secs = fire_secs_of_day.saturating_sub(60);
@@ -1180,7 +1183,23 @@ async fn fire_one_groww_chain_minute(
                     }
                     let expiry_nanos = minute_open_ist_nanos(target.expiry, 0);
                     let fetched_at = fetched_at_ist_nanos_now();
-                    for leg in &chain.legs {
+                    // Moneyness (2026-07-14): the vendor-omitted-spot flag
+                    // short-circuits to 0.0 (mirrors the anchor-store gate
+                    // above — a missing/zero LTP never classifies), which
+                    // the guarded conversion maps to UNKNOWN for every
+                    // row. RAM snapshot rows are built BEFORE the persist
+                    // loop (a persist failure never degrades RAM).
+                    let moneyness_spot = if chain.underlying_ltp_missing {
+                        0.0
+                    } else {
+                        chain.underlying_ltp
+                    };
+                    let cls = classify_chain_legs(
+                        target.underlying,
+                        moneyness_spot,
+                        chain.legs.iter().map(|l| (l.strike, l.leg, l.ltp)),
+                    );
+                    for (leg, leg_moneyness) in chain.legs.iter().zip(cls.row_moneyness.iter()) {
                         let row = OptionChain1mRow {
                             ts_ist_nanos: target_minute_nanos,
                             trading_date_ist_nanos: trading_date_nanos,
@@ -1205,6 +1224,7 @@ async fn fire_one_groww_chain_minute(
                             previous_oi: 0,
                             underlying_spot: chain.underlying_ltp,
                             fetched_at_ist_nanos: fetched_at,
+                            moneyness: leg_moneyness.as_str(),
                         };
                         if let Err(err) = writer.append_row_ext(&row, leg.rho, close_to_data_ms) {
                             persist_failed = true;
@@ -1229,6 +1249,28 @@ async fn fire_one_groww_chain_minute(
                             break;
                         }
                     }
+                    // Moneyness observability (counters + day-latched
+                    // advisory warns) THEN the RAM snapshot publish — the
+                    // decision source of truth, independent of any
+                    // persist outcome above.
+                    record_chain_moneyness_observability(
+                        Feed::Groww.as_str(),
+                        target.underlying,
+                        idx,
+                        trading_date,
+                        &minute_label,
+                        &cls,
+                        moneyness_latches,
+                    );
+                    publish_chain_moneyness_snapshot(
+                        Feed::Groww,
+                        target.underlying,
+                        target_minute_nanos,
+                        fetched_at,
+                        moneyness_spot,
+                        expiry_nanos,
+                        cls,
+                    );
                     let audit_row = build_chain_audit_row(
                         target_minute_nanos,
                         trading_date_nanos,
@@ -1901,6 +1943,7 @@ async fn run_groww_chain_minute_loop(
     // past 15:30 IST; a mid-day supervisor respawn restarts the streak).
     let mut not_served = UnderlyingServedTracker::default();
     let mut token_cache = GrowwTokenCache::new_chain();
+    let mut moneyness_latches = MoneynessWarnLatches::default();
     let mut last_fired: Option<u32> = None;
     // ONE scalar spanning consecutive chain requests (any underlying) —
     // the cross-request min-gap pacing state (MEDIUM-1).
@@ -1976,6 +2019,7 @@ async fn run_groww_chain_minute_loop(
             &mut edge,
             &mut not_served,
             &mut token_cache,
+            &mut moneyness_latches,
             fire,
         )
         .await;
@@ -3200,6 +3244,7 @@ mod tests {
             &mut edge,
             &mut not_served,
             &mut token_cache,
+            &mut MoneynessWarnLatches::default(),
             9 * 3600 + 16 * 60,
         )
         .await;
@@ -3353,6 +3398,7 @@ mod tests {
             &mut edge,
             &mut not_served,
             &mut token_cache,
+            &mut MoneynessWarnLatches::default(),
             9 * 3600 + 16 * 60,
         )
         .await;
@@ -3437,6 +3483,7 @@ mod tests {
             &mut edge,
             &mut not_served,
             &mut token_cache,
+            &mut MoneynessWarnLatches::default(),
             9 * 3600 + 17 * 60,
         )
         .await;
