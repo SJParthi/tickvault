@@ -26,6 +26,14 @@ pub mod calendar_staleness;
 // Operator directive 2026-06-02: post-market (15:31 IST) 1-minute
 // cross-verification of live candles_1m vs Dhan intraday — CSV + audit + count.
 pub mod cross_verify_1m_boot;
+// BruteX↔TickVault daily cross-verify (BRUTEX-XVERIFY, 2026-07-12): PURE
+// comparison core — CSV parse, symbol mapping, day compare. No I/O; the
+// boot/runner shell lives in brutex_crossverify_boot (Unit 5).
+pub mod brutex_crossverify_compare;
+// BruteX↔TickVault daily cross-verify (BRUTEX-XVERIFY, 2026-07-12): the
+// 15:50 IST I/O shell — S3 CSV fetch, QuestDB reads, compare orchestration,
+// persistence, Telegram summary + supervised spawn (Unit 7).
+pub mod brutex_crossverify_boot;
 // Phase 0 Item 20 (wired 2026-06-13): supervised 15:25 IST orphan-position
 // watchdog — daily open-position safety gate (alert-only in sandbox/dry-run).
 pub mod orphan_position_watchdog_boot;

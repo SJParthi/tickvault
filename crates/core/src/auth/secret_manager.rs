@@ -1345,6 +1345,80 @@ mod tests {
         );
     }
 
+    /// BRUTEX-XVERIFY (2026-07-12): `main.rs` MUST spawn the BruteX↔TickVault
+    /// daily cross-verify runner
+    /// (`brutex_crossverify_boot::spawn_brutex_crossverify_task`) on BOTH boot
+    /// paths — the FAST crash-recovery arm (before `return run_shutdown_fast(`)
+    /// AND the slow process-global prefix — the scoreboard-spawn precedent: a
+    /// mid-market crash-restart day must still get its 15:50 IST cross-verify
+    /// run. The spawn is config-gated (`[brutex_crossverify] enabled`, default
+    /// OFF), so pinning both call sites costs nothing on a disabled profile.
+    /// The boot module must also keep its Telegram emit sites
+    /// (`BrutexCrossverifySummary` on success, `BrutexCrossverifyAborted` on
+    /// the Err/panic arms) — the daily signal must never be silently dropped
+    /// (audit Rule 11).
+    #[test]
+    fn test_brutex_crossverify_is_wired_into_main() {
+        let main_rs = std::fs::read_to_string("../app/src/main.rs")
+            .or_else(|_| std::fs::read_to_string("crates/app/src/main.rs"))
+            .expect("main.rs must be readable");
+        assert!(
+            main_rs.contains("brutex_crossverify_boot"),
+            "main.rs MUST reference the brutex_crossverify_boot module — \
+             without it the BruteX cross-verify runner is dead code."
+        );
+        // Call sites (call head only), excluding any fn definition.
+        let spawn_sites: Vec<usize> = main_rs
+            .match_indices("spawn_brutex_crossverify_task(")
+            .map(|(i, _)| i)
+            .filter(|&i| !main_rs[..i].ends_with("fn "))
+            .collect();
+        assert!(
+            spawn_sites.len() >= 2,
+            "main.rs MUST call spawn_brutex_crossverify_task( on BOTH boot \
+             paths (fast crash-recovery arm + slow process-global prefix); \
+             found {} call site(s).",
+            spawn_sites.len()
+        );
+        // The CODE form of the fast-arm return (arg list opens on the next
+        // line) — a prose mention in a comment must NOT anchor the split.
+        let fast_return = main_rs
+            .match_indices("return run_shutdown_fast(")
+            .map(|(i, m)| (i, &main_rs[i + m.len()..]))
+            .find(|(_, rest)| rest.starts_with('\n') || rest.starts_with('\r'))
+            .map(|(i, _)| i)
+            .expect("main.rs must contain the fast-boot `return run_shutdown_fast(` arm");
+        assert!(
+            spawn_sites.iter().any(|&i| i < fast_return),
+            "main.rs MUST spawn the BruteX cross-verify runner on the FAST \
+             crash-recovery boot arm (BEFORE `return run_shutdown_fast(`) — \
+             a mid-market process death restarts through that arm and the \
+             day's 15:50 IST cross-verify must still fire."
+        );
+        assert!(
+            spawn_sites.iter().any(|&i| i > fast_return),
+            "main.rs MUST spawn the BruteX cross-verify runner from the \
+             slow-boot process-global prefix too — without it the runner is \
+             dead code on normal boots."
+        );
+        // The boot module keeps its Telegram emit sites (never a silent day).
+        let boot_rs = std::fs::read_to_string("../app/src/brutex_crossverify_boot.rs")
+            .or_else(|_| std::fs::read_to_string("crates/app/src/brutex_crossverify_boot.rs"))
+            .expect("brutex_crossverify_boot.rs must be readable");
+        assert!(
+            boot_rs.contains("NotificationEvent::BrutexCrossverifySummary {"),
+            "brutex_crossverify_boot.rs MUST emit \
+             `NotificationEvent::BrutexCrossverifySummary` — the daily \
+             operator digest per the 2026-07-12 BRUTEX-XVERIFY directive."
+        );
+        assert!(
+            boot_rs.contains("NotificationEvent::BrutexCrossverifyAborted {"),
+            "brutex_crossverify_boot.rs MUST emit `BrutexCrossverifyAborted` \
+             on the Err/panic arms — the daily signal must never be silently \
+             dropped (audit Rule 11)."
+        );
+    }
+
     /// W2 PR#6 (WAL-SUSPEND-01, 2026-07-10, audit follow-up row 10):
     /// `main.rs` MUST spawn the supervised per-table QuestDB WAL-suspension
     /// probe from the process-global monitor block. Without this wire, a
