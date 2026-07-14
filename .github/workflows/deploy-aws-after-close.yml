@@ -59,11 +59,12 @@
 #   - No new commits → idempotent skip (no restart, no extra cost).
 #   - PR-C3 rider (2026-07-14): scheduled firings inside [08:15, 09:15) IST
 #     (the boot-critical prep band) suppress the DISPATCH — the 08:30/08:45
-#     IST crons no longer restart the app mid-prep; they remain as
-#     scheduler-drop redundancy for postmerge-catchup's overnight deploy-aws
-#     backfill, and manual workflow_dispatch still overrides. A merge landing
-#     in the band deploys via the next slot / postmerge-catchup /
-#     the box-start deploy-watchdog Lambda. ⚠️ envelope: this trades "latest
+#     IST crons no longer restart the app mid-prep. HONEST: fired on time
+#     those two crons land INSIDE the band and are ALWAYS suppressed — they
+#     dispatch only when the scheduler delays them past 09:15 IST (effectively
+#     inert otherwise); overnight deploy coverage is postmerge-catchup's
+#     deploy-aws backfill + the box-start deploy-watchdog Lambda. Manual
+#     workflow_dispatch still overrides. ⚠️ envelope: this trades "latest
 #     main shipped at 08:30 sharp" for "no mid-prep restart"; a boot-critical
 #     fix merged 08:15-09:15 needs the operator's manual dispatch.
 # =============================================================================
@@ -112,12 +113,14 @@ jobs:
       # few minutes later. This gate suppresses the DISPATCH only (the cron
       # firing itself stays free): a merge landing in the band deploys via
       # the next slot / postmerge-catchup / the box-start deploy-watchdog
-      # Lambda (the scheduler-independent stale-binary catch). The 03:00 UTC
-      # (08:30 IST) + 03:15 UTC (08:45 IST) morning crons now serve as
-      # scheduler-drop redundancy for the postmerge-catchup dispatcher's
-      # overnight deploy-aws backfill rather than dispatching mid-prep
-      # themselves; manual workflow_dispatch is NOT suppressed (operator
-      # override stays a real override).
+      # Lambda (the scheduler-independent stale-binary catch). HONEST: the
+      # 03:00 UTC (08:30 IST) + 03:15 UTC (08:45 IST) morning crons fall
+      # INSIDE the band — fired on time they are ALWAYS suppressed and
+      # dispatch nothing; they act only when GitHub's scheduler DELAYS them
+      # past 03:45 UTC (09:15 IST), i.e. they are effectively inert unless
+      # scheduler-delayed. Overnight deploy coverage is postmerge-catchup's
+      # deploy-aws backfill; manual workflow_dispatch is NOT suppressed
+      # (operator override stays a real override).
       - name: Pre-open prep-window gate (08:15-09:15 IST)
         id: prepwindow
         run: |
@@ -128,8 +131,10 @@ jobs:
             exit 0
           fi
           # IST = UTC+05:30 → [08:15, 09:15) IST = [02:45, 03:45) UTC.
+          # Single date read (no hour-boundary straddle between two calls);
           # 10# forces base-10 so zero-padded "08"/"09" never parse as octal.
-          now_utc_mins=$(( 10#$(date -u +%H) * 60 + 10#$(date -u +%M) ))
+          t=$(date -u +%H%M)
+          now_utc_mins=$(( 10#${t:0:2} * 60 + 10#${t:2} ))
           if [ "$now_utc_mins" -ge 165 ] && [ "$now_utc_mins" -lt 225 ]; then
             echo "::notice::inside the 08:15-09:15 IST boot-critical prep window — deploy dispatch suppressed (PR-C3 rider, 2026-07-14); the post-close crons / postmerge-catchup / deploy-watchdog cover this merge"
             echo "suppressed=true" >> "$GITHUB_OUTPUT"

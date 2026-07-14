@@ -1702,7 +1702,8 @@ async fn main() -> Result<()> {
     //
     // Build the PROCESS-shared infra ONCE here: notifier (+ Docker auto-start),
     // health registry, seal-writer (installs the process-wide global_seal_sender),
-    // the tick + order-update broadcasts, the obs / 21-TF aggregator / tick-storage
+    // the tick broadcast (the order-update broadcast retired in PR-C3,
+    // 2026-07-14), the obs / 21-TF aggregator / tick-storage
     // subscriber tasks, and the axum API server (incl. /api/feeds, so the
     // toggle endpoint exists regardless of feed state). The single
     // `run_process_runloop` below keeps the process alive.
@@ -2903,7 +2904,8 @@ struct SharedInfraHandles {
 /// Builds the PROCESS-shared infra ONCE for BOTH the Dhan-OFF and Dhan-ON-slow
 /// boot paths: strict notifier (+ optional coalescer), health registry,
 /// seal-writer (installs the process-wide `global_seal_sender`), the 21-TF
-/// Engine-B aggregator, the tick + order-update broadcast channels, the
+/// Engine-B aggregator, the tick broadcast channel (the order-update
+/// broadcast retired in PR-C3, 2026-07-14), the
 /// observability + tick-storage subscriber tasks (which `.subscribe()` to the
 /// tick broadcast BEFORE the lane's tick processor publishes — the
 /// subscribe-before-publish / zero-tick-loss invariant, preserved by
@@ -2995,7 +2997,7 @@ async fn build_shared_infra(
     // --- Seal-writer (installs the process-wide global_seal_sender) ---
     spawn_seal_writer_loop(&config.questdb);
 
-    // --- Tick + order-update broadcast channels (PROCESS-shared) ---
+    // --- Tick broadcast channel (PROCESS-shared) ---
     // Held for the process lifetime so the aggregator subscriber never wakes on
     // a disconnected channel. With Dhan OFF nothing publishes Dhan ticks into
     // the tick broadcast, but the channel + aggregator still run so the wiring
