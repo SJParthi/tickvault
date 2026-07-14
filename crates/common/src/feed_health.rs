@@ -465,6 +465,27 @@ impl FeedHealthRegistry {
         Some((now_ist_nanos.saturating_sub(last_tick).max(0) / NANOS_PER_SEC) as u64)
     }
 
+    /// RAW IST-epoch-nanos stamp of `feed`'s most-recent tick, or `None` if no
+    /// tick has been seen yet this session. O(1) — one relaxed load of the SAME
+    /// atomic [`Self::last_tick_age_secs`] reads.
+    ///
+    /// FOR EDGE DETECTION (the FEED-GAP-01 gap-episode tracker, review
+    /// CRITICAL 2026-07-14): callers that need to detect a liveness ADVANCE
+    /// must consume this raw stamp — NEVER reconstruct it from the FLOORED
+    /// age (`now - age_secs * 1e9`): the discarded sub-second remainder makes
+    /// the reconstruction creep forward on every >1s poll, so a real gap
+    /// looks like a fresh tick each wake (an OPEN edge can never latch and
+    /// jitter can flap open/close).
+    #[must_use]
+    pub fn last_tick_ist_nanos(&self, feed: Feed) -> Option<i64> {
+        let last_tick = self.last_tick_ist_nanos[feed.index()].load(Ordering::Relaxed);
+        if last_tick == NO_TICK_SENTINEL {
+            None
+        } else {
+            Some(last_tick)
+        }
+    }
+
     /// Build `feed`'s truthful health report from the live signals + the
     /// caller-supplied operator state (`enabled`/`lane_running` from
     /// `FeedRuntimeState`) and the clock/market context. Pure read, O(1).
@@ -1161,6 +1182,20 @@ mod tests {
             reg.last_tick_age_secs(Feed::Dhan, T0 + 31 * NANOS_PER_SEC),
             None
         );
+    }
+
+    #[test]
+    fn test_last_tick_ist_nanos_raw_accessor_none_then_exact_stamp() {
+        // The raw stamp accessor mirrors the age accessor's sentinel handling
+        // but returns the UNFLOORED atomic value — the gap tracker's edge
+        // reference (a floored-age reconstruction is banned; review CRITICAL
+        // 2026-07-14).
+        let reg = FeedHealthRegistry::new();
+        assert_eq!(reg.last_tick_ist_nanos(Feed::Groww), None, "no tick yet");
+        let ts = T0 + 123_456_789; // deliberately NOT whole-second aligned
+        reg.record_tick(Feed::Groww, ts);
+        assert_eq!(reg.last_tick_ist_nanos(Feed::Groww), Some(ts));
+        assert_eq!(reg.last_tick_ist_nanos(Feed::Dhan), None, "per-feed");
     }
 
     #[test]
