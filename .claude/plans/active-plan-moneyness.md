@@ -47,7 +47,7 @@ candle-minute-exact; old rows stay NULL forever (never backfilled).
 - [x] Item 6 — Proof artifacts: Criterion bench + budget, DHAT zero-alloc test, RAM-first ratchet
   - Files: crates/core/benches/moneyness.rs, crates/core/Cargo.toml, quality/benchmark-budgets.toml, crates/core/tests/dhat_moneyness.rs, crates/core/tests/chain_snapshot_ram_first_guard.rs
   - Tests: dhat_moneyness_classify_and_snapshot_read_zero_alloc, test_snapshot_module_has_no_db_or_network_tokens, test_scanner_detects_planted_token, test_banned_pattern_scanner_still_covers_strategy_selects, test_boot_legs_call_classify_and_chain_legs_publish_snapshot
-- [x] Item 7 — Docs: rule-file §2f note + plan archives (spot-1m-diagnostics 2026-07-14, questdb-partition-s3-archive 2026-07-13)
+- [x] Item 7 — Docs: rule-file §2g note + plan archives (spot-1m-diagnostics 2026-07-14, questdb-partition-s3-archive 2026-07-13)
   - Files: .claude/rules/project/rest-1m-pipeline-error-codes.md, .claude/plans/archive/2026-07-14-spot-1m-diagnostics.md, .claude/plans/archive/2026-07-13-questdb-partition-s3-archive.md
   - Tests: n/a (docs; the rule-file trigger list gains moneyness/chain_snapshot tokens)
 
@@ -200,6 +200,6 @@ candle-minute-exact; old rows stay NULL forever (never backfilled).
 - Snapshot publish emits one `debug!` per fire (minute, atm_paise, rows,
   spot_missing) — log-sink only.
 - Rule-file note: `.claude/rules/project/rest-1m-pipeline-error-codes.md`
-  §2f (dated 2026-07-14) documents the column on both tables, UNKNOWN
+  §2g (dated 2026-07-14) documents the column on both tables, UNKNOWN
   semantics, the three counters, the RAM-is-decision-source / DB-write-only
   split + its enforcement ratchet, and the trigger-list tokens.
