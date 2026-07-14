@@ -12,8 +12,22 @@
 //!   ladder rungs AND process restarts
 //! - Dhan spot fire deltas ≥ 400 ms
 //! - zero gate denials on nominal slots (on-time dispatch)
-//! - ≤ 1 decision per (lane, cycle); no decision past the lane cutoff;
-//!   every skip carries a typed reason
+//! - exactly 1 decision per (lane, cycle) — the latch admits every fresh
+//!   pair and refuses every repeat
+//! - a DECIDED outcome is never emitted past the lane cutoff (the sim
+//!   mirrors the runner's `finalize_if_complete` now≤cutoff guard: a
+//!   permutation whose data completes only past the cutoff must
+//!   honest-skip — deleting the guard from the mirror fails the assert
+//!   on late-completing permutations); every skip carries a typed reason
+//! - every successful chain fetch "publishes" its snapshot EXACTLY once
+//!   per (underlying, cycle) — incl. LATE successes (audit-only for the
+//!   decision, never dropped from the registry, never refetched). The
+//!   executor-side publish itself is a contract of the LATER real-broker
+//!   executor PR — this pins the retry policy's never-refetch-a-success
+//!   half, the only half that exists in this PR.
+//! - the replay is NEVER vacuous: all 64 cycles must complete and the
+//!   ledger must carry every cycle's 3 chain primaries + 4 spot singles
+//!   (a boundary-selection regression cannot silently green the proof)
 //!
 //! Plus the deterministic named races (minute-boundary double-fire,
 //! restart-mid-cycle, retry-through-gate) and the #1540-consumption
@@ -25,7 +39,8 @@ use tickvault_common::config::CadenceConfig;
 use tickvault_common::feed::Feed;
 use tickvault_common::moneyness::{Moneyness, OptionLeg};
 use tickvault_core::cadence::assembly::{
-    ChainCell, ChainProvenance, LaneAssembly, SpotProvenance, fold_chain_moneyness,
+    ChainCell, ChainProvenance, LaneAssembly, SpotProvenance, fold_chain_cell_moneyness,
+    fold_chain_moneyness,
 };
 use tickvault_core::cadence::decision::{DecisionLatch, DecisionOutcome, SkipReason};
 use tickvault_core::cadence::executor::{CadenceFetchError, SpotTarget};
@@ -248,8 +263,24 @@ fn sim_gated_spot_fire(
     }
 }
 
+/// One deferred Dhan in-cycle retry (mirrors the runner's `insert_event`
+/// ordering: a retry enters the SAME time-sorted event queue as the
+/// remaining primaries — it fires at its own grid slot AFTER them, never
+/// preempting a later primary. The pre-fix inline refire time-warped the
+/// clock past the remaining primaries' targets, making them dispatch
+/// "late" and self-demoting the nominal-denial gate-bug signal for the
+/// rest of the cycle).
+enum SimRetry {
+    Chain { underlying_idx: usize },
+    Spot { target_idx: usize },
+}
+
 /// Simulate ONE Dhan-lane cycle at `slots`: 3 gated chain primaries +
-/// bounded gated retries, 4 gated spot singles + retries; returns
+/// 4 gated spot singles in slot order, then the merged (time-sorted)
+/// in-cycle retry grid — the production event-queue fire SEQUENCE.
+/// Every successful chain fetch records one registry "publish" into
+/// `publishes` (incl. LATE successes — audit-only for the decision,
+/// never dropped, never refetched). Returns
 /// (arming_failure_seen, lane outcome).
 #[allow(clippy::too_many_lines)]
 #[allow(clippy::too_many_arguments)]
@@ -263,6 +294,7 @@ fn sim_dhan_cycle(
     fail_bias_pct: u64,
     nominal_denials: &mut u32,
     post_reseed: bool,
+    publishes: &mut Vec<(usize, u32)>,
 ) -> (bool, SimLaneOutcome) {
     // The first cycle after a boot/restart reseed demotes nominal
     // deferrals (the reseed's deliberate one-slot hold — the runner's
@@ -274,8 +306,14 @@ fn sim_dhan_cycle(
     let mut retries_used_chain = [0_u32; ChainUnderlying::COUNT];
     let mut retries_used_spot = [0_u32; 4];
     let mut next_retry_slot = 0_usize;
+    let mut retry_queue: Vec<(i64, SimRetry)> = Vec::new();
+    // The instant the LAST required (non-VIX) leg completed usably —
+    // the event-driven decide instant.
+    let mut decide_ready_at = i64::MIN;
 
-    // Chain primaries (nominal), in slot order.
+    // Chain primaries (nominal), in slot order — a failure only QUEUES
+    // its retry at its grid slot (the runner inserts the retry into the
+    // sorted event queue; primaries keep their own slots).
     for (i, u) in ChainUnderlying::ALL.iter().enumerate() {
         let jitter = i64::try_from(rng.below(500)).unwrap_or(0);
         let fired_at = sim_gated_chain_fire(
@@ -293,13 +331,25 @@ fn sim_dhan_cycle(
         let outcome = SimOutcome::draw(rng, fail_bias_pct);
         let completed_at = fired_at + latency;
         match outcome.as_error() {
-            None if completed_at <= slots.dhan_cutoff_ms => chains_ok[i] = true,
-            None => {} // late response — audit-only, cell unusable
+            None => {
+                // The executor publishes EVERY success to the registry —
+                // a LATE one is audit-only for the DECISION (cell
+                // unusable) but never dropped and never refetched.
+                publishes.push((i, slots.boundary_secs_of_day));
+                // The <= cutoff gate is the runner's finalize guard
+                // mirror: a response completing PAST the cutoff never
+                // contributes to a decision (audit-only).
+                if completed_at <= slots.dhan_cutoff_ms {
+                    chains_ok[i] = true;
+                    decide_ready_at = decide_ready_at.max(completed_at);
+                }
+            }
             Some(err) => {
                 if failure_arms_ladder(&err) {
                     arming = true;
                 }
-                // One gated retry on the retry grid, if it can land.
+                // One gated retry admitted onto the retry grid, if it can
+                // land — fired AFTER the remaining primaries (below).
                 if next_retry_slot < slots.dhan_chain_retry_slots_ms.len()
                     && may_retry_in_cycle(
                         &err,
@@ -311,26 +361,11 @@ fn sim_dhan_cycle(
                     )
                 {
                     retries_used_chain[i] += 1;
-                    let retry_target = slots.dhan_chain_retry_slots_ms[next_retry_slot];
+                    retry_queue.push((
+                        slots.dhan_chain_retry_slots_ms[next_retry_slot],
+                        SimRetry::Chain { underlying_idx: i },
+                    ));
                     next_retry_slot += 1;
-                    let jitter = i64::try_from(rng.below(500)).unwrap_or(0);
-                    let refired = sim_gated_chain_fire(
-                        clock,
-                        gates,
-                        ledger,
-                        *u,
-                        retry_target,
-                        jitter,
-                        false,
-                        &mut dispatched_late,
-                        nominal_denials,
-                    );
-                    let latency = 10 + i64::try_from(rng.below(7_990)).unwrap_or(0);
-                    if SimOutcome::draw(rng, fail_bias_pct) == SimOutcome::Ok
-                        && refired + latency <= slots.dhan_cutoff_ms
-                    {
-                        chains_ok[i] = true;
-                    }
                 }
             }
         }
@@ -340,7 +375,7 @@ fn sim_dhan_cycle(
     // (design §1: spot retries are appended AFTER the last nominal spot
     // single, never contending a nominal slot's gate window — the
     // runner's `next_spot_retry_target_ms` mirror).
-    let mut spot_retry_queue: Vec<(usize, CadenceFetchError)> = Vec::new();
+    let mut spot_failures: Vec<(usize, CadenceFetchError)> = Vec::new();
     for k in 0..4 {
         let jitter = i64::try_from(rng.below(500)).unwrap_or(0);
         let fired_at = sim_gated_spot_fire(
@@ -356,18 +391,23 @@ fn sim_dhan_cycle(
         let latency = 10 + i64::try_from(rng.below(7_990)).unwrap_or(0);
         let outcome = SimOutcome::draw(rng, fail_bias_pct);
         match outcome.as_error() {
-            None if fired_at + latency <= slots.dhan_cutoff_ms => spots_ok[k] = true,
+            None if fired_at + latency <= slots.dhan_cutoff_ms => {
+                spots_ok[k] = true;
+                if k < ChainUnderlying::COUNT {
+                    decide_ready_at = decide_ready_at.max(fired_at + latency);
+                }
+            }
             None => {}
             Some(err) => {
                 if failure_arms_ladder(&err) {
                     arming = true;
                 }
-                spot_retry_queue.push((k, err));
+                spot_failures.push((k, err));
             }
         }
     }
     let mut next_spot_retry_target = slots.dhan_spot_slots_ms[3] + cfg.dhan_spot_spacing_ms;
-    for (k, err) in spot_retry_queue {
+    for (k, err) in spot_failures {
         let retry_target = next_spot_retry_target.max(clock.wall_ms);
         if may_retry_in_cycle(
             &err,
@@ -379,36 +419,82 @@ fn sim_dhan_cycle(
         ) {
             retries_used_spot[k] += 1;
             next_spot_retry_target = retry_target + cfg.dhan_spot_spacing_ms;
-            let refired = sim_gated_spot_fire(
-                clock,
-                gates,
-                ledger,
-                retry_target,
-                0,
-                false,
-                &mut dispatched_late,
-                nominal_denials,
-            );
-            let latency = 10 + i64::try_from(rng.below(7_990)).unwrap_or(0);
-            if SimOutcome::draw(rng, fail_bias_pct) == SimOutcome::Ok
-                && refired + latency <= slots.dhan_cutoff_ms
-            {
-                spots_ok[k] = true;
+            retry_queue.push((retry_target, SimRetry::Spot { target_idx: k }));
+        }
+    }
+
+    // The merged retry grid, in target order — the runner's sorted event
+    // queue interleaving (spot appends and chain grid slots can overlap;
+    // the queue fires them by target instant).
+    retry_queue.sort_by_key(|(target, _)| *target);
+    for (target, retry) in retry_queue {
+        match retry {
+            SimRetry::Chain { underlying_idx } => {
+                let jitter = i64::try_from(rng.below(500)).unwrap_or(0);
+                let refired = sim_gated_chain_fire(
+                    clock,
+                    gates,
+                    ledger,
+                    ChainUnderlying::ALL[underlying_idx],
+                    target,
+                    jitter,
+                    false,
+                    &mut dispatched_late,
+                    nominal_denials,
+                );
+                let latency = 10 + i64::try_from(rng.below(7_990)).unwrap_or(0);
+                if SimOutcome::draw(rng, fail_bias_pct) == SimOutcome::Ok {
+                    publishes.push((underlying_idx, slots.boundary_secs_of_day));
+                    if refired + latency <= slots.dhan_cutoff_ms {
+                        chains_ok[underlying_idx] = true;
+                        decide_ready_at = decide_ready_at.max(refired + latency);
+                    }
+                }
+            }
+            SimRetry::Spot { target_idx } => {
+                let refired = sim_gated_spot_fire(
+                    clock,
+                    gates,
+                    ledger,
+                    target,
+                    0,
+                    false,
+                    &mut dispatched_late,
+                    nominal_denials,
+                );
+                let latency = 10 + i64::try_from(rng.below(7_990)).unwrap_or(0);
+                if SimOutcome::draw(rng, fail_bias_pct) == SimOutcome::Ok
+                    && refired + latency <= slots.dhan_cutoff_ms
+                {
+                    spots_ok[target_idx] = true;
+                    if target_idx < ChainUnderlying::COUNT {
+                        decide_ready_at = decide_ready_at.max(refired + latency);
+                    }
+                }
             }
         }
     }
 
     // Decision: 3 chains + 3 underlying spots (VIX advisory — index 3).
+    // MIRRORS the runner's finalize guard ("never a late decision",
+    // runner.rs finalize_if_complete now≤cutoff): only responses
+    // completing AT/BEFORE the cutoff contribute (the ok-flag gates
+    // above), and the Decided emit instant is the ACTUAL completion
+    // instant of the last required leg — never clamped to satisfy the
+    // assertion. Weakening the mirror (dropping the <= cutoff gates)
+    // fails the no-late-decision assert on late-completing permutations.
     let complete = chains_ok.iter().all(|c| *c) && spots_ok[..3].iter().all(|s| *s);
     let outcome = if complete {
         SimLaneOutcome {
             outcome: DecisionOutcome::Decided,
-            emitted_at_wall: clock.wall_ms.min(slots.dhan_cutoff_ms),
+            emitted_at_wall: decide_ready_at,
         }
     } else {
+        // Incomplete: the cutoff event emits the skip (possibly late —
+        // a skip is allowed late; a DECIDED is not).
         SimLaneOutcome {
             outcome: DecisionOutcome::Skipped(SkipReason::Cutoff),
-            emitted_at_wall: slots.dhan_cutoff_ms,
+            emitted_at_wall: slots.dhan_cutoff_ms.max(clock.wall_ms),
         }
     };
     (arming, outcome)
@@ -446,6 +532,7 @@ proptest! {
         let mut nominal_denials = 0_u32;
         let mut cycles = 0_u32;
         let mut decisions_per_cycle: Vec<u32> = Vec::new();
+        let mut publishes: Vec<(usize, u32)> = Vec::new();
         // Boot = a reseed: the first cycle demotes nominal deferrals (the
         // runner's `demote_nominal` mirror).
         let mut post_reseed = true;
@@ -483,17 +570,31 @@ proptest! {
                 fail_bias_pct,
                 &mut nominal_denials,
                 post_reseed,
+                &mut publishes,
             );
             post_reseed = false;
 
-            // Exactly-once decision latch per (lane, cycle) + never past
-            // the lane cutoff; every skip carries a typed reason.
+            // Exactly-once decision latch per (lane, cycle); a DECIDED
+            // outcome is never emitted past the lane cutoff (the sim's
+            // emit instant is the ACTUAL last-required-completion wall
+            // instant — see sim_dhan_cycle; a skip MAY be emitted late);
+            // every skip carries a typed reason.
             let mut emitted = 0_u32;
             if latch.try_latch(Feed::Dhan, slots.cycle_minute_ist) {
                 emitted += 1;
-                prop_assert!(dhan.emitted_at_wall <= slots.dhan_cutoff_ms);
-                if let DecisionOutcome::Skipped(reason) = dhan.outcome {
-                    prop_assert!(!reason.as_str().is_empty());
+                match dhan.outcome {
+                    DecisionOutcome::Decided | DecisionOutcome::DecidedDegraded => {
+                        prop_assert!(
+                            dhan.emitted_at_wall <= slots.dhan_cutoff_ms,
+                            "a DECIDED outcome must never be emitted past the lane cutoff \
+                             (emitted {} > cutoff {})",
+                            dhan.emitted_at_wall,
+                            slots.dhan_cutoff_ms
+                        );
+                    }
+                    DecisionOutcome::Skipped(reason) => {
+                        prop_assert!(!reason.as_str().is_empty());
+                    }
                 }
             }
             prop_assert!(!latch.try_latch(Feed::Dhan, slots.cycle_minute_ist));
@@ -517,12 +618,44 @@ proptest! {
             clock.advance_to_wall(slots.dhan_cutoff_ms);
         }
 
+        // MINIMUM-ACTIVITY floor (Rule 11 — the proof must never pass
+        // vacuously): all 64 cycles ran, and every cycle fired its 3
+        // chain primaries + 4 spot singles at minimum. A regression in
+        // the boundary/joinable calculus or the window constants that
+        // silently produced zero (or partial) activity fails HERE.
+        prop_assert_eq!(cycles, 64, "the replay must complete all 64 cycles");
+        prop_assert!(
+            ledger.chain_global.len() >= 3 * 64,
+            "chain fires below the 3-primaries-per-cycle floor: {}",
+            ledger.chain_global.len()
+        );
+        prop_assert!(
+            ledger.spot.len() >= 4 * 64,
+            "spot fires below the 4-singles-per-cycle floor: {}",
+            ledger.spot.len()
+        );
         // THE floors: per-UL ≥3000, GLOBAL ≥3000, spot ≥400 — including
         // retries, rungs and restarts, in the broker wall domain.
         ledger.assert_floors(cfg.chain_min_spacing_ms, cfg.dhan_spot_spacing_ms, "replay");
         prop_assert_eq!(nominal_denials, 0, "gate denials on nominal slots");
+        // Exactly ONE decision per lane per cycle: the latch must ADMIT
+        // every fresh (lane, minute) pair (a wrongly-refusing latch reads
+        // < 2) — the ≤1 half is the immediate re-latch refusals above.
         for (i, d) in decisions_per_cycle.iter().enumerate() {
-            prop_assert!(*d <= 2, "cycle {i}: >1 decision per lane emitted");
+            prop_assert_eq!(*d, 2, "cycle {}: both lanes must emit exactly once", i);
+        }
+        // Snapshot published EXACTLY once per successful chain fetch per
+        // (underlying, cycle): a success — even a LATE one — is never
+        // refetched (the retry policy fires only on Err), so no
+        // (underlying, boundary) pair may publish twice; late successes
+        // still published (never dropped).
+        let mut seen_publishes = std::collections::HashSet::new();
+        for p in &publishes {
+            prop_assert!(
+                seen_publishes.insert(*p),
+                "chain snapshot published more than once for (underlying, boundary) {:?}",
+                p
+            );
         }
     }
 }
@@ -816,6 +949,8 @@ fn test_cadence_200_empty_spot_fallback_chain_end_to_end() {
         ChainUnderlying::Sensex,
         ChainCell {
             provenance: ChainProvenance::OwnFetch,
+            source_feed: Feed::Groww,
+            published_to_registry: true,
             fetched_at_ms: 36_000_400,
             minute_ist: 35_940,
             embedded_spot: Some(embedded_spot),
@@ -840,4 +975,75 @@ fn test_cadence_200_empty_spot_fallback_chain_end_to_end() {
         && f.itm == 1
         && f.otm == 1
         && !f.all_unknown()));
+}
+
+#[test]
+fn test_cadence_guarded_fold_reads_source_feed_slot_and_rejects_stale_minute() {
+    // Slot: (Groww, Banknifty). A Dhan-lane CROSS-FILLED cell must fold
+    // the LENDER's (Groww) registry slot — the borrowed chain's rows
+    // never live under the borrower's slot (design §3(e): "Groww's
+    // same-cycle data drives the Dhan lane") — and a snapshot from the
+    // WRONG minute folds to 0 rows (all_unknown, SURFACED) per the
+    // design §6 stale-registry guard.
+    let minute: u32 = 35_940; // 09:59:00 — the decided minute
+    let day: i64 = 20_000; // an arbitrary IST calendar day
+    let minute_nanos = (day * 86_400 + i64::from(minute)) * 1_000_000_000;
+    let now_nanos = minute_nanos + 61 * 1_000_000_000; // ~T+1s of the cycle
+    publish_chain_snapshot(ChainMoneynessSnapshot {
+        feed: Feed::Groww,
+        underlying: ChainUnderlying::Banknifty,
+        minute_ts_ist_nanos: minute_nanos,
+        fetched_at_ist_nanos: minute_nanos + 400_000_000,
+        underlying_spot: 51_000.0,
+        underlying_spot_paise: 5_100_000,
+        atm_strike_paise: 5_100_000,
+        expiry_ist_nanos: 0,
+        spot_missing: false,
+        rows: vec![
+            SnapshotRow {
+                strike_paise: 5_100_000, // == ATM → Atm
+                ltp_paise: 100,
+                leg: OptionLeg::Ce,
+                moneyness: Moneyness::Atm,
+            },
+            SnapshotRow {
+                strike_paise: 5_000_000, // CE strike < spot → Itm
+                ltp_paise: 200,
+                leg: OptionLeg::Ce,
+                moneyness: Moneyness::Itm,
+            },
+        ],
+    });
+    // The Dhan lane's cross-filled cell KEEPS the lender's identity.
+    let cell = ChainCell {
+        provenance: ChainProvenance::CrossSource,
+        source_feed: Feed::Groww,
+        published_to_registry: true,
+        fetched_at_ms: 36_000_400,
+        minute_ist: minute,
+        embedded_spot: None,
+    };
+    let fold = fold_chain_cell_moneyness(
+        &cell,
+        ChainUnderlying::Banknifty,
+        minute,
+        now_nanos,
+        5_100_000,
+        5_100_000,
+    );
+    assert_eq!(fold.rows, 2, "the lender's fresh rows drive the fold");
+    assert!(!fold.all_unknown());
+    // The WRONG cycle minute (a previous-minute registry residue) is
+    // REFUSED — 0 rows, all_unknown, surfaced; never a silent stale-row
+    // classification against the current minute's anchors.
+    let stale = fold_chain_cell_moneyness(
+        &cell,
+        ChainUnderlying::Banknifty,
+        minute - 60,
+        now_nanos,
+        5_100_000,
+        5_100_000,
+    );
+    assert_eq!(stale.rows, 0);
+    assert!(stale.all_unknown(), "stale snapshot = unusable, surfaced");
 }
