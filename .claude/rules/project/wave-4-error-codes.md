@@ -227,8 +227,24 @@ the operator at the exact SSM parameter to reconcile.
 > renewal-loop-halt backstop. A TERMINAL re-mint failure now pages the
 > family-(c) Critical directly (`AuthenticationFailed` emitted from the
 > watchdog's terminal arm — `force_renewal`→`acquire_token` pages nothing
-> on a non-RESILIENCE-03 permanent failure, verified 2026-07-14). Content
-> below retained as historical audit; page references are stale.
+> on a non-RESILIENCE-03 permanent failure, verified 2026-07-14).
+>
+> **2026-07-14 fix round (same day):** the family-(c) page is
+> ONCE-PER-EPISODE (H1a `terminal_paged_this_episode` latch — the GAP-04
+> re-arm previously re-paged the same episode every ~30 min), the re-arm
+> is BOUNDED at `REMINT_MAX_ATTEMPTS_PER_EPISODE` (= 3) mints per episode
+> (H1b — the cap fires the same once-per-episode Critical when the
+> profile stays REAL-invalid after all 3, the dead-dataPlan class), and
+> the AG5-R2-1 "flagged follow-up" below is CLOSED: the ~125s mint
+> cooldown now lives INSIDE `TokenManager::renew_with_fallback` (H3 —
+> shared by ALL re-mint callers; the cooldown skip is a typed non-terminal
+> refusal the watchdog never pages on; `initialize`'s boot loop stays
+> ungated). Cadence note: a PERSISTING lock-lost episode re-logs the
+> RESILIENCE-01 `refused_lock_lost` error every ~30 min (the GAP-04
+> re-arm re-evaluates the refusal) — bounded log noise, no mint, no
+> Telegram from that arm; the IN-FLIGHT RESILIENCE-03 tripwire inside
+> `acquire_token` still pages its own family-(c) refusal (pre-existing).
+> Content below retained as historical audit; page references are stale.
 
 **Status (2026-07-06):** LIVE — defined as
 `ErrorCode::AuthGap05ForcedRemintTriggered` with `code_str() == "AUTH-GAP-05"`.

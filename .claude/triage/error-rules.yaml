@@ -1803,14 +1803,16 @@ rules:
     confidence: 1.0
     cooldown_secs: 0
     justification: >-
-      REST-CANARY-01 = a scheduled GET /v2/profile health probe (09:05 /
-      12:00 / 15:25 IST) returned non-2xx or failed to send after one 30s
-      retry. Severity::High, NOT auto-fixable: the captured body names the
-      cause (data-plan expiry vs DH-901 token vs WAF/malformed URL) and
-      each requires a different operator action (renew plan on Dhan portal /
-      rotate token / fix base-URL override). Fires at most 3 times per
-      trading day by construction (3 fixed probe times). The operator reads
-      the body + url fields in the error payload per the runbook triage.
+      RETIRED EMIT 2026-07-14 (operator Dhan noise lock,
+      dhan-rest-only-noise-lock-2026-07-14.md): the REST canary module +
+      both spawn sites are DELETED, so REST-CANARY-01 has ZERO production
+      emit sites — this rule can only match a historical errors.jsonl
+      line. The ErrorCode variant + this rule are retained per the house
+      retirement-banner style (the triage full-coverage guard requires a
+      rule or an exemption per variant). Historical semantics: a scheduled
+      GET /v2/profile health probe (09:05 / 12:00 / 15:25 IST) returned
+      non-2xx or failed to send after one 30s retry; the spot/chain legs'
+      own escalation edges now self-detect a dead REST surface in ~3-4 min.
 
   - name: prevday-01-coverage-empty-escalate
     match:
@@ -2329,7 +2331,8 @@ rules:
       self-retries every minute close and the Telegram page is
       edge-triggered app-side; escalate so the operator inspects the
       bounded secret-redacted sample failure (status + redacted URL +
-      body) and cross-checks REST-CANARY-01 / the WS feed per the runbook.
+      body) per the runbook (the REST canary cross-check retired
+      2026-07-14 — the legs' own edges are the REST-death detector).
       Missing minutes stay absent (never fabricated) and backfill safely
       via DEDUP-idempotent re-appends.
 
@@ -2388,7 +2391,8 @@ rules:
       CHAIN-02 = per-minute option-chain fetch degraded. The scheduler
       self-retries every minute close; escalate so the operator inspects
       the bounded secret-redacted sample failure and cross-checks the
-      spot leg (SPOT1M-01) + REST-CANARY-01 per the runbook. Missing
+      spot leg (SPOT1M-01) per the runbook (the REST canary cross-check
+      retired 2026-07-14 — the legs' own edges detect REST death). Missing
       minutes stay absent (never fabricated) and backfill safely via
       DEDUP-idempotent re-appends.
 

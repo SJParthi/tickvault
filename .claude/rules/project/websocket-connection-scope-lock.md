@@ -309,6 +309,13 @@ constants `INDEX_CONSTITUENCY_BASE_URL` / `GROWW_INSTRUMENT_CSV_URL` /
   canonicalizer, the SEBI tables, the ts-pin migration, `parse_intraday_1m_candles`).
 - Removes the order-update WS instead of rewiring it into `dhan_rest_stack` (Q4-i keeps
   it functional-dormant), or spawns it anywhere OTHER than `dhan_rest_stack`.
+  *(2026-07-14 note — PARTIALLY SUPERSEDED by §A.1, the house §37.6-precedent in-place
+  annotation: the operator's 2026-07-14 Dhan noise directive RETIRED the functional-dormant
+  SPAWN itself — `dhan_rest_stack` Phase 5a no longer opens the socket, so "spawns it
+  anywhere OTHER than dhan_rest_stack" now reads "spawns it ANYWHERE at all" pending the
+  live-trading re-wire quote. The MODULE-DELETION half of this row STANDS unchanged:
+  deleting `order_update_connection.rs` remains REJECT — the dormant module is the
+  live-trading re-wire target.)*
 - Deletes `FeedsConfig` / feed-in-key columns / the WAL-ring-aggregator seam "because only
   one feed remains" — the pluggable contract must stay clean for GDF
   (`gdf-third-feed-scope-2026-07-13.md`).

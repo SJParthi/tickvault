@@ -233,3 +233,79 @@ so reverting is safe but re-pages the noise the operator banned.
 | 3 | Dhan REST surface down (2026-06-10 class) | Spot1m/Chain High pages within minutes (canary deleted — strictly slower coverage removed) |
 | 4 | Manual order placed in the Dhan app | No order-update socket exists — nothing fires (deliberate; dry_run=true, events were discarded anyway) |
 | 5 | Dual tickvault instance | RESILIENCE-01/03 coded errors + DualInstanceDetected page — UNCHANGED |
+
+## Fix Round (2026-07-14 — 4 hostile reviews, no CRITICAL)
+
+- [x] H1a+H1b: once-per-episode family-(3) page (terminal_paged latch) +
+      REMINT_MAX_ATTEMPTS_PER_EPISODE=3 cap on the GAP-04 re-arm (cap page
+      names the N re-logins + blocked spot-1m/chain pulls — the
+      dead-dataPlan class)
+  - Files: crates/core/src/auth/mid_session_watchdog.rs
+  - Tests: h1_cap_stops_rearm_after_max_attempts_per_episode,
+    h1_terminal_page_latch_fires_once_per_episode_and_resets_on_ok,
+    h1_cap_page_fires_once_when_profile_stays_invalid_after_cap,
+    h1_transient_then_recover_pages_nothing
+- [x] H2: silence ratchet de-vacuoused — call-form needle
+      `.notify(NotificationEvent::AuthenticationFailed` pinned at count 2
+      in the production region; module doc reworded so it can't satisfy it
+  - Files: crates/core/tests/mid_session_profile_watchdog_guard.rs,
+    crates/core/src/auth/mid_session_watchdog.rs
+  - Tests: mid_session_watchdog_is_silent_except_terminal_auth_failure
+- [x] H3: shared ~125s mint-cooldown gate inside
+      TokenManager::renew_with_fallback (typed `mint-cooldown` refusal;
+      initialize boot loop ungated; watchdog treats the skip as
+      non-terminal — closes AG5-R2-1)
+  - Files: crates/core/src/auth/token_manager.rs,
+    crates/core/src/auth/mid_session_watchdog.rs
+  - Tests: h3_mint_cooldown_allows_truth_table,
+    h3_renew_with_fallback_refuses_mint_inside_cooldown,
+    h3_renew_with_fallback_allows_mint_after_cooldown,
+    h3_initialize_mint_path_is_ungated,
+    h3_mint_cooldown_refusal_is_prefix_anchored
+- [x] M1: RestSurfaceDegraded rising edge wording class-accurate (no
+      re-login attempted); M2: terminal Telegram body redacted+truncated
+      via capture_rest_error_body
+  - Files: crates/core/src/auth/mid_session_watchdog.rs
+  - Tests: existing classifier tests green; H2 ratchet pins the emits
+- [x] M3: boot-time zero-pager-legs warn in dhan_rest_stack
+  - Files: crates/app/src/dhan_rest_stack.rs
+  - Tests: test_rest_stack_zero_pager_legs_truth_table_and_warn_wired
+- [x] M4: ghost metric tv_order_update_ws_active removed (EMF allowlists,
+      dashboard.tf panel, metrics catalog entry; 27-name pin -> 26)
+  - Files: deploy/aws/cloudwatch-agent.json,
+    deploy/aws/terraform/user-data.sh.tftpl,
+    deploy/aws/terraform/dashboard.tf,
+    crates/common/tests/metrics_catalog.rs,
+    crates/common/tests/cloudwatch_app_alarms_wiring.rs
+  - Tests: test_emf_metric_selectors_name_count_is_twenty_six
+- [x] M5: scope-lock §D stale REJECT row annotated in place (dated
+      2026-07-14; module deletion stays REJECT)
+  - Files: .claude/rules/project/websocket-connection-scope-lock.md
+  - Tests: docs-only
+- [x] M6 (ACCEPTED residual): pre-#1522 dhan-ON lane boot leaves
+      tv_token_valid unpublished — documented in the lock file + honest
+      envelope; prod is dhan-off and #1522 merges first
+  - Files: .claude/rules/project/dhan-rest-only-noise-lock-2026-07-14.md
+  - Tests: docs-only
+- [x] L: lock/runbook wording truth fixes (once-per-episode + cap; sweep
+      warn no longer claims the halted renewal loop retries; RESILIENCE-03
+      comment aligned with acquire_token's in-flight page; RefuseLockLost
+      ~30-min re-log cadence noted); triage YAML rest-canary entries
+      annotated retired; GAP-02 sweep + GAP-06 gauge poller SUPERVISED
+      (house respawn pattern, unwind-build self-heal only)
+  - Files: .claude/rules/project/dhan-rest-only-noise-lock-2026-07-14.md,
+    .claude/rules/project/wave-4-error-codes.md,
+    .claude/triage/error-rules.yaml, crates/app/src/dhan_rest_stack.rs,
+    crates/core/src/auth/mid_session_watchdog.rs
+  - Tests: test_supervised_stack_task_respawns_on_clean_exit,
+    test_sweep_and_gauge_poller_are_supervised
+
+### Fix-round honest envelope additions
+- M6: `tv_token_valid` / live `tv_token_remaining_seconds` are NOT
+  published on a hypothetical `dhan_enabled=true` LANE boot before #1522
+  merges (lane poller spawn sites deleted; the stack does not run on that
+  boot shape). ACCEPTED: prod is dhan-off (config + Phase-A 409) and
+  #1522 merges first; this PR rebases after it.
+- Supervision honesty: the sweep/poller respawn arms self-heal in unwind
+  builds only — release builds run panic=abort, so a production panic
+  aborts the process (restart = recovery), the TICK-FLUSH-01 precedent.
