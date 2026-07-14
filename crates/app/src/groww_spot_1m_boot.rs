@@ -588,20 +588,51 @@ pub(crate) fn parse_groww_ga_failure(body: &str) -> Option<GrowwGaFailure> {
         return None;
     }
     let err = v.get("error");
+    // Sanitize BEFORE bounding (2026-07-14 security review): the code
+    // flows into tracing fields, so only `[A-Za-z0-9_-]` survives — no
+    // newlines/ANSI/BiDi/quotes can reach a log line. Empty (absent or
+    // fully filtered) → "none".
     let ga_code = err
         .and_then(|e| e.get("code"))
         .and_then(|c| c.as_str())
+        .map(|c| {
+            c.chars()
+                .filter(|ch| ch.is_ascii_alphanumeric() || *ch == '_' || *ch == '-')
+                .take(GA_CODE_MAX_CHARS)
+                .collect::<String>()
+        })
         .filter(|c| !c.is_empty())
-        .map_or_else(
-            || "none".to_string(),
-            |c| c.chars().take(GA_CODE_MAX_CHARS).collect(),
-        );
+        .unwrap_or_else(|| "none".to_string());
     let message = err
         .and_then(|e| e.get("message"))
         .and_then(|m| m.as_str())
         .unwrap_or_default()
         .to_string();
     Some(GrowwGaFailure { ga_code, message })
+}
+
+/// One sweep-time 2xx body's classification (G1, 2026-07-14): the FAILURE
+/// envelope is a FAILED sweep fetch — the single choke point that keeps
+/// the ~15:31 post-session sweep from dressing a broker reject as
+/// "answered 200 without the minute" vendor absence (`named_gap`). Pure.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum SweepBodyVerdict {
+    /// The Groww FAILURE envelope — classify the sweep fetch FAILED
+    /// (outcome `error`, class `"ga_failure"`, the real 200 status).
+    GaFailure(GrowwGaFailure),
+    /// A candle body — proceed to minute selection (absent minutes stay
+    /// honest `named_gap` vendor absence).
+    Candles(Vec<MinuteCandle>, GrowwParseStats),
+}
+
+/// Classify one sweep 2xx body — the sniff runs BEFORE candle parsing,
+/// mirroring the per-minute ladder arm. Pure.
+pub(crate) fn classify_sweep_body(body: &str) -> SweepBodyVerdict {
+    if let Some(ga) = parse_groww_ga_failure(body) {
+        return SweepBodyVerdict::GaFailure(ga);
+    }
+    let (candles, stats) = parse_groww_1m_candles(body);
+    SweepBodyVerdict::Candles(candles, stats)
 }
 
 /// The SHARED candle-tuple parser (PR-4 refactor — one wire parser, two
@@ -616,10 +647,14 @@ pub(crate) fn parse_groww_1m_candle_rows(body: &str) -> (Vec<GrowwCandleRow>, Gr
     };
     if v.get("status").and_then(|s| s.as_str()) == Some("FAILURE") {
         // Typed reject, zero malformed. NOTE (G1, 2026-07-14): the spot
-        // ladder sniffs this envelope BEFORE calling this parser
-        // (`parse_groww_ga_failure`) and classifies the rung as an ERROR —
-        // this empty return is no longer a spot-leg classification path.
-        // The contract leg still reaches it (follow-up flagged).
+        // leg sniffs this envelope BEFORE calling this parser at BOTH its
+        // fetch sites — the per-minute ladder (`parse_groww_ga_failure`)
+        // and the ~15:31 post-session sweep (`classify_sweep_body`) — and
+        // classifies the fetch as an ERROR, so this empty return is no
+        // longer a spot-leg classification path. The CONTRACT leg
+        // (`groww_contract_1m_boot.rs`) is the ONLY remaining production
+        // consumer that reaches it (verified by grep 2026-07-14; flagged
+        // follow-up).
         return (Vec::new(), stats);
     }
     let candles = v
@@ -2390,11 +2425,41 @@ async fn run_post_session_sweep(
         );
         let candles =
             match groww_fetch_once(client, GROWW_HISTORICAL_CANDLES_URL, &query, token).await {
-                Ok(body_text) => {
-                    let (candles, stats) = parse_groww_1m_candles(&body_text);
-                    record_parse_stats(stats);
-                    candles
-                }
+                Ok(body_text) => match classify_sweep_body(&body_text) {
+                    // G1 (2026-07-14): a sweep-time 2xx FAILURE envelope is
+                    // a FAILED sweep fetch — never "answered 200 without
+                    // the minute" vendor absence. Honest class + the real
+                    // 200 status + the GA code (forensics only).
+                    SweepBodyVerdict::GaFailure(ga) => {
+                        error!(
+                            code = ErrorCode::Spot1m01FetchDegraded.code_str(),
+                            stage = "sweep_failed",
+                            feed = SPOT_1M_REST_FEED_GROWW,
+                            security_id,
+                            ga_code = %ga.ga_code,
+                            reason = %capture_rest_error_body(&ga.message),
+                            "SPOT1M-01: Groww post-session sweep fetch answered \
+                             2xx with a FAILURE envelope — missing minutes stay \
+                             absent (never dressed as vendor absence)"
+                        );
+                        still_missing = still_missing.saturating_add(missing.len() as u64);
+                        record_named_gaps(
+                            audit_writer,
+                            &missing,
+                            trading_date_nanos,
+                            security_id,
+                            target.symbol,
+                            RestFetchOutcome::Error,
+                            "ga_failure",
+                            200,
+                        );
+                        continue;
+                    }
+                    SweepBodyVerdict::Candles(candles, stats) => {
+                        record_parse_stats(stats);
+                        candles
+                    }
+                },
                 Err(failure) => {
                     error!(
                         code = ErrorCode::Spot1m01FetchDegraded.code_str(),
@@ -3100,6 +3165,20 @@ mod tests {
         );
         let ga = parse_groww_ga_failure(&hostile).expect("hostile FAILURE must still sniff");
         assert_eq!(ga.ga_code.chars().count(), 16, "ga_code must be bounded");
+        // 2026-07-14 security review: newline / ANSI-ESC / quote / BiDi
+        // characters are FILTERED (allowlist [A-Za-z0-9_-]) BEFORE the
+        // bound — control characters can never reach a tracing field.
+        let ga = parse_groww_ga_failure(
+            "{\"status\":\"FAILURE\",\"error\":{\"code\":\"GA0\\n0\\u001b\\\"5\\u202e\"}}",
+        )
+        .expect("control-char code must still sniff");
+        assert_eq!(ga.ga_code, "GA005", "hostile chars filtered, got {ga:?}");
+        // A code that is ONLY hostile chars filters to empty → "none".
+        let ga = parse_groww_ga_failure(
+            "{\"status\":\"FAILURE\",\"error\":{\"code\":\"\\n\\u001b\\u202e\"}}",
+        )
+        .expect("all-hostile code must still sniff");
+        assert_eq!(ga.ga_code, "none");
         // SUCCESS / bare-candles / non-JSON bodies never sniff.
         for body in [
             r#"{"status":"SUCCESS","payload":{"candles":[]}}"#,
@@ -3111,6 +3190,38 @@ mod tests {
                 parse_groww_ga_failure(body).is_none(),
                 "body {body:?} must not sniff as a FAILURE envelope"
             );
+        }
+    }
+
+    /// G1 (2026-07-14, sweep arm): a sweep-time 2xx FAILURE envelope
+    /// classifies `GaFailure` — NEVER the `Candles` arm whose empty set
+    /// would dress a broker reject as `named_gap` vendor absence. A
+    /// normal candle body (and a genuinely empty SUCCESS body) stays on
+    /// the honest `Candles` path.
+    #[test]
+    fn test_sweep_body_ga_failure_never_classifies_as_vendor_absence() {
+        match classify_sweep_body(
+            r#"{"status":"FAILURE","error":{"code":"GA003","message":"unable to serve"}}"#,
+        ) {
+            SweepBodyVerdict::GaFailure(ga) => {
+                assert_eq!(ga.ga_code, "GA003");
+                assert_eq!(ga.message, "unable to serve");
+            }
+            SweepBodyVerdict::Candles(candles, _) => panic!(
+                "sweep-time FAILURE envelope must classify GaFailure — \
+                 an empty Candles set ({candles:?}) would be dressed as \
+                 named_gap vendor absence"
+            ),
+        }
+        // Real candles + a genuinely-empty SUCCESS body take the honest
+        // Candles path (vendor absence stays named_gap).
+        match classify_sweep_body(r#"{"candles":[[1783914300,1.0,2.0,0.5,1.5,0,null]]}"#) {
+            SweepBodyVerdict::Candles(candles, _) => assert_eq!(candles.len(), 1),
+            SweepBodyVerdict::GaFailure(ga) => panic!("candle body must not sniff: {ga:?}"),
+        }
+        match classify_sweep_body(r#"{"status":"SUCCESS","payload":{"candles":[]}}"#) {
+            SweepBodyVerdict::Candles(candles, _) => assert!(candles.is_empty()),
+            SweepBodyVerdict::GaFailure(ga) => panic!("SUCCESS body must not sniff: {ga:?}"),
         }
     }
 

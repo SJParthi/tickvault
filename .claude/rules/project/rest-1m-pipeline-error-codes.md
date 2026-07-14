@@ -287,9 +287,13 @@ minute_failed coalesced log, the escalation edge, and a named
 a redacted bounded message sample. The CHAIN leg (already error-classified)
 gains the same `ga_code=` forensics in its parse-failure msg. FORENSICS
 ONLY — policy never branches on the GA code (no short-circuit even on
-GA005; auth short-circuit stays HTTP-401/403-only). The CONTRACT leg still
-takes the shared parser's empty return on a FAILURE envelope — flagged
-follow-up.
+GA005; auth short-circuit stays HTTP-401/403-only). The spot SWEEP arm
+(~15:31 IST) applies the SAME sniff — a sweep-time GA FAILURE classifies
+`sweep_failed` with the real 200 status + ga_code, never dressed as vendor
+absence (`named_gap`). The CONTRACT leg is now the ONLY consumer of the
+shared parser's FAILURE-empty return — flagged follow-up.
+
+**2026-07-13 — the GROWW CONTRACT leg emits this SAME code with
 `leg = "contract_1m"` (no new variant):** the per-minute per-contract 1m
 candle leg (`crates/app/src/groww_contract_1m_boot.rs`, operator grant
 2026-07-13 — `groww-second-feed-scope-2026-06-19.md` §38 /

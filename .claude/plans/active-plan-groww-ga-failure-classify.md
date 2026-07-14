@@ -174,3 +174,30 @@ reverted with the same commit. No deploy coupling.
   .claude/rules/project/rest-1m-pipeline-error-codes.md
 - [x] G9 assessment: DEFERRED with explicit arithmetic (see Design)
 - [x] Archive the two merged plans (plan-enforcement rule 7)
+
+## Plan Items — adversarial-review fixes (coordinator review of a975e056, 2026-07-14)
+
+- [x] HIGH: restore the 2026-07-13 CONTRACT-leg paragraph header line the
+  first rule-file edit clobbered (recovered verbatim from origin/main) —
+  Files: .claude/rules/project/rest-1m-pipeline-error-codes.md
+- [x] HIGH: sweep arm reclassify — the ~15:31 post-session sweep now sniffs
+  the FAILURE envelope via the pure `classify_sweep_body` choke point; a
+  sweep-time GA failure records `outcome=error, class="ga_failure",
+  status=200` + a coded sweep_failed log with ga_code, never `named_gap`
+  vendor absence — Files: crates/app/src/groww_spot_1m_boot.rs — Tests:
+  test_sweep_body_ga_failure_never_classifies_as_vendor_absence
+- [x] HIGH: truth-sync the parser-site comment + rule-file wording — after
+  the sweep fix the CONTRACT leg is the ONLY production consumer of the
+  shared parser's FAILURE-empty return (verified by grep: the sole
+  remaining unsniffed call site is groww_contract_1m_boot.rs:1214) — Files:
+  crates/app/src/groww_spot_1m_boot.rs,
+  .claude/rules/project/rest-1m-pipeline-error-codes.md
+- [x] MEDIUM (security): ga_code sanitized to the `[A-Za-z0-9_-]` allowlist
+  BEFORE the 16-char bound ("none" when empty after filter) so
+  newline/ANSI/BiDi/quote chars never reach a tracing field — Files:
+  crates/app/src/groww_spot_1m_boot.rs — Tests:
+  test_parse_groww_ga_failure_envelope_extracts_code_and_message (hostile
+  \n/ESC/quote/BiDi arms)
+- [x] OPTIONAL single-parse of the 2xx body: SKIPPED (would grow the diff;
+  the second parse is one serde_json pass over a tiny failure body on the
+  cold path)
