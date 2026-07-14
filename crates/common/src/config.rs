@@ -164,6 +164,14 @@ pub struct ApplicationConfig {
     /// section ⇒ DISABLED (fail-safe default off).
     #[serde(default)]
     pub groww_contract_1m: GrowwContract1mConfig,
+    /// `[exit_orders]` — 🔷 DHAN exit-order execution layer (Cluster B,
+    /// 2026-07-14; `.claude/rules/project/dhan-exit-order-lockout-2026-07-14.md`).
+    /// LOCK #1 of the 4-lock OFF switch: default OFF; absent section =
+    /// disabled (fail-safe). The app-crate dispatcher drops every
+    /// `ExitCommand` while disabled; enabling activates DRY-RUN PAPER
+    /// behavior only (the engine's hardcoded `dry_run` blocks live POSTs).
+    #[serde(default)]
+    pub exit_orders: ExitOrdersConfig,
 }
 
 /// `[feeds]` — pluggable market-data feed selection (operator lock
@@ -705,6 +713,147 @@ impl Default for Spot1mRestConfig {
             fetch_mode: SpotFetchMode::default(),
             batch_interval_minutes: default_spot1m_batch_interval_minutes(),
         }
+    }
+}
+
+/// Days after which the operator's freeze-limit review is considered
+/// stale (>90 days ⇒ one boot-time WARN at trading-pipeline init —
+/// design Ruling 6 amendment, 2026-07-14).
+const FREEZE_REVIEW_STALE_DAYS: i64 = 90;
+
+/// Serde default for [`ExitOrdersConfig::mpp_verify_deadline_secs`] — 30.
+fn default_mpp_verify_deadline_secs() -> u64 {
+    30
+}
+
+/// Serde default for [`ExitOrdersConfig::mpp_verify_max_attempts`] — 5
+/// (the 1, 2, 4, 8, 10 ladder: 25s cumulative inside the 30s deadline).
+fn default_mpp_verify_max_attempts() -> u32 {
+    5
+}
+
+/// `[exit_orders]` — 🔷 DHAN exit-order execution layer (Cluster B,
+/// 2026-07-14 — LOCK #1 of the 4-lock OFF switch;
+/// `.claude/rules/project/dhan-exit-order-lockout-2026-07-14.md`).
+///
+/// Fail-safe: absent section = disabled (every field is
+/// `#[serde(default)]`-safe). The app-crate dispatcher
+/// (`crates/app/src/exit_execution.rs`) drops every `ExitCommand` while
+/// `enabled = false`; flipping to `true` activates DRY-RUN PAPER behavior
+/// ONLY (the engine's hardcoded `dry_run: true` blocks every live POST) —
+/// a flip is never a silent no-op: one boot log line names the mode.
+/// The ENGINE stays config-free (per-call parameters only — policy lives
+/// in the app layer, design Ruling 8).
+#[derive(Debug, Clone, Deserialize)]
+pub struct ExitOrdersConfig {
+    /// Master switch for the exit-order dispatcher. Default OFF
+    /// (fail-safe) — `config/base.toml` carries the section with
+    /// `enabled = false` as the ratchet's non-vacuous scan surface.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Exchange freeze quantity (operator-supplied; NO Dhan-side constant
+    /// exists in-repo — Verified V10). `0` = unset; [`Self::validate`]
+    /// requires `>= 1` when `enabled`. The per-underlying MAP is deferred
+    /// to Cluster A (Ruling 6 amendment); a per-call `freeze_limit`
+    /// parameter on `place_order_sliced` always wins over this scalar.
+    #[serde(default)]
+    pub default_freeze_limit_qty: i64,
+    /// `"YYYY-MM-DD"` the operator last verified the freeze limit against
+    /// the NSE qtyfreeze file. `>90` days stale ⇒ one boot-time WARN
+    /// (via [`freeze_review_is_stale`], logged at trading-pipeline init).
+    #[serde(default)]
+    pub freeze_limits_reviewed_on: String,
+    /// MPP verify-after-place deadline (seconds) — past it a still-PENDING
+    /// order classifies `PendingAtLimit` (orders.md rule 18: a MARKET
+    /// order auto-converted to LIMIT is NEVER assumed filled).
+    #[serde(default = "default_mpp_verify_deadline_secs")]
+    pub mpp_verify_deadline_secs: u64,
+    /// Verify-ladder probe budget (1-indexed rungs of
+    /// `exit_rules::next_verify_backoff_secs`). Default 5 → the
+    /// 1, 2, 4, 8, 10 ladder (25s cumulative inside the 30s deadline).
+    #[serde(default = "default_mpp_verify_max_attempts")]
+    pub mpp_verify_max_attempts: u32,
+    /// Default trailing jump for brackets (`0.0` = no trailing).
+    #[serde(default)]
+    pub default_trailing_jump: f64,
+}
+
+impl Default for ExitOrdersConfig {
+    /// Manual impl so `Default` matches the serde field defaults exactly
+    /// (a derived `Default` would zero the verify deadline/attempts while
+    /// an empty `[exit_orders]` section deserializes them to 30/5).
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            default_freeze_limit_qty: 0,
+            freeze_limits_reviewed_on: String::new(),
+            mpp_verify_deadline_secs: default_mpp_verify_deadline_secs(),
+            mpp_verify_max_attempts: default_mpp_verify_max_attempts(),
+            default_trailing_jump: 0.0,
+        }
+    }
+}
+
+impl ExitOrdersConfig {
+    /// Boot-time validation (design §3.6).
+    ///
+    /// Always: `mpp_verify_deadline_secs` in `1..=300`;
+    /// `mpp_verify_max_attempts` in `1..=8`; `default_trailing_jump`
+    /// finite and `>= 0.0`. When `enabled`: `default_freeze_limit_qty >= 1`
+    /// and `freeze_limits_reviewed_on` parses as `%Y-%m-%d`.
+    ///
+    /// # Errors
+    /// Returns a descriptive error on the first violated bound.
+    pub fn validate(&self) -> Result<()> {
+        if !(1..=300).contains(&self.mpp_verify_deadline_secs) {
+            bail!(
+                "exit_orders.mpp_verify_deadline_secs ({}) must be within 1..=300",
+                self.mpp_verify_deadline_secs
+            );
+        }
+        if !(1..=8).contains(&self.mpp_verify_max_attempts) {
+            bail!(
+                "exit_orders.mpp_verify_max_attempts ({}) must be within 1..=8",
+                self.mpp_verify_max_attempts
+            );
+        }
+        if !(self.default_trailing_jump.is_finite() && self.default_trailing_jump >= 0.0) {
+            bail!(
+                "exit_orders.default_trailing_jump ({}) must be finite and >= 0.0",
+                self.default_trailing_jump
+            );
+        }
+        if self.enabled {
+            if self.default_freeze_limit_qty < 1 {
+                bail!(
+                    "exit_orders.default_freeze_limit_qty ({}) must be >= 1 when \
+                     exit_orders.enabled = true (operator-supplied exchange freeze quantity)",
+                    self.default_freeze_limit_qty
+                );
+            }
+            if chrono::NaiveDate::parse_from_str(&self.freeze_limits_reviewed_on, "%Y-%m-%d")
+                .is_err()
+            {
+                bail!(
+                    "exit_orders.freeze_limits_reviewed_on ('{}') must be a YYYY-MM-DD date \
+                     when exit_orders.enabled = true",
+                    self.freeze_limits_reviewed_on
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Pure staleness check for the operator's freeze-limit review date
+/// (>[`FREEZE_REVIEW_STALE_DAYS`] days ⇒ stale). Empty or unparsable
+/// `reviewed_on` is STALE (fail-safe — the WARN fires rather than a
+/// silent pass). The WARN itself is logged at trading-pipeline init,
+/// not here (this function is pure — zero I/O).
+pub fn freeze_review_is_stale(reviewed_on: &str, today: chrono::NaiveDate) -> bool {
+    match chrono::NaiveDate::parse_from_str(reviewed_on, "%Y-%m-%d") {
+        Ok(reviewed) => (today - reviewed).num_days() > FREEZE_REVIEW_STALE_DAYS,
+        Err(_) => true,
     }
 }
 
@@ -2428,6 +2577,11 @@ impl ApplicationConfig {
         self.dhan_data_api.validate()?;
         self.spot_1m_rest.validate()?;
 
+        // 🔷 DHAN exit-order layer (Cluster B, 2026-07-14): verify-ladder
+        // bounds always; freeze-limit + review-date sanity when enabled —
+        // rejected at boot, BEFORE the trading pipeline spawns.
+        self.exit_orders.validate()?;
+
         Ok(())
     }
 }
@@ -2825,6 +2979,7 @@ mod tests {
             groww_option_chain_1m: GrowwOptionChain1mConfig::default(),
             tf_consistency: TfConsistencyConfig::default(),
             groww_contract_1m: GrowwContract1mConfig::default(),
+            exit_orders: ExitOrdersConfig::default(),
         }
     }
 
@@ -4700,6 +4855,178 @@ mod tests {
             .expect("explicit values must round-trip");
         assert!(on.groww_contract_1m.enabled);
         assert_eq!(on.groww_contract_1m.strikes_each_side, 1);
+    }
+
+    /// 🔷 DHAN exit-order layer (Cluster B, 2026-07-14): the
+    /// `[exit_orders]` section is FAIL-SAFE default OFF — via `Default`,
+    /// a missing section, and an empty section — with the verify-ladder
+    /// defaults (30s deadline, 5 attempts) intact; explicit values
+    /// round-trip. LOCK #1 of the 4-lock OFF switch.
+    #[test]
+    fn test_exit_orders_config_defaults_off_and_round_trips() {
+        use figment::Figment;
+        use figment::providers::{Format, Toml};
+
+        let d = ExitOrdersConfig::default();
+        assert!(
+            !d.enabled,
+            "exit_orders must default OFF (LOCK #1 — fail-safe)"
+        );
+        assert_eq!(d.default_freeze_limit_qty, 0, "freeze default is UNSET");
+        assert!(d.freeze_limits_reviewed_on.is_empty());
+        assert_eq!(d.mpp_verify_deadline_secs, 30);
+        assert_eq!(d.mpp_verify_max_attempts, 5);
+        assert!((d.default_trailing_jump - 0.0).abs() < f64::EPSILON);
+
+        #[derive(Deserialize)]
+        struct Wrapper {
+            #[serde(default)]
+            exit_orders: ExitOrdersConfig,
+        }
+        // Missing section entirely → disabled, never an error.
+        let missing: Wrapper = Figment::new()
+            .merge(Toml::string("[other]\nx = 1\n"))
+            .extract()
+            .expect("missing [exit_orders] must default, not error");
+        assert!(!missing.exit_orders.enabled);
+        assert_eq!(missing.exit_orders.mpp_verify_deadline_secs, 30);
+        assert_eq!(missing.exit_orders.mpp_verify_max_attempts, 5);
+        // Empty section (no keys) → field-level defaults (the base.toml
+        // enabled = false shape must also parse).
+        let empty: Wrapper = Figment::new()
+            .merge(Toml::string("[exit_orders]\nenabled = false\n"))
+            .extract()
+            .expect("the base.toml [exit_orders] shape must parse");
+        assert!(!empty.exit_orders.enabled);
+        assert_eq!(empty.exit_orders.mpp_verify_deadline_secs, 30);
+        // Explicit values (the future dry-run-enable shape) round-trip.
+        let on: Wrapper = Figment::new()
+            .merge(Toml::string(
+                "[exit_orders]\nenabled = true\ndefault_freeze_limit_qty = 1800\n\
+                 freeze_limits_reviewed_on = \"2026-07-14\"\nmpp_verify_deadline_secs = 45\n\
+                 mpp_verify_max_attempts = 6\ndefault_trailing_jump = 0.5\n",
+            ))
+            .extract()
+            .expect("explicit values must round-trip");
+        assert!(on.exit_orders.enabled);
+        assert_eq!(on.exit_orders.default_freeze_limit_qty, 1800);
+        assert_eq!(on.exit_orders.freeze_limits_reviewed_on, "2026-07-14");
+        assert_eq!(on.exit_orders.mpp_verify_deadline_secs, 45);
+        assert_eq!(on.exit_orders.mpp_verify_max_attempts, 6);
+        assert!((on.exit_orders.default_trailing_jump - 0.5).abs() < f64::EPSILON);
+        assert!(on.exit_orders.validate().is_ok());
+    }
+
+    /// `ExitOrdersConfig::validate` — every bound, boundary-tested
+    /// (design §3.6): deadline 1..=300, attempts 1..=8, finite
+    /// non-negative trailing jump always; freeze >= 1 + parseable
+    /// review date only when enabled.
+    #[test]
+    fn test_exit_orders_config_validate_bounds() {
+        // Disabled defaults are always valid (the shipped state).
+        assert!(ExitOrdersConfig::default().validate().is_ok());
+
+        // Deadline bounds — 0 and 301 reject, 1 and 300 pass.
+        for (deadline, ok) in [(0_u64, false), (301, false), (1, true), (300, true)] {
+            let cfg = ExitOrdersConfig {
+                mpp_verify_deadline_secs: deadline,
+                ..Default::default()
+            };
+            assert_eq!(
+                cfg.validate().is_ok(),
+                ok,
+                "deadline {deadline} boundary verdict must be {ok}"
+            );
+        }
+
+        // Attempt bounds — 0 and 9 reject, 1 and 8 pass.
+        for (attempts, ok) in [(0_u32, false), (9, false), (1, true), (8, true)] {
+            let cfg = ExitOrdersConfig {
+                mpp_verify_max_attempts: attempts,
+                ..Default::default()
+            };
+            assert_eq!(
+                cfg.validate().is_ok(),
+                ok,
+                "attempts {attempts} boundary verdict must be {ok}"
+            );
+        }
+
+        // Trailing jump — NaN / infinity / negative reject; 0.0 passes.
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -0.05] {
+            let cfg = ExitOrdersConfig {
+                default_trailing_jump: bad,
+                ..Default::default()
+            };
+            assert!(
+                cfg.validate().is_err(),
+                "trailing jump {bad} must reject (finite >= 0.0 required)"
+            );
+        }
+        let cfg = ExitOrdersConfig {
+            default_trailing_jump: 0.0,
+            ..Default::default()
+        };
+        assert!(cfg.validate().is_ok());
+
+        // Enabled-only gates: freeze must be >= 1 and the review date must
+        // parse — the DISABLED default (freeze 0, empty date) stays valid.
+        let mut cfg = ExitOrdersConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        assert!(
+            cfg.validate().is_err(),
+            "enabled with freeze 0 (unset) must reject"
+        );
+        cfg.default_freeze_limit_qty = 1800;
+        assert!(
+            cfg.validate().is_err(),
+            "enabled with empty review date must reject"
+        );
+        cfg.freeze_limits_reviewed_on = "14-07-2026".to_string();
+        assert!(
+            cfg.validate().is_err(),
+            "enabled with non-%Y-%m-%d review date must reject"
+        );
+        cfg.freeze_limits_reviewed_on = "2026-07-14".to_string();
+        assert!(cfg.validate().is_ok(), "enabled with sane values must pass");
+        cfg.default_freeze_limit_qty = -5;
+        assert!(cfg.validate().is_err(), "negative freeze must reject");
+    }
+
+    /// `freeze_review_is_stale` — pure >90-day boundary + fail-safe on
+    /// empty/garbage input (stale ⇒ the boot WARN fires, never a silent
+    /// pass on an unparsable date).
+    #[test]
+    fn test_freeze_review_is_stale_boundary_and_fail_safe() {
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 7, 14).unwrap_or_default();
+        // Exactly 90 days old = NOT stale (strict > per the design).
+        assert!(!freeze_review_is_stale("2026-04-15", today));
+        // 91 days old = stale.
+        assert!(freeze_review_is_stale("2026-04-14", today));
+        // Same-day and future reviews are fresh.
+        assert!(!freeze_review_is_stale("2026-07-14", today));
+        // Empty / garbage / wrong format ⇒ STALE (fail-safe).
+        assert!(freeze_review_is_stale("", today));
+        assert!(freeze_review_is_stale("not-a-date", today));
+        assert!(freeze_review_is_stale("14-07-2026", today));
+    }
+
+    /// `ApplicationConfig::validate` rejects a bad `[exit_orders]`
+    /// section (the boot-time hook is actually wired).
+    #[test]
+    fn test_application_config_validate_rejects_bad_exit_orders() {
+        let mut config = make_valid_config();
+        config.exit_orders.mpp_verify_max_attempts = 0;
+        let err = config.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("mpp_verify_max_attempts"),
+            "error must name the violated exit_orders bound, got: {err}"
+        );
+        // And the valid default passes end-to-end.
+        let config = make_valid_config();
+        assert!(config.validate().is_ok());
     }
 
     /// A missing `[feeds]` section must fall back to the safe default
