@@ -1,6 +1,6 @@
 # Implementation Plan: Groww chain per-underlying not-served paging edge
 
-**Status:** IN_PROGRESS
+**Status:** VERIFIED
 **Date:** 2026-07-14
 **Approved by:** coordinator relay (operator-directed follow-up, 2026-07-14)
 
@@ -69,14 +69,14 @@ of `SecurityId`):
 
 ## Plan Items
 
-- [ ] Item 1 — Constant: `GROWW_CHAIN_1M_UNDERLYING_NOT_SERVED_THRESHOLD = 10`
+- [x] Item 1 — Constant: `GROWW_CHAIN_1M_UNDERLYING_NOT_SERVED_THRESHOLD = 10`
   in the GROWW_CHAIN_1M constants block (doc style copied from
   `SPOT_1M_REST_SID_NOT_SERVED_THRESHOLD`), pinned in the existing
   chain-constants test.
   - Files: crates/common/src/constants.rs
   - Tests: test_groww_chain_1m_constants_pinned (extended)
 
-- [ ] Item 2 — Typed events: `GrowwChain1mUnderlyingNotServed` (High) +
+- [x] Item 2 — Typed events: `GrowwChain1mUnderlyingNotServed` (High) +
   `GrowwChain1mUnderlyingServedRecovered` (Info) — variant + to_message
   (10-commandments body) + topic + severity + unit tests, mirroring the
   `Spot1mSidNotServed` / `Spot1mSidServedRecovered` pair.
@@ -84,7 +84,7 @@ of `SecurityId`):
   - Tests: test_groww_chain_underlying_not_served_event,
     test_groww_chain_underlying_served_recovered_event
 
-- [ ] Item 3 — Pure tracker + wiring: `UnderlyingServedTracker` /
+- [x] Item 3 — Pure tracker + wiring: `UnderlyingServedTracker` /
   `UnderlyingEdgeAction` pure core, verdict collection in
   `fire_one_groww_chain_minute`, the
   `record_groww_chain_underlying_verdicts` emission sink (counter +
@@ -101,7 +101,7 @@ of `SecurityId`):
     test_fire_token_path_found_and_empty_via_mock (extended),
     test_fire_token_path_auth_reject_short_circuits_via_mock (extended)
 
-- [ ] Item 4 — Rule-file edit: dated 2026-07-14 paragraph in
+- [x] Item 4 — Rule-file edit: dated 2026-07-14 paragraph in
   `rest-1m-pipeline-error-codes.md` §2c documenting the new
   `stage="underlying_not_served"` arm, counter, threshold, the
   no-double-fire argument, the motivating incident, and the delivery
