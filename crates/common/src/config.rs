@@ -841,14 +841,28 @@ impl ExitOrdersConfig {
                     self.default_freeze_limit_qty
                 );
             }
-            if chrono::NaiveDate::parse_from_str(&self.freeze_limits_reviewed_on, "%Y-%m-%d")
-                .is_err()
-            {
-                bail!(
-                    "exit_orders.freeze_limits_reviewed_on ('{}') must be a YYYY-MM-DD date \
-                     when exit_orders.enabled = true",
-                    self.freeze_limits_reviewed_on
-                );
+            match chrono::NaiveDate::parse_from_str(&self.freeze_limits_reviewed_on, "%Y-%m-%d") {
+                Err(_) => {
+                    bail!(
+                        "exit_orders.freeze_limits_reviewed_on ('{}') must be a YYYY-MM-DD date \
+                         when exit_orders.enabled = true",
+                        self.freeze_limits_reviewed_on
+                    );
+                }
+                Ok(reviewed) => {
+                    // L2 (2026-07-14 hostile review): a FUTURE review date is
+                    // a typo/backdating error — it would silence the >90-day
+                    // staleness WARN forever. IST calendar day (market-hours
+                    // rule; the same helper the trading-day checks use).
+                    let today_ist = ist_date_from_utc(chrono::Utc::now());
+                    if reviewed > today_ist {
+                        bail!(
+                            "exit_orders.freeze_limits_reviewed_on ('{}') is in the future \
+                             (IST today is {today_ist}) — the review date must be today or past",
+                            self.freeze_limits_reviewed_on
+                        );
+                    }
+                }
             }
         }
         Ok(())
@@ -5410,6 +5424,32 @@ mod tests {
         assert!(cfg.validate().is_ok(), "enabled with sane values must pass");
         cfg.default_freeze_limit_qty = -5;
         assert!(cfg.validate().is_err(), "negative freeze must reject");
+    }
+
+    /// L2 (2026-07-14 hostile review): a FUTURE `freeze_limits_reviewed_on`
+    /// rejects when enabled — a typo'd/backdated future review date would
+    /// silence the >90-day staleness WARN forever. Past dates (even stale
+    /// ones) stay valid — staleness is the WARN's job, not validate()'s.
+    #[test]
+    fn test_exit_orders_config_validate_rejects_future_review_date() {
+        let mut cfg = ExitOrdersConfig {
+            enabled: true,
+            default_freeze_limit_qty: 1800,
+            freeze_limits_reviewed_on: "2999-01-01".to_string(),
+            ..Default::default()
+        };
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("future"),
+            "error must name the future date, got: {err}"
+        );
+        // A stale-but-past date validates (the staleness WARN handles it).
+        cfg.freeze_limits_reviewed_on = "2020-01-01".to_string();
+        assert!(cfg.validate().is_ok());
+        // Disabled configs never evaluate the date at all.
+        cfg.enabled = false;
+        cfg.freeze_limits_reviewed_on = "2999-01-01".to_string();
+        assert!(cfg.validate().is_ok());
     }
 
     /// `freeze_review_is_stale` — pure >90-day boundary + fail-safe on

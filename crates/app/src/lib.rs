@@ -215,8 +215,9 @@ pub mod api_token_rotation;
 pub mod daily_universe_boot;
 /// 🔷 DHAN exit-order execution dispatcher (Cluster B, 2026-07-14) — the
 /// S6-G1 call-site hub for every engine exit method + LOCK #2's runtime
-/// `!cfg.enabled` gate. Cluster A constructs `ExitCommand`s; only this
-/// module executes them (never the engine methods directly).
+/// `!cfg.enabled` gate. Future entry-side (Cluster A) work constructs
+/// `ExitCommand`s; only this module executes them (never the engine
+/// methods directly).
 pub mod exit_execution;
 pub mod subsystem_memory;
 pub mod trading_pipeline;

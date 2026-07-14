@@ -483,9 +483,20 @@ async fn run_trading_pipeline(
                                     // byte-equivalent legacy cancel+close body; enabled ⇒
                                     // ExitCommand::CloseAll through the dispatcher (super-
                                     // order-aware cancel + sliced close + MPP verify ladder).
+                                    //
+                                    // HONEST BLOCKING ENVELOPE (H3, 2026-07-14 hostile
+                                    // review): while [exit_orders] is ENABLED this await
+                                    // stalls THE STRATEGY TASK for up to
+                                    // ~mpp_verify_deadline_secs per close order (the
+                                    // CloseAll verify budget bounds the multi-slice case to
+                                    // ONE deadline) — ticks buffer in the broadcast channel
+                                    // meanwhile and order updates may lag. Accepted for the
+                                    // dry-run layer; the PRE-LIVE design change is a
+                                    // SPAWNED exit executor (rule-file §4 enable-time
+                                    // protocol).
                                     crate::exit_execution::execute_exit_for_security(
                                         &mut oms,
-                                        &risk_engine,
+                                        &mut risk_engine,
                                         tick.security_id,
                                         &config.exit_orders,
                                     )

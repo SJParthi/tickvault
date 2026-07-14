@@ -35,7 +35,8 @@ use super::types::{
     DhanPlaceSuperOrderRequest, DhanPositionResponse, DhanSuperOrderResponse, DhanTradeEntry,
     EdisFormRequest, EdisInquiryResponse, FundLimitResponse, KillSwitchResponse,
     MarginCalculatorRequest, MarginCalculatorResponse, MultiMarginRequest, MultiMarginResponse,
-    OmsError, OrderLeg, PnlExitRequest, PnlExitResponse, PnlExitStatusResponse, SlicingResponse,
+    OmsError, OrderLeg, PnlExitRequest, PnlExitResponse, PnlExitStatusResponse,
+    SUPER_ORDER_STATUS_ACCEPTED_UNPARSED_BODY, SlicingResponse,
 };
 
 // ---------------------------------------------------------------------------
@@ -118,7 +119,7 @@ fn parse_2xx_body_tolerant(body: &str, endpoint: &'static str) -> DhanSuperOrder
                 "2xx super-order response body unparsable — treating as accepted \
                  (202-no-body class per docs/dhan-ref/dhanhq-v2-upstream-2026-07-03/04-super-orders.md:151)"
             );
-            synthetic_super_order_response("ACCEPTED_UNPARSED_BODY")
+            synthetic_super_order_response(SUPER_ORDER_STATUS_ACCEPTED_UNPARSED_BODY)
         }
     }
 }

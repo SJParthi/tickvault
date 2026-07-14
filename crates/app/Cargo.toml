@@ -59,6 +59,11 @@ notify = { workspace = true }
 # (source_csv_sha256 provenance); optional so the default build stays lean.
 sha2 = { workspace = true, optional = true }
 
+[dev-dependencies]
+# start_paused virtual-time tests for the exit-execution verify ladder
+# (same pattern as crates/core + crates/api dev-deps).
+tokio = { workspace = true, features = ["test-util"] }
+
 [features]
 # GO-LIVE (PR-3, 2026-05-28): daily_universe_fetcher is now in `default` per
 # the operator full-go-live approval ("250 SIDs + new scope as production AND
