@@ -7,6 +7,7 @@
 //! - `rate_limiter` — SEBI-mandated GCRA rate limiter
 //! - `circuit_breaker` — Dhan API circuit breaker
 //! - `idempotency` — UUID v4 correlation ID tracking
+//! - `margin_gate` — 🔷 DHAN pre-trade margin gate (exits never gated)
 //! - `reconciliation` — REST-based state sync
 //! - `engine` — Orchestrator composing all sub-components
 //!
@@ -35,7 +36,7 @@ pub mod dh904_backoff;
 pub mod engine;
 pub mod error_taxonomy;
 pub mod idempotency;
-pub mod order_readiness;
+pub mod margin_gate;
 pub mod rate_limiter;
 pub mod reconciliation;
 pub mod state_machine;
@@ -44,9 +45,9 @@ pub mod types;
 // Re-export key types for ergonomic use.
 pub use api_client::OrderApiClient;
 pub use engine::{OrderManagementSystem, TokenProvider};
-pub use error_taxonomy::{BrokerCooldownLatch, DhanErrorClass, OrderEndpoint, OrderErrorPolicy};
-pub use order_readiness::{OrderReadinessState, ProbeOutcome, ReadinessProbe, ReadinessRefusal};
+pub use margin_gate::{MarginGate, MarginSnapshot, MarginVerdict};
 pub use rate_limiter::OrderRateLimiter;
 pub use types::{
-    ManagedOrder, ModifyOrderRequest, OmsError, PlaceOrderRequest, ReconciliationReport,
+    ManagedOrder, ModifyOrderRequest, OmsError, OrderIntent, PlaceOrderRequest,
+    ReconciliationReport,
 };

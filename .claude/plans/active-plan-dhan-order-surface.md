@@ -210,81 +210,6 @@ Other clusters (checked off by their owning sessions' PRs, all referencing THIS 
 - [ ] E2 — portfolio + margin gate (OrderIntent in RiskEngine::check_order; design-only until the operator REST grant)
   - Files: crates/trading/src/risk/engine.rs, crates/trading/src/oms/api_client.rs
   - Tests: TBD by owning session (exit-never-gated invariant test mandatory)
-- [x] CT1 — Conditional & Multi Order surface (dhanhq v2 /alerts family): typed constructors +
-      `POST /alerts/multi/orders` wrapper, dormant behind the hardcoded alerts gate,
-      Equities/Indices fail-closed segment lock
-  - Gate: `alerts_gate_armed: bool = false` inside `OrderApiClient::new()` (house Lock-1 mirror:
-    hardcoded default + #[cfg(test)]-only `arm_alerts_gate_for_test`); ALL SIX /alerts senders
-    (5 existing Phase-6 fns + new `place_multi_order`) call `require_alerts_gate` FIRST and
-    refuse with the NEW additive `OmsError::AlertsSurfaceDisarmed{operation}` before any
-    URL/socket work. Zero engine.rs / app-crate / config edits. Ratcheted by NEW
-    `crates/trading/tests/conditional_gate_guard.rs` (7 source-scan tests incl. scanner
-    self-test, production-region #[cfg(test)] split, single-choke-point path grep,
-    zero-production-caller dormancy pin).
-  - Types (types.rs additive): `MultiOrderLeg`/`DhanMultiOrderRequest`/`DhanMultiOrderResponse`/
-    `MultiOrderLegResult` (DISTINCT schema: float prices + int disclosedQuantity + sequence/
-    correlationId/AMO vs the conditional legs' string prices + discQuantity), `DhanNumeric`
-    (number-or-string tolerance), `TriggerConditionDetail` (response-only, string-comparingValue
-    safe), GET-detail fields (createdTime/triggeredTime UTC-Z + lastPrice + condition + orders,
-    all #[serde(default)] additive), modify-body optional `alert_id`.
-  - Constructors (NEW crates/trading/src/oms/conditional.rs, pure): `ConditionalSegment`
-    {NSE_EQ, BSE_EQ, IDX_I} (condition, docs-verbatim) + `ConditionalLegSegment` {NSE_EQ, BSE_EQ}
-    (legs — IDX_I not orderable, F&O fail-closed per the family support note; widening needs an
-    operator quote + .claude/rules/dhan/conditional-trigger.md edit FIRST); `TriggerIndicatorName`
-    (21 wire values), `AmoTime`, `TriggerConditionSpec` (4 variants = mandatory-field matrix
-    unrepresentable-wrong), `ConditionalBuildError`; `build_trigger_condition`,
-    `build_trigger_order`, `build_conditional_trigger_request`, `with_alert_id`,
-    `build_multi_order_request` (1..=15 legs via DHAN_CONDITIONAL_MAX_ORDERS_PER_REQUEST,
-    auto-stamped "1".."N" sequences, paise-integer price inputs — exact string formatting for
-    conditional legs, capped paise→f64 for multi legs).
-  - Ledger + docs: dhan_api_coverage conditional 5→6, rest_paths/constants 16→17, totals
-    50→51/54→55 + header (lockstep); `DHAN_ALERTS_MULTI_ORDERS_PATH` constant + the constants.rs
-    slash-test array; NEW `.claude/rules/dhan/conditional-trigger.md` (closes the CLAUDE.md
-    index drift; 18 mechanical rules incl. the multi-order divergence traps, UTC-Z, bare-array
-    GET-all, ONCE-vs-ALWAYS, no-CONFIRM); dated `2026-07-14 Upstream Update (2)` append to
-    `docs/dhan-ref/07c-conditional-trigger.md`. ZERO ErrorCode, ZERO NotificationEvent, ZERO
-    Telegram (noise lock).
-  - Honest envelope: multi endpoint response schema yaml-only UNVERIFIED-LIVE; rate bucket
-    Assumed (Order class); atomicity + quantity-on-modify undocumented; everything dormant —
-    dry_run true, zero production callers (ratcheted), no boot task.
-  - Files: crates/trading/src/oms/types.rs, crates/trading/src/oms/conditional.rs (NEW),
-    crates/trading/src/oms/api_client.rs, crates/trading/src/oms/mod.rs,
-    crates/common/src/constants.rs, crates/common/tests/dhan_api_coverage.rs,
-    crates/trading/tests/conditional_gate_guard.rs (NEW),
-    .claude/rules/dhan/conditional-trigger.md (NEW), docs/dhan-ref/07c-conditional-trigger.md
-  - Tests: test_alerts_gate_defaults_disarmed_in_constructor, test_alerts_gate_arm_is_cfg_test_only,
-    test_every_alerts_sender_checks_gate_first, test_no_production_caller_of_alerts_sender_fns,
-    test_leg_segment_enums_are_fail_closed, test_alerts_paths_single_choke_point,
-    test_gate_guard_scanner_self_test, test_place_multi_order_success,
-    test_place_multi_order_blocked_when_gate_disarmed_no_socket,
-    test_place_multi_order_rate_limited_429, test_place_multi_order_dhan_error_400_records_metric,
-    test_place_multi_order_malformed_json_error, test_url_construction_multi_order_uses_alerts_multi_path,
-    test_existing_conditional_fns_blocked_when_gate_disarmed, test_arm_alerts_gate_for_test_arms_gate,
-    test_multi_order_request_serializes_camel_case_exact, test_conditional_vs_multi_price_type_split,
-    test_multi_order_response_parses_unknown_order_status_modified_inactive_no_panic,
-    test_trigger_response_detail_fields_roundtrip, test_dhan_numeric_accepts_number_and_string,
-    test_modify_request_alert_id_absent_when_none, test_build_trigger_condition_all_four_comparison_types_serialize_mandatory_fields,
-    test_build_trigger_order_price_boundary_zero_market_ok_limit_zero_rejected,
-    test_build_trigger_order_quantity_boundary_zero_negative_i32_max_edge,
-    test_build_trigger_order_disclosed_quantity_boundary_30pct_edge,
-    test_build_conditional_trigger_request_leg_count_boundary_0_1_15_16,
-    test_build_multi_order_request_boundary_15_legs_max_16_rejected_zero_rejected,
-    test_build_multi_order_request_assigns_sequences_one_to_n,
-    test_build_multi_order_request_correlation_id_boundary_30_max_31_rejected_and_charset,
-    proptest_build_multi_order_request_never_panics_on_arbitrary_spec
-
-Cluster B (branch claude/dhan-order-error-taxonomy; MINIMAL ADDITION — this
-cluster was absent from the original umbrella; flagged in the PR body):
-
-- [x] B1 — order-path DH/DATA error taxonomy + per-endpoint retry matrix + 805 STOP-ALL latch + DH-904 ladder wiring
-  - Files: crates/trading/src/oms/error_taxonomy.rs, api_client.rs, mod.rs, crates/common/src/constants.rs
-  - Tests: ratchet_dh904_ladder_constants_and_wiring, ratchet_stop_all_cooldown_is_60s_per_annexure_rule_12, prop_classify_never_panics_and_is_deterministic_on_arbitrary_status_and_body
-- [x] B2 — order-readiness gate (profile/token headroom, fail-closed, live-path-only) + probe refresher (boot spawn = seam handoff)
-  - Files: crates/trading/src/oms/order_readiness.rs, engine.rs, types.rs
-  - Tests: test_place_order_live_refused_when_no_readiness_installed_zero_http_zero_token_fetch, test_place_order_dry_run_ignores_readiness_gate_byte_identical, test_evaluate_order_readiness_stale_boundary_2100_passes_2101_refuses
-- [x] B3 — ORDER-READY-01 ErrorCode + rule file + OmsAlert DHAN attribution
-  - Files: crates/common/src/error_code.rs, .claude/rules/project/order-readiness-error-codes.md, engine.rs
-  - Tests: test_order_ready_01_contract, test_all_oms_alert_operator_messages_start_with_dhan_badge
 
 ## Hard invariants (every Dhan-order PR states these)
 
@@ -453,7 +378,6 @@ adding one records the cost note per `aws-budget.md`.
 | `crates/trading/src/risk/engine.rs` | Cluster A this round (lot_size fix + halt extraction); E2's margin gate REBASES after A merges | `check_order` gains OrderIntent in E2 only |
 | `crates/app/src/groww_bridge.rs` tick seam | Cluster A | marks tap (one guarded try_send block) |
 | Storage order-audit writers (`crates/storage/src/`) | Cluster C | A emits via a seam C fills in; A ships without tables (flagged follow-up) |
-| `oms/{api_client.rs error/ladder additions, error_taxonomy.rs, order_readiness.rs}` + engine gate wiring (outside :256-277 / :549-660) | Cluster B (branch claude/dhan-order-error-taxonomy) | consumption-side classifier; SANDBOX + handle_order_update regions untouched; ~35 legacy api_client error sites byte-identical |
 
 Build-lead: the cluster A session. Conflicts on any seam: the
 non-owner rebases; never a force-merge over an owner's in-flight PR.
