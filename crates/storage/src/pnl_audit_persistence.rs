@@ -6,10 +6,17 @@
 //!   * `OnEod` — **the ONLY emitted kind today**: ONE aggregate row per
 //!     trading day at the market-close signal (sentinel `security_id = 0`,
 //!     `exchange_segment = "ALL"`), carrying the risk engine's
-//!     session-cumulative realized + unrealized P&L. This row is the DAILY
-//!     HEARTBEAT/DENOMINATOR — the table provably receives ≥1 row per
-//!     trading day, exercising channel→writer→ILP→QuestDB end-to-end, so
-//!     silence is detectable (audit Rule 11).
+//!     session-cumulative realized + unrealized P&L — the DAILY
+//!     HEARTBEAT/DENOMINATOR exercising channel→writer→ILP→QuestDB
+//!     end-to-end. HONEST ENVELOPE (C1, 2026-07-14 hostile review): the
+//!     emitting consumer + market-close signal are spawned by the trading
+//!     pipeline, whose BOTH spawn sites are Dhan-lane-gated — the whole
+//!     subsystem is code-ready but DORMANT while `feeds.dhan_enabled =
+//!     false` (today's prod default): on a dhan-off boot NO row lands here
+//!     (and nothing false-pages — nothing runs). The "≥1 on_eod row per
+//!     trading day, so silence is detectable" heartbeat contract (audit
+//!     Rule 11) holds whenever the Dhan lane / live trading runs (dhan-ON,
+//!     in-session, strategy-config-present boots).
 //!   * `OnFill` / `OnMinute` — enum variants SHIPPED, emits DEFERRED to
 //!     Phase-1 (per-position fill/minute snapshots need the live fill path;
 //!     honest scope — no dormant emit sites exist).
@@ -222,9 +229,12 @@ pub async fn ensure_pnl_audit_table(questdb_config: &QuestDbConfig) {
                 let body = resp.text().await.unwrap_or_default();
                 metrics::counter!("tv_pnl_audit_persist_errors_total", "stage" => "ensure_ddl")
                     .increment(1);
+                // SEC-2: bounded DDL prefix (our own static statement — the
+                // prefix identifies it; the full ~600-char CREATE would
+                // exceed the ≤300-char error-payload house bound).
                 error!(code = ErrorCode::StorageGap03AuditWriteFailed.code_str(),
                     stage = "ensure_ddl",
-                    %status, ddl = ddl.as_str(),
+                    %status, ddl = %ddl.chars().take(80).collect::<String>(),
                     body = %body.chars().take(200).collect::<String>(),
                     "STORAGE-GAP-03: pnl_audit DDL returned non-2xx (dedup may be \
                      missing — duplicate-row window until a later ensure succeeds)");
@@ -236,7 +246,8 @@ pub async fn ensure_pnl_audit_table(questdb_config: &QuestDbConfig) {
                     code = ErrorCode::StorageGap03AuditWriteFailed.code_str(),
                     stage = "ensure_ddl",
                     ?err,
-                    ddl = ddl.as_str(),
+                    // SEC-2: bounded DDL prefix (see the non-2xx arm).
+                    ddl = %ddl.chars().take(80).collect::<String>(),
                     "STORAGE-GAP-03: pnl_audit DDL request failed"
                 );
             }
@@ -721,5 +732,26 @@ mod tests {
         w.append_pnl_audit_row(&sample_row())
             .expect("append must succeed without network");
         assert_eq!(w.pending(), 1, "row buffered locally");
+    }
+
+    /// M2 (2026-07-14 hostile review): the `Some(Err(..))` flush arm — a
+    /// REAL server reject through a live (lazily-built) HTTP sender —
+    /// exercises the poisoned-buffer discard, not just the no-sender bail.
+    /// Multi-thread flavor so the mock server task serves while the sync
+    /// flush blocks the test task.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_pnl_audit_flush_server_reject_hits_some_err_and_discards() {
+        let port = spawn_mock_http(MOCK_HTTP_500).await;
+        let mut w = PnlAuditWriter::new(&mock_cfg(port));
+        w.append_pnl_audit_row(&sample_row())
+            .expect("append must succeed");
+        assert_eq!(w.pending(), 1);
+        let err = w.flush().expect_err("server 500 must surface as Err");
+        assert!(
+            err.to_string().contains("discarded"),
+            "discard context expected: {err:#}"
+        );
+        assert_eq!(w.pending(), 0, "failed flush discards pending");
+        assert!(w.buffer_utf8().is_empty(), "ILP buffer cleared on discard");
     }
 }

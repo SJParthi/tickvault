@@ -18,7 +18,9 @@
 # 10 free-tier alarms moves $2.30 -> $3.50/mo. The rule-file "10 alarms free
 # tier" claims were already stale pre-PR. (2026-07-09: +2 more alarms —
 # errcode-aggregator-drop-01 here + seal-writer-dropped in seal-drop-alarm.tf,
-# ~+$0.20/mo.)
+# ~+$0.20/mo.) (+3 (order-side-alarms.tf, 2026-07-14): orders-placed-storm +
+# daily-loss-breach + order-fill-lag-high (disarmed), ~+$0.30/mo — see
+# aws-budget.md COST NOTE 2026-07-14.)
 #
 # DIMENSIONLESS BY DESIGN: errors.jsonl events carry NO `host` field (the host
 # label is added by the Prometheus scrape, not the tracing layer), and metric

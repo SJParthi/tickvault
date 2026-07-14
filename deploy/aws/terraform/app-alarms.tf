@@ -48,6 +48,16 @@
 #     free) × $0.30 = $5.70/mo ⇒ ~$7.60/mo ≈ ₹650/mo total (matches the
 #     app_cloudwatch_alarms output below + aws-budget.md's 2026-07-06
 #     note). Operator MUST acknowledge before terraform apply.
+#   - +3 alarms (order-side-alarms.tf, 2026-07-14): orders-placed-storm
+#     (armed) + daily-loss-breach (armed, dormant-silent in dry-run) +
+#     order-fill-lag-high (disarmed) ≈ +$0.30/mo, +1 derived metric
+#     series (tv_orders_placed_delta_total) ≈ +$0.30/mo; the 2 new EMF
+#     names (tv_daily_pnl, tv_order_fill_lag_seconds) are DORMANT ($0
+#     until cluster A / Phase-1 emits). THIS file's alarm RESOURCE count
+#     stays 21 (the 3 new alarms live standalone in order-side-alarms.tf;
+#     the "twenty_three" wiring test counts METRIC NAMES across
+#     app-alarms.tf + silent-feed-alarms.tf — a different axis, no
+#     conflict). See aws-budget.md COST NOTE 2026-07-14.
 
 locals {
   # All alarms publish to the same SNS topic. Single source of truth so
@@ -339,6 +349,15 @@ resource "aws_cloudwatch_metric_alarm" "aggregator_no_seals" {
 # ---------------------------------------------------------------------------
 # 10. Order rejections — OMS or Dhan-side issue
 # ---------------------------------------------------------------------------
+# REJECTION-CLASS SPLIT (C4, 2026-07-14 hostile review): there are TWO
+# DISJOINT rejection classes. (a) Place-time API errors (DH-905/DH-906
+# at the place_order Err arm) — these fire the OrderRejected Telegram +
+# the `rejected` order_audit row AND (since the C4 fix) increment
+# tv_orders_rejected_total, so they page this alarm. (b) WS-reported
+# REJECTED transitions (process_order_update — the order-update WS is
+# functional-dormant today) — these increment the counter/alarm but
+# produce NO Telegram/audit row (the fire_alert at that transition is a
+# Phase-1 follow-up). The alarm and the Telegram are NOT one signal chain.
 resource "aws_cloudwatch_metric_alarm" "orders_rejected" {
   alarm_name          = "tv-${var.environment}-orders-rejected"
   alarm_description   = "One or more orders rejected in the last 5 minutes. Could be DH-905 (bad input), DH-906 (order error), or risk-gate denial."
@@ -352,7 +371,16 @@ resource "aws_cloudwatch_metric_alarm" "orders_rejected" {
   treat_missing_data  = "notBreaching"
   dimensions          = local.app_dimensions
   alarm_actions       = local.app_alarm_actions
-  ok_actions          = local.app_alarm_ok
+  # 2026-07-14 cluster-C order-side: ok_actions STRIPPED. The rejected
+  # count returning to 0 is not an all-clear (the rejected orders exist;
+  # the rejection cause may persist) — the auto-OK paged a Rule-11 false
+  # recovery on every episode aging out. The counter is now also
+  # pre-registered at 0 in main.rs (first-sample-baseline lesson) so a
+  # single-rejection session (place-time class — the counter emit at the
+  # place_order Err arm, C4) actually pages — see
+  # deploy/aws/terraform/order-side-alarms.tf +
+  # crates/app/tests/order_side_paging_wiring_guard.rs.
+  ok_actions = []
 }
 
 # ---------------------------------------------------------------------------

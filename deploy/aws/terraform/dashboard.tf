@@ -240,6 +240,30 @@ resource "aws_cloudwatch_dashboard" "operator" {
             aws_cloudwatch_metric_alarm.disk_used_high.arn
           ]
         }
+      },
+
+      # ----- Row 6: order-side (cluster C, 2026-07-14) -----
+      # tv_orders_placed_delta_total = the DERIVED metrics-log-filter
+      # series from order-side-alarms.tf (dense from boot via the main.rs
+      # pre-registrations); tv_orders_rejected_total is EMF-published.
+      # ₹0 widget — appended to the EXISTING dashboard, free-tier slot 3
+      # deliberately NOT consumed.
+      {
+        type   = "metric"
+        x      = 0
+        y      = 30
+        width  = 12
+        height = 6
+        properties = {
+          title  = "Orders (paper mode until Phase-1) — placed vs rejected, 5m sums"
+          region = local.dash_region
+          view   = "timeSeries"
+          metrics = [
+            ["Tickvault/Prod", "tv_orders_placed_delta_total", "host", "tickvault-prod", { stat = "Sum" }],
+            ["Tickvault/Prod", "tv_orders_rejected_total", "host", "tickvault-prod", { stat = "Sum" }]
+          ]
+          period = 300
+        }
       }
     ]
   })

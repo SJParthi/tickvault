@@ -2120,12 +2120,48 @@ impl NotificationEvent {
             // ── Dhan-scoped: instrument master build ──
             | Self::InstrumentBuildSuccess { .. }
             | Self::InstrumentBuildFailed { .. }
-            // ── Dhan-scoped: OMS / risk (orders are Dhan-only today) ──
+            // ── Dhan-scoped: per-minute REST legs (spot 1m + option
+            //    chain) — operator directive 2026-07-14: the pull alerts
+            //    must name the feed AND the leg ──
+            | Self::Spot1mFetchDegraded { .. }
+            | Self::Spot1mFetchRecovered { .. }
+            | Self::Spot1mSidNotServed { .. }
+            | Self::Spot1mSidServedRecovered { .. }
+            | Self::ChainFetchDegraded { .. }
+            | Self::ChainFetchRecovered { .. }
+            | Self::ChainEntitlementAbsent { .. }
+            | Self::ChainEntitlementConfirmed
+            | Self::ChainExpirylistFailed { .. }
+            // ── Dhan-scoped: market-open milestones (count the Dhan pool
+            //    + order-update WS) ──
+            | Self::MarketOpenStreamingConfirmation { .. }
+            | Self::MarketOpenStreamingFailed { .. }
+            | Self::MarketOpenReadinessConfirmation { .. }
+            // ── Dhan-scoped: daily candle cross-check (Dhan REST vs our
+            //    candles) + the 09:15 bar cross-check ──
+            | Self::CrossVerify1mSummary { .. }
+            | Self::CrossVerify1mAborted { .. }
+            | Self::BarMismatchCorrectedFromHistorical { .. }
+            | Self::BarMismatchCrossCheckInconclusive { .. }
+            | Self::BarMismatchCrossCheckFailed { .. }
+            // ── Dhan-scoped: static-IP / IP-verify gates + the
+            //    dual-instance lock (one Dhan account, one token) ──
+            | Self::IpVerificationFailed { .. }
+            | Self::IpVerificationSuccess { .. }
+            | Self::StaticIpBootCheckPassed { .. }
+            | Self::StaticIpBootCheckFailed { .. }
+            | Self::StaticIpBootCheckRetrying { .. }
+            | Self::DualInstanceDetected { .. }
+            // ── Dhan-scoped: order path (Dhan is the only broker with
+            //    orders; RiskHalt joins per cluster-C 2026-07-14 — the
+            //    risk engine halts the Dhan order path) ──
             | Self::OrderRejected { .. }
             | Self::CircuitBreakerOpened { .. }
             | Self::CircuitBreakerClosed
             | Self::RateLimitExhausted { .. }
-            | Self::RiskHalt { .. } => Some(FeedBadge::Dhan.badge()),
+            | Self::RiskHalt { .. }
+            | Self::OrphanPositionDetected { .. }
+            | Self::OrphanPositionsClean => Some(FeedBadge::Dhan.badge()),
             // ── Groww-scoped ──
             Self::GrowwSidecarRejected { .. }
             // ── Groww-scoped: per-minute REST legs (spot 1m + option

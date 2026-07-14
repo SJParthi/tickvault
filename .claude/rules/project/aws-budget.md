@@ -82,6 +82,30 @@ effective contract lives in `daily-universe-scope-expansion-2026-05-27.md` §7
 --ebs-size 50` (online) — terraform's `ebs_gp3_size_gb=50` documents
 fresh-provision intent only (`volume_size` is in `lifecycle.ignore_changes`).
 
+## COST NOTE 2026-07-14 — Order-side observability, cluster C (+~$0.60/mo now, ~$1.20/mo ceiling at Phase-1)
+
+Order-side audit tables + alert-sink wiring + alarms (order_audit/pnl_audit rebuild, OMS→Telegram
+bridge, orders-placed storm pager, arm-on-arrival fill-lag/daily-loss alarms), per
+`deploy/aws/terraform/order-side-alarms.tf`:
+
+- **+1 custom-metric series ≈ $0.30/mo:** `tv_orders_placed_delta_total` (derived, metrics-log
+  filter on `/tickvault/<env>/metrics` — dense from the main.rs pre-registrations; the log filter
+  itself is free). NO new EMF-published series bill today: the 2 new allowlist names
+  (`tv_daily_pnl`, `tv_order_fill_lag_seconds`) are DORMANT — their emit sites ship with
+  cluster A / Phase-1, so zero datapoints = $0.00 until then, then ≈ +$0.60/mo (noted here in
+  advance so that PR needs no new cost note for them).
+- **+3 alarms ≈ $0.30/mo:** orders-placed-storm (armed), daily-loss-breach (armed, structurally
+  silent in dry-run — missing gauge + notBreaching), order-fill-lag-high (actions_enabled = false
+  until Phase-1 arming). The pre-existing orders-rejected alarm is fixed at $0 (ok_actions
+  removed + counter pre-registered — it was dead for single-rejection sessions).
+- **Dashboard: ₹0** — one widget row appended to the EXISTING `tv-<env>-operator` dashboard;
+  free-tier dashboard slot 3 deliberately NOT consumed.
+- **Log-ingestion delta:** 3 newly-dense counter series ≈ a few hundred bytes/min into the
+  metrics log group — noise inside the 5 GB free tier.
+
+Total **≈ $0.60/mo pre-GST now (~₹51/mo incl. 18% GST at ₹85/$), ≈ $1.20/mo at Phase-1** —
+inside the $35/mo pre-GST budget alarm ceiling and the ~₹3,101/mo envelope.
+
 ## OPERATOR DECISION 2026-05-20 — Observability stack → CloudWatch-only
 
 > **Operator (Parthiban), 2026-05-20:** "except questdb app and cloud
