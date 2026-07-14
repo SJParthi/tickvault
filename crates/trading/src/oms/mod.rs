@@ -48,9 +48,10 @@ pub mod types;
 pub use api_client::OrderApiClient;
 pub use engine::{OrderManagementSystem, TokenProvider};
 pub use exit_rules::ExitCommand;
+pub use margin_gate::{MarginGate, MarginSnapshot, MarginVerdict};
 pub use rate_limiter::OrderRateLimiter;
 pub use types::{
     ExecutionVerdict, ManagedOrder, ManagedSuperOrder, ModifyOrderRequest, ModifySuperOrderLeg,
-    OcoSecondLeg, OmsError, PlaceForeverOcoRequest, PlaceOrderRequest, PlaceSuperOrderRequest,
-    ReconciliationReport, SlicingResponse, SuperOrderPlacement,
+    OcoSecondLeg, OmsError, OrderIntent, PlaceForeverOcoRequest, PlaceOrderRequest,
+    PlaceSuperOrderRequest, ReconciliationReport, SlicingResponse, SuperOrderPlacement,
 };

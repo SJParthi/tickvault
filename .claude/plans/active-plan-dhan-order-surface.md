@@ -215,16 +215,11 @@ Other clusters (checked off by their owning sessions' PRs, all referencing THIS 
 - [ ] D1 — orphan-watchdog re-homing + expired date-gate re-arm (PR #1545)
   - Files: crates/app/src/main.rs, crates/trading/src/oms/engine.rs, crates/common/src/constants.rs
   - Tests: TBD by cluster D session (watchdog wiring source-scan guard)
-- [ ] B1 — order-alerting surface (cluster B session): broker-attributed order-side Telegram routing; NOTE — if cluster B's `crates/app/src/oms_alert_bridge.rs` merges, it SUPERSEDES cluster A's NotifierAlertSink (A rebases to reuse the shared sink type per the seam contract; not on main as of this PR's merge base)
-  - Files: crates/app/src/oms_alert_bridge.rs (theirs)
-  - Tests: TBD by owning session
-- [ ] E1 — exit-order layer (Super Order/OCO wiring, MPP verify, slicing) — serial after A
+- [x] E1 — exit-order layer (Super Order/OCO wiring, MPP verify, slicing) — serial after A
   - Files: crates/trading/src/oms/ (engine.rs, api_client.rs call sites), crates/app/src/order_runtime.rs
   - Tests: TBD by owning session
-- [ ] E2 — portfolio surface: POSITIONS / HOLDINGS ONLY (funds & margin moved to E3)
-  - Files: crates/trading/src/oms/api_client.rs call sites, read-only api status surface at most
-  - Tests: TBD by owning session
-- [ ] E3 — funds & margin (own session): the OrderIntent { Entry { required_paise }, Exit } contract appended inside RiskEngine::check_order — **exits are never margin-gated** (an exit must always be placeable); design-only, held for the operator's REST grant (`/v2/margincalculator` needs a `no-rest-except-live-feed-2026-06-27.md` dated edit first)
+  - Implemented (owning session label "Cluster B", branch claude/dhan-exit-order-layer): crates/trading/src/oms/{engine,exit_rules,types,api_client,state_machine}.rs + crates/app/src/exit_execution.rs (dispatcher hub) + the trading_pipeline.rs dispatcher seam; guard crates/trading/tests/dhan_exit_order_lockout_guard.rs + rule .claude/rules/project/dhan-exit-order-lockout-2026-07-14.md. Landed 4-lock-dormant (default-off config, hardcoded dry_run); order_runtime integration remains Cluster A's seam.
+- [ ] E2 — portfolio + margin gate (OrderIntent in RiskEngine::check_order; design-only until the operator REST grant)
   - Files: crates/trading/src/risk/engine.rs, crates/trading/src/oms/api_client.rs
   - Tests: TBD by owning session (exit-never-gated invariant test mandatory)
 - [x] B1 — Scheduled OMS reconcile loop, config-gated default-OFF

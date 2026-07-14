@@ -20,6 +20,7 @@ use tracing::{debug, error, info, instrument, warn};
 
 use tickvault_common::error_code::ErrorCode;
 use tickvault_common::order_types::{OrderStatus, OrderType, OrderUpdate, OrderValidity};
+use tickvault_common::sanitize::capture_rest_error_body;
 
 use super::api_client::OrderApiClient;
 use super::circuit_breaker::OrderCircuitBreaker;
@@ -35,7 +36,8 @@ use super::types::{
     EXCHANGE_SEGMENT_NSE_FNO, ExecutionVerdict, LegState, MAX_MODIFICATIONS_PER_ORDER,
     ManagedOrder, ManagedSuperOrder, ModifyOrderRequest, ModifySuperOrderLeg, OmsError, OrderLeg,
     PlaceForeverOcoRequest, PlaceOrderRequest, PlaceSuperOrderRequest, ReconciliationReport,
-    SlicingResponse, SuperOrderLegSnapshot, SuperOrderPlacement, VerifyState,
+    SUPER_ORDER_STATUS_ACCEPTED_UNPARSED_BODY, SlicingResponse, SuperOrderLegSnapshot,
+    SuperOrderPlacement, VerifyState,
 };
 
 // ---------------------------------------------------------------------------
@@ -1487,11 +1489,7 @@ impl OrderManagementSystem {
             .await
         {
             Ok(resp) => {
-                let prev_failures = self.circuit_breaker.failure_count();
-                self.circuit_breaker.record_success();
-                if self.circuit_breaker.was_previously_open(prev_failures) {
-                    self.fire_alert(OmsAlert::CircuitBreakerClosed);
-                }
+                self.record_api_success_and_alert_recovery();
                 resp
             }
             Err(err) => {
@@ -1499,20 +1497,39 @@ impl OrderManagementSystem {
                 if !matches!(err, OmsError::DhanRateLimited) {
                     self.circuit_breaker.record_failure();
                 }
+                // M1 (refuter round 1, 2026-07-14): the alert reason is a
+                // future sink payload — sanitized like every log rendering.
                 self.fire_alert(OmsAlert::OrderRejected {
                     correlation_id: correlation_id.clone(),
-                    reason: format!("{err}"),
+                    reason: sanitize_oms_error(&err),
                 });
                 error!(
                     code = ErrorCode::ExitOrder01ExecutionDegraded.code_str(),
                     correlation_id = %correlation_id,
                     security_id = request.security_id,
-                    error = %err,
+                    error = %sanitize_oms_error(&err),
                     "super order placement failed"
                 );
                 return Err(err);
             }
         };
+
+        // L3 (2026-07-14 hostile review): a malformed server-supplied id is
+        // NEVER tracked (and never echoed raw — length only). The order may
+        // exist broker-side; the next reconcile() surfaces it.
+        if !exit_rules::is_valid_order_id(&response.order_id) {
+            error!(
+                code = ErrorCode::ExitOrder01ExecutionDegraded.code_str(),
+                correlation_id = %correlation_id,
+                security_id = request.security_id,
+                id_len = response.order_id.len(),
+                "super order response carried a malformed orderId — refusing to track"
+            );
+            return Err(OmsError::DhanApiError {
+                status_code: 200,
+                message: "super order response carried a malformed orderId".to_owned(),
+            });
+        }
 
         let entry_order_id = response.order_id.clone();
         let initial_status = resolve_initial_status(&response.order_status);
@@ -1644,15 +1661,30 @@ impl OrderManagementSystem {
         order_id: &str,
         modify: ModifySuperOrderLeg,
     ) -> Result<(), OmsError> {
+        // L3: the id is URL-embedded on the live arm — refuse malformed
+        // input before any lookup/gate (never echoed raw).
+        if !exit_rules::is_valid_order_id(order_id) {
+            return Err(OmsError::RiskRejected {
+                reason: "super order modify refused: malformed order id \
+                         (charset [A-Za-z0-9_-]{1,64})"
+                    .to_owned(),
+            });
+        }
+
         // Step 0: registry lookup + gates (copy out to end the borrow).
-        let (modification_count, entry_status_raw) = {
+        let (modification_count, entry_status_raw, target_status_raw, stop_status_raw) = {
             let so = self
                 .super_orders
                 .get(order_id)
                 .ok_or_else(|| OmsError::OrderNotFound {
                     order_id: order_id.to_owned(),
                 })?;
-            (so.modification_count, so.entry_status_raw.clone())
+            (
+                so.modification_count,
+                so.entry_status_raw.clone(),
+                so.target.status_raw.clone(),
+                so.stop_loss.status_raw.clone(),
+            )
         };
 
         check_modification_limit(modification_count, order_id)?;
@@ -1674,6 +1706,63 @@ impl OrderManagementSystem {
             });
         }
 
+        // H2 (2026-07-14 hostile review): the registry's entry_status_raw
+        // only updates on place/verify/cancel — a fill applied by
+        // handle_order_update / reconcile() lands on the tracked
+        // ManagedOrder, so the TRACKED status is consulted too (registry
+        // staleness defense AT THE GATE, never inside the fill path).
+        if matches!(modify, ModifySuperOrderLeg::Entry { .. })
+            && let Some(tracked) = self.orders.get(order_id)
+            && tracked.is_terminal()
+        {
+            error!(
+                code = ErrorCode::ExitOrder01ExecutionDegraded.code_str(),
+                order_id = %order_id,
+                tracked_status = tracked.status.as_str(),
+                registry_entry_status = %entry_status_raw,
+                "ENTRY_LEG modify refused — tracked entry order is terminal (super registry stale)"
+            );
+            return Err(OmsError::RiskRejected {
+                reason: format!(
+                    "ENTRY_LEG modify refused for order {order_id}: tracked entry status {} \
+                     is terminal (super registry stale)",
+                    tracked.status.as_str()
+                ),
+            });
+        }
+
+        // M4 (2026-07-14 hostile review): a Target/StopLoss modify on a
+        // DEAD leg is refused (fail-open on unknown/empty raw statuses —
+        // Dhan re-validates server-side; see exit_rules::exit_leg_modify_allowed).
+        let (dead_leg, dead_leg_label, dead_leg_raw) = match &modify {
+            ModifySuperOrderLeg::Target { .. } => (
+                !exit_rules::exit_leg_modify_allowed(&target_status_raw),
+                "TARGET_LEG",
+                target_status_raw.as_str(),
+            ),
+            ModifySuperOrderLeg::StopLoss { .. } => (
+                !exit_rules::exit_leg_modify_allowed(&stop_status_raw),
+                "STOP_LOSS_LEG",
+                stop_status_raw.as_str(),
+            ),
+            ModifySuperOrderLeg::Entry { .. } => (false, "ENTRY_LEG", entry_status_raw.as_str()),
+        };
+        if dead_leg {
+            error!(
+                code = ErrorCode::ExitOrder01ExecutionDegraded.code_str(),
+                order_id = %order_id,
+                leg = dead_leg_label,
+                leg_status = %dead_leg_raw,
+                "leg modify refused — the leg is already terminal"
+            );
+            return Err(OmsError::RiskRejected {
+                reason: format!(
+                    "{dead_leg_label} modify refused for order {order_id}: leg status \
+                     {dead_leg_raw} is terminal"
+                ),
+            });
+        }
+
         validate_modify_super_fields(&modify)?;
 
         // Steps 1+2: rate limiter + circuit breaker.
@@ -1690,13 +1779,15 @@ impl OrderManagementSystem {
         let access_token = self.token_provider.get_access_token()?;
         let dhan_request = build_super_modify_request(&self.client_id, order_id, &modify);
 
-        match self
+        let accepted_unparsed = match self
             .api_client
             .modify_super_order(access_token.expose_secret(), order_id, &dhan_request)
             .await
         {
-            Ok(_resp) => {
-                self.circuit_breaker.record_success();
+            Ok(resp) => {
+                // L6: recovered-alert symmetry with the place arms.
+                self.record_api_success_and_alert_recovery();
+                resp.order_status == SUPER_ORDER_STATUS_ACCEPTED_UNPARSED_BODY
             }
             Err(err) => {
                 if !matches!(err, OmsError::DhanRateLimited) {
@@ -1706,14 +1797,29 @@ impl OrderManagementSystem {
                     code = ErrorCode::ExitOrder01ExecutionDegraded.code_str(),
                     order_id = %order_id,
                     leg = %dhan_request.leg_name,
-                    error = %err,
+                    error = %sanitize_oms_error(&err),
                     "super order leg modify failed"
                 );
                 return Err(err);
             }
-        }
+        };
 
         self.apply_super_modify(order_id, &modify);
+        // L5 (2026-07-14 hostile review): a 2xx with an UNPARSABLE body is
+        // accepted-with-doubt — the mutation may not have applied
+        // broker-side, so the tracked entry is flagged for the REST
+        // reconcile (the registry apply above stays, mirroring dry-run).
+        if accepted_unparsed {
+            if let Some(order) = self.orders.get_mut(order_id) {
+                order.needs_reconciliation = true;
+                order.updated_at_us = now_epoch_us();
+            }
+            warn!(
+                order_id = %order_id,
+                leg = %dhan_request.leg_name,
+                "super order leg modify accepted with an unparsable body — flagged for reconciliation"
+            );
+        }
         info!(order_id = %order_id, leg = %dhan_request.leg_name, "super order leg modified successfully");
         Ok(())
     }
@@ -1730,6 +1836,16 @@ impl OrderManagementSystem {
         order_id: &str,
         leg: OrderLeg,
     ) -> Result<(), OmsError> {
+        // L3: the id is URL-embedded on the live arm — refuse malformed
+        // input before any lookup/gate (never echoed raw).
+        if !exit_rules::is_valid_order_id(order_id) {
+            return Err(OmsError::RiskRejected {
+                reason: "super order cancel refused: malformed order id \
+                         (charset [A-Za-z0-9_-]{1,64})"
+                    .to_owned(),
+            });
+        }
+
         // Step 0: registry lookup + the naked-leg race gate.
         let entry_status_raw = self
             .super_orders
@@ -1750,6 +1866,35 @@ impl OrderManagementSystem {
                 reason: format!(
                     "ENTRY_LEG cancel refused for order {order_id}: entry status \
                      {entry_status_raw} — post-fill entry cancel is never exercised (U4)"
+                ),
+            });
+        }
+
+        // H2 (2026-07-14 hostile review): the registry's entry_status_raw
+        // only updates on place/verify/cancel — a fill applied by
+        // handle_order_update / reconcile() lands on the tracked
+        // ManagedOrder, so the TRACKED status is consulted too: a
+        // PartTraded/Traded (or any terminal) tracked entry refuses the
+        // ENTRY_LEG cancel even when the registry still reads pre-fill
+        // (registry staleness defense AT THE GATE — the U4 naked-position
+        // race is never exercised through a stale registry).
+        if leg == OrderLeg::EntryLeg
+            && let Some(tracked) = self.orders.get(order_id)
+            && (tracked.status == OrderStatus::PartTraded || tracked.is_terminal())
+        {
+            error!(
+                code = ErrorCode::ExitOrder01ExecutionDegraded.code_str(),
+                order_id = %order_id,
+                tracked_status = tracked.status.as_str(),
+                registry_entry_status = %entry_status_raw,
+                "ENTRY_LEG cancel refused — tracked entry order already filled/terminal \
+                 (super registry stale, U4)"
+            );
+            return Err(OmsError::RiskRejected {
+                reason: format!(
+                    "ENTRY_LEG cancel refused for order {order_id}: tracked entry status {} \
+                     (super registry stale — post-fill entry cancel is never exercised, U4)",
+                    tracked.status.as_str()
                 ),
             });
         }
@@ -1777,7 +1922,8 @@ impl OrderManagementSystem {
             .await
         {
             Ok(_resp) => {
-                self.circuit_breaker.record_success();
+                // L6: recovered-alert symmetry with the place arms.
+                self.record_api_success_and_alert_recovery();
             }
             Err(err) => {
                 if !matches!(err, OmsError::DhanRateLimited) {
@@ -1787,24 +1933,33 @@ impl OrderManagementSystem {
                     code = ErrorCode::ExitOrder01ExecutionDegraded.code_str(),
                     order_id = %order_id,
                     leg = leg.as_str(),
-                    error = %err,
+                    error = %sanitize_oms_error(&err),
                     "super order leg cancel failed"
                 );
                 return Err(err);
             }
         }
 
-        // Cancel is async server-side — flag the tracked entry for
-        // reconciliation (mirror of cancel_order's live path); the verify
-        // ladder / reconcile confirms the terminal state.
-        if leg == OrderLeg::EntryLeg
-            && let Some(order) = self.orders.get_mut(order_id)
-        {
-            order.needs_reconciliation = true;
-            order.updated_at_us = now_epoch_us();
-        }
-        if let Some(so) = self.super_orders.get_mut(order_id) {
-            so.updated_at_us = now_epoch_us();
+        match leg {
+            OrderLeg::EntryLeg => {
+                // Cancel is async server-side — flag the tracked entry for
+                // reconciliation (mirror of cancel_order's live path); the
+                // verify ladder / reconcile confirms the terminal state.
+                if let Some(order) = self.orders.get_mut(order_id) {
+                    order.needs_reconciliation = true;
+                    order.updated_at_us = now_epoch_us();
+                }
+                if let Some(so) = self.super_orders.get_mut(order_id) {
+                    so.updated_at_us = now_epoch_us();
+                }
+            }
+            // L4 (2026-07-14 hostile review): a live TARGET/STOP_LOSS leg
+            // cancel success updates the registry leg state exactly like
+            // dry-run (apply_super_cancel) — the pre-fix asymmetry left
+            // the leg forever PENDING in the registry.
+            OrderLeg::TargetLeg | OrderLeg::StopLossLeg => {
+                self.apply_super_cancel(order_id, leg);
+            }
         }
 
         info!(order_id = %order_id, leg = leg.as_str(), "super order leg cancel request sent");
@@ -1892,31 +2047,44 @@ impl OrderManagementSystem {
             .await
         {
             Ok(resp) => {
-                let prev_failures = self.circuit_breaker.failure_count();
-                self.circuit_breaker.record_success();
-                if self.circuit_breaker.was_previously_open(prev_failures) {
-                    self.fire_alert(OmsAlert::CircuitBreakerClosed);
-                }
+                self.record_api_success_and_alert_recovery();
                 resp
             }
             Err(err) => {
                 if !matches!(err, OmsError::DhanRateLimited) {
                     self.circuit_breaker.record_failure();
                 }
+                // M1 (refuter round 1, 2026-07-14): sanitized alert reason.
                 self.fire_alert(OmsAlert::OrderRejected {
                     correlation_id: correlation_id.clone(),
-                    reason: format!("{err}"),
+                    reason: sanitize_oms_error(&err),
                 });
                 error!(
                     code = ErrorCode::ExitOrder01ExecutionDegraded.code_str(),
                     correlation_id = %correlation_id,
                     security_id = request.security_id,
-                    error = %err,
+                    error = %sanitize_oms_error(&err),
                     "forever/OCO order placement failed"
                 );
                 return Err(err);
             }
         };
+
+        // L3: malformed server-supplied ids are never tracked (length only
+        // in the log — the raw value is never echoed).
+        if !exit_rules::is_valid_order_id(&response.order_id) {
+            error!(
+                code = ErrorCode::ExitOrder01ExecutionDegraded.code_str(),
+                correlation_id = %correlation_id,
+                security_id = request.security_id,
+                id_len = response.order_id.len(),
+                "forever/OCO response carried a malformed orderId — refusing to track"
+            );
+            return Err(OmsError::DhanApiError {
+                status_code: 200,
+                message: "forever/OCO response carried a malformed orderId".to_owned(),
+            });
+        }
 
         // CONFIRM parses to Triggered (state_machine.rs); Transit fallback.
         let initial_status = resolve_initial_status(&response.order_status);
@@ -2069,33 +2237,30 @@ impl OrderManagementSystem {
             .await
         {
             Ok(resp) => {
-                let prev_failures = self.circuit_breaker.failure_count();
-                self.circuit_breaker.record_success();
-                if self.circuit_breaker.was_previously_open(prev_failures) {
-                    self.fire_alert(OmsAlert::CircuitBreakerClosed);
-                }
+                self.record_api_success_and_alert_recovery();
                 resp
             }
             Err(err) => {
                 if !matches!(err, OmsError::DhanRateLimited) {
                     self.circuit_breaker.record_failure();
                 }
+                // M1 (refuter round 1, 2026-07-14): sanitized alert reason.
                 self.fire_alert(OmsAlert::OrderRejected {
                     correlation_id: correlation_id.clone(),
-                    reason: format!("{err}"),
+                    reason: sanitize_oms_error(&err),
                 });
                 error!(
                     code = ErrorCode::ExitOrder01ExecutionDegraded.code_str(),
                     correlation_id = %correlation_id,
                     security_id = request.security_id,
-                    error = %err,
+                    error = %sanitize_oms_error(&err),
                     "sliced order placement failed"
                 );
                 return Err(err);
             }
         };
 
-        let responses = match response {
+        let mut responses = match response {
             SlicingResponse::Many(list) => list,
             SlicingResponse::One(single) => vec![single],
         };
@@ -2111,10 +2276,51 @@ impl OrderManagementSystem {
             });
         }
 
+        // H3b (2026-07-14 hostile review): the response Vec is
+        // SERVER-CONTROLLED — bound it at MAX_ORDER_SLICES before any
+        // per-row work. Beyond-cap rows are dropped with a coded anomaly
+        // log; every tracked row is reconciliation-flagged below (M3), so
+        // the REST reconcile recovers the true book state.
+        let slice_cap = usize::try_from(exit_rules::MAX_ORDER_SLICES).unwrap_or(usize::MAX);
+        if responses.len() > slice_cap {
+            error!(
+                code = ErrorCode::ExitOrder01ExecutionDegraded.code_str(),
+                correlation_id = %correlation_id,
+                returned = responses.len(),
+                cap = slice_cap,
+                "slicing response anomaly — row count exceeds MAX_ORDER_SLICES; \
+                 tracking only the first rows (all reconciliation-flagged)"
+            );
+            responses.truncate(slice_cap);
+        }
+
+        // L3: ONE malformed server-supplied id refuses the WHOLE response —
+        // nothing tracked (a corrupt payload is not attributable per-slice);
+        // reconcile() against the order book is the recovery path. The raw
+        // id is never echoed (length only).
+        if let Some(bad) = responses
+            .iter()
+            .find(|r| !exit_rules::is_valid_order_id(&r.order_id))
+        {
+            error!(
+                code = ErrorCode::ExitOrder01ExecutionDegraded.code_str(),
+                correlation_id = %correlation_id,
+                id_len = bad.order_id.len(),
+                "slicing response carried a malformed orderId — refusing to track"
+            );
+            return Err(OmsError::DhanApiError {
+                status_code: 200,
+                message: "slicing response carried a malformed orderId".to_owned(),
+            });
+        }
+
         // Per-slice quantity attribution: exact when the server split
         // matches our computed plan; a single object carries the total; any
-        // other mismatch is an anomaly — tracked with needs_reconciliation
-        // so the REST reconcile corrects quantities (never ghost orders).
+        // other mismatch is an anomaly. M3 (2026-07-14 hostile review): the
+        // server NEVER echoes its split back per-slice, so EVERY live
+        // sliced order is reconciliation-flagged (count match or not,
+        // single-object included) — quantities are corrected from the REST
+        // order book, never assumed.
         let counts_match = responses.len() == slices.len();
         let single_object = responses.len() == 1;
         if !counts_match && !single_object {
@@ -2153,7 +2359,8 @@ impl OrderManagementSystem {
                 lot_size: request.lot_size,
                 created_at_us: now_us,
                 updated_at_us: now_us,
-                needs_reconciliation: !counts_match && !single_object,
+                // M3: always reconciliation-flagged (see above).
+                needs_reconciliation: true,
                 modification_count: 0,
             };
             self.orders.insert(resp.order_id.clone(), order);
@@ -2199,15 +2406,27 @@ impl OrderManagementSystem {
         elapsed_secs: u64,
         deadline_secs: u64,
     ) -> Result<ExecutionVerdict, OmsError> {
-        // Step 1: the probe consumes the shared GCRA — dry-run included.
-        self.rate_limiter.check()?;
+        // L3: a malformed id is structural (never tracked, never
+        // URL-embeddable) — refuse before anything else, without echoing
+        // the raw value into the error.
+        if !exit_rules::is_valid_order_id(order_id) {
+            return Err(OmsError::OrderNotFound {
+                order_id: "<malformed-order-id>".to_owned(),
+            });
+        }
 
+        // Step 0 (L1, 2026-07-14 hostile review): the existence check runs
+        // BEFORE the GCRA — a structurally-unknown id must never burn a
+        // shared order-rate cell.
         let is_super = self.super_orders.contains_key(order_id);
         if !is_super && !self.orders.contains_key(order_id) {
             return Err(OmsError::OrderNotFound {
                 order_id: order_id.to_owned(),
             });
         }
+
+        // Step 1: the probe consumes the shared GCRA — dry-run included.
+        self.rate_limiter.check()?;
 
         // ---- DRY-RUN: tracked paper order ⇒ deterministic verdict, no HTTP ----
         if self.dry_run {
@@ -2229,7 +2448,15 @@ impl OrderManagementSystem {
             {
                 Ok(list) => {
                     self.refresh_super_registry(&list);
-                    match list.iter().find(|r| r.order_id == order_id) {
+                    // L7 (2026-07-14 hostile review): on duplicate rows for
+                    // one id, classify from the LAST occurrence — the SAME
+                    // row refresh_super_registry keeps (its forward walk is
+                    // last-write-wins), so verdict and registry never split.
+                    // WITHIN that row the two readers split by field (chosen
+                    // semantics, refuter round 1): THIS classifier reads the
+                    // TOP-LEVEL status + fill quantities; the registry
+                    // refresh reads the legDetails.
+                    match list.iter().rev().find(|r| r.order_id == order_id) {
                         Some(resp) => {
                             let quantity = self
                                 .super_orders
@@ -2249,8 +2476,10 @@ impl OrderManagementSystem {
                         // The list succeeded but our id is missing —
                         // fail-closed Unknown (a failed probe ≠ absence;
                         // /orders/external/{cid} is the documented fallback).
+                        // The ladder retries this sentinel until its FINAL
+                        // attempt (M2 — exit_rules::verify_verdict_decisive).
                         None => ExecutionVerdict::Unknown {
-                            raw_status: "NOT_IN_SUPER_LIST".to_owned(),
+                            raw_status: exit_rules::VERIFY_RAW_NOT_IN_SUPER_LIST.to_owned(),
                         },
                     }
                 }
@@ -2287,10 +2516,13 @@ impl OrderManagementSystem {
                         .map(|o| o.quantity)
                         .unwrap_or(resp.quantity);
                     if !resp.oms_error_description.is_empty() {
+                        // M1: broker-controlled text — redacted + truncated
+                        // before it reaches any sink.
                         warn!(
                             order_id = %order_id,
-                            oms_error_code = %resp.oms_error_code,
-                            oms_error_description = %resp.oms_error_description,
+                            oms_error_code = %capture_rest_error_body(&resp.oms_error_code),
+                            oms_error_description =
+                                %capture_rest_error_body(&resp.oms_error_description),
                             "verify probe carried a broker error description"
                         );
                     }
@@ -2342,6 +2574,21 @@ impl OrderManagementSystem {
             return Err(err);
         }
         Ok(())
+    }
+
+    /// Records one successful live API call on the circuit breaker and
+    /// fires the `CircuitBreakerClosed` recovery alert when the success
+    /// closed a previously-open breaker (L6, 2026-07-14 hostile review —
+    /// every exit live arm shares the place-arm recovery semantics:
+    /// place/modify/cancel/forever/sliced. `verify_order_execution` is
+    /// deliberately EXCLUDED: probes never touch the breaker in either
+    /// direction, so a recovered-alert there would be a false signal).
+    fn record_api_success_and_alert_recovery(&self) {
+        let prev_failures = self.circuit_breaker.failure_count();
+        self.circuit_breaker.record_success();
+        if self.circuit_breaker.was_previously_open(prev_failures) {
+            self.fire_alert(OmsAlert::CircuitBreakerClosed);
+        }
     }
 
     /// Applies a leg modify to the tracked super order + the tracked entry
@@ -2426,6 +2673,15 @@ impl OrderManagementSystem {
     /// Refreshes every tracked super order from ONE batched list response
     /// (raw leg statuses — the registry deliberately bypasses the
     /// ManagedOrder state machine for the top-level walk).
+    ///
+    /// Duplicate rows for one order id (L7, 2026-07-14 hostile review):
+    /// the forward walk is LAST-write-wins, matching the verify
+    /// classification's `.rev().find(...)` LAST-occurrence pick — the
+    /// registry and the returned verdict always read the same row.
+    /// WITHIN that row the two readers split by field (chosen semantics,
+    /// refuter round 1): THIS refresh reads the legDetails (entry/TP/SL
+    /// raw statuses, prices, leg ids); the verify classifier reads the
+    /// TOP-LEVEL status + fill quantities.
     fn refresh_super_registry(&mut self, list: &[DhanSuperOrderResponse]) {
         let now_us = now_epoch_us();
         for resp in list {
@@ -2516,6 +2772,13 @@ impl OrderManagementSystem {
                 }
             }
             ExecutionVerdict::PendingAtLimit { .. } => {
+                // H1 (2026-07-14 hostile review): an at-limit resting order
+                // is flagged for the REST reconcile — verify-ladder
+                // exhaustion is never a silent Pending.
+                if let Some(order) = self.orders.get_mut(order_id) {
+                    order.needs_reconciliation = true;
+                    order.updated_at_us = now_us;
+                }
                 error!(
                     code = ErrorCode::ExitVerify01Degraded.code_str(),
                     order_id = %order_id,
@@ -2525,12 +2788,30 @@ impl OrderManagementSystem {
                 );
             }
             ExecutionVerdict::Unknown { raw_status } => {
-                error!(
-                    code = ErrorCode::ExitVerify01Degraded.code_str(),
-                    order_id = %order_id,
-                    raw_status = %raw_status,
-                    "unparsable verify probe result — fail-closed Unknown (never treated as filled)"
-                );
+                // M2 refined (refuter round 1, 2026-07-14): a
+                // NOT_IN_SUPER_LIST sentinel BEFORE the deadline is
+                // potential list lag — the ladder re-probes the remaining
+                // rungs, so flagging + EXIT-VERIFY-01 fire only at/past
+                // the budget (`elapsed_secs >= deadline_secs`; the
+                // ladder's final-rung elapsed floor guarantees the last
+                // probe lands there). A body-unparsable/other Unknown
+                // stays ALWAYS-flagged fail-closed.
+                let in_budget_list_lag = raw_status == exit_rules::VERIFY_RAW_NOT_IN_SUPER_LIST
+                    && elapsed_secs < deadline_secs;
+                if !in_budget_list_lag {
+                    if let Some(order) = self.orders.get_mut(order_id) {
+                        order.needs_reconciliation = true;
+                        order.updated_at_us = now_us;
+                    }
+                    error!(
+                        code = ErrorCode::ExitVerify01Degraded.code_str(),
+                        order_id = %order_id,
+                        raw_status = %raw_status,
+                        elapsed_secs,
+                        deadline_secs,
+                        "unparsable verify probe result — fail-closed Unknown (never treated as filled)"
+                    );
+                }
             }
             ExecutionVerdict::Terminal { status } => {
                 if let Some(order) = self.orders.get_mut(order_id) {
@@ -2574,6 +2855,17 @@ impl OrderManagementSystem {
 // ---------------------------------------------------------------------------
 // Exit-layer pure helpers (private — zero I/O)
 // ---------------------------------------------------------------------------
+
+/// M1 (2026-07-14 hostile review): every exit-layer log line rendering an
+/// [`OmsError`] routes through the house redaction pipeline — a raw Dhan
+/// body embedded in `DhanApiError::message` is control-char-stripped,
+/// credential/JWT-redacted and truncated to 300 chars
+/// (`capture_rest_error_body`) before it reaches any sink. The typed
+/// `OmsError` itself is UNCHANGED (other crates rely on it); only the log
+/// rendering is bounded.
+fn sanitize_oms_error(err: &OmsError) -> String {
+    capture_rest_error_body(&err.to_string())
+}
 
 /// Maps a raw Dhan leg name to [`OrderLeg`]. Unknown names → `None`
 /// (skipped with a warn — no-panic-on-unknown, annexure rule 15).
@@ -2843,7 +3135,7 @@ fn validate_modify_fields(request: &ModifyOrderRequest) -> Result<(), OmsError> 
 ///
 /// Wired by `place_super_order` Step 0b (Cluster B, 2026-07-14) for the
 /// relative-ordering check on LIMIT entries.
-// TEST-EXEMPT: tested by 12 test_super_order_* tests in this module
+// TEST-EXEMPT: tested by the test_super_order_* suite in this module
 pub(crate) fn validate_super_order_prices(
     transaction_type: &str,
     price: f64,
@@ -6653,6 +6945,11 @@ mod tests {
             oms.order("S-1").unwrap().correlation_id,
             oms.order("S-3").unwrap().correlation_id
         );
+        // M3: the server split is never echoed — every live sliced order
+        // is reconciliation-flagged, even on a count match.
+        for id in ["S-1", "S-2", "S-3"] {
+            assert!(oms.order(id).unwrap().needs_reconciliation, "{id}");
+        }
         assert_eq!(oms.total_placed(), 3);
         handle.abort();
     }
@@ -6672,7 +6969,9 @@ mod tests {
         assert_eq!(ids, vec!["S-9".to_owned()]);
         let order = oms.order("S-9").unwrap();
         assert_eq!(order.quantity, 250);
-        assert!(!order.needs_reconciliation);
+        // M3: single-object arm is reconciliation-flagged too — the true
+        // server-side split is only knowable from the REST order book.
+        assert!(order.needs_reconciliation);
         handle.abort();
     }
 
@@ -6892,6 +7191,10 @@ mod tests {
     async fn test_verify_order_execution_live_super_missing_from_list_unknown() {
         // A successful list WITHOUT our id is fail-closed Unknown — a
         // failed probe ≠ absence (never dropped, never assumed filled).
+        // M2 refined (refuter round 1, 2026-07-14): IN-BUDGET
+        // (elapsed 5 < deadline 30) the sentinel is potential list lag —
+        // NO reconciliation flag and NO EXIT-VERIFY-01 yet; the ladder's
+        // remaining rungs re-probe.
         let body = r#"[{"orderId":"SO-OTHER","orderStatus":"PENDING","legDetails":[]}]"#;
         let (base_url, handle) = start_oms_mock(200, body).await;
 
@@ -6906,6 +7209,437 @@ mod tests {
                 raw_status: "NOT_IN_SUPER_LIST".to_owned()
             }
         );
+        assert!(
+            !oms.order("SO-9").unwrap().needs_reconciliation,
+            "M2 refined: an in-budget NOT_IN_SUPER_LIST is list lag — never flagged yet"
+        );
+        handle.abort();
+    }
+
+    /// M2 refined (refuter round 1, 2026-07-14): NOT_IN_SUPER_LIST at/past
+    /// the budget (the ladder's FINAL floored probe) IS flagged —
+    /// `needs_reconciliation = true` + the EXIT-VERIFY-01 arm fires.
+    #[tokio::test]
+    async fn test_verify_live_super_missing_at_budget_flags_reconciliation() {
+        let body = r#"[{"orderId":"SO-OTHER","orderStatus":"PENDING","legDetails":[]}]"#;
+        let (base_url, handle) = start_oms_mock(200, body).await;
+
+        let mut oms = make_live_oms(&base_url);
+        insert_tracked_super(&mut oms, "SO-9", "PENDING", 75);
+        insert_tracked_order(&mut oms, "SO-9", OrderStatus::Pending, 75);
+
+        let verdict = oms.verify_order_execution("SO-9", 30, 30).await.unwrap();
+        assert_eq!(
+            verdict,
+            ExecutionVerdict::Unknown {
+                raw_status: "NOT_IN_SUPER_LIST".to_owned()
+            }
+        );
+        assert!(
+            oms.order("SO-9").unwrap().needs_reconciliation,
+            "M2 refined: NOT_IN_SUPER_LIST at the budget must flag reconciliation"
+        );
+        handle.abort();
+    }
+
+    // --- 2026-07-14 hostile-review fixes (H1/H2/M2/M4 + L-series) ---
+
+    /// H1: a still-resting order probed AT the deadline classifies
+    /// PendingAtLimit AND is reconciliation-flagged — verify-ladder
+    /// exhaustion is never a silent Pending.
+    #[tokio::test]
+    async fn test_verify_live_pending_at_limit_flags_needs_reconciliation() {
+        let body = r#"{"orderId":"D-1","orderStatus":"PENDING"}"#;
+        let (base_url, handle) = start_oms_mock(200, body).await;
+
+        let mut oms = make_live_oms(&base_url);
+        insert_tracked_order(&mut oms, "D-1", OrderStatus::Pending, 50);
+
+        let verdict = oms.verify_order_execution("D-1", 30, 30).await.unwrap();
+        assert_eq!(
+            verdict,
+            ExecutionVerdict::PendingAtLimit { elapsed_secs: 30 }
+        );
+        assert!(
+            oms.order("D-1").unwrap().needs_reconciliation,
+            "H1: at-limit resting order must be reconciliation-flagged"
+        );
+        handle.abort();
+    }
+
+    /// M2: a fail-closed Unknown verdict (unparsable body) flags the
+    /// tracked order for reconciliation.
+    #[tokio::test]
+    async fn test_verify_live_unknown_body_flags_needs_reconciliation() {
+        let body = "definitely not json";
+        let (base_url, handle) = start_oms_mock(200, body).await;
+
+        let mut oms = make_live_oms(&base_url);
+        insert_tracked_order(&mut oms, "D-1", OrderStatus::Pending, 50);
+
+        let verdict = oms.verify_order_execution("D-1", 5, 30).await.unwrap();
+        assert!(matches!(verdict, ExecutionVerdict::Unknown { .. }));
+        assert!(
+            oms.order("D-1").unwrap().needs_reconciliation,
+            "M2: Unknown verdict must be reconciliation-flagged"
+        );
+        handle.abort();
+    }
+
+    /// H2 (cancel): a fill recorded on the tracked ManagedOrder refuses
+    /// the ENTRY_LEG cancel even when the super registry still reads
+    /// pre-fill (PENDING) — the stale-registry defense at the gate.
+    #[tokio::test]
+    async fn test_cancel_entry_refused_when_tracked_order_filled_registry_stale() {
+        let mut oms = make_dry_oms();
+        for (id, tracked_status) in [
+            ("SO-H2-T", OrderStatus::Traded),
+            ("SO-H2-P", OrderStatus::PartTraded),
+        ] {
+            insert_tracked_super(&mut oms, id, "PENDING", 75);
+            insert_tracked_order(&mut oms, id, tracked_status, 75);
+
+            let refused = oms.cancel_super_order_leg(id, OrderLeg::EntryLeg).await;
+            let err = refused.unwrap_err();
+            assert!(
+                matches!(err, OmsError::RiskRejected { .. }),
+                "{tracked_status:?}"
+            );
+            assert!(
+                err.to_string().contains("registry stale"),
+                "refusal must name the stale registry, got: {err}"
+            );
+        }
+    }
+
+    /// H2 (modify): a terminal tracked entry refuses the ENTRY_LEG modify
+    /// even when the registry's entry_status_raw still reads PENDING.
+    #[tokio::test]
+    async fn test_modify_entry_refused_when_tracked_order_terminal_registry_stale() {
+        let mut oms = make_dry_oms();
+        insert_tracked_super(&mut oms, "SO-H2-M", "PENDING", 75);
+        insert_tracked_order(&mut oms, "SO-H2-M", OrderStatus::Traded, 75);
+
+        let refused = oms
+            .modify_super_order_leg(
+                "SO-H2-M",
+                ModifySuperOrderLeg::Entry {
+                    order_type: OrderType::Limit,
+                    quantity: 75,
+                    price: 101.0,
+                    target_price: 111.0,
+                    stop_loss_price: 96.0,
+                    trailing_jump: 0.0,
+                },
+            )
+            .await;
+        let err = refused.unwrap_err();
+        assert!(matches!(err, OmsError::RiskRejected { .. }));
+        assert!(err.to_string().contains("registry stale"));
+    }
+
+    /// M4: a Target/StopLoss modify on a DEAD leg is refused; an
+    /// empty/unknown leg status stays fail-open (Dhan re-validates).
+    #[tokio::test]
+    async fn test_modify_dead_target_and_stop_legs_refused() {
+        let mut oms = make_dry_oms();
+        oms.place_super_order(make_super_request(), 1_800)
+            .await
+            .unwrap();
+
+        oms.super_orders
+            .get_mut("PAPER-SO-1")
+            .unwrap()
+            .target
+            .status_raw = "TRADED".to_owned();
+        let refused = oms
+            .modify_super_order_leg(
+                "PAPER-SO-1",
+                ModifySuperOrderLeg::Target {
+                    target_price: 112.5,
+                },
+            )
+            .await;
+        let err = refused.unwrap_err();
+        assert!(matches!(err, OmsError::RiskRejected { .. }));
+        assert!(err.to_string().contains("TARGET_LEG modify refused"));
+
+        oms.super_orders
+            .get_mut("PAPER-SO-1")
+            .unwrap()
+            .stop_loss
+            .status_raw = "CANCELLED".to_owned();
+        let refused = oms
+            .modify_super_order_leg(
+                "PAPER-SO-1",
+                ModifySuperOrderLeg::StopLoss {
+                    stop_loss_price: 96.0,
+                    trailing_jump: 0.0,
+                },
+            )
+            .await;
+        assert!(matches!(refused, Err(OmsError::RiskRejected { .. })));
+
+        // Fail-open: an EMPTY leg status allows the modify.
+        oms.super_orders
+            .get_mut("PAPER-SO-1")
+            .unwrap()
+            .target
+            .status_raw = String::new();
+        assert!(
+            oms.modify_super_order_leg(
+                "PAPER-SO-1",
+                ModifySuperOrderLeg::Target {
+                    target_price: 113.0,
+                },
+            )
+            .await
+            .is_ok()
+        );
+    }
+
+    /// L1: a structurally-unknown id never consumes a shared GCRA cell —
+    /// the existence check runs BEFORE the rate limiter.
+    #[tokio::test]
+    async fn test_verify_unknown_order_does_not_consume_gcra() {
+        let api_client = OrderApiClient::new(
+            reqwest::Client::new(),
+            "https://api.dhan.co/v2".to_owned(),
+            "100".to_owned(),
+        );
+        let mut oms = OrderManagementSystem::new(
+            api_client,
+            OrderRateLimiter::new(1),
+            Box::new(TestTokenProvider),
+            "100".to_owned(),
+        );
+        // Burn ZERO cells on unknown ids...
+        for _ in 0..5 {
+            let result = oms.verify_order_execution("NOPE", 1, 30).await;
+            assert!(matches!(result, Err(OmsError::OrderNotFound { .. })));
+        }
+        // ...so the single burst cell is still available for a real order.
+        let order_id = oms.place_order(make_place_request()).await.unwrap();
+        assert!(oms.order(&order_id).is_some());
+    }
+
+    /// L3: malformed caller-supplied ids are refused typed (never
+    /// URL-embedded, never echoed raw).
+    #[tokio::test]
+    async fn test_exit_methods_refuse_malformed_order_id_inputs() {
+        let mut oms = make_dry_oms();
+        let bad = "SO/../100";
+
+        let modify = oms
+            .modify_super_order_leg(
+                bad,
+                ModifySuperOrderLeg::Target {
+                    target_price: 111.0,
+                },
+            )
+            .await;
+        assert!(matches!(modify, Err(OmsError::RiskRejected { .. })));
+
+        let cancel = oms.cancel_super_order_leg(bad, OrderLeg::TargetLeg).await;
+        assert!(matches!(cancel, Err(OmsError::RiskRejected { .. })));
+
+        let verify = oms.verify_order_execution(bad, 1, 30).await;
+        match verify {
+            Err(OmsError::OrderNotFound { order_id }) => {
+                assert_eq!(order_id, "<malformed-order-id>", "raw id must not echo");
+            }
+            other => panic!("expected OrderNotFound, got {other:?}"),
+        }
+    }
+
+    /// L3: a malformed SERVER-supplied id is never tracked (super, sliced,
+    /// forever place paths refuse with a typed error).
+    #[tokio::test]
+    async fn test_place_paths_refuse_malformed_server_ids() {
+        // Super order: path-traversal-shaped entry id.
+        let body = r#"{"orderId":"SO/../1","orderStatus":"PENDING","legDetails":[]}"#;
+        let (base_url, handle) = start_oms_mock(200, body).await;
+        let mut oms = make_live_oms(&base_url);
+        let result = oms.place_super_order(make_super_request(), 1_800).await;
+        assert!(matches!(result, Err(OmsError::DhanApiError { .. })));
+        assert_eq!(oms.total_placed(), 0);
+        assert!(oms.all_orders().is_empty());
+        handle.abort();
+
+        // Sliced: ONE malformed id refuses the whole response.
+        let body = r#"[{"orderId":"S-1","orderStatus":"TRANSIT"},{"orderId":"S 2","orderStatus":"TRANSIT"}]"#;
+        let (base_url, handle) = start_oms_mock(200, body).await;
+        let mut oms = make_live_oms(&base_url);
+        let mut request = make_place_request();
+        request.quantity = 250;
+        let result = oms.place_order_sliced(request, 100).await;
+        assert!(matches!(result, Err(OmsError::DhanApiError { .. })));
+        assert!(oms.all_orders().is_empty());
+        handle.abort();
+
+        // Forever: malformed id refused.
+        let body = r#"{"orderId":"FO\n1","orderStatus":"CONFIRM"}"#;
+        let (base_url, handle) = start_oms_mock(200, body).await;
+        let mut oms = make_live_oms(&base_url);
+        let result = oms.place_forever_oco(make_forever_request()).await;
+        assert!(matches!(result, Err(OmsError::DhanApiError { .. })));
+        assert!(oms.all_orders().is_empty());
+        handle.abort();
+    }
+
+    /// L4: a live TARGET_LEG cancel success updates the registry leg state
+    /// exactly like dry-run (the pre-fix asymmetry left it PENDING).
+    #[tokio::test]
+    async fn test_cancel_target_leg_live_updates_registry_leg_state() {
+        let place_body =
+            r#"{"orderId":"SO-100","orderStatus":"PENDING","legDetails":[]}"#.to_owned();
+        let cancel_body = r#"{"orderId":"SO-100","orderStatus":"PENDING"}"#.to_owned();
+        let (base_url, handle) =
+            start_multi_mock(vec![(200, place_body), (200, cancel_body)]).await;
+
+        let mut oms = make_live_oms(&base_url);
+        oms.place_super_order(make_super_request(), 1_800)
+            .await
+            .unwrap();
+
+        oms.cancel_super_order_leg("SO-100", OrderLeg::TargetLeg)
+            .await
+            .unwrap();
+        let so = oms.super_order("SO-100").unwrap();
+        assert_eq!(so.target.status_raw, "CANCELLED");
+        // The entry + stop loss stay untouched.
+        assert_eq!(so.entry_status_raw, "PENDING");
+        assert_ne!(so.stop_loss.status_raw, "CANCELLED");
+        handle.abort();
+    }
+
+    /// L5: a 2xx modify with an UNPARSABLE body applies locally BUT flags
+    /// the tracked entry for reconciliation (the mutation may not have
+    /// applied broker-side).
+    #[tokio::test]
+    async fn test_modify_live_accepted_unparsed_body_flags_reconciliation() {
+        let place_body =
+            r#"{"orderId":"SO-100","orderStatus":"PENDING","legDetails":[]}"#.to_owned();
+        let modify_body = "garbage not json".to_owned();
+        let (base_url, handle) =
+            start_multi_mock(vec![(200, place_body), (200, modify_body)]).await;
+
+        let mut oms = make_live_oms(&base_url);
+        oms.place_super_order(make_super_request(), 1_800)
+            .await
+            .unwrap();
+
+        oms.modify_super_order_leg(
+            "SO-100",
+            ModifySuperOrderLeg::Target {
+                target_price: 112.5,
+            },
+        )
+        .await
+        .unwrap();
+
+        let so = oms.super_order("SO-100").unwrap();
+        assert!((so.target.price - 112.5).abs() < f64::EPSILON);
+        assert!(
+            oms.order("SO-100").unwrap().needs_reconciliation,
+            "L5: ACCEPTED_UNPARSED_BODY must flag reconciliation"
+        );
+        handle.abort();
+    }
+
+    /// L6: the shared recovery helper fires CircuitBreakerClosed exactly
+    /// when a success closes a previously-open breaker (all exit live
+    /// arms — place/modify/cancel/forever/sliced — call it).
+    #[test]
+    fn test_record_api_success_fires_cb_closed_recovery_alert() {
+        use std::sync::{Arc, Mutex};
+        struct CapturingSink(Arc<Mutex<Vec<&'static str>>>);
+        impl OmsAlertSink for CapturingSink {
+            fn fire(&self, alert: OmsAlert) {
+                let label = match alert {
+                    OmsAlert::CircuitBreakerClosed => "cb_closed",
+                    _ => "other",
+                };
+                if let Ok(mut alerts) = self.0.lock() {
+                    alerts.push(label);
+                }
+            }
+        }
+
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let mut oms = make_dry_oms();
+        oms.set_alert_sink(Box::new(CapturingSink(Arc::clone(&captured))));
+
+        // Below threshold: success fires NO recovery alert.
+        oms.circuit_breaker.record_failure();
+        oms.record_api_success_and_alert_recovery();
+        assert!(
+            captured
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty()
+        );
+
+        // At/above threshold: the closing success fires exactly one alert.
+        for _ in 0..tickvault_common::constants::OMS_CIRCUIT_BREAKER_FAILURE_THRESHOLD {
+            oms.circuit_breaker.record_failure();
+        }
+        oms.record_api_success_and_alert_recovery();
+        assert_eq!(
+            captured
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_slice(),
+            &["cb_closed"]
+        );
+        assert_eq!(oms.circuit_breaker.failure_count(), 0);
+    }
+
+    /// L7: duplicate list rows for one id — classification reads the LAST
+    /// occurrence, matching refresh_super_registry's last-write-wins walk.
+    #[tokio::test]
+    async fn test_verify_live_super_duplicate_rows_last_occurrence_wins() {
+        let body = r#"[{"orderId":"SO-9","orderStatus":"PENDING","legDetails":[]},{"orderId":"SO-9","orderStatus":"TRADED","filledQty":75,"averageTradedPrice":101.5,"legDetails":[]}]"#;
+        let (base_url, handle) = start_oms_mock(200, body).await;
+
+        let mut oms = make_live_oms(&base_url);
+        insert_tracked_super(&mut oms, "SO-9", "PENDING", 75);
+        insert_tracked_order(&mut oms, "SO-9", OrderStatus::Pending, 75);
+
+        let verdict = oms.verify_order_execution("SO-9", 5, 30).await.unwrap();
+        assert_eq!(
+            verdict,
+            ExecutionVerdict::Filled {
+                traded_qty: 75,
+                avg_price: 101.5
+            }
+        );
+        // The registry read the same (LAST) row.
+        assert_eq!(oms.super_order("SO-9").unwrap().entry_status_raw, "TRADED");
+        handle.abort();
+    }
+
+    /// H3b: a server response beyond MAX_ORDER_SLICES rows is truncated at
+    /// the cap — bounded per-row work, every tracked row flagged (M3).
+    #[tokio::test]
+    async fn test_place_order_sliced_live_beyond_cap_truncated_and_flagged() {
+        let cap = usize::try_from(exit_rules::MAX_ORDER_SLICES).unwrap_or(0);
+        let rows: Vec<String> =
+            (0..=cap) // cap + 1 rows
+                .map(|i| format!(r#"{{"orderId":"S-{i}","orderStatus":"TRANSIT"}}"#))
+                .collect();
+        let body = format!("[{}]", rows.join(","));
+        let (base_url, handle) = start_oms_mock(200, &body).await;
+
+        let mut oms = make_live_oms(&base_url);
+        let mut request = make_place_request();
+        request.quantity = 250;
+
+        let ids = oms.place_order_sliced(request, 100).await.unwrap();
+        assert_eq!(ids.len(), cap, "beyond-cap rows must be dropped");
+        assert_eq!(oms.total_placed(), u64::try_from(cap).unwrap_or(0));
+        assert!(oms.order("S-0").unwrap().needs_reconciliation);
+        assert!(oms.order(&format!("S-{cap}")).is_none(), "row past the cap");
         handle.abort();
     }
 

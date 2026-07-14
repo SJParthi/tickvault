@@ -109,7 +109,9 @@ pub struct TradingPipelineConfig {
     /// `[exit_orders]` — 🔷 DHAN exit-order layer (Cluster B, 2026-07-14).
     /// The `Signal::Exit` arm routes through
     /// `exit_execution::execute_exit_for_security` with this; disabled
-    /// (the default) ⇒ byte-equivalent legacy cancel+close behavior.
+    /// (the default) ⇒ behavior-equivalent legacy cancel+close behavior
+    /// (identical control flow and API calls; log fields upgraded to
+    /// redacted rendering per the M1 fix).
     /// Field appended at the END per the Cluster A/B field-append
     /// discipline (design §4).
     pub exit_orders: tickvault_common::config::ExitOrdersConfig,
@@ -555,12 +557,25 @@ async fn run_trading_pipeline(
                                     );
                                     // 🔷 DHAN exit-order layer (Cluster B, design §3.10):
                                     // disabled (the shipped default) ⇒ the delegate runs the
-                                    // byte-equivalent legacy cancel+close body; enabled ⇒
+                                    // behavior-equivalent legacy cancel+close body (identical
+                                    // control flow and API calls; redacted log rendering per
+                                    // the M1 fix); enabled ⇒
                                     // ExitCommand::CloseAll through the dispatcher (super-
                                     // order-aware cancel + sliced close + MPP verify ladder).
+                                    //
+                                    // HONEST BLOCKING ENVELOPE (H3, 2026-07-14 hostile
+                                    // review): while [exit_orders] is ENABLED this await
+                                    // stalls THE STRATEGY TASK for up to
+                                    // ~mpp_verify_deadline_secs per close order (the
+                                    // CloseAll verify budget bounds the multi-slice case to
+                                    // ONE deadline) — ticks buffer in the broadcast channel
+                                    // meanwhile and order updates may lag. Accepted for the
+                                    // dry-run layer; the PRE-LIVE design change is a
+                                    // SPAWNED exit executor (rule-file §4 enable-time
+                                    // protocol).
                                     crate::exit_execution::execute_exit_for_security(
                                         &mut oms,
-                                        &risk_engine,
+                                        &mut risk_engine,
                                         tick.security_id,
                                         &config.exit_orders,
                                     )

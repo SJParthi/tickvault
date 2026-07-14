@@ -3,9 +3,10 @@
 //! LOCK #2's runtime gate + the S6-G1 call-site hub for EVERY engine exit
 //! method (`place_super_order`, `modify_super_order_leg`,
 //! `cancel_super_order_leg`, `place_forever_oco`, `place_order_sliced`,
-//! `verify_order_execution`). Cluster A constructs [`ExitCommand`]s; ONLY
-//! this dispatcher executes them — never the engine methods directly (the
-//! frozen seam contract, design §3.5/§4).
+//! `verify_order_execution`). Future entry-side (Cluster A) work
+//! constructs [`ExitCommand`]s; ONLY this dispatcher executes them —
+//! never the engine methods directly (the frozen seam contract, design
+//! §3.5/§4).
 //!
 //! Gate order (design Ruling 8 / Lock 2a): the `!cfg.enabled` check fires
 //! FIRST — before ANY engine touch — so a disabled layer drops every
@@ -15,22 +16,81 @@
 //! The MPP verify retry LADDER lives HERE (tokio sleeps in the app layer,
 //! never inside the `&mut`-serial engine — design Ruling 5): pure rungs
 //! from `exit_rules::next_verify_backoff_secs` (1, 2, 4, 8, 10s), the
-//! engine's `verify_order_execution` is a single probe per rung.
+//! engine's `verify_order_execution` is a single probe per rung. H1
+//! (2026-07-14 hostile review): elapsed time is WALL-CLOCK
+//! (`tokio::time::Instant` — probe RTT included, honest vs a
+//! sum-of-sleeps), and on the FINAL rung it is floored to
+//! `mpp_verify_deadline_secs` so a never-fills order always classifies
+//! through the engine's at-limit arm (`PendingAtLimit` / partial-at-budget
+//! → EXIT-VERIFY-01 + `needs_reconciliation`) — ladder exhaustion is never
+//! a silent Pending.
+//!
+//! HONEST BLOCKING ENVELOPE (H3, 2026-07-14 hostile review; H3c precision
+//! refuter round 1): while `[exit_orders]` is ENABLED, the strategy
+//! pipeline task drives this dispatcher INLINE from its `select!` loop —
+//! a CloseAll stalls that task for up to ~`mpp_verify_deadline_secs` of
+//! LADDER SLEEP time per close order (the overall CloseAll verify budget
+//! bounds the multi-slice case to ~one deadline of ladder sleeps);
+//! per-probe HTTP RTTs + GCRA pacing are ADDITIONAL and scale with slice
+//! count — a large slice count adds un-slept probe time on top of the
+//! budget. Ticks buffer in the broadcast channel meanwhile and
+//! order updates may lag. Accepted for the dry-run layer; the PRE-LIVE
+//! design change is a SPAWNED exit executor — flagged in the rule file's
+//! enable-time protocol
+//! (`.claude/rules/project/dhan-exit-order-lockout-2026-07-14.md` §4).
 //!
 //! Cold path — orders ~1-100/day; allocations are fine. Every failure is
 //! coded (`EXIT-ORDER-01`, log-sink-only per the 2026-07-14 Dhan noise
-//! lock: zero Telegram emit sites in this module).
+//! lock: zero Telegram emit sites in this module), and every rendered
+//! engine error routes through the house redaction pipeline
+//! (`capture_rest_error_body` — M1: no raw Dhan body reaches a sink
+//! unbounded).
 
 use tickvault_common::config::ExitOrdersConfig;
 use tickvault_common::error_code::ErrorCode;
 use tickvault_common::order_types::{OrderType, OrderValidity, ProductType, TransactionType};
+use tickvault_common::sanitize::capture_rest_error_body;
 use tickvault_trading::oms::exit_rules::{self, ExitCommand};
 use tickvault_trading::oms::types::OrderLeg;
 use tickvault_trading::oms::{
     ExecutionVerdict, OmsError, OrderManagementSystem, PlaceOrderRequest,
 };
 use tickvault_trading::risk::engine::RiskEngine;
+use tickvault_trading::risk::types::RiskCheck;
 use tracing::{error, info, warn};
+
+/// M1 (2026-07-14 hostile review): every dispatcher log line rendering an
+/// [`OmsError`] is redacted + truncated (300 chars) via the house
+/// `capture_rest_error_body` pipeline — a raw Dhan body embedded in
+/// `DhanApiError::message` never reaches a sink unbounded.
+fn sanitize_oms_error(err: &OmsError) -> String {
+    capture_rest_error_body(&err.to_string())
+}
+
+/// H1 (2026-07-14 hostile review): the elapsed seconds handed to a verify
+/// probe for `attempt` (1-indexed).
+///
+/// Non-final rungs pass the honest wall-clock elapsed. The FINAL rung
+/// (the one after which `next_verify_backoff_secs` returns `None`) floors
+/// it to `deadline_secs`, so a still-resting order is CLASSIFIED at-limit
+/// by the engine (`PendingAtLimit` / partial-at-budget → EXIT-VERIFY-01 +
+/// `needs_reconciliation`) instead of exhausting the ladder as a silent
+/// in-budget `Pending` (with the default 1+2+4+8+10 = 25s rung sum inside
+/// the 30s deadline, that silent gap was structural).
+fn probe_elapsed_for_attempt(
+    attempt: u32,
+    max_attempts: u32,
+    actual_elapsed_secs: u64,
+    deadline_secs: u64,
+) -> u64 {
+    let is_final =
+        exit_rules::next_verify_backoff_secs(attempt.saturating_add(1), max_attempts).is_none();
+    if is_final {
+        actual_elapsed_secs.max(deadline_secs)
+    } else {
+        actual_elapsed_secs
+    }
+}
 
 /// Stable per-variant label for logs + tests (no Debug-format allocation
 /// on the gate path).
@@ -59,7 +119,7 @@ fn command_label(cmd: &ExitCommand) -> &'static str {
 /// A DISABLED layer never errors — the drop is deliberate and counted.
 pub async fn dispatch_exit_command(
     oms: &mut OrderManagementSystem,
-    risk_engine: &RiskEngine,
+    risk_engine: &mut RiskEngine,
     cmd: ExitCommand,
     cfg: &ExitOrdersConfig,
 ) -> Result<(), OmsError> {
@@ -81,17 +141,35 @@ pub async fn dispatch_exit_command(
             freeze_limit,
         } => close_all_for_security(oms, risk_engine, security_id, freeze_limit, cfg).await,
         ExitCommand::PlaceBracket(request) => {
-            let security_id = request.security_id;
-            oms.place_super_order(request, cfg.default_freeze_limit_qty)
-                .await
-                .map(|placement| {
-                    info!(
-                        entry_order_id = %placement.entry_order_id,
-                        security_id,
-                        legs = placement.legs.len(),
-                        "exit dispatcher → 3-leg bracket placed"
-                    );
-                })
+            // M5 (2026-07-14 hostile review): the bracket ENTRY is
+            // risk-gated exactly like the pipeline's plain entry arms
+            // (halt → daily loss → position limit) BEFORE any engine
+            // touch — mirror of trading_pipeline.rs's
+            // `risk_engine.check_order` usage on Long/Short signals.
+            let lot_size = i64::from(request.lot_size.max(1));
+            let lots = i32::try_from((request.quantity / lot_size).max(1)).unwrap_or(i32::MAX);
+            let signed_lots = match request.transaction_type {
+                TransactionType::Buy => lots,
+                TransactionType::Sell => lots.saturating_neg(),
+            };
+            match risk_engine.check_order(request.security_id, signed_lots) {
+                RiskCheck::Approved => {
+                    let security_id = request.security_id;
+                    oms.place_super_order(request, cfg.default_freeze_limit_qty)
+                        .await
+                        .map(|placement| {
+                            info!(
+                                entry_order_id = %placement.entry_order_id,
+                                security_id,
+                                legs = placement.legs.len(),
+                                "exit dispatcher → 3-leg bracket placed"
+                            );
+                        })
+                }
+                RiskCheck::Rejected { breach, reason } => Err(OmsError::RiskRejected {
+                    reason: format!("bracket refused by risk engine ({breach:?}): {reason}"),
+                }),
+            }
         }
         ExitCommand::TightenStop { order_id, modify } => {
             oms.modify_super_order_leg(&order_id, modify).await
@@ -127,7 +205,7 @@ pub async fn dispatch_exit_command(
         error!(
             code = ErrorCode::ExitOrder01ExecutionDegraded.code_str(),
             command = label,
-            error = %err,
+            error = %sanitize_oms_error(err),
             "EXIT-ORDER-01: exit command failed"
         );
     }
@@ -136,14 +214,15 @@ pub async fn dispatch_exit_command(
 
 /// The `Signal::Exit` arm delegate (design §3.5).
 ///
-/// `enabled == false` ⇒ the byte-equivalent LEGACY body (cancel actives +
-/// plain MARKET close via `oms.place_order` — the exact pre-Cluster-B
-/// `trading_pipeline.rs` behavior, same log lines). `enabled == true` ⇒
+/// `enabled == false` ⇒ the behavior-equivalent LEGACY body (cancel
+/// actives + plain MARKET close via `oms.place_order` — identical control
+/// flow and API calls to the pre-Cluster-B `trading_pipeline.rs` arm; log
+/// fields upgraded to redacted rendering per the M1 fix). `enabled == true` ⇒
 /// [`ExitCommand::CloseAll`] through [`dispatch_exit_command`] (cancel
 /// actives super-order-aware + `place_order_sliced` + the verify ladder).
 pub async fn execute_exit_for_security(
     oms: &mut OrderManagementSystem,
-    risk_engine: &RiskEngine,
+    risk_engine: &mut RiskEngine,
     security_id: u64,
     cfg: &ExitOrdersConfig,
 ) {
@@ -155,16 +234,20 @@ pub async fn execute_exit_for_security(
         if let Err(err) = dispatch_exit_command(oms, risk_engine, cmd, cfg).await {
             // Already EXIT-ORDER-01-coded inside the dispatcher; this is
             // the pipeline-facing summary line (legacy warn semantics).
+            // M1 (refuter round 1, 2026-07-14): Display through the house
+            // redaction pipeline — never a Debug dump of a raw Dhan body.
             warn!(
-                ?err,
-                security_id, "EXIT signal → exit-command dispatch failed"
+                error = %sanitize_oms_error(&err),
+                security_id,
+                "EXIT signal → exit-command dispatch failed"
             );
         }
         return;
     }
 
-    // ---- LEGACY body (disabled path) — byte-equivalent to the
-    // pre-Cluster-B Signal::Exit arm. ----
+    // ---- LEGACY body (disabled path) — behavior-equivalent to the
+    // pre-Cluster-B Signal::Exit arm (identical control flow and API
+    // calls; log fields upgraded to redacted rendering per the M1 fix). ----
     // Step 1: Cancel active (unfilled/pending) orders for this security
     let active: Vec<String> = oms
         .active_orders()
@@ -174,8 +257,10 @@ pub async fn execute_exit_for_security(
         .collect();
     for order_id in active {
         if let Err(err) = oms.cancel_order(&order_id).await {
+            // M1 (refuter round 1, 2026-07-14): sanitized Display, not
+            // Debug — same redaction class as the enabled path.
             warn!(
-                ?err,
+                error = %sanitize_oms_error(&err),
                 order_id = %order_id,
                 "EXIT signal → cancel failed"
             );
@@ -218,9 +303,12 @@ pub async fn execute_exit_for_security(
                 );
             }
             Err(err) => {
+                // M1 (refuter round 1, 2026-07-14): sanitized Display, not
+                // Debug — same redaction class as the enabled path.
                 warn!(
-                    ?err,
-                    security_id, "EXIT signal → closing order placement failed"
+                    error = %sanitize_oms_error(&err),
+                    security_id,
+                    "EXIT signal → closing order placement failed"
                 );
             }
         }
@@ -265,7 +353,7 @@ async fn close_all_for_security(
                 code = ErrorCode::ExitOrder01ExecutionDegraded.code_str(),
                 order_id = %order_id,
                 security_id,
-                error = %err,
+                error = %sanitize_oms_error(&err),
                 "EXIT-ORDER-01: CloseAll → cancel failed"
             );
         }
@@ -310,13 +398,49 @@ async fn close_all_for_security(
 
     // Step 3: MPP verify-after-place ladder per close-order id
     // (orders.md rule 18 — never assume a MARKET order filled).
+    //
+    // H3b (2026-07-14 hostile review; H3c precision refuter round 1):
+    // the LADDER SLEEP time across all slices is bounded by ONE
+    // `mpp_verify_deadline_secs` — the strategy task drives this inline,
+    // so unbounded per-slice ladder walks would stall the pipeline select
+    // loop for slices × deadline. Per-probe HTTP RTTs + GCRA pacing are
+    // ADDITIONAL to that budget (each remaining slice still costs one
+    // probe round-trip, so a large slice count adds un-slept probe time).
+    // Once the budget is spent, every remaining id gets ONE sleepless
+    // probe at `elapsed = deadline` — the H1 at-limit path: a still-
+    // resting order classifies `PendingAtLimit` engine-side
+    // (EXIT-VERIFY-01 + needs_reconciliation), never a silent skip.
+    let verify_budget = std::time::Duration::from_secs(cfg.mpp_verify_deadline_secs);
+    let verify_started = tokio::time::Instant::now();
+    let mut budget_exhausted_logged = false;
     for order_id in &order_ids {
-        if let Err(err) = run_verify_ladder(oms, order_id, cfg).await {
+        let within_budget = verify_started.elapsed() < verify_budget;
+        if !within_budget && !budget_exhausted_logged {
+            budget_exhausted_logged = true;
+            warn!(
+                security_id,
+                budget_secs = cfg.mpp_verify_deadline_secs,
+                remaining_orders = order_ids.len(),
+                "CloseAll verify budget exhausted — remaining ids get one sleepless at-limit probe each"
+            );
+        }
+        let result = if within_budget {
+            run_verify_ladder(oms, order_id, cfg).await.map(|_| ())
+        } else {
+            oms.verify_order_execution(
+                order_id,
+                cfg.mpp_verify_deadline_secs,
+                cfg.mpp_verify_deadline_secs,
+            )
+            .await
+            .map(|_| ())
+        };
+        if let Err(err) = result {
             error!(
                 code = ErrorCode::ExitOrder01ExecutionDegraded.code_str(),
                 order_id = %order_id,
                 security_id,
-                error = %err,
+                error = %sanitize_oms_error(&err),
                 "EXIT-ORDER-01: CloseAll → verify ladder failed"
             );
         }
@@ -328,10 +452,19 @@ async fn close_all_for_security(
 /// delay (`exit_rules::next_verify_backoff_secs` — 1, 2, 4, 8, 10s), then
 /// one engine probe per rung.
 ///
-/// - A DECISIVE verdict (`Filled` / `SimulatedFilled` / `Terminal` /
-///   `PendingAtLimit` / `Unknown`) stops the ladder (the engine already
-///   emitted `EXIT-VERIFY-01` for the degraded terminals).
+/// - A DECISIVE verdict stops the ladder
+///   (`exit_rules::verify_verdict_decisive` — the engine already emitted
+///   `EXIT-VERIFY-01` + `needs_reconciliation` for the degraded
+///   terminals). M2 (2026-07-14 hostile review): an
+///   `Unknown{NOT_IN_SUPER_LIST}` is NON-decisive before the final
+///   attempt (one list snapshot missing our id may be lag) and decisive
+///   fail-closed ON it; a body-unparsable `Unknown` stays decisive.
 /// - `Pending` / `PartiallyFilled` keep polling until the rungs run out.
+/// - H1: probes carry WALL-CLOCK elapsed (probe RTT included); the FINAL
+///   rung floors it to `mpp_verify_deadline_secs`
+///   ([`probe_elapsed_for_attempt`]) so a never-fills order classifies
+///   at-limit instead of exhausting silently Pending (default rung sum
+///   25s < the 30s deadline).
 /// - A transport/HTTP/429 probe failure is INCONCLUSIVE — retried on the
 ///   next rung, NEVER treated as order-absent (design §5). Only
 ///   `OrderNotFound` (structural — we never tracked the id) aborts.
@@ -344,7 +477,7 @@ async fn run_verify_ladder(
     order_id: &str,
     cfg: &ExitOrdersConfig,
 ) -> Result<ExecutionVerdict, OmsError> {
-    let mut elapsed_secs: u64 = 0;
+    let started = tokio::time::Instant::now();
     let mut last_verdict: Option<ExecutionVerdict> = None;
     let mut last_probe_error: Option<OmsError> = None;
 
@@ -355,21 +488,24 @@ async fn run_verify_ladder(
             break; // ladder exhausted
         };
         tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
-        elapsed_secs = elapsed_secs.saturating_add(delay_secs);
+        let is_final = exit_rules::next_verify_backoff_secs(
+            attempt.saturating_add(1),
+            cfg.mpp_verify_max_attempts,
+        )
+        .is_none();
+        let elapsed_secs = probe_elapsed_for_attempt(
+            attempt,
+            cfg.mpp_verify_max_attempts,
+            started.elapsed().as_secs(),
+            cfg.mpp_verify_deadline_secs,
+        );
 
         match oms
             .verify_order_execution(order_id, elapsed_secs, cfg.mpp_verify_deadline_secs)
             .await
         {
             Ok(verdict) => {
-                let decisive = matches!(
-                    verdict,
-                    ExecutionVerdict::Filled { .. }
-                        | ExecutionVerdict::SimulatedFilled
-                        | ExecutionVerdict::Terminal { .. }
-                        | ExecutionVerdict::PendingAtLimit { .. }
-                        | ExecutionVerdict::Unknown { .. }
-                );
+                let decisive = exit_rules::verify_verdict_decisive(&verdict, is_final);
                 last_probe_error = None;
                 last_verdict = Some(verdict);
                 if decisive {
@@ -384,7 +520,7 @@ async fn run_verify_ladder(
                 warn!(
                     order_id = %order_id,
                     attempt,
-                    error = %err,
+                    error = %sanitize_oms_error(&err),
                     "verify probe inconclusive — retrying next rung"
                 );
                 last_probe_error = Some(err);
@@ -393,6 +529,28 @@ async fn run_verify_ladder(
     }
 
     match (last_verdict, last_probe_error) {
+        // H1 exhaustion fallback: normally unreachable — the final rung's
+        // at-limit floor makes the last SUCCESSFUL probe classify
+        // decisively. It fires only when the FINAL probe itself failed
+        // transport-wise after an earlier in-budget Pending. Fail-closed:
+        // ladder exhaustion is NEVER a silent Pending (the engine-side
+        // needs_reconciliation flag was not reachable here — stated
+        // plainly; the returned at-limit verdict is the caller's signal).
+        (Some(ExecutionVerdict::Pending { .. }), _) => {
+            error!(
+                code = ErrorCode::ExitVerify01Degraded.code_str(),
+                order_id = %order_id,
+                deadline_secs = cfg.mpp_verify_deadline_secs,
+                "EXIT-VERIFY-01: verify ladder exhausted non-decisive (final probe failed) — \
+                 classified at-limit, never assumed filled"
+            );
+            Ok(ExecutionVerdict::PendingAtLimit {
+                elapsed_secs: started
+                    .elapsed()
+                    .as_secs()
+                    .max(cfg.mpp_verify_deadline_secs),
+            })
+        }
         (Some(verdict), _) => Ok(verdict),
         (None, Some(err)) => Err(err),
         // Unreachable with validate()'s attempts >= 1 bound; fail-closed
@@ -489,7 +647,7 @@ mod tests {
     #[tokio::test]
     async fn test_dispatch_gate_off_drops_every_variant_without_touching_oms() {
         let mut oms = make_dry_run_oms();
-        let risk = RiskEngine::new(2.0, 100, 1_000_000.0);
+        let mut risk = RiskEngine::new(2.0, 100, 1_000_000.0);
         let cfg = ExitOrdersConfig::default();
         assert!(!cfg.enabled, "default must be OFF (LOCK #1)");
 
@@ -515,7 +673,7 @@ mod tests {
             },
         ];
         for cmd in commands {
-            let result = dispatch_exit_command(&mut oms, &risk, cmd, &cfg).await;
+            let result = dispatch_exit_command(&mut oms, &mut risk, cmd, &cfg).await;
             assert!(result.is_ok(), "disabled gate must drop with Ok, not Err");
         }
         assert_eq!(
@@ -555,7 +713,7 @@ mod tests {
             security_id: 13,
             freeze_limit: cfg.default_freeze_limit_qty,
         };
-        dispatch_exit_command(&mut oms, &risk, cmd, &cfg)
+        dispatch_exit_command(&mut oms, &mut risk, cmd, &cfg)
             .await
             .expect("CloseAll must succeed in dry-run");
 
@@ -573,12 +731,12 @@ mod tests {
     #[tokio::test]
     async fn test_dispatch_bracket_tighten_and_cancel_smoke() {
         let mut oms = make_dry_run_oms();
-        let risk = RiskEngine::new(2.0, 100, 1_000_000.0);
+        let mut risk = RiskEngine::new(2.0, 100, 1_000_000.0);
         let cfg = enabled_cfg(1800);
 
         dispatch_exit_command(
             &mut oms,
-            &risk,
+            &mut risk,
             ExitCommand::PlaceBracket(bracket_request(49081)),
             &cfg,
         )
@@ -599,7 +757,7 @@ mod tests {
 
         dispatch_exit_command(
             &mut oms,
-            &risk,
+            &mut risk,
             ExitCommand::TightenStop {
                 order_id: entry_id.clone(),
                 modify: ModifySuperOrderLeg::StopLoss {
@@ -614,7 +772,7 @@ mod tests {
 
         dispatch_exit_command(
             &mut oms,
-            &risk,
+            &mut risk,
             ExitCommand::CancelBracket {
                 order_id: entry_id.clone(),
             },
@@ -629,12 +787,12 @@ mod tests {
     #[tokio::test]
     async fn test_dispatch_place_oco_protection_smoke() {
         let mut oms = make_dry_run_oms();
-        let risk = RiskEngine::new(2.0, 100, 1_000_000.0);
+        let mut risk = RiskEngine::new(2.0, 100, 1_000_000.0);
         let cfg = enabled_cfg(1800);
 
         dispatch_exit_command(
             &mut oms,
-            &risk,
+            &mut risk,
             ExitCommand::PlaceOcoProtection(oco_request()),
             &cfg,
         )
@@ -649,7 +807,7 @@ mod tests {
     #[tokio::test]
     async fn test_dispatch_verify_execution_paper_simulated_filled() {
         let mut oms = make_dry_run_oms();
-        let risk = RiskEngine::new(2.0, 100, 1_000_000.0);
+        let mut risk = RiskEngine::new(2.0, 100, 1_000_000.0);
         let cfg = enabled_cfg(1800);
 
         let request = PlaceOrderRequest {
@@ -677,7 +835,7 @@ mod tests {
 
         dispatch_exit_command(
             &mut oms,
-            &risk,
+            &mut risk,
             ExitCommand::VerifyExecution { order_id },
             &cfg,
         )
@@ -691,12 +849,12 @@ mod tests {
     #[tokio::test]
     async fn test_dispatch_engine_failure_propagates_typed_error() {
         let mut oms = make_dry_run_oms();
-        let risk = RiskEngine::new(2.0, 100, 1_000_000.0);
+        let mut risk = RiskEngine::new(2.0, 100, 1_000_000.0);
         let cfg = enabled_cfg(1800);
 
         let result = dispatch_exit_command(
             &mut oms,
-            &risk,
+            &mut risk,
             ExitCommand::TightenStop {
                 order_id: "NO-SUCH-ORDER".to_string(),
                 modify: ModifySuperOrderLeg::Target {
@@ -714,7 +872,7 @@ mod tests {
         // Verify ladder on an untracked id: structural OrderNotFound too.
         let verify = dispatch_exit_command(
             &mut oms,
-            &risk,
+            &mut risk,
             ExitCommand::VerifyExecution {
                 order_id: "NO-SUCH-ORDER".to_string(),
             },
@@ -726,7 +884,7 @@ mod tests {
 
     /// Disabled `execute_exit_for_security` runs the LEGACY body:
     /// cancel actives + ONE plain MARKET close order (no slicing, no
-    /// dispatcher) — byte-equivalent to the pre-Cluster-B Exit arm.
+    /// dispatcher) — behavior-equivalent to the pre-Cluster-B Exit arm.
     #[tokio::test]
     async fn test_execute_exit_disabled_runs_legacy_cancel_and_close() {
         let mut oms = make_dry_run_oms();
@@ -748,7 +906,7 @@ mod tests {
         };
         let pending_id = oms.place_order(pending).await.expect("paper place");
 
-        execute_exit_for_security(&mut oms, &risk, 13, &cfg).await;
+        execute_exit_for_security(&mut oms, &mut risk, 13, &cfg).await;
 
         // Legacy path: the active order cancelled + exactly ONE close
         // order placed (freeze scalar 0 is IGNORED — no slicing path).
@@ -764,10 +922,10 @@ mod tests {
     #[tokio::test]
     async fn test_execute_exit_disabled_flat_position_places_no_close() {
         let mut oms = make_dry_run_oms();
-        let risk = RiskEngine::new(2.0, 100, 1_000_000.0);
+        let mut risk = RiskEngine::new(2.0, 100, 1_000_000.0);
         let cfg = ExitOrdersConfig::default();
 
-        execute_exit_for_security(&mut oms, &risk, 13, &cfg).await;
+        execute_exit_for_security(&mut oms, &mut risk, 13, &cfg).await;
         assert_eq!(oms.total_placed(), 0, "flat + no actives = no orders");
     }
 
@@ -781,12 +939,142 @@ mod tests {
         risk.record_fill(21, -2, 50.0, 1); // net -2 lots → BUY 2 to close
         let cfg = enabled_cfg(1);
 
-        execute_exit_for_security(&mut oms, &risk, 21, &cfg).await;
+        execute_exit_for_security(&mut oms, &mut risk, 21, &cfg).await;
         assert_eq!(
             oms.total_placed(),
             2,
             "2 lots at freeze 1 must slice into 2 paper close orders"
         );
+    }
+
+    /// H1: the ladder's per-attempt elapsed — non-final rungs pass the
+    /// honest wall-clock; the FINAL rung floors it to the deadline, so a
+    /// never-fills order at the defaults (rung sum 25s < deadline 30s)
+    /// classifies at-limit engine-side instead of exhausting silently
+    /// Pending.
+    #[test]
+    fn test_probe_elapsed_for_attempt_floors_final_to_deadline() {
+        // Defaults: max_attempts 5, deadline 30.
+        // Non-final rungs: honest wall-clock, no floor.
+        assert_eq!(probe_elapsed_for_attempt(1, 5, 1, 30), 1);
+        assert_eq!(probe_elapsed_for_attempt(4, 5, 15, 30), 15);
+        // FINAL rung (attempt 5 of 5): actual 25 floors up to 30.
+        assert_eq!(probe_elapsed_for_attempt(5, 5, 25, 30), 30);
+        // FINAL rung with slow probes past the deadline: wall-clock wins.
+        assert_eq!(probe_elapsed_for_attempt(5, 5, 40, 30), 40);
+        // Single-attempt ladder: the first rung IS final.
+        assert_eq!(probe_elapsed_for_attempt(1, 1, 2, 30), 30);
+    }
+
+    /// H1 (end-to-end at defaults): the ladder's decisive verdicts stop
+    /// it on rung 1 for paper orders, and the exhaustion path can never
+    /// return an in-budget `Pending` — the fallback + final-rung floor
+    /// guarantee an at-limit classification. Proven at the seam here via
+    /// the pure helpers ([`probe_elapsed_for_attempt`] above +
+    /// `exit_rules::verify_verdict_decisive`); the resting-PENDING and
+    /// resting-PARTIAL at-limit classifications (EXIT-VERIFY-01 +
+    /// needs_reconciliation) are engine-tested with live HTTP mocks
+    /// (`test_verify_live_pending_at_limit_flags_needs_reconciliation`,
+    /// `test_verify_order_execution_live_partial_fill_at_budget_flags_reconciliation`).
+    #[tokio::test(start_paused = true)]
+    async fn test_ladder_decisive_verdict_stops_at_first_rung() {
+        let mut oms = make_dry_run_oms();
+        let cfg = enabled_cfg(1800);
+        let order_id = oms
+            .place_order(PlaceOrderRequest {
+                security_id: 13,
+                transaction_type: TransactionType::Buy,
+                order_type: OrderType::Market,
+                product_type: ProductType::Intraday,
+                validity: OrderValidity::Day,
+                quantity: 1,
+                price: 0.0,
+                trigger_price: 0.0,
+                lot_size: 1,
+                expiry_date: None,
+            })
+            .await
+            .expect("paper place");
+
+        let started = tokio::time::Instant::now();
+        let verdict = run_verify_ladder(&mut oms, &order_id, &cfg)
+            .await
+            .expect("ladder");
+        assert_eq!(verdict, ExecutionVerdict::SimulatedFilled);
+        // One rung only: exactly the 1s first delay elapsed (paused time).
+        assert_eq!(started.elapsed().as_secs(), 1);
+    }
+
+    /// H3b: the CloseAll verify budget bounds LADDER SLEEP time across
+    /// slices to ~ONE `mpp_verify_deadline_secs` (per-probe RTTs + GCRA
+    /// pacing are additional — H3c) — remaining ids get a sleepless
+    /// at-limit probe, so 5 slices at a 1s budget cannot cost 5 ladder
+    /// walks.
+    #[tokio::test(start_paused = true)]
+    async fn test_close_all_verify_budget_bounds_total_ladder_time() {
+        let mut oms = make_dry_run_oms();
+        let mut risk = RiskEngine::new(2.0, 100, 1_000_000.0);
+        risk.record_fill(13, 5, 100.0, 1); // net +5 lots
+        let mut cfg = enabled_cfg(1); // freeze 1 → 5 close slices
+        cfg.mpp_verify_deadline_secs = 1; // 1s TOTAL verify budget
+
+        let started = tokio::time::Instant::now();
+        dispatch_exit_command(
+            &mut oms,
+            &mut risk,
+            ExitCommand::CloseAll {
+                security_id: 13,
+                freeze_limit: cfg.default_freeze_limit_qty,
+            },
+            &cfg,
+        )
+        .await
+        .expect("CloseAll must succeed in dry-run");
+
+        assert_eq!(oms.total_placed(), 5, "5 slices placed");
+        // First ladder consumed the 1s budget (its rung-1 sleep); the 4
+        // remaining ids probed sleeplessly — total stays ~1 virtual sec,
+        // NOT 5 ladder walks.
+        assert!(
+            started.elapsed().as_secs() <= 2,
+            "verify budget must bound total ladder time, took {}s",
+            started.elapsed().as_secs()
+        );
+    }
+
+    /// M5: a risk-rejecting engine (position limit 0 rejects everything —
+    /// the halted/breached class) refuses PlaceBracket BEFORE any OMS
+    /// touch; an approving engine places it.
+    #[tokio::test]
+    async fn test_dispatch_place_bracket_risk_gated() {
+        let mut oms = make_dry_run_oms();
+        let cfg = enabled_cfg(1800);
+
+        // max_position_lots = 0 → every order breaches the position limit.
+        let mut rejecting_risk = RiskEngine::new(2.0, 0, 1_000_000.0);
+        let refused = dispatch_exit_command(
+            &mut oms,
+            &mut rejecting_risk,
+            ExitCommand::PlaceBracket(bracket_request(49081)),
+            &cfg,
+        )
+        .await;
+        let err = refused.expect_err("risk-rejected bracket must error");
+        assert!(matches!(err, OmsError::RiskRejected { .. }));
+        assert!(err.to_string().contains("risk engine"));
+        assert_eq!(oms.total_placed(), 0, "no OMS touch on risk rejection");
+
+        // An approving engine still places the bracket.
+        let mut approving_risk = RiskEngine::new(2.0, 100, 1_000_000.0);
+        dispatch_exit_command(
+            &mut oms,
+            &mut approving_risk,
+            ExitCommand::PlaceBracket(bracket_request(49081)),
+            &cfg,
+        )
+        .await
+        .expect("approved bracket must place");
+        assert_eq!(oms.total_placed(), 1);
     }
 
     /// `command_label` covers every ExitCommand variant with a stable

@@ -1904,6 +1904,16 @@ pub struct ReconciliationReport {
 /// Exchange segment for NSE F&O (the only segment this system trades).
 pub const EXCHANGE_SEGMENT_NSE_FNO: &str = "NSE_FNO";
 
+/// Synthetic `order_status` the api-client stamps when a 2xx super-order
+/// cancel/modify response carried a body that was PRESENT but UNPARSABLE
+/// (the U6 202-no-body tolerance class).
+///
+/// L5 (2026-07-14 hostile review): the engine treats it as
+/// accepted-with-doubt — the local registry apply still runs, but the
+/// tracked entry is flagged `needs_reconciliation` (the mutation may not
+/// actually have applied broker-side).
+pub const SUPER_ORDER_STATUS_ACCEPTED_UNPARSED_BODY: &str = "ACCEPTED_UNPARSED_BODY";
+
 // ---------------------------------------------------------------------------
 // Multi Order + Conditional Detail Types — 2026-07-14 (07c §multi + portal/yaml)
 // ---------------------------------------------------------------------------

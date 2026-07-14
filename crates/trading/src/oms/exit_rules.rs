@@ -29,12 +29,24 @@ pub const VERIFY_BACKOFF_CAP_SECS: u64 = 10;
 /// would attempt a ~9e18-element allocation (abort — a panic-class
 /// failure). Real freeze limits are thousands of units and exit
 /// quantities a few lots, so any request past this cap is a data error
-/// and refuses with a typed `RiskRejected`.
+/// and refuses with a typed `RiskRejected`. The engine ALSO applies this
+/// cap to the server-controlled `/orders/slicing` response Vec (H3b,
+/// 2026-07-14 hostile review — a hostile/broken broker payload can never
+/// force unbounded per-row tracking work).
 pub const MAX_ORDER_SLICES: i64 = 1_000;
 
-/// The Cluster A seam vocabulary — frozen in this PR. Cluster A constructs
-/// commands; ONLY the app dispatcher executes them (never engine methods
-/// directly).
+/// Raw-status sentinel for a batched super-list probe that succeeded but
+/// did NOT contain the queried order id.
+///
+/// Fail-closed `Unknown` — one list snapshot missing our id is NOT proof
+/// of absence (eventual-consistency lag is plausible), so the verify
+/// ladder treats it as RETRYABLE until the final attempt (M2, 2026-07-14
+/// hostile review — see [`verify_verdict_decisive`]).
+pub const VERIFY_RAW_NOT_IN_SUPER_LIST: &str = "NOT_IN_SUPER_LIST";
+
+/// The Cluster A seam vocabulary — frozen in this PR. Future entry-side
+/// (Cluster A) work constructs commands; ONLY the app dispatcher executes
+/// them (never engine methods directly).
 #[derive(Debug, Clone)]
 pub enum ExitCommand {
     /// What Signal::Exit does today: cancel actives + close net position
@@ -45,7 +57,8 @@ pub enum ExitCommand {
         /// Exchange freeze quantity for the close order(s).
         freeze_limit: i64,
     },
-    /// Entry-time 3-leg bracket (Cluster A constructs at entry decision).
+    /// Entry-time 3-leg bracket (constructed at the entry decision by the
+    /// future entry-side (Cluster A) work).
     PlaceBracket(PlaceSuperOrderRequest),
     /// Tighten (or otherwise modify) one leg of a tracked super order.
     TightenStop {
@@ -292,6 +305,66 @@ pub fn entry_leg_cancel_allowed(entry_status_raw: &str) -> bool {
 /// (07a §3: only PENDING / PART_TRADED; TRANSIT tolerated as pre-PENDING).
 pub fn entry_leg_modify_allowed(entry_status_raw: &str) -> bool {
     matches!(entry_status_raw, "PENDING" | "PART_TRADED" | "TRANSIT")
+}
+
+/// True when a TARGET/STOP_LOSS leg modify is allowed for the given raw
+/// LEG status (M4, 2026-07-14 hostile review).
+///
+/// A DEAD leg — `TRIGGERED` / `TRADED` / `CANCELLED` / `REJECTED` /
+/// `CLOSED` — refuses the modify: mutating an already-done leg is at best
+/// a no-op and at worst an UNVERIFIED-LIVE surprise. `PENDING` /
+/// `CONFIRMED` / `TRANSIT` and unknown/EMPTY strings ALLOW — fail-open by
+/// design: an empty raw status is the synthesized-placeholder case and
+/// Dhan re-validates the leg server-side anyway.
+pub fn exit_leg_modify_allowed(leg_status_raw: &str) -> bool {
+    !matches!(
+        leg_status_raw,
+        "TRIGGERED" | "TRADED" | "CANCELLED" | "REJECTED" | "CLOSED"
+    )
+}
+
+/// L3 (2026-07-14 hostile review): order-id charset gate —
+/// `[A-Za-z0-9_-]{1,64}`.
+///
+/// Every SERVER-SUPPLIED id is validated before it is tracked, and every
+/// CALLER-SUPPLIED id before it is embedded into a request URL path
+/// (`/v2/super/orders/{id}`, `/v2/orders/{id}`). Anything else — path
+/// separators, whitespace, control characters, over-length, non-ASCII —
+/// is refused with a typed error at the call site: never tracked, never
+/// URL-embedded, never echoed raw into a log line.
+pub fn is_valid_order_id(order_id: &str) -> bool {
+    (1..=64).contains(&order_id.len())
+        && order_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+/// True when `verdict` STOPS the app-side verify ladder (M2, 2026-07-14
+/// hostile review).
+///
+/// - `Filled` / `SimulatedFilled` / `Terminal` / `PendingAtLimit` —
+///   always decisive.
+/// - `Unknown` with [`VERIFY_RAW_NOT_IN_SUPER_LIST`] — NON-decisive
+///   before the final attempt (one list snapshot missing our id may be
+///   eventual-consistency lag; the remaining rungs re-probe — and the
+///   engine deliberately does NOT flag/error on those in-budget probes,
+///   refuter round 1 2026-07-14). On the FINAL attempt it turns decisive
+///   fail-closed: the ladder's final-rung elapsed floor puts that probe
+///   at/past the deadline, where the engine's EXIT-VERIFY-01 arm +
+///   `needs_reconciliation` fire.
+/// - Any OTHER `Unknown` (body-unparsable) — always decisive fail-closed.
+/// - `Pending` / `PartiallyFilled` — never decisive (keep polling).
+pub fn verify_verdict_decisive(verdict: &ExecutionVerdict, is_final_attempt: bool) -> bool {
+    match verdict {
+        ExecutionVerdict::Filled { .. }
+        | ExecutionVerdict::SimulatedFilled
+        | ExecutionVerdict::Terminal { .. }
+        | ExecutionVerdict::PendingAtLimit { .. } => true,
+        ExecutionVerdict::Unknown { raw_status } => {
+            raw_status != VERIFY_RAW_NOT_IN_SUPER_LIST || is_final_attempt
+        }
+        ExecutionVerdict::Pending { .. } | ExecutionVerdict::PartiallyFilled { .. } => false,
+    }
 }
 
 /// Classifies an MPP verify probe result into an [`ExecutionVerdict`].
@@ -840,6 +913,112 @@ mod tests {
         assert!(!entry_leg_modify_allowed("CANCELLED"));
         assert!(!entry_leg_modify_allowed(""));
         assert!(!entry_leg_modify_allowed("SOMETHING_NEW"));
+    }
+
+    #[test]
+    fn test_exit_leg_modify_allowed_table() {
+        // M4: dead legs refuse the Target/StopLoss modify.
+        for dead in ["TRIGGERED", "TRADED", "CANCELLED", "REJECTED", "CLOSED"] {
+            assert!(!exit_leg_modify_allowed(dead), "{dead} must refuse");
+        }
+        // Live/unknown/empty legs allow (fail-open — Dhan re-validates).
+        for live in ["PENDING", "CONFIRMED", "TRANSIT", "", "SOMETHING_NEW"] {
+            assert!(exit_leg_modify_allowed(live), "{live:?} must allow");
+        }
+    }
+
+    // --- is_valid_order_id (L3) ---
+
+    #[test]
+    fn test_is_valid_order_id_accepts_real_id_shapes() {
+        for id in [
+            "PAPER-SO-1",
+            "112111182198",
+            "SO_100-a",
+            "A",
+            &"x".repeat(64),
+        ] {
+            assert!(is_valid_order_id(id), "{id:?} must be accepted");
+        }
+    }
+
+    #[test]
+    fn test_is_valid_order_id_rejects_malformed_shapes() {
+        for id in [
+            "",
+            &"x".repeat(65),
+            "SO/../100",
+            "SO 100",
+            "SO\n100",
+            "SO?x=1",
+            "SO#1",
+            "SO%2F1",
+            "ऑर्डर-1",
+            "SO\u{0}1",
+        ] {
+            assert!(!is_valid_order_id(id), "{id:?} must be rejected");
+        }
+    }
+
+    // --- verify_verdict_decisive (M2) ---
+
+    #[test]
+    fn test_verify_verdict_decisive_not_in_super_list_retries_until_final() {
+        // M2: one missing list snapshot is NOT absence — non-decisive
+        // before the final attempt, decisive fail-closed ON it.
+        let missing = ExecutionVerdict::Unknown {
+            raw_status: VERIFY_RAW_NOT_IN_SUPER_LIST.to_string(),
+        };
+        assert!(!verify_verdict_decisive(&missing, false));
+        assert!(verify_verdict_decisive(&missing, true));
+    }
+
+    #[test]
+    fn test_verify_verdict_decisive_unparsable_body_always_decisive() {
+        // A 2xx with garbage is a broken response NOW — no rung fixes it.
+        let garbage = ExecutionVerdict::Unknown {
+            raw_status: "UNPARSABLE_RESPONSE_BODY".to_string(),
+        };
+        assert!(verify_verdict_decisive(&garbage, false));
+        assert!(verify_verdict_decisive(&garbage, true));
+    }
+
+    #[test]
+    fn test_verify_verdict_decisive_full_table() {
+        for is_final in [false, true] {
+            assert!(verify_verdict_decisive(
+                &ExecutionVerdict::Filled {
+                    traded_qty: 75,
+                    avg_price: 100.0
+                },
+                is_final
+            ));
+            assert!(verify_verdict_decisive(
+                &ExecutionVerdict::SimulatedFilled,
+                is_final
+            ));
+            assert!(verify_verdict_decisive(
+                &ExecutionVerdict::Terminal {
+                    status: OrderStatus::Cancelled
+                },
+                is_final
+            ));
+            assert!(verify_verdict_decisive(
+                &ExecutionVerdict::PendingAtLimit { elapsed_secs: 30 },
+                is_final
+            ));
+            assert!(!verify_verdict_decisive(
+                &ExecutionVerdict::Pending { elapsed_secs: 3 },
+                is_final
+            ));
+            assert!(!verify_verdict_decisive(
+                &ExecutionVerdict::PartiallyFilled {
+                    traded_qty: 10,
+                    remaining: 65
+                },
+                is_final
+            ));
+        }
     }
 
     // --- classify_mpp_verdict ---
