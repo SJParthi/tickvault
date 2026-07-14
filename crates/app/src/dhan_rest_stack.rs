@@ -40,12 +40,16 @@
 //!    `instance_lock_held` wiring (RESILIENCE-03 mint tripwire), then
 //!    `set_global_token_manager` + `feed_runtime.set_live_token_manager` so
 //!    the token gauges read this manager;
-//! 3. the token renewal loop + the mid-session profile watchdog;
-//! 4. the REST canary (`rest_canary_boot`), the per-minute `spot_1m_rest`
-//!    scheduler and the per-minute `option_chain_1m` scheduler /
-//!    entitlement probe — mirroring `main.rs::spawn_post_market_tasks`
-//!    exactly (incl. the spot→chain sequencing watch channel and the
-//!    existing `[spot_1m_rest]` / `[option_chain_1m]` config gates);
+//! 3. the token renewal loop + the mid-session profile watchdog (SILENT
+//!    since 2026-07-14 — coded errors/counters only; terminal re-mint
+//!    failure pages the family-(c) `AuthenticationFailed` Critical), the
+//!    GAP-02 900s stale-token sweep and the GAP-06 re-homed token-health
+//!    gauge poller (`dhan-rest-only-noise-lock-2026-07-14.md`);
+//! 4. the per-minute `spot_1m_rest` scheduler and the per-minute
+//!    `option_chain_1m` scheduler / entitlement probe — mirroring
+//!    `main.rs::spawn_post_market_tasks` (incl. the spot→chain sequencing
+//!    watch channel and the existing `[spot_1m_rest]` /
+//!    `[option_chain_1m]` config gates);
 //! 5. **(PR-C1, 2026-07-13 — operator ruling Q4-i "agreed dude")** the Dhan
 //!    ORDER-UPDATE WS, rewired from the retired lane into this stack —
 //!    FUNCTIONAL-DORMANT: connected + authenticated (MsgCode-42 JSON login),
@@ -762,29 +766,9 @@ async fn run_dhan_rest_stack(params: DhanRestStackParams) {
         );
     }
 
-    // REST-health canary (DHAN-REST-400): 09:05 / 12:00 / 15:25 IST probes.
-    {
-        let canary_token = Arc::clone(&token_handle);
-        let canary_base = config.dhan.rest_api_base_url.clone();
-        let canary_calendar = Arc::clone(&params.calendar);
-        let _canary_handle = tokio::spawn(async move {
-            use chrono::{FixedOffset, TimeZone, Timelike, Utc};
-            use tickvault_common::constants::IST_UTC_OFFSET_SECONDS;
-            let Some(ist_offset) = FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS) else {
-                return;
-            };
-            let now_ist = ist_offset.from_utc_datetime(&Utc::now().naive_utc());
-            let is_trading_day = canary_calendar.is_trading_day(now_ist.date_naive());
-            crate::rest_canary_boot::run_rest_canary(
-                canary_token,
-                canary_base,
-                is_trading_day,
-                now_ist.time().num_seconds_from_midnight(),
-            )
-            .await;
-        });
-        info!("rest_canary: REST-health probe task spawned (09:05 / 12:00 / 15:25 IST)");
-    }
+    // REST-health canary (DHAN-REST-400) DELETED 2026-07-14 (operator Dhan
+    // noise lock): the spot-1m + option-chain legs self-detect a dead REST
+    // surface within ~3-4 minutes via their own escalation edges.
 
     // Spot→chain sequencing signal — created ONLY when BOTH halves are
     // enabled (byte-identical to the spawn_post_market_tasks wiring).

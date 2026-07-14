@@ -14891,36 +14891,11 @@ fn spawn_post_market_tasks(
         info!("cross_verify_1m: post-market verification task spawned");
     }
 
-    // Operator task DHAN-REST-400 (2026-06-10): REST-health canary — one
-    // cheap GET /v2/profile at 09:05 / 12:00 / 15:25 IST on trading days.
-    // On non-2xx it pages HIGH (REST-CANARY-01) with the HTTP status, the
-    // exact final URL (token-redacted) and the bounded secret-redacted
-    // response body — so an 08:45-class REST death is known by 09:05, not
-    // discovered at 15:33 by the cross-verify. Spawned from BOTH boot paths
-    // (this fn is the shared site); self-skips on non-trading days and when
-    // booted past 15:25 IST (audit Rule 3).
-    {
-        let canary_token = std::sync::Arc::clone(&token_handle);
-        let canary_base = config.dhan.rest_api_base_url.clone();
-        let canary_calendar = std::sync::Arc::clone(&trading_calendar);
-        tokio::spawn(async move {
-            use chrono::{FixedOffset, TimeZone, Timelike, Utc};
-            use tickvault_common::constants::IST_UTC_OFFSET_SECONDS;
-            let Some(ist_offset) = FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS) else {
-                return;
-            };
-            let now_ist = ist_offset.from_utc_datetime(&Utc::now().naive_utc());
-            let is_trading_day = canary_calendar.is_trading_day(now_ist.date_naive());
-            tickvault_app::rest_canary_boot::run_rest_canary(
-                canary_token,
-                canary_base,
-                is_trading_day,
-                now_ist.time().num_seconds_from_midnight(),
-            )
-            .await;
-        });
-        info!("rest_canary: REST-health probe task spawned (09:05 / 12:00 / 15:25 IST)");
-    }
+    // REST-health canary (DHAN-REST-400) DELETED 2026-07-14 (operator Dhan
+    // noise lock — dhan-rest-only-noise-lock-2026-07-14.md): the retained
+    // spot-1m + option-chain legs self-detect a dead Dhan REST surface
+    // within ~3-4 minutes via their own persist-gated escalation edges —
+    // strictly better coverage than 3 fixed daily probe slots.
 
     // Operator grant 2026-07-12 (PR-2, the SPOT half): per-minute spot 1m
     // REST pipeline — every trading-day minute close in [09:16:00, 15:30:00]
