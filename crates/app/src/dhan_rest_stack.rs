@@ -597,15 +597,28 @@ async fn run_dhan_rest_stack(params: DhanRestStackParams) {
     // sighted. Shares the SAME profile-truth flag as the watchdog above,
     // so a Dhan-killed (but locally unexpired) token reads 0 within one
     // watchdog cycle + one 15s poll.
-    let _token_health_gauge_handle =
-        tickvault_core::auth::token_health_gauge::spawn_token_health_gauge_poller(
-            Arc::clone(&token_manager),
-            Arc::clone(&token_profile_valid),
-        );
+    // L-fix (2026-07-14 fix round): supervised with the house respawn
+    // pattern — a silent poller death would blind the family-(4) alarm
+    // (the exact audited gap GAP-06 closed). Unwind-build self-heal only;
+    // release panics abort the process (panic = "abort").
+    let _token_health_gauge_supervisor = {
+        let gauge_token_manager = Arc::clone(&token_manager);
+        let gauge_profile_valid = Arc::clone(&token_profile_valid);
+        spawn_supervised_stack_task(
+            "token_health_gauge",
+            STACK_TASK_RESPAWN_BACKOFF_SECS,
+            move || {
+                tickvault_core::auth::token_health_gauge::spawn_token_health_gauge_poller(
+                    Arc::clone(&gauge_token_manager),
+                    Arc::clone(&gauge_profile_valid),
+                )
+            },
+        )
+    };
     info!(
         poll_secs = tickvault_core::auth::token_health_gauge::TOKEN_HEALTH_GAUGE_POLL_SECS,
-        "Dhan REST-only stack: live token-health gauge poller spawned \
-         (tv_token_remaining_seconds + tv_token_valid)"
+        "Dhan REST-only stack: live token-health gauge poller spawned (supervised; \
+         tv_token_remaining_seconds + tv_token_valid)"
     );
 
     // GAP-02 (2026-07-14): stale-token sweep — the renewal-loop-halt
@@ -615,44 +628,14 @@ async fn run_dhan_rest_stack(params: DhanRestStackParams) {
     // < 4h local headroom, honoring the RESILIENCE-03 lock tripwire; a
     // terminal mint failure pages via the token machinery's own
     // family-(3) paths. NOT market-hours gated.
-    let _token_sweep_handle = {
+    // L-fix (2026-07-14 fix round): supervised — a silent sweep death
+    // would silently recreate the audited renewal-loop-halt gap GAP-02
+    // exists to close.
+    let _token_sweep_supervisor = {
         let sweep_token_manager = Arc::clone(&token_manager);
-        tokio::spawn(async move {
-            use tickvault_common::constants::{
-                DHAN_REST_STACK_TOKEN_SWEEP_INTERVAL_SECS, TOKEN_SWEEP_STALENESS_THRESHOLD_SECS,
-            };
-            let interval = Duration::from_secs(DHAN_REST_STACK_TOKEN_SWEEP_INTERVAL_SECS);
-            loop {
-                tokio::time::sleep(interval).await;
-                match sweep_token_manager
-                    .force_renewal_if_stale(TOKEN_SWEEP_STALENESS_THRESHOLD_SECS)
-                    .await
-                {
-                    Ok(true) => {
-                        info!(
-                            "Dhan REST-only stack token sweep: renewed stale token (< 4h headroom)"
-                        );
-                        metrics::counter!("tv_token_sweep_renewals_total", "result" => "renewed")
-                            .increment(1);
-                    }
-                    Ok(false) => {
-                        debug!("Dhan REST-only stack token sweep: token still fresh, no action");
-                        metrics::counter!("tv_token_sweep_renewals_total", "result" => "fresh")
-                            .increment(1);
-                    }
-                    Err(err) => {
-                        // The renewal machinery's own retry/paging paths
-                        // own escalation; record the failure only.
-                        warn!(
-                            error = %err,
-                            "Dhan REST-only stack token sweep: force_renewal_if_stale failed \
-                             (renewal loop + AUTH-GAP-05 retry independently)"
-                        );
-                        metrics::counter!("tv_token_sweep_renewals_total", "result" => "failed")
-                            .increment(1);
-                    }
-                }
-            }
+        spawn_supervised_stack_task("token_sweep", STACK_TASK_RESPAWN_BACKOFF_SECS, move || {
+            let tm = Arc::clone(&sweep_token_manager);
+            tokio::spawn(run_token_sweep_loop(tm))
         })
     };
     info!(
@@ -816,6 +799,122 @@ async fn run_dhan_rest_stack(params: DhanRestStackParams) {
          token sweep + token-health gauge + spot_1m_rest + option_chain_1m arms spawned \
          WITHOUT any Dhan WebSocket (operator directives 2026-07-13 + 2026-07-14)"
     );
+
+    // M3 (2026-07-14 fix round): with BOTH per-minute legs disabled the
+    // stack has ZERO leg-level pager coverage — a total Dhan REST death
+    // would page nothing except the token family-(3) Critical + the
+    // CloudWatch token-remaining-low early warning. Loud at boot so the
+    // operator can never discover this from silence.
+    if rest_stack_has_zero_pager_legs(config.spot_1m_rest.enabled, config.option_chain_1m.enabled) {
+        warn!(
+            spot_1m_rest_enabled = false,
+            option_chain_1m_enabled = false,
+            "Dhan REST stack up with ZERO legs enabled — no pager coverage: a total \
+             Dhan REST death would fire NO leg alert (only the token family-(3) \
+             Critical + the tv-token-remaining-low CloudWatch alarm remain); enable \
+             [spot_1m_rest] / [option_chain_1m] if this is not intentional"
+        );
+    }
+}
+
+/// M3 (2026-07-14 fix round). Pure. True iff NEITHER per-minute Dhan REST
+/// leg is enabled — the configuration under which the stack has zero
+/// leg-level pager coverage (the boot-time warn above fires).
+#[must_use]
+pub(crate) fn rest_stack_has_zero_pager_legs(spot_enabled: bool, chain_enabled: bool) -> bool {
+    !spot_enabled && !chain_enabled
+}
+
+/// GAP-02 sweep body (extracted for the supervisor): every
+/// `DHAN_REST_STACK_TOKEN_SWEEP_INTERVAL_SECS`, renew the token iff its
+/// local headroom is < `TOKEN_SWEEP_STALENESS_THRESHOLD_SECS`. SILENT on
+/// no-op/success (debug!); the renewal machinery's own paths own paging.
+async fn run_token_sweep_loop(token_manager: Arc<TokenManager>) {
+    use tickvault_common::constants::{
+        DHAN_REST_STACK_TOKEN_SWEEP_INTERVAL_SECS, TOKEN_SWEEP_STALENESS_THRESHOLD_SECS,
+    };
+    let interval = Duration::from_secs(DHAN_REST_STACK_TOKEN_SWEEP_INTERVAL_SECS);
+    loop {
+        tokio::time::sleep(interval).await;
+        match token_manager
+            .force_renewal_if_stale(TOKEN_SWEEP_STALENESS_THRESHOLD_SECS)
+            .await
+        {
+            Ok(true) => {
+                info!("Dhan REST-only stack token sweep: renewed stale token (< 4h headroom)");
+                metrics::counter!("tv_token_sweep_renewals_total", "result" => "renewed")
+                    .increment(1);
+            }
+            Ok(false) => {
+                debug!("Dhan REST-only stack token sweep: token still fresh, no action");
+                metrics::counter!("tv_token_sweep_renewals_total", "result" => "fresh")
+                    .increment(1);
+            }
+            Err(err) => {
+                // The AUTH-GAP-05 watchdog's GAP-04 re-arm + this sweep's own
+                // next tick are the retry paths. L truth-fix (2026-07-14 fix
+                // round): the ~23h renewal loop is NOT an independent retry —
+                // it HALTS PERMANENTLY after its circuit-breaker cycles are
+                // exhausted (that halt is exactly why this sweep exists).
+                warn!(
+                    error = %err,
+                    "Dhan REST-only stack token sweep: force_renewal_if_stale failed — \
+                     next sweep tick + the AUTH-GAP-05 watchdog retry (the ~23h renewal \
+                     loop halts permanently after its circuit-breaker; it is NOT a backstop)"
+                );
+                metrics::counter!("tv_token_sweep_renewals_total", "result" => "failed")
+                    .increment(1);
+            }
+        }
+    }
+}
+
+/// L-fix (2026-07-14 fix round): respawn backoff for the supervised
+/// stack background tasks (the disk_health_watcher / WS-GAP-05 house
+/// cadence).
+const STACK_TASK_RESPAWN_BACKOFF_SECS: u64 = 5;
+
+/// L-fix (2026-07-14 fix round): minimal house respawn supervisor for the
+/// stack's forever-tasks (GAP-02 sweep + GAP-06 gauge poller). The inner
+/// task is an infinite loop, so ANY resolution of its `JoinHandle` is
+/// abnormal: log + count + backoff + respawn. A CANCELLED inner task means
+/// external teardown — the supervisor exits without respawn. Honest panic
+/// envelope (the TICK-FLUSH-01 precedent): release builds run with
+/// `panic = "abort"`, so the panic-respawn arm is an unwind-build/test
+/// self-heal only; in production a panicking task aborts the process and
+/// recovery is a restart.
+fn spawn_supervised_stack_task<F>(
+    task: &'static str,
+    backoff_secs: u64,
+    factory: F,
+) -> tokio::task::JoinHandle<()>
+where
+    F: Fn() -> tokio::task::JoinHandle<()> + Send + 'static,
+{
+    tokio::spawn(async move {
+        loop {
+            let inner = factory();
+            let reason = match inner.await {
+                Ok(()) => "clean_exit",
+                Err(join_err) if join_err.is_cancelled() => return,
+                Err(_) => "panic",
+            };
+            error!(
+                task,
+                reason,
+                backoff_secs,
+                "Dhan REST-only stack background task died — respawning (silent death \
+                 here would re-open the audited GAP-02/GAP-06 coverage gap)"
+            );
+            metrics::counter!(
+                "tv_dhan_rest_stack_task_respawn_total",
+                "task" => task,
+                "reason" => reason
+            )
+            .increment(1);
+            tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
+        }
+    })
 }
 
 #[cfg(test)]
@@ -1138,6 +1237,90 @@ mod tests {
                 prod.contains(needle),
                 "dhan_rest_stack.rs production region lost `{needle}` — the \
                  REST-only stack no longer mirrors spawn_post_market_tasks"
+            );
+        }
+    }
+
+    /// M3 (2026-07-14 fix round): zero-pager-legs truth table + the boot
+    /// warn stays wired in the production region.
+    #[test]
+    fn test_rest_stack_zero_pager_legs_truth_table_and_warn_wired() {
+        assert!(rest_stack_has_zero_pager_legs(false, false));
+        assert!(!rest_stack_has_zero_pager_legs(true, false));
+        assert!(!rest_stack_has_zero_pager_legs(false, true));
+        assert!(!rest_stack_has_zero_pager_legs(true, true));
+        let own_src = include_str!("dhan_rest_stack.rs");
+        let (prod, _) = own_src
+            .split_once("#[cfg(test)]")
+            .expect("dhan_rest_stack.rs must keep its test module marker");
+        assert!(
+            prod.contains("rest_stack_has_zero_pager_legs(config.spot_1m_rest.enabled"),
+            "the boot-time zero-legs warn must stay wired — with both legs \
+             disabled a total Dhan REST death is otherwise pageless (M3)"
+        );
+    }
+
+    /// L-fix (2026-07-14 fix round): the supervisor respawns a dying inner
+    /// task (clean-exit class) with the configured backoff. 0s backoff so
+    /// the test is instant; the panic arm is unwind-build-only per the
+    /// honest envelope on `spawn_supervised_stack_task`.
+    #[tokio::test]
+    async fn test_supervised_stack_task_respawns_on_clean_exit() {
+        use std::sync::atomic::AtomicU32;
+        let spawns = Arc::new(AtomicU32::new(0));
+        let spawns_in_factory = Arc::clone(&spawns);
+        let supervisor = spawn_supervised_stack_task("test_task", 0, move || {
+            spawns_in_factory.fetch_add(1, Ordering::SeqCst);
+            tokio::spawn(async {}) // resolves Ok(()) immediately = clean_exit
+        });
+        // Give the supervisor a few scheduler turns to cycle.
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+            if spawns.load(Ordering::SeqCst) >= 3 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        supervisor.abort();
+        assert!(
+            spawns.load(Ordering::SeqCst) >= 2,
+            "the supervisor must respawn a dying inner task — got {} spawn(s)",
+            spawns.load(Ordering::SeqCst)
+        );
+    }
+
+    /// GAP-02 + GAP-06 supervision wiring: BOTH stack background tasks go
+    /// through the supervisor in the production region.
+    #[test]
+    fn test_sweep_and_gauge_poller_are_supervised() {
+        let own_src = include_str!("dhan_rest_stack.rs");
+        let (prod, _) = own_src
+            .split_once("#[cfg(test)]")
+            .expect("dhan_rest_stack.rs must keep its test module marker");
+        // Whitespace-insensitive: rustfmt may fold/split the call, so the
+        // needles are matched on a whitespace-stripped view of the source.
+        let flattened: String = prod.split_whitespace().collect();
+        for needle in [
+            "spawn_supervised_stack_task(\"token_sweep\"",
+            "spawn_supervised_stack_task(\"token_health_gauge\"",
+            "run_token_sweep_loop(tm)",
+        ] {
+            let flat_needle: String = needle.split_whitespace().collect();
+            assert!(
+                flattened.contains(&flat_needle),
+                "dhan_rest_stack.rs production region lost `{needle}` — the \
+                 GAP-02 sweep / GAP-06 gauge poller must stay SUPERVISED (a \
+                 silent death re-opens the audited coverage gap)"
+            );
+        }
+        // Keep the original loop shape below vacuous-proof: assert the
+        // supervisor helper itself exists in the production region.
+        for needle in ["fn spawn_supervised_stack_task"] {
+            assert!(
+                prod.contains(needle),
+                "dhan_rest_stack.rs production region lost `{needle}` — the \
+                 GAP-02 sweep / GAP-06 gauge poller must stay SUPERVISED (a \
+                 silent death re-opens the audited coverage gap)"
             );
         }
     }
