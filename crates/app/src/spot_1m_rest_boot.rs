@@ -2776,7 +2776,7 @@ async fn sweep_sids_above_watermark(
             tracker.commit(security_id, minute_nanos);
         }
     }
-    if let Some(w) = audit.as_deref_mut() {
+    if let Some(w) = audit {
         // GAP-11: swept ok rows land ONLY after (and stamped with) the data
         // flush ACK — discarded on a failed flush (the flush_failed rows
         // above are the truth for those minutes).
