@@ -1999,8 +1999,13 @@ mod tests {
     // Self-test gates (F17) + time helpers
     // -------------------------------------------------------------------
 
+    /// L6 (fix-round 2026-07-14): renamed honestly — this pins the PURE
+    /// time-of-day window only; the calendar/holiday gate lives in
+    /// drive_self_test_timers (`ctx.calendar.is_trading_day_today()`,
+    /// source-visible) and cannot be driven deterministically from a test
+    /// running on an arbitrary real day.
     #[test]
-    fn test_selftest_refused_on_holiday_and_off_hours() {
+    fn test_selftest_window_gate_boundaries() {
         // Window gate is pure: [09:20, 15:00) IST.
         assert!(!self_test_window_ok(9 * 3600)); // 09:00 — pre-window
         assert!(!self_test_window_ok(9 * 3600 + 19 * 60)); // 09:19
@@ -2240,6 +2245,28 @@ mod tests {
         assert_eq!(risk.position_security_ids().count(), 0, "no position");
         assert!(book.mirror.is_empty(), "mirror untouched");
         assert!(oms.all_orders().is_empty(), "orphan never tracked");
+    }
+
+    /// M4 (partial — honest scope): exercises every NotifierAlertSink arm
+    /// (all 4 OmsAlert variants + the risk halt) through the PRODUCTION sink
+    /// against a disabled NotificationService — the mapping code executes;
+    /// asserting the emitted NotificationEvent payloads would need a capture
+    /// seam NotificationService does not expose (flagged in the plan).
+    #[test]
+    fn test_alert_sink_event_mapping() {
+        let sink = NotifierAlertSink(NotificationService::disabled());
+        sink.fire(OmsAlert::OrderRejected {
+            correlation_id: "corr-1".to_string(),
+            reason: "test".to_string(),
+        });
+        sink.fire(OmsAlert::CircuitBreakerOpened {
+            consecutive_failures: 3,
+        });
+        sink.fire(OmsAlert::CircuitBreakerClosed);
+        sink.fire(OmsAlert::RateLimitExhausted {
+            limit_type: "per_second".to_string(),
+        });
+        RiskAlertSink::fire_risk_halt(&sink, "MaxDailyLossExceeded");
     }
 
     /// S3: bounded + sanitized log ids — control/BiDi stripped, length capped.

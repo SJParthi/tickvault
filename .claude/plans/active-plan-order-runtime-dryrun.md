@@ -73,20 +73,41 @@ F16 reset race → single-task serialization; F17 self-test on holiday → calen
 Source=P filter; F19 sink I/O stall → `notify()` is sync fire-and-forget; F20 zero-mark fabrication → finite>0 gate;
 F21 WAL replay burst > broadcast(256) → warn + counter; F22 understated daily-loss halt → lot_size fix in this PR.
 
+F15 honesty amendment (fix-round 2026-07-14, L6): the live-reconcile backoff + edge-latched OMS-GAP-02 is NOT
+implemented — the live path is unreachable today (dry_run hard-true) and the backoff/edge-latch is a MANDATORY
+pre-live follow-up listed in the rule file §3. Additional fix-round failure modes closed: E1 (suspend-skipped 16:00
+reset → epoch-keyed catch-up), C6 (dangling self-test position → timeout cancel + loud dangle report), S2
+(unknown-segment tripwire bypass → fill refused), HP-3/E3 (tripwire error storm → per-sid edge latch), C11 (replayed
+NDJSON lines as live marks → replay-window gate on the tap).
+
 ## Test Plan
 
 Ratchet replacements (same PR): `test_rest_stack_spawns_order_update_ws_functional_dormant` → REPLACED by
 `test_rest_stack_wires_order_runtime` (production-region source-order pins: subscribe < spawn_order_runtime < drain <
-confirm arm < run_order_update_connection; `wal_spill: Some(` literal; family-claim < WS spawn kept; ws_audit consumer
-kept; OrderUpdateAuthenticated kept; DISABLED branch retains the discard drain + exact dormant-counter literal);
-`wal_replay_confirm_symmetry_guard.rs` extended (third conditional confirm site + defer arm), never weakened;
-`dhan_live_off_phase_a_guard.rs` untouched-and-green; NEW `ratchet_order_runtime_spawned_only_from_rest_stack` (zero
-`spawn_order_runtime(` in main.rs); `test_oms_http_timeout_is_pinned_at_5s` scan path verified after the
-`oms_wiring.rs` extraction. ~24 named unit tests + proptest `prop_fill_mirror_matches_risk_net_lots` + integration
-`crates/app/tests/order_runtime_e2e.rs` (place → mark → synth fill → net_lots≠0 → close → flat + realized P&L → forced
-loss → halt → sink fires RiskHalt → check_order rejects). Perf evidence: `crates/app/tests/dhat_mark_forward.rs`
-(0 alloc across 10K forwards, empty + armed) + Criterion `order_gate/mark_forward` + `quality/benchmark-budgets.toml`
-entry. Scope: `cargo test -p tickvault-trading -p tickvault-app`; config.rs touched (common) → escalate workspace in CI.
+confirm arm < run_order_update_connection; the M8 `ou_wal_spill` binding-shape + WS-argument pins; family-claim < WS
+spawn kept; ws_audit consumer kept; OrderUpdateAuthenticated kept; DISABLED branch retains the discard drain + exact
+dormant-counter literal); `wal_replay_confirm_symmetry_guard.rs` extended §C — fix-round 2026-07-14 strengthened it to
+CONTAINMENT (confirm_replayed exactly once, inside the Confirm arm slice — M1), never weakened;
+`dhan_live_off_phase_a_guard.rs` untouched-and-green; NEW `order_runtime_spawn_site_guard.rs` — fix-round 2026-07-14
+REWRITTEN on `tickvault_common::source_scan::production_region` (H1: full prod-region coverage incl. main.rs
+post-test-module fns + all of groww_bridge.rs) with scanner self-tests + the M2 mark-tap call-site pin
+(`ratchet_groww_bridge_mark_tap_call_site_pinned`); `test_oms_http_timeout_is_pinned_at_5s` scan path verified after
+the `oms_wiring.rs` extraction.
+
+E2E (H2 honesty, fix-round 2026-07-14): the FULL promised chain — place → mark → synth fill → net_lots≠0 → adverse
+mark → daily-loss halt → sink fires RiskHalt exactly once → check_order rejects — is delivered by the in-module
+`order_runtime::tests::test_e2e_place_fill_mark_halt_fires_risk_halt_sink`, which drives the ACTUAL production arm
+bodies (`process_mark` / `handle_order_update_event` / `evaluate_daily_loss_halt` / production `RiskAlertSink` wiring).
+It lives in-module because the arm bodies are private and the SPAWNED runtime places orders only via the time-gated
+self-test (not deterministically drivable from a test). The integration file
+`crates/app/tests/order_runtime_e2e.rs` covers the SPAWNED task black-box (liveness, orphan tolerance, mark drain,
+disarmed gate). Unit tests + the deterministic-LCG walk `prop_fill_mirror_matches_risk_net_lots` (disclosed: not
+proptest) per the item lists below. Perf evidence: `crates/app/tests/dhat_mark_forward.rs` (disarmed + armed-full arms
+zero-alloc across 10K forwards; armed-accept excluded — amortized tokio block reuse, Criterion-budgeted) + Criterion
+`order_gate/mark_forward` + `quality/benchmark-budgets.toml` entry at 100ns (design draft said 50ns; loosened with the
+bench's recv-in-loop iteration shape and NOT yet run locally — the CI bench lane produces the first real numbers;
+dated note in the rule file §5). Scope: `cargo test -p tickvault-trading -p tickvault-app`; config.rs touched
+(common) → escalate workspace in CI.
 
 ## Rollback
 
@@ -131,30 +152,61 @@ archive runbook + I-P1-11 deferral justification) + dated sections in `ws-reinje
 ## Plan Items
 
 - [x] Item 1 — OMS fill bridge: `handle_order_update` return-widened to `Result<Option<FillEvent>, OmsError>` +
-      `FillEvent` type + `parse_segment_chars` + partial-lot floor + re-exports
+      `FillEvent` type + `parse_segment_chars` + partial-lot handling + re-exports. Fix-round 2026-07-14: DELTA-price
+      math (C1), monotone qty copy (C2), terminal same-status guard (C3), floor-of-cumulatives remainder carry (C4),
+      fill-price guard (C5), reconcile swallowed-delta error (C8)
   - Files: crates/trading/src/oms/engine.rs, crates/trading/src/oms/types.rs, crates/trading/src/oms/mod.rs
   - Tests: test_same_status_refresh_applies_delta_not_cumulative, test_duplicate_update_zero_delta_skipped,
     test_partial_lot_remainder_floors_and_errors, test_fill_sign_from_managed_order_transaction_type,
-    test_segment_char_parse_matrix
+    test_segment_char_parse_matrix, test_two_slice_fill_delta_price_and_risk_avg_entry,
+    test_regressing_and_negative_traded_qty_never_lower_baseline,
+    test_terminal_order_higher_qty_redelivery_never_refills, test_fill_price_guard_rejects_zero_and_nan_avg_price,
+    test_fill_lots_i32_clamp_and_lot_size_zero_normalized, test_active_order_count_matches_active_orders_len
 - [x] Item 2 — Risk engine fixes: `PositionInfo.lot_size` + unrealized-P&L lot_size multiply,
-      `evaluate_daily_loss_halt`, coded `trigger_halt`
+      `evaluate_daily_loss_halt`, coded `trigger_halt`. Fix-round 2026-07-14: record_fill finiteness/positivity
+      guards + realized-overflow skip + avg-entry repair (S1), normalized-lot realized product (C12), fail-closed
+      halt on non-finite P&L, position_security_ids
   - Files: crates/trading/src/risk/engine.rs, crates/trading/src/risk/types.rs
-  - Tests: test_unrealized_pnl_multiplies_lot_size, test_evaluate_daily_loss_halt_boundary
+  - Tests: test_unrealized_pnl_multiplies_lot_size, test_evaluate_daily_loss_halt_boundary,
+    test_record_fill_rejects_nonfinite_and_nonpositive_price, test_record_fill_zero_lots_is_noop,
+    test_record_fill_lot_size_zero_realized_uses_normalized,
+    test_realized_overflow_skipped_keeps_accumulator_finite,
+    test_evaluate_daily_loss_halt_fails_closed_on_nonfinite_pnl, test_halt_fires_risk_halt_once_per_episode,
+    test_position_security_ids_iterates_tracked_rows
 - [x] Item 3 — trading_pipeline FillEvent graft (4-line consumption of the widened return; dormant dhan-on path)
   - Files: crates/app/src/trading_pipeline.rs
-  - Tests: existing pipeline order-update tests updated (test_pipeline_processes_order_updates)
+  - Tests: NONE named (H2 honesty, fix-round 2026-07-14 — the earlier claim of a
+    `test_pipeline_processes_order_updates` was FALSE; the graft is a 4-line exhaustive-match consumption on the
+    dormant dhan-on path, compile-pinned by the widened return type; a dedicated pipeline-level test is a flagged
+    follow-up alongside the dhan-on path's own revival)
 - [x] Item 4 — Order runtime module: single-owner actor (OMS+Risk construction via oms_wiring, order-update consumer
       with Source=P filter, fill bridge, mark consumer + paper filler, reconcile scheduler + local invariant, daily
-      reset/close sweeps, self-test, NotifierAlertSink)
+      reset/close sweeps, self-test, NotifierAlertSink). Fix-round 2026-07-14: epoch-keyed reset (E1), O(1) pending
+      index (HP-2), latched tripwire (HP-3/E3), unknown-segment fill refusal (S2), sanitized log ids (S3), self-test
+      timeout cancel + dangle report (C6), order-fold reconcile leg (C7), index-spot sid pick (E4), trading-day
+      reconcile gate (E5), escalating respawn backoff (E8), f32_to_f64_clean marks (C14)
   - Files: crates/app/src/order_runtime.rs, crates/app/src/oms_wiring.rs, crates/app/src/lib.rs
-  - Tests: test_traded_update_reaches_risk_engine_net_lots_nonzero, test_orphan_fill_update_warns_and_counts,
-    test_source_n_filtered_empty_tolerated, test_paper_fill_deferred_until_finite_positive_mark,
+  - Tests: test_apply_fill_reaches_risk_engine_net_lots_nonzero (apply_fill direct — the handle_order_update leg is
+    covered by test_source_n_update_for_tracked_order_never_fills), test_orphan_fill_update_tolerated_book_unchanged
+    (HONEST scope: the warn+counter emission sits on the exercised branch but the counter itself is not assertable
+    without a metrics recorder), test_source_n_filtered_empty_tolerated (the PRODUCTION is_foreign_source predicate),
+    test_source_n_update_for_tracked_order_never_fills, test_paper_fill_deferred_until_finite_positive_mark,
     test_terminal_order_never_refilled, test_selftest_single_cycle_latched,
-    test_selftest_refused_on_holiday_and_off_hours, test_dry_run_reconcile_classified_heartbeat_not_ok,
-    test_local_reconcile_divergence_errors, test_daily_reset_clears_book_mirror_tripwire_flag_atomically,
-    test_sid_segment_collision_skips_and_errors, test_alert_sink_event_mapping,
-    test_halt_fires_risk_halt_once_per_episode, test_confirm_decision_matrix,
-    prop_fill_mirror_matches_risk_net_lots
+    test_selftest_full_cycle_via_production_advance_latches_day, test_selftest_window_gate_boundaries (window only —
+    the calendar/holiday gate is source-visible in drive_self_test_timers, not deterministically testable on an
+    arbitrary run day), test_selftest_sid_pick_requires_index_spot_mark, test_selftest_timeout_cancels_outstanding_order,
+    test_local_reconcile_invariant_holds_and_diverges, test_local_reconcile_order_fold_catches_lost_fill,
+    test_daily_reset_clears_book_mirror_tripwire_flag_atomically (drives the production perform_daily_reset),
+    test_reset_epoch_same_day_fire_and_new_day_catch_up, test_sid_segment_collision_skips_and_errors,
+    test_tripwire_divergence_error_latched_per_sid, test_apply_fill_refuses_unknown_segment,
+    test_pending_paper_index_tracks_placements_and_fills, test_alert_sink_event_mapping (PARTIAL — exercises all 5
+    sink arms against a disabled NotificationService; the emitted event payloads are not capturable without a
+    NotificationService seam), test_halt_fires_risk_halt_once_per_episode (trading crate, capturing sink),
+    test_confirm_decision_matrix, prop_fill_mirror_matches_risk_net_lots (deterministic LCG walk, not proptest),
+    test_log_safe_id_truncates_and_strips, test_e2e_place_fill_mark_halt_fires_risk_halt_sink (the H3 chain).
+    DROPPED from the original list (H2 honesty): test_dry_run_reconcile_classified_heartbeat_not_ok — the heartbeat
+    classification is an info!/error! wording branch with no capturable output; its state-side substance is covered
+    by the two local_reconcile tests, and the wording is source-visible in run_reconcile_cycle
 - [x] Item 5 — Config: `[order_runtime]` OrderRuntimeConfig (serde default OFF) + base.toml enabled=true + validation
   - Files: crates/common/src/config.rs, config/base.toml
   - Tests: test_order_runtime_config_defaults_off, test_order_runtime_config_validation
