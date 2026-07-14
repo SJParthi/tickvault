@@ -648,9 +648,10 @@ enabled = true
 # DHAN_MARGIN_GATE_REST_ALLOWED (constants.rs) flips with a fresh dated
 # operator quote recorded in .claude/rules/dhan/funds-margin.md (the
 # umbrella-plan E2 hold). Shared account with BruteX: tenant_budget_percent
-# caps OUR entries to <=50% of the pooled availabelBalance;
-# rest_self_cap_per_sec caps our funds/margin REST usage to <=50% of Dhan's
-# 20/sec non-trading budget. Exits are NEVER margin-gated.
+# caps EACH entry to <=50% of the then-current pooled availabelBalance
+# (per-entry, not cumulative); rest_self_cap_per_sec caps our funds/margin
+# REST usage to <=50% of Dhan's 20/sec non-trading budget. Exits are NEVER
+# margin-gated.
 # ===========================================================================
 [dhan_margin_gate]
 enabled = false

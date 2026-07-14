@@ -637,10 +637,14 @@ pub struct MultiMarginResponse {
 
 /// Tolerant f64 deserializer for the multi-margin response's split wire
 /// shapes (2026-07-14): accepts a JSON number (the portal-markdown
-/// camelCase-float shape) OR a numeric string (the classic/yaml
-/// snake_case-string shape like `"150000.00"`). A NON-numeric string is a
-/// hard deserialize error — fail-closed, a garbage margin value must never
-/// silently become 0.0.
+/// camelCase-float shape, integers included) OR a numeric string (the
+/// classic/yaml snake_case-string shape like `"150000.00"`). Fail-closed
+/// on garbage: a NON-numeric string is a hard deserialize error, and a
+/// NON-FINITE value is too — Rust's `f64` parser accepts `"NaN"` /
+/// `"inf"` / `"-inf"`, but a non-finite margin must never round-trip
+/// toward a verdict. Any echoed input text in the error message is
+/// bounded to ≤ 32 chars so a hostile/oversized wire value can never
+/// balloon a log line.
 fn de_f64_from_string_or_number<'de, D>(de: D) -> Result<f64, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -651,14 +655,22 @@ where
         F64(f64),
         Str(String),
     }
-    match NumOrStr::deserialize(de)? {
-        NumOrStr::F64(value) => Ok(value),
+    let value = match NumOrStr::deserialize(de)? {
+        NumOrStr::F64(value) => value,
         NumOrStr::Str(text) => text.parse::<f64>().map_err(|_| {
+            // Bounded echo — chars (not bytes) so the cut is UTF-8-safe.
+            let echoed: String = text.chars().take(32).collect();
             serde::de::Error::custom(format!(
-                "non-numeric margin value {text:?} — refusing to coerce to 0.0"
+                "non-numeric margin value {echoed:?} — refusing to coerce to 0.0"
             ))
-        }),
+        })?,
+    };
+    if !value.is_finite() {
+        return Err(serde::de::Error::custom(
+            "non-finite margin value — refusing to coerce to 0.0",
+        ));
     }
+    Ok(value)
 }
 
 /// Order intent for the pre-trade margin gate (umbrella plan cluster E2).
@@ -1986,6 +1998,34 @@ mod tests {
         let json = r#"{"total_margin": "abc"}"#;
         let result: Result<MultiMarginResponse, _> = serde_json::from_str(json);
         assert!(result.is_err());
+        // Bounded echo: a long garbage value must NOT round-trip verbatim
+        // into the error text (≤ 32 echoed chars).
+        let long_garbage = "x".repeat(500);
+        let json = format!(r#"{{"total_margin": "{long_garbage}"}}"#);
+        let err = serde_json::from_str::<MultiMarginResponse>(&json).unwrap_err();
+        assert!(
+            !err.to_string().contains(&long_garbage),
+            "error text must not carry the full 500-char garbage value"
+        );
+    }
+
+    #[test]
+    fn test_multi_margin_response_rejects_nan_and_inf_strings() {
+        // Rust's f64 parser ACCEPTS these — the deserializer must still
+        // hard-fail (a non-finite margin can never reach a verdict).
+        for bad in ["NaN", "inf", "-inf", "Infinity", "-infinity"] {
+            let json = format!(r#"{{"total_margin": "{bad}"}}"#);
+            let result: Result<MultiMarginResponse, _> = serde_json::from_str(&json);
+            assert!(result.is_err(), "{bad:?} must be a hard deserialize error");
+        }
+    }
+
+    #[test]
+    fn test_multi_margin_response_integer_json_number_normalizes() {
+        // A bare JSON INTEGER (no decimal point) normalizes to f64.
+        let json = r#"{"total_margin": 150000}"#;
+        let resp: MultiMarginResponse = serde_json::from_str(json).unwrap();
+        assert!((resp.total_margin - 150000.0).abs() < 1e-9);
     }
 
     #[test]

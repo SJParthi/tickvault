@@ -897,18 +897,22 @@ impl Default for GrowwContract1mConfig {
 /// dated operator quote — config flips alone can never turn the REST legs on.
 ///
 /// Shared-account safety (BruteX co-tenant on the same Dhan account):
-/// `tenant_budget_percent` caps OUR margin consumption to at most half of
-/// the pooled `availabelBalance`; `rest_self_cap_per_sec` caps our
-/// funds/margin REST usage to at most half of Dhan's 20/sec non-trading
-/// budget.
+/// `tenant_budget_percent` caps EACH entry to at most half of the
+/// then-current pooled `availabelBalance` (per-entry, not cumulative);
+/// `rest_self_cap_per_sec` caps our funds/margin REST usage to at most
+/// half of Dhan's 20/sec non-trading budget.
 #[derive(Debug, Clone, Deserialize)]
 pub struct DhanMarginGateConfig {
     /// Master config gate. Serde default FALSE (absent section = disabled).
     #[serde(default)]
     pub enabled: bool,
-    /// Percent of the pooled account `availabelBalance` our entries may
-    /// consume. Hard-capped at 50 (shared account — never assume the full
-    /// account margin is ours).
+    /// PER-ENTRY cap: percent of the THEN-CURRENT pooled account
+    /// `availabelBalance` a single entry may consume. Hard-capped at 50
+    /// (shared account — never assume the full account margin is ours).
+    /// CUMULATIVE our-share is NOT capped — sequential entries each
+    /// re-read the balance, so they can cumulatively consume more of the
+    /// pool (a cumulative tenant ledger is a flagged follow-up for the
+    /// OMS-wiring PR).
     #[serde(default = "default_margin_gate_tenant_budget_percent")]
     pub tenant_budget_percent: u8,
     /// Self-imposed funds/margin REST ceiling (requests/sec). Hard-capped

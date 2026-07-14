@@ -6,12 +6,21 @@
 //! # Shared-account contract
 //! The Dhan account is pooled with the BruteX co-tenant, so `fundlimit`
 //! reflects the WHOLE account. `insufficientBalance == 0` alone is therefore
-//! NOT authorization to spend: the gate additionally caps our usage at
-//! `tenant_budget_percent` (≤ 50) of the pooled `availabelBalance`, and the
-//! funds/margin REST legs are self-capped at ≤ 10 req/sec (50% of Dhan's
-//! 20/sec non-trading budget). BruteX may still consume margin between our
-//! check and our order — that TOCTOU window is irreducible; the check is
-//! advisory-best-effort and the broker is the final arbiter.
+//! NOT authorization to spend: the gate additionally applies a PER-ENTRY cap
+//! of `tenant_budget_percent` (≤ 50) of the THEN-CURRENT pooled
+//! `availabelBalance`. HONEST LIMIT — the cap is per-entry, NOT cumulative:
+//! sequential entries each re-read the balance, so they can cumulatively
+//! consume more of the pool (geometrically), and the gate cannot distinguish
+//! OUR utilized margin from the co-tenant's (`fundlimit` is pooled), so no
+//! cumulative ledger exists yet (a cumulative tenant ledger is a flagged
+//! follow-up for the OMS-wiring PR). The funds/margin REST legs are
+//! self-capped at ≤ 10 req/sec (50% of Dhan's 20/sec non-trading budget) —
+//! PER GATE INSTANCE: the OMS-wiring PR must construct exactly ONE gate per
+//! process (and pin that with its own ratchet); until then, multi-instance
+//! construction could exceed the documented process-wide budget. BruteX may
+//! still consume margin between our check and our order — that TOCTOU
+//! window is irreducible; the check is advisory-best-effort and the broker
+//! is the final arbiter.
 //!
 //! # The OFF-switch lattice (config AND code lock)
 //! The REST legs fire only when `[dhan_margin_gate] enabled = true` AND the
@@ -45,6 +54,7 @@ use governor::{Quota, RateLimiter, clock::DefaultClock, state::InMemoryState, st
 use secrecy::ExposeSecret;
 use tickvault_common::config::DhanMarginGateConfig;
 use tickvault_common::constants::DHAN_MARGIN_GATE_REST_ALLOWED;
+use tickvault_common::sanitize::capture_rest_error_body;
 use tracing::{error, warn};
 
 use super::api_client::OrderApiClient;
@@ -143,6 +153,10 @@ impl DegradedStage {
 pub enum ImplausibleReason {
     /// A margin value was non-finite, negative, or implausibly large.
     NonFiniteOrNegativeMargin,
+    /// The broker-reported shortfall (`insufficientBalance`) was
+    /// non-finite, negative, or implausibly large — distinct from a bad
+    /// `totalMargin` so triage can tell WHICH field was garbage.
+    NonFiniteInsufficientBalance,
     /// `totalMargin == 0` — a real F&O entry never costs zero; zero usually
     /// means serde-default backfill of an absent/renamed field.
     ZeroTotalMargin,
@@ -158,6 +172,7 @@ impl ImplausibleReason {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::NonFiniteOrNegativeMargin => "non_finite_or_negative_margin",
+            Self::NonFiniteInsufficientBalance => "non_finite_insufficient_balance",
             Self::ZeroTotalMargin => "zero_total_margin",
             Self::NonFiniteFunds => "non_finite_funds",
             Self::ClientIdMismatch => "client_id_mismatch",
@@ -312,7 +327,7 @@ pub fn decide_entry(
     // usable_paise is 0 because the budget was never computed).
     let Some(insufficient) = to_paise(margin.insufficient_balance) else {
         return MarginVerdict::RefusedImplausible {
-            reason: ImplausibleReason::NonFiniteOrNegativeMargin,
+            reason: ImplausibleReason::NonFiniteInsufficientBalance,
         };
     };
     if insufficient > 0 {
@@ -392,6 +407,13 @@ impl MarginGate {
         // NonZeroU32::new is Some for cap >= 2; the fallback keeps the
         // constructor unwrap-free (fail-closed to the 2-call minimum).
         let quota = Quota::per_second(NonZeroU32::new(cap).unwrap_or(ENTRY_REST_BURST));
+        // Belt-and-braces mirror of the rest_self_cap clamp above:
+        // ApplicationConfig::validate already bounds the TOML path to
+        // 1..=50, so this only bites a hand-built config — which must
+        // never widen the tenant share past half the pooled balance.
+        // 0 stays as-is: 0 usable ⇒ refuse everything = fail-closed.
+        let mut cfg = cfg;
+        cfg.tenant_budget_percent = cfg.tenant_budget_percent.min(50);
         Self {
             api,
             tokens,
@@ -433,35 +455,55 @@ impl MarginGate {
 
     /// Entry check — margin calculator + fund limit + the pure
     /// [`decide_entry`] core. Fails CLOSED for entries on any degrade.
+    ///
+    /// The caller-built request is validated against the gate's expected
+    /// client id BEFORE any permit/token/REST work, so a miswired caller
+    /// can never get a verdict computed for the wrong account.
     pub async fn check_entry(&self, request: &MarginCalculatorRequest) -> MarginVerdict {
         // (1) The OFF-switch lattice: config AND the code master lock.
         if !self.is_enabled() {
             return Self::record(MarginVerdict::SkippedDisabled);
         }
 
-        // (2) Self-cap: one entry check issues two REST calls as one
-        // burst. REFUSE (never block/queue) when the cap is hit — a
-        // delayed pre-trade verdict is a stale verdict.
-        match self.self_cap.check_n(ENTRY_REST_BURST) {
-            Ok(Ok(())) => {}
-            Ok(Err(_)) | Err(_) => {
-                warn!(
-                    "dhan margin gate: funds/margin self-cap hit — refusing entry check \
-                     (never queued; a delayed pre-trade verdict is stale)"
-                );
-                return Self::record(MarginVerdict::RefusedSelfCap);
-            }
+        // (2) Request-side client-id validation — STRICT equality: an
+        // EMPTY request id also refuses (the request must carry the real
+        // client id for the broker anyway). Runs before the self-cap so a
+        // miswired caller never burns a REST permit.
+        if request.dhan_client_id != self.expected_client_id {
+            // The mismatch FACT only — neither id (nor the request) is
+            // logged.
+            warn!(
+                "dhan margin gate: entry request carried a client id different from the \
+                 one this gate was built for — refusing fail-closed (a verdict must \
+                 never be computed for the wrong account)"
+            );
+            return Self::record(MarginVerdict::RefusedImplausible {
+                reason: ImplausibleReason::ClientIdMismatch,
+            });
         }
 
-        // (3) Token — no token means no REST leg can run.
+        // (3) Self-cap: one entry check issues two REST calls as one
+        // burst. REFUSE (never block/queue) when the cap is hit — a
+        // delayed pre-trade verdict is a stale verdict.
+        if !self.reserve_entry_permits() {
+            warn!(
+                "dhan margin gate: funds/margin self-cap hit — refusing entry check \
+                 (never queued; a delayed pre-trade verdict is stale)"
+            );
+            return Self::record(MarginVerdict::RefusedSelfCap);
+        }
+
+        // (4) Token — no token means no REST leg can run.
         let token = match self.tokens.get_access_token() {
             Ok(token) => token,
             Err(err) => {
                 // A typed error-code variant lands with the first
-                // production emit site (the OMS-wiring PR).
+                // production emit site (the OMS-wiring PR). The error
+                // text is bounded + redacted through the house sanitize
+                // choke point (uniform with the REST legs below).
                 error!(
                     stage = DegradedStage::Token.as_str(),
-                    error = %err,
+                    sanitized = %capture_rest_error_body(&err.to_string()),
                     "dhan margin gate: entry check degraded — no access token; refusing \
                      entry fail-closed (exits are unaffected)"
                 );
@@ -469,7 +511,7 @@ impl MarginGate {
             }
         };
 
-        // (4) Margin calculator leg.
+        // (5) Margin calculator leg.
         let margin = match self
             .api
             .calculate_margin(token.expose_secret(), request)
@@ -477,9 +519,11 @@ impl MarginGate {
         {
             Ok(margin) => margin,
             Err(err) => {
+                // The error string can embed the raw broker body —
+                // bounded + redacted per the house sanitize choke point.
                 error!(
                     stage = DegradedStage::MarginCall.as_str(),
-                    error = %err,
+                    sanitized = %capture_rest_error_body(&err.to_string()),
                     "dhan margin gate: entry check degraded — margin calculator call \
                      failed; refusing entry fail-closed (exits are unaffected)"
                 );
@@ -487,13 +531,15 @@ impl MarginGate {
             }
         };
 
-        // (5) Fund-limit leg.
+        // (6) Fund-limit leg.
         let funds = match self.api.get_fund_limit(token.expose_secret()).await {
             Ok(funds) => funds,
             Err(err) => {
+                // The error string can embed the raw broker body —
+                // bounded + redacted per the house sanitize choke point.
                 error!(
                     stage = DegradedStage::FundLimitCall.as_str(),
-                    error = %err,
+                    sanitized = %capture_rest_error_body(&err.to_string()),
                     "dhan margin gate: entry check degraded — fund limit call failed; \
                      refusing entry fail-closed (exits are unaffected)"
                 );
@@ -501,7 +547,7 @@ impl MarginGate {
             }
         };
 
-        // (6) The pure decision.
+        // (7) The pure decision.
         let verdict = decide_entry(
             &margin,
             &funds,
@@ -541,6 +587,22 @@ impl MarginGate {
     fn record_degraded(stage: DegradedStage) -> MarginVerdict {
         metrics::counter!("tv_margin_gate_degraded_total", "stage" => stage.as_str()).increment(1);
         Self::record(MarginVerdict::RefusedDegraded { stage })
+    }
+
+    /// Reserves the two-REST-call burst for one entry check against the
+    /// funds/margin self-cap. Returns `false` on refusal — BOTH governor
+    /// error variants (insufficient capacity right now, and burst larger
+    /// than the quota) refuse; the gate never blocks/queues.
+    fn reserve_entry_permits(&self) -> bool {
+        matches!(self.self_cap.check_n(ENTRY_REST_BURST), Ok(Ok(())))
+    }
+
+    /// Test-only view of the permit reservation, so self-cap tests can
+    /// drain permits deterministically (back-to-back sync calls) without
+    /// HTTP round-trips inside the timing-sensitive window.
+    #[cfg(test)]
+    pub(crate) fn try_reserve_entry_permits_for_test(&self) -> bool {
+        self.reserve_entry_permits()
     }
 }
 
@@ -721,6 +783,31 @@ mod tests {
         "withdrawableBalance": 98310.0
     }"#;
 
+    /// Margin body with a broker-reported shortfall (₹250 short).
+    const INSUFFICIENT_MARGIN_BODY: &str = r#"{
+        "totalMargin": 5000.0,
+        "spanMargin": 1200.0,
+        "exposureMargin": 1000.0,
+        "availableBalance": 100000.0,
+        "variableMargin": 0.0,
+        "insufficientBalance": 250.0,
+        "brokerage": 20.0,
+        "leverage": "4.00"
+    }"#;
+
+    /// Margin body with `totalMargin == 0` — the serde-default-backfill
+    /// implausibility class.
+    const ZERO_MARGIN_BODY: &str = r#"{
+        "totalMargin": 0.0,
+        "spanMargin": 0.0,
+        "exposureMargin": 0.0,
+        "availableBalance": 100000.0,
+        "variableMargin": 0.0,
+        "insufficientBalance": 0.0,
+        "brokerage": 20.0,
+        "leverage": "4.00"
+    }"#;
+
     // -- money helpers -------------------------------------------------------
 
     #[test]
@@ -827,6 +914,16 @@ mod tests {
             decide_entry(&margin, &funds, "TEST-100", 50),
             MarginVerdict::RefusedImplausible {
                 reason: ImplausibleReason::NonFiniteOrNegativeMargin
+            }
+        );
+        // A NaN broker SHORTFALL refuses with its OWN distinct reason —
+        // triage must know WHICH field was garbage.
+        let funds = make_funds("TEST-100", 100_000.0);
+        let margin = make_margin(5_000.0, f64::NAN);
+        assert_eq!(
+            decide_entry(&margin, &funds, "TEST-100", 50),
+            MarginVerdict::RefusedImplausible {
+                reason: ImplausibleReason::NonFiniteInsufficientBalance
             }
         );
         // Non-finite funds refuse too (after a plausible margin).
@@ -947,7 +1044,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_check_entry_margin_call_5xx_refused_degraded() {
-        let (base_url, _hits, handle) = start_routing_mock(500, "{}", 200, HAPPY_FUNDS_BODY).await;
+        let (base_url, hits, handle) = start_routing_mock(500, "{}", 200, HAPPY_FUNDS_BODY).await;
         let mut gate = make_gate(&base_url, Arc::new(StaticTokens), enabled_cfg());
         gate.allow_rest_for_test();
         assert_eq!(
@@ -956,12 +1053,14 @@ mod tests {
                 stage: DegradedStage::MarginCall
             }
         );
+        // The margin failure SHORT-CIRCUITS — fundlimit is never called.
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
         handle.abort();
     }
 
     #[tokio::test]
     async fn test_check_entry_fundlimit_malformed_json_refused_degraded() {
-        let (base_url, _hits, handle) =
+        let (base_url, hits, handle) =
             start_routing_mock(200, HAPPY_MARGIN_BODY, 200, "not json at all").await;
         let mut gate = make_gate(&base_url, Arc::new(StaticTokens), enabled_cfg());
         gate.allow_rest_for_test();
@@ -971,6 +1070,8 @@ mod tests {
                 stage: DegradedStage::FundLimitCall
             }
         );
+        // Both routes were reached — the margin leg succeeded first.
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
         handle.abort();
     }
 
@@ -991,8 +1092,27 @@ mod tests {
         handle.abort();
     }
 
+    #[test]
+    fn test_check_entry_self_cap_refuses_not_blocks() {
+        // Deterministic permit-drain: NO HTTP inside the timing-sensitive
+        // window — two back-to-back SYNC calls (a microsecond apart) on a
+        // 2-permit quota. DefaultClock is the house precedent
+        // (rate_limiter.rs); the residual flake vector is a >= 1s stall
+        // BETWEEN two adjacent sync calls — negligible.
+        let cfg = DhanMarginGateConfig {
+            enabled: true,
+            rest_self_cap_per_sec: 2,
+            ..DhanMarginGateConfig::default()
+        };
+        let gate = make_gate("http://127.0.0.1:1", Arc::new(StaticTokens), cfg);
+        // First reservation consumes the whole 2-call burst.
+        assert!(gate.try_reserve_entry_permits_for_test());
+        // Immediate second reservation is REFUSED (never queued/blocked).
+        assert!(!gate.try_reserve_entry_permits_for_test());
+    }
+
     #[tokio::test]
-    async fn test_check_entry_self_cap_refuses_not_blocks() {
+    async fn test_check_entry_self_cap_refused_after_permit_drain_zero_rest_calls() {
         let (base_url, hits, handle) =
             start_routing_mock(200, HAPPY_MARGIN_BODY, 200, HAPPY_FUNDS_BODY).await;
         let cfg = DhanMarginGateConfig {
@@ -1002,20 +1122,105 @@ mod tests {
         };
         let mut gate = make_gate(&base_url, Arc::new(StaticTokens), cfg);
         gate.allow_rest_for_test();
-        // First entry check consumes the whole 2-call burst.
-        assert!(matches!(
-            gate.check_entry(&make_calc_request()).await,
-            MarginVerdict::Allowed(_)
-        ));
-        let hits_after_first = hits.load(Ordering::SeqCst);
-        assert_eq!(hits_after_first, 2);
-        // Second back-to-back check is REFUSED (never queued) with zero
-        // further REST hits.
+        // Pre-drain the whole 2-permit quota via the sync helper (no HTTP).
+        assert!(gate.try_reserve_entry_permits_for_test());
+        // The drained gate REFUSES the entry check with ZERO REST hits.
         assert_eq!(
             gate.check_entry(&make_calc_request()).await,
             MarginVerdict::RefusedSelfCap
         );
-        assert_eq!(hits.load(Ordering::SeqCst), hits_after_first);
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_check_entry_request_client_id_mismatch_refused_zero_rest_calls() {
+        let (base_url, hits, handle) =
+            start_routing_mock(200, HAPPY_MARGIN_BODY, 200, HAPPY_FUNDS_BODY).await;
+        let mut gate = make_gate(&base_url, Arc::new(StaticTokens), enabled_cfg());
+        gate.allow_rest_for_test();
+        let mut request = make_calc_request();
+        request.dhan_client_id = "WRONG".to_owned();
+        assert_eq!(
+            gate.check_entry(&request).await,
+            MarginVerdict::RefusedImplausible {
+                reason: ImplausibleReason::ClientIdMismatch
+            }
+        );
+        // Refused BEFORE any permit/token/REST work.
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+        // Strict equality: an EMPTY request id also refuses (the request
+        // must carry the real client id for the broker anyway).
+        let mut request = make_calc_request();
+        request.dhan_client_id = String::new();
+        assert_eq!(
+            gate.check_entry(&request).await,
+            MarginVerdict::RefusedImplausible {
+                reason: ImplausibleReason::ClientIdMismatch
+            }
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_check_entry_insufficient_balance_body_refused() {
+        // The broker names a shortfall — refused AFTER both fetches (the
+        // pure decision runs over both responses), so hits == 2.
+        let (base_url, hits, handle) =
+            start_routing_mock(200, INSUFFICIENT_MARGIN_BODY, 200, HAPPY_FUNDS_BODY).await;
+        let mut gate = make_gate(&base_url, Arc::new(StaticTokens), enabled_cfg());
+        gate.allow_rest_for_test();
+        match gate.check_entry(&make_calc_request()).await {
+            MarginVerdict::RefusedInsufficient(snapshot) => {
+                assert_eq!(snapshot.insufficient_paise, 25_000);
+                assert_eq!(snapshot.required_paise, 500_000);
+            }
+            other => panic!("expected RefusedInsufficient, got {other:?}"),
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_check_entry_zero_total_margin_body_refused_implausible() {
+        // decide_entry runs after BOTH fetches — hits == 2 even though the
+        // zero-margin refusal needs only the margin response.
+        let (base_url, hits, handle) =
+            start_routing_mock(200, ZERO_MARGIN_BODY, 200, HAPPY_FUNDS_BODY).await;
+        let mut gate = make_gate(&base_url, Arc::new(StaticTokens), enabled_cfg());
+        gate.allow_rest_for_test();
+        assert_eq!(
+            gate.check_entry(&make_calc_request()).await,
+            MarginVerdict::RefusedImplausible {
+                reason: ImplausibleReason::ZeroTotalMargin
+            }
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_margin_gate_new_clamps_tenant_budget_percent_over_50() {
+        // A hand-built config past the shared-account ceiling is clamped
+        // at construction — the verdict math must use 50%, never 200%.
+        let (base_url, _hits, handle) =
+            start_routing_mock(200, HAPPY_MARGIN_BODY, 200, HAPPY_FUNDS_BODY).await;
+        let cfg = DhanMarginGateConfig {
+            enabled: true,
+            tenant_budget_percent: 200,
+            ..DhanMarginGateConfig::default()
+        };
+        let mut gate = make_gate(&base_url, Arc::new(StaticTokens), cfg);
+        gate.allow_rest_for_test();
+        match gate.check_entry(&make_calc_request()).await {
+            MarginVerdict::Allowed(snapshot) => {
+                // available 100,000.00 → 10,000,000 paise; clamped 50% →
+                // usable 5,000,000 paise (200% would read 20,000,000).
+                assert_eq!(snapshot.usable_paise, 5_000_000);
+            }
+            other => panic!("expected Allowed with the clamped budget, got {other:?}"),
+        }
         handle.abort();
     }
 
@@ -1064,6 +1269,10 @@ mod tests {
         assert_eq!(
             ImplausibleReason::NonFiniteOrNegativeMargin.as_str(),
             "non_finite_or_negative_margin"
+        );
+        assert_eq!(
+            ImplausibleReason::NonFiniteInsufficientBalance.as_str(),
+            "non_finite_insufficient_balance"
         );
         assert_eq!(
             ImplausibleReason::ZeroTotalMargin.as_str(),

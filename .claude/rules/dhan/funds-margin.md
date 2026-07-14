@@ -54,10 +54,15 @@
 
 8. **SHARED ACCOUNT — `insufficientBalance == 0` alone is NOT authorization to spend.**
    The Dhan account is pooled with the BruteX co-tenant; `fundlimit` reflects the WHOLE
-   account's balance. The margin gate therefore ADDITIONALLY caps our usage at
-   `tenant_budget_percent` (hard-capped ≤ 50) of `availabelBalance` — we never assume the
-   full pooled margin is ours, and BruteX may consume margin between our check and our
-   order (irreducible TOCTOU; the broker is the final arbiter).
+   account's balance. The margin gate therefore ADDITIONALLY applies a PER-ENTRY cap of
+   `tenant_budget_percent` (hard-capped ≤ 50) of the THEN-CURRENT available balance —
+   CUMULATIVE our-share is NOT capped: sequential entries each re-read the balance, so
+   they can cumulatively consume more of the pool (geometrically), and the gate cannot
+   distinguish OUR utilized margin from the co-tenant's (`fundlimit` is pooled), so no
+   cumulative ledger exists yet (a cumulative tenant ledger is a flagged follow-up for
+   the OMS-wiring PR). We never assume the full pooled margin is ours, and BruteX may
+   consume margin between our check and our order (irreducible TOCTOU; the broker is
+   the final arbiter).
 
 9. **Funds/margin REST usage is self-capped at ≤ 10 req/sec** — 50% of Dhan's 20/sec
    non-trading-API budget (the same co-tenancy discipline as rule 8). The gate REFUSES an
@@ -80,6 +85,23 @@
     quote recorded HERE first (the umbrella plan's cluster-E2 hold: the live funds/margin
     REST call awaits the operator grant). Config flips alone can never turn the REST legs
     on.
+
+## Honest envelope / live-probe flags (2026-07-14)
+
+- **Collateral semantics UNKNOWN:** whether `availabelBalance` includes non-cash
+  collateral (`collateralAmount`) is UNKNOWN from the docs — live-probe before any live
+  sizing decision trusts the balance as cash-equivalent.
+- **Response-side vs request-side client-id strictness:** a fundlimit response MISSING
+  `dhanClientId` (serde-default empty) is TOLERATED by the response-side check (an absent
+  field is not evidence of a wrong account); the REQUEST-side check is STRICT — the gate
+  refuses any entry request whose client id differs from the gate's expected id, empty
+  included (the request must carry the real client id for the broker anyway).
+- **Pre-open values are start-of-day values:** fundlimit values read before 09:15 IST are
+  SOD balances — consumers sizing entries pre-open see start-of-day numbers, not live
+  intraday utilization.
+- **The REST self-cap is PER-GATE-INSTANCE:** the OMS-wiring PR must construct exactly
+  ONE gate per process and pin that with its own ratchet; until then, multi-instance
+  construction could exceed the documented process-wide ≤ 10 req/sec budget.
 
 ## What This Prevents
 
