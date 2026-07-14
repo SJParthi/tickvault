@@ -2775,6 +2775,22 @@ pub const TOKEN_SWEEP_INTERVAL_SECS: u64 = 4 * 3600;
 /// renewal triggers.
 pub const TOKEN_SWEEP_STALENESS_THRESHOLD_SECS: i64 = 4 * 3600;
 
+/// GAP-02 (2026-07-14, Dhan noise lock backstop): the Dhan REST-only
+/// stack's stale-token sweep cadence.
+///
+/// The lane's 4h token sweep dies with the lane (#1522); the REST-only
+/// stack (`dhan_rest_stack.rs` Phase 3) runs its OWN sweep every this
+/// many seconds, calling
+/// `force_renewal_if_stale(TOKEN_SWEEP_STALENESS_THRESHOLD_SECS)` —
+/// the renewal-loop-circuit-breaker-halt backstop. 900s (matching the
+/// mid-session watchdog cadence) instead of the lane's 4h: the stack's
+/// spot/chain legs die within minutes of a stale token, so the backstop
+/// must react on the same timescale. Silent on no-op/success; a failure
+/// logs via the renewal machinery's own paths. NOT market-hours gated
+/// (a token that goes stale overnight must heal before the 09:16 first
+/// fetch).
+pub const DHAN_REST_STACK_TOKEN_SWEEP_INTERVAL_SECS: u64 = 900;
+
 // DELETED: FRAME_SEND_TIMEOUT_SECS and FRAME_BACKPRESSURE_TIMEOUT_SECS
 // Removed per P1.3 — WS readers use non-blocking try_send() + WAL spill,
 // no backpressure timeout needed. Activity watchdog handles dead sockets.

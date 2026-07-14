@@ -568,10 +568,10 @@ async fn run_dhan_rest_stack(params: DhanRestStackParams) {
         .set_live_token_manager(token_manager.clone());
 
     // -----------------------------------------------------------------------
-    // Phase 3: renewal loop + mid-session profile watchdog (both need only
-    // the TokenManager + notifier; the profile-valid flag has no other
-    // consumer here — the token-health gauge poller / writer stay lane-only
-    // in Phase A).
+    // Phase 3: renewal loop + mid-session profile watchdog + (2026-07-14,
+    // Dhan noise lock backstops) the GAP-02 stale-token sweep and the
+    // GAP-06 re-homed token-health gauge poller. All need only the
+    // TokenManager (+ notifier for the watchdog's terminal family-(3) arm).
     // -----------------------------------------------------------------------
     let _renewal_handle = token_manager.spawn_renewal_task();
     info!("Dhan REST-only stack: token renewal task started");
@@ -581,9 +581,84 @@ async fn run_dhan_rest_stack(params: DhanRestStackParams) {
         tickvault_core::auth::mid_session_watchdog::spawn_mid_session_profile_watchdog(
             Arc::clone(&token_manager),
             Some(Arc::clone(&params.notifier)),
-            token_profile_valid,
+            Arc::clone(&token_profile_valid),
         );
-    info!("Dhan REST-only stack: mid-session profile watchdog spawned (15-min cadence)");
+    info!(
+        "Dhan REST-only stack: mid-session profile watchdog spawned \
+         (15-min cadence; silent self-heal — only a terminal re-mint failure pages)"
+    );
+
+    // GAP-06 (2026-07-14): the token-health gauge poller is RE-HOMED here
+    // (its lane/fast-arm spawn sites are deleted) so `tv_token_valid` +
+    // the LIVE `tv_token_remaining_seconds` stay published on dhan-off
+    // boots even after a renewal-loop circuit-breaker halt kills the
+    // renewal loop's own mint-time snapshot writes — keeping the
+    // `tv-<env>-token-remaining-low` CloudWatch alarm (family-(4))
+    // sighted. Shares the SAME profile-truth flag as the watchdog above,
+    // so a Dhan-killed (but locally unexpired) token reads 0 within one
+    // watchdog cycle + one 15s poll.
+    let _token_health_gauge_handle =
+        tickvault_core::auth::token_health_gauge::spawn_token_health_gauge_poller(
+            Arc::clone(&token_manager),
+            Arc::clone(&token_profile_valid),
+        );
+    info!(
+        poll_secs = tickvault_core::auth::token_health_gauge::TOKEN_HEALTH_GAUGE_POLL_SECS,
+        "Dhan REST-only stack: live token-health gauge poller spawned \
+         (tv_token_remaining_seconds + tv_token_valid)"
+    );
+
+    // GAP-02 (2026-07-14): stale-token sweep — the renewal-loop-halt
+    // backstop the lane's 4h sweep used to be, at a 900s cadence matched
+    // to how fast the spot/chain legs feel a dead token. SILENT on
+    // no-op/success (debug!); `force_renewal_if_stale` renews only on
+    // < 4h local headroom, honoring the RESILIENCE-03 lock tripwire; a
+    // terminal mint failure pages via the token machinery's own
+    // family-(3) paths. NOT market-hours gated.
+    let _token_sweep_handle = {
+        let sweep_token_manager = Arc::clone(&token_manager);
+        tokio::spawn(async move {
+            use tickvault_common::constants::{
+                DHAN_REST_STACK_TOKEN_SWEEP_INTERVAL_SECS, TOKEN_SWEEP_STALENESS_THRESHOLD_SECS,
+            };
+            let interval = Duration::from_secs(DHAN_REST_STACK_TOKEN_SWEEP_INTERVAL_SECS);
+            loop {
+                tokio::time::sleep(interval).await;
+                match sweep_token_manager
+                    .force_renewal_if_stale(TOKEN_SWEEP_STALENESS_THRESHOLD_SECS)
+                    .await
+                {
+                    Ok(true) => {
+                        info!(
+                            "Dhan REST-only stack token sweep: renewed stale token (< 4h headroom)"
+                        );
+                        metrics::counter!("tv_token_sweep_renewals_total", "result" => "renewed")
+                            .increment(1);
+                    }
+                    Ok(false) => {
+                        debug!("Dhan REST-only stack token sweep: token still fresh, no action");
+                        metrics::counter!("tv_token_sweep_renewals_total", "result" => "fresh")
+                            .increment(1);
+                    }
+                    Err(err) => {
+                        // The renewal machinery's own retry/paging paths
+                        // own escalation; record the failure only.
+                        warn!(
+                            error = %err,
+                            "Dhan REST-only stack token sweep: force_renewal_if_stale failed \
+                             (renewal loop + AUTH-GAP-05 retry independently)"
+                        );
+                        metrics::counter!("tv_token_sweep_renewals_total", "result" => "failed")
+                            .increment(1);
+                    }
+                }
+            }
+        })
+    };
+    info!(
+        interval_secs = tickvault_common::constants::DHAN_REST_STACK_TOKEN_SWEEP_INTERVAL_SECS,
+        "Dhan REST-only stack: stale-token sweep spawned (silent renewal-loop backstop)"
+    );
 
     // -----------------------------------------------------------------------
     // Phase 4: Dhan client-id (the option-chain endpoints need the extra

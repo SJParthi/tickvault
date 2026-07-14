@@ -2927,28 +2927,11 @@ async fn main() -> Result<()> {
             handle
         });
 
-        // EDGE-2 fix (2026-07-06): AUTH-GAP-05 live token-health gauge
-        // poller on the FAST arm too. Without it, a market-hours
-        // crash-recovery boot (the path MOST correlated with token trouble)
-        // regressed `tv_token_remaining_seconds` to the frozen mint-time
-        // renewal-loop snapshots and `tv_token_valid` never existed (an
-        // alarm on it would go missing-data). The FAST arm runs NO
-        // mid-session profile watchdog, so the profile flag is a fresh
-        // inert `true` — honest envelope: on this arm the composite gauge
-        // reflects has_token AND local expiry only (the local-expiry gate
-        // still forces 0 for a locally-dead token). Handle rides into
-        // `DhanLaneRunHandles` via `run_shutdown_fast` so the H8 Drop floor
-        // owns it.
-        let token_health_gauge_handle = token_manager.as_ref().map(|tm| {
-            tickvault_core::auth::token_health_gauge::spawn_token_health_gauge_poller(
-                std::sync::Arc::clone(tm),
-                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
-            )
-        });
-        info!(
-            spawned = token_health_gauge_handle.is_some(),
-            "live token-health gauge poller (fast boot — profile watchdog not running on this arm)"
-        );
+        // GAP-06 (2026-07-14, Dhan noise lock): the fast-arm token-health
+        // gauge poller spawn is DELETED — the poller is RE-HOMED into
+        // `dhan_rest_stack` Phase 3 (which runs on every dhan-enabled
+        // boot mode and shares the watchdog's profile-truth flag). This
+        // fast crash-recovery arm is Dhan-lane-gated dead code post-#1522.
 
         // PR-C (2026-05-26): Dhan historical fetch chain DELETED entirely
         // per operator directive — pre-market buffer + gap_fill +
@@ -3084,7 +3067,8 @@ async fn main() -> Result<()> {
             Some(order_update_handle),
             Some(api_handle),
             trading_handle,
-            token_health_gauge_handle,
+            // GAP-06 (2026-07-14): gauge poller re-homed to dhan_rest_stack.
+            None,
             fast_pool_watchdog_handle,
             otel_provider,
             &notifier,
@@ -9043,10 +9027,10 @@ async fn start_dhan_lane(
     // -----------------------------------------------------------------------
     // Every 15 minutes during market hours, re-runs `pre_market_check`
     // (dataPlan == "Active", activeSegment contains "Derivative", token
-    // expires > 4h). On rising-edge failure fires CRITICAL Telegram via
-    // NotificationEvent::MidSessionProfileInvalidated. Does NOT HALT —
-    // dropping the live WS feed mid-session costs more than the
-    // silent-failure risk we're monitoring.
+    // expires > 4h). SILENT since 2026-07-14 (Dhan noise lock): rising-edge
+    // failure is a coded error! + counter; the AUTH-GAP-05 re-mint
+    // self-heals, and only a TERMINAL re-mint failure pages (the
+    // family-(3) AuthenticationFailed Critical). Does NOT HALT.
     // Lane-owned (AG5-R1 fix, 2026-07-06): registered in `DhanLaneRunHandles`
     // below so a runtime Dhan disable aborts it. An unregistered spawn would
     // survive the lane teardown holding the DEAD lane's `Arc<TokenManager>`
@@ -9062,27 +9046,11 @@ async fn start_dhan_lane(
         );
     info!("mid-session profile watchdog spawned (15-min cadence, market-hours only)");
 
-    // AUTH-GAP-05: live token-health gauge poller — makes
-    // `tv_token_remaining_seconds` LIVE (was the frozen mint-time snapshot)
-    // and publishes the honest AND-composed `tv_token_valid` 0/1 gauge.
-    // NOT market-hours gated (a killed/expired token must read 0 24/7);
-    // the first interval tick fires immediately, so both gauges are live
-    // at spawn (no separate boot seed needed).
-    // Lane-owned (AG5-R1 fix, 2026-07-06): registered in `DhanLaneRunHandles`
-    // below, mirroring `token_health_handle` — an unregistered spawn would
-    // survive the lane teardown, keep the dead lane's `Arc<TokenManager>`
-    // alive, and publish `tv_token_valid=1.0` for up to ~24h while Dhan is
-    // deliberately OFF (false-OK, audit Rule 11) — then interleave with the
-    // re-enabled lane's fresh poller (gauge flapping every ≤15s).
-    let token_health_gauge_handle =
-        tickvault_core::auth::token_health_gauge::spawn_token_health_gauge_poller(
-            std::sync::Arc::clone(&token_manager),
-            std::sync::Arc::clone(&token_profile_valid),
-        );
-    info!(
-        poll_secs = tickvault_core::auth::token_health_gauge::TOKEN_HEALTH_GAUGE_POLL_SECS,
-        "live token-health gauge poller spawned (tv_token_remaining_seconds + tv_token_valid)"
-    );
+    // GAP-06 (2026-07-14, Dhan noise lock): the lane's token-health gauge
+    // poller spawn is DELETED — the poller is RE-HOMED into
+    // `dhan_rest_stack` Phase 3 (shares the stack watchdog's profile-truth
+    // flag), so the gauges stay live on dhan-off boots. This lane path is
+    // dead code post-#1522.
 
     // -----------------------------------------------------------------------
     // Step 12b: Spawn periodic token-sweep (Audit Finding #6, 2026-05-03)
@@ -9389,11 +9357,11 @@ async fn start_dhan_lane(
         // B3 round-2 (MEDIUM-1): lane-owned so teardown aborts it + resets
         // the shared token block to the honest lane-off state.
         token_health_handle: Some(token_health_handle),
-        // AG5-R1 fix (2026-07-06): the AUTH-GAP-05 gauge poller + the
-        // remint-capable mid-session watchdog are lane-owned too — teardown
-        // aborts them and publishes the honest 0/0.0 gauge state so a
-        // deliberately-OFF lane can never keep reporting tv_token_valid=1.0.
-        token_health_gauge_handle: Some(token_health_gauge_handle),
+        // GAP-06 (2026-07-14): the gauge poller is re-homed to
+        // dhan_rest_stack Phase 3 — no lane spawn exists any more, so the
+        // lane registers None (the teardown's honest 0/0.0 reset still
+        // runs; the stack's poller is process-lifetime by design).
+        token_health_gauge_handle: None,
         mid_session_watchdog_handle: Some(mid_session_watchdog_handle),
         // SEC-R4-1 / R4-CPLX-1 (2026-07-06): the mint-capable 4h token sweep
         // is lane-owned — a detached copy per lane cold-start cycle kept a
