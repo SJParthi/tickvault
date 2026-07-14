@@ -44,6 +44,7 @@ use questdb::ingress::{Buffer, ProtocolVersion, Sender, TimestampNanos};
 use tracing::{error, warn};
 
 use tickvault_common::config::QuestDbConfig;
+use tickvault_common::sanitize::capture_rest_error_body;
 
 /// QuestDB table name. One row per gap-episode edge.
 pub const FEED_GAP_AUDIT_TABLE: &str = "feed_gap_audit";
@@ -238,7 +239,10 @@ pub async fn ensure_feed_gap_audit_table(questdb_config: &QuestDbConfig) {
             .increment(1);
             error!(code = "FEED-GAP-01", stage = "ensure_ddl",
                 %status, ddl = ddl.as_str(),
-                body = %body.chars().take(200).collect::<String>(),
+                // House sanitize choke point (review LOW 2026-07-14): the
+                // server-controlled body is control-char-stripped +
+                // credential/JWT-redacted + bounded BEFORE it reaches a log.
+                body = %capture_rest_error_body(&body),
                 "FEED-GAP-01: gap-table DDL returned non-2xx (dedup may be \
                  missing — duplicate-row window until a later ensure succeeds)");
         }
