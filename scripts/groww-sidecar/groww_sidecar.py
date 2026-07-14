@@ -279,6 +279,21 @@ MARKET_CLOSE_SEC_OF_DAY = 15 * 3600 + 30 * 60  # 15:30:00 IST, exclusive
 MARKET_OPEN_RECONNECT_BASE_SECS = 0.05
 MARKET_OPEN_RECONNECT_CAP_SECS = 5.0
 
+# 2026-07-14 S2 escalation-exit: after this many CONSECUTIVE fully-failed
+# TRANSPORT-class reconnect cycles (feed-connect / subscribe / consume — NEVER
+# auth-stale cycles, whose >=60s minter-gap pacing must not become a daily
+# 06:00 IST relaunch/pager storm, and NEVER rate-limited cycles, whose long
+# backoff must not be defeated by a relaunch), the sidecar prints the FIXED
+# escalation marker below + exits(1) so the Rust supervisor relaunches it cold
+# (fresh SSM token read + full re-subscribe). Market-hours-gated: an off-hours
+# wedged reconnect costs no data and must not churn relaunches. The marker is
+# drain-classified by the supervisor into the SAME stall counter + storm a
+# watchdog kill uses — a self-exit loop keeps BOTH pagers firing (pager-safe).
+ESCALATION_EXIT_AFTER_FAILURES = 2
+# ONE line, kept lockstep with the Rust classifier prefix (source-scan test in
+# crates/app/src/groww_sidecar_supervisor.rs greps this literal).
+ESCALATION_EXIT_MARKER = "GROWW SIDECAR ESCALATION-EXIT: repeated reconnect failure — exiting for clean relaunch"  # noqa: E501
+
 # Coalesced snapshot walks (2026-07-03 lag forensics — THE cure). Before this
 # fix every NATS callback walked the ENTIRE 768-entry get_ltp()/
 # get_index_value() snapshot (~42 full walks/sec ≈ 32,500 record decodes/sec of
@@ -2926,6 +2941,10 @@ def main() -> None:
     # Count of consecutive failed cycles — drives the exponential backoff. Reset to
     # 0 after a fully successful cycle (auth OK + connected + consuming).
     consecutive_failures = 0
+    # 2026-07-14 S2: consecutive TRANSPORT-class failed cycles only (auth-stale
+    # and rate-limited cycles neither increment nor reset it — see the
+    # ESCALATION_EXIT_AFTER_FAILURES docs). Reset on any successful subscribe.
+    escalation_failed_cycles = 0
     # Start the silent-feed watchdog at most ONCE (the first time we reach a
     # successful subscribe), not per reconnect cycle — it watches the global
     # decoded counters for the whole process lifetime.
@@ -3070,10 +3089,28 @@ def main() -> None:
             # subscribe counts in feed-health. Counts only, never a credential. This
             # is the honest "attempted" signal; it does NOT flip `connected=true`.
             write_status("subscribed", len(stock_list), len(index_list))
+            # 2026-07-14 S3 capture-only warm-up: force ONE immediate walker
+            # drain of whatever the SDK snapshot caches already hold, appended
+            # to the NDJSON capture as normal walker lines. Fail-soft by
+            # construction (the dirty flags are the walker's own O(1) trigger;
+            # a fresh-session empty cache emits nothing) and NEVER a liveness
+            # source — the bridge's liveness gate only advances on ts progress.
+            _LTP_DIRTY.set()
+            _INDEX_DIRTY.set()
             # RAW-TICK-PROBE: under GROWW_RAW_PROBE=always, re-arm the bounded
             # sampler each reconnect cycle (default: once per process; the
             # running counters are never reset). No-op on the first cycle.
             RAW_PROBE.rearm_for_reconnect()
+            # 2026-07-14 S2: one coded reconnect-outcome heartbeat per RECOVERED
+            # reconnect cycle (a clean first-boot cycle prints nothing extra).
+            if consecutive_failures > 0:
+                print(
+                    "groww sidecar reconnect-cycle: "
+                    f"attempt={consecutive_failures} outcome=connected",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            escalation_failed_cycles = 0
             # A full cycle succeeded up to the blocking consume — reset backoff so
             # the next genuine disconnect retries quickly, not at the capped delay.
             consecutive_failures = 0
@@ -3215,6 +3252,33 @@ def main() -> None:
                     file=sys.stderr,
                     flush=True,
                 )
+            # 2026-07-14 S2: ONE coded reconnect-outcome heartbeat per failed
+            # cycle (fixed shape — the Rust drain classifies it Info/tracing;
+            # it answers WHY the next incident's reconnects failed).
+            outcome = {
+                "auth": "failed_auth",
+                "feed-connect": "failed_connect",
+                "subscribe": "failed_subscribe",
+            }.get(phase, "failed_other")
+            print(
+                "groww sidecar reconnect-cycle: "
+                f"attempt={consecutive_failures} outcome={outcome}",
+                file=sys.stderr,
+                flush=True,
+            )
+            # 2026-07-14 S2 escalation-exit: transport-class failures only
+            # (auth-stale keeps its >=60s minter pacing; rate-limited keeps its
+            # long backoff), in-market only. exit(1) -> supervisor cold relaunch
+            # (fresh SSM token read + full re-subscribe); the marker is
+            # drain-classified into the stall counter + storm (pager-safe).
+            if not auth_class and not rate_limited:
+                escalation_failed_cycles += 1
+                if (
+                    escalation_failed_cycles >= ESCALATION_EXIT_AFTER_FAILURES
+                    and _is_within_market_hours_ist(time.time())
+                ):
+                    print(ESCALATION_EXIT_MARKER, file=sys.stderr, flush=True)
+                    sys.exit(1)
             time.sleep(delay)
 
 
