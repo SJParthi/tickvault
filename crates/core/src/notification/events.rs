@@ -772,6 +772,16 @@ pub enum NotificationEvent {
         dhan_feed_off: bool,
         /// `true` when Groww was switched OFF for the day (round 4).
         groww_feed_off: bool,
+        /// Official minute-candle pull digest lines (Groww REST plan PR-5,
+        /// operator Quote 2 2026-07-13): one plain-English line per
+        /// feed/pull-family answering "within how many seconds precisely"
+        /// with MEASURED numbers. Empty = the digest is not wired for this
+        /// card (older callers / tests) — the section is simply omitted.
+        rest_legs: Vec<RestLegScoreLine>,
+        /// `true` when the day's per-pull records could not be read while
+        /// building this card — the candle-pull lines may under-count or
+        /// read "not measured yet" (honest cause footnote, Rule 11).
+        rest_legs_read_failed: bool,
     },
 
     /// The daily dual-feed scorecard TASK died (panicked / errored) before
@@ -1504,6 +1514,48 @@ pub struct FeedScoreLine {
     pub streaming_minutes: i64,
 }
 
+/// One official-minute-candle pull digest line on the daily scorecard
+/// (Groww REST plan PR-5, operator Quote 2 2026-07-13: *"always clearly
+/// note within a second — or within how many seconds precisely — we are
+/// fetching this live real OHLCV, along with the option chain API"*).
+///
+/// `-1` on any field means "not measured / not recorded" and renders
+/// honestly (never a fabricated zero — audit Rule 11). Every number is
+/// MEASURED from the day's per-pull records — the line never asserts a
+/// freshness it did not observe.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RestLegScoreLine {
+    /// Feed display name ("Dhan" / "Groww").
+    pub feed: String,
+    /// Pull-family display name ("spot candles" / "option chain" /
+    /// "option contracts") — already plain English, never a wire slug.
+    pub leg: String,
+    /// Pulls that retrieved their target minute; `-1` = counts not
+    /// recorded for this feed/family yet.
+    pub ok_fetches: i64,
+    /// Pulls that ended without the target minute; `-1` = not recorded.
+    pub failed_fetches: i64,
+    /// Minutes that NEVER got repaired (post-close sweep included);
+    /// `-1` = not recorded.
+    pub named_gaps: i64,
+    /// How many rate-limit rejections the day's pulls hit; `-1` unknown.
+    pub rate_limited_hits: i64,
+    /// Pulls repaired LATE (retrieved ≥60s after the minute closed — a
+    /// later pull's catch-up, not the prompt fetch); `-1` unknown.
+    pub late_recovered: i64,
+    /// Prompt-pull minute-close → data delay, median ms; `-1` = not
+    /// measured.
+    pub close_p50_ms: i64,
+    /// Prompt-pull worst-1% delay ms; `-1` = not measured.
+    pub close_p99_ms: i64,
+    /// Prompt-pull slowest delay ms; `-1` = not measured.
+    pub close_max_ms: i64,
+    /// How many prompt pulls the delay distribution is built from;
+    /// `-1` = no delay source at all, `0` = measured zero (every pull
+    /// failed).
+    pub close_samples: i64,
+}
+
 /// The Dhan exchange-clock quantization floor in milliseconds — Dhan LTT
 /// carries WHOLE IST seconds, so its measured lag has a uniform [0,1)s
 /// inflation Groww's millisecond clock does not. The verdict's delay rung
@@ -1626,6 +1678,64 @@ fn render_ms(ms: i64) -> String {
         return format!("{:.1} s", ms as f64 / 1000.0);
     }
     format!("{ms} ms")
+}
+
+/// Renders one official-minute-candle pull digest line (Groww REST plan
+/// PR-5, operator Quote 2). Every number is measured; `-1` sentinels
+/// render "not measured yet" / "(pull counts not recorded yet)" — never a
+/// fabricated zero (audit Rule 11). Plain-English, no wire slugs.
+fn rest_leg_line(l: &RestLegScoreLine) -> String {
+    let label = format!("{} {}", l.feed, l.leg);
+    // Nothing measured for this feed/family at all → one honest phrase.
+    if l.ok_fetches < 0 && l.close_samples < 0 {
+        return format!("{label}: not measured yet");
+    }
+    let mut parts: Vec<String> = Vec::new();
+    if l.ok_fetches >= 0 {
+        parts.push(format!(
+            "{} pulls OK, {} failed",
+            render_count(l.ok_fetches),
+            render_count(l.failed_fetches)
+        ));
+    }
+    if l.close_p50_ms >= 0 {
+        let mut freshness = format!(
+            "typical {} / worst 1% {} / slowest {} after close",
+            render_ms(l.close_p50_ms),
+            render_ms(l.close_p99_ms),
+            render_ms(l.close_max_ms)
+        );
+        if l.ok_fetches < 0 {
+            // Latency measured from the stored candles themselves while
+            // this feed's per-pull records are not written yet — say so.
+            freshness.push_str(" (pull counts not recorded yet)");
+        }
+        parts.push(freshness);
+    } else if l.close_samples == 0 && l.ok_fetches == 0 {
+        parts.push("freshness not measurable (no successful pull)".to_string());
+    } else {
+        parts.push("freshness not measured yet".to_string());
+    }
+    let mut line = format!("{label}: {}", parts.join(" — "));
+    if l.late_recovered > 0 {
+        line.push_str(&format!(
+            "; {} recovered late",
+            render_count(l.late_recovered)
+        ));
+    }
+    if l.rate_limited_hits > 0 {
+        line.push_str(&format!(
+            "; {} rate-limit hits",
+            render_count(l.rate_limited_hits)
+        ));
+    }
+    if l.named_gaps > 0 {
+        line.push_str(&format!(
+            "; {} never recovered \u{26a0}\u{fe0f}",
+            render_count(l.named_gaps)
+        ));
+    }
+    line
 }
 
 /// Renders a `-1`-sentinel count: honest "?" instead of a fabricated zero.
@@ -2680,6 +2790,8 @@ impl NotificationEvent {
                 restart_partial,
                 dhan_feed_off,
                 groww_feed_off,
+                rest_legs,
+                rest_legs_read_failed,
             } => {
                 // Operator-charter §G wording: plain English, emoji status,
                 // IST 12-hour time, specific numbers, ONE decision (the
@@ -2711,7 +2823,36 @@ impl NotificationEvent {
                         render_count(f.blame_unclear)
                     )
                 };
+                // Groww REST plan PR-5 (operator Quote 2, 2026-07-13): the
+                // official minute-candle pull digest — one plain-English
+                // line per feed/pull-family with the MEASURED
+                // seconds-after-close numbers. An empty vec (older callers
+                // / tests) omits the section entirely; a `-1` sentinel
+                // line renders "not measured yet", never a fabricated
+                // freshness (Rule 11).
+                let rest_section = if rest_legs.is_empty() {
+                    String::new()
+                } else {
+                    let mut s = String::from(
+                        "Official minute candles — how fast after each \
+                         minute closed:\n",
+                    );
+                    for l in rest_legs {
+                        s.push_str("  ");
+                        s.push_str(&rest_leg_line(l));
+                        s.push('\n');
+                    }
+                    s
+                };
                 let mut footnotes = String::new();
+                if *rest_legs_read_failed {
+                    footnotes.push_str(
+                        "\n\u{26a0}\u{fe0f} Today's minute-candle pull records could \
+                         not be read while building this card — the candle-pull \
+                         lines may under-count or read \u{201c}not measured \
+                         yet\u{201d}.",
+                    );
+                }
                 if *early_run {
                     footnotes.push_str(
                         "\n\u{26a0}\u{fe0f} This card was produced early on operator \
@@ -2808,7 +2949,7 @@ impl NotificationEvent {
                      Stalls: Dhan {} | Groww {}\n\
                      App restarts detected: Dhan {} | Groww {}\n\
                      Streaming: Dhan {} | Groww {}\n\
-                     {}{}",
+                     {}{}{}",
                     render_count(dhan.ticks),
                     render_count(groww.ticks),
                     render_count(dhan.exclusive_minutes),
@@ -2827,6 +2968,7 @@ impl NotificationEvent {
                     render_count(groww.restarts),
                     streaming_line(dhan),
                     streaming_line(groww),
+                    rest_section,
                     scorecard_verdict(dhan, groww, *dhan_feed_off, *groww_feed_off),
                     footnotes
                 )
@@ -7795,7 +7937,211 @@ mod tests {
             restart_partial: false,
             dhan_feed_off: false,
             groww_feed_off: false,
+            rest_legs: vec![],
+            rest_legs_read_failed: false,
         }
+    }
+
+    fn scorecard_with_rest(rest_legs: Vec<RestLegScoreLine>, read_failed: bool) -> String {
+        NotificationEvent::DualFeedDailyScorecard {
+            trading_date_ist: "2026-07-13".to_string(),
+            dhan: score_line("Dhan"),
+            groww: score_line("Groww"),
+            session_minutes: 375,
+            partial_coverage: false,
+            degraded: false,
+            early_run: false,
+            restart_partial: false,
+            dhan_feed_off: false,
+            groww_feed_off: false,
+            rest_legs,
+            rest_legs_read_failed: read_failed,
+        }
+        .to_message()
+    }
+
+    fn rest_line(feed: &str, leg: &str) -> RestLegScoreLine {
+        RestLegScoreLine {
+            feed: feed.to_string(),
+            leg: leg.to_string(),
+            ok_fetches: -1,
+            failed_fetches: -1,
+            named_gaps: -1,
+            rate_limited_hits: -1,
+            late_recovered: -1,
+            close_p50_ms: -1,
+            close_p99_ms: -1,
+            close_max_ms: -1,
+            close_samples: -1,
+        }
+    }
+
+    /// PR-5 (operator Quote 2): the measured digest line carries pull
+    /// counts + the seconds-after-close distribution + the extras, all in
+    /// plain English.
+    #[test]
+    fn test_rest_leg_digest_line_measured_full() {
+        let msg = scorecard_with_rest(
+            vec![RestLegScoreLine {
+                ok_fetches: 1_496,
+                failed_fetches: 4,
+                named_gaps: 1,
+                rate_limited_hits: 3,
+                late_recovered: 2,
+                close_p50_ms: 1_400,
+                close_p99_ms: 3_200,
+                close_max_ms: 6_200,
+                close_samples: 1_494,
+                ..rest_line("Groww", "spot candles")
+            }],
+            false,
+        );
+        assert!(
+            msg.contains("Official minute candles — how fast after each"),
+            "digest section header missing: {msg}"
+        );
+        assert!(
+            msg.contains(
+                "Groww spot candles: 1496 pulls OK, 4 failed — typical 1.4 s / \
+                 worst 1% 3.2 s / slowest 6.2 s after close; 2 recovered late; \
+                 3 rate-limit hits; 1 never recovered \u{26a0}\u{fe0f}"
+            ),
+            "measured digest line wrong: {msg}"
+        );
+    }
+
+    /// A latency-only line (the Dhan spot fallback: freshness measured
+    /// from the stored candles while per-pull records are not written yet)
+    /// says so — and never fabricates pull counts.
+    #[test]
+    fn test_rest_leg_digest_line_latency_only_and_placeholder() {
+        let msg = scorecard_with_rest(
+            vec![
+                RestLegScoreLine {
+                    close_p50_ms: 1_900,
+                    close_p99_ms: 5_000,
+                    close_max_ms: 61_000,
+                    close_samples: 1_480,
+                    late_recovered: 1,
+                    ..rest_line("Dhan", "spot candles")
+                },
+                rest_line("Dhan", "option chain"),
+            ],
+            false,
+        );
+        assert!(
+            msg.contains(
+                "Dhan spot candles: typical 1.9 s / worst 1% 5.0 s / slowest \
+                 61.0 s after close (pull counts not recorded yet); 1 recovered late"
+            ),
+            "latency-only digest line wrong: {msg}"
+        );
+        // The all-sentinel placeholder is the honest Quote-2 answer for a
+        // family with no measurement source yet — never a fabricated zero.
+        assert!(
+            msg.contains("Dhan option chain: not measured yet"),
+            "placeholder digest line wrong: {msg}"
+        );
+        // The -1 sentinels must never render numerically on a digest line
+        // (a bare `-1` substring check would trip on the ISO date).
+        for leaked in ["-1 pulls", "typical -1", "worst 1% -1", "slowest -1"] {
+            assert!(
+                !msg.contains(leaked),
+                "sentinels must never render numerically ({leaked:?}): {msg}"
+            );
+        }
+    }
+
+    /// An all-pulls-failed day renders a measured-zero, not a fabricated
+    /// freshness ("0 pulls OK" + "not measurable"); and the read-failed
+    /// flag carries its own honest footnote.
+    #[test]
+    fn test_rest_leg_digest_zero_ok_day_and_read_failed_footnote() {
+        let msg = scorecard_with_rest(
+            vec![RestLegScoreLine {
+                ok_fetches: 0,
+                failed_fetches: 375,
+                named_gaps: 375,
+                rate_limited_hits: 0,
+                late_recovered: 0,
+                close_p50_ms: -1,
+                close_p99_ms: -1,
+                close_max_ms: -1,
+                close_samples: 0,
+                ..rest_line("Groww", "option chain")
+            }],
+            true,
+        );
+        assert!(
+            msg.contains(
+                "Groww option chain: 0 pulls OK, 375 failed — freshness not \
+                 measurable (no successful pull); 375 never recovered \u{26a0}\u{fe0f}"
+            ),
+            "zero-ok digest line wrong: {msg}"
+        );
+        assert!(
+            msg.contains("minute-candle pull records could \n                         not be read")
+                || msg.contains("minute-candle pull records could not be read"),
+            "read-failed footnote missing: {msg}"
+        );
+    }
+
+    /// An EMPTY digest vec omits the section entirely (older callers /
+    /// pre-deploy cards) — no header, no stale claim.
+    #[test]
+    fn test_rest_leg_digest_empty_vec_omits_section() {
+        let msg = scorecard(score_line("Dhan"), score_line("Groww")).to_message();
+        assert!(
+            !msg.contains("Official minute candles"),
+            "empty rest_legs must omit the digest section: {msg}"
+        );
+    }
+
+    /// The digest lines obey the Telegram commandments: plain English, no
+    /// wire slugs, no library/infrastructure names, no file paths.
+    #[test]
+    fn test_rest_leg_digest_obeys_telegram_commandments() {
+        let msg = scorecard_with_rest(
+            vec![
+                RestLegScoreLine {
+                    ok_fetches: 1_120,
+                    failed_fetches: 5,
+                    named_gaps: 0,
+                    rate_limited_hits: 0,
+                    late_recovered: 0,
+                    close_p50_ms: 2_100,
+                    close_p99_ms: 4_000,
+                    close_max_ms: 9_000,
+                    close_samples: 1_120,
+                    ..rest_line("Groww", "option chain")
+                },
+                rest_line("Dhan", "option chain"),
+            ],
+            false,
+        );
+        for banned in [
+            "spot_1m",
+            "chain_1m",
+            "contract_1m",
+            "rest_fetch_audit",
+            "p50",
+            "p99",
+            ".rs",
+            "SQL",
+        ] {
+            assert!(
+                !msg.contains(banned),
+                "digest must not carry {banned:?}: {msg}"
+            );
+        }
+        assert!(
+            msg.contains("Groww option chain: 1120 pulls OK, 5 failed"),
+            "{msg}"
+        );
+        // Zero-valued extras stay OFF the line (one line = one answer).
+        assert!(!msg.contains("0 recovered late"), "{msg}");
+        assert!(!msg.contains("0 rate-limit hits"), "{msg}");
+        assert!(!msg.contains("0 never recovered"), "{msg}");
     }
 
     #[test]
@@ -7967,6 +8313,8 @@ mod tests {
             restart_partial: false,
             dhan_feed_off: false,
             groww_feed_off: false,
+            rest_legs: vec![],
+            rest_legs_read_failed: false,
         };
         let msg = ev.to_message();
         assert!(
@@ -7991,6 +8339,8 @@ mod tests {
             restart_partial: false,
             dhan_feed_off: false,
             groww_feed_off: false,
+            rest_legs: vec![],
+            rest_legs_read_failed: false,
         };
         let msg = ev.to_message();
         assert!(
@@ -8051,6 +8401,8 @@ mod tests {
             restart_partial: true,
             dhan_feed_off: false,
             groww_feed_off: false,
+            rest_legs: vec![],
+            rest_legs_read_failed: false,
         };
         let msg = ev.to_message();
         assert!(
@@ -8122,6 +8474,8 @@ mod tests {
             restart_partial: false,
             dhan_feed_off: false,
             groww_feed_off: true,
+            rest_legs: vec![],
+            rest_legs_read_failed: false,
         };
         let msg = ev.to_message();
         assert!(
@@ -8158,6 +8512,8 @@ mod tests {
             restart_partial: false,
             dhan_feed_off: true,
             groww_feed_off: true,
+            rest_legs: vec![],
+            rest_legs_read_failed: false,
         };
         let msg = ev.to_message();
         assert!(
