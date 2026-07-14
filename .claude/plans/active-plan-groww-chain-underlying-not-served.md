@@ -32,12 +32,19 @@ of `SecurityId`):
   failures are OUR side and already feed the escalation edge via the
   spot-M1 persist gate).
 - **Global-failure minute** (zero OK across all underlyings) neither
-  counts nor resets any streak (HOLD). General outages belong to the
-  existing `FailureEdge` escalation — which requires ok == 0 while this
-  edge requires ≥1 OK, so the two pages are MUTUALLY EXCLUSIVE per
-  minute (no double-fire by construction). Skipped-boundary minutes
-  (nothing fetched) deliberately do not touch the tracker — equivalent
-  to HOLD.
+  counts nor resets any streak (HOLD). General fetch outages belong to
+  the existing `FailureEdge` escalation — which requires ok == 0 while
+  this edge requires ≥1 OK, so within the FETCH-failure class the two
+  pages are mutually exclusive per minute. HONEST OVERLAP: a
+  persist-failed minute with ok ≥ 1 can legitimately count toward BOTH
+  edges (the M1 persist gate makes the escalation edge count it
+  fully-failed while an empty sibling counts here) — two DISTINCT
+  signals: persistence broken + vendor not serving one underlying.
+  Skipped-boundary minutes (nothing fetched) deliberately do not touch
+  the tracker — equivalent to HOLD. An AUTH-ABORTED fire (401
+  short-circuit, even after an earlier underlying succeeded) is also a
+  tracker HOLD minute — the dead token is a global condition, so the
+  sink is skipped entirely (neither count nor reset for anyone).
 - U's own OK resets U's streak; if U was latched, ONE Info recovery.
 - Rising edge: streak reaches the new constant
   `GROWW_CHAIN_1M_UNDERLYING_NOT_SERVED_THRESHOLD` (= 10, same value as
@@ -118,6 +125,10 @@ of `SecurityId`):
 - Global-failure minutes (ok == 0: no-token fire, auth reject on the
   first underlying, full vendor outage) interleaved mid-streak → neither
   count nor reset (streak survives the blip).
+- Mid-fire 401 AFTER an earlier underlying succeeded (ok ≥ 1 +
+  auth-skip) → the whole fire is a tracker HOLD (sink skipped): the
+  skipped underlyings must not gain a counted minute for a global token
+  condition, and nobody's streak resets.
 - Recovery (U served) after the latch → exactly ONE recovery event,
   latch cleared; a later NEW streak can page again.
 - Two underlyings empty simultaneously while the third is OK → both

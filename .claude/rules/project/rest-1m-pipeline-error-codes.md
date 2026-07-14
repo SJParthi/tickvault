@@ -565,9 +565,16 @@ The new arm mirrors the spot leg's `sid_not_served` detector (§1 item
 underlying's chain came back empty/failed (FETCH-level — Empty AND
 error-class count the same; persist failures stay the escalation edge's
 M1 business) while ≥1 OTHER underlying was OK in the SAME minute; a
-global-failure minute (zero OK) neither counts nor resets — which also
-guarantees NO DOUBLE-FIRE with the escalation edge (it needs ok == 0,
-this edge needs ≥1 OK; mutually exclusive per minute). At
+global-failure minute (zero OK) neither counts nor resets — so within
+the FETCH-failure class the two edges are mutually exclusive per minute
+(the escalation edge needs ok == 0, this edge needs ≥1 OK). HONEST
+OVERLAP: a persist-failed minute with ok ≥ 1 can legitimately count
+toward BOTH edges (the M1 persist gate makes the escalation edge count
+it fully-failed while an empty sibling counts here) — two DISTINCT
+signals: persistence broken + vendor not serving one underlying. An
+auth-aborted fire (401 short-circuit — a global token condition, even
+after an earlier underlying succeeded) is a tracker HOLD: neither
+counts nor resets. At
 `GROWW_CHAIN_1M_UNDERLYING_NOT_SERVED_THRESHOLD` (10) consecutive
 counted minutes: ONE `error!(code = CHAIN-02,
 stage = "underlying_not_served", feed = "groww", underlying,

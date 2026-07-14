@@ -2644,8 +2644,8 @@ impl NotificationEvent {
                      outage.\n\
                      Live streaming prices are NOT affected — only Groww's \
                      per-minute option chain record for {underlying} is \
-                     missing; the chain record for these minutes is coming \
-                     from the Dhan side only.\n\
+                     missing; the same minutes may still be available from \
+                     the Dhan side.\n\
                      What to do RIGHT NOW:\n\
                      1. Nothing urgent — the other indices keep recording \
                      normally.\n\
@@ -7847,9 +7847,13 @@ mod tests {
         assert!(msg.contains("10 minutes in a row"), "got: {msg}");
         assert!(msg.contains("What to do RIGHT NOW"), "got: {msg}");
         // Honest scope lines: the live WS pipeline is untouched, and the
-        // per-minute chain record for the window is Dhan-side only.
+        // Dhan-side availability is stated as MAY (no false-OK — Dhan's
+        // chain leg has its own independent state).
         assert!(msg.contains("NOT affected"), "got: {msg}");
-        assert!(msg.contains("Dhan side only"), "got: {msg}");
+        assert!(
+            msg.contains("may still be available from the Dhan side"),
+            "got: {msg}"
+        );
     }
 
     #[test]
