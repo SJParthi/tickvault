@@ -25,12 +25,15 @@
 //! → EXIT-VERIFY-01 + `needs_reconciliation`) — ladder exhaustion is never
 //! a silent Pending.
 //!
-//! HONEST BLOCKING ENVELOPE (H3, 2026-07-14 hostile review): while
-//! `[exit_orders]` is ENABLED, the strategy pipeline task drives this
-//! dispatcher INLINE from its `select!` loop — a CloseAll stalls that task
-//! for up to ~`mpp_verify_deadline_secs` per close order (an overall
-//! CloseAll verify budget of ONE `mpp_verify_deadline_secs` bounds the
-//! multi-slice case). Ticks buffer in the broadcast channel meanwhile and
+//! HONEST BLOCKING ENVELOPE (H3, 2026-07-14 hostile review; H3c precision
+//! refuter round 1): while `[exit_orders]` is ENABLED, the strategy
+//! pipeline task drives this dispatcher INLINE from its `select!` loop —
+//! a CloseAll stalls that task for up to ~`mpp_verify_deadline_secs` of
+//! LADDER SLEEP time per close order (the overall CloseAll verify budget
+//! bounds the multi-slice case to ~one deadline of ladder sleeps);
+//! per-probe HTTP RTTs + GCRA pacing are ADDITIONAL and scale with slice
+//! count — a large slice count adds un-slept probe time on top of the
+//! budget. Ticks buffer in the broadcast channel meanwhile and
 //! order updates may lag. Accepted for the dry-run layer; the PRE-LIVE
 //! design change is a SPAWNED exit executor — flagged in the rule file's
 //! enable-time protocol
@@ -230,9 +233,12 @@ pub async fn execute_exit_for_security(
         if let Err(err) = dispatch_exit_command(oms, risk_engine, cmd, cfg).await {
             // Already EXIT-ORDER-01-coded inside the dispatcher; this is
             // the pipeline-facing summary line (legacy warn semantics).
+            // M1 (refuter round 1, 2026-07-14): Display through the house
+            // redaction pipeline — never a Debug dump of a raw Dhan body.
             warn!(
-                ?err,
-                security_id, "EXIT signal → exit-command dispatch failed"
+                error = %sanitize_oms_error(&err),
+                security_id,
+                "EXIT signal → exit-command dispatch failed"
             );
         }
         return;
@@ -249,8 +255,10 @@ pub async fn execute_exit_for_security(
         .collect();
     for order_id in active {
         if let Err(err) = oms.cancel_order(&order_id).await {
+            // M1 (refuter round 1, 2026-07-14): sanitized Display, not
+            // Debug — same redaction class as the enabled path.
             warn!(
-                ?err,
+                error = %sanitize_oms_error(&err),
                 order_id = %order_id,
                 "EXIT signal → cancel failed"
             );
@@ -293,9 +301,12 @@ pub async fn execute_exit_for_security(
                 );
             }
             Err(err) => {
+                // M1 (refuter round 1, 2026-07-14): sanitized Display, not
+                // Debug — same redaction class as the enabled path.
                 warn!(
-                    ?err,
-                    security_id, "EXIT signal → closing order placement failed"
+                    error = %sanitize_oms_error(&err),
+                    security_id,
+                    "EXIT signal → closing order placement failed"
                 );
             }
         }
@@ -386,10 +397,13 @@ async fn close_all_for_security(
     // Step 3: MPP verify-after-place ladder per close-order id
     // (orders.md rule 18 — never assume a MARKET order filled).
     //
-    // H3b (2026-07-14 hostile review): the TOTAL ladder wall-clock across
-    // all slices is bounded by ONE `mpp_verify_deadline_secs` — the
-    // strategy task drives this inline, so an unbounded per-slice ladder
-    // walk would stall the pipeline select loop for slices × deadline.
+    // H3b (2026-07-14 hostile review; H3c precision refuter round 1):
+    // the LADDER SLEEP time across all slices is bounded by ONE
+    // `mpp_verify_deadline_secs` — the strategy task drives this inline,
+    // so unbounded per-slice ladder walks would stall the pipeline select
+    // loop for slices × deadline. Per-probe HTTP RTTs + GCRA pacing are
+    // ADDITIONAL to that budget (each remaining slice still costs one
+    // probe round-trip, so a large slice count adds un-slept probe time).
     // Once the budget is spent, every remaining id gets ONE sleepless
     // probe at `elapsed = deadline` — the H1 at-limit path: a still-
     // resting order classifies `PendingAtLimit` engine-side
@@ -989,10 +1003,11 @@ mod tests {
         assert_eq!(started.elapsed().as_secs(), 1);
     }
 
-    /// H3b: the CloseAll verify budget bounds TOTAL ladder wall-clock
-    /// across slices to ONE `mpp_verify_deadline_secs` — remaining ids
-    /// get a sleepless at-limit probe, so 5 slices at a 1s budget cannot
-    /// cost 5 ladder walks.
+    /// H3b: the CloseAll verify budget bounds LADDER SLEEP time across
+    /// slices to ~ONE `mpp_verify_deadline_secs` (per-probe RTTs + GCRA
+    /// pacing are additional — H3c) — remaining ids get a sleepless
+    /// at-limit probe, so 5 slices at a 1s budget cannot cost 5 ladder
+    /// walks.
     #[tokio::test(start_paused = true)]
     async fn test_close_all_verify_budget_bounds_total_ladder_time() {
         let mut oms = make_dry_run_oms();

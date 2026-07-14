@@ -184,6 +184,73 @@ fn strip_line_comments_keeping(body: &str, keep: &str) -> String {
         .join("\n")
 }
 
+/// F4 (refuter round 1, 2026-07-14): whitespace-NORMALIZED dry_run-false
+/// literal detection — `self.dry_run=false`, `dry_run :false`,
+/// tab-separated variants all match (the plain `contains` scan missed
+/// no-space/odd-space spellings).
+fn line_sets_dry_run_false(line: &str) -> bool {
+    let compact: String = line.chars().filter(|c| !c.is_whitespace()).collect();
+    compact.contains("dry_run=false") || compact.contains("dry_run:false")
+}
+
+/// F5 (refuter round 1, 2026-07-14): per-line `#[cfg(test)]`-gated-span
+/// mask over comment-stripped code. A `#[cfg(test)]` attribute gates the
+/// NEXT item: the span opens at the item's first `{` and closes when the
+/// brace depth returns to the entry depth (an attribute gating a
+/// braceless `use`/`mod x;` item ends at its `;`). Shared by the
+/// dry_run-false gate check (test 11) and the only-caller scan (test 12)
+/// — the old truncate-at-first-`#[cfg(test)]` scan let a PROD call placed
+/// AFTER a test module escape entirely.
+fn cfg_test_line_mask(code: &str) -> Vec<bool> {
+    let mut mask = Vec::new();
+    let mut depth: i64 = 0;
+    let mut gated_entry_depth: Option<i64> = None;
+    let mut pending_gate = false;
+    for line in code.lines() {
+        let is_gate_attr = line.trim() == "#[cfg(test)]";
+        if is_gate_attr && gated_entry_depth.is_none() {
+            pending_gate = true;
+        }
+        mask.push(gated_entry_depth.is_some() || pending_gate);
+        for ch in line.chars() {
+            match ch {
+                '{' => {
+                    depth += 1;
+                    if pending_gate {
+                        gated_entry_depth = Some(depth - 1);
+                        pending_gate = false;
+                    }
+                }
+                '}' => {
+                    depth -= 1;
+                    if let Some(entry) = gated_entry_depth
+                        && depth <= entry
+                    {
+                        gated_entry_depth = None;
+                    }
+                }
+                // A braceless gated item (`#[cfg(test)] use x;`) ends at
+                // its `;` — pending_gate must not leak onto the NEXT item.
+                ';' if pending_gate && !is_gate_attr => {
+                    pending_gate = false;
+                }
+                _ => {}
+            }
+        }
+    }
+    mask
+}
+
+/// True when `code` (comment-stripped) carries at least one occurrence of
+/// `needle` on a line OUTSIDE every `#[cfg(test)]`-gated span (F5 — the
+/// only-caller scan's per-hit verdict).
+fn has_ungated_needle(code: &str, needle: &str) -> bool {
+    let mask = cfg_test_line_mask(code);
+    code.lines()
+        .enumerate()
+        .any(|(idx, line)| line.contains(needle) && !mask.get(idx).copied().unwrap_or(false))
+}
+
 /// The engine exit-execution region: from the `// ==== EXIT EXECUTION`
 /// marker to the first `#[cfg(test)]` after it (the test module). Panics
 /// loudly if the marker moved — the guard must never scan a stale slice.
@@ -697,15 +764,20 @@ fn lockout_rule_file_pins_the_contract() {
 /// `dry_run = false` / `dry_run: false` literal (the `enable_live_mode`
 /// body), and it must sit within a `#[cfg(test)]`-gated item — a second
 /// literal (or an ungated one) is a live-mode escape hatch.
+///
+/// F4 (refuter round 1, 2026-07-14): the literal scan is
+/// whitespace-NORMALIZED (`line_sets_dry_run_false`) so no-space/odd-space
+/// spellings (`self.dry_run=false`, `dry_run :false`) cannot slip past;
+/// the gate check uses the shared `cfg_test_line_mask` span logic (F5).
 #[test]
 fn dry_run_false_literal_only_in_cfg_test_gate() {
     let body = read(&repo_root().join("crates/trading/src/oms/engine.rs"));
     let code = strip_line_comments_keeping(&body, "\u{0}");
-    let lines: Vec<&str> = code.lines().collect();
-    let hits: Vec<usize> = lines
-        .iter()
+    let mask = cfg_test_line_mask(&code);
+    let hits: Vec<usize> = code
+        .lines()
         .enumerate()
-        .filter(|(_, line)| line.contains("dry_run = false") || line.contains("dry_run: false"))
+        .filter(|(_, line)| line_sets_dry_run_false(line))
         .map(|(idx, _)| idx)
         .collect();
     assert_eq!(
@@ -716,11 +788,8 @@ fn dry_run_false_literal_only_in_cfg_test_gate() {
         hits.len()
     );
     for idx in hits {
-        let gated = lines[idx.saturating_sub(6)..idx]
-            .iter()
-            .any(|l| l.trim() == "#[cfg(test)]");
         assert!(
-            gated,
+            mask.get(idx).copied().unwrap_or(false),
             "the dry_run-false literal at comment-stripped line {} is not within a \
              #[cfg(test)]-gated item — {LOCK_MSG}",
             idx + 1
@@ -763,14 +832,14 @@ fn exit_methods_only_called_from_dispatcher_and_engine() {
         let Ok(body) = std::fs::read_to_string(&path) else {
             continue;
         };
-        // Production region only — truncate at the first #[cfg(test)]
-        // (test code may exercise the seam freely). Conservative: an
-        // early inline cfg(test) shrinks the scanned region, never
-        // widens it.
-        let prod = body.split("#[cfg(test)]").next().unwrap_or("");
-        let code = strip_line_comments_keeping(prod, "\u{0}");
+        // F5 (refuter round 1, 2026-07-14): scan the WHOLE file — a hit
+        // passes only when its line sits inside a #[cfg(test)]-gated
+        // span (`cfg_test_line_mask`). The old truncate-at-first-
+        // `#[cfg(test)]` scan let a prod call placed AFTER a test module
+        // escape entirely.
+        let code = strip_line_comments_keeping(&body, "\u{0}");
         for needle in needles {
-            if code.contains(needle) {
+            if has_ungated_needle(&code, needle) {
                 violations.push(format!("{p}: {needle}"));
             }
         }
@@ -850,5 +919,77 @@ fn toml_scanner_detects_flipped_flag() {
     assert_eq!(
         toml_doc_exit_orders_enabled("[other]\nenabled = true\n"),
         None
+    );
+}
+
+/// F4 self-test (refuter round 1, 2026-07-14): the whitespace-normalized
+/// dry_run-false scanner catches no-space / odd-space / tab variants and
+/// never false-positives on `true` or lookalike identifiers.
+#[test]
+fn dry_run_false_scanner_detects_whitespace_variants() {
+    assert!(line_sets_dry_run_false("        self.dry_run = false;"));
+    // No-space fixture — the pre-F4 `contains` scan missed this.
+    assert!(line_sets_dry_run_false("self.dry_run=false;"));
+    assert!(line_sets_dry_run_false("dry_run :false"));
+    assert!(line_sets_dry_run_false("\tdry_run\t=\tfalse,"));
+    assert!(line_sets_dry_run_false("dry_run: false,"));
+    assert!(!line_sets_dry_run_false("self.dry_run = true;"));
+    assert!(!line_sets_dry_run_false("let dry_run_false_docs = 1;"));
+    assert!(!line_sets_dry_run_false("if self.dry_run {"));
+}
+
+/// F5 self-test (refuter round 1, 2026-07-14): the cfg(test)-span scan
+/// must FAIL a prod call placed AFTER a test module (the hole the old
+/// truncate-at-first-`#[cfg(test)]` scan had), while still passing calls
+/// INSIDE the gated span.
+#[test]
+fn only_caller_scan_detects_prod_call_after_test_module() {
+    let prod_after_tests = "\
+#[cfg(test)]
+mod tests {
+    fn t(oms: &mut Oms) {
+        oms.place_super_order(req, 1800);
+    }
+}
+
+fn prod(oms: &mut Oms) {
+    oms.place_super_order(req, 1800);
+}
+";
+    assert!(
+        has_ungated_needle(prod_after_tests, ".place_super_order("),
+        "a prod call AFTER the test module must be flagged (the pre-F5 hole)"
+    );
+
+    let gated_only = "\
+fn unrelated() {}
+
+#[cfg(test)]
+mod tests {
+    fn t(oms: &mut Oms) {
+        oms.place_super_order(req, 1800);
+    }
+}
+";
+    assert!(
+        !has_ungated_needle(gated_only, ".place_super_order("),
+        "a call inside the #[cfg(test)] module must stay exempt"
+    );
+
+    let plain_prod = "fn prod(oms: &mut Oms) { oms.place_super_order(req, 1800); }\n";
+    assert!(has_ungated_needle(plain_prod, ".place_super_order("));
+
+    // A braceless gated item must not leak its gate onto the next item.
+    let braceless_gate = "\
+#[cfg(test)]
+use helper::x;
+
+fn prod(oms: &mut Oms) {
+    oms.place_super_order(req, 1800);
+}
+";
+    assert!(
+        has_ungated_needle(braceless_gate, ".place_super_order("),
+        "a #[cfg(test)] use-item gate must not leak onto the following fn"
     );
 }
