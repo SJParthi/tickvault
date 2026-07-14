@@ -268,7 +268,11 @@ mod tests {
     #[test]
     fn test_poisoned_lock_recovers() {
         use std::sync::Arc;
-        let cache = Arc::new(SingleSlotTtlCache::new(Duration::from_secs(5)));
+        // 3600s TTL: sanitizer builds (-Z build-std) stall ~22s symbolizing the
+        // poisoner's panic backtrace, which blew a 5s TTL (safety run
+        // 29230855037). TTL expiry is NOT what this test verifies — that is
+        // pinned by test_single_slot_ttl_expiry with its own short local TTL.
+        let cache = Arc::new(SingleSlotTtlCache::new(Duration::from_secs(3600)));
         cache.put("pre-poison".to_string());
         let poisoner = Arc::clone(&cache);
         // Panic while holding the lock to poison it.
