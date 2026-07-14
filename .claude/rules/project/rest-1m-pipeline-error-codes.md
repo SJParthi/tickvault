@@ -278,19 +278,28 @@ recommendation", relayed via the coordinator session —
 now fetch CONCURRENTLY per fire (the sequential loop + the old auth
 short-circuit skip rows are gone — every target gets a REAL forensics
 row), at a TIER-dependent post-boundary delay (`two_wave` default:
-close+1,350 ms; probe-gated `seven_concurrent`: close+300 ms). New
-SPOT1M-01 stage: `stage="burst_demoted"` (`warn!`-level, edge-latched —
-the FIRST Groww-leg HTTP 429 of the session demoted the burst tier;
-counter `tv_groww_rest_burst_demoted_total`; the contract leg's demotion
-edge emits the same stage with `leg="contract_1m"`). New counters:
+close+1,350 ms; probe-gated `seven_concurrent`: close+300 ms), with a
+deterministic per-target RUNG jitter (slot × 150 ms, ALL tiers — the
+same-day fix-round HIGH-1: the 4 ladders never re-poll in lockstep on a
+correlated vendor-lag minute). New SPOT1M-01 stages:
+`stage="burst_demoted"` (`warn!`-level, edge-latched ONCE PER DEMOTION
+LEVEL — a live Groww-leg HTTP 429 steps the session one shape down the
+`two_wave → staggered → fully-sequential` ladder (fix-round MEDIUM-1;
+`seven_concurrent` enters at the top); counter
+`tv_groww_rest_burst_demoted_total{level}`; the contract leg's demotion
+edge emits the same stage with `leg="contract_1m"`) and
+`stage="wave_task_failed"` (`error!`-level, unwind builds only — release
+aborts on panic: a wave fetch task failed to JOIN; the lost target is
+synthesized as a Failed outcome for the minute, never a silent missing
+target — fix-round MEDIUM-3 documentation). New counters:
 `tv_groww_rest_burst_tier_total{tier}` (which shape fired) +
 `tv_groww_rest_warmup_total{leg, outcome}` (the pre-boundary
 unauthenticated TLS warm-up GET — best-effort, never coded/paged) +
 `tv_groww_rate_probe_requests_total{outcome}` /
 `tv_groww_rate_probe_rate_limited_total` (the env-gated off-hours rate
-probe — log-lines only, refused in-session, writes no tables). Everything
-else in the spot taxonomy (ladder, backfill, sweep, edges, forensics) is
-unchanged.
+probe — log-lines only, refused inside the [08:30, 16:00) IST wall-clock
+blackout on ANY day, writes no tables). Everything else in the spot
+taxonomy (ladder, backfill, sweep, edges, forensics) is unchanged.
 
 **2026-07-13 scope note — the Groww spot leg covers 4 indices (INDIA VIX
 added, SPOT ONLY; `groww-second-feed-scope-2026-06-19.md` §38.7):** the
@@ -573,10 +582,16 @@ chain-specific rate rule).~~ **SUPERSEDED 2026-07-14 (the auto-ladder —
 fires on its OWN minute-boundary timer at close+300 ms — no spot signal,
 no fallback timer, no min-gap; the 3 underlyings fetch CONCURRENTLY
 within the wave (a demoted `two_wave` session adds a 350 ms intra-wave
-stagger). New CHAIN-02 stage: `stage="burst_demoted"` (`warn!`-level,
-edge-latched — a chain-leg HTTP 429 demoted the session's burst tier;
-`tv_groww_rest_burst_demoted_total`); the boot probe's inter-call pacing
-keeps its own 1 s spacing. Groww counters mirror the Dhan names under the
+stagger; a FURTHER 429 drops to fully-sequential-within-wave — one whole
+per-underlying budget per slot, the fix-round MEDIUM-1 ladder floor).
+New CHAIN-02 stages: `stage="burst_demoted"` (`warn!`-level, edge-latched
+once per demotion level — a chain-leg HTTP 429 stepped the session's
+burst tier down; `tv_groww_rest_burst_demoted_total{level}`) and
+`stage="wave_task_failed"` (`error!`-level, unwind builds only — a wave
+fetch task failed to join; that underlying counts as failed for the
+minute, never silent — fix-round MEDIUM-3 documentation); the boot
+probe's inter-call pacing keeps its own 1 s spacing. Groww counters
+mirror the Dhan names under the
 `tv_groww_chain1m_*` prefix (`fetch_total{outcome}`, `close_to_data_ms`,
 `fetch_duration_ms`, `strikes_per_chain`, `legs_per_chain`,
 `payload_bytes`, `rate_limited_total`, `boundary_skipped_total`,

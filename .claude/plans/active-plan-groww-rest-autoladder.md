@@ -260,7 +260,8 @@ after the off-hours rate probe passes.
   - Files: crates/app/src/groww_rest_burst.rs, crates/app/src/lib.rs
   - Tests: test_effective_tier_mapping, test_spot_fire_delay_per_tier,
     test_intra_wave_stagger_slots, test_demote_edge_fires_once,
-    test_tier_labels_are_static
+    test_tier_labels_are_static,
+    test_wave_sleep_from_now_ms_is_millisecond_precise (fix round)
 - [x] Item 5 — Spot leg auto-ladder rebuild
   - Files: crates/app/src/groww_spot_1m_boot.rs
   - Tests: existing module tests updated; test_fire_token_path_found_and_empty_via_mock
@@ -279,6 +280,29 @@ after the off-hours rate probe passes.
   - Files: crates/app/tests/groww_spot_1m_wiring_guard.rs,
     crates/app/tests/groww_chain_1m_wiring_guard.rs
   - Tests: the ratchets themselves
+- [x] Item 10 — Adversarial fix round (same day, 2026-07-14): CRITICAL-1
+  ms-precise wave wakes (wave_sleep_from_now_ms on both legs — the 1,050 ms
+  separation holds exactly); HIGH-1 deterministic per-target rung jitter
+  (slot x 150 ms, ALL tiers; recomputed const-assert arithmetic: rung worst
+  6/s, seven lag-worst 9/s); MEDIUM-1 second+third demotion levels
+  (staggered -> fully-sequential floor, level-labelled counter); MEDIUM-2 +
+  SECURITY-MEDIUM probe gate rewritten to the unconditional [08:30, 16:00)
+  IST wall-clock blackout (no calendar dependency) + BruteX-coordination
+  documentation; MEDIUM-3 stage="wave_task_failed" documented; LOW-1/LOW-2
+  wording + envelope lines; warm-up error-log redaction-exemption comment.
+  - Files: crates/app/src/groww_rest_burst.rs,
+    crates/app/src/groww_spot_1m_boot.rs,
+    crates/app/src/groww_option_chain_1m_boot.rs,
+    crates/app/src/groww_rate_probe.rs, crates/app/src/main.rs,
+    crates/common/src/constants.rs, crates/common/src/config.rs,
+    config/base.toml, the three rule files of Item 2
+  - Tests: test_wave_sleep_from_now_ms_is_millisecond_precise,
+    test_rung_sleep_delta_applies_slot_jitter_to_whole_schedule,
+    test_effective_tier_mapping (ladder), test_demote_edge_fires_once
+    (per-level edges + floor), test_rate_probe_blackout_window (any-day
+    window), groww_spot_rung_worst_rolling_second /
+    groww_spot_rungs_in_first_second const fns pinned in
+    test_groww_rest_burst_auto_ladder_constants_pinned
 
 ## Scenarios
 
@@ -290,8 +314,8 @@ after the off-hours rate probe passes.
 | 4 | 429 on any leg | one coded warn + demote counter; next minute two_wave/staggered |
 | 5 | Token dead at fire | all targets no_token/auth-fail with forensics rows; cache dropped once |
 | 6 | Warm-up peer black-holed | 3 s timeout; fire unaffected |
-| 7 | Probe run at 11:00 IST on a trading day | refused with one warn, zero requests |
-| 8 | Probe run Saturday | 2 rounds × 4 steps, ~58 requests, structured verdict lines |
+| 7 | Probe run at 11:00 IST — ANY day (fix round: trading day or stale-holiday-list Saturday alike) | refused with one warn, zero requests |
+| 8 | Probe run Saturday 20:00 IST (outside [08:30, 16:00)) | 2 rounds × 4 steps, ~58 requests, structured verdict lines |
 | 9 | Chain leg alone enabled (spot off) | chain fires on own timer at +300 ms — no signal dependency |
 | 10 | Restart after demotion | configured tier restored; re-demotes on the next 429 |
 

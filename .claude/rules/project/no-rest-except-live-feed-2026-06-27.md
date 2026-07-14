@@ -240,16 +240,26 @@ patterns (the Dhan PR #1499 pattern, pending merge).
   (never minted — `groww-shared-token-minter-2026-07-02.md`); §28 indicators/strategies
   boundary untouched.
 - **Burst arithmetic (2026-07-14 auto-ladder — supersedes the "≤6 req/s" pacing line
-  above for the Groww legs; full contract in §9.7):** the shipped `two_wave` tier bursts
-  ≤ 4 req/s at the boundary (3 chain at close+300 ms, 4 spot at close+1,350 ms — the
-  1,050 ms wave separation keeps every rolling second single-wave); the probe-gated
-  `seven_concurrent` tier bursts 7 req/s. The honest vendor-lag worst case (two adjacent
-  spot re-poll rung waves inside one rolling second) is 8 req/s solo — at/below the
-  documented 10/s ceiling but with zero margin over the assumed BruteX ~3/s co-tenancy;
-  any live 429 AUTO-DEMOTES the tier for the rest of the session (one coded warn +
-  `tv_groww_rest_burst_demoted_total`), never out-polled. Per-minute totals stay ≤ 55
-  (30 contract + 20 spot + 3 chain + 2 warm-up) ≈ 18% of the 300/min budget —
-  const-asserted in `crates/common/src/constants.rs`.
+  above for the Groww legs; full contract in §9.7; numbers RECOMPUTED the same day for
+  the fix-round HIGH-1 rung jitter):** the shipped `two_wave` tier bursts ≤ 4 req/s at
+  the boundary (3 chain at close+300 ms, 4 spot at close+1,350 ms — the 1,050 ms wave
+  separation keeps every rolling second single-wave, and both legs compute the wake from
+  the MILLISECOND clock so the separation holds exactly — fix-round CRITICAL-1; the
+  original whole-second else-branch could collapse it to ~51 ms); the probe-gated
+  `seven_concurrent` tier bursts 7 req/s. Each spot target's re-poll rung schedule is
+  jittered by slot × 150 ms in ALL tiers (fix-round HIGH-1 — the Dhan-leg precedent), so
+  the honest vendor-lag worst case (jittered rung stragglers inside one rolling second)
+  is 6 req/s solo for the rungs, 8 with the contract leg's 2/s (pre-jitter: 8 and 10 —
+  AT the ceiling), and 9 for the seven tier's initial-wave-plus-rungs (pre-jitter 11,
+  above the ceiling) — all const-asserted; still zero margin over the assumed BruteX
+  ~3/s co-tenancy, which is why any live 429 AUTO-DEMOTES the tier down the §9.7(3)
+  ladder (one coded warn per level + `tv_groww_rest_burst_demoted_total{level}`), never
+  out-polled. LOW-2 honest note (same fix round): the contract leg now starts ~2–6 s
+  earlier than pre-Stage-1 (the chain leg completes faster), so its 2/s stream stacks
+  INSIDE the spot rung windows — counted inside the solo const-assert, zero co-tenant
+  margin beyond it, accepted by design. Per-minute totals stay ≤ 55 (30 contract + 20
+  spot + 3 chain + 2 warm-up) ≈ 18% of the 300/min budget — const-asserted in
+  `crates/common/src/constants.rs`.
 - **Decision-freshness gate (2026-07-13, recorded with PR-4 — the operator's verbatim
   intent: "we cannot rely on backfill — within the particular second or few seconds it
   should definitely be pulled for TRADING DECISIONS; we need precise filling"):**
@@ -330,12 +340,16 @@ shape).
      documented ceiling solo; zero margin at the assumed BruteX ~3/s
      co-tenancy anchor). Promotion = a config flip + a fresh dated note HERE
      after the §9.7(5) probe passes.
-3. **AUTO-DEMOTE:** any HTTP 429 on any Groww REST leg (spot / chain /
-   contract) demotes the session to `two_wave`; a 429 while already in
-   `two_wave` adds a 350 ms intra-wave stagger. One coded warn on the
-   demotion edge (SPOT1M-01 / CHAIN-02 `stage="burst_demoted"` — no new
-   ErrorCode variants) + `tv_groww_rest_burst_demoted_total`; boot resets to
-   the configured tier.
+3. **AUTO-DEMOTE (a LADDER since the same-day fix round — review
+   MEDIUM-1):** any HTTP 429 on any Groww REST leg (spot / chain /
+   contract) steps the session ONE shape down
+   `seven_concurrent → two_wave → two_wave + 350 ms intra-wave stagger →
+   fully-sequential-within-wave` (the sequential floor spaces wave slots
+   a whole per-slot hard budget apart — the pre-Stage-1 one-at-a-time
+   pacing shape; a 429 at the floor is a no-op). One coded warn per
+   demotion LEVEL (SPOT1M-01 / CHAIN-02 `stage="burst_demoted"` — no new
+   ErrorCode variants) + `tv_groww_rest_burst_demoted_total{level}`; boot
+   resets to the configured tier.
 4. **WARM-UP (`[groww_rest_burst] warm_up`, base.toml ON):** at minute
    boundary − 4 s each leg sends ONE lightweight UNAUTHENTICATED GET on its
    own client (response discarded; the 401/400 still re-establishes an
@@ -343,11 +357,23 @@ shape).
    own 3 s timeout so a fire can never start late. ≤ 2 requests in a second
    that never overlaps the waves — counted in the budget arithmetic.
 5. **OFF-HOURS RATE PROBE (env-gated `TICKVAULT_GROWW_RATE_PROBE=1`, default
-   OFF):** escalating bursts 4 → 6 → 8 → 11 req/s (one second each, ~10 s
-   pause between steps, max 2 rounds, ~58 requests total) against the granted
-   candles endpoint; REFUSED in-session on trading days; per-step 429 count +
-   latency as structured log lines + counters; writes NO data tables. Its
-   verdict is the ONLY gate that can promote `seven_concurrent`.
+   OFF — OPERATOR-TRIGGERED, never scheduled):** escalating bursts
+   4 → 6 → 8 → 11 req/s (one second each, ~10 s pause between steps, max 2
+   rounds, ~58 requests total) against the granted candles endpoint;
+   REFUSED inside the [08:30, 16:00) IST wall-clock blackout window on ANY
+   day — trading day or not (same-day fix round, SECURITY-MEDIUM: the
+   original `trading_day && [09:00, 15:35)` gate depended solely on the
+   trading calendar, so a stale holiday list could fire the burst
+   mid-session; the unconditional wall-clock window has no calendar lookup
+   to fail-open on). CO-TENANCY (review MEDIUM-2): BruteX's bulk pulls are
+   nightly/post-market (§9.3) and the blackout cannot see BruteX's
+   schedule — the operator MUST coordinate the probe run with BruteX's
+   nightly window before arming the env var. Per-step 429 count + latency
+   as structured log lines + counters; writes NO data tables. Its verdict
+   is the ONLY gate that can promote `seven_concurrent`. (The probe's
+   11 req/s top step over-tests: with the fix-round rung jitter the
+   seven-tier lag-worst shape is 9 req/s — the 11 step is kept as
+   deliberate margin.)
 6. **What does NOT change:** the KEEP endpoints, destination tables, DEDUP
    keys, token discipline (SSM read-only, never minted), the bounded spot
    re-poll ladder + backfill + 15:31 sweep (never-skip capture is a hard
