@@ -283,46 +283,25 @@ fn order_update_reconnected_is_stability_gated_not_connect_edge() {
     );
 }
 
-#[test]
-fn main_rs_does_not_emit_order_update_disconnected_after_task_await() {
-    // RE-POINTED (PR-C2, 2026-07-13): the order-update spawn site moved from
-    // the deleted lane in main.rs into dhan_rest_stack.rs (Q4-i rewire).
-    let src = read("crates/app/src/dhan_rest_stack.rs");
-    assert_eq!(
-        src.matches("NotificationEvent::OrderUpdateDisconnected")
-            .count(),
-        0,
-        "main.rs must NOT emit OrderUpdateDisconnected — the post-await site \
-         was unreachable (run_order_update_connection never returns since \
-         WS-GAP-04); the reachable page lives inside the reconnect loop."
-    );
-    assert!(
-        src.contains("task_exited_unreachable"),
-        "dhan_rest_stack.rs must keep the defensive coded error! at the \
-         order-update spawn site so a future refactor that breaks the \
-         never-return loop contract surfaces loudly."
-    );
-}
+// RETIRED (PR-C2 merge reconcile, 2026-07-14):
+// main_rs_does_not_emit_order_update_disconnected_after_task_await died with
+// the machinery it pinned. Lineage: PR-C2 (2026-07-13) re-pointed it from the
+// deleted lane's main.rs spawn to the dhan_rest_stack Q4-i spawn; #1532 (the
+// 2026-07-14 operator Dhan noise lock, scope-lock §A.1) then RETIRED that
+// stack spawn too — so NO order-update spawn site exists on any path. The
+// core module (`order_update_connection.rs`) stays dormant for the
+// live-trading re-wire; its in-module tests + the stability-gate ratchet
+// above keep pinning the loop contract.
 
 // ---------------------------------------------------------------------------
-// (3) The Dhan REST stack wires reconnect_notifier into the surviving
-//     order-update connection (the ONLY Dhan WS since PR-C2, 2026-07-13).
+// (3) RETIRED (PR-C2 merge reconcile, 2026-07-14):
+//     main_rs_passes_reconnect_notifier_to_order_update_call_sites died with
+//     the call sites it pinned — the lane's fast/slow spawns were deleted in
+//     PR-C2 and the dhan_rest_stack spawn was retired by #1532 (see the
+//     retirement note above). A future live-trading re-wire that re-spawns
+//     the order-update WS must restore a reconnect-notifier ratchet at the
+//     new call site.
 // ---------------------------------------------------------------------------
-
-#[test]
-fn main_rs_passes_reconnect_notifier_to_order_update_call_sites() {
-    // Updated 2026-06-02 (CI rot fix): depth-20 / depth-200 were deleted in
-    // AWS-lifecycle PR #4. RE-POINTED PR-C2 (2026-07-13): the fast/slow lane
-    // call sites were deleted with the Dhan live-WS lane; the SOLE surviving
-    // order-update call site lives in dhan_rest_stack.rs (Q4-i rewire) and
-    // must pass a reconnect notifier.
-    let src = read("crates/app/src/dhan_rest_stack.rs");
-    assert!(
-        src.contains("ou_reconnect_notifier"),
-        "dhan_rest_stack.rs must pass a reconnect notifier into the \
-         order-update connection call site."
-    );
-}
 
 // ---------------------------------------------------------------------------
 // (4) Fast first-retry latency on all 4 WS types
