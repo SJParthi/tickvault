@@ -1,0 +1,43 @@
+# Manage Kill Switch
+
+`POST` https://api.dhan.co/v2/killswitch
+
+Activate or deactivate the kill switch for your account. Disables trading for the current day.
+
+This API lets you activate the kill switch for your account, which will disable trading for current trading day. Pass `killSwitchStatus` as a query parameter.
+
+> **Note:** You need to ensure that all your positions are closed and there are no pending orders in your account to be able to activate Kill Switch.
+
+
+> **NOTICE:** Order Placement, Modification and Cancellation APIs requires Static IP whitelisting - [refer here](/api/v2/guides/authentication#setup-static-ip)
+
+
+### Query Parameters
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| killSwitchStatus | string | No | Kill switch status Values: `ACTIVATE`, `DEACTIVATE`. |
+
+
+### Response Fields
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| killSwitchStatus | string | No | Status of Kill Switch Values: `ACTIVATE`, `DEACTIVATE`. |
+
+
+### Status Codes
+
+| Code | Description |
+|------|-------------|
+| 200 | Kill switch status updated |
+| 401 | Unauthorized |
+
+
+### Example Request
+
+```bash
+curl -X POST https://api.dhan.co/v2/killswitch \
+  -H "access-token: <your-access-token>" \
+  -H "Content-Type: application/json"
+```

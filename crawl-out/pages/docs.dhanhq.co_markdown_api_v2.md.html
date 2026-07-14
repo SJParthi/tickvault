@@ -1,0 +1,76 @@
+# DhanHQ API
+
+Introduction to DhanHQ Trading & Investment API
+
+# Getting Started
+
+
+DhanHQ API is a state-of-the-art platform that enables you to build trading and investment services, applications, and strategies.
+
+It provides a set of REST-like APIs that integrate directly with our trading platform. With DhanHQ APIs, you can execute and modify orders in real time, manage portfolios, access live market data, and more through a fast and reliable API collection.
+
+The platform uses resource-based URLs and supports JSON as well as form-encoded requests. Responses are returned in JSON format using standard HTTP response codes, verbs, and authentication methods.
+
+
+  
+  - [DhanHQ Python Client](https://github.com/dhan-oss/DhanHQ-py)
+
+
+## Structure
+
+
+#### REST
+
+All **GET** and **DELETE** request parameters go as query parameters, and **POST** and **PUT** parameters as form-encoded. User has to input an access token in the header for every request.
+
+```bash
+curl --request POST \
+  --url https://api.dhan.co/v2/ \
+  --header 'Content-Type: application/json' \
+  --header 'access-token: <your-access-token>' \
+  --data '{Request JSON}'
+```
+
+#### Python
+
+Install Python Package directly using following command in command line.
+
+```bash
+pip install dhanhq
+```
+This installs entire DhanHQ Python Client along with the required packages. Now, you can start using DhanHQ Client with your Python script.
+
+You can now import 'dhanhq' module and connect to your Dhan account.
+
+```bash
+from dhanhq import dhanhq
+
+dhan = dhanhq("client_id","access_token")
+```
+
+
+## Errors
+
+Error responses come with the error code and message generated internally by the system. The sample structure of error response is shown below.
+
+```json
+{
+    "errorType": "",
+    "errorCode": "",
+    "errorMessage": ""
+}
+```
+
+You can find detailed error code and message under [Annexure](/api/v2/guides/annexure).
+
+
+## Rate Limit
+
+| Rate Limit | Order APIs | Data APIs | Quote APIs | Non Trading APIs |
+|------------|------------|-----------|------------|------------------|
+| **per second** | 10 | 5 | 1 | 20 |
+| **per minute** | 250 | - | Unlimited | Unlimited |
+| **per hour** | 1000 | - | Unlimited | Unlimited |
+| **per day** | 7000 | 100000 | Unlimited | Unlimited |
+
+> **info:** Order Modifications are capped at **25 modifications/order**.

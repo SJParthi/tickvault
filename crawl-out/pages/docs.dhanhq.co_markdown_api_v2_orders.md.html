@@ -1,0 +1,19 @@
+# Orders
+
+Orders
+
+The order management API lets you place a new order, cancel or modify the pending order, retrieve the order status, trade status, order book & tradebook.
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| POST | `/orders` | Place a new order |
+| PUT | `/orders/{order-id}` | Modify a pending order |
+| DELETE | `/orders/{order-id}` | Cancel a pending order |
+| POST | `/orders/slicing` | Slice order into multiple legs over freeze limit |
+| GET | `/orders` | Retrieve the list of all orders for the day |
+| GET | `/orders/{order-id}` | Retrieve the status of an order |
+| GET | `/orders/external/{correlation-id}` | Retrieve the status of an order by correlation id |
+| GET | `/trades` | Retrieve the list of all trades for the day |
+| GET | `/trades/{order-id}` | Retrieve the details of trade by an order id |
+
+> **note:** Order Placement, Modification and Cancellation APIs requires Static IP whitelisting - [here](/api/v2/guides/authentication#setup-static-ip)

@@ -1,0 +1,32 @@
+# Get Market Status
+
+`GET` https://api.dhan.co/v2/globalstocks/marketstatus
+
+Retrieve the current trading status and session timing for the US stock market.
+
+
+
+
+### Response Fields
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| marketCloseTime | string | No | Market close time |
+| marketOpenTime | string | No | Market open time |
+| holidayFlag | boolean | No | Holiday flag |
+| status | string | No | Market status - open/closed |
+
+
+### Status Codes
+
+| Code | Description |
+|------|-------------|
+| 200 | market status |
+
+
+### Example Request
+
+```bash
+curl -X GET https://api.dhan.co/v2/globalstocks/marketstatus \
+  -H "access-token: <your-access-token>"
+```

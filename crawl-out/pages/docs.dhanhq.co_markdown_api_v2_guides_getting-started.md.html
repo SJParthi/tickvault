@@ -1,0 +1,76 @@
+# Getting Started
+
+Get started with DhanHQ API for algorithmic trading
+
+with DhanHQ API
+
+
+DhanHQ API is a state-of-the-art platform that enables you to build trading and investment services, applications, and strategies.
+
+It provides a set of REST-like APIs that integrate directly with our trading platform. With DhanHQ APIs, you can execute and modify orders in real time, manage portfolios, access live market data, and more through a fast and reliable API collection.
+
+The platform uses resource-based URLs and supports JSON as well as form-encoded requests. Responses are returned in JSON format using standard HTTP response codes, verbs, and authentication methods.
+
+## 1. Create an Account
+
+Sign up at [dhan.co](https://dhan.co) and complete KYC verification.
+
+## 2. Generate API Credentials
+
+Navigate to your account settings to generate:
+- **Client ID**: Your unique identifier
+- **Access Token**: JWT authentication token for API requests
+
+## 3. Install the SDK
+
+```bash
+pip install dhanhq
+```
+
+## 4. Initialize the Client
+
+```python
+from dhanhq import DhanContext, dhanhq
+
+context = DhanContext("YOUR_CLIENT_ID", "YOUR_ACCESS_TOKEN")
+dhan = dhanhq(context)
+```
+
+## 5. Place Your First Order
+
+```python
+response = dhan.place_order(
+    security_id="1333",
+    exchange_segment="NSE_EQ",
+    transaction_type="BUY",
+    quantity=10,
+    order_type="MARKET",
+    product_type="INTRADAY"
+)
+print(response)
+```
+
+## API Structure
+
+All API requests follow REST conventions with JSON request/response bodies.
+
+### Base URLs
+
+| Environment | URL | Description |
+|-------------|-----|-------------|
+| **Production** | `https://api.dhan.co/v2` | Live trading environment |
+| **Sandbox** | `https://sandbox.dhan.co/v2` | Testing environment |
+
+### Request Headers
+
+| Header | Required | Description |
+|--------|----------|-------------|
+| `access-token` | Yes | JWT access token from DhanHQ |
+| `Content-Type` | Yes | `application/json` |
+
+## What's Next?
+
+- **[Authentication](/api/v2/guides/authentication)** — Learn about access tokens and security
+- **[API Reference](/api/v2/)** — Browse all 31+ API endpoints
+- **[Python SDK](/api/v2/guides/sdks/python)** — Full Python SDK reference
+- **[Rate Limits](/api/v2/guides/rate-limits)** — Understand API rate limits

@@ -1,0 +1,230 @@
+# Conditional and Multi Order
+
+Place, modify, delete and retrieve conditional orders based on price or technical indicators
+
+The Conditional and Multi Order API lets you place orders based on set conditions. These conditions can be based on price or technical indicators or a combination of both. You can set one or multiple orders to be triggered when the condition is met.
+
+When a conditional order is triggered, you will receive a postback update if [configured](/api/v2/guides/postback).
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| POST | `/alerts/orders` | Place Conditional Order |
+| POST | `/alerts/multi/orders` | Place Multi Order |
+| PUT | `/alerts/orders/{alertId}` | Modify Conditional Order |
+| DELETE | `/alerts/orders/{alertId}` | Delete Conditional Order |
+| GET | `/alerts/orders/{alertId}` | Get Conditional Order by ID |
+| GET | `/alerts/orders` | Get All Conditional Orders |
+
+> **note:** - Conditional Orders are currently supported only for Equities and Indices.
+> - You can receive postback updates by providing a Webhook URL while generating the Access Token.
+
+---
+
+## Place Conditional Order
+
+Create a new conditional trigger with conditions (price or technical indicators) that, when met, place one or multiple orders automatically.
+
+```bash
+curl --request POST \
+  --url https://api.dhan.co/v2/alerts/orders \
+  --header 'Accept: application/json' \
+  --header 'Content-Type: application/json' \
+  --header 'access-token: {JWT}' \
+  --data '{Request Body}'
+```
+
+**Request Structure**
+
+```json
+{
+  "dhanClientId": "123456789",
+  "condition": {
+    "comparisonType": "TECHNICAL_WITH_VALUE",
+    "exchangeSegment": "NSE_EQ",
+    "securityId": "12345",
+    "indicatorName": "SMA_5",
+    "timeFrame": "DAY",
+    "operator": "CROSSING_UP",
+    "comparingValue": 250,
+    "expDate": "2019-08-24",
+    "frequency": "ONCE",
+    "userNote": "Price crossing SMA"
+  },
+  "orders": [
+    {
+      "transactionType": "BUY",
+      "exchangeSegment": "NSE_EQ",
+      "productType": "CNC",
+      "orderType": "LIMIT",
+      "securityId": "12345",
+      "quantity": 10,
+      "validity": "DAY",
+      "price": "250.00",
+      "discQuantity": "0",
+      "triggerPrice": "0"
+    }
+  ]
+}
+```
+
+
+| Parameter | Data Type | Description | Sample Value |
+|-----------|-----------|-------------|--------------|
+| `condition`* | object | Alert condition configuration | — |
+| `condition.comparisonType`* | string | Type of comparison ([see Annexure](/api/v2/guides/annexure#comparison-type)) | `TECHNICAL_WITH_VALUE` |
+| `condition.timeframe`* | string | Timeframe for indicator evaluation — `DATE` `ONE_MIN` `FIVE_MIN` `FIFTEEN_MIN` | `DAY` |
+| `condition.exchangeSegment`* | enum | Exchange — `NSE_EQ` `BSE_EQ` `IDX_I` | `NSE_EQ` |
+| `condition.securityId`* | string | Exchange standard ID for scrip ([Instruments](/api/v2/guides/instruments)) | `12345` |
+| `condition.indicatorName`** | string | Technical indicator ([see Annexure](/api/v2/guides/annexure#indicator-name)) | `SMA_5` |
+| `condition.operator`* | string | Condition operator ([see Annexure](/api/v2/guides/annexure#operator)) | `CROSSING_UP` |
+| `condition.comparingValue`** | number | Value for comparison | `250` |
+| `condition.comparingIndicatorName`** | string | Technical indicator ([see Annexure](/api/v2/guides/annexure#indicator-name)) | `SMA_10` |
+| `condition.expDate`* | string (date) | Expiry date of alert (default: 1 year) | `2019-08-24` |
+| `condition.frequency`* | string | Trigger frequency | `ONCE` |
+| `condition.userNote` | string | User-provided note | `Price crossing SMA` |
+| `orders` | array[obj] | List of orders to execute when triggered | — |
+| `orders.transactionType`* | enum | `BUY` or `SELL` | `BUY` |
+| `orders.exchangeSegment`* | enum | Exchange Segment ([see Annexure](/api/v2/guides/annexure#exchange-segment)) | `NSE_EQ` |
+| `orders.productType`* | enum | `CNC` `INTRADAY` `MARGIN` `MTF` | `CNC` |
+| `orders.orderType`* | enum | `LIMIT` `MARKET` `STOP_LOSS` `STOP_LOSS_MARKET` | `LIMIT` |
+| `orders.securityId`* | string | Exchange standard ID ([Instruments](/api/v2/guides/instruments)) | `12345` |
+| `orders.quantity`* | integer | Number of shares | `10` |
+| `orders.validity`* | enum | `DAY` or `IOC` | `DAY` |
+| `orders.price`* | string | Price at which order is placed | `250` |
+| `orders.discQuantity` | string | Disclosed quantity (≥30% of quantity) | `0` |
+| `orders.triggerPrice`** | string | Trigger price for SL-M & SL-L | `0` |
+
+**Response**
+
+```json
+{
+  "alertId": "12345",
+  "alertStatus": "ACTIVE"
+}
+```
+
+---
+
+## Modify Conditional Order
+
+Modify a conditional trigger logic and/or the associated order execution parameters.
+
+```bash
+curl --request PUT \
+  --url https://api.dhan.co/v2/alerts/orders/{alertId} \
+  --header 'Accept: application/json' \
+  --header 'Content-Type: application/json' \
+  --header 'access-token: {JWT}' \
+  --data '{Request Body}'
+```
+
+The request structure and parameters are the same as [Place Conditional Order](#place-conditional-order), with the addition of `alertId` as a path parameter.
+
+**Response**
+
+```json
+{
+  "alertId": "12345",
+  "alertStatus": "ACTIVE"
+}
+```
+
+---
+
+## Delete Conditional Order
+
+Delete an existing conditional trigger using its `alertId`.
+
+```bash
+curl --request DELETE \
+  --url https://api.dhan.co/v2/alerts/orders/{alertId} \
+  --header 'Accept: application/json' \
+  --header 'access-token: {JWT}'
+```
+
+**Response**
+
+```json
+{
+  "alertId": "12345",
+  "alertStatus": "CANCELLED"
+}
+```
+
+---
+
+## Get Conditional Order by ID
+
+Retrieve status and details for a specific trigger by its `alertId`.
+
+```bash
+curl --request GET \
+  --url https://api.dhan.co/v2/alerts/orders/{alertId} \
+  --header 'Accept: application/json' \
+  --header 'access-token: {JWT}'
+```
+
+**Response**
+
+```json
+{
+  "alertId": "12345",
+  "alertStatus": "ACTIVE",
+  "createdTime": "2019-08-24T14:15:22Z",
+  "triggeredTime": null,
+  "lastPrice": "245.50",
+  "condition": {
+    "comparisonType": "TECHNICAL_WITH_VALUE",
+    "exchangeSegment": "NSE_EQ",
+    "securityId": "12345",
+    "indicatorName": "SMA_5",
+    "timeFrame": "DAY",
+    "operator": "CROSSING_UP",
+    "comparingValue": "250.00",
+    "expDate": "2019-08-24",
+    "frequency": "ONCE",
+    "userNote": "Price crossing SMA"
+  },
+  "orders": [
+    {
+      "transactionType": "BUY",
+      "exchangeSegment": "NSE_EQ",
+      "productType": "CNC",
+      "orderType": "LIMIT",
+      "securityId": "12345",
+      "quantity": 10,
+      "validity": "DAY",
+      "price": "250.00",
+      "discQuantity": "0",
+      "triggerPrice": "0"
+    }
+  ]
+}
+```
+
+**Additional Response Fields**
+
+| Parameter | Data Type | Description |
+|-----------|-----------|-------------|
+| `alertId` | string | Unique identifier of the alert |
+| `alertStatus` | string | Status ([see Annexure](/api/v2/guides/annexure#status)) |
+| `createdTime` | string | Timestamp when alert was created |
+| `triggeredTime` | string | Timestamp when alert was triggered |
+| `lastPrice` | string | Last price of the instrument |
+
+---
+
+## Get All Conditional Orders
+
+Retrieve all conditional triggers for the authenticated account.
+
+```bash
+curl --request GET \
+  --url https://api.dhan.co/v2/alerts/orders \
+  --header 'Accept: application/json' \
+  --header 'access-token: {JWT}'
+```
+
+**Response** — Returns an array of trigger objects with the same structure as [Get by ID](#get-conditional-order-by-id).
+
+For description of enum values, refer to the [Annexure](/api/v2/guides/annexure).

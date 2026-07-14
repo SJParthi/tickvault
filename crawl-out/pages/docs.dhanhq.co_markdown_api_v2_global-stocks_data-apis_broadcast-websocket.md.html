@@ -1,0 +1,243 @@
+# Global Stocks Live Feed
+
+Real-time Global Stocks market data over WebSocket.
+
+The Global Stocks Live Feed streams real-time market data for supported international stocks. Client applications send JSON subscription requests, while the server sends compact binary market-data packets over WebSocket.
+
+- Protocol: WebSocket
+- Client request format: JSON
+- Server response format: binary WebSocket frames
+- Byte order: little-endian for all multi-byte numbers
+- Supported exchange segment: `INX_EQ`
+
+## Establishing Connection
+
+Open a WebSocket connection to:
+
+```text
+wss://global-stocks-api-feed.dhan.co/?clientId=<your-client-id>&token=<your-access-token>&authType=<type>&version=2
+```
+
+| Parameter | Required | Description |
+|-----------|----------|-------------|
+| `clientId` | Yes | Dhan Client ID. For partner authentication, pass the Partner ID. |
+| `token` | Yes | Access token. For partner authentication, pass the secret key. |
+| `authType` | Yes | `1` for Partner's Client, `2` for Self, `3` for Partner. |
+| `version` | Yes | Must be `2`. |
+
+On successful authentication, the connection remains open and can be used for subscriptions. On authentication failure, the server sends an Error packet and closes the connection.
+
+A maximum of 6 concurrent WebSocket connections are allowed per `clientId`. If a 7th connection is opened, the oldest connection is disconnected with error code `805`.
+
+## Request Messages
+
+All request messages are JSON. Each request contains a `requestCode`.
+
+| requestCode | Action |
+|-------------|--------|
+| `12` | Disconnect |
+| `15` | Subscribe Trade |
+| `16` | Unsubscribe Trade |
+| `17` | Subscribe OHLC |
+| `18` | Unsubscribe OHLC |
+
+### Subscribe or Unsubscribe
+
+Use this request structure for request codes `15`, `16`, `17`, and `18`.
+
+```json
+{
+  "requestCode": 15,
+  "instrumentCount": 2,
+  "instrumentList": [
+    { "exchangeSegment": "INX_EQ", "securityId": "1234" },
+    { "exchangeSegment": "INX_EQ", "securityId": "5678" }
+  ]
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `requestCode` | int | Request code for subscribing or unsubscribing Trade or OHLC data. |
+| `instrumentCount` | int | Number of instruments in `instrumentList`. Maximum 100 instruments per request. |
+| `instrumentList` | array | List of instruments to subscribe or unsubscribe. |
+| `instrumentList[].exchangeSegment` | string | Currently supported value: `INX_EQ`. |
+| `instrumentList[].securityId` | string | Security ID of the instrument. |
+
+Each connection supports up to 5000 total subscriptions. Trade and OHLC subscriptions are maintained independently for each instrument.
+
+### Disconnect
+
+```json
+{ "requestCode": 12 }
+```
+
+## Keeping Connection Alive
+
+The server sends WebSocket Ping frames approximately every 10 seconds. Most WebSocket libraries automatically reply with Pong frames.
+
+If 4 consecutive Ping frames are not answered, the server closes the connection.
+
+## Binary Response
+
+All market data is sent as binary WebSocket messages. A single WebSocket message can contain one packet or multiple packets concatenated together. Parse each message in a loop until the full binary buffer is consumed.
+
+### Packet Header
+
+Each normal market-data packet starts with an 11-byte header.
+
+| Offset | Size | Type | Field | Description |
+|--------|------|------|-------|-------------|
+| `0` | 1 | byte | `ExchSeg` | Exchange segment. `14` represents `INX_EQ`. |
+| `1` | 4 | int32 | `ScripId` | Security ID. |
+| `5` | 4 | int32 | `ScripId2` | Duplicate of Security ID. |
+| `9` | 1 | byte | `MsgLength` | Total packet length in bytes. |
+| `10` | 1 | byte | `MsgCode` | Packet type. |
+
+### Message Codes
+
+| MsgCode | Packet | Total Size |
+|---------|--------|------------|
+| `1` | Trade | 37 bytes |
+| `3` | OHLC | 27 bytes |
+| `29` | Market Status | 18 bytes |
+| `32` | Previous Close | 19 bytes |
+| `33` | Circuit Limit | 19 bytes |
+| `36` | 52-Week High/Low | 19 bytes |
+| `50` | Error | 10 bytes |
+
+## Packet Body Layouts
+
+### Trade Packet
+
+`MsgCode = 1`, total length 37 bytes.
+
+Binary layout: `<fhifiii`
+
+| Offset | Size | Type | Field |
+|--------|------|------|-------|
+| `11` | 4 | float32 | LTP - Last Traded Price |
+| `15` | 2 | int16 | LTQ - Last Traded Quantity |
+| `17` | 4 | int32 | Volume |
+| `21` | 4 | float32 | ATP - Average Traded Price |
+| `25` | 4 | int32 | OI - Open Interest |
+| `29` | 4 | int32 | LTT - Last Trade Time |
+| `33` | 4 | int32 | LUT - Last Update Time |
+
+### OHLC Packet
+
+`MsgCode = 3`, total length 27 bytes.
+
+Binary layout: `<ffff`
+
+| Offset | Size | Type | Field |
+|--------|------|------|-------|
+| `11` | 4 | float32 | Open |
+| `15` | 4 | float32 | Close |
+| `19` | 4 | float32 | High |
+| `23` | 4 | float32 | Low |
+
+### Previous Close Packet
+
+`MsgCode = 32`, total length 19 bytes.
+
+| Offset | Size | Type | Field |
+|--------|------|------|-------|
+| `11` | 4 | float32 | PClose - Previous Close |
+| `15` | 4 | float32 | POI - Previous Open Interest |
+
+### Circuit Limit Packet
+
+`MsgCode = 33`, total length 19 bytes.
+
+| Offset | Size | Type | Field |
+|--------|------|------|-------|
+| `11` | 4 | float32 | UCkt - Upper Circuit |
+| `15` | 4 | float32 | LCkt - Lower Circuit |
+
+### 52-Week High/Low Packet
+
+`MsgCode = 36`, total length 19 bytes.
+
+| Offset | Size | Type | Field |
+|--------|------|------|-------|
+| `11` | 4 | float32 | F52WKHIGH - 52-Week High |
+| `15` | 4 | float32 | F52WKLOW - 52-Week Low |
+
+### Market Status Packet
+
+`MsgCode = 29`, total length 18 bytes.
+
+| Offset | Size | Type | Field |
+|--------|------|------|-------|
+| `11` | 3 | [3]byte | MarketType |
+| `14` | 4 | int32 | MarketStatus |
+
+## Error Packet
+
+Error packets use `MsgCode = 50`, total length 10 bytes, and are sent as standalone binary messages. After sending the error packet, the server closes the connection.
+
+| Offset | Size | Type | Field |
+|--------|------|------|-------|
+| `0` | 1 | byte | MsgCode |
+| `1` | 2 | int16 | MsgLength |
+| `3` | 1 | byte | ExchSeg |
+| `4` | 4 | int32 | ScripId |
+| `8` | 2 | int16 | ErrCode |
+
+| ErrCode | Description |
+|---------|-------------|
+| `805` | Connection limit exceeded. |
+| `806` | Payment not done for broadcast. |
+| `807` | Token expired. |
+| `808` | Authentication failure. |
+| `809` | Invalid token. |
+
+## First Tick Snapshot
+
+After subscribing to Trade data, the server immediately sends the latest snapshot values for that instrument:
+
+- Trade packet, `MsgCode = 1`
+- Previous Close packet, `MsgCode = 32`
+- Circuit Limit packet, `MsgCode = 33`
+- 52-Week High/Low packet, `MsgCode = 36`
+
+After subscribing to OHLC data, the server sends an OHLC snapshot with `MsgCode = 3`.
+
+Previous Close, Circuit Limit, and 52-Week High/Low packets are delivered upfront on subscription. They are not part of every live Trade update.
+
+## Parsing Example
+
+```python
+SIZES = {1: 37, 3: 27, 29: 18, 32: 19, 33: 19, 36: 19, 50: 10}
+
+def on_binary_message(buf):
+    offset = 0
+    while offset < len(buf):
+        msg_length = buf[offset + 9]
+        msg_code = buf[offset + 10]
+        size = SIZES.get(msg_code, msg_length)
+
+        if size == 0 or offset + size > len(buf):
+            break
+
+        packet = buf[offset:offset + size]
+        dispatch(msg_code, packet)
+        offset += size
+```
+
+## Sample Decoded Packets
+
+```text
+Header: ExchSeg=14 ScripId=10008660 ScripId2=10008660 MsgLength=37 MsgCode=1
+Trade   | ScripId=10008660 LTP=21.39 LTQ=0 Vol=33064007 ATP=0.00 OI=0 LTT=1466625591 LUT=1782158394
+
+Header: ExchSeg=14 ScripId=10008660 ScripId2=10008660 MsgLength=19 MsgCode=32
+PClose  | ScripId=10008660 PClose=21.36 POI=0.00
+
+Header: ExchSeg=14 ScripId=10008660 ScripId2=10008660 MsgLength=19 MsgCode=33
+CktLmt  | ScripId=10008660 UCkt=27.77 LCkt=14.95
+
+Header: ExchSeg=14 ScripId=10008660 ScripId2=10008660 MsgLength=19 MsgCode=36
+52Week  | ScripId=10008660 High=58.15 Low=10.30
+```

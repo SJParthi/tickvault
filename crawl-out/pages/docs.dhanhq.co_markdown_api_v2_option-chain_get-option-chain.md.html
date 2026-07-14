@@ -1,0 +1,33 @@
+# Get Option Chain
+
+`POST` https://api.dhan.co/v2/optionchain
+
+Retrieve real-time Option Chain across exchanges for all underlying. You can fetch OI, Greeks, Volume, LTP, best bid/ask and IV across all strikes.
+
+Retrieve real-time Option Chain across exchanges for all underlying. You can fetch Open Interest (OI), Greeks, Volume, Last Traded Price, Best Bid/Ask and Implied Volatility (IV) across all strikes for any underlying.
+
+
+### Request Body Parameters
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| UnderlyingScrip | int | Yes | Security ID of underlying instrument (see Annexure) |
+| UnderlyingSeg | string | No | Exchange and segment of underlying (see Annexure) |
+| Expiry | string | No | Expiry date of option in YYYY-MM-DD (active expiries can be fetched from Expiry List API) |
+
+
+### Status Codes
+
+| Code | Description |
+|------|-------------|
+| 200 | Option chain data |
+
+
+### Example Request
+
+```bash
+curl -X POST https://api.dhan.co/v2/optionchain \
+  -H "access-token: <your-access-token>" \
+  -H "client-id: <your-client-id>" \
+  -H "Content-Type: application/json"
+```

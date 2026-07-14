@@ -1,0 +1,29 @@
+# Stop P&L Based Exit
+
+`DELETE` https://api.dhan.co/v2/pnlExit
+
+Disable the active P&L based exit configuration.
+
+> **NOTICE:** Order Placement, Modification and Cancellation APIs requires Static IP whitelisting - [refer here](/api/v2/guides/authentication#setup-static-ip)
+
+
+| Parameter | Data Type | Description |
+|-----------|-----------|-------------|
+| pnlExitStatus | string | P&L based exit status: `ACTIVE` `INACTIVE` |
+| message | string | Status of Conditional Trigger |
+
+
+### Status Codes
+
+| Code | Description |
+|------|-------------|
+| 200 | P&L exit stopped |
+| 401 | Unauthorized |
+
+
+### Example Request
+
+```bash
+curl -X DELETE https://api.dhan.co/v2/pnlExit \
+  -H "access-token: <your-access-token>"
+```

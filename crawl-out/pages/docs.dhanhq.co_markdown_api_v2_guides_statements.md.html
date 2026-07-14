@@ -1,0 +1,155 @@
+# Statement
+
+Retrieve trading account ledger reports and historical trade data
+
+Retrieve your trade and ledger details to help summarise and analyse your trades.
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/ledger` | Retrieve Trading Account debit and credit details |
+| GET | `/trades/{from}/{to}/{page}` | Retrieve historical trade data |
+
+---
+
+## Ledger Report
+
+Retrieve Trading Account Ledger Report with all credit and debit transaction details for a particular time interval.
+
+```bash
+curl --request GET \
+  --url 'https://api.dhan.co/v2/ledger?from-date={YYYY-MM-DD}&to-date={YYYY-MM-DD}' \
+  --header 'Accept: application/json' \
+  --header 'access-token: {JWT}'
+```
+
+**Query Parameters**
+
+| Field | Description |
+|-------|-------------|
+| `from-date`* | Start date in format `YYYY-MM-DD` |
+| `to-date`* | End date in format `YYYY-MM-DD` |
+
+**Response**
+
+```json
+{
+    "dhanClientId": "<your-client-id>",
+    "narration": "FUNDS WITHDRAWAL",
+    "voucherdate": "Jun 22, 2022",
+    "exchange": "NSE-CAPITAL",
+    "voucherdesc": "PAYBNK",
+    "vouchernumber": "202200036701",
+    "debit": "20000.00",
+    "credit": "0.00",
+    "runbal": "957.29"
+}
+```
+
+
+---
+
+## Trade History
+
+Retrieve detailed trade history for all orders for a particular time frame. Response is paginated — pass page number as path parameter.
+
+```bash
+curl --request GET \
+  --url https://api.dhan.co/v2/trades/{from-date}/{to-date}/{page} \
+  --header 'Accept: application/json' \
+  --header 'access-token: {JWT}'
+```
+
+**Path Parameters**
+
+| Field | Description |
+|-------|-------------|
+| `from-date`* | Start date in format `YYYY-MM-DD` |
+| `to-date`* | End date in format `YYYY-MM-DD` |
+| `page`* | Page number (pass `0` as default) |
+
+**Response**
+
+```json
+[
+    {
+        "dhanClientId": "<your-client-id>",
+        "orderId": "212212307731",
+        "exchangeOrderId": "76036896",
+        "exchangeTradeId": "407958",
+        "transactionType": "BUY",
+        "exchangeSegment": "NSE_EQ",
+        "productType": "CNC",
+        "orderType": "MARKET",
+        "tradingSymbol": null,
+        "customSymbol": "Tata Motors",
+        "securityId": "3456",
+        "tradedQuantity": 1,
+        "tradedPrice": 390.9,
+        "isin": "INE155A01022",
+        "instrument": "EQUITY",
+        "sebiTax": 0.0004,
+        "stt": 0,
+        "brokerageCharges": 0,
+        "serviceTax": 0.0025,
+        "exchangeTransactionCharges": 0.0135,
+        "stampDuty": 0,
+        "createTime": "NA",
+        "updateTime": "NA",
+        "exchangeTime": "2022-12-30 10:00:46",
+        "drvExpiryDate": "NA",
+        "drvOptionType": "NA",
+        "drvStrikePrice": 0
+    }
+]
+```
+
+
+For description of enum values, refer to the [Annexure](/api/v2/guides/annexure).
+
+
+### Response Fields
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| dhanClientId | string | No | User specific identification |
+| narration | string | No | Description of the ledger transaction |
+| voucherdate | string | No | Transaction Date |
+| exchange | string | No | Exchange information for the transaction |
+| voucherdesc | string | No | Nature of transaction |
+| vouchernumber | string | No | System generated transaction number |
+| debit | string | No | Debit amount (only when credit returns 0) |
+| credit | string | No | Credit amount (only when debit returns 0) |
+| runbal | string | No | Running Balance post transaction |
+
+
+### Response Fields
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| dhanClientId | string | No | User specific identification |
+| orderId | string | No | Order specific identification by Dhan |
+| exchangeOrderId | string | No | Order specific identification by exchange |
+| exchangeTradeId | string | No | Trade specific identification by exchange |
+| transactionType | enum | No | or Values: `BUY`, `SELL`. |
+| exchangeSegment | enum | No | Exchange Segment ([Annexure](/api/v2/guides/annexure#exchange-segment)) |
+| productType | enum | No | Values: `CNC`, `INTRADAY`, `MARGIN`, `MTF`. |
+| orderType | enum | No | Values: `LIMIT`, `MARKET`, `STOP_LOSS`, `STOP_LOSS_MARKET`. |
+| tradingSymbol | string | No | Symbol ([Instruments](/api/v2/guides/instruments)) |
+| customSymbol | string | No | Trading Symbol as per Dhan |
+| securityId | string | No | Exchange standard ID |
+| tradedQuantity | int | No | Number of shares executed |
+| tradedPrice | float | No | Price at which trade is executed |
+| isin | string | No | Universal standard ID |
+| instrument | string | No | or Values: `EQUITY`, `DERIVATIVES`. |
+| sebiTax | string | No | SEBI Turnover Charges |
+| stt | string | No | Securities Transactions Tax |
+| brokerageCharges | string | No | Brokerage charges ([pricing](https://dhan.co/pricing/)) |
+| serviceTax | string | No | Applicable Service Tax |
+| exchangeTransactionCharges | string | No | Exchange Transaction Charge |
+| stampDuty | string | No | Stamp Duty Charges |
+| createTime | string | No | Time at which the order is created |
+| updateTime | string | No | Time at which the last activity happened |
+| exchangeTime | string | No | Time at which order reached exchange |
+| drvExpiryDate | int | No | Expiry date for F&O contracts |
+| drvOptionType | enum | No | or Values: `CALL`, `PUT`. |
+| drvStrikePrice | float | No | Strike Price for Options |

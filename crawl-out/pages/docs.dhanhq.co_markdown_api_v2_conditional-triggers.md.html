@@ -1,0 +1,17 @@
+# Conditional and Multi Order
+
+Conditional and Multi Order
+
+When the conditional order is triggered, you will receive a postback update if set up [here](/api/v2/guides/postback).
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| POST | `/alerts/orders` | Place Conditional Order |
+| POST | `/alerts/multi/orders` | Place Multi Order |
+| PUT | `/alerts/orders/{alertId}` | Modify Conditional Order |
+| DELETE | `/alerts/orders/{alertId}` | Delete Conditional Order |
+| GET | `/alerts/orders/{alertId}` | Get Conditional Order by ID |
+| GET | `/alerts/orders` | Get All Conditional Orders |
+
+> **note:** - Conditional Orders are currently supported only for Equities and Indices.
+> - You can receive a postback update by providing a Webhook URL ([here](/api/v2/guides/postback)) while generating the Access Token.

@@ -1,0 +1,51 @@
+# Order Estimator
+
+`POST` https://api.dhan.co/v2/globalstocks/transEstimate
+
+Estimate the applicable charges for a US stock order before submitting it.
+
+
+
+
+### Request Body Parameters
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| securityId | string | Yes | Exchange standard ID for the scrip |
+| price | string | Yes | Order price in USD. Use 0 for market orders. |
+| quantity | string | Yes | Order quantity |
+| transactionType | enum | Yes | The trading side Values: `BUY`, `SELL`. Default: `BUY`. |
+
+
+### Response Fields
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| brokerage | number<float> | No | Brokerage charges |
+| orderCharges | number<float> | No | Total order charges |
+| exchangeCharges | number<float> | No | Exchange charges |
+| turnOverFee | number<float> | No | Turnover fee |
+| gstCharges | number<float> | No | GST charges |
+| otherCharges | number<float> | No | Other charges |
+
+
+### Status Codes
+
+| Code | Description |
+|------|-------------|
+| 200 | Transaction estimate |
+
+
+### Example Request
+
+```bash
+curl -X POST https://api.dhan.co/v2/globalstocks/transEstimate \
+  -H "access-token: <your-access-token>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "securityId": "AAPL",
+    "price": "180",
+    "quantity": "1",
+    "transactionType": "BUY"
+  }'
+```

@@ -1,0 +1,83 @@
+# Error Handling
+
+DhanHQ API error types and response format
+
+All DhanHQ API error responses follow a consistent structure.
+
+## Error Response Format
+
+```json
+{
+  "status": "failure",
+  "errorType": "VALIDATION_ERROR",
+  "errorCode": "E001",
+  "errorMessage": "Invalid security ID"
+}
+```
+
+## Error Types
+
+| Error Type | HTTP Code | Description |
+|------------|-----------|-------------|
+| `VALIDATION_ERROR` | 400 | Invalid request parameters |
+| `AUTHENTICATION_ERROR` | 401 | Invalid or expired access token |
+| `AUTHORIZATION_ERROR` | 403 | Insufficient permissions |
+| `RATE_LIMIT_ERROR` | 429 | Too many requests |
+| `INTERNAL_ERROR` | 500 | Server-side error |
+
+## Handling in Python
+
+```python
+from dhanhq import DhanContext, dhanhq
+
+context = DhanContext("client_id", "access_token")
+dhan = dhanhq(context)
+
+response = dhan.place_order(
+    security_id="1333",
+    exchange_segment="NSE_EQ",
+    transaction_type="BUY",
+    quantity=10,
+    order_type="MARKET",
+    product_type="INTRADAY"
+)
+
+if response.get("status") == "failure":
+    error_type = response.get("errorType")
+    error_msg = response.get("errorMessage")
+    print(f"Error [{error_type}]: {error_msg}")
+```
+
+## Common Error Scenarios
+
+### Invalid Security ID
+```json
+{
+  "status": "failure",
+  "errorType": "VALIDATION_ERROR",
+  "errorCode": "E001",
+  "errorMessage": "Invalid security ID"
+}
+```
+
+### Expired Token
+```json
+{
+  "status": "failure",
+  "errorType": "AUTHENTICATION_ERROR",
+  "errorCode": "AUTH001",
+  "errorMessage": "Invalid or expired access token"
+}
+```
+
+### Rate Limit Exceeded
+```json
+{
+  "status": "failure",
+  "errorType": "RATE_LIMIT_ERROR",
+  "errorCode": "RL001",
+  "errorMessage": "Too many requests. Please retry after 1 second."
+}
+```
+
+> **Retry Strategy:** For `RATE_LIMIT_ERROR`, implement exponential backoff with a minimum delay of 1 second between retries.

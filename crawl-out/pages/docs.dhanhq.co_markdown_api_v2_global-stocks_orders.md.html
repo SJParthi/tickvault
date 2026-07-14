@@ -1,0 +1,13 @@
+# Orders
+
+Global Stocks Orders
+
+The Global Stocks order management API lets you place a new order, modify or cancel a pending order, and retrieve the order book.
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| POST | `/globalstocks/orders` | Place a buy or sell order for a US stock using the selected order type, quantity, and price details. |
+| PUT | `/globalstocks/orders/{order-id}` | Modify an existing pending US stock order by submitting updated order details for the given order ID. |
+| DELETE | `/globalstocks/orders/{order-id}` | Cancel an existing pending US stock order using its order ID. |
+| GET | `/globalstocks/orders/{order-id}` | Retrieve the latest order details and status for a specific US stock order using its order ID. |
+| GET | `/globalstocks/orders` | Retrieve the current trading day's US stock order book for the authenticated user. |

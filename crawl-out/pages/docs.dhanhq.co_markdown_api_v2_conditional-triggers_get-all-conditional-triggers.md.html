@@ -1,0 +1,23 @@
+# Get All Conditional Orders
+
+`GET` https://api.dhan.co/v2/alerts/orders
+
+Retrieve all conditional triggers for the authenticated account.
+
+Retrieve a list of all conditional triggers for the authenticated account, along with their current status and configuration details.
+
+
+### Status Codes
+
+| Code | Description |
+|------|-------------|
+| 200 | List of conditional triggers |
+| 401 | Unauthorized |
+
+
+### Example Request
+
+```bash
+curl -X GET https://api.dhan.co/v2/alerts/orders \
+  -H "access-token: <your-access-token>"
+```

@@ -1,0 +1,10 @@
+# Option Chain
+
+Option Chain
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| POST | `/optionchain` | Get Option Chain of any instrument |
+| POST | `/optionchain/expirylist` | Expiry List for Options of Underlying |
+
+> **Info:** Rate limit for Option Chain API is set to one unique request every 3 seconds. This means you can fetch entire option chain for multiple different underlying instrument or multiple expiries of same instrument concurrently every 3 seconds.

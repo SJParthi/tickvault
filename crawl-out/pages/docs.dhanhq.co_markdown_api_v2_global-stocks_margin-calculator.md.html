@@ -1,0 +1,50 @@
+# Margin Calculator
+
+`POST` https://api.dhan.co/v2/globalstocks/margincalculator
+
+Calculate the margin required for a US stock order before submitting it.
+
+
+
+
+### Request Body Parameters
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| securityId | string | Yes | Exchange standard ID for the scrip |
+| price | string | Yes | Order price in USD. Use 0 for market orders. |
+| quantity | string | Yes | Order quantity |
+| transactionType | enum | Yes | The trading side Values: `BUY`, `SELL`. Default: `BUY`. |
+
+
+### Response Fields
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| brokerage | number<float> | No | Brokerage |
+| leverage | string | No | Leverage |
+| insufficientBal | number<float> | No | Insufficient balance |
+| totalMargin | number<float> | No | Total margin required |
+| availableBal | number<float> | No | Available balance |
+
+
+### Status Codes
+
+| Code | Description |
+|------|-------------|
+| 200 | Margin calculation result |
+
+
+### Example Request
+
+```bash
+curl -X POST https://api.dhan.co/v2/globalstocks/margincalculator \
+  -H "access-token: <your-access-token>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "securityId": "AAPL",
+    "price": "180",
+    "quantity": "1",
+    "transactionType": "BUY"
+  }'
+```

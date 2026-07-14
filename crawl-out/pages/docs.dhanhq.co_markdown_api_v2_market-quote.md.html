@@ -1,0 +1,13 @@
+# Market Quote
+
+Market Quote
+
+This API gives you snapshots of multiple instruments at once. You can fetch LTP, Quote or Market Depth of instruments via API which sends real time data at the time of API request.
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| POST | `/marketfeed/ltp` | Get ticker data of instruments |
+| POST | `/marketfeed/ohlc` | Get OHLC data of instruments |
+| POST | `/marketfeed/quote` | Get market depth data of instruments |
+
+> **Info:** You can fetch upto 1000 instruments in single API request with rate limit of 1 request per second.

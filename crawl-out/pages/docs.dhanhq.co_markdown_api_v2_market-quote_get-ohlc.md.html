@@ -1,0 +1,38 @@
+# Get OHLC
+
+`POST` https://api.dhan.co/v2/marketfeed/ohlc
+
+Get OHLC (Open, High, Low, Close) data for instruments.
+
+Retrieve the Open, High, Low and Close price along with LTP for specified list of instruments.
+
+
+### Request Body Parameters
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| NSE_EQ | int-array | No | List of NSE Equity security IDs as integers (comma-separated, e.g. 1333, 11536) |
+| NSE_FNO | int-array | No | List of NSE F&O security IDs as integers (comma-separated, e.g. 49081, 49082) |
+| BSE_EQ | int-array | No | List of BSE Equity security IDs as integers (comma-separated) |
+
+
+### Status Codes
+
+| Code | Description |
+|------|-------------|
+| 200 | OHLC data |
+
+
+### Example Request
+
+```bash
+curl --request POST \
+  --url https://api.dhan.co/v2/marketfeed/ohlc \
+  --header 'Accept: application/json' \
+  --header 'Content-Type: application/json' \
+  --header 'access-token: <your-access-token>' \
+  --header 'client-id: <your-client-id>' \
+  --data '{
+    "NSE_EQ": [11536]
+  }'
+```

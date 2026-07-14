@@ -1,0 +1,12 @@
+# Super Order
+
+Super Order
+
+This particular set of APIs can be used to create, modify and cancel super orders. You can place super orders across all exchanges and segments.
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| POST | `/super/orders` | Create a new super order |
+| PUT | `/super/orders/{order-id}` | Modify a pending super order |
+| DELETE | `/super/orders/{order-id}/{order-leg}` | Cancel a pending super order leg |
+| GET | `/super/orders` | Retrieve the list of all super orders |

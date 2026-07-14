@@ -1,0 +1,28 @@
+# Exit All Positions
+
+`DELETE` https://api.dhan.co/v2/positions
+
+Exit all open positions at market price.
+
+Exit all active positions and cancel all open orders for the current trading day.
+
+
+> **NOTICE:** Order Placement, Modification and Cancellation APIs requires Static IP whitelisting - [refer here](/api/v2/guides/authentication#setup-static-ip)
+
+
+No response body. On successful completion of request, `202 Accepted` response status code will appear.
+
+
+### Status Codes
+
+| Code | Description |
+|------|-------------|
+| 200 | All positions exited |
+
+
+### Example Request
+
+```bash
+curl -X DELETE https://api.dhan.co/v2/positions \
+  -H "access-token: <your-access-token>"
+```

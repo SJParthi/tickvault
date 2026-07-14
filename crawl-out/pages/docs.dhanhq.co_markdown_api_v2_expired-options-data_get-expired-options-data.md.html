@@ -1,0 +1,60 @@
+# Historical Rolling Options Data
+
+`POST` https://api.dhan.co/v2/charts/rollingoption
+
+Fetch expired options contract data on a rolling basis with OHLC, IV, OI and spot information. Up to 45 days per call. Last 5 years available.
+
+Fetch expired options data on a rolling basis, along with the Open Interest, Implied Volatility, OHLC, Volume as well as information about the spot. You can fetch for upto 45 days of data in a single API call. Expired options data is stored on a minute level, based on strike price relative to spot (example ATM, ATM+10, ATM-10, etc.).
+
+You can fetch data upto last 5 years. We have added both Index Options and Stock Options data on this.
+
+
+### Request Body Parameters
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| exchangeSegment | enum | No | Exchange & Segment Values: `NSE_FNO`, `BSE_FNO`. Default: `NSE_FNO`. |
+| interval | enum | No | Minute intervals Values: `1`, `5`, `15`, `30`, `60`. Default: `5`. |
+| securityId | string | No | Underlying security ID |
+| instrument | enum | No | Instrument type Values: `OPTIDX`, `OPTSTK`. Default: `OPTIDX`. |
+| expiryFlag | enum | No | Expiry Flag Values: `WEEK`, `MONTH`. Default: `WEEK`. |
+| expiryCode | enum | No | 1=Near, 2=Next, 3=Far Values: `1`, `2`, `3`. Default: `1`. |
+| strike | string | No | ATM, ATM+10, ATM-10 |
+| drvOptionType | enum | No | Option Type Values: `CALL`, `PUT`. Default: `CALL`. |
+| requiredData | array | No | Array of data fields: open, high, low, close, iv, volume, strike, oi, spot Values: `open`, `high`, `low`, `close`, `iv`, `volume`, `strike`, `oi`, `spot`. |
+| fromDate | string | No | Start Date (YYYY-MM-DD) |
+| toDate | string | No | End Date (YYYY-MM-DD) |
+
+
+### Response Fields
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| data.ce.open | array | No | Array of open prices for CE |
+| data.ce.high | array | No | Array of high prices for CE |
+| data.ce.low | array | No | Array of low prices for CE |
+| data.ce.close | array | No | Array of close prices for CE |
+| data.ce.volume | array | No | Array of volumes for CE |
+| data.ce.iv | array | No | Array of implied volatilities for CE |
+| data.ce.oi | array | No | Array of open interest for CE |
+| data.ce.spot | array | No | Array of underlying spot prices for CE |
+| data.ce.strike | array | No | Array of strike prices for CE |
+| data.ce.timestamp | array | No | Array of epoch timestamps for CE |
+| data.pe | object | No | Object containing PE data points analogous to CE |
+
+
+### Status Codes
+
+| Code | Description |
+|------|-------------|
+| 200 | Expired options data |
+| 401 | Unauthorized |
+
+
+### Example Request
+
+```bash
+curl -X POST https://api.dhan.co/v2/charts/rollingoption \
+  -H "access-token: <your-access-token>" \
+  -H "Content-Type: application/json"
+```
