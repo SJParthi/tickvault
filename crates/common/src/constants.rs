@@ -2151,6 +2151,23 @@ pub const GROWW_CHAIN_1M_CONSECUTIVE_FAIL_PAGE_THRESHOLD: u32 = 3;
 /// to disabled-for-the-day (NEVER a guessed expiry).
 pub const GROWW_CHAIN_1M_MASTER_RETRY_BACKOFF_SECS: [u64; 2] = [3, 6];
 
+/// Consecutive counted not-served minutes for ONE underlying before the
+/// ONE edge-latched per-underlying `CHAIN-02 stage="underlying_not_served"`
+/// page fires (2026-07-14 — the NIFTY expiry-day vendor cutoff companion:
+/// Groww stopped serving the same-day-expiring NIFTY chain at 14:54 IST
+/// while BANKNIFTY + SENSEX kept working, and the ok==0 escalation edge
+/// paged nobody all afternoon). A minute COUNTS toward an underlying's
+/// streak only when that underlying's chain came back empty/failed while
+/// ≥1 OTHER underlying succeeded in the SAME minute — a global-outage
+/// minute (zero underlyings served) neither counts nor resets, so this
+/// detector distinguishes vendor-not-serving-this-underlying from a
+/// general outage (which the
+/// [`GROWW_CHAIN_1M_CONSECUTIVE_FAIL_PAGE_THRESHOLD`] edge owns — the two
+/// are mutually exclusive per minute). Re-armed only by that underlying's
+/// own recovery. Same value as the spot leg's
+/// [`SPOT_1M_REST_SID_NOT_SERVED_THRESHOLD`] (the pattern it mirrors).
+pub const GROWW_CHAIN_1M_UNDERLYING_NOT_SERVED_THRESHOLD: u32 = 10;
+
 const _: () = assert!(
     GROWW_CHAIN_1M_CONSECUTIVE_FAIL_PAGE_THRESHOLD == SPOT_1M_REST_CONSECUTIVE_FAIL_PAGE_THRESHOLD,
     "the Groww chain leg reuses the spot FailureEdge — thresholds must agree"
@@ -4555,6 +4572,14 @@ mod tests {
         );
         // Warmup master-download retries: bounded, 3 attempts total.
         assert_eq!(GROWW_CHAIN_1M_MASTER_RETRY_BACKOFF_SECS, [3, 6]);
+        // Per-underlying not-served detector threshold (~10 minutes) —
+        // mirrors the spot leg's per-SID detector (2026-07-14, the NIFTY
+        // expiry-day vendor-cutoff companion).
+        assert_eq!(GROWW_CHAIN_1M_UNDERLYING_NOT_SERVED_THRESHOLD, 10);
+        assert_eq!(
+            GROWW_CHAIN_1M_UNDERLYING_NOT_SERVED_THRESHOLD,
+            SPOT_1M_REST_SID_NOT_SERVED_THRESHOLD
+        );
     }
 
     /// PR-4 (Groww contract leg): the fill-model leg's pacing + envelope
