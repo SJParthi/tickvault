@@ -281,3 +281,148 @@ fn ratchet_chain1m_strike_is_parse_only_never_computed() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// 2026-07-14 chain-capture hardening ratchets (runbook:
+// `.claude/rules/project/cross-source-chain-coverage-2026-07-14.md`)
+// ---------------------------------------------------------------------------
+
+/// Byte span of `fire_one_chain_minute` in option_chain_1m_boot.rs
+/// (start..next top-level fn) — the region the concurrency + retry pins
+/// scan.
+fn chain_fire_span(module_src: &str) -> &str {
+    let start = module_src
+        .find("async fn fire_one_chain_minute(")
+        .expect("fire_one_chain_minute must exist in option_chain_1m_boot.rs");
+    let rest = &module_src[start..];
+    let end = rest[1..].find("\nfn ").map_or(rest.len(), |off| off + 1);
+    &rest[..end]
+}
+
+/// The fire keeps its Dhan-DOCUMENTED JoinSet concurrency (distinct
+/// underlyings concurrently; the 3s bound is per unique
+/// (underlying, expiry) key) — a future sequentialization must be a
+/// deliberate, rule-edited change, and the doc quote must stay at the
+/// spawn site as the in-code authority.
+#[test]
+fn ratchet_chain_fire_keeps_joinset_concurrency() {
+    let module_src = read_app_src("src/option_chain_1m_boot.rs");
+    let fire = chain_fire_span(&module_src);
+    assert!(
+        fire.contains("JoinSet"),
+        "fire_one_chain_minute lost its JoinSet — the Dhan-documented \
+         concurrent-distinct fire must not be silently sequentialized \
+         (cross-source-chain-coverage-2026-07-14.md rule-edit required)"
+    );
+    // The quote is a wrapped comment block — normalize the wrapping
+    // before matching the doc fragment.
+    let normalized: String = fire
+        .lines()
+        .map(|l| l.trim_start().trim_start_matches("//").trim())
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        normalized.contains("concurrently every 3 seconds"),
+        "the Dhan option-chain rate-limit doc quote must stay at the \
+         spawn site (the in-code authority for keeping concurrency)"
+    );
+}
+
+/// The phase-2 retry pass is wired into the fire AND launch-gated by the
+/// decision ceiling; refused retries are counted, never silent.
+#[test]
+fn ratchet_chain_retry_pass_is_ceiling_gated() {
+    let module_src = read_app_src("src/option_chain_1m_boot.rs");
+    let fire = chain_fire_span(&module_src);
+    assert!(
+        fire.contains("chain_retry_pass("),
+        "fire_one_chain_minute lost its phase-2 retry pass call"
+    );
+    for needle in [
+        // The ceiling gate chain: pass → decision → allowed.
+        "chain_retry_allowed(",
+        "retry_launch_elapsed_ms(",
+        "CHAIN_1M_DECISION_CEILING_SECS",
+        // Refused retries are COUNTED (never silent).
+        "\"skipped_ceiling\"",
+        "tv_chain1m_retry_total",
+        "retry_skipped_ceiling",
+    ] {
+        assert!(
+            module_src.contains(needle),
+            "option_chain_1m_boot.rs lost its `{needle}` wiring — the \
+             bounded retry must stay ceiling-gated with counted refusals"
+        );
+    }
+}
+
+/// The not-served counter's `underlying` label comes from the pinned
+/// static symbols (`target.symbol` via the verdict tuple) — never a
+/// runtime-built string (static-label discipline, 3 label values).
+#[test]
+fn ratchet_not_served_counter_labels_static_underlying_symbols() {
+    let module_src = read_app_src("src/option_chain_1m_boot.rs");
+    // The single EMISSION site: the counter-name literal with the STATIC
+    // `underlying` binding as its label (a &'static str from the pinned
+    // symbols) — never a runtime-built string.
+    let macro_literal = r#""tv_chain1m_underlying_not_served_total", "underlying" => underlying"#;
+    let pos = module_src.find(macro_literal).unwrap_or_else(|| {
+        panic!(
+            "the not-served counter emission must label with the static \
+             `underlying` binding — literal `{macro_literal}` not found"
+        )
+    });
+    // No runtime label construction anywhere near the emission.
+    let window = &module_src[pos.saturating_sub(200)..(pos + 200).min(module_src.len())];
+    assert!(
+        !window.contains("format!"),
+        "the not-served counter label must never be runtime-built: {window}"
+    );
+    // And the verdict tuples feed the pinned static symbols.
+    assert!(
+        module_src.contains("served_verdicts.push((") && module_src.contains("target.symbol"),
+        "the verdict line must push the pinned static target.symbol"
+    );
+}
+
+/// All 3 mid-session trading-day flip exits (chain loop + spot
+/// per-minute loop + spot batch loop) are coded + counted; the bare
+/// info-only exit form is gone.
+#[test]
+fn ratchet_trading_day_flip_exits_are_coded() {
+    let chain_src = read_app_src("src/option_chain_1m_boot.rs");
+    let spot_src = read_app_src("src/spot_1m_rest_boot.rs");
+    assert_eq!(
+        chain_src
+            .matches("stage = \"trading_day_flip_exit\"")
+            .count(),
+        1,
+        "the chain loop must carry exactly ONE coded trading-day flip exit"
+    );
+    assert!(
+        chain_src.contains("tv_chain1m_trading_day_flip_exit_total"),
+        "the chain flip exit lost its counter"
+    );
+    assert_eq!(
+        spot_src
+            .matches("stage = \"trading_day_flip_exit\"")
+            .count(),
+        2,
+        "the spot leg must carry exactly TWO coded flip exits (per-minute \
+         loop + batch loop)"
+    );
+    assert!(
+        spot_src.contains("tv_spot1m_trading_day_flip_exit_total"),
+        "the spot flip exits lost their counter"
+    );
+    for (name, src) in [
+        ("option_chain_1m_boot.rs", chain_src.as_str()),
+        ("spot_1m_rest_boot.rs", spot_src.as_str()),
+    ] {
+        assert!(
+            !src.contains("no longer a trading day — exiting"),
+            "{name} regressed to the bare info-only trading-day exit — \
+             flip exits must stay coded + counted"
+        );
+    }
+}
