@@ -2653,6 +2653,11 @@ pub const ORDER_READINESS_MAX_AGE_SECS: u64 = 2_100;
 /// Minimum effective token headroom for a live order (mirrors pre_market_check's
 /// 4h AUTH-GAP-01 threshold; strict `<` refuses). Decayed per-order from the probe snapshot.
 pub const ORDER_TOKEN_HEADROOM_MIN_SECS: u64 = 14_400;
+/// Backoff before the order-readiness refresher supervisor respawns a dead
+/// probe-loop task (mirrors the house `spawn_supervised_*` 5s cadence —
+/// WS-GAP-05 / DISK-WATCHER-01). A panicking app-supplied probe is caught and
+/// the loop respawned so the fail-closed gate never silently stops refreshing.
+pub const ORDER_READINESS_REFRESHER_RESPAWN_BACKOFF_SECS: u64 = 5;
 
 const _: () = assert!(
     ORDER_READINESS_MAX_AGE_SECS > 2 * ORDER_READINESS_REFRESH_INTERVAL_SECS,
