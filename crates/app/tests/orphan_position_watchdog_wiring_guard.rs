@@ -20,9 +20,12 @@
 //!  2. The family-site spawn INSIDE `spawn_post_market_tasks` (fast
 //!     crash-recovery coverage, `WatchdogAuth::Static`) — exactly 2 spawn
 //!     occurrences total; a third/moved spawn trips the count.
-//!  3. The boot module resolves `global_token_manager()` at fire time and
-//!     carries the no-manager degraded wording (stub-guard — the fallback
-//!     cannot be hollowed out into a silent skip).
+//!  3. The boot module resolves the session at fire time — live lane-owned
+//!     manager PREFERRED, global OnceLock as the fallback (review round 1,
+//!     2026-07-14: the D2c staleness class) — and carries the no-manager
+//!     degraded wording (stub-guard — the fallback cannot be hollowed out
+//!     into a silent skip). Pinned via CODE-SHAPED needles (real call
+//!     expressions), so a comment can never satisfy the assert.
 //!
 //! Mirrors the codebase's `*_is_wired` guard pattern
 //! (`instrument_build_failed_wiring_guard.rs`, `daily_universe_boot_wiring_guard.rs`).
@@ -102,22 +105,39 @@ fn test_orphan_position_watchdog_exactly_two_spawn_sites() {
 
 #[test]
 fn test_watchdog_boot_module_resolves_global_token_manager_at_fire_time() {
-    // Stub-guard: the boot module must (a) read `global_token_manager()` at
-    // fire time for the GlobalAtFireTime arm (the read deliberately lives in
-    // the module, NOT main.rs — main.rs ratchets exactly one such read in its
-    // production region), and (b) carry the no-manager degraded arm's wording
-    // + failure counter so the fallback cannot be hollowed out into a silent
-    // skip (audit Rule 11 — never a clean signal on a failed check).
+    // Stub-guard: the boot module must (a) resolve the session at fire time
+    // for the GlobalAtFireTime arm — live lane-owned manager PREFERRED, the
+    // global OnceLock as fallback (review round 1, 2026-07-14; the reads
+    // deliberately live in the module, NOT main.rs — main.rs ratchets
+    // exactly one `global_token_manager()` read in its production region),
+    // and (b) carry the no-manager degraded arm's wording + failure counter
+    // so the fallback cannot be hollowed out into a silent skip (audit Rule
+    // 11 — never a clean signal on a failed check). The needles below are
+    // CODE-SHAPED (real match-arm / call expressions from the resolver), so
+    // a comment mentioning the fn names can never satisfy this assert.
     let src = watchdog_boot_source();
+    let resolver_start = src
+        .find("fn resolve_watchdog_session(")
+        .expect("orphan_position_watchdog_boot.rs must define fn resolve_watchdog_session(");
+    let resolver = &src[resolver_start..];
     assert!(
-        src.contains("global_token_manager()"),
-        "orphan_position_watchdog_boot.rs must resolve global_token_manager() \
-         at fire time for the GlobalAtFireTime arm."
+        resolver
+            .contains("WatchdogAuth::GlobalAtFireTime { feed_runtime } => prefer_live_session("),
+        "the GlobalAtFireTime match arm must route through prefer_live_session \
+         (the live-first resolution — code-shaped needle)."
     );
+    let live_pos = resolver
+        .find("feed_runtime.live_token_manager(),")
+        .expect("the resolver must read the live lane-owned manager (code-shaped needle)");
+    let global_pos = resolver
+        .find("global_token_manager().cloned(),")
+        .expect("the resolver must keep the global OnceLock fallback (code-shaped needle)");
     assert!(
-        src.contains("GlobalAtFireTime"),
-        "orphan_position_watchdog_boot.rs must define the \
-         WatchdogAuth::GlobalAtFireTime arm."
+        live_pos < global_pos,
+        "the resolver must PREFER the live lane-owned manager (its read must \
+         come before the global fallback in the prefer_live_session args) — \
+         otherwise a runtime lane stop→re-start pins the dead boot manager \
+         (the D2c staleness class)."
     );
     assert!(
         src.contains("no broker session at 15:25 IST"),

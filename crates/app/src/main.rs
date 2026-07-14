@@ -3282,15 +3282,20 @@ async fn main() -> Result<()> {
     // Dhan-gated `spawn_post_market_tasks` — dead on dhan-off boots since
     // 2026-07-13 (the Dhan live-WS retirement flipped `dhan_enabled = false`
     // in prod, so the daily broker-position cross-check never ran); this
-    // process-global spawn closes it. `GlobalAtFireTime` resolves the global
-    // TokenManager (registered by the Dhan lane OR the Dhan REST stack's
-    // Phase 2) at each 15:25 fire — no manager = LOUD degraded Critical page,
-    // never a clean signal. The fast crash-recovery arm keeps its Static
+    // process-global spawn closes it. `GlobalAtFireTime` resolves the session
+    // at each 15:25 fire, PREFERRING the live lane-owned TokenManager (fresh
+    // across a runtime lane stop→re-start — the D2c gauge pattern) and
+    // falling back to the global TokenManager (registered by the Dhan lane
+    // OR the Dhan REST stack's Phase 2) — no manager anywhere = LOUD degraded
+    // Critical page, never a clean signal. The fast crash-recovery arm keeps
+    // its Static
     // spawn via `spawn_post_market_tasks` (that arm early-returns before this
     // block); the module's once-guard makes a duplicate spawn a no-op.
     let _orphan_watchdog_global_handle =
         tickvault_app::orphan_position_watchdog_boot::spawn_supervised_orphan_position_watchdog(
-            tickvault_app::orphan_position_watchdog_boot::WatchdogAuth::GlobalAtFireTime,
+            tickvault_app::orphan_position_watchdog_boot::WatchdogAuth::GlobalAtFireTime {
+                feed_runtime: std::sync::Arc::clone(&feed_runtime),
+            },
             notifier.clone(),
             std::sync::Arc::clone(&trading_calendar),
             config.dhan.rest_api_base_url.clone(),

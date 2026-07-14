@@ -566,13 +566,17 @@ impl TokenManager {
 
     /// Returns the Dhan client id as a plain `String`.
     ///
-    /// The client id is NOT secret-classed in practice — it travels as a
-    /// plain `client-id` / `dhanClientId` HTTP header on every Dhan REST
-    /// call (see `OrderApiClient::auth_headers` and the `RenewToken`
-    /// header at the renewal site). This accessor exists so fire-time
-    /// consumers of the global TokenManager (e.g. the 15:25 IST
-    /// orphan-position watchdog re-homed 2026-07-14) can build an
-    /// `OrderApiClient` without threading credentials through boot.
+    /// The stored field IS `Secret`-wrapped (`DhanCredentials.client_id` —
+    /// uniform defensive posture for everything under `credentials`), and
+    /// this accessor DELIBERATELY widens it to a plain `String`: the client
+    /// id travels as a plain-text `client-id` / `dhanClientId` HTTP header
+    /// on every Dhan REST call (precedent: `OrderApiClient`'s plain
+    /// `client_id: String` field, and the `RenewToken` header at the
+    /// renewal site), so it is not access-token-class secret material.
+    /// This accessor exists so fire-time consumers of the global
+    /// TokenManager (e.g. the 15:25 IST orphan-position watchdog re-homed
+    /// 2026-07-14) can build an `OrderApiClient` without threading
+    /// credentials through boot.
     #[must_use]
     pub fn client_id_string(&self) -> String {
         self.credentials.client_id.expose_secret().to_string()

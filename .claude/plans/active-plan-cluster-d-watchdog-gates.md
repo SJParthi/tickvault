@@ -75,6 +75,18 @@ requires editing the constants with a fresh dated operator quote.
   the epoch against the Gate B NaiveDate (same day) and documents the nuance.
 - `expired_live_gates` at exactly the sentinel date: a gate dated today is NOT
   expired (strictly-past check) — no warn.
+- Config-ON boot held under the runtime-disabled overlay (dormant shape: no
+  Dhan lane starts, no Dhan REST stack starts): NO token manager — live or
+  global — ever registers, so the watchdog fires ONE degraded Critical
+  Telegram per trading day at 15:25. DELIBERATE Rule-11 loudness (a
+  broker-position check that cannot run must never look clean), NOT a bug.
+  Triage: re-enable the Dhan feed, or expect the daily page while the shape
+  is deliberately held. (Review round 1, 2026-07-14.)
+- Runtime lane stop→re-start (once the Phase-A 409 refusal relaxes): the
+  `GlobalAtFireTime` fire-time resolution PREFERS the live lane-owned manager
+  (`FeedRuntimeState::live_token_manager()`, the D2c gauge pattern) and falls
+  back to the global OnceLock — the set-once OnceLock can never pin the
+  watchdog to a dead boot-time JWT. (Review round 1, 2026-07-14.)
 
 ## Failure Modes
 

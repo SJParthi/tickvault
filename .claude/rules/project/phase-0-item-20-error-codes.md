@@ -87,14 +87,25 @@ The sections above are retained as history; the CURRENT state:
   cross-check never ran. The PRIMARY spawn now lives in the main.rs
   PROCESS-GLOBAL prefix (next to the tick-conservation hoist) using
   `WatchdogAuth::GlobalAtFireTime` — at each 15:25 fire it resolves the
-  global `TokenManager` (registered by the Dhan lane or the Dhan REST
-  stack's Phase 2); no manager = LOUD degraded Critical page, never a clean
-  signal. The fast crash-recovery arm keeps its `WatchdogAuth::Static` spawn
-  via `spawn_post_market_tasks`; a module-level once-guard
+  session PREFERRING the live lane-owned `TokenManager`
+  (`FeedRuntimeState::live_token_manager()`, the D2c gauge pattern — fresh
+  across a runtime lane stop→re-start) and falling back to the global
+  `TokenManager` (registered by the Dhan lane or the Dhan REST stack's
+  Phase 2); no manager anywhere = LOUD degraded Critical page, never a
+  clean signal. The fast crash-recovery arm keeps its `WatchdogAuth::Static`
+  spawn via `spawn_post_market_tasks`; a module-level once-guard
   (`ORPHAN_WATCHDOG_CLAIMED`) makes a duplicate spawn a no-op.
+- **Known daily page in the dormant config shape (deliberate — review
+  round 1, 2026-07-14):** a config-ON boot held under the runtime-disabled
+  overlay (no Dhan lane starts, no Dhan REST stack starts) never registers
+  ANY token manager — live or global — so the watchdog fires ONE degraded
+  Critical Telegram per trading day at 15:25 IST. This is Rule-11 loudness
+  by design (an un-runnable broker-position check must never look clean),
+  NOT a bug. Triage: re-enable the Dhan feed (config or runtime), or accept
+  the daily page while that shape is deliberately held.
 - **Live wiring ratchet:** `crates/app/tests/orphan_position_watchdog_wiring_guard.rs`
   (the `secret_manager.rs::test_orphan_position_watchdog_is_wired_into_main`
   guard named above was removed 2026-05-20 with the audit table) — pins the
   process-global-prefix-first topology, the exactly-2 spawn count, the
-  fire-time `global_token_manager()` resolution, and the degraded-arm
-  wording (stub-guard).
+  fire-time live-first-then-global session resolution (code-shaped
+  needles), and the degraded-arm wording (stub-guard).

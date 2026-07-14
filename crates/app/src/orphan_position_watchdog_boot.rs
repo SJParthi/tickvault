@@ -46,6 +46,7 @@ use secrecy::ExposeSecret;
 use secrecy::zeroize::Zeroizing;
 use tracing::{error, info, warn};
 
+use tickvault_api::feed_state::FeedRuntimeState;
 use tickvault_common::constants::IST_UTC_OFFSET_SECONDS;
 use tickvault_common::error_code::ErrorCode;
 use tickvault_common::sanitize::capture_rest_error_body;
@@ -100,11 +101,82 @@ pub enum WatchdogAuth {
         /// Dhan client id (plain header value — not secret-classed).
         client_id: String,
     },
-    /// Resolve `global_token_manager()` at each 15:25 fire. The OnceLock is
-    /// registered by BOTH the Dhan lane and the Dhan REST stack's Phase 2,
-    /// so a dhan-off boot has it well before 15:25. No manager at fire time
-    /// = LOUD degraded Critical page — never a clean signal.
-    GlobalAtFireTime,
+    /// Resolve the Dhan session at each 15:25 fire: PREFER the live
+    /// lane-owned `TokenManager` on `FeedRuntimeState` (fresh across a
+    /// runtime lane stop→re-start — the D2c `gauge_token_headroom_secs`
+    /// pattern in main.rs), FALL BACK to `global_token_manager()` (the
+    /// OnceLock is registered by BOTH the Dhan lane and the Dhan REST
+    /// stack's Phase 2, so a dhan-off boot has it well before 15:25 — but
+    /// it is set-once and would pin a dead boot manager across a runtime
+    /// stop→re-start, hence the live-first order). Neither present at fire
+    /// time = LOUD degraded Critical page — never a clean signal.
+    GlobalAtFireTime {
+        /// Runtime feed state carrying the live lane-owned manager slot.
+        feed_runtime: Arc<FeedRuntimeState>,
+    },
+}
+
+/// Fire-time manager preference for [`WatchdogAuth::GlobalAtFireTime`]: the
+/// LIVE lane-owned manager wins over the boot-time global `OnceLock` (the
+/// D2c `gauge_token_headroom_secs` pattern — the OnceLock is set-once at
+/// first boot and forever points at the dead boot-time manager after a
+/// runtime lane stop→re-start; the live slot tracks the CURRENT manager).
+/// Generic + pure so the preference order is unit-testable without a real
+/// `TokenManager` (its only test constructor is `#[cfg(test)]`-gated inside
+/// `tickvault-core`).
+fn prefer_live_session<T>(live: Option<T>, global_fallback: Option<T>) -> Option<T> {
+    live.or(global_fallback)
+}
+
+/// Resolve the (JWT handle, client id) pair for one 15:25 fire. `Static` is
+/// byte-identical to the pre-2026-07-14 signature; `GlobalAtFireTime`
+/// prefers the live lane-owned manager and falls back to the global
+/// OnceLock (both reads deliberately live HERE, not in main.rs — main.rs
+/// ratchets exactly one `global_token_manager()` read in its production
+/// region). `None` = no broker session anywhere — the caller fires the
+/// degraded arm.
+fn resolve_watchdog_session(auth: &WatchdogAuth) -> Option<(TokenHandle, String)> {
+    match auth {
+        WatchdogAuth::Static {
+            token_handle,
+            client_id,
+        } => Some((token_handle.clone(), client_id.clone())),
+        WatchdogAuth::GlobalAtFireTime { feed_runtime } => prefer_live_session(
+            feed_runtime.live_token_manager(),
+            global_token_manager().cloned(),
+        )
+        .map(|tm| (tm.token_handle(), tm.client_id_string())),
+    }
+}
+
+/// Degraded-arm Telegram wording: fire-time resolution found NO broker
+/// session anywhere (no live lane manager AND no global manager). Pure so
+/// the operator-facing wording is unit-pinned (the 10 Telegram
+/// commandments — plain English, one decision, action verb).
+fn degraded_no_session_message() -> String {
+    "🆘 3:25 PM open-position check could NOT run — no broker session exists. \
+     Check your Dhan app manually before the 3:30 PM close."
+        .to_string()
+}
+
+/// Degraded-arm Telegram wording: a manager exists but holds no active
+/// token at fire time (mint failed / token invalidated). Pure — see
+/// [`degraded_no_session_message`].
+fn degraded_no_token_message() -> String {
+    "🆘 3:25 PM open-position check SKIPPED — no active session token. \
+     Check your Dhan positions manually before the 3:30 PM close."
+        .to_string()
+}
+
+/// Degraded-arm Telegram wording: the positions REST fetch failed after one
+/// retry. `safe_reason` MUST already be redacted via
+/// `capture_rest_error_body` (the caller's contract). Pure — see
+/// [`degraded_no_session_message`].
+fn degraded_fetch_failed_message(safe_reason: &str) -> String {
+    format!(
+        "🆘 3:25 PM open-position check FAILED ({safe_reason}). Could not read \
+         your positions — check Dhan manually before the 3:30 PM close."
+    )
 }
 
 /// Process-global once-guard: the watchdog family may be spawned from BOTH
@@ -220,20 +292,10 @@ async fn orphan_watchdog_loop(
         if calendar.is_trading_day(today_ist) {
             // Resolve the Dhan session at fire time. `Static` behaves
             // exactly as the pre-2026-07-14 signature; `GlobalAtFireTime`
-            // reads the global TokenManager registered by the Dhan lane or
-            // the Dhan REST stack's Phase 2 (this read deliberately lives
-            // HERE, not in main.rs — main.rs ratchets exactly one
-            // `global_token_manager()` read in its production region).
-            let resolved = match &auth {
-                WatchdogAuth::Static {
-                    token_handle,
-                    client_id,
-                } => Some((token_handle.clone(), client_id.clone())),
-                WatchdogAuth::GlobalAtFireTime => {
-                    global_token_manager().map(|tm| (tm.token_handle(), tm.client_id_string()))
-                }
-            };
-            match resolved {
+            // prefers the live lane-owned manager and falls back to the
+            // global OnceLock (see `resolve_watchdog_session` — the reads
+            // deliberately live in THIS module, not main.rs).
+            match resolve_watchdog_session(&auth) {
                 Some((token_handle, client_id)) => {
                     let api =
                         OrderApiClient::new(http.clone(), rest_api_base_url.clone(), client_id);
@@ -247,15 +309,13 @@ async fn orphan_watchdog_loop(
                     // un-coded Custom-Critical style.
                     error!(
                         "orphan watchdog: no broker session at 15:25 IST — the \
-                         orphan-position check could NOT run (no global token \
-                         manager registered); operator must check Dhan manually \
-                         before the 15:30 close (degraded — NOT reported as flat)"
+                         orphan-position check could NOT run (no live-lane or \
+                         global token manager registered); operator must check \
+                         Dhan manually before the 15:30 close (degraded — NOT \
+                         reported as flat)"
                     );
                     notifier.notify(NotificationEvent::Custom {
-                        message: "🆘 3:25 PM open-position check could NOT run — no \
-                                  broker session exists. Check your Dhan app manually \
-                                  before the 3:30 PM close."
-                            .to_string(),
+                        message: degraded_no_session_message(),
                     });
                     metrics::counter!("tv_orphan_position_watchdog_fetch_failures_total")
                         .increment(1);
@@ -296,10 +356,7 @@ async fn run_orphan_check_once(
                      the 15:30 close (degraded — NOT reported as flat)"
                 );
                 notifier.notify(NotificationEvent::Custom {
-                    message: "🆘 3:25 PM open-position check SKIPPED — no active session \
-                              token. Check your Dhan positions manually before the 3:30 PM \
-                              close."
-                        .to_string(),
+                    message: degraded_no_token_message(),
                 });
                 metrics::counter!("tv_orphan_position_watchdog_fetch_failures_total").increment(1);
                 return;
@@ -317,10 +374,7 @@ async fn run_orphan_check_once(
                  (degraded — NOT reported as flat)"
             );
             notifier.notify(NotificationEvent::Custom {
-                message: format!(
-                    "🆘 3:25 PM open-position check FAILED ({safe_reason}). Could not read \
-                     your positions — check Dhan manually before the 3:30 PM close."
-                ),
+                message: degraded_fetch_failed_message(&safe_reason),
             });
             metrics::counter!("tv_orphan_position_watchdog_fetch_failures_total").increment(1);
             return;
@@ -449,11 +503,124 @@ mod tests {
             token_handle: handle,
             client_id: "test-client-id".to_string(),
         };
-        let global_arm = WatchdogAuth::GlobalAtFireTime;
+        let global_arm = WatchdogAuth::GlobalAtFireTime {
+            feed_runtime: Arc::new(FeedRuntimeState::default()),
+        };
         match static_arm.clone() {
             WatchdogAuth::Static { client_id, .. } => assert_eq!(client_id, "test-client-id"),
-            WatchdogAuth::GlobalAtFireTime => panic!("expected Static arm"),
+            WatchdogAuth::GlobalAtFireTime { .. } => panic!("expected Static arm"),
         }
-        assert!(matches!(global_arm.clone(), WatchdogAuth::GlobalAtFireTime));
+        assert!(matches!(
+            global_arm.clone(),
+            WatchdogAuth::GlobalAtFireTime { .. }
+        ));
+    }
+
+    #[test]
+    fn test_prefer_live_session_prefers_live_when_both_present() {
+        // The live lane-owned manager MUST win over the boot-time global
+        // OnceLock (the D2c staleness class: the OnceLock pins the dead
+        // boot manager forever after a runtime lane stop→re-start).
+        assert_eq!(
+            prefer_live_session(Some("live"), Some("global")),
+            Some("live")
+        );
+    }
+
+    #[test]
+    fn test_prefer_live_session_falls_back_to_global_when_live_absent() {
+        // Boot-OFF / Groww-only / pre-start: no live lane manager — the
+        // global OnceLock (registered by the Dhan REST stack's Phase 2)
+        // is the fallback.
+        assert_eq!(prefer_live_session(None, Some("global")), Some("global"));
+    }
+
+    #[test]
+    fn test_prefer_live_session_none_when_both_absent() {
+        // Fully-dhan-less shape: no session anywhere — the caller must
+        // fire the degraded arm (never a clean signal).
+        assert_eq!(prefer_live_session::<&str>(None, None), None);
+    }
+
+    #[test]
+    fn test_resolve_watchdog_session_static_arm_returns_boot_handles() {
+        // `Static` must be byte-identical to the pre-2026-07-14 behaviour:
+        // the boot-time handle + client id come back unchanged.
+        let handle: TokenHandle = Arc::new(arc_swap::ArcSwap::new(Arc::new(None)));
+        let auth = WatchdogAuth::Static {
+            token_handle: handle,
+            client_id: "static-client-id".to_string(),
+        };
+        let (_token_handle, client_id) =
+            resolve_watchdog_session(&auth).expect("Static arm always resolves");
+        assert_eq!(client_id, "static-client-id");
+    }
+
+    #[test]
+    fn test_resolve_watchdog_session_global_arm_none_when_no_managers() {
+        // Mirror of main.rs's `gauge_token_headroom_falls_back_to_global_...`
+        // test: in this test binary the global OnceLock is never set and a
+        // fresh FeedRuntimeState has no live manager, so resolution is None
+        // (the degraded-arm trigger). Precondition asserted so a future
+        // test that installs the global fails HERE with a clear message.
+        let feed_runtime = Arc::new(FeedRuntimeState::default());
+        assert!(
+            feed_runtime.live_token_manager().is_none(),
+            "fresh FeedRuntimeState must carry no live lane manager"
+        );
+        assert!(
+            global_token_manager().is_none(),
+            "precondition: the global TokenManager OnceLock must be unset in \
+             this test binary (no lib test installs it)"
+        );
+        let auth = WatchdogAuth::GlobalAtFireTime { feed_runtime };
+        assert!(
+            resolve_watchdog_session(&auth).is_none(),
+            "no live + no global manager must resolve to None (degraded arm)"
+        );
+    }
+
+    #[test]
+    fn test_degraded_no_session_message_wording() {
+        // Operator-facing wording pin (10 Telegram commandments): severity
+        // emoji, plain English, the manual action, the 3:30 PM deadline.
+        let msg = degraded_no_session_message();
+        assert!(msg.starts_with("🆘"), "severity emoji must lead: {msg}");
+        assert!(
+            msg.contains("could NOT run — no broker session exists"),
+            "must say the check could not run: {msg}"
+        );
+        assert!(
+            msg.contains("Check your Dhan app manually before the 3:30 PM close"),
+            "must carry the manual action + deadline: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_degraded_no_token_message_wording() {
+        let msg = degraded_no_token_message();
+        assert!(msg.starts_with("🆘"), "severity emoji must lead: {msg}");
+        assert!(
+            msg.contains("SKIPPED — no active session token"),
+            "must say why the check was skipped: {msg}"
+        );
+        assert!(
+            msg.contains("before the 3:30 PM close"),
+            "must carry the deadline: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_degraded_fetch_failed_message_embeds_redacted_reason() {
+        let msg = degraded_fetch_failed_message("timeout after 30s");
+        assert!(msg.starts_with("🆘"), "severity emoji must lead: {msg}");
+        assert!(
+            msg.contains("FAILED (timeout after 30s)"),
+            "must embed the redacted reason: {msg}"
+        );
+        assert!(
+            msg.contains("check Dhan manually before the 3:30 PM close"),
+            "must carry the manual action + deadline: {msg}"
+        );
     }
 }
