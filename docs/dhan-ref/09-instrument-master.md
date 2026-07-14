@@ -119,3 +119,35 @@ pub struct InstrumentMaster {
 4. **Derivatives have two SecurityIds** — the derivative contract has its own SecurityId, and `UNDERLYING_SECURITY_ID` points to the underlying equity/index.
 
 5. **Per-segment endpoint** requires `access-token` header and counts against Data API rate limits (5/sec, 100K/day).
+
+---
+
+## 2026-07-14 Upstream Update (runner-crawled live page)
+
+**Evidence tier: Verified-live.** Raw HTML of `https://dhanhq.co/docs/v2/instruments/`
+(runs 1–3, sha256 `36a9b707` content-identical, latest 2026-07-14T07:58:12Z). Both CSV URLs +
+the per-segment endpoint re-confirmed verbatim. Full manifest: `00-COVERAGE-MANIFEST.md`.
+
+1. **The `SECURITY_ID | SEM_SMST_SECURITY_ID` row is ABSENT from the live column table**
+   (`SEM_SMST` grep: 0 hits; the only `*SECURITY_ID` on the page is `UNDERLYING_SECURITY_ID`).
+   The page intro still says the CSV comes "with Security ID and other important details" —
+   an upstream doc-TABLE omission; the actual CSV still carries the column (the whole
+   universe build depended on it). Annotation only; the CSV remains ground truth.
+2. **SEGMENT code list on the live page: `C - Currency, D - Derivatives, E - Equity,
+   M - Commodity` — `I` (Index) is NOT listed.** The CSV empirically carries `I` rows (the
+   entire IDX_I universe); a live-doc omission vs the repo's empirically-correct C/D/E/I/M
+   list. Keep `I`; annotate the divergence.
+3. **Explicit "removed" markers:** the live table's Detailed-tag cell for `SEM_EXPIRY_CODE`
+   and `SEM_TRADING_SYMBOL` literally reads `removed` — Dhan now states these two columns
+   were REMOVED from the detailed CSV (the repo shows "—"; same practical meaning, upstream
+   wording is now explicit).
+4. **18 detailed-CSV columns on the live page that are not in the repo table** (none consumed
+   by tickvault; the CSV parser selects by header name and tolerates extras): `BRACKET_FLAG`
+   ("Bracket order status: N/Y"), `COVER_FLAG` ("Cover order status: N/Y"), and 16 CO/BO
+   margin & range columns — BUY_CO_MIN_MARGIN_PER, SELL_CO_MIN_MARGIN_PER,
+   BUY_CO_SL_RANGE_MAX_PERC, SELL_CO_SL_RANGE_MAX_PERC, BUY_CO_SL_RANGE_MIN_PERC,
+   SELL_CO_SL_RANGE_MIN_PERC, BUY_BO_MIN_MARGIN_PER, SELL_BO_MIN_MARGIN_PER,
+   BUY_BO_SL_RANGE_MAX_PERC, SELL_BO_SL_RANGE_MAX_PERC, BUY_BO_SL_RANGE_MIN_PERC,
+   SELL_BO_SL_MIN_RANGE (live naming inconsistency — not `_SL_RANGE_MIN_PERC`),
+   BUY_BO_PROFIT_RANGE_MAX_PERC, SELL_BO_PROFIT_RANGE_MAX_PERC,
+   BUY_BO_PROFIT_RANGE_MIN_PERC, SELL_BO_PROFIT_RANGE_MIN_PERC.

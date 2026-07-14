@@ -118,3 +118,64 @@
 8. **Option Chain enhanced** — since v2.5, `security_id` field in response
 9. **Python SDK versioning** — Python SDK versions (2.0.0→2.2.0rc1) do NOT match API platform versions (2.0→2.5)
 10. **SEBI algo trading framework** — SEBI directive Feb 2025, effective Aug 2025. Static IP + 2FA + API key traceability mandatory.
+
+---
+
+## 2026-07-13 Upstream Update (search-index spot-check + PyPI — see `verification-2026-07-13.md`)
+
+Per repo convention this dated section supersedes without rewriting the text above.
+
+### (a) Provenance inconsistency in THIS file (flagged, header NOT rewritten)
+
+The header says **Extracted: 2026-03-13**, yet the "Version 2.5.1 — Mar 17, 2026" section above
+postdates that extraction. Per the header NOTE, version labels are our INTERNAL mapping of
+Dhan's dated releases — the 2.5.1 section was compiled from dated announcements (MPP circulars,
+SDK changes) and **may never have been a releases-page entry at all**. Do not treat the header
+extraction date as covering the 2.5.1 section, and do not cite "v2.5.1" as a Dhan-published
+release label.
+
+### (b) Live releases page — latest indexed entry still Feb 09, 2026
+
+The 2026-07-13 search-index spot-check of https://dhanhq.co/docs/v2/releases/ surfaced **no
+entry newer than Feb 09, 2026** (our "v2.5"). No "v2.6"-class release found. **Absence =
+Unknown** — search snippets cannot prove nothing newer exists (index-lag caveat); the page was
+not directly readable from the sandbox (proxy-blocked).
+
+### (c) Python SDK — 2.2.0 final + 2.3.0rc1 (PyPI direct fetch = Verified for the SDK facts)
+
+- `dhanhq` **2.2.0** (final) uploaded to PyPI **2026-04-24** — supersedes the header NOTE's
+  "2.2.0rc1" as the latest stable.
+- `dhanhq` **2.3.0rc1** uploaded **2026-07-07**. Features per the GitHub releases page
+  (Secondary): **Conditional Orders**, **Global Stocks (US)** incl. a separate live feed,
+  **P&L Based Exit**, **Multi-leg Margin Calculator** (documented on the new
+  docs.dhanhq.co portal at api/v2/funds/calculate-multi-margin), enhanced FullDepth callback
+  handling. Global Stocks is out of tickvault scope.
+- SDK versions still do NOT map to platform versions (takeaway 9 stands).
+
+---
+
+## 2026-07-14 Upstream Update (runner-crawled live page)
+
+**Evidence tier: Verified-live.** Raw HTML of `https://dhanhq.co/docs/v2/releases/` (runs 1–3,
+sha256 `54116c5c` content-identical, latest 2026-07-14T07:58:32Z), comment-aware.
+Full manifest: `00-COVERAGE-MANIFEST.md`.
+
+1. **The live releases page DOES use formal version headings** — "Version 2.5 / 2.4 / 2.3 /
+   2.2 / 2.1 / 2" — so the header NOTE's "Dhan's releases page lists features by date without
+   formal version numbers" is outdated (the version numbers are upstream, not our invention).
+   All six version/date pairs above are confirmed verbatim; **the latest live entry remains
+   "Version 2.5 — Monday Feb 09 2026"** — nothing newer exists on the page (the only "2026"
+   string on the whole page is that date).
+2. **"Version 2.5.1 — Mar 17, 2026" above is NOT a Dhan-published release** — now
+   Verified-live, upgrading the 2026-07-13 §(a) provenance note: zero hits for
+   MPP / "Market Price Protection" / "March" / 2.5.1 anywhere on the live page. The 2.5.1
+   block is our internal mapping of SDK + regulatory-comms items; keep it, but never cite it
+   as a releases-page entry. Its getIP-fields sentence (the `detectedIP`/`ipMatchStatus`/
+   `ordersAllowed` claim) is re-sourced per `02-authentication.md` "2026-07-14 Upstream
+   Update" §(b): those fields are WIRE-OBSERVED but doc-unbacked on both live surfaces.
+3. Live-only additions worth knowing: a v2.0 "Bug Fixes" subsection (realtime
+   realizedProfit/unrealizedProfit in Positions; a TARGET_LEG order-modification fix); v2.0
+   notes "quantity and price fields are conditionally required for modification" and
+   "pre-open AMO orders can also be placed now with PRE_OPEN tag" (tension with the SDK note
+   above that PRE_OPEN was removed from SDK AMO validation — the docs + annexure still list
+   PRE_OPEN).

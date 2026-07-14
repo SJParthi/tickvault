@@ -28,8 +28,8 @@
 //!   clause is additionally accepted after the pinned code+level pair —
 //!   `{ $.code = "X" && $.level = "ERROR" && <extra> }` — used by the
 //!   once-per-episode sub-filters (`$.stage = "escalation"` /
-//!   `$.stage = "warmup"` / the AUTH-GAP-05 `$.permanent` failure-arm
-//!   scope). Honest limit: the extra clause's field name/value cannot be
+//!   `$.stage = "warmup"` / the AUTH-GAP-05 `$.cooldown_skip IS FALSE`
+//!   failure-arm scope). Honest limit: the extra clause's field name/value cannot be
 //!   validated against the enum (stage strings are not derivable from
 //!   `ErrorCode`) — a typo'd stage value silently never matches; the
 //!   emit-site check still guarantees the CODE has a real `error!` emit;
@@ -832,7 +832,9 @@ fn synthetic_shape_classifier_detects_planted_drift() {
     );
     // 2026-07-14 extension: ONE extra $.field scoping clause is Coded —
     // the stage-scoped once-per-episode sub-filters and the AUTH-GAP-05
-    // $.permanent failure-arm scope.
+    // $.cooldown_skip failure-arm scope (the field exists only on the
+    // mint-failure emission; IS FALSE excludes the noise-lock H3
+    // non-terminal cooldown-skip lines).
     assert_eq!(
         classify_pattern(
             r#"{ $.code = "SPOT1M-01" && $.level = "ERROR" && $.stage = "escalation" }"#
@@ -841,7 +843,7 @@ fn synthetic_shape_classifier_detects_planted_drift() {
     );
     assert_eq!(
         classify_pattern(
-            r#"{ $.code = "AUTH-GAP-05" && $.level = "ERROR" && ($.permanent IS TRUE || $.permanent IS FALSE) }"#
+            r#"{ $.code = "AUTH-GAP-05" && $.level = "ERROR" && $.cooldown_skip IS FALSE }"#
         ),
         PatternShape::Coded("AUTH-GAP-05".into())
     );

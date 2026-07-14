@@ -192,16 +192,42 @@ data. A server-side reject that persists shows up as the bounded restart
 cadence + the pager + the §1c FEED-REJECT-01 signatures — loud, never silent,
 never a tight kill loop. Known bounds, stated plainly:
 
-- **Page-storm bound (review HIGH, FIXED):** each relaunched child gets a
-  fresh `alerted` latch, so a persistent reject day would have paged the
-  `GrowwSidecarRejected` HIGH ~12×/hour. The single-conn Telegram fan-out is
-  now additionally gated by a supervisor-lifetime cross-child cooldown
-  (`GROWW_REJECT_PAGE_COOLDOWN_SECS` = 1800s, pure `should_page_reject`,
-  CAS'd so the two pipe drains never double-page): at most one reject page
-  per 30 min per supervisor; suppressed episodes keep their `error!`
-  forwards, FEED-REJECT-01 signature, and feed-health marking, and are
-  counted by `tv_groww_reject_page_cooldown_suppressed_total`. The
-  ≥3-per-15-min restart pager independently covers "it keeps failing".
+- **Page-storm bound (review HIGH, FIXED; RESTRUCTURED 2026-07-14):** each
+  relaunched child gets a fresh `alerted` latch, so a persistent reject day
+  would have paged the `GrowwSidecarRejected` HIGH ~12×/hour. Page DEDUP is
+  now owned by the `EpisodeFamily::GrowwFeed` one-bubble fold (2026-07-14
+  operator noise directive): `GrowwSidecarRejected` + the Groww
+  `FeedDown`/`FeedRecovered` arms carry an `episode_key`, so the FIRST
+  reject pages (+ SMS) and every recurrence becomes an in-place bubble edit
+  — no push, no SMS — with `FeedRecovered` closing the bubble green.
+  Scope refinements (same-day hostile review): an OPERATOR-INITIATED
+  `FeedDown` (the deliberate feeds-page disable) is NEVER episode-routed —
+  its legacy body honestly says the feed stays OFF until re-enabled (a
+  bubble edit would falsely claim "retrying"); and the off-hours
+  Low-severity `FeedDown` keeps its pre-existing legacy 60s-coalescer path
+  (only a paging ≥High FeedDown opens/folds the bubble). The
+  supervisor-lifetime cross-child cooldown
+  (`GROWW_REJECT_PAGE_COOLDOWN_SECS`, pure `should_page_reject`, CAS'd so
+  the two pipe drains never double-page) is KEPT but reduced **1800s →
+  60s** (aligned with the fleet 60s coalescer): it is no longer the primary
+  page bound — it only caps notify() volume to ≤1/min on the
+  transport-failure path (a first page that never lands leaves
+  `message_id = None`, so every later reject takes the episode
+  `SendNewFallback` fresh send; without this upstream bound that failure
+  path would restore the storm). The 60s value applies ONLY while
+  `[notification] episode_mode = true` (the fold ON): with the episode
+  kill switch OFF every reject takes the legacy Immediate+SMS lane, so
+  the supervisor restores the legacy 1800s bound
+  (`GROWW_REJECT_PAGE_COOLDOWN_LEGACY_SECS`, selected at boot via
+  `reject_page_cooldown_secs(episode_mode)`; a runtime config flip needs
+  a restart, like episode_mode itself). Suppressed episodes keep their
+  `error!` forwards, FEED-REJECT-01 signature, and feed-health marking,
+  and are counted by `tv_groww_reject_page_cooldown_suppressed_total`.
+  The ≥3-per-15-min restart pager independently covers "it keeps failing".
+  Ratchets: `test_should_page_reject_rising_edge_and_cooldown` pins BOTH
+  cooldowns exactly (60 / 1800) + the mode selector;
+  `episode_runtime_family_wiring_guard.rs` pins the episode routing incl.
+  the operator-initiated + Low-off-hours exclusions.
 - **"This session" = this APP PROCESS:** `feed_health`'s last-tick stamp
   never resets in-process, so on day 2 of a long-running process the arm is
   dormant and the classic 30s stall arm owns everything (no coverage hole).
@@ -248,7 +274,9 @@ chars also stripped per the 2026-07-09 security review). Bounded by its OWN
 per-child `detail_logged` latch — once per child episode on EVERY path,
 re-armed only by a streaming recovery, deliberately NOT by the fleet
 Suppress re-arm of `alerted` (review MEDIUM fix: the re-arm would have made
-this emit per-line on the fleet path). Telegram wording is UNCHANGED.
+this emit per-line on the fleet path). Telegram wording was UNCHANGED by the
+2026-07-09 work — superseded 2026-07-14: the SANITIZED signature now ALSO
+rides the Telegram body (see §1c.1 below).
 
 **Triage:**
 1. `mcp__tickvault-logs__tail_errors` — find `FEED-REJECT-01`; the
@@ -284,6 +312,58 @@ this emit per-line on the fleet path). Telegram wording is UNCHANGED.
 | `subscribed N stocks + M indices — awaiting first tick…` | Subscribed | (none) | subscribe confirmation |
 | `groww auth OK…` / `→ appending NDJSON…` | Streaming | (none) | positive/recovery edge (clears auth_rejected) |
 | everything else (`NATS error_cb ->…`, `NATS disconnected ->…`, `FEED STALLED —…`, `watch file unreadable…`, `DROP[reason] sample…`, capture/walker diagnostics) | Info | (none) | tracing-only |
+
+### §1c.1 — 2026-07-14 Update: the SANITIZED signature now ALSO rides the Telegram body (operator demand, dated override of commandment 2)
+
+**The incident (2026-07-14, 14:59 IST):** the Groww live feed — the SOLE live
+feed since the 2026-07-13 Dhan retirement — died mid-session and the
+operator's page said only *"🆘 Groww live feed rejected — the feed reported an
+error and is retrying"*. It did NOT say WHY. The actual cause was captured by
+the sidecar and logged as the FEED-REJECT-01 signature
+(`ERROR growwapi.groww.nats_client: Error: nats: unexpected EOF`) — but that
+forensic WHY lived only in errors.jsonl / CloudWatch, invisible on the phone.
+
+**The operator demand (2026-07-14, verbatim intent, relayed via the
+coordinator session):** the operator was angry the 14:59 IST rejection page
+carried no reason; the Groww feed-rejection Telegram MUST carry the actual
+captured reject reason — "🟢 GROWW — live feed rejected: \<specific reason\> —
+retrying" — never a bare "reported an error".
+
+**The resolution (this dated edit + the same-PR code):** the once-per-episode
+alert edge in `spawn_pipe_drain` threads the SAME sanitized signature — the
+output of the `sidecar_line_signature` choke point (control-char + BiDi strip,
+credential/JWT redaction, `SIDECAR_LINE_SIGNATURE_MAX_CHARS` 160-char cap;
+NEVER raw child text), via the new pure `sidecar_reject_detail(line)` helper —
+into the `GrowwSidecarRejected` NotificationEvent's new `detail:
+Option<String>` field. The Telegram headline becomes
+`🆘 Groww live feed rejected: <sanitized signature> — retrying` while each
+class's existing fixed plain-English explanation sentence is KEPT as the body
+line beneath it (all three alert classes: AuthRejected / EntitlementRejected /
+Error). An empty/whitespace/`None` detail degrades to the exact pre-2026-07-14
+generic wording — never a hollow "rejected:  — retrying". The fleet-coalesced
+summary arm passes `detail: None` (one child's line must not be presented as
+the cause for N connections).
+
+**The commandment override (conscious, dated, one field):** the 10 Telegram
+commandments' rule 2 (no library names / jargon) is OVERRIDDEN for this ONE
+field — the sanitized signature may legitimately carry SDK/NATS wording like
+`growwapi` / `nats: unexpected EOF`, because the specific machine cause IS the
+operator-demanded payload. Precedent: the B9 `Build:` short-SHA line override
+in `deploy-provenance.md` §1. Everything else about the message keeps the
+commandments: severity emoji first, the 🟢 GROWW badge ordering untouched, the
+plain-English class explanation retained, one message = one decision. The
+sanitize contract is unchanged and remains the hard floor: no raw child text,
+no credential/JWT shape, no control/BiDi chars, ≤160 chars — defense-in-depth
+re-capped + HTML-escaped at the render boundary in `events.rs`.
+
+**Ratchets (same PR):** supervisor-side — `sidecar_reject_detail` unit tests
+(sanitized-equals-signature, hostile JWT/control/overlong line, empty → None)
++ a source-scan pin that the Passthrough notify arm passes
+`detail: sidecar_reject_detail(&line)` and the fleet arm passes `detail:
+None`; events-side — body tests that a present detail renders
+`live feed rejected: <detail> — retrying` verbatim (incl. the dated-override
+`growwapi` wording), that empty/None degrades to the generic wording, and
+that the render boundary HTML-escapes + re-caps the detail.
 
 ---
 
@@ -331,5 +411,6 @@ This rule activates when editing:
 - Any file containing `FEED-STALL-01`, `FEED-SUPERVISOR-01`, `FEED-REJECT-01`,
   `FeedStall01`, `FeedSupervisor01`, `FeedReject01`, `should_restart_on_stall`,
   `should_restart_on_never_streamed`, `sidecar_line_signature`,
+  `sidecar_reject_detail`,
   `tv_feed_sidecar_stall_restart_total`, or
   `tv_feed_sidecar_never_streamed_restart_total`

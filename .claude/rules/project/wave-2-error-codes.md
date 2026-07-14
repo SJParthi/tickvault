@@ -363,6 +363,19 @@ and the ceiling fallback restarts exactly as the legacy Halt did).
 
 ## WS-GAP-10 — order-update WebSocket in-market outage (in-loop HIGH page)
 
+> **⚠ 2026-07-14 UPDATE (operator Dhan noise lock —
+> `dhan-rest-only-noise-lock-2026-07-14.md` +
+> `websocket-connection-scope-lock.md` §A.1):** the `dhan_rest_stack`
+> Phase 5a order-update spawn is CUT — NO live caller of
+> `run_order_update_connection` remains on a dhan-off boot (the legacy
+> fast-arm/lane sites are Dhan-gated dead code deleted by the Phase C-2
+> PR). The core module `order_update_connection.rs` is RETAINED DORMANT
+> (unit tests stay) for the live-trading re-wire, so this section's
+> WS-GAP-10 machinery is dormant code, not a live pager. The two
+> CloudWatch alarms (`tv-<env>-order-update-ws-inactive`,
+> `tv-<env>-order-update-reconnect-storm`) are DELETED with the spawn.
+> Content below retained as historical audit + the re-wire reference.
+
 **Trigger:** ≥ `ORDER_UPDATE_OUTAGE_PAGE_FAILURE_THRESHOLD` (3) consecutive
 in-market order-update reconnect failures → ONE
 `error!(code = "WS-GAP-10", reason = "in_market_outage")` + ONE `[HIGH]`

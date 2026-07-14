@@ -22,6 +22,20 @@
    - Only renews ACTIVE tokens. Expired tokens return error.
    - Extends validity by another 24 hours.
    - **One active token at a time** — generating new token invalidates the old one.
+   - **2026-07-13 note (UNVERIFIED-LIVE — search-index + SDK relayed):** the new
+     docs.dhanhq.co renew-token page describes renewal as **expiring the current token and
+     issuing a NEW one** (adopt the response token; the one-active-token invariant is
+     unchanged) and states plainly it works **only for tokens generated via Dhan Web**. One
+     search summary claimed the verb is POST, but the official SDK (2.3.0rc1) and the docs
+     curl example both indicate **GET** — so GET stands here; live-probe BOTH verbs from the
+     prod box before changing this rule or any code. Runtime risk is bounded by the existing
+     RenewToken→generateAccessToken fallback. See `docs/dhan-ref/02-authentication.md`
+     "2026-07-13 Upstream Update" + `docs/dhan-ref/verification-2026-07-13.md` §4 flag 3.
+   - **2026-07-14 confirmation (runner-crawled):** all three claims above are now
+     Verified-live on BOTH doc surfaces — **GET** (no `-X` in the classic curl; the portal
+     markdown export states `GET /v2/RenewToken`), new-token semantics verbatim ("expires your
+     current token and provides you with a new token"), web-tokens-only verbatim. The POST
+     claim is REFUTED. See `docs/dhan-ref/02-authentication.md` "2026-07-14 Upstream Update".
 
 6. **API Key & Secret flow (OAuth-style, 12-month validity).**
    - Step 1: `POST https://auth.dhan.co/app/generate-consent?client_id={dhanClientId}` with headers `app_id`, `app_secret`. Max 25 consentAppId per day.
@@ -35,6 +49,16 @@
    - Supports IPv4 and IPv6. Primary + Secondary IP per account.
    - NOT required for Data APIs, Market Feed, Portfolio, or non-order APIs.
    - **April 1, 2026 enforcement:** Orders from unregistered IPs are REJECTED by the exchange. No grace period. Pre-market check MUST call GetIP and verify `ordersAllowed == true`.
+   - **2026-07-14 note (runner-crawled, Verified-live for the docs):** `detectedIP` /
+     `ipMatchStatus` / `ordersAllowed` are documented NOWHERE on either live Dhan doc surface
+     (both document only `primaryIP`/`secondaryIP`/`modifyDate*`; 191-page grep = zero hits).
+     They are **WIRE-OBSERVED**: the Item-18 boot gate parsed them fail-closed through daily
+     prod boots (`ip_verifier.rs::classify_static_ip_boot_outcome`) and support-ticket records
+     (2026-04-15 ticket 5519522; 2026-07-08) carry live `ordersAllowed=true` observations. The
+     pre-market `ordersAllowed == true` check is KEPT — its source is wire observation, not
+     the doc page. The April-1-2026 enforcement framing is likewise comms-sourced (absent from
+     both live doc surfaces), NOT contradicted. See `docs/dhan-ref/02-authentication.md`
+     "2026-07-14 Upstream Update" §(b)/(c).
 
 8. **TOTP — 6-digit code, 30-second window, RFC 6238.**
    - Secret in environment/SSM only. Never hardcoded. Never in .env committed to git.

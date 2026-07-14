@@ -45,7 +45,7 @@ migration (#O1/#O2/#O3) — the 2026-07-06 zero-page incident is why this list
 now exists (`deploy/aws/terraform/error-code-alarms.tf`).
 
 Filtered+alarmed codes (each = one `error_code_alerts` map entry):
-REST-CANARY-01, DH-901, DH-906 (term-match tripwire — no coded emit site
+DH-901, DH-906 (term-match tripwire — no coded emit site
 exists yet), AUTH-GAP-04, WS-GAP-07, FEED-STALL-01 (ERROR lines = the
 sidecar's own >5-restarts-per-5-min STORM escalation ONLY; per-restart lines
 are warn!-level and invisible here — the ≥3-restarts-per-15-min restart pager
@@ -69,7 +69,10 @@ page; recovery = the operator's
 `ALTER TABLE <t> RESUME WAL`, never auto-executed; runbook
 `.claude/rules/project/wal-suspension-error-codes.md`**)**, **AUTH-GAP-05
 (added 2026-07-14, REST-audit gap 01** — SCOPED to the mint-FAILURE arm only
-via the `$.permanent` boolean field that exists only on that emission; the
+via `$.cooldown_skip IS FALSE` (the boolean field exists only on that
+emission; IS FALSE additionally excludes the same-day noise-lock H3
+non-terminal mint-cooldown-skip lines, which self-retry at the next re-arm
+window and must never page); the
 trigger arm fires on every forced re-mint INCLUDING successful ~30-min
 self-heals and is operator-ruled noise — silent-when-healing,
 loud-only-when-unobtainable**)**, **SPOT1M-01 and CHAIN-02 (added
@@ -94,6 +97,13 @@ pattern; a broken bot silently killed every typed-event page; honest
 residual: the counter is NOT yet pre-registered at 0 post-recorder-install,
 so the session's first drop per reason-series is eaten as the CW delta
 baseline — flagged crates follow-up).
+
+> Removed from the filtered+alarmed set: the Dhan REST canary code
+> (RETIRED 2026-07-14 with its module + both spawn sites + the
+> `rest-canary-01` map entry, per the operator Dhan noise lock —
+> `dhan-rest-only-noise-lock-2026-07-14.md`; the retained spot-1m +
+> option-chain legs self-detect a dead Dhan REST surface within ~3-4 min
+> via their own escalation edges).
 
 ## The ErrorCode taxonomy (53 variants, 100% rule-synced)
 
