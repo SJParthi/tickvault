@@ -1957,14 +1957,31 @@ impl NotificationEvent {
     ///
     /// `Some` ONLY for events provably scoped to exactly one feed:
     /// - Dhan-scoped (static): Dhan JWT/auth/profile, main-feed +
-    ///   order-update WebSocket lifecycle, Dhan instrument build.
-    /// - Groww-scoped (static): the sidecar reject diagnostic.
+    ///   order-update WebSocket lifecycle, Dhan instrument build, the Dhan
+    ///   per-minute REST legs (spot 1m + option chain), the market-open
+    ///   milestones (they count the Dhan pool), the daily candle
+    ///   cross-check + 09:15 bar cross-check (Dhan REST vs our candles),
+    ///   the Dhan static-IP / IP-verify gates, the dual-instance lock
+    ///   (one Dhan account), and the order-path events (orders, circuit
+    ///   breaker, rate limit, orphan positions — Dhan is the only broker
+    ///   with orders).
+    /// - Groww-scoped (static): the sidecar reject diagnostic + the Groww
+    ///   per-minute REST legs (spot 1m + option chain + option contract).
     /// - Feed-generic (dynamic): the `Feed*` events resolve from their
     ///   `feed` field; an unknown feed name renders un-badged (honest —
-    ///   never a wrong badge).
+    ///   never a wrong badge). The WS sleep/wake events also resolve from
+    ///   their `feed` field, falling back to Dhan for the legacy
+    ///   "main"/"order_update" values (both are Dhan WebSocket types).
     ///
-    /// Everything else (QuestDB, boot, risk, orders, self-test, SLO, market
-    /// digests) returns `None` and renders exactly as before.
+    /// # Host/system convention (operator directive 2026-07-14)
+    ///
+    /// Genuinely feed-agnostic events (host disk, box shutdown, process
+    /// death, QuestDB, boot, self-test, the dual-feed scorecard) stay
+    /// UN-badged — never a wrong broker tag — and their titles name the
+    /// system component in plain words ("tickvault", "QuestDB", "the
+    /// server") so they read as host-level at a glance. The CloudWatch
+    /// alarm phrases (Telegram webhook lambda) follow the same convention
+    /// with explicit "🔷 DHAN:" / "🖥 HOST:" phrase prefixes.
     #[must_use]
     pub fn feed_badge(&self) -> Option<&'static str> {
         use super::feed_badge::{FeedBadge, feed_badge_for_name};
@@ -1988,9 +2005,6 @@ impl NotificationEvent {
             | Self::WebSocketDisconnected { .. }
             | Self::WebSocketDisconnectedOffHours { .. }
             | Self::WebSocketReconnected { .. }
-            | Self::WebSocketSleepEntered { .. }
-            | Self::WebSocketSleepResumed { .. }
-            | Self::WebSocketTokenForceRenewedOnWake { .. }
             | Self::TokenForcedRemintTriggered { .. }
             | Self::WebSocketReconnectionExhausted { .. }
             // ── Dhan-scoped: order-update WebSocket ──
@@ -2000,15 +2014,77 @@ impl NotificationEvent {
             | Self::OrderUpdateReconnected { .. }
             // ── Dhan-scoped: instrument master build ──
             | Self::InstrumentBuildSuccess { .. }
-            | Self::InstrumentBuildFailed { .. } => Some(FeedBadge::Dhan.badge()),
+            | Self::InstrumentBuildFailed { .. }
+            // ── Dhan-scoped: per-minute REST legs (spot 1m + option
+            //    chain) — operator directive 2026-07-14: the pull alerts
+            //    must name the feed AND the leg ──
+            | Self::Spot1mFetchDegraded { .. }
+            | Self::Spot1mFetchRecovered { .. }
+            | Self::Spot1mSidNotServed { .. }
+            | Self::Spot1mSidServedRecovered { .. }
+            | Self::ChainFetchDegraded { .. }
+            | Self::ChainFetchRecovered { .. }
+            | Self::ChainEntitlementAbsent { .. }
+            | Self::ChainEntitlementConfirmed
+            | Self::ChainExpirylistFailed { .. }
+            // ── Dhan-scoped: market-open milestones (count the Dhan pool
+            //    + order-update WS) ──
+            | Self::MarketOpenStreamingConfirmation { .. }
+            | Self::MarketOpenStreamingFailed { .. }
+            | Self::MarketOpenReadinessConfirmation { .. }
+            // ── Dhan-scoped: daily candle cross-check (Dhan REST vs our
+            //    candles) + the 09:15 bar cross-check ──
+            | Self::CrossVerify1mSummary { .. }
+            | Self::CrossVerify1mAborted { .. }
+            | Self::BarMismatchCorrectedFromHistorical { .. }
+            | Self::BarMismatchCrossCheckInconclusive { .. }
+            | Self::BarMismatchCrossCheckFailed { .. }
+            // ── Dhan-scoped: static-IP / IP-verify gates + the
+            //    dual-instance lock (one Dhan account, one token) ──
+            | Self::IpVerificationFailed { .. }
+            | Self::IpVerificationSuccess { .. }
+            | Self::StaticIpBootCheckPassed { .. }
+            | Self::StaticIpBootCheckFailed { .. }
+            | Self::StaticIpBootCheckRetrying { .. }
+            | Self::DualInstanceDetected { .. }
+            // ── Dhan-scoped: order path (Dhan is the only broker with
+            //    orders) ──
+            | Self::OrderRejected { .. }
+            | Self::CircuitBreakerOpened { .. }
+            | Self::CircuitBreakerClosed
+            | Self::RateLimitExhausted { .. }
+            | Self::OrphanPositionDetected { .. }
+            | Self::OrphanPositionsClean => Some(FeedBadge::Dhan.badge()),
             // ── Groww-scoped ──
-            Self::GrowwSidecarRejected { .. } => Some(FeedBadge::Groww.badge()),
+            Self::GrowwSidecarRejected { .. }
+            // ── Groww-scoped: per-minute REST legs (spot 1m + option
+            //    chain + option contract) ──
+            | Self::GrowwSpot1mFetchDegraded { .. }
+            | Self::GrowwSpot1mFetchRecovered { .. }
+            | Self::GrowwChain1mFetchDegraded { .. }
+            | Self::GrowwChain1mFetchRecovered { .. }
+            | Self::GrowwChain1mExpiryUnresolved { .. }
+            | Self::GrowwChain1mProbeVerdict { .. }
+            | Self::GrowwContract1mFetchDegraded { .. }
+            | Self::GrowwContract1mFetchRecovered { .. }
+            | Self::GrowwContract1mBookUnresolved { .. } => Some(FeedBadge::Groww.badge()),
             // ── Feed-generic: badge follows the `feed` field ──
             Self::FeedAuthOk { feed }
             | Self::FeedInstrumentsLoaded { feed, .. }
             | Self::FeedConnectedAwaitingTicks { feed, .. }
             | Self::FeedDown { feed, .. }
             | Self::FeedRecovered { feed, .. } => feed_badge_for_name(feed).map(|b| b.badge()),
+            // ── WS sleep/wake: badge follows the `feed` field, falling
+            //    back to Dhan — the live values are "main"/"order_update"
+            //    (both Dhan WebSocket types); a future feed value like
+            //    "groww" would badge correctly ──
+            Self::WebSocketSleepEntered { feed, .. }
+            | Self::WebSocketSleepResumed { feed, .. }
+            | Self::WebSocketTokenForceRenewedOnWake { feed, .. } => Some(
+                feed_badge_for_name(feed)
+                    .unwrap_or(FeedBadge::Dhan)
+                    .badge(),
+            ),
             _ => None,
         }
     }
@@ -2039,26 +2115,35 @@ impl NotificationEvent {
                 // midnight boot is silent until 9:16 AM and the operator
                 // asked "what happened to it?"). Truthful per-leg wording —
                 // a switched-off leg says so.
+                // 2026-07-14 operator broker-tag directive: the capture
+                // line reports the DHAN per-minute REST legs — say so, and
+                // note the Groww per-minute legs report on their own
+                // alerts (they are config-gated in their own modules).
                 let capture_line = match (spot_1m_enabled, chain_1m_enabled) {
                     (true, true) => format!(
-                        "\u{2705} Per-minute price capture — armed (fires \
-                         9:16 AM to 3:30 PM IST on trading days): spot \
-                         candles for {spot_1m_indices} indices + option \
-                         chain for {chain_1m_underlyings} indices"
+                        "\u{2705} Dhan per-minute price capture — armed \
+                         (fires 9:16 AM to 3:30 PM IST on trading days): \
+                         Dhan spot candles for {spot_1m_indices} indices + \
+                         Dhan option chain for {chain_1m_underlyings} \
+                         indices (Groww per-minute legs report separately)"
                     ),
                     (true, false) => format!(
-                        "\u{2705} Per-minute price capture — armed (fires \
-                         9:16 AM to 3:30 PM IST on trading days): spot \
-                         candles for {spot_1m_indices} indices; option \
-                         chain — switched off"
+                        "\u{2705} Dhan per-minute price capture — armed \
+                         (fires 9:16 AM to 3:30 PM IST on trading days): \
+                         Dhan spot candles for {spot_1m_indices} indices; \
+                         Dhan option chain — switched off (Groww per-minute \
+                         legs report separately)"
                     ),
                     (false, true) => format!(
-                        "\u{2705} Per-minute price capture — armed (fires \
-                         9:16 AM to 3:30 PM IST on trading days): option \
-                         chain for {chain_1m_underlyings} indices; spot \
-                         candles — switched off"
+                        "\u{2705} Dhan per-minute price capture — armed \
+                         (fires 9:16 AM to 3:30 PM IST on trading days): \
+                         Dhan option chain for {chain_1m_underlyings} \
+                         indices; Dhan spot candles — switched off (Groww \
+                         per-minute legs report separately)"
                     ),
-                    (false, false) => "Per-minute price capture — switched off".to_string(),
+                    (false, false) => "Dhan per-minute price capture — switched off \
+                         (Groww per-minute legs report separately)"
+                        .to_string(),
                 };
                 format!(
                     "<b>tickvault started</b>\nMode: {mode}\nBuild: {build}\n\
@@ -2277,7 +2362,7 @@ impl NotificationEvent {
                 format!(
                     "<b>End-of-day digest @ 15:31:30 IST</b>\n\
                      Trading date: {trading_date_ist}\n\
-                     Main feed: {main_feed_active}/{main_feed_total}\n\
+                     Dhan main feed: {main_feed_active}/{main_feed_total}\n\
                      Token headroom: {token_remaining_hours}h\n\
                      {feed_block}\
                      {close_status}{token_warning}"
@@ -2475,15 +2560,15 @@ impl NotificationEvent {
                 minute_ist,
             } => {
                 format!(
-                    "\u{1f198} <b>Minute-by-minute index candle pull is FAILING</b>\n\
-                     The per-minute pull of the official 1-minute candle for \
-                     NIFTY, BANKNIFTY and SENSEX has failed \
+                    "\u{1f198} <b>Minute-by-minute spot index candle pull is FAILING</b>\n\
+                     The per-minute pull of Dhan's official 1-minute candle \
+                     for NIFTY, BANKNIFTY and SENSEX has failed \
                      {consecutive_failed_minutes} minutes in a row (latest \
                      failed minute: {minute_ist} IST).\n\
                      Live streaming prices are NOT affected — only the \
                      per-minute official record copy is missing.\n\
                      What to do RIGHT NOW:\n\
-                     1. Check the broker data subscription is still active.\n\
+                     1. Check the Dhan data subscription is still active.\n\
                      2. If live streaming prices ALSO stopped, treat it as a \
                      full data outage.\n\
                      3. Missing minutes fill in safely once the pull recovers."
@@ -2494,7 +2579,7 @@ impl NotificationEvent {
                 failed_minutes,
             } => {
                 format!(
-                    "\u{2705} <b>Minute-by-minute index candle pull recovered</b>\n\
+                    "\u{2705} <b>Minute-by-minute spot index candle pull recovered</b>\n\
                      The per-minute official candle pull is working again as \
                      of {minute_ist} IST, after {failed_minutes} failed \
                      minute(s). The minutes that failed stay blank in the \
@@ -2506,7 +2591,7 @@ impl NotificationEvent {
                 minute_ist,
             } => {
                 format!(
-                    "\u{1f198} <b>Groww minute-by-minute index candle pull is FAILING</b>\n\
+                    "\u{1f198} <b>Groww minute-by-minute spot index candle pull is FAILING</b>\n\
                      The per-minute pull of the official 1-minute candle for \
                      NIFTY, BANKNIFTY and SENSEX from the second broker \
                      (Groww) has failed {consecutive_failed_minutes} minutes \
@@ -2526,7 +2611,7 @@ impl NotificationEvent {
                 failed_minutes,
             } => {
                 format!(
-                    "\u{2705} <b>Groww minute-by-minute index candle pull recovered</b>\n\
+                    "\u{2705} <b>Groww minute-by-minute spot index candle pull recovered</b>\n\
                      The Groww per-minute official candle pull is working \
                      again as of {minute_ist} IST, after {failed_minutes} \
                      failed minute(s). The minutes that failed stay blank in \
@@ -2544,7 +2629,7 @@ impl NotificationEvent {
                      1-minute candle for {symbol} was missing from the \
                      per-minute pull while the other indices came through \
                      fine — the other indices are unaffected, so this looks \
-                     like the broker not serving THIS index, not a general \
+                     like Dhan not serving THIS index, not a general \
                      outage.\n\
                      Live streaming prices are NOT affected — only the \
                      per-minute official record copy for {symbol} is \
@@ -2552,9 +2637,9 @@ impl NotificationEvent {
                      What to do RIGHT NOW:\n\
                      1. Nothing urgent — the other indices keep recording \
                      normally.\n\
-                     2. If this fires every day, ask the broker whether \
+                     2. If this fires every day, ask Dhan whether \
                      1-minute candles exist for this index at all.\n\
-                     3. Missing minutes fill in safely if the broker starts \
+                     3. Missing minutes fill in safely if Dhan starts \
                      serving them."
                 )
             }
@@ -2619,7 +2704,7 @@ impl NotificationEvent {
                      1. Nothing urgent — the affected recording is off for \
                      today only.\n\
                      2. If this repeats daily, the Groww contract list has a \
-                     problem — check with the broker."
+                     problem — check with Groww."
                 )
             }
             Self::GrowwChain1mProbeVerdict { ok, detail } => {
@@ -2691,7 +2776,7 @@ impl NotificationEvent {
                      Live streaming prices are NOT affected. Tomorrow's start \
                      retries automatically.\n\
                      If this repeats for days, the contract list itself has a \
-                     problem — check with the broker."
+                     problem — check with Groww."
                 )
             }
             Self::ChainFetchDegraded {
@@ -2706,7 +2791,7 @@ impl NotificationEvent {
                      Live streaming prices are NOT affected — only the \
                      per-minute option chain record is missing.\n\
                      What to do RIGHT NOW:\n\
-                     1. Check the broker data subscription is still active.\n\
+                     1. Check the Dhan data subscription is still active.\n\
                      2. If live streaming prices ALSO stopped, treat it as a \
                      full data outage.\n\
                      3. Missing minutes stay blank — nothing is made up."
@@ -2733,14 +2818,14 @@ impl NotificationEvent {
                     format!(
                         "\u{1f198} <b>Option chain recording CANNOT run — no data \
                          subscription</b>\n\
-                         The broker refused the option chain data request: this \
+                         Dhan refused the option chain data request: this \
                          account has NO option chain data subscription right now.\n\
-                         Broker said: {detail}\n\
+                         Dhan said: {detail}\n\
                          Option chain recording stays OFF for today. Live \
                          streaming prices are NOT affected.\n\
                          What to do RIGHT NOW:\n\
-                         1. Buy/renew the option chain data subscription with the \
-                         broker, OR\n\
+                         1. Buy/renew the option chain data subscription with \
+                         Dhan, OR\n\
                          2. Turn the option chain recording setting off so this \
                          alert stops."
                     )
@@ -2748,18 +2833,18 @@ impl NotificationEvent {
                     format!(
                         "\u{1f514} <b>Option chain check: NOT available on this \
                          account</b>\n\
-                         Today's one-time check confirmed the broker account has \
-                         NO option chain data subscription (broker said: \
+                         Today's one-time check confirmed the Dhan account has \
+                         NO option chain data subscription (Dhan said: \
                          {detail}).\n\
                          Nothing is broken — option chain recording is switched \
-                         off and stays off. Buy the subscription with the broker \
+                         off and stays off. Buy the subscription with Dhan \
                          if you want this data."
                     )
                 }
             }
             Self::ChainEntitlementConfirmed => "\u{2705} <b>Option chain data IS available on \
                  this account</b>\n\
-                 Today's one-time check confirmed the broker WILL serve option \
+                 Today's one-time check confirmed Dhan WILL serve option \
                  chain data. Recording is currently switched OFF.\n\
                  To start recording it minute-by-minute: turn ON the option \
                  chain setting and restart the app."
@@ -2771,12 +2856,12 @@ impl NotificationEvent {
                      The day-start lookup of option expiry dates failed after \
                      several tries, so option chain recording stays OFF for \
                      today (expiry dates are never guessed).\n\
-                     Broker said: {detail}\n\
+                     Dhan said: {detail}\n\
                      Live streaming prices are NOT affected. Tomorrow's start \
                      retries automatically.\n\
                      What to do RIGHT NOW:\n\
-                     1. Check the broker data connection is healthy.\n\
-                     2. If this repeats daily, contact the broker."
+                     1. Check the Dhan data connection is healthy.\n\
+                     2. If this repeats daily, contact Dhan."
                 )
             }
             Self::DualFeedDailyScorecard {
@@ -4732,42 +4817,59 @@ mod tests {
             chain_1m_underlyings: 3,
         };
 
+        // 2026-07-14 broker tag: the capture line reports the DHAN REST
+        // legs — it must SAY Dhan and note the Groww legs report on their
+        // own alerts (every arm).
         let both = build(true, true).to_message();
         assert!(
-            both.contains("Per-minute price capture — armed"),
+            both.contains("Dhan per-minute price capture — armed"),
             "got: {both}"
         );
         assert!(both.contains("9:16 AM to 3:30 PM IST"), "got: {both}");
-        assert!(both.contains("spot candles for 4 indices"), "got: {both}");
-        assert!(both.contains("option chain for 3 indices"), "got: {both}");
+        assert!(
+            both.contains("Dhan spot candles for 4 indices"),
+            "got: {both}"
+        );
+        assert!(
+            both.contains("Dhan option chain for 3 indices"),
+            "got: {both}"
+        );
         assert!(!both.contains("switched off"), "got: {both}");
+        assert!(
+            both.contains("Groww per-minute legs report separately"),
+            "got: {both}"
+        );
 
         let chain_off = build(true, false).to_message();
         assert!(
-            chain_off.contains("spot candles for 4 indices"),
+            chain_off.contains("Dhan spot candles for 4 indices"),
             "got: {chain_off}"
         );
         assert!(
-            chain_off.contains("option chain — switched off"),
+            chain_off.contains("Dhan option chain — switched off"),
             "got: {chain_off}"
         );
 
         let spot_off = build(false, true).to_message();
         assert!(
-            spot_off.contains("option chain for 3 indices"),
+            spot_off.contains("Dhan option chain for 3 indices"),
             "got: {spot_off}"
         );
         assert!(
-            spot_off.contains("spot candles — switched off"),
+            spot_off.contains("Dhan spot candles — switched off"),
             "got: {spot_off}"
         );
 
         let both_off = build(false, false).to_message();
         assert!(
-            both_off.contains("Per-minute price capture — switched off"),
+            both_off.contains("Dhan per-minute price capture — switched off"),
             "got: {both_off}"
         );
         assert!(!both_off.contains("armed"), "got: {both_off}");
+        assert!(
+            both_off.contains("Groww per-minute legs report separately"),
+            "got: {both_off}"
+        );
     }
 
     #[test]
@@ -7000,7 +7102,9 @@ mod tests {
         let msg = event.to_message();
         assert!(msg.contains("End-of-day digest @ 15:31:30 IST"));
         assert!(msg.contains("Trading date: 2026-05-15"));
-        assert!(msg.contains("Main feed: 1/1"));
+        // 2026-07-14 broker tag: the digest is a BOTH-feed summary, so the
+        // Dhan connection-count line names Dhan explicitly.
+        assert!(msg.contains("Dhan main feed: 1/1"));
         assert!(msg.contains("Token headroom: 20h"));
         assert!(msg.contains("Feed stayed up through close."));
         // No token warning when headroom is healthy.
@@ -7036,7 +7140,7 @@ mod tests {
             feeds: vec![],
         };
         let msg = event.to_message();
-        assert!(msg.contains("Main feed: 0/1"));
+        assert!(msg.contains("Dhan main feed: 0/1"));
         assert!(msg.contains("check overnight logs"));
         assert!(!msg.contains("stayed up"));
     }
@@ -7302,8 +7406,11 @@ mod tests {
 
     #[test]
     fn test_non_feed_events_carry_no_feed_badge() {
-        // Non-feed events are byte-identical to before — no badge, no "—"
-        // prefix injected.
+        // Host/system-level events are byte-identical to before — no badge,
+        // no "—" prefix injected (never a wrong broker tag; their titles
+        // already name the system component in plain words).
+        // NOTE (2026-07-14): IpVerificationSuccess moved OUT of this list —
+        // it is Dhan-scoped (static-IP order gate) and now carries 🔷 DHAN.
         let events = [
             NotificationEvent::StartupComplete {
                 mode: "sandbox",
@@ -7316,8 +7423,9 @@ mod tests {
                 writer: "ticks".to_string(),
                 failed_checks_before_recovery: 3,
             },
-            NotificationEvent::IpVerificationSuccess {
-                verified_ip: "1.2.3.4".to_string(),
+            NotificationEvent::BootHealthCheck {
+                services_healthy: 3,
+                services_total: 3,
             },
             NotificationEvent::ShutdownComplete,
         ];
@@ -7329,6 +7437,205 @@ mod tests {
                 "non-feed body must not lead with a feed badge: {msg}"
             );
         }
+    }
+
+    #[test]
+    fn test_dhan_rest_leg_events_carry_dhan_badge() {
+        // Operator directive 2026-07-14: the per-minute REST pull alerts
+        // must name the feed. Every Dhan REST-leg event (spot 1m + option
+        // chain) leads with the Dhan badge — trigger AND recovery pairwise,
+        // so an edge-cleared message can never render un-tagged while its
+        // trigger is tagged. Ratchet: removing any arm fails this test.
+        let events = [
+            NotificationEvent::Spot1mFetchDegraded {
+                consecutive_failed_minutes: 3,
+                minute_ist: "10:15".to_string(),
+            },
+            NotificationEvent::Spot1mFetchRecovered {
+                minute_ist: "10:18".to_string(),
+                failed_minutes: 3,
+            },
+            NotificationEvent::Spot1mSidNotServed {
+                symbol: "INDIA VIX".to_string(),
+                consecutive_minutes: 10,
+            },
+            NotificationEvent::Spot1mSidServedRecovered {
+                symbol: "INDIA VIX".to_string(),
+                not_served_minutes: 10,
+            },
+            NotificationEvent::ChainFetchDegraded {
+                consecutive_failed_minutes: 3,
+                minute_ist: "10:15".to_string(),
+            },
+            NotificationEvent::ChainFetchRecovered {
+                minute_ist: "10:18".to_string(),
+                failed_minutes: 3,
+            },
+            NotificationEvent::ChainEntitlementAbsent {
+                pipeline_enabled: true,
+                detail: "no subscription".to_string(),
+            },
+            NotificationEvent::ChainEntitlementConfirmed,
+            NotificationEvent::ChainExpirylistFailed {
+                detail: "lookup failed".to_string(),
+            },
+        ];
+        for ev in events {
+            assert_eq!(ev.feed_badge(), Some("🔷 DHAN"), "event: {}", ev.topic());
+            let msg = ev.to_message();
+            assert!(
+                msg.starts_with("🔷 DHAN — "),
+                "Dhan REST-leg body must lead with the Dhan badge: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_groww_rest_leg_events_carry_groww_badge() {
+        // The Groww per-minute REST legs (spot 1m + option chain + option
+        // contract) lead with the Groww badge — trigger AND recovery
+        // pairwise. Ratchet: removing any arm fails this test.
+        let events = [
+            NotificationEvent::GrowwSpot1mFetchDegraded {
+                consecutive_failed_minutes: 3,
+                minute_ist: "10:15".to_string(),
+            },
+            NotificationEvent::GrowwSpot1mFetchRecovered {
+                minute_ist: "10:18".to_string(),
+                failed_minutes: 3,
+            },
+            NotificationEvent::GrowwChain1mFetchDegraded {
+                consecutive_failed_minutes: 3,
+                minute_ist: "10:15".to_string(),
+            },
+            NotificationEvent::GrowwChain1mFetchRecovered {
+                minute_ist: "10:18".to_string(),
+                failed_minutes: 3,
+            },
+            NotificationEvent::GrowwChain1mExpiryUnresolved {
+                detail: "no usable expiry".to_string(),
+            },
+            NotificationEvent::GrowwChain1mProbeVerdict {
+                ok: true,
+                detail: "3 chains".to_string(),
+            },
+            NotificationEvent::GrowwContract1mFetchDegraded {
+                consecutive_failed_minutes: 3,
+                minute_ist: "10:15".to_string(),
+            },
+            NotificationEvent::GrowwContract1mFetchRecovered {
+                minute_ist: "10:18".to_string(),
+                failed_minutes: 3,
+            },
+            NotificationEvent::GrowwContract1mBookUnresolved {
+                detail: "no usable contracts".to_string(),
+            },
+        ];
+        for ev in events {
+            assert_eq!(ev.feed_badge(), Some("🟢 GROWW"), "event: {}", ev.topic());
+            let msg = ev.to_message();
+            assert!(
+                msg.starts_with("🟢 GROWW — "),
+                "Groww REST-leg body must lead with the Groww badge: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_dhan_scoped_gate_and_order_events_carry_dhan_badge() {
+        // The market-open milestones (they count the Dhan pool), the daily
+        // candle cross-checks (Dhan REST vs our candles), the static-IP /
+        // IP-verify gates, the dual-instance lock, and the order-path
+        // events are all Dhan-scoped — badge ratchet (2026-07-14).
+        let events = [
+            NotificationEvent::MarketOpenStreamingConfirmation {
+                main_feed_active: 1,
+                main_feed_total: 1,
+                order_update_active: true,
+            },
+            NotificationEvent::MarketOpenStreamingFailed {
+                main_feed_active: 0,
+                main_feed_total: 1,
+                order_update_active: false,
+            },
+            NotificationEvent::MarketOpenReadinessConfirmation {
+                main_feed_active: 1,
+                main_feed_total: 1,
+                order_update_active: true,
+                token_remaining_secs: 8 * 3600,
+            },
+            NotificationEvent::CrossVerify1mSummary {
+                trading_date_ist: "2026-07-14".to_string(),
+                instruments: 4,
+                compared: 1500,
+                mismatches: 0,
+                missing: 0,
+                degraded: false,
+            },
+            NotificationEvent::CrossVerify1mAborted {
+                detail: "task died".to_string(),
+            },
+            NotificationEvent::BarMismatchCrossCheckFailed {
+                reason: "all fetches errored".to_string(),
+            },
+            NotificationEvent::IpVerificationFailed {
+                reason: "mismatch".to_string(),
+            },
+            NotificationEvent::IpVerificationSuccess {
+                verified_ip: "1.2.3.4".to_string(),
+            },
+            NotificationEvent::StaticIpBootCheckPassed {
+                ip_flag: "PRIMARY".to_string(),
+            },
+            NotificationEvent::DualInstanceDetected {
+                holder: "local:123:abc".to_string(),
+                lock_key: "instance-lock".to_string(),
+            },
+            NotificationEvent::OrderRejected {
+                correlation_id: "abc".to_string(),
+                reason: "rejected".to_string(),
+            },
+            NotificationEvent::CircuitBreakerClosed,
+            NotificationEvent::RateLimitExhausted {
+                limit_type: "per_second".to_string(),
+            },
+            NotificationEvent::OrphanPositionsClean,
+        ];
+        for ev in events {
+            assert_eq!(ev.feed_badge(), Some("🔷 DHAN"), "event: {}", ev.topic());
+            assert!(
+                ev.to_message().starts_with("🔷 DHAN — "),
+                "Dhan-scoped body must lead with the Dhan badge: {}",
+                ev.to_message()
+            );
+        }
+    }
+
+    #[test]
+    fn test_sleep_events_badge_follows_feed_field_with_dhan_fallback() {
+        // The WS sleep/wake events carry a `feed` field whose live values
+        // are "main"/"order_update" (both Dhan WebSocket types) — those
+        // fall back to the Dhan badge; a future "groww" value badges
+        // Groww. Never un-badged, never a static lie (2026-07-14).
+        let main = NotificationEvent::WebSocketSleepEntered {
+            feed: "main".to_string(),
+            connection_index: 0,
+            sleep_secs: 3600,
+        };
+        assert_eq!(main.feed_badge(), Some("🔷 DHAN"));
+        let order_update = NotificationEvent::WebSocketSleepResumed {
+            feed: "order_update".to_string(),
+            connection_index: 0,
+            slept_for_secs: 3600,
+        };
+        assert_eq!(order_update.feed_badge(), Some("🔷 DHAN"));
+        let groww = NotificationEvent::WebSocketTokenForceRenewedOnWake {
+            feed: "groww".to_string(),
+            connection_index: 0,
+            remaining_secs_before: 100,
+            threshold_secs: 14400,
+        };
+        assert_eq!(groww.feed_badge(), Some("🟢 GROWW"));
     }
 
     #[test]
@@ -7474,7 +7781,12 @@ mod tests {
         // 10-commandments check: emoji-first subject, IST 12-hour time,
         // real numbers, no file paths, no library names.
         let msg = cv_summary(91_230, 0, 0, false).to_message();
-        assert!(msg.starts_with('\u{2705}'), "clean summary leads with ✅");
+        // 2026-07-14 broker tag: the Dhan badge leads the body; the
+        // severity emoji stays first WITHIN the summary line.
+        assert!(
+            msg.starts_with("🔷 DHAN — \u{2705}"),
+            "clean summary leads with the Dhan badge then ✅: {msg}"
+        );
         assert!(msg.contains("3:31 PM IST"), "IST 12-hour time");
         assert!(msg.contains("PASS"));
         assert!(msg.contains("Date: 2026-06-10"));
@@ -7488,7 +7800,10 @@ mod tests {
     #[test]
     fn test_cross_verify_1m_summary_failure_message_has_action_lines() {
         let msg = cv_summary(91_230, 42, 15, false).to_message();
-        assert!(msg.starts_with('\u{26a0}'), "failure summary leads with ⚠️");
+        assert!(
+            msg.starts_with("🔷 DHAN — \u{26a0}"),
+            "failure summary leads with the Dhan badge then ⚠️: {msg}"
+        );
         assert!(msg.contains("NEEDS ATTENTION"));
         assert!(msg.contains("Mismatches: 42 | Missing: 15"));
         assert!(msg.contains("What to do RIGHT NOW"));

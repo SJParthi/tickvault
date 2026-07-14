@@ -402,6 +402,47 @@ class PlainTextTransport(unittest.TestCase):
             for word in banned:
                 self.assertNotIn(word, phrase, f"banned token {word!r} in {phrase!r}")
 
+    def test_broker_scoped_alarm_phrases_carry_dhan_tag(self) -> None:
+        # Operator directive 2026-07-14: broker-specific alarm phrases lead
+        # with the broker tag; the OK flip reuses the phrase so recoveries
+        # inherit the tag automatically. Ratchet — removing a tag fails here.
+        # token-remaining-low wording is coordinator-ruled EXACT (2026-07-14).
+        self.assertEqual(
+            handler.ALARM_PHRASES["token-remaining-low"],
+            "🔷 DHAN: access token expires soon — spot-1m + option-chain pulls will stop",
+        )
+        for key in (
+            "ws-pool-all-dead",
+            "ws-failed-connections",
+            "ws-reconnect-gap-high",
+            "tick-gap-instruments-silent",
+        ):
+            self.assertTrue(
+                handler.ALARM_PHRASES[key].startswith("🔷 DHAN: "),
+                f"{key} must lead with the DHAN tag: {handler.ALARM_PHRASES[key]!r}",
+            )
+
+    def test_host_scoped_liveness_phrase_carries_host_tag(self) -> None:
+        # The app-silent alarm is the whole PROCESS (not one broker feed) —
+        # it must read as host/system-level, never broker-ambiguous.
+        self.assertTrue(
+            handler.ALARM_PHRASES["market-hours-liveness-missing"].startswith("🖥 HOST: "),
+            f"got: {handler.ALARM_PHRASES['market-hours-liveness-missing']!r}",
+        )
+
+    def test_recovered_line_inherits_broker_tag_from_phrase(self) -> None:
+        # OK flip renders "✅ Recovered: {phrase} — {IST} IST" — the tag
+        # rides inside the phrase, so the recovery names the same broker.
+        out = handler._house_line(
+            {
+                "AlarmName": "tv-prod-token-remaining-low",
+                "NewStateValue": "OK",
+                "StateChangeTime": "2026-07-14T04:31:12.345+0000",
+            }
+        )
+        self.assertTrue(out.startswith("✅ Recovered: "))
+        self.assertIn("🔷 DHAN:", out)
+
 
 if __name__ == "__main__":
     unittest.main()

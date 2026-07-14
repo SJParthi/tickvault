@@ -1196,6 +1196,18 @@ pub fn render_episode_recovering(state: &EpisodeState, _ctx: &EpisodeRenderCtx) 
     render_status_lines(state, "Now: reconnected — confirming…")
 }
 
+/// The feed description for the recovered / stale-closed close lines —
+/// carries the SAME broker badge the DOWN bubble led with (operator
+/// directive 2026-07-14: recovered / edge-cleared messages must carry the
+/// same tag as their trigger). The Boot family keeps its plain
+/// description (🚀 is a milestone marker, not a broker tag).
+fn badged_feed_desc(family: EpisodeFamily) -> String {
+    match family {
+        EpisodeFamily::Boot => family.feed_desc().to_string(),
+        f => format!("{} {}", f.badge(), f.feed_desc()),
+    }
+}
+
 /// Neutral close line for a stale-expired Down episode — the incident
 /// stopped reporting (typical cause: a restart whose clean first connect
 /// emits no recovery event). ONE line, plain English, IST 12-hour time.
@@ -1204,7 +1216,7 @@ pub fn render_episode_stale_closed(state: &EpisodeState) -> String {
     let last = format_ist_12h(state.last_event_ms);
     format!(
         "\u{26aa} {desc} alert closed — no updates since {last} IST. Any new problem will open a fresh alert.",
-        desc = state.key.family.feed_desc(),
+        desc = badged_feed_desc(state.key.family),
     )
 }
 
@@ -1220,7 +1232,7 @@ pub fn render_episode_recovered(state: &EpisodeState, ctx: &EpisodeRenderCtx) ->
     let closed = format_ist_12h(ctx.now_ms);
     format!(
         "\u{2705} Recovered — {desc} back. Down {dur}, {att} attempts ({opened}–{closed} IST)",
-        desc = state.key.family.feed_desc(),
+        desc = badged_feed_desc(state.key.family),
         dur = format_duration_human(down_secs),
         att = state.attempts,
     )
@@ -2427,6 +2439,53 @@ mod tests {
         for banned in ["rkyv", "papaya", "mpsc", ".rs", "data/", "editMessageText"] {
             assert!(!line.contains(banned), "banned {banned:?} in {line:?}");
         }
+    }
+
+    #[test]
+    fn test_render_episode_recovered_carries_feed_badge() {
+        // Operator directive 2026-07-14: the recovered close line carries
+        // the SAME broker badge the DOWN bubble led with — a recovery must
+        // never lose the tag its trigger carried (ratchet).
+        for family in [EpisodeFamily::MainFeedWs, EpisodeFamily::OrderUpdateWs] {
+            let mut st = EpisodeState::open(EpisodeKey { family, conn: 1 }, Severity::High, NOW);
+            st.attempts = 4;
+            let ctx = EpisodeRenderCtx {
+                now_ms: NOW + 90_000,
+            };
+            let line = render_episode_recovered(&st, &ctx);
+            assert!(
+                line.contains("\u{1f537} DHAN"),
+                "recovered line must carry the same badge as the DOWN bubble: {line:?}"
+            );
+            assert!(line.starts_with('\u{2705}'), "green stays first: {line:?}");
+        }
+        // The boot bubble is a milestone checklist, not a broker feed —
+        // its close line stays badge-free.
+        let boot = EpisodeState::open(BOOT_EPISODE_KEY, Severity::High, NOW);
+        let ctx = EpisodeRenderCtx {
+            now_ms: NOW + 90_000,
+        };
+        let line = render_episode_recovered(&boot, &ctx);
+        assert!(
+            !line.contains("DHAN") && !line.contains("GROWW"),
+            "boot close line must not carry a broker badge: {line:?}"
+        );
+    }
+
+    #[test]
+    fn test_render_episode_stale_closed_carries_feed_badge() {
+        // Same-tag rule for the neutral stale-close line (2026-07-14).
+        let mut st = live_state(Some(1));
+        st.last_event_ms = NOW;
+        let line = render_episode_stale_closed(&st);
+        assert!(
+            line.contains("\u{1f537} DHAN"),
+            "stale-close line must carry the same badge as the DOWN bubble: {line:?}"
+        );
+        assert!(
+            line.starts_with('\u{26aa}'),
+            "neutral marker stays first: {line:?}"
+        );
     }
 
     // -- Boot bubble (2026-07-09) -------------------------------------------
