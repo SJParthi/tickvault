@@ -1404,6 +1404,7 @@ fn build_fetch_audit_row(
     error_class: &'static str,
 ) -> RestFetchAuditRow {
     RestFetchAuditRow {
+        close_to_persist_ms: -1,
         ts_ist_nanos: target_minute_ist_nanos,
         trading_date_ist_nanos: trading_date_nanos,
         feed: SPOT_1M_REST_FEED_GROWW,
@@ -3139,6 +3140,7 @@ mod tests {
                 &SymbolFetchOutcome::Found {
                     candle,
                     close_to_data_ms: 5,
+                    close_to_persist_ms: -1,
                     backfill_candle: None
                 },
                 &mk_forensics("none")
