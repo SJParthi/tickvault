@@ -1693,38 +1693,28 @@ async fn main() -> Result<()> {
     // (4-IDX_I LOCKED_UNIVERSE — diagnostic.rs module deleted; no CSV
     // download/parse/validate cycle to diagnose).
 
-    // -----------------------------------------------------------------------
-    // Two-Phase Boot: fast path ONLY during market hours on trading days.
-    // Outside market hours or non-trading days → always slow boot.
-    //
-    // INTENTIONAL: Mock trading Saturdays (is_mock_trading_today()) are
-    // excluded from fast boot. Mock sessions have different hours, are not
-    // real market sessions, and should always take the slow boot path
-    // which downloads fresh instruments. This is a safety decision —
-    // is_mock_trading is for logging/awareness only, never for trading gates.
-    // -----------------------------------------------------------------------
     // =======================================================================
-    // Step C — PER-FEED BOOT DISPATCHER (pluggable-feed-runtime.md §6)
+    // Step C — PER-FEED BOOT DISPATCHER (pluggable-feed-runtime.md §6),
+    // SINGLE-PATH since PR-C2 (2026-07-14, Dhan live-WS lane deletion).
     //
     // "A feed's code runs IFF its enable flag is true." All shared infra
-    // (observability, WAL replay, trading calendar, errors.jsonl) is already up,
-    // and the Groww lane (auth + bridge) was already spawned above gated on
-    // `groww_enabled`. If Dhan is disabled we SKIP the entire Dhan fast/slow
-    // boot block below and idle-await shutdown so the enabled lanes keep running.
-    //
-    // When `dhan_enabled=true` (prod default) this branch is skipped and the
-    // Dhan boot below is byte-identical to before.
+    // (observability, WAL replay, trading calendar, errors.jsonl) is already
+    // up, and the Groww lane (auth + bridge) was already spawned above gated
+    // on `groww_enabled`. This block is now a LOGGING dispatcher only: there
+    // is no Dhan fast/slow boot to skip anymore — the two-phase
+    // (fast-crash-recovery vs slow) Dhan boot arms, the lane gate, and the
+    // D2b runtime cold-start were all DELETED with the lane (operator
+    // retirement directive 2026-07-13; websocket-connection-scope-lock.md
+    // "2026-07-13 Amendment" §B). Every boot flows through ONE path:
+    // shared prefix → build_shared_infra → WAL settlement → REST stack
+    // (unconditional) → READY → run_process_runloop. `dhan_enabled=true` is
+    // an ILLEGAL post-retirement config (logged loudly + ignored at the
+    // REST-stack spawn below — dhan_enabled=false is the prod reality).
+    // The OFF-feed-isolation guarantee is now BY CONSTRUCTION: no Dhan auth
+    // beyond the REST stack's own, no instrument fetch, no Dhan WebSocket
+    // (except the stack's functional-dormant order-update WS) exists on any
+    // path.
     // =======================================================================
-    // D2 Stage 2 (genuine shared-infra hoist): the Dhan-OFF path no longer
-    // early-returns into a duplicate `run_shared_infra_only`. It now falls
-    // through to the SAME hoisted PROCESS-shared infra prefix below (notifier,
-    // health, seal-writer, broadcasts, the 3 subscriber tasks, API server incl.
-    // /api/feeds) and the SAME `run_process_runloop`, with the Dhan LANE skipped
-    // via the `if config.feeds.dhan_enabled` wrapper. The OFF-feed-isolation
-    // guarantee is preserved by construction: NO Dhan auth, NO instrument fetch,
-    // NO Dhan WebSocket runs when `dhan_enabled=false` (all of that lives inside
-    // the lane wrapper). Both the fast-arm guard below and the lane wrapper
-    // further down read `config.feeds.dhan_enabled`.
     if !config.feeds.dhan_enabled {
         if config.feeds.groww_enabled {
             info!(
@@ -1958,6 +1948,15 @@ async fn main() -> Result<()> {
     //   2. midnight reset — IST 00:00:00 clears prev-day state so the next live
     //                       tick re-arms (CCL-02 supervised respawn wrapper,
     //                       INDEX-OHLC-02).
+    //
+    // DORMANT SINCE PR-C2 (2026-07-14, Dhan live-WS lane deletion): the tick
+    // broadcast this consumer drains is PUBLISHER-LESS (the lane's
+    // `run_tick_processor` was the only publisher; Groww's IDX ticks flow
+    // through its OWN bridge, never this channel) — so the tracker can never
+    // arm and the INDEX-OHLC machinery can never fire. Retained un-deleted
+    // because the wiring is cheap, self-contained, and publisher-ready; its
+    // retain-vs-delete decision is a C3 call alongside the rest of the idle
+    // tick-broadcast consumers (see the plan's Observability note).
     // -----------------------------------------------------------------------
     let day_ohlc_tracker = std::sync::Arc::new(tickvault_trading::in_mem::DayOhlcTracker::new());
     {
@@ -2149,22 +2148,22 @@ async fn main() -> Result<()> {
 // Helper: S4-T1d — Slow-boot observability-only consumer
 // ---------------------------------------------------------------------------
 
-/// S4-T1d: Gap tracker + QuestDB HTTP health observer for the slow-boot
-/// path. In slow-boot mode the hot-path `run_tick_processor` owns its own
-/// `TickPersistenceWriter` and writes ticks directly; adding a second
-/// writer would double-persist every tick. This task is ADDITIVE —
+/// S4-T1d: Gap tracker + QuestDB HTTP health observer (the process-shared
+/// obs subscriber). PR-C2 truth-sync (2026-07-14): the "slow-boot" naming
+/// and the fast/slow parity prose are historical — there is ONE boot path
+/// now, and the tick broadcast this task subscribes to is PUBLISHER-LESS
+/// (the lane's `run_tick_processor`, the only Dhan tick publisher, was
+/// deleted; Groww persists via its own writer). The task is ADDITIVE —
 /// observability only, no writes:
 ///
-/// 1. Subscribes to the tick broadcast (cheap read-only clone)
-/// 2. Feeds every tick into `TickGapTracker::record_tick` and publishes
-///    a `GapBackfillRequest` on ERROR-level gaps (same as the fast-boot
-///    consumer)
+/// 1. Subscribes to the tick broadcast (idle post-C2 — kept so the wiring
+///    is publisher-ready and the channel never closes under the aggregator)
+/// 2. Feeds any tick into `TickGapTracker::record_tick` (no producer today;
+///    the detector itself deletes in C3)
 /// 3. Every 2 seconds, HTTP-pings QuestDB's `/exec` endpoint and feeds
-///    the result into `QuestDbHealthPoller` so the same metrics +
-///    CRITICAL logs fire as in fast-boot
-///
-/// Matches the zero-tick-loss observability surface in both boot modes
-/// so there is no blind spot.
+///    the result into `QuestDbHealthPoller` — the LIVE, load-bearing half:
+///    it owns the /health `questdb_reachable` flag write (see the param
+///    note below).
 async fn run_slow_boot_observability(
     mut tick_rx: tokio::sync::broadcast::Receiver<tickvault_common::tick_types::ParsedTick>,
     questdb_config: tickvault_common::config::QuestDbConfig,
@@ -2902,8 +2901,13 @@ struct SharedInfraHandles {
     health_status: SharedHealthStatus,
     /// The PROCESS-shared tick broadcast. The 3 subscriber tasks (obs,
     /// aggregator, tick-storage) are spawned in `build_shared_infra` and have
-    /// already `.subscribe()`d to this BEFORE any Dhan tick processor publishes.
-    /// The lane's `run_tick_processor` is the only publisher.
+    /// already `.subscribe()`d to this before anything could publish.
+    /// PUBLISHER-LESS since PR-C2 (2026-07-14): the lane's
+    /// `run_tick_processor` — the only publisher — was deleted with the Dhan
+    /// live-WS lane, and Groww persists via its own writer + owns its own
+    /// aggregator instance. Kept (with its subscribers) so the seal-writer
+    /// install + channel wiring stay publisher-ready; the C3 universe-chain
+    /// deletion decides whether the idle consumers go too.
     tick_broadcast_sender: tokio::sync::broadcast::Sender<tickvault_common::tick_types::ParsedTick>,
     /// The PROCESS-shared order-update broadcast (lane order-update WS publishes;
     /// trading pipeline subscribes).
@@ -3023,8 +3027,14 @@ async fn build_shared_infra(
 
     // --- Subscriber tasks: obs + 21-TF aggregator + tick-storage ---
     // ALL three `.subscribe()` to `tick_broadcast_sender` HERE, in the hoisted
-    // prefix, BEFORE the lane's `run_tick_processor` (the only publisher) runs.
-    // Subscribe-before-publish is therefore preserved by construction.
+    // prefix, before anything could publish — subscribe-before-publish is
+    // preserved by construction. PR-C2 (2026-07-14): the broadcast is
+    // PUBLISHER-LESS (the lane's `run_tick_processor` is deleted; Groww runs
+    // its own writer + aggregator instance), so these consumers idle. The
+    // wiring stays: the `spawn_seal_writer_loop` above installed the
+    // process-wide `global_seal_sender` that Groww's OWN aggregator drains
+    // through (load-bearing), and this Dhan aggregator instance's force-seal
+    // tasks are idempotent no-ops on its empty state.
     {
         let obs_rx = tick_broadcast_sender.subscribe();
         let questdb_cfg = config.questdb.clone();
@@ -3568,10 +3578,13 @@ mod tests {
         );
     }
 
-    /// Step C ratchet: the per-feed boot dispatcher gate must exist — when Dhan
-    /// is disabled the boot SKIPS the Dhan block and idle-awaits shutdown
-    /// (pluggable-feed-runtime.md §6). Guards against regressing back to the old
-    /// warn-only stub where `dhan_enabled=false` still ran Dhan.
+    /// Step C ratchet (single-path since PR-C2, 2026-07-14): the per-feed
+    /// boot dispatcher marker + the `!dhan_enabled` logging branch must
+    /// exist, and the run-loop must idle on the shared shutdown signal.
+    /// Pre-C2 this pinned "Dhan disabled ⇒ SKIP the Dhan fast/slow boot
+    /// block"; with the lane deleted there is no Dhan block to skip — the
+    /// pins now guard the surviving Groww-only / no-feed logging dispatcher
+    /// and the shutdown idle-await.
     #[test]
     fn test_step_c_dhan_disable_gate_exists() {
         let src = include_str!("main.rs");
@@ -3583,32 +3596,22 @@ mod tests {
             src.contains("PER-FEED BOOT DISPATCHER"),
             "Step C: the per-feed boot dispatcher block must be present"
         );
-        // The gate idles on the shared shutdown signal and returns — not a warn-only no-op.
+        // The run-loop idles on the shared shutdown signal — not a warn-only no-op.
         assert!(
             src.contains("wait_for_shutdown_signal().await"),
-            "Step C: the gate must idle-await the shutdown signal"
+            "Step C: the boot must idle-await the shutdown signal"
         );
     }
 
-    /// Step C ratchet: the gate must sit BEFORE the Dhan fast/slow boot decision
-    /// (`load_token_cache_fast`) so the Dhan block is genuinely skipped when
-    /// `dhan_enabled=false`. First-occurrence positions are the real gate + boot
-    /// (both are far above this test module).
-    #[test]
-    fn test_step_c_gate_precedes_dhan_boot() {
-        let src = include_str!("main.rs");
-        let gate_idx = src
-            .find("PER-FEED BOOT DISPATCHER")
-            .expect("gate marker present");
-        let dhan_boot_idx = src
-            .find("load_token_cache_fast")
-            .expect("Dhan boot decision present");
-        assert!(
-            gate_idx < dhan_boot_idx,
-            "Step C: the per-feed gate must precede the Dhan boot decision so \
-             dhan_enabled=false actually skips Dhan (gate@{gate_idx} boot@{dhan_boot_idx})"
-        );
-    }
+    // RETIRED 2026-07-14 (PR-C2 — Dhan live-WS lane deletion):
+    // `test_step_c_gate_precedes_dhan_boot` ordered the dispatcher gate
+    // BEFORE the Dhan fast/slow boot decision (`load_token_cache_fast`).
+    // That decision was DELETED with the lane, which made the test VACUOUS —
+    // its `src.find("load_token_cache_fast")` needle matched only the test's
+    // own doc comment (a Rule-11 false-OK), so it is retired rather than
+    // left pinning nothing. The surviving ordering contracts are
+    // `test_overlay_precedes_boot_skip_guard` (below) and the
+    // systemd_boot_notify_guard pinger-before-READY scan.
 
     /// PR-3 ratchet (3-agent hostile recommendation): the persisted feed-state
     /// overlay MUST be applied to `config.feeds` BEFORE any boot-skip guard reads
