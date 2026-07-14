@@ -1,0 +1,534 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <link href='https://fonts.googleapis.com/css?family=Hind:400,600|Open+Sans:400,600,700' rel='stylesheet' type='text/css'>
+    <title>Is intraday 1-minute historical data available until 2015? - Kite Connect developer forum</title>
+  <link rel="stylesheet" type="text/css" href="/forum/applications/dashboard/design/style.css?v=2.3.1" media="all" />
+  <link rel="stylesheet" type="text/css" href="/forum/plugins/ButtonBar/design/buttonbar.css?v=1.7.1" media="all" />
+  <link rel="stylesheet" type="text/css" href="/forum/plugins/GooglePrettify/design/prettify.css?v=1.2.2" media="all" />
+  <link rel="stylesheet" type="text/css" href="/forum/plugins/Tagging/design/tag.css?v=1.8.12" media="all" />
+  <link rel="stylesheet" type="text/css" href="/forum/plugins/Tagging/design/childtagslist.css?v=1.8.12" media="all" />
+  <link rel="stylesheet" type="text/css" href="/forum/resources/design/vanillicon.css?v=2.3.1" media="all" />
+  <link rel="stylesheet" type="text/css" href="/forum/plugins/editor/design/editor.css?v=1.7.7" media="all" />
+  <link rel="stylesheet" type="text/css" href="/forum/themes/kite/design/custom.css?v=2.3.1" media="all" />
+  <link rel="stylesheet" type="text/css" href="/forum/applications/dashboard/design/spoilers.css?v=2.3.1" media="all" />
+  <link rel="canonical" href="https://kite.trade/forum/discussion/8722/is-intraday-1-minute-historical-data-available-until-2015" />
+  <meta property="og:type" content="article" />
+  <meta property="fb:app_id" content="950631401651649" />
+  <meta property="og:site_name" content="Kite Connect developer forum" />
+  <meta property="og:title" itemprop="name" content="Is intraday 1-minute historical data available until 2015?" />
+  <meta property="og:url" content="https://kite.trade/forum/discussion/8722/is-intraday-1-minute-historical-data-available-until-2015" />
+  <meta name="description" property="og:description" itemprop="description" content="I read the FAQ post which was posted in 2018 and it says that intraday historcal data is available up to 3 years." />
+  <meta property="og:image" itemprop="image" content="https://kite.trade/forum/uploads/M58ZYS3K6UQU.jpg" />
+  <script type="text/javascript">gdn=window.gdn||{};gdn.meta={
+    "ConfirmDeleteCommentHeading": "Delete Comment",
+    "ConfirmDeleteCommentText": "Are you sure you want to delete this comment?",
+    "Spoiler": "Spoiler",
+    "show": "show",
+    "hide": "hide",
+    "emoji": {
+        "assetPath": "\/forum\/resources\/emoji",
+        "format": "<img class=\"emoji\" src=\"%1$s\" title=\"%2$s\" alt=\"%2$s\" height=\"20\" \/>",
+        "emoji": {
+            "smile": "smile.png",
+            "smiley": "smiley.png",
+            "wink": "wink.png",
+            "blush": "blush.png",
+            "neutral": "neutral.png",
+            "relaxed": "relaxed.png",
+            "grin": "grin.png",
+            "joy": "joy.png",
+            "sweat_smile": "sweat_smile.png",
+            "lol": "lol.png",
+            "innocent": "innocent.png",
+            "naughty": "naughty.png",
+            "yum": "yum.png",
+            "relieved": "relieved.png",
+            "love": "love.png",
+            "sunglasses": "sunglasses.png",
+            "smirk": "smirk.png",
+            "expressionless": "expressionless.png",
+            "unamused": "unamused.png",
+            "sweat": "sweat.png",
+            "pensive": "pensive.png",
+            "confused": "confused.png",
+            "confounded": "confounded.png",
+            "kissing": "kissing.png",
+            "kissing_heart": "kissing_heart.png",
+            "kissing_smiling_eyes": "kissing_smiling_eyes.png",
+            "kissing_closed_eyes": "kissing_closed_eyes.png",
+            "tongue": "tongue.png",
+            "disappointed": "disappointed.png",
+            "worried": "worried.png",
+            "angry": "angry.png",
+            "rage": "rage.png",
+            "cry": "cry.png",
+            "persevere": "persevere.png",
+            "triumph": "triumph.png",
+            "frowning": "frowning.png",
+            "anguished": "anguished.png",
+            "fearful": "fearful.png",
+            "weary": "weary.png",
+            "sleepy": "sleepy.png",
+            "tired_face": "tired_face.png",
+            "grimace": "grimace.png",
+            "bawling": "bawling.png",
+            "open_mouth": "open_mouth.png",
+            "hushed": "hushed.png",
+            "cold_sweat": "cold_sweat.png",
+            "scream": "scream.png",
+            "astonished": "astonished.png",
+            "flushed": "flushed.png",
+            "sleeping": "sleeping.png",
+            "dizzy": "dizzy.png",
+            "no_mouth": "no_mouth.png",
+            "mask": "mask.png",
+            "star": "star.png",
+            "cookie": "cookie.png",
+            "warning": "warning.png",
+            "mrgreen": "mrgreen.png",
+            "heart": "heart.png",
+            "heartbreak": "heartbreak.png",
+            "kiss": "kiss.png",
+            "+1": "+1.png",
+            "-1": "-1.png",
+            "grey_question": "grey_question.png",
+            "trollface": "trollface.png",
+            "error": "grey_question.png"
+        }
+    },
+    "DiscussionID": "8722",
+    "Category": "General",
+    "AnalyticsTask": "tick",
+    "TagHint": "Start to type...",
+    "ButtonBarLinkUrl": "Enter your URL:",
+    "ButtonBarImageUrl": "Enter image URL:",
+    "ButtonBarBBCodeHelpText": "You can use <b><a href=\"http:\/\/en.wikipedia.org\/wiki\/BBCode\" target=\"_new\">BBCode<\/a><\/b> in your post.",
+    "ButtonBarHtmlHelpText": "You can use <b><a href=\"http:\/\/htmlguide.drgrog.com\/cheatsheet.php\" target=\"_new\">Simple HTML<\/a><\/b> in your post.",
+    "ButtonBarMarkdownHelpText": "You can use <b><a href=\"http:\/\/en.wikipedia.org\/wiki\/Markdown\" target=\"_new\">Markdown<\/a><\/b> in your post.",
+    "InputFormat": "Html",
+    "editorVersion": "1.7.7",
+    "editorPluginAssets": "\/forum\/plugins\/editor",
+    "wysiwygHelpText": "You are using <a href=\"https:\/\/en.wikipedia.org\/wiki\/WYSIWYG\" target=\"_new\">WYSIWYG<\/a> in your post.",
+    "bbcodeHelpText": "You can use <a href=\"http:\/\/en.wikipedia.org\/wiki\/BBCode\" target=\"_new\">BBCode<\/a> in your post.",
+    "htmlHelpText": "You can use <a href=\"http:\/\/htmlguide.drgrog.com\/cheatsheet.php\" target=\"_new\">Simple HTML<\/a> in your post.",
+    "markdownHelpText": "You can use <a href=\"http:\/\/en.wikipedia.org\/wiki\/Markdown\" target=\"_new\">Markdown<\/a> in your post.",
+    "textHelpText": "You are using plain text in your post.",
+    "editorWysiwygCSS": "\/forum\/plugins\/editor\/design\/wysiwyg.css",
+    "canUpload": false,
+    "maxUploadSize": 2097152,
+    "editorFileInputName": "editorupload",
+    "allowedFileExtensions": "[\"txt\",\"jpg\",\"jpeg\",\"gif\",\"png\",\"bmp\",\"tiff\",\"ico\",\"zip\",\"gz\",\"tar.gz\",\"tgz\",\"psd\",\"ai\",\"fla\",\"pdf\",\"doc\",\"xls\",\"ppt\",\"docx\",\"xlsx\",\"log\",\"rar\",\"7z\"]",
+    "maxFileUploads": "20",
+    "LastCommentID": 29773,
+    "TransportError": "A fatal error occurred while processing the request.<br \/>The server returned the following response: %s",
+    "TransientKey": null,
+    "WebRoot": "https:\/\/kite.trade\/forum",
+    "UrlFormat": "\/forum\/{Path}",
+    "Path": "discussion\/8722\/is-intraday-1-minute-historical-data-available-until-2015",
+    "Args": "",
+    "ResolvedPath": "vanilla\/discussion\/index",
+    "ResolvedArgs": {
+        "DiscussionID": "8722",
+        "DiscussionStub": "is-intraday-1-minute-historical-data-available-until-2015",
+        "Page": ""
+    },
+    "SignedIn": 0,
+    "ConfirmHeading": "Confirm",
+    "ConfirmText": "Are you sure you want to do that?",
+    "Okay": "Okay",
+    "Cancel": "Cancel",
+    "Search": "Search"
+};</script>
+  <script src="//ajax.googleapis.com/ajax/libs/jquery/1.10.2/jquery.min.js?v=2.3.1" type="text/javascript"></script>
+  <script src="/forum/js/library/jquery.form.js?v=2.3.1" type="text/javascript"></script>
+  <script src="/forum/js/library/jquery.popup.js?v=2.3.1" type="text/javascript"></script>
+  <script src="/forum/js/library/jquery.gardenhandleajaxform.js?v=2.3.1" type="text/javascript"></script>
+  <script src="/forum/js/library/jquery.atwho.js?v=2.3.1" type="text/javascript"></script>
+  <script src="/forum/js/global.js?v=2.3.1" type="text/javascript"></script>
+  <script src="/forum/js/library/jquery.autosize.min.js?v=2.3.1" type="text/javascript"></script>
+  <script src="/forum/applications/vanilla/js/autosave.js?v=2.3.1" type="text/javascript"></script>
+  <script src="/forum/applications/vanilla/js/discussion.js?v=2.3.1" type="text/javascript"></script>
+  <script src="/forum/applications/dashboard/js/spoilers.js?v=2.3.1" type="text/javascript"></script>
+  <script src="/forum/plugins/GooglePrettify/js/prettify.js?v=1.2.2" type="text/javascript"></script>
+  <script src="/forum/plugins/ButtonBar/js/buttonbar.js?v=1.7.1" type="text/javascript"></script>
+  <script src="/forum/plugins/ButtonBar/js/jquery.hotkeys.js?v=1.7.1" type="text/javascript"></script>
+  <script src="/forum/plugins/editor/js/editor.js?v=1.7.7" type="text/javascript"></script>
+  <script src="/forum/plugins/editor/js/jquery.ui.widget.js?v=1.7.7" type="text/javascript"></script>
+  <script src="/forum/plugins/editor/js/jquery.iframe-transport.js?v=1.7.7" type="text/javascript"></script>
+  <script src="/forum/plugins/editor/js/jquery.fileupload.js?v=1.7.7" type="text/javascript"></script>
+  <script type="text/javascript">jQuery(function ($) {
+
+            function init() {
+                $('.Message').each(function () {
+                    if ($(this).data('GooglePrettify')) {
+                        return;
+                    }
+                    $(this).data('GooglePrettify', '1');
+
+                    pre = $('pre', this).addClass('prettyprint');
+
+                    // Let prettyprint determine styling, rather than the editor.
+                    $('code', this).removeClass('CodeInline');
+                    pre.removeClass('CodeBlock');
+
+                    prettyPrint();
+
+                    pre.removeClass('prettyprint');
+                });
+            }
+
+            $(document).on('CommentAdded PreviewLoaded popupReveal', init);
+            init();
+        });</script>
+</head>
+<body id="vanilla_discussion_index" class="Vanilla Discussion Index  Section-Discussion Section-color-green">
+<header class="header">
+    <div class="container">
+        <div class="row">
+            <div class="four columns logo-container">
+                <a href="/forum/" class="logo"><img src="https://kite.trade/forum/uploads/M58ZYS3K6UQU.jpg" alt="Kite Connect developer forum" /></a>
+                <a href="/forum/" class="logo-small"><img src="/forum/themes/kite/design/images/logo-small.png" /></a>
+
+                <a href="#" id="burger">☰</a>
+            </div>
+            <!-- <li><a href="/forum/entry/signin" rel="nofollow" class="SignInPopup">Sign In</a></li> -->
+            <div class="five columns search">
+                <form method="get" action="/forum//search">
+                    <div>
+                        <input type="text" id="Form_Search" name="Search" accesskey="/" class="InputBox" />
+                    </div>
+                </form>
+            </div>
+            <div class="three columns profile">
+                <div class="MeBox MeBox-SignIn"><div class="SignInLinks"><a href="/forum/entry/signin?Target=discussion%2F8722%2Fis-intraday-1-minute-historical-data-available-until-2015" class=" SignInPopup" rel="nofollow">Login</a><a href="/forum/entry/register?Target=discussion%2F8722%2Fis-intraday-1-minute-historical-data-available-until-2015" class="ApplyButton" rel="nofollow">Signup</a> </div> <div class="SignInIcons"></div></div>
+            </div>
+        </div>
+    </div>
+</header>
+
+<div class="container">
+    <div class="BreadcrumbsWrapper"><span class="Breadcrumbs" itemscope itemtype="http://data-vocabulary.org/Breadcrumb"><span class="CrumbLabel CrumbLabel HomeCrumb"><a href="https://kite.trade/forum/" itemprop="url"><span itemprop="title">Home</span></a></span> <span itemprop="child" itemscope itemtype="http://data-vocabulary.org/Breadcrumb"><span class="Crumb">›</span> <span class="CrumbLabel color-green Last"><a href="//kite.trade/forum/categories/general" itemprop="url"><span itemprop="title">General</span></a></span> </span></span></div>
+    <div class="row">
+        <div class="three columns panel" id="sidebar">
+            <div class="Box GuestBox">
+    <h4>Howdy, Stranger!</h4>
+
+    <p>It looks like you're new here. If you want to get involved, click one of these buttons!</p>
+
+    <p></p>
+
+    <div class="P"><a href="/forum/entry/signin?Target=discussion%2F8722%2Fis-intraday-1-minute-historical-data-available-until-2015" class="Button Primary SignInPopup" rel="nofollow">Sign In</a> <a href="/forum/entry/register?Target=discussion%2F8722%2Fis-intraday-1-minute-historical-data-available-until-2015" class="Button ApplyButton" rel="nofollow">Register</a></div>    </div>
+<div class="BoxFilter BoxDiscussionFilter">
+    <ul class="FilterMenu">
+        <li class="AllCategories"><a href="/forum/categories"><span class="Sprite SpAllCategories"></span> Categories</a></li>         <li class="Discussions"><a href="/forum/discussions" class=""><span class="Sprite SpDiscussions"></span> Recent Discussions</a></li>
+        <li class="Activities"><a href="/forum/activity" class=""><span class="Sprite SpActivity"></span> Activity</a></li>            </ul>
+</div>
+    <div class="Box BoxCategories">
+        <h4>Categories</h4>        <ul class="PanelInfo PanelCategories">
+            <li><a href="/forum/categories" class="ItemLink"><span class="Aside"><span class="Count"><span title="15,241 discussions" class="Number">15.2K</span></span></span> All Categories</a></li><li class="ClearFix Depth1 Category-incidents"><a href="https://kite.trade/forum/categories/incidents" class="ItemLink"><span class="Aside"><span class="Count"><span title="0 discussions" class="Number">0</span></span></span> Incidents</a></li>
+<li class="ClearFix Depth1 Category-node-js-client"><a href="https://kite.trade/forum/categories/node-js-client" class="ItemLink"><span class="Aside"><span class="Count"><span title="183 discussions" class="Number">183</span></span></span> Node JS client</a></li>
+<li class="ClearFix Depth1 Category-go-client-library"><a href="https://kite.trade/forum/categories/go-client-library" class="ItemLink"><span class="Aside"><span class="Count"><span title="52 discussions" class="Number">52</span></span></span> Go client</a></li>
+<li class="ClearFix Depth1 Category--dotnet-api"><a href="https://kite.trade/forum/categories/-dotnet-api" class="ItemLink"><span class="Aside"><span class="Count"><span title="867 discussions" class="Number">867</span></span></span> .Net API client</a></li>
+<li class="ClearFix Depth1 color-orange"><a href="https://kite.trade/forum/categories/kite-publisher" class="ItemLink"><span class="Aside"><span class="Count"><span title="405 discussions" class="Number">405</span></span></span> Kite Publisher</a></li>
+<li class="ClearFix Depth1 Category--net-client-(3rd-party)"><a href="https://kite.trade/forum/categories/-net-client-%283rd-party%29" class="ItemLink"><span class="Aside"><span class="Count"><span title="557 discussions" class="Number">557</span></span></span> .Net / VBA / Excel (3rd party)</a></li>
+<li class="ClearFix Depth1 color-brick"><a href="https://kite.trade/forum/categories/algorithms-and-strategies" class="ItemLink"><span class="Aside"><span class="Count"><span title="508 discussions" class="Number">508</span></span></span> Algorithms and Strategies</a></li>
+<li class="ClearFix Depth1 color-cobalt"><a href="https://kite.trade/forum/categories/java-client" class="ItemLink"><span class="Aside"><span class="Count"><span title="1,072 discussions" class="Number">1.1K</span></span></span> Java client</a></li>
+<li class="ClearFix Depth1 color-violet"><a href="https://kite.trade/forum/categories/api-clients" class="ItemLink"><span class="Aside"><span class="Count"><span title="1,257 discussions" class="Number">1.3K</span></span></span> API clients</a></li>
+<li class="ClearFix Depth1 color-pink"><a href="https://kite.trade/forum/categories/php-client" class="ItemLink"><span class="Aside"><span class="Count"><span title="410 discussions" class="Number">410</span></span></span> PHP client</a></li>
+<li class="ClearFix Depth1 color-purple"><a href="https://kite.trade/forum/categories/python-client" class="ItemLink"><span class="Aside"><span class="Count"><span title="4,370 discussions" class="Number">4.4K</span></span></span> Python client</a></li>
+<li class="ClearFix Depth1 color-blue"><a href="https://kite.trade/forum/categories/mobile-and-desktop-apps" class="ItemLink"><span class="Aside"><span class="Count"><span title="367 discussions" class="Number">367</span></span></span> Mobile and Desktop apps</a></li>
+<li class="ClearFix Depth1 color-aqua"><a href="https://kite.trade/forum/categories/websockets-%28streaming-data%29" class="ItemLink"><span class="Aside"><span class="Count"><span title="1,502 discussions" class="Number">1.5K</span></span></span> Market data (WebSockets)</a></li>
+<li class="ClearFix Depth1 Active color-green"><a href="https://kite.trade/forum/categories/general" class="ItemLink"><span class="Aside"><span class="Count"><span title="3,691 discussions" class="Number">3.7K</span></span></span> General</a></li>
+        </ul>
+    </div>
+        <div class="Box">
+            <h4>In this Discussion</h4>            <ul class="PanelInfo">
+                                    <li>
+                        <a href="/forum/profile/sujith"><span class="Aside"><span><time title="October 19, 2020  5:39AM" datetime="2020-10-19T05:39:46+00:00">October 2020</time></span></span> <span><span class="Username">sujith</span></span></a>                    </li>
+                                    <li>
+                        <a href="/forum/profile/rakeshr"><span class="Aside"><span><time title="October 19, 2020  5:13AM" datetime="2020-10-19T05:13:06+00:00">October 2020</time></span></span> <span><span class="Username">rakeshr</span></span></a>                    </li>
+                                    <li>
+                        <a href="/forum/profile/Shank"><span class="Aside"><span><time title="October 19, 2020  5:29AM" datetime="2020-10-19T05:29:44+00:00">October 2020</time></span></span> <span><span class="Username">Shank</span></span></a>                    </li>
+                            </ul>
+        </div>
+        
+        </div>
+        <div class="nine columns content" id="Content">
+            <div class="MessageList Discussion"><!-- Page Title -->
+<div id="Item_0" class="PageTitle"><div class="Options"></div><h1>Is intraday 1-minute historical data available until 2015?</h1></div>
+
+<div id="Discussion_8722" class="Item ItemDiscussion">
+    <div class="Discussion">
+        <div class="rowItem-Header DiscussionHeader">
+            <div class="row">
+                <div class="AuthorWrap one column">
+                    <span class="Author">
+                        <a title="Shank" href="/forum/profile/Shank" class="PhotoWrap"><img src="https://secure.gravatar.com/avatar.php?gravatar_id=be9130692847a215365a60bb369e8907&amp;amp;size=50&amp;default=https%3A%2F%2Fvanillicon.com%2Fbe9130692847a215365a60bb369e8907.png" alt="Shank" class="ProfilePhoto ProfilePhotoMedium" /></a>                    </span>
+                </div><!-- author //-->
+                <div class="eleven columns">
+                    <div class="Meta DiscussionMeta">
+                        <span class="AuthorInfo">
+                            <span class="username"><a href="/forum/profile/Shank" class="Username">Shank</a></span>                        </span>
+
+                        <span class="MItem DateCreated">
+                            <a href="https://kite.trade/forum/discussion/8722/is-intraday-1-minute-historical-data-available-until-2015" class="Permalink" rel="nofollow"><time title="October 18, 2020 11:50AM" datetime="2020-10-18T11:50:19+00:00">October 2020</time></a>                        </span>
+                        <span class="MItem"> <span title="Edited October 18, 2020 12:06PM by Shank." class="DateUpdated">edited October 2020</span> </span>                         <span class="MItem Category"> in <a href="https://kite.trade/forum/categories/general">General</a></span>                     </div>
+
+                                        <div class="Item-BodyWrap">
+                        <div class="Item-Body">
+                            <div class="Message">
+                                I read the FAQ post which was posted in 2018 and it says that intraday historcal data is available up to 3 years. Does that mean it's available up to 2015 or 3 years from the time when the api request is made, which would be 2017 if i make the request today?                            </div>
+                                    <div class="InlineTags Meta">
+            Tagged:
+            <ul>
+                                                            <li><a href="/forum/discussions/tagged/historical-api" class="Tag_historical-api">historical API</a></li>
+                                                                                <li><a href="/forum/discussions/tagged/historical-data" class="Tag_historical-data">historical data</a></li>
+                                                </ul>
+        </div>
+        <div class="Reactions"></div>                        </div>
+                    </div>
+                </div>
+            </div><!-- row //-->
+        </div>
+    </div>
+</div>
+</div><div class="CommentsWrap"><span class="BeforeCommentHeading"></span><div class="DataBox DataBox-Comments">    <ul class="MessageList DataList Comments">
+                <li class="Item Alt ItemComment" id="Comment_29746">
+            <div class="Comment row">
+                <div class="one column">
+                    <span class="Author">
+                       <a title="Shank" href="/forum/profile/Shank" class="PhotoWrap"><img src="https://secure.gravatar.com/avatar.php?gravatar_id=be9130692847a215365a60bb369e8907&amp;amp;size=50&amp;default=https%3A%2F%2Fvanillicon.com%2Fbe9130692847a215365a60bb369e8907.png" alt="Shank" class="ProfilePhoto ProfilePhotoMedium" /></a>                    </span>
+                </div><!-- col //-->
+
+                <div class="eleven columns">
+                                        <div class="Options">
+                                            </div>
+                                        <div class="Item-Header CommentHeader">
+                        <div class="Meta CommentMeta CommentInfo">
+                            <span class="AuthorInfo">
+                               <span class="username"><a href="/forum/profile/Shank" class="Username">Shank</a></span>                              </span>
+                            <span class="MItem DateCreated">
+                               <a href="/forum/discussion/comment/29746/#Comment_29746" class="Permalink" name="Item_1" rel="nofollow"><time title="October 18, 2020 12:50PM" datetime="2020-10-18T12:50:11+00:00">October 2020</time></a>                            </span>
+                                                                                </div>
+                    </div>
+                    <div class="Item-BodyWrap">
+                        <div class="Item-Body">
+                            <div class="Message">
+                                <a href="/forum/profile/sujith">@sujith</a> Can you help me out with my query? Thanks.                            </div>
+                            <div class="Reactions"></div>                        </div>
+                    </div>
+                </div><!-- col //-->
+            </div>
+        </li>
+                <li class="Item ItemComment" id="Comment_29758">
+            <div class="Comment row">
+                <div class="one column">
+                    <span class="Author">
+                       <a title="rakeshr" href="/forum/profile/rakeshr" class="PhotoWrap"><img src="https://kite.trade/forum/uploads/userpics/570/nK22NNHS5YXND.jpg" alt="rakeshr" class="ProfilePhoto ProfilePhotoMedium" /></a>                    </span>
+                </div><!-- col //-->
+
+                <div class="eleven columns">
+                                        <div class="Options">
+                                            </div>
+                                        <div class="Item-Header CommentHeader">
+                        <div class="Meta CommentMeta CommentInfo">
+                            <span class="AuthorInfo">
+                               <span class="username"><a href="/forum/profile/rakeshr" class="Username">rakeshr</a></span>                              </span>
+                            <span class="MItem DateCreated">
+                               <a href="/forum/discussion/comment/29758/#Comment_29758" class="Permalink" name="Item_2" rel="nofollow"><time title="October 19, 2020  3:39AM" datetime="2020-10-19T03:39:49+00:00">October 2020</time></a>                            </span>
+                                                                                </div>
+                    </div>
+                    <div class="Item-BodyWrap">
+                        <div class="Item-Body">
+                            <div class="Message">
+                                You can go through <a rel="nofollow" href="https://kite.trade/forum/discussion/4732/frequently-asked-questions-faqs#latest">Historical data FAQs here</a>.                            </div>
+                            <div class="Reactions"></div>                        </div>
+                    </div>
+                </div><!-- col //-->
+            </div>
+        </li>
+                <li class="Item Alt ItemComment" id="Comment_29760">
+            <div class="Comment row">
+                <div class="one column">
+                    <span class="Author">
+                       <a title="Shank" href="/forum/profile/Shank" class="PhotoWrap"><img src="https://secure.gravatar.com/avatar.php?gravatar_id=be9130692847a215365a60bb369e8907&amp;amp;size=50&amp;default=https%3A%2F%2Fvanillicon.com%2Fbe9130692847a215365a60bb369e8907.png" alt="Shank" class="ProfilePhoto ProfilePhotoMedium" /></a>                    </span>
+                </div><!-- col //-->
+
+                <div class="eleven columns">
+                                        <div class="Options">
+                                            </div>
+                                        <div class="Item-Header CommentHeader">
+                        <div class="Meta CommentMeta CommentInfo">
+                            <span class="AuthorInfo">
+                               <span class="username"><a href="/forum/profile/Shank" class="Username">Shank</a></span>                              </span>
+                            <span class="MItem DateCreated">
+                               <a href="/forum/discussion/comment/29760/#Comment_29760" class="Permalink" name="Item_3" rel="nofollow"><time title="October 19, 2020  3:51AM" datetime="2020-10-19T03:51:31+00:00">October 2020</time></a>                            </span>
+                                                                                </div>
+                    </div>
+                    <div class="Item-BodyWrap">
+                        <div class="Item-Body">
+                            <div class="Message">
+                                <a href="/forum/profile/rakeshr">@rakeshr</a> I already went through the FAQs but it was unclear which why I made this post in the first place. You didn't even read my post and nobody else is even bothering to reply. Nice forum Zerodha's got where I can't even get a straight answer to a simple question.                            </div>
+                            <div class="Reactions"></div>                        </div>
+                    </div>
+                </div><!-- col //-->
+            </div>
+        </li>
+                <li class="Item ItemComment" id="Comment_29762">
+            <div class="Comment row">
+                <div class="one column">
+                    <span class="Author">
+                       <a title="Shank" href="/forum/profile/Shank" class="PhotoWrap"><img src="https://secure.gravatar.com/avatar.php?gravatar_id=be9130692847a215365a60bb369e8907&amp;amp;size=50&amp;default=https%3A%2F%2Fvanillicon.com%2Fbe9130692847a215365a60bb369e8907.png" alt="Shank" class="ProfilePhoto ProfilePhotoMedium" /></a>                    </span>
+                </div><!-- col //-->
+
+                <div class="eleven columns">
+                                        <div class="Options">
+                                            </div>
+                                        <div class="Item-Header CommentHeader">
+                        <div class="Meta CommentMeta CommentInfo">
+                            <span class="AuthorInfo">
+                               <span class="username"><a href="/forum/profile/Shank" class="Username">Shank</a></span>                              </span>
+                            <span class="MItem DateCreated">
+                               <a href="/forum/discussion/comment/29762/#Comment_29762" class="Permalink" name="Item_4" rel="nofollow"><time title="October 19, 2020  4:08AM" datetime="2020-10-19T04:08:13+00:00">October 2020</time></a>                            </span>
+                                                                                </div>
+                    </div>
+                    <div class="Item-BodyWrap">
+                        <div class="Item-Body">
+                            <div class="Message">
+                                <a href="/forum/profile/sujith">@sujith</a> <a href="/forum/profile/rakeshr">@rakeshr</a> tagging you again hoping that you can take 10 seconds out of very very busy schedules to actually read my post and give a direct answer instead of linking me to the FAQs again.                            </div>
+                            <div class="Reactions"></div>                        </div>
+                    </div>
+                </div><!-- col //-->
+            </div>
+        </li>
+                <li class="Item Alt ItemComment" id="Comment_29769">
+            <div class="Comment row">
+                <div class="one column">
+                    <span class="Author">
+                       <a title="rakeshr" href="/forum/profile/rakeshr" class="PhotoWrap"><img src="https://kite.trade/forum/uploads/userpics/570/nK22NNHS5YXND.jpg" alt="rakeshr" class="ProfilePhoto ProfilePhotoMedium" /></a>                    </span>
+                </div><!-- col //-->
+
+                <div class="eleven columns">
+                                        <div class="Options">
+                                            </div>
+                                        <div class="Item-Header CommentHeader">
+                        <div class="Meta CommentMeta CommentInfo">
+                            <span class="AuthorInfo">
+                               <span class="username"><a href="/forum/profile/rakeshr" class="Username">rakeshr</a></span>                              </span>
+                            <span class="MItem DateCreated">
+                               <a href="/forum/discussion/comment/29769/#Comment_29769" class="Permalink" name="Item_5" rel="nofollow"><time title="October 19, 2020  5:13AM" datetime="2020-10-19T05:13:06+00:00">October 2020</time></a>                            </span>
+                                                                                </div>
+                    </div>
+                    <div class="Item-BodyWrap">
+                        <div class="Item-Body">
+                            <div class="Message">
+                                As stated, we have intraday candle from <code class="CodeInline">2015-02-02</code> for most of the contracts.                            </div>
+                            <div class="Reactions"></div>                        </div>
+                    </div>
+                </div><!-- col //-->
+            </div>
+        </li>
+                <li class="Item ItemComment" id="Comment_29771">
+            <div class="Comment row">
+                <div class="one column">
+                    <span class="Author">
+                       <a title="Shank" href="/forum/profile/Shank" class="PhotoWrap"><img src="https://secure.gravatar.com/avatar.php?gravatar_id=be9130692847a215365a60bb369e8907&amp;amp;size=50&amp;default=https%3A%2F%2Fvanillicon.com%2Fbe9130692847a215365a60bb369e8907.png" alt="Shank" class="ProfilePhoto ProfilePhotoMedium" /></a>                    </span>
+                </div><!-- col //-->
+
+                <div class="eleven columns">
+                                        <div class="Options">
+                                            </div>
+                                        <div class="Item-Header CommentHeader">
+                        <div class="Meta CommentMeta CommentInfo">
+                            <span class="AuthorInfo">
+                               <span class="username"><a href="/forum/profile/Shank" class="Username">Shank</a></span>                              </span>
+                            <span class="MItem DateCreated">
+                               <a href="/forum/discussion/comment/29771/#Comment_29771" class="Permalink" name="Item_6" rel="nofollow"><time title="October 19, 2020  5:29AM" datetime="2020-10-19T05:29:44+00:00">October 2020</time></a>                            </span>
+                                                                                </div>
+                    </div>
+                    <div class="Item-BodyWrap">
+                        <div class="Item-Body">
+                            <div class="Message">
+                                Finally a proper response. Thanks. Btw you say "as stated" even though it's not stated anywhere in the FAQ post or in any of the links inside the FAQ post that intraday data is available from 2015-02-02. The closest thing pointing to the start date is a post saying "up to 3 years" but it's super vague as it doesn't specify whether it's 3 years from when that post was made or 3 years from the day of request. You should consider updating the FAQs or adding that super important information to the API documentation itself.                             </div>
+                            <div class="Reactions"></div>                        </div>
+                    </div>
+                </div><!-- col //-->
+            </div>
+        </li>
+                <li class="Item Alt ItemComment" id="Comment_29773">
+            <div class="Comment row">
+                <div class="one column">
+                    <span class="Author">
+                       <a title="sujith" href="/forum/profile/sujith" class="PhotoWrap"><img src="https://secure.gravatar.com/avatar.php?gravatar_id=c90357185d9adc74492e4d00b1d8057a&amp;amp;size=50&amp;default=https%3A%2F%2Fvanillicon.com%2Fc90357185d9adc74492e4d00b1d8057a.png" alt="sujith" class="ProfilePhoto ProfilePhotoMedium" /></a>                    </span>
+                </div><!-- col //-->
+
+                <div class="eleven columns">
+                                        <div class="Options">
+                                            </div>
+                                        <div class="Item-Header CommentHeader">
+                        <div class="Meta CommentMeta CommentInfo">
+                            <span class="AuthorInfo">
+                               <span class="username"><a href="/forum/profile/sujith" class="Username">sujith</a></span>                              </span>
+                            <span class="MItem DateCreated">
+                               <a href="/forum/discussion/comment/29773/#Comment_29773" class="Permalink" name="Item_7" rel="nofollow"><time title="October 19, 2020  5:39AM" datetime="2020-10-19T05:39:46+00:00">October 2020</time></a>                            </span>
+                                                                                </div>
+                    </div>
+                    <div class="Item-BodyWrap">
+                        <div class="Item-Body">
+                            <div class="Message">
+                                <a href="/forum/profile/Shank">@Shank</a>,<br />We had back populated data from different sources, for some we might have intraday data from early 2015 but for some, we have data from the last quarter of 2015.<br />The only way to find out is by user fetching data for whichever instrument he is trying to fetch.                            </div>
+                            <div class="Reactions"></div>                        </div>
+                    </div>
+                </div><!-- col //-->
+            </div>
+        </li>
+            </ul>
+</div><div class="P PagerWrap"></div></div>                <div class="Foot Closed">
+                    <div class="Note Closed SignInOrRegister"><a href="/forum/entry/signin?Target=discussion%2F8722%2Fis-intraday-1-minute-historical-data-available-until-2015%3F" class="Popup">Sign In</a> or <a href="/forum/entry/register?Target=discussion%2F8722%2Fis-intraday-1-minute-historical-data-available-until-2015%3F">Register</a> to comment.                    </div>
+                                    </div>
+            
+        </div>
+    </div>
+
+    <footer class="footer">
+        <p>
+            Zerodha Member of  NSE &amp; BSE &mdash; SEBI Registration no.: INZ000031633 | CDSL: Depository services through Zerodha Securities Pvt. Ltd. - SEBI Registration no.: IN-DP-100-2015 | Commodity Trading through Zerodha Commodities Pvt. Ltd. MCX: 46025 | NCDEX : 1138. SEBI Registration no.: INZ000038238 | Registered Address: Zerodha, #153/154, 4th Cross, Dollars Colony, Opp. Clarence Public School, J.P Nagar 4th Phase, Bangalore - 560078, Karnataka, India
+        </p>
+        <p>
+            DISCLAIMER: Capital markets, trading, and investments have inherent risks. Please make sure you understand the risks involved and carefully read the Risk Disclosure Document as prescribed by SEBI | ICF before participating in the markets &mdash; <a href="https://kite.trade/terms">Read terms &amp; conditions</a>
+        </p>
+
+        Operated by Zerodha Technology Pvt. Ltd. &copy; 2015-2026
+        
+    </footer>
+</div>
+
+
+
+<script>
+    $(document).ready(function() {
+        $("#burger").click(function() {
+            if($(this).data("visible") == "1") {
+                $(this).data("visible", 0);
+                $("#sidebar").hide();
+            } else {
+                $(this).data("visible", 1);
+                $("#sidebar").show();
+            }
+        });
+
+	$("#Form_Search").focusin(function () {
+		$("#Form_Search").css("width", "300px");
+	})
+
+        $("#Form_Search").focusout(function () {
+                $("#Form_Search").css("width", "240px");
+        })
+
+        return false;
+    });
+</script>
+
+</body>
+</html>

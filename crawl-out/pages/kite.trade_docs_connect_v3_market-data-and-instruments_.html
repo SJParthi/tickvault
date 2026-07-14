@@ -1,0 +1,1044 @@
+
+<!doctype html>
+<html lang="en" class="no-js">
+  <head>
+    
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      
+      
+      
+      
+      <link rel="icon" href="../images/favicon">
+      <meta name="generator" content="mkdocs-1.2.2, mkdocs-material-7.3.0">
+    
+    
+      
+        <title>Market and instruments - Kite Connect 3 / API documentation</title>
+      
+    
+    
+      <link rel="stylesheet" href="../assets/stylesheets/main.8b42a75e.min.css">
+      
+        
+        <link rel="stylesheet" href="../assets/stylesheets/palette.3f5d1f46.min.css">
+        
+          
+          
+          <meta name="theme-color" content="#ffffff">
+        
+      
+    
+    
+    
+      
+        
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+        <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Roboto:300,400,400i,700%7CRoboto+Mono&display=fallback">
+        <style>:root{--md-text-font-family:"Roboto";--md-code-font-family:"Roboto Mono"}</style>
+      
+    
+    
+    
+      <link rel="stylesheet" href="../static/style.css">
+    
+    
+      
+
+
+    
+    
+  </head>
+  
+  
+    
+    
+    
+    
+    
+    <body dir="ltr" data-md-color-scheme="" data-md-color-primary="white" data-md-color-accent="red">
+  
+    
+    <script>function __prefix(e){return new URL("..",location).pathname+"."+e}function __get(e,t=localStorage){return JSON.parse(t.getItem(__prefix(e)))}</script>
+    
+    <input class="md-toggle" data-md-toggle="drawer" type="checkbox" id="__drawer" autocomplete="off">
+    <input class="md-toggle" data-md-toggle="search" type="checkbox" id="__search" autocomplete="off">
+    <label class="md-overlay" for="__drawer"></label>
+    <div data-md-component="skip">
+      
+        
+        <a href="#market-and-instruments" class="md-skip">
+          Skip to content
+        </a>
+      
+    </div>
+    <div data-md-component="announce">
+      
+    </div>
+    
+      
+
+<header class="md-header" data-md-component="header">
+  <nav class="md-header__inner md-grid" aria-label="Header">
+    <a href=".." title="Kite Connect 3 / API documentation" class="md-header__button md-logo" aria-label="Kite Connect 3 / API documentation" data-md-component="logo">
+      
+  <img src="../images/logo.svg" alt="logo">
+
+    </a>
+    <label class="md-header__button md-icon" for="__drawer">
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M3 6h18v2H3V6m0 5h18v2H3v-2m0 5h18v2H3v-2z"/></svg>
+    </label>
+    <div class="md-header__title" data-md-component="header-title">
+      <div class="md-header__ellipsis">
+        <div class="md-header__topic">
+          <span class="md-ellipsis">
+            Kite Connect 3 / API documentation
+          </span>
+        </div>
+        <div class="md-header__topic" data-md-component="header-topic">
+          <span class="md-ellipsis">
+            
+              Market and instruments
+            
+          </span>
+        </div>
+      </div>
+    </div>
+    
+    
+    
+      <label class="md-header__button md-icon" for="__search">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.516 6.516 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5z"/></svg>
+      </label>
+      
+<div class="md-search" data-md-component="search" role="dialog">
+  <label class="md-search__overlay" for="__search"></label>
+  <div class="md-search__inner" role="search">
+    <form class="md-search__form" name="search">
+      <input type="text" class="md-search__input" name="query" aria-label="Search" placeholder="Search" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false" data-md-component="search-query" required>
+      <label class="md-search__icon md-icon" for="__search">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.516 6.516 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5z"/></svg>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11h12z"/></svg>
+      </label>
+      <nav class="md-search__options" aria-label="Search">
+        
+        <button type="reset" class="md-search__icon md-icon" aria-label="Clear" tabindex="-1">
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12 19 6.41z"/></svg>
+        </button>
+      </nav>
+      
+    </form>
+    <div class="md-search__output">
+      <div class="md-search__scrollwrap" data-md-scrollfix>
+        <div class="md-search-result" data-md-component="search-result">
+          <div class="md-search-result__meta">
+            Initializing search
+          </div>
+          <ol class="md-search-result__list"></ol>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+    
+    
+  </nav>
+  
+</header>
+    
+    <div class="md-container" data-md-component="container">
+      
+      
+        
+          
+        
+      
+      <main class="md-main" data-md-component="main">
+        <div class="md-main__inner md-grid">
+          
+            
+              
+              <div class="md-sidebar md-sidebar--primary" data-md-component="sidebar" data-md-type="navigation" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+
+<nav class="md-nav md-nav--primary" aria-label="Navigation" data-md-level="0">
+  <label class="md-nav__title" for="__drawer">
+    <a href=".." title="Kite Connect 3 / API documentation" class="md-nav__button md-logo" aria-label="Kite Connect 3 / API documentation" data-md-component="logo">
+      
+  <img src="../images/logo.svg" alt="logo">
+
+    </a>
+    Kite Connect 3 / API documentation
+  </label>
+  
+  <ul class="md-nav__list" data-md-scrollfix>
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href=".." class="md-nav__link">
+        Introduction
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../response-structure/" class="md-nav__link">
+        Response structure
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../exceptions/" class="md-nav__link">
+        Exceptions and errors
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../user/" class="md-nav__link">
+        User
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../orders/" class="md-nav__link">
+        Orders
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../gtt/" class="md-nav__link">
+        GTT orders
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../portfolio/" class="md-nav__link">
+        Portfolio
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../market-quotes/" class="md-nav__link">
+        Market quotes and instruments
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../websocket/" class="md-nav__link">
+        WebSocket streaming
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../historical/" class="md-nav__link">
+        Historical candle data
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../postbacks/" class="md-nav__link">
+        Postbacks / WebHooks
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../mutual-funds/" class="md-nav__link">
+        Mutual funds
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../margins/" class="md-nav__link">
+        Margin calculation
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../basket/" class="md-nav__link">
+        Publisher - Offsite orders
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../publisher/" class="md-nav__link">
+        Publisher JS plugin
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../apps/" class="md-nav__link">
+        Mobile and Desktop apps
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../changelog/" class="md-nav__link">
+        Changelog
+      </a>
+    </li>
+  
+
+    
+  </ul>
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+            
+              
+              <div class="md-sidebar md-sidebar--secondary" data-md-component="sidebar" data-md-type="toc" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#retrieving-full-instrument-list" class="md-nav__link">
+    Retrieving full instrument list
+  </a>
+  
+    <nav class="md-nav" aria-label="Retrieving full instrument list">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#response-columns" class="md-nav__link">
+    Response columns
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#retrieving-full-market-quotes" class="md-nav__link">
+    Retrieving full market quotes
+  </a>
+  
+    <nav class="md-nav" aria-label="Retrieving full market quotes">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#response-attributes" class="md-nav__link">
+    Response attributes
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#retrieving-ohlc-quotes" class="md-nav__link">
+    Retrieving OHLC quotes
+  </a>
+  
+    <nav class="md-nav" aria-label="Retrieving OHLC quotes">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#response-attributes_1" class="md-nav__link">
+    Response attributes
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#retrieving-ltps-quotes" class="md-nav__link">
+    Retrieving LTPs quotes
+  </a>
+  
+    <nav class="md-nav" aria-label="Retrieving LTPs quotes">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#response-attributes_2" class="md-nav__link">
+    Response attributes
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+          
+          <div class="md-content" data-md-component="content">
+            <article class="md-content__inner md-typeset">
+              
+                
+                
+                <h1 id="market-and-instruments">Market and instruments<a class="headerlink" href="#market-and-instruments" title="Permanent link">&para;</a></h1>
+<p>Between multiple exchanges and segments, there are tens of thousands of different kinds of instruments that trade. Any application that facilitates trading needs to have a master list of these instruments.</p>
+<p>The market API calls provide a consolidated, import-ready list of instruments available for trading.</p>
+<table>
+<thead>
+<tr>
+<th>type</th>
+<th>endpoint</th>
+<th>&nbsp;</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>GET</td>
+<td><a href="#market-and-instruments">/instruments</a></td>
+<td>Retrieve the CSV dump of all tradable instruments</td>
+</tr>
+<tr>
+<td>GET</td>
+<td><a href="#market-and-instruments">/instruments/:exchange</a></td>
+<td>Retrieve the CSV dump of instruments in the particular exchange</td>
+</tr>
+</tbody>
+</table>
+<h2 id="retrieving-full-instrument-list">Retrieving full instrument list<a class="headerlink" href="#retrieving-full-instrument-list" title="Permanent link">&para;</a></h2>
+<p>Unlike the rest of the calls that return JSON, the instrument list API returns a gzipped CSV dump of instruments across all exchanges that can be imported into a database. The dump is generated once everyday and hence last_price is not real time.</p>
+<div class="codehilite"><pre><span></span><code>curl <span class="s2">&quot;https://api.kite.trade/instruments&quot;</span>
+    -H <span class="s2">&quot;X-Kite-Version: 3&quot;</span> <span class="se">\</span>
+    -H <span class="s2">&quot;Authorization: token api_key:access_token&quot;</span> <span class="se">\</span>
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code>instrument_token, exchange_token, tradingsymbol, name, last_price, expiry, strike, tick_size, lot_size, instrument_type, segment, exchange
+408065,1594,INFY,INFOSYS,0,,,0.05,1,EQ,NSE,NSE
+5720322,22345,NIFTY15DECFUT,,78.0,2015-12-31,,0.05,75,FUT,NFO-FUT,NFO
+5720578,22346,NIFTY159500CE,,23.0,2015-12-31,9500,0.05,75,CE,NFO-OPT,NFO
+645639,SILVER15DECFUT,,7800.0,2015-12-31,,1,1,FUT,MCX,MCX
+</code></pre></div>
+
+<h3 id="response-columns">Response columns<a class="headerlink" href="#response-columns" title="Permanent link">&para;</a></h3>
+<table>
+<thead>
+<tr>
+<th>column</th>
+<th>&nbsp;</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>instrument_token</code><span>string</span></td>
+<td>Numerical identifier used for subscribing to live market quotes with the WebSocket API.</td>
+</tr>
+<tr>
+<td><code>exchange_token</code><span>string</span></td>
+<td>The numerical identifier issued by the exchange representing the instrument.</td>
+</tr>
+<tr>
+<td><code>tradingsymbol</code><span>string</span></td>
+<td>Exchange tradingsymbol of the instrument</td>
+</tr>
+<tr>
+<td><code>name</code><span>string</span></td>
+<td>Name of the company (for equity instruments)</td>
+</tr>
+<tr>
+<td><code>last_price</code><span>float</span></td>
+<td>Last traded market price</td>
+</tr>
+<tr>
+<td><code>expiry</code><span>string</span></td>
+<td>Expiry date (for derivatives)</td>
+</tr>
+<tr>
+<td><code>strike</code><span>float</span></td>
+<td>Strike (for options)</td>
+</tr>
+<tr>
+<td><code>tick_size</code><span>float</span></td>
+<td>Value of a single price tick</td>
+</tr>
+<tr>
+<td><code>lot_size</code><span>int</span></td>
+<td>Quantity of a single lot</td>
+</tr>
+<tr>
+<td><code>instrument_type</code><span>string</span></td>
+<td>EQ, FUT, CE, PE</td>
+</tr>
+<tr>
+<td><code>segment</code><span>string</span></td>
+<td>Segment the instrument belongs to</td>
+</tr>
+<tr>
+<td><code>exchange</code><span>string</span></td>
+<td>Exchange</td>
+</tr>
+</tbody>
+</table>
+<div class="admonition warning">
+<p class="admonition-title">Warning</p>
+<p>The instrument list API returns large amounts of data. It's best to request it once a day (ideally at around 08:30 AM) and store in a database at your end.</p>
+</div>
+<h2 id="retrieving-full-market-quotes">Retrieving full market quotes<a class="headerlink" href="#retrieving-full-market-quotes" title="Permanent link">&para;</a></h2>
+<table>
+<thead>
+<tr>
+<th>type</th>
+<th>endpoint</th>
+<th>&nbsp;</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>GET</td>
+<td><a href="#market-and-instruments">/quote</a></td>
+<td>Retrieve the CSV dump of all tradable instruments</td>
+</tr>
+<tr>
+<td>GET</td>
+<td><a href="#market-and-instruments">/quote/ohlc</a></td>
+<td>Retrieve the CSV dump of instruments in the particular exchange</td>
+</tr>
+<tr>
+<td>GET</td>
+<td><a href="#market-and-instruments">/quote/ltp</a></td>
+<td>Retrieve the CSV dump of instruments in the particular exchange</td>
+</tr>
+</tbody>
+</table>
+<p>This API returns the complete market data snapshot of up to <strong>250</strong> instruments in one go. It includes the quantity, OHLC, and Open Interest fields, and the complete bid/ask market depth amongst others.</p>
+<p>Instruments are identified by the <code>exchange:tradingsymbol</code> combination and are passed as values to the query parameter <code>i</code> which is repeated for every instrument. If there is no data available for a given key, the key will be absent from the response. The existence of all the instrument keys in the response map should be checked before to accessing them.</p>
+<div class="codehilite"><pre><span></span><code>curl <span class="s2">&quot;https://api.kite.trade/quote?i=41729&amp;i=NSE:INFY&quot;</span> <span class="se">\</span>
+     -H <span class="s2">&quot;X-Kite-Version: 3&quot;</span> <span class="se">\</span>
+     -H <span class="s2">&quot;Authorization: token api_key:access_token&quot;</span>
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code><span class="p">{</span>
+  <span class="nt">&quot;status&quot;</span><span class="p">:</span> <span class="s2">&quot;success&quot;</span><span class="p">,</span>
+  <span class="nt">&quot;data&quot;</span><span class="p">:</span> <span class="p">{</span>
+    <span class="nt">&quot;41729&quot;</span><span class="p">:</span> <span class="p">{</span>
+      <span class="nt">&quot;instrument_token&quot;</span><span class="p">:</span> <span class="mi">41729</span><span class="p">,</span>
+      <span class="nt">&quot;timestamp&quot;</span><span class="p">:</span> <span class="s2">&quot;2018-01-12 10:31:54&quot;</span><span class="p">,</span>
+      <span class="nt">&quot;last_price&quot;</span><span class="p">:</span> <span class="mf">278.75</span><span class="p">,</span>
+      <span class="nt">&quot;last_quantity&quot;</span><span class="p">:</span> <span class="mi">8</span><span class="p">,</span>
+      <span class="nt">&quot;last_trade_time&quot;</span><span class="p">:</span> <span class="s2">&quot;2018-01-12 10:31:54&quot;</span><span class="p">,</span>
+      <span class="nt">&quot;average_price&quot;</span><span class="p">:</span> <span class="mf">279.04</span><span class="p">,</span>
+      <span class="nt">&quot;volume&quot;</span><span class="p">:</span> <span class="mi">559981</span><span class="p">,</span>
+      <span class="nt">&quot;buy_quantity&quot;</span><span class="p">:</span> <span class="mi">703982</span><span class="p">,</span>
+      <span class="nt">&quot;sell_quantity&quot;</span><span class="p">:</span> <span class="mi">424423</span><span class="p">,</span>
+      <span class="nt">&quot;ohlc&quot;</span><span class="p">:</span> <span class="p">{</span>
+        <span class="nt">&quot;open&quot;</span><span class="p">:</span> <span class="mf">279.45</span><span class="p">,</span>
+        <span class="nt">&quot;high&quot;</span><span class="p">:</span> <span class="mf">280.55</span><span class="p">,</span>
+        <span class="nt">&quot;low&quot;</span><span class="p">:</span> <span class="mf">277.4</span><span class="p">,</span>
+        <span class="nt">&quot;close&quot;</span><span class="p">:</span> <span class="mf">279.05</span>
+      <span class="p">},</span>
+      <span class="nt">&quot;net_change&quot;</span><span class="p">:</span> <span class="mi">0</span><span class="p">,</span>
+      <span class="nt">&quot;open_interest&quot;</span><span class="p">:</span> <span class="mi">0</span><span class="p">,</span>
+      <span class="nt">&quot;day_high_oi&quot;</span><span class="p">:</span> <span class="mi">0</span><span class="p">,</span>
+      <span class="nt">&quot;day_low_oi&quot;</span><span class="p">:</span> <span class="mi">0</span><span class="p">,</span>
+      <span class="nt">&quot;depth&quot;</span><span class="p">:</span> <span class="p">{</span>
+        <span class="nt">&quot;buy&quot;</span><span class="p">:</span> <span class="p">[</span>
+          <span class="p">{</span>
+            <span class="nt">&quot;price&quot;</span><span class="p">:</span> <span class="mf">278.7</span><span class="p">,</span>
+            <span class="nt">&quot;quantity&quot;</span><span class="p">:</span> <span class="mi">750</span><span class="p">,</span>
+            <span class="nt">&quot;orders&quot;</span><span class="p">:</span> <span class="mi">1</span>
+          <span class="p">},</span>
+          <span class="p">{</span>
+            <span class="nt">&quot;price&quot;</span><span class="p">:</span> <span class="mf">278.6</span><span class="p">,</span>
+            <span class="nt">&quot;quantity&quot;</span><span class="p">:</span> <span class="mi">340</span><span class="p">,</span>
+            <span class="nt">&quot;orders&quot;</span><span class="p">:</span> <span class="mi">3</span>
+          <span class="p">},</span>
+          <span class="p">{</span>
+            <span class="nt">&quot;price&quot;</span><span class="p">:</span> <span class="mf">278.55</span><span class="p">,</span>
+            <span class="nt">&quot;quantity&quot;</span><span class="p">:</span> <span class="mi">1880</span><span class="p">,</span>
+            <span class="nt">&quot;orders&quot;</span><span class="p">:</span> <span class="mi">5</span>
+          <span class="p">},</span>
+          <span class="p">{</span>
+            <span class="nt">&quot;price&quot;</span><span class="p">:</span> <span class="mf">278.5</span><span class="p">,</span>
+            <span class="nt">&quot;quantity&quot;</span><span class="p">:</span> <span class="mi">2259</span><span class="p">,</span>
+            <span class="nt">&quot;orders&quot;</span><span class="p">:</span> <span class="mi">10</span>
+          <span class="p">},</span>
+          <span class="p">{</span>
+            <span class="nt">&quot;price&quot;</span><span class="p">:</span> <span class="mf">278.45</span><span class="p">,</span>
+            <span class="nt">&quot;quantity&quot;</span><span class="p">:</span> <span class="mi">1456</span><span class="p">,</span>
+            <span class="nt">&quot;orders&quot;</span><span class="p">:</span> <span class="mi">4</span>
+          <span class="p">}</span>
+        <span class="p">],</span>
+        <span class="nt">&quot;sell&quot;</span><span class="p">:</span> <span class="p">[</span>
+          <span class="p">{</span>
+            <span class="nt">&quot;price&quot;</span><span class="p">:</span> <span class="mf">278.75</span><span class="p">,</span>
+            <span class="nt">&quot;quantity&quot;</span><span class="p">:</span> <span class="mi">117</span><span class="p">,</span>
+            <span class="nt">&quot;orders&quot;</span><span class="p">:</span> <span class="mi">5</span>
+          <span class="p">},</span>
+          <span class="p">{</span>
+            <span class="nt">&quot;price&quot;</span><span class="p">:</span> <span class="mf">278.8</span><span class="p">,</span>
+            <span class="nt">&quot;quantity&quot;</span><span class="p">:</span> <span class="mi">382</span><span class="p">,</span>
+            <span class="nt">&quot;orders&quot;</span><span class="p">:</span> <span class="mi">2</span>
+          <span class="p">},</span>
+          <span class="p">{</span>
+            <span class="nt">&quot;price&quot;</span><span class="p">:</span> <span class="mf">278.85</span><span class="p">,</span>
+            <span class="nt">&quot;quantity&quot;</span><span class="p">:</span> <span class="mi">5</span><span class="p">,</span>
+            <span class="nt">&quot;orders&quot;</span><span class="p">:</span> <span class="mi">1</span>
+          <span class="p">},</span>
+          <span class="p">{</span>
+            <span class="nt">&quot;price&quot;</span><span class="p">:</span> <span class="mf">278.9</span><span class="p">,</span>
+            <span class="nt">&quot;quantity&quot;</span><span class="p">:</span> <span class="mi">518</span><span class="p">,</span>
+            <span class="nt">&quot;orders&quot;</span><span class="p">:</span> <span class="mi">2</span>
+          <span class="p">},</span>
+          <span class="p">{</span>
+            <span class="nt">&quot;price&quot;</span><span class="p">:</span> <span class="mf">278.95</span><span class="p">,</span>
+            <span class="nt">&quot;quantity&quot;</span><span class="p">:</span> <span class="mi">2663</span><span class="p">,</span>
+            <span class="nt">&quot;orders&quot;</span><span class="p">:</span> <span class="mi">7</span>
+          <span class="p">}</span>
+        <span class="p">]</span>
+      <span class="p">}</span>
+    <span class="p">},</span>
+    <span class="nt">&quot;NSE:INFY&quot;</span><span class="p">:</span> <span class="p">{</span>
+      <span class="nt">&quot;instrument_token&quot;</span><span class="p">:</span> <span class="mi">408065</span><span class="p">,</span>
+      <span class="nt">&quot;timestamp&quot;</span><span class="p">:</span> <span class="s2">&quot;2018-01-12 10:31:54&quot;</span><span class="p">,</span>
+      <span class="nt">&quot;last_price&quot;</span><span class="p">:</span> <span class="mf">1075.1</span><span class="p">,</span>
+      <span class="nt">&quot;last_quantity&quot;</span><span class="p">:</span> <span class="mi">14</span><span class="p">,</span>
+      <span class="nt">&quot;last_trade_time&quot;</span><span class="p">:</span> <span class="s2">&quot;2018-01-12 10:31:53&quot;</span><span class="p">,</span>
+      <span class="nt">&quot;average_price&quot;</span><span class="p">:</span> <span class="mf">1077.13</span><span class="p">,</span>
+      <span class="nt">&quot;volume&quot;</span><span class="p">:</span> <span class="mi">1311662</span><span class="p">,</span>
+      <span class="nt">&quot;buy_quantity&quot;</span><span class="p">:</span> <span class="mi">235801</span><span class="p">,</span>
+      <span class="nt">&quot;sell_quantity&quot;</span><span class="p">:</span> <span class="mi">496803</span><span class="p">,</span>
+      <span class="err">...</span>
+    <span class="p">}</span>
+  <span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<h3 id="response-attributes">Response attributes<a class="headerlink" href="#response-attributes" title="Permanent link">&para;</a></h3>
+<table>
+<thead>
+<tr>
+<th>attribute</th>
+<th>&nbsp;</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>last_price</code><span>float</span></td>
+<td>Last traded market price</td>
+</tr>
+<tr>
+<td><code>volume</code><span>int</span></td>
+<td>Volume traded today</td>
+</tr>
+<tr>
+<td><code>buy_quantity</code><span>int</span></td>
+<td>Total quantity of buy orders</td>
+</tr>
+<tr>
+<td><code>sell_quantity</code><span>int</span></td>
+<td>Total quantity of sell orders</td>
+</tr>
+<tr>
+<td><code>open_interest</code><span>float</span></td>
+<td>Total number of outstanding contracts held by market participants exchange-wide (only F&amp;O)</td>
+</tr>
+<tr>
+<td><code>last_quantity</code><span>int</span></td>
+<td>Last traded quantity</td>
+</tr>
+<tr>
+<td><code>last_time</code><span>null, string</span></td>
+<td>Time of last trade</td>
+</tr>
+<tr>
+<td><code>ohlc.open</code><span>float</span></td>
+<td>Price at market opening</td>
+</tr>
+<tr>
+<td><code>ohlc.high</code><span>float</span></td>
+<td>Highest price today</td>
+</tr>
+<tr>
+<td><code>ohlc.low</code><span>float</span></td>
+<td>Lowest price today</td>
+</tr>
+<tr>
+<td><code>ohlc.close</code><span>float</span></td>
+<td>Closing price of the instrument from the last trading day</td>
+</tr>
+<tr>
+<td><code>depth.buy[].price</code><span>float</span></td>
+<td>Price at which the depth stands</td>
+</tr>
+<tr>
+<td><code>depth.buy[].orders</code><span>int</span></td>
+<td>Number of open BUY (bid) orders at the price</td>
+</tr>
+<tr>
+<td><code>depth.buy[].quantity</code><span>int</span></td>
+<td>Net quantity from the pending orders</td>
+</tr>
+<tr>
+<td><code>depth.sell[].price</code><span>float</span></td>
+<td>Price at which the depth stands</td>
+</tr>
+<tr>
+<td><code>depth.sell[].orders</code><span>int</span></td>
+<td>Number of open SELL (ask) orders at the price</td>
+</tr>
+<tr>
+<td><code>depth.sell[].quantity</code><span>int</span></td>
+<td>Net quantity from the pending orders</td>
+</tr>
+</tbody>
+</table>
+<h2 id="retrieving-ohlc-quotes">Retrieving OHLC quotes<a class="headerlink" href="#retrieving-ohlc-quotes" title="Permanent link">&para;</a></h2>
+<p>This API returns the OHLC + LTP snapshots of up to <strong>250</strong> instruments in one go.</p>
+<p>Instruments are identified by the <code>exchange:tradingsymbol</code> combination and are passed as values to the query parameter <code>i</code> which is repeated for every instrument. If there is no data available for a given key, the key will be absent from the response. The existence of all the instrument keys in the response map should be checked before to accessing them.</p>
+<div class="codehilite"><pre><span></span><code>curl <span class="s2">&quot;https://api.kite.trade/quote/ohlc?i=NSE:INFY&amp;i=BSE:SENSEX&amp;i=NSE:NIFTY+50&quot;</span>
+    -H <span class="s2">&quot;X-Kite-Version: 3&quot;</span> <span class="se">\</span>
+    -H <span class="s2">&quot;Authorization: token api_key:access_token&quot;</span>
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code><span class="p">{</span>
+    <span class="nt">&quot;status&quot;</span><span class="p">:</span> <span class="s2">&quot;success&quot;</span><span class="p">,</span>
+    <span class="nt">&quot;data&quot;</span><span class="p">:</span> <span class="p">{</span>
+        <span class="nt">&quot;BSE:SENSEX&quot;</span><span class="p">:</span> <span class="p">{</span>
+            <span class="nt">&quot;instrument_token&quot;</span><span class="p">:</span> <span class="mi">265</span><span class="p">,</span>
+            <span class="nt">&quot;last_price&quot;</span><span class="p">:</span> <span class="mf">31606.48</span><span class="p">,</span>
+            <span class="nt">&quot;ohlc&quot;</span><span class="p">:</span> <span class="p">{</span>
+                <span class="nt">&quot;open&quot;</span><span class="p">:</span> <span class="mf">31713.5</span><span class="p">,</span>
+                <span class="nt">&quot;high&quot;</span><span class="p">:</span> <span class="mf">31713.5</span><span class="p">,</span>
+                <span class="nt">&quot;low&quot;</span><span class="p">:</span> <span class="mf">31586.53</span><span class="p">,</span>
+                <span class="nt">&quot;close&quot;</span><span class="p">:</span> <span class="mf">31809.55</span>
+            <span class="p">}</span>
+        <span class="p">},</span>
+        <span class="nt">&quot;NSE:INFY&quot;</span><span class="p">:</span> <span class="p">{</span>
+            <span class="nt">&quot;instrument_token&quot;</span><span class="p">:</span> <span class="mi">408065</span><span class="p">,</span>
+            <span class="nt">&quot;last_price&quot;</span><span class="p">:</span> <span class="mf">890.9</span><span class="p">,</span>
+            <span class="nt">&quot;ohlc&quot;</span><span class="p">:</span> <span class="p">{</span>
+                <span class="nt">&quot;open&quot;</span><span class="p">:</span> <span class="mi">900</span><span class="p">,</span>
+                <span class="nt">&quot;high&quot;</span><span class="p">:</span> <span class="mf">900.3</span><span class="p">,</span>
+                <span class="nt">&quot;low&quot;</span><span class="p">:</span> <span class="mi">890</span><span class="p">,</span>
+                <span class="nt">&quot;close&quot;</span><span class="p">:</span> <span class="mf">901.9</span>
+            <span class="p">}</span>
+        <span class="p">},</span>
+        <span class="nt">&quot;NSE:NIFTY 50&quot;</span><span class="p">:</span> <span class="p">{</span>
+            <span class="nt">&quot;instrument_token&quot;</span><span class="p">:</span> <span class="mi">256265</span><span class="p">,</span>
+            <span class="nt">&quot;last_price&quot;</span><span class="p">:</span> <span class="mf">9893.4</span><span class="p">,</span>
+            <span class="nt">&quot;ohlc&quot;</span><span class="p">:</span> <span class="p">{</span>
+                <span class="nt">&quot;open&quot;</span><span class="p">:</span> <span class="mf">9899.25</span><span class="p">,</span>
+                <span class="nt">&quot;high&quot;</span><span class="p">:</span> <span class="mf">9911.9</span><span class="p">,</span>
+                <span class="nt">&quot;low&quot;</span><span class="p">:</span> <span class="mf">9882.55</span><span class="p">,</span>
+                <span class="nt">&quot;close&quot;</span><span class="p">:</span> <span class="mf">9952.2</span>
+            <span class="p">}</span>
+        <span class="p">}</span>
+    <span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<h3 id="response-attributes_1">Response attributes<a class="headerlink" href="#response-attributes_1" title="Permanent link">&para;</a></h3>
+<table>
+<thead>
+<tr>
+<th>attribute</th>
+<th>&nbsp;</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>instrument_token</code><span>uint32</span></td>
+<td>The numerical identifier issued by the exchange representing the instrument.</td>
+</tr>
+<tr>
+<td><code>last_price</code><span>float</span></td>
+<td>Last traded market price</td>
+</tr>
+<tr>
+<td><code>ohlc.open</code><span>float</span></td>
+<td>Price at market opening</td>
+</tr>
+<tr>
+<td><code>ohlc.high</code><span>float</span></td>
+<td>Highest price today</td>
+</tr>
+<tr>
+<td><code>ohlc.low</code><span>float</span></td>
+<td>Lowest price today</td>
+</tr>
+<tr>
+<td><code>ohlc.close</code><span>float</span></td>
+<td>Closing price of the instrument from the last trading day</td>
+</tr>
+</tbody>
+</table>
+<div class="admonition note">
+<p class="admonition-title">Note</p>
+<p>Always check for the existence of a particular key you've requested (eg: NSE:INFY) in the response. If there's no data for the particular instrument or if it has expired, the key will be missing from the response.</p>
+</div>
+<h2 id="retrieving-ltps-quotes">Retrieving LTPs quotes<a class="headerlink" href="#retrieving-ltps-quotes" title="Permanent link">&para;</a></h2>
+<p>This API returns the LTPs of up to <strong>250</strong> instruments in one go.</p>
+<p>Instruments are identified by the <code>exchange:tradingsymbol</code> combination and are passed as values to the query parameter <code>i</code> which is repeated for every instrument. If there is no data available for a given key, the key will be absent from the response. The existence of all the instrument keys in the response map should be checked before to accessing them.</p>
+<div class="codehilite"><pre><span></span><code>curl <span class="s2">&quot;https://api.kite.trade/quote/ltp?i=NSE:INFY&amp;i=BSE:SENSEX&amp;i=NSE:NIFTY+50&quot;</span>
+    -H <span class="s2">&quot;X-Kite-Version: 3&quot;</span> <span class="se">\</span>
+    -H <span class="s2">&quot;Authorization: token api_key:access_token&quot;</span>
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code><span class="p">{</span>
+    <span class="nt">&quot;status&quot;</span><span class="p">:</span> <span class="s2">&quot;success&quot;</span><span class="p">,</span>
+    <span class="nt">&quot;data&quot;</span><span class="p">:</span> <span class="p">{</span>
+        <span class="nt">&quot;BSE:SENSEX&quot;</span><span class="p">:</span> <span class="p">{</span>
+            <span class="nt">&quot;instrument_token&quot;</span><span class="p">:</span> <span class="mi">265</span><span class="p">,</span>
+            <span class="nt">&quot;last_price&quot;</span><span class="p">:</span> <span class="mf">31606.48</span>
+        <span class="p">},</span>
+        <span class="nt">&quot;NSE:INFY&quot;</span><span class="p">:</span> <span class="p">{</span>
+            <span class="nt">&quot;instrument_token&quot;</span><span class="p">:</span> <span class="mi">408065</span><span class="p">,</span>
+            <span class="nt">&quot;last_price&quot;</span><span class="p">:</span> <span class="mf">890.9</span>
+        <span class="p">},</span>
+        <span class="nt">&quot;NSE:NIFTY 50&quot;</span><span class="p">:</span> <span class="p">{</span>
+            <span class="nt">&quot;instrument_token&quot;</span><span class="p">:</span> <span class="mi">256265</span><span class="p">,</span>
+            <span class="nt">&quot;last_price&quot;</span><span class="p">:</span> <span class="mf">9893.4</span>
+        <span class="p">}</span>
+    <span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<h3 id="response-attributes_2">Response attributes<a class="headerlink" href="#response-attributes_2" title="Permanent link">&para;</a></h3>
+<table>
+<thead>
+<tr>
+<th>attribute</th>
+<th>&nbsp;</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>instrument_token</code><span>uint32</span></td>
+<td>The numerical identifier issued by the exchange representing the instrument.</td>
+</tr>
+<tr>
+<td><code>last_price</code><span>float</span></td>
+<td>Last traded market price</td>
+</tr>
+</tbody>
+</table>
+<div class="admonition note">
+<p class="admonition-title">Note</p>
+<p>Always check for the existence of a particular key you've requested (eg: NSE:INFY) in the response. If there's no data for the particular instrument or if it has expired, the key will be absent from the response.</p>
+</div>
+                
+              
+              
+                
+
+
+              
+            </article>
+          </div>
+        </div>
+        
+      </main>
+      
+        
+<footer class="md-footer">
+  
+  <div class="md-footer-meta md-typeset">
+    <div class="md-footer-meta__inner md-grid">
+      <div class="md-footer-copyright">
+        
+          <div class="md-footer-copyright__highlight">
+            Copyright &copy; 2015 - 2020, Zerodha Technology Pvt. Ltd.
+          </div>
+        
+        
+          Made with
+          <a href="https://squidfunk.github.io/mkdocs-material/" target="_blank" rel="noopener">
+            Material for MkDocs
+          </a>
+        
+        
+      </div>
+      
+    </div>
+  </div>
+</footer>
+      
+    </div>
+    <div class="md-dialog" data-md-component="dialog">
+      <div class="md-dialog__inner md-typeset"></div>
+    </div>
+    <script id="__config" type="application/json">{"base": "..", "features": [], "translations": {"clipboard.copy": "Copy to clipboard", "clipboard.copied": "Copied to clipboard", "search.config.lang": "en", "search.config.pipeline": "trimmer, stopWordFilter", "search.config.separator": "[\\s\\-]+", "search.placeholder": "Search", "search.result.placeholder": "Type to start searching", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.term.missing": "Missing", "select.version.title": "Select version"}, "search": "../assets/javascripts/workers/search.f8263e09.min.js", "version": null}</script>
+    
+    
+      <script src="../assets/javascripts/bundle.4fc53ad4.min.js"></script>
+      
+    
+  </body>
+</html>

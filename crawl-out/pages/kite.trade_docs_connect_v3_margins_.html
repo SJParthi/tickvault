@@ -1,0 +1,1465 @@
+
+<!doctype html>
+<html lang="en" class="no-js">
+  <head>
+    
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      
+      
+      
+      
+        <link rel="prev" href="../mutual-funds/">
+      
+      
+        <link rel="next" href="../basket/">
+      
+      <link rel="icon" href="../images/favicon">
+      <meta name="generator" content="mkdocs-1.4.3, mkdocs-material-9.1.18">
+    
+    
+      
+        <title>Margin calculation - Kite Connect 3 / API documentation</title>
+      
+    
+    
+      <link rel="stylesheet" href="../assets/stylesheets/main.26e3688c.min.css">
+      
+        
+        <link rel="stylesheet" href="../assets/stylesheets/palette.ecc896b0.min.css">
+      
+      
+
+    
+    
+    
+      
+        
+        
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+        <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Roboto:300,300i,400,400i,700,700i%7CRoboto+Mono:400,400i,700,700i&display=fallback">
+        <style>:root{--md-text-font:"Roboto";--md-code-font:"Roboto Mono"}</style>
+      
+    
+    
+      <link rel="stylesheet" href="../static/style.css">
+    
+    <script>__md_scope=new URL("..",location),__md_hash=e=>[...e].reduce((e,_)=>(e<<5)-e+_.charCodeAt(0),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
+    
+      
+
+    
+    
+    
+  </head>
+  
+  
+    
+    
+    
+    
+    
+    <body dir="ltr" data-md-color-scheme="default" data-md-color-primary="white" data-md-color-accent="red">
+  
+    
+    
+    <input class="md-toggle" data-md-toggle="drawer" type="checkbox" id="__drawer" autocomplete="off">
+    <input class="md-toggle" data-md-toggle="search" type="checkbox" id="__search" autocomplete="off">
+    <label class="md-overlay" for="__drawer"></label>
+    <div data-md-component="skip">
+      
+        
+        <a href="#margin-calculation" class="md-skip">
+          Skip to content
+        </a>
+      
+    </div>
+    <div data-md-component="announce">
+      
+    </div>
+    
+    
+      
+
+  
+
+<header class="md-header md-header--shadow" data-md-component="header">
+  <nav class="md-header__inner md-grid" aria-label="Header">
+    <a href=".." title="Kite Connect 3 / API documentation" class="md-header__button md-logo" aria-label="Kite Connect 3 / API documentation" data-md-component="logo">
+      
+  <img src="../images/logo.svg" alt="logo">
+
+    </a>
+    <label class="md-header__button md-icon" for="__drawer">
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M3 6h18v2H3V6m0 5h18v2H3v-2m0 5h18v2H3v-2Z"/></svg>
+    </label>
+    <div class="md-header__title" data-md-component="header-title">
+      <div class="md-header__ellipsis">
+        <div class="md-header__topic">
+          <span class="md-ellipsis">
+            Kite Connect 3 / API documentation
+          </span>
+        </div>
+        <div class="md-header__topic" data-md-component="header-topic">
+          <span class="md-ellipsis">
+            
+              Margin calculation
+            
+          </span>
+        </div>
+      </div>
+    </div>
+    
+      
+    
+    
+    
+      <label class="md-header__button md-icon" for="__search">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.516 6.516 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5Z"/></svg>
+      </label>
+      <div class="md-search" data-md-component="search" role="dialog">
+  <label class="md-search__overlay" for="__search"></label>
+  <div class="md-search__inner" role="search">
+    <form class="md-search__form" name="search">
+      <input type="text" class="md-search__input" name="query" aria-label="Search" placeholder="Search" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false" data-md-component="search-query" required>
+      <label class="md-search__icon md-icon" for="__search">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.516 6.516 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5Z"/></svg>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11h12Z"/></svg>
+      </label>
+      <nav class="md-search__options" aria-label="Search">
+        
+        <button type="reset" class="md-search__icon md-icon" title="Clear" aria-label="Clear" tabindex="-1">
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12 19 6.41Z"/></svg>
+        </button>
+      </nav>
+      
+    </form>
+    <div class="md-search__output">
+      <div class="md-search__scrollwrap" data-md-scrollfix>
+        <div class="md-search-result" data-md-component="search-result">
+          <div class="md-search-result__meta">
+            Initializing search
+          </div>
+          <ol class="md-search-result__list" role="presentation"></ol>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+    
+    
+  </nav>
+  
+</header>
+    
+    <div class="md-container" data-md-component="container">
+      
+      
+        
+          
+        
+      
+      <main class="md-main" data-md-component="main">
+        <div class="md-main__inner md-grid">
+          
+            
+              
+              <div class="md-sidebar md-sidebar--primary" data-md-component="sidebar" data-md-type="navigation" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+
+<nav class="md-nav md-nav--primary" aria-label="Navigation" data-md-level="0">
+  <label class="md-nav__title" for="__drawer">
+    <a href=".." title="Kite Connect 3 / API documentation" class="md-nav__button md-logo" aria-label="Kite Connect 3 / API documentation" data-md-component="logo">
+      
+  <img src="../images/logo.svg" alt="logo">
+
+    </a>
+    Kite Connect 3 / API documentation
+  </label>
+  
+  <ul class="md-nav__list" data-md-scrollfix>
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href=".." class="md-nav__link">
+        Introduction
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../sdks/" class="md-nav__link">
+        Libraries and SDKs
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../response-structure/" class="md-nav__link">
+        Response structure
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../exceptions/" class="md-nav__link">
+        Exceptions and errors
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../user/" class="md-nav__link">
+        User
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../orders/" class="md-nav__link">
+        Orders
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../gtt/" class="md-nav__link">
+        GTT orders
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../alerts/" class="md-nav__link">
+        Alerts
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../portfolio/" class="md-nav__link">
+        Portfolio
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../market-quotes/" class="md-nav__link">
+        Market quotes and instruments
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../websocket/" class="md-nav__link">
+        WebSocket streaming
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../historical/" class="md-nav__link">
+        Historical candle data
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../postbacks/" class="md-nav__link">
+        Postbacks / WebHooks
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../mutual-funds/" class="md-nav__link">
+        Mutual funds
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+    
+  
+  
+    <li class="md-nav__item md-nav__item--active">
+      
+      <input class="md-nav__toggle md-toggle" type="checkbox" id="__toc">
+      
+      
+        
+      
+      
+        <label class="md-nav__link md-nav__link--active" for="__toc">
+          Margin calculation
+          <span class="md-nav__icon md-icon"></span>
+        </label>
+      
+      <a href="./" class="md-nav__link md-nav__link--active">
+        Margin calculation
+      </a>
+      
+        
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#order-margins" class="md-nav__link">
+    Order margins
+  </a>
+  
+    <nav class="md-nav" aria-label="Order margins">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#order-structure" class="md-nav__link">
+    Order structure
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#margin-structure" class="md-nav__link">
+    Margin structure
+  </a>
+  
+    <nav class="md-nav" aria-label="Margin structure">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#charges-structure" class="md-nav__link">
+    Charges structure
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#basket-margins" class="md-nav__link">
+    Basket margins
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#virtual-contract-note" class="md-nav__link">
+    Virtual contract note
+  </a>
+  
+    <nav class="md-nav" aria-label="Virtual contract note">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#order-structure_1" class="md-nav__link">
+    Order structure
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#response-attributes" class="md-nav__link">
+    Response attributes
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+      
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../basket/" class="md-nav__link">
+        Publisher - Offsite orders
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../publisher/" class="md-nav__link">
+        Publisher JS plugin
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../apps/" class="md-nav__link">
+        Mobile and Desktop apps
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../changelog/" class="md-nav__link">
+        Changelog
+      </a>
+    </li>
+  
+
+    
+  </ul>
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+            
+              
+              <div class="md-sidebar md-sidebar--secondary" data-md-component="sidebar" data-md-type="toc" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#order-margins" class="md-nav__link">
+    Order margins
+  </a>
+  
+    <nav class="md-nav" aria-label="Order margins">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#order-structure" class="md-nav__link">
+    Order structure
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#margin-structure" class="md-nav__link">
+    Margin structure
+  </a>
+  
+    <nav class="md-nav" aria-label="Margin structure">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#charges-structure" class="md-nav__link">
+    Charges structure
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#basket-margins" class="md-nav__link">
+    Basket margins
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#virtual-contract-note" class="md-nav__link">
+    Virtual contract note
+  </a>
+  
+    <nav class="md-nav" aria-label="Virtual contract note">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#order-structure_1" class="md-nav__link">
+    Order structure
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#response-attributes" class="md-nav__link">
+    Response attributes
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+          
+          
+            <div class="md-content" data-md-component="content">
+              <article class="md-content__inner md-typeset">
+                
+                  
+
+
+<h1 id="margin-calculation">Margin calculation<a class="headerlink" href="#margin-calculation" title="Permanent link">&para;</a></h1>
+<p>Margin calculation APIs lets you calculate <code>span</code>, <code>exposure</code>, <code>option premium</code>, <code>additional</code>, <code>bo</code>, <code>cash</code>, <code>var</code>, <code>pnl</code> values for a list of orders.</p>
+<table>
+<thead>
+<tr>
+<th>type</th>
+<th>endpoint</th>
+<th>&nbsp;</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>POST</td>
+<td><a href="#order-margins">/margins/orders</a></td>
+<td>Calculates margins for each order considering the existing positions and open orders</td>
+</tr>
+<tr>
+<td>POST</td>
+<td><a href="#basket-margins">/margins/basket</a></td>
+<td>Calculates margins for spread orders</td>
+</tr>
+<tr>
+<td>POST</td>
+<td><a href="#virtual-contract-note">/charges/orders</a></td>
+<td>Calculates order-wise charges for orderbook</td>
+</tr>
+</tbody>
+</table>
+<div class="admonition note">
+<p class="admonition-title">Note</p>
+<p>Requests to the above endpoints are JSON POST and it needs <code>application/json</code> header.</p>
+</div>
+<h2 id="order-margins">Order margins<a class="headerlink" href="#order-margins" title="Permanent link">&para;</a></h2>
+<p><a href="#order-structure">Request order structure</a> <br />
+<a href="#margin-structure">Response margin structure</a></p>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>https://api.kite.trade/margins/orders<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-H<span class="w"> </span><span class="s1">&#39;X-Kite-Version: 3&#39;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-H<span class="w"> </span><span class="s1">&#39;Authorization: token api_key:access_token&#39;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-H<span class="w"> </span><span class="s1">&#39;Content-Type: application/json&#39;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-d<span class="w"> </span><span class="s1">&#39;[</span>
+<span class="s1">    {</span>
+<span class="s1">        &quot;exchange&quot;: &quot;NSE&quot;,</span>
+<span class="s1">        &quot;tradingsymbol&quot;: &quot;INFY&quot;,</span>
+<span class="s1">        &quot;transaction_type&quot;: &quot;BUY&quot;,</span>
+<span class="s1">        &quot;variety&quot;: &quot;regular&quot;,</span>
+<span class="s1">        &quot;product&quot;: &quot;CNC&quot;,</span>
+<span class="s1">        &quot;order_type&quot;: &quot;MARKET&quot;,</span>
+<span class="s1">        &quot;quantity&quot;: 1,</span>
+<span class="s1">        &quot;price&quot;: 0,</span>
+<span class="s1">        &quot;trigger_price&quot;: 0</span>
+<span class="s1">    }</span>
+<span class="s1">]&#39;</span>
+</code></pre></div>
+<p>Query parameters are as follows.</p>
+<table>
+<thead>
+<tr>
+<th>parameter</th>
+<th>&nbsp;</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>mode</td>
+<td><code>compact</code> - Compact mode will only give the total margins</td>
+</tr>
+</tbody>
+</table>
+<div class="highlight"><pre><span></span><code><span class="p">{</span>
+<span class="w">  </span><span class="nt">&quot;status&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;success&quot;</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">&quot;data&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+<span class="w">    </span><span class="p">{</span>
+<span class="w">      </span><span class="nt">&quot;type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;equity&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;tradingsymbol&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;INFY&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;exchange&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;NSE&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;span&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;exposure&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;option_premium&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;additional&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;bo&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;cash&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;var&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1498</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;pnl&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="nt">&quot;realised&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;unrealised&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span>
+<span class="w">      </span><span class="p">},</span>
+<span class="w">      </span><span class="nt">&quot;leverage&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;charges&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="nt">&quot;transaction_tax&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">1.498</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;transaction_tax_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;stt&quot;</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;exchange_turnover_charge&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">0.051681</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;sebi_turnover_charge&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">0.001498</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;brokerage&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">0.01</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;stamp_duty&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">0.22</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;gst&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">          </span><span class="nt">&quot;igst&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">0.011372219999999999</span><span class="p">,</span>
+<span class="w">          </span><span class="nt">&quot;cgst&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">          </span><span class="nt">&quot;sgst&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">          </span><span class="nt">&quot;total&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">0.011372219999999999</span>
+<span class="w">        </span><span class="p">},</span>
+<span class="w">        </span><span class="nt">&quot;total&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">1.79255122</span>
+<span class="w">      </span><span class="p">},</span>
+<span class="w">      </span><span class="nt">&quot;total&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1498</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">  </span><span class="p">]</span>
+<span class="p">}</span>
+</code></pre></div>
+<h3 id="order-structure">Order structure<a class="headerlink" href="#order-structure" title="Permanent link">&para;</a></h3>
+<table>
+<thead>
+<tr>
+<th>parameter</th>
+<th>&nbsp;</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>exchange</td>
+<td>Name of the exchange</td>
+</tr>
+<tr>
+<td>transaction_type</td>
+<td><code>BUY</code>/<code>SELL</code></td>
+</tr>
+<tr>
+<td>variety</td>
+<td>Order variety (regular, amo, co etc.)</td>
+</tr>
+<tr>
+<td>product</td>
+<td>Margin product to use for the order (margins are blocked based on this) <a href="https://support.zerodha.com/category/trading-and-markets/product-and-order-types/product/articles/what-does-cnc-mis-and-nrml-mean">?</a></td>
+</tr>
+<tr>
+<td>order_type</td>
+<td>Order type (MARKET, LIMIT etc.)</td>
+</tr>
+<tr>
+<td>quantity</td>
+<td>Quantity of the order</td>
+</tr>
+<tr>
+<td>price</td>
+<td>Price at which the order is going to be placed (LIMIT orders)</td>
+</tr>
+<tr>
+<td>trigger_price</td>
+<td>Trigger price (for SL, SL-M, CO orders)</td>
+</tr>
+</tbody>
+</table>
+<h3 id="margin-structure">Margin structure<a class="headerlink" href="#margin-structure" title="Permanent link">&para;</a></h3>
+<table>
+<thead>
+<tr>
+<th>parameter</th>
+<th>&nbsp;</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>type</td>
+<td><code>equity</code>/<code>commodity</code></td>
+</tr>
+<tr>
+<td>tradingsymbol</td>
+<td>Trading symbol of the instrument</td>
+</tr>
+<tr>
+<td>exchange</td>
+<td>Name of the exchange</td>
+</tr>
+<tr>
+<td>span</td>
+<td>SPAN margins</td>
+</tr>
+<tr>
+<td>exposure</td>
+<td>Exposure margins</td>
+</tr>
+<tr>
+<td>option_premium</td>
+<td>Option premium</td>
+</tr>
+<tr>
+<td>additional</td>
+<td>Additional margins</td>
+</tr>
+<tr>
+<td>bo</td>
+<td>BO margins</td>
+</tr>
+<tr>
+<td>cash</td>
+<td>Cash credit</td>
+</tr>
+<tr>
+<td>var</td>
+<td>VAR</td>
+</tr>
+<tr>
+<td>pnl</td>
+<td>Realised and unrealised profit and loss</td>
+</tr>
+<tr>
+<td>leverage</td>
+<td>Margin leverage allowed for the trade</td>
+</tr>
+<tr>
+<td>charges</td>
+<td>The <a href="#charges-structure">breakdown of the various charges</a> that will be applied to an order</td>
+</tr>
+<tr>
+<td>total</td>
+<td>Total margin block</td>
+</tr>
+</tbody>
+</table>
+<h4 id="charges-structure">Charges structure<a class="headerlink" href="#charges-structure" title="Permanent link">&para;</a></h4>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Definition</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>total</td>
+<td>Total charges</td>
+</tr>
+<tr>
+<td>transaction_tax</td>
+<td>Tax levied for each transaction on the exchanges</td>
+</tr>
+<tr>
+<td>transaction_tax_type</td>
+<td>Type of transaction tax</td>
+</tr>
+<tr>
+<td>exchange_turnover_charge</td>
+<td>Charge levied by the exchange on the total turnover of the day</td>
+</tr>
+<tr>
+<td>sebi_turnover_charge</td>
+<td>Charge levied by SEBI on the total turnover of the day</td>
+</tr>
+<tr>
+<td>brokerage</td>
+<td>The brokerage charge for a particular trade</td>
+</tr>
+<tr>
+<td>stamp_duty</td>
+<td>Duty levied on the transaction value by Government of India</td>
+</tr>
+<tr>
+<td>gst.igst</td>
+<td>Integrated Goods and Services Tax levied by the government</td>
+</tr>
+<tr>
+<td>gst.cgst</td>
+<td>Central Goods and Services Tax levied by the government</td>
+</tr>
+<tr>
+<td>gst.sgst</td>
+<td>State Goods and Services Tax levied by the government</td>
+</tr>
+<tr>
+<td>gst.total</td>
+<td>Total GST</td>
+</tr>
+</tbody>
+</table>
+<h2 id="basket-margins">Basket margins<a class="headerlink" href="#basket-margins" title="Permanent link">&para;</a></h2>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>https://api.kite.trade/margins/basket?consider_positions<span class="o">=</span><span class="nb">true</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-H<span class="w"> </span><span class="s1">&#39;X-Kite-Version: 3&#39;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-H<span class="w"> </span><span class="s1">&#39;Authorization: token api_key:access_token&#39;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-H<span class="w"> </span><span class="s1">&#39;Content-Type: application/json&#39;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-d<span class="w"> </span><span class="s1">&#39;[</span>
+<span class="s1">    {</span>
+<span class="s1">        &quot;exchange&quot;: &quot;NFO&quot;,</span>
+<span class="s1">        &quot;tradingsymbol&quot;: &quot;NIFTY23JUL20600CE&quot;,</span>
+<span class="s1">        &quot;transaction_type&quot;: &quot;SELL&quot;,</span>
+<span class="s1">        &quot;variety&quot;: &quot;regular&quot;,</span>
+<span class="s1">        &quot;product&quot;: &quot;NRML&quot;,</span>
+<span class="s1">        &quot;order_type&quot;: &quot;MARKET&quot;,</span>
+<span class="s1">        &quot;quantity&quot;: 75,</span>
+<span class="s1">        &quot;price&quot;: 0,</span>
+<span class="s1">        &quot;trigger_price&quot;: 0</span>
+<span class="s1">    },</span>
+<span class="s1">    {</span>
+<span class="s1">        &quot;exchange&quot;: &quot;NFO&quot;,</span>
+<span class="s1">        &quot;tradingsymbol&quot;: &quot;NIFTY23JUL20700CE&quot;,</span>
+<span class="s1">        &quot;transaction_type&quot;: &quot;BUY&quot;,</span>
+<span class="s1">        &quot;variety&quot;: &quot;regular&quot;,</span>
+<span class="s1">        &quot;product&quot;: &quot;NRML&quot;,</span>
+<span class="s1">        &quot;order_type&quot;: &quot;MARKET&quot;,</span>
+<span class="s1">        &quot;quantity&quot;: 75,</span>
+<span class="s1">        &quot;price&quot;: 0,</span>
+<span class="s1">        &quot;trigger_price&quot;: 0</span>
+<span class="s1">    }</span>
+<span class="s1">]&#39;</span>
+</code></pre></div>
+<p>Query parameters are as follows.</p>
+<table>
+<thead>
+<tr>
+<th>parameter</th>
+<th>&nbsp;</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>consider_positions</td>
+<td>Boolean to consider users positions</td>
+</tr>
+<tr>
+<td>mode</td>
+<td><code>compact</code> - Compact mode will only give the total margins</td>
+</tr>
+</tbody>
+</table>
+<div class="highlight"><pre><span></span><code><span class="p">{</span>
+<span class="w">  </span><span class="nt">&quot;status&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;success&quot;</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">&quot;data&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="nt">&quot;initial&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">      </span><span class="nt">&quot;type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;tradingsymbol&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;exchange&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;span&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">66832.5</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;exposure&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">29151.225000000002</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;option_premium&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">521.25</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;additional&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;bo&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;cash&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;var&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;pnl&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="nt">&quot;realised&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;unrealised&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span>
+<span class="w">      </span><span class="p">},</span>
+<span class="w">      </span><span class="nt">&quot;leverage&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;charges&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="nt">&quot;transaction_tax&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;transaction_tax_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;&quot;</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;exchange_turnover_charge&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;sebi_turnover_charge&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;brokerage&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;stamp_duty&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;gst&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">          </span><span class="nt">&quot;igst&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">          </span><span class="nt">&quot;cgst&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">          </span><span class="nt">&quot;sgst&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">          </span><span class="nt">&quot;total&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span>
+<span class="w">        </span><span class="p">},</span>
+<span class="w">        </span><span class="nt">&quot;total&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span>
+<span class="w">      </span><span class="p">},</span>
+<span class="w">      </span><span class="nt">&quot;total&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">96504.975</span>
+<span class="w">    </span><span class="p">},</span>
+<span class="w">    </span><span class="nt">&quot;final&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">      </span><span class="nt">&quot;type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;tradingsymbol&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;exchange&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;span&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">7788.000000000007</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;exposure&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">29151.225000000002</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;option_premium&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">-2152.5</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;additional&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;bo&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;cash&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;var&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;pnl&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="nt">&quot;realised&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;unrealised&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span>
+<span class="w">      </span><span class="p">},</span>
+<span class="w">      </span><span class="nt">&quot;leverage&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;charges&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="nt">&quot;transaction_tax&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;transaction_tax_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;&quot;</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;exchange_turnover_charge&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;sebi_turnover_charge&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;brokerage&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;stamp_duty&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;gst&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">          </span><span class="nt">&quot;igst&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">          </span><span class="nt">&quot;cgst&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">          </span><span class="nt">&quot;sgst&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">          </span><span class="nt">&quot;total&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span>
+<span class="w">        </span><span class="p">},</span>
+<span class="w">        </span><span class="nt">&quot;total&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span>
+<span class="w">      </span><span class="p">},</span>
+<span class="w">      </span><span class="nt">&quot;total&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">34786.725000000006</span>
+<span class="w">    </span><span class="p">},</span>
+<span class="w">    </span><span class="nt">&quot;orders&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+<span class="w">      </span><span class="p">{</span>
+<span class="w">        </span><span class="nt">&quot;type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;equity&quot;</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;tradingsymbol&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;NIFTY23JUL20600CE&quot;</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;exchange&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;NFO&quot;</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;span&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">66832.5</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;exposure&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">29151.225000000002</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;option_premium&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;additional&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;bo&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;cash&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;var&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;pnl&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">          </span><span class="nt">&quot;realised&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">          </span><span class="nt">&quot;unrealised&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span>
+<span class="w">        </span><span class="p">},</span>
+<span class="w">        </span><span class="nt">&quot;leverage&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;charges&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">          </span><span class="nt">&quot;transaction_tax&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">1.67109375</span><span class="p">,</span>
+<span class="w">          </span><span class="nt">&quot;transaction_tax_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;stt&quot;</span><span class="p">,</span>
+<span class="w">          </span><span class="nt">&quot;exchange_turnover_charge&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">1.336875</span><span class="p">,</span>
+<span class="w">          </span><span class="nt">&quot;sebi_turnover_charge&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">0.00267375</span><span class="p">,</span>
+<span class="w">          </span><span class="nt">&quot;brokerage&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">20</span><span class="p">,</span>
+<span class="w">          </span><span class="nt">&quot;stamp_duty&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">          </span><span class="nt">&quot;gst&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="nt">&quot;igst&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">3.8411187749999995</span><span class="p">,</span>
+<span class="w">            </span><span class="nt">&quot;cgst&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">            </span><span class="nt">&quot;sgst&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">            </span><span class="nt">&quot;total&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">3.8411187749999995</span>
+<span class="w">          </span><span class="p">},</span>
+<span class="w">          </span><span class="nt">&quot;total&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">26.851761274999998</span>
+<span class="w">        </span><span class="p">},</span>
+<span class="w">        </span><span class="nt">&quot;total&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">95983.725</span>
+<span class="w">      </span><span class="p">},</span>
+<span class="w">      </span><span class="p">{</span>
+<span class="w">        </span><span class="nt">&quot;type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;equity&quot;</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;tradingsymbol&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;NIFTY23JUL20700CE&quot;</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;exchange&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;NFO&quot;</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;span&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;exposure&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;option_premium&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">521.25</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;additional&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;bo&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;cash&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;var&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;pnl&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">          </span><span class="nt">&quot;realised&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">          </span><span class="nt">&quot;unrealised&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span>
+<span class="w">        </span><span class="p">},</span>
+<span class="w">        </span><span class="nt">&quot;leverage&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;charges&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">          </span><span class="nt">&quot;transaction_tax&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">          </span><span class="nt">&quot;transaction_tax_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;stt&quot;</span><span class="p">,</span>
+<span class="w">          </span><span class="nt">&quot;exchange_turnover_charge&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">0.260625</span><span class="p">,</span>
+<span class="w">          </span><span class="nt">&quot;sebi_turnover_charge&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">0.00052125</span><span class="p">,</span>
+<span class="w">          </span><span class="nt">&quot;brokerage&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">20</span><span class="p">,</span>
+<span class="w">          </span><span class="nt">&quot;stamp_duty&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">          </span><span class="nt">&quot;gst&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="nt">&quot;igst&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">3.6470063249999995</span><span class="p">,</span>
+<span class="w">            </span><span class="nt">&quot;cgst&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">            </span><span class="nt">&quot;sgst&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">            </span><span class="nt">&quot;total&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">3.6470063249999995</span>
+<span class="w">          </span><span class="p">},</span>
+<span class="w">          </span><span class="nt">&quot;total&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">23.908152575</span>
+<span class="w">        </span><span class="p">},</span>
+<span class="w">        </span><span class="nt">&quot;total&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">521.25</span>
+<span class="w">      </span><span class="p">}</span>
+<span class="w">    </span><span class="p">],</span>
+<span class="w">    </span><span class="nt">&quot;charges&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">      </span><span class="nt">&quot;transaction_tax&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;transaction_tax_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;exchange_turnover_charge&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;sebi_turnover_charge&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">0.003195</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;brokerage&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">40</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;stamp_duty&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;gst&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="nt">&quot;igst&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;cgst&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;sgst&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;total&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span>
+<span class="w">      </span><span class="p">},</span>
+<span class="w">      </span><span class="nt">&quot;total&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">  </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+<p>Response structure is as follows.</p>
+<table>
+<thead>
+<tr>
+<th>parameter</th>
+<th>&nbsp;</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>initial</td>
+<td>Total <a href="#margin-structure">margins</a> required to execute the orders</td>
+</tr>
+<tr>
+<td>final</td>
+<td>Total <a href="#margin-structure">margins</a> with the spread benefit</td>
+</tr>
+<tr>
+<td>orders</td>
+<td>Individual <a href="#margin-structure">margins</a> per order</td>
+</tr>
+<tr>
+<td>charges</td>
+<td>Final <a href="#charges-structure">charges</a> block</td>
+</tr>
+</tbody>
+</table>
+<div class="admonition note">
+<p class="admonition-title">Note</p>
+<p>The final charges block can be ignored as it may not include <code>transaction_tax</code> charges because baskets can contain both mcx and equity instruments, with different tax types (STT or CTT). Users can refer to the individual <a href="#charges-structure">order charges response</a> in the orders block.</p>
+</div>
+<h2 id="virtual-contract-note">Virtual contract note<a class="headerlink" href="#virtual-contract-note" title="Permanent link">&para;</a></h2>
+<p>A virtual contract provides detailed charges order-wise for brokerage, STT, stamp duty, exchange transaction charges, SEBI turnover charge, and GST.</p>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>https://api.kite.trade/charges/orders<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-H<span class="w"> </span><span class="s1">&#39;X-Kite-Version: 3&#39;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-H<span class="w"> </span><span class="s1">&#39;Authorization: token api_key:access_token&#39;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-H<span class="w"> </span><span class="s1">&#39;Content-Type: application/json&#39;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-d<span class="w"> </span><span class="s1">&#39;[</span>
+<span class="s1">  {</span>
+<span class="s1">    &quot;order_id&quot;: &quot;111111111&quot;,</span>
+<span class="s1">    &quot;exchange&quot;: &quot;NSE&quot;,</span>
+<span class="s1">    &quot;tradingsymbol&quot;: &quot;SBIN&quot;,</span>
+<span class="s1">    &quot;transaction_type&quot;: &quot;BUY&quot;,</span>
+<span class="s1">    &quot;variety&quot;: &quot;regular&quot;,</span>
+<span class="s1">    &quot;product&quot;: &quot;CNC&quot;,</span>
+<span class="s1">    &quot;order_type&quot;: &quot;MARKET&quot;,</span>
+<span class="s1">    &quot;quantity&quot;: 1,</span>
+<span class="s1">    &quot;average_price&quot;: 560</span>
+<span class="s1">  },</span>
+<span class="s1">  {</span>
+<span class="s1">    &quot;order_id&quot;: &quot;2222222222&quot;,</span>
+<span class="s1">    &quot;exchange&quot;: &quot;MCX&quot;,</span>
+<span class="s1">    &quot;tradingsymbol&quot;: &quot;GOLDPETAL23JULFUT&quot;,</span>
+<span class="s1">    &quot;transaction_type&quot;: &quot;SELL&quot;,</span>
+<span class="s1">    &quot;variety&quot;: &quot;regular&quot;,</span>
+<span class="s1">    &quot;product&quot;: &quot;NRML&quot;,</span>
+<span class="s1">    &quot;order_type&quot;: &quot;LIMIT&quot;,</span>
+<span class="s1">    &quot;quantity&quot;: 1,</span>
+<span class="s1">    &quot;average_price&quot;: 5862</span>
+<span class="s1">  },</span>
+<span class="s1">  {</span>
+<span class="s1">    &quot;order_id&quot;: &quot;3333333333&quot;,</span>
+<span class="s1">    &quot;exchange&quot;: &quot;NFO&quot;,</span>
+<span class="s1">    &quot;tradingsymbol&quot;: &quot;NIFTY2371317900PE&quot;,</span>
+<span class="s1">    &quot;transaction_type&quot;: &quot;BUY&quot;,</span>
+<span class="s1">    &quot;variety&quot;: &quot;regular&quot;,</span>
+<span class="s1">    &quot;product&quot;: &quot;NRML&quot;,</span>
+<span class="s1">    &quot;order_type&quot;: &quot;LIMIT&quot;,</span>
+<span class="s1">    &quot;quantity&quot;: 100,</span>
+<span class="s1">    &quot;average_price&quot;: 1.5</span>
+<span class="s1">  }</span>
+<span class="s1">]&#39;</span>
+</code></pre></div>
+<h3 id="order-structure_1">Order structure<a class="headerlink" href="#order-structure_1" title="Permanent link">&para;</a></h3>
+<table>
+<thead>
+<tr>
+<th>parameter</th>
+<th>&nbsp;</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>order_id</code><span>string</span></td>
+<td>Unique order ID (It can be any random string to calculate charges for an imaginary order)</td>
+</tr>
+<tr>
+<td><code>exchange</code><span>string</span></td>
+<td>Name of the exchange</td>
+</tr>
+<tr>
+<td><code>tradingsymbol</code><span>string</span></td>
+<td>Exchange tradingsymbol of the instrument</td>
+</tr>
+<tr>
+<td><code>transaction_type</code><span>string</span></td>
+<td><code>BUY</code>/<code>SELL</code></td>
+</tr>
+<tr>
+<td><code>variety</code><span>string</span></td>
+<td>Order variety (regular, amo, co etc.)</td>
+</tr>
+<tr>
+<td><code>product</code><span>string</span></td>
+<td>Margin product to use for the order (margins are blocked based on this) <a href="https://support.zerodha.com/category/trading-and-markets/product-and-order-types/product/articles/what-does-cnc-mis-and-nrml-mean">?</a></td>
+</tr>
+<tr>
+<td><code>order_type</code><span>string</span></td>
+<td>Order type (MARKET, LIMIT etc.)</td>
+</tr>
+<tr>
+<td><code>quantity</code><span>int64</span></td>
+<td>Quantity of the order</td>
+</tr>
+<tr>
+<td><code>average_price</code><span>float64</span></td>
+<td>Average price at which the order was executed (Note: Should be non-zero).</td>
+</tr>
+</tbody>
+</table>
+<div class="highlight"><pre><span></span><code><span class="p">{</span>
+<span class="w">  </span><span class="nt">&quot;status&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;success&quot;</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">&quot;data&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+<span class="w">    </span><span class="p">{</span>
+<span class="w">      </span><span class="nt">&quot;transaction_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;BUY&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;tradingsymbol&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;SBIN&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;exchange&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;NSE&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;variety&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;regular&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;product&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;CNC&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;order_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;MARKET&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">560</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;charges&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="nt">&quot;transaction_tax&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">0.56</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;transaction_tax_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;stt&quot;</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;exchange_turnover_charge&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">0.01876</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;sebi_turnover_charge&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">0.00056</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;brokerage&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;stamp_duty&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;gst&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">          </span><span class="nt">&quot;igst&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">0.0033767999999999997</span><span class="p">,</span>
+<span class="w">          </span><span class="nt">&quot;cgst&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">          </span><span class="nt">&quot;sgst&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">          </span><span class="nt">&quot;total&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">0.0033767999999999997</span>
+<span class="w">        </span><span class="p">},</span>
+<span class="w">        </span><span class="nt">&quot;total&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">0.5826968</span>
+<span class="w">      </span><span class="p">}</span>
+<span class="w">    </span><span class="p">},</span>
+<span class="w">    </span><span class="p">{</span>
+<span class="w">      </span><span class="nt">&quot;transaction_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;SELL&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;tradingsymbol&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;GOLDPETAL23JULFUT&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;exchange&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;MCX&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;variety&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;regular&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;product&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;NRML&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;order_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;LIMIT&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">5862</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;charges&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="nt">&quot;transaction_tax&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">0.5862</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;transaction_tax_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;ctt&quot;</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;exchange_turnover_charge&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">0.152412</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;sebi_turnover_charge&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">0.005862</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;brokerage&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">1.7586</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;stamp_duty&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;gst&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">          </span><span class="nt">&quot;igst&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">0.34503732</span><span class="p">,</span>
+<span class="w">          </span><span class="nt">&quot;cgst&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">          </span><span class="nt">&quot;sgst&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">          </span><span class="nt">&quot;total&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">0.34503732</span>
+<span class="w">        </span><span class="p">},</span>
+<span class="w">        </span><span class="nt">&quot;total&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">2.84811132</span>
+<span class="w">      </span><span class="p">}</span>
+<span class="w">    </span><span class="p">},</span>
+<span class="w">    </span><span class="p">{</span>
+<span class="w">      </span><span class="nt">&quot;transaction_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;BUY&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;tradingsymbol&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;NIFTY2371317900PE&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;exchange&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;NFO&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;variety&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;regular&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;product&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;NRML&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;order_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;LIMIT&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">100</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">1.5</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;charges&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="nt">&quot;transaction_tax&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;transaction_tax_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;stt&quot;</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;exchange_turnover_charge&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">0.07575</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;sebi_turnover_charge&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">0.00015</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;brokerage&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">20</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;stamp_duty&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;gst&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">          </span><span class="nt">&quot;igst&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">3.613527</span><span class="p">,</span>
+<span class="w">          </span><span class="nt">&quot;cgst&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">          </span><span class="nt">&quot;sgst&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">          </span><span class="nt">&quot;total&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">3.613527</span>
+<span class="w">        </span><span class="p">},</span>
+<span class="w">        </span><span class="nt">&quot;total&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">23.689427000000002</span>
+<span class="w">      </span><span class="p">}</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">  </span><span class="p">]</span>
+<span class="p">}</span>
+</code></pre></div>
+<h3 id="response-attributes">Response attributes<a class="headerlink" href="#response-attributes" title="Permanent link">&para;</a></h3>
+<table>
+<thead>
+<tr>
+<th>attribute</th>
+<th>&nbsp;</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>transaction_type</code><span>string</span></td>
+<td>Type of transaction being processed(BUY/SELL).</td>
+</tr>
+<tr>
+<td><code>tradingsymbol</code><span>string</span></td>
+<td>Exchange tradingsymbol of the instrument</td>
+</tr>
+<tr>
+<td><code>exchange</code><span>string</span></td>
+<td>Name of the exchange</td>
+</tr>
+<tr>
+<td><code>variety</code><span>string</span></td>
+<td>Order variety (regular, amo, co etc.)</td>
+</tr>
+<tr>
+<td><code>product</code><span>string</span></td>
+<td>Margin product to use for the order (margins are blocked based on this) <a href="https://support.zerodha.com/category/trading-and-markets/product-and-order-types/product/articles/what-does-cnc-mis-and-nrml-mean">?</a></td>
+</tr>
+<tr>
+<td><code>order_type</code><span>string</span></td>
+<td>Order type (MARKET, LIMIT etc.)</td>
+</tr>
+<tr>
+<td><code>quantity</code><span>int64</span></td>
+<td>Quantity of the order</td>
+</tr>
+<tr>
+<td><code>price</code><span>float64</span></td>
+<td>Price at which the order is completed</td>
+</tr>
+<tr>
+<td><code>charges</code><span>map</span></td>
+<td>The <a href="#charges-structure">breakdown of the various charges</a> that will be applied to an order</td>
+</tr>
+</tbody>
+</table>
+
+
+
+
+
+                
+              </article>
+            </div>
+          
+          
+        </div>
+        
+      </main>
+      
+        <footer class="md-footer">
+  
+  <div class="md-footer-meta md-typeset">
+    <div class="md-footer-meta__inner md-grid">
+      <div class="md-copyright">
+  
+    <div class="md-copyright__highlight">
+      Copyright &copy; 2015 - 2025, Zerodha Technology Pvt. Ltd.
+    </div>
+  
+  
+    Made with
+    <a href="https://squidfunk.github.io/mkdocs-material/" target="_blank" rel="noopener">
+      Material for MkDocs
+    </a>
+  
+</div>
+      
+    </div>
+  </div>
+</footer>
+      
+    </div>
+    <div class="md-dialog" data-md-component="dialog">
+      <div class="md-dialog__inner md-typeset"></div>
+    </div>
+    
+    <script id="__config" type="application/json">{"base": "..", "features": [], "search": "../assets/javascripts/workers/search.74e28a9f.min.js", "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}}</script>
+    
+    
+      <script src="../assets/javascripts/bundle.220ee61c.min.js"></script>
+      
+    
+  </body>
+</html>

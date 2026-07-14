@@ -1,0 +1,1416 @@
+
+<!doctype html>
+<html lang="en" class="no-js">
+  <head>
+    
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      
+      
+      
+      
+        <link rel="prev" href="../gtt/">
+      
+      
+        <link rel="next" href="../portfolio/">
+      
+      <link rel="icon" href="../images/favicon">
+      <meta name="generator" content="mkdocs-1.4.3, mkdocs-material-9.1.18">
+    
+    
+      
+        <title>Alerts - Kite Connect 3 / API documentation</title>
+      
+    
+    
+      <link rel="stylesheet" href="../assets/stylesheets/main.26e3688c.min.css">
+      
+        
+        <link rel="stylesheet" href="../assets/stylesheets/palette.ecc896b0.min.css">
+      
+      
+
+    
+    
+    
+      
+        
+        
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+        <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Roboto:300,300i,400,400i,700,700i%7CRoboto+Mono:400,400i,700,700i&display=fallback">
+        <style>:root{--md-text-font:"Roboto";--md-code-font:"Roboto Mono"}</style>
+      
+    
+    
+      <link rel="stylesheet" href="../static/style.css">
+    
+    <script>__md_scope=new URL("..",location),__md_hash=e=>[...e].reduce((e,_)=>(e<<5)-e+_.charCodeAt(0),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
+    
+      
+
+    
+    
+    
+  </head>
+  
+  
+    
+    
+    
+    
+    
+    <body dir="ltr" data-md-color-scheme="default" data-md-color-primary="white" data-md-color-accent="red">
+  
+    
+    
+    <input class="md-toggle" data-md-toggle="drawer" type="checkbox" id="__drawer" autocomplete="off">
+    <input class="md-toggle" data-md-toggle="search" type="checkbox" id="__search" autocomplete="off">
+    <label class="md-overlay" for="__drawer"></label>
+    <div data-md-component="skip">
+      
+        
+        <a href="#alerts" class="md-skip">
+          Skip to content
+        </a>
+      
+    </div>
+    <div data-md-component="announce">
+      
+    </div>
+    
+    
+      
+
+  
+
+<header class="md-header md-header--shadow" data-md-component="header">
+  <nav class="md-header__inner md-grid" aria-label="Header">
+    <a href=".." title="Kite Connect 3 / API documentation" class="md-header__button md-logo" aria-label="Kite Connect 3 / API documentation" data-md-component="logo">
+      
+  <img src="../images/logo.svg" alt="logo">
+
+    </a>
+    <label class="md-header__button md-icon" for="__drawer">
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M3 6h18v2H3V6m0 5h18v2H3v-2m0 5h18v2H3v-2Z"/></svg>
+    </label>
+    <div class="md-header__title" data-md-component="header-title">
+      <div class="md-header__ellipsis">
+        <div class="md-header__topic">
+          <span class="md-ellipsis">
+            Kite Connect 3 / API documentation
+          </span>
+        </div>
+        <div class="md-header__topic" data-md-component="header-topic">
+          <span class="md-ellipsis">
+            
+              Alerts
+            
+          </span>
+        </div>
+      </div>
+    </div>
+    
+      
+    
+    
+    
+      <label class="md-header__button md-icon" for="__search">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.516 6.516 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5Z"/></svg>
+      </label>
+      <div class="md-search" data-md-component="search" role="dialog">
+  <label class="md-search__overlay" for="__search"></label>
+  <div class="md-search__inner" role="search">
+    <form class="md-search__form" name="search">
+      <input type="text" class="md-search__input" name="query" aria-label="Search" placeholder="Search" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false" data-md-component="search-query" required>
+      <label class="md-search__icon md-icon" for="__search">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.516 6.516 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5Z"/></svg>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11h12Z"/></svg>
+      </label>
+      <nav class="md-search__options" aria-label="Search">
+        
+        <button type="reset" class="md-search__icon md-icon" title="Clear" aria-label="Clear" tabindex="-1">
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12 19 6.41Z"/></svg>
+        </button>
+      </nav>
+      
+    </form>
+    <div class="md-search__output">
+      <div class="md-search__scrollwrap" data-md-scrollfix>
+        <div class="md-search-result" data-md-component="search-result">
+          <div class="md-search-result__meta">
+            Initializing search
+          </div>
+          <ol class="md-search-result__list" role="presentation"></ol>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+    
+    
+  </nav>
+  
+</header>
+    
+    <div class="md-container" data-md-component="container">
+      
+      
+        
+          
+        
+      
+      <main class="md-main" data-md-component="main">
+        <div class="md-main__inner md-grid">
+          
+            
+              
+              <div class="md-sidebar md-sidebar--primary" data-md-component="sidebar" data-md-type="navigation" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+
+<nav class="md-nav md-nav--primary" aria-label="Navigation" data-md-level="0">
+  <label class="md-nav__title" for="__drawer">
+    <a href=".." title="Kite Connect 3 / API documentation" class="md-nav__button md-logo" aria-label="Kite Connect 3 / API documentation" data-md-component="logo">
+      
+  <img src="../images/logo.svg" alt="logo">
+
+    </a>
+    Kite Connect 3 / API documentation
+  </label>
+  
+  <ul class="md-nav__list" data-md-scrollfix>
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href=".." class="md-nav__link">
+        Introduction
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../sdks/" class="md-nav__link">
+        Libraries and SDKs
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../response-structure/" class="md-nav__link">
+        Response structure
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../exceptions/" class="md-nav__link">
+        Exceptions and errors
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../user/" class="md-nav__link">
+        User
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../orders/" class="md-nav__link">
+        Orders
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../gtt/" class="md-nav__link">
+        GTT orders
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+    
+  
+  
+    <li class="md-nav__item md-nav__item--active">
+      
+      <input class="md-nav__toggle md-toggle" type="checkbox" id="__toc">
+      
+      
+        
+      
+      
+        <label class="md-nav__link md-nav__link--active" for="__toc">
+          Alerts
+          <span class="md-nav__icon md-icon"></span>
+        </label>
+      
+      <a href="./" class="md-nav__link md-nav__link--active">
+        Alerts
+      </a>
+      
+        
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#creating-alerts" class="md-nav__link">
+    Creating alerts
+  </a>
+  
+    <nav class="md-nav" aria-label="Creating alerts">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#simple-alert" class="md-nav__link">
+    Simple alert
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#ato-alert-triggers-order-alert" class="md-nav__link">
+    ATO (Alert Triggers Order) alert
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#alert-parameters" class="md-nav__link">
+    Alert parameters
+  </a>
+  
+    <nav class="md-nav" aria-label="Alert parameters">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#operator-types" class="md-nav__link">
+    Operator types
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#alert-types" class="md-nav__link">
+    Alert types
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#basket-structure-for-ato-alerts" class="md-nav__link">
+    Basket structure for ATO alerts
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#retrieving-alerts" class="md-nav__link">
+    Retrieving alerts
+  </a>
+  
+    <nav class="md-nav" aria-label="Retrieving alerts">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#query-parameters" class="md-nav__link">
+    Query parameters
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#retrieve-alert" class="md-nav__link">
+    Retrieve alert
+  </a>
+  
+    <nav class="md-nav" aria-label="Retrieve alert">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#status" class="md-nav__link">
+    Status
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#modify-alert" class="md-nav__link">
+    Modify alert
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#delete-alert" class="md-nav__link">
+    Delete alert
+  </a>
+  
+    <nav class="md-nav" aria-label="Delete alert">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#delete-single-alert" class="md-nav__link">
+    Delete single alert
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#delete-multiple-alerts" class="md-nav__link">
+    Delete multiple alerts
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#retrieve-alert-history" class="md-nav__link">
+    Retrieve alert history
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+      
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../portfolio/" class="md-nav__link">
+        Portfolio
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../market-quotes/" class="md-nav__link">
+        Market quotes and instruments
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../websocket/" class="md-nav__link">
+        WebSocket streaming
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../historical/" class="md-nav__link">
+        Historical candle data
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../postbacks/" class="md-nav__link">
+        Postbacks / WebHooks
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../mutual-funds/" class="md-nav__link">
+        Mutual funds
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../margins/" class="md-nav__link">
+        Margin calculation
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../basket/" class="md-nav__link">
+        Publisher - Offsite orders
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../publisher/" class="md-nav__link">
+        Publisher JS plugin
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../apps/" class="md-nav__link">
+        Mobile and Desktop apps
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../changelog/" class="md-nav__link">
+        Changelog
+      </a>
+    </li>
+  
+
+    
+  </ul>
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+            
+              
+              <div class="md-sidebar md-sidebar--secondary" data-md-component="sidebar" data-md-type="toc" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#creating-alerts" class="md-nav__link">
+    Creating alerts
+  </a>
+  
+    <nav class="md-nav" aria-label="Creating alerts">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#simple-alert" class="md-nav__link">
+    Simple alert
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#ato-alert-triggers-order-alert" class="md-nav__link">
+    ATO (Alert Triggers Order) alert
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#alert-parameters" class="md-nav__link">
+    Alert parameters
+  </a>
+  
+    <nav class="md-nav" aria-label="Alert parameters">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#operator-types" class="md-nav__link">
+    Operator types
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#alert-types" class="md-nav__link">
+    Alert types
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#basket-structure-for-ato-alerts" class="md-nav__link">
+    Basket structure for ATO alerts
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#retrieving-alerts" class="md-nav__link">
+    Retrieving alerts
+  </a>
+  
+    <nav class="md-nav" aria-label="Retrieving alerts">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#query-parameters" class="md-nav__link">
+    Query parameters
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#retrieve-alert" class="md-nav__link">
+    Retrieve alert
+  </a>
+  
+    <nav class="md-nav" aria-label="Retrieve alert">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#status" class="md-nav__link">
+    Status
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#modify-alert" class="md-nav__link">
+    Modify alert
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#delete-alert" class="md-nav__link">
+    Delete alert
+  </a>
+  
+    <nav class="md-nav" aria-label="Delete alert">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#delete-single-alert" class="md-nav__link">
+    Delete single alert
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#delete-multiple-alerts" class="md-nav__link">
+    Delete multiple alerts
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#retrieve-alert-history" class="md-nav__link">
+    Retrieve alert history
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+          
+          
+            <div class="md-content" data-md-component="content">
+              <article class="md-content__inner md-typeset">
+                
+                  
+
+
+<h1 id="alerts">Alerts<a class="headerlink" href="#alerts" title="Permanent link">&para;</a></h1>
+<p>The Alerts API allows you to create, retrieve, update, and delete market price alerts for various instruments. It enables you to set up notifications that will be triggered when market prices reach specific conditions. The maximum number of active alerts allowed per user is 500.</p>
+<table>
+<thead>
+<tr>
+<th>type</th>
+<th>endpoint</th>
+<th>&nbsp;</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>POST</td>
+<td><a href="#creating-alerts">/alerts</a></td>
+<td>Create a new alert</td>
+</tr>
+<tr>
+<td>GET</td>
+<td><a href="#retrieving-alerts">/alerts</a></td>
+<td>Retrieve all alerts for a user</td>
+</tr>
+<tr>
+<td>GET</td>
+<td><a href="#retrieve-alert">/alerts/{uuid}</a></td>
+<td>Retrieve a specific alert</td>
+</tr>
+<tr>
+<td>PUT</td>
+<td><a href="#modify-alert">/alerts/{uuid}</a></td>
+<td>Modify an existing alert</td>
+</tr>
+<tr>
+<td>DELETE</td>
+<td><a href="#delete-alert">/alerts?uuid={uuid}</a></td>
+<td>Delete a specific alert</td>
+</tr>
+<tr>
+<td>GET</td>
+<td><a href="#retrieve-alert-history">/alerts/{uuid}/history</a></td>
+<td>Retrieve the history of a specific alert</td>
+</tr>
+</tbody>
+</table>
+<h2 id="creating-alerts">Creating alerts<a class="headerlink" href="#creating-alerts" title="Permanent link">&para;</a></h2>
+<h3 id="simple-alert">Simple alert<a class="headerlink" href="#simple-alert" title="Permanent link">&para;</a></h3>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>https://api.kite.trade/alerts<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-H<span class="w"> </span><span class="s1">&#39;X-Kite-Version: 3&#39;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-H<span class="w"> </span><span class="s1">&#39;Authorization: token api_key:access_token&#39;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-d<span class="w"> </span><span class="s1">&#39;name=NIFTY 50&#39;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-d<span class="w"> </span><span class="s1">&#39;lhs_exchange=INDICES&#39;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-d<span class="w"> </span><span class="s1">&#39;lhs_tradingsymbol=NIFTY 50&#39;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-d<span class="w"> </span><span class="s1">&#39;lhs_attribute=LastTradedPrice&#39;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-d<span class="w"> </span><span class="s1">&#39;operator=&gt;=&#39;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-d<span class="w"> </span><span class="s1">&#39;rhs_type=constant&#39;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-d<span class="w"> </span><span class="s1">&#39;type=simple&#39;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-d<span class="w"> </span><span class="s1">&#39;rhs_constant=27000&#39;</span>
+</code></pre></div>
+<div class="highlight"><pre><span></span><code><span class="p">{</span>
+<span class="w">  </span><span class="nt">&quot;status&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;success&quot;</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">&quot;data&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="nt">&quot;type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;simple&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;user_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;AB1234&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;uuid&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;550e8400-e29b-41d4-a716-446655440000&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;name&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;NIFTY 50&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;status&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;enabled&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;disabled_reason&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;lhs_attribute&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;LastTradedPrice&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;lhs_exchange&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;INDICES&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;lhs_tradingsymbol&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;NIFTY 50&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;operator&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;&gt;=&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;rhs_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;constant&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;rhs_attribute&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;rhs_exchange&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;rhs_tradingsymbol&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;rhs_constant&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">27000</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;alert_count&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;created_at&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;2025-05-26 12:07:50&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;updated_at&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;2025-05-26 12:07:50&quot;</span>
+<span class="w">  </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+<h3 id="ato-alert-triggers-order-alert">ATO (Alert Triggers Order) alert<a class="headerlink" href="#ato-alert-triggers-order-alert" title="Permanent link">&para;</a></h3>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>https://api.kite.trade/alerts<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-H<span class="w"> </span><span class="s1">&#39;X-Kite-Version: 3&#39;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-H<span class="w"> </span><span class="s1">&#39;Authorization: token api_key:access_token&#39;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-d<span class="w"> </span><span class="s1">&#39;name=NIFTY 50&#39;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-d<span class="w"> </span><span class="s1">&#39;lhs_exchange=INDICES&#39;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-d<span class="w"> </span><span class="s1">&#39;lhs_tradingsymbol=NIFTY 50&#39;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-d<span class="w"> </span><span class="s1">&#39;lhs_attribute=LastTradedPrice&#39;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-d<span class="w"> </span><span class="s1">&#39;operator=&gt;=&#39;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-d<span class="w"> </span><span class="s1">&#39;rhs_type=constant&#39;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-d<span class="w"> </span><span class="s1">&#39;type=ato&#39;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-d<span class="w"> </span><span class="s1">&#39;rhs_constant=27000&#39;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-d<span class="w"> </span><span class="s1">&#39;basket={&quot;name&quot;:&quot;alerts-basket&quot;,&quot;type&quot;:&quot;alert&quot;,&quot;tags&quot;:[],&quot;items&quot;:[{&quot;type&quot;:&quot;insert&quot;,&quot;tradingsymbol&quot;:&quot;RELIANCE&quot;,&quot;exchange&quot;:&quot;NSE&quot;,&quot;weight&quot;:10000,&quot;params&quot;:{&quot;transaction_type&quot;:&quot;BUY&quot;,&quot;product&quot;:&quot;CNC&quot;,&quot;order_type&quot;:&quot;MARKET&quot;,&quot;validity&quot;:&quot;DAY&quot;,&quot;validity_ttl&quot;:1,&quot;quantity&quot;:1,&quot;price&quot;:0,&quot;trigger_price&quot;:0,&quot;disclosed_quantity&quot;:0,&quot;last_price&quot;:0,&quot;variety&quot;:&quot;regular&quot;,&quot;tags&quot;:[],&quot;squareoff&quot;:0,&quot;stoploss&quot;:0,&quot;trailing_stoploss&quot;:0,&quot;iceberg_legs&quot;:0,&quot;market_protection&quot;:-1}}]}&#39;</span>
+</code></pre></div>
+<div class="highlight"><pre><span></span><code><span class="p">{</span>
+<span class="w">  </span><span class="nt">&quot;status&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;success&quot;</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">&quot;data&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="nt">&quot;type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;ato&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;user_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;AB1234&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;uuid&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;a5a2b03d-4851-44b3-9d85-0123baa4a273&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;name&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;NIFTY 50&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;status&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;enabled&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;disabled_reason&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;lhs_attribute&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;LastTradedPrice&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;lhs_exchange&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;INDICES&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;lhs_tradingsymbol&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;NIFTY 50&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;operator&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;&gt;=&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;rhs_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;constant&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;rhs_attribute&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;rhs_exchange&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;rhs_tradingsymbol&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;rhs_constant&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">27000</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;alert_count&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;created_at&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;2025-05-26 12:09:26&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;updated_at&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;2025-05-26 12:09:26&quot;</span>
+<span class="w">  </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+<h3 id="alert-parameters">Alert parameters<a class="headerlink" href="#alert-parameters" title="Permanent link">&para;</a></h3>
+<table>
+<thead>
+<tr>
+<th>parameter</th>
+<th>&nbsp;</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>name</td>
+<td>Name of the alert</td>
+</tr>
+<tr>
+<td>type</td>
+<td>The <a href="#alert-types">type</a> of alert</td>
+</tr>
+<tr>
+<td>lhs_exchange</td>
+<td>Name of the exchange for left-hand side (NSE, BSE, NFO, CDS, BCD, MCX, INDICES)</td>
+</tr>
+<tr>
+<td>lhs_tradingsymbol</td>
+<td>Trading symbol of the instrument for left-hand side</td>
+</tr>
+<tr>
+<td>lhs_attribute</td>
+<td>Attribute to monitor (e.g., <code>LastTradedPrice</code>)</td>
+</tr>
+<tr>
+<td>operator</td>
+<td>Comparison <a href="#operator-types">operator</a></td>
+</tr>
+<tr>
+<td>rhs_type</td>
+<td>Type of the right-hand side (<code>constant</code> or <code>instrument</code>)</td>
+</tr>
+<tr>
+<td>rhs_constant</td>
+<td>Value to compare against (when <code>rhs_type</code> is <code>constant</code>)</td>
+</tr>
+<tr>
+<td>rhs_exchange</td>
+<td>Exchange for right-hand side (when <code>rhs_type</code> is <code>instrument</code>)</td>
+</tr>
+<tr>
+<td>rhs_tradingsymbol</td>
+<td>Trading symbol for right-hand side (when <code>rhs_type</code> is <code>instrument</code>)</td>
+</tr>
+<tr>
+<td>rhs_attribute</td>
+<td>Attribute for right-hand side (when <code>rhs_type</code> is <code>instrument</code>)</td>
+</tr>
+<tr>
+<td>basket</td>
+<td>JSON string containing basket configuration (required for ATO alerts)</td>
+</tr>
+</tbody>
+</table>
+<h4 id="operator-types">Operator types<a class="headerlink" href="#operator-types" title="Permanent link">&para;</a></h4>
+<p>The Alerts API supports the following operators for comparison:</p>
+<table>
+<thead>
+<tr>
+<th>operator</th>
+<th>&nbsp;</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>&lt;=</code></td>
+<td>Less than or equal to</td>
+</tr>
+<tr>
+<td><code>&gt;=</code></td>
+<td>Greater than or equal to</td>
+</tr>
+<tr>
+<td><code>&lt;</code></td>
+<td>Less than</td>
+</tr>
+<tr>
+<td><code>&gt;</code></td>
+<td>Greater than</td>
+</tr>
+<tr>
+<td><code>==</code></td>
+<td>Equal to</td>
+</tr>
+</tbody>
+</table>
+<h4 id="alert-types">Alert types<a class="headerlink" href="#alert-types" title="Permanent link">&para;</a></h4>
+<table>
+<thead>
+<tr>
+<th>type</th>
+<th>&nbsp;</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>simple</code></td>
+<td>Standard price alert</td>
+</tr>
+<tr>
+<td><code>ato</code></td>
+<td>Alert Triggers Order - when triggered, automatically places an order</td>
+</tr>
+</tbody>
+</table>
+<h4 id="basket-structure-for-ato-alerts">Basket structure for ATO alerts<a class="headerlink" href="#basket-structure-for-ato-alerts" title="Permanent link">&para;</a></h4>
+<p>For ATO alerts, the <code>basket</code> parameter should be a JSON string containing:</p>
+<div class="highlight"><pre><span></span><code><span class="p">{</span>
+<span class="w">  </span><span class="nt">&quot;name&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;alerts-basket&quot;</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">&quot;type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;alert&quot;</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">&quot;tags&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[],</span>
+<span class="w">  </span><span class="nt">&quot;items&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+<span class="w">    </span><span class="p">{</span>
+<span class="w">      </span><span class="nt">&quot;type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;insert&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;tradingsymbol&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;RELIANCE&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;exchange&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;NSE&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;weight&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">10000</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;params&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="nt">&quot;transaction_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;BUY&quot;</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;product&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;CNC&quot;</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;order_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;MARKET&quot;</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;validity&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;DAY&quot;</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;validity_ttl&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;trigger_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;disclosed_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;last_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;variety&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;regular&quot;</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;tags&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[],</span>
+<span class="w">        </span><span class="nt">&quot;squareoff&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;stoploss&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;trailing_stoploss&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;iceberg_legs&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;market_protection&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">-1</span>
+<span class="w">      </span><span class="p">}</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">  </span><span class="p">]</span>
+<span class="p">}</span>
+</code></pre></div>
+<h2 id="retrieving-alerts">Retrieving alerts<a class="headerlink" href="#retrieving-alerts" title="Permanent link">&para;</a></h2>
+<p>Active alerts and alerts in other states can be obtained by a GET API call to the <code>/alerts</code> endpoint.</p>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span><span class="s2">&quot;https://api.kite.trade/alerts&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-H<span class="w"> </span><span class="s2">&quot;X-Kite-Version: 3&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-H<span class="w"> </span><span class="s2">&quot;Authorization: token api_key:access_token&quot;</span>
+</code></pre></div>
+<div class="highlight"><pre><span></span><code><span class="p">{</span>
+<span class="w">  </span><span class="nt">&quot;status&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;success&quot;</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">&quot;data&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+<span class="w">    </span><span class="p">{</span>
+<span class="w">      </span><span class="nt">&quot;type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;simple&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;user_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;AB1234&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;uuid&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;550e8400-e29b-41d4-a716-446655440000&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;name&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;NIFTY 50&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;status&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;enabled&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;disabled_reason&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;lhs_attribute&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;LastTradedPrice&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;lhs_exchange&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;INDICES&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;lhs_tradingsymbol&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;NIFTY 50&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;operator&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;&gt;=&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;rhs_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;constant&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;rhs_attribute&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;rhs_exchange&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;rhs_tradingsymbol&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;rhs_constant&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">27000</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;alert_count&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;created_at&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;2025-05-26 12:07:50&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;updated_at&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;2025-05-26 12:07:50&quot;</span>
+<span class="w">    </span><span class="p">},</span>
+<span class="w">    </span><span class="p">{</span>
+<span class="w">      </span><span class="nt">&quot;type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;ato&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;user_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;AB1234&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;uuid&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;e888ed4a-6801-406f-bdc2-002db5a8411d&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;name&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;buy gold&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;status&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;disabled&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;disabled_reason&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;basket&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="nt">&quot;items&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+<span class="w">          </span><span class="p">{</span>
+<span class="w">            </span><span class="nt">&quot;id&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">275218517</span><span class="p">,</span>
+<span class="w">            </span><span class="nt">&quot;tradingsymbol&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;GOLDBEES&quot;</span><span class="p">,</span>
+<span class="w">            </span><span class="nt">&quot;exchange&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;NSE&quot;</span><span class="p">,</span>
+<span class="w">            </span><span class="nt">&quot;instrument_token&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">3693569</span><span class="p">,</span>
+<span class="w">            </span><span class="nt">&quot;weight&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">10000</span><span class="p">,</span>
+<span class="w">            </span><span class="nt">&quot;params&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">              </span><span class="nt">&quot;validity&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;DAY&quot;</span><span class="p">,</span>
+<span class="w">              </span><span class="nt">&quot;validity_ttl&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">              </span><span class="nt">&quot;variety&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;regular&quot;</span><span class="p">,</span>
+<span class="w">              </span><span class="nt">&quot;product&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;CNC&quot;</span><span class="p">,</span>
+<span class="w">              </span><span class="nt">&quot;order_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;LIMIT&quot;</span><span class="p">,</span>
+<span class="w">              </span><span class="nt">&quot;transaction_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;BUY&quot;</span><span class="p">,</span>
+<span class="w">              </span><span class="nt">&quot;quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">10000</span><span class="p">,</span>
+<span class="w">              </span><span class="nt">&quot;disclosed_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">              </span><span class="nt">&quot;price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">72.22</span><span class="p">,</span>
+<span class="w">              </span><span class="nt">&quot;trigger_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">              </span><span class="nt">&quot;squareoff&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">              </span><span class="nt">&quot;stoploss&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">              </span><span class="nt">&quot;trailing_stoploss&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">              </span><span class="nt">&quot;gtt&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">                </span><span class="nt">&quot;target&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;stoploss&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span>
+<span class="w">              </span><span class="p">},</span>
+<span class="w">              </span><span class="nt">&quot;tags&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[]</span>
+<span class="w">            </span><span class="p">}</span>
+<span class="w">          </span><span class="p">}</span>
+<span class="w">        </span><span class="p">]</span>
+<span class="w">      </span><span class="p">},</span>
+<span class="w">      </span><span class="nt">&quot;lhs_attribute&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;LastTradedPrice&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;lhs_exchange&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;NSE&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;lhs_tradingsymbol&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;GOLDBEES&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;operator&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;&lt;=&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;rhs_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;constant&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;rhs_attribute&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;rhs_exchange&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;rhs_tradingsymbol&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;rhs_constant&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">71.8</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;alert_count&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;created_at&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;2025-02-17 08:24:10&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;updated_at&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;2025-02-17 09:15:20&quot;</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">  </span><span class="p">]</span>
+<span class="p">}</span>
+</code></pre></div>
+<h3 id="query-parameters">Query parameters<a class="headerlink" href="#query-parameters" title="Permanent link">&para;</a></h3>
+<table>
+<thead>
+<tr>
+<th>parameter</th>
+<th>&nbsp;</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>status</code></td>
+<td>Filter alerts by status (<code>enabled</code>, <code>disabled</code>, <code>deleted</code>)</td>
+</tr>
+<tr>
+<td><code>page</code></td>
+<td>Page number for pagination</td>
+</tr>
+<tr>
+<td><code>page_size</code></td>
+<td>Number of alerts per page</td>
+</tr>
+</tbody>
+</table>
+<h2 id="retrieve-alert">Retrieve alert<a class="headerlink" href="#retrieve-alert" title="Permanent link">&para;</a></h2>
+<p>Given an alert UUID, the GET API call to this endpoint will return details of the alert.</p>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span><span class="s2">&quot;https://api.kite.trade/alerts/550e8400-e29b-41d4-a716-446655440000&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-H<span class="w"> </span><span class="s2">&quot;X-Kite-Version: 3&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-H<span class="w"> </span><span class="s2">&quot;Authorization: token api_key:access_token&quot;</span>
+</code></pre></div>
+<div class="highlight"><pre><span></span><code><span class="p">{</span>
+<span class="w">  </span><span class="nt">&quot;status&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;success&quot;</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">&quot;data&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="nt">&quot;type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;simple&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;user_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;AB1234&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;uuid&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;550e8400-e29b-41d4-a716-446655440000&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;name&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;NIFTY 50&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;status&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;enabled&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;disabled_reason&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;lhs_attribute&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;LastTradedPrice&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;lhs_exchange&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;INDICES&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;lhs_tradingsymbol&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;NIFTY 50&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;operator&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;&gt;=&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;rhs_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;constant&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;rhs_attribute&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;rhs_exchange&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;rhs_tradingsymbol&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;rhs_constant&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">27000</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;alert_count&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;created_at&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;2025-05-26 12:07:50&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;updated_at&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;2025-05-26 12:07:50&quot;</span>
+<span class="w">  </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+<h3 id="status">Status<a class="headerlink" href="#status" title="Permanent link">&para;</a></h3>
+<p>Alerts can be in the following states:</p>
+<table>
+<thead>
+<tr>
+<th>status</th>
+<th>&nbsp;</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>enabled</code></td>
+<td>Indicates that the alert is active and being evaluated.</td>
+</tr>
+<tr>
+<td><code>disabled</code></td>
+<td>Indicates that the alert is disabled and not being evaluated.</td>
+</tr>
+<tr>
+<td><code>deleted</code></td>
+<td>Indicates that the alert has been soft-deleted by the user.</td>
+</tr>
+</tbody>
+</table>
+<h2 id="modify-alert">Modify alert<a class="headerlink" href="#modify-alert" title="Permanent link">&para;</a></h2>
+<p>To modify an alert, you need to send a PUT call with updated parameters.</p>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span><span class="s2">&quot;https://api.kite.trade/alerts/550e8400-e29b-41d4-a716-446655440000&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-X<span class="w"> </span>PUT<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-H<span class="w"> </span><span class="s1">&#39;X-Kite-Version: 3&#39;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-H<span class="w"> </span><span class="s1">&#39;Authorization: token api_key:access_token&#39;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-d<span class="w"> </span><span class="s1">&#39;name=NIFTY 50&#39;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-d<span class="w"> </span><span class="s1">&#39;lhs_exchange=INDICES&#39;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-d<span class="w"> </span><span class="s1">&#39;lhs_tradingsymbol=NIFTY 50&#39;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-d<span class="w"> </span><span class="s1">&#39;lhs_attribute=LastTradedPrice&#39;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-d<span class="w"> </span><span class="s1">&#39;operator=&gt;=&#39;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-d<span class="w"> </span><span class="s1">&#39;rhs_type=constant&#39;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-d<span class="w"> </span><span class="s1">&#39;type=simple&#39;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-d<span class="w"> </span><span class="s1">&#39;rhs_constant=27500&#39;</span>
+</code></pre></div>
+<div class="highlight"><pre><span></span><code><span class="p">{</span>
+<span class="w">  </span><span class="nt">&quot;status&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;success&quot;</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">&quot;data&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="nt">&quot;type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;simple&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;user_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;AB1234&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;uuid&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;550e8400-e29b-41d4-a716-446655440000&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;name&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;NIFTY 50&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;status&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;enabled&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;disabled_reason&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;lhs_attribute&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;LastTradedPrice&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;lhs_exchange&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;INDICES&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;lhs_tradingsymbol&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;NIFTY 50&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;operator&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;&gt;=&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;rhs_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;constant&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;rhs_attribute&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;rhs_exchange&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;rhs_tradingsymbol&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;rhs_constant&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">27500</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;alert_count&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;created_at&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;2025-05-26 12:07:50&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;updated_at&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;2025-05-26 12:10:15&quot;</span>
+<span class="w">  </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+<div class="admonition note">
+<p class="admonition-title">Note</p>
+<p>It is recommended to fetch the alert using <a href="#retrieve-alert">alert UUID</a>
+and modify the values and send that to the modify endpoint.</p>
+</div>
+<h2 id="delete-alert">Delete alert<a class="headerlink" href="#delete-alert" title="Permanent link">&para;</a></h2>
+<h3 id="delete-single-alert">Delete single alert<a class="headerlink" href="#delete-single-alert" title="Permanent link">&para;</a></h3>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span><span class="s2">&quot;https://api.kite.trade/alerts?uuid=550e8400-e29b-41d4-a716-446655440000&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-X<span class="w"> </span>DELETE<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-H<span class="w"> </span><span class="s1">&#39;X-Kite-Version: 3&#39;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-H<span class="w"> </span><span class="s1">&#39;Authorization: token api_key:access_token&#39;</span>
+</code></pre></div>
+<div class="highlight"><pre><span></span><code><span class="p">{</span>
+<span class="w">  </span><span class="nt">&quot;status&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;success&quot;</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">&quot;data&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span>
+<span class="p">}</span>
+</code></pre></div>
+<h3 id="delete-multiple-alerts">Delete multiple alerts<a class="headerlink" href="#delete-multiple-alerts" title="Permanent link">&para;</a></h3>
+<p>To delete multiple alerts, pass multiple <code>uuid</code> query parameters:</p>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span><span class="s2">&quot;https://api.kite.trade/alerts?uuid=550e8400-e29b-41d4-a716-446655440000&amp;uuid=a5a2b03d-4851-44b3-9d85-0123baa4a273&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-X<span class="w"> </span>DELETE<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-H<span class="w"> </span><span class="s1">&#39;X-Kite-Version: 3&#39;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-H<span class="w"> </span><span class="s1">&#39;Authorization: token api_key:access_token&#39;</span>
+</code></pre></div>
+<div class="highlight"><pre><span></span><code><span class="p">{</span>
+<span class="w">  </span><span class="nt">&quot;status&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;success&quot;</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">&quot;data&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span>
+<span class="p">}</span>
+</code></pre></div>
+<h2 id="retrieve-alert-history">Retrieve alert history<a class="headerlink" href="#retrieve-alert-history" title="Permanent link">&para;</a></h2>
+<p>This endpoint returns the history of when an alert was triggered, including market data at the time of trigger.</p>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span><span class="s2">&quot;https://api.kite.trade/alerts/550e8400-e29b-41d4-a716-446655440000/history&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-H<span class="w"> </span><span class="s2">&quot;X-Kite-Version: 3&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-H<span class="w"> </span><span class="s2">&quot;Authorization: token api_key:access_token&quot;</span>
+</code></pre></div>
+<div class="highlight"><pre><span></span><code><span class="p">{</span>
+<span class="w">  </span><span class="nt">&quot;status&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;success&quot;</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">&quot;data&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+<span class="w">    </span><span class="p">{</span>
+<span class="w">      </span><span class="nt">&quot;uuid&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;550e8400-e29b-41d4-a716-446655440000&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;simple&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;meta&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+<span class="w">        </span><span class="p">{</span>
+<span class="w">          </span><span class="nt">&quot;instrument_token&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">270857</span><span class="p">,</span>
+<span class="w">          </span><span class="nt">&quot;tradingsymbol&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;NIFTY NEXT 50&quot;</span><span class="p">,</span>
+<span class="w">          </span><span class="nt">&quot;timestamp&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;2025-02-17 09:16:46&quot;</span><span class="p">,</span>
+<span class="w">          </span><span class="nt">&quot;last_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">58288.05</span><span class="p">,</span>
+<span class="w">          </span><span class="nt">&quot;ohlc&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="nt">&quot;open&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">59221.95</span><span class="p">,</span>
+<span class="w">            </span><span class="nt">&quot;high&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">59241.8</span><span class="p">,</span>
+<span class="w">            </span><span class="nt">&quot;low&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">58283.7</span><span class="p">,</span>
+<span class="w">            </span><span class="nt">&quot;close&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">59557.95</span>
+<span class="w">          </span><span class="p">},</span>
+<span class="w">          </span><span class="nt">&quot;net_change&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">-1269.9</span><span class="p">,</span>
+<span class="w">          </span><span class="nt">&quot;exchange&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;INDICES&quot;</span><span class="p">,</span>
+<span class="w">          </span><span class="nt">&quot;last_trade_time&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;0001-01-01 00:00:00&quot;</span><span class="p">,</span>
+<span class="w">          </span><span class="nt">&quot;last_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">          </span><span class="nt">&quot;buy_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">          </span><span class="nt">&quot;sell_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">          </span><span class="nt">&quot;volume&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">          </span><span class="nt">&quot;volume_tick&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">          </span><span class="nt">&quot;average_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">          </span><span class="nt">&quot;oi&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">          </span><span class="nt">&quot;oi_day_high&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">          </span><span class="nt">&quot;oi_day_low&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">          </span><span class="nt">&quot;lower_circuit_limit&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">          </span><span class="nt">&quot;upper_circuit_limit&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="w">      </span><span class="p">],</span>
+<span class="w">      </span><span class="nt">&quot;condition&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;LastTradedPrice(\&quot;INDICES:NIFTY NEXT 50\&quot;) &lt;= 58290.35&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;created_at&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;2025-02-17 09:16:46&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;order_meta&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">  </span><span class="p">]</span>
+<span class="p">}</span>
+</code></pre></div>
+
+
+
+
+
+                
+              </article>
+            </div>
+          
+          
+        </div>
+        
+      </main>
+      
+        <footer class="md-footer">
+  
+  <div class="md-footer-meta md-typeset">
+    <div class="md-footer-meta__inner md-grid">
+      <div class="md-copyright">
+  
+    <div class="md-copyright__highlight">
+      Copyright &copy; 2015 - 2025, Zerodha Technology Pvt. Ltd.
+    </div>
+  
+  
+    Made with
+    <a href="https://squidfunk.github.io/mkdocs-material/" target="_blank" rel="noopener">
+      Material for MkDocs
+    </a>
+  
+</div>
+      
+    </div>
+  </div>
+</footer>
+      
+    </div>
+    <div class="md-dialog" data-md-component="dialog">
+      <div class="md-dialog__inner md-typeset"></div>
+    </div>
+    
+    <script id="__config" type="application/json">{"base": "..", "features": [], "search": "../assets/javascripts/workers/search.74e28a9f.min.js", "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}}</script>
+    
+    
+      <script src="../assets/javascripts/bundle.220ee61c.min.js"></script>
+      
+    
+  </body>
+</html>

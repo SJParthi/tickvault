@@ -1,0 +1,2189 @@
+
+<!doctype html>
+<html lang="en" class="no-js">
+  <head>
+    
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      
+      
+      
+      
+        <link rel="prev" href="../user/">
+      
+      
+        <link rel="next" href="../gtt/">
+      
+      <link rel="icon" href="../images/favicon">
+      <meta name="generator" content="mkdocs-1.4.3, mkdocs-material-9.1.18">
+    
+    
+      
+        <title>Orders - Kite Connect 3 / API documentation</title>
+      
+    
+    
+      <link rel="stylesheet" href="../assets/stylesheets/main.26e3688c.min.css">
+      
+        
+        <link rel="stylesheet" href="../assets/stylesheets/palette.ecc896b0.min.css">
+      
+      
+
+    
+    
+    
+      
+        
+        
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+        <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Roboto:300,300i,400,400i,700,700i%7CRoboto+Mono:400,400i,700,700i&display=fallback">
+        <style>:root{--md-text-font:"Roboto";--md-code-font:"Roboto Mono"}</style>
+      
+    
+    
+      <link rel="stylesheet" href="../static/style.css">
+    
+    <script>__md_scope=new URL("..",location),__md_hash=e=>[...e].reduce((e,_)=>(e<<5)-e+_.charCodeAt(0),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
+    
+      
+
+    
+    
+    
+  </head>
+  
+  
+    
+    
+    
+    
+    
+    <body dir="ltr" data-md-color-scheme="default" data-md-color-primary="white" data-md-color-accent="red">
+  
+    
+    
+    <input class="md-toggle" data-md-toggle="drawer" type="checkbox" id="__drawer" autocomplete="off">
+    <input class="md-toggle" data-md-toggle="search" type="checkbox" id="__search" autocomplete="off">
+    <label class="md-overlay" for="__drawer"></label>
+    <div data-md-component="skip">
+      
+        
+        <a href="#orders" class="md-skip">
+          Skip to content
+        </a>
+      
+    </div>
+    <div data-md-component="announce">
+      
+    </div>
+    
+    
+      
+
+  
+
+<header class="md-header md-header--shadow" data-md-component="header">
+  <nav class="md-header__inner md-grid" aria-label="Header">
+    <a href=".." title="Kite Connect 3 / API documentation" class="md-header__button md-logo" aria-label="Kite Connect 3 / API documentation" data-md-component="logo">
+      
+  <img src="../images/logo.svg" alt="logo">
+
+    </a>
+    <label class="md-header__button md-icon" for="__drawer">
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M3 6h18v2H3V6m0 5h18v2H3v-2m0 5h18v2H3v-2Z"/></svg>
+    </label>
+    <div class="md-header__title" data-md-component="header-title">
+      <div class="md-header__ellipsis">
+        <div class="md-header__topic">
+          <span class="md-ellipsis">
+            Kite Connect 3 / API documentation
+          </span>
+        </div>
+        <div class="md-header__topic" data-md-component="header-topic">
+          <span class="md-ellipsis">
+            
+              Orders
+            
+          </span>
+        </div>
+      </div>
+    </div>
+    
+      
+    
+    
+    
+      <label class="md-header__button md-icon" for="__search">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.516 6.516 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5Z"/></svg>
+      </label>
+      <div class="md-search" data-md-component="search" role="dialog">
+  <label class="md-search__overlay" for="__search"></label>
+  <div class="md-search__inner" role="search">
+    <form class="md-search__form" name="search">
+      <input type="text" class="md-search__input" name="query" aria-label="Search" placeholder="Search" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false" data-md-component="search-query" required>
+      <label class="md-search__icon md-icon" for="__search">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.516 6.516 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5Z"/></svg>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11h12Z"/></svg>
+      </label>
+      <nav class="md-search__options" aria-label="Search">
+        
+        <button type="reset" class="md-search__icon md-icon" title="Clear" aria-label="Clear" tabindex="-1">
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12 19 6.41Z"/></svg>
+        </button>
+      </nav>
+      
+    </form>
+    <div class="md-search__output">
+      <div class="md-search__scrollwrap" data-md-scrollfix>
+        <div class="md-search-result" data-md-component="search-result">
+          <div class="md-search-result__meta">
+            Initializing search
+          </div>
+          <ol class="md-search-result__list" role="presentation"></ol>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+    
+    
+  </nav>
+  
+</header>
+    
+    <div class="md-container" data-md-component="container">
+      
+      
+        
+          
+        
+      
+      <main class="md-main" data-md-component="main">
+        <div class="md-main__inner md-grid">
+          
+            
+              
+              <div class="md-sidebar md-sidebar--primary" data-md-component="sidebar" data-md-type="navigation" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+
+<nav class="md-nav md-nav--primary" aria-label="Navigation" data-md-level="0">
+  <label class="md-nav__title" for="__drawer">
+    <a href=".." title="Kite Connect 3 / API documentation" class="md-nav__button md-logo" aria-label="Kite Connect 3 / API documentation" data-md-component="logo">
+      
+  <img src="../images/logo.svg" alt="logo">
+
+    </a>
+    Kite Connect 3 / API documentation
+  </label>
+  
+  <ul class="md-nav__list" data-md-scrollfix>
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href=".." class="md-nav__link">
+        Introduction
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../sdks/" class="md-nav__link">
+        Libraries and SDKs
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../response-structure/" class="md-nav__link">
+        Response structure
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../exceptions/" class="md-nav__link">
+        Exceptions and errors
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../user/" class="md-nav__link">
+        User
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+    
+  
+  
+    <li class="md-nav__item md-nav__item--active">
+      
+      <input class="md-nav__toggle md-toggle" type="checkbox" id="__toc">
+      
+      
+        
+      
+      
+        <label class="md-nav__link md-nav__link--active" for="__toc">
+          Orders
+          <span class="md-nav__icon md-icon"></span>
+        </label>
+      
+      <a href="./" class="md-nav__link md-nav__link--active">
+        Orders
+      </a>
+      
+        
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#glossary-of-constants" class="md-nav__link">
+    Glossary of constants
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#placing-orders" class="md-nav__link">
+    Placing orders
+  </a>
+  
+    <nav class="md-nav" aria-label="Placing orders">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#order-varieties" class="md-nav__link">
+    Order varieties
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#regular-order-parameters" class="md-nav__link">
+    Regular order parameters
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#modifying-orders" class="md-nav__link">
+    Modifying orders
+  </a>
+  
+    <nav class="md-nav" aria-label="Modifying orders">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#regular-order-parameters_1" class="md-nav__link">
+    Regular order parameters
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#cover-order-co-parameters" class="md-nav__link">
+    Cover order (CO) parameters
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#cancelling-orders" class="md-nav__link">
+    Cancelling orders
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#retrieving-orders" class="md-nav__link">
+    Retrieving orders
+  </a>
+  
+    <nav class="md-nav" aria-label="Retrieving orders">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#response-attributes" class="md-nav__link">
+    Response attributes
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#order-statuses" class="md-nav__link">
+    Order statuses
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#tagging-orders" class="md-nav__link">
+    Tagging orders
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#market-protection" class="md-nav__link">
+    Market protection
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#auto-slice-orders" class="md-nav__link">
+    Auto slice orders
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#multi-legged-orders-co" class="md-nav__link">
+    Multi-legged orders (CO)
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#retrieving-an-orders-history" class="md-nav__link">
+    Retrieving an order's history
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#retrieving-all-trades" class="md-nav__link">
+    Retrieving all trades
+  </a>
+  
+    <nav class="md-nav" aria-label="Retrieving all trades">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#response-attributes_1" class="md-nav__link">
+    Response attributes
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#retrieving-an-orders-trades" class="md-nav__link">
+    Retrieving an order's trades
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+      
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../gtt/" class="md-nav__link">
+        GTT orders
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../alerts/" class="md-nav__link">
+        Alerts
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../portfolio/" class="md-nav__link">
+        Portfolio
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../market-quotes/" class="md-nav__link">
+        Market quotes and instruments
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../websocket/" class="md-nav__link">
+        WebSocket streaming
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../historical/" class="md-nav__link">
+        Historical candle data
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../postbacks/" class="md-nav__link">
+        Postbacks / WebHooks
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../mutual-funds/" class="md-nav__link">
+        Mutual funds
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../margins/" class="md-nav__link">
+        Margin calculation
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../basket/" class="md-nav__link">
+        Publisher - Offsite orders
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../publisher/" class="md-nav__link">
+        Publisher JS plugin
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../apps/" class="md-nav__link">
+        Mobile and Desktop apps
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../changelog/" class="md-nav__link">
+        Changelog
+      </a>
+    </li>
+  
+
+    
+  </ul>
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+            
+              
+              <div class="md-sidebar md-sidebar--secondary" data-md-component="sidebar" data-md-type="toc" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#glossary-of-constants" class="md-nav__link">
+    Glossary of constants
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#placing-orders" class="md-nav__link">
+    Placing orders
+  </a>
+  
+    <nav class="md-nav" aria-label="Placing orders">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#order-varieties" class="md-nav__link">
+    Order varieties
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#regular-order-parameters" class="md-nav__link">
+    Regular order parameters
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#modifying-orders" class="md-nav__link">
+    Modifying orders
+  </a>
+  
+    <nav class="md-nav" aria-label="Modifying orders">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#regular-order-parameters_1" class="md-nav__link">
+    Regular order parameters
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#cover-order-co-parameters" class="md-nav__link">
+    Cover order (CO) parameters
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#cancelling-orders" class="md-nav__link">
+    Cancelling orders
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#retrieving-orders" class="md-nav__link">
+    Retrieving orders
+  </a>
+  
+    <nav class="md-nav" aria-label="Retrieving orders">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#response-attributes" class="md-nav__link">
+    Response attributes
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#order-statuses" class="md-nav__link">
+    Order statuses
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#tagging-orders" class="md-nav__link">
+    Tagging orders
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#market-protection" class="md-nav__link">
+    Market protection
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#auto-slice-orders" class="md-nav__link">
+    Auto slice orders
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#multi-legged-orders-co" class="md-nav__link">
+    Multi-legged orders (CO)
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#retrieving-an-orders-history" class="md-nav__link">
+    Retrieving an order's history
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#retrieving-all-trades" class="md-nav__link">
+    Retrieving all trades
+  </a>
+  
+    <nav class="md-nav" aria-label="Retrieving all trades">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#response-attributes_1" class="md-nav__link">
+    Response attributes
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#retrieving-an-orders-trades" class="md-nav__link">
+    Retrieving an order's trades
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+          
+          
+            <div class="md-content" data-md-component="content">
+              <article class="md-content__inner md-typeset">
+                
+                  
+
+
+<h1 id="orders">Orders<a class="headerlink" href="#orders" title="Permanent link">&para;</a></h1>
+<p>The order APIs let you place orders of different varities, modify and cancel pending orders, retrieve the daily order and more.</p>
+<table>
+<thead>
+<tr>
+<th>type</th>
+<th>endpoint</th>
+<th>&nbsp;</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>POST</td>
+<td><a href="#placing-orders">/orders/:variety</a></td>
+<td>Place an order of a particular variety</td>
+</tr>
+<tr>
+<td>PUT</td>
+<td><a href="#modifying-orders">/orders/:variety/:order_id</a></td>
+<td>Modify an open or pending order</td>
+</tr>
+<tr>
+<td>DELETE</td>
+<td><a href="#cancelling-orders">/orders/:variety/:order_id</a></td>
+<td>Cancel an open or pending order</td>
+</tr>
+<tr>
+<td>GET</td>
+<td><a href="#retrieving-orders">/orders</a></td>
+<td>Retrieve the list of all orders (open and executed) for the day</td>
+</tr>
+<tr>
+<td>GET</td>
+<td><a href="#retrieving-an-orders-history">/orders/:order_id</a></td>
+<td>Retrieve the history of a given order</td>
+</tr>
+<tr>
+<td>GET</td>
+<td><a href="#retrieving-all-trades">/trades</a></td>
+<td>Retrieve the list of all executed trades for the day</td>
+</tr>
+<tr>
+<td>GET</td>
+<td><a href="#retrieving-an-orders-trades">/orders/:order_id/trades</a></td>
+<td>Retrieve the trades generated by an order</td>
+</tr>
+</tbody>
+</table>
+<h2 id="glossary-of-constants">Glossary of constants<a class="headerlink" href="#glossary-of-constants" title="Permanent link">&para;</a></h2>
+<p>Here are several of the constant enum values used for placing orders.</p>
+<table>
+<thead>
+<tr>
+<th>param</th>
+<th>values</th>
+<th>&nbsp;</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>variety</code></td>
+<td><code>regular</code></td>
+<td>Regular order</td>
+</tr>
+<tr>
+<td>&nbsp;</td>
+<td><code>amo</code></td>
+<td>After Market Order</td>
+</tr>
+<tr>
+<td>&nbsp;</td>
+<td><code>co</code></td>
+<td>Cover Order <a href="https://support.zerodha.com/category/trading-and-markets/product-and-order-types/order/articles/what-are-cover-orders-and-how-to-use-them">?</a></td>
+</tr>
+<tr>
+<td>&nbsp;</td>
+<td><code>iceberg</code></td>
+<td>Iceberg Order <a href="https://support.zerodha.com/category/trading-and-markets/product-and-order-types/order/articles/iceberg-orders">?</a></td>
+</tr>
+<tr>
+<td>&nbsp;</td>
+<td><code>auction</code></td>
+<td>Auction Order <a href="https://support.zerodha.com/category/trading-and-markets/kite-features/auctions/articles/participation-in-the-auction">?</a></td>
+</tr>
+<tr>
+<td><code>order_type</code></td>
+<td><code>MARKET</code></td>
+<td>Market order</td>
+</tr>
+<tr>
+<td>&nbsp;</td>
+<td><code>LIMIT</code></td>
+<td>Limit order</td>
+</tr>
+<tr>
+<td>&nbsp;</td>
+<td><code>SL</code></td>
+<td>Stoploss order <a href="https://support.zerodha.com/category/trading-and-markets/product-and-order-types/order/articles/what-are-stop-loss-orders-and-how-to-use-them">?</a></td>
+</tr>
+<tr>
+<td>&nbsp;</td>
+<td><code>SL-M</code></td>
+<td>Stoploss-market order <a href="https://support.zerodha.com/category/trading-and-markets/product-and-order-types/order/articles/what-are-stop-loss-orders-and-how-to-use-them">?</a></td>
+</tr>
+<tr>
+<td><code>product</code></td>
+<td><code>CNC</code></td>
+<td>Cash &amp; Carry for equity <a href="https://support.zerodha.com/category/trading-and-markets/product-and-order-types/product/articles/what-does-cnc-mis-and-nrml-mean">?</a></td>
+</tr>
+<tr>
+<td>&nbsp;</td>
+<td><code>NRML</code></td>
+<td>Normal for futures and options <a href="https://support.zerodha.com/category/trading-and-markets/product-and-order-types/product/articles/what-does-cnc-mis-and-nrml-mean">?</a></td>
+</tr>
+<tr>
+<td>&nbsp;</td>
+<td><code>MIS</code></td>
+<td>Margin Intraday Squareoff for futures and options <a href="https://support.zerodha.com/category/trading-and-markets/product-and-order-types/product/articles/what-does-cnc-mis-and-nrml-mean">?</a></td>
+</tr>
+<tr>
+<td>&nbsp;</td>
+<td><code>MTF</code></td>
+<td>Margin Trading Facility <a href="https://support.zerodha.com/category/trading-and-markets/margins/margin-trading-facility/articles/buy-stocks-using-mtf">?</a></td>
+</tr>
+<tr>
+<td><code>validity</code></td>
+<td><code>DAY</code></td>
+<td>Regular order</td>
+</tr>
+<tr>
+<td>&nbsp;</td>
+<td><code>IOC</code></td>
+<td>Immediate or Cancel</td>
+</tr>
+<tr>
+<td>&nbsp;</td>
+<td><code>TTL</code></td>
+<td>Order validity in minutes</td>
+</tr>
+<tr>
+<td><code>market_protection</code></td>
+<td><code>&gt; 0 and up to 100</code></td>
+<td>Custom market protection percentage (e.g., 2 for 2% protection, 10 for 10% protection)</td>
+</tr>
+<tr>
+<td>&nbsp;</td>
+<td><code>-1</code></td>
+<td>Automatic market protection applied by the system as per <a href="https://support.zerodha.com/category/trading-and-markets/charts-and-orders/order/articles/market-price-protection-on-the-order-window">market protection guidelines</a></td>
+</tr>
+<tr>
+<td><code>autoslice</code></td>
+<td><code>true</code></td>
+<td>Enable automatic order slicing for quantities above freeze limits <a href="https://zerodha.com/z-connect/featured/order-placement-simplified">?</a></td>
+</tr>
+<tr>
+<td>&nbsp;</td>
+<td><code>false</code></td>
+<td>Disable automatic order slicing (default)</td>
+</tr>
+</tbody>
+</table>
+<h2 id="placing-orders">Placing orders<a class="headerlink" href="#placing-orders" title="Permanent link">&para;</a></h2>
+<p>Placing an order implies registering it with the OMS via the API. This does not guarantee the order's receipt at the exchange. The fate of an order is dependent on several factors including market hours, availability of funds, risk checks and so on. Under normal circumstances, order placement, receipt by the OMS, transport to the exchange, execution, and the confirmation roundtrip happen instantly.</p>
+<p>When an order is successfully placed, the API returns an <code>order_id</code>. The status of the order is not known at the moment of placing because of the aforementioned reasons.</p>
+<p>In case of non-MARKET orders that may be open indefinitely during the course of a trading day, it is not practical to poll the order APIs continuously to know the status. For this, <a href="../postbacks/">postbacks</a> are ideal as they sent order updates asynchronously as they happen.</p>
+<div class="admonition note">
+<p class="admonition-title">Note</p>
+<p>Successful placement of an order via the API does not imply its successful execution. To know the true status of a placed order, you should scan the order history or retrieve the particular order's current details using its order_id.</p>
+</div>
+<h3 id="order-varieties">Order varieties<a class="headerlink" href="#order-varieties" title="Permanent link">&para;</a></h3>
+<p>You can place orders of different varieties&mdash;regular orders, after market orders, cover orders, iceberg orders etc. See the list of varieties <a href="#glossary-of-constants">here</a>.</p>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>https://api.kite.trade/orders/regular<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-H<span class="w"> </span><span class="s2">&quot;X-Kite-Version: 3&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-H<span class="w"> </span><span class="s2">&quot;Authorization: token api_key:access_token&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-d<span class="w"> </span><span class="s2">&quot;tradingsymbol=ACC&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-d<span class="w"> </span><span class="s2">&quot;exchange=NSE&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-d<span class="w"> </span><span class="s2">&quot;transaction_type=BUY&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-d<span class="w"> </span><span class="s2">&quot;order_type=MARKET&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-d<span class="w"> </span><span class="s2">&quot;quantity=1&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-d<span class="w"> </span><span class="s2">&quot;product=MIS&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-d<span class="w"> </span><span class="s2">&quot;validity=DAY&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-d<span class="w"> </span><span class="s2">&quot;market_protection=-1&quot;</span>
+</code></pre></div>
+<div class="highlight"><pre><span></span><code><span class="p">{</span>
+<span class="w">    </span><span class="nt">&quot;status&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;success&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;data&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">      </span><span class="nt">&quot;order_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;151220000000000&quot;</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">  </span><span class="p">}</span>
+</code></pre></div>
+<h3 id="regular-order-parameters">Regular order parameters<a class="headerlink" href="#regular-order-parameters" title="Permanent link">&para;</a></h3>
+<p>These parameters are common across different order varieties.</p>
+<table>
+<thead>
+<tr>
+<th>parameter</th>
+<th>&nbsp;</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>tradingsymbol</code></td>
+<td>Tradingsymbol of the instrument <a href="../market-quotes/#retrieving-the-full-instrument-list">?</a></td>
+</tr>
+<tr>
+<td><code>exchange</code></td>
+<td>Name of the exchange (NSE, BSE, NFO, CDS, BCD, MCX)</td>
+</tr>
+<tr>
+<td><code>transaction_type</code></td>
+<td>BUY or SELL</td>
+</tr>
+<tr>
+<td><code>order_type</code></td>
+<td>Order type (MARKET, LIMIT etc.)</td>
+</tr>
+<tr>
+<td><code>quantity</code></td>
+<td>Quantity to transact</td>
+</tr>
+<tr>
+<td><code>product</code></td>
+<td>Margin product to use for the order (margins are blocked based on this) <a href="https://support.zerodha.com/category/trading-and-markets/product-and-order-types/product/articles/what-does-cnc-mis-and-nrml-mean">?</a></td>
+</tr>
+<tr>
+<td><code>price</code></td>
+<td>The price to execute the order at (for LIMIT orders)</td>
+</tr>
+<tr>
+<td><code>trigger_price</code></td>
+<td>The price at which an order should be triggered (SL, SL-M)</td>
+</tr>
+<tr>
+<td><code>disclosed_quantity</code></td>
+<td>Quantity to disclose publicly (for equity trades)</td>
+</tr>
+<tr>
+<td><code>validity</code></td>
+<td>Order validity (DAY, IOC and TTL)</td>
+</tr>
+<tr>
+<td><code>validity_ttl</code></td>
+<td>Order life span in minutes for TTL validity orders</td>
+</tr>
+<tr>
+<td><code>iceberg_legs</code></td>
+<td>Total number of legs for iceberg order type (number of legs per Iceberg should be between 2 and 50)</td>
+</tr>
+<tr>
+<td><code>iceberg_quantity</code></td>
+<td>Split quantity for each iceberg leg order (quantity/iceberg_legs)</td>
+</tr>
+<tr>
+<td><code>auction_number</code> <span>string</span></td>
+<td>A unique identifier for a particular auction</td>
+</tr>
+<tr>
+<td><code>market_protection</code></td>
+<td>Market protection percentage for MARKET and SL-M orders. Values: greater than 0 and up to 100 (custom %), -1 (auto protection)</td>
+</tr>
+<tr>
+<td><code>autoslice</code></td>
+<td>Enable automatic slicing for orders exceeding freeze quantity limits. Values: true (enable), false (disable, default) <a href="https://zerodha.com/z-connect/featured/order-placement-simplified">?</a></td>
+</tr>
+<tr>
+<td><code>tag</code></td>
+<td>An optional tag to apply to an order to identify it (alphanumeric, max 20 chars)</td>
+</tr>
+</tbody>
+</table>
+<h2 id="modifying-orders">Modifying orders<a class="headerlink" href="#modifying-orders" title="Permanent link">&para;</a></h2>
+<p>As long as on order is open or pending in the system, certain attributes of it may be modified. It is important to sent the right value for <code>:variety</code> in the URL.</p>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>--request<span class="w"> </span>PUT<span class="w"> </span>https://api.kite.trade/orders/regular/151220000000000<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-H<span class="w"> </span><span class="s2">&quot;X-Kite-Version: 3&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-H<span class="w"> </span><span class="s2">&quot;Authorization: token api_key:access_token&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-d<span class="w"> </span><span class="s2">&quot;order_type=MARKET&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-d<span class="w"> </span><span class="s2">&quot;quantity=3&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-d<span class="w"> </span><span class="s2">&quot;validity=DAY&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-d<span class="w"> </span><span class="s2">&quot;market_protection=-1&quot;</span>
+</code></pre></div>
+<div class="highlight"><pre><span></span><code><span class="p">{</span>
+<span class="w">    </span><span class="nt">&quot;status&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;success&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;data&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">      </span><span class="nt">&quot;order_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;151220000000000&quot;</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+<h3 id="regular-order-parameters_1">Regular order parameters<a class="headerlink" href="#regular-order-parameters_1" title="Permanent link">&para;</a></h3>
+<table>
+<thead>
+<tr>
+<th>parameter</th>
+<th>&nbsp;</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>order_type</code></td>
+<td></td>
+</tr>
+<tr>
+<td><code>quantity</code></td>
+<td></td>
+</tr>
+<tr>
+<td><code>price</code></td>
+<td></td>
+</tr>
+<tr>
+<td><code>trigger_price</code></td>
+<td></td>
+</tr>
+<tr>
+<td><code>disclosed_quantity</code></td>
+<td></td>
+</tr>
+<tr>
+<td><code>validity</code></td>
+<td></td>
+</tr>
+</tbody>
+</table>
+<h3 id="cover-order-co-parameters">Cover order (CO) parameters<a class="headerlink" href="#cover-order-co-parameters" title="Permanent link">&para;</a></h3>
+<table>
+<thead>
+<tr>
+<th>parameter</th>
+<th>&nbsp;</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>order_id</code></td>
+<td>Unique order ID</td>
+</tr>
+<tr>
+<td><code>price</code></td>
+<td>The price to execute the order at</td>
+</tr>
+<tr>
+<td><code>trigger_price</code></td>
+<td>For <code>LIMIT</code> Cover orders</td>
+</tr>
+</tbody>
+</table>
+<h2 id="cancelling-orders">Cancelling orders<a class="headerlink" href="#cancelling-orders" title="Permanent link">&para;</a></h2>
+<p>As long as on order is open or pending in the system, it can be cancelled.</p>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>--request<span class="w"> </span>DELETE<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span><span class="s2">&quot;https://api.kite.trade/orders/regular/151220000000000&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-H<span class="w"> </span><span class="s2">&quot;X-Kite-Version: 3&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-H<span class="w"> </span><span class="s2">&quot;Authorization: token api_key:access_token&quot;</span><span class="w"> </span><span class="se">\</span>
+</code></pre></div>
+<div class="highlight"><pre><span></span><code><span class="p">{</span>
+<span class="w">  </span><span class="nt">&quot;status&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;success&quot;</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">&quot;data&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="nt">&quot;order_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;151220000000000&quot;</span>
+<span class="w">  </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+<h2 id="retrieving-orders">Retrieving orders<a class="headerlink" href="#retrieving-orders" title="Permanent link">&para;</a></h2>
+<p>The order history or the order book is transient as it only lives for a day in the system. When you retrieve orders, you get all the orders for the day including open, pending, and executed ones.</p>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span><span class="s2">&quot;https://api.kite.trade/orders&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-H<span class="w"> </span><span class="s2">&quot;X-Kite-Version: 3&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-H<span class="w"> </span><span class="s2">&quot;Authorization: token api_key:access_token&quot;</span>
+</code></pre></div>
+<div class="highlight"><pre><span></span><code><span class="p">{</span>
+<span class="w">  </span><span class="nt">&quot;status&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;success&quot;</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">&quot;data&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+<span class="w">    </span><span class="p">{</span>
+<span class="w">      </span><span class="nt">&quot;placed_by&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;XXXXXX&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;order_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;100000000000000&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;exchange_order_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;200000000000000&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;parent_order_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;status&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;CANCELLED&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;status_message&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;status_message_raw&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;order_timestamp&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;2021-05-31 09:18:57&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;exchange_update_timestamp&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;2021-05-31 09:18:58&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;exchange_timestamp&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;2021-05-31 09:15:38&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;variety&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;regular&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;modified&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">false</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;exchange&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;CDS&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;tradingsymbol&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;USDINR21JUNFUT&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;instrument_token&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">412675</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;order_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;LIMIT&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;transaction_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;BUY&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;validity&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;DAY&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;product&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;NRML&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;disclosed_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">72</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;trigger_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;average_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;filled_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;pending_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;cancelled_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;market_protection&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;meta&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{},</span>
+<span class="w">      </span><span class="nt">&quot;tag&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;guid&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;XXXXX&quot;</span>
+<span class="w">    </span><span class="p">},</span>
+<span class="w">    </span><span class="p">{</span>
+<span class="w">      </span><span class="nt">&quot;placed_by&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;XXXXXX&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;order_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;300000000000000&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;exchange_order_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;400000000000000&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;parent_order_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;status&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;COMPLETE&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;status_message&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;status_message_raw&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;order_timestamp&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;2021-05-31 15:20:28&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;exchange_update_timestamp&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;2021-05-31 15:20:28&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;exchange_timestamp&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;2021-05-31 15:20:28&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;variety&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;regular&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;modified&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">false</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;exchange&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;NSE&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;tradingsymbol&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;IOC&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;instrument_token&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">415745</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;order_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;LIMIT&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;transaction_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;BUY&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;validity&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;DAY&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;product&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;CNC&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;disclosed_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">109.4</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;trigger_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;average_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">109.4</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;filled_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;pending_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;cancelled_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;market_protection&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;meta&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{},</span>
+<span class="w">      </span><span class="nt">&quot;tag&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;guid&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;XXXXXX&quot;</span>
+<span class="w">    </span><span class="p">},</span>
+<span class="w">    </span><span class="p">{</span>
+<span class="w">      </span><span class="nt">&quot;placed_by&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;XXXXXX&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;order_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;500000000000000&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;exchange_order_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;600000000000000&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;parent_order_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;status&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;COMPLETE&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;status_message&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;status_message_raw&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;order_timestamp&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;2021-05-31 15:20:51&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;exchange_update_timestamp&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;2021-05-31 15:20:52&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;exchange_timestamp&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;2021-05-31 15:20:52&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;variety&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;regular&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;modified&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">false</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;exchange&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;NSE&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;tradingsymbol&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;IOC&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;instrument_token&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">415745</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;order_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;MARKET&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;transaction_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;SELL&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;validity&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;DAY&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;product&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;CNC&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;disclosed_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;trigger_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;average_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">109.35</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;filled_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;pending_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;cancelled_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;market_protection&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;meta&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{},</span>
+<span class="w">      </span><span class="nt">&quot;tag&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;guid&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;XXXX&quot;</span>
+<span class="w">    </span><span class="p">},</span>
+<span class="w">    </span><span class="p">{</span>
+<span class="w">      </span><span class="nt">&quot;placed_by&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;XXXXXX&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;order_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;220524001859672&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;exchange_order_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;parent_order_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;status&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;REJECTED&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;status_message&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;Insufficient funds. Required margin is 95417.84 but available margin is 74251.80. Check the orderbook for open orders.&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;status_message_raw&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;RMS:Margin Exceeds,Required:95417.84, Available:74251.80 for entity account-XXXXX across exchange across segment across product &quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;order_timestamp&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;2022-05-24 12:26:52&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;exchange_update_timestamp&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;exchange_timestamp&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;variety&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;iceberg&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;modified&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">false</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;exchange&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;NSE&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;tradingsymbol&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;SBIN&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;instrument_token&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">779521</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;order_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;LIMIT&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;transaction_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;BUY&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;validity&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;TTL&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;validity_ttl&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">2</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;product&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;CNC&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">200</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;disclosed_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">463</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;trigger_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;average_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;filled_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;pending_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;cancelled_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;market_protection&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;meta&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="nt">&quot;iceberg&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">          </span><span class="nt">&quot;leg&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="w">          </span><span class="nt">&quot;legs&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">5</span><span class="p">,</span>
+<span class="w">          </span><span class="nt">&quot;leg_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">200</span><span class="p">,</span>
+<span class="w">          </span><span class="nt">&quot;total_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1000</span><span class="p">,</span>
+<span class="w">          </span><span class="nt">&quot;remaining_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">800</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="w">      </span><span class="p">},</span>
+<span class="w">      </span><span class="nt">&quot;tag&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;icebergord&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;tags&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+<span class="w">        </span><span class="s2">&quot;icebergord&quot;</span>
+<span class="w">      </span><span class="p">],</span>
+<span class="w">      </span><span class="nt">&quot;guid&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;XXXXXX&quot;</span>
+<span class="w">    </span><span class="p">},</span>
+<span class="w">    </span><span class="p">{</span>
+<span class="w">      </span><span class="nt">&quot;placed_by&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;XXXXXX&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;order_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;700000000000000&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;exchange_order_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;800000000000000&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;parent_order_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;status&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;COMPLETE&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;status_message&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;status_message_raw&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;order_timestamp&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;2021-05-31 16:00:36&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;exchange_update_timestamp&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;2021-05-31 16:00:36&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;exchange_timestamp&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;2021-05-31 16:00:36&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;variety&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;regular&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;modified&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">false</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;exchange&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;MCX&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;tradingsymbol&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;GOLDPETAL21JUNFUT&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;instrument_token&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">58424839</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;order_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;LIMIT&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;transaction_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;BUY&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;validity&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;DAY&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;product&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;NRML&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;disclosed_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">4854</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;trigger_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;average_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">4852</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;filled_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;pending_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;cancelled_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;market_protection&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;meta&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{},</span>
+<span class="w">      </span><span class="nt">&quot;tag&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;connect test order1&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;tags&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+<span class="w">        </span><span class="s2">&quot;connect test order1&quot;</span>
+<span class="w">      </span><span class="p">],</span>
+<span class="w">      </span><span class="nt">&quot;guid&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;XXXXXXX&quot;</span>
+<span class="w">    </span><span class="p">},</span>
+<span class="w">    </span><span class="p">{</span>
+<span class="w">      </span><span class="nt">&quot;placed_by&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;XXXXXX&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;order_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;9000000000000000&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;exchange_order_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;1000000000000000&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;parent_order_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;status&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;COMPLETE&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;status_message&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;status_message_raw&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;order_timestamp&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;2021-05-31 16:08:40&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;exchange_update_timestamp&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;2021-05-31 16:08:41&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;exchange_timestamp&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;2021-05-31 16:08:41&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;variety&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;regular&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;modified&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">false</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;exchange&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;MCX&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;tradingsymbol&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;GOLDPETAL21JUNFUT&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;instrument_token&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">58424839</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;order_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;LIMIT&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;transaction_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;BUY&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;validity&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;DAY&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;product&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;NRML&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;disclosed_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">4854</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;trigger_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;average_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">4852</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;filled_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;pending_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;cancelled_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;market_protection&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;meta&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{},</span>
+<span class="w">      </span><span class="nt">&quot;tag&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;connect test order2&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;tags&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+<span class="w">        </span><span class="s2">&quot;connect test order2&quot;</span><span class="p">,</span>
+<span class="w">        </span><span class="s2">&quot;XXXXX&quot;</span>
+<span class="w">      </span><span class="p">],</span>
+<span class="w">      </span><span class="nt">&quot;guid&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;XXXXXX&quot;</span>
+<span class="w">    </span><span class="p">},</span>
+<span class="w">    </span><span class="p">{</span>
+<span class="w">      </span><span class="nt">&quot;placed_by&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;XXXXXX&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;order_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;98000000000000000&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;exchange_order_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;67000000000000000&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;parent_order_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;status&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;CANCELLED&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;status_message&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;status_message_raw&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;order_timestamp&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;2023-06-12 14:00:58&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;exchange_update_timestamp&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;2023-06-12 14:00:58&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;exchange_timestamp&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;2023-06-12 14:00:58&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;variety&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;auction&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;modified&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">false</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;exchange&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;NSE&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;tradingsymbol&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;BHEL&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;instrument_token&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">112129</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;order_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;LIMIT&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;transaction_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;SELL&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;validity&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;DAY&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;validity_ttl&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;product&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;CNC&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">60</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;disclosed_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">85</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;trigger_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;auction_number&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;22&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;average_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;filled_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;pending_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">60</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;cancelled_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;market_protection&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;meta&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{},</span>
+<span class="w">      </span><span class="nt">&quot;tag&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;guid&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span>
+<span class="w">    </span><span class="p">},</span>
+<span class="w">    </span><span class="p">{</span>
+<span class="w">      </span><span class="nt">&quot;account_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;XXXXXX&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;placed_by&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;XXXXXX&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;order_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;250117800776785&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;exchange_order_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;1300000029561105&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;parent_order_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;status&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;CANCELLED&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;status_message&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;status_message_raw&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;order_timestamp&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;2025-01-17 11:49:45&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;exchange_update_timestamp&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;2025-01-17 11:49:45&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;exchange_timestamp&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;2025-01-17 11:49:45&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;variety&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;regular&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;modified&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">false</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;exchange&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;NSE&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;tradingsymbol&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;SBIN&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;instrument_token&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">779521</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;order_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;LIMIT&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;transaction_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;BUY&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;validity&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;DAY&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;validity_ttl&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;product&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;MTF&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;disclosed_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">702</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;trigger_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;average_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;filled_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;pending_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;cancelled_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;market_protection&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;meta&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{},</span>
+<span class="w">      </span><span class="nt">&quot;tag&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;guid&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">  </span><span class="p">]</span>
+<span class="p">}</span>
+</code></pre></div>
+<h3 id="response-attributes">Response attributes<a class="headerlink" href="#response-attributes" title="Permanent link">&para;</a></h3>
+<table>
+<thead>
+<tr>
+<th>attribute</th>
+<th>&nbsp;</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>order_id</code><span>string</span></td>
+<td>Unique order ID</td>
+</tr>
+<tr>
+<td><code>parent_order_id</code><span>string</span></td>
+<td>Order ID of the parent order (only applicable in case of multi-legged orders like CO)</td>
+</tr>
+<tr>
+<td><code>exchange_order_id</code><span>null, string</span></td>
+<td>Exchange generated order ID. Orders that don't reach the exchange have null IDs</td>
+</tr>
+<tr>
+<td><code>modified</code><span>bool</span></td>
+<td>Indicate that the order has been modified since placement by the user</td>
+</tr>
+<tr>
+<td><code>placed_by</code><span>string</span></td>
+<td>ID of the user that placed the order. This may different from the user's ID for orders placed outside of Kite, for instance, by dealers at the brokerage using dealer terminals</td>
+</tr>
+<tr>
+<td><code>variety</code><span>string</span></td>
+<td>Order variety (regular, amo, co etc.)</td>
+</tr>
+<tr>
+<td><code>status</code><span>string</span></td>
+<td>Current status of the order. Most common values or COMPLETE, REJECTED, CANCELLED, and OPEN. There may be other values as well.</td>
+</tr>
+<tr>
+<td><code>tradingsymbol</code><span>string</span></td>
+<td>Exchange tradingsymbol of the instrument</td>
+</tr>
+<tr>
+<td><code>exchange</code><span>string</span></td>
+<td>Exchange</td>
+</tr>
+<tr>
+<td><code>instrument_token</code><span>string</span></td>
+<td>The numerical identifier issued by the exchange representing the instrument. Used for subscribing to live market data over WebSocket</td>
+</tr>
+<tr>
+<td><code>transaction_type</code><span>string</span></td>
+<td>BUY or SELL</td>
+</tr>
+<tr>
+<td><code>order_type</code><span>string</span></td>
+<td>Order type (MARKET, LIMIT etc.)</td>
+</tr>
+<tr>
+<td><code>product</code><span>string&gt;</span></td>
+<td>Margin product to use for the order (margins are blocked based on this) <a href="https://support.zerodha.com/category/trading-and-markets/product-and-order-types/product/articles/what-does-cnc-mis-and-nrml-mean">?</a></td>
+</tr>
+<tr>
+<td><code>validity</code><span>string</span></td>
+<td>Order validity</td>
+</tr>
+<tr>
+<td><code>price</code><span>float64</span></td>
+<td>Price at which the order was placed (LIMIT orders)</td>
+</tr>
+<tr>
+<td><code>quantity</code><span>int64</span></td>
+<td>Quantity ordered</td>
+</tr>
+<tr>
+<td><code>trigger_price</code><span>float64</span></td>
+<td>Trigger price (for SL, SL-M, CO orders)</td>
+</tr>
+<tr>
+<td><code>average_price</code><span>float64</span></td>
+<td>Average price at which the order was executed (only for COMPLETE orders)</td>
+</tr>
+<tr>
+<td><code>pending_quantity</code><span>int64</span></td>
+<td>Pending quantity to be filled</td>
+</tr>
+<tr>
+<td><code>filled_quantity</code><span>int64</span></td>
+<td>Quantity that's been filled</td>
+</tr>
+<tr>
+<td><code>disclosed_quantity</code><span>int64</span></td>
+<td>Quantity to be disclosed (may be different from actual quantity) to the public exchange orderbook. Only for equities</td>
+</tr>
+<tr>
+<td><code>order_timestamp</code><span>string</span></td>
+<td>Timestamp at which the order was registered by the API</td>
+</tr>
+<tr>
+<td><code>exchange_timestamp</code><span>string</span></td>
+<td>Timestamp at which the order was registered by the exchange. Orders that don't reach the exchange have null timestamps</td>
+</tr>
+<tr>
+<td><code>exchange_update_timestamp</code><span>string</span></td>
+<td>Timestamp at which an order's state changed at the exchange</td>
+</tr>
+<tr>
+<td><code>status_message</code><span>null, string</span></td>
+<td>Textual description of the order's status. Failed orders come with human readable explanation</td>
+</tr>
+<tr>
+<td><code>status_message_raw</code><span>null, string</span></td>
+<td>Raw textual description of the failed order's status, as received from the OMS</td>
+</tr>
+<tr>
+<td><code>cancelled_quantity</code><span>int64</span></td>
+<td>Quantity that's cancelled</td>
+</tr>
+<tr>
+<td><code>auction_number</code> <span>string</span></td>
+<td>A unique identifier for a particular auction</td>
+</tr>
+<tr>
+<td><code>meta</code><span>{}, string</span></td>
+<td>Map of arbitrary fields that the system may attach to an order.</td>
+</tr>
+<tr>
+<td><code>tag</code><span>null, string</span></td>
+<td>An optional tag to apply to an order to identify it (alphanumeric, max 20 chars)</td>
+</tr>
+<tr>
+<td><code>guid</code><span>string</span></td>
+<td>Unusable request id to avoid order duplication</td>
+</tr>
+</tbody>
+</table>
+<h2 id="order-statuses">Order statuses<a class="headerlink" href="#order-statuses" title="Permanent link">&para;</a></h2>
+<p>The <code>status</code> field in the order response shows the current state of the order. The status values are largely self explanatory. The most common statuses are <code>OPEN</code>, <code>COMPLETE</code>, <code>CANCELLED</code>, and <code>REJECTED</code>.</p>
+<p>An order can traverse through several interim and temporary statuses during its lifetime. For example, when an order is first placed or modified, it instantly passes through several stages before reaching its end state. Some of these are highlighted below.</p>
+<table>
+<thead>
+<tr>
+<th>status</th>
+<th>&nbsp;</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>PUT ORDER REQ RECEIVED</code></td>
+<td>Order request has been received by the backend</td>
+</tr>
+<tr>
+<td><code>VALIDATION PENDING</code></td>
+<td>Order pending validation by the RMS (Risk Management System)</td>
+</tr>
+<tr>
+<td><code>OPEN PENDING</code></td>
+<td>Order is pending registration at the exchange</td>
+</tr>
+<tr>
+<td><code>MODIFY VALIDATION PENDING</code></td>
+<td>Order's modification values are pending validation by the RMS</td>
+</tr>
+<tr>
+<td><code>MODIFY PENDING</code></td>
+<td>Order's modification values are pending registration at the exchange</td>
+</tr>
+<tr>
+<td><code>TRIGGER PENDING</code></td>
+<td>Order's placed but the fill is pending based on a trigger price.</td>
+</tr>
+<tr>
+<td><code>CANCEL PENDING</code></td>
+<td>Order's cancellation request is pending registration at the exchange</td>
+</tr>
+<tr>
+<td><code>AMO REQ RECEIVED</code></td>
+<td>Same as <code>PUT ORDER REQ RECEIVED</code>, but for AMOs</td>
+</tr>
+</tbody>
+</table>
+<h2 id="tagging-orders">Tagging orders<a class="headerlink" href="#tagging-orders" title="Permanent link">&para;</a></h2>
+<p>Often, it may be necessary to tag and filter orders based on various criteria, for instance, to filter out all orders that came from a particular application or an <code>api_key</code> of yours. The <code>tag</code> field comes in handy here. It let's you send an arbitrary string while placing an order. This can be a unique ID, or something that indicates a particular type or context, for example. When the orderbook is retrieved, this value will be present in the <code>tag</code> field in the response.</p>
+<h2 id="market-protection">Market protection<a class="headerlink" href="#market-protection" title="Permanent link">&para;</a></h2>
+<p>Market protection is a feature that helps protect against extreme price movements when placing MARKET and SL-M (stoploss-market) orders. This feature allows you to set a percentage threshold to limit how much the order price can deviate from the current market price.</p>
+<p>The <code>market_protection</code> parameter accepts the following values:</p>
+<ul>
+<li>Greater than <code>0</code> and up to <code>100</code>: Custom market protection percentage (e.g., 2 means 2% protection, 10 means 10% protection)</li>
+<li><code>-1</code>: Automatic market protection applied by the system as per <a href="https://support.zerodha.com/category/trading-and-markets/charts-and-orders/order/articles/market-price-protection-on-the-order-window">market protection guidelines</a></li>
+</ul>
+<p>The protection percentage should be within the circuit limit's.</p>
+<p>Market protection converts market orders to limit orders, but execution remains subject to exchange-defined LPP (Limit Price Protection) ranges. Orders exceeding LPP limits may be rejected.</p>
+<div class="admonition note">
+<p class="admonition-title">Note</p>
+<p>Market protection is only applicable for MARKET and SL-M order types. It has no effect on LIMIT and SL orders as they already have built-in price protection.</p>
+</div>
+<h2 id="auto-slice-orders">Auto slice orders<a class="headerlink" href="#auto-slice-orders" title="Permanent link">&para;</a></h2>
+<p>When placing orders with <code>autoslice=true</code> for quantities exceeding freeze limits, the order is automatically split into multiple smaller orders internally. Unlike a regular order placement response, the API returns <code>data</code> as an array with one entry per slice. Each successful slice entry contains an <code>order_id</code>, while any slice that fails placement (for example, due to margin shortfall) is represented by an <code>error</code> object with <code>code</code>, <code>error_type</code>, <code>message</code>, and <code>data</code> fields, successful and failed slices can coexist in the same response. Each successfully placed slice appears as a separate order in your orderbook with its own <code>order_id</code>. The maximum number of slices generated from a single auto slice order is 10.</p>
+<div class="highlight"><pre><span></span><code><span class="p">{</span>
+<span class="w">  </span><span class="nt">&quot;status&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;success&quot;</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">&quot;data&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+<span class="w">    </span><span class="p">{</span>
+<span class="w">      </span><span class="nt">&quot;order_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;1914227164488687616&quot;</span>
+<span class="w">    </span><span class="p">},</span>
+<span class="w">    </span><span class="p">{</span>
+<span class="w">      </span><span class="nt">&quot;order_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;1914227164534824960&quot;</span>
+<span class="w">    </span><span class="p">},</span>
+<span class="w">    </span><span class="p">{</span>
+<span class="w">      </span><span class="nt">&quot;order_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;1914227164580962304&quot;</span>
+<span class="w">    </span><span class="p">},</span>
+<span class="w">    </span><span class="p">{</span>
+<span class="w">      </span><span class="nt">&quot;error&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="nt">&quot;code&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">400</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;error_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;MarginException&quot;</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;message&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;Insufficient funds. Required margin is 228365.92 but available margin is 228358.50.&quot;</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;data&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span>
+<span class="w">      </span><span class="p">}</span>
+<span class="w">    </span><span class="p">},</span>
+<span class="w">    </span><span class="p">{</span>
+<span class="w">      </span><span class="nt">&quot;order_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;1914227164681625600&quot;</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">  </span><span class="p">]</span>
+<span class="p">}</span>
+</code></pre></div>
+<h2 id="multi-legged-orders-co">Multi-legged orders (CO)<a class="headerlink" href="#multi-legged-orders-co" title="Permanent link">&para;</a></h2>
+<p>Cover orders are "multi-legged" orders, where, a single order you place (first-leg) may spawn new orders (second-leg) based on the conditions you set on the first-leg order. These orders have special properties, where the first-leg order creates a position. The position is exited when the second-leg order is executed or cancelled.</p>
+<p>These second-leg orders will have a <code>parent_order_id</code> field indicating the <code>order_id</code> of its parent order, that is, the first-leg order. This field may be required while modifying or cancelling an open second-leg order.</p>
+<h2 id="retrieving-an-orders-history">Retrieving an order's history<a class="headerlink" href="#retrieving-an-orders-history" title="Permanent link">&para;</a></h2>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span><span class="s2">&quot;https://api.kite.trade/orders/171229000724687&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">     </span>-H<span class="w"> </span><span class="s2">&quot;Authorization: token api_key:access_token&quot;</span>
+</code></pre></div>
+<div class="highlight"><pre><span></span><code><span class="p">{</span>
+<span class="w">  </span><span class="nt">&quot;status&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;success&quot;</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">&quot;data&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+<span class="w">    </span><span class="p">{</span>
+<span class="w">      </span><span class="nt">&quot;average_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;cancelled_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;disclosed_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;exchange&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;NSE&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;exchange_order_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;exchange_timestamp&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;filled_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;instrument_token&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;order_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;171229000724687&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;order_timestamp&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;2017-12-29 11:06:52&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;order_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;LIMIT&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;parent_order_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;pending_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;placed_by&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;DA0017&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">300</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;product&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;CNC&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;status&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;PUT ORDER REQ RECEIVED&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;status_message&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;tag&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;tradingsymbol&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;SBIN&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;transaction_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;BUY&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;trigger_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;validity&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;DAY&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;variety&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;regular&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;modified&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">false</span>
+<span class="w">    </span><span class="p">},</span>
+<span class="w">    </span><span class="p">{</span>
+<span class="w">      </span><span class="nt">&quot;average_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;cancelled_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;disclosed_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;exchange&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;NSE&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;exchange_order_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;exchange_timestamp&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;filled_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;instrument_token&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">779521</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;order_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;171229000724687&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;order_timestamp&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;2017-12-29 11:06:52&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;order_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;LIMIT&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;parent_order_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;pending_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;placed_by&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;DA0017&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">300</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;product&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;CNC&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;status&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;VALIDATION PENDING&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;status_message&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;tag&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;tradingsymbol&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;SBIN&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;transaction_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;BUY&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;trigger_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;validity&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;DAY&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;variety&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;regular&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;modified&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">false</span>
+<span class="w">    </span><span class="p">},</span>
+<span class="w">    </span><span class="p">{</span>
+<span class="w">      </span><span class="nt">&quot;average_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;cancelled_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;disclosed_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;exchange&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;NSE&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;exchange_order_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;exchange_timestamp&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;filled_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;instrument_token&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">779521</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;order_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;171229000724687&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;order_timestamp&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;2017-12-29 11:06:52&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;order_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;LIMIT&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;parent_order_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;pending_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;placed_by&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;DA0017&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">300</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;product&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;CNC&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;status&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;OPEN PENDING&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;status_message&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;tag&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;tradingsymbol&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;SBIN&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;transaction_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;BUY&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;trigger_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;validity&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;DAY&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;variety&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;regular&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;modified&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">false</span>
+<span class="w">    </span><span class="p">},</span>
+<span class="w">    </span><span class="p">{</span>
+<span class="w">      </span><span class="nt">&quot;average_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;cancelled_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;disclosed_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;exchange&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;NSE&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;exchange_order_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;1300000001887410&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;exchange_timestamp&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;2017-12-29 11:06:52&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;filled_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;instrument_token&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">779521</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;order_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;171229000724687&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;order_timestamp&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;2017-12-29 11:06:52&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;order_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;LIMIT&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;parent_order_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;pending_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;placed_by&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;DA0017&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">300</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;product&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;CNC&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;status&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;OPEN&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;status_message&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;tag&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;tradingsymbol&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;SBIN&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;transaction_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;BUY&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;trigger_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;validity&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;DAY&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;variety&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;regular&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;modified&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">false</span>
+<span class="w">    </span><span class="p">},</span>
+<span class="w">    </span><span class="p">{</span>
+<span class="w">      </span><span class="nt">&quot;average_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;cancelled_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;disclosed_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;exchange&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;NSE&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;exchange_order_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;1300000001887410&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;exchange_timestamp&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;2017-12-29 11:06:52&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;filled_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;instrument_token&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">779521</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;order_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;171229000724687&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;order_timestamp&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;2017-12-29 11:08:16&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;order_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;LIMIT&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;parent_order_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;pending_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;placed_by&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;DA0017&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">300</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;product&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;CNC&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;status&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;MODIFY VALIDATION PENDING&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;status_message&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;tag&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;tradingsymbol&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;SBIN&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;transaction_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;BUY&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;trigger_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;validity&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;DAY&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;variety&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;regular&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;modified&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">false</span>
+<span class="w">    </span><span class="p">},</span>
+<span class="w">    </span><span class="p">{</span>
+<span class="w">      </span><span class="nt">&quot;average_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;cancelled_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;disclosed_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;exchange&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;NSE&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;exchange_order_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;1300000001887410&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;exchange_timestamp&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;2017-12-29 11:06:52&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;filled_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;instrument_token&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">779521</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;order_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;171229000724687&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;order_timestamp&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;2017-12-29 11:08:16&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;order_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;LIMIT&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;parent_order_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;pending_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;placed_by&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;DA0017&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">300</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;product&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;CNC&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;status&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;MODIFY PENDING&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;status_message&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;tag&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;tradingsymbol&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;SBIN&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;transaction_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;BUY&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;trigger_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;validity&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;DAY&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;variety&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;regular&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;modified&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">false</span>
+<span class="w">    </span><span class="p">},</span>
+<span class="w">    </span><span class="p">{</span>
+<span class="w">      </span><span class="nt">&quot;average_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;cancelled_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;disclosed_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;exchange&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;NSE&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;exchange_order_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;1300000001887410&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;exchange_timestamp&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;2017-12-29 11:08:16&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;filled_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;instrument_token&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">779521</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;order_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;171229000724687&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;order_timestamp&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;2017-12-29 11:08:16&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;order_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;LIMIT&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;parent_order_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;pending_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;placed_by&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;DA0017&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">300</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;product&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;CNC&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;status&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;MODIFIED&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;status_message&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;tag&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;tradingsymbol&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;SBIN&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;transaction_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;BUY&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;trigger_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;validity&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;DAY&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;variety&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;regular&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;modified&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">false</span>
+<span class="w">    </span><span class="p">},</span>
+<span class="w">    </span><span class="p">{</span>
+<span class="w">      </span><span class="nt">&quot;average_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;cancelled_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;disclosed_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;exchange&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;NSE&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;exchange_order_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;1300000001887410&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;exchange_timestamp&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;2017-12-29 11:08:16&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;filled_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;instrument_token&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">779521</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;order_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;171229000724687&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;order_timestamp&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;2017-12-29 11:08:16&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;order_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;LIMIT&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;parent_order_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;pending_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;placed_by&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;DA0017&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">300.1</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;product&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;CNC&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;status&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;OPEN&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;status_message&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;tag&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;tradingsymbol&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;SBIN&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;transaction_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;BUY&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;trigger_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;validity&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;DAY&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;variety&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;regular&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;modified&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">false</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">  </span><span class="p">]</span>
+<span class="p">}</span>
+</code></pre></div>
+<p>Every order, right after being placed, goes through multiple stages internally in the OMS. Initial validation, RMS (Risk Management System) checks and so on before it goes to the exchange. In addition, an open order, when modified, again goes through these stages.</p>
+<h2 id="retrieving-all-trades">Retrieving all trades<a class="headerlink" href="#retrieving-all-trades" title="Permanent link">&para;</a></h2>
+<p>While an orders is sent as a single entity, it may be executed in arbitrary chunks at the exchange depending on market conditions. For instance, an order for 10 quantity of an instrument can be executed in chunks of 5, 1, 1, 3 or any such combination. Each individual execution that fills an order partially is a trade. An order may have one or more trades.</p>
+<p>This API returns a list of all trades generated by all executed orders for the day.</p>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span><span class="s2">&quot;https://api.kite.trade/trades&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">     </span>-H<span class="w"> </span><span class="s2">&quot;X-Kite-Version: 3&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">     </span>-H<span class="w"> </span><span class="s2">&quot;Authorization: token api_key:access_token&quot;</span>
+</code></pre></div>
+<div class="highlight"><pre><span></span><code><span class="p">{</span>
+<span class="w">  </span><span class="nt">&quot;status&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;success&quot;</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">&quot;data&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+<span class="w">    </span><span class="p">{</span>
+<span class="w">      </span><span class="nt">&quot;trade_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;10000000&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;order_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;200000000000000&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;exchange&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;NSE&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;tradingsymbol&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;SBIN&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;instrument_token&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">779521</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;product&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;CNC&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;average_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">420.65</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;exchange_order_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;300000000000000&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;transaction_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;BUY&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;fill_timestamp&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;2021-05-31 09:16:39&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;order_timestamp&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;09:16:39&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;exchange_timestamp&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;2021-05-31 09:16:39&quot;</span>
+<span class="w">    </span><span class="p">},</span>
+<span class="w">    </span><span class="p">{</span>
+<span class="w">      </span><span class="nt">&quot;trade_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;40000000&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;order_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;500000000000000&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;exchange&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;CDS&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;tradingsymbol&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;USDINR21JUNFUT&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;instrument_token&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">412675</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;product&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;MIS&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;average_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">72.755</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;exchange_order_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;600000000000000&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;transaction_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;BUY&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;fill_timestamp&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;2021-05-31 11:18:27&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;order_timestamp&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;11:18:27&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;exchange_timestamp&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;2021-05-31 11:18:27&quot;</span>
+<span class="w">    </span><span class="p">},</span>
+<span class="w">    </span><span class="p">{</span>
+<span class="w">      </span><span class="nt">&quot;trade_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;70000000&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;order_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;800000000000000&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;exchange&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;MCX&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;tradingsymbol&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;GOLDPETAL21JUNFUT&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;instrument_token&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">58424839</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;product&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;NRML&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;average_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">4852</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;exchange_order_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;312115100078593&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;transaction_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;BUY&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;fill_timestamp&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;2021-05-31 16:00:36&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;order_timestamp&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;16:00:36&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;exchange_timestamp&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;2021-05-31 16:00:36&quot;</span>
+<span class="w">    </span><span class="p">},</span>
+<span class="w">    </span><span class="p">{</span>
+<span class="w">      </span><span class="nt">&quot;trade_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;90000000&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;order_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;1100000000000000&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;exchange&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;MCX&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;tradingsymbol&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;GOLDPETAL21JUNFUT&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;instrument_token&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">58424839</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;product&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;NRML&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;average_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">4852</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;exchange_order_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;1200000000000000&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;transaction_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;BUY&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;fill_timestamp&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;2021-05-31 16:08:41&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;order_timestamp&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;16:08:41&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;exchange_timestamp&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;2021-05-31 16:08:41&quot;</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">  </span><span class="p">]</span>
+<span class="p">}</span>
+</code></pre></div>
+<h3 id="response-attributes_1">Response attributes<a class="headerlink" href="#response-attributes_1" title="Permanent link">&para;</a></h3>
+<table>
+<thead>
+<tr>
+<th>attribute</th>
+<th>&nbsp;</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>trade_id</code><span>string</span></td>
+<td>Exchange generated trade ID</td>
+</tr>
+<tr>
+<td><code>order_id</code><span>string</span></td>
+<td>Unique order ID</td>
+</tr>
+<tr>
+<td><code>exchange_order_id</code><span>null, string</span></td>
+<td>Exchange generated order ID</td>
+</tr>
+<tr>
+<td><code>tradingsymbol</code><span>string</span></td>
+<td>Exchange tradingsymbol of the instrument</td>
+</tr>
+<tr>
+<td><code>exchange</code><span>string</span></td>
+<td>Exchange</td>
+</tr>
+<tr>
+<td><code>instrument_token</code><span>string</span></td>
+<td>The numerical identifier issued by the exchange representing the instrument. Used for subscribing to live market data over WebSocket</td>
+</tr>
+<tr>
+<td><code>transaction_type</code><span>string</span></td>
+<td>BUY or SELL</td>
+</tr>
+<tr>
+<td><code>product</code><span>string</span></td>
+<td>Margin product to use for the order (margins are blocked based on this) <a href="https://support.zerodha.com/category/trading-and-markets/product-and-order-types/product/articles/what-does-cnc-mis-and-nrml-mean">?</a></td>
+</tr>
+<tr>
+<td><code>average_price</code><span>float64</span></td>
+<td>Price at which the quantity was filled</td>
+</tr>
+<tr>
+<td><code>filled</code><span>int64</span></td>
+<td>Filled quantity</td>
+</tr>
+<tr>
+<td><code>fill_timestamp</code><span>string</span></td>
+<td>Timestamp at which the trade was filled at the exchange</td>
+</tr>
+<tr>
+<td><code>order_timestamp</code><span>string</span></td>
+<td>Timestamp at which the order was registered by the API</td>
+</tr>
+<tr>
+<td><code>exchange_timestamp</code><span>string</span></td>
+<td>Timestamp at which the order was registered by the exchange</td>
+</tr>
+</tbody>
+</table>
+<h2 id="retrieving-an-orders-trades">Retrieving an order's trades<a class="headerlink" href="#retrieving-an-orders-trades" title="Permanent link">&para;</a></h2>
+<p>This API returns the trades spawned and executed by a particular order.</p>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span><span class="s2">&quot;https://api.kite.trade/orders/200000000000000/trades&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">     </span>-H<span class="w"> </span><span class="s2">&quot;X-Kite-Version: 3&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">     </span>-H<span class="w"> </span><span class="s2">&quot;Authorization: token api_key:access_token&quot;</span>
+</code></pre></div>
+<div class="highlight"><pre><span></span><code><span class="p">{</span>
+<span class="w">  </span><span class="nt">&quot;status&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;success&quot;</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">&quot;data&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+<span class="w">    </span><span class="p">{</span>
+<span class="w">      </span><span class="nt">&quot;trade_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;10000000&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;order_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;200000000000000&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;exchange&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;MCX&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;tradingsymbol&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;GOLDPETAL21JUNFUT&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;instrument_token&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">58424839</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;product&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;NRML&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;average_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">4852</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;exchange_order_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;300000000000000&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;transaction_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;BUY&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;fill_timestamp&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;2021-05-31 16:00:36&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;order_timestamp&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;16:00:36&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;exchange_timestamp&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;2021-05-31 16:00:36&quot;</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">  </span><span class="p">]</span>
+<span class="p">}</span>
+</code></pre></div>
+
+
+
+
+
+                
+              </article>
+            </div>
+          
+          
+        </div>
+        
+      </main>
+      
+        <footer class="md-footer">
+  
+  <div class="md-footer-meta md-typeset">
+    <div class="md-footer-meta__inner md-grid">
+      <div class="md-copyright">
+  
+    <div class="md-copyright__highlight">
+      Copyright &copy; 2015 - 2025, Zerodha Technology Pvt. Ltd.
+    </div>
+  
+  
+    Made with
+    <a href="https://squidfunk.github.io/mkdocs-material/" target="_blank" rel="noopener">
+      Material for MkDocs
+    </a>
+  
+</div>
+      
+    </div>
+  </div>
+</footer>
+      
+    </div>
+    <div class="md-dialog" data-md-component="dialog">
+      <div class="md-dialog__inner md-typeset"></div>
+    </div>
+    
+    <script id="__config" type="application/json">{"base": "..", "features": [], "search": "../assets/javascripts/workers/search.74e28a9f.min.js", "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}}</script>
+    
+    
+      <script src="../assets/javascripts/bundle.220ee61c.min.js"></script>
+      
+    
+  </body>
+</html>

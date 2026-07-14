@@ -1,0 +1,1246 @@
+
+<!doctype html>
+<html lang="en" class="no-js">
+  <head>
+    
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      
+      
+      
+      
+        <link rel="prev" href="../exceptions/">
+      
+      
+        <link rel="next" href="../orders/">
+      
+      <link rel="icon" href="../images/favicon">
+      <meta name="generator" content="mkdocs-1.4.3, mkdocs-material-9.1.18">
+    
+    
+      
+        <title>User - Kite Connect 3 / API documentation</title>
+      
+    
+    
+      <link rel="stylesheet" href="../assets/stylesheets/main.26e3688c.min.css">
+      
+        
+        <link rel="stylesheet" href="../assets/stylesheets/palette.ecc896b0.min.css">
+      
+      
+
+    
+    
+    
+      
+        
+        
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+        <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Roboto:300,300i,400,400i,700,700i%7CRoboto+Mono:400,400i,700,700i&display=fallback">
+        <style>:root{--md-text-font:"Roboto";--md-code-font:"Roboto Mono"}</style>
+      
+    
+    
+      <link rel="stylesheet" href="../static/style.css">
+    
+    <script>__md_scope=new URL("..",location),__md_hash=e=>[...e].reduce((e,_)=>(e<<5)-e+_.charCodeAt(0),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
+    
+      
+
+    
+    
+    
+  </head>
+  
+  
+    
+    
+    
+    
+    
+    <body dir="ltr" data-md-color-scheme="default" data-md-color-primary="white" data-md-color-accent="red">
+  
+    
+    
+    <input class="md-toggle" data-md-toggle="drawer" type="checkbox" id="__drawer" autocomplete="off">
+    <input class="md-toggle" data-md-toggle="search" type="checkbox" id="__search" autocomplete="off">
+    <label class="md-overlay" for="__drawer"></label>
+    <div data-md-component="skip">
+      
+        
+        <a href="#user" class="md-skip">
+          Skip to content
+        </a>
+      
+    </div>
+    <div data-md-component="announce">
+      
+    </div>
+    
+    
+      
+
+  
+
+<header class="md-header md-header--shadow" data-md-component="header">
+  <nav class="md-header__inner md-grid" aria-label="Header">
+    <a href=".." title="Kite Connect 3 / API documentation" class="md-header__button md-logo" aria-label="Kite Connect 3 / API documentation" data-md-component="logo">
+      
+  <img src="../images/logo.svg" alt="logo">
+
+    </a>
+    <label class="md-header__button md-icon" for="__drawer">
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M3 6h18v2H3V6m0 5h18v2H3v-2m0 5h18v2H3v-2Z"/></svg>
+    </label>
+    <div class="md-header__title" data-md-component="header-title">
+      <div class="md-header__ellipsis">
+        <div class="md-header__topic">
+          <span class="md-ellipsis">
+            Kite Connect 3 / API documentation
+          </span>
+        </div>
+        <div class="md-header__topic" data-md-component="header-topic">
+          <span class="md-ellipsis">
+            
+              User
+            
+          </span>
+        </div>
+      </div>
+    </div>
+    
+      
+    
+    
+    
+      <label class="md-header__button md-icon" for="__search">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.516 6.516 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5Z"/></svg>
+      </label>
+      <div class="md-search" data-md-component="search" role="dialog">
+  <label class="md-search__overlay" for="__search"></label>
+  <div class="md-search__inner" role="search">
+    <form class="md-search__form" name="search">
+      <input type="text" class="md-search__input" name="query" aria-label="Search" placeholder="Search" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false" data-md-component="search-query" required>
+      <label class="md-search__icon md-icon" for="__search">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.516 6.516 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5Z"/></svg>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11h12Z"/></svg>
+      </label>
+      <nav class="md-search__options" aria-label="Search">
+        
+        <button type="reset" class="md-search__icon md-icon" title="Clear" aria-label="Clear" tabindex="-1">
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12 19 6.41Z"/></svg>
+        </button>
+      </nav>
+      
+    </form>
+    <div class="md-search__output">
+      <div class="md-search__scrollwrap" data-md-scrollfix>
+        <div class="md-search-result" data-md-component="search-result">
+          <div class="md-search-result__meta">
+            Initializing search
+          </div>
+          <ol class="md-search-result__list" role="presentation"></ol>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+    
+    
+  </nav>
+  
+</header>
+    
+    <div class="md-container" data-md-component="container">
+      
+      
+        
+          
+        
+      
+      <main class="md-main" data-md-component="main">
+        <div class="md-main__inner md-grid">
+          
+            
+              
+              <div class="md-sidebar md-sidebar--primary" data-md-component="sidebar" data-md-type="navigation" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+
+<nav class="md-nav md-nav--primary" aria-label="Navigation" data-md-level="0">
+  <label class="md-nav__title" for="__drawer">
+    <a href=".." title="Kite Connect 3 / API documentation" class="md-nav__button md-logo" aria-label="Kite Connect 3 / API documentation" data-md-component="logo">
+      
+  <img src="../images/logo.svg" alt="logo">
+
+    </a>
+    Kite Connect 3 / API documentation
+  </label>
+  
+  <ul class="md-nav__list" data-md-scrollfix>
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href=".." class="md-nav__link">
+        Introduction
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../sdks/" class="md-nav__link">
+        Libraries and SDKs
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../response-structure/" class="md-nav__link">
+        Response structure
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../exceptions/" class="md-nav__link">
+        Exceptions and errors
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+    
+  
+  
+    <li class="md-nav__item md-nav__item--active">
+      
+      <input class="md-nav__toggle md-toggle" type="checkbox" id="__toc">
+      
+      
+        
+      
+      
+        <label class="md-nav__link md-nav__link--active" for="__toc">
+          User
+          <span class="md-nav__icon md-icon"></span>
+        </label>
+      
+      <a href="./" class="md-nav__link md-nav__link--active">
+        User
+      </a>
+      
+        
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#login-flow" class="md-nav__link">
+    Login flow
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#authentication-and-token-exchange" class="md-nav__link">
+    Authentication and token exchange
+  </a>
+  
+    <nav class="md-nav" aria-label="Authentication and token exchange">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#request-parameters" class="md-nav__link">
+    Request parameters
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#response-attributes" class="md-nav__link">
+    Response attributes
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#signing-requests" class="md-nav__link">
+    Signing requests
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#user-profile" class="md-nav__link">
+    User profile
+  </a>
+  
+    <nav class="md-nav" aria-label="User profile">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#response-attributes_1" class="md-nav__link">
+    Response attributes
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#funds-and-margins" class="md-nav__link">
+    Funds and margins
+  </a>
+  
+    <nav class="md-nav" aria-label="Funds and margins">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#response-attributes_2" class="md-nav__link">
+    Response attributes
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#logout" class="md-nav__link">
+    Logout
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+      
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../orders/" class="md-nav__link">
+        Orders
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../gtt/" class="md-nav__link">
+        GTT orders
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../alerts/" class="md-nav__link">
+        Alerts
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../portfolio/" class="md-nav__link">
+        Portfolio
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../market-quotes/" class="md-nav__link">
+        Market quotes and instruments
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../websocket/" class="md-nav__link">
+        WebSocket streaming
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../historical/" class="md-nav__link">
+        Historical candle data
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../postbacks/" class="md-nav__link">
+        Postbacks / WebHooks
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../mutual-funds/" class="md-nav__link">
+        Mutual funds
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../margins/" class="md-nav__link">
+        Margin calculation
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../basket/" class="md-nav__link">
+        Publisher - Offsite orders
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../publisher/" class="md-nav__link">
+        Publisher JS plugin
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../apps/" class="md-nav__link">
+        Mobile and Desktop apps
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../changelog/" class="md-nav__link">
+        Changelog
+      </a>
+    </li>
+  
+
+    
+  </ul>
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+            
+              
+              <div class="md-sidebar md-sidebar--secondary" data-md-component="sidebar" data-md-type="toc" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#login-flow" class="md-nav__link">
+    Login flow
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#authentication-and-token-exchange" class="md-nav__link">
+    Authentication and token exchange
+  </a>
+  
+    <nav class="md-nav" aria-label="Authentication and token exchange">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#request-parameters" class="md-nav__link">
+    Request parameters
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#response-attributes" class="md-nav__link">
+    Response attributes
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#signing-requests" class="md-nav__link">
+    Signing requests
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#user-profile" class="md-nav__link">
+    User profile
+  </a>
+  
+    <nav class="md-nav" aria-label="User profile">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#response-attributes_1" class="md-nav__link">
+    Response attributes
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#funds-and-margins" class="md-nav__link">
+    Funds and margins
+  </a>
+  
+    <nav class="md-nav" aria-label="Funds and margins">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#response-attributes_2" class="md-nav__link">
+    Response attributes
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#logout" class="md-nav__link">
+    Logout
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+          
+          
+            <div class="md-content" data-md-component="content">
+              <article class="md-content__inner md-typeset">
+                
+                  
+
+
+<h1 id="user">User<a class="headerlink" href="#user" title="Permanent link">&para;</a></h1>
+<h2 id="login-flow">Login flow<a class="headerlink" href="#login-flow" title="Permanent link">&para;</a></h2>
+<p>The login flow starts by navigating to the public Kite login endpoint.</p>
+<blockquote>
+<p><strong><code>https://kite.zerodha.com/connect/login?v=3&amp;api_key=xxx</code></strong></p>
+</blockquote>
+<p>A successful login comes back with a <code>request_token</code> as a URL query parameter to the redirect URL registered on the developer console for that <code>api_key</code>. This <code>request_token</code>, along with a <code>checksum</code> (SHA-256 of <code>api_key + request_token + api_secret</code>) is POSTed to the token API to obtain an <code>access_token</code>, which is then used for signing all subsequent requests. In summary:</p>
+<ol>
+<li>Navigate to the Kite Connect login page with the api_key</li>
+<li>A successful login comes back with a <code>request_token</code> to the registered redirect URL</li>
+<li>POST the <code>request_token</code> and <code>checksum</code> (SHA-256 of <code>api_key + request_token + api_secret</code>) to <code>/session/token</code></li>
+<li>Obtain the <code>access_token</code> and use that with all subsequent requests</li>
+</ol>
+<blockquote>
+<p>An optional <code>redirect_params</code> param can be appended to public Kite login endpoint, that will be sent back to the redirect URL. The value is URL encoded query params string, eg: <code>some=X&amp;more=Y</code>). eg: <code>https://kite.zerodha.com/connect/login?v=3&amp;api_key=xxx&amp;redirect_params=some%3DX%26more%3DY</code></p>
+</blockquote>
+<p><a href="https://www.youtube.com/watch?v=9vzd289Eedk">Here's a webinar</a> that shows the login flow and other interactions.</p>
+<p><img alt="Kite Connect handshake flow" src="../images/kite-connect-flow.png" /></p>
+<div class="admonition warning">
+<p class="admonition-title">Warning</p>
+<p>Never expose your <code>api_secret</code> by embedding it in a mobile app or a client side application. Do not expose the <code>access_token</code> you obtain for a session to the public either.</p>
+</div>
+<table>
+<thead>
+<tr>
+<th>type</th>
+<th>endpoint</th>
+<th>&nbsp;</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>POST</td>
+<td><a href="#authentication-and-token-exchange">/session/token</a></td>
+<td>Authenticate and obtain the access_token after the login flow</td>
+</tr>
+<tr>
+<td>GET</td>
+<td><a href="#user-profile">/user/profile</a></td>
+<td>Retrieve the user profile</td>
+</tr>
+<tr>
+<td>GET</td>
+<td><a href="#funds-and-margins">/user/margins/:segment</a></td>
+<td>Retrieve detailed funds and margin information</td>
+</tr>
+<tr>
+<td>DELETE</td>
+<td><a href="#logout">/session/token</a></td>
+<td>Logout and invalidate the API session and access_token</td>
+</tr>
+</tbody>
+</table>
+<h2 id="authentication-and-token-exchange">Authentication and token exchange<a class="headerlink" href="#authentication-and-token-exchange" title="Permanent link">&para;</a></h2>
+<p>Once the <code>request_token</code> is obtained from the login flow, it should be POSTed to <code>/session/token</code> to complete the token exchange and retrieve the <code>access_token</code>.</p>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>https://api.kite.trade/session/token<span class="w"> </span><span class="se">\</span>
+<span class="w">   </span>-H<span class="w"> </span><span class="s2">&quot;X-Kite-Version: 3&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">   </span>-d<span class="w"> </span><span class="s2">&quot;api_key=xxx&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">   </span>-d<span class="w"> </span><span class="s2">&quot;request_token=yyy&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">   </span>-d<span class="w"> </span><span class="s2">&quot;checksum=zzz&quot;</span>
+</code></pre></div>
+<div class="highlight"><pre><span></span><code><span class="p">{</span>
+<span class="w">    </span><span class="nt">&quot;status&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;success&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;data&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="nt">&quot;user_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;individual&quot;</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;email&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;XXXXXX&quot;</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;user_name&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;Kite Connect&quot;</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;user_shortname&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;Connect&quot;</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;broker&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;ZERODHA&quot;</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;exchanges&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+<span class="w">            </span><span class="s2">&quot;NSE&quot;</span><span class="p">,</span>
+<span class="w">            </span><span class="s2">&quot;NFO&quot;</span><span class="p">,</span>
+<span class="w">            </span><span class="s2">&quot;BFO&quot;</span><span class="p">,</span>
+<span class="w">            </span><span class="s2">&quot;CDS&quot;</span><span class="p">,</span>
+<span class="w">            </span><span class="s2">&quot;BSE&quot;</span><span class="p">,</span>
+<span class="w">            </span><span class="s2">&quot;MCX&quot;</span><span class="p">,</span>
+<span class="w">            </span><span class="s2">&quot;BCD&quot;</span><span class="p">,</span>
+<span class="w">            </span><span class="s2">&quot;MF&quot;</span>
+<span class="w">        </span><span class="p">],</span>
+<span class="w">        </span><span class="nt">&quot;products&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+<span class="w">            </span><span class="s2">&quot;CNC&quot;</span><span class="p">,</span>
+<span class="w">            </span><span class="s2">&quot;NRML&quot;</span><span class="p">,</span>
+<span class="w">            </span><span class="s2">&quot;MIS&quot;</span><span class="p">,</span>
+<span class="w">            </span><span class="s2">&quot;BO&quot;</span><span class="p">,</span>
+<span class="w">            </span><span class="s2">&quot;CO&quot;</span>
+<span class="w">        </span><span class="p">],</span>
+<span class="w">        </span><span class="nt">&quot;order_types&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+<span class="w">            </span><span class="s2">&quot;MARKET&quot;</span><span class="p">,</span>
+<span class="w">            </span><span class="s2">&quot;LIMIT&quot;</span><span class="p">,</span>
+<span class="w">            </span><span class="s2">&quot;SL&quot;</span><span class="p">,</span>
+<span class="w">            </span><span class="s2">&quot;SL-M&quot;</span>
+<span class="w">        </span><span class="p">],</span>
+<span class="w">        </span><span class="nt">&quot;avatar_url&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;abc&quot;</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;user_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;XX0000&quot;</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;api_key&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;XXXXXX&quot;</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;access_token&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;XXXXXX&quot;</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;public_token&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;XXXXXXXX&quot;</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;enctoken&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;XXXXXX&quot;</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;refresh_token&quot;</span><span class="p">:</span><span class="w"> </span><span class="err">&#39;&#39;</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;silo&quot;</span><span class="p">:</span><span class="w"> </span><span class="err">&#39;&#39;</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;login_time&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;2021-01-01 16:15:14&quot;</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;meta&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="nt">&quot;demat_consent&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;physical&quot;</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+<h3 id="request-parameters">Request parameters<a class="headerlink" href="#request-parameters" title="Permanent link">&para;</a></h3>
+<table>
+<thead>
+<tr>
+<th>parameter</th>
+<th>&nbsp;</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>api_key</code></td>
+<td>The public API key</td>
+</tr>
+<tr>
+<td><code>request_token</code></td>
+<td>The one-time token obtained after the login flow. This token's lifetime is only a few minutes and it is meant to be exchanged for an <code>access_token</code> immediately after being obtained</td>
+</tr>
+<tr>
+<td><code>checksum</code></td>
+<td>SHA-256 hash of (api_key + request_token + api_secret)</td>
+</tr>
+</tbody>
+</table>
+<h3 id="response-attributes">Response attributes<a class="headerlink" href="#response-attributes" title="Permanent link">&para;</a></h3>
+<table>
+<thead>
+<tr>
+<th>attribute</th>
+<th>&nbsp;</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>user_id</code><span>string</span></td>
+<td>The unique, permanent user id registered with the broker and the exchanges</td>
+</tr>
+<tr>
+<td><code>user_name</code><span>string</span></td>
+<td>User's real name</td>
+</tr>
+<tr>
+<td><code>user_shortname</code><span>string</span></td>
+<td>Shortened version of the user's real name</td>
+</tr>
+<tr>
+<td><code>email</code><span>string</span></td>
+<td>User's email</td>
+</tr>
+<tr>
+<td><code>user_type</code><span>string</span></td>
+<td>User's registered role at the broker. This will be <code>individual</code> for all retail users</td>
+</tr>
+<tr>
+<td><code>broker</code><span>string</span></td>
+<td>The broker ID</td>
+</tr>
+<tr>
+<td><code>exchanges</code><span>string[]</span></td>
+<td>Exchanges enabled for trading on the user's account</td>
+</tr>
+<tr>
+<td><code>products</code><span>string[]</span></td>
+<td>Margin product types enabled for the user</td>
+</tr>
+<tr>
+<td><code>order_types</code><span>string[]</span></td>
+<td>Order types enabled for the user</td>
+</tr>
+<tr>
+<td><code>api_key</code><span>string</span></td>
+<td>The API key for which the authentication was performed</td>
+</tr>
+<tr>
+<td><code>access_token</code><span>string</span></td>
+<td>The authentication token that's used with every subsequent request Unless this is <a href="#logout">invalidated using the API</a>, or invalidated by a master-logout from the Kite Web trading terminal, it'll expire at <code>6 AM</code> on the next day (regulatory requirement)</td>
+</tr>
+<tr>
+<td><code>public_token</code><span>string</span></td>
+<td>A token for public session validation where requests may be exposed to the public</td>
+</tr>
+<tr>
+<td><code>refresh_token</code><span>string</span></td>
+<td>A token for getting long standing read permissions. This is only available to certain approved platforms</td>
+</tr>
+<tr>
+<td><code>login_time</code><span>string</span></td>
+<td>User's last login time</td>
+</tr>
+<tr>
+<td><code>meta</code><span>map</span></td>
+<td><code>demat_consent</code>: empty, consent or physical</td>
+</tr>
+<tr>
+<td><code>avatar_url</code><span>string</span></td>
+<td>Full URL to the user's avatar (PNG image) if there's one</td>
+</tr>
+</tbody>
+</table>
+<h3 id="signing-requests">Signing requests<a class="headerlink" href="#signing-requests" title="Permanent link">&para;</a></h3>
+<p>Once the authentication is complete, all requests should be signed with the HTTP <code>Authorization</code> header with <code>token</code> as the authorisation scheme, followed by a space, and then the <code>api_key:access_token</code> combination. For example:</p>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-H<span class="w"> </span><span class="s2">&quot;Authorization: token api_key:access_token&quot;</span>
+curl<span class="w"> </span>-H<span class="w"> </span><span class="s2">&quot;Authorization: token xxx:yyy&quot;</span>
+</code></pre></div>
+<h2 id="user-profile">User profile<a class="headerlink" href="#user-profile" title="Permanent link">&para;</a></h2>
+<p>While a successful token exchange returns the full user profile, it's possible to retrieve it any point of time with the <code>/user/profile</code> API. Do note that the profile API does not return any of the tokens.</p>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>https://api.kite.trade/user/profile<span class="w"> </span><span class="se">\</span>
+<span class="w">   </span>-H<span class="w"> </span><span class="s2">&quot;X-Kite-Version: 3&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">   </span>-H<span class="w"> </span><span class="s2">&quot;Authorization: token api_key:access_token&quot;</span>
+</code></pre></div>
+<div class="highlight"><pre><span></span><code><span class="p">{</span>
+<span class="w">  </span><span class="nt">&quot;status&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;success&quot;</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">&quot;data&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="nt">&quot;user_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;AB1234&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;user_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;individual&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;email&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;<a href="/cdn-cgi/l/email-protection" class="__cf_email__" data-cfemail="cab2b2b2b3b3b38aada7aba3a6e4a9a5a7">[email&#160;protected]</a>&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;user_name&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;AxAx Bxx&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;user_shortname&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;AxAx&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;broker&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;ZERODHA&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;exchanges&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+<span class="w">      </span><span class="s2">&quot;BFO&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="s2">&quot;MCX&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="s2">&quot;NSE&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="s2">&quot;CDS&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="s2">&quot;BSE&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="s2">&quot;BCD&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="s2">&quot;MF&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="s2">&quot;NFO&quot;</span>
+<span class="w">    </span><span class="p">],</span>
+<span class="w">    </span><span class="nt">&quot;products&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+<span class="w">      </span><span class="s2">&quot;CNC&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="s2">&quot;NRML&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="s2">&quot;MIS&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="s2">&quot;BO&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="s2">&quot;CO&quot;</span>
+<span class="w">    </span><span class="p">],</span>
+<span class="w">    </span><span class="nt">&quot;order_types&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+<span class="w">      </span><span class="s2">&quot;MARKET&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="s2">&quot;LIMIT&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="s2">&quot;SL&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="s2">&quot;SL-M&quot;</span>
+<span class="w">    </span><span class="p">],</span>
+<span class="w">    </span><span class="nt">&quot;avatar_url&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;meta&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">      </span><span class="nt">&quot;demat_consent&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;physical&quot;</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">  </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+<h3 id="response-attributes_1">Response attributes<a class="headerlink" href="#response-attributes_1" title="Permanent link">&para;</a></h3>
+<table>
+<thead>
+<tr>
+<th>attribute</th>
+<th>&nbsp;</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>user_id</code><span>string</span></td>
+<td>The unique, permanent user id registered with the broker and the exchanges</td>
+</tr>
+<tr>
+<td><code>user_name</code><span>string</span></td>
+<td>User's real name</td>
+</tr>
+<tr>
+<td><code>user_shortname</code><span>string</span></td>
+<td>Shortened version of the user's real name</td>
+</tr>
+<tr>
+<td><code>email</code><span>string</span></td>
+<td>User's email</td>
+</tr>
+<tr>
+<td><code>user_type</code><span>string</span></td>
+<td>User's registered role at the broker. This will be <code>individual</code> for all retail users</td>
+</tr>
+<tr>
+<td><code>broker</code><span>string</span></td>
+<td>The broker ID</td>
+</tr>
+<tr>
+<td><code>exchanges</code><span>string[]</span></td>
+<td>Exchanges enabled for trading on the user's account</td>
+</tr>
+<tr>
+<td><code>products</code><span>string[]</span></td>
+<td>Margin product types enabled for the user</td>
+</tr>
+<tr>
+<td><code>order_types</code><span>string[]</span></td>
+<td>Order types enabled for the user</td>
+</tr>
+<tr>
+<td><code>meta</code><span>map</span></td>
+<td><code>demat_consent</code>: empty, consent or physical</td>
+</tr>
+<tr>
+<td><code>avatar_url</code><span>string</span></td>
+<td>Full URL to the user's avatar (PNG image) if there's one</td>
+</tr>
+</tbody>
+</table>
+<h2 id="funds-and-margins">Funds and margins<a class="headerlink" href="#funds-and-margins" title="Permanent link">&para;</a></h2>
+<p>A GET request to <code>/user/margins</code> returns funds, cash, and margin information for the user for equity and commodity segments.</p>
+<p>A GET request to <code>/user/margins/:segment</code> returns funds, cash, and margin information for the user. <code>segment</code> in the URI can be either <code>equity</code> or <code>commodity</code>.</p>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span><span class="s2">&quot;https://api.kite.trade/user/margins&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-H<span class="w"> </span><span class="s2">&quot;X-Kite-Version: 3&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-H<span class="w"> </span><span class="s2">&quot;Authorization: token api_key:access_token&quot;</span>
+</code></pre></div>
+<div class="highlight"><pre><span></span><code><span class="p">{</span>
+<span class="w">    </span><span class="nt">&quot;status&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;success&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;data&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">      </span><span class="nt">&quot;equity&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="nt">&quot;enabled&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;net&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">99725.05000000002</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;available&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">          </span><span class="nt">&quot;adhoc_margin&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">          </span><span class="nt">&quot;cash&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">245431.6</span><span class="p">,</span>
+<span class="w">          </span><span class="nt">&quot;opening_balance&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">245431.6</span><span class="p">,</span>
+<span class="w">          </span><span class="nt">&quot;live_balance&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">99725.05000000002</span><span class="p">,</span>
+<span class="w">          </span><span class="nt">&quot;collateral&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">          </span><span class="nt">&quot;intraday_payin&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span>
+<span class="w">        </span><span class="p">},</span>
+<span class="w">        </span><span class="nt">&quot;utilised&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">          </span><span class="nt">&quot;debits&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">145706.55</span><span class="p">,</span>
+<span class="w">          </span><span class="nt">&quot;exposure&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">38981.25</span><span class="p">,</span>
+<span class="w">          </span><span class="nt">&quot;m2m_realised&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">761.7</span><span class="p">,</span>
+<span class="w">          </span><span class="nt">&quot;m2m_unrealised&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">          </span><span class="nt">&quot;option_premium&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">          </span><span class="nt">&quot;payout&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">          </span><span class="nt">&quot;span&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">101989</span><span class="p">,</span>
+<span class="w">          </span><span class="nt">&quot;holding_sales&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">          </span><span class="nt">&quot;turnover&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">          </span><span class="nt">&quot;liquid_collateral&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">          </span><span class="nt">&quot;stock_collateral&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">          </span><span class="nt">&quot;delivery&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="w">      </span><span class="p">},</span>
+<span class="w">      </span><span class="nt">&quot;commodity&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="nt">&quot;enabled&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;net&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">100661.7</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;available&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">          </span><span class="nt">&quot;adhoc_margin&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">          </span><span class="nt">&quot;cash&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">100661.7</span><span class="p">,</span>
+<span class="w">          </span><span class="nt">&quot;opening_balance&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">100661.7</span><span class="p">,</span>
+<span class="w">          </span><span class="nt">&quot;live_balance&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">100661.7</span><span class="p">,</span>
+<span class="w">          </span><span class="nt">&quot;collateral&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">          </span><span class="nt">&quot;intraday_payin&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span>
+<span class="w">        </span><span class="p">},</span>
+<span class="w">        </span><span class="nt">&quot;utilised&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">          </span><span class="nt">&quot;debits&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">          </span><span class="nt">&quot;exposure&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">          </span><span class="nt">&quot;m2m_realised&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">          </span><span class="nt">&quot;m2m_unrealised&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">          </span><span class="nt">&quot;option_premium&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">          </span><span class="nt">&quot;payout&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">          </span><span class="nt">&quot;span&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">          </span><span class="nt">&quot;holding_sales&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">          </span><span class="nt">&quot;turnover&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">          </span><span class="nt">&quot;liquid_collateral&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">          </span><span class="nt">&quot;stock_collateral&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">          </span><span class="nt">&quot;delivery&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="w">      </span><span class="p">}</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">  </span><span class="p">}</span>
+</code></pre></div>
+<h3 id="response-attributes_2">Response attributes<a class="headerlink" href="#response-attributes_2" title="Permanent link">&para;</a></h3>
+<table>
+<thead>
+<tr>
+<th>attribute</th>
+<th>&nbsp;</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>enabled</code><span>bool</span></td>
+<td>Indicates whether the segment is enabled for the user</td>
+</tr>
+<tr>
+<td><code>net</code><span>float64</span></td>
+<td>Net cash balance available for trading (<code>intraday_payin</code> + <code>adhoc_margin</code> + <code>collateral</code>)</td>
+</tr>
+<tr>
+<td><code>available.cash</code><span>float64</span></td>
+<td>Raw cash balance in the account available for trading (also includes <code>intraday_payin</code>)</td>
+</tr>
+<tr>
+<td><code>available.opening_balance</code><span>float64</span></td>
+<td>Opening balance at the day start</td>
+</tr>
+<tr>
+<td><code>available.live_balance</code><span>float64</span></td>
+<td>Current available balance</td>
+</tr>
+<tr>
+<td><code>available.intraday_payin</code><span>float64</span></td>
+<td>Amount that was deposited during the day</td>
+</tr>
+<tr>
+<td><code>available.adhoc_margin</code><span>float64</span></td>
+<td>Additional margin provided by the broker</td>
+</tr>
+<tr>
+<td><code>available.collateral</code><span>float64</span></td>
+<td>Margin derived from pledged stocks</td>
+</tr>
+<tr>
+<td><code>utilised.m2m_unrealised</code><span>float64</span></td>
+<td>Un-booked (open) intraday profits and losses</td>
+</tr>
+<tr>
+<td><code>utilised.m2m_realised</code><span>float64</span></td>
+<td>Booked intraday profits and losses</td>
+</tr>
+<tr>
+<td><code>utilised.debits</code><span>float64</span></td>
+<td>Sum of all utilised margins (unrealised M2M + realised M2M + SPAN + Exposure + Premium + Holding sales)</td>
+</tr>
+<tr>
+<td><code>utilised.span</code><span>float64</span></td>
+<td>SPAN margin blocked for all open F&amp;O positions</td>
+</tr>
+<tr>
+<td><code>utilised.option_premium</code><span>float64</span></td>
+<td>Value of options premium received by shorting</td>
+</tr>
+<tr>
+<td><code>utilised.holding_sales</code><span>float64</span></td>
+<td>Value of holdings sold during the day</td>
+</tr>
+<tr>
+<td><code>utilised.exposure</code><span>float64</span></td>
+<td>Exposure margin blocked for all open F&amp;O positions</td>
+</tr>
+<tr>
+<td><code>utilised.liquid_collateral</code><span>float64</span></td>
+<td>Margin utilised against pledged liquidbees ETFs and liquid mutual funds</td>
+</tr>
+<tr>
+<td><code>utilised.delivery</code><span>float64</span></td>
+<td>Margin blocked when you sell securities (20% of the value of stocks sold) from your demat or T1 holdings</td>
+</tr>
+<tr>
+<td><code>utilised.stock_collateral</code><span>float64</span></td>
+<td>Margin utilised against pledged stocks/ETFs</td>
+</tr>
+<tr>
+<td><code>utilised.turnover</code><span>float64</span></td>
+<td>Utilised portion of the maximum turnover limit (only applicable to certain clients)</td>
+</tr>
+<tr>
+<td><code>utilised.payout</code><span>float64</span></td>
+<td>Funds paid out or withdrawn to bank account during the day</td>
+</tr>
+</tbody>
+</table>
+<h2 id="logout">Logout<a class="headerlink" href="#logout" title="Permanent link">&para;</a></h2>
+<p>This call invalidates the access_token and destroys the API session. After this, the user should be sent through a new login flow before further interactions. This does not log the user out of the official Kite web or mobile applications.</p>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>--request<span class="w"> </span>DELETE<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-H<span class="w"> </span><span class="s2">&quot;X-Kite-Version: 3&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span><span class="s2">&quot;https://api.kite.trade/session/token?api_key=xxx&amp;access_token=yyy&quot;</span>
+</code></pre></div>
+<div class="highlight"><pre><span></span><code><span class="p">{</span>
+<span class="w">  </span><span class="nt">&quot;status&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;success&quot;</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">&quot;data&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span>
+<span class="p">}</span>
+</code></pre></div>
+
+
+
+
+
+                
+              </article>
+            </div>
+          
+          
+        </div>
+        
+      </main>
+      
+        <footer class="md-footer">
+  
+  <div class="md-footer-meta md-typeset">
+    <div class="md-footer-meta__inner md-grid">
+      <div class="md-copyright">
+  
+    <div class="md-copyright__highlight">
+      Copyright &copy; 2015 - 2025, Zerodha Technology Pvt. Ltd.
+    </div>
+  
+  
+    Made with
+    <a href="https://squidfunk.github.io/mkdocs-material/" target="_blank" rel="noopener">
+      Material for MkDocs
+    </a>
+  
+</div>
+      
+    </div>
+  </div>
+</footer>
+      
+    </div>
+    <div class="md-dialog" data-md-component="dialog">
+      <div class="md-dialog__inner md-typeset"></div>
+    </div>
+    
+    <script data-cfasync="false" src="/cdn-cgi/scripts/5c5dd728/cloudflare-static/email-decode.min.js"></script><script id="__config" type="application/json">{"base": "..", "features": [], "search": "../assets/javascripts/workers/search.74e28a9f.min.js", "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}}</script>
+    
+    
+      <script src="../assets/javascripts/bundle.220ee61c.min.js"></script>
+      
+    
+  </body>
+</html>

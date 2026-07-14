@@ -1,0 +1,957 @@
+
+<!doctype html>
+<html lang="en" class="no-js">
+  <head>
+    
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      
+      
+      
+      
+        <link rel="prev" href="../basket/">
+      
+      
+        <link rel="next" href="../apps/">
+      
+      <link rel="icon" href="../images/favicon">
+      <meta name="generator" content="mkdocs-1.4.3, mkdocs-material-9.1.18">
+    
+    
+      
+        <title>Publisher JS plugin - Kite Connect 3 / API documentation</title>
+      
+    
+    
+      <link rel="stylesheet" href="../assets/stylesheets/main.26e3688c.min.css">
+      
+        
+        <link rel="stylesheet" href="../assets/stylesheets/palette.ecc896b0.min.css">
+      
+      
+
+    
+    
+    
+      
+        
+        
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+        <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Roboto:300,300i,400,400i,700,700i%7CRoboto+Mono:400,400i,700,700i&display=fallback">
+        <style>:root{--md-text-font:"Roboto";--md-code-font:"Roboto Mono"}</style>
+      
+    
+    
+      <link rel="stylesheet" href="../static/style.css">
+    
+    <script>__md_scope=new URL("..",location),__md_hash=e=>[...e].reduce((e,_)=>(e<<5)-e+_.charCodeAt(0),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
+    
+      
+
+    
+    
+    
+  </head>
+  
+  
+    
+    
+    
+    
+    
+    <body dir="ltr" data-md-color-scheme="default" data-md-color-primary="white" data-md-color-accent="red">
+  
+    
+    
+    <input class="md-toggle" data-md-toggle="drawer" type="checkbox" id="__drawer" autocomplete="off">
+    <input class="md-toggle" data-md-toggle="search" type="checkbox" id="__search" autocomplete="off">
+    <label class="md-overlay" for="__drawer"></label>
+    <div data-md-component="skip">
+      
+        
+        <a href="#publisher-js-plugin" class="md-skip">
+          Skip to content
+        </a>
+      
+    </div>
+    <div data-md-component="announce">
+      
+    </div>
+    
+    
+      
+
+  
+
+<header class="md-header md-header--shadow" data-md-component="header">
+  <nav class="md-header__inner md-grid" aria-label="Header">
+    <a href=".." title="Kite Connect 3 / API documentation" class="md-header__button md-logo" aria-label="Kite Connect 3 / API documentation" data-md-component="logo">
+      
+  <img src="../images/logo.svg" alt="logo">
+
+    </a>
+    <label class="md-header__button md-icon" for="__drawer">
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M3 6h18v2H3V6m0 5h18v2H3v-2m0 5h18v2H3v-2Z"/></svg>
+    </label>
+    <div class="md-header__title" data-md-component="header-title">
+      <div class="md-header__ellipsis">
+        <div class="md-header__topic">
+          <span class="md-ellipsis">
+            Kite Connect 3 / API documentation
+          </span>
+        </div>
+        <div class="md-header__topic" data-md-component="header-topic">
+          <span class="md-ellipsis">
+            
+              Publisher JS plugin
+            
+          </span>
+        </div>
+      </div>
+    </div>
+    
+      
+    
+    
+    
+      <label class="md-header__button md-icon" for="__search">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.516 6.516 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5Z"/></svg>
+      </label>
+      <div class="md-search" data-md-component="search" role="dialog">
+  <label class="md-search__overlay" for="__search"></label>
+  <div class="md-search__inner" role="search">
+    <form class="md-search__form" name="search">
+      <input type="text" class="md-search__input" name="query" aria-label="Search" placeholder="Search" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false" data-md-component="search-query" required>
+      <label class="md-search__icon md-icon" for="__search">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.516 6.516 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5Z"/></svg>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11h12Z"/></svg>
+      </label>
+      <nav class="md-search__options" aria-label="Search">
+        
+        <button type="reset" class="md-search__icon md-icon" title="Clear" aria-label="Clear" tabindex="-1">
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12 19 6.41Z"/></svg>
+        </button>
+      </nav>
+      
+    </form>
+    <div class="md-search__output">
+      <div class="md-search__scrollwrap" data-md-scrollfix>
+        <div class="md-search-result" data-md-component="search-result">
+          <div class="md-search-result__meta">
+            Initializing search
+          </div>
+          <ol class="md-search-result__list" role="presentation"></ol>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+    
+    
+  </nav>
+  
+</header>
+    
+    <div class="md-container" data-md-component="container">
+      
+      
+        
+          
+        
+      
+      <main class="md-main" data-md-component="main">
+        <div class="md-main__inner md-grid">
+          
+            
+              
+              <div class="md-sidebar md-sidebar--primary" data-md-component="sidebar" data-md-type="navigation" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+
+<nav class="md-nav md-nav--primary" aria-label="Navigation" data-md-level="0">
+  <label class="md-nav__title" for="__drawer">
+    <a href=".." title="Kite Connect 3 / API documentation" class="md-nav__button md-logo" aria-label="Kite Connect 3 / API documentation" data-md-component="logo">
+      
+  <img src="../images/logo.svg" alt="logo">
+
+    </a>
+    Kite Connect 3 / API documentation
+  </label>
+  
+  <ul class="md-nav__list" data-md-scrollfix>
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href=".." class="md-nav__link">
+        Introduction
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../sdks/" class="md-nav__link">
+        Libraries and SDKs
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../response-structure/" class="md-nav__link">
+        Response structure
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../exceptions/" class="md-nav__link">
+        Exceptions and errors
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../user/" class="md-nav__link">
+        User
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../orders/" class="md-nav__link">
+        Orders
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../gtt/" class="md-nav__link">
+        GTT orders
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../alerts/" class="md-nav__link">
+        Alerts
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../portfolio/" class="md-nav__link">
+        Portfolio
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../market-quotes/" class="md-nav__link">
+        Market quotes and instruments
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../websocket/" class="md-nav__link">
+        WebSocket streaming
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../historical/" class="md-nav__link">
+        Historical candle data
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../postbacks/" class="md-nav__link">
+        Postbacks / WebHooks
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../mutual-funds/" class="md-nav__link">
+        Mutual funds
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../margins/" class="md-nav__link">
+        Margin calculation
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../basket/" class="md-nav__link">
+        Publisher - Offsite orders
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+    
+  
+  
+    <li class="md-nav__item md-nav__item--active">
+      
+      <input class="md-nav__toggle md-toggle" type="checkbox" id="__toc">
+      
+      
+        
+      
+      
+        <label class="md-nav__link md-nav__link--active" for="__toc">
+          Publisher JS plugin
+          <span class="md-nav__icon md-icon"></span>
+        </label>
+      
+      <a href="./" class="md-nav__link md-nav__link--active">
+        Publisher JS plugin
+      </a>
+      
+        
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#getting-started" class="md-nav__link">
+    Getting started
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#branded-html5-buttons" class="md-nav__link">
+    Branded HTML5 buttons
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#custom-html5-buttons" class="md-nav__link">
+    Custom HTML5 buttons
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#generating-dynamic-buttons-with-javascript" class="md-nav__link">
+    Generating dynamic buttons with Javascript
+  </a>
+  
+    <nav class="md-nav" aria-label="Generating dynamic buttons with Javascript">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#parameters" class="md-nav__link">
+    Parameters
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#methods" class="md-nav__link">
+    Methods
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+      
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../apps/" class="md-nav__link">
+        Mobile and Desktop apps
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../changelog/" class="md-nav__link">
+        Changelog
+      </a>
+    </li>
+  
+
+    
+  </ul>
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+            
+              
+              <div class="md-sidebar md-sidebar--secondary" data-md-component="sidebar" data-md-type="toc" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#getting-started" class="md-nav__link">
+    Getting started
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#branded-html5-buttons" class="md-nav__link">
+    Branded HTML5 buttons
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#custom-html5-buttons" class="md-nav__link">
+    Custom HTML5 buttons
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#generating-dynamic-buttons-with-javascript" class="md-nav__link">
+    Generating dynamic buttons with Javascript
+  </a>
+  
+    <nav class="md-nav" aria-label="Generating dynamic buttons with Javascript">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#parameters" class="md-nav__link">
+    Parameters
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#methods" class="md-nav__link">
+    Methods
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+          
+          
+            <div class="md-content" data-md-component="content">
+              <article class="md-content__inner md-typeset">
+                
+                  
+
+
+<h1 id="publisher-js-plugin">Publisher JS Plugin<a class="headerlink" href="#publisher-js-plugin" title="Permanent link">&para;</a></h1>
+<div class="admonition warning">
+<p class="admonition-title">Warning</p>
+<p>The publisher JS plugin will not function in the iOS WebView due to Safari's new cookie policy, which blocks cross-domain cookie management in iframes. You will need to implement <a href="../basket/">offsite order execution</a>. We recommend using <a href="../basket/">offsite order execution</a> for all <a href="https://kite.trade/publisher/">Kite Publisher</a> use cases.</p>
+</div>
+<p>The <a href="https://kite.trade/publisher">Kite Publisher</a> Javascript plugin lets you add one-click trade buttons to your webpage. It works like a basket combined with a payment gateway, where an inline popup opens on your webpage, guides the user through a trade, and lands the user back on your page. As described in the offsite order execution section, it is possible to capture the <code>request_token</code> from this flow to start a Kite Connect session as well.</p>
+<p>You can add one or more stocks to the basket (maximum 10) dynamically using the Javascript plugin, or embed simple static buttons using plain HTML.</p>
+<h2 id="getting-started">Getting started<a class="headerlink" href="#getting-started" title="Permanent link">&para;</a></h2>
+<div class="highlight"><pre><span></span><code><span class="p">&lt;</span><span class="nt">script</span> <span class="na">src</span><span class="o">=</span><span class="s">&quot;https://kite.trade/publisher.js?v=3&quot;</span><span class="p">&gt;&lt;/</span><span class="nt">script</span><span class="p">&gt;</span>
+</code></pre></div>
+<p>Include Kite Publisher on your webpage by pasting the following script tag at the end of your webpage, just before the closing <code>&lt;/body&gt;</code> tag. You only need to include this once to render any number of buttons on a page.</p>
+<h2 id="branded-html5-buttons">Branded HTML5 buttons<a class="headerlink" href="#branded-html5-buttons" title="Permanent link">&para;</a></h2>
+<div class="highlight"><pre><span></span><code><span class="cm">&lt;!--  A link that initiates a buy (market) of the SBIN stock //--&gt;</span>
+<span class="p">&lt;</span><span class="nt">kite-button</span>
+  <span class="na">href</span><span class="o">=</span><span class="s">&quot;#&quot;</span>
+  <span class="na">data-kite</span><span class="o">=</span><span class="s">&quot;your_api_key&quot;</span>
+  <span class="na">data-exchange</span><span class="o">=</span><span class="s">&quot;NSE&quot;</span>
+  <span class="na">data-tradingsymbol</span><span class="o">=</span><span class="s">&quot;SBIN&quot;</span>
+  <span class="na">data-transaction_type</span><span class="o">=</span><span class="s">&quot;BUY&quot;</span>
+  <span class="na">data-quantity</span><span class="o">=</span><span class="s">&quot;1&quot;</span>
+  <span class="na">data-order_type</span><span class="o">=</span><span class="s">&quot;MARKET&quot;</span>
+  <span class="p">&gt;</span>Buy SBI stock<span class="p">&lt;/</span><span class="nt">kite-button</span>
+<span class="p">&gt;</span>
+</code></pre></div>
+<p>You can use the custom <code>&lt;kite-button&gt;</code> HTML5 tag to render branded Kite buttons that initiate a trade with a single click. The branded buttons work in a similar fashion to social media buttons, and you can include as many as you want on a page.</p>
+<h2 id="custom-html5-buttons">Custom HTML5 buttons<a class="headerlink" href="#custom-html5-buttons" title="Permanent link">&para;</a></h2>
+<div class="highlight"><pre><span></span><code><span class="cm">&lt;!--  A link that initiates a buy (market) of the SBIN stock //--&gt;</span>
+<span class="p">&lt;</span><span class="nt">a</span>
+  <span class="na">href</span><span class="o">=</span><span class="s">&quot;#&quot;</span>
+  <span class="na">data-kite</span><span class="o">=</span><span class="s">&quot;your_api_key&quot;</span>
+  <span class="na">data-exchange</span><span class="o">=</span><span class="s">&quot;NSE&quot;</span>
+  <span class="na">data-tradingsymbol</span><span class="o">=</span><span class="s">&quot;SBIN&quot;</span>
+  <span class="na">data-transaction_type</span><span class="o">=</span><span class="s">&quot;BUY&quot;</span>
+  <span class="na">data-quantity</span><span class="o">=</span><span class="s">&quot;1&quot;</span>
+  <span class="na">data-order_type</span><span class="o">=</span><span class="s">&quot;MARKET&quot;</span>
+  <span class="p">&gt;</span>Buy SBI stock<span class="p">&lt;/</span><span class="nt">a</span>
+<span class="p">&gt;</span>
+
+<span class="cm">&lt;!--  A button that initiates a sell (LIMIT) of the RELIANCE stock //--&gt;</span>
+<span class="p">&lt;</span><span class="nt">button</span>
+  <span class="na">data-kite</span><span class="o">=</span><span class="s">&quot;your_api_key&quot;</span>
+  <span class="na">data-exchange</span><span class="o">=</span><span class="s">&quot;NSE&quot;</span>
+  <span class="na">data-tradingsymbol</span><span class="o">=</span><span class="s">&quot;RELIANCE&quot;</span>
+  <span class="na">data-transaction_type</span><span class="o">=</span><span class="s">&quot;SELL&quot;</span>
+  <span class="na">data-quantity</span><span class="o">=</span><span class="s">&quot;1&quot;</span>
+  <span class="na">data-order_type</span><span class="o">=</span><span class="s">&quot;LIMIT&quot;</span>
+  <span class="na">data-price</span><span class="o">=</span><span class="s">&quot;100&quot;</span>
+<span class="p">&gt;</span>
+  Buy RELIANCE
+<span class="p">&lt;/</span><span class="nt">button</span><span class="p">&gt;</span>
+
+<span class="cm">&lt;!--  A button that initiates a CO of the RELIANCE stock //--&gt;</span>
+<span class="p">&lt;</span><span class="nt">button</span>
+  <span class="na">data-kite</span><span class="o">=</span><span class="s">&quot;your_api_key&quot;</span>
+  <span class="na">data-exchange</span><span class="o">=</span><span class="s">&quot;NSE&quot;</span>
+  <span class="na">data-tradingsymbol</span><span class="o">=</span><span class="s">&quot;RELIANCE&quot;</span>
+  <span class="na">data-transaction_type</span><span class="o">=</span><span class="s">&quot;BUY&quot;</span>
+  <span class="na">data-quantity</span><span class="o">=</span><span class="s">&quot;1&quot;</span>
+  <span class="na">data-order_type</span><span class="o">=</span><span class="s">&quot;LIMIT&quot;</span>
+  <span class="na">data-variety</span><span class="o">=</span><span class="s">&quot;co&quot;</span>
+  <span class="na">data-product</span><span class="o">=</span><span class="s">&quot;MIS&quot;</span>
+  <span class="na">data-price</span><span class="o">=</span><span class="s">&quot;915&quot;</span>
+  <span class="na">data-trigger_price</span><span class="o">=</span><span class="s">&quot;910&quot;</span>
+<span class="p">&gt;</span>
+  Buy RELIANCE (Cover Order)
+<span class="p">&lt;/</span><span class="nt">button</span><span class="p">&gt;</span>
+</code></pre></div>
+<p>You can use the HTML5 data attributes on any HTML element and turn it into a trade button which gets invoked with a single click. The examples on the right show a link and a button being turned into trade buttons.</p>
+<h2 id="generating-dynamic-buttons-with-javascript">Generating dynamic buttons with Javascript<a class="headerlink" href="#generating-dynamic-buttons-with-javascript" title="Permanent link">&para;</a></h2>
+<div class="highlight"><pre><span></span><code><span class="cm">&lt;!-- A Kite button will be generated inside this container //--&gt;</span>
+<span class="p">&lt;</span><span class="nt">p</span> <span class="na">id</span><span class="o">=</span><span class="s">&quot;default-button&quot;</span><span class="p">&gt;&lt;/</span><span class="nt">p</span><span class="p">&gt;</span>
+
+<span class="cm">&lt;!-- The basket will be linked to this element&#39;s onClick //--&gt;</span>
+<span class="p">&lt;</span><span class="nt">button</span> <span class="na">id</span><span class="o">=</span><span class="s">&quot;custom-button&quot;</span><span class="p">&gt;</span>Buy the basket<span class="p">&lt;/</span><span class="nt">button</span><span class="p">&gt;</span>
+
+<span class="cm">&lt;!-- Include the plugin //--&gt;</span>
+<span class="p">&lt;</span><span class="nt">script</span> <span class="na">src</span><span class="o">=</span><span class="s">&quot;https://kite.trade/publisher.js?v=3&quot;</span><span class="p">&gt;&lt;/</span><span class="nt">script</span><span class="p">&gt;</span>
+
+<span class="p">&lt;</span><span class="nt">script</span><span class="p">&gt;</span>
+<span class="w">  </span><span class="c1">// Only run your custom code once KiteConnect has fully initialised.</span>
+<span class="w">  </span><span class="c1">// Use KiteConnect.ready() to achieve this.</span>
+<span class="w">  </span><span class="nx">KiteConnect</span><span class="p">.</span><span class="nx">ready</span><span class="p">(</span><span class="kd">function</span><span class="w"> </span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="c1">// Initialize a new Kite instance.</span>
+<span class="w">    </span><span class="c1">// You can initialize multiple instances if you need.</span>
+<span class="w">    </span><span class="kd">var</span><span class="w"> </span><span class="nx">kite</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="ow">new</span><span class="w"> </span><span class="nx">KiteConnect</span><span class="p">(</span><span class="s2">&quot;your_api_key&quot;</span><span class="p">);</span>
+
+<span class="w">    </span><span class="c1">// Add a stock to the basket</span>
+<span class="w">    </span><span class="nx">kite</span><span class="p">.</span><span class="nx">add</span><span class="p">({</span>
+<span class="w">      </span><span class="nx">exchange</span><span class="o">:</span><span class="w"> </span><span class="s2">&quot;NSE&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nx">tradingsymbol</span><span class="o">:</span><span class="w"> </span><span class="s2">&quot;INFY&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nx">quantity</span><span class="o">:</span><span class="w"> </span><span class="mf">5</span><span class="p">,</span>
+<span class="w">      </span><span class="nx">transaction_type</span><span class="o">:</span><span class="w"> </span><span class="s2">&quot;BUY&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nx">order_type</span><span class="o">:</span><span class="w"> </span><span class="s2">&quot;MARKET&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="p">});</span>
+
+<span class="w">    </span><span class="c1">// Add another stock</span>
+<span class="w">    </span><span class="nx">kite</span><span class="p">.</span><span class="nx">add</span><span class="p">({</span>
+<span class="w">      </span><span class="nx">exchange</span><span class="o">:</span><span class="w"> </span><span class="s2">&quot;NSE&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nx">tradingsymbol</span><span class="o">:</span><span class="w"> </span><span class="s2">&quot;SBIN&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nx">quantity</span><span class="o">:</span><span class="w"> </span><span class="mf">1</span><span class="p">,</span>
+<span class="w">      </span><span class="nx">order_type</span><span class="o">:</span><span class="w"> </span><span class="s2">&quot;LIMIT&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nx">transaction_type</span><span class="o">:</span><span class="w"> </span><span class="s2">&quot;SELL&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nx">price</span><span class="o">:</span><span class="w"> </span><span class="mf">105</span><span class="p">,</span>
+<span class="w">    </span><span class="p">});</span>
+
+<span class="w">    </span><span class="c1">// Add a Cover Order</span>
+<span class="w">    </span><span class="nx">kite</span><span class="p">.</span><span class="nx">add</span><span class="p">({</span>
+<span class="w">      </span><span class="nx">tradingsymbol</span><span class="o">:</span><span class="w"> </span><span class="s2">&quot;RELIANCE&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nx">exchange</span><span class="o">:</span><span class="w"> </span><span class="s2">&quot;NSE&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nx">transaction_type</span><span class="o">:</span><span class="w"> </span><span class="s2">&quot;BUY&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nx">order_type</span><span class="o">:</span><span class="w"> </span><span class="s2">&quot;LIMIT&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nx">product</span><span class="o">:</span><span class="w"> </span><span class="s2">&quot;MIS&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nx">price</span><span class="o">:</span><span class="w"> </span><span class="mf">915.15</span><span class="p">,</span>
+<span class="w">      </span><span class="nx">quantity</span><span class="o">:</span><span class="w"> </span><span class="mf">1</span><span class="p">,</span>
+<span class="w">      </span><span class="nx">variety</span><span class="o">:</span><span class="w"> </span><span class="s2">&quot;co&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nx">trigger_price</span><span class="o">:</span><span class="w"> </span><span class="mf">910</span><span class="p">,</span>
+<span class="w">      </span><span class="nx">readonly</span><span class="o">:</span><span class="w"> </span><span class="kc">true</span><span class="p">,</span>
+<span class="w">    </span><span class="p">});</span>
+
+<span class="w">    </span><span class="c1">// Register an (optional) callback.</span>
+<span class="w">    </span><span class="nx">kite</span><span class="p">.</span><span class="nx">finished</span><span class="p">(</span><span class="kd">function</span><span class="w"> </span><span class="p">(</span><span class="nx">status</span><span class="p">,</span><span class="w"> </span><span class="nx">request_token</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">      </span><span class="nx">alert</span><span class="p">(</span><span class="s2">&quot;Finished. Status is &quot;</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="nx">status</span><span class="p">);</span>
+<span class="w">    </span><span class="p">});</span>
+
+<span class="w">    </span><span class="c1">// Render the in-built button inside a given target</span>
+<span class="w">    </span><span class="nx">kite</span><span class="p">.</span><span class="nx">renderButton</span><span class="p">(</span><span class="s2">&quot;#default-button&quot;</span><span class="p">);</span>
+
+<span class="w">    </span><span class="c1">// OR, link the basket to any existing element you want</span>
+<span class="w">    </span><span class="nx">kite</span><span class="p">.</span><span class="nx">link</span><span class="p">(</span><span class="s2">&quot;#custom-button&quot;</span><span class="p">);</span>
+<span class="w">  </span><span class="p">});</span>
+<span class="p">&lt;/</span><span class="nt">script</span><span class="p">&gt;</span>
+</code></pre></div>
+<p>You can create a basket of stocks and get the plugin to render a Kite button that executes it, or link the basket to your own button (or any HTML element).</p>
+<p>The plugin loads it's assets asynchronously, so it's important that you initialise your custom KiteConnect calls after it has fully loaded. You need to use the <code>KiteConnect.ready()</code> function to achieve this.</p>
+<div class="admonition note">
+<p class="admonition-title">Note</p>
+<p>Include your custom code after the publisher.js inclusion. Also, make sure to wrap your code in <code>KiteConnect.ready()</code></p>
+</div>
+<h3 id="parameters">Parameters<a class="headerlink" href="#parameters" title="Permanent link">&para;</a></h3>
+<table>
+<thead>
+<tr>
+<th>parameter</th>
+<th>&nbsp;</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>variety</code></td>
+<td>Order variety (<code>regular</code>, <code>amo</code>, <code>co</code>. Defaults to <code>regular</code>)</td>
+</tr>
+<tr>
+<td><code>tradingsymbol</code></td>
+<td>Tradingsymbol of the instrument</td>
+</tr>
+<tr>
+<td><code>exchange</code></td>
+<td>Name of the exchange</td>
+</tr>
+<tr>
+<td><code>transaction_type</code></td>
+<td>BUY or SELL</td>
+</tr>
+<tr>
+<td><code>order_type</code></td>
+<td>Order type (MARKET, LIMIT etc.)</td>
+</tr>
+<tr>
+<td><code>quantity</code></td>
+<td>Quantity to transact</td>
+</tr>
+<tr>
+<td><code>product</code></td>
+<td>Margin product to use for the order (margins are blocked based on this) <a href="https://support.zerodha.com/category/trading-and-markets/product-and-order-types/product/articles/what-does-cnc-mis-and-nrml-mean">?</a></td>
+</tr>
+<tr>
+<td><code>price</code></td>
+<td>For LIMIT orders</td>
+</tr>
+<tr>
+<td><code>trigger_price</code></td>
+<td>For SL, SL-M etc.</td>
+</tr>
+<tr>
+<td><code>disclosed_quantity</code></td>
+<td>Quantity to disclose publicly (for equity trades)</td>
+</tr>
+<tr>
+<td><code>validity</code></td>
+<td>Order validity</td>
+</tr>
+<tr>
+<td><code>readonly</code></td>
+<td>Default is <code>false</code>. If set to true, the UI does not allow the user to edit values such as quantity, price etc., and they can only review and execute.</td>
+</tr>
+<tr>
+<td><code>tag</code></td>
+<td>An optional tag to apply to an order to identify it (alphanumeric, max 8 chars)</td>
+</tr>
+</tbody>
+</table>
+<h3 id="methods">Methods<a class="headerlink" href="#methods" title="Permanent link">&para;</a></h3>
+<table>
+<thead>
+<tr>
+<th>method</th>
+<th>arguments</th>
+<th>&nbsp;</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>KiteConnect.ready()</code></td>
+<td><code>function()</code></td>
+<td>Safe wrapper for all API calls that waits asynchronously for all assets to load.</td>
+</tr>
+<tr>
+<td><code>add()</code></td>
+<td><code>entry</code></td>
+<td>Adds an object literal {} with the parameters mentioned in the previous section represeting a single trading entry to the basket.</td>
+</tr>
+<tr>
+<td><code>get()</code></td>
+<td></td>
+<td>Returns an array[] of all added entries.</td>
+</tr>
+<tr>
+<td><code>count()</code></td>
+<td></td>
+<td>Returns the number of added entries.</td>
+</tr>
+<tr>
+<td><code>setOption()</code></td>
+<td><code>key, value</code></td>
+<td>Sets the value for certain supported keys.</td>
+</tr>
+<tr>
+<td>&nbsp;</td>
+<td><code>redirect_url</code></td>
+<td>A redirect URL to override the registered Kite Connect redirect URL (using <code>setOption()</code>). The value can be a single '#', a 127.0.0.1 url for testing, or a fully qualified URL belonging to the same domain as the registered URL.</td>
+</tr>
+<tr>
+<td><code>renderButton()</code></td>
+<td><code>element_selector</code></td>
+<td>Renders a branded Kite button in the given target element, which when clicked, will start the transaction in an overlay popup. <code>element_selector</code> is an HTML selector, for example, <code>#buy-button</code>, <code>.buttons</code> etc.</td>
+</tr>
+<tr>
+<td><code>link()</code></td>
+<td><code>element_selector</code></td>
+<td>Links the basket to the given HTML element, which when clicked, will start the transaction in an overlay popup. <code>element_selector</code> is an HTML selector, for example, <code>#buy-button</code>, <code>.buttons</code> etc.</td>
+</tr>
+<tr>
+<td><code>html()</code></td>
+<td></td>
+<td>Returns a serialized HTML form with the necessary hidden fields and the basket payload which can be written to the document body and submitted to initiate the transaction.</td>
+</tr>
+<tr>
+<td><code>finished()</code></td>
+<td><code>function(status, request_token)</code></td>
+<td>Register a callback which is triggered after order placement is finished.</td>
+</tr>
+<tr>
+<td><code>authHoldings()</code></td>
+<td><code>request_id, callback(data)</code></td>
+<td>Request ID from <a href="../portfolio/#holdings-authorisation">the holdings authorisation call</a> along with an optional callback function that triggers when the holdings authorisation flow finishes.</td>
+</tr>
+</tbody>
+</table>
+
+
+
+
+
+                
+              </article>
+            </div>
+          
+          
+        </div>
+        
+      </main>
+      
+        <footer class="md-footer">
+  
+  <div class="md-footer-meta md-typeset">
+    <div class="md-footer-meta__inner md-grid">
+      <div class="md-copyright">
+  
+    <div class="md-copyright__highlight">
+      Copyright &copy; 2015 - 2025, Zerodha Technology Pvt. Ltd.
+    </div>
+  
+  
+    Made with
+    <a href="https://squidfunk.github.io/mkdocs-material/" target="_blank" rel="noopener">
+      Material for MkDocs
+    </a>
+  
+</div>
+      
+    </div>
+  </div>
+</footer>
+      
+    </div>
+    <div class="md-dialog" data-md-component="dialog">
+      <div class="md-dialog__inner md-typeset"></div>
+    </div>
+    
+    <script id="__config" type="application/json">{"base": "..", "features": [], "search": "../assets/javascripts/workers/search.74e28a9f.min.js", "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}}</script>
+    
+    
+      <script src="../assets/javascripts/bundle.220ee61c.min.js"></script>
+      
+    
+  </body>
+</html>

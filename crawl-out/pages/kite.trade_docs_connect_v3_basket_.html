@@ -1,0 +1,764 @@
+
+<!doctype html>
+<html lang="en" class="no-js">
+  <head>
+    
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      
+      
+      
+      
+        <link rel="prev" href="../margins/">
+      
+      
+        <link rel="next" href="../publisher/">
+      
+      <link rel="icon" href="../images/favicon">
+      <meta name="generator" content="mkdocs-1.4.3, mkdocs-material-9.1.18">
+    
+    
+      
+        <title>Publisher - Offsite orders - Kite Connect 3 / API documentation</title>
+      
+    
+    
+      <link rel="stylesheet" href="../assets/stylesheets/main.26e3688c.min.css">
+      
+        
+        <link rel="stylesheet" href="../assets/stylesheets/palette.ecc896b0.min.css">
+      
+      
+
+    
+    
+    
+      
+        
+        
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+        <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Roboto:300,300i,400,400i,700,700i%7CRoboto+Mono:400,400i,700,700i&display=fallback">
+        <style>:root{--md-text-font:"Roboto";--md-code-font:"Roboto Mono"}</style>
+      
+    
+    
+      <link rel="stylesheet" href="../static/style.css">
+    
+    <script>__md_scope=new URL("..",location),__md_hash=e=>[...e].reduce((e,_)=>(e<<5)-e+_.charCodeAt(0),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
+    
+      
+
+    
+    
+    
+  </head>
+  
+  
+    
+    
+    
+    
+    
+    <body dir="ltr" data-md-color-scheme="default" data-md-color-primary="white" data-md-color-accent="red">
+  
+    
+    
+    <input class="md-toggle" data-md-toggle="drawer" type="checkbox" id="__drawer" autocomplete="off">
+    <input class="md-toggle" data-md-toggle="search" type="checkbox" id="__search" autocomplete="off">
+    <label class="md-overlay" for="__drawer"></label>
+    <div data-md-component="skip">
+      
+        
+        <a href="#offsite-order-execution" class="md-skip">
+          Skip to content
+        </a>
+      
+    </div>
+    <div data-md-component="announce">
+      
+    </div>
+    
+    
+      
+
+  
+
+<header class="md-header md-header--shadow" data-md-component="header">
+  <nav class="md-header__inner md-grid" aria-label="Header">
+    <a href=".." title="Kite Connect 3 / API documentation" class="md-header__button md-logo" aria-label="Kite Connect 3 / API documentation" data-md-component="logo">
+      
+  <img src="../images/logo.svg" alt="logo">
+
+    </a>
+    <label class="md-header__button md-icon" for="__drawer">
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M3 6h18v2H3V6m0 5h18v2H3v-2m0 5h18v2H3v-2Z"/></svg>
+    </label>
+    <div class="md-header__title" data-md-component="header-title">
+      <div class="md-header__ellipsis">
+        <div class="md-header__topic">
+          <span class="md-ellipsis">
+            Kite Connect 3 / API documentation
+          </span>
+        </div>
+        <div class="md-header__topic" data-md-component="header-topic">
+          <span class="md-ellipsis">
+            
+              Publisher - Offsite orders
+            
+          </span>
+        </div>
+      </div>
+    </div>
+    
+      
+    
+    
+    
+      <label class="md-header__button md-icon" for="__search">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.516 6.516 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5Z"/></svg>
+      </label>
+      <div class="md-search" data-md-component="search" role="dialog">
+  <label class="md-search__overlay" for="__search"></label>
+  <div class="md-search__inner" role="search">
+    <form class="md-search__form" name="search">
+      <input type="text" class="md-search__input" name="query" aria-label="Search" placeholder="Search" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false" data-md-component="search-query" required>
+      <label class="md-search__icon md-icon" for="__search">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.516 6.516 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5Z"/></svg>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11h12Z"/></svg>
+      </label>
+      <nav class="md-search__options" aria-label="Search">
+        
+        <button type="reset" class="md-search__icon md-icon" title="Clear" aria-label="Clear" tabindex="-1">
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12 19 6.41Z"/></svg>
+        </button>
+      </nav>
+      
+    </form>
+    <div class="md-search__output">
+      <div class="md-search__scrollwrap" data-md-scrollfix>
+        <div class="md-search-result" data-md-component="search-result">
+          <div class="md-search-result__meta">
+            Initializing search
+          </div>
+          <ol class="md-search-result__list" role="presentation"></ol>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+    
+    
+  </nav>
+  
+</header>
+    
+    <div class="md-container" data-md-component="container">
+      
+      
+        
+          
+        
+      
+      <main class="md-main" data-md-component="main">
+        <div class="md-main__inner md-grid">
+          
+            
+              
+              <div class="md-sidebar md-sidebar--primary" data-md-component="sidebar" data-md-type="navigation" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+
+<nav class="md-nav md-nav--primary" aria-label="Navigation" data-md-level="0">
+  <label class="md-nav__title" for="__drawer">
+    <a href=".." title="Kite Connect 3 / API documentation" class="md-nav__button md-logo" aria-label="Kite Connect 3 / API documentation" data-md-component="logo">
+      
+  <img src="../images/logo.svg" alt="logo">
+
+    </a>
+    Kite Connect 3 / API documentation
+  </label>
+  
+  <ul class="md-nav__list" data-md-scrollfix>
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href=".." class="md-nav__link">
+        Introduction
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../sdks/" class="md-nav__link">
+        Libraries and SDKs
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../response-structure/" class="md-nav__link">
+        Response structure
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../exceptions/" class="md-nav__link">
+        Exceptions and errors
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../user/" class="md-nav__link">
+        User
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../orders/" class="md-nav__link">
+        Orders
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../gtt/" class="md-nav__link">
+        GTT orders
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../alerts/" class="md-nav__link">
+        Alerts
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../portfolio/" class="md-nav__link">
+        Portfolio
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../market-quotes/" class="md-nav__link">
+        Market quotes and instruments
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../websocket/" class="md-nav__link">
+        WebSocket streaming
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../historical/" class="md-nav__link">
+        Historical candle data
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../postbacks/" class="md-nav__link">
+        Postbacks / WebHooks
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../mutual-funds/" class="md-nav__link">
+        Mutual funds
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../margins/" class="md-nav__link">
+        Margin calculation
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+    
+  
+  
+    <li class="md-nav__item md-nav__item--active">
+      
+      <input class="md-nav__toggle md-toggle" type="checkbox" id="__toc">
+      
+      
+        
+      
+      
+        <label class="md-nav__link md-nav__link--active" for="__toc">
+          Publisher - Offsite orders
+          <span class="md-nav__icon md-icon"></span>
+        </label>
+      
+      <a href="./" class="md-nav__link md-nav__link--active">
+        Publisher - Offsite orders
+      </a>
+      
+        
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#initiating-orders" class="md-nav__link">
+    Initiating orders
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#linking-offsite-execution-to-kite-connect" class="md-nav__link">
+    Linking offsite execution to Kite Connect
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#request-parameters" class="md-nav__link">
+    Request parameters
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+      
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../publisher/" class="md-nav__link">
+        Publisher JS plugin
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../apps/" class="md-nav__link">
+        Mobile and Desktop apps
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../changelog/" class="md-nav__link">
+        Changelog
+      </a>
+    </li>
+  
+
+    
+  </ul>
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+            
+              
+              <div class="md-sidebar md-sidebar--secondary" data-md-component="sidebar" data-md-type="toc" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#initiating-orders" class="md-nav__link">
+    Initiating orders
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#linking-offsite-execution-to-kite-connect" class="md-nav__link">
+    Linking offsite execution to Kite Connect
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#request-parameters" class="md-nav__link">
+    Request parameters
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+          
+          
+            <div class="md-content" data-md-component="content">
+              <article class="md-content__inner md-typeset">
+                
+                  
+
+
+<h1 id="offsite-order-execution">Offsite order execution<a class="headerlink" href="#offsite-order-execution" title="Permanent link">&para;</a></h1>
+<p>The offsite order execution feature allows you to redirect your users to Kite's exchange approved order page where they place orders and come back to your application seamlessly, like a payment gateway. This way, you do not have to build, maintain, and get exchange approvals for order execution screens. The <a href="https://kite.trade/publisher">Kite Publisher</a> program utilizes offsite order execution to provide embeddable Javascript+HTML trade buttons that do not require any API integrations.</p>
+<h3 id="initiating-orders">Initiating orders<a class="headerlink" href="#initiating-orders" title="Permanent link">&para;</a></h3>
+<blockquote>
+<p>Example JSON basket</p>
+</blockquote>
+<div class="highlight"><pre><span></span><code><span class="p">[</span>
+<span class="w">  </span><span class="p">{</span>
+<span class="w">    </span><span class="nt">&quot;variety&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;regular&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;tradingsymbol&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;INFY&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;exchange&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;NSE&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;transaction_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;BUY&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;order_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;MARKET&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">10</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;readonly&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">false</span>
+<span class="w">  </span><span class="p">},</span>
+<span class="w">  </span><span class="p">{</span>
+<span class="w">    </span><span class="nt">&quot;variety&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;regular&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;tradingsymbol&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;NIFTY15DECFUT&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;exchange&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;NFO&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;transaction_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;SELL&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;order_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;LIMIT&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">7845</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;readonly&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">false</span>
+<span class="w">  </span><span class="p">},</span>
+<span class="w">  </span><span class="p">{</span>
+<span class="w">    </span><span class="nt">&quot;variety&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;co&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;tradingsymbol&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;RELIANCE&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;exchange&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;NSE&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;transaction_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;BUY&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;order_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;LIMIT&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;product&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;MIS&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">915.15</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;trigger_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">910</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;readonly&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span>
+<span class="w">  </span><span class="p">}</span>
+<span class="p">]</span>
+</code></pre></div>
+<blockquote>
+<p>Posting the JSON basket</p>
+</blockquote>
+<div class="highlight"><pre><span></span><code><span class="p">&lt;</span><span class="nt">form</span>
+  <span class="na">method</span><span class="o">=</span><span class="s">&quot;post&quot;</span>
+  <span class="na">id</span><span class="o">=</span><span class="s">&quot;basket-form&quot;</span>
+  <span class="na">action</span><span class="o">=</span><span class="s">&quot;https://kite.zerodha.com/connect/basket&quot;</span>
+<span class="p">&gt;</span>
+  <span class="p">&lt;</span><span class="nt">input</span> <span class="na">type</span><span class="o">=</span><span class="s">&quot;hidden&quot;</span> <span class="na">name</span><span class="o">=</span><span class="s">&quot;api_key&quot;</span> <span class="na">value</span><span class="o">=</span><span class="s">&quot;xxx&quot;</span> <span class="p">/&gt;</span>
+  <span class="p">&lt;</span><span class="nt">input</span> <span class="na">type</span><span class="o">=</span><span class="s">&quot;hidden&quot;</span> <span class="na">id</span><span class="o">=</span><span class="s">&quot;basket&quot;</span> <span class="na">name</span><span class="o">=</span><span class="s">&quot;data&quot;</span> <span class="na">value</span><span class="o">=</span><span class="s">&quot;&quot;</span> <span class="p">/&gt;</span>
+<span class="p">&lt;/</span><span class="nt">form</span><span class="p">&gt;</span>
+
+<span class="p">&lt;</span><span class="nt">script</span><span class="p">&gt;</span>
+<span class="w">  </span><span class="nb">document</span><span class="p">.</span><span class="nx">getElementById</span><span class="p">(</span><span class="s2">&quot;basket&quot;</span><span class="p">).</span><span class="nx">value</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nx">your_basket</span><span class="p">;</span>
+<span class="w">  </span><span class="nb">document</span><span class="p">.</span><span class="nx">getElementById</span><span class="p">(</span><span class="s2">&quot;basket-form&quot;</span><span class="p">).</span><span class="nx">submit</span><span class="p">();</span>
+<span class="p">&lt;/</span><span class="nt">script</span><span class="p">&gt;</span>
+</code></pre></div>
+<p>It is possible to send multiple orders which the user then confirms on a shopping basket like interface. You should prepare a JSON list of instruments to be traded with the required order parameters and <code>POST</code> it as a form field with the name <code>data</code> along with your <code>api_key</code> to <strong><code>https://kite.zerodha.com/connect/basket</code></strong>.</p>
+<p>This is a browser / mobile (webview) request and has to happen at the user's end, although the basket preparation can happen in the backend. The easiest way to make the request is to create a hidden form, insert the JSON payload into it and submit it automatically using Javascript.</p>
+<p>If you're preparing the basket client side on your web application, you can use the Kite Publisher <a href="../publisher/#generating-dynamic-buttons-with-javascript">javascript plugin</a> to make things easier.</p>
+<div class="admonition note">
+<p class="admonition-title">Note</p>
+<p>You do not have to initiate a login using the login API to do offsite order execution. If a user is not already logged in, they'll be asked to login, otherwise, they'll be taken to the order basket directly. Either way, in the end, you will receive <code>status</code> and <code>request_token</code> at your <code>redirect_url</code> like in the login flow.</p>
+</div>
+<h3 id="linking-offsite-execution-to-kite-connect">Linking offsite execution to Kite Connect<a class="headerlink" href="#linking-offsite-execution-to-kite-connect" title="Permanent link">&para;</a></h3>
+<p>Offsite order execution follows the same flow as <a href="../user/#login-flow">login</a>, except for the order basket that appears after the login. Once the user is done placing orders, the basket will redirect back to your registered <code>redirect_login</code> along with a <code>request_key</code>, exactly like login. You are free to use this key to create a new Kite Connect session for further API interactions, or disregard it altogether.</p>
+<h3 id="request-parameters">Request parameters<a class="headerlink" href="#request-parameters" title="Permanent link">&para;</a></h3>
+<table>
+<thead>
+<tr>
+<th>parameter</th>
+<th>&nbsp;</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>variety</code></td>
+<td>Order variety (<code>regular</code>, <code>amo</code>, <code>co</code>. Defaults to <code>regular</code>)</td>
+</tr>
+<tr>
+<td><code>tradingsymbol</code></td>
+<td>Tradingsymbol of the instrument</td>
+</tr>
+<tr>
+<td><code>exchange</code></td>
+<td>Name of the exchange</td>
+</tr>
+<tr>
+<td><code>transaction_type</code></td>
+<td>BUY or SELL</td>
+</tr>
+<tr>
+<td><code>order_type</code></td>
+<td>Order type (MARKET, LIMIT etc.)</td>
+</tr>
+<tr>
+<td><code>quantity</code></td>
+<td>Quantity to transact</td>
+</tr>
+<tr>
+<td><code>product</code></td>
+<td>Margin product to use for the order (margins are blocked based on this) <a href="https://support.zerodha.com/category/trading-and-markets/product-and-order-types/product/articles/what-does-cnc-mis-and-nrml-mean">?</a></td>
+</tr>
+<tr>
+<td><code>price</code></td>
+<td>For LIMIT orders</td>
+</tr>
+<tr>
+<td><code>trigger_price</code></td>
+<td>For SL, SL-M etc.</td>
+</tr>
+<tr>
+<td><code>disclosed_quantity</code></td>
+<td>Quantity to disclose publicly (for equity trades)</td>
+</tr>
+<tr>
+<td><code>validity</code></td>
+<td>Order validity</td>
+</tr>
+<tr>
+<td><code>readonly</code></td>
+<td>Default is <code>false</code>. If set to true, the UI does not allow the user to edit values such as quantity, price etc., and they can only review and execute.</td>
+</tr>
+<tr>
+<td><code>tag</code></td>
+<td>An optional tag to apply to an order to identify it (alphanumeric, max 20 chars)</td>
+</tr>
+</tbody>
+</table>
+
+
+
+
+
+                
+              </article>
+            </div>
+          
+          
+        </div>
+        
+      </main>
+      
+        <footer class="md-footer">
+  
+  <div class="md-footer-meta md-typeset">
+    <div class="md-footer-meta__inner md-grid">
+      <div class="md-copyright">
+  
+    <div class="md-copyright__highlight">
+      Copyright &copy; 2015 - 2025, Zerodha Technology Pvt. Ltd.
+    </div>
+  
+  
+    Made with
+    <a href="https://squidfunk.github.io/mkdocs-material/" target="_blank" rel="noopener">
+      Material for MkDocs
+    </a>
+  
+</div>
+      
+    </div>
+  </div>
+</footer>
+      
+    </div>
+    <div class="md-dialog" data-md-component="dialog">
+      <div class="md-dialog__inner md-typeset"></div>
+    </div>
+    
+    <script id="__config" type="application/json">{"base": "..", "features": [], "search": "../assets/javascripts/workers/search.74e28a9f.min.js", "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}}</script>
+    
+    
+      <script src="../assets/javascripts/bundle.220ee61c.min.js"></script>
+      
+    
+  </body>
+</html>

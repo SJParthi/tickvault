@@ -1,0 +1,1533 @@
+
+<!doctype html>
+<html lang="en" class="no-js">
+  <head>
+    
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      
+      
+      
+      
+        <link rel="prev" href="../alerts/">
+      
+      
+        <link rel="next" href="../market-quotes/">
+      
+      <link rel="icon" href="../images/favicon">
+      <meta name="generator" content="mkdocs-1.4.3, mkdocs-material-9.1.18">
+    
+    
+      
+        <title>Portfolio - Kite Connect 3 / API documentation</title>
+      
+    
+    
+      <link rel="stylesheet" href="../assets/stylesheets/main.26e3688c.min.css">
+      
+        
+        <link rel="stylesheet" href="../assets/stylesheets/palette.ecc896b0.min.css">
+      
+      
+
+    
+    
+    
+      
+        
+        
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+        <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Roboto:300,300i,400,400i,700,700i%7CRoboto+Mono:400,400i,700,700i&display=fallback">
+        <style>:root{--md-text-font:"Roboto";--md-code-font:"Roboto Mono"}</style>
+      
+    
+    
+      <link rel="stylesheet" href="../static/style.css">
+    
+    <script>__md_scope=new URL("..",location),__md_hash=e=>[...e].reduce((e,_)=>(e<<5)-e+_.charCodeAt(0),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
+    
+      
+
+    
+    
+    
+  </head>
+  
+  
+    
+    
+    
+    
+    
+    <body dir="ltr" data-md-color-scheme="default" data-md-color-primary="white" data-md-color-accent="red">
+  
+    
+    
+    <input class="md-toggle" data-md-toggle="drawer" type="checkbox" id="__drawer" autocomplete="off">
+    <input class="md-toggle" data-md-toggle="search" type="checkbox" id="__search" autocomplete="off">
+    <label class="md-overlay" for="__drawer"></label>
+    <div data-md-component="skip">
+      
+        
+        <a href="#portfolio" class="md-skip">
+          Skip to content
+        </a>
+      
+    </div>
+    <div data-md-component="announce">
+      
+    </div>
+    
+    
+      
+
+  
+
+<header class="md-header md-header--shadow" data-md-component="header">
+  <nav class="md-header__inner md-grid" aria-label="Header">
+    <a href=".." title="Kite Connect 3 / API documentation" class="md-header__button md-logo" aria-label="Kite Connect 3 / API documentation" data-md-component="logo">
+      
+  <img src="../images/logo.svg" alt="logo">
+
+    </a>
+    <label class="md-header__button md-icon" for="__drawer">
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M3 6h18v2H3V6m0 5h18v2H3v-2m0 5h18v2H3v-2Z"/></svg>
+    </label>
+    <div class="md-header__title" data-md-component="header-title">
+      <div class="md-header__ellipsis">
+        <div class="md-header__topic">
+          <span class="md-ellipsis">
+            Kite Connect 3 / API documentation
+          </span>
+        </div>
+        <div class="md-header__topic" data-md-component="header-topic">
+          <span class="md-ellipsis">
+            
+              Portfolio
+            
+          </span>
+        </div>
+      </div>
+    </div>
+    
+      
+    
+    
+    
+      <label class="md-header__button md-icon" for="__search">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.516 6.516 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5Z"/></svg>
+      </label>
+      <div class="md-search" data-md-component="search" role="dialog">
+  <label class="md-search__overlay" for="__search"></label>
+  <div class="md-search__inner" role="search">
+    <form class="md-search__form" name="search">
+      <input type="text" class="md-search__input" name="query" aria-label="Search" placeholder="Search" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false" data-md-component="search-query" required>
+      <label class="md-search__icon md-icon" for="__search">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.516 6.516 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5Z"/></svg>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11h12Z"/></svg>
+      </label>
+      <nav class="md-search__options" aria-label="Search">
+        
+        <button type="reset" class="md-search__icon md-icon" title="Clear" aria-label="Clear" tabindex="-1">
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12 19 6.41Z"/></svg>
+        </button>
+      </nav>
+      
+    </form>
+    <div class="md-search__output">
+      <div class="md-search__scrollwrap" data-md-scrollfix>
+        <div class="md-search-result" data-md-component="search-result">
+          <div class="md-search-result__meta">
+            Initializing search
+          </div>
+          <ol class="md-search-result__list" role="presentation"></ol>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+    
+    
+  </nav>
+  
+</header>
+    
+    <div class="md-container" data-md-component="container">
+      
+      
+        
+          
+        
+      
+      <main class="md-main" data-md-component="main">
+        <div class="md-main__inner md-grid">
+          
+            
+              
+              <div class="md-sidebar md-sidebar--primary" data-md-component="sidebar" data-md-type="navigation" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+
+<nav class="md-nav md-nav--primary" aria-label="Navigation" data-md-level="0">
+  <label class="md-nav__title" for="__drawer">
+    <a href=".." title="Kite Connect 3 / API documentation" class="md-nav__button md-logo" aria-label="Kite Connect 3 / API documentation" data-md-component="logo">
+      
+  <img src="../images/logo.svg" alt="logo">
+
+    </a>
+    Kite Connect 3 / API documentation
+  </label>
+  
+  <ul class="md-nav__list" data-md-scrollfix>
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href=".." class="md-nav__link">
+        Introduction
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../sdks/" class="md-nav__link">
+        Libraries and SDKs
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../response-structure/" class="md-nav__link">
+        Response structure
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../exceptions/" class="md-nav__link">
+        Exceptions and errors
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../user/" class="md-nav__link">
+        User
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../orders/" class="md-nav__link">
+        Orders
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../gtt/" class="md-nav__link">
+        GTT orders
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../alerts/" class="md-nav__link">
+        Alerts
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+    
+  
+  
+    <li class="md-nav__item md-nav__item--active">
+      
+      <input class="md-nav__toggle md-toggle" type="checkbox" id="__toc">
+      
+      
+        
+      
+      
+        <label class="md-nav__link md-nav__link--active" for="__toc">
+          Portfolio
+          <span class="md-nav__icon md-icon"></span>
+        </label>
+      
+      <a href="./" class="md-nav__link md-nav__link--active">
+        Portfolio
+      </a>
+      
+        
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#holdings" class="md-nav__link">
+    Holdings
+  </a>
+  
+    <nav class="md-nav" aria-label="Holdings">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#response-attributes" class="md-nav__link">
+    Response attributes
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#holdings-auction-list" class="md-nav__link">
+    Holdings auction list
+  </a>
+  
+    <nav class="md-nav" aria-label="Holdings auction list">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#response-attributes_1" class="md-nav__link">
+    Response attributes
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#positions" class="md-nav__link">
+    Positions
+  </a>
+  
+    <nav class="md-nav" aria-label="Positions">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#response-attributes_2" class="md-nav__link">
+    Response attributes
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#position-conversion" class="md-nav__link">
+    Position conversion
+  </a>
+  
+    <nav class="md-nav" aria-label="Position conversion">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#request-parameters" class="md-nav__link">
+    Request parameters
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#exiting-holdings-and-positions" class="md-nav__link">
+    Exiting holdings and positions
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#holdings-authorisation" class="md-nav__link">
+    Holdings authorisation
+  </a>
+  
+    <nav class="md-nav" aria-label="Holdings authorisation">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#initiating-authorisation" class="md-nav__link">
+    Initiating authorisation
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+      
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../market-quotes/" class="md-nav__link">
+        Market quotes and instruments
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../websocket/" class="md-nav__link">
+        WebSocket streaming
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../historical/" class="md-nav__link">
+        Historical candle data
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../postbacks/" class="md-nav__link">
+        Postbacks / WebHooks
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../mutual-funds/" class="md-nav__link">
+        Mutual funds
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../margins/" class="md-nav__link">
+        Margin calculation
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../basket/" class="md-nav__link">
+        Publisher - Offsite orders
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../publisher/" class="md-nav__link">
+        Publisher JS plugin
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../apps/" class="md-nav__link">
+        Mobile and Desktop apps
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../changelog/" class="md-nav__link">
+        Changelog
+      </a>
+    </li>
+  
+
+    
+  </ul>
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+            
+              
+              <div class="md-sidebar md-sidebar--secondary" data-md-component="sidebar" data-md-type="toc" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#holdings" class="md-nav__link">
+    Holdings
+  </a>
+  
+    <nav class="md-nav" aria-label="Holdings">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#response-attributes" class="md-nav__link">
+    Response attributes
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#holdings-auction-list" class="md-nav__link">
+    Holdings auction list
+  </a>
+  
+    <nav class="md-nav" aria-label="Holdings auction list">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#response-attributes_1" class="md-nav__link">
+    Response attributes
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#positions" class="md-nav__link">
+    Positions
+  </a>
+  
+    <nav class="md-nav" aria-label="Positions">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#response-attributes_2" class="md-nav__link">
+    Response attributes
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#position-conversion" class="md-nav__link">
+    Position conversion
+  </a>
+  
+    <nav class="md-nav" aria-label="Position conversion">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#request-parameters" class="md-nav__link">
+    Request parameters
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#exiting-holdings-and-positions" class="md-nav__link">
+    Exiting holdings and positions
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#holdings-authorisation" class="md-nav__link">
+    Holdings authorisation
+  </a>
+  
+    <nav class="md-nav" aria-label="Holdings authorisation">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#initiating-authorisation" class="md-nav__link">
+    Initiating authorisation
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+          
+          
+            <div class="md-content" data-md-component="content">
+              <article class="md-content__inner md-typeset">
+                
+                  
+
+
+<h1 id="portfolio">Portfolio<a class="headerlink" href="#portfolio" title="Permanent link">&para;</a></h1>
+<p>A user's portfolio consists of long term equity holdings and short term positions. The portfolio APIs return instruments in a portfolio with up-to-date profit and loss computations.</p>
+<table>
+<thead>
+<tr>
+<th>type</th>
+<th>endpoint</th>
+<th>&nbsp;</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>GET</td>
+<td><a href="#holdings">/portfolio/holdings</a></td>
+<td>Retrieve the list of long term equity holdings</td>
+</tr>
+<tr>
+<td>GET</td>
+<td><a href="#positions">/portfolio/positions</a></td>
+<td>Retrieve the list of short term positions</td>
+</tr>
+<tr>
+<td>PUT</td>
+<td><a href="#position-conversion">/portfolio/positions</a></td>
+<td>Convert the margin product of an open position</td>
+</tr>
+<tr>
+<td>GET</td>
+<td><a href="#holdings-auction-list">/portfolio/holdings/auctions</a></td>
+<td>Retrieve the list of auctions that are currently being held</td>
+</tr>
+</tbody>
+</table>
+<h2 id="holdings">Holdings<a class="headerlink" href="#holdings" title="Permanent link">&para;</a></h2>
+<p>Holdings contain the user's portfolio of long term equity delivery stocks. An instrument in a holdings portfolio remains there indefinitely until its sold or is delisted or changed by the exchanges. Underneath it all, instruments in the holdings reside in the user's DEMAT account, as settled by exchanges and clearing institutions.</p>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span><span class="s2">&quot;https://api.kite.trade/portfolio/holdings&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-H<span class="w"> </span><span class="s2">&quot;X-Kite-Version: 3&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-H<span class="w"> </span><span class="s2">&quot;Authorization: token api_key:access_token&quot;</span>
+</code></pre></div>
+<div class="highlight"><pre><span></span><code><span class="p">{</span>
+<span class="w">  </span><span class="nt">&quot;status&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;success&quot;</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">&quot;data&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+<span class="w">    </span><span class="p">{</span>
+<span class="w">      </span><span class="nt">&quot;tradingsymbol&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;AARON&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;exchange&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;NSE&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;instrument_token&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">263681</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;isin&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;INE721Z01010&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;product&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;CNC&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;used_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;t1_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;realised_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;authorised_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;authorised_date&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;2025-01-17 00:00:00&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;authorisation&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{},</span>
+<span class="w">      </span><span class="nt">&quot;opening_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;short_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;collateral_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;collateral_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;discrepancy&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">false</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;average_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">161</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;last_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">352.95</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;close_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">352.35</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;pnl&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">191.95</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;day_change&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">0.5999999999999659</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;day_change_percentage&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">0.17028522775648244</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;mtf&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="nt">&quot;quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1000</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;used_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;average_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">100</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;value&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">100000</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;initial_margin&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span>
+<span class="w">      </span><span class="p">}</span>
+<span class="w">    </span><span class="p">},</span>
+<span class="w">    </span><span class="p">{</span>
+<span class="w">      </span><span class="nt">&quot;tradingsymbol&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;SBIN&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;exchange&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;BSE&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;instrument_token&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">128028676</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;isin&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;INE062A01020&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;product&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;CNC&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">16</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;used_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;t1_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;realised_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">16</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;authorised_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;authorised_date&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;2025-01-17 00:00:00&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;authorisation&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{},</span>
+<span class="w">      </span><span class="nt">&quot;opening_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">16</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;short_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;collateral_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;collateral_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;discrepancy&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">false</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;average_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">801.78125</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;last_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">762.45</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;close_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">766.4</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;pnl&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">-629.2999999999993</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;day_change&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">-3.949999999999932</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;day_change_percentage&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">-0.5153966597077155</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;mtf&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="nt">&quot;quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;used_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;average_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;value&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;initial_margin&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span>
+<span class="w">      </span><span class="p">}</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">  </span><span class="p">]</span>
+<span class="p">}</span>
+</code></pre></div>
+<h3 id="response-attributes">Response attributes<a class="headerlink" href="#response-attributes" title="Permanent link">&para;</a></h3>
+<table>
+<thead>
+<tr>
+<th>attribute</th>
+<th>&nbsp;</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>tradingsymbol</code><span>string</span></td>
+<td>Exchange tradingsymbol of the instrument</td>
+</tr>
+<tr>
+<td><code>exchange</code><span>string</span></td>
+<td>Exchange</td>
+</tr>
+<tr>
+<td><code>instrument_token</code><span>uint32</span></td>
+<td>Unique instrument identifier (used for WebSocket subscriptions)</td>
+</tr>
+<tr>
+<td><code>isin</code><span>string</span></td>
+<td>The standard ISIN representing stocks listed on multiple exchanges</td>
+</tr>
+<tr>
+<td><code>t1_quantity</code><span>int64</span></td>
+<td>Quantity on T+1 day after order execution. Stocks are usually delivered into DEMAT accounts on T+2 <a href="https://zerodha.com/varsity/chapter/clearing-and-settlement-process/">?</a></td>
+</tr>
+<tr>
+<td><code>realised_quantity</code><span>int64</span></td>
+<td>Quantity delivered to Demat</td>
+</tr>
+<tr>
+<td><code>quantity</code><span>int64</span></td>
+<td>Realised Quantity(T+2)</td>
+</tr>
+<tr>
+<td><code>used_quantity</code><span>int64</span></td>
+<td>Quantity sold from the net holding quantity</td>
+</tr>
+<tr>
+<td><code>authorised_quantity</code><span>int64</span></td>
+<td>Quantity <a href="#holdings-authorisation">authorised</a> at the depository for sale</td>
+</tr>
+<tr>
+<td><code>opening_quantity</code><span>int64</span></td>
+<td>Quantity carried forward over night</td>
+</tr>
+<tr>
+<td><code>authorised_date</code><span>string</span></td>
+<td>Date on which user can sell required holding stock</td>
+</tr>
+<tr>
+<td><code>price</code><span>float64</span></td>
+<td></td>
+</tr>
+<tr>
+<td><code>average_price</code><span>float64</span></td>
+<td>Average price at which the net holding quantity was acquired</td>
+</tr>
+<tr>
+<td><code>last_price</code><span>float64</span></td>
+<td>Last traded market price of the instrument</td>
+</tr>
+<tr>
+<td><code>close_price</code><span>float64</span></td>
+<td>Closing price of the instrument from the last trading day</td>
+</tr>
+<tr>
+<td><code>pnl</code><span>float64</span></td>
+<td>Net returns on the stock; Profit and loss</td>
+</tr>
+<tr>
+<td><code>day_change</code><span>float64</span></td>
+<td>Day's change in absolute value for the stock</td>
+</tr>
+<tr>
+<td><code>day_change_percentage</code><span>float64</span></td>
+<td>Day's change in percentage for the stock</td>
+</tr>
+<tr>
+<td><code>product</code><span>string</span></td>
+<td>Margin product applied to the holding</td>
+</tr>
+<tr>
+<td><code>collateral_quantity</code><span>int64</span></td>
+<td>Quantity used as collateral</td>
+</tr>
+<tr>
+<td><code>collateral_type</code><span>null,string</span></td>
+<td>Type of collateral</td>
+</tr>
+<tr>
+<td><code>discrepancy</code><span>bool</span></td>
+<td>Indicates whether holding has any price discrepancy</td>
+</tr>
+</tbody>
+</table>
+<h2 id="holdings-auction-list">Holdings auction list<a class="headerlink" href="#holdings-auction-list" title="Permanent link">&para;</a></h2>
+<p>This API returns a list of auctions that are currently being held, along with details about each auction such as the auction number, the security being auctioned, the last price of the security, and the quantity of the security being offered. Only the stocks that you hold in your demat account will be shown in the auctions list.</p>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span><span class="s2">&quot;https://api.kite.trade/portfolio/holdings/auctions&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-H<span class="w"> </span><span class="s2">&quot;X-Kite-Version: 3&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-H<span class="w"> </span><span class="s2">&quot;Authorization: token api_key:access_token&quot;</span>
+</code></pre></div>
+<div class="highlight"><pre><span></span><code><span class="p">{</span>
+<span class="w">  </span><span class="nt">&quot;status&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;success&quot;</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">&quot;data&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+<span class="w">    </span><span class="p">{</span>
+<span class="w">      </span><span class="nt">&quot;tradingsymbol&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;ASHOKLEY&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;exchange&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;NSE&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;instrument_token&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">54282</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;isin&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;INE208A01029&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;product&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;CNC&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;t1_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;realised_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;authorised_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;authorised_date&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;2022-12-21 00:00:00&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;opening_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;collateral_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;collateral_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;discrepancy&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">false</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;average_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">131.95</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;last_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">142.5</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;close_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">145.1</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;pnl&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">10.550000000000011</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;day_change&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">-2.5999999999999943</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;day_change_percentage&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">-1.7918676774638143</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;auction_number&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;20&quot;</span>
+<span class="w">    </span><span class="p">},</span>
+<span class="w">    </span><span class="p">{</span>
+<span class="w">      </span><span class="nt">&quot;tradingsymbol&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;BHEL&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;exchange&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;NSE&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;instrument_token&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">112138</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;isin&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;INE257A01026&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;product&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;CNC&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">5</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;t1_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;realised_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">5</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;authorised_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;authorised_date&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;2022-12-21 00:00:00&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;opening_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">5</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;collateral_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;collateral_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;discrepancy&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">false</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;average_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">75.95</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;last_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">81.1</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;close_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">84</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;pnl&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">25.749999999999957</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;day_change&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">-2.9000000000000057</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;day_change_percentage&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">-3.4523809523809588</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;auction_number&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;34&quot;</span>
+<span class="w">    </span><span class="p">},</span>
+<span class="w">    </span><span class="p">{</span>
+<span class="w">      </span><span class="nt">&quot;tradingsymbol&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;SBIN&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;exchange&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;NSE&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;instrument_token&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">779530</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;isin&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;INE062A01020&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;product&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;CNC&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">3</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;t1_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;realised_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">3</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;authorised_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;authorised_date&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;2022-12-21 00:00:00&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;opening_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">3</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;collateral_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;collateral_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;discrepancy&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">false</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;average_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">573.4</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;last_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">593.75</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;close_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">604.6</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;pnl&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">61.05000000000007</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;day_change&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">-10.850000000000023</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;day_change_percentage&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">-1.794574925570629</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;auction_number&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;7529&quot;</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">  </span><span class="p">]</span>
+<span class="p">}</span>
+</code></pre></div>
+<h3 id="response-attributes_1">Response attributes<a class="headerlink" href="#response-attributes_1" title="Permanent link">&para;</a></h3>
+<table>
+<thead>
+<tr>
+<th>attribute</th>
+<th>&nbsp;</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>auction_number</code><span>string</span></td>
+<td>A unique identifier for a particular auction</td>
+</tr>
+</tbody>
+</table>
+<h2 id="positions">Positions<a class="headerlink" href="#positions" title="Permanent link">&para;</a></h2>
+<p>Positions contain the user's portfolio of short to medium term derivatives (futures and options contracts) and intraday equity stocks. Instruments in the positions portfolio remain there until they're sold, or until expiry, which, for derivatives, is typically three months. Equity positions carried overnight move to the holdings portfolio the next day.</p>
+<p>The positions API returns two sets of positions, <code>net</code> and <code>day</code>. <code>net</code> is the actual, current net position portfolio, while <code>day</code> is a snapshot of the buying and selling activity for that particular day. This is useful for computing intraday profits and losses for trading strategies.</p>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span><span class="s2">&quot;https://api.kite.trade/portfolio/positions&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-H<span class="w"> </span><span class="s2">&quot;X-Kite-Version: 3&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-H<span class="w"> </span><span class="s2">&quot;Authorization: token api_key:access_token&quot;</span>
+</code></pre></div>
+<div class="highlight"><pre><span></span><code><span class="p">{</span>
+<span class="w">    </span><span class="nt">&quot;status&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;success&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;data&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="nt">&quot;net&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+<span class="w">            </span><span class="p">{</span>
+<span class="w">                </span><span class="nt">&quot;tradingsymbol&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;LEADMINI17DECFUT&quot;</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;exchange&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;MCX&quot;</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;instrument_token&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">53496327</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;product&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;NRML&quot;</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;overnight_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;multiplier&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1000</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;average_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">161.05</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;close_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;last_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">161.05</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;value&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">-161050</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;pnl&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;m2m&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;unrealised&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;realised&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;buy_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;buy_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">161.05</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;buy_value&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">161050</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;buy_m2m&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">161050</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;sell_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;sell_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;sell_value&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;sell_m2m&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;day_buy_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;day_buy_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">161.05</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;day_buy_value&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">161050</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;day_sell_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;day_sell_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;day_sell_value&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span>
+<span class="w">            </span><span class="p">},</span>
+<span class="w">            </span><span class="p">{</span>
+<span class="w">                </span><span class="nt">&quot;tradingsymbol&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;GOLDGUINEA17DECFUT&quot;</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;exchange&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;MCX&quot;</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;instrument_token&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">53505799</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;product&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;NRML&quot;</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;overnight_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">3</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;multiplier&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;average_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;close_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">23232</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;last_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">23355</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;value&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">801</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;pnl&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">801</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;m2m&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">276</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;unrealised&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">801</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;realised&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;buy_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">4</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;buy_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">23139.75</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;buy_value&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">92559</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;buy_m2m&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">93084</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;sell_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">4</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;sell_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">23340</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;sell_value&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">93360</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;sell_m2m&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">93360</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;day_buy_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;day_buy_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">23388</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;day_buy_value&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">23388</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;day_sell_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">4</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;day_sell_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">23340</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;day_sell_value&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">93360</span>
+<span class="w">            </span><span class="p">},</span>
+<span class="w">            </span><span class="p">{</span>
+<span class="w">                </span><span class="nt">&quot;tradingsymbol&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;SBIN&quot;</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;exchange&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;NSE&quot;</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;instrument_token&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">779521</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;product&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;CO&quot;</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;overnight_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;multiplier&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;average_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;close_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;last_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">308.4</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;value&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">-2</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;pnl&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">-2</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;m2m&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">-2</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;unrealised&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">-2</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;realised&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;buy_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;buy_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">311</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;buy_value&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">311</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;buy_m2m&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">311</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;sell_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;sell_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">309</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;sell_value&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">309</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;sell_m2m&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">309</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;day_buy_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;day_buy_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">311</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;day_buy_value&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">311</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;day_sell_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;day_sell_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">309</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;day_sell_value&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">309</span>
+<span class="w">            </span><span class="p">}</span>
+<span class="w">        </span><span class="p">],</span>
+<span class="w">        </span><span class="nt">&quot;day&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+<span class="w">            </span><span class="p">{</span>
+<span class="w">                </span><span class="nt">&quot;tradingsymbol&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;GOLDGUINEA17DECFUT&quot;</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;exchange&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;MCX&quot;</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;instrument_token&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">53505799</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;product&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;NRML&quot;</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">-3</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;overnight_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;multiplier&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;average_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">23340</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;close_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">23232</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;last_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">23355</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;value&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">69972</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;pnl&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">-93</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;m2m&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">-93</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;unrealised&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">-93</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;realised&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;buy_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;buy_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">23388</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;buy_value&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">23388</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;buy_m2m&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">23388</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;sell_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">4</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;sell_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">23340</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;sell_value&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">93360</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;sell_m2m&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">93360</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;day_buy_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;day_buy_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">23388</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;day_buy_value&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">23388</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;day_sell_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">4</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;day_sell_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">23340</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;day_sell_value&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">93360</span>
+<span class="w">            </span><span class="p">},</span>
+<span class="w">            </span><span class="p">{</span>
+<span class="w">                </span><span class="nt">&quot;tradingsymbol&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;LEADMINI17DECFUT&quot;</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;exchange&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;MCX&quot;</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;instrument_token&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">53496327</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;product&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;NRML&quot;</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;overnight_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;multiplier&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1000</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;average_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">161.05</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;close_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;last_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">161.05</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;value&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">-161050</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;pnl&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;m2m&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;unrealised&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;realised&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;buy_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;buy_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">161.05</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;buy_value&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">161050</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;buy_m2m&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">161050</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;sell_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;sell_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;sell_value&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;sell_m2m&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;day_buy_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;day_buy_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">161.05</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;day_buy_value&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">161050</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;day_sell_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;day_sell_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;day_sell_value&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span>
+<span class="w">            </span><span class="p">},</span>
+<span class="w">            </span><span class="p">{</span>
+<span class="w">                </span><span class="nt">&quot;tradingsymbol&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;SBIN&quot;</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;exchange&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;NSE&quot;</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;instrument_token&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">779521</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;product&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;CO&quot;</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;overnight_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;multiplier&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;average_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;close_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;last_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">308.4</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;value&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">-2</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;pnl&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">-2</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;m2m&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">-2</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;unrealised&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">-2</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;realised&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;buy_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;buy_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">311</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;buy_value&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">311</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;buy_m2m&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">311</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;sell_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;sell_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">309</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;sell_value&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">309</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;sell_m2m&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">309</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;day_buy_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;day_buy_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">311</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;day_buy_value&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">311</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;day_sell_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;day_sell_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">309</span><span class="p">,</span>
+<span class="w">                </span><span class="nt">&quot;day_sell_value&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">309</span>
+<span class="w">            </span><span class="p">}</span>
+<span class="w">        </span><span class="p">]</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+<h3 id="response-attributes_2">Response attributes<a class="headerlink" href="#response-attributes_2" title="Permanent link">&para;</a></h3>
+<table>
+<thead>
+<tr>
+<th>attribute</th>
+<th>&nbsp;</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>tradingsymbol</code><span>string</span></td>
+<td>Exchange tradingsymbol of the instrument</td>
+</tr>
+<tr>
+<td><code>exchange</code><span>string</span></td>
+<td>Exchange</td>
+</tr>
+<tr>
+<td><code>instrument_token</code><span>uint32</span></td>
+<td>The numerical identifier issued by the exchange representing the instrument. Used for subscribing to live market data over WebSocket</td>
+</tr>
+<tr>
+<td><code>product</code><span>string</span></td>
+<td>Margin product applied to the position</td>
+</tr>
+<tr>
+<td><code>quantity</code><span>int64</span></td>
+<td>Quantity held</td>
+</tr>
+<tr>
+<td><code>overnight_quantity</code><span>int64</span></td>
+<td>Quantity held previously and carried forward over night</td>
+</tr>
+<tr>
+<td><code>multiplier</code><span>int64</span></td>
+<td>The quantity/lot size multiplier used for calculating P&amp;Ls.</td>
+</tr>
+<tr>
+<td><code>average_price</code><span>float64</span></td>
+<td>Average price at which the net position quantity was acquired</td>
+</tr>
+<tr>
+<td><code>close_price</code><span>float64</span></td>
+<td>Closing price of the instrument from the last trading day</td>
+</tr>
+<tr>
+<td><code>last_price</code><span>float64</span></td>
+<td>Last traded market price of the instrument</td>
+</tr>
+<tr>
+<td><code>value</code><span>float64</span></td>
+<td>Net value of the position</td>
+</tr>
+<tr>
+<td><code>pnl</code><span>float64</span></td>
+<td>Net returns on the position; Profit and loss</td>
+</tr>
+<tr>
+<td><code>m2m</code><span>float64</span></td>
+<td>Mark to market returns (computed based on the last close and the last traded price)</td>
+</tr>
+<tr>
+<td><code>unrealised</code><span>float64</span></td>
+<td>Unrealised intraday returns</td>
+</tr>
+<tr>
+<td><code>realised</code><span>float64</span></td>
+<td>Realised intraday returns</td>
+</tr>
+<tr>
+<td><code>buy_quantity</code><span>int64</span></td>
+<td>Quantity bought and added to the position</td>
+</tr>
+<tr>
+<td><code>buy_price</code><span>float64</span></td>
+<td>Average price at which quantities were bought</td>
+</tr>
+<tr>
+<td><code>buy_value</code><span>float64</span></td>
+<td>Net value of the bought quantities</td>
+</tr>
+<tr>
+<td><code>buy_m2m</code><span>float64</span></td>
+<td>Mark to market returns on the bought quantities</td>
+</tr>
+<tr>
+<td><code>day_buy_quantity</code><span>int64</span></td>
+<td>Quantity bought and added to the position during the day</td>
+</tr>
+<tr>
+<td><code>day_buy_price</code><span>float64</span></td>
+<td>Average price at which quantities were bought during the day</td>
+</tr>
+<tr>
+<td><code>day_buy_value</code><span>float64</span></td>
+<td>Net value of the quantities bought during the day</td>
+</tr>
+<tr>
+<td><code>sell_quantity</code><span>int64</span></td>
+<td>Quantity sold off from the position</td>
+</tr>
+<tr>
+<td><code>sell_price</code><span>float64</span></td>
+<td>Average price at which quantities were sold</td>
+</tr>
+<tr>
+<td><code>sell_value</code><span>float64</span></td>
+<td>Net value of the sold quantities</td>
+</tr>
+<tr>
+<td><code>sell_m2m</code><span>float64</span></td>
+<td>Mark to market returns on the sold quantities</td>
+</tr>
+<tr>
+<td><code>day_sell_quantity</code><span>int64</span></td>
+<td>Quantity sold off from the position during the day</td>
+</tr>
+<tr>
+<td><code>day_sell_price</code><span>float64</span></td>
+<td>Average price at which quantities were sold during the day</td>
+</tr>
+<tr>
+<td><code>day_sell_value</code><span>float64</span></td>
+<td>Net value of the quantities sold during the day</td>
+</tr>
+</tbody>
+</table>
+<h2 id="position-conversion">Position conversion<a class="headerlink" href="#position-conversion" title="Permanent link">&para;</a></h2>
+<p>All positions held are of specific margin products such as NRML, MIS etc. A position can have one and only one margin product. These products affect how the user's margin usage and free cash values are computed, and a user may want to covert or change a position's margin product from time to time. <a href="https://zerodha.com/z-connect/tradezerodha/margin-requirements/zerodha-margin-policies">More on margin policies</a>.</p>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>--request<span class="w"> </span>PUT<span class="w"> </span>https://api.kite.trade/portfolio/positions
+<span class="w">    </span>-H<span class="w"> </span><span class="s2">&quot;X-Kite-Version: 3&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-H<span class="w"> </span><span class="s2">&quot;Authorization: token api_key:access_token&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-d<span class="w"> </span><span class="s2">&quot;tradingsymbol=INFY&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-d<span class="w"> </span><span class="s2">&quot;exchange=NSE&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-d<span class="w"> </span><span class="s2">&quot;transaction_type=BUY&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-d<span class="w"> </span><span class="s2">&quot;position_type=overnight&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-d<span class="w"> </span><span class="s2">&quot;quantity=3&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-d<span class="w"> </span><span class="s2">&quot;old_product=NRML&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-d<span class="w"> </span><span class="s2">&quot;new_product=MIS&quot;</span>
+</code></pre></div>
+<div class="highlight"><pre><span></span><code><span class="p">{</span>
+<span class="w">    </span><span class="nt">&quot;status&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;success&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;data&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span>
+<span class="p">}</span>
+</code></pre></div>
+<h3 id="request-parameters">Request parameters<a class="headerlink" href="#request-parameters" title="Permanent link">&para;</a></h3>
+<table>
+<thead>
+<tr>
+<th>parameter</th>
+<th>&nbsp;</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>tradingsymbol</code></td>
+<td>Tradingsymbol of the instrument</td>
+</tr>
+<tr>
+<td><code>exchange</code></td>
+<td>Name of the exchange</td>
+</tr>
+<tr>
+<td><code>transaction_type</code></td>
+<td>BUY or SELL</td>
+</tr>
+<tr>
+<td><code>position_type</code></td>
+<td>overnight or day</td>
+</tr>
+<tr>
+<td><code>quantity</code></td>
+<td>Quantity to convert</td>
+</tr>
+<tr>
+<td><code>old_product</code></td>
+<td>Existing margin product of the position</td>
+</tr>
+<tr>
+<td><code>new_product</code></td>
+<td>Margin product to convert to</td>
+</tr>
+</tbody>
+</table>
+<h2 id="exiting-holdings-and-positions">Exiting holdings and positions<a class="headerlink" href="#exiting-holdings-and-positions" title="Permanent link">&para;</a></h2>
+<p>There are no special API calls for exiting instruments from holdings and positions portfolios. The way to do it is to place an opposite BUY or SELL order depending on whether the position is a long or a short (MARKET order for an immediate exit). It is important to note that the exit order should carry the same <code>product</code> as the existing position. If the exit order is of a different margin product, it may be treated as a new position in the portfolio.</p>
+<h2 id="holdings-authorisation">Holdings authorisation<a class="headerlink" href="#holdings-authorisation" title="Permanent link">&para;</a></h2>
+<p>When executing sell transactions on equity holdings, where shares have to be debited from a user's demat account, a broker either requires a PoA (Power of Attorney) or an electronic authorisation at the depository from the user, to debit shares and settle the transactions.</p>
+<p>Electronic authorisation happens centrally on the depostiory's portal (CDSL in Zerodha's case) when the user executing the sell transaction keys in their demat PIN, similar to a netbanking flow. The demat PIN is known only to the demat account holder and the depository, and not the broker.</p>
+<p>In a single authorisation transaction, multiple shares with <code>n</code> quantities each, can be authorised. The authorisations are valid for a single trading session in a day (beginning of the day till 5:30 PM, after which, the authorisations are for the next trading day). The quantity in a sell transaction need not be the same as <code>n</code>, just that at any point, the total sell quantities, even over multiple days, should not exceed <code>n</code>. When it does, the order API throws an error asking for authorisation, at which point, the user has to be directed to the authorisation flow. To illustrate:</p>
+<ol>
+<li>User has 50 quantity of INFY in their demat. There is no authorisation at this point.</li>
+<li>User attempts to sell 10 quantity of INFY. The <code>POST /orders</code> API throws error &ldquo;<em>10 quantity needs authorisation at depository.</em>&rdquo; (<code>HTTP status 428</code>).</li>
+<li>On encountering <code>428</code>, the authorisation flow is initiated and the user is redirected to the depository's portal. By default, Kite prompts the user to authorise the maximum quantities for every stock in their holding to avoid having to disrupt the sell transactions with the authorisation flow every time. In this case, 50 quantity of INFY is authorised.</li>
+<li>User retries the transaction and 10 quantity is sold. 40 quantity remains authorised for the rest of the trading day (until 5:30 PM) and the user is not prompted for further authorisation until the remaining quantities have been sold.</li>
+</ol>
+<h3 id="initiating-authorisation">Initiating authorisation<a class="headerlink" href="#initiating-authorisation" title="Permanent link">&para;</a></h3>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>--request<span class="w"> </span>POST<span class="w"> </span>https://api.kite.trade/portfolio/holdings/authorise
+<span class="w">    </span>-H<span class="w"> </span><span class="s2">&quot;X-Kite-Version: 3&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-H<span class="w"> </span><span class="s2">&quot;Authorization: token api_key:access_token&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-d<span class="w"> </span><span class="s2">&quot;isin=INE002A01018&quot;</span><span class="w"> </span>-d<span class="w"> </span><span class="s2">&quot;quantity=50&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-d<span class="w"> </span><span class="s2">&quot;isin=INE009A01021&quot;</span><span class="w"> </span>-d<span class="w"> </span><span class="s2">&quot;quantity=50&quot;</span>
+</code></pre></div>
+<div class="highlight"><pre><span></span><code><span class="p">{</span>
+<span class="w">  </span><span class="nt">&quot;status&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;success&quot;</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">&quot;data&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="nt">&quot;request_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;na8QgCeQm05UHG6NL9sAGRzdfSF64UdB&quot;</span>
+<span class="w">  </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+<p>The <code>isin</code> and <code>quantity</code> pairs here are optional. If they're provided, authorisation is sought only for those instruments and otherwise, the entire holdings is presented for authorisation. The <code>request_id</code> is then used to redirect the user to the following URL in a webivew or a popup.</p>
+<p><code>https://kite.zerodha.com/connect/portfolio/authorise/holdings/:api_key/:request_id</code></p>
+<p>After the user finishes the transaction, the webview is redirected to <code>/connect/portfolio/authorise/holdings/:api_key/:request_id/finish?status=success</code>. Mobile applications can watch for this URL to detect the end of the transaction. <code>success</code> or <code>error</code> value in the <code>status</code> query param indicates the result.</p>
+<p>Web applications can invoke this flow using the <code>authHoldings()</code> call in the <a href="../publisher/">Publisher Javascript plugin</a>. It provides a callback event with the completion status along with additional metadata.</p>
+
+
+
+
+
+                
+              </article>
+            </div>
+          
+          
+        </div>
+        
+      </main>
+      
+        <footer class="md-footer">
+  
+  <div class="md-footer-meta md-typeset">
+    <div class="md-footer-meta__inner md-grid">
+      <div class="md-copyright">
+  
+    <div class="md-copyright__highlight">
+      Copyright &copy; 2015 - 2025, Zerodha Technology Pvt. Ltd.
+    </div>
+  
+  
+    Made with
+    <a href="https://squidfunk.github.io/mkdocs-material/" target="_blank" rel="noopener">
+      Material for MkDocs
+    </a>
+  
+</div>
+      
+    </div>
+  </div>
+</footer>
+      
+    </div>
+    <div class="md-dialog" data-md-component="dialog">
+      <div class="md-dialog__inner md-typeset"></div>
+    </div>
+    
+    <script id="__config" type="application/json">{"base": "..", "features": [], "search": "../assets/javascripts/workers/search.74e28a9f.min.js", "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}}</script>
+    
+    
+      <script src="../assets/javascripts/bundle.220ee61c.min.js"></script>
+      
+    
+  </body>
+</html>

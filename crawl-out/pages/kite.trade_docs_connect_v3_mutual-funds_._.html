@@ -1,0 +1,1434 @@
+
+<!doctype html>
+<html lang="en" class="no-js">
+  <head>
+    
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      
+      
+      
+      
+        <link rel="prev" href="../postbacks/">
+      
+      
+        <link rel="next" href="../margins/">
+      
+      <link rel="icon" href="../images/favicon">
+      <meta name="generator" content="mkdocs-1.4.3, mkdocs-material-9.1.18">
+    
+    
+      
+        <title>Mutual funds - Kite Connect 3 / API documentation</title>
+      
+    
+    
+      <link rel="stylesheet" href="../assets/stylesheets/main.26e3688c.min.css">
+      
+        
+        <link rel="stylesheet" href="../assets/stylesheets/palette.ecc896b0.min.css">
+      
+      
+
+    
+    
+    
+      
+        
+        
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+        <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Roboto:300,300i,400,400i,700,700i%7CRoboto+Mono:400,400i,700,700i&display=fallback">
+        <style>:root{--md-text-font:"Roboto";--md-code-font:"Roboto Mono"}</style>
+      
+    
+    
+      <link rel="stylesheet" href="../static/style.css">
+    
+    <script>__md_scope=new URL("..",location),__md_hash=e=>[...e].reduce((e,_)=>(e<<5)-e+_.charCodeAt(0),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
+    
+      
+
+    
+    
+    
+  </head>
+  
+  
+    
+    
+    
+    
+    
+    <body dir="ltr" data-md-color-scheme="default" data-md-color-primary="white" data-md-color-accent="red">
+  
+    
+    
+    <input class="md-toggle" data-md-toggle="drawer" type="checkbox" id="__drawer" autocomplete="off">
+    <input class="md-toggle" data-md-toggle="search" type="checkbox" id="__search" autocomplete="off">
+    <label class="md-overlay" for="__drawer"></label>
+    <div data-md-component="skip">
+      
+        
+        <a href="#mutual-funds" class="md-skip">
+          Skip to content
+        </a>
+      
+    </div>
+    <div data-md-component="announce">
+      
+    </div>
+    
+    
+      
+
+  
+
+<header class="md-header md-header--shadow" data-md-component="header">
+  <nav class="md-header__inner md-grid" aria-label="Header">
+    <a href=".." title="Kite Connect 3 / API documentation" class="md-header__button md-logo" aria-label="Kite Connect 3 / API documentation" data-md-component="logo">
+      
+  <img src="../images/logo.svg" alt="logo">
+
+    </a>
+    <label class="md-header__button md-icon" for="__drawer">
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M3 6h18v2H3V6m0 5h18v2H3v-2m0 5h18v2H3v-2Z"/></svg>
+    </label>
+    <div class="md-header__title" data-md-component="header-title">
+      <div class="md-header__ellipsis">
+        <div class="md-header__topic">
+          <span class="md-ellipsis">
+            Kite Connect 3 / API documentation
+          </span>
+        </div>
+        <div class="md-header__topic" data-md-component="header-topic">
+          <span class="md-ellipsis">
+            
+              Mutual funds
+            
+          </span>
+        </div>
+      </div>
+    </div>
+    
+      
+    
+    
+    
+      <label class="md-header__button md-icon" for="__search">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.516 6.516 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5Z"/></svg>
+      </label>
+      <div class="md-search" data-md-component="search" role="dialog">
+  <label class="md-search__overlay" for="__search"></label>
+  <div class="md-search__inner" role="search">
+    <form class="md-search__form" name="search">
+      <input type="text" class="md-search__input" name="query" aria-label="Search" placeholder="Search" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false" data-md-component="search-query" required>
+      <label class="md-search__icon md-icon" for="__search">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.516 6.516 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5Z"/></svg>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11h12Z"/></svg>
+      </label>
+      <nav class="md-search__options" aria-label="Search">
+        
+        <button type="reset" class="md-search__icon md-icon" title="Clear" aria-label="Clear" tabindex="-1">
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12 19 6.41Z"/></svg>
+        </button>
+      </nav>
+      
+    </form>
+    <div class="md-search__output">
+      <div class="md-search__scrollwrap" data-md-scrollfix>
+        <div class="md-search-result" data-md-component="search-result">
+          <div class="md-search-result__meta">
+            Initializing search
+          </div>
+          <ol class="md-search-result__list" role="presentation"></ol>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+    
+    
+  </nav>
+  
+</header>
+    
+    <div class="md-container" data-md-component="container">
+      
+      
+        
+          
+        
+      
+      <main class="md-main" data-md-component="main">
+        <div class="md-main__inner md-grid">
+          
+            
+              
+              <div class="md-sidebar md-sidebar--primary" data-md-component="sidebar" data-md-type="navigation" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+
+<nav class="md-nav md-nav--primary" aria-label="Navigation" data-md-level="0">
+  <label class="md-nav__title" for="__drawer">
+    <a href=".." title="Kite Connect 3 / API documentation" class="md-nav__button md-logo" aria-label="Kite Connect 3 / API documentation" data-md-component="logo">
+      
+  <img src="../images/logo.svg" alt="logo">
+
+    </a>
+    Kite Connect 3 / API documentation
+  </label>
+  
+  <ul class="md-nav__list" data-md-scrollfix>
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href=".." class="md-nav__link">
+        Introduction
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../sdks/" class="md-nav__link">
+        Libraries and SDKs
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../response-structure/" class="md-nav__link">
+        Response structure
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../exceptions/" class="md-nav__link">
+        Exceptions and errors
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../user/" class="md-nav__link">
+        User
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../orders/" class="md-nav__link">
+        Orders
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../gtt/" class="md-nav__link">
+        GTT orders
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../alerts/" class="md-nav__link">
+        Alerts
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../portfolio/" class="md-nav__link">
+        Portfolio
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../market-quotes/" class="md-nav__link">
+        Market quotes and instruments
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../websocket/" class="md-nav__link">
+        WebSocket streaming
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../historical/" class="md-nav__link">
+        Historical candle data
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../postbacks/" class="md-nav__link">
+        Postbacks / WebHooks
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+    
+  
+  
+    <li class="md-nav__item md-nav__item--active">
+      
+      <input class="md-nav__toggle md-toggle" type="checkbox" id="__toc">
+      
+      
+        
+      
+      
+        <label class="md-nav__link md-nav__link--active" for="__toc">
+          Mutual funds
+          <span class="md-nav__icon md-icon"></span>
+        </label>
+      
+      <a href="./" class="md-nav__link md-nav__link--active">
+        Mutual funds
+      </a>
+      
+        
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#retrieving-orders" class="md-nav__link">
+    Retrieving orders
+  </a>
+  
+    <nav class="md-nav" aria-label="Retrieving orders">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#response-attributes" class="md-nav__link">
+    Response attributes
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#retrieving-an-individual-order" class="md-nav__link">
+    Retrieving an individual order
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#retrieving-all-sips" class="md-nav__link">
+    Retrieving all SIPs
+  </a>
+  
+    <nav class="md-nav" aria-label="Retrieving all SIPs">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#response-attributes_1" class="md-nav__link">
+    Response attributes
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#holdings" class="md-nav__link">
+    Holdings
+  </a>
+  
+    <nav class="md-nav" aria-label="Holdings">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#response-attributes_2" class="md-nav__link">
+    Response attributes
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#retrieving-the-full-instrument-list" class="md-nav__link">
+    Retrieving the full instrument list
+  </a>
+  
+    <nav class="md-nav" aria-label="Retrieving the full instrument list">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#response-columns" class="md-nav__link">
+    Response columns
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+      
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../margins/" class="md-nav__link">
+        Margin calculation
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../basket/" class="md-nav__link">
+        Publisher - Offsite orders
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../publisher/" class="md-nav__link">
+        Publisher JS plugin
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../apps/" class="md-nav__link">
+        Mobile and Desktop apps
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../changelog/" class="md-nav__link">
+        Changelog
+      </a>
+    </li>
+  
+
+    
+  </ul>
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+            
+              
+              <div class="md-sidebar md-sidebar--secondary" data-md-component="sidebar" data-md-type="toc" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#retrieving-orders" class="md-nav__link">
+    Retrieving orders
+  </a>
+  
+    <nav class="md-nav" aria-label="Retrieving orders">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#response-attributes" class="md-nav__link">
+    Response attributes
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#retrieving-an-individual-order" class="md-nav__link">
+    Retrieving an individual order
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#retrieving-all-sips" class="md-nav__link">
+    Retrieving all SIPs
+  </a>
+  
+    <nav class="md-nav" aria-label="Retrieving all SIPs">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#response-attributes_1" class="md-nav__link">
+    Response attributes
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#holdings" class="md-nav__link">
+    Holdings
+  </a>
+  
+    <nav class="md-nav" aria-label="Holdings">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#response-attributes_2" class="md-nav__link">
+    Response attributes
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#retrieving-the-full-instrument-list" class="md-nav__link">
+    Retrieving the full instrument list
+  </a>
+  
+    <nav class="md-nav" aria-label="Retrieving the full instrument list">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#response-columns" class="md-nav__link">
+    Response columns
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+          
+          
+            <div class="md-content" data-md-component="content">
+              <article class="md-content__inner md-typeset">
+                
+                  
+
+
+<h1 id="mutual-funds">Mutual funds<a class="headerlink" href="#mutual-funds" title="Permanent link">&para;</a></h1>
+<p>The mutual fund APIs allow managing SIPs of mutual funds listed on Zerodha's <a href="https://coin.zerodha.com">Coin platform</a>, where successful purchases are delivered to the buyer's DEMAT account. Order placement can't be done, as order placement needs payment from the user's bank account. The APIs are built on top of the BSE STARMF platform. The mutual fund APIs have been grouped here under a separate section as they differ in structure, although not substantially, from the other trading APIs.</p>
+<table>
+<thead>
+<tr>
+<th>type</th>
+<th>endpoint</th>
+<th>&nbsp;</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>GET</td>
+<td><a href="#retrieving-orders">/mf/orders</a></td>
+<td>Retrieve the list of all orders (open and executed) over the last 7 days</td>
+</tr>
+<tr>
+<td>GET</td>
+<td><a href="#retrieving-an-individual-order">/mf/orders/:order_id</a></td>
+<td>Retrieve an individual order</td>
+</tr>
+<tr>
+<td>GET</td>
+<td><a href="#retrieving-all-sips">/mf/sips/</a></td>
+<td>Retrieve the list of all open SIP orders</td>
+</tr>
+<tr>
+<td>GET</td>
+<td><a href="#holdings">/mf/holdings</a></td>
+<td>Retrieve the list of mutual fund holdings available in the DEMAT</td>
+</tr>
+<tr>
+<td>GET</td>
+<td><a href="#retrieving-the-full-instrument-list">/mf/instruments</a></td>
+<td>Retrieve the master list of all mutual funds available on the platform</td>
+</tr>
+</tbody>
+</table>
+<div class="admonition note">
+<p class="admonition-title">Note</p>
+<p>Dividend reinvestment schemes are currently not supported.</p>
+</div>
+<h2 id="retrieving-orders">Retrieving orders<a class="headerlink" href="#retrieving-orders" title="Permanent link">&para;</a></h2>
+<p>This API returns all orders placed in the last 7 days.</p>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span><span class="s2">&quot;https://api.kite.trade/mf/orders&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-H<span class="w"> </span><span class="s2">&quot;X-Kite-Version: 3&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-H<span class="w"> </span><span class="s2">&quot;Authorization: token api_key:access_token&quot;</span>
+</code></pre></div>
+<div class="highlight"><pre><span></span><code><span class="p">{</span>
+<span class="w">  </span><span class="nt">&quot;status&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;success&quot;</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">&quot;data&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+<span class="w">    </span><span class="p">{</span>
+<span class="w">      </span><span class="nt">&quot;status&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;REJECTED&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;purchase_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;FRESH&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;folio&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;order_timestamp&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;2021-06-30 08:33:07&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;average_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">0.0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;exchange_order_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;254657127&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;last_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">30.6800</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;tradingsymbol&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;INF179K01VY8&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;settlement_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;2122061&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;transaction_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;BUY&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;order_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;271989e0-a64e-4cf3-b4e4-afb8f38dd203&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;amount&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">1000.0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;tag&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;placed_by&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;ZV8062&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;exchange_timestamp&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;2021-06-30&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;variety&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;amc_sip&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;last_price_date&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;2021-06-29&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;status_message&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;AMC SIP: Insufficient balance.&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;fund&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;HDFC Balanced Advantage Fund - Direct Plan&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">0.0</span>
+<span class="w">    </span><span class="p">},</span>
+<span class="w">    </span><span class="p">{</span>
+<span class="w">      </span><span class="nt">&quot;status&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;REJECTED&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;purchase_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;ADDITIONAL&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;folio&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;order_timestamp&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;2021-06-30 01:30:02&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;average_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">0.0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;exchange_order_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;last_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">52.7980</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;tradingsymbol&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;INF174K01LS2&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;settlement_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;transaction_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;BUY&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;order_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;ef7e696c-2fa6-400b-b180-eb25e6a04ccf&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;amount&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">2000.0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;tag&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;coinandroidsip&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;placed_by&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;ZV8062&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;exchange_timestamp&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;variety&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;sip&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;last_price_date&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;2021-06-29&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;status_message&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;SIP: Insufficient balance.&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;fund&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;Kotak Flexicap Fund - Direct Plan&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">0.0</span>
+<span class="w">    </span><span class="p">},</span>
+<span class="w">    </span><span class="p">{</span>
+<span class="w">      </span><span class="nt">&quot;status&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;OPEN&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;purchase_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;FRESH&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;folio&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;order_timestamp&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;2021-06-29 12:20:28&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;average_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">0.0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;exchange_order_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;last_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">10.4324</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;tradingsymbol&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;INF761K01EE1&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;settlement_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;transaction_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;BUY&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;order_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;2b6ad4b7-c84e-4c76-b459-f3a8994184f1&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;amount&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">5000.0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;tag&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;placed_by&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;ZV8062&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;exchange_timestamp&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;variety&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;regular&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;last_price_date&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;2021-06-29&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;status_message&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;Insufficient fund. 1/5&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;fund&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;BOI AXA Arbitrage Fund - Direct Plan&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">0.0</span>
+<span class="w">    </span><span class="p">},</span>
+<span class="w">    </span><span class="p">{</span>
+<span class="w">      </span><span class="nt">&quot;status&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;REJECTED&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;purchase_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;FRESH&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;folio&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;order_timestamp&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;2021-06-29 08:36:41&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;average_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">0.0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;exchange_order_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;254447867&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;last_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">271.7500</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;tradingsymbol&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;INF179K01WA6&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;settlement_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;2122060&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;transaction_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;BUY&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;order_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;40410882-b1f8-4938-bb08-4bef2765cbfb&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;amount&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">1000.0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;tag&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;placed_by&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;ZV8062&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;exchange_timestamp&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;2021-06-29&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;variety&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;amc_sip&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;last_price_date&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;2021-06-29&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;status_message&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;AMC SIP: Insufficient balance.&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;fund&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;HDFC Balanced Advantage Fund - Direct Plan&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">0.0</span>
+<span class="w">    </span><span class="p">},</span>
+<span class="w">    </span><span class="p">{</span>
+<span class="w">      </span><span class="nt">&quot;status&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;OPEN&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;purchase_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;FRESH&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;folio&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;order_timestamp&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;2021-06-24 15:37:27&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;average_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">0.0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;exchange_order_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;last_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">11.5182</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;tradingsymbol&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;INF109K01V59&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;settlement_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;transaction_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;BUY&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;order_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;e67b8741-5054-4fd5-a2da-8c672e1f494a&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;amount&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">5000.0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;tag&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;placed_by&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;ZV8062&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;exchange_timestamp&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;variety&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;regular&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;last_price_date&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;2021-06-29&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;status_message&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;Insufficient fund. 3/5&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;fund&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;ICICI Prudential Bond Fund - Direct Plan&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">0.0</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">  </span><span class="p">]</span>
+<span class="p">}</span>
+</code></pre></div>
+<h3 id="response-attributes">Response attributes<a class="headerlink" href="#response-attributes" title="Permanent link">&para;</a></h3>
+<table>
+<thead>
+<tr>
+<th>attribute</th>
+<th>&nbsp;</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>order_id</code><span>string</span></td>
+<td>Unique order id</td>
+</tr>
+<tr>
+<td><code>exchange_order_id</code><span>null, string</span></td>
+<td>Exchange generated order id</td>
+</tr>
+<tr>
+<td><code>tradingsymbol</code><span>string</span></td>
+<td>ISIN of the fund</td>
+</tr>
+<tr>
+<td><code>status</code><span>null, string</span></td>
+<td>Current status of the order. Most common values or COMPLETE, REJECTED, CANCELLED, and OPEN. There may be other values as well</td>
+</tr>
+<tr>
+<td><code>status_message</code><span>null, string</span></td>
+<td>Textual description of the order's status. Failed orders come with human readable explanation</td>
+</tr>
+<tr>
+<td><code>folio</code><span>null, string</span></td>
+<td>Folio number generated by AMC for the completed purchase order</td>
+</tr>
+<tr>
+<td><code>fund</code><span>string</span></td>
+<td>Name of the fund</td>
+</tr>
+<tr>
+<td><code>order_timestamp</code><span>string</span></td>
+<td>Timestamp at which the order was registered by the API</td>
+</tr>
+<tr>
+<td><code>exchange_timestamp</code><span>string</span></td>
+<td>Date on which the order was registered by the exchange. Orders that don't reach the exchange have null timestamps</td>
+</tr>
+<tr>
+<td><code>settlement_id</code><span>string</span></td>
+<td>Exchange settlement ID</td>
+</tr>
+<tr>
+<td><code>transaction_type</code><span>string</span></td>
+<td>BUY or SELL</td>
+</tr>
+<tr>
+<td><code>amount</code><span>float64</span></td>
+<td>Amount placed for purchase of units</td>
+</tr>
+<tr>
+<td><code>variety</code><span>string</span></td>
+<td>Order variety (regular, sip)</td>
+</tr>
+<tr>
+<td><code>purchase_type</code><span>null, string</span></td>
+<td>FRESH or ADDITIONAL (null incase of SELL order)</td>
+</tr>
+<tr>
+<td><code>quantity</code><span>float64</span></td>
+<td>Number of units allotted or sold</td>
+</tr>
+<tr>
+<td><code>price</code><span>float64</span></td>
+<td>Buy or sell price</td>
+</tr>
+<tr>
+<td><code>last_price</code><span>float64</span></td>
+<td>Last available NAV price of the fund</td>
+</tr>
+<tr>
+<td><code>average_price</code><span>float64</span></td>
+<td>Allotted or sold NAV price</td>
+</tr>
+<tr>
+<td><code>placed_by</code><span>string</span></td>
+<td>Id of the user that placed the order</td>
+</tr>
+<tr>
+<td><code>last_price_date</code><span>string</span></td>
+<td>Date for which last NAV is available</td>
+</tr>
+<tr>
+<td><code>tag</code><span>string</span></td>
+<td>Tag that was sent with an order to identify it (alphanumeric, max 8 chars)</td>
+</tr>
+</tbody>
+</table>
+<h2 id="retrieving-an-individual-order">Retrieving an individual order<a class="headerlink" href="#retrieving-an-individual-order" title="Permanent link">&para;</a></h2>
+<p>While the orders list API returns orders within the last 7 days, given an order ID, this API will return the order details irrespective of its age.</p>
+<div class="highlight"><pre><span></span><code>curl<span class="w">  </span><span class="s2">&quot;https://api.kite.trade/mf/orders/123123&quot;</span>
+<span class="w">    </span>-H<span class="w"> </span><span class="s2">&quot;X-Kite-Version: 3&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-H<span class="w"> </span><span class="s2">&quot;Authorization: token api_key:access_token&quot;</span><span class="w"> </span><span class="se">\</span>
+</code></pre></div>
+<div class="highlight"><pre><span></span><code><span class="p">{</span>
+<span class="w">  </span><span class="nt">&quot;status&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;success&quot;</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">&quot;data&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="nt">&quot;status&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;OPEN&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;purchase_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;FRESH&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;exchange_order_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;last_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">10.4324</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;order_timestamp&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;2021-06-29 12:20:28&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;fund&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;BOI AXA Arbitrage Fund - Direct Plan&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;tradingsymbol&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;INF761K01EE1&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;tag&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;placed_by&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;ZV8062&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;last_price_date&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;2021-06-29&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;folio&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;variety&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;regular&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;exchange_timestamp&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;average_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">0.0</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;settlement_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;transaction_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;BUY&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;order_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;2b6ad4b7-c84e-4c76-b459-f3a8994184f1&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;amount&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">5000.0</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;status_message&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;Insufficient fund. 1/5&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span>
+<span class="w">  </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+<h2 id="retrieving-all-sips">Retrieving all SIPs<a class="headerlink" href="#retrieving-all-sips" title="Permanent link">&para;</a></h2>
+<p>This API returns the list of all active and paused SIPs</p>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span><span class="s2">&quot;https://api.kite.trade/mf/sips&quot;</span>
+<span class="w">    </span>-H<span class="w"> </span><span class="s2">&quot;X-Kite-Version: 3&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-H<span class="w"> </span><span class="s2">&quot;Authorization: token api_key:access_token&quot;</span><span class="w"> </span><span class="se">\</span>
+</code></pre></div>
+<div class="highlight"><pre><span></span><code><span class="p">{</span>
+<span class="nt">&quot;data&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+<span class="w">  </span><span class="p">{</span>
+<span class="w">    </span><span class="nt">&quot;status&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;ACTIVE&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;sip_reg_num&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;created&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;2021-05-05 05:56:27&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;dividend_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;idcw&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;instalment_amount&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">500.0</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;fund&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;Aditya Birla Sun Life Liquid Fund - Direct Plan&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;instalments&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">-1</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;next_instalment&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;2021-05-12&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;transaction_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;BUY&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;trigger_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;step_up&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">      </span><span class="nt">&quot;05-05&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">10</span>
+<span class="w">    </span><span class="p">},</span>
+<span class="w">    </span><span class="nt">&quot;tradingsymbol&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;INF209K01VD7&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;tag&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;coiniossip&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;frequency&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;weekly&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;last_instalment&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;2021-05-05 05:56:27&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;pending_instalments&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">-1</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;instalment_day&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;sip_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;sip&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;completed_instalments&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;sip_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;892741486820670&quot;</span>
+<span class="w">  </span><span class="p">},</span>
+<span class="w">  </span><span class="p">{</span>
+<span class="w">    </span><span class="nt">&quot;status&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;ACTIVE&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;sip_reg_num&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;created&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;2021-05-25 10:55:09&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;dividend_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;idcw&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;instalment_amount&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">1000.0</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;fund&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;HDFC Balanced Advantage Fund - Direct Plan&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;instalments&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">-1</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;next_instalment&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;2021-06-01&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;transaction_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;BUY&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;trigger_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;step_up&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">      </span><span class="nt">&quot;25-05&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">10</span>
+<span class="w">    </span><span class="p">},</span>
+<span class="w">    </span><span class="nt">&quot;tradingsymbol&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;INF179K01VY8&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;tag&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;coiniossip&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;frequency&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;weekly&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;last_instalment&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;2021-05-25 10:55:09&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;pending_instalments&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">-1</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;instalment_day&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;sip_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;sip&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;completed_instalments&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;sip_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;109195857904698&quot;</span>
+<span class="w">  </span><span class="p">},</span>
+<span class="w">  </span><span class="p">{</span>
+<span class="w">    </span><span class="nt">&quot;status&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;ACTIVE&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;sip_reg_num&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;15158182&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;created&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;2021-05-22 10:45:29&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;dividend_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;idcw&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;instalment_amount&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">1000.0</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;fund&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;HDFC Balanced Advantage Fund - Direct Plan&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;instalments&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">9999</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;next_instalment&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;2021-07-12&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;transaction_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;BUY&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;trigger_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;step_up&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{},</span>
+<span class="w">    </span><span class="nt">&quot;tradingsymbol&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;INF179K01VY8&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;tag&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;coinandroidsip&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;frequency&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;monthly&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;last_instalment&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;2021-06-10 08:37:11&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;pending_instalments&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">9998</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;instalment_day&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">10</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;sip_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;amc_sip&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;completed_instalments&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;sip_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;846479755969168&quot;</span>
+<span class="w">  </span><span class="p">},</span>
+<span class="w">  </span><span class="p">{</span>
+<span class="w">    </span><span class="nt">&quot;status&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;ACTIVE&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;sip_reg_num&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;16055666&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;created&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;2021-06-18 03:56:46&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;dividend_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;idcw&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;instalment_amount&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">1000.0</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;fund&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;HDFC Balanced Advantage Fund - Direct Plan&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;instalments&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">9999</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;next_instalment&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;2021-07-30&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;transaction_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;BUY&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;trigger_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;step_up&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{},</span>
+<span class="w">    </span><span class="nt">&quot;tradingsymbol&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;INF179K01VY8&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;tag&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;coinandroidsip&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;frequency&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;monthly&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;last_instalment&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;2021-06-30 08:33:07&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;pending_instalments&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">9998</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;instalment_day&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">30</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;sip_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;amc_sip&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;completed_instalments&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;sip_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;749073272501476&quot;</span>
+<span class="w">  </span><span class="p">},</span>
+<span class="w">  </span><span class="p">{</span>
+<span class="w">    </span><span class="nt">&quot;status&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;ACTIVE&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;sip_reg_num&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;created&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;2020-11-20 01:06:11&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;dividend_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;growth&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;instalment_amount&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">7427.0</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;fund&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;HDFC Hybrid Equity Fund - Direct Plan&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;instalments&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">-1</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;next_instalment&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;2021-02-19&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;transaction_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;BUY&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;trigger_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;step_up&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">      </span><span class="nt">&quot;20-11&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">30</span>
+<span class="w">    </span><span class="p">},</span>
+<span class="w">    </span><span class="nt">&quot;tradingsymbol&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;INF179K01XZ1&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;tag&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;coinandroidsip&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;frequency&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;quarterly&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;last_instalment&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;2020-11-20 01:06:11&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;pending_instalments&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">-1</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;instalment_day&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;sip_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;sip&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;completed_instalments&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;sip_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;576440634181776&quot;</span>
+<span class="w">  </span><span class="p">}]</span>
+<span class="p">}</span>
+</code></pre></div>
+<h3 id="response-attributes_1">Response attributes<a class="headerlink" href="#response-attributes_1" title="Permanent link">&para;</a></h3>
+<table>
+<thead>
+<tr>
+<th>attribute</th>
+<th>&nbsp;</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>sip_id</code><span>string</span></td>
+<td>Unique SIP id</td>
+</tr>
+<tr>
+<td><code>tradingsymbol</code><span>string</span></td>
+<td>ISIN of the fund.</td>
+</tr>
+<tr>
+<td><code>fund</code><span>string</span></td>
+<td>Name of the fund</td>
+</tr>
+<tr>
+<td><code>dividend_type</code><span>string</span></td>
+<td>Dividend type (growth, payout)</td>
+</tr>
+<tr>
+<td><code>transaction_type</code><span>string</span></td>
+<td>BUY or SELL</td>
+</tr>
+<tr>
+<td><code>status</code><span>string</span></td>
+<td>ACTIVE, PAUSED or CANCELLED</td>
+</tr>
+<tr>
+<td><code>created</code><span>string</span></td>
+<td>Timestamp at which the SIP was registered by the API</td>
+</tr>
+<tr>
+<td><code>frequency</code><span>string</span></td>
+<td>Frequency at which order is triggered (monthly, weekly, or quarterly)</td>
+</tr>
+<tr>
+<td><code>next_instalment</code><span>string</span></td>
+<td>Upcoming instalment date</td>
+</tr>
+<tr>
+<td><code>instalment_amount</code><span>int64</span></td>
+<td>Amount worth of units to purchase in each instalment</td>
+</tr>
+<tr>
+<td><code>instalments</code><span>int64</span></td>
+<td>Number of instalments (-1 in case of SIPs active until cancelled)</td>
+</tr>
+<tr>
+<td><code>last_instalment</code><span>string</span></td>
+<td>Timestamp at which the last instalment was triggered</td>
+</tr>
+<tr>
+<td><code>pending_instalments</code><span>int64</span></td>
+<td>Number of instalments pending (-1 in case of SIPs active until cancelled)</td>
+</tr>
+<tr>
+<td><code>instalment_day</code><span>int64</span></td>
+<td>Calendar day in a month on which SIP order to be triggered (valid only incase of frequency monthly, else 0)</td>
+</tr>
+<tr>
+<td><code>completed_instalments</code><span>int64</span></td>
+<td>Total number of completed instalments from the start</td>
+</tr>
+<tr>
+<td><code>tag</code><span>string</span></td>
+<td>Tag that was sent with an order to identify it (alphanumeric, max 8 chars)</td>
+</tr>
+</tbody>
+</table>
+<h2 id="holdings">Holdings<a class="headerlink" href="#holdings" title="Permanent link">&para;</a></h2>
+<p>Holdings contain the user's portfolio of allotted mutual fund units.</p>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span><span class="s2">&quot;https://api.kite.trade/mf/holdings&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-H<span class="w"> </span><span class="s2">&quot;X-Kite-Version: 3&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-H<span class="w"> </span><span class="s2">&quot;Authorization: token api_key:access_token&quot;</span><span class="w"> </span><span class="se">\</span>
+</code></pre></div>
+<div class="highlight"><pre><span></span><code><span class="p">{</span>
+<span class="w">  </span><span class="nt">&quot;status&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;success&quot;</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">&quot;data&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+<span class="w">    </span><span class="p">{</span>
+<span class="w">      </span><span class="nt">&quot;folio&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;3108290884&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;average_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">78.43</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;last_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">84.86</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;last_price_date&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;pledged_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;fund&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;INVESCO INDIA TAX PLAN - DIRECT PLAN&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;tradingsymbol&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;INF205K01NT8&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;pnl&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">382.488</span>
+<span class="w">    </span><span class="p">},</span>
+<span class="w">    </span><span class="p">{</span>
+<span class="w">      </span><span class="nt">&quot;folio&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;5102495241&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;average_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">1874.101138</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;last_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">2081.4984</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;last_price_date&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;pledged_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;fund&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;Indiabulls Liquid Fund - Direct Plan&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;tradingsymbol&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;INF666M01451&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;pnl&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">1.334</span>
+<span class="w">    </span><span class="p">},</span>
+<span class="w">    </span><span class="p">{</span>
+<span class="w">      </span><span class="nt">&quot;folio&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;9104386836&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;average_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">116.7</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;last_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">101.13</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;last_price_date&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;pledged_quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;fund&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;BOI AXA TAX ADVANTAGE FUND - DIRECT PLAN&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;tradingsymbol&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;INF761K01884&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;pnl&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">257.057</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">  </span><span class="p">]</span>
+<span class="p">}</span>
+</code></pre></div>
+<h3 id="response-attributes_2">Response attributes<a class="headerlink" href="#response-attributes_2" title="Permanent link">&para;</a></h3>
+<table>
+<thead>
+<tr>
+<th>attribute</th>
+<th>&nbsp;</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>folio</code><span>null, string</span></td>
+<td>Folio number generated by AMC for the completed purchase order (null incase of SELL order)</td>
+</tr>
+<tr>
+<td><code>fund</code><span>string</span></td>
+<td>Name of the fund</td>
+</tr>
+<tr>
+<td><code>tradingsymbol</code><span>string</span></td>
+<td>ISIN of the fund.</td>
+</tr>
+<tr>
+<td><code>average_price</code><span>float64</span></td>
+<td>Allotted NAV price for a completed BUY order; Selling NAV price for completed SELL order</td>
+</tr>
+<tr>
+<td><code>last_price</code><span>float64</span></td>
+<td>Last available NAV price of the fund</td>
+</tr>
+<tr>
+<td><code>pnl</code><span>float64</span></td>
+<td>Net returns of the holding. Based on the last available NAV price.</td>
+</tr>
+<tr>
+<td><code>last_price_date</code><span>string</span></td>
+<td>Date for which last NAV is available</td>
+</tr>
+<tr>
+<td><code>quantity</code><span>float64</span></td>
+<td>Quantity available in the client's holding for this ISIN.</td>
+</tr>
+</tbody>
+</table>
+<h2 id="retrieving-the-full-instrument-list">Retrieving the full instrument list<a class="headerlink" href="#retrieving-the-full-instrument-list" title="Permanent link">&para;</a></h2>
+<p>Unlike the rest of the calls that return JSON, the instrument list API returns a Gzipped CSV dump of mutual funds supported by Zerodha's <a href="https://coin.zerodha.com">Coin</a> platform.</p>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span><span class="s2">&quot;https://api.kite.trade/mf/instruments&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-H<span class="w"> </span><span class="s2">&quot;X-Kite-Version: 3&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-H<span class="w"> </span><span class="s2">&quot;Authorization: token api_key:access_token&quot;</span><span class="w"> </span><span class="se">\</span>
+</code></pre></div>
+<div class="highlight"><pre><span></span><code>tradingsymbol,amc,name,purchase_allowed,redemption_allowed,minimum_purchase_amount,purchase_amount_multiplier,minimum_additional_purchase_amount,minimum_redemption_quantity,redemption_quantity_multiplier,dividend_type,scheme_type,plan,settlement_type,last_price,last_price_date
+INF846K01DP8,AXISMUTUALFUND_MF,Axis Equity Fund - Direct Plan - Growth,1,1,5000.0,1.0,100.0,1.0,0.001,growth,equity,direct,T3,20.09,2016-11-11
+INF846K01EW2,AXISMUTUALFUND_MF,Axis Long Term Equity Fund - Direct Growth,1,1,500.0,500.0,500.0,1.0,0.001,growth,elss,direct,T3,33.0425,2016-11-11
+INF174K01LS2,KOTAKMAHINDRAMF,Kotak Select Focus Fund- Direct Plan - Growth,1,1,5000.0,1.0,1000.0,0.001,0.001,growth,equity,direct,T3,26.549,2016-11-11
+INF174K01336,KOTAKMAHINDRAMF,Kotak Select Focus Fund-Growth,1,1,5000.0,0.01,1000.0,0.001,0.001,growth,equity,regular,T3,25.635,2016-11-11
+</code></pre></div>
+<h3 id="response-columns">Response columns<a class="headerlink" href="#response-columns" title="Permanent link">&para;</a></h3>
+<table>
+<thead>
+<tr>
+<th>column</th>
+<th>&nbsp;</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>tradingsymbol</code><span>string</span></td>
+<td>ISIN of the fund</td>
+</tr>
+<tr>
+<td><code>amc</code><span>string</span></td>
+<td>AMC code as per the exchange</td>
+</tr>
+<tr>
+<td><code>name</code><span>string</span></td>
+<td>Fund name</td>
+</tr>
+<tr>
+<td><code>purchase_allowed</code><span>string</span></td>
+<td><code>0</code> or <code>1</code></td>
+</tr>
+<tr>
+<td><code>redemption_allowed</code><span>string</span></td>
+<td><code>0</code> or <code>1</code></td>
+</tr>
+<tr>
+<td><code>minimum_purchase_amount</code><span>float64</span></td>
+<td>Minimum purchase amount for the first BUY</td>
+</tr>
+<tr>
+<td><code>purchase_amount_multiplier</code><span>float64</span></td>
+<td>Buy amount should be in multiple of this value</td>
+</tr>
+<tr>
+<td><code>minimum_additional_purchase_amount</code><span>float64</span></td>
+<td>Minimum additional BUY amount</td>
+</tr>
+<tr>
+<td><code>minimum_redemption_quantity</code><span>float64</span></td>
+<td>Minimum SELL quantity</td>
+</tr>
+<tr>
+<td><code>redemption_quantity_multiplier</code><span>float64</span></td>
+<td>SELL quantity multiple</td>
+</tr>
+<tr>
+<td><code>dividend_type</code><span>string</span></td>
+<td><code>growth</code> or <code>payout</code></td>
+</tr>
+<tr>
+<td><code>scheme_type</code><span>string</span></td>
+<td><code>equity</code>, <code>debt</code>, <code>elss</code></td>
+</tr>
+<tr>
+<td><code>plan</code><span>string</span></td>
+<td><code>direct</code> or <code>regular</code></td>
+</tr>
+<tr>
+<td><code>settlement_type</code><span>string</span></td>
+<td>Settlement type of the fund (<code>T1</code>, <code>T2</code> etc.)</td>
+</tr>
+<tr>
+<td><code>last_price</code><span>float64</span></td>
+<td>Last available NAV price of the fund</td>
+</tr>
+<tr>
+<td><code>last_price_date</code><span>string</span></td>
+<td>Last available NAV's date</td>
+</tr>
+</tbody>
+</table>
+
+
+
+
+
+                
+              </article>
+            </div>
+          
+          
+        </div>
+        
+      </main>
+      
+        <footer class="md-footer">
+  
+  <div class="md-footer-meta md-typeset">
+    <div class="md-footer-meta__inner md-grid">
+      <div class="md-copyright">
+  
+    <div class="md-copyright__highlight">
+      Copyright &copy; 2015 - 2025, Zerodha Technology Pvt. Ltd.
+    </div>
+  
+  
+    Made with
+    <a href="https://squidfunk.github.io/mkdocs-material/" target="_blank" rel="noopener">
+      Material for MkDocs
+    </a>
+  
+</div>
+      
+    </div>
+  </div>
+</footer>
+      
+    </div>
+    <div class="md-dialog" data-md-component="dialog">
+      <div class="md-dialog__inner md-typeset"></div>
+    </div>
+    
+    <script id="__config" type="application/json">{"base": "..", "features": [], "search": "../assets/javascripts/workers/search.74e28a9f.min.js", "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}}</script>
+    
+    
+      <script src="../assets/javascripts/bundle.220ee61c.min.js"></script>
+      
+    
+  </body>
+</html>

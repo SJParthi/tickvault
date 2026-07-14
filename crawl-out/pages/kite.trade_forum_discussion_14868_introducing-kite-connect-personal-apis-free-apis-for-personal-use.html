@@ -1,0 +1,1325 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <link href='https://fonts.googleapis.com/css?family=Hind:400,600|Open+Sans:400,600,700' rel='stylesheet' type='text/css'>
+    <title>Introducing Kite Connect Personal APIs — Free APIs for personal use - Kite Connect developer forum</title>
+  <link rel="stylesheet" type="text/css" href="/forum/applications/dashboard/design/style.css?v=2.3.1" media="all" />
+  <link rel="stylesheet" type="text/css" href="/forum/plugins/ButtonBar/design/buttonbar.css?v=1.7.1" media="all" />
+  <link rel="stylesheet" type="text/css" href="/forum/plugins/GooglePrettify/design/prettify.css?v=1.2.2" media="all" />
+  <link rel="stylesheet" type="text/css" href="/forum/plugins/Tagging/design/tag.css?v=1.8.12" media="all" />
+  <link rel="stylesheet" type="text/css" href="/forum/plugins/Tagging/design/childtagslist.css?v=1.8.12" media="all" />
+  <link rel="stylesheet" type="text/css" href="/forum/resources/design/vanillicon.css?v=2.3.1" media="all" />
+  <link rel="stylesheet" type="text/css" href="/forum/plugins/editor/design/editor.css?v=1.7.7" media="all" />
+  <link rel="stylesheet" type="text/css" href="/forum/themes/kite/design/custom.css?v=2.3.1" media="all" />
+  <link rel="stylesheet" type="text/css" href="/forum/applications/dashboard/design/spoilers.css?v=2.3.1" media="all" />
+  <link rel="canonical" href="https://kite.trade/forum/discussion/14868/introducing-kite-connect-personal-apis-free-apis-for-personal-use" />
+  <meta property="og:type" content="article" />
+  <meta property="fb:app_id" content="950631401651649" />
+  <meta property="og:site_name" content="Kite Connect developer forum" />
+  <meta property="og:title" itemprop="name" content="Introducing Kite Connect Personal APIs — Free APIs for personal use" />
+  <meta property="og:url" content="https://kite.trade/forum/discussion/14868/introducing-kite-connect-personal-apis-free-apis-for-personal-use" />
+  <meta name="description" property="og:description" itemprop="description" content="We are excited to announce the launch of Kite Connect Personal, a new offering that gives you free access to your Zerodha account with all the essential features of Kite Connect, minus the market data (both real-time and historical)." />
+  <meta property="og:image" itemprop="image" content="https://kite.trade/forum/uploads/M58ZYS3K6UQU.jpg" />
+  <script type="text/javascript">gdn=window.gdn||{};gdn.meta={
+    "ConfirmDeleteCommentHeading": "Delete Comment",
+    "ConfirmDeleteCommentText": "Are you sure you want to delete this comment?",
+    "Spoiler": "Spoiler",
+    "show": "show",
+    "hide": "hide",
+    "emoji": {
+        "assetPath": "\/forum\/resources\/emoji",
+        "format": "<img class=\"emoji\" src=\"%1$s\" title=\"%2$s\" alt=\"%2$s\" height=\"20\" \/>",
+        "emoji": {
+            "smile": "smile.png",
+            "smiley": "smiley.png",
+            "wink": "wink.png",
+            "blush": "blush.png",
+            "neutral": "neutral.png",
+            "relaxed": "relaxed.png",
+            "grin": "grin.png",
+            "joy": "joy.png",
+            "sweat_smile": "sweat_smile.png",
+            "lol": "lol.png",
+            "innocent": "innocent.png",
+            "naughty": "naughty.png",
+            "yum": "yum.png",
+            "relieved": "relieved.png",
+            "love": "love.png",
+            "sunglasses": "sunglasses.png",
+            "smirk": "smirk.png",
+            "expressionless": "expressionless.png",
+            "unamused": "unamused.png",
+            "sweat": "sweat.png",
+            "pensive": "pensive.png",
+            "confused": "confused.png",
+            "confounded": "confounded.png",
+            "kissing": "kissing.png",
+            "kissing_heart": "kissing_heart.png",
+            "kissing_smiling_eyes": "kissing_smiling_eyes.png",
+            "kissing_closed_eyes": "kissing_closed_eyes.png",
+            "tongue": "tongue.png",
+            "disappointed": "disappointed.png",
+            "worried": "worried.png",
+            "angry": "angry.png",
+            "rage": "rage.png",
+            "cry": "cry.png",
+            "persevere": "persevere.png",
+            "triumph": "triumph.png",
+            "frowning": "frowning.png",
+            "anguished": "anguished.png",
+            "fearful": "fearful.png",
+            "weary": "weary.png",
+            "sleepy": "sleepy.png",
+            "tired_face": "tired_face.png",
+            "grimace": "grimace.png",
+            "bawling": "bawling.png",
+            "open_mouth": "open_mouth.png",
+            "hushed": "hushed.png",
+            "cold_sweat": "cold_sweat.png",
+            "scream": "scream.png",
+            "astonished": "astonished.png",
+            "flushed": "flushed.png",
+            "sleeping": "sleeping.png",
+            "dizzy": "dizzy.png",
+            "no_mouth": "no_mouth.png",
+            "mask": "mask.png",
+            "star": "star.png",
+            "cookie": "cookie.png",
+            "warning": "warning.png",
+            "mrgreen": "mrgreen.png",
+            "heart": "heart.png",
+            "heartbreak": "heartbreak.png",
+            "kiss": "kiss.png",
+            "+1": "+1.png",
+            "-1": "-1.png",
+            "grey_question": "grey_question.png",
+            "trollface": "trollface.png",
+            "error": "grey_question.png"
+        }
+    },
+    "DiscussionID": "14868",
+    "Category": "General",
+    "AnalyticsTask": "tick",
+    "TagHint": "Start to type...",
+    "ButtonBarLinkUrl": "Enter your URL:",
+    "ButtonBarImageUrl": "Enter image URL:",
+    "ButtonBarBBCodeHelpText": "You can use <b><a href=\"http:\/\/en.wikipedia.org\/wiki\/BBCode\" target=\"_new\">BBCode<\/a><\/b> in your post.",
+    "ButtonBarHtmlHelpText": "You can use <b><a href=\"http:\/\/htmlguide.drgrog.com\/cheatsheet.php\" target=\"_new\">Simple HTML<\/a><\/b> in your post.",
+    "ButtonBarMarkdownHelpText": "You can use <b><a href=\"http:\/\/en.wikipedia.org\/wiki\/Markdown\" target=\"_new\">Markdown<\/a><\/b> in your post.",
+    "InputFormat": "Html",
+    "editorVersion": "1.7.7",
+    "editorPluginAssets": "\/forum\/plugins\/editor",
+    "wysiwygHelpText": "You are using <a href=\"https:\/\/en.wikipedia.org\/wiki\/WYSIWYG\" target=\"_new\">WYSIWYG<\/a> in your post.",
+    "bbcodeHelpText": "You can use <a href=\"http:\/\/en.wikipedia.org\/wiki\/BBCode\" target=\"_new\">BBCode<\/a> in your post.",
+    "htmlHelpText": "You can use <a href=\"http:\/\/htmlguide.drgrog.com\/cheatsheet.php\" target=\"_new\">Simple HTML<\/a> in your post.",
+    "markdownHelpText": "You can use <a href=\"http:\/\/en.wikipedia.org\/wiki\/Markdown\" target=\"_new\">Markdown<\/a> in your post.",
+    "textHelpText": "You are using plain text in your post.",
+    "editorWysiwygCSS": "\/forum\/plugins\/editor\/design\/wysiwyg.css",
+    "canUpload": false,
+    "maxUploadSize": 2097152,
+    "editorFileInputName": "editorupload",
+    "allowedFileExtensions": "[\"txt\",\"jpg\",\"jpeg\",\"gif\",\"png\",\"bmp\",\"tiff\",\"ico\",\"zip\",\"gz\",\"tar.gz\",\"tgz\",\"psd\",\"ai\",\"fla\",\"pdf\",\"doc\",\"xls\",\"ppt\",\"docx\",\"xlsx\",\"log\",\"rar\",\"7z\"]",
+    "maxFileUploads": "20",
+    "LastCommentID": 49282,
+    "TransportError": "A fatal error occurred while processing the request.<br \/>The server returned the following response: %s",
+    "TransientKey": null,
+    "WebRoot": "https:\/\/kite.trade\/forum",
+    "UrlFormat": "\/forum\/{Path}",
+    "Path": "discussion\/14868\/introducing-kite-connect-personal-apis-free-apis-for-personal-use",
+    "Args": "",
+    "ResolvedPath": "vanilla\/discussion\/index",
+    "ResolvedArgs": {
+        "DiscussionID": "14868",
+        "DiscussionStub": "introducing-kite-connect-personal-apis-free-apis-for-personal-use",
+        "Page": ""
+    },
+    "SignedIn": 0,
+    "ConfirmHeading": "Confirm",
+    "ConfirmText": "Are you sure you want to do that?",
+    "Okay": "Okay",
+    "Cancel": "Cancel",
+    "Search": "Search"
+};</script>
+  <script src="//ajax.googleapis.com/ajax/libs/jquery/1.10.2/jquery.min.js?v=2.3.1" type="text/javascript"></script>
+  <script src="/forum/js/library/jquery.form.js?v=2.3.1" type="text/javascript"></script>
+  <script src="/forum/js/library/jquery.popup.js?v=2.3.1" type="text/javascript"></script>
+  <script src="/forum/js/library/jquery.gardenhandleajaxform.js?v=2.3.1" type="text/javascript"></script>
+  <script src="/forum/js/library/jquery.atwho.js?v=2.3.1" type="text/javascript"></script>
+  <script src="/forum/js/global.js?v=2.3.1" type="text/javascript"></script>
+  <script src="/forum/js/library/jquery.autosize.min.js?v=2.3.1" type="text/javascript"></script>
+  <script src="/forum/applications/vanilla/js/autosave.js?v=2.3.1" type="text/javascript"></script>
+  <script src="/forum/applications/vanilla/js/discussion.js?v=2.3.1" type="text/javascript"></script>
+  <script src="/forum/applications/dashboard/js/spoilers.js?v=2.3.1" type="text/javascript"></script>
+  <script src="/forum/plugins/GooglePrettify/js/prettify.js?v=1.2.2" type="text/javascript"></script>
+  <script src="/forum/plugins/ButtonBar/js/buttonbar.js?v=1.7.1" type="text/javascript"></script>
+  <script src="/forum/plugins/ButtonBar/js/jquery.hotkeys.js?v=1.7.1" type="text/javascript"></script>
+  <script src="/forum/plugins/editor/js/editor.js?v=1.7.7" type="text/javascript"></script>
+  <script src="/forum/plugins/editor/js/jquery.ui.widget.js?v=1.7.7" type="text/javascript"></script>
+  <script src="/forum/plugins/editor/js/jquery.iframe-transport.js?v=1.7.7" type="text/javascript"></script>
+  <script src="/forum/plugins/editor/js/jquery.fileupload.js?v=1.7.7" type="text/javascript"></script>
+  <script type="text/javascript">jQuery(function ($) {
+
+            function init() {
+                $('.Message').each(function () {
+                    if ($(this).data('GooglePrettify')) {
+                        return;
+                    }
+                    $(this).data('GooglePrettify', '1');
+
+                    pre = $('pre', this).addClass('prettyprint');
+
+                    // Let prettyprint determine styling, rather than the editor.
+                    $('code', this).removeClass('CodeInline');
+                    pre.removeClass('CodeBlock');
+
+                    prettyPrint();
+
+                    pre.removeClass('prettyprint');
+                });
+            }
+
+            $(document).on('CommentAdded PreviewLoaded popupReveal', init);
+            init();
+        });</script>
+</head>
+<body id="vanilla_discussion_index" class="Vanilla Discussion Index  Section-Discussion Section-color-green">
+<header class="header">
+    <div class="container">
+        <div class="row">
+            <div class="four columns logo-container">
+                <a href="/forum/" class="logo"><img src="https://kite.trade/forum/uploads/M58ZYS3K6UQU.jpg" alt="Kite Connect developer forum" /></a>
+                <a href="/forum/" class="logo-small"><img src="/forum/themes/kite/design/images/logo-small.png" /></a>
+
+                <a href="#" id="burger">☰</a>
+            </div>
+            <!-- <li><a href="/forum/entry/signin" rel="nofollow" class="SignInPopup">Sign In</a></li> -->
+            <div class="five columns search">
+                <form method="get" action="/forum//search">
+                    <div>
+                        <input type="text" id="Form_Search" name="Search" accesskey="/" class="InputBox" />
+                    </div>
+                </form>
+            </div>
+            <div class="three columns profile">
+                <div class="MeBox MeBox-SignIn"><div class="SignInLinks"><a href="/forum/entry/signin?Target=discussion%2F14868%2Fintroducing-kite-connect-personal-apis-free-apis-for-personal-use" class=" SignInPopup" rel="nofollow">Login</a><a href="/forum/entry/register?Target=discussion%2F14868%2Fintroducing-kite-connect-personal-apis-free-apis-for-personal-use" class="ApplyButton" rel="nofollow">Signup</a> </div> <div class="SignInIcons"></div></div>
+            </div>
+        </div>
+    </div>
+</header>
+
+<div class="container">
+    <div class="BreadcrumbsWrapper"><span class="Breadcrumbs" itemscope itemtype="http://data-vocabulary.org/Breadcrumb"><span class="CrumbLabel CrumbLabel HomeCrumb"><a href="https://kite.trade/forum/" itemprop="url"><span itemprop="title">Home</span></a></span> <span itemprop="child" itemscope itemtype="http://data-vocabulary.org/Breadcrumb"><span class="Crumb">›</span> <span class="CrumbLabel color-green Last"><a href="//kite.trade/forum/categories/general" itemprop="url"><span itemprop="title">General</span></a></span> </span></span></div>
+    <div class="row">
+        <div class="three columns panel" id="sidebar">
+            <div class="Box GuestBox">
+    <h4>Howdy, Stranger!</h4>
+
+    <p>It looks like you're new here. If you want to get involved, click one of these buttons!</p>
+
+    <p></p>
+
+    <div class="P"><a href="/forum/entry/signin?Target=discussion%2F14868%2Fintroducing-kite-connect-personal-apis-free-apis-for-personal-use" class="Button Primary SignInPopup" rel="nofollow">Sign In</a> <a href="/forum/entry/register?Target=discussion%2F14868%2Fintroducing-kite-connect-personal-apis-free-apis-for-personal-use" class="Button ApplyButton" rel="nofollow">Register</a></div>    </div>
+<div class="BoxFilter BoxDiscussionFilter">
+    <ul class="FilterMenu">
+        <li class="AllCategories"><a href="/forum/categories"><span class="Sprite SpAllCategories"></span> Categories</a></li>         <li class="Discussions"><a href="/forum/discussions" class=""><span class="Sprite SpDiscussions"></span> Recent Discussions</a></li>
+        <li class="Activities"><a href="/forum/activity" class=""><span class="Sprite SpActivity"></span> Activity</a></li>            </ul>
+</div>
+    <div class="Box BoxCategories">
+        <h4>Categories</h4>        <ul class="PanelInfo PanelCategories">
+            <li><a href="/forum/categories" class="ItemLink"><span class="Aside"><span class="Count"><span title="15,241 discussions" class="Number">15.2K</span></span></span> All Categories</a></li><li class="ClearFix Depth1 Category-incidents"><a href="https://kite.trade/forum/categories/incidents" class="ItemLink"><span class="Aside"><span class="Count"><span title="0 discussions" class="Number">0</span></span></span> Incidents</a></li>
+<li class="ClearFix Depth1 Category-node-js-client"><a href="https://kite.trade/forum/categories/node-js-client" class="ItemLink"><span class="Aside"><span class="Count"><span title="183 discussions" class="Number">183</span></span></span> Node JS client</a></li>
+<li class="ClearFix Depth1 Category-go-client-library"><a href="https://kite.trade/forum/categories/go-client-library" class="ItemLink"><span class="Aside"><span class="Count"><span title="52 discussions" class="Number">52</span></span></span> Go client</a></li>
+<li class="ClearFix Depth1 Category--dotnet-api"><a href="https://kite.trade/forum/categories/-dotnet-api" class="ItemLink"><span class="Aside"><span class="Count"><span title="867 discussions" class="Number">867</span></span></span> .Net API client</a></li>
+<li class="ClearFix Depth1 color-orange"><a href="https://kite.trade/forum/categories/kite-publisher" class="ItemLink"><span class="Aside"><span class="Count"><span title="405 discussions" class="Number">405</span></span></span> Kite Publisher</a></li>
+<li class="ClearFix Depth1 Category--net-client-(3rd-party)"><a href="https://kite.trade/forum/categories/-net-client-%283rd-party%29" class="ItemLink"><span class="Aside"><span class="Count"><span title="557 discussions" class="Number">557</span></span></span> .Net / VBA / Excel (3rd party)</a></li>
+<li class="ClearFix Depth1 color-brick"><a href="https://kite.trade/forum/categories/algorithms-and-strategies" class="ItemLink"><span class="Aside"><span class="Count"><span title="508 discussions" class="Number">508</span></span></span> Algorithms and Strategies</a></li>
+<li class="ClearFix Depth1 color-cobalt"><a href="https://kite.trade/forum/categories/java-client" class="ItemLink"><span class="Aside"><span class="Count"><span title="1,072 discussions" class="Number">1.1K</span></span></span> Java client</a></li>
+<li class="ClearFix Depth1 color-violet"><a href="https://kite.trade/forum/categories/api-clients" class="ItemLink"><span class="Aside"><span class="Count"><span title="1,257 discussions" class="Number">1.3K</span></span></span> API clients</a></li>
+<li class="ClearFix Depth1 color-pink"><a href="https://kite.trade/forum/categories/php-client" class="ItemLink"><span class="Aside"><span class="Count"><span title="410 discussions" class="Number">410</span></span></span> PHP client</a></li>
+<li class="ClearFix Depth1 color-purple"><a href="https://kite.trade/forum/categories/python-client" class="ItemLink"><span class="Aside"><span class="Count"><span title="4,370 discussions" class="Number">4.4K</span></span></span> Python client</a></li>
+<li class="ClearFix Depth1 color-blue"><a href="https://kite.trade/forum/categories/mobile-and-desktop-apps" class="ItemLink"><span class="Aside"><span class="Count"><span title="367 discussions" class="Number">367</span></span></span> Mobile and Desktop apps</a></li>
+<li class="ClearFix Depth1 color-aqua"><a href="https://kite.trade/forum/categories/websockets-%28streaming-data%29" class="ItemLink"><span class="Aside"><span class="Count"><span title="1,502 discussions" class="Number">1.5K</span></span></span> Market data (WebSockets)</a></li>
+<li class="ClearFix Depth1 Active color-green"><a href="https://kite.trade/forum/categories/general" class="ItemLink"><span class="Aside"><span class="Count"><span title="3,691 discussions" class="Number">3.7K</span></span></span> General</a></li>
+        </ul>
+    </div>
+        <div class="Box">
+            <h4>In this Discussion</h4>            <ul class="PanelInfo">
+                                    <li>
+                        <a href="/forum/profile/akraghavendran"><span class="Aside"><span><time title="March 24, 2025  9:54AM" datetime="2025-03-24T09:54:51+00:00">March 2025</time></span></span> <span><span class="Username">akraghavendran</span></span></a>                    </li>
+                                    <li>
+                        <a href="/forum/profile/bhaskarsancheti"><span class="Aside"><span><time title="March 24, 2025  8:11AM" datetime="2025-03-24T08:11:04+00:00">March 2025</time></span></span> <span><span class="Username">bhaskarsancheti</span></span></a>                    </li>
+                                    <li>
+                        <a href="/forum/profile/sujith"><span class="Aside"><span><time title="March 24, 2025 10:08AM" datetime="2025-03-24T10:08:45+00:00">March 2025</time></span></span> <span><span class="Username">sujith</span></span></a>                    </li>
+                                    <li>
+                        <a href="/forum/profile/chpadma"><span class="Aside"><span><time title="March 24, 2025  5:18AM" datetime="2025-03-24T05:18:28+00:00">March 2025</time></span></span> <span><span class="Username">chpadma</span></span></a>                    </li>
+                                    <li>
+                        <a href="/forum/profile/Sravanthi_bh"><span class="Aside"><span><time title="March 24, 2025  3:40AM" datetime="2025-03-24T03:40:30+00:00">March 2025</time></span></span> <span><span class="Username">Sravanthi_bh</span></span></a>                    </li>
+                                    <li>
+                        <a href="/forum/profile/Glen"><span class="Aside"><span><time title="March 24, 2025  2:12AM" datetime="2025-03-24T02:12:26+00:00">March 2025</time></span></span> <span><span class="Username">Glen</span></span></a>                    </li>
+                                    <li>
+                        <a href="/forum/profile/niksya"><span class="Aside"><span><time title="March 23, 2025 12:35PM" datetime="2025-03-23T12:35:21+00:00">March 2025</time></span></span> <span><span class="Username">niksya</span></span></a>                    </li>
+                                    <li>
+                        <a href="/forum/profile/chinmay227"><span class="Aside"><span><time title="March 22, 2025  7:25PM" datetime="2025-03-22T19:25:32+00:00">March 2025</time></span></span> <span><span class="Username">chinmay227</span></span></a>                    </li>
+                                    <li>
+                        <a href="/forum/profile/impratikthakkar"><span class="Aside"><span><time title="March 21, 2025  5:18PM" datetime="2025-03-21T17:18:30+00:00">March 2025</time></span></span> <span><span class="Username">impratikthakkar</span></span></a>                    </li>
+                                    <li>
+                        <a href="/forum/profile/enigmaticvision"><span class="Aside"><span><time title="March 21, 2025  4:30PM" datetime="2025-03-21T16:30:42+00:00">March 2025</time></span></span> <span><span class="Username">enigmaticvision</span></span></a>                    </li>
+                                    <li>
+                        <a href="/forum/profile/SharadKothari"><span class="Aside"><span><time title="March 21, 2025  7:44AM" datetime="2025-03-21T07:44:42+00:00">March 2025</time></span></span> <span><span class="Username">SharadKothari</span></span></a>                    </li>
+                                    <li>
+                        <a href="/forum/profile/newtrader1"><span class="Aside"><span><time title="March 21, 2025  6:00AM" datetime="2025-03-21T06:00:33+00:00">March 2025</time></span></span> <span><span class="Username">newtrader1</span></span></a>                    </li>
+                                    <li>
+                        <a href="/forum/profile/HF3810"><span class="Aside"><span><time title="March 19, 2025  2:54PM" datetime="2025-03-19T14:54:41+00:00">March 2025</time></span></span> <span><span class="Username">HF3810</span></span></a>                    </li>
+                                    <li>
+                        <a href="/forum/profile/v4vikash"><span class="Aside"><span><time title="March 17, 2025 12:14PM" datetime="2025-03-17T12:14:07+00:00">March 2025</time></span></span> <span><span class="Username">v4vikash</span></span></a>                    </li>
+                                    <li>
+                        <a href="/forum/profile/abhi_shah"><span class="Aside"><span><time title="March 17, 2025 12:07PM" datetime="2025-03-17T12:07:20+00:00">March 2025</time></span></span> <span><span class="Username">abhi_shah</span></span></a>                    </li>
+                                    <li>
+                        <a href="/forum/profile/amman777"><span class="Aside"><span><time title="March 17, 2025  6:40AM" datetime="2025-03-17T06:40:25+00:00">March 2025</time></span></span> <span><span class="Username">amman777</span></span></a>                    </li>
+                                    <li>
+                        <a href="/forum/profile/Vivek"><span class="Aside"><span><time title="March 15, 2025 10:14AM" datetime="2025-03-15T10:14:19+00:00">March 2025</time></span></span> <span><span class="Username">Vivek</span></span></a>                    </li>
+                                    <li>
+                        <a href="/forum/profile/ravisw82"><span class="Aside"><span><time title="March 15, 2025 10:15AM" datetime="2025-03-15T10:15:55+00:00">March 2025</time></span></span> <span><span class="Username">ravisw82</span></span></a>                    </li>
+                                    <li>
+                        <a href="/forum/profile/priyesh"><span class="Aside"><span><time title="March 15, 2025  6:00AM" datetime="2025-03-15T06:00:36+00:00">March 2025</time></span></span> <span><span class="Username">priyesh</span></span></a>                    </li>
+                                    <li>
+                        <a href="/forum/profile/Matti"><span class="Aside"><span><time title="March 21, 2025  8:13AM" datetime="2025-03-21T08:13:16+00:00">March 2025</time></span></span> <span><span class="Username">Matti</span></span></a>                    </li>
+                            </ul>
+        </div>
+        
+        </div>
+        <div class="nine columns content" id="Content">
+            <div class="MessageList Discussion"><!-- Page Title -->
+<div id="Item_0" class="PageTitle"><div class="Options"></div><h1>Introducing Kite Connect Personal APIs — Free APIs for personal use</h1></div>
+
+<div id="Discussion_14868" class="Item ItemDiscussion">
+    <div class="Discussion">
+        <div class="rowItem-Header DiscussionHeader">
+            <div class="row">
+                <div class="AuthorWrap one column">
+                    <span class="Author">
+                        <a title="Matti" href="/forum/profile/Matti" class="PhotoWrap"><img src="https://kite.trade/forum/uploads/userpics/412/n88U0IQ9AABKI.png" alt="Matti" class="ProfilePhoto ProfilePhotoMedium" /></a>                    </span>
+                </div><!-- author //-->
+                <div class="eleven columns">
+                    <div class="Meta DiscussionMeta">
+                        <span class="AuthorInfo">
+                            <span class="username"><a href="/forum/profile/Matti" class="Username">Matti</a></span>                        </span>
+
+                        <span class="MItem DateCreated">
+                            <a href="https://kite.trade/forum/discussion/14868/introducing-kite-connect-personal-apis-free-apis-for-personal-use" class="Permalink" rel="nofollow"><time title="March 14, 2025  8:39AM" datetime="2025-03-14T08:39:24+00:00">March 2025</time></a>                        </span>
+                        <span class="MItem"> <span title="Edited March 17, 2025 6:46AM by Matti." class="DateUpdated">edited March 2025</span> </span>                         <span class="MItem Category"> in <a href="https://kite.trade/forum/categories/general">General</a></span>                     </div>
+
+                                        <div class="Item-BodyWrap">
+                        <div class="Item-Body">
+                            <div class="Message">
+                                We are excited to announce the launch of <b>Kite Connect Personal</b>, a new offering that gives you free access to your Zerodha account with all the essential features of Kite Connect, minus the market data (both real-time and historical). You can place orders, track your positions, holdings, and funds with Kite Connect Personal as long as you have a source for market data.<br /><br />To get started, simply create a new Personal app on the <a rel="nofollow" href="https://developers.kite.trade">Developer Console</a>, and get started! <br /><br /><br />                            </div>
+                            <div class="Reactions"></div>                        </div>
+                    </div>
+                </div>
+            </div><!-- row //-->
+        </div>
+    </div>
+</div>
+</div><div class="CommentsWrap"><span class="BeforeCommentHeading"></span><div class="DataBox DataBox-Comments">    <ul class="MessageList DataList Comments">
+                <li class="Item Alt ItemComment" id="Comment_49193">
+            <div class="Comment row">
+                <div class="one column">
+                    <span class="Author">
+                       <a title="krishkalyani" href="/forum/profile/krishkalyani" class="PhotoWrap"><img src="https://secure.gravatar.com/avatar.php?gravatar_id=ca99080b025b1511aefb037bc1cd3610&amp;amp;size=50&amp;default=https%3A%2F%2Fvanillicon.com%2Fca99080b025b1511aefb037bc1cd3610.png" alt="krishkalyani" class="ProfilePhoto ProfilePhotoMedium" /></a>                    </span>
+                </div><!-- col //-->
+
+                <div class="eleven columns">
+                                        <div class="Options">
+                                            </div>
+                                        <div class="Item-Header CommentHeader">
+                        <div class="Meta CommentMeta CommentInfo">
+                            <span class="AuthorInfo">
+                               <span class="username"><a href="/forum/profile/krishkalyani" class="Username">krishkalyani</a></span>                              </span>
+                            <span class="MItem DateCreated">
+                               <a href="/forum/discussion/comment/49193/#Comment_49193" class="Permalink" name="Item_1" rel="nofollow"><time title="March 14, 2025 10:44AM" datetime="2025-03-14T10:44:32+00:00">March 2025</time></a>                            </span>
+                                                                                </div>
+                    </div>
+                    <div class="Item-BodyWrap">
+                        <div class="Item-Body">
+                            <div class="Message">
+                                It's good news, Postback url option doesn't exist then how do we get realtime order updates                            </div>
+                            <div class="Reactions"></div>                        </div>
+                    </div>
+                </div><!-- col //-->
+            </div>
+        </li>
+                <li class="Item ItemComment" id="Comment_49194">
+            <div class="Comment row">
+                <div class="one column">
+                    <span class="Author">
+                       <a title="venu_kite" href="/forum/profile/venu_kite" class="PhotoWrap"><img src="https://secure.gravatar.com/avatar.php?gravatar_id=2aa8999fc2785d553504c90a5689778d&amp;amp;size=50&amp;default=https%3A%2F%2Fvanillicon.com%2F2aa8999fc2785d553504c90a5689778d.png" alt="venu_kite" class="ProfilePhoto ProfilePhotoMedium" /></a>                    </span>
+                </div><!-- col //-->
+
+                <div class="eleven columns">
+                                        <div class="Options">
+                                            </div>
+                                        <div class="Item-Header CommentHeader">
+                        <div class="Meta CommentMeta CommentInfo">
+                            <span class="AuthorInfo">
+                               <span class="username"><a href="/forum/profile/venu_kite" class="Username">venu_kite</a></span>                              </span>
+                            <span class="MItem DateCreated">
+                               <a href="/forum/discussion/comment/49194/#Comment_49194" class="Permalink" name="Item_2" rel="nofollow"><time title="March 14, 2025 12:58PM" datetime="2025-03-14T12:58:42+00:00">March 2025</time></a>                            </span>
+                                                                                </div>
+                    </div>
+                    <div class="Item-BodyWrap">
+                        <div class="Item-Body">
+                            <div class="Message">
+                                I have created a personal account but I didnt get a secret key generated.                             </div>
+                            <div class="Reactions"></div>                        </div>
+                    </div>
+                </div><!-- col //-->
+            </div>
+        </li>
+                <li class="Item Alt ItemComment" id="Comment_49195">
+            <div class="Comment row">
+                <div class="one column">
+                    <span class="Author">
+                       <a title="krishkalyani" href="/forum/profile/krishkalyani" class="PhotoWrap"><img src="https://secure.gravatar.com/avatar.php?gravatar_id=ca99080b025b1511aefb037bc1cd3610&amp;amp;size=50&amp;default=https%3A%2F%2Fvanillicon.com%2Fca99080b025b1511aefb037bc1cd3610.png" alt="krishkalyani" class="ProfilePhoto ProfilePhotoMedium" /></a>                    </span>
+                </div><!-- col //-->
+
+                <div class="eleven columns">
+                                        <div class="Options">
+                                            </div>
+                                        <div class="Item-Header CommentHeader">
+                        <div class="Meta CommentMeta CommentInfo">
+                            <span class="AuthorInfo">
+                               <span class="username"><a href="/forum/profile/krishkalyani" class="Username">krishkalyani</a></span>                              </span>
+                            <span class="MItem DateCreated">
+                               <a href="/forum/discussion/comment/49195/#Comment_49195" class="Permalink" name="Item_3" rel="nofollow"><time title="March 14, 2025  4:41PM" datetime="2025-03-14T16:41:49+00:00">March 2025</time></a>                            </span>
+                                                                                </div>
+                    </div>
+                    <div class="Item-BodyWrap">
+                        <div class="Item-Body">
+                            <div class="Message">
+                                Hi Please ignore the my previous message. I gree with venu, secret key is not available                             </div>
+                            <div class="Reactions"></div>                        </div>
+                    </div>
+                </div><!-- col //-->
+            </div>
+        </li>
+                <li class="Item ItemComment" id="Comment_49196">
+            <div class="Comment row">
+                <div class="one column">
+                    <span class="Author">
+                       <a title="ashutoshsahu" href="/forum/profile/ashutoshsahu" class="PhotoWrap"><img src="https://secure.gravatar.com/avatar.php?gravatar_id=d17f7e719e7683e72fd4db8e1cacedd0&amp;amp;size=50&amp;default=https%3A%2F%2Fvanillicon.com%2Fd17f7e719e7683e72fd4db8e1cacedd0.png" alt="ashutoshsahu" class="ProfilePhoto ProfilePhotoMedium" /></a>                    </span>
+                </div><!-- col //-->
+
+                <div class="eleven columns">
+                                        <div class="Options">
+                                            </div>
+                                        <div class="Item-Header CommentHeader">
+                        <div class="Meta CommentMeta CommentInfo">
+                            <span class="AuthorInfo">
+                               <span class="username"><a href="/forum/profile/ashutoshsahu" class="Username">ashutoshsahu</a></span>                              </span>
+                            <span class="MItem DateCreated">
+                               <a href="/forum/discussion/comment/49196/#Comment_49196" class="Permalink" name="Item_4" rel="nofollow"><time title="March 14, 2025  5:02PM" datetime="2025-03-14T17:02:09+00:00">March 2025</time></a>                            </span>
+                                                                                </div>
+                    </div>
+                    <div class="Item-BodyWrap">
+                        <div class="Item-Body">
+                            <div class="Message">
+                                I also don't see the api secret                            </div>
+                            <div class="Reactions"></div>                        </div>
+                    </div>
+                </div><!-- col //-->
+            </div>
+        </li>
+                <li class="Item Alt ItemComment" id="Comment_49197">
+            <div class="Comment row">
+                <div class="one column">
+                    <span class="Author">
+                       <a title="Anony" href="/forum/profile/Anony" class="PhotoWrap"><img src="https://secure.gravatar.com/avatar.php?gravatar_id=5627caa119f097aacdaef0200b6e5df9&amp;amp;size=50&amp;default=https%3A%2F%2Fvanillicon.com%2F5627caa119f097aacdaef0200b6e5df9.png" alt="Anony" class="ProfilePhoto ProfilePhotoMedium" /></a>                    </span>
+                </div><!-- col //-->
+
+                <div class="eleven columns">
+                                        <div class="Options">
+                                            </div>
+                                        <div class="Item-Header CommentHeader">
+                        <div class="Meta CommentMeta CommentInfo">
+                            <span class="AuthorInfo">
+                               <span class="username"><a href="/forum/profile/Anony" class="Username">Anony</a></span>                              </span>
+                            <span class="MItem DateCreated">
+                               <a href="/forum/discussion/comment/49197/#Comment_49197" class="Permalink" name="Item_5" rel="nofollow"><time title="March 14, 2025  5:47PM" datetime="2025-03-14T17:47:38+00:00">March 2025</time></a>                            </span>
+                                                                                </div>
+                    </div>
+                    <div class="Item-BodyWrap">
+                        <div class="Item-Body">
+                            <div class="Message">
+                                Does not work yet.                            </div>
+                            <div class="Reactions"></div>                        </div>
+                    </div>
+                </div><!-- col //-->
+            </div>
+        </li>
+                <li class="Item ItemComment" id="Comment_49198">
+            <div class="Comment row">
+                <div class="one column">
+                    <span class="Author">
+                       <a title="Matti" href="/forum/profile/Matti" class="PhotoWrap"><img src="https://kite.trade/forum/uploads/userpics/412/n88U0IQ9AABKI.png" alt="Matti" class="ProfilePhoto ProfilePhotoMedium" /></a>                    </span>
+                </div><!-- col //-->
+
+                <div class="eleven columns">
+                                        <div class="Options">
+                                            </div>
+                                        <div class="Item-Header CommentHeader">
+                        <div class="Meta CommentMeta CommentInfo">
+                            <span class="AuthorInfo">
+                               <span class="username"><a href="/forum/profile/Matti" class="Username">Matti</a></span>                              </span>
+                            <span class="MItem DateCreated">
+                               <a href="/forum/discussion/comment/49198/#Comment_49198" class="Permalink" name="Item_6" rel="nofollow"><time title="March 14, 2025  7:50PM" datetime="2025-03-14T19:50:34+00:00">March 2025</time></a>                            </span>
+                                                                                </div>
+                    </div>
+                    <div class="Item-BodyWrap">
+                        <div class="Item-Body">
+                            <div class="Message">
+                                We're checking this.                            </div>
+                            <div class="Reactions"></div>                        </div>
+                    </div>
+                </div><!-- col //-->
+            </div>
+        </li>
+                <li class="Item Alt ItemComment" id="Comment_49199">
+            <div class="Comment row">
+                <div class="one column">
+                    <span class="Author">
+                       <a title="priyesh" href="/forum/profile/priyesh" class="PhotoWrap"><img src="https://secure.gravatar.com/avatar.php?gravatar_id=f5e81ca7af03d1c242de8eb003ff438d&amp;amp;size=50&amp;default=https%3A%2F%2Fvanillicon.com%2Ff5e81ca7af03d1c242de8eb003ff438d.png" alt="priyesh" class="ProfilePhoto ProfilePhotoMedium" /></a>                    </span>
+                </div><!-- col //-->
+
+                <div class="eleven columns">
+                                        <div class="Options">
+                                            </div>
+                                        <div class="Item-Header CommentHeader">
+                        <div class="Meta CommentMeta CommentInfo">
+                            <span class="AuthorInfo">
+                               <span class="username"><a href="/forum/profile/priyesh" class="Username">priyesh</a></span>                              </span>
+                            <span class="MItem DateCreated">
+                               <a href="/forum/discussion/comment/49199/#Comment_49199" class="Permalink" name="Item_7" rel="nofollow"><time title="March 15, 2025  6:00AM" datetime="2025-03-15T06:00:36+00:00">March 2025</time></a>                            </span>
+                                                                                </div>
+                    </div>
+                    <div class="Item-BodyWrap">
+                        <div class="Item-Body">
+                            <div class="Message">
+                                when secret key's issue will be fixed ?                            </div>
+                            <div class="Reactions"></div>                        </div>
+                    </div>
+                </div><!-- col //-->
+            </div>
+        </li>
+                <li class="Item ItemComment" id="Comment_49200">
+            <div class="Comment row">
+                <div class="one column">
+                    <span class="Author">
+                       <a title="ravisw82" href="/forum/profile/ravisw82" class="PhotoWrap"><img src="https://secure.gravatar.com/avatar.php?gravatar_id=f33d73ba57c033433ab8af6925a4a133&amp;amp;size=50&amp;default=https%3A%2F%2Fvanillicon.com%2Ff33d73ba57c033433ab8af6925a4a133.png" alt="ravisw82" class="ProfilePhoto ProfilePhotoMedium" /></a>                    </span>
+                </div><!-- col //-->
+
+                <div class="eleven columns">
+                                        <div class="Options">
+                                            </div>
+                                        <div class="Item-Header CommentHeader">
+                        <div class="Meta CommentMeta CommentInfo">
+                            <span class="AuthorInfo">
+                               <span class="username"><a href="/forum/profile/ravisw82" class="Username">ravisw82</a></span>                              </span>
+                            <span class="MItem DateCreated">
+                               <a href="/forum/discussion/comment/49200/#Comment_49200" class="Permalink" name="Item_8" rel="nofollow"><time title="March 15, 2025 10:13AM" datetime="2025-03-15T10:13:33+00:00">March 2025</time></a>                            </span>
+                                                                                </div>
+                    </div>
+                    <div class="Item-BodyWrap">
+                        <div class="Item-Body">
+                            <div class="Message">
+                                I created personal app, it has created API key, but API secret is not generated.                            </div>
+                            <div class="Reactions"></div>                        </div>
+                    </div>
+                </div><!-- col //-->
+            </div>
+        </li>
+                <li class="Item Alt ItemComment" id="Comment_49201">
+            <div class="Comment row">
+                <div class="one column">
+                    <span class="Author">
+                       <a title="Vivek" href="/forum/profile/Vivek" class="PhotoWrap"><img src="https://secure.gravatar.com/avatar.php?gravatar_id=b4271ad7c04b748e53e1f0f9d4b311ed&amp;amp;size=50&amp;default=https%3A%2F%2Fvanillicon.com%2Fb4271ad7c04b748e53e1f0f9d4b311ed.png" alt="Vivek" class="ProfilePhoto ProfilePhotoMedium" /></a>                    </span>
+                </div><!-- col //-->
+
+                <div class="eleven columns">
+                                        <div class="Options">
+                                            </div>
+                                        <div class="Item-Header CommentHeader">
+                        <div class="Meta CommentMeta CommentInfo">
+                            <span class="AuthorInfo">
+                               <span class="username"><a href="/forum/profile/Vivek" class="Username">Vivek</a></span>                              </span>
+                            <span class="MItem DateCreated">
+                               <a href="/forum/discussion/comment/49201/#Comment_49201" class="Permalink" name="Item_9" rel="nofollow"><time title="March 15, 2025 10:14AM" datetime="2025-03-15T10:14:19+00:00">March 2025</time></a>                            </span>
+                                                                                </div>
+                    </div>
+                    <div class="Item-BodyWrap">
+                        <div class="Item-Body">
+                            <div class="Message">
+                                Do check now, it should show up.                             </div>
+                            <div class="Reactions"></div>                        </div>
+                    </div>
+                </div><!-- col //-->
+            </div>
+        </li>
+                <li class="Item ItemComment" id="Comment_49202">
+            <div class="Comment row">
+                <div class="one column">
+                    <span class="Author">
+                       <a title="ravisw82" href="/forum/profile/ravisw82" class="PhotoWrap"><img src="https://secure.gravatar.com/avatar.php?gravatar_id=f33d73ba57c033433ab8af6925a4a133&amp;amp;size=50&amp;default=https%3A%2F%2Fvanillicon.com%2Ff33d73ba57c033433ab8af6925a4a133.png" alt="ravisw82" class="ProfilePhoto ProfilePhotoMedium" /></a>                    </span>
+                </div><!-- col //-->
+
+                <div class="eleven columns">
+                                        <div class="Options">
+                                            </div>
+                                        <div class="Item-Header CommentHeader">
+                        <div class="Meta CommentMeta CommentInfo">
+                            <span class="AuthorInfo">
+                               <span class="username"><a href="/forum/profile/ravisw82" class="Username">ravisw82</a></span>                              </span>
+                            <span class="MItem DateCreated">
+                               <a href="/forum/discussion/comment/49202/#Comment_49202" class="Permalink" name="Item_10" rel="nofollow"><time title="March 15, 2025 10:15AM" datetime="2025-03-15T10:15:55+00:00">March 2025</time></a>                            </span>
+                                                                                </div>
+                    </div>
+                    <div class="Item-BodyWrap">
+                        <div class="Item-Body">
+                            <div class="Message">
+                                Yes, now it is showing up, Thanks Vivek                            </div>
+                            <div class="Reactions"></div>                        </div>
+                    </div>
+                </div><!-- col //-->
+            </div>
+        </li>
+                <li class="Item Alt ItemComment" id="Comment_49203">
+            <div class="Comment row">
+                <div class="one column">
+                    <span class="Author">
+                       <a title="krishkalyani" href="/forum/profile/krishkalyani" class="PhotoWrap"><img src="https://secure.gravatar.com/avatar.php?gravatar_id=ca99080b025b1511aefb037bc1cd3610&amp;amp;size=50&amp;default=https%3A%2F%2Fvanillicon.com%2Fca99080b025b1511aefb037bc1cd3610.png" alt="krishkalyani" class="ProfilePhoto ProfilePhotoMedium" /></a>                    </span>
+                </div><!-- col //-->
+
+                <div class="eleven columns">
+                                        <div class="Options">
+                                            </div>
+                                        <div class="Item-Header CommentHeader">
+                        <div class="Meta CommentMeta CommentInfo">
+                            <span class="AuthorInfo">
+                               <span class="username"><a href="/forum/profile/krishkalyani" class="Username">krishkalyani</a></span>                              </span>
+                            <span class="MItem DateCreated">
+                               <a href="/forum/discussion/comment/49203/#Comment_49203" class="Permalink" name="Item_11" rel="nofollow"><time title="March 15, 2025  1:04PM" datetime="2025-03-15T13:04:31+00:00">March 2025</time></a>                            </span>
+                                                                                </div>
+                    </div>
+                    <div class="Item-BodyWrap">
+                        <div class="Item-Body">
+                            <div class="Message">
+                                Its Working now                            </div>
+                            <div class="Reactions"></div>                        </div>
+                    </div>
+                </div><!-- col //-->
+            </div>
+        </li>
+                <li class="Item ItemComment" id="Comment_49204">
+            <div class="Comment row">
+                <div class="one column">
+                    <span class="Author">
+                       <a title="krishkalyani" href="/forum/profile/krishkalyani" class="PhotoWrap"><img src="https://secure.gravatar.com/avatar.php?gravatar_id=ca99080b025b1511aefb037bc1cd3610&amp;amp;size=50&amp;default=https%3A%2F%2Fvanillicon.com%2Fca99080b025b1511aefb037bc1cd3610.png" alt="krishkalyani" class="ProfilePhoto ProfilePhotoMedium" /></a>                    </span>
+                </div><!-- col //-->
+
+                <div class="eleven columns">
+                                        <div class="Options">
+                                            </div>
+                                        <div class="Item-Header CommentHeader">
+                        <div class="Meta CommentMeta CommentInfo">
+                            <span class="AuthorInfo">
+                               <span class="username"><a href="/forum/profile/krishkalyani" class="Username">krishkalyani</a></span>                              </span>
+                            <span class="MItem DateCreated">
+                               <a href="/forum/discussion/comment/49204/#Comment_49204" class="Permalink" name="Item_12" rel="nofollow"><time title="March 15, 2025  1:13PM" datetime="2025-03-15T13:13:17+00:00">March 2025</time></a>                            </span>
+                            <span class="MItem"> <span title="Edited March 15, 2025 1:28PM by krishkalyani." class="DateUpdated">edited March 2025</span> </span>                                                    </div>
+                    </div>
+                    <div class="Item-BodyWrap">
+                        <div class="Item-Body">
+                            <div class="Message">
+                                <a href="/forum/profile/Matti">@Matti</a> <br /><br />Its really appreciate Kite Team on bringing free version for personal use. <br /><br />As a developer to place an new order or updating trailing stop loss we are using LTP prices for securing price fluctuations for New Order / Modify Order. I think at least GetLTP , Get MarketQuote API would requires to start use Personal Kite API.  <br /><br />I have checked GetLTP , Get MarketQuote API both are returning errors as "Insufficient permission for that call", Can you please discuss with your team to add these two API calls to Personal Use API<br />                            </div>
+                            <div class="Reactions"></div>                        </div>
+                    </div>
+                </div><!-- col //-->
+            </div>
+        </li>
+                <li class="Item Alt ItemComment" id="Comment_49209">
+            <div class="Comment row">
+                <div class="one column">
+                    <span class="Author">
+                       <a title="amman777" href="/forum/profile/amman777" class="PhotoWrap"><img src="https://secure.gravatar.com/avatar.php?gravatar_id=c204c845b12a8598fe09aadf4cefa3c5&amp;amp;size=50&amp;default=https%3A%2F%2Fvanillicon.com%2Fc204c845b12a8598fe09aadf4cefa3c5.png" alt="amman777" class="ProfilePhoto ProfilePhotoMedium" /></a>                    </span>
+                </div><!-- col //-->
+
+                <div class="eleven columns">
+                                        <div class="Options">
+                                            </div>
+                                        <div class="Item-Header CommentHeader">
+                        <div class="Meta CommentMeta CommentInfo">
+                            <span class="AuthorInfo">
+                               <span class="username"><a href="/forum/profile/amman777" class="Username">amman777</a></span>                              </span>
+                            <span class="MItem DateCreated">
+                               <a href="/forum/discussion/comment/49209/#Comment_49209" class="Permalink" name="Item_13" rel="nofollow"><time title="March 17, 2025  6:40AM" datetime="2025-03-17T06:40:25+00:00">March 2025</time></a>                            </span>
+                                                                                </div>
+                    </div>
+                    <div class="Item-BodyWrap">
+                        <div class="Item-Body">
+                            <div class="Message">
+                                <a href="/forum/profile/krishkalyani">@krishkalyani</a> <br />I Totally agree with you, atleast we should get GetLTP in this free version                            </div>
+                            <div class="Reactions"></div>                        </div>
+                    </div>
+                </div><!-- col //-->
+            </div>
+        </li>
+                <li class="Item ItemComment" id="Comment_49210">
+            <div class="Comment row">
+                <div class="one column">
+                    <span class="Author">
+                       <a title="Matti" href="/forum/profile/Matti" class="PhotoWrap"><img src="https://kite.trade/forum/uploads/userpics/412/n88U0IQ9AABKI.png" alt="Matti" class="ProfilePhoto ProfilePhotoMedium" /></a>                    </span>
+                </div><!-- col //-->
+
+                <div class="eleven columns">
+                                        <div class="Options">
+                                            </div>
+                                        <div class="Item-Header CommentHeader">
+                        <div class="Meta CommentMeta CommentInfo">
+                            <span class="AuthorInfo">
+                               <span class="username"><a href="/forum/profile/Matti" class="Username">Matti</a></span>                              </span>
+                            <span class="MItem DateCreated">
+                               <a href="/forum/discussion/comment/49210/#Comment_49210" class="Permalink" name="Item_14" rel="nofollow"><time title="March 17, 2025  6:53AM" datetime="2025-03-17T06:53:58+00:00">March 2025</time></a>                            </span>
+                                                                                </div>
+                    </div>
+                    <div class="Item-BodyWrap">
+                        <div class="Item-Body">
+                            <div class="Message">
+                                Hey <a href="/forum/profile/krishkalyani">@krishkalyani</a> <a href="/forum/profile/amman777">@amman777</a>, it isn't scalable to offer data for free. There is a cost to maintaining the infrastructure to offer these APIs and data is quite a large part of that cost.                            </div>
+                            <div class="Reactions"></div>                        </div>
+                    </div>
+                </div><!-- col //-->
+            </div>
+        </li>
+                <li class="Item Alt ItemComment" id="Comment_49214">
+            <div class="Comment row">
+                <div class="one column">
+                    <span class="Author">
+                       <a title="abhi_shah" href="/forum/profile/abhi_shah" class="PhotoWrap"><img src="https://kite.trade/forum/uploads/userpics/947/nGL7TMMTNM061.png" alt="abhi_shah" class="ProfilePhoto ProfilePhotoMedium" /></a>                    </span>
+                </div><!-- col //-->
+
+                <div class="eleven columns">
+                                        <div class="Options">
+                                            </div>
+                                        <div class="Item-Header CommentHeader">
+                        <div class="Meta CommentMeta CommentInfo">
+                            <span class="AuthorInfo">
+                               <span class="username"><a href="/forum/profile/abhi_shah" class="Username">abhi_shah</a></span>                              </span>
+                            <span class="MItem DateCreated">
+                               <a href="/forum/discussion/comment/49214/#Comment_49214" class="Permalink" name="Item_15" rel="nofollow"><time title="March 17, 2025 12:07PM" datetime="2025-03-17T12:07:20+00:00">March 2025</time></a>                            </span>
+                                                                                </div>
+                    </div>
+                    <div class="Item-BodyWrap">
+                        <div class="Item-Body">
+                            <div class="Message">
+                                Hey <a href="/forum/profile/Matti">@Matti</a> <br />This is great!<br />Does the Personal API support websocket order updates?                            </div>
+                            <div class="Reactions"></div>                        </div>
+                    </div>
+                </div><!-- col //-->
+            </div>
+        </li>
+                <li class="Item ItemComment" id="Comment_49215">
+            <div class="Comment row">
+                <div class="one column">
+                    <span class="Author">
+                       <a title="v4vikash" href="/forum/profile/v4vikash" class="PhotoWrap"><img src="https://secure.gravatar.com/avatar.php?gravatar_id=57af718811fb794a9e9eba84cecb2f85&amp;amp;size=50&amp;default=https%3A%2F%2Fvanillicon.com%2F57af718811fb794a9e9eba84cecb2f85.png" alt="v4vikash" class="ProfilePhoto ProfilePhotoMedium" /></a>                    </span>
+                </div><!-- col //-->
+
+                <div class="eleven columns">
+                                        <div class="Options">
+                                            </div>
+                                        <div class="Item-Header CommentHeader">
+                        <div class="Meta CommentMeta CommentInfo">
+                            <span class="AuthorInfo">
+                               <span class="username"><a href="/forum/profile/v4vikash" class="Username">v4vikash</a></span>                              </span>
+                            <span class="MItem DateCreated">
+                               <a href="/forum/discussion/comment/49215/#Comment_49215" class="Permalink" name="Item_16" rel="nofollow"><time title="March 17, 2025 12:14PM" datetime="2025-03-17T12:14:07+00:00">March 2025</time></a>                            </span>
+                            <span class="MItem"> <span title="Edited March 17, 2025 12:15PM by v4vikash." class="DateUpdated">edited March 2025</span> </span>                                                    </div>
+                    </div>
+                    <div class="Item-BodyWrap">
+                        <div class="Item-Body">
+                            <div class="Message">
+                                <del><del>Login is not working with the personal api key. <br /><br />```<br />{<br />"status": "error",<br />"message": "Invalid `api_key`.",<br />"data": null,<br />"error_type": "InputException"<br />}<br />```</del></del><br /><br />EDIT: It started working after a bit of time.                             </div>
+                            <div class="Reactions"></div>                        </div>
+                    </div>
+                </div><!-- col //-->
+            </div>
+        </li>
+                <li class="Item Alt ItemComment" id="Comment_49216">
+            <div class="Comment row">
+                <div class="one column">
+                    <span class="Author">
+                       <a title="krishkalyani" href="/forum/profile/krishkalyani" class="PhotoWrap"><img src="https://secure.gravatar.com/avatar.php?gravatar_id=ca99080b025b1511aefb037bc1cd3610&amp;amp;size=50&amp;default=https%3A%2F%2Fvanillicon.com%2Fca99080b025b1511aefb037bc1cd3610.png" alt="krishkalyani" class="ProfilePhoto ProfilePhotoMedium" /></a>                    </span>
+                </div><!-- col //-->
+
+                <div class="eleven columns">
+                                        <div class="Options">
+                                            </div>
+                                        <div class="Item-Header CommentHeader">
+                        <div class="Meta CommentMeta CommentInfo">
+                            <span class="AuthorInfo">
+                               <span class="username"><a href="/forum/profile/krishkalyani" class="Username">krishkalyani</a></span>                              </span>
+                            <span class="MItem DateCreated">
+                               <a href="/forum/discussion/comment/49216/#Comment_49216" class="Permalink" name="Item_17" rel="nofollow"><time title="March 17, 2025 12:41PM" datetime="2025-03-17T12:41:37+00:00">March 2025</time></a>                            </span>
+                                                                                </div>
+                    </div>
+                    <div class="Item-BodyWrap">
+                        <div class="Item-Body">
+                            <div class="Message">
+                                <a href="/forum/profile/Matti">@Matti</a> ,<br />
+<br />
+It's our request only. Having ltp price would help for quick trades. Without ltp price one should have enter price manually from our own UI, this will lead no use of personal API for intraday traders and company wont get brokerage for each trade in automation.<br />
+<br />
+I can understand this is business descision. Thanks for your reply.<br />
+<br />
+Will continue with monthly chargeable subscription <br />
+<br />
+Thanks                            </div>
+                            <div class="Reactions"></div>                        </div>
+                    </div>
+                </div><!-- col //-->
+            </div>
+        </li>
+                <li class="Item ItemComment" id="Comment_49243">
+            <div class="Comment row">
+                <div class="one column">
+                    <span class="Author">
+                       <a title="HF3810" href="/forum/profile/HF3810" class="PhotoWrap"><img src="https://secure.gravatar.com/avatar.php?gravatar_id=8f7abe88064915d76ab2d1c7896f03d7&amp;amp;size=50&amp;default=https%3A%2F%2Fvanillicon.com%2F8f7abe88064915d76ab2d1c7896f03d7.png" alt="HF3810" class="ProfilePhoto ProfilePhotoMedium" /></a>                    </span>
+                </div><!-- col //-->
+
+                <div class="eleven columns">
+                                        <div class="Options">
+                                            </div>
+                                        <div class="Item-Header CommentHeader">
+                        <div class="Meta CommentMeta CommentInfo">
+                            <span class="AuthorInfo">
+                               <span class="username"><a href="/forum/profile/HF3810" class="Username">HF3810</a></span>                              </span>
+                            <span class="MItem DateCreated">
+                               <a href="/forum/discussion/comment/49243/#Comment_49243" class="Permalink" name="Item_18" rel="nofollow"><time title="March 19, 2025  2:54PM" datetime="2025-03-19T14:54:41+00:00">March 2025</time></a>                            </span>
+                                                                                </div>
+                    </div>
+                    <div class="Item-BodyWrap">
+                        <div class="Item-Body">
+                            <div class="Message">
+                                Receiving error while trying to generate token<br /><br />{"status":"error","message":"Invalid `api_key`.","data":null,"error_type":"InputException"}                            </div>
+                            <div class="Reactions"></div>                        </div>
+                    </div>
+                </div><!-- col //-->
+            </div>
+        </li>
+                <li class="Item Alt ItemComment" id="Comment_49248">
+            <div class="Comment row">
+                <div class="one column">
+                    <span class="Author">
+                       <a title="Matti" href="/forum/profile/Matti" class="PhotoWrap"><img src="https://kite.trade/forum/uploads/userpics/412/n88U0IQ9AABKI.png" alt="Matti" class="ProfilePhoto ProfilePhotoMedium" /></a>                    </span>
+                </div><!-- col //-->
+
+                <div class="eleven columns">
+                                        <div class="Options">
+                                            </div>
+                                        <div class="Item-Header CommentHeader">
+                        <div class="Meta CommentMeta CommentInfo">
+                            <span class="AuthorInfo">
+                               <span class="username"><a href="/forum/profile/Matti" class="Username">Matti</a></span>                              </span>
+                            <span class="MItem DateCreated">
+                               <a href="/forum/discussion/comment/49248/#Comment_49248" class="Permalink" name="Item_19" rel="nofollow"><time title="March 20, 2025  6:14AM" datetime="2025-03-20T06:14:24+00:00">March 2025</time></a>                            </span>
+                                                                                </div>
+                    </div>
+                    <div class="Item-BodyWrap">
+                        <div class="Item-Body">
+                            <div class="Message">
+                                Try changing the app status to "Paused" and back to active. Should fix this for you. We're looking into why it happened in the first place.<br />                            </div>
+                            <div class="Reactions"></div>                        </div>
+                    </div>
+                </div><!-- col //-->
+            </div>
+        </li>
+                <li class="Item ItemComment" id="Comment_49261">
+            <div class="Comment row">
+                <div class="one column">
+                    <span class="Author">
+                       <a title="newtrader1" href="/forum/profile/newtrader1" class="PhotoWrap"><img src="https://secure.gravatar.com/avatar.php?gravatar_id=8390142242c557a01923a6eb1b13a96c&amp;amp;size=50&amp;default=https%3A%2F%2Fvanillicon.com%2F8390142242c557a01923a6eb1b13a96c.png" alt="newtrader1" class="ProfilePhoto ProfilePhotoMedium" /></a>                    </span>
+                </div><!-- col //-->
+
+                <div class="eleven columns">
+                                        <div class="Options">
+                                            </div>
+                                        <div class="Item-Header CommentHeader">
+                        <div class="Meta CommentMeta CommentInfo">
+                            <span class="AuthorInfo">
+                               <span class="username"><a href="/forum/profile/newtrader1" class="Username">newtrader1</a></span>                              </span>
+                            <span class="MItem DateCreated">
+                               <a href="/forum/discussion/comment/49261/#Comment_49261" class="Permalink" name="Item_20" rel="nofollow"><time title="March 21, 2025  6:00AM" datetime="2025-03-21T06:00:33+00:00">March 2025</time></a>                            </span>
+                            <span class="MItem"> <span title="Edited March 21, 2025 6:07AM by newtrader1." class="DateUpdated">edited March 2025</span> </span>                                                    </div>
+                    </div>
+                    <div class="Item-BodyWrap">
+                        <div class="Item-Body">
+                            <div class="Message">
+                                Please give LTP  at reduced price.<br />Thanks                            </div>
+                            <div class="Reactions"></div>                        </div>
+                    </div>
+                </div><!-- col //-->
+            </div>
+        </li>
+                <li class="Item Alt ItemComment" id="Comment_49263">
+            <div class="Comment row">
+                <div class="one column">
+                    <span class="Author">
+                       <a title="SharadKothari" href="/forum/profile/SharadKothari" class="PhotoWrap"><img src="https://secure.gravatar.com/avatar.php?gravatar_id=108c53089e73a633351b55d526432d54&amp;amp;size=50&amp;default=https%3A%2F%2Fvanillicon.com%2F108c53089e73a633351b55d526432d54.png" alt="SharadKothari" class="ProfilePhoto ProfilePhotoMedium" /></a>                    </span>
+                </div><!-- col //-->
+
+                <div class="eleven columns">
+                                        <div class="Options">
+                                            </div>
+                                        <div class="Item-Header CommentHeader">
+                        <div class="Meta CommentMeta CommentInfo">
+                            <span class="AuthorInfo">
+                               <span class="username"><a href="/forum/profile/SharadKothari" class="Username">SharadKothari</a></span>                              </span>
+                            <span class="MItem DateCreated">
+                               <a href="/forum/discussion/comment/49263/#Comment_49263" class="Permalink" name="Item_21" rel="nofollow"><time title="March 21, 2025  7:44AM" datetime="2025-03-21T07:44:42+00:00">March 2025</time></a>                            </span>
+                            <span class="MItem"> <span title="Edited March 21, 2025 7:45AM by SharadKothari." class="DateUpdated">edited March 2025</span> </span>                                                    </div>
+                    </div>
+                    <div class="Item-BodyWrap">
+                        <div class="Item-Body">
+                            <div class="Message">
+                                Apart from: Kiteticker, kite.quote and kite.historical_quote, which command will not work in personal.<br /><br />If everything else works, that I might have just one connect account for multiple accounts in the family.                            </div>
+                            <div class="Reactions"></div>                        </div>
+                    </div>
+                </div><!-- col //-->
+            </div>
+        </li>
+                <li class="Item ItemComment" id="Comment_49264">
+            <div class="Comment row">
+                <div class="one column">
+                    <span class="Author">
+                       <a title="Matti" href="/forum/profile/Matti" class="PhotoWrap"><img src="https://kite.trade/forum/uploads/userpics/412/n88U0IQ9AABKI.png" alt="Matti" class="ProfilePhoto ProfilePhotoMedium" /></a>                    </span>
+                </div><!-- col //-->
+
+                <div class="eleven columns">
+                                        <div class="Options">
+                                            </div>
+                                        <div class="Item-Header CommentHeader">
+                        <div class="Meta CommentMeta CommentInfo">
+                            <span class="AuthorInfo">
+                               <span class="username"><a href="/forum/profile/Matti" class="Username">Matti</a></span>                              </span>
+                            <span class="MItem DateCreated">
+                               <a href="/forum/discussion/comment/49264/#Comment_49264" class="Permalink" name="Item_22" rel="nofollow"><time title="March 21, 2025  8:13AM" datetime="2025-03-21T08:13:16+00:00">March 2025</time></a>                            </span>
+                                                                                </div>
+                    </div>
+                    <div class="Item-BodyWrap">
+                        <div class="Item-Body">
+                            <div class="Message">
+                                Everything else indeed works, <a href="/forum/profile/SharadKothari">@SharadKothari</a>                             </div>
+                            <div class="Reactions"></div>                        </div>
+                    </div>
+                </div><!-- col //-->
+            </div>
+        </li>
+                <li class="Item Alt ItemComment" id="Comment_49265">
+            <div class="Comment row">
+                <div class="one column">
+                    <span class="Author">
+                       <a title="enigmaticvision" href="/forum/profile/enigmaticvision" class="PhotoWrap"><img src="https://secure.gravatar.com/avatar.php?gravatar_id=454a8ddfe2e00da521dd320c86c07592&amp;amp;size=50&amp;default=https%3A%2F%2Fvanillicon.com%2F454a8ddfe2e00da521dd320c86c07592.png" alt="enigmaticvision" class="ProfilePhoto ProfilePhotoMedium" /></a>                    </span>
+                </div><!-- col //-->
+
+                <div class="eleven columns">
+                                        <div class="Options">
+                                            </div>
+                                        <div class="Item-Header CommentHeader">
+                        <div class="Meta CommentMeta CommentInfo">
+                            <span class="AuthorInfo">
+                               <span class="username"><a href="/forum/profile/enigmaticvision" class="Username">enigmaticvision</a></span>                              </span>
+                            <span class="MItem DateCreated">
+                               <a href="/forum/discussion/comment/49265/#Comment_49265" class="Permalink" name="Item_23" rel="nofollow"><time title="March 21, 2025  4:30PM" datetime="2025-03-21T16:30:42+00:00">March 2025</time></a>                            </span>
+                            <span class="MItem"> <span title="Edited March 21, 2025 4:31PM by enigmaticvision." class="DateUpdated">edited March 2025</span> </span>                                                    </div>
+                    </div>
+                    <div class="Item-BodyWrap">
+                        <div class="Item-Body">
+                            <div class="Message">
+                                I get error while connecting through "personal" of Zerodha<br /><br />error is as below : {"status":"error","message":"Invalid `api_key`.","data":null,"error_type":"InputException"}<br /><br />Code used: <br />from kiteconnect import KiteConnect<br />import pandas as pd<br /><br />api_key = "ycavr5szpoa6nzmp"<br />api_secret = "r7sp4mvujmos2lcwhbrpywj3miebdgii"<br />kite = KiteConnect(api_key=api_key)<br />print(kite.login_url())<br /><br />URL :<br /><a href="https://kite.zerodha.com/connect/login?api_key=ycavr5szpoa6nzmp&amp;v=3" target="_blank" rel="nofollow">https://kite.zerodha.com/connect/login?api_key=ycavr5szpoa6nzmp&amp;v=3</a><br /><br />NOTE : API key and api_secret is not correct here intentionally . I used correct one in my code <br /><br />                            </div>
+                            <div class="Reactions"></div>                        </div>
+                    </div>
+                </div><!-- col //-->
+            </div>
+        </li>
+                <li class="Item ItemComment" id="Comment_49266">
+            <div class="Comment row">
+                <div class="one column">
+                    <span class="Author">
+                       <a title="impratikthakkar" href="/forum/profile/impratikthakkar" class="PhotoWrap"><img src="https://secure.gravatar.com/avatar.php?gravatar_id=74613fdd0a015e613d56b338bc3da66a&amp;amp;size=50&amp;default=https%3A%2F%2Fvanillicon.com%2F74613fdd0a015e613d56b338bc3da66a.png" alt="impratikthakkar" class="ProfilePhoto ProfilePhotoMedium" /></a>                    </span>
+                </div><!-- col //-->
+
+                <div class="eleven columns">
+                                        <div class="Options">
+                                            </div>
+                                        <div class="Item-Header CommentHeader">
+                        <div class="Meta CommentMeta CommentInfo">
+                            <span class="AuthorInfo">
+                               <span class="username"><a href="/forum/profile/impratikthakkar" class="Username">impratikthakkar</a></span>                              </span>
+                            <span class="MItem DateCreated">
+                               <a href="/forum/discussion/comment/49266/#Comment_49266" class="Permalink" name="Item_24" rel="nofollow"><time title="March 21, 2025  5:17PM" datetime="2025-03-21T17:17:11+00:00">March 2025</time></a>                            </span>
+                                                                                </div>
+                    </div>
+                    <div class="Item-BodyWrap">
+                        <div class="Item-Body">
+                            <div class="Message">
+                                what are the best use cases of personal api (without market data) that you have come across?                            </div>
+                            <div class="Reactions"></div>                        </div>
+                    </div>
+                </div><!-- col //-->
+            </div>
+        </li>
+                <li class="Item Alt ItemComment" id="Comment_49267">
+            <div class="Comment row">
+                <div class="one column">
+                    <span class="Author">
+                       <a title="impratikthakkar" href="/forum/profile/impratikthakkar" class="PhotoWrap"><img src="https://secure.gravatar.com/avatar.php?gravatar_id=74613fdd0a015e613d56b338bc3da66a&amp;amp;size=50&amp;default=https%3A%2F%2Fvanillicon.com%2F74613fdd0a015e613d56b338bc3da66a.png" alt="impratikthakkar" class="ProfilePhoto ProfilePhotoMedium" /></a>                    </span>
+                </div><!-- col //-->
+
+                <div class="eleven columns">
+                                        <div class="Options">
+                                            </div>
+                                        <div class="Item-Header CommentHeader">
+                        <div class="Meta CommentMeta CommentInfo">
+                            <span class="AuthorInfo">
+                               <span class="username"><a href="/forum/profile/impratikthakkar" class="Username">impratikthakkar</a></span>                              </span>
+                            <span class="MItem DateCreated">
+                               <a href="/forum/discussion/comment/49267/#Comment_49267" class="Permalink" name="Item_25" rel="nofollow"><time title="March 21, 2025  5:18PM" datetime="2025-03-21T17:18:30+00:00">March 2025</time></a>                            </span>
+                                                                                </div>
+                    </div>
+                    <div class="Item-BodyWrap">
+                        <div class="Item-Body">
+                            <div class="Message">
+                                is it possible to post orders from tradingview to zerodha using personal API?                            </div>
+                            <div class="Reactions"></div>                        </div>
+                    </div>
+                </div><!-- col //-->
+            </div>
+        </li>
+                <li class="Item ItemComment" id="Comment_49268">
+            <div class="Comment row">
+                <div class="one column">
+                    <span class="Author">
+                       <a title="chinmay227" href="/forum/profile/chinmay227" class="PhotoWrap"><img src="https://secure.gravatar.com/avatar.php?gravatar_id=6f07154b734be3a4c586d4a6f0d83d43&amp;amp;size=50&amp;default=https%3A%2F%2Fvanillicon.com%2F6f07154b734be3a4c586d4a6f0d83d43.png" alt="chinmay227" class="ProfilePhoto ProfilePhotoMedium" /></a>                    </span>
+                </div><!-- col //-->
+
+                <div class="eleven columns">
+                                        <div class="Options">
+                                            </div>
+                                        <div class="Item-Header CommentHeader">
+                        <div class="Meta CommentMeta CommentInfo">
+                            <span class="AuthorInfo">
+                               <span class="username"><a href="/forum/profile/chinmay227" class="Username">chinmay227</a></span>                              </span>
+                            <span class="MItem DateCreated">
+                               <a href="/forum/discussion/comment/49268/#Comment_49268" class="Permalink" name="Item_26" rel="nofollow"><time title="March 22, 2025  7:25PM" datetime="2025-03-22T19:25:32+00:00">March 2025</time></a>                            </span>
+                                                                                </div>
+                    </div>
+                    <div class="Item-BodyWrap">
+                        <div class="Item-Body">
+                            <div class="Message">
+                                <a href="/forum/profile/impratikthakkar">@impratikthakkar</a> yes, you can use webhooks to send alerts, which can be used to send a buy or sell order based on your strategy. you also wouldn't need to get Connect for this as your data source would be tradingview                            </div>
+                            <div class="Reactions"></div>                        </div>
+                    </div>
+                </div><!-- col //-->
+            </div>
+        </li>
+                <li class="Item Alt ItemComment" id="Comment_49272">
+            <div class="Comment row">
+                <div class="one column">
+                    <span class="Author">
+                       <a title="niksya" href="/forum/profile/niksya" class="PhotoWrap"><img src="https://secure.gravatar.com/avatar.php?gravatar_id=95149efa3618082781deb43fd0e66005&amp;amp;size=50&amp;default=https%3A%2F%2Fvanillicon.com%2F95149efa3618082781deb43fd0e66005.png" alt="niksya" class="ProfilePhoto ProfilePhotoMedium" /></a>                    </span>
+                </div><!-- col //-->
+
+                <div class="eleven columns">
+                                        <div class="Options">
+                                            </div>
+                                        <div class="Item-Header CommentHeader">
+                        <div class="Meta CommentMeta CommentInfo">
+                            <span class="AuthorInfo">
+                               <span class="username"><a href="/forum/profile/niksya" class="Username">niksya</a></span>                              </span>
+                            <span class="MItem DateCreated">
+                               <a href="/forum/discussion/comment/49272/#Comment_49272" class="Permalink" name="Item_27" rel="nofollow"><time title="March 23, 2025 12:35PM" datetime="2025-03-23T12:35:21+00:00">March 2025</time></a>                            </span>
+                            <span class="MItem"> <span title="Edited March 23, 2025 12:36PM by niksya." class="DateUpdated">edited March 2025</span> </span>                                                    </div>
+                    </div>
+                    <div class="Item-BodyWrap">
+                        <div class="Item-Body">
+                            <div class="Message">
+                                <del><del><a href="/forum/profile/v4vikash">@v4vikash</a> How much time did it take ? Facing same issue for more than 2-3 hours.</del></del><br /><del><del><a href="/forum/profile/enigmaticvision">@enigmaticvision</a> were you able to solve this ? If yes could you please share steps involved ?</del></del><br /><br />I was able to solve by pausing and marking active again. Thanks!                            </div>
+                            <div class="Reactions"></div>                        </div>
+                    </div>
+                </div><!-- col //-->
+            </div>
+        </li>
+                <li class="Item ItemComment" id="Comment_49273">
+            <div class="Comment row">
+                <div class="one column">
+                    <span class="Author">
+                       <a title="Glen" href="/forum/profile/Glen" class="PhotoWrap"><img src="https://secure.gravatar.com/avatar.php?gravatar_id=4839a16fa784962acff48d092f08900a&amp;amp;size=50&amp;default=https%3A%2F%2Fvanillicon.com%2F4839a16fa784962acff48d092f08900a.png" alt="Glen" class="ProfilePhoto ProfilePhotoMedium" /></a>                    </span>
+                </div><!-- col //-->
+
+                <div class="eleven columns">
+                                        <div class="Options">
+                                            </div>
+                                        <div class="Item-Header CommentHeader">
+                        <div class="Meta CommentMeta CommentInfo">
+                            <span class="AuthorInfo">
+                               <span class="username"><a href="/forum/profile/Glen" class="Username">Glen</a></span>                              </span>
+                            <span class="MItem DateCreated">
+                               <a href="/forum/discussion/comment/49273/#Comment_49273" class="Permalink" name="Item_28" rel="nofollow"><time title="March 24, 2025  2:12AM" datetime="2025-03-24T02:12:26+00:00">March 2025</time></a>                            </span>
+                                                                                </div>
+                    </div>
+                    <div class="Item-BodyWrap">
+                        <div class="Item-Body">
+                            <div class="Message">
+                                Hey how do I change the type of the current app from "Kite connect + Historical Chart data" to just "Kite connect"? Do I need to delete this existing app and create a new one? There's not other option to just change the type?                            </div>
+                            <div class="Reactions"></div>                        </div>
+                    </div>
+                </div><!-- col //-->
+            </div>
+        </li>
+                <li class="Item Alt ItemComment" id="Comment_49274">
+            <div class="Comment row">
+                <div class="one column">
+                    <span class="Author">
+                       <a title="Sravanthi_bh" href="/forum/profile/Sravanthi_bh" class="PhotoWrap"><img src="https://kite.trade/forum/uploads/userpics/468/nOHKJHKFU7KEO.png" alt="Sravanthi_bh" class="ProfilePhoto ProfilePhotoMedium" /></a>                    </span>
+                </div><!-- col //-->
+
+                <div class="eleven columns">
+                                        <div class="Options">
+                                            </div>
+                                        <div class="Item-Header CommentHeader">
+                        <div class="Meta CommentMeta CommentInfo">
+                            <span class="AuthorInfo">
+                               <span class="username"><a href="/forum/profile/Sravanthi_bh" class="Username">Sravanthi_bh</a></span>                              </span>
+                            <span class="MItem DateCreated">
+                               <a href="/forum/discussion/comment/49274/#Comment_49274" class="Permalink" name="Item_29" rel="nofollow"><time title="March 24, 2025  3:40AM" datetime="2025-03-24T03:40:30+00:00">March 2025</time></a>                            </span>
+                                                                                </div>
+                    </div>
+                    <div class="Item-BodyWrap">
+                        <div class="Item-Body">
+                            <div class="Message">
+                                You can continue using the app until the subscription expires while simultaneously you can create the app with a Personal API.<br /><img src="https://kite.trade/forum/uploads/editor/6q/8l08vnxjlfzz.png" alt="" /><br />                            </div>
+                            
+<div class="editor-upload-saved editor-upload-readonly" id="editor-uploads-commentid49274">
+
+   
+      
+      <div class="editor-file-preview file-readonly in-body"
+           id="media-id-3436"
+           title="image.png">
+         <input type="hidden" name="MediaIDs[]" value="3436" disabled="disabled"/>
+         <i class="file-preview icon icon-file"></i>         <div class="file-data">
+            <a class="filename" data-type="image/png"
+               href="https://kite.trade/forum/uploads/editor/6q/8l08vnxjlfzz.png"
+               target="_blank"
+                data-width="1580"data-height="952"                >
+                image.png            </a>
+            <span class="meta">76.2K</span>
+         </div>
+         <span class="editor-file-remove" title="Remove"></span>
+         <span class="editor-file-reattach" title="Click to re-attach"></span>
+      </div>
+
+   
+</div>
+<div class="Reactions"></div>                        </div>
+                    </div>
+                </div><!-- col //-->
+            </div>
+        </li>
+                <li class="Item ItemComment" id="Comment_49276">
+            <div class="Comment row">
+                <div class="one column">
+                    <span class="Author">
+                       <a title="chpadma" href="/forum/profile/chpadma" class="PhotoWrap"><img src="https://secure.gravatar.com/avatar.php?gravatar_id=f554729ec1760f9424f55d5b16cdad8d&amp;amp;size=50&amp;default=https%3A%2F%2Fvanillicon.com%2Ff554729ec1760f9424f55d5b16cdad8d.png" alt="chpadma" class="ProfilePhoto ProfilePhotoMedium" /></a>                    </span>
+                </div><!-- col //-->
+
+                <div class="eleven columns">
+                                        <div class="Options">
+                                            </div>
+                                        <div class="Item-Header CommentHeader">
+                        <div class="Meta CommentMeta CommentInfo">
+                            <span class="AuthorInfo">
+                               <span class="username"><a href="/forum/profile/chpadma" class="Username">chpadma</a></span>                              </span>
+                            <span class="MItem DateCreated">
+                               <a href="/forum/discussion/comment/49276/#Comment_49276" class="Permalink" name="Item_30" rel="nofollow"><time title="March 24, 2025  5:18AM" datetime="2025-03-24T05:18:28+00:00">March 2025</time></a>                            </span>
+                            <span class="MItem"> <span title="Edited March 24, 2025 5:18AM by chpadma." class="DateUpdated">edited March 2025</span> </span>                                                    </div>
+                    </div>
+                    <div class="Item-BodyWrap">
+                        <div class="Item-Body">
+                            <div class="Message">
+                                Facing this issue when I tried free API,     
+<pre class="CodeBlock"><code>raise exp(data[&quot;message&quot;], code=r.status_code)<br />kiteconnect.exceptions.TokenException: Token is invalid or has expired.</code></pre>
+The error is coming at line
+<pre class="CodeBlock"><code>            session = broker.generate_session(requestToken, api_secret=appSecret)<br /></code></pre>
+I am passing the new requestToken I got from url, then new appSecret.                              </div>
+                            <div class="Reactions"></div>                        </div>
+                    </div>
+                </div><!-- col //-->
+            </div>
+        </li>
+                <li class="Item Alt ItemComment" id="Comment_49277">
+            <div class="Comment row">
+                <div class="one column">
+                    <span class="Author">
+                       <a title="sujith" href="/forum/profile/sujith" class="PhotoWrap"><img src="https://secure.gravatar.com/avatar.php?gravatar_id=c90357185d9adc74492e4d00b1d8057a&amp;amp;size=50&amp;default=https%3A%2F%2Fvanillicon.com%2Fc90357185d9adc74492e4d00b1d8057a.png" alt="sujith" class="ProfilePhoto ProfilePhotoMedium" /></a>                    </span>
+                </div><!-- col //-->
+
+                <div class="eleven columns">
+                                        <div class="Options">
+                                            </div>
+                                        <div class="Item-Header CommentHeader">
+                        <div class="Meta CommentMeta CommentInfo">
+                            <span class="AuthorInfo">
+                               <span class="username"><a href="/forum/profile/sujith" class="Username">sujith</a></span>                              </span>
+                            <span class="MItem DateCreated">
+                               <a href="/forum/discussion/comment/49277/#Comment_49277" class="Permalink" name="Item_31" rel="nofollow"><time title="March 24, 2025  5:52AM" datetime="2025-03-24T05:52:18+00:00">March 2025</time></a>                            </span>
+                                                                                </div>
+                    </div>
+                    <div class="Item-BodyWrap">
+                        <div class="Item-Body">
+                            <div class="Message">
+                                <a href="/forum/profile/chpadma">@chpadma</a>,<br />Are you sure you are using the right api_key and app_secret? Please create a new thread for the issues, it may help others who are looking for similar solution. Don't hijack existing threads.                            </div>
+                            <div class="Reactions"></div>                        </div>
+                    </div>
+                </div><!-- col //-->
+            </div>
+        </li>
+                <li class="Item ItemComment" id="Comment_49280">
+            <div class="Comment row">
+                <div class="one column">
+                    <span class="Author">
+                       <a title="bhaskarsancheti" href="/forum/profile/bhaskarsancheti" class="PhotoWrap"><img src="https://secure.gravatar.com/avatar.php?gravatar_id=9ef608700e222a4a720af755e11330bd&amp;amp;size=50&amp;default=https%3A%2F%2Fvanillicon.com%2F9ef608700e222a4a720af755e11330bd.png" alt="bhaskarsancheti" class="ProfilePhoto ProfilePhotoMedium" /></a>                    </span>
+                </div><!-- col //-->
+
+                <div class="eleven columns">
+                                        <div class="Options">
+                                            </div>
+                                        <div class="Item-Header CommentHeader">
+                        <div class="Meta CommentMeta CommentInfo">
+                            <span class="AuthorInfo">
+                               <span class="username"><a href="/forum/profile/bhaskarsancheti" class="Username">bhaskarsancheti</a></span>                              </span>
+                            <span class="MItem DateCreated">
+                               <a href="/forum/discussion/comment/49280/#Comment_49280" class="Permalink" name="Item_32" rel="nofollow"><time title="March 24, 2025  8:11AM" datetime="2025-03-24T08:11:04+00:00">March 2025</time></a>                            </span>
+                                                                                </div>
+                    </div>
+                    <div class="Item-BodyWrap">
+                        <div class="Item-Body">
+                            <div class="Message">
+                                Hi, I am getting an error message Login Failed! error: route not found - getting this error on stoxxo an execution platform, but not having any issues with paid api login on the same software.                            </div>
+                            <div class="Reactions"></div>                        </div>
+                    </div>
+                </div><!-- col //-->
+            </div>
+        </li>
+                <li class="Item Alt ItemComment" id="Comment_49281">
+            <div class="Comment row">
+                <div class="one column">
+                    <span class="Author">
+                       <a title="akraghavendran" href="/forum/profile/akraghavendran" class="PhotoWrap"><img src="https://secure.gravatar.com/avatar.php?gravatar_id=cadabe79bf0f0b0b19946704d1363110&amp;amp;size=50&amp;default=https%3A%2F%2Fvanillicon.com%2Fcadabe79bf0f0b0b19946704d1363110.png" alt="akraghavendran" class="ProfilePhoto ProfilePhotoMedium" /></a>                    </span>
+                </div><!-- col //-->
+
+                <div class="eleven columns">
+                                        <div class="Options">
+                                            </div>
+                                        <div class="Item-Header CommentHeader">
+                        <div class="Meta CommentMeta CommentInfo">
+                            <span class="AuthorInfo">
+                               <span class="username"><a href="/forum/profile/akraghavendran" class="Username">akraghavendran</a></span>                              </span>
+                            <span class="MItem DateCreated">
+                               <a href="/forum/discussion/comment/49281/#Comment_49281" class="Permalink" name="Item_33" rel="nofollow"><time title="March 24, 2025  9:54AM" datetime="2025-03-24T09:54:51+00:00">March 2025</time></a>                            </span>
+                            <span class="MItem"> <span title="Edited March 24, 2025 10:06AM by akraghavendran." class="DateUpdated">edited March 2025</span> </span>                                                    </div>
+                    </div>
+                    <div class="Item-BodyWrap">
+                        <div class="Item-Body">
+                            <div class="Message">
+                                nice feature addition. Thank you                             </div>
+                            <div class="Reactions"></div>                        </div>
+                    </div>
+                </div><!-- col //-->
+            </div>
+        </li>
+                <li class="Item ItemComment" id="Comment_49282">
+            <div class="Comment row">
+                <div class="one column">
+                    <span class="Author">
+                       <a title="sujith" href="/forum/profile/sujith" class="PhotoWrap"><img src="https://secure.gravatar.com/avatar.php?gravatar_id=c90357185d9adc74492e4d00b1d8057a&amp;amp;size=50&amp;default=https%3A%2F%2Fvanillicon.com%2Fc90357185d9adc74492e4d00b1d8057a.png" alt="sujith" class="ProfilePhoto ProfilePhotoMedium" /></a>                    </span>
+                </div><!-- col //-->
+
+                <div class="eleven columns">
+                                        <div class="Options">
+                                            </div>
+                                        <div class="Item-Header CommentHeader">
+                        <div class="Meta CommentMeta CommentInfo">
+                            <span class="AuthorInfo">
+                               <span class="username"><a href="/forum/profile/sujith" class="Username">sujith</a></span>                              </span>
+                            <span class="MItem DateCreated">
+                               <a href="/forum/discussion/comment/49282/#Comment_49282" class="Permalink" name="Item_34" rel="nofollow"><time title="March 24, 2025 10:08AM" datetime="2025-03-24T10:08:45+00:00">March 2025</time></a>                            </span>
+                                                                                </div>
+                    </div>
+                    <div class="Item-BodyWrap">
+                        <div class="Item-Body">
+                            <div class="Message">
+                                <a href="/forum/profile/bhaskarsancheti">@bhaskarsancheti</a>,<br />Are you getting this after login or before that? <br /><br />PS: Please create a new thread for the issues, it may help others who are looking for similar solution. Don't hijack existing threads.                            </div>
+                            <div class="Reactions"></div>                        </div>
+                    </div>
+                </div><!-- col //-->
+            </div>
+        </li>
+            </ul>
+</div><div class="P PagerWrap"></div></div>            <div class="Foot Closed">
+                <div class="Note Closed">This discussion has been closed.</div>
+            </div>
+        
+        </div>
+    </div>
+
+    <footer class="footer">
+        <p>
+            Zerodha Member of  NSE &amp; BSE &mdash; SEBI Registration no.: INZ000031633 | CDSL: Depository services through Zerodha Securities Pvt. Ltd. - SEBI Registration no.: IN-DP-100-2015 | Commodity Trading through Zerodha Commodities Pvt. Ltd. MCX: 46025 | NCDEX : 1138. SEBI Registration no.: INZ000038238 | Registered Address: Zerodha, #153/154, 4th Cross, Dollars Colony, Opp. Clarence Public School, J.P Nagar 4th Phase, Bangalore - 560078, Karnataka, India
+        </p>
+        <p>
+            DISCLAIMER: Capital markets, trading, and investments have inherent risks. Please make sure you understand the risks involved and carefully read the Risk Disclosure Document as prescribed by SEBI | ICF before participating in the markets &mdash; <a href="https://kite.trade/terms">Read terms &amp; conditions</a>
+        </p>
+
+        Operated by Zerodha Technology Pvt. Ltd. &copy; 2015-2026
+        
+    </footer>
+</div>
+
+
+
+<script>
+    $(document).ready(function() {
+        $("#burger").click(function() {
+            if($(this).data("visible") == "1") {
+                $(this).data("visible", 0);
+                $("#sidebar").hide();
+            } else {
+                $(this).data("visible", 1);
+                $("#sidebar").show();
+            }
+        });
+
+	$("#Form_Search").focusin(function () {
+		$("#Form_Search").css("width", "300px");
+	})
+
+        $("#Form_Search").focusout(function () {
+                $("#Form_Search").css("width", "240px");
+        })
+
+        return false;
+    });
+</script>
+
+</body>
+</html>
