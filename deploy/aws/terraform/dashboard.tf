@@ -113,10 +113,14 @@ resource "aws_cloudwatch_dashboard" "operator" {
         width  = 8
         height = 6
         properties = {
-          title   = "Instruments silent (tick-gap — 0 = all streaming)"
+          # PR-C3 (2026-07-14): the per-SID tick-gap silent-count panel was
+          # replaced — its gauge producer (the tick-gap detector) was deleted
+          # with the Dhan WS lane (operator Q4-ii 2026-07-13). The FEED-level
+          # last-tick age is the surviving stall signal (FEED-STALL-01).
+          title   = "Feed last-tick age (s — feed-level stall signal)"
           region  = local.dash_region
           view    = "timeSeries"
-          metrics = [[local.dash_namespace, "tv_tick_gap_instruments_silent"]]
+          metrics = [[local.dash_namespace, "tv_feed_last_tick_age_seconds"]]
           period  = 60
           stat    = "Maximum"
         }
@@ -232,7 +236,7 @@ resource "aws_cloudwatch_dashboard" "operator" {
           alarms = [
             aws_cloudwatch_metric_alarm.questdb_disconnected.arn,
             aws_cloudwatch_metric_alarm.token_remaining_low.arn,
-            aws_cloudwatch_metric_alarm.tick_gap_instruments_silent.arn,
+            # tick_gap_instruments_silent retired in PR-C3 (2026-07-14).
             aws_cloudwatch_metric_alarm.spill_dropped.arn,
             aws_cloudwatch_metric_alarm.dlq_ticks.arn,
             aws_cloudwatch_metric_alarm.clock_skew_high.arn,

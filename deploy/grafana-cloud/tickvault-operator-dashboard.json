@@ -115,12 +115,12 @@
     {
       "id": 7,
       "type": "stat",
-      "title": "Silent instruments (0 = good)",
+      "title": "Feed last-tick age s (low = good)",
       "gridPos": { "h": 4, "w": 4, "x": 12, "y": 4 },
       "datasource": { "type": "cloudwatch", "uid": "${DS_CLOUDWATCH}" },
       "fieldConfig": { "defaults": { "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "orange", "value": 1 }, { "color": "red", "value": 10 } ] } }, "overrides": [] },
       "options": { "colorMode": "background", "graphMode": "none", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false } },
-      "targets": [ { "refId": "A", "datasource": { "type": "cloudwatch", "uid": "${DS_CLOUDWATCH}" }, "namespace": "Tickvault/Prod", "metricName": "tv_tick_gap_instruments_silent", "statistic": "Maximum", "dimensions": { "host": "*" }, "region": "ap-south-1", "matchExact": false } ]
+      "targets": [ { "refId": "A", "datasource": { "type": "cloudwatch", "uid": "${DS_CLOUDWATCH}" }, "namespace": "Tickvault/Prod", "metricName": "tv_feed_last_tick_age_seconds", "statistic": "Maximum", "dimensions": { "host": "*" }, "region": "ap-south-1", "matchExact": false } ]
     },
     {
       "id": 8,

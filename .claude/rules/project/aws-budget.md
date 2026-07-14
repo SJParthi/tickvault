@@ -68,6 +68,15 @@ The dual-feed scoreboard PR-C added, per `deploy/aws/terraform/silent-feed-alarm
 Total **≈ $0.40/mo pre-GST (~₹40/mo incl. 18% GST at ₹85/$)** — inside the
 $35/mo pre-GST budget alarm ceiling and the ~₹2,919/mo envelope.
 
+## COST NOTE 2026-07-14 — PR-C3 tick-gap retirement (−~$0.40/mo)
+
+PR-C3 (tick-gap detector deletion, operator Q4-ii 2026-07-13) removed the
+`tv-<env>-tick-gap-instruments-silent` alarm (−1 alarm ≈ −$0.10/mo) and the
+`tv_tick_gap_instruments_silent` custom-metric series from the EMF allowlist
+(−1 series ≈ −$0.30/mo) — the gauge producer was deleted with the Dhan WS
+lane, so both would have been dead monitors. Dated notes in
+`deploy/aws/terraform/app-alarms.tf` + `market-hours-liveness-alarm.tf`.
+
 ## COST NOTE 2026-07-13 — EBS 30→50 GB (+~₹170/mo incl GST)
 
 Prod disk-pressure remediation (operator pre-approved 2026-07-13): the root fs

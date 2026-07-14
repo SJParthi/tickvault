@@ -290,8 +290,9 @@ pub enum NotificationEvent {
         boot_path: BootPathLabel,
         boot_wall_clock_secs: f64,
         /// Age (secs) of the most-recent REAL tick across all instruments,
-        /// or `None` if zero real ticks captured yet. Sourced from
-        /// `TickGapDetector::freshest_tick_age_secs` (real ticks only —
+        /// or `None` if zero real ticks captured yet. Historically sourced
+        /// from the tick-gap detector's `freshest_tick_age_secs` (DELETED
+        /// in PR-C3, 2026-07-14, with the Dhan WS lane; real ticks only —
         /// never pings). Closes the 2026-06-02 false-OK where the per-feed
         /// "last update Xs ago" counted Dhan keep-alive pings and could
         /// read healthy while no real ticks were captured.

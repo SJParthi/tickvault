@@ -1824,8 +1824,9 @@ pub struct FeaturesConfig {
     pub ws_depth_ou_sleep_until_open: bool,
     /// Wave 2 Item 7 — fast-boot 60-second deadline with mid-market degraded mode.
     pub fast_boot_60s_deadline: bool,
-    /// Wave 2 Item 8 — tick-gap detector 60-second alert coalescing.
-    pub tick_gap_detector_60s_coalesce: bool,
+    // PR-C3 (2026-07-14): `tick_gap_detector_60s_coalesce` (Wave 2 Item 8)
+    // retired alongside the deleted tick-gap detector (operator Q4-ii
+    // 2026-07-13 — the detector was fed only by the retired Dhan WS lane).
     /// Wave 2 Item 9 — 6 audit tables (subscribe/disconnect/depth/etc).
     pub audit_tables_enabled: bool,
     /// Wave 3 Item 11 — Telegram bucket-coalescer + dispatcher hardening.
@@ -1847,7 +1848,6 @@ impl Default for FeaturesConfig {
             ws_main_sleep_until_open: true,
             ws_depth_ou_sleep_until_open: true,
             fast_boot_60s_deadline: true,
-            tick_gap_detector_60s_coalesce: true,
             audit_tables_enabled: true,
             telegram_bucket_coalescer: true,
             market_open_self_test: true,
