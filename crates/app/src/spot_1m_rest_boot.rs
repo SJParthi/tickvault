@@ -192,6 +192,17 @@ pub struct Spot1mRestTaskParams {
     /// option-chain leg wakes on it so it fires immediately AFTER the spot
     /// fetch; `None` keeps PR-2 behaviour byte-identical.
     pub minute_done_tx: Option<tokio::sync::watch::Sender<Option<u32>>>,
+    /// 2026-07-14 serving-delay diagnostics rider: when `true`, two
+    /// one-shot LOG-ONLY probe moments (the first session fire after boot
+    /// + once at `diagnostics_second_probe_secs_of_day_ist`) each issue 3
+    /// bounded extra requests for ONE SID — the cross-verify's byte-exact
+    /// day window, the previous-trading-day window, and a same-day-to-now
+    /// window — and log the request bodies + response shapes side by side.
+    /// Never touches the fetch / persist / edge behaviour.
+    pub diagnostics_enabled: bool,
+    /// IST seconds-of-day of the second one-shot probe (default 11:00 IST
+    /// from config). Inert while `diagnostics_enabled` is false.
+    pub diagnostics_second_probe_secs_of_day_ist: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -313,20 +324,154 @@ pub fn select_minute_candle(
 
 /// Parse a Dhan intraday columnar body and pick the target minute's candle
 /// PLUS (when requested) the previous-minute backfill candle from the SAME
-/// full-day body. Malformed / short / length-mismatched bodies parse to an
-/// empty set (the reused panic-free columnar parser) and therefore yield
-/// `(None, None)`. Pure.
+/// full-day body, PLUS the body's diagnostic shape stats
+/// (`(rows, newest candle minute nanos)` — 2026-07-14 serving-delay
+/// instrumentation; `None` for a zero-candle parse). Malformed / short /
+/// length-mismatched bodies parse to an empty set (the reused panic-free
+/// columnar parser) and therefore yield `(None, None, None)`. Pure.
 #[must_use]
 pub fn parse_intraday_columnar_for_minutes(
     body: &str,
     target_minute_ist_nanos: i64,
     backfill_minute_ist_nanos: Option<i64>,
-) -> (Option<MinuteCandle>, Option<MinuteCandle>) {
+) -> (
+    Option<MinuteCandle>,
+    Option<MinuteCandle>,
+    Option<(usize, i64)>,
+) {
     let candles = parse_intraday_1m_candles(body);
     (
         select_minute_candle(&candles, target_minute_ist_nanos),
         backfill_minute_ist_nanos.and_then(|b| select_minute_candle(&candles, b)),
+        body_stats(&candles),
     )
+}
+
+// ---------------------------------------------------------------------------
+// 2026-07-14 serving-delay diagnostics — empty-classification split
+// ---------------------------------------------------------------------------
+
+/// Diagnostic classification of a 2xx-but-no-target-candle ladder verdict
+/// (2026-07-14 serving-delay instrumentation). The pre-split `empty`
+/// outcome collapsed two VERY different vendor states; the split is the
+/// per-minute discriminator between "Dhan has NO same-day data at all"
+/// and "Dhan serves same-day data with a LAG". Edge / backfill / persist
+/// semantics are unchanged — both classes still count as an empty minute.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EmptyClass {
+    /// Every 2xx body of the ladder parsed to ZERO candles for the day —
+    /// the vendor is returning an empty day (`outcome="empty_no_rows"`).
+    NoRows,
+    /// Candles present but none at/after the target minute — the vendor
+    /// is serving the day with a measurable delay
+    /// (`outcome="empty_stale"`).
+    Stale {
+        /// Candle count in the freshest 2xx body of the ladder.
+        rows_in_response: usize,
+        /// The freshest body's newest candle (IST minute-open nanos).
+        last_candle_ist_nanos: i64,
+        /// The vendor SERVING LAG: `target minute open − last candle
+        /// minute open`, in whole seconds, clamped ≥ 0 (a body carrying
+        /// candles BEYOND the target while the exact target is missing is
+        /// a pathological gap — recorded as lag 0, never negative).
+        serving_lag_secs: i64,
+    },
+}
+
+/// The vendor serving lag in whole seconds for a stale body: target minute
+/// open − newest candle minute open, clamped ≥ 0. Pure.
+#[must_use]
+pub fn serving_lag_secs(target_minute_ist_nanos: i64, last_candle_ist_nanos: i64) -> i64 {
+    target_minute_ist_nanos
+        .saturating_sub(last_candle_ist_nanos)
+        .max(0)
+        / NANOS_PER_SEC
+}
+
+/// Classify an empty ladder verdict from the freshest 2xx body's shape.
+/// `None` stats (no 2xx body ever parsed any rows — including the
+/// zero-candle parse of a malformed body) → [`EmptyClass::NoRows`]. Pure.
+#[must_use]
+pub fn classify_empty_body(
+    freshest_body: Option<(usize, i64)>,
+    target_minute_ist_nanos: i64,
+) -> EmptyClass {
+    match freshest_body {
+        Some((rows_in_response, last_candle_ist_nanos)) if rows_in_response > 0 => {
+            EmptyClass::Stale {
+                rows_in_response,
+                last_candle_ist_nanos,
+                serving_lag_secs: serving_lag_secs(target_minute_ist_nanos, last_candle_ist_nanos),
+            }
+        }
+        _ => EmptyClass::NoRows,
+    }
+}
+
+/// The freshest 2xx body's `(rows, newest candle minute nanos)` — `None`
+/// for a zero-candle parse (the caller keeps the LAST non-empty view so a
+/// transiently-empty later rung never launders an earlier stale view into
+/// `NoRows`... it can't: a later NON-empty body simply replaces the
+/// stats, and a later EMPTY body leaves them untouched). Pure.
+#[must_use]
+pub fn body_stats(candles: &[MinuteCandle]) -> Option<(usize, i64)> {
+    candles
+        .iter()
+        .map(|c| c.minute_ts_ist_nanos)
+        .max()
+        .map(|last| (candles.len(), last))
+}
+
+/// Per-fire aggregate of the empty-class diagnostics for the coalesced
+/// minute log (2026-07-14 serving-delay instrumentation). Log-only — the
+/// edge / persist / backfill semantics never read it. Pure state.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct EmptyDiagnostics {
+    /// SIDs whose ladder ended `empty_no_rows` this fire.
+    pub no_rows: usize,
+    /// SIDs whose ladder ended `empty_stale` this fire.
+    pub stale: usize,
+    /// Max candle count across the stale SIDs' freshest bodies.
+    pub max_rows_in_response: usize,
+    /// Max vendor serving lag across the stale SIDs (whole seconds).
+    pub max_serving_lag_secs: i64,
+    /// Newest candle seen across the stale SIDs (IST minute-open nanos).
+    pub latest_candle_ist_nanos: Option<i64>,
+}
+
+impl EmptyDiagnostics {
+    /// Fold one SID's empty classification into the fire's aggregate.
+    pub fn record(&mut self, class: EmptyClass) {
+        match class {
+            EmptyClass::NoRows => self.no_rows = self.no_rows.saturating_add(1),
+            EmptyClass::Stale {
+                rows_in_response,
+                last_candle_ist_nanos,
+                serving_lag_secs,
+            } => {
+                self.stale = self.stale.saturating_add(1);
+                self.max_rows_in_response = self.max_rows_in_response.max(rows_in_response);
+                self.max_serving_lag_secs = self.max_serving_lag_secs.max(serving_lag_secs);
+                self.latest_candle_ist_nanos = Some(
+                    self.latest_candle_ist_nanos
+                        .map_or(last_candle_ist_nanos, |cur| cur.max(last_candle_ist_nanos)),
+                );
+            }
+        }
+    }
+}
+
+/// IST 12-hour label for an IST minute-open nanosecond instant on the
+/// given trading day (`"10:38 AM"`) — commandment-9 wording for the
+/// coalesced diagnostics fields. Out-of-day instants clamp into the day.
+/// Pure.
+#[must_use]
+pub fn ist_nanos_minute_label(minute_ist_nanos: i64, trading_date_nanos: i64) -> String {
+    let secs_of_day = (minute_ist_nanos.saturating_sub(trading_date_nanos) / NANOS_PER_SEC)
+        .clamp(0, i64::from(SECONDS_PER_DAY) - 1);
+    // Clamped into [0, SECONDS_PER_DAY); the cast is safe.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    format_minute_ist_12h(secs_of_day as u32)
 }
 
 /// Nanoseconds per minute (backfill arithmetic).
@@ -640,6 +785,267 @@ impl SidServedTracker {
 }
 
 // ---------------------------------------------------------------------------
+// 2026-07-14 serving-delay diagnostics — one-shot side-by-side probes
+// ---------------------------------------------------------------------------
+//
+// Config-gated (`[spot_1m_rest] diagnostics`), LOG-ONLY, bounded: two probe
+// moments per day (the first session fire after boot + once at the
+// configurable second instant, default 11:00 IST), each issuing up to 3
+// extra requests for ONE SID spaced [`PROBE_REQUEST_SPACING_MS`] apart —
+// ≤6 requests/day, trivially inside the Data-API 5/sec budget. The probes
+// NEVER touch the persist / edge / backfill legs; their whole output is
+// ONE structured side-by-side log line per probe moment. Shapes:
+//   a. `crossverify_day_window` — the 15:31 cross-verify's byte-exact
+//      day-granular request (== [`spot_1m_day_request_body`]; the two
+//      builders share [`intraday_request_body`] — byte-equality is
+//      unit-pinned below), issued AT the probe instant: does the shape
+//      that provably works at 15:31 also work now?
+//   b. `prev_trading_day_window` — the previous trading day's full window:
+//      proves SETTLED-data serving is healthy right now.
+//   c. `same_day_to_now_window` — same day but `toDate = now` instead of
+//      D+1 00:00:00: does the toDate shape change same-day serving?
+// Together with the per-minute empty-class split these discriminate
+// "vendor serves same-day intraday with a DELAY" from "our request shape
+// is wrong".
+
+/// Sleep between the probe's sequential requests (budget spacing).
+const PROBE_REQUEST_SPACING_MS: u64 = 300;
+/// Minimum seconds remaining before the next minute boundary for a probe
+/// to start: 3 requests × the 5 s client timeout + 2 × spacing ≈ 15.6 s
+/// worst case, so 20 s of room guarantees the probe can never eat the next
+/// boundary (and if it somehow did, the H2 missed-boundary accounting
+/// still counts it — the probe runs BEFORE that accounting).
+const PROBE_ROOM_SECS: u32 = 20;
+
+/// Which one-shot probe moment fired.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProbeSlot {
+    /// The first session fire after boot.
+    FirstFire,
+    /// The configurable second instant (default 11:00 IST).
+    SecondScheduled,
+}
+
+/// One-shot latches for the two probe moments (session-scoped; a task
+/// respawn re-arms them — worst case a few extra bounded probes, log-only).
+#[derive(Debug, Default)]
+pub struct ProbeState {
+    pub first_done: bool,
+    pub second_done: bool,
+}
+
+/// Which probe (if any) is due after the fire at `fire_secs_of_day`.
+/// `None` while diagnostics are off or both one-shots already ran. Pure.
+#[must_use]
+pub fn should_run_probe(
+    diagnostics_enabled: bool,
+    state: &ProbeState,
+    fire_secs_of_day: u32,
+    second_probe_secs_of_day: u32,
+) -> Option<ProbeSlot> {
+    if !diagnostics_enabled {
+        return None;
+    }
+    if !state.first_done {
+        return Some(ProbeSlot::FirstFire);
+    }
+    if !state.second_done && fire_secs_of_day >= second_probe_secs_of_day {
+        return Some(ProbeSlot::SecondScheduled);
+    }
+    None
+}
+
+/// `true` when the wall clock leaves at least [`PROBE_ROOM_SECS`] before
+/// the next minute boundary — a due probe with no room DEFERS to the next
+/// fire (the latch stays un-set), never risks eating a fetch minute. Pure.
+#[must_use]
+pub fn probe_has_room(now_secs_of_day: u32) -> bool {
+    let next_boundary = (now_secs_of_day / 60).saturating_add(1).saturating_mul(60);
+    next_boundary.saturating_sub(now_secs_of_day) >= PROBE_ROOM_SECS
+}
+
+/// The most recent trading day STRICTLY BEFORE `today` (bounded 14-day
+/// walk — longer than any NSE holiday cluster). Predicate-injected so the
+/// calendar never has to be mocked. Pure. `None` only on a pathological
+/// 14-straight-closed-days calendar (the probe then simply skips shape b).
+#[must_use]
+pub fn previous_trading_day(
+    today: NaiveDate,
+    is_trading_day: impl Fn(NaiveDate) -> bool,
+) -> Option<NaiveDate> {
+    let mut d = today.pred_opt()?;
+    for _ in 0..14 {
+        if is_trading_day(d) {
+            return Some(d);
+        }
+        d = d.pred_opt()?;
+    }
+    None
+}
+
+/// The `same_day_to_now_window` probe body: identical to the proven day
+/// window EXCEPT `toDate` = the current IST wall-clock instant (instead of
+/// D+1 00:00:00). Pure.
+#[must_use]
+pub fn probe_to_now_body(
+    security_id: &str,
+    trading_date: NaiveDate,
+    now_secs_of_day: u32,
+) -> serde_json::Value {
+    let clamped = now_secs_of_day.min(SECONDS_PER_DAY - 1);
+    let (h, m, s) = (clamped / 3600, (clamped % 3600) / 60, clamped % 60);
+    serde_json::json!({
+        "securityId": security_id,
+        "exchangeSegment": SPOT_1M_REST_SEGMENT_IDX_I,
+        "instrument": SPOT_1M_INSTRUMENT_INDEX,
+        "interval": "1",
+        "oi": false,
+        "fromDate": trading_date.format("%Y-%m-%d 00:00:00").to_string(),
+        "toDate": format!("{} {h:02}:{m:02}:{s:02}", trading_date.format("%Y-%m-%d")),
+    })
+}
+
+/// One probe response's shape summary. `serving_lag_secs = -1` is the
+/// honest "no candles, nothing to measure" sentinel. Pure construction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProbeBodySummary {
+    pub rows: usize,
+    pub first_candle_ist_nanos: Option<i64>,
+    pub last_candle_ist_nanos: Option<i64>,
+    pub target_present: bool,
+    pub serving_lag_secs: i64,
+}
+
+/// Summarize a parsed probe body against the shape's target minute. Pure.
+#[must_use]
+pub fn summarize_probe_candles(
+    candles: &[MinuteCandle],
+    target_minute_ist_nanos: i64,
+) -> ProbeBodySummary {
+    let first = candles.iter().map(|c| c.minute_ts_ist_nanos).min();
+    let last = candles.iter().map(|c| c.minute_ts_ist_nanos).max();
+    ProbeBodySummary {
+        rows: candles.len(),
+        first_candle_ist_nanos: first,
+        last_candle_ist_nanos: last,
+        target_present: select_minute_candle(candles, target_minute_ist_nanos).is_some(),
+        serving_lag_secs: last.map_or(-1, |l| serving_lag_secs(target_minute_ist_nanos, l)),
+    }
+}
+
+/// Run one probe moment: up to 3 sequential bounded requests, ONE
+/// structured side-by-side log line. Returns `true` when the probe
+/// actually issued requests (the caller latches the one-shot); a
+/// no-token moment defers. LOG-ONLY — never touches writer/tracker/edge.
+// TEST-EXEMPT: live-deps async runner — the gating (should_run_probe / probe_has_room), body builders (spot_1m_day_request_body byte-equality / probe_to_now_body), previous_trading_day walk and summarize_probe_candles are pure fns unit-tested below; the HTTP leg reuses the tested spot_1m_fetch_once.
+async fn run_serving_delay_probe(
+    params: &Spot1mRestTaskParams,
+    client: &reqwest::Client,
+    url: &str,
+    slot: ProbeSlot,
+    fire_secs_of_day: u32,
+) -> bool {
+    let jwt: Option<secrecy::SecretString> = {
+        let guard = params.token_handle.load();
+        guard
+            .as_ref()
+            .as_ref()
+            .map(|state| state.access_token().clone())
+    };
+    let Some(jwt) = jwt else {
+        warn!(
+            slot = ?slot,
+            "spot_1m_rest diagnostics: no access token at probe time — \
+             deferring the one-shot probe to the next minute"
+        );
+        return false;
+    };
+    let trading_date = today_ist();
+    let (probe_sid, probe_symbol) = SPOT_1M_REST_INDICES[0];
+    let sid_str = probe_sid.to_string();
+    let target_minute_open_secs = fire_secs_of_day.saturating_sub(60);
+    let today_target_nanos = minute_open_ist_nanos(trading_date, target_minute_open_secs);
+    let today_base_nanos = minute_open_ist_nanos(trading_date, 0);
+
+    // (name, body, shape's own day base for labels, shape's target minute)
+    let mut shapes: Vec<(&'static str, serde_json::Value, i64, i64)> = vec![(
+        "crossverify_day_window",
+        spot_1m_day_request_body(&sid_str, trading_date),
+        today_base_nanos,
+        today_target_nanos,
+    )];
+    if let Some(prev) = previous_trading_day(trading_date, |d| params.calendar.is_trading_day(d)) {
+        // Settled-data shape: the target is the PREVIOUS day's last
+        // session minute (15:29 open) — "did the whole settled day serve?"
+        shapes.push((
+            "prev_trading_day_window",
+            spot_1m_day_request_body(&sid_str, prev),
+            minute_open_ist_nanos(prev, 0),
+            minute_open_ist_nanos(prev, SPOT_1M_REST_LAST_FIRE_SECS_OF_DAY_IST - 60),
+        ));
+    }
+    shapes.push((
+        "same_day_to_now_window",
+        probe_to_now_body(&sid_str, trading_date, ist_secs_of_day_now()),
+        today_base_nanos,
+        today_target_nanos,
+    ));
+
+    let mut summaries: Vec<serde_json::Value> = Vec::with_capacity(shapes.len());
+    for (i, (name, body, base_nanos, target_nanos)) in shapes.iter().enumerate() {
+        if i > 0 {
+            tokio::time::sleep(Duration::from_millis(PROBE_REQUEST_SPACING_MS)).await;
+        }
+        let entry = match spot_1m_fetch_once(client, url, jwt.expose_secret(), body).await {
+            Ok(text) => {
+                let candles = parse_intraday_1m_candles(&text);
+                let s = summarize_probe_candles(&candles, *target_nanos);
+                serde_json::json!({
+                    "probe": name,
+                    "request": body.to_string(),
+                    "status": "2xx",
+                    "rows": s.rows,
+                    "first_candle_ist": s
+                        .first_candle_ist_nanos
+                        .map(|n| ist_nanos_minute_label(n, *base_nanos)),
+                    "last_candle_ist": s
+                        .last_candle_ist_nanos
+                        .map(|n| ist_nanos_minute_label(n, *base_nanos)),
+                    "target_present": s.target_present,
+                    "serving_lag_secs": s.serving_lag_secs,
+                })
+            }
+            Err(failure) => {
+                if failure.rate_limited {
+                    metrics::counter!("tv_spot1m_rate_limited_total").increment(1);
+                }
+                // `failure.msg` is already status + token-redacted URL +
+                // ≤300-char secret-redacted body (spot_1m_fetch_once).
+                serde_json::json!({
+                    "probe": name,
+                    "request": body.to_string(),
+                    "status": failure.msg,
+                })
+            }
+        };
+        summaries.push(entry);
+    }
+    // ONE structured line: every shape's request body + response shape,
+    // side by side — tomorrow's session reads this single line.
+    info!(
+        slot = ?slot,
+        probe_sid,
+        probe_symbol,
+        target_minute = %format_minute_ist_12h(target_minute_open_secs),
+        probes = %serde_json::Value::Array(summaries),
+        "spot_1m_rest diagnostics: one-shot serving-delay probe — \
+         cross-verify byte-exact day window vs previous-trading-day window \
+         vs same-day-to-now window (log-only; bounded; never touches persist)"
+    );
+    true
+}
+
+// ---------------------------------------------------------------------------
 // Wall-clock helpers (IST)
 // ---------------------------------------------------------------------------
 
@@ -694,8 +1100,11 @@ enum SidFetchOutcome {
         backfill_candle: Option<MinuteCandle>,
     },
     /// Every attempt got a parseable 2xx but the target minute never
-    /// appeared — counted `outcome="empty"`, included in the failure edge.
+    /// appeared — counted `outcome="empty_no_rows"` / `outcome="empty_stale"`
+    /// per the [`EmptyClass`] split (2026-07-14 serving-delay
+    /// instrumentation), included in the failure edge either way.
     Empty {
+        class: EmptyClass,
         backfill_candle: Option<MinuteCandle>,
     },
     /// The last attempt (transport / non-2xx) failure, bounded + redacted.
@@ -822,6 +1231,10 @@ async fn fetch_minute_with_ladder(
     // Sticky: the FIRST 2xx body carrying the due backfill minute wins —
     // preserved across rungs and across a failing own-minute verdict.
     let mut backfill_found: Option<MinuteCandle> = None;
+    // 2026-07-14 serving-delay instrumentation: the freshest NON-empty 2xx
+    // body's `(rows, newest candle minute)` — classifies an Empty verdict
+    // into `empty_no_rows` vs `empty_stale` + measures the serving lag.
+    let mut freshest_body: Option<(usize, i64)> = None;
     for attempt in 0..=deltas.len() {
         if attempt > 0 {
             let sleep_ms = ladder_sleep_ms(
@@ -838,11 +1251,14 @@ async fn fetch_minute_with_ladder(
             .record(started.elapsed().as_secs_f64() * 1_000.0);
         match result {
             Ok(body_text) => {
-                let (target, backfill) = parse_intraday_columnar_for_minutes(
+                let (target, backfill, stats) = parse_intraday_columnar_for_minutes(
                     &body_text,
                     target_minute_ist_nanos,
                     backfill_minute_ist_nanos,
                 );
+                if stats.is_some() {
+                    freshest_body = stats;
+                }
                 if backfill_found.is_none() {
                     backfill_found = backfill;
                 }
@@ -877,6 +1293,7 @@ async fn fetch_minute_with_ladder(
             backfill_candle: backfill_found,
         },
         None => SidFetchOutcome::Empty {
+            class: classify_empty_body(freshest_body, target_minute_ist_nanos),
             backfill_candle: backfill_found,
         },
     }
@@ -976,6 +1393,8 @@ pub async fn run_spot_1m_rest(params: Spot1mRestTaskParams) {
     // skipped-stale) — the next fire is always STRICTLY after it, so a
     // fast-completing fire can never re-fire the same boundary second.
     let mut last_fired: Option<u32> = None;
+    // 2026-07-14 serving-delay diagnostics: one-shot probe latches.
+    let mut probe_state = ProbeState::default();
     info!(
         indices = SPOT_1M_REST_INDICES.len(),
         "spot_1m_rest: per-minute fetch loop armed (fires each minute close \
@@ -1042,6 +1461,24 @@ pub async fn run_spot_1m_rest(params: Spot1mRestTaskParams) {
         // a failing spot leg). `send_replace` never errors.
         if let Some(tx) = &params.minute_done_tx {
             tx.send_replace(Some(fire));
+        }
+        // 2026-07-14 serving-delay diagnostics: one-shot log-only probes,
+        // AFTER the chain sequencing signal (never delays the chain leg)
+        // and BEFORE the H2 overrun accounting (a pathological probe
+        // overrun is still counted as a missed boundary, never silent).
+        // A due probe with no room / no token DEFERS to the next fire.
+        if let Some(slot) = should_run_probe(
+            params.diagnostics_enabled,
+            &probe_state,
+            fire,
+            params.diagnostics_second_probe_secs_of_day_ist,
+        ) && probe_has_room(ist_secs_of_day_now())
+            && run_serving_delay_probe(&params, &client, &url, slot, fire).await
+        {
+            match slot {
+                ProbeSlot::FirstFire => probe_state.first_done = true,
+                ProbeSlot::SecondScheduled => probe_state.second_done = true,
+            }
         }
         last_fired = Some(fire);
         // H2 overrun accounting: boundaries that fully elapsed DURING the
@@ -1155,6 +1592,7 @@ async fn fire_one_minute(
     let minute_open_secs = fire_secs_of_day.saturating_sub(60);
     let minute_label = format_minute_ist_12h(minute_open_secs);
     let trading_date = today_ist();
+    let trading_date_nanos = minute_open_ist_nanos(trading_date, 0);
 
     // Zeroize-on-drop JWT copy, re-loaded EVERY fire (the JWT rotates
     // mid-session); never logged.
@@ -1169,6 +1607,9 @@ async fn fire_one_minute(
     let mut ok_count: usize = 0;
     let mut empty_count: usize = 0;
     let mut error_count: usize = 0;
+    // 2026-07-14 serving-delay instrumentation: log-only per-fire aggregate
+    // of the empty-class split (never read by the edge / persist legs).
+    let mut empty_diag = EmptyDiagnostics::default();
     // M1 (2026-07-12): a minute is fully-OK for the edge ONLY when the
     // fetch succeeded AND append+flush confirmed — a day-long QuestDB
     // outage must eventually page via the SAME Spot1mFetchDegraded path.
@@ -1222,7 +1663,6 @@ async fn fire_one_minute(
                 (security_id, symbol, outcome)
             });
         }
-        let trading_date_nanos = minute_open_ist_nanos(trading_date, 0);
         while let Some(joined) = join_set.join_next().await {
             let Ok((security_id, symbol, outcome)) = joined else {
                 error_count = error_count.saturating_add(1);
@@ -1242,14 +1682,52 @@ async fn fire_one_minute(
                     close_to_data_ms,
                     backfill_candle,
                 } => (Some((candle, close_to_data_ms)), backfill_candle),
-                SidFetchOutcome::Empty { backfill_candle } => {
+                SidFetchOutcome::Empty {
+                    class,
+                    backfill_candle,
+                } => {
                     empty_count = empty_count.saturating_add(1);
-                    metrics::counter!("tv_spot1m_fetch_total", "outcome" => "empty").increment(1);
-                    if sample_failure.is_none() {
-                        sample_failure = Some(format!(
-                            "sid {security_id}: 2xx but the minute's candle never \
-                             appeared within the re-poll ladder"
-                        ));
+                    empty_diag.record(class);
+                    match class {
+                        // 2026-07-14 split: static label values only.
+                        EmptyClass::NoRows => {
+                            metrics::counter!("tv_spot1m_fetch_total", "outcome" => "empty_no_rows")
+                                .increment(1);
+                            if sample_failure.is_none() {
+                                sample_failure = Some(format!(
+                                    "sid {security_id}: 2xx with ZERO candles for the \
+                                     whole day (empty_no_rows)"
+                                ));
+                            }
+                        }
+                        EmptyClass::Stale {
+                            rows_in_response,
+                            last_candle_ist_nanos,
+                            serving_lag_secs,
+                        } => {
+                            metrics::counter!("tv_spot1m_fetch_total", "outcome" => "empty_stale")
+                                .increment(1);
+                            // The vendor SERVING LAG, measured every stale
+                            // minute — the per-minute discriminator for the
+                            // "Dhan serves same-day candles with a delay"
+                            // hypothesis. Dedicated 1s→6h buckets bound via
+                            // Matcher::Full in observability.rs.
+                            #[allow(clippy::cast_precision_loss)]
+                            // APPROVED: histogram sample only
+                            metrics::histogram!("tv_spot1m_serving_lag_ms")
+                                .record(serving_lag_secs.saturating_mul(1_000) as f64);
+                            if sample_failure.is_none() {
+                                let last_label = ist_nanos_minute_label(
+                                    last_candle_ist_nanos,
+                                    trading_date_nanos,
+                                );
+                                sample_failure = Some(format!(
+                                    "sid {security_id}: 2xx STALE — rows={rows_in_response}, \
+                                     last_candle={last_label} IST, \
+                                     serving_lag={serving_lag_secs}s (empty_stale)"
+                                ));
+                            }
+                        }
                     }
                     (None, backfill_candle)
                 }
@@ -1371,6 +1849,8 @@ async fn fire_one_minute(
         empty_count,
         persist_failed,
         sample_failure.as_deref(),
+        &empty_diag,
+        trading_date_nanos,
     );
     record_sid_served_verdicts(params, sid_tracker, &sid_verdicts, &minute_label);
 }
@@ -1637,6 +2117,8 @@ fn record_minute_verdict(
     empty_count: usize,
     persist_failed: bool,
     sample_failure: Option<&str>,
+    empty_diag: &EmptyDiagnostics,
+    trading_date_nanos: i64,
 ) {
     let fully_failed = minute_fully_failed(ok_count, persist_failed);
     let action = edge.record_minute(fully_failed);
@@ -1673,6 +2155,14 @@ fn record_minute_verdict(
         }
         EdgeAction::None => {
             if error_count > 0 || empty_count > 0 || persist_failed {
+                // 2026-07-14 serving-delay instrumentation: the empty-class
+                // split fields ride the SAME coalesced line — no new log
+                // cadence, just honest accounting of WHICH empty state
+                // each minute saw.
+                let last_candle_ist = empty_diag.latest_candle_ist_nanos.map_or_else(
+                    || "n/a".to_string(),
+                    |n| ist_nanos_minute_label(n, trading_date_nanos),
+                );
                 // Coalesced ONCE per fire (never per retry); log-sink-only —
                 // sub-edge failures never page (the escalation arm does).
                 error!(
@@ -1682,6 +2172,11 @@ fn record_minute_verdict(
                     ok = ok_count,
                     errors = error_count,
                     empty = empty_count,
+                    empty_no_rows = empty_diag.no_rows,
+                    empty_stale = empty_diag.stale,
+                    rows_in_response = empty_diag.max_rows_in_response,
+                    last_candle_ist = %last_candle_ist,
+                    max_serving_lag_secs = empty_diag.max_serving_lag_secs,
                     persist_failed,
                     sample = sample_failure.unwrap_or("none captured"),
                     "SPOT1M-01: per-minute spot fetch degraded for this minute"
@@ -2013,14 +2508,17 @@ mod tests {
             prev = utc_ts - 60,
             next = utc_ts + 60
         );
-        let (candle, backfill) = parse_intraday_columnar_for_minutes(&body, target, None);
+        let (candle, backfill, stats) = parse_intraday_columnar_for_minutes(&body, target, None);
         let candle = candle.expect("target found");
         assert!(backfill.is_none(), "no backfill requested → none returned");
         assert_eq!(candle.minute_ts_ist_nanos, target);
         assert_eq!(candle.open, 100.0);
         assert_eq!(candle.close, 100.5);
+        // 2026-07-14 diagnostics: the body stats ride along — 3 rows, the
+        // newest candle is the minute AFTER the target.
+        assert_eq!(stats, Some((3, target + NANOS_PER_MINUTE)));
         // A target NOT in the body → None (the "empty" arm).
-        let (missing, _) =
+        let (missing, _, _) =
             parse_intraday_columnar_for_minutes(&body, target + 120 * 1_000_000_000, None);
         assert!(missing.is_none());
     }
@@ -2039,13 +2537,17 @@ mod tests {
             r#"{{"open":[100.0],"high":[101.0],"low":[99.0],"close":[100.5],
                 "volume":[0],"timestamp":[{utc_prev}]}}"#
         );
-        let (t, b) = parse_intraday_columnar_for_minutes(&body_prev_only, target, Some(prev));
+        let (t, b, stats) =
+            parse_intraday_columnar_for_minutes(&body_prev_only, target, Some(prev));
         assert!(t.is_none(), "target minute not sealed yet");
         assert_eq!(
             b.expect("backfill found").minute_ts_ist_nanos,
             prev,
             "previous minute must backfill even when the target is absent"
         );
+        // 2026-07-14 diagnostics: this is the STALE shape — 1 row whose
+        // newest candle is one minute behind the target.
+        assert_eq!(stats, Some((1, prev)));
         // Body carries BOTH → both returned.
         let body_both = format!(
             r#"{{"open":[100.0,200.0],"high":[101.0,201.0],"low":[99.0,199.0],
@@ -2053,9 +2555,10 @@ mod tests {
                 "timestamp":[{utc_prev},{utc_target}]}}"#,
             utc_target = utc_prev + 60
         );
-        let (t, b) = parse_intraday_columnar_for_minutes(&body_both, target, Some(prev));
+        let (t, b, stats) = parse_intraday_columnar_for_minutes(&body_both, target, Some(prev));
         assert_eq!(t.expect("target").minute_ts_ist_nanos, target);
         assert_eq!(b.expect("backfill").minute_ts_ist_nanos, prev);
+        assert_eq!(stats, Some((2, target)));
     }
 
     #[test]
@@ -2065,25 +2568,25 @@ mod tests {
         // Malformed JSON.
         assert_eq!(
             parse_intraday_columnar_for_minutes("not json", target, bf),
-            (None, None)
+            (None, None, None)
         );
         // Missing arrays.
         assert_eq!(
             parse_intraday_columnar_for_minutes("{}", target, bf),
-            (None, None)
+            (None, None, None)
         );
         // Empty arrays.
         let empty = r#"{"open":[],"high":[],"low":[],"close":[],"volume":[],"timestamp":[]}"#;
         assert_eq!(
             parse_intraday_columnar_for_minutes(empty, target, bf),
-            (None, None)
+            (None, None, None)
         );
         // Length-mismatched parallel arrays.
         let mismatched = r#"{"open":[1.0,2.0],"high":[1.0],"low":[1.0],
             "close":[1.0],"volume":[0],"timestamp":[1752118500]}"#;
         assert_eq!(
             parse_intraday_columnar_for_minutes(mismatched, target, bf),
-            (None, None)
+            (None, None, None)
         );
     }
 
@@ -2598,5 +3101,278 @@ mod tests {
         );
         assert!(select_minute_candle(&candles, 180_000_000_000).is_none());
         assert!(select_minute_candle(&[], 60_000_000_000).is_none());
+    }
+
+    // ---- 2026-07-14 serving-delay diagnostics -------------------------------
+
+    fn mk_candle(ts: i64) -> MinuteCandle {
+        MinuteCandle {
+            minute_ts_ist_nanos: ts,
+            open: 1.0,
+            high: 2.0,
+            low: 0.5,
+            close: 1.5,
+            volume: 0,
+        }
+    }
+
+    /// The empty-class split: zero-row bodies (and no 2xx stats at all)
+    /// classify `empty_no_rows`; a body with candles but none at the
+    /// target classifies `empty_stale` with the measured serving lag; a
+    /// found target never reaches classification (the ladder returns
+    /// `Found` first — pinned indirectly by the Found-arm tests above).
+    #[test]
+    fn test_classify_empty_body_no_rows_vs_stale() {
+        let target = 1_783_934_100_000_000_000; // an IST minute open
+        // No 2xx stats at all (every body parsed to zero candles).
+        assert_eq!(classify_empty_body(None, target), EmptyClass::NoRows);
+        // Defensive: a zero-row stats tuple is still NoRows.
+        assert_eq!(
+            classify_empty_body(Some((0, target)), target),
+            EmptyClass::NoRows
+        );
+        // Candles present, newest 4 minutes behind the target → STALE with
+        // a 240 s serving lag.
+        let last = target - 4 * NANOS_PER_MINUTE;
+        assert_eq!(
+            classify_empty_body(Some((21, last)), target),
+            EmptyClass::Stale {
+                rows_in_response: 21,
+                last_candle_ist_nanos: last,
+                serving_lag_secs: 240,
+            }
+        );
+    }
+
+    /// Serving-lag math: whole seconds of `target − last`, clamped ≥ 0
+    /// (candles beyond the target with the exact target missing is a
+    /// pathological gap — never a negative lag).
+    #[test]
+    fn test_serving_lag_secs_math_and_clamp() {
+        let target = 1_783_934_100_000_000_000;
+        assert_eq!(serving_lag_secs(target, target), 0);
+        assert_eq!(serving_lag_secs(target, target - NANOS_PER_MINUTE), 60);
+        assert_eq!(serving_lag_secs(target, target - 90 * NANOS_PER_SEC), 90);
+        // A body reaching PAST the target clamps to 0, never negative.
+        assert_eq!(serving_lag_secs(target, target + NANOS_PER_MINUTE), 0);
+    }
+
+    /// `body_stats` yields `(rows, newest minute)`; empty → `None`.
+    #[test]
+    fn test_body_stats_rows_and_newest_minute() {
+        assert_eq!(body_stats(&[]), None);
+        let c = [mk_candle(60_000_000_000), mk_candle(300_000_000_000)];
+        assert_eq!(body_stats(&c), Some((2, 300_000_000_000)));
+    }
+
+    /// The per-fire aggregate folds both classes: counts, max rows, max
+    /// lag, and the NEWEST candle across stale SIDs.
+    #[test]
+    fn test_empty_diagnostics_aggregate_folds_max() {
+        let target = 1_783_934_100_000_000_000;
+        let mut d = EmptyDiagnostics::default();
+        d.record(EmptyClass::NoRows);
+        d.record(EmptyClass::Stale {
+            rows_in_response: 10,
+            last_candle_ist_nanos: target - 5 * NANOS_PER_MINUTE,
+            serving_lag_secs: 300,
+        });
+        d.record(EmptyClass::Stale {
+            rows_in_response: 21,
+            last_candle_ist_nanos: target - 2 * NANOS_PER_MINUTE,
+            serving_lag_secs: 120,
+        });
+        assert_eq!(d.no_rows, 1);
+        assert_eq!(d.stale, 2);
+        assert_eq!(d.max_rows_in_response, 21);
+        assert_eq!(d.max_serving_lag_secs, 300);
+        assert_eq!(
+            d.latest_candle_ist_nanos,
+            Some(target - 2 * NANOS_PER_MINUTE)
+        );
+    }
+
+    /// Commandment-9 label for a candle instant on its own trading day —
+    /// and the out-of-day clamp never panics.
+    #[test]
+    fn test_ist_nanos_minute_label() {
+        let date = NaiveDate::from_ymd_opt(2026, 7, 14).expect("valid date");
+        let base = minute_open_ist_nanos(date, 0);
+        let n = minute_open_ist_nanos(date, 10 * 3600 + 38 * 60);
+        assert_eq!(ist_nanos_minute_label(n, base), "10:38 AM");
+        // A previous-day instant against today's base clamps, never panics.
+        assert_eq!(
+            ist_nanos_minute_label(base - NANOS_PER_MINUTE, base),
+            "12:00 AM"
+        );
+    }
+
+    /// PROBE BYTE-EQUALITY FIXTURE: the probe's `crossverify_day_window`
+    /// shape ([`spot_1m_day_request_body`]) serializes BYTE-IDENTICALLY to
+    /// the 15:31 cross-verify's own request for the same index — both
+    /// delegate to the shared [`intraday_request_body`] with the exact
+    /// args the cross-verify passes for an IDX_I target (`"INDEX"` /
+    /// `"IDX_I"` / D → D+1). Pinned against a literal fixture of the
+    /// serialized JSON so a drift in EITHER builder (or in serde_json key
+    /// ordering) fails loudly.
+    #[test]
+    fn test_probe_crossverify_request_byte_equality_fixture() {
+        let date = NaiveDate::from_ymd_opt(2026, 7, 14).expect("valid date");
+        let spot = spot_1m_day_request_body("13", date).to_string();
+        // The cross-verify call shape (cross_verify_1m_boot::compare_one_target
+        // for an index target): intraday_request_body(sid, segment,
+        // instrument, trading_date, trading_date.succ()).
+        let next = date.succ_opt().expect("next day");
+        let crossverify =
+            intraday_request_body("13", SPOT_1M_REST_SEGMENT_IDX_I, "INDEX", date, next)
+                .to_string();
+        assert_eq!(
+            spot, crossverify,
+            "the probe/normal fetch body must stay byte-exact to the \
+             cross-verify's request"
+        );
+        // Literal fixture (serde_json BTreeMap ordering — alphabetical).
+        assert_eq!(
+            spot,
+            r#"{"exchangeSegment":"IDX_I","fromDate":"2026-07-14 00:00:00","instrument":"INDEX","interval":"1","oi":false,"securityId":"13","toDate":"2026-07-15 00:00:00"}"#
+        );
+    }
+
+    /// The `same_day_to_now_window` probe body differs from the proven day
+    /// window ONLY in `toDate` (the current IST wall-clock instant).
+    #[test]
+    fn test_probe_to_now_body_todate_is_now() {
+        let date = NaiveDate::from_ymd_opt(2026, 7, 14).expect("valid date");
+        let now = 9 * 3600 + 17 * 60 + 42; // 09:17:42 IST
+        let body = probe_to_now_body("13", date, now);
+        assert_eq!(body["toDate"], "2026-07-14 09:17:42");
+        // Every other field matches the proven day window byte-for-byte.
+        let day = spot_1m_day_request_body("13", date);
+        for key in [
+            "securityId",
+            "exchangeSegment",
+            "instrument",
+            "interval",
+            "oi",
+            "fromDate",
+        ] {
+            assert_eq!(body[key], day[key], "field {key} must match");
+        }
+        // Out-of-range seconds-of-day clamps inside the day, never panics.
+        let clamped = probe_to_now_body("13", date, SECONDS_PER_DAY + 5);
+        assert_eq!(clamped["toDate"], "2026-07-14 23:59:59");
+    }
+
+    /// Probe gating truth table: off → never; first fire → FirstFire once;
+    /// second slot only at/after the configured instant; both done → None.
+    #[test]
+    fn test_should_run_probe_gating() {
+        let second = 11 * 3600;
+        let mut state = ProbeState::default();
+        // Diagnostics off: never, regardless of state.
+        assert_eq!(should_run_probe(false, &state, FIRST, second), None);
+        // First fire after boot.
+        assert_eq!(
+            should_run_probe(true, &state, FIRST, second),
+            Some(ProbeSlot::FirstFire)
+        );
+        state.first_done = true;
+        // Before the second instant: nothing due.
+        assert_eq!(should_run_probe(true, &state, 10 * 3600, second), None);
+        // At/after the second instant: the scheduled probe.
+        assert_eq!(
+            should_run_probe(true, &state, second, second),
+            Some(ProbeSlot::SecondScheduled)
+        );
+        assert_eq!(
+            should_run_probe(true, &state, second + 300, second),
+            Some(ProbeSlot::SecondScheduled)
+        );
+        state.second_done = true;
+        assert_eq!(should_run_probe(true, &state, second + 300, second), None);
+        // A mid-session boot AFTER the second instant: the first-fire probe
+        // runs first, then the second follows on a later fire.
+        let fresh = ProbeState::default();
+        assert_eq!(
+            should_run_probe(true, &fresh, 12 * 3600, second),
+            Some(ProbeSlot::FirstFire)
+        );
+    }
+
+    /// Room gate: a probe needs ≥ PROBE_ROOM_SECS before the next minute
+    /// boundary (3 × 5 s request timeout + 2 × 300 ms spacing ≈ 15.6 s
+    /// worst case fits; a late-in-minute wake defers).
+    #[test]
+    fn test_probe_has_room_boundary_math() {
+        // 09:16:02 → next boundary 09:17:00, 58 s of room.
+        assert!(probe_has_room(9 * 3600 + 16 * 60 + 2));
+        // Exactly 20 s of room qualifies.
+        assert!(probe_has_room(10 * 3600 + 40));
+        // 19 s of room defers.
+        assert!(!probe_has_room(10 * 3600 + 41));
+        // 1 s before the boundary defers.
+        assert!(!probe_has_room(10 * 3600 + 59));
+    }
+
+    /// Previous-trading-day walk: skips weekends + injected holidays,
+    /// bounded, and honestly `None` on a never-open calendar.
+    #[test]
+    fn test_previous_trading_day_walks_weekends_and_holidays() {
+        // 2026-07-14 is a Tuesday → Monday 2026-07-13.
+        let tue = NaiveDate::from_ymd_opt(2026, 7, 14).expect("valid date");
+        let mon = NaiveDate::from_ymd_opt(2026, 7, 13).expect("valid date");
+        let fri = NaiveDate::from_ymd_opt(2026, 7, 10).expect("valid date");
+        use chrono::Datelike;
+        let is_weekday =
+            |d: NaiveDate| !matches!(d.weekday(), chrono::Weekday::Sat | chrono::Weekday::Sun);
+        assert_eq!(previous_trading_day(tue, is_weekday), Some(mon));
+        // Monday walks back across the weekend to Friday.
+        assert_eq!(previous_trading_day(mon, is_weekday), Some(fri));
+        // Monday with a Friday holiday → Thursday 2026-07-09.
+        let thu = NaiveDate::from_ymd_opt(2026, 7, 9).expect("valid date");
+        assert_eq!(
+            previous_trading_day(mon, |d| is_weekday(d) && d != fri),
+            Some(thu)
+        );
+        // A calendar that is never open: bounded walk returns None.
+        assert_eq!(previous_trading_day(tue, |_| false), None);
+    }
+
+    /// Probe body summary: rows + first/last + target presence + lag, and
+    /// the `-1` no-candles sentinel.
+    #[test]
+    fn test_summarize_probe_candles_shape_and_sentinel() {
+        let target = 1_783_934_100_000_000_000;
+        // No candles: everything empty, lag sentinel -1.
+        let empty = summarize_probe_candles(&[], target);
+        assert_eq!(
+            empty,
+            ProbeBodySummary {
+                rows: 0,
+                first_candle_ist_nanos: None,
+                last_candle_ist_nanos: None,
+                target_present: false,
+                serving_lag_secs: -1,
+            }
+        );
+        // Stale body: 2 rows ending 2 minutes behind the target.
+        let c = [
+            mk_candle(target - 3 * NANOS_PER_MINUTE),
+            mk_candle(target - 2 * NANOS_PER_MINUTE),
+        ];
+        let s = summarize_probe_candles(&c, target);
+        assert_eq!(s.rows, 2);
+        assert_eq!(
+            s.first_candle_ist_nanos,
+            Some(target - 3 * NANOS_PER_MINUTE)
+        );
+        assert_eq!(s.last_candle_ist_nanos, Some(target - 2 * NANOS_PER_MINUTE));
+        assert!(!s.target_present);
+        assert_eq!(s.serving_lag_secs, 120);
+        // Target present: lag 0, presence true.
+        let c2 = [mk_candle(target)];
+        let s2 = summarize_probe_candles(&c2, target);
+        assert!(s2.target_present);
+        assert_eq!(s2.serving_lag_secs, 0);
     }
 }

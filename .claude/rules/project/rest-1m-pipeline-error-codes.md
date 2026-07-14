@@ -178,6 +178,41 @@ the `stage` field):
    fully-failed and NOT edge-counted), and index candles legitimately
    carry zero volume (never flagged as an error).
 
+**2026-07-14 update — serving-delay diagnostics (empty-class split + one-shot
+probes):** the 2026-07-14 morning ran 21/21 minutes `empty` on all 4 SIDs
+(2xx, no errors, no 429s, healthy token) WITH the #1499 day-granular window
+live — and the single `outcome="empty"` label could not discriminate the two
+very different vendor states behind it. The split (unconditional — honest
+accounting): `outcome="empty_no_rows"` (the 2xx body parsed to ZERO candles
+for the whole day) vs `outcome="empty_stale"` (candles present but none at
+the target minute — the vendor is serving the day with a LAG). Every
+`empty_stale` records the measured SERVING LAG (`target minute open −
+newest candle minute open`, whole seconds) into the
+`tv_spot1m_serving_lag_ms` histogram (dedicated 1 s→6 h buckets via
+`Matcher::Full` in `observability.rs` — the generic `_ms` 60 s cap would
+collapse every meaningful sample into `+Inf`), and the coalesced
+`stage="minute_failed"` line gains `empty_no_rows` / `empty_stale` /
+`rows_in_response` / `last_candle_ist` / `max_serving_lag_secs` fields —
+one glance per minute answers "is Dhan behind, and by how much?". Edge /
+backfill / persist semantics are UNCHANGED (both empty classes still count
+as an empty minute). Companion LOG-ONLY probes, config-gated
+(`[spot_1m_rest] diagnostics`, serde default OFF; base.toml ON while this
+investigation runs): two one-shot moments per day (the first session fire
+after boot + a configurable second instant, default 11:00 IST —
+`diagnostics_second_probe_secs_of_day_ist`), each issuing ≤3 bounded extra
+requests for ONE SID ~300 ms apart (≤6/day, inside the Data-API 5/sec
+budget; a probe only starts with ≥20 s of room before the next boundary and
+otherwise defers) — (a) the 15:31 cross-verify's BYTE-EXACT day window
+(equality unit-pinned: both builders share `intraday_request_body`), (b)
+the previous-trading-day full window (proves settled-data serving), (c) a
+same-day window with `toDate = now`. All three requests' bodies + response
+shapes (rows, first/last candle IST, target presence, serving lag) land
+side by side in ONE structured `info!` line
+("spot_1m_rest diagnostics: one-shot serving-delay probe"). Together with
+the 15:33:30 sweep's verdict this discriminates "Dhan serves same-day
+intraday candles with a DELAY" from "our request shape is wrong". The
+probes never touch the fetch / persist / edge legs.
+
 **Triage:**
 1. `mcp__tickvault-logs__tail_errors` — find `SPOT1M-01`; the payload
    carries `stage`, the failing minute (IST), per-SID outcomes and a
@@ -727,7 +762,8 @@ This rule activates when editing:
   / `GrowwSpot1mConfig` / `GrowwOptionChain1mConfig` / `GrowwContract1mConfig`)
 - Any file containing `SPOT1M-01`, `SPOT1M-02`, `Spot1m01FetchDegraded`,
   `Spot1m02PersistFailed`, `spot_1m_rest`, `SPOT_1M_REST_INDICES`,
-  `tv_spot1m_fetch_total`, `CHAIN-01`, `CHAIN-02`, `CHAIN-03`, `CHAIN-04`,
+  `tv_spot1m_fetch_total`, `tv_spot1m_serving_lag_ms`, `EmptyClass`,
+  `CHAIN-01`, `CHAIN-02`, `CHAIN-03`, `CHAIN-04`,
   `Chain01EntitlementAbsent`, `Chain02FetchDegraded`,
   `Chain03PersistFailed`, `Chain04ExpirylistFailed`, `option_chain_1m`,
   `tv_chain1m_fetch_total`, `GROWW_SPOT_1M_SYMBOLS`, `rest_fetch_audit`,
