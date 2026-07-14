@@ -1,6 +1,6 @@
 # Implementation Plan: Dhan REST-Only Noise Reduction (2026-07-14 operator lock)
 
-**Status:** APPROVED
+**Status:** VERIFIED
 **Date:** 2026-07-14
 **Approved by:** Parthiban (operator) — 2026-07-14 directive relayed verbatim via the coordinator session: "for Dhan except spot 1m and option chain nothing else should work… these fucking issues of mid profile and all other fucking issues of Dhan should be entirely removed… always make the telegram messages/notifications cleaner, always mention precisely which broker."
 
@@ -135,7 +135,7 @@ so reverting is safe but re-pages the noise the operator banned.
 
 ## Plan Items
 
-- [ ] Rule files first (A1–A4): scope-lock §A.1 + new noise-lock file +
+- [x] Rule files first (A1–A4): scope-lock §A.1 + new noise-lock file +
       3 retirement banners + paging-list edit
   - Files: .claude/rules/project/websocket-connection-scope-lock.md,
     .claude/rules/project/dhan-rest-only-noise-lock-2026-07-14.md,
@@ -147,7 +147,7 @@ so reverting is safe but re-pages the noise the operator banned.
     every_error_code_variant_appears_in_a_rule_file,
     tf_map_and_doc_paging_list_agree_bidirectionally
 
-- [ ] Delete the no-tick watchdog + NoLiveTicksDuringMarketHours
+- [x] Delete the no-tick watchdog + NoLiveTicksDuringMarketHours
   - Files: crates/core/src/pipeline/no_tick_watchdog.rs (deleted),
     crates/core/src/pipeline/mod.rs, crates/core/src/pipeline/tick_processor.rs,
     crates/app/src/main.rs, crates/app/src/observability.rs,
@@ -156,13 +156,13 @@ so reverting is safe but re-pages the noise the operator banned.
     crates/core/tests/event_formatting_coverage.rs
   - Tests: grep-zero references workspace-wide; core/app crate suites green
 
-- [ ] Delete fast_boot_validation (AUTH-GAP-06 module; variant retained)
+- [x] Delete fast_boot_validation (AUTH-GAP-06 module; variant retained)
   - Files: crates/core/src/auth/fast_boot_validation.rs (deleted),
     crates/core/src/auth/mod.rs, crates/app/src/main.rs,
     crates/app/tests/fast_boot_token_validation_wiring_guard.rs (deleted)
   - Tests: core/app crate suites green; grep-zero call sites
 
-- [ ] Retire the REST canary (module + both spawn sites + CW filter entry)
+- [x] Retire the REST canary (module + both spawn sites + CW filter entry)
   - Files: crates/app/src/rest_canary_boot.rs (deleted),
     crates/app/src/lib.rs, crates/app/src/main.rs,
     crates/app/src/dhan_rest_stack.rs (Phase 5b),
@@ -171,7 +171,7 @@ so reverting is safe but re-pages the noise the operator banned.
   - Tests: error_code_paging_filter_drift_guard (tf↔doc↔emit lockstep),
     test_rest_stack_module_is_not_a_stub (needle updated)
 
-- [ ] Cut the order-update spawn (Phase 5a) + its two alarms; module dormant
+- [x] Cut the order-update spawn (Phase 5a) + its two alarms; module dormant
   - Files: crates/app/src/dhan_rest_stack.rs,
     crates/app/tests/ws_event_audit_boot_guard.rs,
     crates/app/tests/dhan_live_off_phase_a_guard.rs,
@@ -183,7 +183,7 @@ so reverting is safe but re-pages the noise the operator banned.
     region must NOT contain run_order_update_connection( nor the canary
     spawn needle); order_update_connection.rs unit tests untouched
 
-- [ ] Silence the mid-session watchdog pages; delete the two variants; page
+- [x] Silence the mid-session watchdog pages; delete the two variants; page
       family-(3) on terminal re-mint failure
   - Files: crates/core/src/auth/mid_session_watchdog.rs,
     crates/core/src/notification/events.rs,
@@ -192,32 +192,34 @@ so reverting is safe but re-pages the noise the operator banned.
   - Tests: watchdog unit suite green; terminal-arm AuthenticationFailed emit
     pinned; deleted-variant tests removed
 
-- [ ] GAP-06: re-home the token-health gauge poller into dhan_rest_stack
+- [x] GAP-06: re-home the token-health gauge poller into dhan_rest_stack
       Phase 3 (module kept; lane/fast-arm spawns + handle plumbing deleted)
-  - Files: crates/core/src/auth/token_health_gauge.rs (doc update only),
-    crates/app/src/main.rs (spawn sites + DhanLaneRunHandles field),
+  - Files: crates/app/src/main.rs (spawn sites + handle plumbing),
     crates/app/src/dhan_rest_stack.rs,
     crates/core/src/auth/secret_manager.rs (wiring meta-guard rewrite)
   - Tests: stack production-region ratchet asserts the poller spawn;
     api token_headroom_wired_guard stays green
 
-- [ ] GAP-02: REST-stack stale-token sweep (900s force_renewal_if_stale(4h))
-  - Files: crates/app/src/dhan_rest_stack.rs
-    (DHAN_REST_STACK_TOKEN_SWEEP_INTERVAL_SECS + supervised loop)
+- [x] GAP-02: REST-stack stale-token sweep (900s force_renewal_if_stale(4h))
+  - Files: crates/app/src/dhan_rest_stack.rs (the sweep loop),
+    crates/common/src/constants.rs (DHAN_REST_STACK_TOKEN_SWEEP_INTERVAL_SECS)
   - Tests: production-region ratchet asserts the sweep spawn; pure cadence
     constant unit-pinned
 
-- [ ] GAP-04: re-arm the AUTH-GAP-05 re-mint latch every 2nd failing cycle
-  - Files: crates/core/src/auth/mid_session_watchdog.rs (decide_remint)
-  - Tests: pure-fn tests — retry on cycles 2, 4, 6…; clean cycle resets;
-    cooldown/lock refusal arms unchanged
+- [x] GAP-04: re-arm the AUTH-GAP-05 re-mint latch every 2nd failing cycle
+  - Files: crates/core/src/auth/mid_session_watchdog.rs
+    (should_rearm_remint_latch + apply_cycle_outcome wiring)
+  - Tests: should_rearm_remint_latch_truth_table,
+    gap04_persisting_episode_remints_every_second_failing_cycle,
+    gap04_rearm_never_fires_on_non_real_failures,
+    gap04_rearm_cadence_constant_is_sane
 
-- [ ] Reword AuthenticationFailed + TokenRenewalFailed bodies (broker +
+- [x] Reword AuthenticationFailed + TokenRenewalFailed bodies (broker +
       consequence, plain English)
   - Files: crates/core/src/notification/events.rs
   - Tests: existing severity/escape tests green; body tests updated
 
-- [ ] Plan housekeeping: archive merged-PR plans #1524 + #1504
+- [x] Plan housekeeping: archive merged-PR plans #1524 + #1504
   - Files: .claude/plans/archive/2026-07-14-spot-1m-diagnostics.md,
     .claude/plans/archive/2026-07-13-questdb-partition-s3-archive.md
   - Tests: bash .claude/hooks/plan-gate.sh (V7 cap holds at 5)
