@@ -248,7 +248,9 @@ chars also stripped per the 2026-07-09 security review). Bounded by its OWN
 per-child `detail_logged` latch — once per child episode on EVERY path,
 re-armed only by a streaming recovery, deliberately NOT by the fleet
 Suppress re-arm of `alerted` (review MEDIUM fix: the re-arm would have made
-this emit per-line on the fleet path). Telegram wording is UNCHANGED.
+this emit per-line on the fleet path). Telegram wording was UNCHANGED by the
+2026-07-09 work — superseded 2026-07-14: the SANITIZED signature now ALSO
+rides the Telegram body (see §1c.1 below).
 
 **Triage:**
 1. `mcp__tickvault-logs__tail_errors` — find `FEED-REJECT-01`; the
@@ -284,6 +286,58 @@ this emit per-line on the fleet path). Telegram wording is UNCHANGED.
 | `subscribed N stocks + M indices — awaiting first tick…` | Subscribed | (none) | subscribe confirmation |
 | `groww auth OK…` / `→ appending NDJSON…` | Streaming | (none) | positive/recovery edge (clears auth_rejected) |
 | everything else (`NATS error_cb ->…`, `NATS disconnected ->…`, `FEED STALLED —…`, `watch file unreadable…`, `DROP[reason] sample…`, capture/walker diagnostics) | Info | (none) | tracing-only |
+
+### §1c.1 — 2026-07-14 Update: the SANITIZED signature now ALSO rides the Telegram body (operator demand, dated override of commandment 2)
+
+**The incident (2026-07-14, 14:59 IST):** the Groww live feed — the SOLE live
+feed since the 2026-07-13 Dhan retirement — died mid-session and the
+operator's page said only *"🆘 Groww live feed rejected — the feed reported an
+error and is retrying"*. It did NOT say WHY. The actual cause was captured by
+the sidecar and logged as the FEED-REJECT-01 signature
+(`ERROR growwapi.groww.nats_client: Error: nats: unexpected EOF`) — but that
+forensic WHY lived only in errors.jsonl / CloudWatch, invisible on the phone.
+
+**The operator demand (2026-07-14, verbatim intent, relayed via the
+coordinator session):** the operator was angry the 14:59 IST rejection page
+carried no reason; the Groww feed-rejection Telegram MUST carry the actual
+captured reject reason — "🟢 GROWW — live feed rejected: \<specific reason\> —
+retrying" — never a bare "reported an error".
+
+**The resolution (this dated edit + the same-PR code):** the once-per-episode
+alert edge in `spawn_pipe_drain` threads the SAME sanitized signature — the
+output of the `sidecar_line_signature` choke point (control-char + BiDi strip,
+credential/JWT redaction, `SIDECAR_LINE_SIGNATURE_MAX_CHARS` 160-char cap;
+NEVER raw child text), via the new pure `sidecar_reject_detail(line)` helper —
+into the `GrowwSidecarRejected` NotificationEvent's new `detail:
+Option<String>` field. The Telegram headline becomes
+`🆘 Groww live feed rejected: <sanitized signature> — retrying` while each
+class's existing fixed plain-English explanation sentence is KEPT as the body
+line beneath it (all three alert classes: AuthRejected / EntitlementRejected /
+Error). An empty/whitespace/`None` detail degrades to the exact pre-2026-07-14
+generic wording — never a hollow "rejected:  — retrying". The fleet-coalesced
+summary arm passes `detail: None` (one child's line must not be presented as
+the cause for N connections).
+
+**The commandment override (conscious, dated, one field):** the 10 Telegram
+commandments' rule 2 (no library names / jargon) is OVERRIDDEN for this ONE
+field — the sanitized signature may legitimately carry SDK/NATS wording like
+`growwapi` / `nats: unexpected EOF`, because the specific machine cause IS the
+operator-demanded payload. Precedent: the B9 `Build:` short-SHA line override
+in `deploy-provenance.md` §1. Everything else about the message keeps the
+commandments: severity emoji first, the 🟢 GROWW badge ordering untouched, the
+plain-English class explanation retained, one message = one decision. The
+sanitize contract is unchanged and remains the hard floor: no raw child text,
+no credential/JWT shape, no control/BiDi chars, ≤160 chars — defense-in-depth
+re-capped + HTML-escaped at the render boundary in `events.rs`.
+
+**Ratchets (same PR):** supervisor-side — `sidecar_reject_detail` unit tests
+(sanitized-equals-signature, hostile JWT/control/overlong line, empty → None)
++ a source-scan pin that the Passthrough notify arm passes
+`detail: sidecar_reject_detail(&line)` and the fleet arm passes `detail:
+None`; events-side — body tests that a present detail renders
+`live feed rejected: <detail> — retrying` verbatim (incl. the dated-override
+`growwapi` wording), that empty/None degrades to the generic wording, and
+that the render boundary HTML-escapes + re-caps the detail.
 
 ---
 
@@ -331,5 +385,6 @@ This rule activates when editing:
 - Any file containing `FEED-STALL-01`, `FEED-SUPERVISOR-01`, `FEED-REJECT-01`,
   `FeedStall01`, `FeedSupervisor01`, `FeedReject01`, `should_restart_on_stall`,
   `should_restart_on_never_streamed`, `sidecar_line_signature`,
+  `sidecar_reject_detail`,
   `tv_feed_sidecar_stall_restart_total`, or
   `tv_feed_sidecar_never_streamed_restart_total`
