@@ -1969,9 +1969,14 @@ impl NotificationEvent {
     ///   per-minute REST legs (spot 1m + option chain + option contract).
     /// - Feed-generic (dynamic): the `Feed*` events resolve from their
     ///   `feed` field; an unknown feed name renders un-badged (honest —
-    ///   never a wrong badge). The WS sleep/wake events also resolve from
-    ///   their `feed` field, falling back to Dhan for the legacy
-    ///   "main"/"order_update" values (both are Dhan WebSocket types).
+    ///   never a wrong badge). The WS sleep/wake events ALSO resolve from
+    ///   their `feed` field but fall back to the DHAN badge for any
+    ///   unrecognized value — the live values are "main"/"order_update"
+    ///   (both Dhan WebSocket types) and the emit sites live in the Dhan
+    ///   connection code. HONEST LIMIT: if a future non-Dhan feed reuses
+    ///   these variants with a feed name the resolver does not know, the
+    ///   fallback would mislabel it Dhan — such a reuse must pass a
+    ///   resolvable name ("groww") or extend `feed_badge_for_name` first.
     ///
     /// # Host/system convention (operator directive 2026-07-14)
     ///
@@ -1981,7 +1986,7 @@ impl NotificationEvent {
     /// system component in plain words ("tickvault", "QuestDB", "the
     /// server") so they read as host-level at a glance. The CloudWatch
     /// alarm phrases (Telegram webhook lambda) follow the same convention
-    /// with explicit "🔷 DHAN:" / "🖥 HOST:" phrase prefixes.
+    /// with explicit "🔷 DHAN:" / "🖥️ HOST:" phrase prefixes.
     #[must_use]
     pub fn feed_badge(&self) -> Option<&'static str> {
         use super::feed_badge::{FeedBadge, feed_badge_for_name};
@@ -7578,6 +7583,16 @@ mod tests {
             NotificationEvent::BarMismatchCrossCheckFailed {
                 reason: "all fetches errored".to_string(),
             },
+            NotificationEvent::BarMismatchCorrectedFromHistorical {
+                compared_count: 222,
+                mismatches_count: 3,
+                sample_symbols: vec!["NIFTY".to_string()],
+                cross_check_pass: "corrected",
+            },
+            NotificationEvent::BarMismatchCrossCheckInconclusive {
+                compared_count: 150,
+                expected_count: 222,
+            },
             NotificationEvent::IpVerificationFailed {
                 reason: "mismatch".to_string(),
             },
@@ -7587,6 +7602,16 @@ mod tests {
             NotificationEvent::StaticIpBootCheckPassed {
                 ip_flag: "PRIMARY".to_string(),
             },
+            NotificationEvent::StaticIpBootCheckFailed {
+                reason: "ordersAllowed false".to_string(),
+                orders_allowed: false,
+                ip_match_status: "MISMATCH".to_string(),
+                attempts_made: 30,
+            },
+            NotificationEvent::StaticIpBootCheckRetrying {
+                attempt: 2,
+                max_attempts: 30,
+            },
             NotificationEvent::DualInstanceDetected {
                 holder: "local:123:abc".to_string(),
                 lock_key: "instance-lock".to_string(),
@@ -7595,9 +7620,18 @@ mod tests {
                 correlation_id: "abc".to_string(),
                 reason: "rejected".to_string(),
             },
+            NotificationEvent::CircuitBreakerOpened {
+                consecutive_failures: 3,
+            },
             NotificationEvent::CircuitBreakerClosed,
             NotificationEvent::RateLimitExhausted {
                 limit_type: "per_second".to_string(),
+            },
+            NotificationEvent::OrphanPositionDetected {
+                count: 1,
+                total_abs_net_qty: 50,
+                sample_symbols: vec!["NIFTY-Jun2026-28500-CE".to_string()],
+                dry_run: true,
             },
             NotificationEvent::OrphanPositionsClean,
         ];

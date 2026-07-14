@@ -54,7 +54,7 @@
   - Files: crates/core/src/notification/events.rs
   - Tests: test_startup_complete_message_contains_context, test_end_of_day_digest_happy_path_message
 
-- [x] Item 7 — Lambda ALARM_PHRASES: DHAN tag on token-remaining-low / order-update-ws-inactive / ws-pool-all-dead / ws-failed-connections / ws-reconnect-gap-high / tick-gap-instruments-silent; HOST tag on market-hours-liveness-missing
+- [x] Item 7 — Lambda ALARM_PHRASES: DHAN tag on token-remaining-low (coordinator-ruled exact wording) / ws-pool-all-dead / ws-failed-connections / ws-reconnect-gap-high / tick-gap-instruments-silent; HOST tag on market-hours-liveness-missing. NOTE: order-update-ws-inactive ("Order confirmations feed has gone quiet") was deliberately left UNTOUCHED per the coordinator scope exclusion (the parallel Dhan-cleanup session owns the order-update surface)
   - Files: deploy/aws/lambda/telegram-webhook/handler.py, deploy/aws/lambda/telegram-webhook/test_handler.py
   - Tests: test_handler.py (phrase pins updated)
 
@@ -121,8 +121,12 @@ zero emit-site changes. This plan:
 
 ## Failure Modes
 
-- A future variant added to the Dhan/Groww REST families without a badge →
-  caught by the extended badge ratchet tests (build-failing).
+- Removing any of the badge arms shipped here → caught by the extended
+  badge ratchet tests (build-failing): every new arm is pinned by name.
+  HONEST LIMIT: a future NEW variant added without a badge is NOT caught
+  by these ratchets (they pin existing arms only) — an all-variant
+  completeness meta-test (e.g. "every variant whose topic starts with
+  'Groww' must badge GROWW") is a flagged follow-up, not shipped here.
 - A wrong badge on a host event → caught by
   `test_non_feed_events_carry_no_feed_badge` (kept, with the newly-badged
   IpVerificationSuccess swapped out for genuinely host events).

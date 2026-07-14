@@ -1204,7 +1204,10 @@ pub fn render_episode_recovering(state: &EpisodeState, _ctx: &EpisodeRenderCtx) 
 fn badged_feed_desc(family: EpisodeFamily) -> String {
     match family {
         EpisodeFamily::Boot => family.feed_desc().to_string(),
-        f => format!("{} {}", f.badge(), f.feed_desc()),
+        // "{badge} — {desc}" — the SAME format the DOWN bubble's status
+        // lines lead with (render_status_lines), so the close line reads
+        // identically at a glance.
+        f => format!("{} — {}", f.badge(), f.feed_desc()),
     }
 }
 
@@ -2454,8 +2457,8 @@ mod tests {
             };
             let line = render_episode_recovered(&st, &ctx);
             assert!(
-                line.contains("\u{1f537} DHAN"),
-                "recovered line must carry the same badge as the DOWN bubble: {line:?}"
+                line.contains("\u{1f537} DHAN — "),
+                "recovered line must carry the same badge format as the DOWN bubble: {line:?}"
             );
             assert!(line.starts_with('\u{2705}'), "green stays first: {line:?}");
         }
@@ -2479,8 +2482,8 @@ mod tests {
         st.last_event_ms = NOW;
         let line = render_episode_stale_closed(&st);
         assert!(
-            line.contains("\u{1f537} DHAN"),
-            "stale-close line must carry the same badge as the DOWN bubble: {line:?}"
+            line.contains("\u{1f537} DHAN — "),
+            "stale-close line must carry the same badge format as the DOWN bubble: {line:?}"
         );
         assert!(
             line.starts_with('\u{26aa}'),

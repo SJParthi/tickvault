@@ -85,7 +85,7 @@ _ENV_PREFIX_RE = re.compile(r"^tv-[a-z0-9]+-")
 #
 # Broker/host tag convention (operator directive 2026-07-14): a phrase
 # scoped to exactly one broker leads with "🔷 DHAN:" (or "🟢 GROWW:");
-# a phrase about the whole box/process leads with "🖥 HOST:" where the
+# a phrase about the whole box/process leads with "🖥️ HOST:" where the
 # subject would otherwise be ambiguous. The OK flip reuses the phrase
 # verbatim, so recoveries carry the same tag automatically.
 ALARM_PHRASES: dict[str, str] = {
@@ -103,7 +103,7 @@ ALARM_PHRASES: dict[str, str] = {
     "instance-status-failed": "The cloud server is failing its health checks",
     "late-tick-after-boundary": "Market data is arriving too late to build candles",
     "logs-ingestion-runaway": "Log volume is growing abnormally fast",
-    "market-hours-liveness-missing": "🖥 HOST: the app has gone silent during market hours",
+    "market-hours-liveness-missing": "🖥️ HOST: the app has gone silent during market hours",
     "mem-used-high": "Server memory is almost full",
     "network-out-runaway": "Outbound network traffic is abnormally high",
     "operator-control-errors": "The operator control page is failing",

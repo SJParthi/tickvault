@@ -426,7 +426,7 @@ class PlainTextTransport(unittest.TestCase):
         # The app-silent alarm is the whole PROCESS (not one broker feed) —
         # it must read as host/system-level, never broker-ambiguous.
         self.assertTrue(
-            handler.ALARM_PHRASES["market-hours-liveness-missing"].startswith("🖥 HOST: "),
+            handler.ALARM_PHRASES["market-hours-liveness-missing"].startswith("🖥️ HOST: "),
             f"got: {handler.ALARM_PHRASES['market-hours-liveness-missing']!r}",
         )
 
