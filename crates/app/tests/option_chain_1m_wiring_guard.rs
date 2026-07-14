@@ -62,10 +62,23 @@ fn production_code(module_src: &str) -> String {
         .split("#[cfg(test)]")
         .next()
         .expect("split always yields at least one piece");
-    prod.lines()
+    let stripped = prod
+        .lines()
         .map(code_portion)
         .collect::<Vec<_>>()
-        .join("\n")
+        .join("\n");
+    // Block-comment tripwire (refuter round 1, MEDIUM): [`code_portion`]
+    // strips ONLY `//` line comments — a `/* join_set.spawn( */` block
+    // comment would survive the strip and vacuously satisfy every
+    // production-region needle. Both target modules carry zero `/*`
+    // today; keep it that way (loud false-BLOCK on a string-literal
+    // `/*` is acceptable — never a false pass).
+    assert!(
+        !stripped.contains("/*"),
+        "block comments in the production region would defeat the \
+         comment-stripped needles — use // comments or extend the stripper"
+    );
+    stripped
 }
 
 /// Stripper self-test (the http_client_fallback_guard precedent): a URL
@@ -514,11 +527,14 @@ fn ratchet_trading_day_flip_exits_are_coded() {
 /// firing on a non-trading day with every count/counter needle above
 /// still green. Windowed source-scan (the flip sites live inside a
 /// non-injectable supervised loop, so a real behavioral unit test would
-/// need a full scheduler harness — the scan is the honest pin): within
-/// the 10 non-empty stripped-code lines after the `stage = ...` line
-/// (the multi-line `error!` message body + `);` span ≤ 8 lines today; 10
-/// leaves slack without reaching the next loop arm), one line must START
-/// with `return`.
+/// need a full scheduler harness — the scan is the honest pin): the scan
+/// stops at the flip if-block's own closing `}` (a trimmed line starting
+/// with `}`), so ONLY the flip block's own `return` counts — an unrelated
+/// `return;` in the next loop arm (the `next_fire_after` else-block's,
+/// which sat at exactly non-empty line 10 at the chain site) can never
+/// satisfy the pin (refuter round 1, HIGH). A hard cap of 8 non-empty
+/// lines (the multi-line `error!` message body + `);` span ≤ 5 today)
+/// backstops pathological formatting.
 #[test]
 fn ratchet_trading_day_flip_exits_return_immediately() {
     for (name, rel, expected_sites) in [
@@ -536,20 +552,26 @@ fn ratchet_trading_day_flip_exits_return_immediately() {
                 if trimmed.is_empty() {
                     continue;
                 }
-                non_empty += 1;
                 if trimmed.starts_with("return") {
                     has_return = true;
                     break;
                 }
-                if non_empty >= 10 {
+                // The flip if-block's closing brace: the block ended
+                // WITHOUT a `return` — stop here so a later loop arm's
+                // `return` can never satisfy the pin.
+                if trimmed.starts_with('}') {
+                    break;
+                }
+                non_empty += 1;
+                if non_empty >= 8 {
                     break;
                 }
             }
             assert!(
                 has_return,
                 "{name}: the trading_day_flip_exit emission at byte {pos} \
-                 is no longer followed by a `return` within 10 non-empty \
-                 code lines — the loop would keep firing on a non-trading \
+                 is no longer followed by a `return` inside its own \
+                 if-block — the loop would keep firing on a non-trading \
                  day (the exit IS the behavior, not the log line)"
             );
         }
