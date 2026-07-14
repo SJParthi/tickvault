@@ -79,11 +79,11 @@ use tracing::{error, info, warn};
 
 use tickvault_common::config::QuestDbConfig;
 use tickvault_common::constants::{
-    CHAIN_1M_CONSECUTIVE_FAIL_PAGE_THRESHOLD, CHAIN_1M_EXPIRYLIST_RETRY_BACKOFF_SECS,
-    CHAIN_1M_FALLBACK_DELAY_MS, CHAIN_1M_MAX_BODY_BYTES, CHAIN_1M_MIN_GAP_SECS,
-    CHAIN_1M_REQUEST_TIMEOUT_SECS, CHAIN_1M_UNDERLYING_BUDGET_SECS, CHAIN_1M_UNDERLYINGS,
-    DHAN_OPTION_CHAIN_EXPIRYLIST_PATH, DHAN_OPTION_CHAIN_PATH, IST_UTC_OFFSET_SECONDS,
-    SECONDS_PER_DAY, SPOT_1M_REST_CONSECUTIVE_FAIL_PAGE_THRESHOLD,
+    CHAIN_1M_CONSECUTIVE_FAIL_PAGE_THRESHOLD, CHAIN_1M_DECISION_CEILING_SECS,
+    CHAIN_1M_EXPIRYLIST_RETRY_BACKOFF_SECS, CHAIN_1M_FALLBACK_DELAY_MS, CHAIN_1M_MAX_BODY_BYTES,
+    CHAIN_1M_MIN_GAP_SECS, CHAIN_1M_REQUEST_TIMEOUT_SECS, CHAIN_1M_UNDERLYING_BUDGET_SECS,
+    CHAIN_1M_UNDERLYINGS, DHAN_OPTION_CHAIN_EXPIRYLIST_PATH, DHAN_OPTION_CHAIN_PATH,
+    IST_UTC_OFFSET_SECONDS, SECONDS_PER_DAY, SPOT_1M_REST_CONSECUTIVE_FAIL_PAGE_THRESHOLD,
 };
 use tickvault_common::error_code::ErrorCode;
 use tickvault_common::sanitize::{capture_rest_error_body, redact_url_params};
@@ -237,6 +237,32 @@ pub fn min_gap_wait_ms(last_request_ms_of_day: Option<i64>, now_ms_of_day: i64) 
 #[must_use]
 pub fn stale_wake_backoff_ms(fire_secs_of_day: u32, woke_at_secs_of_day: u32) -> u64 {
     u64::from(fire_secs_of_day.saturating_sub(woke_at_secs_of_day)).saturating_mul(1_000)
+}
+
+/// A retry may LAUNCH only while the fire is still inside the decision
+/// ceiling — measured from the minute close, REAL wall clock, including
+/// the same-key min-gap wait still ahead of it (2026-07-14 hardening;
+/// runbook `cross-source-chain-coverage-2026-07-14.md` §2). Pure.
+#[must_use]
+pub fn chain_retry_allowed(elapsed_ms_since_close_at_launch: i64) -> bool {
+    elapsed_ms_since_close_at_launch >= 0
+        && elapsed_ms_since_close_at_launch
+            < (CHAIN_1M_DECISION_CEILING_SECS as i64) * MILLIS_PER_SEC
+}
+
+/// The REAL-clock elapsed-since-close a retry would LAUNCH at: now minus
+/// the minute close, PLUS the same-key ≥3s gap wait still ahead of it
+/// (the [`min_gap_wait_ms`] output) — the [`chain_retry_allowed`] input.
+/// Saturating so a pathological clock never wraps. Pure.
+#[must_use]
+pub fn retry_launch_elapsed_ms(
+    now_ms_of_day: i64,
+    minute_close_ms_of_day: i64,
+    gap_wait_ms: u64,
+) -> i64 {
+    now_ms_of_day
+        .saturating_sub(minute_close_ms_of_day)
+        .saturating_add(i64::try_from(gap_wait_ms).unwrap_or(i64::MAX))
 }
 
 /// `true` when the body parses as the documented Dhan error-JSON shape —
@@ -849,6 +875,121 @@ async fn fetch_chain_bounded(
     }
 }
 
+/// What phase 2 does with ONE first-pass outcome (2026-07-14 hardening —
+/// runbook `cross-source-chain-coverage-2026-07-14.md` §2). Pure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RetryDecision {
+    /// Not retry-eligible (Found / Entitlement) — the first-pass outcome
+    /// stands. Persist failures happen in phase 3 (our side) and the
+    /// no-token minute never builds outcomes at all — neither can reach
+    /// this classifier.
+    Keep,
+    /// Eligible, but the decision ceiling refuses the LAUNCH — counted
+    /// (`tv_chain1m_retry_total{outcome="skipped_ceiling"}`) + coded,
+    /// never silent.
+    SkippedCeiling,
+    /// Launch the single bounded retry.
+    Launch,
+}
+
+/// Retry-eligibility + ceiling gate for one first-pass outcome: ONLY
+/// `Empty` and transport-`Failed` are eligible; the launch must sit
+/// inside [`chain_retry_allowed`]'s decision ceiling. Pure.
+fn chain_retry_decision(outcome: &ChainFetchOutcome, elapsed_ms_at_launch: i64) -> RetryDecision {
+    if !matches!(
+        outcome,
+        ChainFetchOutcome::Empty | ChainFetchOutcome::Failed(_)
+    ) {
+        return RetryDecision::Keep;
+    }
+    if chain_retry_allowed(elapsed_ms_at_launch) {
+        RetryDecision::Launch
+    } else {
+        RetryDecision::SkippedCeiling
+    }
+}
+
+/// Phase-2 bounded retry pass: at most ONE retry per underlying per
+/// minute for first-pass `Empty` / transport-`Failed` outcomes,
+/// SEQUENTIAL over the (≤3, usually ≤1) queue. Each retry honors the
+/// same-key ≥3s gap (the wait itself happens INSIDE the injected fetch —
+/// `fetch_chain_bounded`'s existing internal gap sleep) and may LAUNCH
+/// only inside the [`CHAIN_1M_DECISION_CEILING_SECS`] window measured on
+/// the REAL wall clock from the minute close INCLUDING that wait; a
+/// refused retry is counted + coded, never silent. The retry's outcome
+/// REPLACES the first pass's for ALL downstream processing (a retry
+/// answering with the entitlement class is honored exactly like a pass-1
+/// entitlement → the day-scoped CHAIN-01 stop). NEVER retried: `Found`,
+/// `Entitlement`, the no-token minute (no outcomes exist), persist
+/// failures (phase 3, our side). Generic over the fetch + clock so the
+/// unit tests below inject deterministic outcomes; production passes the
+/// real `fetch_chain_bounded` closure + `ist_millis_of_day_now`.
+async fn chain_retry_pass<N, F, Fut>(
+    outcomes: &mut [(usize, ChainFetchOutcome)],
+    targets: &[ResolvedUnderlying],
+    last_request_ms: &mut [Option<i64>],
+    minute_close_ms: i64,
+    minute_label: &str,
+    now_ms_of_day: N,
+    mut fetch: F,
+) where
+    N: Fn() -> i64,
+    F: FnMut(&ResolvedUnderlying, Option<i64>) -> Fut,
+    Fut: std::future::Future<Output = (ChainFetchOutcome, i64)>,
+{
+    for (idx, outcome) in outcomes.iter_mut() {
+        // Defensive: every idx comes from the phase-1 enumerate, so the
+        // lookup always succeeds — a miss just keeps the pass-1 outcome.
+        let Some(target) = targets.get(*idx) else {
+            continue;
+        };
+        let prior_request_ms = last_request_ms.get(*idx).copied().flatten();
+        let gap_wait_ms = min_gap_wait_ms(prior_request_ms, now_ms_of_day());
+        let elapsed_at_launch =
+            retry_launch_elapsed_ms(now_ms_of_day(), minute_close_ms, gap_wait_ms);
+        match chain_retry_decision(outcome, elapsed_at_launch) {
+            RetryDecision::Keep => continue,
+            RetryDecision::SkippedCeiling => {
+                metrics::counter!("tv_chain1m_retry_total", "outcome" => "skipped_ceiling")
+                    .increment(1);
+                let symbol = target.symbol;
+                warn!(
+                    code = ErrorCode::Chain02FetchDegraded.code_str(),
+                    stage = "retry_skipped_ceiling",
+                    symbol,
+                    elapsed_ms_at_launch = elapsed_at_launch,
+                    ceiling_secs = CHAIN_1M_DECISION_CEILING_SECS,
+                    minute = minute_label,
+                    "CHAIN-02: retry refused — the decision ceiling has \
+                     passed (counted, never silent; the minute's failure \
+                     rides the existing accounting)"
+                );
+                continue;
+            }
+            RetryDecision::Launch => {}
+        }
+        let (retry_outcome, requested_at_ms) = fetch(target, prior_request_ms).await;
+        if let Some(slot) = last_request_ms.get_mut(*idx) {
+            *slot = Some(requested_at_ms);
+        }
+        match &retry_outcome {
+            ChainFetchOutcome::Found { .. } => {
+                metrics::counter!("tv_chain1m_retry_total", "outcome" => "recovered").increment(1);
+            }
+            ChainFetchOutcome::Empty | ChainFetchOutcome::Failed(_) => {
+                metrics::counter!("tv_chain1m_retry_total", "outcome" => "still_failed")
+                    .increment(1);
+            }
+            // A retry answering with the entitlement class is neither
+            // recovered nor still-failed in the retry sense — it becomes
+            // the day-scoped stop; the minute-final fetch counter
+            // (phase 3's entitlement arm) records it.
+            ChainFetchOutcome::Entitlement(_) => {}
+        }
+        *outcome = retry_outcome;
+    }
+}
+
 /// The chain edge's "fully failed" verdict for one fired minute — no
 /// underlying succeeded, OR the persist leg (append/flush) failed. A
 /// fetched-but-never-persisted minute is NOT ok (the spot M1 precedent).
@@ -902,6 +1043,18 @@ async fn fire_one_chain_minute(
         let trading_date_nanos = minute_open_ist_nanos(trading_date, 0);
         let minute_close_ms = i64::from(fire_secs_of_day).saturating_mul(MILLIS_PER_SEC);
 
+        // 2026-07-14 pacing decision (runbook
+        // `cross-source-chain-coverage-2026-07-14.md` §2): the JoinSet
+        // concurrency is KEPT — Dhan's option-chain rate-limit doc
+        // (quoted 2026-07-14): "Rate limit for Option Chain API is set to
+        // one unique request every 3 seconds. This means you can fetch
+        // entire option chain for multiple different underlying
+        // instrument or multiple expiries of same instrument concurrently
+        // every 3 seconds." The 3s bound is per unique (underlying,
+        // expiry) KEY — enforced by min_gap_wait_ms through the
+        // per-underlying last_request_ms stamps; DISTINCT underlyings go
+        // concurrently. A future sequentialization must be a deliberate,
+        // rule-edited change.
         let mut join_set = tokio::task::JoinSet::new();
         for (idx, target) in targets.iter().enumerate() {
             let client = client.clone();
@@ -924,6 +1077,11 @@ async fn fire_one_chain_minute(
                 (idx, outcome, requested_at_ms)
             });
         }
+        // Phase 1 — drain the JoinSet into the first-pass outcomes
+        // (stamps last_request_ms exactly as before; the join-failure arm
+        // keeps its error accounting and pushes nothing — idx unknown;
+        // unwind-builds only, release panics abort).
+        let mut outcomes: Vec<(usize, ChainFetchOutcome)> = Vec::with_capacity(targets.len());
         while let Some(joined) = join_set.join_next().await {
             let Ok((idx, outcome, requested_at_ms)) = joined else {
                 error_count = error_count.saturating_add(1);
@@ -936,6 +1094,38 @@ async fn fire_one_chain_minute(
             if let Some(slot) = last_request_ms.get_mut(idx) {
                 *slot = Some(requested_at_ms);
             }
+            outcomes.push((idx, outcome));
+        }
+        // Phase 2 — the bounded same-key retry pass (≤1 per underlying
+        // per minute, decision-ceiling-gated; refused retries counted).
+        chain_retry_pass(
+            &mut outcomes,
+            targets,
+            last_request_ms,
+            minute_close_ms,
+            &minute_label,
+            ist_millis_of_day_now,
+            |target, prior_request_ms| {
+                let body = chain_request_body(target.security_id, &target.expiry_str);
+                let jwt = jwt.clone();
+                async move {
+                    fetch_chain_bounded(
+                        client,
+                        chain_url,
+                        &jwt,
+                        &params.client_id,
+                        &body,
+                        minute_close_ms,
+                        prior_request_ms,
+                    )
+                    .await
+                }
+            },
+        )
+        .await;
+        // Phase 3 — process the FINAL post-retry outcomes (the per-outcome
+        // match below is the pre-2026-07-14 processing body, unchanged).
+        for (idx, outcome) in outcomes {
             let Some(target) = targets.get(idx) else {
                 continue;
             };
@@ -2088,5 +2278,257 @@ mod tests {
                 panic!("transport failure is not an entitlement verdict")
             }
         }
+    }
+
+    // ---- bounded retry + decision ceiling (2026-07-14 hardening) --------------
+
+    /// Test helper: one resolved underlying with a fixed expiry.
+    fn ru(symbol: &'static str, sid: u64) -> ResolvedUnderlying {
+        ResolvedUnderlying {
+            security_id: sid,
+            symbol,
+            expiry: d("2026-07-16"),
+            expiry_str: "2026-07-16".to_string(),
+        }
+    }
+
+    #[test]
+    fn test_chain_retry_allowed_below_ceiling() {
+        assert!(chain_retry_allowed(0));
+        assert!(chain_retry_allowed(1));
+        // The fast path: empties known ~2.8s, retry launch ~5.5s.
+        assert!(chain_retry_allowed(5_500));
+        // The worst timed-out first attempt (P1): 12.5s is still inside.
+        assert!(chain_retry_allowed(12_500));
+        assert!(chain_retry_allowed(
+            (CHAIN_1M_DECISION_CEILING_SECS as i64) * 1_000 - 1
+        ));
+    }
+
+    #[test]
+    fn test_chain_retry_allowed_refused_at_and_past_ceiling() {
+        let ceiling_ms = (CHAIN_1M_DECISION_CEILING_SECS as i64) * 1_000;
+        // The ceiling itself is EXCLUSIVE (a 15.000s launch is refused).
+        assert!(!chain_retry_allowed(ceiling_ms));
+        assert!(!chain_retry_allowed(ceiling_ms + 1));
+        assert!(!chain_retry_allowed(ceiling_ms + 60_000));
+        assert!(!chain_retry_allowed(i64::MAX));
+    }
+
+    #[test]
+    fn test_chain_retry_allowed_refused_negative_elapsed() {
+        // A clock step-back can only produce a negative elapsed — refuse
+        // (the stale-wake machinery owns that shape, never a retry).
+        assert!(!chain_retry_allowed(-1));
+        assert!(!chain_retry_allowed(-15_000));
+        assert!(!chain_retry_allowed(i64::MIN));
+    }
+
+    /// The launch gate includes the same-key ≥3s gap wait STILL AHEAD of
+    /// the retry: a wall clock inside the ceiling whose pending gap wait
+    /// crosses it is REFUSED — the fetch never launches.
+    #[tokio::test]
+    async fn test_retry_gate_includes_min_gap_wait() {
+        let minute_close_ms = 1_000_000_i64;
+        // 12.6s after the close: inside the 15s ceiling ON ITS OWN…
+        let now_ms = minute_close_ms + 12_600;
+        assert!(chain_retry_allowed(now_ms - minute_close_ms));
+        // …but the same-key stamp 600ms ago forces a 2.4s gap wait, so
+        // the LAUNCH would land at exactly 15.0s — refused.
+        let gap_wait = min_gap_wait_ms(Some(now_ms - 600), now_ms);
+        assert_eq!(gap_wait, 2_400);
+        let elapsed_at_launch = retry_launch_elapsed_ms(now_ms, minute_close_ms, gap_wait);
+        assert_eq!(elapsed_at_launch, 15_000);
+        assert!(!chain_retry_allowed(elapsed_at_launch));
+
+        // The pass itself refuses: fetch is NEVER invoked, the outcome
+        // and the request stamp stay untouched.
+        let targets = vec![ru("NIFTY", 13)];
+        let mut outcomes = vec![(0_usize, ChainFetchOutcome::Empty)];
+        let mut last_request_ms = vec![Some(now_ms - 600)];
+        let mut calls = 0_u32;
+        chain_retry_pass(
+            &mut outcomes,
+            &targets,
+            &mut last_request_ms,
+            minute_close_ms,
+            "9:16 AM",
+            move || now_ms,
+            |_, _| {
+                calls += 1;
+                async move { (ChainFetchOutcome::Empty, 0_i64) }
+            },
+        )
+        .await;
+        assert_eq!(calls, 0, "ceiling-refused retry must never launch");
+        assert_eq!(outcomes[0].1, ChainFetchOutcome::Empty);
+        assert_eq!(last_request_ms[0], Some(now_ms - 600));
+    }
+
+    #[test]
+    fn test_retry_only_for_empty_or_failed_never_entitlement_or_found() {
+        let launchable = 5_000_i64; // well inside the ceiling
+        assert_eq!(
+            chain_retry_decision(&ChainFetchOutcome::Empty, launchable),
+            RetryDecision::Launch
+        );
+        assert_eq!(
+            chain_retry_decision(
+                &ChainFetchOutcome::Failed("send: x".to_string()),
+                launchable
+            ),
+            RetryDecision::Launch
+        );
+        // Found is final — never re-fetched.
+        assert_eq!(
+            chain_retry_decision(
+                &ChainFetchOutcome::Found {
+                    chain: ParsedChain::default(),
+                    close_to_data_ms: 1_500,
+                },
+                launchable
+            ),
+            RetryDecision::Keep
+        );
+        // Entitlement is a day-scoped account verdict — retrying it would
+        // earn the same reject (CHAIN-01 owns the day).
+        assert_eq!(
+            chain_retry_decision(
+                &ChainFetchOutcome::Entitlement("DH-902".to_string()),
+                launchable
+            ),
+            RetryDecision::Keep
+        );
+        // Eligible-but-late is the counted refusal.
+        assert_eq!(
+            chain_retry_decision(&ChainFetchOutcome::Empty, 15_000),
+            RetryDecision::SkippedCeiling
+        );
+    }
+
+    /// A recovered retry REPLACES the first-pass outcome for all
+    /// downstream processing, and stamps the same-key request time.
+    #[tokio::test]
+    async fn test_retry_found_replaces_first_pass_outcome() {
+        let minute_close_ms = 1_000_000_i64;
+        let targets = vec![ru("NIFTY", 13)];
+        let mut outcomes = vec![(0_usize, ChainFetchOutcome::Empty)];
+        // Prior request 4s ago — the gap is already clear.
+        let mut last_request_ms = vec![Some(minute_close_ms)];
+        let mut calls = 0_u32;
+        chain_retry_pass(
+            &mut outcomes,
+            &targets,
+            &mut last_request_ms,
+            minute_close_ms,
+            "9:16 AM",
+            move || minute_close_ms + 4_000,
+            |_, _| {
+                calls += 1;
+                async move {
+                    (
+                        ChainFetchOutcome::Found {
+                            chain: ParsedChain::default(),
+                            close_to_data_ms: 6_000,
+                        },
+                        1_007_000_i64,
+                    )
+                }
+            },
+        )
+        .await;
+        assert_eq!(calls, 1);
+        assert!(matches!(
+            outcomes[0].1,
+            ChainFetchOutcome::Found {
+                close_to_data_ms: 6_000,
+                ..
+            }
+        ));
+        assert_eq!(
+            last_request_ms[0],
+            Some(1_007_000),
+            "the retry stamps the same-key request time"
+        );
+    }
+
+    /// A retry answering with the ENTITLEMENT class is honored — the
+    /// final outcome becomes Entitlement, which the (unchanged) phase-3
+    /// match turns into MinuteVerdict::EntitlementStop exactly like a
+    /// pass-1 entitlement (CHAIN-01 owns the day).
+    #[tokio::test]
+    async fn test_retry_entitlement_outcome_becomes_entitlement_stop() {
+        let minute_close_ms = 1_000_000_i64;
+        let targets = vec![ru("BANKNIFTY", 25)];
+        let mut outcomes = vec![(0_usize, ChainFetchOutcome::Failed("http 500 …".to_string()))];
+        let mut last_request_ms = vec![None];
+        chain_retry_pass(
+            &mut outcomes,
+            &targets,
+            &mut last_request_ms,
+            minute_close_ms,
+            "9:16 AM",
+            move || minute_close_ms + 3_000,
+            |_, _| async move {
+                (
+                    ChainFetchOutcome::Entitlement("DH-902".to_string()),
+                    1_003_000_i64,
+                )
+            },
+        )
+        .await;
+        assert_eq!(
+            outcomes[0].1,
+            ChainFetchOutcome::Entitlement("DH-902".to_string()),
+            "the retry's entitlement verdict replaces the transport failure"
+        );
+        // And an Entitlement outcome is never itself retried.
+        assert_eq!(
+            chain_retry_decision(&outcomes[0].1, 3_000),
+            RetryDecision::Keep
+        );
+    }
+
+    /// The retry pass walks each first-pass outcome exactly once — at
+    /// most ONE retry per underlying per minute, even when every retry
+    /// still fails (a still-failed retry is never re-retried).
+    #[tokio::test]
+    async fn test_at_most_one_retry_per_underlying_per_minute() {
+        let minute_close_ms = 1_000_000_i64;
+        let targets = vec![ru("NIFTY", 13), ru("BANKNIFTY", 25), ru("SENSEX", 51)];
+        let mut outcomes = vec![
+            (0_usize, ChainFetchOutcome::Empty),
+            (
+                1_usize,
+                ChainFetchOutcome::Found {
+                    chain: ParsedChain::default(),
+                    close_to_data_ms: 1_500,
+                },
+            ),
+            (2_usize, ChainFetchOutcome::Failed("send: y".to_string())),
+        ];
+        let mut last_request_ms: Vec<Option<i64>> = vec![None, None, None];
+        let mut called: Vec<&'static str> = Vec::new();
+        chain_retry_pass(
+            &mut outcomes,
+            &targets,
+            &mut last_request_ms,
+            minute_close_ms,
+            "9:16 AM",
+            move || minute_close_ms + 3_000,
+            |target, _| {
+                called.push(target.symbol);
+                async move { (ChainFetchOutcome::Empty, 1_003_000_i64) }
+            },
+        )
+        .await;
+        // Exactly the two eligible underlyings, once each; the Found one
+        // is never re-fetched.
+        assert_eq!(called, vec!["NIFTY", "SENSEX"]);
+        // Still-failed retries keep the FINAL (retry) outcome and are not
+        // retried again within the pass.
+        assert_eq!(outcomes[0].1, ChainFetchOutcome::Empty);
+        assert!(matches!(outcomes[1].1, ChainFetchOutcome::Found { .. }));
+        assert_eq!(outcomes[2].1, ChainFetchOutcome::Empty);
     }
 }
