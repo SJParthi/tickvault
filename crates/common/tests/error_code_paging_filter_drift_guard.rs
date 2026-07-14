@@ -4,7 +4,8 @@
 //! The three surfaces:
 //! 1. The `error_code_alerts` map in
 //!    `deploy/aws/terraform/error-code-alarms.tf` (the filters + alarms
-//!    that actually page — 9 entries as of 2026-07-09).
+//!    that actually page — 15 entries as of 2026-07-14: +5 REST-audit
+//!    entries per docs/audits/2026-07-14-rest-pipeline-adversarial-audit.md).
 //! 2. The documented paging list in
 //!    `.claude/rules/project/observability-architecture.md`
 //!    ("Which codes page" → the "Filtered+alarmed codes" paragraph).
@@ -22,7 +23,16 @@
 //! - a coded pattern that deviates from the errors.jsonl line shape
 //!   `{ $.code = "X" && $.level = "ERROR" }` (the tracing JSON layer's
 //!   `flatten_event(true)` top-level fields — a malformed pattern
-//!   silently never matches);
+//!   silently never matches). 2026-07-14 extension (REST-audit
+//!   GAP-01/GAP-03): ONE optional extra `$.field`-referencing scoping
+//!   clause is additionally accepted after the pinned code+level pair —
+//!   `{ $.code = "X" && $.level = "ERROR" && <extra> }` — used by the
+//!   once-per-episode sub-filters (`$.stage = "escalation"` /
+//!   `$.stage = "warmup"` / the AUTH-GAP-05 `$.cooldown_skip IS FALSE`
+//!   failure-arm scope). Honest limit: the extra clause's field name/value cannot be
+//!   validated against the enum (stage strings are not derivable from
+//!   `ErrorCode`) — a typo'd stage value silently never matches; the
+//!   emit-site check still guarantees the CODE has a real `error!` emit;
 //! - an ALLOWLISTED no-emit tripwire (DH-906) silently GAINING a coded
 //!   emit site (the allowlist + the "no coded emit site exists yet" doc
 //!   note + the term-match filter would all be stale — retire together).
@@ -187,60 +197,140 @@ fn strip_rust_comments(body: &str) -> String {
     out
 }
 
-/// Everything strictly before the first test-`cfg`-gated MODULE — the
-/// production region of a Rust source file.
+fn is_test_cfg(attr: &str) -> bool {
+    attr.starts_with("#[cfg(") && attr.contains("test") && !attr.contains("not(test)")
+}
+
+/// The production view of a Rust source file: comments stripped, then
+/// every test-`cfg`-gated MODULE **excised** (its whole `{ … }` body
+/// removed), everything else kept.
 ///
-/// Deliberately NOT a naive split at the first `#[cfg(test)]` token
-/// (the seal_drop_paging_wiring_guard shape): real production files
-/// carry early `#[cfg(test)]` items that are NOT the trailing test
-/// module — e.g. `crates/core/src/websocket/connection.rs:20` gates a
-/// test-only static near the TOP of the file, and a naive split there
-/// hid the real WS-GAP-07 emit at line ~1853 (a FALSE "dead filter"
-/// found while bringing this guard up on 2026-07-10). A truncation
-/// point is a `#[cfg(…test…)]` attribute line (NOT `not(test)` — that
-/// gates PRODUCTION code) that gates a `mod` — either on the SAME line
-/// (`#[cfg(test)] mod tests {`) or as the next non-attribute line,
-/// covering `#[cfg(all(test, feature = …))] mod` too (2026-07-10
-/// hostile-review MEDIUM). Everything else (test-gated statics, fields,
-/// inline attributes) stays in the scanned region — which at worst
-/// keeps a few test-only items visible, never hides a production emit.
-fn production_region(body: &str) -> &str {
-    fn is_test_cfg(attr: &str) -> bool {
-        attr.starts_with("#[cfg(") && attr.contains("test") && !attr.contains("not(test)")
-    }
-    let mut offset = 0usize;
-    let mut lines = body.split_inclusive('\n').peekable();
-    while let Some(line) = lines.next() {
-        let trimmed = line.trim();
+/// History of this function's shape:
+/// - NOT a naive split at the first `#[cfg(test)]` token (the
+///   seal_drop_paging_wiring_guard shape): real production files carry
+///   early `#[cfg(test)]` items that are NOT modules — e.g.
+///   `crates/core/src/websocket/connection.rs:20` gates a test-only
+///   static near the TOP of the file, and a naive split there hid the
+///   real WS-GAP-07 emit at line ~1853 (a FALSE "dead filter" found
+///   while bringing this guard up on 2026-07-10).
+/// - NOT a truncation at the first test-gated MODULE either (the
+///   2026-07-10 shape of this function): `crates/app/src/
+///   cross_verify_1m_boot.rs` carries a MID-FILE `#[cfg(test)] mod
+///   start_decision_tests` at line ~134 with the real
+///   CROSS-VERIFY-1M-01/-02 `error!` emits AFTER it — truncating there
+///   reported both codes as dead filters (a FALSE dead found on
+///   2026-07-14 while adding their paging entries). Test-gated modules
+///   are now EXCISED via string-aware brace matching, so production
+///   code before AND after a mid-file test module stays visible while
+///   needles inside any test module never count.
+///
+/// A test-gated module is a `#[cfg(…test…)]` attribute line (NOT
+/// `not(test)` — that gates PRODUCTION code) whose gated item is a
+/// `mod` — same-line (`#[cfg(test)] mod tests {`) or as the next
+/// non-attribute line, covering `#[cfg(all(test, feature = …))] mod`
+/// too. Test-gated NON-module items (statics, fns, fields) stay in the
+/// scanned region — at worst a few test-only items are visible, never
+/// is a production emit hidden. Brace matching is string-aware (quotes +
+/// escapes tracked); TWO documented residuals (2026-07-14 mutation
+/// review): (a) char literals / lifetimes are not tracked (no real test
+/// module carries an unbalanced brace char literal — same as the comment
+/// stripper's `'` note); (b) RAW string literals (`r#"…"#`) are not
+/// specially tracked — a raw string containing an ODD number of `"`
+/// characters would desync the quote-parity state and could mis-scope a
+/// module boundary (a possible silent false-ALIVE on the emit-site
+/// check). No `.rs` file scanned by this guard currently carries an
+/// odd-quote-parity raw string inside or around a test module; if one
+/// ever appears, upgrade the scanner to a raw-string-aware lexer in the
+/// same PR.
+fn production_view(body: &str) -> String {
+    excise_test_modules(&strip_rust_comments(body))
+}
+
+/// Remove every test-cfg-gated module body from COMMENT-STRIPPED Rust
+/// source (see [`production_view`]).
+fn excise_test_modules(stripped: &str) -> String {
+    let lines: Vec<&str> = stripped.split_inclusive('\n').collect();
+    let mut out = String::with_capacity(stripped.len());
+    let mut i = 0usize;
+    while i < lines.len() {
+        let trimmed = lines[i].trim();
         if is_test_cfg(trimmed) {
             // Same-line form: `#[cfg(test)] mod tests {`
-            if let Some(close) = trimmed.find(']')
-                && trimmed[close + 1..].trim_start().starts_with("mod ")
-            {
-                return &body[..offset];
+            let same_line_mod = trimmed
+                .find(']')
+                .map(|c| trimmed[c + 1..].trim_start().starts_with("mod "))
+                .unwrap_or(false);
+            if same_line_mod {
+                i = skip_module(&lines, i);
+                continue;
             }
             // Next-non-attribute-line form.
-            let mut ahead = lines.clone();
-            let mut next_code = None;
-            for l in ahead.by_ref() {
-                let t = l.trim();
+            let mut j = i + 1;
+            while j < lines.len() {
+                let t = lines[j].trim();
                 if t.is_empty() || t.starts_with("#[") {
+                    j += 1;
                     continue;
                 }
-                next_code = Some(t);
                 break;
             }
-            if let Some(t) = next_code
-                && (t.starts_with("mod ")
+            if j < lines.len() {
+                let t = lines[j].trim();
+                if t.starts_with("mod ")
                     || t.starts_with("pub mod ")
-                    || t.starts_with("pub(") && t.contains(" mod "))
-            {
-                return &body[..offset];
+                    || (t.starts_with("pub(") && t.contains(" mod "))
+                {
+                    i = skip_module(&lines, j);
+                    continue;
+                }
             }
         }
-        offset += line.len();
+        out.push_str(lines[i]);
+        i += 1;
     }
-    body
+    out
+}
+
+/// Skip from the module-opening line at `start` through its closing
+/// brace; returns the index of the first line AFTER the module.
+/// CHAR-LEVEL string-aware depth tracking (a per-LINE delta cannot see a
+/// single-line `mod t { … }` whose braces balance to 0 on its own line —
+/// found while pinning the 2026-07-14 mid-file-module regression). A
+/// body-less `mod tests;` declaration skips just its own line. String
+/// state persists across lines (Rust string literals may span lines).
+fn skip_module(lines: &[&str], start: usize) -> usize {
+    let mut depth = 0i32;
+    let mut opened = false;
+    let mut in_str = false;
+    let mut esc = false;
+    let mut k = start;
+    while k < lines.len() {
+        let line = lines[k];
+        if !opened && !in_str && line.contains(';') && !line.contains('{') {
+            return k + 1; // `mod tests;` — declaration only
+        }
+        for b in line.bytes() {
+            if esc {
+                esc = false;
+                continue;
+            }
+            match b {
+                b'\\' if in_str => esc = true,
+                b'"' => in_str = !in_str,
+                b'{' if !in_str => {
+                    depth += 1;
+                    opened = true;
+                }
+                b'}' if !in_str => depth -= 1,
+                _ => {}
+            }
+        }
+        k += 1;
+        if opened && depth <= 0 {
+            return k;
+        }
+    }
+    k
 }
 
 fn compact(body: &str) -> String {
@@ -408,13 +498,32 @@ enum PatternShape {
 }
 
 fn classify_pattern(pattern: &str) -> PatternShape {
-    // Coded shape, pinned EXACTLY (spacing included — the 9 live entries
-    // and the emit convention both use this byte shape).
+    // Coded shape, pinned EXACTLY (spacing included — the live entries
+    // and the emit convention both use this byte shape), with the
+    // 2026-07-14 extension: ONE optional extra scoping clause after the
+    // pinned code+level pair (` && <extra>` before the closing ` }`),
+    // where <extra> is non-empty, references a JSON field (`$.`), and
+    // does not smuggle a second `$.code` clause (which could shadow the
+    // extracted code and defeat the validity/emit-site checks).
     if let Some(rest) = pattern.strip_prefix("{ $.code = \"")
         && let Some(code_end) = rest.find('"')
     {
         let code = &rest[..code_end];
-        if rest[code_end..] == *"\" && $.level = \"ERROR\" }" && !code.is_empty() {
+        if code.is_empty() {
+            return PatternShape::Malformed;
+        }
+        let Some(tail) = rest[code_end..].strip_prefix("\" && $.level = \"ERROR\"") else {
+            return PatternShape::Malformed;
+        };
+        if tail == " }" {
+            return PatternShape::Coded(code.to_string());
+        }
+        if let Some(extra) = tail.strip_prefix(" && ")
+            && let Some(extra) = extra.strip_suffix(" }")
+            && !extra.is_empty()
+            && extra.contains("$.")
+            && !extra.contains("$.code")
+        {
             return PatternShape::Coded(code.to_string());
         }
         return PatternShape::Malformed;
@@ -535,7 +644,7 @@ fn has_error_level_emit_site(variant_name: &str, sources: &[PathBuf]) -> bool {
         let Ok(body) = fs::read_to_string(path) else {
             continue;
         };
-        let prod = compact(&strip_rust_comments(production_region(&body)));
+        let prod = compact(&production_view(&body));
         if prod_has_error_level_needle(&prod, &needle) {
             return true;
         }
@@ -806,6 +915,44 @@ fn synthetic_shape_classifier_detects_planted_drift() {
         classify_pattern(r#"{ $.code = "PROC-01" && $.level = "WARN" }"#),
         PatternShape::Malformed
     );
+    // 2026-07-14 extension: ONE extra $.field scoping clause is Coded —
+    // the stage-scoped once-per-episode sub-filters and the AUTH-GAP-05
+    // $.cooldown_skip failure-arm scope (the field exists only on the
+    // mint-failure emission; IS FALSE excludes the noise-lock H3
+    // non-terminal cooldown-skip lines).
+    assert_eq!(
+        classify_pattern(
+            r#"{ $.code = "SPOT1M-01" && $.level = "ERROR" && $.stage = "escalation" }"#
+        ),
+        PatternShape::Coded("SPOT1M-01".into())
+    );
+    assert_eq!(
+        classify_pattern(
+            r#"{ $.code = "AUTH-GAP-05" && $.level = "ERROR" && $.cooldown_skip IS FALSE }"#
+        ),
+        PatternShape::Coded("AUTH-GAP-05".into())
+    );
+    // The extra clause must reference a JSON field…
+    assert_eq!(
+        classify_pattern(r#"{ $.code = "PROC-01" && $.level = "ERROR" && true }"#),
+        PatternShape::Malformed
+    );
+    // …must not be empty…
+    assert_eq!(
+        classify_pattern(r#"{ $.code = "PROC-01" && $.level = "ERROR" &&  }"#),
+        PatternShape::Malformed
+    );
+    // …and must not smuggle a SECOND $.code clause (which could shadow
+    // the extracted code and defeat the validity/emit-site checks).
+    assert_eq!(
+        classify_pattern(r#"{ $.code = "PROC-01" && $.level = "ERROR" && $.code = "FAKE-99" }"#),
+        PatternShape::Malformed
+    );
+    // The level clause is still mandatory even with a stage clause:
+    assert_eq!(
+        classify_pattern(r#"{ $.code = "PROC-01" && $.stage = "escalation" }"#),
+        PatternShape::Malformed
+    );
     // A typo'd code is Coded(...) but must fail validity:
     assert!(variant_name_for("PROC-99-TYPO").is_none());
     assert!(variant_name_for("PROC-01").is_some());
@@ -836,7 +983,7 @@ fn synthetic_doc_parser_detects_a_missing_code() {
 /// Run a synthetic source through the SAME pipeline the real detector
 /// uses and ask whether the given variant counts as an error-level emit.
 fn synth_detect(src: &str, variant: &str) -> bool {
-    let prod = compact(&strip_rust_comments(production_region(src)));
+    let prod = compact(&production_view(src));
     prod_has_error_level_needle(&prod, &format!("ErrorCode::{variant}.code_str()"))
 }
 
@@ -898,6 +1045,47 @@ fn synthetic_emit_detector_ignores_comments_and_test_regions() {
     assert!(
         synth_detect(not_test, "Proc01OomKillDetected"),
         "cfg(not(test)) gates PRODUCTION code — it must never truncate"
+    );
+    // Regression pin (2026-07-14, the CROSS-VERIFY-1M false-dead found
+    // while adding its paging entry): a MID-FILE cfg(test) module —
+    // cross_verify_1m_boot.rs's `mod start_decision_tests` at ~line 134 —
+    // must be EXCISED, never TRUNCATED AT: the real production emit AFTER
+    // it must stay visible, while a needle INSIDE the mid-file module
+    // still never counts. Both directions:
+    let mid_file_mod = "fn head() {}\n\
+                        #[cfg(test)]\n\
+                        mod start_decision_tests { fn f() { tracing::error!(code = \
+                        ErrorCode::WsReinject01Aborted.code_str(), \"x\"); } }\n\
+                        fn emit() { tracing::error!(code = \
+                        ErrorCode::Proc01OomKillDetected.code_str(), \"x\"); }\n";
+    assert!(
+        synth_detect(mid_file_mod, "Proc01OomKillDetected"),
+        "a mid-file cfg(test) module must not hide the LATER production emit \
+         (the 2026-07-14 CROSS-VERIFY-1M false-dead regression)"
+    );
+    assert!(
+        !synth_detect(mid_file_mod, "WsReinject01Aborted"),
+        "a needle inside a mid-file cfg(test) module must still be excised"
+    );
+    // Multi-line mid-file module + a body-less `mod x;` declaration:
+    let multiline = "#[cfg(test)]\n\
+                     mod t {\n\
+                     fn f() {\n\
+                     tracing::error!(code = ErrorCode::WsReinject01Aborted.code_str(), \"x\");\n\
+                     }\n\
+                     }\n\
+                     mod real_decl;\n\
+                     fn emit() { tracing::error!(code = \
+                     ErrorCode::Proc01OomKillDetected.code_str(), \"x\"); }\n";
+    assert!(synth_detect(multiline, "Proc01OomKillDetected"));
+    assert!(!synth_detect(multiline, "WsReinject01Aborted"));
+    let decl_only = "#[cfg(test)]\n\
+                     mod tests;\n\
+                     fn emit() { tracing::error!(code = \
+                     ErrorCode::Proc01OomKillDetected.code_str(), \"x\"); }\n";
+    assert!(
+        synth_detect(decl_only, "Proc01OomKillDetected"),
+        "a body-less `mod tests;` declaration must skip only its own line"
     );
 }
 
