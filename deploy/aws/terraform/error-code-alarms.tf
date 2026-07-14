@@ -43,28 +43,8 @@
 # table silently stopped applying ILP-ACKed writes with zero signal — the
 # new 60s wal_tables() probe pages it here.
 #
-# 2026-07-14 UPDATE (REST-pipeline adversarial audit, GAP-01 + GAP-03 —
-# docs/audits/2026-07-14-rest-pipeline-adversarial-audit.md): +5 entries ->
-# 15 filters + 15 alarms (~+$0.50/mo). The audit's single biggest systemic
-# weakness: REST-leg paging was app-emitted Telegram ONLY — a dead app
-# notifier (or Telegram bot) silenced AUTH-GAP-05 + SPOT1M/CHAIN entirely.
-# SCOPED sub-filters (a 2026-07-14 extension of the pinned coded shape —
-# error_code_paging_filter_drift_guard.rs accepts one extra $.field clause):
-#   - auth-gap-05-remint-failed matches ONLY the mint-FAILURE arm (the
-#     $.permanent bool field exists only on that emission) — the trigger
-#     arm fires on every forced re-mint INCLUDING successful self-heals,
-#     and the operator ruled those pages noise ("silent-when-healing,
-#     loud-only-when-unobtainable").
-#   - spot1m-01-escalation / chain-02-escalation match ONLY the
-#     once-per-episode stage="escalation" edge lines — the per-minute
-#     stage="minute_failed" lines are sub-edge by design (the 3-minute
-#     escalation edge is the page; a plain code filter would over-page
-#     every failed minute).
-#   - chain-04-warmup matches ONLY the down-for-the-day stage="warmup"
-#     arm — the probe_* / warmup_no_token stages are log-only-by-design
-#     respawn-retry arms (rest-1m-pipeline-error-codes.md §2e).
-#   - chain-01 is a plain coded filter (both its stages — warmup +
-#     mid_session — are once-per-episode page-worthy).
+# 2026-07-14 UPDATE (operator Dhan noise lock): -1 entry (REST-CANARY-01
+# retired with the canary module) -> 9 filters + 9 alarms (~-$0.10/mo).
 # =============================================================================
 
 locals {
@@ -81,9 +61,8 @@ locals {
   # the telegram-webhook Lambda forwards OK states as a green "recovered"
   # page -- while the underlying condition still persists (a Rule-11
   # false-recovery). ok_recovery = false suppresses that misleading OK for:
-  #   - rest-canary-01: 3 probes/day; OK = "no new probe ran yet". Recovery
-  #     signal = the NEXT scheduled probe staying silent (or the DH-901
-  #     profile-poll alarm).
+  #   (rest-canary-01 was in this list until its 2026-07-14 retirement
+  #   with the canary module - operator Dhan noise lock.)
   #   - ws-reinject-01: emitted exactly ONCE per boot (wal_reinject.rs abort
   #     arm); the condition -- frames staged in WAL replaying/ with a
   #     dead/wedged consumer -- persists until the NEXT boot. OK ~15 min
@@ -100,16 +79,11 @@ locals {
   # StartLimitBurst (8/600s) ever halts the restart loop while the secret is
   # still wrong, emissions stop and the OK would be an aged-out false
   # recovery -- borderline, kept ON with this stated residual.
+  # rest-canary-01 entry RETIRED 2026-07-14 with the REST canary module
+  # (operator Dhan noise lock - dhan-rest-only-noise-lock-2026-07-14.md):
+  # the retained spot-1m + option-chain legs self-detect a dead Dhan REST
+  # surface within ~3-4 min via their own escalation edges.
   error_code_alerts = {
-    "rest-canary-01" = {
-      pattern     = "{ $.code = \"REST-CANARY-01\" && $.level = \"ERROR\" }"
-      period      = 300
-      threshold   = 1
-      eval        = 3
-      dta         = 1
-      ok_recovery = false
-      desc        = "REST-CANARY-01: Dhan REST health probe FAILED (09:05/12:00/15:25 IST canary). REST surface down or rejecting while the WebSocket may still look healthy (2026-07-06 12:00 IST incident class). Read status/url/body in the errors-jsonl stream. NO recovered/OK page for this alarm: the probe runs 3x/day, so the auto-OK ~15 min later only means the episode aged out - the next probe staying silent is the recovery signal. Runbook: .claude/rules/project/dhan-rest-canary-error-codes.md"
-    }
     "dh-901" = {
       pattern     = "{ $.code = \"DH-901\" && $.level = \"ERROR\" }"
       period      = 300
@@ -368,8 +342,9 @@ resource "aws_cloudwatch_metric_alarm" "error_code" {
   treat_missing_data  = "notBreaching"
   # deliberately NO dimensions (see filter comment)
   alarm_actions = local.app_alarm_actions
-  # ok_recovery = false (rest-canary-01, ws-reinject-01, proc-01, dh-906,
-  # aggregator-drop-01 [2026-07-09], wal-suspend-01 [2026-07-10] -
+  # ok_recovery = false (ws-reinject-01, proc-01, dh-906,
+  # aggregator-drop-01 [2026-07-09], wal-suspend-01 [2026-07-10];
+  # rest-canary-01 retired 2026-07-14 -
   # the one-shot/discrete emitters) suppresses the OK page: their auto-OK
   # ~15 min after the datapoint ages out would be a Rule-11 false
   # "recovered" message while the condition persists (see the locals

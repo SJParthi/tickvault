@@ -1770,33 +1770,160 @@ mod tests {
         );
     }
 
-    /// AUTH-GAP-05 (2026-07-06): the live token-health gauge poller MUST be
-    /// spawned — without it `tv_token_remaining_seconds` regresses to the
-    /// frozen mint-time snapshot and the honest AND-composed `tv_token_valid`
-    /// gauge never exists (audit Rule 11).
+    /// AUTH-GAP-05 (2026-07-06) / GAP-06 re-home (2026-07-14, Dhan noise
+    /// lock): the live token-health gauge poller keeps
+    /// `tv_token_remaining_seconds` LIVE and publishes the AND-composed
+    /// `tv_token_valid` — without it both regress to the frozen mint-time
+    /// snapshots (false-OK, audit Rule 11) and the family-(4)
+    /// `tv-<env>-token-remaining-low` alarm goes blind.
     ///
-    /// RE-POINTED (PR-C2, 2026-07-13): the spawn moved from the deleted
-    /// `start_dhan_lane` / FAST-arm dual wiring (main.rs) into
-    /// `dhan_rest_stack.rs` — the SINGLE surviving Dhan boot path (the lane
-    /// + fast arm were deleted with the live-WS retirement, so the old
-    /// two-site / lane-ownership assertions retired with them; the stack owns
-    /// its handles directly for the process lifetime). The mid-session
-    /// profile watchdog (AUTH-GAP-05's self-heal driver) must ride along.
+    /// GAP-06 (2026-07-14): the poller's HOME moved from main.rs (the two
+    /// lane/fast-arm spawn sites) into `dhan_rest_stack.rs` Phase 3 — the
+    /// one Dhan bring-up path that runs on every dhan-enabled boot mode,
+    /// sharing the stack watchdog's profile-truth flag. This ratchet now
+    /// pins (a) the stack spawn EXISTS in dhan_rest_stack.rs's production
+    /// region, (b) main.rs's production region has ZERO gauge-poller spawn
+    /// sites (a re-added lane spawn would interleave with the stack's
+    /// poller — gauge flapping every ≤15s), and (c) the surviving lane
+    /// handle registrations (watchdog / sweep / health) stay lane-owned.
     #[test]
     fn test_token_health_gauge_poller_wired_into_main() {
+        let main_rs = std::fs::read_to_string("../app/src/main.rs")
+            .or_else(|_| std::fs::read_to_string("crates/app/src/main.rs"))
+            .expect("main.rs must be readable");
+        // R7-CPLX-1 idiom hardening (2026-07-07): split at the test MODULE
+        // (`mod tests`), not the first raw `#[cfg(test)]` occurrence — an
+        // inline item-level #[cfg(test)] attribute (or a doc-comment
+        // mention) added earlier in main.rs would silently truncate the
+        // scanned "production region" (the token_manager.rs false-OK class).
+        let production = main_rs_production_region(&main_rs);
+        let spawn_count = production
+            .matches("spawn_token_health_gauge_poller(")
+            .count();
+        assert_eq!(
+            spawn_count, 0,
+            "main.rs (production region) must have ZERO token-health \
+             gauge-poller spawn sites — GAP-06 (2026-07-14) re-homed the \
+             poller into dhan_rest_stack.rs Phase 3; a re-added main.rs \
+             spawn would interleave with the stack's poller (gauge \
+             flapping every ≤15s). Found {spawn_count}."
+        );
         let stack_rs = std::fs::read_to_string("../app/src/dhan_rest_stack.rs")
             .or_else(|_| std::fs::read_to_string("crates/app/src/dhan_rest_stack.rs"))
-            .expect("dhan_rest_stack.rs must be readable from the test working dir");
-        assert!(
-            stack_rs.contains("spawn_token_health_gauge_poller("),
-            "dhan_rest_stack.rs MUST spawn the live token-health gauge poller \
-             (AUTH-GAP-05) — without it tv_token_remaining_seconds freezes at \
-             the mint-time snapshot and tv_token_valid never exists."
+            .expect("dhan_rest_stack.rs must be readable");
+        let stack_production = main_rs_production_region(&stack_rs);
+        assert_eq!(
+            stack_production
+                .matches("spawn_token_health_gauge_poller(")
+                .count(),
+            1,
+            "dhan_rest_stack.rs (production region) MUST spawn the live \
+             token-health gauge poller exactly once (GAP-06 re-home) — \
+             deleting it blinds the tv-<env>-token-remaining-low alarm \
+             (family-(4)) after a renewal-loop circuit-breaker halt."
         );
         assert!(
-            stack_rs.contains("spawn_mid_session_profile_watchdog("),
-            "dhan_rest_stack.rs MUST spawn the mid-session profile watchdog \
-             (AUTH-GAP-05 forced-remint self-heal) alongside the gauge poller."
+            production.contains("mid_session_watchdog_handle: Some("),
+            "main.rs (production region) MUST register the mid-session \
+             watchdog handle lane-owned \
+             (`mid_session_watchdog_handle: Some(`) in DhanLaneRunHandles — \
+             a leaked watchdog keeps hitting /v2/profile with the dead \
+             lane's token and fires false RESILIENCE-01 pages (AG5-R1)."
+        );
+        // SEC-R4-1 / R4-CPLX-1/2 (2026-07-06): the last two detached spawns
+        // in start_dhan_lane — the MINT-CAPABLE 4h token sweep
+        // (force_renewal_if_stale → acquire_token fallback) and the 5-min
+        // periodic health check — are lane-owned now. Pin the registrations:
+        // a revert to a bare `tokio::spawn` (handle discarded) leaks one
+        // immortal copy per D2b lane cold-start cycle; the leaked sweep
+        // keeps a deliberately-disabled lane's JWT alive via RenewToken and
+        // fires a false RESILIENCE-03 "peer owns the session" Critical page
+        // every 4h after a lane stop/restart.
+        assert!(
+            production.contains("token_sweep_handle: Some("),
+            "main.rs (production region) MUST register the 4h token-sweep \
+             handle lane-owned (`token_sweep_handle: Some(`) in \
+             DhanLaneRunHandles — a detached mint-capable sweep survives \
+             the lane teardown and fires false RESILIENCE-03 pages \
+             (SEC-R4-1 / R4-CPLX-1)."
+        );
+        assert!(
+            production.contains("periodic_health_handle: Some("),
+            "main.rs (production region) MUST register the periodic \
+             health-check handle lane-owned \
+             (`periodic_health_handle: Some(`) in DhanLaneRunHandles — a \
+             detached copy per lane cold-start cycle multiplies alert \
+             traffic with independent cooldown state (R4-CPLX-2)."
+        );
+        // COV-C4-1 (2026-07-07): the R8-EDGE-2 pool-watchdog lane-ownership
+        // has TWO production halves and only the SLOW one was ratcheted
+        // (test_pre_lane_abort_guard_covers_early_spawn_windows scopes its
+        // needles to start_dhan_lane's body). Pin the FAST crash-recovery
+        // arm's BINDING + its ride into run_shutdown_fast — a regression
+        // that keeps the fast-arm spawn but discards the handle
+        // (`let _ = spawn_pool_watchdog_task(...)` + passing `None`)
+        // compiles silently (main.rs lacks the lib.rs deny(unused_must_use)
+        // blanket, and `let _ =` defeats must_use anyway) and would re-open
+        // the leaked-watchdog class on a fast-boot process: an immortal
+        // stale writer of the shared /health + feed-health Dhan slots and a
+        // possible false CRITICAL WebSocketPoolHalt after a runtime Dhan
+        // disable.
+        assert!(
+            production.contains("let fast_pool_watchdog_handle = spawn_pool_watchdog_task("),
+            "main.rs (production region) MUST bind the FAST crash-recovery \
+             arm's pool-watchdog handle \
+             (`let fast_pool_watchdog_handle = spawn_pool_watchdog_task(`) — \
+             discarding it detaches the watchdog from lane ownership \
+             (COV-C4-1, R8-EDGE-2 class)."
+        );
+        assert!(
+            production.contains("(handles, Some(pool_arc), Some(fast_pool_watchdog_handle))"),
+            "main.rs (production region) MUST thread the FAST arm's \
+             pool-watchdog handle out of the pool-spawn block \
+             (`Some(fast_pool_watchdog_handle)`) so it rides into \
+             run_shutdown_fast → DhanLaneRunHandles (COV-C4-1)."
+        );
+        // R9-EDGE-1/2 + R10-CPLX-1 + COV-C4-2 (2026-07-07): pin the three
+        // remaining formerly-detached start_dhan_lane spawns' lane-ownership
+        // registrations — a revert to `let _ =` / anonymous `tokio::spawn`
+        // leaks one immortal midnight-rollover loop (+ a potentially
+        // immortal 5-min prev_oi QuestDB poller + a forever-parked
+        // OrderUpdateAuthenticated listener on its attempt-private Notify)
+        // per D2b lane cold-start cycle.
+        assert!(
+            production.contains("order_update_auth_listener_handle: Some("),
+            "main.rs (production region) MUST register the \
+             OrderUpdateAuthenticated listener handle lane-owned \
+             (`order_update_auth_listener_handle: Some(`) in \
+             DhanLaneRunHandles — a detached listener parks FOREVER on the \
+             attempt-private auth Notify once the order-update task is \
+             aborted (R9-EDGE-1 / R10-CPLX-1)."
+        );
+        assert!(
+            production
+                .contains("midnight_rollover_handle: midnight_rollover_guard.into_inner().pop()"),
+            "main.rs (production region) MUST defuse the midnight-rollover \
+             PreLaneAbortGuard into DhanLaneRunHandles \
+             (`midnight_rollover_handle: midnight_rollover_guard.into_inner().pop()`) \
+             — a detached rollover loop is IMMORTAL, one leaked copy per \
+             lane cycle (R9-EDGE-2 / COV-C4-2)."
+        );
+        assert!(
+            production.contains("prev_oi_refresh_handle: prev_oi_refresh_guard.into_inner().pop()"),
+            "main.rs (production region) MUST defuse the prev_oi-refresh \
+             PreLaneAbortGuard into DhanLaneRunHandles \
+             (`prev_oi_refresh_handle: prev_oi_refresh_guard.into_inner().pop()`) \
+             — a detached poller may never self-exit while candles_1d stays \
+             empty (R9-EDGE-2 / COV-C4-2)."
+        );
+        // Non-vacuity self-check: `main_rs_production_region` already
+        // asserted the split boundary is the #[cfg(test)]-gated `mod tests`
+        // seam (R7-CPLX-1 idiom hardening).
+        assert!(
+            !production.contains("\nmod tests {"),
+            "main.rs production region must have its #[cfg(test)] mod tests \
+             block excised (blanked) — the split found no test module \
+             (vacuous whole-file scan)"
         );
     }
 
