@@ -482,6 +482,26 @@ presence_fold_enabled   = true   # hot-path presence fold (lands in PR-4)
 groww_lag_enabled       = true   # Groww lag histograms (land in PR-3)
 trigger_secs_of_day_ist = 56700  # 15:45:00 IST
 
+# Daily BruteX↔TickVault Groww 1-minute cross-verification (default OFF —
+# flip enabled = true once the BruteX producer publishes daily CSVs to
+# s3://tv-prod-cold/crossverify/groww/<date>/). Cold path only; reads live
+# candles_1m (feed='groww') vs the BruteX CSVs, writes forensic tables +
+# one Telegram summary. Runbook:
+# .claude/rules/project/brutex-crossverify-error-codes.md
+[brutex_crossverify]
+enabled                  = false
+telegram_enabled         = true
+bucket                   = "tv-prod-cold"
+prefix                   = "crossverify/groww"
+trigger_secs_of_day_ist  = 57000    # 15:50:00 IST
+deadline_secs_of_day_ist = 57900    # 16:05:00 IST S3 wall-clock cap
+repoll_interval_secs     = 120      # empty-prefix re-poll cadence
+max_object_bytes         = 5242880  # 5 MiB per CSV object
+max_keys                 = 2000     # listed-key cap per day
+fetch_attempts_per_object = 3
+price_tolerance_paise    = 0        # exact match (inclusive <= compare)
+compare_volume           = false    # groww live volume is always 0
+
 # ===========================================================================
 # Per-minute spot 1m REST pipeline (operator grant 2026-07-12 — PR-2, the
 # SPOT half). Every trading-day minute close in [09:16:00, 15:30:00] IST,
@@ -502,6 +522,30 @@ enabled = true
 # ON while the 2026-07-14 all-morning empty signature is under
 # investigation; flip to false once the verdict lands.
 diagnostics = true
+# 2026-07-14 architecture optionality (pending the ~15:40 IST sweep-
+# discriminator operator ruling): "per_minute" (default — fire each minute
+# close) or "batch_catchup" (a sweep-style catch-up every
+# batch_interval_minutes instead of per-minute fires — one day-window fetch
+# per SID through the shared Dhan Data-API limiter, persisting everything
+# new above the per-SID watermark). A CONFIG MODE, not a rewrite.
+fetch_mode = "per_minute"
+batch_interval_minutes = 5
+
+# ===========================================================================
+# Shared Dhan Data-API REST pacing (operator directive 2026-07-14: pace
+# Dhan to 3 requests/sec — tunable DOWN to 2 — spread overflow into the
+# next second(s), route the option-chain API through the SAME limiter,
+# with incremental/decremental self-tuning: "if it accepts max 3 or 2,
+# stick to that and split it up"). target_rps is the tuning CAP (legal
+# range 2..=4, rejected at boot outside it); the self-tuner steps down to
+# the 2 rps floor on observed 429 bursts and back up toward this cap on
+# clean streaks. Dhan-ONLY — the Groww legs keep their own budgets.
+# HONESTY: this limiter eliminates 429 waste; it does NOT make Dhan serve
+# same-day candles (the 2026-07-14 0/980 spot regime is a vendor serving
+# question, not a pacing one).
+# ===========================================================================
+[dhan_data_api]
+target_rps = 3
 
 # ===========================================================================
 # Per-minute option-chain REST pipeline (operator grant 2026-07-12 — PR-3,
