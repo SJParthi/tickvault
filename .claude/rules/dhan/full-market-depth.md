@@ -27,6 +27,10 @@
 6. **200-level endpoint URL is UNRESOLVED upstream** (root path vs `/twohundreddepth`
    flip-flop — see the dated 2026-07-03 note in the ground-truth doc). Live-probe both
    paths before trusting either; preserve the 2026-04-06 SDK-verified note.
+   **2026-07-14 update:** the DOCS side is no longer flip-flopping — three consecutive
+   captures (2026-06-02 → 2026-07-14 runner crawl) + the new portal guide all pin
+   `/twohundreddepth`; only the 2026-04-06 SDK note backs the root path. The
+   live-probe-both-before-trusting mandate stands.
 
 ## Trigger
 

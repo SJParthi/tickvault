@@ -162,7 +162,24 @@ pg_port = 8812
 ilp_port = 9009
 
 [partition_retention]
+# STANDARD class (audit / daily-data tables) hot window.
 retention_days = 90
+# HIGH-VOLUME market-data class (ticks + 21 candles_* tables, ~1.2-2 GB/day).
+# 90d of ticks (~135+ GB) can never fit the 30 GB volume; 14d hot on EBS with
+# the verified S3 archive as the durable long-term store (SEBI retention is
+# satisfied by the S3 copy — aws-budget hot-window doctrine).
+market_data_hot_days = 14
+# Archive->verify->drop leg ON (2026-07-13 disk-pressure remediation).
+# Fail-closed: a partition is dropped ONLY after its S3 copy is row-count-
+# and size-verified. ROLLBACK: set false (or delete the key) to restore the
+# legacy detach-only behaviour instantly.
+archive_enabled = true
+# Empty = derive tv-<TV_ENVIRONMENT>-cold (prod -> tv-prod-cold; the instance
+# role already has Put/Get/List on it — no IAM change).
+archive_bucket = ""
+# Oldest-first per-run bound so the first catch-up sweep converges over a few
+# post-market runs instead of overrunning the 16:30 IST box stop.
+max_partitions_per_run = 200
 
 # [valkey] section DELETED in #O4 (2026-05-24). Valkey removed from
 # the runtime; the dual-instance lock moved to AWS SSM Parameter Store
@@ -324,6 +341,16 @@ groww_enabled = false
 # No shared-table writes, no strategy/order wiring, no sidecar changes.
 groww_native_shadow = false
 
+# Groww capture-archive S3 offload (2026-07-13 disk-retention hardening).
+# Rotated sidecar capture archives (data/groww/live-ticks-YYYYMMDD.ndjson)
+# are uploaded to s3://<bucket>/<prefix>/<filename>, VERIFIED (head_object
+# size match), and only then deleted locally after a grace window. Empty
+# bucket = archival OFF (archives kept on disk — the dev-Mac behaviour);
+# the sidecar NEVER deletes a file without a verified S3 copy.
+[feeds.groww]
+capture_archive_s3_bucket = "tv-prod-cold"
+capture_archive_s3_prefix = "groww-capture"
+
 # Groww multi-connection AUTO-SCALE ladder (operator authorization 2026-07-03,
 # §34 of .claude/rules/project/groww-second-feed-scope-2026-06-19.md).
 # enabled = false (the default) keeps the single-connection sidecar path
@@ -466,6 +493,15 @@ trigger_secs_of_day_ist = 56700  # 15:45:00 IST
 # ===========================================================================
 [spot_1m_rest]
 enabled = true
+# 2026-07-14 serving-delay diagnostics rider: LOG-ONLY one-shot probes
+# (first session fire after boot + once at ~11:00 IST; ≤6 bounded extra
+# requests/day, ~300ms apart, inside the Data-API budget) that log the
+# cross-verify byte-exact day window, the previous-trading-day window and
+# a same-day-to-now window side by side — discriminating vendor serving
+# DELAY from request shape. Never touches fetch/persist/edge behaviour.
+# ON while the 2026-07-14 all-morning empty signature is under
+# investigation; flip to false once the verdict lands.
+diagnostics = true
 
 # ===========================================================================
 # Per-minute option-chain REST pipeline (operator grant 2026-07-12 — PR-3,
@@ -521,6 +557,28 @@ enabled = true
 [groww_option_chain_1m]
 enabled = true # flipped 2026-07-13 after the live probe PASSED (groww-second-feed-scope §38.6); serde default stays OFF
 probe_and_report = true # inert while enabled; the rollback canary (the Dhan §8.7 precedent)
+
+# ===========================================================================
+# Groww per-minute PER-CONTRACT 1m candle REST leg (operator grant
+# 2026-07-13 — PR-4 of the Groww per-minute REST plan, the FILL-MODEL
+# leg). When enabled: every session minute — sequenced right after the
+# Groww chain fetch — pull the just-closed minute's 1m candle for a
+# BOUNDED ATM-window selection of option contracts (ATM ±
+# strikes_each_side x CE+PE x 3 underlyings, hard-capped per minute) via
+# Groww GET /v1/historical/candles (segment=FNO) and persist to the NEW
+# option_contract_1m_rest table tagged feed='groww' (feed-in-key DEDUP).
+# DEPENDS ON THE CHAIN LEG: the per-minute ATM anchor is the chain's
+# underlying price — the chain leg is live (enabled = true above, §38.6),
+# but THIS leg stays OFF until the operator flips it with its own dated
+# note. Rows are RECORD data: any future strategy consumer must fail
+# closed on staleness per the decision-freshness gate
+# (groww-second-feed-scope-2026-06-19.md §38.8).
+# An ABSENT section = disabled (fail-safe); `enabled = false` is the
+# rollback switch.
+# ===========================================================================
+[groww_contract_1m]
+enabled = false # stays OFF until the operator's dated flip note (the chain leg feeds its ATM anchors)
+strikes_each_side = 2
 
 # ===========================================================================
 # Daily timeframe-consistency verifier (operator directive 2026-07-13 —

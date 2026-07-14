@@ -422,7 +422,13 @@ mod alert_routing {
     fn test_normal_events_are_low_or_info() {
         let normal_events: Vec<(NotificationEvent, Severity)> = vec![
             (
-                NotificationEvent::StartupComplete { mode: "LIVE" },
+                NotificationEvent::StartupComplete {
+                    mode: "LIVE",
+                    spot_1m_enabled: true,
+                    spot_1m_indices: 4,
+                    chain_1m_enabled: true,
+                    chain_1m_underlyings: 3,
+                },
                 Severity::Info,
             ),
             (NotificationEvent::ShutdownComplete, Severity::Info),

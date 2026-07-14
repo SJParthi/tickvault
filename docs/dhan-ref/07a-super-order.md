@@ -118,3 +118,31 @@ pub struct SuperOrderLeg {
     pub trailing_jump: f64,
 }
 ```
+
+---
+
+## 2026-07-14 Upstream Update (runner-crawled live pages)
+
+**Evidence tier: Verified-live.** Raw HTML of `https://dhanhq.co/docs/v2/super-order/`
+(runs 1–3, sha256 `4a04b343` content-identical, latest 2026-07-14T07:57:53Z) + portal markdown
+exports (place/modify/cancel super-order, 2026-07-14T08:05:03–14Z). Full manifest:
+`00-COVERAGE-MANIFEST.md`.
+
+1. **`trailingJump` is `required` in the live place table** ("trailingJump required | float |
+   Price Jump by which Stop Loss should be trailed") — pass `0` for no trail; the field itself
+   is required, not optional.
+2. **Trail cancellation is WIDER than the =0 arm:** live modify table verbatim — "If trailing
+   jump is **not added** or passed as 0, it will be cancelled" (ENTRY_LEG or STOP_LOSS_LEG
+   modify). OMITTING `trailingJump` on a modify ALSO cancels the trail — load-bearing for any
+   future modify caller: always re-send `trailingJump`.
+3. **Single-trail-only on the v2 API surface (BOTH doc surfaces):** exactly ONE trailing field
+   exists — `trailingJump`, the SL trail (×8 on the classic page; the portal place/modify
+   exports agree); the TARGET_LEG modify body carries only `targetPrice`; no second trail
+   field, no "Super Trail" text anywhere. The dhan.co support-page "Super Trail" claim (dual
+   SL + target trailing — `verification-2026-07-13.md` §4 flag 6) is a PLATFORM feature claim
+   (Secondary tier); the v2 API exposes SL-trail only as of 2026-07-14. This note records the
+   API-surface fact and deliberately does NOT encode the platform claim.
+4. Consistency spot-check: the classic page's "Cancelling main order ID cancels all legs. If
+   particular target or stop loss leg is cancelled, then the same cannot be added again." is
+   ABSENT from the portal cancel page (an omission, not a contradiction — the classic note
+   stands).
