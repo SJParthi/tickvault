@@ -189,3 +189,56 @@ what those SOURCES contain — which is Secondary evidence about Dhan's API, not
 
 Full sweep detail (scratchpad, session-local, not committed): findings-B.md + findings-C.md;
 sweep A's findings survive only as the hostile-review summary (quote text not preserved).
+
+---
+
+## 2026-07-14 — Runner crawl SUPERSEDES the search-index tiers above
+
+**What changed:** the day after this record was written, a reusable GitHub-Actions runner
+workflow (`docs-fetch.yml`; runner IPs are not blocked by Dhan) fetched the raw
+server-rendered pages directly — three runs: 29279025906 (2026-07-13T19:35–19:37Z),
+29294952698 (2026-07-14T00:05–00:07Z), 29316310511 (2026-07-14T07:57–08:06Z, the canonical
+191-row manifest: classic pages + the NEW portal's `/markdown/api/v2/**.md` exports +
+docs-export.md + the OpenAPI yaml). Classic-page sha256s were content-identical across all
+three runs. Consequences for THIS record:
+
+1. **The §2 verdict tiers are superseded**: every "Verified-snippet"/"Unknown" row now has a
+   Verified-live backing (or a dated drift note) — the per-file 2026-07-14 "Upstream Update"
+   sections appended to `01`, `02`, `04`, `05`, `07`, `07a`, `07b`, `07c`, `08`, `09`, `10`,
+   `12`, `13`, `14`, `15`, `16` (+ the `dhanhq-v2-upstream-2026-07-03/22-rate-limits.md`
+   banner update) are the authoritative per-file records. Coverage manifest:
+   `00-COVERAGE-MANIFEST.md`.
+2. **The §3 operator paste list is MOOT** (retained above for history): the runner crawl
+   fetched every listed page verbatim, including both NEW-portal probe targets (real content
+   via the `/markdown/` export routes — the portal's HTML routes are a client-rendered SPA
+   shell).
+3. **§4 flag outcomes:** flag 1 (transposed rate limits) — now proven LIVE portal corruption
+   on `guides/rate-limits.md` + the yaml intro, canonical table confirmed verbatim on both
+   surfaces' primary pages; flag 2 (2.5.1 provenance) — Verified-live NOT a Dhan release;
+   flag 3 (RenewToken) — all three claims CONFIRMED (GET; new-token semantics; web-only; the
+   POST claim refuted); flag 4 (multi-margin) — upgraded to a three-artifact split (classic
+   page internally split; portal markdown vs yaml disagree; still live-probe-gated); flag 5
+   (killSwitchStatus) — the header-vs-query self-contradiction is REAL on the live page;
+   flag 6 (Super Trail) — the v2 API surface has exactly ONE trail field on both surfaces
+   (the support-page claim stays a Secondary platform claim); flag 7 (two portals) — CONFIRMED
+   and now central: the two surfaces DISAGREE on the annexure enums (see
+   `08-annexure-enums.md` "2026-07-14 Upstream Update" — the 2026-07-03 comparison had read
+   the PORTAL export and misattributed cross-surface divergence as cross-time drift); flag 8
+   (candle latency) — confirmed undocumented on the full 191-page corpus; flag 9 — unchanged.
+4. **The honest envelope of the superseding evidence** (hostile-review-2, verbatim):
+
+> Every "Verified-current"/"Verified-live" claim in this sync is backed by verbatim
+> server-rendered HTML fetched by a GitHub-Actions runner from `dhanhq.co/docs/v2/*`
+> (runs 1–3, 2026-07-13T19:35Z–2026-07-14T00:07Z, content-identical sha256 across runs,
+> 24/24 distinct page hashes, zero WAF markers) plus — NEW in run 3
+> (2026-07-14T07:58–08:01Z) — the new portal's markdown-export routes
+> (`docs.dhanhq.co/markdown/api/v2/**.md`), which returned real per-page content;
+> the portal's HTML routes remain a client-rendered SPA shell and are NOT covered.
+> Claims were verified comment-aware (content hidden in HTML comments counted as
+> non-rendered; absences checked inside comments too). Where the two official surfaces
+> disagree (annexure currency segments, ExpiryCode numbering, instrument-type count,
+> depth unsubscribe code, multi-margin request shape), BOTH readings are recorded and
+> neither is asserted as API wire truth — wire behavior for contested enums remains
+> UNVERIFIED-LIVE and gated on live probes; getIP response fields are wire-observed
+> (prod boot gate + support-ticket records) but doc-unbacked on both surfaces. No live
+> API endpoint was probed by this crawl.
