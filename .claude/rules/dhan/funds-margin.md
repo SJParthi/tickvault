@@ -64,10 +64,14 @@
    consume margin between our check and our order (irreducible TOCTOU; the broker is
    the final arbiter).
 
-9. **Funds/margin REST usage is self-capped at ≤ 10 req/sec** — 50% of Dhan's 20/sec
-   non-trading-API budget (the same co-tenancy discipline as rule 8). The gate REFUSES an
-   entry check rather than queueing when the self-cap is hit — a delayed pre-trade verdict
-   is a stale verdict.
+9. **Funds/margin REST usage is self-capped (default 5 req/sec, hard ceiling 10).** The
+   funds/margin endpoints' rate bucket is NOT named by Dhan's docs (the ground truth names
+   no bucket; api-introduction lists Funds under the Trading-API family while the rate
+   table's buckets are Order/Data/Quote/Non-Trading) — **Assumed** Non-Trading (20/sec); a
+   5/sec default stays ≤ 50% even under the more conservative 10/sec reading; live-probe
+   before raising. Same co-tenancy discipline as rule 8. The gate REFUSES an entry check
+   rather than queueing when the self-cap is hit — a delayed pre-trade verdict is a stale
+   verdict.
 
 10. **The margin gate contract.**
     - **EXITS ARE NEVER MARGIN-GATED.** The exit path is structurally REST-free (no token
@@ -99,13 +103,16 @@
   `dhanClientId` (serde-default empty) is TOLERATED by the response-side check (an absent
   field is not evidence of a wrong account); the REQUEST-side check is STRICT — the gate
   refuses any entry request whose client id differs from the gate's expected id, empty
-  included (the request must carry the real client id for the broker anyway).
+  included (the request must carry the real client id for the broker anyway). A
+  `MarginGate` constructed with an EMPTY expected client id refuses ALL entries
+  fail-closed (constructor-side — there is no real account to validate against; distinct
+  from the request-mismatch arm).
 - **Pre-open values are start-of-day values:** fundlimit values read before 09:15 IST are
   SOD balances — consumers sizing entries pre-open see start-of-day numbers, not live
   intraday utilization.
 - **The REST self-cap is PER-GATE-INSTANCE:** the OMS-wiring PR must construct exactly
   ONE gate per process and pin that with its own ratchet; until then, multi-instance
-  construction could exceed the documented process-wide ≤ 10 req/sec budget.
+  construction could exceed the intended process-wide self-cap budget (rule 9).
 
 ## What This Prevents
 
@@ -150,7 +157,15 @@ This rule activates when editing files matching:
     gated by the const; they have ZERO production callers today, and the
     no-production-caller ratchet
     (`crates/trading/tests/margin_gate_off_guard.rs::test_margin_gate_and_wrappers_have_no_production_callers`)
-    pins that zero until the OMS-wiring PR deliberately updates its allowlist.
+    pins that zero until the OMS-wiring PR deliberately updates its allowlist. The
+    ratchet scans every `crates/*/src/**/*.rs` file WHOLE except exactly two files —
+    `oms/margin_gate.rs` and `oms/api_client.rs`, whose in-file test modules
+    legitimately call the needles and are excised via the production-region split
+    (everything above the column-0 `#[cfg(test)]` line). It is a tripwire for
+    INNOCENT early wiring, not an adversarial barrier: the method-syntax needles
+    leave a named residual — UFCS calls (`MarginGate::check_entry(&gate, ..)`) and
+    aliased imports are not caught (accepted class per the house source-scan
+    conventions).
   - "Zero runtime REST calls" is scoped to THIS funds/margin surface only — the spot-1m /
     option-chain per-minute legs are SEPARATELY granted Dhan REST surfaces that do run
     (`no-rest-except-live-feed-2026-06-27.md` §8).

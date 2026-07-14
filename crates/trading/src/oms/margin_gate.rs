@@ -14,8 +14,12 @@
 //! OUR utilized margin from the co-tenant's (`fundlimit` is pooled), so no
 //! cumulative ledger exists yet (a cumulative tenant ledger is a flagged
 //! follow-up for the OMS-wiring PR). The funds/margin REST legs are
-//! self-capped at ≤ 10 req/sec (50% of Dhan's 20/sec non-trading budget) —
-//! PER GATE INSTANCE: the OMS-wiring PR must construct exactly ONE gate per
+//! self-capped (default 5 req/sec, hard ceiling 10) — the funds/margin
+//! endpoints' rate bucket is NOT named by Dhan's docs, so the budget is
+//! Assumed Non-Trading (20/sec); a 5/sec default stays ≤ 50% even under
+//! the more conservative 10/sec reading; live-probe before raising. The
+//! self-cap is PER GATE INSTANCE: the OMS-wiring PR must construct exactly
+//! ONE gate per
 //! process (and pin that with its own ratchet); until then, multi-instance
 //! construction could exceed the documented process-wide budget. BruteX may
 //! still consume margin between our check and our order — that TOCTOU
@@ -389,8 +393,9 @@ pub struct MarginGate {
     expected_client_id: String,
     /// `[dhan_margin_gate]` config.
     cfg: DhanMarginGateConfig,
-    /// Funds/margin REST self-cap (≤ 10 req/sec — half of Dhan's 20/sec
-    /// non-trading budget; the account is shared with the co-tenant).
+    /// Funds/margin REST self-cap (default 5 req/sec, ceiling 10 — the
+    /// endpoints' rate bucket is NOT named by Dhan's docs; Assumed
+    /// Non-Trading 20/sec, and the account is shared with the co-tenant).
     self_cap: RateLimiter<NotKeyed, InMemoryState, DefaultClock>,
     /// Snapshot of the code-change master lock
     /// [`DHAN_MARGIN_GATE_REST_ALLOWED`] taken at construction — tests

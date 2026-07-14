@@ -31,11 +31,25 @@ fn read_repo_file(rel: &str) -> String {
 /// next line that starts a new `[` table (or EOF). Parsing the SECTION
 /// SLICE — not whole-file substring matching — because many sections carry
 /// an `enabled = false` key.
+///
+/// The header match is a NON-COMMENT LINE match (the trimmed line must
+/// start with the header and must not start with `#`) — a commented-out
+/// `# [dhan_margin_gate]` banner line can never satisfy the check.
 fn toml_section<'a>(content: &'a str, header: &str) -> &'a str {
-    let start = content
-        .find(header)
-        .unwrap_or_else(|| panic!("section {header} not found"));
-    let after_header = start + header.len();
+    let mut offset = 0_usize;
+    let mut header_end = None;
+    for line in content.lines() {
+        let trimmed = line.trim_start();
+        if !trimmed.starts_with('#') && trimmed.starts_with(header) {
+            // Slice starts right after the WHOLE header line (any trailing
+            // text on the header line is not section body).
+            header_end = Some(offset + line.len());
+            break;
+        }
+        offset += line.len() + 1;
+    }
+    let after_header =
+        header_end.unwrap_or_else(|| panic!("section {header} not found as a non-comment line"));
     let rest = &content[after_header..];
     let end = rest
         .lines()
@@ -92,6 +106,15 @@ fn test_margin_gate_guard_section_slicer_finds_known_key() {
         !section.lines().any(|l| l.trim_start().starts_with('[')),
         "slicer self-test: the slice must not spill into the next section"
     );
+    // A COMMENTED-OUT header must not satisfy the match — the slicer must
+    // skip past it to the real (non-comment) header line.
+    let synthetic = "# [demo]\n# enabled = true\n[demo]\nenabled = false\n[next]\nx = 1\n";
+    let demo = toml_section(synthetic, "[demo]");
+    assert!(
+        demo.contains("enabled = false") && !demo.contains("enabled = true"),
+        "slicer self-test: a commented-out section header must never satisfy the \
+         match; sliced:\n{demo}"
+    );
 }
 
 #[test]
@@ -102,30 +125,45 @@ fn test_margin_gate_config_serde_default_is_disabled() {
         toml::from_str("").unwrap_or_else(|err| panic!("empty TOML must deserialize: {err}"));
     assert!(!cfg.enabled, "serde default must be DISABLED");
     assert_eq!(cfg.tenant_budget_percent, 50);
-    assert_eq!(cfg.rest_self_cap_per_sec, 10);
+    // 5, not 10: the funds/margin rate bucket is NOT named by Dhan's docs
+    // (Assumed Non-Trading 20/sec) — 5/sec stays <= 50% even under the
+    // more conservative 10/sec reading.
+    assert_eq!(cfg.rest_self_cap_per_sec, 5);
     // Default::default() must agree with the serde defaults.
     let d = DhanMarginGateConfig::default();
     assert!(!d.enabled);
     assert_eq!(d.tenant_budget_percent, 50);
-    assert_eq!(d.rest_self_cap_per_sec, 10);
+    assert_eq!(d.rest_self_cap_per_sec, 5);
 }
 
 #[test]
 fn test_margin_gate_test_bypass_is_cfg_test_gated() {
+    // ATTACHMENT semantics, not a proximity window: walking UP from the fn
+    // line, skipping comment lines and NON-cfg attribute lines, the FIRST
+    // remaining line must carry `#[cfg(test)]` — a nearby-but-unattached
+    // cfg line (e.g. gating a neighbouring item) can never satisfy this.
     let src = read_repo_file("crates/trading/src/oms/margin_gate.rs");
     let lines: Vec<&str> = src.lines().collect();
     let bypass_line = lines
         .iter()
         .position(|l| l.contains("fn allow_rest_for_test"))
         .unwrap_or_else(|| panic!("allow_rest_for_test must exist in margin_gate.rs"));
-    let window_start = bypass_line.saturating_sub(4);
-    let preceded_by_cfg_test = lines[window_start..bypass_line]
-        .iter()
-        .any(|l| l.contains("#[cfg(test)]"));
+    let mut attached_cfg_test = false;
+    for line in lines[..bypass_line].iter().rev() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("//") {
+            continue; // comment lines sit between attributes and the fn
+        }
+        if trimmed.starts_with("#[") && !trimmed.contains("cfg(test)") {
+            continue; // other attributes (e.g. #[allow]) may stack above
+        }
+        attached_cfg_test = trimmed.contains("#[cfg(test)]");
+        break;
+    }
     assert!(
-        preceded_by_cfg_test,
-        "allow_rest_for_test must be #[cfg(test)]-gated — the master-lock bypass may \
-         never exist in a production build"
+        attached_cfg_test,
+        "allow_rest_for_test must have an ATTACHED #[cfg(test)] attribute — the \
+         master-lock bypass may never exist in a production build"
     );
 }
 
@@ -155,7 +193,7 @@ fn test_margin_gate_validate_bounds() {
         ..DhanMarginGateConfig::default()
     };
     assert!(zero.validate().is_err(), "0% must be rejected");
-    // REST self-cap out of range (over half the 20/sec budget, or below
+    // REST self-cap out of range (over the 10/sec hard ceiling, or below
     // the 2-call entry burst).
     let cap_high = DhanMarginGateConfig {
         rest_self_cap_per_sec: 11,
@@ -215,6 +253,36 @@ fn production_region(content: &str) -> String {
     region
 }
 
+/// The ONLY two files whose in-file test modules legitimately call the
+/// gate/wrapper needles — they alone keep the production-region truncation
+/// (the split excises their tests modules). Every other crate has no
+/// legitimate needle caller ANYWHERE in src, so every other file is scanned
+/// WHOLE — closing the items-after-tests-module blind region (e.g. main.rs
+/// boot helpers declared below its column-0 `#[cfg(test)]` module). A
+/// future legitimate cfg(test) caller elsewhere updates this allowlist
+/// DELIBERATELY, never as a side effect.
+const TRUNCATED_SCAN_ALLOWLIST: [&str; 2] = ["oms/margin_gate.rs", "oms/api_client.rs"];
+
+/// The exact region the no-production-caller scan reads for one file:
+/// whole-file everywhere, production-region-only for the two allowlisted
+/// oms files above.
+fn scanned_region<'a>(path: &std::path::Path, content: &'a str) -> std::borrow::Cow<'a, str> {
+    if TRUNCATED_SCAN_ALLOWLIST
+        .iter()
+        .any(|suffix| path.ends_with(suffix))
+    {
+        std::borrow::Cow::Owned(production_region(content))
+    } else {
+        std::borrow::Cow::Borrowed(content)
+    }
+}
+
+/// TRIPWIRE, not an adversarial barrier: this ratchet exists to catch
+/// INNOCENT early wiring of the funds/margin surface before the OMS-wiring
+/// PR deliberately opens it — it is NOT proof against a determined evasion.
+/// The method-syntax needles do not catch UFCS calls
+/// (`MarginGate::check_entry(&gate, ..)`) or aliased imports; that residual
+/// is an accepted class per the house source-scan conventions.
 #[test]
 fn test_margin_gate_and_wrappers_have_no_production_callers() {
     // Pins the funds-margin.md claim "the funds/margin REST surface has
@@ -253,9 +321,12 @@ fn test_margin_gate_and_wrappers_have_no_production_callers() {
     for path in &src_files {
         let content = fs::read_to_string(path)
             .unwrap_or_else(|err| panic!("guard cannot read {}: {err}", path.display()));
-        let region = production_region(&content);
+        // Whole-file everywhere; production-region-only for the two
+        // allowlisted oms files (their tests modules call the needles).
+        let region = scanned_region(path, &content);
         // The gate's own module legitimately calls two wrappers on
-        // self.api inside check_entry — the SOLE allowlisted file.
+        // self.api inside check_entry — the SOLE wrapper-needle allowance,
+        // scoped to its PRODUCTION region only.
         let is_margin_gate_module = path.ends_with("oms/margin_gate.rs");
         for needle in GATE_NEEDLES {
             assert!(
@@ -307,6 +378,19 @@ fn test_margin_gate_and_wrappers_have_no_production_callers() {
         "scanner self-test: the production region must EXCLUDE the tests \
          module's MarginGate::new( construction"
     );
+    // Whole-file self-test: the historical blind-spot file (main.rs, whose
+    // boot helpers sit BELOW its column-0 #[cfg(test)] module) must be
+    // scanned in FULL — the scanned region's length equals the file's.
+    let main_rs_path = repo_root().join("crates/app/src/main.rs");
+    let main_rs = fs::read_to_string(&main_rs_path)
+        .unwrap_or_else(|err| panic!("guard cannot read {}: {err}", main_rs_path.display()));
+    let main_rs_region = scanned_region(&main_rs_path, &main_rs);
+    assert_eq!(
+        main_rs_region.len(),
+        main_rs.len(),
+        "scanner self-test: crates/app/src/main.rs must be scanned WHOLE-FILE — a \
+         truncated scan re-opens the items-after-tests-module blind region"
+    );
 }
 
 #[test]
@@ -321,8 +405,13 @@ fn test_margin_gate_exit_arm_has_no_rest_reachability() {
     let after = &src[fn_start..];
     // The fn body ends where the next `pub` item begins at method
     // indentation (check_entry's declaration or its doc comment block).
+    // Fallback terminator: if no such item follows, slice to the first
+    // column-0 `#[cfg(test)]` line instead — keeps the needle scan honest
+    // (never a whole-tail slice into the tests module) if check_exit ever
+    // becomes the last method in the impl.
     let fn_end = after[1..]
         .find("\n    pub ")
+        .or_else(|| after[1..].find("\n#[cfg(test)]"))
         .map_or(after.len(), |offset| offset + 1);
     let exit_body = &after[..fn_end];
     for needle in [".await", "calculate_margin", "get_fund_limit", "self_cap"] {

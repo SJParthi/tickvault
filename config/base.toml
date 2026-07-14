@@ -649,11 +649,14 @@ enabled = true
 # operator quote recorded in .claude/rules/dhan/funds-margin.md (the
 # umbrella-plan E2 hold). Shared account with BruteX: tenant_budget_percent
 # caps EACH entry to <=50% of the then-current pooled availabelBalance
-# (per-entry, not cumulative); rest_self_cap_per_sec caps our funds/margin
-# REST usage to <=50% of Dhan's 20/sec non-trading budget. Exits are NEVER
-# margin-gated.
+# (per-entry, not cumulative); rest_self_cap_per_sec self-caps our
+# funds/margin REST usage — the endpoints' rate bucket is NOT named by
+# Dhan's docs (Assumed Non-Trading 20/sec; 5/sec stays <=50% even under the
+# more conservative 10/sec reading; live-probe before raising). The
+# self-cap is per gate instance — the OMS wiring PR constructs exactly one
+# gate per process and ratchets it. Exits are NEVER margin-gated.
 # ===========================================================================
 [dhan_margin_gate]
 enabled = false
 tenant_budget_percent = 50
-rest_self_cap_per_sec = 10
+rest_self_cap_per_sec = 5

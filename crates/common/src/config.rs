@@ -899,8 +899,11 @@ impl Default for GrowwContract1mConfig {
 /// Shared-account safety (BruteX co-tenant on the same Dhan account):
 /// `tenant_budget_percent` caps EACH entry to at most half of the
 /// then-current pooled `availabelBalance` (per-entry, not cumulative);
-/// `rest_self_cap_per_sec` caps our funds/margin REST usage to at most
-/// half of Dhan's 20/sec non-trading budget.
+/// `rest_self_cap_per_sec` self-caps our funds/margin REST usage — the
+/// funds/margin endpoints' rate bucket is NOT named by Dhan's docs, so the
+/// budget is Assumed Non-Trading (20/sec); the 5/sec default stays ≤ 50%
+/// even under the more conservative 10/sec reading; live-probe before
+/// raising.
 #[derive(Debug, Clone, Deserialize)]
 pub struct DhanMarginGateConfig {
     /// Master config gate. Serde default FALSE (absent section = disabled).
@@ -915,9 +918,12 @@ pub struct DhanMarginGateConfig {
     /// OMS-wiring PR).
     #[serde(default = "default_margin_gate_tenant_budget_percent")]
     pub tenant_budget_percent: u8,
-    /// Self-imposed funds/margin REST ceiling (requests/sec). Hard-capped
-    /// at 10 = 50% of Dhan's 20/sec non-trading budget. Minimum 2 (one
-    /// entry check issues two REST calls in one burst).
+    /// Self-imposed funds/margin REST ceiling (requests/sec). Default 5:
+    /// the funds/margin endpoints' rate bucket is NOT named by Dhan's docs
+    /// — Assumed Non-Trading (20/sec); a 5/sec default stays ≤ 50% even
+    /// under the more conservative 10/sec reading; live-probe before
+    /// raising. Hard-capped at 10; minimum 2 (one entry check issues two
+    /// REST calls in one burst).
     #[serde(default = "default_margin_gate_rest_self_cap_per_sec")]
     pub rest_self_cap_per_sec: u32,
 }
@@ -929,16 +935,18 @@ fn default_margin_gate_tenant_budget_percent() -> u8 {
     50
 }
 
-/// Serde default for [`DhanMarginGateConfig::rest_self_cap_per_sec`] — 10,
-/// 50% of Dhan's 20/sec non-trading-API budget (co-tenant discipline).
+/// Serde default for [`DhanMarginGateConfig::rest_self_cap_per_sec`] — 5.
+/// The funds/margin endpoints' rate bucket is NOT named by Dhan's docs —
+/// Assumed Non-Trading (20/sec); a 5/sec default stays ≤ 50% even under the
+/// more conservative 10/sec reading; live-probe before raising.
 fn default_margin_gate_rest_self_cap_per_sec() -> u32 {
-    10
+    5
 }
 
 impl Default for DhanMarginGateConfig {
     /// Manual impl so `Default` matches the serde field defaults exactly
     /// (a derived `Default` would zero the budget/cap fields while an
-    /// absent `[dhan_margin_gate]` section deserializes them to 50/10).
+    /// absent `[dhan_margin_gate]` section deserializes them to 50/5).
     fn default() -> Self {
         Self {
             enabled: false,
@@ -955,9 +963,10 @@ impl DhanMarginGateConfig {
     /// Returns a descriptive error when `tenant_budget_percent` is outside
     /// `1..=50` (the Dhan account is pooled with the BruteX co-tenant, so
     /// our entries may never claim more than half the pooled balance) or
-    /// when `rest_self_cap_per_sec` is outside `2..=10` (at most half of
-    /// Dhan's 20/sec non-trading budget; at least 2 because one entry
-    /// check issues two REST calls in one burst).
+    /// when `rest_self_cap_per_sec` is outside `2..=10` (the ceiling is
+    /// half of the Assumed Non-Trading 20/sec bucket — the funds/margin
+    /// endpoints' bucket is NOT named by Dhan's docs; at least 2 because
+    /// one entry check issues two REST calls in one burst).
     pub fn validate(&self) -> Result<()> {
         if !(1..=50).contains(&self.tenant_budget_percent) {
             bail!(
@@ -969,9 +978,10 @@ impl DhanMarginGateConfig {
         }
         if !(2..=10).contains(&self.rest_self_cap_per_sec) {
             bail!(
-                "dhan_margin_gate.rest_self_cap_per_sec ({}) must be within 2..=10 — at most \
-                 half of Dhan's 20/sec non-trading budget (the account is shared with the \
-                 BruteX co-tenant) and at least 2 (one entry check bursts two REST calls)",
+                "dhan_margin_gate.rest_self_cap_per_sec ({}) must be within 2..=10 — the \
+                 ceiling is half of the ASSUMED Non-Trading 20/sec bucket (the funds/margin \
+                 endpoints' bucket is not named by Dhan's docs; the account is shared with \
+                 the BruteX co-tenant) and at least 2 (one entry check bursts two REST calls)",
                 self.rest_self_cap_per_sec
             );
         }
@@ -4528,7 +4538,8 @@ mod tests {
     /// 🔷 DHAN margin gate (2026-07-14): `[dhan_margin_gate]` is FAIL-SAFE
     /// default OFF on every path — `Default`, a missing section, and an
     /// empty section — with the shared-account defaults (50% tenant budget,
-    /// 10 req/sec self-cap) intact on all of them.
+    /// 5 req/sec self-cap — the funds/margin rate bucket is Assumed
+    /// Non-Trading, unnamed by Dhan's docs) intact on all of them.
     #[test]
     fn test_dhan_margin_gate_config_default_is_disabled() {
         use figment::Figment;
@@ -4537,7 +4548,7 @@ mod tests {
         let d = DhanMarginGateConfig::default();
         assert!(!d.enabled, "margin gate must default OFF (fail-safe)");
         assert_eq!(d.tenant_budget_percent, 50);
-        assert_eq!(d.rest_self_cap_per_sec, 10);
+        assert_eq!(d.rest_self_cap_per_sec, 5);
 
         #[derive(Deserialize)]
         struct Wrapper {
@@ -4551,7 +4562,7 @@ mod tests {
             .expect("missing [dhan_margin_gate] must default, not error");
         assert!(!missing.dhan_margin_gate.enabled);
         assert_eq!(missing.dhan_margin_gate.tenant_budget_percent, 50);
-        assert_eq!(missing.dhan_margin_gate.rest_self_cap_per_sec, 10);
+        assert_eq!(missing.dhan_margin_gate.rest_self_cap_per_sec, 5);
         // Empty section (no keys) → disabled via the field-level default.
         let empty: Wrapper = Figment::new()
             .merge(Toml::string("[dhan_margin_gate]\n"))
@@ -4559,7 +4570,7 @@ mod tests {
             .expect("empty [dhan_margin_gate] must default, not error");
         assert!(!empty.dhan_margin_gate.enabled);
         assert_eq!(empty.dhan_margin_gate.tenant_budget_percent, 50);
-        assert_eq!(empty.dhan_margin_gate.rest_self_cap_per_sec, 10);
+        assert_eq!(empty.dhan_margin_gate.rest_self_cap_per_sec, 5);
     }
 
     /// Shared-account tenant budget: 0% and >50% are REJECTED at boot
@@ -4591,8 +4602,8 @@ mod tests {
     }
 
     /// Funds/margin REST self-cap: 0/1 (below the 2-call entry burst) and
-    /// 11+ (over half of Dhan's 20/sec non-trading budget) are REJECTED;
-    /// the 2..=10 boundaries pass.
+    /// 11+ (over half of the ASSUMED Non-Trading 20/sec bucket — unnamed
+    /// by Dhan's docs) are REJECTED; the 2..=10 boundaries pass.
     #[test]
     fn test_dhan_margin_gate_validate_rejects_rest_cap_out_of_range() {
         for bad in [0_u32, 1, 11, 100] {
