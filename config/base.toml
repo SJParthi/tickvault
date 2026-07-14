@@ -639,3 +639,16 @@ strikes_each_side = 2
 # ===========================================================================
 [tf_consistency]
 enabled = true
+
+# ===========================================================================
+# Scheduled OMS order-book reconciliation (2026-07-14). Every
+# `interval_secs` during the NSE session the trading pipeline reconciles
+# OMS state against the Dhan order book (the OMS-GAP-02 machinery gains a
+# scheduled caller). DEFAULT-OFF until live trading — the OMS dry-run
+# short-circuit makes an enabled run a zero-HTTP no-op anyway. An ABSENT
+# section = disabled (fail-safe); `enabled = false` is the rollback switch.
+# ===========================================================================
+[oms_reconcile]
+enabled = false
+interval_secs = 300
+trading_hours_only = true
