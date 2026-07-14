@@ -691,6 +691,7 @@ fn build_chain_audit_row(
     error_class: &'static str,
 ) -> RestFetchAuditRow {
     RestFetchAuditRow {
+        close_to_persist_ms: -1,
         ts_ist_nanos: target_minute_ist_nanos,
         trading_date_ist_nanos: trading_date_nanos,
         feed: OPTION_CHAIN_1M_FEED_GROWW,

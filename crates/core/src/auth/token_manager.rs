@@ -101,6 +101,24 @@ pub(crate) const PROFILE_PARSE_ERROR_WRAPPER: &str = "profile response parse err
 pub(crate) const RESILIENCE03_MINT_REFUSAL_REASON_PREFIX: &str =
     "RESILIENCE-03: instance lock not held";
 
+/// H3 (2026-07-14 fix round): mint-cooldown refusal reason PREFIX —
+/// `renew_with_fallback` skipped the `generateAccessToken` fallback
+/// because a previous mint attempt is younger than the ~125s Dhan
+/// cooldown. The AUTH-GAP-05 watchdog prefix-anchors on this shared
+/// literal to classify the skip as NON-terminal (never a family-(3)
+/// page, never burns the once-per-episode latch) — same SEC-R1-3
+/// discipline as the RESILIENCE-03 prefix above.
+pub(crate) const MINT_COOLDOWN_REFUSAL_REASON_PREFIX: &str =
+    "mint-cooldown: generateAccessToken fallback skipped";
+
+/// H3. Pure. True iff a fallback mint is allowed given the seconds
+/// elapsed since the previous mint attempt (`None` = no prior attempt
+/// this process — always allowed).
+#[must_use]
+pub(crate) fn mint_cooldown_allows(elapsed_since_last_attempt_secs: Option<u64>) -> bool {
+    elapsed_since_last_attempt_secs.is_none_or(|s| s >= DHAN_TOKEN_GENERATION_COOLDOWN_SECS)
+}
+
 /// Wave 2 Item 5.4 (AUTH-GAP-03) — global TokenManager handle so the
 /// WebSocket sleep-wake path can call `force_renewal_if_stale()`
 /// without the connection holding a back-reference. Set once at boot
@@ -166,6 +184,21 @@ pub struct TokenManager {
     /// arm, which never mints at boot — documented residual gap in
     /// `.claude/rules/project/dual-instance-lock-2026-07-04.md`).
     instance_lock_held: Option<Arc<std::sync::atomic::AtomicBool>>,
+
+    /// H3 (2026-07-14 fix round, closes the AG5-R2-1 flagged residual):
+    /// wall-clock stamp of the most recent `generateAccessToken` MINT
+    /// ATTEMPT issued by THIS manager. `renew_with_fallback` — the shared
+    /// re-mint entry used by the AUTH-GAP-05 watchdog, the GAP-02 stack
+    /// sweep, the renewal loop and `force_renewal*` — refuses the
+    /// fallback mint fail-soft while a previous attempt is younger than
+    /// [`DHAN_TOKEN_GENERATION_COOLDOWN_SECS`], so uncoordinated
+    /// concurrent callers can no longer double-mint inside Dhan's ~125s
+    /// window. The boot-time `initialize` TOTP retry loop calls
+    /// `acquire_token` DIRECTLY (never `renew_with_fallback`) and owns
+    /// its own ≥130s floor — deliberately UNGATED, no boot deadlock.
+    /// std Mutex, poisoning-safe reads (`unwrap_or_else(into_inner)`),
+    /// cold path only.
+    last_mint_attempt: std::sync::Mutex<Option<std::time::Instant>>,
 }
 
 impl TokenManager {
@@ -265,6 +298,7 @@ impl TokenManager {
             network_config: network_config.clone(),
             notifier: Arc::clone(notifier),
             instance_lock_held,
+            last_mint_attempt: std::sync::Mutex::new(None),
         });
 
         // Fast path: try loading a cached token from a previous run.
@@ -523,6 +557,7 @@ impl TokenManager {
             network_config: network_config.clone(),
             notifier: Arc::clone(notifier),
             instance_lock_held,
+            last_mint_attempt: std::sync::Mutex::new(None),
         });
 
         // Validate cached client_id against SSM. If they differ, the cache was
@@ -562,6 +597,24 @@ impl TokenManager {
     /// on renewal — zero lock contention on the hot path.
     pub fn token_handle(&self) -> TokenHandle {
         Arc::clone(&self.token)
+    }
+
+    /// Returns the Dhan client id as a plain `String`.
+    ///
+    /// The stored field IS `Secret`-wrapped (`DhanCredentials.client_id` —
+    /// uniform defensive posture for everything under `credentials`), and
+    /// this accessor DELIBERATELY widens it to a plain `String`: the client
+    /// id travels as a plain-text `client-id` / `dhanClientId` HTTP header
+    /// on every Dhan REST call (precedent: `OrderApiClient`'s plain
+    /// `client_id: String` field, and the `RenewToken` header at the
+    /// renewal site), so it is not access-token-class secret material.
+    /// This accessor exists so fire-time consumers of the global
+    /// TokenManager (e.g. the 15:25 IST orphan-position watchdog re-homed
+    /// 2026-07-14) can build an `OrderApiClient` without threading
+    /// credentials through boot.
+    #[must_use]
+    pub fn client_id_string(&self) -> String {
+        self.credentials.client_id.expose_secret().to_string()
     }
 
     /// Spawns the background token renewal task.
@@ -827,6 +880,15 @@ impl TokenManager {
             });
         }
 
+        // H3 (2026-07-14 fix round): stamp the mint ATTEMPT (post-tripwire —
+        // a lock-refused call never touched Dhan, so it never stamps) so the
+        // shared `renew_with_fallback` cooldown gate sees boot mints,
+        // watchdog mints, sweep mints and renewal-loop fallbacks alike.
+        *self
+            .last_mint_attempt
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(std::time::Instant::now());
+
         let totp_code = generate_totp_code(&self.credentials.totp_secret)?;
 
         let url = join_api_url(&self.auth_base_url, DHAN_GENERATE_TOKEN_PATH);
@@ -991,10 +1053,44 @@ impl TokenManager {
     }
 
     /// Attempts renewal with fallback: renewToken → generateAccessToken.
+    ///
+    /// H3 (2026-07-14 fix round): the fallback MINT is gated on the shared
+    /// per-manager mint cooldown — within
+    /// [`DHAN_TOKEN_GENERATION_COOLDOWN_SECS`] of the previous mint
+    /// ATTEMPT the fallback is SKIPPED with a coded warn + a typed error
+    /// (prefix [`MINT_COOLDOWN_REFUSAL_REASON_PREFIX`]) instead of hitting
+    /// Dhan — closing the AG5-R2-1 residual where the watchdog, the GAP-02
+    /// 900s sweep and the renewal loop could double-mint inside Dhan's
+    /// ~125s window. `RenewToken` itself is NEVER gated (renewing our own
+    /// active token harms nothing), and the boot-time `initialize` retry
+    /// loop calls `acquire_token` directly — deliberately ungated.
     async fn renew_with_fallback(&self) -> Result<(), ApplicationError> {
         match self.try_renew_token().await {
             Ok(()) => Ok(()),
             Err(renew_err) => {
+                let elapsed_secs = self
+                    .last_mint_attempt
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .map(|at| at.elapsed().as_secs());
+                if !mint_cooldown_allows(elapsed_secs) {
+                    warn!(
+                        elapsed_secs = elapsed_secs.unwrap_or_default(),
+                        cooldown_secs = DHAN_TOKEN_GENERATION_COOLDOWN_SECS,
+                        renew_error = %renew_err,
+                        "renewToken failed but a generateAccessToken attempt is younger than \
+                         the Dhan mint cooldown — skipping the fallback mint (the caller's \
+                         own retry cadence re-attempts after the window)"
+                    );
+                    metrics::counter!("tv_token_mint_cooldown_skipped_total").increment(1);
+                    return Err(ApplicationError::AuthenticationFailed {
+                        reason: format!(
+                            "{MINT_COOLDOWN_REFUSAL_REASON_PREFIX} — last mint attempt was \
+                             {}s ago (< {DHAN_TOKEN_GENERATION_COOLDOWN_SECS}s)",
+                            elapsed_secs.unwrap_or_default()
+                        ),
+                    });
+                }
                 // Audit-2026-05-03 L3: warn lacks `code=` field. Add it for
                 // consistency with the project-wide error-code-tag convention
                 // even though `error_code_tag_guard` only enforces error-level.
@@ -1431,6 +1527,7 @@ impl TokenManager {
             },
             notifier: crate::notification::service::NotificationService::disabled(),
             instance_lock_held,
+            last_mint_attempt: std::sync::Mutex::new(None),
         })
     }
 }
@@ -1640,6 +1737,14 @@ mod tests {
         ));
         // Unrelated transient errors stay transient.
         assert!(!is_permanent_auth_error("connection reset by peer"));
+    }
+
+    #[test]
+    fn test_client_id_string_returns_constructor_client_id() {
+        // Constructor-level, no network — pins the fire-time accessor the
+        // orphan-position watchdog uses to build its OrderApiClient.
+        let manager = TokenManager::new_for_test(None);
+        assert_eq!(manager.client_id_string(), "test-client-id");
     }
 
     #[test]
@@ -2199,6 +2304,7 @@ mod tests {
             },
             notifier: crate::notification::service::NotificationService::disabled(),
             instance_lock_held: None,
+            last_mint_attempt: std::sync::Mutex::new(None),
         })
     }
 
@@ -2592,6 +2698,7 @@ mod tests {
             },
             notifier: crate::notification::service::NotificationService::disabled(),
             instance_lock_held: None,
+            last_mint_attempt: std::sync::Mutex::new(None),
         })
     }
 
@@ -2866,6 +2973,7 @@ mod tests {
             },
             notifier: crate::notification::service::NotificationService::disabled(),
             instance_lock_held: None,
+            last_mint_attempt: std::sync::Mutex::new(None),
         });
 
         let handle = manager.spawn_renewal_task();
@@ -3041,6 +3149,7 @@ mod tests {
             },
             notifier: crate::notification::service::NotificationService::disabled(),
             instance_lock_held: None,
+            last_mint_attempt: std::sync::Mutex::new(None),
         });
 
         let handle = tokio::spawn(Arc::clone(&manager).renewal_loop());
@@ -3105,6 +3214,7 @@ mod tests {
             },
             notifier: crate::notification::service::NotificationService::disabled(),
             instance_lock_held: None,
+            last_mint_attempt: std::sync::Mutex::new(None),
         });
 
         let handle = tokio::spawn(Arc::clone(&manager).renewal_loop());
@@ -3841,5 +3951,117 @@ mod tests {
                  missing marker: {marker}"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // H3 (2026-07-14 fix round) — shared mint-cooldown gate on the
+    // renew_with_fallback generateAccessToken path.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn h3_mint_cooldown_allows_truth_table() {
+        // No prior attempt this process: always allowed.
+        assert!(mint_cooldown_allows(None));
+        // Inside the window: refused.
+        assert!(!mint_cooldown_allows(Some(0)));
+        assert!(!mint_cooldown_allows(Some(
+            DHAN_TOKEN_GENERATION_COOLDOWN_SECS - 1
+        )));
+        // At/after the window: allowed.
+        assert!(mint_cooldown_allows(Some(
+            DHAN_TOKEN_GENERATION_COOLDOWN_SECS
+        )));
+        assert!(mint_cooldown_allows(Some(
+            DHAN_TOKEN_GENERATION_COOLDOWN_SECS + 1
+        )));
+    }
+
+    /// H3: a fallback mint inside the cooldown window is REFUSED with the
+    /// shared prefix (never hits Dhan), regardless of the renew failure.
+    #[tokio::test]
+    async fn h3_renew_with_fallback_refuses_mint_inside_cooldown() {
+        let data = DhanAuthResponseData {
+            access_token: "existing-jwt".to_string(),
+            token_type: "Bearer".to_string(),
+            expires_in: 86400,
+        };
+        let token_state = TokenState::from_response(&data);
+        let manager = make_test_manager_with_totp(
+            Some(token_state),
+            "https://127.0.0.1:1",
+            "https://127.0.0.1:1",
+        );
+        *manager
+            .last_mint_attempt
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(std::time::Instant::now());
+        let result = manager.renew_with_fallback().await;
+        let err = result.expect_err("must fail: renew unreachable + mint gated");
+        let rendered = format!("{err}");
+        assert!(
+            rendered.contains(MINT_COOLDOWN_REFUSAL_REASON_PREFIX),
+            "inside the window the fallback must be the typed cooldown skip, \
+             never a network attempt against Dhan — got: {rendered}"
+        );
+    }
+
+    /// H3: after the window the fallback mint proceeds (and fails on the
+    /// unreachable URL with a NON-cooldown error) — the gate never wedges.
+    #[tokio::test]
+    async fn h3_renew_with_fallback_allows_mint_after_cooldown() {
+        let data = DhanAuthResponseData {
+            access_token: "existing-jwt".to_string(),
+            token_type: "Bearer".to_string(),
+            expires_in: 86400,
+        };
+        let token_state = TokenState::from_response(&data);
+        let manager = make_test_manager_with_totp(
+            Some(token_state),
+            "https://127.0.0.1:1",
+            "https://127.0.0.1:1",
+        );
+        *manager
+            .last_mint_attempt
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = std::time::Instant::now()
+            .checked_sub(Duration::from_secs(
+                DHAN_TOKEN_GENERATION_COOLDOWN_SECS + 60,
+            ));
+        let result = manager.renew_with_fallback().await;
+        let err = result.expect_err("must fail: both endpoints unreachable");
+        let rendered = format!("{err}");
+        assert!(
+            !rendered.contains(MINT_COOLDOWN_REFUSAL_REASON_PREFIX),
+            "after the window the mint must be ATTEMPTED (network failure \
+             expected here) — got the cooldown skip instead: {rendered}"
+        );
+    }
+
+    /// H3: the boot-time `initialize` path stays UNGATED by construction —
+    /// its retry loop calls `acquire_token` directly, and the gate lives
+    /// ONLY in `renew_with_fallback` (source-scan pin so a refactor cannot
+    /// silently move the gate into `acquire_token` and deadlock boot).
+    #[test]
+    fn h3_initialize_mint_path_is_ungated() {
+        let source = include_str!("token_manager.rs");
+        let start = source
+            .find("async fn acquire_token")
+            .expect("acquire_token must exist");
+        let end = start
+            + source[start..]
+                .find("async fn renew_with_fallback")
+                .expect("renew_with_fallback must follow acquire_token");
+        let acquire_body = &source[start..end];
+        assert!(
+            !acquire_body.contains("mint_cooldown_allows("),
+            "the cooldown GATE must never live inside acquire_token — the \
+             boot-time initialize retry loop calls it directly and owns its \
+             own >=130s floor; gating it would deadlock boot (H3 contract)"
+        );
+        assert!(
+            acquire_body.contains("last_mint_attempt"),
+            "acquire_token must STAMP the mint attempt so all \
+             renew_with_fallback callers share one cooldown window"
+        );
     }
 }

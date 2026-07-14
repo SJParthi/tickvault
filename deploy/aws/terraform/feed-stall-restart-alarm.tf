@@ -22,7 +22,7 @@
 # /tickvault/<env>/metrics; a log metric filter extracts the per-scrape delta.
 #
 # COUNTER SHAPE: identical model + identical honest residual as
-# order-update-reconnect-storm-alarm.tf — the CW agent's prometheus pipeline
+# the (since-retired 2026-07-14) order-update-reconnect-storm alarm — the CW agent's prometheus pipeline
 # converts COUNTER samples to PER-SCRAPE DELTAS, so `Sum` over the window =
 # restarts in the window. Not live-verified from this sandbox; if the field
 # ever proved CUMULATIVE, Sum overcounts and pages too eagerly (fail-loud,

@@ -524,7 +524,7 @@ pub const TICK_GAP_ALERT_THRESHOLD_SECS: u32 = 30;
 /// showed 988 ERROR entries in 15 minutes for illiquid F&O options that
 /// legitimately don't trade for 2-5 minutes at a time. A real feed
 /// disconnect is detected by WS ping/pong within 40s (Dhan server
-/// timeout) plus the `no_tick_watchdog` in `crates/core/src/pipeline/`;
+/// timeout) plus the feed-level stall watchdogs;
 /// a 5-minute silence on ONE instrument while others keep ticking is
 /// illiquidity, not disconnect. The WARN band (30s threshold) still
 /// surfaces illiquidity to the aggregated 30s summary log.
@@ -1485,6 +1485,16 @@ pub const DHAN_MARGIN_CALCULATOR_MULTI_PATH: &str = "/margincalculator/multi";
 /// Path for fund limit query (appended to rest_api_base_url).
 /// Endpoint: GET <https://api.dhan.co/v2/fundlimit>
 pub const DHAN_FUND_LIMIT_PATH: &str = "/fundlimit";
+
+/// Master code-change lock for the 🔷 DHAN margin-gate REST legs (fundlimit
+/// + margincalculator). The order-surface umbrella plan (cluster E2) holds
+/// the live funds/margin REST call for an explicit operator grant; until a
+/// fresh dated quote is recorded in `.claude/rules/dhan/funds-margin.md`,
+/// this stays `false` and `MarginGate` can never issue a REST call even if
+/// `[dhan_margin_gate] enabled = true` — config flips alone can never turn
+/// the REST legs on (the hardcoded-dry_run / GROWW_ORDER_LIVE_FIRE
+/// precedent). Change ONLY with explicit approval from Parthiban.
+pub const DHAN_MARGIN_GATE_REST_ALLOWED: bool = false;
 
 /// Path for kill switch activate/deactivate (appended to rest_api_base_url).
 /// Endpoint: POST <https://api.dhan.co/v2/killswitch?killSwitchStatus=ACTIVATE|DEACTIVATE>
@@ -2749,9 +2759,35 @@ pub const IST_UTC_OFFSET_NANOS: i64 = 19_800_000_000_000;
 /// Earliest date (IST) when `mode = "live"` is permitted.
 /// Before this date, config validation rejects live mode at startup.
 /// Change these constants ONLY with explicit approval from Parthiban.
-pub const LIVE_TRADING_EARLIEST_YEAR: i32 = 2026;
-pub const LIVE_TRADING_EARLIEST_MONTH: u32 = 7;
-pub const LIVE_TRADING_EARLIEST_DAY: u32 = 1;
+///
+/// 2026-07-14 re-arm (operator cluster-D directive via coordinator): the
+/// 2026-07-01 date EXPIRED silently on 2026-07-01 leaving this gate a no-op;
+/// re-armed to the 2099-12-31 sentinel matching production.toml
+/// sandbox_only_until — going live now requires editing this constant with a
+/// fresh dated operator quote.
+pub const LIVE_TRADING_EARLIEST_YEAR: i32 = 2099;
+pub const LIVE_TRADING_EARLIEST_MONTH: u32 = 12;
+pub const LIVE_TRADING_EARLIEST_DAY: u32 = 31;
+
+/// Sandbox deadline for the OMS `place_order` live-mode gate, as UNIX epoch
+/// seconds: **2099-12-31T00:00:00Z** (= `4_102_358_400`; chrono-cross-checked
+/// by `crates/trading/tests/sandbox_enforcement_guard.rs`).
+///
+/// Consumed by `crates/trading/src/oms/engine.rs::place_order` (the
+/// `#[cfg(not(test))]` sandbox-enforcement block): any non-dry-run order
+/// while `Utc::now().timestamp() < SANDBOX_DEADLINE_EPOCH_SECS` returns
+/// `Err(OmsError::SandboxEnforcement)`. This gate is mode-INDEPENDENT — it is
+/// the last line even for hypothetical non-Live paths the config-level gates
+/// (`LIVE_TRADING_EARLIEST_*`, `sandbox_only_until`) never see.
+///
+/// MUST stay aligned with `LIVE_TRADING_EARLIEST_*` above (same 2099-12-31
+/// calendar day; this epoch is midnight UTC while the config gate compares
+/// IST calendar dates — the 5h30m nuance is inside the same day, and the
+/// alignment ratchet compares the UTC calendar date of this epoch against
+/// the `LIVE_TRADING_EARLIEST_*` NaiveDate). 2026-07-14 re-arm: the previous
+/// fn-local 2026-07-01 epoch in engine.rs expired silently; re-armed to the
+/// 2099-12-31 sentinel — going live requires a fresh dated operator quote.
+pub const SANDBOX_DEADLINE_EPOCH_SECS: i64 = 4_102_358_400;
 
 // ---------------------------------------------------------------------------
 // Periodic Health Check
@@ -2859,6 +2895,22 @@ pub const TOKEN_SWEEP_INTERVAL_SECS: u64 = 4 * 3600;
 /// (main feed, depth, order update) so behaviour is uniform across all
 /// renewal triggers.
 pub const TOKEN_SWEEP_STALENESS_THRESHOLD_SECS: i64 = 4 * 3600;
+
+/// GAP-02 (2026-07-14, Dhan noise lock backstop): the Dhan REST-only
+/// stack's stale-token sweep cadence.
+///
+/// The lane's 4h token sweep dies with the lane (#1522); the REST-only
+/// stack (`dhan_rest_stack.rs` Phase 3) runs its OWN sweep every this
+/// many seconds, calling
+/// `force_renewal_if_stale(TOKEN_SWEEP_STALENESS_THRESHOLD_SECS)` —
+/// the renewal-loop-circuit-breaker-halt backstop. 900s (matching the
+/// mid-session watchdog cadence) instead of the lane's 4h: the stack's
+/// spot/chain legs die within minutes of a stale token, so the backstop
+/// must react on the same timescale. Silent on no-op/success; a failure
+/// logs via the renewal machinery's own paths. NOT market-hours gated
+/// (a token that goes stale overnight must heal before the 09:16 first
+/// fetch).
+pub const DHAN_REST_STACK_TOKEN_SWEEP_INTERVAL_SECS: u64 = 900;
 
 // DELETED: FRAME_SEND_TIMEOUT_SECS and FRAME_BACKPRESSURE_TIMEOUT_SECS
 // Removed per P1.3 — WS readers use non-blocking try_send() + WAL spill,
