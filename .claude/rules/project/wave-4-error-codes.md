@@ -342,12 +342,16 @@ lane-only). A CloudWatch log-filter alarm now backstops it:
 `tv-<env>-errcode-auth-gap-05-remint-failed`
 (`deploy/aws/terraform/error-code-alarms.tf`) — errors.jsonl → CW Logs
 `/tickvault/<env>/app` → filter
-`{ $.code = "AUTH-GAP-05" && $.level = "ERROR" && ($.permanent IS TRUE ||
-$.permanent IS FALSE) }` → alarm (≤5 min) → SNS → Telegram.
-**SCOPED to the mint-FAILURE arm** via the `$.permanent` boolean field,
+`{ $.code = "AUTH-GAP-05" && $.level = "ERROR" && $.cooldown_skip IS FALSE }`
+→ alarm (≤5 min) → SNS → Telegram.
+**SCOPED to the mint-FAILURE arm** via the `$.cooldown_skip` boolean field,
 which exists ONLY on the "forced re-mint failed" emission (the
 `flatten_event(true)` JSON layer hoists event fields top-level in
-errors.jsonl): the TRIGGER arm ("forcing re-mint") fires on every episode
+errors.jsonl; `IS FALSE` additionally excludes the same-day Dhan-noise-lock
+H3 mint-cooldown-skip lines — a TokenManager cooldown skip is NOT terminal,
+the next re-arm window retries, and the app Telegram is equally gated
+`!permanent && !cooldown_skip`): the TRIGGER arm ("forcing re-mint") fires
+on every episode
 INCLUDING successful ~30-min self-heals and is operator-ruled noise —
 silent-when-healing, loud-only-when-unobtainable — so it deliberately does
 NOT page here (the HIGH `TokenForcedRemintTriggered` Telegram remains its

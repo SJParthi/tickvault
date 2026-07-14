@@ -16,8 +16,9 @@ REST-leg paging chain was app-emitted Telegram ONLY (GAP-01/GAP-03) with no
 alarm on Telegram drops themselves (GAP-05). Added:
 
 - **+5 errcode log-filter alarms ≈ $0.50/mo** (`error-code-alarms.tf`):
-  `auth-gap-05-remint-failed` (mint-FAILURE arm only — `$.permanent`
-  scoped), `spot1m-01-escalation` + `chain-02-escalation`
+  `auth-gap-05-remint-failed` (mint-FAILURE arm only — `$.cooldown_skip
+  IS FALSE` scoped; excludes the noise-lock H3 non-terminal
+  cooldown-skip lines), `spot1m-01-escalation` + `chain-02-escalation`
   (`stage="escalation"` once-per-episode edges only), `chain-01`,
   `chain-04-warmup`. Their log-derived metrics are sparse/dimensionless
   (billed only in hours a code fires — near-free).
