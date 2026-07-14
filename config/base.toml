@@ -513,6 +513,39 @@ compare_volume           = false    # groww live volume is always 0
 # ===========================================================================
 [spot_1m_rest]
 enabled = true
+# 2026-07-14 serving-delay diagnostics rider: LOG-ONLY one-shot probes
+# (first session fire after boot + once at ~11:00 IST; ≤6 bounded extra
+# requests/day, ~300ms apart, inside the Data-API budget) that log the
+# cross-verify byte-exact day window, the previous-trading-day window and
+# a same-day-to-now window side by side — discriminating vendor serving
+# DELAY from request shape. Never touches fetch/persist/edge behaviour.
+# ON while the 2026-07-14 all-morning empty signature is under
+# investigation; flip to false once the verdict lands.
+diagnostics = true
+# 2026-07-14 architecture optionality (pending the ~15:40 IST sweep-
+# discriminator operator ruling): "per_minute" (default — fire each minute
+# close) or "batch_catchup" (a sweep-style catch-up every
+# batch_interval_minutes instead of per-minute fires — one day-window fetch
+# per SID through the shared Dhan Data-API limiter, persisting everything
+# new above the per-SID watermark). A CONFIG MODE, not a rewrite.
+fetch_mode = "per_minute"
+batch_interval_minutes = 5
+
+# ===========================================================================
+# Shared Dhan Data-API REST pacing (operator directive 2026-07-14: pace
+# Dhan to 3 requests/sec — tunable DOWN to 2 — spread overflow into the
+# next second(s), route the option-chain API through the SAME limiter,
+# with incremental/decremental self-tuning: "if it accepts max 3 or 2,
+# stick to that and split it up"). target_rps is the tuning CAP (legal
+# range 2..=4, rejected at boot outside it); the self-tuner steps down to
+# the 2 rps floor on observed 429 bursts and back up toward this cap on
+# clean streaks. Dhan-ONLY — the Groww legs keep their own budgets.
+# HONESTY: this limiter eliminates 429 waste; it does NOT make Dhan serve
+# same-day candles (the 2026-07-14 0/980 spot regime is a vendor serving
+# question, not a pacing one).
+# ===========================================================================
+[dhan_data_api]
+target_rps = 3
 
 # ===========================================================================
 # Per-minute option-chain REST pipeline (operator grant 2026-07-12 — PR-3,

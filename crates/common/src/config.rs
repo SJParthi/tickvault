@@ -7,7 +7,10 @@ use anyhow::{Result, bail};
 use chrono::NaiveTime;
 use serde::Deserialize;
 
-use crate::constants::SEBI_MAX_ORDERS_PER_SECOND;
+use crate::constants::{
+    DHAN_DATA_API_DEFAULT_TARGET_RPS, DHAN_DATA_API_RPS_CEILING, DHAN_DATA_API_RPS_FLOOR,
+    SEBI_MAX_ORDERS_PER_SECOND,
+};
 use crate::trading_calendar::TradingCalendar;
 
 /// Root application configuration.
@@ -99,6 +102,14 @@ pub struct ApplicationConfig {
     /// section ⇒ DISABLED (fail-safe default off).
     #[serde(default)]
     pub spot_1m_rest: Spot1mRestConfig,
+    /// `[dhan_data_api]` — shared Dhan Data-API REST pacing (operator
+    /// pacing directive 2026-07-14): the process-wide token-bucket limiter
+    /// every per-minute Dhan Data-API REST fire passes through (spot-1m
+    /// fires + ladder re-polls + the 15:33:30 sweep + the #1524 diagnostic
+    /// probes + the option-chain fires). Absent section ⇒ the directed
+    /// 3 rps default. Dhan-ONLY — Groww untouched.
+    #[serde(default)]
+    pub dhan_data_api: DhanDataApiConfig,
     /// `[option_chain_1m]` — per-minute option-chain REST pipeline (operator
     /// grant 2026-07-12, `no-rest-except-live-feed-2026-06-27.md` §8; PR-3,
     /// the OPTION-CHAIN half). Config-gated DEFAULT-OFF pending the
@@ -548,12 +559,153 @@ impl Default for BrutexCrossverifyConfig {
 /// deserializing byte-identically — nothing chain-specific ships in
 /// PR-2; the chain PR adds its own knobs here without a config-surface
 /// break (the `GrowwFeedTuning` sub-table precedent).
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct Spot1mRestConfig {
     /// Master switch for the per-minute spot 1m REST fetcher. Default
     /// OFF (fail-safe) — `config/base.toml` turns it on explicitly.
     #[serde(default)]
     pub enabled: bool,
+    /// 2026-07-14 serving-delay diagnostics rider: one-shot LOG-ONLY
+    /// side-by-side + alternate-window probes (≤6 bounded extra requests
+    /// per day) that discriminate "Dhan serves same-day intraday candles
+    /// with a DELAY" from "our request shape is wrong". Default OFF
+    /// (fail-safe); `config/base.toml` opts in while the 2026-07-14
+    /// all-morning `empty` signature is under investigation. Never touches
+    /// the fetch/persist/edge behaviour.
+    #[serde(default)]
+    pub diagnostics: bool,
+    /// IST seconds-of-day of the SECOND one-shot diagnostics probe (the
+    /// first fires at the first session fire after boot). Default 11:00
+    /// IST — mid-session, far from both the open and the 15:31 cross-verify
+    /// burst. Inert while `diagnostics = false`.
+    #[serde(default = "default_spot1m_diagnostics_second_probe_secs")]
+    pub diagnostics_second_probe_secs_of_day_ist: u32,
+    /// 2026-07-14 architecture optionality (pending the ~15:40 IST
+    /// sweep-discriminator operator ruling): `per_minute` (default —
+    /// today's behaviour) fires each minute close; `batch_catchup`
+    /// replaces the per-minute fires with a sweep-style catch-up every
+    /// [`Self::batch_interval_minutes`] — one day-window fetch per SID
+    /// through the shared Dhan Data-API limiter, persisting everything
+    /// new above the per-SID persisted watermark. A CONFIG MODE, not a
+    /// rewrite (reuses the existing sweep machinery).
+    #[serde(default)]
+    pub fetch_mode: SpotFetchMode,
+    /// Batch catch-up cadence (minutes) — inert while
+    /// `fetch_mode = "per_minute"`. Default 5; validated to 1..=60.
+    #[serde(default = "default_spot1m_batch_interval_minutes")]
+    pub batch_interval_minutes: u32,
+}
+
+/// `[spot_1m_rest] fetch_mode` values (2026-07-14 — see the field doc).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SpotFetchMode {
+    /// Fire each in-session minute close (the shipped PR-2 behaviour).
+    #[default]
+    PerMinute,
+    /// Sweep-style catch-up every `batch_interval_minutes` instead of
+    /// per-minute fires (the batch-architecture option the ~15:40 IST
+    /// sweep-discriminator verdict may select).
+    BatchCatchup,
+}
+
+/// Serde default for [`Spot1mRestConfig::batch_interval_minutes`] — 5.
+fn default_spot1m_batch_interval_minutes() -> u32 {
+    5
+}
+
+impl Spot1mRestConfig {
+    /// Boot-time validation — the batch cadence must be a sane in-session
+    /// interval (1..=60 minutes).
+    ///
+    /// # Errors
+    /// Returns a descriptive error when `batch_interval_minutes` is
+    /// outside `1..=60`.
+    pub fn validate(&self) -> Result<()> {
+        if !(1..=60).contains(&self.batch_interval_minutes) {
+            bail!(
+                "spot_1m_rest.batch_interval_minutes ({}) must be within 1..=60",
+                self.batch_interval_minutes
+            );
+        }
+        Ok(())
+    }
+}
+
+/// `[dhan_data_api]` — shared Dhan Data-API REST pacing (operator pacing
+/// directive 2026-07-14, relayed via the coordinator session: pace Dhan to
+/// 3 requests/sec — tunable DOWN to 2 — spread overflow into the next
+/// second(s), route the option-chain API through the SAME limiter, with
+/// incremental/decremental self-tuning: "if it accepts max 3 or 2, stick
+/// to that and split it up").
+///
+/// `target_rps` is the tuning CAP: the shared limiter starts here and the
+/// self-tuner steps down to the [`DHAN_DATA_API_RPS_FLOOR`] on observed
+/// 429 bursts / back up toward this cap on clean streaks. Legal range
+/// [`DHAN_DATA_API_RPS_FLOOR`]..=[`DHAN_DATA_API_RPS_CEILING`] (2..=4),
+/// rejected at boot by [`Self::validate`]. Absent section ⇒ the directed
+/// 3 rps default. Dhan-ONLY — the Groww legs keep their own budgets.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DhanDataApiConfig {
+    /// Target (cap) requests/second for the shared Dhan Data-API limiter.
+    #[serde(default = "default_dhan_data_api_target_rps")]
+    pub target_rps: u32,
+}
+
+/// Serde default for [`DhanDataApiConfig::target_rps`] — the directed 3.
+fn default_dhan_data_api_target_rps() -> u32 {
+    DHAN_DATA_API_DEFAULT_TARGET_RPS
+}
+
+impl Default for DhanDataApiConfig {
+    fn default() -> Self {
+        Self {
+            target_rps: default_dhan_data_api_target_rps(),
+        }
+    }
+}
+
+impl DhanDataApiConfig {
+    /// Boot-time validation — the pacing cap must stay inside the
+    /// operator-directed ladder (2..=4; 5/sec is the ACCOUNT budget and is
+    /// deliberately never claimable by this process alone).
+    ///
+    /// # Errors
+    /// Returns a descriptive error when `target_rps` is outside the legal
+    /// range.
+    pub fn validate(&self) -> Result<()> {
+        if !(DHAN_DATA_API_RPS_FLOOR..=DHAN_DATA_API_RPS_CEILING).contains(&self.target_rps) {
+            bail!(
+                "dhan_data_api.target_rps ({}) must be within {}..={}",
+                self.target_rps,
+                DHAN_DATA_API_RPS_FLOOR,
+                DHAN_DATA_API_RPS_CEILING
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Serde default for [`Spot1mRestConfig::diagnostics_second_probe_secs_of_day_ist`]
+/// — 11:00 IST as seconds-of-day.
+fn default_spot1m_diagnostics_second_probe_secs() -> u32 {
+    11 * 3600
+}
+
+impl Default for Spot1mRestConfig {
+    /// Manual impl so `Default` matches the serde field defaults exactly
+    /// (a derived `Default` would zero the second-probe instant while an
+    /// empty `[spot_1m_rest]` section deserializes it to 11:00 IST).
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            diagnostics: false,
+            diagnostics_second_probe_secs_of_day_ist: default_spot1m_diagnostics_second_probe_secs(
+            ),
+            fetch_mode: SpotFetchMode::default(),
+            batch_interval_minutes: default_spot1m_batch_interval_minutes(),
+        }
+    }
 }
 
 /// `[tf_consistency]` — daily timeframe-consistency verifier (operator
@@ -2269,6 +2421,13 @@ impl ApplicationConfig {
         // valid, so today's single-conn boot is unaffected).
         self.feeds.groww.scale.validate()?;
 
+        // 2026-07-14 operator pacing directive: the shared Dhan Data-API
+        // limiter cap must stay inside the 2..=4 ladder, and the spot-1m
+        // batch catch-up cadence must be a sane in-session interval —
+        // both rejected at boot, BEFORE any REST task spawns.
+        self.dhan_data_api.validate()?;
+        self.spot_1m_rest.validate()?;
+
         Ok(())
     }
 }
@@ -2660,6 +2819,7 @@ mod tests {
             scoreboard: ScoreboardConfig::default(),
             brutex_crossverify: BrutexCrossverifyConfig::default(),
             spot_1m_rest: Spot1mRestConfig::default(),
+            dhan_data_api: DhanDataApiConfig::default(),
             option_chain_1m: OptionChain1mConfig::default(),
             groww_spot_1m: GrowwSpot1mConfig::default(),
             groww_option_chain_1m: GrowwOptionChain1mConfig::default(),
@@ -4152,6 +4312,172 @@ mod tests {
             .extract()
             .expect("explicit enabled = true must round-trip");
         assert!(on.spot_1m_rest.enabled);
+    }
+
+    /// 2026-07-14 serving-delay diagnostics rider: `diagnostics` is
+    /// FAIL-SAFE default OFF (via `Default`, a missing section, and an
+    /// empty section), the second-probe instant defaults to 11:00 IST on
+    /// BOTH paths (manual `Default` == serde default — no derive drift),
+    /// and the base.toml opt-in shape round-trips.
+    #[test]
+    fn test_spot_1m_rest_diagnostics_defaults_off_with_1100_second_probe() {
+        use figment::Figment;
+        use figment::providers::{Format, Toml};
+
+        let d = Spot1mRestConfig::default();
+        assert!(
+            !d.diagnostics,
+            "diagnostics must default OFF (log-only opt-in)"
+        );
+        assert_eq!(
+            d.diagnostics_second_probe_secs_of_day_ist,
+            11 * 3600,
+            "second probe defaults to 11:00 IST"
+        );
+
+        #[derive(Deserialize)]
+        struct Wrapper {
+            #[serde(default)]
+            spot_1m_rest: Spot1mRestConfig,
+        }
+        // Pre-rider TOML (enabled only) → diagnostics off, probe at 11:00.
+        let old: Wrapper = Figment::new()
+            .merge(Toml::string("[spot_1m_rest]\nenabled = true\n"))
+            .extract()
+            .expect("pre-rider TOML must keep deserializing");
+        assert!(!old.spot_1m_rest.diagnostics);
+        assert_eq!(
+            old.spot_1m_rest.diagnostics_second_probe_secs_of_day_ist,
+            11 * 3600
+        );
+        // The base.toml opt-in shape + an explicit probe override round-trip.
+        let on: Wrapper = Figment::new()
+            .merge(Toml::string(
+                "[spot_1m_rest]\nenabled = true\ndiagnostics = true\n\
+                 diagnostics_second_probe_secs_of_day_ist = 43200\n",
+            ))
+            .extract()
+            .expect("diagnostics opt-in must round-trip");
+        assert!(on.spot_1m_rest.diagnostics);
+        assert_eq!(
+            on.spot_1m_rest.diagnostics_second_probe_secs_of_day_ist,
+            12 * 3600
+        );
+    }
+
+    /// 2026-07-14 operator pacing directive: `[dhan_data_api] target_rps`
+    /// defaults to the directed 3 (via `Default`, a missing section, and
+    /// an empty section), explicit values round-trip, and `validate()`
+    /// rejects anything outside the 2..=4 ladder.
+    #[test]
+    fn test_dhan_data_api_config_default_is_3_and_round_trips() {
+        use figment::Figment;
+        use figment::providers::{Format, Toml};
+
+        assert_eq!(
+            DhanDataApiConfig::default().target_rps,
+            3,
+            "target_rps must default to the operator-directed 3"
+        );
+
+        #[derive(Deserialize)]
+        struct Wrapper {
+            #[serde(default)]
+            dhan_data_api: DhanDataApiConfig,
+        }
+        let missing: Wrapper = Figment::new()
+            .merge(Toml::string("[other]\nx = 1\n"))
+            .extract()
+            .expect("missing [dhan_data_api] must default, not error");
+        assert_eq!(missing.dhan_data_api.target_rps, 3);
+        let empty: Wrapper = Figment::new()
+            .merge(Toml::string("[dhan_data_api]\n"))
+            .extract()
+            .expect("empty [dhan_data_api] must default, not error");
+        assert_eq!(empty.dhan_data_api.target_rps, 3);
+        let two: Wrapper = Figment::new()
+            .merge(Toml::string("[dhan_data_api]\ntarget_rps = 2\n"))
+            .extract()
+            .expect("explicit target_rps must round-trip");
+        assert_eq!(two.dhan_data_api.target_rps, 2);
+    }
+
+    /// The 2..=4 pacing ladder is REJECTED-at-boot enforced: 0/1/5 fail,
+    /// every in-range value passes.
+    #[test]
+    fn test_dhan_data_api_config_validate_rejects_out_of_range() {
+        for bad in [0_u32, 1, 5, 100] {
+            let cfg = DhanDataApiConfig { target_rps: bad };
+            assert!(
+                cfg.validate().is_err(),
+                "target_rps {bad} must be rejected (legal range 2..=4)"
+            );
+        }
+        for good in [2_u32, 3, 4] {
+            let cfg = DhanDataApiConfig { target_rps: good };
+            assert!(cfg.validate().is_ok(), "target_rps {good} must pass");
+        }
+    }
+
+    /// 2026-07-14 fetch-mode flag: defaults to `per_minute` on every path
+    /// (Default / missing key / pre-flag TOML), `batch_catchup` +
+    /// `batch_interval_minutes` parse, and unknown mode strings are
+    /// REJECTED (never silently coerced to a mode).
+    #[test]
+    fn test_spot1m_fetch_mode_defaults_per_minute_and_parses_batch() {
+        use figment::Figment;
+        use figment::providers::{Format, Toml};
+
+        let d = Spot1mRestConfig::default();
+        assert_eq!(d.fetch_mode, SpotFetchMode::PerMinute);
+        assert_eq!(d.batch_interval_minutes, 5);
+
+        #[derive(Deserialize)]
+        struct Wrapper {
+            #[serde(default)]
+            spot_1m_rest: Spot1mRestConfig,
+        }
+        // Pre-flag TOML (enabled only) → per_minute, interval 5.
+        let old: Wrapper = Figment::new()
+            .merge(Toml::string("[spot_1m_rest]\nenabled = true\n"))
+            .extract()
+            .expect("pre-flag TOML must keep deserializing");
+        assert_eq!(old.spot_1m_rest.fetch_mode, SpotFetchMode::PerMinute);
+        assert_eq!(old.spot_1m_rest.batch_interval_minutes, 5);
+        // The batch shape round-trips.
+        let batch: Wrapper = Figment::new()
+            .merge(Toml::string(
+                "[spot_1m_rest]\nenabled = true\nfetch_mode = \"batch_catchup\"\n\
+                 batch_interval_minutes = 10\n",
+            ))
+            .extract()
+            .expect("batch_catchup opt-in must round-trip");
+        assert_eq!(batch.spot_1m_rest.fetch_mode, SpotFetchMode::BatchCatchup);
+        assert_eq!(batch.spot_1m_rest.batch_interval_minutes, 10);
+        // An unknown mode string is an ERROR, never a silent default.
+        let junk: Result<Wrapper, _> = Figment::new()
+            .merge(Toml::string(
+                "[spot_1m_rest]\nfetch_mode = \"warp_speed\"\n",
+            ))
+            .extract();
+        assert!(junk.is_err(), "unknown fetch_mode must be rejected");
+    }
+
+    /// Batch cadence bounds: 0 and 61+ are rejected; 1..=60 pass.
+    #[test]
+    fn test_spot1m_batch_interval_validate_bounds() {
+        let mut cfg = Spot1mRestConfig::default();
+        for bad in [0_u32, 61, 1_000] {
+            cfg.batch_interval_minutes = bad;
+            assert!(
+                cfg.validate().is_err(),
+                "batch_interval_minutes {bad} must be rejected (1..=60)"
+            );
+        }
+        for good in [1_u32, 5, 60] {
+            cfg.batch_interval_minutes = good;
+            assert!(cfg.validate().is_ok(), "interval {good} must pass");
+        }
     }
 
     /// Per-minute option-chain REST pipeline (operator grant 2026-07-12,

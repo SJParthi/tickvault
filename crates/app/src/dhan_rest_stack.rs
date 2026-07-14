@@ -796,6 +796,14 @@ async fn run_dhan_rest_stack(params: DhanRestStackParams) {
             (None, None)
         };
 
+    // 2026-07-14 operator pacing directive: configure the shared Dhan
+    // Data-API limiter cap from `[dhan_data_api] target_rps` BEFORE any
+    // REST task spawns (idempotent; validate() already rejected an
+    // out-of-range value at boot).
+    crate::dhan_data_api_limiter::configure_shared_dhan_data_api_limiter(
+        config.dhan_data_api.target_rps,
+    );
+
     if config.spot_1m_rest.enabled {
         let _spot1m_supervisor = crate::spot_1m_rest_boot::spawn_supervised_spot_1m_rest(
             crate::spot_1m_rest_boot::Spot1mRestTaskParams {
@@ -805,6 +813,12 @@ async fn run_dhan_rest_stack(params: DhanRestStackParams) {
                 questdb: config.questdb.clone(),
                 rest_api_base_url: config.dhan.rest_api_base_url.clone(),
                 minute_done_tx: spot_minute_done_tx,
+                diagnostics_enabled: config.spot_1m_rest.diagnostics,
+                diagnostics_second_probe_secs_of_day_ist: config
+                    .spot_1m_rest
+                    .diagnostics_second_probe_secs_of_day_ist,
+                fetch_mode: config.spot_1m_rest.fetch_mode,
+                batch_interval_minutes: config.spot_1m_rest.batch_interval_minutes,
             },
         );
         info!(

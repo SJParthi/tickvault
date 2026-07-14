@@ -178,6 +178,41 @@ the `stage` field):
    fully-failed and NOT edge-counted), and index candles legitimately
    carry zero volume (never flagged as an error).
 
+**2026-07-14 update — serving-delay diagnostics (empty-class split + one-shot
+probes):** the 2026-07-14 morning ran 21/21 minutes `empty` on all 4 SIDs
+(2xx, no errors, no 429s, healthy token) WITH the #1499 day-granular window
+live — and the single `outcome="empty"` label could not discriminate the two
+very different vendor states behind it. The split (unconditional — honest
+accounting): `outcome="empty_no_rows"` (the 2xx body parsed to ZERO candles
+for the whole day) vs `outcome="empty_stale"` (candles present but none at
+the target minute — the vendor is serving the day with a LAG). Every
+`empty_stale` records the measured SERVING LAG (`target minute open −
+newest candle minute open`, whole seconds) into the
+`tv_spot1m_serving_lag_ms` histogram (dedicated 1 s→6 h buckets via
+`Matcher::Full` in `observability.rs` — the generic `_ms` 60 s cap would
+collapse every meaningful sample into `+Inf`), and the coalesced
+`stage="minute_failed"` line gains `empty_no_rows` / `empty_stale` /
+`rows_in_response` / `last_candle_ist` / `max_serving_lag_secs` fields —
+one glance per minute answers "is Dhan behind, and by how much?". Edge /
+backfill / persist semantics are UNCHANGED (both empty classes still count
+as an empty minute). Companion LOG-ONLY probes, config-gated
+(`[spot_1m_rest] diagnostics`, serde default OFF; base.toml ON while this
+investigation runs): two one-shot moments per day (the first session fire
+after boot + a configurable second instant, default 11:00 IST —
+`diagnostics_second_probe_secs_of_day_ist`), each issuing ≤3 bounded extra
+requests for ONE SID ~300 ms apart (≤6/day, inside the Data-API 5/sec
+budget; a probe only starts with ≥20 s of room before the next boundary and
+otherwise defers) — (a) the 15:31 cross-verify's BYTE-EXACT day window
+(equality unit-pinned: both builders share `intraday_request_body`), (b)
+the previous-trading-day full window (proves settled-data serving), (c) a
+same-day window with `toDate = now`. All three requests' bodies + response
+shapes (rows, first/last candle IST, target presence, serving lag) land
+side by side in ONE structured `info!` line
+("spot_1m_rest diagnostics: one-shot serving-delay probe"). Together with
+the 15:33:30 sweep's verdict this discriminates "Dhan serves same-day
+intraday candles with a DELAY" from "our request shape is wrong". The
+probes never touch the fetch / persist / edge legs.
+
 **Triage:**
 1. `mcp__tickvault-logs__tail_errors` — find `SPOT1M-01`; the payload
    carries `stage`, the failing minute (IST), per-SID outcomes and a
@@ -652,6 +687,76 @@ never-roll). A master that carries no usable FNO rows for an underlying
 degrades THAT underlying via CHAIN-02 `stage="expiry_unresolved"`
 (`feed = "groww"`), never a whole-pipeline CHAIN-04 day-kill.
 
+## §2f. 2026-07-14 — shared self-tuning Dhan Data-API rate limiter (3→2 rps) + spot retry-shaping + fetch-mode flag
+
+**Operator directive (2026-07-14, relayed verbatim via the coordinator
+session):** pace Dhan to 3 requests/sec (tunable DOWN to 2), spread overflow
+into the next second(s), route the option-chain API through the SAME
+limiter, with incremental/decremental self-tuning — *"if it accepts max 3
+or 2, stick to that and split it up"*. Dhan-ONLY; Groww untouched.
+
+**HONESTY (read first):** on 2026-07-14 the spot leg was **0/980 (0%)** with
+**~244 wasted 429s** (the ladder re-fired ~20 req/min against all-empty
+responses; the first two rungs are 0.7s apart → ~8 requests in a rolling
+second at the fire instant) while the chain leg was **735/735 (100%)**. THE
+LIMITER ELIMINATES THE 429 WASTE AND MAKES US A GOOD API CITIZEN — IT DOES
+NOT MAKE DHAN SERVE SAME-DAY CANDLES. The 429s are a symptom of hammering
+empties, not the root cause of the 0%. The per-minute-vs-batch architecture
+question is decided by the separate ~15:40 IST sweep-discriminator verdict;
+this change makes that a CONFIG MODE, not a rewrite.
+
+**The limiter** (`crates/app/src/dhan_data_api_limiter.rs`): ONE
+process-wide async token-bucket gate every per-minute Dhan Data-API REST
+fire passes through — spot-1m fires + ladder re-polls + the 15:33:30 sweep
++ the #1524 diagnostic probes + the option-chain fires + expirylist
+warmup/probe. Routing choke points: `spot_1m_rest_boot::spot_1m_fetch_once`
+and `option_chain_1m_boot::chain_fetch_once` (every enumerated caller
+funnels through them; ratchet
+`crates/app/tests/dhan_data_api_limiter_wiring_guard.rs`). `acquire().await`
+semantics — overflow spills into later seconds, nothing errors or drops.
+The chain's 1-unique-per-3s per-underlying min-gap stays layered on top,
+unchanged. Config: `[dhan_data_api] target_rps = 3` (serde default 3; legal
+range 2..=4 rejected at boot by `ApplicationConfig::validate`).
+
+**Self-tuning levels:** pre-built governor cells per level (2..=4) swapped
+via `ArcSwap` (quotas are fixed at construction); the pure `RpsTuner` FSM
+is fed by REAL StatusCode-429 observations — ≥3 429s in a rolling 2-minute
+window → ONE step DOWN to the 2 rps floor (the operator's literal "step
+DOWN to 2"; at the default target 3 that is also exactly one level); 10
+clean minutes → ONE step back UP one level toward the config cap. Every
+transition is edge-logged once (`error!` down / `info!` up — codeless
+degrade lines, this section is their runbook) + `tv_dhan_data_api_rps`
+gauge + `tv_dhan_data_api_tuner_transitions_total{direction}`.
+
+**Spot retry-shaping:** (a) STALE-WATERMARK CUTOFF — a ladder attempt whose
+parsed day payload carries the SAME last-candle watermark as the previous
+attempt's (including two consecutive zero-row payloads) STOPS the ladder
+for that minute (`tv_spot1m_ladder_watermark_cutoff_total`; re-polling
+cannot outrun a serving delay per the #1524 serving-lag data — the honest
+trade-off is the 1.5–6s marginal-appearance window, repaired by the
+backfill + sweep). (b) ADAPTIVE DEGRADE — after 5 consecutive no-data
+minutes (zero SIDs served), single-attempt-per-minute until ANY success
+re-arms the full ladder (`tv_spot1m_ladder_degraded` gauge, one warn!/info!
+per transition). The pre-existing slot-jitter is KEPT as a harmless
+schedule de-sync — the limiter is the pacing authority now.
+
+**Fetch-mode flag:** `[spot_1m_rest] fetch_mode = "per_minute" |
+"batch_catchup"` (serde default per_minute; `batch_interval_minutes`
+default 5, validated 1..=60). Batch mode = a sweep-style catch-up every K
+minutes through the SAME limiter, reusing the shared
+`sweep_sids_above_watermark` helper (also used by the 15:33:30 sweep) —
+`tv_spot1m_batch_cycles_total{outcome}` + the same SPOT1M-01 FailureEdge
+escalation events per cycle. Default stays per_minute pending the operator
+ruling.
+
+**Triage:** `tv_dhan_data_api_rps` pinned at 2 all session = Dhan keeps
+rejecting the 3 rps pace (cross-check `tv_spot1m_rate_limited_total` +
+`tv_chain1m_fetch_total{outcome="error"}`); a step-down/step-up flap cycle
+is bounded to ≤1 per ~12 min by the 10-minute clean-streak requirement.
+Scope boundary (honest): the boot-time prev-day fetch and the 15:31 bulk
+cross-verify keep their own pacing cells (disjoint windows; not in the
+operator's enumerated scope — unifying them is a flagged follow-up).
+
 ## §3. Delivery boundary (honest — no false-OK)
 
 All six codes (SPOT1M-01/02 + CHAIN-01..04) are **log-sink-only today**: NO `error_code_alerts` map entry in
@@ -724,10 +829,16 @@ This rule activates when editing:
 - `crates/storage/src/rest_fetch_audit_persistence.rs` (the 2026-07-13
   per-fetch forensics table)
 - `crates/common/src/config.rs` (`Spot1mRestConfig` / `OptionChain1mConfig`
-  / `GrowwSpot1mConfig` / `GrowwOptionChain1mConfig` / `GrowwContract1mConfig`)
+  / `GrowwSpot1mConfig` / `GrowwOptionChain1mConfig` / `GrowwContract1mConfig`
+  / `DhanDataApiConfig` / `SpotFetchMode`)
+- `crates/app/src/dhan_data_api_limiter.rs` (the 2026-07-14 shared
+  self-tuning limiter — §2f)
 - Any file containing `SPOT1M-01`, `SPOT1M-02`, `Spot1m01FetchDegraded`,
   `Spot1m02PersistFailed`, `spot_1m_rest`, `SPOT_1M_REST_INDICES`,
-  `tv_spot1m_fetch_total`, `CHAIN-01`, `CHAIN-02`, `CHAIN-03`, `CHAIN-04`,
+  `tv_spot1m_fetch_total`, `tv_spot1m_serving_lag_ms`, `EmptyClass`,
+  `dhan_data_api_limiter`, `tv_dhan_data_api_rps`, `RpsTuner`,
+  `ladder_watermark_repeated`, `LadderDegrade`, `batch_catchup`,
+  `CHAIN-01`, `CHAIN-02`, `CHAIN-03`, `CHAIN-04`,
   `Chain01EntitlementAbsent`, `Chain02FetchDegraded`,
   `Chain03PersistFailed`, `Chain04ExpirylistFailed`, `option_chain_1m`,
   `tv_chain1m_fetch_total`, `GROWW_SPOT_1M_SYMBOLS`, `rest_fetch_audit`,
