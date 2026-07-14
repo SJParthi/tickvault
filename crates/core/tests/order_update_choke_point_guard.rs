@@ -22,9 +22,23 @@ fn production_region(src: &str) -> &str {
 
 /// Bypass needles: any of these outside the parser module is a direct decode
 /// that skips the normalizer/cap/counter choke point.
+///
+/// Refuter-A M2 (2026-07-14): the `::<OrderUpdate` prefix (no closing `>`)
+/// covers BOTH `OrderUpdate` and `OrderUpdateMessage` turbofish targets
+/// across `from_str`/`from_slice`/`from_value`/`from_reader`, and the two
+/// inference-form needles catch typed-binding decodes with no turbofish.
+/// The four fn-qualified prefixes are used (not a bare `::<OrderUpdate`)
+/// so legitimate non-decode turbofish like `channel::<OrderUpdate>` can
+/// never false-positive.
 const BYPASS_NEEDLES: &[&str] = &[
-    "from_str::<OrderUpdateMessage>",
-    "from_value::<OrderUpdateMessage>",
+    "from_str::<OrderUpdate",
+    "from_slice::<OrderUpdate",
+    "from_value::<OrderUpdate",
+    "from_reader::<OrderUpdate",
+    // from_reader's turbofish carries the reader type first — cover the
+    // realistic `from_reader::<_, OrderUpdate…>` form explicitly.
+    "from_reader::<_, OrderUpdate",
+    ": OrderUpdate = serde_json::from_",
     ": OrderUpdateMessage = serde_json::from_",
 ];
 
@@ -124,20 +138,49 @@ fn ratchet_decode_quirk_counter_exists_in_parser() {
     );
 }
 
-// Self-test: the bypass scanner cannot regress to a vacuous pass.
+// Self-test: the bypass scanner cannot regress to a vacuous pass — one
+// planted violation per needle form (Refuter-A M2 evasion coverage).
 #[test]
 fn bypass_scanner_detects_planted_violation() {
     let planted = "let msg = serde_json::from_str::<OrderUpdateMessage>(payload)?;\nlet other = 1;";
     assert_eq!(
         find_bypass_violations(planted),
-        vec!["from_str::<OrderUpdateMessage>"]
+        vec!["from_str::<OrderUpdate"]
+    );
+    let planted_slice = "let msg = serde_json::from_slice::<OrderUpdateMessage>(bytes)?;";
+    assert_eq!(
+        find_bypass_violations(planted_slice),
+        vec!["from_slice::<OrderUpdate"]
+    );
+    let planted_value = "let msg = serde_json::from_value::<OrderUpdate>(v)?;";
+    assert_eq!(
+        find_bypass_violations(planted_value),
+        vec!["from_value::<OrderUpdate"]
+    );
+    let planted_reader = "let msg = serde_json::from_reader::<_, OrderUpdate>(r)?;";
+    assert_eq!(
+        find_bypass_violations(planted_reader),
+        vec!["from_reader::<_, OrderUpdate"]
+    );
+    let planted_reader_direct = "let msg = serde_json::from_reader::<OrderUpdateMessage>(r)?;";
+    assert_eq!(
+        find_bypass_violations(planted_reader_direct),
+        vec!["from_reader::<OrderUpdate"]
     );
     let planted_binding = "let m: OrderUpdateMessage = serde_json::from_value(v)?;";
     assert_eq!(
         find_bypass_violations(planted_binding),
         vec![": OrderUpdateMessage = serde_json::from_"]
     );
+    let planted_inference = "let m: OrderUpdate = serde_json::from_str(s)?;";
+    assert_eq!(
+        find_bypass_violations(planted_inference),
+        vec![": OrderUpdate = serde_json::from_"]
+    );
     assert!(find_bypass_violations("fn clean() {}").is_empty());
+    // Legitimate non-decode turbofish must never false-positive.
+    let legit = "let (tx, rx) = broadcast::channel::<OrderUpdate>(16);";
+    assert!(find_bypass_violations(legit).is_empty());
     // The test-region cut keeps test code out of scope.
     let with_tests = "prod();\n#[cfg(test)]\nmod t { from_str::<OrderUpdateMessage> }";
     assert!(find_bypass_violations(production_region(with_tests)).is_empty());

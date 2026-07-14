@@ -680,23 +680,38 @@ impl OrderManagementSystem {
 
         // Apply corrections (status + fill data).
         //
-        // M2 terminal-regression guard (2026-07-14): the broker GET snapshot
-        // can be STALER than local state (a fill event already applied
-        // locally), so a correction whose LOCAL status is terminal is never
-        // applied — a raw assign would regress a terminal order (e.g. local
-        // Traded reverted to PartTraded) bypassing the state machine. Routing
-        // corrections through the state machine proper is the umbrella
-        // follow-up. Non-terminal corrections apply exactly as before.
+        // M2 terminal-regression guard (2026-07-14, refined per refuter B1):
+        // the broker GET snapshot can be STALER than local state (a fill
+        // event already applied locally), so a correction whose LOCAL status
+        // is terminal NEVER changes `order.status` — a raw assign would
+        // regress a terminal order (e.g. local Traded reverted to
+        // PartTraded) bypassing the state machine. The update's FILL fields
+        // (traded_qty / avg_traded_price) DO apply even on terminal orders:
+        // the broker's fill accounting is authoritative and dropping it
+        // would lose fill data (B1). The skip counter fires ONLY when a
+        // status change was actually suppressed (broker status != local
+        // status). Routing corrections through the state machine proper is
+        // the umbrella follow-up. Non-terminal corrections apply as before.
         let mut skipped_local_terminal: u64 = 0;
         for update in updates {
             if let Some(order) = self.orders.get_mut(&update.order_id) {
                 if order.is_terminal() {
-                    counter!(
-                        "tv_oms_reconcile_corrections_skipped_total",
-                        "reason" => "local_terminal"
-                    )
-                    .increment(1);
-                    skipped_local_terminal = skipped_local_terminal.saturating_add(1);
+                    let status_suppressed = order.status != update.status;
+                    order.traded_qty = update.traded_qty;
+                    order.avg_traded_price = update.avg_traded_price;
+                    order.updated_at_us = now_epoch_us();
+                    if status_suppressed {
+                        counter!(
+                            "tv_oms_reconcile_corrections_skipped_total",
+                            "reason" => "local_terminal"
+                        )
+                        .increment(1);
+                        skipped_local_terminal = skipped_local_terminal.saturating_add(1);
+                    } else {
+                        // Statuses agree — the fill-only correction was
+                        // fully consumed; nothing was suppressed.
+                        order.needs_reconciliation = false;
+                    }
                     continue;
                 }
                 order.status = update.status;
@@ -711,8 +726,9 @@ impl OrderManagementSystem {
             warn!(
                 code = tickvault_common::error_code::ErrorCode::OmsGapReconciliation.code_str(),
                 skipped = skipped_local_terminal,
-                "reconcile corrections skipped — local order status is terminal; \
-                 a stale broker snapshot must not regress a terminal order"
+                "reconcile status corrections suppressed — local order status \
+                 is terminal; a stale broker snapshot must not regress a \
+                 terminal order (fill fields were still applied)"
             );
         }
 
@@ -3074,10 +3090,12 @@ mod tests {
         )
     }
 
-    /// M2 scenario 1: local TRADED + stale broker PART_TRADED snapshot →
-    /// the correction is SKIPPED; local terminal state never regresses.
+    /// M2/B1 scenario 1: local TRADED + stale broker PART_TRADED snapshot
+    /// with qty drift → the FILL fields apply (broker fill accounting is
+    /// authoritative), but the terminal STATUS never regresses; the
+    /// suppressed status change keeps needs_reconciliation set.
     #[tokio::test]
-    async fn live_mode_reconcile_skips_correction_when_local_status_terminal() {
+    async fn live_mode_reconcile_terminal_applies_fill_but_never_status() {
         let body = format!("[{}]", broker_order_json("1", "PART_TRADED", 25));
         let (base_url, handle) = start_oms_mock(200, &body).await;
 
@@ -3090,13 +3108,42 @@ mod tests {
         let report = oms.reconcile().await.unwrap();
         // The mismatch is still REPORTED (OMS-GAP-02 visibility)…
         assert_eq!(report.mismatches_found, 1);
-        // …but the local terminal state is UNCHANGED (skip applied).
         let local = oms.order("1").unwrap();
+        // …the terminal STATUS never regresses…
         assert_eq!(local.status, OrderStatus::Traded);
-        assert_eq!(local.traded_qty, 50);
+        // …but the broker's fill fields DO apply (B1 — no fill-data loss).
+        assert_eq!(local.traded_qty, 25);
         assert!(
             local.needs_reconciliation,
-            "skipped correction must not clear needs_reconciliation"
+            "a suppressed status change must not clear needs_reconciliation"
+        );
+        handle.abort();
+    }
+
+    /// B1 scenario: local CANCELLED qty=0 + broker CANCELLED qty=25 (a
+    /// cancel that partially filled first) → the fill fields apply; the
+    /// statuses agree so NOTHING was suppressed (no skip, update fully
+    /// consumed → needs_reconciliation clears).
+    #[tokio::test]
+    async fn live_mode_reconcile_terminal_fill_only_update_applies_fully() {
+        let body = format!("[{}]", broker_order_json("1", "CANCELLED", 25));
+        let (base_url, handle) = start_oms_mock(200, &body).await;
+
+        let mut oms = make_live_oms(&base_url);
+        oms.orders.insert(
+            "1".to_owned(),
+            make_reconcile_order("1", OrderStatus::Cancelled),
+        );
+
+        let report = oms.reconcile().await.unwrap();
+        // No status mismatch — fill-only drift is not an OMS-GAP-02 page.
+        assert_eq!(report.mismatches_found, 0);
+        let local = oms.order("1").unwrap();
+        assert_eq!(local.status, OrderStatus::Cancelled);
+        assert_eq!(local.traded_qty, 25, "broker fill qty must apply (B1)");
+        assert!(
+            !local.needs_reconciliation,
+            "a fully-consumed fill-only update clears needs_reconciliation"
         );
         handle.abort();
     }
@@ -3124,9 +3171,10 @@ mod tests {
     }
 
     /// M2 scenario 3: other terminal states (CANCELLED, REJECTED) are also
-    /// never regressed by a stale broker snapshot.
+    /// never status-regressed by a stale broker snapshot — while the fill
+    /// fields still apply (B1).
     #[tokio::test]
-    async fn live_mode_reconcile_skips_corrections_for_cancelled_and_rejected() {
+    async fn live_mode_reconcile_skips_status_for_cancelled_and_rejected() {
         let body = format!(
             "[{},{}]",
             broker_order_json("1", "PENDING", 0),
@@ -3146,10 +3194,12 @@ mod tests {
 
         let report = oms.reconcile().await.unwrap();
         assert_eq!(report.mismatches_found, 2);
+        // Terminal statuses never regress…
         assert_eq!(oms.order("1").unwrap().status, OrderStatus::Cancelled);
         assert_eq!(oms.order("1").unwrap().traded_qty, 0);
         assert_eq!(oms.order("2").unwrap().status, OrderStatus::Rejected);
-        assert_eq!(oms.order("2").unwrap().traded_qty, 0);
+        // …but broker fill fields apply even on terminal orders (B1).
+        assert_eq!(oms.order("2").unwrap().traded_qty, 50);
         handle.abort();
     }
 

@@ -101,6 +101,69 @@ fn ratchet_reconcile_body_touches_neither_rate_limiter_nor_circuit_breaker() {
     );
 }
 
+/// Returns true when `region` maps a timeout elapse to the failed-outcome
+/// counter: an `Err(_elapsed)` arm followed (inside the arm) by the
+/// failed-run counter increment.
+fn elapsed_maps_to_failed(region: &str) -> bool {
+    match region.find("Err(_elapsed)") {
+        Some(pos) => region[pos..]
+            .find("m_reconcile_failed.increment(1)")
+            .is_some_and(|off| off < 1200),
+        None => false,
+    }
+}
+
+// B4a — the production Elapsed→failed mapping: the reconcile call stays
+// wrapped in a bounded timeout, and a timeout elapse counts as a FAILED
+// run (outcome="failed" — streak/edge semantics identical to a typed
+// OMS error, never a silent drop).
+#[test]
+fn ratchet_reconcile_timeout_elapse_counts_as_failed() {
+    let src = read_repo_file("src/trading_pipeline.rs");
+    let prod = production_region(&src);
+
+    let reconcile_pos = prod
+        .find("oms.reconcile()")
+        .expect("reconcile call site must exist in the production region");
+    let timeout_pos = prod[..reconcile_pos]
+        .rfind("tokio::time::timeout(")
+        .expect("the reconcile call must be wrapped in tokio::time::timeout");
+    assert!(
+        reconcile_pos - timeout_pos < 200,
+        "oms.reconcile() must be the timeout's bounded future (the wrap \
+         must sit immediately around the call)"
+    );
+    assert!(
+        elapsed_maps_to_failed(&prod[reconcile_pos..]),
+        "the reconcile arm's Err(_elapsed) branch must increment the \
+         failed-run counter (a timeout elapse is a FAILED run)"
+    );
+    assert!(
+        prod.contains(r#"metrics::counter!("tv_oms_reconcile_runs_total", "outcome" => "failed")"#),
+        "the m_reconcile_failed handle must stay bound to the \
+         outcome=failed series"
+    );
+}
+
+// Self-test: the Elapsed→failed scanner cannot regress to a vacuous pass.
+#[test]
+fn elapsed_scanner_detects_planted_regression() {
+    let good = "match tokio::time::timeout(d, oms.reconcile()).await {\n\
+                Err(_elapsed) => { m_reconcile_failed.increment(1); } }";
+    assert!(elapsed_maps_to_failed(good));
+    let renamed_arm = "match tokio::time::timeout(d, oms.reconcile()).await {\n\
+                       Err(e) => { m_reconcile_failed.increment(1); } }";
+    assert!(
+        !elapsed_maps_to_failed(renamed_arm),
+        "a renamed elapsed arm must not satisfy the pin"
+    );
+    let arm_without_count = "Err(_elapsed) => { /* silent */ }";
+    assert!(
+        !elapsed_maps_to_failed(arm_without_count),
+        "an elapsed arm that drops the failed count must trip the pin"
+    );
+}
+
 // R3 — every tracked config TOML keeps [oms_reconcile] OFF; base.toml
 // must carry the explicit disabled section.
 #[test]

@@ -50,9 +50,12 @@ pub const ORDER_UPDATE_MAX_FRAME_BYTES: usize = 262_144;
 /// The live Dhan order-update sample (2026-07-14 runner crawl of
 /// `docs/dhan-ref/10-live-order-update-websocket.md`) carries a camelCase
 /// DUPLICATE cluster ahead of the PascalCase fields — real wire frames may
-/// carry EITHER or BOTH casings. Per-pair rule: accepted-key-wins (identical
-/// to today's derive behavior for every frame that parses today), with the
-/// alternate casing accepted as a fallback when the struct's key is absent.
+/// carry EITHER or BOTH casings. Per-pair rule: accepted-key-wins. The
+/// precise invariant (refuter-C wording, 2026-07-14): output is identical to
+/// the pre-normalizer derive ONLY for frames carrying the accepted key;
+/// alt-casing-only frames now populate values (previously silently
+/// defaulted); previously-`Err` duplicate-key frames now parse last-wins
+/// (spec-blessed JSON duplicate handling).
 const CASING_PAIRS: &[(&str, &str)] = &[
     ("refLtp", "RefLtp"),
     ("tickSize", "TickSize"),
