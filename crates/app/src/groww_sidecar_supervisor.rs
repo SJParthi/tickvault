@@ -3745,3 +3745,58 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod relaunch_grace_tests {
+    use super::*;
+
+    /// Args that make the BASE decision fn return true (stale + in-market +
+    /// enabled) — copied from
+    /// `test_should_restart_on_stall_true_when_stale_market_open_enabled`.
+    fn kill_args() -> (Option<u64>, bool, bool, u64) {
+        (
+            Some(FEED_STALL_RESTART_SECS + 1),
+            true,
+            true,
+            FEED_STALL_RESTART_SECS,
+        )
+    }
+
+    #[test]
+    fn replay_2026_07_14_feed31_child5_no_kill() {
+        // 2026-07-14 14:59 IST replay: feed-level age 31s (stale), child only
+        // 5s old (mid-handshake) — the grace must refuse the kill.
+        let (age, open, enabled, thr) = kill_args();
+        assert!(!should_restart_on_stall_graced(5, age, open, enabled, thr));
+    }
+
+    #[test]
+    fn feed31_child16_kills() {
+        // Same stale feed, child past the 15s grace — a genuinely dead
+        // relaunch still restarts.
+        let (age, open, enabled, thr) = kill_args();
+        assert!(should_restart_on_stall_graced(16, age, open, enabled, thr));
+    }
+
+    #[test]
+    fn boundary_child_age_equals_grace_no_kill() {
+        // Strict `>` boundary: child_age == grace must NOT kill.
+        let (age, open, enabled, thr) = kill_args();
+        assert!(!should_restart_on_stall_graced(
+            FEED_STALL_HANDSHAKE_GRACE_SECS,
+            age,
+            open,
+            enabled,
+            thr
+        ));
+    }
+
+    #[test]
+    fn grace_const_pinned() {
+        assert_eq!(FEED_STALL_HANDSHAKE_GRACE_SECS, 15);
+        assert!(
+            FEED_STALL_HANDSHAKE_GRACE_SECS > 5
+                && FEED_STALL_HANDSHAKE_GRACE_SECS < FEED_STALL_RESTART_SECS
+        );
+    }
+}
