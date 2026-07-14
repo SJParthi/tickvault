@@ -57,6 +57,15 @@
 #   - NSE holiday: cron fires; deploy-aws's own market-hours guard is a no-op
 #     outside trading hours, so the deploy runs harmlessly on holiday windows.
 #   - No new commits → idempotent skip (no restart, no extra cost).
+#   - PR-C3 rider (2026-07-14): scheduled firings inside [08:15, 09:15) IST
+#     (the boot-critical prep band) suppress the DISPATCH — the 08:30/08:45
+#     IST crons no longer restart the app mid-prep; they remain as
+#     scheduler-drop redundancy for postmerge-catchup's overnight deploy-aws
+#     backfill, and manual workflow_dispatch still overrides. A merge landing
+#     in the band deploys via the next slot / postmerge-catchup /
+#     the box-start deploy-watchdog Lambda. ⚠️ envelope: this trades "latest
+#     main shipped at 08:30 sharp" for "no mid-prep restart"; a boot-critical
+#     fix merged 08:15-09:15 needs the operator's manual dispatch.
 # =============================================================================
 
 name: deploy-aws-after-close
@@ -94,8 +103,44 @@ jobs:
           fetch-depth: 1
           ref: main
 
+      # ── PRE-OPEN PREP-WINDOW SUPPRESSION (PR-C3 rider (b), 2026-07-14,
+      # coordinator-approved) ─────────────────────────────────────────────
+      # [08:15, 09:15) IST is the box's boot-critical prep band: the 08:30
+      # auto-start boot, the Groww watch build, the option-chain entitlement
+      # probe and the spot-1m warm-up all run in it. A deploy dispatched
+      # INSIDE the band restarts the app mid-prep — worse than deploying a
+      # few minutes later. This gate suppresses the DISPATCH only (the cron
+      # firing itself stays free): a merge landing in the band deploys via
+      # the next slot / postmerge-catchup / the box-start deploy-watchdog
+      # Lambda (the scheduler-independent stale-binary catch). The 03:00 UTC
+      # (08:30 IST) + 03:15 UTC (08:45 IST) morning crons now serve as
+      # scheduler-drop redundancy for the postmerge-catchup dispatcher's
+      # overnight deploy-aws backfill rather than dispatching mid-prep
+      # themselves; manual workflow_dispatch is NOT suppressed (operator
+      # override stays a real override).
+      - name: Pre-open prep-window gate (08:15-09:15 IST)
+        id: prepwindow
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "manual dispatch — prep-window gate bypassed (operator override)"
+            echo "suppressed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # IST = UTC+05:30 → [08:15, 09:15) IST = [02:45, 03:45) UTC.
+          # 10# forces base-10 so zero-padded "08"/"09" never parse as octal.
+          now_utc_mins=$(( 10#$(date -u +%H) * 60 + 10#$(date -u +%M) ))
+          if [ "$now_utc_mins" -ge 165 ] && [ "$now_utc_mins" -lt 225 ]; then
+            echo "::notice::inside the 08:15-09:15 IST boot-critical prep window — deploy dispatch suppressed (PR-C3 rider, 2026-07-14); the post-close crons / postmerge-catchup / deploy-watchdog cover this merge"
+            echo "suppressed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "outside the prep window — proceeding"
+            echo "suppressed=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Compare main HEAD vs last successful deploy
         id: check
+        if: steps.prepwindow.outputs.suppressed != 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -171,7 +216,9 @@ jobs:
           {
             echo "## Auto-deploy after market close"
             echo ""
-            if [ "${{ steps.check.outputs.dispatch }}" = "true" ]; then
+            if [ "${{ steps.prepwindow.outputs.suppressed }}" = "true" ]; then
+              echo "⏸️  Inside the 08:15-09:15 IST prep window — dispatch suppressed (PR-C3 rider, 2026-07-14)."
+            elif [ "${{ steps.check.outputs.dispatch }}" = "true" ]; then
               echo "✅ Dispatched \`deploy-aws.yml\` on \`main\` — operator sees green/red on the deploy-aws run."
             else
               echo "ℹ️  \`main\` is already deployed — no action taken (idempotent)."
