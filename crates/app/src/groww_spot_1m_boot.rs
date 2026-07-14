@@ -1135,7 +1135,11 @@ async fn groww_fetch_once(
             status: 0,
             rate_limited: false,
             auth_rejected: false,
-            msg: format!("send: {e}"),
+            // Security parity (review LOW, 2026-07-14): reqwest send-leg
+            // errors can echo the request URL/params — bounded +
+            // secret-redacted through the same sanitize choke point as
+            // every other Groww send-error site (chain/contract legs).
+            msg: format!("send: {}", capture_rest_error_body(&e.to_string())),
         })?;
     let status = resp.status();
     if !status.is_success() {
@@ -2020,6 +2024,25 @@ async fn fire_one_minute(
                         "groww_spot_1m: previous minute backfilled from this \
                          fire's full-day response (DEDUP-idempotent)"
                     );
+                    // GAP-11 review MEDIUM 2 (2026-07-14): late recovery —
+                    // an `ok` row keyed on the BACKFILLED minute with the
+                    // honest > 60 s real delay (the Dhan backfill-row
+                    // semantics), HELD until the data flush ACK like the
+                    // own-minute ok row above. Without it a Groww minute
+                    // repaired by backfill read "failed, never recovered"
+                    // in the digest forever (the sweep skips committed
+                    // minutes). Forensics = the own-minute ladder's (the
+                    // backfill was mined from the same 2xx bodies).
+                    held_ok_rows.push(build_fetch_audit_row(
+                        backfill.minute_ts_ist_nanos,
+                        trading_date_nanos,
+                        security_id,
+                        target.symbol,
+                        &forensics,
+                        RestFetchOutcome::Ok,
+                        backfill_close_to_data_ms,
+                        "none",
+                    ));
                     staged.push((security_id, backfill.minute_ts_ist_nanos));
                 }
             }
