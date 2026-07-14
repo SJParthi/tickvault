@@ -79,19 +79,19 @@ pub enum OmsAlert {
         correlation_id: String,
         reason: String,
     },
-    /// Cluster B: a live order was refused by the readiness gate.
+    /// Cluster F: a live order was refused by the readiness gate.
     OrderReadinessRefused {
         reason: &'static str,
         correlation_id: String,
     },
-    /// Cluster B: the order path HALTED after a broker account error.
+    /// Cluster F: the order path HALTED after a broker account error.
     OmsHalted { cause: &'static str, detail: String },
-    /// Cluster B: the DH-904 backoff ladder gave up.
+    /// Cluster F: the DH-904 backoff ladder gave up.
     Dh904LadderExhausted {
         operation: &'static str,
         attempts: u32,
     },
-    /// Cluster B: DATA-805 STOP-ALL cooldown engaged.
+    /// Cluster F: DATA-805 STOP-ALL cooldown engaged.
     OrderApiStopAll { cooldown_secs: u64 },
 }
 
@@ -182,24 +182,24 @@ pub struct OrderManagementSystem {
     /// `None` in tests; `Some` in production. Fires CircuitBreakerOpened/Closed,
     /// RateLimitExhausted, OrderRejected events.
     alert_sink: Option<Box<dyn OmsAlertSink>>,
-    /// Cluster B: order-readiness snapshot (LIVE path only). `None` ⇒ live
+    /// Cluster F: order-readiness snapshot (LIVE path only). `None` ⇒ live
     /// orders REFUSED (fail-closed). Installed by the boot seam.
     readiness: Option<Arc<OrderReadinessState>>,
-    /// Cluster B: DH-901(post-retry)/902/903/DATA-810 halt latch. `reset_daily`
+    /// Cluster F: DH-901(post-retry)/902/903/DATA-810 halt latch. `reset_daily`
     /// does NOT clear it — only `clear_order_halt` or a restart.
     halt: Option<HaltInfo>,
-    /// Cluster B (C3/F-D fix): engine-side edge-latch for the `readiness == None`
+    /// Cluster F (C3/F-D fix): engine-side edge-latch for the `readiness == None`
     /// (unwired-seam) refusal case, where the state-side `refusal_latched` does
     /// not exist. Keeps ORDER-READY-01 "loud once per episode".
     never_probed_latched: bool,
-    /// Cluster B (C2 fix): engine-side per-episode latch for the DATA-805
+    /// Cluster F (C2 fix): engine-side per-episode latch for the DATA-805
     /// STOP-ALL operator alert, so a strategy loop hammering orders during the
     /// 60s cooldown fires ONE Telegram, not N (audit-findings Rule 4). Cleared
     /// when a call succeeds or surfaces a non-805 class (the window ended).
     stop_all_alert_latched: bool,
 }
 
-/// Cluster B: order-path halt record. Set idempotently; cleared only by an
+/// Cluster F: order-path halt record. Set idempotently; cleared only by an
 /// operator (`clear_order_halt`) or a process restart.
 #[derive(Debug, Clone)]
 struct HaltInfo {
@@ -609,30 +609,42 @@ impl OrderManagementSystem {
 
         // ---- LIVE MODE: actual Dhan REST API call ----
 
-        // Sandbox enforcement: block live orders before July 2026.
+        // Sandbox enforcement: block live orders until the sentinel deadline.
         // This is a mechanical safety gate — no real money should be at risk
-        // until the system is fully validated in production.
-        // 2026-07-01T00:00:00 UTC = 1_782_864_000 epoch seconds.
+        // until the operator explicitly re-arms for live.
         //
-        // FIX 2026-04-14 (session 8): the previous value 1_782_777_600 was
-        // ONE DAY TOO EARLY (it was 2026-06-30T00:00:00 UTC). Caught by
+        // 2026-07-14 re-arm (operator cluster-D directive via coordinator):
+        // the previous fn-local 2026-07-01 deadline (1_782_864_000) EXPIRED
+        // silently on 2026-07-01, leaving this gate a no-op. The constant now
+        // lives in `tickvault_common::constants::SANDBOX_DEADLINE_EPOCH_SECS`
+        // (single source of truth, 2099-12-31T00:00:00Z sentinel matching
+        // production.toml's sandbox_only_until) — going live requires editing
+        // that constant with a fresh dated operator quote.
+        //
+        // FIX 2026-04-14 (session 8, retained for history): the original
+        // value 1_782_777_600 was ONE DAY TOO EARLY (2026-06-30T00:00:00
+        // UTC). Caught by
         // `sandbox_enforcement_guard::test_sandbox_deadline_matches_known_utc_epoch`.
-        // Regression test now locks both the constant and the chrono-computed
-        // expected value so this class of bug cannot recur silently.
+        // The guard still locks the constant against a chrono-computed
+        // expected value so that class of bug cannot recur silently.
         #[cfg(not(test))]
         {
-            const SANDBOX_DEADLINE_EPOCH_SECS: i64 = 1_782_864_000;
+            use tickvault_common::constants::SANDBOX_DEADLINE_EPOCH_SECS;
             let now_secs = chrono::Utc::now().timestamp();
             if now_secs < SANDBOX_DEADLINE_EPOCH_SECS {
                 // Session 8 C4: count every block so Grafana can alert on
                 // unexpected live-mode attempts during the sandbox window.
                 metrics::counter!("tv_sandbox_gate_blocks_total").increment(1);
-                error!("SANDBOX ENFORCEMENT: live orders blocked until 2026-07-01");
+                error!(
+                    "SANDBOX ENFORCEMENT: live orders blocked pending explicit \
+                     re-arm (sentinel 2099-12-31; a dated operator quote + \
+                     constant edit are required to go live)"
+                );
                 return Err(OmsError::SandboxEnforcement);
             }
         }
 
-        // Step 3a (Cluster B): live-order readiness gate (fail-closed). Runs
+        // Step 3a (Cluster F): live-order readiness gate (fail-closed). Runs
         // AFTER the sandbox block, BEFORE the token fetch. Cancel is exempt.
         self.check_live_order_gates(OrderEndpoint::Place, &correlation_id)?;
 
@@ -798,7 +810,7 @@ impl OrderManagementSystem {
             return Ok(());
         }
 
-        // Step 3a (Cluster B): live-order readiness gate (fail-closed). Runs
+        // Step 3a (Cluster F): live-order readiness gate (fail-closed). Runs
         // BEFORE the token fetch. Cancel is exempt; Modify is NOT.
         self.check_live_order_gates(OrderEndpoint::Modify, order_id)?;
 
@@ -1134,7 +1146,7 @@ impl OrderManagementSystem {
         self.total_updates = 0;
         self.paper_order_counter = 0;
         self.circuit_breaker.reset();
-        // Cluster B (R8): the order-path halt latch is INTENTIONALLY NOT cleared
+        // Cluster F (R8): the order-path halt latch is INTENTIONALLY NOT cleared
         // here. A broker account-class halt (DH-902/903/…) persists across the
         // daily reset until a deliberate operator `clear_order_halt()`.
         info!(dry_run = self.dry_run, "OMS daily state reset");
@@ -1359,7 +1371,7 @@ fn now_epoch_s() -> u64 {
 }
 
 // ---------------------------------------------------------------------------
-// Cluster B: engine error-policy helpers
+// Cluster F: engine error-policy helpers
 // ---------------------------------------------------------------------------
 
 /// The action the caller takes with the error it still owns after
@@ -3833,7 +3845,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Cluster B: readiness gate + halt latch + engine error policy
+    // Cluster F: readiness gate + halt latch + engine error policy
     // -----------------------------------------------------------------------
 
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};

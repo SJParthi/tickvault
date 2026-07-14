@@ -507,7 +507,12 @@ impl OrderApiClient {
     /// Calculates margin for multiple orders (portfolio margin).
     ///
     /// `POST /v2/margincalculator/multi` — includes position/order context
-    /// and hedge benefit calculation. All response values are STRINGS.
+    /// and hedge benefit calculation. Response margin values are normalized
+    /// to f64 (Dhan's own artifacts split between snake_case strings and
+    /// camelCase floats — 2026-07-14, `docs/dhan-ref/13-funds-margin.md`).
+    /// The REQUEST shape (`dhanClientId`/`includeOrder`/`scripList`) is
+    /// UNVERIFIED-LIVE — live-probe before the first production
+    /// multi-margin caller.
     ///
     /// # Errors
     /// Same as `place_order`.
@@ -1641,7 +1646,7 @@ impl OrderApiClient {
 
     // -----------------------------------------------------------------------
     // Order-path policy wrappers + DH-904 ladder + DATA-805 STOP-ALL latch
-    // (Cluster B). Strictly additive — the methods above are untouched.
+    // (Cluster F). Strictly additive — the methods above are untouched.
     // -----------------------------------------------------------------------
 
     /// O(1) DATA-805 STOP-ALL pre-check. `Err(StopAllCooldown{..})` if latched.
@@ -2355,15 +2360,17 @@ mod tests {
         let client = make_test_client(&base_url);
 
         let request = MultiMarginRequest {
+            dhan_client_id: "TEST-100".to_owned(),
             include_position: true,
-            include_orders: false,
-            scripts: vec![],
+            include_order: false,
+            scrip_list: vec![],
         };
 
         let result = client.calculate_multi_margin("fake-token", &request).await;
         let resp = result.unwrap();
-        assert_eq!(resp.total_margin, "25000.50");
-        assert_eq!(resp.hedge_benefit, "3500.00");
+        // String wire values normalize to f64 (2026-07-14 tolerant parse).
+        assert!((resp.total_margin - 25000.50).abs() < 1e-9);
+        assert!((resp.hedge_benefit - 3500.00).abs() < 1e-9);
 
         handle.abort();
     }
@@ -2987,9 +2994,10 @@ mod tests {
     async fn test_calculate_multi_margin_transport_error() {
         let client = make_test_client("http://127.0.0.1:1");
         let request = MultiMarginRequest {
+            dhan_client_id: "TEST-100".to_owned(),
             include_position: false,
-            include_orders: false,
-            scripts: vec![],
+            include_order: false,
+            scrip_list: vec![],
         };
         let result = client.calculate_multi_margin("fake-token", &request).await;
         assert!(matches!(result.unwrap_err(), OmsError::HttpError(_)));
@@ -3073,9 +3081,10 @@ mod tests {
         let (base_url, handle) = start_mock_server(429, "{}").await;
         let client = make_test_client(&base_url);
         let request = MultiMarginRequest {
+            dhan_client_id: "TEST-100".to_owned(),
             include_position: false,
-            include_orders: false,
-            scripts: vec![],
+            include_order: false,
+            scrip_list: vec![],
         };
         let result = client.calculate_multi_margin("fake-token", &request).await;
         assert!(matches!(result.unwrap_err(), OmsError::DhanRateLimited));
@@ -3228,9 +3237,10 @@ mod tests {
         let (base_url, handle) = start_mock_server(200, "garbage").await;
         let client = make_test_client(&base_url);
         let request = MultiMarginRequest {
+            dhan_client_id: "TEST-100".to_owned(),
             include_position: false,
-            include_orders: false,
-            scripts: vec![],
+            include_order: false,
+            scrip_list: vec![],
         };
         let result = client.calculate_multi_margin("fake-token", &request).await;
         assert!(matches!(result.unwrap_err(), OmsError::JsonError(_)));
@@ -3268,9 +3278,10 @@ mod tests {
         let (base_url, handle) = start_mock_server(400, body).await;
         let client = make_test_client(&base_url);
         let request = MultiMarginRequest {
+            dhan_client_id: "TEST-100".to_owned(),
             include_position: false,
-            include_orders: false,
-            scripts: vec![],
+            include_order: false,
+            scrip_list: vec![],
         };
         let result = client.calculate_multi_margin("fake-token", &request).await;
         assert!(matches!(
@@ -3504,9 +3515,10 @@ mod tests {
         let (base_url, handle) = start_mock_server(500, body).await;
         let client = make_test_client(&base_url);
         let request = MultiMarginRequest {
+            dhan_client_id: "TEST-100".to_owned(),
             include_position: false,
-            include_orders: false,
-            scripts: vec![],
+            include_order: false,
+            scrip_list: vec![],
         };
         let result = client.calculate_multi_margin("fake-token", &request).await;
         match result.unwrap_err() {
@@ -3663,9 +3675,10 @@ mod tests {
         let client = make_test_client(&base_url);
 
         let request = MultiMarginRequest {
+            dhan_client_id: "TEST-100".to_owned(),
             include_position: false,
-            include_orders: false,
-            scripts: vec![],
+            include_order: false,
+            scrip_list: vec![],
         };
         let result = client.calculate_multi_margin("fake-token", &request).await;
 
@@ -4158,9 +4171,10 @@ mod tests {
         let client = make_test_client(&base_url);
 
         let request = MultiMarginRequest {
+            dhan_client_id: "TEST-100".to_owned(),
             include_position: false,
-            include_orders: false,
-            scripts: vec![],
+            include_order: false,
+            scrip_list: vec![],
         };
 
         let result = client.calculate_multi_margin("fake-token", &request).await;
@@ -4181,9 +4195,10 @@ mod tests {
         let client = make_test_client(&base_url);
 
         let request = MultiMarginRequest {
+            dhan_client_id: "TEST-100".to_owned(),
             include_position: false,
-            include_orders: false,
-            scripts: vec![],
+            include_order: false,
+            scrip_list: vec![],
         };
 
         let result = client.calculate_multi_margin("fake-token", &request).await;
@@ -5137,7 +5152,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Cluster B: DH-904 ladder + STOP-ALL latch + policy wrappers
+    // Cluster F: DH-904 ladder + STOP-ALL latch + policy wrappers
     // -----------------------------------------------------------------------
 
     const DH904_BODY: &str = r#"{"errorCode":"DH-904"}"#;

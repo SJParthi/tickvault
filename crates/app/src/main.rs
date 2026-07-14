@@ -720,6 +720,11 @@ async fn main() -> Result<()> {
     let groww_sidecar_options = tickvault_app::groww_sidecar_supervisor::GrowwSidecarOptions {
         archive_s3_bucket: config.feeds.groww.capture_archive_s3_bucket.clone(),
         archive_s3_prefix: config.feeds.groww.capture_archive_s3_prefix.clone(),
+        // FIX-B (2026-07-14): boot-time episode_mode selects the reject-page
+        // cooldown (60s with the GrowwFeed episode fold ON, legacy 1800s when
+        // the episode kill switch is OFF). Runtime config flip = restart,
+        // consistent with how episode_mode itself is consumed.
+        episode_mode: config.notification.episode_mode,
         ..tickvault_app::groww_sidecar_supervisor::GrowwSidecarOptions::default()
     };
     if groww_scale_enabled {
@@ -2938,8 +2943,13 @@ async fn main() -> Result<()> {
         // cross_verify chains all retired. The runtime is now spot-only
         // NIFTY 50 strategy (no VWAP, no futures, no historical fetch).
 
-        notifier.notify(NotificationEvent::Custom {
-            message: "<b>FAST BOOT</b>\nCrash recovery: ticks flowing, all services ready"
+        // FIX-5: this fast arm runs ONLY on a mid-market restart (cache present
+        // AND inside market hours — `should_fast_boot`), i.e. a crash/unexpected
+        // restart during the session. Operator-notable → deliver INSTANTLY, but
+        // Low severity so it never fires an SMS page.
+        notifier.notify(NotificationEvent::CustomStatusUrgent {
+            message: "<b>Fast start</b>\nRestart recovery complete — prices are flowing and all \
+                      services are ready."
                 .to_string(),
         });
 
@@ -3232,6 +3242,32 @@ async fn main() -> Result<()> {
     // Spawned exactly once here; each lane's run is gated at 15:40 on the
     // truthful runtime feed flags. See `spawn_daily_tick_conservation_task`.
     spawn_daily_tick_conservation_task(&config, &trading_calendar, &feed_runtime);
+
+    // Daily 15:25 IST orphan-position watchdog — PROCESS-GLOBAL
+    // (2026-07-14 re-home; the tick-conservation hoist precedent directly
+    // above). The 15:25 orphan-position watchdog previously ran ONLY via the
+    // Dhan-gated `spawn_post_market_tasks` — dead on dhan-off boots since
+    // 2026-07-13 (the Dhan live-WS retirement flipped `dhan_enabled = false`
+    // in prod, so the daily broker-position cross-check never ran); this
+    // process-global spawn closes it. `GlobalAtFireTime` resolves the session
+    // at each 15:25 fire, PREFERRING the live lane-owned TokenManager (fresh
+    // across a runtime lane stop→re-start — the D2c gauge pattern) and
+    // falling back to the global TokenManager (registered by the Dhan lane
+    // OR the Dhan REST stack's Phase 2) — no manager anywhere = LOUD degraded
+    // Critical page, never a clean signal. The fast crash-recovery arm keeps
+    // its Static
+    // spawn via `spawn_post_market_tasks` (that arm early-returns before this
+    // block); the module's once-guard makes a duplicate spawn a no-op.
+    let _orphan_watchdog_global_handle =
+        tickvault_app::orphan_position_watchdog_boot::spawn_supervised_orphan_position_watchdog(
+            tickvault_app::orphan_position_watchdog_boot::WatchdogAuth::GlobalAtFireTime {
+                feed_runtime: std::sync::Arc::clone(&feed_runtime),
+            },
+            notifier.clone(),
+            std::sync::Arc::clone(&trading_calendar),
+            config.dhan.rest_api_base_url.clone(),
+            config.strategy.dry_run,
+        );
 
     // Dual-feed scoreboard (operator 2026-07-10) — PROCESS-GLOBAL like the
     // conservation audit above: the boot-time process-death reconciler + the
@@ -7135,9 +7171,9 @@ async fn start_dhan_lane(
                     "recovered stale tick spill files from previous crashes"
                 );
                 notifier.notify(
-                    tickvault_core::notification::events::NotificationEvent::Custom {
+                    tickvault_core::notification::events::NotificationEvent::CustomStatus {
                         message: format!(
-                            "<b>Tick Recovery</b>\nRecovered {recovered} orphaned ticks from previous crash spill files."
+                            "<b>Recovered saved prices</b>\nRestored {recovered} price updates that were safely saved during the last restart."
                         ),
                     },
                 );
@@ -7153,9 +7189,11 @@ async fn start_dhan_lane(
             );
             notifier.notify(
                 tickvault_core::notification::events::NotificationEvent::Custom {
-                    message: format!(
-                        "<b>CRITICAL: QuestDB UNAVAILABLE</b>\nTick writer in BUFFERING mode: {err}\nTicks buffered to ring buffer + disk spill. Will drain when QuestDB recovers."
-                    ),
+                    // Kept High + actionable (the price database is down at
+                    // startup). Raw `{err}` stays in the `warn!` log above only
+                    // — it is an implementation detail, not for Telegram.
+                    message: "<b>Price database unavailable</b>\nThe price database was not reachable at startup — live prices are being safely saved and will load in automatically once it is back.\nWhat to do now: check the price database service."
+                        .to_string(),
                 },
             );
             // A3: Create writer in disconnected mode — zero tick loss.
@@ -9225,8 +9263,8 @@ async fn start_dhan_lane(
                 {
                     health_notifier.notify(NotificationEvent::Custom {
                         message: format!(
-                            "CRITICAL: LOW DISK SPACE — only {percent_free}% free. \
-                             Tick spill files may fail if disk fills up."
+                            "<b>Low disk space</b>\nOnly {percent_free}% free — please free \
+                             up space so price backups keep working."
                         ),
                     });
                 }
@@ -9243,10 +9281,13 @@ async fn start_dhan_lane(
                 if spill_bytes > 500 * 1024 * 1024 && should_alert(&mut last_spill_alert, cooldown)
                 {
                     // > 500 MB of spill files — QuestDB likely down for extended period.
-                    health_notifier.notify(NotificationEvent::Custom {
+                    // CustomStatus (Low): the root cause is already paged at
+                    // Critical below (QuestDbDisconnected) — this is a
+                    // supporting status ping, not a second page.
+                    health_notifier.notify(NotificationEvent::CustomStatus {
                         message: format!(
-                            "WARNING: Tick spill files total {:.1} MB — QuestDB may be \
-                             down. Data safe on disk but investigate.",
+                            "<b>Price backups growing</b>\n{:.1} MB of prices saved on disk — \
+                             the price database may be slow or down. Your data is safe.",
                             spill_bytes as f64 / (1024.0 * 1024.0)
                         ),
                     });
@@ -9300,10 +9341,10 @@ async fn start_dhan_lane(
                 // C5: Docker container watchdog — detect and restart unhealthy containers.
                 let unhealthy = infra::check_and_restart_containers().await;
                 if unhealthy > 0 && should_alert(&mut last_docker_alert, cooldown) {
-                    health_notifier.notify(NotificationEvent::Custom {
+                    health_notifier.notify(NotificationEvent::CustomStatus {
                         message: format!(
-                            "[Watchdog] {unhealthy} unhealthy Docker container(s) detected. \
-                             Auto-restart triggered via docker compose up -d."
+                            "<b>Background service auto-restarted</b>\n{unhealthy} background \
+                             service(s) were unhealthy and have been automatically restarted."
                         ),
                     });
                 }
@@ -11285,8 +11326,11 @@ pub async fn run_dhan_lane_cold_start(ctx: std::sync::Arc<DhanLaneRuntimeContext
                     "[dhan-lane] runtime cold-start SUCCEEDED (Starting→Running) — main-feed \
                      pool live, ticks flowing; lane idling until disable"
                 );
-                ctx.notifier.notify(NotificationEvent::Custom {
-                    message: "🟢 <b>Dhan feed started</b>\nThe live price feed is now connected \
+                // FIX-5: a feed on/off toggle is an operator action — ack it
+                // INSTANTLY (Immediate) but never SMS (Low). FIX-4: no hardcoded
+                // glyph — dispatch prepends the Low severity emoji.
+                ctx.notifier.notify(NotificationEvent::CustomStatusUrgent {
+                    message: "<b>Dhan feed started</b>\nThe live price feed is now connected \
                               and streaming."
                         .to_string(),
                 });
@@ -11485,8 +11529,13 @@ async fn park_running_dhan_lane(
         // fall back to the global instead of reading this stopped lane's manager.
         ctx.feed_runtime.clear_live_token_manager();
         info!("[dhan-lane] lane torn down (Stopping→Off) — ready to cold-start again on re-enable");
-        ctx.notifier.notify(NotificationEvent::Custom {
-            message: "⚪ <b>Dhan feed stopped</b>\nThe live price feed is now disconnected."
+        // FIX-5: instant toggle ack (Immediate dispatch, Low severity → never
+        // SMS). FIX-4: dropped the redundant hardcoded in-body ⚪ glyph — the
+        // dispatcher already prepends the standard Low-severity ack tag
+        // (`✅ [LOW]`), and the body ("now disconnected") disambiguates the
+        // stop, so a second in-body glyph was pure noise.
+        ctx.notifier.notify(NotificationEvent::CustomStatusUrgent {
+            message: "<b>Dhan feed stopped</b>\nThe live price feed is now disconnected."
                 .to_string(),
         });
         return;
@@ -11636,10 +11685,10 @@ async fn run_process_runloop(
             .with_timezone(&tickvault_common::trading_calendar::ist_offset())
             .date_naive();
         if should_emit_post_market_alert(&trading_calendar, today_ist) {
-            notifier.notify(NotificationEvent::Custom {
-                message:
-                    "<b>Post-Market</b>\nMarket closed — WebSockets disconnected, API stays up"
-                        .to_string(),
+            notifier.notify(NotificationEvent::CustomStatus {
+                message: "<b>Market closed</b>\nThe live price feed has disconnected for the \
+                          day; the system stays running."
+                    .to_string(),
             });
         } else {
             info!(
@@ -14612,20 +14661,27 @@ fn spawn_post_market_tasks(
         );
         return;
     }
-    // Phase 0 Item 20 (wired 2026-06-13): supervised 15:25 IST orphan-position
-    // watchdog — the daily open-position safety gate. Alert-only in
-    // sandbox/dry-run (no order/cancel call exists on any path); pages CRITICAL
-    // every day open positions exist (NOT edge-suppressed — it is a compliance
-    // gate). Supervised respawn + busy-loop floor + secret-redacted REST errors
-    // per the 2026-06-13 3-agent adversarial review. Called from BOTH boot
-    // paths (boot-symmetry) so a mid-session restart re-arms it.
+    // Phase 0 Item 20 (wired 2026-06-13; auth re-homed 2026-07-14): supervised
+    // 15:25 IST orphan-position watchdog — the daily open-position safety gate.
+    // Alert-only in sandbox/dry-run (no order/cancel call exists on any path);
+    // pages CRITICAL every day open positions exist (NOT edge-suppressed — it
+    // is a compliance gate). Supervised respawn + busy-loop floor +
+    // secret-redacted REST errors per the 2026-06-13 3-agent adversarial
+    // review. Since 2026-07-14 the PRIMARY spawn lives in the process-global
+    // prefix (`WatchdogAuth::GlobalAtFireTime`) so dhan-off boots are covered;
+    // THIS family-site spawn keeps the fast crash-recovery arm's coverage with
+    // the boot-time handles (`Static` — byte-identical to the pre-2026-07-14
+    // behaviour). The module's once-guard makes whichever call site runs
+    // second a no-op, so a double 15:25 page is structurally impossible.
     let _orphan_watchdog_handle =
         tickvault_app::orphan_position_watchdog_boot::spawn_supervised_orphan_position_watchdog(
-            token_handle.clone(),
+            tickvault_app::orphan_position_watchdog_boot::WatchdogAuth::Static {
+                token_handle: token_handle.clone(),
+                client_id: client_id.clone(),
+            },
             notifier.clone(),
             std::sync::Arc::clone(&trading_calendar),
             config.dhan.rest_api_base_url.clone(),
-            client_id.clone(),
             config.strategy.dry_run,
         );
     // Phase 0 Item 22d (2026-05-15): End-of-day digest at

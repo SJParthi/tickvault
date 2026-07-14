@@ -1,4 +1,4 @@
-//! Source-scan ratchets for the Cluster B Dhan order-path error taxonomy,
+//! Source-scan ratchets for the Cluster F Dhan order-path error taxonomy,
 //! the fail-closed order-readiness gate and the DH-904 backoff ladder.
 //!
 //! House pattern (`api_token_rotation_wiring_guard.rs` /
