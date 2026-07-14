@@ -83,7 +83,12 @@
 12. **Multi response is YAML-only** (the portal page documents no body):
     `orderStatus` is a 10-value enum incl. `MODIFIED`/`INACTIVE` beyond the
     repo's 9-variant `OrderStatus` — UNVERIFIED-LIVE; parse as a plain
-    String, never panic on unknown values (annexure rule 15).
+    String, never panic on unknown values (annexure rule 15). The client
+    tolerates the PORTAL-documented bodyless 200 (empty/whitespace body →
+    empty per-leg results, `place_multi_order` 2026-07-14 round-3 fix) — a
+    200 means the legs are ALREADY placed, and a parse brick would invite a
+    double-placing retry; a NON-empty unparsable 200 body stays a typed
+    JSON error (which legs went live is then genuinely unknown).
 
 13. **Strict lowerCamelCase serde everywhere** in this family
     (`dhanClientId`, `comparisonType`, `timeFrame`, `alertId`,

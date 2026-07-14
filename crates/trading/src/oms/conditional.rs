@@ -42,6 +42,12 @@ const MAX_CORRELATION_ID_CHARS: usize = 30;
 /// Max `securityId` length (docs: <= 20 characters; empty fail-closed refused).
 const MAX_SECURITY_ID_CHARS: usize = 20;
 
+/// Max `dhanClientId` length. The docs type it only as "string, Required"
+/// (live-docs §3.2/§9.1); real Dhan client IDs are short numeric account
+/// identifiers (the `1106656882` class), so 20 is a generous fail-closed
+/// bound against runaway/garbage inputs while tolerating any plausible ID.
+const MAX_DHAN_CLIENT_ID_CHARS: usize = 20;
+
 // ---------------------------------------------------------------------------
 // Segment locks (fail-closed)
 // ---------------------------------------------------------------------------
@@ -315,6 +321,12 @@ pub enum ConditionalBuildError {
     /// Correlation ID longer than 30 chars or outside `[a-zA-Z0-9 _-]`.
     #[error("correlation id invalid: max 30 chars of [a-zA-Z0-9 _-]")]
     BadCorrelationId,
+    /// Dhan client ID empty, overlong, or outside ASCII alphanumerics
+    /// (docs mark `dhanClientId` Required on both endpoints — an empty or
+    /// whitespace/BiDi-carrying ID is a guaranteed-invalid order body,
+    /// refused locally instead of burning an Order-API slot on a DH-905).
+    #[error("dhan client id invalid: must be 1..=20 ASCII alphanumeric chars")]
+    BadDhanClientId,
     /// Expiry date not in `YYYY-MM-DD` form.
     #[error("expDate must be YYYY-MM-DD")]
     BadExpDate,
@@ -552,6 +564,25 @@ fn validate_common_leg(
     Ok(())
 }
 
+/// Validates the mandatory `dhanClientId`: 1..=20 ASCII alphanumeric chars.
+/// The docs mark it Required on BOTH family endpoints (live-docs §3.2/§9.1);
+/// an empty string would serialize `"dhanClientId":""` — a guaranteed-
+/// invalid order body from a module whose contract is fail-closed typed
+/// refusals. ASCII-alphanumeric-only also refuses whitespace, control, BiDi
+/// and multi-byte garbage fail-closed (real Dhan IDs are numeric strings).
+fn validate_dhan_client_id(dhan_client_id: &str) -> Result<(), ConditionalBuildError> {
+    if dhan_client_id.is_empty() || dhan_client_id.len() > MAX_DHAN_CLIENT_ID_CHARS {
+        return Err(ConditionalBuildError::BadDhanClientId);
+    }
+    if !dhan_client_id
+        .chars()
+        .all(|character| character.is_ascii_alphanumeric())
+    {
+        return Err(ConditionalBuildError::BadDhanClientId);
+    }
+    Ok(())
+}
+
 /// Validates an optional `correlationId`: <= 30 chars of `[a-zA-Z0-9 _-]`.
 fn validate_correlation_id(correlation_id: &str) -> Result<(), ConditionalBuildError> {
     if correlation_id.chars().count() > MAX_CORRELATION_ID_CHARS {
@@ -719,12 +750,15 @@ pub fn build_trigger_order(spec: &TriggerOrderSpec) -> Result<TriggerOrder, Cond
 /// `None` here (Place semantics) — use [`with_alert_id`] for the Modify echo.
 ///
 /// # Errors
+/// - [`ConditionalBuildError::BadDhanClientId`] on an empty / overlong /
+///   non-ASCII-alphanumeric `dhan_client_id` (docs: Required)
 /// - [`ConditionalBuildError::LegCountOutOfBounds`] on 0 or >15 legs
 pub fn build_conditional_trigger_request(
     dhan_client_id: &str,
     condition: TriggerCondition,
     orders: Vec<TriggerOrder>,
 ) -> Result<DhanConditionalTriggerRequest, ConditionalBuildError> {
+    validate_dhan_client_id(dhan_client_id)?;
     let count = orders.len();
     if count == 0 || count > DHAN_CONDITIONAL_MAX_ORDERS_PER_REQUEST {
         return Err(ConditionalBuildError::LegCountOutOfBounds { count });
@@ -757,11 +791,14 @@ pub fn with_alert_id(
 /// coupling; prices convert paise → f64 rupees (exact within the cap).
 ///
 /// # Errors
-/// Every refusal is a typed [`ConditionalBuildError`].
+/// Every refusal is a typed [`ConditionalBuildError`], including
+/// [`ConditionalBuildError::BadDhanClientId`] on an empty / overlong /
+/// non-ASCII-alphanumeric `dhan_client_id` (docs: Required).
 pub fn build_multi_order_request(
     dhan_client_id: &str,
     specs: &[MultiOrderLegSpec],
 ) -> Result<DhanMultiOrderRequest, ConditionalBuildError> {
+    validate_dhan_client_id(dhan_client_id)?;
     let count = specs.len();
     if count == 0 || count > DHAN_CONDITIONAL_MAX_ORDERS_PER_REQUEST {
         return Err(ConditionalBuildError::LegCountOutOfBounds { count });
@@ -1294,6 +1331,44 @@ mod tests {
     }
 
     #[test]
+    fn test_build_requests_reject_bad_dhan_client_id_boundary_empty_21_chars_charset() {
+        let leg = build_trigger_order(&limit_leg_spec()).unwrap();
+        // Empty, whitespace, BiDi, control, and 21-char IDs refused on BOTH
+        // builders (docs mark dhanClientId Required — an empty ID is a
+        // guaranteed-invalid order body, refused locally).
+        let twenty_one = "1".repeat(21);
+        for bad in ["", " ", "  100", "110\u{202E}882", "10\n0", &twenty_one] {
+            assert!(
+                matches!(
+                    build_conditional_trigger_request(bad, valid_condition(), vec![leg.clone()]),
+                    Err(ConditionalBuildError::BadDhanClientId)
+                ),
+                "conditional builder must refuse dhanClientId {bad:?}"
+            );
+            assert!(
+                matches!(
+                    build_multi_order_request(bad, &[multi_leg_spec()]),
+                    Err(ConditionalBuildError::BadDhanClientId)
+                ),
+                "multi builder must refuse dhanClientId {bad:?}"
+            );
+        }
+        // 20 chars (inclusive boundary) and the real numeric-ID shape pass.
+        let twenty = "1".repeat(20);
+        for good in [twenty.as_str(), "1106656882", "100"] {
+            assert!(
+                build_conditional_trigger_request(good, valid_condition(), vec![leg.clone()])
+                    .is_ok(),
+                "conditional builder must accept dhanClientId {good:?}"
+            );
+            assert!(
+                build_multi_order_request(good, &[multi_leg_spec()]).is_ok(),
+                "multi builder must accept dhanClientId {good:?}"
+            );
+        }
+    }
+
+    #[test]
     fn test_with_alert_id_sets_field() {
         let leg = build_trigger_order(&limit_leg_spec()).unwrap();
         let request =
@@ -1481,6 +1556,7 @@ mod tests {
     proptest::proptest! {
         #[test]
         fn proptest_build_multi_order_request_never_panics_on_arbitrary_spec(
+            dhan_client_id in ".{0,24}",
             segment_is_bse in proptest::prelude::any::<bool>(),
             sell in proptest::prelude::any::<bool>(),
             product_idx in 0usize..6,
@@ -1531,8 +1607,8 @@ mod tests {
                 correlation_id,
                 amo: amo_idx.map(|idx| amo_times[idx]),
             };
-            // Ok or typed Err — never a panic.
-            let _ = build_multi_order_request("100", &[spec]);
+            // Ok or typed Err — never a panic (client id fuzzed too).
+            let _ = build_multi_order_request(&dhan_client_id, &[spec]);
         }
     }
 }
