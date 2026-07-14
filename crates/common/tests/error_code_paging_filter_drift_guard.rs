@@ -220,11 +220,18 @@ fn is_test_cfg(attr: &str) -> bool {
 /// non-attribute line, covering `#[cfg(all(test, feature = …))] mod`
 /// too. Test-gated NON-module items (statics, fns, fields) stay in the
 /// scanned region — at worst a few test-only items are visible, never
-/// is a production emit hidden. Brace matching is string-aware
-/// (`hcl_brace_delta` — quotes + escapes tracked); char literals /
-/// lifetimes are not tracked (no real test module carries an unbalanced
-/// brace char literal — documented residual, same as the comment
-/// stripper's `'` note).
+/// is a production emit hidden. Brace matching is string-aware (quotes +
+/// escapes tracked); TWO documented residuals (2026-07-14 mutation
+/// review): (a) char literals / lifetimes are not tracked (no real test
+/// module carries an unbalanced brace char literal — same as the comment
+/// stripper's `'` note); (b) RAW string literals (`r#"…"#`) are not
+/// specially tracked — a raw string containing an ODD number of `"`
+/// characters would desync the quote-parity state and could mis-scope a
+/// module boundary (a possible silent false-ALIVE on the emit-site
+/// check). No `.rs` file scanned by this guard currently carries an
+/// odd-quote-parity raw string inside or around a test module; if one
+/// ever appears, upgrade the scanner to a raw-string-aware lexer in the
+/// same PR.
 fn production_view(body: &str) -> String {
     excise_test_modules(&strip_rust_comments(body))
 }
