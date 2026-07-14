@@ -4684,6 +4684,7 @@ mod tests {
         let client = make_test_client(&url);
         let req = DhanModifySuperOrderRequest {
             dhan_client_id: "100".to_string(),
+            order_id: "SO-1".to_string(),
             leg_name: "TARGET_LEG".to_string(),
             order_type: None,
             quantity: None,

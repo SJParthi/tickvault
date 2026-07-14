@@ -8,6 +8,8 @@
 //! - `circuit_breaker` — Dhan API circuit breaker
 //! - `idempotency` — UUID v4 correlation ID tracking
 //! - `reconciliation` — REST-based state sync
+//! - `exit_rules` — pure exit-order rules (slicing math, OCO/CNC-MTF
+//!   validation, MPP verdict classification, verify backoff ladder)
 //! - `engine` — Orchestrator composing all sub-components
 //!
 //! # Architecture
@@ -32,6 +34,7 @@ pub mod api_client;
 pub mod circuit_breaker;
 pub mod dh904_backoff;
 pub mod engine;
+pub mod exit_rules;
 pub mod idempotency;
 pub mod rate_limiter;
 pub mod reconciliation;
@@ -41,7 +44,10 @@ pub mod types;
 // Re-export key types for ergonomic use.
 pub use api_client::OrderApiClient;
 pub use engine::{OrderManagementSystem, TokenProvider};
+pub use exit_rules::ExitCommand;
 pub use rate_limiter::OrderRateLimiter;
 pub use types::{
-    ManagedOrder, ModifyOrderRequest, OmsError, PlaceOrderRequest, ReconciliationReport,
+    ExecutionVerdict, ManagedOrder, ManagedSuperOrder, ModifyOrderRequest, ModifySuperOrderLeg,
+    OcoSecondLeg, OmsError, PlaceForeverOcoRequest, PlaceOrderRequest, PlaceSuperOrderRequest,
+    ReconciliationReport, SlicingResponse, SuperOrderPlacement,
 };
