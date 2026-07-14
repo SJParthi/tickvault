@@ -101,9 +101,9 @@ use tickvault_common::constants::{
     GROWW_API_VERSION_HEADER, GROWW_API_VERSION_VALUE, GROWW_CHAIN_1M_FALLBACK_DELAY_MS,
     GROWW_CHAIN_1M_MASTER_RETRY_BACKOFF_SECS, GROWW_CHAIN_1M_MAX_BODY_BYTES,
     GROWW_CHAIN_1M_MIN_GAP_MS, GROWW_CHAIN_1M_REQUEST_TIMEOUT_SECS,
-    GROWW_CHAIN_1M_UNDERLYING_BUDGET_SECS, GROWW_CHAIN_1M_UNDERLYINGS,
-    GROWW_OPTION_CHAIN_URL_PREFIX, IST_UTC_OFFSET_SECONDS, SECONDS_PER_DAY,
-    SPOT_1M_REST_LAST_FIRE_SECS_OF_DAY_IST,
+    GROWW_CHAIN_1M_UNDERLYING_BUDGET_SECS, GROWW_CHAIN_1M_UNDERLYING_NOT_SERVED_THRESHOLD,
+    GROWW_CHAIN_1M_UNDERLYINGS, GROWW_OPTION_CHAIN_URL_PREFIX, IST_UTC_OFFSET_SECONDS,
+    SECONDS_PER_DAY, SPOT_1M_REST_LAST_FIRE_SECS_OF_DAY_IST,
 };
 use tickvault_common::error_code::ErrorCode;
 use tickvault_common::sanitize::capture_rest_error_body;
@@ -836,6 +836,113 @@ async fn fetch_groww_chain_bounded(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Pure per-underlying not-served detector (2026-07-14 — the NIFTY
+// expiry-day vendor-cutoff companion: Groww stopped serving the
+// same-day-expiring NIFTY chain at 14:54 IST while BANKNIFTY + SENSEX
+// kept working, and the ok==0 escalation edge paged nobody all
+// afternoon; mirrors the spot leg's SidServedTracker)
+// ---------------------------------------------------------------------------
+
+/// What the caller must do for ONE underlying after recording a minute's
+/// per-underlying served verdicts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnderlyingEdgeAction {
+    /// Nothing to page for this underlying this minute.
+    None,
+    /// RISING edge: this underlying reached
+    /// [`GROWW_CHAIN_1M_UNDERLYING_NOT_SERVED_THRESHOLD`] consecutive
+    /// counted not-served minutes (each with ≥1 sibling success) — page
+    /// ONCE (High), latched until this underlying's own recovery.
+    Page { consecutive: u32 },
+    /// FALLING edge: a paged underlying's chain was served again — one
+    /// Info ping; the latch re-arms.
+    Recover { not_served_minutes: u32 },
+}
+
+/// Per-underlying not-served state: consecutive COUNTED not-served
+/// minutes + the page latch.
+#[derive(Debug, Default)]
+struct UnderlyingServedState {
+    consecutive_not_served: u32,
+    paged: bool,
+}
+
+/// Per-underlying "is the vendor serving this chain?" tracker.
+/// Distinguishes vendor-not-serving-ONE-underlying from a global outage:
+///
+/// | This minute, this underlying | ≥1 OTHER underlying served? | Effect on this underlying |
+/// |---|---|---|
+/// | served (chain with strikes retrieved) | — | streak reset; `Recover` if paged |
+/// | not served (empty OR error) | yes | streak +1; `Page` once at the threshold |
+/// | not served | no (global outage) | HOLD — neither counts nor resets |
+///
+/// The global-outage HOLD keeps the two signals disjoint for the
+/// FETCH-failure class: a full fetch outage (ok == 0) is the
+/// [`FailureEdge`] escalation's page, this edge needs ≥1 OK — mutually
+/// exclusive per minute WITHIN that class. HONEST OVERLAP: a
+/// persist-failed minute with ok ≥ 1 can legitimately count toward BOTH
+/// edges (the M1 gate makes the escalation edge count it fully-failed
+/// while an empty sibling counts here) — two DISTINCT signals:
+/// persistence broken + vendor not serving one underlying. "Served" is
+/// FETCH-level (`Found`): the vendor-serving question — persist
+/// failures are OUR side and already feed the escalation edge via the
+/// spot-M1 persist gate. Pure state machine — unit-tested without a
+/// clock. State is per scheduler run (session-scoped, same envelope as
+/// [`FailureEdge`] — a task respawn restarts the streak; the run itself
+/// is per trading day).
+#[derive(Debug, Default)]
+pub struct UnderlyingServedTracker {
+    per_underlying: std::collections::HashMap<&'static str, UnderlyingServedState>,
+}
+
+impl UnderlyingServedTracker {
+    /// Record one fired minute's per-underlying served verdicts
+    /// (`served` = a chain with strikes was retrieved for that underlying
+    /// this fire) and return one action per input underlying,
+    /// index-aligned with `verdicts`.
+    pub fn record_minute(
+        &mut self,
+        verdicts: &[(&'static str, bool)],
+    ) -> Vec<(&'static str, UnderlyingEdgeAction)> {
+        let any_served = verdicts.iter().any(|&(_, served)| served);
+        verdicts
+            .iter()
+            .map(|&(underlying, served)| {
+                let state = self.per_underlying.entry(underlying).or_default();
+                let action = if served {
+                    let not_served_minutes = state.consecutive_not_served;
+                    let was_paged = state.paged;
+                    state.consecutive_not_served = 0;
+                    state.paged = false;
+                    if was_paged {
+                        UnderlyingEdgeAction::Recover { not_served_minutes }
+                    } else {
+                        UnderlyingEdgeAction::None
+                    }
+                } else if any_served {
+                    state.consecutive_not_served = state.consecutive_not_served.saturating_add(1);
+                    if !state.paged
+                        && state.consecutive_not_served
+                            >= GROWW_CHAIN_1M_UNDERLYING_NOT_SERVED_THRESHOLD
+                    {
+                        state.paged = true;
+                        UnderlyingEdgeAction::Page {
+                            consecutive: state.consecutive_not_served,
+                        }
+                    } else {
+                        UnderlyingEdgeAction::None
+                    }
+                } else {
+                    // Global-outage minute (no underlying served): HOLD.
+                    UnderlyingEdgeAction::None
+                };
+                (underlying, action)
+            })
+            .collect()
+    }
+}
+
 /// One minute-close fire: SEQUENTIAL bounded chain fetches for the
 /// resolved underlyings (pacing rule — at most one in-flight request) →
 /// per-leg rows via `append_row_ext` (rho + measured close→data delay) →
@@ -851,6 +958,7 @@ async fn fire_one_groww_chain_minute(
     writer: &mut OptionChain1mWriter,
     audit_writer: &mut RestFetchAuditWriter,
     edge: &mut FailureEdge,
+    not_served: &mut UnderlyingServedTracker,
     token_cache: &mut GrowwTokenCache,
     fire_secs_of_day: u32,
 ) {
@@ -868,6 +976,16 @@ async fn fire_one_groww_chain_minute(
     // persisted minute is NOT ok — a day-long QuestDB outage must page.
     let mut persist_failed = false;
     let mut sample_failure: Option<String> = None;
+    // Per-underlying FETCH-level served verdicts (`Found` = served) for
+    // the not-served detector — the vendor-serving question, deliberately
+    // NOT persist-gated (persist failures are ours; the escalation edge
+    // owns them via the M1 gate).
+    let mut served_verdicts: Vec<(&'static str, bool)> = Vec::with_capacity(targets.len());
+    // An auth-class abort is a GLOBAL token condition: even when an
+    // earlier underlying succeeded, the skipped remainder must not gain
+    // counted not-served minutes — the whole fire becomes a tracker HOLD
+    // (the sink is skipped below; neither count nor reset for anyone).
+    let mut auth_aborted = false;
 
     if let Some(token) = token_cache.ensure_token().await {
         for (idx, target) in targets.iter().enumerate() {
@@ -892,6 +1010,7 @@ async fn fire_one_groww_chain_minute(
                     payload_bytes,
                 } => {
                     ok_count = ok_count.saturating_add(1);
+                    served_verdicts.push((target.underlying, true));
                     // PR-4: hand the contract leg its ATM anchor — only a
                     // REAL vendor LTP updates it (an omitted/zero LTP never
                     // erases a previous good anchor). The observation stamp
@@ -1040,6 +1159,7 @@ async fn fire_one_groww_chain_minute(
                 }
                 GrowwChainFetchOutcome::Empty => {
                     empty_count = empty_count.saturating_add(1);
+                    served_verdicts.push((target.underlying, false));
                     metrics::counter!("tv_groww_chain1m_fetch_total", "outcome" => "empty")
                         .increment(1);
                     if sample_failure.is_none() {
@@ -1065,6 +1185,7 @@ async fn fire_one_groww_chain_minute(
                 }
                 GrowwChainFetchOutcome::Failed(failure) => {
                     error_count = error_count.saturating_add(1);
+                    served_verdicts.push((target.underlying, false));
                     metrics::counter!("tv_groww_chain1m_fetch_total", "outcome" => "error")
                         .increment(1);
                     if sample_failure.is_none() {
@@ -1100,6 +1221,7 @@ async fn fire_one_groww_chain_minute(
                 // every further request with the same rejected token is a
                 // doomed 401. The next fire's ensure_token re-reads SSM at
                 // the ≥60s floor; NEVER a mint.
+                auth_aborted = true;
                 token_cache.note_auth_rejected();
                 let remaining = &targets[idx + 1..];
                 if !remaining.is_empty() {
@@ -1111,6 +1233,7 @@ async fn fire_one_groww_chain_minute(
                          requests); forensics rows still emitted"
                     );
                     for skipped in remaining {
+                        served_verdicts.push((skipped.underlying, false));
                         metrics::counter!("tv_groww_chain1m_fetch_total", "outcome" => "error")
                             .increment(1);
                         let row = build_chain_audit_row(
@@ -1156,6 +1279,9 @@ async fn fire_one_groww_chain_minute(
         error_count = targets.len();
         sample_failure = Some("no shared Groww access token available at fire time".to_string());
         for target in targets {
+            // All not-served with zero served siblings → the tracker's
+            // global-outage HOLD arm (neither counts nor resets).
+            served_verdicts.push((target.underlying, false));
             metrics::counter!("tv_groww_chain1m_fetch_total", "outcome" => "error").increment(1);
             let row = build_chain_audit_row(
                 target_minute_nanos,
@@ -1185,6 +1311,9 @@ async fn fire_one_groww_chain_minute(
         persist_failed,
         sample_failure.as_deref(),
     );
+    if !auth_aborted {
+        record_groww_chain_underlying_verdicts(params, not_served, &served_verdicts, &minute_label);
+    }
 }
 
 /// Coalesced per-minute verdict: ONE coded log per fired minute with any
@@ -1251,6 +1380,76 @@ fn record_groww_chain_minute_verdict(
                     "CHAIN-02: Groww per-minute chain fetch degraded for this minute"
                 );
             }
+        }
+    }
+}
+
+/// 2026-07-14 not-served companion: feed one fired minute's
+/// per-underlying FETCH-level served verdicts into the
+/// [`UnderlyingServedTracker`] and emit the edge-latched per-underlying
+/// page / recovery ping + the per-counted-minute counter
+/// (`tv_groww_chain1m_underlying_not_served_total{underlying}` — 3
+/// static label values, the pinned plain symbols). Counting semantics
+/// live in the tracker doc. Skipped-boundary minutes deliberately never
+/// reach this sink (nothing was fetched for ANY underlying — the HOLD
+/// arm by construction).
+fn record_groww_chain_underlying_verdicts(
+    params: &GrowwChain1mTaskParams,
+    not_served: &mut UnderlyingServedTracker,
+    verdicts: &[(&'static str, bool)],
+    minute_label: &str,
+) {
+    if verdicts.is_empty() {
+        return;
+    }
+    let any_served = verdicts.iter().any(|&(_, served)| served);
+    let actions = not_served.record_minute(verdicts);
+    for (&(underlying, served), &(_, action)) in verdicts.iter().zip(actions.iter()) {
+        if !served && any_served {
+            // One counted vendor-not-serving minute for this underlying
+            // (a global-outage minute is deliberately NOT counted here).
+            metrics::counter!(
+                "tv_groww_chain1m_underlying_not_served_total", "underlying" => underlying
+            )
+            .increment(1);
+        }
+        match action {
+            UnderlyingEdgeAction::Page { consecutive } => {
+                error!(
+                    code = ErrorCode::Chain02FetchDegraded.code_str(),
+                    stage = "underlying_not_served",
+                    feed = OPTION_CHAIN_1M_FEED_GROWW,
+                    underlying,
+                    consecutive_minutes = consecutive,
+                    minute = minute_label,
+                    "CHAIN-02: Groww is not serving this underlying's option \
+                     chain while the other underlyings succeed — paging once \
+                     per underlying (edge-latched; re-armed on this \
+                     underlying's own recovery)"
+                );
+                params
+                    .notifier
+                    .notify(NotificationEvent::GrowwChain1mUnderlyingNotServed {
+                        underlying,
+                        empty_minutes: consecutive,
+                    });
+            }
+            UnderlyingEdgeAction::Recover { not_served_minutes } => {
+                info!(
+                    underlying,
+                    not_served_minutes,
+                    minute = minute_label,
+                    "groww_chain_1m: this underlying's chain is being served \
+                     again after a paged not-served episode"
+                );
+                params
+                    .notifier
+                    .notify(NotificationEvent::GrowwChain1mUnderlyingServedRecovered {
+                        underlying,
+                        empty_minutes: not_served_minutes,
+                    });
+            }
+            UnderlyingEdgeAction::None => {}
         }
     }
 }
@@ -1538,6 +1737,10 @@ async fn run_groww_chain_minute_loop(
     );
     let mut audit_writer = RestFetchAuditWriter::new(&params.questdb);
     let mut edge = FailureEdge::default();
+    // Per-underlying not-served detector (2026-07-14) — same lifetime as
+    // the FailureEdge: this run, which is per trading day (the loop exits
+    // past 15:30 IST; a mid-day supervisor respawn restarts the streak).
+    let mut not_served = UnderlyingServedTracker::default();
     let mut token_cache = GrowwTokenCache::new_chain();
     let mut last_fired: Option<u32> = None;
     // ONE scalar spanning consecutive chain requests (any underlying) —
@@ -1612,6 +1815,7 @@ async fn run_groww_chain_minute_loop(
             &mut writer,
             &mut audit_writer,
             &mut edge,
+            &mut not_served,
             &mut token_cache,
             fire,
         )
@@ -2641,6 +2845,7 @@ mod tests {
         );
         let mut audit_writer = RestFetchAuditWriter::for_test();
         let mut edge = FailureEdge::default();
+        let mut not_served = UnderlyingServedTracker::default();
         let mut token_cache = GrowwTokenCache::for_test_paced_out(epoch_ms_now());
         fire_one_groww_chain_minute(
             &params,
@@ -2650,6 +2855,7 @@ mod tests {
             &mut writer,
             &mut audit_writer,
             &mut edge,
+            &mut not_served,
             &mut token_cache,
             9 * 3600 + 16 * 60,
         )
@@ -2670,6 +2876,21 @@ mod tests {
             edge.record_minute(true),
             EdgeAction::Page { consecutive: 3 }
         ));
+        // A no-token fire is a GLOBAL miss (zero served) → the not-served
+        // tracker HELD: a subsequent counted streak still needs the FULL
+        // threshold before paging (had the fire counted, the page below
+        // would land one minute early).
+        let n = GROWW_CHAIN_1M_UNDERLYING_NOT_SERVED_THRESHOLD;
+        for i in 1..n {
+            let actions = not_served.record_minute(&[("NIFTY", false), ("SENSEX", true)]);
+            assert_eq!(
+                actions[0].1,
+                UnderlyingEdgeAction::None,
+                "no page below the threshold (counted minute {i})"
+            );
+        }
+        let actions = not_served.record_minute(&[("NIFTY", false), ("SENSEX", true)]);
+        assert_eq!(actions[0].1, UnderlyingEdgeAction::Page { consecutive: n });
     }
 
     fn non_trading_params() -> GrowwChain1mTaskParams {
@@ -2764,6 +2985,7 @@ mod tests {
         );
         let mut audit_writer = RestFetchAuditWriter::for_test();
         let mut edge = FailureEdge::default();
+        let mut not_served = UnderlyingServedTracker::default();
         let mut token_cache = GrowwTokenCache::for_test_with_token(SecretString::from("t"));
         fire_one_groww_chain_minute(
             &params,
@@ -2773,6 +2995,7 @@ mod tests {
             &mut writer,
             &mut audit_writer,
             &mut edge,
+            &mut not_served,
             &mut token_cache,
             9 * 3600 + 16 * 60,
         )
@@ -2790,6 +3013,17 @@ mod tests {
             edge.record_minute(true),
             EdgeAction::Page { consecutive: 3 }
         ));
+        // The not-served tracker is FETCH-level: NIFTY was served (Found),
+        // SENSEX was not (empty) with a served sibling → SENSEX's streak
+        // holds 1 counted minute — threshold-1 more counted minutes page
+        // it (had the fire NOT counted, the page would land one late).
+        let n = GROWW_CHAIN_1M_UNDERLYING_NOT_SERVED_THRESHOLD;
+        for _ in 2..n {
+            let actions = not_served.record_minute(&[("NIFTY", true), ("SENSEX", false)]);
+            assert_eq!(actions[1].1, UnderlyingEdgeAction::None);
+        }
+        let actions = not_served.record_minute(&[("NIFTY", true), ("SENSEX", false)]);
+        assert_eq!(actions[1].1, UnderlyingEdgeAction::Page { consecutive: n });
     }
 
     /// The token-path fire's auth short-circuit (the item-12 mirror): a
@@ -2825,6 +3059,7 @@ mod tests {
         );
         let mut audit_writer = RestFetchAuditWriter::for_test();
         let mut edge = FailureEdge::default();
+        let mut not_served = UnderlyingServedTracker::default();
         let mut token_cache = GrowwTokenCache::for_test_with_token(SecretString::from("t"));
         fire_one_groww_chain_minute(
             &params,
@@ -2834,6 +3069,7 @@ mod tests {
             &mut writer,
             &mut audit_writer,
             &mut edge,
+            &mut not_served,
             &mut token_cache,
             9 * 3600 + 17 * 60,
         )
@@ -2845,6 +3081,98 @@ mod tests {
             edge.record_minute(true),
             EdgeAction::Page { consecutive: 3 }
         ));
+        // 401 + auth-skipped = an auth-ABORTED fire → the sink is
+        // skipped entirely and the not-served tracker HELD (no streak
+        // started for either underlying): a full fresh threshold is
+        // still required.
+        let n = GROWW_CHAIN_1M_UNDERLYING_NOT_SERVED_THRESHOLD;
+        for _ in 1..n {
+            let actions = not_served.record_minute(&[("NIFTY", false), ("SENSEX", true)]);
+            assert_eq!(actions[0].1, UnderlyingEdgeAction::None);
+        }
+        let actions = not_served.record_minute(&[("NIFTY", false), ("SENSEX", true)]);
+        assert_eq!(actions[0].1, UnderlyingEdgeAction::Page { consecutive: n });
+    }
+
+    /// The 2026-07-14 review-fix pin: a mid-fire 401 AFTER an earlier
+    /// underlying succeeded (ok ≥ 1 + auth-skip) is a tracker HOLD — the
+    /// sink is skipped for the whole fire, so the auth-skipped
+    /// underlyings gain NO counted not-served minute (and therefore no
+    /// counter increment — the sink is the only increment site), and
+    /// NOBODY's streak advances or resets (not even the Found
+    /// underlying's).
+    #[tokio::test]
+    async fn test_fire_auth_abort_after_found_is_tracker_hold() {
+        let params = test_params();
+        let body = r#"{"payload":{"underlying_ltp":1.0,"strikes":{"100":{"CE":{"ltp":1.5},"PE":{"ltp":2.5}}}}}"#;
+        let found_resp: &'static str = Box::leak(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            )
+            .into_boxed_str(),
+        );
+        let found_url = spawn_chain_mock(found_resp).await;
+        let url_401 =
+            spawn_chain_mock("HTTP/1.1 401 Unauthorized\r\nContent-Length: 2\r\n\r\n{}").await;
+        // The third target's port is CLOSED — the auth short-circuit must
+        // never send to it (the item-12 discipline).
+        let dead = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let dead_port = dead.local_addr().expect("addr").port();
+        drop(dead);
+        let targets = vec![
+            test_target_with_url("NIFTY", "NSE", found_url),
+            test_target_with_url("BANKNIFTY", "NSE", url_401),
+            test_target_with_url(
+                "SENSEX",
+                "BSE",
+                format!("http://127.0.0.1:{dead_port}/v1/option-chain"),
+            ),
+        ];
+        let mut last_request_ms: Option<i64> = None;
+        let mut writer = OptionChain1mWriter::for_test_with_feed(
+            OPTION_CHAIN_1M_FEED_GROWW,
+            OPTION_CHAIN_1M_SOURCE_GROWW_CHAIN,
+        );
+        let mut audit_writer = RestFetchAuditWriter::for_test();
+        let mut edge = FailureEdge::default();
+        let mut not_served = UnderlyingServedTracker::default();
+        let mut token_cache = GrowwTokenCache::for_test_with_token(SecretString::from("t"));
+        // Pre-seed: NIFTY + SENSEX each carry a 3-counted-minute streak
+        // going into the auth-aborted fire.
+        let seed = [("NIFTY", false), ("SENSEX", false), ("BANKNIFTY", true)];
+        for _ in 0..3 {
+            not_served.record_minute(&seed);
+        }
+        fire_one_groww_chain_minute(
+            &params,
+            &test_client(),
+            &targets,
+            &mut last_request_ms,
+            &mut writer,
+            &mut audit_writer,
+            &mut edge,
+            &mut not_served,
+            &mut token_cache,
+            9 * 3600 + 18 * 60,
+        )
+        .await;
+        // HOLD proven both directions: the streaks neither ADVANCED (the
+        // auth-skipped SENSEX did not gain a counted minute) nor RESET
+        // (NIFTY's Found in the aborted fire did not clear its streak) —
+        // exactly threshold-3 more counted minutes page BOTH, at the full
+        // threshold, together.
+        let n = GROWW_CHAIN_1M_UNDERLYING_NOT_SERVED_THRESHOLD;
+        for _ in 3..n - 1 {
+            let actions = not_served.record_minute(&seed);
+            assert_eq!(actions[0].1, UnderlyingEdgeAction::None, "NIFTY sub-edge");
+            assert_eq!(actions[1].1, UnderlyingEdgeAction::None, "SENSEX sub-edge");
+        }
+        let actions = not_served.record_minute(&seed);
+        assert_eq!(actions[0].1, UnderlyingEdgeAction::Page { consecutive: n });
+        assert_eq!(actions[1].1, UnderlyingEdgeAction::Page { consecutive: n });
     }
 
     /// The verdict sink's three edge arms execute without panicking and
@@ -2878,6 +3206,225 @@ mod tests {
         // (the spot M1 discipline — pure fn already pins it; this pins the
         // sink wiring).
         record_groww_chain_minute_verdict(&params, &mut edge, "9:22 AM", 2, 0, 0, true, None);
+    }
+
+    // -----------------------------------------------------------------------
+    // UnderlyingServedTracker (2026-07-14 — the NIFTY expiry-day
+    // vendor-cutoff companion; the spot SidServedTracker test style)
+    // -----------------------------------------------------------------------
+
+    const NOT_SERVED_N: u32 = GROWW_CHAIN_1M_UNDERLYING_NOT_SERVED_THRESHOLD;
+
+    /// The incident shape: ok=2/empty=1 for the full threshold → exactly
+    /// ONE page for the empty underlying at the threshold minute; later
+    /// counted minutes stay latched (no re-page).
+    #[test]
+    fn test_underlying_not_served_pages_once_at_threshold_then_stays_latched() {
+        let mut tracker = UnderlyingServedTracker::default();
+        let minute = [("NIFTY", false), ("BANKNIFTY", true), ("SENSEX", true)];
+        for i in 1..NOT_SERVED_N {
+            let actions = tracker.record_minute(&minute);
+            assert_eq!(
+                actions[0],
+                ("NIFTY", UnderlyingEdgeAction::None),
+                "no page below the threshold (counted minute {i})"
+            );
+            assert_eq!(actions[1].1, UnderlyingEdgeAction::None);
+            assert_eq!(actions[2].1, UnderlyingEdgeAction::None);
+        }
+        let actions = tracker.record_minute(&minute);
+        assert_eq!(
+            actions[0],
+            (
+                "NIFTY",
+                UnderlyingEdgeAction::Page {
+                    consecutive: NOT_SERVED_N
+                }
+            )
+        );
+        // Minutes 11+: latched — counted but never re-paged.
+        for _ in 0..3 {
+            let actions = tracker.record_minute(&minute);
+            assert_eq!(actions[0].1, UnderlyingEdgeAction::None);
+        }
+    }
+
+    /// Global-failure minutes (zero served — the escalation edge's class)
+    /// interleaved mid-streak neither count nor reset: the streak
+    /// survives the blip and still pages after the SAME total of counted
+    /// minutes. Within the FETCH-failure class this is the
+    /// no-double-fire proof (the escalation edge needs ok == 0, this
+    /// edge needs ≥1 OK); the honest persist-failed overlap (ok ≥ 1 +
+    /// persist failure counting toward BOTH edges) is documented on the
+    /// tracker.
+    #[test]
+    fn test_underlying_not_served_global_failure_neither_counts_nor_resets() {
+        let mut tracker = UnderlyingServedTracker::default();
+        let counted = [("NIFTY", false), ("BANKNIFTY", true), ("SENSEX", true)];
+        let global = [("NIFTY", false), ("BANKNIFTY", false), ("SENSEX", false)];
+        for _ in 1..NOT_SERVED_N {
+            assert_eq!(
+                tracker.record_minute(&counted)[0].1,
+                UnderlyingEdgeAction::None
+            );
+            // The interleaved global-outage minute: HOLD for everyone.
+            for &(_, action) in &tracker.record_minute(&global) {
+                assert_eq!(action, UnderlyingEdgeAction::None);
+            }
+        }
+        // The streak survived every HOLD: the NEXT counted minute pages.
+        let actions = tracker.record_minute(&counted);
+        assert_eq!(
+            actions[0].1,
+            UnderlyingEdgeAction::Page {
+                consecutive: NOT_SERVED_N
+            }
+        );
+    }
+
+    /// Recovery after the latch → exactly ONE Recover carrying the
+    /// episode length, latch cleared, and a NEW streak can page again.
+    #[test]
+    fn test_underlying_not_served_recovery_rearms_the_latch() {
+        let mut tracker = UnderlyingServedTracker::default();
+        let counted = [("NIFTY", false), ("BANKNIFTY", true)];
+        for _ in 0..NOT_SERVED_N {
+            tracker.record_minute(&counted);
+        }
+        // Two more counted minutes while latched (episode length grows).
+        tracker.record_minute(&counted);
+        tracker.record_minute(&counted);
+        // NIFTY served again → ONE Recover with the full episode length.
+        let actions = tracker.record_minute(&[("NIFTY", true), ("BANKNIFTY", true)]);
+        assert_eq!(
+            actions[0],
+            (
+                "NIFTY",
+                UnderlyingEdgeAction::Recover {
+                    not_served_minutes: NOT_SERVED_N + 2
+                }
+            )
+        );
+        // A second served minute is NOT a second recovery.
+        let actions = tracker.record_minute(&[("NIFTY", true), ("BANKNIFTY", true)]);
+        assert_eq!(actions[0].1, UnderlyingEdgeAction::None);
+        // A fresh streak pages again at the full threshold.
+        for _ in 1..NOT_SERVED_N {
+            assert_eq!(
+                tracker.record_minute(&counted)[0].1,
+                UnderlyingEdgeAction::None
+            );
+        }
+        assert_eq!(
+            tracker.record_minute(&counted)[0].1,
+            UnderlyingEdgeAction::Page {
+                consecutive: NOT_SERVED_N
+            }
+        );
+    }
+
+    /// Two underlyings empty simultaneously while the third is OK → both
+    /// count and both page independently at their own thresholds.
+    #[test]
+    fn test_underlying_not_served_two_empty_simultaneously_page_independently() {
+        let mut tracker = UnderlyingServedTracker::default();
+        // BANKNIFTY starts failing one minute after NIFTY.
+        tracker.record_minute(&[("NIFTY", false), ("BANKNIFTY", true), ("SENSEX", true)]);
+        let both = [("NIFTY", false), ("BANKNIFTY", false), ("SENSEX", true)];
+        for _ in 2..NOT_SERVED_N {
+            let actions = tracker.record_minute(&both);
+            assert_eq!(actions[0].1, UnderlyingEdgeAction::None);
+            assert_eq!(actions[1].1, UnderlyingEdgeAction::None);
+        }
+        // NIFTY reaches the threshold first…
+        let actions = tracker.record_minute(&both);
+        assert_eq!(
+            actions[0].1,
+            UnderlyingEdgeAction::Page {
+                consecutive: NOT_SERVED_N
+            }
+        );
+        assert_eq!(actions[1].1, UnderlyingEdgeAction::None);
+        // …BANKNIFTY one minute later, independently.
+        let actions = tracker.record_minute(&both);
+        assert_eq!(actions[0].1, UnderlyingEdgeAction::None);
+        assert_eq!(
+            actions[1].1,
+            UnderlyingEdgeAction::Page {
+                consecutive: NOT_SERVED_N
+            }
+        );
+    }
+
+    /// A sub-threshold streak at day end fires nothing, and a fresh
+    /// tracker (fresh day / fresh run) starts from zero. Error-class
+    /// not-served minutes count exactly like empty ones — the tracker
+    /// takes the SAME `served = false` verdict for both (the fire fn maps
+    /// Empty AND Failed to not-served; vendor not serving U either way).
+    #[test]
+    fn test_underlying_not_served_error_class_counts_like_empty() {
+        let mut tracker = UnderlyingServedTracker::default();
+        let counted = [("NIFTY", false), ("BANKNIFTY", true)];
+        // Sub-threshold streak → nothing fires…
+        for _ in 1..NOT_SERVED_N {
+            assert_eq!(
+                tracker.record_minute(&counted)[0].1,
+                UnderlyingEdgeAction::None
+            );
+        }
+        // …and a fresh tracker (day end → fresh day) holds no carryover:
+        // the full threshold is required again from zero.
+        let mut fresh = UnderlyingServedTracker::default();
+        for _ in 1..NOT_SERVED_N {
+            assert_eq!(
+                fresh.record_minute(&counted)[0].1,
+                UnderlyingEdgeAction::None
+            );
+        }
+        assert_eq!(
+            fresh.record_minute(&counted)[0].1,
+            UnderlyingEdgeAction::Page {
+                consecutive: NOT_SERVED_N
+            }
+        );
+    }
+
+    /// The per-underlying emission sink's three arms execute without
+    /// panicking and advance the tracker exactly as the pure contract
+    /// says (page at the threshold, recover on the next served minute);
+    /// an empty verdicts slice is a no-op.
+    #[test]
+    fn test_record_underlying_verdicts_page_and_recover_arms() {
+        let params = test_params();
+        let mut tracker = UnderlyingServedTracker::default();
+        record_groww_chain_underlying_verdicts(&params, &mut tracker, &[], "9:16 AM");
+        let counted = [("NIFTY", false), ("BANKNIFTY", true), ("SENSEX", true)];
+        for _ in 0..NOT_SERVED_N {
+            // The threshold-th call executes the Page arm inside.
+            record_groww_chain_underlying_verdicts(&params, &mut tracker, &counted, "2:55 PM");
+        }
+        // Latched: one more counted minute is the None arm.
+        record_groww_chain_underlying_verdicts(&params, &mut tracker, &counted, "3:05 PM");
+        // Served again: the Recover arm.
+        record_groww_chain_underlying_verdicts(
+            &params,
+            &mut tracker,
+            &[("NIFTY", true), ("BANKNIFTY", true), ("SENSEX", true)],
+            "3:06 PM",
+        );
+        // The tracker really did recover: a fresh full streak is needed.
+        for _ in 1..NOT_SERVED_N {
+            assert_eq!(
+                tracker.record_minute(&counted)[0].1,
+                UnderlyingEdgeAction::None
+            );
+        }
+        assert_eq!(
+            tracker.record_minute(&counted)[0].1,
+            UnderlyingEdgeAction::Page {
+                consecutive: NOT_SERVED_N
+            }
+        );
     }
 
     /// Boundary-skip accounting: zero skips is a no-op; a real skip writes
