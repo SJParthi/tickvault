@@ -14,7 +14,7 @@
 > behavior only**; going LIVE requires the §4 enable-time protocol with a
 > fresh dated operator quote recorded HERE first.
 > **Mechanical enforcement:** `crates/trading/tests/dhan_exit_order_lockout_guard.rs`
-> (10 build-failing tests; `All Green` is a GitHub-required check on `main`,
+> (12 build-failing tests; `All Green` is a GitHub-required check on `main`,
 > so a red guard physically blocks the merge button — see
 > `merge-gate-lock-2026-07-04.md`).
 > **Cross-ref:** `crates/common/tests/error_code_rule_file_crossref.rs`
@@ -56,7 +56,7 @@ hardcode (code), flip the config, edit the ratchet + this rule file with a
 dated operator quote — each of which individually fails `All Green` if
 attempted alone.
 
-## §2. The guard — `dhan_exit_order_lockout_guard.rs` (10 tests)
+## §2. The guard — `dhan_exit_order_lockout_guard.rs` (12 tests)
 
 | # | Test | Pins |
 |---|---|---|
@@ -69,7 +69,9 @@ attempted alone.
 | 7 | `exit_layer_emits_no_telegram_dispatch` | the exit-layer source (engine exit region + exit_rules.rs + exit_execution.rs) contains no `NotificationService` / `.notify(`; AND `NotificationEvent::OrderRejected` / `::CircuitBreakerOpened` keep ZERO production dispatch sites OR `dhan-rest-only-noise-lock-2026-07-14.md` §2 carries an `order execution` family row (the conditional pin that lets the legitimate rule-edited enable PR pass) |
 | 8 | `validate_super_order_prices_wired_not_dead_code` | no `#[allow(dead_code)]` on `validate_super_order_prices`; a real call site exists inside the exit region |
 | 9 | `lockout_rule_file_pins_the_contract` | this file exists and keeps the contract phrases (guard filename, lock table, enable-time protocol heading, both codes + both variant names) |
-| 10 | `toml_scanner_detects_flipped_flag` | scanner self-test: flipped / off / commented / other-section / prefix-section fixtures |
+| 10 | `toml_scanner_detects_flipped_flag` | scanner self-test: flipped / off / commented / other-section / prefix-section fixtures + the M6a `toml`-crate doc-parser fixtures (inline-table `exit_orders = { enabled = true }` + dotted `exit_orders.enabled = true`) — tests 1 and 6 apply the doc parser to `config/*.toml` (must parse) and to parseable deploy-path files |
+| 11 | `dry_run_false_literal_only_in_cfg_test_gate` | (M6b, 2026-07-14 hostile review) engine.rs carries EXACTLY ONE `dry_run = false`/`dry_run: false` literal (comment-stripped), and it sits within a `#[cfg(test)]`-gated item (the `enable_live_mode` body) |
+| 12 | `exit_methods_only_called_from_dispatcher_and_engine` | (M6c) the S6-G1 only-caller pin — outside `crates/app/src/exit_execution.rs`, `oms/engine.rs`, and test code, ZERO production occurrences of `.place_super_order(` / `.modify_super_order_leg(` / `.cancel_super_order_leg(` / `.place_forever_oco(` / `.place_order_sliced(` / `.verify_order_execution(` |
 
 ## §3. Runbooks (both codes LOG-SINK-ONLY — the noise-lock posture)
 
@@ -123,15 +125,24 @@ actions deliberately NOT implemented in the dry-run layer).
 **Delivery:** log-sink-only.
 
 **Trigger:** the verify-after-place ladder (bounded ≤5 probes, 1/2/4/8/10s
-backoff inside the 30s deadline, every probe consuming the shared 10/s
-GCRA) exhausted with a degraded verdict:
+backoff, every probe consuming the shared 10/s GCRA) reached a degraded
+verdict. Ladder timing is WALL-CLOCK (`tokio::time::Instant` — probe RTT
+included), and on the FINAL rung the elapsed value is FLOORED to
+`mpp_verify_deadline_secs` (H1, 2026-07-14 hostile review) — so with the
+default rung sum (25s) inside the 30s deadline, exhaustion ALWAYS
+classifies through an at-limit arm instead of ending silently in-budget
+Pending. Degraded verdicts:
 - `PendingAtLimit` — MPP converted a MARKET order to LIMIT and it is
-  RESTING on the book past the deadline (orders.md rule 18). NEVER assumed
-  filled; the order stays tracked.
+  RESTING on the book at/past the deadline (orders.md rule 18). NEVER
+  assumed filled; the order stays tracked AND is flagged
+  `needs_reconciliation` (H1).
 - `PartiallyFilled` at budget — `needs_reconciliation = true` is set on the
   ManagedOrder; the remainder is NEVER silently forgotten.
-- `Unknown { raw_status }` — an unparsable Dhan status. Fail-closed: an
-  unparsable status is NEVER treated as filled.
+- `Unknown { raw_status }` — an unparsable Dhan status, or
+  `NOT_IN_SUPER_LIST` on the ladder's FINAL attempt (M2: a missing-from-
+  list snapshot RETRIES the remaining rungs first — one snapshot is not
+  proof of absence; a body-unparsable Unknown stays decisive at any rung).
+  Fail-closed: never treated as filled; `needs_reconciliation` is set.
 
 **Triage:**
 1. `mcp__tickvault-logs__tail_errors` — find `EXIT-VERIFY-01`; the payload
@@ -151,6 +162,19 @@ is never promisable under MPP; the ladder's degraded verdicts are the
 honest terminal states. In dry-run, `PAPER-*` orders return
 `SimulatedFilled` deterministically (no HTTP; GCRA still consumed) — a
 verdict deliberately distinct so no consumer confuses paper for real.
+**Pipeline blocking (H3, 2026-07-14 hostile review):** while
+`[exit_orders]` is ENABLED, the strategy task drives the dispatcher INLINE
+from its select loop — a close order stalls that task for up to
+~`mpp_verify_deadline_secs`, with the CloseAll multi-slice case bounded by
+ONE overall verify budget of the same deadline (remaining slices get one
+sleepless at-limit probe each); ticks buffer in the broadcast channel
+meanwhile and order updates may lag. Accepted for the dry-run layer —
+flagged as a pre-live design change (§4 step 5: spawned exit executor).
+Sliced-response honesty (M3): the server split is never echoed back, so
+EVERY live sliced-tracked order carries `needs_reconciliation = true`
+(single-object and count-match arms included) and the response Vec is
+bounded at 1,000 rows (H3b — beyond-cap rows are dropped with a coded
+anomaly log).
 
 ## §4. The enable-time protocol (each step a separate PR-visible diff)
 
@@ -177,7 +201,11 @@ A future operator-enable PR sequence MUST, in order:
    edits the ratchet without the dated quote here fails review per §5.
 5. **Pre-live prerequisites (flagged, not shipped in Cluster B):** the
    reserved protective-op rate lane (cancel/SL-modify never denied by a
-   probe burst) and the 7,000/day `DailyRequestTracker` budget tracker.
+   probe burst), the 7,000/day `DailyRequestTracker` budget tracker, and
+   a **SPAWNED exit executor** (H3, 2026-07-14 hostile review — the
+   enabled dispatcher currently runs INLINE on the strategy task, which
+   blocks the pipeline select loop up to ~`mpp_verify_deadline_secs` per
+   close; live trading must move the verify ladder off that task).
 
 ## §5. What a violating PR looks like (REJECT)
 
