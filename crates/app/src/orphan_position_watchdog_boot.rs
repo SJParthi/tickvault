@@ -38,6 +38,7 @@
 //!   `capture_rest_error_body` before it reaches a log or Telegram.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use chrono::{DateTime, Duration as ChronoDuration, NaiveDate};
@@ -49,7 +50,7 @@ use tickvault_common::constants::IST_UTC_OFFSET_SECONDS;
 use tickvault_common::error_code::ErrorCode;
 use tickvault_common::sanitize::capture_rest_error_body;
 use tickvault_common::trading_calendar::TradingCalendar;
-use tickvault_core::auth::token_manager::TokenHandle;
+use tickvault_core::auth::token_manager::{TokenHandle, global_token_manager};
 use tickvault_core::notification::{NotificationEvent, NotificationService};
 use tickvault_trading::oms::OrderApiClient;
 use tickvault_trading::orphan_position_watchdog::{
@@ -80,6 +81,55 @@ pub fn ist_date_from_utc(now_utc_secs: i64) -> NaiveDate {
     (utc + ChronoDuration::seconds(i64::from(IST_UTC_OFFSET_SECONDS))).date_naive()
 }
 
+/// How the 15:25 IST check obtains its Dhan session (JWT + client id).
+///
+/// Re-home 2026-07-14: the watchdog previously ran ONLY from the Dhan-gated
+/// `spawn_post_market_tasks` family in `main.rs` — dead on `dhan_enabled =
+/// false` boots (the production default since the 2026-07-13 Dhan live-WS
+/// retirement). The process-global prefix spawn cannot thread a
+/// `TokenHandle`/client id at boot (the Dhan REST stack mints asynchronously
+/// in its Phase 2), so this enum lets each call site choose:
+#[derive(Clone)]
+pub enum WatchdogAuth {
+    /// Boot-time handles, byte-identical behaviour to the pre-2026-07-14
+    /// signature. Used by the fast crash-recovery arm's
+    /// `spawn_post_market_tasks` family (both are in scope there).
+    Static {
+        /// O(1) atomic JWT handle from the lane-owned `TokenManager`.
+        token_handle: TokenHandle,
+        /// Dhan client id (plain header value — not secret-classed).
+        client_id: String,
+    },
+    /// Resolve `global_token_manager()` at each 15:25 fire. The OnceLock is
+    /// registered by BOTH the Dhan lane and the Dhan REST stack's Phase 2,
+    /// so a dhan-off boot has it well before 15:25. No manager at fire time
+    /// = LOUD degraded Critical page — never a clean signal.
+    GlobalAtFireTime,
+}
+
+/// Process-global once-guard: the watchdog family may be spawned from BOTH
+/// the process-global prefix and the fast crash-recovery arm's
+/// `spawn_post_market_tasks`. The two call sites are mutually exclusive by
+/// control flow today (the fast arm early-returns before the process-global
+/// block) — this guard is belt-and-braces against future refactors making
+/// both reachable (a double 15:25 page would violate the one-decision-per-
+/// Telegram commandment).
+static ORPHAN_WATCHDOG_CLAIMED: AtomicBool = AtomicBool::new(false);
+
+/// Claim the single orphan-watchdog spawn slot. `true` = this caller owns
+/// the spawn; `false` = another call site already spawned it.
+fn claim_orphan_watchdog_once() -> bool {
+    ORPHAN_WATCHDOG_CLAIMED
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_ok()
+}
+
+/// Test-only reset so the once-guard is exercisable deterministically.
+#[cfg(test)]
+fn reset_orphan_watchdog_claim() {
+    ORPHAN_WATCHDOG_CLAIMED.store(false, Ordering::SeqCst);
+}
+
 /// Spawn the supervised orphan-position watchdog. The supervisor catches a
 /// panicked/exited inner loop and respawns it after a backoff, so the daily
 /// 15:25 IST compliance gate can never silently disappear.
@@ -92,21 +142,26 @@ pub fn ist_date_from_utc(now_utc_secs: i64) -> NaiveDate {
 // wiring is pinned by `crates/app/tests/orphan_position_watchdog_wiring_guard.rs`.
 // TEST-EXEMPT: live-token + REST + tokio supervisor wiring (no pure logic here).
 pub fn spawn_supervised_orphan_position_watchdog(
-    token_handle: TokenHandle,
+    auth: WatchdogAuth,
     notifier: Arc<NotificationService>,
     calendar: Arc<TradingCalendar>,
     rest_api_base_url: String,
-    client_id: String,
     dry_run: bool,
 ) -> tokio::task::JoinHandle<()> {
+    if !claim_orphan_watchdog_once() {
+        info!(
+            "orphan watchdog already spawned by another call site — skipping \
+             duplicate spawn (once-guard)"
+        );
+        return tokio::spawn(async {});
+    }
     tokio::spawn(async move {
         loop {
             let inner = tokio::spawn(orphan_watchdog_loop(
-                token_handle.clone(),
+                auth.clone(),
                 Arc::clone(&notifier),
                 Arc::clone(&calendar),
                 rest_api_base_url.clone(),
-                client_id.clone(),
                 dry_run,
             ));
             match inner.await {
@@ -136,14 +191,15 @@ pub fn spawn_supervised_orphan_position_watchdog(
 /// The perpetual daily loop. Never panics, never `unwrap`s — every fault
 /// path logs + (where operator-actionable) pages, then continues.
 async fn orphan_watchdog_loop(
-    token_handle: TokenHandle,
+    auth: WatchdogAuth,
     notifier: Arc<NotificationService>,
     calendar: Arc<TradingCalendar>,
     rest_api_base_url: String,
-    client_id: String,
     dry_run: bool,
 ) {
-    // Build the HTTP client once, outside the loop.
+    // Build the HTTP client once, outside the loop (the per-fire
+    // `OrderApiClient` shares it via reqwest's internal Arc — no per-fire
+    // TLS/resolver init, the HTTP-CLIENT-01 lesson).
     let http = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(
             ORPHAN_WATCHDOG_HTTP_CONNECT_TIMEOUT_SECS,
@@ -151,7 +207,6 @@ async fn orphan_watchdog_loop(
         .timeout(Duration::from_secs(ORPHAN_WATCHDOG_HTTP_TIMEOUT_SECS))
         .build()
         .unwrap_or_default();
-    let api = OrderApiClient::new(http, rest_api_base_url, client_id);
 
     loop {
         let sleep_dur = sleep_duration_until_orphan_watchdog(chrono::Utc::now().timestamp());
@@ -163,7 +218,49 @@ async fn orphan_watchdog_loop(
 
         let today_ist = ist_date_from_utc(chrono::Utc::now().timestamp());
         if calendar.is_trading_day(today_ist) {
-            run_orphan_check_once(&api, &token_handle, &notifier, dry_run).await;
+            // Resolve the Dhan session at fire time. `Static` behaves
+            // exactly as the pre-2026-07-14 signature; `GlobalAtFireTime`
+            // reads the global TokenManager registered by the Dhan lane or
+            // the Dhan REST stack's Phase 2 (this read deliberately lives
+            // HERE, not in main.rs — main.rs ratchets exactly one
+            // `global_token_manager()` read in its production region).
+            let resolved = match &auth {
+                WatchdogAuth::Static {
+                    token_handle,
+                    client_id,
+                } => Some((token_handle.clone(), client_id.clone())),
+                WatchdogAuth::GlobalAtFireTime => {
+                    global_token_manager().map(|tm| (tm.token_handle(), tm.client_id_string()))
+                }
+            };
+            match resolved {
+                Some((token_handle, client_id)) => {
+                    let api =
+                        OrderApiClient::new(http.clone(), rest_api_base_url.clone(), client_id);
+                    run_orphan_check_once(&api, &token_handle, &notifier, dry_run).await;
+                }
+                None => {
+                    // Degraded arm (fire-time, no broker session at all —
+                    // fully-dhan-less boot, or the Dhan REST stack parked /
+                    // still pre-Phase-2). NEVER a clean signal (audit Rule
+                    // 11) — mirrors the existing no-token degraded arm's
+                    // un-coded Custom-Critical style.
+                    error!(
+                        "orphan watchdog: no broker session at 15:25 IST — the \
+                         orphan-position check could NOT run (no global token \
+                         manager registered); operator must check Dhan manually \
+                         before the 15:30 close (degraded — NOT reported as flat)"
+                    );
+                    notifier.notify(NotificationEvent::Custom {
+                        message: "🆘 3:25 PM open-position check could NOT run — no \
+                                  broker session exists. Check your Dhan app manually \
+                                  before the 3:30 PM close."
+                            .to_string(),
+                    });
+                    metrics::counter!("tv_orphan_position_watchdog_fetch_failures_total")
+                        .increment(1);
+                }
+            }
         } else {
             info!(
                 date = %today_ist,
@@ -326,5 +423,37 @@ mod tests {
         // The post-run floor MUST be > 1s so we advance past the 1-second
         // window where the clock helper returns 0 at exactly 15:25:00.
         assert!(ORPHAN_WATCHDOG_POST_RUN_FLOOR_SECS > 1);
+    }
+
+    #[test]
+    fn test_orphan_watchdog_claim_once_guard() {
+        // Single test owns the guard (no parallel-test race): claim wins
+        // once, the second claim is refused, and the test-only reset re-arms.
+        reset_orphan_watchdog_claim();
+        assert!(claim_orphan_watchdog_once(), "first claim must win");
+        assert!(
+            !claim_orphan_watchdog_once(),
+            "second claim must be refused (once-guard)"
+        );
+        reset_orphan_watchdog_claim();
+        assert!(claim_orphan_watchdog_once(), "claim must win after reset");
+        reset_orphan_watchdog_claim();
+    }
+
+    #[test]
+    fn test_watchdog_auth_enum_arms_construct() {
+        // Compile-path pin: both arms are constructible and Clone — the
+        // supervisor respawn loop clones the auth per inner spawn.
+        let handle: TokenHandle = Arc::new(arc_swap::ArcSwap::new(Arc::new(None)));
+        let static_arm = WatchdogAuth::Static {
+            token_handle: handle,
+            client_id: "test-client-id".to_string(),
+        };
+        let global_arm = WatchdogAuth::GlobalAtFireTime;
+        match static_arm.clone() {
+            WatchdogAuth::Static { client_id, .. } => assert_eq!(client_id, "test-client-id"),
+            WatchdogAuth::GlobalAtFireTime => panic!("expected Static arm"),
+        }
+        assert!(matches!(global_arm.clone(), WatchdogAuth::GlobalAtFireTime));
     }
 }

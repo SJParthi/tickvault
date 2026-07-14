@@ -564,6 +564,20 @@ impl TokenManager {
         Arc::clone(&self.token)
     }
 
+    /// Returns the Dhan client id as a plain `String`.
+    ///
+    /// The client id is NOT secret-classed in practice — it travels as a
+    /// plain `client-id` / `dhanClientId` HTTP header on every Dhan REST
+    /// call (see `OrderApiClient::auth_headers` and the `RenewToken`
+    /// header at the renewal site). This accessor exists so fire-time
+    /// consumers of the global TokenManager (e.g. the 15:25 IST
+    /// orphan-position watchdog re-homed 2026-07-14) can build an
+    /// `OrderApiClient` without threading credentials through boot.
+    #[must_use]
+    pub fn client_id_string(&self) -> String {
+        self.credentials.client_id.expose_secret().to_string()
+    }
+
     /// Spawns the background token renewal task.
     ///
     /// Sleeps until the refresh window (token_validity - refresh_before_expiry),
@@ -1640,6 +1654,14 @@ mod tests {
         ));
         // Unrelated transient errors stay transient.
         assert!(!is_permanent_auth_error("connection reset by peer"));
+    }
+
+    #[test]
+    fn test_client_id_string_returns_constructor_client_id() {
+        // Constructor-level, no network — pins the fire-time accessor the
+        // orphan-position watchdog uses to build its OrderApiClient.
+        let manager = TokenManager::new_for_test(None);
+        assert_eq!(manager.client_id_string(), "test-client-id");
     }
 
     #[test]
