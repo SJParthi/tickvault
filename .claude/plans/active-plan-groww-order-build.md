@@ -1,6 +1,6 @@
 # Implementation Plan: Groww Order-Side Build — Gated Live-Fire Lattice (PR-0 scaffold + area PRs)
 
-**Status:** APPROVED
+**Status:** VERIFIED
 **Date:** 2026-07-14
 **Approved by:** Parthiban (operator) — DIRECT dated in-thread confirmation 2026-07-14 (session event `321350d4-cf70-4a1c-88fc-36584527c8fd`), verbatim: "confirm — apply the Groww order scope-unlock PR-0. Build only, behind the OFF switch, no live orders"
 
