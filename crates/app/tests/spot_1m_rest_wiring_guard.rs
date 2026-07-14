@@ -211,7 +211,11 @@ fn ratchet_ok_audit_rows_stamp_after_data_flush_ack() {
             "src/spot_1m_rest_boot.rs",
             &[
                 "async fn fire_one_minute(",
-                "async fn run_post_session_sweep(",
+                // 2026-07-14 merge with main's batch-catchup refactor: the
+                // sweep's fetch/persist/hold/stamp body moved into the
+                // SHARED `sweep_sids_above_watermark` helper (the
+                // post-session sweep passes `Some(audit_writer)` into it).
+                "async fn sweep_sids_above_watermark(",
             ],
         ),
         ("src/groww_spot_1m_boot.rs", &["async fn fire_one_minute("]),

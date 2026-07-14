@@ -1437,6 +1437,7 @@ async fn fetch_minute_with_ladder(
     backfill_minute_ist_nanos: Option<i64>,
     minute_close_ms_of_day: i64,
     jitter_ms: u64,
+    max_attempts: usize,
 ) -> (SidFetchOutcome, DhanLadderForensics) {
     let deltas = retry_sleep_deltas_ms();
     // 2026-07-14 adaptive degrade: 1 while degraded (no re-polls), the
@@ -1507,6 +1508,12 @@ async fn fetch_minute_with_ladder(
                 last_error = None;
                 prev_rate_limited = false;
                 forensics.terminal_rate_limited = false;
+                let current_watermark = stats.map(|(_, newest)| newest);
+                if ladder_watermark_repeated(prev_parsed_watermark, current_watermark) {
+                    metrics::counter!("tv_spot1m_ladder_watermark_cutoff_total").increment(1);
+                    break;
+                }
+                prev_parsed_watermark = Some(current_watermark);
             }
             Err(failure) => {
                 if failure.rate_limited {
@@ -1549,6 +1556,7 @@ async fn fetch_minute_bounded(
     backfill_minute_ist_nanos: Option<i64>,
     minute_close_ms_of_day: i64,
     jitter_ms: u64,
+    max_attempts: usize,
 ) -> (SidFetchOutcome, DhanLadderForensics) {
     match tokio::time::timeout(
         Duration::from_secs(SPOT_1M_REST_SID_BUDGET_SECS),
@@ -1628,6 +1636,9 @@ pub async fn run_spot_1m_rest(params: Spot1mRestTaskParams) {
         }
     };
     let mut writer = Spot1mRestWriter::new(&params.questdb);
+    // Gap-11 forensics: best-effort per-fetch audit rows (never on the
+    // fetch/verdict/edge path).
+    let mut audit_writer = RestFetchAuditWriter::new(&params.questdb);
     // 2026-07-13 backfill sweep: per-SID latest PERSISTED minute — drives
     // the previous-minute repair on every fire (and the batch catch-up
     // ceiling in batch mode).
@@ -1642,7 +1653,15 @@ pub async fn run_spot_1m_rest(params: Spot1mRestTaskParams) {
         let session_complete =
             run_batch_catchup_loop(&params, &client, &url, &mut writer, &mut tracker).await;
         if session_complete {
-            run_post_session_sweep(&client, &url, &params, &mut writer, &mut tracker).await;
+            run_post_session_sweep(
+                &client,
+                &url,
+                &params,
+                &mut writer,
+                &mut audit_writer,
+                &mut tracker,
+            )
+            .await;
         }
         return;
     }
@@ -2553,6 +2572,16 @@ struct SweepCycleStats {
 /// `spot_1m_fetch_once` — and persist every missing minute found.
 /// Watermarks advance ONLY after the flush confirms (poisoned-buffer
 /// defense; DEDUP-idempotent re-appends).
+///
+/// Gap-11 forensics (2026-07-14): when `audit` is `Some` (the TERMINAL
+/// 15:33:30 post-session sweep) every still-missing minute lands a NAMED
+/// gap row (`named_gap` / `persist_failed` / `flush_failed`) and every
+/// recovered minute an `ok` row HELD until the data flush ACK then
+/// stamped with its real `close_to_persist_ms`. Mid-session batch
+/// catch-up cycles pass `None` — a minute missing at one cycle may be
+/// recovered by the next, so stamping a terminal `named_gap` there would
+/// be a false verdict (the per-minute fires' own rows + the terminal
+/// sweep remain the forensics truth for a batch-mode day).
 #[allow(clippy::too_many_arguments)] // APPROVED: private shared sweep body — a struct would be pure ceremony
 // TEST-EXEMPT: live-deps async body — the missing-minute selection (sweep_missing_minutes), row/window builders and cycle verdict (batch_cycle_fully_failed) are pure fns unit-tested below; the HTTP+persist legs reuse the tested fire_one_minute pattern.
 async fn sweep_sids_above_watermark(
@@ -2566,9 +2595,13 @@ async fn sweep_sids_above_watermark(
     session_first: i64,
     up_to_last_minute: i64,
     stage: &'static str,
+    mut audit: Option<&mut RestFetchAuditWriter>,
 ) -> SweepCycleStats {
     let mut stats = SweepCycleStats::default();
     let mut staged: Vec<(SecurityId, i64)> = Vec::new();
+    // GAP-11 persist stamping: swept `ok` forensics rows are HELD until
+    // the data flush ACK (stamped then; discarded on a failed flush).
+    let mut held_ok_rows: Vec<RestFetchAuditRow> = Vec::new();
     for (security_id, symbol) in SPOT_1M_REST_INDICES {
         let missing = sweep_missing_minutes(
             tracker.last_persisted(security_id),
@@ -2594,6 +2627,28 @@ async fn sweep_sids_above_watermark(
                     "SPOT1M-01: sweep fetch failed for this SID"
                 );
                 stats.still_missing = stats.still_missing.saturating_add(missing.len() as u64);
+                // Gap-11 forensics: the whole-SID sweep fetch failed —
+                // every still-missing minute is a NAMED gap, never silent
+                // (a 429'd sweep fetch keeps its real rate-limit fact —
+                // GAP-11 review HIGH, 2026-07-14).
+                if let Some(w) = audit.as_deref_mut() {
+                    for minute_nanos in &missing {
+                        audit_append_best_effort(
+                            w,
+                            &build_dhan_fetch_audit_row(
+                                *minute_nanos,
+                                trading_date_nanos,
+                                security_id,
+                                symbol,
+                                1,
+                                i64::from(failure.rate_limited),
+                                RestFetchOutcome::NamedGap,
+                                -1,
+                                "named_gap",
+                            ),
+                        );
+                    }
+                }
                 continue;
             }
         };
@@ -2601,6 +2656,24 @@ async fn sweep_sids_above_watermark(
         for minute_nanos in &missing {
             let Some(candle) = select_minute_candle(&candles, *minute_nanos) else {
                 stats.still_missing = stats.still_missing.saturating_add(1);
+                // Gap-11 forensics: still absent after the sweep — a
+                // NAMED gap row for this exact (minute, SID).
+                if let Some(w) = audit.as_deref_mut() {
+                    audit_append_best_effort(
+                        w,
+                        &build_dhan_fetch_audit_row(
+                            *minute_nanos,
+                            trading_date_nanos,
+                            security_id,
+                            symbol,
+                            1,
+                            0,
+                            RestFetchOutcome::NamedGap,
+                            -1,
+                            "named_gap",
+                        ),
+                    );
+                }
                 continue;
             };
             // Honest real retrieval delay for the swept minute.
@@ -2626,14 +2699,47 @@ async fn sweep_sids_above_watermark(
                     "SPOT1M-02: sweep row append failed"
                 );
                 stats.still_missing = stats.still_missing.saturating_add(1);
+                if let Some(w) = audit.as_deref_mut() {
+                    audit_append_best_effort(
+                        w,
+                        &build_dhan_fetch_audit_row(
+                            *minute_nanos,
+                            trading_date_nanos,
+                            security_id,
+                            symbol,
+                            1,
+                            0,
+                            RestFetchOutcome::NamedGap,
+                            -1,
+                            "persist_failed",
+                        ),
+                    );
+                }
             } else {
                 found_for_sid = found_for_sid.saturating_add(1);
+                // Gap-11 forensics: sweep recovery — `ok` with the honest
+                // real (big) close_to_data_ms. HELD until the data flush
+                // ACK (GAP-11 persist stamping).
+                if audit.is_some() {
+                    held_ok_rows.push(build_dhan_fetch_audit_row(
+                        *minute_nanos,
+                        trading_date_nanos,
+                        security_id,
+                        symbol,
+                        1,
+                        0,
+                        RestFetchOutcome::Ok,
+                        close_to_data_ms,
+                        "none",
+                    ));
+                }
                 staged.push((security_id, *minute_nanos));
             }
         }
         stats.swept = stats.swept.saturating_add(found_for_sid);
     }
-    if let Err(err) = writer.flush() {
+    let flush_result = writer.flush();
+    if let Err(err) = &flush_result {
         stats.persist_failed = true;
         metrics::counter!("tv_spot1m_persist_errors_total", "stage" => "flush").increment(1);
         error!(
@@ -2645,10 +2751,45 @@ async fn sweep_sids_above_watermark(
         );
         stats.still_missing = stats.still_missing.saturating_add(stats.swept);
         stats.swept = 0;
+        // Gap-11 forensics: the staged swept minutes become flush_failed
+        // rows — captured from `staged` BEFORE the commit arm consumes it.
+        if let Some(w) = audit.as_deref_mut() {
+            for (security_id, minute_nanos) in &staged {
+                audit_append_best_effort(
+                    w,
+                    &build_dhan_fetch_audit_row(
+                        *minute_nanos,
+                        trading_date_nanos,
+                        *security_id,
+                        spot_1m_symbol_for_sid(*security_id),
+                        1,
+                        0,
+                        RestFetchOutcome::NamedGap,
+                        -1,
+                        "flush_failed",
+                    ),
+                );
+            }
+        }
     } else {
         for (security_id, minute_nanos) in staged {
             tracker.commit(security_id, minute_nanos);
         }
+    }
+    if let Some(w) = audit {
+        // GAP-11: swept ok rows land ONLY after (and stamped with) the data
+        // flush ACK — discarded on a failed flush (the flush_failed rows
+        // above are the truth for those minutes).
+        for row in stamp_held_ok_rows(
+            held_ok_rows,
+            flush_result.is_ok(),
+            trading_date_nanos,
+            ist_millis_of_day_now(),
+        ) {
+            audit_append_best_effort(w, &row);
+        }
+        // Gap-11 forensics: one best-effort flush for the sweep's audit rows.
+        audit_flush_best_effort(w);
     }
     stats
 }
@@ -2738,6 +2879,11 @@ async fn run_batch_catchup_loop(
             session_first,
             up_to,
             "batch_cycle_failed",
+            // Gap-11: NO forensics mid-session — a batch cycle's missing
+            // minute may be recovered by the next cycle; only the terminal
+            // post-session sweep stamps named-gap/ok rows (see the helper
+            // doc note).
+            None,
         )
         .await;
         let fully_failed =
@@ -2885,186 +3031,21 @@ async fn run_post_session_sweep(
         return;
     };
 
-    let mut swept: u64 = 0;
-    let mut still_missing: u64 = 0;
-    let mut staged: Vec<(SecurityId, i64)> = Vec::new();
-    // GAP-11 persist stamping: swept `ok` forensics rows are HELD until
-    // the data flush ACK (stamped then; discarded on a failed flush).
-    let mut held_ok_rows: Vec<RestFetchAuditRow> = Vec::new();
-    let mut persist_failed = false;
-    for (security_id, symbol) in SPOT_1M_REST_INDICES {
-        let missing = sweep_missing_minutes(
-            tracker.last_persisted(security_id),
-            session_first,
-            session_last,
-        );
-        if missing.is_empty() {
-            continue;
-        }
-        let body = spot_1m_day_request_body(&security_id.to_string(), trading_date);
-        let candles = match spot_1m_fetch_once(client, url, jwt.expose_secret(), &body).await {
-            Ok(body_text) => parse_intraday_1m_candles(&body_text),
-            Err(failure) => {
-                if failure.rate_limited {
-                    metrics::counter!("tv_spot1m_rate_limited_total").increment(1);
-                }
-                error!(
-                    code = ErrorCode::Spot1m01FetchDegraded.code_str(),
-                    stage = "sweep_failed",
-                    security_id,
-                    reason = %failure.msg,
-                    "SPOT1M-01: post-session sweep fetch failed for this SID"
-                );
-                still_missing = still_missing.saturating_add(missing.len() as u64);
-                // Gap-11 forensics: the whole-SID sweep fetch failed —
-                // every still-missing minute is a NAMED gap, never silent
-                // (a 429'd sweep fetch keeps its real rate-limit fact —
-                // GAP-11 review HIGH, 2026-07-14).
-                for minute_nanos in &missing {
-                    audit_append_best_effort(
-                        audit_writer,
-                        &build_dhan_fetch_audit_row(
-                            *minute_nanos,
-                            trading_date_nanos,
-                            security_id,
-                            symbol,
-                            1,
-                            i64::from(failure.rate_limited),
-                            RestFetchOutcome::NamedGap,
-                            -1,
-                            "named_gap",
-                        ),
-                    );
-                }
-                continue;
-            }
-        };
-        let mut found_for_sid: u64 = 0;
-        for minute_nanos in &missing {
-            let Some(candle) = select_minute_candle(&candles, *minute_nanos) else {
-                still_missing = still_missing.saturating_add(1);
-                // Gap-11 forensics: still absent after the sweep — a
-                // NAMED gap row for this exact (minute, SID).
-                audit_append_best_effort(
-                    audit_writer,
-                    &build_dhan_fetch_audit_row(
-                        *minute_nanos,
-                        trading_date_nanos,
-                        security_id,
-                        symbol,
-                        1,
-                        0,
-                        RestFetchOutcome::NamedGap,
-                        -1,
-                        "named_gap",
-                    ),
-                );
-                continue;
-            };
-            // Honest real retrieval delay for the swept minute.
-            let close_ms_of_day = ((minute_nanos - trading_date_nanos) / NANOS_PER_SEC + 60)
-                .saturating_mul(MILLIS_PER_SEC);
-            let close_to_data_ms = (ist_millis_of_day_now() - close_ms_of_day).max(0);
-            let row = build_spot_1m_row(
-                &candle,
-                security_id,
-                symbol,
-                trading_date_nanos,
-                close_to_data_ms,
-            );
-            if let Err(err) = writer.append_row(&row) {
-                persist_failed = true;
-                metrics::counter!("tv_spot1m_persist_errors_total", "stage" => "append")
-                    .increment(1);
-                error!(
-                    code = ErrorCode::Spot1m02PersistFailed.code_str(),
-                    stage = "append",
-                    security_id,
-                    ?err,
-                    "SPOT1M-02: post-session sweep row append failed"
-                );
-                still_missing = still_missing.saturating_add(1);
-                audit_append_best_effort(
-                    audit_writer,
-                    &build_dhan_fetch_audit_row(
-                        *minute_nanos,
-                        trading_date_nanos,
-                        security_id,
-                        symbol,
-                        1,
-                        0,
-                        RestFetchOutcome::NamedGap,
-                        -1,
-                        "persist_failed",
-                    ),
-                );
-            } else {
-                found_for_sid = found_for_sid.saturating_add(1);
-                // Gap-11 forensics: sweep recovery — `ok` with the honest
-                // real (big) close_to_data_ms. HELD until the data flush
-                // ACK (GAP-11 persist stamping).
-                held_ok_rows.push(build_dhan_fetch_audit_row(
-                    *minute_nanos,
-                    trading_date_nanos,
-                    security_id,
-                    symbol,
-                    1,
-                    0,
-                    RestFetchOutcome::Ok,
-                    close_to_data_ms,
-                    "none",
-                ));
-                staged.push((security_id, *minute_nanos));
-            }
-        }
-        swept = swept.saturating_add(found_for_sid);
-    }
-    let flush_result = writer.flush();
-    if let Err(err) = &flush_result {
-        persist_failed = true;
-        metrics::counter!("tv_spot1m_persist_errors_total", "stage" => "flush").increment(1);
-        error!(
-            code = ErrorCode::Spot1m02PersistFailed.code_str(),
-            stage = "flush",
-            ?err,
-            "SPOT1M-02: post-session sweep ILP flush failed — pending swept \
-             rows discarded (poisoned-buffer defense)"
-        );
-        still_missing = still_missing.saturating_add(swept);
-        swept = 0;
-        // Gap-11 forensics: the staged swept minutes become flush_failed
-        // rows — captured from `staged` BEFORE the commit arm consumes it.
-        for (security_id, minute_nanos) in &staged {
-            audit_append_best_effort(
-                audit_writer,
-                &build_dhan_fetch_audit_row(
-                    *minute_nanos,
-                    trading_date_nanos,
-                    *security_id,
-                    spot_1m_symbol_for_sid(*security_id),
-                    1,
-                    0,
-                    RestFetchOutcome::NamedGap,
-                    -1,
-                    "flush_failed",
-                ),
-            );
-        }
-    } else {
-        for (security_id, minute_nanos) in staged {
-            tracker.commit(security_id, minute_nanos);
-        }
-    }
-    // GAP-11: swept ok rows land ONLY after (and stamped with) the data
-    // flush ACK — discarded on a failed flush (the flush_failed rows above
-    // are the truth for those minutes).
-    for row in stamp_held_ok_rows(
-        held_ok_rows,
-        flush_result.is_ok(),
+    // Gap-11 forensics ride the SHARED sweep body (`Some(audit_writer)`):
+    // named_gap / persist_failed / flush_failed rows + held-then-stamped
+    // `ok` rows land exactly as the pre-refactor inline sweep emitted them.
+    let stats = sweep_sids_above_watermark(
+        client,
+        url,
+        writer,
+        tracker,
+        &jwt,
+        trading_date,
         trading_date_nanos,
         session_first,
         session_last,
         "sweep_failed",
+        Some(audit_writer),
     )
     .await;
     let (swept, still_missing, persist_failed) =
