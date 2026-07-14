@@ -959,10 +959,12 @@ async fn main() -> Result<()> {
                      pre-retirement residue with no live consumer (PR-C3, 2026-07-14): \
                      counted loudly at STAGE-C.2b, then archived (raw frames stay on disk)"
                 );
-                metrics::counter!("tv_ws_frame_wal_replay_total", "ws_type" => "live_feed")
-                    .increment(live);
-                metrics::counter!("tv_ws_frame_wal_replay_total", "ws_type" => "order_update")
-                    .increment(ord);
+                // PR-C3 round-2 review (2026-07-14, MEDIUM): the
+                // tv_ws_frame_wal_replay_total increments that lived HERE
+                // fired BEFORE observability::init_metrics installs the
+                // recorder — they hit the no-op recorder and were silently
+                // lost. They now fire at STAGE-C.2b (post-install), derived
+                // from the same recovered-frame vec lengths.
             }
         }
         Err(err) => {
@@ -1990,6 +1992,17 @@ async fn main() -> Result<()> {
     //     forever (the WS-REINJECT-01 growth-storm class). Durable
     //     order-event capture returns with the live-trading re-wire.
     // =======================================================================
+    // Replay counters (moved here from the STAGE-C replay match in the PR-C3
+    // round-2 fix — this point is AFTER observability::init_metrics, so the
+    // increments land on the real recorder instead of the pre-install no-op).
+    if !ws_wal_replay_live_feed.is_empty() {
+        metrics::counter!("tv_ws_frame_wal_replay_total", "ws_type" => "live_feed")
+            .increment(ws_wal_replay_live_feed.len() as u64);
+    }
+    if !ws_wal_replay_order_update.is_empty() {
+        metrics::counter!("tv_ws_frame_wal_replay_total", "ws_type" => "order_update")
+            .increment(ws_wal_replay_order_update.len() as u64);
+    }
     if !ws_wal_replay_order_update.is_empty() {
         let dropped = ws_wal_replay_order_update.len() as u64;
         warn!(
@@ -2023,9 +2036,15 @@ async fn main() -> Result<()> {
         ws_wal_replay_live_feed.clear();
     }
     {
-        // Both legs settled (drained or loudly archived) — archive the staged
-        // segments so they never re-stage. `confirm_replayed` MOVES segments
-        // into the WAL archive dir (never deletes).
+        // Both legs settled (loudly archived) — archive the staged segments
+        // so they never re-stage. `confirm_replayed` MOVES segments into the
+        // WAL archive dir (never deletes). Honest envelope (round-2 note,
+        // 2026-07-14): this confirm also runs when `replay_all` itself
+        // ERRORED above — segments staged but never read are archived with
+        // a zero count (raw frames preserved on disk, count lost).
+        // Acceptable post-retirement: no consumer exists to re-replay into,
+        // and NOT confirming would re-stage the unreadable segments forever
+        // (the WS-REINJECT-01 growth-storm class).
         let confirm_ws_wal_path = tickvault_app::tick_conservation_boot::ws_wal_dir();
         tickvault_storage::ws_frame_spill::confirm_replayed(&confirm_ws_wal_path);
     }

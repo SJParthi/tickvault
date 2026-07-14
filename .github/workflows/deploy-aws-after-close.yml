@@ -9,14 +9,16 @@
 # other time — including the 08:30 IST auto-start — auto-deploys the latest main.
 #
 # Five crons, all Mon–Fri:
-#   • 03:00 UTC = 08:30 IST → INSTANCE-START deploy. Fires the moment the box is
-#     scheduled to auto-start. deploy-aws SELF-STARTS a stopped box in the
-#     08:30-16:30 up-window (see "Ensure instance running" in deploy-aws.yml),
-#     so even if the 08:30 EventBridge instance-start silently fails, THIS cron
-#     still brings the box up + ships the latest main before 09:00 open. This is
-#     the belt-and-suspenders fix for the 2026-06-03 "box never auto-started"
-#     incident — it does not depend on the EC2 'running' event firing at all.
-#   • 03:15 UTC = 08:45 IST → PRE-MARKET backup, well before the 09:15 open.
+#   • 03:00 UTC = 08:30 IST + 03:15 UTC = 08:45 IST → HISTORICAL morning slots.
+#     SUPERSEDED by the PR-C3 prep-window suppression (2026-07-14): fired on
+#     time both land INSIDE the [08:15, 09:15) IST boot-critical band and are
+#     ALWAYS suppressed — they dispatch only when GitHub's scheduler delays
+#     them past 09:15 IST. Their pre-C3 roles (2026-06-03 "box never
+#     auto-started" belt-and-suspenders self-start + pre-market deploy of the
+#     latest main) are now owned by the box-start deploy-watchdog Lambda
+#     (scheduler-independent stale-binary catch + redeploy) and, for
+#     bot-merged (push-suppressed) commits, postmerge-catchup's overnight
+#     deploy-aws backfill.
 #   • 10:16 UTC = 15:46 IST → POST-MARKET window, just AFTER the 15:45 IST end of
 #     the no-deploy band (moved from 15:31 so it is no longer blocked by the
 #     guard). ~16 min after NSE close — redeploys anything merged during hours.
@@ -51,9 +53,17 @@
 #     HONEST ENVELOPE: cron redundancy REDUCES but cannot ELIMINATE GitHub
 #     scheduler risk — the scheduler is an external system and can drop any or
 #     all slots (as it did repo-wide on 2026-07-02). ⚠️
-#   - Merge over the weekend → auto-fires Monday 08:30 IST (instance-start) ✅
-#   - Merge before 08:30 IST on a weekday → auto-fires same day 08:30 IST ✅
-#   - Box failed to auto-start at 08:30 → the 08:30 cron self-starts it + deploys ✅
+#   - Merge over the weekend / before 08:30 IST on a weekday → the morning
+#     crons are prep-window-suppressed (PR-C3); the deploy lands via the
+#     deploy-watchdog Lambda at box start (it compares on-box provenance vs
+#     main HEAD and redeploys a stale binary) — or earlier via
+#     postmerge-catchup IF the merge was bot-made (push-suppressed, so no
+#     deploy-aws run exists for the HEAD; a HUMAN evening merge already has a
+#     green off-hours skip run, which postmerge-catchup deliberately counts
+#     as covered). ⚠️ latest-main-at-08:30-sharp is no longer promised.
+#   - Box failed to auto-start at 08:30 → deploy-aws runs dispatched OUTSIDE
+#     the prep window still self-start the box; inside the window the
+#     EventBridge start + deploy-watchdog own it.
 #   - NSE holiday: cron fires; deploy-aws's own market-hours guard is a no-op
 #     outside trading hours, so the deploy runs harmlessly on holiday windows.
 #   - No new commits → idempotent skip (no restart, no extra cost).
@@ -62,8 +72,10 @@
 #     IST crons no longer restart the app mid-prep. HONEST: fired on time
 #     those two crons land INSIDE the band and are ALWAYS suppressed — they
 #     dispatch only when the scheduler delays them past 09:15 IST (effectively
-#     inert otherwise); overnight deploy coverage is postmerge-catchup's
-#     deploy-aws backfill + the box-start deploy-watchdog Lambda. Manual
+#     inert otherwise); overnight deploy coverage is the box-start
+#     deploy-watchdog Lambda (all merges) + postmerge-catchup's deploy-aws
+#     backfill (bot merges — a human evening merge already has a green
+#     off-hours skip run, so the existence check counts it covered). Manual
 #     workflow_dispatch still overrides. ⚠️ envelope: this trades "latest
 #     main shipped at 08:30 sharp" for "no mid-prep restart"; a boot-critical
 #     fix merged 08:15-09:15 needs the operator's manual dispatch.
@@ -112,8 +124,10 @@ jobs:
       # INSIDE the band restarts the app mid-prep — worse than deploying a
       # few minutes later. This gate suppresses the DISPATCH only (the cron
       # firing itself stays free): a merge landing in the band deploys via
-      # the next slot / postmerge-catchup / the box-start deploy-watchdog
-      # Lambda (the scheduler-independent stale-binary catch). HONEST: the
+      # the next slot / the box-start deploy-watchdog Lambda (the
+      # scheduler-independent stale-binary catch; postmerge-catchup
+      # additionally covers BOT merges, whose push runs are suppressed —
+      # a human merge's green skip run counts as covered there). HONEST: the
       # 03:00 UTC (08:30 IST) + 03:15 UTC (08:45 IST) morning crons fall
       # INSIDE the band — fired on time they are ALWAYS suppressed and
       # dispatch nothing; they act only when GitHub's scheduler DELAYS them

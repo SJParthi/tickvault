@@ -147,9 +147,21 @@ jobs:
             # run that ends in a green off-hours no-op skip, or a market-hours
             # guard block, still counts — this dispatcher backfills MISSING runs,
             # it never re-runs (or re-builds) a SHA that already has one.
+            # Fail-safe (round-2 review 2026-07-14, MEDIUM): a transient API
+            # failure on ONE lane's existence probe must not kill the whole
+            # step under set -euo pipefail (the same class the tf_touched
+            # guard above closes) — and a non-numeric count must never fall
+            # through to "lane already covered" (false-OK direction). A
+            # failed probe SKIPS the lane loudly; the next 30-min firing
+            # retries (skipping is safe — a missed dispatch defers, while a
+            # blind dispatch could double-run deploy-aws).
             count=$(gh api \
               "repos/${GH_REPO}/actions/workflows/${wf}/runs?head_sha=${head_sha}&per_page=1" \
-              --jq .total_count)
+              --jq .total_count 2>/dev/null || echo "")
+            if ! [[ "${count}" =~ ^[0-9]+$ ]]; then
+              echo "::warning::existence probe for ${wf} failed (got '${count}') — skipping this lane; the next 30-min firing retries"
+              continue
+            fi
             if [ "${count}" -eq 0 ]; then
               echo "::warning::${wf} has ZERO runs for main HEAD ${head_sha} — a GITHUB_TOKEN bot merge (or a scheduler-dropped morning deploy cron) left it uncovered. Dispatching catch-up run on main."
               # A transient dispatch failure must not abort the REMAINING
