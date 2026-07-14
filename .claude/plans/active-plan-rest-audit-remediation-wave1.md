@@ -34,7 +34,10 @@
 
 ## Plan Items
 
-- [ ] **Item 1 (GAP-11, priority 1) — Dhan spot + chain legs emit `rest_fetch_audit` rows.**
+- [x] **Item 1 (GAP-11, priority 1) — Dhan spot + chain legs emit `rest_fetch_audit` rows.**
+  DONE 2026-07-14 on branch `claude/rest-audit-gap11-dhan-forensics` (spot emits ee31b861;
+  chain port + the close_to_persist_ms hold-then-stamp extension in the follow-on commits —
+  see the delivered-tests note at the end of this item).
   Verified today: `grep rest_fetch_audit crates/app/src/spot_1m_rest_boot.rs
   option_chain_1m_boot.rs` = ZERO hits — the Dhan legs are forensics-silent while the
   Groww legs write one row per (minute, symbol, feed, leg). Port the Groww pattern
@@ -60,15 +63,23 @@
     (§2b note only: the Dhan-spot `spot_1m_rest.close_to_data_ms` latency FALLBACK in
     `feed_scoreboard_boot.rs` becomes redundant once Dhan forensics rows exist — fallback
     code is KEPT this wave, removal is a later cleanup)
-  - Tests: `test_dhan_build_fetch_audit_row_shape_and_feed`,
-    `test_dhan_audit_rows_cover_all_sid_outcomes` (ok/empty/error/no_token map),
-    `test_dhan_sweep_writes_named_gap_and_swept_rows`,
-    `test_chain_audit_row_attempts_is_one_and_leg_chain_1m`,
-    ratchet in `crates/app/tests/spot_1m_rest_wiring_guard.rs`
-    (`ratchet_dhan_spot_leg_emits_rest_fetch_audit` — source-scan: the production region
-    of `spot_1m_rest_boot.rs` + `option_chain_1m_boot.rs` must contain
-    `audit_append_best_effort`/`RestFetchAuditRow` call sites), plus the isolation pin:
-    `test_dhan_audit_failure_never_sets_persist_failed_or_feeds_edge`
+  - Tests (AS DELIVERED 2026-07-14 — names updated at tick time; the emit-site coverage
+    is source-scan ratcheted, the pure hold/stamp/discard decision is unit-tested):
+    `test_chain_audit_row_attempts_is_one_and_leg_chain_1m` (option_chain_1m_boot.rs),
+    `test_close_to_persist_ms_for_math_and_clamp`,
+    `test_stamp_held_ok_rows_flush_ok_stamps_each_row`,
+    `test_stamp_held_ok_rows_flush_err_discards_all` (spot_1m_rest_boot.rs — the GAP-11
+    persist-stamp extension: ok rows HELD until the data flush ACK, stamped with the real
+    close_to_persist_ms, discarded on flush Err), ratchets in
+    `crates/app/tests/spot_1m_rest_wiring_guard.rs`
+    (`ratchet_dhan_spot_and_chain_legs_emit_rest_fetch_audit` — production-region
+    source-scan of both Dhan legs' emit needles;
+    `ratchet_ok_audit_rows_stamp_after_data_flush_ack` — per fire/sweep fn region, the
+    stamp call must follow the data `writer.flush()` in source order + no hardcoded
+    `close_to_persist_ms: -1` at the ok emit sites). Isolation is structural
+    (`audit_append_best_effort` has no access to `persist_failed`/the tally/the edge —
+    the behavioral pin `test_dhan_audit_failure_never_sets_persist_failed_or_feeds_edge`
+    needs a fault-injectable writer and is deferred with the plan's remaining items)
 
 - [ ] **Item 2 (GAP-12) — VIX failure reaches Telegram (Groww side ONLY).**
   Precise scope, verified: the DHAN side ALREADY pages — a persistently-unserved VIX
