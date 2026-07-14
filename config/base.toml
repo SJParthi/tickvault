@@ -224,7 +224,10 @@ config_path = "config/strategies.toml"
 capital = 1000000.0
 dry_run = true
 mode = "sandbox"
-sandbox_only_until = "2026-06-30"
+# 2026-07-14 re-arm: the old 2026-06-30 date EXPIRED silently on 2026-07-01;
+# re-armed to the 2099-12-31 sentinel matching production.toml — going live
+# requires an explicit config edit with a fresh dated operator quote.
+sandbox_only_until = "2099-12-31"
 
 [logging]
 level = "info"
