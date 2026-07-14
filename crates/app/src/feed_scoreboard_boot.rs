@@ -3856,7 +3856,8 @@ pub async fn run_feed_scoreboard(
                         match writer.flush() {
                             Ok(()) if !append_err => info!(
                                 closed = dangling.len(),
-                                "feed_scoreboard: dangling gap episodes closed                                  with -1 sentinels (FEED-GAP-01 sweep)"
+                                "feed_scoreboard: dangling gap episodes closed with -1 sentinels \
+                                 (FEED-GAP-01 sweep)"
                             ),
                             Ok(()) => {}
                             Err(err) => {
@@ -3869,7 +3870,8 @@ pub async fn run_feed_scoreboard(
                                     code = "FEED-GAP-01",
                                     stage = "dangling_close",
                                     ?err,
-                                    "FEED-GAP-01: dangling-close flush failed —                                      the day's open episodes stay open (honest,                                      visible via SQL); the next run re-sweeps"
+                                    "FEED-GAP-01: dangling-close flush failed — the day's open episodes \
+                                     stay open (honest, visible via SQL); the next run re-sweeps"
                                 );
                             }
                         }
@@ -3878,13 +3880,15 @@ pub async fn run_feed_scoreboard(
                 None => error!(
                     code = "FEED-GAP-01",
                     stage = "dangling_close",
-                    "FEED-GAP-01: the day's feed_gap_audit body was unparsable                      — dangling episodes stay open until the next sweep"
+                    "FEED-GAP-01: the day's feed_gap_audit body was unparsable — dangling \
+                     episodes stay open until the next sweep"
                 ),
             },
             None => error!(
                 code = "FEED-GAP-01",
                 stage = "dangling_close",
-                "FEED-GAP-01: the day's feed_gap_audit rows could not be read                  — dangling episodes stay open until the next sweep"
+                "FEED-GAP-01: the day's feed_gap_audit rows could not be read — \
+                 dangling episodes stay open until the next sweep"
             ),
         }
     }
