@@ -720,6 +720,11 @@ async fn main() -> Result<()> {
     let groww_sidecar_options = tickvault_app::groww_sidecar_supervisor::GrowwSidecarOptions {
         archive_s3_bucket: config.feeds.groww.capture_archive_s3_bucket.clone(),
         archive_s3_prefix: config.feeds.groww.capture_archive_s3_prefix.clone(),
+        // FIX-B (2026-07-14): boot-time episode_mode selects the reject-page
+        // cooldown (60s with the GrowwFeed episode fold ON, legacy 1800s when
+        // the episode kill switch is OFF). Runtime config flip = restart,
+        // consistent with how episode_mode itself is consumed.
+        episode_mode: config.notification.episode_mode,
         ..tickvault_app::groww_sidecar_supervisor::GrowwSidecarOptions::default()
     };
     if groww_scale_enabled {
