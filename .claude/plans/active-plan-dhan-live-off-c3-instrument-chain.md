@@ -1,6 +1,6 @@
 # Implementation Plan: Dhan Live-WS Retirement — PR-C3 (delete the Dhan instrument-download chain + tick-gap detector)
 
-**Status:** APPROVED
+**Status:** VERIFIED
 **Date:** 2026-07-14
 **Approved by:** Parthiban (operator) — 2026-07-13 directive, verbatim Q3: "hereafter no Dhan
 instrument download/parsing — just direct hardcoded security IDs passed to spot 1m and option
@@ -221,7 +221,7 @@ spawn sites) or Dhan-lane-dead since C2.
 
 - [x] Create this plan (Files: .claude/plans/active-plan-dhan-live-off-c3-instrument-chain.md)
 - [x] Delete app dormant Dhan REST-history modules + retire their paging entries + relocate the sweep const (Files: crates/app/src/{cross_verify_1m_boot.rs,prev_day_ohlcv_boot.rs,spot_1m_rest_boot.rs,lib.rs}, crates/api/src/handlers/debug.rs, deploy/aws/terraform/error-code-alarms.tf, .claude/rules/project/cross-verify-1m-error-codes.md, .claude/rules/project/observability-architecture.md; Tests: cross_verify_1m_visibility_guard retired, error_code_paging_filter_drift_guard green, spot_1m_rest sweep const-asserts green)
-- [x] Delete the Dhan instrument chain + feature flag + relocations (Files: crates/{core,app,storage,common} per Design items 1–5 + 11, config/base.toml, crates/core/src/instrument/{csv_row.rs,trading_date.rs} NEW; Tests: daily_universe_scope_guard trimmed, futidx pins green, MigrationGate ratchets green, workspace suite)
+- [x] Delete the Dhan instrument chain + feature flag + relocations (Files: crates/{core,app,storage,common} per Design items 1–5 + 11, config/base.toml, crates/core/src/instrument/csv_row.rs NEW (is_valid_trading_date stayed IN PLACE in a trimmed instrument_snapshot.rs — import path unchanged for groww_activation, so no trading_date.rs split was needed); Tests: daily_universe_scope_guard trimmed, futidx pins green, MigrationGate ratchets green, workspace suite)
 - [x] Delete the tick-gap detector + WS-GAP-06 + far-month gate plumbing + terraform (Files: crates/core/src/pipeline/{tick_gap_detector.rs deleted,tick_processor.rs,mod.rs}, crates/app/src/{main.rs,observability.rs}, crates/core/src/notification/{events.rs,coalescer.rs,service.rs}, crates/common/src/{constants.rs,config.rs}, config/base.toml, quality/benchmark-budgets.toml, deploy/aws/terraform/{app-alarms.tf,market-hours-liveness-alarm.tf,user-data.sh.tftpl}, deploy/aws/cloudwatch-agent.json; Tests: far_month_alarm_gate_wiring_guard + tick_gap_reset_wiring_guard retired with tombstones, cloudwatch wiring guards adjusted, feature_flag_rollback_guard adjusted)
 - [x] Fix the STAGE-C.2b order-update WAL leg (archive-only, loud) (Files: crates/app/src/{main.rs,boot_helpers.rs}; Tests: wal_replay_confirm_symmetry_guard re-shaped)
 - [x] Rider (a): postmerge-catchup backfills terraform-apply.yml (Files: .github/workflows/postmerge-catchup.yml, .claude/rules/project/merge-gate-lock-2026-07-04.md §3.1 dated edit)
