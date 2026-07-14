@@ -21,11 +21,18 @@
 //! only — the `MidSessionProfileInvalidated` Critical and
 //! `TokenForcedRemintTriggered` High Telegram pages are DELETED). The
 //! ONLY Telegram from this module is the family-(3) token-unobtainable
-//! Critical (`NotificationEvent::AuthenticationFailed`) when a forced
-//! re-mint fails TERMINALLY — i.e. the token could not be obtained at
-//! all. Everything else self-heals: the GAP-04 latch re-arm retries the
-//! re-mint every [`REMINT_REARM_FAILING_CYCLES`] failing cycles
-//! (~30 min) while the episode persists.
+//! Critical (the `AuthenticationFailed` event — the full constructor
+//! path is deliberately NOT spelled here so the silence ratchet's
+//! call-form needle can never be satisfied by this doc comment), fired
+//! AT MOST ONCE PER FAILING EPISODE (H1, 2026-07-14 fix round) when
+//! EITHER (a) a forced re-mint fails TERMINALLY — the token could not
+//! be obtained at all — OR (b) [`REMINT_MAX_ATTEMPTS_PER_EPISODE`]
+//! re-mints all "succeeded" yet the profile stayed REAL-invalid (the
+//! dead-dataPlan class: the broker accepts the login but the account
+//! entitlement is broken). Everything else self-heals: the GAP-04
+//! latch re-arm retries the re-mint every
+//! [`REMINT_REARM_FAILING_CYCLES`] failing cycles (~30 min) while the
+//! episode persists, STOPPING at the per-episode attempt cap.
 //!
 //! # Design
 //!
@@ -73,13 +80,14 @@ use tracing::{error, info, warn};
 // outage — the AG5-R1-3 CRITICAL this file fixed). Local aliases keep the
 // pre-existing names used throughout this module.
 use crate::auth::token_manager::{
-    PROFILE_HTTP_RESPONSE_WRAPPER as HTTP_RESPONSE_WRAPPER,
+    MINT_COOLDOWN_REFUSAL_REASON_PREFIX, PROFILE_HTTP_RESPONSE_WRAPPER as HTTP_RESPONSE_WRAPPER,
     PROFILE_PARSE_ERROR_WRAPPER as PARSE_ERROR_WRAPPER,
     PROFILE_SEND_LEG_WRAPPER as SEND_LEG_WRAPPER, RESILIENCE03_MINT_REFUSAL_REASON_PREFIX,
     TokenManager,
 };
 use crate::notification::events::NotificationEvent;
 use crate::notification::service::NotificationService;
+use tickvault_common::sanitize::capture_rest_error_body;
 
 /// Check cadence (seconds). 15 minutes = 900 s. Loose enough to stay
 /// under the 1 req/sec Quote API rate limit even under pathological
@@ -113,6 +121,21 @@ pub fn should_rearm_remint_latch(consecutive_invalid: u32) -> bool {
     consecutive_invalid > CONSECUTIVE_INVALID_REMINT_THRESHOLD
         && (consecutive_invalid - CONSECUTIVE_INVALID_REMINT_THRESHOLD)
             .is_multiple_of(REMINT_REARM_FAILING_CYCLES)
+}
+
+/// H1b (2026-07-14 fix round): hard cap on forced re-mints per failing
+/// episode. After this many mints in ONE episode the GAP-04 re-arm STOPS
+/// (no further mint until a clean `Ok` cycle clears the episode) and the
+/// once-per-episode family-(3) Critical fires if the profile is STILL
+/// REAL-invalid — closing the silent dead-dataPlan loop where every
+/// re-mint "succeeds" (the broker accepts the login) yet the profile
+/// stays invalid: previously ~48 silent mints/day with zero pages.
+pub const REMINT_MAX_ATTEMPTS_PER_EPISODE: u32 = 3;
+
+/// H1b. Pure. True iff the per-episode mint budget is spent.
+#[must_use]
+pub fn remint_cap_reached(attempts_this_episode: u32) -> bool {
+    attempts_this_episode >= REMINT_MAX_ATTEMPTS_PER_EPISODE
 }
 
 /// Spawns the mid-session profile watchdog as an independent tokio task.
@@ -194,9 +217,47 @@ async fn run_watchdog_loop(
 
         // Rising/falling edge bookkeeping — SILENT since 2026-07-14 (the
         // MidSessionProfileInvalidated Critical page is deleted per the
-        // Dhan noise lock; the coded error! + counter remain).
+        // Dhan noise lock; the coded error! + counter remain). M1 (fix
+        // round): the outcome rides along so the rising-edge wording is
+        // class-accurate (a REST-surface degrade never engages a re-mint).
         let transition = evaluate_transition(&state, is_real_auth_failing);
-        apply_transition(transition, &mut state, reason);
+        apply_transition(transition, &mut state, reason, outcome);
+
+        // H1b (2026-07-14 fix round): the attempt-cap page — the episode
+        // spent all REMINT_MAX_ATTEMPTS_PER_EPISODE re-mints (each
+        // "succeeded" or failed non-terminally) and the profile is STILL
+        // REAL-invalid on this cycle. This is the dead-dataPlan /
+        // dead-segment class: the broker accepts the login but the
+        // account entitlement stays broken, so more re-logins cannot
+        // help. ONE family-(3) Critical per episode (shared latch with
+        // the terminal-failure arm below).
+        if outcome == CycleOutcome::RealAuthFail
+            && remint_cap_exhausted(&state)
+            && take_terminal_page(&mut state)
+        {
+            error!(
+                code = ErrorCode::AuthGap05ForcedRemintTriggered.code_str(),
+                attempts = state.remint_attempts_this_episode,
+                consecutive = state.consecutive_invalid,
+                "AUTH-GAP-05 re-mint attempt cap reached with the profile STILL invalid — \
+                 dataPlan/segment class; paging once per episode, no further re-mints \
+                 until the episode clears"
+            );
+            metrics::counter!("tv_token_forced_remint_total", "outcome" => "cap_exhausted")
+                .increment(1);
+            if let Some(n) = notifier.as_ref() {
+                n.notify(NotificationEvent::AuthenticationFailed {
+                    reason: format!(
+                        "the Dhan login profile stayed INVALID after {} automatic \
+                         re-logins (~30 minutes apart) — the broker accepts the login \
+                         but the account check keeps failing (data plan / segment \
+                         class). The Dhan spot-1m + option-chain pulls are blocked \
+                         until this is fixed on the Dhan portal",
+                        state.remint_attempts_this_episode
+                    ),
+                });
+            }
+        }
 
         // AUTH-GAP-05: forced re-mint decision (pure) + action (bounded —
         // once per failing episode, NEVER while the dual-instance lock is
@@ -258,28 +319,58 @@ async fn run_watchdog_loop(
                         // pre-mint gate refusal below.
                         let rendered = format!("{e}");
                         let permanent = is_inflight_lock_refusal(&rendered);
+                        // H3 (2026-07-14 fix round): a TokenManager-level
+                        // mint-cooldown skip (another caller minted < ~125s
+                        // ago) is NOT a terminal failure — the next re-arm
+                        // window retries after the cooldown; it must never
+                        // page or burn the episode's single page.
+                        let cooldown_skip = is_mint_cooldown_refusal(&rendered);
                         error!(
                             code = ErrorCode::AuthGap05ForcedRemintTriggered.code_str(),
                             permanent,
+                            cooldown_skip,
                             error = %e,
-                            "AUTH-GAP-05 forced re-mint failed — no local retry (episode latch holds; GAP-04 re-arms in ~30 min)"
+                            "AUTH-GAP-05 forced re-mint failed — no local retry (episode latch holds; GAP-04 re-arms in ~30 min while the attempt cap lasts)"
                         );
                         metrics::counter!(
                             "tv_token_forced_remint_total",
-                            "outcome" => if permanent { "refused_lock_lost_inflight" } else { "failed" }
+                            "outcome" => if permanent {
+                                "refused_lock_lost_inflight"
+                            } else if cooldown_skip {
+                                "cooldown_skipped"
+                            } else {
+                                "failed"
+                            }
                         )
                         .increment(1);
                         // 2026-07-14 Dhan noise lock, family-(3): a forced
                         // re-mint that FAILED means the token could not be
                         // obtained — the ONE Dhan token condition that still
-                        // pages. The RESILIENCE-03 in-flight lock refusal is
-                        // deliberately NOT paged here (a peer owns the
-                        // session; its token is alive — not "unobtainable").
-                        if !permanent && let Some(n) = notifier.as_ref() {
+                        // pages, AT MOST ONCE PER EPISODE (H1a latch — the
+                        // GAP-04 re-arm previously re-paged the same episode
+                        // every ~30 min). The RESILIENCE-03 in-flight lock
+                        // refusal is deliberately NOT paged FROM HERE (a peer
+                        // owns the session; its token is alive — not
+                        // "unobtainable") — though note `acquire_token`'s own
+                        // tripwire already paged its family-(3) refusal
+                        // before returning this error (pre-existing
+                        // token_manager behavior; see the L-fix comment on
+                        // the RefuseLockLost arm below). M2: the rendered
+                        // error is redacted + truncated (≤300 chars) before
+                        // it reaches the Telegram body — the mint-HTTP shape
+                        // embeds a raw server-controlled `body=`.
+                        if !permanent
+                            && !cooldown_skip
+                            && take_terminal_page(&mut state)
+                            && let Some(n) = notifier.as_ref()
+                        {
+                            let sanitized = capture_rest_error_body(&rendered);
                             n.notify(NotificationEvent::AuthenticationFailed {
                                 reason: format!(
                                     "the automatic Dhan token re-mint failed after ~30 minutes \
-                                     of the broker rejecting our login ({rendered})"
+                                     of the broker rejecting our login ({sanitized}) — the Dhan \
+                                     spot-1m + option-chain pulls are blocked until the token \
+                                     is fixed"
                                 ),
                             });
                         }
@@ -288,7 +379,17 @@ async fn run_watchdog_loop(
             }
             RemintDecision::RefuseLockLost => {
                 // Latched above via `apply_remint_decision` so this refusal
-                // is not re-evaluated every cycle; a clean Ok cycle re-arms.
+                // is not re-evaluated every cycle; a clean Ok cycle re-arms
+                // — and the GAP-04 re-arm means a PERSISTING lock-lost
+                // episode re-logs this error roughly every ~30 minutes
+                // (bounded log cadence, no Telegram FROM THIS ARM; noted in
+                // the wave-4-error-codes.md AUTH-GAP-05 banner). Truth note
+                // (L-fix, 2026-07-14 fix round): this PRE-mint gate never
+                // calls force_renewal, so nothing pages here — but the
+                // IN-FLIGHT RESILIENCE-03 tripwire inside `acquire_token`
+                // DOES page its own family-(3) AuthenticationFailed when a
+                // mint that already started loses the lock (pre-existing
+                // token_manager behavior, unchanged by the noise lock).
                 // NEVER calls force_renewal — zero external side effects (a
                 // peer owns the session and its active token must never be
                 // destroyed).
@@ -482,6 +583,17 @@ fn is_inflight_lock_refusal(rendered_error: &str) -> bool {
     reason_core(rendered_error).starts_with(RESILIENCE03_MINT_REFUSAL_REASON_PREFIX)
 }
 
+/// H3 (2026-07-14 fix round). Pure. True iff a rendered `force_renewal`
+/// error IS the TokenManager mint-cooldown skip (`renew_with_fallback`
+/// refused the `generateAccessToken` fallback because ANOTHER caller
+/// minted within the ~125s Dhan cooldown). PREFIX-anchored on our own
+/// shared [`MINT_COOLDOWN_REFUSAL_REASON_PREFIX`] literal — same SEC-R1-3
+/// discipline as [`is_inflight_lock_refusal`] (never substring-scan text
+/// that concatenates a server-controlled body).
+fn is_mint_cooldown_refusal(rendered_error: &str) -> bool {
+    reason_core(rendered_error).starts_with(MINT_COOLDOWN_REFUSAL_REASON_PREFIX)
+}
+
 /// Pure. Parses the HTTP status from the FIXED position immediately after
 /// the [`HTTP_RESPONSE_WRAPPER`] prefix. SEC-R1-3: the status token is
 /// produced by OUR `format!` before any server body is appended, so it is
@@ -586,6 +698,8 @@ fn apply_cycle_outcome(
         CycleOutcome::Ok => {
             state.consecutive_invalid = 0;
             state.remint_attempted_this_episode = false;
+            state.remint_attempts_this_episode = 0;
+            state.terminal_paged_this_episode = false;
             profile_valid.store(true, Ordering::Release);
         }
         CycleOutcome::RealAuthFail => {
@@ -595,8 +709,12 @@ fn apply_cycle_outcome(
             // GAP-04 (2026-07-14): a PERSISTING episode re-arms the
             // retry-once latch every REMINT_REARM_FAILING_CYCLES failing
             // cycles (~30 min), so a still-dead token keeps re-minting
-            // (silently) instead of stalling after the single attempt.
+            // (silently) instead of stalling after the single attempt —
+            // BOUNDED by the H1b per-episode attempt cap: once the budget
+            // is spent the re-arm STOPS (the cap page fires instead) until
+            // a clean Ok cycle clears the episode.
             if state.remint_attempted_this_episode
+                && !remint_cap_reached(state.remint_attempts_this_episode)
                 && should_rearm_remint_latch(state.consecutive_invalid)
             {
                 state.remint_attempted_this_episode = false;
@@ -680,6 +798,12 @@ fn apply_remint_decision(
     match decision {
         RemintDecision::Trigger => {
             state.remint_attempted_this_episode = true;
+            // H1b: one unit of the per-episode mint budget is spent the
+            // moment a mint is ATTEMPTED (success or failure — a
+            // "successful" mint that leaves the profile invalid is the
+            // dead-dataPlan class the cap page exists for).
+            state.remint_attempts_this_episode =
+                state.remint_attempts_this_episode.saturating_add(1);
             *last_remint_at = Some(Instant::now());
         }
         RemintDecision::RefuseLockLost => {
@@ -780,8 +904,43 @@ struct WatchdogState {
     /// RefuseLockLost so at most ONE re-mint fires per re-arm window; a
     /// clean Ok cycle resets it, and GAP-04 re-arms it every
     /// [`REMINT_REARM_FAILING_CYCLES`] failing cycles of a persisting
-    /// episode (~30 min retry cadence, silent).
+    /// episode (~30 min retry cadence, silent) — until the H1b
+    /// per-episode cap is spent.
     remint_attempted_this_episode: bool,
+    /// H1b (2026-07-14 fix round): total forced re-mints fired THIS
+    /// episode. The GAP-04 re-arm stops at
+    /// [`REMINT_MAX_ATTEMPTS_PER_EPISODE`]; a clean Ok cycle resets.
+    remint_attempts_this_episode: u32,
+    /// H1a (2026-07-14 fix round): once-per-episode Telegram latch for
+    /// the family-(3) `AuthenticationFailed` Critical — set by
+    /// [`take_terminal_page`] the first time the episode pages (terminal
+    /// mint failure OR the H1b attempt-cap page); a clean Ok cycle
+    /// resets. Without it the GAP-04 re-arm re-paged the SAME dead-token
+    /// episode every ~30 minutes.
+    terminal_paged_this_episode: bool,
+}
+
+/// H1a. Pure. Returns `true` exactly once per failing episode — the
+/// caller may fire the family-(3) Critical iff this returns `true`. Sets
+/// the latch as a side effect; [`apply_cycle_outcome`]'s `Ok` arm resets
+/// it when the episode clears.
+fn take_terminal_page(state: &mut WatchdogState) -> bool {
+    if state.terminal_paged_this_episode {
+        return false;
+    }
+    state.terminal_paged_this_episode = true;
+    true
+}
+
+/// H1b. Pure. True iff the episode has reached the state where the
+/// attempt-cap page is due: the failing threshold was crossed AND the
+/// per-episode mint budget is spent (all mints fired, profile still
+/// REAL-invalid on the current cycle — the caller additionally gates on
+/// `outcome == RealAuthFail` so a REST-surface/transient cycle can never
+/// fire it). Once-per-episode delivery is [`take_terminal_page`]'s job.
+fn remint_cap_exhausted(state: &WatchdogState) -> bool {
+    state.consecutive_invalid >= CONSECUTIVE_INVALID_REMINT_THRESHOLD
+        && remint_cap_reached(state.remint_attempts_this_episode)
 }
 
 /// Pure verdict — isolates the decision logic from IO so tests can
@@ -806,7 +965,12 @@ fn evaluate_transition(state: &WatchdogState, is_failing_now: bool) -> Transitio
     }
 }
 
-fn apply_transition(transition: Transition, state: &mut WatchdogState, reason: Option<String>) {
+fn apply_transition(
+    transition: Transition,
+    state: &mut WatchdogState,
+    reason: Option<String>,
+    outcome: CycleOutcome,
+) {
     match transition {
         Transition::NoOp => {}
         Transition::FirstFailure => {
@@ -814,13 +978,24 @@ fn apply_transition(transition: Transition, state: &mut WatchdogState, reason: O
             // SILENT since 2026-07-14 (Dhan noise lock): coded error! +
             // counter only — the MidSessionProfileInvalidated Critical
             // Telegram page is DELETED. The AUTH-GAP-05 re-mint machinery
-            // self-heals; only a TERMINAL re-mint failure pages (the
-            // family-(3) AuthenticationFailed arm in the loop above).
-            error!(
-                code = ErrorCode::AuthGap05ForcedRemintTriggered.code_str(),
-                reason = %reason,
-                "mid-session profile check FAILED — dataPlan / activeSegment / token may be invalid (silent; AUTH-GAP-05 self-heal engaged)"
-            );
+            // self-heals a REAL auth failure; only a TERMINAL re-mint
+            // failure / the H1b attempt-cap pages (the family-(3) arms in
+            // the loop above). M1 (fix round): the wording is
+            // class-accurate — a REST-surface degrade NEVER engages a
+            // re-mint, so its rising edge must not claim a self-heal.
+            if outcome == CycleOutcome::RestSurfaceDegraded {
+                error!(
+                    code = ErrorCode::AuthGap05ForcedRemintTriggered.code_str(),
+                    reason = %reason,
+                    "mid-session profile check FAILED — REST surface degraded (transport-failure class: 5xx/429/400/parse/unknown-send-leg); NO Dhan re-login attempted (this is not evidence the token is bad)"
+                );
+            } else {
+                error!(
+                    code = ErrorCode::AuthGap05ForcedRemintTriggered.code_str(),
+                    reason = %reason,
+                    "mid-session profile check FAILED — dataPlan / activeSegment / token may be invalid (silent; AUTH-GAP-05 self-heal engaged)"
+                );
+            }
             metrics::counter!("tv_mid_session_profile_alert_fired_total").increment(1);
             state.currently_failing = true;
         }
@@ -883,9 +1058,10 @@ mod tests {
             Transition::FirstFailure,
             &mut state,
             Some("test failure".to_string()),
+            CycleOutcome::RealAuthFail,
         );
         assert!(state.currently_failing);
-        apply_transition(Transition::Recovery, &mut state, None);
+        apply_transition(Transition::Recovery, &mut state, None, CycleOutcome::Ok);
         assert!(!state.currently_failing);
     }
 
@@ -1074,7 +1250,7 @@ mod tests {
             Transition::NoOp,
             "transient must NOT trigger the FirstFailure transition"
         );
-        apply_transition(t1, &mut state, None);
+        apply_transition(t1, &mut state, None, CycleOutcome::Transient);
         assert!(
             !state.currently_failing,
             "state must stay clean after a transient"
@@ -1358,6 +1534,7 @@ mod tests {
             currently_failing: true,
             consecutive_invalid: 1,
             remint_attempted_this_episode: false,
+            ..WatchdogState::default()
         };
         apply_cycle_outcome(&mut state, CycleOutcome::RestSurfaceDegraded, &flag);
         assert_eq!(
@@ -1531,6 +1708,7 @@ mod tests {
             currently_failing: true,
             consecutive_invalid: 3,
             remint_attempted_this_episode: true,
+            ..WatchdogState::default()
         };
         apply_cycle_outcome(&mut state, CycleOutcome::Ok, &flag);
         assert_eq!(state.consecutive_invalid, 0);
@@ -1562,6 +1740,7 @@ mod tests {
             currently_failing: false,
             consecutive_invalid: 1,
             remint_attempted_this_episode: false,
+            ..WatchdogState::default()
         };
         apply_cycle_outcome(&mut state, CycleOutcome::Transient, &flag);
         assert_eq!(state.consecutive_invalid, 1, "transient must not escalate");
@@ -1962,6 +2141,7 @@ mod tests {
             currently_failing: true,
             consecutive_invalid: CONSECUTIVE_INVALID_REMINT_THRESHOLD,
             remint_attempted_this_episode: true,
+            ..WatchdogState::default()
         };
         for _ in 0..4 {
             apply_cycle_outcome(&mut state, CycleOutcome::RestSurfaceDegraded, &flag);
@@ -1985,5 +2165,132 @@ mod tests {
         const _: () = assert!(REMINT_REARM_FAILING_CYCLES >= 2);
         // …at most 4 so a genuinely dead token keeps retrying within the hour.
         const _: () = assert!(REMINT_REARM_FAILING_CYCLES <= 4);
+    }
+
+    // ---------------------------------------------------------------
+    // H1 (2026-07-14 fix round) — once-per-episode terminal page +
+    // per-episode re-mint attempt cap.
+    // ---------------------------------------------------------------
+
+    /// H1b cap arithmetic: a persisting dead-token episode mints at
+    /// consecutive counts 2, 4, 6 and then STOPS — the GAP-04 re-arm is
+    /// blocked once the per-episode budget is spent, and the cap-page
+    /// condition becomes due exactly on the next REAL failing cycle.
+    #[test]
+    fn h1_cap_stops_rearm_after_max_attempts_per_episode() {
+        let flag = AtomicBool::new(true);
+        let mut state = WatchdogState::default();
+        let mut last_remint_at: Option<Instant> = None;
+        let mut mints = Vec::new();
+        for cycle in 1..=12u32 {
+            apply_cycle_outcome(&mut state, CycleOutcome::RealAuthFail, &flag);
+            let decision = decide_remint(
+                state.consecutive_invalid,
+                state.remint_attempted_this_episode,
+                true,
+                Some(true),
+            );
+            apply_remint_decision(&mut state, &mut last_remint_at, decision);
+            if decision == RemintDecision::Trigger {
+                mints.push(cycle);
+            }
+        }
+        assert_eq!(
+            mints,
+            vec![2, 4, 6],
+            "the episode must mint exactly REMINT_MAX_ATTEMPTS_PER_EPISODE \
+             (= {REMINT_MAX_ATTEMPTS_PER_EPISODE}) times, then stop — got {mints:?}"
+        );
+        assert_eq!(
+            state.remint_attempts_this_episode,
+            REMINT_MAX_ATTEMPTS_PER_EPISODE
+        );
+        assert!(
+            remint_cap_exhausted(&state),
+            "after the cap the cap-page condition must be due on a REAL failing cycle"
+        );
+    }
+
+    /// H1a latch: the family-(3) page fires at most ONCE per episode; a
+    /// clean Ok cycle resets the latch so the NEXT episode can page again.
+    #[test]
+    fn h1_terminal_page_latch_fires_once_per_episode_and_resets_on_ok() {
+        let flag = AtomicBool::new(true);
+        let mut state = WatchdogState::default();
+        assert!(take_terminal_page(&mut state), "first take must page");
+        assert!(
+            !take_terminal_page(&mut state),
+            "second take in the SAME episode must NOT page (the pre-fix bug: \
+             the GAP-04 re-arm re-paged every ~30 min)"
+        );
+        assert!(!take_terminal_page(&mut state));
+        // Episode clears — the latch re-arms for the next episode.
+        apply_cycle_outcome(&mut state, CycleOutcome::Ok, &flag);
+        assert!(
+            take_terminal_page(&mut state),
+            "a NEW episode after a clean Ok cycle must be able to page again"
+        );
+    }
+
+    /// H1b dead-dataPlan walk: every mint "succeeds" (no terminal failure)
+    /// yet the profile stays REAL-invalid — the cap page becomes due
+    /// exactly once, on the first failing cycle after the budget is spent,
+    /// and never again within the episode.
+    #[test]
+    fn h1_cap_page_fires_once_when_profile_stays_invalid_after_cap() {
+        let flag = AtomicBool::new(true);
+        let mut state = WatchdogState::default();
+        let mut last_remint_at: Option<Instant> = None;
+        let mut pages = Vec::new();
+        for cycle in 1..=12u32 {
+            apply_cycle_outcome(&mut state, CycleOutcome::RealAuthFail, &flag);
+            // The loop's cap-page block (H1b), replicated verbatim.
+            if remint_cap_exhausted(&state) && take_terminal_page(&mut state) {
+                pages.push(cycle);
+            }
+            let decision = decide_remint(
+                state.consecutive_invalid,
+                state.remint_attempted_this_episode,
+                true,
+                Some(true),
+            );
+            apply_remint_decision(&mut state, &mut last_remint_at, decision);
+        }
+        assert_eq!(
+            pages,
+            vec![7],
+            "the cap page must fire exactly ONCE, on the first REAL failing \
+             cycle after the third mint (consecutive 7) — got {pages:?}"
+        );
+    }
+
+    /// H1 regression floor: a transient blip followed by recovery pages
+    /// NOTHING — no mint, no cap condition, no latch consumed.
+    #[test]
+    fn h1_transient_then_recover_pages_nothing() {
+        let flag = AtomicBool::new(true);
+        let mut state = WatchdogState::default();
+        apply_cycle_outcome(&mut state, CycleOutcome::Transient, &flag);
+        assert!(!remint_cap_exhausted(&state));
+        assert_eq!(state.remint_attempts_this_episode, 0);
+        assert!(!state.terminal_paged_this_episode);
+        apply_cycle_outcome(&mut state, CycleOutcome::Ok, &flag);
+        assert_eq!(state, WatchdogState::default());
+    }
+
+    /// H3 classifier: the TokenManager mint-cooldown skip is recognized
+    /// prefix-anchored and must never be treated as a terminal failure.
+    #[test]
+    fn h3_mint_cooldown_refusal_is_prefix_anchored() {
+        let genuine = format!("{MINT_COOLDOWN_REFUSAL_REASON_PREFIX}: last mint was 40s ago");
+        assert!(is_mint_cooldown_refusal(&genuine));
+        // With the ApplicationError Display prefix (the rendered shape).
+        let rendered = format!("Dhan authentication failed: {genuine}");
+        assert!(is_mint_cooldown_refusal(&rendered));
+        // A server-controlled body embedding the literal mid-string must
+        // NOT classify (SEC-R1-3 prefix discipline).
+        let forged =
+            format!("generateAccessToken HTTP 500 body={MINT_COOLDOWN_REFUSAL_REASON_PREFIX}");
+        assert!(!is_mint_cooldown_refusal(&forged));
     }
 }

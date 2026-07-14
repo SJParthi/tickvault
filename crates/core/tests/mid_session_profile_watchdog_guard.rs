@@ -87,6 +87,13 @@ fn main_rs_spawns_mid_session_watchdog() {
 #[test]
 fn mid_session_watchdog_is_silent_except_terminal_auth_failure() {
     let src = read("crates/core/src/auth/mid_session_watchdog.rs");
+    // H2 (2026-07-14 fix round): scan the PRODUCTION region only — the
+    // pre-fix positive pin matched the MODULE DOC COMMENT, so deleting the
+    // real emit left the ratchet green (a vacuous-pass class bug).
+    let production = src
+        .split("#[cfg(test)]")
+        .next()
+        .expect("split always yields at least one segment");
     for banned in ["MidSessionProfileInvalidated", "TokenForcedRemintTriggered"] {
         // Grep the SOURCE for constructor sites (`NotificationEvent::X`)
         // — the doc-comment mentions of the deleted variants are fine.
@@ -97,19 +104,38 @@ fn mid_session_watchdog_is_silent_except_terminal_auth_failure() {
              — a fresh dated operator quote is required first)."
         );
     }
-    // The ONE allowed Telegram: the family-(3) token-unobtainable Critical
-    // on a terminal forced-re-mint failure.
-    assert!(
-        src.contains("NotificationEvent::AuthenticationFailed"),
-        "the terminal forced-re-mint failure must page the family-(3) \
-         AuthenticationFailed Critical — silent terminal failure is a \
-         Rule-11 false-OK."
+    // The ONE allowed Telegram: the family-(3) token-unobtainable Critical,
+    // once per failing episode, from exactly TWO delivery arms — the
+    // terminal forced-re-mint failure and the H1b attempt-cap page. H2: pin
+    // the CALL FORM (`.notify(NotificationEvent::AuthenticationFailed`) in
+    // the production region — a doc comment can never satisfy this needle
+    // (the module doc deliberately avoids spelling the constructor path).
+    let call_form = ".notify(NotificationEvent::AuthenticationFailed";
+    let emit_count = production.matches(call_form).count();
+    assert_eq!(
+        emit_count, 2,
+        "the watchdog must carry exactly TWO family-(3) AuthenticationFailed \
+         emit CALL SITES in production code (terminal mint failure + the H1b \
+         attempt-cap page) — found {emit_count}. Zero = silent terminal \
+         failure (Rule-11 false-OK); more = a new page needs a fresh dated \
+         operator quote in dhan-rest-only-noise-lock-2026-07-14.md first."
     );
-    // GAP-04: the silent latch re-arm must stay wired.
+    // H1a: both emits must be gated by the once-per-episode latch.
+    assert!(
+        production.contains("take_terminal_page"),
+        "the family-(3) page must be once-per-episode via take_terminal_page \
+         — without the latch the GAP-04 re-arm re-pages every ~30 min."
+    );
+    // GAP-04: the silent latch re-arm must stay wired, bounded by the H1b cap.
     assert!(
         src.contains("should_rearm_remint_latch"),
         "the GAP-04 latch re-arm (~30-min silent retry cadence) must stay \
          wired — deleting it stalls the self-heal after one attempt."
+    );
+    assert!(
+        production.contains("remint_cap_reached"),
+        "the H1b per-episode attempt cap must bound the GAP-04 re-arm — \
+         without it a dead-dataPlan token re-mints ~48 times/day silently."
     );
 }
 
