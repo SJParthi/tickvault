@@ -64,14 +64,23 @@ EXCEPT `rate_limited`, which fires per-request by design (see below):
 
 | stage | Meaning |
 |---|---|
-| `fetch_failed` | ≥1 chain/spot request on the lane ended Timeout / Transport / Auth / Malformed after the retry budget |
+| `fetch_failed` | ≥1 chain/spot request on the lane ended Timeout / Transport / Auth / Malformed AFTER the retry budget (Dhan: no in-cycle retry admitted / the retry itself failed; Groww: the fallback attempt failed) with the cell still missing — never a first-attempt-then-retried-OK blip, and never the Empty class (that has its own stages below) |
 | `rate_limited` | a broker 429 arrived DESPITE the gates — per-request (rare by construction; every occurrence is a gate-bug signal worth its own line), arms the ladder, NEVER blind-retried |
-| `spot_empty` | a spot leg returned 2xx-without-data (the Dhan 200-empty class) |
+| `spot_empty` | a spot leg returned 2xx-without-data (the Dhan 200-empty saga class; EITHER lane — dry-run returns Empty on every fire by design, see the dry-run note below); does NOT arm the ladder |
+| `chain_empty` | a chain leg returned 2xx-without-usable-data (EITHER lane); does NOT arm the ladder — kept distinct from `fetch_failed` so a 200-empty is never misread as a transport failure |
 | `groww_fallback` | the Groww T+800 verdict found failed burst legs — the sequential fallback engaged |
-| `cross_fill` | the lane's own spot never arrived; the OTHER lane's fresh same-minute spot filled it (provenance stamped `CrossSource`) |
-| `chain_embedded_spot` | third-rung provenance: the chain response's own embedded underlying spot filled the cell |
-| `moneyness_unknown` | ≥1 underlying's fold classified Unknown (spot unusable / rows unclassifiable) |
+| `cross_fill` | the lane's OWN fetch path exhausted (every own fire completed/failed, retries spent) without the cell; the OTHER lane's fresh same-minute data filled it (provenance stamped `CrossSource`). The fallback rungs run only on own-path exhaustion or at the cutoff — never preempting a still-scheduled own fire (design §5 resolution order) |
+| `chain_embedded_spot` | third-rung provenance: the chain response's own embedded underlying spot filled the cell (own path exhausted first, as above) |
+| `moneyness_unknown` | ≥1 underlying's fold classified Unknown (spot unusable / rows unclassifiable / registry snapshot refused by the decide-time guard: unconfirmed publish, wrong minute, stale, or the boot sentinel) |
 | `ladder_exhausted` | the failure ladder hit its max rung (5) — edge-latched ONCE per episode, re-armed by a clean cycle |
+
+**Dry-run note (honest — not an incident):** with the
+`DryRunLoggingExecutor` every fire returns Empty, so EVERY enabled dry-run
+cycle also emits ONE coalesced CADENCE-01 per lane whose stages are the
+empty classes (`chain_empty,spot_empty` on Dhan; `chain_empty,spot_empty,
+groww_fallback` on Groww). That is the same honest end-to-end timing
+signal as the §2 dry-run skip flood — NOT broker degradation; a real
+broker problem shows as `fetch_failed` / `rate_limited` instead.
 
 **Triage:**
 1. `mcp__tickvault-logs__tail_errors` — find `CADENCE-01`; the payload carries
@@ -114,7 +123,8 @@ by `tv_cadence_late_response_total{lane}`; the decision is untouched.
    skips on one lane = that broker's surface is down — cross-check CADENCE-01
    stages and the capture legs' codes for the same window.
 3. Dry-run note: with the `DryRunLoggingExecutor` EVERY cycle skips (`cutoff` —
-   Empty results by design). That is the honest dry-run signal that the timing
+   Empty results by design) AND emits the §1 dry-run CADENCE-01 empty-stage
+   line per lane. Both are the honest dry-run signal that the timing
    machinery runs end-to-end, not an incident.
 
 **Delivery boundary (honest — no false-OK):** CADENCE-02 is **log-sink-only on
@@ -166,7 +176,10 @@ self-corrected or self-reported; the operator inspects trends).
 > the deterministic replay proptest
 > (`crates/core/tests/cadence_zero_429_replay.rs`) drives 64-cycle days through
 > skew/jitter/failure/restart permutations and asserts zero spacing violations,
-> zero nominal-slot denials, and ≤1 decision per (lane, cycle). NOT claimed:
+> zero nominal-slot denials, exactly 1 decision per (lane, cycle), no DECIDED
+> outcome past the lane cutoff, exactly-once snapshot publication per
+> successful chain fetch, and a non-vacuous 64-full-cycle activity floor.
+> NOT claimed:
 > that the BROKER never 429s — a shared-budget co-tenant (BruteX) or a
 > broker-side tightening can still produce one, which is typed
 > `rate_limited`, arms the ladder, and is never blind-retried; that dry-run

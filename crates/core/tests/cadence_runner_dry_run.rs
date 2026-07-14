@@ -28,7 +28,7 @@ use tickvault_core::cadence::executor::{
     SpotSnapshot, SpotTarget,
 };
 use tickvault_core::cadence::runner::{
-    CadenceClock, CadenceRunnerDeps, LoopExit, run_cadence_loop,
+    CadenceClock, CadenceRunnerDeps, LoopExit, run_cadence_loop, spawn_supervised_cadence_runner,
 };
 use tickvault_core::pipeline::chain_snapshot::ChainUnderlying;
 use tokio::sync::Notify;
@@ -322,13 +322,19 @@ async fn test_cadence_runner_dry_run_full_cycle_emits_decisions_or_skips() {
             )
         })
         .count();
-    assert!(
-        (3..=6).contains(&dhan_chains),
-        "Dhan chain fires (primaries + bounded grid retries): {dhan_chains}"
+    // EXACT counts (deterministic all-Empty script): Empty IS retryable
+    // in-cycle (may_retry_in_cycle) and every retry slot lands inside the
+    // :15 cutoff — 3 chain primaries + 3 grid retries, 4 spot singles +
+    // 4 appended retries. Exact equality pins that the RUNNER's retry
+    // insertion (handle_completion → insert_event) actually fires:
+    // deleting it would read 3/4 here.
+    assert_eq!(
+        dhan_chains, 6,
+        "Dhan chains: 3 primaries + 3 grid retries (all Empty)"
     );
-    assert!(
-        (4..=8).contains(&dhan_spots),
-        "Dhan spot fires (singles + bounded appended retries): {dhan_spots}"
+    assert_eq!(
+        dhan_spots, 8,
+        "Dhan spots: 4 singles + 4 appended retries (all Empty)"
     );
     assert_eq!(
         groww_chains, 6,
@@ -438,6 +444,8 @@ fn test_decision_fires_instant_predicate_completes() {
             *u,
             ChainCell {
                 provenance: ChainProvenance::OwnFetch,
+                source_feed: Feed::Groww,
+                published_to_registry: true,
                 fetched_at_ms: 33_360_100,
                 minute_ist: FIRST_CYCLE_MINUTE,
                 embedded_spot: None,
@@ -495,4 +503,114 @@ fn test_honest_skip_at_cutoff_emits_alert_once() {
     if let DecisionOutcome::Skipped(reason) = snap.outcome {
         assert_eq!(reason.as_str(), "cutoff");
     }
+}
+
+// ---------------------------------------------------------------------------
+// Both-lanes-disabled park + supervisor shutdown
+// ---------------------------------------------------------------------------
+
+#[tokio::test(start_paused = true)]
+async fn test_cadence_runner_reenable_after_both_disabled_park_still_cycles() {
+    // A transient dual-disable must NOT burn the day's remaining
+    // boundaries: pre-fix, a both-lanes-disabled cycle resolved instantly
+    // and the day loop consumed every boundary up to 15:30 in one tick —
+    // re-enabling a lane minutes later could never produce another cycle
+    // until the next IST day. The park keeps the boundary horizon intact
+    // (level-triggered re-check, missed boundaries counted loud).
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let exec = Arc::new(RecordingExecutor {
+        log: Arc::clone(&log),
+        chain_verdict: empty_chain,
+        spot_verdict: empty_spot,
+    });
+    let shutdown = Arc::new(Notify::new());
+    let groww_enabled = Arc::new(AtomicBool::new(false));
+    let deps = CadenceRunnerDeps {
+        config: CadenceConfig::default(),
+        calendar: test_calendar(),
+        dhan_executor: Arc::clone(&exec),
+        groww_executor: Arc::clone(&exec),
+        dhan_enabled: Arc::new(AtomicBool::new(false)),
+        groww_enabled: Arc::clone(&groww_enabled),
+        shutdown: Arc::clone(&shutdown),
+    };
+    let clock = Arc::new(TestClock {
+        anchor: tokio::time::Instant::now(),
+        base_wall_ms: BASE_WALL_MS,
+        date: NaiveDate::from_ymd_opt(2026, 7, 14).expect("valid date"), // Tuesday
+    });
+    let task = tokio::spawn(run_cadence_loop(clock, deps));
+
+    // ~3 minutes parked with BOTH lanes disabled (paused time advances
+    // through the park polls instantly).
+    for _ in 0..180 {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+    {
+        // Nothing may have fired while parked.
+        // APPROVED (test-only): poisoned mutex propagates the panic.
+        #[allow(clippy::unwrap_used)]
+        let calls = log.lock().unwrap().clone();
+        assert!(calls.is_empty(), "no fires while both lanes are disabled");
+    }
+    // Re-enable Groww: the runner must resume at the NEXT joinable
+    // boundary (boundaries were NOT consumed while parked).
+    groww_enabled.store(true, std::sync::atomic::Ordering::Release);
+    for _ in 0..180 {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+    shutdown.notify_waiters();
+    let exit = tokio::time::timeout(std::time::Duration::from_secs(120), task)
+        .await
+        .expect("runner must exit after shutdown")
+        .expect("runner task must not panic");
+    assert_eq!(exit, LoopExit::Shutdown);
+
+    // APPROVED (test-only): poisoned mutex propagates the panic.
+    #[allow(clippy::unwrap_used)]
+    let calls = log.lock().unwrap().clone();
+    assert!(
+        calls.iter().any(|c| matches!(
+            c,
+            RecordedCall::Chain {
+                feed: Feed::Groww,
+                ..
+            } | RecordedCall::Spot {
+                feed: Feed::Groww,
+                ..
+            }
+        )),
+        "the Groww lane must fire again after the re-enable — the day's \
+         boundaries were not burned by the disabled park"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_cadence_supervisor_graceful_shutdown_not_respawning() {
+    // The SUPERVISOR itself (spawn_supervised_cadence_runner, system
+    // clock): a graceful shutdown terminates it without a respawn. Both
+    // lanes disabled ⇒ the inner loop parks in a shutdown-responsive
+    // select regardless of the real wall-clock instant this test runs at
+    // (in-session parks on the disabled gate; off-session parks on the
+    // calendar/window gate).
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let exec = Arc::new(RecordingExecutor {
+        log,
+        chain_verdict: empty_chain,
+        spot_verdict: empty_spot,
+    });
+    let (deps, shutdown) = deps_with(exec, false, false);
+    let handle = spawn_supervised_cadence_runner(deps);
+    // Notify repeatedly: Notify carries no pre-registration permit for
+    // notify_waiters, so keep signalling until the supervisor observes it.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !handle.is_finished() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the supervisor must exit on graceful shutdown"
+        );
+        shutdown.notify_waiters();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    handle.await.expect("supervisor task must not panic");
 }

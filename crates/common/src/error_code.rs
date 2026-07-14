@@ -1024,13 +1024,16 @@ pub enum ErrorCode {
     // failure ladder, event-driven per-lane decisions. DEFAULT-OFF.
     // See cadence-error-codes.md.
     // -----------------------------------------------------------------------
-    /// CADENCE-01: a cadence lane DEGRADED this cycle — a fetch failed
+    /// CADENCE-01: a cadence lane DEGRADED this cycle — a non-Empty fetch
+    /// failure ended terminal after the retry budget
     /// (`stage="fetch_failed"`), a 429 arrived despite the gates
-    /// (`stage="rate_limited"` — also a gate-bug signal), a Dhan spot
-    /// returned 200-empty (`stage="spot_empty"`), the Groww burst fell back
-    /// (`stage="groww_fallback"`), a lane borrowed the other broker's data
-    /// (`stage="cross_fill"`), a spot resolved from the chain-embedded
-    /// price (`stage="chain_embedded_spot"`), moneyness classified Unknown
+    /// (`stage="rate_limited"` — also a gate-bug signal), a spot returned
+    /// 200-empty (`stage="spot_empty"`, either lane), a chain returned
+    /// 200-empty (`stage="chain_empty"`, either lane), the Groww burst
+    /// fell back (`stage="groww_fallback"`), a lane borrowed the other
+    /// broker's data after its own path exhausted (`stage="cross_fill"`),
+    /// a spot resolved from the chain-embedded price
+    /// (`stage="chain_embedded_spot"`), moneyness classified Unknown
     /// (`stage="moneyness_unknown"`), or the failure ladder exhausted its
     /// floor (`stage="ladder_exhausted"`, edge-latched per episode). ONE
     /// coalesced emission per (lane, cycle), never per-request.
