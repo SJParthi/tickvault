@@ -16,7 +16,8 @@ use metrics::counter;
 use secrecy::{ExposeSecret, SecretString};
 use tracing::{debug, error, info, instrument, warn};
 
-use tickvault_common::order_types::{OrderStatus, OrderUpdate};
+use tickvault_common::error_code::ErrorCode;
+use tickvault_common::order_types::{OrderStatus, OrderUpdate, TransactionType};
 
 use super::api_client::OrderApiClient;
 use super::circuit_breaker::OrderCircuitBreaker;
@@ -25,9 +26,9 @@ use super::rate_limiter::OrderRateLimiter;
 use super::reconciliation::reconcile_orders;
 use super::state_machine::{is_valid_transition, parse_order_status};
 use super::types::{
-    DhanModifyOrderRequest, DhanPlaceOrderRequest, EXCHANGE_SEGMENT_NSE_FNO,
+    DhanModifyOrderRequest, DhanPlaceOrderRequest, EXCHANGE_SEGMENT_NSE_FNO, FillEvent,
     MAX_MODIFICATIONS_PER_ORDER, ManagedOrder, ModifyOrderRequest, OmsError, PlaceOrderRequest,
-    ReconciliationReport,
+    ReconciliationReport, SEGMENT_CODE_UNKNOWN, parse_segment_chars,
 };
 
 // ---------------------------------------------------------------------------
@@ -545,8 +546,17 @@ impl OrderManagementSystem {
     /// Invalid transitions are logged at ERROR level (triggers Telegram alert).
     ///
     /// # Returns
-    /// `Ok(())` if the update was processed (even if the order is unknown).
-    pub fn handle_order_update(&mut self, update: &OrderUpdate) -> Result<(), OmsError> {
+    /// `Ok(Some(FillEvent))` when the update carried a POSITIVE executed-
+    /// quantity delta on a tracked order (the OMS → RiskEngine fill bridge,
+    /// order-runtime dry-run PR 2026-07-14 — the delta is computed HERE where
+    /// old and new `traded_qty` are adjacent, so duplicate / same-status
+    /// re-deliveries yield delta 0 → `Ok(None)`, double-count-safe).
+    /// `Ok(None)` when the update was processed without a new fill (unknown
+    /// order, unknown status, zero/negative delta).
+    pub fn handle_order_update(
+        &mut self,
+        update: &OrderUpdate,
+    ) -> Result<Option<FillEvent>, OmsError> {
         self.total_updates = self.total_updates.saturating_add(1);
 
         let order_id = &update.order_no;
@@ -570,7 +580,7 @@ impl OrderManagementSystem {
                     status = %update.status,
                     "order update for unknown order — ignoring"
                 );
-                return Ok(());
+                return Ok(None);
             }
         };
 
@@ -596,24 +606,27 @@ impl OrderManagementSystem {
                     status = %update.status,
                     "unknown order status in WebSocket update"
                 );
-                return Ok(());
+                return Ok(None);
             }
         };
 
         // Get mutable reference to order
         let order = match self.orders.get_mut(&order_id) {
             Some(o) => o,
-            None => return Ok(()),
+            None => return Ok(None),
         };
 
         // Validate transition
         let old_status = order.status;
         if old_status == new_status {
-            // Same status — just update fields (e.g., partial fill qty update)
+            // Same status — just update fields (e.g., partial fill qty update).
+            // Fill delta is computed BEFORE the copy so incremental
+            // PART_TRADED quantity refreshes still produce a FillEvent.
+            let fill = Self::extract_fill_delta(order, update);
             order.traded_qty = update.traded_qty;
             order.avg_traded_price = update.avg_traded_price;
             order.updated_at_us = now_epoch_us();
-            return Ok(());
+            return Ok(fill);
         }
 
         if !is_valid_transition(old_status, new_status) {
@@ -630,6 +643,9 @@ impl OrderManagementSystem {
                 to: new_status.as_str().to_owned(),
             });
         }
+
+        // Fill delta BEFORE the copy overwrites the previous traded_qty.
+        let fill = Self::extract_fill_delta(order, update);
 
         // Apply transition
         order.status = new_status;
@@ -656,7 +672,59 @@ impl OrderManagementSystem {
             "order state transition applied"
         );
 
-        Ok(())
+        Ok(fill)
+    }
+
+    /// Computes the executed-quantity DELTA between the tracked order and an
+    /// incoming update, converted to signed lots for `RiskEngine::record_fill`.
+    ///
+    /// - Delta = `update.traded_qty − order.traded_qty` (units). ≤ 0 → `None`
+    ///   (duplicate / regressing update — never a fill; a reconcile-class
+    ///   traded_qty DECREASE is corrected by the copy, not by a fill event).
+    /// - Lots = delta / `lot_size` (0 normalized to 1). A non-zero remainder
+    ///   is FLOORED and reported loudly (`OMS-GAP-01`) — Dhan fills arrive in
+    ///   lot multiples, so a remainder means a wire/lot-size anomaly.
+    /// - Sign from the tracked order's `transaction_type` (authoritative —
+    ///   the wire `TxnType` is serde-default and may be empty).
+    fn extract_fill_delta(order: &ManagedOrder, update: &OrderUpdate) -> Option<FillEvent> {
+        let qty_delta = update.traded_qty.saturating_sub(order.traded_qty);
+        if qty_delta <= 0 {
+            return None;
+        }
+        let lot_size = order.lot_size.max(1);
+        let lots_abs = qty_delta / i64::from(lot_size);
+        let remainder = qty_delta % i64::from(lot_size);
+        if remainder != 0 {
+            error!(
+                code = ErrorCode::OmsGapStateMachine.code_str(),
+                order_id = %order.order_id,
+                qty_delta,
+                lot_size,
+                remainder,
+                "OMS-GAP-01: partial-lot fill remainder — flooring to whole lots \
+                 (fill delta is not a lot multiple; wire/lot-size anomaly)"
+            );
+        }
+        if lots_abs == 0 {
+            return None;
+        }
+        // i64 → i32 clamp: a real fill can never approach i32::MAX lots;
+        // saturate defensively instead of panicking (annexure rule 15 class).
+        let lots = i32::try_from(lots_abs).unwrap_or(i32::MAX);
+        let fill_lots = match order.transaction_type {
+            TransactionType::Buy => lots,
+            TransactionType::Sell => lots.saturating_neg(),
+        };
+        let segment_code = parse_segment_chars(&update.exchange, &update.segment)
+            .map_or(SEGMENT_CODE_UNKNOWN, |seg| seg.binary_code());
+        Some(FillEvent {
+            security_id: order.security_id,
+            segment_code,
+            fill_lots,
+            avg_price: update.avg_traded_price,
+            lot_size,
+            order_id: order.order_id.clone(),
+        })
     }
 
     /// Runs reconciliation against the Dhan REST API.
@@ -1090,6 +1158,137 @@ mod tests {
         assert_eq!(order.status, OrderStatus::Traded);
         assert_eq!(order.traded_qty, 50);
         assert!(order.is_terminal());
+    }
+
+    // -----------------------------------------------------------------------
+    // FillEvent bridge (order-runtime dry-run PR, 2026-07-14) — the delta is
+    // computed in-engine, so re-deliveries can never double-count.
+    // -----------------------------------------------------------------------
+
+    /// A full-fill transition returns a FillEvent whose lots = delta/lot_size.
+    #[test]
+    fn handle_order_update_returns_fill_event_on_traded() {
+        let mut oms = make_oms_with_order("1", OrderStatus::Pending);
+        let mut update = make_order_update("1", "TRADED");
+        update.traded_qty = 50; // 50 units / lot_size 25 = 2 lots
+        update.avg_traded_price = 245.50;
+        update.exchange = "NSE".to_owned();
+        update.segment = "D".to_owned();
+
+        let fill = oms
+            .handle_order_update(&update)
+            .ok()
+            .flatten()
+            .expect("TRADED update with positive delta must yield a FillEvent"); // APPROVED: test
+        assert_eq!(fill.security_id, 52432);
+        assert_eq!(fill.fill_lots, 2, "Buy order → positive lots");
+        assert_eq!(fill.lot_size, 25);
+        assert!((fill.avg_price - 245.50).abs() < f64::EPSILON);
+        assert_eq!(
+            fill.segment_code,
+            tickvault_common::types::ExchangeSegment::NseFno.binary_code()
+        );
+        assert_eq!(fill.order_id, "1");
+    }
+
+    /// Same-status refresh (incremental PART_TRADED) yields the DELTA, not
+    /// the cumulative quantity (F2 double-count safety).
+    #[test]
+    fn test_same_status_refresh_applies_delta_not_cumulative() {
+        let mut oms = make_oms_with_order("1", OrderStatus::Pending);
+
+        // First partial: PENDING → PART_TRADED with 25 units filled.
+        let mut update = make_order_update("1", "PART_TRADED");
+        update.traded_qty = 25;
+        update.avg_traded_price = 100.0;
+        let fill = oms.handle_order_update(&update).ok().flatten();
+        assert_eq!(fill.map(|f| f.fill_lots), Some(1), "first 25 units = 1 lot");
+
+        // Same-status refresh: cumulative traded_qty rises 25 → 50.
+        let mut update2 = make_order_update("1", "PART_TRADED");
+        update2.traded_qty = 50;
+        update2.avg_traded_price = 101.0;
+        let fill2 = oms.handle_order_update(&update2).ok().flatten();
+        assert_eq!(
+            fill2.map(|f| f.fill_lots),
+            Some(1),
+            "delta = 50-25 = 25 units = 1 lot — NOT the cumulative 2 lots"
+        );
+    }
+
+    /// A byte-identical re-delivery (same cumulative traded_qty) yields
+    /// delta 0 → no FillEvent (WAL replay / broadcast duplicate safety).
+    #[test]
+    fn test_duplicate_update_zero_delta_skipped() {
+        let mut oms = make_oms_with_order("1", OrderStatus::Pending);
+        let mut update = make_order_update("1", "PART_TRADED");
+        update.traded_qty = 25;
+        update.avg_traded_price = 100.0;
+        assert!(oms.handle_order_update(&update).ok().flatten().is_some());
+        // Re-deliver the SAME update (same status, same cumulative qty).
+        let dup = oms.handle_order_update(&update).ok().flatten();
+        assert!(dup.is_none(), "duplicate re-delivery must yield NO fill");
+        // And a REGRESSING traded_qty (reconcile-class correction) too.
+        let mut regress = make_order_update("1", "PART_TRADED");
+        regress.traded_qty = 10;
+        let r = oms.handle_order_update(&regress).ok().flatten();
+        assert!(r.is_none(), "regressing traded_qty must never yield a fill");
+    }
+
+    /// A delta that is not a lot multiple is FLOORED (loud OMS-GAP-01 error
+    /// at the emit site); a sub-lot delta floors to zero lots → no event.
+    #[test]
+    fn test_partial_lot_remainder_floors_and_errors() {
+        let mut oms = make_oms_with_order("1", OrderStatus::Pending);
+        // 30 units on a 25-unit lot = 1 lot + remainder 5 → floored to 1.
+        let mut update = make_order_update("1", "PART_TRADED");
+        update.traded_qty = 30;
+        update.avg_traded_price = 100.0;
+        let fill = oms.handle_order_update(&update).ok().flatten();
+        assert_eq!(fill.map(|f| f.fill_lots), Some(1), "30/25 floors to 1 lot");
+
+        // Sub-lot delta: 30 → 40 (delta 10 < lot_size 25) → zero lots → None.
+        let mut update2 = make_order_update("1", "PART_TRADED");
+        update2.traded_qty = 40;
+        let fill2 = oms.handle_order_update(&update2).ok().flatten();
+        assert!(fill2.is_none(), "sub-lot delta floors to zero → no event");
+    }
+
+    /// Fill sign comes from the tracked ManagedOrder's transaction_type
+    /// (authoritative), never the serde-default wire TxnType.
+    #[test]
+    fn test_fill_sign_from_managed_order_transaction_type() {
+        // Sell order: positive traded_qty delta must yield NEGATIVE lots.
+        let mut oms = make_oms_with_order("1", OrderStatus::Pending);
+        if let Some(order) = oms.orders.get_mut("1") {
+            order.transaction_type = TransactionType::Sell;
+        }
+        let mut update = make_order_update("1", "TRADED");
+        update.traded_qty = 50;
+        update.avg_traded_price = 200.0;
+        // Wire TxnType left EMPTY (serde-default reality) — must not matter.
+        assert!(update.txn_type.is_empty());
+        let fill = oms
+            .handle_order_update(&update)
+            .ok()
+            .flatten()
+            .expect("fill expected"); // APPROVED: test
+        assert_eq!(fill.fill_lots, -2, "Sell order → negative lots");
+    }
+
+    /// Unknown exchange/segment chars map to the sentinel, never a panic.
+    #[test]
+    fn test_fill_event_unknown_segment_uses_sentinel() {
+        let mut oms = make_oms_with_order("1", OrderStatus::Pending);
+        let mut update = make_order_update("1", "TRADED");
+        update.traded_qty = 25;
+        // exchange/segment left empty by make_order_update.
+        let fill = oms
+            .handle_order_update(&update)
+            .ok()
+            .flatten()
+            .expect("fill expected"); // APPROVED: test
+        assert_eq!(fill.segment_code, SEGMENT_CODE_UNKNOWN);
     }
 
     #[test]

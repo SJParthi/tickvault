@@ -10,6 +10,7 @@
 
 use std::collections::HashMap;
 
+use tickvault_common::error_code::ErrorCode;
 use tracing::{error, info, instrument, warn};
 
 use super::types::{PositionInfo, RiskBreach, RiskCheck};
@@ -119,9 +120,7 @@ impl RiskEngine {
         }
 
         // Check 1: Daily loss threshold
-        let unrealized = self.total_unrealized_pnl();
-        let total_pnl = self.total_realized_pnl + unrealized;
-        let max_loss = self.capital * self.max_daily_loss_fraction;
+        let (total_pnl, max_loss) = self.daily_loss_state();
 
         // P&L is negative for losses; compare absolute value against threshold
         if total_pnl < 0.0 && total_pnl.abs() >= max_loss {
@@ -177,6 +176,9 @@ impl RiskEngine {
         lot_size: u32,
     ) {
         let pos = self.positions.entry(security_id).or_default();
+        // 2026-07-14 unrealized-P&L fix: store the lot size so mark-to-market
+        // P&L multiplies by the SAME contract multiplier realized P&L uses.
+        pos.lot_size = lot_size.max(1);
 
         // Check if this fill reduces or closes the position (generates realized P&L)
         let is_reducing =
@@ -231,6 +233,31 @@ impl RiskEngine {
             return;
         }
         self.market_prices.insert(security_id, current_price);
+    }
+
+    /// Mark-to-market daily-loss evaluation OUTSIDE the order path
+    /// (order-runtime dry-run PR, 2026-07-14): before this, the daily-loss
+    /// threshold was only checked inside `check_order`, so a drawdown with
+    /// no new signal never halted. The order runtime calls this ≤1/sec after
+    /// mark batches. Returns `true` when trading is (now) halted.
+    pub fn evaluate_daily_loss_halt(&mut self) -> bool {
+        if self.halted {
+            return true;
+        }
+        let (total_pnl, max_loss) = self.daily_loss_state();
+        if total_pnl < 0.0 && total_pnl.abs() >= max_loss {
+            self.trigger_halt(RiskBreach::MaxDailyLossExceeded);
+            return true;
+        }
+        false
+    }
+
+    /// Shared daily-loss computation: `(realized + unrealized, threshold)` —
+    /// used by both `check_order` and `evaluate_daily_loss_halt` so the two
+    /// paths can never drift.
+    fn daily_loss_state(&self) -> (f64, f64) {
+        let total_pnl = self.total_realized_pnl + self.total_unrealized_pnl();
+        (total_pnl, self.capital * self.max_daily_loss_fraction)
     }
 
     /// Manually halts trading (operator-initiated).
@@ -292,8 +319,22 @@ impl RiskEngine {
                 continue;
             }
             if let Some(&market_price) = self.market_prices.get(security_id) {
-                let unrealized = (pos.net_lots as f64) * (market_price - pos.avg_entry_price);
-                total += unrealized;
+                // 2026-07-14 fix (order-runtime dry-run PR): multiply by the
+                // contract lot size — previously omitted, so the daily-loss
+                // halt would have been 25-75x understated on options
+                // (a Rule-11 false-guarantee class). `max(1)` covers pre-fix
+                // Default rows and equities (lot_size 0 → 1).
+                let unrealized = (pos.net_lots as f64)
+                    * (market_price - pos.avg_entry_price)
+                    * f64::from(pos.lot_size.max(1));
+                // Defensive finiteness guard: with the lot_size multiplier an
+                // ABSURD (finite-but-huge, ~1e307) price could overflow the
+                // product to ±inf and poison the total. Conservative-skip,
+                // same policy as the missing-market-price arm above —
+                // unreachable with real NSE prices (stress-test pinned).
+                if unrealized.is_finite() {
+                    total += unrealized;
+                }
             }
             // Conservative: skip securities without a market price
         }
@@ -332,13 +373,17 @@ impl RiskEngine {
 
     fn trigger_halt(&mut self, breach: RiskBreach) {
         if !self.halted {
-            // Gap 2 fix: ERROR level triggers Telegram via Loki → Grafana.
-            // Previously WARN — operator was unaware trading was halted.
+            // ERROR level + typed code (2026-07-14: the previously-uncoded
+            // halt error gains `code = RISK-GAP-01` per charter rule 5; the
+            // stale "via Loki → Grafana" routing claim is retired — the
+            // reachable page is the RiskAlertSink → NotificationService
+            // Telegram below, wired by the order runtime).
             error!(
+                code = ErrorCode::RiskGapPreTrade.code_str(),
                 breach = ?breach,
                 realized_pnl = self.total_realized_pnl,
-                "CRITICAL: RISK BREACH — trading HALTED. ALL orders blocked. \
-                 Investigate immediately."
+                "RISK-GAP-01 CRITICAL: RISK BREACH — trading HALTED. ALL orders \
+                 blocked. Investigate immediately."
             );
             self.halted = true;
             self.halt_reason = Some(breach);
@@ -1025,8 +1070,61 @@ mod tests {
         let mut engine = make_engine();
         engine.record_fill(1001, 10, 100.0, 25);
         engine.update_market_price(1001, 110.0);
-        // unrealized = 10 * (110 - 100) = 100 (per-lot, not multiplied by lot_size here)
-        assert!((engine.total_unrealized_pnl() - 100.0).abs() < f64::EPSILON);
+        // 2026-07-14 fix (order-runtime dry-run PR): unrealized now multiplies
+        // by lot_size, symmetric with realized P&L. Before this fix the pinned
+        // value here was 100.0 (per-lot) — a 25x understatement that would
+        // have hollowed out the daily-loss halt on options.
+        // unrealized = 10 * (110 - 100) * 25 = 2500
+        assert!((engine.total_unrealized_pnl() - 2500.0).abs() < f64::EPSILON);
+    }
+
+    /// 2026-07-14 asserting test for the lot_size fix: realized and
+    /// unrealized P&L must use the SAME contract multiplier.
+    #[test]
+    fn test_unrealized_pnl_multiplies_lot_size() {
+        let mut engine = make_engine();
+        // Long 4 lots at 100 with lot_size 75 (BANKNIFTY-class contract).
+        engine.record_fill(2001, 4, 100.0, 75);
+        engine.update_market_price(2001, 90.0);
+        // unrealized = 4 * (90 - 100) * 75 = -3000
+        assert!((engine.total_unrealized_pnl() - (-3000.0)).abs() < f64::EPSILON);
+        // Close at the same 90 → realized must equal the prior unrealized.
+        engine.record_fill(2001, -4, 90.0, 75);
+        assert!((engine.total_realized_pnl() - (-3000.0)).abs() < f64::EPSILON);
+        assert!((engine.total_unrealized_pnl() - 0.0).abs() < f64::EPSILON);
+    }
+
+    /// 2026-07-14: mark-to-market halt evaluation between signals — a
+    /// drawdown with NO new order must now halt via
+    /// `evaluate_daily_loss_halt` (previously only `check_order` evaluated
+    /// the threshold).
+    #[test]
+    fn test_evaluate_daily_loss_halt_boundary() {
+        // 2% of 1_000_000 = 20_000 max loss.
+        let mut engine = make_engine();
+        // Long 8 lots at 100, lot_size 25.
+        engine.record_fill(1001, 8, 100.0, 25);
+        // Mark just above the loss boundary: 8 * (0.05 - 100)… use exact
+        // arithmetic — loss = 8 * (mark - 100) * 25; boundary at -20_000
+        // needs mark = 0. Use a bigger position instead: 100 lots.
+        engine.record_fill(1001, 92, 100.0, 25); // now 100 lots @ 100
+        // Loss just BELOW threshold: 100 * (92.01 - 100) * 25 = -19_975
+        engine.update_market_price(1001, 92.01);
+        assert!(
+            !engine.evaluate_daily_loss_halt(),
+            "below the threshold must not halt"
+        );
+        assert!(!engine.is_halted());
+        // Loss exactly AT threshold: 100 * (92 - 100) * 25 = -20_000
+        engine.update_market_price(1001, 92.0);
+        assert!(
+            engine.evaluate_daily_loss_halt(),
+            "at the inclusive boundary the mark-to-market halt must fire"
+        );
+        assert!(engine.is_halted());
+        assert_eq!(engine.halt_reason(), Some(RiskBreach::MaxDailyLossExceeded));
+        // Idempotent: once halted, stays halted (returns true, no re-trigger).
+        assert!(engine.evaluate_daily_loss_halt());
     }
 
     // -----------------------------------------------------------------------
@@ -1171,8 +1269,8 @@ mod tests {
         // Short 10 at 200
         engine.record_fill(1001, -10, 200.0, 25);
         engine.update_market_price(1001, 190.0);
-        // unrealized = -10 * (190 - 200) = -10 * -10 = 100
-        assert!((engine.total_unrealized_pnl() - 100.0).abs() < f64::EPSILON);
+        // unrealized = -10 * (190 - 200) * 25 = 2500 (lot_size fix 2026-07-14)
+        assert!((engine.total_unrealized_pnl() - 2500.0).abs() < f64::EPSILON);
     }
 
     // -----------------------------------------------------------------------

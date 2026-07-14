@@ -541,12 +541,27 @@ async fn run_trading_pipeline(
             update_result = order_update_receiver.recv() => {
                 match update_result {
                     Ok(update) => {
-                        if let Err(err) = oms.handle_order_update(&update) {
-                            warn!(
-                                ?err,
-                                order_no = %update.order_no,
-                                "order update handling error"
-                            );
+                        match oms.handle_order_update(&update) {
+                            // Order-runtime dry-run PR (2026-07-14): the fill
+                            // bridge — executed-quantity deltas now reach the
+                            // risk engine, so net_lots/P&L/EXIT-close work on
+                            // this (dormant, dhan-on) path too.
+                            Ok(Some(fill)) => {
+                                risk_engine.record_fill(
+                                    fill.security_id,
+                                    fill.fill_lots,
+                                    fill.avg_price,
+                                    fill.lot_size,
+                                );
+                            }
+                            Ok(None) => {}
+                            Err(err) => {
+                                warn!(
+                                    ?err,
+                                    order_no = %update.order_no,
+                                    "order update handling error"
+                                );
+                            }
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(skipped)) => {
