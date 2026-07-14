@@ -1,55 +1,59 @@
-# Dhan live-docs crawl list — 2026-07-13
-#
-# Provenance: docs/dhan-ref/verification-2026-07-13.md §3 (the operator
-# paste list from the 2026-07-13 search-index verification sweep, branch
-# claude/dhan-docs-verification-2026-07-13). The sandbox proxy 403-blocks
-# every Dhan host; this list is fetched runner-side by
-# .github/workflows/docs-fetch.yml where egress is open.
-#
-# Format: `SEED <url>` = fetched AND nav-crawled for doc links;
-# bare `<url>` = fetched only; `#` = comment.
-
-# Nav roots (seed the discovery crawl — defines the completeness universe)
-SEED https://dhanhq.co/docs/v2/
-SEED https://docs.dhanhq.co/
-
-# The 21 dhan-ref section pages (verification §3 checklist)
-https://dhanhq.co/docs/v2/authentication/
-https://dhanhq.co/docs/v2/live-market-feed/
-https://dhanhq.co/docs/v2/full-market-depth/
-https://dhanhq.co/docs/v2/historical-data/
-https://dhanhq.co/docs/v2/option-chain/
-https://dhanhq.co/docs/v2/orders/
-https://dhanhq.co/docs/v2/super-order/
-https://dhanhq.co/docs/v2/forever/
-https://dhanhq.co/docs/v2/conditional-trigger/
-https://dhanhq.co/docs/v2/edis/
-https://dhanhq.co/docs/v2/postback/
-https://dhanhq.co/docs/v2/annexure/
-https://dhanhq.co/docs/v2/instruments/
-https://dhanhq.co/docs/v2/order-update/
-https://dhanhq.co/docs/v2/market-quote/
-https://dhanhq.co/docs/v2/portfolio/
-https://dhanhq.co/docs/v2/funds/
-https://dhanhq.co/docs/v2/statements/
-https://dhanhq.co/docs/v2/traders-control/
-https://dhanhq.co/docs/v2/releases/
-
-# Snapshot-only coverage (no dhan-ref file)
-https://dhanhq.co/docs/v2/expired-options-data/
-
-# NEW docs portal pages named in verification §3 / §4 flag 7
-https://docs.dhanhq.co/api/v2/authentication/renew-token
-https://docs.dhanhq.co/api/v2/funds/calculate-multi-margin
-
-# Portal content probes (added after run 1: every docs.dhanhq.co route
-# returned the IDENTICAL 33,884-byte Docusaurus root shell — SPA/CDN
-# rewrite. Probe the LLM-export + .md + trailing-slash forms.)
-https://docs.dhanhq.co/llms.txt
-https://docs.dhanhq.co/llms-full.txt
-https://docs.dhanhq.co/api/v2/authentication/renew-token/
-https://docs.dhanhq.co/api/v2/authentication/renew-token.md
-https://docs.dhanhq.co/api/v2/funds/calculate-multi-margin/
-https://docs.dhanhq.co/api/v2/funds/calculate-multi-margin.md
-https://docs.dhanhq.co/api/v2/guides/rate-limits.md
-https://dhanhq.co/sitemap-api-docs.xml
+# GDF crawl list — from the GDF docs session (PR #1511), 2026-07-14
+# All were HTTP-403 from sandbox+Anthropic egress on 2026-07-13.
+# SEED pages carry the docs sidebar / are section indexes — link-extract them: hunting 5 slug-unknown pages:
+#   SubscribeSnapshot, GetLimitation (WS), GetServerInfo (WS), StreamAllSnapshots, GetHolidays
+https://globaldatafeeds.in/authorised-data-vendors/
+SEED https://globaldatafeeds.in/apis/
+https://globaldatafeeds.in/nimbledatapro/
+https://globaldatafeeds.in/global-datafeeds-apis/global-datafeeds-apis/introduction/type-of-data-available/
+https://globaldatafeeds.in/global-datafeeds-apis/global-datafeeds-apis/introduction/type-of-apis-available/
+https://globaldatafeeds.in/global-datafeeds-apis/global-datafeeds-apis/introduction/introduction-to-apis/
+https://globaldatafeeds.in/global-datafeeds-apis/global-datafeeds-apis/pricing-sales/api-pricing/
+https://globaldatafeeds.in/global-datafeeds-apis/global-datafeeds-apis/pricing-sales/who-can-purchase/
+https://globaldatafeeds.in/global-datafeeds-apis/global-datafeeds-apis/faqs/faqs/
+SEED https://globaldatafeeds.in/global-datafeeds-apis/global-datafeeds-apis/websockets-api-documentation/how-to-connect-using-websockets-api/
+https://globaldatafeeds.in/global-datafeeds-apis/global-datafeeds-apis/websockets-api-documentation/authenticate/
+https://globaldatafeeds.in/global-datafeeds-apis/global-datafeeds-apis/websockets-api-documentation/function-subscriberealtime/
+https://globaldatafeeds.in/global-datafeeds-apis/global-datafeeds-apis/websockets-api-documentation/function-getsnapshot-2/
+https://globaldatafeeds.in/global-datafeeds-apis/global-datafeeds-apis/websockets-api-documentation/function-getlastquote-2/
+https://globaldatafeeds.in/global-datafeeds-apis/global-datafeeds-apis/websockets-api-documentation/getinstruments/
+https://globaldatafeeds.in/global-datafeeds-apis/global-datafeeds-apis/websockets-api-documentation/getstrikeprices-2/
+https://globaldatafeeds.in/global-datafeeds-apis/global-datafeeds-apis/websockets-api-documentation/function-gethistory-2/
+https://globaldatafeeds.in/global-datafeeds-apis/global-datafeeds-apis/websockets-api-documentation/gethistoryaftermarket-3/
+SEED https://globaldatafeeds.in/global-datafeeds-apis/global-datafeeds-apis/rest-api-documentation/how-to-connect-using-rest-api/
+https://globaldatafeeds.in/global-datafeeds-apis/global-datafeeds-apis/rest-api-documentation/function-gethistory/
+https://globaldatafeeds.in/global-datafeeds-apis/global-datafeeds-apis/rest-api-documentation/gethistoryaftermarket-2/
+https://globaldatafeeds.in/global-datafeeds-apis/global-datafeeds-apis/rest-api-documentation/function-getlastquotearray/
+https://globaldatafeeds.in/global-datafeeds-apis/global-datafeeds-apis/rest-api-documentation/function-getsnapshot/
+https://globaldatafeeds.in/global-datafeeds-apis/global-datafeeds-apis/rest-api-documentation/getexchangesnapshot/
+https://globaldatafeeds.in/global-datafeeds-apis/global-datafeeds-apis/rest-api-documentation/getlastquoteoptionchain/
+https://globaldatafeeds.in/global-datafeeds-apis/global-datafeeds-apis/rest-api-documentation/handling-special-characters/
+https://globaldatafeeds.in/global-datafeeds-apis/global-datafeeds-apis/greeks-api/subscriberealtimegreeks/
+https://globaldatafeeds.in/global-datafeeds-apis/global-datafeeds-apis/greeks-api/getlastquoteoptiongreeks/
+https://globaldatafeeds.in/global-datafeeds-apis/global-datafeeds-apis/greeks-api/getlastquotearrayoptiongreeks/
+https://globaldatafeeds.in/global-datafeeds-apis/global-datafeeds-apis/greeks-api/getlastquoteoptiongreekschain/
+https://globaldatafeeds.in/global-datafeeds-apis/global-datafeeds-apis/greeks-api/gethistorygreeks-2/
+https://globaldatafeeds.in/global-datafeeds-apis/global-datafeeds-apis/optionchain-api/subscribeoptionchain/
+SEED https://globaldatafeeds.in/global-datafeeds-apis/global-datafeeds-apis/advanced_streaming_api/
+https://globaldatafeeds.in/global-datafeeds-apis/global-datafeeds-apis/advanced_streaming_api/subscribeoptionchain/
+SEED https://globaldatafeeds.in/global-datafeeds-apis/global-datafeeds-apis/streaming_api/
+https://globaldatafeeds.in/global-datafeeds-apis/global-datafeeds-apis/streaming_api/stream-all-symbols/
+https://globaldatafeeds.in/global-datafeeds-apis/global-datafeeds-apis/delayed-api/getexchangesnapshot-delayed/
+https://globaldatafeeds.in/global-datafeeds-apis/global-datafeeds-apis/documentation-support/diagnostic-api-responses/
+https://globaldatafeeds.in/global-datafeeds-apis/global-datafeeds-apis/documentation-support/api-fields-description/
+https://globaldatafeeds.in/global-datafeeds-apis/global-datafeeds-apis/documentation-support/symbol-naming-conventions/
+SEED https://globaldatafeeds.in/global-datafeeds-apis/documentation-support/documentation/websockets-api-documentation/
+SEED https://globaldatafeeds.in/global-datafeeds-apis/documentation-support/documentation/rest-api-documentation/
+SEED https://globaldatafeeds.in/global-datafeeds-apis/documentation-support/api-code-samples/
+https://globaldatafeeds.in/global-datafeeds-apis/global-datafeeds-apis/api-code-samples/websockets-python/
+https://globaldatafeeds.in/global-datafeeds-apis/global-datafeeds-apis/api-code-samples/websockets-java/
+https://globaldatafeeds.in/global-datafeeds-apis/global-datafeeds-apis/api-code-samples/websockets-nodejs/
+https://globaldatafeeds.in/global-datafeeds-apis/global-datafeeds-apis/api-code-samples/websockets-javascript-sample/
+https://globaldatafeeds.in/global-datafeeds-apis/global-datafeeds-apis/api-code-samples/rest-python/
+https://globaldatafeeds.in/global-datafeeds-apis/global-datafeeds-apis/api-code-samples/download-code-samples-2/
+https://globaldatafeeds.in/wp-content/uploads/2024/07/GFDL_Websocket_Python_Sample_AllFunctions.pdf
+https://globaldatafeeds.in/robots.txt
+SEED https://globaldatafeeds.in/sitemap.xml
+SEED https://globaldatafeeds.in/wp-sitemap.xml
+SEED https://docs.globaldatafeeds.in/
+https://docs.globaldatafeeds.in/getserverinfo-15575607e0

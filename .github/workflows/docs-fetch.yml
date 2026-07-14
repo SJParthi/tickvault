@@ -129,10 +129,8 @@ jobs:
 
           REQUESTED_COUNT=$(wc -l < "$FETCHED_URLS_FILE" | tr -d ' ')
 
-          # --- Sitemaps (best-effort, always attempted) ---
-          for sm in https://dhanhq.co/sitemap.xml https://docs.dhanhq.co/sitemap.xml; do
-            fetch_one "$sm" 0
-          done
+          # --- Sitemaps: covered by the list itself on this branch (GDF
+          # sitemap.xml / wp-sitemap.xml are SEED entries in urls.txt) ---
 
           # --- Pass 2: nav crawl from SEED pages ---
           DISCOVERED_FILE=$(mktemp)
@@ -153,7 +151,15 @@ jobs:
                     case "$href" in
                       https://dhanhq.co/docs/v2/*|https://docs.dhanhq.co/*) echo "$href" ;;
                       //dhanhq.co/docs/v2/*|//docs.dhanhq.co/*) echo "https:${href}" ;;
-                      /docs/v2/*|/api/v2/*) echo "${host}${href}" ;;
+                      https://globaldatafeeds.in/global-datafeeds-apis/*|https://www.globaldatafeeds.in/global-datafeeds-apis/*|https://docs.globaldatafeeds.in/*) echo "$href" ;;
+                      //globaldatafeeds.in/global-datafeeds-apis/*|//docs.globaldatafeeds.in/*) echo "https:${href}" ;;
+                      /docs/v2/*|/api/v2/*|/global-datafeeds-apis/*) echo "${host}${href}" ;;
+                      //*) ;;
+                      /*)
+                        case "$host" in
+                          https://docs.globaldatafeeds.in) echo "${host}${href}" ;;
+                        esac
+                        ;;
                     esac
                   done >> "$DISCOVERED_FILE" || true
             done < "$SEEDS_FILE"
