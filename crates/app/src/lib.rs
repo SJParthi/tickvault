@@ -213,6 +213,11 @@ pub mod lifecycle_reconcile_orchestrator;
 pub mod api_token_rotation;
 #[cfg(feature = "daily_universe_fetcher")]
 pub mod daily_universe_boot;
+/// 🔷 DHAN exit-order execution dispatcher (Cluster B, 2026-07-14) — the
+/// S6-G1 call-site hub for every engine exit method + LOCK #2's runtime
+/// `!cfg.enabled` gate. Cluster A constructs `ExitCommand`s; only this
+/// module executes them (never the engine methods directly).
+pub mod exit_execution;
 /// Cluster-C order-side observability (2026-07-14): OmsAlertSink /
 /// RiskAlertSink bridges → Telegram + the rebuilt SEBI order_audit /
 /// pnl_audit tables via one bounded mpsc(1024) consumer task; daily
