@@ -24,8 +24,8 @@
 //!     ts TIMESTAMP, trading_date_ist TIMESTAMP, feed SYMBOL, leg SYMBOL,
 //!     security_id LONG, exchange_segment SYMBOL, symbol SYMBOL,
 //!     attempts INT, final_http_status INT, fetch_latency_ms LONG,
-//!     close_to_data_ms LONG, rate_limited_count INT, outcome SYMBOL,
-//!     close_to_persist_ms LONG, rate_limited_count INT, outcome SYMBOL,
+//!     close_to_data_ms LONG, close_to_persist_ms LONG,
+//!     rate_limited_count INT, outcome SYMBOL,
 //!     error_class SYMBOL
 //! ) timestamp(ts) PARTITION BY DAY
 //!   DEDUP UPSERT KEYS(ts, trading_date_ist, feed, leg, security_id, exchange_segment, outcome);
