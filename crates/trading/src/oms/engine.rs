@@ -11,16 +11,24 @@
 //! Token access is via a callback trait to decouple from the core crate.
 
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
 
 use metrics::counter;
 use secrecy::{ExposeSecret, SecretString};
 use tracing::{debug, error, info, instrument, warn};
 
+use tickvault_common::constants::{
+    DATA_805_STOP_ALL_COOLDOWN_SECS, DH901_ROTATE_RETRY_DELAY_SECS, DH904_MAX_RETRY_ATTEMPTS,
+};
+use tickvault_common::error_code::ErrorCode;
 use tickvault_common::order_types::{OrderStatus, OrderUpdate};
 
 use super::api_client::OrderApiClient;
 use super::circuit_breaker::OrderCircuitBreaker;
+use super::error_taxonomy::{self, DhanErrorClass, OrderEndpoint, OrderErrorPolicy};
 use super::idempotency::CorrelationTracker;
+use super::order_readiness::{OrderReadinessState, ReadinessRefusal, evaluate_order_readiness};
 use super::rate_limiter::OrderRateLimiter;
 use super::reconciliation::reconcile_orders;
 use super::state_machine::{is_valid_transition, parse_order_status};
@@ -42,6 +50,17 @@ use super::types::{
 pub trait TokenProvider: Send + Sync {
     /// Returns the current valid access token, or an error.
     fn get_access_token(&self) -> Result<SecretString, OmsError>;
+
+    /// Requests an out-of-band token rotation through the EXISTING TokenManager
+    /// renewal machinery (`force_renewal_if_stale` / `renew_with_fallback` — the
+    /// H3 mint cooldown + RESILIENCE-03 lock stay upstream). The trading crate
+    /// NEVER mints. Default no-op: the DH-901/807 retry-once simply re-reads the
+    /// arc-swap's current token (the renewal loop/watchdog may have already
+    /// rotated it); if not, the second failure halts (901) or returns
+    /// TokenExpired (807). Returns whether a rotation was requested.
+    fn request_token_rotation(&self) -> bool {
+        false
+    }
 }
 
 /// OMS alert types fired to Telegram via the notification bridge.
@@ -59,6 +78,59 @@ pub enum OmsAlert {
         correlation_id: String,
         reason: String,
     },
+    /// Cluster B: a live order was refused by the readiness gate.
+    OrderReadinessRefused {
+        reason: &'static str,
+        correlation_id: String,
+    },
+    /// Cluster B: the order path HALTED after a broker account error.
+    OmsHalted { cause: &'static str, detail: String },
+    /// Cluster B: the DH-904 backoff ladder gave up.
+    Dh904LadderExhausted {
+        operation: &'static str,
+        attempts: u32,
+    },
+    /// Cluster B: DATA-805 STOP-ALL cooldown engaged.
+    OrderApiStopAll { cooldown_secs: u64 },
+}
+
+impl OmsAlert {
+    /// Operator-facing plain-English message. EVERY variant starts with
+    /// "🔷 DHAN" so any future sink inherits broker attribution (noise-lock
+    /// strategy — the sink has zero installers today). 10-commandments
+    /// compliant: plain English, specific numbers, action verbs on degraded.
+    #[must_use]
+    pub fn operator_message(&self) -> String {
+        match self {
+            Self::CircuitBreakerOpened {
+                consecutive_failures,
+            } => format!(
+                "🔷 DHAN — order safety switch TRIPPED after {consecutive_failures} failures in a row. No orders will be sent until the broker recovers."
+            ),
+            Self::CircuitBreakerClosed => {
+                "🔷 DHAN — order safety switch reset: orders are flowing again.".to_owned()
+            }
+            Self::RateLimitExhausted { limit_type } => format!(
+                "🔷 DHAN — order rate limit hit ({limit_type}). This order was NOT sent; it must not be retried."
+            ),
+            Self::OrderRejected {
+                correlation_id,
+                reason,
+            } => format!("🔷 DHAN — order {correlation_id} was REJECTED by the broker: {reason}"),
+            Self::OrderReadinessRefused { reason, .. } => format!(
+                "🔷 DHAN — live order REFUSED: the broker account is not order-ready ({reason}). Check the Dhan data plan, Derivative segment and token, then retry. No order was sent."
+            ),
+            Self::OmsHalted { cause, .. } => format!(
+                "🔷 DHAN — order system HALTED after a broker {cause} error. No more orders will be sent until an operator clears the halt. What to do RIGHT NOW: 1) check the Dhan account status 2) check the token 3) clear the halt once fixed."
+            ),
+            Self::Dh904LadderExhausted { attempts, .. } => format!(
+                "🔷 DHAN — order gave up after {attempts} rate-limit retries (~150 seconds). The broker is throttling us. The order was NOT placed."
+            ),
+            Self::OrderApiStopAll { cooldown_secs } => format!(
+                "🔷 DHAN — too many requests: ALL order calls paused for {cooldown_secs} seconds, then resume automatically."
+            ),
+        }
+    }
 }
 
 /// Callback trait for OMS → Telegram alerts.
@@ -109,6 +181,24 @@ pub struct OrderManagementSystem {
     /// `None` in tests; `Some` in production. Fires CircuitBreakerOpened/Closed,
     /// RateLimitExhausted, OrderRejected events.
     alert_sink: Option<Box<dyn OmsAlertSink>>,
+    /// Cluster B: order-readiness snapshot (LIVE path only). `None` ⇒ live
+    /// orders REFUSED (fail-closed). Installed by the boot seam.
+    readiness: Option<Arc<OrderReadinessState>>,
+    /// Cluster B: DH-901(post-retry)/902/903/DATA-810 halt latch. `reset_daily`
+    /// does NOT clear it — only `clear_order_halt` or a restart.
+    halt: Option<HaltInfo>,
+}
+
+/// Cluster B: order-path halt record. Set idempotently; cleared only by an
+/// operator (`clear_order_halt`) or a process restart.
+#[derive(Debug, Clone)]
+struct HaltInfo {
+    /// The Dhan code that caused the halt (e.g. "DH-901", "DATA-810").
+    cause: &'static str,
+    /// The sanitized/formatted underlying error detail.
+    detail: String,
+    /// When the halt engaged (IST epoch micros).
+    at_epoch_us: i64,
 }
 
 impl OrderManagementSystem {
@@ -141,6 +231,8 @@ impl OrderManagementSystem {
             dry_run: true,
             paper_order_counter: 0,
             alert_sink: None,
+            readiness: None,
+            halt: None,
         }
     }
 
@@ -156,10 +248,216 @@ impl OrderManagementSystem {
         self.alert_sink = Some(sink);
     }
 
-    /// Fires an OMS alert if a sink is wired. Best-effort — never blocks.
+    /// Fires an OMS alert if a sink is wired. Best-effort — never blocks. The
+    /// `warn!` makes every alert visible in the log sinks TODAY (sink installers
+    /// = zero) and gives `operator_message` its production call site.
     fn fire_alert(&self, alert: OmsAlert) {
+        warn!(alert = %alert.operator_message(), "OMS alert fired");
         if let Some(ref sink) = self.alert_sink {
             sink.fire(alert);
+        }
+    }
+
+    /// Installs the order-readiness snapshot (boot seam). Until installed, the
+    /// LIVE path fail-closes ORDER-READY-01 (reason=no_probe).
+    pub fn set_order_readiness(&mut self, state: Arc<OrderReadinessState>) {
+        self.readiness = Some(state);
+    }
+
+    /// Whether the OMS order path is halted (DH-901 post-retry / 902 / 903 / 810).
+    #[must_use]
+    pub fn is_order_halted(&self) -> bool {
+        self.halt.is_some()
+    }
+
+    /// Deliberate operator/boot-owner action to clear the order-path halt. Logs
+    /// the original cause on clear. `reset_daily` does NOT call this.
+    pub fn clear_order_halt(&mut self) {
+        if let Some(info) = self.halt.take() {
+            error!(
+                code = ErrorCode::OrderReady01GateRefused.code_str(),
+                cause = info.cause,
+                detail = %info.detail,
+                halted_since_us = info.at_epoch_us,
+                "🔷 DHAN — OMS order-path halt CLEARED by operator"
+            );
+            metrics::gauge!("tv_oms_halted").set(0.0);
+        }
+    }
+
+    /// Engage the halt latch idempotently. Returns `true` on the rising edge
+    /// (newly halted) so the caller alerts exactly once.
+    fn engage_halt(&mut self, cause: &'static str, detail: String) -> bool {
+        if self.halt.is_some() {
+            debug!(cause, "OMS order path already halted (idempotent)");
+            return false;
+        }
+        self.halt = Some(HaltInfo {
+            cause,
+            detail,
+            at_epoch_us: now_epoch_us(),
+        });
+        metrics::gauge!("tv_oms_halted").set(1.0);
+        metrics::counter!(
+            "tv_oms_halt_engaged_total",
+            "cause" => halt_cause_slug(cause),
+        )
+        .increment(1);
+        true
+    }
+
+    /// O(1) live-order gate: halt check + readiness evaluation. Place + Modify
+    /// ONLY (Cancel is exempt — exposure-reducing). First failure wins.
+    fn check_live_order_gates(
+        &mut self,
+        endpoint: OrderEndpoint,
+        correlation_id: &str,
+    ) -> Result<(), OmsError> {
+        if let Some(ref info) = self.halt {
+            let cause = info.cause;
+            return Err(OmsError::OrderPathHalted { cause });
+        }
+        let Some(state) = self.readiness.clone() else {
+            return self.refuse_readiness(ReadinessRefusal::NeverProbed, endpoint, correlation_id);
+        };
+        match evaluate_order_readiness(&state, now_epoch_s()) {
+            Ok(()) => Ok(()),
+            Err(refusal) => self.refuse_readiness(refusal, endpoint, correlation_id),
+        }
+    }
+
+    /// Emit an ORDER-READY-01 refusal (edge-latched loud, else debug) and return
+    /// the refusal error.
+    fn refuse_readiness(
+        &mut self,
+        refusal: ReadinessRefusal,
+        endpoint: OrderEndpoint,
+        correlation_id: &str,
+    ) -> Result<(), OmsError> {
+        let reason = refusal.slug();
+        // Rising edge iff there is no state (never-probed) or the state's latch
+        // flips clear→latched.
+        let rising = self.readiness.as_ref().is_none_or(|s| s.latch_refusal());
+        if rising {
+            error!(
+                code = ErrorCode::OrderReady01GateRefused.code_str(),
+                reason,
+                endpoint = order_endpoint_str(endpoint),
+                correlation_id,
+                "🔷 DHAN — live order REFUSED by the order-readiness gate"
+            );
+            self.fire_alert(OmsAlert::OrderReadinessRefused {
+                reason,
+                correlation_id: correlation_id.to_owned(),
+            });
+        } else {
+            debug!(reason, "order-readiness refusal (already latched)");
+        }
+        metrics::counter!("tv_order_readiness_refusals_total", "reason" => reason).increment(1);
+        Err(OmsError::OrderReadinessRefused { reason })
+    }
+
+    /// Apply the engine-layer policy for a surfaced order error. The wrapper
+    /// (`*_with_policy`) already ran the DH-904 ladder + 805 latch + Cancel
+    /// single-retry; this layer owns the auth rotate-retry-once, the halt latch,
+    /// the 806 readiness-poison, and the circuit-breaker decision (R19). Returns
+    /// the action the caller takes with the error it still owns.
+    async fn apply_engine_error_policy(
+        &mut self,
+        err: &OmsError,
+        endpoint: OrderEndpoint,
+        auth_retry_used: &mut bool,
+    ) -> EngineAction {
+        let Some(class) = error_taxonomy::classify_oms_error(err) else {
+            // Non-Dhan-surface error: default to tripping the breaker + pass through.
+            self.circuit_breaker.record_failure();
+            return EngineAction::PassThrough;
+        };
+        // Circuit-breaker decision (R19): halt/rate/refresh classes never trip.
+        if error_taxonomy::trips_circuit_breaker(class) {
+            self.circuit_breaker.record_failure();
+        }
+        match error_taxonomy::policy_for(class, endpoint) {
+            OrderErrorPolicy::RotateRetryOnceThenHalt => {
+                if !*auth_retry_used {
+                    *auth_retry_used = true;
+                    warn!(
+                        code = ErrorCode::Dh901InvalidAuth.code_str(),
+                        stage = "rotate_requested",
+                        "🔷 DHAN — auth invalid; rotating token and retrying once"
+                    );
+                    self.token_provider.request_token_rotation();
+                    tokio::time::sleep(Duration::from_secs(DH901_ROTATE_RETRY_DELAY_SECS)).await;
+                    EngineAction::Retry
+                } else {
+                    self.halt_with_alert("DH-901", err);
+                    EngineAction::Halt("DH-901")
+                }
+            }
+            OrderErrorPolicy::HaltAndAlert => {
+                let cause = halt_cause_for(class);
+                self.halt_with_alert(cause, err);
+                EngineAction::Halt(cause)
+            }
+            OrderErrorPolicy::TokenRefreshRetryOnce => {
+                if !*auth_retry_used {
+                    *auth_retry_used = true;
+                    warn!(
+                        code = error_taxonomy::error_code_for(class).code_str(),
+                        stage = "token_refresh_requested",
+                        "🔷 DHAN — token expired/invalid; refreshing and retrying once"
+                    );
+                    self.token_provider.request_token_rotation();
+                    tokio::time::sleep(Duration::from_secs(DH901_ROTATE_RETRY_DELAY_SECS)).await;
+                    EngineAction::Retry
+                } else {
+                    error!(
+                        code = error_taxonomy::error_code_for(class).code_str(),
+                        "🔷 DHAN — token refresh retry failed (no halt); order not sent"
+                    );
+                    EngineAction::ReturnTokenExpired
+                }
+            }
+            OrderErrorPolicy::AlertOnlyPoisonReadiness => {
+                warn!(
+                    code = ErrorCode::Data806NotSubscribed.code_str(),
+                    "🔷 DHAN — data plan not subscribed; poisoning order readiness"
+                );
+                if let Some(ref state) = self.readiness {
+                    state.poison_profile();
+                }
+                EngineAction::PassThrough
+            }
+            OrderErrorPolicy::BackoffLadder => {
+                // Surfacing here means the ladder already exhausted upstream.
+                self.fire_alert(OmsAlert::Dh904LadderExhausted {
+                    operation: order_endpoint_str(endpoint),
+                    attempts: DH904_MAX_RETRY_ATTEMPTS as u32,
+                });
+                EngineAction::PassThrough
+            }
+            OrderErrorPolicy::StopAllCooldown => {
+                self.fire_alert(OmsAlert::OrderApiStopAll {
+                    cooldown_secs: DATA_805_STOP_ALL_COOLDOWN_SECS,
+                });
+                EngineAction::PassThrough
+            }
+            // NeverRetry / CheckParamsNoRetry / LogAndAlert / CancelSingleRetry
+            // are all resolved as a pass-through at the engine layer.
+            _ => EngineAction::PassThrough,
+        }
+    }
+
+    /// Engage the halt (idempotent) and, on the rising edge, log + alert + gauge.
+    fn halt_with_alert(&mut self, cause: &'static str, err: &OmsError) {
+        let detail = format!("{err}");
+        if self.engage_halt(cause, detail.clone()) {
+            error!(
+                code = halt_error_code(cause).code_str(),
+                cause,
+                "🔷 DHAN — broker account error; OMS order path HALTED (operator action required)"
+            );
+            self.fire_alert(OmsAlert::OmsHalted { cause, detail });
         }
     }
 
@@ -276,10 +574,12 @@ impl OrderManagementSystem {
             }
         }
 
-        // Step 3b: Get access token (only in live mode)
-        let access_token = self.token_provider.get_access_token()?;
+        // Step 3a (Cluster B): live-order readiness gate (fail-closed). Runs
+        // AFTER the sandbox block, BEFORE the token fetch. Cancel is exempt.
+        self.check_live_order_gates(OrderEndpoint::Place, &correlation_id)?;
 
-        // Step 4: Build Dhan REST request
+        // Step 4: Build Dhan REST request (independent of the token, so it is
+        // built once and reused across any auth rotate-retry — same correlationId).
         let dhan_request = DhanPlaceOrderRequest {
             dhan_client_id: self.client_id.clone(),
             transaction_type: request.transaction_type.as_str().to_owned(),
@@ -296,31 +596,41 @@ impl OrderManagementSystem {
             correlation_id: correlation_id.clone(),
         };
 
-        // Step 5: Call Dhan REST API
-        let response = match self
-            .api_client
-            .place_order(access_token.expose_secret(), &dhan_request)
-            .await
-        {
-            Ok(resp) => {
-                let prev_failures = self.circuit_breaker.failure_count();
-                self.circuit_breaker.record_success();
-                if self.circuit_breaker.was_previously_open(prev_failures) {
-                    self.fire_alert(OmsAlert::CircuitBreakerClosed);
+        // Step 5: Call Dhan REST API through the STOP-ALL latch + DH-904 ladder,
+        // with an at-most-once auth rotate-retry at the engine layer.
+        let mut auth_retry_used = false;
+        let response = loop {
+            let access_token = self.token_provider.get_access_token()?;
+            match self
+                .api_client
+                .place_order_with_policy(access_token.expose_secret(), &dhan_request)
+                .await
+            {
+                Ok(resp) => {
+                    let prev_failures = self.circuit_breaker.failure_count();
+                    self.circuit_breaker.record_success();
+                    if self.circuit_breaker.was_previously_open(prev_failures) {
+                        self.fire_alert(OmsAlert::CircuitBreakerClosed);
+                    }
+                    break resp;
                 }
-                resp
-            }
-            Err(err) => {
-                // Rate limit errors (DH-904 / HTTP 429) should NOT trip the
-                // circuit breaker — the API is healthy, we're just throttled.
-                if !matches!(err, OmsError::DhanRateLimited) {
-                    self.circuit_breaker.record_failure();
-                }
-                self.fire_alert(OmsAlert::OrderRejected {
-                    correlation_id: correlation_id.clone(),
-                    reason: format!("{err}"),
-                });
-                return Err(err);
+                Err(err) => match self
+                    .apply_engine_error_policy(&err, OrderEndpoint::Place, &mut auth_retry_used)
+                    .await
+                {
+                    EngineAction::Retry => continue,
+                    EngineAction::Halt(cause) => {
+                        return Err(OmsError::OrderPathHalted { cause });
+                    }
+                    EngineAction::ReturnTokenExpired => return Err(OmsError::TokenExpired),
+                    EngineAction::PassThrough => {
+                        self.fire_alert(OmsAlert::OrderRejected {
+                            correlation_id: correlation_id.clone(),
+                            reason: format!("{err}"),
+                        });
+                        return Err(err);
+                    }
+                },
             }
         };
 
@@ -425,9 +735,13 @@ impl OrderManagementSystem {
             return Ok(());
         }
 
-        // ---- LIVE MODE ----
-        let access_token = self.token_provider.get_access_token()?;
+        // Step 3a (Cluster B): live-order readiness gate (fail-closed). Runs
+        // BEFORE the token fetch. Cancel is exempt; Modify is NOT.
+        self.check_live_order_gates(OrderEndpoint::Modify, order_id)?;
 
+        // ---- LIVE MODE ----
+        // Build the Dhan request once (token-independent) so it is reused across
+        // any auth rotate-retry — the same order_id / correlationId.
         let dhan_request = DhanModifyOrderRequest {
             dhan_client_id: self.client_id.clone(),
             order_id: order_id.to_owned(),
@@ -440,21 +754,33 @@ impl OrderManagementSystem {
             disclosed_quantity: request.disclosed_quantity,
         };
 
-        match self
-            .api_client
-            .modify_order(access_token.expose_secret(), order_id, &dhan_request)
-            .await
-        {
-            Ok(()) => {
-                self.circuit_breaker.record_success();
-            }
-            Err(err) => {
-                // Rate limit errors (DH-904 / HTTP 429) should NOT trip the
-                // circuit breaker — the API is healthy, we're just throttled.
-                if !matches!(err, OmsError::DhanRateLimited) {
-                    self.circuit_breaker.record_failure();
+        // STOP-ALL latch + DH-904 ladder in the client wrapper; auth
+        // rotate-retry-once + halt latch + circuit-breaker decision here.
+        let mut auth_retry_used = false;
+        loop {
+            let access_token = self.token_provider.get_access_token()?;
+            match self
+                .api_client
+                .modify_order_with_policy(access_token.expose_secret(), order_id, &dhan_request)
+                .await
+            {
+                Ok(()) => {
+                    let prev_failures = self.circuit_breaker.failure_count();
+                    self.circuit_breaker.record_success();
+                    if self.circuit_breaker.was_previously_open(prev_failures) {
+                        self.fire_alert(OmsAlert::CircuitBreakerClosed);
+                    }
+                    break;
                 }
-                return Err(err);
+                Err(err) => match self
+                    .apply_engine_error_policy(&err, OrderEndpoint::Modify, &mut auth_retry_used)
+                    .await
+                {
+                    EngineAction::Retry => continue,
+                    EngineAction::Halt(cause) => return Err(OmsError::OrderPathHalted { cause }),
+                    EngineAction::ReturnTokenExpired => return Err(OmsError::TokenExpired),
+                    EngineAction::PassThrough => return Err(err),
+                },
             }
         }
 
@@ -508,23 +834,35 @@ impl OrderManagementSystem {
         }
 
         // ---- LIVE MODE ----
-        let access_token = self.token_provider.get_access_token()?;
-
-        match self
-            .api_client
-            .cancel_order(access_token.expose_secret(), order_id)
-            .await
-        {
-            Ok(()) => {
-                self.circuit_breaker.record_success();
-            }
-            Err(err) => {
-                // Rate limit errors (DH-904 / HTTP 429) should NOT trip the
-                // circuit breaker — the API is healthy, we're just throttled.
-                if !matches!(err, OmsError::DhanRateLimited) {
-                    self.circuit_breaker.record_failure();
+        // Cancel is exposure-REDUCING: NO readiness gate and NO halt gate (R4).
+        // It must always be attempted so the operator can flatten during a halt.
+        // STOP-ALL latch + DH-904 ladder + cancel single-retry in the client
+        // wrapper; auth rotate-retry-once + circuit-breaker decision here.
+        let mut auth_retry_used = false;
+        loop {
+            let access_token = self.token_provider.get_access_token()?;
+            match self
+                .api_client
+                .cancel_order_with_policy(access_token.expose_secret(), order_id)
+                .await
+            {
+                Ok(()) => {
+                    let prev_failures = self.circuit_breaker.failure_count();
+                    self.circuit_breaker.record_success();
+                    if self.circuit_breaker.was_previously_open(prev_failures) {
+                        self.fire_alert(OmsAlert::CircuitBreakerClosed);
+                    }
+                    break;
                 }
-                return Err(err);
+                Err(err) => match self
+                    .apply_engine_error_policy(&err, OrderEndpoint::Cancel, &mut auth_retry_used)
+                    .await
+                {
+                    EngineAction::Retry => continue,
+                    EngineAction::Halt(cause) => return Err(OmsError::OrderPathHalted { cause }),
+                    EngineAction::ReturnTokenExpired => return Err(OmsError::TokenExpired),
+                    EngineAction::PassThrough => return Err(err),
+                },
             }
         }
 
@@ -725,6 +1063,9 @@ impl OrderManagementSystem {
         self.total_updates = 0;
         self.paper_order_counter = 0;
         self.circuit_breaker.reset();
+        // Cluster B (R8): the order-path halt latch is INTENTIONALLY NOT cleared
+        // here. A broker account-class halt (DH-902/903/…) persists across the
+        // daily reset until a deliberate operator `clear_order_halt()`.
         info!(dry_run = self.dry_run, "OMS daily state reset");
     }
 
@@ -935,6 +1276,74 @@ fn now_epoch_us() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_micros() as i64
+}
+
+/// UTC epoch seconds — same time base as the order-readiness refresher so the
+/// gate and the probe snapshot agree.
+fn now_epoch_s() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+// ---------------------------------------------------------------------------
+// Cluster B: engine error-policy helpers
+// ---------------------------------------------------------------------------
+
+/// The action the caller takes with the error it still owns after
+/// `apply_engine_error_policy`.
+enum EngineAction {
+    /// Rotate + sleep already performed; retry with a fresh token.
+    Retry,
+    /// Return `OmsError::OrderPathHalted { cause }`.
+    Halt(&'static str),
+    /// Return `OmsError::TokenExpired` (807/808/809 second failure — no halt).
+    ReturnTokenExpired,
+    /// Return the original error (pass-through; the caller fires OrderRejected).
+    PassThrough,
+}
+
+/// Static metric-label slug for a halt cause.
+fn halt_cause_slug(cause: &'static str) -> &'static str {
+    match cause {
+        "DH-901" => "dh901",
+        "DH-902" => "dh902",
+        "DH-903" => "dh903",
+        "DATA-810" => "data810",
+        _ => "other",
+    }
+}
+
+/// Static operation label for a metric/alert.
+const fn order_endpoint_str(endpoint: OrderEndpoint) -> &'static str {
+    match endpoint {
+        OrderEndpoint::Place => "place",
+        OrderEndpoint::Modify => "modify",
+        OrderEndpoint::Cancel => "cancel",
+    }
+}
+
+/// The halt cause string for a HaltAndAlert class.
+const fn halt_cause_for(class: DhanErrorClass) -> &'static str {
+    match class {
+        DhanErrorClass::Dh902 => "DH-902",
+        DhanErrorClass::Dh903 => "DH-903",
+        DhanErrorClass::Data810 => "DATA-810",
+        // Unreachable: HaltAndAlert only maps 902/903/810; fail safe.
+        _ => "DH-910",
+    }
+}
+
+/// The coded `ErrorCode` for a halt cause (for the halt `error!`).
+fn halt_error_code(cause: &'static str) -> ErrorCode {
+    match cause {
+        "DH-901" => ErrorCode::Dh901InvalidAuth,
+        "DH-902" => ErrorCode::Dh902NoApiAccess,
+        "DH-903" => ErrorCode::Dh903AccountIssue,
+        "DATA-810" => ErrorCode::Data810ClientIdInvalid,
+        _ => ErrorCode::Dh910Other,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2593,7 +3002,6 @@ mod tests {
     }
 
     /// Multi-shot mock server that handles `n` sequential requests.
-    #[allow(dead_code)] // APPROVED: utility for future multi-request OMS tests
     #[allow(clippy::arithmetic_side_effects)]
     async fn start_multi_mock(
         responses: Vec<(u16, String)>,
@@ -2642,6 +3050,43 @@ mod tests {
         oms
     }
 
+    /// Live OMS whose HTTP client has NO per-request timeout. Used by the
+    /// `start_paused` DH-904 ladder tests: with a request timeout armed, tokio's
+    /// auto-advance would fire it mid-request (the paused-clock-vs-real-TCP trap)
+    /// and surface a spurious HttpError instead of the real DhanRateLimited. With
+    /// no request timer, the only pending timer during a ladder run is the
+    /// backoff sleep, which auto-advances cleanly.
+    fn make_live_oms_no_timeout(base_url: &str) -> OrderManagementSystem {
+        let http = reqwest::Client::builder().build().unwrap();
+        let api_client = OrderApiClient::new(http, base_url.to_owned(), "100".to_owned());
+        let rate_limiter = OrderRateLimiter::new(10);
+        let mut oms = OrderManagementSystem::new(
+            api_client,
+            rate_limiter,
+            Box::new(TestTokenProvider),
+            "100".to_owned(),
+        );
+        oms.enable_live_mode();
+        oms
+    }
+
+    /// Install a FRESH, PROFILE-OK, high-headroom readiness snapshot so a live
+    /// test exercises the API path rather than the fail-closed gate. The gate
+    /// itself is covered by the dedicated `readiness_gate_*` tests below.
+    fn install_ready(oms: &mut OrderManagementSystem) {
+        use crate::oms::order_readiness::{ProbeOutcome, apply_probe_outcome};
+        let state = Arc::new(OrderReadinessState::new());
+        apply_probe_outcome(
+            &state,
+            ProbeOutcome {
+                profile_ok: true,
+                token_headroom_secs: 86_400,
+            },
+            now_epoch_s(),
+        );
+        oms.set_order_readiness(state);
+    }
+
     fn make_place_request() -> PlaceOrderRequest {
         PlaceOrderRequest {
             security_id: 52432,
@@ -2667,6 +3112,7 @@ mod tests {
         let (base_url, handle) = start_oms_mock(200, body).await;
 
         let mut oms = make_live_oms(&base_url);
+        install_ready(&mut oms);
         let result = oms.place_order(make_place_request()).await;
         assert!(result.is_ok());
         let order_id = result.unwrap();
@@ -2687,6 +3133,7 @@ mod tests {
         let (base_url, handle) = start_oms_mock(400, body).await;
 
         let mut oms = make_live_oms(&base_url);
+        install_ready(&mut oms);
         let result = oms.place_order(make_place_request()).await;
         assert!(result.is_err());
         handle.abort();
@@ -2696,15 +3143,23 @@ mod tests {
     // Live-mode: place_order rate-limited does NOT trip circuit breaker
     // -----------------------------------------------------------------------
 
-    #[tokio::test]
+    // DH-904 (HTTP 429) now drives the backoff ladder (10/20/40/80s). The ladder
+    // makes 1 initial + 4 retries = 5 attempts before exhausting, so the mock
+    // serves 5 identical 429s. `start_paused` collapses the 150s of ladder sleep
+    // to virtual time. The exhausted ladder still surfaces DhanRateLimited and
+    // never trips the circuit breaker (R19: rate class is CB-exempt).
+    #[tokio::test(start_paused = true)]
     async fn live_mode_place_order_rate_limited() {
         let body = r#"{"errorType":"RATE_LIMIT","errorCode":"DH-904","errorMessage":"throttled"}"#;
-        let (base_url, handle) = start_oms_mock(429, body).await;
+        let responses = vec![(429u16, body.to_owned()); 5];
+        let (base_url, handle) = start_multi_mock(responses).await;
 
-        let mut oms = make_live_oms(&base_url);
+        let mut oms = make_live_oms_no_timeout(&base_url);
+        install_ready(&mut oms);
         let result = oms.place_order(make_place_request()).await;
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), OmsError::DhanRateLimited));
+        assert_eq!(oms.circuit_breaker.failure_count(), 0);
         handle.abort();
     }
 
@@ -2718,6 +3173,7 @@ mod tests {
         let (base_url, handle) = start_oms_mock(200, body).await;
 
         let mut oms = make_live_oms(&base_url);
+        install_ready(&mut oms);
         // Insert a non-terminal order to modify
         let order = ManagedOrder {
             order_id: "1".to_owned(),
@@ -2769,6 +3225,7 @@ mod tests {
         let (base_url, handle) = start_oms_mock(400, body).await;
 
         let mut oms = make_live_oms(&base_url);
+        install_ready(&mut oms);
         let order = ManagedOrder {
             order_id: "1".to_owned(),
             correlation_id: "corr-1".to_owned(),
@@ -2809,12 +3266,14 @@ mod tests {
     // Live-mode: modify_order rate-limited
     // -----------------------------------------------------------------------
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn live_mode_modify_order_rate_limited() {
-        let body = "";
-        let (base_url, handle) = start_oms_mock(429, body).await;
+        // HTTP 429 with an empty body still classifies as the DH-904 ladder.
+        let responses = vec![(429u16, String::new()); 5];
+        let (base_url, handle) = start_multi_mock(responses).await;
 
-        let mut oms = make_live_oms(&base_url);
+        let mut oms = make_live_oms_no_timeout(&base_url);
+        install_ready(&mut oms);
         let order = ManagedOrder {
             order_id: "1".to_owned(),
             correlation_id: "corr-1".to_owned(),
@@ -2849,6 +3308,7 @@ mod tests {
         let result = oms.modify_order("1", request).await;
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), OmsError::DhanRateLimited));
+        assert_eq!(oms.circuit_breaker.failure_count(), 0);
         handle.abort();
     }
 
@@ -2932,12 +3392,13 @@ mod tests {
     // Live-mode: cancel_order rate-limited
     // -----------------------------------------------------------------------
 
-    #[tokio::test]
+    // Cancel is gate-exempt but the DH-904 ladder still applies to it.
+    #[tokio::test(start_paused = true)]
     async fn live_mode_cancel_order_rate_limited() {
-        let body = "";
-        let (base_url, handle) = start_oms_mock(429, body).await;
+        let responses = vec![(429u16, String::new()); 5];
+        let (base_url, handle) = start_multi_mock(responses).await;
 
-        let mut oms = make_live_oms(&base_url);
+        let mut oms = make_live_oms_no_timeout(&base_url);
         let order = ManagedOrder {
             order_id: "1".to_owned(),
             correlation_id: "corr-1".to_owned(),
@@ -2963,6 +3424,7 @@ mod tests {
         let result = oms.cancel_order("1").await;
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), OmsError::DhanRateLimited));
+        assert_eq!(oms.circuit_breaker.failure_count(), 0);
         handle.abort();
     }
 
@@ -3293,5 +3755,257 @@ mod tests {
                 .to_string()
                 .contains("unknown transaction type")
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Cluster B: readiness gate + halt latch + engine error policy
+    // -----------------------------------------------------------------------
+
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+    /// Token provider that counts `get_access_token` and `request_token_rotation`
+    /// calls so a test can prove the gate refused BEFORE any token fetch, or that
+    /// a DH-901 rotate happened exactly once.
+    struct CountingTokenProvider {
+        calls: Arc<AtomicUsize>,
+        rotations: Arc<AtomicUsize>,
+    }
+    impl TokenProvider for CountingTokenProvider {
+        fn get_access_token(&self) -> Result<SecretString, OmsError> {
+            self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+            Ok(SecretString::from("test-token"))
+        }
+        fn request_token_rotation(&self) -> bool {
+            self.rotations.fetch_add(1, AtomicOrdering::SeqCst);
+            true
+        }
+    }
+
+    /// (untimed live OMS, token-fetch counter, rotation counter).
+    fn make_live_oms_counting(
+        base_url: &str,
+    ) -> (OrderManagementSystem, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let rotations = Arc::new(AtomicUsize::new(0));
+        let http = reqwest::Client::builder().build().unwrap();
+        let api_client = OrderApiClient::new(http, base_url.to_owned(), "100".to_owned());
+        let rate_limiter = OrderRateLimiter::new(10);
+        let mut oms = OrderManagementSystem::new(
+            api_client,
+            rate_limiter,
+            Box::new(CountingTokenProvider {
+                calls: Arc::clone(&calls),
+                rotations: Arc::clone(&rotations),
+            }),
+            "100".to_owned(),
+        );
+        oms.enable_live_mode();
+        (oms, calls, rotations)
+    }
+
+    fn insert_open_order(oms: &mut OrderManagementSystem, order_id: &str) {
+        let order = ManagedOrder {
+            order_id: order_id.to_owned(),
+            correlation_id: "corr-1".to_owned(),
+            security_id: 52432,
+            transaction_type: TransactionType::Buy,
+            order_type: OrderType::Limit,
+            product_type: ProductType::Intraday,
+            validity: OrderValidity::Day,
+            quantity: 50,
+            price: 245.50,
+            trigger_price: 0.0,
+            status: OrderStatus::Confirmed,
+            traded_qty: 0,
+            avg_traded_price: 0.0,
+            lot_size: 25,
+            created_at_us: 0,
+            updated_at_us: 0,
+            needs_reconciliation: false,
+            modification_count: 0,
+        };
+        oms.orders.insert(order_id.to_owned(), order);
+    }
+
+    /// DRY-RUN must be byte-identical: the readiness gate is NEVER consulted and
+    /// NO token is fetched — a paper order succeeds with no readiness installed.
+    #[tokio::test]
+    async fn test_place_order_dry_run_ignores_readiness_gate_byte_identical() {
+        // Default OMS is dry-run; NO readiness installed.
+        let (mut oms, calls, _rot) = make_live_oms_counting("http://127.0.0.1:1");
+        oms.dry_run = true;
+        let result = oms.place_order(make_place_request()).await;
+        assert!(result.is_ok());
+        assert!(result.unwrap().starts_with("PAPER-"));
+        assert_eq!(
+            calls.load(AtomicOrdering::SeqCst),
+            0,
+            "dry-run fetches no token"
+        );
+    }
+
+    /// LIVE place with NO readiness installed is fail-closed refused BEFORE any
+    /// HTTP call or token fetch.
+    #[tokio::test]
+    async fn test_place_order_live_refused_when_no_readiness_zero_http_zero_token() {
+        let (mut oms, calls, _rot) = make_live_oms_counting("http://127.0.0.1:1");
+        let result = oms.place_order(make_place_request()).await;
+        assert!(matches!(
+            result.unwrap_err(),
+            OmsError::OrderReadinessRefused { reason: "no_probe" }
+        ));
+        assert_eq!(
+            calls.load(AtomicOrdering::SeqCst),
+            0,
+            "gate refuses before token fetch"
+        );
+    }
+
+    /// LIVE modify with NO readiness installed is fail-closed refused (Modify is
+    /// NOT exempt).
+    #[tokio::test]
+    async fn test_modify_order_live_refused_when_no_readiness() {
+        let (mut oms, calls, _rot) = make_live_oms_counting("http://127.0.0.1:1");
+        insert_open_order(&mut oms, "1");
+        let request = ModifyOrderRequest {
+            order_type: OrderType::Limit,
+            quantity: 75,
+            price: 250.0,
+            trigger_price: 0.0,
+            validity: OrderValidity::Day,
+            disclosed_quantity: 0,
+        };
+        let result = oms.modify_order("1", request).await;
+        assert!(matches!(
+            result.unwrap_err(),
+            OmsError::OrderReadinessRefused { .. }
+        ));
+        assert_eq!(calls.load(AtomicOrdering::SeqCst), 0);
+    }
+
+    /// LIVE place while HALTED is refused BEFORE any token fetch.
+    #[tokio::test]
+    async fn test_place_order_refused_when_halted() {
+        let (mut oms, calls, _rot) = make_live_oms_counting("http://127.0.0.1:1");
+        install_ready(&mut oms);
+        oms.engage_halt("DH-903", "account issue".to_owned());
+        let result = oms.place_order(make_place_request()).await;
+        assert!(matches!(
+            result.unwrap_err(),
+            OmsError::OrderPathHalted { cause: "DH-903" }
+        ));
+        assert_eq!(calls.load(AtomicOrdering::SeqCst), 0);
+    }
+
+    /// R8: `reset_daily` does NOT clear the halt latch.
+    #[test]
+    fn test_reset_daily_does_not_clear_halt() {
+        let mut oms = make_oms_with_order("1", OrderStatus::Confirmed);
+        oms.engage_halt("DH-902", "no api access".to_owned());
+        assert!(oms.is_order_halted());
+        oms.reset_daily();
+        assert!(oms.is_order_halted(), "halt must survive the daily reset");
+    }
+
+    /// Operator-driven `clear_order_halt` re-enables the live place path.
+    #[tokio::test]
+    async fn test_clear_order_halt_reenables_live_place() {
+        let body = r#"{"orderId":"DHAN-9","orderStatus":"TRANSIT"}"#;
+        let (base_url, handle) = start_oms_mock(200, body).await;
+        let mut oms = make_live_oms(&base_url);
+        install_ready(&mut oms);
+        oms.engage_halt("DH-902", "no api access".to_owned());
+        assert!(oms.place_order(make_place_request()).await.is_err());
+        oms.clear_order_halt();
+        assert!(!oms.is_order_halted());
+        let result = oms.place_order(make_place_request()).await;
+        assert!(result.is_ok());
+        handle.abort();
+    }
+
+    /// R4: cancel is EXEMPT from the halt gate — it must still reach the broker so
+    /// the operator can flatten during a halt.
+    #[tokio::test]
+    async fn test_cancel_order_exempt_from_halt_gate() {
+        let body = r#"{"orderId":"1","orderStatus":"CANCELLED"}"#;
+        let (base_url, handle) = start_oms_mock(200, body).await;
+        let (mut oms, calls, _rot) = make_live_oms_counting(&base_url);
+        insert_open_order(&mut oms, "1");
+        oms.engage_halt("DH-903", "account issue".to_owned());
+        // No readiness installed either — cancel is exempt from BOTH gates.
+        let result = oms.cancel_order("1").await;
+        assert!(result.is_ok(), "cancel must proceed despite the halt");
+        assert!(
+            calls.load(AtomicOrdering::SeqCst) >= 1,
+            "cancel reached the token fetch"
+        );
+        handle.abort();
+    }
+
+    /// DH-901 rotates the token exactly once, then HALTS (R19: never trips the
+    /// circuit breaker). Paused clock collapses the 5s rotate delay.
+    #[tokio::test(start_paused = true)]
+    async fn test_dh901_rotates_once_then_halts() {
+        let body = r#"{"errorType":"INVALID_AUTHENTICATION","errorCode":"DH-901","errorMessage":"invalid"}"#;
+        let responses = vec![(401u16, body.to_owned()); 2];
+        let (base_url, handle) = start_multi_mock(responses).await;
+        let (mut oms, _calls, rotations) = make_live_oms_counting(&base_url);
+        install_ready(&mut oms);
+        let result = oms.place_order(make_place_request()).await;
+        assert!(matches!(
+            result.unwrap_err(),
+            OmsError::OrderPathHalted { cause: "DH-901" }
+        ));
+        assert_eq!(
+            rotations.load(AtomicOrdering::SeqCst),
+            1,
+            "exactly one rotate"
+        );
+        assert!(oms.is_order_halted());
+        assert_eq!(
+            oms.circuit_breaker.failure_count(),
+            0,
+            "R19: DH-901 is circuit-breaker-exempt"
+        );
+        handle.abort();
+    }
+
+    /// Every `OmsAlert` operator message carries the 🔷 DHAN broker badge so any
+    /// future sink inherits broker attribution (noise-lock strategy).
+    #[test]
+    fn test_all_oms_alert_operator_messages_start_with_dhan_badge() {
+        let alerts = vec![
+            OmsAlert::CircuitBreakerOpened {
+                consecutive_failures: 3,
+            },
+            OmsAlert::CircuitBreakerClosed,
+            OmsAlert::RateLimitExhausted {
+                limit_type: "per_second".to_owned(),
+            },
+            OmsAlert::OrderRejected {
+                correlation_id: "c".to_owned(),
+                reason: "r".to_owned(),
+            },
+            OmsAlert::OrderReadinessRefused {
+                reason: "no_probe",
+                correlation_id: "c".to_owned(),
+            },
+            OmsAlert::OmsHalted {
+                cause: "DH-902",
+                detail: "d".to_owned(),
+            },
+            OmsAlert::Dh904LadderExhausted {
+                operation: "place",
+                attempts: 4,
+            },
+            OmsAlert::OrderApiStopAll { cooldown_secs: 60 },
+        ];
+        for alert in alerts {
+            let msg = alert.operator_message();
+            assert!(
+                msg.starts_with("🔷 DHAN"),
+                "operator message must carry the DHAN badge: {msg}"
+            );
+        }
     }
 }
