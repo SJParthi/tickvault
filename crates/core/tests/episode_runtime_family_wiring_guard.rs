@@ -19,9 +19,10 @@
 //! companion covering the shared dispatch machinery).
 
 use tickvault_core::notification::episode::{
-    BOOT_EPISODE_KEY, EpisodeConfig, EpisodeFamily, EpisodeRole, episode_config_for,
+    BOOT_EPISODE_KEY, EpisodeAction, EpisodeConfig, EpisodeFamily, EpisodeRole, episode_config_for,
+    next_episode_action,
 };
-use tickvault_core::notification::events::NotificationEvent;
+use tickvault_core::notification::events::{NotificationEvent, Severity};
 
 fn groww_reject() -> NotificationEvent {
     NotificationEvent::GrowwSidecarRejected {
@@ -36,6 +37,15 @@ fn feed_down(feed: &str) -> NotificationEvent {
         reason: "the feed stopped streaming".to_string(),
         market_open: true,
         operator_initiated: false,
+    }
+}
+
+fn feed_down_full(feed: &str, market_open: bool, operator_initiated: bool) -> NotificationEvent {
+    NotificationEvent::FeedDown {
+        feed: feed.to_string(),
+        reason: "the feed stopped streaming".to_string(),
+        market_open,
+        operator_initiated,
     }
 }
 
@@ -133,6 +143,14 @@ fn guard_groww_boot_pings_unchanged() {
 }
 
 // (d) The GrowwFeed family runs the default (WS-identical) episode config.
+//
+// FIX-E note (hostile review 2026-07-14, pre-existing): the runtime
+// dispatch/tick sites in service.rs currently hardcode
+// `EpisodeConfig::default()` rather than calling `episode_config_for`
+// (the Boot family has its own dispatcher with its own zero-throttle
+// config), so for non-Boot families `episode_config_for` is a
+// FORWARD-LOOKING lever — this pin guarantees that IF it is wired later,
+// the GrowwFeed behavior is unchanged (default == what runtime uses today).
 #[test]
 fn guard_groww_family_uses_default_episode_config() {
     let cfg = episode_config_for(EpisodeFamily::GrowwFeed);
@@ -141,4 +159,98 @@ fn guard_groww_family_uses_default_episode_config() {
     assert_eq!(cfg.stability_secs, default.stability_secs);
     assert_eq!(cfg.reopen_secs, default.reopen_secs);
     assert_eq!(cfg.down_stale_expire_secs, default.down_stale_expire_secs);
+}
+
+// (e) FIX-A (hostile review 2026-07-14): a DELIBERATE feeds-page disable is
+//     NEVER episode-routed — an in-place "retrying automatically" edit (or
+//     a silently-throttled fold) would falsely claim a disabled feed
+//     retries. The legacy lane carries the honest body naming the ONE
+//     action that fixes it (re-enable from the feeds page).
+#[test]
+fn guard_operator_initiated_feed_down_stays_legacy() {
+    for market_open in [true, false] {
+        let event = feed_down_full("Groww", market_open, true);
+        assert!(
+            event.episode_key().is_none(),
+            "operator-initiated FeedDown (market_open={market_open}) must keep the legacy lane"
+        );
+        let body = event.to_message();
+        assert!(
+            body.contains("re-enable"),
+            "the legacy body must still name the re-enable action: {body:?}"
+        );
+    }
+}
+
+// (f) FIX-D (hostile review 2026-07-14): the off-hours Low-severity Groww
+//     FeedDown keeps its pre-existing legacy 60s-coalescer path — only a
+//     PAGING (>= High, in-market) FeedDown opens/folds the incident bubble.
+#[test]
+fn guard_off_hours_low_feed_down_stays_legacy() {
+    let event = feed_down_full("Groww", false, false);
+    assert_eq!(event.severity(), Severity::Low, "off-hours FeedDown is Low");
+    assert!(
+        event.episode_key().is_none(),
+        "Low off-hours FeedDown must keep the legacy coalescer path"
+    );
+    // The in-market High flavor IS routed (the incident bubble).
+    let paging = feed_down_full("Groww", true, false);
+    assert_eq!(paging.severity(), Severity::High);
+    assert!(paging.episode_key().is_some());
+}
+
+// (g) A Groww FeedRecovered with NO open episode (e.g. the Down was the
+//     Low/off-hours flavor that never opened a bubble) is DELIVERED via
+//     the FSM's SendLegacy arm — never dropped (the legacy_passthrough
+//     arm in the dispatch shell).
+#[test]
+fn guard_recovery_without_open_episode_delivers_via_legacy_lane() {
+    let action = next_episode_action(
+        None,
+        None,
+        EpisodeRole::Resolve,
+        Severity::Medium,
+        1_751_900_000_000,
+        &EpisodeConfig::default(),
+    );
+    assert_eq!(
+        action,
+        EpisodeAction::SendLegacy,
+        "an untracked recovery must route through the legacy immediate lane"
+    );
+}
+
+// (h) FIX-G advisory pin (hostile review 2026-07-14): NO Critical-severity
+//     event maps to the GrowwFeed family today, so the un-exercised
+//     Critical branch of the High→Critical escalation edge stays
+//     unreachable. Adding a Critical Groww event later must consciously
+//     revisit this pin (and exercise that edge).
+#[test]
+fn guard_no_critical_event_maps_to_groww_family() {
+    let routed = [
+        groww_reject(),
+        NotificationEvent::GrowwSidecarRejected {
+            reason: "3 of 10 connections rejected".to_string(),
+            fleet_summary: true,
+        },
+        feed_down_full("Groww", true, false),
+        NotificationEvent::FeedRecovered {
+            feed: "Groww".to_string(),
+            down_secs: 120,
+        },
+    ];
+    for event in routed {
+        assert_eq!(
+            event.episode_key().map(|k| k.family),
+            Some(EpisodeFamily::GrowwFeed),
+            "{} must be episode-routed for this pin to be meaningful",
+            event.topic()
+        );
+        assert!(
+            event.severity() < Severity::Critical,
+            "{} must stay below Critical — a Critical GrowwFeed event would \
+             exercise the untested escalation edge; revisit this pin first",
+            event.topic()
+        );
+    }
 }

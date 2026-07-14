@@ -211,12 +211,17 @@ impl EpisodeFamily {
         }
     }
 
-    /// Noun for the attempts counter.
+    /// Noun for the attempts counter on the steady line. EMPTY = the
+    /// attempts segment is OMITTED for this family (FIX-F, hostile review
+    /// 2026-07-14): the episode `attempts` field counts FOLDED NOTIFY
+    /// events, which for the Groww family undercounts the sidecar's real
+    /// retry cadence ~12× — showing it would be dishonest, so the Groww
+    /// bubble shows only the rejection occurrence count.
     #[must_use]
     pub const fn counter_noun(self) -> &'static str {
         match self {
             Self::MainFeedWs | Self::OrderUpdateWs | Self::Boot => "reconnect attempts",
-            Self::GrowwFeed => "retry attempts",
+            Self::GrowwFeed => "",
         }
     }
 
@@ -246,6 +251,18 @@ impl EpisodeFamily {
         match self {
             Self::MainFeedWs | Self::OrderUpdateWs | Self::Boot => "back",
             Self::GrowwFeed => "streaming again",
+        }
+    }
+
+    /// Noun for the attempts counter on the green close line. EMPTY = the
+    /// segment is OMITTED (same FIX-F honesty rationale as
+    /// [`Self::counter_noun`] — the folded-event count undercounts the
+    /// Groww sidecar's real retries).
+    #[must_use]
+    pub const fn recovered_noun(self) -> &'static str {
+        match self {
+            Self::MainFeedWs | Self::OrderUpdateWs | Self::Boot => "attempts",
+            Self::GrowwFeed => "",
         }
     }
 }
@@ -1252,11 +1269,21 @@ fn render_status_lines(state: &EpisodeState, now_line: &str) -> String {
     let occ_noun = state.key.family.occurrence_noun();
     let att_noun = state.key.family.counter_noun();
     let since = format_ist_12h(state.opened_at_ms);
-    let text = format!(
-        "{badge} — {desc} {headline}\nSince {since} IST · {occ} {occ_noun} · {att} {att_noun}\n{now_line}",
-        occ = state.occurrences,
-        att = state.attempts,
-    );
+    // An empty counter noun OMITS the attempts segment (FIX-F honesty —
+    // the folded-event count undercounts real retries for some families).
+    let counters = if att_noun.is_empty() {
+        format!(
+            "Since {since} IST · {occ} {occ_noun}",
+            occ = state.occurrences,
+        )
+    } else {
+        format!(
+            "Since {since} IST · {occ} {occ_noun} · {att} {att_noun}",
+            occ = state.occurrences,
+            att = state.attempts,
+        )
+    };
+    let text = format!("{badge} — {desc} {headline}\n{counters}\n{now_line}");
     // Defensive ceiling — never panics, never chunks.
     let mut out: String = text.chars().take(EPISODE_STEADY_MAX_CHARS).collect();
     // Keep the line ceiling honest even if inputs somehow carried newlines.
@@ -1321,12 +1348,19 @@ pub fn render_episode_recovered(state: &EpisodeState, ctx: &EpisodeRenderCtx) ->
         .unwrap_or(0);
     let opened = format_ist_12h(state.opened_at_ms);
     let closed = format_ist_12h(ctx.now_ms);
+    let noun = state.key.family.recovered_noun();
+    // An empty noun OMITS the attempts segment (FIX-F honesty — see
+    // `EpisodeFamily::recovered_noun`).
+    let attempts_segment = if noun.is_empty() {
+        String::new()
+    } else {
+        format!(", {att} {noun}", att = state.attempts)
+    };
     format!(
-        "\u{2705} Recovered — {desc} {verb}. Down {dur}, {att} attempts ({opened}–{closed} IST)",
+        "\u{2705} Recovered — {desc} {verb}. Down {dur}{attempts_segment} ({opened}–{closed} IST)",
         desc = badged_feed_desc(state.key.family),
         verb = state.key.family.recovered_verb(),
         dur = format_duration_human(down_secs),
-        att = state.attempts,
     )
 }
 
@@ -2669,7 +2703,10 @@ mod tests {
         assert!(steady.starts_with("\u{1f7e2} GROWW"), "{steady:?}");
         assert!(steady.contains("Groww price feed not receiving prices"));
         assert!(steady.contains("5 rejections"));
-        assert!(steady.contains("9 retry attempts"));
+        // FIX-F (2026-07-14 hostile review): the attempts counter counts
+        // folded notify events — an ~12× undercount of the sidecar's real
+        // retries — so the Groww bubble OMITS it entirely.
+        assert!(!steady.contains("attempts"), "{steady:?}");
         assert!(steady.contains("Now: retrying automatically"));
         let recovering = render_episode_recovering(&st, &ctx);
         assert!(recovering.contains("confirming"), "{recovering:?}");
@@ -2678,6 +2715,7 @@ mod tests {
             recovered.contains("Groww price feed streaming again"),
             "{recovered:?}"
         );
+        assert!(!recovered.contains("attempts"), "{recovered:?}");
         // No WS-flavored literals where inappropriate + commandment scan
         // (plain English, no library names, no file paths, no jargon).
         for r in [&steady, &recovering, &recovered] {

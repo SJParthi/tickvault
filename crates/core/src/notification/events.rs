@@ -4110,7 +4110,38 @@ impl NotificationEvent {
                 family: EpisodeFamily::GrowwFeed,
                 conn: 0,
             }),
-            Self::FeedDown { feed, .. } | Self::FeedRecovered { feed, .. } => {
+            Self::FeedDown {
+                feed,
+                operator_initiated,
+                ..
+            } => {
+                // FIX-A (hostile review 2026-07-14): a DELIBERATE feeds-page
+                // disable is NEVER episode-routed — the bubble's "retrying
+                // automatically" edit would falsely claim a disabled feed
+                // retries (the 2026-07-06 FeedDown honesty split); the
+                // legacy lane carries the honest "stays OFF until
+                // re-enabled" body.
+                // FIX-D: only a PAGING (≥ High, i.e. in-market) FeedDown
+                // opens/folds the incident bubble; the off-hours Low flavor
+                // keeps its pre-existing legacy 60s-coalescer path.
+                if !*operator_initiated
+                    && self.severity() >= Severity::High
+                    && feed.eq_ignore_ascii_case("groww")
+                {
+                    Some(EpisodeKey {
+                        family: EpisodeFamily::GrowwFeed,
+                        conn: 0,
+                    })
+                } else {
+                    // Non-Groww feeds also keep the legacy immediate lane.
+                    None
+                }
+            }
+            Self::FeedRecovered { feed, .. } => {
+                // Recovery stays episode-routed (Resolve). With no open
+                // episode (e.g. the Down was Low/off-hours and never
+                // opened a bubble) the FSM returns SendLegacy — the
+                // legacy_passthrough arm delivers it, never a drop.
                 if feed.eq_ignore_ascii_case("groww") {
                     Some(EpisodeKey {
                         family: EpisodeFamily::GrowwFeed,

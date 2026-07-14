@@ -31,7 +31,10 @@
   - Tests: test_should_page_reject_rising_edge_and_cooldown (≤60 + >0 pins)
 - [x] Update the rule file's cooldown contract with a dated 2026-07-14 note
   - Files: .claude/rules/project/feed-stall-watchdog-error-codes.md
-  - Tests: (docs; the ≤60 pin above is the mechanical guard)
+  - Tests: (docs; the ==60/==1800 pins are the mechanical guard)
+- [x] Hostile-review round-1 fixes (FIX-A..G, 2026-07-14)
+  - Files: crates/core/src/notification/{events.rs,episode.rs}, crates/app/src/{groww_sidecar_supervisor.rs,main.rs}, crates/core/tests/episode_runtime_family_wiring_guard.rs, .claude/rules/project/feed-stall-watchdog-error-codes.md
+  - Tests: guard_operator_initiated_feed_down_stays_legacy, guard_off_hours_low_feed_down_stays_legacy, guard_recovery_without_open_episode_delivers_via_legacy_lane, guard_no_critical_event_maps_to_groww_family, test_should_page_reject_rising_edge_and_cooldown (==60/==1800/mode selector)
 
 ## Design
 
@@ -60,13 +63,15 @@ the redundant pager), WS endpoints, §28 indicator/strategy, hot path.
 
 ## Edge Cases
 
-- Off-hours `FeedDown` is Low: a Low-peak GrowwFeed bubble crossing into an
-  in-market High reject re-pages FRESH via the severity-escalation edge
-  (episode.rs FSM, pre-existing, family-generic) — SMS never swallowed.
-- `FeedDown{operator_initiated:true}` (deliberate toggle-off) fires ONCE
-  (edge-latched upstream); the bubble stays on its first page, which carries
-  the honest "stays OFF until re-enabled" body — the "retrying" steady line
-  only appears if involuntary events RECUR.
+- Off-hours `FeedDown` is Low (FIX-D): it keeps the pre-existing legacy 60s
+  coalescer path — only a PAGING (>= High, in-market) FeedDown opens/folds
+  the bubble, so the fold changes no off-hours routing. A later in-market
+  High reject opens a fresh first page (+ SMS) as today.
+- `FeedDown{operator_initiated:true}` (deliberate feeds-page disable,
+  FIX-A): NEVER episode-routed — the bubble's "retrying automatically"
+  steady edit would falsely claim a disabled feed retries (the 2026-07-06
+  honesty split). The legacy lane carries the honest "stays OFF until you
+  re-enable it from the feeds page" body.
 - Non-Groww `FeedDown`/`FeedRecovered` (Dhan, future feed #3) keep the
   legacy lane (feed-name compare, case-insensitive) — never wrongly folded.
 - Groww BOOT pings (FeedAuthOk/FeedInstrumentsLoaded/FeedConnectedAwaitingTicks)
@@ -124,6 +129,10 @@ the redundant pager), WS endpoints, §28 indicator/strategy, hot path.
   a rolled-back binary reading a "groww_feed" entry drops it silently.
 - Config kill switch already exists: `[notification] episode_mode = false`
   restores legacy per-event dispatch for ALL families (pre-existing).
+  FIX-B: with the switch OFF the supervisor's reject-page cooldown reverts
+  to the legacy 1800s (`reject_page_cooldown_secs(episode_mode)`, boot-time
+  read) — the rollback path is never 30× noisier than the 2026-07-09
+  contract. Both values pinned exactly (==60 / ==1800, FIX-C).
 
 ## Observability
 
@@ -147,7 +156,9 @@ the redundant pager), WS endpoints, §28 indicator/strategy, hot path.
 | 1 | Persistent Groww reject day (the 2026-07-09 class) | ONE bubble: first page + SMS at 9:22 AM, occurrence counter edits ≤3/min thereafter, zero further pushes/SMS |
 | 2 | Reject recovers (streaming resumes) | FeedRecovered → amber "confirming…" edit → ONE green close after 60s quiet |
 | 3 | Telegram transport down at first page | SendNewFallback fresh sends bounded ≤1/min by the kept 60s cooldown; TELEGRAM-01 loud |
-| 4 | Off-hours Low FeedDown then in-market High reject | escalation edge re-pages FRESH + SMS |
+| 4 | Off-hours Low FeedDown then in-market High reject | Low batches via legacy coalescer (FIX-D); the High reject opens a fresh bubble first page + SMS |
+| 4b | Operator disables the Groww feed mid-storm | legacy honest "stays OFF until re-enabled" page (FIX-A); the open bubble stale-closes neutrally after 30 min of silence |
+| 4c | episode_mode = false rollback | legacy Immediate+SMS lane at the legacy 1800s cooldown (FIX-B) — never ~60 pages/hr |
 | 5 | Dhan FeedDown | legacy immediate lane, byte-identical to today |
 | 6 | Restart mid-storm | bubble rehydrated from snapshot; edits continue on the same message id |
 
