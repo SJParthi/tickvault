@@ -687,16 +687,20 @@ mod stress_state_machine {
             }
         }
 
-        // The state machine has exactly 19 valid transitions implemented:
+        // The state machine has exactly 23 valid transitions implemented:
         // Transit->Pending, Transit->Rejected
         // Pending->Confirmed, Pending->PartTraded, Pending->Traded, Pending->Cancelled,
-        // Pending->Rejected, Pending->Expired
-        // Confirmed->PartTraded, Confirmed->Traded, Confirmed->Cancelled, Confirmed->Expired
-        // PartTraded->Traded, PartTraded->Cancelled, PartTraded->Expired
-        // Triggered->Pending, Triggered->Traded, Triggered->Cancelled, Triggered->Rejected
+        // Pending->Rejected, Pending->Expired, Pending->Closed
+        // Confirmed->PartTraded, Confirmed->Traded, Confirmed->Cancelled, Confirmed->Expired,
+        // Confirmed->Closed
+        // PartTraded->Traded, PartTraded->Cancelled, PartTraded->Expired, PartTraded->Closed
+        // Triggered->Pending, Triggered->Traded, Triggered->Cancelled, Triggered->Rejected,
+        // Triggered->Closed
+        // (the 4 into-Closed arms landed with the exit-order layer —
+        // Cluster B Ruling 4, 2026-07-14; Traded->Closed stays INVALID.)
         assert_eq!(
-            valid_count, 19,
-            "expected 19 valid transitions in the DAG, found {valid_count}"
+            valid_count, 23,
+            "expected 23 valid transitions in the DAG, found {valid_count}"
         );
     }
 
@@ -757,14 +761,16 @@ mod stress_state_machine {
     }
 
     #[test]
-    fn test_stress_state_machine_pending_six_outgoing() {
+    fn test_stress_state_machine_pending_seven_outgoing() {
+        // 7 since Pending->Closed landed (Cluster B Ruling 4, 2026-07-14).
         let mut valid = vec![];
         for &to in &ALL_STATUSES {
             if is_valid_transition(OrderStatus::Pending, to) {
                 valid.push(to);
             }
         }
-        assert_eq!(valid.len(), 6, "Pending should have 6 outgoing transitions");
+        assert_eq!(valid.len(), 7, "Pending should have 7 outgoing transitions");
+        assert!(valid.contains(&OrderStatus::Closed));
     }
 
     #[test]
@@ -817,36 +823,39 @@ mod stress_state_machine {
     }
 
     #[test]
-    fn test_stress_state_machine_confirmed_four_outgoing() {
+    fn test_stress_state_machine_confirmed_five_outgoing() {
+        // 5 since Confirmed->Closed landed (Cluster B Ruling 4, 2026-07-14).
         let mut count = 0;
         for &to in &ALL_STATUSES {
             if is_valid_transition(OrderStatus::Confirmed, to) {
                 count += 1;
             }
         }
-        assert_eq!(count, 4, "Confirmed should have 4 outgoing transitions");
+        assert_eq!(count, 5, "Confirmed should have 5 outgoing transitions");
     }
 
     #[test]
-    fn test_stress_state_machine_part_traded_three_outgoing() {
+    fn test_stress_state_machine_part_traded_four_outgoing() {
+        // 4 since PartTraded->Closed landed (Cluster B Ruling 4, 2026-07-14).
         let mut count = 0;
         for &to in &ALL_STATUSES {
             if is_valid_transition(OrderStatus::PartTraded, to) {
                 count += 1;
             }
         }
-        assert_eq!(count, 3, "PartTraded should have 3 outgoing transitions");
+        assert_eq!(count, 4, "PartTraded should have 4 outgoing transitions");
     }
 
     #[test]
-    fn test_stress_state_machine_triggered_four_outgoing() {
+    fn test_stress_state_machine_triggered_five_outgoing() {
+        // 5 since Triggered->Closed landed (Cluster B Ruling 4, 2026-07-14).
         let mut count = 0;
         for &to in &ALL_STATUSES {
             if is_valid_transition(OrderStatus::Triggered, to) {
                 count += 1;
             }
         }
-        assert_eq!(count, 4, "Triggered should have 4 outgoing transitions");
+        assert_eq!(count, 5, "Triggered should have 5 outgoing transitions");
     }
 }
 
