@@ -231,6 +231,31 @@ const API_MS_HISTOGRAM_BUCKETS: &[f64] = &[
     60_000.0, // 60 s
 ];
 
+/// Bucket boundaries (upper bounds in milliseconds) for the spot-1m vendor
+/// SERVING-LAG histogram `tv_spot1m_serving_lag_ms` (2026-07-14
+/// serving-delay diagnostics: on every `empty_stale` per-minute fetch —
+/// candles present but none at the target minute — the fetcher records
+/// `target minute open − max(candle minute open)`). Registered via
+/// `Matcher::Full` so it overrides the generic `_ms` suffix buckets:
+/// serving lag is a minutes-to-hours-scale signal, and the generic 60 s
+/// `_ms` cap would collapse every meaningful sample into `+Inf`.
+///
+/// Range: 1 s → 6 h, roughly log-spaced (a whole-session-behind vendor
+/// still lands in a real bucket).
+const SPOT1M_SERVING_LAG_MS_BUCKETS: &[f64] = &[
+    1_000.0,      // 1 s
+    5_000.0,      // 5 s
+    15_000.0,     // 15 s
+    30_000.0,     // 30 s
+    60_000.0,     // 1 min
+    120_000.0,    // 2 min
+    300_000.0,    // 5 min
+    600_000.0,    // 10 min
+    1_800_000.0,  // 30 min
+    3_600_000.0,  // 1 h
+    21_600_000.0, // 6 h
+];
+
 /// Initializes the Prometheus metrics exporter.
 ///
 /// Starts an HTTP server on `0.0.0.0:{metrics_port}` that serves `/metrics`
@@ -266,6 +291,15 @@ pub fn init_metrics(config: &ObservabilityConfig) -> Result<()> {
         .context("failed to set histogram buckets for _duration_ns metrics")?
         .set_buckets_for_metric(Matcher::Suffix("_ms".to_string()), API_MS_HISTOGRAM_BUCKETS)
         .context("failed to set histogram buckets for _ms metrics")?
+        // Serving-lag override: `Matcher::Full` sorts BEFORE `Matcher::Suffix`
+        // in the exporter's override resolution (variant order on the derived
+        // `Ord`), so this metric gets the minutes-to-hours buckets instead of
+        // the generic 60 s-capped `_ms` set regardless of registration order.
+        .set_buckets_for_metric(
+            Matcher::Full("tv_spot1m_serving_lag_ms".to_string()),
+            SPOT1M_SERVING_LAG_MS_BUCKETS,
+        )
+        .context("failed to set histogram buckets for tv_spot1m_serving_lag_ms")?
         .install()
         .context("failed to install Prometheus metrics exporter")?;
 
@@ -668,6 +702,10 @@ mod tests {
         for (name, buckets) in [
             ("TICK_NS_HISTOGRAM_BUCKETS", TICK_NS_HISTOGRAM_BUCKETS),
             ("API_MS_HISTOGRAM_BUCKETS", API_MS_HISTOGRAM_BUCKETS),
+            (
+                "SPOT1M_SERVING_LAG_MS_BUCKETS",
+                SPOT1M_SERVING_LAG_MS_BUCKETS,
+            ),
         ] {
             assert!(!buckets.is_empty(), "{name} must not be empty");
             for window in buckets.windows(2) {
