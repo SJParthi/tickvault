@@ -192,16 +192,42 @@ data. A server-side reject that persists shows up as the bounded restart
 cadence + the pager + the §1c FEED-REJECT-01 signatures — loud, never silent,
 never a tight kill loop. Known bounds, stated plainly:
 
-- **Page-storm bound (review HIGH, FIXED):** each relaunched child gets a
-  fresh `alerted` latch, so a persistent reject day would have paged the
-  `GrowwSidecarRejected` HIGH ~12×/hour. The single-conn Telegram fan-out is
-  now additionally gated by a supervisor-lifetime cross-child cooldown
-  (`GROWW_REJECT_PAGE_COOLDOWN_SECS` = 1800s, pure `should_page_reject`,
-  CAS'd so the two pipe drains never double-page): at most one reject page
-  per 30 min per supervisor; suppressed episodes keep their `error!`
-  forwards, FEED-REJECT-01 signature, and feed-health marking, and are
-  counted by `tv_groww_reject_page_cooldown_suppressed_total`. The
-  ≥3-per-15-min restart pager independently covers "it keeps failing".
+- **Page-storm bound (review HIGH, FIXED; RESTRUCTURED 2026-07-14):** each
+  relaunched child gets a fresh `alerted` latch, so a persistent reject day
+  would have paged the `GrowwSidecarRejected` HIGH ~12×/hour. Page DEDUP is
+  now owned by the `EpisodeFamily::GrowwFeed` one-bubble fold (2026-07-14
+  operator noise directive): `GrowwSidecarRejected` + the Groww
+  `FeedDown`/`FeedRecovered` arms carry an `episode_key`, so the FIRST
+  reject pages (+ SMS) and every recurrence becomes an in-place bubble edit
+  — no push, no SMS — with `FeedRecovered` closing the bubble green.
+  Scope refinements (same-day hostile review): an OPERATOR-INITIATED
+  `FeedDown` (the deliberate feeds-page disable) is NEVER episode-routed —
+  its legacy body honestly says the feed stays OFF until re-enabled (a
+  bubble edit would falsely claim "retrying"); and the off-hours
+  Low-severity `FeedDown` keeps its pre-existing legacy 60s-coalescer path
+  (only a paging ≥High FeedDown opens/folds the bubble). The
+  supervisor-lifetime cross-child cooldown
+  (`GROWW_REJECT_PAGE_COOLDOWN_SECS`, pure `should_page_reject`, CAS'd so
+  the two pipe drains never double-page) is KEPT but reduced **1800s →
+  60s** (aligned with the fleet 60s coalescer): it is no longer the primary
+  page bound — it only caps notify() volume to ≤1/min on the
+  transport-failure path (a first page that never lands leaves
+  `message_id = None`, so every later reject takes the episode
+  `SendNewFallback` fresh send; without this upstream bound that failure
+  path would restore the storm). The 60s value applies ONLY while
+  `[notification] episode_mode = true` (the fold ON): with the episode
+  kill switch OFF every reject takes the legacy Immediate+SMS lane, so
+  the supervisor restores the legacy 1800s bound
+  (`GROWW_REJECT_PAGE_COOLDOWN_LEGACY_SECS`, selected at boot via
+  `reject_page_cooldown_secs(episode_mode)`; a runtime config flip needs
+  a restart, like episode_mode itself). Suppressed episodes keep their
+  `error!` forwards, FEED-REJECT-01 signature, and feed-health marking,
+  and are counted by `tv_groww_reject_page_cooldown_suppressed_total`.
+  The ≥3-per-15-min restart pager independently covers "it keeps failing".
+  Ratchets: `test_should_page_reject_rising_edge_and_cooldown` pins BOTH
+  cooldowns exactly (60 / 1800) + the mode selector;
+  `episode_runtime_family_wiring_guard.rs` pins the episode routing incl.
+  the operator-initiated + Low-off-hours exclusions.
 - **"This session" = this APP PROCESS:** `feed_health`'s last-tick stamp
   never resets in-process, so on day 2 of a long-running process the arm is
   dormant and the classic 30s stall arm owns everything (no coverage hole).

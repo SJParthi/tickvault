@@ -224,7 +224,10 @@ config_path = "config/strategies.toml"
 capital = 1000000.0
 dry_run = true
 mode = "sandbox"
-sandbox_only_until = "2026-06-30"
+# 2026-07-14 re-arm: the old 2026-06-30 date EXPIRED silently on 2026-07-01;
+# re-armed to the 2099-12-31 sentinel matching production.toml — going live
+# requires an explicit config edit with a fresh dated operator quote.
+sandbox_only_until = "2099-12-31"
 
 [logging]
 level = "info"
@@ -639,3 +642,24 @@ strikes_each_side = 2
 # ===========================================================================
 [tf_consistency]
 enabled = true
+
+# ===========================================================================
+# 🔷 DHAN pre-trade margin gate (operator directive 2026-07-14, relayed via
+# the coordinator session — the Funds & Margin surface runs as its own
+# dedicated build). Code-ready, DEFAULT-OFF: even with enabled = true the
+# REST legs stay dark until the code-change master lock
+# DHAN_MARGIN_GATE_REST_ALLOWED (constants.rs) flips with a fresh dated
+# operator quote recorded in .claude/rules/dhan/funds-margin.md (the
+# umbrella-plan E2 hold). Shared account with BruteX: tenant_budget_percent
+# caps EACH entry to <=50% of the then-current pooled availabelBalance
+# (per-entry, not cumulative); rest_self_cap_per_sec self-caps our
+# funds/margin REST usage — the endpoints' rate bucket is NOT named by
+# Dhan's docs (Assumed Non-Trading 20/sec; 5/sec stays <=50% even under the
+# more conservative 10/sec reading; live-probe before raising). The
+# self-cap is per gate instance — the OMS wiring PR constructs exactly one
+# gate per process and ratchets it. Exits are NEVER margin-gated.
+# ===========================================================================
+[dhan_margin_gate]
+enabled = false
+tenant_budget_percent = 50
+rest_self_cap_per_sec = 5

@@ -1456,6 +1456,9 @@ fn episode_attempts_hint(event: &NotificationEvent) -> u32 {
         NotificationEvent::OrderUpdateReconnected {
             consecutive_failures,
         } => *consecutive_failures,
+        // GrowwFeed incident events (GrowwSidecarRejected / FeedDown /
+        // FeedRecovered) carry no attempt count in their payload → 0, so
+        // the registry uses the folded-event count (2026-07-14 noise fold).
         _ => 0,
     }
 }

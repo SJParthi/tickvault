@@ -720,6 +720,11 @@ async fn main() -> Result<()> {
     let groww_sidecar_options = tickvault_app::groww_sidecar_supervisor::GrowwSidecarOptions {
         archive_s3_bucket: config.feeds.groww.capture_archive_s3_bucket.clone(),
         archive_s3_prefix: config.feeds.groww.capture_archive_s3_prefix.clone(),
+        // FIX-B (2026-07-14): boot-time episode_mode selects the reject-page
+        // cooldown (60s with the GrowwFeed episode fold ON, legacy 1800s when
+        // the episode kill switch is OFF). Runtime config flip = restart,
+        // consistent with how episode_mode itself is consumed.
+        episode_mode: config.notification.episode_mode,
         ..tickvault_app::groww_sidecar_supervisor::GrowwSidecarOptions::default()
     };
     if groww_scale_enabled {
@@ -3255,6 +3260,32 @@ async fn main() -> Result<()> {
     // Spawned exactly once here; each lane's run is gated at 15:40 on the
     // truthful runtime feed flags. See `spawn_daily_tick_conservation_task`.
     spawn_daily_tick_conservation_task(&config, &trading_calendar, &feed_runtime);
+
+    // Daily 15:25 IST orphan-position watchdog — PROCESS-GLOBAL
+    // (2026-07-14 re-home; the tick-conservation hoist precedent directly
+    // above). The 15:25 orphan-position watchdog previously ran ONLY via the
+    // Dhan-gated `spawn_post_market_tasks` — dead on dhan-off boots since
+    // 2026-07-13 (the Dhan live-WS retirement flipped `dhan_enabled = false`
+    // in prod, so the daily broker-position cross-check never ran); this
+    // process-global spawn closes it. `GlobalAtFireTime` resolves the session
+    // at each 15:25 fire, PREFERRING the live lane-owned TokenManager (fresh
+    // across a runtime lane stop→re-start — the D2c gauge pattern) and
+    // falling back to the global TokenManager (registered by the Dhan lane
+    // OR the Dhan REST stack's Phase 2) — no manager anywhere = LOUD degraded
+    // Critical page, never a clean signal. The fast crash-recovery arm keeps
+    // its Static
+    // spawn via `spawn_post_market_tasks` (that arm early-returns before this
+    // block); the module's once-guard makes a duplicate spawn a no-op.
+    let _orphan_watchdog_global_handle =
+        tickvault_app::orphan_position_watchdog_boot::spawn_supervised_orphan_position_watchdog(
+            tickvault_app::orphan_position_watchdog_boot::WatchdogAuth::GlobalAtFireTime {
+                feed_runtime: std::sync::Arc::clone(&feed_runtime),
+            },
+            notifier.clone(),
+            std::sync::Arc::clone(&trading_calendar),
+            config.dhan.rest_api_base_url.clone(),
+            config.strategy.dry_run,
+        );
 
     // Dual-feed scoreboard (operator 2026-07-10) — PROCESS-GLOBAL like the
     // conservation audit above: the boot-time process-death reconciler + the
@@ -14656,20 +14687,27 @@ fn spawn_post_market_tasks(
         );
         return;
     }
-    // Phase 0 Item 20 (wired 2026-06-13): supervised 15:25 IST orphan-position
-    // watchdog — the daily open-position safety gate. Alert-only in
-    // sandbox/dry-run (no order/cancel call exists on any path); pages CRITICAL
-    // every day open positions exist (NOT edge-suppressed — it is a compliance
-    // gate). Supervised respawn + busy-loop floor + secret-redacted REST errors
-    // per the 2026-06-13 3-agent adversarial review. Called from BOTH boot
-    // paths (boot-symmetry) so a mid-session restart re-arms it.
+    // Phase 0 Item 20 (wired 2026-06-13; auth re-homed 2026-07-14): supervised
+    // 15:25 IST orphan-position watchdog — the daily open-position safety gate.
+    // Alert-only in sandbox/dry-run (no order/cancel call exists on any path);
+    // pages CRITICAL every day open positions exist (NOT edge-suppressed — it
+    // is a compliance gate). Supervised respawn + busy-loop floor +
+    // secret-redacted REST errors per the 2026-06-13 3-agent adversarial
+    // review. Since 2026-07-14 the PRIMARY spawn lives in the process-global
+    // prefix (`WatchdogAuth::GlobalAtFireTime`) so dhan-off boots are covered;
+    // THIS family-site spawn keeps the fast crash-recovery arm's coverage with
+    // the boot-time handles (`Static` — byte-identical to the pre-2026-07-14
+    // behaviour). The module's once-guard makes whichever call site runs
+    // second a no-op, so a double 15:25 page is structurally impossible.
     let _orphan_watchdog_handle =
         tickvault_app::orphan_position_watchdog_boot::spawn_supervised_orphan_position_watchdog(
-            token_handle.clone(),
+            tickvault_app::orphan_position_watchdog_boot::WatchdogAuth::Static {
+                token_handle: token_handle.clone(),
+                client_id: client_id.clone(),
+            },
             notifier.clone(),
             std::sync::Arc::clone(&trading_calendar),
             config.dhan.rest_api_base_url.clone(),
-            client_id.clone(),
             config.strategy.dry_run,
         );
     // Phase 0 Item 22d (2026-05-15): End-of-day digest at
