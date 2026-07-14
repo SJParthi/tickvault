@@ -110,6 +110,18 @@ for the day — visible, never wrong.
 **The composite `(u64, u8)` rewrite is a MANDATORY pre-live follow-up** —
 no `dry_run = false` flip without it.
 
+**Second pre-live landmine, same follow-up (E9, fix-round 2026-07-14):**
+the paper book's id SPACE is Groww-native today — positions are keyed by
+the u64 the MARK carried (bit-62 index ids / Groww exchange_tokens),
+because in dry-run the fills are synthesized FROM the marks. In LIVE mode
+positions would be keyed by DHAN-space sids (from real order updates)
+while marks keep arriving in GROWW-space u64s — `update_market_price`
+would never match a live position and unrealized P&L would read
+permanently 0 (the daily-loss halt goes blind). The composite-key rewrite
+MUST therefore include a cross-feed id MAPPING leg (contract identity per
+`futidx-4-error-codes.md` §2 — never native-id equality). No
+`dry_run = false` flip without BOTH halves.
+
 ## §4. Scope guard — EXPLICITLY OUT (a violating PR is REJECTED)
 
 1. Strategy/indicator activation — §28 boundary; the runtime never
