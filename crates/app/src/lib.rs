@@ -23,9 +23,10 @@ pub mod bar_cache_loader;
 // coverage-horizon staleness watchdog - pages the operator BEFORE the
 // calendar runs off its year-end cliff into un-listed holidays.
 pub mod calendar_staleness;
-// Operator directive 2026-06-02: post-market (15:31 IST) 1-minute
-// cross-verification of live candles_1m vs Dhan intraday — CSV + audit + count.
-pub mod cross_verify_1m_boot;
+// PR-C3 (2026-07-14): `cross_verify_1m_boot` module DELETED — the 15:31 IST
+// Dhan live-vs-historical 1m cross-verify retired with the Dhan live WS
+// (operator 2026-07-13; cross-verify-1m-error-codes.md retirement banner).
+// Its parser lives on in `dhan_intraday_parse` (relocated in C1).
 // BruteX↔TickVault daily cross-verify (BRUTEX-XVERIFY, 2026-07-12): PURE
 // comparison core — CSV parse, symbol mapping, day compare. No I/O; the
 // boot/runner shell lives in brutex_crossverify_boot (Unit 5).
@@ -157,11 +158,10 @@ pub mod infra;
 // "only ticks and our 9 needed candle timeframes are available".
 // The 25 `movers_*` matviews + `movers_1s` base table are dropped at
 // boot by `materialized_views::drop_bug3_retired_views`.
-// PR #454 (2026-05-03): boot-time prev_oi cache loader. Wires
-// bhavcopy → cache extraction primitives into the boot path so the
-// in-memory cache (consumed by the cascade seal-time pct-stamping
-// path + tick enricher) is Dhan-precise from the first tick.
-pub mod prev_day_ohlcv_boot;
+// PR-C3 (2026-07-14): `prev_day_ohlcv_boot` module DELETED — the boot-time
+// previous-day OHLCV REST fetch retired with the Dhan live-WS lane (operator
+// 2026-07-13; prev-day-ohlcv-error-codes.md retirement banner). The
+// `prev_day_ohlcv` QuestDB table is retained (forensic).
 // F2 (Wave-5 #504e follow-up) — boot-time loader for `PrevDayCache`
 // so the cascade seal-time pct-stamping path (PR #520 / F1) sees
 // non-zero `prev_day_close` values from QuestDB's `previous_close`

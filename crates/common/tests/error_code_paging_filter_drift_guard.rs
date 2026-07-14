@@ -215,11 +215,14 @@ fn is_test_cfg(attr: &str) -> bool {
 ///   while bringing this guard up on 2026-07-10).
 /// - NOT a truncation at the first test-gated MODULE either (the
 ///   2026-07-10 shape of this function): `crates/app/src/
-///   cross_verify_1m_boot.rs` carries a MID-FILE `#[cfg(test)] mod
+///   cross_verify_1m_boot.rs` carried a MID-FILE `#[cfg(test)] mod
 ///   start_decision_tests` at line ~134 with the real
 ///   CROSS-VERIFY-1M-01/-02 `error!` emits AFTER it — truncating there
 ///   reported both codes as dead filters (a FALSE dead found on
-///   2026-07-14 while adding their paging entries). Test-gated modules
+///   2026-07-14 while adding their paging entries; that module and its
+///   paging entries have since RETIRED — PR-C3 the same day — but the
+///   excision shape stays load-bearing for ANY mid-file test module).
+///   Test-gated modules
 ///   are now EXCISED via string-aware brace matching, so production
 ///   code before AND after a mid-file test module stays visible while
 ///   needles inside any test module never count.
@@ -1047,8 +1050,9 @@ fn synthetic_emit_detector_ignores_comments_and_test_regions() {
         "cfg(not(test)) gates PRODUCTION code — it must never truncate"
     );
     // Regression pin (2026-07-14, the CROSS-VERIFY-1M false-dead found
-    // while adding its paging entry): a MID-FILE cfg(test) module —
-    // cross_verify_1m_boot.rs's `mod start_decision_tests` at ~line 134 —
+    // while adding its then-live paging entry; the module + entries have
+    // since retired — PR-C3 the same day): a MID-FILE cfg(test) module —
+    // the deleted cross_verify_1m_boot.rs's `mod start_decision_tests` —
     // must be EXCISED, never TRUNCATED AT: the real production emit AFTER
     // it must stay visible, while a needle INSIDE the mid-file module
     // still never counts. Both directions:

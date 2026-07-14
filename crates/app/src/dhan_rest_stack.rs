@@ -54,11 +54,11 @@
 //!    watch channel and the existing `[spot_1m_rest]` /
 //!    `[option_chain_1m]` config gates);
 //! **Deliberately NOT spawned (PR-C2 truth-sync, 2026-07-14):** the
-//! prev-day OHLCV fetch (retained-dormant module — deletes in C3), the EOD
+//! prev-day OHLCV fetch (module DELETED in PR-C3, 2026-07-14), the EOD
 //! digest (its `EndOfDayDigest` event variant survives emitterless in core;
 //! the emit died with the lane), and the WS pool / universe build / SLO
 //! publisher / the 15:31 cross-verify SPAWN — all DELETED in PR-C2 with the
-//! lane (the cross_verify_1m_boot.rs FILE deletion is C3). The
+//! lane (the cross_verify_1m_boot.rs FILE was deleted in PR-C3, 2026-07-14). The
 //! orphan-position watchdog moved OFF this list in PR-C2 (RE-HOMED into
 //! this stack — see its spawn below). ALSO not spawned, since 2026-07-14
 //! (operator Dhan noise lock, `dhan-rest-only-noise-lock-2026-07-14.md` +
