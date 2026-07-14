@@ -1325,6 +1325,16 @@ async fn main() -> Result<()> {
     // (source-order scan of this file):
     // crates/app/tests/seal_drop_paging_wiring_guard.rs.
     metrics::counter!("tv_seal_writer_drain_total", "kind" => "dropped").increment(0);
+    // Order-side counters (cluster-C, 2026-07-14): dense-from-boot so the CW
+    // agent's dropped-first-sample delta baseline is the harmless 0 — without
+    // this, alarm #10 (orders-rejected) is dead for a single-rejection session
+    // (the counter is born AT the first reject and that sample IS the dropped
+    // baseline), and the orders-placed-storm delta filter starts blind. Same
+    // rationale as the three registrations above. Ratchet (source-order scan
+    // of this file): crates/app/tests/order_side_paging_wiring_guard.rs.
+    metrics::counter!("tv_orders_rejected_total").increment(0);
+    metrics::counter!("tv_orders_placed_total", "mode" => "paper").increment(0);
+    metrics::counter!("tv_orders_placed_total", "mode" => "live").increment(0);
 
     // L18 (revised) + L121-L130 (Wave-5 in-memory-store plan §AA):
     // register the per-subsystem memory gauges, the sampler heartbeat,
@@ -2823,6 +2833,14 @@ async fn main() -> Result<()> {
                         hot_reloader,
                         Some(std::sync::Arc::clone(&daily_reset_signal)),
                         Some(std::sync::Arc::clone(&market_close_signal)),
+                        // Cluster-C (2026-07-14): order-side observability
+                        // wiring (audit tables + alert-sink Telegram bridge).
+                        Some(tickvault_app::order_observability::OrderSideWiring {
+                            notifier: std::sync::Arc::clone(&fast_notifier),
+                            questdb: config.questdb.clone(),
+                            dry_run: config.strategy.dry_run,
+                            calendar: std::sync::Arc::clone(&trading_calendar),
+                        }),
                     );
                     info!("trading pipeline started (paper trading, fast boot)");
                     Some(handle)
@@ -9012,6 +9030,14 @@ async fn start_dhan_lane(
                     hot_reloader,
                     Some(std::sync::Arc::clone(&daily_reset_signal)),
                     Some(std::sync::Arc::clone(&market_close_signal)),
+                    // Cluster-C (2026-07-14): order-side observability
+                    // wiring (audit tables + alert-sink Telegram bridge).
+                    Some(tickvault_app::order_observability::OrderSideWiring {
+                        notifier: std::sync::Arc::clone(&notifier),
+                        questdb: config.questdb.clone(),
+                        dry_run: config.strategy.dry_run,
+                        calendar: std::sync::Arc::clone(&trading_calendar),
+                    }),
                 );
                 info!("trading pipeline started (paper trading)");
                 Some(handle)

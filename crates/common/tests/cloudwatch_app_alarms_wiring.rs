@@ -322,7 +322,7 @@ fn test_deployed_emf_source_labels_match_a_real_series_label() {
 }
 
 #[test]
-fn test_emf_metric_selectors_name_count_is_twenty_six() {
+fn test_emf_metric_selectors_name_count_is_twenty_eight() {
     // Pin the MAIN (host-only) EMF publish list: 19 alarm-backing signals
     // + 2 memory-measurement gauges added 2026-07-02 for the 2K-universe RAM
     // measurement (tv_process_rss_bytes — crates/storage/src/resource_monitor.rs;
@@ -355,15 +355,20 @@ fn test_emf_metric_selectors_name_count_is_twenty_six() {
     // (scope-lock §A.1), so the gauge has zero reachable writers; shipping
     // a dead name in the EMF list would publish nothing while implying
     // coverage. Cost: -1 custom metric (~-$0.30/mo).
+    //
+    // 28 (was 26) since 2026-07-14 (cluster-C order-side): +tv_daily_pnl
+    // +tv_order_fill_lag_seconds — both DORMANT in dry-run (emit sites ship
+    // with cluster A / Phase-1); $0 until data.
     let user_data = read("deploy/aws/terraform/user-data.sh.tftpl");
     let names = emf_declared_names(&user_data, "metric_selectors");
     assert_eq!(
         names.len(),
-        26,
-        "Z+ L2 VERIFY ratchet: expected exactly 26 names in the MAIN EMF \
+        28,
+        "Z+ L2 VERIFY ratchet: expected exactly 28 names in the MAIN EMF \
          metric_selectors list (24 post-#1437 groww feed-down alerting + 2 \
          silent-feed lag names 2026-07-06 + 1 groww lag gauge 2026-07-11 \
-         scoreboard PR-C - 1 order-update gauge removed 2026-07-14 M4); \
+         scoreboard PR-C - 1 order-update gauge removed 2026-07-14 M4 + 2 \
+         dormant order-side names 2026-07-14 cluster-C); \
          found {}: {names:?}",
         names.len()
     );
@@ -373,6 +378,9 @@ fn test_emf_metric_selectors_name_count_is_twenty_six() {
         "tv_dhan_exchange_lag_p99_seconds",
         "tv_dhan_lag_samples_excluded_total",
         "tv_groww_exchange_lag_p99_seconds",
+        // 2026-07-14 cluster-C order-side (dormant until cluster A / Phase-1):
+        "tv_daily_pnl",
+        "tv_order_fill_lag_seconds",
     ] {
         assert!(
             names.iter().any(|n| n == required),
