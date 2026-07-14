@@ -618,23 +618,27 @@ impl OrderManagementSystem {
                     }
                     break resp;
                 }
-                Err(err) => match self
-                    .apply_engine_error_policy(&err, OrderEndpoint::Place, &mut auth_retry_used)
-                    .await
-                {
-                    EngineAction::Retry => continue,
-                    EngineAction::Halt(cause) => {
-                        return Err(OmsError::OrderPathHalted { cause });
-                    }
-                    EngineAction::ReturnTokenExpired => return Err(OmsError::TokenExpired),
-                    EngineAction::PassThrough => {
-                        self.fire_alert(OmsAlert::OrderRejected {
-                            correlation_id: correlation_id.clone(),
-                            reason: format!("{err}"),
-                        });
-                        return Err(err);
-                    }
-                },
+                resp
+            }
+            Err(err) => {
+                // Rate limit errors (DH-904 / HTTP 429) should NOT trip the
+                // circuit breaker — the API is healthy, we're just throttled.
+                if !matches!(err, OmsError::DhanRateLimited) {
+                    self.circuit_breaker.record_failure();
+                }
+                // C4 (2026-07-14): place-time API rejections and WS-reported
+                // REJECTED transitions are DISJOINT classes — this arm
+                // previously fired only the OrderRejected alert while the
+                // tv-<env>-orders-rejected alarm's counter moved only at the
+                // process_order_update REJECTED transition. Count BOTH
+                // classes so the alarm pages for the only class reachable at
+                // Phase-1 entry (the order-update WS is functional-dormant).
+                counter!("tv_orders_rejected_total").increment(1);
+                self.fire_alert(OmsAlert::OrderRejected {
+                    correlation_id: correlation_id.clone(),
+                    reason: format!("{err}"),
+                });
+                return Err(err);
             }
         };
 

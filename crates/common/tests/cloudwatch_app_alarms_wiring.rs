@@ -364,19 +364,19 @@ fn test_emf_metric_selectors_name_count_is_twenty_eight() {
     // a dead name in the EMF list would publish nothing while implying
     // coverage. Cost: -1 custom metric (~-$0.30/mo).
     //
-    // 28 (was 26) since 2026-07-14 (cluster-C order-side): +tv_daily_pnl
+    // 23 (was 21 on this branch / 28 on main) since 2026-07-14 (cluster-C
+    // order-side, reconciled through the PR-C2 merge): +tv_daily_pnl
     // +tv_order_fill_lag_seconds — both DORMANT in dry-run (emit sites ship
     // with cluster A / Phase-1); $0 until data.
     let user_data = read("deploy/aws/terraform/user-data.sh.tftpl");
     let names = emf_declared_names(&user_data, "metric_selectors");
     assert_eq!(
         names.len(),
-        28,
-        "Z+ L2 VERIFY ratchet: expected exactly 28 names in the MAIN EMF \
-         metric_selectors list (24 post-#1437 groww feed-down alerting + 2 \
-         silent-feed lag names 2026-07-06 + 1 groww lag gauge 2026-07-11 \
-         scoreboard PR-C - 1 order-update gauge removed 2026-07-14 M4 + 2 \
-         dormant order-side names 2026-07-14 cluster-C); \
+        23,
+        "Z+ L2 VERIFY ratchet: expected exactly 23 names in the MAIN EMF \
+         metric_selectors list (27 pre-PR-C2 minus the 5 Dhan-lane names \
+         retired 2026-07-13 minus the order-update gauge removed 2026-07-14 \
+         M4 plus the 2 dormant order-side names 2026-07-14 cluster-C); \
          found {}: {names:?}",
         names.len()
     );

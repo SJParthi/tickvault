@@ -329,8 +329,18 @@ locals {
       ok_recovery = false # 2026-07-14: once-per-episode mint failure - the retry-once latch holds, so the token stays dead for the session; auto-OK ~15 min later would be a Rule-11 false recovery
       desc        = "AUTH-GAP-05 forced re-mint FAILED: the mid-session watchdog detected a sustained dead Dhan token, issued its ONE forced re-mint for the episode, and the mint FAILED (permanent=true = a peer holds the dual-instance lock in-flight; permanent=false = mint HTTP/TOTP failure) - the token stays DEAD for the rest of the session (the retry-once latch holds; the 4h sweep backstop is lane-only per audit GAP-02). Successful self-heal re-mints deliberately do NOT page (trigger arm unmatched - silent-when-healing), and cooldown_skip=true mint-cooldown skips are excluded (non-terminal; the next re-arm window retries). NO recovered/OK page: recovery signal = tv_token_valid back to 1 / the next clean profile cycle. Runbook: .claude/rules/project/wave-4-error-codes.md (AUTH-GAP-05)"
     }
-    "cross-verify-1m-02" = {
-      pattern     = "{ $.code = \"CROSS-VERIFY-1M-02\" && $.level = \"ERROR\" }"
+    # SPOT1M-01 escalation edge (added 2026-07-14 — REST-audit GAP-03):
+    # the per-minute spot-1m REST legs (Dhan spot + Groww spot + Groww
+    # contract — all emit SPOT1M-01) page HIGH via app Telegram at the
+    # 3-consecutive-fully-failed-minutes edge; this filter is the CW
+    # backstop for exactly that edge. Stage-scoped: stage="escalation" is
+    # the ONCE-per-episode edge line (edge-latched, re-armed only after a
+    # fetch+persist-clean minute); the per-minute stage="minute_failed" /
+    # "boundary_skipped" / etc. lines fire every failed minute and are
+    # sub-edge by design — a plain code filter would over-page vs the
+    # designed 3-minute escalation (rest-1m-pipeline-error-codes.md §1).
+    "spot1m-01-escalation" = {
+      pattern     = "{ $.code = \"SPOT1M-01\" && $.level = \"ERROR\" && $.stage = \"escalation\" }"
       period      = 300
       threshold   = 1
       eval        = 3
@@ -338,8 +348,12 @@ locals {
       ok_recovery = false # 2026-07-14: once-per-episode edge - the recovery signal is the leg's own typed Info recovery Telegram / rows landing again, not the datapoint aging out
       desc        = "SPOT1M-01 escalation: a per-minute REST 1m candle leg (Dhan spot, Groww spot, or Groww contract - read the feed/leg fields in the errors-jsonl stream) fully failed 3+ consecutive minutes (persist-gated: fetch-ok-but-lost rows count as failed). Fires once per episode (edge-latched). Triage: cross-check DH-901 (REST surface/token; the REST canary was retired 2026-07-14 with the Dhan noise lock), tv_spot1m_fetch_total outcome rates, QuestDB health for persist-gated episodes. NO recovered/OK page: recovery = the leg's typed recovery Telegram + rows landing again. Runbook: .claude/rules/project/rest-1m-pipeline-error-codes.md"
     }
-    "tick-conserve-01" = {
-      pattern     = "{ $.code = \"TICK-CONSERVE-01\" && $.level = \"ERROR\" }"
+    # CHAIN-02 escalation edge (added 2026-07-14 — REST-audit GAP-03):
+    # same contract as spot1m-01-escalation for the option-chain legs
+    # (Dhan + Groww). stage="escalation" only — per-minute sub-edge lines
+    # deliberately unmatched.
+    "chain-02-escalation" = {
+      pattern     = "{ $.code = \"CHAIN-02\" && $.level = \"ERROR\" && $.stage = \"escalation\" }"
       period      = 300
       threshold   = 1
       eval        = 3

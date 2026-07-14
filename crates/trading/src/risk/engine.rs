@@ -460,13 +460,10 @@ impl RiskEngine {
 
     fn trigger_halt(&mut self, breach: RiskBreach) {
         if !self.halted {
-            // ERROR level + typed code (2026-07-14: the previously-uncoded
-            // halt error gains `code = RISK-GAP-01` per charter rule 5; the
-            // stale "via Loki → Grafana" routing claim is retired — the
-            // reachable page is the RiskAlertSink → NotificationService
-            // Telegram below, wired by the order runtime).
+            // RISK-GAP-01 coded emit (2026-07-14): log-sink-only; the
+            // Telegram page is the sink's Critical RiskHalt event.
             error!(
-                code = ErrorCode::RiskGapPreTrade.code_str(),
+                code = tickvault_common::error_code::ErrorCode::RiskGapPreTrade.code_str(),
                 breach = ?breach,
                 realized_pnl = self.total_realized_pnl,
                 "RISK-GAP-01 CRITICAL: RISK BREACH — trading HALTED. ALL orders \
