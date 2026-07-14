@@ -189,8 +189,7 @@ impl RpsTuner {
             // full streak (deterministic, no unbounded loop).
             let idle =
                 (gap - window_len).min(u64::from(DHAN_DATA_API_TUNER_CLEAN_MINUTES_FOR_STEP_UP));
-            // APPROVED: bounded by the min() above — cast cannot truncate
-            #[allow(clippy::cast_possible_truncation)]
+            #[allow(clippy::cast_possible_truncation)] // APPROVED: bounded by the min() above
             {
                 self.clean_streak = self.clean_streak.saturating_add(idle as u32);
             }
