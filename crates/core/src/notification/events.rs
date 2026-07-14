@@ -935,19 +935,11 @@ pub enum NotificationEvent {
     /// disconnect leg (unchanged: `test_order_update_reconnected_severity_is_low`).
     OrderUpdateReconnected { consecutive_failures: u32 },
 
-    /// CRITICAL: zero live ticks received during market hours past the
-    /// configured silence threshold. Fires edge-triggered (once on rising
-    /// edge — when ticks resume, an INFO recovery log fires but no
-    /// Telegram). This event would have caught the 2026-04-21 morning
-    /// failure where the WS was connected but Dhan stopped streaming
-    /// (likely data-plan issue).
-    NoLiveTicksDuringMarketHours {
-        /// How long the heartbeat has been stale, in seconds.
-        silent_for_secs: u64,
-        /// Threshold that triggered the alert, in seconds.
-        threshold_secs: u64,
-    },
-
+    // 2026-07-14 operator Dhan noise lock: `NoLiveTicksDuringMarketHours`
+    // (Critical) DELETED with the no-tick watchdog — its heartbeat was fed
+    // ONLY by the Dhan tick pipeline; Groww stall detection is
+    // FEED-STALL-01 + the market-hours-liveness alarm. See
+    // .claude/rules/project/dhan-rest-only-noise-lock-2026-07-14.md.
     /// Graceful shutdown initiated.
     ShutdownInitiated,
 
@@ -3128,17 +3120,6 @@ impl NotificationEvent {
                     "<b>Order Update WS reconnected</b>\nRecovered after {consecutive_failures} consecutive failures"
                 )
             }
-            Self::NoLiveTicksDuringMarketHours {
-                silent_for_secs,
-                threshold_secs,
-            } => {
-                format!(
-                    "<b>CRITICAL: zero live ticks during market hours</b>\n\
-                     Silent for {silent_for_secs}s (threshold {threshold_secs}s).\n\
-                     WebSockets may be connected but NO data streaming. \
-                     Check Dhan dataPlan + IP allowlist + token validity."
-                )
-            }
             Self::OrderUpdateDisconnected { reason } => {
                 format!(
                     "<b>Order Update WS DISCONNECTED</b>\n{}",
@@ -3724,7 +3705,6 @@ impl NotificationEvent {
             Self::OrderUpdateAuthenticated => "OrderUpdateAuthenticated",
             Self::OrderUpdateDisconnected { .. } => "OrderUpdateDisconnected",
             Self::OrderUpdateReconnected { .. } => "OrderUpdateReconnected",
-            Self::NoLiveTicksDuringMarketHours { .. } => "NoLiveTicksDuringMarketHours",
             Self::ShutdownInitiated => "ShutdownInitiated",
             Self::ShutdownComplete => "ShutdownComplete",
             Self::InstrumentBuildSuccess { .. } => "InstrumentBuildSuccess",
@@ -3948,7 +3928,6 @@ impl NotificationEvent {
             // Swap itself failed — depth quality degraded until next rebalance.
             Self::OrderUpdateDisconnected { .. } => Severity::High,
             Self::OrderUpdateReconnected { .. } => Severity::Low,
-            Self::NoLiveTicksDuringMarketHours { .. } => Severity::Critical,
             Self::ShutdownInitiated => Severity::Medium,
             Self::CircuitBreakerClosed => Severity::Medium,
             Self::WebSocketConnected { .. } => Severity::Low,
@@ -8761,15 +8740,6 @@ mod tests {
         assert!(
             reconnected.contains("reconnected") && reconnected.contains('3'),
             "got: {reconnected}"
-        );
-        let silent = NotificationEvent::NoLiveTicksDuringMarketHours {
-            silent_for_secs: 120,
-            threshold_secs: 60,
-        }
-        .to_message();
-        assert!(
-            silent.contains("zero live ticks") && silent.contains("120"),
-            "got: {silent}"
         );
     }
 

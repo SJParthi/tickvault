@@ -2274,17 +2274,11 @@ async fn main() -> Result<()> {
             // multi-TF aggregator (Engine B) is the only candle engine.
             let tick_broadcast_for_processor = Some(fast_tick_broadcast_sender.clone());
 
-            // Parthiban directive (2026-04-21): no-tick-during-market-hours
-            // watchdog. The tick processor updates this atomic on every
-            // parsed tick; the watchdog fires CRITICAL + Telegram if it
-            // stays stale > NO_TICK_THRESHOLD_SECS during market hours.
-            let fast_tick_heartbeat =
-                tickvault_core::pipeline::no_tick_watchdog::new_tick_heartbeat();
-            let _no_tick_watchdog_handle =
-                tickvault_core::pipeline::no_tick_watchdog::spawn_no_tick_watchdog(
-                    std::sync::Arc::clone(&fast_tick_heartbeat),
-                    Some(std::sync::Arc::clone(&fast_notifier)),
-                );
+            // 2026-07-14 operator Dhan noise lock: the no-tick watchdog
+            // (NoLiveTicksDuringMarketHours Critical) is DELETED — its
+            // heartbeat was fed ONLY by the Dhan tick pipeline; Groww stall
+            // detection is FEED-STALL-01 + the market-hours-liveness alarm.
+            // See .claude/rules/project/dhan-rest-only-noise-lock-2026-07-14.md.
 
             // O(1) EXEMPT: cold path — build inline Greeks computer once at startup.
             let greeks_enricher = build_inline_greeks_enricher(&config, &subscription_plan);
@@ -2318,7 +2312,7 @@ async fn main() -> Result<()> {
                     fast_tick_writer,
                     tick_broadcast_for_processor,
                     greeks_enricher,
-                    Some(fast_tick_heartbeat),
+                    None, // tick_heartbeat — no-tick watchdog retired 2026-07-14 (Dhan noise lock)
                     None, // tick_enricher — Phase 2.5 wiring deferred until prev_oi_cache + boot ordering gate land in slow boot
                     tickvault_common::always_on::current(), // §30 GIFT exemption
                     Some(feed_health_for_processor), // SP5: Dhan live-feed health
@@ -5278,7 +5272,7 @@ async fn run_slow_boot_observability(
     // to a 30s periodic poller. The method existed in the tracker but was never
     // called in production, so per-instrument stall detection (Dhan silently drops
     // a subscription OR an ATM strike stops trading mid-session) stayed invisible
-    // until the global `no_tick_watchdog` fired on total silence — up to 120s
+    // until the global no-tick watchdog (retired 2026-07-14) fired on total silence — up to 120s
     // of missed signals on a single underlying. The 30s cadence is the sweet
     // spot: fast enough to catch stalls before operators manually notice them,
     // slow enough to stay off the hot path (O(n) scan of tracked securities,
@@ -7716,14 +7710,8 @@ async fn start_dhan_lane(
         // volume_nse_audit QuestDB table is KEPT on disk per SEBI 5-year
         // retention pending operator-triggered DROP TABLE migration.
 
-        // Parthiban directive (2026-04-21): no-tick-during-market-hours
-        // watchdog (slow boot path). Same pattern as fast boot above.
-        let slow_tick_heartbeat = tickvault_core::pipeline::no_tick_watchdog::new_tick_heartbeat();
-        let _slow_no_tick_watchdog_handle =
-            tickvault_core::pipeline::no_tick_watchdog::spawn_no_tick_watchdog(
-                std::sync::Arc::clone(&slow_tick_heartbeat),
-                Some(std::sync::Arc::clone(&notifier)),
-            );
+        // 2026-07-14 operator Dhan noise lock: the no-tick watchdog (slow
+        // boot path) is DELETED — see the fast-arm note above.
 
         // 29-tf engine plan Phase 2.6 — Phase 2 lifecycle enricher.
         //
@@ -7949,7 +7937,7 @@ async fn start_dhan_lane(
                 tick_writer,
                 tick_broadcast_for_processor,
                 greeks_enricher,
-                Some(slow_tick_heartbeat),
+                None, // tick_heartbeat — no-tick watchdog retired 2026-07-14 (Dhan noise lock)
                 // 29-tf engine Phase 2.6 — production-attach the
                 // lifecycle enricher. The prev_oi_cache was loaded
                 // synchronously above (or skipped on QuestDB error
@@ -11122,12 +11110,11 @@ pub async fn run_dhan_lane_runtime_supervisor(
                 // AG5-R3-1 early-constructed `DhanLaneRunHandles` H8 floor —
                 // so dropping the cancelled future ABORTS-or-RELEASES (never
                 // detaches) the lane's registered tasks. Honest residual
-                // (COV-C4-2, deliberately NOT lane-owned): the
-                // market-hours-gated no-tick watchdog and the one-shot
-                // sleep-then-notify close/reset timers — the timers
-                // self-terminate at their fire time (bounded ≤ ~24h) and the
-                // watchdog is heartbeat-driven + session-gated, so neither
-                // pins lane data-path state nor pages from a dead lane.
+                // (COV-C4-2, deliberately NOT lane-owned): the one-shot
+                // sleep-then-notify close/reset timers — they self-terminate
+                // at their fire time (bounded ≤ ~24h), so they pin no lane
+                // data-path state. (The formerly-listed no-tick watchdog was
+                // retired 2026-07-14 per the Dhan noise lock.)
                 if let Some(task) = active_task.take() {
                     info!(
                         "[dhan-lane] Dhan disabled mid-cold-start (Starting→Off won) — aborting \
