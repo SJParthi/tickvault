@@ -152,13 +152,6 @@ build_window_end = "15:30:00"
 host = "0.0.0.0"
 port = 3001
 
-[subscription]
-feed_mode = "Full"
-subscribe_stock_equities = true
-stock_atm_strikes_above = 10
-stock_atm_strikes_below = 10
-stock_default_atm_fallback_enabled = true
-
 [notification]
 telegram_api_base_url = "https://api.telegram.org"
 send_timeout_ms = 10000

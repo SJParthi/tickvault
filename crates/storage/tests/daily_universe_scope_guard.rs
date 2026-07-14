@@ -1,25 +1,28 @@
-//! Sub-PR #1 of 2026-05-27 daily-universe expansion — source-scan ratchet
-//! pinning the **`SubscriptionScope::DailyUniverse` contract** documented
-//! in `.claude/rules/project/daily-universe-scope-expansion-2026-05-27.md`.
+//! §36 FUTIDX + storage-primitive ratchets — the SURVIVING half of the
+//! daily-universe scope guard.
 //!
-//! This guard fails the build if:
+//! PR-C3 (2026-07-14, operator retirement directive 2026-07-13 —
+//! `websocket-connection-scope-lock.md` "2026-07-13 Amendment" §A/§B): the
+//! daily-universe SUBSCRIPTION contract this guard originally pinned
+//! (Sections A–J: the Dhan Detailed CSV URL, Quote-mode-for-all, the §4
+//! infinite retry, the no-fallback policy, the [100, 1200] size envelope,
+//! the `SubscriptionScope::DailyUniverse` variant, plus the F&O-master /
+//! batched-reconcile / O(1)-warm-skip code pins) is RETIRED — the fetch
+//! chain, the reconcile chain, `DailyUniverse`, and the `SubscriptionScope`
+//! enum are DELETED (Q3: "hereafter no Dhan instrument download/parsing").
+//! The rule file's sections survive as dated historical audit; pinning a
+//! retired contract's text would freeze history, so those tests retired
+//! WITH their subjects.
 //!
-//!  1. The Dhan Detailed CSV URL is changed or removed from the rule file.
-//!  2. The Quote-mode-for-all-SIDs rule is weakened (Ticker or Full
-//!     creep into the daily-universe subscription path).
-//!  3. The infinite-retry policy is replaced by any give-up condition.
-//!  4. The composite-key contract `(security_id, exchange_segment)`
-//!     per I-P1-11 is dropped from the `instrument_lifecycle` DEDUP
-//!     UPSERT KEYS clause.
-//!  5. A fallback data source (REST LTP, S3 cache, yesterday's stale
-//!     CSV) is documented as acceptable.
-//!  6. The `SubscriptionScope::DailyUniverse` enum variant disappears
-//!     from `crates/common/src/config.rs`.
+//! What KEEPS pinning (still-live contracts):
 //!
-//! See:
-//! - `.claude/rules/project/daily-universe-scope-expansion-2026-05-27.md`
-//! - `.claude/rules/project/security-id-uniqueness.md` (I-P1-11)
-//! - `.claude/rules/project/operator-charter-forever.md` §I
+//! - the §36/§36.7 FUTIDX scope (4 underlyings, all monthly serials,
+//!   never-roll, the un-feature-gateable shared selector) — the GROWW
+//!   futures leg stands after the Dhan retirement;
+//! - the storage SEBI-table primitives (`instrument_lifecycle` bulk ILP
+//!   append fns + the O(1) warm-bump/fetch-audit-SHA primitives) — the
+//!   tables are never-delete and the Groww shared-master writer is their
+//!   live producer.
 
 #![cfg(test)]
 
@@ -34,279 +37,18 @@ fn repo_root() -> PathBuf {
         .to_path_buf()
 }
 
-fn rule_file_body() -> String {
-    let path =
-        repo_root().join(".claude/rules/project/daily-universe-scope-expansion-2026-05-27.md");
-    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {} failed: {e}", path.display()))
-}
-
-fn config_rs_body() -> String {
-    let path = repo_root().join("crates/common/src/config.rs");
-    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {} failed: {e}", path.display()))
-}
-
-/// Section A — the Detailed CSV URL is the SINGLE source of truth for
-/// the daily universe. Compact CSV lacks `UNDERLYING_SECURITY_ID`
-/// (required for F&O dedup). If someone replaces the URL with the
-/// compact CSV, the contract breaks silently.
-#[test]
-fn daily_universe_dhan_detailed_csv_url_pinned() {
-    let body = rule_file_body();
-    assert!(
-        body.contains("https://images.dhan.co/api-data/api-scrip-master-detailed.csv"),
-        "rule file must pin the Dhan Detailed CSV URL (compact CSV lacks UNDERLYING_SECURITY_ID)"
-    );
-}
-
-/// Section B — Quote mode is locked for EVERY SID. Per operator Quote 2
-/// (2026-05-27): "for all of them it should be quote mode dude always".
-#[test]
-fn daily_universe_quote_mode_locked_for_all_sids() {
-    let body = rule_file_body();
-    assert!(
-        body.contains("Quote mode")
-            || body.contains("Quote (request code 17)")
-            || body.contains("**Quote**"),
-        "rule file must pin Quote mode for all daily-universe SIDs"
-    );
-    assert!(
-        body.contains("Feed Request Code: `17`")
-            || body.contains("request code 17")
-            || body.contains("Subscribe — Quote Packet"),
-        "rule file must pin Dhan Feed Request Code 17 for Quote mode"
-    );
-}
-
-/// Section C — infinite retry policy. Per operator Quote 4 (2026-05-27):
-/// "irrespective of any situations it should never ever fail … without
-/// the proper fetch it should retry". Boot stays BLOCKED until a fresh
-/// CSV is in hand.
-#[test]
-fn daily_universe_infinite_retry_policy_locked() {
-    let body = rule_file_body();
-    assert!(
-        body.contains("Never give up") || body.contains("never give up") || body.contains("∞"),
-        "rule file must pin the never-give-up infinite-retry policy"
-    );
-    assert!(
-        body.contains("Boot stays BLOCKED")
-            || body.contains("BOOT BLOCKS")
-            || body.contains("blocks until fresh CSV"),
-        "rule file must pin that boot BLOCKS until fresh CSV in hand"
-    );
-}
-
-/// Section D — no API/REST/S3/stale-cache fallback. Per operator
-/// Quote 2 (2026-05-27): "no need of any api pull in case of any
-/// failures". The §3 forbidden-fallbacks list is part of the contract.
-#[test]
-fn daily_universe_no_fallback_policy_locked() {
-    let body = rule_file_body();
-    assert!(
-        body.contains("No fallback to a different data source")
-            || body.contains("no fallback")
-            || body.contains("NEVER fallback"),
-        "rule file must pin the no-fallback policy"
-    );
-    // Banned fallbacks explicitly enumerated in §3.
-    for banned in [
-        "Per-segment REST",
-        "REST `/v2/marketfeed/ltp`",
-        "S3 cached snapshot",
-    ] {
-        assert!(
-            body.contains(banned),
-            "rule file §3 must enumerate banned fallback: '{banned}'"
-        );
-    }
-}
-
-/// Section E — `instrument_lifecycle` table is the SEBI-compliant
-/// no-delete state-machine. DEDUP UPSERT KEYS = `(security_id,
-/// exchange_segment)` per I-P1-11 composite-uniqueness rule.
-#[test]
-fn daily_universe_instrument_lifecycle_dedup_includes_segment() {
-    let body = rule_file_body();
-    assert!(
-        body.contains("`instrument_lifecycle`"),
-        "rule file must define the instrument_lifecycle table"
-    );
-    assert!(
-        body.contains("(security_id, exchange_segment)"),
-        "instrument_lifecycle DEDUP KEYS must include `(security_id, exchange_segment)` per I-P1-11"
-    );
-    assert!(
-        body.contains("NEVER DELETE")
-            || body.contains("never deleted")
-            || body.contains("NO DELETEs"),
-        "rule file must pin the NEVER-DELETE invariant on instrument_lifecycle"
-    );
-}
-
-/// Section F — `lifecycle_state_locked` BOOLEAN column for operator
-/// manual overrides (per option Y approval, 2026-05-27).
-#[test]
-fn daily_universe_lifecycle_state_locked_override_column() {
-    let body = rule_file_body();
-    assert!(
-        body.contains("`lifecycle_state_locked`"),
-        "rule file must define the operator-override `lifecycle_state_locked` BOOLEAN column"
-    );
-}
-
-/// Section G — `instrument_lifecycle_audit` is the SEBI 5-year forensic
-/// chain capturing every state transition.
-#[test]
-fn daily_universe_lifecycle_audit_table_locked() {
-    let body = rule_file_body();
-    assert!(
-        body.contains("`instrument_lifecycle_audit`"),
-        "rule file must define the instrument_lifecycle_audit forensic table"
-    );
-    assert!(
-        body.contains("SEBI") || body.contains("5 year") || body.contains("5-year"),
-        "rule file must pin SEBI 5-year retention for the audit chain"
-    );
-}
-
-/// Section H — universe size envelope bounds. Boot HALTS if outside.
-#[test]
-fn daily_universe_size_envelope_locked() {
-    let body = rule_file_body();
-    assert!(
-        body.contains("MAX_DAILY_UNIVERSE_SIZE = 1200")
-            || body.contains("`MAX_DAILY_UNIVERSE_SIZE`"),
-        "rule file must pin the MAX_DAILY_UNIVERSE_SIZE = 1200 cap"
-    );
-    assert!(
-        body.contains("[100, 1200]"),
-        "rule file must pin the [100, 1200] universe-size envelope"
-    );
-}
-
-/// Section I — the `DailyUniverse` enum variant exists in `config.rs`.
-/// Without this, Sub-PRs #2-#13 cannot reference the type when wiring
-/// CSV fetcher / lifecycle reconciler / boot orchestrator.
-#[test]
-fn daily_universe_subscription_scope_variant_exists() {
-    let body = config_rs_body();
-    assert!(
-        body.contains("DailyUniverse"),
-        "crates/common/src/config.rs must define SubscriptionScope::DailyUniverse"
-    );
-    assert!(
-        body.contains("\"daily_universe\"") || body.contains("rename = \"daily_universe\""),
-        "SubscriptionScope::DailyUniverse must have stable serde label `daily_universe`"
-    );
-}
-
-/// Section J — the 2-WebSocket envelope (1 main-feed + 1 order-update)
-/// is UNCHANGED by the daily-universe expansion. Only the instrument
-/// set on the single main-feed conn expanded.
-#[test]
-fn daily_universe_two_websocket_envelope_unchanged() {
-    let body = rule_file_body();
-    assert!(
-        body.contains("exactly TWO WebSocket connections")
-            || body.contains("Total live WebSocket connections to Dhan: 2"),
-        "rule file must reaffirm the 2-WebSocket lock (1 main-feed + 1 order-update)"
-    );
-    assert!(
-        body.contains("UNCHANGED"),
-        "rule file must mark the 2-WebSocket envelope as UNCHANGED from prior 2026-05-15 lock"
-    );
-}
-
-// ---------------------------------------------------------------------------
-// F&O-master code wiring (operator lock 2026-05-29 Quote 5) — these pin the
-// CODE that makes `instrument_lifecycle` the applicable-F&O master while the
-// WebSocket subscription stays at the 331-SID set. A future edit that reverts
-// the master to "331-only" (drops the contract collector or the chained
-// extraction) fails the build here.
-// ---------------------------------------------------------------------------
-
 fn src(rel: &str) -> String {
     let path = repo_root().join(rel);
     std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {} failed: {e}", path.display()))
 }
 
-/// The applicable-F&O contract collector MUST exist and gate on the tracked
-/// underlyings + tracked index SIDs (not blindly take every derivative).
-#[test]
-fn fno_master_contract_collector_exists() {
-    let body = src("crates/core/src/instrument/fno_underlying_extractor.rs");
-    assert!(
-        body.contains("pub fn collect_applicable_fno_contracts"),
-        "collect_applicable_fno_contracts must exist (applicable-F&O master, Quote 5)"
-    );
-    assert!(
-        body.contains("INDEX_DERIVATIVE_PREFIXES") && body.contains("\"FUTIDX\""),
-        "collector must handle index F&O (FUTIDX/OPTIDX) for tracked indices"
-    );
-    // Stock derivs gate on the tracked NSE_EQ underlying set; index derivs gate
-    // by equity-index EXCHANGE (PR #882 — index F&O link via a DERIVATIVES-domain
-    // underlying SID, NOT the IDX_I spot SID, so the prior `index_sids.contains`
-    // gating dropped ~17K contracts; exchange-gating recovered them). Updated
-    // 2026-05-30 to match the current collector after the #882 fix.
-    assert!(
-        body.contains("unique_underlying_ids.contains"),
-        "collector must gate stock derivs on the tracked NSE_EQ underlying set"
-    );
-    assert!(
-        body.contains("is_equity_index_exchange"),
-        "collector must gate index derivs by equity-index exchange (PR #882 — \
-         index F&O underlying SID is DERIVATIVES-domain, not the IDX_I spot SID)"
-    );
-}
-
-/// `DailyUniverse` MUST carry `fno_contracts` SEPARATE from `subscription_targets`
-/// so the master holds contracts while the feed does not.
-#[test]
-fn daily_universe_has_master_only_fno_contracts_field() {
-    let body = src("crates/core/src/instrument/daily_universe.rs");
-    assert!(
-        body.contains("pub fno_contracts: Vec<CsvRow>"),
-        "DailyUniverse must have a master-only `fno_contracts` field"
-    );
-    // The envelope check must remain on subscription_targets (the 331), NOT
-    // on the contracts — else the ~219K master would trip the [100,400] HALT.
-    assert!(
-        body.contains("let total = subscription_targets.len();"),
-        "the [100,400] envelope must bound subscription_targets, not the contracts"
-    );
-}
-
-/// The lifecycle reconcile extraction MUST chain `fno_contracts` so the master
-/// UPSERTs them; the subscription dispatcher path must NOT.
-#[test]
-fn extract_today_instruments_chains_fno_contracts() {
-    let body = src("crates/app/src/today_instrument.rs");
-    assert!(
-        body.contains(".fno_contracts") && body.contains(".chain("),
-        "extract_today_instruments must chain universe.fno_contracts into the lifecycle set"
-    );
-}
-
-// ---------------------------------------------------------------------------
-// PERF ratchet (2026-05-29): the lifecycle reconcile MUST write in BATCHES,
-// not one HTTP round-trip per row. The per-row path built a fresh client +
-// one round-trip per row → ~219K rows = ~438K round-trips = boot took
-// minutes→hours. A regression to the per-row append fns fails the build here.
-// ---------------------------------------------------------------------------
-#[test]
-fn apply_reconcile_uses_batched_writes_not_per_row() {
-    let body = src("crates/app/src/apply_reconcile_plan.rs");
-    assert!(
-        body.contains("append_instrument_lifecycle_rows(")
-            && body.contains("append_instrument_lifecycle_audit_rows("),
-        "apply_reconcile_plan must use the BATCHED append fns (one client, multi-row INSERT)"
-    );
-    assert!(
-        !body.contains("append_instrument_lifecycle_row(")
-            && !body.contains("append_instrument_lifecycle_audit_row("),
-        "apply_reconcile_plan must NOT use the per-row append fns — perf regression \
-         (219K rows = 219K HTTP round-trips). Use the batched *_rows fns."
-    );
+/// The daily-universe rule file — its §36/§36.7 FUTIDX sections remain the
+/// LIVE authority for the Groww futures leg (the rest of the file is dated
+/// historical audit per its 2026-07-13 retirement banner).
+fn rule_file_body() -> String {
+    let path =
+        repo_root().join(".claude/rules/project/daily-universe-scope-expansion-2026-05-27.md");
+    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {} failed: {e}", path.display()))
 }
 
 #[test]
@@ -339,24 +81,12 @@ fn lifecycle_persistence_uses_ilp_not_exec_url() {
 }
 
 // ---------------------------------------------------------------------------
-// O(1) WARM-BOOT ratchet (2026-05-29): when today's CSV SHA-256 matches the
-// last boot's, the reconcile MUST skip the full re-UPSERT and do a single
-// last_seen bump (O(1) requests, any universe size). A regression that drops
-// the warm path fails the build here.
+// O(1) WARM-BOOT storage primitives (2026-05-29). PR-C3 (2026-07-14): the
+// app-side warm-skip orchestrator test (`reconcile_has_o1_warm_skip_on_
+// unchanged_sha`) retired with the deleted `lifecycle_reconcile_orchestrator`;
+// the storage primitives it consumed stay pinned below (retained SEBI-table
+// surface — the C4 sweep owns any caller-less-fn cleanup decision).
 // ---------------------------------------------------------------------------
-#[test]
-fn reconcile_has_o1_warm_skip_on_unchanged_sha() {
-    let body = src("crates/app/src/lifecycle_reconcile_orchestrator.rs");
-    assert!(
-        body.contains("read_last_fetch_audit_sha") && body.contains("bump_active_last_seen"),
-        "reconcile must compare last CSV SHA + bump last_seen on a match (O(1) warm skip)"
-    );
-    assert!(
-        body.contains("warm_skipped: true"),
-        "the warm path must early-return warm_skipped=true (skipping the full re-UPSERT)"
-    );
-}
-
 #[test]
 fn storage_exposes_o1_warm_primitives() {
     let lc = src("crates/storage/src/instrument_lifecycle_persistence.rs");
@@ -535,21 +265,18 @@ fn futidx_scope_never_roll_source_pin() {
 
 #[test]
 fn futidx_scope_legacy_gate_still_false() {
-    // The legacy planner gate was NOT the vector — it stays `false` forever.
+    // PR-C3 (2026-07-14): the legacy planner gate DIED with
+    // `subscription_planner.rs` (scope-lock amendment §B item 2) — a
+    // stronger state than "returns false": the fn no longer exists at all.
+    // This pin flips direction: the planner file (and with it any
+    // `should_subscribe_*` gate) must STAY deleted. Re-introducing a Dhan
+    // subscription planner requires a fresh dated operator quote in
+    // websocket-connection-scope-lock.md FIRST (§D of the amendment).
     let path = repo_root().join("crates/core/src/instrument/subscription_planner.rs");
-    let src = std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("read {} failed: {e}", path.display()));
-    // The gate fn name is assembled at runtime so THIS file never contains
-    // the retired-flag substring the `indices4only_scope_lock_guard.rs`
-    // whole-crates scan bans (its allowlist covers only 3 files).
-    let gate_fn_name: String = ["should_", "subscribe_index_", "derivatives"].concat();
-    let gate = src
-        .find(&format!("pub const fn {gate_fn_name}"))
-        .expect("legacy gate fn must still exist");
-    let gate_body = &src[gate..gate + 200];
     assert!(
-        gate_body.contains("false"),
-        "the legacy index-derivatives gate must keep returning false — the §36 FUTIDX path \
-         is the DailyUniverse IndexFuture role, never this gate"
+        !path.exists(),
+        "subscription_planner.rs must stay DELETED (PR-C3, 2026-07-14 — \
+         operator retirement directive 2026-07-13); found it recreated at {}",
+        path.display()
     );
 }

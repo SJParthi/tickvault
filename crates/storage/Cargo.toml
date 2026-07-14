@@ -47,13 +47,11 @@ sha2 = { workspace = true }
 
 [features]
 # Sub-PR #10b-ε of 2026-05-27 daily-universe expansion: gates the
-# `instrument_fetch_audit` table contract (schema constants + DEDUP key +
-# FetchOutcome enum). Mirrors the `tickvault-core` feature gate per
-# `.claude/rules/project/daily-universe-scope-expansion-2026-05-27.md` §21
-# — until Sub-PR #10b-ζ ships the DDL + append helpers AND the boot
-# orchestrator wires it, this feature is dormant and the gated code is
-# dead. No default feature.
-daily_universe_fetcher = []
+# PR-C3 (2026-07-14): the `daily_universe_fetcher` feature was DELETED —
+# the SEBI table persistence modules it gated (instrument_lifecycle /
+# index_constituency / instrument_fetch_audit + the pure lifecycle
+# reconciler) are KEEP items of the scope-lock §B seam and now compile
+# unconditionally (the Groww shared-master writer is their live producer).
 
 [dev-dependencies]
 criterion = { workspace = true }
