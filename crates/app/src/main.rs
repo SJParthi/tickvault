@@ -2956,8 +2956,13 @@ async fn main() -> Result<()> {
         // cross_verify chains all retired. The runtime is now spot-only
         // NIFTY 50 strategy (no VWAP, no futures, no historical fetch).
 
-        notifier.notify(NotificationEvent::Custom {
-            message: "<b>FAST BOOT</b>\nCrash recovery: ticks flowing, all services ready"
+        // FIX-5: this fast arm runs ONLY on a mid-market restart (cache present
+        // AND inside market hours — `should_fast_boot`), i.e. a crash/unexpected
+        // restart during the session. Operator-notable → deliver INSTANTLY, but
+        // Low severity so it never fires an SMS page.
+        notifier.notify(NotificationEvent::CustomStatusUrgent {
+            message: "<b>Fast start</b>\nRestart recovery complete — prices are flowing and all \
+                      services are ready."
                 .to_string(),
         });
 
@@ -7153,9 +7158,9 @@ async fn start_dhan_lane(
                     "recovered stale tick spill files from previous crashes"
                 );
                 notifier.notify(
-                    tickvault_core::notification::events::NotificationEvent::Custom {
+                    tickvault_core::notification::events::NotificationEvent::CustomStatus {
                         message: format!(
-                            "<b>Tick Recovery</b>\nRecovered {recovered} orphaned ticks from previous crash spill files."
+                            "<b>Recovered saved prices</b>\nRestored {recovered} price updates that were safely saved during the last restart."
                         ),
                     },
                 );
@@ -7171,9 +7176,11 @@ async fn start_dhan_lane(
             );
             notifier.notify(
                 tickvault_core::notification::events::NotificationEvent::Custom {
-                    message: format!(
-                        "<b>CRITICAL: QuestDB UNAVAILABLE</b>\nTick writer in BUFFERING mode: {err}\nTicks buffered to ring buffer + disk spill. Will drain when QuestDB recovers."
-                    ),
+                    // Kept High + actionable (the price database is down at
+                    // startup). Raw `{err}` stays in the `warn!` log above only
+                    // — it is an implementation detail, not for Telegram.
+                    message: "<b>Price database unavailable</b>\nThe price database was not reachable at startup — live prices are being safely saved and will load in automatically once it is back.\nWhat to do now: check the price database service."
+                        .to_string(),
                 },
             );
             // A3: Create writer in disconnected mode — zero tick loss.
@@ -9251,8 +9258,8 @@ async fn start_dhan_lane(
                 {
                     health_notifier.notify(NotificationEvent::Custom {
                         message: format!(
-                            "CRITICAL: LOW DISK SPACE — only {percent_free}% free. \
-                             Tick spill files may fail if disk fills up."
+                            "<b>Low disk space</b>\nOnly {percent_free}% free — please free \
+                             up space so price backups keep working."
                         ),
                     });
                 }
@@ -9269,10 +9276,13 @@ async fn start_dhan_lane(
                 if spill_bytes > 500 * 1024 * 1024 && should_alert(&mut last_spill_alert, cooldown)
                 {
                     // > 500 MB of spill files — QuestDB likely down for extended period.
-                    health_notifier.notify(NotificationEvent::Custom {
+                    // CustomStatus (Low): the root cause is already paged at
+                    // Critical below (QuestDbDisconnected) — this is a
+                    // supporting status ping, not a second page.
+                    health_notifier.notify(NotificationEvent::CustomStatus {
                         message: format!(
-                            "WARNING: Tick spill files total {:.1} MB — QuestDB may be \
-                             down. Data safe on disk but investigate.",
+                            "<b>Price backups growing</b>\n{:.1} MB of prices saved on disk — \
+                             the price database may be slow or down. Your data is safe.",
                             spill_bytes as f64 / (1024.0 * 1024.0)
                         ),
                     });
@@ -9326,10 +9336,10 @@ async fn start_dhan_lane(
                 // C5: Docker container watchdog — detect and restart unhealthy containers.
                 let unhealthy = infra::check_and_restart_containers().await;
                 if unhealthy > 0 && should_alert(&mut last_docker_alert, cooldown) {
-                    health_notifier.notify(NotificationEvent::Custom {
+                    health_notifier.notify(NotificationEvent::CustomStatus {
                         message: format!(
-                            "[Watchdog] {unhealthy} unhealthy Docker container(s) detected. \
-                             Auto-restart triggered via docker compose up -d."
+                            "<b>Background service auto-restarted</b>\n{unhealthy} background \
+                             service(s) were unhealthy and have been automatically restarted."
                         ),
                     });
                 }
@@ -11311,8 +11321,11 @@ pub async fn run_dhan_lane_cold_start(ctx: std::sync::Arc<DhanLaneRuntimeContext
                     "[dhan-lane] runtime cold-start SUCCEEDED (Starting→Running) — main-feed \
                      pool live, ticks flowing; lane idling until disable"
                 );
-                ctx.notifier.notify(NotificationEvent::Custom {
-                    message: "🟢 <b>Dhan feed started</b>\nThe live price feed is now connected \
+                // FIX-5: a feed on/off toggle is an operator action — ack it
+                // INSTANTLY (Immediate) but never SMS (Low). FIX-4: no hardcoded
+                // glyph — dispatch prepends the Low severity emoji.
+                ctx.notifier.notify(NotificationEvent::CustomStatusUrgent {
+                    message: "<b>Dhan feed started</b>\nThe live price feed is now connected \
                               and streaming."
                         .to_string(),
                 });
@@ -11511,8 +11524,13 @@ async fn park_running_dhan_lane(
         // fall back to the global instead of reading this stopped lane's manager.
         ctx.feed_runtime.clear_live_token_manager();
         info!("[dhan-lane] lane torn down (Stopping→Off) — ready to cold-start again on re-enable");
-        ctx.notifier.notify(NotificationEvent::Custom {
-            message: "⚪ <b>Dhan feed stopped</b>\nThe live price feed is now disconnected."
+        // FIX-5: instant toggle ack (Immediate dispatch, Low severity → never
+        // SMS). FIX-4: dropped the redundant hardcoded in-body ⚪ glyph — the
+        // dispatcher already prepends the standard Low-severity ack tag
+        // (`✅ [LOW]`), and the body ("now disconnected") disambiguates the
+        // stop, so a second in-body glyph was pure noise.
+        ctx.notifier.notify(NotificationEvent::CustomStatusUrgent {
+            message: "<b>Dhan feed stopped</b>\nThe live price feed is now disconnected."
                 .to_string(),
         });
         return;
@@ -11662,10 +11680,10 @@ async fn run_process_runloop(
             .with_timezone(&tickvault_common::trading_calendar::ist_offset())
             .date_naive();
         if should_emit_post_market_alert(&trading_calendar, today_ist) {
-            notifier.notify(NotificationEvent::Custom {
-                message:
-                    "<b>Post-Market</b>\nMarket closed — WebSockets disconnected, API stays up"
-                        .to_string(),
+            notifier.notify(NotificationEvent::CustomStatus {
+                message: "<b>Market closed</b>\nThe live price feed has disconnected for the \
+                          day; the system stays running."
+                    .to_string(),
             });
         } else {
             info!(
