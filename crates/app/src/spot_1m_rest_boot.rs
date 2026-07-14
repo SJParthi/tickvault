@@ -153,8 +153,13 @@ use tickvault_common::url_join::join_api_url;
 use tickvault_core::auth::token_manager::TokenHandle;
 use tickvault_core::notification::{NotificationEvent, NotificationService};
 use tickvault_storage::disk_health_watcher::classify_join_exit;
+use tickvault_storage::rest_fetch_audit_persistence::{
+    REST_FETCH_LEG_SPOT_1M, RestFetchAuditRow, RestFetchAuditWriter, RestFetchOutcome,
+    ensure_rest_fetch_audit_table,
+};
 use tickvault_storage::spot_1m_rest_persistence::{
-    SPOT_1M_REST_SEGMENT_IDX_I, Spot1mRestRow, Spot1mRestWriter, ensure_spot_1m_rest_table,
+    SPOT_1M_REST_FEED_DHAN, SPOT_1M_REST_SEGMENT_IDX_I, Spot1mRestRow, Spot1mRestWriter,
+    ensure_spot_1m_rest_table,
 };
 
 use crate::dhan_intraday_parse::{MinuteCandle, intraday_request_body, parse_intraday_1m_candles};
@@ -1354,6 +1359,9 @@ pub async fn run_spot_1m_rest(params: Spot1mRestTaskParams) {
     // Idempotent DDL first (CREATE → ADD COLUMN self-heal → DEDUP ENABLE);
     // failures degrade loudly inside (SPOT1M-02) and never block the run.
     ensure_spot_1m_rest_table(&params.questdb).await;
+    // Gap-11 forensics: the shared rest_fetch_audit table (idempotent —
+    // the Groww leg also ensures it; a second call is harmless).
+    ensure_rest_fetch_audit_table(&params.questdb).await;
 
     if !params.calendar.is_trading_day_today() {
         info!("spot_1m_rest: non-trading day — skipping all minute fires");
@@ -1383,6 +1391,9 @@ pub async fn run_spot_1m_rest(params: Spot1mRestTaskParams) {
         }
     };
     let mut writer = Spot1mRestWriter::new(&params.questdb);
+    // Gap-11 forensics: best-effort per-fetch audit rows (never on the
+    // fetch/verdict/edge path).
+    let mut audit_writer = RestFetchAuditWriter::new(&params.questdb);
     let mut edge = FailureEdge::default();
     // 2026-07-13 VIX companion: per-SID vendor-not-serving detector.
     let mut sid_tracker = SidServedTracker::default();
@@ -1414,7 +1425,15 @@ pub async fn run_spot_1m_rest(params: Spot1mRestTaskParams) {
                 "spot_1m_rest: past 15:30 IST — today's minute fires complete; \
                  running the one bounded post-session sweep"
             );
-            run_post_session_sweep(&client, &url, &params, &mut writer, &mut tracker).await;
+            run_post_session_sweep(
+                &client,
+                &url,
+                &params,
+                &mut writer,
+                &mut audit_writer,
+                &mut tracker,
+            )
+            .await;
             return;
         };
         let sleep_ms =
@@ -1450,6 +1469,7 @@ pub async fn run_spot_1m_rest(params: Spot1mRestTaskParams) {
             &client,
             &url,
             &mut writer,
+            &mut audit_writer,
             &mut edge,
             &mut sid_tracker,
             &mut tracker,
@@ -1571,6 +1591,86 @@ fn build_spot_1m_row(
     }
 }
 
+/// Best-effort symbol lookup for a staged `(security_id, minute)` pair —
+/// the pinned [`SPOT_1M_REST_INDICES`] set is 4 entries (cold path).
+fn spot_1m_symbol_for_sid(security_id: SecurityId) -> &'static str {
+    SPOT_1M_REST_INDICES
+        .into_iter()
+        .find(|(sid, _)| *sid == security_id)
+        .map_or("unknown", |(_, symbol)| symbol)
+}
+
+/// Pure Dhan-side `rest_fetch_audit` row builder — the mirror of the Groww
+/// `build_fetch_audit_row`. The Dhan ladder exposes no per-request
+/// forensics struct (attempts/status/latency live inside
+/// `fetch_minute_bounded`), so those columns carry the storage crate's
+/// documented sentinels (`final_http_status = 0` = no captured status,
+/// `fetch_latency_ms = -1` = not measured).
+#[allow(clippy::too_many_arguments)] // APPROVED: private forensics builder — a struct would be pure ceremony
+fn build_dhan_fetch_audit_row(
+    target_minute_ist_nanos: i64,
+    trading_date_nanos: i64,
+    security_id: SecurityId,
+    symbol: &'static str,
+    attempts: i64,
+    outcome: RestFetchOutcome,
+    close_to_data_ms: i64,
+    error_class: &'static str,
+) -> RestFetchAuditRow {
+    RestFetchAuditRow {
+        ts_ist_nanos: target_minute_ist_nanos,
+        trading_date_ist_nanos: trading_date_nanos,
+        feed: SPOT_1M_REST_FEED_DHAN,
+        leg: REST_FETCH_LEG_SPOT_1M,
+        // Unreachable overflow for the pinned SID set — a visible
+        // sentinel, never a silent sid=0 (the build_spot_1m_row precedent).
+        security_id: i64::try_from(security_id).unwrap_or(i64::MAX),
+        exchange_segment: SPOT_1M_REST_SEGMENT_IDX_I,
+        symbol,
+        attempts,
+        final_http_status: 0,
+        fetch_latency_ms: -1,
+        close_to_data_ms,
+        rate_limited_count: 0,
+        outcome,
+        error_class,
+    }
+}
+
+/// Best-effort forensics append: a failure logs (coded) + counts and
+/// RETURNS — the fetch loop, the verdict and the failure edge are never
+/// affected by the forensics leg. Dhan emit sites stay field-less on the
+/// SPOT1M codes per the rule-file convention (grep-split by
+/// `feed="groww"`).
+fn audit_append_best_effort(audit_writer: &mut RestFetchAuditWriter, row: &RestFetchAuditRow) {
+    if let Err(err) = audit_writer.append_row(row) {
+        metrics::counter!("tv_rest_fetch_audit_persist_errors_total", "stage" => "audit_append")
+            .increment(1);
+        error!(
+            code = ErrorCode::Spot1m02PersistFailed.code_str(),
+            stage = "audit_append",
+            ?err,
+            "SPOT1M-02: rest_fetch_audit row append failed (forensics only — \
+             the fetch loop is unaffected)"
+        );
+    }
+}
+
+/// Best-effort forensics flush (same never-affects-the-loop contract).
+fn audit_flush_best_effort(audit_writer: &mut RestFetchAuditWriter) {
+    if let Err(err) = audit_writer.flush() {
+        metrics::counter!("tv_rest_fetch_audit_persist_errors_total", "stage" => "audit_flush")
+            .increment(1);
+        error!(
+            code = ErrorCode::Spot1m02PersistFailed.code_str(),
+            stage = "audit_flush",
+            ?err,
+            "SPOT1M-02: rest_fetch_audit ILP flush failed — pending forensics \
+             rows discarded (best-effort; the fetch loop is unaffected)"
+        );
+    }
+}
+
 /// One minute-close fire: 4 concurrent ladder fetches (each carrying the
 /// full-day proven window) → persist the target minute AND the
 /// previous-minute backfill when due → counters → edge accounting.
@@ -1584,6 +1684,7 @@ async fn fire_one_minute(
     client: &reqwest::Client,
     url: &str,
     writer: &mut Spot1mRestWriter,
+    audit_writer: &mut RestFetchAuditWriter,
     edge: &mut FailureEdge,
     sid_tracker: &mut SidServedTracker,
     tracker: &mut PersistTracker,
@@ -1676,6 +1777,11 @@ async fn fire_one_minute(
             // HONEST real retrieval delay (> 60 s by construction). Never
             // counted as this fire's `ok` and never sampled into the
             // own-fire `tv_spot1m_close_to_data_ms` histogram.
+            // Gap-11 forensics: the non-ok verdict/class for this
+            // (minute, SID), captured by the match arms below (the ok /
+            // persist verdict is only knowable after the append).
+            let mut audit_outcome = RestFetchOutcome::Error;
+            let mut audit_error_class: &'static str = "error";
             let (own_outcome, backfill_candle) = match outcome {
                 SidFetchOutcome::Found {
                     candle,
@@ -1688,9 +1794,11 @@ async fn fire_one_minute(
                 } => {
                     empty_count = empty_count.saturating_add(1);
                     empty_diag.record(class);
+                    audit_outcome = RestFetchOutcome::Empty;
                     match class {
                         // 2026-07-14 split: static label values only.
                         EmptyClass::NoRows => {
+                            audit_error_class = "empty_no_rows";
                             metrics::counter!("tv_spot1m_fetch_total", "outcome" => "empty_no_rows")
                                 .increment(1);
                             if sample_failure.is_none() {
@@ -1705,6 +1813,7 @@ async fn fire_one_minute(
                             last_candle_ist_nanos,
                             serving_lag_secs,
                         } => {
+                            audit_error_class = "empty_stale";
                             metrics::counter!("tv_spot1m_fetch_total", "outcome" => "empty_stale")
                                 .increment(1);
                             // The vendor SERVING LAG, measured every stale
@@ -1744,6 +1853,24 @@ async fn fire_one_minute(
                 }
             };
             sid_verdicts.push((security_id, symbol, own_outcome.is_some()));
+            // Gap-11 forensics: non-ok verdicts (empty_no_rows /
+            // empty_stale / error) emit their audit row here — one per
+            // (minute, SID). The ok verdict emits after its append below.
+            if own_outcome.is_none() {
+                audit_append_best_effort(
+                    audit_writer,
+                    &build_dhan_fetch_audit_row(
+                        target_nanos,
+                        trading_date_nanos,
+                        security_id,
+                        symbol,
+                        1,
+                        audit_outcome,
+                        -1,
+                        audit_error_class,
+                    ),
+                );
+            }
             if let Some((candle, close_to_data_ms)) = own_outcome {
                 ok_count = ok_count.saturating_add(1);
                 metrics::counter!("tv_spot1m_fetch_total", "outcome" => "ok").increment(1);
@@ -1770,7 +1897,35 @@ async fn fire_one_minute(
                     if sample_failure.is_none() {
                         sample_failure = Some(format!("persist append failed: {err:#}"));
                     }
+                    // Gap-11 forensics: fetched-but-lost — never dressed
+                    // as vendor absence (round-2 LOW precedent).
+                    audit_append_best_effort(
+                        audit_writer,
+                        &build_dhan_fetch_audit_row(
+                            candle.minute_ts_ist_nanos,
+                            trading_date_nanos,
+                            security_id,
+                            symbol,
+                            1,
+                            RestFetchOutcome::NamedGap,
+                            -1,
+                            "persist_failed",
+                        ),
+                    );
                 } else {
+                    audit_append_best_effort(
+                        audit_writer,
+                        &build_dhan_fetch_audit_row(
+                            candle.minute_ts_ist_nanos,
+                            trading_date_nanos,
+                            security_id,
+                            symbol,
+                            1,
+                            RestFetchOutcome::Ok,
+                            close_to_data_ms,
+                            "none",
+                        ),
+                    );
                     staged.push((security_id, candle.minute_ts_ist_nanos));
                 }
             }
@@ -1797,6 +1952,19 @@ async fn fire_one_minute(
                         ?err,
                         "SPOT1M-02: spot_1m_rest BACKFILL row append failed"
                     );
+                    audit_append_best_effort(
+                        audit_writer,
+                        &build_dhan_fetch_audit_row(
+                            backfill.minute_ts_ist_nanos,
+                            trading_date_nanos,
+                            security_id,
+                            symbol,
+                            1,
+                            RestFetchOutcome::NamedGap,
+                            -1,
+                            "persist_failed",
+                        ),
+                    );
                 } else {
                     metrics::counter!("tv_spot1m_backfilled_total").increment(1);
                     info!(
@@ -1805,6 +1973,21 @@ async fn fire_one_minute(
                         backfill_close_to_data_ms,
                         "spot_1m_rest: previous minute backfilled from this \
                          fire's full-day response (DEDUP-idempotent)"
+                    );
+                    // Gap-11 forensics: late recovery — `ok` keyed on the
+                    // BACKFILLED minute with the honest > 60 s delay.
+                    audit_append_best_effort(
+                        audit_writer,
+                        &build_dhan_fetch_audit_row(
+                            backfill.minute_ts_ist_nanos,
+                            trading_date_nanos,
+                            security_id,
+                            symbol,
+                            1,
+                            RestFetchOutcome::Ok,
+                            backfill_close_to_data_ms,
+                            "none",
+                        ),
                     );
                     staged.push((security_id, backfill.minute_ts_ist_nanos));
                 }
@@ -1824,6 +2007,25 @@ async fn fire_one_minute(
             if sample_failure.is_none() {
                 sample_failure = Some(format!("persist flush failed: {err:#}"));
             }
+            // Gap-11 forensics: the staged-but-lost minutes become
+            // flush_failed rows — identity captured from `staged` BEFORE
+            // the commit arm would consume it (spec caveat). The earlier
+            // `ok` rows survive alongside (outcome is in the DEDUP key).
+            for (security_id, minute_nanos) in &staged {
+                audit_append_best_effort(
+                    audit_writer,
+                    &build_dhan_fetch_audit_row(
+                        *minute_nanos,
+                        trading_date_nanos,
+                        *security_id,
+                        spot_1m_symbol_for_sid(*security_id),
+                        1,
+                        RestFetchOutcome::NamedGap,
+                        -1,
+                        "flush_failed",
+                    ),
+                );
+            }
         } else {
             // Flush confirmed — advance the per-SID persisted watermark.
             for (security_id, minute_nanos) in staged {
@@ -1835,10 +2037,27 @@ async fn fire_one_minute(
         // a full miss (counted per SID for honest rate math).
         error_count = SPOT_1M_REST_INDICES.len();
         sample_failure = Some("no access token available at fire time".to_string());
-        for _ in 0..error_count {
+        let target_nanos = minute_open_ist_nanos(trading_date, minute_open_secs);
+        for (security_id, symbol) in SPOT_1M_REST_INDICES {
             metrics::counter!("tv_spot1m_fetch_total", "outcome" => "error").increment(1);
+            // Gap-11 forensics: no request ran — 0 attempts / -1 sentinels.
+            audit_append_best_effort(
+                audit_writer,
+                &build_dhan_fetch_audit_row(
+                    target_nanos,
+                    trading_date_nanos,
+                    security_id,
+                    symbol,
+                    0,
+                    RestFetchOutcome::NoToken,
+                    -1,
+                    "no_token",
+                ),
+            );
         }
     }
+    // Gap-11 forensics: flush ONCE per fire (best-effort).
+    audit_flush_best_effort(audit_writer);
 
     record_minute_verdict(
         params,
@@ -1884,6 +2103,7 @@ async fn run_post_session_sweep(
     url: &str,
     params: &Spot1mRestTaskParams,
     writer: &mut Spot1mRestWriter,
+    audit_writer: &mut RestFetchAuditWriter,
     tracker: &mut PersistTracker,
 ) {
     // Wait for the sweep instant (a run reaching here right at 15:30:00
@@ -1959,6 +2179,23 @@ async fn run_post_session_sweep(
                     "SPOT1M-01: post-session sweep fetch failed for this SID"
                 );
                 still_missing = still_missing.saturating_add(missing.len() as u64);
+                // Gap-11 forensics: the whole-SID sweep fetch failed —
+                // every still-missing minute is a NAMED gap, never silent.
+                for minute_nanos in &missing {
+                    audit_append_best_effort(
+                        audit_writer,
+                        &build_dhan_fetch_audit_row(
+                            *minute_nanos,
+                            trading_date_nanos,
+                            security_id,
+                            symbol,
+                            1,
+                            RestFetchOutcome::NamedGap,
+                            -1,
+                            "named_gap",
+                        ),
+                    );
+                }
                 continue;
             }
         };
@@ -1966,6 +2203,21 @@ async fn run_post_session_sweep(
         for minute_nanos in &missing {
             let Some(candle) = select_minute_candle(&candles, *minute_nanos) else {
                 still_missing = still_missing.saturating_add(1);
+                // Gap-11 forensics: still absent after the sweep — a
+                // NAMED gap row for this exact (minute, SID).
+                audit_append_best_effort(
+                    audit_writer,
+                    &build_dhan_fetch_audit_row(
+                        *minute_nanos,
+                        trading_date_nanos,
+                        security_id,
+                        symbol,
+                        1,
+                        RestFetchOutcome::NamedGap,
+                        -1,
+                        "named_gap",
+                    ),
+                );
                 continue;
             };
             // Honest real retrieval delay for the swept minute.
@@ -1991,8 +2243,36 @@ async fn run_post_session_sweep(
                     "SPOT1M-02: post-session sweep row append failed"
                 );
                 still_missing = still_missing.saturating_add(1);
+                audit_append_best_effort(
+                    audit_writer,
+                    &build_dhan_fetch_audit_row(
+                        *minute_nanos,
+                        trading_date_nanos,
+                        security_id,
+                        symbol,
+                        1,
+                        RestFetchOutcome::NamedGap,
+                        -1,
+                        "persist_failed",
+                    ),
+                );
             } else {
                 found_for_sid = found_for_sid.saturating_add(1);
+                // Gap-11 forensics: sweep recovery — `ok` with the honest
+                // real (big) close_to_data_ms.
+                audit_append_best_effort(
+                    audit_writer,
+                    &build_dhan_fetch_audit_row(
+                        *minute_nanos,
+                        trading_date_nanos,
+                        security_id,
+                        symbol,
+                        1,
+                        RestFetchOutcome::Ok,
+                        close_to_data_ms,
+                        "none",
+                    ),
+                );
                 staged.push((security_id, *minute_nanos));
             }
         }
@@ -2010,11 +2290,30 @@ async fn run_post_session_sweep(
         );
         still_missing = still_missing.saturating_add(swept);
         swept = 0;
+        // Gap-11 forensics: the staged swept minutes become flush_failed
+        // rows — captured from `staged` BEFORE the commit arm consumes it.
+        for (security_id, minute_nanos) in &staged {
+            audit_append_best_effort(
+                audit_writer,
+                &build_dhan_fetch_audit_row(
+                    *minute_nanos,
+                    trading_date_nanos,
+                    *security_id,
+                    spot_1m_symbol_for_sid(*security_id),
+                    1,
+                    RestFetchOutcome::NamedGap,
+                    -1,
+                    "flush_failed",
+                ),
+            );
+        }
     } else {
         for (security_id, minute_nanos) in staged {
             tracker.commit(security_id, minute_nanos);
         }
     }
+    // Gap-11 forensics: one best-effort flush for the sweep's audit rows.
+    audit_flush_best_effort(audit_writer);
     metrics::counter!("tv_spot1m_sweep_backfilled_total").increment(swept);
     metrics::counter!("tv_spot1m_sweep_still_missing_total").increment(still_missing);
     if still_missing > 0 || persist_failed {
