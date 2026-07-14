@@ -2981,6 +2981,26 @@ async fn build_shared_infra(
     // shows as pending from its first page.
     notifier.set_boot_expectations(config.feeds.dhan_enabled, config.feeds.groww_enabled);
 
+    // Positive boot signal (audit-findings Rule 11): the once-per-boot
+    // BootHealthCheck ping with the real healthy/total container counts —
+    // fires even at 0/0 (honest "nothing healthy") so the operator always
+    // learns the boot outcome. RE-HOMED here in PR-C2 (2026-07-13, operator
+    // retirement directive per websocket-connection-scope-lock.md
+    // "2026-07-13 Amendment"): the emit previously lived in the deleted
+    // fast/slow Dhan boot arms; it is PROCESS-shared infra (Docker health,
+    // not a Dhan surface), so it survives in the hoisted shared-infra build.
+    // Spawned so the `docker compose ps` shell-out never blocks boot.
+    {
+        let boot_health_notifier = notifier.clone();
+        tokio::spawn(async move {
+            let (services_healthy, services_total) = infra::container_health_counts().await;
+            boot_health_notifier.notify(NotificationEvent::BootHealthCheck {
+                services_healthy,
+                services_total,
+            });
+        });
+    }
+
     // --- Health registry (drives /health + /api/feeds/health) ---
     let health_status: SharedHealthStatus = std::sync::Arc::new(SystemHealthStatus::new());
 

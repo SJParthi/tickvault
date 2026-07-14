@@ -36,24 +36,29 @@ const SPAWN_CALL: &str = "spawn_supervised_option_chain_1m(";
 const PROBE_CALL: &str = "run_option_chain_1m_probe(";
 const PIPELINE_GATE: &str = "config.option_chain_1m.enabled";
 const PROBE_GATE: &str = "config.option_chain_1m.probe_and_report";
-const POST_MARKET_FN: &str = "fn spawn_post_market_tasks(";
-
-/// Byte span of `spawn_post_market_tasks` in main.rs (start..next top-level
-/// fn) — the seam both arms must live inside.
-fn post_market_span(main_src: &str) -> (usize, usize) {
-    let seam_pos = main_src
-        .find(POST_MARKET_FN)
-        .expect("spawn_post_market_tasks must exist in main.rs");
-    let seam_end = main_src[seam_pos + POST_MARKET_FN.len()..]
-        .find("\nfn ")
-        .map_or(main_src.len(), |off| seam_pos + POST_MARKET_FN.len() + off);
-    (seam_pos, seam_end)
+// PR-C2 re-home (2026-07-13, operator retirement directive —
+// websocket-connection-scope-lock.md "2026-07-13 Amendment"): the Dhan
+// chain legs moved OUT of the deleted main.rs `spawn_post_market_tasks`
+// seam INTO `dhan_rest_stack.rs` (the sole surviving Dhan surface, which
+// owns the token + the spot→chain sequencing). The seam for the pins below
+// is therefore the dhan_rest_stack module itself.
+fn read_stack_src() -> String {
+    // PRODUCTION region only — cut at the module's own `#[cfg(test)]`
+    // in-file tests, whose needle literals would otherwise satisfy the
+    // pins vacuously (the shadow-writer vacuous-scan lesson).
+    let full = read_app_src("src/dhan_rest_stack.rs");
+    match full.find("#[cfg(test)]") {
+        Some(cut) => full[..cut].to_string(),
+        None => full,
+    }
 }
 
 #[test]
 fn ratchet_chain1m_spawn_and_probe_are_config_gated_inside_post_market_seam() {
-    let main_src = read_app_src("src/main.rs");
-    let (seam_pos, seam_end) = post_market_span(&main_src);
+    // PR-C2: the seam is the dhan_rest_stack module (see the re-home note
+    // above); positions are module-relative.
+    let main_src = read_stack_src();
+    let (seam_pos, seam_end) = (0usize, main_src.len());
 
     // Exactly ONE pipeline spawn site, inside the seam.
     let spawn_positions: Vec<usize> = main_src
@@ -63,17 +68,16 @@ fn ratchet_chain1m_spawn_and_probe_are_config_gated_inside_post_market_seam() {
     assert_eq!(
         spawn_positions.len(),
         1,
-        "expected exactly 1 `{SPAWN_CALL}` call site in main.rs (the shared \
-         spawn_post_market_tasks seam covers BOTH boot paths + the \
-         once-guard); found {} — a second site would double-spawn the \
-         per-minute chain fetcher",
+        "expected exactly 1 `{SPAWN_CALL}` call site in dhan_rest_stack.rs \
+         (the sole surviving Dhan surface since PR-C2); found {} — a second \
+         site would double-spawn the per-minute chain fetcher",
         spawn_positions.len()
     );
     let spawn_pos = spawn_positions[0];
     assert!(
         spawn_pos > seam_pos && spawn_pos < seam_end,
-        "the chain spawn at byte {spawn_pos} must live INSIDE \
-         spawn_post_market_tasks (fn spans bytes {seam_pos}..{seam_end})"
+        "the chain spawn at byte {spawn_pos} must live inside the \
+         dhan_rest_stack module (bytes {seam_pos}..{seam_end})"
     );
 
     // Exactly ONE probe-only spawn site, inside the seam.
@@ -84,15 +88,15 @@ fn ratchet_chain1m_spawn_and_probe_are_config_gated_inside_post_market_seam() {
     assert_eq!(
         probe_positions.len(),
         1,
-        "expected exactly 1 `{PROBE_CALL}` spawn in main.rs (the probe-only \
-         arm of the DEFAULT-OFF contract); found {}",
+        "expected exactly 1 `{PROBE_CALL}` spawn in dhan_rest_stack.rs (the \
+         probe-only arm of the DEFAULT-OFF contract); found {}",
         probe_positions.len()
     );
     let probe_pos = probe_positions[0];
     assert!(
         probe_pos > seam_pos && probe_pos < seam_end,
-        "the probe spawn at byte {probe_pos} must live INSIDE \
-         spawn_post_market_tasks (fn spans bytes {seam_pos}..{seam_end})"
+        "the probe spawn at byte {probe_pos} must live inside the \
+         dhan_rest_stack module (bytes {seam_pos}..{seam_end})"
     );
 
     // The pipeline gate precedes the pipeline spawn; the probe gate
@@ -101,7 +105,7 @@ fn ratchet_chain1m_spawn_and_probe_are_config_gated_inside_post_market_seam() {
     // never run alongside the probe).
     let gate_pos = main_src
         .find(PIPELINE_GATE)
-        .expect("main.rs must gate the chain spawn on the enabled flag");
+        .expect("dhan_rest_stack.rs must gate the chain spawn on the enabled flag");
     // Find the gate INSIDE the seam nearest before the spawn.
     let gate_positions: Vec<usize> = main_src
         .match_indices(PIPELINE_GATE)
@@ -112,7 +116,7 @@ fn ratchet_chain1m_spawn_and_probe_are_config_gated_inside_post_market_seam() {
             .iter()
             .any(|g| *g > seam_pos && *g < spawn_pos && spawn_pos - g < 2_048),
         "the `{PIPELINE_GATE}` gate must immediately precede the chain \
-         spawn inside spawn_post_market_tasks (gates at {gate_positions:?}, \
+         spawn inside dhan_rest_stack.rs (gates at {gate_positions:?}, \
          spawn at {spawn_pos}, first gate {gate_pos})"
     );
     let probe_gate_positions: Vec<usize> = main_src
@@ -138,9 +142,10 @@ fn ratchet_chain1m_spawn_and_probe_are_config_gated_inside_post_market_seam() {
 /// sender into the spot params and its receiver into the chain params.
 #[test]
 fn ratchet_chain1m_watch_channel_is_plumbed_between_spot_and_chain() {
-    let main_src = read_app_src("src/main.rs");
-    let (seam_pos, seam_end) = post_market_span(&main_src);
-    let seam = &main_src[seam_pos..seam_end];
+    // PR-C2: the plumbing lives in dhan_rest_stack.rs (see the re-home
+    // note above).
+    let stack_src = read_stack_src();
+    let seam = &stack_src[..];
 
     for needle in [
         // One watch channel, dual-gated on BOTH config flags.
@@ -153,7 +158,7 @@ fn ratchet_chain1m_watch_channel_is_plumbed_between_spot_and_chain() {
     ] {
         assert!(
             seam.contains(needle),
-            "spawn_post_market_tasks lost its `{needle}` wiring — the \
+            "dhan_rest_stack.rs lost its `{needle}` wiring — the \
              spot→chain sequencing signal must be plumbed exactly once, \
              gated on both halves being enabled"
         );

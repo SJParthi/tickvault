@@ -906,15 +906,34 @@ async fn run_dhan_rest_stack(params: DhanRestStackParams) {
         }
     }
 
+    // Phase 0 Item 20 — supervised 15:25 IST orphan-position watchdog: the
+    // daily open-position safety/compliance gate (alert-only in dry-run; no
+    // order/cancel call exists on any path). RE-HOMED here in PR-C2
+    // (2026-07-13, operator retirement directive per
+    // websocket-connection-scope-lock.md "2026-07-13 Amendment"): it was
+    // spawned from the deleted main.rs `spawn_post_market_tasks` seam; it
+    // needs ONLY the Dhan token + REST base URL, which THIS stack owns
+    // (`GET /v2/positions` is the trading-adjacent KEEP class per
+    // no-rest-except-live-feed-2026-06-27.md §3).
+    let _orphan_watchdog_handle =
+        crate::orphan_position_watchdog_boot::spawn_supervised_orphan_position_watchdog(
+            Arc::clone(&token_handle),
+            params.notifier.clone(),
+            Arc::clone(&params.calendar),
+            config.dhan.rest_api_base_url.clone(),
+            client_id.clone(),
+            config.strategy.dry_run,
+        );
+
     metrics::gauge!("tv_dhan_rest_stack_up").set(1.0);
     info!(
         spot_1m_rest_enabled = config.spot_1m_rest.enabled,
         option_chain_1m_enabled = config.option_chain_1m.enabled,
         option_chain_1m_probe = config.option_chain_1m.probe_and_report,
         "DHAN REST-ONLY STACK UP — lock + token + renewal + mid-session watchdog + REST \
-         canary + spot_1m_rest + option_chain_1m arms + the functional-dormant \
-         order-update WS (Q4-i, PR-C1) spawned WITHOUT the market-data WS lane \
-         (operator directive 2026-07-13)"
+         canary + spot_1m_rest + option_chain_1m arms + the 15:25 IST orphan-position \
+         watchdog + the functional-dormant order-update WS (Q4-i, PR-C1) spawned \
+         WITHOUT the market-data WS lane (operator directive 2026-07-13)"
     );
 }
 

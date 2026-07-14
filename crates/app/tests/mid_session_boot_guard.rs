@@ -41,32 +41,11 @@ fn read_file(rel: &str) -> String {
     })
 }
 
-#[test]
-fn test_market_open_heartbeat_skip_is_debug_not_info() {
-    let src = read_file("crates/app/src/main.rs");
-    // Pre-fix: `info!(... "market-open heartbeat: skipping (past 09:15:30 — late start)"`
-    // Post-fix: `debug!(... "market-open heartbeat: skipping (past 09:15:30 — expected on mid-session boot)"`
-    assert!(
-        !src.contains("info!(\n                            now = %now_time,\n                            \"market-open heartbeat: skipping (past 09:15:30"),
-        "2026-04-24 regression: market-open heartbeat skip log re-promoted to INFO. Should be DEBUG on mid-session boot."
-    );
-    assert!(
-        src.contains(
-            "market-open heartbeat: skipping (past 09:15:30 — expected on mid-session boot)"
-        ),
-        "2026-04-24 regression: market-open heartbeat skip message missing or rewritten. Expected 'expected on mid-session boot' wording so operators don't treat it as a bug."
-    );
-}
-
-// `test_depth_anchor_skip_is_debug_not_info` retired with the legacy
-// 09:13 anchor task in the v2-only refactor (PR <TBD>). The pinned
-// literal "depth-anchor: skipping (past 09:13:00..." lived inside
-// the deleted anchor task body; under v2 the anchor is structurally
-// absent so the skip log no longer exists.
-
-// `test_depth_rebalancer_market_hours_gate_present` RETIRED with the
-// PR #4 (2026-05-19) deletion of depth_rebalancer.rs per operator lock
-// 2026-05-15 (websocket-connection-scope-lock.md).
+// RETIRED (PR-C2, 2026-07-13 — Dhan live-WS lane deletion, operator
+// retirement directive per websocket-connection-scope-lock.md "2026-07-13
+// Amendment" §B): `test_market_open_heartbeat_skip_is_debug_not_info` died
+// with the market-open 09:15:30 heartbeat one-shot (deleted with the lane —
+// no Dhan pool exists to announce).
 
 #[test]
 fn test_tick_gap_tracker_has_backlog_before_state_mutation() {
@@ -103,38 +82,11 @@ fn test_tick_gap_error_threshold_is_raised_to_300s() {
 // PR #4 (2026-05-19) deletion of depth_connection.rs per operator lock
 // 2026-05-15 (websocket-connection-scope-lock.md).
 
-#[test]
-fn test_instrument_build_success_event_is_emitted_on_both_boot_paths() {
-    // 2026-04-24 audit finding #6: InstrumentBuildSuccess was defined and
-    // unit-tested but NEVER emitted in production. Only the FAILURE path
-    // (InstrumentBuildFailed) fired, so operators had no positive Telegram
-    // signal that the daily instrument rebuild succeeded.
-    //
-    // This guard ensures InstrumentBuildSuccess is fired from BOTH the
-    // fast-boot and slow-boot load_instruments call sites.
-    let src = read_file("crates/app/src/main.rs");
-    let emissions = src
-        .matches("NotificationEvent::InstrumentBuildSuccess")
-        .count();
-    assert!(
-        emissions >= 2,
-        "2026-04-24 regression: InstrumentBuildSuccess must be emitted from \
-         BOTH boot paths (fast-boot + slow-boot). Found only {emissions} emission(s). \
-         Without both, one boot path regresses to silent-success behaviour."
-    );
-    // The source tag must be one of the two expected values — not a blank
-    // or generic string.
-    assert!(
-        src.contains("\"fresh_csv_build\""),
-        "2026-04-24 regression: source tag for FreshBuild must be \
-         'fresh_csv_build' (distinguishes from cache-hit path)."
-    );
-    assert!(
-        src.contains("\"rkyv_cache\""),
-        "2026-04-24 regression: source tag for CachedPlan must be \
-         'rkyv_cache' (distinguishes from fresh-csv path)."
-    );
-}
+// RETIRED (PR-C2, 2026-07-13): `test_instrument_build_success_event_is_emitted_on_both_boot_paths`
+// died with the Dhan instrument load (operator Q3 — no Dhan instrument
+// download/parsing; both load_instruments boot sites deleted). The
+// InstrumentBuildSuccess variant is DORMANT pending the Phase C
+// cleanup/re-home (see instrument_build_failed_wiring_guard.rs).
 
 // PR #4 (2026-05-19): legacy `test_depth_200_main_rs_increments_spawn_counter`
 // and the v2 depth-200 spawn counter test are both retired alongside the
@@ -178,31 +130,11 @@ fn test_per_instrument_stall_poller_is_wired() {
     );
 }
 
-#[test]
-fn test_market_open_streaming_routes_to_failed_when_main_feed_is_zero() {
-    // 2026-04-24 audit finding #8: when main_feed_active == 0 at the
-    // 09:15:30 heartbeat, the event MUST route to MarketOpenStreamingFailed
-    // (Severity::High), NOT to MarketOpenStreamingConfirmation
-    // (Severity::Info). Without this branch, a catastrophic "no connections
-    // at market open" scenario shows up as "Streaming live / Main feed: 0/5"
-    // in Telegram — Info severity, wakes nobody up.
-    let src = read_file("crates/app/src/main.rs");
-    assert!(
-        src.contains("NotificationEvent::MarketOpenStreamingFailed"),
-        "2026-04-24 regression: MarketOpenStreamingFailed routing missing. \
-         When main_feed_active == 0 at 09:15:30 IST, operator must page via \
-         the High-severity Failed variant, not the Info-severity Confirmation."
-    );
-    // Branch predicate must be `main_active == 0` — if someone relaxes it
-    // to `main_active < 5` or similar, the normal degraded-but-still-streaming
-    // case flips to High-severity noise.
-    assert!(
-        src.contains("if main_active == 0 {"),
-        "2026-04-24 regression: MarketOpenStreamingFailed gate must be \
-         `main_active == 0` exactly — relaxing to `< 5` etc. produces \
-         false pages for degraded-but-streaming pool states."
-    );
-}
+// RETIRED (PR-C2, 2026-07-13): `test_market_open_streaming_routes_to_failed_when_main_feed_is_zero`
+// died with the 09:15:30 market-open streaming heartbeat + the Dhan
+// main-feed pool (no `main_feed_active` exists to route on). The
+// MarketOpenStreamingFailed/Confirmation variants are DORMANT pending the
+// Phase C cleanup/re-home.
 
 // PR-C (2026-05-26): 2 source-scan guards for the deleted
 // `spawn_historical_candle_fetch` routing tree are retired.
