@@ -346,9 +346,12 @@ pub fn is_valid_order_id(order_id: &str) -> bool {
 ///   always decisive.
 /// - `Unknown` with [`VERIFY_RAW_NOT_IN_SUPER_LIST`] — NON-decisive
 ///   before the final attempt (one list snapshot missing our id may be
-///   eventual-consistency lag; the remaining rungs re-probe). On the
-///   FINAL attempt it turns decisive fail-closed (the engine's
-///   EXIT-VERIFY-01 arm + `needs_reconciliation` already fired).
+///   eventual-consistency lag; the remaining rungs re-probe — and the
+///   engine deliberately does NOT flag/error on those in-budget probes,
+///   refuter round 1 2026-07-14). On the FINAL attempt it turns decisive
+///   fail-closed: the ladder's final-rung elapsed floor puts that probe
+///   at/past the deadline, where the engine's EXIT-VERIFY-01 arm +
+///   `needs_reconciliation` fire.
 /// - Any OTHER `Unknown` (body-unparsable) — always decisive fail-closed.
 /// - `Pending` / `PartiallyFilled` — never decisive (keep polling).
 pub fn verify_verdict_decisive(verdict: &ExecutionVerdict, is_final_attempt: bool) -> bool {

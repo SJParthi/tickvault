@@ -815,6 +815,21 @@ impl ExitOrdersConfig {
     /// # Errors
     /// Returns a descriptive error on the first violated bound.
     pub fn validate(&self) -> Result<()> {
+        self.validate_with_today(ist_date_from_utc(chrono::Utc::now()))
+    }
+
+    /// Deterministic core of [`Self::validate`] — `today_ist` is INJECTED
+    /// so tests never read the wall clock (flake root-cause hardening,
+    /// refuter round 2 2026-07-14: the L2 future-review-date check
+    /// compared hardcoded test dates against `Utc::now()`, so a run on a
+    /// host clock before 2026-07-14 IST — skew, or a session straddling
+    /// IST midnight — could flip an enabled-config `validate()` verdict).
+    /// Production goes through [`Self::validate`], which supplies the
+    /// real IST calendar day.
+    ///
+    /// # Errors
+    /// Returns a descriptive error on the first violated bound.
+    pub fn validate_with_today(&self, today_ist: chrono::NaiveDate) -> Result<()> {
         if !(1..=300).contains(&self.mpp_verify_deadline_secs) {
             bail!(
                 "exit_orders.mpp_verify_deadline_secs ({}) must be within 1..=300",
@@ -853,8 +868,8 @@ impl ExitOrdersConfig {
                     // L2 (2026-07-14 hostile review): a FUTURE review date is
                     // a typo/backdating error — it would silence the >90-day
                     // staleness WARN forever. IST calendar day (market-hours
-                    // rule; the same helper the trading-day checks use).
-                    let today_ist = ist_date_from_utc(chrono::Utc::now());
+                    // rule) — injected by the caller; `validate()` supplies
+                    // `ist_date_from_utc(Utc::now())`.
                     if reviewed > today_ist {
                         bail!(
                             "exit_orders.freeze_limits_reviewed_on ('{}') is in the future \
@@ -5345,7 +5360,10 @@ mod tests {
         assert_eq!(on.exit_orders.mpp_verify_deadline_secs, 45);
         assert_eq!(on.exit_orders.mpp_verify_max_attempts, 6);
         assert!((on.exit_orders.default_trailing_jump - 0.5).abs() < f64::EPSILON);
-        assert!(on.exit_orders.validate().is_ok());
+        // Deterministic (refuter round 2, 2026-07-14): injected today —
+        // this assertion must never depend on the host wall clock.
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 7, 14).unwrap_or_default();
+        assert!(on.exit_orders.validate_with_today(today).is_ok());
     }
 
     /// `ExitOrdersConfig::validate` — every bound, boundary-tested
@@ -5402,28 +5420,38 @@ mod tests {
 
         // Enabled-only gates: freeze must be >= 1 and the review date must
         // parse — the DISABLED default (freeze 0, empty date) stays valid.
+        // Deterministic (refuter round 2, 2026-07-14): every enabled-arm
+        // assertion injects a fixed today so the hardcoded review dates
+        // can never flip against the host wall clock.
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 7, 14).unwrap_or_default();
         let mut cfg = ExitOrdersConfig {
             enabled: true,
             ..Default::default()
         };
         assert!(
-            cfg.validate().is_err(),
+            cfg.validate_with_today(today).is_err(),
             "enabled with freeze 0 (unset) must reject"
         );
         cfg.default_freeze_limit_qty = 1800;
         assert!(
-            cfg.validate().is_err(),
+            cfg.validate_with_today(today).is_err(),
             "enabled with empty review date must reject"
         );
         cfg.freeze_limits_reviewed_on = "14-07-2026".to_string();
         assert!(
-            cfg.validate().is_err(),
+            cfg.validate_with_today(today).is_err(),
             "enabled with non-%Y-%m-%d review date must reject"
         );
         cfg.freeze_limits_reviewed_on = "2026-07-14".to_string();
-        assert!(cfg.validate().is_ok(), "enabled with sane values must pass");
+        assert!(
+            cfg.validate_with_today(today).is_ok(),
+            "enabled with sane values must pass"
+        );
         cfg.default_freeze_limit_qty = -5;
-        assert!(cfg.validate().is_err(), "negative freeze must reject");
+        assert!(
+            cfg.validate_with_today(today).is_err(),
+            "negative freeze must reject"
+        );
     }
 
     /// L2 (2026-07-14 hostile review): a FUTURE `freeze_limits_reviewed_on`
@@ -5432,21 +5460,29 @@ mod tests {
     /// ones) stay valid — staleness is the WARN's job, not validate()'s.
     #[test]
     fn test_exit_orders_config_validate_rejects_future_review_date() {
+        // Deterministic (refuter round 2, 2026-07-14): injected today —
+        // the boundary assertions can never flip against the wall clock.
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 7, 14).unwrap_or_default();
         let mut cfg = ExitOrdersConfig {
             enabled: true,
             default_freeze_limit_qty: 1800,
-            freeze_limits_reviewed_on: "2999-01-01".to_string(),
+            freeze_limits_reviewed_on: "2026-07-15".to_string(),
             ..Default::default()
         };
-        let err = cfg.validate().unwrap_err();
+        let err = cfg.validate_with_today(today).unwrap_err();
         assert!(
             err.to_string().contains("future"),
             "error must name the future date, got: {err}"
         );
+        // Same-day review is valid (today-or-past rule, strict >).
+        cfg.freeze_limits_reviewed_on = "2026-07-14".to_string();
+        assert!(cfg.validate_with_today(today).is_ok());
         // A stale-but-past date validates (the staleness WARN handles it).
         cfg.freeze_limits_reviewed_on = "2020-01-01".to_string();
-        assert!(cfg.validate().is_ok());
-        // Disabled configs never evaluate the date at all.
+        assert!(cfg.validate_with_today(today).is_ok());
+        // Disabled configs never evaluate the date at all — proven through
+        // the PRODUCTION wall-clock entry point (also the pub-fn wiring
+        // call-site pin for `validate()` delegating to the injected core).
         cfg.enabled = false;
         cfg.freeze_limits_reviewed_on = "2999-01-01".to_string();
         assert!(cfg.validate().is_ok());

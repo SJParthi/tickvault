@@ -972,9 +972,11 @@ impl OrderManagementSystem {
                 if !matches!(err, OmsError::DhanRateLimited) {
                     self.circuit_breaker.record_failure();
                 }
+                // M1 (refuter round 1, 2026-07-14): the alert reason is a
+                // future sink payload — sanitized like every log rendering.
                 self.fire_alert(OmsAlert::OrderRejected {
                     correlation_id: correlation_id.clone(),
-                    reason: format!("{err}"),
+                    reason: sanitize_oms_error(&err),
                 });
                 error!(
                     code = ErrorCode::ExitOrder01ExecutionDegraded.code_str(),
@@ -1527,9 +1529,10 @@ impl OrderManagementSystem {
                 if !matches!(err, OmsError::DhanRateLimited) {
                     self.circuit_breaker.record_failure();
                 }
+                // M1 (refuter round 1, 2026-07-14): sanitized alert reason.
                 self.fire_alert(OmsAlert::OrderRejected {
                     correlation_id: correlation_id.clone(),
-                    reason: format!("{err}"),
+                    reason: sanitize_oms_error(&err),
                 });
                 error!(
                     code = ErrorCode::ExitOrder01ExecutionDegraded.code_str(),
@@ -1716,9 +1719,10 @@ impl OrderManagementSystem {
                 if !matches!(err, OmsError::DhanRateLimited) {
                     self.circuit_breaker.record_failure();
                 }
+                // M1 (refuter round 1, 2026-07-14): sanitized alert reason.
                 self.fire_alert(OmsAlert::OrderRejected {
                     correlation_id: correlation_id.clone(),
-                    reason: format!("{err}"),
+                    reason: sanitize_oms_error(&err),
                 });
                 error!(
                     code = ErrorCode::ExitOrder01ExecutionDegraded.code_str(),
@@ -1923,6 +1927,10 @@ impl OrderManagementSystem {
                     // one id, classify from the LAST occurrence — the SAME
                     // row refresh_super_registry keeps (its forward walk is
                     // last-write-wins), so verdict and registry never split.
+                    // WITHIN that row the two readers split by field (chosen
+                    // semantics, refuter round 1): THIS classifier reads the
+                    // TOP-LEVEL status + fill quantities; the registry
+                    // refresh reads the legDetails.
                     match list.iter().rev().find(|r| r.order_id == order_id) {
                         Some(resp) => {
                             let quantity = self
@@ -2145,6 +2153,10 @@ impl OrderManagementSystem {
     /// the forward walk is LAST-write-wins, matching the verify
     /// classification's `.rev().find(...)` LAST-occurrence pick — the
     /// registry and the returned verdict always read the same row.
+    /// WITHIN that row the two readers split by field (chosen semantics,
+    /// refuter round 1): THIS refresh reads the legDetails (entry/TP/SL
+    /// raw statuses, prices, leg ids); the verify classifier reads the
+    /// TOP-LEVEL status + fill quantities.
     fn refresh_super_registry(&mut self, list: &[DhanSuperOrderResponse]) {
         let now_us = now_epoch_us();
         for resp in list {
@@ -2251,20 +2263,30 @@ impl OrderManagementSystem {
                 );
             }
             ExecutionVerdict::Unknown { raw_status } => {
-                // M2 (2026-07-14 hostile review): an Unknown probe result
-                // (unparsable body, or NOT_IN_SUPER_LIST on the ladder's
-                // final attempt) is fail-closed — the tracked order is
-                // flagged for the REST reconcile.
-                if let Some(order) = self.orders.get_mut(order_id) {
-                    order.needs_reconciliation = true;
-                    order.updated_at_us = now_us;
+                // M2 refined (refuter round 1, 2026-07-14): a
+                // NOT_IN_SUPER_LIST sentinel BEFORE the deadline is
+                // potential list lag — the ladder re-probes the remaining
+                // rungs, so flagging + EXIT-VERIFY-01 fire only at/past
+                // the budget (`elapsed_secs >= deadline_secs`; the
+                // ladder's final-rung elapsed floor guarantees the last
+                // probe lands there). A body-unparsable/other Unknown
+                // stays ALWAYS-flagged fail-closed.
+                let in_budget_list_lag = raw_status == exit_rules::VERIFY_RAW_NOT_IN_SUPER_LIST
+                    && elapsed_secs < deadline_secs;
+                if !in_budget_list_lag {
+                    if let Some(order) = self.orders.get_mut(order_id) {
+                        order.needs_reconciliation = true;
+                        order.updated_at_us = now_us;
+                    }
+                    error!(
+                        code = ErrorCode::ExitVerify01Degraded.code_str(),
+                        order_id = %order_id,
+                        raw_status = %raw_status,
+                        elapsed_secs,
+                        deadline_secs,
+                        "unparsable verify probe result — fail-closed Unknown (never treated as filled)"
+                    );
                 }
-                error!(
-                    code = ErrorCode::ExitVerify01Degraded.code_str(),
-                    order_id = %order_id,
-                    raw_status = %raw_status,
-                    "unparsable verify probe result — fail-closed Unknown (never treated as filled)"
-                );
             }
             ExecutionVerdict::Terminal { status } => {
                 if let Some(order) = self.orders.get_mut(order_id) {
@@ -6029,6 +6051,10 @@ mod tests {
     async fn test_verify_order_execution_live_super_missing_from_list_unknown() {
         // A successful list WITHOUT our id is fail-closed Unknown — a
         // failed probe ≠ absence (never dropped, never assumed filled).
+        // M2 refined (refuter round 1, 2026-07-14): IN-BUDGET
+        // (elapsed 5 < deadline 30) the sentinel is potential list lag —
+        // NO reconciliation flag and NO EXIT-VERIFY-01 yet; the ladder's
+        // remaining rungs re-probe.
         let body = r#"[{"orderId":"SO-OTHER","orderStatus":"PENDING","legDetails":[]}]"#;
         let (base_url, handle) = start_oms_mock(200, body).await;
 
@@ -6042,6 +6068,36 @@ mod tests {
             ExecutionVerdict::Unknown {
                 raw_status: "NOT_IN_SUPER_LIST".to_owned()
             }
+        );
+        assert!(
+            !oms.order("SO-9").unwrap().needs_reconciliation,
+            "M2 refined: an in-budget NOT_IN_SUPER_LIST is list lag — never flagged yet"
+        );
+        handle.abort();
+    }
+
+    /// M2 refined (refuter round 1, 2026-07-14): NOT_IN_SUPER_LIST at/past
+    /// the budget (the ladder's FINAL floored probe) IS flagged —
+    /// `needs_reconciliation = true` + the EXIT-VERIFY-01 arm fires.
+    #[tokio::test]
+    async fn test_verify_live_super_missing_at_budget_flags_reconciliation() {
+        let body = r#"[{"orderId":"SO-OTHER","orderStatus":"PENDING","legDetails":[]}]"#;
+        let (base_url, handle) = start_oms_mock(200, body).await;
+
+        let mut oms = make_live_oms(&base_url);
+        insert_tracked_super(&mut oms, "SO-9", "PENDING", 75);
+        insert_tracked_order(&mut oms, "SO-9", OrderStatus::Pending, 75);
+
+        let verdict = oms.verify_order_execution("SO-9", 30, 30).await.unwrap();
+        assert_eq!(
+            verdict,
+            ExecutionVerdict::Unknown {
+                raw_status: "NOT_IN_SUPER_LIST".to_owned()
+            }
+        );
+        assert!(
+            oms.order("SO-9").unwrap().needs_reconciliation,
+            "M2 refined: NOT_IN_SUPER_LIST at the budget must flag reconciliation"
         );
         handle.abort();
     }

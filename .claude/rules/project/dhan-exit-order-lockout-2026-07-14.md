@@ -17,6 +17,10 @@
 > (12 build-failing tests; `All Green` is a GitHub-required check on `main`,
 > so a red guard physically blocks the merge button — see
 > `merge-gate-lock-2026-07-04.md`).
+> **Plan mapping:** the session label "Cluster B" used throughout this
+> layer's code/commits IS umbrella plan item **E1** of
+> `.claude/plans/active-plan-dhan-order-surface.md` (the exit-order layer
+> row) — one and the same work item.
 > **Cross-ref:** `crates/common/tests/error_code_rule_file_crossref.rs`
 > requires this file to mention every `ExitOrder01*` / `ExitVerify01*`
 > variant verbatim — `ExitOrder01ExecutionDegraded`, `ExitVerify01Degraded`,
@@ -142,7 +146,13 @@ Pending. Degraded verdicts:
   `NOT_IN_SUPER_LIST` on the ladder's FINAL attempt (M2: a missing-from-
   list snapshot RETRIES the remaining rungs first — one snapshot is not
   proof of absence; a body-unparsable Unknown stays decisive at any rung).
-  Fail-closed: never treated as filled; `needs_reconciliation` is set.
+  Fail-closed: never treated as filled. M2 refined (refuter round 1,
+  2026-07-14): for `NOT_IN_SUPER_LIST` the `needs_reconciliation` flag +
+  the EXIT-VERIFY-01 error fire only AT/PAST the deadline
+  (`elapsed >= deadline` — the ladder's final-rung elapsed floor lands
+  the last probe there); an in-budget sentinel is potential list lag and
+  is neither flagged nor errored yet. A body-unparsable/other Unknown
+  stays always-flagged at any rung.
 
 **Triage:**
 1. `mcp__tickvault-logs__tail_errors` — find `EXIT-VERIFY-01`; the payload
@@ -162,12 +172,15 @@ is never promisable under MPP; the ladder's degraded verdicts are the
 honest terminal states. In dry-run, `PAPER-*` orders return
 `SimulatedFilled` deterministically (no HTTP; GCRA still consumed) — a
 verdict deliberately distinct so no consumer confuses paper for real.
-**Pipeline blocking (H3, 2026-07-14 hostile review):** while
-`[exit_orders]` is ENABLED, the strategy task drives the dispatcher INLINE
-from its select loop — a close order stalls that task for up to
-~`mpp_verify_deadline_secs`, with the CloseAll multi-slice case bounded by
-ONE overall verify budget of the same deadline (remaining slices get one
-sleepless at-limit probe each); ticks buffer in the broadcast channel
+**Pipeline blocking (H3, 2026-07-14 hostile review; H3c precision,
+refuter round 1):** while `[exit_orders]` is ENABLED, the strategy task
+drives the dispatcher INLINE from its select loop — a close order stalls
+that task for up to ~`mpp_verify_deadline_secs` of LADDER SLEEP time,
+with the CloseAll multi-slice case bounded by ONE overall verify budget
+of the same deadline of ladder sleeps (remaining slices get one sleepless
+at-limit probe each). Per-probe HTTP RTTs + GCRA pacing are ADDITIONAL to
+that budget and scale with slice count — a large slice count adds
+un-slept probe time on top. Ticks buffer in the broadcast channel
 meanwhile and order updates may lag. Accepted for the dry-run layer —
 flagged as a pre-live design change (§4 step 5: spawned exit executor).
 Sliced-response honesty (M3): the server split is never echoed back, so
@@ -175,6 +188,21 @@ EVERY live sliced-tracked order carries `needs_reconciliation = true`
 (single-object and count-match arms included) and the response Vec is
 bounded at 1,000 rows (H3b — beyond-cap rows are dropped with a coded
 anomaly log).
+**Pre-existing residuals (refuter round 1, 2026-07-14 — documented, not
+introduced by this layer):** (a) `handle_order_update`'s re-index
+staleness — when a WebSocket update arrives via correlation_id with a NEW
+`order_no`, the order is re-indexed (cloned) under the new key, and the
+OLD-key entry can go stale afterwards; the H2 cancel gate consults the
+tracked entry under the id the caller holds, so a fill recorded only on
+the other key could read pre-fill — the PartTraded/terminal arm still
+refuses cancels whenever EITHER consulted surface (super registry raw
+status or the tracked entry) shows a fill. Unifying the re-index is a
+Cluster A follow-up (that session owns `handle_order_update` internals).
+(b) Untracked-entry fail-open — the H2 gate falls through to the
+registry-only check when `self.orders` has no entry for the id (a
+registry-tracked super with no ManagedOrder mirror): the
+`entry_leg_cancel_allowed` raw-status gate remains the sole defense on
+that shape.
 
 ## §4. The enable-time protocol (each step a separate PR-visible diff)
 
@@ -204,8 +232,10 @@ A future operator-enable PR sequence MUST, in order:
    probe burst), the 7,000/day `DailyRequestTracker` budget tracker, and
    a **SPAWNED exit executor** (H3, 2026-07-14 hostile review — the
    enabled dispatcher currently runs INLINE on the strategy task, which
-   blocks the pipeline select loop up to ~`mpp_verify_deadline_secs` per
-   close; live trading must move the verify ladder off that task).
+   blocks the pipeline select loop up to ~`mpp_verify_deadline_secs` of
+   ladder sleep per close, PLUS per-probe RTTs + GCRA pacing that scale
+   with slice count (H3c); live trading must move the verify ladder off
+   that task).
 
 ## §5. What a violating PR looks like (REJECT)
 
