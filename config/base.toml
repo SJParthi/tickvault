@@ -493,6 +493,15 @@ trigger_secs_of_day_ist = 56700  # 15:45:00 IST
 # ===========================================================================
 [spot_1m_rest]
 enabled = true
+# 2026-07-14 serving-delay diagnostics rider: LOG-ONLY one-shot probes
+# (first session fire after boot + once at ~11:00 IST; ≤6 bounded extra
+# requests/day, ~300ms apart, inside the Data-API budget) that log the
+# cross-verify byte-exact day window, the previous-trading-day window and
+# a same-day-to-now window side by side — discriminating vendor serving
+# DELAY from request shape. Never touches fetch/persist/edge behaviour.
+# ON while the 2026-07-14 all-morning empty signature is under
+# investigation; flip to false once the verdict lands.
+diagnostics = true
 
 # ===========================================================================
 # Per-minute option-chain REST pipeline (operator grant 2026-07-12 — PR-3,

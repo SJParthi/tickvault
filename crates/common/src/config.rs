@@ -416,12 +416,47 @@ impl Default for ScoreboardConfig {
 /// deserializing byte-identically — nothing chain-specific ships in
 /// PR-2; the chain PR adds its own knobs here without a config-surface
 /// break (the `GrowwFeedTuning` sub-table precedent).
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct Spot1mRestConfig {
     /// Master switch for the per-minute spot 1m REST fetcher. Default
     /// OFF (fail-safe) — `config/base.toml` turns it on explicitly.
     #[serde(default)]
     pub enabled: bool,
+    /// 2026-07-14 serving-delay diagnostics rider: one-shot LOG-ONLY
+    /// side-by-side + alternate-window probes (≤6 bounded extra requests
+    /// per day) that discriminate "Dhan serves same-day intraday candles
+    /// with a DELAY" from "our request shape is wrong". Default OFF
+    /// (fail-safe); `config/base.toml` opts in while the 2026-07-14
+    /// all-morning `empty` signature is under investigation. Never touches
+    /// the fetch/persist/edge behaviour.
+    #[serde(default)]
+    pub diagnostics: bool,
+    /// IST seconds-of-day of the SECOND one-shot diagnostics probe (the
+    /// first fires at the first session fire after boot). Default 11:00
+    /// IST — mid-session, far from both the open and the 15:31 cross-verify
+    /// burst. Inert while `diagnostics = false`.
+    #[serde(default = "default_spot1m_diagnostics_second_probe_secs")]
+    pub diagnostics_second_probe_secs_of_day_ist: u32,
+}
+
+/// Serde default for [`Spot1mRestConfig::diagnostics_second_probe_secs_of_day_ist`]
+/// — 11:00 IST as seconds-of-day.
+fn default_spot1m_diagnostics_second_probe_secs() -> u32 {
+    11 * 3600
+}
+
+impl Default for Spot1mRestConfig {
+    /// Manual impl so `Default` matches the serde field defaults exactly
+    /// (a derived `Default` would zero the second-probe instant while an
+    /// empty `[spot_1m_rest]` section deserializes it to 11:00 IST).
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            diagnostics: false,
+            diagnostics_second_probe_secs_of_day_ist: default_spot1m_diagnostics_second_probe_secs(
+            ),
+        }
+    }
 }
 
 /// `[tf_consistency]` — daily timeframe-consistency verifier (operator
@@ -3952,6 +3987,57 @@ mod tests {
             .extract()
             .expect("explicit enabled = true must round-trip");
         assert!(on.spot_1m_rest.enabled);
+    }
+
+    /// 2026-07-14 serving-delay diagnostics rider: `diagnostics` is
+    /// FAIL-SAFE default OFF (via `Default`, a missing section, and an
+    /// empty section), the second-probe instant defaults to 11:00 IST on
+    /// BOTH paths (manual `Default` == serde default — no derive drift),
+    /// and the base.toml opt-in shape round-trips.
+    #[test]
+    fn test_spot_1m_rest_diagnostics_defaults_off_with_1100_second_probe() {
+        use figment::Figment;
+        use figment::providers::{Format, Toml};
+
+        let d = Spot1mRestConfig::default();
+        assert!(
+            !d.diagnostics,
+            "diagnostics must default OFF (log-only opt-in)"
+        );
+        assert_eq!(
+            d.diagnostics_second_probe_secs_of_day_ist,
+            11 * 3600,
+            "second probe defaults to 11:00 IST"
+        );
+
+        #[derive(Deserialize)]
+        struct Wrapper {
+            #[serde(default)]
+            spot_1m_rest: Spot1mRestConfig,
+        }
+        // Pre-rider TOML (enabled only) → diagnostics off, probe at 11:00.
+        let old: Wrapper = Figment::new()
+            .merge(Toml::string("[spot_1m_rest]\nenabled = true\n"))
+            .extract()
+            .expect("pre-rider TOML must keep deserializing");
+        assert!(!old.spot_1m_rest.diagnostics);
+        assert_eq!(
+            old.spot_1m_rest.diagnostics_second_probe_secs_of_day_ist,
+            11 * 3600
+        );
+        // The base.toml opt-in shape + an explicit probe override round-trip.
+        let on: Wrapper = Figment::new()
+            .merge(Toml::string(
+                "[spot_1m_rest]\nenabled = true\ndiagnostics = true\n\
+                 diagnostics_second_probe_secs_of_day_ist = 43200\n",
+            ))
+            .extract()
+            .expect("diagnostics opt-in must round-trip");
+        assert!(on.spot_1m_rest.diagnostics);
+        assert_eq!(
+            on.spot_1m_rest.diagnostics_second_probe_secs_of_day_ist,
+            12 * 3600
+        );
     }
 
     /// Per-minute option-chain REST pipeline (operator grant 2026-07-12,
