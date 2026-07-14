@@ -225,7 +225,10 @@ Other clusters (checked off by their owning sessions' PRs, all referencing THIS 
     `MultiOrderLegResult` (DISTINCT schema: float prices + int disclosedQuantity + sequence/
     correlationId/AMO vs the conditional legs' string prices + discQuantity), `DhanNumeric`
     (number-or-string tolerance), `TriggerConditionDetail` (response-only, string-comparingValue
-    safe), GET-detail fields (createdTime/triggeredTime UTC-Z + lastPrice + condition + orders,
+    safe), `TriggerOrderDetail` (response-only order-leg echo mirror — all-defaulted,
+    DhanNumeric prices; review round 1 fix 2026-07-14: the echo was initially typed with the
+    strict request-side `TriggerOrder`, which would brick a GET/GET-all on one sparse leg),
+    GET-detail fields (createdTime/triggeredTime UTC-Z + lastPrice + condition + orders,
     all #[serde(default)] additive), modify-body optional `alert_id`.
   - Constructors (NEW crates/trading/src/oms/conditional.rs, pure): `ConditionalSegment`
     {NSE_EQ, BSE_EQ, IDX_I} (condition, docs-verbatim) + `ConditionalLegSegment` {NSE_EQ, BSE_EQ}
@@ -237,8 +240,10 @@ Other clusters (checked off by their owning sessions' PRs, all referencing THIS 
     `build_multi_order_request` (1..=15 legs via DHAN_CONDITIONAL_MAX_ORDERS_PER_REQUEST,
     auto-stamped "1".."N" sequences, paise-integer price inputs — exact string formatting for
     conditional legs, capped paise→f64 for multi legs).
-  - Ledger + docs: dhan_api_coverage conditional 5→6, rest_paths/constants 16→17, totals
-    50→51/54→55 + header (lockstep); `DHAN_ALERTS_MULTI_ORDERS_PATH` constant + the constants.rs
+  - Ledger + docs: dhan_api_coverage conditional 5→6, rest_paths/constants 16→17→19, totals
+    50→51→53/54→55→57 + header (lockstep; review round 1 fix 2026-07-14: the 2 LIVE option-chain
+    constants — §8 rebuild, app-crate scheduled pull — were absent and falsely narrated
+    "no longer implemented"); `DHAN_ALERTS_MULTI_ORDERS_PATH` constant + the constants.rs
     slash-test array; NEW `.claude/rules/dhan/conditional-trigger.md` (closes the CLAUDE.md
     index drift; 18 mechanical rules incl. the multi-order divergence traps, UTC-Z, bare-array
     GET-all, ONCE-vs-ALWAYS, no-CONFIRM); dated `2026-07-14 Upstream Update (2)` append to

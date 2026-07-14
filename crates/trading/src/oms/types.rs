@@ -787,9 +787,12 @@ pub struct DhanConditionalTriggerResponse {
     /// Condition echo on GET responses (string `comparingValue` safe).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub condition: Option<TriggerConditionDetail>,
-    /// Order-leg echo on GET responses.
+    /// Order-leg echo on GET responses — the tolerant [`TriggerOrderDetail`]
+    /// mirror, NEVER the strict request-side [`TriggerOrder`] (one
+    /// non-conforming leg must never brick the whole GET / GET-all parse;
+    /// the OpenAPI yaml marks NO order sub-field required).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub orders: Option<Vec<TriggerOrder>>,
+    pub orders: Option<Vec<TriggerOrderDetail>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1517,6 +1520,51 @@ pub struct TriggerConditionDetail {
     /// User note echo.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_note: Option<String>,
+}
+
+/// Response-only mirror of [`TriggerOrder`] — every field defaulted and the
+/// price-family fields tolerant ([`DhanNumeric`]). The GET / GET-all order
+/// echo must be parsed DEFENSIVELY: the OpenAPI yaml marks NO order
+/// sub-field required (an alert created via Dhan's web/app UI can omit the
+/// request-optional `triggerPrice`/`discQuantity`), and the family's
+/// documented number/string wobble (`comparingValue`/`lastPrice`) applies
+/// to the leg's `price` fields too. Parsing the echo with the strict
+/// request-side struct would fail the ENTIRE response — and the whole
+/// account list on GET-all — over ONE such leg.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TriggerOrderDetail {
+    /// "BUY" or "SELL" echo.
+    #[serde(default)]
+    pub transaction_type: String,
+    /// Exchange segment echo.
+    #[serde(default)]
+    pub exchange_segment: String,
+    /// Product type echo.
+    #[serde(default)]
+    pub product_type: String,
+    /// Order type echo.
+    #[serde(default)]
+    pub order_type: String,
+    /// Security ID echo.
+    #[serde(default)]
+    pub security_id: String,
+    /// Quantity echo.
+    #[serde(default)]
+    pub quantity: i64,
+    /// Validity echo.
+    #[serde(default)]
+    pub validity: String,
+    /// Price — STRING in the doc example ("250.00"); tolerant to a bare
+    /// number (the family's documented wobble class).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub price: Option<DhanNumeric>,
+    /// Disclosed quantity echo (STRING "0" in the doc example).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disc_quantity: Option<DhanNumeric>,
+    /// Trigger price echo — request-optional, so the echo may omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger_price: Option<DhanNumeric>,
 }
 
 /// Multi-order WIRE leg — DISTINCT schema from [`TriggerOrder`] (07c §9.1
@@ -3124,7 +3172,18 @@ mod tests {
         );
         let orders = resp.orders.expect("orders echo present");
         assert_eq!(orders.len(), 1);
-        assert_eq!(orders[0].price, "250.00");
+        assert_eq!(
+            orders[0].price,
+            Some(DhanNumeric::Text("250.00".to_string())) // STRING in response
+        );
+        assert_eq!(
+            orders[0].disc_quantity,
+            Some(DhanNumeric::Text("0".to_string()))
+        );
+        assert_eq!(
+            orders[0].trigger_price,
+            Some(DhanNumeric::Text("0".to_string()))
+        );
 
         // Place/Modify 2-field responses stay byte-identical: the five
         // additive detail fields serialize away when None (golden check).
@@ -3133,6 +3192,40 @@ mod tests {
         let place_json = serde_json::to_string(&place).unwrap();
         assert_eq!(place_json, r#"{"alertId":"12345","alertStatus":"ACTIVE"}"#);
         assert!(!place_json.contains("createdTime"));
+    }
+
+    #[test]
+    fn test_trigger_response_order_echo_tolerates_missing_and_numeric_fields() {
+        // A leg created via Dhan's web/app UI (or another client) can omit
+        // request-optional fields — the OpenAPI yaml marks NO order
+        // sub-field required — and the family's documented number/string
+        // wobble can echo `price` as a bare number. Neither shape may brick
+        // the response parse (tolerance parity with origin/main, where the
+        // whole echo was serde-ignored).
+        let json = r#"{
+            "alertId": "77",
+            "alertStatus": "ACTIVE",
+            "orders": [ { "transactionType": "BUY", "securityId": "1333", "quantity": 5, "price": 250.5 } ]
+        }"#;
+        let resp: DhanConditionalTriggerResponse = serde_json::from_str(json).unwrap();
+        let orders = resp.orders.expect("orders echo present");
+        assert_eq!(orders.len(), 1);
+        assert_eq!(orders[0].price, Some(DhanNumeric::Num(250.5)));
+        assert!(orders[0].trigger_price.is_none()); // omitted, never a failure
+        assert!(orders[0].disc_quantity.is_none());
+        assert_eq!(orders[0].quantity, 5);
+        assert!(orders[0].validity.is_empty()); // defaulted, never required
+
+        // GET-all: one UI-created sparse alert must not fail the WHOLE list.
+        let list_json = r#"[
+            {"alertId":"A1","alertStatus":"ACTIVE",
+             "orders":[{"transactionType":"BUY","securityId":"1333","quantity":1}]},
+            {"alertId":"A2","alertStatus":"ACTIVE"}
+        ]"#;
+        let list: Vec<DhanConditionalTriggerResponse> = serde_json::from_str(list_json).unwrap();
+        assert_eq!(list.len(), 2);
+        assert!(list[0].orders.is_some());
+        assert!(list[1].orders.is_none());
     }
 
     #[test]

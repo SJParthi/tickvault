@@ -7,8 +7,14 @@
 //! a `.claude/rules/dhan/conditional-trigger.md` edit FIRST:
 //!
 //! 1. The gate defaults DISARMED in the constructor.
-//! 2. The only arm path is `#[cfg(test)]`-scoped (not compiled in prod).
-//! 3. Every `/alerts` URL-building sender checks the gate.
+//! 2. The only arm path is `#[cfg(test)]`-scoped (not compiled in prod) —
+//!    assignment (`= true`) AND struct-literal (`: true`) syntaxes both.
+//! 3. Every `/alerts` URL-building sender checks the gate BEFORE any
+//!    URL/socket work. The URL census is GENERAL: any `/alerts` text in
+//!    comment-stripped production code (inline positional, captured-
+//!    identifier, and bare-literal format shapes alike) plus any
+//!    `DHAN_ALERTS_`-prefixed constant use — so a new sender built from a
+//!    NEW constant or a split-argument literal still trips the equality.
 //! 4. NO production code calls any of the 6 sender fns (dormancy ratchet —
 //!    the activation PR edits THIS test alongside the operator quote).
 //! 5. The order-leg segment enums stay equities-only fail-closed.
@@ -63,6 +69,34 @@ fn production_region(source: &str) -> &str {
 /// Counts non-overlapping occurrences of `needle` in `haystack`.
 fn count_occurrences(haystack: &str, needle: &str) -> usize {
     haystack.matches(needle).count()
+}
+
+/// Strips FULL-LINE comments (`//` / `///` / `//!` lines) so doc-comment
+/// mentions of `/alerts` never count as URL sites. Deliberately keeps
+/// inline TRAILING comments: a naive `//`-to-EOL strip would corrupt
+/// `://` inside string literals (the http_client_fallback_guard lesson),
+/// and keeping more text is conservative for a violation hunt (an
+/// over-count fails the equality LOUDLY, never silently).
+fn strip_full_line_comments(source: &str) -> String {
+    source
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Extracts the body region of a sender fn: from its `pub async fn` token
+/// to the next `\n    pub ` item (or end of region). Doc comments of the
+/// FOLLOWING item may trail in — harmless for ordering scans (they carry
+/// no `self.http.` / `format!(` tokens).
+fn sender_fn_region<'a>(production: &'a str, fn_name: &str) -> &'a str {
+    let decl = format!("pub async fn {fn_name}(");
+    let start = production
+        .find(&decl)
+        .unwrap_or_else(|| panic!("sender fn {fn_name} must exist in api_client.rs"));
+    let after = &production[start + decl.len()..];
+    let end = after.find("\n    pub ").unwrap_or(after.len());
+    &after[..end]
 }
 
 /// True when the production region of `source` calls any alerts sender fn
@@ -180,6 +214,22 @@ fn test_alerts_gate_arm_is_cfg_test_only() {
         "the single `alerts_gate_armed = true` assignment must live inside \
          arm_alerts_gate_for_test's body"
     );
+
+    // A STRUCT-LITERAL arm (`alerts_gate_armed: true` field init, e.g. a
+    // `new_armed(..)` constructor) is equally forbidden — zero occurrences
+    // anywhere in the file, test module included (tests arm via
+    // arm_alerts_gate_for_test, never a field init). Both fmt'd and
+    // unspaced spellings are scanned.
+    for field_init in ["alerts_gate_armed: true", "alerts_gate_armed:true"] {
+        assert_eq!(
+            count_occurrences(&source, field_init),
+            0,
+            "`{field_init}` field-init arming is FORBIDDEN — the ONLY field \
+             init is `alerts_gate_armed: false` in OrderApiClient::new; a \
+             production arm path requires a dated operator quote + a \
+             .claude/rules/dhan/conditional-trigger.md edit FIRST"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -199,18 +249,58 @@ fn test_every_alerts_sender_checks_gate_first() {
          found only {gate_calls} call sites"
     );
 
-    // URL-building sites: inline `"{}/alerts...` format literals + uses of
-    // DHAN_ALERTS_* path constants. Doc-comment mentions of /alerts do not
-    // build URLs and are deliberately not counted.
-    let inline_url_sites = count_occurrences(production, "\"{}/alerts");
-    let constant_url_sites = count_occurrences(production, "DHAN_ALERTS_MULTI_ORDERS_PATH");
-    let url_sites = inline_url_sites + constant_url_sites;
+    // URL-building census — GENERAL, not needle-per-shape: after stripping
+    // full-line comments, any `/alerts` text left in production code can
+    // only live inside a string literal (inline `"{}/alerts`, captured
+    // `"{base}/alerts`, and split-argument `"/alerts/..."` shapes all
+    // match), plus any `DHAN_ALERTS_`-PREFIXED constant use (so a new
+    // constant like DHAN_ALERTS_ORDERS_PATH is counted, not just the one
+    // known name). The gate's own refusal message is the single allowed
+    // non-URL `/alerts` mention and is excluded by its exact prefix.
+    let code = strip_full_line_comments(production);
+    let gate_refusal_mentions = count_occurrences(&code, "alerts gate DISARMED: /alerts");
+    assert_eq!(
+        gate_refusal_mentions, 1,
+        "exactly ONE `alerts gate DISARMED: /alerts` refusal message may \
+         exist (inside require_alerts_gate) — a second copy could hide a \
+         URL site from the census"
+    );
+    let literal_url_sites = count_occurrences(&code, "/alerts") - gate_refusal_mentions;
+    let constant_url_sites = count_occurrences(&code, "DHAN_ALERTS_");
+    let url_sites = literal_url_sites + constant_url_sites;
     assert_eq!(
         url_sites, gate_calls,
         "every /alerts URL-building site ({url_sites}) must be matched by a \
          require_alerts_gate call ({gate_calls}) — an ungated /alerts sender \
-         cannot be added silently"
+         cannot be added silently (any string shape, any DHAN_ALERTS_* \
+         constant)"
     );
+
+    // ORDERING: in every sender fn body the gate check must precede the
+    // FIRST URL/socket token — `require_alerts_gate` doc contract "Checked
+    // BEFORE any URL/socket work". A gate call after `.send().await` would
+    // otherwise satisfy the count equality.
+    for fn_name in ALERTS_SENDER_FNS {
+        let region = sender_fn_region(production, fn_name);
+        let gate = region
+            .find("self.require_alerts_gate(")
+            .unwrap_or_else(|| panic!("{fn_name} must call require_alerts_gate"));
+        let http = region
+            .find("self.http.")
+            .unwrap_or_else(|| panic!("{fn_name} must perform HTTP via self.http"));
+        assert!(
+            gate < http,
+            "{fn_name}: require_alerts_gate must precede the first \
+             self.http. token (gate BEFORE socket work)"
+        );
+        if let Some(url_build) = region.find("format!(") {
+            assert!(
+                gate < url_build,
+                "{fn_name}: require_alerts_gate must precede the first \
+                 format!( token (gate BEFORE URL work)"
+            );
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -401,12 +491,65 @@ fn test_gate_guard_scanner_self_test() {
         "scanner must detect a planted forbidden segment literal"
     );
 
-    // count_occurrences counts URL-building tokens, not doc mentions.
-    let synthetic_sender = "let url = format!(\"{}/alerts/orders\", base);";
-    assert_eq!(count_occurrences(synthetic_sender, "\"{}/alerts"), 1);
+    // The URL census detects EVERY string shape once comments are stripped:
+    // inline positional, captured-identifier, and split-argument literals.
+    let inline_shape = "let url = format!(\"{}/alerts/orders\", base);";
     assert_eq!(
-        count_occurrences("/// POST /v2/alerts/orders doc", "\"{}/alerts"),
+        count_occurrences(&strip_full_line_comments(inline_shape), "/alerts"),
+        1
+    );
+    let captured_shape = "let url = format!(\"{base}/alerts/orders\");";
+    assert_eq!(
+        count_occurrences(&strip_full_line_comments(captured_shape), "/alerts"),
+        1
+    );
+    let split_arg_shape = "let url = format!(\"{}{}\", base, \"/alerts/orders\");";
+    assert_eq!(
+        count_occurrences(&strip_full_line_comments(split_arg_shape), "/alerts"),
+        1
+    );
+    // A NEW DHAN_ALERTS_* constant (the flagged inline-path retrofit
+    // follow-up) is counted by prefix, not by one hardcoded name.
+    let new_constant_shape =
+        "let url = format!(\"{}{}\", base, constants::DHAN_ALERTS_ORDERS_PATH);";
+    assert_eq!(count_occurrences(new_constant_shape, "DHAN_ALERTS_"), 1);
+
+    // strip_full_line_comments removes doc mentions but keeps code —
+    // including string literals carrying `://` (never a comment start).
+    let doc_only = "/// POST /v2/alerts/orders doc";
+    assert_eq!(
+        count_occurrences(&strip_full_line_comments(doc_only), "/alerts"),
         0
+    );
+    let doc_plus_code = "/// see /alerts docs\nlet u = \"https://x/alerts\";";
+    assert_eq!(
+        count_occurrences(&strip_full_line_comments(doc_plus_code), "/alerts"),
+        1
+    );
+
+    // sender_fn_region + the ordering scan: a gate call AFTER the HTTP work
+    // is detected (gate index > http index).
+    let out_of_order = "    pub async fn place_multi_order(&self) {\n        \
+                        let x = self.http.post(url);\n        \
+                        self.require_alerts_gate(\"late\");\n    }\n    pub fn next() {}";
+    let region = sender_fn_region(out_of_order, "place_multi_order");
+    let gate = region
+        .find("self.require_alerts_gate(")
+        .expect("planted gate call visible");
+    let http = region
+        .find("self.http.")
+        .expect("planted http call visible");
+    assert!(
+        gate > http,
+        "self-test plant must model a LATE gate (gate after http)"
+    );
+
+    // The struct-literal arm needle trips on a planted field init.
+    let planted_field_init = "Self { alerts_gate_armed: true }";
+    assert_eq!(
+        count_occurrences(planted_field_init, "alerts_gate_armed: true"),
+        1,
+        "scanner must detect a planted struct-literal arm"
     );
 
     // enum_body extracts only the first block's body.
