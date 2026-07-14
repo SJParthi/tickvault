@@ -792,7 +792,10 @@ impl OrderManagementSystem {
                 delta_price,
                 "OMS-GAP-01: fill delta price is non-finite or non-positive — \
                  REJECTING the fill event (never a poisoned price into the risk \
-                 book; the qty copy still advances and reconcile() corrects)"
+                 book; the qty copy still advances — reconcile() corrects the \
+                 QTY only, and the NEXT valid slice's delta over-attributes the \
+                 rejected slice's value: pre-live doc note, paper fills are \
+                 always finite>0)"
             );
             counter!("tv_oms_fill_price_rejected_total").increment(1);
             return None;

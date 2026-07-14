@@ -75,9 +75,26 @@ fn ratchet_order_runtime_spawned_only_from_rest_stack() {
     }
 
     // The definition itself lives in order_runtime.rs (one supervisor entry).
+    let runtime_prod = prod_region("order_runtime.rs");
     assert!(
-        prod_region("order_runtime.rs").contains("pub fn spawn_order_runtime("),
+        runtime_prod.contains("pub fn spawn_order_runtime("),
         "order_runtime.rs lost its spawn_order_runtime entry point"
+    );
+
+    // H3 residual pin (refuter round-2): the LOOP must actually call the
+    // MTM halt evaluator — the e2e test drives the arm bodies directly, so
+    // deleting the loop's two production calls (post-mark-batch + the
+    // housekeeping backstop) would silently kill the halt in the spawned
+    // task while every test stays green.
+    let halt_calls = runtime_prod
+        .matches("risk.evaluate_daily_loss_halt()")
+        .count();
+    assert!(
+        halt_calls >= 2,
+        "order_runtime.rs production region must call \
+         risk.evaluate_daily_loss_halt() at least twice (post-mark-batch + \
+         housekeeping backstop); found {halt_calls} — the MTM halt would be \
+         dead in the spawned task"
     );
 }
 

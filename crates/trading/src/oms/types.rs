@@ -2820,7 +2820,7 @@ mod tests {
     /// The full wire-char → segment matrix from live-order-update.md rule 6,
     /// plus the fail-closed unknown arms (annexure rule 15 — None, no panic).
     #[test]
-    fn test_segment_char_parse_matrix() {
+    fn test_parse_segment_chars_matrix() {
         assert_eq!(
             parse_segment_chars("NSE", "D"),
             Some(ExchangeSegment::NseFno)

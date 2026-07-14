@@ -216,7 +216,7 @@ archive runbook + I-P1-11 deferral justification) + dated sections in `ws-reinje
   - Tests: test_rest_stack_wires_order_runtime (replaces the dormant-shape ratchet)
 - [x] Item 7 — groww_bridge mark tap: `marks_wanted` AtomicBool gate + `try_send(MarkUpdate)` (zero alloc/lock/await)
   - Files: crates/app/src/groww_bridge.rs, crates/app/src/main.rs
-  - Tests: test_marks_wanted_false_skips_send, test_mark_channel_full_drops_counted_never_blocks
+  - Tests: test_mark_forward_skips_send_when_marks_wanted_false, test_mark_forward_channel_full_never_blocks_or_panics
 - [x] Item 8 — Ratchets + perf evidence: confirm-symmetry guard extension, spawn-site ratchet, DHAT mark-forward,
       Criterion bench + budget entry, e2e integration
   - Files: crates/app/tests/wal_replay_confirm_symmetry_guard.rs,

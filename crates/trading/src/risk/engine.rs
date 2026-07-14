@@ -385,6 +385,7 @@ impl RiskEngine {
     /// arm of `evaluate_daily_loss_halt`, which is structurally unreachable
     /// through the guarded production write paths.
     #[cfg(test)]
+    // TEST-EXEMPT: cfg(test)-only accumulator poison helper (exercised by the fail-closed halt test)
     pub(crate) fn poison_realized_pnl_for_test(&mut self, value: f64) {
         self.total_realized_pnl = value;
     }
