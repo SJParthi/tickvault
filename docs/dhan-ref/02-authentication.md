@@ -248,3 +248,68 @@ evidence chain: `verification-2026-07-13.md` §4 flag 3.
 5. **Runtime risk is bounded either way:** tickvault's TokenManager already runs
    RenewToken-then-`generateAccessToken` fallback, so a wrong verb or the new-token semantics
    degrades to one extra mint, not an outage.
+
+---
+
+## 2026-07-14 Upstream Update (runner-crawled live pages)
+
+**Evidence tier: Verified-live** for the doc-surface claims below: raw server-rendered HTML of
+`https://dhanhq.co/docs/v2/authentication/` (runs 1–3, 2026-07-13T19:35Z →
+2026-07-14T07:57:34Z, sha256 `1c2546f0` content-identical across runs) + the NEW portal's
+markdown exports `docs.dhanhq.co/markdown/api/v2/authentication/renew-token.md` (07:59:12Z)
+and `get-ip.md` (07:59:01Z) + the portal OpenAPI yaml. Comment-aware grep. **No live API call
+was made.** Full manifest: `00-COVERAGE-MANIFEST.md`.
+
+### (a) RenewToken — the 2026-07-13 note is now CONFIRMED Verified-live on BOTH surfaces
+
+- **New-token semantics**, classic page VERBATIM: "This API expires your current token and
+  provides you with a new token with another 24 hours of validity." Portal export VERBATIM:
+  "…returns a new token with another 24 hours of validity", with response field
+  `accessToken | string | Newly generated access token`. §2.2's "Extends validity by another
+  24 hours" must be read as "returns a NEW accessToken valid 24h" (adopt the response token).
+- **Web-tokens-only**, classic VERBATIM: "You can use this only for tokens generated from
+  Dhan Web."
+- **Verb:** the classic curl carries NO `-X`/`--request` (curl default **GET**); the portal
+  export states `GET https://api.dhan.co/v2/RenewToken`. The relayed "Method: POST" claim is
+  REFUTED. (The portal OpenAPI yaml carries NO auth paths at all — the auth surface is
+  markdown-only there.)
+- Actives-only re-confirmed verbatim: "This only renews tokens which are active. If you try to
+  renew an expired token, it will return an error."
+
+### (b) getIP response fields — `detectedIP` / `ipMatchStatus` / `ordersAllowed` are DOC-ABSENT on BOTH surfaces but WIRE-OBSERVED — re-source, do NOT weaken the pre-market check
+
+- BOTH live surfaces document exactly FOUR getIP response fields. Classic response VERBATIM:
+  `{ "modifyDateSecondary": "2025-09-30", "secondaryIP": "10.420.43.12",
+  "modifyDatePrimary": "2025-09-28", "primaryIP": "10.420.29.14" }`; the portal `get-ip.md`
+  field table is the identical 4-field set. Grep of the entire 191-page crawl for
+  `ordersAllowed|detectedIP|ipMatchStatus`: **ZERO hits on any surface** (comments included).
+- The §5 Get IP response + field table above (7 fields) therefore does NOT match either live
+  doc page as of 2026-07-14. **But the three extra fields are WIRE-OBSERVED, not
+  hallucinated:** the production boot gate
+  (`crates/core/src/network/ip_verifier.rs::classify_static_ip_boot_outcome`) fail-closes
+  unless `orders_allowed == true` AND `ip_match_status == "MATCH"` with every field
+  `#[serde(default)]` — a wire response matching the DOCUMENTED 4-field shape would default to
+  false/empty and HALT boot, yet prod booted daily through that Item-18 gate until the
+  2026-07-13 Dhan retirement; support-ticket records also carry live observations
+  (`docs/dhan-support/` 2026-04-15 ticket 5519522 "getIP returns ordersAllowed=true";
+  2026-07-08 doc line 128 "Registered, ordersAllowed=true").
+- **Re-tiering: "wire-observed, doc-unbacked on BOTH surfaces as of 2026-07-14." The
+  pre-market `ordersAllowed == true` check is KEPT — fix the citation, not the check.** Note
+  the divergence is bigger than 3 fields: the documented shape also lacks the `ip` field the
+  production struct parses — the WHOLE documented getIP response shape diverges from the
+  observed wire shape. Follow-up (outside this PR): if the Dhan lane is ever re-enabled,
+  capture one live getIP response body into `docs/dhan-support/` to hard-pin the wire shape.
+
+### (c) April-1-2026 static-IP enforcement — provenance annotation for §5's "MANDATORY April 1, 2026" block
+
+Neither live surface carries the April-1-2026 date, "no grace period", or the
+exchange-rejection wording (the classic page says only "Static IP whitelisting is mandatory as
+per the new SEBI and exchange guidelines"; the live releases page's newest entry is Feb 09
+2026). The §5 enforcement block is SEBI/exchange-circular + broker-comms sourced, NOT
+doc-page-backed as of 2026-07-14 — NOT contradicted; operational force KEPT.
+
+### (d) Minor
+
+The §4 partner-flow Step 1/Step 3 curls carry no `-X POST` on the live page (curl default GET
+— the same doc-shape ambiguity as consumeApp-consent §3 Step 3). Partner flow unused by
+tickvault; recorded for completeness.

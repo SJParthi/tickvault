@@ -10,6 +10,16 @@
 > change**. Treat this capture (and the whole `dhanhq-v2-upstream-2026-07-03/` LLM-export
 > snapshot dir) as suspect; the canonical limits stand (Order 7,000/day; Data 100,000/day).
 > See `docs/dhan-ref/verification-2026-07-13.md` §4 flag 1. Snapshot body preserved verbatim below.
+>
+> **2026-07-14 update (runner-crawled):** the transposition is now PROVEN LIVE on the portal
+> itself — the rendered `docs.dhanhq.co/markdown/api/v2/guides/rate-limits.md` (fetched
+> 2026-07-14T08:01:34Z) AND the OpenAPI yaml's intro description carry the same swapped
+> dailies, while BOTH surfaces' PRIMARY tables (classic dhanhq.co/docs/v2 root + the portal's
+> own api/v2.md index) confirm the canonical values verbatim (Order 7,000/day; Data
+> 100,000/day). So: live portal-page corruption on the dedicated guide, not merely an export
+> artifact — and still contradicted by both surfaces' primary tables; the canonical limits
+> stand unchanged. See `docs/dhan-ref/01-introduction-and-rate-limits.md` "2026-07-14
+> Upstream Update".
 <!-- ═══════════════════════════════ END REPO-ADDED NOTE 2026-07-13 ═══════════════════════════════ -->
 
 # DhanHQ API v2 — Rate Limits

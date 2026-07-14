@@ -151,3 +151,31 @@ not directly readable from the sandbox (proxy-blocked).
   docs.dhanhq.co portal at api/v2/funds/calculate-multi-margin), enhanced FullDepth callback
   handling. Global Stocks is out of tickvault scope.
 - SDK versions still do NOT map to platform versions (takeaway 9 stands).
+
+---
+
+## 2026-07-14 Upstream Update (runner-crawled live page)
+
+**Evidence tier: Verified-live.** Raw HTML of `https://dhanhq.co/docs/v2/releases/` (runs 1–3,
+sha256 `54116c5c` content-identical, latest 2026-07-14T07:58:32Z), comment-aware.
+Full manifest: `00-COVERAGE-MANIFEST.md`.
+
+1. **The live releases page DOES use formal version headings** — "Version 2.5 / 2.4 / 2.3 /
+   2.2 / 2.1 / 2" — so the header NOTE's "Dhan's releases page lists features by date without
+   formal version numbers" is outdated (the version numbers are upstream, not our invention).
+   All six version/date pairs above are confirmed verbatim; **the latest live entry remains
+   "Version 2.5 — Monday Feb 09 2026"** — nothing newer exists on the page (the only "2026"
+   string on the whole page is that date).
+2. **"Version 2.5.1 — Mar 17, 2026" above is NOT a Dhan-published release** — now
+   Verified-live, upgrading the 2026-07-13 §(a) provenance note: zero hits for
+   MPP / "Market Price Protection" / "March" / 2.5.1 anywhere on the live page. The 2.5.1
+   block is our internal mapping of SDK + regulatory-comms items; keep it, but never cite it
+   as a releases-page entry. Its getIP-fields sentence (the `detectedIP`/`ipMatchStatus`/
+   `ordersAllowed` claim) is re-sourced per `02-authentication.md` "2026-07-14 Upstream
+   Update" §(b): those fields are WIRE-OBSERVED but doc-unbacked on both live surfaces.
+3. Live-only additions worth knowing: a v2.0 "Bug Fixes" subsection (realtime
+   realizedProfit/unrealizedProfit in Positions; a TARGET_LEG order-modification fix); v2.0
+   notes "quantity and price fields are conditionally required for modification" and
+   "pre-open AMO orders can also be placed now with PRE_OPEN tag" (tension with the SDK note
+   above that PRE_OPEN was removed from SDK AMO validation — the docs + annexure still list
+   PRE_OPEN).

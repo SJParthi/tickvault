@@ -287,3 +287,44 @@ zero runtime impact.
    next live crawl (operator paste list, `verification-2026-07-13.md` §3).
 3. **`availabelBalance` typo still live** in the indexed v1 AND v2 funds pages (exact-term
    search hit only those two pages) — the §4/§6 "do NOT fix it" rule stands.
+
+---
+
+## 2026-07-14 Upstream Update (runner-crawled live pages) — multi-margin is now a THREE-artifact split
+
+**Evidence tier: Verified-live.** Raw HTML of `https://dhanhq.co/docs/v2/funds/` (runs 1–3,
+sha256 `4244823f` content-identical, latest 2026-07-14T07:58:23Z) + the portal markdown export
+`docs.dhanhq.co/markdown/api/v2/funds/calculate-multi-margin.md` (2026-07-14T08:00:01Z) + the
+portal OpenAPI yaml (07:58:48Z). Supersedes the 2026-07-13 note's item-2 "whether that portal
+page is the SAME endpoint … is Unknown" hedge — run 3 fetched the portal's REAL markdown
+content (the SPA-shell limitation applies only to the portal's HTML routes). Full manifest:
+`00-COVERAGE-MANIFEST.md`. Still ZERO runtime impact (no multi-margin caller in `crates/`);
+live-probe before any caller is written.
+
+1. **The classic funds page is INTERNALLY split on the SAME page:** its curl shows
+   `"includeOrder": true` + `scripList` + `dhanClientId` (agreeing with the SDK 2.3.0rc1 wire
+   body), while the adjacent Request Structure + param table still show `includeOrders` +
+   `scripts` (no dhanClientId). Live-only oddity: the multi curl URL is literally
+   `https://api.dhan.co/v2/%20%20/margincalculator/multi` (two encoded spaces in the path —
+   a doc bug).
+2. **The portal's own two artifacts DISAGREE with each other:** the markdown export says
+   `includeOrder` + `scripList[...]` with a camelCase float response and NO `hedge_benefit`;
+   the OpenAPI yaml says `includeOrders` + `scripts` with a snake_case all-string response
+   INCLUDING `hedge_benefit`. UNRESOLVED between Dhan's own artifacts — **live-probe before
+   any caller**. If forced to pick: the rendered markdown + the SDK + the classic curl
+   converge on `includeOrder`/`scripList` (the yaml's own x-codeSample body even uses
+   `scripts` while its markdown twin uses `scripList` — the yaml smells hand-rolled).
+3. **`currency` response-field semantics are now suspect:** the classic live example shows
+   `"currency": "INR"` (reads as a currency CODE) while the portal markdown types it
+   `currency | float | Currency margin` (a margin amount for the currency segment). Meaning
+   Unknown until probed; the §3 table's "Currency segment margin" description can no longer
+   be treated as settled.
+4. **`NSE_COMM`** appears as a `scripList[0].exchangeSegment` enum value on the portal
+   markdown (verbatim: NSE_EQ, NSE_FNO, NSE_COMM, BSE_EQ, BSE_FNO, MCX_COMM — and in the
+   yaml's conditional-trigger/multi-order enums) — a documented request-side STRING value
+   with NO numeric annexure code on any surface. tickvault never sends it (commodity out of
+   scope); recorded for decode awareness.
+5. **`availabelBalance` typo re-confirmed live on BOTH surfaces** (classic fundlimit example
+   + table; portal get-fund-limits.md; yaml `FundLimit.availabelBalance`); the
+   margin-calculator's correctly-spelled `availableBalance` also re-confirmed — the
+   two-spellings rule (§6.7) stands, now Verified-live.

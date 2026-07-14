@@ -62,6 +62,18 @@
       PascalCase on the official Live Order Update page, same as every other Data field.
       (An earlier note here claimed camelCase — wrong; our parser ignores both fields,
       so zero code impact.)
+    - **2026-07-14 correction (runner-crawled, Verified-live):** the live sample JSON now
+      carries a camelCase DUPLICATE cluster (`series`/`goodTillDaysDate`/`instrumentType`/
+      `refLtp`/`tickSize`/`algoId`/`multiplier`, with Dhan's own missing-comma typo) AHEAD of
+      the PascalCase fields, while the parameter table stays PascalCase-only — wire frames may
+      carry either/both casings. And the 2026-07-02 parenthetical above is itself corrected:
+      "our parser ignores both fields" is WRONG — the production `OrderUpdateData`
+      (`crates/common/src/order_types.rs:306-310`) parses `refLtp`/`tickSize` camelCase-ONLY
+      via `#[serde(rename)]`; zero impact holds only because no consumer reads them for
+      decisions. Follow-up (code, not this docs PR): `#[serde(alias)]` for both casings. Also:
+      `AlgoOrdNo` is typed `float` on the live table (stable upstream typing error — keep
+      tolerant `Option<String>` parsing). See
+      `docs/dhan-ref/10-live-order-update-websocket.md` "2026-07-14 Upstream Update".
 
 ## What This Prevents
 
