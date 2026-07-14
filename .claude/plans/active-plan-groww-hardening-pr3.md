@@ -1,6 +1,6 @@
 # Implementation Plan: Groww Lossless-Reconnect Hardening PR-3 — Feed Gap-Episode Audit
 
-**Status:** APPROVED
+**Status:** VERIFIED
 **Date:** 2026-07-14
 **Approved by:** Parthiban (operator) via coordinator session, 2026-07-14 — lossless-reconnect build PR-3 authorized; FEED-GAP-01 Telegram-episode-only default approved
 
@@ -96,15 +96,27 @@ CloudWatch metric filter (documented in the rule file §1).
 - [x] FEED-GAP-01 rule file
   - Files: .claude/rules/project/feed-gap-error-codes.md
   - Tests: error_code_rule_file_crossref
-- [ ] ErrorCode variant FeedGap01EpisodeDegraded
+- [x] ErrorCode variant FeedGap01EpisodeDegraded
   - Files: crates/common/src/error_code.rs
   - Tests: test_all_variants_have_unique_code_str
-- [ ] feed_gap_audit persistence
+- [x] feed_gap_audit persistence
   - Files: crates/storage/src/feed_gap_audit_persistence.rs, crates/storage/src/lib.rs
   - Tests: feed_gap_audit DDL/row builder unit tests
-- [ ] NotificationEvent variants + bridge gap-episode tracker
+- [x] NotificationEvent variants + bridge gap-episode tracker
   - Files: crates/core/src/notification/events.rs, crates/app/src/groww_bridge.rs
   - Tests: tracker transition tests, threshold pin, partial-minute tests
-- [ ] Scoreboard dangling-close sweep (or honest flagged deferral)
+- [x] Scoreboard dangling-close sweep (or honest flagged deferral)
   - Files: crates/app/src/feed_scoreboard_boot.rs
   - Tests: dangling-close pure helper test (if not deferred)
+
+## Per-Item Guarantee Matrix
+
+See per-wave-guarantee-matrix.md — the full 15-row 100% Guarantee Matrix and
+the 7-row Resilience Demand Matrix apply to every item in this plan. All
+15 + 7 rows are confirmed for each plan item: annotation-only subsystem
+(no new tick-drop path, no hot-path allocation — the tracker rides the
+existing ≤1s wake), DEDUP UPSERT KEYS on the new table (outcome + feed
+in-key), every error path uses error! with code = FEED-GAP-01, the
+Telegram events are edge-triggered, and every invariant is pinned by a
+build-failing unit test (threshold pin, tracker transitions, DDL/DEDUP
+shape, dangling pairing, retention registration).
