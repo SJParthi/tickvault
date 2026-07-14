@@ -1391,7 +1391,26 @@ pub enum NotificationEvent {
     /// total-outage trailer ("receiving nothing … prices will not flow"),
     /// which would contradict a partial summary with a false
     /// whole-feed-down claim.
-    GrowwSidecarRejected { reason: String, fleet_summary: bool },
+    ///
+    /// `detail` (operator demand 2026-07-14 — the 14:59 IST rejection page
+    /// said only "the feed reported an error" with no WHY): the SANITIZED
+    /// reject-cause signature, rendered into the headline as
+    /// "Groww live feed rejected: {detail} — retrying". CONTRACT: the emit
+    /// site MUST pass ONLY the output of the supervisor's
+    /// `sidecar_line_signature` choke point (control-char + BiDi strip,
+    /// credential/JWT redaction, 160-char cap) — NEVER raw child text. A
+    /// `None` / empty / whitespace detail degrades to the pre-2026-07-14
+    /// generic headline. This field is a conscious, dated override of
+    /// Telegram commandment 2 (no library jargon) for the ONE field whose
+    /// payload IS the machine cause — recorded in
+    /// `.claude/rules/project/feed-stall-watchdog-error-codes.md` §1c.1
+    /// (precedent: the B9 "Build:" short-SHA override). The render boundary
+    /// re-caps + html-escapes it anyway (defense-in-depth).
+    GrowwSidecarRejected {
+        reason: String,
+        fleet_summary: bool,
+        detail: Option<String>,
+    },
 
     /// W2 PR#5 (2026-07-10, audit follow-up row 15): the configured NSE
     /// holiday calendar's coverage horizon is running out (or already ran
@@ -3608,12 +3627,37 @@ impl NotificationEvent {
             Self::GrowwSidecarRejected {
                 reason,
                 fleet_summary,
+                detail,
             } => {
+                // Defensive render-boundary cap (chars) on `detail` —
+                // mirrors the supervisor's SIDECAR_LINE_SIGNATURE_MAX_CHARS
+                // (core sits BELOW the app crate, so the value is mirrored,
+                // not imported). The emit-site contract already caps; this
+                // is defense-in-depth so a future emit site can never flood
+                // a Telegram headline.
+                const GROWW_REJECT_DETAIL_MAX_CHARS: usize = 160;
                 // `reason` is a fixed per-class &'static str (or the fleet
                 // coalescer's counted summary) mapped to String by the
                 // supervisor (never raw child text), but html_escape it
                 // anyway for defense-in-depth, consistent with every String arm.
                 let reason = html_escape(reason);
+                // 2026-07-14 operator demand (the 14:59 IST page carried no
+                // WHY): when the SANITIZED reject-cause signature is present
+                // the headline names it — "rejected: <cause> — retrying".
+                // Truncate BEFORE html_escape so an escape entity is never
+                // cut mid-sequence; empty/whitespace degrades to the exact
+                // pre-2026-07-14 generic headline (never a hollow
+                // "rejected:  — retrying"). Dated commandment-2 override:
+                // feed-stall-watchdog-error-codes.md §1c.1.
+                let title = match detail.as_deref().map(str::trim).filter(|d| !d.is_empty()) {
+                    Some(d) => {
+                        let capped: String =
+                            d.chars().take(GROWW_REJECT_DETAIL_MAX_CHARS).collect();
+                        let capped = html_escape(&capped);
+                        format!("🆘 <b>Groww live feed rejected: {capped} — retrying</b>")
+                    }
+                    None => "🆘 <b>Groww live feed rejected</b>".to_string(),
+                };
                 if *fleet_summary {
                     // Fleet-coalesced partial summary (hostile-review fix
                     // 2026-07-06): the trailer must NOT claim the whole feed
@@ -3621,13 +3665,13 @@ impl NotificationEvent {
                     // reported a problem, and nothing positive is claimed
                     // about the rest.
                     format!(
-                        "🆘 <b>Groww live feed rejected</b>\n{reason}\n\nThe affected \
+                        "{title}\n{reason}\n\nThe affected \
                          connections keep retrying automatically. Prices from those \
                          connections will not flow until they recover."
                     )
                 } else {
                     format!(
-                        "🆘 <b>Groww live feed rejected</b>\n{reason}\n\nThe Groww feed is \
+                        "{title}\n{reason}\n\nThe Groww feed is \
                          connected but receiving nothing. Until this is fixed, Groww \
                          prices will not flow."
                     )
@@ -4830,6 +4874,7 @@ mod tests {
         let event = NotificationEvent::GrowwSidecarRejected {
             reason: "account lacks live market-data feed entitlement".to_string(),
             fleet_summary: false,
+            detail: None,
         };
         let msg = event.to_message();
         // The plain-English reason reaches the operator…
@@ -4860,6 +4905,7 @@ mod tests {
                      no reject reported from the other 33 connections"
                 .to_string(),
             fleet_summary: true,
+            detail: None,
         };
         let msg = event.to_message();
         assert!(
@@ -4886,6 +4932,7 @@ mod tests {
         let single = NotificationEvent::GrowwSidecarRejected {
             reason: "access token stale".to_string(),
             fleet_summary: false,
+            detail: None,
         };
         assert!(single.to_message().contains("receiving nothing"));
     }
@@ -4898,12 +4945,108 @@ mod tests {
         let event = NotificationEvent::GrowwSidecarRejected {
             reason: "<script>".to_string(),
             fleet_summary: false,
+            detail: None,
         };
         let msg = event.to_message();
         assert!(!msg.contains("<script>"), "raw HTML not escaped: {msg}");
         assert!(
             msg.contains("&lt;script&gt;"),
             "expected escaped form: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_groww_sidecar_rejected_detail_renders_reason_and_retrying() {
+        // 2026-07-14 operator demand (the 14:59 IST page carried no WHY):
+        // when the SANITIZED reject-cause signature is present, the headline
+        // names it verbatim — "live feed rejected: <cause> — retrying" — and
+        // the class's plain-English explanation line is KEPT beneath it.
+        // The detail legitimately carries SDK/NATS wording (`growwapi`,
+        // `nats:`) per the dated commandment-2 override recorded in
+        // feed-stall-watchdog-error-codes.md §1c.1 — so the no-jargon pin in
+        // test_groww_sidecar_rejected_renders_reason_and_topic_and_severity
+        // applies only to the detail-less form.
+        let event = NotificationEvent::GrowwSidecarRejected {
+            reason: "the feed reported an error and is retrying".to_string(),
+            fleet_summary: false,
+            detail: Some(
+                "ERROR growwapi.groww.nats_client: Error: nats: unexpected EOF".to_string(),
+            ),
+        };
+        let msg = event.to_message();
+        assert!(
+            msg.contains(
+                "Groww live feed rejected: ERROR growwapi.groww.nats_client: \
+                 Error: nats: unexpected EOF — retrying"
+            ),
+            "headline must name the sanitized cause + retrying: {msg}"
+        );
+        // The existing class explanation stays as the body line.
+        assert!(
+            msg.contains("the feed reported an error and is retrying"),
+            "class explanation must be kept: {msg}"
+        );
+        // The single-conn total-outage trailer is unchanged.
+        assert!(msg.contains("receiving nothing"), "trailer lost: {msg}");
+        // Badge ordering untouched (PR #1529 owns the badge arms).
+        assert!(
+            msg.starts_with("🟢 GROWW — "),
+            "badge ordering broke: {msg}"
+        );
+        assert_eq!(event.severity(), Severity::High);
+    }
+
+    #[test]
+    fn test_groww_sidecar_rejected_empty_detail_degrades_to_generic() {
+        // An empty / whitespace / None detail must render the EXACT generic
+        // pre-2026-07-14 headline — never a hollow "rejected:  — retrying".
+        let expected = NotificationEvent::GrowwSidecarRejected {
+            reason: "the feed reported an error and is retrying".to_string(),
+            fleet_summary: false,
+            detail: None,
+        }
+        .to_message();
+        assert!(
+            expected.contains("Groww live feed rejected</b>"),
+            "generic headline missing: {expected}"
+        );
+        for hollow in [Some(String::new()), Some("   ".to_string())] {
+            let msg = NotificationEvent::GrowwSidecarRejected {
+                reason: "the feed reported an error and is retrying".to_string(),
+                fleet_summary: false,
+                detail: hollow,
+            }
+            .to_message();
+            assert_eq!(msg, expected, "empty detail must degrade to generic");
+            assert!(
+                !msg.contains("rejected:"),
+                "hollow 'rejected:' headline leaked: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_groww_sidecar_rejected_detail_html_escaped_and_recapped() {
+        // Defense-in-depth at the render boundary: the emit-site contract
+        // already sanitizes + caps, but a hostile/oversized detail from any
+        // future emit site is re-capped to 160 chars (BEFORE escaping, so an
+        // entity is never cut mid-sequence) and html-escaped.
+        let event = NotificationEvent::GrowwSidecarRejected {
+            reason: "the feed reported an error and is retrying".to_string(),
+            fleet_summary: false,
+            detail: Some(format!("<script>{}", "x".repeat(400))),
+        };
+        let msg = event.to_message();
+        assert!(!msg.contains("<script>"), "raw HTML not escaped: {msg}");
+        assert!(
+            msg.contains("rejected: &lt;script&gt;"),
+            "escaped detail missing from headline: {msg}"
+        );
+        // 160-char cap: the raw detail is 408 chars; after the cap the
+        // headline's x-run is 160 - "<script>".len() = 152 chars long.
+        assert!(
+            msg.contains(&"x".repeat(152)) && !msg.contains(&"x".repeat(153)),
+            "detail must be re-capped to 160 chars at the render boundary: {msg}"
         );
     }
 
@@ -7406,6 +7549,7 @@ mod tests {
         let sidecar = NotificationEvent::GrowwSidecarRejected {
             reason: "access token stale".to_string(),
             fleet_summary: false,
+            detail: None,
         };
         assert_eq!(sidecar.feed_badge(), Some("🟢 GROWW"));
         assert!(
