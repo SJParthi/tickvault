@@ -89,9 +89,13 @@ resource "aws_cloudwatch_log_metric_filter" "telegram_drops_fallback" {
   }
 }
 
+# AWS caps alarm_description at 1024 chars — the full honest-residuals text
+# (first-sample baseline, 2+1 straddle, Telegram-down floor, no-OK rationale)
+# lives in this file's header block; the description below is the
+# operator-facing summary (813 chars, inside the cap).
 resource "aws_cloudwatch_metric_alarm" "telegram_drops" {
   alarm_name          = "tv-${var.environment}-telegram-drops"
-  alarm_description   = "Telegram typed-event pages are being DROPPED: >=3 drops of tv_telegram_dropped_total within one 15-min window (Sum of the CW agent's per-scrape deltas; reasons = send_failed / noop_mode / coalesced_sample_capped, aggregated - read the reason split on the app /metrics exporter). A broken bot token or Telegram-API failure silently kills EVERY typed-event page (REST-leg escalations, AUTH-GAP-05, scorecards) - this alarm is the SNS->Lambda backstop leg, which delivers while the app-side dispatcher is broken. A one-off coalescer sample-cap drop never pages. Honest residuals: the session's FIRST drop per reason-series is eaten as the CW delta baseline until the crates-side pre-registration lands (effective first-episode threshold 4, flagged follow-up 2026-07-14); an aligned-window 2+1 straddle never pages; if Telegram-the-service itself is down, this page cannot deliver either (CloudWatch console is the floor). NO recovered/OK page: the sparse metric's auto-OK only means no typed event fired lately, never bot recovery - verify by sending a test page. Triage: check tv_telegram_dropped_total reason split, the bot token in SSM, api.telegram.org reachability. Runbook: .claude/rules/project/wave-3-error-codes.md (TELEGRAM-01)"
+  alarm_description   = "Telegram typed-event pages are being DROPPED: >=3 drops of tv_telegram_dropped_total within one 15-min window (Sum of CW-agent per-scrape deltas; reasons send_failed / noop_mode / coalesced_sample_capped aggregated - read the reason split on the app /metrics exporter). A broken bot token or Telegram-API failure silently kills EVERY typed-event page (REST-leg escalations, AUTH-GAP-05, scorecards) - this alarm is the SNS->Lambda backstop leg, which delivers while the app-side dispatcher is broken. NO recovered/OK page: the sparse metric's auto-OK only means no typed event fired lately, never bot recovery - verify by sending a test page. Triage: bot token in SSM, api.telegram.org reachability. Full residuals: telegram-drop-alarm.tf header. Runbook: .claude/rules/project/wave-3-error-codes.md (TELEGRAM-01)"
   comparison_operator = "GreaterThanOrEqualToThreshold"
   threshold           = 3
   evaluation_periods  = 1
