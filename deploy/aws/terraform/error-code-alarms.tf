@@ -5,9 +5,9 @@
 #   The CloudWatch-only migration (#O1/#O2/#O3) retired the
 #   Loki -> Alertmanager -> Telegram route with NO replacement, so an `error!`
 #   reached only the log sinks. On 2026-07-06 the 12:00 IST REST-CANARY-01
-#   probe failure produced ZERO pages. These 10 log metric filters + alarms
+#   probe failure produced ZERO pages. These 13 log metric filters + alarms
 #   (8 on 2026-07-06; +AGGREGATOR-DROP-01 on 2026-07-09; +WAL-SUSPEND-01 on
-#   2026-07-10) on
+#   2026-07-10; +CROSS-VERIFY-1M-01/-02 + TICK-CONSERVE-01 on 2026-07-14) on
 #   the /tickvault/<env>/app log group (the errors.jsonl stream) restore the
 #   route: error! -> errors.jsonl -> CloudWatch Logs -> filter -> tv_errcode_*
 #   metric -> alarm (<=5 min) -> SNS tv-alerts -> Telegram webhook Lambda.
@@ -42,6 +42,13 @@
 # 10 alarms (~+$0.10/mo). Audit follow-up row 10: a WAL-suspended QuestDB
 # table silently stopped applying ILP-ACKed writes with zero signal — the
 # new 60s wal_tables() probe pages it here.
+#
+# 2026-07-14 UPDATE (automation-gaps PR-3): +3 entries (CROSS-VERIFY-1M-01,
+# CROSS-VERIFY-1M-02, TICK-CONSERVE-01) -> 13 filters + 13 alarms
+# (~+$0.30/mo). The 2026-07-10 automation audit found all three High
+# post-market audit codes emitted error! but were log-sink-only — a 15:31
+# IST OHLCV mismatch / degraded cross-verify run and a 15:40 IST
+# tick-conservation residual paged NOBODY.
 # =============================================================================
 
 locals {
@@ -69,6 +76,12 @@ locals {
   #     caused it is not fixed by the episode aging out.
   #   - dh-906: a discrete per-order reject; OK = aged out, never "orders
   #     working again".
+  #   - cross-verify-1m-01 / cross-verify-1m-02 / tick-conserve-01
+  #     (2026-07-14): daily ONE-SHOT audit findings — the 15:31 IST
+  #     cross-verify fires its mismatch/degraded lines once per run and
+  #     the 15:40 IST conservation audit fires its residual once per day;
+  #     the auto-OK ~15 min later can never mean the mismatch/residual was
+  #     fixed. Recovery signal = the NEXT trading day's clean run.
   # auth-gap-04 stays ok_recovery = true with a stated ambiguity (round-4):
   # its emit site returns Err from the boot mint path, systemd Restart=always
   # re-boots and re-emits roughly every failing boot cycle (each cycle spans
@@ -223,6 +236,45 @@ locals {
       ok_recovery = false # 2026-07-10: once-per-episode emitter - the auto-OK ~15 min later only means the datapoint aged out while the table may still be suspended (Rule-11 false-recovery; ws-reinject-01 precedent)
       desc        = "WAL-SUSPEND-01: a QuestDB table's WAL apply is SUSPENDED - ingestion keeps ACKing rows while they silently stop becoming visible/applied (silent data-visibility loss; typical cause = a disk-full episode or a WAL apply error). Operator action: read the table/error_tag/error_message fields in the errors-jsonl stream, fix the underlying cause (df -h /data, QuestDB logs), then run ALTER TABLE <table> RESUME WAL in the QuestDB console - NEVER auto-executed (resuming into a still-broken disk replays the failure). NO recovered/OK page: the code fires once per suspension episode; recovery signal = the falling-edge recovery log + tv_questdb_wal_suspended_tables returning to 0. Runbook: .claude/rules/project/wal-suspension-error-codes.md"
     }
+    # CROSS-VERIFY-1M-01/-02 + TICK-CONSERVE-01 (added 2026-07-14 —
+    # automation-gaps PR-3): the 2026-07-10 automation audit found all
+    # three High post-market audit codes were LOG-SINK-ONLY. Emit sites:
+    # crates/app/src/cross_verify_1m_boot.rs (the 15:31 IST run's
+    # mismatch/degraded arms + the audit-append/final-flush failure arms)
+    # and crates/app/src/tick_conservation_boot.rs (the 15:40 IST
+    # reconciler's Leak arm). All three are daily one-shot audit findings
+    # -> ok_recovery = false (the aggregator-drop-01 / ws-reinject-01
+    # precedent): the auto-OK ~15 min after the single datapoint ages out
+    # can never mean the mismatch/residual was fixed (Rule-11
+    # false-recovery); the real recovery signal is the NEXT trading day's
+    # clean run.
+    "cross-verify-1m-01" = {
+      pattern     = "{ $.code = \"CROSS-VERIFY-1M-01\" && $.level = \"ERROR\" }"
+      period      = 300
+      threshold   = 1
+      eval        = 3
+      dta         = 1
+      ok_recovery = false # 2026-07-14: daily one-shot audit finding - the mismatched candles do not fix themselves when the episode ages out (Rule-11 false-recovery)
+      desc        = "CROSS-VERIFY-1M-01: post-market 1m cross-verify found OHLCV mismatches between our live candles_1m and Dhan's intraday history (15:31 IST daily run; also fires when a mismatch audit row/flush could not persist). Track the trend, not the absolute count - a stable baseline is sampling noise, a spike or sustained Open/Close drift is real. Open data/cross-verify/cross-verify-1m-<date>.csv + the cross_verify_1m_audit table. NO recovered/OK page: a daily one-shot finding - the auto-OK ~15 min later only means the episode aged out; recovery = the next trading day's clean run. Runbook: .claude/rules/project/cross-verify-1m-error-codes.md"
+    }
+    "cross-verify-1m-02" = {
+      pattern     = "{ $.code = \"CROSS-VERIFY-1M-02\" && $.level = \"ERROR\" }"
+      period      = 300
+      threshold   = 1
+      eval        = 3
+      dta         = 1
+      ok_recovery = false # 2026-07-14: daily one-shot audit finding - the day's coverage gap persists after the episode ages out (Rule-11 false-recovery)
+      desc        = "CROSS-VERIFY-1M-02: post-market 1m cross-verify fetch DEGRADED - Dhan intraday REST errored/rate-limited/empty (or no JWT at run time) for a material fraction of the spot SIDs, so the day's OHLCV parity signal is partial or blind. Check Dhan Data-API health + the captured sample_failure field in the errors-jsonl stream. NO recovered/OK page: the run fires once per day - the auto-OK ~15 min later only means the episode aged out; recovery = the next trading day's clean run. Runbook: .claude/rules/project/cross-verify-1m-error-codes.md"
+    }
+    "tick-conserve-01" = {
+      pattern     = "{ $.code = \"TICK-CONSERVE-01\" && $.level = \"ERROR\" }"
+      period      = 300
+      threshold   = 1
+      eval        = 3
+      dta         = 1
+      ok_recovery = false # 2026-07-14: daily one-shot data-accounting finding - the residual is a discrete event; aging out never means the accounting balanced (Rule-11 false-recovery)
+      desc        = "TICK-CONSERVE-01: the 15:40 IST daily tick-conservation audit found a positive residual - frames Dhan delivered (in the WAL) never reached the processor (delivery_residual: recovered by next-boot WAL replay) and/or ticks entered the pipeline but reached no known outcome (outcome_residual: a true in-process leak - investigate). Read the per-stage numbers in tick_conservation_audit + the 60s conservation ledger logs. NO recovered/OK page: a daily one-shot finding - the auto-OK ~15 min later only means the episode aged out; recovery = the next trading day's balanced row. Runbook: .claude/rules/project/tick-conservation-audit-error-codes.md"
+    }
   }
 }
 
@@ -259,7 +311,8 @@ resource "aws_cloudwatch_metric_alarm" "error_code" {
   # deliberately NO dimensions (see filter comment)
   alarm_actions = local.app_alarm_actions
   # ok_recovery = false (rest-canary-01, ws-reinject-01, proc-01, dh-906,
-  # aggregator-drop-01 [2026-07-09], wal-suspend-01 [2026-07-10] -
+  # aggregator-drop-01 [2026-07-09], wal-suspend-01 [2026-07-10],
+  # cross-verify-1m-01/-02 + tick-conserve-01 [2026-07-14] -
   # the one-shot/discrete emitters) suppresses the OK page: their auto-OK
   # ~15 min after the datapoint ages out would be a Rule-11 false
   # "recovered" message while the condition persists (see the locals
