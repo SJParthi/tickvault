@@ -85,23 +85,23 @@ lag (structurally absent in dry-run — armed-on-arrival), broker-book reconcili
 live mode + a no-rest-except-live-feed §3 ruling), paging for the log-sink-only codes.
 
 ## Plan Items
-- [ ] order_audit persistence rebuild — Files: crates/storage/src/order_audit_persistence.rs,
+- [x] order_audit persistence rebuild — Files: crates/storage/src/order_audit_persistence.rs,
   crates/storage/src/lib.rs — Tests: test_order_audit_create_ddl_contains_expected_columns,
   test_order_audit_dedup_key_ts_first_event_and_feed_in_key, test_append_order_audit_row_nonfinite_price_clamped_to_zero_boundary
-- [ ] pnl_audit persistence rebuild — Files: crates/storage/src/pnl_audit_persistence.rs,
+- [x] pnl_audit persistence rebuild — Files: crates/storage/src/pnl_audit_persistence.rs,
   crates/storage/tests/dedup_segment_meta_guard.rs — Tests: test_pnl_audit_dedup_key_ts_first_snapshot_kind_and_feed_in_key,
   test_append_pnl_audit_row_zero_pnl_boundary
-- [ ] core wording + badges — Files: crates/core/src/notification/events.rs — Tests:
+- [x] core wording + badges — Files: crates/core/src/notification/events.rs — Tests:
   test_risk_halt_notification, test_circuit_breaker_notify_on_open, test_oms_risk_events_are_dhan_badged
-- [ ] RISK-GAP-01 coded emit — Files: crates/trading/src/risk/engine.rs — Tests: existing halt tests + test_risk_halt_error_is_coded_risk_gap_01 (app guard)
-- [ ] bridge + consumer + wiring — Files: crates/app/src/order_observability.rs,
+- [x] RISK-GAP-01 coded emit — Files: crates/trading/src/risk/engine.rs — Tests: existing halt tests + test_risk_halt_error_is_coded_risk_gap_01 (app guard)
+- [x] bridge + consumer + wiring — Files: crates/app/src/order_observability.rs,
   crates/app/src/trading_pipeline.rs, crates/app/src/main.rs — Tests: test_map_oms_alert_exhaustive,
   test_alert_pacer_suppresses_within_cooldown_and_folds_count, test_classify_order_side_reconcile_verdict_matrix,
   order_side_wiring_guard.rs (all)
-- [ ] terraform + EMF + dashboard — Files: deploy/aws/terraform/order-side-alarms.tf,
+- [x] terraform + EMF + dashboard — Files: deploy/aws/terraform/order-side-alarms.tf,
   deploy/aws/terraform/app-alarms.tf, deploy/aws/terraform/user-data.sh.tftpl,
   deploy/aws/cloudwatch-agent.json, deploy/aws/terraform/variables.tf, deploy/aws/terraform/dashboard.tf,
   crates/common/tests/cloudwatch_app_alarms_wiring.rs — Tests: order_side_paging_wiring_guard.rs (all),
   test_emf_metric_selectors_name_count_is_twenty_nine
-- [ ] rules + cost note + plan hygiene — Files: .claude/rules/project/wave-2-error-codes.md,
+- [x] rules + cost note + plan hygiene — Files: .claude/rules/project/wave-2-error-codes.md,
   .claude/rules/project/gap-enforcement.md, .claude/rules/project/aws-budget.md, .claude/plans/* — Tests: error_code_rule_file_crossref (existing)

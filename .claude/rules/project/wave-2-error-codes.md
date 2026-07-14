@@ -516,6 +516,37 @@ are SEBI-relevant — write failures must surface immediately.
 applies to this table.
 **Source:** `crates/storage/src/order_audit_persistence.rs`
 
+### 2026-07-14 rebuild (cluster-C order-side observability)
+
+The `order_audit` module was REBUILT on the modern
+`rest_fetch_audit_persistence.rs` template (the pre-deletion source is
+history only):
+
+- **DEDUP key (verbatim):** `ts, trading_date_ist, order_id, leg, event, feed`
+  — `order_id` is the identity (NOT `security_id`; the I-P1-11 pair does
+  not apply to order events — one order has one instrument, and two
+  lifecycle events for the same order at the same instant must BOTH
+  survive, hence `event` in-key). `feed` per the feed-in-key override.
+- **Transport:** ILP-over-HTTP with per-flush server ACK (the 2026-07-05
+  fire-and-forget lesson); failed flush → `discard_pending`
+  (poisoned-buffer defense, `tv_order_audit_rows_discarded_total`).
+- **Stages on the `error!` (`code = AUDIT-06`):** `ensure_client_build` /
+  `ensure_ddl` (HTTP-CLIENT-01-class duplicate-row window until a later
+  ensure succeeds) / `append` / `flush` / `sink_drop` (the bounded
+  order-side channel refused a message — the row AND its Telegram page
+  are lost for that one event; best-effort forensics, the order path is
+  unaffected).
+- **Delivery boundary (honest):** AUDIT-06 is **log-sink-only** — no
+  `error_code_alerts` map entry; the operator signals are the order-side
+  sink's typed Telegram events + the daily OMS-GAP-02 reconcile verdict.
+  Adding a CW log filter is a flagged follow-up.
+- **Counters:** `tv_order_audit_rows_total{event}`,
+  `tv_order_audit_persist_errors_total{stage}`,
+  `tv_order_audit_nonfinite_clamped_total`,
+  `tv_order_alert_dropped_total{reason}`.
+- Consumer: `crates/app/src/order_observability.rs` (paper rows TODAY —
+  `mode = "paper"` while `dry_run = true`).
+
 ## STORAGE-GAP-03 — audit-table write failure (any table)
 
 **Trigger:** any audit-table writer hit an unrecoverable error after the
@@ -523,6 +554,20 @@ ring + spill backoff exhausted. Coalesces AUDIT-01..06.
 
 **Triage:** see specific AUDIT-NN code emitted alongside.
 **Source:** `crates/storage/src/{phase2,depth_rebalance,ws_reconnect,boot,selftest,order}_audit_persistence.rs`
+
+### 2026-07-14 note — pnl_audit rebuild emits this code (cluster-C)
+
+`crates/storage/src/pnl_audit_persistence.rs` (rebuilt on the same
+ILP-over-HTTP template as order_audit above) emits STORAGE-GAP-03 with
+stages `ensure_client_build` / `ensure_ddl` / `append` / `flush`. DEDUP
+key: `ts, trading_date_ist, security_id, exchange_segment, snapshot_kind,
+feed` (I-P1-11 pair + `snapshot_kind` + `feed` in-key). **OnEod heartbeat
+contract:** the order-side consumer writes ≥1 `snapshot_kind = "on_eod"`
+row per trading day (aggregate sentinels `security_id = 0`,
+`exchange_segment = "ALL"`) at the market-close message — the positive
+"the pnl audit leg is alive" signal (audit Rule 11) and the daily
+reconcile denominator. `on_fill` / `on_minute` are Phase-1 emits
+(documented, dormant). Log-sink-only delivery boundary, same as AUDIT-06.
 
 ## STORAGE-GAP-04 — S3 archive failure
 
