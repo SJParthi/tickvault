@@ -186,11 +186,18 @@ fn every_dedup_key_is_listed_here_for_auditing() {
     // The 2026-05-27 daily-universe lifecycle contracts added
     // `DEDUP_KEY_INSTRUMENT_LIFECYCLE` + `DEDUP_KEY_INSTRUMENT_LIFECYCLE_AUDIT`
     // (both segment-paired per I-P1-11), so the threshold rose from 2 to 4
-    // as anticipated. Current set touching `security_id`:
+    // as anticipated. Cluster-C (2026-07-14) rebuilt `DEDUP_KEY_PNL_AUDIT`
+    // (pnl_audit_persistence.rs — segment-paired per I-P1-11), raising the
+    // observed count further; the assert stays `>= 4`. Current set touching
+    // `security_id`:
     //   DEDUP_KEY_TICKS (tick_persistence.rs),
     //   DEDUP_KEY_CANDLES (shadow_persistence.rs),
     //   DEDUP_KEY_INSTRUMENT_LIFECYCLE (instrument_lifecycle_persistence.rs),
-    //   DEDUP_KEY_INSTRUMENT_LIFECYCLE_AUDIT (instrument_lifecycle_persistence.rs).
+    //   DEDUP_KEY_INSTRUMENT_LIFECYCLE_AUDIT (instrument_lifecycle_persistence.rs),
+    //   DEDUP_KEY_PNL_AUDIT (pnl_audit_persistence.rs).
+    //   (Plus the feed-scoreboard/coverage/rest-fetch/spot-1m families that
+    //   carry security_id — the scanner lists them all; every one is
+    //   segment-paired, enforced independently by the test above.)
     let decls = collect_dedup_key_declarations();
     let keys_with_security_id: Vec<&str> = decls
         .iter()
