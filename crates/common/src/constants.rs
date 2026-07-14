@@ -2311,28 +2311,12 @@ const _: () = assert!(
 /// For AWS instance lifecycle, use systemd timer or cron for restart.
 pub const APP_DAILY_RESET_TIME_IST: &str = "16:00:00";
 
-/// Wave-2-D (G19) — daily reset time for the `TickGapDetector`. Fires
-/// 5 minutes after market close so it cannot race the 15:30 close
-/// signal. The papaya `last_seen` map is cleared at this point so
-/// overnight silence does NOT register as a tick gap on next day's
-/// market open. Pinned constant; see
-/// `.claude/rules/project/disaster-recovery.md` Scenario 14
-/// (Overnight wake) for the operator-visible flow.
-pub const TICK_GAP_RESET_TIME_IST: &str = "15:35:00";
-
-/// Wave-2-D — short post-fire settle window for the daily tick-gap
-/// reset task. After firing `reset_daily()` at 15:35 IST, sleep this
-/// long before recomputing the next-fire delay so we cannot race the
-/// same boundary back into a near-zero sleep.
-pub const TICK_GAP_RESET_SETTLE_SECS: u64 = 60;
-
-/// Wave-2-D — bounded busy-loop avoidance for the daily tick-gap
-/// reset task. If the post-fire recomputed delay is still zero (e.g.
-/// the host clock is stuck), sleep this long before retrying so we
-/// don't burn CPU. One hour is short enough that the task self-heals
-/// within a single trading session if the clock recovers, and long
-/// enough that we don't spin on a stuck system.
-pub const TICK_GAP_RESET_BUSYLOOP_GUARD_SECS: u64 = 3600;
+// PR-C3 (2026-07-14): the Wave-2-D `TICK_GAP_RESET_*` constants (the
+// 15:35 IST daily-reset time + settle/busy-loop guards) were DELETED with
+// the tick-gap detector and its main.rs reset task (operator Q4-ii
+// 2026-07-13). The RISK-GAP-03 `TICK_GAP_ALERT/ERROR_THRESHOLD_SECS` +
+// `TICK_GAP_MIN_TICKS_BEFORE_ACTIVE` constants above are a DIFFERENT
+// component (`trading::risk::tick_gap_tracker`) and are KEPT.
 
 /// Number of 1-minute candles in the cross-verification window (09:15 to 15:29 = 375).
 ///

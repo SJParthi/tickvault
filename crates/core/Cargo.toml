@@ -93,9 +93,8 @@ harness = false
 name = "prev_close_writer"
 harness = false
 
-[[bench]]
-name = "tick_gap_detector"
-harness = false
+# [[bench]] tick_gap_detector removed in PR-C3 (2026-07-14) with the
+# deleted tick-gap detector module (operator Q4-ii 2026-07-13).
 
 [[bench]]
 name = "slo_score"

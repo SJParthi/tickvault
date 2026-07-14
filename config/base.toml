@@ -370,7 +370,8 @@ previous_close_persist = true
 ws_main_sleep_until_open = true
 ws_depth_ou_sleep_until_open = true
 fast_boot_60s_deadline = true
-tick_gap_detector_60s_coalesce = true
+# tick_gap_detector_60s_coalesce retired in PR-C3 (2026-07-14) with the
+# deleted tick-gap detector (operator Q4-ii 2026-07-13).
 audit_tables_enabled = true
 telegram_bucket_coalescer = true
 market_open_self_test = true
