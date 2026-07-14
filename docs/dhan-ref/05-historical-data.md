@@ -232,3 +232,32 @@ impl HistoricalDataResponse {
 9. **Expired Options Data** — A separate endpoint `POST /v2/charts/rollingoption` exists for fetching historical data of expired option contracts using ATM±strike syntax. See `docs/dhan-ref/05b-expired-options-data.md` if documented separately.
 
 10. **`interval` is a STRING** — despite looking numeric, the API expects `"1"` not `1`. The Python SDK accepts an integer but this may be auto-converted. Always serialize as string in Rust.
+
+---
+
+## 2026-07-14 Upstream Update (runner-crawled live pages)
+
+**Evidence tier: Verified-live.** Raw HTML of `https://dhanhq.co/docs/v2/historical-data/`
+(runs 1–3, sha256 `5ef184e4` content-identical, latest 2026-07-14T07:57:44Z) + the portal
+markdown exports `get-daily-historical.md` / `get-intraday-historical.md` (2026-07-14T07:59Z)
++ the portal OpenAPI yaml. `/v2/charts/historical` is itself now Verified-live (endpoint table
++ curl verbatim, incl. the `"expiryCode": 0, "oi": false` request sample); the daily toDate
+"(non-inclusive)" marking and the 90-day intraday cap re-confirmed verbatim. Full manifest:
+`00-COVERAGE-MANIFEST.md`.
+
+1. **Intraday interval set — a portal-only "30" drift:** classic page verbatim "1, 5, 15, 25
+   and 60 min"; OpenAPI yaml `enum [1, 5, 15, 25, 60]` (as integers!); the PORTAL intraday
+   export ALONE says "1, 5, 15, **30**, 60". Classic + yaml + repo agree on **25** — keep 25;
+   "30" is flagged as portal-only drift (live-probe only if it ever matters; no consumer
+   exists today).
+2. **Portal intraday date-format divergence:** the portal export documents bare `YYYY-MM-DD`
+   from/to for intraday, while the classic example uses datetimes ("2024-09-11 09:30:00").
+   The repo's datetime form matches the classic page + live-proven behavior — keep datetime.
+3. **Candle-availability latency: CONFIRMED UNDOCUMENTED on every surface** — the full
+   191-page crawl carries NOTHING about how quickly the just-closed minute becomes available
+   from `/charts/intraday`. The `spot_1m_rest` honest-envelope stance ("just-closed-minute
+   availability is UNDOCUMENTED — measure, don't assume";
+   `rest-1m-pipeline-error-codes.md` §1) is re-confirmed Verified-live.
+4. Upstream self-contradiction recorded: the intraday params table types `interval` as "enum
+   integer" while its own sample sends the string `"1"` — the repo/rule string reading
+   (note 10 above) stands.
