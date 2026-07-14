@@ -235,20 +235,12 @@ jobs:
       fail-fast: false
       matrix:
         crate: [common, storage, core, trading, api, app]
-        # Crates that define the `daily_universe_fetcher` feature must be
-        # tested WITH it enabled — otherwise the entire daily-universe
-        # subsystem (CSV downloader/parser/extractors + the warm-resubscribe
-        # snapshot) is #[cfg]-excluded and its --lib unit tests run vacuously
-        # (false-OK, charter Rule 11). These `include` entries merge a
-        # `features` arg into the matching crate job; crates without an entry
-        # get an empty `features` string.
-        include:
-          - crate: core
-            features: "--features daily_universe_fetcher"
-          - crate: storage
-            features: "--features daily_universe_fetcher"
-          - crate: app
-            features: "--features daily_universe_fetcher"
+        # PR-C3 (2026-07-14): the `daily_universe_fetcher` feature was
+        # DELETED with the Dhan instrument chain (operator Q3, 2026-07-13 —
+        # websocket-connection-scope-lock.md "2026-07-13 Amendment" §B); the
+        # formerly-gated storage persistence modules are now UN-GATED and
+        # always compiled, so the per-crate `include` feature entries are
+        # gone and every crate tests with default features.
     steps:
       - name: Checkout
         uses: actions/checkout@v7.0.0
@@ -558,10 +550,10 @@ jobs:
   #
   # WHY: the 15 crates/*/tests/dhat_*.rs targets previously ran in NO
   # complete CI lane. The feature-UNGATED ones ran inside Test (core/
-  # storage/trading), but the three `#![cfg(feature = "dhat")]`-gated core
-  # targets (dhat_prev_close_writer / dhat_telegram_dispatcher /
-  # dhat_tick_gap_detector) compiled to EMPTY binaries there (Test (core)
-  # enables only daily_universe_fetcher) and the Coverage & Perf job
+  # storage/trading), but the `#![cfg(feature = "dhat")]`-gated core
+  # targets (dhat_prev_close_writer / dhat_telegram_dispatcher / the
+  # PR-C3-deleted dhat_tick_gap_detector) compiled to EMPTY binaries there
+  # (Test (core) runs default features) and the Coverage & Perf job
   # explicitly `--skip dhat_` (DHAT-vs-llvm-cov incompatibility). Proven
   # rot: dhat_tick_gap_detector.rs failed to compile for ~2 weeks
   # (u32→u64 SecurityId-widening fallout, E0308 ×4) and nothing went red.
@@ -608,7 +600,6 @@ jobs:
           crates/core/tests/dhat_instrument_registry.rs
           crates/core/tests/dhat_prev_close_writer.rs
           crates/core/tests/dhat_telegram_dispatcher.rs
-          crates/core/tests/dhat_tick_gap_detector.rs
           crates/core/tests/dhat_token_handle.rs
           crates/core/tests/dhat_ws_reader_zero_alloc.rs
           crates/storage/tests/dhat_tick_flush_offload.rs
@@ -663,7 +654,6 @@ jobs:
             --test dhat_instrument_registry \
             --test dhat_prev_close_writer \
             --test dhat_telegram_dispatcher \
-            --test dhat_tick_gap_detector \
             --test dhat_token_handle \
             --test dhat_ws_reader_zero_alloc \
             2>&1 | tee /tmp/dhat-core.log
@@ -677,8 +667,10 @@ jobs:
           # CI while all 9 tests passed (first live run of this lane,
           # 2026-07-09, job 86196056113).
           ran=$(grep -c 'Running.*tests/dhat_' /tmp/dhat-core.log || true)
-          if [ "$ran" -ne 11 ]; then
-            echo "::error::core DHAT step executed $ran targets, expected 11 — a --test flag was dropped from this step (drift list vs run step mismatch)."
+          # PR-C3 (2026-07-14): 11 -> 10 — dhat_tick_gap_detector deleted
+          # with the tick-gap detector (operator Q4-ii 2026-07-13).
+          if [ "$ran" -ne 10 ]; then
+            echo "::error::core DHAT step executed $ran targets, expected 10 — a --test flag was dropped from this step (drift list vs run step mismatch)."
             exit 1
           fi
 

@@ -2597,26 +2597,16 @@ mod tests {
         );
     }
 
-    // ── F3: feature OFF — persist_groww_instruments is a compiled no-op ──
-
-    #[cfg(not(feature = "daily_universe_fetcher"))]
-    #[tokio::test]
-    async fn test_persist_is_noop_when_feature_off() {
-        // With `daily_universe_fetcher` OFF the shared master tables don't exist, so
-        // the stub must compile + return WITHOUT touching QuestDB. We call it with an
-        // empty set + a bogus questdb config; it must return cleanly (no connect, no
-        // panic). Proves the call site compiles identically regardless of feature.
-        use tickvault_common::config::QuestDbConfig;
-        let set = set_of(vec![]);
-        let questdb = QuestDbConfig {
-            host: "127.0.0.1".to_string(),
-            http_port: 9000,
-            pg_port: 8812,
-            ilp_port: 9009,
-        };
-        // Returns () without any network I/O — the stub body is empty.
-        persist_groww_instruments(&questdb, &set, "2026-06-28", false).await;
-    }
+    // ── F3 RETIRED in PR-C3 (2026-07-14): `test_persist_is_noop_when_feature_off`
+    // tested the cfg(not(feature = "daily_universe_fetcher")) NO-OP STUB of
+    // persist_groww_instruments. The feature and the stub were both deleted
+    // (the real fn now compiles unconditionally), so the test's cfg gate
+    // became permanently TRUE and it would have called the REAL persist —
+    // probing a live QuestDB at 127.0.0.1:9000 from a unit test (3×5s
+    // readiness waits + a coded GROWW-MASTER-01 error!, and real
+    // prior-snapshot reads on a dev box with local QuestDB). Deleted with
+    // the stub it tested; the real persist path is boot-exercised +
+    // covered by the pure-primitive tests around it. ──
 
     // ── FIX 13b (2026-07-04): readiness + bounded-retry primitives ──
 
