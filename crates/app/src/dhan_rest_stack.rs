@@ -45,12 +45,37 @@
 //!    scheduler and the per-minute `option_chain_1m` scheduler /
 //!    entitlement probe — mirroring `main.rs::spawn_post_market_tasks`
 //!    exactly (incl. the spot→chain sequencing watch channel and the
-//!    existing `[spot_1m_rest]` / `[option_chain_1m]` config gates).
+//!    existing `[spot_1m_rest]` / `[option_chain_1m]` config gates);
+//! 5. **(PR-C1, 2026-07-13 — operator ruling Q4-i "agreed dude")** the Dhan
+//!    ORDER-UPDATE WS, rewired from the retired lane into this stack —
+//!    FUNCTIONAL-DORMANT: connected + authenticated (MsgCode-42 JSON login),
+//!    receiving order events for any order placed via the retained REST
+//!    surface; it carries NO market data and is NOT a live price feed. Its
+//!    reconnect / post-close-sleep machinery (WS-GAP-04/10) is
+//!    self-contained; it runs as its own tokio task and can never block or
+//!    kill this stack's bring-up.
+//!    **Dormancy honesty (2026-07-13 hostile-review M1/M2):** while
+//!    functionally dormant, incoming order-update frames are parsed,
+//!    COUNTED (`tv_order_update_dormant_events_total` — a stack-held DRAIN
+//!    task consumes the broadcast; the positive "order activity observed
+//!    while dormant" signal) and DISCARDED — no WAL capture, no OMS
+//!    consumer; durable order-event capture returns with live trading (the
+//!    OMS wiring). Boot-staged order-update WAL segments remain UNDRAINED
+//!    on dhan-off boots (pre-existing Phase A residual — C2 settles the
+//!    replay topology).
+//!    **Paging honesty (2026-07-13 hostile-review L2):** there is NO
+//!    CloudWatch dead-socket alarm for this stack's order-update WS —
+//!    `tv_order_update_ws_active` is written ONLY by the (dead) lane spawn
+//!    sites, so the `tv-<env>-order-update-ws-inactive` alarm is
+//!    missing-data-silent both ways on a dhan-off boot; the WS-GAP-10
+//!    in-loop outage page (notifier wired) is the SOLE pager. Re-homing
+//!    the gauge into the connection loop is a C2 target.
 //!
 //! **Deliberately NOT spawned (stay lane-only; deletion is a later phase):**
 //! the WS pool, universe build / CSV download, prev-day OHLCV, the SLO
-//! publisher, the 15:31 cross-verify, the EOD digest, the orphan-position
-//! watchdog, and the order-update WS.
+//! publisher, the 15:31 cross-verify, the EOD digest, and the
+//! orphan-position watchdog. (The order-update WS moved OFF this list in
+//! PR-C1 per Q4-i — see item 5 above.)
 //!
 //! **Mutual exclusion by construction:** this stack is spawned ONLY from the
 //! Dhan-OFF branch of main.rs (the `else` of `if config.feeds.dhan_enabled`)
@@ -625,6 +650,118 @@ async fn run_dhan_rest_stack(params: DhanRestStackParams) {
     let token_handle = token_manager.token_handle();
     let config = &params.config;
 
+    // -----------------------------------------------------------------------
+    // Phase 5a (PR-C1, 2026-07-13 — operator ruling Q4-i "agreed dude"): the
+    // Dhan ORDER-UPDATE WS, rewired from the retired lane into this stack —
+    // FUNCTIONAL-DORMANT (module docs item 5). Placed AFTER the family claim
+    // above so a broken lane/stack mutual-exclusion invariant can never
+    // produce a SECOND order-update WS (the lane spawns its own). After the
+    // Phase C2 deletion of the legacy fast-arm + lane spawn sites, THIS is
+    // the SOLE `run_order_update_connection` call site.
+    //
+    // Parameter honesty:
+    //   - `order_sender`: a STACK-LOCAL broadcast channel (capacity mirrors
+    //     the legacy 256); a stack-held DRAIN task consumes every event —
+    //     counted (`tv_order_update_dormant_events_total`, static label) and
+    //     DISCARDED: no WAL capture, no OMS consumer until live trading
+    //     returns (the OMS wiring restores durable order-event capture).
+    //     Holding a live receiver keeps the connection's dropped-receiver
+    //     error arm (`tv_order_update_broadcast_drops_total`) dormant BY
+    //     CONSTRUCTION — that arm again means what it says (a crashed
+    //     subscriber), never "the stack is dormant by design"
+    //     (2026-07-13 hostile-review M1: the WS receives ALL account order
+    //     events incl. the operator's manual Dhan-app orders, so a dropped
+    //     receiver produced a per-event false "subscriber crashed" ERROR
+    //     stream on any manual-order day).
+    //   - `wal_spill = None` (Verified 2026-07-13): the order-update WAL
+    //     replay staging is a `main()` STAGE-C boot concern — main.rs stages
+    //     residual frames at boot, and BOTH drain sites (fast arm + lane)
+    //     are Dhan-gated and dead on a dhan-off boot, so this stack neither
+    //     drains nor appends that WAL. The dormant phase places no orders,
+    //     so there is no order-event stream to durably capture; lifecycle
+    //     rows still land in `ws_event_audit` via the consumer below.
+    //   - `dhan_feed_flag = None`: always-on within this stack — the stack
+    //     exists only when the raw boot TOML retires the lane, and the
+    //     /api/feeds handler 409-refuses a runtime Dhan enable.
+    // -----------------------------------------------------------------------
+    {
+        let (order_update_sender, mut order_update_receiver) =
+            tokio::sync::broadcast::channel::<tickvault_common::order_types::OrderUpdate>(256);
+        // Dormant DRAIN task (2026-07-13 hostile-review M1): the receiver is
+        // HELD and drained — never dropped. Events are parsed upstream,
+        // counted here, and DISCARDED (module docs item 5 dormancy honesty);
+        // `Lagged` is impossible in practice at this event rate but is
+        // skipped defensively; `Closed` (sender gone = connection task dead)
+        // ends the drain — the WS-GAP-10 unreachable-exit error at the spawn
+        // below is the loud signal for that case.
+        tokio::spawn(async move {
+            loop {
+                match order_update_receiver.recv().await {
+                    Ok(_event) => {
+                        metrics::counter!("tv_order_update_dormant_events_total").increment(1);
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
+        let ou_url = config.dhan.order_update_websocket_url.clone();
+        let ou_client_id = client_id.clone();
+        let ou_token = Arc::clone(&token_handle);
+        let ou_calendar = Arc::clone(&params.calendar);
+        // OrderUpdateAuthenticated Telegram once Dhan accepts the token
+        // (the fast-arm listener mirror; this stack is process-lifetime, so
+        // a plain spawn is correct — no lane teardown can orphan it).
+        let auth_signal = Arc::new(tokio::sync::Notify::new());
+        let auth_latch = Arc::new(AtomicBool::new(false));
+        {
+            let listener_signal = Arc::clone(&auth_signal);
+            let listener_notifier = params.notifier.clone();
+            tokio::spawn(async move {
+                listener_signal.notified().await;
+                listener_notifier.notify(NotificationEvent::OrderUpdateAuthenticated);
+            });
+        }
+        let run_signal = Some(Arc::clone(&auth_signal));
+        let run_latch = Some(Arc::clone(&auth_latch));
+        let ou_reconnect_notifier = Some(params.notifier.clone());
+        // Order-update lifecycle events → ws_event_audit (its own consumer,
+        // the SAME relocated helper the main.rs spawn sites use).
+        let ou_ws_audit_tx = Some(crate::ws_audit_consumer::spawn_ws_event_audit_consumer(
+            config.questdb.clone(),
+        ));
+        let _order_update_handle = tokio::spawn(async move {
+            tickvault_core::websocket::order_update_connection::run_order_update_connection(
+                ou_url,
+                ou_client_id,
+                ou_token,
+                order_update_sender,
+                ou_calendar,
+                None,
+                run_signal,
+                run_latch,
+                ou_reconnect_notifier,
+                ou_ws_audit_tx,
+                None,
+            )
+            .await;
+            // Defensive only (the lane-site mirror): run_order_update_connection
+            // is an infinite never-give-up loop (WS-GAP-04) and structurally
+            // cannot return. If this line ever executes, a future refactor
+            // broke the loop contract — surface it loudly, never silently.
+            error!(
+                code = ErrorCode::WsGap10OrderUpdateOutage.code_str(),
+                reason = "task_exited_unreachable",
+                "order update WebSocket task exited — unreachable by design; investigate immediately"
+            );
+        });
+        info!(
+            "Dhan REST-only stack: order-update WS spawned (functional-dormant, Q4-i — \
+             connects at market open via the off-hours gate; incoming order events are \
+             drained + counted, NOT persisted, until live trading returns)"
+        );
+    }
+
     // REST-health canary (DHAN-REST-400): 09:05 / 12:00 / 15:25 IST probes.
     {
         let canary_token = Arc::clone(&token_handle);
@@ -668,6 +805,10 @@ async fn run_dhan_rest_stack(params: DhanRestStackParams) {
                 questdb: config.questdb.clone(),
                 rest_api_base_url: config.dhan.rest_api_base_url.clone(),
                 minute_done_tx: spot_minute_done_tx,
+                diagnostics_enabled: config.spot_1m_rest.diagnostics,
+                diagnostics_second_probe_secs_of_day_ist: config
+                    .spot_1m_rest
+                    .diagnostics_second_probe_secs_of_day_ist,
             },
         );
         info!(
@@ -730,7 +871,8 @@ async fn run_dhan_rest_stack(params: DhanRestStackParams) {
         option_chain_1m_enabled = config.option_chain_1m.enabled,
         option_chain_1m_probe = config.option_chain_1m.probe_and_report,
         "DHAN REST-ONLY STACK UP — lock + token + renewal + mid-session watchdog + REST \
-         canary + spot_1m_rest + option_chain_1m arms spawned WITHOUT the WS lane \
+         canary + spot_1m_rest + option_chain_1m arms + the functional-dormant \
+         order-update WS (Q4-i, PR-C1) spawned WITHOUT the market-data WS lane \
          (operator directive 2026-07-13)"
     );
 }
@@ -974,6 +1116,59 @@ mod tests {
         assert!(dhan_rest_lock_park_due(u64::MAX), "saturated domain end");
     }
 
+    /// PR-C1 (2026-07-13, operator ruling Q4-i): the stack spawns the Dhan
+    /// order-update WS functional-dormant — production-region source pins
+    /// (the house production-region split so these assertion literals can
+    /// never satisfy themselves), plus the family-claim ordering invariant:
+    /// the spawn must sit AFTER the `claim_post_market_task_family_once()`
+    /// call so a broken lane/stack mutual-exclusion invariant can never
+    /// produce a SECOND order-update WS.
+    #[test]
+    fn test_rest_stack_spawns_order_update_ws_functional_dormant() {
+        let own_src = include_str!("dhan_rest_stack.rs");
+        let (prod, _) = own_src
+            .split_once("#[cfg(test)]")
+            .expect("dhan_rest_stack.rs must keep its test module marker");
+        for needle in [
+            // The rewired spawn itself (Q4-i).
+            "run_order_update_connection(",
+            // Stack-local broadcast channel (no OMS consumer — dormant).
+            "broadcast::channel::<tickvault_common::order_types::OrderUpdate>",
+            // 2026-07-13 hostile-review M1: the receiver is HELD + drained —
+            // dropping it makes the connection's send arm spam a per-event
+            // false "subscriber crashed" ERROR on every manual account order.
+            "order_update_receiver.recv()",
+            // The dormant-activity counter is the CODE line, not the comment
+            // (full macro invocation so a comment mention can never satisfy).
+            "metrics::counter!(\"tv_order_update_dormant_events_total\")",
+            // Lifecycle rows keep flowing to ws_event_audit.
+            "ws_audit_consumer::spawn_ws_event_audit_consumer(",
+            // Operator visibility: the authenticated Telegram listener.
+            "NotificationEvent::OrderUpdateAuthenticated",
+        ] {
+            assert!(
+                prod.contains(needle),
+                "dhan_rest_stack.rs production region lost `{needle}` — the Q4-i \
+                 order-update rewire regressed (the WS must be spawned from this \
+                 stack, functional-dormant)"
+            );
+        }
+        // Ordering: the family-claim CALL (the lane/stack exclusion tripwire)
+        // precedes the order-update spawn.
+        let claim_call = prod
+            .find("if !claim_post_market_task_family_once()")
+            .expect("family-claim call present"); // APPROVED: test
+        let ou_spawn = prod
+            .find("run_order_update_connection(")
+            .expect("order-update spawn present (asserted above)"); // APPROVED: test
+        assert!(
+            claim_call < ou_spawn,
+            "the order-update spawn @{ou_spawn} must sit AFTER the family-claim \
+             call @{claim_call} — spawning before the claim would double the \
+             order-update WS when the lane/stack invariant breaks"
+        );
+    }
+
     /// Source-scan pin of the #1499-mirrored spot→chain contract
     /// (2026-07-13 sequencing merge): PR #1499 rewrote the spot-1m fetch
     /// internals (day-window + backfill + the 15:31 post-session sweep)
@@ -993,6 +1188,7 @@ mod tests {
             "run_post_session_sweep(",
             "pub minute_done_tx",
             "send_replace",
+            // TEST-EXEMPT: string-literal ratchet needle (not a fn declaration) — pub-fn-test-guard grep false positive
             "pub fn spawn_supervised_spot_1m_rest",
         ] {
             assert!(

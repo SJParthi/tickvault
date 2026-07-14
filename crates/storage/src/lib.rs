@@ -111,6 +111,10 @@ pub mod feed_scoreboard_persistence;
 /// Groww auto-scale ladder forensic chain (§34, auto-scale PR-2 Item 8) —
 /// one row per ladder transition; feeds restart rehydration.
 pub mod groww_scale_audit_persistence;
+/// Daily timeframe-consistency verifier (operator 2026-07-13): one row per
+/// finding cell where a stored higher-TF candle disagrees with its
+/// recomputed-from-1m value (TF-VERIFY-01/02).
+pub mod tf_consistency_audit_persistence;
 pub mod tick_conservation_audit_persistence;
 pub mod ws_event_audit_persistence;
 // PR-E (2026-05-26): `candle_persistence` module deleted alongside the
@@ -180,6 +184,12 @@ pub mod lifecycle_reconciler;
 // `movers_*` matviews + `movers_1s` base table are no longer recreated
 // either (the old `drop_bug3_retired_views` lived in this module).
 pub mod partition_manager;
+// 2026-07-13 disk-pressure remediation: partition archive→verify→drop —
+// the S3-archival leg partition_manager's honest boundary documented as
+// missing. Fail-closed: a partition is dropped ONLY after its S3 copy is
+// row-count- and size-verified; gated on [partition_retention]
+// archive_enabled (serde default false).
+pub mod partition_archive;
 pub mod prev_day_ohlcv_persistence;
 pub mod questdb_health;
 pub mod seal_absorption;
@@ -202,6 +212,11 @@ pub mod spot_1m_rest_persistence;
 // the OPTION-CHAIN half; CHAIN-03): the `option_chain_1m` table DDL +
 // ILP-over-HTTP writer.
 pub mod option_chain_1m_persistence;
+// Per-contract 1m candle leg of the Groww per-minute REST pipeline
+// (operator grant 2026-07-13, PR-4 — the fill-model leg): the
+// `option_contract_1m_rest` table DDL + ILP-over-HTTP writer (feed in the
+// DEDUP key; retention registered in partition_manager.rs).
+pub mod option_contract_1m_rest_persistence;
 // Per-fetch forensics for the per-minute REST legs (operator scope addition
 // 2026-07-13, Groww REST plan PR-2): the `rest_fetch_audit` table DDL +
 // ILP-over-HTTP writer — one row per (target minute, symbol, feed, leg).
