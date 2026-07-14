@@ -8,23 +8,50 @@
 //!
 //! 1. The gate defaults DISARMED in the constructor.
 //! 2. The only arm path is `#[cfg(test)]`-scoped (not compiled in prod) —
-//!    assignment (`= true`) AND struct-literal (`: true`) syntaxes both.
+//!    enforced by a TOTAL census of EVERY `alerts_gate_armed` identifier
+//!    site in the file (round-2 hardening): exactly ONE assignment (any
+//!    RHS shape — literal, variable, or parameter — is counted; only the
+//!    literal-`true` write inside the ATTACHED-`#[cfg(test)]` arm fn is
+//!    allowed), exactly TWO colon sites (the `: bool` field decl + the
+//!    `: false` constructor init — a `new_armed(.., armed)` parameterized
+//!    init is counted and refused), zero compound assignments
+//!    (`|=`/`&=`/`^=`), zero `&mut` borrows of the field.
 //! 3. Every `/alerts` URL-building sender checks the gate BEFORE any
-//!    URL/socket work. The URL census is GENERAL: any `/alerts` text in
-//!    comment-stripped production code (inline positional, captured-
-//!    identifier, and bare-literal format shapes alike) plus any
-//!    `DHAN_ALERTS_`-prefixed constant use — so a new sender built from a
-//!    NEW constant or a split-argument literal still trips the equality.
-//! 4. NO production code calls any of the 6 sender fns (dormancy ratchet —
-//!    the activation PR edits THIS test alongside the operator quote).
+//!    URL/socket work. BOTH sides of the census count the SAME
+//!    comment-stripped production text (a commented-out gate call can
+//!    never balance the equality), the URL census is GENERAL (any
+//!    `/alerts` string shape + any `DHAN_ALERTS_`-prefixed constant use),
+//!    and the SENDER SET IS DERIVED from the code (every `pub async fn`
+//!    whose body touches `/alerts` text or a `DHAN_ALERTS_*` constant)
+//!    and pinned equal to `ALERTS_SENDER_FNS` — a NEW 7th sender cannot
+//!    ship without editing this test and thereby entering the
+//!    gate-before-HTTP ordering scan.
+//! 4. NO production code calls any of the 6 sender fns (dormancy ratchet)
+//!    — api_client.rs' OWN production region INCLUDED (round-2: its
+//!    test-module call sites are excluded by the region split, never by a
+//!    whole-file skip). The activation PR edits THIS test alongside the
+//!    operator quote.
 //! 5. The order-leg segment enums stay equities-only fail-closed.
-//! 6. The `/alerts` paths have a single choke point (no rogue sender files).
-//! 7. The scanner itself detects planted violations (vacuous-pass defense —
-//!    the 2026-07-06 lesson).
+//! 6. The `/alerts` paths have a single choke point (no rogue sender
+//!    files). Within the allowlist: constants.rs is under a
+//!    `DHAN_ALERTS_`-naming ratchet (every code line carrying `/alerts`
+//!    must be a DHAN_ALERTS_*-prefixed constant, so a rogue-named
+//!    constant cannot dodge test 3's census), and types.rs /
+//!    conditional.rs may mention the paths in DOC COMMENTS ONLY.
+//! 7. The scanner itself detects planted violations (vacuous-pass defense
+//!    — the 2026-07-06 lesson).
 //!
 //! Pattern: `sandbox_enforcement_guard.rs` (source scanning, not runtime
 //! probing — the gate's arm path is `#[cfg(test)]`-scoped, so text is the
 //! honest evidence surface).
+//!
+//! HONEST ENVELOPE: these are text ratchets. They pin every regression
+//! shape surfaced by the round-1/round-2 adversarial reviews (literal and
+//! non-literal arms, parameterized constructors, compound assignments,
+//! `&mut` borrows, new senders, new constants, comment-inflated counts);
+//! they do NOT claim to stop deliberate obfuscation outside those shapes
+//! (byte-assembled strings, `unsafe` pointer writes) — such code fails
+//! human review + the operator-quote protocol, not this file.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -152,6 +179,159 @@ fn enum_body<'a>(source: &'a str, enum_name: &str) -> &'a str {
     &source[body_start..body_start + body_len]
 }
 
+/// The gate field identifier — the census subject of test 2.
+const GATE_FIELD_IDENT: &str = "alerts_gate_armed";
+
+/// How a `alerts_gate_armed` identifier site uses the field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GateSiteKind {
+    /// `alerts_gate_armed = <rhs>` / `|=` / `&=` / `^=` — a WRITE.
+    Assignment,
+    /// `alerts_gate_armed: <rhs>` — field declaration or struct-literal init.
+    FieldColon,
+    /// `&mut …alerts_gate_armed` — a mutable borrow (mutation vector, e.g.
+    /// `mem::replace(&mut self.alerts_gate_armed, true)`).
+    MutBorrow,
+    /// Everything else (`if self.alerts_gate_armed {`, `== other`, asserts).
+    Read,
+}
+
+/// One classified occurrence of [`GATE_FIELD_IDENT`].
+struct GateSite {
+    /// Byte index of the identifier in the scanned source.
+    index: usize,
+    /// Usage class.
+    kind: GateSiteKind,
+    /// First identifier-ish token of the RHS (`true`, `false`, `bool`,
+    /// `on`, `armed`, `self`, …). Empty for reads/borrows.
+    rhs: String,
+}
+
+/// First identifier-like token of `text` (post-whitespace).
+fn first_rhs_token(text: &str) -> String {
+    text.trim_start()
+        .chars()
+        .take_while(|character| character.is_ascii_alphanumeric() || *character == '_')
+        .collect()
+}
+
+/// True when the identifier at `index` is reached through a `&mut ` borrow
+/// (only path segments / whitespace between the `&mut` and the field).
+fn preceded_by_mut_borrow(source: &str, index: usize) -> bool {
+    let mut window_start = index.saturating_sub(48);
+    while !source.is_char_boundary(window_start) {
+        window_start += 1;
+    }
+    let window = &source[window_start..index];
+    match window.rfind("&mut ") {
+        Some(position) => window[position + "&mut ".len()..].chars().all(|character| {
+            character.is_ascii_alphanumeric()
+                || character == '_'
+                || character == '.'
+                || character.is_whitespace()
+        }),
+        None => false,
+    }
+}
+
+/// TOTAL census of every `alerts_gate_armed` identifier site in `source`
+/// (identifier-boundary checked, so `alerts_gate_armed_x` never counts).
+/// Classification is by the token FOLLOWING the identifier, so a
+/// non-literal write (`= on`, `: armed`, `|= flag`) is counted exactly like
+/// a literal one — the round-2 hardening the literal-`true` needles lacked.
+fn classify_gate_sites(source: &str) -> Vec<GateSite> {
+    let bytes = source.as_bytes();
+    let mut sites = Vec::new();
+    for (index, _) in source.match_indices(GATE_FIELD_IDENT) {
+        let boundary_before = index == 0 || {
+            let before = bytes[index - 1] as char;
+            !(before.is_ascii_alphanumeric() || before == '_')
+        };
+        let after = index + GATE_FIELD_IDENT.len();
+        let boundary_after = after >= bytes.len() || {
+            let following = bytes[after] as char;
+            !(following.is_ascii_alphanumeric() || following == '_')
+        };
+        if !boundary_before || !boundary_after {
+            continue;
+        }
+        if preceded_by_mut_borrow(source, index) {
+            sites.push(GateSite {
+                index,
+                kind: GateSiteKind::MutBorrow,
+                rhs: String::new(),
+            });
+            continue;
+        }
+        let rest = source[after..].trim_start();
+        let (kind, rhs_text) = if rest.starts_with("==") || rest.starts_with("::") {
+            (GateSiteKind::Read, "")
+        } else if let Some(tail) = ["|=", "&=", "^="]
+            .iter()
+            .find_map(|operator| rest.strip_prefix(operator))
+        {
+            (GateSiteKind::Assignment, tail)
+        } else if let Some(tail) = rest.strip_prefix('=') {
+            if tail.starts_with('>') {
+                // `=>` match arm — a read position.
+                (GateSiteKind::Read, "")
+            } else {
+                (GateSiteKind::Assignment, tail)
+            }
+        } else if let Some(tail) = rest.strip_prefix(':') {
+            (GateSiteKind::FieldColon, tail)
+        } else {
+            (GateSiteKind::Read, "")
+        };
+        sites.push(GateSite {
+            index,
+            kind,
+            rhs: first_rhs_token(rhs_text),
+        });
+    }
+    sites
+}
+
+/// Derives the alerts-sender fn set from `code` (comment-stripped
+/// production text): every `pub async fn` whose body region touches
+/// `/alerts` text or a `DHAN_ALERTS_`-prefixed constant. Returns sorted,
+/// deduped names — pinned against [`ALERTS_SENDER_FNS`] so a NEW sender
+/// cannot ship without editing this test.
+fn derive_alerts_sender_fns(code: &str) -> Vec<String> {
+    const DECL: &str = "pub async fn ";
+    let mut names: Vec<String> = Vec::new();
+    let mut search_from = 0;
+    while let Some(position) = code[search_from..].find(DECL) {
+        let name_start = search_from + position + DECL.len();
+        let name: String = code[name_start..]
+            .chars()
+            .take_while(|character| character.is_ascii_alphanumeric() || *character == '_')
+            .collect();
+        search_from = name_start;
+        if name.is_empty() {
+            continue;
+        }
+        let region = sender_fn_region(code, &name);
+        if region.contains("/alerts") || region.contains("DHAN_ALERTS_") {
+            names.push(name);
+        }
+    }
+    names.sort_unstable();
+    names.dedup();
+    names
+}
+
+/// Lines of (comment-stripped) `code` that mention `/alerts` WITHOUT being
+/// a `DHAN_ALERTS_`-prefixed constant — the constants.rs naming ratchet
+/// (a rogue-named constant carrying the path would be invisible to the
+/// api_client.rs census, which counts `DHAN_ALERTS_` by prefix).
+fn alerts_naming_violations(code: &str) -> Vec<String> {
+    code.lines()
+        .filter(|line| line.contains("/alerts") && !line.contains("DHAN_ALERTS_"))
+        .map(|line| line.trim().to_string())
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // 1. Gate defaults DISARMED in the constructor
 // ---------------------------------------------------------------------------
@@ -185,51 +365,108 @@ fn test_alerts_gate_arm_is_cfg_test_only() {
         .find("fn arm_alerts_gate_for_test")
         .expect("arm_alerts_gate_for_test must exist (the test-only arm path)");
 
-    // The declaration must be preceded by #[cfg(test)] within a bounded
-    // window (doc comment + attribute lines).
-    let window_start = arm_decl.saturating_sub(400);
-    let preceding_window = &source[window_start..arm_decl];
+    // The #[cfg(test)] attribute must be ATTACHED to the arm fn: walk the
+    // lines immediately above the declaration line — only attribute/comment
+    // lines may intervene, and one of them must be exactly `#[cfg(test)]`
+    // (a stray attribute elsewhere in a 400-char window is NOT accepted —
+    // the round-2 hardening of the proximity check).
+    let decl_line_start = source[..arm_decl]
+        .rfind('\n')
+        .map_or(0, |position| position + 1);
+    let mut attached_cfg_test = false;
+    let mut cursor = decl_line_start;
+    while cursor > 0 {
+        let previous_line_start = source[..cursor - 1]
+            .rfind('\n')
+            .map_or(0, |position| position + 1);
+        let line = source[previous_line_start..cursor].trim();
+        if line == "#[cfg(test)]" {
+            attached_cfg_test = true;
+            break;
+        }
+        if line.starts_with("#[") || line.starts_with("//") {
+            cursor = previous_line_start;
+            continue;
+        }
+        break;
+    }
     assert!(
-        preceding_window.contains("#[cfg(test)]"),
-        "arm_alerts_gate_for_test must be #[cfg(test)]-scoped — a production \
-         arm path for the /alerts gate is FORBIDDEN without a dated operator quote."
+        attached_cfg_test,
+        "arm_alerts_gate_for_test must carry an ATTACHED #[cfg(test)] \
+         attribute (only attribute/comment lines may sit between it and the \
+         declaration) — a production arm path for the /alerts gate is \
+         FORBIDDEN without a dated operator quote."
     );
 
-    // `alerts_gate_armed = true` may appear ONLY inside that fn (never a
-    // second arm site).
-    let assignments: Vec<usize> = source
-        .match_indices("alerts_gate_armed = true")
-        .map(|(index, _)| index)
+    // TOTAL identifier census (whole file, test module included — the arm
+    // fn is the ONLY write allowed anywhere). Classification is by the
+    // token AFTER the identifier, so a non-literal write (`= on`,
+    // `: armed`, `|= flag`, `&mut …`) is counted exactly like a literal
+    // one — the round-1 literal-`true` needles missed those shapes.
+    let sites = classify_gate_sites(&source);
+    assert!(
+        !sites.is_empty(),
+        "the census must see the alerts_gate_armed field (rename requires \
+         updating this guard in the same PR)"
+    );
+
+    let assignments: Vec<&GateSite> = sites
+        .iter()
+        .filter(|site| site.kind == GateSiteKind::Assignment)
         .collect();
     assert_eq!(
         assignments.len(),
         1,
-        "exactly ONE `alerts_gate_armed = true` assignment may exist (inside \
-         arm_alerts_gate_for_test); found {}",
+        "exactly ONE `alerts_gate_armed = …` assignment (ANY right-hand \
+         side — literal, variable, parameter, or compound `|=`/`&=`/`^=`) \
+         may exist in the whole file; a production setter like \
+         `set_alerts_gate(on)` is a forbidden arm path requiring a dated \
+         operator quote + a .claude/rules/dhan/conditional-trigger.md edit \
+         FIRST. Found {}",
         assignments.len()
     );
-    let assignment = assignments[0];
+    assert_eq!(
+        assignments[0].rhs, "true",
+        "the single assignment must be the literal `= true` inside \
+         arm_alerts_gate_for_test — found RHS token `{}`",
+        assignments[0].rhs
+    );
     assert!(
-        assignment > arm_decl && assignment < arm_decl + 400,
+        assignments[0].index > arm_decl && assignments[0].index < arm_decl + 400,
         "the single `alerts_gate_armed = true` assignment must live inside \
          arm_alerts_gate_for_test's body"
     );
 
-    // A STRUCT-LITERAL arm (`alerts_gate_armed: true` field init, e.g. a
-    // `new_armed(..)` constructor) is equally forbidden — zero occurrences
-    // anywhere in the file, test module included (tests arm via
-    // arm_alerts_gate_for_test, never a field init). Both fmt'd and
-    // unspaced spellings are scanned.
-    for field_init in ["alerts_gate_armed: true", "alerts_gate_armed:true"] {
-        assert_eq!(
-            count_occurrences(&source, field_init),
-            0,
-            "`{field_init}` field-init arming is FORBIDDEN — the ONLY field \
-             init is `alerts_gate_armed: false` in OrderApiClient::new; a \
-             production arm path requires a dated operator quote + a \
-             .claude/rules/dhan/conditional-trigger.md edit FIRST"
-        );
-    }
+    // Colon sites: exactly the `: bool` field DECLARATION and the `: false`
+    // constructor init. ANY other field-init — `: true`, `:true`, OR a
+    // parameterized `alerts_gate_armed: armed` (`new_armed(.., armed)`
+    // constructor) — is a forbidden arm path.
+    let mut colon_rhs: Vec<&str> = sites
+        .iter()
+        .filter(|site| site.kind == GateSiteKind::FieldColon)
+        .map(|site| site.rhs.as_str())
+        .collect();
+    colon_rhs.sort_unstable();
+    assert_eq!(
+        colon_rhs,
+        ["bool", "false"],
+        "exactly TWO `alerts_gate_armed:` sites may exist — the `: bool` \
+         field declaration and the `: false` init in OrderApiClient::new. \
+         Any other field init (literal OR variable RHS) is a production \
+         arm path requiring a dated operator quote + a \
+         .claude/rules/dhan/conditional-trigger.md edit FIRST"
+    );
+
+    // No mutable borrow of the field anywhere (`mem::replace`,
+    // `&mut client.alerts_gate_armed`, …).
+    assert!(
+        sites
+            .iter()
+            .all(|site| site.kind != GateSiteKind::MutBorrow),
+        "no `&mut …alerts_gate_armed` borrow may exist — a mutable borrow \
+         is an arm vector (e.g. mem::replace) requiring a dated operator \
+         quote FIRST"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -242,11 +479,19 @@ fn test_every_alerts_sender_checks_gate_first() {
         .expect("api_client.rs must be readable for the alerts-gate guard");
     let production = production_region(&source);
 
-    let gate_calls = count_occurrences(production, "self.require_alerts_gate(");
-    assert!(
-        gate_calls >= 6,
-        "all SIX /alerts senders must call self.require_alerts_gate( FIRST; \
-         found only {gate_calls} call sites"
+    // BOTH census sides count the SAME comment-stripped text (round-2: a
+    // full-line comment containing `self.require_alerts_gate(` must never
+    // inflate the gate side and balance a genuinely ungated URL site).
+    let code = strip_full_line_comments(production);
+
+    let gate_calls = count_occurrences(&code, "self.require_alerts_gate(");
+    assert_eq!(
+        gate_calls,
+        ALERTS_SENDER_FNS.len(),
+        "exactly {} require_alerts_gate call sites must exist (one per \
+         sender) — a NEW sender must be added to ALERTS_SENDER_FNS in this \
+         test alongside a dated operator quote; found {gate_calls}",
+        ALERTS_SENDER_FNS.len()
     );
 
     // URL-building census — GENERAL, not needle-per-shape: after stripping
@@ -257,7 +502,6 @@ fn test_every_alerts_sender_checks_gate_first() {
     // constant like DHAN_ALERTS_ORDERS_PATH is counted, not just the one
     // known name). The gate's own refusal message is the single allowed
     // non-URL `/alerts` mention and is excluded by its exact prefix.
-    let code = strip_full_line_comments(production);
     let gate_refusal_mentions = count_occurrences(&code, "alerts gate DISARMED: /alerts");
     assert_eq!(
         gate_refusal_mentions, 1,
@@ -276,12 +520,31 @@ fn test_every_alerts_sender_checks_gate_first() {
          constant)"
     );
 
-    // ORDERING: in every sender fn body the gate check must precede the
-    // FIRST URL/socket token — `require_alerts_gate` doc contract "Checked
-    // BEFORE any URL/socket work". A gate call after `.send().await` would
-    // otherwise satisfy the count equality.
-    for fn_name in ALERTS_SENDER_FNS {
-        let region = sender_fn_region(production, fn_name);
+    // The sender set is DERIVED from the code, never assumed (round-2): a
+    // NEW `pub async fn` touching `/alerts` text or a DHAN_ALERTS_*
+    // constant — even one that balances the count equality with its own
+    // late gate call — fails this set comparison until it is added to
+    // ALERTS_SENDER_FNS, which puts it under the ordering scan below.
+    let derived_senders = derive_alerts_sender_fns(&code);
+    let mut expected_senders: Vec<String> = ALERTS_SENDER_FNS
+        .iter()
+        .map(|name| (*name).to_string())
+        .collect();
+    expected_senders.sort_unstable();
+    assert_eq!(
+        derived_senders, expected_senders,
+        "the DERIVED /alerts sender set must equal ALERTS_SENDER_FNS — a \
+         new/renamed sender requires editing this test alongside a dated \
+         operator quote (and thereby enters the gate-before-HTTP ordering \
+         scan)"
+    );
+
+    // ORDERING: in every DERIVED sender fn body (comment-stripped) the gate
+    // check must precede the FIRST URL/socket token — `require_alerts_gate`
+    // doc contract "Checked BEFORE any URL/socket work". A gate call after
+    // `.send().await` would otherwise satisfy the count equality.
+    for fn_name in &derived_senders {
+        let region = sender_fn_region(&code, fn_name);
         let gate = region
             .find("self.require_alerts_gate(")
             .unwrap_or_else(|| panic!("{fn_name} must call require_alerts_gate"));
@@ -325,11 +588,11 @@ fn test_no_production_caller_of_alerts_sender_fns() {
     let mut violations = Vec::new();
     for file in files {
         let path_text = file.to_string_lossy().replace('\\', "/");
-        // The declaring file is the single gated choke point (its own senders
-        // are the definitions, and its call sites are #[cfg(test)]-scoped).
-        if path_text.ends_with("trading/src/oms/api_client.rs") {
-            continue;
-        }
+        // api_client.rs is deliberately NOT skipped (round-2 hardening):
+        // its sender DECLARATIONS never match the `.name(` call token, and
+        // its test-module call sites are excluded by the production-region
+        // split — so an in-file production wrapper (`autofire()` calling
+        // `self.place_multi_order(..)`) is caught like any other caller.
         let Ok(source) = fs::read_to_string(&file) else {
             continue;
         };
@@ -435,6 +698,45 @@ fn test_alerts_paths_single_choke_point() {
          mention alerts/orders or alerts/multi. Violations:\n{}",
         violations.join("\n")
     );
+
+    // Round-2 hardening: the allowlisted files carry TIGHTENED contracts,
+    // so an allowlisted file cannot smuggle a path literal past test 3's
+    // api_client.rs census.
+    //
+    // (a) constants.rs naming ratchet: every CODE line mentioning `/alerts`
+    //     must be a DHAN_ALERTS_*-prefixed constant — the api_client census
+    //     counts alerts constants by the `DHAN_ALERTS_` prefix, so a
+    //     rogue-named `DHAN_COND_ORDERS = "/alerts/orders"` constant would
+    //     otherwise be invisible to it.
+    let constants_source = fs::read_to_string("../common/src/constants.rs")
+        .expect("constants.rs must be readable for the alerts naming ratchet");
+    let constants_code = strip_full_line_comments(production_region(&constants_source));
+    let naming_violations = alerts_naming_violations(&constants_code);
+    assert!(
+        naming_violations.is_empty(),
+        "every constants.rs code line carrying `/alerts` must be a \
+         DHAN_ALERTS_*-prefixed constant (test 3's census counts that \
+         prefix). Violations:\n{}",
+        naming_violations.join("\n")
+    );
+
+    // (b) types.rs + conditional.rs may mention the /alerts paths in DOC
+    //     COMMENTS ONLY — zero comment-stripped code mentions, so neither
+    //     file can carry a path literal for a new sender to consume.
+    for path in ["src/oms/types.rs", CONDITIONAL_RS] {
+        let source = fs::read_to_string(path)
+            .unwrap_or_else(|_| panic!("{path} must be readable for the choke-point guard"));
+        let file_code = strip_full_line_comments(production_region(&source));
+        for token in ["alerts/orders", "alerts/multi"] {
+            assert_eq!(
+                count_occurrences(&file_code, token),
+                0,
+                "{path} may mention `{token}` in doc comments ONLY — a code \
+                 (string-literal) mention is a rogue path source outside the \
+                 gated api_client.rs choke point"
+            );
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -544,12 +846,138 @@ fn test_gate_guard_scanner_self_test() {
         "self-test plant must model a LATE gate (gate after http)"
     );
 
-    // The struct-literal arm needle trips on a planted field init.
-    let planted_field_init = "Self { alerts_gate_armed: true }";
+    // ------------------------------------------------------------------
+    // classify_gate_sites — the round-2 total-write census must detect
+    // every planted arm SHAPE the literal-`true` needles missed.
+    // ------------------------------------------------------------------
+
+    // (1) Non-literal production setter (`= on`) IS an assignment.
+    let planted_setter = "pub fn set_alerts_gate(&mut self, on: bool) { \
+                          self.alerts_gate_armed = on; }";
+    let sites = classify_gate_sites(planted_setter);
+    assert_eq!(sites.len(), 1);
+    assert_eq!(sites[0].kind, GateSiteKind::Assignment);
+    assert_eq!(sites[0].rhs, "on", "non-literal RHS must be captured");
+
+    // (2) Literal arm classifies as an assignment with RHS `true`.
+    let planted_literal_arm = "self.alerts_gate_armed = true;";
+    let sites = classify_gate_sites(planted_literal_arm);
+    assert_eq!(sites.len(), 1);
+    assert_eq!(sites[0].kind, GateSiteKind::Assignment);
+    assert_eq!(sites[0].rhs, "true");
+
+    // (3) Parameterized constructor init (`: armed`) IS a colon site with a
+    //     non-`false` RHS (the `new_armed(.., armed)` bypass).
+    let planted_param_init = "Self { alerts_gate_armed: armed }";
+    let sites = classify_gate_sites(planted_param_init);
+    assert_eq!(sites.len(), 1);
+    assert_eq!(sites[0].kind, GateSiteKind::FieldColon);
+    assert_eq!(sites[0].rhs, "armed");
+
+    // (4) Literal struct-literal arm (`: true`, spaced or not) is a colon
+    //     site with RHS `true`.
+    for planted_field_init in [
+        "Self { alerts_gate_armed: true }",
+        "Self{alerts_gate_armed:true}",
+    ] {
+        let sites = classify_gate_sites(planted_field_init);
+        assert_eq!(sites.len(), 1, "planted field init must be seen");
+        assert_eq!(sites[0].kind, GateSiteKind::FieldColon);
+        assert_eq!(sites[0].rhs, "true");
+    }
+
+    // (5) Compound assignment (`|=`) IS an assignment.
+    let planted_compound = "self.alerts_gate_armed |= flag;";
+    let sites = classify_gate_sites(planted_compound);
+    assert_eq!(sites.len(), 1);
+    assert_eq!(sites[0].kind, GateSiteKind::Assignment);
+
+    // (6) `&mut` borrow of the field is its own mutation class.
+    let planted_borrow = "std::mem::replace(&mut self.alerts_gate_armed, true)";
+    let sites = classify_gate_sites(planted_borrow);
+    assert_eq!(sites.len(), 1);
+    assert_eq!(sites[0].kind, GateSiteKind::MutBorrow);
+
+    // (7) Reads never count as writes: bare read, `==` compare, match arm.
+    for read_shape in [
+        "if self.alerts_gate_armed { }",
+        "if self.alerts_gate_armed == other { }",
+        "assert!(client.alerts_gate_armed);",
+        "match x { alerts_gate_armed => {} }",
+    ] {
+        let sites = classify_gate_sites(read_shape);
+        assert_eq!(sites.len(), 1, "read shape must be seen: {read_shape}");
+        assert_eq!(
+            sites[0].kind,
+            GateSiteKind::Read,
+            "read shape must classify Read: {read_shape}"
+        );
+    }
+
+    // (8) Identifier boundary: a LONGER identifier never counts.
+    assert!(
+        classify_gate_sites("let alerts_gate_armed_x = true;").is_empty(),
+        "boundary check must skip longer identifiers"
+    );
+    // The field declaration classifies as a colon site with RHS `bool`.
+    let decl = "    alerts_gate_armed: bool,";
+    let sites = classify_gate_sites(decl);
+    assert_eq!(sites[0].kind, GateSiteKind::FieldColon);
+    assert_eq!(sites[0].rhs, "bool");
+
+    // ------------------------------------------------------------------
+    // derive_alerts_sender_fns — a NEW /alerts-touching pub async fn is
+    // derived (even with a LATE gate call), a non-alerts fn is not.
+    // ------------------------------------------------------------------
+    let synthetic_api = "    pub async fn cancel_multi_order(&self) {\n        \
+                         let x = self.http.post(url).send();\n        \
+                         self.require_alerts_gate(\"late\");\n        \
+                         let url = format!(\"{}/alerts/multi\", base);\n    }\n    \
+                         pub async fn place_order(&self) {\n        \
+                         let url = format!(\"{}/orders\", base);\n    }\n";
     assert_eq!(
-        count_occurrences(planted_field_init, "alerts_gate_armed: true"),
+        derive_alerts_sender_fns(synthetic_api),
+        vec!["cancel_multi_order".to_string()],
+        "sender derivation must catch a NEW /alerts fn and skip non-alerts fns"
+    );
+    let constant_backed_sender = "    pub async fn bulk(&self) {\n        \
+                                  let url = format!(\"{}{}\", b, constants::DHAN_ALERTS_X);\n    }\n";
+    assert_eq!(
+        derive_alerts_sender_fns(constant_backed_sender),
+        vec!["bulk".to_string()],
+        "sender derivation must catch a DHAN_ALERTS_*-constant-backed fn"
+    );
+
+    // ------------------------------------------------------------------
+    // Comment-stripped gate-call counting — a full-line comment carrying
+    // the gate token must NOT inflate the census (round-2 asymmetry fix).
+    // ------------------------------------------------------------------
+    let commented_gate = "// callers must self.require_alerts_gate(..) first\n\
+                          let url = \"/alerts/orders\";";
+    assert_eq!(
+        count_occurrences(
+            &strip_full_line_comments(commented_gate),
+            "self.require_alerts_gate("
+        ),
+        0,
+        "a commented-out gate call must not count as a gate site"
+    );
+
+    // ------------------------------------------------------------------
+    // alerts_naming_violations — a rogue-named constant carrying /alerts
+    // is flagged; the DHAN_ALERTS_* spelling is not.
+    // ------------------------------------------------------------------
+    let rogue_constant = "pub const DHAN_COND_ORDERS: &str = \"/alerts/orders\";";
+    assert_eq!(
+        alerts_naming_violations(rogue_constant).len(),
         1,
-        "scanner must detect a planted struct-literal arm"
+        "a /alerts constant without the DHAN_ALERTS_ prefix must be flagged"
+    );
+    let proper_constant =
+        "pub const DHAN_ALERTS_MULTI_ORDERS_PATH: &str = \"/alerts/multi/orders\";";
+    assert!(
+        alerts_naming_violations(proper_constant).is_empty(),
+        "a DHAN_ALERTS_*-prefixed constant is the allowed spelling"
     );
 
     // enum_body extracts only the first block's body.

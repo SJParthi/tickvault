@@ -766,11 +766,12 @@ pub struct DhanConditionalTriggerRequest {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DhanConditionalTriggerResponse {
-    /// Alert ID.
-    #[serde(default)]
+    /// Alert ID (`null` tolerated — the GET echo family emits explicit
+    /// `null` for unset fields, e.g. the verbatim `"triggeredTime": null`).
+    #[serde(default, deserialize_with = "null_to_default")]
     pub alert_id: String,
     /// Alert status: "ACTIVE", "TRIGGERED", "EXPIRED", "CANCELLED".
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub alert_status: String,
     /// Creation time — ISO-8601 **UTC `Z`** format ("2019-08-24T14:15:22Z").
     /// The ONLY UTC timestamps in the trading-API family (everything else is
@@ -1478,6 +1479,50 @@ impl DhanNumeric {
             Self::Text(text) => text.trim().parse().ok(),
         }
     }
+
+    /// Best-effort i64 view; `None` for unparsable text. A fractional value
+    /// truncates toward zero and an out-of-range value saturates (Rust `as`
+    /// casts never panic) — response-echo use only, never a request input.
+    pub fn as_i64(&self) -> Option<i64> {
+        match self {
+            Self::Num(value) => Some(*value as i64),
+            Self::Text(text) => {
+                let trimmed = text.trim();
+                trimmed
+                    .parse::<i64>()
+                    .ok()
+                    .or_else(|| trimmed.parse::<f64>().ok().map(|value| value as i64))
+            }
+        }
+    }
+}
+
+/// Deserializes a possibly-explicit-`null` field into `T::default()`.
+///
+/// `#[serde(default)]` alone tolerates only a MISSING key; the /alerts GET
+/// echo family emits EXPLICIT `null` for unset fields (verbatim doc example:
+/// `"triggeredTime": null`), which would otherwise brick the WHOLE GET /
+/// GET-all parse over one non-conforming leg. Response-only mirrors use this
+/// on every defaulted non-`Option` field.
+fn null_to_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Default + serde::Deserialize<'de>,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
+}
+
+/// Deserializes a quantity echo that may arrive as a bare number, a quoted
+/// decimal string (the family's documented number/string wobble class —
+/// `comparingValue` / `lastPrice`), or explicit `null`. Unparsable text
+/// degrades to 0 — response-only mirror, never a request input.
+fn tolerant_quantity<'de, D>(deserializer: D) -> Result<i64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<DhanNumeric>::deserialize(deserializer)?
+        .and_then(|value| value.as_i64())
+        .unwrap_or_default())
 }
 
 /// Response-only mirror of [`TriggerCondition`] — every field defaulted /
@@ -1488,13 +1533,13 @@ impl DhanNumeric {
 #[serde(rename_all = "camelCase")]
 pub struct TriggerConditionDetail {
     /// Comparison type echo.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub comparison_type: String,
     /// Exchange segment echo.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub exchange_segment: String,
     /// Security ID echo.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub security_id: String,
     /// Indicator name echo (TECHNICAL_WITH_* only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1503,7 +1548,7 @@ pub struct TriggerConditionDetail {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub time_frame: Option<String>,
     /// Operator echo.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub operator: String,
     /// Comparing value — number in the request, STRING in the GET response.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1515,7 +1560,7 @@ pub struct TriggerConditionDetail {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exp_date: Option<String>,
     /// Frequency: "ONCE" | yaml-only "ALWAYS" | anything — String tolerates all.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub frequency: String,
     /// User note echo.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1535,25 +1580,26 @@ pub struct TriggerConditionDetail {
 #[serde(rename_all = "camelCase")]
 pub struct TriggerOrderDetail {
     /// "BUY" or "SELL" echo.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub transaction_type: String,
     /// Exchange segment echo.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub exchange_segment: String,
     /// Product type echo.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub product_type: String,
     /// Order type echo.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub order_type: String,
     /// Security ID echo.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub security_id: String,
-    /// Quantity echo.
-    #[serde(default)]
+    /// Quantity echo — number, quoted decimal string (the family's
+    /// documented wobble class), or explicit `null` all tolerated.
+    #[serde(default, deserialize_with = "tolerant_quantity")]
     pub quantity: i64,
     /// Validity echo.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub validity: String,
     /// Price — STRING in the doc example ("250.00"); tolerant to a bare
     /// number (the family's documented wobble class).
@@ -1626,8 +1672,10 @@ pub struct DhanMultiOrderRequest {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DhanMultiOrderResponse {
-    /// Per-leg order results.
-    #[serde(default)]
+    /// Per-leg order results (`null` tolerated → empty — a 200 body means
+    /// the legs are ALREADY placed at the broker; a parse brick here would
+    /// hide which legs went live).
+    #[serde(default, deserialize_with = "null_to_default")]
     pub orders: Vec<MultiOrderLegResult>,
 }
 
@@ -1635,16 +1683,17 @@ pub struct DhanMultiOrderResponse {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MultiOrderLegResult {
-    /// Dhan order ID for this leg.
-    #[serde(default)]
+    /// Dhan order ID for this leg — a REJECTED leg plausibly echoes
+    /// `"orderId": null` (yaml-only, UNVERIFIED-LIVE); tolerated as `""`.
+    #[serde(default, deserialize_with = "null_to_default")]
     pub order_id: String,
     /// Sequence number echo.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub sequence: String,
     /// 10-value yaml enum (TRANSIT PENDING REJECTED CANCELLED PART_TRADED
     /// TRADED EXPIRED MODIFIED TRIGGERED INACTIVE) — UNVERIFIED-LIVE; kept a
     /// plain String so unknown values NEVER panic (annexure rule 15).
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub order_status: String,
 }
 
@@ -3246,5 +3295,130 @@ mod tests {
         assert_eq!(garbage.as_f64(), None);
         let padded = DhanNumeric::Text("  250.00  ".to_string());
         assert_eq!(padded.as_f64(), Some(250.0));
+    }
+
+    #[test]
+    fn test_dhan_numeric_as_i64_boundaries() {
+        // Financial boundary sweep: number, integer string, decimal string,
+        // padded, negative, garbage, and saturating extremes — never panics.
+        assert_eq!(DhanNumeric::Num(5.0).as_i64(), Some(5));
+        assert_eq!(DhanNumeric::Num(5.7).as_i64(), Some(5)); // truncates
+        assert_eq!(DhanNumeric::Num(-3.9).as_i64(), Some(-3));
+        assert_eq!(DhanNumeric::Num(f64::MAX).as_i64(), Some(i64::MAX)); // saturates
+        assert_eq!(DhanNumeric::Num(f64::NAN).as_i64(), Some(0)); // saturating cast
+        assert_eq!(DhanNumeric::Text("5".to_string()).as_i64(), Some(5));
+        assert_eq!(DhanNumeric::Text("5.0".to_string()).as_i64(), Some(5));
+        assert_eq!(DhanNumeric::Text(" 42 ".to_string()).as_i64(), Some(42));
+        assert_eq!(DhanNumeric::Text("-7".to_string()).as_i64(), Some(-7));
+        assert_eq!(DhanNumeric::Text("abc".to_string()).as_i64(), None);
+    }
+
+    #[test]
+    fn test_conditional_get_echo_tolerates_explicit_nulls() {
+        // Family-proven wire shape: the verbatim GET doc example carries
+        // `"triggeredTime": null` — explicit `null` on ANY echo field (not
+        // just a missing key, which `#[serde(default)]` alone covers) must
+        // never brick the GET-by-id or GET-all parse over one leg.
+        let json = r#"{
+            "alertId": null,
+            "alertStatus": null,
+            "createdTime": null,
+            "triggeredTime": null,
+            "lastPrice": null,
+            "condition": {
+                "comparisonType": null,
+                "exchangeSegment": null,
+                "securityId": null,
+                "operator": null,
+                "comparingValue": null,
+                "frequency": null
+            },
+            "orders": [ {
+                "transactionType": null,
+                "exchangeSegment": null,
+                "productType": null,
+                "orderType": null,
+                "securityId": null,
+                "quantity": null,
+                "validity": null,
+                "price": null,
+                "discQuantity": null,
+                "triggerPrice": null
+            } ]
+        }"#;
+        let resp: DhanConditionalTriggerResponse = serde_json::from_str(json).unwrap();
+        assert!(resp.alert_id.is_empty());
+        assert!(resp.alert_status.is_empty());
+        let condition = resp.condition.expect("condition echo present");
+        assert!(condition.comparison_type.is_empty());
+        assert!(condition.exchange_segment.is_empty());
+        assert!(condition.security_id.is_empty());
+        assert!(condition.operator.is_empty());
+        assert!(condition.frequency.is_empty());
+        assert!(condition.comparing_value.is_none());
+        let orders = resp.orders.expect("orders echo present");
+        assert_eq!(orders.len(), 1);
+        assert!(orders[0].transaction_type.is_empty());
+        assert_eq!(orders[0].quantity, 0);
+        assert!(orders[0].price.is_none());
+
+        // GET-all: one all-null-echo alert must not fail the WHOLE list.
+        let list_json = r#"[
+            {"alertId":"A1","alertStatus":"ACTIVE"},
+            {"alertId":null,"alertStatus":null,
+             "orders":[{"transactionType":null,"quantity":null}]}
+        ]"#;
+        let list: Vec<DhanConditionalTriggerResponse> = serde_json::from_str(list_json).unwrap();
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0].alert_id, "A1");
+        assert!(list[1].alert_id.is_empty());
+    }
+
+    #[test]
+    fn test_trigger_order_detail_quantity_tolerates_string_and_null() {
+        // The family's documented number/string wobble (`comparingValue` is
+        // number-in-request / string-in-response) applied to quantity: a
+        // string-echoed quantity must not re-brick GET-all.
+        let from_number: TriggerOrderDetail = serde_json::from_str(r#"{"quantity":5}"#).unwrap();
+        assert_eq!(from_number.quantity, 5);
+        let from_string: TriggerOrderDetail = serde_json::from_str(r#"{"quantity":"5"}"#).unwrap();
+        assert_eq!(from_string.quantity, 5);
+        let from_decimal: TriggerOrderDetail =
+            serde_json::from_str(r#"{"quantity":"5.0"}"#).unwrap();
+        assert_eq!(from_decimal.quantity, 5);
+        let from_null: TriggerOrderDetail = serde_json::from_str(r#"{"quantity":null}"#).unwrap();
+        assert_eq!(from_null.quantity, 0);
+        let missing: TriggerOrderDetail = serde_json::from_str("{}").unwrap();
+        assert_eq!(missing.quantity, 0);
+    }
+
+    #[test]
+    fn test_multi_order_response_tolerates_null_order_id_and_null_orders() {
+        // YAML-only response, UNVERIFIED-LIVE: a REJECTED leg plausibly
+        // echoes `"orderId": null`. A 200 body means the legs are ALREADY
+        // placed at the broker — a JSON brick here would hide which legs
+        // went live.
+        let leg: MultiOrderLegResult =
+            serde_json::from_str(r#"{"orderId":null,"sequence":null,"orderStatus":"REJECTED"}"#)
+                .unwrap();
+        assert!(leg.order_id.is_empty());
+        assert!(leg.sequence.is_empty());
+        assert_eq!(leg.order_status, "REJECTED");
+
+        let mixed: DhanMultiOrderResponse = serde_json::from_str(
+            r#"{"orders":[
+                {"orderId":"112111182198","sequence":"1","orderStatus":"TRANSIT"},
+                {"orderId":null,"sequence":"2","orderStatus":null}
+            ]}"#,
+        )
+        .unwrap();
+        assert_eq!(mixed.orders.len(), 2);
+        assert_eq!(mixed.orders[0].order_id, "112111182198");
+        assert!(mixed.orders[1].order_id.is_empty());
+        assert!(mixed.orders[1].order_status.is_empty());
+
+        let null_orders: DhanMultiOrderResponse =
+            serde_json::from_str(r#"{"orders":null}"#).unwrap();
+        assert!(null_orders.orders.is_empty());
     }
 }

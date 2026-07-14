@@ -351,13 +351,26 @@ fn test_skipped_endpoints_documented() {
 // Test: OMS endpoints that use inline paths in api_client.rs
 // ---------------------------------------------------------------------------
 
-/// Verifies the complete set of 35 OMS endpoint paths used in api_client.rs.
+/// Verifies the OMS REST endpoint ledger for the trading surface.
 ///
-/// These are currently constructed inline (e.g., `format!("{}/orders", base_url)`)
-/// rather than using named constants. This test documents and verifies the
-/// expected inline paths to detect accidental changes or omissions.
+/// TWO DISTINCT COUNTS, kept honest (2026-07-14 round-2 reconciliation —
+/// the prior header conflated them as "35 endpoints used in api_client.rs"):
 ///
-/// The 35 endpoints break down as:
+/// * **35 unique endpoint PATHS** = 16 inline base paths built in
+///   api_client.rs (e.g., `format!("{}/orders", base_url)`) + 19
+///   constants-backed `DHAN_*_PATH` paths from constants.rs. The
+///   constants are consumed ACROSS the workspace — api_client.rs for the
+///   OMS families, but also core (auth/RenewToken/ip/charts) and app
+///   (option-chain per-minute pull) — NOT all "in api_client.rs".
+/// * **38 per-method REST OPERATIONS** enumerated in the breakdown below
+///   (several operations share one path, e.g. PUT/DELETE/GET on
+///   /orders/{order-id}) — plus exit-all's DELETE reusing the shared
+///   /positions path as a 39th operation on an already-counted path.
+///
+/// The inline paths are documented here to detect accidental changes or
+/// omissions.
+///
+/// The 38 listed operations break down as:
 /// - Orders (9): place, modify, cancel, order-book, single-order, by-correlation, trade-book, trades-by-order, slicing
 /// - Super orders (4): place, modify, cancel, list
 /// - Forever orders (4): create, modify, delete, list
@@ -371,12 +384,17 @@ fn test_skipped_endpoints_documented() {
 /// - Portfolio via constant (3): holdings, positions, positions/convert
 /// - Funds/margin via constant (3): margin-calc, margin-multi, fund-limit
 /// - Trader's control via constant (2): killswitch, pnl-exit
-/// - Exit-all (DELETE /positions) shares DHAN_POSITIONS_PATH (1, counted above)
+/// - Exit-all (DELETE /positions) reuses DHAN_POSITIONS_PATH — a distinct
+///   operation on a path already inside the 35 (asserted below, not part
+///   of the 38-item list)
 ///
-/// Total unique paths: 19 (constants) + 16 (inline in api_client) = 35 (+1 constants-backed /alerts/multi/orders 2026-07-14; +2 option-chain constants re-counted 2026-07-14 — live since the 2026-07-12 §8 rebuild)
+/// Total unique paths: 19 (constants — incl. /alerts/multi/orders added
+/// 2026-07-14 and the 2 option-chain constants, live since the 2026-07-12
+/// §8 rebuild) + 16 (inline in api_client.rs) = 35
 /// Plus 4 WebSocket URLs = 39 endpoint URLs
 /// Plus 14 parameterized variants (e.g., /orders/{id}) that share base paths
-/// Grand total of distinct API operations: 57
+/// Grand ledger total: 57 = 53 implemented endpoint URLs/variants
+/// (35 paths + 14 variants + 4 WebSocket) + 4 intentionally skipped
 #[test]
 fn test_oms_inline_endpoint_paths_documented() {
     // --- Orders (docs/dhan-ref/07-orders.md) ---
@@ -511,14 +529,17 @@ fn test_oms_inline_endpoint_paths_documented() {
         constants_rest_count + inline_base_paths + parameterized_variants + websocket_count;
     assert_eq!(
         total_implemented, 53,
-        "53 implemented endpoint operations (/alerts/multi/orders added 2026-07-14; option-chain's 2 constants re-counted 2026-07-14 — live since the 2026-07-12 §8 rebuild)"
+        "53 implemented endpoint URLs/variants (35 unique paths + 14 \
+         parameterized variants + 4 WebSocket; /alerts/multi/orders added \
+         2026-07-14; option-chain's 2 constants re-counted 2026-07-14 — \
+         live since the 2026-07-12 §8 rebuild)"
     );
 
     // Plus the 4 intentionally skipped = total Dhan API endpoints known
     let total_known = total_implemented + skipped_count;
     assert_eq!(
         total_known, 57,
-        "57 total known Dhan API endpoints (53 implemented + 4 skipped)"
+        "57 total known Dhan API endpoint URLs/variants (53 implemented + 4 skipped)"
     );
 }
 
