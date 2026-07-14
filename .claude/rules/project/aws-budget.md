@@ -8,6 +8,27 @@
 > **Ground truth:** `docs/architecture/aws-indices-only-locked-architecture.md` §5 (instance lock 2026-05-18) and the 2026-05-20 CloudWatch-only decision below.
 > **Scope:** Any file touching AWS deployment, infrastructure, Docker config, or cost-impacting changes.
 
+## COST NOTE 2026-07-14 — REST-audit alarm gaps (GAP-01/03/05, +~$0.60/mo)
+
+The 2026-07-14 REST-pipeline adversarial audit
+(`docs/audits/2026-07-14-rest-pipeline-adversarial-audit.md`) found the
+REST-leg paging chain was app-emitted Telegram ONLY (GAP-01/GAP-03) with no
+alarm on Telegram drops themselves (GAP-05). Added:
+
+- **+5 errcode log-filter alarms ≈ $0.50/mo** (`error-code-alarms.tf`):
+  `auth-gap-05-remint-failed` (mint-FAILURE arm only — `$.permanent`
+  scoped), `spot1m-01-escalation` + `chain-02-escalation`
+  (`stage="escalation"` once-per-episode edges only), `chain-01`,
+  `chain-04-warmup`. Their log-derived metrics are sparse/dimensionless
+  (billed only in hours a code fires — near-free).
+- **+1 counter-delta alarm ≈ $0.10/mo** (`telegram-drop-alarm.tf`):
+  `tv-<env>-telegram-drops` on `tv_telegram_dropped_total` (Sum ≥ 3 per
+  900s, metrics-log delta-extraction house pattern). The derived metric is
+  sparse until the flagged crates-side pre-registration lands (near-free).
+
+Total **≈ $0.60/mo pre-GST (~₹60/mo incl. 18% GST at ₹85/$)** — inside the
+$35/mo pre-GST budget alarm ceiling and the ~₹3,101/mo envelope.
+
 ## COST NOTE 2026-07-06 — Silent-feed alerting hardening (+~$1.50/mo)
 
 The 2026-07-06 incident (Dhan feed degraded ALL day — lag p99 46s/max 199s,
