@@ -45,6 +45,11 @@ chrono-tz = { workspace = true }
 rustls = { workspace = true }
 reqwest = { workspace = true }
 core_affinity = { workspace = true }
+# 2026-07-12 (BruteX crossverify Commit 2): the 15:50 IST daily task reads the
+# BruteX-produced Groww 1m CSVs from S3 (tv-prod-cold, read-only GET/List —
+# the instance role already holds the permissions; ZERO IAM change).
+aws-config = { workspace = true }
+aws-sdk-s3 = { workspace = true }
 # Event-driven (zero-poll) file watching for the Groww bridge tick-file tail
 # (operator 2026-06-28: "true zero latency, no polling"). Same crate + pin the
 # strategy hot-reloader uses (`crates/trading/src/strategy/hot_reload.rs`) —

@@ -70,17 +70,20 @@ fn test_order_update_connection_is_audit_wired() {
         src.contains("ord_ws_audit_tx") || src.contains("ou_ws_audit_tx"),
         "the order-update spawn must pass an audit sender into run_order_update_connection."
     );
-    // PR-C1 (2026-07-13, Q4-i): the dhan_rest_stack rewire site must ALSO
-    // create its own consumer and pass the sender into the connection —
-    // the stack becomes the SOLE order-update call site after Phase C2.
+    // 2026-07-14 operator Dhan noise lock: the PR-C1/Q4-i dhan_rest_stack
+    // order-update spawn is RETIRED — the stack must no longer open the
+    // socket at all (its negative ratchet lives in dhan_rest_stack.rs
+    // tests). The main.rs lane sites above are Dhan-gated dead code that
+    // the Phase C-2 PR deletes wholesale.
     let stack = rest_stack_src();
+    let stack_prod = stack
+        .split_once("#[cfg(test)]")
+        .map(|(prod, _)| prod.to_string())
+        .unwrap_or(stack);
     assert!(
-        stack.contains("ws_audit_consumer::spawn_ws_event_audit_consumer("),
-        "dhan_rest_stack must create a ws_event_audit consumer for its order-update WS."
-    );
-    assert!(
-        stack.contains("ou_ws_audit_tx"),
-        "dhan_rest_stack must pass the audit sender into run_order_update_connection."
+        !stack_prod.contains("run_order_update_connection("),
+        "dhan_rest_stack must NOT spawn the order-update WS (retired \
+         2026-07-14 — dhan-rest-only-noise-lock-2026-07-14.md)."
     );
 }
 
