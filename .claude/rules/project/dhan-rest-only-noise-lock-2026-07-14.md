@@ -27,8 +27,9 @@
 
 **The ONLY Dhan Telegram alerts that can ever fire are: (1) the DHAN spot-1m
 pull failing/recovered, (2) the DHAN option-chain pull failing/recovered,
-(3) the DHAN token-unobtainable Critical, and (4) the CloudWatch 4h
-token-remaining early-warning — every other Dhan-era page, probe, watchdog
+(3) the DHAN token-unobtainable Critical, (4) the CloudWatch 4h
+token-remaining early-warning, and (5) the order-side family of §2.1 once
+order flow is revived — every other Dhan-era page, probe, watchdog
 Telegram, and dead alarm is deleted or silenced; the token machinery
 self-heals SILENTLY.**
 
@@ -42,6 +43,40 @@ self-heals SILENTLY.**
 | 2 | Option-chain pull failing / recovered | `ChainFetchDegraded` (High) / `ChainFetchRecovered` (Info) / `ChainEntitlementAbsent`/`Confirmed` / `ChainExpirylistFailed` (High) | the chain leg's own edges (`rest-1m-pipeline-error-codes.md`) |
 | 3 | Token could not be obtained | `AuthenticationFailed` / `TokenRenewalFailed` (both Critical; reworded 2026-07-14 to plain English naming DHAN + the consequence: "the Dhan spot-1m and option-chain pulls will stop until this is fixed") | mint/renewal is TERMINALLY dead — the mid-session watchdog pages **ONCE PER FAILING EPISODE** (H1a latch, 2026-07-14 fix round — never the pre-fix ~30-min repeat) on EITHER (a) a forced re-mint failing terminally OR (b) the H1b attempt cap: `REMINT_MAX_ATTEMPTS_PER_EPISODE` (= 3) re-mints all "succeeded" yet the profile stayed REAL-invalid (dead-dataPlan/segment class — the body names the N re-logins + that the spot-1m/chain pulls are blocked). The latch resets on a clean profile cycle. (Its terminal arm emits `AuthenticationFailed` directly, since `force_renewal` -> `acquire_token` pages nothing on a non-RESILIENCE-03 permanent failure; the Telegram body is redacted + truncated via the house sanitizer — M2.) |
 | 4 | Token expires soon (4h early warning) | CloudWatch alarm `tv-<env>-token-remaining-low` on `tv_token_remaining_seconds` → SNS → Telegram Lambda | the renewal loop stopped renewing (the watchdog-of-the-renewal-loop). The Lambda's wording is ANOTHER session's scope. |
+
+### §2.1 — 2026-07-14 (same day) amendment: the DHAN ORDER-SIDE alert family (dormant behind the OFF switch)
+
+**The verbatim coordinator-relayed operator directive (2026-07-14 — the fresh
+dated quote §3 demands):**
+
+> "Own 🔷 DHAN order-side ALERTING + monitoring wiring, behind the OFF
+> switch... Add emit sites for OrderRejected / CircuitBreakerOpened Telegram
+> variants... CloudWatch alarms for OMS-GAP/RISK-GAP error codes... EMF
+> metric adds: order placement/rejection/latency, circuit-breaker state,
+> daily P&L... Order-side dashboards."
+
+This grant ADDS the order-side alert family to the §2 allowed set — FIVE
+Telegram variants (all pre-existing in events.rs, all 🔷 DHAN-badged, ALL
+STRUCTURALLY DORMANT today: the order engine is never instantiated while
+`dry_run = true` + `dhan_enabled = false`; the first possible page requires
+Cluster A's order-runtime revival):
+
+| # | Variant | Severity | Fires when |
+|---|---|---|---|
+| 5 | `OrderRejected` | High | an order is rejected (OMS or Dhan-side) |
+| 6 | `CircuitBreakerOpened` | High | consecutive Dhan API failures opened the breaker — all submissions blocked |
+| 7 | `CircuitBreakerClosed` | Medium | the breaker recovered (the falling-edge companion of #6) |
+| 8 | `RateLimitExhausted` | High | the SEBI order rate limiter denied an order |
+| 9 | `RiskHalt` | **Critical (→ SNS SMS too)** | the risk engine HALTED trading (daily-loss breach / position-limit / manual) |
+
+Plus SEVEN CloudWatch alarms (3 errcode log-filter: OMS-GAP-03, OMS-GAP-04,
+RISK-GAP-01; 4 metric: orders-placed-live tripwire {mode="live"},
+circuit-breaker-open, daily-pnl-breach ≤ −₹20,000, order-latency-high >5s) —
+all `treat_missing_data = notBreaching`, silent while dormant. The §1
+one-line rule now reads with "…(5) the order-side family of §2.1 once order
+flow is revived". The §3 REJECT row "Adds ANY new Dhan-scoped Telegram page
+outside the §2 4-item set" is qualified: the set is now §2 + §2.1 (4 + 5
+variants, 7 + 7 alarms).
 
 **Deleted or silenced 2026-07-14 (everything else Dhan):**
 
@@ -63,8 +98,9 @@ self-heals SILENTLY.**
 
 ## §3. What a PR that violates this lock looks like (REJECT)
 
-- Adds ANY new Dhan-scoped Telegram page outside the §2 4-item set without a
-  fresh dated operator quote HERE first.
+- Adds ANY new Dhan-scoped Telegram page outside the §2 4-item set + the
+  §2.1 order-side family (4 + 5 variants, 7 + 7 alarms) without a fresh
+  dated operator quote HERE first.
 - Re-introduces the mid-session profile / forced-re-mint Telegram pages, the
   REST canary, the no-tick watchdog, the fast-boot validation call, or the
   order-update spawn (each needs a fresh dated quote; the order-update
@@ -141,3 +177,4 @@ Always loaded. Reinforced on any session editing:
   `TokenForcedRemintTriggered`, `NoLiveTicksDuringMarketHours`,
   `rest_canary`, `fast_boot_validation`, `run_order_update_connection`, or
   `DHAN_REST_STACK_TOKEN_SWEEP_INTERVAL_SECS`
+- Any file containing `oms_alert_bridge` (the §2.1 order-side alert family)

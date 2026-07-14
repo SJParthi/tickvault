@@ -67,7 +67,13 @@ fires one edge-latched ERROR per (table, suspension episode) — a merely-DOWN
 QuestDB never fires it, the boot-probe escalation codes own the down-server
 page; recovery = the operator's
 `ALTER TABLE <t> RESUME WAL`, never auto-executed; runbook
-`.claude/rules/project/wal-suspension-error-codes.md`**)**. **Everything else
+`.claude/rules/project/wal-suspension-error-codes.md`**)**, **OMS-GAP-03,
+OMS-GAP-04, RISK-GAP-01 (added 2026-07-14 — the DHAN order-side alert
+family; OMS-GAP-04/RISK-GAP-01 emit from the app-side alert bridge
+`crates/app/src/oms_alert_bridge.rs`, OMS-GAP-03 from
+`crates/trading/src/oms/circuit_breaker.rs:148`; all dormant until order
+flow is revived — runbook `.claude/rules/project/gap-enforcement.md`)**.
+**Everything else
 is log-sink-only** unless it has its own metric alarm (app-alarms.tf) or a
 typed `NotificationEvent`.
 

@@ -303,6 +303,30 @@ SSM; exactly one middleware OOB hint site).
 - Manual `reset()` always returns to Closed
 - Test: all `circuit_breaker::tests::*` + integration `oms_circuit_breaker::*`
 
+### 2026-07-14 Update — OMS-GAP-03 now PAGES (dual route)
+
+The DHAN order-side alerting PR (noise-lock §2.1 grant) wired the paging
+chain for the pre-existing coded emit at
+`crates/trading/src/oms/circuit_breaker.rs:148`:
+
+1. **errcode log-filter alarm** `tv-<env>-errcode-oms-gap-03`
+   (`deploy/aws/terraform/error-code-alarms.tf`): `ok_recovery = false` —
+   the CB-open emit is a CAS-gated once-per-episode edge
+   (circuit_breaker.rs:145-148); an auto-OK ~15 min later never means the
+   breaker closed. The genuine recovery signals are
+   `tv_circuit_breaker_state` returning to 0 + the `CircuitBreakerClosed`
+   Telegram.
+2. **metric alarm** `tv-<env>-circuit-breaker-open` on
+   `tv_circuit_breaker_state` (Maximum ≥ 1 / 300s, ok_actions ON — the
+   gauge genuinely returns to 0=Closed; the AGGREGATOR-DROP-01 dual-route
+   precedent).
+3. **Telegram**: `CircuitBreakerOpened` (High) / `CircuitBreakerClosed`
+   (Medium) via the app-side alert bridge
+   (`crates/app/src/oms_alert_bridge.rs`).
+
+All dormant today — the OMS is never instantiated with
+`dhan_enabled = false` + `dry_run = true`.
+
 ## OMS-GAP-04: SEBI Rate Limiting
 - `OrderRateLimiter::new(0)` must panic (fail-fast at config time)
 - SEBI limit: max 10 orders/sec enforced via GCRA algorithm
@@ -311,6 +335,18 @@ SSM; exactly one middleware OOB hint site).
 - Counter must NOT exceed limit (saturating decrement on rejection)
 - `reset()` clears all counters to 0
 - Test: all `rate_limiter::tests::*` + integration `oms_rate_limiter::*`
+
+### 2026-07-14 Update — OMS-GAP-04 coded emit + pager
+
+The coded ERROR emit lives in the app-side alert bridge
+(`crates/app/src/oms_alert_bridge.rs`, the `RateLimitExhausted` arm), NOT
+the trading crate (seam-minimal — the trading crate's rate limiter stays
+untouched; the bridge fires the coded line + the `RateLimitExhausted`
+Telegram when the OMS alert sink delivers the denial). Pages via the
+errcode log-filter alarm `tv-<env>-errcode-oms-gap-04`
+(`ok_recovery = true` — fires per denied order, so it repeat-emits during
+a storm and the OK genuinely ≈ the storm stopped; the dh-901/ws-gap-07
+class). Dormant until order flow is revived.
 
 ## OMS-GAP-05: Idempotency (Correlation Tracking)
 - `generate_id()` must return valid UUID v4
@@ -364,6 +400,24 @@ SSM; exactly one middleware OOB hint site).
 - Position limit: `(current + new).abs() > max_lots` → reject
 - Order of checks: halt → daily loss → position limit
 - Test: integration `risk_engine::*`
+
+### 2026-07-14 Update — RISK-GAP-01 halt paging + semantic note
+
+The halt event pages via the app-side alert bridge's coded emit
+(`crates/app/src/oms_alert_bridge.rs::fire_risk_halt` →
+`tv-<env>-errcode-risk-gap-01`, `ok_recovery = false` — the halt persists
+until `reset_daily`/manual reset; the emit fires once per trigger, so an
+auto-OK while halted would be a Rule-11 false recovery) + the Critical
+`RiskHalt` Telegram + the independent `tv-<env>-daily-pnl-breach` backstop
+alarm on `tv_daily_pnl` (≤ −20,000, Minimum/300s). HONEST NOTES:
+(a) `ManualHalt` also routes through this code (an operator action paging
+as a pre-trade-check code — intentional: a halt is a halt);
+(b) per-order `PositionSizeLimitExceeded` rejections never call
+`trigger_halt` and emit nothing — page-on-halt-only is the deliberate
+noise posture;
+(c) `tv_daily_pnl` updates on risk checks (any `total_unrealized_pnl`
+caller), not on fills — staleness between signals is the envelope.
+All dormant until order flow is revived.
 
 ## RISK-GAP-02: Position & P&L Tracking
 - `record_fill()`: reducing fills → realized P&L computed correctly
