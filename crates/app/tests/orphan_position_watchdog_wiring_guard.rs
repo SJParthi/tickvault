@@ -56,12 +56,6 @@ fn watchdog_boot_source() -> String {
     fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
 }
 
-fn watchdog_boot_source() -> String {
-    let path =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/orphan_position_watchdog_boot.rs");
-    fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
-}
-
 #[test]
 fn test_orphan_position_watchdog_is_wired_into_main() {
     let src = main_rs_source();

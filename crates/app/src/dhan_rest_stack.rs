@@ -190,15 +190,11 @@ pub struct DhanRestStackParams {
     /// Runtime feed-state — receives `set_live_token_manager` so the token
     /// gauges read this stack's manager.
     pub feed_runtime: Arc<FeedRuntimeState>,
-    /// The runtime's mark receiver, stashed by main.rs and taken ONCE at
-    /// spawn (a `Receiver` is not `Clone`; the slot keeps the params struct
-    /// constructible on every boot arm). `None` inside = already taken or
-    /// runtime disabled.
-    pub mark_rx_slot: Arc<
-        std::sync::Mutex<Option<tokio::sync::mpsc::Receiver<crate::order_runtime::MarkUpdate>>>,
-    >,
-    /// Shared mark-gate flag (the Groww bridge's per-tick `Relaxed` load).
-    pub marks_wanted: Arc<AtomicBool>,
+    /// Shared /health state (PR-C2, 2026-07-13): the stack owns the token
+    /// block writer (`token_remaining_secs` + `token_valid`) — the lane's
+    /// `spawn_token_health_writer` died with the lane, and without a writer
+    /// GET /health would report the token invalid forever.
+    pub health: tickvault_api::state::SharedHealthStatus,
 }
 
 /// Cadence (seconds) of the /health token-block writer (PR-C2 re-home of

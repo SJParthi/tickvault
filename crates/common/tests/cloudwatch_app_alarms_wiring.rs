@@ -322,7 +322,7 @@ fn test_deployed_emf_source_labels_match_a_real_series_label() {
 }
 
 #[test]
-fn test_emf_metric_selectors_name_count_is_twenty_eight() {
+fn test_emf_metric_selectors_name_count_is_pinned() {
     // Pin the MAIN (host-only) EMF publish list: 19 alarm-backing signals
     // + 2 memory-measurement gauges added 2026-07-02 for the 2K-universe RAM
     // measurement (tv_process_rss_bytes — crates/storage/src/resource_monitor.rs;
