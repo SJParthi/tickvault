@@ -250,32 +250,11 @@ allowed_origins = ["http://localhost:3000", "http://localhost:3001"]
 # /portal/* frontend deletion. Grafana / QuestDB Console / Prometheus
 # are still auto-opened at boot by `infra::DASHBOARD_SERVICES`.
 
-[subscription]
-# Phase 0 LEAN MVP (operator lock 2026-05-15) — 222 SIDs ONLY.
-# 4 IDX_I (NIFTY=13, BANKNIFTY=25, SENSEX=51, INDIA VIX=21) in Ticker mode +
-# 218 NSE_EQ F&O underlying stocks in Quote mode. NO derivatives, NO greeks,
-# NO depth-20, NO depth-200, NO movers pipeline, NO Phase 2 dispatcher.
-#
-# Scope is the SOURCE OF TRUTH for the WS subscription per
-# `.claude/rules/project/daily-universe-scope-expansion-2026-05-27.md`
-# (supersedes the 2026-05-15 4-SID lock). GO-LIVE 2026-05-28: `daily_universe`
-# is the operator-locked production scope — ~250 SIDs (all NSE indices + 1 BSE
-# SENSEX + unique F&O underlying spots), Quote mode, fail-closed §4. The
-# 2-WebSocket lock (1 main-feed + 1 order-update) is UNCHANGED. The only other
-# legal value is `indices_4_only` (the retired 4-SID scope, kept for rollback).
-# Adding a new scope requires operator re-approval recorded in the rule file.
-scope = "daily_universe"
-feed_mode = "Full"
-subscribe_stock_equities = true
-stock_atm_strikes_above = 25
-stock_atm_strikes_below = 25
-stock_default_atm_fallback_enabled = true
-# Phase 0 lock — depth-20 stays defined but NEVER spawns per the 2-WS rule.
-# Scope = `indices_underlyings_only` would already gate this off, but
-# belt-and-suspenders default-off prevents a future scope flip from
-# accidentally re-enabling depth.
-enable_twenty_depth = false
-twenty_depth_max_instruments = 50
+# PR-C3 (2026-07-14): the [subscription] section was DELETED with the Dhan
+# instrument-download + subscription chain (operator retirement directive
+# 2026-07-13 — websocket-connection-scope-lock.md "2026-07-13 Amendment"
+# §B item 2). Groww builds its watch set from its own master; the retained
+# Dhan REST pulls run on the hardcoded SPOT_1M_REST_INDICES.
 
 [notification]
 telegram_api_base_url = "https://api.telegram.org"

@@ -426,8 +426,10 @@ pub enum NotificationEvent {
         trading_date_ist: String,
         /// Final main-feed connection count at 15:31:30 IST.
         main_feed_active: usize,
-        /// Operator's expected total — same `effective_main_feed_pool_size`
-        /// value as `MarketOpenReadinessConfirmation` for parity.
+        /// Operator's expected total — historically the
+        /// `effective_main_feed_pool_size` value (fn deleted with the Dhan
+        /// subscription surface, PR-C3 2026-07-14); same source as
+        /// `MarketOpenReadinessConfirmation` for parity.
         main_feed_total: usize,
         /// JWT remaining lifetime in whole hours. The 24h SEBI cycle
         /// means anything < 12h after market close needs a TOTP-driven

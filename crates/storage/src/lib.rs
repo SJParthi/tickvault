@@ -82,9 +82,10 @@ pub mod boot_probe;
 // Human-readable analyst console views (`ticks_named` / `candles_named`) —
 // plain QuestDB views LEFT-joining ticks/candles_1m against the
 // instrument_lifecycle master. Cold-path console tooling only (O(join) at
-// SELECT time, honestly O(N); zero hot-path impact). NOT feature-gated:
-// the DDL builders compile feature-free; the lifecycle-ensure call inside
-// is `#[cfg(feature = "daily_universe_fetcher")]`-gated.
+// SELECT time, honestly O(N); zero hot-path impact). (The
+// `daily_universe_fetcher` feature that once gated the lifecycle-ensure
+// call inside was deleted in PR-C3, 2026-07-14 — everything here is
+// unconditional now.)
 pub mod console_views;
 // C2 (2026-07-03): HTTP-CLIENT-01 — panic-free reqwest client construction.
 // Shared OnceLock probe client for the repeating QuestDB readiness probes
@@ -156,22 +157,18 @@ pub mod groww_candle_persistence;
 // unified `feed_parity_1m_audit_persistence` above (one table, `feed` in the
 // DEDUP key). Its empty `groww_cross_verify_1m_audit` table is retained on disk.
 // §21. DDL + append helpers + Row struct land in Sub-PR #10b-ζ.
-#[cfg(feature = "daily_universe_fetcher")]
 pub mod instrument_fetch_audit_persistence;
 // Lifecycle table contracts (§5/§6 SEBI never-delete) — schema constants
 // + DEDUP keys + LifecycleState/TransitionKind enums. Feature-gated per
 // rule §21. DDL + Row + append helpers land in follow-up sub-PRs.
-#[cfg(feature = "daily_universe_fetcher")]
 pub mod instrument_lifecycle_persistence;
 // §31 item 2 (NTM Map-A, 2026-06-06): full index→constituents mapping table —
 // queryable both directions. Map-only (does NOT change the subscription).
 // Feature-gated per rule §21.
-#[cfg(feature = "daily_universe_fetcher")]
 pub mod index_constituency_persistence;
 // Daily lifecycle reconciler — PURE decision logic (§5/§6/§23). The app
 // boot orchestrator owns the I/O loop and consumes these pure functions.
 // Feature-gated per rule §21.
-#[cfg(feature = "daily_universe_fetcher")]
 pub mod lifecycle_reconciler;
 // PR #3 (2026-05-19): `greeks_persistence` module DELETED. greeks
 // pipeline retired alongside the indices-only universe. The
