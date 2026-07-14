@@ -749,7 +749,12 @@ pub(crate) async fn run_order_side_consumer(
                 // `appended` into a false OMS-GAP-02 Mismatch. FIFO means
                 // every pre-PnlEod message is already consumed, so
                 // `appended` is settled here; the residual race is the
-                // ms-scale PnlEod enqueue→dequeue drain only.
+                // PnlEod enqueue→dequeue drain only — bounded by the
+                // channel-backlog drain time, NOT ms-scale in the worst
+                // case: against a HANGING (not refusing) QuestDB each
+                // queued row can cost up to the 5s request_timeout, so a
+                // degraded-storm drain can take seconds-to-minutes
+                // (round-3 honesty; OMS-GAP-02 stays log-sink-only).
                 let received = stats.received.load(Ordering::Relaxed);
                 let appended = stats.appended.load(Ordering::Relaxed);
                 let dropped = stats.dropped.load(Ordering::Relaxed);

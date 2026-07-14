@@ -18,7 +18,7 @@ the audit rows; capture placements/cancels at the crates/app trading_pipeline ca
 (zero trading-crate hook surface); one OnEod pnl heartbeat row per trading day from the
 existing market-close Notify + a counters-vs-rows daily reconcile (OMS-GAP-02 on mismatch);
 CloudWatch: orders-placed derived metric + storm alarm (armed), daily-loss + fill-lag alarms
-arm-on-arrival in a standalone order-side-alarms.tf, EMF allowlist 27→29 (both names dormant
+arm-on-arrival in a standalone order-side-alarms.tf, EMF allowlist →28 post-rebase (main's M4 removed the dead order-update gauge: 27→26, +2 here; both names dormant
 — emit sites ship with cluster A / Phase-1: tv_daily_pnl, tv_order_fill_lag_seconds), alarm
 #10 ok_actions strip + order-counter pre-registrations in crates/app main.rs; one operator-
 dashboard widget row. Zero new ErrorCode variants (AUDIT-06 / STORAGE-GAP-03 / OMS-GAP-02
@@ -44,7 +44,8 @@ fails → reconcile verdict Mismatch → OMS-GAP-02 error! (heartbeat absence is
 silent); consumer task dies → every subsequent fire() = coded Closed-drop error + counter
 (supervised respawn is a flagged follow-up); channel full → coded drop per event; Telegram
 down → NotificationService retry + TELEGRAM-01 counters (existing) + the daily-loss CW alarm
-is the redundant Critical route; reconcile /exec query fails → verdict Unverified
+is the redundant Critical route (arm-on-arrival — dormant until cluster A ships the
+tv_daily_pnl emit; until then a Telegram-down window has NO redundant daily-loss route); reconcile /exec query fails → verdict Unverified
 (db_rows=unknown — Rule 11, never false-OK); alarm #10 first-sample bug → fixed by
 pre-registration; CW counter-delta shape not live-verified → fail-loud residual (house).
 
@@ -59,7 +60,7 @@ order_side_wiring_guard.rs (both set_alert_sink calls, both OrderSideWiring cons
 RISK-GAP-01 code field in risk/engine.rs); order_side_paging_wiring_guard.rs (pre-reg order,
 tf shapes from real literals, daily-loss armed + ok_actions=[], fill-lag disarmed + arming
 sentence, HCL-stripper self-test). Core: wording-test updates + Dhan-badge test. Common tests:
-EMF count 27→29 bump. Trading: existing halt tests cover the 2-line diff. cargo test on every
+EMF count →28 bump (post-rebase: main's 26 + 2 dormant names). Trading: existing halt tests cover the 2-line diff. cargo test on every
 touched crate; FULL_QA before push.
 
 ## Rollback
@@ -111,6 +112,6 @@ live mode + a no-rest-except-live-feed §3 ruling), paging for the log-sink-only
   deploy/aws/terraform/app-alarms.tf, deploy/aws/terraform/user-data.sh.tftpl,
   deploy/aws/cloudwatch-agent.json, deploy/aws/terraform/variables.tf, deploy/aws/terraform/dashboard.tf,
   crates/common/tests/cloudwatch_app_alarms_wiring.rs — Tests: order_side_paging_wiring_guard.rs (all),
-  test_emf_metric_selectors_name_count_is_twenty_nine
+  test_emf_metric_selectors_name_count_is_twenty_eight
 - [x] rules + cost note + plan hygiene — Files: .claude/rules/project/wave-2-error-codes.md,
   .claude/rules/project/gap-enforcement.md, .claude/rules/project/aws-budget.md, .claude/plans/* — Tests: error_code_rule_file_crossref (existing)
