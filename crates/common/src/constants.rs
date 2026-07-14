@@ -524,7 +524,7 @@ pub const TICK_GAP_ALERT_THRESHOLD_SECS: u32 = 30;
 /// showed 988 ERROR entries in 15 minutes for illiquid F&O options that
 /// legitimately don't trade for 2-5 minutes at a time. A real feed
 /// disconnect is detected by WS ping/pong within 40s (Dhan server
-/// timeout) plus the `no_tick_watchdog` in `crates/core/src/pipeline/`;
+/// timeout) plus the feed-level stall watchdogs;
 /// a 5-minute silence on ONE instrument while others keep ticking is
 /// illiquidity, not disconnect. The WARN band (30s threshold) still
 /// surfaces illiquidity to the aggregated 30s summary log.
@@ -2842,6 +2842,22 @@ pub const TOKEN_SWEEP_INTERVAL_SECS: u64 = 4 * 3600;
 /// (main feed, depth, order update) so behaviour is uniform across all
 /// renewal triggers.
 pub const TOKEN_SWEEP_STALENESS_THRESHOLD_SECS: i64 = 4 * 3600;
+
+/// GAP-02 (2026-07-14, Dhan noise lock backstop): the Dhan REST-only
+/// stack's stale-token sweep cadence.
+///
+/// The lane's 4h token sweep dies with the lane (#1522); the REST-only
+/// stack (`dhan_rest_stack.rs` Phase 3) runs its OWN sweep every this
+/// many seconds, calling
+/// `force_renewal_if_stale(TOKEN_SWEEP_STALENESS_THRESHOLD_SECS)` —
+/// the renewal-loop-circuit-breaker-halt backstop. 900s (matching the
+/// mid-session watchdog cadence) instead of the lane's 4h: the stack's
+/// spot/chain legs die within minutes of a stale token, so the backstop
+/// must react on the same timescale. Silent on no-op/success; a failure
+/// logs via the renewal machinery's own paths. NOT market-hours gated
+/// (a token that goes stale overnight must heal before the 09:16 first
+/// fetch).
+pub const DHAN_REST_STACK_TOKEN_SWEEP_INTERVAL_SECS: u64 = 900;
 
 // DELETED: FRAME_SEND_TIMEOUT_SECS and FRAME_BACKPRESSURE_TIMEOUT_SECS
 // Removed per P1.3 — WS readers use non-blocking try_send() + WAL spill,

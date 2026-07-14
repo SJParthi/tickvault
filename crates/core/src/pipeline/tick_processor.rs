@@ -812,11 +812,12 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
     mut tick_writer: Option<TickPersistenceWriter>,
     tick_broadcast: Option<broadcast::Sender<ParsedTick>>,
     mut greeks_enricher: Option<G>,
-    // Shared heartbeat for the no-tick watchdog (Parthiban directive
-    // 2026-04-21). Updated to `Utc::now().timestamp()` on every parsed
-    // tick — single relaxed atomic store on the hot path. `None`
-    // disables the heartbeat (used by unit tests that do not spawn
-    // the watchdog). See `crate::pipeline::no_tick_watchdog`.
+    // Optional shared last-tick heartbeat (single relaxed atomic store on
+    // the hot path when `Some`). The no-tick watchdog that consumed it was
+    // retired 2026-07-14 (operator Dhan noise lock —
+    // dhan-rest-only-noise-lock-2026-07-14.md); every production call site
+    // now passes `None`. The parameter is kept so the whole Dhan pipeline
+    // signature stays untouched for the Phase C-2 wholesale deletion.
     tick_heartbeat: Option<std::sync::Arc<std::sync::atomic::AtomicI64>>,
     // 29-tf engine plan Phase 2.5: optional Phase 2 lifecycle
     // enricher. When `Some`, every tick that reaches persistence is
@@ -1225,12 +1226,12 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                 ticks_processed = ticks_processed.saturating_add(1);
                 m_ticks.increment(1);
 
-                // No-tick watchdog heartbeat (Parthiban directive 2026-04-21).
+                // Optional last-tick heartbeat (consumer retired 2026-07-14 —
+                // see the `tick_heartbeat` param docs; production passes None).
                 // Single relaxed atomic store. Latency-hunt 2026-06-10:
                 // derive seconds from the frame's `received_at_nanos`
                 // (captured once per frame above) instead of a second
-                // `Utc::now()` vDSO read (~57 ns measured) — identical
-                // wall-clock second; the watchdog threshold is 30 s.
+                // `Utc::now()` vDSO read (~57 ns measured).
                 if let Some(ref hb) = tick_heartbeat {
                     hb.store(
                         received_at_nanos.saturating_div(1_000_000_000),
@@ -1664,9 +1665,9 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                 ticks_processed = ticks_processed.saturating_add(1);
                 m_ticks.increment(1);
 
-                // No-tick watchdog heartbeat — same pattern as the Tick
+                // Optional last-tick heartbeat — same pattern as the Tick
                 // branch above (incl. the latency-hunt 2026-06-10
-                // received_at-derived seconds). See `no_tick_watchdog`.
+                // received_at-derived seconds); consumer retired 2026-07-14.
                 if let Some(ref hb) = tick_heartbeat {
                     hb.store(
                         received_at_nanos.saturating_div(1_000_000_000),

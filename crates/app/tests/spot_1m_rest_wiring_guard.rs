@@ -3,7 +3,7 @@
 //!
 //! Pins (house pattern: `ws_rate_limit_cooldown_wiring_guard.rs`):
 //! 1. main.rs carries exactly ONE `spawn_supervised_spot_1m_rest(` call
-//!    site, INSIDE `spawn_post_market_tasks` (the rest_canary seam —
+//!    site, INSIDE `spawn_post_market_tasks` (the shared post-market seam; the rest_canary itself was retired 2026-07-14 —
 //!    invoked from BOTH boot paths, once-guarded), and that call is gated
 //!    on `config.spot_1m_rest.enabled` (fail-safe: absent section = off).
 //! 2. Stub-guard: `spot_1m_rest_boot.rs` really does the work — posts to
