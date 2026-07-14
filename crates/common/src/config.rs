@@ -5371,7 +5371,7 @@ mod tests {
     /// non-negative trailing jump always; freeze >= 1 + parseable
     /// review date only when enabled.
     #[test]
-    fn test_exit_orders_config_validate_bounds() {
+    fn test_exit_orders_config_validate_with_today_bounds_and_dates() {
         // Disabled defaults are always valid (the shipped state).
         assert!(ExitOrdersConfig::default().validate().is_ok());
 

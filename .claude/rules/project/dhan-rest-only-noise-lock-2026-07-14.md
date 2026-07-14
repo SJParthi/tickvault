@@ -59,6 +59,31 @@ self-heals SILENTLY.**
 | Order-update WS spawn (`dhan_rest_stack` Phase 5a) + its 2 alarms (`tv-<env>-order-update-ws-inactive`, `tv-<env>-order-update-reconnect-storm`) | **Spawn + alarms DELETED** per `websocket-connection-scope-lock.md` §A.1. The core module `order_update_connection.rs` is RETAINED DORMANT (unit tests stay) for the live-trading re-wire — re-spawn or module deletion needs a fresh dated quote in the scope-lock file first. |
 | `observability-architecture.md` paging list | REST-CANARY-01 removed from the Filtered+alarmed set (dated note; the paging drift guard pins tf↔doc↔emit). |
 
+### §2a. Order-execution family (cluster C, PR #1554 — a SEPARATE landed family, NOT a Dhan REST alert)
+
+The §2 4-item set is the **Dhan REST-only surface** (spot-1m / option-chain /
+token). Distinct from it, the **order-execution family** — the cluster-C
+order-side observability that landed on `main` in **PR #1554** — dispatches its
+OWN typed Telegram events from `crates/app/src/order_observability.rs`
+(the order-side consumer's `OmsAlertBridge` / `RiskAlertBridge` sinks):
+`NotificationEvent::OrderRejected`, `NotificationEvent::CircuitBreakerOpened`,
+and `NotificationEvent::RiskHalt`. These fire on the OMS order path (order
+rejects, circuit-breaker transitions, risk halts) in the paper/dry-run layer —
+NOT on the Dhan REST data-pull surface — so they are **outside** the §2 count
+and are NOT governed by the §3 "new Dhan-scoped REST Telegram page" REJECT.
+
+**This subsection is a rebase-reconciliation note (2026-07-14):** it DOCUMENTS
+the pre-existing, landed #1554 dispatch sites so the exit-order lockout guard
+(`dhan_exit_order_lockout_guard::exit_layer_emits_no_telegram_dispatch`) — which
+requires this file to carry an `order execution` family row once any order-path
+`NotificationEvent` dispatch site exists — reconciles cleanly with `main`. It
+introduces NO new emit. **The 🔷 DHAN exit-order layer itself stays
+Telegram-free** (engine exit region + `exit_rules.rs` + `exit_execution.rs` are
+sink-free; EXIT-ORDER-01 / EXIT-VERIFY-01 remain log-sink-only) — the guard's
+part (a) still enforces that verbatim. Any FUTURE change that routes the exit
+layer's own signals to Telegram remains a REJECT under §3 until an operator
+dated quote lands here.
+
 ---
 
 ## §3. What a PR that violates this lock looks like (REJECT)

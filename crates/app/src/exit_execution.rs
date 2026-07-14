@@ -233,12 +233,13 @@ pub async fn dispatch_exit_command(
 
 /// The `Signal::Exit` arm delegate (design §3.5).
 ///
-/// `enabled == false` ⇒ the byte-equivalent LEGACY body (cancel actives +
-/// plain MARKET close via `oms.place_order` — the exact pre-Cluster-B
-/// `trading_pipeline.rs` behavior, same log lines AND the cluster-C
-/// order-side observability (#1554): every exit cancel/close still lands
-/// in `order_audit` via `order_side` — audit-row-only, no Telegram).
-/// `enabled == true` ⇒ [`ExitCommand::CloseAll`] through
+/// `enabled == false` ⇒ the behavior-equivalent LEGACY body (cancel
+/// actives + plain MARKET close via `oms.place_order` — identical control
+/// flow and API calls to the pre-Cluster-B `trading_pipeline.rs` arm,
+/// including the cluster-C order-side observability (#1554): every exit
+/// cancel/close still lands in `order_audit` via `order_side` —
+/// audit-row-only, no Telegram; log fields upgraded to redacted rendering
+/// per the M1 fix). `enabled == true` ⇒ [`ExitCommand::CloseAll`] through
 /// [`dispatch_exit_command`] (cancel actives super-order-aware +
 /// `place_order_sliced` + the verify ladder).
 pub async fn execute_exit_for_security(
@@ -268,9 +269,10 @@ pub async fn execute_exit_for_security(
         return;
     }
 
-    // ---- LEGACY body (disabled path) — byte-equivalent to the
-    // pre-Cluster-B Signal::Exit arm, including the cluster-C order-side
-    // observability (#1554). ----
+    // ---- LEGACY body (disabled path) — behavior-equivalent to the
+    // pre-Cluster-B Signal::Exit arm (identical control flow and API
+    // calls), including the cluster-C order-side observability (#1554);
+    // log fields upgraded to redacted rendering per the M1 fix. ----
     // Step 1: Cancel active (unfilled/pending) orders for this security
     let active: Vec<String> = oms
         .active_orders()
@@ -940,7 +942,7 @@ mod tests {
 
     /// Disabled `execute_exit_for_security` runs the LEGACY body:
     /// cancel actives + ONE plain MARKET close order (no slicing, no
-    /// dispatcher) — byte-equivalent to the pre-Cluster-B Exit arm.
+    /// dispatcher) — behavior-equivalent to the pre-Cluster-B Exit arm.
     #[tokio::test]
     async fn test_execute_exit_disabled_runs_legacy_cancel_and_close() {
         let mut oms = make_dry_run_oms();
