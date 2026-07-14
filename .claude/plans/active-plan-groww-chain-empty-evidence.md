@@ -1,6 +1,6 @@
 # Implementation Plan: Groww chain Empty-arm evidence + empty-vs-leg_shape_drift split
 
-**Status:** IN_PROGRESS
+**Status:** VERIFIED
 **Date:** 2026-07-14
 **Approved by:** coordinator relay (operator top-priority directive, 2026-07-14)
 
@@ -174,24 +174,24 @@ call, no new table, no cadence change).
 
 ## Plan Items
 
-- [ ] Item 1 — parser diagnostics: `strikes_seen` on `GrowwParsedChain`
+- [x] Item 1 — parser diagnostics: `strikes_seen` on `GrowwParsedChain`
   - Files: crates/app/src/groww_option_chain_1m_boot.rs
   - Tests: test_parse_groww_option_chain_invalid_and_absurd_strikes_counted,
     test_parse_groww_option_chain_strike_cap_truncates_and_counts,
     test_parse_groww_option_chain_hostile_shapes_never_panic
-- [ ] Item 2 — `ChainZeroLegEvidence` + pure `zero_leg_outcome` classifier +
+- [x] Item 2 — `ChainZeroLegEvidence` + pure `zero_leg_outcome` classifier +
   the Empty/LegShapeDrift outcome split
   - Files: crates/app/src/groww_option_chain_1m_boot.rs
   - Tests: test_zero_leg_outcome_matrix_empty_vs_drift,
     test_zero_leg_outcome_body_sample_bounded_and_sanitized
-- [ ] Item 3 — fire-arm wiring: Empty evidence error line + empty payload
+- [x] Item 3 — fire-arm wiring: Empty evidence error line + empty payload
   histogram; drift arm → errors count + drift counter + coded line + audit
   row (`RestFetchOutcome::Error`, `error_class="leg_shape_drift"`)
   - Files: crates/app/src/groww_option_chain_1m_boot.rs
   - Tests: test_fetch_bounded_found_empty_and_parse_failure_via_mock,
     test_fetch_bounded_leg_shape_drift_via_mock,
     test_fire_token_path_found_and_empty_via_mock
-- [ ] Item 4 — rule-file dated paragraph (§2c, 2026-07-14 evidence-gap note)
+- [x] Item 4 — rule-file dated paragraph (§2c, 2026-07-14 evidence-gap note)
   - Files: .claude/rules/project/rest-1m-pipeline-error-codes.md
   - Tests: n/a (docs; cross-ref tests stay green — no new ErrorCode)
 
