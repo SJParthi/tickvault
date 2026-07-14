@@ -199,6 +199,15 @@ pub mod lifecycle_reconcile_orchestrator;
 pub mod api_token_rotation;
 #[cfg(feature = "daily_universe_fetcher")]
 pub mod daily_universe_boot;
+/// Shared OMS wiring (TokenHandle→TokenProvider adapter + pinned-timeout
+/// HTTP client builder) — extracted from `trading_pipeline` 2026-07-14 so
+/// the two OMS construction sites can never drift.
+pub mod oms_wiring;
+/// Order runtime (dry-run) — cluster A, operator directive 2026-07-14
+/// (`.claude/plans/active-plan-order-runtime-dryrun.md`): the single-owner
+/// supervised task owning the paper OMS + RiskEngine on the dhan-off prod
+/// profile, spawned ONLY from `dhan_rest_stack` Phase 5a.
+pub mod order_runtime;
 pub mod subsystem_memory;
 pub mod trading_pipeline;
 /// C3 (2026-07-03): bounded, chunked, backpressured STAGE-C.2b WAL frame

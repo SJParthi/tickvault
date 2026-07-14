@@ -299,6 +299,8 @@ async fn groww_ticks_and_candles_land_tagged_feed_groww() {
         std::sync::Arc::new(tickvault_app::groww_bridge::GrowwAuditLatches::default()),
         std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0)),
         None,
+        // Order-runtime mark tap: not under test here.
+        None,
     ));
 
     // Mirror the real sidecar's ≤1s status rewrite on real emits: keep the
@@ -473,6 +475,8 @@ async fn malformed_ndjson_line_is_skipped_and_valid_lines_land() {
         test_aggregator(),
         std::sync::Arc::new(tickvault_app::groww_bridge::GrowwAuditLatches::default()),
         std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0)),
+        None,
+        // Order-runtime mark tap: not under test here.
         None,
     ));
 

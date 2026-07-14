@@ -670,6 +670,34 @@ async fn main() -> Result<()> {
     let _rotated_capture = tickvault_app::groww_bridge::rotate_stale_groww_capture_at_open(
         std::path::Path::new(tickvault_app::groww_bridge::GROWW_TICK_FILE_DEFAULT),
     );
+    // ── Order-runtime mark bridge (dry-run PR, 2026-07-14) ──────────────────
+    // Built BEFORE the Groww bridge spawn so the per-tick tap exists from the
+    // first tick. `[order_runtime].enabled = false` → all three slots stay
+    // empty/None and every downstream path is byte-identical. The receiver is
+    // stashed in a take-once slot for the Dhan REST-only stack's Phase 5a
+    // (`spawn_dhan_rest_stack` — the runtime's single spawn site); the
+    // forwarder (flag + bounded sender) rides into the Groww bridge.
+    let (order_runtime_mark_forwarder, order_runtime_mark_rx_slot, order_runtime_marks_wanted) =
+        if config.order_runtime.enabled {
+            let (mark_tx, mark_rx) = tokio::sync::mpsc::channel::<
+                tickvault_app::order_runtime::MarkUpdate,
+            >(config.order_runtime.mark_channel_capacity);
+            let marks_wanted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            (
+                Some(tickvault_app::order_runtime::MarkForwarder {
+                    marks_wanted: std::sync::Arc::clone(&marks_wanted),
+                    tx: mark_tx,
+                }),
+                std::sync::Arc::new(std::sync::Mutex::new(Some(mark_rx))),
+                marks_wanted,
+            )
+        } else {
+            (
+                None,
+                std::sync::Arc::new(std::sync::Mutex::new(None)),
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            )
+        };
     if groww_scale_enabled {
         let _groww_shard_bridges =
             tickvault_app::groww_bridge::spawn_supervised_groww_shard_bridges(
@@ -703,6 +731,9 @@ async fn main() -> Result<()> {
             // boundary task's trading-day gate — built from the SAME `config.trading`
             // the Dhan IST-midnight force-seal calendar uses.
             groww_trading_calendar,
+            // Order-runtime mark tap (dry-run PR, 2026-07-14): per-tick LTP
+            // forwarder into the dry-run runtime; `None` when disabled.
+            order_runtime_mark_forwarder,
         );
     }
     // On a sidecar auth/entitlement/error diagnostic the sidecar supervisor
@@ -3525,6 +3556,17 @@ async fn main() -> Result<()> {
                     notifier: std::sync::Arc::clone(&notifier),
                     calendar: std::sync::Arc::clone(&trading_calendar),
                     feed_runtime: std::sync::Arc::clone(&feed_runtime),
+                    // Order-runtime dry-run PR (2026-07-14): WAL capture +
+                    // boot-staged replay + conditional confirm + mark bridge.
+                    // Dhan-OFF boots never move these into the lane ctx (that
+                    // branch is the `if`; this is the `else`), so the Vec +
+                    // count are intact here.
+                    ws_frame_spill: ws_frame_spill.clone(),
+                    ws_wal_replay_order_update,
+                    livefeed_frames_replayed: ws_wal_replay_live_feed.len(),
+                    wal_dir: ws_wal_path.clone(),
+                    mark_rx_slot: std::sync::Arc::clone(&order_runtime_mark_rx_slot),
+                    marks_wanted: std::sync::Arc::clone(&order_runtime_marks_wanted),
                 },
             );
         }

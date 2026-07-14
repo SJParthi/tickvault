@@ -25,7 +25,6 @@
 
 use std::path::Path;
 
-use secrecy::{ExposeSecret, SecretString};
 use tokio::sync::broadcast;
 use tracing::{debug, error, info, warn};
 
@@ -46,42 +45,19 @@ use tickvault_core::auth::token_manager::TokenHandle;
 
 use tickvault_trading::indicator::{IndicatorEngine, IndicatorParams};
 use tickvault_trading::oms::{
-    OrderApiClient, OrderManagementSystem, OrderRateLimiter, PlaceOrderRequest, TokenProvider,
+    OrderApiClient, OrderManagementSystem, OrderRateLimiter, PlaceOrderRequest,
 };
 use tickvault_trading::risk::engine::RiskEngine;
 use tickvault_trading::risk::types::RiskCheck;
 use tickvault_trading::strategy::{Signal, StrategyHotReloader, StrategyInstance};
 
 // ---------------------------------------------------------------------------
-// TokenProvider bridge — connects core::TokenHandle to trading::TokenProvider
+// TokenProvider bridge — EXTRACTED to `crate::oms_wiring::TokenHandleBridge`
+// (order-runtime dry-run PR, 2026-07-14) so this pipeline and the dhan-off
+// `order_runtime` share ONE adapter + ONE pinned-timeout client builder.
 // ---------------------------------------------------------------------------
 
-/// Bridges the core crate's `TokenHandle` (arc-swap) to the trading crate's
-/// `TokenProvider` trait. Cold path — called once per order placement.
-struct TokenHandleBridge {
-    handle: TokenHandle,
-}
-
-impl TokenProvider for TokenHandleBridge {
-    fn get_access_token(&self) -> Result<SecretString, tickvault_trading::oms::OmsError> {
-        let guard = self.handle.load();
-        match guard.as_ref() {
-            Some(token_state) => {
-                // Reject expired tokens — prevents sending orders with stale JWT
-                // that would return DH-901 and enter a retry loop.
-                if !token_state.is_valid() {
-                    return Err(tickvault_trading::oms::OmsError::TokenExpired);
-                }
-                let token_str = token_state.access_token().expose_secret();
-                if token_str.is_empty() {
-                    return Err(tickvault_trading::oms::OmsError::NoToken);
-                }
-                Ok(SecretString::from(token_str.to_owned()))
-            }
-            None => Err(tickvault_trading::oms::OmsError::NoToken),
-        }
-    }
-}
+use crate::oms_wiring::TokenHandleBridge;
 
 // ---------------------------------------------------------------------------
 // Trading Pipeline Task
@@ -204,19 +180,9 @@ async fn run_trading_pipeline(
         config.capital,
     );
 
-    // Initialize OMS (always starts in dry_run mode by default)
-    let oms_http_client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(
-            tickvault_common::constants::OMS_HTTP_TIMEOUT_SECS,
-        ))
-        .connect_timeout(std::time::Duration::from_secs(
-            tickvault_common::constants::OMS_HTTP_CONNECT_TIMEOUT_SECS,
-        ))
-        .pool_idle_timeout(std::time::Duration::from_secs(
-            tickvault_common::constants::OMS_HTTP_POOL_IDLE_TIMEOUT_SECS,
-        ))
-        .build()
-        .unwrap_or_default();
+    // Initialize OMS (always starts in dry_run mode by default). Client via
+    // the SHARED pinned-timeout builder (oms_wiring — 2026-07-14 extraction).
+    let oms_http_client = crate::oms_wiring::build_oms_http_client();
     let api_client = OrderApiClient::new(
         oms_http_client,
         config.rest_api_base_url,
@@ -759,6 +725,7 @@ mod tests {
     use secrecy::ExposeSecret;
 
     use tickvault_core::auth::types::{DhanAuthResponseData, TokenState};
+    use tickvault_trading::oms::TokenProvider;
 
     /// Creates a TokenHandle with a valid token for testing.
     fn make_token_handle_with_value(access_token: &str) -> TokenHandle {

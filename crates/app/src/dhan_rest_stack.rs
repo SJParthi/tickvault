@@ -155,6 +155,12 @@ const DHAN_REST_STACK_ALREADYHELD_PATIENCE_SECS: u64 = 300;
 /// ~125s generateAccessToken cooldown — see
 /// [`dhan_rest_token_backoff_secs`].
 const DHAN_REST_STACK_TOKEN_RETRY_FLOOR_SECS: u64 = 130;
+/// Boot-staged order-update WAL burst warning threshold (order-runtime
+/// dry-run PR, 2026-07-14): the stack broadcast holds 256 events — a
+/// replay burst beyond ~200 can lag the runtime's receiver mid-drain
+/// (counted there); this fires ONE coalesced warn + counter so the
+/// envelope crossing is visible.
+const ORDER_UPDATE_WAL_REPLAY_BURST_WARN: usize = 200;
 
 /// Process-global once-guard: the REST-only stack must never be brought up
 /// twice (N stacks = N heartbeats + N renewal loops + N canary/spot/chain
@@ -197,6 +203,34 @@ pub struct DhanRestStackParams {
     /// Runtime feed-state — receives `set_live_token_manager` so the token
     /// gauges read this stack's manager.
     pub feed_runtime: Arc<FeedRuntimeState>,
+    /// The process-shared WS frame WAL (order-runtime dry-run PR,
+    /// 2026-07-14): with `[order_runtime].enabled` the order-update WS
+    /// restores durable frame capture (`wal_spill = Some(..)`); disabled
+    /// keeps the Phase-A dormant `None`. `Option` mirrors main.rs's
+    /// fail-closed init (always `Some` on a real boot — init exits(1)
+    /// on failure).
+    pub ws_frame_spill: Option<Arc<tickvault_storage::ws_frame_spill::WsFrameSpill>>,
+    /// Boot-staged order-update WAL frames (main.rs STAGE-C replay) —
+    /// drained into the stack broadcast BEFORE the WS spawns (FIFO law F4)
+    /// when the runtime is enabled. Disabled: left staged in `replaying/`
+    /// (byte-identical Phase-A residual).
+    pub ws_wal_replay_order_update: Vec<Vec<u8>>,
+    /// Count of boot-staged LIVE-FEED frames (dhan-off = never re-injected).
+    /// Gates the conditional `confirm_replayed`: a whole-dir confirm while
+    /// stale live-feed frames sit staged would archive them un-reinjected
+    /// (silent tick loss, F6) — so confirm fires ONLY when this is 0.
+    pub livefeed_frames_replayed: usize,
+    /// The WAL directory (`ws_wal_dir()`) — the conditional confirm target.
+    pub wal_dir: std::path::PathBuf,
+    /// The runtime's mark receiver, stashed by main.rs and taken ONCE at
+    /// spawn (a `Receiver` is not `Clone`; the slot keeps the params struct
+    /// constructible on every boot arm). `None` inside = already taken or
+    /// runtime disabled.
+    pub mark_rx_slot: Arc<
+        std::sync::Mutex<Option<tokio::sync::mpsc::Receiver<crate::order_runtime::MarkUpdate>>>,
+    >,
+    /// Shared mark-gate flag (the Groww bridge's per-tick `Relaxed` load).
+    pub marks_wanted: Arc<AtomicBool>,
 }
 
 /// Bounded exponential backoff for the stack's retry-forever loops:
@@ -298,7 +332,7 @@ pub fn spawn_dhan_rest_stack(params: DhanRestStackParams) -> Option<tokio::task:
 /// entirely in the background off the cold path).
 // TEST-EXEMPT: live-I/O orchestration (see spawn_dhan_rest_stack); exercised
 // by the live boot-deploy follow, with the pure helpers unit-tested below.
-async fn run_dhan_rest_stack(params: DhanRestStackParams) {
+async fn run_dhan_rest_stack(mut params: DhanRestStackParams) {
     // Rule-11 discipline: the gauge reads 0 for the whole bring-up window so
     // "stack not up yet" is never presented as up.
     metrics::gauge!("tv_dhan_rest_stack_up").set(0.0);
@@ -661,59 +695,190 @@ async fn run_dhan_rest_stack(params: DhanRestStackParams) {
     //
     // Parameter honesty:
     //   - `order_sender`: a STACK-LOCAL broadcast channel (capacity mirrors
-    //     the legacy 256); a stack-held DRAIN task consumes every event —
-    //     counted (`tv_order_update_dormant_events_total`, static label) and
-    //     DISCARDED: no WAL capture, no OMS consumer until live trading
-    //     returns (the OMS wiring restores durable order-event capture).
-    //     Holding a live receiver keeps the connection's dropped-receiver
-    //     error arm (`tv_order_update_broadcast_drops_total`) dormant BY
-    //     CONSTRUCTION — that arm again means what it says (a crashed
-    //     subscriber), never "the stack is dormant by design"
-    //     (2026-07-13 hostile-review M1: the WS receives ALL account order
-    //     events incl. the operator's manual Dhan-app orders, so a dropped
-    //     receiver produced a per-event false "subscriber crashed" ERROR
-    //     stream on any manual-order day).
-    //   - `wal_spill = None` (Verified 2026-07-13): the order-update WAL
-    //     replay staging is a `main()` STAGE-C boot concern — main.rs stages
-    //     residual frames at boot, and BOTH drain sites (fast arm + lane)
-    //     are Dhan-gated and dead on a dhan-off boot, so this stack neither
-    //     drains nor appends that WAL. The dormant phase places no orders,
-    //     so there is no order-event stream to durably capture; lifecycle
-    //     rows still land in `ws_event_audit` via the consumer below.
+    //     the legacy 256). Consumer depends on `[order_runtime].enabled`:
+    //       * DISABLED (Phase-A dormant shape, byte-identical): a stack-held
+    //         DRAIN task consumes every event — counted
+    //         (`tv_order_update_dormant_events_total`, static label) and
+    //         DISCARDED: no WAL capture, no OMS consumer.
+    //       * ENABLED (order-runtime dry-run PR, 2026-07-14): the dry-run
+    //         ORDER RUNTIME subscribes BEFORE the boot-staged WAL frames are
+    //         drained into the broadcast (ordering law F5 — replayed fills
+    //         must reach the runtime), replacing the discard drain. The
+    //         runtime holds its receiver for the process lifetime, so the
+    //         connection's dropped-receiver error arm
+    //         (`tv_order_update_broadcast_drops_total`) stays dormant BY
+    //         CONSTRUCTION exactly as the M1 drain guaranteed.
+    //   - `wal_spill`: `None` when the runtime is disabled (Phase-A dormant
+    //     shape — Verified 2026-07-13); `Some(ws_frame_spill)` when enabled —
+    //     durable order-event frame CAPTURE is restored (the upstream
+    //     append-before-broadcast code always existed; this re-arms it), and
+    //     the boot-staged order-update WAL segments are drained + CONDITIONALLY
+    //     confirmed below (confirm iff parse-clean AND zero stale live-feed
+    //     frames staged — F6; else defer with ONE coalesced WS-REINJECT-01
+    //     `warn!` + counter, never a page).
     //   - `dhan_feed_flag = None`: always-on within this stack — the stack
     //     exists only when the raw boot TOML retires the lane, and the
     //     /api/feeds handler 409-refuses a runtime Dhan enable.
     // -----------------------------------------------------------------------
     {
-        let (order_update_sender, mut order_update_receiver) =
+        let (order_update_sender, order_update_receiver) =
             tokio::sync::broadcast::channel::<tickvault_common::order_types::OrderUpdate>(256);
-        // Dormant DRAIN task (2026-07-13 hostile-review M1): the receiver is
-        // HELD and drained — never dropped. Events are parsed upstream,
-        // counted here, and DISCARDED (module docs item 5 dormancy honesty);
-        // `Lagged` is impossible in practice at this event rate but is
-        // skipped defensively; `Closed` (sender gone = connection task dead)
-        // ends the drain — the WS-GAP-10 unreachable-exit error at the spawn
-        // below is the loud signal for that case.
-        tokio::spawn(async move {
-            loop {
-                match order_update_receiver.recv().await {
-                    Ok(_event) => {
-                        metrics::counter!("tv_order_update_dormant_events_total").increment(1);
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+        // OrderUpdateAuthenticated Telegram once Dhan accepts the token
+        // (the fast-arm listener mirror; this stack is process-lifetime, so
+        // a plain spawn is correct — no lane teardown can orphan it).
+        // Hoisted ABOVE the consumer branch: the order runtime shares the
+        // auth signal (its one-shot reconcile arm fires on first WS auth).
+        let auth_signal = Arc::new(tokio::sync::Notify::new());
+        let auth_latch = Arc::new(AtomicBool::new(false));
+        // wal_spill for the WS spawn below: capture restored ONLY with the
+        // runtime enabled (disabled keeps the Phase-A dormant `None`).
+        let ou_wal_spill = if config.order_runtime.enabled {
+            params.ws_frame_spill.clone()
+        } else {
+            None
+        };
+        if config.order_runtime.enabled {
+            // The channel-construction receiver is replaced by an explicit
+            // subscribe so the ordering law is visible + ratchetable:
+            // subscribe() BEFORE spawn_order_runtime BEFORE the WAL drain
+            // BEFORE the WS spawn.
+            drop(order_update_receiver);
+            let runtime_rx = order_update_sender.subscribe();
+            // Take the mark receiver ONCE from the boot slot (poisoning-safe
+            // — the slot is written once by main.rs before this task spawns).
+            let mark_rx = params
+                .mark_rx_slot
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            let mark_rx = match mark_rx {
+                Some(rx) => rx,
+                None => {
+                    // Structurally unreachable (once-guarded spawn + the slot
+                    // is filled on every enabled boot): degrade to a mark-less
+                    // runtime — order updates still flow; the leaked sender
+                    // keeps the dummy channel open so the mark arm just idles.
+                    error!(
+                        "order runtime: mark receiver slot was EMPTY at spawn — running \
+                         mark-less (paper fills defer until marks return; investigate the \
+                         boot wiring)"
+                    );
+                    let (dummy_tx, rx) = tokio::sync::mpsc::channel(1);
+                    std::mem::forget(dummy_tx);
+                    rx
+                }
+            };
+            let _order_runtime_supervisor = crate::order_runtime::spawn_order_runtime(
+                crate::order_runtime::OrderRuntimeParams {
+                    config: Arc::clone(&params.config),
+                    notifier: params.notifier.clone(),
+                    calendar: Arc::clone(&params.calendar),
+                    order_update_sender: order_update_sender.clone(),
+                    first_order_update_rx: runtime_rx,
+                    mark_rx,
+                    marks_wanted: Arc::clone(&params.marks_wanted),
+                    token_handle: Arc::clone(&token_handle),
+                    client_id: client_id.clone(),
+                    auth_notify: Arc::clone(&auth_signal),
+                },
+            );
+            // F4 FIFO: drain the boot-staged order-update WAL frames into the
+            // broadcast BEFORE the WS spawns, so replayed fills precede fresh
+            // live events on the runtime's receiver.
+            let frames = std::mem::take(&mut params.ws_wal_replay_order_update);
+            let staged_count = frames.len();
+            if staged_count > ORDER_UPDATE_WAL_REPLAY_BURST_WARN {
+                // Broadcast(256) envelope honesty: a burst larger than the
+                // channel would lag the runtime receiver mid-drain (counted
+                // there); loud here so the operator knows the day started
+                // from an unusually deep residual.
+                warn!(
+                    staged_frames = staged_count,
+                    "order runtime: boot-staged order-update WAL burst exceeds the \
+                     broadcast envelope — replay proceeds; receiver lag is counted"
+                );
+                metrics::counter!("tv_wal_replay_burst_total").increment(1);
+            }
+            let (replay_parsed, replay_broadcast, replay_parse_errors) =
+                crate::boot_helpers::drain_replayed_order_updates_to_broadcast(
+                    frames,
+                    &order_update_sender,
+                );
+            if staged_count > 0 {
+                info!(
+                    parsed = replay_parsed,
+                    broadcast = replay_broadcast,
+                    parse_errors = replay_parse_errors,
+                    "order runtime: boot-staged order-update WAL frames drained into the \
+                     stack broadcast (before the WS spawn — FIFO preserved)"
+                );
+            }
+            // F6/F7 conditional confirm: whole-dir `confirm_replayed` archives
+            // EVERYTHING staged in `replaying/` — safe ONLY when this drain
+            // was parse-clean AND no stale live-feed frames sit staged
+            // (dhan-off boots never re-inject live-feed frames).
+            match crate::order_runtime::confirm_decision(
+                replay_parse_errors,
+                params.livefeed_frames_replayed,
+            ) {
+                crate::order_runtime::ConfirmVerdict::Confirm => {
+                    tickvault_storage::ws_frame_spill::confirm_replayed(&params.wal_dir);
+                    info!(
+                        confirmed_frames = staged_count,
+                        "order runtime: WAL order-update replay confirmed — staged segments \
+                         archived (replaying/ clean)"
+                    );
+                }
+                crate::order_runtime::ConfirmVerdict::Defer { live_feed_frames } => {
+                    // `warn!` DELIBERATELY (not `error!`): WS-REINJECT-01 has a
+                    // CloudWatch ERROR-level log-filter alarm, and a stale
+                    // live-feed residual on a dhan-off boot is EXPECTED (the
+                    // Phase-A class) — a per-boot page would be pager noise.
+                    // The frames stay staged (re-replayed next boot, never
+                    // lost); the runbook's one-time archive procedure clears
+                    // the stale live-feed segments.
+                    warn!(
+                        code = ErrorCode::WsReinject01Aborted.code_str(),
+                        reason = "confirm_deferred_stale_livefeed",
+                        live_feed_frames,
+                        parse_errors = replay_parse_errors,
+                        "order runtime: WAL confirm DEFERRED — staged segments left in \
+                         replaying/ (zero loss; cleared by the operator archive procedure \
+                         or the next dhan-on boot's live-feed re-injection)"
+                    );
+                    metrics::counter!("tv_wal_confirm_deferred_total").increment(1);
                 }
             }
-        });
+            info!(
+                "order runtime: dry-run order runtime spawned (replaces the dormant \
+                 discard drain; order-update WAL capture restored)"
+            );
+        } else {
+            // DISABLED: byte-identical Phase-A dormant shape.
+            // Dormant DRAIN task (2026-07-13 hostile-review M1): the receiver
+            // is HELD and drained — never dropped. Events are parsed upstream,
+            // counted here, and DISCARDED (module docs item 5 dormancy
+            // honesty); `Lagged` is impossible in practice at this event rate
+            // but is skipped defensively; `Closed` (sender gone = connection
+            // task dead) ends the drain — the WS-GAP-10 unreachable-exit error
+            // at the spawn below is the loud signal for that case.
+            let mut order_update_receiver = order_update_receiver;
+            tokio::spawn(async move {
+                loop {
+                    match order_update_receiver.recv().await {
+                        Ok(_event) => {
+                            metrics::counter!("tv_order_update_dormant_events_total").increment(1);
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+            });
+        }
         let ou_url = config.dhan.order_update_websocket_url.clone();
         let ou_client_id = client_id.clone();
         let ou_token = Arc::clone(&token_handle);
         let ou_calendar = Arc::clone(&params.calendar);
-        // OrderUpdateAuthenticated Telegram once Dhan accepts the token
-        // (the fast-arm listener mirror; this stack is process-lifetime, so
-        // a plain spawn is correct — no lane teardown can orphan it).
-        let auth_signal = Arc::new(tokio::sync::Notify::new());
-        let auth_latch = Arc::new(AtomicBool::new(false));
         {
             let listener_signal = Arc::clone(&auth_signal);
             let listener_notifier = params.notifier.clone();
@@ -737,7 +902,9 @@ async fn run_dhan_rest_stack(params: DhanRestStackParams) {
                 ou_token,
                 order_update_sender,
                 ou_calendar,
-                None,
+                // wal_spill: Some(..) with the runtime enabled (durable frame
+                // capture restored); None keeps the Phase-A dormant shape.
+                ou_wal_spill,
                 run_signal,
                 run_latch,
                 ou_reconnect_notifier,
@@ -755,11 +922,19 @@ async fn run_dhan_rest_stack(params: DhanRestStackParams) {
                 "order update WebSocket task exited — unreachable by design; investigate immediately"
             );
         });
-        info!(
-            "Dhan REST-only stack: order-update WS spawned (functional-dormant, Q4-i — \
-             connects at market open via the off-hours gate; incoming order events are \
-             drained + counted, NOT persisted, until live trading returns)"
-        );
+        if config.order_runtime.enabled {
+            info!(
+                "Dhan REST-only stack: order-update WS spawned (Q4-i — connects at market \
+                 open via the off-hours gate; incoming order events feed the DRY-RUN order \
+                 runtime and are durably WAL-captured)"
+            );
+        } else {
+            info!(
+                "Dhan REST-only stack: order-update WS spawned (functional-dormant, Q4-i — \
+                 connects at market open via the off-hours gate; incoming order events are \
+                 drained + counted, NOT persisted, until live trading returns)"
+            );
+        }
     }
 
     // REST-health canary (DHAN-REST-400): 09:05 / 12:00 / 15:25 IST probes.
