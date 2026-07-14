@@ -58,6 +58,18 @@ pub const DEDUP_KEY_ORDER_AUDIT: &str = "ts, trading_date_ist, order_id, leg, ev
 /// `detail` column hard cap — bounded forensic text, never raw bodies.
 pub const ORDER_AUDIT_DETAIL_MAX_CHARS: usize = 200;
 
+/// Sentinel for a SYMBOL value that is empty/not-applicable at row time.
+/// Empty ILP tag values (`,order_id=`) are invalid in classic line
+/// protocol and UNVERIFIED-LIVE against QuestDB (C3, 2026-07-14 hostile
+/// review) — the house convention is either skip-when-empty (→ NULL, the
+/// `instrument_lifecycle_persistence` optional-SYMBOL pattern) or the
+/// `"n/a"` sentinel. This module uses the sentinel for BOTH `order_id`
+/// and `correlation_id`: `order_id` is IN the DEDUP key, so the constant
+/// sentinel gives a stable dedup identity, and it matches the sibling
+/// `"n/a"` sentinels already stamped on `exchange_segment` /
+/// `transaction_type` / `order_status` in the same row.
+pub const ORDER_AUDIT_SYMBOL_NA: &str = "n/a";
+
 const QUESTDB_DDL_TIMEOUT_SECS: u64 = 10;
 
 /// Typed order-lifecycle event — the SYMBOL wire strings are stable
@@ -238,9 +250,12 @@ pub async fn ensure_order_audit_table(questdb_config: &QuestDbConfig) {
                 let body = resp.text().await.unwrap_or_default();
                 metrics::counter!("tv_order_audit_persist_errors_total", "stage" => "ensure_ddl")
                     .increment(1);
+                // SEC-2: bounded DDL prefix (our own static statement — the
+                // prefix identifies it; the full ~800-char CREATE would
+                // exceed the ≤300-char error-payload house bound).
                 error!(code = ErrorCode::Audit06OrderWriteFailed.code_str(),
                     stage = "ensure_ddl",
-                    %status, ddl = ddl.as_str(),
+                    %status, ddl = %ddl.chars().take(80).collect::<String>(),
                     body = %body.chars().take(200).collect::<String>(),
                     "AUDIT-06: order_audit DDL returned non-2xx (dedup may be \
                      missing — duplicate-row window until a later ensure succeeds)");
@@ -252,7 +267,8 @@ pub async fn ensure_order_audit_table(questdb_config: &QuestDbConfig) {
                     code = ErrorCode::Audit06OrderWriteFailed.code_str(),
                     stage = "ensure_ddl",
                     ?err,
-                    ddl = ddl.as_str(),
+                    // SEC-2: bounded DDL prefix (see the non-2xx arm).
+                    ddl = %ddl.chars().take(80).collect::<String>(),
                     "AUDIT-06: order_audit DDL request failed"
                 );
             }
@@ -358,13 +374,24 @@ impl OrderAuditWriter {
             .chars()
             .take(ORDER_AUDIT_DETAIL_MAX_CHARS)
             .collect();
+        // C3: never write an empty ILP SYMBOL value — map to the "n/a"
+        // house sentinel (checked AFTER sanitize, so a hostile all-
+        // control-char input cannot sneak an empty tag through either).
+        let symbol_or_na = |value: &str| -> String {
+            let sanitized = sanitize_audit_string(value);
+            if sanitized.is_empty() {
+                ORDER_AUDIT_SYMBOL_NA.to_string()
+            } else {
+                sanitized
+            }
+        };
         self.buffer
             .table(ORDER_AUDIT_TABLE)
             .context("table")?
             // Symbols BEFORE columns (ILP tags-before-fields rule).
-            .symbol("order_id", sanitize_audit_string(&r.order_id))
+            .symbol("order_id", symbol_or_na(&r.order_id))
             .context("order_id")?
-            .symbol("correlation_id", sanitize_audit_string(&r.correlation_id))
+            .symbol("correlation_id", symbol_or_na(&r.correlation_id))
             .context("correlation_id")?
             .symbol("leg", r.leg)
             .context("leg")?
@@ -776,5 +803,56 @@ mod tests {
         w.append_order_audit_row(&sample_row())
             .expect("append must succeed without network");
         assert_eq!(w.pending(), 1, "row buffered locally");
+    }
+
+    /// C3 (2026-07-14 hostile review): empty `order_id`/`correlation_id`
+    /// never produce an empty ILP tag value (`,order_id=` — invalid in
+    /// classic line protocol, UNVERIFIED-LIVE against QuestDB) — they map
+    /// to the "n/a" house sentinel instead.
+    #[test]
+    fn test_append_order_audit_row_empty_symbols_map_to_na_sentinel() {
+        let mut w = OrderAuditWriter::for_test();
+        let row = OrderAuditRow {
+            order_id: String::new(),
+            correlation_id: String::new(),
+            event: OrderAuditEvent::RateLimited,
+            ..sample_row()
+        };
+        w.append_order_audit_row(&row).expect("append must succeed");
+        let line = w.buffer_utf8();
+        assert!(
+            line.contains(",order_id=n/a"),
+            "empty order_id must become the n/a sentinel: {line}"
+        );
+        assert!(
+            line.contains(",correlation_id=n/a"),
+            "empty correlation_id must become the n/a sentinel: {line}"
+        );
+        assert!(
+            !line.contains("order_id=,") && !line.contains("order_id= "),
+            "no bare-equals empty tag value: {line}"
+        );
+        assert_eq!(ORDER_AUDIT_SYMBOL_NA, "n/a");
+    }
+
+    /// M2 (2026-07-14 hostile review): the `Some(Err(..))` flush arm — a
+    /// REAL server reject through a live (lazily-built) HTTP sender —
+    /// exercises the poisoned-buffer discard, not just the no-sender bail.
+    /// Multi-thread flavor so the mock server task serves while the sync
+    /// flush blocks the test task.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_order_audit_flush_server_reject_hits_some_err_and_discards() {
+        let port = spawn_mock_http(MOCK_HTTP_500).await;
+        let mut w = OrderAuditWriter::new(&mock_cfg(port));
+        w.append_order_audit_row(&sample_row())
+            .expect("append must succeed");
+        assert_eq!(w.pending(), 1);
+        let err = w.flush().expect_err("server 500 must surface as Err");
+        assert!(
+            err.to_string().contains("discarded"),
+            "discard context expected: {err:#}"
+        );
+        assert_eq!(w.pending(), 0, "failed flush discards pending");
+        assert!(w.buffer_utf8().is_empty(), "ILP buffer cleared on discard");
     }
 }

@@ -546,6 +546,13 @@ history only):
   `tv_order_alert_dropped_total{reason}`.
 - Consumer: `crates/app/src/order_observability.rs` (paper rows TODAY —
   `mode = "paper"` while `dry_run = true`).
+- **Rejection-class split (C4, 2026-07-14 hostile review):** place-time
+  API rejections (the `place_order` Err arm — OrderRejected Telegram +
+  `rejected` audit row + since the C4 fix `tv_orders_rejected_total`) and
+  WS-reported REJECTED transitions (`process_order_update` — counter/alarm
+  only, NO Telegram/row; a `fire_alert` at that transition is a Phase-1
+  follow-up) are DISJOINT classes — the orders-rejected alarm and the
+  OrderRejected Telegram are two routes, not one signal chain.
 
 ## STORAGE-GAP-03 — audit-table write failure (any table)
 
@@ -562,12 +569,18 @@ ILP-over-HTTP template as order_audit above) emits STORAGE-GAP-03 with
 stages `ensure_client_build` / `ensure_ddl` / `append` / `flush`. DEDUP
 key: `ts, trading_date_ist, security_id, exchange_segment, snapshot_kind,
 feed` (I-P1-11 pair + `snapshot_kind` + `feed` in-key). **OnEod heartbeat
-contract:** the order-side consumer writes ≥1 `snapshot_kind = "on_eod"`
-row per trading day (aggregate sentinels `security_id = 0`,
-`exchange_segment = "ALL"`) at the market-close message — the positive
-"the pnl audit leg is alive" signal (audit Rule 11) and the daily
-reconcile denominator. `on_fill` / `on_minute` are Phase-1 emits
-(documented, dormant). Log-sink-only delivery boundary, same as AUDIT-06.
+contract (honest envelope — C1 truth-sync, 2026-07-14):** WHILE the
+order-side consumer runs, it writes ≥1 `snapshot_kind = "on_eod"` row per
+trading day (aggregate sentinels `security_id = 0`, `exchange_segment =
+"ALL"`) at the market-close message — the positive "the pnl audit leg is
+alive" signal (audit Rule 11) and the daily reconcile denominator. The
+consumer + close signal are spawned by the trading pipeline, whose BOTH
+spawn sites are Dhan-lane-gated — the subsystem is code-ready but DORMANT
+while `feeds.dhan_enabled = false` (today's prod default): on a dhan-off
+boot no row lands and nothing false-pages (nothing runs); the contract
+activates whenever the Dhan lane / live trading runs. `on_fill` /
+`on_minute` are Phase-1 emits (documented, dormant). Log-sink-only
+delivery boundary, same as AUDIT-06.
 
 ## STORAGE-GAP-04 — S3 archive failure
 

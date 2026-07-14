@@ -316,6 +316,14 @@ impl OrderManagementSystem {
                 if !matches!(err, OmsError::DhanRateLimited) {
                     self.circuit_breaker.record_failure();
                 }
+                // C4 (2026-07-14): place-time API rejections and WS-reported
+                // REJECTED transitions are DISJOINT classes — this arm
+                // previously fired only the OrderRejected alert while the
+                // tv-<env>-orders-rejected alarm's counter moved only at the
+                // process_order_update REJECTED transition. Count BOTH
+                // classes so the alarm pages for the only class reachable at
+                // Phase-1 entry (the order-update WS is functional-dormant).
+                counter!("tv_orders_rejected_total").increment(1);
                 self.fire_alert(OmsAlert::OrderRejected {
                     correlation_id: correlation_id.clone(),
                     reason: format!("{err}"),

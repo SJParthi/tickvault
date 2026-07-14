@@ -30,7 +30,10 @@ boot; non-finite price/pnl clamped to 0.0 + counted; reject/rate-limit storm →
 absorbs, overflow = loud coded drop, AlertPacer bounds Telegram to 1/kind/300s with suppressed
 counts; mid-day restart → process-internal reconcile only (DB count informational — no false
 mismatch); weekend/holiday manual run → trading-day gate skips OnEod + reconcile; dhan-off
-boot → ensures still run, zero order rows (honest), OnEod aggregate still written; same-ns
+boot (today's prod default) → the WHOLE subsystem is DORMANT — both pipeline spawn sites are
+Dhan-lane-gated, so NO consumer, NO ensure-DDL, NO OnEod heartbeat, NO reconcile run (and
+nothing false-pages: nothing runs); the subsystem is code-ready + fully wired and activates
+whenever the Dhan lane / live trading runs (C1 truth-sync, 2026-07-14 hostile review); same-ns
 duplicate events survive via event-in-key; notifier NoOp mode → notify() self-counts, audit
 rows unaffected; pre-registration must follow recorder install (first-sample-baseline).
 
@@ -74,11 +77,17 @@ tv_order_alert_dropped_total{reason}) · coded error! (AUDIT-06, STORAGE-GAP-03,
 RISK-GAP-01 — all log-sink-only, delivery boundary documented in rule files) · Telegram typed
 events (OrderRejected/CircuitBreaker*/RateLimitExhausted High-Medium, RiskHalt Critical, all
 Dhan-badged, paced, session-gated except Critical) · audit tables (order_audit + pnl_audit,
-SEBI 5y, DEDUP self-healing DDL) · CW alarms (orders-rejected fixed, orders-placed-storm
-armed, daily-loss armed-dormant, fill-lag disarmed-with-arming-contract) · dashboard widget ·
+SEBI 5y, DEDUP self-healing DDL) · CW alarms (orders-rejected fixed — NOTE the C4 rejection-
+class split: the alarm's counter moves at the place-time API-error arm (C4 fix) AND the
+WS-reported REJECTED transition, while the OrderRejected Telegram/audit row fires ONLY at the
+place-time arm — two routes, not one signal chain; orders-placed-storm armed, daily-loss
+armed-dormant, fill-lag disarmed-with-arming-contract) · dashboard widget ·
 daily reconcile info!/error! line. Honest 100% claim: 100% inside the tested envelope, with
 ratcheted regression coverage: best-effort forensic subsystem — bounded mpsc(1024) with loud
-coded drops, discard-pending poisoned-buffer defense, DEDUP-idempotent re-appends,
+coded drops, discard-pending poisoned-buffer defense (duplicates cannot arise from re-appends
+— per-message wall-clock-ns `ts` in both DEDUP keys and NO replay source exists for order
+events; `event`-in-key is defense-in-depth, and DEDUP absorbs only an exact same-ts duplicate
+key — M3 truth-sync, 2026-07-14),
 first-sample pre-registrations ratcheted by source-order scans; a failure here never touches
 tick capture, candles, the (paper) order path, or feed recovery. NOT claimed: fill-side rows/
 lag (structurally absent in dry-run — armed-on-arrival), broker-book reconciliation (needs
