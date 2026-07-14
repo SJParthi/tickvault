@@ -53,5 +53,8 @@ still caught by the read loop's `Err(..)` branch.
 
 - `.claude/rules/project/websocket-enforcement.md` — WebSocket rules
 - `crates/core/src/websocket/activity_watchdog.rs` — watchdog constants
-- `crates/core/src/websocket/connection.rs:456-510` — severity split
+- `crates/core/src/websocket/order_update_connection.rs` — the surviving
+  off-hours severity split (PR-C2, 2026-07-13: the main-feed connection
+  module that originally carried this split was deleted with the Dhan
+  live-WS lane)
 - `crates/core/src/notification/events.rs` — `WebSocketDisconnectedOffHours` variant

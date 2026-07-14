@@ -239,10 +239,13 @@ mod tests {
         let spawn_calls = main_src
             .matches("spawn_supervised_api_token_reload(")
             .count();
-        assert!(
-            spawn_calls >= 2,
-            "both boot arms (fast crash-recovery + slow) must spawn the \
-             supervised API token reload task; found {spawn_calls} call site(s)"
+        // PR-C2 (2026-07-13): the FAST crash-recovery boot arm was deleted
+        // with the Dhan live-WS lane, so the process has a SINGLE boot path
+        // — exactly one spawn site (was >= 2 for the dual-arm wiring).
+        assert_eq!(
+            spawn_calls, 1,
+            "the process-global boot path must spawn the supervised API \
+             token reload task exactly once; found {spawn_calls} call site(s)"
         );
     }
 }

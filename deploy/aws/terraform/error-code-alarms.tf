@@ -19,7 +19,9 @@
 # 10 free-tier alarms moves $2.30 -> $3.50/mo. The rule-file "10 alarms free
 # tier" claims were already stale pre-PR. (2026-07-09: +2 more alarms —
 # errcode-aggregator-drop-01 here + seal-writer-dropped in seal-drop-alarm.tf,
-# ~+$0.20/mo.)
+# ~+$0.20/mo.) (+3 (order-side-alarms.tf, 2026-07-14): orders-placed-storm +
+# daily-loss-breach + order-fill-lag-high (disarmed), ~+$0.30/mo — see
+# aws-budget.md COST NOTE 2026-07-14.)
 #
 # DIMENSIONLESS BY DESIGN: errors.jsonl events carry NO `host` field (the host
 # label is added by the Prometheus scrape, not the tracing layer), and metric
@@ -160,15 +162,12 @@ locals {
       ok_recovery = true # round-4 documented ambiguity: repeat-emits per failing boot cycle under systemd Restart=always, so OK ~= stopped firing; if StartLimitBurst (8/600s) halts the loop, the OK would be aged-out - stated residual (see locals header)
       desc        = "AUTH-GAP-04: TOTP secret likely rotated externally - auth is DEAD until the SSM totp-secret is reconciled with dhan.co. CAVEAT on the recovered/OK page: it is trustworthy while the systemd restart loop keeps re-emitting; if systemd's StartLimitBurst halted the unit, the OK only means emissions stopped - verify the app is actually up before treating it as recovery. Runbook: .claude/rules/project/wave-4-error-codes.md"
     }
-    "ws-gap-07" = {
-      pattern     = "{ $.code = \"WS-GAP-07\" && $.level = \"ERROR\" }"
-      period      = 300
-      threshold   = 1
-      eval        = 3
-      dta         = 1
-      ok_recovery = true
-      desc        = "WS-GAP-07: live-feed frame channel CLOSED - the tick consumer died; no ticks reach the pipeline from that connection until restart. Runbook: .claude/rules/project/wave-2-error-codes.md"
-    }
+    # RETIRED (PR-C2, 2026-07-13 — Dhan live-WS lane deletion): the
+    # "ws-gap-07" entry — its ONLY error!-level emit site (the main-feed
+    # frame-channel Closed arm in crates/core/src/websocket/connection.rs)
+    # was deleted with the lane, so the filter could never match again
+    # (dead paging filter). The WsGap07 variant retirement is Phase C
+    # variant cleanup.
     # FEED-STALL-01 (round-3 review fix, 2026-07-06): the ONLY ERROR-level
     # FEED-STALL-01 emission is the sidecar's own STORM escalation — the 6th+
     # rapid restart inside a 300s ANCHORED-RESET window
@@ -446,7 +445,7 @@ resource "aws_cloudwatch_metric_alarm" "error_code" {
   # formats every OK as a green message (it reads only NewStateValue - no
   # OldStateValue filter). Expect up to ~5 one-time green "recovered" pages
   # the apply evening (canonical count, round-14): the 4 ok_recovery=true
-  # codes here (dh-901, auth-gap-04, ws-gap-07, feed-stall-01) +
+  # codes here (dh-901, auth-gap-04, feed-stall-01; ws-gap-07 retired PR-C2 2026-07-13) +
   # feed-stall-restarts. Exempt: the reconnect-storm alarm via
   # actions_enabled=false, and BOTH AWS/Lambda Errors watchman alarms
   # (readiness-errors + market-hours-gate-errors) via ok_actions=[]

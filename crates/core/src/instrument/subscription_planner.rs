@@ -1434,15 +1434,12 @@ mod tests {
     use tickvault_common::instrument_types::*;
     use tickvault_common::types::{Exchange, ExchangeSegment, OptionType, SecurityId};
 
-    /// PR #7b — after legacy-variant retirement the helper simply
-    /// returns the default LOCKED config (`Indices4Only`). Retained
-    /// so the dozens of call sites compile; tests that historically
-    /// asserted legacy stock-F&O behavior under `FullUniverse` have
-    /// been deleted or rewritten to assert the LOCKED contract
-    /// (zero stock F&O, zero index F&O, 4 IDX_I + INDIA VIX only).
-    fn legacy_full_universe_config() -> SubscriptionConfig {
-        SubscriptionConfig::default()
-    }
+    // `legacy_full_universe_config` DELETED 2026-07-14 (PR-C2 r1 hygiene):
+    // after this PR's test deletions its only remaining "call sites" were
+    // inside `#[cfg(any())]`-retired (never-compiled) PR #7b test bodies, so
+    // the helper was dead code in every build mode. The retired bodies still
+    // parse without it (cfg(any()) items are token-dropped before name
+    // resolution).
 
     fn make_test_universe() -> FnoUniverse {
         let ist = tickvault_common::trading_calendar::ist_offset();

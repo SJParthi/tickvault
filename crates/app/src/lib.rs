@@ -90,13 +90,14 @@ pub mod boot_helpers;
 /// Dhan runtime activation watcher (PR-2) — dormant supervisor that keeps the
 /// Dhan lane's running flag honest across runtime toggles and enforces the
 /// Dhan-disable safety gate at the supervisor layer (operator 2026-06-21/24).
-pub mod dhan_activation;
 /// Shared self-tuning Dhan Data-API rate limiter (operator pacing
 /// directive 2026-07-14): ONE process-wide token-bucket gate every
 /// per-minute Dhan Data-API REST fire passes through — spot-1m fires +
 /// ladder re-polls + the 15:33:30 sweep + the #1524 diagnostic probes +
 /// the option-chain fires — 3 rps default, self-tuning down to the 2 rps
 /// floor on observed 429 bursts. Dhan-ONLY; Groww untouched.
+/// (`dhan_activation` — the lane cold-start watcher that preceded this
+/// decl — was deleted in PR-C2 with the Dhan live-WS lane.)
 pub mod dhan_data_api_limiter;
 /// Shared Dhan `/v2/charts/intraday` 1m request/response primitives —
 /// relocated from `cross_verify_1m_boot.rs` in Phase C1 of the 2026-07-13
@@ -213,6 +214,11 @@ pub mod lifecycle_reconcile_orchestrator;
 pub mod api_token_rotation;
 #[cfg(feature = "daily_universe_fetcher")]
 pub mod daily_universe_boot;
+/// Cluster-C order-side observability (2026-07-14): OmsAlertSink /
+/// RiskAlertSink bridges → Telegram + the rebuilt SEBI order_audit /
+/// pnl_audit tables via one bounded mpsc(1024) consumer task; daily
+/// OnEod heartbeat + counters-vs-rows reconcile (OMS-GAP-02 on mismatch).
+pub mod order_observability;
 pub mod subsystem_memory;
 pub mod trading_pipeline;
 /// C3 (2026-07-03): bounded, chunked, backpressured STAGE-C.2b WAL frame
