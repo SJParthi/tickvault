@@ -649,7 +649,7 @@ mod tests {
     }
 
     #[test]
-    fn test_cross_fill_freshness_floor_is_rung_aware_for_dhan_lender() {
+    fn test_cross_fill_freshness_floor_ms_is_rung_aware_for_dhan_lender() {
         // CADENCE-XFILL-RUNG-1 (2026-07-15): the borrow floor must span
         // the LENDER's actual scheduled pre-fire. At rung 0 the floor is
         // the base T − 5000; at rung r the Dhan chains fire wholesale
