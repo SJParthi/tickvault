@@ -297,7 +297,7 @@ mod tests {
     }
 
     #[test]
-    fn test_from_groww_specific_mappings() {
+    fn test_from_groww_status_specific_mappings() {
         assert_eq!(
             BrokerOrderStatus::from_groww_status("NEW"),
             BrokerOrderStatus::New
