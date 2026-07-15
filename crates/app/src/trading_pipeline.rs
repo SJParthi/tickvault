@@ -52,6 +52,26 @@ use tickvault_trading::risk::engine::RiskEngine;
 use tickvault_trading::risk::types::RiskCheck;
 use tickvault_trading::strategy::{Signal, StrategyHotReloader, StrategyInstance};
 
+use crate::order_observability::{
+    ORDER_SIDE_CHANNEL_CAPACITY, OmsAlertBridge, OrderSideDayStats, OrderSideMsg, OrderSideWiring,
+    RiskAlertBridge, run_order_side_consumer, try_send_order_side,
+};
+
+/// Cluster-C (2026-07-14): the live order-side channel handle the
+/// call-site captures use — `None` when the order-side wiring is absent
+/// (tests / callers that pass `order_side = None`).
+type OrderSideHandle = Option<(
+    tokio::sync::mpsc::Sender<OrderSideMsg>,
+    std::sync::Arc<OrderSideDayStats>,
+)>;
+
+/// Counted, non-blocking order-side capture — no-op without wiring.
+fn order_side_send(handle: &OrderSideHandle, msg: OrderSideMsg) {
+    if let Some((tx, stats)) = handle {
+        try_send_order_side(tx, stats, msg);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // TokenProvider bridge — connects core::TokenHandle to trading::TokenProvider
 // ---------------------------------------------------------------------------
@@ -157,10 +177,15 @@ pub fn spawn_trading_pipeline_with_reset(
         strategy_hot_reloader,
         daily_reset_signal,
         None,
+        None,
     )
 }
 
 /// Spawns the trading pipeline with all optional signals.
+///
+/// `order_side` (cluster-C, 2026-07-14): when `Some`, the pipeline wires
+/// the OMS/risk alert sinks + order/pnl audit capture through the
+/// order-side observability consumer.
 pub fn spawn_trading_pipeline_full(
     pipeline_config: TradingPipelineConfig,
     tick_receiver: broadcast::Receiver<ParsedTick>,
@@ -168,6 +193,7 @@ pub fn spawn_trading_pipeline_full(
     strategy_hot_reloader: Option<StrategyHotReloader>,
     daily_reset_signal: Option<std::sync::Arc<tokio::sync::Notify>>,
     market_close_signal: Option<std::sync::Arc<tokio::sync::Notify>>,
+    order_side: Option<OrderSideWiring>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         run_trading_pipeline(
@@ -177,6 +203,7 @@ pub fn spawn_trading_pipeline_full(
             strategy_hot_reloader,
             daily_reset_signal,
             market_close_signal,
+            order_side,
         )
         .await;
     })
@@ -190,6 +217,7 @@ async fn run_trading_pipeline(
     hot_reloader: Option<StrategyHotReloader>,
     daily_reset_signal: Option<std::sync::Arc<tokio::sync::Notify>>,
     market_close_signal: Option<std::sync::Arc<tokio::sync::Notify>>,
+    order_side_wiring: Option<OrderSideWiring>,
 ) {
     // Initialize indicator engine
     let mut indicator_engine = IndicatorEngine::new(config.indicator_params);
@@ -228,6 +256,31 @@ async fn run_trading_pipeline(
     });
     let mut oms =
         OrderManagementSystem::new(api_client, rate_limiter, token_bridge, config.client_id);
+
+    // Cluster-C (2026-07-14): order-side observability — spawn the audit +
+    // Telegram consumer, then wire BOTH alert sinks (the first-ever
+    // set_alert_sink call sites; both sinks were None since birth).
+    let order_side: OrderSideHandle = match order_side_wiring {
+        Some(wiring) => {
+            let (tx, rx) = tokio::sync::mpsc::channel::<OrderSideMsg>(ORDER_SIDE_CHANNEL_CAPACITY);
+            let stats = std::sync::Arc::new(OrderSideDayStats::default());
+            tokio::spawn(run_order_side_consumer(
+                rx,
+                wiring,
+                std::sync::Arc::clone(&stats),
+            ));
+            risk_engine.set_alert_sink(Box::new(RiskAlertBridge {
+                tx: tx.clone(),
+                stats: std::sync::Arc::clone(&stats),
+            }));
+            oms.set_alert_sink(Box::new(OmsAlertBridge {
+                tx: tx.clone(),
+                stats: std::sync::Arc::clone(&stats),
+            }));
+            Some((tx, stats))
+        }
+        None => None,
+    };
 
     info!(
         dry_run = config.dry_run,
@@ -355,6 +408,18 @@ async fn run_trading_pipeline(
                                                         strategy = %strategy.definition().name,
                                                         "LONG signal → order placed"
                                                     );
+                                                    order_side_send(&order_side, OrderSideMsg::Placed {
+                                                        order_id,
+                                                        correlation_id: String::new(),
+                                                        security_id: tick.security_id,
+                                                        exchange_segment:
+                                                            tickvault_common::segment::segment_code_to_str(
+                                                                tick.exchange_segment_code,
+                                                            ),
+                                                        transaction_type: "BUY",
+                                                        quantity: 1,
+                                                        price: 0.0,
+                                                    });
                                                 }
                                                 Err(err) => {
                                                     warn!(
@@ -362,6 +427,11 @@ async fn run_trading_pipeline(
                                                         security_id = tick.security_id,
                                                         "LONG signal → order placement failed"
                                                     );
+                                                    order_side_send(&order_side, OrderSideMsg::PlaceFailed {
+                                                        correlation_id: String::new(),
+                                                        security_id: tick.security_id,
+                                                        detail: format!("long entry: {err}"),
+                                                    });
                                                 }
                                             }
                                         }
@@ -414,6 +484,18 @@ async fn run_trading_pipeline(
                                                         strategy = %strategy.definition().name,
                                                         "SHORT signal → order placed"
                                                     );
+                                                    order_side_send(&order_side, OrderSideMsg::Placed {
+                                                        order_id,
+                                                        correlation_id: String::new(),
+                                                        security_id: tick.security_id,
+                                                        exchange_segment:
+                                                            tickvault_common::segment::segment_code_to_str(
+                                                                tick.exchange_segment_code,
+                                                            ),
+                                                        transaction_type: "SELL",
+                                                        quantity: 1,
+                                                        price: 0.0,
+                                                    });
                                                 }
                                                 Err(err) => {
                                                     warn!(
@@ -421,6 +503,11 @@ async fn run_trading_pipeline(
                                                         security_id = tick.security_id,
                                                         "SHORT signal → order placement failed"
                                                     );
+                                                    order_side_send(&order_side, OrderSideMsg::PlaceFailed {
+                                                        correlation_id: String::new(),
+                                                        security_id: tick.security_id,
+                                                        detail: format!("short entry: {err}"),
+                                                    });
                                                 }
                                             }
                                         }
@@ -450,12 +537,23 @@ async fn run_trading_pipeline(
                                         .map(|o| o.order_id.clone())
                                         .collect();
                                     for order_id in active {
-                                        if let Err(err) = oms.cancel_order(&order_id).await {
-                                            warn!(
-                                                ?err,
-                                                order_id = %order_id,
-                                                "EXIT signal → cancel failed"
-                                            );
+                                        match oms.cancel_order(&order_id).await {
+                                            Ok(()) => {
+                                                order_side_send(&order_side, OrderSideMsg::Cancelled {
+                                                    order_id,
+                                                });
+                                            }
+                                            Err(err) => {
+                                                warn!(
+                                                    ?err,
+                                                    order_id = %order_id,
+                                                    "EXIT signal → cancel failed"
+                                                );
+                                                order_side_send(&order_side, OrderSideMsg::CancelFailed {
+                                                    order_id,
+                                                    detail: format!("exit cancel: {err}"),
+                                                });
+                                            }
                                         }
                                     }
                                     // Step 2: Close open position (if any filled lots exist)
@@ -493,6 +591,22 @@ async fn run_trading_pipeline(
                                                     net_lots,
                                                     "EXIT signal → closing order placed"
                                                 );
+                                                order_side_send(&order_side, OrderSideMsg::Placed {
+                                                    order_id,
+                                                    correlation_id: String::new(),
+                                                    security_id: tick.security_id,
+                                                    exchange_segment:
+                                                        tickvault_common::segment::segment_code_to_str(
+                                                            tick.exchange_segment_code,
+                                                        ),
+                                                    transaction_type: if net_lots > 0 {
+                                                        "SELL"
+                                                    } else {
+                                                        "BUY"
+                                                    },
+                                                    quantity: close_qty,
+                                                    price: 0.0,
+                                                });
                                             }
                                             Err(err) => {
                                                 warn!(
@@ -500,6 +614,11 @@ async fn run_trading_pipeline(
                                                     security_id = tick.security_id,
                                                     "EXIT signal → closing order placement failed"
                                                 );
+                                                order_side_send(&order_side, OrderSideMsg::PlaceFailed {
+                                                    correlation_id: String::new(),
+                                                    security_id: tick.security_id,
+                                                    detail: format!("exit close: {err}"),
+                                                });
                                             }
                                         }
                                     }
@@ -608,12 +727,23 @@ async fn run_trading_pipeline(
                         .map(|o| o.order_id.clone())
                         .collect();
                     for order_id in &pending_ids {
-                        if let Err(err) = oms.cancel_order(order_id).await {
-                            warn!(
-                                ?err,
-                                order_id = %order_id,
-                                "market close — paper order cancel failed"
-                            );
+                        match oms.cancel_order(order_id).await {
+                            Ok(()) => {
+                                order_side_send(&order_side, OrderSideMsg::Cancelled {
+                                    order_id: order_id.clone(),
+                                });
+                            }
+                            Err(err) => {
+                                warn!(
+                                    ?err,
+                                    order_id = %order_id,
+                                    "market close — paper order cancel failed"
+                                );
+                                order_side_send(&order_side, OrderSideMsg::CancelFailed {
+                                    order_id: order_id.clone(),
+                                    detail: format!("market-close cancel: {err}"),
+                                });
+                            }
                         }
                     }
                     info!(
@@ -623,6 +753,14 @@ async fn run_trading_pipeline(
                 } else {
                     info!("market close — no active paper orders");
                 }
+
+                // Cluster-C (2026-07-14): the daily OnEod P&L heartbeat +
+                // counters-vs-rows reconcile trigger — AFTER the cancel
+                // sweep so the day's final cancel rows are in the ledger.
+                order_side_send(&order_side, OrderSideMsg::PnlEod {
+                    realized: risk_engine.total_realized_pnl(),
+                    unrealized: risk_engine.total_unrealized_pnl(),
+                });
 
                 // Prevent re-triggering.
                 wait_for_market_close = Box::pin(std::future::pending::<()>());

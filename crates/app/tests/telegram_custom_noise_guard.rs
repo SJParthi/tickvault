@@ -263,14 +263,21 @@ fn all_bodies() -> Vec<CustomBody> {
 fn status_pings_use_low_variant_not_custom() {
     let bodies = all_bodies();
     // Fragments unique to each informational status body (post-reword).
+    //
+    // PR-C2 retirement (2026-07-14 merge resolution): the other six #1526
+    // status bodies — "Fast start" (the fast crash-recovery arm),
+    // "Recovered saved prices" / "Price backups growing" / "Background
+    // service auto-restarted" / "Price database unavailable" / "Dhan feed
+    // started" / "Dhan feed stopped" (all inside `start_dhan_lane`) — were
+    // DELETED with the Dhan live-WS lane + the fast arm (operator
+    // retirement directive 2026-07-13, websocket-connection-scope-lock.md
+    // "2026-07-13 Amendment"; deletion is the ultimate noise cut). The
+    // surviving process-global equivalents (disk-health watcher, WAL
+    // replay, WAL-suspension probe) signal via their own storage-crate
+    // metrics + CloudWatch alarms, not main.rs Custom bodies. Only the
+    // fragments below still exist in the scanned sources.
     const STATUS_FRAGMENTS: &[&str] = &[
-        "Fast start",                        // 2752 (CustomStatusUrgent)
-        "Recovered saved prices",            // 6776 (CustomStatus)
-        "Price backups growing",             // 8905 (CustomStatus)
-        "Background service auto-restarted", // 8962 (CustomStatus)
-        "Dhan feed started",                 // 10762 (CustomStatusUrgent)
-        "Dhan feed stopped",                 // 10962 (CustomStatusUrgent)
-        "Market closed",                     // 11100 (CustomStatus)
+        "Market closed", // post-market housekeeping (CustomStatus)
     ];
     for frag in STATUS_FRAGMENTS {
         let hits: Vec<&CustomBody> = bodies.iter().filter(|b| b.literal.contains(frag)).collect();
@@ -296,9 +303,13 @@ fn status_pings_use_low_variant_not_custom() {
 fn actionable_custom_sites_stay_custom_high() {
     let bodies = all_bodies();
     // Fragments unique to each kept-High actionable body.
+    //
+    // PR-C2 retirement (2026-07-14 merge resolution): "Price database
+    // unavailable" + "Low disk space" lived inside the DELETED
+    // `start_dhan_lane` (Dhan live-WS retirement 2026-07-13); the surviving
+    // disk/DB signals are the storage-crate watchers' coded error! chains +
+    // CloudWatch alarms (DISK-WATCHER-01 / RESOURCE-03 / BOOT-01/02).
     const ACTIONABLE_FRAGMENTS: &[&str] = &[
-        "Price database unavailable", // main.rs 6793 — DB down at boot
-        "Low disk space",             // main.rs 8885 — free disk
         // orphan boot — check Dhan before 15:30. 2026-07-14: the bodies live
         // in pure wording fns (degraded_no_*_message / degraded_fetch_failed_
         // message), reached via the helper-fn resolution in

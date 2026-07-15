@@ -1,5 +1,17 @@
 //! Runtime IP change detection (GAP-NET-01).
 //!
+//! **RETAINED-DORMANT since PR-C2 (2026-07-14, Dhan live-WS lane
+//! deletion):** the monitor's production spawn site lived in the deleted
+//! Dhan boot arms, so `spawn_ip_monitor` has ZERO runtime call sites today
+//! (unit tests only). Kept un-deleted because the Dhan static-IP ORDER
+//! mandate (April 2026 enforcement — `authentication.md` rule 7) makes
+//! this the ready-made watchdog for the live-trading re-wire: when real
+//! orders return, the re-wire MUST also restore the
+//! [`IpMonitorConfig::for_runtime`] halt gate (`halt_on_mismatch` from
+//! `dry_run` — blind-then-halt on a confirmed IP change), not just the
+//! alert-only default. Fate decided in C3/C4 or the live-trading PR with
+//! its own dated quote.
+//!
 //! Spawns a background task that periodically re-verifies the machine's
 //! public IP against the expected static IP from boot-time verification.
 //! If the IP changes (e.g., Elastic IP disassociation, NAT gateway failover),

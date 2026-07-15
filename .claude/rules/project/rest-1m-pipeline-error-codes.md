@@ -615,6 +615,80 @@ to `true` in base.toml — dated record in
 OFF (fail-safe) and `probe_and_report` stays `true` (inert while
 enabled; the rollback canary).
 
+**2026-07-14 — the GROWW leg gains a per-underlying not-served paging
+edge (`stage="underlying_not_served"`):** the motivating incident — on
+expiry day 2026-07-14 Groww stopped serving NIFTY's same-day-expiring
+chain at 14:54 IST (2xx, zero strikes, `outcome=empty`) while BANKNIFTY
++ SENSEX kept working (`ok=2 empty=1` per minute, ALL afternoon), and
+NOTHING paged: the `stage="escalation"` edge arms only on FULLY-failed
+minutes (ok == 0), so a single-underlying vendor cutoff was invisible.
+The new arm mirrors the spot leg's `sid_not_served` detector (§1 item
+5): a minute COUNTS toward an underlying's streak only when that
+underlying's chain came back empty/failed (FETCH-level — Empty AND
+error-class count the same; persist failures stay the escalation edge's
+M1 business) while ≥1 OTHER underlying was OK in the SAME minute; a
+global-failure minute (zero OK) neither counts nor resets — so within
+the FETCH-failure class the two edges are mutually exclusive per minute
+(the escalation edge needs ok == 0, this edge needs ≥1 OK). HONEST
+OVERLAP: a persist-failed minute with ok ≥ 1 can legitimately count
+toward BOTH edges (the M1 persist gate makes the escalation edge count
+it fully-failed while an empty sibling counts here) — two DISTINCT
+signals: persistence broken + vendor not serving one underlying. An
+auth-aborted fire (401 short-circuit — a global token condition, even
+after an earlier underlying succeeded) is a tracker HOLD: neither
+counts nor resets. At
+`GROWW_CHAIN_1M_UNDERLYING_NOT_SERVED_THRESHOLD` (10) consecutive
+counted minutes: ONE `error!(code = CHAIN-02,
+stage = "underlying_not_served", feed = "groww", underlying,
+consecutive_minutes)` + ONE typed HIGH `GrowwChain1mUnderlyingNotServed`
+Telegram page per underlying per episode (edge-latched, Rule 4;
+re-armed only by that underlying's own recovery — falling edge = one
+Info `GrowwChain1mUnderlyingServedRecovered`). Counter:
+`tv_groww_chain1m_underlying_not_served_total{underlying}` (3 static
+label values — the pinned plain symbols), one increment per counted
+minute. The typed HIGH Telegram event IS the page — CHAIN-02 remains
+log-sink-only per §3. Streak state is per scheduler run (per trading
+day; a mid-day task respawn restarts it — the FailureEdge envelope).
+Source: `crates/app/src/groww_option_chain_1m_boot.rs`
+(`UnderlyingServedTracker` / `record_groww_chain_underlying_verdicts`).
+
+**2026-07-14 — the GROWW leg's zero-leg classifications are now
+SELF-EVIDENCING (empty-vs-`leg_shape_drift` split):** the same 2026-07-14
+incident's second finding — NIFTY (expiry day) classified `outcome=empty`
+every minute 14:54→15:29 IST with `errors=0` (every body WAS a parseable
+chain envelope whose `strikes` object yielded zero legs) — could NOT be
+discriminated retroactively: was the body ~40 B (a truly empty map) or
+~37 KB (entries our leg extraction dropped)? The evidence was STRUCTURALLY
+UNRECORDED — `tv_groww_chain1m_payload_bytes` + the `strikes_kept` /
+`invalid_strikes` counts were recorded ONLY on the Found arm; the Empty arm
+discarded the parsed struct and captured no body evidence (the payload
+histogram count simply dropped 3→2 at 14:55). Closed in two halves:
+(1) **EVIDENCE** — every zero-leg classification now carries
+`payload_bytes`, `strikes_seen` (RAW `strikes`-map entry count — a new
+parse diagnostic), `strikes_kept`, `invalid_strikes`, and a BOUNDED
+SANITIZED body sample (≤300 chars through the house
+`capture_rest_error_body` choke point — the exact sanitizer the failure
+arms use, so a token/credential can never leak) on ONE coded `error!` per
+affected underlying per fired minute (`stage="empty_chain"` /
+`stage="leg_shape_drift"`, `feed="groww"`), plus the new
+`tv_groww_chain1m_empty_payload_bytes` histogram (the Found-only
+`tv_groww_chain1m_payload_bytes` semantics never shift). (2) **HONEST
+RECLASSIFICATION** — the zero-legs case splits: `strikes_seen == 0` (map
+literally empty) stays `Empty` (`outcome="empty"`, audit
+`empty`/`error_class="empty_chain"` — unchanged wire values);
+`strikes_seen > 0` with zero extractable legs is now **`leg_shape_drift`**
+(the vendor served entries our leg extraction couldn't read — an ERROR,
+not an empty chain): it flows into the minute verdict's `errors` count,
+the same CHAIN-02 `minute_failed` accounting, its own
+`tv_groww_chain1m_leg_shape_drift_total` counter, and the audit row's
+EXISTING `error` outcome with `error_class="leg_shape_drift"` (no audit
+schema change, no new ErrorCode). The `underlying_not_served` detector is
+UNAFFECTED (empty and error-class minutes already counted not-served
+identically). HONEST NOTE: today's 14:54 incident class (empty vs drift)
+could not be discriminated after the fact — from this change forward it
+is, within one minute of occurrence
+(`mcp__tickvault-logs__tail_errors` shows the size + sample directly).
+
 **2026-07-14 — the DHAN chain leg emits this SAME code with the new
 stages** `underlying_not_served` (error, edge — the #1537 Groww mirror,
 Dhan emits field-less), `ladder_shrunk` (warn, edge-latched heuristic),
@@ -851,16 +925,36 @@ operator's enumerated scope — unifying them is a flagged follow-up).
 
 ## §3. Delivery boundary (honest — no false-OK)
 
-All six codes (SPOT1M-01/02 + CHAIN-01..04) are **log-sink-only today**: NO `error_code_alerts` map entry in
-`deploy/aws/terraform/error-code-alarms.tf` and NO mention in
-`observability-architecture.md`'s paging list (the paging drift guard pins
-those surfaces untouched). The operator page for a failing pipeline is the
-typed HIGH Telegram event at the 3-minute escalation edge (+ the Info
-recovery event) — and, for the chain half, the once-per-day
-`ChainEntitlementAbsent` / `ChainExpirylistFailed` HIGH pages + the
-probe-verdict Infos; the coded `error!` lines are the forensic WHY. Adding a
-CloudWatch filter+alarm is a flagged follow-up (one map entry + the doc
-paragraph + a cost note, per the FEED-REJECT-01 / SCOREBOARD-01 precedent).
+**2026-07-14 UPDATE (REST-audit GAP-03 —
+`docs/audits/2026-07-14-rest-pipeline-adversarial-audit.md`): the flagged
+CloudWatch follow-up below is now PARTIALLY LANDED.** Four SCOPED
+`error_code_alerts` entries exist in
+`deploy/aws/terraform/error-code-alarms.tf` (+ the doc paging list +
+`error_code_paging_filter_drift_guard.rs` pattern-shape extension for one
+extra `$.field` clause, all in lockstep):
+
+| Entry | Filter scope | Why scoped |
+|---|---|---|
+| `spot1m-01-escalation` | `$.stage = "escalation"` only | the per-minute `minute_failed`/`boundary_skipped` lines fire every failed minute — a plain code filter would over-page vs the designed 3-minute edge; covers the Dhan spot + Groww spot + Groww contract legs (same code) |
+| `chain-02-escalation` | `$.stage = "escalation"` only | same rationale, both feeds' chain legs |
+| `chain-01` | plain coded filter | both stages (warmup + mid_session) are once-per-episode page-worthy; the probe-only path never emits CHAIN-01 at ERROR |
+| `chain-04-warmup` | `$.stage = "warmup"` only | the probe_* / warmup_no_token stages are log-only-by-design transient/respawn arms (warmup_no_token repeats every ~30s until a token exists) |
+
+**Still log-sink-only (deliberate):** the persist codes SPOT1M-02 +
+CHAIN-03 have no direct filter — every persist failure feeds the
+persist-gated 3-minute escalation edge (the M1 rule), so a sustained
+persist outage still reaches the `spot1m-01-escalation` /
+`chain-02-escalation` pages; a direct filter on the per-minute persist
+lines would over-page. The Groww-leg CHAIN-04-class degrades
+(`expiry_unresolved` etc.) remain CHAIN-02-stage territory per §2c.
+
+The typed HIGH Telegram event at the 3-minute escalation edge (+ the Info
+recovery event) remains the primary operator page — and, for the chain
+half, the once-per-day `ChainEntitlementAbsent` / `ChainExpirylistFailed`
+HIGH pages + the probe-verdict Infos; the coded `error!` lines are the
+forensic WHY. The CloudWatch entries are the BACKSTOP leg that survives a
+dead app notifier / dropped Telegram (the audit's GAP-05 class — see also
+`telegram-drop-alarm.tf`).
 
 **Contract-leg honest envelope (2026-07-13, PR-4):** UNVERIFIED-LIVE —
 FNO per-contract 1m candle availability latency for the just-sealed
