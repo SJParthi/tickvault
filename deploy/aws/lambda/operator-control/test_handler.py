@@ -900,7 +900,7 @@ class WipeGate(unittest.TestCase):
         rm_pos = src.index("feed capture/replay sources removed")
         truncate_pos = src.index("PYWIPE")
         self.assertLess(rm_pos, truncate_pos, "replay-source rm must precede TRUNCATE")
-        disable_pos = src.index('"systemctl disable tickvault || true",\n                "pkill -f groww_sidecar.py')
+        disable_pos = src.index('"systemctl disable tickvault || true",')
         self.assertLess(disable_pos, rm_pos, "unit must be disabled before the wipe body")
         self.assertIn("t == 'prev_day_ohlcv'", src)
         self.assertIn('"systemctl enable tickvault || true"', src)
@@ -1507,9 +1507,8 @@ class WipeGrowwGate(unittest.TestCase):
         self.assertEqual(resp["statusCode"], 200)
         self.assertEqual(json.loads(resp["body"])["command_id"], "cmd-groww")
         joined = "\n".join(captured["cmds"])
-        # app + groww sidecar stopped first; app restarted after.
+        # app stopped first; app restarted after (sidecar pkill retired 2026-07-15).
         self.assertIn("systemctl stop tickvault", joined)
-        self.assertIn("pkill -f groww_sidecar.py", joined)
         self.assertIn("systemctl start tickvault", joined)
         # ONLY the groww capture dir removed (capture file + status + bridge
         # offset snapshot) — the resurrection vector, removed BEFORE restart.

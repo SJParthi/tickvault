@@ -668,8 +668,10 @@ jobs:
           ran=$(grep -c 'Running.*tests/dhat_' /tmp/dhat-core.log || true)
           # PR-C3 (2026-07-14): 11 -> 10 — dhat_tick_gap_detector deleted
           # with the tick-gap detector (operator Q4-ii 2026-07-13).
-          if [ "$ran" -ne 10 ]; then
-            echo "::error::core DHAT step executed $ran targets, expected 10 — a --test flag was dropped from this step (drift list vs run step mismatch)."
+          # 2026-07-15: 10 -> 9 — dhat_feed_lag_groww deleted with the Groww
+          # live feed.
+          if [ "$ran" -ne 9 ]; then
+            echo "::error::core DHAT step executed $ran targets, expected 9 — a --test flag was dropped from this step (drift list vs run step mismatch)."
             exit 1
           fi
 
