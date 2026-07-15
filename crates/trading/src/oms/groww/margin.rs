@@ -1761,14 +1761,58 @@ mod tests {
     const RATCHET_MACRO_TOKENS: [&str; 5] = ["error!(", "warn!(", "info!(", "debug!(", "trace!("];
 
     /// Nearest preceding tracing-macro token before byte `off` in the
-    /// comment-stripped source, or `None` when no macro token precedes.
-    fn nearest_preceding_macro(stripped: &str, off: usize) -> Option<&'static str> {
+    /// comment-stripped source (with its start position), or `None` when
+    /// no macro token precedes.
+    fn nearest_preceding_macro_at(stripped: &str, off: usize) -> Option<(usize, &'static str)> {
         let prefix = &stripped[..off];
         RATCHET_MACRO_TOKENS
             .iter()
             .filter_map(|tok| prefix.rfind(tok).map(|pos| (pos, *tok)))
             .max_by_key(|(pos, _)| *pos)
-            .map(|(_, tok)| tok)
+    }
+
+    /// Nearest preceding tracing-macro token before byte `off`, or `None`.
+    fn nearest_preceding_macro(stripped: &str, off: usize) -> Option<&'static str> {
+        nearest_preceding_macro_at(stripped, off).map(|(_, tok)| tok)
+    }
+
+    /// LEFT identifier-boundary check (round-3 proven escape (c)): true
+    /// when the byte before `off` is NOT an identifier char — a needle
+    /// starting mid-identifier (`stale_code = ErrorCode::...code_str()`)
+    /// is a suffix substring of a LONGER binding name, not a macro field.
+    fn left_boundary_ok(stripped: &str, off: usize) -> bool {
+        match off.checked_sub(1).and_then(|i| stripped.as_bytes().get(i)) {
+            None => true,
+            Some(&b) => !(b.is_ascii_alphanumeric() || b == b'_'),
+        }
+    }
+
+    /// IN-MACRO-SPAN check (round-3 proven escape (d) — `let code = ...`
+    /// outside any macro anchoring to an EARLIER unrelated `error!(`):
+    /// belt-and-braces, BOTH halves must hold for the occurrence at `off`
+    /// to be a genuine field of the anchoring macro invocation:
+    /// (a) the span between the end of the anchoring macro token and `off`
+    ///     contains no statement boundary — neither `;` nor a
+    ///     whitespace-delimited `let` token (a needle past a statement
+    ///     terminator belongs to LATER code, not the macro's arg list);
+    /// (b) the last non-whitespace char before `off` is `(` or `,` — the
+    ///     only legal positions for a field in a tracing macro arg list.
+    fn in_macro_field_position(
+        stripped: &str,
+        anchor_pos: usize,
+        anchor_tok: &str,
+        off: usize,
+    ) -> bool {
+        let span = &stripped[anchor_pos + anchor_tok.len()..off];
+        let no_statement_boundary = !span.contains(';')
+            && !span
+                .split(|c: char| c.is_whitespace())
+                .any(|word| word == "let");
+        let preceding_non_ws_ok = matches!(
+            stripped[..off].trim_end().as_bytes().last(),
+            Some(b'(' | b',')
+        );
+        no_statement_boundary && preceding_non_ws_ok
     }
 
     /// Ratchet (hostile-review 2026-07-15, medium; HARDENED same day after
@@ -1803,14 +1847,27 @@ mod tests {
     ///    downgrade (the round-2 proven escape (b), which would silently
     ///    drop the emission from the ERROR-only errors.jsonl sink) now
     ///    fails the build.
+    /// 4. Every counted occurrence must be a GENUINE FIELD of the
+    ///    anchoring macro (the round-3 proven escapes): a LEFT
+    ///    identifier-boundary check rejects a suffix-substring match
+    ///    inside a longer binding name (`let stale_code = ErrorCode::...
+    ///    code_str();` — escape (c)), and an IN-MACRO-SPAN check rejects
+    ///    an occurrence sitting OUTSIDE the anchoring invocation
+    ///    (`let code = ErrorCode::...code_str();` after an unrelated
+    ///    earlier `error!(` — escape (d)): no `;` / whitespace-delimited
+    ///    `let` token between the anchor and the needle, AND the
+    ///    preceding non-whitespace char must be `(` or `,` (the only
+    ///    legal field positions in a tracing macro arg list).
     ///
     /// Named residuals this ratchet deliberately does NOT catch: a needle
     /// embedded in a production STRING LITERAL would still count (the
     /// stripper preserves strings verbatim; no margin message embeds the
-    /// needle text today), and the anchor is a nearest-preceding-token
-    /// heuristic, not a parse (sound here because the exact
-    /// `code = ...code_str()` field syntax only occurs inside tracing
-    /// macro invocations in this file).
+    /// needle text today), and the anchor + span checks remain a LEXICAL
+    /// tripwire, not a parser — per the house "tripwire for innocent
+    /// edits, not an adversarial barrier" convention (funds-margin.md): a
+    /// deliberately contrived nesting that satisfies left-boundary +
+    /// no-`;`/no-`let` span + `(`/`,` preceding-char while not being a
+    /// real field is not defended against.
     #[test]
     fn test_ratchet_margin_emit_sites_carry_shared_errcode_fields() {
         let src = include_str!("margin.rs");
@@ -1860,13 +1917,29 @@ mod tests {
                  together)"
             );
             for off in offsets {
+                assert!(
+                    left_boundary_ok(&production, off),
+                    "the `{needle}` occurrence at byte offset {off} starts \
+                     mid-identifier (e.g. a `let stale_code = ...` binding) — \
+                     a suffix-substring match is NOT a macro field; the LIVE \
+                     error! emission was removed or rewritten"
+                );
+                let (anchor_pos, anchor_tok) = nearest_preceding_macro_at(&production, off)
+                    .expect("a counted needle must have a preceding tracing-macro token");
                 assert_eq!(
-                    nearest_preceding_macro(&production, off),
-                    Some("error!("),
+                    anchor_tok, "error!(",
                     "the `{needle}` field at byte offset {off} must sit inside \
                      a LIVE `error!` emission — a warn!/info!/debug!/trace! \
                      downgrade silently removes it from the ERROR-only \
                      errors.jsonl sink (these codes' entire operator surface)"
+                );
+                assert!(
+                    in_macro_field_position(&production, anchor_pos, anchor_tok, off),
+                    "the `{needle}` occurrence at byte offset {off} sits OUTSIDE \
+                     the anchoring `error!(` invocation (a statement boundary or \
+                     a non-field position intervenes — e.g. a `let code = ...` \
+                     binding after an unrelated earlier error!) — the LIVE \
+                     emission's field was removed or rewritten"
                 );
             }
         }
@@ -1930,6 +2003,68 @@ mod tests {
 
         // (v) no preceding macro at all -> None (never a vacuous pass).
         assert_eq!(nearest_preceding_macro("code = NEEDLE", 0), None);
+
+        // (vi) round-3 escape (c): a `let stale_code = ...` binding OUTSIDE
+        // any macro — the needle matches as a suffix substring of the longer
+        // identifier; the LEFT boundary check must reject it even though an
+        // earlier unrelated error!( satisfies the anchor heuristic.
+        let binding_escape = "error!(\n    code = OTHER,\n    \"msg\"\n);\n\
+                              let stale_code = NEEDLE;\nuse_it(stale_code);\n";
+        let stripped = strip_rust_comments(binding_escape);
+        let off = stripped
+            .find("code = NEEDLE")
+            .expect("suffix-substring occurrence must exist");
+        assert!(
+            !left_boundary_ok(&stripped, off),
+            "a needle starting mid-identifier (`stale_code = ...`) must FAIL \
+             the left identifier-boundary check"
+        );
+
+        // (vii) round-3 escape (d): a whitespace-preceded `let code = ...`
+        // binding passes the left-boundary check but must be rejected by the
+        // in-macro-span check (statement boundary + non-field position),
+        // even though the anchor still resolves to the earlier error!(.
+        let let_escape = "error!(\n    code = OTHER,\n    \"msg\"\n);\n\
+                          let code = NEEDLE;\nuse_it(code);\n";
+        let stripped = strip_rust_comments(let_escape);
+        let off = stripped
+            .find("code = NEEDLE")
+            .expect("whitespace-preceded occurrence must exist");
+        assert!(
+            left_boundary_ok(&stripped, off),
+            "sanity: the whitespace-preceded form passes the boundary check \
+             — it is the span check's job to reject it"
+        );
+        let (anchor_pos, anchor_tok) = nearest_preceding_macro_at(&stripped, off)
+            .expect("the earlier unrelated error!( anchors the occurrence");
+        assert_eq!(
+            anchor_tok, "error!(",
+            "sanity: the anchor heuristic alone false-passes"
+        );
+        assert!(
+            !in_macro_field_position(&stripped, anchor_pos, anchor_tok, off),
+            "an occurrence past a statement boundary / outside the anchoring \
+             macro's arg list must FAIL the in-macro-span check"
+        );
+
+        // (viii) a GENUINE field (first position AND after another field)
+        // passes ALL THREE checks — the strengthened ratchet still counts
+        // real emit sites.
+        for genuine in [
+            "error!(\n    code = NEEDLE,\n    \"msg\"\n);\n",
+            "error!(\n    stage = \"x\",\n    code = NEEDLE,\n    \"msg\"\n);\n",
+        ] {
+            let stripped = strip_rust_comments(genuine);
+            let off = stripped.find("code = NEEDLE").expect("live needle");
+            assert!(left_boundary_ok(&stripped, off));
+            let (anchor_pos, anchor_tok) =
+                nearest_preceding_macro_at(&stripped, off).expect("anchor");
+            assert_eq!(anchor_tok, "error!(");
+            assert!(
+                in_macro_field_position(&stripped, anchor_pos, anchor_tok, off),
+                "a genuine macro field must PASS the in-macro-span check"
+            );
+        }
     }
 
     // -- test doubles ---------------------------------------------------------
