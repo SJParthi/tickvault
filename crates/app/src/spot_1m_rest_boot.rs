@@ -153,8 +153,13 @@ use tickvault_common::url_join::join_api_url;
 use tickvault_core::auth::token_manager::TokenHandle;
 use tickvault_core::notification::{NotificationEvent, NotificationService};
 use tickvault_storage::disk_health_watcher::classify_join_exit;
+use tickvault_storage::rest_fetch_audit_persistence::{
+    REST_FETCH_LEG_SPOT_1M, RestFetchAuditRow, RestFetchAuditWriter, RestFetchOutcome,
+    ensure_rest_fetch_audit_table,
+};
 use tickvault_storage::spot_1m_rest_persistence::{
-    SPOT_1M_REST_SEGMENT_IDX_I, Spot1mRestRow, Spot1mRestWriter, ensure_spot_1m_rest_table,
+    SPOT_1M_REST_FEED_DHAN, SPOT_1M_REST_SEGMENT_IDX_I, Spot1mRestRow, Spot1mRestWriter,
+    ensure_spot_1m_rest_table,
 };
 
 use crate::dhan_intraday_parse::{MinuteCandle, intraday_request_body, parse_intraday_1m_candles};
@@ -479,7 +484,7 @@ impl EmptyDiagnostics {
 pub fn ist_nanos_minute_label(minute_ist_nanos: i64, trading_date_nanos: i64) -> String {
     let secs_of_day = (minute_ist_nanos.saturating_sub(trading_date_nanos) / NANOS_PER_SEC)
         .clamp(0, i64::from(SECONDS_PER_DAY) - 1);
-    // Clamped into [0, SECONDS_PER_DAY); the cast is safe.
+    // APPROVED: clamped into [0, SECONDS_PER_DAY) — the cast is safe.
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     format_minute_ist_12h(secs_of_day as u32)
 }
@@ -516,13 +521,21 @@ pub fn backfill_minute_nanos(
 /// The const-assert below pins the sweep strictly clear of that window.
 const SPOT_1M_REST_SWEEP_FIRE_SECS_OF_DAY_IST: u32 = 15 * 3600 + 33 * 60 + 30;
 
-// The sweep must clear the cross-verify burst: at least 150 s after the
-// 15:31:00 cross-verify trigger (burst observed through 15:33), and still
-// comfortably before the 16:30 IST box stop.
+/// Historical anchor: the 15:31:00 IST trigger of the RETIRED bulk 1m
+/// cross-verify (`cross_verify_1m_boot.rs`, DELETED in PR-C3 2026-07-14 per
+/// the 2026-07-13 operator retirement directive — the const was relocated
+/// here from that module). The 15:33:30 sweep instant was chosen to clear
+/// that run's observed 429 burst window; the TIMING IS KEPT UNCHANGED — the
+/// burst producer is gone, but the ≥150s margin + the 16:30 box-stop bound
+/// still document why 15:33:30 was chosen.
+const RETIRED_CROSS_VERIFY_TRIGGER_SECS_OF_DAY_IST: u32 = 15 * 3600 + 31 * 60; // 55_860
+
+// The sweep must clear the (retired) cross-verify burst window: at least
+// 150 s after the historical 15:31:00 trigger (burst observed through
+// 15:33), and still comfortably before the 16:30 IST box stop.
 const _: () = assert!(
-    SPOT_1M_REST_SWEEP_FIRE_SECS_OF_DAY_IST
-        >= crate::cross_verify_1m_boot::CROSS_VERIFY_TRIGGER_SECS_OF_DAY_IST + 150,
-    "post-session sweep must clear the 15:31-15:33 cross-verify burst window"
+    SPOT_1M_REST_SWEEP_FIRE_SECS_OF_DAY_IST >= RETIRED_CROSS_VERIFY_TRIGGER_SECS_OF_DAY_IST + 150,
+    "post-session sweep must clear the historical 15:31-15:33 cross-verify burst window"
 );
 const _: () = assert!(
     SPOT_1M_REST_SWEEP_FIRE_SECS_OF_DAY_IST < 16 * 3600 + 30 * 60,
@@ -1155,13 +1168,22 @@ async fn run_serving_delay_probe(
             tokio::time::sleep(Duration::from_millis(PROBE_REQUEST_SPACING_MS)).await;
         }
         let entry = match spot_1m_fetch_once(client, url, jwt.expose_secret(), body).await {
-            Ok(text) => {
-                let candles = parse_intraday_1m_candles(&text);
+            Ok(fetched) => {
+                let candles = parse_intraday_1m_candles(&fetched.text);
                 let s = summarize_probe_candles(&candles, *target_nanos);
                 serde_json::json!({
                     "probe": name,
                     "request": body.to_string(),
                     "status": "2xx",
+                    // 2026-07-14 raw-body discriminator (diagnostics-gated
+                    // by construction — probes only run under
+                    // `[spot_1m_rest] diagnostics_enabled`): bounded
+                    // 600-char secret-redacted body sample + shape stats.
+                    "content_type": fetched.content_type,
+                    "body_bytes": fetched.text.len(),
+                    "body_sample": tickvault_common::sanitize::capture_rest_raw_body_sample(
+                        &fetched.text,
+                    ),
                     "rows": s.rows,
                     "first_candle_ist": s
                         .first_candle_ist_nanos
@@ -1281,6 +1303,94 @@ struct FetchFailure {
     msg: String,
 }
 
+/// Per-ladder forensics for the Dhan `rest_fetch_audit` row (GAP-11
+/// review HIGH, 2026-07-14): the REAL rung count + 429 count + whether
+/// the TERMINAL failure was an HTTP 429 — so a Dhan 429 storm can never
+/// again read 0 on the scoreboard digest while
+/// `tv_spot1m_rate_limited_total` climbs. `final_http_status` /
+/// `fetch_latency_ms` REMAIN the storage crate's 0/-1 named sentinels
+/// (the Dhan [`FetchFailure`] carries no status/latency fields — that
+/// residual is the remaining flagged follow-up).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct DhanLadderForensics {
+    /// Requests actually sent by the ladder (0 = the budget-overrun arm —
+    /// the timed-out ladder's partial state is dropped with its future,
+    /// the Groww `budget_exceeded` honesty note).
+    attempts: u32,
+    /// How many of those attempts were HTTP 429 (derived from the REAL
+    /// `StatusCode`, never a substring scan).
+    rate_limited_count: u32,
+    /// The FINAL attempt was an HTTP 429 — drives the terminal
+    /// [`RestFetchOutcome::RateLimited`] classification (mirrors the
+    /// Groww `error_class == "rate_limited"` rule: the LAST attempt's
+    /// status decides).
+    terminal_rate_limited: bool,
+}
+
+/// GAP-11 review HIGH (2026-07-14): terminal-failure classification for
+/// the Dhan audit row — mirrors the Groww `audit_outcome_for` rule
+/// (`RateLimited` keys on the LAST attempt being an HTTP 429). Pure.
+fn dhan_failed_audit_class(forensics: &DhanLadderForensics) -> (RestFetchOutcome, &'static str) {
+    if forensics.terminal_rate_limited {
+        (RestFetchOutcome::RateLimited, "rate_limited")
+    } else {
+        (RestFetchOutcome::Error, "error")
+    }
+}
+
+/// A 2xx response body + its `Content-Type` header value (2026-07-14
+/// raw-body discriminator: the header names WHAT Dhan is serving when the
+/// body carries zero candles — JSON envelope vs HTML shell vs empty).
+struct FetchedBody {
+    text: String,
+    content_type: String,
+}
+
+// ---------------------------------------------------------------------------
+// 2026-07-14 once-per-day raw-body sample (the account-condition vs
+// envelope-drift discriminator + Dhan-support evidence). For ≥14 days BOTH
+// /v2/charts/intraday and /v2/charts/historical returned 2xx with zero
+// parseable candles for ALL SIDs while option-chain + WS worked — and no
+// 2xx body was ever logged anywhere. On the FIRST empty_no_rows/empty_stale
+// classification of each IST day, ONE structured line captures a bounded
+// (600-char, secret-redacted) sample of the last parsed 2xx body + its
+// total byte length + Content-Type. Edge-latched: exactly one line per
+// day per process, unconditional (not diagnostics-gated — it is one log
+// line per day).
+// ---------------------------------------------------------------------------
+
+/// Process-global latch: the IST day key (nanos / day) whose raw-body
+/// sample has already been captured. 0 = never.
+static RAW_BODY_CAPTURE_DAY_KEY: std::sync::atomic::AtomicI64 =
+    std::sync::atomic::AtomicI64::new(0);
+
+/// Nanoseconds per day — the day-key divisor for the once-per-day latch.
+const NANOS_PER_DAY_I64: i64 = 86_400 * 1_000_000_000;
+
+/// Pure: the once-per-day latch key for a minute inside the trading day.
+#[must_use]
+pub fn raw_body_capture_day_key(minute_ist_nanos: i64) -> i64 {
+    minute_ist_nanos.div_euclid(NANOS_PER_DAY_I64)
+}
+
+/// Pure: whether a capture is still due for `day_key` given the latched
+/// value (`0` = never captured).
+#[must_use]
+pub fn raw_body_capture_due(latched_day_key: i64, day_key: i64) -> bool {
+    latched_day_key != day_key
+}
+
+/// Claim today's capture slot. `true` exactly once per day key per
+/// process (CAS — the 4 concurrent per-SID ladders can never double-log).
+fn try_claim_raw_body_capture(day_key: i64) -> bool {
+    use std::sync::atomic::Ordering;
+    let prev = RAW_BODY_CAPTURE_DAY_KEY.load(Ordering::Relaxed);
+    raw_body_capture_due(prev, day_key)
+        && RAW_BODY_CAPTURE_DAY_KEY
+            .compare_exchange(prev, day_key, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+}
+
 /// `true` when a DECLARED `Content-Length` fits the body cap (an absent
 /// declaration passes — the streamed accumulator below still enforces the
 /// cap). Pure (2026-07-12 security-review M — unbounded body read).
@@ -1330,7 +1440,7 @@ async fn spot_1m_fetch_once(
     url: &str,
     jwt: &str,
     body: &serde_json::Value,
-) -> Result<String, FetchFailure> {
+) -> Result<FetchedBody, FetchFailure> {
     // 2026-07-14 operator pacing directive: EVERY spot-1m Data-API request
     // (per-minute fires, ladder re-polls, the 15:33:30 sweep, the #1524
     // diagnostic probes — they all funnel through this fn) waits for a
@@ -1369,10 +1479,20 @@ async fn spot_1m_fetch_once(
             ),
         });
     }
-    read_body_capped(resp).await.map_err(|msg| FetchFailure {
+    // Content-Type BEFORE the body read consumes the response (2026-07-14
+    // raw-body discriminator — the header value rides the once-per-day
+    // sample line + the diagnostics probe entries).
+    let content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    let text = read_body_capped(resp).await.map_err(|msg| FetchFailure {
         rate_limited: false,
         msg,
-    })
+    })?;
+    Ok(FetchedBody { text, content_type })
 }
 
 /// Bounded in-minute re-poll ladder for ONE index: first attempt at the
@@ -1398,7 +1518,7 @@ async fn fetch_minute_with_ladder(
     minute_close_ms_of_day: i64,
     jitter_ms: u64,
     max_attempts: usize,
-) -> SidFetchOutcome {
+) -> (SidFetchOutcome, DhanLadderForensics) {
     let deltas = retry_sleep_deltas_ms();
     // 2026-07-14 adaptive degrade: 1 while degraded (no re-polls), the
     // full schedule otherwise — clamped so a hostile value can never
@@ -1406,6 +1526,9 @@ async fn fetch_minute_with_ladder(
     let attempts = max_attempts.clamp(1, deltas.len() + 1);
     let mut last_error: Option<String> = None;
     let mut prev_rate_limited = false;
+    // GAP-11 review HIGH (2026-07-14): real attempt/429 facts for the
+    // forensics row (previously fabricated as attempts=1 / rate=0).
+    let mut forensics = DhanLadderForensics::default();
     // Sticky: the FIRST 2xx body carrying the due backfill minute wins —
     // preserved across rungs and across a failing own-minute verdict.
     let mut backfill_found: Option<MinuteCandle> = None;
@@ -1416,6 +1539,12 @@ async fn fetch_minute_with_ladder(
     // 2026-07-14 stale-watermark cutoff: the previous PARSED attempt's
     // last-candle watermark (`Some(None)` = a parsed zero-row payload).
     let mut prev_parsed_watermark: Option<Option<i64>> = None;
+    // 2026-07-14 raw-body discriminator: the last target-less 2xx body's
+    // bounded redacted sample + Content-Type + total byte length. Stashed
+    // ONLY while today's once-per-day capture is still due (zero work on
+    // every later minute of the day).
+    let capture_day_key = raw_body_capture_day_key(target_minute_ist_nanos);
+    let mut empty_body_sample: Option<(String, String, usize)> = None;
     for attempt in 0..attempts {
         if attempt > 0 {
             let sleep_ms = ladder_sleep_ms(
@@ -1430,8 +1559,10 @@ async fn fetch_minute_with_ladder(
         let result = spot_1m_fetch_once(client, url, jwt.expose_secret(), body).await;
         metrics::histogram!("tv_spot1m_fetch_duration_ms")
             .record(started.elapsed().as_secs_f64() * 1_000.0);
+        forensics.attempts = forensics.attempts.saturating_add(1);
         match result {
-            Ok(body_text) => {
+            Ok(fetched) => {
+                let body_text = fetched.text;
                 let (target, backfill, stats) = parse_intraday_columnar_for_minutes(
                     &body_text,
                     target_minute_ist_nanos,
@@ -1446,20 +1577,37 @@ async fn fetch_minute_with_ladder(
                 if let Some(candle) = target {
                     let close_to_data_ms =
                         (ist_millis_of_day_now() - minute_close_ms_of_day).max(0);
-                    return SidFetchOutcome::Found {
-                        candle,
-                        close_to_data_ms,
-                        backfill_candle: backfill_found,
-                    };
+                    return (
+                        SidFetchOutcome::Found {
+                            candle,
+                            close_to_data_ms,
+                            backfill_candle: backfill_found,
+                        },
+                        forensics,
+                    );
                 }
-                // 2xx without the target minute — the seal may not have
-                // landed yet; the next ladder rung re-polls UNLESS the
-                // watermark provably did not move between two polls
+                // 2xx without the target minute — stash the bounded
+                // redacted sample for the once-per-day raw-body capture
+                // (only while today's slot is unclaimed; cold path).
+                if raw_body_capture_due(
+                    RAW_BODY_CAPTURE_DAY_KEY.load(std::sync::atomic::Ordering::Relaxed),
+                    capture_day_key,
+                ) {
+                    empty_body_sample = Some((
+                        tickvault_common::sanitize::capture_rest_raw_body_sample(&body_text),
+                        fetched.content_type,
+                        body_text.len(),
+                    ));
+                }
+                // The seal may not have landed yet; the next ladder rung
+                // re-polls UNLESS the watermark provably did not move
+                // between two polls
                 // (stale-watermark cutoff, 2026-07-14 — re-polling cannot
                 // outrun a serving delay; the saved rungs were today's
                 // wasted-429 fuel).
                 last_error = None;
                 prev_rate_limited = false;
+                forensics.terminal_rate_limited = false;
                 let current_watermark = stats.map(|(_, newest)| newest);
                 if ladder_watermark_repeated(prev_parsed_watermark, current_watermark) {
                     metrics::counter!("tv_spot1m_ladder_watermark_cutoff_total").increment(1);
@@ -1472,22 +1620,48 @@ async fn fetch_minute_with_ladder(
                     // DH-904 class: counted; the NEXT rung waits the extra
                     // bounded backoff; NEVER retried past the ladder.
                     metrics::counter!("tv_spot1m_rate_limited_total").increment(1);
+                    forensics.rate_limited_count = forensics.rate_limited_count.saturating_add(1);
                 }
                 prev_rate_limited = failure.rate_limited;
+                forensics.terminal_rate_limited = failure.rate_limited;
                 last_error = Some(failure.msg);
             }
         }
     }
-    match last_error {
+    let outcome = match last_error {
         Some(reason) => SidFetchOutcome::Failed {
             reason,
             backfill_candle: backfill_found,
         },
-        None => SidFetchOutcome::Empty {
-            class: classify_empty_body(freshest_body, target_minute_ist_nanos),
-            backfill_candle: backfill_found,
-        },
-    }
+        None => {
+            let class = classify_empty_body(freshest_body, target_minute_ist_nanos);
+            // 2026-07-14 once-per-day raw-body capture: the FIRST
+            // empty_no_rows/empty_stale classification of the IST day logs
+            // ONE bounded structured line — the account-condition vs
+            // envelope-drift discriminator (Dhan-support evidence). CAS
+            // claim: the concurrent per-SID ladders can never double-log.
+            if let Some((sample, content_type, body_bytes)) = empty_body_sample
+                && try_claim_raw_body_capture(capture_day_key)
+            {
+                error!(
+                    code = ErrorCode::Spot1m01FetchDegraded.code_str(),
+                    stage = "raw_body_sample",
+                    class = ?class,
+                    body_bytes,
+                    content_type = %content_type,
+                    body_sample = %sample,
+                    "spot_1m_rest: FIRST empty classification of the day — bounded \
+                     600-char secret-redacted sample of the 2xx charts body (the \
+                     account-condition vs envelope-drift discriminator; once per day)"
+                );
+            }
+            SidFetchOutcome::Empty {
+                class,
+                backfill_candle: backfill_found,
+            }
+        }
+    };
+    (outcome, forensics)
 }
 
 /// The ladder wrapped in the HARD per-SID wall-clock budget
@@ -1506,7 +1680,7 @@ async fn fetch_minute_bounded(
     minute_close_ms_of_day: i64,
     jitter_ms: u64,
     max_attempts: usize,
-) -> SidFetchOutcome {
+) -> (SidFetchOutcome, DhanLadderForensics) {
     match tokio::time::timeout(
         Duration::from_secs(SPOT_1M_REST_SID_BUDGET_SECS),
         fetch_minute_with_ladder(
@@ -1526,12 +1700,18 @@ async fn fetch_minute_bounded(
         Ok(outcome) => outcome,
         Err(_elapsed) => {
             metrics::counter!("tv_spot1m_sid_budget_exceeded_total").increment(1);
-            SidFetchOutcome::Failed {
-                reason: format!(
-                    "ladder budget exceeded ({SPOT_1M_REST_SID_BUDGET_SECS}s) — peer stalling"
-                ),
-                backfill_candle: None,
-            }
+            // Honest sentinels (the Groww budget-overrun note): the
+            // timed-out ladder's partial forensics are dropped with its
+            // future — attempts reads 0, never a fabricated count.
+            (
+                SidFetchOutcome::Failed {
+                    reason: format!(
+                        "ladder budget exceeded ({SPOT_1M_REST_SID_BUDGET_SECS}s) — peer stalling"
+                    ),
+                    backfill_candle: None,
+                },
+                DhanLadderForensics::default(),
+            )
         }
     }
 }
@@ -1547,6 +1727,9 @@ pub async fn run_spot_1m_rest(params: Spot1mRestTaskParams) {
     // Idempotent DDL first (CREATE → ADD COLUMN self-heal → DEDUP ENABLE);
     // failures degrade loudly inside (SPOT1M-02) and never block the run.
     ensure_spot_1m_rest_table(&params.questdb).await;
+    // Gap-11 forensics: the shared rest_fetch_audit table (idempotent —
+    // the Groww leg also ensures it; a second call is harmless).
+    ensure_rest_fetch_audit_table(&params.questdb).await;
 
     if !params.calendar.is_trading_day_today() {
         info!("spot_1m_rest: non-trading day — skipping all minute fires");
@@ -1576,6 +1759,9 @@ pub async fn run_spot_1m_rest(params: Spot1mRestTaskParams) {
         }
     };
     let mut writer = Spot1mRestWriter::new(&params.questdb);
+    // Gap-11 forensics: best-effort per-fetch audit rows (never on the
+    // fetch/verdict/edge path).
+    let mut audit_writer = RestFetchAuditWriter::new(&params.questdb);
     // 2026-07-13 backfill sweep: per-SID latest PERSISTED minute — drives
     // the previous-minute repair on every fire (and the batch catch-up
     // ceiling in batch mode).
@@ -1590,7 +1776,15 @@ pub async fn run_spot_1m_rest(params: Spot1mRestTaskParams) {
         let session_complete =
             run_batch_catchup_loop(&params, &client, &url, &mut writer, &mut tracker).await;
         if session_complete {
-            run_post_session_sweep(&client, &url, &params, &mut writer, &mut tracker).await;
+            run_post_session_sweep(
+                &client,
+                &url,
+                &params,
+                &mut writer,
+                &mut audit_writer,
+                &mut tracker,
+            )
+            .await;
         }
         return;
     }
@@ -1618,16 +1812,43 @@ pub async fn run_spot_1m_rest(params: Spot1mRestTaskParams) {
         // Audit Rule 3: re-read the wall clock + trading-day verdict EVERY
         // iteration (a suspend can cross midnight and stale the verdict).
         if !params.calendar.is_trading_day_today() {
-            info!("spot_1m_rest: no longer a trading day — exiting");
+            // 2026-07-14: loud + coded (was a bare info!) — a mid-session
+            // calendar flip silently stopping a capture leg must be
+            // greppable in errors.jsonl. Log-sink-only, NO Telegram (a
+            // calendar flip is not broker failure); a suspend that
+            // crossed IST midnight is a legitimate cause.
+            metrics::counter!("tv_spot1m_trading_day_flip_exit_total").increment(1);
+            error!(
+                code = ErrorCode::Spot1m01FetchDegraded.code_str(),
+                stage = "trading_day_flip_exit",
+                "SPOT1M-01: the trading-day verdict flipped mid-session — \
+                 exiting today's spot fire loop (a suspend that crossed \
+                 IST midnight is a legitimate cause; remaining minutes \
+                 stay absent, re-fetchable via backfill)"
+            );
             return;
         }
+        // Groww Item-7 precedent (GAP-11 review MEDIUM 1): the trading
+        // date as of THIS iteration's start — a suspend across IST
+        // midnight makes the post-wake `today_ist()` a DIFFERENT day, and
+        // stamping pre-suspend session seconds onto it would file the
+        // boundary-skip forensics rows under the wrong trading date.
+        let iter_date = today_ist();
         let now = ist_secs_of_day_now();
         let Some(fire) = next_fire_after(now, last_fired) else {
             info!(
                 "spot_1m_rest: past 15:30 IST — today's minute fires complete; \
                  running the one bounded post-session sweep"
             );
-            run_post_session_sweep(&client, &url, &params, &mut writer, &mut tracker).await;
+            run_post_session_sweep(
+                &client,
+                &url,
+                &params,
+                &mut writer,
+                &mut audit_writer,
+                &mut tracker,
+            )
+            .await;
             return;
         };
         let sleep_ms =
@@ -1649,7 +1870,14 @@ pub async fn run_spot_1m_rest(params: Spot1mRestTaskParams) {
             // Boundaries in (fire-60, woke) are gone (a midnight-wrap wake
             // counts 0 — the trading-day gate exits next iteration).
             let missed = count_missed_boundaries(fire.saturating_sub(60), woke.saturating_sub(1));
-            record_skipped_boundaries(&params, &mut edge, missed, fire);
+            record_skipped_boundaries(
+                &params,
+                &mut edge,
+                &mut audit_writer,
+                missed,
+                fire,
+                iter_date,
+            );
             // Advance past everything that already elapsed so the next
             // iteration never re-selects a long-gone boundary.
             if woke > fire {
@@ -1663,6 +1891,7 @@ pub async fn run_spot_1m_rest(params: Spot1mRestTaskParams) {
             &client,
             &url,
             &mut writer,
+            &mut audit_writer,
             &mut edge,
             &mut sid_tracker,
             &mut tracker,
@@ -1725,7 +1954,14 @@ pub async fn run_spot_1m_rest(params: Spot1mRestTaskParams) {
         // fire can never be fetched — count them loudly + feed the edge.
         let after = ist_secs_of_day_now();
         let missed = count_missed_boundaries(fire, after.saturating_sub(1));
-        record_skipped_boundaries(&params, &mut edge, missed, fire);
+        record_skipped_boundaries(
+            &params,
+            &mut edge,
+            &mut audit_writer,
+            missed,
+            fire + 60,
+            iter_date,
+        );
         if missed > 0 {
             last_fired = Some((after.min(SPOT_1M_REST_LAST_FIRE_SECS_OF_DAY_IST) / 60) * 60);
         }
@@ -1735,18 +1971,25 @@ pub async fn run_spot_1m_rest(params: Spot1mRestTaskParams) {
 /// Loud accounting for minute boundaries that elapsed UNFETCHED (fire
 /// overrun / suspend / clock step): counter + ONE coalesced coded log +
 /// each missed minute feeds the failure edge so a sustained-overrun outage
-/// still reaches the SPOT1M-01 escalation page (2026-07-12 H2 fix).
+/// still reaches the SPOT1M-01 escalation page (2026-07-12 H2 fix) + one
+/// `outcome=skipped` forensics row per (missed minute, SID) so the hole is
+/// queryable (GAP-11 review MEDIUM 1, 2026-07-14 — the Groww spot / Dhan
+/// chain shape; never silent, Rule 11). `first_missed_boundary_secs` = the
+/// FIRST boundary in the missed run (each targets the minute opening 60 s
+/// before it).
 fn record_skipped_boundaries(
     params: &Spot1mRestTaskParams,
     edge: &mut FailureEdge,
+    audit_writer: &mut RestFetchAuditWriter,
     skipped: u32,
-    context_secs_of_day: u32,
+    first_missed_boundary_secs: u32,
+    iter_date: NaiveDate,
 ) {
     if skipped == 0 {
         return;
     }
     metrics::counter!("tv_spot1m_boundary_skipped_total").increment(u64::from(skipped));
-    let around = format_minute_ist_12h(context_secs_of_day);
+    let around = format_minute_ist_12h(first_missed_boundary_secs);
     error!(
         code = ErrorCode::Spot1m01FetchDegraded.code_str(),
         stage = "boundary_skipped",
@@ -1755,7 +1998,45 @@ fn record_skipped_boundaries(
         "SPOT1M-01: minute boundaries elapsed unfetched (fire overrun / \
          suspend) — those minutes stay absent (re-fetchable via backfill)"
     );
-    for _ in 0..skipped {
+    // Groww Item-7 midnight-cross guard: a wake that crossed IST midnight
+    // would stamp the missed PRE-SUSPEND session seconds onto the
+    // POST-WAKE date — wrong trading date on every row. The counter + the
+    // coalesced log above already fired; skip the (mis-dated) forensics
+    // rows AND the per-boundary edge accounting. DELIBERATE edge-accounting
+    // consequence (review MEDIUM 3 class): the trading day is over for this
+    // run — an escalation page for yesterday's tail would be noise.
+    let trading_date = today_ist();
+    if trading_date != iter_date {
+        warn!(
+            %iter_date,
+            %trading_date,
+            "spot_1m_rest: wake crossed IST midnight — skipping the \
+             boundary-skip forensics rows (they would carry the wrong \
+             trading date); the day is over for this run"
+        );
+        return;
+    }
+    let trading_date_nanos = minute_open_ist_nanos(trading_date, 0);
+    for i in 0..skipped {
+        let boundary = first_missed_boundary_secs.saturating_add(i.saturating_mul(60));
+        let minute_open_secs = boundary.saturating_sub(60);
+        let target_nanos = minute_open_ist_nanos(trading_date, minute_open_secs);
+        for (security_id, symbol) in SPOT_1M_REST_INDICES {
+            audit_append_best_effort(
+                audit_writer,
+                &build_dhan_fetch_audit_row(
+                    target_nanos,
+                    trading_date_nanos,
+                    security_id,
+                    symbol,
+                    0,
+                    0,
+                    RestFetchOutcome::Skipped,
+                    -1,
+                    "boundary_skipped",
+                ),
+            );
+        }
         if let EdgeAction::Page { consecutive } = edge.record_minute(true) {
             error!(
                 code = ErrorCode::Spot1m01FetchDegraded.code_str(),
@@ -1773,6 +2054,7 @@ fn record_skipped_boundaries(
                 });
         }
     }
+    audit_flush_best_effort(audit_writer);
 }
 
 /// Build one `spot_1m_rest` row from a parsed candle. The `close_to_data_ms`
@@ -1811,6 +2093,146 @@ fn build_spot_1m_row(
     }
 }
 
+/// Best-effort symbol lookup for a staged `(security_id, minute)` pair —
+/// the pinned [`SPOT_1M_REST_INDICES`] set is 4 entries (cold path).
+fn spot_1m_symbol_for_sid(security_id: SecurityId) -> &'static str {
+    SPOT_1M_REST_INDICES
+        .into_iter()
+        .find(|(sid, _)| *sid == security_id)
+        .map_or("unknown", |(_, symbol)| symbol)
+}
+
+/// Pure Dhan-side `rest_fetch_audit` row builder — the mirror of the Groww
+/// `build_fetch_audit_row`. Since the GAP-11 review HIGH fix (2026-07-14)
+/// `attempts` and `rate_limited_count` are the ladder's REAL counts
+/// ([`DhanLadderForensics`]); `final_http_status` / `fetch_latency_ms`
+/// REMAIN the storage crate's documented sentinels (`0` = no captured
+/// status, `-1` = not measured — the Dhan [`FetchFailure`] carries no
+/// status/latency fields, the remaining flagged follow-up).
+///
+/// DEDUP note (review LOW, 2026-07-14): `error_class` is NOT in the audit
+/// DEDUP key `(ts, trading_date_ist, feed, leg, security_id,
+/// exchange_segment, outcome)` — two rows sharing that key with DIFFERENT
+/// error_class values (e.g. a fire's `persist_failed` NamedGap then the
+/// sweep's `named_gap` for the same minute) UPSERT in place, so the
+/// LAST-written error_class wins for that key. The outcome-level truth is
+/// unaffected (`outcome` IS in-key — transition rows with distinct
+/// outcomes both survive).
+#[allow(clippy::too_many_arguments)] // APPROVED: private forensics builder — a struct would be pure ceremony
+fn build_dhan_fetch_audit_row(
+    target_minute_ist_nanos: i64,
+    trading_date_nanos: i64,
+    security_id: SecurityId,
+    symbol: &'static str,
+    attempts: i64,
+    rate_limited_count: i64,
+    outcome: RestFetchOutcome,
+    close_to_data_ms: i64,
+    error_class: &'static str,
+) -> RestFetchAuditRow {
+    RestFetchAuditRow {
+        close_to_persist_ms: -1,
+        ts_ist_nanos: target_minute_ist_nanos,
+        trading_date_ist_nanos: trading_date_nanos,
+        feed: SPOT_1M_REST_FEED_DHAN,
+        leg: REST_FETCH_LEG_SPOT_1M,
+        // Unreachable overflow for the pinned SID set — a visible
+        // sentinel, never a silent sid=0 (the build_spot_1m_row precedent).
+        security_id: i64::try_from(security_id).unwrap_or(i64::MAX),
+        exchange_segment: SPOT_1M_REST_SEGMENT_IDX_I,
+        symbol,
+        attempts,
+        final_http_status: 0,
+        fetch_latency_ms: -1,
+        close_to_data_ms,
+        rate_limited_count,
+        outcome,
+        error_class,
+    }
+}
+
+/// Best-effort forensics append: a failure logs (coded) + counts and
+/// RETURNS — the fetch loop, the verdict and the failure edge are never
+/// affected by the forensics leg. Dhan emit sites stay field-less on the
+/// SPOT1M codes per the rule-file convention (grep-split by
+/// `feed="groww"`).
+fn audit_append_best_effort(audit_writer: &mut RestFetchAuditWriter, row: &RestFetchAuditRow) {
+    if let Err(err) = audit_writer.append_row(row) {
+        metrics::counter!("tv_rest_fetch_audit_persist_errors_total", "stage" => "audit_append")
+            .increment(1);
+        error!(
+            code = ErrorCode::Spot1m02PersistFailed.code_str(),
+            stage = "audit_append",
+            ?err,
+            "SPOT1M-02: rest_fetch_audit row append failed (forensics only — \
+             the fetch loop is unaffected)"
+        );
+    }
+}
+
+/// Best-effort forensics flush (same never-affects-the-loop contract).
+fn audit_flush_best_effort(audit_writer: &mut RestFetchAuditWriter) {
+    if let Err(err) = audit_writer.flush() {
+        metrics::counter!("tv_rest_fetch_audit_persist_errors_total", "stage" => "audit_flush")
+            .increment(1);
+        error!(
+            code = ErrorCode::Spot1m02PersistFailed.code_str(),
+            stage = "audit_flush",
+            ?err,
+            "SPOT1M-02: rest_fetch_audit ILP flush failed — pending forensics \
+             rows discarded (best-effort; the fetch loop is unaffected)"
+        );
+    }
+}
+
+/// GAP-11 persist stamping: minute CLOSE (row minute open + 60 s) → the
+/// data-table ILP flush-ACK instant, in ms of the IST day. Clamped at 0
+/// (clock jitter can never fabricate a negative latency). The row's
+/// `ts_ist_nanos` is its minute-OPEN in IST nanos — the same math the
+/// sweep's `close_to_data_ms` uses. Pure.
+///
+/// IST-midnight wrap (review LOW, 2026-07-14): a `now_ms_of_day` that
+/// wrapped past midnight reads BELOW the close instant and the stamp
+/// clamps to 0 — unreachable on the prod schedule (last fire 15:30,
+/// sweep ~15:33:30, box auto-stops 16:30 IST); documented, not special-cased.
+#[must_use]
+pub fn close_to_persist_ms_for(
+    minute_ts_ist_nanos: i64,
+    trading_date_nanos: i64,
+    now_ms_of_day: i64,
+) -> i64 {
+    let close_ms_of_day =
+        ((minute_ts_ist_nanos.saturating_sub(trading_date_nanos)) / NANOS_PER_SEC + 60)
+            .saturating_mul(MILLIS_PER_SEC);
+    (now_ms_of_day - close_ms_of_day).max(0)
+}
+
+/// GAP-11 hold-then-stamp: `ok`-class forensics rows are HELD until the
+/// DATA-table ILP flush ACK. On flush Ok every held row is stamped with
+/// its real `close_to_persist_ms` and returned for the best-effort audit
+/// append; on flush Err the held rows are DISCARDED — a false `ok` row
+/// must never land (the `flush_failed` named-gap rows emitted from the
+/// staged set are the truth for those minutes; `outcome` is in the audit
+/// DEDUP key, so an ok row would otherwise survive ALONGSIDE them and
+/// lie about the ok path). Pure — the hold/stamp/discard decision in one
+/// unit-testable place.
+#[must_use]
+pub fn stamp_held_ok_rows(
+    mut held: Vec<RestFetchAuditRow>,
+    flush_ok: bool,
+    trading_date_nanos: i64,
+    now_ms_of_day: i64,
+) -> Vec<RestFetchAuditRow> {
+    if !flush_ok {
+        return Vec::new();
+    }
+    for row in &mut held {
+        row.close_to_persist_ms =
+            close_to_persist_ms_for(row.ts_ist_nanos, trading_date_nanos, now_ms_of_day);
+    }
+    held
+}
+
 /// One minute-close fire: 4 concurrent ladder fetches (each carrying the
 /// full-day proven window) → persist the target minute AND the
 /// previous-minute backfill when due → counters → edge accounting.
@@ -1824,6 +2246,7 @@ async fn fire_one_minute(
     client: &reqwest::Client,
     url: &str,
     writer: &mut Spot1mRestWriter,
+    audit_writer: &mut RestFetchAuditWriter,
     edge: &mut FailureEdge,
     sid_tracker: &mut SidServedTracker,
     tracker: &mut PersistTracker,
@@ -1858,8 +2281,14 @@ async fn fire_one_minute(
     let mut sample_failure: Option<String> = None;
     // Minutes appended this fire, committed to the tracker ONLY after the
     // flush confirms (a failed flush discards the buffer — never a false
-    // watermark advance).
-    let mut staged: Vec<(SecurityId, i64)> = Vec::new();
+    // watermark advance). The ladder forensics ride along so a flush
+    // failure's named-gap rows keep the REAL attempt/429 facts (GAP-11
+    // review HIGH, 2026-07-14).
+    let mut staged: Vec<(SecurityId, i64, DhanLadderForensics)> = Vec::new();
+    // GAP-11 persist stamping: `ok` forensics rows are HELD here until the
+    // data flush ACK, then stamped with the real close_to_persist_ms (a
+    // failed flush discards them — the flush_failed rows are the truth).
+    let mut held_ok_rows: Vec<RestFetchAuditRow> = Vec::new();
     // 2026-07-13 VIX companion: per-SID served verdicts for THIS minute
     // (served = the SID's OWN target-minute candle was retrieved). A
     // join-failed task leaves its SID unrecorded (HOLD); the no-token arm
@@ -1896,7 +2325,7 @@ async fn fire_one_minute(
             // the no-data regime, full ladder otherwise.
             let max_attempts = ladder_attempt_count(degraded);
             join_set.spawn(async move {
-                let outcome = fetch_minute_bounded(
+                let (outcome, forensics) = fetch_minute_bounded(
                     &client,
                     &url,
                     &jwt,
@@ -1908,11 +2337,11 @@ async fn fire_one_minute(
                     max_attempts,
                 )
                 .await;
-                (security_id, symbol, outcome)
+                (security_id, symbol, outcome, forensics)
             });
         }
         while let Some(joined) = join_set.join_next().await {
-            let Ok((security_id, symbol, outcome)) = joined else {
+            let Ok((security_id, symbol, outcome, forensics)) = joined else {
                 error_count = error_count.saturating_add(1);
                 metrics::counter!("tv_spot1m_fetch_total", "outcome" => "error").increment(1);
                 if sample_failure.is_none() {
@@ -1924,6 +2353,11 @@ async fn fire_one_minute(
             // HONEST real retrieval delay (> 60 s by construction). Never
             // counted as this fire's `ok` and never sampled into the
             // own-fire `tv_spot1m_close_to_data_ms` histogram.
+            // Gap-11 forensics: the non-ok verdict/class for this
+            // (minute, SID), captured by the match arms below (the ok /
+            // persist verdict is only knowable after the append).
+            let mut audit_outcome = RestFetchOutcome::Error;
+            let mut audit_error_class: &'static str = "error";
             let (own_outcome, backfill_candle) = match outcome {
                 SidFetchOutcome::Found {
                     candle,
@@ -1936,9 +2370,11 @@ async fn fire_one_minute(
                 } => {
                     empty_count = empty_count.saturating_add(1);
                     empty_diag.record(class);
+                    audit_outcome = RestFetchOutcome::Empty;
                     match class {
                         // 2026-07-14 split: static label values only.
                         EmptyClass::NoRows => {
+                            audit_error_class = "empty_no_rows";
                             metrics::counter!("tv_spot1m_fetch_total", "outcome" => "empty_no_rows")
                                 .increment(1);
                             if sample_failure.is_none() {
@@ -1953,6 +2389,7 @@ async fn fire_one_minute(
                             last_candle_ist_nanos,
                             serving_lag_secs,
                         } => {
+                            audit_error_class = "empty_stale";
                             metrics::counter!("tv_spot1m_fetch_total", "outcome" => "empty_stale")
                                 .increment(1);
                             // The vendor SERVING LAG, measured every stale
@@ -1985,6 +2422,11 @@ async fn fire_one_minute(
                 } => {
                     error_count = error_count.saturating_add(1);
                     metrics::counter!("tv_spot1m_fetch_total", "outcome" => "error").increment(1);
+                    // GAP-11 review HIGH (2026-07-14): a terminal-429
+                    // ladder classifies `rate_limited`, never a generic
+                    // `error` — the scoreboard digest sums these rows'
+                    // rate-limit facts (the Groww classification rule).
+                    (audit_outcome, audit_error_class) = dhan_failed_audit_class(&forensics);
                     if sample_failure.is_none() {
                         sample_failure = Some(format!("sid {security_id}: {reason}"));
                     }
@@ -1992,6 +2434,25 @@ async fn fire_one_minute(
                 }
             };
             sid_verdicts.push((security_id, symbol, own_outcome.is_some()));
+            // Gap-11 forensics: non-ok verdicts (empty_no_rows /
+            // empty_stale / error) emit their audit row here — one per
+            // (minute, SID). The ok verdict emits after its append below.
+            if own_outcome.is_none() {
+                audit_append_best_effort(
+                    audit_writer,
+                    &build_dhan_fetch_audit_row(
+                        target_nanos,
+                        trading_date_nanos,
+                        security_id,
+                        symbol,
+                        i64::from(forensics.attempts),
+                        i64::from(forensics.rate_limited_count),
+                        audit_outcome,
+                        -1,
+                        audit_error_class,
+                    ),
+                );
+            }
             if let Some((candle, close_to_data_ms)) = own_outcome {
                 ok_count = ok_count.saturating_add(1);
                 metrics::counter!("tv_spot1m_fetch_total", "outcome" => "ok").increment(1);
@@ -2018,8 +2479,38 @@ async fn fire_one_minute(
                     if sample_failure.is_none() {
                         sample_failure = Some(format!("persist append failed: {err:#}"));
                     }
+                    // Gap-11 forensics: fetched-but-lost — never dressed
+                    // as vendor absence (round-2 LOW precedent).
+                    audit_append_best_effort(
+                        audit_writer,
+                        &build_dhan_fetch_audit_row(
+                            candle.minute_ts_ist_nanos,
+                            trading_date_nanos,
+                            security_id,
+                            symbol,
+                            i64::from(forensics.attempts),
+                            i64::from(forensics.rate_limited_count),
+                            RestFetchOutcome::NamedGap,
+                            -1,
+                            "persist_failed",
+                        ),
+                    );
                 } else {
-                    staged.push((security_id, candle.minute_ts_ist_nanos));
+                    // GAP-11: HOLD the ok row until the data flush ACK —
+                    // close_to_persist_ms is stamped post-flush, and a
+                    // failed flush discards it (never a false ok row).
+                    held_ok_rows.push(build_dhan_fetch_audit_row(
+                        candle.minute_ts_ist_nanos,
+                        trading_date_nanos,
+                        security_id,
+                        symbol,
+                        i64::from(forensics.attempts),
+                        i64::from(forensics.rate_limited_count),
+                        RestFetchOutcome::Ok,
+                        close_to_data_ms,
+                        "none",
+                    ));
+                    staged.push((security_id, candle.minute_ts_ist_nanos, forensics));
                 }
             }
             if let Some(backfill) = backfill_candle {
@@ -2045,6 +2536,20 @@ async fn fire_one_minute(
                         ?err,
                         "SPOT1M-02: spot_1m_rest BACKFILL row append failed"
                     );
+                    audit_append_best_effort(
+                        audit_writer,
+                        &build_dhan_fetch_audit_row(
+                            backfill.minute_ts_ist_nanos,
+                            trading_date_nanos,
+                            security_id,
+                            symbol,
+                            i64::from(forensics.attempts),
+                            i64::from(forensics.rate_limited_count),
+                            RestFetchOutcome::NamedGap,
+                            -1,
+                            "persist_failed",
+                        ),
+                    );
                 } else {
                     metrics::counter!("tv_spot1m_backfilled_total").increment(1);
                     info!(
@@ -2054,11 +2559,27 @@ async fn fire_one_minute(
                         "spot_1m_rest: previous minute backfilled from this \
                          fire's full-day response (DEDUP-idempotent)"
                     );
-                    staged.push((security_id, backfill.minute_ts_ist_nanos));
+                    // Gap-11 forensics: late recovery — `ok` keyed on the
+                    // BACKFILLED minute with the honest > 60 s delay.
+                    // GAP-11: held until the data flush ACK like the
+                    // own-minute ok row above.
+                    held_ok_rows.push(build_dhan_fetch_audit_row(
+                        backfill.minute_ts_ist_nanos,
+                        trading_date_nanos,
+                        security_id,
+                        symbol,
+                        i64::from(forensics.attempts),
+                        i64::from(forensics.rate_limited_count),
+                        RestFetchOutcome::Ok,
+                        backfill_close_to_data_ms,
+                        "none",
+                    ));
+                    staged.push((security_id, backfill.minute_ts_ist_nanos, forensics));
                 }
             }
         }
-        if let Err(err) = writer.flush() {
+        let flush_result = writer.flush();
+        if let Err(err) = &flush_result {
             persist_failed = true;
             metrics::counter!("tv_spot1m_persist_errors_total", "stage" => "flush").increment(1);
             error!(
@@ -2072,21 +2593,71 @@ async fn fire_one_minute(
             if sample_failure.is_none() {
                 sample_failure = Some(format!("persist flush failed: {err:#}"));
             }
+            // Gap-11 forensics: the staged-but-lost minutes become
+            // flush_failed rows — identity captured from `staged` BEFORE
+            // the commit arm would consume it (spec caveat). The earlier
+            // `ok` rows survive alongside (outcome is in the DEDUP key);
+            // the staged ladder forensics keep the real 429 facts.
+            for (security_id, minute_nanos, forensics) in &staged {
+                audit_append_best_effort(
+                    audit_writer,
+                    &build_dhan_fetch_audit_row(
+                        *minute_nanos,
+                        trading_date_nanos,
+                        *security_id,
+                        spot_1m_symbol_for_sid(*security_id),
+                        i64::from(forensics.attempts),
+                        i64::from(forensics.rate_limited_count),
+                        RestFetchOutcome::NamedGap,
+                        -1,
+                        "flush_failed",
+                    ),
+                );
+            }
         } else {
             // Flush confirmed — advance the per-SID persisted watermark.
-            for (security_id, minute_nanos) in staged {
+            for (security_id, minute_nanos, _forensics) in staged {
                 tracker.commit(security_id, minute_nanos);
             }
+        }
+        // GAP-11: the ok rows land ONLY after (and stamped with) the data
+        // flush ACK — discarded on a failed flush (the flush_failed rows
+        // above are the truth for those minutes).
+        for row in stamp_held_ok_rows(
+            held_ok_rows,
+            flush_result.is_ok(),
+            trading_date_nanos,
+            ist_millis_of_day_now(),
+        ) {
+            audit_append_best_effort(audit_writer, &row);
         }
     } else {
         // No token at fire time — REST cannot succeed; the whole minute is
         // a full miss (counted per SID for honest rate math).
         error_count = SPOT_1M_REST_INDICES.len();
         sample_failure = Some("no access token available at fire time".to_string());
-        for _ in 0..error_count {
+        let target_nanos = minute_open_ist_nanos(trading_date, minute_open_secs);
+        for (security_id, symbol) in SPOT_1M_REST_INDICES {
             metrics::counter!("tv_spot1m_fetch_total", "outcome" => "error").increment(1);
+            // Gap-11 forensics: no request ran — 0 attempts / -1 sentinels.
+            audit_append_best_effort(
+                audit_writer,
+                &build_dhan_fetch_audit_row(
+                    target_nanos,
+                    trading_date_nanos,
+                    security_id,
+                    symbol,
+                    0,
+                    0,
+                    RestFetchOutcome::NoToken,
+                    -1,
+                    "no_token",
+                ),
+            );
         }
     }
+    // Gap-11 forensics: flush ONCE per fire (best-effort).
+    audit_flush_best_effort(audit_writer);
 
     record_minute_verdict(
         params,
@@ -2137,6 +2708,16 @@ struct SweepCycleStats {
 /// `spot_1m_fetch_once` — and persist every missing minute found.
 /// Watermarks advance ONLY after the flush confirms (poisoned-buffer
 /// defense; DEDUP-idempotent re-appends).
+///
+/// Gap-11 forensics (2026-07-14): when `audit` is `Some` (the TERMINAL
+/// 15:33:30 post-session sweep) every still-missing minute lands a NAMED
+/// gap row (`named_gap` / `persist_failed` / `flush_failed`) and every
+/// recovered minute an `ok` row HELD until the data flush ACK then
+/// stamped with its real `close_to_persist_ms`. Mid-session batch
+/// catch-up cycles pass `None` — a minute missing at one cycle may be
+/// recovered by the next, so stamping a terminal `named_gap` there would
+/// be a false verdict (the per-minute fires' own rows + the terminal
+/// sweep remain the forensics truth for a batch-mode day).
 #[allow(clippy::too_many_arguments)] // APPROVED: private shared sweep body — a struct would be pure ceremony
 // TEST-EXEMPT: live-deps async body — the missing-minute selection (sweep_missing_minutes), row/window builders and cycle verdict (batch_cycle_fully_failed) are pure fns unit-tested below; the HTTP+persist legs reuse the tested fire_one_minute pattern.
 async fn sweep_sids_above_watermark(
@@ -2150,9 +2731,13 @@ async fn sweep_sids_above_watermark(
     session_first: i64,
     up_to_last_minute: i64,
     stage: &'static str,
+    mut audit: Option<&mut RestFetchAuditWriter>,
 ) -> SweepCycleStats {
     let mut stats = SweepCycleStats::default();
     let mut staged: Vec<(SecurityId, i64)> = Vec::new();
+    // GAP-11 persist stamping: swept `ok` forensics rows are HELD until
+    // the data flush ACK (stamped then; discarded on a failed flush).
+    let mut held_ok_rows: Vec<RestFetchAuditRow> = Vec::new();
     for (security_id, symbol) in SPOT_1M_REST_INDICES {
         let missing = sweep_missing_minutes(
             tracker.last_persisted(security_id),
@@ -2165,7 +2750,7 @@ async fn sweep_sids_above_watermark(
         stats.missing_before = stats.missing_before.saturating_add(missing.len() as u64);
         let body = spot_1m_day_request_body(&security_id.to_string(), trading_date);
         let candles = match spot_1m_fetch_once(client, url, jwt.expose_secret(), &body).await {
-            Ok(body_text) => parse_intraday_1m_candles(&body_text),
+            Ok(fetched) => parse_intraday_1m_candles(&fetched.text),
             Err(failure) => {
                 if failure.rate_limited {
                     metrics::counter!("tv_spot1m_rate_limited_total").increment(1);
@@ -2178,6 +2763,28 @@ async fn sweep_sids_above_watermark(
                     "SPOT1M-01: sweep fetch failed for this SID"
                 );
                 stats.still_missing = stats.still_missing.saturating_add(missing.len() as u64);
+                // Gap-11 forensics: the whole-SID sweep fetch failed —
+                // every still-missing minute is a NAMED gap, never silent
+                // (a 429'd sweep fetch keeps its real rate-limit fact —
+                // GAP-11 review HIGH, 2026-07-14).
+                if let Some(w) = audit.as_deref_mut() {
+                    for minute_nanos in &missing {
+                        audit_append_best_effort(
+                            w,
+                            &build_dhan_fetch_audit_row(
+                                *minute_nanos,
+                                trading_date_nanos,
+                                security_id,
+                                symbol,
+                                1,
+                                i64::from(failure.rate_limited),
+                                RestFetchOutcome::NamedGap,
+                                -1,
+                                "named_gap",
+                            ),
+                        );
+                    }
+                }
                 continue;
             }
         };
@@ -2185,6 +2792,24 @@ async fn sweep_sids_above_watermark(
         for minute_nanos in &missing {
             let Some(candle) = select_minute_candle(&candles, *minute_nanos) else {
                 stats.still_missing = stats.still_missing.saturating_add(1);
+                // Gap-11 forensics: still absent after the sweep — a
+                // NAMED gap row for this exact (minute, SID).
+                if let Some(w) = audit.as_deref_mut() {
+                    audit_append_best_effort(
+                        w,
+                        &build_dhan_fetch_audit_row(
+                            *minute_nanos,
+                            trading_date_nanos,
+                            security_id,
+                            symbol,
+                            1,
+                            0,
+                            RestFetchOutcome::NamedGap,
+                            -1,
+                            "named_gap",
+                        ),
+                    );
+                }
                 continue;
             };
             // Honest real retrieval delay for the swept minute.
@@ -2210,14 +2835,47 @@ async fn sweep_sids_above_watermark(
                     "SPOT1M-02: sweep row append failed"
                 );
                 stats.still_missing = stats.still_missing.saturating_add(1);
+                if let Some(w) = audit.as_deref_mut() {
+                    audit_append_best_effort(
+                        w,
+                        &build_dhan_fetch_audit_row(
+                            *minute_nanos,
+                            trading_date_nanos,
+                            security_id,
+                            symbol,
+                            1,
+                            0,
+                            RestFetchOutcome::NamedGap,
+                            -1,
+                            "persist_failed",
+                        ),
+                    );
+                }
             } else {
                 found_for_sid = found_for_sid.saturating_add(1);
+                // Gap-11 forensics: sweep recovery — `ok` with the honest
+                // real (big) close_to_data_ms. HELD until the data flush
+                // ACK (GAP-11 persist stamping).
+                if audit.is_some() {
+                    held_ok_rows.push(build_dhan_fetch_audit_row(
+                        *minute_nanos,
+                        trading_date_nanos,
+                        security_id,
+                        symbol,
+                        1,
+                        0,
+                        RestFetchOutcome::Ok,
+                        close_to_data_ms,
+                        "none",
+                    ));
+                }
                 staged.push((security_id, *minute_nanos));
             }
         }
         stats.swept = stats.swept.saturating_add(found_for_sid);
     }
-    if let Err(err) = writer.flush() {
+    let flush_result = writer.flush();
+    if let Err(err) = &flush_result {
         stats.persist_failed = true;
         metrics::counter!("tv_spot1m_persist_errors_total", "stage" => "flush").increment(1);
         error!(
@@ -2229,10 +2887,45 @@ async fn sweep_sids_above_watermark(
         );
         stats.still_missing = stats.still_missing.saturating_add(stats.swept);
         stats.swept = 0;
+        // Gap-11 forensics: the staged swept minutes become flush_failed
+        // rows — captured from `staged` BEFORE the commit arm consumes it.
+        if let Some(w) = audit.as_deref_mut() {
+            for (security_id, minute_nanos) in &staged {
+                audit_append_best_effort(
+                    w,
+                    &build_dhan_fetch_audit_row(
+                        *minute_nanos,
+                        trading_date_nanos,
+                        *security_id,
+                        spot_1m_symbol_for_sid(*security_id),
+                        1,
+                        0,
+                        RestFetchOutcome::NamedGap,
+                        -1,
+                        "flush_failed",
+                    ),
+                );
+            }
+        }
     } else {
         for (security_id, minute_nanos) in staged {
             tracker.commit(security_id, minute_nanos);
         }
+    }
+    if let Some(w) = audit {
+        // GAP-11: swept ok rows land ONLY after (and stamped with) the data
+        // flush ACK — discarded on a failed flush (the flush_failed rows
+        // above are the truth for those minutes).
+        for row in stamp_held_ok_rows(
+            held_ok_rows,
+            flush_result.is_ok(),
+            trading_date_nanos,
+            ist_millis_of_day_now(),
+        ) {
+            audit_append_best_effort(w, &row);
+        }
+        // Gap-11 forensics: one best-effort flush for the sweep's audit rows.
+        audit_flush_best_effort(w);
     }
     stats
 }
@@ -2265,7 +2958,17 @@ async fn run_batch_catchup_loop(
         // Audit Rule 3: re-read the wall clock + trading-day verdict every
         // iteration.
         if !params.calendar.is_trading_day_today() {
-            info!("spot_1m_rest: no longer a trading day — exiting batch loop");
+            // 2026-07-14: loud + coded (was a bare info!) — same class as
+            // the per-minute loop's flip exit; this names the BATCH loop.
+            metrics::counter!("tv_spot1m_trading_day_flip_exit_total").increment(1);
+            error!(
+                code = ErrorCode::Spot1m01FetchDegraded.code_str(),
+                stage = "trading_day_flip_exit",
+                "SPOT1M-01: the trading-day verdict flipped mid-session — \
+                 exiting the batch catch-up loop (a suspend that crossed \
+                 IST midnight is a legitimate cause; remaining cycles \
+                 stay absent, re-fetchable via backfill)"
+            );
             return false;
         }
         let now = ist_secs_of_day_now();
@@ -2322,6 +3025,11 @@ async fn run_batch_catchup_loop(
             session_first,
             up_to,
             "batch_cycle_failed",
+            // Gap-11: NO forensics mid-session — a batch cycle's missing
+            // minute may be recovered by the next cycle; only the terminal
+            // post-session sweep stamps named-gap/ok rows (see the helper
+            // doc note).
+            None,
         )
         .await;
         let fully_failed =
@@ -2421,6 +3129,7 @@ async fn run_post_session_sweep(
     url: &str,
     params: &Spot1mRestTaskParams,
     writer: &mut Spot1mRestWriter,
+    audit_writer: &mut RestFetchAuditWriter,
     tracker: &mut PersistTracker,
 ) {
     // Wait for the sweep instant (a run reaching here right at 15:30:00
@@ -2468,6 +3177,9 @@ async fn run_post_session_sweep(
         return;
     };
 
+    // Gap-11 forensics ride the SHARED sweep body (`Some(audit_writer)`):
+    // named_gap / persist_failed / flush_failed rows + held-then-stamped
+    // `ok` rows land exactly as the pre-refactor inline sweep emitted them.
     let stats = sweep_sids_above_watermark(
         client,
         url,
@@ -2479,6 +3191,7 @@ async fn run_post_session_sweep(
         session_first,
         session_last,
         "sweep_failed",
+        Some(audit_writer),
     )
     .await;
     let (swept, still_missing, persist_failed) =
@@ -3327,7 +4040,7 @@ mod tests {
         // through 15:33) and before the 16:30 IST box stop.
         assert!(
             SPOT_1M_REST_SWEEP_FIRE_SECS_OF_DAY_IST
-                >= crate::cross_verify_1m_boot::CROSS_VERIFY_TRIGGER_SECS_OF_DAY_IST + 150
+                >= RETIRED_CROSS_VERIFY_TRIGGER_SECS_OF_DAY_IST + 150
         );
         assert!(SPOT_1M_REST_SWEEP_FIRE_SECS_OF_DAY_IST > SPOT_1M_REST_LAST_FIRE_SECS_OF_DAY_IST);
         assert!(SPOT_1M_REST_SWEEP_FIRE_SECS_OF_DAY_IST < 16 * 3600 + 30 * 60);
@@ -3775,6 +4488,46 @@ mod tests {
     /// The per-fire aggregate folds both classes: counts, max rows, max
     /// lag, and the NEWEST candle across stale SIDs.
     #[test]
+    fn test_raw_body_capture_day_key_is_stable_within_a_day() {
+        // Two minutes of the same IST day share the key; the next day's
+        // first minute gets a NEW key (the once-per-day boundary).
+        let t0 = 1_783_934_100_000_000_000_i64; // some session minute
+        let t1 = t0 + 5 * NANOS_PER_MINUTE;
+        let next_day = t0 + NANOS_PER_DAY_I64;
+        assert_eq!(raw_body_capture_day_key(t0), raw_body_capture_day_key(t1));
+        assert_ne!(
+            raw_body_capture_day_key(t0),
+            raw_body_capture_day_key(next_day)
+        );
+    }
+
+    #[test]
+    fn test_raw_body_capture_due_pure_semantics() {
+        // Unlatched (0) → due; same day latched → not due; a NEW day is
+        // due again even after yesterday's capture.
+        assert!(raw_body_capture_due(0, 20_650));
+        assert!(!raw_body_capture_due(20_650, 20_650));
+        assert!(raw_body_capture_due(20_650, 20_651));
+    }
+
+    #[test]
+    fn test_try_claim_raw_body_capture_fires_exactly_once_per_day_key() {
+        // Distinct key space (negative — no real IST nanos map here) so the
+        // process-global latch never races the other tests / day keys.
+        let key = -777_001_i64;
+        assert!(try_claim_raw_body_capture(key), "first claim must win");
+        assert!(
+            !try_claim_raw_body_capture(key),
+            "second claim same day must be latched out"
+        );
+        let next_day = key + 1;
+        assert!(
+            try_claim_raw_body_capture(next_day),
+            "a new day key re-arms the capture"
+        );
+    }
+
+    #[test]
     fn test_empty_diagnostics_aggregate_folds_max() {
         let target = 1_783_934_100_000_000_000;
         let mut d = EmptyDiagnostics::default();
@@ -3826,9 +4579,10 @@ mod tests {
     fn test_probe_crossverify_request_byte_equality_fixture() {
         let date = NaiveDate::from_ymd_opt(2026, 7, 14).expect("valid date");
         let spot = spot_1m_day_request_body("13", date).to_string();
-        // The cross-verify call shape (cross_verify_1m_boot::compare_one_target
-        // for an index target): intraday_request_body(sid, segment,
-        // instrument, trading_date, trading_date.succ()).
+        // The (retired — PR-C3 2026-07-14) cross-verify call shape
+        // (`compare_one_target` for an index target):
+        // intraday_request_body(sid, segment, instrument, trading_date,
+        // trading_date.succ()). Kept as the live-proven day-window fixture.
         let next = date.succ_opt().expect("next day");
         let crossverify =
             intraday_request_body("13", SPOT_1M_REST_SEGMENT_IDX_I, "INDEX", date, next)
@@ -3981,5 +4735,164 @@ mod tests {
         let s2 = summarize_probe_candles(&c2, target);
         assert!(s2.target_present);
         assert_eq!(s2.serving_lag_secs, 0);
+    }
+
+    // ---- GAP-11 persist stamping (hold-then-stamp) --------------------------
+
+    fn held_ok_row_fixture(minute_open_secs: i64) -> RestFetchAuditRow {
+        RestFetchAuditRow {
+            ts_ist_nanos: minute_open_secs * NANOS_PER_SEC,
+            trading_date_ist_nanos: 0,
+            feed: "dhan",
+            leg: "spot_1m",
+            security_id: 13,
+            exchange_segment: "IDX_I",
+            symbol: "NIFTY",
+            attempts: 1,
+            final_http_status: 0,
+            fetch_latency_ms: -1,
+            close_to_data_ms: 1_042,
+            close_to_persist_ms: -1,
+            rate_limited_count: 0,
+            outcome: RestFetchOutcome::Ok,
+            error_class: "none",
+        }
+    }
+
+    #[test]
+    fn test_close_to_persist_ms_for_math_and_clamp() {
+        // 09:15 minute open → closes 09:16:00; flush ACK at 09:16:01.500.
+        let open_secs: i64 = 9 * 3600 + 15 * 60;
+        let nanos = open_secs * NANOS_PER_SEC;
+        let close_ms = (open_secs + 60) * MILLIS_PER_SEC;
+        assert_eq!(close_to_persist_ms_for(nanos, 0, close_ms + 1_500), 1_500);
+        // A non-midnight trading_date base subtracts out.
+        let date_nanos = 1_700_000_000 * NANOS_PER_SEC;
+        assert_eq!(
+            close_to_persist_ms_for(date_nanos + nanos, date_nanos, close_ms + 250),
+            250
+        );
+        // Clock jitter can never fabricate a negative latency.
+        assert_eq!(close_to_persist_ms_for(nanos, 0, close_ms - 10), 0);
+    }
+
+    #[test]
+    fn test_stamp_held_ok_rows_flush_ok_stamps_each_row() {
+        let open_a: i64 = 9 * 3600 + 15 * 60; // closes 09:16:00
+        let open_b = open_a + 60; // closes 09:17:00
+        let held = vec![held_ok_row_fixture(open_a), held_ok_row_fixture(open_b)];
+        // Flush ACK 2 s after the LATER minute's close.
+        let now_ms = (open_b + 60) * MILLIS_PER_SEC + 2_000;
+        let stamped = stamp_held_ok_rows(held, true, 0, now_ms);
+        assert_eq!(stamped.len(), 2);
+        // Per-row stamping: the earlier minute closed 60 s before.
+        assert_eq!(stamped[0].close_to_persist_ms, 62_000);
+        assert_eq!(stamped[1].close_to_persist_ms, 2_000);
+        // The measured close_to_data_ms + everything else is untouched, so
+        // persist ≥ data for own-fire rows by construction (flush follows
+        // the verdict on the same wall clock).
+        assert!(
+            stamped
+                .iter()
+                .all(|r| r.close_to_data_ms == 1_042 && r.outcome == RestFetchOutcome::Ok)
+        );
+    }
+
+    #[test]
+    fn test_stamp_held_ok_rows_flush_err_discards_all() {
+        // Discard is MANDATORY: `outcome` is in the audit DEDUP key, so an
+        // ok row appended after a failed flush would land ALONGSIDE the
+        // flush_failed named-gap row and lie about the ok path.
+        let held = vec![held_ok_row_fixture(9 * 3600 + 15 * 60)];
+        assert!(stamp_held_ok_rows(held, false, 0, i64::MAX / 2).is_empty());
+        // Empty hold is a no-op on either arm.
+        assert!(stamp_held_ok_rows(Vec::new(), true, 0, 0).is_empty());
+    }
+
+    // ---- GAP-11 review HIGH (2026-07-14): real rate-limit facts -------------
+
+    #[test]
+    fn test_dhan_failed_audit_class_terminal_429_maps_rate_limited() {
+        // The Groww classification rule mirrored: the LAST attempt's 429
+        // decides the terminal verdict (a 429-exhausted ladder must never
+        // read `error` while the digest sums 0 rate-limit hits).
+        let forensics = DhanLadderForensics {
+            attempts: 5,
+            rate_limited_count: 3,
+            terminal_rate_limited: true,
+        };
+        assert_eq!(
+            dhan_failed_audit_class(&forensics),
+            (RestFetchOutcome::RateLimited, "rate_limited")
+        );
+    }
+
+    #[test]
+    fn test_dhan_failed_audit_class_non_429_maps_error() {
+        // A mid-ladder 429 followed by a non-429 terminal failure stays
+        // `error` (last status decides — Groww semantics), but the row
+        // still carries the real rate_limited_count.
+        let forensics = DhanLadderForensics {
+            attempts: 5,
+            rate_limited_count: 2,
+            terminal_rate_limited: false,
+        };
+        assert_eq!(
+            dhan_failed_audit_class(&forensics),
+            (RestFetchOutcome::Error, "error")
+        );
+        // The budget-overrun sentinel arm (attempts 0) is also `error`.
+        assert_eq!(
+            dhan_failed_audit_class(&DhanLadderForensics::default()),
+            (RestFetchOutcome::Error, "error")
+        );
+    }
+
+    #[test]
+    fn test_build_dhan_fetch_audit_row_carries_real_rate_limit_facts() {
+        // Real attempts + 429 count land on the row; status/latency stay
+        // the documented 0/-1 sentinels (FetchFailure carries neither).
+        let row = build_dhan_fetch_audit_row(
+            1_000,
+            0,
+            13,
+            "NIFTY",
+            5,
+            3,
+            RestFetchOutcome::RateLimited,
+            -1,
+            "rate_limited",
+        );
+        assert_eq!(row.attempts, 5);
+        assert_eq!(row.rate_limited_count, 3);
+        assert_eq!(row.outcome, RestFetchOutcome::RateLimited);
+        assert_eq!(row.error_class, "rate_limited");
+        assert_eq!(row.final_http_status, 0);
+        assert_eq!(row.fetch_latency_ms, -1);
+        assert_eq!(row.close_to_persist_ms, -1);
+    }
+
+    #[test]
+    fn test_build_dhan_fetch_audit_row_skipped_boundary_shape() {
+        // GAP-11 review MEDIUM 1 (2026-07-14): the Dhan spot leg's missed
+        // boundaries land `outcome=skipped` / `boundary_skipped` rows with
+        // the no-request sentinels (0 attempts / 0 429s / -1 latency) —
+        // the Groww spot / Dhan chain shape.
+        let row = build_dhan_fetch_audit_row(
+            2_000,
+            0,
+            25,
+            "BANKNIFTY",
+            0,
+            0,
+            RestFetchOutcome::Skipped,
+            -1,
+            "boundary_skipped",
+        );
+        assert_eq!(row.outcome, RestFetchOutcome::Skipped);
+        assert_eq!(row.error_class, "boundary_skipped");
+        assert_eq!(row.attempts, 0);
+        assert_eq!(row.rate_limited_count, 0);
+        assert_eq!(row.close_to_data_ms, -1);
     }
 }

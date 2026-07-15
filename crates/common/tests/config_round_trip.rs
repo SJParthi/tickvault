@@ -326,10 +326,8 @@ fn test_config_default_values() {
     let config: ApplicationConfig =
         toml::from_str(VALID_CONFIG_TOML).expect("valid TOML must deserialize");
 
-    // SubscriptionConfig defaults.
-    assert_eq!(config.subscription.feed_mode, "Full");
-    assert!(config.subscription.subscribe_stock_equities);
-    assert_eq!(config.subscription.stock_atm_strikes_above, 25);
+    // (PR-C3 2026-07-14: SubscriptionConfig defaults retired with the
+    // deleted subscription surface — scope-lock amendment §B item 2.)
 
     // StrategyConfig defaults.
     assert_eq!(config.strategy.config_path, "config/strategies.toml");

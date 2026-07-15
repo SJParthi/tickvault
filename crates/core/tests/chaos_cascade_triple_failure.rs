@@ -16,9 +16,11 @@
 //!   3. **Auth token expiry** — the JWT is past its expiry instant. The
 //!      recovery primitives that drive `force_renewal_if_stale` MUST signal
 //!      "engage renewal" (`TokenState::is_valid() == false`,
-//!      `needs_refresh() == true`) and the reconnect-backoff helper MUST
-//!      engage its ladder (instant 0 ms first retry, then a growing,
-//!      capped backoff).
+//!      `needs_refresh() == true`).
+//!      (PR-C2 trim, 2026-07-13: the main-feed reconnect-backoff ladder
+//!      assertions retired with `connection.rs::compute_reconnect_base_delay_ms`
+//!      — deleted with the Dhan live-WS lane; the surviving order-update
+//!      backoff ladder is unit-tested in `order_update_connection.rs`.)
 //!
 //! The unifying, asserted invariant across all three legs is **ZERO durable
 //! loss**: every captured frame survives the WAL belt, every tick survives
@@ -47,7 +49,6 @@ use tickvault_common::config::QuestDbConfig;
 use tickvault_common::constants::TICK_BUFFER_CAPACITY;
 use tickvault_common::tick_types::ParsedTick;
 use tickvault_core::auth::types::{DhanAuthResponseData, TokenState};
-use tickvault_core::websocket::connection::compute_reconnect_base_delay_ms;
 use tickvault_storage::tick_persistence::TickPersistenceWriter;
 use tickvault_storage::ws_frame_spill::{AppendOutcome, WsFrameSpill, WsType, replay_all};
 
@@ -56,11 +57,6 @@ use tickvault_storage::ws_frame_spill::{AppendOutcome, WsFrameSpill, WsType, rep
 /// (100,000) so the tick ring never even needs to overflow to disk — the
 /// strongest form of "zero loss" is "zero drop AND nothing forced to spill".
 const N: usize = 5_000;
-
-/// QuestDB ILP first-retry: instant (0 ms). Mirrors the production main-feed
-/// reconnect contract `compute_reconnect_base_delay_ms(0, _, _) == 0`.
-const RECONNECT_INITIAL_MS: u64 = 500;
-const RECONNECT_MAX_MS: u64 = 30_000;
 
 /// A unique temp dir per tag + process, removed first so a stale run can't
 /// pollute the assertion. Matches `chaos_ws_frame_spill_saturation::chaos_tmp`.
@@ -296,31 +292,10 @@ fn cascade_01_triple_failure_loses_zero_durable_data() {
 
     // ======================================================================
     // INVARIANT 3 — LEG 3: the auth-recovery primitives engage. The expired
-    // token drives renewal, and the reconnect-backoff ladder engages with the
-    // documented instant-first-retry contract.
+    // token drives renewal. (PR-C2, 2026-07-13: the main-feed
+    // reconnect-backoff ladder assertions retired with the deleted
+    // `connection.rs` — the order-update ladder keeps its own unit suite.)
     // ======================================================================
-    // First reconnect attempt is instant (0 ms) per the main-feed contract.
-    assert_eq!(
-        compute_reconnect_base_delay_ms(0, RECONNECT_INITIAL_MS, RECONNECT_MAX_MS),
-        0,
-        "LEG 3: first reconnect retry must be instant (0 ms)"
-    );
-    // Subsequent attempts engage a growing, capped exponential backoff.
-    assert_eq!(
-        compute_reconnect_base_delay_ms(1, RECONNECT_INITIAL_MS, RECONNECT_MAX_MS),
-        RECONNECT_INITIAL_MS,
-        "LEG 3: second retry must be the base delay"
-    );
-    assert_eq!(
-        compute_reconnect_base_delay_ms(2, RECONNECT_INITIAL_MS, RECONNECT_MAX_MS),
-        RECONNECT_INITIAL_MS * 2,
-        "LEG 3: backoff must double on the third retry"
-    );
-    assert_eq!(
-        compute_reconnect_base_delay_ms(64, RECONNECT_INITIAL_MS, RECONNECT_MAX_MS),
-        RECONNECT_MAX_MS,
-        "LEG 3: backoff must saturate at the cap, never overflow"
-    );
     // Re-assert the token is still expired post-window (no clock surprise).
     assert!(
         !token.is_valid() && token.needs_refresh(4),

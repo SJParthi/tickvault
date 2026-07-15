@@ -295,8 +295,9 @@ pub fn lifecycle_select_sql() -> String {
 
 /// The day's live `candles_1m` SELECT (`feed='groww'`).
 ///
-/// REGRESSION LOCK (the `cross_verify_1m_boot::our_candles_select_sql`
-/// lesson, empirically confirmed on QuestDB 9.3.5): a bare integer literal
+/// REGRESSION LOCK (the `our_candles_select_sql` lesson from the retired
+/// Dhan cross-verify — module deleted PR-C3 2026-07-14 — empirically
+/// confirmed on QuestDB 9.3.5): a bare integer literal
 /// compared against a TIMESTAMP column is epoch MICROSECONDS — the WHERE
 /// bounds are `nanos / 1000`; and `(ts / 1)` yields micros, so the
 /// projected key is re-scaled `* 1000` back to nanos. Pinned by the

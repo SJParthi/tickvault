@@ -56,19 +56,7 @@ resource "aws_cloudwatch_log_metric_filter" "tv_boot_completed_fallback" {
   }
 }
 
-resource "aws_cloudwatch_log_metric_filter" "tv_realtime_guarantee_score_fallback" {
-  name           = "tv-${var.environment}-realtime-guarantee-score-fallback"
-  log_group_name = "/tickvault/${var.environment}/metrics"
-
-  pattern = "{ $.tv_realtime_guarantee_score = * }"
-
-  metric_transformation {
-    name      = "tv_realtime_guarantee_score"
-    namespace = "Tickvault/Prod"
-    value     = "$.tv_realtime_guarantee_score"
-    dimensions = {
-      host = "$.host"
-    }
-    # Deliberately no default value — missing data must stay missing (alarm breaches on it).
-  }
-}
+# RETIRED (PR-C2, 2026-07-13): the tv_realtime_guarantee_score fallback
+# filter — the SLO publisher was deleted per the operator PARK ruling
+# (wave-3-d-error-codes.md banner); no event carries the field anymore and
+# both score alarms were retired with it.
