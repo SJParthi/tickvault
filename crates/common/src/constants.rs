@@ -3770,7 +3770,7 @@ pub const fn g2_wall_clock_gate_accepts(wall_clock_ts_nanos_of_day: i64) -> bool
 
 /// Order-family REST base URL. Bare host only — the `/v1/order/*` PATHS live
 /// ONLY in `oms/groww/api_client.rs` behind the 4-gate lattice (Gate 5).
-pub const GROWW_ORDER_API_BASE_URL: &str = "https://api.groww.in";
+pub const GROWW_ORDER_API_BASE_URL: &str = "https://api.groww.in"; // APPROVED: constants.rs is the single static-URL source (same as GROWW_INSTRUMENT_CSV_URL)
 
 /// Self-cap: order MUTATIONS (place/modify/cancel) per second. Const-asserted
 /// ≤ the documented Orders family ceiling of 10/s.
