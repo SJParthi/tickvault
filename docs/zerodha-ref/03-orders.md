@@ -1,196 +1,244 @@
 # Zerodha Kite Connect v3 — Orders (reference)
 
-> **Source:** `https://kite.trade/docs/connect/v3/orders/` (official live doc — UNREACHABLE from this sandbox; see provenance below)
-> **Fetched-Verified:** 2026-07-13 via CLIENT-LIB-SOURCE (`zerodha/pykiteconnect@master`, `zerodha/gokiteconnect@master` — raw.githubusercontent.com, fetched 2026-07-13) + OFFICIAL-MOCK (`zerodha/kiteconnect-mocks@main` c7a8123, fetched 2026-07-13) + SEARCH (result snippets of the live orders page + Kite forum, 2026-07-13) + ARITH. **ARCHIVE-DOC and MIRROR-LIVE were BOTH BLOCKED** at the egress proxy on 2026-07-13 (web.archive.org: WebFetch client refusal + proxy CONNECT 403; r.jina.ai: CONNECT 403; kite.trade direct: CONNECT 403 — per the same-day probe log). No claim in this file is byte-verbatim from the live docs page.
-> **Evidence tiers:** see README legend — Verified (CLIENT-LIB-SOURCE …) / Verified (OFFICIAL-MOCK …) / SEARCH / Assumed / Unknown. A SEARCH-tier fact is substantive but NOT byte-verbatim; re-verify from an unblocked network before contracting.
+> **Source:** `https://kite.trade/docs/connect/v3/orders/` (official live doc — NOW LIVE-VERIFIED) + `https://support.zerodha.com/.../market-price-protection-on-the-order-window` + `https://support.zerodha.com/.../order-rate-limits-on-kite`
+> **Fetched-Verified:** live-verbatim via GH-runner 2026-07-14 (UTC timestamps + per-URL sha256 in `00-COVERAGE-MANIFEST.md`; the orders page, the market-price-protection article, and the order-rate-limits article are all in the fetch-log at HTTP 200). Cross-check evidence retained from 2026-07-13: CLIENT-LIB-SOURCE (`zerodha/pykiteconnect@master`, `zerodha/gokiteconnect@master`) + OFFICIAL-MOCK (`zerodha/kiteconnect-mocks@main` c7a8123) + SEARCH + ARITH. The 2026-07-13 note that the live page was unreachable is OBSOLETE — the 2026-07-14 runner crawl fetched it directly.
+> **Evidence tiers:** see README legend — **Verified (LIVE-DOC runner 2026-07-14)** is the TOP tier for this pack (claim confirmed against the runner-fetched live page); Verified (CLIENT-LIB-SOURCE …) / Verified (OFFICIAL-MOCK …) remain as cross-checks; SEARCH / Assumed / Unknown as before. **Two live corrections in this revision:** iceberg legs are 2–50 (the old 2–10 SEARCH claim was WRONG — §6), and the autoslice response is a FLAT `data: []` array of slice entries, not a parent-`order_id`-plus-`children` object (§3b).
 > **Scope note:** REFERENCE ONLY — docs pack, not a feed-scope grant. No credentials, no code. TickVault places NO orders on Zerodha; any future order path requires its own dated operator grant per the house rule-file protocol.
-> **Related:** `99-UNKNOWNS.md` (Z-ORD-1 … Z-ORD-8 below), `docs/dhan-ref/07-orders.md` (comparison), `docs/groww-ref/16-orders-margins-portfolio.md` (comparison).
+> **Related:** `99-UNKNOWNS.md` (Z-ORD-1 … Z-ORD-8 below — Z-ORD-1/2/7 substantially RESOLVED by the live fetch), `docs/dhan-ref/07-orders.md` (comparison), `docs/groww-ref/16-orders-margins-portfolio.md` (comparison).
 
 ---
 
 ## 1. Endpoints (the full order surface)
 
-**Verified (CLIENT-LIB-SOURCE pykiteconnect@master `kiteconnect/connect.py` `_routes` dict, fetched 2026-07-13 — https://raw.githubusercontent.com/zerodha/pykiteconnect/master/kiteconnect/connect.py; cross-checked Verified (CLIENT-LIB-SOURCE gokiteconnect@master `connect.go` URI constants + `orders.go` HTTP methods)):**
+**Verified (LIVE-DOC runner 2026-07-14 — https://kite.trade/docs/connect/v3/orders/, the page's own endpoint table; cross-check: CLIENT-LIB-SOURCE pykiteconnect `_routes` + gokiteconnect URI constants, fetched 2026-07-13):**
 
-| Action | Method | Route | SDK fn (py) |
+| Action | Method | Route | Live-page description |
 |---|---|---|---|
-| Place order | `POST` | `/orders/{variety}` | `place_order(...)` → returns `order_id` |
-| Modify order | `PUT` | `/orders/{variety}/{order_id}` | `modify_order(...)` → returns `order_id` |
-| Cancel order | `DELETE` | `/orders/{variety}/{order_id}` (optional `parent_order_id` param) | `cancel_order(...)` |
-| Exit CO | `DELETE` | same as cancel (py `exit_order` is a literal alias of `cancel_order`; Go `ExitOrder` likewise aliases `CancelOrder`) | `exit_order(...)` |
-| Order book (day's orders) | `GET` | `/orders` | `orders()` |
-| Single-order history | `GET` | `/orders/{order_id}` | `order_history(order_id)` — returns the LIST of state transitions, not one row |
-| Trade book (day's trades) | `GET` | `/trades` | `trades()` |
-| Trades of one order | `GET` | `/orders/{order_id}/trades` | `order_trades(order_id)` |
-| Order margins | `POST` | `/margins/orders` | `order_margins(...)` (see the margins section file) |
-| Basket margins | `POST` | `/margins/basket` | `basket_order_margins(...)` |
-| Virtual contract note (charges) | `POST` | `/charges/orders` | `get_virtual_contract_note(...)` |
+| Place order | `POST` | `/orders/:variety` | "Place an order of a particular variety" |
+| Modify order | `PUT` | `/orders/:variety/:order_id` | "Modify an open or pending order" |
+| Cancel order | `DELETE` | `/orders/:variety/:order_id` | "Cancel an open or pending order" (optional `parent_order_id` param per SDKs — see §8) |
+| Order book (day's orders) | `GET` | `/orders` | "Retrieve the list of all orders (open and executed) for the day" |
+| Single-order history | `GET` | `/orders/:order_id` | "Retrieve the history of a given order" — returns the LIST of state transitions, not one row |
+| Trade book (day's trades) | `GET` | `/trades` | "Retrieve the list of all executed trades for the day" |
+| Trades of one order | `GET` | `/orders/:order_id/trades` | "Retrieve the trades generated by an order" |
 
-**Verified (CLIENT-LIB-SOURCE pykiteconnect connect.py):** base URL `https://api.kite.trade` (`_default_root_uri`), header `X-Kite-Version: 3` (`kite_header_version = "3"`), auth header `Authorization: token {api_key}:{access_token}`. Request bodies are form-encoded params (the py client posts `params`; the Go client encodes `url.Values`) — **NOT JSON bodies** (contrast Dhan, which takes JSON bodies on POST/PUT — `docs/dhan-ref/07-orders.md`).
+**Verified (CLIENT-LIB-SOURCE pykiteconnect `_routes` — NOT on the live orders page; they live on the margins doc page):** order margins `POST /margins/orders`, basket margins `POST /margins/basket`, virtual contract note `POST /charges/orders`. Exit CO: py `exit_order` is a literal alias of `cancel_order`; Go `ExitOrder` aliases `CancelOrder` (CLIENT-LIB-SOURCE).
 
-**Verified (OFFICIAL-MOCK order_response.json / order_modify.json / order_cancel.json, kiteconnect-mocks@main, fetched 2026-07-13):** place / modify / cancel all return the same envelope:
+**Verified (LIVE-DOC runner 2026-07-14 — the page's own curl examples):** base URL `https://api.kite.trade`, header `X-Kite-Version: 3`, auth header `Authorization: token api_key:access_token`, request bodies are form-encoded params (curl `-d` fields) — **NOT JSON bodies** (contrast Dhan, which takes JSON bodies on POST/PUT — `docs/dhan-ref/07-orders.md`).
+
+**Verified (LIVE-DOC runner 2026-07-14 — the place/modify/cancel examples on the page; cross-check OFFICIAL-MOCK order_response/order_modify/order_cancel.json):** place / modify / cancel all return the same envelope:
 
 ```json
 { "status": "success", "data": { "order_id": "151220000000000" } }
 ```
 
-`order_id` is a **string** on the wire (all mocks; Go `OrderID string`).
+`order_id` is a **string** on the wire (live examples + all mocks; Go `OrderID string`).
+
+**Verified (LIVE-DOC runner 2026-07-14 — "Placing orders" prose, verbatim):** "Successful placement of an order via the API does not imply its successful execution. To know the true status of a placed order, you should scan the order history or retrieve the particular order's current details using its order_id." — the page recommends postbacks for async status of open orders.
 
 ## 2. Order varieties
 
-**Verified (CLIENT-LIB-SOURCE pykiteconnect connect.py constants):** the `{variety}` path segment takes exactly these values in the current py SDK:
+**Verified (LIVE-DOC runner 2026-07-14 — the "Glossary of constants" `variety` rows; cross-check CLIENT-LIB-SOURCE pykiteconnect constants):** the `{variety}` path segment takes exactly these values:
 
-| Variety | Constant | Meaning |
-|---|---|---|
-| `regular` | `VARIETY_REGULAR` | Normal in-market order |
-| `amo` | `VARIETY_AMO` | After-market order (queued outside market hours) — the py README's own AMO example places `variety=kite.VARIETY_AMO` with `order_type=MARKET`, `product=NRML` (Verified, pykiteconnect README.md fetched 2026-07-13) |
-| `co` | `VARIETY_CO` | Cover order |
-| `iceberg` | `VARIETY_ICEBERG` | Iceberg order (split into legs; §6) |
-| `auction` | `VARIETY_AUCTION` | Auction-session order (§10) |
+| Variety | Live-page gloss |
+|---|---|
+| `regular` | "Regular order" |
+| `amo` | "After Market Order" — the py README's AMO example places `variety=kite.VARIETY_AMO` with `order_type=MARKET`, `product=NRML` (Verified, pykiteconnect README.md, 2026-07-13) |
+| `co` | "Cover Order" — live-documented (glossary + a dedicated "Cover order (CO) parameters" modify table + a "Multi-legged orders (CO)" section, §8/§8b) |
+| `iceberg` | "Iceberg Order" (§6) |
+| `auction` | "Auction Order" (§10) |
 
-**Verified (CLIENT-LIB-SOURCE gokiteconnect connect.go):** the Go SDK ADDITIONALLY still ships `VarietyBO = "bo"` and `ProductBO = "BO"` / `ProductCO = "CO"` constants. The py SDK has NO `bo` variety and no BO product constant. **Assumed:** BO (bracket order) is discontinued at the broker and the Go constants are legacy residue — Zerodha publicly discontinued bracket orders in 2020; the constant-set divergence between the two official SDKs is the observable fact. Treat `bo` as dead; do not build against it. → Z-ORD-1.
+**Verified (LIVE-DOC runner 2026-07-14):** the live glossary lists NO `bo` variety. **Verified (CLIENT-LIB-SOURCE gokiteconnect connect.go):** the Go SDK still ships legacy `VarietyBO = "bo"` and `ProductBO = "BO"` constants; the py SDK has neither. **Assumed (strengthened by the live omission):** BO (bracket order) is discontinued at the broker and the Go constants are legacy residue — Zerodha publicly discontinued bracket orders in 2020. Treat `bo` as dead; do not build against it. → Z-ORD-1 (RESOLVED for CO's status; see appendix).
 
-**AMO timing/eligibility windows: Unknown** — which exchanges/segments accept AMO and the queue-open hours are documented only on the live page/support portal, not in any SDK source. → Z-ORD-2.
+**AMO timing/eligibility windows: Unknown** — the live orders page documents the `amo` variety and the `AMO REQ RECEIVED` status (§12) but NOT the queue-open hours / per-exchange eligibility. → Z-ORD-2 (residual).
 
 ## 3. Place order — full parameter set
 
-**Verified (CLIENT-LIB-SOURCE pykiteconnect connect.py `place_order` signature, fetched 2026-07-13; cross-checked against gokiteconnect `orders.go::OrderParams`):**
+**Verified (LIVE-DOC runner 2026-07-14 — the "Regular order parameters" table; cross-check CLIENT-LIB-SOURCE pykiteconnect `place_order` signature + gokiteconnect `OrderParams`):**
 
-| Param | Required | Type/values | Notes |
+| Param | Required | Type/values | Notes (live-page wording where quoted) |
 |---|---|---|---|
 | `variety` | yes (path) | §2 values | path segment, not a body param |
-| `exchange` | yes | `NSE` `BSE` `NFO` `CDS` `BFO` `MCX` `BCD` (py `EXCHANGE_*` constants) | with `tradingsymbol` this IS the instrument identity — **Compare Dhan:** Dhan identifies by numeric-as-string `securityId` + `exchangeSegment` enum instead (`docs/dhan-ref/07-orders.md` rule 4) |
-| `tradingsymbol` | yes | string, e.g. `INFY`, `SBIN` | from the instruments dump (see instruments section file) |
+| `exchange` | yes | live page: "Name of the exchange (NSE, BSE, NFO, CDS, BCD, MCX)" | the LIVE list omits `BFO`, which the py SDK ships as `EXCHANGE_BFO` (CLIENT-LIB-SOURCE) — treat BFO as SDK-attested but not on the live orders-page list. With `tradingsymbol` this IS the instrument identity — **Compare Dhan:** Dhan identifies by numeric-as-string `securityId` + `exchangeSegment` enum instead (`docs/dhan-ref/07-orders.md` rule 4) |
+| `tradingsymbol` | yes | string, e.g. `ACC`, `SBIN` | "Tradingsymbol of the instrument" — from the instruments dump (see instruments section file) |
 | `transaction_type` | yes | `BUY` / `SELL` | |
-| `quantity` | yes | int | |
-| `product` | yes | §4 values | |
+| `quantity` | yes | int | "Quantity to transact" |
+| `product` | yes | §4 values | "Margin product to use for the order (margins are blocked based on this)" |
 | `order_type` | yes | §5 values | |
-| `price` | optional | float | for LIMIT / SL |
+| `price` | optional | float | "The price to execute the order at (for LIMIT orders)" |
 | `validity` | optional | `DAY` / `IOC` / `TTL` (§5) | |
-| `validity_ttl` | optional | int | order life in **minutes**, used with `validity=TTL` — minutes unit is SEARCH-tier (live-page snippet, 2026-07-13, kite.trade/docs/connect/v3/orders/) corroborated by the mock iceberg order carrying `"validity": "TTL", "validity_ttl": 2` (Verified OFFICIAL-MOCK orders.json) |
-| `disclosed_quantity` | optional | int | classic disclosed-qty; min-% rule not in SDK → Unknown (Z-ORD-3). **Compare Dhan:** Dhan documents disclosed > 30% of quantity (`docs/dhan-ref/07-orders.md` rule 12) |
-| `trigger_price` | optional | float | for SL / SL-M |
-| `iceberg_legs` | optional | int | §6 |
-| `iceberg_quantity` | optional | int | §6 |
-| `auction_number` | optional | string | §10 (string in Go struct + mocks) |
-| `tag` | optional | string | §9 |
-| `market_protection` | optional | number | §7 — docstring verbatim: "accepts `-1` for automatic market protection applied by the system as per market protection guidelines, or a value greater than `0` up to `100` representing a percentage" (Verified, CLIENT-LIB-SOURCE pykiteconnect connect.py) |
+| `validity_ttl` | optional | int | "Order life span in **minutes** for TTL validity orders" — **Verified (LIVE-DOC runner 2026-07-14)**, upgraded from SEARCH; corroborated by the iceberg example row (`"validity": "TTL", "validity_ttl": 2`) on the live page itself |
+| `disclosed_quantity` | optional | int | "Quantity to disclose publicly (for equity trades)" — min-% rule NOT on the live page → Unknown (Z-ORD-3). **Compare Dhan:** Dhan documents disclosed > 30% of quantity (`docs/dhan-ref/07-orders.md` rule 12) |
+| `trigger_price` | optional | float | "The price at which an order should be triggered (SL, SL-M)" |
+| `iceberg_legs` | optional | int | "Total number of legs for iceberg order type (number of legs per Iceberg should be **between 2 and 50**)" — §6 (LIVE CORRECTION of the old 2–10 SEARCH claim) |
+| `iceberg_quantity` | optional | int | "Split quantity for each iceberg leg order (quantity/iceberg_legs)" — §6 |
+| `auction_number` | optional | string | "A unique identifier for a particular auction" — §10 |
+| `tag` | optional | string | "An optional tag to apply to an order to identify it (**alphanumeric, max 20 chars**)" — §9 (Verified LIVE-DOC runner 2026-07-14; the old length Unknown is RESOLVED) |
+| `market_protection` | optional | number | "Market protection percentage for MARKET and SL-M orders. Values: greater than 0 and up to 100 (custom %), -1 (auto protection)" — §7 |
+| `autoslice` | optional | `true`/`false` | "Enable automatic slicing for orders exceeding freeze quantity limits. Values: true (enable), false (disable, default)" — §3b (Verified LIVE-DOC runner 2026-07-14: autoslice is a documented first-class param in the live glossary + params table) |
 
-**Verified (CLIENT-LIB-SOURCE gokiteconnect orders.go, Go-only params):** `OrderParams` additionally carries `squareoff`, `stoploss`, `trailing_stoploss` (the legacy CO/BO leg params — ABSENT from the current py `place_order` signature) and `algo_id`. **Assumed:** `squareoff`/`trailing_stoploss` are BO-era legacy kept for back-compat; `stoploss`/`trigger_price` handling for live CO orders should be probed on the live page. `algo_id` purpose is Unknown (exchange algo-tagging mandate is the plausible reading). → Z-ORD-1, Z-ORD-4.
+**Note (LIVE-DOC 2026-07-14):** the page's own basic MARKET place example passes `market_protection=-1`.
+
+**Verified (CLIENT-LIB-SOURCE gokiteconnect orders.go, Go-only params — NOT on the live page):** `OrderParams` additionally carries `squareoff`, `stoploss`, `trailing_stoploss` (the legacy CO/BO leg params — ABSENT from the current py `place_order` signature AND from the live parameters table) and `algo_id`. **Assumed (strengthened):** `squareoff`/`trailing_stoploss` are BO-era legacy. `algo_id` purpose remains Unknown (not on the live page). → Z-ORD-4.
 
 ## 3b. Autoslice (freeze-limit splitting)
 
-**Verified (CLIENT-LIB-SOURCE pykiteconnect connect.py `place_autoslice_order`):** same params as `place_order` plus the client adds `autoslice=true`; docstring: "Place an order with automatic slicing for quantities exceeding freeze limits. The order is automatically split into multiple smaller orders internally when the requested quantity exceeds exchange freeze limits." Returns the FULL response dict: parent `order_id` + a `children` list where each child is either `{order_id}` or an `{error}` payload.
+**Verified (LIVE-DOC runner 2026-07-14 — "Auto slice orders" section, verbatim):** "When placing orders with autoslice=true for quantities exceeding freeze limits, the order is automatically split into multiple smaller orders internally. Unlike a regular order placement response, the API returns **data as an array with one entry per slice**. Each successful slice entry contains an order_id, while any slice that fails placement (for example, due to margin shortfall) is represented by an error object with code, error_type, message, and data fields, successful and failed slices can coexist in the same response. Each successfully placed slice appears as a separate order in your orderbook with its own order_id. **The maximum number of slices generated from a single auto slice order is 10.**"
 
-**Verified (OFFICIAL-MOCK autoslice_response.json):** a REAL mixed outcome — parent `order_id`, 3 child `order_id`s AND one child error:
+**Verified (LIVE-DOC runner 2026-07-14 — the page's own response example):** a real mixed outcome — 4 slice `order_id`s AND one slice error in ONE response:
 
 ```json
-{"error": {"code": 400, "error_type": "MarginException",
-  "message": "Insufficient funds. Required margin is 228365.92 but available margin is 228358.50.", "data": null}}
+{"status": "success", "data": [
+  {"order_id": "1914227164488687616"},
+  {"order_id": "1914227164534824960"},
+  {"order_id": "1914227164580962304"},
+  {"error": {"code": 400, "error_type": "MarginException",
+    "message": "Insufficient funds. Required margin is 228365.92 but available margin is 228358.50.", "data": null}},
+  {"order_id": "1914227164681625600"}
+]}
 ```
 
-i.e. **partial fills of the slice-set are possible: some children place, some reject — the caller must walk `children`.** (Cross-checked: gokiteconnect `orders.go` `OrderResponse{OrderID, Children []OrderChild}` with `OrderChildError{Code, ErrorType, Message, Data}`.)
+**⚠ LIVE CORRECTION (2026-07-14):** the previous revision of this file described the autoslice response as "parent `order_id` + a `children` list" (read off the mock/Go `OrderResponse{OrderID, Children []OrderChild}` struct). **The live page wins: the documented wire shape is a FLAT `data: []` array of slice entries — there is no parent `order_id` and no `children` nesting in the response example.** The Go struct's `OrderID` + `Children` fields are a client-side model; a port must parse the flat array. The per-slice error envelope `{code, error_type, message, data}` is unchanged (LIVE-DOC + OFFICIAL-MOCK agree). **The caller must walk every entry of `data` — partial placement of the slice-set is real.**
 
-**Compare Dhan:** Dhan exposes slicing as a SEPARATE endpoint `POST /v2/orders/slicing` with the same body as place (`docs/dhan-ref/07-orders.md` rule 17); Kite does it as a param on the normal place route.
+**Compare Dhan:** Dhan exposes slicing as a SEPARATE endpoint `POST /v2/orders/slicing` with the same body as place (`docs/dhan-ref/07-orders.md` rule 17); Kite does it as an `autoslice=true` param on the normal place route.
 
 ## 4. Products
 
-**Verified (CLIENT-LIB-SOURCE pykiteconnect connect.py constants):** `MIS`, `CNC`, `NRML`, `CO`.
-**Verified (CLIENT-LIB-SOURCE gokiteconnect connect.go):** Go adds `ProductMTF = "MTF"` (and legacy `ProductBO`).
-**Verified (OFFICIAL-MOCK orders.json):** a real order row with `"product": "MTF"` (`variety: regular`, `order_type: LIMIT`, order_id `250117800776785`) — **MTF is a live wire value even though the py constant set doesn't include it.** A py caller can pass the raw string.
+**Verified (LIVE-DOC runner 2026-07-14 — the glossary `product` rows, verbatim glosses):**
 
-| Product | Meaning (Assumed from standard Indian-broker usage; the live page holds the authoritative table) |
+| Product | Live-page gloss |
 |---|---|
-| `CNC` | Cash & carry, equity delivery |
-| `NRML` | Normal / carry-forward (F&O, currency, commodity) |
-| `MIS` | Margin intraday square-off |
-| `MTF` | Margin trading facility (Verified as a wire value per above; semantics Assumed) |
-| `CO` | Cover-order product (paired with `variety=co`) |
+| `CNC` | "Cash & Carry for equity" |
+| `NRML` | "Normal for futures and options" |
+| `MIS` | "Margin Intraday Squareoff for futures and options" |
+| `MTF` | "Margin Trading Facility" — **now LIVE-DOC** (was mock-only wire value); the live page's own order-book example includes a `"product": "MTF"` row (order_id `250117800776785`) |
 
-→ Z-ORD-5 (exact product-by-segment eligibility matrix is live-doc-only).
+**Note (LIVE-DOC 2026-07-14):** the live products glossary lists exactly these FOUR — `CO` is NOT listed as a product on the live page, though the py SDK still ships `PRODUCT_CO` and gokiteconnect ships `ProductCO`/`ProductBO`/`ProductMTF` (CLIENT-LIB-SOURCE). Treat the CO product constant as SDK residue tied to the `co` variety; the live glossary's product set is CNC/NRML/MIS/MTF.
+
+→ Z-ORD-5 (exact product-by-segment eligibility matrix beyond the one-line glosses is still live-support-portal-only).
 
 ## 5. Order types + validity
 
-**Verified (CLIENT-LIB-SOURCE pykiteconnect connect.py constants; identical set in gokiteconnect connect.go):**
+**Verified (LIVE-DOC runner 2026-07-14 — glossary rows; cross-check CLIENT-LIB-SOURCE constants, identical set):**
 
-- Order types: `MARKET`, `LIMIT`, `SL` (stop-loss limit), `SL-M` (stop-loss market). Note the wire literal is `SL-M` with a hyphen (py constant name `ORDER_TYPE_SLM`).
-- Validity: `DAY`, `IOC`, `TTL`. `TTL` pairs with `validity_ttl` (minutes — §3). **Compare Dhan:** Dhan has only `DAY`/`IOC` (`docs/dhan-ref/07-orders.md` rule 9). **Compare Groww:** the Groww annexure documents validity `DAY` only (`docs/groww-ref/README.md` claims row 26).
+- Order types: `MARKET`, `LIMIT`, `SL` (stoploss), `SL-M` (stoploss-market). The wire literal is `SL-M` with a hyphen (py constant name `ORDER_TYPE_SLM`).
+- Validity: `DAY` ("Regular order"), `IOC` ("Immediate or Cancel"), `TTL` ("Order validity in minutes") — pairs with `validity_ttl` (minutes, §3, now LIVE-DOC). **Compare Dhan:** Dhan has only `DAY`/`IOC` (`docs/dhan-ref/07-orders.md` rule 9). **Compare Groww:** the Groww annexure documents validity `DAY` only (`docs/groww-ref/README.md` claims row 26).
 
 ## 6. Iceberg mechanics
 
-- **Verified (CLIENT-LIB-SOURCE):** placed as `variety=iceberg` with `iceberg_legs` (py docstring-free; Go: "Total number of legs") and `iceberg_quantity` (per-leg split quantity).
-- **SEARCH (live orders page snippet, 2026-07-13 — https://kite.trade/docs/connect/v3/orders/):** `iceberg_legs` must be between **2 and 10**; `iceberg_quantity` is "split quantity for each iceberg leg order".
-- **Verified (OFFICIAL-MOCK orders.json — the real iceberg row, order_id `220524001859672`):** an iceberg order carries `meta.iceberg` on the order book row: `{"leg": 1, "legs": 5, "leg_quantity": 200, "total_quantity": 1000, "remaining_quantity": 800}` — i.e. the book row you see is the CURRENT leg; leg progress is in `meta`. That row also demonstrates iceberg + `validity: TTL` (`validity_ttl: 2`) co-use, and that `quantity` on the row is the LEG quantity (200) while `meta.iceberg.total_quantity` holds the full 1000 (ARITH: 5 legs × 200 = 1000; remaining 800 = 1000 − 200 after leg 1).
-- **Unknown:** minimum order value / minimum per-leg quantity constraints, and whether a cancel of the visible leg kills the whole iceberg → Z-ORD-6.
+- **Verified (LIVE-DOC runner 2026-07-14):** placed as `variety=iceberg` with `iceberg_legs` — "Total number of legs for iceberg order type (number of legs per Iceberg should be **between 2 and 50**)" — and `iceberg_quantity` — "Split quantity for each iceberg leg order (quantity/iceberg_legs)".
+- **⚠ LIVE CORRECTION (2026-07-14):** the previous revision carried a SEARCH-tier claim that `iceberg_legs` must be between 2 and **10**. **The live page says 2 and 50 — the live page wins.** (Plausible source of the old confusion: the AUTOSLICE max of 10 slices, §3b, which IS 10.)
+- **Verified (LIVE-DOC runner 2026-07-14 — the page's own iceberg order-book row, order_id `220524001859672`; identical to OFFICIAL-MOCK orders.json):** an iceberg order carries `meta.iceberg` on the book row: `{"leg": 1, "legs": 5, "leg_quantity": 200, "total_quantity": 1000, "remaining_quantity": 800}` — the book row you see is the CURRENT leg; leg progress is in `meta`. The row also demonstrates iceberg + `validity: TTL` (`validity_ttl: 2`) co-use, and that `quantity` on the row is the LEG quantity (200) while `meta.iceberg.total_quantity` holds the full 1000 (ARITH: 5 legs × 200 = 1000; remaining 800 = 1000 − 200 after leg 1).
+- **Unknown:** minimum order value / minimum per-leg quantity constraints, and whether a cancel of the visible leg kills the whole iceberg — not on the live orders page → Z-ORD-6 (the support-portal iceberg article is in the crawl bundle for a follow-up pass).
 
-## 7. Market protection (market/SL-M orders)
+## 7. Market protection (MARKET / SL-M orders)
 
-- **Verified (CLIENT-LIB-SOURCE pykiteconnect connect.py docstrings on BOTH `place_order` and `modify_order`):** `market_protection` accepts `-1` (system-applied automatic protection "as per market protection guidelines") or a value `> 0` up to `100` (a percentage).
-- **Verified (OFFICIAL-MOCK orders.json):** every order-book row carries a `market_protection` field (all `0` in the mock data set) — it is a first-class order attribute, echoed back.
-- **SEARCH (Kite forum + Zerodha support snippets, 2026-07-13 — kite.trade/forum/discussion/15177, support.zerodha.com "Market price protection"):** snippets indicate market orders must carry protection and that a `market_protection` of `0` is treated as an unprotected market order and rejected in the segments where protection is mandated; the protection band converts the market order into a limit at LTP ± the percentage. **NOT byte-verified against the official doc — treat the mandatory-ness and the exact default band as SEARCH-grade** → Z-ORD-7.
+- **Verified (LIVE-DOC runner 2026-07-14 — "Market protection" section):** `market_protection` accepts "Greater than 0 and up to 100: Custom market protection percentage (e.g., 2 means 2% protection, 10 means 10% protection)" or "-1: Automatic market protection applied by the system as per market protection guidelines". Verbatim page notes: "The protection percentage should be within the circuit limit's."; "Market protection converts market orders to limit orders, but execution remains subject to exchange-defined **LPP (Limit Price Protection)** ranges. Orders exceeding LPP limits may be rejected."; "Market protection is **only applicable for MARKET and SL-M order types**. It has no effect on LIMIT and SL orders as they already have built-in price protection."
+- **Verified (LIVE-DOC runner 2026-07-14 — order-book examples on the page; cross-check OFFICIAL-MOCK):** every order-book row carries a `market_protection` field (all `0` in the examples) — a first-class order attribute, echoed back.
+- **Verified (LIVE-DOC runner 2026-07-14 — https://support.zerodha.com/category/trading-and-markets/charts-and-orders/order/articles/market-price-protection-on-the-order-window):** the automatic protection band ("percentage of the Last Traded Price") by security type + price range:
+
+  | Security type | Price range (₹) | % of LTP |
+  |---|---|---|
+  | EQ and FUT | < 100 | 2% |
+  | EQ and FUT | 100–500 | 1% |
+  | EQ and FUT | > 500 | 0.5% |
+  | OPT | < 10 | 5% |
+  | OPT | 10–100 | 3% |
+  | OPT | 100–500 | 2% |
+  | OPT | > 500 | 1% |
+
+  Behaviour per the article: the market order executes immediately within the protection range; if it cannot fully fill inside the range, it "will be converted to a limit order at the calculated protection price" and "the remaining quantity will remain open as a limit order" (worked example on the article: LTP ₹90 → 2% band → buy protection limit ₹91.80). The article documents the Kite order-window feature; **Assumed:** the API's `-1` ("as per market protection guidelines") applies this same band table.
+- **Mandatory-ness: NOT confirmed by the live pages.** The previous revision carried a SEARCH claim that market orders MUST carry protection and that `market_protection=0` is rejected in mandated segments. The live orders page lists `market_protection` as an ordinary optional parameter with only `>0..100` and `-1` as documented values, and does NOT state that omission or `0` is rejected (order-book rows echoing `0` exist on the page itself). Treat the mandatory/0-rejection reading as **unsupported by the live docs — Unknown residual** → Z-ORD-7 (band table RESOLVED; mandatory-ness residual).
 - **Compare Dhan:** Dhan's equivalent is exchange-side MPP (effective 2026-03-21): `orderType: "MARKET"` is auto-converted to LIMIT-with-MPP by the exchange and may rest `PENDING` (`docs/dhan-ref/07-orders.md` rule 18). Kite instead exposes the protection percentage as an explicit API param.
 
 ## 8. Modify + cancel
 
-**Verified (CLIENT-LIB-SOURCE pykiteconnect connect.py `modify_order` signature):** modifiable fields = `quantity`, `price`, `order_type`, `trigger_price`, `validity`, `disclosed_quantity`, `market_protection`; plus `parent_order_id` (for second-leg/CO modifications). `PUT /orders/{variety}/{order_id}`.
+**Verified (LIVE-DOC runner 2026-07-14 — "Modifying orders"):** `PUT /orders/:variety/:order_id`; "As long as on order is open or pending in the system, certain attributes of it may be modified. It is important to sent the right value for :variety in the URL." [sic — live-page typos preserved]. The live "Regular order parameters" modify table lists: `order_type`, `quantity`, `price`, `trigger_price`, `disclosed_quantity`, `validity`. The page's own modify example ALSO passes `market_protection=-1`, and the py `modify_order` signature includes `market_protection` + `parent_order_id` (CLIENT-LIB-SOURCE) — so the modifiable set in practice is the live six + `market_protection`.
 
-- **Unknown — quantity semantics on modify** (total vs remaining): not stated in any SDK source. **Compare Dhan:** Dhan explicitly documents modify `quantity` = TOTAL order quantity, a classic foot-gun (`docs/dhan-ref/07-orders.md` rule 6). Do NOT assume Kite matches. → Z-ORD-8.
-- **Unknown — modification count cap:** Dhan caps at 25 modifications/order; no Kite equivalent found in SDK/mocks.
+**Verified (LIVE-DOC runner 2026-07-14 — "Cover order (CO) parameters" modify table):** `order_id` ("Unique order ID"), `price` ("The price to execute the order at"), `trigger_price` ("For LIMIT Cover orders").
 
-**Verified (CLIENT-LIB-SOURCE):** cancel = `DELETE /orders/{variety}/{order_id}` with optional `parent_order_id` (used when cancelling the second leg of a CO — the py `exit_order("co", ...)` alias exists exactly for "Exit a CO order" per its docstring).
+- **Unknown — quantity semantics on modify** (total vs remaining): NOT stated on the live page either. **Compare Dhan:** Dhan explicitly documents modify `quantity` = TOTAL order quantity, a classic foot-gun (`docs/dhan-ref/07-orders.md` rule 6). Do NOT assume Kite matches. → Z-ORD-8 (still open after the live fetch).
+- **Modification count cap — RESOLVED (LIVE-DOC runner 2026-07-14, order-rate-limits support article):** "you can make a maximum of **25 modifications per order**" — the SAME cap as Dhan's 25/order.
+
+**Verified (LIVE-DOC runner 2026-07-14):** cancel = `DELETE /orders/:variety/:order_id` ("As long as on order is open or pending in the system, it can be cancelled."), optional `parent_order_id` param when cancelling a CO second leg (CLIENT-LIB-SOURCE; the py `exit_order("co", ...)` alias exists exactly for "Exit a CO order" per its docstring).
+
+## 8b. Multi-legged orders (CO)
+
+**Verified (LIVE-DOC runner 2026-07-14 — "Multi-legged orders (CO)" section, verbatim):** "Cover orders are 'multi-legged' orders, where, a single order you place (first-leg) may spawn new orders (second-leg) based on the conditions you set on the first-leg order. These orders have special properties, where the first-leg order creates a position. The position is exited when the second-leg order is executed or cancelled. These second-leg orders will have a **parent_order_id** field indicating the order_id of its parent order, that is, the first-leg order. This field may be required while modifying or cancelling an open second-leg order."
+
+## 8c. Broker-side order rate limits (NEW — live-verified)
+
+**Verified (LIVE-DOC runner 2026-07-14 — https://support.zerodha.com/category/trading-and-markets/alerts-and-nudges/kite-error-messages/articles/order-rate-limits-on-kite, verbatim):** "As a risk management measure, you cannot place more than **5000 orders per day** at Zerodha. This restriction applies across all segments. There is also a limitation of **400 orders per minute**. Rate limitations also apply for order modification, where you can make a maximum of **25 modifications per order**." The error surfaced is "Maximum allowed order requests exceeded". (These are the broker/account-level order caps; the per-second API-endpoint rate limits are covered in the introduction/rate-limits section file. The article's related-links include a Kite-Connect-specific variant of the same error — same 5000/day class.)
+
+**Compare Dhan:** Dhan order APIs: 10/sec, 250/min, 1000/hr, **7000/day**, max **25 modifications per order** (`docs/dhan-ref/01-introduction-and-rate-limits.md` rule 7) — the 25-mods cap is identical across both brokers; Zerodha's day cap (5000) is lower, its minute cap (400) is higher.
 
 ## 9. Tags
 
-- **Verified (CLIENT-LIB-SOURCE both SDKs):** `tag` is a free-form string param on place; echoed back on order rows (mock rows show `"tag": "connect test order1"`).
-- **Verified (CLIENT-LIB-SOURCE gokiteconnect orders.go + OFFICIAL-MOCK orders.json):** order rows ALSO carry a plural `tags` array field (Go `Tags []string`; present on rows in the orders.json mock) — the read side can return multiple tags.
-- **Unknown:** max tag length / charset (Dhan documents 30 chars `[a-zA-Z0-9 _-]` for its `correlationId`; no Kite equivalent found in SDK). **Compare Dhan:** Dhan's `correlationId` also flows through its order-update WebSocket; Kite's Postback/WebSocket order updates echo `tag` (see the postbacks section file).
+- **Verified (LIVE-DOC runner 2026-07-14):** `tag` = "An optional tag to apply to an order to identify it (**alphanumeric, max 20 chars**)" — the length/charset Unknown from the previous revision is RESOLVED. Echoed back on order rows ("this value will be present in the tag field in the response" — the page's "Tagging orders" section; example rows show `"tag": "connect test order1"`).
+- **Verified (LIVE-DOC runner 2026-07-14 — order-book examples on the page; cross-check gokiteconnect `Tags []string`):** order rows ALSO carry a plural `tags` array field (e.g. `"tags": ["connect test order2", "XXXXX"]`) — the read side can return multiple tags.
+- **Compare Dhan:** Dhan's `correlationId` is ≤30 chars `[a-zA-Z0-9 _-]` and flows through its order-update WebSocket; Kite's tag is alphanumeric ≤20 and is echoed in Postback/WebSocket order updates (see the postbacks section file).
 
 ## 10. Auction variety
 
-- **Verified (CLIENT-LIB-SOURCE pykiteconnect `_routes`):** `GET /portfolio/holdings/auctions` lists holdings eligible for the current auction session (`get_auction_instruments`).
-- **Verified (OFFICIAL-MOCK auctions_list.json):** each eligible row carries `auction_number` (string, e.g. `"20"`), ISIN, quantities and P&L context.
-- **Verified (OFFICIAL-MOCK orders.json):** a real `variety: "auction"` order row (CNC, LIMIT, DAY) carrying an `auction_number` field.
-- **Assumed:** the flow is list auctions → place `variety=auction` with the matching `auction_number` (this is the only coherent reading of the params; live page confirms wording).
+- **Verified (LIVE-DOC runner 2026-07-14):** `auction` is a live glossary variety; `auction_number` ("A unique identifier for a particular auction") is a live place param AND a live order-book response attribute; the page's own examples include a real `variety: "auction"` order row (BHEL, CNC, LIMIT, DAY, `"auction_number": "22"` — a string).
+- **Verified (CLIENT-LIB-SOURCE pykiteconnect `_routes`):** `GET /portfolio/holdings/auctions` lists holdings eligible for the current auction session (`get_auction_instruments`) — that route lives on the portfolio doc page, not the orders page. **Verified (OFFICIAL-MOCK auctions_list.json):** each eligible row carries `auction_number` (string, e.g. `"20"`), ISIN, quantities and P&L context.
+- **Assumed:** the flow is list auctions → place `variety=auction` with the matching `auction_number` (the live page documents the param semantics but not the flow prose).
 
 ## 11. Order response object (order book / history rows)
 
-**Verified (OFFICIAL-MOCK orders.json first-row key set, cross-checked field-for-field against gokiteconnect `orders.go::Order`):**
+**Verified (LIVE-DOC runner 2026-07-14 — the "Response attributes" table + the full order-book example on the page; cross-check OFFICIAL-MOCK orders.json — the mock rows ARE the live page's example rows — and gokiteconnect `orders.go::Order`):**
 
-`placed_by, order_id, exchange_order_id, parent_order_id, status, status_message, status_message_raw, order_timestamp, exchange_update_timestamp, exchange_timestamp, variety, modified (bool), meta (object — iceberg progress lives here), exchange, tradingsymbol, instrument_token (numeric), order_type, transaction_type, validity, (validity_ttl on TTL rows), product, quantity, disclosed_quantity, price, trigger_price, average_price, filled_quantity, pending_quantity, cancelled_quantity, market_protection, tag, tags, guid` (Go also declares `account_id`, `auction_number`, `algo_id`-adjacent fields).
+`placed_by, order_id, exchange_order_id, parent_order_id, status, status_message, status_message_raw, order_timestamp, exchange_update_timestamp, exchange_timestamp, variety, modified (bool), exchange, tradingsymbol, instrument_token, order_type, transaction_type, validity, (validity_ttl on TTL rows), product, quantity, disclosed_quantity, price, trigger_price, average_price, filled_quantity, pending_quantity, cancelled_quantity, market_protection, auction_number (auction rows), meta (object — iceberg progress lives here), tag, tags[], guid` (the newest example row also shows `account_id`; Go declares it too).
 
-Notes:
-- `status_message` (human) vs `status_message_raw` (verbatim OMS/RMS text, e.g. `"RMS:Margin Exceeds,Required:95417.84, Available:74251.80 …"`) — both real in the mock REJECTED row (Verified OFFICIAL-MOCK).
+Live-page attribute notes (verbatim where quoted):
+- `exchange_order_id` — "Exchange generated order ID. Orders that don't reach the exchange have **null** IDs"; likewise `exchange_timestamp` is null pre-exchange.
+- `placed_by` — "ID of the user that placed the order. This may different from the user's ID for orders placed outside of Kite, for instance, by dealers at the brokerage using dealer terminals" [sic].
+- `status` — "Most common values or COMPLETE, REJECTED, CANCELLED, and OPEN. **There may be other values as well.**" [sic]
+- `average_price` — "Average price at which the order was executed (**only for COMPLETE orders**)".
+- `guid` — "Unusable request id to avoid order duplication".
+- `meta` — "Map of arbitrary fields that the system may attach to an order."
+- `instrument_token` — typed "string" in the live attributes table but appears as a bare number in every JSON example on the same page (e.g. `412675`) — parse as numeric, per the examples.
+- `status_message` (human) vs `status_message_raw` ("Raw textual description of the failed order's status, as received from the OMS", e.g. `"RMS:Margin Exceeds,Required:95417.84, Available:74251.80 …"`) — both real in the page's REJECTED iceberg example row.
 - Timestamps are `"YYYY-MM-DD HH:MM:SS"` strings, 19 chars (the py client date-parses exactly the 19-char forms — Verified CLIENT-LIB-SOURCE `_format_response`). Timezone is not stated on the wire — **Assumed IST** (NSE convention; same assumption class as Dhan/Groww packs).
 - **Compare Dhan:** Dhan order-book timestamps are also IST strings (`docs/dhan-ref/07-orders.md` rule 15); Dhan has no `status_message_raw` / `meta` equivalents.
 
 ## 12. Order states + lifecycle
 
-**Verified (CLIENT-LIB-SOURCE pykiteconnect constants):** the SDK names only the terminal trio `COMPLETE`, `REJECTED`, `CANCELLED` as constants.
+**Verified (LIVE-DOC runner 2026-07-14 — the "Order statuses" section):** "The most common statuses are `OPEN`, `COMPLETE`, `CANCELLED`, and `REJECTED`. An order can traverse through several interim and temporary statuses during its lifetime… **Some of these are highlighted below**" — i.e. the interim set is explicitly NON-exhaustive. The live-enumerated interim statuses (all now LIVE-DOC literals; `TRIGGER PENDING` upgraded from SEARCH, `CANCEL PENDING` and `AMO REQ RECEIVED` upgraded from Unknown):
 
-**Verified (OFFICIAL-MOCK order_info.json — a REAL 8-row single-order history, in wire order):**
+| Status | Live-page gloss |
+|---|---|
+| `PUT ORDER REQ RECEIVED` | "Order request has been received by the backend" |
+| `VALIDATION PENDING` | "Order pending validation by the RMS (Risk Management System)" |
+| `OPEN PENDING` | "Order is pending registration at the exchange" |
+| `MODIFY VALIDATION PENDING` | "Order's modification values are pending validation by the RMS" |
+| `MODIFY PENDING` | "Order's modification values are pending registration at the exchange" |
+| `TRIGGER PENDING` | "Order's placed but the fill is pending based on a trigger price." |
+| `CANCEL PENDING` | "Order's cancellation request is pending registration at the exchange" |
+| `AMO REQ RECEIVED` | "Same as PUT ORDER REQ RECEIVED, but for AMOs" |
+
+**Verified (LIVE-DOC runner 2026-07-14 — the page's own `GET /orders/{order_id}` history example, identical to OFFICIAL-MOCK order_info.json; a REAL 8-row single-order history, in wire order):**
 
 ```
 PUT ORDER REQ RECEIVED → VALIDATION PENDING → OPEN PENDING → OPEN
 → MODIFY VALIDATION PENDING → MODIFY PENDING → MODIFIED → OPEN
 ```
 
-i.e. `GET /orders/{order_id}` returns the full transition list; a modify inserts its own `MODIFY VALIDATION PENDING / MODIFY PENDING / MODIFIED` interim states before the order returns to `OPEN`.
+i.e. `GET /orders/{order_id}` returns the full transition list; a modify inserts its own `MODIFY VALIDATION PENDING / MODIFY PENDING / MODIFIED` interim states before the order returns to `OPEN`. (`MODIFIED` appears in the example history but not in the statuses table — the table is non-exhaustive by its own admission.)
 
-**SEARCH (live orders page snippet, 2026-07-13 — kite.trade/docs/connect/v3/orders/):** the official page says the common statuses are `OPEN, COMPLETE, CANCELLED, REJECTED` and that orders "pass through several interim and temporary statuses". Separately, the `TRIGGER PENDING` literal for resting SL/SL-M orders is **forum-corroborated SEARCH** (its attribution to the docs page vs forum answers could not be disambiguated). `AMO REQ RECEIVED` appears in ecosystem discussions of AMO interim states but was NOT found in any fetched artifact — **Unknown** as an exact wire literal. → Z-ORD-2.
-
-**Practical rule (Assumed, from the observed mock lifecycle):** treat any non-{`COMPLETE`,`CANCELLED`,`REJECTED`} status as non-terminal; poll `order_history`/consume postbacks rather than string-matching interim states, since the official page declines to enumerate them exhaustively. **Compare Dhan:** Dhan documents a closed 9-value enum (`TRANSIT/PENDING/…/TRADED/EXPIRED`, `docs/dhan-ref/08-annexure-enums.md` rule 6) — Kite's interim state space is explicitly open-ended.
+**Practical rule (Assumed, from the live lifecycle + the page's "There may be other values as well"):** treat any non-{`COMPLETE`,`CANCELLED`,`REJECTED`} status as non-terminal; poll `order_history`/consume postbacks rather than string-matching interim states, since the official page declines to enumerate them exhaustively. **Compare Dhan:** Dhan documents a closed 9-value enum (`TRANSIT/PENDING/…/TRADED/EXPIRED`, `docs/dhan-ref/08-annexure-enums.md` rule 6) — Kite's interim state space is explicitly open-ended.
 
 ## 13. Trades (fills)
 
-**Verified (OFFICIAL-MOCK order_trades.json / trades.json key set, cross-checked vs gokiteconnect `orders.go::Trade`):** trade rows carry `trade_id, order_id, exchange_order_id, tradingsymbol, exchange, instrument_token, transaction_type, product, average_price, quantity, fill_timestamp, order_timestamp, exchange_timestamp`.
+**Verified (LIVE-DOC runner 2026-07-14 — the `/trades` + `/orders/:order_id/trades` examples and the trades "Response attributes" table; cross-check OFFICIAL-MOCK trades.json/order_trades.json + gokiteconnect `Trade`):** trade rows carry `trade_id, order_id, exchange_order_id, tradingsymbol, exchange, instrument_token, transaction_type, product, average_price, quantity, fill_timestamp, order_timestamp, exchange_timestamp`. Live glosses: `trade_id` = "Exchange generated trade ID"; `average_price` = "Price at which the quantity was filled"; `fill_timestamp` = "Timestamp at which the trade was filled at the exchange". (The live attributes table also lists a `filled int64` "Filled quantity" name; the JSON examples carry `quantity` — trust the examples.) Note: `order_timestamp` in the live trade examples is time-only (`"09:16:39"`), unlike the 19-char order-book timestamps.
 
-**Verified (CLIENT-LIB-SOURCE pykiteconnect `trades` docstring):** "An order can be executed in tranches based on market conditions. These trades are individually recorded under an order." — one order ⇒ N trade rows.
+**Verified (LIVE-DOC runner 2026-07-14, verbatim):** "While an orders is sent as a single entity, it may be executed in arbitrary chunks at the exchange depending on market conditions. For instance, an order for 10 quantity of an instrument can be executed in chunks of 5, 1, 1, 3 or any such combination." — one order ⇒ N trade rows.
 
 ## 14. Order errors (envelope)
 
 **Verified (CLIENT-LIB-SOURCE pykiteconnect exceptions.py):** order-relevant exception CLASSES mapped from the API's `error_type`: `OrderException` (default HTTP 500), `InputException` (400 — missing/invalid params), `TokenException` (403), `NetworkException` (503, client↔OMS network), `DataException` (502, bad OMS response), `GeneralException` (500). Note: `MarginException` is **NOT a pykiteconnect class** — exceptions.py contains exactly 8 classes and no margin variant.
 
-**Verified (OFFICIAL-MOCK autoslice_response.json ONLY):** the wire value `error_type: "MarginException"` (code 400) is real — it appears in the autoslice mock's child error. Because pykiteconnect has no matching class, its dispatcher (`getattr(ex, error_type, GeneralException)`) raises **GeneralException** for it — an error-taxonomy port must keep that unknown-name fallback, not invent a mapped class. Error envelope shape (from the autoslice child): `{code, error_type, message, data}`.
+**Verified (LIVE-DOC runner 2026-07-14 — the autoslice response example on the orders page; cross-check OFFICIAL-MOCK autoslice_response.json):** the wire value `error_type: "MarginException"` (code 400) is real — it appears in the live page's own autoslice example. Because pykiteconnect has no matching class, its dispatcher (`getattr(ex, error_type, GeneralException)`) raises **GeneralException** for it — an error-taxonomy port must keep that unknown-name fallback, not invent a mapped class. Per-slice error envelope: `{code, error_type, message, data}` (LIVE-DOC).
 
 **Compare Dhan:** Dhan's error envelope is 3 string fields `errorType/errorCode/errorMessage` with `DH-9xx` codes (`docs/dhan-ref/01-introduction-and-rate-limits.md` rule 6); Kite uses HTTP status + `error_type` class names instead of a numeric code family.
 
@@ -199,40 +247,45 @@ i.e. `GET /orders/{order_id}` returns the full transition list; a modify inserts
 | Aspect | Kite | Dhan | Cite |
 |---|---|---|---|
 | Instrument identity in order | `exchange` + `tradingsymbol` strings | `securityId` (numeric-as-STRING) + `exchangeSegment` enum | `docs/dhan-ref/07-orders.md` rule 4 |
-| Market order protection | explicit `market_protection` param (−1 auto / % / 0-rejected per SEARCH) | exchange-side MPP auto-converts MARKET→LIMIT (2026-03-21), may rest PENDING | `docs/dhan-ref/07-orders.md` rule 18 |
-| Slicing | `autoslice=true` param on the normal place route, `children[]` mixed-outcome response | separate `POST /v2/orders/slicing` | `docs/dhan-ref/07-orders.md` rule 17 |
-| Modify `quantity` semantics | Unknown (Z-ORD-8) | documented TOTAL, not remaining | `docs/dhan-ref/07-orders.md` rule 6 |
-| Validity | DAY / IOC / TTL(minutes) | DAY / IOC only | `docs/dhan-ref/07-orders.md` rule 9 |
-| Order states | open-ended interim set + terminal COMPLETE/CANCELLED/REJECTED | closed 9-value enum | `docs/dhan-ref/08-annexure-enums.md` rule 6 |
-| Client order tag | `tag` (+ read-side `tags[]`) | `correlationId` (≤30 chars, charset-limited) | `docs/dhan-ref/07-orders.md` rule 5 |
-| Body encoding | form-encoded params | JSON body | `docs/dhan-ref/01-introduction-and-rate-limits.md` rule 5 |
+| Market order protection | explicit `market_protection` param: −1 auto / >0..100 % (LIVE-DOC); auto band table per security type + price range (LIVE-DOC support article); mandatory-ness NOT documented | exchange-side MPP auto-converts MARKET→LIMIT (2026-03-21), may rest PENDING | `docs/dhan-ref/07-orders.md` rule 18 |
+| Slicing | `autoslice=true` param on the normal place route; flat `data[]` of per-slice `{order_id}` / `{error}` entries, mixed outcomes real, max 10 slices (LIVE-DOC) | separate `POST /v2/orders/slicing` | `docs/dhan-ref/07-orders.md` rule 17 |
+| Modify `quantity` semantics | Unknown (Z-ORD-8 — live page silent) | documented TOTAL, not remaining | `docs/dhan-ref/07-orders.md` rule 6 |
+| Modification cap | 25 per order (LIVE-DOC support article) | 25 per order | `docs/dhan-ref/07-orders.md` rule 2 area / rule 7 of intro |
+| Order rate caps (account) | 5000/day all segments, 400/min (LIVE-DOC support article) | 10/sec, 250/min, 1000/hr, 7000/day | `docs/dhan-ref/01-introduction-and-rate-limits.md` rule 7 |
+| Validity | DAY / IOC / TTL(minutes) — LIVE-DOC | DAY / IOC only | `docs/dhan-ref/07-orders.md` rule 9 |
+| Order states | open-ended interim set (8 live-enumerated, non-exhaustive) + common OPEN/COMPLETE/CANCELLED/REJECTED | closed 9-value enum | `docs/dhan-ref/08-annexure-enums.md` rule 6 |
+| Client order tag | `tag` alphanumeric ≤20 chars (LIVE-DOC) + read-side `tags[]` | `correlationId` (≤30 chars, charset-limited) | `docs/dhan-ref/07-orders.md` rule 5 |
+| Body encoding | form-encoded params (LIVE-DOC curl examples) | JSON body | `docs/dhan-ref/01-introduction-and-rate-limits.md` rule 5 |
 
 ---
 
 ## OPEN QUESTIONS (for 99-UNKNOWNS)
 
-- **Z-ORD-1 — CO/BO current status + CO leg params.** Is `variety=co` still accepted, and which of `stoploss`/`trigger_price` drives the CO stop leg? (Go keeps `bo` + `squareoff`/`stoploss`/`trailing_stoploss`; py dropped them.) Paste: `https://kite.trade/docs/connect/v3/orders/` (varieties table + CO section). Matters: an order-path design must not target a discontinued variety.
-- **Z-ORD-2 — Exhaustive interim order-state list + AMO windows.** Does the official page enumerate `TRIGGER PENDING`, `AMO REQ RECEIVED`, `CANCEL PENDING`, etc., and the AMO placement windows per exchange? Paste: `https://kite.trade/docs/connect/v3/orders/` (order status + AMO paragraphs). Matters: state-machine mapping (the Dhan-style OMS FSM) needs the authoritative literal set.
-- **Z-ORD-3 — `disclosed_quantity` minimum-% rule.** Exchange/broker floor (NSE convention is ≥10%; Dhan documents >30%). Paste: same page, disclosed quantity row. Matters: pre-validation.
-- **Z-ORD-4 — `algo_id` semantics.** Present in gokiteconnect `OrderParams`, absent from py. Exchange algo-registration mandate field? Paste: same page + `https://kite.trade/docs/connect/v3/` changelog. Matters: compliance field for automated orders.
-- **Z-ORD-5 — product×segment eligibility matrix (incl. MTF).** Which products are legal on which exchanges, and MTF constraints (approved list, delivery-only?). Paste: same page, products table + `https://support.zerodha.com` MTF articles. Matters: order validation.
-- **Z-ORD-6 — iceberg floors + cancel semantics.** Minimum order value/leg size for `variety=iceberg`; does cancelling the live leg cancel the remainder? Paste: same page, iceberg section. Matters: split-order planning.
-- **Z-ORD-7 — market-protection mandatory-ness + default band.** Is `market_protection` REQUIRED for MARKET/SL-M in F&O, is `0` rejected, and what is the `-1` auto band per segment? Paste: same page + `https://support.zerodha.com/category/trading-and-markets/charts-and-orders/order/articles/market-price-protection-on-the-order-window`. Matters: MARKET orders fail-closed if the param is mishandled (SEARCH-tier today).
-- **Z-ORD-8 — modify `quantity` = total or remaining?** Paste: same page, modify section. Matters: the exact Dhan foot-gun class (`docs/dhan-ref/07-orders.md` rule 6); getting it wrong resizes live orders.
+- **Z-ORD-1 — CO/BO current status. RESOLVED by live fetch (2026-07-14):** `variety=co` IS current — the live orders page documents it in the glossary, ships a dedicated "Cover order (CO) parameters" modify table (`order_id`, `price`, `trigger_price` "For LIMIT Cover orders") and a "Multi-legged orders (CO)" section (`parent_order_id` on second legs). `bo` appears NOWHERE on the live page — the Go `VarietyBO`/BO-leg params are legacy residue; do not build against `bo`. Residual sliver: the place-time CO stop-leg param is not shown in the live regular-params table (the Go-only `stoploss` param remains SDK-attested only). Cite: https://kite.trade/docs/connect/v3/orders/ (LIVE-DOC 2026-07-14).
+- **Z-ORD-2 — interim order-state list: RESOLVED by live fetch (2026-07-14); AMO windows still OPEN.** The live page enumerates `PUT ORDER REQ RECEIVED, VALIDATION PENDING, OPEN PENDING, MODIFY VALIDATION PENDING, MODIFY PENDING, TRIGGER PENDING, CANCEL PENDING, AMO REQ RECEIVED` and explicitly marks the set non-exhaustive ("Some of these are highlighted below" / "There may be other values as well"). REMAINING Unknown: AMO placement windows / per-exchange AMO eligibility (not on the page; support-portal AMO article needed). Matters: state-machine mapping can now pin the 8 literals but must keep an open-world fallback arm.
+- **Z-ORD-3 — `disclosed_quantity` minimum-% rule. STILL OPEN after live fetch:** the live page says only "Quantity to disclose publicly (for equity trades)" — no floor stated (NSE convention is ≥10%; Dhan documents >30%). Paste: support portal disclosed-quantity article. Matters: pre-validation.
+- **Z-ORD-4 — `algo_id` semantics. STILL OPEN after live fetch:** present in gokiteconnect `OrderParams`, absent from py AND from the live orders page. Paste: `https://kite.trade/docs/connect/v3/` changelog. Matters: compliance field for automated orders.
+- **Z-ORD-5 — product×segment eligibility matrix (incl. MTF). PARTIALLY informed by live fetch:** the live glossary now gives one-line glosses (CNC "for equity", NRML/MIS "for futures and options", MTF) and drops CO from the product list, but no full eligibility matrix or MTF constraints (approved list, delivery-only?). Paste: `https://support.zerodha.com` MTF articles (the buy-stocks-using-mtf article is in the crawl bundle). Matters: order validation.
+- **Z-ORD-6 — iceberg floors + cancel semantics. STILL OPEN after live fetch (legs range CORRECTED to 2–50):** minimum order value/leg size for `variety=iceberg` and whether cancelling the live leg cancels the remainder are not on the orders page. Paste: the support-portal iceberg-orders article (in the crawl bundle). Matters: split-order planning.
+- **Z-ORD-7 — market-protection band: RESOLVED by live fetch (2026-07-14); mandatory-ness still OPEN.** The automatic band table (EQ/FUT: 2%/1%/0.5% by price band; OPT: 5%/3%/2%/1%) is now LIVE-DOC from the support article; the API semantics (−1 auto / >0..100, MARKET+SL-M only, converts to limit, LPP rejection possible) are LIVE-DOC from the orders page. REMAINING Unknown: whether `market_protection` is mandatory anywhere and whether `0`/omission is rejected — the live pages do NOT say so (the old SEARCH mandatory-ness reading is unsupported). Matters: MARKET-order pre-validation.
+- **Z-ORD-8 — modify `quantity` = total or remaining? STILL OPEN after live fetch:** the live modify section does not state it. Paste: Kite forum / support ticket. Matters: the exact Dhan foot-gun class (`docs/dhan-ref/07-orders.md` rule 6); getting it wrong resizes live orders.
 
 ## CLAIMS (for README reconciled table)
 
-- Order routes: `POST /orders/{variety}`, `PUT /orders/{variety}/{order_id}`, `DELETE /orders/{variety}/{order_id}`, `GET /orders`, `GET /orders/{order_id}` (full history list), `GET /trades`, `GET /orders/{order_id}/trades`; base `https://api.kite.trade`, header `X-Kite-Version: 3`, `Authorization: token api_key:access_token`, form-encoded bodies — **Verified (CLIENT-LIB-SOURCE pykiteconnect connect.py `_routes` + gokiteconnect connect.go/orders.go)** — https://raw.githubusercontent.com/zerodha/pykiteconnect/master/kiteconnect/connect.py
-- Varieties = `regular, amo, co, iceberg, auction` (py); Go additionally ships legacy `bo` — **Verified (CLIENT-LIB-SOURCE both SDKs)**.
-- Place-order params: exchange, tradingsymbol, transaction_type, quantity, product, order_type, price, validity, validity_ttl, disclosed_quantity, trigger_price, iceberg_legs, iceberg_quantity, auction_number, tag, market_protection — **Verified (CLIENT-LIB-SOURCE pykiteconnect `place_order` signature)**.
-- `market_protection`: `-1` = automatic system protection, else `>0..100` percent; echoed on every order row — **Verified (CLIENT-LIB-SOURCE py docstring + OFFICIAL-MOCK orders.json)**; `0`-rejected behaviour is **SEARCH** only.
-- Autoslice: `autoslice=true` on the normal place route; response = parent `order_id` + `children[]` where each child is `{order_id}` OR `{error{code,error_type,message}}` (mixed outcomes real) — **Verified (CLIENT-LIB-SOURCE py `place_autoslice_order` + OFFICIAL-MOCK autoslice_response.json)**.
-- Products on the wire include `MTF` (real mock order row) even though the py constant set is only MIS/CNC/NRML/CO — **Verified (OFFICIAL-MOCK orders.json + CLIENT-LIB-SOURCE gokiteconnect `ProductMTF`)**.
-- Order types = `MARKET, LIMIT, SL, SL-M`; validity = `DAY, IOC, TTL` with `validity_ttl` in minutes — **Verified (CLIENT-LIB-SOURCE constants)**; minutes-unit **SEARCH** (live-page snippet 2026-07-13) + mock corroboration (`validity_ttl: 2`).
-- Iceberg: `iceberg_legs` 2–10 (**SEARCH**, live-page snippet 2026-07-13); book row shows the CURRENT leg with progress in `meta.iceberg{leg,legs,leg_quantity,total_quantity,remaining_quantity}` — **Verified (OFFICIAL-MOCK orders.json)**.
-- Single-order history endpoint returns the transition LIST; real interim states observed: `PUT ORDER REQ RECEIVED, VALIDATION PENDING, OPEN PENDING, OPEN, MODIFY VALIDATION PENDING, MODIFY PENDING, MODIFIED` — **Verified (OFFICIAL-MOCK order_info.json)**; `TRIGGER PENDING` for SL orders — **SEARCH**.
-- Place/modify/cancel all return `{"status":"success","data":{"order_id":"<string>"}}` — **Verified (OFFICIAL-MOCK order_response/order_modify/order_cancel.json)**.
-- Order rows carry both `status_message` and verbatim `status_message_raw` (RMS text), plus `modified` bool, `guid`, `exchange_update_timestamp`, `tags[]` — **Verified (OFFICIAL-MOCK orders.json + CLIENT-LIB-SOURCE gokiteconnect Order struct)**.
-- Auction flow: `GET /portfolio/holdings/auctions` lists eligible holdings with `auction_number` (string); auction orders carry `auction_number` — **Verified (CLIENT-LIB-SOURCE `_routes` + OFFICIAL-MOCK auctions_list.json / orders.json)**.
-- Error classes: `OrderException(500), InputException(400), TokenException(403), NetworkException(503), DataException(502)` — **Verified (CLIENT-LIB-SOURCE pykiteconnect exceptions.py)**; wire value `MarginException` (400 observed) is attested by the **OFFICIAL-MOCK autoslice_response.json ONLY** (no SDK class; pykiteconnect dispatches it to GeneralException); child-error envelope `{code, error_type, message, data}` — **Verified (OFFICIAL-MOCK)**.
-- Modify-order `quantity` semantics (total vs remaining) — **Unknown** (Z-ORD-8; contrast Dhan's documented TOTAL).
+- Order routes: `POST /orders/:variety`, `PUT /orders/:variety/:order_id`, `DELETE /orders/:variety/:order_id`, `GET /orders`, `GET /orders/:order_id` (full history list), `GET /trades`, `GET /orders/:order_id/trades`; base `https://api.kite.trade`, header `X-Kite-Version: 3`, `Authorization: token api_key:access_token`, form-encoded bodies — **Verified (LIVE-DOC runner 2026-07-14 — https://kite.trade/docs/connect/v3/orders/; cross-check CLIENT-LIB-SOURCE pykiteconnect `_routes` + gokiteconnect)**.
+- Varieties = `regular, amo, co, iceberg, auction` — **Verified (LIVE-DOC runner 2026-07-14 glossary)**; `bo` absent from the live page (Go ships it as legacy — CLIENT-LIB-SOURCE).
+- Place-order params: exchange (live list: NSE, BSE, NFO, CDS, BCD, MCX — no BFO on the live page; py ships `EXCHANGE_BFO`), tradingsymbol, transaction_type, quantity, product, order_type, price, validity, validity_ttl, disclosed_quantity, trigger_price, iceberg_legs, iceberg_quantity, auction_number, tag, market_protection, autoslice — **Verified (LIVE-DOC runner 2026-07-14 params table)**.
+- `market_protection`: `-1` = automatic system protection, else `>0..100` percent; MARKET + SL-M only (no effect on LIMIT/SL); converts market orders to limit orders; subject to exchange LPP ranges (may reject); echoed on every order row — **Verified (LIVE-DOC runner 2026-07-14 orders page)**. Automatic band = EQ/FUT 2%/1%/0.5% and OPT 5%/3%/2%/1% by LTP price band — **Verified (LIVE-DOC runner 2026-07-14 market-price-protection support article)**. `0`-rejected / mandatory-ness — **Unknown** (NOT stated on the live pages; the old SEARCH claim is unsupported).
+- Autoslice: `autoslice=true` on the normal place route; response `data` is a FLAT ARRAY of per-slice entries, each `{order_id}` OR `{error{code,error_type,message,data}}` (mixed outcomes real); max 10 slices per autoslice order; each slice is a separate orderbook order — **Verified (LIVE-DOC runner 2026-07-14)**. **CORRECTED 2026-07-14:** the earlier "parent order_id + children[]" shape (from the Go struct/mock reading) is not the documented wire shape.
+- Products on the live glossary = `CNC, NRML, MIS, MTF` (CO product NOT listed live; py/Go still ship CO/BO/MTF constants) — **Verified (LIVE-DOC runner 2026-07-14)**; the MTF order row (order_id `250117800776785`) is on the live page itself.
+- Order types = `MARKET, LIMIT, SL, SL-M`; validity = `DAY, IOC, TTL` with `validity_ttl` = order life span in MINUTES — **Verified (LIVE-DOC runner 2026-07-14)** (minutes-unit upgraded from SEARCH).
+- Iceberg: `iceberg_legs` between **2 and 50** — **Verified (LIVE-DOC runner 2026-07-14)**; **CORRECTED 2026-07-14** (the old SEARCH-tier "2–10" was wrong — 10 is the AUTOSLICE max-slices figure). Book row shows the CURRENT leg with progress in `meta.iceberg{leg,legs,leg_quantity,total_quantity,remaining_quantity}` — **Verified (LIVE-DOC runner 2026-07-14 example row; cross-check OFFICIAL-MOCK orders.json)**.
+- Single-order history endpoint returns the transition LIST; interim statuses live-enumerated (non-exhaustive): `PUT ORDER REQ RECEIVED, VALIDATION PENDING, OPEN PENDING, MODIFY VALIDATION PENDING, MODIFY PENDING, TRIGGER PENDING, CANCEL PENDING, AMO REQ RECEIVED` (+ `MODIFIED` in the example history); common = `OPEN, COMPLETE, CANCELLED, REJECTED`, "There may be other values as well" — **Verified (LIVE-DOC runner 2026-07-14)** (`TRIGGER PENDING` upgraded from SEARCH; `CANCEL PENDING`/`AMO REQ RECEIVED` upgraded from Unknown).
+- Place/modify/cancel all return `{"status":"success","data":{"order_id":"<string>"}}` — **Verified (LIVE-DOC runner 2026-07-14 examples; cross-check OFFICIAL-MOCK)**.
+- Order rows carry both `status_message` and verbatim `status_message_raw` (RMS text), plus `modified` bool, `guid` ("Unusable request id to avoid order duplication"), `exchange_update_timestamp`, `tags[]`, `meta{}`; `exchange_order_id`/`exchange_timestamp` null for orders that never reached the exchange; `average_price` only for COMPLETE orders — **Verified (LIVE-DOC runner 2026-07-14 attributes table + examples)**.
+- Modify params (live table): `order_type, quantity, price, trigger_price, disclosed_quantity, validity` (+ `market_protection` in the live example + py signature); CO modify params: `order_id, price, trigger_price` — **Verified (LIVE-DOC runner 2026-07-14)**. Modify `quantity` semantics (total vs remaining) — **Unknown** (Z-ORD-8).
+- CO is multi-legged: first leg creates the position; second-leg orders carry `parent_order_id`, which may be required to modify/cancel them — **Verified (LIVE-DOC runner 2026-07-14)**.
+- Tag: alphanumeric, max 20 chars; echoed in `tag`; read side may return plural `tags[]` — **Verified (LIVE-DOC runner 2026-07-14)** (length/charset upgraded from Unknown).
+- Auction flow: `auction_number` (string) is a live place param + response attribute; real auction order row on the live page; `GET /portfolio/holdings/auctions` lists eligible holdings — **Verified (LIVE-DOC runner 2026-07-14 for the param/row; CLIENT-LIB-SOURCE `_routes` + OFFICIAL-MOCK auctions_list.json for the listing route)**.
+- Broker order caps: **5000 orders/day across all segments, 400 orders/minute, 25 modifications/order**; error text "Maximum allowed order requests exceeded" — **Verified (LIVE-DOC runner 2026-07-14 — order-rate-limits-on-kite support article)** (NEW; the 25-mods cap closes the old modification-cap Unknown).
+- Error classes: `OrderException(500), InputException(400), TokenException(403), NetworkException(503), DataException(502)` — **Verified (CLIENT-LIB-SOURCE pykiteconnect exceptions.py)**; wire value `MarginException` (code 400) in the per-slice error envelope `{code, error_type, message, data}` — **Verified (LIVE-DOC runner 2026-07-14 autoslice example; cross-check OFFICIAL-MOCK)**; pykiteconnect has no MarginException class and dispatches it to GeneralException.
