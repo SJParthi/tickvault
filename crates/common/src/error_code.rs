@@ -2081,7 +2081,16 @@ mod tests {
         // client/query/truncation/flush/budget stage taxonomy) => 148.
         // 2026-07-14 (Groww hardening PR-3): FEED-GAP-01 (gap-episode
         // forensics degraded — annotation-only side record) => 149.
-        assert_eq!(ErrorCode::all().len(), 149);
+        // 2026-07-15 (C4 sweep — Dhan live-WS retirement, operator
+        // 2026-07-13): DROPPED 149 -> 127. The 22 zero-emit-site variants
+        // retained through Phases A/B/C1/C2/C3 were deleted:
+        // INSTR-FETCH-01..04, NTM-CONSTITUENCY-01, PREVDAY-01,
+        // CROSS-VERIFY-1M-01/-02, DHAN-LANE-01..04, WS-GAP-05..09,
+        // AUTH-GAP-06, REST-CANARY-01, SLO-01/02/03 (WS-GAP-04 +
+        // WS-GAP-10 survive — emitted by the retained-dormant
+        // order_update_connection.rs; main's FEED-GAP-01 landed
+        // mid-flight, hence 149 -> 127, not 148 -> 126).
+        assert_eq!(ErrorCode::all().len(), 127);
     }
 
     #[test]

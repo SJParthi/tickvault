@@ -90,8 +90,10 @@
 //! * Rule §3 + §22 — `daily-universe-scope-expansion-2026-05-27.md`
 //! * Rule §0 — `daily-universe-instr-fetch-error-codes.md`
 //! * Rule §21 — feature-gate contract (compile-time scope barrier)
-//! * `ErrorCode::InstrFetch01..04` — failure classes routed through
-//!   the matching `FetchOutcome::*` SYMBOL value.
+//! * `InstrFetch01..04` — the HISTORICAL failure classes routed through
+//!   the matching `FetchOutcome::*` SYMBOL value (the ErrorCode variants
+//!   were retired in the C4 sweep, 2026-07-15; the wire strings remain
+//!   the table's data format).
 
 use std::time::Duration;
 
