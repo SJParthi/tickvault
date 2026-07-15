@@ -46,5 +46,5 @@ pub use tickvault_common::broker_order_events::{BrokerOrderEvent, BrokerOrderSta
 //   pub mod api_client;    // Orders        (GROWW-ORD-*)
 //   pub mod smart_orders;  // Smart Orders  (GROWW-OCO-*)
 //   pub mod portfolio;     // Portfolio     (GROWW-PORT-*)
-//   pub mod margin;        // Margin        (GROWW-MARG-*)
 //   pub mod user;          // User + Exceptions (GROWW-READY-*)
+pub mod margin; // Margin (GROWW-MARG-*)
