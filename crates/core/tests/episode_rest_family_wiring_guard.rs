@@ -474,17 +474,91 @@ fn guard_rest_family_badges_and_descriptions_name_the_broker() {
 
 #[test]
 fn guard_rest_families_are_down_stale_expiry_exempt() {
-    // G1 (fix round 2, 2026-07-15): the routed REST Degraded emitters are
-    // once-per-episode edge-latched, so a Down bubble legitimately gets
-    // ZERO further events for hours mid-outage — stale-expiring it would
-    // edit the phone's last word to "alert closed" while the leg is STILL
-    // failing (Rule-11 false recovery). Only Resolve may close them.
+    // G1 (fix round 2, 2026-07-15), NARROWED by R1 (fix round 3): the
+    // routed REST Degraded emitters are once-per-episode edge-latched, so
+    // a Down bubble legitimately gets ZERO further events for hours
+    // mid-outage — stale-expiring it would edit the phone's last word to
+    // "alert closed" while the leg is STILL failing (Rule-11 false
+    // recovery). Only Resolve may close them WHILE the exemption envelope
+    // holds; the family predicate is condition 1 of 3 (see the envelope
+    // guard below).
     assert!(EpisodeFamily::DhanRest.down_stale_expiry_exempt());
     assert!(EpisodeFamily::GrowwRest.down_stale_expiry_exempt());
     // The fold-fed families keep expiring (unchanged semantics).
     assert!(!EpisodeFamily::MainFeedWs.down_stale_expiry_exempt());
     assert!(!EpisodeFamily::OrderUpdateWs.down_stale_expiry_exempt());
     assert!(!EpisodeFamily::GrowwFeed.down_stale_expiry_exempt());
+}
+
+#[test]
+fn guard_rest_stale_expiry_exemption_is_the_three_condition_envelope() {
+    // R1 (fix round 3, 2026-07-15): the exemption's premise ("event-less
+    // = still failing") holds only IN-PROCESS + IN-SESSION — the emitter
+    // edge latches are process-local and the pulls stop at 15:30 IST. The
+    // envelope is family-eligible AND reconfirmed AND in-session; losing
+    // ANY leg of it re-opens one of: an immortal rehydrated false-alarm
+    // bubble that swallows the next outage's page/SMS, or a session-end
+    // bubble that can never close.
+    use tickvault_core::notification::episode::{
+        EPISODE_DOWN_STALE_EXPIRE_SECS, EpisodeKey, EpisodeRegistry, in_ist_session,
+    };
+    let in_session_ms = {
+        use chrono::TimeZone;
+        let offset = chrono::FixedOffset::east_opt(19_800).unwrap();
+        u64::try_from(
+            offset
+                .with_ymd_and_hms(2026, 7, 15, 11, 0, 0)
+                .unwrap()
+                .timestamp_millis(),
+        )
+        .unwrap()
+    };
+    assert!(
+        in_ist_session(in_session_ms),
+        "test anchor must be in-session"
+    );
+    let post_close_ms = in_session_ms + 5 * 3600 * 1000; // 16:00 IST
+    assert!(!in_ist_session(post_close_ms));
+    let stale = EPISODE_DOWN_STALE_EXPIRE_SECS * 1000;
+
+    let k = EpisodeKey {
+        family: EpisodeFamily::DhanRest,
+        conn: 12,
+    };
+    // (1) In-process + in-session: exempt — never expires.
+    let reg = EpisodeRegistry::new();
+    let _ = reg.apply_event(
+        k,
+        EpisodeRole::Open,
+        Severity::High,
+        0,
+        in_session_ms,
+        &EpisodeConfig::default(),
+    );
+    assert!(
+        reg.tick(in_session_ms + 2 * stale, &EpisodeConfig::default())
+            .expired
+            .is_empty()
+    );
+    // (2) Rehydrated-unconfirmed (restart edge): expires the stale window
+    //     after the RESTART even in-session — a recovered-while-down leg
+    //     never shows "failing" all day.
+    let reg2 = EpisodeRegistry::new();
+    reg2.rehydrate(reg.snapshot(), in_session_ms);
+    assert_eq!(
+        reg2.tick(in_session_ms + stale, &EpisodeConfig::default())
+            .expired
+            .len(),
+        1
+    );
+    // (3) Out-of-session: even a reconfirmed in-process bubble closes ~30
+    //     min after its last event once the pulls stop firing.
+    assert_eq!(
+        reg.tick(post_close_ms, &EpisodeConfig::default())
+            .expired
+            .len(),
+        1
+    );
 }
 
 #[test]

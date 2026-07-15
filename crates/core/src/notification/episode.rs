@@ -87,7 +87,29 @@ pub const EPISODE_EDIT_FAILURES_FALLBACK_THRESHOLD: u8 = 2;
 /// fresh page and no SMS. Expiry closes the bubble neutrally and writes
 /// NO tombstone, so the next outage opens a FRESH first page (with the
 /// SNS-SMS leg).
+///
+/// R1 (fix round 3, 2026-07-15): the G1 REST-family exemption from this
+/// expiry is NARROWED to the exact case it was built for — see
+/// [`EpisodeFamily::down_stale_expiry_exempt`] for the three-condition
+/// envelope. The restart edge this constant's paragraph describes is
+/// therefore covered again for the REST families too: a rehydrated
+/// REST Down bubble that never receives a post-rehydrate event stale-
+/// closes within this window of the restart (rehydrate resets the
+/// event-less clock), and a later same-day outage opens a FRESH page.
 pub const EPISODE_DOWN_STALE_EXPIRE_SECS: u64 = 1800;
+
+/// NSE session bounds in IST seconds-of-day, derived from the canonical
+/// nanos constants in `tickvault_common::constants` (lockstep by
+/// construction — a bounds change there propagates here at compile time).
+/// Used by the R1 stale-expiry exemption envelope: outside
+/// `[09:15, 15:30)` IST the per-minute REST legs stop firing, so an
+/// event-less REST Down bubble out of session is stale by definition.
+pub const SESSION_START_SECS_OF_DAY_IST: u32 =
+    (tickvault_common::constants::MARKET_OPEN_IST_NANOS / 1_000_000_000) as u32;
+
+/// Exclusive end of the NSE session in IST seconds-of-day (15:30:00).
+pub const SESSION_END_SECS_OF_DAY_IST: u32 =
+    (tickvault_common::constants::MARKET_CLOSE_IST_NANOS / 1_000_000_000) as u32;
 
 /// Boot-bubble render ceiling — characters (2026-07-09 operator escalation:
 /// ONE consolidated boot bubble per boot). Larger than the WS steady ceiling
@@ -306,10 +328,13 @@ impl EpisodeFamily {
         }
     }
 
-    /// G1 (fix round 2, 2026-07-15): families whose DOWN bubbles are EXEMPT
-    /// from the [`EPISODE_DOWN_STALE_EXPIRE_SECS`] stale expiry.
+    /// G1 (fix round 2, 2026-07-15), NARROWED by R1 (fix round 3): families
+    /// whose DOWN bubbles are ELIGIBLE for exemption from the
+    /// [`EPISODE_DOWN_STALE_EXPIRE_SECS`] stale expiry.
     ///
-    /// - `Boot`: a hung boot keeps honestly showing ⏳ (pre-existing arm).
+    /// - `Boot`: a hung boot keeps honestly showing ⏳ (pre-existing arm —
+    ///   UNCONDITIONAL in `tick()`; Boot bubbles are never snapshotted and
+    ///   a hung 08:30 boot sits outside the session window by design).
     /// - `DhanRest` / `GrowwRest`: every routed REST Degraded emitter is
     ///   once-per-episode EDGE-LATCHED upstream (the escalation / not-served
     ///   edges fire once and re-arm only on recovery), so a Down bubble
@@ -317,7 +342,24 @@ impl EpisodeFamily {
     ///   is STILL failing — stale-expiring it edits the phone's last word
     ///   to "alert closed" mid-outage (Rule-11 false recovery) and strands
     ///   the eventual Recovered on the legacy lane. Only a Resolve edge
-    ///   may close these bubbles.
+    ///   may close these bubbles WHILE the exemption envelope holds.
+    ///
+    /// **R1 — the three-condition envelope (applied in `tick()`, not
+    /// here):** a REST Down bubble is exempt only while ALL of:
+    /// 1. this predicate (family eligibility);
+    /// 2. [`EpisodeState::reconfirmed`] — the bubble was created or last
+    ///    received a REAL event in THIS process. The edge latches
+    ///    (FailureEdge / UnderlyingServedTracker) are process-local, so
+    ///    "event-less = still failing" holds only in-process: a REHYDRATED
+    ///    bubble whose leg recovered while the process was down never gets
+    ///    its Resolve — without this condition it would show "failing" all
+    ///    day (Rule-11 false alarm) and swallow the next real outage's
+    ///    page/SMS as a silent edit. A continuing outage re-fires its edge
+    ///    within minutes of restart; the fold reconfirms the bubble.
+    /// 3. in-session ([`in_ist_session`]) — outside `[09:15, 15:30)` IST
+    ///    the per-minute REST legs stop firing, so an event-less Down
+    ///    bubble is stale by definition; a bubble open at session end
+    ///    closes neutrally ~30 min after its last event.
     ///
     /// The WS/GrowwFeed families keep expiring: their Down bubbles receive
     /// per-cooldown fold events while genuinely down, so an event-less
@@ -467,6 +509,15 @@ pub struct EpisodeState {
     pub edit_failures: u8,
     /// Down vs Recovering.
     pub phase: EpisodePhase,
+    /// R1 (fix round 3, 2026-07-15): `true` while the episode was created
+    /// or last received a REAL event in THIS process. Cleared by
+    /// [`EpisodeRegistry::rehydrate`]; set again by any folded event.
+    /// Governs the REST-family stale-expiry exemption envelope (see
+    /// [`EpisodeFamily::down_stale_expiry_exempt`]). NOT persisted in the
+    /// snapshot — rehydrate clears it unconditionally, so old snapshots
+    /// need no field and back-compat holds by construction (a rehydrated
+    /// bubble always starts unconfirmed — the safe direction).
+    pub reconfirmed: bool,
 }
 
 impl EpisodeState {
@@ -486,6 +537,7 @@ impl EpisodeState {
             last_edit_ms: 0,
             edit_failures: 0,
             phase: EpisodePhase::Down,
+            reconfirmed: true,
         }
     }
 }
@@ -1056,6 +1108,10 @@ impl EpisodeRegistry {
         let state = match inner.get_mut(&key) {
             Some(st) => {
                 st.last_event_ms = now_ms;
+                // R1: a real event landed in THIS process — the bubble is
+                // reconfirmed (restores the REST stale-expiry exemption
+                // for a rehydrated bubble whose outage is continuing).
+                st.reconfirmed = true;
                 st.severity_peak = st.severity_peak.max(severity);
                 match role {
                     EpisodeRole::Open | EpisodeRole::Progress => {
@@ -1212,16 +1268,27 @@ impl EpisodeRegistry {
         // live incident view (typical cause: restart whose clean first
         // connect emits no recovery event). NO tombstone on purpose.
         let stale_ms = cfg.down_stale_expire_secs.saturating_mul(MS_PER_SEC);
+        // R1 (fix round 3): the session check is per-tick, once.
+        let in_session = in_ist_session(now_ms);
         let expired_keys: Vec<EpisodeKey> = inner
             .iter()
             .filter(|(_, st)| {
-                // Exempt families never stale-expire (G1, fix round 2):
-                // Boot keeps honestly showing ⏳ (retire_boot owns the
-                // happy path); the REST families' emitters are
-                // once-per-episode edge-latched, so an event-less Down
-                // bubble there is a STILL-FAILING incident — only a
-                // Resolve edge may close it.
-                !st.key.family.down_stale_expiry_exempt()
+                // Exemption envelope (G1 narrowed by R1):
+                // - Boot is UNCONDITIONAL — a hung boot keeps honestly
+                //   showing ⏳ (retire_boot owns the happy path; boot
+                //   bubbles are never snapshotted, and an 08:30 boot sits
+                //   outside the session window by design).
+                // - REST families are exempt only while the bubble was
+                //   created / last fed in THIS process (`reconfirmed` —
+                //   the edge latches are process-local, so "event-less =
+                //   still failing" holds only in-process) AND the clock is
+                //   inside the [09:15, 15:30) IST session (outside it the
+                //   REST legs stop firing, so event-less = stale).
+                let exempt = match st.key.family {
+                    EpisodeFamily::Boot => true,
+                    f => f.down_stale_expiry_exempt() && st.reconfirmed && in_session,
+                };
+                !exempt
                     && st.phase == EpisodePhase::Down
                     && now_ms.saturating_sub(st.last_event_ms) >= stale_ms
             })
@@ -1247,9 +1314,20 @@ impl EpisodeRegistry {
     }
 
     /// Rehydrates the registry from decoded snapshot entries (boot path).
-    pub fn rehydrate(&self, entries: Vec<EpisodeState>) {
+    ///
+    /// R1 (fix round 3, 2026-07-15): every rehydrated entry starts
+    /// UNRECONFIRMED (the process-local edge latches restarted, so an
+    /// event-less rehydrated Down bubble may be a recovered leg) and its
+    /// event-less clock is RESET to `now_ms` — the new process's re-fired
+    /// edge (a continuing outage re-escalates within minutes) gets the
+    /// full [`EPISODE_DOWN_STALE_EXPIRE_SECS`] window to fold in and
+    /// reconfirm the bubble; a recovered-while-down leg stale-closes
+    /// neutrally that long after the restart instead of at the first tick.
+    pub fn rehydrate(&self, entries: Vec<EpisodeState>, now_ms: u64) {
         let mut inner = self.lock_inner();
-        for st in entries {
+        for mut st in entries {
+            st.reconfirmed = false;
+            st.last_event_ms = now_ms;
             inner.entry(st.key).or_insert(st);
         }
     }
@@ -1288,6 +1366,30 @@ pub fn fnv1a_hash(s: &str) -> u64 {
 pub struct EpisodeRenderCtx {
     /// Wall-clock epoch milliseconds at render time (injected).
     pub now_ms: u64,
+}
+
+/// `true` when the epoch-ms instant falls inside the NSE session window
+/// `[09:15, 15:30)` IST. Pure — no clock reads. Used by the R1
+/// stale-expiry exemption envelope; a failed IST conversion reads OUT of
+/// session (fail toward the neutral stale close, never an immortal
+/// false-alarm bubble).
+#[must_use]
+pub fn in_ist_session(epoch_ms: u64) -> bool {
+    use chrono::Timelike;
+    let secs = (epoch_ms / MS_PER_SEC) as i64;
+    let Some(offset) =
+        chrono::FixedOffset::east_opt(tickvault_common::constants::IST_UTC_OFFSET_SECONDS)
+    else {
+        return false;
+    };
+    let Some(utc) = chrono::DateTime::<chrono::Utc>::from_timestamp(secs, 0) else {
+        return false;
+    };
+    let secs_of_day = utc
+        .with_timezone(&offset)
+        .time()
+        .num_seconds_from_midnight();
+    (SESSION_START_SECS_OF_DAY_IST..SESSION_END_SECS_OF_DAY_IST).contains(&secs_of_day)
 }
 
 /// Formats an epoch-ms instant as IST 12-hour wall-clock ("10:02 AM").
@@ -1802,6 +1904,18 @@ mod tests {
         EpisodeConfig::default()
     }
 
+    /// Epoch ms for 2026-07-15 (a Wednesday trading day) at the given IST
+    /// wall clock — R1 tests need IN-SESSION instants (`NOW` above lands
+    /// at ~21:43 IST, outside the session window).
+    fn ist_ms(h: u32, m: u32) -> u64 {
+        use chrono::TimeZone;
+        let offset =
+            chrono::FixedOffset::east_opt(tickvault_common::constants::IST_UTC_OFFSET_SECONDS)
+                .unwrap();
+        let dt = offset.with_ymd_and_hms(2026, 7, 15, h, m, 0).unwrap();
+        u64::try_from(dt.timestamp_millis()).unwrap()
+    }
+
     fn live_state(message_id: Option<i64>) -> EpisodeState {
         let mut st = EpisodeState::open(key(), Severity::High, NOW);
         st.message_id = message_id;
@@ -2242,22 +2356,27 @@ mod tests {
 
     #[test]
     fn test_tick_never_stale_expires_rest_family_down_bubbles() {
-        // G1 (fix round 2, 2026-07-15): every routed REST Degraded emitter
-        // is once-per-episode edge-latched, so an event-less Down bubble is
-        // a STILL-FAILING incident — stale-expiring it would edit the
-        // phone's last word to "alert closed" mid-outage (Rule-11 false
-        // recovery). Only a Resolve edge may close these bubbles.
+        // G1 (fix round 2) narrowed by R1 (fix round 3): an IN-PROCESS
+        // (reconfirmed), IN-SESSION REST Down bubble never stale-expires —
+        // the routed emitters are once-per-episode edge-latched, so an
+        // event-less Down bubble here is a STILL-FAILING incident. Only a
+        // Resolve edge may close it while the envelope holds.
         for family in [EpisodeFamily::DhanRest, EpisodeFamily::GrowwRest] {
             let k = EpisodeKey { family, conn: 1 };
             let reg = EpisodeRegistry::new();
-            let _ = reg.apply_event(k, EpisodeRole::Open, Severity::High, 0, NOW, &cfg());
-            reg.record_sent(k, Some(42), NOW);
-            // Hours past the stale bound: STILL live, never expired.
-            let far = NOW + (EPISODE_DOWN_STALE_EXPIRE_SECS + 7200) * 1000;
+            let opened = ist_ms(9, 30);
+            let _ = reg.apply_event(k, EpisodeRole::Open, Severity::High, 0, opened, &cfg());
+            reg.record_sent(k, Some(42), opened);
+            // Hours past the stale bound, still in-session: STILL live.
+            let far = ist_ms(13, 30);
+            assert!(
+                far - opened > EPISODE_DOWN_STALE_EXPIRE_SECS * 1000,
+                "test setup: must be past the stale bound"
+            );
             let outcome = reg.tick(far, &cfg());
             assert!(
                 outcome.expired.is_empty(),
-                "{family:?} Down bubble must never stale-expire"
+                "{family:?} reconfirmed in-session Down bubble must never stale-expire"
             );
             assert_eq!(reg.live_count(), 1, "{family:?}");
             // The Resolve edge still closes it via the normal
@@ -2271,6 +2390,166 @@ mod tests {
             let outcome = reg.tick(far + EPISODE_STABILITY_SECS * 1000, &cfg());
             assert_eq!(outcome.closed.len(), 1, "{family:?} green close");
         }
+    }
+
+    #[test]
+    fn test_rest_down_bubble_survives_restart_during_continuing_outage() {
+        // R1 scenario 1 (fix round 3): continuing outage across a restart —
+        // the rehydrated bubble starts unreconfirmed with a fresh
+        // event-less clock; the new process's re-fired edge (~3-10 min)
+        // folds into the SAME bubble, reconfirms it, and the exemption is
+        // restored — the bubble lives.
+        let k = EpisodeKey {
+            family: EpisodeFamily::DhanRest,
+            conn: 12,
+        };
+        let reg = EpisodeRegistry::new();
+        let opened = ist_ms(10, 0);
+        let _ = reg.apply_event(k, EpisodeRole::Open, Severity::High, 0, opened, &cfg());
+        reg.record_sent(k, Some(77), opened);
+        // Snapshot round-trip (the real restart path).
+        let json = episode_snapshot::encode(&reg.snapshot());
+        let restart = ist_ms(11, 0);
+        let decoded = episode_snapshot::decode(&json, restart, ist_date_of(restart));
+        assert_eq!(decoded.len(), 1);
+        let reg2 = EpisodeRegistry::new();
+        reg2.rehydrate(decoded, restart);
+        // The re-fired edge lands 8 minutes after restart and FOLDS
+        // (peak was persisted High → no escalation re-page; same bubble).
+        let refire = restart + 8 * 60 * 1000;
+        let d = reg2.apply_event(k, EpisodeRole::Open, Severity::High, 0, refire, &cfg());
+        assert_eq!(
+            d.action,
+            EpisodeAction::Edit {
+                message_id: 77,
+                close: false
+            },
+            "the re-fired edge folds into the rehydrated bubble"
+        );
+        assert!(d.state.reconfirmed, "the fold reconfirms the bubble");
+        // Hours later, in-session, event-less: the exemption is restored —
+        // the bubble lives until its Resolve.
+        let outcome = reg2.tick(ist_ms(15, 0), &cfg());
+        assert!(outcome.expired.is_empty(), "reconfirmed bubble lives");
+        assert_eq!(reg2.live_count(), 1);
+    }
+
+    #[test]
+    fn test_rest_down_bubble_recovered_across_restart_stale_closes_then_fresh_page() {
+        // R1 scenario 2 (fix round 3): the leg recovered while the process
+        // was down (the restart itself fixing it is the common case) — no
+        // post-rehydrate event arrives, so the unreconfirmed bubble
+        // stale-closes neutrally EPISODE_DOWN_STALE_EXPIRE_SECS after the
+        // restart, and a LATER real outage opens a FRESH episode with a
+        // fresh first page (the stale expiry writes NO tombstone).
+        let k = EpisodeKey {
+            family: EpisodeFamily::GrowwRest,
+            conn: 3,
+        };
+        let reg = EpisodeRegistry::new();
+        let opened = ist_ms(10, 0);
+        let _ = reg.apply_event(k, EpisodeRole::Open, Severity::High, 0, opened, &cfg());
+        reg.record_sent(k, Some(88), opened);
+        let json = episode_snapshot::encode(&reg.snapshot());
+        let restart = ist_ms(11, 0);
+        let reg2 = EpisodeRegistry::new();
+        reg2.rehydrate(
+            episode_snapshot::decode(&json, restart, ist_date_of(restart)),
+            restart,
+        );
+        // Just under the window (in-session): still live — the grace for a
+        // continuing outage's re-fired edge.
+        let outcome = reg2.tick(restart + EPISODE_DOWN_STALE_EXPIRE_SECS * 1000 - 1, &cfg());
+        assert!(outcome.expired.is_empty());
+        // At the window (in-session, no event since restart): neutral
+        // stale close.
+        let expire_at = restart + EPISODE_DOWN_STALE_EXPIRE_SECS * 1000;
+        let outcome = reg2.tick(expire_at, &cfg());
+        assert_eq!(outcome.expired.len(), 1, "unreconfirmed bubble expires");
+        assert_eq!(reg2.live_count(), 0);
+        // A LATER same-day REAL outage pages FRESH (no tombstone fold).
+        let d = reg2.apply_event(
+            k,
+            EpisodeRole::Open,
+            Severity::High,
+            0,
+            expire_at + 10 * 60 * 1000,
+            &cfg(),
+        );
+        assert_eq!(
+            d.action,
+            EpisodeAction::SendFirstPage,
+            "a later real outage opens a FRESH episode with a fresh page"
+        );
+    }
+
+    #[test]
+    fn test_rest_down_bubble_stale_closes_after_session_end() {
+        // R1 scenario 3 (fix round 3): the pulls stop at 15:30 IST, so a
+        // Down bubble open at session end never gets another event — it
+        // stale-closes ~30 min after its last event once outside the
+        // session window (even though it is reconfirmed in-process).
+        let k = EpisodeKey {
+            family: EpisodeFamily::DhanRest,
+            conn: 7,
+        };
+        let reg = EpisodeRegistry::new();
+        let opened = ist_ms(15, 4); // the 2026-07-14 expiry-day cutoff class
+        let _ = reg.apply_event(k, EpisodeRole::Open, Severity::High, 0, opened, &cfg());
+        reg.record_sent(k, Some(99), opened);
+        // 15:29 IST (in-session, under the bound): live.
+        let outcome = reg.tick(ist_ms(15, 29), &cfg());
+        assert!(outcome.expired.is_empty());
+        // 15:40 IST: out of session but the bound (15:34) already passed —
+        // the session gate lifts the exemption and the bubble closes.
+        let after_close = ist_ms(15, 40);
+        assert!(
+            after_close - opened >= EPISODE_DOWN_STALE_EXPIRE_SECS * 1000,
+            "test setup: past the stale bound"
+        );
+        let outcome = reg.tick(after_close, &cfg());
+        assert_eq!(
+            outcome.expired.len(),
+            1,
+            "session-end Down bubble stale-closes once out of session"
+        );
+    }
+
+    #[test]
+    fn test_rehydrate_clears_reconfirmed_and_resets_event_clock() {
+        // R1 mechanics: rehydrated entries start unreconfirmed with
+        // last_event_ms reset to the rehydrate instant (the fresh grace
+        // window); fresh + folded episodes are reconfirmed.
+        let fresh = EpisodeState::open(key(), Severity::High, NOW);
+        assert!(fresh.reconfirmed, "fresh episodes start reconfirmed");
+        let reg = EpisodeRegistry::new();
+        let mut st = live_state(Some(5));
+        st.last_event_ms = NOW - 3_600_000;
+        reg.rehydrate(vec![st], NOW);
+        let snap = reg.snapshot();
+        assert!(!snap[0].reconfirmed, "rehydrated entries are unconfirmed");
+        assert_eq!(
+            snap[0].last_event_ms, NOW,
+            "rehydrate resets the event-less clock to the restart instant"
+        );
+        // Any folded event reconfirms.
+        let d = reg.apply_event(key(), EpisodeRole::Progress, Severity::High, 0, NOW, &cfg());
+        assert!(d.state.reconfirmed, "a folded event reconfirms");
+    }
+
+    #[test]
+    fn test_in_ist_session_bounds() {
+        // [09:15, 15:30) IST, inclusive-exclusive; lockstep with the
+        // canonical MARKET_OPEN/CLOSE nanos constants.
+        assert_eq!(SESSION_START_SECS_OF_DAY_IST, 9 * 3600 + 15 * 60);
+        assert_eq!(SESSION_END_SECS_OF_DAY_IST, 15 * 3600 + 30 * 60);
+        assert!(in_ist_session(ist_ms(9, 15)));
+        assert!(in_ist_session(ist_ms(12, 0)));
+        assert!(in_ist_session(ist_ms(15, 29)));
+        assert!(!in_ist_session(ist_ms(15, 30)));
+        assert!(!in_ist_session(ist_ms(9, 14)));
+        assert!(!in_ist_session(ist_ms(21, 43)));
+        assert!(!in_ist_session(0));
     }
 
     #[test]
@@ -2643,7 +2922,7 @@ mod tests {
     fn test_registry_rehydrate_and_attempts_hint() {
         let reg = EpisodeRegistry::new();
         let st = live_state(Some(5));
-        reg.rehydrate(vec![st]);
+        reg.rehydrate(vec![st], NOW);
         assert_eq!(reg.live_count(), 1);
         // Rehydrated state edits, not re-sends.
         let d = reg.apply_event(
