@@ -1016,6 +1016,15 @@ once): `crates/common/src/error_code.rs`, `crates/common/src/config.rs`,
 `config/base.toml`, `crates/core/src/notification/events.rs`,
 `crates/trading/src/oms/mod.rs`, `crates/trading/src/oms/groww/mod.rs`.
 
+**Gate-bearing shared files (2026-07-15, build-lead-serialized — an area PR must
+NEVER edit these):** `crates/common/src/constants.rs` (the Gate-3 live-fire
+const), `crates/common/Cargo.toml` + `crates/trading/Cargo.toml` (the Gate-2
+`groww_orders` non-default feature). These three carry the live-fire lattice
+gates, so — exactly like the enum/config/events surfaces above — they are the
+build lead's serialized responsibility and are added here to close the omission
+noted in the shared-scaffolding pass, ensuring serialization covers 100% of the
+gate surface, not just the enum/config/events surface.
+
 ## §39.4 What still REJECTS (even under this grant)
 
 - Any Groww mutating order request while ANY of Gates 1–3 is not aligned (config

@@ -381,6 +381,56 @@ Covered by the §6 trigger list (extended 2026-07-14 with `v1/order/`,
 `v1/user/detail`, `groww_orders`, `GROWW_ORDER_LIVE_FIRE`, `oms/groww`, and the
 `broker_order_events` seam).
 
+## §10.7 Order-side read cadence — shared post-close carve-out + Orders (`GROWW-ORD-*`) (2026-07-15, build-lead shared scaffolding)
+
+**The shared post-close carve-out (both §10.7 and §10.8 read cadences inherit
+it):** the whole order-side is REST-only for the READ surface — market data is
+REST-only as of the 2026-07-13 live-WS retirement, and the order-side inherits
+the same discipline. Every order-side READ-ONLY GET is a COLD-PATH scheduled
+read, MARKET-HOURS-ONLY (`[09:15, 15:30)` IST trading days), each behind its
+per-area `[groww_orders] *_read` gate default-OFF (§39.2 Gate 1). A read fired
+at or after 15:30 IST is REFUSED — the post-close carve-out: no order-side REST
+touches Groww once the session closes. The ONE bounded exception (a post-close
+settlement / end-of-day read) exists only if a future dated grant adds it HERE
+first. Every read carries the shared-minter SSM READ-ONLY token (never mint —
+token-minter lock 2026-07-02); a 429 backs off through the shared self-tuning
+Data-API limiter and never out-polls; every read self-caps at the tenant
+read-share under BruteX co-tenancy (fail-closed). Order MUTATIONS are NOT reads
+and are hard-locked behind the full 4-gate live-fire lattice (§39.2) — nothing in
+this cadence authorizes an order to be placed.
+
+**What is NOT REST and stays a PERMANENT KEEP (not governed by the post-close
+carve-out):** the order-update / fill / position-update WebSocket subscriptions
+ride the EXISTING single feed connection — no new connection, no REST poll for
+the push surface. They are a permanent keep exactly like the retained live-feed
+WebSocket: a push event's provenance is `EventSource::Push`, distinct from the
+`EventSource::Poll` of the scheduled reads below, so the two never conflate.
+
+**Orders cadence (`GROWW-ORD-*`):** the order / trade read family (order list,
+order detail, order status, status-by-reference, trades) fires on the Orders
+session's rank-monotone poll tiers — a fresh working order polls tightest, a
+settled/terminal order relaxes, so the scheduled-read budget is spent where a
+decision could still change. The order-update WebSocket push (permanent keep,
+above) is the low-latency spine; the poll tiers are the cold-path completeness
+backstop. All of it is market-hours-only + post-close-refused per the shared
+carve-out. Order-side failure/forensics classify under the `GROWW-ORD-*` code
+family (variants land per-area, build-lead-serialized in `error_code.rs`).
+
+## §10.8 Portfolio read cadence (`GROWW-PORT-*`) (2026-07-15, build-lead shared scaffolding)
+
+**Portfolio cadence (`GROWW-PORT-*`):** the positions read family (positions by
+user, positions by trading-symbol) and the holdings read inherit the SAME shared
+post-close carve-out from §10.7 — cold-path, market-hours-only, `portfolio_read`
+gate default-OFF, post-close-refused, SSM read-only token, 429 self-capped.
+Positions poll on the in-session cadence; holdings carry their own own-staleness
+stamp on an hourly-class read (the Dhan portfolio precedent — a holdings row is
+settlement-slow, so its freshness is stamped and any future consumer fails closed
+on staleness rather than trusting a stale row). Portfolio failure/forensics
+classify under the `GROWW-PORT-*` code family (variants land per-area,
+build-lead-serialized). Margin (`GROWW-MARG-*`) and User (`GROWW-READY-*`) read
+cadences fold in under their own slots, each cross-referencing the §10.7 shared
+post-close carve-out written once above.
+
 ---
 
 # §11 — 2026-07-14 operator re-assertion: Dhan spot-1m + option-chain REST are ENABLED classes
