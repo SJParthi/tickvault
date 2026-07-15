@@ -1756,55 +1756,180 @@ mod tests {
 
     // -- source-scan ratchets -------------------------------------------------
 
-    /// Ratchet (hostile-review 2026-07-15, medium): the 7 flipped
-    /// `code = ErrorCode::GrowwMarg*` emit-site fields are pinned by NO
-    /// other build-failing gate — the tag guard fires only when the
-    /// `error!` MESSAGE text carries a literal tracked code string (none
-    /// of the 7 messages does), and the crossref test checks rule-file
-    /// mentions only. The structured `code` field is these log-sink-only
-    /// codes' ENTIRE operator surface (errors.jsonl grouping,
-    /// find_runbook_for_code, the triage YAML `code:` matchers), so this
-    /// production-region source scan (the margin_gate_off_guard.rs house
-    /// pattern: split at the first COLUMN-0 `#[cfg(test)]` line so this
-    /// test's own assertion literals are never scanned — the false-OK
-    /// class) fails the build if any field is silently removed. Exact
-    /// counts per the house ratchet convention: 4x GROWW-MARG-01,
-    /// 2x GROWW-MARG-04, 1x GROWW-MARG-03.
+    /// The tracing-macro tokens the emit-site ratchet anchors against —
+    /// each needle occurrence's NEAREST PRECEDING token must be `error!(`.
+    const RATCHET_MACRO_TOKENS: [&str; 5] = ["error!(", "warn!(", "info!(", "debug!(", "trace!("];
+
+    /// Nearest preceding tracing-macro token before byte `off` in the
+    /// comment-stripped source, or `None` when no macro token precedes.
+    fn nearest_preceding_macro(stripped: &str, off: usize) -> Option<&'static str> {
+        let prefix = &stripped[..off];
+        RATCHET_MACRO_TOKENS
+            .iter()
+            .filter_map(|tok| prefix.rfind(tok).map(|pos| (pos, *tok)))
+            .max_by_key(|(pos, _)| *pos)
+            .map(|(_, tok)| tok)
+    }
+
+    /// Ratchet (hostile-review 2026-07-15, medium; HARDENED same day after
+    /// the round-2 review proved two escapes in the raw-substring version):
+    /// the 7 flipped `code = ErrorCode::GrowwMarg*` emit-site fields are
+    /// pinned by NO other build-failing gate — the tag guard fires only
+    /// when the `error!` MESSAGE text carries a literal tracked code
+    /// string (none of the 7 messages does), and the crossref test checks
+    /// rule-file mentions only. The structured `code` field is these
+    /// log-sink-only codes' ENTIRE operator surface (errors.jsonl
+    /// grouping, find_runbook_for_code, the triage YAML `code:` matchers).
+    ///
+    /// What this pins (exactly):
+    /// 1. Production region = everything ABOVE the first column-0
+    ///    `#[cfg(test)]` line (marker-asserted so the split can never go
+    ///    vacuous), run through the SHARED house comment stripper
+    ///    `tickvault_common::source_scan::strip_rust_comments` (the F8
+    ///    presence-scan convention — seal_drop_paging_wiring_guard /
+    ///    http_client_fallback_guard precedents) so a COMMENTED-OUT
+    ///    `code =` line can never satisfy the counts (the round-2 proven
+    ///    escape (a) — audit Rule 11 false-OK class). The shared stripper
+    ///    is string-aware (a `://` inside a string literal is code, not a
+    ///    comment start) and strips line + doc + nested block comments,
+    ///    so there is NO line-only `/* */` residual here.
+    /// 2. Exact LIVE counts: 4x GROWW-MARG-01, 2x GROWW-MARG-04,
+    ///    1x GROWW-MARG-03 — a drift means a field was removed
+    ///    (regression) or a new emit site landed (update this ratchet +
+    ///    the runbook together).
+    /// 3. Every counted occurrence is anchored to a LIVE `error!`
+    ///    emission: its nearest preceding tracing-macro token in the
+    ///    stripped text must be `error!(` — a warn!/info!/debug!/trace!
+    ///    downgrade (the round-2 proven escape (b), which would silently
+    ///    drop the emission from the ERROR-only errors.jsonl sink) now
+    ///    fails the build.
+    ///
+    /// Named residuals this ratchet deliberately does NOT catch: a needle
+    /// embedded in a production STRING LITERAL would still count (the
+    /// stripper preserves strings verbatim; no margin message embeds the
+    /// needle text today), and the anchor is a nearest-preceding-token
+    /// heuristic, not a parse (sound here because the exact
+    /// `code = ...code_str()` field syntax only occurs inside tracing
+    /// macro invocations in this file).
     #[test]
     fn test_ratchet_margin_emit_sites_carry_shared_errcode_fields() {
         let src = include_str!("margin.rs");
         // Production region = everything ABOVE the first column-0
         // `#[cfg(test)]` (the tests-module attribute); `\n`-anchored so an
         // indented mid-impl attribute could never truncate the scan early.
-        let production = src.split("\n#[cfg(test)]").next().unwrap_or_default();
+        let production_raw = src.split("\n#[cfg(test)]").next().unwrap_or_default();
         assert!(
-            production.len() < src.len(),
+            production_raw.len() < src.len(),
             "column-0 #[cfg(test)] split marker not found — the scan would \
              cover the test region and pass vacuously"
         );
+        // Comment-strip BEFORE counting (offsets preserved — the stripper
+        // blanks comment bytes with spaces), so comment text can never
+        // satisfy a presence needle.
+        let production = tickvault_common::source_scan::strip_rust_comments(production_raw);
 
-        let count = |needle: &str| production.matches(needle).count();
+        let needles: [(&str, usize, &str); 3] = [
+            (
+                "code = ErrorCode::GrowwMarg01FetchDegraded.code_str()",
+                4,
+                "GROWW-MARG-01 emit sites must carry exactly 4 LIVE shared-errcode \
+                 `code =` fields (per-poll degrade x3 + escalation edge)",
+            ),
+            (
+                "code = ErrorCode::GrowwMarg04EntryRejectedInsufficient.code_str()",
+                2,
+                "GROWW-MARG-04 emit sites must carry exactly 2 LIVE shared-errcode \
+                 `code =` fields (enforce-mode rejection + stage=ledger_full)",
+            ),
+            (
+                "code = ErrorCode::GrowwMarg03SnapshotStaleGateClosed.code_str()",
+                1,
+                "GROWW-MARG-03 emit site must carry exactly 1 LIVE shared-errcode \
+                 `code =` field (the stale-gate-closed episode edge)",
+            ),
+        ];
 
+        for (needle, expected, why) in needles {
+            let offsets: Vec<usize> = production.match_indices(needle).map(|(o, _)| o).collect();
+            assert_eq!(
+                offsets.len(),
+                expected,
+                "{why} — a count drift means a field was removed (regression, \
+                 incl. commented out — comments are stripped before counting) \
+                 or a new emit site landed (update this ratchet + the runbook \
+                 together)"
+            );
+            for off in offsets {
+                assert_eq!(
+                    nearest_preceding_macro(&production, off),
+                    Some("error!("),
+                    "the `{needle}` field at byte offset {off} must sit inside \
+                     a LIVE `error!` emission — a warn!/info!/debug!/trace! \
+                     downgrade silently removes it from the ERROR-only \
+                     errors.jsonl sink (these codes' entire operator surface)"
+                );
+            }
+        }
+    }
+
+    /// Scanner SELF-TEST (house convention — the seal_drop / http_client
+    /// stripper-self-test precedent): fixtures proving the emit-site
+    /// ratchet's two hardening halves actually discriminate.
+    #[test]
+    fn test_ratchet_scanner_self_test_comment_strip_and_error_anchor() {
+        use tickvault_common::source_scan::strip_rust_comments;
+
+        // (i) a commented-out needle line must NOT count.
+        let commented = "error!(\n    // code = NEEDLE,\n    \"msg\"\n);\n";
         assert_eq!(
-            count("code = ErrorCode::GrowwMarg01FetchDegraded.code_str()"),
-            4,
-            "GROWW-MARG-01 emit sites must carry exactly 4 shared-errcode \
-             `code =` fields (per-poll degrade x3 + escalation edge) — a \
-             count drift means a field was removed (regression) or a new \
-             emit site landed (update this ratchet + the runbook together)"
+            strip_rust_comments(commented)
+                .matches("code = NEEDLE")
+                .count(),
+            0,
+            "a commented-out field line must never satisfy the presence scan"
+        );
+
+        // (ii) a `://` inside a string literal is CODE — the stripper must
+        // not truncate the rest of the line, while a real trailing line
+        // comment on the same line is still stripped.
+        let url_line = "let u = \"https://api.groww.in\"; let live = 1; // code = NEEDLE\n";
+        let stripped = strip_rust_comments(url_line);
+        assert!(
+            stripped.contains("let live = 1"),
+            "code after a string-literal `://` must survive the stripper"
         );
         assert_eq!(
-            count("code = ErrorCode::GrowwMarg04EntryRejectedInsufficient.code_str()"),
-            2,
-            "GROWW-MARG-04 emit sites must carry exactly 2 shared-errcode \
-             `code =` fields (enforce-mode rejection + stage=ledger_full)"
+            stripped.matches("code = NEEDLE").count(),
+            0,
+            "the trailing real line comment must still be stripped"
         );
+
+        // (iii) a LIVE needle DOES count and anchors to `error!(`.
+        let live = "error!(\n    code = NEEDLE,\n    \"msg\"\n);\n";
+        let stripped = strip_rust_comments(live);
+        let off = stripped
+            .find("code = NEEDLE")
+            .expect("live needle must survive");
         assert_eq!(
-            count("code = ErrorCode::GrowwMarg03SnapshotStaleGateClosed.code_str()"),
+            stripped.matches("code = NEEDLE").count(),
             1,
-            "GROWW-MARG-03 emit site must carry exactly 1 shared-errcode \
-             `code =` field (the stale-gate-closed episode edge)"
+            "a live field line must count exactly once"
         );
+        assert_eq!(nearest_preceding_macro(&stripped, off), Some("error!("));
+
+        // (iv) a warn!-downgraded needle anchors to `warn!(` — the
+        // ratchet's error!-anchor assert would fail on it.
+        let downgraded = "warn!(\n    code = NEEDLE,\n    \"msg\"\n);\n";
+        let stripped = strip_rust_comments(downgraded);
+        let off = stripped.find("code = NEEDLE").expect("needle must survive");
+        assert_eq!(
+            nearest_preceding_macro(&stripped, off),
+            Some("warn!("),
+            "a macro downgrade must be visible to the anchor check"
+        );
+
+        // (v) no preceding macro at all -> None (never a vacuous pass).
+        assert_eq!(nearest_preceding_macro("code = NEEDLE", 0), None);
     }
 
     // -- test doubles ---------------------------------------------------------
@@ -2029,7 +2154,8 @@ mod tests {
     /// 🟢 The params default is FAIL-SAFE: fully disabled with the safe
     /// tuning defaults intact — the module is dark until the deferred
     /// wiring constructs an enabled instance (the config-section twin of
-    /// this test rides the central contract-stubs PR).
+    /// this test lands with the area's FUTURE config PR — the stubs PR
+    /// #1587 merged carrying NO config section; see the module header).
     #[test]
     fn test_groww_margin_gate_params_default_is_disabled() {
         let d = GrowwMarginGateParams::default();
