@@ -114,6 +114,15 @@ pub enum SidecarLineClass {
     /// A generic sidecar error (feed-connect / subscribe / consume phase, or the
     /// SDK's bare `Error:` NATS line).
     Error,
+    /// The sidecar's 2026-07-14 S2 ESCALATION-EXIT marker (prefix-anchored
+    /// `GROWW SIDECAR ESCALATION-EXIT:`): after 2 consecutive TRANSPORT-class
+    /// failed reconnect cycles the sidecar exits(1) for a clean cold relaunch
+    /// (fresh SSM token read + full re-subscribe). Routed into the SAME
+    /// `tv_feed_sidecar_stall_restart_total{feed}` counter + `StallRestartStorm`
+    /// record a watchdog kill uses (pager parity — a sustained self-exit loop
+    /// keeps BOTH pagers firing). Deliberately NOT a reject page class (no
+    /// `alert_reason`) and never an auth latch.
+    EscalationExit,
     /// A subscribe-confirmation line (`subscribed N stocks + M indices`).
     Subscribed,
     /// A positive/streaming line (`groww auth OK`, NDJSON append).
@@ -193,7 +202,7 @@ impl SidecarLineClass {
                  check the bruteX groww-token-minter Lambda's last daily mint",
             ),
             Self::Error => Some("the feed reported an error and is retrying"),
-            Self::Subscribed | Self::Streaming | Self::Info => None,
+            Self::EscalationExit | Self::Subscribed | Self::Streaming | Self::Info => None,
         }
     }
 
@@ -207,7 +216,7 @@ impl SidecarLineClass {
             Self::EntitlementRejected => Some("server session limit or throttle"),
             Self::AuthRejected => Some("access token stale"),
             Self::Error => Some("feed error"),
-            Self::Subscribed | Self::Streaming | Self::Info => None,
+            Self::EscalationExit | Self::Subscribed | Self::Streaming | Self::Info => None,
         }
     }
 }
@@ -247,11 +256,24 @@ pub fn silent_feed_diagnostic_level(market_open: bool) -> tracing::Level {
     }
 }
 
+/// Prefix of the sidecar's FIXED escalation-exit marker line (2026-07-14 S2).
+/// Kept lockstep with `ESCALATION_EXIT_MARKER` in
+/// `scripts/groww-sidecar/groww_sidecar.py` — pinned by
+/// `escalation_exit_tests::marker_literal_lockstep_with_python_sidecar`.
+pub const ESCALATION_EXIT_MARKER_PREFIX: &str = "GROWW SIDECAR ESCALATION-EXIT:";
+
 /// Classify one sidecar diagnostic line. Pure, O(1), case-insensitive substring
 /// match against the REAL strings `scripts/groww-sidecar/groww_sidecar.py`
 /// prints. Order matters: the most-specific / most-actionable class wins.
 #[must_use]
 pub fn classify_sidecar_line(line: &str) -> SidecarLineClass {
+    // 2026-07-14 S2: the escalation-exit marker is PREFIX-anchored on the RAW
+    // line (a fixed uppercase literal the sidecar prints alone on one line) —
+    // a mid-line embedding inside other log noise must never classify
+    // (test-pinned in escalation_exit_tests).
+    if line.starts_with(ESCALATION_EXIT_MARKER_PREFIX) {
+        return SidecarLineClass::EscalationExit;
+    }
     let l = line.to_ascii_lowercase();
     // Auth reject is the most specific cause — check before the generic error.
     // "access token stale" is the sidecar's 10-min minter-dead marker (2026-07-02
@@ -370,7 +392,12 @@ pub const fn stall_cause_latch_update(
         // the next stall must not inherit a pre-recovery reject class).
         SidecarLineClass::Streaming => Some(STALL_CAUSE_NONE),
         // Generic errors / subscribe / info lines never change the latch.
-        SidecarLineClass::Error | SidecarLineClass::Subscribed | SidecarLineClass::Info => None,
+        // The escalation-exit marker is a TRANSPORT-class self-exit — it
+        // neither latches nor clears an auth/entitlement cause.
+        SidecarLineClass::Error
+        | SidecarLineClass::EscalationExit
+        | SidecarLineClass::Subscribed
+        | SidecarLineClass::Info => None,
     }
 }
 
@@ -1263,6 +1290,10 @@ fn spawn_pipe_drain<R>(
     // precise cause slug into its `stall_restarted` audit row. Cleared on a
     // streaming recovery; generic `Error` lines never latch.
     stall_cause: Arc<std::sync::atomic::AtomicU8>,
+    // 2026-07-14 S2: escalation-exit latch — set when the drain classifies the
+    // sidecar's FIXED escalation marker; read by supervise_child's exit arm to
+    // route the self-exit into the stall counter + storm (watchdog-kill parity).
+    escalation_exit_seen: Arc<std::sync::atomic::AtomicBool>,
 ) -> tokio::task::JoinHandle<()>
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
@@ -1272,6 +1303,9 @@ where
         // next_line() is cancel-safe and ends with Ok(None) on EOF (pipe closed).
         while let Ok(Some(line)) = lines.next_line().await {
             let class = classify_sidecar_line(&line);
+            if class == SidecarLineClass::EscalationExit {
+                escalation_exit_seen.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
             // The sidecar's SILENT-FEED WATCHDOG line ("subscribed N but received
             // NO records in 30s") is benign when the market is closed (silence is
             // expected after-hours — matches the `/feeds` page, PR #1260) but is a
@@ -1314,6 +1348,12 @@ where
                     | SidecarLineClass::EntitlementRejected
                     | SidecarLineClass::Error => {
                         error!(stream = pipe_name, "[feeds] groww sidecar: {line}");
+                    }
+                    SidecarLineClass::EscalationExit => {
+                        // 2026-07-14 S2: the marker line itself logs WARN — the
+                        // FEED-STALL-01-coded counter/storm mapping fires once
+                        // at supervise_child's exit arm (watchdog-kill mirror).
+                        warn!(stream = pipe_name, "[feeds] groww sidecar: {line}");
                     }
                     SidecarLineClass::Subscribed | SidecarLineClass::Streaming => {
                         info!(stream = pipe_name, "[feeds] groww sidecar: {line}");
@@ -1559,6 +1599,8 @@ async fn supervise_child(
     // Stall-cause latch (PR-B): the drains record the child's last CONFIRMED
     // reject class so a stall kill stamps the precise cause slug.
     let stall_cause = Arc::new(std::sync::atomic::AtomicU8::new(STALL_CAUSE_NONE));
+    // 2026-07-14 S2: escalation-exit latch (see spawn_pipe_drain).
+    let escalation_exit_seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut drains: Vec<tokio::task::JoinHandle<()>> = Vec::new();
     if let Some(stdout) = child.stdout.take() {
         drains.push(spawn_pipe_drain(
@@ -1572,6 +1614,7 @@ async fn supervise_child(
             Arc::clone(reject_page_gate),
             reject_page_cooldown_secs,
             Arc::clone(&stall_cause),
+            Arc::clone(&escalation_exit_seen),
         ));
     }
     if let Some(stderr) = child.stderr.take() {
@@ -1586,6 +1629,7 @@ async fn supervise_child(
             Arc::clone(reject_page_gate),
             reject_page_cooldown_secs,
             Arc::clone(&stall_cause),
+            Arc::clone(&escalation_exit_seen),
         ));
     }
     let abort_drains = || {
@@ -1619,6 +1663,50 @@ async fn supervise_child(
                         feed = feed.as_str(),
                         "[feeds] sidecar wait() failed — will relaunch with backoff"
                     ),
+                }
+                // 2026-07-14 S2: give the drains a bounded moment to finish the
+                // EOF'd pipes so an escalation-exit marker printed immediately
+                // before exit(1) is classified before the latch is read (the
+                // drain tasks end naturally on pipe EOF; 250ms is scheduling
+                // headroom, not a wait-for-data — honest residual: extreme
+                // scheduler starvation could still miss the latch; the exit
+                // then counts as a plain relaunch, never a silent loss of the
+                // relaunch itself).
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                if escalation_exit_seen.load(std::sync::atomic::Ordering::Relaxed) {
+                    // Mirror of the stall-watchdog kill (FEED-STALL-01): the
+                    // sidecar self-escalated after consecutive failed
+                    // TRANSPORT-class reconnect cycles and exited for a clean
+                    // cold relaunch. SAME counter + SAME storm record as a
+                    // watchdog kill — a sustained self-exit loop keeps BOTH
+                    // pagers (the restart pager + the storm escalation) firing;
+                    // self-heal can never silence the alarms.
+                    let now_secs = (now_ist_nanos() / 1_000_000_000).max(0) as u64;
+                    let is_storm = storm.record_and_is_storm(now_secs);
+                    if is_storm {
+                        error!(
+                            code = ErrorCode::FeedStall01SidecarRestarted.code_str(),
+                            feed = feed.as_str(),
+                            reason = "escalation_exit",
+                            rapid_restarts = storm.count_in_window(),
+                            "[feeds] sidecar ESCALATION-EXIT STORM — repeated self-exits after \
+                             failed reconnect cycles; applying backoff ceiling (still retrying, \
+                             never giving up in market hours)"
+                        );
+                    } else {
+                        warn!(
+                            code = ErrorCode::FeedStall01SidecarRestarted.code_str(),
+                            feed = feed.as_str(),
+                            reason = "escalation_exit",
+                            "[feeds] sidecar self-escalated after repeated failed reconnect \
+                             cycles — exited for clean relaunch (re-auth + re-subscribe)"
+                        );
+                    }
+                    metrics::counter!(
+                        "tv_feed_sidecar_stall_restart_total",
+                        "feed" => feed.as_str(),
+                    )
+                    .increment(1);
                 }
                 abort_drains();
                 return SuperviseOutcome::Exited;
@@ -3944,6 +4032,104 @@ mod tests {
                 "{spawn} must be handed a ws_event_audit sender (stall rows)"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod escalation_exit_tests {
+    use super::*;
+
+    #[test]
+    fn marker_line_classifies_escalation_exit() {
+        assert_eq!(
+            classify_sidecar_line(
+                "GROWW SIDECAR ESCALATION-EXIT: repeated reconnect failure — exiting for clean relaunch"
+            ),
+            SidecarLineClass::EscalationExit
+        );
+        // Prefix alone is sufficient (prefix-anchored classifier).
+        assert_eq!(
+            classify_sidecar_line(ESCALATION_EXIT_MARKER_PREFIX),
+            SidecarLineClass::EscalationExit
+        );
+    }
+
+    #[test]
+    fn heartbeat_lines_classify_info() {
+        for line in [
+            "groww sidecar reconnect-cycle: attempt=1 outcome=failed_connect",
+            "groww sidecar reconnect-cycle: attempt=2 outcome=failed_other",
+            "groww sidecar reconnect-cycle: attempt=1 outcome=failed_auth",
+            "groww sidecar reconnect-cycle: attempt=1 outcome=failed_subscribe",
+            "groww sidecar reconnect-cycle: attempt=3 outcome=connected",
+        ] {
+            assert_eq!(
+                classify_sidecar_line(line),
+                SidecarLineClass::Info,
+                "heartbeat must be tracing-only Info: {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn mid_line_marker_does_not_classify_escalation() {
+        // Prefix-anchored: the marker embedded mid-line (log noise / quoting)
+        // must NEVER classify as an escalation exit.
+        let line = format!("some earlier noise {ESCALATION_EXIT_MARKER_PREFIX} tail");
+        assert_ne!(
+            classify_sidecar_line(&line),
+            SidecarLineClass::EscalationExit
+        );
+        let lower = "groww sidecar escalation-exit: lowercase is not the fixed marker";
+        assert_ne!(
+            classify_sidecar_line(lower),
+            SidecarLineClass::EscalationExit
+        );
+    }
+
+    #[test]
+    fn escalation_exit_is_not_an_alert_or_auth_class() {
+        assert!(!SidecarLineClass::EscalationExit.triggers_alert());
+        assert!(!SidecarLineClass::EscalationExit.sets_auth_rejected());
+        assert!(!SidecarLineClass::EscalationExit.clears_auth_rejected());
+        assert!(SidecarLineClass::EscalationExit.alert_reason().is_none());
+        assert!(SidecarLineClass::EscalationExit.summary_label().is_none());
+        // Never latches or clears a stall cause (transport-class self-exit).
+        assert!(stall_cause_latch_update(SidecarLineClass::EscalationExit, false, true).is_none());
+        assert!(stall_cause_latch_update(SidecarLineClass::EscalationExit, false, false).is_none());
+    }
+
+    #[test]
+    fn marker_literal_lockstep_with_python_sidecar() {
+        // Source-scan lockstep: the .py marker literal and the .rs classifier
+        // prefix must never drift apart (a drift would silently orphan the
+        // self-exit from the stall counter + storm — the pager-safety core).
+        let py_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../scripts/groww-sidecar/groww_sidecar.py"
+        );
+        let py = std::fs::read_to_string(py_path).expect("read groww_sidecar.py");
+        assert!(
+            py.contains(ESCALATION_EXIT_MARKER_PREFIX),
+            "groww_sidecar.py lost the escalation-exit marker prefix"
+        );
+        let full_one_line = "GROWW SIDECAR ESCALATION-EXIT: repeated reconnect failure — exiting for clean relaunch";
+        assert!(
+            py.contains(full_one_line),
+            "groww_sidecar.py must carry the FULL fixed marker on one line"
+        );
+        let rs_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/groww_sidecar_supervisor.rs"
+        );
+        let rs = std::fs::read_to_string(rs_path).expect("read groww_sidecar_supervisor.rs");
+        assert!(
+            rs.contains("GROWW SIDECAR ESCALATION-EXIT:"),
+            "the .rs classifier lost the marker prefix literal"
+        );
+        // The heartbeat shape stays lockstep too (the drain relies on it
+        // classifying Info — no substring collides with an alert arm).
+        assert!(py.contains("groww sidecar reconnect-cycle: "));
     }
 }
 
