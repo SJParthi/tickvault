@@ -44,14 +44,18 @@ follow-up retires it.
     groww-native-rust-error-codes.md, groww-scale-error-codes.md,
     feed-gap-error-codes.md, dual-feed-scoreboard-error-codes.md,
     observability-architecture.md, operator-charter-forever.md,
-    brutex-crossverify-error-codes.md, aws-budget.md (cost note lands with TRAP A), CLAUDE.md
+    brutex-crossverify-error-codes.md, aws-budget.md (cost note lands with TRAP A)
+    (CLAUDE.md: verified no-op — tripwire clean, no edit needed; de-listed fix-round-1b)
   - Tests: n/a (docs; crossref forward direction satisfied by banner mentions)
 
 - [x] Item 3 — Seam relocations + [groww_universe] rider
   - Files: crates/core/src/feed/groww/watch_reader.rs (relocated from native/),
     crates/core/src/feed/groww/mod.rs, crates/app/src/groww_spot_1m_boot.rs (imports),
-    crates/app/src/groww_universe_boot.rs (NEW — daily watch build + master persist +
-    IST midnight+120s day-roll; GROWW-MASTER-01 string stage="watch_build"),
+    crates/app/src/groww_universe.rs (NEW — daily watch build + master persist +
+    IST midnight+120s day-roll; GROWW-MASTER-01 string stage="watch_build"; supervised
+    respawn wrapper added fix-round-1b), crates/app/src/groww_watch_paths.rs (NEW —
+    watch_file_path_for + secs_until_day_roll relocated),
+    crates/app/tests/groww_universe_wiring_guard.rs (NEW, fix-round-1b),
     crates/common/src/config.rs ([groww_universe] serde default OFF), config/base.toml
   - Tests: watch_reader unit tests move intact; watch_file_path_for/secs_until_day_roll
     unit tests move with the fns; groww_universe day-roll math unit tests
@@ -64,8 +68,10 @@ follow-up retires it.
     shard_cutter.rs, auth.rs}, crates/storage/src/{feed_gap_audit_persistence.rs,
     groww_scale_audit_persistence.rs, groww_candle_persistence.rs,
     groww_persistence.rs (partial)}, crates/app/src/main.rs (spawn sites),
-    crates/core/src/pipeline/{feed_consumer.rs, feed_lag_monitor.rs (groww half),
-    feed_presence.rs (groww slots)}, crates/core/src/instance_lock.rs (GrowwScale05 emit
+    crates/core/src/pipeline/feed_lag_monitor.rs (groww half)
+    (feed_consumer.rs KEPT — shared core, Dhan tick_processor delegates to it;
+    feed_presence.rs UNTOUCHED — feed-generic, live consumers remain),
+    crates/core/src/instance_lock.rs (GrowwScale05 emit
     arms ONLY — the named-lock knob is the GDF seam and STAYS), guard tests per the
     verified map, storage partition_manager retention rows
   - Tests: workspace green after delete; guard retunes in Item 8
@@ -238,3 +244,23 @@ the deletion is module-level and single-revert recoverable. NOT claimed: any Gro
 tick capture — by operator directive 2026-07-15 there is NONE; Groww market data is the
 per-minute official REST candles + chain only, so intraminute Groww price movement is
 invisible between fetches.
+
+## Committed Follow-ups (fix-round-1b, 2026-07-15 — NOT in this PR)
+
+- **C-phase candle/TF retirement:** the Groww candle/TF seal machinery stays DORMANT in
+  this PR (the seal_routing Groww emit site, the seals-emitted dashboard widget, the EMF
+  seal rows in cloudwatch-agent.json / user-data.sh.tftpl, and the telegram-webhook
+  friendly-name map entry are all deliberately KEPT dormant); a dedicated C-phase PR owns
+  their full retirement. `ensure_named_views` is also dormant (zero call sites).
+- **Contract-1m operator kill-decision PENDING:** the Groww per-contract 1m REST leg
+  (§38 PR-4) remains enabled-capable; whether it survives without the live chain anchor
+  cadence is an operator decision — do not delete or degrade it without a dated quote.
+- **GDF-trial operator decision PENDING:** the GDF feed #3 trial
+  (`gdf-third-feed-scope-2026-07-13.md`) awaits its own operator go; NOTE the Q1 tension —
+  the 2026-07-15 REST-only directive ("keep only spot 1m and option chain for both
+  brokers") vs the GDF lock's live-WS trial design needs an explicit operator ruling
+  before PR-B starts.
+- **Presence-registry producer-less dormancy:** `feed_presence.rs` is retained
+  feed-generic but its Groww producer is gone — the registry runs producer-less for the
+  Groww slots (scoreboard coverage columns read the SQL fallback); a future feed re-wire
+  or C-phase cleanup decides its fate.
