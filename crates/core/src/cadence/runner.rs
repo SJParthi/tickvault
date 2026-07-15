@@ -379,6 +379,16 @@ where
             groww_ladder = StreakLadder::starting_at(0);
             exhausted_episode = false;
             last_boundary = None;
+            // The decision latch stores bare minute-of-day slots, which
+            // recur EVERY day — a lane whose slot froze across the day
+            // flip (parked lanes, a midnight suspend) would otherwise
+            // collide on the same minute-of-day tomorrow: try_latch
+            // refuses, NO Decided/Skipped is emitted for that
+            // (lane, minute) (an exactly-once hole in the zero
+            // direction) and the should-never double_latch +
+            // illegal_fsm_move channels fire for a routine pattern
+            // (hostile-review round 1, CAD-NEW-1/CONC-1, 2026-07-15).
+            latch = DecisionLatch::new();
             metrics::gauge!("tv_cadence_ladder_rung").set(0.0);
             metrics::gauge!("tv_cadence_spot_concurrency_step").set(f64::from(spot_ladder.step));
             metrics::gauge!("tv_cadence_groww_shape_step").set(0.0);
