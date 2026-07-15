@@ -381,15 +381,6 @@ impl RiskEngine {
         self.positions.keys().copied()
     }
 
-    /// Test-only accumulator poison — exercises the fail-closed non-finite
-    /// arm of `evaluate_daily_loss_halt`, which is structurally unreachable
-    /// through the guarded production write paths.
-    #[cfg(test)]
-    // TEST-EXEMPT: cfg(test)-only accumulator poison helper (exercised by the fail-closed halt test)
-    pub(crate) fn poison_realized_pnl_for_test(&mut self, value: f64) {
-        self.total_realized_pnl = value;
-    }
-
     /// Returns the total realized P&L for today.
     pub fn total_realized_pnl(&self) -> f64 {
         self.total_realized_pnl
@@ -485,6 +476,18 @@ impl RiskEngine {
                 sink.fire_risk_halt(reason);
             }
         }
+    }
+
+    /// Test-only accumulator poison — exercises the fail-closed non-finite
+    /// arm of `evaluate_daily_loss_halt`, which is structurally unreachable
+    /// through the guarded production write paths. Placed AFTER
+    /// `trigger_halt` (2026-07-15 merge reconcile): cluster C's
+    /// `order_side_wiring_guard` scans the prefix before the FIRST
+    /// `#[cfg(test)]` marker, so this attr must not precede the halt fn.
+    #[cfg(test)]
+    // TEST-EXEMPT: cfg(test)-only accumulator poison helper (exercised by the fail-closed halt test)
+    pub(crate) fn poison_realized_pnl_for_test(&mut self, value: f64) {
+        self.total_realized_pnl = value;
     }
 }
 
