@@ -4291,6 +4291,44 @@ impl NotificationEvent {
         }
     }
 
+    /// Per-index / per-underlying not-served episode slot inside the REST
+    /// families (2026-07-15 cleanliness fold): each pinned symbol gets its
+    /// own bubble `conn` so one index's episode never swallows another's.
+    /// Slots 0..=2 are the whole-leg pulls (spot / chain / contracts);
+    /// 8..=11 are the per-symbol not-served slots; 15 is the honest
+    /// catch-all for an unrecognized symbol (one shared bubble, never a
+    /// panic). Exact match over the pinned `&'static str` set — const,
+    /// zero-alloc (the DHAT bypass-arm pin holds).
+    const fn rest_slot(symbol: &str) -> u8 {
+        // `match` on str literals is not const-stable in all positions;
+        // byte-compare keeps this a true const fn.
+        const fn eq(a: &str, b: &str) -> bool {
+            let (a, b) = (a.as_bytes(), b.as_bytes());
+            if a.len() != b.len() {
+                return false;
+            }
+            let mut i = 0;
+            while i < a.len() {
+                if a[i] != b[i] {
+                    return false;
+                }
+                i += 1;
+            }
+            true
+        }
+        if eq(symbol, "NIFTY") {
+            8
+        } else if eq(symbol, "BANKNIFTY") {
+            9
+        } else if eq(symbol, "SENSEX") {
+            10
+        } else if eq(symbol, "INDIA VIX") {
+            11
+        } else {
+            15
+        }
+    }
+
     /// Telegram UX Overhaul (2026-07-07): which episode bubble, if any,
     /// this event folds into.
     ///
@@ -4401,6 +4439,61 @@ impl NotificationEvent {
                     None
                 }
             }
+            // Per-minute REST pull incident families (2026-07-15
+            // coordinator-relayed cleanliness directive): each leg's
+            // Degraded/Recovered pair folds into ONE live-edited bubble per
+            // (family, leg) instead of 2 messages per flap cycle. First
+            // Degraded still pages (+ SMS at ≥ High); repeats edit in
+            // place; Recovered closes green. The once-per-day pages with no
+            // recovery edge (entitlement / expirylist / book-unresolved /
+            // probe verdicts) and the family-(3) token Criticals stay
+            // LEGACY — Critical never episode-folds. Zero-alloc: Copy match
+            // + const-fn slot lookup; String payloads match via as_str()
+            // (the DHAT bypass-arm pin holds).
+            Self::Spot1mFetchDegraded { .. } | Self::Spot1mFetchRecovered { .. } => {
+                Some(EpisodeKey {
+                    family: EpisodeFamily::DhanRest,
+                    conn: 0,
+                })
+            }
+            Self::ChainFetchDegraded { .. } | Self::ChainFetchRecovered { .. } => {
+                Some(EpisodeKey {
+                    family: EpisodeFamily::DhanRest,
+                    conn: 1,
+                })
+            }
+            Self::Spot1mSidNotServed { symbol, .. }
+            | Self::Spot1mSidServedRecovered { symbol, .. } => Some(EpisodeKey {
+                family: EpisodeFamily::DhanRest,
+                conn: Self::rest_slot(symbol.as_str()),
+            }),
+            Self::Chain1mUnderlyingNotServed { underlying, .. }
+            | Self::Chain1mUnderlyingServedRecovered { underlying, .. } => Some(EpisodeKey {
+                family: EpisodeFamily::DhanRest,
+                conn: Self::rest_slot(underlying),
+            }),
+            Self::GrowwSpot1mFetchDegraded { .. } | Self::GrowwSpot1mFetchRecovered { .. } => {
+                Some(EpisodeKey {
+                    family: EpisodeFamily::GrowwRest,
+                    conn: 0,
+                })
+            }
+            Self::GrowwChain1mFetchDegraded { .. } | Self::GrowwChain1mFetchRecovered { .. } => {
+                Some(EpisodeKey {
+                    family: EpisodeFamily::GrowwRest,
+                    conn: 1,
+                })
+            }
+            Self::GrowwContract1mFetchDegraded { .. }
+            | Self::GrowwContract1mFetchRecovered { .. } => Some(EpisodeKey {
+                family: EpisodeFamily::GrowwRest,
+                conn: 2,
+            }),
+            Self::GrowwChain1mUnderlyingNotServed { underlying, .. }
+            | Self::GrowwChain1mUnderlyingServedRecovered { underlying, .. } => Some(EpisodeKey {
+                family: EpisodeFamily::GrowwRest,
+                conn: Self::rest_slot(underlying),
+            }),
             _ => None,
         }
     }
@@ -4474,9 +4567,19 @@ impl NotificationEvent {
         match self {
             // FeedRecovered is the Groww episode's recovery edge (2026-07-14
             // noise fold); role is consulted only when episode_key() is Some.
+            // The 8 REST *Recovered variants (2026-07-15 cleanliness fold)
+            // are their bubbles' recovery edges the same way.
             Self::WebSocketReconnected { .. }
             | Self::OrderUpdateReconnected { .. }
-            | Self::FeedRecovered { .. } => EpisodeRole::Resolve,
+            | Self::FeedRecovered { .. }
+            | Self::Spot1mFetchRecovered { .. }
+            | Self::ChainFetchRecovered { .. }
+            | Self::Spot1mSidServedRecovered { .. }
+            | Self::Chain1mUnderlyingServedRecovered { .. }
+            | Self::GrowwSpot1mFetchRecovered { .. }
+            | Self::GrowwChain1mFetchRecovered { .. }
+            | Self::GrowwContract1mFetchRecovered { .. }
+            | Self::GrowwChain1mUnderlyingServedRecovered { .. } => EpisodeRole::Resolve,
             _ => EpisodeRole::Open,
         }
     }

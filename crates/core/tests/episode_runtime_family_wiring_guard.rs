@@ -228,31 +228,74 @@ fn guard_recovery_without_open_episode_delivers_via_legacy_lane() {
 //     unreachable. Adding a Critical Groww event later must consciously
 //     revisit this pin (and exercise that edge).
 #[test]
-fn guard_no_critical_event_maps_to_groww_family() {
+fn guard_no_critical_event_maps_to_any_feed_family() {
+    // Renamed from guard_no_critical_event_maps_to_groww_family (2026-07-15
+    // S4): the pin now covers EVERY feed-incident family — GrowwFeed plus
+    // the DhanRest/GrowwRest REST families — because a Critical event in
+    // any of them would exercise the untested escalation edge. Token
+    // Criticals stay legacy forever (episode_rest_family_wiring_guard.rs).
     let routed = [
-        groww_reject(),
-        NotificationEvent::GrowwSidecarRejected {
-            reason: "3 of 10 connections rejected".to_string(),
-            fleet_summary: true,
-            detail: None,
-        },
-        feed_down_full("Groww", true, false),
-        NotificationEvent::FeedRecovered {
-            feed: "Groww".to_string(),
-            down_secs: 120,
-        },
+        (groww_reject(), EpisodeFamily::GrowwFeed),
+        (
+            NotificationEvent::GrowwSidecarRejected {
+                reason: "3 of 10 connections rejected".to_string(),
+                fleet_summary: true,
+                detail: None,
+            },
+            EpisodeFamily::GrowwFeed,
+        ),
+        (
+            feed_down_full("Groww", true, false),
+            EpisodeFamily::GrowwFeed,
+        ),
+        (
+            NotificationEvent::FeedRecovered {
+                feed: "Groww".to_string(),
+                down_secs: 120,
+            },
+            EpisodeFamily::GrowwFeed,
+        ),
+        (
+            NotificationEvent::Spot1mFetchDegraded {
+                consecutive_failed_minutes: 3,
+                minute_ist: "10:42 AM".to_string(),
+            },
+            EpisodeFamily::DhanRest,
+        ),
+        (
+            NotificationEvent::Chain1mUnderlyingNotServed {
+                underlying: "NIFTY",
+                empty_minutes: 10,
+            },
+            EpisodeFamily::DhanRest,
+        ),
+        (
+            NotificationEvent::GrowwSpot1mFetchDegraded {
+                consecutive_failed_minutes: 3,
+                minute_ist: "10:42 AM".to_string(),
+            },
+            EpisodeFamily::GrowwRest,
+        ),
+        (
+            NotificationEvent::GrowwContract1mFetchRecovered {
+                minute_ist: "10:45 AM".to_string(),
+                failed_minutes: 3,
+            },
+            EpisodeFamily::GrowwRest,
+        ),
     ];
-    for event in routed {
+    for (event, family) in routed {
         assert_eq!(
             event.episode_key().map(|k| k.family),
-            Some(EpisodeFamily::GrowwFeed),
+            Some(family),
             "{} must be episode-routed for this pin to be meaningful",
             event.topic()
         );
         assert!(
             event.severity() < Severity::Critical,
-            "{} must stay below Critical — a Critical GrowwFeed event would \
-             exercise the untested escalation edge; revisit this pin first",
+            "{} must stay below Critical — a Critical feed-family event \
+             would exercise the untested escalation edge; revisit this pin \
+             first",
             event.topic()
         );
     }

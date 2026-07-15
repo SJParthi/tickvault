@@ -133,6 +133,19 @@ pub enum EpisodeFamily {
     /// ≤1 notify/60s upstream. Dynamic like the WS families: snapshotted,
     /// tick-promoted, tick-expired.
     GrowwFeed,
+    /// The Dhan per-minute REST candle/chain pulls as live-edited incident
+    /// bubbles (2026-07-15 coordinator-relayed cleanliness directive): each
+    /// leg's Degraded/Recovered pair folds into ONE bubble per
+    /// `(family, leg)` — `conn` 0 = spot pulls, 1 = option-chain pulls,
+    /// 8..=11 = per-index not-served slots (15 = unrecognized symbol).
+    /// Token Criticals stay LEGACY forever (Critical never episode-folds).
+    /// Dynamic like the WS families: snapshotted, tick-promoted,
+    /// tick-expired.
+    DhanRest,
+    /// The Groww per-minute REST candle/chain/contract pulls — the Groww
+    /// twin of [`Self::DhanRest`]: `conn` 0 = spot, 1 = chain,
+    /// 2 = contracts, 8..=11 = per-underlying not-served slots.
+    GrowwRest,
 }
 
 impl EpisodeFamily {
@@ -141,9 +154,9 @@ impl EpisodeFamily {
     #[must_use]
     pub const fn badge(self) -> &'static str {
         match self {
-            Self::MainFeedWs | Self::OrderUpdateWs => "\u{1f537} DHAN", // 🔷
-            Self::Boot => "\u{1f680}",                                  // 🚀
-            Self::GrowwFeed => "\u{1f7e2} GROWW",                       // 🟢
+            Self::MainFeedWs | Self::OrderUpdateWs | Self::DhanRest => "\u{1f537} DHAN", // 🔷
+            Self::Boot => "\u{1f680}",                                                   // 🚀
+            Self::GrowwFeed | Self::GrowwRest => "\u{1f7e2} GROWW",                      // 🟢
         }
     }
 
@@ -155,6 +168,8 @@ impl EpisodeFamily {
             Self::OrderUpdateWs => "Order confirmations feed",
             Self::Boot => "System boot",
             Self::GrowwFeed => "Groww price feed",
+            Self::DhanRest => "Per-minute candle pull",
+            Self::GrowwRest => "Groww per-minute candle pull",
         }
     }
 
@@ -166,6 +181,8 @@ impl EpisodeFamily {
             Self::OrderUpdateWs => "order_update_ws",
             Self::Boot => "boot",
             Self::GrowwFeed => "groww_feed",
+            Self::DhanRest => "dhan_rest",
+            Self::GrowwRest => "groww_rest",
         }
     }
 
@@ -178,6 +195,8 @@ impl EpisodeFamily {
             "order_update_ws" => Some(Self::OrderUpdateWs),
             "boot" => Some(Self::Boot),
             "groww_feed" => Some(Self::GrowwFeed),
+            "dhan_rest" => Some(Self::DhanRest),
+            "groww_rest" => Some(Self::GrowwRest),
             _ => None,
         }
     }
@@ -199,6 +218,7 @@ impl EpisodeFamily {
         match self {
             Self::MainFeedWs | Self::OrderUpdateWs | Self::Boot => "DOWN",
             Self::GrowwFeed => "not receiving prices",
+            Self::DhanRest | Self::GrowwRest => "failing",
         }
     }
 
@@ -208,6 +228,7 @@ impl EpisodeFamily {
         match self {
             Self::MainFeedWs | Self::OrderUpdateWs | Self::Boot => "drops",
             Self::GrowwFeed => "rejections",
+            Self::DhanRest | Self::GrowwRest => "failed pulls",
         }
     }
 
@@ -221,7 +242,10 @@ impl EpisodeFamily {
     pub const fn counter_noun(self) -> &'static str {
         match self {
             Self::MainFeedWs | Self::OrderUpdateWs | Self::Boot => "reconnect attempts",
-            Self::GrowwFeed => "",
+            // Same FIX-F honesty rationale: the folded NOTIFY count
+            // undercounts the REST legs' real per-minute retry cadence —
+            // the bubble shows only the failed-pull occurrence count.
+            Self::GrowwFeed | Self::DhanRest | Self::GrowwRest => "",
         }
     }
 
@@ -233,6 +257,7 @@ impl EpisodeFamily {
                 "Now: reconnecting automatically"
             }
             Self::GrowwFeed => "Now: retrying automatically",
+            Self::DhanRest | Self::GrowwRest => "Now: retrying every minute",
         }
     }
 
@@ -242,6 +267,7 @@ impl EpisodeFamily {
         match self {
             Self::MainFeedWs | Self::OrderUpdateWs | Self::Boot => "Now: reconnected — confirming…",
             Self::GrowwFeed => "Now: prices arriving again — confirming…",
+            Self::DhanRest | Self::GrowwRest => "Now: pulls succeeding again — confirming…",
         }
     }
 
@@ -251,6 +277,7 @@ impl EpisodeFamily {
         match self {
             Self::MainFeedWs | Self::OrderUpdateWs | Self::Boot => "back",
             Self::GrowwFeed => "streaming again",
+            Self::DhanRest | Self::GrowwRest => "pulling again",
         }
     }
 
@@ -262,7 +289,7 @@ impl EpisodeFamily {
     pub const fn recovered_noun(self) -> &'static str {
         match self {
             Self::MainFeedWs | Self::OrderUpdateWs | Self::Boot => "attempts",
-            Self::GrowwFeed => "",
+            Self::GrowwFeed | Self::DhanRest | Self::GrowwRest => "",
         }
     }
 }
@@ -290,9 +317,11 @@ pub const BOOT_EPISODE_KEY: EpisodeKey = EpisodeKey {
 #[must_use]
 pub fn episode_config_for(family: EpisodeFamily) -> EpisodeConfig {
     match family {
-        EpisodeFamily::MainFeedWs | EpisodeFamily::OrderUpdateWs | EpisodeFamily::GrowwFeed => {
-            EpisodeConfig::default()
-        }
+        EpisodeFamily::MainFeedWs
+        | EpisodeFamily::OrderUpdateWs
+        | EpisodeFamily::GrowwFeed
+        | EpisodeFamily::DhanRest
+        | EpisodeFamily::GrowwRest => EpisodeConfig::default(),
         EpisodeFamily::Boot => EpisodeConfig {
             edit_min_interval_secs: 0,
             ..EpisodeConfig::default()
@@ -2495,6 +2524,8 @@ mod tests {
             EpisodeFamily::OrderUpdateWs,
             EpisodeFamily::Boot,
             EpisodeFamily::GrowwFeed,
+            EpisodeFamily::DhanRest,
+            EpisodeFamily::GrowwRest,
         ] {
             assert_eq!(
                 EpisodeFamily::from_snapshot_label(family.snapshot_label()),
@@ -2507,7 +2538,9 @@ mod tests {
             EpisodeFamily::MainFeedWs
             | EpisodeFamily::OrderUpdateWs
             | EpisodeFamily::Boot
-            | EpisodeFamily::GrowwFeed => (),
+            | EpisodeFamily::GrowwFeed
+            | EpisodeFamily::DhanRest
+            | EpisodeFamily::GrowwRest => (),
         };
         assert_eq!(EpisodeFamily::from_snapshot_label("alien_ws"), None);
         for phase in [EpisodePhase::Down, EpisodePhase::Recovering] {
