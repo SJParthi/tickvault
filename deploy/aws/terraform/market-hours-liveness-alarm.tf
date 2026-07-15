@@ -211,7 +211,9 @@ resource "aws_cloudwatch_metric_alarm" "market_hours_liveness_missing" {
 #   - tv-<env>-realtime-guarantee-critical (score legitimately 0 off-hours —
 #     VERIFIED SOS page at 05:40 IST 2026-07-03 on a healthy pre-market box;
 #     alarm RETIRED in PR-C2 2026-07-14 with the SLO publisher — historical)
-#   - tv-<env>-aggregator-no-seals (zero seals off-hours is by design)
+#   - tv-<env>-aggregator-no-seals (zero seals off-hours is by design;
+#     alarm RETIRED 2026-07-15 with the Groww live-feed retirement — the
+#     seals metric lost its last live producer; historical)
 # ---------------------------------------------------------------------------
 data "archive_file" "tv_market_hours_liveness_gate_zip" {
   type        = "zip"
@@ -448,12 +450,14 @@ resource "aws_cloudwatch_log_group" "tv_market_hours_liveness_gate" {
 
 # ---------------------------------------------------------------------------
 # Watch the watchman (round-13, 2026-07-06): the gate Lambda's 09:20 IST open
-# invocation is the ONLY path that arms the 6 gated alarms (the ALARM_NAMES
+# invocation is the ONLY path that arms the 4 gated alarms (the ALARM_NAMES
 # env list above — the surviving 2026-07-06 silent-feed set; count 12 → 8 in
 # PR-C2 2026-07-14: realtime-guarantee-critical/-degraded + ws-pool-all-dead
 # + ws-failed-connections retired with the Dhan lane; → 7 same day via the
 # merged Dhan noise lock (→ 6 in PR-C3 2026-07-14: tick-gap-instruments-
-# silent retired with its deleted gauge producer): the leg-3
+# silent retired with its deleted gauge producer; → 4 on 2026-07-15:
+# groww-exchange-lag-p99-high + aggregator-no-seals retired with the Groww
+# live-feed retirement): the leg-3
 # order-update reconnect-storm pager
 # retired with the order-update WS spawn). A gate failure
 # previously re-opened
@@ -490,8 +494,10 @@ resource "aws_cloudwatch_metric_alarm" "market_hours_gate_lambda_errors" {
   # close), so the post-ALARM auto-OK is always AGED-OUT, never a fix — a
   # recurring Rule-11 false-recovery green per failure episode. Worse, for
   # THIS watchman the green also invited skipping the manual re-arm of the
-  # 6 gated alarms (the leg-3 reconnect-storm pager + PR-C3's tick-gap alarm
-  # retired 2026-07-14) — the description above says: re-arm manually
+  # 4 gated alarms (the leg-3 reconnect-storm pager + PR-C3's tick-gap alarm
+  # retired 2026-07-14; groww-exchange-lag-p99-high + aggregator-no-seals
+  # retired 2026-07-15 with the Groww live feed) — the description above
+  # says: re-arm manually
   # REGARDLESS.
   ok_actions = []
 }

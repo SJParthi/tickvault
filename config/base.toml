@@ -317,10 +317,14 @@ dhan_enabled = false
 groww_enabled = false
 # The Groww LIVE feed was RETIRED 2026-07-15 (operator directive: "remove
 # the whole Groww live feed; keep only spot 1m and option chain for both
-# brokers"). groww_enabled above now gates only REST-leg feed identity
-# surfaces; the daily watch-set build lives under [groww_universe]. The
-# retired keys (groww_native_shadow, [feeds.groww] capture archive,
-# [feeds.groww.scale]) were removed with the live machinery.
+# brokers"). groww_enabled above does NOT gate the Groww REST legs (each is
+# section-gated by its own [groww_spot_1m] / [groww_option_chain_1m] /
+# contract-leg `enabled` key); it feeds the boot-completed feed gate, the
+# scoreboard feed_off day classification, and the /feeds page display only
+# (verified 2026-07-15 — the live feed itself is retired). The daily
+# watch-set build lives under [groww_universe]. The retired keys
+# (groww_native_shadow, [feeds.groww] capture archive, [feeds.groww.scale])
+# were removed with the live machinery.
 
 # [movers] section retired in PR #2 (2026-05-18) alongside the deleted
 # movers pipeline. Under the 4-IDX_I-only universe top-N gainers/losers/

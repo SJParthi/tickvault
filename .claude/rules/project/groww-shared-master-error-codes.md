@@ -105,7 +105,9 @@ delete-marker operator procedure) could re-TRUNCATE behind a permanently-green g
    spawned BEFORE the Groww activation watcher and regardless of `feeds.dhan_enabled` — a quiet
    12×5s QuestDB readiness probe (never BOOT-01/02 pages) then the gate-aware migration, marking
    the gate within ~75s worst case, inside the 120s wait, on EVERY boot mode. Ratchet:
-   `ratchet_ts_pin_migration_spawns_before_groww_watcher` (main.rs source-order scan) +
+   `ratchet_ts_pin_migration_spawns_before_groww_universe_rider` (renamed 2026-07-15 from
+   `…_before_groww_watcher` — the Groww activation watcher retired with the live feed;
+   source-order scan) +
    `test_ts_pin_readiness_constants_bound_inside_groww_gate_wait`.
 2. **In-process exactly-once wrapper (F15).** `MigrationGate` gained a `run_once`
    `tokio::sync::OnceCell` latch; `migrate_index_constituency_truncate_once_with_gate` executes
