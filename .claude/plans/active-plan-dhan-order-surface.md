@@ -246,8 +246,10 @@ Other clusters (checked off by their owning sessions' PRs, all referencing THIS 
     review round 3 fix 2026-07-14: the 53/57 path-side arithmetic was irreproducible — the
     inline set is now MEASURED by a source scan of api_client.rs' production region and
     pinned as 19 templates incl. get_positions' inline /positions, websocket_count corrected
-    4→2 per the file's own two-WS test, honest totals 37 unique path templates / 39
-    implemented / 43 known); `DHAN_ALERTS_MULTI_ORDERS_PATH` constant + the constants.rs
+    4→2 per the file's own two-WS test; round-8 truth-sync: the 2 depth WS URL constants are
+    orphan-PINNED, not implemented — honest grand totals 37 unique path templates + 2 live WS
+    = 39 implemented, + 2 orphaned depth WS constants + 4 intentionally skipped = 45 known,
+    over 41 per-method REST operations); `DHAN_ALERTS_MULTI_ORDERS_PATH` constant + the constants.rs
     slash-test array; NEW `.claude/rules/dhan/conditional-trigger.md` (closes the CLAUDE.md
     index drift; 18 mechanical rules incl. the multi-order divergence traps, UTC-Z, bare-array
     GET-all, ONCE-vs-ALWAYS, no-CONFIRM); dated `2026-07-14 Upstream Update (2)` append to
@@ -281,6 +283,15 @@ Other clusters (checked off by their owning sessions' PRs, all referencing THIS 
     test_build_multi_order_request_assigns_sequences_one_to_n,
     test_build_multi_order_request_correlation_id_boundary_30_max_31_rejected_and_charset,
     proptest_build_multi_order_request_never_panics_on_arbitrary_spec
+    + review-hardening tests (rounds 1-9: tolerant echo mirrors, gate-site census —
+    comment-blanking / destructuring-assignment / mut-borrow arms + anchored /alerts
+    allowlist, dhan-client-id + security-id content validation, slashless family needles,
+    wire-observed multi-order POST, bodyless-200 tolerance, orphan pins + extractor
+    self-test). Branch-added test-fn inventory: 7 conditional_gate_guard.rs source-scan
+    tests (scanner internals hardened across all 9 rounds), 11 api_client.rs
+    multi-order/gate tests, 23 conditional.rs constructor tests (incl. the proptest),
+    14 types.rs wire-shape tests, 3 dhan_api_coverage.rs orphan/extractor tests —
+    58 total.
 
 ## Hard invariants (every Dhan-order PR states these)
 
