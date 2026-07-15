@@ -1133,14 +1133,14 @@ impl CadenceConfig {
         // dispatches, with the coded errors pointing at broker slowness
         // instead of the degenerate schedule). Mirror of the spot-anchor
         // feasibility check above.
-        if let Some(&last_chain_offset) = self.dhan_chain_offsets_ms.last() {
-            if last_chain_offset >= self.dhan_lane_cutoff_ms {
-                bail!(
-                    "cadence.dhan_chain_offsets_ms last slot ({}) must land strictly before dhan_lane_cutoff_ms ({}) — a nominal chain fire at/after the cutoff is silently discarded once the cutoff skip resolves the lane",
-                    last_chain_offset,
-                    self.dhan_lane_cutoff_ms
-                );
-            }
+        if let Some(&last_chain_offset) = self.dhan_chain_offsets_ms.last()
+            && last_chain_offset >= self.dhan_lane_cutoff_ms
+        {
+            bail!(
+                "cadence.dhan_chain_offsets_ms last slot ({}) must land strictly before dhan_lane_cutoff_ms ({}) — a nominal chain fire at/after the cutoff is silently discarded once the cutoff skip resolves the lane",
+                last_chain_offset,
+                self.dhan_lane_cutoff_ms
+            );
         }
         // CAD-NEW-3/CAD-SEC-1 lower bound: the anchor failure-ladder
         // shifts the FIRST chain slot earlier by up to
