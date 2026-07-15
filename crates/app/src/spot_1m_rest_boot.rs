@@ -1812,7 +1812,20 @@ pub async fn run_spot_1m_rest(params: Spot1mRestTaskParams) {
         // Audit Rule 3: re-read the wall clock + trading-day verdict EVERY
         // iteration (a suspend can cross midnight and stale the verdict).
         if !params.calendar.is_trading_day_today() {
-            info!("spot_1m_rest: no longer a trading day — exiting");
+            // 2026-07-14: loud + coded (was a bare info!) — a mid-session
+            // calendar flip silently stopping a capture leg must be
+            // greppable in errors.jsonl. Log-sink-only, NO Telegram (a
+            // calendar flip is not broker failure); a suspend that
+            // crossed IST midnight is a legitimate cause.
+            metrics::counter!("tv_spot1m_trading_day_flip_exit_total").increment(1);
+            error!(
+                code = ErrorCode::Spot1m01FetchDegraded.code_str(),
+                stage = "trading_day_flip_exit",
+                "SPOT1M-01: the trading-day verdict flipped mid-session — \
+                 exiting today's spot fire loop (a suspend that crossed \
+                 IST midnight is a legitimate cause; remaining minutes \
+                 stay absent, re-fetchable via backfill)"
+            );
             return;
         }
         // Groww Item-7 precedent (GAP-11 review MEDIUM 1): the trading
@@ -2945,7 +2958,17 @@ async fn run_batch_catchup_loop(
         // Audit Rule 3: re-read the wall clock + trading-day verdict every
         // iteration.
         if !params.calendar.is_trading_day_today() {
-            info!("spot_1m_rest: no longer a trading day — exiting batch loop");
+            // 2026-07-14: loud + coded (was a bare info!) — same class as
+            // the per-minute loop's flip exit; this names the BATCH loop.
+            metrics::counter!("tv_spot1m_trading_day_flip_exit_total").increment(1);
+            error!(
+                code = ErrorCode::Spot1m01FetchDegraded.code_str(),
+                stage = "trading_day_flip_exit",
+                "SPOT1M-01: the trading-day verdict flipped mid-session — \
+                 exiting the batch catch-up loop (a suspend that crossed \
+                 IST midnight is a legitimate cause; remaining cycles \
+                 stay absent, re-fetchable via backfill)"
+            );
             return false;
         }
         let now = ist_secs_of_day_now();
