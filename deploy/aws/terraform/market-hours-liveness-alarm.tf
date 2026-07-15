@@ -137,22 +137,39 @@
 # The market-hours liveness alarm — pages when tv_groww_exchange_lag_p99_seconds
 # is MISSING (app wedged / crash-looped / dead OR Groww never streamed; signal
 # moved off the retired SLO score 2026-07-13). Actions gated to market hours.
+# HONEST SIGNAL CHOICE — tv_rest_1m_fire_heartbeat (2026-07-15):
+#   SIGNAL MOVED AGAIN 2026-07-15 (Groww live-feed retirement, operator
+#   directive: "remove the whole Groww live feed; keep only spot 1m and
+#   option chain for both brokers"). The previous gauge's ONLY sample
+#   producer — record_groww_tick in the deleted Groww bridge — died with
+#   the feed, so tv_groww_exchange_lag_p99_seconds would be MISSING all
+#   session and this breaching-on-missing alarm would false-SOS ~09:25 IST
+#   daily (the exact Phase-A failure shape, one knob later).
+#   New signal: tv_rest_1m_fire_heartbeat — an unlabeled gauge set ONCE PER
+#   PER-MINUTE FIRE by BOTH retained REST 1m spot legs
+#   (crates/app/src/spot_1m_rest_boot.rs + groww_spot_1m_boot.rs,
+#   fire_one_minute). Deliberately NOT pre-registered at boot: the first
+#   set at the 09:16:01 IST fire IS the session-start signal, and
+#   metrics-exporter-prometheus re-renders the last value on every scrape
+#   thereafter — a WEDGED/DEAD/crash-looped process (or BOTH REST legs
+#   dead/disabled — zero in-session capture) goes MISSING and pages.
+#   Evaluation shape, treat_missing_data = "breaching", dimensions and the
+#   09:20–15:35 IST window gate are UNCHANGED (metric_name-only swap).
 # ---------------------------------------------------------------------------
 resource "aws_cloudwatch_metric_alarm" "market_hours_liveness_missing" {
   alarm_name        = "tv-${var.environment}-market-hours-liveness-missing"
-  alarm_description = "App/Groww-feed liveness signal ABSENT during MARKET HOURS — tv_groww_exchange_lag_p99_seconds (published every 10s in-session by the process-global Groww lag publisher, crates/app/src/main.rs) has not been published for ~5 min. Signal moved from the Dhan-lane SLO score 2026-07-13: the Dhan live WS lane (the score's only publisher) is retired per the operator directive; missing Groww lag in-window now means the app is WEDGED/CRASH-LOOPING/OOM-killed/DEAD OR the Groww live feed never streamed this session — both need operator action between 09:15-15:30 IST. Check: SSM → the box → 'systemctl status tickvault' + 'systemctl is-failed tickvault' + 'docker ps' + tail /opt/tickvault/logs/errors.jsonl + the Groww feed health (/api/feeds/health, FEED-STALL-01 runbook). See operator-charter-forever.md §C."
+  alarm_description = "App liveness signal ABSENT during MARKET HOURS — tv_rest_1m_fire_heartbeat (set once per per-minute REST 1m fire by the retained Dhan + Groww spot legs, crates/app/src/spot_1m_rest_boot.rs + groww_spot_1m_boot.rs) has not been published for ~5 min. Signal moved 2026-07-15: the Groww live feed (the previous lag gauge's only sample producer) is retired per the operator directive; missing heartbeat in-window now means the app is WEDGED/CRASH-LOOPING/OOM-killed/DEAD OR both per-minute REST legs stopped firing — both need operator action between 09:15-15:30 IST. Check: SSM → the box → 'systemctl status tickvault' + 'systemctl is-failed tickvault' + 'docker ps' + tail /opt/tickvault/logs/errors.jsonl + the SPOT1M-01/CHAIN-02 runbook (rest-1m-pipeline-error-codes.md). See operator-charter-forever.md §C."
 
   # LessThanThreshold / threshold=0 / statistic=Maximum: the lag p99 is >= 0,
   # so a present value never satisfies <0 (present = OK); a MISSING metric is
   # forced BREACHING below. Same math as boot-heartbeat-alarm.tf.
   comparison_operator = "LessThanThreshold"
   evaluation_periods  = 5 # five missing 60s periods = ~5 min absent before paging
-  # 2026-07-13 (Phase A, Dhan-live-feed removal): was
-  # tv_realtime_guarantee_score — lane-owned publisher, retired with the lane
-  # (see the HONEST SIGNAL CHOICE block above). Dimension shape copied from
-  # the groww-exchange-lag-p99-high alarm (silent-feed-alarms.tf S4), which
-  # watches the SAME gauge.
-  metric_name = "tv_groww_exchange_lag_p99_seconds"
+  # 2026-07-15 (Groww live retirement): was tv_groww_exchange_lag_p99_seconds
+  # — its only sample producer (the Groww bridge) is deleted; see the
+  # 2026-07-15 HONEST SIGNAL CHOICE block above. 2026-07-13 history: was
+  # tv_realtime_guarantee_score (lane-owned publisher, retired with the lane).
+  metric_name = "tv_rest_1m_fire_heartbeat"
   namespace   = local.app_namespace
   period      = 60
   statistic   = "Maximum"
@@ -377,7 +394,10 @@ resource "aws_lambda_function" "tv_market_hours_liveness_gate" {
       # WS spawn is deleted).
       # PR-C3 (2026-07-14): tick-gap-instruments-silent also retired — its
       # gauge producer (the per-SID tick-gap detector) was deleted with the
-      # Dhan WS lane (operator Q4-ii 2026-07-13). The gate now arms 6 alarms.
+      # Dhan WS lane (operator Q4-ii 2026-07-13).
+      # 2026-07-15 (Groww live-feed retirement): groww-exchange-lag-p99-high
+      # also retired — its gauge's only sample producer (the Groww bridge)
+      # was deleted. The gate now arms 5 alarms.
       ALARM_NAMES = join(",", [
         aws_cloudwatch_metric_alarm.market_hours_liveness_missing.alarm_name,
         aws_cloudwatch_metric_alarm.aggregator_no_seals.alarm_name,
@@ -388,7 +408,7 @@ resource "aws_lambda_function" "tv_market_hours_liveness_gate" {
         # tick_gap_instruments_silent retired in PR-C3 (2026-07-14).
         aws_cloudwatch_metric_alarm.boundary_catchup_storm_dhan.alarm_name,
         aws_cloudwatch_metric_alarm.dhan_exchange_lag_p99_high.alarm_name,
-        aws_cloudwatch_metric_alarm.groww_exchange_lag_p99_high.alarm_name, # 2026-07-11 scoreboard PR-C
+        # groww_exchange_lag_p99_high retired 2026-07-15 (Groww live feed removal).
       ])
       # Weekday-NSE-holiday safety: the open path skips enabling when this
       # instance is not up (holiday-gate.sh self-stop). Referencing

@@ -46,11 +46,9 @@ now exists (`deploy/aws/terraform/error-code-alarms.tf`).
 
 Filtered+alarmed codes (each = one `error_code_alerts` map entry):
 DH-901, DH-906 (term-match tripwire — no coded emit site
-exists yet), AUTH-GAP-04, FEED-STALL-01 (ERROR lines = the
-sidecar's own >5-restarts-per-5-min STORM escalation ONLY; per-restart lines
-are warn!-level and invisible here — the ≥3-restarts-per-15-min restart pager
-is the separate `tv_feed_sidecar_stall_restart_total` counter alarm,
-`feed-stall-restart-alarm.tf`; round-3 correction 2026-07-06),
+exists yet), AUTH-GAP-04 (the Groww stall-storm entry left this list
+2026-07-15 — its only ERROR-level emit site, the deleted sidecar stall
+watchdog, died with the Groww live feed; see "Retired paging entries" below),
 WS-REINJECT-01, PROC-01, **AGGREGATOR-DROP-01 (added 2026-07-09** — the
 audit found the Severity::Critical sealed-candle-drop code, the ONLY
 silent-data-loss path for sealed candles, paged nobody; it also gains a
