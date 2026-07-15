@@ -110,8 +110,10 @@ const MS_PER_SEC: u64 = 1000;
 
 /// Which incident family a Telegram episode bubble tracks.
 ///
-/// Extensible; only the two live WebSocket lifecycle families today — they
-/// cover the observed 40-message disconnect storms.
+/// Extensible; the two live WebSocket lifecycle families cover the observed
+/// 40-message disconnect storms, and `GrowwFeed` (2026-07-14 operator noise
+/// directive) covers the persistent Groww reject storm — the runtime
+/// incident class the 2026-07-10 escalation named.
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
 pub enum EpisodeFamily {
     /// Dhan main-feed WebSocket lifecycle (disconnect / reconnect).
@@ -123,6 +125,14 @@ pub enum EpisodeFamily {
     /// Single fixed key ([`BOOT_EPISODE_KEY`]); excluded from the tick
     /// promote/expire scans and from the cross-restart snapshot.
     Boot,
+    /// The Groww market-data feed as ONE logical runtime incident (2026-07-14
+    /// operator noise directive): a persistent reject/never-streamed storm
+    /// (`GrowwSidecarRejected` + the Groww `FeedDown`/`FeedRecovered` arms)
+    /// folds into ONE live-edited bubble instead of a page every cooldown
+    /// window. `conn` is always 0 — the fleet path is already coalesced to
+    /// ≤1 notify/60s upstream. Dynamic like the WS families: snapshotted,
+    /// tick-promoted, tick-expired.
+    GrowwFeed,
 }
 
 impl EpisodeFamily {
@@ -133,6 +143,7 @@ impl EpisodeFamily {
         match self {
             Self::MainFeedWs | Self::OrderUpdateWs => "\u{1f537} DHAN", // 🔷
             Self::Boot => "\u{1f680}",                                  // 🚀
+            Self::GrowwFeed => "\u{1f7e2} GROWW",                       // 🟢
         }
     }
 
@@ -143,6 +154,7 @@ impl EpisodeFamily {
             Self::MainFeedWs => "Live price feed",
             Self::OrderUpdateWs => "Order confirmations feed",
             Self::Boot => "System boot",
+            Self::GrowwFeed => "Groww price feed",
         }
     }
 
@@ -153,6 +165,7 @@ impl EpisodeFamily {
             Self::MainFeedWs => "main_feed_ws",
             Self::OrderUpdateWs => "order_update_ws",
             Self::Boot => "boot",
+            Self::GrowwFeed => "groww_feed",
         }
     }
 
@@ -164,7 +177,92 @@ impl EpisodeFamily {
             "main_feed_ws" => Some(Self::MainFeedWs),
             "order_update_ws" => Some(Self::OrderUpdateWs),
             "boot" => Some(Self::Boot),
+            "groww_feed" => Some(Self::GrowwFeed),
             _ => None,
+        }
+    }
+
+    // -- Per-family renderer phrasing (2026-07-14 noise fold) ---------------
+    //
+    // The status-line renderers were WS-flavored literals; these `const fn`s
+    // supply the phrasing per family so the WS families render BYTE-IDENTICAL
+    // to before (the strings below are the exact prior literals — ratcheted
+    // by `test_render_regression_ws_families_byte_identical`) while new
+    // runtime families read correctly. All `&'static str`, zero-alloc,
+    // commandment-clean (plain English, no library names, no file paths).
+    // The `Boot` arms are structurally unreachable (the Boot family has its
+    // own checklist renderer + dispatcher) but stay total — never a panic.
+
+    /// Headline appended to `feed_desc` on the steady status line.
+    #[must_use]
+    pub const fn down_headline(self) -> &'static str {
+        match self {
+            Self::MainFeedWs | Self::OrderUpdateWs | Self::Boot => "DOWN",
+            Self::GrowwFeed => "not receiving prices",
+        }
+    }
+
+    /// Noun for the folded degradation-event count.
+    #[must_use]
+    pub const fn occurrence_noun(self) -> &'static str {
+        match self {
+            Self::MainFeedWs | Self::OrderUpdateWs | Self::Boot => "drops",
+            Self::GrowwFeed => "rejections",
+        }
+    }
+
+    /// Noun for the attempts counter on the steady line. EMPTY = the
+    /// attempts segment is OMITTED for this family (FIX-F, hostile review
+    /// 2026-07-14): the episode `attempts` field counts FOLDED NOTIFY
+    /// events, which for the Groww family undercounts the sidecar's real
+    /// retry cadence ~12× — showing it would be dishonest, so the Groww
+    /// bubble shows only the rejection occurrence count.
+    #[must_use]
+    pub const fn counter_noun(self) -> &'static str {
+        match self {
+            Self::MainFeedWs | Self::OrderUpdateWs | Self::Boot => "reconnect attempts",
+            Self::GrowwFeed => "",
+        }
+    }
+
+    /// The "Now:" action line on the steady (Down) render.
+    #[must_use]
+    pub const fn action_line(self) -> &'static str {
+        match self {
+            Self::MainFeedWs | Self::OrderUpdateWs | Self::Boot => {
+                "Now: reconnecting automatically"
+            }
+            Self::GrowwFeed => "Now: retrying automatically",
+        }
+    }
+
+    /// The "Now:" line on the Recovering render (amber confirming tail).
+    #[must_use]
+    pub const fn recovering_line(self) -> &'static str {
+        match self {
+            Self::MainFeedWs | Self::OrderUpdateWs | Self::Boot => "Now: reconnected — confirming…",
+            Self::GrowwFeed => "Now: prices arriving again — confirming…",
+        }
+    }
+
+    /// Verb phrase for the final green close line.
+    #[must_use]
+    pub const fn recovered_verb(self) -> &'static str {
+        match self {
+            Self::MainFeedWs | Self::OrderUpdateWs | Self::Boot => "back",
+            Self::GrowwFeed => "streaming again",
+        }
+    }
+
+    /// Noun for the attempts counter on the green close line. EMPTY = the
+    /// segment is OMITTED (same FIX-F honesty rationale as
+    /// [`Self::counter_noun`] — the folded-event count undercounts the
+    /// Groww sidecar's real retries).
+    #[must_use]
+    pub const fn recovered_noun(self) -> &'static str {
+        match self {
+            Self::MainFeedWs | Self::OrderUpdateWs | Self::Boot => "attempts",
+            Self::GrowwFeed => "",
         }
     }
 }
@@ -192,7 +290,9 @@ pub const BOOT_EPISODE_KEY: EpisodeKey = EpisodeKey {
 #[must_use]
 pub fn episode_config_for(family: EpisodeFamily) -> EpisodeConfig {
     match family {
-        EpisodeFamily::MainFeedWs | EpisodeFamily::OrderUpdateWs => EpisodeConfig::default(),
+        EpisodeFamily::MainFeedWs | EpisodeFamily::OrderUpdateWs | EpisodeFamily::GrowwFeed => {
+            EpisodeConfig::default()
+        }
         EpisodeFamily::Boot => EpisodeConfig {
             edit_min_interval_secs: 0,
             ..EpisodeConfig::default()
@@ -1163,12 +1263,27 @@ pub fn render_episode_first_page(event_body: &str) -> String {
 fn render_status_lines(state: &EpisodeState, now_line: &str) -> String {
     let badge = state.key.family.badge();
     let desc = state.key.family.feed_desc();
+    // Per-family phrasing (2026-07-14 noise fold) — the WS families' strings
+    // are the exact prior literals, so their render stays byte-identical.
+    let headline = state.key.family.down_headline();
+    let occ_noun = state.key.family.occurrence_noun();
+    let att_noun = state.key.family.counter_noun();
     let since = format_ist_12h(state.opened_at_ms);
-    let text = format!(
-        "{badge} — {desc} DOWN\nSince {since} IST · {occ} drops · {att} reconnect attempts\n{now_line}",
-        occ = state.occurrences,
-        att = state.attempts,
-    );
+    // An empty counter noun OMITS the attempts segment (FIX-F honesty —
+    // the folded-event count undercounts real retries for some families).
+    let counters = if att_noun.is_empty() {
+        format!(
+            "Since {since} IST · {occ} {occ_noun}",
+            occ = state.occurrences,
+        )
+    } else {
+        format!(
+            "Since {since} IST · {occ} {occ_noun} · {att} {att_noun}",
+            occ = state.occurrences,
+            att = state.attempts,
+        )
+    };
+    let text = format!("{badge} — {desc} {headline}\n{counters}\n{now_line}");
     // Defensive ceiling — never panics, never chunks.
     let mut out: String = text.chars().take(EPISODE_STEADY_MAX_CHARS).collect();
     // Keep the line ceiling honest even if inputs somehow carried newlines.
@@ -1187,13 +1302,28 @@ fn render_status_lines(state: &EpisodeState, now_line: &str) -> String {
 /// [`EPISODE_STEADY_MAX_CHARS`] chars, live counters only, no boilerplate.
 #[must_use]
 pub fn render_episode_steady(state: &EpisodeState, _ctx: &EpisodeRenderCtx) -> String {
-    render_status_lines(state, "Now: reconnecting automatically")
+    render_status_lines(state, state.key.family.action_line())
 }
 
 /// Recovering render — same live counters, amber "confirming" tail.
 #[must_use]
 pub fn render_episode_recovering(state: &EpisodeState, _ctx: &EpisodeRenderCtx) -> String {
-    render_status_lines(state, "Now: reconnected — confirming…")
+    render_status_lines(state, state.key.family.recovering_line())
+}
+
+/// The feed description for the recovered / stale-closed close lines —
+/// carries the SAME broker badge the DOWN bubble led with (operator
+/// directive 2026-07-14: recovered / edge-cleared messages must carry the
+/// same tag as their trigger). The Boot family keeps its plain
+/// description (🚀 is a milestone marker, not a broker tag).
+fn badged_feed_desc(family: EpisodeFamily) -> String {
+    match family {
+        EpisodeFamily::Boot => family.feed_desc().to_string(),
+        // "{badge} — {desc}" — the SAME format the DOWN bubble's status
+        // lines lead with (render_status_lines), so the close line reads
+        // identically at a glance.
+        f => format!("{} — {}", f.badge(), f.feed_desc()),
+    }
 }
 
 /// Neutral close line for a stale-expired Down episode — the incident
@@ -1204,7 +1334,7 @@ pub fn render_episode_stale_closed(state: &EpisodeState) -> String {
     let last = format_ist_12h(state.last_event_ms);
     format!(
         "\u{26aa} {desc} alert closed — no updates since {last} IST. Any new problem will open a fresh alert.",
-        desc = state.key.family.feed_desc(),
+        desc = badged_feed_desc(state.key.family),
     )
 }
 
@@ -1218,11 +1348,19 @@ pub fn render_episode_recovered(state: &EpisodeState, ctx: &EpisodeRenderCtx) ->
         .unwrap_or(0);
     let opened = format_ist_12h(state.opened_at_ms);
     let closed = format_ist_12h(ctx.now_ms);
+    let noun = state.key.family.recovered_noun();
+    // An empty noun OMITS the attempts segment (FIX-F honesty — see
+    // `EpisodeFamily::recovered_noun`).
+    let attempts_segment = if noun.is_empty() {
+        String::new()
+    } else {
+        format!(", {att} {noun}", att = state.attempts)
+    };
     format!(
-        "\u{2705} Recovered — {desc} back. Down {dur}, {att} attempts ({opened}–{closed} IST)",
-        desc = state.key.family.feed_desc(),
+        "\u{2705} Recovered — {desc} {verb}. Down {dur}{attempts_segment} ({opened}–{closed} IST)",
+        desc = badged_feed_desc(state.key.family),
+        verb = state.key.family.recovered_verb(),
         dur = format_duration_human(down_secs),
-        att = state.attempts,
     )
 }
 
@@ -2356,12 +2494,21 @@ mod tests {
             EpisodeFamily::MainFeedWs,
             EpisodeFamily::OrderUpdateWs,
             EpisodeFamily::Boot,
+            EpisodeFamily::GrowwFeed,
         ] {
             assert_eq!(
                 EpisodeFamily::from_snapshot_label(family.snapshot_label()),
                 Some(family)
             );
         }
+        // Exhaustiveness pin: adding an EpisodeFamily variant fails to
+        // compile here until it joins the roundtrip list above.
+        let _exhaustive = |f: EpisodeFamily| match f {
+            EpisodeFamily::MainFeedWs
+            | EpisodeFamily::OrderUpdateWs
+            | EpisodeFamily::Boot
+            | EpisodeFamily::GrowwFeed => (),
+        };
         assert_eq!(EpisodeFamily::from_snapshot_label("alien_ws"), None);
         for phase in [EpisodePhase::Down, EpisodePhase::Recovering] {
             assert_eq!(
@@ -2427,6 +2574,244 @@ mod tests {
         for banned in ["rkyv", "papaya", "mpsc", ".rs", "data/", "editMessageText"] {
             assert!(!line.contains(banned), "banned {banned:?} in {line:?}");
         }
+    }
+
+    #[test]
+    fn test_render_episode_recovered_carries_feed_badge() {
+        // Operator directive 2026-07-14: the recovered close line carries
+        // the SAME broker badge the DOWN bubble led with — a recovery must
+        // never lose the tag its trigger carried (ratchet).
+        for family in [EpisodeFamily::MainFeedWs, EpisodeFamily::OrderUpdateWs] {
+            let mut st = EpisodeState::open(EpisodeKey { family, conn: 1 }, Severity::High, NOW);
+            st.attempts = 4;
+            let ctx = EpisodeRenderCtx {
+                now_ms: NOW + 90_000,
+            };
+            let line = render_episode_recovered(&st, &ctx);
+            assert!(
+                line.contains("\u{1f537} DHAN — "),
+                "recovered line must carry the same badge format as the DOWN bubble: {line:?}"
+            );
+            assert!(line.starts_with('\u{2705}'), "green stays first: {line:?}");
+        }
+        // The boot bubble is a milestone checklist, not a broker feed —
+        // its close line stays badge-free.
+        let boot = EpisodeState::open(BOOT_EPISODE_KEY, Severity::High, NOW);
+        let ctx = EpisodeRenderCtx {
+            now_ms: NOW + 90_000,
+        };
+        let line = render_episode_recovered(&boot, &ctx);
+        assert!(
+            !line.contains("DHAN") && !line.contains("GROWW"),
+            "boot close line must not carry a broker badge: {line:?}"
+        );
+    }
+
+    #[test]
+    fn test_render_episode_stale_closed_carries_feed_badge() {
+        // Same-tag rule for the neutral stale-close line (2026-07-14).
+        let mut st = live_state(Some(1));
+        st.last_event_ms = NOW;
+        let line = render_episode_stale_closed(&st);
+        assert!(
+            line.contains("\u{1f537} DHAN — "),
+            "stale-close line must carry the same badge format as the DOWN bubble: {line:?}"
+        );
+        assert!(
+            line.starts_with('\u{26aa}'),
+            "neutral marker stays first: {line:?}"
+        );
+    }
+
+    // -- GrowwFeed runtime incident family (2026-07-14 noise fold) ----------
+
+    fn groww_key() -> EpisodeKey {
+        EpisodeKey {
+            family: EpisodeFamily::GrowwFeed,
+            conn: 0,
+        }
+    }
+
+    fn groww_state(message_id: Option<i64>) -> EpisodeState {
+        let mut st = EpisodeState::open(groww_key(), Severity::High, NOW);
+        st.message_id = message_id;
+        st
+    }
+
+    /// RATCHET (render regression): the renderer generalization must keep
+    /// the pre-existing families' output BYTE-IDENTICAL — these are the
+    /// exact strings the pre-2026-07-14 WS-literal renderer produced,
+    /// updated for the #1526 badge rule (recovered/stale-close lines now
+    /// carry the same broker badge the DOWN bubble leads with).
+    #[test]
+    fn test_render_regression_ws_families_byte_identical() {
+        let ctx = EpisodeRenderCtx {
+            now_ms: NOW + 90_000,
+        };
+        for (family, desc) in [
+            (EpisodeFamily::MainFeedWs, "Live price feed"),
+            (EpisodeFamily::OrderUpdateWs, "Order confirmations feed"),
+        ] {
+            let mut st = EpisodeState::open(EpisodeKey { family, conn: 0 }, Severity::High, NOW);
+            st.message_id = Some(1);
+            st.occurrences = 7;
+            st.attempts = 31;
+            let since = format_ist_12h(NOW);
+            assert_eq!(
+                render_episode_steady(&st, &ctx),
+                format!(
+                    "\u{1f537} DHAN — {desc} DOWN\nSince {since} IST · 7 drops · 31 reconnect attempts\nNow: reconnecting automatically"
+                ),
+                "steady render must stay byte-identical for {family:?}"
+            );
+            assert_eq!(
+                render_episode_recovering(&st, &ctx),
+                format!(
+                    "\u{1f537} DHAN — {desc} DOWN\nSince {since} IST · 7 drops · 31 reconnect attempts\nNow: reconnected — confirming…"
+                ),
+                "recovering render must stay byte-identical for {family:?}"
+            );
+            let opened = format_ist_12h(NOW);
+            let closed = format_ist_12h(ctx.now_ms);
+            assert_eq!(
+                render_episode_recovered(&st, &ctx),
+                format!(
+                    "\u{2705} Recovered — \u{1f537} DHAN — {desc} back. Down 1m 30s, 31 attempts ({opened}–{closed} IST)"
+                ),
+                "recovered render must stay byte-identical for {family:?}"
+            );
+            st.last_event_ms = NOW;
+            assert_eq!(
+                render_episode_stale_closed(&st),
+                format!(
+                    "\u{26aa} \u{1f537} DHAN — {desc} alert closed — no updates since {since} IST. Any new problem will open a fresh alert."
+                ),
+                "stale-close render must stay byte-identical for {family:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_groww_feed_render_phrasing_no_ws_literals() {
+        let mut st = groww_state(Some(1));
+        st.occurrences = 5;
+        st.attempts = 9;
+        let ctx = EpisodeRenderCtx {
+            now_ms: NOW + 60_000,
+        };
+        let steady = render_episode_steady(&st, &ctx);
+        assert!(steady.starts_with("\u{1f7e2} GROWW"), "{steady:?}");
+        assert!(steady.contains("Groww price feed not receiving prices"));
+        assert!(steady.contains("5 rejections"));
+        // FIX-F (2026-07-14 hostile review): the attempts counter counts
+        // folded notify events — an ~12× undercount of the sidecar's real
+        // retries — so the Groww bubble OMITS it entirely.
+        assert!(!steady.contains("attempts"), "{steady:?}");
+        assert!(steady.contains("Now: retrying automatically"));
+        let recovering = render_episode_recovering(&st, &ctx);
+        assert!(recovering.contains("confirming"), "{recovering:?}");
+        let recovered = render_episode_recovered(&st, &ctx);
+        assert!(
+            recovered.contains("Groww price feed streaming again"),
+            "{recovered:?}"
+        );
+        assert!(!recovered.contains("attempts"), "{recovered:?}");
+        // No WS-flavored literals where inappropriate + commandment scan
+        // (plain English, no library names, no file paths, no jargon).
+        for r in [&steady, &recovering, &recovered] {
+            assert!(!r.contains("reconnect"), "WS literal leaked: {r:?}");
+            assert!(!r.contains("DOWN"), "WS literal leaked: {r:?}");
+            for banned in [
+                "rkyv",
+                "papaya",
+                "mpsc",
+                ".rs",
+                "data/",
+                "QuestDB",
+                "ring buffer",
+                "spill",
+                "editMessageText",
+            ] {
+                assert!(!r.contains(banned), "banned {banned:?} in {r:?}");
+            }
+        }
+    }
+
+    /// RATCHET (FSM): first Groww reject pages; recurrences edit-in-place
+    /// (never a second page); FeedRecovered flips to Recovering; the
+    /// stability tick closes green.
+    #[test]
+    fn test_groww_reject_open_then_progress_edits_no_second_page() {
+        let reg = EpisodeRegistry::new();
+        let c = cfg();
+        // First reject → first page (the preserved High bypass + SMS leg).
+        let d1 = reg.apply_event(groww_key(), EpisodeRole::Open, Severity::High, 0, NOW, &c);
+        assert_eq!(d1.action, EpisodeAction::SendFirstPage);
+        reg.record_sent(groww_key(), Some(77), NOW);
+        // Recurring rejects (outside the edit throttle) → in-place edits,
+        // NEVER a fresh page; occurrence counter advances.
+        let mut now = NOW;
+        for i in 2..=4u32 {
+            now += (c.edit_min_interval_secs + 1) * 1000;
+            let d = reg.apply_event(groww_key(), EpisodeRole::Open, Severity::High, 0, now, &c);
+            assert_eq!(
+                d.action,
+                EpisodeAction::Edit {
+                    message_id: 77,
+                    close: false
+                },
+                "recurrence {i} must edit in place"
+            );
+            assert_eq!(d.state.occurrences, i);
+            reg.record_edit_applied(groww_key(), now, i.into());
+        }
+        // Recovery → Recovering phase edit (amber confirming, no green yet).
+        now += 1000;
+        let dr = reg.apply_event(
+            groww_key(),
+            EpisodeRole::Resolve,
+            Severity::Medium,
+            0,
+            now,
+            &c,
+        );
+        assert_eq!(
+            dr.action,
+            EpisodeAction::Edit {
+                message_id: 77,
+                close: false
+            }
+        );
+        assert_eq!(dr.state.phase, EpisodePhase::Recovering);
+        // Stability window quiet → the tick closes it green.
+        let out = reg.tick(now + (c.stability_secs + 1) * 1000, &c);
+        assert_eq!(out.closed.len(), 1);
+        assert_eq!(out.closed[0].key, groww_key());
+        assert_eq!(reg.live_count(), 0);
+    }
+
+    /// RATCHET (Boot-exclusion inverse): the GrowwFeed family IS admitted
+    /// to the tick promote/expire scans and the cross-restart snapshot —
+    /// only Boot stays excluded.
+    #[test]
+    fn test_groww_feed_included_in_tick_scans_and_snapshot() {
+        let c = cfg();
+        // Stale-Down expiry admits GrowwFeed.
+        let reg = EpisodeRegistry::new();
+        let _ = reg.apply_event(groww_key(), EpisodeRole::Open, Severity::High, 0, NOW, &c);
+        reg.record_sent(groww_key(), Some(5), NOW);
+        // Snapshot encode includes the live GrowwFeed episode (unlike Boot).
+        let snap = reg.snapshot();
+        assert_eq!(snap.len(), 1);
+        let encoded = episode_snapshot::encode(&snap);
+        assert!(
+            encoded.contains("groww_feed"),
+            "GrowwFeed must be persisted: {encoded}"
+        );
+        let out = reg.tick(NOW + (c.down_stale_expire_secs + 1) * 1000, &c);
+        assert_eq!(out.expired.len(), 1, "event-less Down must stale-expire");
+        assert_eq!(out.expired[0].key, groww_key());
+        assert_eq!(reg.live_count(), 0);
     }
 
     // -- Boot bubble (2026-07-09) -------------------------------------------

@@ -329,6 +329,21 @@ day-drainable). Ratchets:
 `crates/app/tests/rest_leg_digest_wiring_guard.rs` (3 tests) + the
 aggregation/render unit suites in `feed_scoreboard_boot.rs` / `events.rs`.
 
+**2026-07-14 update — Dhan forensics rows are LIVE (GAP-11):** the Dhan
+spot AND chain legs now emit `rest_fetch_audit` rows (one per (minute,
+SID/underlying) — every verdict, backfill, sweep repair, named gap,
+no-token and skipped boundary; `rest-1m-pipeline-error-codes.md` §2/§2d),
+so the digest's PRIMARY source covers all four feed/leg pairs and the
+Dhan option-chain line flips from "not measured yet" to measured with
+zero scoreboard code change (the aggregation was always generic over
+`feed`/`leg`). The `spot_1m_rest` latency-fallback column read is KEPT
+as historical/defensive coverage (pre-2026-07-14 days + a
+forensics-writer outage window); removal is a later cleanup. The rows
+additionally carry the NEW `close_to_persist_ms` column (minute close →
+data-flush-ACK, stamped post-ACK via the hold-then-stamp pattern; -1 =
+not persisted/not measured) — not yet rendered on the card, available
+for a future digest rung.
+
 ## §3. Trigger / auto-load
 
 This rule activates when editing:

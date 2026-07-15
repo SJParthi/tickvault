@@ -49,13 +49,9 @@ fn test_auth_and_profile_event_messages() {
     });
     assert!(m.contains("investigate before 09:15 IST"), "{m}");
 
-    let m = render(&NotificationEvent::MidSessionProfileInvalidated {
-        reason: "RSN-PROFILE-773".to_string(),
-    });
-    assert!(
-        m.contains("RSN-PROFILE-773") && m.contains("INVALIDATED"),
-        "{m}"
-    );
+    // MidSessionProfileInvalidated render coverage DELETED 2026-07-14 with
+    // the variant (Dhan noise lock) — the watchdog runs silently; a
+    // terminal re-mint failure routes through AuthenticationFailed.
 }
 
 #[test]
@@ -353,11 +349,8 @@ fn test_oms_and_questdb_event_messages() {
 
 #[test]
 fn test_misc_event_messages() {
-    let m = render(&NotificationEvent::NoLiveTicksDuringMarketHours {
-        silent_for_secs: 4250,
-        threshold_secs: 30,
-    });
-    assert!(m.contains("4250"), "{m}");
+    // RETIRED 2026-07-14: NoLiveTicksDuringMarketHours deleted with the
+    // no-tick watchdog (operator Dhan noise lock).
 
     // RETIRED 2026-06-12: LastTickAfterBoundary deleted (redundant with the live
     // tv_late_tick_after_boundary_total counter; wiring it = hot-path risk).

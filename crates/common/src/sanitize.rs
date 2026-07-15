@@ -258,6 +258,16 @@ pub fn sanitize_audit_string(input: &str) -> String {
 /// truncated to its identifying prefix.
 pub const REST_BODY_CAPTURE_MAX_CHARS: usize = 300;
 
+/// Widened cap for the once-per-day RAW-BODY SAMPLE of a 2xx-but-empty
+/// Dhan charts response (2026-07-14 — the account-condition vs
+/// envelope-drift discriminator: ≥14 days of 2xx responses carrying zero
+/// parseable candles for every SID while option-chain + WS work, and no
+/// 2xx body was ever logged anywhere). 600 chars shows the full columnar
+/// envelope shape (or its absence / an HTML shell prefix) while staying a
+/// bounded one-line log field. Same redaction pipeline as the 300-char
+/// error capture.
+pub const REST_RAW_BODY_SAMPLE_MAX_CHARS: usize = 600;
+
 /// Minimum run length of JWT-alphabet characters after `eyJ` for a substring
 /// to be treated as a JWT and redacted. Real Dhan JWTs are hundreds of chars;
 /// 20 keeps false positives (e.g. the literal word "eyJ" in prose) implausible
@@ -309,6 +319,23 @@ pub fn redact_jwt_like(input: &str) -> String {
 /// — they are the entire point of the capture.
 #[must_use]
 pub fn capture_rest_error_body(body: &str) -> String {
+    capture_rest_body_bounded(body, REST_BODY_CAPTURE_MAX_CHARS)
+}
+
+/// Sibling of [`capture_rest_error_body`] with the WIDENED
+/// [`REST_RAW_BODY_SAMPLE_MAX_CHARS`] bound — the once-per-day raw-body
+/// sample of a 2xx-but-empty Dhan charts response (Dhan-support evidence;
+/// see the constant's doc for the 2026-07-14 rationale). IDENTICAL
+/// redaction pipeline: no access-token substring can survive.
+#[must_use]
+pub fn capture_rest_raw_body_sample(body: &str) -> String {
+    capture_rest_body_bounded(body, REST_RAW_BODY_SAMPLE_MAX_CHARS)
+}
+
+/// Shared bounded pipeline behind [`capture_rest_error_body`] (300) and
+/// [`capture_rest_raw_body_sample`] (600). Redaction order is
+/// load-bearing — see the ORDER MATTERS comment below.
+fn capture_rest_body_bounded(body: &str, max_chars: usize) -> String {
     if body.is_empty() {
         return String::new();
     }
@@ -335,7 +362,7 @@ pub fn capture_rest_error_body(body: &str) -> String {
     ] {
         redacted = redact_json_string_field(&redacted, key);
     }
-    redacted.chars().take(REST_BODY_CAPTURE_MAX_CHARS).collect()
+    redacted.chars().take(max_chars).collect()
 }
 
 /// Replaces the string VALUE of every `"<key>" : "<value>"` occurrence with
@@ -631,6 +658,33 @@ mod tests {
         let out = capture_rest_error_body(&waf_page);
         assert_eq!(out.chars().count(), REST_BODY_CAPTURE_MAX_CHARS);
         assert!(out.starts_with("<html>blocked"));
+    }
+
+    #[test]
+    fn test_capture_rest_raw_body_sample_truncates_to_600_chars() {
+        let big = "0123456789".repeat(200);
+        let out = capture_rest_raw_body_sample(&big);
+        assert_eq!(out.chars().count(), REST_RAW_BODY_SAMPLE_MAX_CHARS);
+        assert!(out.starts_with("0123456789"));
+    }
+
+    /// The widened sample runs the SAME redaction pipeline: a JWT echoed in
+    /// a 2xx body can never survive into the 600-char sample.
+    #[test]
+    fn test_capture_rest_raw_body_sample_redacts_jwt() {
+        let jwt = fake_jwt();
+        let body = format!(r#"{{"open":[],"note":"token {jwt} echoed"}}"#);
+        let out = capture_rest_raw_body_sample(&body);
+        assert!(!out.contains(&jwt), "full JWT leaked: {out}");
+        assert!(out.contains("[REDACTED-JWT]"), "marker missing: {out}");
+    }
+
+    /// A short benign columnar body passes through unmodified (the whole
+    /// point of the sample — the envelope shape must survive).
+    #[test]
+    fn test_capture_rest_raw_body_sample_passes_columnar_envelope_through() {
+        let body = r#"{"open":[],"high":[],"low":[],"close":[],"volume":[],"timestamp":[]}"#;
+        assert_eq!(capture_rest_raw_body_sample(body), body);
     }
 
     #[test]

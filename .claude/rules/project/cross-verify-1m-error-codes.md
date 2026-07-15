@@ -116,6 +116,29 @@ its requests clear this run's burst window (see
 
 ---
 
+## §2b. 2026-07-14 Update — CROSS-VERIFY-1M-01/-02 now PAGE (delivery boundary closed)
+
+The 2026-07-10 automation audit found both codes emitted `error!` but were
+**log-sink-only** — neither had an `error_code_alerts` entry, so a 15:31
+IST mismatch or a degraded/blind run paged NOBODY. Both now route via the
+canonical errcode chain: `error!` → errors.jsonl → CloudWatch Logs
+`/tickvault/<env>/app` → filters `tv-<env>-errcode-cross-verify-1m-01` /
+`-02` (`deploy/aws/terraform/error-code-alarms.tf`) → alarm (≤5 min) →
+SNS → Telegram. `ok_recovery = false` on both: these are daily ONE-SHOT
+audit findings — the auto-OK ~15 min after the single datapoint ages out
+can never mean the mismatch/coverage gap was fixed (Rule-11
+false-recovery; the aggregator-drop-01 precedent); the real recovery
+signal is the NEXT trading day's clean run. Lockstep surfaces: the
+"Which codes page" list in `observability-architecture.md` + the
+bidirectional drift ratchet
+`crates/common/tests/error_code_paging_filter_drift_guard.rs` (whose
+production-region scanner was upgraded the same day to EXCISE mid-file
+`#[cfg(test)]` modules — `cross_verify_1m_boot.rs`'s
+`mod start_decision_tests` at ~line 134 previously truncated the scan and
+would have reported these emits as dead filters).
+
+---
+
 ## §3. Trigger / auto-load
 
 This rule activates when editing:

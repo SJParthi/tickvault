@@ -108,49 +108,19 @@ fn test_regression_ws_frame_wal_init_is_fail_closed() {
     );
 }
 
-/// Regression: 2026-06-02 — prod deploy of 8debad0 failed because the prev_oi
-/// cache was repointed (PR #979) from `candles_1d` to the NEW `prev_day_ohlcv`
-/// table, which may not exist on a fresh box when the boot-ordering gate's
-/// blocking load runs. A missing table → load Err → gate AwaitingOiCache →
-/// try_authorize_subscribe() false → std::process::exit(1) → systemd marks
-/// tickvault.service failed → deploy aborts. The fix ensures the table exists
-/// BEFORE the load. This guard pins that ordering so it can't regress.
-#[test]
-fn test_regression_prev_day_ohlcv_table_ensured_before_prev_oi_load() {
-    let src = read("app/src/main.rs");
-    let ensure_idx = src
-        .find("ensure_prev_day_ohlcv_table(")
-        .expect("main.rs must ensure prev_day_ohlcv table before the prev_oi load");
-    let load_idx = src
-        .find(".load_from_questdb(&config.questdb)")
-        .expect("main.rs must load prev_oi_cache from QuestDB at boot");
-    assert!(
-        ensure_idx < load_idx,
-        "ensure_prev_day_ohlcv_table() MUST be called BEFORE \
-         prev_oi_cache.load_from_questdb() — otherwise a missing prev_day_ohlcv \
-         table on a fresh box makes the boot-ordering gate exit(1) and the \
-         deploy fails (regression 2026-06-02, commit 8debad0)"
-    );
-}
+// RETIRED (PR-C2, 2026-07-13 — Dhan live-WS lane deletion, operator
+// retirement directive per websocket-connection-scope-lock.md
+// "2026-07-13 Amendment" §B): test_regression_prev_day_ohlcv_table_ensured_before_prev_oi_load died with the wiring it pinned — the
+// Dhan tick pipeline (frame channel → run_tick_processor → TickEnricher /
+// prev_oi lifecycle enrichment / L14 boot-ordering gate) was deleted from
+// main.rs with the lane; the Groww feed carries its own bridge path.
 
-/// Hostile C1 ratchet: midnight rollover task is spawned in slow boot.
-/// Without this, ~24,300 ticks at 09:15 IST on Day N+1 trigger false
-/// VOLUME-MONO-01 alerts (per L13).
-#[test]
-fn hostile_c1_midnight_rollover_task_spawned_in_slow_boot() {
-    let src = read("app/src/main.rs");
-    assert!(
-        src.contains("spawn_midnight_rollover_task"),
-        "main.rs slow boot must call spawn_midnight_rollover_task — without \
-         it, day-rollover false VOLUME-MONO-01 alerts fire (~24,300 ticks at \
-         IST 09:15 every trading day per L13)"
-    );
-    assert!(
-        src.contains("config.questdb.clone()"),
-        "spawn_midnight_rollover_task receives the QuestDB config so it can \
-         reload prev_oi_cache from prev_day_ohlcv at IST midnight"
-    );
-}
+// RETIRED (PR-C2, 2026-07-13 — Dhan live-WS lane deletion, operator
+// retirement directive per websocket-connection-scope-lock.md
+// "2026-07-13 Amendment" §B): hostile_c1_midnight_rollover_task_spawned_in_slow_boot died with the wiring it pinned — the
+// Dhan tick pipeline (frame channel → run_tick_processor → TickEnricher /
+// prev_oi lifecycle enrichment / L14 boot-ordering gate) was deleted from
+// main.rs with the lane; the Groww feed carries its own bridge path.
 
 /// Hostile C1 ratchet: the spawn helper exists in the public API of
 /// the tick_enricher module.
@@ -217,19 +187,12 @@ fn hostile_c2_no_enricher_means_no_suppression() {
     );
 }
 
-/// Phase 2.7 explicit name-match for the pub-fn-test guard:
-/// `spawn_midnight_rollover_task` is wired into the slow boot
-/// (covered by `hostile_c1_midnight_rollover_task_spawned_in_slow_boot`
-/// above, but the guard's regex requires a test name containing the
-/// fn name literally).
-#[test]
-fn test_spawn_midnight_rollover_task_is_referenced_in_slow_boot() {
-    let src = read("app/src/main.rs");
-    assert!(
-        src.contains("spawn_midnight_rollover_task("),
-        "main.rs slow boot must invoke spawn_midnight_rollover_task with the enricher Arc"
-    );
-}
+// RETIRED (PR-C2, 2026-07-13 — Dhan live-WS lane deletion, operator
+// retirement directive per websocket-connection-scope-lock.md
+// "2026-07-13 Amendment" §B): test_spawn_midnight_rollover_task_is_referenced_in_slow_boot died with the wiring it pinned — the
+// Dhan tick pipeline (frame channel → run_tick_processor → TickEnricher /
+// prev_oi lifecycle enrichment / L14 boot-ordering gate) was deleted from
+// main.rs with the lane; the Groww feed carries its own bridge path.
 
 /// Phase 2.7 explicit name-match for the pub-fn-test guard:
 /// `secs_until_next_ist_midnight` is the scheduler primitive used by

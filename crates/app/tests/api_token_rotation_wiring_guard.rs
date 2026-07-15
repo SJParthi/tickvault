@@ -64,25 +64,29 @@ fn production_region(body: &str) -> String {
 
 #[test]
 fn ratchet_main_spawns_reload_at_both_boot_arms() {
+    // PR-C2 re-shape (2026-07-13, operator retirement directive —
+    // websocket-connection-scope-lock.md "2026-07-13 Amendment"): the fast
+    // crash-recovery boot arm (and its `api_auth_config_fast` duplicate) was
+    // DELETED with the Dhan live-WS lane, so main.rs has a SINGLE boot path
+    // and exactly ONE gated reload spawn site. The rotation contract itself
+    // is unchanged — the spawn must exist and stay gated on `enabled`.
     let main_src = production_region(&read_repo_file("src/main.rs"));
     let spawn_calls = main_src
         .matches("spawn_supervised_api_token_reload(")
         .count();
-    assert!(
-        spawn_calls >= 2,
-        "BOTH main.rs boot arms (fast crash-recovery + slow) must spawn the \
-         supervised API token reload task in the production region; found \
+    assert_eq!(
+        spawn_calls, 1,
+        "the single main.rs boot path must spawn the supervised API token \
+         reload task exactly once in the production region; found \
          {spawn_calls} call site(s)"
     );
-    // Each spawn must be gated on `enabled` — a disabled dev config
+    // The spawn must be gated on `enabled` — a disabled dev config
     // (empty token, dry-run) must never get a reload task.
-    for arm in ["api_auth_config_fast.enabled", "api_auth_config.enabled"] {
-        assert!(
-            main_src.contains(arm),
-            "the reload spawn must be gated on `{arm}` (disabled dev config \
-             gets no task)"
-        );
-    }
+    assert!(
+        main_src.contains("api_auth_config.enabled"),
+        "the reload spawn must be gated on `api_auth_config.enabled` \
+         (disabled dev config gets no task)"
+    );
 }
 
 #[test]

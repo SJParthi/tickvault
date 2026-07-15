@@ -163,3 +163,10 @@ variable "portal_git_sha" {
   type        = string
   default     = "unknown"
 }
+
+variable "daily_loss_alarm_inr" {
+  # = config/base.toml [risk] max_daily_loss_percent (2.0) × capital (1000000.0) = ₹20,000. Two sources of truth by necessity (terraform cannot read TOML); update BOTH together.
+  description = "Daily loss alarm threshold in INR (positive number; the daily-loss-breach alarm fires when tv_daily_pnl Minimum < -1 x this). Lockstep with config/base.toml [risk] max_daily_loss_percent x capital."
+  type        = number
+  default     = 20000
+}

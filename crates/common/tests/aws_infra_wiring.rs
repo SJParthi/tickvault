@@ -179,8 +179,10 @@ fn test_cloudwatch_operator_dashboard_exists() {
         "dashboard.tf must declare the operator CloudWatch dashboard"
     );
     // A few signal metrics that MUST be charted (and are in the scrape allowlist).
+    // (PR-C2, 2026-07-13: tv_realtime_guarantee_score replaced by the Groww
+    // lag gauge — the score widget retired with the PARKed SLO publisher.)
     for metric in &[
-        "tv_realtime_guarantee_score",
+        "tv_groww_exchange_lag_p99_seconds",
         "tv_questdb_disconnected_seconds",
         "tv_token_remaining_seconds",
         "tv_aggregator_seals_emitted_total",

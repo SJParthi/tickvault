@@ -101,6 +101,11 @@ pub(crate) const DAY_PARTITIONED_TABLES: &[&str] = &[
     "feed_scoreboard_daily",
     "feed_coverage_daily",
     "feed_episode_audit",
+    // BRUTEX-XVERIFY-01/02 (2026-07-12, §37): one row per divergent cell /
+    // one row per trading-day summary — same SEBI-audit class + DAY
+    // partitioning as cross_verify_1m_audit / feed_scoreboard_daily.
+    "brutex_crossverify_cell_audit",
+    "brutex_crossverify_daily",
     // SPOT1M-01/02 (2026-07-12, per-minute REST pipeline PR-2): one row per
     // fetched (minute, index) — ~1,125 rows/day (375 min × 3 IDX_I SIDs),
     // trivial disk; same DAY partitioning + retention class as the
@@ -136,6 +141,15 @@ pub(crate) const DAY_PARTITIONED_TABLES: &[&str] = &[
     // TF_VERIFY_MAX_AUDIT_ROWS_PER_RUN, normally ~0; same SEBI-audit class
     // + DAY partitioning as cross_verify_1m_audit; `feed` is in the DEDUP key.
     "tf_consistency_audit",
+    // AUDIT-06 / STORAGE-GAP-03 (2026-07-14, cluster-C order-side): one row
+    // per order lifecycle event / per P&L snapshot — the strict SEBI 5y
+    // order-audit class (disaster-recovery.md: "order_audit is the strict
+    // 5y SEBI-mandate table"): 90d hot in QuestDB, then the DAY sweep's
+    // detach→S3-archive leg owns the cold path exactly like the audit
+    // tables above. Tiny in dry-run (a handful of paper rows/day + 1 OnEod
+    // pnl heartbeat row); `feed` is in both DEDUP keys.
+    "order_audit",
+    "pnl_audit",
 ];
 
 /// Tables EXEMPT from retention sweeping — NEVER detached or dropped.
