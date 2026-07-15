@@ -49,10 +49,15 @@ const _: () = assert!(
 /// design also uses for the Groww per-request timeout.
 pub const CADENCE_RETRY_LATENCY_ALLOWANCE_MS: i64 = 1_500;
 
-/// Cross-fill freshness floor (design §5): a foreign snapshot is valid
-/// for the borrowing lane only when fetched at/after T − this — the
-/// window deliberately spans Dhan's PRE-close :55 chain and Groww's
-/// POST-close :00 burst.
+/// Cross-fill freshness floor (design §5): the BASE of the borrow
+/// window — a foreign snapshot is valid for the borrowing lane only
+/// when fetched at/after T − this. At anchor-ladder rung 0 the window
+/// spans Dhan's PRE-close :55 chain and Groww's POST-close :00 burst
+/// exactly; at rung ≥ 1 the Dhan chains pre-fire EARLIER
+/// (T − 5000 − rung·step), so the effective floor is the LENDER-aware
+/// `assembly::cross_fill_freshness_floor_ms` — the base widened to the
+/// Dhan lender's earliest scheduled chain slot (CADENCE-XFILL-RUNG-1,
+/// 2026-07-15); the Groww lender keeps this base.
 pub const CADENCE_CROSS_FILL_FRESHNESS_FLOOR_MS: i64 = 5_000;
 
 /// Number of Dhan chain in-cycle retry slots (≤1 per failed underlying,
