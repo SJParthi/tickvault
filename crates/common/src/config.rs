@@ -105,6 +105,12 @@ pub struct ApplicationConfig {
     /// section ⇒ DISABLED (fail-safe default off).
     #[serde(default)]
     pub spot_1m_rest: Spot1mRestConfig,
+    /// `[oms_reconcile]` — scheduled OMS order-book reconciliation loop
+    /// (2026-07-14): a timer arm in the trading pipeline periodically calls
+    /// `reconcile()` so OMS state converges with the Dhan order book.
+    /// Absent section ⇒ DISABLED (fail-safe default off).
+    #[serde(default)]
+    pub oms_reconcile: OmsReconcileConfig,
     /// `[dhan_data_api]` — shared Dhan Data-API REST pacing (operator
     /// pacing directive 2026-07-14): the process-wide token-bucket limiter
     /// every per-minute Dhan Data-API REST fire passes through (spot-1m
@@ -504,6 +510,74 @@ impl Spot1mRestConfig {
             bail!(
                 "spot_1m_rest.batch_interval_minutes ({}) must be within 1..=60",
                 self.batch_interval_minutes
+            );
+        }
+        Ok(())
+    }
+}
+
+/// `[oms_reconcile]` — scheduled OMS order-book reconciliation
+/// (2026-07-14): a `tokio::select!` timer arm in the trading pipeline
+/// periodically calls `reconcile()` so OMS state converges with the Dhan
+/// order book (the OMS-GAP-02 machinery gains its first scheduled caller).
+///
+/// Triple-gated fail-safe shape: this config defaults OFF (an absent
+/// `[oms_reconcile]` section keeps today's behaviour byte-identical), the
+/// OMS dry-run flag short-circuits `reconcile()` before any HTTP, and the
+/// trading-pipeline spawn itself is dhan-gated.
+#[derive(Debug, Clone, Deserialize)]
+pub struct OmsReconcileConfig {
+    /// Master switch. Default OFF (fail-safe) — an absent section or an
+    /// empty `[oms_reconcile]` section keeps the loop disabled.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Seconds between scheduled reconcile runs. Validated 60..=3600 at
+    /// boot — the 60s floor bounds any future live-mode order-book GET
+    /// rate to ≤1/min (≤375/session), trivially inside the Data-API budget.
+    #[serde(default = "default_oms_reconcile_interval_secs")]
+    pub interval_secs: u64,
+    /// Gate runs to [09:15, 15:30) IST on NSE trading days (Rule 3
+    /// market-hours-aware; holiday-correct via the trading calendar).
+    /// Default true.
+    #[serde(default = "default_oms_reconcile_trading_hours_only")]
+    pub trading_hours_only: bool,
+}
+
+/// Serde default for [`OmsReconcileConfig::interval_secs`] — 300 (5 min).
+fn default_oms_reconcile_interval_secs() -> u64 {
+    300
+}
+
+/// Serde default for [`OmsReconcileConfig::trading_hours_only`] — true.
+fn default_oms_reconcile_trading_hours_only() -> bool {
+    true
+}
+
+impl Default for OmsReconcileConfig {
+    /// Manual impl so `Default` matches the serde field defaults exactly
+    /// (a derived `Default` would zero `interval_secs` while an empty
+    /// `[oms_reconcile]` section deserializes it to 300).
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            interval_secs: default_oms_reconcile_interval_secs(),
+            trading_hours_only: default_oms_reconcile_trading_hours_only(),
+        }
+    }
+}
+
+impl OmsReconcileConfig {
+    /// Boot-time validation — the reconcile cadence must be a sane
+    /// in-session interval (60..=3600 seconds).
+    ///
+    /// # Errors
+    /// Returns a descriptive error when `interval_secs` is outside
+    /// `60..=3600`.
+    pub fn validate(&self) -> Result<()> {
+        if !(60..=3600).contains(&self.interval_secs) {
+            bail!(
+                "oms_reconcile.interval_secs ({}) must be within 60..=3600",
+                self.interval_secs
             );
         }
         Ok(())
@@ -2494,6 +2568,10 @@ impl ApplicationConfig {
         self.dhan_data_api.validate()?;
         self.spot_1m_rest.validate()?;
 
+        // 2026-07-14: scheduled OMS reconcile cadence must stay inside the
+        // 60..=3600s envelope — rejected at boot, BEFORE the pipeline spawns.
+        self.oms_reconcile.validate()?;
+
         // 2026-07-14 Dhan margin gate: the shared-account budget/self-cap
         // envelope (≤50% of the pooled balance, ≤10 req/sec) is rejected at
         // boot, BEFORE any gate could consult it.
@@ -3070,6 +3148,7 @@ mod tests {
             scoreboard: ScoreboardConfig::default(),
             brutex_crossverify: BrutexCrossverifyConfig::default(),
             spot_1m_rest: Spot1mRestConfig::default(),
+            oms_reconcile: OmsReconcileConfig::default(),
             dhan_data_api: DhanDataApiConfig::default(),
             option_chain_1m: OptionChain1mConfig::default(),
             groww_spot_1m: GrowwSpot1mConfig::default(),
@@ -4272,6 +4351,89 @@ mod tests {
     /// `[spot_1m_rest]` section is FAIL-SAFE default OFF — via `Default`,
     /// via a missing section, and via an empty section — and an explicit
     /// `enabled = true` (the `config/base.toml` shape) must round-trip.
+    #[test]
+    fn test_oms_reconcile_config_default_is_disabled() {
+        let d = OmsReconcileConfig::default();
+        assert!(
+            !d.enabled,
+            "oms_reconcile must default OFF (fail-safe; base.toml keeps it off too)"
+        );
+        assert_eq!(d.interval_secs, 300, "default cadence must be 5 minutes");
+        assert!(
+            d.trading_hours_only,
+            "default must gate to NSE trading hours"
+        );
+    }
+
+    #[test]
+    fn test_oms_reconcile_config_serde_defaults_and_round_trip() {
+        use figment::Figment;
+        use figment::providers::{Format, Toml};
+
+        #[derive(Deserialize)]
+        struct Wrapper {
+            #[serde(default)]
+            oms_reconcile: OmsReconcileConfig,
+        }
+        // Missing section entirely → disabled with full defaults, never an error.
+        let missing: Wrapper = Figment::new()
+            .merge(Toml::string("[other]\nx = 1\n"))
+            .extract()
+            .expect("missing [oms_reconcile] must default, not error");
+        assert!(!missing.oms_reconcile.enabled);
+        assert_eq!(missing.oms_reconcile.interval_secs, 300);
+        assert!(missing.oms_reconcile.trading_hours_only);
+        // Empty section (no keys) → disabled via the field-level defaults.
+        let empty: Wrapper = Figment::new()
+            .merge(Toml::string("[oms_reconcile]\n"))
+            .extract()
+            .expect("empty [oms_reconcile] must default, not error");
+        assert!(!empty.oms_reconcile.enabled);
+        assert_eq!(empty.oms_reconcile.interval_secs, 300);
+        // Explicit values round-trip.
+        let on: Wrapper = Figment::new()
+            .merge(Toml::string(
+                "[oms_reconcile]\nenabled = true\ninterval_secs = 120\ntrading_hours_only = false\n",
+            ))
+            .extract()
+            .expect("explicit [oms_reconcile] values must round-trip");
+        assert!(on.oms_reconcile.enabled);
+        assert_eq!(on.oms_reconcile.interval_secs, 120);
+        assert!(!on.oms_reconcile.trading_hours_only);
+    }
+
+    #[test]
+    fn test_oms_reconcile_interval_validation_bounds() {
+        let mut cfg = OmsReconcileConfig {
+            interval_secs: 59,
+            ..OmsReconcileConfig::default()
+        };
+        assert!(cfg.validate().is_err(), "59s is below the 60s floor");
+        cfg.interval_secs = 60;
+        assert!(cfg.validate().is_ok(), "60s floor is inclusive");
+        cfg.interval_secs = 3600;
+        assert!(cfg.validate().is_ok(), "3600s ceiling is inclusive");
+        cfg.interval_secs = 3601;
+        assert!(cfg.validate().is_err(), "3601s is above the ceiling");
+    }
+
+    #[test]
+    fn test_application_config_validate_rejects_bad_reconcile_interval() {
+        let mut config = make_valid_config();
+        config.oms_reconcile.interval_secs = 59;
+        let err = config
+            .validate()
+            .expect_err("59s reconcile interval must fail whole-config validation");
+        assert!(
+            err.to_string().contains("oms_reconcile.interval_secs"),
+            "error must name the offending key, got: {err}"
+        );
+        config.oms_reconcile.interval_secs = 300;
+        config
+            .validate()
+            .expect("default reconcile interval must pass whole-config validation");
+    }
+
     #[test]
     fn test_spot_1m_rest_config_defaults_off_and_round_trips() {
         use figment::Figment;
