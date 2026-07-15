@@ -88,6 +88,12 @@ pub mod day_ohlc_orchestrator;
 // cross-check retired under 4-IDX_I LOCKED_UNIVERSE (operator lock 2026-05-15).
 // Bhavcopy is NSE_FNO-only; no F&O subscriptions remain to cross-check.
 pub mod boot_helpers;
+/// Once-per-trading-day delivery markers for daily scheduled tasks
+/// (Telegram cleanliness overhaul, coordinator-relayed directive
+/// 2026-07-15). Fail-open advisory files under `data/state/daily/` —
+/// the 15:40 timeframe check's catch-up arm consults them so a
+/// post-15:40 restart never re-fires an already-delivered daily card.
+pub mod daily_task_marker;
 /// Dhan runtime activation watcher (PR-2) — dormant supervisor that keeps the
 /// Dhan lane's running flag honest across runtime toggles and enforces the
 /// Dhan-disable safety gate at the supervisor layer (operator 2026-06-21/24).
@@ -119,6 +125,10 @@ pub mod groww_watch_paths;
 /// Shared per-seal routing for BOTH feeds (Dhan + Groww) — the single
 /// `route_seal` body the two `on_seal` call sites invoke (C2, behavior-preserving).
 pub mod seal_routing;
+/// Pure shutdown classifier (Telegram cleanliness overhaul, 2026-07-15):
+/// signal kind × runtime source × IST clock × trading calendar →
+/// `ShutdownClass`. Fails toward ExternalStop (loud) on any doubt.
+pub mod shutdown_class;
 // PR #4 (2026-05-19): depth-20 / depth-200 modules DELETED (operator-locked
 // per websocket-connection-scope-lock.md — 4-IDX_I uses 1 main-feed conn
 // + 1 order-update conn only).

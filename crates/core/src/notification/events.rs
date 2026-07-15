@@ -142,6 +142,28 @@ pub enum DispatchPolicy {
     Default,
 }
 
+/// Classified cause of a graceful shutdown (Telegram cleanliness overhaul,
+/// coordinator-relayed directive 2026-07-15).
+///
+/// Every restart used to pair a boot bubble with a `[MEDIUM] Shutdown
+/// initiated` page — even the daily scheduled 4:30 PM IST stop. The app-side
+/// classifier (`classify_shutdown` in the app crate) derives this class from
+/// the signal kind, the runtime source (AWS vs local), the IST clock, and
+/// the trading calendar. Fail-safe direction: ANY classifier doubt lands
+/// [`Self::ExternalStop`] — today's Medium loudness, never quieter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShutdownClass {
+    /// The daily scheduled stop — the 4:30 PM IST weekday auto-stop window,
+    /// or the holiday-gate self-stop on a non-trading day. Quiet (Low).
+    ScheduledStop,
+    /// A local operator stop (Ctrl+C / local SIGTERM from `make stop` or a
+    /// container stop). Quiet (Low) — the operator did it themselves.
+    OperatorStop,
+    /// Anything else — deploy restart, budget killswitch, manual AWS stop
+    /// outside the daily window. Stays Medium and loud.
+    ExternalStop,
+}
+
 /// Which boot path was used to bring the WebSocket pool online.
 ///
 /// Per operator policy 2026-05-04 + `boot_helpers::should_fast_boot`:
@@ -1044,8 +1066,16 @@ pub enum NotificationEvent {
     // ONLY by the Dhan tick pipeline; Groww stall detection is
     // FEED-STALL-01 + the market-hours-liveness alarm. See
     // .claude/rules/project/dhan-rest-only-noise-lock-2026-07-14.md.
-    /// Graceful shutdown initiated.
-    ShutdownInitiated,
+    /// Graceful shutdown initiated. The payload classifies WHY (Telegram
+    /// cleanliness overhaul, 2026-07-15): scheduled / operator stops render
+    /// one quiet Low line; an unexpected external stop stays Medium and
+    /// loud. Crash paths still emit nothing (the boot-heartbeat alarm + the
+    /// scoreboard process-death reconciler own that class, unchanged).
+    ShutdownInitiated {
+        /// Classified stop cause. The app-side classifier fails TOWARD
+        /// [`ShutdownClass::ExternalStop`] on any doubt — never quieter.
+        class: ShutdownClass,
+    },
 
     /// Application stopped.
     ShutdownComplete,
@@ -1648,36 +1678,38 @@ pub struct RestLegScoreLine {
 /// are pinned to 1000 by their own unit tests).
 const VERDICT_LAG_CLOCK_FLOOR_MS: i64 = 1000;
 
-/// The scorecard's ONE decision (Telegram commandment 8): who won today.
-/// Tiebreak ladder — feed-off no-contest (round 4: a switched-off feed's
-/// measured zeros are a one-horse race, never a win for the other) →
-/// exclusive minutes → worst-1% delay beyond the clock floor (only when
-/// BOTH are measured AND the delta exceeds [`VERDICT_LAG_CLOCK_FLOOR_MS`];
-/// a −1 sentinel never decides, and a sub-floor delta is clock asymmetry,
-/// not speed) → broker-blamed incidents → even day.
+/// The scorecard's ONE decision (Telegram commandment 8): who won today —
+/// returned as `(header emoji, one sentence)` for the verdict-FIRST line
+/// (Telegram cleanliness overhaul, 2026-07-15). Tiebreak ladder unchanged
+/// from the 2026-07-10/11 reviews: feed-off no-contest (round 4: a
+/// switched-off feed's measured zeros are a one-horse race, never a win
+/// for the other) → exclusive minutes → worst-1% delay beyond the clock
+/// floor (only when BOTH are measured AND the delta exceeds
+/// [`VERDICT_LAG_CLOCK_FLOOR_MS`]; a −1 sentinel never decides, and a
+/// sub-floor delta is clock asymmetry, not speed) → broker-blamed
+/// incidents → even day. "No contest" / feed-off wording appears ONLY in
+/// this line.
 fn scorecard_verdict(
     dhan: &FeedScoreLine,
     groww: &FeedScoreLine,
     dhan_feed_off: bool,
     groww_feed_off: bool,
-) -> String {
+) -> (&'static str, String) {
     // Rung 0 (round 4, 2026-07-10): a feed switched OFF for the day makes
     // every comparison rung a one-horse race — no winner is declared.
     if dhan_feed_off && groww_feed_off {
-        return "\u{1f91d} Verdict: not comparable — both feeds were switched \
-                off today, no contest."
-            .to_string();
+        return (
+            "\u{1f4ca}",
+            "both feeds were off today, no contest.".to_string(),
+        );
     }
     if dhan_feed_off || groww_feed_off {
-        let off = if dhan_feed_off {
-            &dhan.name
-        } else {
+        let on = if dhan_feed_off {
             &groww.name
+        } else {
+            &dhan.name
         };
-        return format!(
-            "\u{1f91d} Verdict: not comparable — {off} was switched off \
-             today, no contest."
-        );
+        return ("\u{1f4ca}", format!("{on}-only day."));
     }
     // Rung 1: exclusive coverage minutes.
     if dhan.exclusive_minutes >= 0
@@ -1689,9 +1721,12 @@ fn scorecard_verdict(
         } else {
             (groww, dhan)
         };
-        return format!(
-            "\u{1f3c6} Verdict: {} won today — {} exclusive minutes vs {}.",
-            w.name, w.exclusive_minutes, l.exclusive_minutes
+        return (
+            "\u{1f3c6}",
+            format!(
+                "{} won today ({} vs {} solo minutes).",
+                w.name, w.exclusive_minutes, l.exclusive_minutes
+            ),
         );
     }
     // Rung 2: worst-1% delay (lower wins; only when both are measured AND
@@ -1699,7 +1734,7 @@ fn scorecard_verdict(
     // round 1, 2026-07-11: Dhan's p99 physically cannot read below ~1s, so
     // a raw compare would crown Groww "faster" on every healthy day from
     // clock asymmetry, exactly the sub-floor comparison the runbook bans).
-    // A sub-floor delta falls through to the incident rung / "Even day".
+    // A sub-floor delta falls through to the incident rung / "even day".
     if dhan.lag_p99_ms >= 0
         && groww.lag_p99_ms >= 0
         && dhan.lag_p99_ms.saturating_sub(groww.lag_p99_ms).abs() > VERDICT_LAG_CLOCK_FLOOR_MS
@@ -1709,24 +1744,21 @@ fn scorecard_verdict(
         } else {
             (groww, dhan)
         };
-        return format!(
-            "\u{1f3c6} Verdict: {} won today — faster prices beyond the clock floor \
-             (worst 1% delay {} vs {}).",
-            w.name,
-            render_ms(w.lag_p99_ms),
-            render_ms(l.lag_p99_ms)
+        return (
+            "\u{1f3c6}",
+            format!(
+                "{} won today (faster prices beyond the clock floor: worst 1% delay {} vs {}).",
+                w.name,
+                render_ms(w.lag_p99_ms),
+                render_ms(l.lag_p99_ms)
+            ),
         );
     }
-    // Rung 3: fewer broker-caused INCIDENTS wins — since PR-B the broker
-    // blame tally covers drops + stalls (restarts are always ours, so they
-    // never inflate it), and the wording must match what is compared: on a
-    // stall-heavy zero-drop day "fewer broker-caused drops (0 vs 5)" would
-    // contradict the card's own Drops line (review round 1, charter §D
-    // commandment 6 — the incident-split line was already reworded for
-    // exactly this reason). The blame tallies must BOTH be measured too —
-    // a -1 sentinel would otherwise "win" (-1 < N) and render as gibberish
-    // (hostile review 2026-07-10); sentinel days fall through to
-    // "Even day".
+    // Rung 3: fewer broker-caused INCIDENTS wins — the broker blame tally
+    // covers drops + stalls (restarts are always ours, so they never
+    // inflate it). The blame tallies must BOTH be measured — a -1 sentinel
+    // would otherwise "win" (-1 < N) and render as gibberish (hostile
+    // review 2026-07-10); sentinel days fall through to "even day".
     if dhan.drops_market >= 0
         && groww.drops_market >= 0
         && dhan.blame_broker >= 0
@@ -1738,12 +1770,15 @@ fn scorecard_verdict(
         } else {
             (groww, dhan)
         };
-        return format!(
-            "\u{1f3c6} Verdict: {} won today — fewer broker-caused incidents ({} vs {}).",
-            w.name, w.blame_broker, l.blame_broker
+        return (
+            "\u{1f3c6}",
+            format!(
+                "{} won today (fewer broker-caused incidents: {} vs {}).",
+                w.name, w.blame_broker, l.blame_broker
+            ),
         );
     }
-    "\u{1f91d} Verdict: Even day.".to_string()
+    ("\u{1f4ca}", "even day.".to_string())
 }
 
 /// Renders a millisecond delay for the scorecard: `-1` = honest "not
@@ -1760,62 +1795,223 @@ fn render_ms(ms: i64) -> String {
     format!("{ms} ms")
 }
 
-/// Renders one official-minute-candle pull digest line (Groww REST plan
-/// PR-5, operator Quote 2). Every number is measured; `-1` sentinels
-/// render "not measured yet" / "(pull counts not recorded yet)" — never a
-/// fabricated zero (audit Rule 11). Plain-English, no wire slugs.
-fn rest_leg_line(l: &RestLegScoreLine) -> String {
-    let label = format!("{} {}", l.feed, l.leg);
-    // Nothing measured for this feed/family at all → one honest phrase.
-    if l.ok_fetches < 0 && l.close_samples < 0 {
-        return format!("{label}: not measured yet");
-    }
-    let mut parts: Vec<String> = Vec::new();
-    if l.ok_fetches >= 0 {
-        parts.push(format!(
-            "{} pulls OK, {} failed",
-            render_count(l.ok_fetches),
-            render_count(l.failed_fetches)
-        ));
-    }
-    if l.close_p50_ms >= 0 {
-        let mut freshness = format!(
-            "typical {} / worst 1% {} / slowest {} after close",
-            render_ms(l.close_p50_ms),
-            render_ms(l.close_p99_ms),
-            render_ms(l.close_max_ms)
-        );
-        if l.ok_fetches < 0 {
-            // Latency measured from the stored candles themselves while
-            // this feed's per-pull records are not written yet — say so.
-            freshness.push_str(" (pull counts not recorded yet)");
+/// Compact IST date for card headers (`"2026-07-14"` → `"14 Jul"`) so a
+/// past-day backfill / forced-run card is distinguishable from today's at
+/// a glance (G3, fix round 2 — the documented `TICKVAULT_SCOREBOARD_DATE`
+/// / `TICKVAULT_TF_VERIFY_DATE` triage flows produce past-day cards that
+/// previously rendered date-less). Fail-soft: an unparsable date renders
+/// verbatim — never dropped, never fabricated.
+fn render_compact_date_ist(date: &str) -> String {
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let mut parts = date.splitn(3, '-');
+    let (Some(_year), Some(month), Some(day)) = (parts.next(), parts.next(), parts.next()) else {
+        return date.to_string();
+    };
+    let day_trimmed = day.trim_start_matches('0');
+    match month.parse::<usize>() {
+        Ok(m) if (1..=12).contains(&m) && !day_trimmed.is_empty() => {
+            format!("{day_trimmed} {}", MONTHS[m - 1])
         }
-        parts.push(freshness);
-    } else if l.close_samples == 0 && l.ok_fetches == 0 {
-        parts.push("freshness not measurable (no successful pull)".to_string());
+        _ => date.to_string(),
+    }
+}
+
+/// Compact per-leg label for the pulls segment: the digest leg display
+/// names ("spot candles" / "option chain" / "option contracts") shorten
+/// to one word so the two feed lines never wrap; an unknown future leg
+/// keeps its full plain-English name (never a wire slug — commandment 2).
+fn compact_leg_label(leg: &str) -> &str {
+    match leg {
+        "spot candles" => "spot",
+        "option chain" => "chain",
+        "option contracts" => "contracts",
+        other => other,
+    }
+}
+
+/// PER-LEG official-minute-candle pull segment for ONE feed (F3,
+/// 2026-07-15 fix round): renders each MEASURED leg compactly —
+/// `pulls spot 735/735 (1.8s), chain 733/735 (2.1s) ✅` — with one
+/// overall mark and the never-recovered note. The bracketed figure is
+/// the leg's worst-1% (p99) seconds-after-close pull delay (G7, fix
+/// round 2 — restores the operator's Quote-2 "how many seconds
+/// precisely" answer on the card in ONE compact figure per leg). Legs
+/// on the documented latency-only fallback source (counts `-1`,
+/// latency MEASURED — the `spot_1m_rest` forensics-writer-outage /
+/// pre-2026-07-14 arm) render count-less as `spot (1.8s)` (G6 — never
+/// dropped, never logged "not measured"). Legs with NOTHING measured
+/// render NOTHING on the card (the operator's 2026-07-15 escalation
+/// demanded suppressing unmeasured lines on the phone); `None` when no
+/// leg for the feed carries any measurement.
+///
+/// RULE-CONTRACT TENSION, recorded deliberately (see the plan file's
+/// Observability section): `dual-feed-scoreboard-error-codes.md` §2b
+/// mandates the four canonical feed/leg pairs ALWAYS render, with an
+/// absent source reading "not measured yet" — and, with
+/// `rest-1m-pipeline-error-codes.md` §3, a per-leg p50/p99/max delay
+/// digest. This card intentionally deviates per the operator's direct
+/// 2026-07-15 cleanliness escalation — unmeasured pairs move to the
+/// day's LOGS (`feed_scoreboard_boot::log_rest_leg_measurement_gaps`,
+/// fired from the aggregation path on EVERY run) and the delay digest folds to
+/// the ONE p99 figure above — PENDING the rule-file supersession the
+/// operator must land with a dated quote. Rule files are not editable
+/// in this PR.
+fn render_pulls_per_leg(rest_legs: &[RestLegScoreLine], feed: &str) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    let mut gaps = 0i64;
+    // R2 (fix round 3): the verdict mark is three-state and never
+    // fabricated — ✅ only when EVERY rendered leg is FULLY counted
+    // (ok >= 0 AND failed >= 0) and failure-free; ⚠️ when any counted
+    // failure / never-recovered gap exists (real trouble wins over
+    // partial data); NO mark when any rendered leg is latency-only or
+    // failed-count-unmeasured (the spot_1m_rest fallback exists exactly
+    // for forensics-writer outages, where failures are invisible — a
+    // green check there was a Rule-11 false-OK).
+    let mut any_failure = false;
+    let mut any_unmeasured = false;
+    for l in rest_legs {
+        if !l.feed.eq_ignore_ascii_case(feed) {
+            continue;
+        }
+        // p99 seconds-after-close, rendered only when genuinely measured
+        // (samples > 0 guards a zero-sample day from fabricating "0.0s").
+        let p99 = (l.close_p99_ms >= 0 && l.close_samples > 0)
+            .then(|| render_compact_secs(l.close_p99_ms));
+        if l.ok_fetches >= 0 {
+            if l.failed_fetches >= 0 {
+                // Fully counted leg: the only shape that may render x/y.
+                let total = l.ok_fetches.saturating_add(l.failed_fetches);
+                let counts = format!("{} {}/{total}", compact_leg_label(&l.leg), l.ok_fetches);
+                parts.push(match p99 {
+                    Some(secs) => format!("{counts} ({secs})"),
+                    None => counts,
+                });
+                if l.ok_fetches != total {
+                    any_failure = true;
+                }
+            } else {
+                // Failure count unmeasured (-1 sentinel): "x/x" would
+                // imply zero failures — render the ok count alone.
+                let counts = format!("{} {} ok", compact_leg_label(&l.leg), l.ok_fetches);
+                parts.push(match p99 {
+                    Some(secs) => format!("{counts} ({secs})"),
+                    None => counts,
+                });
+                any_unmeasured = true;
+            }
+        } else if let Some(secs) = p99 {
+            // Latency-only fallback leg (G6): the delay WAS measured —
+            // render it count-less instead of dropping the measurement.
+            parts.push(format!("{} ({secs})", compact_leg_label(&l.leg)));
+            any_unmeasured = true;
+        }
+        if l.named_gaps > 0 {
+            gaps = gaps.saturating_add(l.named_gaps);
+        }
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    if gaps > 0 {
+        any_failure = true;
+    }
+    let mut seg = if any_failure {
+        format!("pulls {} \u{26a0}\u{fe0f}", parts.join(", "))
+    } else if any_unmeasured {
+        // Partially-unmeasured day: no verdict mark — the numbers shown
+        // are honest, but a clean/degraded verdict is unknowable.
+        format!("pulls {}", parts.join(", "))
     } else {
-        parts.push("freshness not measured yet".to_string());
+        format!("pulls {} \u{2705}", parts.join(", "))
+    };
+    if gaps > 0 {
+        seg.push_str(&format!("; {gaps} never recovered \u{26a0}\u{fe0f}"));
     }
-    let mut line = format!("{label}: {}", parts.join(" — "));
-    if l.late_recovered > 0 {
-        line.push_str(&format!(
-            "; {} recovered late",
-            render_count(l.late_recovered)
-        ));
+    Some(seg)
+}
+
+/// Compact tick-count renderer for the aligned feed stat line: millions
+/// render as `1.94M` (the line must stay short enough to never wrap);
+/// smaller measured counts keep thousands separators (commandment 6).
+fn render_compact_count(v: i64) -> String {
+    if v >= 1_000_000 {
+        #[allow(clippy::cast_precision_loss)]
+        // APPROVED: display-only division of a bounded daily tick total.
+        return format!("{:.2}M", v as f64 / 1_000_000.0);
     }
-    if l.rate_limited_hits > 0 {
-        line.push_str(&format!(
-            "; {} rate-limit hits",
-            render_count(l.rate_limited_hits)
-        ));
+    render_count(v)
+}
+
+/// Compact delay renderer for the aligned feed stat line: always seconds
+/// with one decimal (`1.4s` / `0.4s`) so the two feed lines stay aligned.
+fn render_compact_secs(ms: i64) -> String {
+    #[allow(clippy::cast_precision_loss)]
+    // APPROVED: display-only division of a bounded daily lag value.
+    let secs = ms.max(0) as f64 / 1000.0;
+    format!("{secs:.1}s")
+}
+
+/// One aligned per-feed stat line for the daily scorecard (2026-07-15
+/// verdict-first redesign). `<code>`-wrapped (Telegram renders monospace)
+/// with the feed name padded to `name_width` so the two lines align.
+/// Unmeasured `-1` fields are OMITTED — never "?", never "not measured"; a
+/// feed with ZERO measured fields renders one honest plain line instead
+/// (never silent).
+fn aligned_feed_line(f: &FeedScoreLine, name_width: usize, pulls: Option<String>) -> String {
+    let mut segments: Vec<String> = Vec::new();
+    if f.ticks >= 0 {
+        segments.push(format!("{} ticks", render_compact_count(f.ticks)));
     }
-    if l.named_gaps > 0 {
-        line.push_str(&format!(
-            "; {} never recovered \u{26a0}\u{fe0f}",
-            render_count(l.named_gaps)
-        ));
+    if f.lag_p99_ms >= 0 {
+        segments.push(format!("delay {}", render_compact_secs(f.lag_p99_ms)));
     }
-    line
+    if f.drops_market >= 0 {
+        segments.push(format!("drops {}", f.drops_market));
+    }
+    if let Some(p) = pulls {
+        segments.push(p);
+    }
+    if segments.is_empty() {
+        // Wholly unmeasured feed: honest, not silent (audit Rule 11).
+        return format!("{}: no numbers recorded today \u{26a0}\u{fe0f}", f.name);
+    }
+    let padded = format!("{:<name_width$}", f.name);
+    format!("<code>{padded}: {}</code>", segments.join(" \u{b7} "))
+}
+
+/// One feed's segment of the optional `Incidents:` line — total blamed
+/// incidents with the non-zero blame split in brackets, plus stall /
+/// restart counts when non-zero. `-1` sentinels are treated as
+/// not-measured and OMITTED from the tally (never rendered).
+fn incident_segment(f: &FeedScoreLine) -> String {
+    let broker = f.blame_broker.max(0);
+    let ours = f.blame_ours.max(0);
+    let unclear = f.blame_unclear.max(0);
+    let total = broker + ours + unclear;
+    let mut split: Vec<String> = Vec::new();
+    if broker > 0 {
+        split.push(format!("broker {broker}"));
+    }
+    if ours > 0 {
+        split.push(format!("ours {ours}"));
+    }
+    if unclear > 0 {
+        split.push(format!("unclear {unclear}"));
+    }
+    let mut s = if split.is_empty() {
+        format!("{} {total}", f.name)
+    } else {
+        format!("{} {total} ({})", f.name, split.join(" / "))
+    };
+    if f.stalls > 0 {
+        s.push_str(&format!(" \u{b7} stalls {}", f.stalls));
+    }
+    if f.restarts > 0 {
+        s.push_str(&format!(" \u{b7} restarts {}", f.restarts));
+    }
+    s
 }
 
 /// Renders a `-1`-sentinel count: honest "?" instead of a fabricated zero.
@@ -2556,12 +2752,28 @@ impl NotificationEvent {
                 // L6: wording derives from status_label — the verifier's
                 // flush-adjusted verdict — never re-derived from counts.
                 if status_label == "pass" {
+                    // 2026-07-15 cleanliness overhaul: a green daily check
+                    // is ONE line — the H1 tail carve-out rides inline.
+                    let candles = usize::try_from(*buckets_compared)
+                        .map(format_with_commas)
+                        .unwrap_or_else(|_| buckets_compared.to_string());
+                    let instruments_fmt = usize::try_from(*instruments)
+                        .map(format_with_commas)
+                        .unwrap_or_else(|_| instruments.to_string());
+                    let tail_inline = if *tail_unsealed > 0 {
+                        format!(" ({tail_unsealed} end-of-day candles unverified)")
+                    } else {
+                        String::new()
+                    };
+                    // G3 (fix round 2): the one-liner ALWAYS carries the
+                    // compact verified date (the run's Dhan-side target
+                    // day — the run's identity date) so a forced
+                    // TICKVAULT_TF_VERIFY_DATE past-day backfill's PASS
+                    // card is distinguishable from today's daily check.
+                    let date = render_compact_date_ist(dhan_date_ist);
                     format!(
-                        "\u{2705} <b>Daily timeframe check @ 3:40 PM IST — PASS</b>\n\
-                         Dhan day: {dhan_date_ist} | Groww day: {groww_date_ist}\n\
-                         Instruments: {instruments} | Candles compared: {buckets_compared}\n\
-                         Every 2-minute-to-4-hour candle matches its 1-minute \
-                         building blocks exactly.{tail_note}"
+                        "\u{2705} Timeframe check 3:40 PM \u{b7} {date} — {candles} candles \
+                         across {instruments_fmt} instruments, all match.{tail_inline}"
                     )
                 } else if status_label == "no_data" {
                     format!(
@@ -3032,7 +3244,7 @@ impl NotificationEvent {
                 trading_date_ist,
                 dhan,
                 groww,
-                session_minutes,
+                session_minutes: _,
                 partial_coverage,
                 degraded,
                 early_run,
@@ -3042,185 +3254,96 @@ impl NotificationEvent {
                 rest_legs,
                 rest_legs_read_failed,
             } => {
-                // Operator-charter §G wording: plain English, emoji status,
-                // IST 12-hour time, specific numbers, ONE decision (the
-                // verdict line), no library names, no file paths. −1
-                // sentinels render honestly ("?" / "not measured yet") —
-                // never fabricated zeros (audit Rule 11).
-                let streaming_line = |f: &FeedScoreLine| -> String {
-                    if f.streaming_minutes < 0 || *session_minutes <= 0 {
-                        return "unknown".to_string();
-                    }
-                    let ok = f.streaming_minutes.saturating_mul(100)
-                        >= session_minutes.saturating_mul(99);
-                    let mark = if ok { "\u{2705}" } else { "\u{26a0}\u{fe0f}" };
-                    format!(
-                        "{} of {} min {}",
-                        f.streaming_minutes, session_minutes, mark
-                    )
-                };
-                // The who-caused-them split covers ALL of the day's headline
-                // incidents (drops + stalls + restarts), so it lives on its
-                // OWN line, decoupled from the drops count — a day with 0
-                // drops and 1 restart must never read "0 (ours 1)" (hostile
-                // review 2026-07-10).
-                let incident_split = |f: &FeedScoreLine| -> String {
-                    format!(
-                        "broker {} / ours {} / unclear {}",
-                        render_count(f.blame_broker),
-                        render_count(f.blame_ours),
-                        render_count(f.blame_unclear)
-                    )
-                };
-                // Groww REST plan PR-5 (operator Quote 2, 2026-07-13): the
-                // official minute-candle pull digest — one plain-English
-                // line per feed/pull-family with the MEASURED
-                // seconds-after-close numbers. An empty vec (older callers
-                // / tests) omits the section entirely; a `-1` sentinel
-                // line renders "not measured yet", never a fabricated
-                // freshness (Rule 11).
-                let rest_section = if rest_legs.is_empty() {
-                    String::new()
+                // Telegram cleanliness overhaul (2026-07-15): verdict line
+                // FIRST (one emoji + one sentence), then one aligned
+                // `<code>` stat line per feed (unmeasured `-1` fields are
+                // OMITTED — never "?", never "not measured"), an optional
+                // incidents line, and AT MOST one caveat line. The six
+                // explanatory footnotes are deleted; the dropped per-leg
+                // pull freshness / exclusive-minute / streaming detail
+                // stays in the day's stored records and the portal.
+                let caveat =
+                    *partial_coverage || *degraded || *restart_partial || *rest_legs_read_failed;
+                let (verdict_emoji, verdict_sentence) =
+                    scorecard_verdict(dhan, groww, *dhan_feed_off, *groww_feed_off);
+                // A caveat day renders the warning emoji up front — the
+                // verdict sentence itself is unchanged (still ONE decision).
+                let emoji = if caveat {
+                    "\u{26a0}\u{fe0f}"
                 } else {
-                    let mut s = String::from(
-                        "Official minute candles — how fast after each \
-                         minute closed:\n",
-                    );
-                    for l in rest_legs {
-                        s.push_str("  ");
-                        s.push_str(&rest_leg_line(l));
-                        s.push('\n');
-                    }
-                    s
+                    verdict_emoji
                 };
-                let mut footnotes = String::new();
-                if *rest_legs_read_failed {
-                    footnotes.push_str(
-                        "\n\u{26a0}\u{fe0f} Today's minute-candle pull records could \
-                         not be read while building this card — the candle-pull \
-                         lines may under-count or read \u{201c}not measured \
-                         yet\u{201d}.",
-                    );
-                }
-                if *early_run {
-                    footnotes.push_str(
-                        "\n\u{26a0}\u{fe0f} This card was produced early on operator \
-                         request — it covers the day only up to the run time; \
-                         re-run after close for the full-day card.",
-                    );
-                }
-                if *partial_coverage {
-                    // Honest PR-1 cause (hostile review 2026-07-10): this
-                    // flag flips on READ/WRITE failures while building the
-                    // card — NOT on "the app was down part of the session"
-                    // (restart detection is a later upgrade).
-                    footnotes.push_str(
-                        "\n\u{26a0}\u{fe0f} Some of today's records could not be read \
-                         while building this card — numbers shown as \u{201c}?\u{201d} \
-                         are missing, and the rest may under-count.",
-                    );
-                }
-                if *degraded {
-                    footnotes.push_str(
-                        "\n\u{26a0}\u{fe0f} Some connection events could not be recorded \
-                         today — treat the drop counts as a minimum, not a truth.",
-                    );
-                }
-                if *restart_partial {
-                    // Round-3 honesty fix: the persisted row is stamped
-                    // partial on a restart day — the card must carry the
-                    // same caveat, not stay silent.
-                    footnotes.push_str(
-                        "\n\u{26a0}\u{fe0f} The app restarted during the day — records \
-                         from before the restart may under-count, so today's \
-                         numbers are a floor, not a truth.",
-                    );
-                }
-                for (off, line) in [(dhan_feed_off, dhan), (groww_feed_off, groww)] {
+                let early = if *early_run { " (early run)" } else { "" };
+                // G3 (fix round 2): the header ALWAYS carries the compact
+                // trading date — a past-day backfill/rerun card
+                // (TICKVAULT_SCOREBOARD_DATE) is otherwise
+                // indistinguishable from today's and claims "won today".
+                let date = render_compact_date_ist(trading_date_ist);
+                let mut lines: Vec<String> = Vec::new();
+                lines.push(format!(
+                    "{emoji} <b>Feed scorecard 3:45 PM \u{b7} {date}</b> \u{2014} \
+                     {verdict_sentence}{early}"
+                ));
+                // G8 (fix round 2): a broken pull-record READ renders an
+                // explicit token on the feed lines (incl. the feed-off
+                // line) — never silently omitted; previously only the
+                // shared floor caveat fired, indistinguishable from
+                // "no pull data exists" on the (permanent) Dhan
+                // feed-off day.
+                let pulls_for = |name: &str| -> Option<String> {
+                    if *rest_legs_read_failed {
+                        Some("pulls: records unreadable \u{26a0}\u{fe0f}".to_string())
+                    } else {
+                        render_pulls_per_leg(rest_legs, name)
+                    }
+                };
+                let name_width = dhan.name.chars().count().max(groww.name.chars().count());
+                for (off, f) in [(dhan_feed_off, dhan), (groww_feed_off, groww)] {
                     if *off {
-                        // Round-4 fix: a switched-off feed's day is a
-                        // one-horse race — say so and keep it out of the
-                        // month tally (its row is stamped 'feed_off').
-                        footnotes.push_str(&format!(
-                            "\n\u{26a0}\u{fe0f} {} was switched off today — no contest; \
-                             this day does not count toward the month verdict.",
-                            line.name
-                        ));
+                        // A deliberately-switched-off feed is ONE honest
+                        // line — never a wall of zeros, never a winner.
+                        // F2 (2026-07-15 fix round): the OFF line still
+                        // carries the pull digest when pull data exists —
+                        // on current prod every day is a Dhan feed-off day
+                        // (live WS retired) while the Dhan spot-1m/chain
+                        // REST pulls are the operator's most-watched
+                        // signal. Omitted only when there are genuinely no
+                        // measured pull rows for the feed.
+                        let mut off_line = format!("{}: OFF today (excluded from verdict)", f.name);
+                        if let Some(p) = pulls_for(&f.name) {
+                            off_line.push_str(&format!(" \u{b7} {p}"));
+                        }
+                        lines.push(off_line);
+                    } else {
+                        lines.push(aligned_feed_line(f, name_width, pulls_for(&f.name)));
                     }
                 }
-                // Scoreboard PR-C (2026-07-11): delay is MEASURED — the day
-                // lag histograms are live. The footnote carries the
-                // resolution asymmetry honestly: Dhan's whole-second price
-                // clock (≥1 s floor) vs Groww's millisecond clock read one
-                // step after the wire (the sidecar writes each price down
-                // the instant it arrives). An unmeasured side (backfill
-                // re-run / too few samples) renders "not measured yet" with
-                // the honest cause — the retired PR-1 "next upgrade" claim
-                // never appears. The gate keys on EITHER feed (review
-                // round 1, 2026-07-11): a Dhan-off / thin-Dhan day with a
-                // measured Groww delay must never assert "Delay could not
-                // be measured today" under a card showing real Groww
-                // milliseconds (Rule-11 self-contradiction).
-                if dhan.lag_p50_ms >= 0
-                    || dhan.lag_p99_ms >= 0
-                    || groww.lag_p50_ms >= 0
-                    || groww.lag_p99_ms >= 0
-                {
-                    footnotes.push_str(
-                        "\nNote: Dhan's price clock ticks in whole seconds, so its \
-                         delay can never read below about 1 second; Groww's delay \
-                         is millisecond-precise, measured where its helper first \
-                         writes each price down (one step after the wire).",
-                    );
-                } else {
-                    footnotes.push_str(
-                        "\nDelay could not be measured today (a re-run for a past \
-                         day, or too few prices) — it reads \u{201c}not measured \
-                         yet\u{201d}.",
+                // Incidents line: rendered ONLY when any blame/stall/
+                // restart count is positive (a clean day carries no
+                // incident noise; `-1` sentinels never count).
+                let any_incident = [dhan, groww].iter().any(|f| {
+                    f.blame_broker > 0
+                        || f.blame_ours > 0
+                        || f.blame_unclear > 0
+                        || f.stalls > 0
+                        || f.restarts > 0
+                });
+                if any_incident {
+                    lines.push(format!(
+                        "Incidents: {} | {}",
+                        incident_segment(dhan),
+                        incident_segment(groww)
+                    ));
+                }
+                if caveat {
+                    // Exactly ONE caveat line, only when a partial/degraded
+                    // flag is true (Rule 11: counts stay a floor, honestly).
+                    lines.push(
+                        "Counts are a floor \u{2014} some of today's records could not be read."
+                            .to_string(),
                     );
                 }
-                // Scoreboard PR-B (2026-07-10): the PR-1 stall + Groww-drops
-                // sentinel footnotes are RETIRED — stall episodes are
-                // measured from this deploy forward (0 = measured 0; the
-                // runbook keeps the pre-ship-day caveat), and the Groww
-                // socket-death family is now visible in the Stalls column,
-                // so the drops count renders as a measurement again. A `-1`
-                // still renders as "?" defensively, without a stale claim.
-                format!(
-                    "\u{1f4ca} <b>Daily feed scorecard @ 3:45 PM IST</b>\n\
-                     Date: {trading_date_ist}\n\
-                     Ticks today: Dhan {} | Groww {}\n\
-                     Minutes only one feed had prices: Dhan {} | Groww {}\n\
-                     Typical delay: Dhan {} | Groww {}\n\
-                     Worst 1% delay: Dhan {} | Groww {}\n\
-                     Drops in market hours: Dhan {} | Groww {}\n\
-                     Who caused today's incidents: Dhan {} | Groww {}\n\
-                     Stalls: Dhan {} | Groww {}\n\
-                     App restarts detected: Dhan {} | Groww {}\n\
-                     Streaming: Dhan {} | Groww {}\n\
-                     {}{}{}",
-                    render_count(dhan.ticks),
-                    render_count(groww.ticks),
-                    render_count(dhan.exclusive_minutes),
-                    render_count(groww.exclusive_minutes),
-                    render_ms(dhan.lag_p50_ms),
-                    render_ms(groww.lag_p50_ms),
-                    render_ms(dhan.lag_p99_ms),
-                    render_ms(groww.lag_p99_ms),
-                    render_count(dhan.drops_market),
-                    render_count(groww.drops_market),
-                    incident_split(dhan),
-                    incident_split(groww),
-                    render_count(dhan.stalls),
-                    render_count(groww.stalls),
-                    render_count(dhan.restarts),
-                    render_count(groww.restarts),
-                    streaming_line(dhan),
-                    streaming_line(groww),
-                    rest_section,
-                    scorecard_verdict(dhan, groww, *dhan_feed_off, *groww_feed_off),
-                    footnotes
-                )
+                lines.join("\n")
             }
             Self::DualFeedScorecardAborted { detail } => {
                 let detail = html_escape(detail);
@@ -3674,7 +3797,18 @@ impl NotificationEvent {
                      Restart the app once `Last offset` < {threshold_secs:.2}s."
                 )
             }
-            Self::ShutdownInitiated => "<b>Shutdown initiated</b>".to_string(),
+            Self::ShutdownInitiated { class } => match class {
+                // One quiet line each (2026-07-15): a scheduled/operator
+                // stop is routine, never an incident.
+                ShutdownClass::ScheduledStop => "\u{1f6d1} Scheduled stop — daily 4:30 PM IST \
+                                                 window (or holiday). Back at next start."
+                    .to_string(),
+                ShutdownClass::OperatorStop => "\u{1f6d1} Stopped by operator.".to_string(),
+                ShutdownClass::ExternalStop => "<b>Unexpected stop</b> — outside the daily \
+                                                4:30 PM IST window. If you didn't do this, \
+                                                check the box (deploy / budget stop / manual)."
+                    .to_string(),
+            },
             Self::ShutdownComplete => "<b>tickvault stopped</b>".to_string(),
             Self::SelfTestPassed { checks_passed } => {
                 format!(
@@ -4013,7 +4147,7 @@ impl NotificationEvent {
             Self::OrderUpdateAuthenticated => "OrderUpdateAuthenticated",
             Self::OrderUpdateDisconnected { .. } => "OrderUpdateDisconnected",
             Self::OrderUpdateReconnected { .. } => "OrderUpdateReconnected",
-            Self::ShutdownInitiated => "ShutdownInitiated",
+            Self::ShutdownInitiated { .. } => "ShutdownInitiated",
             Self::ShutdownComplete => "ShutdownComplete",
             Self::InstrumentBuildSuccess { .. } => "InstrumentBuildSuccess",
             Self::InstrumentBuildFailed { .. } => "InstrumentBuildFailed",
@@ -4055,6 +4189,90 @@ impl NotificationEvent {
             Self::Custom { .. } => "Custom",
             Self::CustomStatus { .. } => "CustomStatus",
             Self::CustomStatusUrgent { .. } => "CustomStatusUrgent",
+        }
+    }
+
+    /// Per-index / per-underlying not-served episode slot inside the REST
+    /// families (2026-07-15 cleanliness fold): each pinned symbol gets its
+    /// own bubble `conn` so one index's episode never swallows another's.
+    ///
+    /// The family-wide slot map (fix-round F1, 2026-07-15 — the SPOT and
+    /// CHAIN per-symbol ranges are DISJOINT so a spot recovery can never
+    /// green-close a chain leg's still-open bubble, and vice versa; the
+    /// chain not-served emit is edge-latched upstream, so a cross-leg
+    /// close would be a permanent Rule-11 false recovery):
+    ///
+    /// | conn | meaning |
+    /// |---|---|
+    /// | 0 | whole-leg spot pulls |
+    /// | 1 | whole-leg chain pulls |
+    /// | 2 | whole-leg contract pulls (Groww) |
+    /// | 7 | CHAIN not-served catch-all (unknown / never-chained symbol) |
+    /// | 8..=11 | SPOT not-served: NIFTY / BANKNIFTY / SENSEX / INDIA VIX |
+    /// | 12..=14 | CHAIN not-served: NIFTY / BANKNIFTY / SENSEX |
+    /// | 15 | SPOT not-served catch-all (unknown symbol) |
+    ///
+    /// Exact match over the pinned `&'static str` set — const, zero-alloc
+    /// (the DHAT bypass-arm pin holds).
+    const fn rest_slot(symbol: &str) -> u8 {
+        // `match` on str literals is not const-stable in all positions;
+        // byte-compare keeps this a true const fn.
+        const fn eq(a: &str, b: &str) -> bool {
+            let (a, b) = (a.as_bytes(), b.as_bytes());
+            if a.len() != b.len() {
+                return false;
+            }
+            let mut i = 0;
+            while i < a.len() {
+                if a[i] != b[i] {
+                    return false;
+                }
+                i += 1;
+            }
+            true
+        }
+        if eq(symbol, "NIFTY") {
+            8
+        } else if eq(symbol, "BANKNIFTY") {
+            9
+        } else if eq(symbol, "SENSEX") {
+            10
+        } else if eq(symbol, "INDIA VIX") {
+            11
+        } else {
+            15
+        }
+    }
+
+    /// CHAIN-leg per-underlying not-served slot — DISJOINT from every
+    /// [`Self::rest_slot`] spot slot (F1, 2026-07-15): known chain
+    /// underlyings map to `spot slot + 4` (12..=14); anything else —
+    /// including INDIA VIX, which is const-asserted out of every chain
+    /// leg upstream — shares the chain catch-all `7` (distinct from the
+    /// spot catch-all `15`). Const, zero-alloc.
+    const fn chain_rest_slot(symbol: &str) -> u8 {
+        const fn eq(a: &str, b: &str) -> bool {
+            let (a, b) = (a.as_bytes(), b.as_bytes());
+            if a.len() != b.len() {
+                return false;
+            }
+            let mut i = 0;
+            while i < a.len() {
+                if a[i] != b[i] {
+                    return false;
+                }
+                i += 1;
+            }
+            true
+        }
+        if eq(symbol, "NIFTY") {
+            12
+        } else if eq(symbol, "BANKNIFTY") {
+            13
+        } else if eq(symbol, "SENSEX") {
+            14
+        } else {
+            7
         }
     }
 
@@ -4105,10 +4323,73 @@ impl NotificationEvent {
             | Self::StartupComplete { .. } => Some(super::episode::BOOT_EPISODE_KEY),
             // The Groww runtime incident family (GrowwSidecarRejected +
             // FeedDown/FeedRecovered, 2026-07-14 noise directive) was
-            // RETIRED 2026-07-15 with the Groww live feed — those variants
-            // and their EpisodeFamily::GrowwFeed routing arms are deleted;
-            // the GrowwFeed family itself stays (renderer + historical
-            // snapshots still name it).
+            // RETIRED 2026-07-15 with the Groww live feed (main #1581) —
+            // those variants and their EpisodeFamily::GrowwFeed routing
+            // arms are deleted; the GrowwFeed family itself stays
+            // (renderer + historical snapshots still name it). Merge
+            // resolution 2026-07-15: the boot-ping fold arms died with
+            // their variants; the REST-family routing below is KEPT.
+            // Per-minute REST pull incident families (2026-07-15
+            // coordinator-relayed cleanliness directive): each leg's
+            // Degraded/Recovered pair folds into ONE live-edited bubble per
+            // (family, leg) instead of 2 messages per flap cycle. First
+            // Degraded still pages (+ SMS at ≥ High); repeats edit in
+            // place; Recovered closes green. The once-per-day pages with no
+            // recovery edge (entitlement / expirylist / book-unresolved /
+            // probe verdicts) and the family-(3) token Criticals stay
+            // LEGACY — Critical never episode-folds. Zero-alloc: Copy match
+            // + const-fn slot lookup; String payloads match via as_str()
+            // (the DHAT bypass-arm pin holds).
+            Self::Spot1mFetchDegraded { .. } | Self::Spot1mFetchRecovered { .. } => {
+                Some(EpisodeKey {
+                    family: EpisodeFamily::DhanRest,
+                    conn: 0,
+                })
+            }
+            Self::ChainFetchDegraded { .. } | Self::ChainFetchRecovered { .. } => {
+                Some(EpisodeKey {
+                    family: EpisodeFamily::DhanRest,
+                    conn: 1,
+                })
+            }
+            Self::Spot1mSidNotServed { symbol, .. }
+            | Self::Spot1mSidServedRecovered { symbol, .. } => Some(EpisodeKey {
+                family: EpisodeFamily::DhanRest,
+                conn: Self::rest_slot(symbol.as_str()),
+            }),
+            // F1 (2026-07-15 fix round): chain not-served uses the DISJOINT
+            // chain slot range — a spot recovery on the same symbol must
+            // never green-close the chain leg's still-open bubble.
+            Self::Chain1mUnderlyingNotServed { underlying, .. }
+            | Self::Chain1mUnderlyingServedRecovered { underlying, .. } => Some(EpisodeKey {
+                family: EpisodeFamily::DhanRest,
+                conn: Self::chain_rest_slot(underlying),
+            }),
+            Self::GrowwSpot1mFetchDegraded { .. } | Self::GrowwSpot1mFetchRecovered { .. } => {
+                Some(EpisodeKey {
+                    family: EpisodeFamily::GrowwRest,
+                    conn: 0,
+                })
+            }
+            Self::GrowwChain1mFetchDegraded { .. } | Self::GrowwChain1mFetchRecovered { .. } => {
+                Some(EpisodeKey {
+                    family: EpisodeFamily::GrowwRest,
+                    conn: 1,
+                })
+            }
+            Self::GrowwContract1mFetchDegraded { .. }
+            | Self::GrowwContract1mFetchRecovered { .. } => Some(EpisodeKey {
+                family: EpisodeFamily::GrowwRest,
+                conn: 2,
+            }),
+            // F1: same disjoint chain-slot range on the Groww side (no Groww
+            // spot per-symbol pair exists today — kept disjoint anyway so a
+            // future one can never collide).
+            Self::GrowwChain1mUnderlyingNotServed { underlying, .. }
+            | Self::GrowwChain1mUnderlyingServedRecovered { underlying, .. } => Some(EpisodeKey {
+                family: EpisodeFamily::GrowwRest,
+                conn: Self::chain_rest_slot(underlying),
+            }),
             _ => None,
         }
     }
@@ -4167,9 +4448,20 @@ impl NotificationEvent {
     pub fn episode_role(&self) -> super::episode::EpisodeRole {
         use super::episode::EpisodeRole;
         match self {
-            Self::WebSocketReconnected { .. } | Self::OrderUpdateReconnected { .. } => {
-                EpisodeRole::Resolve
-            }
+            // The 8 REST *Recovered variants (2026-07-15 cleanliness fold)
+            // are their bubbles' recovery edges; role is consulted only
+            // when episode_key() is Some. (FeedRecovered retired with the
+            // Groww live feed, main #1581 — merge resolution 2026-07-15.)
+            Self::WebSocketReconnected { .. }
+            | Self::OrderUpdateReconnected { .. }
+            | Self::Spot1mFetchRecovered { .. }
+            | Self::ChainFetchRecovered { .. }
+            | Self::Spot1mSidServedRecovered { .. }
+            | Self::Chain1mUnderlyingServedRecovered { .. }
+            | Self::GrowwSpot1mFetchRecovered { .. }
+            | Self::GrowwChain1mFetchRecovered { .. }
+            | Self::GrowwContract1mFetchRecovered { .. }
+            | Self::GrowwChain1mUnderlyingServedRecovered { .. } => EpisodeRole::Resolve,
             _ => EpisodeRole::Open,
         }
     }
@@ -4222,7 +4514,13 @@ impl NotificationEvent {
             // Swap itself failed — depth quality degraded until next rebalance.
             Self::OrderUpdateDisconnected { .. } => Severity::High,
             Self::OrderUpdateReconnected { .. } => Severity::Low,
-            Self::ShutdownInitiated => Severity::Medium,
+            // 2026-07-15 shutdown classification: scheduled/operator stops
+            // are routine (Low — one quiet coalesced line); only an
+            // unexpected external stop keeps the historical Medium loudness.
+            Self::ShutdownInitiated { class } => match class {
+                ShutdownClass::ScheduledStop | ShutdownClass::OperatorStop => Severity::Low,
+                ShutdownClass::ExternalStop => Severity::Medium,
+            },
             Self::CircuitBreakerClosed => Severity::Medium,
             Self::WebSocketConnected { .. } => Severity::Low,
             // 2026-05-09: demoted Medium → Low so the boot-success summary
@@ -4589,7 +4887,9 @@ mod tests {
         // family — see test_episode_key_boot_variants_map_to_boot_family.)
         for event in [
             NotificationEvent::TokenRenewed,
-            NotificationEvent::ShutdownInitiated,
+            NotificationEvent::ShutdownInitiated {
+                class: ShutdownClass::ExternalStop,
+            },
             NotificationEvent::ShutdownComplete,
             NotificationEvent::SelfTestPassed { checks_passed: 8 },
             NotificationEvent::MarketOpenStreamingConfirmation {
@@ -5367,10 +5667,42 @@ mod tests {
     }
 
     #[test]
-    fn test_shutdown_initiated_message() {
-        let event = NotificationEvent::ShutdownInitiated;
+    fn test_shutdown_initiated_message_scheduled_stop_is_one_quiet_line() {
+        let event = NotificationEvent::ShutdownInitiated {
+            class: ShutdownClass::ScheduledStop,
+        };
         let msg = event.to_message();
-        assert!(msg.contains("Shutdown"));
+        assert!(msg.contains("Scheduled stop"), "{msg}");
+        assert!(msg.contains("4:30 PM IST"), "{msg}");
+        assert!(msg.contains("Back at next start"), "{msg}");
+        assert_eq!(msg.lines().count(), 1, "one-line body: {msg}");
+        assert!(
+            !msg.contains("Unexpected"),
+            "a scheduled stop must never read as unexpected: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_shutdown_initiated_message_operator_stop_is_one_quiet_line() {
+        let event = NotificationEvent::ShutdownInitiated {
+            class: ShutdownClass::OperatorStop,
+        };
+        let msg = event.to_message();
+        assert_eq!(msg, "\u{1f6d1} Stopped by operator.");
+    }
+
+    #[test]
+    fn test_shutdown_initiated_message_external_stop_stays_loud() {
+        let event = NotificationEvent::ShutdownInitiated {
+            class: ShutdownClass::ExternalStop,
+        };
+        let msg = event.to_message();
+        assert!(msg.contains("<b>Unexpected stop</b>"), "{msg}");
+        assert!(msg.contains("4:30 PM IST"), "{msg}");
+        assert!(
+            msg.contains("deploy / budget stop / manual"),
+            "the body must name the likely external causes: {msg}"
+        );
     }
 
     #[test]
@@ -6036,9 +6368,30 @@ mod tests {
     }
 
     #[test]
-    fn test_shutdown_initiated_severity() {
+    fn test_shutdown_initiated_severity_per_class() {
+        // 2026-07-15: scheduled/operator stops are routine (Low — quiet
+        // coalesced line); ONLY an unexpected external stop keeps the
+        // historical Medium loudness. Demoting ExternalStop below Medium
+        // needs a fresh dated operator quote — talk to the operator first.
         assert_eq!(
-            NotificationEvent::ShutdownInitiated.severity(),
+            NotificationEvent::ShutdownInitiated {
+                class: ShutdownClass::ScheduledStop
+            }
+            .severity(),
+            Severity::Low
+        );
+        assert_eq!(
+            NotificationEvent::ShutdownInitiated {
+                class: ShutdownClass::OperatorStop
+            }
+            .severity(),
+            Severity::Low
+        );
+        assert_eq!(
+            NotificationEvent::ShutdownInitiated {
+                class: ShutdownClass::ExternalStop
+            }
+            .severity(),
             Severity::Medium
         );
     }
@@ -6386,7 +6739,9 @@ mod tests {
         let low_event = NotificationEvent::TokenRenewed;
         assert_eq!(low_event.severity(), Severity::Low);
 
-        let medium_event = NotificationEvent::ShutdownInitiated;
+        let medium_event = NotificationEvent::ShutdownInitiated {
+            class: ShutdownClass::ExternalStop,
+        };
         assert_eq!(medium_event.severity(), Severity::Medium);
 
         let high_event = NotificationEvent::Custom {
@@ -8163,7 +8518,9 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // DualFeedDailyScorecard + DualFeedScorecardAborted (2026-07-10 PR-A)
+    // DualFeedDailyScorecard + DualFeedScorecardAborted (2026-07-10 PR-A;
+    // body redesigned 2026-07-15 — verdict-first, aligned <code> feed
+    // lines, sentinel OMISSION, one caveat line, zero footnotes)
     // -----------------------------------------------------------------------
 
     fn score_line(name: &str) -> FeedScoreLine {
@@ -8180,6 +8537,24 @@ mod tests {
             stalls: 0,
             restarts: 0,
             streaming_minutes: 373,
+        }
+    }
+
+    /// A wholly-unmeasured feed side (every stat field a `-1` sentinel).
+    fn sentinel_line(name: &str) -> FeedScoreLine {
+        FeedScoreLine {
+            name: name.to_string(),
+            ticks: -1,
+            exclusive_minutes: -1,
+            lag_p50_ms: -1,
+            lag_p99_ms: -1,
+            drops_market: -1,
+            blame_broker: -1,
+            blame_ours: -1,
+            blame_unclear: -1,
+            stalls: -1,
+            restarts: -1,
+            streaming_minutes: -1,
         }
     }
 
@@ -8200,24 +8575,6 @@ mod tests {
         }
     }
 
-    fn scorecard_with_rest(rest_legs: Vec<RestLegScoreLine>, read_failed: bool) -> String {
-        NotificationEvent::DualFeedDailyScorecard {
-            trading_date_ist: "2026-07-13".to_string(),
-            dhan: score_line("Dhan"),
-            groww: score_line("Groww"),
-            session_minutes: 375,
-            partial_coverage: false,
-            degraded: false,
-            early_run: false,
-            restart_partial: false,
-            dhan_feed_off: false,
-            groww_feed_off: false,
-            rest_legs,
-            rest_legs_read_failed: read_failed,
-        }
-        .to_message()
-    }
-
     fn rest_line(feed: &str, leg: &str) -> RestLegScoreLine {
         RestLegScoreLine {
             feed: feed.to_string(),
@@ -8234,174 +8591,6 @@ mod tests {
         }
     }
 
-    /// PR-5 (operator Quote 2): the measured digest line carries pull
-    /// counts + the seconds-after-close distribution + the extras, all in
-    /// plain English.
-    #[test]
-    fn test_rest_leg_digest_line_measured_full() {
-        let msg = scorecard_with_rest(
-            vec![RestLegScoreLine {
-                ok_fetches: 1_496,
-                failed_fetches: 4,
-                named_gaps: 1,
-                rate_limited_hits: 3,
-                late_recovered: 2,
-                close_p50_ms: 1_400,
-                close_p99_ms: 3_200,
-                close_max_ms: 6_200,
-                close_samples: 1_494,
-                ..rest_line("Groww", "spot candles")
-            }],
-            false,
-        );
-        assert!(
-            msg.contains("Official minute candles — how fast after each"),
-            "digest section header missing: {msg}"
-        );
-        assert!(
-            msg.contains(
-                "Groww spot candles: 1496 pulls OK, 4 failed — typical 1.4 s / \
-                 worst 1% 3.2 s / slowest 6.2 s after close; 2 recovered late; \
-                 3 rate-limit hits; 1 never recovered \u{26a0}\u{fe0f}"
-            ),
-            "measured digest line wrong: {msg}"
-        );
-    }
-
-    /// A latency-only line (the Dhan spot fallback: freshness measured
-    /// from the stored candles while per-pull records are not written yet)
-    /// says so — and never fabricates pull counts.
-    #[test]
-    fn test_rest_leg_digest_line_latency_only_and_placeholder() {
-        let msg = scorecard_with_rest(
-            vec![
-                RestLegScoreLine {
-                    close_p50_ms: 1_900,
-                    close_p99_ms: 5_000,
-                    close_max_ms: 61_000,
-                    close_samples: 1_480,
-                    late_recovered: 1,
-                    ..rest_line("Dhan", "spot candles")
-                },
-                rest_line("Dhan", "option chain"),
-            ],
-            false,
-        );
-        assert!(
-            msg.contains(
-                "Dhan spot candles: typical 1.9 s / worst 1% 5.0 s / slowest \
-                 61.0 s after close (pull counts not recorded yet); 1 recovered late"
-            ),
-            "latency-only digest line wrong: {msg}"
-        );
-        // The all-sentinel placeholder is the honest Quote-2 answer for a
-        // family with no measurement source yet — never a fabricated zero.
-        assert!(
-            msg.contains("Dhan option chain: not measured yet"),
-            "placeholder digest line wrong: {msg}"
-        );
-        // The -1 sentinels must never render numerically on a digest line
-        // (a bare `-1` substring check would trip on the ISO date).
-        for leaked in ["-1 pulls", "typical -1", "worst 1% -1", "slowest -1"] {
-            assert!(
-                !msg.contains(leaked),
-                "sentinels must never render numerically ({leaked:?}): {msg}"
-            );
-        }
-    }
-
-    /// An all-pulls-failed day renders a measured-zero, not a fabricated
-    /// freshness ("0 pulls OK" + "not measurable"); and the read-failed
-    /// flag carries its own honest footnote.
-    #[test]
-    fn test_rest_leg_digest_zero_ok_day_and_read_failed_footnote() {
-        let msg = scorecard_with_rest(
-            vec![RestLegScoreLine {
-                ok_fetches: 0,
-                failed_fetches: 375,
-                named_gaps: 375,
-                rate_limited_hits: 0,
-                late_recovered: 0,
-                close_p50_ms: -1,
-                close_p99_ms: -1,
-                close_max_ms: -1,
-                close_samples: 0,
-                ..rest_line("Groww", "option chain")
-            }],
-            true,
-        );
-        assert!(
-            msg.contains(
-                "Groww option chain: 0 pulls OK, 375 failed — freshness not \
-                 measurable (no successful pull); 375 never recovered \u{26a0}\u{fe0f}"
-            ),
-            "zero-ok digest line wrong: {msg}"
-        );
-        assert!(
-            msg.contains("minute-candle pull records could \n                         not be read")
-                || msg.contains("minute-candle pull records could not be read"),
-            "read-failed footnote missing: {msg}"
-        );
-    }
-
-    /// An EMPTY digest vec omits the section entirely (older callers /
-    /// pre-deploy cards) — no header, no stale claim.
-    #[test]
-    fn test_rest_leg_digest_empty_vec_omits_section() {
-        let msg = scorecard(score_line("Dhan"), score_line("Groww")).to_message();
-        assert!(
-            !msg.contains("Official minute candles"),
-            "empty rest_legs must omit the digest section: {msg}"
-        );
-    }
-
-    /// The digest lines obey the Telegram commandments: plain English, no
-    /// wire slugs, no library/infrastructure names, no file paths.
-    #[test]
-    fn test_rest_leg_digest_obeys_telegram_commandments() {
-        let msg = scorecard_with_rest(
-            vec![
-                RestLegScoreLine {
-                    ok_fetches: 1_120,
-                    failed_fetches: 5,
-                    named_gaps: 0,
-                    rate_limited_hits: 0,
-                    late_recovered: 0,
-                    close_p50_ms: 2_100,
-                    close_p99_ms: 4_000,
-                    close_max_ms: 9_000,
-                    close_samples: 1_120,
-                    ..rest_line("Groww", "option chain")
-                },
-                rest_line("Dhan", "option chain"),
-            ],
-            false,
-        );
-        for banned in [
-            "spot_1m",
-            "chain_1m",
-            "contract_1m",
-            "rest_fetch_audit",
-            "p50",
-            "p99",
-            ".rs",
-            "SQL",
-        ] {
-            assert!(
-                !msg.contains(banned),
-                "digest must not carry {banned:?}: {msg}"
-            );
-        }
-        assert!(
-            msg.contains("Groww option chain: 1120 pulls OK, 5 failed"),
-            "{msg}"
-        );
-        // Zero-valued extras stay OFF the line (one line = one answer).
-        assert!(!msg.contains("0 recovered late"), "{msg}");
-        assert!(!msg.contains("0 rate-limit hits"), "{msg}");
-        assert!(!msg.contains("0 never recovered"), "{msg}");
-    }
-
     #[test]
     fn test_dual_feed_scorecard_topic_severity_policy() {
         let ev = scorecard(score_line("Dhan"), score_line("Groww"));
@@ -8414,16 +8603,20 @@ mod tests {
     }
 
     #[test]
-    fn test_dual_feed_scorecard_body_verdict_ladder() {
-        // Rung 1: exclusive minutes decide.
+    fn test_dual_feed_scorecard_body_verdict_first_ladder() {
+        // Rung 1: exclusive (solo) minutes decide — and the verdict is the
+        // FIRST line of the body (2026-07-15 redesign).
         let mut groww = score_line("Groww");
         groww.exclusive_minutes = 63;
         let msg = scorecard(score_line("Dhan"), groww).to_message();
-        assert!(
-            msg.contains("\u{1f3c6} Verdict: Groww won today — 63 exclusive minutes vs 14."),
-            "rung-1 verdict wrong: {msg}"
+        let first = msg.lines().next().unwrap_or_default();
+        assert_eq!(
+            first,
+            "\u{1f3c6} <b>Feed scorecard 3:45 PM \u{b7} 10 Jul</b> \u{2014} Groww won today \
+                 (63 vs 14 solo minutes).",
+            "rung-1 verdict-first line wrong: {msg}"
         );
-        // Rung 2: tied exclusive minutes → measured worst-1% delay decides
+        // Rung 2: tied solo minutes → measured worst-1% delay decides
         // (delta 2160 ms > the 1000 ms clock floor).
         let mut d = score_line("Dhan");
         let mut g = score_line("Groww");
@@ -8431,13 +8624,15 @@ mod tests {
         g.lag_p99_ms = 740;
         let msg = scorecard(d, g).to_message();
         assert!(
-            msg.contains("Verdict: Groww won today — faster prices beyond the clock floor"),
+            msg.lines()
+                .next()
+                .unwrap_or_default()
+                .contains("Groww won today (faster prices beyond the clock floor"),
             "rung-2 verdict wrong: {msg}"
         );
         // Rung-2 clock-floor guard (PR-C review round 1, 2026-07-11): a
         // sub-floor delta is Dhan's whole-second quantization, not speed —
-        // 1400 vs 700 (delta 700 ≤ 1000) must NOT declare a lag winner;
-        // identical evidence elsewhere falls through to "Even day".
+        // 1400 vs 700 (delta 700 ≤ 1000) must NOT declare a lag winner.
         let mut d = score_line("Dhan");
         let mut g = score_line("Groww");
         d.lag_p99_ms = 1400;
@@ -8448,144 +8643,156 @@ mod tests {
             "a sub-floor p99 delta must never decide the delay rung: {msg}"
         );
         assert!(
-            msg.contains("\u{1f91d} Verdict: Even day."),
+            msg.contains("even day."),
             "sub-floor delta falls through the ladder: {msg}"
-        );
-        // ... while a beyond-floor delta (5000 vs 700 = 4300 > 1000)
-        // decides.
-        let mut d = score_line("Dhan");
-        let mut g = score_line("Groww");
-        d.lag_p99_ms = 5000;
-        g.lag_p99_ms = 700;
-        let msg = scorecard(d, g).to_message();
-        assert!(
-            msg.contains("Verdict: Groww won today — faster prices beyond the clock floor"),
-            "a beyond-floor delta must decide rung 2: {msg}"
         );
         // The floor const must stay lockstep with the persisted Dhan
         // lag_floor_ms value (LAG_FLOOR_MS_DHAN = 1000 in
         // tickvault-storage — core cannot import it; both pin 1000).
         assert_eq!(VERDICT_LAG_CLOCK_FLOOR_MS, 1000);
-        // Rung 2 skip: a −1 sentinel must never decide the delay rung.
+        // Rung 3: a −1 lag sentinel never decides; broker blame does.
         let mut d = score_line("Dhan");
         let g = score_line("Groww"); // lag -1 both sides
         d.blame_broker = 5;
         let msg = scorecard(d, g).to_message();
         assert!(
-            msg.contains("Verdict: Groww won today — fewer broker-caused incidents (2 vs 5)."),
+            msg.lines()
+                .next()
+                .unwrap_or_default()
+                .contains("Groww won today (fewer broker-caused incidents: 2 vs 5)."),
             "rung-3 verdict wrong: {msg}"
         );
         // Rung 3 skip (hostile review 2026-07-10): a −1 blame sentinel must
-        // never win the drops rung nor render "-1" — falls to Even day.
+        // never win the incidents rung nor render "-1" — falls to even day.
         let mut d = score_line("Dhan");
         let g = score_line("Groww");
         d.blame_broker = -1; // drops_market still >= 0
         let msg = scorecard(d, g).to_message();
         assert!(
-            msg.contains("\u{1f91d} Verdict: Even day."),
+            msg.contains("even day."),
             "a -1 blame sentinel must not decide rung 3: {msg}"
         );
         assert!(
-            !msg.contains("(-1 vs"),
-            "the -1 sentinel must never render in a verdict: {msg}"
+            !msg.contains("-1"),
+            "the -1 sentinel must never render anywhere: {msg}"
         );
         // Rung 4: identical evidence → even day.
         let msg = scorecard(score_line("Dhan"), score_line("Groww")).to_message();
-        assert!(msg.contains("\u{1f91d} Verdict: Even day."), "{msg}");
+        assert!(msg.contains("even day."), "{msg}");
     }
 
     #[test]
-    fn test_dual_feed_scorecard_body_sentinels_and_footnotes() {
-        // −1 lag renders honestly, never a fabricated 0 (audit Rule 11).
-        let msg = scorecard(score_line("Dhan"), score_line("Groww")).to_message();
-        assert!(msg.contains("not measured yet"), "{msg}");
-        // Scoreboard PR-C: the retired PR-1 "next upgrade" claim must not
-        // render — the unmeasured arm now names the honest cause (backfill
-        // re-run / too few samples).
-        assert!(
-            msg.contains("Delay could not be measured today"),
-            "unmeasured-lag footnote missing: {msg}"
-        );
-        assert!(
-            !msg.contains("Delay measurement starts with the next upgrade"),
-            "the retired PR-1 delay footnote must not render: {msg}"
-        );
-        // MEASURED lag swaps in the resolution-asymmetry footnote (Dhan
-        // whole-second floor + Groww millisecond one-step-after-the-wire)
-        // and renders both feeds at their native precision.
+    fn test_dual_feed_scorecard_feed_lines_are_code_wrapped_and_aligned() {
         let mut d = score_line("Dhan");
         let mut g = score_line("Groww");
-        d.lag_p50_ms = 1200;
-        d.lag_p99_ms = 2900;
-        g.lag_p50_ms = 180;
-        g.lag_p99_ms = 740;
+        d.lag_p99_ms = 1400;
+        g.lag_p99_ms = 400;
         let msg = scorecard(d, g).to_message();
+        // One <code>-wrapped stat line per feed, names padded to equal
+        // width ("Dhan " vs "Groww") so the columns align in monospace.
         assert!(
-            msg.contains("Dhan's price clock ticks in whole seconds"),
-            "lag-floor footnote missing: {msg}"
+            msg.contains("<code>Dhan : 1.84M ticks \u{b7} delay 1.4s \u{b7} drops 3</code>"),
+            "aligned Dhan line wrong: {msg}"
         );
         assert!(
-            msg.contains("Groww's delay is millisecond-precise"),
-            "Groww receipt-clock semantics footnote missing: {msg}"
+            msg.contains("<code>Groww: 1.84M ticks \u{b7} delay 0.4s \u{b7} drops 3</code>"),
+            "aligned Groww line wrong: {msg}"
         );
-        assert!(msg.contains("1.2 s"), "≥1s delays render in seconds: {msg}");
+        // Big tick counts render compact (1.84M), never a raw integer wall.
+        assert!(!msg.contains("1842551"), "{msg}");
+    }
+
+    #[test]
+    fn test_dual_feed_scorecard_sentinels_are_omitted_never_rendered() {
+        // Default fixture: lag is -1 on both sides — the delay segment is
+        // simply OMITTED (2026-07-15: never "?", never "not measured").
+        let msg = scorecard(score_line("Dhan"), score_line("Groww")).to_message();
         assert!(
-            msg.contains("180 ms"),
-            "sub-second Groww delays render in milliseconds: {msg}"
+            !msg.contains("delay"),
+            "unmeasured delay must be omitted: {msg}"
         );
-        // Scoreboard PR-B (2026-07-10): stalls are MEASURED — a real count
-        // renders numerically and the retired PR-1 footnote never appears
-        // (0 = measured 0 from this deploy forward; the runbook keeps the
-        // pre-ship-day caveat).
+        assert!(!msg.contains("not measured"), "{msg}");
+        assert!(!msg.contains('?'), "{msg}");
+        // A wholly-unmeasured feed renders ONE honest line — not silence.
+        let msg = scorecard(score_line("Dhan"), sentinel_line("Groww")).to_message();
+        assert!(
+            msg.contains("Groww: no numbers recorded today \u{26a0}\u{fe0f}"),
+            "wholly-unmeasured feed must render the honest line: {msg}"
+        );
+        assert!(!msg.contains("<code>Groww"), "{msg}");
+    }
+
+    #[test]
+    fn test_dual_feed_scorecard_incidents_line_only_when_nonzero() {
+        // Fixture blame: broker 2 / ours 0 / unclear 1 → the line renders
+        // with the non-zero split only.
+        let msg = scorecard(score_line("Dhan"), score_line("Groww")).to_message();
+        assert!(
+            msg.contains(
+                "Incidents: Dhan 3 (broker 2 / unclear 1) | Groww 3 (broker 2 / unclear 1)"
+            ),
+            "incidents line wrong: {msg}"
+        );
+        // Zero-incident day: the line is absent entirely.
+        let mut d = score_line("Dhan");
+        let mut g = score_line("Groww");
+        for f in [&mut d, &mut g] {
+            f.blame_broker = 0;
+            f.blame_ours = 0;
+            f.blame_unclear = 0;
+        }
+        let msg = scorecard(d, g).to_message();
+        assert!(!msg.contains("Incidents:"), "{msg}");
+        // Stall / restart counts ride the segment when positive.
         let mut g = score_line("Groww");
         g.stalls = 1;
+        g.restarts = 2;
         let msg = scorecard(score_line("Dhan"), g).to_message();
-        assert!(msg.contains("Stalls: Dhan 0 | Groww 1"), "{msg}");
         assert!(
-            !msg.contains("Stall tracking starts with the next upgrade"),
-            "the retired PR-1 stall footnote must not render: {msg}"
+            msg.contains("Groww 3 (broker 2 / unclear 1) \u{b7} stalls 1 \u{b7} restarts 2"),
+            "stall/restart segment wrong: {msg}"
         );
-        // A `-1` still renders as the defensive "?" — without the stale
-        // footnote claim.
-        let mut d = score_line("Dhan");
-        let mut g = score_line("Groww");
-        d.stalls = -1;
-        g.stalls = -1;
-        let msg = scorecard(d, g).to_message();
-        assert!(msg.contains("Stalls: Dhan ? | Groww ?"), "{msg}");
-        assert!(
-            !msg.contains("Stall tracking starts with the next upgrade"),
-            "the retired PR-1 stall footnote must not render: {msg}"
-        );
-        // Partial + degraded days carry loud warnings — the partial wording
-        // names the HONEST PR-1 cause (a read failure while building the
-        // card), never an unmeasured "app was down" claim.
-        let ev = NotificationEvent::DualFeedDailyScorecard {
-            trading_date_ist: "2026-07-10".to_string(),
-            dhan: score_line("Dhan"),
-            groww: score_line("Groww"),
-            session_minutes: 375,
-            partial_coverage: true,
-            degraded: true,
-            early_run: false,
-            restart_partial: false,
-            dhan_feed_off: false,
-            groww_feed_off: false,
-            rest_legs: vec![],
-            rest_legs_read_failed: false,
-        };
-        let msg = ev.to_message();
-        assert!(
-            msg.contains("Some of today's records could not be read"),
-            "{msg}"
-        );
-        assert!(
-            !msg.contains("the app did not watch the whole session"),
-            "the unmeasured restart claim must not render: {msg}"
-        );
-        assert!(msg.contains("treat the drop counts as a minimum"), "{msg}");
-        // An early forced run says so explicitly (the row is stamped
-        // partial; the card must not masquerade as end-of-day).
+    }
+
+    #[test]
+    fn test_dual_feed_scorecard_caveat_line_exactly_once() {
+        for (partial, degraded, restart, rest_failed) in [
+            (true, false, false, false),
+            (false, true, false, false),
+            (false, false, true, false),
+            (false, false, false, true),
+            (true, true, true, true),
+        ] {
+            let ev = NotificationEvent::DualFeedDailyScorecard {
+                trading_date_ist: "2026-07-10".to_string(),
+                dhan: score_line("Dhan"),
+                groww: score_line("Groww"),
+                session_minutes: 375,
+                partial_coverage: partial,
+                degraded,
+                early_run: false,
+                restart_partial: restart,
+                dhan_feed_off: false,
+                groww_feed_off: false,
+                rest_legs: vec![],
+                rest_legs_read_failed: rest_failed,
+            };
+            let msg = ev.to_message();
+            assert_eq!(
+                msg.matches("Counts are a floor").count(),
+                1,
+                "exactly ONE caveat line: {msg}"
+            );
+            // A caveat day leads with the warning emoji.
+            assert!(msg.starts_with("\u{26a0}\u{fe0f}"), "{msg}");
+        }
+        // A clean day carries NO caveat and no warning header.
+        let msg = scorecard(score_line("Dhan"), score_line("Groww")).to_message();
+        assert!(!msg.contains("Counts are a floor"), "{msg}");
+    }
+
+    #[test]
+    fn test_dual_feed_scorecard_early_run_suffix_on_verdict_line() {
         let ev = NotificationEvent::DualFeedDailyScorecard {
             trading_date_ist: "2026-07-10".to_string(),
             dhan: score_line("Dhan"),
@@ -8601,122 +8808,18 @@ mod tests {
             rest_legs_read_failed: false,
         };
         let msg = ev.to_message();
+        let first = msg.lines().next().unwrap_or_default();
         assert!(
-            msg.contains("produced early on operator request"),
-            "early-run footnote missing: {msg}"
+            first.ends_with("(early run)"),
+            "early-run suffix missing: {msg}"
         );
     }
 
     #[test]
-    fn test_dual_feed_scorecard_mixed_lag_state_footnote_keys_on_either_feed() {
-        // PR-C review round 1 (2026-07-11): the delay footnote branch was
-        // keyed on Dhan alone — a Dhan-off / thin-Dhan day with a measured
-        // Groww delay rendered "Typical delay: Dhan not measured yet |
-        // Groww 180 ms" directly above "Delay could not be measured today"
-        // (a Rule-11 self-contradiction on the operator surface). The gate
-        // now keys on EITHER feed.
-        let d = score_line("Dhan"); // lag -1/-1
-        let mut g = score_line("Groww");
-        g.lag_p50_ms = 180;
-        g.lag_p99_ms = 740;
-        let msg = scorecard(d, g).to_message();
-        assert!(
-            !msg.contains("Delay could not be measured today"),
-            "a measured Groww delay must not render under an unmeasured claim: {msg}"
-        );
-        assert!(
-            msg.contains("Dhan's price clock ticks in whole seconds"),
-            "the asymmetry footnote must render on a mixed-state day: {msg}"
-        );
-        assert!(msg.contains("180 ms"), "{msg}");
-        // The mirror mixed state (Dhan measured / Groww unmeasured) —
-        // reachable on a thin-Groww day — must not claim unmeasured either.
-        let mut d = score_line("Dhan");
-        d.lag_p50_ms = 1200;
-        d.lag_p99_ms = 2900;
-        let g = score_line("Groww"); // lag -1/-1
-        let msg = scorecard(d, g).to_message();
-        assert!(
-            !msg.contains("Delay could not be measured today"),
-            "a measured Dhan delay must not render under an unmeasured claim: {msg}"
-        );
-    }
-
-    #[test]
-    fn test_dual_feed_scorecard_restart_partial_footnote() {
-        // Round-3 hostile review 2026-07-10: a restart day's card must
-        // carry the same partial caveat its persisted row does — never a
-        // silent row-vs-card honesty mismatch on exactly the day the
-        // feature exists for.
-        let ev = NotificationEvent::DualFeedDailyScorecard {
-            trading_date_ist: "2026-07-10".to_string(),
-            dhan: score_line("Dhan"),
-            groww: score_line("Groww"),
-            session_minutes: 375,
-            partial_coverage: false,
-            degraded: false,
-            early_run: false,
-            restart_partial: true,
-            dhan_feed_off: false,
-            groww_feed_off: false,
-            rest_legs: vec![],
-            rest_legs_read_failed: false,
-        };
-        let msg = ev.to_message();
-        assert!(
-            msg.contains("The app restarted during the day"),
-            "restart-partial footnote missing: {msg}"
-        );
-        // Absent on a clean day.
-        let msg = scorecard(score_line("Dhan"), score_line("Groww")).to_message();
-        assert!(
-            !msg.contains("The app restarted during the day"),
-            "restart footnote must not render on a clean day: {msg}"
-        );
-    }
-
-    #[test]
-    fn test_dual_feed_scorecard_groww_drops_sentinel_footnote() {
-        // Scoreboard PR-B (2026-07-10): the round-2 Groww drops blind spot
-        // closed with the stall rows — the footnote is RETIRED. A `-1`
-        // (defensive) still renders as "?" and must never decide a verdict
-        // rung, but no stale "not counted yet" claim renders.
-        let mut g = score_line("Groww");
-        g.drops_market = -1;
-        let msg = scorecard(score_line("Dhan"), g).to_message();
-        assert!(
-            msg.contains("Drops in market hours: Dhan 3 | Groww ?"),
-            "{msg}"
-        );
-        assert!(
-            !msg.contains("Groww connection drops are not counted yet"),
-            "the retired blind-spot footnote must not render: {msg}"
-        );
-        // The drops verdict rung must not decide against the sentinel —
-        // identical evidence elsewhere → Even day.
-        let mut d = score_line("Dhan");
-        d.blame_broker = 5;
-        let mut g = score_line("Groww");
-        g.drops_market = -1;
-        let msg = scorecard(d, g).to_message();
-        assert!(
-            msg.contains("\u{1f91d} Verdict: Even day."),
-            "a sentinel drops side must never lose/win the drops rung: {msg}"
-        );
-        // Both sides measured → still no footnote.
-        let msg = scorecard(score_line("Dhan"), score_line("Groww")).to_message();
-        assert!(
-            !msg.contains("Groww connection drops are not counted yet"),
-            "{msg}"
-        );
-    }
-
-    #[test]
-    fn test_dual_feed_scorecard_feed_off_no_contest() {
-        // Round-4 hostile review 2026-07-10 (the round-2 finding): a feed
-        // switched OFF for the day is a one-horse race — the verdict must
-        // say "no contest" (never crown the other feed on exclusive
-        // minutes) and the card must carry the switched-off footnote.
+    fn test_dual_feed_scorecard_feed_off_single_line_no_contest() {
+        // Round-4 semantics kept (2026-07-15 re-render): a switched-off
+        // feed is a one-horse race — line 1 says "-only day", the OFF feed
+        // renders exactly ONE line, and no winner is ever declared.
         let mut g = score_line("Groww");
         g.ticks = 0;
         g.exclusive_minutes = 0;
@@ -8736,29 +8839,25 @@ mod tests {
             rest_legs_read_failed: false,
         };
         let msg = ev.to_message();
-        assert!(
-            msg.contains(
-                "not comparable — Groww was switched off \n             today, no contest"
-            ) || msg.contains("not comparable — Groww was switched off today, no contest"),
-            "feed-off rung-0 verdict missing: {msg}"
+        let first = msg.lines().next().unwrap_or_default();
+        assert_eq!(
+            first,
+            "\u{1f4ca} <b>Feed scorecard 3:45 PM \u{b7} 10 Jul</b> \u{2014} Dhan-only day."
         );
         assert!(
-            !msg.contains("won today"),
-            "a switched-off feed's day must never declare a winner: {msg}"
+            msg.contains("Groww: OFF today (excluded from verdict)"),
+            "feed-off single line missing: {msg}"
         );
+        assert!(!msg.contains("won today"), "{msg}");
         assert!(
-            msg.contains("Groww was switched off today — no contest"),
-            "feed-off footnote missing: {msg}"
+            !msg.contains("<code>Groww"),
+            "an OFF feed must not render a stat line: {msg}"
         );
-        // Both feeds off (a feeds-disabled test session) — still no winner.
+        // Both feeds off — "no contest" appears ONLY on line 1.
         let mut d = score_line("Dhan");
         d.ticks = 0;
-        d.exclusive_minutes = 0;
-        d.streaming_minutes = 0;
         let mut g = score_line("Groww");
         g.ticks = 0;
-        g.exclusive_minutes = 0;
-        g.streaming_minutes = 0;
         let ev = NotificationEvent::DualFeedDailyScorecard {
             trading_date_ist: "2026-07-10".to_string(),
             dhan: d,
@@ -8774,46 +8873,567 @@ mod tests {
             rest_legs_read_failed: false,
         };
         let msg = ev.to_message();
+        let first = msg.lines().next().unwrap_or_default();
         assert!(
-            msg.contains("both feeds were switched"),
-            "both-off verdict missing: {msg}"
+            first.contains("both feeds were off today, no contest."),
+            "{msg}"
         );
-        // A clean comparable day renders NO feed-off wording.
+        let rest: String = msg.lines().skip(1).collect::<Vec<_>>().join("\n");
+        assert!(
+            !rest.contains("no contest"),
+            "no-contest wording may appear ONLY in line 1: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_dual_feed_scorecard_feed_off_line_still_carries_pull_digest() {
+        // F2 (2026-07-15 fix round): on current prod EVERY day is a Dhan
+        // feed-off day (live WS retired) while the Dhan spot-1m/chain REST
+        // pulls are the operator's most-watched signal — the OFF line must
+        // still carry the pulls segment when pull data exists.
+        let mut d = score_line("Dhan");
+        d.ticks = 0;
+        let rest_legs = vec![
+            RestLegScoreLine {
+                ok_fetches: 735,
+                failed_fetches: 735,
+                ..rest_line("Dhan", "spot candles")
+            },
+            RestLegScoreLine {
+                ok_fetches: 733,
+                failed_fetches: 2,
+                ..rest_line("Dhan", "option chain")
+            },
+        ];
+        let ev = NotificationEvent::DualFeedDailyScorecard {
+            trading_date_ist: "2026-07-15".to_string(),
+            dhan: d,
+            groww: score_line("Groww"),
+            session_minutes: 375,
+            partial_coverage: false,
+            degraded: false,
+            early_run: false,
+            restart_partial: false,
+            dhan_feed_off: true,
+            groww_feed_off: false,
+            rest_legs,
+            rest_legs_read_failed: false,
+        };
+        let msg = ev.to_message();
+        let off_line = msg
+            .lines()
+            .find(|l| l.contains("Dhan: OFF today"))
+            .unwrap_or_default();
+        assert!(
+            off_line.contains(
+                "OFF today (excluded from verdict) \u{b7} pulls spot 735/1470, chain 733/735"
+            ),
+            "OFF line must carry the per-leg pull digest: {msg}"
+        );
+        assert!(
+            off_line.contains("\u{26a0}\u{fe0f}"),
+            "degraded pulls on the OFF line must carry the warning mark: {msg}"
+        );
+        // No pull rows for the OFF feed → the segment is genuinely omitted.
+        let mut d = score_line("Dhan");
+        d.ticks = 0;
+        let ev = NotificationEvent::DualFeedDailyScorecard {
+            trading_date_ist: "2026-07-15".to_string(),
+            dhan: d,
+            groww: score_line("Groww"),
+            session_minutes: 375,
+            partial_coverage: false,
+            degraded: false,
+            early_run: false,
+            restart_partial: false,
+            dhan_feed_off: true,
+            groww_feed_off: false,
+            rest_legs: vec![rest_line("Dhan", "spot candles")],
+            rest_legs_read_failed: false,
+        };
+        let msg = ev.to_message();
+        assert!(
+            msg.contains("Dhan: OFF today (excluded from verdict)"),
+            "{msg}"
+        );
+        assert!(
+            !msg.contains("Dhan: OFF today (excluded from verdict) \u{b7}"),
+            "all-sentinel pull rows must omit the segment, never fabricate: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_dual_feed_scorecard_pulls_fold_into_feed_lines() {
+        // The retired per-leg digest folds into ONE `pulls a/b` segment per
+        // feed line (aggregate over that feed's measured legs; `-1` legs
+        // skipped; named gaps append the honest warning).
+        let rest_legs = vec![
+            RestLegScoreLine {
+                ok_fetches: 735,
+                failed_fetches: 0,
+                ..rest_line("Dhan", "spot candles")
+            },
+            RestLegScoreLine {
+                ok_fetches: 700,
+                failed_fetches: 33,
+                named_gaps: 2,
+                ..rest_line("Groww", "spot candles")
+            },
+            RestLegScoreLine {
+                ok_fetches: 33,
+                failed_fetches: 2,
+                ..rest_line("Groww", "option chain")
+            },
+            // All-sentinel leg: contributes nothing, fabricates nothing.
+            rest_line("Groww", "option contracts"),
+        ];
+        let ev = NotificationEvent::DualFeedDailyScorecard {
+            trading_date_ist: "2026-07-13".to_string(),
+            dhan: score_line("Dhan"),
+            groww: score_line("Groww"),
+            session_minutes: 375,
+            partial_coverage: false,
+            degraded: false,
+            early_run: false,
+            restart_partial: false,
+            dhan_feed_off: false,
+            groww_feed_off: false,
+            rest_legs,
+            rest_legs_read_failed: false,
+        };
+        let msg = ev.to_message();
+        assert!(
+            msg.contains("pulls spot 735/735 \u{2705}"),
+            "clean pulls segment wrong: {msg}"
+        );
+        assert!(
+            msg.contains(
+                "pulls spot 700/733, chain 33/35 \u{26a0}\u{fe0f}; 2 never recovered \u{26a0}\u{fe0f}"
+            ),
+            "degraded pulls segment wrong: {msg}"
+        );
+        // The retired per-leg digest section must never come back.
+        assert!(!msg.contains("Official minute candles"), "{msg}");
+        assert!(!msg.contains("after close"), "{msg}");
+        // An empty rest_legs vec omits the pulls segment entirely.
         let msg = scorecard(score_line("Dhan"), score_line("Groww")).to_message();
-        assert!(!msg.contains("switched off today"), "{msg}");
+        assert!(!msg.contains("pulls"), "{msg}");
+    }
+
+    #[test]
+    fn test_render_compact_date_ist_shapes() {
+        // G3 (fix round 2): compact card date — leading zero stripped,
+        // month name plain English, unparsable input rendered verbatim
+        // (fail-soft, never dropped).
+        assert_eq!(render_compact_date_ist("2026-07-14"), "14 Jul");
+        assert_eq!(render_compact_date_ist("2026-01-07"), "7 Jan");
+        assert_eq!(render_compact_date_ist("2026-12-31"), "31 Dec");
+        assert_eq!(render_compact_date_ist("garbage"), "garbage");
+        assert_eq!(render_compact_date_ist("2026-13-01"), "2026-13-01");
+        assert_eq!(render_compact_date_ist(""), "");
+    }
+
+    #[test]
+    fn test_dual_feed_scorecard_pulls_carry_p99_latency() {
+        // G7 (fix round 2): the pulls segment folds the measured worst-1%
+        // seconds-after-close delay into ONE compact bracketed figure per
+        // leg — the operator's Quote-2 latency answer back on the card.
+        let rest_legs = vec![
+            RestLegScoreLine {
+                ok_fetches: 735,
+                failed_fetches: 0,
+                close_p99_ms: 1_800,
+                close_samples: 730,
+                ..rest_line("Dhan", "spot candles")
+            },
+            RestLegScoreLine {
+                ok_fetches: 733,
+                failed_fetches: 2,
+                close_p99_ms: 2_100,
+                close_samples: 733,
+                ..rest_line("Dhan", "option chain")
+            },
+        ];
+        let ev = NotificationEvent::DualFeedDailyScorecard {
+            trading_date_ist: "2026-07-14".to_string(),
+            dhan: score_line("Dhan"),
+            groww: score_line("Groww"),
+            session_minutes: 375,
+            partial_coverage: false,
+            degraded: false,
+            early_run: false,
+            restart_partial: false,
+            dhan_feed_off: false,
+            groww_feed_off: false,
+            rest_legs,
+            rest_legs_read_failed: false,
+        };
+        let msg = ev.to_message();
+        assert!(
+            msg.contains("pulls spot 735/735 (1.8s), chain 733/735 (2.1s)"),
+            "pulls segment must carry per-leg p99 delay: {msg}"
+        );
+        // Zero-sample legs never fabricate a "0.0s" delay figure.
+        let rest_legs = vec![RestLegScoreLine {
+            ok_fetches: 735,
+            failed_fetches: 0,
+            close_p99_ms: 0,
+            close_samples: 0,
+            ..rest_line("Dhan", "spot candles")
+        }];
+        let ev = NotificationEvent::DualFeedDailyScorecard {
+            trading_date_ist: "2026-07-14".to_string(),
+            dhan: score_line("Dhan"),
+            groww: score_line("Groww"),
+            session_minutes: 375,
+            partial_coverage: false,
+            degraded: false,
+            early_run: false,
+            restart_partial: false,
+            dhan_feed_off: false,
+            groww_feed_off: false,
+            rest_legs,
+            rest_legs_read_failed: false,
+        };
+        let msg = ev.to_message();
+        assert!(
+            msg.contains("pulls spot 735/735 \u{2705}"),
+            "zero-sample leg must render counts without a delay figure: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_dual_feed_scorecard_latency_only_leg_renders_countless() {
+        // G6 (fix round 2): the documented spot_1m_rest latency-only
+        // fallback (counts -1, latency MEASURED — the forensics-writer
+        // outage / pre-2026-07-14 arm) renders a compact count-less
+        // segment — previously the measurement vanished from the card.
+        let rest_legs = vec![RestLegScoreLine {
+            close_p50_ms: 1_100,
+            close_p99_ms: 1_800,
+            close_max_ms: 5_000,
+            close_samples: 372,
+            ..rest_line("Dhan", "spot candles")
+        }];
+        let ev = NotificationEvent::DualFeedDailyScorecard {
+            trading_date_ist: "2026-07-14".to_string(),
+            dhan: score_line("Dhan"),
+            groww: score_line("Groww"),
+            session_minutes: 375,
+            partial_coverage: false,
+            degraded: false,
+            early_run: false,
+            restart_partial: false,
+            dhan_feed_off: false,
+            groww_feed_off: false,
+            rest_legs,
+            rest_legs_read_failed: false,
+        };
+        let msg = ev.to_message();
+        assert!(
+            msg.contains("pulls spot (1.8s)"),
+            "latency-only leg must render count-less, never vanish: {msg}"
+        );
+        // All-sentinel legs (nothing measured) still render nothing —
+        // the honest suppress-on-phone arm is unchanged.
+        let msg = scorecard(score_line("Dhan"), score_line("Groww")).to_message();
+        assert!(!msg.contains("pulls"), "{msg}");
+    }
+
+    #[test]
+    fn test_dual_feed_scorecard_read_failed_renders_unreadable_token() {
+        // G8 (fix round 2): a broken pull-record READ is an explicit
+        // per-feed token — distinguishable on the phone from "no pull
+        // data exists", including on the (permanent prod) feed-off line.
+        let mut d = score_line("Dhan");
+        d.ticks = 0;
+        let ev = NotificationEvent::DualFeedDailyScorecard {
+            trading_date_ist: "2026-07-14".to_string(),
+            dhan: d,
+            groww: score_line("Groww"),
+            session_minutes: 375,
+            partial_coverage: false,
+            degraded: false,
+            early_run: false,
+            restart_partial: false,
+            dhan_feed_off: true,
+            groww_feed_off: false,
+            rest_legs: vec![],
+            rest_legs_read_failed: true,
+        };
+        let msg = ev.to_message();
+        assert!(
+            msg.contains(
+                "Dhan: OFF today (excluded from verdict) \u{b7} pulls: records \
+                 unreadable \u{26a0}\u{fe0f}"
+            ),
+            "OFF line must carry the unreadable token on a read-failed day: {msg}"
+        );
+        let groww_line = msg
+            .lines()
+            .find(|l| l.contains("<code>Groww"))
+            .unwrap_or_default();
+        assert!(
+            groww_line.contains("pulls: records unreadable \u{26a0}\u{fe0f}"),
+            "the measured feed line must carry the unreadable token too: {msg}"
+        );
+        // The shared floor caveat still rides along (read-failed is a
+        // caveat class), and the line budget holds.
+        assert!(
+            msg.contains("Counts are a floor"),
+            "read-failed keeps the floor caveat: {msg}"
+        );
+        assert!(msg.lines().count() <= 6, "{msg}");
+    }
+
+    #[test]
+    fn test_dual_feed_scorecard_line_budget_and_footnotes_deleted() {
+        // Worst realistic case (measured everything + incidents + caveat)
+        // stays inside the 6-line budget; the six retired footnotes never
+        // render.
+        let mut d = score_line("Dhan");
+        let mut g = score_line("Groww");
+        d.lag_p50_ms = 1200;
+        d.lag_p99_ms = 2900;
+        g.lag_p50_ms = 180;
+        g.lag_p99_ms = 740;
+        g.stalls = 1;
+        let ev = NotificationEvent::DualFeedDailyScorecard {
+            trading_date_ist: "2026-07-10".to_string(),
+            dhan: d,
+            groww: g,
+            session_minutes: 375,
+            partial_coverage: true,
+            degraded: true,
+            early_run: true,
+            restart_partial: true,
+            dhan_feed_off: false,
+            groww_feed_off: false,
+            rest_legs: vec![RestLegScoreLine {
+                ok_fetches: 735,
+                failed_fetches: 0,
+                ..rest_line("Dhan", "spot candles")
+            }],
+            rest_legs_read_failed: true,
+        };
+        let msg = ev.to_message();
+        assert!(
+            msg.lines().count() <= 6,
+            "scorecard must stay ≤ 6 lines, got {}: {msg}",
+            msg.lines().count()
+        );
+        for retired in [
+            "Note: Dhan's price clock",
+            "Delay could not be measured today",
+            "produced early on operator request",
+            "The app restarted during the day",
+            "treat the drop counts as a minimum",
+            "while building this card",
+            "was switched off today \u{2014} no contest",
+        ] {
+            assert!(
+                !msg.contains(retired),
+                "retired footnote must not render ({retired:?}): {msg}"
+            );
+        }
     }
 
     #[test]
     fn test_dual_feed_scorecard_body_obeys_telegram_commandments() {
-        // 10-commandments litmus: emoji-first subject, IST 12-hour time,
-        // specific numbers, blame split, streaming check, no file paths,
-        // no library/infrastructure names.
         let msg = scorecard(score_line("Dhan"), score_line("Groww")).to_message();
-        assert!(msg.contains("\u{1f4ca}"), "scorecard leads with 📊: {msg}");
-        assert!(msg.contains("3:45 PM IST"), "IST 12-hour time: {msg}");
-        assert!(msg.contains("Date: 2026-07-10"), "{msg}");
-        // Commandment 6: big counts carry thousands separators.
-        assert!(
-            msg.contains("Ticks today: Dhan 1,842,551 | Groww 1,842,551"),
-            "{msg}"
-        );
-        assert!(
-            msg.contains("Drops in market hours: Dhan 3 | Groww 3"),
-            "drops line missing: {msg}"
-        );
-        // The blame split is its OWN line, decoupled from the drops count
-        // (it covers ALL headline incidents — drops + stalls + restarts).
-        assert!(
-            msg.contains("Who caused today's incidents: Dhan broker 2 / ours 0 / unclear 1"),
-            "incident split line missing: {msg}"
-        );
-        assert!(msg.contains("Streaming: Dhan 373 of 375 min"), "{msg}");
+        assert!(msg.contains("3:45 PM"), "IST 12-hour time: {msg}");
         for banned in ["data/", "QuestDB", "ILP", "DEDUP", ".rs", "SQL"] {
             assert!(
                 !msg.contains(banned),
                 "operator text must not carry {banned:?}: {msg}"
             );
         }
+    }
+
+    // -- helper units (2026-07-15) ------------------------------------------
+
+    #[test]
+    fn test_render_pulls_per_leg_skips_sentinel_legs_and_names_each_leg() {
+        // F3 (2026-07-15 fix round), verdict semantics tightened by R2
+        // (fix round 3): per-LEG pulls segment — each measured leg named
+        // compactly; `-1` legs render nothing (omission, never a
+        // fabricated zero); named gaps append the honest warning once.
+        // A failed-unmeasured leg renders "N ok" (never "N/N", which
+        // would imply zero failures) and real failures win the ⚠️ mark.
+        let legs = vec![
+            RestLegScoreLine {
+                ok_fetches: 10,
+                failed_fetches: 2,
+                named_gaps: 1,
+                ..rest_line("Groww", "spot candles")
+            },
+            rest_line("Groww", "option chain"), // all -1: skipped
+            RestLegScoreLine {
+                ok_fetches: 5,
+                failed_fetches: -1, // failed unmeasured: "5 ok", never 5/5
+                ..rest_line("groww", "option contracts")
+            },
+        ];
+        assert_eq!(
+            render_pulls_per_leg(&legs, "Groww"),
+            Some(
+                "pulls spot 10/12, contracts 5 ok \u{26a0}\u{fe0f}; \
+                 1 never recovered \u{26a0}\u{fe0f}"
+                    .to_string()
+            )
+        );
+        // No measured legs for this feed → None (segment omitted).
+        assert_eq!(render_pulls_per_leg(&legs, "Dhan"), None);
+        assert_eq!(render_pulls_per_leg(&[], "Dhan"), None);
+        // All-clean FULLY-COUNTED legs earn the green mark; unknown legs
+        // keep their plain-English name.
+        let clean = vec![
+            RestLegScoreLine {
+                ok_fetches: 3,
+                failed_fetches: 0,
+                ..rest_line("Dhan", "spot candles")
+            },
+            RestLegScoreLine {
+                ok_fetches: 7,
+                failed_fetches: 0,
+                ..rest_line("Dhan", "expired options")
+            },
+        ];
+        assert_eq!(
+            render_pulls_per_leg(&clean, "Dhan"),
+            Some("pulls spot 3/3, expired options 7/7 \u{2705}".to_string())
+        );
+    }
+
+    #[test]
+    fn test_render_pulls_per_leg_never_fabricates_a_verdict_mark() {
+        // R2 (fix round 3): a leg with ANY unmeasured half renders NO
+        // verdict mark — a latency-only day (the forensics-writer-outage
+        // fallback, where failures are invisible) previously rendered a
+        // fabricated green ✅ (Rule-11 false-OK).
+        // (a) Latency-only leg alone: numbers shown, NO mark.
+        let latency_only = vec![RestLegScoreLine {
+            close_p99_ms: 1800,
+            close_samples: 350,
+            ..rest_line("Dhan", "spot candles")
+        }];
+        assert_eq!(
+            render_pulls_per_leg(&latency_only, "Dhan"),
+            Some("pulls spot (1.8s)".to_string())
+        );
+        // (b) Failed-unmeasured leg alone: "N ok", NO /total, NO mark.
+        let failed_unmeasured = vec![RestLegScoreLine {
+            ok_fetches: 735,
+            failed_fetches: -1,
+            close_p99_ms: 1800,
+            close_samples: 700,
+            ..rest_line("Dhan", "spot candles")
+        }];
+        assert_eq!(
+            render_pulls_per_leg(&failed_unmeasured, "Dhan"),
+            Some("pulls spot 735 ok (1.8s)".to_string())
+        );
+        // (c) Mixed clean-counted + latency-only: still NO mark — the
+        // unmeasured leg makes a clean verdict unknowable.
+        let mixed = vec![
+            RestLegScoreLine {
+                ok_fetches: 733,
+                failed_fetches: 0,
+                ..rest_line("Groww", "spot candles")
+            },
+            RestLegScoreLine {
+                close_p99_ms: 2100,
+                close_samples: 400,
+                ..rest_line("Groww", "option chain")
+            },
+        ];
+        assert_eq!(
+            render_pulls_per_leg(&mixed, "Groww"),
+            Some("pulls spot 733/733, chain (2.1s)".to_string())
+        );
+        // (d) Mixed counted-WITH-failures + latency-only: real trouble
+        // wins — the ⚠️ mark renders (honest "known trouble", partial
+        // data notwithstanding).
+        let mixed_failing = vec![
+            RestLegScoreLine {
+                ok_fetches: 700,
+                failed_fetches: 35,
+                ..rest_line("Groww", "spot candles")
+            },
+            RestLegScoreLine {
+                close_p99_ms: 2100,
+                close_samples: 400,
+                ..rest_line("Groww", "option chain")
+            },
+        ];
+        assert_eq!(
+            render_pulls_per_leg(&mixed_failing, "Groww"),
+            Some("pulls spot 700/735, chain (2.1s) \u{26a0}\u{fe0f}".to_string())
+        );
+        // (e) Never-recovered gaps on a latency-only day: ⚠️ + the gap
+        // suffix (a named gap is real, counted trouble).
+        let gaps_latency_only = vec![RestLegScoreLine {
+            close_p99_ms: 1800,
+            close_samples: 350,
+            named_gaps: 3,
+            ..rest_line("Dhan", "spot candles")
+        }];
+        assert_eq!(
+            render_pulls_per_leg(&gaps_latency_only, "Dhan"),
+            Some(
+                "pulls spot (1.8s) \u{26a0}\u{fe0f}; 3 never recovered \u{26a0}\u{fe0f}"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn test_aligned_feed_line_omits_each_sentinel_field() {
+        let mut f = score_line("Dhan");
+        f.lag_p99_ms = 1400;
+        let line = aligned_feed_line(&f, 5, Some("pulls spot 735/735 \u{2705}".to_string()));
+        assert_eq!(
+            line,
+            "<code>Dhan : 1.84M ticks \u{b7} delay 1.4s \u{b7} drops 3 \u{b7} \
+                 pulls spot 735/735 \u{2705}</code>"
+        );
+        let mut f = score_line("Dhan");
+        f.ticks = -1;
+        f.drops_market = -1;
+        let line = aligned_feed_line(&f, 5, None);
+        assert!(!line.contains("ticks"), "{line}");
+        assert!(!line.contains("drops"), "{line}");
+        assert!(!line.contains("pulls"), "{line}");
+    }
+
+    #[test]
+    fn test_render_compact_count_and_secs() {
+        assert_eq!(render_compact_count(1_842_551), "1.84M");
+        assert_eq!(render_compact_count(999_999), "999,999");
+        assert_eq!(render_compact_count(42), "42");
+        assert_eq!(render_compact_secs(1400), "1.4s");
+        assert_eq!(render_compact_secs(400), "0.4s");
+        assert_eq!(render_compact_secs(0), "0.0s");
+    }
+
+    #[test]
+    fn test_incident_segment_split_and_extras() {
+        let mut f = score_line("Dhan");
+        f.blame_broker = 1;
+        f.blame_ours = 1;
+        f.blame_unclear = 0;
+        assert_eq!(incident_segment(&f), "Dhan 2 (broker 1 / ours 1)");
+        let mut f = score_line("Groww");
+        f.blame_broker = 0;
+        f.blame_ours = 0;
+        f.blame_unclear = 0;
+        assert_eq!(incident_segment(&f), "Groww 0");
+        // -1 sentinels never render and never poison the tally.
+        let mut f = score_line("Groww");
+        f.blame_broker = -1;
+        f.blame_ours = 2;
+        f.blame_unclear = -1;
+        assert_eq!(incident_segment(&f), "Groww 2 (ours 2)");
     }
 
     #[test]

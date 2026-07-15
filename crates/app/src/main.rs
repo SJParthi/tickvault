@@ -2888,7 +2888,11 @@ async fn run_process_runloop(
         }
     };
 
-    if shutdown_reason == "market_close" {
+    // 2026-07-15 shutdown classification: the signal kind that actually
+    // ended the run (previously logged then DROPPED) is threaded into the
+    // ShutdownInitiated event so a scheduled 4:30 PM IST stop renders one
+    // quiet line instead of paging like an incident.
+    let final_signal: &'static str = if shutdown_reason == "market_close" {
         info!("market close reached — post-market housekeeping, API stays alive");
         // 2026-05-02: suppress the Post-Market Telegram on non-trading
         // days (Saturday / Sunday / NSE holidays) where no market open
@@ -3011,11 +3015,44 @@ async fn run_process_runloop(
             reason,
             "shutdown signal received — stopping remaining services"
         );
+        reason
     } else {
         info!("shutdown signal received — stopping gracefully");
-    }
+        shutdown_reason
+    };
 
-    notifier.notify(NotificationEvent::ShutdownInitiated);
+    // Classify the stop (pure fn; fails toward ExternalStop — loud — on any
+    // doubt). Inputs are all in-process: the signal kind, the runtime
+    // source badge, the IST clock, and the trading calendar.
+    let shutdown_class = {
+        use chrono::{Datelike, Timelike};
+        let now_ist =
+            chrono::Utc::now().with_timezone(&tickvault_common::trading_calendar::ist_offset());
+        let today_ist = now_ist.date_naive();
+        let is_weekday = !matches!(
+            today_ist.weekday(),
+            chrono::Weekday::Sat | chrono::Weekday::Sun
+        );
+        let is_aws = matches!(
+            tickvault_core::notification::source_badge::runtime_source(),
+            tickvault_core::notification::source_badge::RuntimeSource::Aws
+        );
+        tickvault_app::shutdown_class::classify_shutdown(
+            final_signal,
+            is_aws,
+            now_ist.time().num_seconds_from_midnight(),
+            is_weekday,
+            trading_calendar.is_trading_day(today_ist),
+        )
+    };
+    info!(
+        signal = final_signal,
+        class = ?shutdown_class,
+        "shutdown classified"
+    );
+    notifier.notify(NotificationEvent::ShutdownInitiated {
+        class: shutdown_class,
+    });
 
     // Second Ctrl+C → force exit.
     tokio::spawn(async {
