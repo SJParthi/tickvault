@@ -5,7 +5,7 @@
 > **(b) `instrument_lifecycle` / `instrument_lifecycle_audit` / `index_constituency` SEBI retention STANDS UNCHANGED (§5/§6/§25)** — rows are NEVER deleted; `feed='dhan'` rows simply stop being written (retained as point-in-time history), the Groww `shared_master_writer` keeps writing `feed='groww'` rows, and the process-global ts-pin migration is KEPT.
 > **(c) Groww's watch build is UNAFFECTED** — it consumes its OWN master CSV + the niftyindices NTM list (Verified: zero Dhan-CSV consumption in `crates/core/src/feed/groww/`); the §31/§31.1 NTM contract lives on in the Groww resolver (`build_isin_token_map`).
 > **(d) §36 FUTIDX: the DHAN leg is RETIRED with the subscription contract; the GROWW leg STANDS** (§36.7 all-months, envelope ≤6/underlying, never-roll). The shared selector `index_futures.rs::select_index_future_expiries` becomes single-feed (must be DE-GATED from the `daily_universe_fetcher` cargo feature in Phase C or the Groww futures silently drop — scope violation); the FUTIDX-02 cross-feed parity comparator goes structurally DORMANT (fires only when both feeds record; variant retained — see `futidx-4-error-codes.md`).
-> **(e) The §7 instance/schedule/cost lock (r8g.large, 08:30–16:30 IST, ~₹2,919/mo) is UNTOUCHED by this banner.**
+> **(e) The §7 instance/schedule/cost lock (r8g.large, 08:30–16:30 IST, ~₹2,919/mo *(instance+bill SUPERSEDED 2026-07-15 → t4g.medium, ~₹1,471/mo — see §7 Quote 8; the schedule row is unchanged)*) is UNTOUCHED by this banner.**
 > Sections below are retained as historical audit per house convention; where they conflict with the 2026-07-13 amendment, the amendment wins.
 
 > **Authority:** CLAUDE.md > `operator-charter-forever.md` §I > this file > `websocket-connection-scope-lock.md` (SUPERSEDED below) > `aws-budget.md` (SUPERSEDED below) > defaults.
@@ -101,7 +101,7 @@
 - 2026-06-05: Operator NARROWED the schedule back from 08:00–17:00 IST to **08:30–16:30 IST** (verbatim: "make the aws instance start and stop from 8.30 am till 4.30 pm dude one and only when it is needed let me start it manually"). Crons: start `cron(0 3 ? * MON-FRI *)` (03:00 UTC = 08:30 IST), stop `cron(0 11 ? * MON-FRI *)` (11:00 UTC = 16:30 IST). The start-watchdog ping/check move to 08:30/08:45 IST; the GitHub-Actions after-close start cron + `aws-autopilot.sh`/`deploy-aws.yml` up-window move to 08:30–16:30 in lockstep. Cost: −1 hr/day (~−₹120/mo). The 08:30 start still gives the documented §10 boot budget before the 09:00 pre-open. This dated quote satisfies §7 Mechanical Rule 1 + §12 for the schedule change and supersedes the 2026-06-02 widening.
 - 2026-06-30: Approved instance UPGRADE m8g.large → **r8g.large** (Graviton4, 2 vCPU / 16 GiB) + EIP KEPT per Quote 7; bill ~₹2,058/mo → ~₹2,919/mo incl GST (270 hrs, 30 GB EBS, +EIP). The 2K-universe expansion is deferred to a separate later PR.
 - 2026-07-13: Approved EBS grow 30 GB -> 50 GB gp3 (+~₹170/mo incl GST) + instance-role S3 write on tv-prod-cold/groww-capture/* (Groww capture archival), per operator quote: "go ahead and merge everything once it is green - yes do whatever is the recommendation" (prod disk-pressure remediation - disk hit 82% on 2026-07-13 with zero reclamation). Note: the instance role's existing cold-bucket statement (main.tf, s3:GetObject/PutObject/ListBucket on the whole `tv-<env>-cold` bucket) ALREADY covers the groww-capture/* prefix — no IAM change was needed. Bill ~₹2,919/mo → ~₹3,101/mo incl GST (recomputed below).
-- 2026-07-15: Approved instance DOWNSIZE r8g.large → **t4g.medium** (2 vCPU / 4 GiB) + QDB_MEM_LIMIT 4g → 1g, executed via the guarded `downsize-instance.yml` workflow (old root snapshotted first, kept ~1 week), per Quote 8 ("Flip tonight: t4g.medium, QuestDB 1g, automated"). INTERIM bill (the live root stays 50 GB — gp3 cannot shrink) ~₹3,101/mo → **~₹1,471/mo** incl GST at 270 hrs; drops to ~₹1,197/mo only AFTER the 20 GB fresh-volume recreate (executor pre-stage, not operator-quoted); ~₹986/mo corresponds to the ~176-hr pure auto-schedule basis only, NEVER the 270-hr figure. EIP kept.
+- 2026-07-15: Approved instance DOWNSIZE r8g.large → **t4g.medium** (2 vCPU / 4 GiB) + QDB_MEM_LIMIT 4g → 1g, executed via the guarded `downsize-instance.yml` workflow (old root snapshotted first, kept ~1 week), per Quote 8 ("Flip tonight: t4g.medium, QuestDB 1g, automated"). INTERIM bill (the live root stays 50 GB — gp3 cannot shrink) ~₹3,101/mo → **~₹1,471/mo** incl GST at 270 hrs; drops to ~₹1,197/mo only AFTER the 20 GB fresh-volume recreate (executor pre-stage, not operator-quoted); ~₹986/mo requires BOTH the ~176-hr pure auto-schedule basis AND the post-recreate 20 GB volume (on the live 50 GB root the ~176-hr figure is ~₹1,260), NEVER the 270-hr figure. EIP kept.
 
 ---
 
@@ -266,7 +266,7 @@ Telegram are all included and free-tier.**
 | EBS gp3 50 GB (LIVE — cannot shrink; the 20 GB post-recreate line is $1.82) | $0.0912 × 50 | $4.56 |
 | S3 cold (aged-out partitions) | tiny, grows over time | $0.18 |
 | Docker (QuestDB + tickvault containers) | runs on the EC2 host | $0.00 |
-| CloudWatch metrics / alarms / Logs / Dashboards | free tier (unchanged from the r8g bill) | $0.00 |
+| CloudWatch metrics / alarms / Logs / Dashboards | BASE free tier only — the ~$2.7/mo of dated COST-NOTE alarms in aws-budget.md is NOT itemised here (see the honest envelope below) | $0.00 |
 | Lambda (telegram-webhook, budget-killswitch, triage) | free tier = 1M req/mo | $0.00 |
 | SNS → Telegram + Email fan-out | free tier (1M / 1k) | $0.00 |
 | SNS → SMS (optional) | ~100 India msgs | $0.28 |
@@ -279,13 +279,20 @@ Telegram are all included and free-tier.**
 (270 hrs, live 50 GB root, EIP kept) — a ~₹1,630/mo cut from the r8g.large
 ~₹3,101. **~₹1,197/mo applies ONLY after the 20 GB fresh-volume recreate**
 (subtotal $11.93 → ₹1,014 → ×1.18 ≈ ₹1,197; the EBS line moves $4.56 →
-$1.82). The operator's earlier ~₹986/mo figure corresponds to the **~176-hr
-pure Mon–Fri auto-schedule basis only** ($9.83 → ₹835 → ×1.18 ≈ ₹986) — it
-is NEVER to be presented as the 270-hr figure, and the hours basis is NOT
-re-based by this change. **The entire observability stack — CloudWatch
-metrics/alarms/logs/dashboards, all 3 Lambdas, and Telegram + Email alert
-fan-out — costs ₹0** (free tier per §7 Rule 5's CloudWatch-only design;
-only optional SMS is ~₹24). The EIP is kept because an
+$1.82). The operator's earlier ~₹986/mo figure **requires BOTH the ~176-hr
+pure Mon–Fri auto-schedule basis AND the post-recreate 20 GB volume**
+($9.82 → ₹835 → ×1.18 ≈ ₹986); on the LIVE 50 GB root the ~176-hr figure
+is **~₹1,260** ($12.56 → ₹1,068 → ×1.18 ≈ ₹1,260) — ~₹986 is NEVER to be
+presented as the 270-hr figure or as achievable before the recreate, and
+the hours basis is NOT re-based by this change. **The observability stack
+is NOT ₹0** (corrected 2026-07-15 — an earlier draft of this section said
+"costs ₹0"): the BASE CloudWatch/Lambda/Telegram+Email fan-out design sits
+in the free tier per §7 Rule 5, but the dated COST NOTES accumulated in
+`aws-budget.md` (silent-feed +$1.50, REST-audit +$0.60, order-side +$0.60,
+scoreboard +$0.40, PR-C3 −$0.40) total ~**$2.7/mo ≈ ₹271/mo incl GST** of
+live alarm/metric spend that the bill table above does NOT itemise (the
+same omission every prior §7 headline bill carried); optional SMS is ~₹24
+on top. The EIP is kept because an
 `aws ec2 modify-instance-attribute` instance-type flip (stop→modify→start)
 leaves the ENI with NO ephemeral public IP (auto-assign-public-IP is a
 fresh-launch-only attribute), so only the EIP gives the box an internet
@@ -318,14 +325,14 @@ note in aws-budget.md). Operator approved 2026-07-15 (Quote 8).
 
 2. **Host memory budget for t4g.medium (4 GiB total) — Groww-only runtime (~770-SID universe, 21 TFs):**
    - QuestDB process: ~1.0 GB (`QDB_MEM_LIMIT=1g` — compose default + the on-box `deploy/docker/.env`, retuned by the downsize workflow's SSM step)
-   - Tickvault app: ~700 MB actual / 1.5 GB cap (Groww-only feed — the pre-downsize Rule 2 budgeted ~3.2 GB at a ~1000-SID BOTH-feeds universe; see the FLAG below)
+   - Tickvault app: ~700 MB actual **(the 2026-05-18 4-SID-universe measurement — NOT a ~770-SID measurement)** / 1.5 GB cap (see the FLAG below for what the retained sizing formula predicts at ~770 SIDs)
    - App: rescue ring (100K tick cap, fixed): 10 MB
    - App: QuestDB ILP write buffer: 25 MB
    - App: 15+ audit-table buffers: 30 MB
    - Tracing / errors.jsonl rotation buffer: 100 MB
    - OS + FS cache + kernel TCP buffers: ~400 MB
-   - **Total used: ~2.6–3.1 GB**
-   - **Headroom: ~0.9–1.4 GB** — above the 1 GB Linux kswapd floor only at the low end. **FLAG (honest, unresolved — Assumed until measured):** if the app's live RSS is materially above ~1.5 GB (read `tv_process_rss_bytes` / RESOURCE-02 and `mem_used_percent` before AND after cutover), 4 GiB does NOT fit and t4g.large (8 GiB) is the rip-cord. QuestDB at 1g serving today's ~770-SID Groww write load is likewise re-validated live (the old 1g-class budget served the 4-SID universe). BURSTABLE CPU: watch `CPUCreditBalance` after cutover.
+   - **Total used: ~2.3 GB (app at the ~700 MB 4-SID actual) – ~3.1 GB (app at the 1.5 GB cap)** — the rows above sum to ~2.27 GB / ~3.07 GB (arithmetic corrected 2026-07-15; an earlier draft said "~2.6–3.1")
+   - **Headroom: ~0.9–1.7 GB** — above the 1 GB Linux kswapd floor only while the app stays at/under its cap. **FLAG (honest, unresolved — Assumed until measured; Rule 11, no false-OK):** the pre-downsize Rule 2 sizing formula this file has always carried (≈3.2 MB × SID for the 21-TF today+yesterday RAM-resident set) predicts an app working set of **~2.5 GB at ~770 SIDs** — with QuestDB at 1g that totals ~4.1 GB (2.5 app + 1.0 QDB + ~0.17 buffers + ~0.4 OS) and does **NOT fit in 4 GiB**. The ~700 MB "actual" and the formula cannot both hold at ~770 SIDs; **the first live session on t4g.medium is the measured gate** — read `tv_process_rss_bytes` / RESOURCE-02 and `mem_used_percent` before AND after cutover; if live RSS is materially above ~1.5 GB, 4 GiB does not fit and t4g.large (8 GiB) is the rip-cord. QuestDB at 1g serving today's ~770-SID Groww write load is likewise re-validated live (the old 1g-class budget served the 4-SID universe). BURSTABLE CPU: watch `CPUCreditBalance` after cutover.
 
 3. **EBS = 50 GB gp3 LIVE; 20 GB is the pre-staged fresh-volume TARGET** (executor decision 2026-07-15, recorded in §0 under Quote 8 — NOT operator-quoted scope). gp3 grows online but can NEVER shrink: `modify-volume` refuses a smaller size and a 50 GB snapshot cannot restore into a 20 GB volume, so 50 → 20 requires a volume/instance REPLACEMENT (terraform terminate-and-recreate in the operator's post-market erase window; the box is fully cattle-provisioned by `user-data.sh.tftpl`; tonight's pre-downsize snapshot is the rollback, kept ~1 week; the GitHub secret `EC2_INSTANCE_ID` must be rotated to the new id at recreate time). Terraform `ebs_gp3_size_gb` default = 20 documents FRESH-PROVISION intent only — `root_block_device[0].volume_size` is in the instance `lifecycle.ignore_changes`, so `terraform apply` never touches the live volume. History: 10 GB → 30 GB (2026-05-29 Quote 6) → 50 GB (2026-07-13 disk-pressure grow) → 20 GB target (2026-07-15). The partition manager keeps auto-archiving partitions >90d to the S3 cold bucket (~4× cheaper per GB than EBS), so EBS holds only the hot window.
 
@@ -453,7 +460,7 @@ When any PR / commit message / Telegram body invokes "100% guarantee" for the da
 > app boot BLOCKS until fresh CSV in hand — never proceeds with stale, partial, or corrupt data;
 > ≤20-second tick burst absorbed via 100K-tick rescue ring (constant `TICK_BUFFER_CAPACITY`, ratcheted by `zero_tick_loss_alert_guard.rs`);
 > beyond 20s, NDJSON spill → DLQ catches every payload as recoverable text;
-> all 21 timeframes RAM-resident for today + yesterday across the current universe (~770 SIDs, Groww-only runtime; app cap ~1.5 GB per §7 Rule 2, ~0.9–1.4 GB headroom on the t4g.medium 4 GiB host — headroom Assumed until live-measured; wording updated 2026-07-15 per Quote 8, was "~3.2 GB working set, ~7.8 GB headroom on the r8g.large 16 GiB host");
+> all 21 timeframes RAM-resident for today + yesterday across the current universe (~770 SIDs, Groww-only runtime; app cap ~1.5 GB per §7 Rule 2, ~0.9–1.7 GB budgeted headroom on the t4g.medium 4 GiB host — headroom Assumed until live-measured; wording updated 2026-07-15 per Quote 8, was "~3.2 GB working set, ~7.8 GB headroom on the r8g.large 16 GiB host");
 > `instrument_lifecycle` table is SEBI-compliant — NO DELETEs ever, only state transitions to `expired_*` SYMBOLs preserved in `(security_id, exchange_segment)` composite-key history per I-P1-11;
 > daily lifecycle reconciler captures every appearance, disappearance, rename, segment-move, split — logged to `instrument_lifecycle_audit` forensic chain with 5-year SEBI retention."
 
@@ -962,7 +969,7 @@ boot that produced the snapshot.
   **2026-07-15 Quote 8 supersession note:** the host is now **t4g.medium 4 GiB**
   (§7) — a ~1,000-SID ~3.2 GB working set does NOT fit next to QuestDB@1g + OS on
   4 GiB. Today's Groww-only ~770-SID runtime is budgeted per §7 Rule 2 with
-  ~0.9–1.4 GB headroom (Assumed until live-measured). Any NTM-scale re-expansion
+  ~0.9–1.7 GB budgeted headroom (Assumed until live-measured). Any NTM-scale re-expansion
   must re-pass the measured RAM gate on the 4 GiB host — or re-size the instance
   per §7 Mechanical Rule 1 — before go-live.
 - "~750 NTM stocks" is the expected count; the EXACT count comes from the live
@@ -1091,7 +1098,7 @@ far-suffix vendor publication lag is an info-level note + counter.
 Bandwidth delta (typical ~12 contracts, vendor-controlled): Dhan ~12 × 50 B Quote × ~4 pkts/s
 ≈ 2.4 KB/s + ~0.15 KB/s code-5 OI packets (<1.5% of the §8 envelope); Groww ~12 LTP subs
 (~779 of the 1000 cap, futures cap-priority); RAM ~12 SIDs × 21 TF cells ≈ 39 MB against
-the t4g.medium 4 GiB host's ~0.9–1.4 GB headroom (Assumed until live-measured — host
+the t4g.medium 4 GiB host's ~0.9–1.7 GB budgeted headroom (Assumed until live-measured — host
 downsized 2026-07-15 per §7 Quote 8; was ~7.8 GB on r8g.large when this envelope was
 written); universe ≈ 343 inside [100, 1200]; no buffer/channel constant
 changes; no cost impact (no instance/schedule/storage change — §15 step 5 N/A).

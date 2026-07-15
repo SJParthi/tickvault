@@ -151,10 +151,11 @@ fn instance_lock_supersession_markers_present_in_operator_charter() {
 /// number is the honest INTERIM ~₹1,471/mo (270 hrs, EIP kept, incl.
 /// 18% GST, LIVE 50 GB root — gp3 cannot shrink tonight). ~₹1,197/mo is
 /// pinned only as the labelled post-20-GB-recreate figure, and ~₹986/mo
-/// only as the ~176-hr auto-schedule figure — the guard additionally
-/// requires those labels so the live bill is never misstated. If someone
-/// re-tunes any of this in the rule file without operator approval, the
-/// build fails.
+/// requires BOTH the ~176-hr auto-schedule basis AND the post-recreate
+/// 20 GB volume (on the live 50 GB root the ~176-hr figure is ~₹1,260) —
+/// the guard requires those labels so the live bill is never misstated.
+/// If someone re-tunes any of this in the rule file without operator
+/// approval, the build fails.
 #[test]
 fn instance_lock_monthly_bill_pinned_to_rupees_1471_interim() {
     let root = repo_root();
@@ -169,8 +170,12 @@ fn instance_lock_monthly_bill_pinned_to_rupees_1471_interim() {
         "rule file §7 must label ~₹1,197/mo as the post-20-GB-recreate figure, never the current bill"
     );
     assert!(
-        body.contains("~176-hr"),
-        "rule file §7 must label ~₹986/mo as the ~176-hr auto-schedule figure, never the 270-hr one"
+        body.contains("requires BOTH the ~176-hr"),
+        "rule file §7 must label ~₹986/mo as requiring BOTH the ~176-hr basis AND the post-recreate 20 GB volume (review round 6 — the 176-hr-only label understated the live-50-GB figure)"
+    );
+    assert!(
+        body.contains("~₹1,260"),
+        "rule file §7 must state the live-50-GB ~176-hr figure (~₹1,260) so ~₹986 is never presented as reachable before the 20 GB recreate"
     );
 }
 

@@ -27,6 +27,9 @@
 - [x] The guarded one-shot workflow with review-round-1 fixes folded in (env-mapped inputs, SSM/SNS IAM probes, retune-only continuation mode, verified rollback, always()-power-state restore, honest failure Telegram)
   - Files: .github/workflows/downsize-instance.yml
   - Tests: (workflow YAML — validated by yamllint-equivalent parse + the SSM-quoting rule pattern; not crate-testable)
+- [x] Review round 6 hardening: credential_mode input (bootstrap-keys default — the OIDC role has ZERO EC2 mutation grants), probe list matched to the actions actually used (volume-mutation probes removed; DescribeVolumes/Addresses/Snapshots/InstanceStatus + CreateTags added), fail-loud SSM QuestDB-cred fetch (admin/quest fallbacks removed), snapshot AFTER stop with immediate snap_id output + tv-delete-after tag + manual-deletion honesty, MainPID-verified app restart, 240s QuestDB readiness, verified re-stop feeding the success Telegram (failed re-stop fails the run), honest initially-running-left-stopped reporting, rollback stop-wait, status-ok wait loop, post-modify type read-back, SHA-pinned credentials action; honest cost/memory wording sweep (₹986 dual-precondition caveat, ~₹271/mo observability COST NOTES, Rule-2 arithmetic + 4-SID measurement qualifier + ~770-SID formula flag, banner clause (e) supersession bracket, dated r8g drift notes in main.tf/budget.tf/user-data/app-alarms/instance-upgrade runbook/PROC-01 triage)
+  - Files: .github/workflows/downsize-instance.yml, scripts/validate-deploy-ssm-quoting.sh, .claude/rules/project/daily-universe-scope-expansion-2026-05-27.md, .claude/rules/project/aws-budget.md, .claude/rules/project/wave-4-error-codes.md, docs/architecture/aws-indices-only-locked-architecture.md, docs/runbooks/instance-upgrade.md, deploy/aws/terraform/main.tf, deploy/aws/terraform/budget.tf, deploy/aws/terraform/user-data.sh.tftpl, deploy/aws/terraform/app-alarms.tf, crates/storage/tests/instance_type_lock_guard.rs, crates/storage/tests/aws_deploy_safety_guard.rs
+  - Tests: instance_lock_monthly_bill_pinned_to_rupees_1471_interim, deploy_questdb_mem_limit_pins_1g_for_t4g_medium
 
 ## Design
 
@@ -37,7 +40,9 @@ probe of EVERY EC2 mutation + real read-probes of ssm:DescribeInstanceInformatio
 sns:Publish (preflight ping) → post-market IST guard → bounded wait for in-flight
 deploy-aws runs → record state + pick mode (`full` when r8g.large; `retune_only`
 when already t4g.medium — a prior partial run continues instead of dead-ending) →
-snapshot-first (rollback, ~1 week) → stop → modify → start + status-ok + EIP
+stop (benign/reversible) → snapshot AFTER the stop (clean image; NO auto-delete —
+manual cleanup after the rollback week, tagged tv-delete-after; round 6, was
+snapshot-first) → modify (post-modify type read-back) → start + status-ok + EIP
 identity + SSM-online → SSM retune (idempotent .env sed-upsert to QDB_MEM_LIMIT=1g
 on BOTH .env paths + questdb recreate + app restart with a 300s active bound) →
 log-ingestion smoke → power-state restore (`if: always()`) → honest Telegram. The
@@ -49,9 +54,12 @@ the operator-window terminate-and-recreate (executor decision, not Quote 8 scope
 
 ## Edge Cases
 
-- Box initially STOPPED (normal post-16:30 IST) vs RUNNING — both tolerated; step 4
-  re-reads LIVE state (a queued deploy dispatch can self-start the box mid-run);
-  step 9b restores the initial power state on success AND failure.
+- Box initially STOPPED (normal post-16:30 IST) vs RUNNING — both tolerated; the
+  stop step re-reads LIVE state (a queued deploy dispatch can self-start the box
+  mid-run); step 9b restores the initial power state on success AND failure, reads
+  back the final LIVE state for the success message, fails the run on a failed
+  re-stop, and honestly reports an initially-running box a failure left stopped
+  (never auto-restarts post-failure).
 - Box already t4g.medium (prior partial run) — retune-only continuation mode, never
   a refusal; the .env upsert is idempotent.
 - Queued deploy-aws dispatches (29409568521 / 29411020997) + 16:16/17:01 IST crons —
@@ -67,7 +75,8 @@ the operator-window terminate-and-recreate (executor decision, not Quote 8 scope
 
 - Missing IAM action — discovered pre-mutation by step 0 (EC2 dry-runs + SSM read
   canary + SNS publish probe); named in the error; nothing changed.
-- Snapshot never completes (~60 min bound) — abort BEFORE any stop; nothing changed.
+- Snapshot never completes (~60 min bound) — abort BEFORE the type change; the box
+  is merely stopped (benign/reversible — step 9b reports/restores power state).
 - t4g.medium start failure (capacity) — auto-rollback to r8g.large, then VERIFIED
   (live type + power re-read); Telegram says "rolled back (verified)" or "ROLLBACK
   NOT CONFIRMED + actual state + manual commands" — never an unverified claim.
