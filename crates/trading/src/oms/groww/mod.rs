@@ -44,7 +44,9 @@ pub use tickvault_common::broker_order_events::{BrokerOrderEvent, BrokerOrderSta
 
 // Area modules land in their own serial PRs, each behind this same feature:
 //   pub mod api_client;    // Orders        (GROWW-ORD-*)
-//   pub mod smart_orders;  // Smart Orders  (GROWW-OCO-*)
 //   pub mod portfolio;     // Portfolio     (GROWW-PORT-*)
 //   pub mod margin;        // Margin        (GROWW-MARG-*)
 //   pub mod user;          // User + Exceptions (GROWW-READY-*)
+
+/// Smart Orders (GTT/OCO) area — `GROWW-OCO-*` (§39.3, 2026-07-15).
+pub mod smart_orders;
