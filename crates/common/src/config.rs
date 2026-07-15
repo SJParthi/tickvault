@@ -176,6 +176,16 @@ pub struct ApplicationConfig {
     /// (fail-safe default off); `config/base.toml` opts in.
     #[serde(default)]
     pub groww_universe: GrowwUniverseConfig,
+    /// `[groww_orders]` — Groww ORDER-SIDE build gate (operator authorization
+    /// 2026-07-14, `.claude/rules/project/groww-second-feed-scope-2026-06-19.md`
+    /// §39). GATE 1 of the 4-gate live-fire lattice: every key default-OFF, so
+    /// an absent section leaves the entire Groww order-side dark. Read-only
+    /// order/portfolio/margin/user GETs are per-area config-gated + market-hours
+    /// -only when enabled; live order placement is hard-locked behind Gates
+    /// 2 (cargo feature) + 3 (the `GROWW_ORDER_LIVE_FIRE` const) regardless of
+    /// this config. Absent section ⇒ fully DISABLED (fail-safe default off).
+    #[serde(default)]
+    pub groww_orders: GrowwOrdersConfig,
     /// `[dhan_margin_gate]` — 🔷 DHAN pre-trade margin gate (operator
     /// directive 2026-07-14, relayed via the coordinator session — the
     /// Funds & Margin surface runs as its own dedicated build; umbrella
@@ -753,6 +763,62 @@ impl Default for GrowwContract1mConfig {
             strikes_each_side: default_groww_contract_1m_strikes_each_side(),
         }
     }
+}
+
+/// `[groww_orders]` — Groww ORDER-SIDE build gate (operator authorization
+/// 2026-07-14; `.claude/rules/project/groww-second-feed-scope-2026-06-19.md`
+/// §39, `.claude/rules/project/no-rest-except-live-feed-2026-06-27.md` §10).
+///
+/// This is GATE 1 of the 4-gate live-fire lattice (§39.2). Every field is
+/// `#[serde(default)]` = `false`, so an absent `[groww_orders]` section (or a
+/// TOML written before this build) leaves the ENTIRE Groww order-side dark —
+/// no read-only order GET, no margin/portfolio poll, and (independently)
+/// NO mutating order request. `config/base.toml` ships the section with every
+/// key `false`.
+///
+/// Two independent classes of gate:
+/// - Per-area READ-ONLY GETs (`orders_read`, `portfolio_read`, `margin_read`,
+///   `user_read`) — order/trade list+detail+status, positions, holdings,
+///   margins, user profile. When flipped `true` these run CONFIG-GATED +
+///   MARKET-HOURS-ONLY (the cold-path scheduled-read discipline). They place
+///   NO order.
+/// - `live_fire_requested` — a DECLARED INTENT flag ONLY. It is IGNORED unless
+///   Gate 3 (the hardcoded [`crate::constants::GROWW_ORDER_LIVE_FIRE`] const)
+///   is ALSO flipped in source AND the `groww_orders` cargo feature (Gate 2)
+///   is built in. Setting it `true` alone fires nothing — a config value can
+///   never, by itself, place a live Groww order. Flipping the actual
+///   live-orders enable is a SEPARATE, future, dated operator action that
+///   edits §39 + Gate 3 first.
+///
+/// Extension point: every FUTURE field on this struct MUST also be
+/// `#[serde(default)]` so older TOMLs keep deserializing byte-identically
+/// (the `GrowwSpot1mConfig` / `Spot1mRestConfig` precedent).
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct GrowwOrdersConfig {
+    /// Read-only order/trade GETs (list, detail, status, status-by-reference,
+    /// trades). Default OFF. Market-hours-gated when enabled.
+    #[serde(default)]
+    pub orders_read: bool,
+    /// Read-only portfolio GETs (positions user + by-symbol, holdings).
+    /// Default OFF. Market-hours-gated when enabled.
+    #[serde(default)]
+    pub portfolio_read: bool,
+    /// Read-only margin GETs (user margin detail + margin calculator).
+    /// Default OFF. Market-hours-gated when enabled.
+    #[serde(default)]
+    pub margin_read: bool,
+    /// Read-only user-profile GET (the user-detail endpoint) + exceptions
+    /// surface.
+    /// Default OFF. Market-hours-gated when enabled.
+    #[serde(default)]
+    pub user_read: bool,
+    /// DECLARED-INTENT flag for placing live Groww orders. IGNORED unless the
+    /// hardcoded [`crate::constants::GROWW_ORDER_LIVE_FIRE`] const (Gate 3) is
+    /// ALSO `true` AND the `groww_orders` cargo feature (Gate 2) is built —
+    /// a config value alone can NEVER fire an order. Default OFF; flipping the
+    /// real enable is a separate future dated operator action.
+    #[serde(default)]
+    pub live_fire_requested: bool,
 }
 
 /// 🔷 DHAN pre-trade margin gate (`[dhan_margin_gate]`).
@@ -2743,8 +2809,25 @@ mod tests {
             tf_consistency: TfConsistencyConfig::default(),
             groww_contract_1m: GrowwContract1mConfig::default(),
             groww_universe: GrowwUniverseConfig::default(),
+            groww_orders: GrowwOrdersConfig::default(),
             dhan_margin_gate: DhanMarginGateConfig::default(),
         }
+    }
+
+    /// PR-0 (Groww order-side build, §39.2 Gate 1): every `[groww_orders]`
+    /// gate defaults OFF — the safe, dark default. A missing section must
+    /// produce exactly this.
+    #[test]
+    fn test_groww_orders_config_defaults_all_off() {
+        let cfg = GrowwOrdersConfig::default();
+        assert!(!cfg.orders_read, "orders_read must default off");
+        assert!(!cfg.portfolio_read, "portfolio_read must default off");
+        assert!(!cfg.margin_read, "margin_read must default off");
+        assert!(!cfg.user_read, "user_read must default off");
+        assert!(
+            !cfg.live_fire_requested,
+            "live_fire_requested must default off — and is inert without Gate 3"
+        );
     }
 
     // -----------------------------------------------------------------------

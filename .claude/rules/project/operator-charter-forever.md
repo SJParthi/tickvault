@@ -231,6 +231,8 @@ For every plan item / new feature / Telegram message / docs:
 >
 > **2026-07-15:** the GROWW live WS is ALSO retired (operator Q1, received directly in this session: *"remove the whole Groww live feed; keep only spot 1m and option chain for both brokers; go."*) — the market-data runtime is REST-only for both brokers, live market-data WS count = 0; see `websocket-connection-scope-lock.md` "2026-07-15 Amendment".
 >
+> **⚠ 2026-07-14 — Groww ORDER-SIDE build authorized, live fire LOCKED (pointer):** the operator authorized BUILDING + INTEGRATING the Groww order-side (orders / smart orders / portfolio / margin / user) **entirely behind a 4-gate live-fire lattice** — `.claude/rules/project/groww-second-feed-scope-2026-06-19.md` §39 + `.claude/rules/project/no-rest-except-live-feed-2026-06-27.md` §10 (each gate build-failure-ratcheted by `crates/common/tests/groww_order_lattice_guard.rs`). NO Groww order fires until a separate future dated live-orders enable; `dry_run` stays `true` and the §28 strategy/indicator boundary stays frozen. This is a market-data-WS-neutral change — it adds NO WebSocket connection.
+>
 > **⚠ ALLOWED-INSTRUMENTS SUPERSEDED 2026-05-27 by [`daily-universe-scope-expansion-2026-05-27.md`](./daily-universe-scope-expansion-2026-05-27.md):** main-feed expanded from 4 IDX_I SIDs to ~250 daily-fetched SIDs (all NSE indices + 1 BSE SENSEX + unique F&O underlyings, all Quote mode). The 2-WebSocket lock (1 main-feed + 1 order-update FOREVER) is UNCHANGED — only the instrument set on the single main-feed conn expanded per operator approval 2026-05-27. The 2026-05-15 verbatim quote below still binds the 2-WS architecture.
 >
 > Operator verbatim 2026-05-15:

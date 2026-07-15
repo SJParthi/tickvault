@@ -600,6 +600,25 @@ strikes_each_side = 2
 enabled = true
 
 # ===========================================================================
+# Groww ORDER-SIDE build gate (operator authorization 2026-07-14 —
+# groww-second-feed-scope-2026-06-19.md §39, no-rest-except-live-feed §10).
+# GATE 1 of the 4-gate live-fire lattice. EVERY key is false: the entire
+# Groww order-side ships DARK. Read-only order/portfolio/margin/user GETs run
+# ONLY when their per-area flag here is true AND during market hours. Live
+# order PLACEMENT is additionally hard-locked behind Gate 2 (the non-default
+# `groww_orders` cargo feature) + Gate 3 (the GROWW_ORDER_LIVE_FIRE = false
+# source const): flipping live_fire_requested alone fires NOTHING. Flipping
+# any of these to true for live orders is a SEPARATE future dated operator
+# action that edits §39 + Gate 3 first. Absent section = fully disabled.
+# ===========================================================================
+[groww_orders]
+orders_read = false
+portfolio_read = false
+margin_read = false
+user_read = false
+live_fire_requested = false
+
+# ===========================================================================
 # 🔷 DHAN pre-trade margin gate (operator directive 2026-07-14, relayed via
 # the coordinator session — the Funds & Margin surface runs as its own
 # dedicated build). Code-ready, DEFAULT-OFF: even with enabled = true the
