@@ -2072,10 +2072,10 @@ pub fn spawn_tf_consistency_tasks(
                 // Terminal-quality outcomes ONLY (pass / no_data) mark the
                 // day delivered; mismatch/degraded/blind leave the marker
                 // unwritten so a restart re-runs + re-pages (Rule 11).
-                if status_label == "pass" || status_label == "no_data" {
-                    if let Some(d) = marker_date {
-                        crate::daily_task_marker::write_daily_marker(TF_CONSISTENCY_MARKER_TASK, d);
-                    }
+                if (status_label == "pass" || status_label == "no_data")
+                    && let Some(d) = marker_date
+                {
+                    crate::daily_task_marker::write_daily_marker(TF_CONSISTENCY_MARKER_TASK, d);
                 }
             }
             Ok(Ok(None)) => {} // non-trading-day skip / refused force — no page.
