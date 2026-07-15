@@ -228,6 +228,26 @@ pub fn expiry_page_due_after_wave(
         )
 }
 
+/// R3 (2026-07-15): fold ONE completed resolution wave into a
+/// (broker, underlying) pair's REAL-failed-wave counter. Counts ONLY
+/// waves where a fetch was actually DISPATCHED for the pair and the
+/// pair remained unresolved — a disabled-lane iteration, a
+/// gate-deferred/conceded fire, or a skipped already-resolved pair
+/// never advances the counter. The pre-R3 loop-global counter
+/// resurrected the E4 hair trigger via the lane-toggle path: a
+/// post-deadline boot with a delayed Dhan lane enable reached
+/// [`POST_DEADLINE_BOOT_MIN_FAILED_WAVES`] with ZERO real attempts, so
+/// the FIRST real attempt paged immediately.
+#[must_use]
+// TEST-EXEMPT: covered by test_cadence_expiry_failed_waves_count_only_real_attempts (guard name-pattern mismatch).
+pub fn next_failed_wave_count(prev: u32, attempt_dispatched: bool, resolved: bool) -> u32 {
+    if attempt_dispatched && !resolved {
+        prev.saturating_add(1)
+    } else {
+        prev
+    }
+}
+
 /// One underlying's day-locked resolution view (the read API surface the
 /// future capture-leg delegation consumes — see the ONE-SOURCE-OF-TRUTH
 /// DELEGATION section of `cadence-error-codes.md`).
@@ -720,11 +740,46 @@ mod tests {
     }
 
     #[test]
+    fn test_cadence_expiry_failed_waves_count_only_real_attempts() {
+        // R3 (2026-07-15): disabled-lane / gate-deferred / no-dispatch
+        // iterations (attempt_dispatched = false) never advance the
+        // counter — a post-deadline boot with a delayed lane enable
+        // therefore needs TWO REAL failed waves before the page, never
+        // "N zero-attempt loop iterations, then page on the first real
+        // attempt" (the resurrected E4 hair trigger).
+        let mut waves = 0_u32;
+        for _ in 0..5 {
+            waves = next_failed_wave_count(waves, false, false);
+        }
+        assert_eq!(waves, 0, "zero-attempt iterations must not count");
+        waves = next_failed_wave_count(waves, true, false);
+        assert_eq!(waves, 1);
+        assert!(
+            !expiry_page_due_after_wave(40_000, 32_100, false, false, true, waves),
+            "the FIRST real failed attempt after disabled-lane iterations must not page"
+        );
+        waves = next_failed_wave_count(waves, true, false);
+        assert_eq!(waves, 2);
+        assert!(
+            expiry_page_due_after_wave(40_000, 32_100, false, false, true, waves),
+            "the SECOND consecutive REAL failed wave pages"
+        );
+        // A dispatched wave that RESOLVED never counts (page is moot).
+        assert_eq!(next_failed_wave_count(2, true, true), 2);
+        // Saturating — a day-long outage can never wrap the counter.
+        assert_eq!(next_failed_wave_count(u32::MAX, true, false), u32::MAX);
+    }
+
+    #[test]
     fn test_cadence_expiry_page_post_deadline_boot_needs_two_failed_waves() {
         // E4 (2026-07-15): a process BOOTING after the deadline (e.g. a
         // crash-boot at 11:00 IST) must observe ≥2 consecutive failed
         // waves before the page fires — never the first-wave hair
-        // trigger.
+        // trigger. R3 (2026-07-15) STRENGTHENS the wave semantics: the
+        // counter fed into this predicate counts only REAL dispatched
+        // attempts per (broker, underlying) pair (see
+        // next_failed_wave_count) — never disabled-lane or
+        // gate-deferred iterations.
         assert_eq!(POST_DEADLINE_BOOT_MIN_FAILED_WAVES, 2);
         // Post-deadline boot, first failed wave: NOT due.
         assert!(!expiry_page_due_after_wave(

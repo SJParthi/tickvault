@@ -40,8 +40,8 @@ use super::executor::{
     ExpiryResolver, SpotFetchRequest, SpotSnapshot, SpotTarget,
 };
 use super::expiry::{
-    DayLockedExpiryStore, expiry_page_due_after_wave, naive_to_yyyymmdd, policy_for,
-    resolve_policy_expiry,
+    DayLockedExpiryStore, expiry_page_due_after_wave, naive_to_yyyymmdd, next_failed_wave_count,
+    policy_for, resolve_policy_expiry,
 };
 use super::gate::{DhanGates, GateVerdict};
 use super::ladder::{
@@ -632,12 +632,17 @@ async fn run_expiry_resolution_loop<C, D, G>(
     // E4 (2026-07-15): was the loop's FIRST observation of the current
     // day already past the deadline (a post-deadline crash-boot)? Such a
     // day requires ≥2 consecutive failed waves before the page fires —
-    // never the first-wave hair trigger. `failed_waves` counts completed
-    // in-session attempt waves since the day was first observed (pairs
-    // resolve monotonically within a day, so an unresolved pair has
-    // failed every wave so far).
+    // never the first-wave hair trigger. R3 (2026-07-15): `failed_waves`
+    // counts REAL failed attempt waves PER (broker, underlying) pair —
+    // only iterations that actually DISPATCHED a fetch for the pair and
+    // left it unresolved advance a cell (`next_failed_wave_count`); a
+    // disabled-lane iteration or a gate-deferred/conceded fire never
+    // counts (the pre-R3 loop-global counter reached ≥2 with ZERO real
+    // attempts on a post-deadline boot with a delayed lane enable, so
+    // the FIRST real attempt paged immediately — the E4 hair trigger
+    // resurrected via the lane-toggle path).
     let mut booted_after_deadline = false;
-    let mut failed_waves: u32 = 0;
+    let mut failed_waves = [[0_u32; ChainUnderlying::COUNT]; Feed::COUNT];
     loop {
         // IST trading-day identity via the injected clock (production:
         // `trading_calendar::ist_offset()` — NEVER UTC); the day flip is
@@ -651,14 +656,15 @@ async fn run_expiry_resolution_loop<C, D, G>(
             paged_day = Some(today);
             paged = [[false; ChainUnderlying::COUNT]; Feed::COUNT];
             booted_after_deadline = now_secs >= deadline_secs;
-            failed_waves = 0;
+            failed_waves = [[0_u32; ChainUnderlying::COUNT]; Feed::COUNT];
         }
         let session_over = now_secs >= super::schedule::CADENCE_LAST_CYCLE_BOUNDARY_SECS_OF_DAY_IST;
         if deps.calendar.is_trading_day(today) && !session_over {
             let dhan_on = deps.dhan_enabled.load(Ordering::Acquire);
             let groww_on = deps.groww_enabled.load(Ordering::Acquire);
+            let mut attempted = [[false; ChainUnderlying::COUNT]; Feed::COUNT];
             if dhan_on {
-                resolve_broker_expiries(
+                attempted[Feed::Dhan.index()] = resolve_broker_expiries(
                     clock.as_ref(),
                     deps.dhan_executor.as_ref(),
                     store.as_ref(),
@@ -670,7 +676,7 @@ async fn run_expiry_resolution_loop<C, D, G>(
                 .await;
             }
             if groww_on {
-                resolve_broker_expiries(
+                attempted[Feed::Groww.index()] = resolve_broker_expiries(
                     clock.as_ref(),
                     deps.groww_executor.as_ref(),
                     store.as_ref(),
@@ -681,8 +687,19 @@ async fn run_expiry_resolution_loop<C, D, G>(
                 )
                 .await;
             }
-            // E4: one attempt wave completed this iteration.
-            failed_waves = failed_waves.saturating_add(1);
+            // E4 + R3: fold this iteration's wave into the per-pair
+            // REAL-failed counters — only pairs whose fetch was actually
+            // dispatched AND that stayed unresolved advance.
+            for feed in [Feed::Dhan, Feed::Groww] {
+                for underlying in ChainUnderlying::ALL {
+                    let cell = &mut failed_waves[feed.index()][underlying.index()];
+                    *cell = next_failed_wave_count(
+                        *cell,
+                        attempted[feed.index()][underlying.index()],
+                        store.is_resolved(today, feed, *underlying),
+                    );
+                }
+            }
             // The deadline PAGE (edge-latched per pair per day; disabled
             // lanes never page — nothing fires for them).
             for (feed, enabled) in [(Feed::Dhan, dhan_on), (Feed::Groww, groww_on)] {
@@ -698,7 +715,7 @@ async fn run_expiry_resolution_loop<C, D, G>(
                         resolved,
                         *latch,
                         booted_after_deadline,
-                        failed_waves,
+                        failed_waves[feed.index()][underlying.index()],
                     ) {
                         *latch = true;
                         metrics::counter!(
@@ -723,9 +740,35 @@ async fn run_expiry_resolution_loop<C, D, G>(
                 }
             }
         }
+        // R1 (2026-07-15): in the cycle-burst era, retry waves anchor at
+        // mid-minute (:30 — `next_expiry_wave_instant_ms`), maximally far
+        // from the Dhan :55–:05 burst region and the Groww :00–:03
+        // waves, so a vendor-outage retry cadence can never invade the
+        // burst window and evict a NOMINAL fire from the combined
+        // per-second budget (a false `gate_deferred_nominal` should-never
+        // page every outage minute). The L2 expiry gate stays the
+        // backstop. Boot-phase / non-trading / post-session waves keep
+        // the plain configured interval — no bursts exist to collide
+        // with. The wave itself (above) still runs immediately at spawn:
+        // only the SLEEP between waves is anchored.
+        let now_ms_of_day = clock.ist_ms_of_day();
+        // APPROVED: ms-of-day / 1000 fits u32 (< 86_400) — the cast is safe.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let post_wave_secs = (now_ms_of_day.max(0) / 1_000) as u32;
+        let anchor_mid_minute = deps.calendar.is_trading_day(today)
+            && post_wave_secs < super::schedule::CADENCE_LAST_CYCLE_BOUNDARY_SECS_OF_DAY_IST
+            && post_wave_secs.saturating_add(60)
+                >= super::schedule::CADENCE_FIRST_CYCLE_BOUNDARY_SECS_OF_DAY_IST;
+        let sleep_ms = super::schedule::next_expiry_wave_instant_ms(
+            now_ms_of_day,
+            interval_ms,
+            anchor_mid_minute,
+        )
+        .saturating_sub(now_ms_of_day)
+        .max(1);
         // APPROVED: clamped positive above — the cast is safe.
         #[allow(clippy::cast_sign_loss)]
-        let sleep_dur = Duration::from_millis(interval_ms as u64);
+        let sleep_dur = Duration::from_millis(sleep_ms as u64);
         tokio::select! {
             biased;
             () = &mut shutdown_fut => return,
@@ -762,6 +805,12 @@ const CADENCE_EXPIRY_GATE_WAIT_CAP_MS: i64 = 2_000;
 /// the next `expiry_retry_interval_ms` wave re-attempts — a deferral,
 /// never a violation. Groww expiry fires stay ungated by design (no
 /// Groww rate rule; the Groww lane never touches [`DhanGates`]).
+///
+/// RETURNS (R3, 2026-07-15) the per-underlying REAL-attempt flags: TRUE
+/// exactly when a fetch was actually DISPATCHED for the pair this wave
+/// (gate-deferred/conceded fires and already-resolved skips stay
+/// FALSE), so the caller's per-pair failed-wave counters count only
+/// real evidence — never loop iterations.
 // APPROVED: cold-path resolver wave — the deps are individually threaded (clock/exec/store/gates) so the pure attempt fn stays test-injectable.
 #[allow(clippy::too_many_arguments)]
 async fn resolve_broker_expiries<C, E>(
@@ -772,12 +821,14 @@ async fn resolve_broker_expiries<C, E>(
     broker: Feed,
     today: NaiveDate,
     paged_row: [bool; ChainUnderlying::COUNT],
-) where
+) -> [bool; ChainUnderlying::COUNT]
+where
     C: CadenceClock,
     E: CadenceExecutor,
 {
+    let mut attempted = [false; ChainUnderlying::COUNT];
     let Some(today_yyyymmdd) = naive_to_yyyymmdd(today) else {
-        return; // unreachable for market dates (fail-closed)
+        return attempted; // unreachable for market dates (fail-closed)
     };
     for underlying in ChainUnderlying::ALL {
         if store.is_resolved(today, broker, *underlying) {
@@ -820,6 +871,8 @@ async fn resolve_broker_expiries<C, E>(
                 continue;
             }
         }
+        // R3: a REAL attempt is being dispatched for this pair.
+        attempted[underlying.index()] = true;
         let req = ExpiryListRequest {
             broker,
             underlying: *underlying,
@@ -918,7 +971,10 @@ async fn resolve_broker_expiries<C, E>(
                     broker = broker.as_str(),
                     underlying = underlying.as_str(),
                     expiry = %date.as_iso_string(),
-                    "CADENCE-01 recovery: expiry resolved LATE — after the                      pre-market deadline page for this pair; the lanes                      re-key from the next fire (falling edge, at most once                      per broker+underlying per day)"
+                    "CADENCE-01 recovery: expiry resolved LATE — after the \
+                     pre-market deadline page for this pair; the lanes \
+                     re-key from the next fire (falling edge, at most once \
+                     per broker+underlying per day)"
                 );
             }
         }
@@ -951,6 +1007,7 @@ async fn resolve_broker_expiries<C, E>(
             );
         }
     }
+    attempted
 }
 
 // ---------------------------------------------------------------------------
