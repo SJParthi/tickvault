@@ -4294,11 +4294,25 @@ impl NotificationEvent {
     /// Per-index / per-underlying not-served episode slot inside the REST
     /// families (2026-07-15 cleanliness fold): each pinned symbol gets its
     /// own bubble `conn` so one index's episode never swallows another's.
-    /// Slots 0..=2 are the whole-leg pulls (spot / chain / contracts);
-    /// 8..=11 are the per-symbol not-served slots; 15 is the honest
-    /// catch-all for an unrecognized symbol (one shared bubble, never a
-    /// panic). Exact match over the pinned `&'static str` set — const,
-    /// zero-alloc (the DHAT bypass-arm pin holds).
+    ///
+    /// The family-wide slot map (fix-round F1, 2026-07-15 — the SPOT and
+    /// CHAIN per-symbol ranges are DISJOINT so a spot recovery can never
+    /// green-close a chain leg's still-open bubble, and vice versa; the
+    /// chain not-served emit is edge-latched upstream, so a cross-leg
+    /// close would be a permanent Rule-11 false recovery):
+    ///
+    /// | conn | meaning |
+    /// |---|---|
+    /// | 0 | whole-leg spot pulls |
+    /// | 1 | whole-leg chain pulls |
+    /// | 2 | whole-leg contract pulls (Groww) |
+    /// | 7 | CHAIN not-served catch-all (unknown / never-chained symbol) |
+    /// | 8..=11 | SPOT not-served: NIFTY / BANKNIFTY / SENSEX / INDIA VIX |
+    /// | 12..=14 | CHAIN not-served: NIFTY / BANKNIFTY / SENSEX |
+    /// | 15 | SPOT not-served catch-all (unknown symbol) |
+    ///
+    /// Exact match over the pinned `&'static str` set — const, zero-alloc
+    /// (the DHAT bypass-arm pin holds).
     const fn rest_slot(symbol: &str) -> u8 {
         // `match` on str literals is not const-stable in all positions;
         // byte-compare keeps this a true const fn.
@@ -4326,6 +4340,38 @@ impl NotificationEvent {
             11
         } else {
             15
+        }
+    }
+
+    /// CHAIN-leg per-underlying not-served slot — DISJOINT from every
+    /// [`Self::rest_slot`] spot slot (F1, 2026-07-15): known chain
+    /// underlyings map to `spot slot + 4` (12..=14); anything else —
+    /// including INDIA VIX, which is const-asserted out of every chain
+    /// leg upstream — shares the chain catch-all `7` (distinct from the
+    /// spot catch-all `15`). Const, zero-alloc.
+    const fn chain_rest_slot(symbol: &str) -> u8 {
+        const fn eq(a: &str, b: &str) -> bool {
+            let (a, b) = (a.as_bytes(), b.as_bytes());
+            if a.len() != b.len() {
+                return false;
+            }
+            let mut i = 0;
+            while i < a.len() {
+                if a[i] != b[i] {
+                    return false;
+                }
+                i += 1;
+            }
+            true
+        }
+        if eq(symbol, "NIFTY") {
+            12
+        } else if eq(symbol, "BANKNIFTY") {
+            13
+        } else if eq(symbol, "SENSEX") {
+            14
+        } else {
+            7
         }
     }
 
@@ -4467,10 +4513,13 @@ impl NotificationEvent {
                 family: EpisodeFamily::DhanRest,
                 conn: Self::rest_slot(symbol.as_str()),
             }),
+            // F1 (2026-07-15 fix round): chain not-served uses the DISJOINT
+            // chain slot range — a spot recovery on the same symbol must
+            // never green-close the chain leg's still-open bubble.
             Self::Chain1mUnderlyingNotServed { underlying, .. }
             | Self::Chain1mUnderlyingServedRecovered { underlying, .. } => Some(EpisodeKey {
                 family: EpisodeFamily::DhanRest,
-                conn: Self::rest_slot(underlying),
+                conn: Self::chain_rest_slot(underlying),
             }),
             Self::GrowwSpot1mFetchDegraded { .. } | Self::GrowwSpot1mFetchRecovered { .. } => {
                 Some(EpisodeKey {
@@ -4489,10 +4538,13 @@ impl NotificationEvent {
                 family: EpisodeFamily::GrowwRest,
                 conn: 2,
             }),
+            // F1: same disjoint chain-slot range on the Groww side (no Groww
+            // spot per-symbol pair exists today — kept disjoint anyway so a
+            // future one can never collide).
             Self::GrowwChain1mUnderlyingNotServed { underlying, .. }
             | Self::GrowwChain1mUnderlyingServedRecovered { underlying, .. } => Some(EpisodeKey {
                 family: EpisodeFamily::GrowwRest,
-                conn: Self::rest_slot(underlying),
+                conn: Self::chain_rest_slot(underlying),
             }),
             _ => None,
         }

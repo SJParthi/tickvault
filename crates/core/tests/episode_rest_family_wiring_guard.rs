@@ -86,7 +86,7 @@ fn routed_rest_events() -> Vec<(NotificationEvent, EpisodeFamily, u8, bool)> {
                 empty_minutes: 10,
             },
             EpisodeFamily::DhanRest,
-            8,
+            12,
             false,
         ),
         (
@@ -95,7 +95,7 @@ fn routed_rest_events() -> Vec<(NotificationEvent, EpisodeFamily, u8, bool)> {
                 empty_minutes: 10,
             },
             EpisodeFamily::DhanRest,
-            8,
+            12,
             true,
         ),
         (
@@ -158,7 +158,7 @@ fn routed_rest_events() -> Vec<(NotificationEvent, EpisodeFamily, u8, bool)> {
                 empty_minutes: 10,
             },
             EpisodeFamily::GrowwRest,
-            9,
+            13,
             false,
         ),
         (
@@ -167,7 +167,7 @@ fn routed_rest_events() -> Vec<(NotificationEvent, EpisodeFamily, u8, bool)> {
                 empty_minutes: 10,
             },
             EpisodeFamily::GrowwRest,
-            9,
+            13,
             true,
         ),
     ]
@@ -249,6 +249,111 @@ fn guard_rest_slot_map_per_symbol_and_unknown_catch_all() {
             .episode_key()
             .unwrap_or_else(|| panic!("Spot1mSidNotServed({symbol}) must be routed"));
         assert_eq!(key.conn, slot, "slot for {symbol:?} drifted");
+    }
+}
+
+#[test]
+fn guard_chain_slot_map_per_underlying_and_distinct_catch_all() {
+    // F1 (2026-07-15 fix round): the CHAIN not-served slots are the spot
+    // slot + 4 (NIFTY=12, BANKNIFTY=13, SENSEX=14); everything else —
+    // including INDIA VIX, const-asserted out of every chain leg upstream
+    // — shares the chain catch-all 7, DISTINCT from the spot catch-all 15.
+    for (underlying, slot) in [
+        ("NIFTY", 12_u8),
+        ("BANKNIFTY", 13),
+        ("SENSEX", 14),
+        ("INDIA VIX", 7),
+        ("MIDCPNIFTY", 7),
+        ("", 7),
+    ] {
+        for (label, key) in [
+            (
+                "Chain1mUnderlyingNotServed",
+                NotificationEvent::Chain1mUnderlyingNotServed {
+                    underlying,
+                    empty_minutes: 10,
+                }
+                .episode_key(),
+            ),
+            (
+                "GrowwChain1mUnderlyingNotServed",
+                NotificationEvent::GrowwChain1mUnderlyingNotServed {
+                    underlying,
+                    empty_minutes: 10,
+                }
+                .episode_key(),
+            ),
+        ] {
+            let key = key.unwrap_or_else(|| panic!("{label}({underlying}) must be routed"));
+            assert_eq!(
+                key.conn, slot,
+                "{label} chain slot for {underlying:?} drifted"
+            );
+        }
+    }
+}
+
+#[test]
+fn guard_spot_and_chain_slot_sets_are_disjoint() {
+    // F1 DISJOINTNESS pin (the regression itself, not just the literals):
+    // the spot leg's per-symbol recovery must NEVER share an EpisodeKey
+    // conn with the chain leg's not-served bubble — a shared slot lets a
+    // spot recovery green-close a still-open chain incident (Rule-11
+    // false recovery; the chain emit is edge-latched upstream so it never
+    // re-fires). Probe every pinned symbol PLUS unknown catch-alls and
+    // assert the two conn sets do not intersect anywhere.
+    let probes = [
+        "NIFTY",
+        "BANKNIFTY",
+        "SENSEX",
+        "INDIA VIX",
+        "MIDCPNIFTY",
+        "",
+    ];
+    let spot_slots: std::collections::BTreeSet<u8> = probes
+        .iter()
+        .map(|s| {
+            NotificationEvent::Spot1mSidNotServed {
+                symbol: (*s).to_string(),
+                consecutive_minutes: 10,
+            }
+            .episode_key()
+            .expect("spot not-served must be routed")
+            .conn
+        })
+        .collect();
+    let chain_slots: std::collections::BTreeSet<u8> = probes
+        .iter()
+        .flat_map(|s| {
+            [
+                NotificationEvent::Chain1mUnderlyingNotServed {
+                    underlying: s,
+                    empty_minutes: 10,
+                }
+                .episode_key()
+                .expect("dhan chain not-served must be routed")
+                .conn,
+                NotificationEvent::GrowwChain1mUnderlyingNotServed {
+                    underlying: s,
+                    empty_minutes: 10,
+                }
+                .episode_key()
+                .expect("groww chain not-served must be routed")
+                .conn,
+            ]
+        })
+        .collect();
+    let overlap: Vec<u8> = spot_slots.intersection(&chain_slots).copied().collect();
+    assert!(
+        overlap.is_empty(),
+        "spot and chain not-served slot sets must be DISJOINT — overlap: {overlap:?}"
+    );
+    // The whole-leg slots (0..=2) must not collide with either set.
+    for leg in 0..=2_u8 {
+        assert!(
+            !spot_slots.contains(&leg) && !chain_slots.contains(&leg),
+            "whole-leg slot {leg} collides with a per-symbol slot set"
+        );
     }
 }
 
