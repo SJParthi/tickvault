@@ -116,33 +116,11 @@ pub mod dhan_intraday_parse;
 /// TokenManager → renewal + mid-session watchdog → REST canary +
 /// spot_1m_rest + option_chain_1m — WITHOUT any WebSocket lane.
 pub mod dhan_rest_stack;
-/// Groww runtime activation watcher — feed toggle cold-starts/teardowns the
-/// whole Groww lane live (operator 2026-06-24). Default-OFF; dormant until enabled.
-pub mod groww_activation;
-/// Groww second-feed bridge — consumer side (operator lock §32). Default-OFF.
-pub mod groww_bridge;
-/// Fleet-scoped Telegram alert coalescing for the Groww auto-scale fleet
-/// (§34, exam-fix 2026-07-06): reject/connected transitions across ALL fleet
-/// connections aggregate into at most ONE Telegram per 60s window per
-/// direction; single-connection semantics untouched.
-pub mod groww_fleet_alerts;
-/// Groww NATIVE-RUST shadow client runner (PR-R1 parity migration, operator
-/// "go" 2026-07-04 — `groww-second-feed-scope-2026-06-19.md` §35). Default-OFF
-/// behind `[feeds] groww_native_shadow`.
-pub mod groww_native_shadow;
-/// Groww auto-scale ladder FSM + gates + restart rehydration (§34, PR-2 of
-/// `.claude/plans/active-plan-groww-autoscale.md`). Default-OFF behind
-/// `[feeds.groww.scale] enabled`.
-pub mod groww_scale_ladder;
-/// Groww scale-FLEET dual-instance SSM lock gate (Session-B fix #1,
-/// operator go 2026-07-04): refuses the multi-connection fleet spawn when a
-/// peer instance already holds `/tickvault/<env>/instance-lock-groww-scale`
-/// (GROWW-SCALE-05, fail-closed; single-connection fallback).
-pub mod groww_scale_lock;
-/// Groww Python-sidecar auto-launcher + supervisor (operator lock §32 +
-/// "no manual commands" 2026-06-19). Default-OFF.
-pub mod groww_sidecar_supervisor;
-pub mod scale_test_preflight;
+/// `[groww_universe]` process-global daily Groww watch-set + shared-master
+/// rider (2026-07-15 live-feed retirement re-home of the activation daily
+/// build loop + the sole persist_groww_instruments caller).
+pub mod groww_universe;
+pub mod groww_watch_paths;
 /// Shared per-seal routing for BOTH feeds (Dhan + Groww) — the single
 /// `route_seal` body the two `on_seal` call sites invoke (C2, behavior-preserving).
 pub mod seal_routing;

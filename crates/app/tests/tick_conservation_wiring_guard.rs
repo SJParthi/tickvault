@@ -34,15 +34,11 @@ fn test_dhan_tick_conservation_audit_is_wired_into_main() {
     );
 }
 
-#[test]
-fn test_groww_tick_conservation_audit_is_wired_into_main() {
-    let src = main_rs_source();
-    assert!(
-        src.contains("run_groww_tick_conservation_audit("),
-        "main.rs must call run_groww_tick_conservation_audit(...) at 15:40 IST — \
-         otherwise the Groww feed writes ticks but no daily conservation row."
-    );
-}
+// RETIRED 2026-07-15 (Groww live-feed deletion):
+// test_groww_tick_conservation_audit_is_wired_into_main died with the Groww
+// NDJSON leg — the sidecar that produced the NDJSON delivered-count is
+// deleted, so main.rs no longer calls run_groww_tick_conservation_audit
+// (the Dhan WAL-vs-DB audit below is the surviving daily conservation row).
 
 #[test]
 fn test_conservation_spawn_lives_in_common_path_not_post_market() {
@@ -67,10 +63,9 @@ fn test_conservation_spawn_lives_in_common_path_not_post_market() {
     // originally ordered against was DELETED with the Dhan live-WS lane,
     // so the anti-nesting anchor reduces to the dedicated-fn check — a
     // Dhan-gated re-nesting target no longer exists in main.rs.)
-    for pat in [
-        "run_tick_conservation_audit(",
-        "run_groww_tick_conservation_audit(",
-    ] {
+    // (2026-07-15: the run_groww_tick_conservation_audit pattern retired
+    // with the Groww NDJSON leg — Dhan is the sole surviving run.)
+    for pat in ["run_tick_conservation_audit("] {
         let mut search_from = 0;
         while let Some(rel) = src[search_from..].find(pat) {
             let abs = search_from + rel;
@@ -86,31 +81,16 @@ fn test_conservation_spawn_lives_in_common_path_not_post_market() {
 }
 
 #[test]
-fn test_both_feed_gates_present_and_groww_after_dhan() {
-    // Each lane's 15:40 run is gated on the truthful runtime feed flag so a
-    // disabled lane writes no misleading zero-balanced row; the Groww run is
-    // sequenced after the Dhan run in the same task (same IST day/window).
+fn test_dhan_feed_gate_present() {
+    // The Dhan lane's 15:40 run is gated on the truthful runtime feed flag so
+    // a disabled lane writes no misleading zero-balanced row. (2026-07-15:
+    // the Groww gate + Groww-after-Dhan ordering pins retired with the Groww
+    // NDJSON conservation leg.)
     let src = main_rs_source();
     assert!(
         src.contains("is_enabled(tickvault_common::feed::Feed::Dhan)"),
         "the Dhan conservation run must be gated on \
          feed_runtime.is_enabled(Feed::Dhan)."
-    );
-    assert!(
-        src.contains("is_enabled(tickvault_common::feed::Feed::Groww)"),
-        "the Groww conservation run must be gated on \
-         feed_runtime.is_enabled(Feed::Groww)."
-    );
-    let dhan_idx = src
-        .find("run_tick_conservation_audit(")
-        .expect("Dhan conservation run must exist in main.rs");
-    let groww_idx = src
-        .find("run_groww_tick_conservation_audit(")
-        .expect("Groww conservation run must exist in main.rs");
-    assert!(
-        groww_idx > dhan_idx,
-        "the Groww conservation run must be sequenced AFTER the Dhan run inside \
-         the same 15:40 IST task so both reconcile the same IST day."
     );
 }
 

@@ -133,9 +133,29 @@ jobs:
           targets: aarch64-unknown-linux-musl
 
       - name: Install ARM64 musl build deps (cmake for aws-lc-rs + musl-tools)
+        # 2026-07-15: ports.ubuntu.com outage killed deploy runs 29430374817/29431100541 — retry then fall back to the Azure-local ports mirror.
         run: |
-          sudo apt-get update
-          sudo apt-get install -y cmake build-essential pkg-config musl-tools musl-dev
+          apt_install() {
+            sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=15 update \
+              && sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=15 \
+                   install -y --no-install-recommends \
+                   cmake build-essential pkg-config musl-tools musl-dev
+          }
+          if apt_install; then
+            exit 0
+          fi
+          echo "::warning::apt failed against the default mirror (ports.ubuntu.com) — switching sources to azure.ports.ubuntu.com and retrying."
+          if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then
+            sudo sed -i 's|://ports\.ubuntu\.com|://azure.ports.ubuntu.com|g' /etc/apt/sources.list.d/ubuntu.sources
+          fi
+          if [ -f /etc/apt/sources.list ]; then
+            sudo sed -i 's|://ports\.ubuntu\.com|://azure.ports.ubuntu.com|g' /etc/apt/sources.list
+          fi
+          if apt_install; then
+            exit 0
+          fi
+          echo "::error::apt install failed on BOTH mirrors (ports.ubuntu.com AND azure.ports.ubuntu.com) — cannot install ARM64 musl build deps."
+          exit 1
 
       - name: Cache cargo registry + target
         uses: actions/cache@v6
@@ -573,31 +593,12 @@ jobs:
               "# Without this the box runs its first-boot unit forever.",
               "if [ -f repo/deploy/systemd/tickvault.service ]; then cp -f repo/deploy/systemd/tickvault.service /etc/systemd/system/tickvault.service; fi",
               "if [ -f repo/deploy/systemd/tickvault-holiday-gate.service ]; then cp -f repo/deploy/systemd/tickvault-holiday-gate.service /etc/systemd/system/tickvault-holiday-gate.service; fi",
-              "# Ship the Groww Python sidecar source from the repo clone into",
-              "# /opt/tickvault/scripts/groww-sidecar/ so the in-app supervisor can run it.",
-              "# WorkingDirectory=/opt/tickvault (systemd unit), and groww_sidecar_supervisor.rs",
-              "# invokes the sidecar via RELATIVE paths (scripts/groww-sidecar/groww_sidecar.py +",
-              "# scripts/groww-sidecar/requirements.txt) which resolve under that WD. The deploy",
-              "# ships only the compiled binaries, so without this copy the sidecar crash-loops with",
-              "# a `cannot open file \"/opt/tickvault/scripts/groww-sidecar/groww_sidecar.py\"` error. Mirrors the",
-              "# config/systemd sync above: copy from the refreshed repo clone, idempotent.",
-              "if [ ! -d repo/scripts/groww-sidecar ]; then echo FATAL: repo/scripts/groww-sidecar missing after git clone; exit 1; fi",
-              "mkdir -p scripts/groww-sidecar",
-              "cp -f repo/scripts/groww-sidecar/* scripts/groww-sidecar/",
-              "chown -R ec2-user:ec2-user scripts",
-              "if [ ! -f scripts/groww-sidecar/groww_sidecar.py ] || [ ! -f scripts/groww-sidecar/requirements.txt ]; then echo FATAL: groww sidecar source not deployed to /opt/tickvault/scripts/groww-sidecar/; ls -la scripts/groww-sidecar/ || true; exit 1; fi",
-              "echo GROWW-SIDECAR-SOURCE-DEPLOYED: && ls -la scripts/groww-sidecar/",
-              "# Rebuild the Groww sidecar venv from scratch on every deploy. The",
-              "# in-app supervisor (groww_sidecar_supervisor.rs) treats an EXISTING",
-              "# data/groww/venv as fully provisioned and SKIPS pip install -r",
-              "# requirements.txt. An earlier broken run created the venv but its pip",
-              "# install failed (requirements.txt was not yet shipped to the box), so",
-              "# the venv exists WITHOUT pyotp/growwapi and the sidecar crash-loops",
-              "# with ModuleNotFoundError: No module named pyotp. Removing the stale",
-              "# venv forces the supervisor to recreate it AND re-run pip install",
-              "# against the now-present requirements.txt. Idempotent: no-op when the",
-              "# venv is absent; the supervisor rebuilds it once on next launch.",
-              "rm -rf /opt/tickvault/data/groww/venv && echo GROWW-VENV-RESET: stale venv removed so deps reinstall from requirements.txt",
+              "# Groww live feed RETIRED 2026-07-15 (operator directive: REST legs",
+              "# only) — the Python sidecar ship + venv-reset steps were removed with",
+              "# scripts/groww-sidecar/. Clean any leftover on-box sidecar artifacts so",
+              "# nothing stale can be launched (idempotent no-ops once clean).",
+              "rm -rf scripts/groww-sidecar && echo GROWW-SIDECAR-RETIRED: on-box sidecar source removed",
+              "rm -rf /opt/tickvault/data/groww/venv && echo GROWW-VENV-RETIRED: stale sidecar venv removed",
               "# Back up the current binary so we can roll back",
               "if [ -f bin/tickvault ]; then cp bin/tickvault bin/tickvault.backup; fi",
               "# Download the new binaries from S3",

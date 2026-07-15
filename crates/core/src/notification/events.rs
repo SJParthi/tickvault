@@ -1124,134 +1124,6 @@ pub enum NotificationEvent {
         underlying_count: usize,
     },
 
-    /// A market-data feed finished loading + resolving its instrument set
-    /// (operator directive 2026-07-03 — Telegram feed parity: "whatever we
-    /// have provided for dhan the same should be provided for groww also …
-    /// instruments load message"). Mirrors `InstrumentBuildSuccess` (the
-    /// Dhan universe-build ping) for every OTHER feed: fired once when a
-    /// feed's watch-set resolves at boot/activation. Severity::Info.
-    FeedInstrumentsLoaded {
-        /// Feed display name (e.g. "Groww").
-        feed: String,
-        /// Instruments actually subscribed by this feed today.
-        subscribed: usize,
-        /// Index instruments inside `subscribed`.
-        indices: usize,
-        /// Stock instruments inside `subscribed`.
-        stocks: usize,
-        /// Instruments that could not be matched/resolved today (skipped —
-        /// logged by name in the app log, counted here for the operator).
-        skipped: usize,
-    },
-
-    /// A market-data feed's access token was read and accepted at
-    /// boot/activation (operator directive 2026-07-04 — Groww boot-visibility
-    /// parity: "i need the same view display everything even for groww").
-    /// Mirrors Dhan's `AuthenticationSuccess` ("Auth OK") ping for every
-    /// OTHER feed. Fired once per activation (once per boot when the feed is
-    /// enabled at boot; again after a genuine disable → re-enable).
-    /// Severity::Low, immediate dispatch (boot milestone).
-    FeedAuthOk {
-        /// Feed display name (e.g. "Groww").
-        feed: String,
-    },
-
-    /// A market-data feed's socket connected + subscribe completed — BEFORE
-    /// any tick has streamed (operator directive 2026-07-04 — Groww
-    /// boot-visibility parity). On a closed market this is the ONLY honest
-    /// "the feed is up" signal: the streaming confirmation (first tick) may
-    /// be days away. The message text deliberately says "awaiting first
-    /// tick" — socket-connected ≠ streaming, so this event NEVER claims
-    /// ticks are flowing (audit Rule 11 — no false-OK). Edge-latched: once
-    /// per connected episode, re-armed only on a genuine disconnect.
-    FeedConnectedAwaitingTicks {
-        /// Feed display name (e.g. "Groww").
-        feed: String,
-        /// Instruments the feed's subscribe completed with.
-        subscribed: u64,
-        /// Whether the market was open at connect time — flips the honest
-        /// suffix between "market closed — idle is normal" and "market open
-        /// — ticks should arrive shortly".
-        market_open: bool,
-    },
-
-    /// A market-data feed went DOWN (operator directive 2026-07-06 — Groww
-    /// feed-down alerting parity with the Dhan main feed). Fired on the
-    /// feed's lifecycle FALLING edge (runtime disable / internal bridge
-    /// death), exactly ONCE per DOWN episode (edge-latched via
-    /// `GrowwAuditLatches::down_announced`, re-armed only when the feed is
-    /// STREAMING again). Never claims upstream tick counts — it only states
-    /// that prices from this feed will not flow until recovery. Severity is
-    /// field-driven: High in-market (pages + SNS), Low off-hours (60s
-    /// coalesced — the 2026-04-22 pre-market-spam precedent class).
-    FeedDown {
-        /// Feed display name (e.g. "Groww").
-        feed: String,
-        /// Fixed plain-English cause (never raw child text / URLs).
-        reason: String,
-        /// Whether the market was open at the falling edge — drives severity
-        /// (High in-market, Low off-hours) and the message register.
-        market_open: bool,
-        /// `true` when the feed was DELIBERATELY switched off (the runtime
-        /// feed toggle) — the body then says it stays OFF until re-enabled
-        /// from the feeds page. `false` for involuntary falling edges
-        /// (bridge death / internal restart) where the auto-retry trailer is
-        /// honest. Without this split the operator-disable page falsely
-        /// claimed "the system keeps retrying automatically" — a disabled
-        /// feed is NEVER retried, so the message actively delayed the one
-        /// action (re-enable) that fixes it (2026-07-06 fix, Telegram
-        /// commandment 7 + audit Rule 11).
-        operator_initiated: bool,
-    },
-
-    /// A previously-DOWN market-data feed is STREAMING again (operator
-    /// directive 2026-07-06). Fired exactly ONCE per DOWN episode, on the
-    /// STREAMING rising edge (a real tick / the feed's own streaming
-    /// status) — never on mere socket-connect, preserving the
-    /// connected ≠ streaming honesty split (`FeedConnectedAwaitingTicks`
-    /// keeps announcing socket-connect separately with "awaiting first
-    /// tick"). Severity::Medium — mirrors `WebSocketReconnected`.
-    FeedRecovered {
-        /// Feed display name (e.g. "Groww").
-        feed: String,
-        /// Total downtime of the episode in seconds (first-down-wins, so it
-        /// spans intermediate retry failures).
-        down_secs: u64,
-    },
-
-    /// A feed GAP EPISODE opened (Groww hardening PR-3, 2026-07-14): the
-    /// feed-level last-tick age crossed `FEED_GAP_EPISODE_THRESHOLD_SECS`
-    /// in-session. ONE bubble per episode (edge-latched — never per-poll
-    /// spam). The durable twin is the `feed_gap_audit` OPEN row; this event
-    /// is the operator-visible half of the same edge. Severity::High —
-    /// pages once per episode.
-    FeedGapEpisodeOpened {
-        /// Feed display name (e.g. "Groww").
-        feed: String,
-        /// Gap detection instant as an IST HH:MM label (12-hour style is
-        /// handled at the format site; the producer sends "HH:MM").
-        start_hhmm_ist: String,
-        /// `true` in paper/dry-run mode — the body then reassures the
-        /// operator no live orders exist.
-        dry_run: bool,
-    },
-
-    /// A feed GAP EPISODE closed (recovery edge): liveness advanced again
-    /// after an open episode. Carries the MEASURED gap, the stall-restart
-    /// count inside the episode (`-1` sentinel = not cheaply measurable),
-    /// and the NAMED partial 1-minute bars the gap overlapped — annotation
-    /// only, never a repair claim (`candles_*` untouched). Severity::Info.
-    FeedGapEpisodeClosed {
-        /// Feed display name (e.g. "Groww").
-        feed: String,
-        /// Measured gap in whole seconds.
-        gap_secs: u64,
-        /// Stall-watchdog restarts inside the episode; `-1` = unknown.
-        kill_count: i64,
-        /// Comma list of partial 1m bucket labels (bounded, may be empty).
-        partial_minutes: String,
-    },
-
     /// Instrument build failed — includes manual trigger URL for retry.
     InstrumentBuildFailed {
         /// Error description.
@@ -1502,43 +1374,6 @@ pub enum NotificationEvent {
         /// the tick-persistence rescue ring), so this carries the honest,
         /// available downtime signal rather than a hardcoded zero.
         failed_checks_before_recovery: u32,
-    },
-
-    /// The Groww Python sidecar printed a diagnostic line classifying as a
-    /// genuine auth / entitlement / error reject (e.g. its watchdog's
-    /// "account lacks a live market-data feed entitlement" line, or a
-    /// "sidecar error [auth]" line). Previously these lines reached only the
-    /// container logs because the supervisor inherited the child's stdio — so
-    /// the operator was blind to WHY Groww streamed 0 ticks. The supervisor now
-    /// fires this ONCE per running-child reject (edge-triggered) with a fixed
-    /// plain-English `reason` per class (never the raw child text — defense in
-    /// depth so no runtime/credential data reaches Telegram). Severity::High.
-    ///
-    /// `fleet_summary` (exam-fix hardening 2026-07-06): `true` when `reason`
-    /// is a FLEET-coalesced "N of M connections retrying" summary — the body
-    /// then describes the partial-fleet condition instead of the single-conn
-    /// total-outage trailer ("receiving nothing … prices will not flow"),
-    /// which would contradict a partial summary with a false
-    /// whole-feed-down claim.
-    ///
-    /// `detail` (operator demand 2026-07-14 — the 14:59 IST rejection page
-    /// said only "the feed reported an error" with no WHY): the SANITIZED
-    /// reject-cause signature, rendered into the headline as
-    /// "Groww live feed rejected: {detail} — retrying". CONTRACT: the emit
-    /// site MUST pass ONLY the output of the supervisor's
-    /// `sidecar_line_signature` choke point (control-char + BiDi strip,
-    /// credential/JWT redaction, 160-char cap) — NEVER raw child text. A
-    /// `None` / empty / whitespace detail degrades to the pre-2026-07-14
-    /// generic headline. This field is a conscious, dated override of
-    /// Telegram commandment 2 (no library jargon) for the ONE field whose
-    /// payload IS the machine cause — recorded in
-    /// `.claude/rules/project/feed-stall-watchdog-error-codes.md` §1c.1
-    /// (precedent: the B9 "Build:" short-SHA override). The render boundary
-    /// re-caps + html-escapes it anyway (defense-in-depth).
-    GrowwSidecarRejected {
-        reason: String,
-        fleet_summary: bool,
-        detail: Option<String>,
     },
 
     /// W2 PR#5 (2026-07-10, audit follow-up row 15): the configured NSE
@@ -2229,11 +2064,9 @@ impl NotificationEvent {
             | Self::RiskHalt { .. }
             | Self::OrphanPositionDetected { .. }
             | Self::OrphanPositionsClean => Some(FeedBadge::Dhan.badge()),
-            // ── Groww-scoped ──
-            Self::GrowwSidecarRejected { .. }
             // ── Groww-scoped: per-minute REST legs (spot 1m + option
             //    chain + option contract) ──
-            | Self::GrowwSpot1mFetchDegraded { .. }
+            Self::GrowwSpot1mFetchDegraded { .. }
             | Self::GrowwSpot1mFetchRecovered { .. }
             | Self::GrowwChain1mFetchDegraded { .. }
             | Self::GrowwChain1mFetchRecovered { .. }
@@ -2242,14 +2075,6 @@ impl NotificationEvent {
             | Self::GrowwContract1mFetchDegraded { .. }
             | Self::GrowwContract1mFetchRecovered { .. }
             | Self::GrowwContract1mBookUnresolved { .. } => Some(FeedBadge::Groww.badge()),
-            // ── Feed-generic: badge follows the `feed` field ──
-            Self::FeedAuthOk { feed }
-            | Self::FeedInstrumentsLoaded { feed, .. }
-            | Self::FeedConnectedAwaitingTicks { feed, .. }
-            | Self::FeedDown { feed, .. }
-            | Self::FeedRecovered { feed, .. }
-            | Self::FeedGapEpisodeOpened { feed, .. }
-            | Self::FeedGapEpisodeClosed { feed, .. } => feed_badge_for_name(feed).map(|b| b.badge()),
             // ── WS sleep/wake: badge follows the `feed` field, falling
             //    back to Dhan — the live values are "main"/"order_update"
             //    (both Dhan WebSocket types); a future feed value like
@@ -3578,159 +3403,6 @@ impl NotificationEvent {
                     "<b>Instruments OK</b>\nSource: {source}\nDerivatives: {derivative_count}\nUnderlyings: {underlying_count}"
                 )
             }
-            Self::FeedInstrumentsLoaded {
-                feed,
-                subscribed,
-                indices,
-                stocks,
-                skipped,
-            } => {
-                // Operator-charter §G wording: plain English, provider name
-                // only, real numbers, one glance = "the second feed loaded
-                // its instruments and subscribed them".
-                let skipped_line = if *skipped > 0 {
-                    format!("\nSkipped {skipped} that could not be matched today")
-                } else {
-                    "\nEvery instrument matched".to_string()
-                };
-                format!(
-                    "<b>✅ {feed_name} instruments loaded</b>\n\
-                     Subscribed {sub} instruments ({indices} indices + {stocks} stocks)\
-                     {skipped_line}",
-                    feed_name = html_escape(feed),
-                    sub = format_with_commas(*subscribed),
-                )
-            }
-            Self::FeedAuthOk { feed } => {
-                // Groww boot-visibility parity (operator 2026-07-04): the
-                // exact mirror of Dhan's "Auth OK" boot ping — access token
-                // in hand, feed can connect. Plain English, provider name
-                // only (charter §D).
-                format!(
-                    "✅ <b>{feed_name} Auth OK</b> — access token in hand, feed can connect",
-                    feed_name = html_escape(feed),
-                )
-            }
-            Self::FeedConnectedAwaitingTicks {
-                feed,
-                subscribed,
-                market_open,
-            } => {
-                // HONEST wording (no false-OK): socket-connected ≠ streaming.
-                // This message must ALWAYS say "awaiting first tick" — the
-                // streaming confirmation is a separate event that fires only
-                // when a real tick is observed.
-                let suffix = if *market_open {
-                    "market open — ticks should arrive shortly"
-                } else {
-                    "market closed — idle is normal"
-                };
-                format!(
-                    "✅ <b>{feed_name} feed connected</b>\n\
-                     Subscribed {sub} instruments — awaiting first tick ({suffix})",
-                    feed_name = html_escape(feed),
-                    sub = format_with_commas(*subscribed as usize),
-                )
-            }
-            Self::FeedDown {
-                feed,
-                reason,
-                market_open,
-                operator_initiated,
-            } => {
-                // `reason` is a fixed plain-English literal at every emit
-                // site (never raw child text / URLs), but html_escape it
-                // anyway for defense-in-depth, consistent with every String
-                // arm. The trailer BRANCHES on `operator_initiated`
-                // (2026-07-06 fix): a deliberately switched-off feed is
-                // NEVER retried, so the auto-retry reassurance would be a
-                // false signal that delays the one action (re-enable) that
-                // fixes it — the operator-disable form names that action
-                // instead (Telegram commandment 7). The involuntary form
-                // keeps the hostile-review-passed GrowwSidecarRejected
-                // honesty wording: state what will NOT flow + that retry is
-                // automatic.
-                let feed_name = html_escape(feed);
-                let reason = html_escape(reason);
-                match (*market_open, *operator_initiated) {
-                    (true, true) => format!(
-                        "🆘 <b>{feed_name} feed is DOWN</b>\n{reason}\n\n\
-                         Prices from {feed_name} will not flow while it is switched off. \
-                         It stays OFF until you re-enable it from the feeds page."
-                    ),
-                    (true, false) => format!(
-                        "🆘 <b>{feed_name} feed is DOWN</b>\n{reason}\n\n\
-                         Prices from {feed_name} will not flow until it recovers. \
-                         The system keeps retrying automatically — no restart needed."
-                    ),
-                    (false, true) => format!(
-                        "⚠️ <b>{feed_name} feed is down [off-hours]</b>\n{reason}\n\
-                         It stays off until you re-enable it from the feeds page — \
-                         idle is normal until then."
-                    ),
-                    (false, false) => format!(
-                        "⚠️ <b>{feed_name} feed is down [off-hours]</b>\n{reason}\n\
-                         Reconnect is automatic — idle is normal until market open."
-                    ),
-                }
-            }
-            Self::FeedRecovered { feed, down_secs } => {
-                // Honest recovery: fired ONLY on the streaming rising edge
-                // (real ticks), so "prices are flowing" is never a false-OK
-                // claim (connected ≠ streaming split preserved).
-                format!(
-                    "✅ <b>{feed_name} feed streaming again</b> — down {down_secs}s. \
-                     Prices are flowing.",
-                    feed_name = html_escape(feed),
-                )
-            }
-            Self::FeedGapEpisodeOpened {
-                feed,
-                start_hhmm_ist,
-                dry_run,
-            } => {
-                // One bubble per gap episode (audit Rule 4 edge discipline).
-                // Plain English per the 10 Telegram commandments — no
-                // library names, no file paths; the paper-mode clause keeps
-                // the page calm when no live orders exist.
-                let feed_name = html_escape(feed).to_uppercase();
-                let since = html_escape(start_hhmm_ist);
-                let paper = if *dry_run {
-                    " (paper mode — no live orders exist)"
-                } else {
-                    ""
-                };
-                format!(
-                    "🟡 <b>{feed_name} — feed paused — reconnecting</b>\n\
-                     No prices since {since} IST. The system is reconnecting \
-                     automatically — no restart needed.{paper}"
-                )
-            }
-            Self::FeedGapEpisodeClosed {
-                feed,
-                gap_secs,
-                kill_count,
-                partial_minutes,
-            } => {
-                // Annotation, never repair: the partial bars are NAMED so
-                // the operator knows which 1-minute bars are thin — they
-                // are never back-filled or fabricated (live-feed purity).
-                let feed_name = html_escape(feed).to_uppercase();
-                let restarts = if *kill_count < 0 {
-                    "restarts not measured".to_string()
-                } else {
-                    format!("{kill_count} restart(s)")
-                };
-                let bars = if partial_minutes.is_empty() {
-                    "none".to_string()
-                } else {
-                    html_escape(partial_minutes)
-                };
-                format!(
-                    "🟢 <b>{feed_name} — feed recovered</b>\n\
-                     gap {gap_secs}s, {restarts}; partial 1-minute bars: {bars}"
-                )
-            }
             Self::InstrumentBuildFailed {
                 reason,
                 manual_trigger_url,
@@ -4066,59 +3738,6 @@ impl NotificationEvent {
                      No action needed unless this recurs."
                 )
             }
-            Self::GrowwSidecarRejected {
-                reason,
-                fleet_summary,
-                detail,
-            } => {
-                // Defensive render-boundary cap (chars) on `detail` —
-                // mirrors the supervisor's SIDECAR_LINE_SIGNATURE_MAX_CHARS
-                // (core sits BELOW the app crate, so the value is mirrored,
-                // not imported). The emit-site contract already caps; this
-                // is defense-in-depth so a future emit site can never flood
-                // a Telegram headline.
-                const GROWW_REJECT_DETAIL_MAX_CHARS: usize = 160;
-                // `reason` is a fixed per-class &'static str (or the fleet
-                // coalescer's counted summary) mapped to String by the
-                // supervisor (never raw child text), but html_escape it
-                // anyway for defense-in-depth, consistent with every String arm.
-                let reason = html_escape(reason);
-                // 2026-07-14 operator demand (the 14:59 IST page carried no
-                // WHY): when the SANITIZED reject-cause signature is present
-                // the headline names it — "rejected: <cause> — retrying".
-                // Truncate BEFORE html_escape so an escape entity is never
-                // cut mid-sequence; empty/whitespace degrades to the exact
-                // pre-2026-07-14 generic headline (never a hollow
-                // "rejected:  — retrying"). Dated commandment-2 override:
-                // feed-stall-watchdog-error-codes.md §1c.1.
-                let title = match detail.as_deref().map(str::trim).filter(|d| !d.is_empty()) {
-                    Some(d) => {
-                        let capped: String =
-                            d.chars().take(GROWW_REJECT_DETAIL_MAX_CHARS).collect();
-                        let capped = html_escape(&capped);
-                        format!("🆘 <b>Groww live feed rejected: {capped} — retrying</b>")
-                    }
-                    None => "🆘 <b>Groww live feed rejected</b>".to_string(),
-                };
-                if *fleet_summary {
-                    // Fleet-coalesced partial summary (hostile-review fix
-                    // 2026-07-06): the trailer must NOT claim the whole feed
-                    // is "receiving nothing" — only the counted connections
-                    // reported a problem, and nothing positive is claimed
-                    // about the rest.
-                    format!(
-                        "{title}\n{reason}\n\nThe affected \
-                         connections keep retrying automatically. Prices from those \
-                         connections will not flow until they recover."
-                    )
-                } else {
-                    format!(
-                        "{title}\n{reason}\n\nThe Groww feed is \
-                         connected but receiving nothing. Until this is fixed, Groww \
-                         prices will not flow."
-                    )
-                }
-            }
             Self::HolidayCalendarCoverageLow {
                 days_remaining,
                 coverage_end_display,
@@ -4240,13 +3859,6 @@ impl NotificationEvent {
             Self::ShutdownInitiated => "ShutdownInitiated",
             Self::ShutdownComplete => "ShutdownComplete",
             Self::InstrumentBuildSuccess { .. } => "InstrumentBuildSuccess",
-            Self::FeedInstrumentsLoaded { .. } => "FeedInstrumentsLoaded",
-            Self::FeedAuthOk { .. } => "FeedAuthOk",
-            Self::FeedConnectedAwaitingTicks { .. } => "FeedConnectedAwaitingTicks",
-            Self::FeedDown { .. } => "FeedDown",
-            Self::FeedRecovered { .. } => "FeedRecovered",
-            Self::FeedGapEpisodeOpened { .. } => "FeedGapEpisodeOpened",
-            Self::FeedGapEpisodeClosed { .. } => "FeedGapEpisodeClosed",
             Self::InstrumentBuildFailed { .. } => "InstrumentBuildFailed",
             Self::IpVerificationFailed { .. } => "IpVerificationFailed",
             Self::IpVerificationSuccess { .. } => "IpVerificationSuccess",
@@ -4276,7 +3888,6 @@ impl NotificationEvent {
             Self::RealtimeGuaranteeHealthy { .. } => "RealtimeGuaranteeHealthy",
             Self::RealtimeGuaranteeDegraded { .. } => "RealtimeGuaranteeDegraded",
             Self::RealtimeGuaranteeCritical { .. } => "RealtimeGuaranteeCritical",
-            Self::GrowwSidecarRejected { .. } => "GrowwSidecarRejected",
             Self::HolidayCalendarCoverageLow { .. } => "HolidayCalendarCoverageLow",
             Self::Custom { .. } => "Custom",
             Self::CustomStatus { .. } => "CustomStatus",
@@ -4329,71 +3940,12 @@ impl NotificationEvent {
             | Self::OrderUpdateAuthenticated
             | Self::BootHealthCheck { .. }
             | Self::StartupComplete { .. } => Some(super::episode::BOOT_EPISODE_KEY),
-            // Feed-generic boot pings fold ONLY for the Groww feed (str
-            // compare — zero-alloc; the DHAT pin holds). Any other feed
-            // name keeps the legacy immediate lane.
-            Self::FeedAuthOk { feed }
-            | Self::FeedInstrumentsLoaded { feed, .. }
-            | Self::FeedConnectedAwaitingTicks { feed, .. } => {
-                if feed.eq_ignore_ascii_case("groww") {
-                    Some(super::episode::BOOT_EPISODE_KEY)
-                } else {
-                    None
-                }
-            }
-            // Groww runtime incident family (2026-07-14 operator noise
-            // directive): the persistent reject storm folds into ONE
-            // live-edited bubble — first page still pages (+ SMS at ≥High);
-            // recurrences become in-place edits. Distinct from the boot
-            // pings above: FeedDown/FeedRecovered are RUNTIME incidents,
-            // never boot milestones. Zero-alloc str compare — the DHAT
-            // bypass-arm pin holds.
-            Self::GrowwSidecarRejected { .. } => Some(EpisodeKey {
-                family: EpisodeFamily::GrowwFeed,
-                conn: 0,
-            }),
-            Self::FeedDown {
-                feed,
-                operator_initiated,
-                ..
-            } => {
-                // FIX-A (hostile review 2026-07-14): a DELIBERATE feeds-page
-                // disable is NEVER episode-routed — the bubble's "retrying
-                // automatically" edit would falsely claim a disabled feed
-                // retries (the 2026-07-06 FeedDown honesty split); the
-                // legacy lane carries the honest "stays OFF until
-                // re-enabled" body.
-                // FIX-D: only a PAGING (≥ High, i.e. in-market) FeedDown
-                // opens/folds the incident bubble; the off-hours Low flavor
-                // keeps its pre-existing legacy 60s-coalescer path.
-                if !*operator_initiated
-                    && self.severity() >= Severity::High
-                    && feed.eq_ignore_ascii_case("groww")
-                {
-                    Some(EpisodeKey {
-                        family: EpisodeFamily::GrowwFeed,
-                        conn: 0,
-                    })
-                } else {
-                    // Non-Groww feeds also keep the legacy immediate lane.
-                    None
-                }
-            }
-            Self::FeedRecovered { feed, .. } => {
-                // Recovery stays episode-routed (Resolve). With no open
-                // episode (e.g. the Down was Low/off-hours and never
-                // opened a bubble) the FSM returns SendLegacy — the
-                // legacy_passthrough arm delivers it, never a drop.
-                if feed.eq_ignore_ascii_case("groww") {
-                    Some(EpisodeKey {
-                        family: EpisodeFamily::GrowwFeed,
-                        conn: 0,
-                    })
-                } else {
-                    // A future feed #3 keeps the legacy immediate lane.
-                    None
-                }
-            }
+            // The Groww runtime incident family (GrowwSidecarRejected +
+            // FeedDown/FeedRecovered, 2026-07-14 noise directive) was
+            // RETIRED 2026-07-15 with the Groww live feed — those variants
+            // and their EpisodeFamily::GrowwFeed routing arms are deleted;
+            // the GrowwFeed family itself stays (renderer + historical
+            // snapshots still name it).
             _ => None,
         }
     }
@@ -4440,19 +3992,6 @@ impl NotificationEvent {
             Self::OrderUpdateConnected => Some(BootMilestone::OrderUpdateConnected),
             Self::OrderUpdateAuthenticated => Some(BootMilestone::OrderUpdateAuthenticated),
             Self::StartupComplete { mode, .. } => Some(BootMilestone::Complete { mode }),
-            Self::FeedAuthOk { feed } if feed.eq_ignore_ascii_case("groww") => {
-                Some(BootMilestone::GrowwAuth)
-            }
-            Self::FeedInstrumentsLoaded {
-                feed, subscribed, ..
-            } if feed.eq_ignore_ascii_case("groww") => Some(BootMilestone::GrowwInstruments {
-                subscribed: clamp_u32(*subscribed),
-            }),
-            Self::FeedConnectedAwaitingTicks {
-                feed, market_open, ..
-            } if feed.eq_ignore_ascii_case("groww") => Some(BootMilestone::GrowwConnected {
-                market_open: *market_open,
-            }),
             _ => None,
         }
     }
@@ -4465,11 +4004,9 @@ impl NotificationEvent {
     pub fn episode_role(&self) -> super::episode::EpisodeRole {
         use super::episode::EpisodeRole;
         match self {
-            // FeedRecovered is the Groww episode's recovery edge (2026-07-14
-            // noise fold); role is consulted only when episode_key() is Some.
-            Self::WebSocketReconnected { .. }
-            | Self::OrderUpdateReconnected { .. }
-            | Self::FeedRecovered { .. } => EpisodeRole::Resolve,
+            Self::WebSocketReconnected { .. } | Self::OrderUpdateReconnected { .. } => {
+                EpisodeRole::Resolve
+            }
             _ => EpisodeRole::Open,
         }
     }
@@ -4691,36 +4228,6 @@ impl NotificationEvent {
             // 2026-05-09 complaint resolved.
             Self::AuthenticationSuccess => Severity::Low,
             Self::InstrumentBuildSuccess { .. } => Severity::Low,
-            // 2026-07-03 feed parity: once-per-activation positive ping that
-            // a non-Dhan feed loaded + subscribed its instruments. Info so
-            // it never pages — a purely positive signal, like the EOD digest.
-            Self::FeedInstrumentsLoaded { .. } => Severity::Info,
-            // 2026-07-04 Groww boot-visibility parity: green ✅ boot-stage
-            // pings, exact mirrors of `AuthenticationSuccess` (Low) and the
-            // Dhan connect signals — never page, ship immediately via
-            // `dispatch_policy()`.
-            Self::FeedAuthOk { .. } => Severity::Low,
-            Self::FeedConnectedAwaitingTicks { .. } => Severity::Low,
-            // 2026-07-06 Groww feed-down alerting: field-driven severity
-            // (CrossVerify1mSummary precedent) — one variant carries the
-            // in-market/off-hours split the Dhan WebSocketDisconnected /
-            // ...OffHours pair encodes with two variants. High pages
-            // Telegram + SNS mid-session; Low coalesces 60s off-hours
-            // (the 2026-04-22 pre-market TCP-reset spam precedent class).
-            Self::FeedDown { market_open, .. } => {
-                if *market_open {
-                    Severity::High
-                } else {
-                    Severity::Low
-                }
-            }
-            // Mirrors WebSocketReconnected (Medium) — a recovery is
-            // operator-visible but never pages SNS.
-            Self::FeedRecovered { .. } => Severity::Medium,
-            // Gap-episode bubbles (2026-07-14): opened pages ONCE per
-            // episode (High); closed is the calm Info companion.
-            Self::FeedGapEpisodeOpened { .. } => Severity::High,
-            Self::FeedGapEpisodeClosed { .. } => Severity::Info,
             Self::BootHealthCheck { .. } => Severity::Low,
             Self::OrphanPositionDetected { .. } => Severity::Critical,
             Self::OrphanPositionsClean => Severity::Info,
@@ -4729,9 +4236,6 @@ impl NotificationEvent {
             Self::BarMismatchCrossCheckFailed { .. } => Severity::Critical,
             Self::StartupComplete { .. } => Severity::Info,
             Self::ShutdownComplete => Severity::Info,
-            // A genuine Groww feed reject (auth / entitlement / error) is
-            // operator-actionable — pages so the 0-ticks cause is visible.
-            Self::GrowwSidecarRejected { .. } => Severity::High,
             // W2 PR#5 (2026-07-10): the holiday-calendar coverage cliff
             // demands operator action (paste the next NSE circular) — High
             // pages Telegram; the watchdog's per-IST-date latch bounds it
@@ -4766,16 +4270,6 @@ impl NotificationEvent {
             // batch 3); OrderUpdateConnected is the surviving WS ping.
             Self::AuthenticationSuccess
             | Self::InstrumentBuildSuccess { .. }
-            // 2026-07-03 feed parity: the Groww (any-feed) instruments-load
-            // ping is a boot-success milestone — ship instantly like the
-            // Dhan `InstrumentBuildSuccess` it mirrors, never coalesced.
-            | Self::FeedInstrumentsLoaded { .. }
-            // 2026-07-04 Groww boot-visibility parity: the per-feed Auth OK
-            // + connected-awaiting-ticks pings are boot-success milestones —
-            // ship instantly (Low would otherwise coalesce 60s and break the
-            // boot-Telegram ordering the operator reads).
-            | Self::FeedAuthOk { .. }
-            | Self::FeedConnectedAwaitingTicks { .. }
             | Self::WebSocketPoolOnline { .. }
             | Self::WebSocketPoolDeferredOffHours { .. }
             // PR #5 (2026-05-19): Phase2Complete retired.
@@ -4984,21 +4478,6 @@ mod tests {
                 chain_1m_enabled: true,
                 chain_1m_underlyings: 3,
             },
-            NotificationEvent::FeedAuthOk {
-                feed: "Groww".to_string(),
-            },
-            NotificationEvent::FeedInstrumentsLoaded {
-                feed: "Groww".to_string(),
-                subscribed: 768,
-                indices: 2,
-                stocks: 766,
-                skipped: 0,
-            },
-            NotificationEvent::FeedConnectedAwaitingTicks {
-                feed: "Groww".to_string(),
-                subscribed: 768,
-                market_open: true,
-            },
         ]
     }
 
@@ -5022,32 +4501,6 @@ mod tests {
                 "boot-mapped variant must carry a milestone: {}",
                 event.topic()
             );
-        }
-    }
-
-    #[test]
-    fn test_episode_key_non_groww_feed_is_none() {
-        // A future feed #3 (or a renamed feed) keeps the legacy lane —
-        // never a wrong fold into the boot bubble.
-        for event in [
-            NotificationEvent::FeedAuthOk {
-                feed: "SomeOtherFeed".to_string(),
-            },
-            NotificationEvent::FeedInstrumentsLoaded {
-                feed: "SomeOtherFeed".to_string(),
-                subscribed: 10,
-                indices: 1,
-                stocks: 9,
-                skipped: 0,
-            },
-            NotificationEvent::FeedConnectedAwaitingTicks {
-                feed: "SomeOtherFeed".to_string(),
-                subscribed: 10,
-                market_open: false,
-            },
-        ] {
-            assert!(event.episode_key().is_none(), "{}", event.topic());
-            assert!(event.boot_milestone().is_none(), "{}", event.topic());
         }
     }
 
@@ -5125,33 +4578,6 @@ mod tests {
             }
             .boot_milestone(),
             Some(BootMilestone::Complete { mode: "sandbox" })
-        );
-        assert_eq!(
-            NotificationEvent::FeedAuthOk {
-                feed: "Groww".to_string()
-            }
-            .boot_milestone(),
-            Some(M::GrowwAuth)
-        );
-        assert_eq!(
-            NotificationEvent::FeedInstrumentsLoaded {
-                feed: "Groww".to_string(),
-                subscribed: 768,
-                indices: 2,
-                stocks: 766,
-                skipped: 0,
-            }
-            .boot_milestone(),
-            Some(M::GrowwInstruments { subscribed: 768 })
-        );
-        assert_eq!(
-            NotificationEvent::FeedConnectedAwaitingTicks {
-                feed: "Groww".to_string(),
-                subscribed: 768,
-                market_open: false,
-            }
-            .boot_milestone(),
-            Some(M::GrowwConnected { market_open: false })
         );
         // Non-boot events carry no milestone.
         assert!(NotificationEvent::TokenRenewed.boot_milestone().is_none());
@@ -5405,367 +4831,6 @@ mod tests {
             msg.contains(&expected),
             "boot message must carry '{expected}': {msg}"
         );
-    }
-
-    #[test]
-    fn test_groww_sidecar_rejected_renders_reason_and_topic_and_severity() {
-        let event = NotificationEvent::GrowwSidecarRejected {
-            reason: "account lacks live market-data feed entitlement".to_string(),
-            fleet_summary: false,
-            detail: None,
-        };
-        let msg = event.to_message();
-        // The plain-English reason reaches the operator…
-        assert!(
-            msg.contains("account lacks live market-data feed entitlement"),
-            "reason missing from message: {msg}"
-        );
-        // …with a status emoji at the start (10 commandments rule 5/10)…
-        assert!(msg.contains("🆘"), "severity emoji missing: {msg}");
-        assert!(msg.contains("Groww"), "feed name missing: {msg}");
-        // …no library names / file paths / version numbers (10 commandments).
-        assert!(!msg.contains("Stdio"), "lib jargon leaked: {msg}");
-        assert!(!msg.contains(".rs"), "file path leaked: {msg}");
-        assert!(!msg.contains("growwapi"), "lib name leaked: {msg}");
-        // Stable topic + High severity so it pages.
-        assert_eq!(event.topic(), "GrowwSidecarRejected");
-        assert_eq!(event.severity(), Severity::High);
-    }
-
-    #[test]
-    fn test_groww_sidecar_rejected_fleet_summary_body_is_fleet_aware() {
-        // Hostile-review fix 2026-07-06: a PARTIAL-fleet coalesced summary
-        // must not be wrapped in the single-conn total-outage trailer — the
-        // body would simultaneously report a partial count AND claim the
-        // whole feed is "receiving nothing" / "prices will not flow".
-        let event = NotificationEvent::GrowwSidecarRejected {
-            reason: "7 of 40 connections retrying (server session limit or throttle) — \
-                     no reject reported from the other 33 connections"
-                .to_string(),
-            fleet_summary: true,
-            detail: None,
-        };
-        let msg = event.to_message();
-        assert!(
-            msg.contains("7 of 40 connections retrying"),
-            "fleet summary reason missing: {msg}"
-        );
-        assert!(
-            !msg.contains("receiving nothing"),
-            "total-outage trailer must not wrap a partial fleet summary: {msg}"
-        );
-        assert!(
-            !msg.contains("Groww prices will not flow"),
-            "whole-feed no-flow claim must not wrap a partial fleet summary: {msg}"
-        );
-        assert!(
-            msg.contains("Prices from those connections will not flow"),
-            "fleet trailer must scope the no-flow claim to the affected connections: {msg}"
-        );
-        // Same topic/severity/badge as the single-conn arm — only the body
-        // trailer is fleet-aware.
-        assert_eq!(event.topic(), "GrowwSidecarRejected");
-        assert_eq!(event.severity(), Severity::High);
-        // The single-conn arm keeps its original total-outage wording.
-        let single = NotificationEvent::GrowwSidecarRejected {
-            reason: "access token stale".to_string(),
-            fleet_summary: false,
-            detail: None,
-        };
-        assert!(single.to_message().contains("receiving nothing"));
-    }
-
-    #[test]
-    fn test_groww_sidecar_rejected_html_escapes_reason() {
-        // Defense-in-depth: even though the supervisor only passes a fixed
-        // &'static str reason, any angle brackets are escaped at the render
-        // boundary (consistent with every other String arm).
-        let event = NotificationEvent::GrowwSidecarRejected {
-            reason: "<script>".to_string(),
-            fleet_summary: false,
-            detail: None,
-        };
-        let msg = event.to_message();
-        assert!(!msg.contains("<script>"), "raw HTML not escaped: {msg}");
-        assert!(
-            msg.contains("&lt;script&gt;"),
-            "expected escaped form: {msg}"
-        );
-    }
-
-    #[test]
-    fn test_groww_sidecar_rejected_detail_renders_reason_and_retrying() {
-        // 2026-07-14 operator demand (the 14:59 IST page carried no WHY):
-        // when the SANITIZED reject-cause signature is present, the headline
-        // names it verbatim — "live feed rejected: <cause> — retrying" — and
-        // the class's plain-English explanation line is KEPT beneath it.
-        // The detail legitimately carries SDK/NATS wording (`growwapi`,
-        // `nats:`) per the dated commandment-2 override recorded in
-        // feed-stall-watchdog-error-codes.md §1c.1 — so the no-jargon pin in
-        // test_groww_sidecar_rejected_renders_reason_and_topic_and_severity
-        // applies only to the detail-less form.
-        let event = NotificationEvent::GrowwSidecarRejected {
-            reason: "the feed reported an error and is retrying".to_string(),
-            fleet_summary: false,
-            detail: Some(
-                "ERROR growwapi.groww.nats_client: Error: nats: unexpected EOF".to_string(),
-            ),
-        };
-        let msg = event.to_message();
-        assert!(
-            msg.contains(
-                "Groww live feed rejected: ERROR growwapi.groww.nats_client: \
-                 Error: nats: unexpected EOF — retrying"
-            ),
-            "headline must name the sanitized cause + retrying: {msg}"
-        );
-        // The existing class explanation stays as the body line.
-        assert!(
-            msg.contains("the feed reported an error and is retrying"),
-            "class explanation must be kept: {msg}"
-        );
-        // The single-conn total-outage trailer is unchanged.
-        assert!(msg.contains("receiving nothing"), "trailer lost: {msg}");
-        // Badge ordering untouched (PR #1529 owns the badge arms).
-        assert!(
-            msg.starts_with("🟢 GROWW — "),
-            "badge ordering broke: {msg}"
-        );
-        assert_eq!(event.severity(), Severity::High);
-    }
-
-    #[test]
-    fn test_groww_sidecar_rejected_empty_detail_degrades_to_generic() {
-        // An empty / whitespace / None detail must render the EXACT generic
-        // pre-2026-07-14 headline — never a hollow "rejected:  — retrying".
-        let expected = NotificationEvent::GrowwSidecarRejected {
-            reason: "the feed reported an error and is retrying".to_string(),
-            fleet_summary: false,
-            detail: None,
-        }
-        .to_message();
-        assert!(
-            expected.contains("Groww live feed rejected</b>"),
-            "generic headline missing: {expected}"
-        );
-        for hollow in [Some(String::new()), Some("   ".to_string())] {
-            let msg = NotificationEvent::GrowwSidecarRejected {
-                reason: "the feed reported an error and is retrying".to_string(),
-                fleet_summary: false,
-                detail: hollow,
-            }
-            .to_message();
-            assert_eq!(msg, expected, "empty detail must degrade to generic");
-            assert!(
-                !msg.contains("rejected:"),
-                "hollow 'rejected:' headline leaked: {msg}"
-            );
-        }
-    }
-
-    #[test]
-    fn test_groww_sidecar_rejected_detail_html_escaped_and_recapped() {
-        // Defense-in-depth at the render boundary: the emit-site contract
-        // already sanitizes + caps, but a hostile/oversized detail from any
-        // future emit site is re-capped to 160 chars (BEFORE escaping, so an
-        // entity is never cut mid-sequence) and html-escaped.
-        let event = NotificationEvent::GrowwSidecarRejected {
-            reason: "the feed reported an error and is retrying".to_string(),
-            fleet_summary: false,
-            detail: Some(format!("<script>{}", "x".repeat(400))),
-        };
-        let msg = event.to_message();
-        assert!(!msg.contains("<script>"), "raw HTML not escaped: {msg}");
-        assert!(
-            msg.contains("rejected: &lt;script&gt;"),
-            "escaped detail missing from headline: {msg}"
-        );
-        // 160-char cap: the raw detail is 408 chars; after the cap the
-        // headline's x-run is 160 - "<script>".len() = 152 chars long.
-        assert!(
-            msg.contains(&"x".repeat(152)) && !msg.contains(&"x".repeat(153)),
-            "detail must be re-capped to 160 chars at the render boundary: {msg}"
-        );
-    }
-
-    #[test]
-    fn test_feed_down_in_market_is_high_severity() {
-        // Regression pin (2026-07-06 Groww feed-down alerting): a mid-session
-        // feed-DOWN must PAGE (High → Telegram + SNS) — the incident class is
-        // "Groww died at 10:31 IST, operator learned hours later".
-        let ev = NotificationEvent::FeedDown {
-            feed: "Groww".to_string(),
-            reason: "feed switched off by the operator".to_string(),
-            market_open: true,
-            operator_initiated: true,
-        };
-        assert_eq!(ev.severity(), Severity::High);
-    }
-
-    #[test]
-    fn test_feed_down_off_hours_is_low_severity() {
-        // Regression pin: off-hours feed-down must be Low (60s coalesced) —
-        // the 2026-04-22 pre-market Telegram-spam precedent class
-        // (WebSocketDisconnectedOffHours). The split is field-driven, not a
-        // second variant.
-        let ev = NotificationEvent::FeedDown {
-            feed: "Groww".to_string(),
-            reason: "feed switched off by the operator".to_string(),
-            market_open: false,
-            operator_initiated: true,
-        };
-        assert_eq!(ev.severity(), Severity::Low);
-    }
-
-    #[test]
-    fn test_feed_recovered_is_medium_severity() {
-        // Mirrors WebSocketReconnected (Medium): recovery is visible
-        // immediately but never pages SNS.
-        let ev = NotificationEvent::FeedRecovered {
-            feed: "Groww".to_string(),
-            down_secs: 154,
-        };
-        assert_eq!(ev.severity(), Severity::Medium);
-    }
-
-    #[test]
-    fn test_feed_down_renders_reason_and_topic_and_severity() {
-        // 10-commandments pin (pattern: GrowwSidecarRejected test above).
-        let ev = NotificationEvent::FeedDown {
-            feed: "Groww".to_string(),
-            reason: "internal restart — recovering automatically".to_string(),
-            market_open: true,
-            operator_initiated: false,
-        };
-        let msg = ev.to_message();
-        assert!(
-            msg.contains("internal restart — recovering automatically"),
-            "reason missing from message: {msg}"
-        );
-        // Status emoji at the start of the body (commandments 5/10) + the
-        // honest no-flow + auto-retry trailer.
-        assert!(msg.contains("🆘"), "severity emoji missing: {msg}");
-        assert!(msg.contains("Groww"), "feed name missing: {msg}");
-        assert!(
-            msg.contains("will not flow until it recovers"),
-            "honest no-flow claim missing: {msg}"
-        );
-        assert!(
-            msg.contains("retrying automatically"),
-            "auto-retry reassurance missing: {msg}"
-        );
-        // No library names / file paths (10 commandments).
-        assert!(!msg.contains(".rs"), "file path leaked: {msg}");
-        assert!(!msg.contains("mpsc"), "lib jargon leaked: {msg}");
-        assert_eq!(ev.topic(), "FeedDown");
-        assert_eq!(ev.severity(), Severity::High);
-        // Off-hours body flips register: soft warning, idle-is-normal.
-        let off = NotificationEvent::FeedDown {
-            feed: "Groww".to_string(),
-            reason: "feed switched off by the operator".to_string(),
-            market_open: false,
-            operator_initiated: true,
-        };
-        let off_msg = off.to_message();
-        assert!(
-            off_msg.contains("off-hours") && off_msg.contains("idle is normal"),
-            "off-hours body must say off-hours + idle is normal: {off_msg}"
-        );
-    }
-
-    #[test]
-    fn test_feed_down_operator_disable_body_names_the_action_not_auto_retry() {
-        // Regression pin (2026-07-06 fix): a DELIBERATE runtime disable is
-        // never retried by the system — the body must name the ONE action
-        // that fixes it (re-enable from the feeds page) and must NOT claim
-        // automatic retry/reconnect (Telegram commandment 7; a false
-        // auto-retry promise actively delays recovery — audit Rule 11).
-        let ev = NotificationEvent::FeedDown {
-            feed: "Groww".to_string(),
-            reason: "feed switched off by the operator".to_string(),
-            market_open: true,
-            operator_initiated: true,
-        };
-        let msg = ev.to_message();
-        assert!(
-            msg.contains("re-enable it from the feeds page"),
-            "operator-disable body must name the re-enable action: {msg}"
-        );
-        assert!(
-            !msg.contains("retrying automatically") && !msg.contains("Reconnect is automatic"),
-            "operator-disable body must NOT claim automatic retry: {msg}"
-        );
-        // Off-hours form of the same deliberate disable: same rule.
-        let off = NotificationEvent::FeedDown {
-            feed: "Groww".to_string(),
-            reason: "feed switched off by the operator".to_string(),
-            market_open: false,
-            operator_initiated: true,
-        };
-        let off_msg = off.to_message();
-        assert!(
-            off_msg.contains("re-enable it from the feeds page"),
-            "off-hours operator-disable body must name the re-enable action: {off_msg}"
-        );
-        assert!(
-            !off_msg.contains("Reconnect is automatic"),
-            "off-hours operator-disable body must NOT claim automatic reconnect: {off_msg}"
-        );
-    }
-
-    #[test]
-    fn test_feed_down_html_escapes_reason() {
-        // Defense-in-depth: reasons are fixed literals at every emit site,
-        // but any angle brackets are escaped at the render boundary
-        // (consistent with every other String arm).
-        let ev = NotificationEvent::FeedDown {
-            feed: "Groww".to_string(),
-            reason: "<script>".to_string(),
-            market_open: true,
-            operator_initiated: false,
-        };
-        let msg = ev.to_message();
-        assert!(!msg.contains("<script>"), "raw HTML not escaped: {msg}");
-        assert!(
-            msg.contains("&lt;script&gt;"),
-            "expected escaped form: {msg}"
-        );
-    }
-
-    #[test]
-    fn test_feed_recovered_renders_down_secs_and_topic() {
-        let ev = NotificationEvent::FeedRecovered {
-            feed: "Groww".to_string(),
-            down_secs: 154,
-        };
-        let msg = ev.to_message();
-        assert!(msg.contains("✅"), "recovery emoji missing: {msg}");
-        assert!(
-            msg.contains("streaming again"),
-            "recovery must claim STREAMING (ticks), not just socket-connect: {msg}"
-        );
-        assert!(msg.contains("154"), "down duration missing: {msg}");
-        assert!(msg.contains("Groww"), "feed name missing: {msg}");
-        assert_eq!(ev.topic(), "FeedRecovered");
-    }
-
-    #[test]
-    fn test_feed_down_and_recovered_resolve_groww_badge() {
-        // Both variants must resolve the 🟢 GROWW badge via the feed-generic
-        // arm — falling to `_ => None` would violate the 2026-07-05
-        // "uniquely seen" per-feed badge directive.
-        let down = NotificationEvent::FeedDown {
-            feed: "Groww".to_string(),
-            reason: "x".to_string(),
-            market_open: true,
-            operator_initiated: false,
-        };
-        let rec = NotificationEvent::FeedRecovered {
-            feed: "Groww".to_string(),
-            down_secs: 1,
-        };
-        assert_eq!(down.feed_badge(), Some("🟢 GROWW"));
-        assert_eq!(rec.feed_badge(), Some("🟢 GROWW"));
     }
 
     #[test]
@@ -7951,7 +7016,7 @@ mod tests {
 
     // -----------------------------------------------------------------------
     // Feed-agnostic Telegram parity (operator directive 2026-07-03):
-    // FeedStatusLine block + FeedInstrumentsLoaded
+    // FeedStatusLine block (FeedInstrumentsLoaded deleted 2026-07-15)
     // -----------------------------------------------------------------------
 
     fn feed_lines() -> Vec<FeedStatusLine> {
@@ -8044,64 +7109,10 @@ mod tests {
         assert!(msg.contains("Groww: 768 instruments"), "got: {msg}");
     }
 
-    #[test]
-    fn test_feed_instruments_loaded_message_and_severity() {
-        let ev = NotificationEvent::FeedInstrumentsLoaded {
-            feed: "Groww".to_string(),
-            subscribed: 768,
-            indices: 2,
-            stocks: 766,
-            skipped: 5,
-        };
-        assert_eq!(ev.topic(), "FeedInstrumentsLoaded");
-        assert_eq!(ev.severity(), Severity::Info);
-        // Boot-success milestone — must ship instantly like the Dhan
-        // instruments ping it mirrors, never coalesced 60s.
-        assert_eq!(ev.dispatch_policy(), DispatchPolicy::Immediate);
-        let msg = ev.to_message();
-        assert!(msg.contains("Groww instruments loaded"), "got: {msg}");
-        assert!(
-            msg.contains("Subscribed 768 instruments (2 indices + 766 stocks)"),
-            "got: {msg}"
-        );
-        assert!(
-            msg.contains("Skipped 5 that could not be matched today"),
-            "got: {msg}"
-        );
-    }
-
-    #[test]
-    fn test_feed_instruments_loaded_skipped_zero_wording() {
-        let ev = NotificationEvent::FeedInstrumentsLoaded {
-            feed: "Groww".to_string(),
-            subscribed: 770,
-            indices: 2,
-            stocks: 768,
-            skipped: 0,
-        };
-        let msg = ev.to_message();
-        assert!(msg.contains("Every instrument matched"), "got: {msg}");
-        assert!(!msg.contains("Skipped"), "got: {msg}");
-    }
-
     // -----------------------------------------------------------------------
-    // Groww boot-visibility parity (operator directive 2026-07-04):
-    // FeedAuthOk + FeedConnectedAwaitingTicks + feed-aware off-hours boot
+    // Groww boot-visibility parity pings (FeedAuthOk / FeedConnectedAwaitingTicks)
+    // deleted 2026-07-15 with the Groww live feed.
     // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_feed_auth_ok_message_topic_severity() {
-        let ev = NotificationEvent::FeedAuthOk {
-            feed: "Groww".to_string(),
-        };
-        assert_eq!(ev.topic(), "FeedAuthOk");
-        assert_eq!(ev.severity(), Severity::Low);
-        // Boot milestone — ships instantly like Dhan's AuthenticationSuccess.
-        assert_eq!(ev.dispatch_policy(), DispatchPolicy::Immediate);
-        let msg = ev.to_message();
-        assert!(msg.contains("Groww Auth OK"), "got: {msg}");
-        assert!(msg.contains("access token in hand"), "got: {msg}");
-    }
 
     // -----------------------------------------------------------------------
     // Per-feed visual identity (operator directive 2026-07-05: "dhan and
@@ -8132,58 +7143,6 @@ mod tests {
                 "Dhan-scoped body must lead with the Dhan badge: {msg}"
             );
         }
-    }
-
-    #[test]
-    fn test_groww_feed_events_carry_groww_badge_in_message() {
-        let sidecar = NotificationEvent::GrowwSidecarRejected {
-            reason: "access token stale".to_string(),
-            fleet_summary: false,
-            detail: None,
-        };
-        assert_eq!(sidecar.feed_badge(), Some("🟢 GROWW"));
-        assert!(
-            sidecar.to_message().starts_with("🟢 GROWW — "),
-            "got: {}",
-            sidecar.to_message()
-        );
-        let auth = NotificationEvent::FeedAuthOk {
-            feed: "Groww".to_string(),
-        };
-        let msg = auth.to_message();
-        assert!(
-            msg.starts_with("🟢 GROWW — "),
-            "Groww feed events must lead with the Groww badge: {msg}"
-        );
-    }
-
-    #[test]
-    fn test_dynamic_feed_events_badge_follows_feed_field() {
-        // The generic Feed* events resolve their badge from the `feed`
-        // field — Dhan-tagged renders Dhan, Groww-tagged renders Groww, an
-        // unknown future feed renders UN-badged (honest, never wrong).
-        let dhan = NotificationEvent::FeedInstrumentsLoaded {
-            feed: "Dhan".to_string(),
-            subscribed: 243,
-            indices: 25,
-            stocks: 218,
-            skipped: 0,
-        };
-        assert_eq!(dhan.feed_badge(), Some("🔷 DHAN"));
-        let groww = NotificationEvent::FeedConnectedAwaitingTicks {
-            feed: "Groww".to_string(),
-            subscribed: 768,
-            market_open: false,
-        };
-        assert_eq!(groww.feed_badge(), Some("🟢 GROWW"));
-        let unknown = NotificationEvent::FeedAuthOk {
-            feed: "SomeFutureFeed".to_string(),
-        };
-        assert_eq!(unknown.feed_badge(), None);
-        assert!(
-            !unknown.to_message().contains("DHAN") && !unknown.to_message().contains("GROWW"),
-            "unknown feed must render un-badged"
-        );
     }
 
     #[test]
@@ -8447,50 +7406,6 @@ mod tests {
             threshold_secs: 14400,
         };
         assert_eq!(groww.feed_badge(), Some("🟢 GROWW"));
-    }
-
-    #[test]
-    fn test_feed_connected_awaiting_ticks_market_closed_wording() {
-        let ev = NotificationEvent::FeedConnectedAwaitingTicks {
-            feed: "Groww".to_string(),
-            subscribed: 768,
-            market_open: false,
-        };
-        assert_eq!(ev.topic(), "FeedConnectedAwaitingTicks");
-        assert_eq!(ev.severity(), Severity::Low);
-        assert_eq!(ev.dispatch_policy(), DispatchPolicy::Immediate);
-        let msg = ev.to_message();
-        assert!(msg.contains("Groww feed connected"), "got: {msg}");
-        assert!(msg.contains("Subscribed 768 instruments"), "got: {msg}");
-        // FALSE-OK TRAP (operator 2026-07-04 + audit Rule 11): the boot-time
-        // connect ping must say "awaiting first tick" — socket-connected is
-        // NOT streaming, and on a closed market the idle is normal.
-        assert!(msg.contains("awaiting first tick"), "got: {msg}");
-        assert!(msg.contains("market closed — idle is normal"), "got: {msg}");
-        assert!(
-            !msg.contains("streaming"),
-            "must never claim streaming: {msg}"
-        );
-    }
-
-    #[test]
-    fn test_feed_connected_awaiting_ticks_market_open_wording_never_claims_streaming() {
-        let ev = NotificationEvent::FeedConnectedAwaitingTicks {
-            feed: "Groww".to_string(),
-            subscribed: 768,
-            market_open: true,
-        };
-        let msg = ev.to_message();
-        assert!(msg.contains("awaiting first tick"), "got: {msg}");
-        assert!(
-            msg.contains("market open — ticks should arrive shortly"),
-            "got: {msg}"
-        );
-        assert!(
-            !msg.contains("streaming"),
-            "must never claim streaming: {msg}"
-        );
-        assert!(!msg.contains("idle is normal"), "wrong suffix: {msg}");
     }
 
     #[test]

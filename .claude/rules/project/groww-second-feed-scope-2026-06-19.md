@@ -1,5 +1,21 @@
 # Groww Second Feed — Pluggable-Feeds Scope Extension (Operator Lock 2026-06-19)
 
+> **⚠ GROWW LIVE FEED RETIRED 2026-07-15 (operator directive — received directly in this session):** operator
+> verbatim Q1: *"remove the whole Groww live feed; keep only spot 1m and option chain for both brokers; go."*;
+> approval Q2 (typos preserved): *"go aehad approv ed dude"*. The Groww live NATS-over-WS feed — the sole live
+> market-data feed since the 2026-07-13 Dhan retirement — is RETIRED; the runtime market-data surface is
+> REST-only for BOTH brokers (Dhan §8 + Groww §9/§38 per-minute scheduled pulls,
+> `no-rest-except-live-feed-2026-06-27.md`). WHAT STANDS: the §38 REST grants, §37 (dormant), the
+> token-minter lock (`groww-shared-token-minter-2026-07-02.md`), and the Groww master-CSV / watch-set KEEP
+> rows (REST-leg identity + SEBI master continuity). RETIRED AS HISTORICAL AUDIT: §§1–3 (the live-feed
+> contract), §32 (the Python sidecar), §34 (auto-scale), §35 (native shadow), and the §36 Groww LIVE leg
+> (the shared expiry selector stays for the REST legs' contract identity). ErrorCode variants
+> (`FeedStall01*`/`FeedSupervisor01*`/`FeedReject01*`/`FeedGap01*`/`GrowwNative*`/`GrowwScale*`) are RETAINED
+> until the post-C4 variant sweep. Order/position live channels are a separate, permanently-kept surface per
+> the operator's 2026-07-15 order-side directive (recorded by the order-side session; see the cluster-A rule
+> updates) — market data = per-minute REST pull, order/position events = live push. Where sections below
+> conflict with this banner, the banner wins.
+
 > **Authority:** CLAUDE.md > `operator-charter-forever.md` §I > this file > `websocket-connection-scope-lock.md` (EXTENDED below) > `daily-universe-scope-expansion-2026-05-27.md` > defaults.
 > **Scope:** PERMANENT. Every Phase. Every PR. Every future Claude/Cowork session.
 > **Operator-locked:** 2026-06-19 (verbatim quotes preserved below).

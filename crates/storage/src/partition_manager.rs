@@ -90,10 +90,6 @@ pub(crate) const DAY_PARTITIONED_TABLES: &[&str] = &[
     // both feeds write here, `feed` is in the DEDUP key. Same SEBI-audit class +
     // DAY partitioning as the two siloed tables it merges.
     "feed_parity_1m_audit",
-    // GROWW-SCALE-01..04 (2026-07-03, auto-scale ladder PR-2): one row per
-    // ladder rung transition — same SEBI-audit class + DAY partitioning as
-    // ws_event_audit; `feed` is in the DEDUP key.
-    "groww_scale_audit",
     // SCOREBOARD-01 (2026-07-10, dual-feed scoreboard PR-A): one row per
     // (trading day, feed) verdict / per (trading day, feed) coverage snapshot /
     // per outage episode — same SEBI-audit class + DAY partitioning as the
@@ -101,9 +97,6 @@ pub(crate) const DAY_PARTITIONED_TABLES: &[&str] = &[
     "feed_scoreboard_daily",
     "feed_coverage_daily",
     "feed_episode_audit",
-    // FEED-GAP-01 gap-episode forensics (Groww hardening PR-3, 2026-07-14) —
-    // a handful of edge rows per day; DAY retention like its episode sibling.
-    "feed_gap_audit",
     // BRUTEX-XVERIFY-01/02 (2026-07-12, §37): one row per divergent cell /
     // one row per trading-day summary — same SEBI-audit class + DAY
     // partitioning as cross_verify_1m_audit / feed_scoreboard_daily.
