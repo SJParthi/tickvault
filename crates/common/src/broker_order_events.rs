@@ -27,6 +27,7 @@
 //! Missing/absent fields are `Option`, never a sentinel.
 
 use crate::feed::Feed;
+use tokio::sync::watch;
 
 /// A single broker order-lifecycle observation, normalized across brokers.
 ///
@@ -128,6 +129,35 @@ pub enum EventSource {
     Poll,
     /// An order-update stream push produced this observation (event-driven).
     Push,
+}
+
+/// Default for the [`push_active`](new_push_active_channel) flag: `false` — no
+/// order-update PUSH feed is live at boot, so the REST status poller runs its
+/// full adaptive cadence.
+pub const PUSH_ACTIVE_DEFAULT: bool = false;
+
+/// Creates the Session-3 order-update **PUSH-active** flag channel — a
+/// [`tokio::sync::watch`] pair seeded to [`PUSH_ACTIVE_DEFAULT`] (`false`).
+///
+/// This is the additive PR-A0 seam (spec §4.11): the flag lives in `common`
+/// so a FUTURE core/app producer (Session 3's order-update feed) and the
+/// trading-side REST poller (consumer) can share it WITHOUT either depending
+/// on `tickvault-trading` (dependency flow `common ← core ← trading`).
+///
+/// - **Producer (Session 3):** when the order-update push feed goes live it
+///   `send(true)`; when it drops it `send(false)`.
+/// - **Consumer (the poller):** reads the receiver. While `false` the poller
+///   runs full cadence; when a producer flips it `true`, the poller MAY later
+///   (a ratchet-gated change) degrade per-order cadence toward the reconcile
+///   floor. A hint NEVER transitions state — it only schedules a targeted
+///   status poll, so lossiness under lag is safe.
+///
+/// PR-A0 ships the seam only — there is NO production producer yet (Session 3
+/// owns the flip). Returns `(Sender, Receiver)`; the caller wires ownership.
+#[must_use]
+// WIRING-EXEMPT: PR-A0 seam — the production producer (Session 3 order-update feed) and consumer (Orders poller) land in later serial §39.3 area PRs; tested inline.
+pub fn new_push_active_channel() -> (watch::Sender<bool>, watch::Receiver<bool>) {
+    watch::channel(PUSH_ACTIVE_DEFAULT)
 }
 
 impl BrokerOrderStatus {
@@ -492,5 +522,29 @@ mod tests {
         assert_eq!(s, t);
         assert_eq!(format!("{:?}", EventSource::Poll), "Poll");
         assert_eq!(format!("{:?}", EventSource::Push), "Push");
+    }
+
+    // --- push_active seam (Session-3 order-update PUSH flag) ---
+
+    #[test]
+    fn test_push_active_channel_defaults_false_and_flips() {
+        // Seeded to the default: no push feed live at boot.
+        assert!(!PUSH_ACTIVE_DEFAULT);
+        let (tx, rx) = new_push_active_channel();
+        assert!(
+            !*rx.borrow(),
+            "push_active must start false (poller full cadence)"
+        );
+        // A producer (Session 3) flips it true; the consumer sees it.
+        tx.send(true).expect("receiver alive"); // APPROVED: test
+        assert!(
+            *rx.borrow(),
+            "consumer must observe the producer's flip to true"
+        );
+        tx.send(false).expect("receiver alive"); // APPROVED: test
+        assert!(
+            !*rx.borrow(),
+            "consumer must observe the drop back to false"
+        );
     }
 }
