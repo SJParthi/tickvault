@@ -359,6 +359,30 @@ mod tests {
     }
 
     #[test]
+    fn ratchet_runner_day_start_reset_recreates_decision_latch() {
+        // CAD-NEW-1 / CONC-1 (hostile-review round 1, 2026-07-15): cycle
+        // minutes are BARE minute-of-day values that recur every day. A
+        // latch slot frozen across the IST day flip (parked lanes via
+        // /api/feeds, a midnight suspend's Abandoned cycle) collides with
+        // the same minute-of-day the next day: try_latch refuses, the
+        // (lane, minute) gets ZERO Decided/Skipped outcomes (an
+        // exactly-once hole in the zero direction) and the should-never
+        // double_latch + illegal_fsm_move channels fire for a routine
+        // pattern. The runner's day-start reset block MUST therefore
+        // re-create the latch alongside the ladders.
+        let src = include_str!("runner.rs");
+        let start = src
+            .find("Day-start reset")
+            .expect("runner day-start reset block present");
+        let window = &src[start..start.saturating_add(3_000).min(src.len())];
+        assert!(
+            window.contains("latch = DecisionLatch::new()"),
+            "the runner's day-start reset block must reset the \
+             DecisionLatch (CAD-NEW-1/CONC-1)"
+        );
+    }
+
+    #[test]
     fn test_emit_decision_skip_reason_and_outcome_labels_stable() {
         // Stable wire labels (counters + CADENCE-02 stage taxonomy).
         assert_eq!(SkipReason::Cutoff.as_str(), "cutoff");
