@@ -445,6 +445,16 @@ jobs:
       # ── STEP 8: SSM — set QDB_MEM_LIMIT=1g in on-box .env + restart stack ──
       # Pattern = aws-upgrade-instance.sh Step 8 (env upsert) + deploy-aws.yml SSM rules:
       # single-line commands, escaped quotes only, NO apostrophes; manual poll, never `ssm wait`.
+      # QUESTDB PG CREDS (review round 4 CRITICAL): docker-compose.yml HARD-REQUIRES
+      # TV_QUESTDB_PG_USER / TV_QUESTDB_PG_PASSWORD ("${VAR:?...}" interpolations,
+      # docker-compose.yml lines ~168-169) on EVERY compose invocation — they are
+      # NEVER persisted to the on-box .env; every proven bring-up path fetches them
+      # from SSM at invocation time (deploy-aws.yml ~L634, ensure-questdb.sh,
+      # infra.rs). Without them the recreate below fails whole-file interpolation
+      # and the retune is unreachable in BOTH full and retune-only mode. So: fetch
+      # both params (--with-decryption, deploy-aws.yml parity incl. the admin/quest
+      # fallbacks) and run a `docker compose config -q` interpolation PREFLIGHT
+      # before the recreate, so a creds/compose problem fails loudly and named.
       # READINESS BOUND: the deploy lane expects systemd READY=1 within 180s of boot;
       # the 300s is-active loop below (60 x 5s) brackets that with margin — if the box
       # cannot go active well inside 180s on t4g.medium, that is itself a too-tight-
@@ -463,7 +473,10 @@ jobs:
               "grep -q \"^QDB_MEM_LIMIT=\" repo/deploy/docker/.env && sed -i \"s/^QDB_MEM_LIMIT=.*/QDB_MEM_LIMIT=1g/\" repo/deploy/docker/.env || echo \"QDB_MEM_LIMIT=1g\" >> repo/deploy/docker/.env",
               "if [ -f deploy/docker/.env ]; then grep -q \"^QDB_MEM_LIMIT=\" deploy/docker/.env && sed -i \"s/^QDB_MEM_LIMIT=.*/QDB_MEM_LIMIT=1g/\" deploy/docker/.env || echo \"QDB_MEM_LIMIT=1g\" >> deploy/docker/.env; fi",
               "chown ec2-user:ec2-user repo/deploy/docker/.env",
-              "(cd repo/deploy/docker && timeout 600 docker compose up -d --no-deps tv-questdb)",
+              "export TV_QUESTDB_PG_USER=$(aws ssm get-parameter --region ap-south-1 --name /tickvault/prod/questdb/pg-user --with-decryption --output text --query Parameter.Value 2>/dev/null || echo admin)",
+              "export TV_QUESTDB_PG_PASSWORD=$(aws ssm get-parameter --region ap-south-1 --name /tickvault/prod/questdb/pg-password --with-decryption --output text --query Parameter.Value 2>/dev/null || echo quest)",
+              "(cd repo/deploy/docker && TV_QUESTDB_PG_USER=\"$TV_QUESTDB_PG_USER\" TV_QUESTDB_PG_PASSWORD=\"$TV_QUESTDB_PG_PASSWORD\" docker compose config -q) || { echo FATAL: compose interpolation preflight failed - QuestDB PG creds missing or compose file invalid; exit 1; }",
+              "(cd repo/deploy/docker && TV_QUESTDB_PG_USER=\"$TV_QUESTDB_PG_USER\" TV_QUESTDB_PG_PASSWORD=\"$TV_QUESTDB_PG_PASSWORD\" timeout 600 docker compose up -d --no-deps tv-questdb)",
               "for i in 1 2 3 4 5 6; do if curl -fsS \"http://127.0.0.1:9000/exec?query=SELECT%201\" >/dev/null 2>&1; then echo QUESTDB-UP; break; fi; sleep 5; if [ $i -eq 6 ]; then echo FATAL: QuestDB not responding after retune; exit 1; fi; done",
               "QDB_LIMIT_BYTES=$(docker inspect tv-questdb --format \"{{.HostConfig.Memory}}\")",
               "echo MEMLIMIT=$QDB_LIMIT_BYTES",
@@ -472,7 +485,7 @@ jobs:
               "systemctl restart tickvault --no-block",
               "READY_OK=no; for i in $(seq 1 60); do if systemctl is-active --quiet tickvault; then READY_OK=yes; break; fi; sleep 5; done",
               "if [ \"$READY_OK\" != yes ]; then echo FATAL: tickvault not active within 300s; journalctl -u tickvault.service -n 120 --no-pager --output=cat || true; exit 1; fi",
-              "curl -fsS --max-time 5 http://127.0.0.1:3001/health || echo WARN: on-box health probe failed (API may be auth-gated or still warming)",
+              "curl -fsS --max-time 5 http://127.0.0.1:3001/health || echo \"WARN: on-box health probe failed (API may be auth-gated or still warming)\"",
               "echo DOWNSIZE-BOX-OK"
             ]' \
             --query 'Command.CommandId' --output text)

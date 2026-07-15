@@ -53,7 +53,7 @@
 #        --qdb-mem 4g                                       # emergency roll-UP direction
 #
 # NOTE: a t4g.medium target auto-defaults QDB_MEM_LIMIT=1g and an r8g.large
-#   target auto-defaults QDB_MEM_LIMIT=4g (persisted in deploy/docker/.env)
+#   target auto-defaults QDB_MEM_LIMIT=4g (persisted in repo/deploy/docker/.env)
 #   so the QuestDB ceiling always lands COUPLED to the host RAM change.
 #   Pass an explicit --qdb-mem to override.
 #
@@ -243,7 +243,7 @@ fi
 # ---------------------------------------------------------------------------
 # Couple QuestDB mem_limit to the host RAM change (2026-07-15 Quote 8).
 # When the operator did NOT pass an explicit --qdb-mem, auto-default it per
-# target so Step 8 persists the matching QDB_MEM_LIMIT in deploy/docker/.env
+# target so Step 8 persists the matching QDB_MEM_LIMIT in repo/deploy/docker/.env
 # EXACTLY when the box changes size — t4g.medium (4 GiB) → 1g (the downsize),
 # r8g.large (16 GiB) → 4g (the emergency roll-UP direction). Applies whether
 # the flip happens now (DO_TYPE_FLIP=1) or the box is already TO_TYPE
@@ -253,10 +253,10 @@ if [ -z "$QDB_MEM" ]; then
   case "$TO_TYPE" in
     t4g.medium)
       QDB_MEM="1g"
-      ok "Target t4g.medium (4 GiB): defaulting QuestDB mem_limit to ${QDB_MEM} (set in deploy/docker/.env at Step 8, coupled to the downsize)." ;;
+      ok "Target t4g.medium (4 GiB): defaulting QuestDB mem_limit to ${QDB_MEM} (set in repo/deploy/docker/.env at Step 8, coupled to the downsize)." ;;
     r8g.large)
       QDB_MEM="4g"
-      ok "Target r8g.large (16 GiB): defaulting QuestDB mem_limit to ${QDB_MEM} (set in deploy/docker/.env at Step 8, coupled to the resize)." ;;
+      ok "Target r8g.large (16 GiB): defaulting QuestDB mem_limit to ${QDB_MEM} (set in repo/deploy/docker/.env at Step 8, coupled to the resize)." ;;
     *) : ;; # no auto-default for other targets — --qdb-mem is explicit-only
   esac
 fi
@@ -422,25 +422,40 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Step 8 — QuestDB mem_limit retune. The compose file reads
-# ${QDB_MEM_LIMIT:-2g} (safe default for the 8 GiB box), so we persist that env
-# on the box and restart the questdb container. QDB_MEM is either an explicit
-# --qdb-mem or the 4g auto-default for the r8g.large flip (set above) — so for
-# an r8g.large upgrade this runs automatically, coupling the 4g ceiling to the
-# 16 GiB resize. We EMIT the exact command; with --apply-ssm we send it via SSM
-# RunShellScript (only if the operator opts in).
+# Step 8 — QuestDB mem_limit retune. The compose PROJECT on the box is
+# /opt/tickvault/repo/deploy/docker (user-data.sh.tftpl Step 6 cd's there;
+# deploy-aws.yml operates there too) — NOT /opt/tickvault/deploy/docker, which
+# does not exist on the box (review round 4 HIGH: the old path aborted the
+# whole && chain at `touch`, so the documented manual/emergency retune leg
+# never executed). The compose file reads ${QDB_MEM_LIMIT:-1g}, so we persist
+# that env in the PROJECT .env (the one every compose caller reads) and
+# recreate ONLY the questdb container. docker-compose.yml also HARD-REQUIRES
+# TV_QUESTDB_PG_USER / TV_QUESTDB_PG_PASSWORD ("${VAR:?}" interpolations) on
+# EVERY compose invocation and they are never persisted to .env — so the
+# on-box command fetches them from SSM at invocation time (the deploy-aws.yml
+# ~L634 pattern, same admin/quest fallbacks; the instance role has
+# ssm:GetParameter). QDB_MEM is either an explicit --qdb-mem or the per-target
+# auto-default (t4g.medium→1g, r8g.large→4g), coupling the QuestDB ceiling to
+# the host RAM change. We EMIT the exact command; with --apply-ssm we send it
+# via SSM RunShellScript (only if the operator opts in).
 # ---------------------------------------------------------------------------
 if [ -n "$QDB_MEM" ]; then
   log "QuestDB mem_limit retune → ${QDB_MEM}"
-  # The on-box command: persist QDB_MEM_LIMIT in the compose env file and
+  # The on-box command: persist QDB_MEM_LIMIT in the compose PROJECT env file,
+  # export the SSM-held QuestDB PG creds (compose hard-requires them), and
   # recreate ONLY the questdb container so the new mem_limit takes effect.
+  # NOTE: \$(...) below is deliberately escaped — the SSM parameter fetches run
+  # ON THE BOX at invocation time, never on the operator's machine.
   read -r -d '' QDB_CMD <<EOF || true
-cd /opt/tickvault \
-  && touch deploy/docker/.env \
-  && (grep -q '^QDB_MEM_LIMIT=' deploy/docker/.env \
-        && sed -i 's/^QDB_MEM_LIMIT=.*/QDB_MEM_LIMIT=${QDB_MEM}/' deploy/docker/.env \
-        || echo 'QDB_MEM_LIMIT=${QDB_MEM}' >> deploy/docker/.env) \
-  && docker compose -f deploy/docker/docker-compose.yml up -d --no-deps tv-questdb \
+cd /opt/tickvault/repo/deploy/docker \
+  && touch .env \
+  && (grep -q '^QDB_MEM_LIMIT=' .env \
+        && sed -i 's/^QDB_MEM_LIMIT=.*/QDB_MEM_LIMIT=${QDB_MEM}/' .env \
+        || echo 'QDB_MEM_LIMIT=${QDB_MEM}' >> .env) \
+  && export TV_QUESTDB_PG_USER=\$(aws ssm get-parameter --region ${REGION} --name /tickvault/prod/questdb/pg-user --with-decryption --output text --query Parameter.Value 2>/dev/null || echo admin) \
+  && export TV_QUESTDB_PG_PASSWORD=\$(aws ssm get-parameter --region ${REGION} --name /tickvault/prod/questdb/pg-password --with-decryption --output text --query Parameter.Value 2>/dev/null || echo quest) \
+  && docker compose config -q \
+  && docker compose up -d --no-deps tv-questdb \
   && echo "questdb restarted with mem_limit=${QDB_MEM}"
 EOF
   printf '  Run this ON THE BOX (or it is SSM-sent below):\n\n%s\n\n' "$QDB_CMD"
