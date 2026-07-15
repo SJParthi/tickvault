@@ -54,6 +54,8 @@ pub mod types;
 // Area modules land in their own serial PRs, each behind this same feature:
 //   pub mod api_client;    // Orders        (GROWW-ORD-*)
 //   pub mod smart_orders;  // Smart Orders  (GROWW-OCO-*)
-//   pub mod portfolio;     // Portfolio     (GROWW-PORT-*)
 //   pub mod margin;        // Margin        (GROWW-MARG-*)
 //   pub mod user;          // User + Exceptions (GROWW-READY-*)
+
+/// Portfolio area (`GROWW-PORT-*`) — field-inventory probe (item 6c.2).
+pub mod portfolio;
