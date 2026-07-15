@@ -211,6 +211,14 @@ Other clusters (checked off by their owning sessions' PRs, all referencing THIS 
 - [ ] E2 — portfolio + margin gate (OrderIntent in RiskEngine::check_order; design-only until the operator REST grant)
   - Files: crates/trading/src/risk/engine.rs, crates/trading/src/oms/api_client.rs
   - Tests: TBD by owning session (exit-never-gated invariant test mandatory)
+- [x] B1 — Scheduled OMS reconcile loop, config-gated default-OFF
+  - Files: crates/app/src/trading_pipeline.rs, crates/common/src/config.rs, config/base.toml, crates/app/tests/oms_reconcile_wiring_guard.rs
+  - Tests: should_run_scheduled_reconcile decision table, oms_reconcile_wiring_guard ratchets (7), config round-trip/defaults
+- [x] B2 — Dhan order-update decode hardening (dual-casing Value-stage normalizer, frame-size cap, terminal-guard fill preservation)
+  - Files: crates/core/src/parser/order_update.rs, crates/core/src/websocket/order_update_connection.rs, crates/trading/src/oms/engine.rs, crates/core/tests/order_update_choke_point_guard.rs
+  - Tests: parser T3-T16 + proptests, choke-point guard (3), reconcile terminal-guard scenarios
+
+> B1/B2 added+ticked by the ingestion session (coordinator-approved scope 2026-07-14); build lead notified for #1561 de-dup.
 
 ## Hard invariants (every Dhan-order PR states these)
 

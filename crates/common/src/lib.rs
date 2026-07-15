@@ -46,6 +46,7 @@ pub mod open_price_rest_fallback;
 pub mod open_price_source;
 pub mod order_types;
 pub mod phase;
+pub mod portfolio_types;
 pub mod price_precision;
 pub mod sanitize;
 pub mod segment;
