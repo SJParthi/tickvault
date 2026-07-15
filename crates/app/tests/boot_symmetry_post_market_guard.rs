@@ -1,70 +1,30 @@
-//! BOOT-SYMMETRY ratchet (2026-06-09).
+//! RETIRED (PR-C2, 2026-07-13 — Dhan live-WS lane deletion, operator
+//! retirement directive per websocket-connection-scope-lock.md
+//! "2026-07-13 Amendment" §B).
 //!
-//! `main.rs` has two mutually-exclusive boot paths — slow boot (normal /
-//! off-hours) and fast boot (mid-session crash restart). The post-market
-//! tasks — the 15:31:30 IST end-of-day digest and the 15:31:00 IST 1-minute
-//! cross-verify — used to be spawned ONLY in the slow-boot tail, so a
-//! mid-session fast-boot restart silently skipped both (the operator's
-//! "couldn't see the post-market cross-verification" incident).
+//! This BOOT-SYMMETRY ratchet (2026-06-09) pinned `spawn_post_market_tasks`
+//! being called from BOTH boot paths (fast crash-recovery + slow) and the
+//! 15:31:30 IST end-of-day digest + 15:31:00 IST 1-minute cross-verify
+//! living solely inside that helper. All three legs retired together:
 //!
-//! The fix extracts both spawns into ONE `spawn_post_market_tasks` helper that
-//! BOTH boot paths call. This guard fails the build if:
-//!   1. the helper is called from fewer than 2 sites (i.e. a boot path stopped
-//!      calling it), or
-//!   2. the end-of-day digest notify OR the cross-verify call is duplicated
-//!      inline instead of living solely inside the helper (drift).
+//! - `spawn_post_market_tasks` was DELETED with the Dhan lane (the Dhan
+//!   REST surface now boots via `dhan_rest_stack::spawn_dhan_rest_stack`).
+//! - The 15:31 Dhan live-vs-historical 1m cross-verify is RETIRED — with no
+//!   Dhan live candles there is no live side to compare
+//!   (cross-verify-1m-error-codes.md retirement banner).
+//! - The `EndOfDayDigest` NotificationEvent variant is DORMANT pending its
+//!   Phase C cleanup/re-home (tracked follow-up).
+//! - The "both boot paths" symmetry class itself is structurally gone:
+//!   main.rs has a SINGLE boot path since the fast crash-recovery arm was
+//!   deleted with the lane.
 //!
-//! It mirrors the repo's S6-G4 "both boot paths must be wired" boot-symmetry
-//! rule for these two specific post-market tasks.
+//! The surviving post-close schedulers (spot-1m sweep, option-chain probe,
+//! Groww legs, scoreboard, TF-verifier) each carry their own wiring guards
+//! (`spot_1m_rest_wiring_guard.rs`, `option_chain_1m_wiring_guard.rs`,
+//! `groww_spot_1m_wiring_guard.rs`, …).
 
-#![cfg(test)]
-
-use std::path::PathBuf;
-
-fn main_rs() -> String {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/main.rs");
-    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {} failed: {e}", path.display()))
-}
-
-/// Section A — `spawn_post_market_tasks` must be CALLED from at least two sites
-/// (the slow-boot tail + the fast-boot path). Total occurrences minus the one
-/// `fn` definition = number of call sites.
 #[test]
-fn post_market_tasks_called_from_both_boot_paths() {
-    let body = main_rs();
-    let total = body.matches("spawn_post_market_tasks(").count();
-    let defs = body.matches("fn spawn_post_market_tasks(").count();
-    assert_eq!(
-        defs, 1,
-        "expected exactly one `fn spawn_post_market_tasks` definition, found {defs}"
-    );
-    let calls = total - defs;
-    assert!(
-        calls >= 2,
-        "spawn_post_market_tasks must be called from BOTH boot paths (>=2 call \
-         sites); found {calls}. A boot path stopped spawning the post-market \
-         tasks — boot-symmetry regression."
-    );
-}
-
-/// Section B — the end-of-day digest notify and the cross-verify call must live
-/// ONLY inside the shared helper (exactly once each), never duplicated inline in
-/// a single boot path.
-#[test]
-fn eod_digest_and_cross_verify_live_only_in_the_helper() {
-    let body = main_rs();
-    let eod = body.matches("NotificationEvent::EndOfDayDigest").count();
-    assert_eq!(
-        eod, 1,
-        "EndOfDayDigest notify must appear exactly once (inside \
-         spawn_post_market_tasks), found {eod} — inline duplication = drift"
-    );
-    let cv = body
-        .matches("cross_verify_1m_boot::run_cross_verify_1m(")
-        .count();
-    assert_eq!(
-        cv, 1,
-        "run_cross_verify_1m must be called exactly once (inside \
-         spawn_post_market_tasks), found {cv} — inline duplication = drift"
-    );
+fn boot_symmetry_post_market_suite_retired_with_dhan_live_ws_lane() {
+    // Tombstone: the module-level doc above records why every assertion in
+    // this suite retired.
 }

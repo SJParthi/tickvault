@@ -337,13 +337,20 @@ fn test_cw_agent_selector_ships_the_new_metrics() {
 
 #[test]
 fn test_dhan_blast_radius_is_zero() {
-    // The Groww feed-down alerting must not leak into the Dhan main-feed
-    // connection code — Dhan keeps its own WebSocketDisconnected /
-    // ...OffHours / Reconnected semantics untouched (hard scope constraint).
-    let dhan = read_repo_file("../core/src/websocket/connection.rs");
+    // The Groww feed-down alerting must not leak into the Dhan WS code —
+    // Dhan keeps its own WebSocketDisconnected / ...OffHours / Reconnected
+    // semantics untouched (hard scope constraint).
+    // PR-C2 re-point (2026-07-13, operator retirement directive —
+    // websocket-connection-scope-lock.md "2026-07-13 Amendment"): the Dhan
+    // main-feed `connection.rs` this test scanned was DELETED with the lane;
+    // the surviving Dhan WS surface is the order-update connection (kept
+    // functional-dormant in dhan_rest_stack), so the zero-blast-radius pin
+    // moves there.
+    let dhan = read_repo_file("../core/src/websocket/order_update_connection.rs");
     assert!(
         !dhan.contains("FeedDown") && !dhan.contains("FeedRecovered"),
-        "crates/core/src/websocket/connection.rs must NOT emit FeedDown/FeedRecovered — \
-         the Dhan lanes are out of scope for the Groww feed-down alerting"
+        "crates/core/src/websocket/order_update_connection.rs must NOT emit \
+         FeedDown/FeedRecovered — the Dhan order-update WS is out of scope \
+         for the Groww feed-down alerting"
     );
 }

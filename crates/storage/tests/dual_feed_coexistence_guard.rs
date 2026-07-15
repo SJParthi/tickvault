@@ -18,10 +18,14 @@
 //! and (2) the same rows WOULD collide if `feed` were dropped from the key —
 //! proving `feed` is the discriminator.
 //!
-//! Feature-gated under `daily_universe_fetcher` (same as the persistence module
-//! that defines `InstrumentLifecycleRow`).
+//! PR-C3 (2026-07-14): the `daily_universe_fetcher` feature predicate was
+//! REMOVED from the cfg below — the feature was deleted with the Dhan
+//! instrument chain, `instrument_lifecycle_persistence` (and
+//! `InstrumentLifecycleRow`) now compile unconditionally, and keeping the
+//! dead predicate would have silently compiled this LIVE operator-mandate
+//! ratchet to an EMPTY binary forever (Rule-11 false-OK class).
 
-#![cfg(all(test, feature = "daily_universe_fetcher"))]
+#![cfg(test)]
 
 use tickvault_common::feed::Feed;
 use tickvault_storage::instrument_lifecycle_persistence::{

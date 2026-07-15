@@ -341,7 +341,7 @@ impl InstrumentRegistry {
     ///
     /// `0` is the healthy baseline.
     #[inline]
-    // TEST-EXEMPT: covered by subscription_planner::tests::test_regression_finnifty_id27_both_segments_are_kept (integration test)
+    // TEST-EXEMPT: covered by tests::test_cross_segment_collisions_counts_both_colliding_pairs (in-module; the former subscription_planner citation died with the planner in PR-C3, 2026-07-14)
     pub fn cross_segment_collisions(&self) -> u64 {
         self.cross_segment_collisions
     }
@@ -366,7 +366,7 @@ impl InstrumentRegistry {
     /// reads segment from the 8-byte header byte 3) SHOULD use this
     /// instead of `get(id)`.
     #[inline]
-    // TEST-EXEMPT: covered by subscription_planner::tests::test_regression_finnifty_id27_both_segments_are_kept
+    // TEST-EXEMPT: covered by tests::test_get_with_segment_disambiguates_cross_segment_collision (in-module; the former subscription_planner citation died with the planner in PR-C3, 2026-07-14)
     pub fn get_with_segment(
         &self,
         security_id: SecurityId,
@@ -380,7 +380,7 @@ impl InstrumentRegistry {
     /// known to avoid false positives from a different-segment entry
     /// with the same numeric id.
     #[inline]
-    // TEST-EXEMPT: covered by subscription_planner::tests::test_regression_finnifty_id27_both_segments_are_kept
+    // TEST-EXEMPT: covered by tests::test_contains_with_segment_matches_get_with_segment (in-module; the former subscription_planner citation died with the planner in PR-C3, 2026-07-14)
     pub fn contains_with_segment(&self, security_id: SecurityId, segment: ExchangeSegment) -> bool {
         self.by_composite.contains_key(&(security_id, segment))
     }

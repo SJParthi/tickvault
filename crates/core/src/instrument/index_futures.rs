@@ -19,9 +19,10 @@
 //!   [`MAX_MONTHLY_EXPIRIES_PER_UNDERLYING`]; the NEAREST expiry is the
 //!   first of each set ([`select_index_future_expiry`] delegates).
 //! - Index futures NEVER roll — the T-0 expiring month stays selected
-//!   through the 15:30 close ALONGSIDE the later months
-//!   (`subscription_planner.rs` "FUTIDX → NEVER roll" lock +
-//!   `test_index_expiry_never_rolls_via_planner`). The next trading day's
+//!   through the 15:30 close ALONGSIDE the later months (the "FUTIDX →
+//!   NEVER roll" lock; the planner-side twin pins died with
+//!   `subscription_planner.rs` in PR-C3, 2026-07-14 — the selector-side
+//!   boundary tests below remain the lock). The next trading day's
 //!   build advances automatically because `expiry < today` fails the
 //!   `>= today` filter. Deliberately NO `TradingCalendar` parameter — the
 //!   calendar arm exists only to trigger the STOCK T-0 roll, which is banned
@@ -54,7 +55,7 @@ use chrono::NaiveDate;
 use tickvault_common::error_code::ErrorCode;
 use tracing::{error, info};
 
-use super::csv_parser::CsvRow;
+use super::csv_row::CsvRow;
 use super::index_extractor::canonicalize_index_symbol;
 
 /// §36 (2026-07-08): one authorized index-futures underlying.
@@ -125,8 +126,8 @@ pub const MAX_UNDERLYING_SYMBOLS_EVIDENCE: usize = 20;
 ///
 /// The expiring month stays through its final session (`>= today` keeps
 /// T-0) and falls out the next morning; NEVER rolls (index futures trade to
-/// expiry — contrast `select_stock_expiry_with_rollover`'s stock-only T-0
-/// roll). NO calendar parameter, deliberately: accidental roll activation is
+/// expiry — contrast the RETIRED stock selector's T-0 roll, deleted with
+/// `subscription_planner.rs` in PR-C3 2026-07-14). NO calendar parameter, deliberately: accidental roll activation is
 /// unrepresentable. `expiry_dates_sorted_asc` MUST be sorted ascending.
 #[must_use]
 pub fn select_index_future_expiries(
@@ -563,75 +564,13 @@ fn record_selection_in(
     RecordOutcome::Verdict(verdict)
 }
 
-/// §36 hostile-review round 2 (2026-07-08, F4): derive the Dhan-side
-/// [`FeedFutureSelection`] list from a BUILT universe's `IndexFuture`
-/// targets. Pure + testable; shared by the cold orchestrator (Step 3d) and
-/// the §29 warm-snapshot boot path so BOTH boot paths produce the identical
-/// parity entry + boot-evidence lines (previously the warm path emitted
-/// neither until the background reconcile ran — and never, if it failed).
-///
-/// PR-C1 (2026-07-13): ITEM-level feature gate only — this Dhan-side helper
-/// consumes the feature-gated `DailyUniverse` and RETIRES with the Dhan
-/// instrument chain in Phase C3; the shared selector + Groww-consumed API of
-/// this module are deliberately ungated (banner §(d) de-gate).
-#[cfg(feature = "daily_universe_fetcher")]
-pub fn dhan_selections_from_universe(
-    universe: &crate::instrument::daily_universe::DailyUniverse,
-) -> Vec<FeedFutureSelection> {
-    use crate::instrument::daily_universe::InstrumentRole;
-    let mut out = Vec::with_capacity(MAX_INDEX_FUTURE_TARGETS);
-    for target in &universe.subscription_targets {
-        if target.role != InstrumentRole::IndexFuture {
-            continue;
-        }
-        let row = &target.csv_row;
-        let Ok(expiry) = NaiveDate::parse_from_str(row.expiry_date.trim(), "%Y-%m-%d") else {
-            continue;
-        };
-        let canonical_owned = canonicalize_index_symbol(&row.underlying_symbol);
-        if let Some(entry) = INDEX_FUTURES_UNDERLYINGS
-            .iter()
-            .find(|u| u.canonical == canonical_owned)
-        {
-            out.push(FeedFutureSelection {
-                canonical: entry.canonical,
-                expiry,
-                native_id: row.security_id.clone(),
-                segment: row.segment.clone(),
-            });
-        }
-    }
-    out
-}
-
-/// Emits the per-contract machine-readable boot-evidence `info!` lines and
-/// records the Dhan parity entry from a built universe (cold + warm boot
-/// paths — see [`dhan_selections_from_universe`]).
-// Thin recording wrapper — the global-recorder side effect is deliberately
-// NOT asserted from tests (see the recorder-test honesty note above
-// `record_selection_in`); the pure derivation + the recorder core are tested.
-// PR-C1 (2026-07-13): ITEM-level gate — Dhan-side helper, retires in C3
-// (see dhan_selections_from_universe above).
-// TEST-EXEMPT: thin wrapper over dhan_selections_from_universe (tested) + record_index_future_selection (tested)
-#[cfg(feature = "daily_universe_fetcher")]
-pub fn record_dhan_selection_from_universe(
-    universe: &crate::instrument::daily_universe::DailyUniverse,
-    trading_date_ist: NaiveDate,
-) {
-    let sels = dhan_selections_from_universe(universe);
-    for sel in &sels {
-        // The boot evidence line (machine-readable) — one per chosen contract.
-        info!(
-            feed = "dhan",
-            underlying = sel.canonical,
-            expiry = %sel.expiry,
-            native_id = %sel.native_id,
-            segment = %sel.segment,
-            "index-futures selection"
-        );
-    }
-    record_index_future_selection("dhan", trading_date_ist, sels);
-}
+// PR-C3 (2026-07-14, operator retirement directive 2026-07-13 — scope-lock
+// amendment §B): the two Dhan-side `DailyUniverse` helpers
+// (`dhan_selections_from_universe` + `record_dhan_selection_from_universe`,
+// item-gated since C1 with "retires in C3" notes) are DELETED with the Dhan
+// instrument chain. The FUTIDX-02 comparator below goes structurally DORMANT
+// (single-feed runs never fire it — futidx-4-error-codes.md §2 banner); it is
+// RETAINED as the ready-made cross-feed parity seam for GDF feed #3.
 
 /// Record one feed's index-future selection for one IST trading date (cold
 /// path, once per feed per boot/activation). Order-independent: the
@@ -711,8 +650,9 @@ mod tests {
     /// `daily_universe_fetcher` gate (a future removal of the feature would
     /// silently drop the Groww §36.7 futures — a scope violation), and the
     /// Groww extraction call chain in `feed/groww/instruments.rs` must stay
-    /// UNCONDITIONAL. The two Dhan-side `DailyUniverse` helpers keep their
-    /// documented ITEM-level gates until Phase C3 deletes them.
+    /// UNCONDITIONAL. (The two item-gated Dhan-side `DailyUniverse`
+    /// helpers were deleted in PR-C3, 2026-07-14, with the feature itself —
+    /// this ratchet now pins a feature that must never RETURN.)
     #[test]
     fn test_futidx_selector_is_not_feature_gated() {
         // (a) No inner module-level gate in THIS file (the `#![cfg(...)]`
@@ -917,34 +857,16 @@ mod tests {
         assert_eq!(select_index_future_expiry(&dates, d("2026-07-08")), None);
     }
 
+    // PR-C3 (2026-07-14): `test_index_future_selection_never_rolls_unlike_stocks`
+    // — the comparative pin against the STOCK T-0 roll selector — retired with
+    // its import (`subscription_planner::select_stock_expiry_with_rollover`,
+    // deleted with the Dhan subscription planner per the scope-lock amendment
+    // §B item 2). The index-side half of the divergence stays pinned:
     #[test]
-    fn test_index_future_selection_never_rolls_unlike_stocks() {
-        // Same T-0 fixture through the STOCK selector (with calendar → ROLLS)
-        // vs the index selector (→ KEEPS): pins the deliberate divergence.
-        use crate::instrument::subscription_planner::select_stock_expiry_with_rollover;
-        use tickvault_common::config::TradingConfig;
-        use tickvault_common::trading_calendar::TradingCalendar;
-
+    fn test_index_future_selection_never_rolls_on_t_zero() {
         let expiry = d("2026-07-30"); // a Thursday
         let next = d("2026-08-27");
         let dates = [expiry, next];
-        let cfg = TradingConfig {
-            market_open_time: "09:00:00".to_string(),
-            market_close_time: "15:30:00".to_string(),
-            order_cutoff_time: "15:29:00".to_string(),
-            data_collection_start: "09:00:00".to_string(),
-            data_collection_end: "15:30:00".to_string(),
-            timezone: "Asia/Kolkata".to_string(),
-            max_orders_per_second: 10,
-            nse_holidays: vec![],
-            muhurat_trading_dates: vec![],
-            nse_mock_trading_dates: vec![],
-        };
-        let calendar = TradingCalendar::from_config(&cfg).expect("calendar must build");
-
-        let stock = select_stock_expiry_with_rollover(&dates, expiry, Some(&calendar));
-        assert_eq!(stock, Some(next), "stocks ROLL on T-0");
-
         let index = select_index_future_expiry(&dates, expiry);
         assert_eq!(index, Some(expiry), "index futures NEVER roll on T-0");
     }
@@ -1086,34 +1008,9 @@ mod tests {
         );
     }
 
-    /// Hostile-review round 2 (2026-07-08, F4): the warm/cold-shared
-    /// derivation is empty on a futures-less universe and skips targets
-    /// whose expiry is unparsable — never panics, never invents a selection.
-    /// PR-C1 (2026-07-13): feature-gated WITH its subject — the Dhan-side
-    /// `DailyUniverse` helper keeps an item-level gate until Phase C3.
-    /// PR-C1 round-2 (2026-07-13): the test name carries BOTH the derivation
-    /// (`dhan_selections_from_universe`) AND its thin recording wrapper
-    /// (`record_dhan_selection_from_universe`) so the pub-fn-test-guard name
-    /// heuristic pins both — the wrapper's TEST-EXEMPT comment sits above its
-    /// item-level `#[cfg]` attribute, outside the guard's preceding-line
-    /// window. The wrapper is smoke-called (never panics on a futures-less
-    /// universe; single-feed record → the comparator cannot fire; the global
-    /// recorder side effect is deliberately NOT asserted — see the
-    /// recorder-test honesty note above `record_selection_in`).
-    #[cfg(feature = "daily_universe_fetcher")]
-    #[test]
-    fn test_record_dhan_selection_from_universe_and_dhan_selections_from_universe_empty() {
-        use crate::instrument::daily_universe::DailyUniverse;
-        let universe = DailyUniverse {
-            subscription_targets: vec![],
-            fno_contracts: vec![],
-        };
-        assert!(dhan_selections_from_universe(&universe).is_empty());
-        // Smoke: the wrapper is a no-op-derivation single-feed record on an
-        // empty universe — must not panic. Far date so a future test that
-        // records a "groww" selection can never accidentally pair with it.
-        record_dhan_selection_from_universe(&universe, d("2099-01-01"));
-    }
+    // PR-C3 (2026-07-14): the gated smoke test for the two deleted Dhan-side
+    // `DailyUniverse` helpers retired with its subjects (see the production
+    // region's dated note above the comparator).
 
     /// Hostile-review round 2 (2026-07-08): a vendor-glitch EXACT-duplicate
     /// CSV line (SAME SECURITY_ID at the chosen expiry) collapses

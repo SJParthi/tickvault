@@ -147,6 +147,7 @@ use crate::spot_1m_rest_boot::{
     EdgeAction, FailureEdge, accumulation_within_cap, count_missed_boundaries,
     declared_len_within_cap, fire_is_fresh, format_minute_ist_12h, minute_fully_failed,
     minute_open_ist_nanos, next_fire_after, select_minute_candle, spot_1m_day_is_over,
+    stamp_held_ok_rows,
 };
 
 /// Backoff before the supervisor respawns a dead/failed scheduler run.
@@ -1134,7 +1135,11 @@ async fn groww_fetch_once(
             status: 0,
             rate_limited: false,
             auth_rejected: false,
-            msg: format!("send: {e}"),
+            // Security parity (review LOW, 2026-07-14): reqwest send-leg
+            // errors can echo the request URL/params — bounded +
+            // secret-redacted through the same sanitize choke point as
+            // every other Groww send-error site (chain/contract legs).
+            msg: format!("send: {}", capture_rest_error_body(&e.to_string())),
         })?;
     let status = resp.status();
     if !status.is_success() {
@@ -1404,6 +1409,7 @@ fn build_fetch_audit_row(
     error_class: &'static str,
 ) -> RestFetchAuditRow {
     RestFetchAuditRow {
+        close_to_persist_ms: -1,
         ts_ist_nanos: target_minute_ist_nanos,
         trading_date_ist_nanos: trading_date_nanos,
         feed: SPOT_1M_REST_FEED_GROWW,
@@ -1816,6 +1822,10 @@ async fn fire_one_minute(
     // flush confirms (a failed flush discards the buffer — never a false
     // watermark advance).
     let mut staged: Vec<(i64, i64)> = Vec::new();
+    // GAP-11 persist stamping: `ok` forensics rows are HELD here until the
+    // data flush ACK, then stamped with the real close_to_persist_ms (a
+    // failed flush discards them — the flush_failed rows are the truth).
+    let mut held_ok_rows: Vec<RestFetchAuditRow> = Vec::new();
 
     if let Some(token) = token_cache.ensure_token().await {
         for (idx, target) in targets.iter().enumerate() {
@@ -1842,8 +1852,11 @@ async fn fire_one_minute(
             )
             .await;
 
-            // Forensics row FIRST (success AND failure) — best-effort, the
-            // verdict below is computed independently.
+            // Forensics row (success AND failure) — best-effort, the
+            // verdict below is computed independently. GAP-11 persist
+            // stamping: a non-ok row appends immediately; an `ok` row is
+            // HELD until the data append + flush confirm, then stamped
+            // with the real close_to_persist_ms (never a false ok row).
             let audit_outcome = audit_outcome_for(&outcome, &forensics);
             let audit_close_to_data = match &outcome {
                 SymbolFetchOutcome::Found {
@@ -1865,7 +1878,12 @@ async fn fire_one_minute(
                     forensics.error_class
                 },
             );
-            audit_append_best_effort(audit_writer, &audit_row);
+            let mut pending_ok_audit: Option<RestFetchAuditRow> = None;
+            if audit_outcome == RestFetchOutcome::Ok {
+                pending_ok_audit = Some(audit_row);
+            } else {
+                audit_append_best_effort(audit_writer, &audit_row);
+            }
 
             // Previous-minute backfill (any outcome arm): persist with the
             // HONEST real retrieval delay (> 60 s by construction). Never
@@ -1945,7 +1963,27 @@ async fn fire_one_minute(
                     if sample_failure.is_none() {
                         sample_failure = Some(format!("persist append failed: {err:#}"));
                     }
+                    // GAP-11: fetched-but-lost — never dressed as vendor
+                    // absence (the round-2 LOW precedent); the held ok
+                    // row is dropped, a persist_failed named-gap row is
+                    // the truth for this minute.
+                    audit_append_best_effort(
+                        audit_writer,
+                        &build_fetch_audit_row(
+                            target_nanos,
+                            trading_date_nanos,
+                            security_id,
+                            target.symbol,
+                            &forensics,
+                            RestFetchOutcome::NamedGap,
+                            -1,
+                            "persist_failed",
+                        ),
+                    );
                 } else {
+                    if let Some(row) = pending_ok_audit.take() {
+                        held_ok_rows.push(row);
+                    }
                     staged.push((security_id, candle.minute_ts_ist_nanos));
                 }
             }
@@ -1986,6 +2024,25 @@ async fn fire_one_minute(
                         "groww_spot_1m: previous minute backfilled from this \
                          fire's full-day response (DEDUP-idempotent)"
                     );
+                    // GAP-11 review MEDIUM 2 (2026-07-14): late recovery —
+                    // an `ok` row keyed on the BACKFILLED minute with the
+                    // honest > 60 s real delay (the Dhan backfill-row
+                    // semantics), HELD until the data flush ACK like the
+                    // own-minute ok row above. Without it a Groww minute
+                    // repaired by backfill read "failed, never recovered"
+                    // in the digest forever (the sweep skips committed
+                    // minutes). Forensics = the own-minute ladder's (the
+                    // backfill was mined from the same 2xx bodies).
+                    held_ok_rows.push(build_fetch_audit_row(
+                        backfill.minute_ts_ist_nanos,
+                        trading_date_nanos,
+                        security_id,
+                        target.symbol,
+                        &forensics,
+                        RestFetchOutcome::Ok,
+                        backfill_close_to_data_ms,
+                        "none",
+                    ));
                     staged.push((security_id, backfill.minute_ts_ist_nanos));
                 }
             }
@@ -2016,7 +2073,8 @@ async fn fire_one_minute(
                 break;
             }
         }
-        if let Err(err) = writer.flush() {
+        let flush_result = writer.flush();
+        if let Err(err) = &flush_result {
             persist_failed = true;
             metrics::counter!("tv_groww_spot1m_persist_errors_total", "stage" => "flush")
                 .increment(1);
@@ -2033,11 +2091,42 @@ async fn fire_one_minute(
                 sample_failure = Some(format!("persist flush failed: {err:#}"));
             }
             tally.note_flush_failure();
+            // GAP-11: the staged-but-lost minutes become flush_failed
+            // named-gap rows (the fetch itself answered 200); the held ok
+            // rows are discarded below — never a false ok row.
+            for target in targets {
+                let gap_sid = target.security_id;
+                let lost: Vec<i64> = staged
+                    .iter()
+                    .filter(|(sid, _)| *sid == gap_sid)
+                    .map(|(_, minute)| *minute)
+                    .collect();
+                record_named_gaps(
+                    audit_writer,
+                    &lost,
+                    trading_date_nanos,
+                    gap_sid,
+                    target.symbol,
+                    RestFetchOutcome::NamedGap,
+                    "flush_failed",
+                    200,
+                );
+            }
         } else {
             // Flush confirmed — advance the per-symbol persisted watermark.
             for (security_id, minute_nanos) in staged {
                 tracker.commit(security_id, minute_nanos);
             }
+        }
+        // GAP-11: the ok rows land ONLY after (and stamped with) the data
+        // flush ACK — discarded on a failed flush.
+        for row in stamp_held_ok_rows(
+            held_ok_rows,
+            flush_result.is_ok(),
+            trading_date_nanos,
+            ist_millis_of_day_now(),
+        ) {
+            audit_append_best_effort(audit_writer, &row);
         }
         if implausible_count > 0 {
             // Item 9: implausible vendor OHLC (non-positive O/H/L/C or

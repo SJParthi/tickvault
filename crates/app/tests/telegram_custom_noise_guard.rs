@@ -122,6 +122,67 @@ fn squish(s: &str) -> String {
         .collect()
 }
 
+/// Bound the `message:` FIELD EXPRESSION: the text after `message:` up to the
+/// first `,` or closing `}` at paren/brace/bracket depth 0 (string-aware).
+/// Prevents the literal search from bleeding past the field into a LATER
+/// string in the same window (e.g. a following `metrics::counter!("...")`
+/// literal being misread as the message body).
+fn message_expression(after_msg: &str) -> &str {
+    let bytes = after_msg.as_bytes();
+    let mut depth: i32 = 0;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (i, &b) in bytes.iter().enumerate() {
+        let c = b as char;
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match c {
+            '"' => in_string = true,
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => {
+                if depth == 0 {
+                    return &after_msg[..i];
+                }
+                depth -= 1;
+            }
+            ',' if depth == 0 => return &after_msg[..i],
+            _ => {}
+        }
+    }
+    after_msg
+}
+
+/// Resolve ONE level of same-file wording-helper indirection: for
+/// `message: some_helper(...)`, find `fn some_helper(` in the (comment-
+/// stripped) source and read the FIRST string literal inside a bounded
+/// window of its body — the wording the helper returns.
+///
+/// 2026-07-14 re-home: the orphan-watchdog degraded alert bodies moved from
+/// inline `message: "..."` literals (the shape this guard was written
+/// against at orphan boot 201/222) into pure wording fns
+/// (`degraded_no_session_message()` / `degraded_no_token_message()` /
+/// `degraded_fetch_failed_message()`) so the wording is unit-pinnable. The
+/// alerts' meaning, severity (Custom/High), and the pinned
+/// "open-position check" fragment are unchanged — this resolution keeps the
+/// guard scanning the REAL message text instead of going blind on (or
+/// misreading) helper-routed bodies.
+fn resolve_helper_literal(src: &str, ident: &str) -> Option<String> {
+    let sig = format!("fn {ident}(");
+    let pos = src.find(&sig)?;
+    let after = &src[pos..];
+    let window = &after[..after.len().min(600)];
+    let qrel = window.find('"')?;
+    Some(read_string_literal(&window[qrel + 1..]))
+}
+
 /// Extract every `NotificationEvent::Custom`/`CustomStatus`/`CustomStatusUrgent`
 /// `{ message: ... }` body from a comment-stripped source string.
 fn extract_custom_bodies(raw: &str) -> Vec<CustomBody> {
@@ -159,10 +220,26 @@ fn extract_custom_bodies(raw: &str) -> Vec<CustomBody> {
             continue;
         };
         let after_msg = &window[mrel + "message:".len()..];
-        let Some(qrel) = after_msg.find('"') else {
-            continue;
+        // Bound the search to THIS field's expression, then either read the
+        // inline literal (`"..."` / `format!("...")`) or resolve one level
+        // of same-file wording-helper indirection (2026-07-14 re-home).
+        let expr = message_expression(after_msg);
+        let literal = if let Some(qrel) = expr.find('"') {
+            read_string_literal(&expr[qrel + 1..])
+        } else {
+            let ident: String = expr
+                .trim()
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect();
+            if ident.is_empty() {
+                continue;
+            }
+            let Some(resolved) = resolve_helper_literal(&src, &ident) else {
+                continue;
+            };
+            resolved
         };
-        let literal = read_string_literal(&after_msg[qrel + 1..]);
         out.push(CustomBody { is_status, literal });
     }
     out
@@ -186,14 +263,21 @@ fn all_bodies() -> Vec<CustomBody> {
 fn status_pings_use_low_variant_not_custom() {
     let bodies = all_bodies();
     // Fragments unique to each informational status body (post-reword).
+    //
+    // PR-C2 retirement (2026-07-14 merge resolution): the other six #1526
+    // status bodies — "Fast start" (the fast crash-recovery arm),
+    // "Recovered saved prices" / "Price backups growing" / "Background
+    // service auto-restarted" / "Price database unavailable" / "Dhan feed
+    // started" / "Dhan feed stopped" (all inside `start_dhan_lane`) — were
+    // DELETED with the Dhan live-WS lane + the fast arm (operator
+    // retirement directive 2026-07-13, websocket-connection-scope-lock.md
+    // "2026-07-13 Amendment"; deletion is the ultimate noise cut). The
+    // surviving process-global equivalents (disk-health watcher, WAL
+    // replay, WAL-suspension probe) signal via their own storage-crate
+    // metrics + CloudWatch alarms, not main.rs Custom bodies. Only the
+    // fragments below still exist in the scanned sources.
     const STATUS_FRAGMENTS: &[&str] = &[
-        "Fast start",                        // 2752 (CustomStatusUrgent)
-        "Recovered saved prices",            // 6776 (CustomStatus)
-        "Price backups growing",             // 8905 (CustomStatus)
-        "Background service auto-restarted", // 8962 (CustomStatus)
-        "Dhan feed started",                 // 10762 (CustomStatusUrgent)
-        "Dhan feed stopped",                 // 10962 (CustomStatusUrgent)
-        "Market closed",                     // 11100 (CustomStatus)
+        "Market closed", // post-market housekeeping (CustomStatus)
     ];
     for frag in STATUS_FRAGMENTS {
         let hits: Vec<&CustomBody> = bodies.iter().filter(|b| b.literal.contains(frag)).collect();
@@ -219,10 +303,18 @@ fn status_pings_use_low_variant_not_custom() {
 fn actionable_custom_sites_stay_custom_high() {
     let bodies = all_bodies();
     // Fragments unique to each kept-High actionable body.
+    //
+    // PR-C2 retirement (2026-07-14 merge resolution): "Price database
+    // unavailable" + "Low disk space" lived inside the DELETED
+    // `start_dhan_lane` (Dhan live-WS retirement 2026-07-13); the surviving
+    // disk/DB signals are the storage-crate watchers' coded error! chains +
+    // CloudWatch alarms (DISK-WATCHER-01 / RESOURCE-03 / BOOT-01/02).
     const ACTIONABLE_FRAGMENTS: &[&str] = &[
-        "Price database unavailable", // main.rs 6793 — DB down at boot
-        "Low disk space",             // main.rs 8885 — free disk
-        "open-position check",        // orphan boot 201/222 — check Dhan before 15:30
+        // orphan boot — check Dhan before 15:30. 2026-07-14: the bodies live
+        // in pure wording fns (degraded_no_*_message / degraded_fetch_failed_
+        // message), reached via the helper-fn resolution in
+        // `extract_custom_bodies`; the fragment + High severity are unchanged.
+        "open-position check",
     ];
     for frag in ACTIONABLE_FRAGMENTS {
         let hits: Vec<&CustomBody> = bodies.iter().filter(|b| b.literal.contains(frag)).collect();
@@ -436,6 +528,61 @@ fn extractor_classifies_all_three_variants() {
     assert_eq!(custom[0].literal, "real alert body");
     assert!(status.iter().any(|b| b.literal == "status ping body"));
     assert!(status.iter().any(|b| b.literal == "urgent status body"));
+}
+
+#[test]
+fn extractor_resolves_wording_helper_indirection() {
+    // 2026-07-14 re-home: `message: helper_fn(),` must resolve to the
+    // helper's literal (same file, one level), inheriting the construction's
+    // severity classification.
+    let sample = r#"
+        fn my_degraded_wording() -> String {
+            "resolved helper body with open-position check".to_string()
+        }
+        notifier.notify(NotificationEvent::Custom {
+            message: my_degraded_wording(),
+        });
+        metrics::counter!("tv_some_counter_total").increment(1);
+    "#;
+    let bodies = extract_custom_bodies(sample);
+    assert_eq!(bodies.len(), 1, "expected exactly one body, got {bodies:?}");
+    assert!(!bodies[0].is_status, "helper-routed body must stay High");
+    assert_eq!(
+        bodies[0].literal,
+        "resolved helper body with open-position check"
+    );
+}
+
+#[test]
+fn extractor_never_bleeds_past_message_field_into_later_literal() {
+    // A helper call with NO resolvable fn must be SKIPPED — never misread the
+    // NEXT string in the window (e.g. a following metrics counter name) as
+    // the message body.
+    let sample = r#"
+        notifier.notify(NotificationEvent::Custom {
+            message: helper_defined_elsewhere(),
+        });
+        metrics::counter!("tv_unrelated_counter_total").increment(1);
+    "#;
+    let bodies = extract_custom_bodies(sample);
+    assert!(
+        bodies.is_empty(),
+        "unresolvable helper must be skipped, not misread: {bodies:?}"
+    );
+}
+
+#[test]
+fn message_expression_stops_at_field_comma_and_block_close() {
+    assert_eq!(
+        message_expression(" my_helper(a, b),\n});"),
+        " my_helper(a, b)"
+    );
+    assert_eq!(
+        message_expression(" \"inline, with comma\".to_string(),\n});"),
+        " \"inline, with comma\".to_string()"
+    );
+    // Closing `}` of the construction at depth 0 also terminates.
+    assert_eq!(message_expression(" ident }"), " ident ");
 }
 
 #[test]

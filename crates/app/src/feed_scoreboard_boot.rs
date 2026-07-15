@@ -1866,8 +1866,9 @@ pub fn last_minute_secs_of_day(minutes: &HashSet<String>) -> Option<i64> {
 /// before ~15:28 with the socket up (pings keep the watchdog quiet, no
 /// disconnect row) then cleanly 16:30-stopped + evening-restarted produces
 /// the same `< 15:28` shape and self-blames a process that survived to the
-/// scheduled stop — conservative error direction, cross-check tick-gap /
-/// FEED-STALL signals before signing). Pure.
+/// scheduled stop — conservative error direction, cross-check the
+/// FEED-STALL signals before signing; the per-SID tick-gap detector
+/// retired in PR-C3, 2026-07-14). Pure.
 #[must_use]
 pub fn post_close_reconnect_is_real_death(last_streamed_minute_secs: Option<i64>) -> bool {
     match last_streamed_minute_secs {

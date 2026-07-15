@@ -145,6 +145,48 @@ unreachable. `down_secs` carries the silent
 window. The 15:45 IST scoreboard counts these as stall episodes with blame
 (`dual-feed-scoreboard-error-codes.md` §2). Counters + pagers UNCHANGED.
 
+### 2026-07-14 Update — relaunch handshake grace (`FEED_STALL_HANDSHAKE_GRACE_SECS`)
+
+**The incident this closes (2026-07-14, 14:59:28 IST):** the Groww NATS
+socket died server-side (`nats: unexpected EOF` — the server closed the
+socket). The stall watchdog correctly detected the feed-level silence and
+killed+relaunched the sidecar — but then re-killed each freshly-relaunched
+child THREE more times at 14:59:59 / 15:00:00 / 15:00:01 / 15:00:02
+(stall_secs 31/32/33/34). Root cause: the feed-level last-tick age
+(`FeedHealthRegistry::last_tick_age_secs`) is PROCESS-GLOBAL and does not
+reset on a child relaunch, so a relaunched child that needs ~1-5 s to
+re-auth + re-subscribe + stream its first organic tick was judged by the
+PREVIOUS child's silence and killed before it could ever prove liveness.
+Total gap: 34.999 s — ~31.1 s legitimate detection latency plus ~3.9 s
+wasted on 3 graceless re-kills of healthy relaunching children.
+
+**Operator demand (2026-07-14, relayed via the coordinator session):**
+*"irrespective of any situation the Groww feed must never break"* — the
+lossless-reconnect hardening chain was authorized the same day, with the
+15 s grace default explicitly approved.
+
+**The new semantics:** the stall-arm kill now requires BOTH conditions:
+1. feed-level last-tick age > `FEED_STALL_RESTART_SECS` (30 s, UNCHANGED),
+2. **current child age > `FEED_STALL_HANDSHAKE_GRACE_SECS` (15 s, strict `>`)**
+   — `supervise_child` stamps `child_spawned_at` at every (re)launch and
+   passes `child_spawned_at.elapsed()` into the pure
+   `should_restart_on_stall` decision alongside the feed age.
+
+**Honest envelope:** the grace guarantees ≤1 kill per relaunch handshake —
+a healthy relaunching child can never be re-killed inside its first 15 s.
+The trade-off: a relaunched child that is GENUINELY dead (persistent
+server-side reject) is now re-killed at a bounded ~16-17 s cadence instead
+of ~1 s, so the >5-restarts-per-5-min STORM escalation arrives in ≤~2 min
+instead of ~36 s — accepted (the storm is still loud, still bounded, still
+pages). The `should_restart_on_never_streamed` 300 s arm, the
+`StallRestartStorm` bound, the liveness recording, the disable-toggle
+re-read, and every Telegram wording are UNCHANGED. The grace covers ONLY
+the first 15 s after each spawn; past it, the classic 30 s feed-level arm
+owns liveness exactly as before. Replayed against the 2026-07-14 incident:
+kill #1 fires identically (~31 s detection); kills #2-#4 become
+structurally impossible (child ages 1-3 s « 15 s grace) — the gap shrinks
+from 34.999 s to ~31 s + one handshake.
+
 ### §1b. 2026-07-09 Update — NEVER-STREAMED restart arm (`reason = "never_streamed"`)
 
 **The incident this closes:** the Groww feed paged `[HIGH] Groww live feed
@@ -192,16 +234,42 @@ data. A server-side reject that persists shows up as the bounded restart
 cadence + the pager + the §1c FEED-REJECT-01 signatures — loud, never silent,
 never a tight kill loop. Known bounds, stated plainly:
 
-- **Page-storm bound (review HIGH, FIXED):** each relaunched child gets a
-  fresh `alerted` latch, so a persistent reject day would have paged the
-  `GrowwSidecarRejected` HIGH ~12×/hour. The single-conn Telegram fan-out is
-  now additionally gated by a supervisor-lifetime cross-child cooldown
-  (`GROWW_REJECT_PAGE_COOLDOWN_SECS` = 1800s, pure `should_page_reject`,
-  CAS'd so the two pipe drains never double-page): at most one reject page
-  per 30 min per supervisor; suppressed episodes keep their `error!`
-  forwards, FEED-REJECT-01 signature, and feed-health marking, and are
-  counted by `tv_groww_reject_page_cooldown_suppressed_total`. The
-  ≥3-per-15-min restart pager independently covers "it keeps failing".
+- **Page-storm bound (review HIGH, FIXED; RESTRUCTURED 2026-07-14):** each
+  relaunched child gets a fresh `alerted` latch, so a persistent reject day
+  would have paged the `GrowwSidecarRejected` HIGH ~12×/hour. Page DEDUP is
+  now owned by the `EpisodeFamily::GrowwFeed` one-bubble fold (2026-07-14
+  operator noise directive): `GrowwSidecarRejected` + the Groww
+  `FeedDown`/`FeedRecovered` arms carry an `episode_key`, so the FIRST
+  reject pages (+ SMS) and every recurrence becomes an in-place bubble edit
+  — no push, no SMS — with `FeedRecovered` closing the bubble green.
+  Scope refinements (same-day hostile review): an OPERATOR-INITIATED
+  `FeedDown` (the deliberate feeds-page disable) is NEVER episode-routed —
+  its legacy body honestly says the feed stays OFF until re-enabled (a
+  bubble edit would falsely claim "retrying"); and the off-hours
+  Low-severity `FeedDown` keeps its pre-existing legacy 60s-coalescer path
+  (only a paging ≥High FeedDown opens/folds the bubble). The
+  supervisor-lifetime cross-child cooldown
+  (`GROWW_REJECT_PAGE_COOLDOWN_SECS`, pure `should_page_reject`, CAS'd so
+  the two pipe drains never double-page) is KEPT but reduced **1800s →
+  60s** (aligned with the fleet 60s coalescer): it is no longer the primary
+  page bound — it only caps notify() volume to ≤1/min on the
+  transport-failure path (a first page that never lands leaves
+  `message_id = None`, so every later reject takes the episode
+  `SendNewFallback` fresh send; without this upstream bound that failure
+  path would restore the storm). The 60s value applies ONLY while
+  `[notification] episode_mode = true` (the fold ON): with the episode
+  kill switch OFF every reject takes the legacy Immediate+SMS lane, so
+  the supervisor restores the legacy 1800s bound
+  (`GROWW_REJECT_PAGE_COOLDOWN_LEGACY_SECS`, selected at boot via
+  `reject_page_cooldown_secs(episode_mode)`; a runtime config flip needs
+  a restart, like episode_mode itself). Suppressed episodes keep their
+  `error!` forwards, FEED-REJECT-01 signature, and feed-health marking,
+  and are counted by `tv_groww_reject_page_cooldown_suppressed_total`.
+  The ≥3-per-15-min restart pager independently covers "it keeps failing".
+  Ratchets: `test_should_page_reject_rising_edge_and_cooldown` pins BOTH
+  cooldowns exactly (60 / 1800) + the mode selector;
+  `episode_runtime_family_wiring_guard.rs` pins the episode routing incl.
+  the operator-initiated + Low-off-hours exclusions.
 - **"This session" = this APP PROCESS:** `feed_health`'s last-tick stamp
   never resets in-process, so on day 2 of a long-running process the arm is
   dormant and the classic 30s stall arm owns everything (no coverage hole).
@@ -340,6 +408,29 @@ None`; events-side — body tests that a present detail renders
 that the render boundary HTML-escapes + re-caps the detail.
 
 ---
+
+### 2026-07-14 Update — sidecar escalation-exit + reconnect heartbeat (S2) and capture-only warm-up (S3)
+
+**Escalation-exit:** the sidecar now prints ONE coded reconnect-outcome heartbeat line per
+force-close/reconnect cycle (fixed shape, `groww sidecar reconnect-cycle: attempt=N
+outcome=<connected|failed_...>`), and after 2 consecutive failed cycles prints the FIXED
+marker `GROWW SIDECAR ESCALATION-EXIT: repeated reconnect failure — exiting for clean
+relaunch` then exits(1) so the supervisor relaunches it cold (fresh SSM token read + full
+re-subscribe). The Rust pipe drain classifies that marker and maps it into the SAME
+`tv_feed_sidecar_stall_restart_total{feed}` counter + `StallRestartStorm` record as a
+watchdog kill — a sustained self-exit loop therefore keeps BOTH pagers
+(`tv-<env>-feed-stall-restarts`, storm FEED-STALL-01) firing; self-heal can never silence
+the alarms. Honest envelope: bounds the in-process wedge to ~2 failed cycles (~10-25s
+depending on ladder position) WITHOUT lowering the 30s watchdog threshold; the heartbeat
+lines answer WHY a reconnect failed next time; no recovery-time number is claimed until
+live-measured; the exit costs one SSM read + a full cold re-subscribe (no vendor resume
+protocol exists).
+
+**Capture-only warm-up:** immediately after a successful re-subscribe the sidecar performs
+a fail-soft last-known-price snapshot walk (SDK cache reads) appended to the NDJSON capture
+ONLY — it does NOT and CANNOT advance feed liveness (the bridge's liveness gate only
+advances on ts progress; fresh-session SDK caches are empty), it is never a liveness
+source, never recovered prints.
 
 ## §2. FEED-SUPERVISOR-01 — feed supervisor task respawned
 

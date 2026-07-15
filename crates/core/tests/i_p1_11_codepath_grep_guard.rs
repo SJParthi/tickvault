@@ -8,8 +8,9 @@
 //! removes the I-P1-11 mention from the enforcement files fails the build.
 //!
 //! Files that MUST cite "I-P1-11":
-//! - `crates/core/src/pipeline/tick_gap_detector.rs` — composite-key
-//!   `(security_id, exchange_segment)` papaya pin
+//! - (tick_gap_detector.rs entry RETIRED in PR-C3, 2026-07-14 — the
+//!   detector was deleted with the Dhan WS lane per operator Q4-ii
+//!   2026-07-13; its composite-key pin died with the module)
 //! - `crates/storage/tests/dedup_segment_meta_guard.rs` — meta-guard that
 //!   scans every DEDUP UPSERT KEYS for segment qualification
 //! - `crates/common/src/instrument_registry.rs` — composite_index,
@@ -23,7 +24,7 @@ use std::fs;
 use std::path::PathBuf;
 
 const ENFORCEMENT_FILES: &[&str] = &[
-    "../../crates/core/src/pipeline/tick_gap_detector.rs",
+    // tick_gap_detector.rs entry retired in PR-C3 (2026-07-14).
     "../../crates/storage/tests/dedup_segment_meta_guard.rs",
     "../../crates/common/src/instrument_registry.rs",
 ];
@@ -61,15 +62,7 @@ fn i_p1_11_appears_in_security_id_uniqueness_rule_doc() {
     );
 }
 
-#[test]
-fn tick_gap_detector_uses_composite_key_tuple() {
-    // Pin the actual code shape: `(security_id, segment)` tuple — not
-    // `security_id` alone. Catches a future refactor that silently
-    // drops the segment from the key.
-    let text = read("../../crates/core/src/pipeline/tick_gap_detector.rs");
-    assert!(
-        text.contains("(security_id, segment)") || text.contains("(security_id, exchange_segment)"),
-        "tick_gap_detector.rs must use the composite tuple `(security_id, \
-         segment)` per I-P1-11. Audit Finding #8."
-    );
-}
+// `tick_gap_detector_uses_composite_key_tuple` RETIRED in PR-C3
+// (2026-07-14): the detector module it read was deleted with the Dhan WS
+// lane (operator Q4-ii 2026-07-13). The composite-key discipline stays
+// pinned by the surviving ENFORCEMENT_FILES entries above.

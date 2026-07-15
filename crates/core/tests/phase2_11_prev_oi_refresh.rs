@@ -59,30 +59,19 @@ fn phase2_11_refresh_interval_constant_is_pinned() {
     );
 }
 
-#[test]
-fn phase2_11_main_rs_spawns_refresh_task_in_slow_boot() {
-    let src = read("app/src/main.rs");
-    assert!(
-        src.contains("spawn_prev_oi_cache_refresh_task"),
-        "main.rs slow boot must call spawn_prev_oi_cache_refresh_task — \
-         without it, fresh-deploy OI Change panels read 0% for the entire \
-         first day (M2/M4 fix)"
-    );
-}
+// RETIRED (PR-C2, 2026-07-13 — Dhan live-WS lane deletion, operator
+// retirement directive per websocket-connection-scope-lock.md
+// "2026-07-13 Amendment" §B): phase2_11_main_rs_spawns_refresh_task_in_slow_boot died with the wiring it pinned — the
+// Dhan tick pipeline (frame channel → run_tick_processor → TickEnricher /
+// prev_oi lifecycle enrichment / L14 boot-ordering gate) was deleted from
+// main.rs with the lane; the Groww feed carries its own bridge path.
 
-#[test]
-fn phase2_11_refresh_task_runs_alongside_midnight_rollover() {
-    let src = read("app/src/main.rs");
-    // Both spawn calls must coexist — they cover complementary scenarios.
-    assert!(
-        src.contains("spawn_midnight_rollover_task"),
-        "midnight rollover task must still be spawned (Phase 2.7)"
-    );
-    assert!(
-        src.contains("spawn_prev_oi_cache_refresh_task"),
-        "refresh task must also be spawned (Phase 2.11)"
-    );
-}
+// RETIRED (PR-C2, 2026-07-13 — Dhan live-WS lane deletion, operator
+// retirement directive per websocket-connection-scope-lock.md
+// "2026-07-13 Amendment" §B): phase2_11_refresh_task_runs_alongside_midnight_rollover died with the wiring it pinned — the
+// Dhan tick pipeline (frame channel → run_tick_processor → TickEnricher /
+// prev_oi lifecycle enrichment / L14 boot-ordering gate) was deleted from
+// main.rs with the lane; the Groww feed carries its own bridge path.
 
 #[test]
 fn phase2_11_refresh_task_self_exits_on_population() {
