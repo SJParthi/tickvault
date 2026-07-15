@@ -151,6 +151,25 @@ const _: () = assert!(
 /// (= 60) — equality tripwire-pinned in the tests below.
 pub const GROWW_CATCHUP_MARGIN_SECS: u32 = 60;
 
+/// Task slug for the once-per-trading-day delivery marker
+/// (`data/state/daily/tf-consistency-YYYY-MM-DD.marker` — Telegram
+/// cleanliness overhaul, coordinator-relayed directive 2026-07-15). ONLY the
+/// `RunCatchUp` arm consults it; the real 15:40 fire (`SleepThenRun`) and
+/// forced runs (`RunNow`) never do, and it is written ONLY after a
+/// terminal-quality (`pass` / `no_data`) summary was dispatched — a
+/// FAILURE-class day re-runs AND re-pages on restart (Rule 11).
+const TF_CONSISTENCY_MARKER_TASK: &str = "tf-consistency";
+
+/// Pure notify predicate for the daily summary: a `no_data` day ("nothing to
+/// check" — feeds were off) is LOG-ONLY, never a Telegram card; every other
+/// verdict (pass / mismatch / degraded / blind) notifies. Name + semantics
+/// deliberately match the groww-live-off branch's planned predicate so a
+/// double landing merges as a trivial union.
+#[must_use]
+pub fn should_notify_summary(status_label: &str) -> bool {
+    status_label != "no_data"
+}
+
 // ---------------------------------------------------------------------------
 // Scheduling (pure)
 // ---------------------------------------------------------------------------
@@ -1976,6 +1995,24 @@ pub fn spawn_tf_consistency_tasks(
                     );
                 }
                 TfVerifyStart::RunCatchUp => {
+                    // Once-per-trading-day gate (2026-07-15): a post-15:40
+                    // restart must not re-fire an already-delivered daily
+                    // card. ONLY this catch-up arm consults the marker —
+                    // the scheduled 15:40 fire and forced runs never do,
+                    // and a FAILURE-class day never writes one (Rule 11:
+                    // suppression never hides a failure).
+                    if crate::daily_task_marker::daily_marker_exists(
+                        TF_CONSISTENCY_MARKER_TASK,
+                        today_ist,
+                    ) {
+                        info!(
+                            "tf_consistency: today's summary was already delivered — \
+                             skipping the catch-up re-run (remove the day's marker \
+                             under data/state/daily/ or set TICKVAULT_TF_VERIFY_NOW=1 \
+                             to force)"
+                        );
+                        return Ok(None);
+                    }
                     info!(
                         now = %now_ist.time(),
                         "tf_consistency: late boot (past 15:40 IST) — running the day's \
@@ -1997,22 +2034,49 @@ pub fn spawn_tf_consistency_tasks(
     tokio::spawn(async move {
         match inner.await {
             Ok(Ok(Some(s))) => {
-                tf_notifier.notify(NotificationEvent::TfConsistencySummary {
-                    dhan_date_ist: s.dhan_date_ist,
-                    groww_date_ist: s.groww_date_ist,
-                    instruments: s.instruments,
-                    buckets_compared: s.buckets_compared,
-                    mismatches: s.mismatches,
-                    missing_tf_rows: s.missing_tf_rows,
-                    no_coverage: s.no_coverage,
-                    off_grid: s.off_grid,
-                    duplicates: s.duplicates,
-                    tail_unsealed: s.tail_unsealed,
-                    degraded: s.degraded,
-                    truncated: s.truncated,
-                    status_label: s.status_label,
-                    top_detail: s.top_detail,
-                });
+                let status_label = s.status_label.clone();
+                // Marker keyed on the VERIFIED (Dhan) date, never blindly
+                // "today" — a forced past-date backfill must not suppress
+                // today's catch-up (2026-07-15 once-per-day gate).
+                let marker_date =
+                    chrono::NaiveDate::parse_from_str(&s.dhan_date_ist, "%Y-%m-%d").ok();
+                if should_notify_summary(&status_label) {
+                    tf_notifier.notify(NotificationEvent::TfConsistencySummary {
+                        dhan_date_ist: s.dhan_date_ist,
+                        groww_date_ist: s.groww_date_ist,
+                        instruments: s.instruments,
+                        buckets_compared: s.buckets_compared,
+                        mismatches: s.mismatches,
+                        missing_tf_rows: s.missing_tf_rows,
+                        no_coverage: s.no_coverage,
+                        off_grid: s.off_grid,
+                        duplicates: s.duplicates,
+                        tail_unsealed: s.tail_unsealed,
+                        degraded: s.degraded,
+                        truncated: s.truncated,
+                        status_label: s.status_label,
+                        top_detail: s.top_detail,
+                    });
+                } else {
+                    // no_data is log-only (2026-07-15): "nothing to check"
+                    // must never page — the suppressed send is replaced by
+                    // this one visible line (never a silent skip).
+                    info!(
+                        status = %status_label,
+                        dhan_date = %s.dhan_date_ist,
+                        groww_date = %s.groww_date_ist,
+                        "tf_consistency: nothing to check today — Telegram summary \
+                         suppressed (log-only; pass and failure days still notify)"
+                    );
+                }
+                // Terminal-quality outcomes ONLY (pass / no_data) mark the
+                // day delivered; mismatch/degraded/blind leave the marker
+                // unwritten so a restart re-runs + re-pages (Rule 11).
+                if status_label == "pass" || status_label == "no_data" {
+                    if let Some(d) = marker_date {
+                        crate::daily_task_marker::write_daily_marker(TF_CONSISTENCY_MARKER_TASK, d);
+                    }
+                }
             }
             Ok(Ok(None)) => {} // non-trading-day skip / refused force — no page.
             Ok(Err(reason)) => {
@@ -2076,6 +2140,37 @@ mod tests {
     #[test]
     fn test_decide_tf_verify_start_trigger_constant_is_1540_ist() {
         assert_eq!(TF_VERIFY_TRIGGER_SECS_OF_DAY_IST, 56_400);
+    }
+
+    // -------------------------------------------------------------------
+    // should_notify_summary (2026-07-15 no_data log-only gate)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_should_notify_summary_suppresses_only_no_data() {
+        assert!(
+            !should_notify_summary("no_data"),
+            "a nothing-to-check day is log-only"
+        );
+    }
+
+    #[test]
+    fn test_should_notify_summary_pass_and_failure_classes_notify() {
+        // Rule 11: every verdict with information content still notifies —
+        // pass (positive daily signal) AND every failure class.
+        for label in ["pass", "mismatch", "degraded", "blind"] {
+            assert!(should_notify_summary(label), "{label} must keep notifying");
+        }
+        // Fail-open on an unknown / drifted label: notify, never silence.
+        assert!(should_notify_summary("some_future_label"));
+        assert!(should_notify_summary(""));
+    }
+
+    #[test]
+    fn test_tf_consistency_marker_task_slug_is_pinned() {
+        // The marker filename is derived from this slug — a drift would
+        // orphan existing markers and re-fire the day's card once.
+        assert_eq!(TF_CONSISTENCY_MARKER_TASK, "tf-consistency");
     }
 
     #[test]

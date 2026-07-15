@@ -91,6 +91,9 @@ fn test_tf_consistency_boot_module_is_not_a_stub() {
         "TfVerify02RunDegraded",     // TF-VERIFY-02 emit site
         "TfConsistencySummary",      // the one-per-run Telegram summary
         "TfConsistencyAborted",      // the supervisor abort page
+        "daily_marker_exists(",      // once-per-day RunCatchUp gate (2026-07-15)
+        "write_daily_marker(",       // marker written on terminal-quality outcomes only
+        "should_notify_summary(",    // no_data log-only predicate (2026-07-15)
     ] {
         assert!(
             src.contains(needle),

@@ -88,6 +88,12 @@ pub mod day_ohlc_orchestrator;
 // cross-check retired under 4-IDX_I LOCKED_UNIVERSE (operator lock 2026-05-15).
 // Bhavcopy is NSE_FNO-only; no F&O subscriptions remain to cross-check.
 pub mod boot_helpers;
+/// Once-per-trading-day delivery markers for daily scheduled tasks
+/// (Telegram cleanliness overhaul, coordinator-relayed directive
+/// 2026-07-15). Fail-open advisory files under `data/state/daily/` —
+/// the 15:40 timeframe check's catch-up arm consults them so a
+/// post-15:40 restart never re-fires an already-delivered daily card.
+pub mod daily_task_marker;
 /// Dhan runtime activation watcher (PR-2) — dormant supervisor that keeps the
 /// Dhan lane's running flag honest across runtime toggles and enforces the
 /// Dhan-disable safety gate at the supervisor layer (operator 2026-06-21/24).
