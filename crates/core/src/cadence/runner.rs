@@ -29,7 +29,7 @@ use tracing::{debug, error, info, warn};
 
 use super::assembly::{
     ChainCell, ChainProvenance, LaneAssembly, MoneynessFold, SpotProvenance,
-    fold_chain_cell_moneyness,
+    cross_fill_freshness_floor_ms, fold_chain_cell_moneyness,
 };
 use super::decision::{
     CadenceEvent, CadenceState, DecisionLatch, DecisionOutcome, DecisionSnapshot, SkipReason,
@@ -2646,8 +2646,14 @@ fn finalize_if_complete<C: CadenceClock>(
             return;
         }
         // Rung 2: cross-source fill from the other lane's same-cycle data
-        // (freshness-checked; valid up to AND INCLUDING the cutoff).
-        let (spots, chains) = lane.asm.cross_fill_from(&other.asm, now_wall, cutoff);
+        // (freshness-checked against the LENDER-aware floor — the base
+        // T − 5000 widened to the Dhan lender's rung-shifted earliest
+        // chain pre-fire, CADENCE-XFILL-RUNG-1 2026-07-15; valid up to
+        // AND INCLUDING the cutoff).
+        let floor = cross_fill_freshness_floor_ms(slots, other.asm.feed);
+        let (spots, chains) = lane
+            .asm
+            .cross_fill_from(&other.asm, floor, now_wall, cutoff);
         if spots + chains > 0 {
             lane.flags.cross_fill = true;
             let direction = if lane.asm.feed == Feed::Dhan {

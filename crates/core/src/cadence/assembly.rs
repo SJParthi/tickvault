@@ -15,7 +15,7 @@ use tickvault_common::moneyness::{
 };
 
 use super::executor::SpotTarget;
-use super::schedule::CADENCE_CROSS_FILL_FRESHNESS_FLOOR_MS;
+use super::schedule::{CADENCE_CROSS_FILL_FRESHNESS_FLOOR_MS, CycleSlots};
 use crate::pipeline::chain_snapshot::{
     ChainMoneynessSnapshot, ChainUnderlying, load_chain_snapshot,
 };
@@ -284,11 +284,15 @@ impl LaneAssembly {
     }
 
     /// Second rung: cross-fill still-missing cells from the OTHER lane's
-    /// same-cycle assembly, freshness-checked per [`cross_fill_fresh`].
-    /// Returns `(spots_filled, chains_filled)`.
+    /// same-cycle assembly, freshness-checked per [`cross_fill_fresh`]
+    /// against the caller-supplied `freshness_floor_abs_ms` (the
+    /// LENDER-aware floor from [`cross_fill_freshness_floor_ms`] —
+    /// CADENCE-XFILL-RUNG-1, 2026-07-15). Returns
+    /// `(spots_filled, chains_filled)`.
     pub fn cross_fill_from(
         &mut self,
         other: &LaneAssembly,
+        freshness_floor_abs_ms: i64,
         now_ms: i64,
         cutoff_abs_ms: i64,
     ) -> (u32, u32) {
@@ -301,7 +305,7 @@ impl LaneAssembly {
                     foreign.minute_ist,
                     self.cycle_minute_ist,
                     foreign.fetched_at_ms,
-                    self.boundary_ms,
+                    freshness_floor_abs_ms,
                     now_ms,
                     cutoff_abs_ms,
                 )
@@ -317,7 +321,7 @@ impl LaneAssembly {
                     foreign.minute_ist,
                     self.cycle_minute_ist,
                     foreign.fetched_at_ms,
-                    self.boundary_ms,
+                    freshness_floor_abs_ms,
                     now_ms,
                     cutoff_abs_ms,
                 )
@@ -335,9 +339,13 @@ impl LaneAssembly {
 
 /// The cross-fill freshness window, BOTH directions (design §5, LOCKED):
 /// a foreign snapshot is valid iff its `minute_ts` equals the borrowing
-/// cycle's minute AND it was fetched at/after T − 5000ms AND the borrow
-/// happens at/before the borrowing lane's cutoff. The window deliberately
-/// spans Dhan's PRE-close :55/:58 chains and Groww's POST-close :00
+/// cycle's minute AND it was fetched at/after `freshness_floor_abs_ms`
+/// AND the borrow happens at/before the borrowing lane's cutoff. The
+/// floor is the LENDER-aware absolute instant from
+/// [`cross_fill_freshness_floor_ms`]: the base T − 5000ms window,
+/// widened when the Dhan anchor ladder has shifted the lender's chains
+/// earlier (CADENCE-XFILL-RUNG-1, 2026-07-15) — so it always spans
+/// Dhan's ACTUAL scheduled pre-close chains AND Groww's POST-close :00
 /// burst; any pre-close-chain ↔ post-close-spot mix is stamped
 /// `DecidedDegraded`, never hidden. Pure.
 #[must_use]
@@ -345,14 +353,43 @@ pub fn cross_fill_fresh(
     foreign_minute_ist: u32,
     cycle_minute_ist: u32,
     foreign_fetched_at_ms: i64,
-    boundary_ms: i64,
+    freshness_floor_abs_ms: i64,
     now_ms: i64,
     borrowing_cutoff_abs_ms: i64,
 ) -> bool {
     foreign_minute_ist == cycle_minute_ist
-        && foreign_fetched_at_ms
-            >= boundary_ms.saturating_sub(CADENCE_CROSS_FILL_FRESHNESS_FLOOR_MS)
+        && foreign_fetched_at_ms >= freshness_floor_abs_ms
         && now_ms <= borrowing_cutoff_abs_ms
+}
+
+/// The LENDER-aware cross-fill freshness floor (absolute IST ms-of-day)
+/// for borrowing FROM `lender_feed` in the cycle described by `slots`
+/// (CADENCE-XFILL-RUNG-1, 2026-07-15). Base = T − 5000ms
+/// ([`CADENCE_CROSS_FILL_FRESHNESS_FLOOR_MS`]). When the lender is the
+/// DHAN lane the floor widens to the lane's EARLIEST scheduled chain
+/// pre-fire: the anchor ladder shifts the chain slots wholesale by
+/// −1000·rung ms (rung ≥ 1 fires NIFTY at T − 5000 − rung·step), and a
+/// fixed floor would refuse those same-minute chains as "stale" while
+/// the SAME data drives Dhan's OWN decision — an inconsistent staleness
+/// standard. The Groww lender (post-close :00 burst, never rung-shifted)
+/// keeps the base floor. Completions at/after their own scheduled fire
+/// instant therefore always pass the floor regardless of rung. Pure.
+#[must_use]
+pub fn cross_fill_freshness_floor_ms(slots: &CycleSlots, lender_feed: Feed) -> i64 {
+    let base = slots
+        .boundary_ms
+        .saturating_sub(CADENCE_CROSS_FILL_FRESHNESS_FLOOR_MS);
+    if lender_feed == Feed::Dhan {
+        let earliest_chain = slots
+            .dhan_chain_slots_ms
+            .iter()
+            .copied()
+            .min()
+            .unwrap_or(base);
+        base.min(earliest_chain)
+    } else {
+        base
+    }
 }
 
 /// One underlying's moneyness classification counts over the registry
@@ -558,6 +595,9 @@ mod tests {
         assert!(a.vix_spot().is_some_and(|v| v.atm_paise == 0));
     }
 
+    /// The rung-0 base floor: T − 5000ms absolute.
+    const BASE_FLOOR_MS: i64 = T_MS - CADENCE_CROSS_FILL_FRESHNESS_FLOOR_MS;
+
     #[test]
     fn test_cross_source_freshness_window_pre_close_chain_post_close_spot() {
         // Dhan's :55 pre-close chain (fetched T−5000) IS fresh for the
@@ -566,7 +606,7 @@ mod tests {
             MINUTE,
             MINUTE,
             T_MS - 5_000,
-            T_MS,
+            BASE_FLOOR_MS,
             T_MS + 900,
             T_MS + 6_000
         ));
@@ -575,16 +615,16 @@ mod tests {
             MINUTE,
             MINUTE,
             T_MS + 400,
-            T_MS,
+            BASE_FLOOR_MS,
             T_MS + 4_500,
             T_MS + 15_000
         ));
-        // One ms OLDER than T−5000 → stale, refused.
+        // One ms OLDER than the floor → stale, refused.
         assert!(!cross_fill_fresh(
             MINUTE,
             MINUTE,
             T_MS - 5_001,
-            T_MS,
+            BASE_FLOOR_MS,
             T_MS + 900,
             T_MS + 6_000
         ));
@@ -593,7 +633,7 @@ mod tests {
             MINUTE - 60,
             MINUTE,
             T_MS + 400,
-            T_MS,
+            BASE_FLOOR_MS,
             T_MS + 900,
             T_MS + 6_000
         ));
@@ -602,8 +642,67 @@ mod tests {
             MINUTE,
             MINUTE,
             T_MS + 400,
-            T_MS,
+            BASE_FLOOR_MS,
             T_MS + 6_001,
+            T_MS + 6_000
+        ));
+    }
+
+    #[test]
+    fn test_cross_fill_freshness_floor_is_rung_aware_for_dhan_lender() {
+        // CADENCE-XFILL-RUNG-1 (2026-07-15): the borrow floor must span
+        // the LENDER's actual scheduled pre-fire. At rung 0 the floor is
+        // the base T − 5000; at rung r the Dhan chains fire wholesale
+        // −1000·r earlier, so the floor widens with them. The Groww
+        // lender (post-close, never rung-shifted) keeps the base floor.
+        use super::super::schedule::build_cycle_slots;
+        use tickvault_common::config::CadenceConfig;
+        let cfg = CadenceConfig::default();
+        let boundary_secs = 10 * 3600; // 10:00:00 IST — matches T_MS.
+
+        let slots0 = build_cycle_slots(boundary_secs, 0, 0, 0, &cfg);
+        assert_eq!(
+            cross_fill_freshness_floor_ms(&slots0, Feed::Dhan),
+            BASE_FLOOR_MS,
+            "rung 0: floor == the base T − 5000"
+        );
+        assert_eq!(
+            cross_fill_freshness_floor_ms(&slots0, Feed::Groww),
+            BASE_FLOOR_MS,
+            "Groww lender: base floor at every rung"
+        );
+
+        let slots3 = build_cycle_slots(boundary_secs, 3, 0, 0, &cfg);
+        assert_eq!(
+            cross_fill_freshness_floor_ms(&slots3, Feed::Dhan),
+            T_MS - 8_000,
+            "rung 3: NIFTY pre-fires at T − 5000 − 3·1000 — the floor spans it"
+        );
+        assert_eq!(
+            cross_fill_freshness_floor_ms(&slots3, Feed::Groww),
+            BASE_FLOOR_MS,
+            "the Groww lender floor is rung-independent"
+        );
+
+        // The rung-3 Dhan NIFTY completion (fetched at/after its own
+        // scheduled fire) is FRESH under the widened floor and would be
+        // WRONGLY refused under the fixed base floor — the exact
+        // CADENCE-XFILL-RUNG-1 failure shape.
+        let rung3_fetch = T_MS - 7_900;
+        assert!(cross_fill_fresh(
+            MINUTE,
+            MINUTE,
+            rung3_fetch,
+            cross_fill_freshness_floor_ms(&slots3, Feed::Dhan),
+            T_MS + 900,
+            T_MS + 6_000
+        ));
+        assert!(!cross_fill_fresh(
+            MINUTE,
+            MINUTE,
+            rung3_fetch,
+            BASE_FLOOR_MS,
+            T_MS + 900,
             T_MS + 6_000
         ));
     }
@@ -646,7 +745,8 @@ mod tests {
             ChainUnderlying::Sensex,
             own_chain(Feed::Groww, MINUTE, T_MS + 300, Some(81_250.0)),
         );
-        let (spots, chains) = borrower.cross_fill_from(&lender, T_MS + 1_000, T_MS + 15_000);
+        let (spots, chains) =
+            borrower.cross_fill_from(&lender, BASE_FLOOR_MS, T_MS + 1_000, T_MS + 15_000);
         assert_eq!((spots, chains), (1, 1));
         assert!(
             borrower
@@ -801,7 +901,7 @@ mod tests {
             own_chain(Feed::Groww, MINUTE - 60, T_MS - 59_000, None),
         );
         assert_eq!(
-            borrower.cross_fill_from(&lender, T_MS + 1_000, T_MS + 15_000),
+            borrower.cross_fill_from(&lender, BASE_FLOOR_MS, T_MS + 1_000, T_MS + 15_000),
             (0, 0)
         );
         assert!(borrower.spot(ChainUnderlying::Nifty).is_none());
