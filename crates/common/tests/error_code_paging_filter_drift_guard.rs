@@ -963,10 +963,13 @@ fn synthetic_shape_classifier_detects_planted_drift() {
 
 #[test]
 fn synthetic_doc_parser_detects_a_missing_code() {
+    // Fixture codes must be VALID variants (the parser filters on
+    // `ErrorCode::all()`). C4 sweep (2026-07-15): REST-CANARY-01 was
+    // retired with its variant, so the fixture uses FEED-STALL-01.
     let doc = "### Which codes page (2026-07-06)\n\nFiltered+alarmed codes: \
-               REST-CANARY-01, DH-901, PROC-01. **Everything else** is log-sink-only.\n";
+               FEED-STALL-01, DH-901, PROC-01. **Everything else** is log-sink-only.\n";
     let codes = parse_doc_paging_codes(doc);
-    assert_eq!(codes, vec!["REST-CANARY-01", "DH-901", "PROC-01"]);
+    assert_eq!(codes, vec!["FEED-STALL-01", "DH-901", "PROC-01"]);
     // A tf set containing AGGREGATOR-DROP-01 vs this doc must diff:
     assert!(
         !codes.contains(&"AGGREGATOR-DROP-01".to_string()),
