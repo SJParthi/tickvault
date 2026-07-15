@@ -1021,6 +1021,30 @@ pub struct GrowwOrdersConfig {
     /// window. Default 30.
     #[serde(default = "default_groww_oco_sibling_cancel_deadline_secs")]
     pub oco_sibling_cancel_deadline_secs: u64,
+    /// Gates the zero-HTTP PAPER executor + intent ledger + paper reconciler
+    /// (ledger-only). Default OFF. Deliberately SEPARATE from `orders_read`
+    /// (which authorizes read GETs): paper mode makes ZERO HTTP calls,
+    /// including GETs — the paper lane can NEVER reach any HTTP endpoint
+    /// regardless of every other flag (enforced type-level: the reqwest
+    /// transport lives only in `oms/groww/api_client.rs`, + an import-scan
+    /// ratchet). Read GETs stay gated ONLY by the per-area `*_read` flags;
+    /// `paper_enabled` neither enables nor blocks them. Live mutations require
+    /// ALL of: the `groww_orders` cargo feature + an `orders_read`-area
+    /// runtime + `live_fire_requested = true` + `GROWW_ORDER_LIVE_FIRE = true`
+    /// — and are UNAFFECTED by `paper_enabled`. At the future live flip,
+    /// `paper_enabled == true` together with live is REFUSED at boot (one
+    /// account, one lane).
+    #[serde(default)]
+    pub paper_enabled: bool,
+    /// Fail-closed maximum order quantity a single order may request. Default
+    /// `0` = refuse-all (pending the operator's 0-vs-1 answer). A requested
+    /// quantity above this is refused BEFORE any HTTP with `GROWW-ORD-09` —
+    /// the fail-closed verdict for Groww's absent slicing endpoint (there is
+    /// no client-side split). Raising it is a conscious config change;
+    /// exchange freeze limits are exchange-published and changing, never
+    /// hardcoded.
+    #[serde(default)]
+    pub max_order_quantity: i64,
 }
 
 fn default_groww_oco_reconcile_poll_secs() -> u64 {
@@ -1047,9 +1071,18 @@ impl Default for GrowwOrdersConfig {
             smart_orders_write: false,
             oco_reconcile_poll_secs: default_groww_oco_reconcile_poll_secs(),
             oco_sibling_cancel_deadline_secs: default_groww_oco_sibling_cancel_deadline_secs(),
+            paper_enabled: false,
+            max_order_quantity: 0,
         }
     }
 }
+
+// NOTE: the pure `decide_orders_runtime(cfg, live_fire) -> RuntimeLanes`
+// resolver (the 7-row truth table, spec-flags-response FLAG-1) lands in
+// PR-A core (`oms/groww/`), NOT here — its first truth-table column is the
+// compile-time `groww_orders` cargo feature, which a pure runtime fn over
+// `(&GrowwOrdersConfig, bool)` cannot express; forcing it into `common`
+// would misrepresent the feature gate.
 
 /// 🔷 DHAN pre-trade margin gate (`[dhan_margin_gate]`).
 ///
@@ -3081,6 +3114,14 @@ mod tests {
             cfg.oco_sibling_cancel_deadline_secs, 30,
             "oco_sibling_cancel_deadline_secs must default to the 30s design value"
         );
+        assert!(
+            !cfg.paper_enabled,
+            "paper_enabled must default off (Gate 1) — the zero-HTTP paper lane is dark by default"
+        );
+        assert_eq!(
+            cfg.max_order_quantity, 0,
+            "max_order_quantity must default 0 (refuse-all) pending the operator's 0-vs-1 answer"
+        );
     }
 
     /// PR-0 / Smart Orders area (2026-07-15): an ABSENT `[groww_orders]`
@@ -3089,7 +3130,7 @@ mod tests {
     /// `#[serde(default…)]` attribute — which would make an absent field a
     /// hard deserialize ERROR (the two OCO cadences) or silently zero a u64 —
     /// fails the build. (`GrowwOrdersConfig` derives no `PartialEq`, so the
-    /// nine fields are compared explicitly against `Default`.)
+    /// eleven fields are compared explicitly against `Default`.)
     #[test]
     fn test_groww_orders_config_absent_section_serde_parity() {
         let parsed: GrowwOrdersConfig = toml::from_str("")
@@ -3107,6 +3148,8 @@ mod tests {
             parsed.oco_sibling_cancel_deadline_secs,
             def.oco_sibling_cancel_deadline_secs
         );
+        assert_eq!(parsed.paper_enabled, def.paper_enabled);
+        assert_eq!(parsed.max_order_quantity, def.max_order_quantity);
     }
 
     // -----------------------------------------------------------------------

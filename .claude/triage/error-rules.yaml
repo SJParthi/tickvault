@@ -2528,3 +2528,140 @@ rules:
       formula. One coalesced warn per day; the operator compares the
       local vs broker numbers per the runbook and re-tunes with a dated
       note — nothing is auto-adjusted.
+  # -----------------------------------------------------------------------
+  # Groww REGULAR orders — shared contracts PR-A0 (operator authorization
+  # 2026-07-14; DORMANT / dry-run only). All 10 are LOG-SINK-ONLY; the
+  # operator page is the typed Telegram event. GROWW-ORD-03 (Critical) +
+  # GROWW-ORD-04 (severity-independent override) MUST escalate; the
+  # self-healing rate-limit code is silenced (expected co-tenant noise).
+  # Emit sites land in later serial Orders PRs.
+  # -----------------------------------------------------------------------
+  - name: groww-ord-01-mutation-rejected-escalate
+    match:
+      code: GROWW-ORD-01
+    action: escalate
+    runbook_path: .claude/rules/project/groww-orders-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 600
+    justification: >-
+      GROWW-ORD-01 = a place/modify/cancel was definitively rejected
+      (400-class + well-shaped FAILURE envelope). Never auto-retried;
+      the operator reads the GA code + plain reason.
+
+  - name: groww-ord-02-ambiguous-outcome-escalate
+    match:
+      code: GROWW-ORD-02
+    action: escalate
+    runbook_path: .claude/rules/project/groww-orders-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 600
+    justification: >-
+      GROWW-ORD-02 = a mutation entered the ambiguity resolution ladder
+      (timeout/5xx/decode/429/GA-on-non-400). The ladder self-resolves or
+      escalates to GROWW-ORD-03; surface so the operator knows an outcome
+      is being confirmed.
+
+  - name: groww-ord-03-ambiguity-unresolved-escalate
+    match:
+      code: GROWW-ORD-03
+    action: escalate
+    runbook_path: .claude/rules/project/groww-orders-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 300
+    justification: >-
+      GROWW-ORD-03 = the resolution ladder exhausted without confirming an
+      order's fate (Critical, never auto-triaged). The operator MUST open
+      the Groww app and check the order book — an order may be live and
+      unknown to us.
+
+  - name: groww-ord-04-reconcile-mismatch-escalate
+    match:
+      code: GROWW-ORD-04
+    action: escalate
+    runbook_path: .claude/rules/project/groww-orders-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 600
+    justification: >-
+      GROWW-ORD-04 = reconciliation found a status/fill drift, ghost, or
+      fill-monotonicity breach. A data-integrity verdict is never
+      auto-actioned (is_auto_triage_safe = false, the FUTIDX-02
+      precedent); the operator judges which side drifted.
+
+  - name: groww-ord-05-rate-limited-silence
+    match:
+      code: GROWW-ORD-05
+    action: silence
+    runbook_path: .claude/rules/project/groww-orders-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 600
+    justification: >-
+      GROWW-ORD-05 = broker 429 on an order-family call while our self-caps
+      were green (the shared-account co-tenant hypothesis). Counted +
+      backed off, never out-polled, never trips the circuit breaker —
+      expected recurring noise, so silence; a sustained rate is the
+      co-tenant signal the operator inspects.
+
+  - name: groww-ord-06-ledger-write-failed-escalate
+    match:
+      code: GROWW-ORD-06
+    action: escalate
+    runbook_path: .claude/rules/project/groww-orders-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 600
+    justification: >-
+      GROWW-ORD-06 = the write-ahead intent ledger failed an append/fsync
+      or replay found interior corruption. The mutation is already refused
+      fail-closed; escalate so the operator checks the ledger directory's
+      disk/permissions.
+
+  - name: groww-ord-07-unknown-status-escalate
+    match:
+      code: GROWW-ORD-07
+    action: escalate
+    runbook_path: .claude/rules/project/groww-orders-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 600
+    justification: >-
+      GROWW-ORD-07 = an undocumented (open-set) order-status string was
+      observed; the order is parked + reconciled. A NEW distinct string
+      means the wire vocabulary drifted — the operator adds it to the
+      parser's known set in a reviewed PR (never a guessed rank).
+
+  - name: groww-ord-08-audit-write-failed-escalate
+    match:
+      code: GROWW-ORD-08
+    action: escalate
+    runbook_path: .claude/rules/project/groww-orders-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 600
+    justification: >-
+      GROWW-ORD-08 = the shared order_audit ILP append/flush failed
+      (best-effort, AUDIT-WS-01 class). The intent ledger is the safety
+      record and a failed audit row never gates a mutation; escalate so the
+      operator knows a forensic row is missing until QuestDB recovers.
+
+  - name: groww-ord-09-quantity-refused-escalate
+    match:
+      code: GROWW-ORD-09
+    action: escalate
+    runbook_path: .claude/rules/project/groww-orders-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 600
+    justification: >-
+      GROWW-ORD-09 = a requested order quantity exceeded the
+      max_order_quantity config gate; refused loudly before any HTTP. The
+      operator decides whether raising the cap is intended (freeze limits
+      are exchange-published and changing — never hardcoded).
+
+  - name: groww-ord-10-auth-stale-escalate
+    match:
+      code: GROWW-ORD-10
+    action: escalate
+    runbook_path: .claude/rules/project/groww-orders-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 600
+    justification: >-
+      GROWW-ORD-10 = an order-family call classified 401/403; the
+      minter-lock re-read ladder engaged (SSM read-only, never mints). At
+      the ~06:00 IST daily reset this self-heals; a sustained rate means
+      the minter is stale (cross-check the shared-token minter runbook).

@@ -58,6 +58,9 @@ const TRACKED_PREFIXES: &[&str] = &[
     // now enforces enum variants for every GROWW-MARG-* mentioned in rule
     // text.
     "GROWW-MARG-",
+    // Groww orders shared contracts (PR-A0, 2026-07-15) — every GROWW-ORD-NN
+    // referenced in a rule file must have a matching enum variant.
+    "GROWW-ORD-",
 ];
 
 /// Codes mentioned in rule files that intentionally don't have an enum
