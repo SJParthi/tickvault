@@ -1,6 +1,6 @@
 # Implementation Plan: Dhan live-WS retirement Phase C-4 — ErrorCode variant sweep + dormant-code cleanup
 
-**Status:** APPROVED
+**Status:** VERIFIED
 **Date:** 2026-07-15
 **Approved by:** Parthiban (operator) — standing 2026-07-13 retirement directive
 (`.claude/rules/project/websocket-connection-scope-lock.md` "2026-07-13 Amendment"
@@ -19,7 +19,7 @@
 
 ## Plan Items
 
-- [ ] Item 1 — Delete the 19 zero-emit-site ErrorCode variants retained from
+- [x] Item 1 — Delete the 19 zero-emit-site ErrorCode variants retained from
   Phases A/B/C1/C2/C3: `InstrFetch01CsvHardFailed`, `InstrFetch02SchemaValidationFailed`,
   `InstrFetch03DanglingReferences`, `InstrFetch04UniverseSizeOutOfBounds`,
   `NtmConstituency01SourceDegraded`, `PrevDay01CoverageEmpty`,
@@ -36,14 +36,14 @@
   - Files: crates/common/src/error_code.rs, crates/common/tests/error_code_rule_file_crossref.rs, crates/storage/src/instrument_fetch_audit_persistence.rs (dated doc-comment truth-sync)
   - Tests: test_all_variants_have_unique_code_str, test_code_str_roundtrip_via_from_str, test_all_list_length_matches_catalogue_size, every_error_code_variant_appears_in_a_rule_file, every_rule_file_code_has_an_enum_variant (REVERSE_CHECK_ALLOWLIST extended for WS-GAP-05..09 + AUTH-GAP-06 — tracked prefixes whose rule-file history stays per house banner convention)
 
-- [ ] Item 2 — Delete the caller-less parked SLO evaluator with its variants:
+- [x] Item 2 — Delete the caller-less parked SLO evaluator with its variants:
   `crates/core/src/instrument/slo_score.rs` (only consumers were its own tests,
   its bench, and comments), its Criterion bench + `[[bench]]` entry, and the two
   `slo_score_*` budget keys (the C3 tick-gap-budget-removal precedent).
   - Files: crates/core/src/instrument/slo_score.rs (DELETE), crates/core/benches/slo_score.rs (DELETE), crates/core/Cargo.toml, crates/core/src/instrument/mod.rs, quality/benchmark-budgets.toml
   - Tests: cargo test -p tickvault-core green; bench_budget_elements_guard stays green (no slo pin exists)
 
-- [ ] Item 3 — Delete `TokenManager::initialize_deferred` (WIRING-EXEMPT since
+- [x] Item 3 — Delete `TokenManager::initialize_deferred` (WIRING-EXEMPT since
   PR-C2, zero callers — "C4 sweep owns deletion") and the C3 judgment-call #2
   caller-less storage fns: `bump_active_last_seen` + `build_bump_active_last_seen_sql`
   (instrument_lifecycle_persistence.rs) and `read_last_fetch_audit_sha`
@@ -54,7 +54,7 @@
   - Files: crates/core/src/auth/token_manager.rs, crates/storage/src/instrument_lifecycle_persistence.rs, crates/storage/src/instrument_fetch_audit_persistence.rs, crates/storage/tests/daily_universe_scope_guard.rs
   - Tests: cargo test -p tickvault-storage / -p tickvault-core green; daily_universe_scope_guard remaining pins green
 
-- [ ] Item 4 — Rule-file dated truth-sync: stamp the "retained until the C4
+- [x] Item 4 — Rule-file dated truth-sync: stamp the "retained until the C4
   variant sweep" notes (dhan-rest-only-noise-lock-2026-07-14.md ×2,
   dhan-rest-canary-error-codes.md, wave-3-d-error-codes.md) and the Phase C
   retirement banners (daily-universe-instr-fetch-error-codes.md,
