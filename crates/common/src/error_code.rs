@@ -925,6 +925,74 @@ pub enum ErrorCode {
     /// status (fail-closed). Severity::High, auto-triage-safe (the order
     /// stays tracked; reconcile + the caller's policy own the follow-up).
     ExitVerify01Degraded,
+    // -----------------------------------------------------------------------
+    // Groww ORDERS — shared contracts PR-A0 (operator authorization
+    // 2026-07-14; live flip is a SEPARATE future dated quote). All ten codes
+    // ship LOG-SINK-ONLY (no error-code-alarms.tf entry, no paging-list
+    // mention). Runbook: groww-orders-error-codes.md.
+    // -----------------------------------------------------------------------
+    /// GROWW-ORD-01 (Groww orders PR-A0, 2026-07-15) — a place/modify/cancel
+    /// mutation was DEFINITIVELY rejected: a 400-class HTTP status AND a
+    /// well-shaped FAILURE envelope (or a REJECTED/FAILED order status). Never
+    /// auto-retried (the broker refused it for a reason). Severity::High,
+    /// auto-triage-safe (the refusal is terminal; the operator reads the GA
+    /// code + plain reason).
+    GrowwOrd01MutationRejected,
+    /// GROWW-ORD-02 (Groww orders PR-A0, 2026-07-15) — a mutation entered
+    /// phase=ambiguous (timeout / 5xx / decode failure / 429 / a GA code
+    /// riding a non-400-class status): the outcome is UNKNOWN and the
+    /// write-ahead intent enters the reference-id/GA007 resolution ladder on
+    /// the SAME reference_id. Severity::High, auto-triage-safe (the ladder
+    /// resolves it or escalates to GROWW-ORD-03).
+    GrowwOrd02AmbiguousOutcome,
+    /// GROWW-ORD-03 (Groww orders PR-A0, 2026-07-15) — the resolution ladder
+    /// EXHAUSTED its bounded budget (600s, auth-paused clock) without
+    /// confirming an order's fate. The operator MUST open the Groww app and
+    /// check the order book — an order may be live and unknown to us.
+    /// Severity::Critical, NOT auto-triage-safe (Critical is never
+    /// auto-actioned).
+    GrowwOrd03AmbiguityUnresolved,
+    /// GROWW-ORD-04 (Groww orders PR-A0, 2026-07-15) — reconciliation found a
+    /// status/fill DRIFT between our records and the broker (a ghost order, a
+    /// backward transition from a live source, or a fill-monotonicity breach —
+    /// after stale-snapshot-skip filtering). Severity::High, NOT
+    /// auto-triage-safe (severity-INDEPENDENT override — a data-integrity
+    /// verdict is an operator judgment: which side drifted; the FUTIDX-02
+    /// precedent).
+    GrowwOrd04ReconcileMismatch,
+    /// GROWW-ORD-05 (Groww orders PR-A0, 2026-07-15) — the broker returned 429
+    /// on an order-family call while our self-caps were green: the
+    /// co-tenant (BruteX) hypothesis. Counted + backed off, never out-polled,
+    /// never trips the circuit breaker. Severity::Medium, auto-triage-safe.
+    GrowwOrd05RateLimited,
+    /// GROWW-ORD-06 (Groww orders PR-A0, 2026-07-15) — the write-ahead intent
+    /// ledger failed an append / fsync, or replay found interior corruption.
+    /// The mutation is already REFUSED (fail-closed: no durable intent, no
+    /// send). Severity::High, auto-triage-safe (the operator checks the
+    /// ledger directory's disk/permissions; a torn FINAL line is tolerated).
+    GrowwOrd06LedgerWriteFailed,
+    /// GROWW-ORD-07 (Groww orders PR-A0, 2026-07-15) — an undocumented
+    /// (open-set) order-status string was observed: the order is PARKED (no
+    /// transition) + a coalesced once-per-distinct-string-per-day warn +
+    /// reconcile. The fail-closed answer to the O-1 `OPEN`/status-drift
+    /// Unknown. Severity::Medium, auto-triage-safe.
+    GrowwOrd07UnknownStatus,
+    /// GROWW-ORD-08 (Groww orders PR-A0, 2026-07-15) — the shared `order_audit`
+    /// ILP append/flush failed (best-effort forensic write — the AUDIT-WS-01
+    /// class). The ledger is the safety record; a failed audit row NEVER gates
+    /// a mutation. Severity::Medium, auto-triage-safe.
+    GrowwOrd08AuditWriteFailed,
+    /// GROWW-ORD-09 (Groww orders PR-A0, 2026-07-15) — a requested order
+    /// quantity exceeded the `max_order_quantity` config gate: refused loudly
+    /// before any HTTP (the fail-closed no-slicing-endpoint verdict).
+    /// Severity::High, auto-triage-safe.
+    GrowwOrd09QuantityRefused,
+    /// GROWW-ORD-10 (Groww orders PR-A0, 2026-07-15) — an order-family call
+    /// classified 401/403 (auth-stale): the minter-lock re-read ladder engaged
+    /// (SSM read-only, NEVER mints — token-minter lock 2026-07-02); an
+    /// in-flight mutation stays ambiguous with the ladder clock paused.
+    /// Severity::High, auto-triage-safe.
+    GrowwOrd10AuthStale,
 }
 
 impl ErrorCode {
@@ -1104,6 +1172,17 @@ impl ErrorCode {
             Self::FeedGap01EpisodeDegraded => "FEED-GAP-01",
             Self::ExitOrder01ExecutionDegraded => "EXIT-ORDER-01",
             Self::ExitVerify01Degraded => "EXIT-VERIFY-01",
+            // Groww orders shared contracts (PR-A0, 2026-07-15)
+            Self::GrowwOrd01MutationRejected => "GROWW-ORD-01",
+            Self::GrowwOrd02AmbiguousOutcome => "GROWW-ORD-02",
+            Self::GrowwOrd03AmbiguityUnresolved => "GROWW-ORD-03",
+            Self::GrowwOrd04ReconcileMismatch => "GROWW-ORD-04",
+            Self::GrowwOrd05RateLimited => "GROWW-ORD-05",
+            Self::GrowwOrd06LedgerWriteFailed => "GROWW-ORD-06",
+            Self::GrowwOrd07UnknownStatus => "GROWW-ORD-07",
+            Self::GrowwOrd08AuditWriteFailed => "GROWW-ORD-08",
+            Self::GrowwOrd09QuantityRefused => "GROWW-ORD-09",
+            Self::GrowwOrd10AuthStale => "GROWW-ORD-10",
         }
     }
 
@@ -1328,6 +1407,22 @@ impl ErrorCode {
             // FEED-GAP-01 (2026-07-14): gap-episode forensics degraded —
             // annotation-only side record; capture/recovery unaffected. Medium.
             Self::FeedGap01EpisodeDegraded => Severity::Medium,
+            // GROWW-ORD-01..10 (Groww orders PR-A0, 2026-07-15). Critical: an
+            // unresolved order fate demands the operator open the app NOW.
+            Self::GrowwOrd03AmbiguityUnresolved => Severity::Critical,
+            // High: definitive reject / ambiguity opened / reconcile drift /
+            // ledger-refused mutation / quantity gate / auth-stale.
+            Self::GrowwOrd01MutationRejected
+            | Self::GrowwOrd02AmbiguousOutcome
+            | Self::GrowwOrd04ReconcileMismatch
+            | Self::GrowwOrd06LedgerWriteFailed
+            | Self::GrowwOrd09QuantityRefused
+            | Self::GrowwOrd10AuthStale => Severity::High,
+            // Medium: broker 429 (co-tenant hypothesis) / open-set status /
+            // best-effort order_audit write failure.
+            Self::GrowwOrd05RateLimited
+            | Self::GrowwOrd07UnknownStatus
+            | Self::GrowwOrd08AuditWriteFailed => Severity::Medium,
             // Low: trading-day / Dhan other
             // PR #6a (2026-05-19): I-P1-01 (DailyScheduler) + I-P1-02 (DeltaFieldCoverage) retired
             Self::InstrumentP2TradingDayGuard
@@ -1546,6 +1641,20 @@ impl ErrorCode {
             Self::ExitOrder01ExecutionDegraded | Self::ExitVerify01Degraded => {
                 ".claude/rules/project/dhan-exit-order-lockout-2026-07-14.md"
             }
+            // Groww orders shared contracts (PR-A0, 2026-07-15) — one runbook
+            // for the whole GROWW-ORD-* family.
+            Self::GrowwOrd01MutationRejected
+            | Self::GrowwOrd02AmbiguousOutcome
+            | Self::GrowwOrd03AmbiguityUnresolved
+            | Self::GrowwOrd04ReconcileMismatch
+            | Self::GrowwOrd05RateLimited
+            | Self::GrowwOrd06LedgerWriteFailed
+            | Self::GrowwOrd07UnknownStatus
+            | Self::GrowwOrd08AuditWriteFailed
+            | Self::GrowwOrd09QuantityRefused
+            | Self::GrowwOrd10AuthStale => {
+                ".claude/rules/project/groww-orders-error-codes.md"
+            }
         }
     }
 
@@ -1588,6 +1697,12 @@ impl ErrorCode {
                 // would re-stamp rows and could mask the evidence (the
                 // Futidx02 precedent).
                 | Self::TfVerify01MismatchFound
+                // GROWW-ORD-04 (Groww orders PR-A0, 2026-07-15): a reconcile
+                // status/fill drift is a data-integrity VERDICT — the operator
+                // judges which side (our records or the broker) drifted; never
+                // auto-actioned despite High severity (the Futidx02 precedent).
+                // GROWW-ORD-03 is already covered by the Critical fallthrough.
+                | Self::GrowwOrd04ReconcileMismatch
         ) {
             return false;
         }
@@ -1757,6 +1872,17 @@ impl ErrorCode {
             // 🔷 DHAN exit-order execution layer (Cluster B, 2026-07-14)
             Self::ExitOrder01ExecutionDegraded,
             Self::ExitVerify01Degraded,
+            // Groww orders shared contracts (PR-A0, 2026-07-15)
+            Self::GrowwOrd01MutationRejected,
+            Self::GrowwOrd02AmbiguousOutcome,
+            Self::GrowwOrd03AmbiguityUnresolved,
+            Self::GrowwOrd04ReconcileMismatch,
+            Self::GrowwOrd05RateLimited,
+            Self::GrowwOrd06LedgerWriteFailed,
+            Self::GrowwOrd07UnknownStatus,
+            Self::GrowwOrd08AuditWriteFailed,
+            Self::GrowwOrd09QuantityRefused,
+            Self::GrowwOrd10AuthStale,
         ]
     }
 }
@@ -2139,7 +2265,14 @@ mod tests {
         // mid-flight making the pre-merge base 149, and the exit-order
         // pair #1566 landed during the merge train making it 151 —
         // hence 151 -> 129, not 148 -> 126).
-        assert_eq!(ErrorCode::all().len(), 129);
+        // 2026-07-15 (Groww orders shared contracts PR-A0, rebased onto
+        // the C4-sweep base of 129): bumped 129 -> 139 for
+        // GROWW-ORD-01..10 (mutation-rejected / ambiguous-outcome /
+        // ambiguity-unresolved [Critical] / reconcile-mismatch [High,
+        // manual triage] / rate-limited / ledger-write-failed /
+        // unknown-status / audit-write-failed / quantity-refused /
+        // auth-stale) — all log-sink-only.
+        assert_eq!(ErrorCode::all().len(), 139);
     }
 
     #[test]
@@ -2442,7 +2575,11 @@ mod tests {
                 || s.starts_with("FEED-GAP-")
                 // 🔷 DHAN exit-order execution layer (Cluster B, 2026-07-14)
                 || s.starts_with("EXIT-ORDER-")
-                || s.starts_with("EXIT-VERIFY-");
+                || s.starts_with("EXIT-VERIFY-")
+                // Groww orders shared contracts (PR-A0, 2026-07-15). Does NOT
+                // auto-accept via any other GROWW-* arm (GROWW-MASTER-/SCALE-/
+                // NATIVE- are enumerated separately) — this arm is required.
+                || s.starts_with("GROWW-ORD-");
             assert!(has_known_prefix, "unexpected code prefix: {s}");
         }
     }

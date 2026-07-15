@@ -9,16 +9,18 @@
 # preserved across the upgrade.
 #
 # This is READY-TO-FIRE TOOLING, not an actual upgrade. The instance-type
-# LOCK is r8g.large everywhere (Terraform validation +
-# instance_type_lock_guard.rs) per operator Quote 7 (2026-06-30). Flipping the
-# lock to a different type requires a dated operator quote + the 4-file lock
-# update FIRST (see daily-universe-scope-expansion-2026-05-27.md §7 Mechanical
-# Rule 1). This script merely lets the operator EXECUTE the m8g.large →
-# r8g.large flip safely — the safe defaults below are the current locked types.
+# LOCK is t4g.medium everywhere (Terraform validation +
+# instance_type_lock_guard.rs) per operator Quote 8 (2026-07-15 downsize;
+# supersedes the 2026-06-30 r8g.large Quote 7 lock). Flipping the lock to a
+# different type requires a dated operator quote + the 4-file lock update
+# FIRST (see daily-universe-scope-expansion-2026-05-27.md §7 Mechanical
+# Rule 1). This script is the MANUAL fallback for the r8g.large → t4g.medium
+# flip (the primary path is .github/workflows/downsize-instance.yml) — the
+# safe defaults below are the current locked types.
 #
 # What it does (each step idempotent / guarded):
 #   1. Discover the instance by Name tag `tv-${ENV}-app` (default env=prod).
-#   2. Validate --to is in the allowlist {m8g.large,r8g.large,m8g.xlarge,r8g.xlarge}.
+#   2. Validate --to is in the allowlist {t4g.medium,t4g.large,m8g.large,r8g.large,m8g.xlarge,r8g.xlarge}.
 #   3. Refuse unless current type == FROM_TYPE (idempotent: if already TO_TYPE,
 #      report and skip the type change but still run optional EBS/QuestDB steps).
 #   4. Market-hours guard — refuse 09:00–15:30 IST Mon–Fri unless --force
@@ -40,18 +42,24 @@
 #
 # Usage:
 #   ./scripts/aws-upgrade-instance.sh                       # type flip only, guarded
-#                                                           # (r8g.large target auto-sets QDB_MEM_LIMIT=4g)
+#                                                           # (t4g.medium target auto-sets QDB_MEM_LIMIT=1g)
 #   ./scripts/aws-upgrade-instance.sh --dry-run             # print actions, change nothing
 #   ./scripts/aws-upgrade-instance.sh --force               # bypass market-hours guard
-#   ./scripts/aws-upgrade-instance.sh --from m8g.large --to r8g.large \
-#        --ebs-size 60 --ebs-iops 4000 --ebs-throughput 250 --qdb-mem 4g
+#   ./scripts/aws-upgrade-instance.sh --from r8g.large --to t4g.medium \
+#        --qdb-mem 1g
 #   ./scripts/aws-upgrade-instance.sh --ebs-size 60         # ONLY grow the disk (no type change)
-#   ./scripts/aws-upgrade-instance.sh --qdb-mem 4g --apply-ssm  # retune QuestDB, send via SSM
+#   ./scripts/aws-upgrade-instance.sh --qdb-mem 1g --apply-ssm  # retune QuestDB, send via SSM
+#   ./scripts/aws-upgrade-instance.sh --from t4g.medium --to r8g.large \
+#        --qdb-mem 4g                                       # emergency roll-UP direction
 #
-# NOTE: an r8g.large flip auto-defaults QDB_MEM_LIMIT=4g (persisted in
-#   deploy/docker/.env) so the 4g QuestDB ceiling lands COUPLED to the 16 GiB
-#   resize, never via the pre-resize auto-deploy (which keeps the compose
-#   default 2g on the current 8 GiB box). Pass an explicit --qdb-mem to override.
+# NOTE: a t4g.medium target auto-defaults QDB_MEM_LIMIT=1g and an r8g.large
+#   target auto-defaults QDB_MEM_LIMIT=4g (persisted in repo/deploy/docker/.env)
+#   so the QuestDB ceiling always lands COUPLED to the host RAM change.
+#   Pass an explicit --qdb-mem to override.
+#
+# EBS NOTE: this script GROWS disks only — gp3 can NEVER shrink, and the
+#   2026-07-15 20 GB target is a FRESH-VOLUME replacement plan (terraform
+#   terminate-and-recreate in the operator's erase window), not a resize.
 #
 # Env overrides: TV_ENV, AWS_REGION, FROM_TYPE, TO_TYPE.
 # Idempotent: re-running after success is a no-op for steps already applied.
@@ -63,14 +71,15 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 ENV="${TV_ENV:-prod}"
 REGION="${AWS_REGION:-ap-south-1}"          # ap-south-1 Mumbai per aws-budget.md
-FROM_TYPE="${FROM_TYPE:-m8g.large}"         # the prior locked type to flip FROM (overridable)
-TO_TYPE="${TO_TYPE:-r8g.large}"             # operator lock 2026-06-30 §7 Quote 7
+FROM_TYPE="${FROM_TYPE:-r8g.large}"         # the prior locked type to flip FROM (overridable)
+TO_TYPE="${TO_TYPE:-t4g.medium}"            # operator lock 2026-07-15 §7 Quote 8 (downsize)
 NAME_TAG="tv-${ENV}-app"
 
-# Allowlist of upgrade targets. Adding a new type here is NOT the same as
+# Allowlist of flip targets. Adding a new type here is NOT the same as
 # flipping the lock — the lock lives in Terraform + the ratchet. This list
-# only bounds what this tool will accept once an upgrade is authorized.
-ALLOWED_TO_TYPES="m8g.large r8g.large m8g.xlarge r8g.xlarge"
+# only bounds what this tool will accept once a flip is authorized.
+# r8g.large is KEPT so the emergency roll-UP direction stays executable.
+ALLOWED_TO_TYPES="t4g.medium t4g.large m8g.large r8g.large m8g.xlarge r8g.xlarge"
 
 DRY_RUN=0
 FORCE=0
@@ -175,10 +184,11 @@ if [ -n "$QDB_MEM" ]; then
   fi
 fi
 # --apply-ssm needs something to send. Allow it without an explicit --qdb-mem
-# ONLY when the target is r8g.large, because QDB_MEM is auto-defaulted to 4g
-# below (after instance discovery) for that flip — so there WILL be a value to
-# send. For any other target, --apply-ssm with no --qdb-mem sends nothing.
-[ "$APPLY_SSM" -eq 1 ] && [ -z "$QDB_MEM" ] && [ "$TO_TYPE" != "r8g.large" ] \
+# ONLY when the target has an auto-defaulted QDB_MEM below (t4g.medium → 1g,
+# r8g.large → 4g, coupled after instance discovery) — so there WILL be a value
+# to send. For any other target, --apply-ssm with no --qdb-mem sends nothing.
+[ "$APPLY_SSM" -eq 1 ] && [ -z "$QDB_MEM" ] \
+  && [ "$TO_TYPE" != "r8g.large" ] && [ "$TO_TYPE" != "t4g.medium" ] \
   && die "--apply-ssm requires --qdb-mem (nothing to send otherwise)."
 
 WANT_EBS=0
@@ -231,18 +241,24 @@ elif [ "$CUR_TYPE" != "$FROM_TYPE" ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# Couple QuestDB mem_limit to the r8g.large (16 GiB) resize.
-# The compose default is the safe 2g (current m8g.large 8 GiB box). When this
-# flip targets r8g.large and the operator did NOT pass an explicit --qdb-mem,
-# default it to 4g so Step 8 persists QDB_MEM_LIMIT=4g in deploy/docker/.env
-# EXACTLY when the box becomes 16 GiB — never ahead of the physical resize via
-# the pre-resize auto-deploy. Applies whether the flip happens now
-# (DO_TYPE_FLIP=1) or the box is already r8g.large (idempotent re-run,
-# DO_TYPE_FLIP=0) — in both cases the steady-state box is 16 GiB. Any explicit
-# --qdb-mem the operator passed wins (already validated above).
-if [ -z "$QDB_MEM" ] && [ "$TO_TYPE" = "r8g.large" ]; then
-  QDB_MEM="4g"
-  ok "Target r8g.large (16 GiB): defaulting QuestDB mem_limit to ${QDB_MEM} (set in deploy/docker/.env at Step 8, coupled to the resize)."
+# Couple QuestDB mem_limit to the host RAM change (2026-07-15 Quote 8).
+# When the operator did NOT pass an explicit --qdb-mem, auto-default it per
+# target so Step 8 persists the matching QDB_MEM_LIMIT in repo/deploy/docker/.env
+# EXACTLY when the box changes size — t4g.medium (4 GiB) → 1g (the downsize),
+# r8g.large (16 GiB) → 4g (the emergency roll-UP direction). Applies whether
+# the flip happens now (DO_TYPE_FLIP=1) or the box is already TO_TYPE
+# (idempotent re-run / retune-only, DO_TYPE_FLIP=0). Any explicit --qdb-mem
+# the operator passed wins (already validated above).
+if [ -z "$QDB_MEM" ]; then
+  case "$TO_TYPE" in
+    t4g.medium)
+      QDB_MEM="1g"
+      ok "Target t4g.medium (4 GiB): defaulting QuestDB mem_limit to ${QDB_MEM} (set in repo/deploy/docker/.env at Step 8, coupled to the downsize)." ;;
+    r8g.large)
+      QDB_MEM="4g"
+      ok "Target r8g.large (16 GiB): defaulting QuestDB mem_limit to ${QDB_MEM} (set in repo/deploy/docker/.env at Step 8, coupled to the resize)." ;;
+    *) : ;; # no auto-default for other targets — --qdb-mem is explicit-only
+  esac
 fi
 
 # Now apply the market-hours guard ONLY if a stop will actually happen.
@@ -406,25 +422,40 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Step 8 — QuestDB mem_limit retune. The compose file reads
-# ${QDB_MEM_LIMIT:-2g} (safe default for the 8 GiB box), so we persist that env
-# on the box and restart the questdb container. QDB_MEM is either an explicit
-# --qdb-mem or the 4g auto-default for the r8g.large flip (set above) — so for
-# an r8g.large upgrade this runs automatically, coupling the 4g ceiling to the
-# 16 GiB resize. We EMIT the exact command; with --apply-ssm we send it via SSM
-# RunShellScript (only if the operator opts in).
+# Step 8 — QuestDB mem_limit retune. The compose PROJECT on the box is
+# /opt/tickvault/repo/deploy/docker (user-data.sh.tftpl Step 6 cd's there;
+# deploy-aws.yml operates there too) — NOT /opt/tickvault/deploy/docker, which
+# does not exist on the box (review round 4 HIGH: the old path aborted the
+# whole && chain at `touch`, so the documented manual/emergency retune leg
+# never executed). The compose file reads ${QDB_MEM_LIMIT:-1g}, so we persist
+# that env in the PROJECT .env (the one every compose caller reads) and
+# recreate ONLY the questdb container. docker-compose.yml also HARD-REQUIRES
+# TV_QUESTDB_PG_USER / TV_QUESTDB_PG_PASSWORD ("${VAR:?}" interpolations) on
+# EVERY compose invocation and they are never persisted to .env — so the
+# on-box command fetches them from SSM at invocation time (the deploy-aws.yml
+# ~L634 pattern, same admin/quest fallbacks; the instance role has
+# ssm:GetParameter). QDB_MEM is either an explicit --qdb-mem or the per-target
+# auto-default (t4g.medium→1g, r8g.large→4g), coupling the QuestDB ceiling to
+# the host RAM change. We EMIT the exact command; with --apply-ssm we send it
+# via SSM RunShellScript (only if the operator opts in).
 # ---------------------------------------------------------------------------
 if [ -n "$QDB_MEM" ]; then
   log "QuestDB mem_limit retune → ${QDB_MEM}"
-  # The on-box command: persist QDB_MEM_LIMIT in the compose env file and
+  # The on-box command: persist QDB_MEM_LIMIT in the compose PROJECT env file,
+  # export the SSM-held QuestDB PG creds (compose hard-requires them), and
   # recreate ONLY the questdb container so the new mem_limit takes effect.
+  # NOTE: \$(...) below is deliberately escaped — the SSM parameter fetches run
+  # ON THE BOX at invocation time, never on the operator's machine.
   read -r -d '' QDB_CMD <<EOF || true
-cd /opt/tickvault \
-  && touch deploy/docker/.env \
-  && (grep -q '^QDB_MEM_LIMIT=' deploy/docker/.env \
-        && sed -i 's/^QDB_MEM_LIMIT=.*/QDB_MEM_LIMIT=${QDB_MEM}/' deploy/docker/.env \
-        || echo 'QDB_MEM_LIMIT=${QDB_MEM}' >> deploy/docker/.env) \
-  && docker compose -f deploy/docker/docker-compose.yml up -d --no-deps tv-questdb \
+cd /opt/tickvault/repo/deploy/docker \
+  && touch .env \
+  && (grep -q '^QDB_MEM_LIMIT=' .env \
+        && sed -i 's/^QDB_MEM_LIMIT=.*/QDB_MEM_LIMIT=${QDB_MEM}/' .env \
+        || echo 'QDB_MEM_LIMIT=${QDB_MEM}' >> .env) \
+  && export TV_QUESTDB_PG_USER=\$(aws ssm get-parameter --region ${REGION} --name /tickvault/prod/questdb/pg-user --with-decryption --output text --query Parameter.Value 2>/dev/null || echo admin) \
+  && export TV_QUESTDB_PG_PASSWORD=\$(aws ssm get-parameter --region ${REGION} --name /tickvault/prod/questdb/pg-password --with-decryption --output text --query Parameter.Value 2>/dev/null || echo quest) \
+  && docker compose config -q \
+  && docker compose up -d --no-deps tv-questdb \
   && echo "questdb restarted with mem_limit=${QDB_MEM}"
 EOF
   printf '  Run this ON THE BOX (or it is SSM-sent below):\n\n%s\n\n' "$QDB_CMD"
