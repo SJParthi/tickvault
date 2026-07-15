@@ -1549,7 +1549,7 @@ async fn fire_one_chain_minute(
     writer: &mut OptionChain1mWriter,
     audit_writer: &mut RestFetchAuditWriter,
     edge: &mut FailureEdge,
-    moneyness_latches: &mut MoneynessWarnLatches,
+    health: &mut ChainServingHealth,
     fire_secs_of_day: u32,
 ) -> MinuteVerdict {
     let minute_open_secs = fire_secs_of_day.saturating_sub(60);
@@ -2475,7 +2475,10 @@ pub async fn run_option_chain_1m(
     // fetch/verdict/edge path).
     let mut audit_writer = RestFetchAuditWriter::new(&params.questdb);
     let mut edge = FailureEdge::default();
-    let mut moneyness_latches = MoneynessWarnLatches::default();
+    // Per-underlying not-served tracker + ladder watermarks (2026-07-14)
+    // — same lifetime as the FailureEdge: this run, which is per trading
+    // day; a mid-day supervisor respawn restarts the streaks.
+    let mut health = ChainServingHealth::default();
     let mut last_fired: Option<u32> = None;
     let mut last_request_ms: Vec<Option<i64>> = vec![None; targets.len()];
     let mut spot_rx = params.spot_minute_done.clone();
@@ -2564,7 +2567,7 @@ pub async fn run_option_chain_1m(
             &mut writer,
             &mut audit_writer,
             &mut edge,
-            &mut moneyness_latches,
+            &mut health,
             fire,
         )
         .await;

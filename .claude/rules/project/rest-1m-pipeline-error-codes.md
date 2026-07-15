@@ -718,6 +718,16 @@ could not be discriminated after the fact — from this change forward it
 is, within one minute of occurrence
 (`mcp__tickvault-logs__tail_errors` shows the size + sample directly).
 
+**2026-07-14 — the DHAN chain leg emits this SAME code with the new
+stages** `underlying_not_served` (error, edge — the #1537 Groww mirror,
+Dhan emits field-less), `ladder_shrunk` (warn, edge-latched heuristic),
+`retry_skipped_ceiling` (warn, per refused retry — bounded ≤3/minute),
+`trading_day_flip_exit` (error, one-shot; + the SPOT1M-01 spot twin),
+plus the bounded retry counters
+(`tv_chain1m_retry_total{outcome="recovered"|"still_failed"|"skipped_ceiling"}`)
+— full contract + triage in
+`cross-source-chain-coverage-2026-07-14.md`.
+
 ## §2d. CHAIN-03 — option_chain_1m persist failed
 
 **Severity:** High. **Auto-triage safe:** Yes (best-effort persist; the
