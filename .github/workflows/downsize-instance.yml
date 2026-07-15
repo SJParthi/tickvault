@@ -97,6 +97,9 @@ concurrency:
 permissions:
   id-token: write # OIDC if AWS_ROLE_ARN is set (deploy-aws.yml parity)
   contents: read
+  actions: read # step 1b `gh run list --workflow deploy-aws.yml` — without this
+  # the explicit permissions block zeroes the scope, every poll 403s, and the
+  # in-flight-deploy guard silently degrades to a fixed 45-min stall (round 2).
 
 env:
   REGION: ${{ vars.AWS_REGION || 'ap-south-1' }}
@@ -152,10 +155,19 @@ jobs:
           ACCT_ID: ${{ steps.acct.outputs.id }}
         run: |
           set -uo pipefail
+          # Round-2 CRITICAL fix: GitHub runs steps as `bash -e {0}`, and
+          # `set -uo pipefail` does NOT clear the inherited -e. Every probe
+          # below EXPECTS a non-zero exit (DryRunOperation = 254), so errexit
+          # would abort the step on the FIRST probe's assignment with the
+          # error text swallowed into $OUT. This step manages its own error
+          # handling (explicit exit 1 arms) — disable errexit explicitly.
+          set +e
           FAILED=()
           probe() { # $1=label  $2...=aws cli args (with --dry-run where supported)
             local label="$1"; shift
-            OUT=$("$@" 2>&1); RC=$?
+            local OUT RC
+            # errexit-safe even if -e ever returns: assignment in condition context.
+            if OUT=$("$@" 2>&1); then RC=0; else RC=$?; fi
             if [ $RC -eq 0 ]; then echo "  ok $label (unexpectedly succeeded without --dry-run? check)"; return; fi
             case "$OUT" in
               *DryRunOperation*)        echo "  ok $label — authorized (DryRunOperation)";;
@@ -171,6 +183,9 @@ jobs:
             --query 'Reservations[0].Instances[0].BlockDeviceMappings[0].Ebs.VolumeId' --output text)
           AZ=$(aws ec2 describe-instances --region "$REGION" --instance-ids "$IID" \
             --query 'Reservations[0].Instances[0].Placement.AvailabilityZone' --output text)
+          # With errexit off, a failed read above would otherwise flow garbage into the probes:
+          case "$ROOT_VOL" in vol-*) : ;; *) echo "::error::could not resolve the root volume id (got: ${ROOT_VOL:0:120})"; exit 1;; esac
+          [ -n "${AZ:-}" ] || { echo "::error::could not resolve the availability zone"; exit 1; }
           probe "ec2:CreateSnapshot"          aws ec2 create-snapshot --dry-run --region "$REGION" --volume-id "$ROOT_VOL" --description probe
           probe "ec2:StopInstances"           aws ec2 stop-instances  --dry-run --region "$REGION" --instance-ids "$IID"
           probe "ec2:ModifyInstanceAttribute" aws ec2 modify-instance-attribute --dry-run --region "$REGION" --instance-id "$IID" --instance-type "{\"Value\":\"$TO_TYPE\"}"
@@ -236,13 +251,30 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -uo pipefail
+          # Round-2 fix: a gh failure (e.g. a missing actions:read scope) is a
+          # DISTINCT loud arm — never conflated with "busy" (which used to burn
+          # the full 45 min on every run and left the guard non-functional).
+          # This step runs BEFORE any mutation, so failing here is always safe.
+          GH_ERRS=0
           for i in $(seq 1 45); do
-            BUSY=$(gh run list --repo "${{ github.repository }}" --workflow deploy-aws.yml \
-              --json status --jq '[.[] | select(.status=="in_progress" or .status=="queued")] | length' \
-              2>/dev/null || echo unknown)
-            if [ "$BUSY" = "0" ]; then
-              echo "no deploy-aws run in_progress/queued — proceeding"; exit 0
+            if BUSY=$(gh run list --repo "${{ github.repository }}" --workflow deploy-aws.yml \
+              --json status --jq '[.[] | select(.status=="in_progress" or .status=="queued")] | length' 2>&1); then
+              GH_ERRS=0
+            else
+              GH_ERRS=$((GH_ERRS + 1))
+              echo "::warning::poll $i/45: gh run list FAILED (attempt $GH_ERRS/3): ${BUSY:0:200}"
+              if [ "$GH_ERRS" -ge 3 ]; then
+                echo "::error::gh run list failed 3x in a row — the in-flight-deploy guard CANNOT function (missing actions:read scope? token drift?). Refusing to blind-wait; NOTHING was changed — fix the token scope and re-dispatch."
+                exit 1
+              fi
+              sleep 60; continue
             fi
+            case "$BUSY" in
+              0) echo "no deploy-aws run in_progress/queued — proceeding"; exit 0;;
+              ''|*[!0-9]*)
+                echo "::error::unexpected gh output '$BUSY' — the deploy-idle guard cannot function; refusing to blind-wait. NOTHING was changed."
+                exit 1;;
+            esac
             echo "poll $i/45: deploy-aws runs in_progress/queued = $BUSY — waiting 60s"
             sleep 60
           done
@@ -433,7 +465,9 @@ jobs:
               "chown ec2-user:ec2-user repo/deploy/docker/.env",
               "(cd repo/deploy/docker && timeout 600 docker compose up -d --no-deps tv-questdb)",
               "for i in 1 2 3 4 5 6; do if curl -fsS \"http://127.0.0.1:9000/exec?query=SELECT%201\" >/dev/null 2>&1; then echo QUESTDB-UP; break; fi; sleep 5; if [ $i -eq 6 ]; then echo FATAL: QuestDB not responding after retune; exit 1; fi; done",
-              "docker inspect tv-questdb --format \"MEMLIMIT={{.HostConfig.Memory}}\"",
+              "QDB_LIMIT_BYTES=$(docker inspect tv-questdb --format \"{{.HostConfig.Memory}}\")",
+              "echo MEMLIMIT=$QDB_LIMIT_BYTES",
+              "if [ \"$QDB_LIMIT_BYTES\" != \"1073741824\" ]; then echo FATAL: QuestDB container memory limit is $QDB_LIMIT_BYTES bytes but 1073741824 = 1g was required. The .env upsert or compose recreate did NOT take effect; exit 1; fi",
               "systemctl daemon-reload",
               "systemctl restart tickvault --no-block",
               "READY_OK=no; for i in $(seq 1 60); do if systemctl is-active --quiet tickvault; then READY_OK=yes; break; fi; sleep 5; done",
@@ -462,13 +496,22 @@ jobs:
           STATUS=$(aws ssm get-command-invocation --region "$REGION" \
             --command-id "${{ steps.ssm.outputs.command_id }}" --instance-id "$IID" --query Status --output text)
           echo "===== status: $STATUS ====="
-          aws ssm get-command-invocation --region "$REGION" \
+          BOX_OUT=$(aws ssm get-command-invocation --region "$REGION" \
             --command-id "${{ steps.ssm.outputs.command_id }}" --instance-id "$IID" \
-            --query StandardOutputContent --output text || true
+            --query StandardOutputContent --output text || true)
+          echo "$BOX_OUT"
           aws ssm get-command-invocation --region "$REGION" \
             --command-id "${{ steps.ssm.outputs.command_id }}" --instance-id "$IID" \
             --query StandardErrorContent --output text || true
           [ "$STATUS" = "Success" ] || { echo "::error::on-box retune/restart failed — re-dispatch this workflow (retune-only mode) once the cause is fixed"; exit 1; }
+          # Round-2 fix (Rule-11 false-OK class): the success Telegram claims the
+          # database cap "is now confirmed at 1 GB" — CONFIRM it here, workflow-side,
+          # on top of the on-box assertion (defense in depth against a truncated /
+          # rewritten on-box script silently skipping the check).
+          case "$BOX_OUT" in
+            *MEMLIMIT=1073741824*) echo "QuestDB 1g limit CONFIRMED (MEMLIMIT=1073741824 in the box output)";;
+            *) echo "::error::box output does not carry MEMLIMIT=1073741824 — the QuestDB 1g retune is NOT confirmed; refusing to report success. Re-dispatch this workflow (retune-only mode)."; exit 1;;
+          esac
 
       # ── STEP 9: health verify. deploy-aws.yml has NO /health-over-EIP pattern
       # (the SG does not expose :3001 publicly); the honest verify is the SSM

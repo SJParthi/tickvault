@@ -438,7 +438,7 @@ The new `instrument_lifecycle` orchestrator slots between existing Step 6 (auth)
 - Subscribes the daily universe to derivative contracts **beyond the §36 grant** (OPTIDX/FUTSTK/OPTSTK always; FUTIDX beyond the 4 named underlyings, beyond monthly serials `>= today`, or beyond the `MAX_MONTHLY_EXPIRIES_PER_UNDERLYING` envelope) — otherwise only the UNDERLYING_SECURITY_ID spot rows are subscribed (§36 2026-07-08; §36.7 2026-07-10)
 - DELETES rows from `instrument_lifecycle` (lifecycle_state transitions are the ONLY allowed mutation; no DELETE statements)
 - Changes `effective_main_feed_pool_size` to anything other than 1
-- Modifies instance type from r8g.large without the 4-file update protocol in §7 Mechanical Rule 1
+- Modifies instance type from t4g.medium without the 4-file update protocol in §7 Mechanical Rule 1 (t4g.medium per Quote 8, 2026-07-15 — this row previously guarded r8g.large)
 
 Any such PR MUST be rejected in review even if the operator approves verbally — the operator must update this rule file FIRST with a dated quote, only then can the PR land. This prevents accidental scope creep through casual approvals.
 
@@ -453,7 +453,7 @@ When any PR / commit message / Telegram body invokes "100% guarantee" for the da
 > app boot BLOCKS until fresh CSV in hand — never proceeds with stale, partial, or corrupt data;
 > ≤20-second tick burst absorbed via 100K-tick rescue ring (constant `TICK_BUFFER_CAPACITY`, ratcheted by `zero_tick_loss_alert_guard.rs`);
 > beyond 20s, NDJSON spill → DLQ catches every payload as recoverable text;
-> all 21 timeframes RAM-resident for today + yesterday across the current universe (~250–1000 SIDs; ~3.2 GB working set, ~7.8 GB headroom on the r8g.large 16 GiB host);
+> all 21 timeframes RAM-resident for today + yesterday across the current universe (~770 SIDs, Groww-only runtime; app cap ~1.5 GB per §7 Rule 2, ~0.9–1.4 GB headroom on the t4g.medium 4 GiB host — headroom Assumed until live-measured; wording updated 2026-07-15 per Quote 8, was "~3.2 GB working set, ~7.8 GB headroom on the r8g.large 16 GiB host");
 > `instrument_lifecycle` table is SEBI-compliant — NO DELETEs ever, only state transitions to `expired_*` SYMBOLs preserved in `(security_id, exchange_segment)` composite-key history per I-P1-11;
 > daily lifecycle reconciler captures every appearance, disappearance, rename, segment-move, split — logged to `instrument_lifecycle_audit` forensic chain with 5-year SEBI retention."
 
@@ -959,6 +959,12 @@ boot that produced the snapshot.
   (~7.8 GB headroom). This is a **MEASURED gate** in the persistence/validation
   sub-PR — NOT promised blind. If the measurement exceeds budget, the scope or the
   resident-TF set is revisited with the operator before go-live.
+  **2026-07-15 Quote 8 supersession note:** the host is now **t4g.medium 4 GiB**
+  (§7) — a ~1,000-SID ~3.2 GB working set does NOT fit next to QuestDB@1g + OS on
+  4 GiB. Today's Groww-only ~770-SID runtime is budgeted per §7 Rule 2 with
+  ~0.9–1.4 GB headroom (Assumed until live-measured). Any NTM-scale re-expansion
+  must re-pass the measured RAM gate on the 4 GiB host — or re-size the instance
+  per §7 Mechanical Rule 1 — before go-live.
 - "~750 NTM stocks" is the expected count; the EXACT count comes from the live
   niftyindices.com constituent file at build time (no hard-coded hallucinated number).
 
@@ -1085,7 +1091,9 @@ far-suffix vendor publication lag is an info-level note + counter.
 Bandwidth delta (typical ~12 contracts, vendor-controlled): Dhan ~12 × 50 B Quote × ~4 pkts/s
 ≈ 2.4 KB/s + ~0.15 KB/s code-5 OI packets (<1.5% of the §8 envelope); Groww ~12 LTP subs
 (~779 of the 1000 cap, futures cap-priority); RAM ~12 SIDs × 21 TF cells ≈ 39 MB against
-~7.8 GB r8g.large headroom; universe ≈ 343 inside [100, 1200]; no buffer/channel constant
+the t4g.medium 4 GiB host's ~0.9–1.4 GB headroom (Assumed until live-measured — host
+downsized 2026-07-15 per §7 Quote 8; was ~7.8 GB on r8g.large when this envelope was
+written); universe ≈ 343 inside [100, 1200]; no buffer/channel constant
 changes; no cost impact (no instance/schedule/storage change — §15 step 5 N/A).
 NOT claimed: futures OI capture (`ticks.oi = 0` for ALL future SIDs — code-5 packets still
 counted-and-dropped); prev-day pct coverage for futures (role-keyed exclusion,
