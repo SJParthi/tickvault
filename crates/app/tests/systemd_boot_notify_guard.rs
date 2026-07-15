@@ -14,16 +14,19 @@
 //! restart loop.
 //!
 //! Pins (comment lines are stripped before matching so a doc-comment
-//! mention can never vacuously satisfy a pin):
-//! 1. `infra::notify_systemd_ready();` appears on ALL THREE boot paths —
-//!    ≥3 real code sites, one of them inside the Dhan-OFF arm's
-//!    `if !config.feeds.dhan_enabled` block between the lane gate's
-//!    else-arm and the process run-loop.
+//! mention can never vacuously satisfy a pin). PR-C2 (2026-07-14, Dhan
+//! live-WS lane deletion) collapsed the three boot paths (fast
+//! crash-recovery / slow lane / Dhan-OFF) into ONE — the assertions below
+//! were re-pointed at the single-path reality in the same PR; an earlier
+//! revision of this header still said "ALL THREE boot paths / ≥3 real code
+//! sites" (stale — corrected here):
+//! 1. `infra::notify_systemd_ready();` appears EXACTLY ONCE — the single
+//!    unconditional READY site on the single boot path, between the REST
+//!    stack spawn and the process run-loop.
 //! 2. The PROCESS-GLOBAL `WATCHDOG=1` pinger spawn lives in the SHARED
-//!    boot prefix — in source order BEFORE the fast/slow arm split, BEFORE
-//!    the Dhan lane gate, and BEFORE every READY site — and is NOT gated
-//!    on `config.feeds.dhan_enabled` (no ON-gate exists anywhere above
-//!    it inside `main()`).
+//!    boot prefix — in source order BEFORE the READY site — and is NOT
+//!    gated on `config.feeds.dhan_enabled` (no ON-gate exists anywhere
+//!    above it inside `main()`).
 //! 3. The pinger body really pings (`infra::notify_systemd_watchdog();` on
 //!    a `WATCHDOG_INTERVAL_SECS` interval) — never a stub (Rule 14).
 //! 4. The code cadence honors the unit file: `WATCHDOG_INTERVAL_SECS × 2 ≤
@@ -76,10 +79,15 @@ fn test_comment_stripper_removes_commented_needles() {
 const READY_NEEDLE: &str = "infra::notify_systemd_ready();";
 const PINGER_SPAWN_NEEDLE: &str = "let _process_global_watchdog_pinger = tokio::spawn(";
 
-/// Pin 1 — READY=1 is provably reached on all three boot paths: ≥3 real
-/// code sites, with the Dhan-OFF site positioned inside the Dhan-OFF arm
-/// region (after the lane gate's `DHAN LANE SKIPPED` else-arm, before the
-/// process run-loop) and gated `if !config.feeds.dhan_enabled`.
+/// Pin 1 — READY=1 is provably reached on the boot path.
+/// PR-C2 re-shape (2026-07-13, operator retirement directive —
+/// websocket-connection-scope-lock.md "2026-07-13 Amendment"): the FAST
+/// arm, `start_dhan_lane`, and the Dhan-OFF else-arm (with its
+/// `if !config.feeds.dhan_enabled` gate) all DIED with the lane — main.rs
+/// has a SINGLE boot path with exactly ONE unconditional READY site,
+/// positioned before the process run-loop. The 2026-07-13 deploy-hang
+/// class (Type=notify start job never released) regresses only if that
+/// site disappears or moves after the run-loop.
 #[test]
 fn test_ready_notify_covers_all_boot_paths() {
     let main_src = strip_line_comments(&read("crates/app/src/main.rs"));
@@ -88,53 +96,25 @@ fn test_ready_notify_covers_all_boot_paths() {
         .match_indices(READY_NEEDLE)
         .map(|(pos, _)| pos)
         .collect();
-    assert!(
-        ready_positions.len() >= 3,
-        "expected >= 3 real `{READY_NEEDLE}` sites (FAST arm + start_dhan_lane \
-         + the Dhan-OFF arm); found {} — losing the Dhan-OFF site re-opens the \
-         2026-07-13 deploy hang (Type=notify start job never released, 5 \
-         consecutive prod deploys burned their SSM wait budget)",
+    assert_eq!(
+        ready_positions.len(),
+        1,
+        "expected exactly 1 real `{READY_NEEDLE}` site (the single boot \
+         path since PR-C2); found {} — zero re-opens the 2026-07-13 deploy \
+         hang (systemd `activating` forever); two means a boot-path fork \
+         crept back without updating this guard",
         ready_positions.len()
     );
+    let ready_pos = ready_positions[0];
 
-    // The Dhan-OFF site: between the lane gate's else-arm log and the
-    // process run-loop, inside an `if !config.feeds.dhan_enabled` block.
-    let skipped_pos = main_src
-        .find("DHAN LANE SKIPPED")
-        .expect("the DHAN LANE SKIPPED log must exist in main.rs"); // APPROVED: test
     let runloop_pos = main_src
         .find("run_process_runloop(")
         .expect("run_process_runloop must exist in main.rs"); // APPROVED: test
     assert!(
-        skipped_pos < runloop_pos,
-        "source-order assumption broken: DHAN LANE SKIPPED must precede the \
-         first run_process_runloop call"
-    );
-    let dhan_off_ready = ready_positions
-        .iter()
-        .copied()
-        .find(|&p| p > skipped_pos && p < runloop_pos)
-        .unwrap_or_else(|| {
-            panic!(
-                "no `{READY_NEEDLE}` site between DHAN LANE SKIPPED \
-                 @{skipped_pos} and run_process_runloop @{runloop_pos} — the \
-                 Dhan-OFF boot arm lost its READY=1 (every dhan_enabled=false \
-                 boot leaves systemd `activating` forever; deploy hang class \
-                 2026-07-13)"
-            ) // APPROVED: test
-        });
-    // The site must sit directly under its `if !config.feeds.dhan_enabled {`
-    // gate (READY on the Dhan-ON slow path is owned by start_dhan_lane).
-    let gate_pos = main_src[..dhan_off_ready]
-        .rfind("if !config.feeds.dhan_enabled {")
-        .expect("the Dhan-OFF READY site must be gated on !dhan_enabled"); // APPROVED: test
-    assert!(
-        dhan_off_ready - gate_pos < 200,
-        "the Dhan-OFF READY site must sit directly inside its \
-         `if !config.feeds.dhan_enabled` gate (gate @{gate_pos}, notify \
-         @{dhan_off_ready} — gap {} chars; a drifted gate means the notify \
-         may no longer be on the Dhan-OFF path)",
-        dhan_off_ready - gate_pos
+        ready_pos < runloop_pos,
+        "READY=1 @{ready_pos} must be sent BEFORE the process run-loop \
+         @{runloop_pos} parks — a post-run-loop notify never executes until \
+         shutdown (deploy hang class 2026-07-13)"
     );
 }
 
@@ -159,27 +139,21 @@ fn test_watchdog_pinger_is_shared_prefix_feed_unconditional_and_real() {
     );
     let spawn_pos = spawn_positions[0];
 
-    // Shared prefix: before the fast/slow arm split...
-    let fast_split_pos = main_src
-        .find("fast_cache.filter(|_| is_market_hours && config.feeds.dhan_enabled)")
-        .expect("the FAST-arm gate must exist in main.rs"); // APPROVED: test
-    // ...before the Dhan lane gate...
-    let lane_gate_pos = main_src
-        .find("let dhan_lane: Option<DhanLaneRunHandles> = if config.feeds.dhan_enabled {")
-        .expect("the Dhan lane gate must exist in main.rs"); // APPROVED: test
-    // ...and before EVERY READY site (the watchdog must be armed before any
-    // path can send READY=1 — READY with no pinger = SIGABRT at t+60s).
+    // Shared prefix: before the READY site (the watchdog must be armed
+    // before the boot path can send READY=1 — READY with no pinger =
+    // SIGABRT at t+60s). PR-C2: the FAST-arm split + lane-gate anchors the
+    // original pin ordered against died with the lane; pinger-before-READY
+    // is the surviving load-bearing ordering on the single boot path.
     let first_ready = main_src
         .find(READY_NEEDLE)
-        .expect("notify_systemd_ready sites must exist (Pin 1)"); // APPROVED: test
+        .expect("notify_systemd_ready site must exist (Pin 1)"); // APPROVED: test
     assert!(
-        spawn_pos < fast_split_pos && spawn_pos < lane_gate_pos && spawn_pos < first_ready,
-        "the WATCHDOG=1 pinger spawn must live in the SHARED boot prefix: \
-         spawn @{spawn_pos} must precede the FAST-arm split @{fast_split_pos}, \
-         the lane gate @{lane_gate_pos}, and the first READY site \
-         @{first_ready} — otherwise some boot path sends READY=1 with no \
-         pinger and systemd SIGABRTs the box 60s later (restart loop into \
-         StartLimitBurst hard-fail)"
+        spawn_pos < first_ready,
+        "the WATCHDOG=1 pinger spawn must live in the shared boot prefix: \
+         spawn @{spawn_pos} must precede the READY site @{first_ready} — \
+         otherwise the boot sends READY=1 with no pinger and systemd \
+         SIGABRTs the box 60s later (restart loop into StartLimitBurst \
+         hard-fail)"
     );
 
     // NOT feed-gated: no `if config.feeds.dhan_enabled` (the ON-gate form —

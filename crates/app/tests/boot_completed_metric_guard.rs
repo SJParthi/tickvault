@@ -54,22 +54,20 @@ fn test_emit_boot_completed_helper_exists_and_sets_the_gauge() {
 #[test]
 fn test_boot_completed_is_emitted_on_both_boot_paths() {
     let main_src = read_app("src/main.rs");
-    // The `tv_boot_completed` gauge is now published via the feed-liveness-gated
-    // wrapper `emit_boot_completed_when_feed_live(...)`, called on BOTH boot
-    // completion paths (fast-boot crash-recovery + slow-boot normal). The bare
-    // `emit_boot_completed()` remains the pure gauge-setter, called by the
-    // wrapper (and the no-feed-enabled fast arm). Count the gated wrapper call
-    // sites — there must be one per boot path so neither path can silently skip
-    // the alive signal.
+    // The `tv_boot_completed` gauge is published via the feed-liveness-gated
+    // wrapper `emit_boot_completed_when_feed_live(...)`.
+    // PR-C2 re-shape (2026-07-13, operator retirement directive —
+    // websocket-connection-scope-lock.md "2026-07-13 Amendment"): the fast
+    // crash-recovery boot arm was DELETED with the Dhan live-WS lane, so
+    // main.rs has a SINGLE boot-completion path: exactly 1 definition site
+    // (`async fn emit_boot_completed_when_feed_live(`) + 1 call site.
     let gated_sites = main_src
         .matches("emit_boot_completed_when_feed_live(")
         .count();
-    // 1 definition site (`async fn emit_boot_completed_when_feed_live(`) + 2 call
-    // sites (fast-boot + slow-boot).
     assert!(
-        gated_sites >= 3,
-        "expected `emit_boot_completed_when_feed_live` to appear >= 3 times (1 def + 2 boot-path \
-         calls), found {gated_sites} — every boot-completion path must publish \
+        gated_sites >= 2,
+        "expected `emit_boot_completed_when_feed_live` to appear >= 2 times (1 def + the single \
+         boot-path call), found {gated_sites} — the boot-completion path must publish \
          `{BOOT_COMPLETED_METRIC}` through the feed-liveness gate."
     );
     // The pure gauge-setter must still exist and be the thing the gate calls.
@@ -120,18 +118,15 @@ fn boot_completed_emit_sites_are_gated_on_live_feed() {
          `is_dhan_lane_running()` / `is_groww_lane_running()` — a bare unconditional emit is a \
          regression that re-opens the alerting hole."
     );
-    // Both boot-path emits must go through the gate — no bare `emit_boot_completed();`
-    // statement may remain on the success paths (only the wrapper body calls it).
-    // The bare form appears exactly once, inside the wrapper (and once more in the
-    // no-feed-enabled fast arm of the wrapper). Assert it is never called with a
-    // trailing `.await`-less statement at a boot-completion marker by requiring the
-    // gated wrapper to sit next to both `notify_systemd_ready()` sites.
+    // The boot-path emit must go through the gate — no bare `emit_boot_completed();`
+    // statement may remain on the success path (only the wrapper body calls it).
+    // PR-C2 (2026-07-13): single boot path — 1 def + 1 call.
     let gated_sites = main_src
         .matches("emit_boot_completed_when_feed_live(")
         .count();
     assert!(
-        gated_sites >= 3,
-        "both boot paths must emit via the feed-liveness gate (>= 1 def + 2 calls), found \
+        gated_sites >= 2,
+        "the boot path must emit via the feed-liveness gate (>= 1 def + 1 call), found \
          {gated_sites}."
     );
 }

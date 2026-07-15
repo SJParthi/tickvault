@@ -624,6 +624,32 @@ pub enum NotificationEvent {
         failed_minutes: u32,
     },
 
+    /// Per-underlying not-served detector on the Groww chain leg
+    /// (2026-07-14 — the NIFTY expiry-day vendor-cutoff companion): ONE
+    /// underlying accumulated N consecutive empty/failed minutes in the
+    /// per-minute Groww option-chain pull WHILE the other underlyings
+    /// succeeded in those same minutes — the vendor is not serving THIS
+    /// underlying's chain, not a general outage. Fires ONCE per
+    /// underlying per episode (edge-latched, Rule 4); re-armed only by
+    /// that underlying's own recovery. Severity::High.
+    GrowwChain1mUnderlyingNotServed {
+        /// The affected underlying (a pinned plain symbol, e.g. "NIFTY").
+        underlying: &'static str,
+        /// How many counted minutes in a row this underlying's chain
+        /// went unserved.
+        empty_minutes: u32,
+    },
+
+    /// A previously-not-served underlying's chain is being served again
+    /// (falling edge — one Info ping; the missing minutes stay absent
+    /// until re-pulled, never fabricated).
+    GrowwChain1mUnderlyingServedRecovered {
+        /// The recovered underlying (a pinned plain symbol, e.g. "NIFTY").
+        underlying: &'static str,
+        /// How many counted minutes the underlying's chain went unserved.
+        empty_minutes: u32,
+    },
+
     /// The Groww chain leg could not resolve today's option expiry for one
     /// or more underlyings from the daily instruments list (list download
     /// failed after bounded tries, or the list carried no usable option
@@ -1429,7 +1455,26 @@ pub enum NotificationEvent {
     /// total-outage trailer ("receiving nothing … prices will not flow"),
     /// which would contradict a partial summary with a false
     /// whole-feed-down claim.
-    GrowwSidecarRejected { reason: String, fleet_summary: bool },
+    ///
+    /// `detail` (operator demand 2026-07-14 — the 14:59 IST rejection page
+    /// said only "the feed reported an error" with no WHY): the SANITIZED
+    /// reject-cause signature, rendered into the headline as
+    /// "Groww live feed rejected: {detail} — retrying". CONTRACT: the emit
+    /// site MUST pass ONLY the output of the supervisor's
+    /// `sidecar_line_signature` choke point (control-char + BiDi strip,
+    /// credential/JWT redaction, 160-char cap) — NEVER raw child text. A
+    /// `None` / empty / whitespace detail degrades to the pre-2026-07-14
+    /// generic headline. This field is a conscious, dated override of
+    /// Telegram commandment 2 (no library jargon) for the ONE field whose
+    /// payload IS the machine cause — recorded in
+    /// `.claude/rules/project/feed-stall-watchdog-error-codes.md` §1c.1
+    /// (precedent: the B9 "Build:" short-SHA override). The render boundary
+    /// re-caps + html-escapes it anyway (defense-in-depth).
+    GrowwSidecarRejected {
+        reason: String,
+        fleet_summary: bool,
+        detail: Option<String>,
+    },
 
     /// W2 PR#5 (2026-07-10, audit follow-up row 15): the configured NSE
     /// holiday calendar's coverage horizon is running out (or already ran
@@ -1451,8 +1496,27 @@ pub enum NotificationEvent {
         coverage_end_display: String,
     },
 
-    /// Custom alert from any component.
+    /// Custom alert from any component. `Severity::High` → pages Telegram +
+    /// SNS SMS. Reserve for genuinely operator-actionable conditions; for
+    /// informational status pings use [`Self::CustomStatus`] instead.
     Custom { message: String },
+
+    /// Informational, non-actionable status ping from any component
+    /// (`Severity::Low` — batches into the digest / off-hours coalescer, never
+    /// pages SNS SMS). Introduced 2026-07-10 to stop routine status pings
+    /// ("market closed", "recovered saved prices", "service auto-restarted")
+    /// firing as High + SMS. Not episode-routed (`episode_key() == None`), so
+    /// the episode machinery is untouched.
+    CustomStatus { message: String },
+
+    /// Instant informational status ping (`Severity::Low` → NEVER SMS, but
+    /// `DispatchPolicy::Immediate` → delivered instantly as its own message,
+    /// NOT batched). Introduced 2026-07-10 for operator-notable-but-not-
+    /// actionable events that must be SEEN at once without paging: a mid-market
+    /// crash/restart recovery ("fast start") and the feed enable/disable toggle
+    /// acknowledgements. Like [`Self::CustomStatus`] it is NOT episode-routed
+    /// (`episode_key() == None`).
+    CustomStatusUrgent { message: String },
     // RETIRED 2026-06-12: LastTickAfterBoundary deleted — it was defined but
     // NEVER emitted (0 production sites). The post-close-tick anomaly it
     // describes is ALREADY tracked by the `tv_late_tick_after_boundary_total`
@@ -2089,11 +2153,13 @@ impl NotificationEvent {
             | Self::StaticIpBootCheckRetrying { .. }
             | Self::DualInstanceDetected { .. }
             // ── Dhan-scoped: order path (Dhan is the only broker with
-            //    orders) ──
+            //    orders; RiskHalt joins per cluster-C 2026-07-14 — the
+            //    risk engine halts the Dhan order path) ──
             | Self::OrderRejected { .. }
             | Self::CircuitBreakerOpened { .. }
             | Self::CircuitBreakerClosed
             | Self::RateLimitExhausted { .. }
+            | Self::RiskHalt { .. }
             | Self::OrphanPositionDetected { .. }
             | Self::OrphanPositionsClean => Some(FeedBadge::Dhan.badge()),
             // ── Groww-scoped ──
@@ -2724,6 +2790,45 @@ impl NotificationEvent {
                      again as of {minute_ist} IST, after {failed_minutes} \
                      failed minute(s). The minutes that failed stay blank in \
                      the record until re-pulled — nothing is made up."
+                )
+            }
+            Self::GrowwChain1mUnderlyingNotServed {
+                underlying,
+                empty_minutes,
+            } => {
+                format!(
+                    "\u{1f198} <b>Groww is not returning the option chain \
+                     for {underlying}</b>\n\
+                     For {empty_minutes} minutes in a row the per-minute \
+                     option chain for {underlying} came back empty from \
+                     Groww while the other indices came through fine — the \
+                     other indices are unaffected, so this looks like the \
+                     broker not serving THIS index's chain, not a general \
+                     outage.\n\
+                     Live streaming prices are NOT affected — only Groww's \
+                     per-minute option chain record for {underlying} is \
+                     missing; the same minutes may still be available from \
+                     the Dhan side.\n\
+                     What to do RIGHT NOW:\n\
+                     1. Nothing urgent — the other indices keep recording \
+                     normally.\n\
+                     2. On an expiry day this is usually the broker cutting \
+                     off the expiring chain early — it comes back with the \
+                     next expiry.\n\
+                     3. Missing minutes stay blank — nothing is made up."
+                )
+            }
+            Self::GrowwChain1mUnderlyingServedRecovered {
+                underlying,
+                empty_minutes,
+            } => {
+                format!(
+                    "\u{2705} <b>Groww is serving the option chain for \
+                     {underlying} again</b>\n\
+                     The per-minute option chain for {underlying} is working \
+                     again after {empty_minutes} empty minute(s). The \
+                     minutes that were missed stay blank in the record until \
+                     re-pulled — nothing is made up."
                 )
             }
             Self::GrowwChain1mExpiryUnresolved { detail } => {
@@ -3735,8 +3840,10 @@ impl NotificationEvent {
             Self::CircuitBreakerOpened {
                 consecutive_failures,
             } => {
+                // Cluster-C (2026-07-14): self-heal line appended so the
+                // operator knows no action is needed if a CLOSED follows.
                 format!(
-                    "<b>Circuit breaker OPENED</b>\nConsecutive failures: {consecutive_failures}\nOrder API calls halted"
+                    "<b>Circuit breaker OPENED</b>\nConsecutive failures: {consecutive_failures}\nOrder API calls halted\nThe system retries by itself in about a minute — if a CLOSED message follows, no action needed."
                 )
             }
             Self::CircuitBreakerClosed => {
@@ -3746,7 +3853,14 @@ impl NotificationEvent {
                 format!("<b>Rate limit EXHAUSTED</b>\nLimit: {limit_type}")
             }
             Self::RiskHalt { reason } => {
-                format!("<b>RISK HALT</b>\nTrading stopped: {}", html_escape(reason))
+                // Cluster-C (2026-07-14): APPEND-style action lines
+                // (Telegram commandment 7 — Critical needs "what to do
+                // RIGHT NOW"); the leading "RISK HALT" literal is kept so
+                // the 4 pinning contains()-tests survive.
+                format!(
+                    "<b>RISK HALT</b>\nTrading stopped: {}\nAll new orders are blocked.\nWhat you need to do RIGHT NOW:\n1. Open the broker app and check open positions.\n2. Decide: exit positions now, or accept no trading for the rest of the day.\n3. Trading stays blocked until the daily reset or a restart.",
+                    html_escape(reason)
+                )
             }
             Self::WebSocketReconnectionExhausted {
                 connection_index,
@@ -3797,12 +3911,37 @@ impl NotificationEvent {
             Self::GrowwSidecarRejected {
                 reason,
                 fleet_summary,
+                detail,
             } => {
+                // Defensive render-boundary cap (chars) on `detail` —
+                // mirrors the supervisor's SIDECAR_LINE_SIGNATURE_MAX_CHARS
+                // (core sits BELOW the app crate, so the value is mirrored,
+                // not imported). The emit-site contract already caps; this
+                // is defense-in-depth so a future emit site can never flood
+                // a Telegram headline.
+                const GROWW_REJECT_DETAIL_MAX_CHARS: usize = 160;
                 // `reason` is a fixed per-class &'static str (or the fleet
                 // coalescer's counted summary) mapped to String by the
                 // supervisor (never raw child text), but html_escape it
                 // anyway for defense-in-depth, consistent with every String arm.
                 let reason = html_escape(reason);
+                // 2026-07-14 operator demand (the 14:59 IST page carried no
+                // WHY): when the SANITIZED reject-cause signature is present
+                // the headline names it — "rejected: <cause> — retrying".
+                // Truncate BEFORE html_escape so an escape entity is never
+                // cut mid-sequence; empty/whitespace degrades to the exact
+                // pre-2026-07-14 generic headline (never a hollow
+                // "rejected:  — retrying"). Dated commandment-2 override:
+                // feed-stall-watchdog-error-codes.md §1c.1.
+                let title = match detail.as_deref().map(str::trim).filter(|d| !d.is_empty()) {
+                    Some(d) => {
+                        let capped: String =
+                            d.chars().take(GROWW_REJECT_DETAIL_MAX_CHARS).collect();
+                        let capped = html_escape(&capped);
+                        format!("🆘 <b>Groww live feed rejected: {capped} — retrying</b>")
+                    }
+                    None => "🆘 <b>Groww live feed rejected</b>".to_string(),
+                };
                 if *fleet_summary {
                     // Fleet-coalesced partial summary (hostile-review fix
                     // 2026-07-06): the trailer must NOT claim the whole feed
@@ -3810,13 +3949,13 @@ impl NotificationEvent {
                     // reported a problem, and nothing positive is claimed
                     // about the rest.
                     format!(
-                        "🆘 <b>Groww live feed rejected</b>\n{reason}\n\nThe affected \
+                        "{title}\n{reason}\n\nThe affected \
                          connections keep retrying automatically. Prices from those \
                          connections will not flow until they recover."
                     )
                 } else {
                     format!(
-                        "🆘 <b>Groww live feed rejected</b>\n{reason}\n\nThe Groww feed is \
+                        "{title}\n{reason}\n\nThe Groww feed is \
                          connected but receiving nothing. Until this is fixed, Groww \
                          prices will not flow."
                     )
@@ -3861,6 +4000,8 @@ impl NotificationEvent {
                 )
             }
             Self::Custom { message } => message.clone(),
+            Self::CustomStatus { message } => message.clone(),
+            Self::CustomStatusUrgent { message } => message.clone(),
         }
     }
 
@@ -3905,6 +4046,10 @@ impl NotificationEvent {
             Self::Spot1mSidServedRecovered { .. } => "Spot1mSidServedRecovered",
             Self::GrowwChain1mFetchDegraded { .. } => "GrowwChain1mFetchDegraded",
             Self::GrowwChain1mFetchRecovered { .. } => "GrowwChain1mFetchRecovered",
+            Self::GrowwChain1mUnderlyingNotServed { .. } => "GrowwChain1mUnderlyingNotServed",
+            Self::GrowwChain1mUnderlyingServedRecovered { .. } => {
+                "GrowwChain1mUnderlyingServedRecovered"
+            }
             Self::GrowwChain1mExpiryUnresolved { .. } => "GrowwChain1mExpiryUnresolved",
             Self::GrowwChain1mProbeVerdict { .. } => "GrowwChain1mProbeVerdict",
             Self::GrowwContract1mFetchDegraded { .. } => "GrowwContract1mFetchDegraded",
@@ -3972,6 +4117,8 @@ impl NotificationEvent {
             Self::GrowwSidecarRejected { .. } => "GrowwSidecarRejected",
             Self::HolidayCalendarCoverageLow { .. } => "HolidayCalendarCoverageLow",
             Self::Custom { .. } => "Custom",
+            Self::CustomStatus { .. } => "CustomStatus",
+            Self::CustomStatusUrgent { .. } => "CustomStatusUrgent",
         }
     }
 
@@ -3979,9 +4126,12 @@ impl NotificationEvent {
     /// this event folds into.
     ///
     /// `Some` ONLY for the WS lifecycle families that produce the observed
-    /// 40-message disconnect storms; EVERY other variant returns `None` so
-    /// the legacy dispatch path stays byte-identical. Zero-alloc (`Copy`
-    /// match) — DHAT-pinned on the dispatch bypass arm by
+    /// 40-message disconnect storms, the boot-milestone set, and (2026-07-14
+    /// operator noise directive) the Groww runtime incident family
+    /// (`GrowwSidecarRejected` + the Groww `FeedDown`/`FeedRecovered` arms);
+    /// EVERY other variant returns `None` so the legacy dispatch path stays
+    /// byte-identical. Zero-alloc (`Copy` match) — DHAT-pinned on the
+    /// dispatch bypass arm by
     /// `crates/core/tests/dhat_telegram_dispatcher.rs`.
     #[must_use]
     pub fn episode_key(&self) -> Option<super::episode::EpisodeKey> {
@@ -4026,6 +4176,59 @@ impl NotificationEvent {
                 if feed.eq_ignore_ascii_case("groww") {
                     Some(super::episode::BOOT_EPISODE_KEY)
                 } else {
+                    None
+                }
+            }
+            // Groww runtime incident family (2026-07-14 operator noise
+            // directive): the persistent reject storm folds into ONE
+            // live-edited bubble — first page still pages (+ SMS at ≥High);
+            // recurrences become in-place edits. Distinct from the boot
+            // pings above: FeedDown/FeedRecovered are RUNTIME incidents,
+            // never boot milestones. Zero-alloc str compare — the DHAT
+            // bypass-arm pin holds.
+            Self::GrowwSidecarRejected { .. } => Some(EpisodeKey {
+                family: EpisodeFamily::GrowwFeed,
+                conn: 0,
+            }),
+            Self::FeedDown {
+                feed,
+                operator_initiated,
+                ..
+            } => {
+                // FIX-A (hostile review 2026-07-14): a DELIBERATE feeds-page
+                // disable is NEVER episode-routed — the bubble's "retrying
+                // automatically" edit would falsely claim a disabled feed
+                // retries (the 2026-07-06 FeedDown honesty split); the
+                // legacy lane carries the honest "stays OFF until
+                // re-enabled" body.
+                // FIX-D: only a PAGING (≥ High, i.e. in-market) FeedDown
+                // opens/folds the incident bubble; the off-hours Low flavor
+                // keeps its pre-existing legacy 60s-coalescer path.
+                if !*operator_initiated
+                    && self.severity() >= Severity::High
+                    && feed.eq_ignore_ascii_case("groww")
+                {
+                    Some(EpisodeKey {
+                        family: EpisodeFamily::GrowwFeed,
+                        conn: 0,
+                    })
+                } else {
+                    // Non-Groww feeds also keep the legacy immediate lane.
+                    None
+                }
+            }
+            Self::FeedRecovered { feed, .. } => {
+                // Recovery stays episode-routed (Resolve). With no open
+                // episode (e.g. the Down was Low/off-hours and never
+                // opened a bubble) the FSM returns SendLegacy — the
+                // legacy_passthrough arm delivers it, never a drop.
+                if feed.eq_ignore_ascii_case("groww") {
+                    Some(EpisodeKey {
+                        family: EpisodeFamily::GrowwFeed,
+                        conn: 0,
+                    })
+                } else {
+                    // A future feed #3 keeps the legacy immediate lane.
                     None
                 }
             }
@@ -4100,9 +4303,11 @@ impl NotificationEvent {
     pub fn episode_role(&self) -> super::episode::EpisodeRole {
         use super::episode::EpisodeRole;
         match self {
-            Self::WebSocketReconnected { .. } | Self::OrderUpdateReconnected { .. } => {
-                EpisodeRole::Resolve
-            }
+            // FeedRecovered is the Groww episode's recovery edge (2026-07-14
+            // noise fold); role is consulted only when episode_key() is Some.
+            Self::WebSocketReconnected { .. }
+            | Self::OrderUpdateReconnected { .. }
+            | Self::FeedRecovered { .. } => EpisodeRole::Resolve,
             _ => EpisodeRole::Open,
         }
     }
@@ -4130,6 +4335,12 @@ impl NotificationEvent {
             Self::WebSocketDisconnected { .. } => Severity::High,
             Self::WebSocketDisconnectedOffHours { .. } => Severity::Low,
             Self::Custom { .. } => Severity::High,
+            // Informational status ping — Low so it batches (digest / 60s
+            // coalesce) and never fires SNS SMS (gate is `>= High`).
+            Self::CustomStatus { .. } => Severity::Low,
+            // Instant status ping — Low (never SMS); `dispatch_policy()` forces
+            // Immediate so it ships at once instead of batching.
+            Self::CustomStatusUrgent { .. } => Severity::Low,
             Self::RiskHalt { .. } => Severity::Critical,
             Self::WebSocketReconnectionExhausted { .. } => Severity::Critical,
             Self::CircuitBreakerOpened { .. } => Severity::High,
@@ -4213,6 +4424,8 @@ impl NotificationEvent {
             Self::Spot1mSidServedRecovered { .. } => Severity::Info,
             Self::GrowwChain1mFetchDegraded { .. } => Severity::High,
             Self::GrowwChain1mFetchRecovered { .. } => Severity::Info,
+            Self::GrowwChain1mUnderlyingNotServed { .. } => Severity::High,
+            Self::GrowwChain1mUnderlyingServedRecovered { .. } => Severity::Info,
             // One page per day when an underlying's chain recording could
             // not start (never a guessed expiry) — actionable, not fatal.
             Self::GrowwChain1mExpiryUnresolved { .. } => Severity::High,
@@ -4430,6 +4643,10 @@ impl NotificationEvent {
             Self::MarketOpenReadinessConfirmation { .. }
             | Self::MarketOpenStreamingConfirmation { .. }
             | Self::SelfTestPassed { .. } => DispatchPolicy::Immediate,
+            // Instant informational status ping (Low severity → never SMS, but
+            // ships immediately as its own message, not batched): a mid-market
+            // crash/restart recovery + the feed on/off toggle acknowledgements.
+            Self::CustomStatusUrgent { .. } => DispatchPolicy::Immediate,
             _ => DispatchPolicy::Default,
         }
     }
@@ -5025,6 +5242,7 @@ mod tests {
         let event = NotificationEvent::GrowwSidecarRejected {
             reason: "account lacks live market-data feed entitlement".to_string(),
             fleet_summary: false,
+            detail: None,
         };
         let msg = event.to_message();
         // The plain-English reason reaches the operator…
@@ -5055,6 +5273,7 @@ mod tests {
                      no reject reported from the other 33 connections"
                 .to_string(),
             fleet_summary: true,
+            detail: None,
         };
         let msg = event.to_message();
         assert!(
@@ -5081,6 +5300,7 @@ mod tests {
         let single = NotificationEvent::GrowwSidecarRejected {
             reason: "access token stale".to_string(),
             fleet_summary: false,
+            detail: None,
         };
         assert!(single.to_message().contains("receiving nothing"));
     }
@@ -5093,12 +5313,108 @@ mod tests {
         let event = NotificationEvent::GrowwSidecarRejected {
             reason: "<script>".to_string(),
             fleet_summary: false,
+            detail: None,
         };
         let msg = event.to_message();
         assert!(!msg.contains("<script>"), "raw HTML not escaped: {msg}");
         assert!(
             msg.contains("&lt;script&gt;"),
             "expected escaped form: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_groww_sidecar_rejected_detail_renders_reason_and_retrying() {
+        // 2026-07-14 operator demand (the 14:59 IST page carried no WHY):
+        // when the SANITIZED reject-cause signature is present, the headline
+        // names it verbatim — "live feed rejected: <cause> — retrying" — and
+        // the class's plain-English explanation line is KEPT beneath it.
+        // The detail legitimately carries SDK/NATS wording (`growwapi`,
+        // `nats:`) per the dated commandment-2 override recorded in
+        // feed-stall-watchdog-error-codes.md §1c.1 — so the no-jargon pin in
+        // test_groww_sidecar_rejected_renders_reason_and_topic_and_severity
+        // applies only to the detail-less form.
+        let event = NotificationEvent::GrowwSidecarRejected {
+            reason: "the feed reported an error and is retrying".to_string(),
+            fleet_summary: false,
+            detail: Some(
+                "ERROR growwapi.groww.nats_client: Error: nats: unexpected EOF".to_string(),
+            ),
+        };
+        let msg = event.to_message();
+        assert!(
+            msg.contains(
+                "Groww live feed rejected: ERROR growwapi.groww.nats_client: \
+                 Error: nats: unexpected EOF — retrying"
+            ),
+            "headline must name the sanitized cause + retrying: {msg}"
+        );
+        // The existing class explanation stays as the body line.
+        assert!(
+            msg.contains("the feed reported an error and is retrying"),
+            "class explanation must be kept: {msg}"
+        );
+        // The single-conn total-outage trailer is unchanged.
+        assert!(msg.contains("receiving nothing"), "trailer lost: {msg}");
+        // Badge ordering untouched (PR #1529 owns the badge arms).
+        assert!(
+            msg.starts_with("🟢 GROWW — "),
+            "badge ordering broke: {msg}"
+        );
+        assert_eq!(event.severity(), Severity::High);
+    }
+
+    #[test]
+    fn test_groww_sidecar_rejected_empty_detail_degrades_to_generic() {
+        // An empty / whitespace / None detail must render the EXACT generic
+        // pre-2026-07-14 headline — never a hollow "rejected:  — retrying".
+        let expected = NotificationEvent::GrowwSidecarRejected {
+            reason: "the feed reported an error and is retrying".to_string(),
+            fleet_summary: false,
+            detail: None,
+        }
+        .to_message();
+        assert!(
+            expected.contains("Groww live feed rejected</b>"),
+            "generic headline missing: {expected}"
+        );
+        for hollow in [Some(String::new()), Some("   ".to_string())] {
+            let msg = NotificationEvent::GrowwSidecarRejected {
+                reason: "the feed reported an error and is retrying".to_string(),
+                fleet_summary: false,
+                detail: hollow,
+            }
+            .to_message();
+            assert_eq!(msg, expected, "empty detail must degrade to generic");
+            assert!(
+                !msg.contains("rejected:"),
+                "hollow 'rejected:' headline leaked: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_groww_sidecar_rejected_detail_html_escaped_and_recapped() {
+        // Defense-in-depth at the render boundary: the emit-site contract
+        // already sanitizes + caps, but a hostile/oversized detail from any
+        // future emit site is re-capped to 160 chars (BEFORE escaping, so an
+        // entity is never cut mid-sequence) and html-escaped.
+        let event = NotificationEvent::GrowwSidecarRejected {
+            reason: "the feed reported an error and is retrying".to_string(),
+            fleet_summary: false,
+            detail: Some(format!("<script>{}", "x".repeat(400))),
+        };
+        let msg = event.to_message();
+        assert!(!msg.contains("<script>"), "raw HTML not escaped: {msg}");
+        assert!(
+            msg.contains("rejected: &lt;script&gt;"),
+            "escaped detail missing from headline: {msg}"
+        );
+        // 160-char cap: the raw detail is 408 chars; after the cap the
+        // headline's x-run is 160 - "<script>".len() = 152 chars long.
+        assert!(
+            msg.contains(&"x".repeat(152)) && !msg.contains(&"x".repeat(153)),
+            "detail must be re-capped to 160 chars at the render boundary: {msg}"
         );
     }
 
@@ -5731,6 +6047,125 @@ mod tests {
         assert_eq!(event.severity(), Severity::High);
     }
 
+    // -- CustomStatus (2026-07-10 Telegram noise cut, F2) --
+
+    #[test]
+    fn test_custom_status_severity_is_low() {
+        // Informational status pings must be Low so they batch and never SMS.
+        let event = NotificationEvent::CustomStatus {
+            message: "status".to_string(),
+        };
+        assert_eq!(event.severity(), Severity::Low);
+        // Below the SNS-SMS threshold (`service.rs` gates SMS on `>= High`).
+        assert!(event.severity() < Severity::High);
+    }
+
+    #[test]
+    fn test_custom_status_message_passthrough() {
+        let event = NotificationEvent::CustomStatus {
+            message: "status payload".to_string(),
+        };
+        assert_eq!(event.to_message(), "status payload");
+    }
+
+    #[test]
+    fn test_custom_status_topic_is_distinct_from_custom() {
+        let status = NotificationEvent::CustomStatus {
+            message: "x".to_string(),
+        };
+        let custom = NotificationEvent::Custom {
+            message: "x".to_string(),
+        };
+        assert_eq!(status.topic(), "CustomStatus");
+        assert_eq!(custom.topic(), "Custom");
+        assert_ne!(status.topic(), custom.topic());
+    }
+
+    #[test]
+    fn test_custom_status_episode_key_is_none() {
+        // Not episode-routed — the episode machinery stays untouched (F1 deferred).
+        let event = NotificationEvent::CustomStatus {
+            message: "x".to_string(),
+        };
+        assert!(event.episode_key().is_none());
+    }
+
+    #[test]
+    fn test_low_custom_status_never_immediate_or_sms() {
+        use crate::notification::coalescer::{DispatchLane, classify_dispatch};
+        let event = NotificationEvent::CustomStatus {
+            message: "x".to_string(),
+        };
+        // Feed the event's OWN severity() + dispatch_policy() into the real
+        // classifier — so reverting `CustomStatus.severity()` back to High
+        // makes THIS test fail end-to-end (the Immediate lane resolves and the
+        // SMS assertion breaks), not just the sibling severity pin.
+        let severity = event.severity();
+        let policy = event.dispatch_policy();
+        // In-market → Digest, off-hours → Coalesce60. Never Immediate — the
+        // only SMS-carrying lane for a non-episode event. This is the direct
+        // "noise is cut" assertion.
+        let in_market = classify_dispatch(
+            severity,
+            policy,
+            event.episode_key().map(|_| event.episode_role()),
+            true,
+        );
+        let off_hours = classify_dispatch(
+            severity,
+            policy,
+            event.episode_key().map(|_| event.episode_role()),
+            false,
+        );
+        assert_eq!(in_market, DispatchLane::Digest);
+        assert_eq!(off_hours, DispatchLane::Coalesce60);
+        assert_ne!(in_market, DispatchLane::Immediate);
+        assert_ne!(off_hours, DispatchLane::Immediate);
+        // The SMS gate (`service.rs`) is `severity >= High`; Low is below it.
+        assert!(
+            severity < Severity::High,
+            "CustomStatus must be below the SMS threshold"
+        );
+    }
+
+    // -- CustomStatusUrgent (2026-07-10, FIX-5): instant but NEVER SMS --
+
+    #[test]
+    fn test_custom_status_urgent_is_immediate_and_low() {
+        use crate::notification::coalescer::{DispatchLane, classify_dispatch};
+        let event = NotificationEvent::CustomStatusUrgent {
+            message: "x".to_string(),
+        };
+        let severity = event.severity();
+        let policy = event.dispatch_policy();
+        // Instant: ships as its own message regardless of market phase.
+        assert_eq!(policy, DispatchPolicy::Immediate);
+        assert_eq!(
+            classify_dispatch(severity, policy, None, true),
+            DispatchLane::Immediate,
+        );
+        assert_eq!(
+            classify_dispatch(severity, policy, None, false),
+            DispatchLane::Immediate,
+        );
+        // But NEVER SMS: severity is Low, strictly below the `>= High` gate.
+        assert_eq!(severity, Severity::Low);
+        assert!(
+            severity < Severity::High,
+            "CustomStatusUrgent must be instant but below the SMS threshold"
+        );
+    }
+
+    #[test]
+    fn test_custom_status_urgent_episode_key_is_none_and_topic_distinct() {
+        let event = NotificationEvent::CustomStatusUrgent {
+            message: "payload".to_string(),
+        };
+        assert!(event.episode_key().is_none());
+        assert_eq!(event.topic(), "CustomStatusUrgent");
+        assert_eq!(event.to_message(), "payload");
+    }
+
     #[test]
     fn test_startup_complete_is_info() {
         let event = NotificationEvent::StartupComplete {
@@ -6019,6 +6454,9 @@ mod tests {
         let msg = event.to_message();
         assert!(msg.contains("OPENED"));
         assert!(msg.contains("halted"));
+        // Cluster-C (2026-07-14): the self-heal line — a lone OPENED page
+        // must tell the operator the system retries on its own.
+        assert!(msg.contains("retries by itself"));
         assert_eq!(event.severity(), Severity::High);
     }
 
@@ -6030,7 +6468,49 @@ mod tests {
         let msg = event.to_message();
         assert!(msg.contains("RISK HALT"));
         assert!(msg.contains("daily_loss_breach"));
+        // Cluster-C (2026-07-14): Critical bodies carry action lines
+        // (Telegram commandment 7).
+        assert!(msg.contains("What you need to do RIGHT NOW"));
+        assert!(msg.contains("All new orders are blocked"));
         assert_eq!(event.severity(), Severity::Critical);
+    }
+
+    /// Cluster-C (2026-07-14): the 5 OMS/risk events are Dhan-badged —
+    /// orders are Dhan-only today, so their pages must carry the same
+    /// feed badge as the order-update WS lifecycle events.
+    #[test]
+    fn test_oms_risk_events_are_dhan_badged() {
+        let events = [
+            NotificationEvent::OrderRejected {
+                correlation_id: "X".to_string(),
+                reason: "bad".to_string(),
+            },
+            NotificationEvent::CircuitBreakerOpened {
+                consecutive_failures: 3,
+            },
+            NotificationEvent::CircuitBreakerClosed,
+            NotificationEvent::RateLimitExhausted {
+                limit_type: "per_second".to_string(),
+            },
+            NotificationEvent::RiskHalt {
+                reason: "x".to_string(),
+            },
+        ];
+        for event in events {
+            let badge = event
+                .feed_badge()
+                .unwrap_or_else(|| panic!("{} must be feed-badged", event.topic()));
+            assert!(
+                badge.contains("DHAN"),
+                "{} must carry the Dhan badge, got {badge}",
+                event.topic()
+            );
+            assert!(
+                event.to_message().starts_with(badge),
+                "{} message must start with the badge",
+                event.topic()
+            );
+        }
     }
 
     #[test]
@@ -7489,6 +7969,7 @@ mod tests {
         let sidecar = NotificationEvent::GrowwSidecarRejected {
             reason: "access token stale".to_string(),
             fleet_summary: false,
+            detail: None,
         };
         assert_eq!(sidecar.feed_badge(), Some("🟢 GROWW"));
         assert!(
@@ -8229,6 +8710,51 @@ mod tests {
         assert!(msg.contains("recovered"), "got: {msg}");
         assert!(msg.contains("10:45 AM IST"), "got: {msg}");
         assert!(msg.contains("4 failed"), "got: {msg}");
+        // No false-OK: recovery never claims the missing minutes came back.
+        assert!(msg.contains("nothing is made up"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_groww_chain_1m_underlying_not_served_is_high_names_the_underlying() {
+        let event = NotificationEvent::GrowwChain1mUnderlyingNotServed {
+            underlying: "NIFTY",
+            empty_minutes: 10,
+        };
+        assert_eq!(event.topic(), "GrowwChain1mUnderlyingNotServed");
+        assert_eq!(event.severity(), Severity::High);
+        let msg = event.to_message();
+        // The operator-mandated plain-English core wording.
+        assert!(
+            msg.contains("not returning the option chain for NIFTY"),
+            "got: {msg}"
+        );
+        assert!(msg.contains("other indices are unaffected"), "got: {msg}");
+        assert!(msg.contains("10 minutes in a row"), "got: {msg}");
+        assert!(msg.contains("What to do RIGHT NOW"), "got: {msg}");
+        // Honest scope lines: the live WS pipeline is untouched, and the
+        // Dhan-side availability is stated as MAY (no false-OK — Dhan's
+        // chain leg has its own independent state).
+        assert!(msg.contains("NOT affected"), "got: {msg}");
+        assert!(
+            msg.contains("may still be available from the Dhan side"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_groww_chain_1m_underlying_served_recovered_is_info_positive_ping() {
+        let event = NotificationEvent::GrowwChain1mUnderlyingServedRecovered {
+            underlying: "NIFTY",
+            empty_minutes: 12,
+        };
+        assert_eq!(event.topic(), "GrowwChain1mUnderlyingServedRecovered");
+        assert_eq!(event.severity(), Severity::Info);
+        let msg = event.to_message();
+        assert!(
+            msg.contains("serving the option chain for NIFTY again"),
+            "got: {msg}"
+        );
+        assert!(msg.contains("12 empty"), "got: {msg}");
         // No false-OK: recovery never claims the missing minutes came back.
         assert!(msg.contains("nothing is made up"), "got: {msg}");
     }
