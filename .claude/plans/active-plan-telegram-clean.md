@@ -134,13 +134,38 @@ escalation demanded suppressing unmeasured lines on the phone. Resolution
 shipped in this PR (rule files are NOT editable here): the card renders a
 compact per-LEG pulls segment per feed line ("pulls spot 735/735, chain
 733/735") on measured legs only, and the honest not-measured signal moves
-to the day's LOGS — `build_rest_leg_score_lines` emits one `info!` per
-unmeasured canonical pair ("rest-leg digest: <feed>/<leg> not measured").
-The §2b always-render contract is therefore satisfied in logs, not on the
-card, PENDING the rule-file supersession the operator must land with a
-dated quote. Code comments at `events.rs::render_pulls_per_leg` and
-`feed_scoreboard_boot.rs::build_rest_leg_score_lines` cross-reference this
-entry.
+to the day's LOGS — `feed_scoreboard_boot::log_rest_leg_measurement_gaps`
+(re-homed to the AGGREGATION path by G6, fix round 2, so it fires even on
+telegram-disabled boots) emits one `info!` per unmeasured canonical pair
+("rest-leg digest: <feed>/<leg> not measured") and one per latency-only
+pair (counts missing, latency measured — the spot_1m_rest fallback arm,
+which now renders count-less on the card instead of vanishing). The §2b
+always-render contract is therefore satisfied in logs, not on the card,
+PENDING the rule-file supersession the operator must land with a dated
+quote. Code comments at `events.rs::render_pulls_per_leg` and
+`feed_scoreboard_boot.rs::unmeasured_canonical_rest_pairs` cross-reference
+this entry.
+
+**Rule-contract tension #2, recorded deliberately (G7, fix round 2
+2026-07-15):** `dual-feed-scoreboard-error-codes.md` §2b +
+`rest-1m-pipeline-error-codes.md` §3 mandate a per-(feed, leg)
+p50/p99/max seconds-after-close delay digest on the SAME card (the
+operator's verbatim Quote 2). The rewritten card folds that to ONE
+compact p99 figure per leg inside the pulls segment
+("pulls spot 735/735 (1.8s), chain 733/735 (2.1s)") — the full
+p50/p99/max digest stays in the day's stored records/gauges, PENDING the
+rule-file supersession the operator must land with a dated quote. Code
+comment at `events.rs::render_pulls_per_leg`.
+
+**Rule-contract tension #3, recorded deliberately (G4c, fix round 2
+2026-07-15):** `tf-consistency-error-codes.md` §3's delivery contract
+reads "the typed TfConsistencySummary Telegram (ONE per run — Info only
+when clean WITH coverage or pure no-data)". This branch suppresses the
+scheduled/catch-up `no_data` Telegram to ONE `warn!` log line (forced
+runs still always notify per F4) — PENDING the rule-file supersession the
+operator must land with a dated quote. Code comment at the suppression
+arm in `tf_consistency_boot.rs`. The coordinator should sequence the
+merge with that rule edit in view.
 
 ## Plan Items
 
@@ -202,13 +227,116 @@ entry.
         .claude/plans/active-plan-telegram-clean.md (Failure Modes)
       — Tests: existing marker suite (behavioral no-op; comment + log change)
 
+### Fix round 2 (2026-07-15, review-round-2 confirmed — G1–G11)
+
+- [x] G1 — DhanRest/GrowwRest Down bubbles NEVER stale-expire (emitters are
+      once-per-episode edge-latched; only Resolve closes them)
+      — Files: crates/core/src/notification/episode.rs,
+        crates/core/tests/episode_rest_family_wiring_guard.rs
+      — Tests: test_down_stale_expiry_exempt_family_predicate,
+        test_tick_never_stale_expires_rest_family_down_bubbles,
+        guard_rest_families_are_down_stale_expiry_exempt
+- [x] G2 — per-slot naming on every REST-family render (slot_desc +
+      slot_or_feed_desc; green close names WHICH pull recovered)
+      — Files: crates/core/src/notification/episode.rs,
+        crates/core/tests/episode_rest_family_wiring_guard.rs
+      — Tests: test_rest_renders_name_the_slot,
+        guard_rest_slot_descs_match_the_routing_slot_table
+- [x] G3 — compact date on the scorecard header + TF pass one-liner
+      — Files: crates/core/src/notification/events.rs,
+        crates/core/tests/telegram_body_format_guard.rs,
+        crates/core/tests/event_formatting_coverage.rs
+      — Tests: test_render_compact_date_ist_shapes,
+        guard_daily_cards_carry_the_compact_date
+- [x] G4 — NoData honesty: (a) marker on PASS only; (b) trading-day no_data
+      suppression line is warn!; (c) §3 rule-tension recorded (Observability
+      tension #3 + code comment at the suppression arm)
+      — Files: crates/app/src/tf_consistency_boot.rs,
+        crates/app/src/daily_task_marker.rs (docs),
+        crates/app/tests/tf_consistency_wiring_guard.rs
+      — Tests: wiring-guard needles (pass-only marker + no_data-disjunct
+        negative pin), existing marker + notify suites
+- [x] G5 — shutdown quiet arms narrowed to explicit IST windows
+      (16:25–16:45 weekday stop-cron window any day; 08:25–09:00
+      holiday-gate window on non-trading days only; Muhurat evening /
+      manual weekend kills stay Medium)
+      — Files: crates/app/src/shutdown_class.rs
+      — Tests: test_classify_shutdown_holiday_gate_self_stop_window_only,
+        test_classify_shutdown_nontrading_day_arbitrary_hour_stays_loud,
+        test_classify_shutdown_weekday_holiday_stop_cron_window_is_scheduled,
+        test_classify_shutdown_holiday_gate_window_consts_are_0825_and_0900_ist
+- [x] G6 — latency-only fallback pairs are MEASURED (predicate fix +
+      count-less card segment + logging re-homed to the aggregation path)
+      — Files: crates/app/src/feed_scoreboard_boot.rs,
+        crates/core/src/notification/events.rs
+      — Tests: test_latency_only_pair_is_measured_not_unmeasured,
+        test_dual_feed_scorecard_latency_only_leg_renders_countless
+- [x] G7 — per-leg p99 seconds-after-close folded into the pulls segment
+      (Quote-2 latency answer restored; tension #2 recorded)
+      — Files: crates/core/src/notification/events.rs
+      — Tests: test_dual_feed_scorecard_pulls_carry_p99_latency
+- [x] G8 — rest_legs_read_failed renders "pulls: records unreadable ⚠️"
+      on the feed lines (incl. the feed-off line)
+      — Files: crates/core/src/notification/events.rs
+      — Tests: test_dual_feed_scorecard_read_failed_renders_unreadable_token
+- [x] G9 — merge-risk mitigation vs claude/groww-live-off-rest-only:
+      (a) false "trivial union" doc replaced by MERGE-NOTEs at both
+      should_notify_summary collision sites; (b) Groww live-WS variant
+      constructions isolated in one delimited MERGE-NOTE block in
+      episode_runtime_family_wiring_guard.rs; (c) the Merge coordination
+      section below
+      — Files: crates/app/src/tf_consistency_boot.rs,
+        crates/core/tests/episode_runtime_family_wiring_guard.rs,
+        .claude/plans/active-plan-telegram-clean.md
+      — Tests: behavioral no-op (comments + helper extraction; existing
+        guard suites green)
+- [x] G10 — EpisodeFamily::DhanRest/GrowwRest doc comments synced to the
+      REAL post-F1 slot table
+      — Files: crates/core/src/notification/episode.rs
+      — Tests: guard_rest_slot_descs_match_the_routing_slot_table (the
+        lockstep pin)
+- [x] G11 — daily_marker_path wired into the RunCatchUp skip info!
+      (exact honored marker path in the operator hint)
+      — Files: crates/app/src/tf_consistency_boot.rs,
+        crates/app/tests/tf_consistency_wiring_guard.rs
+      — Tests: wiring-guard needle "daily_marker_path("
+
+## Merge coordination (G9c — REQUIRED READING for the coordinator)
+
+Two in-flight branches collide; **THIS branch (claude/telegram-clean-noise)
+should land FIRST**, then `claude/groww-live-off-rest-only` rebases over it.
+
+Collision sites + resolution rules (whoever lands second):
+
+1. `crates/app/src/tf_consistency_boot.rs::should_notify_summary` — this
+   branch ships the 2-arg forced-aware `pub fn should_notify_summary(
+   status_label, forced_run)`; groww-live-off ships a 1-arg `pub(crate)`
+   version. RESOLUTION: keep the 2-arg version — forced runs ALWAYS notify
+   (the F4 Rule-11 fix; resolving toward the 1-arg version silently loses
+   it with no test failing on the surviving side).
+2. The SAME file's `Ok(Ok(Some(...)))` notify arm — this branch tuples the
+   JoinHandle payload as `(TfConsistencySummaryData, bool)` (the forced
+   flag rides the tuple); groww-live-off keeps the un-tupled arm.
+   RESOLUTION: keep the tupled shape.
+3. `crates/core/src/notification/events.rs` episode_key region +
+   `crates/core/tests/episode_runtime_family_wiring_guard.rs` —
+   groww-live-off DELETES GrowwSidecarRejected / FeedDown / FeedRecovered;
+   this branch's guard constructs them ONLY inside the delimited
+   MERGE-NOTE block at the top of that guard file. RESOLUTION: delete that
+   block + its caller tests with the variants; keep the DhanRest/GrowwRest
+   REST-family pins (surviving variants only).
+4. Semantic (no textual conflict): groww-live-off's TRAP-B rationale
+   ("every trading day legitimately reads no_data") collides with this
+   branch's S2 marker gating + G4a pass-only marker — reconcile against
+   G4a: no_data NEVER seals the daily marker.
+
 ## Scenarios
 
 | # | Scenario | Expected |
 |---|----------|----------|
 | 1 | Restart at 16:10 after a delivered 15:40 PASS | RunCatchUp skipped (marker), one info! line, no Telegram |
 | 2 | Restart at 16:10 after a 15:40 MISMATCH day | Re-run + re-page (marker never written on FAIL class) |
-| 3 | no_data TF day | log-only, no Telegram; marker written |
+| 3 | no_data TF day (scheduled/catch-up) | warn!-log-only on a trading day, no Telegram; marker NOT written (G4a) — a same-day restart re-runs |
 | 4 | EventBridge 16:30 SIGTERM on AWS weekday | ScheduledStop, Low, one line |
 | 5 | SIGTERM on AWS at 11:00 on a trading day | ExternalStop, Medium, loud |
 | 6 | Ctrl+C anywhere | OperatorStop, Low |

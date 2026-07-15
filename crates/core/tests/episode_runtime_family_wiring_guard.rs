@@ -24,10 +24,30 @@ use tickvault_core::notification::episode::{
 };
 use tickvault_core::notification::events::{NotificationEvent, Severity};
 
+// ===========================================================================
+// MERGE-NOTE (G9b, fix round 2 — DELETE THIS BLOCK with the Groww live-WS
+// variants): the in-flight `claude/groww-live-off-rest-only` branch DELETES
+// `GrowwSidecarRejected` / `FeedDown` / `FeedRecovered` from events.rs
+// (its 149-file sweep). EVERY construction of those variants in this guard
+// lives in the helper fns of THIS delimited block (plus one fleet-summary
+// flavor, `groww_reject_fleet`) — when that branch lands, delete this block
+// and the tests that call these helpers, keeping the DhanRest/GrowwRest
+// REST-family pins (which construct only surviving variants). Landing
+// order + resolution rules: the plan file's "Merge coordination" section.
+// ===========================================================================
+
 fn groww_reject() -> NotificationEvent {
     NotificationEvent::GrowwSidecarRejected {
         reason: "authentication rejected".to_string(),
         fleet_summary: false,
+        detail: None,
+    }
+}
+
+fn groww_reject_fleet() -> NotificationEvent {
+    NotificationEvent::GrowwSidecarRejected {
+        reason: "3 of 10 connections rejected".to_string(),
+        fleet_summary: true,
         detail: None,
     }
 }
@@ -56,6 +76,8 @@ fn feed_recovered(feed: &str) -> NotificationEvent {
         down_secs: 120,
     }
 }
+
+// ==================== end MERGE-NOTE delimited block ======================
 
 // (a) The Groww runtime incident events are episode-routed with the
 //     Open/Open/Resolve role table.
@@ -94,11 +116,7 @@ fn guard_groww_runtime_events_are_episode_routed() {
         Some(EpisodeFamily::GrowwFeed)
     );
     // The fleet-summary flavor folds into the SAME bubble.
-    let fleet = NotificationEvent::GrowwSidecarRejected {
-        reason: "3 of 10 connections rejected".to_string(),
-        fleet_summary: true,
-        detail: None,
-    };
+    let fleet = groww_reject_fleet();
     assert_eq!(
         fleet.episode_key().map(|k| k.family),
         Some(EpisodeFamily::GrowwFeed)
@@ -236,25 +254,12 @@ fn guard_no_critical_event_maps_to_any_feed_family() {
     // Criticals stay legacy forever (episode_rest_family_wiring_guard.rs).
     let routed = [
         (groww_reject(), EpisodeFamily::GrowwFeed),
-        (
-            NotificationEvent::GrowwSidecarRejected {
-                reason: "3 of 10 connections rejected".to_string(),
-                fleet_summary: true,
-                detail: None,
-            },
-            EpisodeFamily::GrowwFeed,
-        ),
+        (groww_reject_fleet(), EpisodeFamily::GrowwFeed),
         (
             feed_down_full("Groww", true, false),
             EpisodeFamily::GrowwFeed,
         ),
-        (
-            NotificationEvent::FeedRecovered {
-                feed: "Groww".to_string(),
-                down_secs: 120,
-            },
-            EpisodeFamily::GrowwFeed,
-        ),
+        (feed_recovered("Groww"), EpisodeFamily::GrowwFeed),
         (
             NotificationEvent::Spot1mFetchDegraded {
                 consecutive_failed_minutes: 3,
