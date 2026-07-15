@@ -900,6 +900,31 @@ pub enum ErrorCode {
     /// 2026-07-14 default (no CloudWatch filter). Severity::Medium,
     /// auto-triage-safe.
     FeedGap01EpisodeDegraded,
+
+    // -----------------------------------------------------------------------
+    // 🔷 DHAN exit-order execution layer (Cluster B, 2026-07-14).
+    // Default-off behind FOUR independent locks (config default-off, no
+    // reachable live path, hardcoded dry_run, build-failing ratchet guard).
+    // Both codes are LOG-SINK-ONLY (no error_code_alerts map entry, no
+    // paging-list edit — the 2026-07-14 Dhan noise lock posture).
+    // See dhan-exit-order-lockout-2026-07-14.md.
+    // -----------------------------------------------------------------------
+    /// EXIT-ORDER-01: an exit engine call degraded — a validation refusal
+    /// on a dispatched command, a Dhan API error on a super/forever/sliced
+    /// order, an ENTRY_LEG cancel refused post-fill (the naked-position
+    /// race U4 — never exercised), or a slicing response anomaly.
+    /// Severity::High, auto-triage-safe (the dispatched command already
+    /// refused/degraded loudly; the operator inspects the correlation-id
+    /// forensic log line).
+    ExitOrder01ExecutionDegraded,
+    /// EXIT-VERIFY-01: the MPP verify ladder exhausted with a degraded
+    /// verdict — `PendingAtLimit` (MARKET→LIMIT auto-conversion resting on
+    /// the book past the deadline — orders.md rule 18; NEVER assumed
+    /// filled), a partial fill at budget (`needs_reconciliation` set — the
+    /// remainder is never silently forgotten), or an `Unknown` unparsable
+    /// status (fail-closed). Severity::High, auto-triage-safe (the order
+    /// stays tracked; reconcile + the caller's policy own the follow-up).
+    ExitVerify01Degraded,
 }
 
 impl ErrorCode {
@@ -1077,6 +1102,8 @@ impl ErrorCode {
             Self::TfVerify02RunDegraded => "TF-VERIFY-02",
             // Feed gap-episode forensics (Groww hardening PR-3, 2026-07-14)
             Self::FeedGap01EpisodeDegraded => "FEED-GAP-01",
+            Self::ExitOrder01ExecutionDegraded => "EXIT-ORDER-01",
+            Self::ExitVerify01Degraded => "EXIT-VERIFY-01",
         }
     }
 
@@ -1233,6 +1260,13 @@ impl ErrorCode {
             // run could not vouch for it); never a halt — the live candle
             // pipeline is untouched and reruns are DEDUP-idempotent.
             Self::TfVerify01MismatchFound | Self::TfVerify02RunDegraded => Severity::High,
+            // EXIT-ORDER-01 / EXIT-VERIFY-01 (Cluster B, 2026-07-14) — the
+            // exit-order layer degraded / the MPP verify ladder exhausted
+            // without a clean fill. High: operator eyes on every occurrence
+            // (an unverified exit is open exposure); never a halt — the
+            // order stays tracked and reconcile owns the follow-up. Both
+            // LOG-SINK-ONLY (no pager entry — 2026-07-14 Dhan noise lock).
+            Self::ExitOrder01ExecutionDegraded | Self::ExitVerify01Degraded => Severity::High,
             // Medium: data pipeline correctness
             // PR #6b (2026-05-19): I-P0-01/02/04/05 retired with their modules.
             Self::InstrumentP1CrossSegmentCollision
@@ -1508,6 +1542,10 @@ impl ErrorCode {
             Self::FeedGap01EpisodeDegraded => {
                 ".claude/rules/project/feed-gap-error-codes.md"
             }
+            // 🔷 DHAN exit-order execution layer (Cluster B, 2026-07-14)
+            Self::ExitOrder01ExecutionDegraded | Self::ExitVerify01Degraded => {
+                ".claude/rules/project/dhan-exit-order-lockout-2026-07-14.md"
+            }
         }
     }
 
@@ -1716,6 +1754,9 @@ impl ErrorCode {
             Self::TfVerify02RunDegraded,
             // Feed gap-episode forensics (Groww hardening PR-3, 2026-07-14)
             Self::FeedGap01EpisodeDegraded,
+            // 🔷 DHAN exit-order execution layer (Cluster B, 2026-07-14)
+            Self::ExitOrder01ExecutionDegraded,
+            Self::ExitVerify01Degraded,
         ]
     }
 }
@@ -2081,16 +2122,24 @@ mod tests {
         // client/query/truncation/flush/budget stage taxonomy) => 148.
         // 2026-07-14 (Groww hardening PR-3): FEED-GAP-01 (gap-episode
         // forensics degraded — annotation-only side record) => 149.
+        // 2026-07-14 (🔷 DHAN exit-order layer, Cluster B WP1): bumped
+        // 149 -> 151 for EXIT-ORDER-01 (exit engine call degraded —
+        // validation refusal / Dhan API error / post-fill ENTRY_LEG cancel
+        // refused / slicing anomaly) + EXIT-VERIFY-01 (MPP verify ladder
+        // exhausted with PendingAtLimit / partial-at-budget / Unknown —
+        // fail-closed, never assumed filled). Both log-sink-only.
         // 2026-07-15 (C4 sweep — Dhan live-WS retirement, operator
-        // 2026-07-13): DROPPED 149 -> 127. The 22 zero-emit-site variants
+        // 2026-07-13): DROPPED 151 -> 129. The 22 zero-emit-site variants
         // retained through Phases A/B/C1/C2/C3 were deleted:
         // INSTR-FETCH-01..04, NTM-CONSTITUENCY-01, PREVDAY-01,
         // CROSS-VERIFY-1M-01/-02, DHAN-LANE-01..04, WS-GAP-05..09,
         // AUTH-GAP-06, REST-CANARY-01, SLO-01/02/03 (WS-GAP-04 +
         // WS-GAP-10 survive — emitted by the retained-dormant
         // order_update_connection.rs; main's FEED-GAP-01 landed
-        // mid-flight, hence 149 -> 127, not 148 -> 126).
-        assert_eq!(ErrorCode::all().len(), 127);
+        // mid-flight making the pre-merge base 149, and the exit-order
+        // pair #1566 landed during the merge train making it 151 —
+        // hence 151 -> 129, not 148 -> 126).
+        assert_eq!(ErrorCode::all().len(), 129);
     }
 
     #[test]
@@ -2231,6 +2280,44 @@ mod tests {
     // with its PrevDay01CoverageEmpty variant (Dhan live-WS retirement).
 
     #[test]
+    fn test_exit_order_codes_contract() {
+        // 🔷 DHAN exit-order execution layer (Cluster B, 2026-07-14).
+        let e1 = ErrorCode::ExitOrder01ExecutionDegraded;
+        assert_eq!(e1.code_str(), "EXIT-ORDER-01");
+        assert_eq!("EXIT-ORDER-01".parse::<ErrorCode>(), Ok(e1));
+        assert_eq!(e1.severity(), Severity::High);
+        // The refusal/degrade already happened loudly; the operator
+        // inspects the correlation-id forensic line — auto-triage may look.
+        assert!(e1.is_auto_triage_safe());
+
+        let e2 = ErrorCode::ExitVerify01Degraded;
+        assert_eq!(e2.code_str(), "EXIT-VERIFY-01");
+        assert_eq!("EXIT-VERIFY-01".parse::<ErrorCode>(), Ok(e2));
+        assert_eq!(e2.severity(), Severity::High);
+        assert!(e2.is_auto_triage_safe());
+
+        for code in [e1, e2] {
+            assert!(ErrorCode::all().contains(&code));
+            assert_eq!(
+                code.runbook_path(),
+                ".claude/rules/project/dhan-exit-order-lockout-2026-07-14.md"
+            );
+            // The lockout rule file must exist on disk (cross-ref test 14).
+            let abs = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .and_then(std::path::Path::parent)
+                .map(|root| root.join(code.runbook_path()))
+                .unwrap_or_default();
+            let shown = abs.display().to_string();
+            assert!(
+                abs.exists(),
+                "{} runbook missing on disk: {shown}",
+                code.code_str()
+            );
+        }
+    }
+
+    #[test]
     fn test_ws_reinject_01_aborted_contract() {
         let code = ErrorCode::WsReinject01Aborted;
         // Wire-format string + roundtrip via FromStr.
@@ -2352,7 +2439,10 @@ mod tests {
                 || s.starts_with("TF-VERIFY-")
                 // Groww hardening PR-3 (2026-07-14): feed gap-episode
                 // forensics.
-                || s.starts_with("FEED-GAP-");
+                || s.starts_with("FEED-GAP-")
+                // 🔷 DHAN exit-order execution layer (Cluster B, 2026-07-14)
+                || s.starts_with("EXIT-ORDER-")
+                || s.starts_with("EXIT-VERIFY-");
             assert!(has_known_prefix, "unexpected code prefix: {s}");
         }
     }
