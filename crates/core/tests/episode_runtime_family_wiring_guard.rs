@@ -7,43 +7,16 @@
 //! keep only spot 1m and option chain for both brokers") — those variants
 //! and their `EpisodeFamily::GrowwFeed` routing arms are deleted.
 //!
-//! What SURVIVES and stays pinned here:
-//! (a) the Groww BOOT pings (`FeedAuthOk` / `FeedInstrumentsLoaded`) still
-//!     fold into the Boot bubble (the boot family), and
-//! (b) the retained `EpisodeFamily::GrowwFeed` family (renderer +
-//!     historical snapshots still name it) keeps the default episode
-//!     config, so any future re-wire inherits unchanged behavior.
+//! What SURVIVES and stays pinned here: the retained
+//! `EpisodeFamily::GrowwFeed` family (renderer + historical snapshots still
+//! name it) keeps the default episode config, so any future re-wire inherits
+//! unchanged behavior. (The Groww boot pings `FeedAuthOk` /
+//! `FeedInstrumentsLoaded` were deleted 2026-07-15 fix-round-1b —
+//! constructor-less since the rider replaced the activation lane.)
 
-use tickvault_core::notification::episode::{
-    BOOT_EPISODE_KEY, EpisodeConfig, EpisodeFamily, episode_config_for,
-};
-use tickvault_core::notification::events::NotificationEvent;
+use tickvault_core::notification::episode::{EpisodeConfig, EpisodeFamily, episode_config_for};
 
-// (a) The Groww boot pings still map to the Boot family.
-#[test]
-fn guard_groww_boot_pings_unchanged() {
-    for event in [
-        NotificationEvent::FeedAuthOk {
-            feed: "Groww".to_string(),
-        },
-        NotificationEvent::FeedInstrumentsLoaded {
-            feed: "Groww".to_string(),
-            subscribed: 768,
-            indices: 2,
-            stocks: 766,
-            skipped: 0,
-        },
-    ] {
-        assert_eq!(
-            event.episode_key(),
-            Some(BOOT_EPISODE_KEY),
-            "{} must keep folding into the boot bubble",
-            event.topic()
-        );
-    }
-}
-
-// (b) The retained GrowwFeed family runs the default episode config.
+// The retained GrowwFeed family runs the default episode config.
 #[test]
 fn guard_groww_family_uses_default_episode_config() {
     let cfg = episode_config_for(EpisodeFamily::GrowwFeed);

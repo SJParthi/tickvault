@@ -1124,38 +1124,6 @@ pub enum NotificationEvent {
         underlying_count: usize,
     },
 
-    /// A market-data feed finished loading + resolving its instrument set
-    /// (operator directive 2026-07-03 — Telegram feed parity: "whatever we
-    /// have provided for dhan the same should be provided for groww also …
-    /// instruments load message"). Mirrors `InstrumentBuildSuccess` (the
-    /// Dhan universe-build ping) for every OTHER feed: fired once when a
-    /// feed's watch-set resolves at boot/activation. Severity::Info.
-    FeedInstrumentsLoaded {
-        /// Feed display name (e.g. "Groww").
-        feed: String,
-        /// Instruments actually subscribed by this feed today.
-        subscribed: usize,
-        /// Index instruments inside `subscribed`.
-        indices: usize,
-        /// Stock instruments inside `subscribed`.
-        stocks: usize,
-        /// Instruments that could not be matched/resolved today (skipped —
-        /// logged by name in the app log, counted here for the operator).
-        skipped: usize,
-    },
-
-    /// A market-data feed's access token was read and accepted at
-    /// boot/activation (operator directive 2026-07-04 — Groww boot-visibility
-    /// parity: "i need the same view display everything even for groww").
-    /// Mirrors Dhan's `AuthenticationSuccess` ("Auth OK") ping for every
-    /// OTHER feed. Fired once per activation (once per boot when the feed is
-    /// enabled at boot; again after a genuine disable → re-enable).
-    /// Severity::Low, immediate dispatch (boot milestone).
-    FeedAuthOk {
-        /// Feed display name (e.g. "Groww").
-        feed: String,
-    },
-
     /// Instrument build failed — includes manual trigger URL for retry.
     InstrumentBuildFailed {
         /// Error description.
@@ -2107,11 +2075,6 @@ impl NotificationEvent {
             | Self::GrowwContract1mFetchDegraded { .. }
             | Self::GrowwContract1mFetchRecovered { .. }
             | Self::GrowwContract1mBookUnresolved { .. } => Some(FeedBadge::Groww.badge()),
-            // ── Feed-generic: badge follows the `feed` field ──
-            Self::FeedAuthOk { feed }
-            | Self::FeedInstrumentsLoaded { feed, .. } => {
-                feed_badge_for_name(feed).map(|b| b.badge())
-            }
             // ── WS sleep/wake: badge follows the `feed` field, falling
             //    back to Dhan — the live values are "main"/"order_update"
             //    (both Dhan WebSocket types); a future feed value like
@@ -3440,39 +3403,6 @@ impl NotificationEvent {
                     "<b>Instruments OK</b>\nSource: {source}\nDerivatives: {derivative_count}\nUnderlyings: {underlying_count}"
                 )
             }
-            Self::FeedInstrumentsLoaded {
-                feed,
-                subscribed,
-                indices,
-                stocks,
-                skipped,
-            } => {
-                // Operator-charter §G wording: plain English, provider name
-                // only, real numbers, one glance = "the second feed loaded
-                // its instruments and subscribed them".
-                let skipped_line = if *skipped > 0 {
-                    format!("\nSkipped {skipped} that could not be matched today")
-                } else {
-                    "\nEvery instrument matched".to_string()
-                };
-                format!(
-                    "<b>✅ {feed_name} instruments loaded</b>\n\
-                     Subscribed {sub} instruments ({indices} indices + {stocks} stocks)\
-                     {skipped_line}",
-                    feed_name = html_escape(feed),
-                    sub = format_with_commas(*subscribed),
-                )
-            }
-            Self::FeedAuthOk { feed } => {
-                // Groww boot-visibility parity (operator 2026-07-04): the
-                // exact mirror of Dhan's "Auth OK" boot ping — access token
-                // in hand, feed can connect. Plain English, provider name
-                // only (charter §D).
-                format!(
-                    "✅ <b>{feed_name} Auth OK</b> — access token in hand, feed can connect",
-                    feed_name = html_escape(feed),
-                )
-            }
             Self::InstrumentBuildFailed {
                 reason,
                 manual_trigger_url,
@@ -3929,8 +3859,6 @@ impl NotificationEvent {
             Self::ShutdownInitiated => "ShutdownInitiated",
             Self::ShutdownComplete => "ShutdownComplete",
             Self::InstrumentBuildSuccess { .. } => "InstrumentBuildSuccess",
-            Self::FeedInstrumentsLoaded { .. } => "FeedInstrumentsLoaded",
-            Self::FeedAuthOk { .. } => "FeedAuthOk",
             Self::InstrumentBuildFailed { .. } => "InstrumentBuildFailed",
             Self::IpVerificationFailed { .. } => "IpVerificationFailed",
             Self::IpVerificationSuccess { .. } => "IpVerificationSuccess",
@@ -4012,16 +3940,6 @@ impl NotificationEvent {
             | Self::OrderUpdateAuthenticated
             | Self::BootHealthCheck { .. }
             | Self::StartupComplete { .. } => Some(super::episode::BOOT_EPISODE_KEY),
-            // Feed-generic boot pings fold ONLY for the Groww feed (str
-            // compare — zero-alloc; the DHAT pin holds). Any other feed
-            // name keeps the legacy immediate lane.
-            Self::FeedAuthOk { feed } | Self::FeedInstrumentsLoaded { feed, .. } => {
-                if feed.eq_ignore_ascii_case("groww") {
-                    Some(super::episode::BOOT_EPISODE_KEY)
-                } else {
-                    None
-                }
-            }
             // The Groww runtime incident family (GrowwSidecarRejected +
             // FeedDown/FeedRecovered, 2026-07-14 noise directive) was
             // RETIRED 2026-07-15 with the Groww live feed — those variants
@@ -4074,14 +3992,6 @@ impl NotificationEvent {
             Self::OrderUpdateConnected => Some(BootMilestone::OrderUpdateConnected),
             Self::OrderUpdateAuthenticated => Some(BootMilestone::OrderUpdateAuthenticated),
             Self::StartupComplete { mode, .. } => Some(BootMilestone::Complete { mode }),
-            Self::FeedAuthOk { feed } if feed.eq_ignore_ascii_case("groww") => {
-                Some(BootMilestone::GrowwAuth)
-            }
-            Self::FeedInstrumentsLoaded {
-                feed, subscribed, ..
-            } if feed.eq_ignore_ascii_case("groww") => Some(BootMilestone::GrowwInstruments {
-                subscribed: clamp_u32(*subscribed),
-            }),
             _ => None,
         }
     }
@@ -4318,15 +4228,6 @@ impl NotificationEvent {
             // 2026-05-09 complaint resolved.
             Self::AuthenticationSuccess => Severity::Low,
             Self::InstrumentBuildSuccess { .. } => Severity::Low,
-            // 2026-07-03 feed parity: once-per-activation positive ping that
-            // a non-Dhan feed loaded + subscribed its instruments. Info so
-            // it never pages — a purely positive signal, like the EOD digest.
-            Self::FeedInstrumentsLoaded { .. } => Severity::Info,
-            // 2026-07-04 Groww boot-visibility parity: green ✅ boot-stage
-            // pings, exact mirrors of `AuthenticationSuccess` (Low) and the
-            // Dhan connect signals — never page, ship immediately via
-            // `dispatch_policy()`.
-            Self::FeedAuthOk { .. } => Severity::Low,
             Self::BootHealthCheck { .. } => Severity::Low,
             Self::OrphanPositionDetected { .. } => Severity::Critical,
             Self::OrphanPositionsClean => Severity::Info,
@@ -4369,14 +4270,6 @@ impl NotificationEvent {
             // batch 3); OrderUpdateConnected is the surviving WS ping.
             Self::AuthenticationSuccess
             | Self::InstrumentBuildSuccess { .. }
-            // 2026-07-03 feed parity: the Groww (any-feed) instruments-load
-            // ping is a boot-success milestone — ship instantly like the
-            // Dhan `InstrumentBuildSuccess` it mirrors, never coalesced.
-            | Self::FeedInstrumentsLoaded { .. }
-            // 2026-07-04 Groww boot-visibility parity: the per-feed Auth OK
-            // ping is a boot-success milestone — ship instantly (Low would
-            // otherwise coalesce 60s and break the boot-Telegram ordering).
-            | Self::FeedAuthOk { .. }
             | Self::WebSocketPoolOnline { .. }
             | Self::WebSocketPoolDeferredOffHours { .. }
             // PR #5 (2026-05-19): Phase2Complete retired.
@@ -4585,16 +4478,6 @@ mod tests {
                 chain_1m_enabled: true,
                 chain_1m_underlyings: 3,
             },
-            NotificationEvent::FeedAuthOk {
-                feed: "Groww".to_string(),
-            },
-            NotificationEvent::FeedInstrumentsLoaded {
-                feed: "Groww".to_string(),
-                subscribed: 768,
-                indices: 2,
-                stocks: 766,
-                skipped: 0,
-            },
         ]
     }
 
@@ -4618,27 +4501,6 @@ mod tests {
                 "boot-mapped variant must carry a milestone: {}",
                 event.topic()
             );
-        }
-    }
-
-    #[test]
-    fn test_episode_key_non_groww_feed_is_none() {
-        // A future feed #3 (or a renamed feed) keeps the legacy lane —
-        // never a wrong fold into the boot bubble.
-        for event in [
-            NotificationEvent::FeedAuthOk {
-                feed: "SomeOtherFeed".to_string(),
-            },
-            NotificationEvent::FeedInstrumentsLoaded {
-                feed: "SomeOtherFeed".to_string(),
-                subscribed: 10,
-                indices: 1,
-                stocks: 9,
-                skipped: 0,
-            },
-        ] {
-            assert!(event.episode_key().is_none(), "{}", event.topic());
-            assert!(event.boot_milestone().is_none(), "{}", event.topic());
         }
     }
 
@@ -4716,24 +4578,6 @@ mod tests {
             }
             .boot_milestone(),
             Some(BootMilestone::Complete { mode: "sandbox" })
-        );
-        assert_eq!(
-            NotificationEvent::FeedAuthOk {
-                feed: "Groww".to_string()
-            }
-            .boot_milestone(),
-            Some(M::GrowwAuth)
-        );
-        assert_eq!(
-            NotificationEvent::FeedInstrumentsLoaded {
-                feed: "Groww".to_string(),
-                subscribed: 768,
-                indices: 2,
-                stocks: 766,
-                skipped: 0,
-            }
-            .boot_milestone(),
-            Some(M::GrowwInstruments { subscribed: 768 })
         );
         // Non-boot events carry no milestone.
         assert!(NotificationEvent::TokenRenewed.boot_milestone().is_none());
@@ -7172,7 +7016,7 @@ mod tests {
 
     // -----------------------------------------------------------------------
     // Feed-agnostic Telegram parity (operator directive 2026-07-03):
-    // FeedStatusLine block + FeedInstrumentsLoaded
+    // FeedStatusLine block (FeedInstrumentsLoaded deleted 2026-07-15)
     // -----------------------------------------------------------------------
 
     fn feed_lines() -> Vec<FeedStatusLine> {
@@ -7265,64 +7109,10 @@ mod tests {
         assert!(msg.contains("Groww: 768 instruments"), "got: {msg}");
     }
 
-    #[test]
-    fn test_feed_instruments_loaded_message_and_severity() {
-        let ev = NotificationEvent::FeedInstrumentsLoaded {
-            feed: "Groww".to_string(),
-            subscribed: 768,
-            indices: 2,
-            stocks: 766,
-            skipped: 5,
-        };
-        assert_eq!(ev.topic(), "FeedInstrumentsLoaded");
-        assert_eq!(ev.severity(), Severity::Info);
-        // Boot-success milestone — must ship instantly like the Dhan
-        // instruments ping it mirrors, never coalesced 60s.
-        assert_eq!(ev.dispatch_policy(), DispatchPolicy::Immediate);
-        let msg = ev.to_message();
-        assert!(msg.contains("Groww instruments loaded"), "got: {msg}");
-        assert!(
-            msg.contains("Subscribed 768 instruments (2 indices + 766 stocks)"),
-            "got: {msg}"
-        );
-        assert!(
-            msg.contains("Skipped 5 that could not be matched today"),
-            "got: {msg}"
-        );
-    }
-
-    #[test]
-    fn test_feed_instruments_loaded_skipped_zero_wording() {
-        let ev = NotificationEvent::FeedInstrumentsLoaded {
-            feed: "Groww".to_string(),
-            subscribed: 770,
-            indices: 2,
-            stocks: 768,
-            skipped: 0,
-        };
-        let msg = ev.to_message();
-        assert!(msg.contains("Every instrument matched"), "got: {msg}");
-        assert!(!msg.contains("Skipped"), "got: {msg}");
-    }
-
     // -----------------------------------------------------------------------
-    // Groww boot-visibility parity (operator directive 2026-07-04):
-    // FeedAuthOk + FeedConnectedAwaitingTicks + feed-aware off-hours boot
+    // Groww boot-visibility parity pings (FeedAuthOk / FeedConnectedAwaitingTicks)
+    // deleted 2026-07-15 with the Groww live feed.
     // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_feed_auth_ok_message_topic_severity() {
-        let ev = NotificationEvent::FeedAuthOk {
-            feed: "Groww".to_string(),
-        };
-        assert_eq!(ev.topic(), "FeedAuthOk");
-        assert_eq!(ev.severity(), Severity::Low);
-        // Boot milestone — ships instantly like Dhan's AuthenticationSuccess.
-        assert_eq!(ev.dispatch_policy(), DispatchPolicy::Immediate);
-        let msg = ev.to_message();
-        assert!(msg.contains("Groww Auth OK"), "got: {msg}");
-        assert!(msg.contains("access token in hand"), "got: {msg}");
-    }
 
     // -----------------------------------------------------------------------
     // Per-feed visual identity (operator directive 2026-07-05: "dhan and
@@ -7353,49 +7143,6 @@ mod tests {
                 "Dhan-scoped body must lead with the Dhan badge: {msg}"
             );
         }
-    }
-
-    #[test]
-    fn test_groww_feed_events_carry_groww_badge_in_message() {
-        let auth = NotificationEvent::FeedAuthOk {
-            feed: "Groww".to_string(),
-        };
-        let msg = auth.to_message();
-        assert!(
-            msg.starts_with("🟢 GROWW — "),
-            "Groww feed events must lead with the Groww badge: {msg}"
-        );
-    }
-
-    #[test]
-    fn test_dynamic_feed_events_badge_follows_feed_field() {
-        // The generic Feed* events resolve their badge from the `feed`
-        // field — Dhan-tagged renders Dhan, Groww-tagged renders Groww, an
-        // unknown future feed renders UN-badged (honest, never wrong).
-        let dhan = NotificationEvent::FeedInstrumentsLoaded {
-            feed: "Dhan".to_string(),
-            subscribed: 243,
-            indices: 25,
-            stocks: 218,
-            skipped: 0,
-        };
-        assert_eq!(dhan.feed_badge(), Some("🔷 DHAN"));
-        let groww = NotificationEvent::FeedInstrumentsLoaded {
-            feed: "Groww".to_string(),
-            subscribed: 768,
-            indices: 2,
-            stocks: 766,
-            skipped: 0,
-        };
-        assert_eq!(groww.feed_badge(), Some("🟢 GROWW"));
-        let unknown = NotificationEvent::FeedAuthOk {
-            feed: "SomeFutureFeed".to_string(),
-        };
-        assert_eq!(unknown.feed_badge(), None);
-        assert!(
-            !unknown.to_message().contains("DHAN") && !unknown.to_message().contains("GROWW"),
-            "unknown feed must render un-badged"
-        );
     }
 
     #[test]

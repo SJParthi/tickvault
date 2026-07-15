@@ -313,11 +313,6 @@ pub struct FeedHealthRow {
 pub struct FeedsHealthResponse {
     pub market_open: bool,
     pub feeds: Vec<FeedHealthRow>,
-    /// §34 PR-3 (Item 12): the Groww auto-scale panel (ladder state + one
-    /// health row per connection). `null` / absent when scale mode is off or
-    /// the ladder has not published yet.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub groww_scale: Option<crate::feed_state::GrowwScaleSnapshot>,
 }
 
 /// Current IST epoch nanos (Utc::now + IST offset) for last-tick-age math.
@@ -395,11 +390,7 @@ pub async fn get_feeds_health(State(state): State<SharedAppState>) -> Json<Feeds
         })
         .collect();
 
-    Json(FeedsHealthResponse {
-        market_open,
-        feeds,
-        groww_scale: runtime.groww_scale_snapshot().map(|s| (*s).clone()),
-    })
+    Json(FeedsHealthResponse { market_open, feeds })
 }
 
 #[cfg(test)]
@@ -516,60 +507,6 @@ mod tests {
             .expect("dhan row");
         assert!(!dhan.connected);
         assert_eq!(dhan.ticks_total, 0);
-    }
-
-    #[tokio::test]
-    async fn test_feeds_health_includes_connections_array() {
-        // §34 PR-3 (Item 12): once the ladder publishes a scale snapshot, the
-        // health payload carries it — ladder state + one row per connection.
-        // test coverage (pub-fn-test-guard lines): set_groww_scale_snapshot groww_scale_snapshot
-        use crate::feed_state::{GrowwScaleConnRow, GrowwScaleSnapshot};
-        let state = test_state(FeedsConfig {
-            dhan_enabled: false,
-            groww_enabled: true,
-            ..Default::default()
-        });
-        // Before the ladder publishes: absent (None), serialized away entirely.
-        let Json(before) = get_feeds_health(State(state.clone())).await;
-        assert!(before.groww_scale.is_none(), "no snapshot before publish");
-        // The ladder publishes a 2-conn snapshot.
-        state
-            .feed_runtime()
-            .set_groww_scale_snapshot(Arc::new(GrowwScaleSnapshot {
-                ladder_state: "holding",
-                desired_conns: 2,
-                target_conns: 10,
-                probe_mode: false,
-                smoke: false,
-                connections: vec![
-                    GrowwScaleConnRow {
-                        conn_id: 0,
-                        desired: true,
-                        subscribed_proof: true,
-                        tick_file_bytes: 4096,
-                        last_capture_age_secs: Some(3),
-                    },
-                    GrowwScaleConnRow {
-                        conn_id: 1,
-                        desired: true,
-                        subscribed_proof: false,
-                        tick_file_bytes: 0,
-                        last_capture_age_secs: None,
-                    },
-                ],
-            }));
-        let Json(resp) = get_feeds_health(State(state)).await;
-        let scale = resp.groww_scale.expect("snapshot after publish");
-        assert_eq!(scale.ladder_state, "holding");
-        assert_eq!(scale.desired_conns, 2);
-        assert_eq!(scale.connections.len(), 2);
-        assert_eq!(scale.connections[0].conn_id, 0);
-        assert!(scale.connections[0].subscribed_proof);
-        assert_eq!(scale.connections[1].tick_file_bytes, 0);
-        // The JSON shape the /feeds page reads: `connections` array present.
-        let json = serde_json::to_value(&scale).expect("serializes");
-        assert!(json["connections"].is_array());
-        assert_eq!(json["connections"].as_array().map(Vec::len), Some(2));
     }
 
     #[tokio::test]

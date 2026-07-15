@@ -50,13 +50,13 @@
 # dominant shape: one catastrophic cycle, then restart/recovery) would
 # produce ZERO datapoints and this alarm would be dead on arrival. The
 # series is therefore PRE-REGISTERED at 0 in main.rs immediately AFTER the
-# metrics recorder installs (boot Step 2, next to the
-# tv_feed_sidecar_stall_restart_total registration — ratcheted by
+# metrics recorder installs (boot Step 2 — ratcheted by
 # crates/app/tests/seal_drop_paging_wiring_guard.rs, a source-order scan of
-# main.rs), so the dropped first sample is the harmless 0 baseline and the
-# series is DENSE while the app runs (a 0-delta event per 60s scrape —
-# harmless to Sum; the metric bills during uptime hours like the feed-stall
-# counter). Honest residual: a drop inside the pre-install boot window
+# main.rs; the sibling tv_feed_sidecar_stall_restart_total registration that
+# used to sit next to it was DELETED 2026-07-15 with the Groww live feed),
+# so the dropped first sample is the harmless 0 baseline and the series is
+# DENSE while the app runs (a 0-delta event per 60s scrape — harmless to
+# Sum; the metric bills during uptime hours). Honest residual: a drop inside the pre-install boot window
 # (seal-writer spawn -> Step 2) would increment a no-op handle and be
 # uncounted here — physically implausible (a drop needs ring + spill + DLQ
 # to ALL fail on live seal traffic inside the boot prefix), and the errcode
