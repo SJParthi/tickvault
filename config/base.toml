@@ -623,64 +623,62 @@ strikes_each_side = 2
 [tf_consistency]
 enabled = true
 
-# Judge-locked cadence scheduler (2026-07-14): per-minute chain + spot fire
-# timing with structural zero-429 gates (pure CAS min-spacing, monotonic
-# domain), backward failure ladder, and event-driven per-(lane, minute)
-# moneyness decisions. SHIPS DISABLED: day 1 both lanes run the dry-run
-# logging executor (fires logged, Empty returned, NO REST call — decisions
-# honest-skip). Flipping `enabled = true` needs the real broker executors
-# (a later PR) + the dated rule-file note per
-# `.claude/rules/project/cadence-error-codes.md`.
-[cadence]
+# ===========================================================================
+# Groww ORDER-SIDE build gate (operator authorization 2026-07-14 —
+# groww-second-feed-scope-2026-06-19.md §39, no-rest-except-live-feed §10).
+# GATE 1 of the 4-gate live-fire lattice. EVERY key is false: the entire
+# Groww order-side ships DARK. Read-only order/portfolio/margin/user GETs run
+# ONLY when their per-area flag here is true AND during market hours. Live
+# order PLACEMENT is additionally hard-locked behind Gate 2 (the non-default
+# `groww_orders` cargo feature) + Gate 3 (the GROWW_ORDER_LIVE_FIRE = false
+# source const): flipping live_fire_requested alone fires NOTHING. Flipping
+# any of these to true for live orders is a SEPARATE future dated operator
+# action that edits §39 + Gate 3 first. Absent section = fully disabled.
+# ===========================================================================
+[groww_orders]
+orders_read = false
+portfolio_read = false
+margin_read = false
+user_read = false
+live_fire_requested = false
+
+# ===========================================================================
+# 🔷 DHAN pre-trade margin gate (operator directive 2026-07-14, relayed via
+# the coordinator session — the Funds & Margin surface runs as its own
+# dedicated build). Code-ready, DEFAULT-OFF: even with enabled = true the
+# REST legs stay dark until the code-change master lock
+# DHAN_MARGIN_GATE_REST_ALLOWED (constants.rs) flips with a fresh dated
+# operator quote recorded in .claude/rules/dhan/funds-margin.md (the
+# umbrella-plan E2 hold). Shared account with BruteX: tenant_budget_percent
+# caps EACH entry to <=50% of the then-current pooled availabelBalance
+# (per-entry, not cumulative); rest_self_cap_per_sec self-caps our
+# funds/margin REST usage — the endpoints' rate bucket is NOT named by
+# Dhan's docs (Assumed Non-Trading 20/sec; 5/sec stays <=50% even under the
+# more conservative 10/sec reading; live-probe before raising). The
+# self-cap is per gate instance — the OMS wiring PR constructs exactly one
+# gate per process and ratchets it. Exits are NEVER margin-gated.
+# ===========================================================================
+[dhan_margin_gate]
 enabled = false
-# Dhan chain fire offsets vs each minute close T, ms (the operator's
-# :55/:58/:02 — exactly 3, one per underlying, pairwise gaps validated
-# >= chain_min_spacing_ms).
-dhan_chain_offsets_ms = [-5000, -2000, 2000]
-# Dhan spot group anchor at T+3000 (:03). The 2026-07-15 adaptive
-# concurrency ladder groups the 4 single-symbol spot calls per step —
-# step 0 fires all 4 SIMULTANEOUSLY at :03.0; degraded steps split
-# 3+1 / 2+2 / fully sequential across 1000ms-spaced group anchors (both
-# brokers' candle endpoints are single-symbol-per-request — a true
-# multi-symbol batch does not exist).
-dhan_spot_start_offset_ms = 3000
-# Rolling-1000ms-window spot gate: at most this many spot requests in ANY
-# sliding second (1..=5 — Dhan's hard cap is 5/sec; the shared 3 rps
-# dhan_data_api_limiter still smooths a 4-simultaneous burst to ~3/sec —
-# the window gate is the STRUCTURAL ceiling, the limiter defense-in-depth).
-spot_window_cap = 4
-# Adaptive-concurrency streaks (BOTH Assumed — operator confirm pending):
-# degrade one step after this many CONSECUTIVE spot-dirty (rate-limited)
-# cycles; recover one step after this many consecutive fully-clean cycles.
-# The same streaks drive the Groww three-choice fallback-shape ladder.
-concurrency_degrade_after_dirty_cycles = 2
-concurrency_recover_after_clean_cycles = 3
-# Ladder rung clamp: spots never fire earlier than T + this (house 300ms).
-spot_min_post_close_ms = 300
-# Failure ladder: chains shift wholesale -1000ms per rung, max 5 rungs.
-dhan_ladder_step_ms = 1000
-dhan_ladder_max_rungs = 5
-# At most one in-cycle retry per failed request (RateLimited never retried).
-in_cycle_retry_max = 1
-recovery_mode = "step_back_one"
-# Lane staleness cutoffs past T: older data is stale for a next-minute fill.
-dhan_lane_cutoff_ms = 15000
-groww_lane_cutoff_ms = 6000
-# Groww three-choice fallback-shape ladder (operator verbatim 2026-07-15):
-# choice 1 (default) = all 7 requests in parallel at T+0; choice 2 = :01
-# all 3 chains / :02 ALL 4 spots (VIX included); choice 3 (last resort) =
-# :01 chains / :02 core spots / :03 VIX alone. Verdict = last wave + the
-# burst timeout; 1500ms per request on the sequential fallback.
-groww_anchor_offset_ms = 0
-groww_burst_timeout_ms = 800
-groww_request_timeout_ms = 1500
-# The structural zero-429 floor: per-underlying AND global chain gates.
-chain_min_spacing_ms = 3000
-# Pre-market expiry resolution (operator spec 2026-07-15): bounded retry
-# interval per (broker, underlying) expiry-list fetch until the IST
-# deadline; past the deadline ONE edge-latched CADENCE-01
-# `expiry_unresolved` page per pair episode while background retry
-# continues to session end (the deadline gates the PAGE, never attempts).
-expiry_retry_interval_ms = 60000
-# 08:55:00 IST = 32100 seconds of day (validated within [0, 86400)).
-expiry_deadline_secs_of_day_ist = 32100
+tenant_budget_percent = 50
+rest_self_cap_per_sec = 5
+
+# ===========================================================================
+# 🔷 DHAN exit-order execution layer (Cluster B, 2026-07-14 — LOCK #1 of
+# the 4-lock OFF switch; runbook + lockout contract in
+# .claude/rules/project/dhan-exit-order-lockout-2026-07-14.md). While
+# enabled = false the app-crate dispatcher drops every exit command
+# (counted, never silent). Flipping to true activates DRY-RUN PAPER
+# behavior ONLY — the engine's hardcoded dry_run = true blocks every live
+# POST, and one boot log line names the mode honestly (a flip is never a
+# silent no-op). Going live needs a code change + ratchet edit + rule-file
+# edit with a dated operator quote — never a config flip alone. This
+# section deliberately EXISTS with enabled = false: it is the lockout
+# guard's non-vacuous scan surface (the groww-scale-lockout pattern).
+# When enabling: default_freeze_limit_qty (>= 1, the NSE freeze quantity)
+# and freeze_limits_reviewed_on ("YYYY-MM-DD", warns when > 90 days old)
+# become mandatory; mpp_verify_deadline_secs (default 30) and
+# mpp_verify_max_attempts (default 5) drive the verify-after-place ladder.
+# ===========================================================================
+[exit_orders]
+enabled = false

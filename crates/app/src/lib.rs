@@ -184,12 +184,14 @@ pub mod metrics_catalog;
 /// rotate the API bearer token (/tickvault/<env>/api/bearer-token) without
 /// an app restart — closes audit row 13.
 pub mod api_token_rotation;
-#[cfg(feature = "daily_universe_fetcher")]
-pub mod daily_universe_boot;
-/// Shared OMS wiring (TokenHandle→TokenProvider adapter + pinned-timeout
-/// HTTP client builder) — extracted from `trading_pipeline` 2026-07-14 so
-/// the two OMS construction sites can never drift.
-pub mod oms_wiring;
+/// 🔷 DHAN exit-order execution dispatcher (Cluster B, 2026-07-14) — the
+/// S6-G1 call-site hub for every engine exit method + LOCK #2's runtime
+/// `!cfg.enabled` gate. Future entry-side (Cluster A) work constructs
+/// `ExitCommand`s; only this module executes them (never the engine
+/// methods directly).
+pub mod exit_execution;
+pub mod index_constituency_boot;
+pub mod observability;
 /// Cluster-C order-side observability (2026-07-14): OmsAlertSink /
 /// RiskAlertSink bridges → Telegram + the rebuilt SEBI order_audit /
 /// pnl_audit tables via one bounded mpsc(1024) consumer task; daily

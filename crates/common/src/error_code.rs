@@ -896,48 +896,42 @@ pub enum ErrorCode {
     /// Severity::High, auto-triage-safe (the next trading day re-runs
     /// automatically; forced reruns are DEDUP-idempotent).
     TfVerify02RunDegraded,
+    /// FEED-GAP-01 (Groww hardening PR-3, 2026-07-14) — the feed GAP-EPISODE
+    /// forensics machinery DEGRADED: the tracker could not persist an
+    /// OPEN/CLOSE row to the `feed_gap_audit` table (ensure-DDL / ILP append /
+    /// flush), or the 15:45 IST scoreboard dangling-close sweep failed
+    /// (`stage` names the leg). ANNOTATION ONLY — never on the feed recovery
+    /// path or the tick hot path; the Telegram episode bubble still fires and
+    /// re-appends are DEDUP-idempotent (`ts, trading_date_ist, feed, start_ts,
+    /// outcome`). Telegram-episode-only delivery per the operator-approved
+    /// 2026-07-14 default (no CloudWatch filter). Severity::Medium,
+    /// auto-triage-safe.
+    FeedGap01EpisodeDegraded,
 
     // -----------------------------------------------------------------------
-    // Cadence scheduler (operator cadence directive 2026-07-14, judge-locked
-    // design rev-8 — `crates/core/src/cadence/`). Dry-run decision-timing
-    // skeleton: per-minute Dhan (:55 pre-close serialized) + Groww (:00
-    // post-close burst) fetch cadence with structural zero-429 gates,
-    // failure ladder, event-driven per-lane decisions. DEFAULT-OFF.
-    // See cadence-error-codes.md.
+    // 🔷 DHAN exit-order execution layer (Cluster B, 2026-07-14).
+    // Default-off behind FOUR independent locks (config default-off, no
+    // reachable live path, hardcoded dry_run, build-failing ratchet guard).
+    // Both codes are LOG-SINK-ONLY (no error_code_alerts map entry, no
+    // paging-list edit — the 2026-07-14 Dhan noise lock posture).
+    // See dhan-exit-order-lockout-2026-07-14.md.
     // -----------------------------------------------------------------------
-    /// CADENCE-01: a cadence lane DEGRADED this cycle — a non-Empty fetch
-    /// failure ended terminal after the retry budget
-    /// (`stage="fetch_failed"`), a 429 arrived despite the gates
-    /// (`stage="rate_limited"` — also a gate-bug signal), a spot returned
-    /// 200-empty (`stage="spot_empty"`, either lane), a chain returned
-    /// 200-empty (`stage="chain_empty"`, either lane), the Groww burst
-    /// fell back (`stage="groww_fallback"`), a lane borrowed the other
-    /// broker's data after its own path exhausted (`stage="cross_fill"`),
-    /// a spot resolved from the chain-embedded price
-    /// (`stage="chain_embedded_spot"`), moneyness classified Unknown
-    /// (`stage="moneyness_unknown"`), or the failure ladder exhausted its
-    /// floor (`stage="ladder_exhausted"`, edge-latched per episode). ONE
-    /// coalesced emission per (lane, cycle), never per-request.
-    /// Severity::High, auto-triage-safe (the next cycle re-attempts; the
-    /// ladder + cross-fill are the self-corrections).
-    Cadence01LaneDegraded,
-    /// CADENCE-02: a cadence lane's decision was HONEST-SKIPPED — the lane
-    /// was incomplete at its cutoff (`stage="cutoff"`), both brokers were
-    /// dead (`stage="both_sources_dead"`), or every underlying classified
-    /// Unknown (`stage="all_unknown"`). Exactly one per (lane, cycle);
-    /// never a late decision, never a decision on missing/stale data.
-    /// Severity::High, auto-triage-safe (the skip IS the fail-closed
-    /// action; the operator inspects the stage at leisure).
-    Cadence02DecisionSkipped,
-    /// CADENCE-03: the cadence scheduler itself DEGRADED — the failure
-    /// ladder shifted a rung (`stage="ladder_shift"`), a wake landed late
-    /// past a slot (`stage="late_wake"`), one or more minute boundaries
-    /// were skipped (`stage="boundary_skipped"`), a clock skew was clamped
-    /// (`stage="skew_clamped"`), the supervised runner respawned
-    /// (`stage="respawn"`), or a gate deferred a NOMINAL slot
-    /// (`stage="gate_deferred_nominal"` — a should-never scheduling-math
-    /// signal). Severity::Medium, auto-triage-safe.
-    Cadence03SchedulerDegraded,
+    /// EXIT-ORDER-01: an exit engine call degraded — a validation refusal
+    /// on a dispatched command, a Dhan API error on a super/forever/sliced
+    /// order, an ENTRY_LEG cancel refused post-fill (the naked-position
+    /// race U4 — never exercised), or a slicing response anomaly.
+    /// Severity::High, auto-triage-safe (the dispatched command already
+    /// refused/degraded loudly; the operator inspects the correlation-id
+    /// forensic log line).
+    ExitOrder01ExecutionDegraded,
+    /// EXIT-VERIFY-01: the MPP verify ladder exhausted with a degraded
+    /// verdict — `PendingAtLimit` (MARKET→LIMIT auto-conversion resting on
+    /// the book past the deadline — orders.md rule 18; NEVER assumed
+    /// filled), a partial fill at budget (`needs_reconciliation` set — the
+    /// remainder is never silently forgotten), or an `Unknown` unparsable
+    /// status (fail-closed). Severity::High, auto-triage-safe (the order
+    /// stays tracked; reconcile + the caller's policy own the follow-up).
+    ExitVerify01Degraded,
 }
 
 impl ErrorCode {
@@ -1117,6 +1111,8 @@ impl ErrorCode {
             Self::TfVerify02RunDegraded => "TF-VERIFY-02",
             // Feed gap-episode forensics (Groww hardening PR-3, 2026-07-14)
             Self::FeedGap01EpisodeDegraded => "FEED-GAP-01",
+            Self::ExitOrder01ExecutionDegraded => "EXIT-ORDER-01",
+            Self::ExitVerify01Degraded => "EXIT-VERIFY-01",
         }
     }
 
@@ -1563,6 +1559,10 @@ impl ErrorCode {
             Self::FeedGap01EpisodeDegraded => {
                 ".claude/rules/project/feed-gap-error-codes.md"
             }
+            // 🔷 DHAN exit-order execution layer (Cluster B, 2026-07-14)
+            Self::ExitOrder01ExecutionDegraded | Self::ExitVerify01Degraded => {
+                ".claude/rules/project/dhan-exit-order-lockout-2026-07-14.md"
+            }
         }
     }
 
@@ -1777,6 +1777,9 @@ impl ErrorCode {
             Self::TfVerify02RunDegraded,
             // Feed gap-episode forensics (Groww hardening PR-3, 2026-07-14)
             Self::FeedGap01EpisodeDegraded,
+            // 🔷 DHAN exit-order execution layer (Cluster B, 2026-07-14)
+            Self::ExitOrder01ExecutionDegraded,
+            Self::ExitVerify01Degraded,
         ]
     }
 }
@@ -2142,7 +2145,24 @@ mod tests {
         // client/query/truncation/flush/budget stage taxonomy) => 148.
         // 2026-07-14 (Groww hardening PR-3): FEED-GAP-01 (gap-episode
         // forensics degraded — annotation-only side record) => 149.
-        assert_eq!(ErrorCode::all().len(), 149);
+        // 2026-07-14 (🔷 DHAN exit-order layer, Cluster B WP1): bumped
+        // 149 -> 151 for EXIT-ORDER-01 (exit engine call degraded —
+        // validation refusal / Dhan API error / post-fill ENTRY_LEG cancel
+        // refused / slicing anomaly) + EXIT-VERIFY-01 (MPP verify ladder
+        // exhausted with PendingAtLimit / partial-at-budget / Unknown —
+        // fail-closed, never assumed filled). Both log-sink-only.
+        // 2026-07-15 (C4 sweep — Dhan live-WS retirement, operator
+        // 2026-07-13): DROPPED 151 -> 129. The 22 zero-emit-site variants
+        // retained through Phases A/B/C1/C2/C3 were deleted:
+        // INSTR-FETCH-01..04, NTM-CONSTITUENCY-01, PREVDAY-01,
+        // CROSS-VERIFY-1M-01/-02, DHAN-LANE-01..04, WS-GAP-05..09,
+        // AUTH-GAP-06, REST-CANARY-01, SLO-01/02/03 (WS-GAP-04 +
+        // WS-GAP-10 survive — emitted by the retained-dormant
+        // order_update_connection.rs; main's FEED-GAP-01 landed
+        // mid-flight making the pre-merge base 149, and the exit-order
+        // pair #1566 landed during the merge train making it 151 —
+        // hence 151 -> 129, not 148 -> 126).
+        assert_eq!(ErrorCode::all().len(), 129);
     }
 
     #[test]
@@ -2316,20 +2336,41 @@ mod tests {
     // with its PrevDay01CoverageEmpty variant (Dhan live-WS retirement).
 
     #[test]
-    fn test_order_ready_01_contract() {
-        let c = ErrorCode::OrderReady01GateRefused;
-        assert_eq!(c.code_str(), "ORDER-READY-01");
-        assert_eq!("ORDER-READY-01".parse::<ErrorCode>(), Ok(c));
-        assert_eq!(c.severity(), Severity::High);
-        assert!(
-            !c.is_auto_triage_safe(),
-            "operator-only: account/order-path decision"
-        );
-        assert_eq!(
-            c.runbook_path(),
-            ".claude/rules/project/order-readiness-error-codes.md"
-        );
-        assert!(ErrorCode::all().contains(&c));
+    fn test_exit_order_codes_contract() {
+        // 🔷 DHAN exit-order execution layer (Cluster B, 2026-07-14).
+        let e1 = ErrorCode::ExitOrder01ExecutionDegraded;
+        assert_eq!(e1.code_str(), "EXIT-ORDER-01");
+        assert_eq!("EXIT-ORDER-01".parse::<ErrorCode>(), Ok(e1));
+        assert_eq!(e1.severity(), Severity::High);
+        // The refusal/degrade already happened loudly; the operator
+        // inspects the correlation-id forensic line — auto-triage may look.
+        assert!(e1.is_auto_triage_safe());
+
+        let e2 = ErrorCode::ExitVerify01Degraded;
+        assert_eq!(e2.code_str(), "EXIT-VERIFY-01");
+        assert_eq!("EXIT-VERIFY-01".parse::<ErrorCode>(), Ok(e2));
+        assert_eq!(e2.severity(), Severity::High);
+        assert!(e2.is_auto_triage_safe());
+
+        for code in [e1, e2] {
+            assert!(ErrorCode::all().contains(&code));
+            assert_eq!(
+                code.runbook_path(),
+                ".claude/rules/project/dhan-exit-order-lockout-2026-07-14.md"
+            );
+            // The lockout rule file must exist on disk (cross-ref test 14).
+            let abs = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .and_then(std::path::Path::parent)
+                .map(|root| root.join(code.runbook_path()))
+                .unwrap_or_default();
+            let shown = abs.display().to_string();
+            assert!(
+                abs.exists(),
+                "{} runbook missing on disk: {shown}",
+                code.code_str()
+            );
+        }
     }
 
     #[test]
@@ -2388,15 +2429,11 @@ mod tests {
                 || s.starts_with("TELEGRAM-")
                 // Wave 3-C: market-open self-test prefix
                 || s.starts_with("SELFTEST-")
-                // Wave 3-D: composite real-time guarantee score
-                || s.starts_with("SLO-")
                 // Wave 5 (2026-05-01): core_affinity pinning.
                 // (Depth-20/200 dynamic selector prefixes retired by PR #4.)
                 || s.starts_with("CORE-PIN-")
                 // Wave 5 Item 26 L1: volume cumulative-monotonicity guard.
                 || s.starts_with("VOLUME-")
-                // DHAN-REST-400 (2026-06-10): scheduled REST-health canary.
-                || s.starts_with("REST-CANARY-")
                 // B6 (2026-07-03): off-thread tick ILP flush worker.
                 || s.starts_with("TICK-FLUSH-")
                 // W2 PR#6 (2026-07-10): per-table WAL-suspension probe.
@@ -2416,24 +2453,20 @@ mod tests {
                 || s.starts_with("BAR-MISMATCH-")
                 // PR #2.5 (AWS-lifecycle): Day OHLC tracker for IDX_I
                 || s.starts_with("INDEX-OHLC-")
-                // Sub-PR #9 of 2026-05-27 daily-universe expansion
-                || s.starts_with("INSTR-FETCH-")
-                // Operator 2026-06-02: post-market 1-minute cross-verification
-                || s.starts_with("CROSS-VERIFY-1M-")
                 // zero-tick-loss PR-5 (G3): supervised disk-health watcher
                 || s.starts_with("DISK-WATCHER-")
                 // zero-tick-loss 2026-06-09: WAL frame-spill writer hardening
                 || s.starts_with("WS-SPILL-")
                 // C3 2026-07-03: bounded chunked-backpressure WAL re-injection
                 || s.starts_with("WS-REINJECT-")
-                // NTM Sub-PR #10a (§31): niftyindices constituent source degrade
-                || s.starts_with("NTM-CONSTITUENCY-")
                 // Operator 2026-06-10: daily end-to-end tick-conservation audit
                 || s.starts_with("TICK-CONSERVE-")
-                // PR4 2026-06-01: boot-time previous-day OHLCV fetch coverage
-                || s.starts_with("PREVDAY-")
-                // D2b 2026-06-26: runtime Dhan-lane cold-start FSM
-                || s.starts_with("DHAN-LANE-")
+                // C4 sweep (2026-07-15): the SLO- / REST-CANARY- /
+                // INSTR-FETCH- / CROSS-VERIFY-1M- / NTM-CONSTITUENCY- /
+                // PREVDAY- / DHAN-LANE- family prefixes were REMOVED from
+                // this allowlist with their last variants — a future variant
+                // reusing a retired family must consciously re-add its
+                // prefix here (never silently).
                 // PR-A 2026-06-28: Groww shared-master persist
                 || s.starts_with("GROWW-MASTER-")
                 // §34 (2026-07-03): Groww multi-connection auto-scale ladder
@@ -2464,7 +2497,10 @@ mod tests {
                 || s.starts_with("TF-VERIFY-")
                 // Groww hardening PR-3 (2026-07-14): feed gap-episode
                 // forensics.
-                || s.starts_with("FEED-GAP-");
+                || s.starts_with("FEED-GAP-")
+                // 🔷 DHAN exit-order execution layer (Cluster B, 2026-07-14)
+                || s.starts_with("EXIT-ORDER-")
+                || s.starts_with("EXIT-VERIFY-");
             assert!(has_known_prefix, "unexpected code prefix: {s}");
         }
     }
