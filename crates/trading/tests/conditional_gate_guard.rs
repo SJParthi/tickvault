@@ -52,11 +52,16 @@
 //!    subpath like `format!("{}/{}", b, "alerts/settings")` matched none
 //!    of the four fixed needles), AND `DHAN_ALERTS_`-prefixed constant
 //!    identifiers (a rogue file IMPORTING the existing constant previously
-//!    shipped invisible). Allowlist matching is SEPARATOR-ANCHORED
-//!    (round-5): a rogue crate/dir whose name merely SUFFIX-COLLIDES with
-//!    an allowlisted component (`crates/xtrading/src/oms/api_client.rs`,
-//!    `crates/mycommon/src/constants.rs`) previously passed a bare
-//!    `ends_with` while the tightened sub-checks read only the REAL files.
+//!    shipped invisible). Allowlist matching is FULL-PATH-ANCHORED
+//!    (round-6): after stripping the allowlisted component, the prefix
+//!    must be EXACTLY the walk root (`../../crates/`). History: a rogue
+//!    crate whose name merely SUFFIX-COLLIDES with an allowlisted
+//!    component (`crates/xtrading/src/oms/api_client.rs`) passed the
+//!    original bare `ends_with`; the round-5 separator anchor
+//!    (`prefix.ends_with('/')`) blocked that but still accepted any
+//!    DEEPER NESTING (`crates/evil/trading/src/oms/api_client.rs`) —
+//!    both shapes now fail the pin while the tightened sub-checks keep
+//!    reading only the REAL files.
 //!    Within the allowlist: constants.rs is under a
 //!    `DHAN_ALERTS_`-naming ratchet — every code line carrying `/alerts`
 //!    must DECLARE a `pub const DHAN_ALERTS_*` (the declared IDENTIFIER
@@ -81,7 +86,10 @@
 //! comments, UFCS/path/bare-call production callers, rogue-FILE senders on
 //! any `/alerts` subpath or via a `DHAN_ALERTS_*` constant import,
 //! slashless `format!("{}/{}", base, "alerts/…")` subpath assemblies,
-//! allowlist suffix-collision crate names); they do NOT claim to stop
+//! allowlist suffix-collision crate names AND nested-directory rogue
+//! crates like `crates/evil/trading/src/oms/api_client.rs` — the
+//! allowlist is full-path-pinned to the walk root); they do NOT claim to
+//! stop
 //! deliberate obfuscation outside those shapes (byte-assembled strings, a
 //! bare `"alerts"` literal with NO adjacent slash in ANY fragment — e.g.
 //! `format!("{}/{}/{}", base, "alerts", "orders")` — raw-string literals —
@@ -163,12 +171,18 @@ fn count_alerts_url_tokens(code: &str) -> usize {
 }
 
 /// True when `path_text` (forward-slash normalized) is one of the four
-/// allowlisted /alerts-family production files — SEPARATOR-ANCHORED
-/// (round-5): the previous bare `ends_with` let a rogue crate/dir whose
-/// NAME merely suffix-collides with an allowlisted component
-/// (`crates/xtrading/src/oms/api_client.rs`,
-/// `crates/mycommon/src/constants.rs`) be silently allowlisted, while the
-/// tightened sub-checks read only the REAL files' paths.
+/// allowlisted /alerts-family production files — FULL-PATH-ANCHORED
+/// (round-6): after stripping the allowlisted `crate/src/...` suffix, the
+/// remaining prefix must be EXACTLY the walk root (`../../crates/`, derived
+/// from [`WORKSPACE_CRATES_DIR`] — every path test 6 walks starts there).
+/// History: the original bare `ends_with` let a rogue crate whose NAME
+/// merely suffix-collides with an allowlisted component
+/// (`crates/xtrading/src/oms/api_client.rs`) be silently allowlisted; the
+/// round-5 separator-anchor (`prefix.ends_with('/')`) blocked that
+/// single-level collision but still accepted any DEEPER NESTING
+/// (`crates/evil/trading/src/oms/api_client.rs` — prefix
+/// `../../crates/evil/` ends in `/`), re-opening the ungated-sender class.
+/// The full-path pin closes both shapes.
 fn is_alerts_allowlisted_path(path_text: &str) -> bool {
     // The ONLY production files allowed to mention the /alerts family:
     // constants.rs (the path constants), api_client.rs (the 6 senders),
@@ -183,7 +197,8 @@ fn is_alerts_allowlisted_path(path_text: &str) -> bool {
     ALLOWLIST.iter().any(|allowed| {
         path_text
             .strip_suffix(allowed)
-            .is_some_and(|prefix| prefix.ends_with('/'))
+            .and_then(|prefix| prefix.strip_suffix('/'))
+            .is_some_and(|walk_root| walk_root == WORKSPACE_CRATES_DIR)
     })
 }
 
@@ -904,11 +919,14 @@ fn test_alerts_paths_single_choke_point() {
         if !mentions_alerts_family(&source) {
             continue;
         }
-        // Round-5 hardening: SEPARATOR-ANCHORED allowlist match — a rogue
-        // crate/dir suffix-colliding with an allowlisted component
-        // (crates/xtrading/src/oms/api_client.rs) previously passed a bare
-        // `ends_with` while the tightened sub-checks below read only the
-        // REAL files.
+        // Round-6 hardening: FULL-PATH-ANCHORED allowlist match — the
+        // prefix left after stripping the allowlisted component must be
+        // EXACTLY the walk root. A suffix-colliding crate name
+        // (crates/xtrading/src/oms/api_client.rs) passed the original bare
+        // `ends_with`; a NESTED rogue dir
+        // (crates/evil/trading/src/oms/api_client.rs) passed the round-5
+        // `prefix.ends_with('/')` anchor — while the tightened sub-checks
+        // below read only the REAL files.
         if !is_alerts_allowlisted_path(&path_text) {
             violations.push(path_text);
         }
@@ -1385,11 +1403,14 @@ fn test_gate_guard_scanner_self_test() {
     );
 
     // ------------------------------------------------------------------
-    // is_alerts_allowlisted_path — SEPARATOR-ANCHORED (round-5): a
-    // crate/dir whose name merely SUFFIX-COLLIDES with an allowlisted
-    // component must NOT be allowlisted (the tightened sub-checks read
-    // only the REAL files, so a collision shipped /alerts literals
-    // invisible).
+    // is_alerts_allowlisted_path — FULL-PATH-ANCHORED (round-6): the
+    // prefix after stripping the allowlisted component must be EXACTLY
+    // the walk root. A crate/dir whose name merely SUFFIX-COLLIDES with
+    // an allowlisted component (round-5 shape) AND a NESTED rogue dir
+    // whose prefix ends in '/' but is deeper than the walk root (round-6
+    // shape — crates/evil/trading/...) must both be REJECTED (the
+    // tightened sub-checks read only the REAL files, so either shape
+    // shipped /alerts literals invisible).
     // ------------------------------------------------------------------
     assert!(
         is_alerts_allowlisted_path("../../crates/trading/src/oms/api_client.rs"),
@@ -1410,6 +1431,19 @@ fn test_gate_guard_scanner_self_test() {
     assert!(
         !is_alerts_allowlisted_path("trading/src/oms/api_client.rs"),
         "an exact-suffix path with no separator prefix must not match"
+    );
+    assert!(
+        !is_alerts_allowlisted_path("../../crates/evil/trading/src/oms/api_client.rs"),
+        "a NESTED rogue dir (crates/evil/trading/...) must NOT be allowlisted \
+         (round-6 — the round-5 '/'-suffix anchor accepted it)"
+    );
+    assert!(
+        !is_alerts_allowlisted_path("../../crates/evil/common/src/constants.rs"),
+        "a NESTED rogue dir (crates/evil/common/...) must NOT be allowlisted"
+    );
+    assert!(
+        !is_alerts_allowlisted_path("../../crates/groww_alerts/trading/src/oms/conditional.rs"),
+        "a NESTED rogue dir (crates/groww_alerts/trading/...) must NOT be allowlisted"
     );
 
     // ------------------------------------------------------------------
