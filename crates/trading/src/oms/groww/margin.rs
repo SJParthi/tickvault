@@ -78,12 +78,10 @@
 //!
 //! - **Error codes** — the `GROWW-MARG-01..05` `ErrorCode` variants + the
 //!   runbook (`.claude/rules/project/groww-margin-error-codes.md`) + the
-//!   triage rules land there. Until they land, every emit site below is
-//!   CODE-LESS (stage-field only — the `margin_gate.rs` house precedent of
-//!   deferring the typed variant) and carries a
-//!   `// GROWW-MARG-0N (contract-stubs PR pending)` marker.
-//!   WIRING-TODO: at the final rebase AFTER the stubs PR merges, flip each
-//!   marked emit to `code = ErrorCode::GrowwMargNN...code_str()`.
+//!   triage rules landed with the contract-stubs PR (#1587, merged
+//!   2026-07-15). Every emit site below carries the REAL
+//!   `code = ErrorCode::GrowwMargNN...code_str()` field (the WIRING-TODO
+//!   flip was executed at the post-stubs rebase).
 //! - **Config** — the `[groww_margin_gate]` section is OPERATOR-HELD with
 //!   the stubs PR. Until it lands, the module-local
 //!   [`GrowwMarginGateParams`] (same 9 knobs, same bounds, same fail-safe
@@ -104,6 +102,7 @@ use tickvault_common::broker_order_events::{BrokerOrderEvent, BrokerOrderStatus}
 use tickvault_common::constants::{
     GROWW_API_VERSION_HEADER, GROWW_API_VERSION_VALUE, IST_UTC_OFFSET_SECONDS_I64,
 };
+use tickvault_common::error_code::ErrorCode;
 use tickvault_common::feed::Feed;
 use tickvault_common::sanitize::capture_rest_error_body;
 use tracing::{debug, error, info};
@@ -820,8 +819,8 @@ pub fn evaluate_and_record(
         // decision — see the runbook §4): the operator needs the numbers
         // to act; the SEC-M1 field-names-only redaction applies to the
         // fetch-side lines, not this forensic verdict.
-        // GROWW-MARG-04 (contract-stubs PR pending)
         error!(
+            code = ErrorCode::GrowwMarg04EntryRejectedInsufficient.code_str(),
             source,
             required_paise = numbers.required_paise,
             avail_paise = numbers.avail_paise,
@@ -1009,8 +1008,8 @@ impl PendingLedger {
             return Err(LedgerPushRefused::DuplicateReference);
         }
         if entries.len() >= MARGIN_LEDGER_CAP {
-            // GROWW-MARG-04 (contract-stubs PR pending)
             error!(
+                code = ErrorCode::GrowwMarg04EntryRejectedInsufficient.code_str(),
                 stage = "ledger_full",
                 cap = MARGIN_LEDGER_CAP,
                 dropped_required_paise = entry.required_paise,
@@ -1417,8 +1416,8 @@ async fn poll_turn_from(
         Ok(token) => token,
         Err(err) => {
             let issue = FetchIssue::NoToken;
-            // GROWW-MARG-01 (contract-stubs PR pending)
             error!(
+                code = ErrorCode::GrowwMarg01FetchDegraded.code_str(),
                 stage = issue.stage(),
                 sanitized = %capture_rest_error_body(&err.to_string()),
                 "groww margin fetch degraded — no access token; the snapshot ages \
@@ -1447,8 +1446,8 @@ async fn poll_turn_from(
     let payload = match result {
         Ok(payload) => payload,
         Err(issue) => {
-            // GROWW-MARG-01 (contract-stubs PR pending)
             error!(
+                code = ErrorCode::GrowwMarg01FetchDegraded.code_str(),
                 stage = issue.stage(),
                 sanitized = %issue.detail(),
                 "groww margin fetch degraded — this poll is lost; the prior \
@@ -1500,8 +1499,8 @@ async fn poll_turn_from(
         Err(issue) => {
             // Field NAMES + clamp class only — NEVER the fetched balance
             // value (the SEC-M1 redaction rule for fetch-side lines).
-            // GROWW-MARG-01 (contract-stubs PR pending)
             error!(
+                code = ErrorCode::GrowwMarg01FetchDegraded.code_str(),
                 stage = issue.stage(),
                 detail = issue.detail(),
                 "groww margin payload refused — snapshot NOT stored; the prior \
@@ -1693,8 +1692,8 @@ pub async fn run_margin_poll_loop<M>(
             }
             PollOutcome::Failed(_stage) => {
                 if failure_edge.record_failure() {
-                    // GROWW-MARG-01 (contract-stubs PR pending)
                     error!(
+                        code = ErrorCode::GrowwMarg01FetchDegraded.code_str(),
                         stage = "escalation",
                         consecutive = failure_edge.consecutive(),
                         "groww margin fetch: consecutive-failure escalation edge — the \
@@ -1722,8 +1721,8 @@ pub async fn run_margin_poll_loop<M>(
         };
         match stale_edge.observe(is_stale) {
             Some(true) => {
-                // GROWW-MARG-03 (contract-stubs PR pending)
                 error!(
+                    code = ErrorCode::GrowwMarg03SnapshotStaleGateClosed.code_str(),
                     age_secs,
                     reason,
                     stale_secs = cfg.stale_secs,
