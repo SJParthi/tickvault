@@ -203,10 +203,11 @@ fn scan_legacy_spill(dir: &Path) -> (u64, u64, Option<String>) {
     (count, bytes, newest.map(|(_, n)| n))
 }
 
-/// Default cross-verify artefact directory. Matches `CROSS_VERIFY_CSV_DIR`
-/// in `crates/app/src/cross_verify_1m_boot.rs` (the 15:31 IST post-market
-/// run writes `cross-verify-1m-YYYY-MM-DD.csv` + a sibling
-/// `cross-verify-1m-YYYY-MM-DD.summary.json` there).
+/// Default cross-verify artefact directory. The PRODUCER (the 15:31 IST
+/// post-market run, `cross_verify_1m_boot.rs`) was RETIRED with the Dhan
+/// live WS and deleted in PR-C3 (2026-07-14) — this endpoint keeps serving
+/// the RETAINED forensic artifacts (`cross-verify-1m-YYYY-MM-DD.csv` + the
+/// sibling `.summary.json`) read-only; no new files are written.
 const DEFAULT_CROSS_VERIFY_DIR: &str = "data/cross-verify";
 const CROSS_VERIFY_DIR_ENV: &str = "TV_CROSS_VERIFY_DIR";
 const CROSS_VERIFY_CSV_PREFIX: &str = "cross-verify-1m-";

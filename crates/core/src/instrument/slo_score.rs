@@ -1,5 +1,16 @@
 //! Wave 3-D Item 13 — Composite real-time guarantee score.
 //!
+//! **RETAINED-DORMANT since PR-C2 (2026-07-14 — SLO publisher PARKED per
+//! the operator ruling recorded in the wave-3-d-error-codes.md banner):**
+//! the 10s evaluator/publisher (`spawn_slo_publisher_task` /
+//! `spawn_supervised_slo_publisher` in main.rs) was DELETED with the Dhan
+//! lane — its six dimensions were dominated by the retired Dhan inputs, so
+//! the composite could never read honestly on the Groww-only runtime. This
+//! pure evaluator has ZERO runtime call sites (unit tests + bench only)
+//! and is kept as the contract stub behind the retained SLO-01/02/03
+//! ErrorCode variants, pending either a Groww-scoped SLO re-design with a
+//! fresh dated operator quote or the C4 variant cleanup.
+//!
 //! Every 10 seconds the boot scheduler samples the live state of six
 //! independent dimensions and hands a populated [`SloInputs`] to
 //! [`evaluate_slo_score`]. The pure evaluator returns a tri-state

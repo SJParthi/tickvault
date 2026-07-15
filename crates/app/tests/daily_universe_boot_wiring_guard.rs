@@ -1,59 +1,26 @@
-//! Source-scan ratchet (Z+ L5 AUDIT / L4 PREVENT) pinning that the
-//! daily-universe boot orchestrator is wired into `main.rs` Step-6c,
-//! fail-closed, and feature-gated. Mirrors the codebase's `*_is_wired`
-//! guard pattern (e.g. `secret_manager.rs::test_orphan_position_watchdog_is_wired_into_main`).
+//! RETIRED (PR-C2, 2026-07-13 — Dhan live-WS lane deletion, operator
+//! retirement directive per websocket-connection-scope-lock.md
+//! "2026-07-13 Amendment" §B; operator Q3: "hereafter no Dhan instrument
+//! download/parsing — just direct hardcoded security IDs passed to spot 1m
+//! and option chain").
 //!
-//! These tests read the `main.rs` SOURCE text, so they run on the default
-//! build (feature OFF) — the ratchet is always active in CI, independent
-//! of the `daily_universe_fetcher` feature.
-
-use std::fs;
-use std::path::PathBuf;
-
-fn main_rs_source() -> String {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/main.rs");
-    fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
-}
-
-#[test]
-fn test_daily_universe_boot_is_wired_into_main() {
-    let src = main_rs_source();
-    assert!(
-        src.contains("run_daily_universe_boot("),
-        "Step-6c must call run_daily_universe_boot — the daily-universe fetch \
-         is otherwise dead code (pub-fn-wiring + go-live regression)."
-    );
-}
+//! This guard pinned the main.rs Step-6c wiring of the daily-universe boot
+//! orchestrator (`run_daily_universe_boot` + the three lifecycle-table
+//! ensures + the fail-closed §4 halt). The Step-6c call sites DIED with the
+//! Dhan lane: main.rs performs NO Dhan instrument fetch — the retained Dhan
+//! REST pulls run on the HARDCODED `SPOT_1M_REST_INDICES`. PR-C3
+//! (2026-07-14) then DELETED the `daily_universe_boot.rs` MODULE itself
+//! with the whole daily-universe fetch chain (scope-lock amendment §B
+//! item 3). The
+//! `instrument_lifecycle` / `instrument_lifecycle_audit` /
+//! `instrument_fetch_audit` TABLES survive (SEBI never-delete) and are
+//! ensured/written by the Groww shared-master writer
+//! (`groww-shared-master-error-codes.md`).
 
 #[test]
-fn test_step_6c_ensures_three_lifecycle_tables() {
-    let src = main_rs_source();
-    for ensure_fn in [
-        "ensure_instrument_lifecycle_table",
-        "ensure_instrument_lifecycle_audit_table",
-        "ensure_instrument_fetch_audit_table",
-    ] {
-        assert!(
-            src.contains(ensure_fn),
-            "Step-6c must call {ensure_fn} before run_daily_universe_boot — the \
-             downstream writers assume the table exists."
-        );
-    }
-}
-
-#[test]
-fn test_step_6c_is_feature_gated_and_fail_closed() {
-    let src = main_rs_source();
-    assert!(
-        src.contains("#[cfg(feature = \"daily_universe_fetcher\")]"),
-        "Step-6c must stay feature-gated (default-OFF until the go-live flip)."
-    );
-    // Fail-closed §4: the orchestrator result is `?`-propagated with a
-    // halting context (NOT swallowed / fail-open). Pinning the halt context
-    // string keeps a future edit from silently downgrading to fail-open.
-    assert!(
-        src.contains("daily-universe boot failed (fail-closed") && src.contains("halting"),
-        "Step-6c must be fail-closed per §4 — propagate the orchestrator Err \
-         with a halting context, never log-and-continue."
-    );
+fn daily_universe_boot_wiring_suite_retired_with_dhan_live_ws_lane() {
+    // Tombstone: the module-level doc above records why every assertion in
+    // this suite retired. Re-introducing a Dhan instrument download requires
+    // a fresh dated operator quote in websocket-connection-scope-lock.md
+    // FIRST (§D of the amendment).
 }
