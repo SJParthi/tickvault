@@ -315,47 +315,12 @@ auto_start_docker = true
 [feeds]
 dhan_enabled = false
 groww_enabled = false
-# Groww NATIVE-RUST SHADOW client (PR-R1 of the parity migration, operator
-# "go" 2026-07-04 — groww-second-feed-scope-2026-06-19.md §35). Default OFF.
-# When true, the native Rust client runs ALONGSIDE the Python sidecar (same
-# watch set) and writes its own NDJSON capture file
-# (data/groww/rust-live-ticks.ndjson) for the exact per-tick parity comparer.
-# No shared-table writes, no strategy/order wiring, no sidecar changes.
-groww_native_shadow = false
-
-# Groww capture-archive S3 offload (2026-07-13 disk-retention hardening).
-# Rotated sidecar capture archives (data/groww/live-ticks-YYYYMMDD.ndjson)
-# are uploaded to s3://<bucket>/<prefix>/<filename>, VERIFIED (head_object
-# size match), and only then deleted locally after a grace window. Empty
-# bucket = archival OFF (archives kept on disk — the dev-Mac behaviour);
-# the sidecar NEVER deletes a file without a verified S3 copy.
-[feeds.groww]
-capture_archive_s3_bucket = "tv-prod-cold"
-capture_archive_s3_prefix = "groww-capture"
-
-# Groww multi-connection AUTO-SCALE ladder (operator authorization 2026-07-03,
-# §34 of .claude/rules/project/groww-second-feed-scope-2026-06-19.md).
-# enabled = false (the default) keeps the single-connection sidecar path
-# byte-identical. Tier A ceiling = 10 connections (Monday); raising
-# target_connections beyond the current tier requires the §34.2 gate evidence.
-[feeds.groww.scale]
-enabled = false
-target_connections = 10
-instruments_per_conn = 1000
-ladder = [1, 2, 5, 10]
-gate_hold_minutes = 15
-gate_max_cpu_pct = 70.0
-gate_min_disk_free_pct = 20.0
-gate_max_capture_lag_ms = 30000
-rollback_hold_base_minutes = 10
-advance_window_ist = ["09:20", "14:30"]
-# Cap-probe mode (PR-3): exactly 2 conns x 600 instruments + a
-# per-conn-vs-per-account verdict, then hold at 2. Scale-test harness only.
-probe_mode = false
-# Weekend SMOKE mode (PR-3): when the market is CLOSED, exercise the full
-# scale machinery with tick gates honestly SKIPPED (labelled SMOKE).
-# No effect while the market is open. Scale-test harness only.
-weekend_smoke = false
+# The Groww LIVE feed was RETIRED 2026-07-15 (operator directive: "remove
+# the whole Groww live feed; keep only spot 1m and option chain for both
+# brokers"). groww_enabled above now gates only REST-leg feed identity
+# surfaces; the daily watch-set build lives under [groww_universe]. The
+# retired keys (groww_native_shadow, [feeds.groww] capture archive,
+# [feeds.groww.scale]) were removed with the live machinery.
 
 # [movers] section retired in PR #2 (2026-05-18) alongside the deleted
 # movers pipeline. Under the 4-IDX_I-only universe top-N gainers/losers/

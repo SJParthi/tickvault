@@ -1,7 +1,8 @@
 //! C2 convergence ratchet — the ordered per-tick consumer sequence
 //! (enrich → persist → aggregate handoff) exists in EXACTLY ONE place —
-//! `pipeline::feed_consumer::consume_feed_tick` — and BOTH live-feed consumer
-//! loops delegate to it.
+//! `pipeline::feed_consumer::consume_feed_tick` — and the Dhan consumer
+//! loop delegates to it. (The Groww bridge delegation arm was retired
+//! 2026-07-15 with the Groww live feed.)
 //!
 //! Mirrors the C1 guard (`crates/storage/tests/feed_tick_writer_convergence_guard.rs`):
 //! a source-scan that fails the build if a future refactor silently re-forks the
@@ -12,7 +13,6 @@
 //!
 //! - The Dhan `Tick` arm (Quote/Ticker packets — the production path under the
 //!   Quote-mode locked universe) delegates. ✔
-//! - The Groww `drain_new_data` per-line body delegates. ✔
 //! - The Dhan `TickWithDepth` (Full-packet) arm does NOT delegate — its
 //!   aggregate handoff (the broadcast) is separated from persist by depth-frame
 //!   gating whose loop-`continue`s cannot route through the shared core without
@@ -110,49 +110,7 @@ fn test_one_consumer_loop_path_guard() {
          (Tick-arm closure + the documented TickWithDepth exception)"
     );
 
-    // 3. The Groww consumer loop delegates: drain_new_data routes its
-    // persist + 21-TF fold through the SAME shared core.
-    let groww = read_rel("../app/src/groww_bridge.rs");
-    let groww_prod = production_region(&groww);
-    assert!(
-        groww_prod.contains("tickvault_core::pipeline::feed_consumer::consume_feed_tick("),
-        "run_groww_bridge (drain_new_data) must delegate to the shared consume_feed_tick"
-    );
-    assert_eq!(
-        groww_prod.matches("consume_feed_tick(").count(),
-        1,
-        "the Groww bridge must have exactly ONE consume_feed_tick call site"
-    );
-    // The Groww TICK persist call exists ONLY inside the shared-core closure.
-    // Pin the documented FeedGapAuditWriter exception: exactly TWO
-    // `.append_row(` sites exist in the bridge's production region — the tick
-    // persist inside the consume_feed_tick closure, plus the gap-episode
-    // FeedGapAuditRow write (an audit-table row, not a tick persist — the
-    // 2026-07-14 feed-gap tracker). A THIRD site = a re-forked persist path.
-    assert_eq!(
-        groww_prod.matches(".append_row(").count(),
-        2,
-        "the Groww bridge persist sites re-forked — expected exactly 2 \
-         (the consume_feed_tick tick-persist closure + the documented \
-         FeedGapAuditWriter gap-episode audit exception)"
-    );
-    // The tick-persist site itself stays singular: exactly ONE
-    // `live_writer.append_row(` in the production region.
-    assert_eq!(
-        groww_prod.matches("live_writer.append_row(").count(),
-        1,
-        "the Groww bridge must persist TICKS through exactly ONE \
-         live_writer.append_row( site (inside the consume_feed_tick persist \
-         closure)"
-    );
-    // The Groww fold exists ONLY inside the shared-core closure: one
-    // per-tick `.consume_tick(` site in the bridge's production region (the
-    // catch-up/force-seal tasks route through catch_up_seal_all/force_seal_all,
-    // not consume_tick).
-    assert_eq!(
-        groww_prod.matches(".consume_tick(").count(),
-        1,
-        "the Groww bridge must fold through exactly ONE .consume_tick( site \
-         (inside the consume_feed_tick aggregate closure)"
-    );
+    // Section 3 (the Groww bridge delegation pins) was RETIRED 2026-07-15
+    // with the Groww live feed (operator directive: live feed removed;
+    // REST legs only). The shared-core + Dhan pins above remain the ratchet.
 }

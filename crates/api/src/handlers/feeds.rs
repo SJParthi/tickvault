@@ -149,10 +149,34 @@ pub async fn set_feed(
             StatusCode::CONFLICT,
             Json(FeedErrorResponse {
                 error: "the Dhan live feed was retired by operator directive 2026-07-13 \
-                     and its lane code was deleted (Dhan is REST-only now; Groww is the \
-                     live feed) — enabling it at runtime is permanently refused because \
+                     and its lane code was deleted (both brokers are REST-only since the \
+                     2026-07-15 Groww retirement) — enabling it at runtime is permanently refused because \
                      nothing exists to start; re-introducing the Dhan live WS requires a \
                      fresh dated operator quote in the scope-lock rule file first"
+                    .to_string(),
+                allowed: toggleable_except_dhan_labels(),
+            }),
+        ));
+    }
+
+    // S2b refusal (operator directive 2026-07-15 — "remove the whole Groww
+    // live feed; keep only spot 1m and option chain for both brokers"): the
+    // Groww live feed machinery (sidecar, bridge, activation lane) is
+    // DELETED — nothing exists to start, on ANY config. Accepting an enable
+    // would be a false-OK (flag flipped + persisted while no lane can ever
+    // run). Mirrors the Dhan 2026-07-13 refusal above. The REST legs are
+    // config-gated ([groww_spot_1m] / [groww_option_chain_1m] /
+    // [groww_contract_1m]) and independent of this flag.
+    if feed == Feed::Groww && req.enabled {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(FeedErrorResponse {
+                error: "the Groww live feed was retired by operator directive 2026-07-15 \
+                     and its lane code was deleted (the per-minute REST legs are \
+                     config-gated and unaffected) — enabling it at runtime is permanently \
+                     refused because nothing exists to start; re-introducing the Groww \
+                     live feed requires a fresh dated operator quote in the scope rule \
+                     file first"
                     .to_string(),
                 allowed: toggleable_except_dhan_labels(),
             }),
@@ -184,19 +208,9 @@ pub async fn set_feed(
         enabled = req.enabled,
         "feed runtime toggled via API"
     );
-    // Honesty (3-agent hostile review): the Groww lane is spawned dormant at boot
-    // and the activation watcher cold-STARTS it at runtime on enable — NO restart
-    // needed (PR-1). `groww_lane_running` is still false at this instant because
-    // activation (tables + auth + watch-list build) takes a few seconds; the
-    // response carries it so the truth is machine-readable and the page polls
-    // until it flips to running. This is an info, not a "needs restart".
-    if feed == Feed::Groww && req.enabled && !state.feed_runtime().is_groww_lane_running() {
-        info!(
-            "feed 'groww' enabled via API — the dormant lane is cold-starting now \
-             (ensuring tables, auth smoke-check, building the watch-list); no restart \
-             needed. It reports running once the watch-list is built (a few seconds)."
-        );
-    }
+    // S2b (2026-07-15): the Groww-enable path never reaches here anymore —
+    // the unconditional 409 above owns it; only DISABLE (both feeds) and the
+    // legacy Dhan-disable gate flow through.
     // PR-C2 (2026-07-13): the Dhan-enable path never reaches here anymore —
     // the unconditional 409 above owns it — so the old boot-ON
     // "re-activation transient" warn is deleted with the lane.
@@ -570,8 +584,11 @@ mod tests {
         assert!(!resp.groww_enabled);
     }
 
+    /// S2b (2026-07-15): the Groww live feed is retired — enabling it at
+    /// runtime is permanently refused with 409 (the Dhan 2026-07-13
+    /// precedent), and the runtime flag is NEVER flipped or persisted.
     #[tokio::test]
-    async fn test_set_feed_groww_enable_flips_state() {
+    async fn test_set_feed_groww_enable_refused_409_after_retirement() {
         let state = test_state(FeedsConfig {
             dhan_enabled: true,
             groww_enabled: false,
@@ -583,9 +600,20 @@ mod tests {
             Json(SetFeedRequest { enabled: true }),
         )
         .await;
-        let Json(resp) = res.expect("groww enable must succeed");
-        assert!(resp.groww_enabled, "groww now enabled");
-        assert!(state.feed_runtime().is_enabled(Feed::Groww));
+        let Err((code, Json(body))) = res else {
+            panic!("groww enable must be refused after the 2026-07-15 retirement");
+        };
+        assert_eq!(code, StatusCode::CONFLICT);
+        assert!(
+            body.error
+                .contains("retired by operator directive 2026-07-15"),
+            "got: {}",
+            body.error
+        );
+        assert!(
+            !state.feed_runtime().is_enabled(Feed::Groww),
+            "the refused enable must not flip the runtime flag"
+        );
     }
 
     #[tokio::test]
@@ -604,31 +632,6 @@ mod tests {
         let Json(resp) = res.expect("groww disable must succeed");
         assert!(!resp.groww_enabled);
         assert!(!state.feed_runtime().is_enabled(Feed::Groww));
-    }
-
-    #[tokio::test]
-    async fn test_enabling_groww_reports_lane_not_yet_running_during_cold_start() {
-        // Honesty: enabling Groww via API records the flag and the dormant lane
-        // cold-starts at runtime (PR-1, no restart). Immediately after the call the
-        // lane is not YET running (activation takes a few seconds), so the response
-        // reports groww_lane_running=false — an honest transient, not "needs restart".
-        let state = test_state(FeedsConfig {
-            dhan_enabled: true,
-            groww_enabled: false,
-            ..Default::default()
-        });
-        let Json(resp) = set_feed(
-            State(state),
-            Path("groww".to_string()),
-            Json(SetFeedRequest { enabled: true }),
-        )
-        .await
-        .expect("enable accepted");
-        assert!(resp.groww_enabled, "flag recorded");
-        assert!(
-            !resp.groww_lane_running,
-            "lane not yet running this instant — it cold-starts within seconds (no restart)"
-        );
     }
 
     #[tokio::test]
@@ -812,22 +815,15 @@ mod tests {
         }
     }
 
-    /// Groww toggles are UNAFFECTED by the Dhan retirement gate.
+    /// A Groww DISABLE is UNAFFECTED by the Dhan retirement gate (and by the
+    /// 2026-07-15 Groww-enable refusal — disable narrows, never widens).
     #[tokio::test]
-    async fn test_set_feed_groww_toggles_unaffected_when_dhan_config_off() {
+    async fn test_set_feed_groww_disable_unaffected_when_dhan_config_off() {
         let state = test_state(FeedsConfig {
             dhan_enabled: false,
-            groww_enabled: false,
+            groww_enabled: true,
             ..Default::default()
         });
-        let Json(on) = set_feed(
-            State(state.clone()),
-            Path("groww".to_string()),
-            Json(SetFeedRequest { enabled: true }),
-        )
-        .await
-        .expect("groww enable unaffected");
-        assert!(on.groww_enabled);
         let Json(off) = set_feed(
             State(state.clone()),
             Path("groww".to_string()),

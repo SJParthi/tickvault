@@ -251,8 +251,7 @@ pub fn load_feed_state(path: &Path) -> Option<PersistedFeedState> {
 pub fn overlay_feeds(config: FeedsConfig, persisted: Option<PersistedFeedState>) -> FeedsConfig {
     match persisted {
         None => config,
-        // The persisted overlay carries ONLY the runtime toggles; the
-        // `[feeds.groww]` tuning (auto-scale §34) always comes from config.
+        // The persisted overlay carries ONLY the runtime toggles.
         Some(p) => FeedsConfig {
             // 2026-07-13: narrow-only for Dhan — config-off wins over any
             // persisted-on (the retired live WS lane can never be
@@ -260,10 +259,6 @@ pub fn overlay_feeds(config: FeedsConfig, persisted: Option<PersistedFeedState>)
             // the operator's last disable (pre-Phase-A behaviour).
             dhan_enabled: config.dhan_enabled && p.dhan_enabled,
             groww_enabled: p.groww_enabled,
-            groww: config.groww,
-            // PR-R1 (2026-07-04): the native-shadow flag is CONFIG-ONLY (no
-            // runtime toggle in R1) — always from config, never persisted.
-            groww_native_shadow: config.groww_native_shadow,
         },
     }
 }
