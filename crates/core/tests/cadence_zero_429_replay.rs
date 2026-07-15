@@ -14,6 +14,11 @@
 //!   rolling 1000ms window — across every concurrency-ladder step,
 //!   step transition, anchor rung, retry and restart (the 2026-07-15
 //!   rolling-window gate change; Dhan hard cap 5/sec)
+//! - NEVER more than 5 TOTAL Dhan fires (chain + spot COMBINED) in ANY
+//!   rolling 1000ms window (verifier L1, 2026-07-15: the combined
+//!   per-second budget — pre-L1 the spot window and the chain gates
+//!   were independent and their SUM could hit 5-6/sec, zero headroom
+//!   vs Dhan's 5/sec)
 //! - zero gate denials on nominal slots (on-time dispatch)
 //! - exactly 1 decision per (lane, cycle) — the latch admits every fresh
 //!   pair and refuses every repeat
@@ -39,7 +44,7 @@
 
 use proptest::prelude::*;
 use tickvault_common::config::CadenceConfig;
-use tickvault_common::constants::CADENCE_SPOT_WINDOW_MS;
+use tickvault_common::constants::{CADENCE_SPOT_WINDOW_CAP_CEILING, CADENCE_SPOT_WINDOW_MS};
 use tickvault_common::feed::Feed;
 use tickvault_common::moneyness::{Moneyness, OptionLeg};
 use tickvault_core::cadence::assembly::{
@@ -161,6 +166,9 @@ struct FireLedger {
     per_underlying: [Vec<i64>; ChainUnderlying::COUNT],
     chain_global: Vec<i64>,
     spot: Vec<i64>,
+    /// EVERY Dhan fire (chain AND spot), in acquisition order — the
+    /// COMBINED per-second budget ledger (verifier L1, 2026-07-15).
+    combined: Vec<i64>,
 }
 
 impl FireLedger {
@@ -178,6 +186,18 @@ impl FireLedger {
             CADENCE_SPOT_WINDOW_MS,
             spot_window_cap,
             &format!("{case}: spot"),
+        );
+        // The COMBINED budget (verifier L1, 2026-07-15): never more than
+        // 5 TOTAL Dhan fires — chain + spot, across retries, ladder
+        // steps, rungs and restarts — in ANY rolling 1000ms window. The
+        // pre-L1 gates asserted spot and chain floors SEPARATELY, so
+        // their SUM (a chain fire + a full spot group in one window) was
+        // never caught.
+        assert_window_cap(
+            &self.combined,
+            CADENCE_SPOT_WINDOW_MS,
+            CADENCE_SPOT_WINDOW_CAP_CEILING,
+            &format!("{case}: COMBINED chain+spot"),
         );
     }
 }
@@ -246,6 +266,7 @@ fn sim_gated_chain_fire(
             GateVerdict::Acquired => {
                 ledger.per_underlying[underlying.index()].push(clock.wall_ms);
                 ledger.chain_global.push(clock.wall_ms);
+                ledger.combined.push(clock.wall_ms);
                 return clock.wall_ms;
             }
             GateVerdict::RetryAtMs(at_mono) => {
@@ -279,6 +300,7 @@ fn sim_gated_spot_fire(
         match gates.try_acquire_spot(clock.mono()) {
             GateVerdict::Acquired => {
                 ledger.spot.push(clock.wall_ms);
+                ledger.combined.push(clock.wall_ms);
                 return clock.wall_ms;
             }
             GateVerdict::RetryAtMs(at_mono) => {
