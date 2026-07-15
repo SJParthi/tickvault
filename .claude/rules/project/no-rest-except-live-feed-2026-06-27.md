@@ -1,5 +1,17 @@
 # No REST Except Live Feed — Market-Data REST Lock (Operator Lock 2026-06-27)
 
+> **⚠ LOCK INVERTED 2026-07-15 — NO live market-data feed exists (operator Q1, received directly in this
+> session: *"remove the whole Groww live feed; keep only spot 1m and option chain for both brokers; go."*;
+> approval Q2, typos preserved: *"go aehad approv ed dude"*):** with the Groww live WS retired (after the
+> 2026-07-13 Dhan retirement), the §8 (Dhan) + §9 (Groww) scheduled-pull KEEP classes ARE the entire
+> market-data surface — §1's "only the live-feed WebSocket carries market data" no longer names a running
+> feed. The Groww master-CSV + token-read KEEP rows STAND (the watch set supplies the REST legs' identity;
+> the SEBI master continuity keeps writing). The live-feed-AUTH KEEP class now serves only the REST stacks +
+> the order-side channels (order/position live push is a separate, permanently-kept surface per the
+> operator's 2026-07-15 order-side directive — recorded by the order-side session; see the cluster-A rule
+> updates — market data = per-minute REST pull, order/position events = live push). GDF
+> (`gdf-third-feed-scope-2026-07-13.md`) remains the only path to a future live market-data feed.
+
 > **⚠ 2026-07-12 NOTE — BruteX cross-verify S3 read is a KEEP class:** per the operator's 2026-07-12 directive recorded verbatim in `groww-second-feed-scope-2026-06-19.md` §37, TickVault reads BruteX-produced backtest CSVs from OUR OWN S3 bucket (`s3://tv-prod-cold/crossverify/*`) via `aws-sdk-s3` GetObject/ListObjectsV2. That is an INTERNAL artifact transfer from our own infrastructure — the same class as the S3 cold-archive surface — NOT a market-data REST endpoint of Dhan or Groww. A new **KEEP** row is added to the §3 inventory below. This lock's ban on Dhan/Groww market-data REST pulls is UNCHANGED.
 >
 > **⚠ 2026-07-12 NOTE (SECOND same-day directive) — per-minute REST pipeline is a scheduled-pull KEEP class:** a SECOND 2026-07-12 operator directive (relayed verbatim via the coordinator session, quote preserved in §8.0 below) adds a narrow **scheduled-pull KEEP class**: the per-minute **spot-1m intraday fetch** (`POST /v2/charts/intraday`, interval `"1"`, exactly 3 IDX_I SIDs — NIFTY=13, BANKNIFTY=25, SENSEX=51) + the per-minute **option-chain fetch** (`POST /v2/optionchain` + `POST /v2/optionchain/expirylist`, the same 3 underlyings' current expiry, config-gated DEFAULT-OFF pending the first-live-boot entitlement probe) — **see the new §8**. Two new KEEP rows join the §3 inventory; the matching legacy REMOVE rows are annotated, never deleted. The ban on all OTHER market-data REST pulls is UNCHANGED.

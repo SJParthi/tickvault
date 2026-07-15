@@ -116,7 +116,11 @@ emit module `cross_verify_1m_boot.rs` was deleted with the Dhan instrument
 chain (the 15:31 IST Dhan live-vs-historical cross-verify has no live side
 to compare — `cross-verify-1m-error-codes.md` retirement banner), so both
 filters could never match again; the tf map entries were removed in the
-same PR (dated note in `error-code-alarms.tf`).
+same PR (dated note in `error-code-alarms.tf`). The `feed-stall-01`
+filter+alarm AND the `tv-<env>-feed-stall-restarts` counter alarm
+(`feed-stall-restart-alarm.tf`) were RETIRED 2026-07-15 with the Groww live
+feed — their emit sites (the stall watchdog + sidecar supervisor) were
+deleted, so neither could ever fire again (dated notes in both tf files).
 
 > Removed from the filtered+alarmed set: the Dhan REST canary code
 > (RETIRED 2026-07-14 with its module + both spawn sites + the
