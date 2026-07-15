@@ -1244,13 +1244,13 @@ where
             }
             Some(completion) = rx.recv() => {
                 handle_completion(
-                    clock.as_ref(),
-                    &deps.config,
+                    clock,
+                    deps,
                     slots,
                     completion,
                     &mut cycle,
                     latch,
-                    deps.dry_run,
+                    &tx,
                 );
             }
             () = tokio::time::sleep(sleep_dur) => {
@@ -1347,10 +1347,8 @@ struct CycleState {
     groww_leg_ok: [bool; 7],
     /// Per-leg Groww completion count (burst = 1st, fallback = 2nd): a
     /// failure is TERMINAL for the leg only on its 2nd attempt (the
-    /// verdict refetches every failed leg exactly once) — or on its 1st
-    /// when it completes AFTER the verdict passed it by (still in flight
-    /// at the verdict instant — F4, 2026-07-15: never refetched
-    /// concurrently, so no 2nd attempt exists for it).
+    /// verdict — or the L3 DEFERRED per-leg fallback — refetches every
+    /// failed leg exactly once).
     groww_leg_attempts: [u8; 7],
     /// Per-leg dispatched-but-not-completed flags (F4, 2026-07-15): the
     /// verdict must NOT refetch a leg whose ORIGINAL request is still in
@@ -1359,8 +1357,12 @@ struct CycleState {
     /// still-in-flight leg is SKIPPED by the fallback (await-or-skip;
     /// first-write-wins on completion stays).
     groww_leg_inflight: [bool; 7],
-    /// The GrowwVerdict instant passed (F4): a leg completing Err after
-    /// it was skipped in flight is TERMINAL on its 1st attempt.
+    /// The GrowwVerdict instant passed (F4/L3): a leg completing Err on
+    /// its 1st attempt after it was skipped in flight has no later
+    /// verdict — the L3 DEFERRED fallback (2026-07-15) dispatches its one
+    /// fallback attempt AT that completion when it can still land inside
+    /// the lane cutoff; only when it cannot is the leg terminal on its
+    /// 1st attempt.
     groww_verdict_passed: bool,
     groww_fallback_launched: bool,
     late_wake_flagged: bool,
@@ -1863,19 +1865,26 @@ async fn bound_spot_fetch<E: CadenceExecutor>(
     }
 }
 
-/// Handle one fetch completion: record, count, retry-policy, and attempt
+/// Handle one fetch completion: record, count, retry-policy (incl. the
+/// L3 DEFERRED Groww per-leg fallback, 2026-07-15), and attempt
 /// event-driven finalize for BOTH lanes (cross-fill runs inside).
-// APPROVED: the completion dispatcher threads the whole cycle state + the F10 dry-run mode — one private fn with one call site.
-#[allow(clippy::too_many_arguments)]
-fn handle_completion<C: CadenceClock>(
-    clock: &C,
-    cfg: &CadenceConfig,
+// APPROVED: the completion dispatcher threads the whole cycle state + the runner deps — one private fn with one call site.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn handle_completion<C, D, G>(
+    clock: &Arc<C>,
+    deps: &CadenceRunnerDeps<D, G>,
     slots: &CycleSlots,
     completion: Completion,
     cycle: &mut CycleState,
     latch: &mut DecisionLatch,
-    dry_run: bool,
-) {
+    tx: &mpsc::Sender<Completion>,
+) where
+    C: CadenceClock,
+    D: CadenceExecutor + 'static,
+    G: CadenceExecutor + 'static,
+{
+    let cfg = &deps.config;
+    let dry_run = deps.dry_run;
     let now_wall = clock.ist_ms_of_day();
     let lane_feed = completion.lane;
     let leg_label = match &completion.kind {
@@ -1996,20 +2005,79 @@ fn handle_completion<C: CadenceClock>(
                                 }
                             }
                         }
+                        // L3 (2026-07-15): the DEFERRED per-leg fallback
+                        // — a leg SKIPPED in flight at the verdict (F4)
+                        // whose original request completes Err AFTER the
+                        // verdict has no later verdict to refetch it. Its
+                        // ONE fallback attempt dispatches IMMEDIATELY at
+                        // this completion when it can still land inside
+                        // the lane cutoff (mirrors the verdict fallback:
+                        // any Err class, expiry resolved at dispatch,
+                        // first-write-wins on completion; never a
+                        // concurrent duplicate — the original already
+                        // completed).
+                        let mut deferred_fallback = false;
+                        if lane_feed == Feed::Groww
+                            && cycle.groww_verdict_passed
+                            && cycle.groww_leg_attempts[underlying_idx] == 1
+                            && !lane.resolved
+                            && now_wall.saturating_add(CADENCE_RETRY_LATENCY_ALLOWANCE_MS)
+                                <= slots.groww_cutoff_ms
+                        {
+                            deferred_fallback = true;
+                            lane.flags.groww_fallback = true;
+                            metrics::counter!(
+                                "tv_cadence_groww_fallback_total",
+                                "leg" => "chain"
+                            )
+                            .increment(1);
+                            debug!(
+                                underlying_idx,
+                                "cadence: groww chain DEFERRED fallback dispatched (L3)"
+                            );
+                            let expiry_yyyymmdd = deps.expiry_resolver.resolved_expiry(
+                                Feed::Groww,
+                                underlying,
+                                clock.ist_date(),
+                            );
+                            if expiry_yyyymmdd.is_none() {
+                                lane.flags.expiry_unresolved = true;
+                            }
+                            let req = ChainFetchRequest {
+                                feed: Feed::Groww,
+                                underlying,
+                                expiry_yyyymmdd,
+                                cycle_minute_ist: slots.cycle_minute_ist,
+                                deadline_epoch_ms: clock
+                                    .epoch_ms()
+                                    .saturating_add(deps.config.groww_request_timeout_ms),
+                            };
+                            lane.inflight = lane.inflight.saturating_add(1);
+                            cycle.groww_leg_inflight[underlying_idx] = true;
+                            spawn_chain_fetch(
+                                Arc::clone(&deps.groww_executor),
+                                tx.clone(),
+                                req,
+                                underlying_idx,
+                                deps.config.groww_request_timeout_ms,
+                            );
+                        }
                         // `fetch_failed` = the rule-file definition: a
                         // non-Empty failure AFTER the retry budget (Dhan:
                         // no retry admitted; Groww: the fallback attempt
-                        // itself failed, or the verdict already passed a
-                        // still-in-flight leg by — F4: no 2nd attempt
-                        // exists for it) with the cell still missing.
-                        // QueueDelay is stage-tagged distinctly (its own
-                        // coalesced stage; F1(iii)) — never conflated
-                        // with the transport-class fetch_failed.
+                        // itself failed, or no fallback could land — L3:
+                        // an in-flight-skipped leg whose deferred fallback
+                        // dispatched is NOT terminal on its 1st attempt)
+                        // with the cell still missing. QueueDelay is
+                        // stage-tagged distinctly (its own coalesced
+                        // stage; F1(iii)) — never conflated with the
+                        // transport-class fetch_failed.
                         let terminal = match lane_feed {
                             Feed::Dhan => !retry_scheduled,
                             Feed::Groww => {
-                                cycle.groww_leg_attempts[underlying_idx] >= 2
-                                    || cycle.groww_verdict_passed
+                                !deferred_fallback
+                                    && (cycle.groww_leg_attempts[underlying_idx] >= 2
+                                        || cycle.groww_verdict_passed)
                             }
                         };
                         if terminal
@@ -2093,11 +2161,54 @@ fn handle_completion<C: CadenceClock>(
                                 );
                             }
                         }
+                        // L3 (2026-07-15): the DEFERRED per-leg fallback
+                        // for an in-flight-skipped SPOT leg — see the
+                        // chain arm above.
+                        let mut deferred_fallback = false;
+                        if lane_feed == Feed::Groww
+                            && cycle.groww_verdict_passed
+                            && cycle.groww_leg_attempts[target_idx + ChainUnderlying::COUNT] == 1
+                            && !lane.resolved
+                            && now_wall.saturating_add(CADENCE_RETRY_LATENCY_ALLOWANCE_MS)
+                                <= slots.groww_cutoff_ms
+                        {
+                            deferred_fallback = true;
+                            lane.flags.groww_fallback = true;
+                            metrics::counter!(
+                                "tv_cadence_groww_fallback_total",
+                                "leg" => "spot"
+                            )
+                            .increment(1);
+                            debug!(
+                                target_idx,
+                                "cadence: groww spot DEFERRED fallback dispatched (L3)"
+                            );
+                            let req = SpotFetchRequest {
+                                feed: Feed::Groww,
+                                target,
+                                cycle_minute_ist: slots.cycle_minute_ist,
+                                deadline_epoch_ms: clock
+                                    .epoch_ms()
+                                    .saturating_add(deps.config.groww_request_timeout_ms),
+                            };
+                            lane.inflight = lane.inflight.saturating_add(1);
+                            cycle.groww_leg_inflight[target_idx + ChainUnderlying::COUNT] = true;
+                            spawn_spot_fetch(
+                                Arc::clone(&deps.groww_executor),
+                                tx.clone(),
+                                req,
+                                target_idx,
+                                deps.config.groww_request_timeout_ms,
+                            );
+                        }
                         let terminal = match lane_feed {
                             Feed::Dhan => !retry_scheduled,
                             Feed::Groww => {
-                                cycle.groww_leg_attempts[target_idx + ChainUnderlying::COUNT] >= 2
-                                    || cycle.groww_verdict_passed
+                                !deferred_fallback
+                                    && (cycle.groww_leg_attempts
+                                        [target_idx + ChainUnderlying::COUNT]
+                                        >= 2
+                                        || cycle.groww_verdict_passed)
                             }
                         };
                         let cell_missing = match target.chain_underlying() {
@@ -2126,8 +2237,24 @@ fn handle_completion<C: CadenceClock>(
     let dhan_exhausted = lane_own_path_exhausted(Feed::Dhan, cycle);
     let groww_exhausted = lane_own_path_exhausted(Feed::Groww, cycle);
     let CycleState { dhan, groww, .. } = cycle;
-    finalize_if_complete(clock, slots, dhan, groww, latch, dhan_exhausted, dry_run);
-    finalize_if_complete(clock, slots, groww, dhan, latch, groww_exhausted, dry_run);
+    finalize_if_complete(
+        clock.as_ref(),
+        slots,
+        dhan,
+        groww,
+        latch,
+        dhan_exhausted,
+        dry_run,
+    );
+    finalize_if_complete(
+        clock.as_ref(),
+        slots,
+        groww,
+        dhan,
+        latch,
+        groww_exhausted,
+        dry_run,
+    );
 }
 
 /// Is the lane's OWN fetch path exhausted for this cycle? TRUE when the

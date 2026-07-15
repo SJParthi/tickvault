@@ -831,8 +831,13 @@ pub struct CadenceConfig {
     #[serde(default)]
     pub groww_anchor_offset_ms: i64,
     /// Groww burst-failure verdict instant, ms after the burst anchor
-    /// (Assumed — default 800: a request FAILED iff Err OR still pending
-    /// here; any failure ⇒ sequential fallback).
+    /// (Assumed — default 800): a leg FAILED iff it completed Err by
+    /// here; every failed leg gets ONE sequential fallback refetch. A
+    /// leg still IN FLIGHT here is SKIPPED (F4, 2026-07-15 — never a
+    /// duplicate concurrent same-leg request); if its original request
+    /// later completes Err before the lane cutoff, its one fallback
+    /// attempt dispatches IMMEDIATELY at that completion (the L3
+    /// DEFERRED per-leg fallback, 2026-07-15).
     #[serde(default = "default_cadence_groww_burst_timeout_ms")]
     pub groww_burst_timeout_ms: i64,
     /// Per-request bound on every individual Groww request incl. fallback
