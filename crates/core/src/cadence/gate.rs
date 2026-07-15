@@ -813,6 +813,56 @@ mod tests {
     }
 
     #[test]
+    fn test_cadence_gate_expiry_fire_in_burst_window_defers_fourth_nominal_spot() {
+        // R1 (2026-07-15) — DOCUMENTATION of the collision class the
+        // mid-minute wave anchor exists to prevent (verifier round-2
+        // reproducer): an expiry-list retry fire invading the cycle
+        // burst window consumes one COMBINED-budget slot, so a nominal
+        // chain post-fire (T+2000, routine 1ms wake jitter) + the
+        // invading expiry fire + the step-0 4-spot group at T+3000 puts
+        // SIX Dhan fires in the spot group's rolling second — the 4th
+        // NOMINAL spot DEFERS, which the runner reports as the
+        // should-never `gate_deferred_nominal` CADENCE-03 error + the
+        // must-stay-0 `tv_cadence_gate_denials_total`. The gate behaves
+        // CORRECTLY here (a deferral, never a broker violation) — the
+        // FIX is scheduling: in-session expiry retry waves anchor at
+        // mid-minute (:30, `next_expiry_wave_instant_ms`), so they can
+        // never share a rolling second with the :55–:05 burst region;
+        // this L2 gate stays the backstop the assertion exercises.
+        let g = DhanGates::new(3_000, 4);
+        let t = 10_000_i64; // an arbitrary boundary in the monotonic domain
+        // Nominal chain post-fire at T+2000 with routine 1ms jitter.
+        assert_eq!(
+            g.try_acquire_chain(ChainUnderlying::Nifty, None, t + 2_001),
+            GateVerdict::Acquired
+        );
+        // The invading expiry retry fire inside the burst window.
+        assert_eq!(g.try_acquire_expiry(t + 2_500), GateVerdict::Acquired);
+        // The nominal step-0 spot group at T+3000: the combined budget
+        // (cap 5) already carries chain+expiry — only THREE spots admit.
+        assert_eq!(g.try_acquire_spot(t + 3_000), GateVerdict::Acquired);
+        assert_eq!(g.try_acquire_spot(t + 3_000), GateVerdict::Acquired);
+        assert_eq!(g.try_acquire_spot(t + 3_000), GateVerdict::Acquired);
+        // The 4th NOMINAL spot defers to the chain fire's window exit —
+        // the false should-never page, every minute of a vendor outage,
+        // if the retry waves were allowed to phase-lock into the burst.
+        assert_eq!(
+            g.try_acquire_spot(t + 3_000),
+            GateVerdict::RetryAtMs(t + 3_001)
+        );
+        // CONTRAST: without the expiry invasion the SAME nominal cycle
+        // admits in full (chain + 4 spots = 5 ≤ the combined budget).
+        let clean = DhanGates::new(3_000, 4);
+        assert_eq!(
+            clean.try_acquire_chain(ChainUnderlying::Nifty, None, t + 2_001),
+            GateVerdict::Acquired
+        );
+        for _ in 0..4 {
+            assert_eq!(clean.try_acquire_spot(t + 3_000), GateVerdict::Acquired);
+        }
+    }
+
+    #[test]
     fn test_cadence_gate_reseed_all_wastes_at_most_one_slot() {
         // reseed_all (boot / restart) defers every gate exactly one full
         // spacing/window from the reseed instant — never more, never less.
