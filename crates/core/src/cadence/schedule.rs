@@ -113,6 +113,37 @@ pub fn next_expiry_wave_instant_ms(
         .saturating_add(CADENCE_EXPIRY_WAVE_MID_MINUTE_ANCHOR_MS)
 }
 
+/// Should the sleep between expiry-resolution retry waves anchor at the
+/// mid-minute instant? True on a trading day, before session end (the
+/// last cycle boundary), whenever the PLAIN `now + interval` target
+/// would reach the era look-ahead window (one minute before the first
+/// cycle boundary). That single condition subsumes the pre-R3-F1 "now
+/// within one minute of the first boundary" look-ahead (`interval` ≥
+/// 1ms means the target is strictly after `now`) AND clamps the
+/// transitional wave (R3-F1 belt (b), 2026-07-15): validation bounds
+/// `expiry_retry_interval_ms` ≤ 60s (belt (a)), but even under future
+/// validation drift the LAST pre-era wake of a >60s interval must not
+/// sleep the plain interval straight into the first session cycle's
+/// burst window (65s @ 09:14:58 → a plain wake at 09:16:03 = the
+/// spot-group instant → one false `gate_deferred_nominal` page at
+/// session entry). Boot-phase / non-trading / post-session wakes keep
+/// the plain configured cadence — no cycle bursts exist to collide
+/// with. Pure.
+#[must_use]
+pub fn expiry_wave_anchor_active(now_ms_of_day: i64, interval_ms: i64, trading_day: bool) -> bool {
+    if !trading_day {
+        return false;
+    }
+    const MINUTE_MS: i64 = 60 * MS_PER_SEC;
+    let last_ms = i64::from(CADENCE_LAST_CYCLE_BOUNDARY_SECS_OF_DAY_IST) * MS_PER_SEC;
+    if now_ms_of_day >= last_ms {
+        return false;
+    }
+    let era_lookahead_ms =
+        i64::from(CADENCE_FIRST_CYCLE_BOUNDARY_SECS_OF_DAY_IST) * MS_PER_SEC - MINUTE_MS;
+    now_ms_of_day.saturating_add(interval_ms.max(1)) >= era_lookahead_ms
+}
+
 /// The next cycle boundary at-or-after `now_secs_of_day` on the IST
 /// seconds-of-day domain — the SAME calculus as the app's
 /// `next_minute_close_fire` (boundaries are the exact minute marks
@@ -330,10 +361,12 @@ mod tests {
     #[test]
     fn test_cadence_expiry_wave_anchor_mid_minute_band_never_burst_window() {
         // R1 (2026-07-15): every IN-SESSION expiry retry wave lands at
-        // seconds-of-minute 30 — inside the mid-minute band [20, 50],
-        // therefore NEVER inside the burst region (chain pre-fires from
-        // :55, Groww waves :00–:03, spot group :03, retry grid ≤ :15) —
-        // for arbitrary wake phases and configured intervals.
+        // seconds-of-minute 30 EXACTLY — therefore NEVER inside the
+        // burst region (chain pre-fires from :55, Groww waves :00–:03,
+        // spot group :03, retry grid ≤ :15) — for arbitrary wake phases
+        // and configured intervals. The exact ==30 pin IS the band
+        // assertion (any band check after it would be dead code —
+        // R3 nit, 2026-07-15).
         for interval in [1_i64, 5_000, 60_000, 90_000, 120_000, 300_000] {
             let mut now = ms(9, 16, 0, 0);
             while now < ms(9, 26, 0, 0) {
@@ -343,10 +376,6 @@ mod tests {
                 assert_eq!(
                     secs_of_minute, 30,
                     "in-session waves fire at :30 exactly (interval {interval}, now {now})"
-                );
-                assert!(
-                    (20..=50).contains(&secs_of_minute),
-                    "mid-minute band [20, 50] — never the burst window"
                 );
                 // A slower-than-per-minute interval is honored to within
                 // one anchor-grid minute (waves skip anchors, never fire
@@ -367,6 +396,47 @@ mod tests {
         // cadence — no cycle bursts exist to collide with.
         assert_eq!(next_expiry_wave_instant_ms(1_000, 60_000, false), 61_000);
         assert_eq!(next_expiry_wave_instant_ms(1_000, 0, false), 1_001);
+    }
+
+    /// R3-F1 belt (b), 2026-07-15: the transitional-wave clamp. A
+    /// config-legal-under-drift interval > 60s used to escape the
+    /// runner's fixed one-minute look-ahead: the LAST pre-era wake
+    /// (≤ 09:14:59) slept the PLAIN interval and landed ONE
+    /// transitional wave inside the FIRST session cycle's burst window
+    /// (65s @ 09:14:58 → 09:16:03 = the spot-group instant → one false
+    /// `gate_deferred_nominal` page at session entry). The predicate
+    /// now keys on where the PLAIN target would LAND, so the first
+    /// in-era wake snaps to a :30 anchor instead.
+    #[test]
+    fn test_expiry_wave_anchor_active_clamps_first_in_era_wake_to_anchor() {
+        let now = ms(9, 14, 58, 0);
+        let interval = 65_000_i64;
+        // The bug shape: the plain target IS the spot-group instant of
+        // the first session cycle (boundary 09:16:00, spot group T+3s).
+        assert_eq!(now + interval, ms(9, 16, 3, 0));
+        // The clamp turns the anchor ON for this wake…
+        assert!(expiry_wave_anchor_active(now, interval, true));
+        // …and the anchored instant is a :30 anchor, honoring the
+        // whole-minute head-room of the >60s interval, OUTSIDE any
+        // burst window.
+        assert_eq!(
+            next_expiry_wave_instant_ms(now, interval, true),
+            ms(9, 15, 30, 0)
+        );
+        // The pre-existing one-minute look-ahead is preserved (subsumed
+        // by the plain-target condition).
+        assert!(expiry_wave_anchor_active(ms(9, 15, 30, 0), 60_000, true));
+        // Far pre-era wakes keep the plain cadence (target far short of
+        // the era look-ahead window).
+        assert!(!expiry_wave_anchor_active(ms(8, 0, 0, 0), 60_000, true));
+        // Non-trading days never anchor.
+        assert!(!expiry_wave_anchor_active(now, interval, false));
+        // Session-over wakes keep the plain cadence.
+        assert!(!expiry_wave_anchor_active(ms(15, 30, 0, 0), 60_000, true));
+        // Boundary edge: the era look-ahead opens exactly one minute
+        // before the first cycle boundary (plain target at 09:15:00).
+        assert!(expiry_wave_anchor_active(ms(9, 14, 0, 0), 60_000, true));
+        assert!(!expiry_wave_anchor_active(ms(9, 13, 59, 999), 60_000, true));
     }
 
     #[test]
