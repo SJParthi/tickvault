@@ -40,7 +40,8 @@ use super::executor::{
     ExpiryResolver, SpotFetchRequest, SpotSnapshot, SpotTarget,
 };
 use super::expiry::{
-    DayLockedExpiryStore, expiry_page_due, naive_to_yyyymmdd, policy_for, resolve_policy_expiry,
+    DayLockedExpiryStore, expiry_page_due_after_wave, naive_to_yyyymmdd, policy_for,
+    resolve_policy_expiry,
 };
 use super::gate::{DhanGates, GateVerdict};
 use super::ladder::{
@@ -628,19 +629,30 @@ async fn run_expiry_resolution_loop<C, D, G>(
     let shutdown = Arc::clone(&deps.shutdown);
     let shutdown_fut = shutdown.notified();
     tokio::pin!(shutdown_fut);
+    // E4 (2026-07-15): was the loop's FIRST observation of the current
+    // day already past the deadline (a post-deadline crash-boot)? Such a
+    // day requires ≥2 consecutive failed waves before the page fires —
+    // never the first-wave hair trigger. `failed_waves` counts completed
+    // in-session attempt waves since the day was first observed (pairs
+    // resolve monotonically within a day, so an unresolved pair has
+    // failed every wave so far).
+    let mut booted_after_deadline = false;
+    let mut failed_waves: u32 = 0;
     loop {
         // IST trading-day identity via the injected clock (production:
         // `trading_calendar::ist_offset()` — NEVER UTC); the day flip is
         // the ONLY re-resolution trigger (the store re-keys inside
         // record_policy_date / the is_resolved day check).
         let today = clock.ist_date();
-        if paged_day != Some(today) {
-            paged_day = Some(today);
-            paged = [[false; ChainUnderlying::COUNT]; Feed::COUNT];
-        }
         // APPROVED: ms-of-day / 1000 fits u32 (< 86_400) — the cast is safe.
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let now_secs = (clock.ist_ms_of_day().max(0) / 1_000) as u32;
+        if paged_day != Some(today) {
+            paged_day = Some(today);
+            paged = [[false; ChainUnderlying::COUNT]; Feed::COUNT];
+            booted_after_deadline = now_secs >= deadline_secs;
+            failed_waves = 0;
+        }
         let session_over = now_secs >= super::schedule::CADENCE_LAST_CYCLE_BOUNDARY_SECS_OF_DAY_IST;
         if deps.calendar.is_trading_day(today) && !session_over {
             let dhan_on = deps.dhan_enabled.load(Ordering::Acquire);
@@ -652,6 +664,7 @@ async fn run_expiry_resolution_loop<C, D, G>(
                     store.as_ref(),
                     Feed::Dhan,
                     today,
+                    paged[Feed::Dhan.index()],
                 )
                 .await;
             }
@@ -662,9 +675,12 @@ async fn run_expiry_resolution_loop<C, D, G>(
                     store.as_ref(),
                     Feed::Groww,
                     today,
+                    paged[Feed::Groww.index()],
                 )
                 .await;
             }
+            // E4: one attempt wave completed this iteration.
+            failed_waves = failed_waves.saturating_add(1);
             // The deadline PAGE (edge-latched per pair per day; disabled
             // lanes never page — nothing fires for them).
             for (feed, enabled) in [(Feed::Dhan, dhan_on), (Feed::Groww, groww_on)] {
@@ -674,7 +690,14 @@ async fn run_expiry_resolution_loop<C, D, G>(
                 for underlying in ChainUnderlying::ALL {
                     let resolved = store.is_resolved(today, feed, *underlying);
                     let latch = &mut paged[feed.index()][underlying.index()];
-                    if expiry_page_due(now_secs, deadline_secs, resolved, *latch) {
+                    if expiry_page_due_after_wave(
+                        now_secs,
+                        deadline_secs,
+                        resolved,
+                        *latch,
+                        booted_after_deadline,
+                        failed_waves,
+                    ) {
                         *latch = true;
                         metrics::counter!(
                             "tv_cadence_expiry_unresolved_total",
@@ -721,6 +744,7 @@ async fn resolve_broker_expiries<C, E>(
     store: &DayLockedExpiryStore,
     broker: Feed,
     today: NaiveDate,
+    paged_row: [bool; ChainUnderlying::COUNT],
 ) where
     C: CadenceClock,
     E: CadenceExecutor,
@@ -786,6 +810,26 @@ async fn resolve_broker_expiries<C, E>(
                 expiry = %date.as_iso_string(),
                 "cadence: expiry resolved + day-locked"
             );
+            // E3 (2026-07-15): the typed FALLING-EDGE recovery signal —
+            // fires only when the pre-market deadline page HAD fired for
+            // this (broker, underlying) pair (the paged latch). At most
+            // once per pair per day by construction (first write wins).
+            if paged_row[underlying.index()] {
+                metrics::counter!(
+                    "tv_cadence_expiry_resolved_late_total",
+                    "broker" => broker.as_str(),
+                    "underlying" => underlying.as_str()
+                )
+                .increment(1);
+                info!(
+                    code = ErrorCode::Cadence01LaneDegraded.code_str(),
+                    stage = "expiry_resolved_late",
+                    broker = broker.as_str(),
+                    underlying = underlying.as_str(),
+                    expiry = %date.as_iso_string(),
+                    "CADENCE-01 recovery: expiry resolved LATE — after the                      pre-market deadline page for this pair; the lanes                      re-key from the next fire (falling edge, at most once                      per broker+underlying per day)"
+                );
+            }
         }
         if verdict.newly_disagreeing {
             let view = store.view(today, *underlying);
