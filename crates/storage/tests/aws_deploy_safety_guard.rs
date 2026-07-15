@@ -175,20 +175,24 @@ fn deploy_eip_is_enabled_by_default() {
     );
 }
 
-/// EBS hot-window default is 50 GB (operator approval 2026-07-13 — prod
-/// disk-pressure grow 30 -> 50; history 10 -> 30 -> 50; S3 cold-tier
-/// archives partitions > 90d).
+/// EBS FRESH-PROVISION default is 20 GB (2026-07-15 downsize pre-stage —
+/// executor decision recorded in daily-universe-scope-expansion §0/§7 Rule 3,
+/// NOT operator-quoted scope). gp3 cannot SHRINK, so the LIVE root stays
+/// 50 GB tonight; 20 GB lands only via the terminate-and-recreate in the
+/// operator's erase window. History 10 -> 30 -> 50 -> 20 target; S3
+/// cold-tier archives partitions > 90d.
 #[test]
-fn deploy_ebs_default_is_50gb() {
+fn deploy_ebs_default_is_20gb() {
     let vars = squish(&read(VARIABLES_TF));
     assert!(
         vars.contains("variable \"ebs_gp3_size_gb\""),
         "variables.tf must declare `ebs_gp3_size_gb`."
     );
     assert!(
-        vars.contains("type = number default = 50"),
-        "ebs_gp3_size_gb must default to 50 GB (operator approval 2026-07-13 — \
-         disk-pressure grow; supersedes the 2026-05-29 §7 Quote 6 30 GB lock)."
+        vars.contains("type = number default = 20"),
+        "ebs_gp3_size_gb must default to 20 GB (2026-07-15 downsize pre-stage: \
+         fresh-volume replacement target only — the live 50 GB root cannot \
+         shrink in place; supersedes the 2026-07-13 50 GB grow default)."
     );
 }
 

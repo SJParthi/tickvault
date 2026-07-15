@@ -66,6 +66,32 @@
 > later PR gated on a live memory measurement and is NOT changed here;
 > `dry_run` stays `true`.
 
+**Quote 8 (2026-07-15, downsize = t4g.medium + QuestDB 1g, automated):**
+> "Flip tonight: t4g.medium, QuestDB 1g, automated"
+>
+> Operator authorized (the quote's exact scope — nothing more): the host instance
+> downsizes from **r8g.large** (2 vCPU / 16 GiB) → **t4g.medium** (ARM Graviton2
+> burstable, 2 vCPU / **4 GiB**), QuestDB `QDB_MEM_LIMIT` 4g → **1g** (compose
+> default + the on-box `deploy/docker/.env` override, retuned via SSM in the same
+> run), executed AUTOMATED via a new guarded one-shot `workflow_dispatch` GitHub
+> Actions workflow (`.github/workflows/downsize-instance.yml`, reusing the deploy
+> workflow's existing AWS credentials), with the old 50 GB root volume snapshotted
+> FIRST (rollback artifact, kept ~1 week). Live ap-south-1 on-demand =
+> **$0.0224/hr** (the 2026-05-18-verified console rate — re-verify at execution).
+> The **Elastic IP is KEPT** (Dhan static-IP + the SSM path). This dated quote
+> satisfies §7 Mechanical Rule 1 for the instance change.
+>
+> **Executor decision (2026-07-15, NOT operator-quoted — recorded separately per
+> §15, no scope put in the operator's mouth):** the terraform `ebs_gp3_size_gb`
+> default flips 50 → **20 GB** ONLY to pre-stage a later terminate-and-recreate
+> in the operator's post-market data-erase window. Shrinking the live 50 GB root
+> in place is IMPOSSIBLE (gp3 `modify-volume` grows only, and a 50 GB snapshot
+> cannot restore into a 20 GB volume), so TONIGHT'S flip keeps the live 50 GB
+> root. Terraform never touches the live volume (`root_block_device[0].volume_size`
+> is in `lifecycle.ignore_changes`); the box is fully cattle-provisioned by
+> `user-data.sh.tftpl`, so the 20 GB root lands only with a deliberate instance
+> replacement, guarded by tonight's snapshot.
+
 **Approvals:**
 - 2026-05-27: Approved Sub-PR plan items A–D (infinite retry policy, single `instrument_lifecycle` table, separate `instrument_lifecycle_audit` table, plan growing to 14 sub-PRs)
 - 2026-05-27: Approved options X–Z (EventBridge cron at 08:30 IST, `lifecycle_state_locked` column for operator overrides, `--dry-run-universe` CLI flag for first prod validation)
@@ -75,6 +101,7 @@
 - 2026-06-05: Operator NARROWED the schedule back from 08:00–17:00 IST to **08:30–16:30 IST** (verbatim: "make the aws instance start and stop from 8.30 am till 4.30 pm dude one and only when it is needed let me start it manually"). Crons: start `cron(0 3 ? * MON-FRI *)` (03:00 UTC = 08:30 IST), stop `cron(0 11 ? * MON-FRI *)` (11:00 UTC = 16:30 IST). The start-watchdog ping/check move to 08:30/08:45 IST; the GitHub-Actions after-close start cron + `aws-autopilot.sh`/`deploy-aws.yml` up-window move to 08:30–16:30 in lockstep. Cost: −1 hr/day (~−₹120/mo). The 08:30 start still gives the documented §10 boot budget before the 09:00 pre-open. This dated quote satisfies §7 Mechanical Rule 1 + §12 for the schedule change and supersedes the 2026-06-02 widening.
 - 2026-06-30: Approved instance UPGRADE m8g.large → **r8g.large** (Graviton4, 2 vCPU / 16 GiB) + EIP KEPT per Quote 7; bill ~₹2,058/mo → ~₹2,919/mo incl GST (270 hrs, 30 GB EBS, +EIP). The 2K-universe expansion is deferred to a separate later PR.
 - 2026-07-13: Approved EBS grow 30 GB -> 50 GB gp3 (+~₹170/mo incl GST) + instance-role S3 write on tv-prod-cold/groww-capture/* (Groww capture archival), per operator quote: "go ahead and merge everything once it is green - yes do whatever is the recommendation" (prod disk-pressure remediation - disk hit 82% on 2026-07-13 with zero reclamation). Note: the instance role's existing cold-bucket statement (main.tf, s3:GetObject/PutObject/ListBucket on the whole `tv-<env>-cold` bucket) ALREADY covers the groww-capture/* prefix — no IAM change was needed. Bill ~₹2,919/mo → ~₹3,101/mo incl GST (recomputed below).
+- 2026-07-15: Approved instance DOWNSIZE r8g.large → **t4g.medium** (2 vCPU / 4 GiB) + QDB_MEM_LIMIT 4g → 1g, executed via the guarded `downsize-instance.yml` workflow (old root snapshotted first, kept ~1 week), per Quote 8 ("Flip tonight: t4g.medium, QuestDB 1g, automated"). INTERIM bill (the live root stays 50 GB — gp3 cannot shrink) ~₹3,101/mo → **~₹1,471/mo** incl GST at 270 hrs; drops to ~₹1,197/mo only AFTER the 20 GB fresh-volume recreate (executor pre-stage, not operator-quoted); ~₹986/mo corresponds to the ~176-hr pure auto-schedule basis only, NEVER the 270-hr figure. EIP kept.
 
 ---
 
@@ -198,77 +225,76 @@ SEBI retention: 5 years (matches the `order_audit` table standard).
 
 ---
 
-## §7. Instance lock — r8g.large (LOCKED 2026-06-30, supersedes the 2026-05-29 m8g.large + 2026-05-27 t4g.large + 2026-05-18 t4g.medium locks)
+## §7. Instance lock — t4g.medium (LOCKED 2026-07-15, supersedes the 2026-06-30 r8g.large + 2026-05-29 m8g.large + 2026-05-27 t4g.large + 2026-05-18 t4g.medium locks)
 
-**2026-06-30 change (operator Quote 7):** instance lock → **r8g.large**
-(Graviton4, the latest generation, memory-optimized) — **16 GiB RAM** (DOUBLED
-from the m8g.large 8 GiB) so the Mechanical Rule 2 memory budget below is
-recomputed for 16 GiB. Family choice rationale: the upcoming both-feeds +
-larger-universe workload wants headroom, and the **r-family 8:1 (memory)
-ratio** gives 16 GiB at the same 2 vCPU — m8g.large (8 GiB, general-purpose
-4:1) was the prior lock; c8g.large (4 GiB, compute 2:1) is too little.
-r8g.large is the right family/size for 2 vCPU / 16 GiB. EBS-backed (NOT the
-`r8gd` local-SSD variant — that NVMe is wiped on every daily auto-stop).
+**2026-07-15 change (operator Quote 8):** instance lock → **t4g.medium**
+(ARM Graviton2, burstable general-purpose) — **4 GiB RAM** (DOWN from the
+r8g.large 16 GiB), with QuestDB re-capped at `QDB_MEM_LIMIT=1g` in the same
+flip. Rationale: the Dhan live WS + its instrument chain retired 2026-07-13
+(Groww-only runtime, ~770-SID universe), so the 16 GiB memory-optimized
+headroom is no longer earning its premium; t4g.medium is the cheapest
+2-vCPU Graviton that fits the §7 Rule 2 budget below. BURSTABLE caveat
+(honest): t4g baseline is 20%/vCPU with CPU credits — the old aws-budget.md
+analysis blessed it for the 4-SID universe; the ~770-SID + 21-TF +
+per-minute-REST workload is NOT yet live-validated on credits — watch
+`CPUCreditBalance` after cutover (t4g.large 8 GiB is the rip-cord).
 
 | Spec | Value |
 |---|---|
-| Instance | **r8g.large** — ARM Graviton4, **2 vCPU, 16 GiB RAM** (memory-optimized) |
+| Instance | **t4g.medium** — ARM Graviton2, **2 vCPU, 4 GiB RAM** (burstable general-purpose) |
 | Region | ap-south-1 (Mumbai) |
 | Tenancy | Default (Shared) |
-| Pricing | On-demand **$0.08258/hr** (live ap-south-1, 2026-06-30) — no Reserved / Savings Plan / Spot |
+| Pricing | On-demand **$0.0224/hr** (ap-south-1, console-verified 2026-05-18 — re-verify at execution) — no Reserved / Savings Plan / Spot |
 | Schedule | **Trading weekdays only (Mon–Fri), 08:30–16:30 IST auto** (start `cron(0 3 ? * MON-FRI *)`, stop `cron(0 11 ? * MON-FRI *)`) — narrowed back from 08:00–17:00 on 2026-06-05 per operator ("make the aws instance start and stop from 8.30 am till 4.30 pm"; supersedes the 2026-06-02 widening). Out-of-window runs = operator manual start. Weekends + holidays = OFF unless manually started. |
-| EBS | gp3 **50 GB** (2026-07-13 grow; was 30) |
+| EBS | gp3 **50 GB LIVE** (gp3 cannot shrink — the 20 GB target lands only via the fresh-volume terminate-and-recreate in the operator's erase window; terraform default pre-staged to 20, executor decision 2026-07-15) |
 | EIP | 1 (24/7) — **KEPT** (`enable_eip = true`, 2026-05-31 flip; without it the box has no public IP after a stop/modify/start → unreachable by SSM + Dhan) |
 | Network | ENA enabled by default |
 
-### Cost bill (LOCKED ~₹3,101/mo incl. 18% GST — 270 hrs, 50 GB EBS, +EIP; was ~₹2,919 at 30 GB pre-2026-07-13)
+### Cost bill (LOCKED INTERIM ~₹1,471/mo incl. 18% GST — 270 hrs, live 50 GB EBS, +EIP; drops to ~₹1,197/mo after the 20 GB recreate; was ~₹3,101 on r8g.large pre-2026-07-15)
 
 Operator-set ceiling **270 running hours/month** (auto weekday schedule
-~176 hrs + manual runs). **EBS 50 GB** (2026-07-13 grow; was 30 per Quote 6). **Elastic IP KEPT**
-(`enable_eip = true`, 2026-05-31 — the box needs a public IP at all). r8g.large
-@ $0.08258/hr, $1 ≈ ₹85. **Every running component is itemised below —
-monitoring, alerting, Docker, Lambdas, Telegram are all included and
-free-tier.**
+~176 hrs + manual runs — the hours BASIS is unchanged; every prior §7 bill
+used it). **EBS stays 50 GB tonight** (shrink impossible in place — Rule 3).
+**Elastic IP KEPT**. t4g.medium @ $0.0224/hr, $1 ≈ ₹85. **Every running
+component is itemised below — monitoring, alerting, Docker, Lambdas,
+Telegram are all included and free-tier.**
 
 | Line | Calc | USD |
 |---|---|---|
-| EC2 r8g.large (hosts app + Docker + QuestDB) | $0.08258/hr × 270 hrs | $22.30 |
+| EC2 t4g.medium (hosts app + Docker + QuestDB) | $0.0224/hr × 270 hrs | $6.05 |
 | Elastic IP (24/7, KEPT) | $0.005/hr × 720 hrs | $3.60 |
-| EBS gp3 50 GB (2026-07-13 grow; was 30 → $2.74) | $0.0912 × 50 | $4.56 |
+| EBS gp3 50 GB (LIVE — cannot shrink; the 20 GB post-recreate line is $1.82) | $0.0912 × 50 | $4.56 |
 | S3 cold (aged-out partitions) | tiny, grows over time | $0.18 |
 | Docker (QuestDB + tickvault containers) | runs on the EC2 host | $0.00 |
-| CloudWatch metrics (10 custom) | free tier = 10 | $0.00 |
-| CloudWatch alarms (10) | free tier = 10 | $0.00 |
-| CloudWatch Logs (app/journal) | free tier = 5 GB/mo | $0.00 |
-| CloudWatch Dashboards (3) | free tier = 3 | $0.00 |
+| CloudWatch metrics / alarms / Logs / Dashboards | free tier (unchanged from the r8g bill) | $0.00 |
 | Lambda (telegram-webhook, budget-killswitch, triage) | free tier = 1M req/mo | $0.00 |
 | SNS → Telegram + Email fan-out | free tier (1M / 1k) | $0.00 |
 | SNS → SMS (optional) | ~100 India msgs | $0.28 |
 | Data transfer out | ~14 GB < 100 GB free egress | $0.00 |
-| **Subtotal (pre-GST)** | | **$30.92** |
-| **× ₹85/$** | | **₹2,628** |
-| **+ 18% GST (AWS India)** | | **~₹3,101/mo** |
+| **Subtotal (pre-GST)** | | **$14.67** |
+| **× ₹85/$** | | **₹1,247** |
+| **+ 18% GST (AWS India)** | | **~₹1,471/mo** |
 
-**Honest envelope:** ~**₹3,101/month all-in including GST** at the 270-hr
-ceiling, 50 GB EBS, with the EIP kept. The 2026-07-13 EBS grow adds ~₹180/mo
-(the EBS line moves $2.74 → $4.56). The r8g.large upgrade added ~₹420/mo over
-the prior m8g.large bill (the EC2 line moves $17.32 → $22.30) and the EIP adds
-~₹306/mo vs the superseded EIP-excluded figure — the pre-grow bill was ~₹2,919
-vs the prior ~₹2,058. **The entire observability stack — CloudWatch
+**Honest envelope:** the CURRENT bill is ~**₹1,471/month all-in incl. GST**
+(270 hrs, live 50 GB root, EIP kept) — a ~₹1,630/mo cut from the r8g.large
+~₹3,101. **~₹1,197/mo applies ONLY after the 20 GB fresh-volume recreate**
+(subtotal $11.93 → ₹1,014 → ×1.18 ≈ ₹1,197; the EBS line moves $4.56 →
+$1.82). The operator's earlier ~₹986/mo figure corresponds to the **~176-hr
+pure Mon–Fri auto-schedule basis only** ($9.83 → ₹835 → ×1.18 ≈ ₹986) — it
+is NEVER to be presented as the 270-hr figure, and the hours basis is NOT
+re-based by this change. **The entire observability stack — CloudWatch
 metrics/alarms/logs/dashboards, all 3 Lambdas, and Telegram + Email alert
-fan-out — costs ₹0** (low-volume control-plane services sit inside AWS's
-permanent free tier per §7 Rule 5's CloudWatch-only design; only optional SMS
-is ~₹24). 30 GB was originally chosen over 100 GB because the partition manager
-archives >90d data to S3 (~4× cheaper/GB), so EBS holds only the hot window;
-gp3 grows online if needed — exercised 2026-07-13 with the 30→50 grow when the
-root fs hit 82% before any partition reached the 90-day archival age. The EIP is kept because an `aws ec2 modify-instance-attribute`
-instance-type flip (stop→modify→start) leaves the ENI with NO ephemeral public
-IP (auto-assign-public-IP is a fresh-launch-only attribute), so only the EIP
-gives the box an internet path to SSM + Dhan. **Tax:** 18% GST total (IGST
-inter-state, or CGST 9% + SGST 9% intra-state — identical 18%, no extra cess).
-Verified: r8g.large $0.08258/hr (ap-south-1, 2026-06-30); EIP/EBS/S3/SNS are
-AWS list rates. Budget alarm ceiling = $35/mo pre-GST. Operator approved
-2026-06-30.
+fan-out — costs ₹0** (free tier per §7 Rule 5's CloudWatch-only design;
+only optional SMS is ~₹24). The EIP is kept because an
+`aws ec2 modify-instance-attribute` instance-type flip (stop→modify→start)
+leaves the ENI with NO ephemeral public IP (auto-assign-public-IP is a
+fresh-launch-only attribute), so only the EIP gives the box an internet
+path to SSM + Dhan. **Tax:** 18% GST total (IGST inter-state, or CGST 9% +
+SGST 9% intra-state — identical 18%, no extra cess). Verified: t4g.medium
+$0.0224/hr (ap-south-1 console 2026-05-18 — re-verify at execution);
+EIP/EBS/S3/SNS are AWS list rates. Budget alarm ceiling stays $35/mo
+pre-GST (lowering toward ~$15 is an optional follow-up with its own cost
+note in aws-budget.md). Operator approved 2026-07-15 (Quote 8).
 
 > **Note on instance schedule (2026-05-29):** trading WEEKDAYS only
 > (Mon–Fri), **08:30–16:30 IST** auto start/stop. Weekends + NSE holidays
@@ -280,9 +306,9 @@ AWS list rates. Budget alarm ceiling = $35/mo pre-GST. Operator approved
 
 ### Mechanical Rules (replaces aws-budget.md mechanical rules 1+6)
 
-1. **Instance type is r8g.large. PERIOD.** Changing it (to m8g.large, t4g.large,
-   m7g, a larger r8g size, etc.) requires:
-   - Operator explicit approval with dated quote (see §0 Quote 7)
+1. **Instance type is t4g.medium. PERIOD.** Changing it (back to r8g.large, to
+   t4g.large, etc.) requires:
+   - Operator explicit approval with dated quote (see §0 Quote 8)
    - Update to this file
    - Update to `aws-indices-only-locked-architecture.md` §5
    - Update to `aws-budget.md` (existing file marked SUPERSEDED)
@@ -290,18 +316,18 @@ AWS list rates. Budget alarm ceiling = $35/mo pre-GST. Operator approved
    - Update to `deploy/aws/terraform/variables.tf` `instance_type` default + validation
    - Update to `scripts/aws-upgrade-instance.sh` `FROM_TYPE` default
 
-2. **Host memory budget for r8g.large (16 GiB total) — POST CloudWatch-only migration, current universe (~250–1000 SIDs across 21 TFs):**
-   - QuestDB process: ~4 GB (`QDB_MEM_LIMIT=4g`; write pressure ~5000 ticks/sec sustained, ~2500 audit rows/min)
-   - Tickvault app: registry + 21-TF aggregator + indicator state + today/yesterday RAM-resident sealed bars (≈3.2 MB × up to ~1000 SIDs) ≈ **~3.2 GB**
+2. **Host memory budget for t4g.medium (4 GiB total) — Groww-only runtime (~770-SID universe, 21 TFs):**
+   - QuestDB process: ~1.0 GB (`QDB_MEM_LIMIT=1g` — compose default + the on-box `deploy/docker/.env`, retuned by the downsize workflow's SSM step)
+   - Tickvault app: ~700 MB actual / 1.5 GB cap (Groww-only feed — the pre-downsize Rule 2 budgeted ~3.2 GB at a ~1000-SID BOTH-feeds universe; see the FLAG below)
    - App: rescue ring (100K tick cap, fixed): 10 MB
    - App: QuestDB ILP write buffer: 25 MB
    - App: 15+ audit-table buffers: 30 MB
    - Tracing / errors.jsonl rotation buffer: 100 MB
-   - OS + FS cache + kernel TCP buffers: ~800 MB
-   - **Total used: ~8.2 GB**
-   - **Headroom: ~7.8 GB** — well above the 1 GB Linux kswapd floor; the doubled RAM is the reason for the r-family upgrade. (The 2K-universe expansion is a SEPARATE later PR — at ~2K SIDs the app working set grows toward ~6.4 GB and is re-measured before go-live.)
+   - OS + FS cache + kernel TCP buffers: ~400 MB
+   - **Total used: ~2.6–3.1 GB**
+   - **Headroom: ~0.9–1.4 GB** — above the 1 GB Linux kswapd floor only at the low end. **FLAG (honest, unresolved — Assumed until measured):** if the app's live RSS is materially above ~1.5 GB (read `tv_process_rss_bytes` / RESOURCE-02 and `mem_used_percent` before AND after cutover), 4 GiB does NOT fit and t4g.large (8 GiB) is the rip-cord. QuestDB at 1g serving today's ~770-SID Groww write load is likewise re-validated live (the old 1g-class budget served the 4-SID universe). BURSTABLE CPU: watch `CPUCreditBalance` after cutover.
 
-3. **EBS = 50 GB gp3** (operator approval 2026-07-13 — "go ahead and merge everything once it is green - yes do whatever is the recommendation", prod disk-pressure remediation: root fs hit 82% on 2026-07-13 growing ~2.5–3.6 GB/day with zero reclamation. History: 10 GB → 30 GB per the 2026-05-29 Quote 6 lock [30 chosen over 100 to keep the then-bill ~₹2,058/mo near the <₹2,000 target] → 50 GB 2026-07-13). The partition manager auto-archives partitions >90d to the S3 cold bucket (~4× cheaper per GB than EBS), so EBS holds only the hot window. gp3 **grows online** (no stop, no data loss) — 50 GB is a floor; raise it live if the hot window grows. Internal/instance (m8gd local NVMe) storage is NOT used — it is wiped on every daily auto-stop, so it cannot hold QuestDB data. Terraform `ebs_gp3_size_gb` default = 50, range 10–200; the LIVE volume is grown out-of-band (`scripts/aws-upgrade-instance.sh --ebs-size 50`, online `aws ec2 modify-volume`) because `root_block_device[0].volume_size` is in the instance `lifecycle.ignore_changes` — `terraform apply` never touches the live volume.
+3. **EBS = 50 GB gp3 LIVE; 20 GB is the pre-staged fresh-volume TARGET** (executor decision 2026-07-15, recorded in §0 under Quote 8 — NOT operator-quoted scope). gp3 grows online but can NEVER shrink: `modify-volume` refuses a smaller size and a 50 GB snapshot cannot restore into a 20 GB volume, so 50 → 20 requires a volume/instance REPLACEMENT (terraform terminate-and-recreate in the operator's post-market erase window; the box is fully cattle-provisioned by `user-data.sh.tftpl`; tonight's pre-downsize snapshot is the rollback, kept ~1 week; the GitHub secret `EC2_INSTANCE_ID` must be rotated to the new id at recreate time). Terraform `ebs_gp3_size_gb` default = 20 documents FRESH-PROVISION intent only — `root_block_device[0].volume_size` is in the instance `lifecycle.ignore_changes`, so `terraform apply` never touches the live volume. History: 10 GB → 30 GB (2026-05-29 Quote 6) → 50 GB (2026-07-13 disk-pressure grow) → 20 GB target (2026-07-15). The partition manager keeps auto-archiving partitions >90d to the S3 cold bucket (~4× cheaper per GB than EBS), so EBS holds only the hot window.
 
 4. **No paid AWS services** (RDS, ElastiCache, NAT Gateway, ALB) without budget review.
 
@@ -309,7 +335,7 @@ AWS list rates. Budget alarm ceiling = $35/mo pre-GST. Operator approved
 
 6. **RAM-first hot path (mandatory, unchanged):** every indicator + strategy + risk decision reads from RAM. QuestDB is persistence + audit + cold-path boot rehydration only. Banned-pattern scanner enforces.
 
-7. **One-time instance upgrade script:** `scripts/aws-upgrade-instance.sh` performs the in-place instance flip (the already-running instance → **r8g.large**, via `--from m8g.large --to r8g.large`) using `aws ec2 stop-instances` → `aws ec2 modify-instance-attribute` → `aws ec2 start-instances`. EIP + EBS preserved (the script verifies the EIP survives and aborts if it changed) — the EIP is mandatory because the stop/modify/start leaves the ENI with no ephemeral public IP. Downtime ~3 minutes, run on a Sunday off-market window. `FROM_TYPE`/`TO_TYPE` in the script are the single source for the flip; the market-hours guard refuses 09:00–15:30 IST Mon–Fri without `--force`.
+7. **Instance flip tooling:** the 2026-07-15 downsize executes via the guarded one-shot GitHub Actions workflow `.github/workflows/downsize-instance.yml` (snapshot-first → stop → `aws ec2 modify-instance-attribute` → start → EIP identity check → SSM `QDB_MEM_LIMIT=1g` retune → verify; a capacity start-failure rolls back to r8g.large with a VERIFIED post-rollback type/state check; a run that finds the box ALREADY t4g.medium continues in retune-only mode instead of refusing). `scripts/aws-upgrade-instance.sh` remains the manual fallback (`--from r8g.large --to t4g.medium` defaults; a t4g.medium target auto-defaults `QDB_MEM_LIMIT=1g`, an r8g.large target keeps the 4g arm for the emergency roll-UP direction). EIP + EBS preserved on either path (both verify the EIP survives and abort loudly if it changed) — the EIP is mandatory because the stop/modify/start leaves the ENI with no ephemeral public IP. Downtime ~3 minutes; the market-hours guards refuse the in-session window without an explicit force.
 
 ---
 
