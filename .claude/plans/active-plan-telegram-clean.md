@@ -2,7 +2,7 @@
 
 **Status:** VERIFIED
 **Date:** 2026-07-15
-**Approved by:** directive relayed via the coordinator session 2026-07-15 — coordinator relay, not a direct in-session operator message; pending operator ratification on the PR
+**Approved by:** Parthiban (operator) — in-session approval "proceed approved", 2026-07-15
 
 Guarantee matrices: this plan carries the 15-row + 7-row guarantee matrices by
 cross-reference to `.claude/rules/project/per-wave-guarantee-matrix.md` (the
@@ -174,6 +174,33 @@ entry.
       — Tests: episode_rest_family_wiring_guard.rs (routing table, roles,
         rest_slot map, snapshot label round-trip, once-per-day None pins),
         family-guard extension, dhat rerun
+
+### Fix round 1 (2026-07-15, review-confirmed)
+
+- [x] F1 — disjoint chain not-served episode slots (chain_rest_slot 12..=14,
+      catch-all 7; spot recovery can no longer green-close a chain bubble)
+      — Files: crates/core/src/notification/events.rs,
+        crates/core/tests/episode_rest_family_wiring_guard.rs
+      — Tests: guard_chain_slot_map_per_underlying_and_distinct_catch_all,
+        guard_spot_and_chain_slot_sets_are_disjoint (pins disjointness itself)
+- [x] F2 — feed-off scorecard line still carries the REST pull digest
+      — Files: crates/core/src/notification/events.rs
+      — Tests: test_dual_feed_scorecard_feed_off_line_still_carries_pull_digest
+- [x] F3 — per-leg pulls segment; not-measured signal moves to logs (the §2b
+      rule tension recorded in Observability + code comments)
+      — Files: crates/core/src/notification/events.rs,
+        crates/app/src/feed_scoreboard_boot.rs
+      — Tests: test_render_pulls_per_leg_skips_sentinel_legs_and_names_each_leg,
+        test_unmeasured_canonical_rest_pairs_names_only_sentinel_pairs
+- [x] F4 — forced TF runs always notify (no_data silence = scheduled only)
+      — Files: crates/app/src/tf_consistency_boot.rs
+      — Tests: test_should_notify_summary_forced_run_always_notifies
+- [x] F5 — marker = dispatch not delivery: residual documented (timeboxed
+      decision — no service.rs completion signal exists), skip path names the
+      honored marker date
+      — Files: crates/app/src/tf_consistency_boot.rs,
+        .claude/plans/active-plan-telegram-clean.md (Failure Modes)
+      — Tests: existing marker suite (behavioral no-op; comment + log change)
 
 ## Scenarios
 
