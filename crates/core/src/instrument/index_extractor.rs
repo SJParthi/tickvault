@@ -46,7 +46,7 @@
 use thiserror::Error;
 use tickvault_common::constants::INDEX_SYMBOL_ALIASES;
 
-use super::csv_parser::CsvRow;
+use super::csv_row::CsvRow;
 
 /// IDX_I segment string (per Dhan ExchangeSegment enum) — every index
 /// row in the Detailed CSV lives in this segment.

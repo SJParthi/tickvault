@@ -3,7 +3,8 @@
 //! operator lock 2026-06-22 "make everything as common runtime dynamic scalable").
 //!
 //! Replaces the two copy-forked comparators (`core::feed::groww::parity_1m::
-//! compare_groww_1m` and the Dhan `cross_verify_1m_boot::diff_minute_candles`).
+//! compare_groww_1m` and the Dhan `diff_minute_candles` — whose home module
+//! `cross_verify_1m_boot.rs` retired with the Dhan live WS, PR-C3 2026-07-14).
 //! SP7 wires both feeds to call THIS; until then it is additive + offline-tested.
 //!
 //! Pure, in-memory, ZERO-tolerance: any OHLC `!=` (and volume `!=` when the feed
