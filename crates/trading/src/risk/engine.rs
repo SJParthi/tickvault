@@ -381,15 +381,6 @@ impl RiskEngine {
         self.positions.keys().copied()
     }
 
-    /// Test-only accumulator poison — exercises the fail-closed non-finite
-    /// arm of `evaluate_daily_loss_halt`, which is structurally unreachable
-    /// through the guarded production write paths.
-    #[cfg(test)]
-    // TEST-EXEMPT: cfg(test)-only accumulator poison helper (exercised by the fail-closed halt test)
-    pub(crate) fn poison_realized_pnl_for_test(&mut self, value: f64) {
-        self.total_realized_pnl = value;
-    }
-
     /// Returns the total realized P&L for today.
     pub fn total_realized_pnl(&self) -> f64 {
         self.total_realized_pnl
@@ -460,10 +451,13 @@ impl RiskEngine {
 
     fn trigger_halt(&mut self, breach: RiskBreach) {
         if !self.halted {
-            // RISK-GAP-01 coded emit (2026-07-14): log-sink-only; the
-            // Telegram page is the sink's Critical RiskHalt event.
+            // ERROR level + typed code (2026-07-14: the previously-uncoded
+            // halt error gains `code = RISK-GAP-01` per charter rule 5; the
+            // stale legacy log-routing claim is retired — the reachable
+            // page is the RiskAlertSink → NotificationService Telegram
+            // below, wired by the order runtime).
             error!(
-                code = tickvault_common::error_code::ErrorCode::RiskGapPreTrade.code_str(),
+                code = ErrorCode::RiskGapPreTrade.code_str(),
                 breach = ?breach,
                 realized_pnl = self.total_realized_pnl,
                 "RISK-GAP-01 CRITICAL: RISK BREACH — trading HALTED. ALL orders \
@@ -482,6 +476,18 @@ impl RiskEngine {
                 sink.fire_risk_halt(reason);
             }
         }
+    }
+
+    /// Test-only accumulator poison — exercises the fail-closed non-finite
+    /// arm of `evaluate_daily_loss_halt`, which is structurally unreachable
+    /// through the guarded production write paths. Placed AFTER
+    /// `trigger_halt` (2026-07-15 merge reconcile): cluster C's
+    /// `order_side_wiring_guard` scans the prefix before the FIRST
+    /// `#[cfg(test)]` marker, so this attr must not precede the halt fn.
+    #[cfg(test)]
+    // TEST-EXEMPT: cfg(test)-only accumulator poison helper (exercised by the fail-closed halt test)
+    pub(crate) fn poison_realized_pnl_for_test(&mut self, value: f64) {
+        self.total_realized_pnl = value;
     }
 }
 

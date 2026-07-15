@@ -207,10 +207,14 @@ mod tests {
     );
 
     // (b) Real files: late-file production symbols must be in-region.
+    // Sentinel updated at the PR-C2 merge reconcile (2026-07-15):
+    // `spawn_post_market_tasks` was deleted with the Dhan live-WS lane
+    // (#1522); `spawn_feed_scoreboard_tasks` is the surviving
+    // post-test-module production fn that proves the same H1 coverage.
     let main_prod = prod_region("main.rs");
     assert!(
-        main_prod.contains("fn spawn_post_market_tasks"),
-        "main.rs scanned region lost `fn spawn_post_market_tasks` — the \
+        main_prod.contains("fn spawn_feed_scoreboard_tasks"),
+        "main.rs scanned region lost `fn spawn_feed_scoreboard_tasks` — the \
          post-test-module production code is no longer covered (H1 regression)"
     );
     let bridge = src("groww_bridge.rs");

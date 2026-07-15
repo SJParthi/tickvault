@@ -2085,6 +2085,16 @@ async fn main() -> Result<()> {
             notifier: std::sync::Arc::clone(&notifier),
             calendar: std::sync::Arc::clone(&trading_calendar),
             feed_runtime: std::sync::Arc::clone(&feed_runtime),
+            // Order-runtime dry-run PR (2026-07-14, SOCKET-FREE per the
+            // same-day operator Dhan noise lock): only the mark bridge
+            // rides in — no order-update WS, no WAL capture / boot drain
+            // (both gated behind a fresh dated operator quote in
+            // dhan-rest-only-noise-lock-2026-07-14 §3). Post-C2 the stack
+            // spawns UNCONDITIONALLY, so `[order_runtime]` is never inert
+            // on any boot shape (the pre-C2 E6 dhan-ON warn is retired
+            // with the lane).
+            mark_rx_slot: std::sync::Arc::clone(&order_runtime_mark_rx_slot),
+            marks_wanted: std::sync::Arc::clone(&order_runtime_marks_wanted),
             // PR-C2: the stack owns the /health token-block writer.
             health: health_status.clone(),
         },
