@@ -4,23 +4,34 @@
 //! Per trading-day minute-close instant T in `[09:16:00, 15:30:00]` IST:
 //! Dhan pre-fires its 3 serialized option chains at :55/:58/:02 (rate-gated
 //! 1-per-3s per-underlying AND globally) and fetches 4 post-close intraday
-//! spot singles at :03.0/:03.4/:03.8/:04.2 (400ms gate); Groww bursts all 7
-//! requests (3 chains + 4 spots) in parallel at :00 (gate-free lane) with
-//! an :00.8 verdict + sequential fallback. Each lane's decision fires the
-//! INSTANT its data-complete predicate flips (event-driven, latched
-//! exactly-once per (lane, cycle)); past its cutoff the lane HONEST-SKIPS
-//! with a coded loud log — never a late decision, never a decision on
-//! missing/stale data.
+//! spot singles grouped by the ADAPTIVE CONCURRENCY LADDER (operator spec
+//! addition 2026-07-15 — step 0: all 4 SIMULTANEOUS at :03.0; degraded
+//! steps split 3+1 / 2+2 / fully sequential across 1000ms-spaced group
+//! anchors; both brokers' candle endpoints are single-symbol-per-request,
+//! so step 0 is 4 parallel single-symbol calls, never one batched HTTP
+//! request), each fire passing the spot ROLLING-1000ms-WINDOW gate (≤
+//! `spot_window_cap` per sliding second); Groww fires per its
+//! THREE-CHOICE fallback-shape ladder (coordinator 2026-07-15 — choice 1:
+//! all 7 requests in parallel at :00, gate-free lane; choice 2: :01
+//! chains / :02 all 4 spots; choice 3: :01 / :02 core spots / :03 VIX
+//! alone) with a last-wave+timeout verdict + sequential fallback. Each
+//! lane's decision fires the INSTANT its data-complete predicate flips
+//! (event-driven, latched exactly-once per (lane, cycle)); past its
+//! cutoff the lane HONEST-SKIPS with a coded loud log — never a late
+//! decision, never a decision on missing/stale data.
 //!
 //! # Modules
 //! - `schedule` — pure IST minute-boundary + slot-table calculus (per
-//!   broker anchor + ladder rung; boundary math reimplemented here — core
-//!   cannot depend on `crates/app`; drift is pinned by mirrored vectors +
-//!   const-asserts against the shared `SPOT_1M_REST_*` window constants)
-//! - `gate` — pure CAS [`gate::MinSpacingGate`] in the MONOTONIC time
-//!   domain (injected clock) — the structural zero-429 hard floor
+//!   broker anchor + ladder rung + concurrency step + fallback shape;
+//!   boundary math reimplemented here — core cannot depend on
+//!   `crates/app`; drift is pinned by mirrored vectors + const-asserts
+//!   against the shared `SPOT_1M_REST_*` window constants)
+//! - `gate` — pure CAS [`gate::MinSpacingGate`] + the spot
+//!   [`gate::RollingWindowGate`] in the MONOTONIC time domain (injected
+//!   clock) — the structural zero-429 hard floor
 //! - `ladder` — the Dhan failure ladder (rungs 0..=5, next-cycle anchor
-//!   shift, step-back-one recovery) + in-cycle retry policy
+//!   shift, step-back-one recovery) + in-cycle retry policy + the
+//!   streak-driven concurrency/shape ladders ([`ladder::StreakLadder`])
 //! - `executor` — the LOCKED [`executor::CadenceExecutor`] seam (this PR
 //!   ships NO REST caller; [`executor::DryRunLoggingExecutor`] logs fires
 //!   and returns `Err(Empty)` — never synthesizes prices)
@@ -60,6 +71,6 @@ pub mod schedule;
 
 pub use executor::{
     CadenceExecutor, CadenceFetchError, ChainFetchOk, ChainFetchRequest, DryRunLoggingExecutor,
-    SpotFetchRequest, SpotSnapshot, SpotTarget,
+    ExpiryResolver, SpotFetchRequest, SpotSnapshot, SpotTarget, StubExpiryResolver,
 };
 pub use runner::{CadenceRunnerDeps, SystemCadenceClock, spawn_supervised_cadence_runner};

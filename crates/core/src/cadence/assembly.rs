@@ -16,7 +16,23 @@ use tickvault_common::moneyness::{
 
 use super::executor::SpotTarget;
 use super::schedule::CADENCE_CROSS_FILL_FRESHNESS_FLOOR_MS;
-use crate::pipeline::chain_snapshot::{ChainUnderlying, load_chain_snapshot};
+use crate::pipeline::chain_snapshot::{
+    ChainMoneynessSnapshot, ChainUnderlying, load_chain_snapshot,
+};
+
+/// Max snapshot age (whole seconds vs the caller's IST-epoch-nanos "now")
+/// a decide-time registry read may trust (design §6 guard fields). A
+/// same-cycle snapshot is ≤ ~75s old at the latest Dhan cutoff (minute
+/// open + 60s boundary + 15s cutoff); 120s adds slack while rejecting a
+/// yesterday-same-minute stale slot (age ≈ 86,400s) outright.
+pub const CADENCE_CHAIN_SNAPSHOT_MAX_AGE_SECS: i64 = 120;
+
+/// Seconds per IST day (minute-of-day reduction of the registry's
+/// IST-epoch-nanos minute stamp).
+const SECS_PER_DAY: i64 = 86_400;
+
+/// Nanoseconds per second.
+const NANOS_PER_SEC: i64 = 1_000_000_000;
 
 /// Where a lane's per-underlying spot came from — the design §5
 /// resolution order (each step past the first stamps the decision
@@ -77,6 +93,19 @@ pub struct SpotCell {
 pub struct ChainCell {
     /// Resolution provenance.
     pub provenance: ChainProvenance,
+    /// The feed whose executor FETCHED (and published) this chain — the
+    /// registry slot the decide-time fold must read. Equals the lane's
+    /// own feed for an own fetch; the LENDER's feed for a cross-filled
+    /// cell (design §3(e): the borrowed chain's rows live under the
+    /// lender's registry slot, never the borrower's).
+    pub source_feed: Feed,
+    /// TRUE when the fetching executor confirmed it published the
+    /// classified snapshot to the `chain_snapshot` registry for this
+    /// (source_feed, underlying) — the decide-time fold refuses an
+    /// unconfirmed publish (a stale prior-minute registry read is the
+    /// exact silent-corruption class the design §6 guard fields exist to
+    /// prevent).
+    pub published_to_registry: bool,
     /// Receipt instant, IST ms-of-day.
     pub fetched_at_ms: i64,
     /// The minute the chain belongs to (MINUTE-OPEN, IST secs-of-day).
@@ -368,7 +397,17 @@ pub fn fold_chain_moneyness(
     spot_paise: i64,
     atm_paise: i64,
 ) -> MoneynessFold {
-    let snap = load_chain_snapshot(feed, underlying);
+    let guard = load_chain_snapshot(feed, underlying);
+    let snap: &ChainMoneynessSnapshot = &guard;
+    fold_snapshot_rows(snap, spot_paise, atm_paise)
+}
+
+/// The raw row fold shared by the guarded and unguarded entry points.
+fn fold_snapshot_rows(
+    snap: &ChainMoneynessSnapshot,
+    spot_paise: i64,
+    atm_paise: i64,
+) -> MoneynessFold {
     let mut fold = MoneynessFold::default();
     for row in &snap.rows {
         // classify_moneyness_paise is total: any operand < 1 (incl. an
@@ -390,6 +429,61 @@ pub fn fold_chain_moneyness(
     fold
 }
 
+/// The decide-time registry guard (design §6 consumer contract): a
+/// snapshot is usable for the cycle ONLY when it is not the boot
+/// sentinel, its minute-of-day equals the decided cycle minute, and its
+/// age against the caller's IST-epoch-nanos "now" sits inside
+/// `[0, CADENCE_CHAIN_SNAPSHOT_MAX_AGE_SECS]` (a negative age = a
+/// publisher clock ahead of ours — fail-closed; a yesterday-same-minute
+/// slot fails the age bound). Pure.
+#[must_use]
+pub fn chain_snapshot_fresh_for_cycle(
+    snap: &ChainMoneynessSnapshot,
+    cycle_minute_ist: u32,
+    now_ist_nanos: i64,
+) -> bool {
+    if snap.is_empty_sentinel() {
+        return false;
+    }
+    let minute_of_day_secs = (snap.minute_ts_ist_nanos / NANOS_PER_SEC).rem_euclid(SECS_PER_DAY);
+    if minute_of_day_secs != i64::from(cycle_minute_ist) {
+        return false;
+    }
+    (0..=CADENCE_CHAIN_SNAPSHOT_MAX_AGE_SECS).contains(&snap.age_secs(now_ist_nanos))
+}
+
+/// GUARDED decide-time fold over the resolved chain cell (design §5/§6):
+/// reads the registry slot of the cell's SOURCE feed (the lender's slot
+/// for a cross-filled chain — the borrowed rows never live under the
+/// borrower's slot), refuses an unconfirmed executor publish, and
+/// refuses a stale / wrong-minute / sentinel snapshot via
+/// [`chain_snapshot_fresh_for_cycle`]. Any refusal returns the default
+/// fold (0 rows ⇒ `all_unknown` ⇒ SURFACED as unusable, never a silent
+/// stale-row classification).
+///
+/// # Performance
+/// O(rows) over the lock-free snapshot guard, zero allocation
+/// (DHAT-ratcheted alongside the raw fold).
+#[must_use]
+pub fn fold_chain_cell_moneyness(
+    cell: &ChainCell,
+    underlying: ChainUnderlying,
+    cycle_minute_ist: u32,
+    now_ist_nanos: i64,
+    spot_paise: i64,
+    atm_paise: i64,
+) -> MoneynessFold {
+    if !cell.published_to_registry {
+        return MoneynessFold::default();
+    }
+    let guard = load_chain_snapshot(cell.source_feed, underlying);
+    let snap: &ChainMoneynessSnapshot = &guard;
+    if !chain_snapshot_fresh_for_cycle(snap, cycle_minute_ist, now_ist_nanos) {
+        return MoneynessFold::default();
+    }
+    fold_snapshot_rows(snap, spot_paise, atm_paise)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -401,9 +495,11 @@ mod tests {
         LaneAssembly::new(feed, MINUTE, T_MS)
     }
 
-    fn own_chain(minute: u32, fetched_at: i64, embedded: Option<f64>) -> ChainCell {
+    fn own_chain(feed: Feed, minute: u32, fetched_at: i64, embedded: Option<f64>) -> ChainCell {
         ChainCell {
             provenance: ChainProvenance::OwnFetch,
+            source_feed: feed,
+            published_to_registry: true,
             fetched_at_ms: fetched_at,
             minute_ist: minute,
             embedded_spot: embedded,
@@ -415,7 +511,7 @@ mod tests {
         let mut a = asm(Feed::Groww);
         assert!(!a.is_data_complete());
         for u in ChainUnderlying::ALL {
-            a.record_chain(*u, own_chain(MINUTE, T_MS + 100, None));
+            a.record_chain(*u, own_chain(Feed::Groww, MINUTE, T_MS + 100, None));
         }
         assert!(!a.is_data_complete(), "chains alone are not complete");
         a.record_spot(
@@ -548,7 +644,7 @@ mod tests {
         );
         lender.record_chain(
             ChainUnderlying::Sensex,
-            own_chain(MINUTE, T_MS + 300, Some(81_250.0)),
+            own_chain(Feed::Groww, MINUTE, T_MS + 300, Some(81_250.0)),
         );
         let (spots, chains) = borrower.cross_fill_from(&lender, T_MS + 1_000, T_MS + 15_000);
         assert_eq!((spots, chains), (1, 1));
@@ -561,6 +657,14 @@ mod tests {
             borrower
                 .chain(ChainUnderlying::Sensex)
                 .is_some_and(|c| c.provenance == ChainProvenance::CrossSource)
+        );
+        // A cross-filled chain KEEPS the lender's registry identity — the
+        // decide-time fold must read the LENDER's slot, never the
+        // borrower's (design §3(e)).
+        assert!(
+            borrower
+                .chain(ChainUnderlying::Sensex)
+                .is_some_and(|c| c.source_feed == Feed::Groww && c.published_to_registry)
         );
         assert!(borrower.any_degraded_provenance());
 
@@ -627,7 +731,10 @@ mod tests {
         assert!(a.chain(ChainUnderlying::Nifty).is_none());
         assert!(a.spot(ChainUnderlying::Nifty).is_none());
         assert!(a.vix_spot().is_none());
-        a.record_chain(ChainUnderlying::Nifty, own_chain(MINUTE, T_MS, None));
+        a.record_chain(
+            ChainUnderlying::Nifty,
+            own_chain(Feed::Dhan, MINUTE, T_MS, None),
+        );
         assert!(a.chain(ChainUnderlying::Nifty).is_some());
     }
 
@@ -636,7 +743,7 @@ mod tests {
         let mut a = asm(Feed::Dhan);
         a.record_chain(
             ChainUnderlying::Nifty,
-            own_chain(MINUTE, T_MS - 5_000, None),
+            own_chain(Feed::Dhan, MINUTE, T_MS - 5_000, None),
         );
         // A late duplicate (e.g. a post-latch cross-fill race) never
         // overwrites — first write wins, the duplicate is audit-only.
@@ -644,6 +751,8 @@ mod tests {
             ChainUnderlying::Nifty,
             ChainCell {
                 provenance: ChainProvenance::CrossSource,
+                source_feed: Feed::Groww,
+                published_to_registry: true,
                 fetched_at_ms: T_MS + 900,
                 minute_ist: MINUTE,
                 embedded_spot: Some(1.0),
@@ -689,7 +798,7 @@ mod tests {
         );
         lender.record_chain(
             ChainUnderlying::Nifty,
-            own_chain(MINUTE - 60, T_MS - 59_000, None),
+            own_chain(Feed::Groww, MINUTE - 60, T_MS - 59_000, None),
         );
         assert_eq!(
             borrower.cross_fill_from(&lender, T_MS + 1_000, T_MS + 15_000),
@@ -705,9 +814,93 @@ mod tests {
         // Groww absence) → rung 3 fills nothing, absence tracked upstream.
         let mut a = asm(Feed::Groww);
         for u in ChainUnderlying::ALL {
-            a.record_chain(*u, own_chain(MINUTE, T_MS + 100, None));
+            a.record_chain(*u, own_chain(Feed::Groww, MINUTE, T_MS + 100, None));
         }
         assert_eq!(a.fill_spots_from_chain_embedded(T_MS + 900), 0);
         assert!(!a.is_data_complete());
+    }
+
+    /// IST-epoch nanos helper for the guard vectors: `day_base` days past
+    /// epoch + `secs_of_day` (pure arithmetic — no chrono in the guard).
+    const fn ist_nanos(days: i64, secs_of_day: i64) -> i64 {
+        (days * SECS_PER_DAY + secs_of_day) * NANOS_PER_SEC
+    }
+
+    #[test]
+    fn test_cadence_chain_snapshot_fresh_for_cycle_guards_sentinel_minute_and_age() {
+        let mk = |minute_ts_ist_nanos: i64| ChainMoneynessSnapshot {
+            minute_ts_ist_nanos,
+            ..ChainMoneynessSnapshot::empty_sentinel(Feed::Dhan, ChainUnderlying::Nifty)
+        };
+        let day = 20_000_i64; // an arbitrary IST calendar day
+        let minute_open = i64::from(MINUTE);
+        // "now" = boundary + 900ms → age ≈ 60s: fresh.
+        let now = ist_nanos(day, minute_open + 60);
+        // The boot sentinel is NEVER fresh.
+        assert!(!chain_snapshot_fresh_for_cycle(&mk(0), MINUTE, now));
+        // Same-day matching minute inside the age bound: fresh.
+        assert!(chain_snapshot_fresh_for_cycle(
+            &mk(ist_nanos(day, minute_open)),
+            MINUTE,
+            now
+        ));
+        // The PREVIOUS minute's snapshot (the stale-registry class):
+        // refused on the minute-of-day mismatch.
+        assert!(!chain_snapshot_fresh_for_cycle(
+            &mk(ist_nanos(day, minute_open - 60)),
+            MINUTE,
+            now
+        ));
+        // YESTERDAY's same-minute snapshot: minute-of-day matches but the
+        // age bound refuses it.
+        assert!(!chain_snapshot_fresh_for_cycle(
+            &mk(ist_nanos(day - 1, minute_open)),
+            MINUTE,
+            now
+        ));
+        // A publisher clock AHEAD of ours (negative age): fail-closed.
+        assert!(!chain_snapshot_fresh_for_cycle(
+            &mk(ist_nanos(day, minute_open + 120)),
+            MINUTE,
+            now
+        ));
+        // Exactly AT the age bound is admitted (inclusive).
+        assert!(chain_snapshot_fresh_for_cycle(
+            &mk(ist_nanos(day, minute_open)),
+            MINUTE,
+            ist_nanos(day, minute_open + CADENCE_CHAIN_SNAPSHOT_MAX_AGE_SECS)
+        ));
+        // One second PAST the bound is refused.
+        assert!(!chain_snapshot_fresh_for_cycle(
+            &mk(ist_nanos(day, minute_open)),
+            MINUTE,
+            ist_nanos(day, minute_open + CADENCE_CHAIN_SNAPSHOT_MAX_AGE_SECS + 1)
+        ));
+    }
+
+    #[test]
+    fn test_cadence_fold_chain_cell_moneyness_refuses_unconfirmed_publish() {
+        // published_to_registry = false ⇒ the fold NEVER touches the
+        // registry — default fold (0 rows ⇒ all_unknown, SURFACED).
+        let cell = ChainCell {
+            provenance: ChainProvenance::OwnFetch,
+            source_feed: Feed::Dhan,
+            published_to_registry: false,
+            fetched_at_ms: T_MS + 400,
+            minute_ist: MINUTE,
+            embedded_spot: None,
+        };
+        let day = 20_000_i64;
+        let now = ist_nanos(day, i64::from(MINUTE) + 61);
+        let fold = fold_chain_cell_moneyness(
+            &cell,
+            ChainUnderlying::Nifty,
+            MINUTE,
+            now,
+            2_450_000,
+            2_450_000,
+        );
+        assert_eq!(fold, MoneynessFold::default());
+        assert!(fold.all_unknown(), "an unconfirmed publish is unusable");
     }
 }

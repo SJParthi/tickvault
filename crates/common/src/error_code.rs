@@ -896,17 +896,48 @@ pub enum ErrorCode {
     /// Severity::High, auto-triage-safe (the next trading day re-runs
     /// automatically; forced reruns are DEDUP-idempotent).
     TfVerify02RunDegraded,
-    /// FEED-GAP-01 (Groww hardening PR-3, 2026-07-14) — the feed GAP-EPISODE
-    /// forensics machinery DEGRADED: the tracker could not persist an
-    /// OPEN/CLOSE row to the `feed_gap_audit` table (ensure-DDL / ILP append /
-    /// flush), or the 15:45 IST scoreboard dangling-close sweep failed
-    /// (`stage` names the leg). ANNOTATION ONLY — never on the feed recovery
-    /// path or the tick hot path; the Telegram episode bubble still fires and
-    /// re-appends are DEDUP-idempotent (`ts, trading_date_ist, feed, start_ts,
-    /// outcome`). Telegram-episode-only delivery per the operator-approved
-    /// 2026-07-14 default (no CloudWatch filter). Severity::Medium,
-    /// auto-triage-safe.
-    FeedGap01EpisodeDegraded,
+
+    // -----------------------------------------------------------------------
+    // Cadence scheduler (operator cadence directive 2026-07-14, judge-locked
+    // design rev-8 — `crates/core/src/cadence/`). Dry-run decision-timing
+    // skeleton: per-minute Dhan (:55 pre-close serialized) + Groww (:00
+    // post-close burst) fetch cadence with structural zero-429 gates,
+    // failure ladder, event-driven per-lane decisions. DEFAULT-OFF.
+    // See cadence-error-codes.md.
+    // -----------------------------------------------------------------------
+    /// CADENCE-01: a cadence lane DEGRADED this cycle — a non-Empty fetch
+    /// failure ended terminal after the retry budget
+    /// (`stage="fetch_failed"`), a 429 arrived despite the gates
+    /// (`stage="rate_limited"` — also a gate-bug signal), a spot returned
+    /// 200-empty (`stage="spot_empty"`, either lane), a chain returned
+    /// 200-empty (`stage="chain_empty"`, either lane), the Groww burst
+    /// fell back (`stage="groww_fallback"`), a lane borrowed the other
+    /// broker's data after its own path exhausted (`stage="cross_fill"`),
+    /// a spot resolved from the chain-embedded price
+    /// (`stage="chain_embedded_spot"`), moneyness classified Unknown
+    /// (`stage="moneyness_unknown"`), or the failure ladder exhausted its
+    /// floor (`stage="ladder_exhausted"`, edge-latched per episode). ONE
+    /// coalesced emission per (lane, cycle), never per-request.
+    /// Severity::High, auto-triage-safe (the next cycle re-attempts; the
+    /// ladder + cross-fill are the self-corrections).
+    Cadence01LaneDegraded,
+    /// CADENCE-02: a cadence lane's decision was HONEST-SKIPPED — the lane
+    /// was incomplete at its cutoff (`stage="cutoff"`), both brokers were
+    /// dead (`stage="both_sources_dead"`), or every underlying classified
+    /// Unknown (`stage="all_unknown"`). Exactly one per (lane, cycle);
+    /// never a late decision, never a decision on missing/stale data.
+    /// Severity::High, auto-triage-safe (the skip IS the fail-closed
+    /// action; the operator inspects the stage at leisure).
+    Cadence02DecisionSkipped,
+    /// CADENCE-03: the cadence scheduler itself DEGRADED — the failure
+    /// ladder shifted a rung (`stage="ladder_shift"`), a wake landed late
+    /// past a slot (`stage="late_wake"`), one or more minute boundaries
+    /// were skipped (`stage="boundary_skipped"`), a clock skew was clamped
+    /// (`stage="skew_clamped"`), the supervised runner respawned
+    /// (`stage="respawn"`), or a gate deferred a NOMINAL slot
+    /// (`stage="gate_deferred_nominal"` — a should-never scheduling-math
+    /// signal). Severity::Medium, auto-triage-safe.
+    Cadence03SchedulerDegraded,
 }
 
 impl ErrorCode {
