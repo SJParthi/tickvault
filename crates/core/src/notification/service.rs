@@ -2962,7 +2962,9 @@ mod tests {
             down_secs: 0,
             attempts: 0,
         });
-        service.notify(NotificationEvent::ShutdownInitiated);
+        service.notify(NotificationEvent::ShutdownInitiated {
+            class: crate::notification::events::ShutdownClass::ExternalStop,
+        });
         // PR-D (2026-05-26): HistoricalFetchFailed + CandleVerificationFailed
         // notify calls removed alongside the deleted variants.
 
@@ -3519,7 +3521,9 @@ mod tests {
             down_secs: 0,
             attempts: 0,
         });
-        service.notify(NotificationEvent::ShutdownInitiated);
+        service.notify(NotificationEvent::ShutdownInitiated {
+            class: crate::notification::events::ShutdownClass::ExternalStop,
+        });
         service.notify(NotificationEvent::ShutdownComplete);
     }
 

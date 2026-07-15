@@ -142,6 +142,28 @@ pub enum DispatchPolicy {
     Default,
 }
 
+/// Classified cause of a graceful shutdown (Telegram cleanliness overhaul,
+/// coordinator-relayed directive 2026-07-15).
+///
+/// Every restart used to pair a boot bubble with a `[MEDIUM] Shutdown
+/// initiated` page — even the daily scheduled 4:30 PM IST stop. The app-side
+/// classifier (`classify_shutdown` in the app crate) derives this class from
+/// the signal kind, the runtime source (AWS vs local), the IST clock, and
+/// the trading calendar. Fail-safe direction: ANY classifier doubt lands
+/// [`Self::ExternalStop`] — today's Medium loudness, never quieter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShutdownClass {
+    /// The daily scheduled stop — the 4:30 PM IST weekday auto-stop window,
+    /// or the holiday-gate self-stop on a non-trading day. Quiet (Low).
+    ScheduledStop,
+    /// A local operator stop (Ctrl+C / local SIGTERM from `make stop` or a
+    /// container stop). Quiet (Low) — the operator did it themselves.
+    OperatorStop,
+    /// Anything else — deploy restart, budget killswitch, manual AWS stop
+    /// outside the daily window. Stays Medium and loud.
+    ExternalStop,
+}
+
 /// Which boot path was used to bring the WebSocket pool online.
 ///
 /// Per operator policy 2026-05-04 + `boot_helpers::should_fast_boot`:
@@ -1044,8 +1066,16 @@ pub enum NotificationEvent {
     // ONLY by the Dhan tick pipeline; Groww stall detection is
     // FEED-STALL-01 + the market-hours-liveness alarm. See
     // .claude/rules/project/dhan-rest-only-noise-lock-2026-07-14.md.
-    /// Graceful shutdown initiated.
-    ShutdownInitiated,
+    /// Graceful shutdown initiated. The payload classifies WHY (Telegram
+    /// cleanliness overhaul, 2026-07-15): scheduled / operator stops render
+    /// one quiet Low line; an unexpected external stop stays Medium and
+    /// loud. Crash paths still emit nothing (the boot-heartbeat alarm + the
+    /// scoreboard process-death reconciler own that class, unchanged).
+    ShutdownInitiated {
+        /// Classified stop cause. The app-side classifier fails TOWARD
+        /// [`ShutdownClass::ExternalStop`] on any doubt — never quieter.
+        class: ShutdownClass,
+    },
 
     /// Application stopped.
     ShutdownComplete,
@@ -3917,7 +3947,18 @@ impl NotificationEvent {
                      Restart the app once `Last offset` < {threshold_secs:.2}s."
                 )
             }
-            Self::ShutdownInitiated => "<b>Shutdown initiated</b>".to_string(),
+            Self::ShutdownInitiated { class } => match class {
+                // One quiet line each (2026-07-15): a scheduled/operator
+                // stop is routine, never an incident.
+                ShutdownClass::ScheduledStop => "\u{1f6d1} Scheduled stop — daily 4:30 PM IST \
+                                                 window (or holiday). Back at next start."
+                    .to_string(),
+                ShutdownClass::OperatorStop => "\u{1f6d1} Stopped by operator.".to_string(),
+                ShutdownClass::ExternalStop => "<b>Unexpected stop</b> — outside the daily \
+                                                4:30 PM IST window. If you didn't do this, \
+                                                check the box (deploy / budget stop / manual)."
+                    .to_string(),
+            },
             Self::ShutdownComplete => "<b>tickvault stopped</b>".to_string(),
             Self::SelfTestPassed { checks_passed } => {
                 format!(
@@ -4237,7 +4278,7 @@ impl NotificationEvent {
             Self::OrderUpdateAuthenticated => "OrderUpdateAuthenticated",
             Self::OrderUpdateDisconnected { .. } => "OrderUpdateDisconnected",
             Self::OrderUpdateReconnected { .. } => "OrderUpdateReconnected",
-            Self::ShutdownInitiated => "ShutdownInitiated",
+            Self::ShutdownInitiated { .. } => "ShutdownInitiated",
             Self::ShutdownComplete => "ShutdownComplete",
             Self::InstrumentBuildSuccess { .. } => "InstrumentBuildSuccess",
             Self::FeedInstrumentsLoaded { .. } => "FeedInstrumentsLoaded",
@@ -4522,7 +4563,13 @@ impl NotificationEvent {
             // Swap itself failed — depth quality degraded until next rebalance.
             Self::OrderUpdateDisconnected { .. } => Severity::High,
             Self::OrderUpdateReconnected { .. } => Severity::Low,
-            Self::ShutdownInitiated => Severity::Medium,
+            // 2026-07-15 shutdown classification: scheduled/operator stops
+            // are routine (Low — one quiet coalesced line); only an
+            // unexpected external stop keeps the historical Medium loudness.
+            Self::ShutdownInitiated { class } => match class {
+                ShutdownClass::ScheduledStop | ShutdownClass::OperatorStop => Severity::Low,
+                ShutdownClass::ExternalStop => Severity::Medium,
+            },
             Self::CircuitBreakerClosed => Severity::Medium,
             Self::WebSocketConnected { .. } => Severity::Low,
             // 2026-05-09: demoted Medium → Low so the boot-success summary
@@ -4923,7 +4970,9 @@ mod tests {
         // family — see test_episode_key_boot_variants_map_to_boot_family.)
         for event in [
             NotificationEvent::TokenRenewed,
-            NotificationEvent::ShutdownInitiated,
+            NotificationEvent::ShutdownInitiated {
+                class: ShutdownClass::ExternalStop,
+            },
             NotificationEvent::ShutdownComplete,
             NotificationEvent::SelfTestPassed { checks_passed: 8 },
             NotificationEvent::MarketOpenStreamingConfirmation {
@@ -6130,10 +6179,42 @@ mod tests {
     }
 
     #[test]
-    fn test_shutdown_initiated_message() {
-        let event = NotificationEvent::ShutdownInitiated;
+    fn test_shutdown_initiated_message_scheduled_stop_is_one_quiet_line() {
+        let event = NotificationEvent::ShutdownInitiated {
+            class: ShutdownClass::ScheduledStop,
+        };
         let msg = event.to_message();
-        assert!(msg.contains("Shutdown"));
+        assert!(msg.contains("Scheduled stop"), "{msg}");
+        assert!(msg.contains("4:30 PM IST"), "{msg}");
+        assert!(msg.contains("Back at next start"), "{msg}");
+        assert_eq!(msg.lines().count(), 1, "one-line body: {msg}");
+        assert!(
+            !msg.contains("Unexpected"),
+            "a scheduled stop must never read as unexpected: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_shutdown_initiated_message_operator_stop_is_one_quiet_line() {
+        let event = NotificationEvent::ShutdownInitiated {
+            class: ShutdownClass::OperatorStop,
+        };
+        let msg = event.to_message();
+        assert_eq!(msg, "\u{1f6d1} Stopped by operator.");
+    }
+
+    #[test]
+    fn test_shutdown_initiated_message_external_stop_stays_loud() {
+        let event = NotificationEvent::ShutdownInitiated {
+            class: ShutdownClass::ExternalStop,
+        };
+        let msg = event.to_message();
+        assert!(msg.contains("<b>Unexpected stop</b>"), "{msg}");
+        assert!(msg.contains("4:30 PM IST"), "{msg}");
+        assert!(
+            msg.contains("deploy / budget stop / manual"),
+            "the body must name the likely external causes: {msg}"
+        );
     }
 
     #[test]
@@ -6799,9 +6880,30 @@ mod tests {
     }
 
     #[test]
-    fn test_shutdown_initiated_severity() {
+    fn test_shutdown_initiated_severity_per_class() {
+        // 2026-07-15: scheduled/operator stops are routine (Low — quiet
+        // coalesced line); ONLY an unexpected external stop keeps the
+        // historical Medium loudness. Demoting ExternalStop below Medium
+        // needs a fresh dated operator quote — talk to the operator first.
         assert_eq!(
-            NotificationEvent::ShutdownInitiated.severity(),
+            NotificationEvent::ShutdownInitiated {
+                class: ShutdownClass::ScheduledStop
+            }
+            .severity(),
+            Severity::Low
+        );
+        assert_eq!(
+            NotificationEvent::ShutdownInitiated {
+                class: ShutdownClass::OperatorStop
+            }
+            .severity(),
+            Severity::Low
+        );
+        assert_eq!(
+            NotificationEvent::ShutdownInitiated {
+                class: ShutdownClass::ExternalStop
+            }
+            .severity(),
             Severity::Medium
         );
     }
@@ -7149,7 +7251,9 @@ mod tests {
         let low_event = NotificationEvent::TokenRenewed;
         assert_eq!(low_event.severity(), Severity::Low);
 
-        let medium_event = NotificationEvent::ShutdownInitiated;
+        let medium_event = NotificationEvent::ShutdownInitiated {
+            class: ShutdownClass::ExternalStop,
+        };
         assert_eq!(medium_event.severity(), Severity::Medium);
 
         let high_event = NotificationEvent::Custom {

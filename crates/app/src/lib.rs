@@ -147,6 +147,10 @@ pub mod scale_test_preflight;
 /// Shared per-seal routing for BOTH feeds (Dhan + Groww) — the single
 /// `route_seal` body the two `on_seal` call sites invoke (C2, behavior-preserving).
 pub mod seal_routing;
+/// Pure shutdown classifier (Telegram cleanliness overhaul, 2026-07-15):
+/// signal kind × runtime source × IST clock × trading calendar →
+/// `ShutdownClass`. Fails toward ExternalStop (loud) on any doubt.
+pub mod shutdown_class;
 // PR #4 (2026-05-19): depth-20 / depth-200 modules DELETED (operator-locked
 // per websocket-connection-scope-lock.md — 4-IDX_I uses 1 main-feed conn
 // + 1 order-update conn only).
