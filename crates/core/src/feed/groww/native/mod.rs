@@ -38,4 +38,4 @@ pub mod connect;
 pub mod keypair;
 pub mod shadow_writer;
 pub mod socket_token;
-pub mod watch_reader;
+pub use super::watch_reader;

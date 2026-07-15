@@ -1273,7 +1273,7 @@ fn serialize_watch_file(
 /// Atomically writes `content` to `path` (write `.tmp` → rename). Creates parent
 /// dirs. Testable via tempdir.
 /// Test-only bridge to the private serializer so the native shadow client's
-/// watch READER (`native::watch_reader`, PR-R1 2026-07-04) round-trips against
+/// watch READER (`watch_reader`, PR-R1 2026-07-04) round-trips against
 /// the REAL writer instead of a hand-copied fixture.
 #[cfg(test)]
 // TEST-EXEMPT: cfg(test)-only shim over the private serializer; exercised by the watch_reader round-trip test.

@@ -43,9 +43,9 @@ use crate::feed::groww::native::connect::{build_connect_frame, extract_nonce};
 use crate::feed::groww::native::keypair::GrowwSessionKeypair;
 use crate::feed::groww::native::shadow_writer::ShadowTick;
 use crate::feed::groww::native::socket_token::{is_auth_status, mint_client, mint_socket_token};
-use crate::feed::groww::native::watch_reader::TickIdentity;
 use crate::feed::groww::nats::{self, NatsServerOp};
 use crate::feed::groww::proto::{GrowwSocketMessage, decode_socket_response};
+use crate::feed::groww::watch_reader::TickIdentity;
 
 /// SUB lines batched per WebSocket message at subscribe time (cold path;
 /// keeps any single WS frame comfortably small).
