@@ -2255,6 +2255,16 @@ async fn fire_one_minute(
 ) -> usize {
     let minute_open_secs = fire_secs_of_day.saturating_sub(60);
     let minute_label = format_minute_ist_12h(minute_open_secs);
+    // TRAP-A (2026-07-15, Groww live-feed retirement): per-fire liveness
+    // heartbeat for the re-pointed market-hours liveness alarm
+    // (market-hours-liveness-alarm.tf, treat_missing_data = "breaching").
+    // Set ONCE per per-minute fire, deliberately NOT pre-registered at
+    // boot — the first set at the 09:16:01 IST fire IS the session-start
+    // signal (a pre-registered 0 would satisfy the alarm while the legs
+    // never fire); metrics-exporter-prometheus re-renders the last value
+    // on every scrape thereafter, so a wedged/dead process (or both legs
+    // dead) goes MISSING in-window and pages.
+    metrics::gauge!("tv_rest_1m_fire_heartbeat").set(1.0);
     let trading_date = today_ist();
     let trading_date_nanos = minute_open_ist_nanos(trading_date, 0);
 
