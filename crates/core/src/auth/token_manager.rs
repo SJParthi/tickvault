@@ -1530,11 +1530,15 @@ mod tests {
             checked = checked.saturating_add(1);
             search_from = off.saturating_add(builder_needle.len());
         }
+        // C4 sweep (2026-07-15): the vacuity floor dropped 2 -> 1 — the
+        // deferred-auth builder died with `initialize_deferred` (dormant
+        // since PR-C2; deleted per its own WIRING-EXEMPT C4 note). The
+        // `initialize` builder remains the pinned production chain.
         assert!(
-            checked >= 2,
-            "expected at least the 2 production TokenManager client builders \
-             (initialize + deferred auth) — found {checked}; the scan went \
-             vacuous"
+            checked >= 1,
+            "expected at least the 1 production TokenManager client builder \
+             (initialize; the deferred-auth builder was deleted in the C4 \
+             sweep 2026-07-15) — found {checked}; the scan went vacuous"
         );
     }
 
