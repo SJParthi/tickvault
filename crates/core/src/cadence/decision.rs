@@ -192,7 +192,14 @@ impl DecisionLatch {
 /// `tv_cadence_decision_total{lane,outcome}` (+ the latency histogram);
 /// a skip additionally fires the coded CADENCE-02 `error!` (Rule 11 — a
 /// skip is never rendered OK). NO strategy wiring.
-pub fn emit_decision(snapshot: &DecisionSnapshot) {
+///
+/// `dry_run` (verifier F10, dated 2026-07-15): when the wiring runs
+/// DRY-RUN executors (every fetch structurally returns `Empty`), every
+/// cycle's skips are the EXPECTED SHAPE — ~1,500 High `error!` lines/day
+/// of pure noise. A dry-run skip therefore logs at `info!` with a
+/// `dry_run = true` field (counters unchanged — the trend survives);
+/// REAL executor wirings keep the coded `error!`.
+pub fn emit_decision(snapshot: &DecisionSnapshot, dry_run: bool) {
     metrics::counter!(
         "tv_cadence_decision_total",
         "lane" => snapshot.lane.as_str(),
@@ -210,6 +217,18 @@ pub fn emit_decision(snapshot: &DecisionSnapshot) {
     let unknown_total: u32 = snapshot.moneyness.iter().map(|f| f.unknown).sum();
     let rows_total: u32 = snapshot.moneyness.iter().map(|f| f.rows).sum();
     match snapshot.outcome {
+        DecisionOutcome::Skipped(reason) if dry_run => {
+            info!(
+                dry_run = true,
+                stage = reason.as_str(),
+                lane = snapshot.lane.as_str(),
+                cycle_minute_ist = snapshot.cycle_minute_ist,
+                latency_ms = snapshot.latency_ms,
+                post_close = snapshot.post_close,
+                "cadence lane skip under DRY-RUN executors (expected \
+                 shape — every dry-run fetch returns Empty; F10 demotion)"
+            );
+        }
         DecisionOutcome::Skipped(reason) => {
             error!(
                 code = ErrorCode::Cadence02DecisionSkipped.code_str(),
@@ -354,8 +373,10 @@ mod tests {
             DecisionOutcome::Skipped(SkipReason::Cutoff).as_str(),
             "skipped"
         );
-        // emit_decision is total over both arms (smoke — sink is
-        // logs+counters only; no panic, no strategy side effects).
+        // emit_decision is total over both arms AND both dry_run modes
+        // (smoke — sink is logs+counters only; no panic, no strategy
+        // side effects). F10: dry_run=true demotes the skip to info!;
+        // dry_run=false keeps the coded CADENCE-02 error!.
         let snap = DecisionSnapshot {
             lane: Feed::Groww,
             cycle_minute_ist: 35_940,
@@ -366,11 +387,13 @@ mod tests {
             moneyness: [MoneynessFold::default(); ChainUnderlying::COUNT],
             spot_provenance: [None; ChainUnderlying::COUNT],
         };
-        emit_decision(&snap);
+        emit_decision(&snap, false);
+        emit_decision(&snap, true);
         let decided = DecisionSnapshot {
             outcome: DecisionOutcome::Decided,
             ..snap
         };
-        emit_decision(&decided);
+        emit_decision(&decided, false);
+        emit_decision(&decided, true);
     }
 }

@@ -45,23 +45,46 @@ pub struct ChainFetchRequest {
     pub deadline_epoch_ms: i64,
 }
 
+/// One bounded expiry-LIST fetch request (operator spec 2026-07-15 —
+/// the pre-market expiry-resolution boot phase): the executor returns the
+/// broker's VENDOR-RAW expiry dates for the underlying as `yyyymmdd`
+/// integers — unsorted tolerated, garbage tolerated (the pure policy in
+/// `cadence::expiry` validates + selects; executors only fetch, NEVER
+/// apply policy math).
+#[derive(Clone, Copy, Debug)]
+pub struct ExpiryListRequest {
+    /// The broker whose expiry list is fetched.
+    pub broker: Feed,
+    /// Which chain underlying's expiries.
+    pub underlying: ChainUnderlying,
+    /// Absolute deadline for this ONE request, epoch milliseconds — the
+    /// impl must give up (return [`CadenceFetchError::Timeout`]) at/before
+    /// it; the resolution loop retries at its own bounded cadence.
+    pub deadline_epoch_ms: i64,
+}
+
 /// The day-locked expiry lookup SEAM (coordinator-confirmed minimal shape,
 /// 2026-07-15): the scheduler consumes a resolver handed in at boot;
 /// `None` = unresolved — the scheduler NEVER guesses (it stamps `None`
 /// through to the executor and logs a coded stage; the executor impl may
 /// fall back to its own warmup expiry). The FULL resolution machinery
-/// (async fetch, 08:30 day-lock store, retry, disagreement checks) is a
-/// SEPARATE follow-up increment owned by the parallel expiry-resolver
-/// session.
+/// (the pre-market fetch loop, the day-locked store, bounded retry and
+/// the disagreement verdict) lives in `cadence::expiry` — the
+/// [`crate::cadence::expiry::DayLockedExpiryStore`] IS this trait's
+/// production implementation (its read facade).
 pub trait ExpiryResolver: Send + Sync {
-    /// The day-locked expiry (`yyyymmdd`) for `(broker, underlying)`, or
-    /// `None` when unresolved.
+    /// The day-locked WINNING expiry (`yyyymmdd`) for
+    /// `(broker, underlying)`, or `None` when unresolved. NOTE: on the
+    /// store implementation the winner is PER-UNDERLYING (the
+    /// disagreement rule keys BOTH lanes on the Dhan-preferred date), so
+    /// the `broker` parameter selects nothing there — it is kept for the
+    /// seam's generality (a test resolver may key per-broker).
     fn resolved_expiry(&self, broker: Feed, underlying: ChainUnderlying) -> Option<u32>;
 }
 
-/// The day-1 resolver: always `None` (unresolved — the dry-run executors
-/// carry no expiry anyway; the real resolver lands with the parallel
-/// expiry-resolver session's increment).
+/// The always-unresolved resolver: `None` for every pair (kept for tests
+/// — the production read facade is the day-locked store in
+/// `cadence::expiry`).
 #[derive(Clone, Copy, Debug, Default)]
 pub struct StubExpiryResolver;
 
@@ -150,6 +173,15 @@ pub enum CadenceFetchError {
     /// A 2xx response carrying NO usable data (the Dhan 200-with-zero-
     /// candles class) — does NOT arm the ladder (Assumed, design §0).
     Empty,
+    /// The SHARED `dhan_data_api_limiter` queued the request past its
+    /// deadline (verifier F1 composition contract, 2026-07-15): a
+    /// SELF-INFLICTED pacing delay, NOT a broker failure — stage-tagged
+    /// distinctly from a real [`CadenceFetchError::Timeout`] and
+    /// NON-ARMING for the start ladder (`ladder::failure_arms_ladder`
+    /// returns `false`; shifting the anchor earlier cannot fix our own
+    /// queue). Executor impls MUST type a limiter-queue-induced deadline
+    /// miss as this, never as `Timeout`.
+    QueueDelay,
     /// An auth-class reject (dead token / entitlement) — the token
     /// machinery owns recovery; does not arm the ladder.
     Auth,
@@ -169,6 +201,7 @@ impl CadenceFetchError {
             Self::RateLimited { .. } => "rate_limited",
             Self::Timeout => "timeout",
             Self::Empty => "empty",
+            Self::QueueDelay => "queue_delay",
             Self::Auth => "auth",
             Self::Transport => "transport",
             Self::Malformed => "malformed",
@@ -222,6 +255,17 @@ pub trait CadenceExecutor: Send + Sync {
         &self,
         req: SpotFetchRequest,
     ) -> impl Future<Output = Result<SpotSnapshot, CadenceFetchError>> + Send;
+
+    /// Fetch ONE underlying's VENDOR-RAW expiry-date list as `yyyymmdd`
+    /// integers (operator spec 2026-07-15 — the pre-market expiry
+    /// resolution boot phase). Unsorted tolerated; garbage tolerated —
+    /// the pure policy in `cadence::expiry` validates + selects
+    /// (executors only fetch, NEVER apply policy math). Bounded by the
+    /// request's deadline; no internal retries/re-polls.
+    fn fetch_expiry_list(
+        &self,
+        req: ExpiryListRequest,
+    ) -> impl Future<Output = Result<Vec<u32>, CadenceFetchError>> + Send;
 }
 
 /// The dry-run executor both lanes ship with in this PR: logs the fire
@@ -249,6 +293,19 @@ impl CadenceExecutor for DryRunLoggingExecutor {
             cycle_minute_ist = req.cycle_minute_ist,
             deadline_epoch_ms = req.deadline_epoch_ms,
             "cadence dry-run: spot fire (no REST call — returning Empty)"
+        );
+        Err(CadenceFetchError::Empty)
+    }
+
+    async fn fetch_expiry_list(
+        &self,
+        req: ExpiryListRequest,
+    ) -> Result<Vec<u32>, CadenceFetchError> {
+        info!(
+            broker = req.broker.as_str(),
+            underlying = req.underlying.as_str(),
+            deadline_epoch_ms = req.deadline_epoch_ms,
+            "cadence dry-run: expiry-list fire (no REST call — returning Empty)"
         );
         Err(CadenceFetchError::Empty)
     }
@@ -330,6 +387,7 @@ mod tests {
         );
         assert_eq!(CadenceFetchError::Timeout.as_str(), "timeout");
         assert_eq!(CadenceFetchError::Empty.as_str(), "empty");
+        assert_eq!(CadenceFetchError::QueueDelay.as_str(), "queue_delay");
         assert_eq!(CadenceFetchError::Auth.as_str(), "auth");
         assert_eq!(CadenceFetchError::Transport.as_str(), "transport");
         assert_eq!(CadenceFetchError::Malformed.as_str(), "malformed");
@@ -358,5 +416,15 @@ mod tests {
             })
             .await;
         assert!(matches!(spot, Err(CadenceFetchError::Empty)));
+        // The 2026-07-15 expiry-list seam: dry-run logs the fire and
+        // returns Empty — a date list is NEVER synthesized.
+        let expiries = ex
+            .fetch_expiry_list(ExpiryListRequest {
+                broker: Feed::Dhan,
+                underlying: ChainUnderlying::Nifty,
+                deadline_epoch_ms: 1,
+            })
+            .await;
+        assert_eq!(expiries.unwrap_err(), CadenceFetchError::Empty);
     }
 }

@@ -99,6 +99,62 @@ runner at request-build time + the day-1 `StubExpiryResolver` (always
 None) wired in `cadence_boot.rs`; the FULL resolution boot phase is a
 SEPARATE follow-up increment by a different worker.
 
+**2026-07-15 increment 2 — PRE-MARKET EXPIRY RESOLUTION (Workstream A,
+operator spec 2026-07-15):** the executor seam gains
+`fetch_expiry_list(ExpiryListRequest) -> Result<Vec<u32>, CadenceFetchError>`
+(yyyymmdd, vendor-raw, unsorted tolerated; DryRunLoggingExecutor logs +
+returns Err(Empty)). PURE POLICY (`cadence/expiry.rs::resolve_policy_expiry`):
+Nifty/Sensex = NearestActiveDate (min date >= today); BankNifty =
+LastExpiryOfNearestActiveMonth (group by (year,month), nearest group with
+ANY date >= today, that group's LAST date — NEVER the flat minimum;
+premise "no BANKNIFTY weeklies post-Nov-2024 NSE rationalisation" is
+Assumed, flagged in the rule file). DAY-LOCKED STORE
+(`DayLockedExpiryStore`, process-global `global_expiry_store()` OnceLock +
+poison-recovering Mutex): keyed by the IST trading day via the house
+`trading_calendar::ist_offset()` FixedOffset (NEVER UTC); re-resolution
+ONLY at day flip; respawn-proof (a runner respawn re-reads the same
+day-locked verdicts). Read API: winning date per underlying + per-broker
+raw provenance + disagreement flag; `ExpiryDate` = yyyymmdd u32 +
+`as_iso_string()` + `NaiveDate`. The store IS the production
+`ExpiryResolver` read facade — cadence_boot wires it as BOTH
+`expiry_resolver` and `expiry_store`. BOOT PHASE
+(`runner.rs::run_expiry_resolution_loop`, spawned per runner life,
+abort-on-drop): per (broker, underlying) fetch with bounded retry
+(`expiry_retry_interval_ms`, default 60000) until the IST deadline
+(`expiry_deadline_secs_of_day_ist`, default 32100 = 08:55) → past
+deadline ONE edge-latched CADENCE-01 `expiry_unresolved` per pair
+episode + background retry continues to session end; lanes degrade
+(chains fire with `expiry_yyyymmdd = None`). The deadline gates the
+PAGE, never the attempts. DISAGREEMENT ARM: both brokers resolve and
+differ → Dhan WINS keying BOTH lanes; edge-latched CADENCE-01
+`expiry_disagreement`; the store records both raws + the verdict.
+
+**2026-07-15 increment 2 — VERIFIER FIXES F1–F10 (Workstream B):**
+F1 per-(underlying,expiry) chain gate stamp alongside the always-on
+per-underlying gate (expiry-less fire strictly more conservative —
+subsumption-tested) + process-global `global_dhan_gates()` +
+COMPOSITION CONTRACT (2026-07-15) section in the rule file binding
+every future Dhan-firing executor (route through dhan_data_api_limiter
++ the global gate; limiter-queue delays are the NEW NON-ARMING
+`CadenceFetchError::QueueDelay`) + the F1(iv) source-scan ratchet
+`cadence_composition_contract_guard.rs`; F2 shutdown Notify parked in
+`cadence_boot::CADENCE_SHUTDOWN` + `notify_cadence_shutdown()` fired
+from main.rs teardown; F3 dispatch order extracted into pure
+`build_cycle_events` driven directly by proptest; F4 the Groww verdict
+never refetches an in-flight leg (`groww_leg_inflight` tracking); F5/F6/
+F8 honest doc corrections (trend-only counter, brief-queue-at-floor,
+level-triggered enable flags); F7 any-failure arming kept as contract
+(amplitude-1 oscillation test) with a strengthened Assumed flag; F9
+retry admission tests the ACTUAL insertion instant
+(`retry_at.max(now_wall)`); F10 `dry_run: bool` threaded through the
+runner — dry-run-shaped skips/degrades demote to `info!(dry_run=true)`,
+real failures keep the coded `error!`, and the decision double-latch
+debug_assert is replaced by a coded CADENCE-03 `double_latch` error +
+counter. Unnumbered: `dhan_spot_start_offset_ms` +
+`groww_anchor_offset_ms` range-validated in `validate()`. ONE-SOURCE-OF-
+TRUTH DELEGATION (pending) recorded in the rule file naming the 3
+duplicate expiry-selection sites to be delegated to the policy module.
+
 ## Edge Cases
 
 Minute-boundary races (wake at T±ε — no double fire, latch on
@@ -124,6 +180,24 @@ together); Groww wave/fallback tails can NEVER overlap the next minute's
 request timeouts inside the 60s cycle, asserted again in the replay
 proof and the paused-time runner test).
 
+2026-07-15 increment 2: unsorted/duplicate vendor expiry lists (policy
+sorts + dedups internally); expiry lists entirely in the past →
+unresolved (never a stale pick); year-0/absurd yyyymmdd values rejected
+by `ExpiryDate::from_yyyymmdd` (year clamped to 2000..=2100); BankNifty
+month-boundary (a group whose only remaining date is today still wins;
+an exhausted month falls to the next month's LAST date); one broker
+resolved + one unresolved → the resolved broker's date keys BOTH lanes
+WITHOUT a disagreement page (disagreement requires both resolved AND
+differing); day flip mid-process → store re-resolves, edge latches
+reset; runner respawn mid-day → day-locked store keeps the verdicts
+(no re-page, no re-fetch churn beyond the loop's own bounded retry);
+expiry-less chain fire consults ONLY the per-underlying gate (stamp map
+untouched — subsumption holds); a same-(underlying,expiry) fire inside
+the spacing window is deferred by the stamp even when the per-underlying
+gate would admit it; QueueDelay outcomes never arm the failure ladder
+but do surface in the degrade flags; Groww verdict with a leg still
+in-flight at verdict time → awaited/skipped, never double-fetched.
+
 ## Failure Modes
 
 Dhan transport/timeout/5xx/RateLimited arms the failure ladder (next-cycle
@@ -139,6 +213,21 @@ release panic=abort honesty) + CADENCE-03 stage=respawn; a 429 arriving
 DESPITE the gates is typed RateLimited, arms the ladder and fires a
 gate-bug error. Every degrade is a typed coded error!, coalesced per-cycle
 never per-request (Rule 11: a skip is never rendered OK).
+
+2026-07-15 increment 2: expiry-list fetch failures retry bounded
+(`expiry_retry_interval_ms`) until the 08:55 IST deadline, then ONE
+edge-latched CADENCE-01 `expiry_unresolved` per (broker, underlying)
+episode while background retry continues to session end — the deadline
+gates the PAGE, never the attempts; unresolved past deadline = lanes
+degrade honestly (chains fire expiry-less, the executor may fall back
+to its own warmup expiry — never a scheduler guess); cross-broker
+disagreement = Dhan wins + ONE edge-latched CADENCE-01
+`expiry_disagreement` (both raws + verdict recorded for forensics);
+dry-run executors return Empty forever → the store stays honestly
+unresolved and the unresolved page demotes to `info!(dry_run=true)`
+(F10 — the real coded error ships with the real-executor flip);
+decision double-latch (structurally unreachable) is a coded CADENCE-03
+`double_latch` error + counter, never a debug-only assert.
 
 ## Test Plan
 
@@ -202,6 +291,22 @@ test_cadence_200_empty_spot_fallback_chain_end_to_end); DHAT
 tokio time) + the app spawn wiring guard
 `crates/app/tests/cadence_boot_wiring_guard.rs`.
 
+2026-07-15 increment 2 additions: expiry-policy unit + PROPERTY tests
+(nearest-active-date is provably the min date >= today; BankNifty
+month-last invariants — winner is in the nearest active month, is that
+month's max, and is NEVER the flat min when the group has >1 future
+date), day-locked store tests (day flip re-resolution, respawn-proof
+reads, Dhan-wins disagreement), runner integration tests (boot-phase
+resolution stamps ChainFetchRequest.expiry_yyyymmdd; disagreement keys
+BOTH lanes from the Dhan date; in-flight Groww leg never double-fetched
+— SlowLegExecutor), gate tests (per-(underlying,expiry) stamp recorded/
+consulted; expiry-less subsumption; global handle first-write-wins),
+ladder tests (QueueDelay non-arming; amplitude-1 oscillation contract),
+the dispatch-order parity proptest over `build_cycle_events`, the
+cross-ladder no-oscillation replay test, and the F1(iv) composition-
+contract source-scan ratchet
+`crates/core/tests/cadence_composition_contract_guard.rs`.
+
 - [x] Plan-gate precursor: archive `active-plan-telegram-groww-episode-fold.md` (work merged as #1560 / 82db448)
   - Files: .claude/plans/archive/2026-07-14-telegram-groww-episode-fold.md
 - [x] CadenceConfig + validate + ErrorCode variants + rule file
@@ -216,6 +321,12 @@ tokio time) + the app spawn wiring guard
 - [x] App boot wiring (dual-spawn, DEFAULT-OFF) + base.toml section
   - Files: crates/app/src/cadence_boot.rs, crates/app/src/main.rs, crates/app/src/lib.rs, config/base.toml
   - Tests: crates/app/tests/cadence_boot_wiring_guard.rs
+- [x] Increment 2 Workstream A: pre-market expiry resolution (policy + day-locked store + boot phase + disagreement arm)
+  - Files: crates/core/src/cadence/expiry.rs, crates/core/src/cadence/executor.rs, crates/core/src/cadence/runner.rs, crates/core/src/cadence/mod.rs, crates/common/src/config.rs, crates/app/src/cadence_boot.rs, config/base.toml, .claude/rules/project/cadence-error-codes.md
+  - Tests: test_cadence_expiry_policy_for_underlyings_locked_mapping, test_cadence_expiry_nearest_active_date_unsorted_vendor_list, test_cadence_expiry_banknifty_month_last_never_flat_min, test_cadence_expiry_empty_and_garbage_lists_fail_closed, test_cadence_expiry_store_day_lock_first_write_wins_and_day_flip, test_cadence_expiry_store_disagreement_dhan_wins_edge_latched, test_cadence_expiry_store_resolver_facade_reads_winner_for_both_brokers, test_cadence_expiry_page_due_edge_latch_deadline_gates_page_not_attempts, test_cadence_expiry_date_yyyymmdd_iso_naive_helpers, proptest_cadence_expiry_nearest_active_is_min_geq_today, proptest_cadence_expiry_banknifty_group_last_is_active_and_group_max, proptest_cadence_expiry_all_past_or_garbage_never_selected, proptest_cadence_expiry_day_holds_then_rolls_next_group, test_cadence_runner_expiry_boot_phase_resolves_and_stamps, test_cadence_runner_expiry_disagreement_dhan_wins_both_lanes
+- [x] Increment 2 Workstream B: verifier fixes F1–F10 + unnumbered config validation
+  - Files: crates/core/src/cadence/gate.rs, crates/core/src/cadence/ladder.rs, crates/core/src/cadence/decision.rs, crates/core/src/cadence/runner.rs, crates/app/src/cadence_boot.rs, crates/app/src/main.rs, crates/common/src/config.rs, crates/core/tests/cadence_composition_contract_guard.rs, crates/core/tests/cadence_zero_429_replay.rs, crates/core/tests/cadence_runner_dry_run.rs, .claude/rules/project/cadence-error-codes.md
+  - Tests: test_cadence_gate_expiry_stamp_recorded_and_consulted, test_cadence_gate_expiryless_fire_subsumes_expiry_stamp, test_cadence_gate_global_handle_first_write_wins_and_shared, test_ladder_queue_delay_is_non_arming_but_retryable, test_ladder_any_failure_arming_amplitude_1_oscillation, proptest_cadence_build_cycle_events_dispatch_order_parity, test_cadence_anchor_and_concurrency_ladders_never_oscillate_against_each_other, test_groww_verdict_skips_inflight_leg_never_duplicates, test_cadence_rule_file_pins_composition_contract_heading, test_cadence_gate_module_keeps_global_handle_fns, test_composition_contract_guard_needles_are_non_vacuous
 
 ## Rollback
 

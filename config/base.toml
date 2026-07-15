@@ -676,3 +676,11 @@ groww_burst_timeout_ms = 800
 groww_request_timeout_ms = 1500
 # The structural zero-429 floor: per-underlying AND global chain gates.
 chain_min_spacing_ms = 3000
+# Pre-market expiry resolution (operator spec 2026-07-15): bounded retry
+# interval per (broker, underlying) expiry-list fetch until the IST
+# deadline; past the deadline ONE edge-latched CADENCE-01
+# `expiry_unresolved` page per pair episode while background retry
+# continues to session end (the deadline gates the PAGE, never attempts).
+expiry_retry_interval_ms = 60000
+# 08:55:00 IST = 32100 seconds of day (validated within [0, 86400)).
+expiry_deadline_secs_of_day_ist = 32100

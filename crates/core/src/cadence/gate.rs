@@ -12,8 +12,9 @@
 //! slots carry no gate parameter and the runner's Groww arms never touch
 //! [`DhanGates`] (compile-time gate-free, design §4).
 
-use std::sync::Mutex;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use tickvault_common::constants::{CADENCE_SPOT_WINDOW_CAP_CEILING, CADENCE_SPOT_WINDOW_MS};
 
@@ -55,7 +56,6 @@ impl MinSpacingGate {
     }
 
     /// The enforced spacing, ms.
-    // TEST-EXEMPT: trivial field accessor consumed by the replay-proof assertions.
     #[must_use]
     pub fn spacing_ms(&self) -> i64 {
         self.spacing_ms
@@ -150,14 +150,13 @@ impl RollingWindowGate {
     }
 
     /// The sliding window length, ms.
-    // TEST-EXEMPT: trivial field accessor consumed by the replay-proof assertions.
     #[must_use]
+    // TEST-EXEMPT: trivial field accessor consumed by the replay-proof assertions.
     pub fn window_ms(&self) -> i64 {
         self.window_ms
     }
 
     /// The enforced cap.
-    // TEST-EXEMPT: trivial field accessor consumed by the replay-proof assertions.
     #[must_use]
     pub fn cap(&self) -> usize {
         self.ring
@@ -238,7 +237,31 @@ pub struct DhanGates {
     /// scheduler's window gate is the structural ceiling and the shared
     /// limiter is defense-in-depth (composition documented, never
     /// fought).
+    ///
+    /// HONEST COMPOSITION NOTE (verifier F6, dated 2026-07-15): "never
+    /// queues" holds at the DEFAULT composition only (window cap 4 vs the
+    /// limiter's 3 rps target leaves headroom inside a nominal cycle). At
+    /// the limiter's 2 rps FLOOR (a 429-storm step-down), a
+    /// gate-authorized 4-spot group CAN briefly queue inside the shared
+    /// limiter — bounded (≤ ~1s of pacing spill, the limiter smooths, it
+    /// never rejects) and harmless (a limiter-queue deferral is
+    /// SELF-INFLICTED pacing, typed `CadenceFetchError::QueueDelay`,
+    /// NON-ARMING for the ladders). Stated plainly so the composition is
+    /// never mistaken for a violation.
     spot: RollingWindowGate,
+    /// Per-(underlying, expiry) chain fire stamps (verifier F1(i), dated
+    /// 2026-07-15): recorded on a FINAL `Acquired` when the caller knows
+    /// the expiry it is firing for, consulted BEFORE the spacing gates on
+    /// later expiry-known fires. The per-underlying 3s gate is ALWAYS
+    /// enforced and SUBSUMES this map on the nominal single-expiry path
+    /// (one expiry per underlying per day) — the map exists so a future
+    /// multi-expiry composition still honors Dhan's
+    /// 1-unique-request-per-3s PER (underlying, expiry) KEY rule, and so
+    /// an expiry-LESS fire (boot-degraded lane) is strictly MORE
+    /// conservative (it passes the per-underlying gate, which bounds
+    /// every expiry of that underlying at once). Cold path: a Mutex'd
+    /// HashMap touched a handful of times per minute.
+    chain_expiry_stamps: Mutex<HashMap<(usize, u32), i64>>,
 }
 
 impl DhanGates {
@@ -250,40 +273,88 @@ impl DhanGates {
             chain_per_underlying: std::array::from_fn(|_| MinSpacingGate::new(chain_spacing_ms)),
             chain_global: MinSpacingGate::new(chain_spacing_ms),
             spot: RollingWindowGate::new(CADENCE_SPOT_WINDOW_MS, spot_window_cap),
+            chain_expiry_stamps: Mutex::new(HashMap::new()),
         }
     }
 
-    /// Authorize a chain fire for `underlying`: per-underlying gate FIRST,
-    /// then the GLOBAL gate. The schedule serializes chains ≥3s apart, so
-    /// the global acquire cannot fail after the per-underlying acquire
-    /// succeeded on nominal slots (asserted by the replay proof); if it
-    /// ever does, the per-underlying slot was conservatively consumed and
-    /// the fire DEFERS — a deferral, never a violation (design §4). The
-    /// carried retry instant is the MAX of both constraints (the consumed
+    /// Authorize a chain fire for `underlying` (optionally keyed to a
+    /// resolved `expiry_yyyymmdd`): the per-(underlying, expiry) stamp is
+    /// consulted FIRST when the expiry is known (F1(i), 2026-07-15), then
+    /// the per-underlying gate, then the GLOBAL gate. The schedule
+    /// serializes chains ≥3s apart, so the global acquire cannot fail
+    /// after the per-underlying acquire succeeded on nominal slots
+    /// (asserted by the replay proof); if it ever does, the
+    /// per-underlying slot was conservatively consumed and the fire
+    /// DEFERS — a deferral, never a violation (design §4). The carried
+    /// retry instant is the MAX of both constraints (the consumed
     /// per-underlying slot now binds at `now + spacing`), so the caller's
-    /// next wake cannot arrive before it can actually pass.
+    /// next wake cannot arrive before it can actually pass. On a FINAL
+    /// `Acquired` with a known expiry, the (underlying, expiry) stamp is
+    /// recorded. An expiry-less fire (`None` — boot-degraded lane)
+    /// consults NO stamp but still passes the per-underlying gate, which
+    /// is strictly MORE conservative (it spaces ALL expiries of the
+    /// underlying at once — subsumption, pinned by
+    /// `test_cadence_gate_expiryless_fire_subsumes_expiry_stamp`).
     #[must_use]
     pub fn try_acquire_chain(
         &self,
         underlying: ChainUnderlying,
+        expiry_yyyymmdd: Option<u32>,
         now_monotonic_ms: i64,
     ) -> GateVerdict {
-        match self.chain_per_underlying[underlying.index()].try_acquire(now_monotonic_ms) {
-            GateVerdict::Acquired => {
-                match self.chain_global.try_acquire(now_monotonic_ms) {
-                    GateVerdict::Acquired => GateVerdict::Acquired,
-                    GateVerdict::RetryAtMs(global_at) => {
-                        // The per-underlying slot was conservatively
-                        // consumed above: it now binds at now + spacing.
-                        let per_ul_at = now_monotonic_ms.saturating_add(
-                            self.chain_per_underlying[underlying.index()].spacing_ms(),
-                        );
-                        GateVerdict::RetryAtMs(global_at.max(per_ul_at))
-                    }
+        let spacing = self.chain_per_underlying[underlying.index()].spacing_ms();
+        if let Some(expiry) = expiry_yyyymmdd {
+            let stamps = self
+                .chain_expiry_stamps
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(&last) = stamps.get(&(underlying.index(), expiry)) {
+                let earliest = last.saturating_add(spacing);
+                if now_monotonic_ms < earliest {
+                    return GateVerdict::RetryAtMs(earliest);
                 }
             }
-            defer @ GateVerdict::RetryAtMs(_) => defer,
         }
+        let verdict =
+            match self.chain_per_underlying[underlying.index()].try_acquire(now_monotonic_ms) {
+                GateVerdict::Acquired => {
+                    match self.chain_global.try_acquire(now_monotonic_ms) {
+                        GateVerdict::Acquired => GateVerdict::Acquired,
+                        GateVerdict::RetryAtMs(global_at) => {
+                            // The per-underlying slot was conservatively
+                            // consumed above: it now binds at now + spacing.
+                            let per_ul_at = now_monotonic_ms.saturating_add(spacing);
+                            GateVerdict::RetryAtMs(global_at.max(per_ul_at))
+                        }
+                    }
+                }
+                defer @ GateVerdict::RetryAtMs(_) => defer,
+            };
+        if verdict == GateVerdict::Acquired
+            && let Some(expiry) = expiry_yyyymmdd
+        {
+            self.chain_expiry_stamps
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert((underlying.index(), expiry), now_monotonic_ms);
+        }
+        verdict
+    }
+
+    /// The recorded per-(underlying, expiry) authorization stamp, if any
+    /// (monotonic ms of the last expiry-keyed `Acquired`).
+    #[must_use]
+    // TEST-EXEMPT: covered by test_cadence_gate_expiry_stamp_recorded_and_consulted (guard name-pattern mismatch).
+    pub fn chain_expiry_stamp(
+        &self,
+        underlying: ChainUnderlying,
+        expiry_yyyymmdd: u32,
+    ) -> Option<i64> {
+        self.chain_expiry_stamps
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&(underlying.index(), expiry_yyyymmdd))
+            .copied()
     }
 
     /// Authorize a Dhan spot fire.
@@ -293,14 +364,59 @@ impl DhanGates {
     }
 
     /// Conservative boot re-seed of EVERY gate (see
-    /// [`MinSpacingGate::reseed`]).
+    /// [`MinSpacingGate::reseed`]) — the per-(underlying, expiry) stamps
+    /// are CLEARED (a respawned runner creates a fresh monotonic domain;
+    /// stale-domain stamps would defer/admit against meaningless
+    /// instants, and the reseeded spacing gates already refuse everything
+    /// for one full spacing anyway).
     pub fn reseed_all(&self, now_monotonic_ms: i64) {
         for g in &self.chain_per_underlying {
             g.reseed(now_monotonic_ms);
         }
         self.chain_global.reseed(now_monotonic_ms);
         self.spot.reseed(now_monotonic_ms);
+        self.chain_expiry_stamps
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
     }
+}
+
+/// The PROCESS-GLOBAL Dhan gate registry (verifier F1(ii), dated
+/// 2026-07-15): every production Dhan cadence fire — the runner today,
+/// any future real executor composition — must record/consult ONE shared
+/// gate set, so two accidental runner instances (or a future
+/// executor-side fast path) can never each hold private gates and jointly
+/// exceed Dhan's budget. Initialized once by the boot wiring
+/// ([`init_global_dhan_gates`]); tests inject their OWN isolated
+/// [`DhanGates`] through the runner deps and never touch this handle.
+static GLOBAL_DHAN_GATES: OnceLock<Arc<DhanGates>> = OnceLock::new();
+
+/// Initialize-or-fetch the process-global Dhan gate set. First caller's
+/// spacings win (the boot wiring runs once, guarded by the
+/// once-per-process spawn latch); later callers receive the existing set
+/// unchanged — deliberately first-write-wins, mirroring the
+/// `global_expiry_store` / OnceLock house pattern.
+// TEST-EXEMPT: covered by test_cadence_gate_global_handle_first_write_wins_and_shared (guard name-pattern mismatch).
+pub fn init_global_dhan_gates(
+    chain_spacing_ms: i64,
+    spot_window_cap: u32,
+) -> &'static Arc<DhanGates> {
+    GLOBAL_DHAN_GATES.get_or_init(|| Arc::new(DhanGates::new(chain_spacing_ms, spot_window_cap)))
+}
+
+/// The process-global Dhan gate registry, initializing at the
+/// conservative defaults (3s chain spacing floor, window cap 4) if the
+/// boot wiring has not seeded it yet — fail-closed: the defaults are the
+/// STRICTEST legal composition, so an early caller can only be MORE
+/// conservative than the configured set.
+#[must_use]
+// TEST-EXEMPT: covered by test_cadence_gate_global_handle_first_write_wins_and_shared (guard name-pattern mismatch).
+pub fn global_dhan_gates() -> &'static Arc<DhanGates> {
+    init_global_dhan_gates(
+        tickvault_common::constants::CADENCE_CHAIN_MIN_SPACING_FLOOR_MS,
+        4,
+    )
 }
 
 #[cfg(test)]
@@ -345,7 +461,7 @@ mod tests {
         // (chains) / one full window (spots) must elapse first (the
         // conservative belt-and-braces).
         assert_eq!(
-            gates.try_acquire_chain(ChainUnderlying::Nifty, 100_000),
+            gates.try_acquire_chain(ChainUnderlying::Nifty, None, 100_000),
             GateVerdict::RetryAtMs(103_000)
         );
         assert_eq!(
@@ -354,7 +470,7 @@ mod tests {
         );
         // After one spacing/window everything flows again.
         assert_eq!(
-            gates.try_acquire_chain(ChainUnderlying::Nifty, 103_000),
+            gates.try_acquire_chain(ChainUnderlying::Nifty, None, 103_000),
             GateVerdict::Acquired
         );
         assert_eq!(gates.try_acquire_spot(101_000), GateVerdict::Acquired);
@@ -416,7 +532,7 @@ mod tests {
         let gates = DhanGates::new(3_000, 4);
         // NIFTY at t=0 passes both its own and the global gate.
         assert_eq!(
-            gates.try_acquire_chain(ChainUnderlying::Nifty, 0),
+            gates.try_acquire_chain(ChainUnderlying::Nifty, None, 0),
             GateVerdict::Acquired
         );
         // BANKNIFTY 1s later: its per-underlying gate is fresh (slot
@@ -424,19 +540,19 @@ mod tests {
         // defers at 3s — the carried instant is the MAX (4s), so the
         // caller's next wake can actually pass.
         assert_eq!(
-            gates.try_acquire_chain(ChainUnderlying::Banknifty, 1_000),
+            gates.try_acquire_chain(ChainUnderlying::Banknifty, None, 1_000),
             GateVerdict::RetryAtMs(4_000)
         );
         // At the max boundary it flows (per-UL 4s ok, global 3s ok).
         assert_eq!(
-            gates.try_acquire_chain(ChainUnderlying::Banknifty, 4_000),
+            gates.try_acquire_chain(ChainUnderlying::Banknifty, None, 4_000),
             GateVerdict::Acquired
         );
         // NIFTY 500ms after the BANKNIFTY fire: NIFTY's own gate is clear
         // (last NIFTY fire was t=0), but the GLOBAL gate advanced to 7s;
         // NIFTY's slot is conservatively consumed → binds at 7.5s = max.
         assert_eq!(
-            gates.try_acquire_chain(ChainUnderlying::Nifty, 4_500),
+            gates.try_acquire_chain(ChainUnderlying::Nifty, None, 4_500),
             GateVerdict::RetryAtMs(7_500)
         );
     }
@@ -447,7 +563,7 @@ mod tests {
         // floors: a chain fire never consumes a spot slot and vice versa.
         let gates = DhanGates::new(3_000, 2);
         assert_eq!(
-            gates.try_acquire_chain(ChainUnderlying::Sensex, 1_000),
+            gates.try_acquire_chain(ChainUnderlying::Sensex, None, 1_000),
             GateVerdict::Acquired
         );
         assert_eq!(gates.try_acquire_spot(1_010), GateVerdict::Acquired);
@@ -466,17 +582,17 @@ mod tests {
         // Consume slots so a reseed must OVERWRITE live state, not just
         // initialize fresh gates.
         assert_eq!(
-            gates.try_acquire_chain(ChainUnderlying::Nifty, 500),
+            gates.try_acquire_chain(ChainUnderlying::Nifty, None, 500),
             GateVerdict::Acquired
         );
         assert_eq!(gates.try_acquire_spot(500), GateVerdict::Acquired);
         gates.reseed_all(10_000);
         assert_eq!(
-            gates.try_acquire_chain(ChainUnderlying::Nifty, 12_999),
+            gates.try_acquire_chain(ChainUnderlying::Nifty, None, 12_999),
             GateVerdict::RetryAtMs(13_000)
         );
         assert_eq!(
-            gates.try_acquire_chain(ChainUnderlying::Nifty, 13_000),
+            gates.try_acquire_chain(ChainUnderlying::Nifty, None, 13_000),
             GateVerdict::Acquired
         );
         assert_eq!(
@@ -484,5 +600,137 @@ mod tests {
             GateVerdict::RetryAtMs(11_000)
         );
         assert_eq!(gates.try_acquire_spot(11_000), GateVerdict::Acquired);
+        // reseed_all ALSO clears the expiry stamps (fresh monotonic
+        // domain on a respawn — stale-domain stamps are meaningless).
+        assert_eq!(
+            gates.try_acquire_chain(ChainUnderlying::Sensex, Some(20_260_730), 20_000),
+            GateVerdict::Acquired
+        );
+        assert!(
+            gates
+                .chain_expiry_stamp(ChainUnderlying::Sensex, 20_260_730)
+                .is_some()
+        );
+        gates.reseed_all(30_000);
+        assert!(
+            gates
+                .chain_expiry_stamp(ChainUnderlying::Sensex, 20_260_730)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_cadence_gate_expiry_stamp_recorded_and_consulted() {
+        // F1(i), 2026-07-15: an expiry-keyed Acquired records the
+        // (underlying, expiry) stamp; a later expiry-keyed fire for the
+        // SAME key defers on the stamp even if (hypothetically) the
+        // spacing gates were bypassed — the stamp is consulted FIRST.
+        let gates = DhanGates::new(3_000, 4);
+        assert_eq!(
+            gates.try_acquire_chain(ChainUnderlying::Nifty, Some(20_260_716), 10_000),
+            GateVerdict::Acquired
+        );
+        assert_eq!(
+            gates.chain_expiry_stamp(ChainUnderlying::Nifty, 20_260_716),
+            Some(10_000)
+        );
+        // Same key inside the window → deferral carries the stamp bound.
+        assert_eq!(
+            gates.try_acquire_chain(ChainUnderlying::Nifty, Some(20_260_716), 11_000),
+            GateVerdict::RetryAtMs(13_000)
+        );
+        // A DIFFERENT expiry of the same underlying is NOT deferred by
+        // the stamp — but the per-underlying gate still binds (13s), so
+        // the composed verdict is a deferral (subsumption in the other
+        // direction: the per-underlying gate is always enforced).
+        assert_eq!(
+            gates.try_acquire_chain(ChainUnderlying::Nifty, Some(20_260_723), 11_000),
+            GateVerdict::RetryAtMs(13_000)
+        );
+        // A deferred fire never records a stamp for its key.
+        assert_eq!(
+            gates.chain_expiry_stamp(ChainUnderlying::Nifty, 20_260_723),
+            None
+        );
+        // At/after the boundary the same key flows again and re-stamps.
+        assert_eq!(
+            gates.try_acquire_chain(ChainUnderlying::Nifty, Some(20_260_716), 13_000),
+            GateVerdict::Acquired
+        );
+        assert_eq!(
+            gates.chain_expiry_stamp(ChainUnderlying::Nifty, 20_260_716),
+            Some(13_000)
+        );
+    }
+
+    #[test]
+    fn test_cadence_gate_expiryless_fire_subsumes_expiry_stamp() {
+        // F1(i) SUBSUMPTION, 2026-07-15: an expiry-LESS fire (None — the
+        // boot-degraded lane) records no stamp, but the ALWAYS-enforced
+        // per-underlying gate bounds EVERY expiry of that underlying at
+        // once — so two expiry-less fires intended for DIFFERENT expiries
+        // sharing one underlying can never be closer than the
+        // per-(underlying, expiry) rule would allow for either key. The
+        // expiry-less path is therefore strictly MORE conservative.
+        let gates = DhanGates::new(3_000, 4);
+        assert_eq!(
+            gates.try_acquire_chain(ChainUnderlying::Banknifty, None, 5_000),
+            GateVerdict::Acquired
+        );
+        // No stamp was recorded for ANY expiry key…
+        assert_eq!(
+            gates.chain_expiry_stamp(ChainUnderlying::Banknifty, 20_260_729),
+            None
+        );
+        // …yet a second expiry-less fire (intended for a DIFFERENT
+        // expiry) is still refused inside the window: the per-underlying
+        // gate subsumes the per-key rule.
+        assert_eq!(
+            gates.try_acquire_chain(ChainUnderlying::Banknifty, None, 7_999),
+            GateVerdict::RetryAtMs(8_000)
+        );
+        // An expiry-KEYED fire after an expiry-less fire is equally
+        // bounded by the per-underlying gate (no stamp needed).
+        assert_eq!(
+            gates.try_acquire_chain(ChainUnderlying::Banknifty, Some(20_260_729), 7_500),
+            GateVerdict::RetryAtMs(8_000)
+        );
+        assert_eq!(
+            gates.try_acquire_chain(ChainUnderlying::Banknifty, Some(20_260_729), 8_000),
+            GateVerdict::Acquired
+        );
+    }
+
+    #[test]
+    fn test_cadence_gate_global_handle_first_write_wins_and_shared() {
+        // F1(ii), 2026-07-15: the process-global registry hands every
+        // caller the SAME Arc; a later init with different knobs does NOT
+        // replace it (first-write-wins, OnceLock semantics).
+        let a = init_global_dhan_gates(3_000, 4);
+        let b = global_dhan_gates();
+        let c = init_global_dhan_gates(9_999, 1);
+        assert!(Arc::ptr_eq(a, b));
+        assert!(Arc::ptr_eq(a, c));
+        // Shared state is visible across handles: a fire through one
+        // handle defers the same fire through another.
+        let now = 1_000_000;
+        let first = a.try_acquire_chain(ChainUnderlying::Sensex, None, now);
+        // (Tolerate a prior test-process user of the global handle — the
+        // verdict either acquires fresh or defers; EITHER way the second
+        // handle must observe the SAME gate state.)
+        match first {
+            GateVerdict::Acquired => {
+                assert_eq!(
+                    b.try_acquire_chain(ChainUnderlying::Sensex, None, now),
+                    GateVerdict::RetryAtMs(now + 3_000)
+                );
+            }
+            GateVerdict::RetryAtMs(at) => {
+                assert_eq!(
+                    b.try_acquire_chain(ChainUnderlying::Sensex, None, now),
+                    GateVerdict::RetryAtMs(at)
+                );
+            }
+        }
     }
 }
