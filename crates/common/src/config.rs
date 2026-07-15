@@ -216,10 +216,12 @@ pub struct FeedsConfig {
     pub dhan_enabled: bool,
     /// Groww feed identity gate. The Groww LIVE feed was RETIRED
     /// 2026-07-15 (operator directive: "remove the whole Groww live feed;
-    /// keep only spot 1m and option chain for both brokers") — this flag now
-    /// gates only REST-leg feed identity surfaces (/feeds page rendering,
-    /// boot expectations) and rides alongside the `[groww_universe]` daily
-    /// watch-set rider (which has its OWN gate). Default OFF.
+    /// keep only spot 1m and option chain for both brokers"). This flag does
+    /// NOT gate the Groww REST legs (each is section-gated by its own
+    /// `enabled` key); it feeds the boot-completed feed gate, the scoreboard
+    /// `feed_off` day classification, and the /feeds page display only, and
+    /// rides alongside the `[groww_universe]` daily watch-set rider (which
+    /// has its OWN gate). Default OFF.
     pub groww_enabled: bool,
 }
 
