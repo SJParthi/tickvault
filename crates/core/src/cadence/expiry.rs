@@ -205,6 +205,7 @@ pub const POST_DEADLINE_BOOT_MIN_FAILED_WAVES: u32 = 2;
 /// [`POST_DEADLINE_BOOT_MIN_FAILED_WAVES`] consecutive failed waves are
 /// required; otherwise 1 (the pre-deadline path, unchanged).
 #[must_use]
+// TEST-EXEMPT: covered by test_cadence_expiry_page_post_deadline_boot_needs_two_failed_waves (guard name-pattern mismatch).
 pub fn expiry_page_due_after_wave(
     now_secs_of_day: u32,
     deadline_secs_of_day: u32,
