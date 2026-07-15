@@ -7,7 +7,8 @@
 
 ---
 
-> **⚠ RETIREMENT AUTHORIZED 2026-07-13 (deletion lands with the Phase C PRs):** the
+> **⚠ RETIREMENT AUTHORIZED 2026-07-13 (deletion lands with the Phase C PRs) —
+> variants DELETED in the C4 sweep (2026-07-15):** the
 > daily-universe fetch chain these four codes instrument is retired with the Dhan live WS
 > (operator Q1/Q3, 2026-07-13 — verbatim in `websocket-connection-scope-lock.md`
 > "2026-07-13 Amendment"; no Dhan instrument download/parsing at all, hardcoded SIDs feed

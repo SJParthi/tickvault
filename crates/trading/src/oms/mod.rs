@@ -9,6 +9,8 @@
 //! - `idempotency` — UUID v4 correlation ID tracking
 //! - `margin_gate` — 🔷 DHAN pre-trade margin gate (exits never gated)
 //! - `reconciliation` — REST-based state sync
+//! - `exit_rules` — pure exit-order rules (slicing math, OCO/CNC-MTF
+//!   validation, MPP verdict classification, verify backoff ladder)
 //! - `engine` — Orchestrator composing all sub-components
 //!
 //! # Architecture
@@ -33,6 +35,7 @@ pub mod api_client;
 pub mod circuit_breaker;
 pub mod dh904_backoff;
 pub mod engine;
+pub mod exit_rules;
 pub mod idempotency;
 pub mod margin_gate;
 pub mod rate_limiter;
@@ -48,9 +51,11 @@ pub mod groww;
 // Re-export key types for ergonomic use.
 pub use api_client::OrderApiClient;
 pub use engine::{OrderManagementSystem, TokenProvider};
+pub use exit_rules::ExitCommand;
 pub use margin_gate::{MarginGate, MarginSnapshot, MarginVerdict};
 pub use rate_limiter::OrderRateLimiter;
 pub use types::{
-    ManagedOrder, ModifyOrderRequest, OmsError, OrderIntent, PlaceOrderRequest,
-    ReconciliationReport,
+    ExecutionVerdict, ManagedOrder, ManagedSuperOrder, ModifyOrderRequest, ModifySuperOrderLeg,
+    OcoSecondLeg, OmsError, OrderIntent, PlaceForeverOcoRequest, PlaceOrderRequest,
+    PlaceSuperOrderRequest, ReconciliationReport, SlicingResponse, SuperOrderPlacement,
 };

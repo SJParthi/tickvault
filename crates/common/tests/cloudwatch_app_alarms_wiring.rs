@@ -790,8 +790,10 @@ fn test_cw_agent_collects_machine_log_paths() {
 // the alarm it pinned — realtime_guarantee_degraded was removed from
 // silent-feed-alarms.tf because the SLO publisher is PARKED (wave-3-d
 // banner; no tv_realtime_guarantee_score is ever published again). The
-// SLO_WARN_THRESHOLD constant remains in the retained slo_score.rs contract
-// stub for a future Groww-scoped re-design.
+// slo_score.rs contract stub itself (with SLO_WARN_THRESHOLD and the
+// SLO-01/02/03 variants) was DELETED in the C4 sweep (2026-07-15) —
+// a future Groww-scoped SLO re-design starts fresh with its own dated
+// operator quote.
 
 #[test]
 fn test_silent_feed_alarms_are_window_gated() {
