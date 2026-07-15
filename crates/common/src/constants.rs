@@ -1904,6 +1904,47 @@ const _: () = assert!(
     "CHAIN_1M per-request timeout must fit inside the per-underlying budget"
 );
 
+/// Hard wall-clock ceiling (secs after the minute close) past which a
+/// chain RETRY may no longer LAUNCH — the operator's ≤~15s decision-data
+/// window (2026-07-14 directive). Gates ONLY the retry pass; pass 1 is
+/// the unchanged concurrent fire (Dhan-documented: distinct underlyings
+/// concurrently; the 3s bound is per unique (underlying, expiry) key).
+pub const CHAIN_1M_DECISION_CEILING_SECS: u64 = 15;
+
+/// Per-underlying not-served threshold — pinned to the spot leg's value
+/// (and, transitively once #1537 merges, the Groww chain's).
+pub const CHAIN_1M_UNDERLYING_NOT_SERVED_THRESHOLD: u32 = 10;
+const _: () = assert!(
+    CHAIN_1M_UNDERLYING_NOT_SERVED_THRESHOLD == SPOT_1M_REST_SID_NOT_SERVED_THRESHOLD,
+    "one not-served threshold family across the REST legs"
+);
+
+// P1. A worst-case TIMED-OUT first attempt still leaves its retry
+// launchable inside the ceiling: 2.5s fallback + 10s request timeout
+// = 12.5s ≤ 15s (the 2.5s remainder is the modeled limiter-queue
+// headroom at 3 rps; at the 2 rps floor under a 429 storm the REAL-clock
+// gate may refuse — counted, never silent).
+const _: () = assert!(
+    CHAIN_1M_FALLBACK_DELAY_MS + CHAIN_1M_REQUEST_TIMEOUT_SECS * 1_000
+        <= CHAIN_1M_DECISION_CEILING_SECS * 1_000,
+    "a timed-out first attempt must leave the retry launchable inside the ceiling"
+);
+
+// P2. A ceiling-edge retry can never overrun the minute:
+// 15s launch + 20s per-underlying budget = 35s < 60s.
+const _: () = assert!(
+    (CHAIN_1M_DECISION_CEILING_SECS + CHAIN_1M_UNDERLYING_BUDGET_SECS) * 1_000 < 60_000,
+    "a ceiling-edge retry must not overrun the minute"
+);
+
+// P3. A FAST-FAIL first attempt's same-key ≥3s gap always leaves the
+// retry launchable: 3s gap < 15s − 2.5s fallback.
+const _: () = assert!(
+    CHAIN_1M_MIN_GAP_SECS * 1_000
+        < CHAIN_1M_DECISION_CEILING_SECS * 1_000 - CHAIN_1M_FALLBACK_DELAY_MS,
+    "the same-key retry gap must fit inside the decision ceiling"
+);
+
 // ---------------------------------------------------------------------------
 // Groww spot 1m REST leg (operator grant 2026-07-13 — PR-2 of the Groww
 // per-minute REST plan, `.claude/plans/active-plan-groww-rest-1m.md`;
@@ -4435,6 +4476,38 @@ mod tests {
         // (retrying the SAME request inside it earns the reject it retries).
         assert!(CHAIN_1M_EXPIRYLIST_RETRY_BACKOFF_SECS[0] >= CHAIN_1M_MIN_GAP_SECS);
         assert_eq!(CHAIN_1M_MAX_BODY_BYTES, 8 * 1024 * 1024);
+    }
+
+    /// 2026-07-14 chain-capture hardening: the retry decision ceiling +
+    /// the per-underlying not-served threshold, pinned alongside their
+    /// existing schedule partners (2500ms fallback / 10s request timeout /
+    /// 20s budget) so the P1–P3 const-assert proofs stay meaningful.
+    #[test]
+    fn test_chain_decision_ceiling_constants_pinned() {
+        assert_eq!(CHAIN_1M_DECISION_CEILING_SECS, 15);
+        assert_eq!(CHAIN_1M_UNDERLYING_NOT_SERVED_THRESHOLD, 10);
+        assert_eq!(
+            CHAIN_1M_UNDERLYING_NOT_SERVED_THRESHOLD,
+            SPOT_1M_REST_SID_NOT_SERVED_THRESHOLD
+        );
+        // The schedule partners the ceiling proofs are computed against.
+        assert_eq!(CHAIN_1M_FALLBACK_DELAY_MS, 2_500);
+        assert_eq!(CHAIN_1M_REQUEST_TIMEOUT_SECS, 10);
+        assert_eq!(CHAIN_1M_UNDERLYING_BUDGET_SECS, 20);
+        // P1: a timed-out first attempt leaves the retry launchable.
+        assert!(
+            CHAIN_1M_FALLBACK_DELAY_MS + CHAIN_1M_REQUEST_TIMEOUT_SECS * 1_000
+                <= CHAIN_1M_DECISION_CEILING_SECS * 1_000
+        );
+        // P2: a ceiling-edge retry never overruns the minute.
+        assert!(
+            (CHAIN_1M_DECISION_CEILING_SECS + CHAIN_1M_UNDERLYING_BUDGET_SECS) * 1_000 < 60_000
+        );
+        // P3: the same-key ≥3s gap fits inside the ceiling.
+        assert!(
+            CHAIN_1M_MIN_GAP_SECS * 1_000
+                < CHAIN_1M_DECISION_CEILING_SECS * 1_000 - CHAIN_1M_FALLBACK_DELAY_MS
+        );
     }
 
     /// Groww spot 1m REST leg (operator grant 2026-07-13, PR-2 of the
