@@ -755,6 +755,32 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_classify_moneyness_dual_atm_off_grid_spot_and_grid_atm_coexist() {
+        // Spec pin (hostile-review round 1): when the spot itself is an
+        // OFF-GRID value, decision-table rows 5 AND 6 can BOTH be live in
+        // one chain — the grid-rounded ATM strike (row 5) and a degenerate
+        // off-grid strike paise-exactly == spot (row 6) each classify ATM.
+        // The P1 single-ATM proptest invariant is scoped to ON-GRID
+        // uniform chains and is not contradicted.
+        let spot_paise = 2_453_640_i64; // 24536.40 — the 2026-04-21 capture
+        let step_paise = 5_000_i64;
+        let atm = atm_strike_paise(spot_paise, step_paise).expect("ATM must resolve");
+        assert_eq!(atm, 2_455_000, "grid ATM = 24550.00 (round-half-up)");
+        for leg in ["CE", "PE"] {
+            assert_eq!(
+                classify_moneyness_paise(leg, spot_paise, spot_paise, atm),
+                Moneyness::Atm,
+                "{leg}: off-grid strike paise-exactly == spot is ATM (row 6)"
+            );
+            assert_eq!(
+                classify_moneyness_paise(leg, atm, spot_paise, atm),
+                Moneyness::Atm,
+                "{leg}: the grid-rounded ATM strike is ATM (row 5)"
+            );
+        }
+    }
+
     // -- Observed-step cross-check helper ------------------------------------
 
     #[test]

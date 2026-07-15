@@ -587,8 +587,9 @@ impl MoneynessWarnLatches {
 }
 
 /// Post-classification observability for one chain fire (shared by both
-/// chain legs): the UNKNOWN-row counter, the atm-absent detection (zero
-/// rows label ATM that minute — never a silently promoted substitute),
+/// chain legs): the UNKNOWN-row counter, the atm-absent detection (no
+/// row lies on the computed grid-ATM strike that minute — a degenerate
+/// strike==spot row may still label ATM; never a promoted substitute),
 /// and the once-per-chain observed-step cross-check (min positive
 /// adjacent strike diff vs the directive const step — advisory ONLY,
 /// never changes a classification). Warns are edge-latched per
@@ -624,8 +625,10 @@ pub fn record_chain_moneyness_observability(
                 spot_paise = cls.spot_paise,
                 minute = %minute_label,
                 "CHAIN-02: computed grid ATM strike is not among the \
-                 minute's listed strikes — zero rows label ATM this minute \
-                 (never a promoted substitute); ITM/OTM are unaffected"
+                 minute's listed strikes — no row lies on the computed \
+                 grid-ATM strike this minute (a degenerate strike==spot \
+                 row may still label ATM; never a promoted substitute); \
+                 ITM/OTM are unaffected"
             );
         }
     }
@@ -673,7 +676,13 @@ pub fn publish_chain_moneyness_snapshot(
     cls: ChainClassification,
 ) {
     let Some(underlying) = ChainUnderlying::from_symbol(underlying_symbol) else {
-        // Unreachable for the pinned 3-underlying sets — never a panic.
+        // Unreachable for the pinned 3-underlying sets — never a panic,
+        // and never a fully silent drop (hostile-review round 1).
+        debug!(
+            symbol = underlying_symbol,
+            "chain moneyness snapshot publish skipped — symbol outside the \
+             pinned ChainUnderlying set"
+        );
         return;
     };
     debug!(
