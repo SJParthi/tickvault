@@ -16,6 +16,7 @@
 
 use std::future::Future;
 
+use chrono::NaiveDate;
 use tickvault_common::feed::Feed;
 use tracing::info;
 
@@ -74,12 +75,21 @@ pub struct ExpiryListRequest {
 /// production implementation (its read facade).
 pub trait ExpiryResolver: Send + Sync {
     /// The day-locked WINNING expiry (`yyyymmdd`) for
-    /// `(broker, underlying)`, or `None` when unresolved. NOTE: on the
+    /// `(broker, underlying)` on the IST trading day `day`, or `None`
+    /// when unresolved FOR THAT DAY (E1 fix, 2026-07-15: the day is
+    /// threaded from the caller's injected clock — production:
+    /// `trading_calendar::ist_offset()`, NEVER UTC — so a stale prior
+    /// day's lock can never be stamped into a request). NOTE: on the
     /// store implementation the winner is PER-UNDERLYING (the
     /// disagreement rule keys BOTH lanes on the Dhan-preferred date), so
     /// the `broker` parameter selects nothing there — it is kept for the
     /// seam's generality (a test resolver may key per-broker).
-    fn resolved_expiry(&self, broker: Feed, underlying: ChainUnderlying) -> Option<u32>;
+    fn resolved_expiry(
+        &self,
+        broker: Feed,
+        underlying: ChainUnderlying,
+        day: NaiveDate,
+    ) -> Option<u32>;
 }
 
 /// The always-unresolved resolver: `None` for every pair (kept for tests
@@ -89,7 +99,12 @@ pub trait ExpiryResolver: Send + Sync {
 pub struct StubExpiryResolver;
 
 impl ExpiryResolver for StubExpiryResolver {
-    fn resolved_expiry(&self, _broker: Feed, _underlying: ChainUnderlying) -> Option<u32> {
+    fn resolved_expiry(
+        &self,
+        _broker: Feed,
+        _underlying: ChainUnderlying,
+        _day: NaiveDate,
+    ) -> Option<u32> {
         None
     }
 }
@@ -348,9 +363,10 @@ mod tests {
         // stage; the executor impl may fall back to its own warmup
         // expiry.
         let stub = StubExpiryResolver;
+        let day = NaiveDate::from_ymd_opt(2026, 7, 15).expect("valid");
         for feed in [Feed::Dhan, Feed::Groww] {
             for u in ChainUnderlying::ALL {
-                assert_eq!(stub.resolved_expiry(feed, *u), None);
+                assert_eq!(stub.resolved_expiry(feed, *u, day), None);
             }
         }
         // A resolved resolver's value is stamped verbatim onto the
@@ -358,19 +374,19 @@ mod tests {
         // end-to-end in cadence_runner_dry_run.rs).
         struct Fixed;
         impl ExpiryResolver for Fixed {
-            fn resolved_expiry(&self, _b: Feed, _u: ChainUnderlying) -> Option<u32> {
+            fn resolved_expiry(&self, _b: Feed, _u: ChainUnderlying, _d: NaiveDate) -> Option<u32> {
                 Some(20_260_716)
             }
         }
         assert_eq!(
-            Fixed.resolved_expiry(Feed::Dhan, ChainUnderlying::Nifty),
+            Fixed.resolved_expiry(Feed::Dhan, ChainUnderlying::Nifty, day),
             Some(20_260_716)
         );
         let req = ChainFetchRequest {
             feed: Feed::Dhan,
             underlying: ChainUnderlying::Nifty,
             cycle_minute_ist: 33_300,
-            expiry_yyyymmdd: Fixed.resolved_expiry(Feed::Dhan, ChainUnderlying::Nifty),
+            expiry_yyyymmdd: Fixed.resolved_expiry(Feed::Dhan, ChainUnderlying::Nifty, day),
             deadline_epoch_ms: 1,
         };
         assert_eq!(req.expiry_yyyymmdd, Some(20_260_716));

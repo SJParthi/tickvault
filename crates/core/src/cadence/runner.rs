@@ -1404,7 +1404,9 @@ fn handle_action<C, D, G>(
             // NEVER guesses (the executor impl may fall back to its
             // warmup expiry) and the expiry-less fire rides the strictly
             // MORE conservative per-underlying gate alone (subsumption).
-            let expiry_yyyymmdd = deps.expiry_resolver.resolved_expiry(Feed::Dhan, underlying);
+            let expiry_yyyymmdd =
+                deps.expiry_resolver
+                    .resolved_expiry(Feed::Dhan, underlying, clock.ist_date());
             match gates.try_acquire_chain(underlying, expiry_yyyymmdd, now_mono) {
                 GateVerdict::Acquired => {
                     if cycle.dhan.state == CadenceState::Armed {
@@ -1510,9 +1512,11 @@ fn handle_action<C, D, G>(
                         // ExpiryResolver seam (2026-07-15): `None` =
                         // unresolved — never guessed; coalesced
                         // `expiry_unresolved` stage on the lane.
-                        let expiry_yyyymmdd = deps
-                            .expiry_resolver
-                            .resolved_expiry(Feed::Groww, *underlying);
+                        let expiry_yyyymmdd = deps.expiry_resolver.resolved_expiry(
+                            Feed::Groww,
+                            *underlying,
+                            clock.ist_date(),
+                        );
                         if expiry_yyyymmdd.is_none() {
                             cycle.groww.flags.expiry_unresolved = true;
                         }
@@ -1600,9 +1604,11 @@ fn handle_action<C, D, G>(
             let failed_chain_reqs: Vec<(usize, Option<u32>)> = failed_chains
                 .iter()
                 .map(|&i| {
-                    let expiry_yyyymmdd = deps
-                        .expiry_resolver
-                        .resolved_expiry(Feed::Groww, ChainUnderlying::ALL[i]);
+                    let expiry_yyyymmdd = deps.expiry_resolver.resolved_expiry(
+                        Feed::Groww,
+                        ChainUnderlying::ALL[i],
+                        clock.ist_date(),
+                    );
                     if expiry_yyyymmdd.is_none() {
                         cycle.groww.flags.expiry_unresolved = true;
                     }

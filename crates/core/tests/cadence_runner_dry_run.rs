@@ -766,7 +766,7 @@ async fn test_cadence_expiry_resolver_stamps_requests_when_resolved() {
     // full-cycle test above.
     struct FixedExpiry;
     impl ExpiryResolver for FixedExpiry {
-        fn resolved_expiry(&self, _b: Feed, _u: ChainUnderlying) -> Option<u32> {
+        fn resolved_expiry(&self, _b: Feed, _u: ChainUnderlying, _d: NaiveDate) -> Option<u32> {
             Some(20_260_730)
         }
     }
