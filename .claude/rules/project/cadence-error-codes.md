@@ -44,7 +44,13 @@ lane as close to each minute close T as the brokers' rate rules allow:
   `spot_window_cap`, default 4, hard-bounded 1..=5 — Dhan's 5/sec cap; the
   shared 3 rps `dhan_data_api_limiter` still smooths a 4-simultaneous burst
   to ~3/sec — the window gate is the STRUCTURAL ceiling, the limiter
-  defense-in-depth). Degrade one step after 2 CONSECUTIVE spot-dirty
+  defense-in-depth). Since verifier L1 (2026-07-15) EVERY Dhan fire —
+  chain, spot AND expiry-list — additionally records into ONE COMBINED
+  rolling-1000ms window (cap 5, Dhan's Data-API per-second hard budget)
+  inside `DhanGates`, checked-then-recorded atomically, so a chain fire +
+  a full spot group (+ an expiry fire) can never jointly exceed 5 Dhan
+  requests in any rolling second (the replay ledger asserts the COMBINED
+  cap, not just the per-class floors). Degrade one step after 2 CONSECUTIVE spot-dirty
   (rate-limited) cycles; recover one step after 3 consecutive clean cycles
   (both config-keyed, Assumed pending operator confirm).
 - **Groww** fires per its THREE-CHOICE fallback-shape ladder (operator
@@ -145,6 +151,7 @@ EXCEPT `rate_limited`, which fires per-request by design (see below):
 | `queue_delay` | a fetch was refused by the SHARED `dhan_data_api_limiter`'s queue deadline (SELF-INFLICTED pacing — our own defense-in-depth limiter, not the broker; F1(iii) 2026-07-15). Stage-tagged distinctly, NEVER folded into `fetch_failed`, NEVER arms any ladder |
 | `expiry_unresolved` | TWO emission points share this stage: (a) the per-cycle coalesced flag — ≥1 chain request was stamped `expiry_yyyymmdd = None` (the day-locked store has no policy date yet; the scheduler NEVER guesses — the executor impl may fall back to its warmup expiry; ALWAYS present in dry-run, where every expiry-list fetch returns Empty); (b) the resolution loop's EDGE-LATCHED deadline page — ONE `error!` per (broker, underlying) per IST day the instant `expiry_deadline_secs_of_day_ist` (default 08:55) passes unresolved; the lanes run degraded meanwhile and the background retry continues at `expiry_retry_interval_ms` until session end (the deadline gates the PAGE, never the attempts, and a post-deadline BOOT requires ≥2 consecutive failed waves before the page — E4, 2026-07-15). FALLING EDGE (E3, 2026-07-15): a LATER successful resolution for a pair whose page HAD fired emits one coded recovery `info!` (`stage = "expiry_resolved_late"` on the same CADENCE-01 code — no new variant) + `tv_cadence_expiry_resolved_late_total{broker, underlying}`, at most once per pair per day (first write wins) |
 | `expiry_disagreement` | both brokers resolved the day's policy expiry for one underlying and the dates DIFFER — **Dhan WINS for keying BOTH lanes** (exchange-sourced expirylist authority); edge-latched ONCE per (underlying, day); both raw dates ride the payload + the store's provenance view (`tv_cadence_expiry_disagreement_total{underlying}`) |
+| `expiry_rate_limited` | an expiry-list fetch returned a broker 429 (verifier L2, 2026-07-15 — was `debug!`-only): one coded `warn!` per occurrence + `tv_cadence_expiry_rate_limited_total{broker}`; never blind-retried in-wave — the next `expiry_retry_interval_ms` wave re-attempts THROUGH the gates. Dhan expiry fires pass `DhanGates::try_acquire_expiry` (the L1 COMBINED 5-per-rolling-second budget + a 1-per-rolling-second expiry spacing) BEFORE dispatch, so a Dhan expiry 429 despite the gates is a gate-bug / shared-budget-co-tenant signal; a gate deferral skips the fire to the next wave (`tv_cadence_expiry_gate_deferred_total{broker}` — a deferral, never a violation). Groww expiry fires stay ungated by design (no Groww rate rule) |
 | `ladder_exhausted` | the failure ladder hit its max rung (5) — edge-latched ONCE per episode, re-armed by a clean cycle |
 
 **Dry-run note (honest — not an incident; DEMOTED per verifier F10, dated
@@ -234,6 +241,7 @@ self-corrected or self-reported; the operator inspects trends).
 | `respawn` | the supervised runner task died and was respawned (`tv_cadence_runner_respawn_total{reason}`) |
 | `gate_deferred_nominal` | a NOMINAL slot fire was deferred by a gate — a should-never signal (the schedule serializes nominal slots wider than every spacing); any occurrence is a schedule/gate consistency bug worth a report |
 | `double_latch` | a decision double-latch attempt was REFUSED by the exactly-once guard (should-never scheduler-logic signal; `tv_cadence_double_latch_total{lane}`). Replaced the pre-fix `debug_assert!(false)` — a coded loud refusal, never a panic path (verifier F10, dated 2026-07-15) |
+| `illegal_fsm_move` | a lane-FSM transition with no legal target was REFUSED — the state HOLDS (should-never scheduler-logic signal; `tv_cadence_illegal_fsm_move_total{lane}`). Replaced the pre-fix `debug_assert!(false)` at `LaneRun::fsm` — a coded loud refusal, never a panic path (verifier nuance-b, dated 2026-07-15; the F10 double-latch precedent) |
 
 **Triage:**
 1. `mcp__tickvault-logs__tail_errors` — find `CADENCE-03`; the `stage` names
