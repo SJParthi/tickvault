@@ -112,3 +112,24 @@ This plan and every item in it carry the canonical **15-row 100% Guarantee Matri
 - [~] Item 6 (DEFERRED — area PRs, serial, follow PR-0) — Orders / Smart Orders / Portfolio / Margin / User+Exceptions per §39.3 collision contract, each behind the `groww_orders` feature + all four gates
   - Files: `crates/trading/src/oms/groww/{api_client,smart_orders,portfolio,margin,user}.rs` (one per serial PR); shared `crates/common/src/error_code.rs` + `crates/core/src/notification/events.rs` touched by the build lead only
   - Tests: per-area error-code cross-ref + tag-guard; per-area 22-test-category coverage; each area PR ships its own guard extension keeping live fire locked
+  - [x] Item 6a — User + Exceptions (readiness) area PR: `crates/trading/src/oms/groww/user.rs`
+    (probe = one bounded in-market GET /v1/margins/detail/user, ≤2 attempts/day;
+    verdict GREEN/RED/DEGRADED — RED only on HTTP-proven 401/403; zero new ErrorCode
+    variants — reuses Spot1m01FetchDegraded with feed="groww", leg="readiness",
+    stage slugs {auth, rate_limited, vendor_reject, http_error, parse, oversize,
+    transport, token_read} (+ warn-level payload_parse); /v1/user/detail never
+    consumed nor named — schema NOT DOCUMENTED; fire-time const 09:15:30 IST per
+    §10 market-hours-only, 08:50 flip documented pending a dated §39 amendment;
+    GA classifier pub as the exceptions home for sibling areas; scheduler/SSM/
+    Telegram/audit wiring deferred to the build-lead wiring PR)
+    - Files: crates/trading/src/oms/groww/user.rs (new), crates/trading/src/oms/groww/mod.rs
+      (one `pub mod user;` line + doc comment)
+    - Tests: user.rs inline `#[cfg(test)]` — classify_response permutation suite
+      (envelope-wins, 401+SUCCESS contradiction, GA005-on-2xx≠auth, 4xx/5xx split,
+      dual-shape payload, redaction cap, #1539 GA-sanitizer copy-drift pins),
+      2 proptests (classifier + sniffer totality), fire-decision boundaries +
+      market-hours-compliance pin, ist_day_number + monotonic day-latch race,
+      refusal arms, bounded retry ladder (attempt cap, token re-fetch,
+      vendor-reject no-retry, oversize pre-read), operator_summary wording,
+      slug stability, 5 source-scan self-ratchets (GET-only, single-URL-literal,
+      expose_secret-once, no-unwrap/config/SSM/storage, error!-carries-code)
