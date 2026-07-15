@@ -70,7 +70,12 @@ or reconnect behaviour.
   arm), reconnect (`connect_and_listen`), sleep-entered/resumed — each calls
   `emit_order_update_ws_audit`. Both live WebSockets now write `ws_event_audit`
   rows. A future depth pool would call the same pattern with its own `WsType`.
-- Append site (LIVE since PR-10, 2026-06-29): the Groww second-feed bridge
+- *(2026-07-15: the THREE Groww append sites below — bridge lifecycle rows, the boot-time
+  Connected row, and the stall-watchdog `stall_restarted` rows — are DELETED with the Groww
+  live feed (writers gone with `groww_bridge.rs` / `groww_sidecar_supervisor.rs`); the
+  historical `feed='groww'` rows remain readable in `ws_event_audit`. Paragraphs retained
+  as historical audit.)*
+- Append site (HISTORICAL — writer deleted 2026-07-15): the Groww second-feed bridge
   `crates/app/src/groww_bridge.rs` (`WsType::GrowwBridge`, `feed='groww'`) —
   `emit_groww_ws_audit` fires one row per Groww lifecycle transition (Connected
   on the first streaming rising edge, Disconnected/DisconnectedOffHours on the
