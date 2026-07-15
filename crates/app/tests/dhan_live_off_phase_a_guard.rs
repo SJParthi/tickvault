@@ -162,11 +162,20 @@ fn test_overlay_and_gate_and_suppression_warn_exist() {
         "feed_state_persist.rs lost the dhan_overlay_suppressed predicate — \
          the boot-site suppression warn depends on it"
     );
-    // Groww overlay semantics UNCHANGED (persisted wins both directions).
+    // 2026-07-15 (Groww live-feed retirement): the Groww overlay is
+    // narrow-only too — a stale persisted groww_enabled=true (written while
+    // Groww WAS the live feed) must never resurrect the retired feed over
+    // the production.toml flip.
     assert!(
-        persist_src.contains("groww_enabled: p.groww_enabled"),
-        "feed_state_persist.rs must keep the Groww overlay semantics \
-         unchanged (persisted groww choice wins both directions)"
+        persist_src.contains("groww_enabled: config.groww_enabled && p.groww_enabled"),
+        "feed_state_persist.rs lost the Groww overlay AND-gate — a stale \
+         data/feed-state.json with groww_enabled=true could resurrect the \
+         retired Groww live feed (operator directive 2026-07-15)"
+    );
+    assert!(
+        persist_src.contains("pub fn groww_overlay_suppressed("),
+        "feed_state_persist.rs lost the groww_overlay_suppressed predicate — \
+         the boot-site suppression warn depends on it"
     );
 
     let main_src = strip_line_comments(&read("crates/app/src/main.rs"));
@@ -174,6 +183,11 @@ fn test_overlay_and_gate_and_suppression_warn_exist() {
         main_src.contains("dhan_overlay_suppressed("),
         "main.rs must consult dhan_overlay_suppressed at the overlay \
          application site (the one-shot boot warn)"
+    );
+    assert!(
+        main_src.contains("groww_overlay_suppressed("),
+        "main.rs must consult groww_overlay_suppressed at the overlay \
+         application site (the 2026-07-15 one-shot boot warn)"
     );
     assert!(
         main_src.contains("overlay SUPPRESSED"),

@@ -449,6 +449,24 @@ async fn main() -> Result<()> {
                  a config change + restart."
             );
         }
+        // 2026-07-15 operator directive ("remove the whole Groww live feed;
+        // keep only spot 1m and option chain for both brokers"): the Groww
+        // overlay is narrow-only too — a STALE data/feed-state.json written
+        // while Groww WAS the live feed (`groww_enabled: true`) can never
+        // resurrect the retired feed over the production.toml flip (the
+        // boot-heartbeat false-page class). One boot-time warn makes the
+        // suppression visible (never silent).
+        if tickvault_api::feed_state_persist::groww_overlay_suppressed(
+            &config.feeds,
+            persisted.as_ref(),
+        ) {
+            warn!(
+                "feed-state overlay requested groww_enabled=true but the config says false — \
+                 overlay SUPPRESSED: the Groww live feed is retired by operator directive \
+                 2026-07-15 (both brokers are REST-only for market data). Re-enabling requires \
+                 a config change + restart."
+            );
+        }
         config.feeds = tickvault_api::feed_state_persist::overlay_feeds(config.feeds, persisted);
     }
     let feeds = &config.feeds;
