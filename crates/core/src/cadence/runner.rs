@@ -29,11 +29,11 @@ use tracing::{debug, error, info, warn};
 
 use super::assembly::{
     ChainCell, ChainProvenance, LaneAssembly, MoneynessFold, SpotProvenance,
-    fold_chain_cell_moneyness,
+    cross_fill_freshness_floor_ms, fold_chain_cell_moneyness,
 };
 use super::decision::{
     CadenceEvent, CadenceState, DecisionLatch, DecisionOutcome, DecisionSnapshot, SkipReason,
-    emit_decision, next_cadence_state,
+    emit_decision, may_decide_at_completion, next_cadence_state,
 };
 use super::executor::{
     CadenceExecutor, CadenceFetchError, ChainFetchOk, ChainFetchRequest, ExpiryListRequest,
@@ -2630,11 +2630,15 @@ fn finalize_if_complete<C: CadenceClock>(
     } else {
         slots.groww_cutoff_ms
     };
-    if now_wall > cutoff {
+    if !may_decide_at_completion(now_wall, cutoff) {
         // Past the cutoff there is NO decide path — the queued cutoff
         // event emits the honest skip ("never a late decision"). A
         // completion processed after the cutoff instant (unbiased select
-        // race / stalled runner) must not produce a late Decided.
+        // race / stalled runner) must not produce a late Decided. The
+        // comparison is the pure, unit-pinned
+        // `decision::may_decide_at_completion` and this call site is
+        // source-scan-ratcheted (TRH-R2-1, 2026-07-15) — deleting or
+        // inverting the guard fails the build.
         return;
     }
     if !lane.asm.is_data_complete() {
@@ -2646,8 +2650,14 @@ fn finalize_if_complete<C: CadenceClock>(
             return;
         }
         // Rung 2: cross-source fill from the other lane's same-cycle data
-        // (freshness-checked; valid up to AND INCLUDING the cutoff).
-        let (spots, chains) = lane.asm.cross_fill_from(&other.asm, now_wall, cutoff);
+        // (freshness-checked against the LENDER-aware floor — the base
+        // T − 5000 widened to the Dhan lender's rung-shifted earliest
+        // chain pre-fire, CADENCE-XFILL-RUNG-1 2026-07-15; valid up to
+        // AND INCLUDING the cutoff).
+        let floor = cross_fill_freshness_floor_ms(slots, other.asm.feed);
+        let (spots, chains) = lane
+            .asm
+            .cross_fill_from(&other.asm, floor, now_wall, cutoff);
         if spots + chains > 0 {
             lane.flags.cross_fill = true;
             let direction = if lane.asm.feed == Feed::Dhan {

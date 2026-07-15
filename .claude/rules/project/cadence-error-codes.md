@@ -157,7 +157,7 @@ EXCEPT `rate_limited`, which fires per-request by design (see below):
 | `spot_empty` | a spot leg returned 2xx-without-data (the Dhan 200-empty saga class; EITHER lane — dry-run returns Empty on every fire by design, see the dry-run note below); does NOT arm the ladder |
 | `chain_empty` | a chain leg returned 2xx-without-usable-data (EITHER lane); does NOT arm the ladder — kept distinct from `fetch_failed` so a 200-empty is never misread as a transport failure |
 | `groww_fallback` | the Groww T+800 verdict found failed burst legs — the sequential fallback engaged |
-| `cross_fill` | the lane's OWN fetch path exhausted (every own fire completed/failed, retries spent) without the cell; the OTHER lane's fresh same-minute data filled it (provenance stamped `CrossSource`). The fallback rungs run only on own-path exhaustion or at the cutoff — never preempting a still-scheduled own fire (design §5 resolution order) |
+| `cross_fill` | the lane's OWN fetch path exhausted (every own fire completed/failed, retries spent) without the cell; the OTHER lane's fresh same-minute data filled it (provenance stamped `CrossSource`). The freshness floor is LENDER-aware (CADENCE-XFILL-RUNG-1, 2026-07-15): the base T−5000 window widens to the Dhan lender's rung-shifted earliest chain pre-fire (`cross_fill_freshness_floor_ms`), so an anchor-ladder-shifted same-minute Dhan chain is never refused as stale while driving Dhan's own decision; the Groww lender keeps the base floor. The fallback rungs run only on own-path exhaustion or at the cutoff — never preempting a still-scheduled own fire (design §5 resolution order) |
 | `chain_embedded_spot` | third-rung provenance: the chain response's own embedded underlying spot filled the cell (own path exhausted first, as above) |
 | `moneyness_unknown` | ≥1 underlying's fold classified Unknown (spot unusable / rows unclassifiable / registry snapshot refused by the decide-time guard: unconfirmed publish, wrong minute, stale, or the boot sentinel) |
 | `queue_delay` | a fetch was refused by the SHARED `dhan_data_api_limiter`'s queue deadline (SELF-INFLICTED pacing — our own defense-in-depth limiter, not the broker; F1(iii) 2026-07-15). Stage-tagged distinctly, NEVER folded into `fetch_failed`, NEVER arms any ladder |
@@ -412,9 +412,16 @@ the option-chain month policy here.
 > skew/jitter/failure/restart permutations — INCLUDING every concurrency-ladder
 > step and shape transition — and asserts zero chain-spacing violations, never
 > more than `spot_window_cap` spot fires in ANY rolling 1000ms window,
-> zero nominal-slot denials, exactly 1 decision per (lane, cycle), no DECIDED
-> outcome past the lane cutoff, exactly-once snapshot publication per
-> successful chain fetch, and a non-vacuous 64-full-cycle activity floor.
+> zero nominal-slot denials, exactly 1 decision per (lane, cycle),
+> exactly-once snapshot publication per successful chain fetch, and a
+> non-vacuous 64-full-cycle activity floor. The 'no DECIDED outcome past the
+> lane cutoff' invariant is enforced RUNNER-SIDE (TRH-R2-1 truth-sync,
+> 2026-07-15): the finalize guard routes through the pure, unit-pinned
+> `decision::may_decide_at_completion` (boundary tests in decision.rs) and
+> the call site + early return are source-scan-ratcheted by
+> `cadence_composition_contract_guard.rs::test_cadence_finalize_pins_never_a_late_decided_guard`
+> — the replay proptest's matching assert exercises its own honest MIRROR of
+> that guard (labeled as such in the sim), never the runner code path itself.
 > NOT claimed:
 > that the BROKER never 429s — a shared-budget co-tenant (BruteX) or a
 > broker-side tightening can still produce one, which is typed
