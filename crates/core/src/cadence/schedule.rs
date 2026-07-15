@@ -92,6 +92,7 @@ pub const CADENCE_EXPIRY_WAVE_MID_MINUTE_ANCHOR_MS: i64 = 30_000;
 /// moves the waves OUT of the burst window so the backstop never has
 /// to defer a nominal fire.
 #[must_use]
+// TEST-EXEMPT: covered by test_cadence_expiry_wave_anchor_mid_minute_band_never_burst_window (guard name-pattern mismatch).
 pub fn next_expiry_wave_instant_ms(
     now_ms_of_day: i64,
     interval_ms: i64,
