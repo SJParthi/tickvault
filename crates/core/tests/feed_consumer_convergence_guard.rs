@@ -123,13 +123,27 @@ fn test_one_consumer_loop_path_guard() {
         1,
         "the Groww bridge must have exactly ONE consume_feed_tick call site"
     );
-    // The Groww persist call exists ONLY inside the shared-core closure: one
-    // `.append_row(` site total in the bridge's production region.
+    // The Groww TICK persist call exists ONLY inside the shared-core closure.
+    // Pin the documented FeedGapAuditWriter exception: exactly TWO
+    // `.append_row(` sites exist in the bridge's production region — the tick
+    // persist inside the consume_feed_tick closure, plus the gap-episode
+    // FeedGapAuditRow write (an audit-table row, not a tick persist — the
+    // 2026-07-14 feed-gap tracker). A THIRD site = a re-forked persist path.
     assert_eq!(
         groww_prod.matches(".append_row(").count(),
+        2,
+        "the Groww bridge persist sites re-forked — expected exactly 2 \
+         (the consume_feed_tick tick-persist closure + the documented \
+         FeedGapAuditWriter gap-episode audit exception)"
+    );
+    // The tick-persist site itself stays singular: exactly ONE
+    // `live_writer.append_row(` in the production region.
+    assert_eq!(
+        groww_prod.matches("live_writer.append_row(").count(),
         1,
-        "the Groww bridge must persist through exactly ONE .append_row( site \
-         (inside the consume_feed_tick persist closure)"
+        "the Groww bridge must persist TICKS through exactly ONE \
+         live_writer.append_row( site (inside the consume_feed_tick persist \
+         closure)"
     );
     // The Groww fold exists ONLY inside the shared-core closure: one
     // per-tick `.consume_tick(` site in the bridge's production region (the

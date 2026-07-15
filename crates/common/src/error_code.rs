@@ -1015,6 +1015,17 @@ pub enum ErrorCode {
     /// Severity::High, auto-triage-safe (the next trading day re-runs
     /// automatically; forced reruns are DEDUP-idempotent).
     TfVerify02RunDegraded,
+    /// FEED-GAP-01 (Groww hardening PR-3, 2026-07-14) — the feed GAP-EPISODE
+    /// forensics machinery DEGRADED: the tracker could not persist an
+    /// OPEN/CLOSE row to the `feed_gap_audit` table (ensure-DDL / ILP append /
+    /// flush), or the 15:45 IST scoreboard dangling-close sweep failed
+    /// (`stage` names the leg). ANNOTATION ONLY — never on the feed recovery
+    /// path or the tick hot path; the Telegram episode bubble still fires and
+    /// re-appends are DEDUP-idempotent (`ts, trading_date_ist, feed, start_ts,
+    /// outcome`). Telegram-episode-only delivery per the operator-approved
+    /// 2026-07-14 default (no CloudWatch filter). Severity::Medium,
+    /// auto-triage-safe.
+    FeedGap01EpisodeDegraded,
 }
 
 impl ErrorCode {
@@ -1212,6 +1223,8 @@ impl ErrorCode {
             // Daily timeframe-consistency verifier (operator 2026-07-13)
             Self::TfVerify01MismatchFound => "TF-VERIFY-01",
             Self::TfVerify02RunDegraded => "TF-VERIFY-02",
+            // Feed gap-episode forensics (Groww hardening PR-3, 2026-07-14)
+            Self::FeedGap01EpisodeDegraded => "FEED-GAP-01",
         }
     }
 
@@ -1470,6 +1483,9 @@ impl ErrorCode {
             // aggregate degraded; feeds/capture/trading unaffected, the
             // DEDUP-idempotent re-run backfills. Medium.
             | Self::Scoreboard01AggregationDegraded => Severity::Medium,
+            // FEED-GAP-01 (2026-07-14): gap-episode forensics degraded —
+            // annotation-only side record; capture/recovery unaffected. Medium.
+            Self::FeedGap01EpisodeDegraded => Severity::Medium,
             // Low: trading-day / Dhan other
             // PR #6a (2026-05-19): I-P1-01 (DailyScheduler) + I-P1-02 (DeltaFieldCoverage) retired
             Self::InstrumentP2TradingDayGuard
@@ -1724,6 +1740,10 @@ impl ErrorCode {
             Self::TfVerify01MismatchFound | Self::TfVerify02RunDegraded => {
                 ".claude/rules/project/tf-consistency-error-codes.md"
             }
+            // Feed gap-episode forensics (Groww hardening PR-3, 2026-07-14)
+            Self::FeedGap01EpisodeDegraded => {
+                ".claude/rules/project/feed-gap-error-codes.md"
+            }
         }
     }
 
@@ -1957,6 +1977,8 @@ impl ErrorCode {
             // Daily timeframe-consistency verifier (operator 2026-07-13)
             Self::TfVerify01MismatchFound,
             Self::TfVerify02RunDegraded,
+            // Feed gap-episode forensics (Groww hardening PR-3, 2026-07-14)
+            Self::FeedGap01EpisodeDegraded,
         ]
     }
 }
@@ -2320,7 +2342,9 @@ mod tests {
         // recomputed-from-1m value — coalesced per (feed, date) pass,
         // manual triage) + TF-VERIFY-02 (the daily run degraded —
         // client/query/truncation/flush/budget stage taxonomy) => 148.
-        assert_eq!(ErrorCode::all().len(), 148);
+        // 2026-07-14 (Groww hardening PR-3): FEED-GAP-01 (gap-episode
+        // forensics degraded — annotation-only side record) => 149.
+        assert_eq!(ErrorCode::all().len(), 149);
     }
 
     #[test]
@@ -2609,7 +2633,10 @@ mod tests {
                 // Per-minute option-chain REST pipeline (PR-3, 2026-07-12).
                 || s.starts_with("CHAIN-")
                 // Operator 2026-07-13: daily timeframe-consistency verifier
-                || s.starts_with("TF-VERIFY-");
+                || s.starts_with("TF-VERIFY-")
+                // Groww hardening PR-3 (2026-07-14): feed gap-episode
+                // forensics.
+                || s.starts_with("FEED-GAP-");
             assert!(has_known_prefix, "unexpected code prefix: {s}");
         }
     }
