@@ -36,6 +36,7 @@ pub mod feed_parity;
 pub mod formulas;
 pub mod instrument_registry;
 pub mod instrument_types;
+pub mod live_bar_freshness;
 // PR-C3 (2026-07-14): `locked_universe` DELETED with the Dhan subscription
 // surface (operator retirement directive 2026-07-13, scope-lock amendment
 // §B item 2 — no Dhan WS subscription remains to lock a universe for).
