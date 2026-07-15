@@ -40,6 +40,11 @@ pub mod reconciliation;
 pub mod state_machine;
 pub mod types;
 
+/// Groww order-side lane — GATED behind the non-default `groww_orders` cargo
+/// feature (§39.2 Gate 2). Absent from a default build.
+#[cfg(feature = "groww_orders")]
+pub mod groww;
+
 // Re-export key types for ergonomic use.
 pub use api_client::OrderApiClient;
 pub use engine::{OrderManagementSystem, TokenProvider};
