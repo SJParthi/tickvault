@@ -1911,6 +1911,24 @@ fn aggregate_pulls_per_feed(rest_legs: &[RestLegScoreLine], feed: &str) -> Optio
     measured.then_some((ok, total, gaps))
 }
 
+/// Renders the aggregated pulls segment shared by the aligned feed stat
+/// line AND the feed-off line (F2, 2026-07-15 fix round): the OFF-day
+/// Dhan line must still carry the pull digest — on the current prod
+/// shape every day is a Dhan feed-off day while the spot-1m/chain pulls
+/// are the operator's most-watched signal.
+fn render_pulls_segment((ok, total, gaps): (i64, i64, i64)) -> String {
+    let mark = if ok == total && gaps == 0 {
+        "\u{2705}"
+    } else {
+        "\u{26a0}\u{fe0f}"
+    };
+    let mut pulls_seg = format!("pulls {ok}/{total} {mark}");
+    if gaps > 0 {
+        pulls_seg.push_str(&format!("; {gaps} never recovered \u{26a0}\u{fe0f}"));
+    }
+    pulls_seg
+}
+
 /// Compact tick-count renderer for the aligned feed stat line: millions
 /// render as `1.94M` (the line must stay short enough to never wrap);
 /// smaller measured counts keep thousands separators (commandment 6).
@@ -1953,17 +1971,8 @@ fn aligned_feed_line(
     if f.drops_market >= 0 {
         segments.push(format!("drops {}", f.drops_market));
     }
-    if let Some((ok, total, gaps)) = pulls {
-        let mark = if ok == total && gaps == 0 {
-            "\u{2705}"
-        } else {
-            "\u{26a0}\u{fe0f}"
-        };
-        let mut pulls_seg = format!("pulls {ok}/{total} {mark}");
-        if gaps > 0 {
-            pulls_seg.push_str(&format!("; {gaps} never recovered \u{26a0}\u{fe0f}"));
-        }
-        segments.push(pulls_seg);
+    if let Some(p) = pulls {
+        segments.push(render_pulls_segment(p));
     }
     if segments.is_empty() {
         // Wholly unmeasured feed: honest, not silent (audit Rule 11).
@@ -3272,7 +3281,18 @@ impl NotificationEvent {
                     if *off {
                         // A deliberately-switched-off feed is ONE honest
                         // line — never a wall of zeros, never a winner.
-                        lines.push(format!("{}: OFF today (excluded from verdict)", f.name));
+                        // F2 (2026-07-15 fix round): the OFF line still
+                        // carries the pull digest when pull data exists —
+                        // on current prod every day is a Dhan feed-off day
+                        // (live WS retired) while the Dhan spot-1m/chain
+                        // REST pulls are the operator's most-watched
+                        // signal. Omitted only when there are genuinely no
+                        // measured pull rows for the feed.
+                        let mut off_line = format!("{}: OFF today (excluded from verdict)", f.name);
+                        if let Some(p) = aggregate_pulls_per_feed(rest_legs, &f.name) {
+                            off_line.push_str(&format!(" \u{b7} {}", render_pulls_segment(p)));
+                        }
+                        lines.push(off_line);
                     } else {
                         lines.push(aligned_feed_line(
                             f,
@@ -9665,6 +9685,81 @@ mod tests {
         assert!(
             !rest.contains("no contest"),
             "no-contest wording may appear ONLY in line 1: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_dual_feed_scorecard_feed_off_line_still_carries_pull_digest() {
+        // F2 (2026-07-15 fix round): on current prod EVERY day is a Dhan
+        // feed-off day (live WS retired) while the Dhan spot-1m/chain REST
+        // pulls are the operator's most-watched signal — the OFF line must
+        // still carry the pulls segment when pull data exists.
+        let mut d = score_line("Dhan");
+        d.ticks = 0;
+        let rest_legs = vec![
+            RestLegScoreLine {
+                ok_fetches: 735,
+                failed_fetches: 735,
+                ..rest_line("Dhan", "spot candles")
+            },
+            RestLegScoreLine {
+                ok_fetches: 733,
+                failed_fetches: 2,
+                ..rest_line("Dhan", "option chain")
+            },
+        ];
+        let ev = NotificationEvent::DualFeedDailyScorecard {
+            trading_date_ist: "2026-07-15".to_string(),
+            dhan: d,
+            groww: score_line("Groww"),
+            session_minutes: 375,
+            partial_coverage: false,
+            degraded: false,
+            early_run: false,
+            restart_partial: false,
+            dhan_feed_off: true,
+            groww_feed_off: false,
+            rest_legs,
+            rest_legs_read_failed: false,
+        };
+        let msg = ev.to_message();
+        let off_line = msg
+            .lines()
+            .find(|l| l.contains("Dhan: OFF today"))
+            .unwrap_or_default();
+        assert!(
+            off_line.contains("OFF today (excluded from verdict) \u{b7} pulls 1468/2205"),
+            "OFF line must carry the aggregated pull digest: {msg}"
+        );
+        assert!(
+            off_line.contains("\u{26a0}\u{fe0f}"),
+            "degraded pulls on the OFF line must carry the warning mark: {msg}"
+        );
+        // No pull rows for the OFF feed → the segment is genuinely omitted.
+        let mut d = score_line("Dhan");
+        d.ticks = 0;
+        let ev = NotificationEvent::DualFeedDailyScorecard {
+            trading_date_ist: "2026-07-15".to_string(),
+            dhan: d,
+            groww: score_line("Groww"),
+            session_minutes: 375,
+            partial_coverage: false,
+            degraded: false,
+            early_run: false,
+            restart_partial: false,
+            dhan_feed_off: true,
+            groww_feed_off: false,
+            rest_legs: vec![rest_line("Dhan", "spot candles")],
+            rest_legs_read_failed: false,
+        };
+        let msg = ev.to_message();
+        assert!(
+            msg.contains("Dhan: OFF today (excluded from verdict)"),
+            "{msg}"
+        );
+        assert!(
+            !msg.contains("Dhan: OFF today (excluded from verdict) \u{b7}"),
+            "all-sentinel pull rows must omit the segment, never fabricate: {msg}"
         );
     }
 
