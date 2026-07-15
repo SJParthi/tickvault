@@ -641,6 +641,10 @@ portfolio_read = false
 margin_read = false
 user_read = false
 live_fire_requested = false
+smart_orders_read = false # read-only GTT/OCO get/list (the OCO reconcile poller's read surface)
+smart_orders_write = false # smart-order create/modify/cancel INTENT — inert without Gates 2+3
+oco_reconcile_poll_secs = 15 # OCO reconcile poller cadence (seconds; Smart Orders area design value)
+oco_sibling_cancel_deadline_secs = 30 # sibling-cancel verification deadline (seconds) — past it = GROWW-OCO-02
 
 # ===========================================================================
 # 🔷 DHAN pre-trade margin gate (operator directive 2026-07-14, relayed via

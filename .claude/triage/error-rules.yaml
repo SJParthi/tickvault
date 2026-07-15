@@ -2287,3 +2287,238 @@ rules:
       An unverified exit is open exposure — operator eyes required; any
       live policy action (modify-to-aggressive / cancel-remainder) is a
       live order action and is never auto-executed in the dry-run layer.
+
+  # -----------------------------------------------------------------------
+  # 🟢 GROWW order-side fan-out contract stubs (2026-07-15) — Portfolio,
+  # Smart Orders (GTT/OCO), Margin. ALL escalate: contract stubs with zero
+  # emit sites until the area code PRs land; no auto-fix script exists,
+  # and the order-side never auto-actions (the §39 live-fire lattice).
+  # -----------------------------------------------------------------------
+
+  # GROWW-PORT-01 = the broker portfolio snapshot fetch degraded (stage
+  # taxonomy: cycle_failed / escalation / token_read / client_build /
+  # task_respawn / resolve_failed / schema_drift / rate_limited /
+  # blind_tier). The next tier/cycle re-attempts; consumers fail closed
+  # on snapshot age — nothing is safe to auto-fix on a read surface.
+  - name: groww-port-01-snapshot-degraded-escalate
+    match:
+      code: GROWW-PORT-01
+    action: escalate
+    runbook_path: .claude/rules/project/groww-portfolio-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 600
+    justification: >-
+      GROWW-PORT-01 = portfolio snapshot fetch degraded. The next
+      tier/cycle re-attempts automatically and consumers fail closed on
+      staleness; the operator inspects the stage + the shared token /
+      pooled rate bucket per the runbook rather than a blind auto-fix.
+
+  # GROWW-PORT-02 = a broker-portfolio QuestDB persist leg failed
+  # (best-effort; discard-pending defense; DEDUP-idempotent re-append).
+  - name: groww-port-02-persist-failed-escalate
+    match:
+      code: GROWW-PORT-02
+    action: escalate
+    runbook_path: .claude/rules/project/groww-portfolio-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 600
+    justification: >-
+      GROWW-PORT-02 = portfolio persist failed. Re-appends are
+      DEDUP-idempotent; the underlying condition is QuestDB ILP/HTTP
+      health (make doctor, BOOT-01/BOOT-02 cross-check) — operator
+      inspection, never a blind auto-fix.
+
+  # GROWW-PORT-03 = the three-book reconciliation ledger CONFIRMED a
+  # residual. is_auto_triage_safe = false (severity-independent override,
+  # the FUTIDX-02 precedent): a data-comparability verdict between our
+  # book, the broker book, and co-tenant activity is an operator
+  # judgment — auto-"fixing" either side would forge position state.
+  - name: groww-port-03-recon-divergence-escalate
+    match:
+      code: GROWW-PORT-03
+    action: escalate
+    runbook_path: .claude/rules/project/groww-portfolio-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 600
+    justification: >-
+      GROWW-PORT-03 = reconciliation residual confirmed. Never
+      auto-actioned (FUTIDX-02 precedent) — the operator judges which
+      book explains the residual via the position_recon_audit trend
+      per the runbook.
+
+  # GROWW-PORT-04 = a foreign (not-ours) position on the SHARED account
+  # (BruteX co-tenant). Evidence-only visibility; never auto-exited —
+  # the never-auto-exit invariant is source-scan-ratcheted.
+  - name: groww-port-04-foreign-position-escalate
+    match:
+      code: GROWW-PORT-04
+    action: escalate
+    runbook_path: .claude/rules/project/groww-portfolio-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 600
+    justification: >-
+      GROWW-PORT-04 = foreign position detected on the pooled account.
+      The page IS the dry-run action; nothing is ever auto-actioned —
+      the operator eyeballs the broker app per the runbook.
+
+  # GROWW-OCO-01 = a smart-order (GTT/OCO) create/cancel leg failed after
+  # one bounded transport retry. Never auto-fixed: re-issuing an
+  # order-side mutation blind is the double-exposure class the
+  # idempotency machinery exists to prevent.
+  - name: groww-oco-01-placement-failed-escalate
+    match:
+      code: GROWW-OCO-01
+    action: escalate
+    runbook_path: .claude/rules/project/groww-oco-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 600
+    justification: >-
+      GROWW-OCO-01 = smart-order placement/cancel leg failed. The
+      failure is already loud with correlation forensics; the reconcile
+      poller owns the follow-up — auto-triage must never re-issue an
+      order mutation.
+
+  # GROWW-OCO-02 = an OCO sibling-leg cancel UNVERIFIED past the 30s
+  # deadline after the other leg filled — a DOUBLE-FILL exposure window.
+  # Severity::Critical: never auto-actioned (the Critical blanket); the
+  # operator verifies/cancels the sibling on the broker book NOW.
+  - name: groww-oco-02-sibling-cancel-unverified-escalate
+    match:
+      code: GROWW-OCO-02
+    action: escalate
+    runbook_path: .claude/rules/project/groww-oco-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 600
+    justification: >-
+      GROWW-OCO-02 = OCO sibling cancel unverified past the deadline.
+      Critical double-fill exposure — the operator must verify the
+      sibling on the broker book immediately; an automated cancel is a
+      live order action and is never auto-executed.
+
+  # GROWW-OCO-03 = OCO pair state reconcile mismatch vs the broker (incl.
+  # the partial-fill class; broker semantics doc-UNKNOWN, fail-closed).
+  # is_auto_triage_safe = false (severity-independent override, the
+  # FUTIDX-02 data-comparability precedent).
+  - name: groww-oco-03-reconcile-mismatch-escalate
+    match:
+      code: GROWW-OCO-03
+    action: escalate
+    runbook_path: .claude/rules/project/groww-oco-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 600
+    justification: >-
+      GROWW-OCO-03 = OCO pair reconcile mismatch. Never auto-actioned
+      (FUTIDX-02 precedent) — the operator judges partial-fill vs
+      broker lag vs a tracked-state bug; the next poll re-measures.
+
+  # GROWW-OCO-04 = a smart-order modify rejected by the broker OR
+  # targeting an API-immutable leg field (leg order_type/price) — the
+  # fallback is cancel+recreate, a mutation no auto-fix may issue.
+  - name: groww-oco-04-modify-rejected-escalate
+    match:
+      code: GROWW-OCO-04
+    action: escalate
+    runbook_path: .claude/rules/project/groww-oco-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 600
+    justification: >-
+      GROWW-OCO-04 = smart-order modify rejected. An immutable-field
+      rejection is a request-construction bug routed through
+      cancel+recreate — an order mutation the auto-triage daemon never
+      issues.
+
+  # GROWW-OCO-05 = the OCO get/list reconcile poller (15s cadence)
+  # degraded/respawned. Bounded re-poll at the next tick self-heals; a
+  # sustained degrade while a pair is live blinds the OCO-02 check.
+  - name: groww-oco-05-poller-degraded-escalate
+    match:
+      code: GROWW-OCO-05
+    action: escalate
+    runbook_path: .claude/rules/project/groww-oco-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 600
+    justification: >-
+      GROWW-OCO-05 = OCO reconcile poller degraded. The next tick
+      re-polls automatically; the operator checks whether an OCO pair
+      is live (the sibling-verification window) per the runbook —
+      nothing is safe to auto-fix.
+
+  # GROWW-MARG-01 = the /v1/margins/detail/user fetch leg degraded — the
+  # next poll retries; a sustained degrade ages the snapshot toward the
+  # MARG-03 fail-closed stale gate (the designed consequence).
+  - name: groww-marg-01-fetch-degraded-escalate
+    match:
+      code: GROWW-MARG-01
+    action: escalate
+    runbook_path: .claude/rules/project/groww-margin-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 600
+    justification: >-
+      GROWW-MARG-01 = margin fetch degraded. The next poll retries and
+      the stale gate fails closed for entries meanwhile; the operator
+      cross-checks the shared token + sibling Groww REST legs per the
+      runbook.
+
+  # GROWW-MARG-02 = the margin snapshot persist leg failed (best-effort;
+  # DEDUP-idempotent re-append; the RAM gate input is persist-independent).
+  - name: groww-marg-02-persist-failed-escalate
+    match:
+      code: GROWW-MARG-02
+    action: escalate
+    runbook_path: .claude/rules/project/groww-margin-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 600
+    justification: >-
+      GROWW-MARG-02 = margin snapshot persist failed. Forensic rows for
+      the outage window are missing until QuestDB recovers (make
+      doctor); the gate's RAM input is unaffected — operator
+      inspection, never a blind auto-fix.
+
+  # GROWW-MARG-03 = the margin snapshot exceeded stale_secs and the gate
+  # failed CLOSED for entries (exits are NEVER margin-gated). The page is
+  # visibility of the fail-closed design working — not an action request.
+  - name: groww-marg-03-stale-gate-closed-escalate
+    match:
+      code: GROWW-MARG-03
+    action: escalate
+    runbook_path: .claude/rules/project/groww-margin-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 600
+    justification: >-
+      GROWW-MARG-03 = margin snapshot stale, entry gate closed
+      fail-closed. Entries resume automatically on a fresh snapshot;
+      the operator triages the upstream fetch degrade (GROWW-MARG-01)
+      — force-opening the gate is never an option.
+
+  # GROWW-MARG-04 = an entry refused on insufficient margin after
+  # buffer_pct + floor_paise. is_auto_triage_safe = false
+  # (severity-independent override): spend authorization on the POOLED
+  # shared account is operator territory (funds-margin shared-account
+  # doctrine; FUTIDX-02 override precedent).
+  - name: groww-marg-04-entry-rejected-escalate
+    match:
+      code: GROWW-MARG-04
+    action: escalate
+    runbook_path: .claude/rules/project/groww-margin-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 600
+    justification: >-
+      GROWW-MARG-04 = entry refused for insufficient pooled margin.
+      Never auto-actioned — the operator decides fund/resize/stand-down;
+      the co-tenant shares the balance so a refusal is never
+      auto-overridden.
+
+  # GROWW-MARG-05 = margin-calculator vs user-margin divergence beyond
+  # tolerance — a trend signal (neither side is ground truth, the §37
+  # doctrine); the next poll re-measures.
+  - name: groww-marg-05-calc-divergence-escalate
+    match:
+      code: GROWW-MARG-05
+    action: escalate
+    runbook_path: .claude/rules/project/groww-margin-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 600
+    justification: >-
+      GROWW-MARG-05 = calculator-vs-user margin divergence. Track the
+      trend per the runbook (rounding/timing skew vs parse drift) —
+      nothing is safe to auto-fix on a comparability signal.
