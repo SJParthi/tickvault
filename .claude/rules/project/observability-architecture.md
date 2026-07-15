@@ -271,6 +271,7 @@ summary file and drives the above flow.
 | `.claude/triage/error-rules.yaml` | triage classifier | Phase 6 |
 | `.claude/triage/claude-loop-prompt.md` | Claude-watches-logs runbook | Phase 7 |
 | `.claude/state/triage-seen.jsonl` | edge-trigger dedup | Phase 6 |
+| `data/orders/` (+ `groww-intents-YYYYMMDD.ndjson`) | Groww order intent write-ahead ledger (fsync-per-append; IST-midnight rotation; retained, no sweeper) | Groww orders (2026-07-15) |
 
 ## What future sessions MUST NOT do
 
