@@ -77,10 +77,35 @@ lane as close to each minute close T as the brokers' rate rules allow:
   mid-day. The IST deadline (`expiry_deadline_secs_of_day_ist`, default
   08:55) gates the edge-latched PAGE, never the attempts — a boot after the
   deadline still resolves on its first success, and the background retry
-  continues at the same cadence until session end. Both brokers resolving to
+  continues at the same cadence until session end; a process that BOOTS
+  after the deadline requires ≥2 consecutive failed attempt waves
+  (`POST_DEADLINE_BOOT_MIN_FAILED_WAVES`) before the page fires — never the
+  first-wave hair trigger (E4, 2026-07-15; the pre-deadline path is
+  unchanged). The read facade the runner stamps requests from is
+  DAY-CHECKED (E1 fix, 2026-07-15): the IST trading day is threaded from
+  the injected clock into every `resolved_expiry` call, so a process
+  crossing IST midnight whose morning re-resolution keeps FAILING stamps
+  `None` (degraded, loud) — never yesterday's (potentially expired) winner.
+  Both brokers resolving to
   DIFFERENT dates ⇒ **Dhan WINS for keying BOTH lanes** (the
   exchange-sourced expirylist is authoritative), loudly via the edge-latched
   `expiry_disagreement` stage; both raws stay recorded for provenance.
+  **HONEST RESIDUAL (E2, dated 2026-07-15 — process-restart re-resolution):**
+  the day lock is IN-MEMORY (process-global `OnceLock`), so it is
+  TASK-RESPAWN-proof ONLY — a mid-session PROCESS restart (crash-boot,
+  deploy) re-resolves from scratch against the vendor's CURRENT list. On
+  expiry day, a vendor list that drops today's date intraday would then
+  silently roll BOTH lanes to the next series mid-session (pinned by the
+  passes-by-design demo test
+  `test_cadence_expiry_process_restart_reresolution_rolls_forward_when_vendor_drops_today`).
+  **Flagged follow-up:** persist the day lock as a tiny date+expiries JSON
+  file (the `data/instrument-cache` plan-snapshot precedent —
+  `instrument_snapshot.rs`, incl. its fail-closed `is_valid_trading_date`
+  validation) that the boot resolution phase consults FIRST: same IST day +
+  parseable → adopt without re-resolving; else cold-resolve and rewrite;
+  fail-closed on corrupt/mismatched files. Deliberately NOT smuggled into
+  the 2026-07-15 fix round — it adds file I/O + a path knob to the
+  resolution loop and every deps construction site.
 
 **HONEST COMPOSITION WORDING (verifier F6, dated 2026-07-15 — re-located):**
 the earlier "never queues" claim about the spot gate vs the shared
@@ -118,7 +143,7 @@ EXCEPT `rate_limited`, which fires per-request by design (see below):
 | `chain_embedded_spot` | third-rung provenance: the chain response's own embedded underlying spot filled the cell (own path exhausted first, as above) |
 | `moneyness_unknown` | ≥1 underlying's fold classified Unknown (spot unusable / rows unclassifiable / registry snapshot refused by the decide-time guard: unconfirmed publish, wrong minute, stale, or the boot sentinel) |
 | `queue_delay` | a fetch was refused by the SHARED `dhan_data_api_limiter`'s queue deadline (SELF-INFLICTED pacing — our own defense-in-depth limiter, not the broker; F1(iii) 2026-07-15). Stage-tagged distinctly, NEVER folded into `fetch_failed`, NEVER arms any ladder |
-| `expiry_unresolved` | TWO emission points share this stage: (a) the per-cycle coalesced flag — ≥1 chain request was stamped `expiry_yyyymmdd = None` (the day-locked store has no policy date yet; the scheduler NEVER guesses — the executor impl may fall back to its warmup expiry; ALWAYS present in dry-run, where every expiry-list fetch returns Empty); (b) the resolution loop's EDGE-LATCHED deadline page — ONE `error!` per (broker, underlying) per IST day the instant `expiry_deadline_secs_of_day_ist` (default 08:55) passes unresolved; the lanes run degraded meanwhile and the background retry continues at `expiry_retry_interval_ms` until session end (the deadline gates the PAGE, never the attempts) |
+| `expiry_unresolved` | TWO emission points share this stage: (a) the per-cycle coalesced flag — ≥1 chain request was stamped `expiry_yyyymmdd = None` (the day-locked store has no policy date yet; the scheduler NEVER guesses — the executor impl may fall back to its warmup expiry; ALWAYS present in dry-run, where every expiry-list fetch returns Empty); (b) the resolution loop's EDGE-LATCHED deadline page — ONE `error!` per (broker, underlying) per IST day the instant `expiry_deadline_secs_of_day_ist` (default 08:55) passes unresolved; the lanes run degraded meanwhile and the background retry continues at `expiry_retry_interval_ms` until session end (the deadline gates the PAGE, never the attempts, and a post-deadline BOOT requires ≥2 consecutive failed waves before the page — E4, 2026-07-15). FALLING EDGE (E3, 2026-07-15): a LATER successful resolution for a pair whose page HAD fired emits one coded recovery `info!` (`stage = "expiry_resolved_late"` on the same CADENCE-01 code — no new variant) + `tv_cadence_expiry_resolved_late_total{broker, underlying}`, at most once per pair per day (first write wins) |
 | `expiry_disagreement` | both brokers resolved the day's policy expiry for one underlying and the dates DIFFER — **Dhan WINS for keying BOTH lanes** (exchange-sourced expirylist authority); edge-latched ONCE per (underlying, day); both raw dates ride the payload + the store's provenance view (`tv_cadence_expiry_disagreement_total{underlying}`) |
 | `ladder_exhausted` | the failure ladder hit its max rung (5) — edge-latched ONCE per episode, re-armed by a clean cycle |
 
@@ -351,10 +376,15 @@ the option-chain month policy here.
 > real broker executors (and the dated rule-file re-authorization for their
 > decision-path fires) land in a LATER PR — this PR ships timing machinery
 > only, no REST caller. Expiry resolution (2026-07-15) is day-locked +
-> respawn-proof (process-global store keyed on the IST trading day via
-> `trading_calendar::ist_offset()`); its policy math is pure + property-
+> TASK-respawn-proof (process-global store keyed on the IST trading day via
+> `trading_calendar::ist_offset()`; the read facade is DAY-CHECKED — E1,
+> 2026-07-15 — so a failed morning re-resolution serves None, never a stale
+> prior-day winner); its policy math is pure + property-
 > tested (BANKNIFTY month-last never flat-min; expiry-day holds through
 > close then rolls; garbage/empty lists fail closed to None). NOT claimed:
+> PROCESS-restart-proofness — the in-memory day lock re-resolves on a
+> mid-session crash-boot (the E2 residual + flagged persisted-lock
+> follow-up in §0). NOT claimed:
 > that the vendor lists are correct — a wrong upstream list resolves to a
 > wrong-but-loud date (the disagreement arm catches cross-broker splits;
 > a same-wrong-both-sides list is invisible by construction)."

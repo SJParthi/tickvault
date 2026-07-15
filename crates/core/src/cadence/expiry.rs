@@ -187,6 +187,46 @@ pub fn expiry_page_due(
     now_secs_of_day >= deadline_secs_of_day && !resolved && !already_paged
 }
 
+/// E4 (2026-07-15): the minimum CONSECUTIVE failed attempt waves a
+/// process that BOOTED after the deadline must observe before the
+/// edge-latched `expiry_unresolved` page fires. A crash-boot at e.g.
+/// 11:00 IST previously paged on the very FIRST failed wave (hair
+/// trigger — one transient vendor blip at boot = a page); it now needs
+/// ≥2 consecutive failed waves. The pre-deadline path is unchanged: the
+/// deadline itself still gates the page (threshold 1 — an unresolved
+/// pair at the deadline crossing has, by loop construction, just failed
+/// its wave).
+pub const POST_DEADLINE_BOOT_MIN_FAILED_WAVES: u32 = 2;
+
+/// Wave-aware page decision (E4, 2026-07-15): [`expiry_page_due`] AND the
+/// boot-mode wave threshold — `booted_after_deadline` is whether the
+/// resolution loop's FIRST observation of this IST day was already past
+/// the deadline (a post-deadline crash-boot), in which case
+/// [`POST_DEADLINE_BOOT_MIN_FAILED_WAVES`] consecutive failed waves are
+/// required; otherwise 1 (the pre-deadline path, unchanged).
+#[must_use]
+pub fn expiry_page_due_after_wave(
+    now_secs_of_day: u32,
+    deadline_secs_of_day: u32,
+    resolved: bool,
+    already_paged: bool,
+    booted_after_deadline: bool,
+    consecutive_failed_waves: u32,
+) -> bool {
+    let min_waves = if booted_after_deadline {
+        POST_DEADLINE_BOOT_MIN_FAILED_WAVES
+    } else {
+        1
+    };
+    consecutive_failed_waves >= min_waves
+        && expiry_page_due(
+            now_secs_of_day,
+            deadline_secs_of_day,
+            resolved,
+            already_paged,
+        )
+}
+
 /// One underlying's day-locked resolution view (the read API surface the
 /// future capture-leg delegation consumes — see the ONE-SOURCE-OF-TRUTH
 /// DELEGATION section of `cadence-error-codes.md`).
@@ -514,6 +554,26 @@ mod tests {
     }
 
     #[test]
+    fn test_cadence_expiry_process_restart_reresolution_rolls_forward_when_vendor_drops_today() {
+        // E2 demo (verifier, 2026-07-15 — passes BY DESIGN, documenting
+        // the residual named in cadence-error-codes.md §0): the day lock
+        // is IN-MEMORY, so a mid-session process RESTART re-resolves
+        // from scratch. On expiry day, a vendor list that dropped
+        // today's date intraday makes the fresh resolution roll BOTH
+        // lanes forward to the next series mid-session — the pure policy
+        // math is doing exactly what it is told; only a persisted day
+        // lock (flagged follow-up) would pin the morning's verdict
+        // across a restart. Task RESPAWNS are covered (process-global
+        // store); process restarts are not.
+        let morning = [20_260_716, 20_260_723];
+        let held = resolve_policy_expiry(ExpiryPolicy::NearestActiveDate, &morning, 20_260_716);
+        assert_eq!(held.map(ExpiryDate::yyyymmdd), Some(20_260_716));
+        let intraday = [20_260_723];
+        let rolled = resolve_policy_expiry(ExpiryPolicy::NearestActiveDate, &intraday, 20_260_716);
+        assert_eq!(rolled.map(ExpiryDate::yyyymmdd), Some(20_260_723));
+    }
+
+    #[test]
     fn test_cadence_expiry_store_day_lock_first_write_wins_and_day_flip() {
         let store = DayLockedExpiryStore::new();
         let day = NaiveDate::from_ymd_opt(2026, 7, 15).expect("valid");
@@ -656,6 +716,42 @@ mod tests {
         // Resolved (even late — the deadline gates the PAGE, not the
         // attempts): never due.
         assert!(!expiry_page_due(40_000, 32_100, true, false));
+    }
+
+    #[test]
+    fn test_cadence_expiry_page_post_deadline_boot_needs_two_failed_waves() {
+        // E4 (2026-07-15): a process BOOTING after the deadline (e.g. a
+        // crash-boot at 11:00 IST) must observe ≥2 consecutive failed
+        // waves before the page fires — never the first-wave hair
+        // trigger.
+        assert_eq!(POST_DEADLINE_BOOT_MIN_FAILED_WAVES, 2);
+        // Post-deadline boot, first failed wave: NOT due.
+        assert!(!expiry_page_due_after_wave(
+            40_000, 32_100, false, false, true, 1
+        ));
+        // Second consecutive failed wave: due.
+        assert!(expiry_page_due_after_wave(
+            40_000, 32_100, false, false, true, 2
+        ));
+        // Pre-deadline boot path UNCHANGED: the deadline gates the page
+        // and one wave suffices.
+        assert!(expiry_page_due_after_wave(
+            32_100, 32_100, false, false, false, 1
+        ));
+        // Still never before the deadline, resolved, or already paged.
+        assert!(!expiry_page_due_after_wave(
+            32_099, 32_100, false, false, true, 9
+        ));
+        assert!(!expiry_page_due_after_wave(
+            40_000, 32_100, true, false, true, 9
+        ));
+        assert!(!expiry_page_due_after_wave(
+            40_000, 32_100, false, true, true, 9
+        ));
+        // Zero waves never page in either boot mode.
+        assert!(!expiry_page_due_after_wave(
+            40_000, 32_100, false, false, false, 0
+        ));
     }
 
     // -----------------------------------------------------------------
