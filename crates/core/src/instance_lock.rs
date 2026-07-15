@@ -1791,7 +1791,7 @@ mod tests {
             "host-a".to_string(),
             Arc::clone(&shutdown),
             Arc::clone(&held),
-            ErrorCode::GrowwScale05DualFleetDetected,
+            ErrorCode::Resilience01DualInstanceDetected,
         );
         shutdown.notify_one();
         tokio::time::timeout(Duration::from_secs(30), handle)
@@ -1833,7 +1833,7 @@ mod tests {
             "host-a".to_string(),
             Arc::clone(&shutdown),
             Arc::clone(&held),
-            ErrorCode::GrowwScale05DualFleetDetected,
+            ErrorCode::Resilience01DualInstanceDetected,
         );
         tokio::time::timeout(Duration::from_secs(3600), handle)
             .await
@@ -1861,7 +1861,7 @@ mod tests {
             "host-a".to_string(),
             Arc::clone(&shutdown),
             Arc::clone(&held),
-            ErrorCode::GrowwScale05DualFleetDetected,
+            ErrorCode::Resilience01DualInstanceDetected,
         );
         // Let at least THRESHOLD (+2 margin) renewal ticks elapse so the
         // consecutive-failure counter crosses the TTL escalation.

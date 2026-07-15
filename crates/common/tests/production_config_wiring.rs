@@ -66,16 +66,16 @@ fn test_production_locks_dry_run_no_real_orders() {
 }
 
 #[test]
-fn test_production_groww_live_dhan_rest_only() {
-    // Operator directive 2026-07-13 (verbatim, relayed via the coordinator
-    // session): "now remove this entire Dhan live websocket feed instruments
-    // subscription even entire live websocket feed itself... As of now only
-    // Groww and Dhan historical api pull as we discussed last night along
-    // with option chain."
+fn test_production_rest_only_no_live_feeds() {
+    // Operator directive 2026-07-15 (relayed via the coordinator session):
+    // "remove the whole Groww live feed; keep only spot 1m and option chain
+    // for both brokers" — the runtime is REST-ONLY for BOTH brokers.
     //
-    // SUPERSEDES the 2026-06-30 both-feeds lock (the retired
-    // `test_production_runs_both_feeds`): the Dhan live WS lane is OFF by
-    // default; Groww is THE live feed; the Dhan REST retained surface
+    // SUPERSEDES the 2026-07-13 Groww-is-the-live-feed pin (the renamed
+    // `test_production_groww_live_dhan_rest_only`), which itself SUPERSEDED
+    // the 2026-06-30 both-feeds lock (the retired
+    // `test_production_runs_both_feeds`). The 2026-07-13 Dhan half stands:
+    // the Dhan live WS lane is OFF; the Dhan REST retained surface
     // (token/auth stack, spot_1m_rest, option_chain_1m + entitlement probe,
     // REST canary) runs WITHOUT the WS lane via
     // crates/app/src/dhan_rest_stack.rs. Phase A is a config flip +
@@ -94,9 +94,15 @@ fn test_production_groww_live_dhan_rest_only() {
          resurrects the retired lane (operator directive 2026-07-13)"
     );
     assert!(
-        prod.contains("groww_enabled = true"),
-        "production.toml must keep the Groww feed enabled — Groww is THE \
-         live feed (operator directive 2026-07-13)"
+        prod.contains("groww_enabled = false"),
+        "production.toml must keep the Groww live feed disabled — the runtime \
+         is REST-only (operator directive 2026-07-15: remove the whole Groww \
+         live feed; keep only spot 1m and option chain for both brokers)"
+    );
+    assert!(
+        !prod.contains("groww_enabled = true"),
+        "production.toml must not re-enable the retired Groww live feed \
+         (operator directive 2026-07-15)"
     );
 
     // base.toml carries the same Dhan-off default so a TV_ENVIRONMENT=dev/
@@ -112,6 +118,38 @@ fn test_production_groww_live_dhan_rest_only() {
         !base.contains("dhan_enabled = true"),
         "base.toml must NOT re-enable the Dhan live WS feed (operator \
          directive 2026-07-13)"
+    );
+}
+
+#[test]
+fn test_base_config_sandbox_only_until_is_2099_sentinel() {
+    // Refuter round 1 (2026-07-14, LOW): production.toml's 2099-12-31 pin
+    // above left config/base.toml UN-pinned — the historical incident was
+    // exactly base.toml's `sandbox_only_until = "2026-06-30"` EXPIRING
+    // silently on 2026-07-01. A silent revert to a past date must fail the
+    // BUILD, not just fire the runtime gate-4 boot warn. Comment-filtered
+    // (base.toml carries prose comments mentioning the sentinel date, so a
+    // bare `contains("2099-12-31")` would pass even after a revert).
+    let base = std::fs::read_to_string(workspace_root().join("config").join("base.toml"))
+        .expect("base.toml must be readable"); // APPROVED: test
+    let assignments: Vec<&str> = base
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.starts_with('#') && l.contains("sandbox_only_until"))
+        .collect();
+    assert_eq!(
+        assignments.len(),
+        1,
+        "base.toml must carry exactly ONE sandbox_only_until assignment; \
+         found {assignments:?}"
+    );
+    assert!(
+        assignments[0].starts_with("sandbox_only_until = \"2099-12-31\""),
+        "BASE LOCKDOWN: base.toml must set sandbox_only_until = \"2099-12-31\" \
+         (the far-future sentinel matching production.toml) — a past date \
+         silently disarms the sandbox window on every base-merged boot \
+         (the 2026-07-01 silent-expiry incident class); found: {}",
+        assignments[0]
     );
 }
 

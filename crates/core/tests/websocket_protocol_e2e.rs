@@ -1081,141 +1081,19 @@ fn test_f32_price_no_division_needed() {
 }
 
 // =========================================================================
-// SECTION 20: SUBSCRIPTION JSON FORMAT VERIFICATION
-// Cross-reference: dhanhq.co/docs/v2/live-market-feed/#adding-instruments
+// SECTION 20: SUBSCRIPTION JSON FORMAT VERIFICATION — RETIRED (PR-C2,
+// 2026-07-13). The subscribe/unsubscribe/disconnect JSON tests died with the
+// functionality they pinned: `subscription_builder.rs` was DELETED with the
+// Dhan live main-feed WS lane (operator retirement directive —
+// websocket-connection-scope-lock.md "2026-07-13 Amendment").
 // =========================================================================
 
-#[test]
-fn test_subscription_json_format() {
-    use tickvault_common::types::{ExchangeSegment, FeedMode};
-    use tickvault_core::websocket::subscription_builder::build_subscription_messages;
-    use tickvault_core::websocket::types::InstrumentSubscription;
-
-    let instruments = vec![
-        InstrumentSubscription::new(ExchangeSegment::IdxI, 13),
-        InstrumentSubscription::new(ExchangeSegment::NseEquity, 2885),
-        InstrumentSubscription::new(ExchangeSegment::NseFno, 52432),
-    ];
-
-    let messages =
-        build_subscription_messages(&instruments, FeedMode::Full, SUBSCRIPTION_BATCH_SIZE);
-    assert_eq!(messages.len(), 1, "3 instruments fit in one batch");
-
-    let json: serde_json::Value = serde_json::from_str(&messages[0]).unwrap();
-    assert_eq!(json["RequestCode"], 21, "Full subscribe = 21");
-    assert_eq!(json["InstrumentCount"], 3);
-
-    let list = json["InstrumentList"].as_array().unwrap();
-    assert_eq!(list[0]["ExchangeSegment"], "IDX_I");
-    assert_eq!(
-        list[0]["SecurityId"], "13",
-        "SecurityId must be STRING not int"
-    );
-    assert_eq!(list[1]["ExchangeSegment"], "NSE_EQ");
-    assert_eq!(list[1]["SecurityId"], "2885");
-    assert_eq!(list[2]["ExchangeSegment"], "NSE_FNO");
-    assert_eq!(list[2]["SecurityId"], "52432");
-}
-
-#[test]
-fn test_subscription_batch_splitting() {
-    use tickvault_common::types::{ExchangeSegment, FeedMode};
-    use tickvault_core::websocket::subscription_builder::build_subscription_messages;
-    use tickvault_core::websocket::types::InstrumentSubscription;
-
-    // 250 instruments should split into 3 batches (100+100+50)
-    let instruments: Vec<InstrumentSubscription> = (0..250)
-        .map(|i| InstrumentSubscription::new(ExchangeSegment::NseEquity, i as u64))
-        .collect();
-
-    let messages =
-        build_subscription_messages(&instruments, FeedMode::Full, SUBSCRIPTION_BATCH_SIZE);
-    assert_eq!(messages.len(), 3, "250 instruments → 3 batches");
-
-    let batch1: serde_json::Value = serde_json::from_str(&messages[0]).unwrap();
-    let batch2: serde_json::Value = serde_json::from_str(&messages[1]).unwrap();
-    let batch3: serde_json::Value = serde_json::from_str(&messages[2]).unwrap();
-
-    assert_eq!(batch1["InstrumentCount"], 100);
-    assert_eq!(batch2["InstrumentCount"], 100);
-    assert_eq!(batch3["InstrumentCount"], 50);
-}
-
-#[test]
-fn test_unsubscription_uses_correct_codes() {
-    use tickvault_common::types::{ExchangeSegment, FeedMode};
-    use tickvault_core::websocket::subscription_builder::build_unsubscription_messages;
-    use tickvault_core::websocket::types::InstrumentSubscription;
-
-    let instruments = vec![InstrumentSubscription::new(
-        ExchangeSegment::NseEquity,
-        2885,
-    )];
-
-    // Test each feed mode → expected unsubscribe code
-    for (feed_mode, expected_unsub) in [
-        (FeedMode::Ticker, FEED_UNSUBSCRIBE_TICKER),
-        (FeedMode::Quote, FEED_UNSUBSCRIBE_QUOTE),
-        (FeedMode::Full, FEED_UNSUBSCRIBE_FULL),
-    ] {
-        let messages =
-            build_unsubscription_messages(&instruments, feed_mode, SUBSCRIPTION_BATCH_SIZE);
-        let json: serde_json::Value = serde_json::from_str(&messages[0]).unwrap();
-        assert_eq!(
-            json["RequestCode"].as_u64().unwrap(),
-            u64::from(expected_unsub),
-            "unsub code for {feed_mode:?} must be {expected_unsub}"
-        );
-    }
-}
-
-#[test]
-fn test_disconnect_message_format() {
-    use tickvault_core::websocket::subscription_builder::build_disconnect_message;
-
-    let msg = build_disconnect_message();
-    let json: serde_json::Value = serde_json::from_str(&msg).unwrap();
-    assert_eq!(
-        json["RequestCode"], FEED_REQUEST_DISCONNECT as i64,
-        "disconnect = 12"
-    );
-    // Disconnect message must not have instrument list
-    assert!(
-        json.get("InstrumentList").is_none()
-            || json["InstrumentList"]
-                .as_array()
-                .map(|a| a.is_empty())
-                .unwrap_or(true),
-        "disconnect must have no instruments"
-    );
-}
-
 // =========================================================================
-// SECTION 21: SECURITY_ID IS STRING IN JSON, u32 IN BINARY
-// This is a CRITICAL mapping requirement — getting this wrong = wrong data
+// SECTION 21: SECURITY_ID IS STRING IN JSON — RETIRED (PR-C2, 2026-07-13).
+// The string-SecurityId subscribe-JSON contract died with
+// `subscription_builder.rs` (deleted with the Dhan live main-feed WS lane).
+// The binary-side u32 SecurityId parsing remains pinned by the header tests.
 // =========================================================================
-
-#[test]
-fn test_security_id_is_string_in_subscription_json() {
-    use tickvault_common::types::{ExchangeSegment, FeedMode};
-    use tickvault_core::websocket::subscription_builder::build_subscription_messages;
-    use tickvault_core::websocket::types::InstrumentSubscription;
-
-    let instruments = vec![InstrumentSubscription::new(
-        ExchangeSegment::NseEquity,
-        u64::from(u32::MAX),
-    )];
-    let messages =
-        build_subscription_messages(&instruments, FeedMode::Ticker, SUBSCRIPTION_BATCH_SIZE);
-    let json: serde_json::Value = serde_json::from_str(&messages[0]).unwrap();
-
-    let sid = &json["InstrumentList"][0]["SecurityId"];
-    assert!(
-        sid.is_string(),
-        "SecurityId must be a JSON STRING, got {sid:?}"
-    );
-    assert_eq!(sid.as_str().unwrap(), &u32::MAX.to_string());
-}
 
 // =========================================================================
 // SECTION 22: PARSEDTICK TYPE SAFETY — COPY + DEFAULT
@@ -1444,50 +1322,9 @@ fn test_all_fields_are_little_endian() {
 }
 
 // =========================================================================
-// SECTION 29: SUBSCRIPTION BUILDER — EDGE CASES
+// SECTION 29: SUBSCRIPTION BUILDER — EDGE CASES — RETIRED (PR-C2,
+// 2026-07-13; `subscription_builder.rs` deleted with the Dhan live-WS lane).
 // =========================================================================
-
-#[test]
-fn test_subscription_empty_instruments() {
-    use tickvault_common::types::FeedMode;
-    use tickvault_core::websocket::subscription_builder::build_subscription_messages;
-    use tickvault_core::websocket::types::InstrumentSubscription;
-
-    let instruments: Vec<InstrumentSubscription> = vec![];
-    let messages =
-        build_subscription_messages(&instruments, FeedMode::Full, SUBSCRIPTION_BATCH_SIZE);
-    assert!(messages.is_empty(), "no instruments = no messages");
-}
-
-#[test]
-fn test_subscription_exactly_100_instruments_one_batch() {
-    use tickvault_common::types::{ExchangeSegment, FeedMode};
-    use tickvault_core::websocket::subscription_builder::build_subscription_messages;
-    use tickvault_core::websocket::types::InstrumentSubscription;
-
-    let instruments: Vec<InstrumentSubscription> = (0..100)
-        .map(|i| InstrumentSubscription::new(ExchangeSegment::NseEquity, i as u64))
-        .collect();
-
-    let messages =
-        build_subscription_messages(&instruments, FeedMode::Full, SUBSCRIPTION_BATCH_SIZE);
-    assert_eq!(messages.len(), 1, "exactly 100 = 1 batch");
-}
-
-#[test]
-fn test_subscription_101_instruments_two_batches() {
-    use tickvault_common::types::{ExchangeSegment, FeedMode};
-    use tickvault_core::websocket::subscription_builder::build_subscription_messages;
-    use tickvault_core::websocket::types::InstrumentSubscription;
-
-    let instruments: Vec<InstrumentSubscription> = (0..101)
-        .map(|i| InstrumentSubscription::new(ExchangeSegment::NseEquity, i as u64))
-        .collect();
-
-    let messages =
-        build_subscription_messages(&instruments, FeedMode::Full, SUBSCRIPTION_BATCH_SIZE);
-    assert_eq!(messages.len(), 2, "101 = 2 batches (100+1)");
-}
 
 // =========================================================================
 // SECTION 30: CONNECTION POOL DISTRIBUTION

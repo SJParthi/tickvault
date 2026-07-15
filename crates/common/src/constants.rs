@@ -647,26 +647,13 @@ pub const GROWW_INSTRUMENT_CSV_URL: &str =
 /// Groww live-feed NATS-over-WebSocket endpoint (wheel `feed.py::_GROWW_SOCKET_URL`).
 pub const GROWW_SOCKET_URL: &str = "wss://socket-api.groww.in"; // APPROVED: constants.rs is the single WS-URL source
 
-/// Groww per-session socket-token mint endpoint (wheel `client.py::generate_socket_token`).
-///
-/// LIVE-FEED-AUTH class (the KEEP class of
-/// `no-rest-except-live-feed-2026-06-27.md` §2/§3 — recorded there 2026-07-04):
-/// consumes the SSM-read ACCESS token (`Authorization: Bearer …`) to mint a
-/// per-session NATS user JWT bound to a fresh ed25519 nkey. It does NOT mint
-/// the access token (shared-minter lock 2026-07-02 untouched) and carries NO
-/// market data. This is exactly the call the Python sidecar's SDK already
-/// makes on every feed (re)construction.
-pub const GROWW_SOCKET_TOKEN_URL: &str = "https://api.groww.in/v1/api/apex/v1/socket/token/create/"; // APPROVED: constants.rs is the single REST-URL source
-
+// (2026-07-15: GROWW_SOCKET_TOKEN_URL deleted — its sole caller, the native
+// shadow socket-token mint, was deleted with the Groww live feed.)
 /// Groww data directory (watch files, sidecar NDJSON, shadow NDJSON).
 pub const GROWW_DATA_DIR: &str = "data/groww";
 
-/// The native shadow client's OWN NDJSON capture file (same `GrowwTickLine`
-/// line schema as the sidecar's `data/groww/live-ticks.ndjson`), rotated to
-/// `rust-live-ticks-YYYYMMDD.ndjson` at the IST day boundary — mirrors the
-/// sidecar's rotation so the parity comparer sees symmetrical archives.
-pub const GROWW_NATIVE_SHADOW_NDJSON_PATH: &str = "data/groww/rust-live-ticks.ndjson";
-
+// (2026-07-15: GROWW_NATIVE_SHADOW_NDJSON_PATH deleted — the shadow client
+// producer was deleted with the Groww live feed.)
 /// First reconnect delay for the native shadow client (bounded expo backoff).
 pub const GROWW_NATIVE_RECONNECT_BASE_SECS: u64 = 5;
 
@@ -1486,6 +1473,16 @@ pub const DHAN_MARGIN_CALCULATOR_MULTI_PATH: &str = "/margincalculator/multi";
 /// Endpoint: GET <https://api.dhan.co/v2/fundlimit>
 pub const DHAN_FUND_LIMIT_PATH: &str = "/fundlimit";
 
+/// Master code-change lock for the 🔷 DHAN margin-gate REST legs (fundlimit
+/// + margincalculator). The order-surface umbrella plan (cluster E2) holds
+/// the live funds/margin REST call for an explicit operator grant; until a
+/// fresh dated quote is recorded in `.claude/rules/dhan/funds-margin.md`,
+/// this stays `false` and `MarginGate` can never issue a REST call even if
+/// `[dhan_margin_gate] enabled = true` — config flips alone can never turn
+/// the REST legs on (the hardcoded-dry_run / GROWW_ORDER_LIVE_FIRE
+/// precedent). Change ONLY with explicit approval from Parthiban.
+pub const DHAN_MARGIN_GATE_REST_ALLOWED: bool = false;
+
 /// Path for kill switch activate/deactivate (appended to rest_api_base_url).
 /// Endpoint: POST <https://api.dhan.co/v2/killswitch?killSwitchStatus=ACTIVATE|DEACTIVATE>
 pub const DHAN_KILL_SWITCH_PATH: &str = "/killswitch";
@@ -1894,6 +1891,47 @@ const _: () = assert!(
     "CHAIN_1M per-request timeout must fit inside the per-underlying budget"
 );
 
+/// Hard wall-clock ceiling (secs after the minute close) past which a
+/// chain RETRY may no longer LAUNCH — the operator's ≤~15s decision-data
+/// window (2026-07-14 directive). Gates ONLY the retry pass; pass 1 is
+/// the unchanged concurrent fire (Dhan-documented: distinct underlyings
+/// concurrently; the 3s bound is per unique (underlying, expiry) key).
+pub const CHAIN_1M_DECISION_CEILING_SECS: u64 = 15;
+
+/// Per-underlying not-served threshold — pinned to the spot leg's value
+/// (and, transitively once #1537 merges, the Groww chain's).
+pub const CHAIN_1M_UNDERLYING_NOT_SERVED_THRESHOLD: u32 = 10;
+const _: () = assert!(
+    CHAIN_1M_UNDERLYING_NOT_SERVED_THRESHOLD == SPOT_1M_REST_SID_NOT_SERVED_THRESHOLD,
+    "one not-served threshold family across the REST legs"
+);
+
+// P1. A worst-case TIMED-OUT first attempt still leaves its retry
+// launchable inside the ceiling: 2.5s fallback + 10s request timeout
+// = 12.5s ≤ 15s (the 2.5s remainder is the modeled limiter-queue
+// headroom at 3 rps; at the 2 rps floor under a 429 storm the REAL-clock
+// gate may refuse — counted, never silent).
+const _: () = assert!(
+    CHAIN_1M_FALLBACK_DELAY_MS + CHAIN_1M_REQUEST_TIMEOUT_SECS * 1_000
+        <= CHAIN_1M_DECISION_CEILING_SECS * 1_000,
+    "a timed-out first attempt must leave the retry launchable inside the ceiling"
+);
+
+// P2. A ceiling-edge retry can never overrun the minute:
+// 15s launch + 20s per-underlying budget = 35s < 60s.
+const _: () = assert!(
+    (CHAIN_1M_DECISION_CEILING_SECS + CHAIN_1M_UNDERLYING_BUDGET_SECS) * 1_000 < 60_000,
+    "a ceiling-edge retry must not overrun the minute"
+);
+
+// P3. A FAST-FAIL first attempt's same-key ≥3s gap always leaves the
+// retry launchable: 3s gap < 15s − 2.5s fallback.
+const _: () = assert!(
+    CHAIN_1M_MIN_GAP_SECS * 1_000
+        < CHAIN_1M_DECISION_CEILING_SECS * 1_000 - CHAIN_1M_FALLBACK_DELAY_MS,
+    "the same-key retry gap must fit inside the decision ceiling"
+);
+
 // ---------------------------------------------------------------------------
 // Groww spot 1m REST leg (operator grant 2026-07-13 — PR-2 of the Groww
 // per-minute REST plan, `.claude/plans/active-plan-groww-rest-1m.md`;
@@ -2141,6 +2179,23 @@ pub const GROWW_CHAIN_1M_CONSECUTIVE_FAIL_PAGE_THRESHOLD: u32 = 3;
 /// to disabled-for-the-day (NEVER a guessed expiry).
 pub const GROWW_CHAIN_1M_MASTER_RETRY_BACKOFF_SECS: [u64; 2] = [3, 6];
 
+/// Consecutive counted not-served minutes for ONE underlying before the
+/// ONE edge-latched per-underlying `CHAIN-02 stage="underlying_not_served"`
+/// page fires (2026-07-14 — the NIFTY expiry-day vendor cutoff companion:
+/// Groww stopped serving the same-day-expiring NIFTY chain at 14:54 IST
+/// while BANKNIFTY + SENSEX kept working, and the ok==0 escalation edge
+/// paged nobody all afternoon). A minute COUNTS toward an underlying's
+/// streak only when that underlying's chain came back empty/failed while
+/// ≥1 OTHER underlying succeeded in the SAME minute — a global-outage
+/// minute (zero underlyings served) neither counts nor resets, so this
+/// detector distinguishes vendor-not-serving-this-underlying from a
+/// general outage (which the
+/// [`GROWW_CHAIN_1M_CONSECUTIVE_FAIL_PAGE_THRESHOLD`] edge owns — the two
+/// are mutually exclusive per minute). Re-armed only by that underlying's
+/// own recovery. Same value as the spot leg's
+/// [`SPOT_1M_REST_SID_NOT_SERVED_THRESHOLD`] (the pattern it mirrors).
+pub const GROWW_CHAIN_1M_UNDERLYING_NOT_SERVED_THRESHOLD: u32 = 10;
+
 const _: () = assert!(
     GROWW_CHAIN_1M_CONSECUTIVE_FAIL_PAGE_THRESHOLD == SPOT_1M_REST_CONSECUTIVE_FAIL_PAGE_THRESHOLD,
     "the Groww chain leg reuses the spot FailureEdge — thresholds must agree"
@@ -2220,6 +2275,32 @@ pub const GROWW_CONTRACT_1M_REQUEST_TIMEOUT_SECS: u64 = 5;
 /// nearest-ATM-first — counted + one coded warn, never fetched past the
 /// cap, never silent.
 pub const GROWW_CONTRACT_1M_MAX_PER_MINUTE: usize = 30;
+
+/// GATE 3 of the Groww order-side 4-gate live-fire lattice (operator
+/// authorization 2026-07-14 — `.claude/rules/project/groww-second-feed-scope-2026-06-19.md`
+/// §39.2, `.claude/rules/project/no-rest-except-live-feed-2026-06-27.md` §10).
+///
+/// The HARDCODED master live-fire switch for placing REAL Groww orders. While
+/// `false`, every Groww mutating order path (order create / modify / cancel
+/// and the smart-order family) MUST refuse to send — fail-closed, at
+/// compile-reasoned certainty, independent of any config value. A
+/// `[groww_orders] live_fire_requested = true` in config is INERT unless this
+/// const is ALSO flipped to `true` in source AND the non-default `groww_orders`
+/// cargo feature (Gate 2) is built.
+///
+/// Flipping this to `true` is a SEPARATE, FUTURE, DATED operator action: it
+/// requires editing §39 with a fresh dated live-orders-enable quote FIRST, and
+/// is caught by the lattice ratchet
+/// (`crates/common/tests/groww_order_lattice_guard.rs`), which pins this
+/// literal at `false` until that dated edit lands. It stays `false` here — the
+/// operator's 2026-07-14 authorization ("confirm — apply the Groww order
+/// scope-unlock PR-0. Build only, behind the OFF switch, no live orders") was
+/// to BUILD + INTEGRATE the order-side behind the lattice, explicitly NOT to
+/// fire live orders.
+///
+/// `dry_run` (StrategyConfig) stays `true` and the §28 strategy/indicator
+/// boundary stays frozen — this const does not touch either.
+pub const GROWW_ORDER_LIVE_FIRE: bool = false;
 
 /// HARD wall-clock deadline (secs) for ONE minute's whole contract fire:
 /// contracts not reached before the deadline are SKIPPED loudly (counted +
@@ -2301,28 +2382,12 @@ const _: () = assert!(
 /// For AWS instance lifecycle, use systemd timer or cron for restart.
 pub const APP_DAILY_RESET_TIME_IST: &str = "16:00:00";
 
-/// Wave-2-D (G19) — daily reset time for the `TickGapDetector`. Fires
-/// 5 minutes after market close so it cannot race the 15:30 close
-/// signal. The papaya `last_seen` map is cleared at this point so
-/// overnight silence does NOT register as a tick gap on next day's
-/// market open. Pinned constant; see
-/// `.claude/rules/project/disaster-recovery.md` Scenario 14
-/// (Overnight wake) for the operator-visible flow.
-pub const TICK_GAP_RESET_TIME_IST: &str = "15:35:00";
-
-/// Wave-2-D — short post-fire settle window for the daily tick-gap
-/// reset task. After firing `reset_daily()` at 15:35 IST, sleep this
-/// long before recomputing the next-fire delay so we cannot race the
-/// same boundary back into a near-zero sleep.
-pub const TICK_GAP_RESET_SETTLE_SECS: u64 = 60;
-
-/// Wave-2-D — bounded busy-loop avoidance for the daily tick-gap
-/// reset task. If the post-fire recomputed delay is still zero (e.g.
-/// the host clock is stuck), sleep this long before retrying so we
-/// don't burn CPU. One hour is short enough that the task self-heals
-/// within a single trading session if the clock recovers, and long
-/// enough that we don't spin on a stuck system.
-pub const TICK_GAP_RESET_BUSYLOOP_GUARD_SECS: u64 = 3600;
+// PR-C3 (2026-07-14): the Wave-2-D `TICK_GAP_RESET_*` constants (the
+// 15:35 IST daily-reset time + settle/busy-loop guards) were DELETED with
+// the tick-gap detector and its main.rs reset task (operator Q4-ii
+// 2026-07-13). The RISK-GAP-03 `TICK_GAP_ALERT/ERROR_THRESHOLD_SECS` +
+// `TICK_GAP_MIN_TICKS_BEFORE_ACTIVE` constants above are a DIFFERENT
+// component (`trading::risk::tick_gap_tracker`) and are KEPT.
 
 /// Number of 1-minute candles in the cross-verification window (09:15 to 15:29 = 375).
 ///
@@ -2732,9 +2797,35 @@ pub const IST_UTC_OFFSET_NANOS: i64 = 19_800_000_000_000;
 /// Earliest date (IST) when `mode = "live"` is permitted.
 /// Before this date, config validation rejects live mode at startup.
 /// Change these constants ONLY with explicit approval from Parthiban.
-pub const LIVE_TRADING_EARLIEST_YEAR: i32 = 2026;
-pub const LIVE_TRADING_EARLIEST_MONTH: u32 = 7;
-pub const LIVE_TRADING_EARLIEST_DAY: u32 = 1;
+///
+/// 2026-07-14 re-arm (operator cluster-D directive via coordinator): the
+/// 2026-07-01 date EXPIRED silently on 2026-07-01 leaving this gate a no-op;
+/// re-armed to the 2099-12-31 sentinel matching production.toml
+/// sandbox_only_until — going live now requires editing this constant with a
+/// fresh dated operator quote.
+pub const LIVE_TRADING_EARLIEST_YEAR: i32 = 2099;
+pub const LIVE_TRADING_EARLIEST_MONTH: u32 = 12;
+pub const LIVE_TRADING_EARLIEST_DAY: u32 = 31;
+
+/// Sandbox deadline for the OMS `place_order` live-mode gate, as UNIX epoch
+/// seconds: **2099-12-31T00:00:00Z** (= `4_102_358_400`; chrono-cross-checked
+/// by `crates/trading/tests/sandbox_enforcement_guard.rs`).
+///
+/// Consumed by `crates/trading/src/oms/engine.rs::place_order` (the
+/// `#[cfg(not(test))]` sandbox-enforcement block): any non-dry-run order
+/// while `Utc::now().timestamp() < SANDBOX_DEADLINE_EPOCH_SECS` returns
+/// `Err(OmsError::SandboxEnforcement)`. This gate is mode-INDEPENDENT — it is
+/// the last line even for hypothetical non-Live paths the config-level gates
+/// (`LIVE_TRADING_EARLIEST_*`, `sandbox_only_until`) never see.
+///
+/// MUST stay aligned with `LIVE_TRADING_EARLIEST_*` above (same 2099-12-31
+/// calendar day; this epoch is midnight UTC while the config gate compares
+/// IST calendar dates — the 5h30m nuance is inside the same day, and the
+/// alignment ratchet compares the UTC calendar date of this epoch against
+/// the `LIVE_TRADING_EARLIEST_*` NaiveDate). 2026-07-14 re-arm: the previous
+/// fn-local 2026-07-01 epoch in engine.rs expired silently; re-armed to the
+/// 2099-12-31 sentinel — going live requires a fresh dated operator quote.
+pub const SANDBOX_DEADLINE_EPOCH_SECS: i64 = 4_102_358_400;
 
 // ---------------------------------------------------------------------------
 // Periodic Health Check
@@ -3579,6 +3670,123 @@ pub const fn g2_wall_clock_gate_accepts(wall_clock_ts_nanos_of_day: i64) -> bool
 }
 
 // ---------------------------------------------------------------------------
+// Groww REGULAR-orders constants (shared contracts PR-A0, operator
+// authorization 2026-07-14; live flip is a SEPARATE future dated quote).
+// The order-family REST base is a const (not config — house pattern); the
+// live-fire master switch `GROWW_ORDER_LIVE_FIRE` lives above (Gate 3) and is
+// NOT re-declared here. Self-caps are const-asserted ≤ the documented family
+// ceilings; the closed worst-case read arithmetic is asserted ≤ the reads
+// self-cap (the §10.7 granted number).
+// ---------------------------------------------------------------------------
+
+/// Order-family REST base URL. Bare host only — the `/v1/order/*` PATHS live
+/// ONLY in `oms/groww/api_client.rs` behind the 4-gate lattice (Gate 5).
+pub const GROWW_ORDER_API_BASE_URL: &str = "https://api.groww.in";
+
+/// Self-cap: order MUTATIONS (place/modify/cancel) per second. Const-asserted
+/// ≤ the documented Orders family ceiling of 10/s.
+pub const GROWW_ORDER_MUTATIONS_PER_SECOND_CAP: u32 = 5;
+/// Self-cap: order MUTATIONS per minute. Const-asserted ≤ the 250/min ceiling.
+pub const GROWW_ORDER_MUTATIONS_PER_MINUTE_CAP: u32 = 100;
+/// Self-cap: order READS (status/list/detail/trades) per second. Const-asserted
+/// ≤ the documented Non-Trading family ceiling of 20/s.
+pub const GROWW_ORDER_READS_PER_SECOND_CAP: u32 = 8;
+/// Self-cap: order READS per minute. Const-asserted ≤ the 500/min ceiling; the
+/// closed worst-case (198/min) is asserted ≤ this value.
+pub const GROWW_ORDER_READS_PER_MINUTE_CAP: u32 = 200;
+/// Reads/min reserved for the ambiguity-resolution ladder — 1/s, outranks all
+/// routine polling so a co-tenant burst cannot starve resolution.
+pub const GROWW_ORDER_RESERVED_RESOLUTION_READS_PER_MIN: u32 = 60;
+
+/// Per-order HOT status-poll cadence (secs): the first 30s after a mutation.
+pub const GROWW_ORDER_STATUS_POLL_HOT_SECS: u64 = 2;
+/// Per-order WARM status-poll cadence (secs): until first fill / terminal.
+pub const GROWW_ORDER_STATUS_POLL_WARM_SECS: u64 = 5;
+/// Per-order STEADY status-poll cadence (secs): steady + hot/warm-overflow tier.
+pub const GROWW_ORDER_STATUS_POLL_STEADY_SECS: u64 = 15;
+/// One cheap status confirm this many ms after every mutation response.
+pub const GROWW_ORDER_POST_MUTATION_CONFIRM_DELAY_MS: u64 = 500;
+
+/// Concurrent non-terminal order cap (all tiers).
+pub const GROWW_ORDER_MAX_TRACKED_OPEN_ORDERS: usize = 8;
+/// HOT (2s) tier occupancy cap; overflow starts at STEADY 15s.
+pub const GROWW_ORDER_MAX_HOT_TIER_ORDERS: usize = 3;
+/// WARM (5s) tier occupancy cap; overflow demotes to STEADY 15s (build-lead
+/// approved spec delta 2026-07-15 — closes the warm-saturation read hole).
+pub const GROWW_ORDER_MAX_WARM_TIER_ORDERS: usize = 2;
+
+/// Reconcile list-sweep cadence (secs) while ≥1 non-terminal order is tracked.
+pub const GROWW_ORDER_RECONCILE_INTERVAL_SECS: u64 = 60;
+/// Idle reconcile-sweep cadence (secs) — session-gated.
+pub const GROWW_ORDER_RECONCILE_IDLE_INTERVAL_SECS: u64 = 300;
+
+/// Ambiguity-resolution ladder rungs (secs); after the last rung, 60s-paced to
+/// the [`GROWW_ORDER_AMBIGUITY_LADDER_MAX_SECS`] bound.
+pub const GROWW_ORDER_AMBIGUITY_LADDER_STEPS_SECS: [u64; 5] = [2, 5, 10, 30, 60];
+/// Ambiguity-ladder budget (secs). A 401/403-classified poll PAUSES this clock
+/// (auth-stale time does not consume the budget — GROWW-ORD-10 / F-5).
+pub const GROWW_ORDER_AMBIGUITY_LADDER_MAX_SECS: u64 = 600;
+/// Bounded replay/re-resolve iterations on the SAME reference_id.
+pub const GROWW_ORDER_AMBIGUITY_REPLAY_MAX: u32 = 2;
+
+/// Post-close EOD force-terminalize sweep time (IST, HH:MM:SS) — the bounded
+/// post-close carve-out of `no-rest-except-live-feed-2026-06-27.md` §10.7.
+pub const GROWW_ORDER_EOD_SWEEP_IST: &str = "15:35:00";
+/// Intent write-ahead ledger directory (canonical path; registered in
+/// observability-architecture.md's paths table; retained, no sweeper).
+pub const GROWW_ORDER_LEDGER_DIR: &str = "data/orders";
+/// Dhan-analog self-cap on modifications per order (Groww's own cap is
+/// Unknown — O-8; conservative fail-closed).
+pub const GROWW_ORDER_MAX_MODIFICATIONS_PER_ORDER: u32 = 25;
+
+// --- Const-asserts: self-caps stay ≤ the documented family ceilings ---
+const _: () = assert!(
+    GROWW_ORDER_MUTATIONS_PER_SECOND_CAP <= 10,
+    "order-mutation self-cap must stay <= the 10/s Orders family doc ceiling"
+);
+const _: () = assert!(
+    GROWW_ORDER_MUTATIONS_PER_MINUTE_CAP <= 250,
+    "order-mutation self-cap must stay <= the 250/min Orders family doc ceiling"
+);
+const _: () = assert!(
+    GROWW_ORDER_READS_PER_SECOND_CAP <= 20,
+    "order-read self-cap must stay <= the 20/s Non-Trading family doc ceiling"
+);
+const _: () = assert!(
+    GROWW_ORDER_READS_PER_MINUTE_CAP <= 500,
+    "order-read self-cap must stay <= the 500/min Non-Trading family doc ceiling"
+);
+const _: () = assert!(
+    GROWW_ORDER_MAX_WARM_TIER_ORDERS >= 1,
+    "the WARM status-poll tier must hold at least one order"
+);
+const _: () = assert!(
+    GROWW_ORDER_MAX_HOT_TIER_ORDERS + GROWW_ORDER_MAX_WARM_TIER_ORDERS
+        <= GROWW_ORDER_MAX_TRACKED_OPEN_ORDERS,
+    "hot + warm tier occupancy cannot exceed the tracked-open cap"
+);
+// Closed worst-case reads/min (the §10.7 granted number): 3 hot × 30 +
+// 2 warm × 12 + 3 steady × 4 + 60 resolution + 10 confirms + 2 sweeps = 198.
+const _: () = {
+    let hot_per_min = 60 / (GROWW_ORDER_STATUS_POLL_HOT_SECS as u32);
+    let warm_per_min = 60 / (GROWW_ORDER_STATUS_POLL_WARM_SECS as u32);
+    let steady_per_min = 60 / (GROWW_ORDER_STATUS_POLL_STEADY_SECS as u32);
+    let steady_slots = (GROWW_ORDER_MAX_TRACKED_OPEN_ORDERS
+        - GROWW_ORDER_MAX_HOT_TIER_ORDERS
+        - GROWW_ORDER_MAX_WARM_TIER_ORDERS) as u32;
+    let worst = (GROWW_ORDER_MAX_HOT_TIER_ORDERS as u32) * hot_per_min
+        + (GROWW_ORDER_MAX_WARM_TIER_ORDERS as u32) * warm_per_min
+        + steady_slots * steady_per_min
+        + GROWW_ORDER_RESERVED_RESOLUTION_READS_PER_MIN
+        + 10 // post-mutation confirms/min bound
+        + 2; // reconcile sweeps/min bound
+    assert!(
+        worst <= GROWW_ORDER_READS_PER_MINUTE_CAP,
+        "worst-case order-read load must stay within the reads/min self-cap (§10.7)"
+    );
+};
+
+// ---------------------------------------------------------------------------
 // Tests — Market Hours Constants
 // ---------------------------------------------------------------------------
 
@@ -3695,6 +3903,17 @@ mod boot_constants_tests {
 #[allow(clippy::assertions_on_constants)] // APPROVED: S4 — schema-stability tests intentionally assert on compile-time constants as a regression guard against silent protocol-value drift. Converting to `const { assert!(..) }` blocks compiles away the check message which defeats the guard purpose.
 mod tests {
     use super::*;
+
+    /// GATE 3 (§39.2): the hardcoded Groww live-fire switch MUST be false
+    /// until a dated operator live-orders-enable edits §39 + this const
+    /// together.
+    #[test]
+    fn test_groww_order_live_fire_is_off() {
+        assert!(
+            !GROWW_ORDER_LIVE_FIRE,
+            "GROWW_ORDER_LIVE_FIRE must stay false — see groww-second-feed-scope §39.2 Gate 3"
+        );
+    }
 
     #[test]
     fn test_ist_offset_seconds_is_5h30m() {
@@ -4400,6 +4619,38 @@ mod tests {
         assert_eq!(CHAIN_1M_MAX_BODY_BYTES, 8 * 1024 * 1024);
     }
 
+    /// 2026-07-14 chain-capture hardening: the retry decision ceiling +
+    /// the per-underlying not-served threshold, pinned alongside their
+    /// existing schedule partners (2500ms fallback / 10s request timeout /
+    /// 20s budget) so the P1–P3 const-assert proofs stay meaningful.
+    #[test]
+    fn test_chain_decision_ceiling_constants_pinned() {
+        assert_eq!(CHAIN_1M_DECISION_CEILING_SECS, 15);
+        assert_eq!(CHAIN_1M_UNDERLYING_NOT_SERVED_THRESHOLD, 10);
+        assert_eq!(
+            CHAIN_1M_UNDERLYING_NOT_SERVED_THRESHOLD,
+            SPOT_1M_REST_SID_NOT_SERVED_THRESHOLD
+        );
+        // The schedule partners the ceiling proofs are computed against.
+        assert_eq!(CHAIN_1M_FALLBACK_DELAY_MS, 2_500);
+        assert_eq!(CHAIN_1M_REQUEST_TIMEOUT_SECS, 10);
+        assert_eq!(CHAIN_1M_UNDERLYING_BUDGET_SECS, 20);
+        // P1: a timed-out first attempt leaves the retry launchable.
+        assert!(
+            CHAIN_1M_FALLBACK_DELAY_MS + CHAIN_1M_REQUEST_TIMEOUT_SECS * 1_000
+                <= CHAIN_1M_DECISION_CEILING_SECS * 1_000
+        );
+        // P2: a ceiling-edge retry never overruns the minute.
+        assert!(
+            (CHAIN_1M_DECISION_CEILING_SECS + CHAIN_1M_UNDERLYING_BUDGET_SECS) * 1_000 < 60_000
+        );
+        // P3: the same-key ≥3s gap fits inside the ceiling.
+        assert!(
+            CHAIN_1M_MIN_GAP_SECS * 1_000
+                < CHAIN_1M_DECISION_CEILING_SECS * 1_000 - CHAIN_1M_FALLBACK_DELAY_MS
+        );
+    }
+
     /// Groww spot 1m REST leg (operator grant 2026-07-13, PR-2 of the
     /// Groww per-minute REST plan) — endpoint identity, the 3-symbol table,
     /// the SEQUENTIAL-fetch timing envelope and the token re-read floor.
@@ -4535,6 +4786,14 @@ mod tests {
         );
         // Warmup master-download retries: bounded, 3 attempts total.
         assert_eq!(GROWW_CHAIN_1M_MASTER_RETRY_BACKOFF_SECS, [3, 6]);
+        // Per-underlying not-served detector threshold (~10 minutes) —
+        // mirrors the spot leg's per-SID detector (2026-07-14, the NIFTY
+        // expiry-day vendor-cutoff companion).
+        assert_eq!(GROWW_CHAIN_1M_UNDERLYING_NOT_SERVED_THRESHOLD, 10);
+        assert_eq!(
+            GROWW_CHAIN_1M_UNDERLYING_NOT_SERVED_THRESHOLD,
+            SPOT_1M_REST_SID_NOT_SERVED_THRESHOLD
+        );
     }
 
     /// PR-4 (Groww contract leg): the fill-model leg's pacing + envelope
@@ -4828,21 +5087,7 @@ mod tests {
     #[test]
     fn test_groww_native_constants_pinned() {
         assert_eq!(GROWW_SOCKET_URL, "wss://socket-api.groww.in");
-        assert_eq!(
-            GROWW_SOCKET_TOKEN_URL,
-            "https://api.groww.in/v1/api/apex/v1/socket/token/create/"
-        );
-        assert!(GROWW_SOCKET_TOKEN_URL.starts_with("https://"));
         assert_eq!(GROWW_DATA_DIR, "data/groww");
-        assert_eq!(
-            GROWW_NATIVE_SHADOW_NDJSON_PATH,
-            "data/groww/rust-live-ticks.ndjson"
-        );
-        assert!(GROWW_NATIVE_SHADOW_NDJSON_PATH.starts_with(GROWW_DATA_DIR));
-        assert_ne!(
-            GROWW_NATIVE_SHADOW_NDJSON_PATH, "data/groww/live-ticks.ndjson",
-            "shadow capture must never collide with the sidecar's file"
-        );
         assert_eq!(GROWW_NATIVE_RECONNECT_BASE_SECS, 5);
         assert_eq!(GROWW_NATIVE_RECONNECT_MAX_SECS, 60);
         assert!(GROWW_NATIVE_RECONNECT_BASE_SECS <= GROWW_NATIVE_RECONNECT_MAX_SECS);

@@ -149,7 +149,7 @@ pub fn build_category_targets(cat: LogCategory) -> &'static [&'static str] {
         LogCategory::LiveTicks => &[
             "tickvault_core::websocket",
             "tickvault_core::pipeline::tick_processor",
-            "tickvault_core::pipeline::tick_gap_detector",
+            // tick_gap_detector target retired in PR-C3 (2026-07-14).
             "tickvault_core::pipeline::depth_sequence_tracker",
             "tickvault_core::pipeline::volume_monotonicity_guard",
             "tickvault_core::pipeline::mover_classifier",

@@ -102,27 +102,11 @@ fn events_rs_formats_all_reconnect_variants_in_to_message() {
 // (2) Every emission site wires notifier.notify(...)
 // ---------------------------------------------------------------------------
 
-#[test]
-fn main_feed_wires_notify_on_disconnect_and_reconnect() {
-    let src = read("crates/core/src/websocket/connection.rs");
-    // At least one notifier call emitting WebSocketDisconnected.
-    assert!(
-        src.matches("WebSocketDisconnected").count() >= 3,
-        "connection.rs must emit WebSocketDisconnected at every disconnect site \
-         (non-reconnectable / 807 token / generic-read / connect-failed)."
-    );
-    assert!(
-        src.contains("WebSocketReconnected"),
-        "connection.rs must emit WebSocketReconnected on successful reconnect."
-    );
-    // No in_hours gating should re-appear; main feed MUST emit unconditionally.
-    assert!(
-        !src.contains("if is_within_market_hours_ist()") && !src.contains("if in_hours {"),
-        "connection.rs must NOT gate disconnect/reconnect Telegram by market \
-         hours — Parthiban directive 2026-04-21 requires full audit trail on \
-         every WS event regardless of hours."
-    );
-}
+// RETIRED (PR-C2, 2026-07-13 — Dhan live-WS lane deletion, operator
+// retirement directive per websocket-connection-scope-lock.md
+// "2026-07-13 Amendment" §B): main_feed_wires_notify_on_disconnect_and_reconnect died with the machinery it pinned —
+// the main-feed disconnect/reconnect notify wiring was deleted with
+// `connection.rs`.
 
 // REMOVED 2026-06-02 (CI rot fix): depth_20 / depth_200 reconnect-notify
 // source-scan ratchets. The depth WebSocket module
@@ -299,43 +283,25 @@ fn order_update_reconnected_is_stability_gated_not_connect_edge() {
     );
 }
 
-#[test]
-fn main_rs_does_not_emit_order_update_disconnected_after_task_await() {
-    let src = read("crates/app/src/main.rs");
-    assert_eq!(
-        src.matches("NotificationEvent::OrderUpdateDisconnected")
-            .count(),
-        0,
-        "main.rs must NOT emit OrderUpdateDisconnected — the post-await site \
-         was unreachable (run_order_update_connection never returns since \
-         WS-GAP-04); the reachable page lives inside the reconnect loop."
-    );
-    assert!(
-        src.contains("task_exited_unreachable"),
-        "main.rs must keep the defensive coded error! at the order-update \
-         spawn site so a future refactor that breaks the never-return loop \
-         contract surfaces loudly."
-    );
-}
+// RETIRED (PR-C2 merge reconcile, 2026-07-14):
+// main_rs_does_not_emit_order_update_disconnected_after_task_await died with
+// the machinery it pinned. Lineage: PR-C2 (2026-07-13) re-pointed it from the
+// deleted lane's main.rs spawn to the dhan_rest_stack Q4-i spawn; #1532 (the
+// 2026-07-14 operator Dhan noise lock, scope-lock §A.1) then RETIRED that
+// stack spawn too — so NO order-update spawn site exists on any path. The
+// core module (`order_update_connection.rs`) stays dormant for the
+// live-trading re-wire; its in-module tests + the stability-gate ratchet
+// above keep pinning the loop contract.
 
 // ---------------------------------------------------------------------------
-// (3) Main.rs wires reconnect_notifier into the surviving connection functions
-//     (main-feed + order-update — the only 2 WS types per the scope lock).
+// (3) RETIRED (PR-C2 merge reconcile, 2026-07-14):
+//     main_rs_passes_reconnect_notifier_to_order_update_call_sites died with
+//     the call sites it pinned — the lane's fast/slow spawns were deleted in
+//     PR-C2 and the dhan_rest_stack spawn was retired by #1532 (see the
+//     retirement note above). A future live-trading re-wire that re-spawns
+//     the order-update WS must restore a reconnect-notifier ratchet at the
+//     new call site.
 // ---------------------------------------------------------------------------
-
-#[test]
-fn main_rs_passes_reconnect_notifier_to_order_update_call_sites() {
-    // Updated 2026-06-02 (CI rot fix): depth-20 / depth-200 were deleted in
-    // AWS-lifecycle PR #4, so the former "all 3 connection functions" is now
-    // the order-update connection (fast + slow boot call sites). Order-update
-    // has two call sites; both must pass a reconnect notifier.
-    let src = read("crates/app/src/main.rs");
-    assert!(
-        src.matches("reconnect_notifier").count() >= 2,
-        "main.rs must pass a reconnect notifier into every order-update \
-         connection call site (fast boot + slow boot)."
-    );
-}
 
 // ---------------------------------------------------------------------------
 // (4) Fast first-retry latency on all 4 WS types
@@ -376,47 +342,23 @@ fn order_update_watchdog_threshold_is_at_least_1800_secs() {
 // (6) Subscription replay invariant on main feed reconnect
 // ---------------------------------------------------------------------------
 
-#[test]
-fn main_feed_replays_cached_subscription_on_every_reconnect() {
-    let src = read("crates/core/src/websocket/connection.rs");
-    assert!(
-        src.contains("self.cached_subscription_messages.iter()"),
-        "connection.rs connect_and_subscribe must iterate \
-         cached_subscription_messages. Without this, a reconnect comes up \
-         subscribed to ZERO instruments and tick stream stays silent — \
-         silent data loss on every Dhan pre-market TCP reset."
-    );
-    assert!(
-        src.contains("self.connect_and_subscribe().await"),
-        "connection.rs reconnect loop must call connect_and_subscribe \
-         (not a subscribe-less connect variant)."
-    );
-}
+// RETIRED (PR-C2, 2026-07-13 — Dhan live-WS lane deletion, operator
+// retirement directive per websocket-connection-scope-lock.md
+// "2026-07-13 Amendment" §B): main_feed_replays_cached_subscription_on_every_reconnect died with the machinery it pinned —
+// `SubscribeRxGuard` + the cached-subscription replay were deleted
+// with `connection.rs` (no subscription messages exist on the surviving
+// order-update WS — MsgCode-42 auth only).
 
 // ---------------------------------------------------------------------------
 // (7) Main feed responds to Dhan's ping frame (protocol adherence)
 // ---------------------------------------------------------------------------
 
-#[test]
-fn main_feed_responds_to_dhan_ping_with_bounded_pong() {
-    let src = read("crates/core/src/websocket/connection.rs");
-    assert!(
-        src.contains("Message::Ping"),
-        "connection.rs must explicitly handle Dhan server Ping frames \
-         (Dhan pings every 10s per live-market-feed rule §16)."
-    );
-    assert!(
-        src.contains("Message::Pong(data)"),
-        "connection.rs must reply to every Ping with a Pong carrying the \
-         same payload (RFC 6455 ping/pong semantics). Dhan closes idle \
-         sockets after 40s of no pong."
-    );
-    assert!(
-        src.contains("pong_timeout") || src.contains("pong_timeout_secs"),
-        "connection.rs must bound the Pong send by a timeout so a stuck \
-         TCP buffer is detected as a dead socket and triggers reconnect."
-    );
-}
+// RETIRED (PR-C2, 2026-07-13 — Dhan live-WS lane deletion, operator
+// retirement directive per websocket-connection-scope-lock.md
+// "2026-07-13 Amendment" §B): main_feed_responds_to_dhan_ping_with_bounded_pong died with the machinery it pinned —
+// the main-feed read loop's ping/pong arm was deleted with
+// `connection.rs`; the order-update loop keeps its own library-level
+// ping handling.
 
 // ---------------------------------------------------------------------------
 // (8) RETIRED 2026-07-14 (operator Dhan noise lock —

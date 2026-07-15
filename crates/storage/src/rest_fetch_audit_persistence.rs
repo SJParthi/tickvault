@@ -24,7 +24,8 @@
 //!     ts TIMESTAMP, trading_date_ist TIMESTAMP, feed SYMBOL, leg SYMBOL,
 //!     security_id LONG, exchange_segment SYMBOL, symbol SYMBOL,
 //!     attempts INT, final_http_status INT, fetch_latency_ms LONG,
-//!     close_to_data_ms LONG, rate_limited_count INT, outcome SYMBOL,
+//!     close_to_data_ms LONG, close_to_persist_ms LONG,
+//!     rate_limited_count INT, outcome SYMBOL,
 //!     error_class SYMBOL
 //! ) timestamp(ts) PARTITION BY DAY
 //!   DEDUP UPSERT KEYS(ts, trading_date_ist, feed, leg, security_id, exchange_segment, outcome);
@@ -150,6 +151,9 @@ pub struct RestFetchAuditRow {
     /// non-`ok` outcome (never a fabricated latency — the scoreboard −1
     /// honesty precedent).
     pub close_to_data_ms: i64,
+    /// Minute close → data-table ILP flush-ACK latency in ms; -1 = not persisted/not measured.
+    /// Flush-ACK of an async-batched ILP write — NOT a per-row commit; WAL apply can lag.
+    pub close_to_persist_ms: i64,
     /// How many attempts of this fetch were HTTP 429.
     pub rate_limited_count: i64,
     /// Typed outcome.
@@ -174,6 +178,7 @@ pub fn rest_fetch_audit_create_ddl() -> String {
             final_http_status INT, \
             fetch_latency_ms  LONG, \
             close_to_data_ms  LONG, \
+            close_to_persist_ms  LONG, \
             rate_limited_count INT, \
             outcome           SYMBOL, \
             error_class       SYMBOL\
@@ -228,6 +233,7 @@ pub async fn ensure_rest_fetch_audit_table(questdb_config: &QuestDbConfig) {
         ("final_http_status", "INT"),
         ("fetch_latency_ms", "LONG"),
         ("close_to_data_ms", "LONG"),
+        ("close_to_persist_ms", "LONG"),
         ("rate_limited_count", "INT"),
         ("outcome", "SYMBOL"),
         ("error_class", "SYMBOL"),
@@ -382,6 +388,8 @@ impl RestFetchAuditWriter {
             .context("fetch_latency_ms")?
             .column_i64("close_to_data_ms", r.close_to_data_ms)
             .context("close_to_data_ms")?
+            .column_i64("close_to_persist_ms", r.close_to_persist_ms)
+            .context("close_to_persist_ms")?
             .column_i64("rate_limited_count", r.rate_limited_count)
             .context("rate_limited_count")?
             .at(TimestampNanos::new(r.ts_ist_nanos))
@@ -466,6 +474,7 @@ mod tests {
             final_http_status: 200,
             fetch_latency_ms: 143,
             close_to_data_ms: 1_042,
+            close_to_persist_ms: -1,
             rate_limited_count: 0,
             outcome: RestFetchOutcome::Ok,
             error_class: "none",
@@ -487,6 +496,7 @@ mod tests {
             "final_http_status",
             "fetch_latency_ms",
             "close_to_data_ms",
+            "close_to_persist_ms",
             "rate_limited_count",
             "outcome",
             "error_class",
@@ -606,6 +616,7 @@ mod tests {
             final_http_status: 0,
             fetch_latency_ms: -1,
             close_to_data_ms: -1,
+            close_to_persist_ms: -1,
             attempts: 5,
             rate_limited_count: 1,
             ..sample_row()

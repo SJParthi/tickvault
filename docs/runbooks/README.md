@@ -75,7 +75,7 @@ the remediation steps.
 | **DATA-810** ClientIdInvalid | Critical | `.claude/rules/dhan/authentication.md` | — | **no** |
 | **DATA-811** InvalidExpiry | Medium | `.claude/rules/dhan/option-chain.md` | check params | yes |
 | **DATA-812** InvalidDateFormat | Medium | `.claude/rules/dhan/historical-data.md` | check params | yes |
-| **DATA-813** InvalidSecurityId | Medium | `crates/common/src/locked_universe.rs` | verify LOCKED_UNIVERSE SIDs match Dhan response | yes |
+| **DATA-813** InvalidSecurityId | Medium | `crates/common/src/constants.rs` (`SPOT_1M_REST_INDICES` — the hardcoded Dhan REST SIDs; `locked_universe.rs` deleted PR-C3 2026-07-14) | verify the hardcoded SIDs match Dhan response | yes |
 | **DATA-814** InvalidRequest | Medium | `.claude/rules/dhan/api-introduction.md` | — | yes |
 
 ## How Claude's auto-triage uses this table

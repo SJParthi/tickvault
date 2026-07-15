@@ -9,11 +9,6 @@
 use std::fs;
 use std::path::PathBuf;
 
-fn main_src() -> String {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/main.rs");
-    fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
-}
-
 /// Phase C1 (2026-07-13): the consumer helper relocated from the main.rs
 /// binary to the lib module so `dhan_rest_stack` (the Q4-i order-update
 /// rewire home) can create its own consumer — the internals pins now scan
@@ -42,34 +37,22 @@ fn test_spawn_ws_event_audit_consumer_wired_and_moved_intact() {
             && module.contains("run_ws_event_audit_consumer(rx, questdb_cfg)"),
         "spawn_ws_event_audit_consumer helper must create the channel + spawn the consumer."
     );
-    let src = main_src();
-    assert!(
-        src.contains("use tickvault_app::ws_audit_consumer::spawn_ws_event_audit_consumer;"),
-        "main.rs must re-import the relocated consumer helper."
-    );
-    assert!(
-        src.contains("Some(ws_audit_tx)"),
-        "the audit channel sender must be passed into the WebSocket pool."
-    );
+    // 2026-07-15 (Groww live-feed deletion): the Groww bridge / fleet /
+    // sidecar-supervisor producer sites — the last main.rs consumers of the
+    // helper — died with the lanes, so main.rs no longer imports it. The
+    // helper module is RETAINED (the scoreboard still reads ws_event_audit;
+    // a future producer re-wires through the same helper) and its internals
+    // stay pinned above + in the table/error-code test below.
 }
 
 #[test]
 fn test_order_update_connection_is_audit_wired() {
     // The order-update connection must also stamp ws_event_audit rows — it
     // creates its own consumer via the shared helper and passes the sender.
-    let src = main_src();
-    let helper_calls = src
-        .matches("spawn_ws_event_audit_consumer(config.questdb.clone())")
-        .count();
-    assert!(
-        helper_calls >= 2,
-        "the order-update spawn site(s) must call spawn_ws_event_audit_consumer too \
-         (found {helper_calls} call(s); expected the pool + at least one order-update site)."
-    );
-    assert!(
-        src.contains("ord_ws_audit_tx") || src.contains("ou_ws_audit_tx"),
-        "the order-update spawn must pass an audit sender into run_order_update_connection."
-    );
+    // 2026-07-15 (Groww live-feed deletion): the >=2 Groww producer-site
+    // count retired with the bridge + stall-watchdog spawns; the surviving
+    // pin is the NEGATIVE dhan_rest_stack ratchet below (the order-update
+    // socket must stay un-spawned per the 2026-07-14 Dhan noise lock).
     // 2026-07-14 operator Dhan noise lock: the PR-C1/Q4-i dhan_rest_stack
     // order-update spawn is RETIRED — the stack must no longer open the
     // socket at all (its negative ratchet lives in dhan_rest_stack.rs

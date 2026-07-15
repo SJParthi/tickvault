@@ -1,5 +1,13 @@
 # Dual-Feed Scoreboard — Error Codes (SCOREBOARD-01)
 
+> **⚠ 2026-07-15 dormancy note (Groww live feed retired — operator Q1, received directly in this session:
+> *"remove the whole Groww live feed; keep only spot 1m and option chain for both brokers; go."*):** the
+> Groww LIVE inputs retire with the feed — live lifecycle episode rows, the presence registry, and the live
+> lag histograms stop being produced; the FEED-GAP dangling-close sweep step is REMOVED (its subsystem is
+> deleted — `feed-gap-error-codes.md` retirement banner). The REST-leg digest (§2b) and the episode
+> aggregation over HISTORICAL `ws_event_audit` rows SURVIVE; from 2026-07-15 forward the live
+> episode/presence/lag columns honestly read `feed_off`/absent per the existing round-4/5/6 semantics.
+
 > **Authority:** CLAUDE.md > `operator-charter-forever.md` §C/§F >
 > `groww-second-feed-scope-2026-06-19.md` (the two-feed contract) > this file.
 > **Operator directive (2026-07-10, dual-feed scoreboard):** *"run these two
@@ -328,6 +336,21 @@ Dhan forensics follow-up lands (its per-fire histogram is not
 day-drainable). Ratchets:
 `crates/app/tests/rest_leg_digest_wiring_guard.rs` (3 tests) + the
 aggregation/render unit suites in `feed_scoreboard_boot.rs` / `events.rs`.
+
+**2026-07-14 update — Dhan forensics rows are LIVE (GAP-11):** the Dhan
+spot AND chain legs now emit `rest_fetch_audit` rows (one per (minute,
+SID/underlying) — every verdict, backfill, sweep repair, named gap,
+no-token and skipped boundary; `rest-1m-pipeline-error-codes.md` §2/§2d),
+so the digest's PRIMARY source covers all four feed/leg pairs and the
+Dhan option-chain line flips from "not measured yet" to measured with
+zero scoreboard code change (the aggregation was always generic over
+`feed`/`leg`). The `spot_1m_rest` latency-fallback column read is KEPT
+as historical/defensive coverage (pre-2026-07-14 days + a
+forensics-writer outage window); removal is a later cleanup. The rows
+additionally carry the NEW `close_to_persist_ms` column (minute close →
+data-flush-ACK, stamped post-ACK via the hold-then-stamp pattern; -1 =
+not persisted/not measured) — not yet rendered on the card, available
+for a future digest rung.
 
 ## §3. Trigger / auto-load
 

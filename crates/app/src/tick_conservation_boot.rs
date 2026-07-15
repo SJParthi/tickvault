@@ -75,9 +75,10 @@ pub fn ws_wal_dir() -> std::path::PathBuf {
     )
 }
 
-/// Decision for WHEN the conservation audit should fire. Mirrors
-/// `cross_verify_1m_boot::CrossVerifyStart` (whose own `SkipPastTrigger`
-/// is a SEPARATE design decision — cross-verify is untouched here).
+/// Decision for WHEN the conservation audit should fire. Historically
+/// mirrored the retired cross-verify's `CrossVerifyStart` (its
+/// `cross_verify_1m_boot.rs` module was deleted in PR-C3, 2026-07-14 —
+/// this audit's own start semantics are unchanged).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConservationStart {
     /// Not a trading day and not forced → do not run.
@@ -718,8 +719,9 @@ pub async fn run_groww_tick_conservation_audit(
         delivery_residual,
         outcome = outcome.as_str(),
         partial_coverage,
-        "groww tick conservation: reconciled sidecar NDJSON delivered-count vs \
-         persisted feed='groww' ticks (feed='groww' row in tick_conservation_audit)"
+        "groww tick conservation: reconciled capture NDJSON delivered-count vs \
+         persisted feed='groww' ticks (DORMANT since 2026-07-15 — the live-feed \
+         capture producer was deleted; row lands in tick_conservation_audit)"
     );
 
     // 5. Forensic row (fail-soft).

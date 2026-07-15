@@ -26,9 +26,9 @@ use criterion::{Criterion, criterion_group, criterion_main};
 use tickvault_common::config::QuestDbConfig;
 use tickvault_common::constants::{QUOTE_PACKET_SIZE, RESPONSE_CODE_QUOTE};
 use tickvault_common::tick_types::ParsedTick;
-use tickvault_common::types::ExchangeSegment;
 use tickvault_core::parser::dispatcher::dispatch_frame;
-use tickvault_core::pipeline::TickGapDetector;
+// TickGapDetector import removed in PR-C3 (2026-07-14) — the detector
+// module was deleted with the Dhan WS lane (operator Q4-ii 2026-07-13).
 use tickvault_core::pipeline::tick_enricher::TickEnricher;
 use tickvault_core::pipeline::volume_monotonicity_guard::VolumeMonotonicityGuard;
 use tickvault_storage::tick_persistence::TickPersistenceWriter;
@@ -125,25 +125,8 @@ fn bench_parse(c: &mut Criterion) {
     });
 }
 
-fn bench_gap_detector(c: &mut Criterion) {
-    let detector = TickGapDetector::new(30);
-    let now = std::time::Instant::now();
-    // Seed at the live universe scale (~250 SIDs, Quote mode).
-    for id in 0..250_u64 {
-        detector.record_tick(id, ExchangeSegment::IdxI, now);
-    }
-    c.bench_function("gap_detector/record_tick_250_sids", |b| {
-        let mut sid: u64 = 0;
-        b.iter(|| {
-            sid = sid.wrapping_add(1) % 250;
-            detector.record_tick(
-                black_box(sid),
-                black_box(ExchangeSegment::IdxI),
-                black_box(now),
-            );
-        });
-    });
-}
+// `bench_gap_detector` removed in PR-C3 (2026-07-14) with the deleted
+// tick-gap detector module (operator Q4-ii 2026-07-13).
 
 fn bench_enricher(c: &mut Criterion) {
     let enricher = TickEnricher::new();
@@ -241,7 +224,6 @@ fn bench_composite(c: &mut Criterion) {
     let m_tick_duration = metrics::histogram!("bench_tick_duration_ns");
     let m_wire_to_done = metrics::histogram!("bench_wire_to_done_ns");
     let heartbeat = AtomicI64::new(0);
-    let detector = TickGapDetector::new(30);
     let enricher = TickEnricher::new();
     let mut mono_guard = VolumeMonotonicityGuard::new();
     let mut buffer = tickvault_storage::tick_persistence_testing::new_ilp_buffer_pub();
@@ -274,10 +256,8 @@ fn bench_composite(c: &mut Criterion) {
                 Ordering::Relaxed,
             );
 
-            // Gap detector — reuses tick_start (post-cut production loop).
-            if let Some(seg) = ExchangeSegment::from_byte(tick.exchange_segment_code) {
-                detector.record_tick(tick.security_id, seg, tick_start);
-            }
+            // Gap-detector record site removed in PR-C3 (2026-07-14) —
+            // mirrors the deleted tick_processor.rs production site.
 
             // Canary 3-element scan — received_at-derived seconds
             // (post-cut production loop).
@@ -445,7 +425,6 @@ fn bench_composite_compute_only(c: &mut Criterion) {
     let m_tick_compute = metrics::histogram!("bench_co_tick_compute_ns");
     let m_wire_to_done = metrics::histogram!("bench_co_wire_to_done_ns");
     let heartbeat = AtomicI64::new(0);
-    let detector = TickGapDetector::new(30);
     let enricher = TickEnricher::new();
     let mut mono_guard = VolumeMonotonicityGuard::new();
     let (sender, receiver) = tokio::sync::broadcast::channel::<ParsedTick>(262_144);
@@ -472,9 +451,7 @@ fn bench_composite_compute_only(c: &mut Criterion) {
                 Ordering::Relaxed,
             );
 
-            if let Some(seg) = ExchangeSegment::from_byte(tick.exchange_segment_code) {
-                detector.record_tick(tick.security_id, seg, tick_start);
-            }
+            // Gap-detector record site removed in PR-C3 (2026-07-14).
 
             for sid in &canary_sids {
                 if *sid == tick.security_id {
@@ -526,7 +503,6 @@ criterion_group!(
     benches,
     bench_clock_reads,
     bench_parse,
-    bench_gap_detector,
     bench_enricher,
     bench_ilp_row_build,
     bench_payload_hash,

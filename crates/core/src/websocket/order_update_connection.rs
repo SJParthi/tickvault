@@ -429,13 +429,26 @@ fn emit_order_update_ws_audit(
     // the dropped row, whose pre-redaction reason must never reach a log
     // (security review).
     if let Err(err) = tx.try_send(row) {
-        let drop_reason = super::connection::ws_audit_drop_reason(&err);
+        let drop_reason = ws_audit_drop_reason(&err);
         error!(
             code = tickvault_common::error_code::ErrorCode::AuditWs01EventWriteFailed.code_str(),
             reason = drop_reason,
             "order-update ws_event_audit channel full/closed — row dropped (log+Telegram still fired)"
         );
         metrics::counter!("tv_ws_event_audit_dropped_total", "reason" => drop_reason).increment(1);
+    }
+}
+
+/// Maps a ws_event_audit channel `TrySendError` to its static drop-reason
+/// label. Pure, no allocation. Relocated from the deleted main-feed
+/// `connection.rs` in PR-C2 (2026-07-13) — the order-update WS (and the
+/// Groww bridge's own copy) are the surviving AUDIT-WS-01 drop sites.
+pub(crate) fn ws_audit_drop_reason(
+    err: &tokio::sync::mpsc::error::TrySendError<tickvault_common::ws_event_types::WsEventAuditRow>,
+) -> &'static str {
+    match err {
+        tokio::sync::mpsc::error::TrySendError::Full(_) => "full",
+        tokio::sync::mpsc::error::TrySendError::Closed(_) => "closed",
     }
 }
 

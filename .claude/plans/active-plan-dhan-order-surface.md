@@ -204,9 +204,10 @@ Other clusters (checked off by their owning sessions' PRs, all referencing THIS 
 - [ ] D1 — orphan-watchdog re-homing + expired date-gate re-arm (PR #1545)
   - Files: crates/app/src/main.rs, crates/trading/src/oms/engine.rs, crates/common/src/constants.rs
   - Tests: TBD by cluster D session (watchdog wiring source-scan guard)
-- [ ] E1 — exit-order layer (Super Order/OCO wiring, MPP verify, slicing) — serial after A
+- [x] E1 — exit-order layer (Super Order/OCO wiring, MPP verify, slicing) — serial after A
   - Files: crates/trading/src/oms/ (engine.rs, api_client.rs call sites), crates/app/src/order_runtime.rs
   - Tests: TBD by owning session
+  - Implemented (owning session label "Cluster B", branch claude/dhan-exit-order-layer): crates/trading/src/oms/{engine,exit_rules,types,api_client,state_machine}.rs + crates/app/src/exit_execution.rs (dispatcher hub) + the trading_pipeline.rs dispatcher seam; guard crates/trading/tests/dhan_exit_order_lockout_guard.rs + rule .claude/rules/project/dhan-exit-order-lockout-2026-07-14.md. Landed 4-lock-dormant (default-off config, hardcoded dry_run); order_runtime integration remains Cluster A's seam.
 - [ ] E2 — portfolio + margin gate (OrderIntent in RiskEngine::check_order; design-only until the operator REST grant)
   - Files: crates/trading/src/risk/engine.rs, crates/trading/src/oms/api_client.rs
   - Tests: TBD by owning session (exit-never-gated invariant test mandatory)

@@ -302,36 +302,28 @@ jobs:
           # tickvault-api). Each crate now runs its own suite with
           # --no-fail-fast; failures accumulate and the per-crate PASS/FAIL
           # summary below proves exactly which crates were scanned.
-          # Feature parity (2026-07-14 hostile-review HIGH): the old
-          # `cargo test --workspace` run unified features — tickvault-app's
-          # default `daily_universe_fetcher` forwarded to core+storage — so
-          # their gated modules + gated integration tests were scanned.
-          # Per-crate runs must ask explicitly: core+storage get
-          # `--features daily_universe_fetcher` (app already enables it by
-          # default); the app crate also gets `--bins` because its bin
-          # target carries #[test] fns that `--lib --tests` never runs.
-          # Budget: the loop compiles exactly TWO feature configurations —
-          # no-feature (common/trading/api) and daily_universe_fetcher
-          # (storage/core/app) — ordered so each configuration's
-          # -Z build-std artifacts build once and are reused consecutively
-          # (bounded: one extra bounded compile pass, NOT a per-crate
-          # rebuild). No explicit timeout-minutes needed (GitHub default
-          # 360 min — run 29230855037 built in ~7 min warm-cache; the full
-          # workspace test sweep ran in ~3 min under cargo-careful).
+          # Feature parity note (2026-07-14 hostile-review HIGH, then
+          # PR-C3 same day): the per-crate `--features daily_universe_fetcher`
+          # injections were REMOVED in PR-C3 — the feature was deleted with
+          # the Dhan instrument chain (the formerly-gated modules are now
+          # UN-GATED and always compiled, so default-feature runs scan
+          # them). The app crate still gets `--bins` because its bin target
+          # carries #[test] fns that `--lib --tests` never runs. Budget:
+          # ONE feature configuration — the -Z build-std artifacts build
+          # once and are reused across every crate.
           set -o pipefail
           : > /tmp/asan-test.log
           declare -A verdict
           failed=()
-          # Ordered so the two feature configurations run consecutively:
-          # the no-feature group first, then the daily_universe_fetcher
-          # group (storage -> core -> app; core's feature enables
-          # storage's, app's default enables both).
+          # Order retained from the two-configuration era (PR-C3 collapsed
+          # it to ONE configuration — the feature is deleted; order is now
+          # cosmetic).
           crates="tickvault-common tickvault-trading tickvault-api tickvault-storage tickvault-core tickvault-app"
           extra_args() {
             case "$1" in
-              # Restore the daily_universe_fetcher-gated test surface the
-              # old --workspace run had via feature unification.
-              tickvault-core|tickvault-storage) echo "--features daily_universe_fetcher" ;;
+              # PR-C3 (2026-07-14): the core/storage daily_universe_fetcher
+              # arm was removed — the feature is deleted; those modules are
+              # un-gated and scanned under default features.
               # App bin target carries #[test] fns --lib --tests never runs.
               tickvault-app) echo "--bins" ;;
               *) echo "" ;;
@@ -560,36 +552,28 @@ jobs:
           # tickvault-api). Each crate now runs its own suite with
           # --no-fail-fast; failures accumulate and the per-crate PASS/FAIL
           # summary below proves exactly which crates were scanned.
-          # Feature parity (2026-07-14 hostile-review HIGH): the old
-          # `cargo test --workspace` run unified features — tickvault-app's
-          # default `daily_universe_fetcher` forwarded to core+storage — so
-          # their gated modules + gated integration tests were scanned.
-          # Per-crate runs must ask explicitly: core+storage get
-          # `--features daily_universe_fetcher` (app already enables it by
-          # default); the app crate also gets `--bins` because its bin
-          # target carries #[test] fns that `--lib --tests` never runs.
-          # Budget: the loop compiles exactly TWO feature configurations —
-          # no-feature (common/trading/api) and daily_universe_fetcher
-          # (storage/core/app) — ordered so each configuration's
-          # -Z build-std artifacts build once and are reused consecutively
-          # (bounded: one extra bounded compile pass, NOT a per-crate
-          # rebuild). No explicit timeout-minutes needed (GitHub default
-          # 360 min — run 29230855037 built in ~7 min warm-cache; the full
-          # workspace test sweep ran in ~3 min under cargo-careful).
+          # Feature parity note (2026-07-14 hostile-review HIGH, then
+          # PR-C3 same day): the per-crate `--features daily_universe_fetcher`
+          # injections were REMOVED in PR-C3 — the feature was deleted with
+          # the Dhan instrument chain (the formerly-gated modules are now
+          # UN-GATED and always compiled, so default-feature runs scan
+          # them). The app crate still gets `--bins` because its bin target
+          # carries #[test] fns that `--lib --tests` never runs. Budget:
+          # ONE feature configuration — the -Z build-std artifacts build
+          # once and are reused across every crate.
           set -o pipefail
           : > /tmp/tsan-test.log
           declare -A verdict
           failed=()
-          # Ordered so the two feature configurations run consecutively:
-          # the no-feature group first, then the daily_universe_fetcher
-          # group (storage -> core -> app; core's feature enables
-          # storage's, app's default enables both).
+          # Order retained from the two-configuration era (PR-C3 collapsed
+          # it to ONE configuration — the feature is deleted; order is now
+          # cosmetic).
           crates="tickvault-common tickvault-trading tickvault-api tickvault-storage tickvault-core tickvault-app"
           extra_args() {
             case "$1" in
-              # Restore the daily_universe_fetcher-gated test surface the
-              # old --workspace run had via feature unification.
-              tickvault-core|tickvault-storage) echo "--features daily_universe_fetcher" ;;
+              # PR-C3 (2026-07-14): the core/storage daily_universe_fetcher
+              # arm was removed — the feature is deleted; those modules are
+              # un-gated and scanned under default features.
               # App bin target carries #[test] fns --lib --tests never runs.
               tickvault-app) echo "--bins" ;;
               *) echo "" ;;

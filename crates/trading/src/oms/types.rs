@@ -134,6 +134,247 @@ pub struct ModifyOrderRequest {
 }
 
 // ---------------------------------------------------------------------------
+// Exit-Order Execution Layer — engine-level request types (Cluster B, 2026-07-14)
+// ---------------------------------------------------------------------------
+
+/// Engine-level 3-leg bracket request (converted to DhanPlaceSuperOrderRequest).
+#[derive(Debug, Clone)]
+pub struct PlaceSuperOrderRequest {
+    /// Dhan security identifier (matches `PlaceOrderRequest`; wire = `.to_string()`).
+    pub security_id: u64,
+    /// Buy or sell.
+    pub transaction_type: TransactionType,
+    /// Entry-leg order type: LIMIT | MARKET only (validated — super orders
+    /// reject SL/SLM per portal 04:51).
+    pub order_type: OrderType,
+    /// Product type.
+    pub product_type: ProductType,
+    /// Total order quantity.
+    pub quantity: i64,
+    /// Entry price (0.0 required for MARKET — mirrors the plain-order rule;
+    /// live-probe U1).
+    pub price: f64,
+    /// Target exit price (profit booking).
+    pub target_price: f64,
+    /// Stop loss price (risk limit).
+    pub stop_loss_price: f64,
+    /// Trailing SL jump. 0.0 = no trailing; ALWAYS serialized (the wire
+    /// field is non-Option — omission on a modify CANCELS the trail).
+    pub trailing_jump: f64,
+    /// Lot size for risk engine integration.
+    pub lot_size: u32,
+    /// I-P0-03 gate input (engine place-order pattern).
+    pub expiry_date: Option<NaiveDate>,
+}
+
+/// Result of place_super_order: entry-leg order id + parsed leg snapshot.
+#[derive(Debug, Clone)]
+pub struct SuperOrderPlacement {
+    /// Dhan order id of the ENTRY leg (`PAPER-SO-{n}` in dry-run).
+    pub entry_order_id: String,
+    /// Snapshot of every leg returned by the place response.
+    pub legs: Vec<SuperOrderLegSnapshot>,
+}
+
+/// One leg of a freshly placed super order.
+#[derive(Debug, Clone)]
+pub struct SuperOrderLegSnapshot {
+    /// Which leg.
+    pub leg: OrderLeg,
+    /// Dhan order id for this leg.
+    pub order_id: String,
+    /// Raw Dhan status string for this leg (never re-mapped here).
+    pub status_raw: String,
+}
+
+/// Engine-level Forever/OCO request. `oco_leg` None ⇒ SINGLE, Some ⇒ OCO
+/// (price1/triggerPrice1/quantity1 pairing complete BY CONSTRUCTION).
+#[derive(Debug, Clone)]
+pub struct PlaceForeverOcoRequest {
+    /// Dhan security identifier.
+    pub security_id: u64,
+    /// Buy or sell.
+    pub transaction_type: TransactionType,
+    /// CNC | MTF only (validated in exit_rules — 07b §1).
+    pub product_type: ProductType,
+    /// LIMIT | MARKET only.
+    pub order_type: OrderType,
+    /// Order validity.
+    pub validity: OrderValidity,
+    /// First-leg quantity.
+    pub quantity: i64,
+    /// First-leg price.
+    pub price: f64,
+    /// First-leg trigger price.
+    pub trigger_price: f64,
+    /// OCO second leg — None ⇒ SINGLE order flag.
+    pub oco_leg: Option<OcoSecondLeg>,
+    /// I-P0-03 gate input.
+    pub expiry_date: Option<NaiveDate>,
+}
+
+/// The OCO second leg (all three fields required together by construction).
+#[derive(Debug, Clone)]
+pub struct OcoSecondLeg {
+    /// Second-leg price.
+    pub price: f64,
+    /// Second-leg trigger price.
+    pub trigger_price: f64,
+    /// Second-leg quantity.
+    pub quantity: i64,
+}
+
+/// Leg-restricted super-order modify — illegal field/leg combos unrepresentable.
+/// `trailing_jump` is NON-Option on Entry + StopLoss: omitting trailingJump on a
+/// modify CANCELS the trail (07a 2026-07-14 update #2, Verified-live).
+#[derive(Debug, Clone)]
+pub enum ModifySuperOrderLeg {
+    /// ENTRY_LEG modify — all fields (allowed only when the entry is
+    /// PENDING / PART_TRADED / TRANSIT per 07a §3).
+    Entry {
+        /// New entry order type.
+        order_type: OrderType,
+        /// New total quantity.
+        quantity: i64,
+        /// New entry price.
+        price: f64,
+        /// New target price.
+        target_price: f64,
+        /// New stop loss price.
+        stop_loss_price: f64,
+        /// Trailing jump — ALWAYS resent (omission cancels the trail).
+        trailing_jump: f64,
+    },
+    /// TARGET_LEG modify — only targetPrice (minimal body; sending
+    /// trailingJump on a TARGET_LEG modify is doc-unbacked — live-probe U8).
+    Target {
+        /// New target price.
+        target_price: f64,
+    },
+    /// STOP_LOSS_LEG modify — stopLossPrice + trailingJump (always resent).
+    StopLoss {
+        /// New stop loss price.
+        stop_loss_price: f64,
+        /// Trailing jump — ALWAYS resent (omission cancels the trail).
+        trailing_jump: f64,
+    },
+}
+
+/// MPP verify-after-place verdict (orders.md rule 18: never assume filled).
+#[derive(Debug, Clone, PartialEq)]
+pub enum ExecutionVerdict {
+    /// Fully traded.
+    Filled {
+        /// Quantity traded.
+        traded_qty: i64,
+        /// Volume-weighted average fill price.
+        avg_price: f64,
+    },
+    /// Partially traded (in-budget: keep polling; at budget: the engine
+    /// flags `needs_reconciliation` + EXIT-VERIFY-01 — remainder never
+    /// silently forgotten).
+    PartiallyFilled {
+        /// Quantity traded so far.
+        traded_qty: i64,
+        /// Quantity still open.
+        remaining: i64,
+    },
+    /// Still inside the verify budget — caller retries per the ladder.
+    Pending {
+        /// Seconds elapsed since the first probe.
+        elapsed_secs: u64,
+    },
+    /// MPP: MARKET→LIMIT conversion left the order resting past the deadline.
+    PendingAtLimit {
+        /// Seconds elapsed since the first probe.
+        elapsed_secs: u64,
+    },
+    /// Rejected / Cancelled / Expired (also Closed for super orders — the
+    /// engine applies the Closed transition + leg reconcile separately).
+    Terminal {
+        /// The terminal status observed.
+        status: OrderStatus,
+    },
+    /// Dry-run paper only — deliberately distinct so no consumer confuses
+    /// paper for real.
+    SimulatedFilled,
+    /// Fail-closed: unparsable status is NEVER treated as filled.
+    Unknown {
+        /// The raw Dhan status string that failed to parse.
+        raw_status: String,
+    },
+}
+
+/// Tracked 3-leg super order (engine-internal registry; raw leg statuses —
+/// deliberately BYPASSES the ManagedOrder state machine for the top-level
+/// PENDING→TRADED→TRIGGERED→CLOSED walk).
+#[derive(Debug, Clone)]
+pub struct ManagedSuperOrder {
+    /// Entry-leg Dhan order id (`PAPER-SO-{n}` in dry-run).
+    pub entry_order_id: String,
+    /// Our UUID v4 correlation ID.
+    pub correlation_id: String,
+    /// Dhan security identifier.
+    pub security_id: u64,
+    /// Buy or sell.
+    pub transaction_type: TransactionType,
+    /// Total quantity.
+    pub quantity: i64,
+    /// Entry price.
+    pub entry_price: f64,
+    /// Raw entry-leg status string — gates ENTRY_LEG modify/cancel.
+    pub entry_status_raw: String,
+    /// Target-leg state.
+    pub target: LegState,
+    /// Stop-loss-leg state.
+    pub stop_loss: LegState,
+    /// Current trailing jump — the always-resend source.
+    pub trailing_jump: f64,
+    /// Top-level status (parse of list orderStatus; Transit fallback).
+    pub status: OrderStatus,
+    /// Shared 25-modification cap across legs (Assumed A3).
+    pub modification_count: u32,
+    /// Creation timestamp (epoch microseconds).
+    pub created_at_us: i64,
+    /// Last update timestamp (epoch microseconds).
+    pub updated_at_us: i64,
+}
+
+/// State of one exit leg (target or stop loss) of a tracked super order.
+#[derive(Debug, Clone)]
+pub struct LegState {
+    /// Dhan order id for this leg.
+    pub order_id: String,
+    /// Raw Dhan status string for this leg.
+    pub status_raw: String,
+    /// Current price on this leg.
+    pub price: f64,
+}
+
+/// Verify-ladder bookkeeping (separate map — ManagedOrder struct untouched).
+#[derive(Debug, Clone)]
+pub struct VerifyState {
+    /// Probes issued so far (1-indexed ladder position).
+    pub attempts: u32,
+    /// Timestamp of the first probe (epoch microseconds).
+    pub first_probe_us: i64,
+    /// Stable label of the most recent verdict (for metrics/logs).
+    pub last_verdict_label: &'static str,
+}
+
+/// POST /orders/slicing response — portal documents a single object but says
+/// "Sliced orders placed" (plural); SDK returns a list. Tolerate BOTH.
+/// Many FIRST so an array wins the untagged race.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(untagged)]
+pub enum SlicingResponse {
+    /// Array shape (the SDK-observed list of per-slice responses).
+    Many(Vec<DhanPlaceOrderResponse>),
+    /// Single-object shape (the portal-documented schema).
+    One(DhanPlaceOrderResponse),
+}
+
+// ---------------------------------------------------------------------------
 // Dhan REST API request/response types (camelCase JSON)
 // ---------------------------------------------------------------------------
 
@@ -157,7 +398,7 @@ pub struct DhanPlaceOrderRequest {
 }
 
 /// Dhan REST API place order response.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DhanPlaceOrderResponse {
     pub order_id: String,
@@ -535,47 +776,159 @@ pub struct MarginScript {
 }
 
 /// Request body for `POST /v2/margincalculator/multi`.
+///
+/// 2026-07-14 note: the multi-margin request naming is a Dhan-side
+/// THREE-artifact split (classic page vs portal markdown vs portal
+/// OpenAPI yaml disagree — see `docs/dhan-ref/13-funds-margin.md`
+/// "2026-07-14 Upstream Update"). We send the shape the official SDK
+/// 2.3.0rc1 + the classic curl + the portal markdown CONVERGE on:
+/// `{dhanClientId, includePosition, includeOrder, scripList}`. This is
+/// UNVERIFIED-LIVE — live-probe the endpoint before the first production
+/// multi-margin caller trusts either naming.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MultiMarginRequest {
+    /// Dhan client ID (present in the SDK/classic-curl wire body; absent
+    /// from the yaml's request schema — part of the unresolved split).
+    pub dhan_client_id: String,
     /// Whether to include existing positions in calculation.
     pub include_position: bool,
-    /// Whether to include pending orders in calculation.
-    pub include_orders: bool,
+    /// Whether to include pending orders in calculation. SINGULAR
+    /// `includeOrder` on the wire (the SDK-converged shape) — the yaml's
+    /// plural `includeOrders` is the LESS-supported reading.
+    pub include_order: bool,
     /// Array of scripts (instruments) to calculate margin for.
-    pub scripts: Vec<MarginScript>,
+    /// Serializes as `scripList` (the SDK-converged name; the yaml says
+    /// `scripts` — unresolved Dhan-side).
+    pub scrip_list: Vec<MarginScript>,
 }
 
 /// Response from `POST /v2/margincalculator/multi`.
 ///
-/// CRITICAL: ALL values are STRINGS, not floats.
-/// Uses snake_case (inconsistent with other Dhan APIs).
+/// 2026-07-14 note: Dhan's own artifacts DISAGREE on the response shape
+/// (`docs/dhan-ref/13-funds-margin.md` "2026-07-14 Upstream Update"): the
+/// classic page + OpenAPI yaml show snake_case ALL-STRING values
+/// (`"total_margin": "150000.00"`), while the portal markdown shows
+/// camelCase floats (`"totalMargin": 150000.0`). We tolerant-parse BOTH —
+/// each margin field accepts a JSON number OR a numeric string, under
+/// either casing (snake_case native name + camelCase `alias`), normalized
+/// to `f64`. A NON-numeric string is a hard deserialize error (fail-closed
+/// — a garbage margin value must never silently become 0.0). Absent
+/// fields default to 0.0.
 #[derive(Debug, Clone, Deserialize)]
 pub struct MultiMarginResponse {
-    /// Total margin required (STRING).
-    #[serde(default)]
-    pub total_margin: String,
-    /// SPAN margin (STRING).
-    #[serde(default)]
-    pub span_margin: String,
-    /// Exposure margin (STRING).
-    #[serde(default)]
-    pub exposure_margin: String,
-    /// Equity margin (STRING).
-    #[serde(default)]
-    pub equity_margin: String,
-    /// F&O margin (STRING).
-    #[serde(default)]
-    pub fo_margin: String,
-    /// Commodity margin (STRING).
-    #[serde(default)]
-    pub commodity_margin: String,
-    /// Currency margin (STRING).
+    /// Total margin required (normalized to f64).
+    #[serde(
+        default,
+        alias = "totalMargin",
+        deserialize_with = "de_f64_from_string_or_number"
+    )]
+    pub total_margin: f64,
+    /// SPAN margin (normalized to f64).
+    #[serde(
+        default,
+        alias = "spanMargin",
+        deserialize_with = "de_f64_from_string_or_number"
+    )]
+    pub span_margin: f64,
+    /// Exposure margin (normalized to f64).
+    #[serde(
+        default,
+        alias = "exposureMargin",
+        deserialize_with = "de_f64_from_string_or_number"
+    )]
+    pub exposure_margin: f64,
+    /// Equity margin (normalized to f64).
+    #[serde(
+        default,
+        alias = "equityMargin",
+        deserialize_with = "de_f64_from_string_or_number"
+    )]
+    pub equity_margin: f64,
+    /// F&O margin (normalized to f64).
+    #[serde(
+        default,
+        alias = "foMargin",
+        deserialize_with = "de_f64_from_string_or_number"
+    )]
+    pub fo_margin: f64,
+    /// Commodity margin (normalized to f64).
+    #[serde(
+        default,
+        alias = "commodityMargin",
+        deserialize_with = "de_f64_from_string_or_number"
+    )]
+    pub commodity_margin: f64,
+    /// Currency field — kept as a RAW string. The classic live example
+    /// shows `"INR"` (a currency CODE) while the portal markdown types it
+    /// as a float margin amount — semantics Unknown until live-probed
+    /// (2026-07-14 split, ground-truth doc item 3). Snake_case and
+    /// camelCase are the same word here, so no alias is needed.
     #[serde(default)]
     pub currency: String,
-    /// Hedge benefit from offsetting positions (STRING).
-    #[serde(default)]
-    pub hedge_benefit: String,
+    /// Hedge benefit from offsetting positions (normalized to f64;
+    /// absent from the portal markdown's response → defaults to 0.0).
+    #[serde(
+        default,
+        alias = "hedgeBenefit",
+        deserialize_with = "de_f64_from_string_or_number"
+    )]
+    pub hedge_benefit: f64,
+}
+
+/// Tolerant f64 deserializer for the multi-margin response's split wire
+/// shapes (2026-07-14): accepts a JSON number (the portal-markdown
+/// camelCase-float shape, integers included) OR a numeric string (the
+/// classic/yaml snake_case-string shape like `"150000.00"`). Fail-closed
+/// on garbage: a NON-numeric string is a hard deserialize error, and a
+/// NON-FINITE value is too — Rust's `f64` parser accepts `"NaN"` /
+/// `"inf"` / `"-inf"`, but a non-finite margin must never round-trip
+/// toward a verdict. Any echoed input text in the error message is
+/// bounded to ≤ 32 chars so a hostile/oversized wire value can never
+/// balloon a log line.
+fn de_f64_from_string_or_number<'de, D>(de: D) -> Result<f64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum NumOrStr {
+        F64(f64),
+        Str(String),
+    }
+    let value = match NumOrStr::deserialize(de)? {
+        NumOrStr::F64(value) => value,
+        NumOrStr::Str(text) => text.parse::<f64>().map_err(|_| {
+            // Bounded echo — chars (not bytes) so the cut is UTF-8-safe.
+            let echoed: String = text.chars().take(32).collect();
+            serde::de::Error::custom(format!(
+                "non-numeric margin value {echoed:?} — refusing to coerce to 0.0"
+            ))
+        })?,
+    };
+    if !value.is_finite() {
+        return Err(serde::de::Error::custom(
+            "non-finite margin value — refusing to coerce to 0.0",
+        ));
+    }
+    Ok(value)
+}
+
+/// Order intent for the pre-trade margin gate (umbrella plan cluster E2).
+///
+/// `Entry` carries the margin the gate computed for the order (integer
+/// paise); `Exit` is never margin-gated — an exit must always be
+/// placeable. The future `RiskEngine::check_order` integration takes this
+/// type (rebases after cluster A's risk-engine round merges).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrderIntent {
+    /// Opens or increases exposure — margin-gated.
+    Entry {
+        /// Margin required for the entry, in integer paise.
+        required_paise: i64,
+    },
+    /// Closes or reduces exposure — NEVER margin-gated.
+    Exit,
 }
 
 // ---------------------------------------------------------------------------
@@ -1004,6 +1357,10 @@ pub struct DhanPlaceSuperOrderRequest {
 pub struct DhanModifySuperOrderRequest {
     /// Dhan client ID.
     pub dhan_client_id: String,
+    /// Dhan order ID — REQUIRED in the modify BODY per the portal capture
+    /// (docs/dhan-ref/dhanhq-v2-upstream-2026-07-03/04-super-orders.md:110);
+    /// the URL path alone is doc-non-conformant. NOT Option — always sent.
+    pub order_id: String,
     /// Which leg to modify.
     pub leg_name: String,
     /// Order type (ENTRY_LEG only).
@@ -1054,6 +1411,10 @@ pub struct SuperOrderLegDetail {
     /// Trailing jump value.
     #[serde(default)]
     pub trailing_jump: f64,
+    /// Total quantity for this leg — Dhan's API literally sends the typo
+    /// `totalQuatity` (verified 2026-07-14). Do NOT "fix" the rename.
+    #[serde(default, rename = "totalQuatity")]
+    pub total_quatity: i64,
 }
 
 /// Super order response (includes leg details).
@@ -1073,6 +1434,28 @@ pub struct DhanSuperOrderResponse {
     /// Leg details array (target + stop loss legs).
     #[serde(default)]
     pub leg_details: Vec<SuperOrderLegDetail>,
+    /// Quantity filled so far (list endpoint — the ONLY super read path).
+    #[serde(default)]
+    pub filled_qty: i64,
+    /// Volume-weighted average fill price (wire typing UNVERIFIED-LIVE —
+    /// probe U2; deserialize f64 + default, treat 0 defensively).
+    #[serde(default)]
+    pub average_traded_price: f64,
+    /// Quantity still open.
+    #[serde(default)]
+    pub remaining_quantity: i64,
+    /// Dhan security ID (STRING in response).
+    #[serde(default)]
+    pub security_id: String,
+    /// Transaction type: "BUY" or "SELL".
+    #[serde(default)]
+    pub transaction_type: String,
+    /// Exchange segment (e.g. "NSE_FNO").
+    #[serde(default)]
+    pub exchange_segment: String,
+    /// Dhan OMS error description (rejection diagnostics).
+    #[serde(default)]
+    pub oms_error_description: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -1420,6 +1803,16 @@ pub struct ReconciliationReport {
 
 /// Exchange segment for NSE F&O (the only segment this system trades).
 pub const EXCHANGE_SEGMENT_NSE_FNO: &str = "NSE_FNO";
+
+/// Synthetic `order_status` the api-client stamps when a 2xx super-order
+/// cancel/modify response carried a body that was PRESENT but UNPARSABLE
+/// (the U6 202-no-body tolerance class).
+///
+/// L5 (2026-07-14 hostile review): the engine treats it as
+/// accepted-with-doubt — the local registry apply still runs, but the
+/// tracked entry is flagged `needs_reconciliation` (the mutation may not
+/// actually have applied broker-side).
+pub const SUPER_ORDER_STATUS_ACCEPTED_UNPARSED_BODY: &str = "ACCEPTED_UNPARSED_BODY";
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -1812,9 +2205,10 @@ mod tests {
     #[test]
     fn test_multi_margin_request_serializes() {
         let req = MultiMarginRequest {
+            dhan_client_id: "TEST-100".to_owned(),
             include_position: true,
-            include_orders: false,
-            scripts: vec![MarginScript {
+            include_order: false,
+            scrip_list: vec![MarginScript {
                 exchange_segment: "NSE_FNO".to_owned(),
                 transaction_type: "BUY".to_owned(),
                 quantity: 50,
@@ -1825,13 +2219,19 @@ mod tests {
             }],
         };
         let json = serde_json::to_string(&req).unwrap();
+        // The 2026-07-14 SDK/classic-curl-converged wire shape.
+        assert!(json.contains("dhanClientId"));
         assert!(json.contains("includePosition"));
-        assert!(json.contains("includeOrders"));
-        assert!(json.contains("scripts"));
+        assert!(json.contains("includeOrder"));
+        assert!(json.contains("scripList"));
+        // The yaml's LESS-supported reading must NOT be emitted.
+        assert!(!json.contains("includeOrders"));
+        assert!(!json.contains("\"scripts\""));
     }
 
     #[test]
-    fn test_multi_margin_response_all_strings() {
+    fn test_multi_margin_response_snake_case_strings_normalize() {
+        // The classic/yaml shape: snake_case, all-string values.
         let json = r#"{
             "total_margin": "12500.00",
             "span_margin": "10000.00",
@@ -1844,12 +2244,78 @@ mod tests {
         }"#;
 
         let resp: MultiMarginResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(resp.total_margin, "12500.00");
-        assert_eq!(resp.span_margin, "10000.00");
-        assert_eq!(resp.hedge_benefit, "500.00");
-        // All fields are strings
-        assert_eq!(resp.fo_margin, "12500.00");
-        assert_eq!(resp.commodity_margin, "0.00");
+        assert!((resp.total_margin - 12500.00).abs() < 1e-9);
+        assert!((resp.span_margin - 10000.00).abs() < 1e-9);
+        assert!((resp.exposure_margin - 2500.00).abs() < 1e-9);
+        assert!((resp.fo_margin - 12500.00).abs() < 1e-9);
+        assert!(resp.commodity_margin.abs() < 1e-9);
+        assert!((resp.hedge_benefit - 500.00).abs() < 1e-9);
+        // `currency` stays RAW (semantics Unknown — 2026-07-14 split).
+        assert_eq!(resp.currency, "0.00");
+    }
+
+    #[test]
+    fn test_multi_margin_response_camel_case_floats_normalize() {
+        // The portal-markdown shape: camelCase, float values, no
+        // hedge_benefit field (absent → 0.0 via serde default).
+        let json = r#"{
+            "totalMargin": 150000.0,
+            "spanMargin": 50000.0,
+            "exposureMargin": 45000.0
+        }"#;
+
+        let resp: MultiMarginResponse = serde_json::from_str(json).unwrap();
+        assert!((resp.total_margin - 150000.0).abs() < 1e-9);
+        assert!((resp.span_margin - 50000.0).abs() < 1e-9);
+        assert!((resp.exposure_margin - 45000.0).abs() < 1e-9);
+        assert!(resp.hedge_benefit.abs() < 1e-9);
+        assert!(resp.equity_margin.abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_multi_margin_response_rejects_garbage_string() {
+        // Fail-closed: a non-numeric margin string is a hard deserialize
+        // error — never silently coerced to 0.0.
+        let json = r#"{"total_margin": "abc"}"#;
+        let result: Result<MultiMarginResponse, _> = serde_json::from_str(json);
+        assert!(result.is_err());
+        // Bounded echo: a long garbage value must NOT round-trip verbatim
+        // into the error text (≤ 32 echoed chars).
+        let long_garbage = "x".repeat(500);
+        let json = format!(r#"{{"total_margin": "{long_garbage}"}}"#);
+        let err = serde_json::from_str::<MultiMarginResponse>(&json).unwrap_err();
+        assert!(
+            !err.to_string().contains(&long_garbage),
+            "error text must not carry the full 500-char garbage value"
+        );
+    }
+
+    #[test]
+    fn test_multi_margin_response_rejects_nan_and_inf_strings() {
+        // Rust's f64 parser ACCEPTS these — the deserializer must still
+        // hard-fail (a non-finite margin can never reach a verdict).
+        for bad in ["NaN", "inf", "-inf", "Infinity", "-infinity"] {
+            let json = format!(r#"{{"total_margin": "{bad}"}}"#);
+            let result: Result<MultiMarginResponse, _> = serde_json::from_str(&json);
+            assert!(result.is_err(), "{bad:?} must be a hard deserialize error");
+        }
+    }
+
+    #[test]
+    fn test_multi_margin_response_integer_json_number_normalizes() {
+        // A bare JSON INTEGER (no decimal point) normalizes to f64.
+        let json = r#"{"total_margin": 150000}"#;
+        let resp: MultiMarginResponse = serde_json::from_str(json).unwrap();
+        assert!((resp.total_margin - 150000.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_multi_margin_response_currency_inr_raw() {
+        // The classic live example shows a currency CODE — must parse and
+        // survive verbatim (kept raw; semantics Unknown until live-probed).
+        let json = r#"{"currency": "INR"}"#;
+        let resp: MultiMarginResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.currency, "INR");
     }
 
     // --- FundLimitResponse (C4) ---
@@ -2155,14 +2621,14 @@ mod tests {
     fn multi_margin_response_defaults_for_missing_fields() {
         let json = r#"{}"#;
         let resp: MultiMarginResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(resp.total_margin, "");
-        assert_eq!(resp.span_margin, "");
-        assert_eq!(resp.exposure_margin, "");
-        assert_eq!(resp.equity_margin, "");
-        assert_eq!(resp.fo_margin, "");
-        assert_eq!(resp.commodity_margin, "");
+        assert!(resp.total_margin.abs() < 1e-9);
+        assert!(resp.span_margin.abs() < 1e-9);
+        assert!(resp.exposure_margin.abs() < 1e-9);
+        assert!(resp.equity_margin.abs() < 1e-9);
+        assert!(resp.fo_margin.abs() < 1e-9);
+        assert!(resp.commodity_margin.abs() < 1e-9);
         assert_eq!(resp.currency, "");
-        assert_eq!(resp.hedge_benefit, "");
+        assert!(resp.hedge_benefit.abs() < 1e-9);
     }
 
     #[test]
@@ -2474,6 +2940,7 @@ mod tests {
     fn test_modify_super_order_target_only_price() {
         let req = DhanModifySuperOrderRequest {
             dhan_client_id: "1".to_string(),
+            order_id: "SO-1".to_string(),
             leg_name: "TARGET_LEG".to_string(),
             order_type: None,
             quantity: None,
@@ -2484,14 +2951,17 @@ mod tests {
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("\"targetPrice\":1650"));
+        // Ruling 2 fix 1: orderId is REQUIRED in the modify body.
+        assert!(json.contains("\"orderId\":\"SO-1\""));
         assert!(!json.contains("quantity")); // Skipped
-        assert!(!json.contains("price\":")); // Skipped (not targetPrice)
+        assert!(!json.contains("\"price\":")); // Skipped (not targetPrice)
     }
 
     #[test]
     fn test_modify_super_order_sl_only_sl_and_trail() {
         let req = DhanModifySuperOrderRequest {
             dhan_client_id: "1".to_string(),
+            order_id: "SO-2".to_string(),
             leg_name: "STOP_LOSS_LEG".to_string(),
             order_type: None,
             quantity: None,
@@ -2755,5 +3225,257 @@ mod tests {
         let resp: DhanCancelOrderResponse = serde_json::from_str(json).unwrap();
         assert_eq!(resp.order_id, "ORD-123");
         assert_eq!(resp.order_status, "CANCELLED");
+    }
+
+    // -----------------------------------------------------------------------
+    // Exit-Order Execution Layer types (Cluster B, 2026-07-14)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_super_order_leg_detail_total_quatity_typo_rename() {
+        // Dhan's API literally sends `totalQuatity` (missing 'n') — the
+        // rename must match the typo verbatim, and default to 0 when absent.
+        let json = r#"{"orderId":"L-1","legName":"TARGET_LEG","totalQuatity":75}"#;
+        let leg: SuperOrderLegDetail = serde_json::from_str(json).unwrap();
+        assert_eq!(leg.total_quatity, 75);
+
+        let json_missing = r#"{"orderId":"L-2","legName":"STOP_LOSS_LEG"}"#;
+        let leg2: SuperOrderLegDetail = serde_json::from_str(json_missing).unwrap();
+        assert_eq!(leg2.total_quatity, 0);
+
+        // The corrected spelling must NOT populate the field.
+        let json_correct_spelling = r#"{"orderId":"L-3","totalQuantity":99}"#;
+        let leg3: SuperOrderLegDetail = serde_json::from_str(json_correct_spelling).unwrap();
+        assert_eq!(leg3.total_quatity, 0);
+    }
+
+    #[test]
+    fn test_super_order_response_extended_fill_fields() {
+        // Ruling 2 fix 4: without these the verify loop is blind to fills.
+        let json = r#"{"orderId":"SO-9","orderStatus":"TRADED","correlationId":"c9",
+            "filledQty":50,"averageTradedPrice":123.45,"remainingQuantity":25,
+            "securityId":"49081","transactionType":"SELL","exchangeSegment":"NSE_FNO",
+            "omsErrorDescription":"","legDetails":[]}"#;
+        let resp: DhanSuperOrderResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.filled_qty, 50);
+        assert!((resp.average_traded_price - 123.45).abs() < f64::EPSILON);
+        assert_eq!(resp.remaining_quantity, 25);
+        assert_eq!(resp.security_id, "49081");
+        assert_eq!(resp.transaction_type, "SELL");
+        assert_eq!(resp.exchange_segment, "NSE_FNO");
+        assert_eq!(resp.oms_error_description, "");
+    }
+
+    #[test]
+    fn test_super_order_response_extended_fields_default_when_missing() {
+        // Additive `#[serde(default)]` — the pre-fix 4-field body still parses.
+        let json =
+            r#"{"orderId":"SO-9","orderStatus":"PENDING","correlationId":"","legDetails":[]}"#;
+        let resp: DhanSuperOrderResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.filled_qty, 0);
+        assert_eq!(resp.remaining_quantity, 0);
+        assert!(resp.average_traded_price.abs() < f64::EPSILON);
+        assert_eq!(resp.security_id, "");
+        assert_eq!(resp.oms_error_description, "");
+    }
+
+    #[test]
+    fn test_modify_super_order_request_body_carries_order_id_camel_case() {
+        let req = DhanModifySuperOrderRequest {
+            dhan_client_id: "100".to_string(),
+            order_id: "112111182198".to_string(),
+            leg_name: "ENTRY_LEG".to_string(),
+            order_type: Some("LIMIT".to_string()),
+            quantity: Some(75),
+            price: Some(1300.0),
+            target_price: Some(1400.0),
+            stop_loss_price: Some(1250.0),
+            trailing_jump: Some(10.0),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("\"orderId\":\"112111182198\""));
+        assert!(json.contains("\"dhanClientId\":\"100\""));
+        assert!(json.contains("\"legName\":\"ENTRY_LEG\""));
+    }
+
+    #[test]
+    fn test_slicing_response_many_array_shape() {
+        // The SDK-observed shape: a list of per-slice responses.
+        let json = r#"[{"orderId":"S-1","orderStatus":"TRANSIT"},{"orderId":"S-2","orderStatus":"TRANSIT"}]"#;
+        let resp: SlicingResponse = serde_json::from_str(json).unwrap();
+        match resp {
+            SlicingResponse::Many(orders) => {
+                assert_eq!(orders.len(), 2);
+                assert_eq!(orders[0].order_id, "S-1");
+                assert_eq!(orders[1].order_id, "S-2");
+            }
+            SlicingResponse::One(_) => panic!("array must deserialize as Many"),
+        }
+    }
+
+    #[test]
+    fn test_slicing_response_one_object_shape() {
+        // The portal-documented shape: a single response object.
+        let json = r#"{"orderId":"S-1","orderStatus":"TRANSIT"}"#;
+        let resp: SlicingResponse = serde_json::from_str(json).unwrap();
+        match resp {
+            SlicingResponse::One(order) => assert_eq!(order.order_id, "S-1"),
+            SlicingResponse::Many(_) => panic!("single object must deserialize as One"),
+        }
+    }
+
+    #[test]
+    fn test_slicing_response_garbage_is_a_typed_error() {
+        // Neither shape → typed serde error, never a panic.
+        let result: Result<SlicingResponse, _> = serde_json::from_str(r#""not-an-order""#);
+        assert!(result.is_err());
+        let result2: Result<SlicingResponse, _> = serde_json::from_str("42");
+        assert!(result2.is_err());
+    }
+
+    #[test]
+    fn test_place_super_order_request_engine_type_constructs() {
+        let req = PlaceSuperOrderRequest {
+            security_id: 49081,
+            transaction_type: TransactionType::Buy,
+            order_type: OrderType::Limit,
+            product_type: ProductType::Intraday,
+            quantity: 75,
+            price: 100.0,
+            target_price: 110.0,
+            stop_loss_price: 95.0,
+            trailing_jump: 0.0,
+            lot_size: 75,
+            expiry_date: None,
+        };
+        let cloned = req.clone();
+        assert_eq!(cloned.security_id, 49081);
+        assert!(format!("{req:?}").contains("PlaceSuperOrderRequest"));
+    }
+
+    #[test]
+    fn test_place_forever_oco_request_engine_type_constructs() {
+        let req = PlaceForeverOcoRequest {
+            security_id: 1333,
+            transaction_type: TransactionType::Sell,
+            product_type: ProductType::Cnc,
+            order_type: OrderType::Limit,
+            validity: OrderValidity::Day,
+            quantity: 5,
+            price: 1428.0,
+            trigger_price: 1427.0,
+            oco_leg: Some(OcoSecondLeg {
+                price: 1420.0,
+                trigger_price: 1419.0,
+                quantity: 5,
+            }),
+            expiry_date: None,
+        };
+        let cloned = req.clone();
+        assert!(cloned.oco_leg.is_some());
+        assert!(format!("{req:?}").contains("OcoSecondLeg"));
+    }
+
+    #[test]
+    fn test_execution_verdict_variants_are_distinct() {
+        let filled = ExecutionVerdict::Filled {
+            traded_qty: 10,
+            avg_price: 100.0,
+        };
+        assert_ne!(filled, ExecutionVerdict::SimulatedFilled);
+        assert_ne!(
+            ExecutionVerdict::Pending { elapsed_secs: 5 },
+            ExecutionVerdict::PendingAtLimit { elapsed_secs: 5 }
+        );
+        assert_eq!(
+            ExecutionVerdict::Unknown {
+                raw_status: "GARBAGE".to_string()
+            },
+            ExecutionVerdict::Unknown {
+                raw_status: "GARBAGE".to_string()
+            }
+        );
+        assert_ne!(
+            ExecutionVerdict::Terminal {
+                status: OrderStatus::Rejected
+            },
+            ExecutionVerdict::Terminal {
+                status: OrderStatus::Cancelled
+            }
+        );
+    }
+
+    #[test]
+    fn test_modify_super_order_leg_enum_variants_construct() {
+        let entry = ModifySuperOrderLeg::Entry {
+            order_type: OrderType::Limit,
+            quantity: 75,
+            price: 100.0,
+            target_price: 110.0,
+            stop_loss_price: 95.0,
+            trailing_jump: 2.0,
+        };
+        let target = ModifySuperOrderLeg::Target {
+            target_price: 112.0,
+        };
+        let sl = ModifySuperOrderLeg::StopLoss {
+            stop_loss_price: 96.0,
+            trailing_jump: 0.0,
+        };
+        // Type-level leg restriction: Target carries ONLY target_price;
+        // StopLoss/Entry carry a NON-Option trailing_jump (always resent).
+        assert!(format!("{entry:?}").contains("trailing_jump"));
+        assert!(!format!("{target:?}").contains("trailing_jump"));
+        assert!(format!("{sl:?}").contains("trailing_jump"));
+    }
+
+    #[test]
+    fn test_managed_super_order_and_verify_state_construct() {
+        let mso = ManagedSuperOrder {
+            entry_order_id: "PAPER-SO-1".to_string(),
+            correlation_id: "c1".to_string(),
+            security_id: 49081,
+            transaction_type: TransactionType::Buy,
+            quantity: 75,
+            entry_price: 100.0,
+            entry_status_raw: "PENDING".to_string(),
+            target: LegState {
+                order_id: "PAPER-SO-1-TGT".to_string(),
+                status_raw: "PENDING".to_string(),
+                price: 110.0,
+            },
+            stop_loss: LegState {
+                order_id: "PAPER-SO-1-SL".to_string(),
+                status_raw: "PENDING".to_string(),
+                price: 95.0,
+            },
+            trailing_jump: 0.0,
+            status: OrderStatus::Pending,
+            modification_count: 0,
+            created_at_us: 1,
+            updated_at_us: 1,
+        };
+        assert_eq!(mso.clone().target.order_id, "PAPER-SO-1-TGT");
+
+        let vs = VerifyState {
+            attempts: 1,
+            first_probe_us: 42,
+            last_verdict_label: "pending",
+        };
+        assert_eq!(vs.clone().attempts, 1);
+    }
+
+    #[test]
+    fn test_super_order_placement_snapshot_constructs() {
+        let placement = SuperOrderPlacement {
+            entry_order_id: "SO-1".to_string(),
+            legs: vec![SuperOrderLegSnapshot {
+                leg: OrderLeg::TargetLeg,
+                order_id: "SO-1-TGT".to_string(),
+                status_raw: "PENDING".to_string(),
+            }],
+        };
+        assert_eq!(placement.clone().legs.len(), 1);
+        assert_eq!(placement.legs[0].leg, OrderLeg::TargetLeg);
     }
 }

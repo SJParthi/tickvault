@@ -48,10 +48,14 @@ resource "aws_cloudwatch_dashboard" "operator" {
         width  = 8
         height = 6
         properties = {
-          title   = "Real-time guarantee score (1.0 = all healthy)"
+          # 2026-07-15 (Groww live retirement): was the Groww lag p99 gauge —
+          # its only sample producer (the Groww bridge) is deleted; the REST
+          # 1m fire heartbeat is the liveness signal (1 = per-minute legs
+          # firing; MISSING in-session = wedged/dead — the liveness alarm).
+          title   = "REST 1m fire heartbeat (1 = per-minute candle pulls firing)"
           region  = local.dash_region
           view    = "gauge"
-          metrics = [[local.dash_namespace, "tv_realtime_guarantee_score"]]
+          metrics = [[local.dash_namespace, "tv_rest_1m_fire_heartbeat"]]
           yAxis   = { left = { min = 0, max = 1 } }
           period  = 60
           stat    = "Average"
@@ -103,21 +107,9 @@ resource "aws_cloudwatch_dashboard" "operator" {
           period  = 300
         }
       },
-      {
-        type   = "metric"
-        x      = 8
-        y      = 8
-        width  = 8
-        height = 6
-        properties = {
-          title   = "Instruments silent (tick-gap — 0 = all streaming)"
-          region  = local.dash_region
-          view    = "timeSeries"
-          metrics = [[local.dash_namespace, "tv_tick_gap_instruments_silent"]]
-          period  = 60
-          stat    = "Maximum"
-        }
-      },
+      # ("Feed last-tick age" widget retired 2026-07-15 — its sole producer,
+      # the Groww bridge liveness stamp, was deleted with the Groww live feed;
+      # the series can never publish again.)
       {
         type   = "metric"
         x      = 16
@@ -227,17 +219,39 @@ resource "aws_cloudwatch_dashboard" "operator" {
         properties = {
           title = "Live alarm status (red = firing -> Telegram/Email/SMS already paged)"
           alarms = [
-            aws_cloudwatch_metric_alarm.ws_pool_all_dead.arn,
             aws_cloudwatch_metric_alarm.questdb_disconnected.arn,
             aws_cloudwatch_metric_alarm.token_remaining_low.arn,
-            aws_cloudwatch_metric_alarm.tick_gap_instruments_silent.arn,
-            aws_cloudwatch_metric_alarm.realtime_guarantee_critical.arn,
+            # tick_gap_instruments_silent retired in PR-C3 (2026-07-14).
             aws_cloudwatch_metric_alarm.spill_dropped.arn,
             aws_cloudwatch_metric_alarm.dlq_ticks.arn,
             aws_cloudwatch_metric_alarm.clock_skew_high.arn,
             aws_cloudwatch_metric_alarm.high_cpu.arn,
             aws_cloudwatch_metric_alarm.disk_used_high.arn
           ]
+        }
+      },
+
+      # ----- Row 6: order-side (cluster C, 2026-07-14) -----
+      # tv_orders_placed_delta_total = the DERIVED metrics-log-filter
+      # series from order-side-alarms.tf (dense from boot via the main.rs
+      # pre-registrations); tv_orders_rejected_total is EMF-published.
+      # ₹0 widget — appended to the EXISTING dashboard, free-tier slot 3
+      # deliberately NOT consumed.
+      {
+        type   = "metric"
+        x      = 0
+        y      = 30
+        width  = 12
+        height = 6
+        properties = {
+          title  = "Orders (paper mode until Phase-1) — placed vs rejected, 5m sums"
+          region = local.dash_region
+          view   = "timeSeries"
+          metrics = [
+            ["Tickvault/Prod", "tv_orders_placed_delta_total", "host", "tickvault-prod", { stat = "Sum" }],
+            ["Tickvault/Prod", "tv_orders_rejected_total", "host", "tickvault-prod", { stat = "Sum" }]
+          ]
+          period = 300
         }
       }
     ]
@@ -300,34 +314,18 @@ resource "aws_cloudwatch_dashboard" "scoreboard" {
         width  = 12
         height = 6
         properties = {
-          title   = "Groww price delay, worst 1% (seconds — millisecond clock, measured at helper capture)"
+          title   = "REST 1m fire heartbeat over time (official minute-candle pulls alive)"
           region  = local.dash_region
           view    = "timeSeries"
-          metrics = [[local.dash_namespace, "tv_groww_exchange_lag_p99_seconds"]]
+          metrics = [[local.dash_namespace, "tv_rest_1m_fire_heartbeat"]]
           period  = 60
           stat    = "Maximum"
         }
       },
 
-      # ----- Row 2 (PR-D): stall restarts | catch-up seals per feed -----
-      {
-        type   = "metric"
-        x      = 0
-        y      = 8
-        width  = 12
-        height = 6
-        properties = {
-          title  = "Feed helper restarts (stalled / never-streamed sockets killed + relaunched)"
-          region = local.dash_region
-          view   = "timeSeries"
-          metrics = [
-            [local.dash_namespace, "tv_feed_sidecar_stall_restart_total"],
-            [local.dash_namespace, "tv_feed_sidecar_never_streamed_restart_total"]
-          ]
-          period = 300
-          stat   = "Sum"
-        }
-      },
+      # ----- Row 2 (PR-D): catch-up seals per feed -----
+      # ("Feed helper restarts" widget retired 2026-07-15 — the stall-restart
+      # counters died with the Groww live feed's stall watchdog.)
       {
         type   = "metric"
         x      = 12
@@ -339,8 +337,8 @@ resource "aws_cloudwatch_dashboard" "scoreboard" {
           region = local.dash_region
           view   = "timeSeries"
           metrics = [
-            [local.dash_namespace, "tv_boundary_catchup_total", "host", "tickvault-prod", "feed", "dhan"],
-            [local.dash_namespace, "tv_boundary_catchup_total", "host", "tickvault-prod", "feed", "groww"]
+            [local.dash_namespace, "tv_boundary_catchup_total", "host", "tickvault-prod", "feed", "dhan"]
+            # (feed=groww series retired 2026-07-15 — spawn_groww_catchup_seal deleted with the Groww live feed; groww rows can never increment again)
           ]
           period = 300
           stat   = "Sum"
@@ -372,12 +370,10 @@ resource "aws_cloudwatch_dashboard" "scoreboard" {
         properties = {
           title = "Feed alarm status (red = firing -> already paged)"
           alarms = [
-            aws_cloudwatch_metric_alarm.ws_pool_all_dead.arn,
-            aws_cloudwatch_metric_alarm.feed_stall_restarts.arn,
+            # feed_stall_restarts + groww_exchange_lag_p99_high retired
+            # 2026-07-15 with the Groww live feed.
             aws_cloudwatch_metric_alarm.boundary_catchup_storm_dhan.arn,
-            aws_cloudwatch_metric_alarm.dhan_exchange_lag_p99_high.arn,
-            aws_cloudwatch_metric_alarm.groww_exchange_lag_p99_high.arn,
-            aws_cloudwatch_metric_alarm.realtime_guarantee_degraded.arn
+            aws_cloudwatch_metric_alarm.dhan_exchange_lag_p99_high.arn
           ]
         }
       },

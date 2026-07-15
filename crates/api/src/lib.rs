@@ -714,8 +714,9 @@ mod tests {
 
         // Companion ratchet to the 401 test above: the gate OPENS for the real
         // token in BOTH modes — the 2026-07-04 gating must never lock the
-        // operator out. The groww enable flip through auth_test_state() returns
-        // 200 (same handler the retired public-route test exercised).
+        // operator out. S2b (2026-07-15): a groww ENABLE now hits the
+        // retired-feed 409 INSIDE the handler — the assertion is "past the
+        // auth gate" (never 401), so use a groww DISABLE which flows through.
         for feed_toggle_public in [true, false] {
             let auth = ApiAuthConfig::from_token(SecretString::from("secret-tok".to_string()));
             let router = build_router_with_auth(auth_test_state(), &[], auth, feed_toggle_public);
@@ -727,7 +728,7 @@ mod tests {
                         .uri("/api/feeds/groww")
                         .header("content-type", "application/json")
                         .header("authorization", "Bearer secret-tok")
-                        .body(Body::from(r#"{"enabled":true}"#))
+                        .body(Body::from(r#"{"enabled":false}"#))
                         .unwrap(),
                 )
                 .await

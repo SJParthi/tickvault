@@ -1,5 +1,12 @@
 # Groww Native-Rust Shadow Client — Error Codes (GROWW-NATIVE-01..04)
 
+> **⚠ RETIRED 2026-07-15 (Groww live feed deleted — operator Q1, received directly in this session: *"remove
+> the whole Groww live feed; keep only spot 1m and option chain for both brokers; go."*):** the native-Rust
+> shadow client, its supervised runner, and every GROWW-NATIVE-01..04 emit site are DELETED with the Groww
+> live feed (the PR-R2/R3 parity migration is moot — there is no live feed to migrate to). The
+> `GrowwNative0*` ErrorCode variants are RETAINED until the post-C4 variant sweep (this file keeps
+> satisfying the cross-ref test). Content below retained as historical audit.
+
 > **Authority:** CLAUDE.md > `operator-charter-forever.md` §C/§F >
 > `groww-second-feed-scope-2026-06-19.md` §32/§33/§35 (native Rust is the
 > production option; LIVE-FEED-ONLY; the 2026-07-04 shadow authorization) >

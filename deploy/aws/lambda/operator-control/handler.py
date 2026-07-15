@@ -1683,11 +1683,11 @@ def _wipe_groww_commands() -> list[str]:
     data_dir = "/opt/tickvault/data"
     return [
         "set +e",
-        # 1. stop the app + the groww sidecar FIRST: releases QuestDB writers,
-        #    stops the capture-file appender + the bridge so nothing re-appends
-        #    or re-tails groww rows mid-wipe.
+        # 1. stop the app FIRST: releases QuestDB writers so nothing
+        #    re-appends rows mid-wipe (the groww sidecar was deleted with
+        #    the live feed, 2026-07-15).
         "systemctl stop tickvault || true",
-        "pkill -f groww_sidecar.py 2>/dev/null || true",
+        # (2026-07-15: the groww sidecar pkill retired — sidecar deleted with the Groww live feed)
         # Best-effort safety net: if SSM kills this script mid-run (execution
         # timeout on an enormous table / manual cancel), restart the app on
         # the way out so the box is never left silently dead. SIGKILL cannot
@@ -1987,7 +1987,6 @@ def lambda_handler(event, _context):
                 #    capture file). Re-enabled just before the final start.
                 "systemctl stop tickvault || true",
                 "systemctl disable tickvault || true",
-                "pkill -f groww_sidecar.py 2>/dev/null || true",
                 # 2. PR-5 H-2 REORDER: remove EVERY feed's capture/replay
                 #    sources FIRST (was after TRUNCATE) — even a forced start
                 #    mid-window now finds NOTHING to replay: Dhan WAL, Groww

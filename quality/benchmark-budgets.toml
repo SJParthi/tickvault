@@ -23,16 +23,16 @@ token_handle             = 50           # <50ns  — matches token_handle/load (
 f32_to_f64_clean         = 50           # <50ns  — matches f32_to_f64_clean/* (storage precision conversion)
 ws_reader_frame_handle   = 5000         # <5μs  — STAGE-D P7.6: counter bump + WAL append + dispatch per frame. Generous ceiling because WAL append includes one heap alloc + one crossbeam try_send; measured ~1-3μs in criterion, budget gives 2× headroom for noisy CI runners.
 phase2_compute_subscriptions = 1000000  # <1ms  — Plan item Q (2026-04-23): cold-path 09:13 dispatcher computes ATM±24 for 4 depth underlyings × 200-strike option chains. Measured ~4.3μs; 1ms budget gives ~230× headroom so accidental O(n²) regressions fail CI without being tight enough to flake on noisy runners.
-tick_gap_record_tick_steady_state = 500 # <500ns — Wave 2 Item 8.5: hot-path papaya pin().insert() with composite (security_id, segment) key. Budget covers papaya's epoch-list overhead; a regression to allocating .clone() on string fields would push median past this ceiling.
-tick_gap_scan_gaps_full_universe = 5000000 # <5ms — Wave 2 Item 8.5: cold-path scan over ~24K-entry map, runs once per 60s coalesce window. Budget is operator-visible latency, not hot-path.
-slo_score_evaluate_all_green = 1000      # <1µs — Wave 3-D Item 13: composite SLO score evaluator hot path (six clamps + five multiplies + 6-way min-scan). 1µs ceiling gives ~20× headroom over the measured median; regression past this size means a heap allocation or a powf entered the path.
-slo_score_evaluate_degraded = 1000       # <1µs — Wave 3-D Item 13: degraded path (find-weakest scan + threshold branches). Same budget as all-green.
+# tick_gap_record_tick_steady_state / tick_gap_scan_gaps_full_universe budgets
+# removed in PR-C3 (2026-07-14) with the deleted tick-gap detector
+# (operator Q4-ii 2026-07-13).
+# slo_score_evaluate_* budgets removed in the C4 sweep (2026-07-15) with the
+# deleted slo_score.rs contract stub + its bench (wave-3-d PARK banner).
 
 # Silent-feed hardening Item 4 (2026-07-06 incident) — Dhan exchange-lag monitor.
 feed_lag_record_dhan_tick = 100          # <100ns — HOT PATH ring write (dwell check + clock alignment + two relaxed atomic stores + head bump + two relaxed day-histogram RMWs since scoreboard PR-C; zero-alloc, DHAT-ratcheted by dhat_feed_lag_ring.rs). Regression past this means an allocation or a lock entered the per-tick observation.
-feed_lag_record_groww_tick = 100         # <100ns — HOT PATH Groww fold (scoreboard PR-C: capture/staleness classify + ring write + two relaxed day-histogram RMWs; zero-alloc, DHAT-ratcheted by dhat_feed_lag_groww.rs). Same budget class as the Dhan target.
 feed_presence_record = 100               # <100ns — HOT PATH presence fold (scoreboard PR-D: enabled check + minute math + one lock-free papaya read + one relaxed fetch_or; zero-alloc, DHAT-ratcheted by dhat_feed_presence.rs). Same budget class as the feed_lag hot targets — the papaya hash+read dominates.
-feed_lag_p99_window = 5000000            # <5ms — COLD path: publisher p99 over a full 32,768-sample window via select_nth_unstable. Honestly O(N-window), NOT O(1) — runs on the supervised 10s task off the tick thread (same cold-budget class as tick_gap_scan_gaps_full_universe).
+feed_lag_p99_window = 5000000            # <5ms — COLD path: publisher p99 over a full 32,768-sample window via select_nth_unstable. Honestly O(N-window), NOT O(1) — runs on the supervised 10s task off the tick thread (cold-budget class; the former tick_gap_scan_gaps_full_universe peer budget retired in PR-C3, 2026-07-14).
 
 # Phase 12-runtime (2026-04-28) — Movers 22-TF primitives
 compute_swap_delta_150_30_overlap   = 50000   # <50µs — depth-20 dynamic top-150 set diff with 30-entry crossover (typical per-minute case).
