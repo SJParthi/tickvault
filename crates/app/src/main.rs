@@ -251,7 +251,8 @@ async fn emit_boot_completed_when_feed_live(
         // with no live feed.
         info!(
             "boot-completed: no feed enabled (dhan_enabled=false, groww_enabled=false) — \
-             emitting the alive signal for a deliberately shared-infra-only run"
+             emitting the alive signal immediately for the REST-only boot (the per-minute \
+             Dhan/Groww REST legs are config-gated by their own sections, not these flags)"
         );
         emit_boot_completed();
         return;
@@ -289,8 +290,9 @@ async fn emit_boot_completed_when_feed_live(
                 wait_secs = BOOT_COMPLETED_FEED_LIVENESS_WAIT_SECS,
                 "boot-completed: NO enabled feed reached a live state within the wait window — \
                  WITHHOLDING the alive signal (tv_boot_completed) so the boot-heartbeat alarm \
-                 pages on the missing metric. Check the enabled feed(s): a Dhan lane that never \
-                 reached Running or a Groww activation that never built its watch-list."
+                 pages on the missing metric. Check the enabled feed(s) — with the live lanes \
+                 retired (Dhan 2026-07-13, Groww 2026-07-15) an enabled-but-dead feed flag \
+                 means the config re-enabled a lane this build no longer ships."
             );
             return;
         }
@@ -2715,9 +2717,12 @@ async fn build_shared_infra(
     // PUBLISHER-LESS (the lane's `run_tick_processor` is deleted; Groww runs
     // its own writer + aggregator instance), so these consumers idle. The
     // wiring stays: the `spawn_seal_writer_loop` above installed the
-    // process-wide `global_seal_sender` that Groww's OWN aggregator drains
-    // through (load-bearing), and this Dhan aggregator instance's force-seal
-    // tasks are idempotent no-ops on its empty state.
+    // process-wide `global_seal_sender` — since 2026-07-15 (Groww live-feed
+    // retirement) it has NO live-producing aggregator either (the Groww
+    // instance died with the bridge), so the whole seal chain is DORMANT on
+    // the REST-only runtime — and this Dhan aggregator instance's force-seal
+    // tasks are idempotent no-ops on its empty state. The committed C-phase
+    // follow-up retires the candle machinery wholesale.
     {
         let obs_rx = tick_broadcast_sender.subscribe();
         let questdb_cfg = config.questdb.clone();
@@ -2747,7 +2752,14 @@ async fn build_shared_infra(
             "L10 tick_storage broadcast consumer spawned + IST 09:15 reset task running"
         );
     }
-    info!("SHARED-INFRA BOOT: seal-writer + 21-TF aggregator running (Groww candles can seal)");
+    // (2026-07-15 wording fix: with the Groww live feed retired the aggregator
+    // has NO live tick producer — candle aggregation is DORMANT machinery on a
+    // REST-only boot; the committed C-phase follow-up owns its retirement.)
+    info!(
+        "SHARED-INFRA BOOT: seal-writer + 21-TF aggregator running (DORMANT — no live \
+         tick producer on the REST-only runtime; candle machinery retires in the \
+         committed C-phase follow-up)"
+    );
 
     // --- HTTP API server (incl. /api/feeds toggle routes) — C1 fix ---
     let api_state = SharedAppState::new_with_feed_runtime_and_health(

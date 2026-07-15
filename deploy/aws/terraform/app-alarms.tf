@@ -218,35 +218,17 @@ resource "aws_cloudwatch_metric_alarm" "ticks_dropped" {
 }
 
 # ---------------------------------------------------------------------------
-# 9. Aggregator producing zero seals during market hours
-#
-# MARKET-HOURS-GATED (2026-07-03, 5 AM false-SOS fix): zero seals is the
-# CORRECT, by-design state whenever the market is closed but the app is
-# running (early manual start, 15:30-16:30 IST post-close idle). The prior
-# "operator learns to ignore off-hours fires" stance is exactly the
-# pager-fatigue anti-pattern audit-findings Rule 3 (market-hours-aware)
-# forbids. Actions are OFF by default; the shared market-hours gate Lambda
-# (market-hours-liveness-alarm.tf) enables them 09:20-15:35 IST Mon-Fri
-# only. In-market sensitivity is UNCHANGED (same metric/threshold/periods).
+# 9. Aggregator no-seals alarm — RETIRED 2026-07-15 (Groww live-feed
+# retirement). The alarm's metric, tv_aggregator_seals_emitted_total, lost
+# its LAST live producer with this PR: the Groww bridge's aggregator drain
+# was deleted, and the Dhan broadcast instance has been publisher-less since
+# the 2026-07-13 Dhan live-WS retirement — so the metric can never emit a
+# datapoint again and the alarm (treat_missing_data = notBreaching) was a
+# permanently-dead monitor that the window gate kept arming daily. The
+# dormant seal_routing emit site + the EMF selector row survive this PR;
+# the committed C-phase candle-machinery follow-up owns their full
+# retirement (.claude/plans/active-plan-groww-live-off.md).
 # ---------------------------------------------------------------------------
-resource "aws_cloudwatch_metric_alarm" "aggregator_no_seals" {
-  alarm_name          = "tv-${var.environment}-aggregator-no-seals"
-  alarm_description   = "Aggregator emitted zero seals in the last 5 minutes DURING MARKET HOURS. Actions gated to 09:20-15:35 IST Mon-Fri by the market-hours gate Lambda — off-hours zero-seal is by design and never pages."
-  comparison_operator = "LessThanOrEqualToThreshold"
-  evaluation_periods  = 1
-  metric_name         = "tv_aggregator_seals_emitted_total"
-  namespace           = local.app_namespace
-  period              = 300
-  statistic           = "Sum"
-  threshold           = 0
-  treat_missing_data  = "notBreaching"
-  dimensions          = local.app_dimensions
-  # Actions OFF by default; the market-hours gate Lambda flips them ON
-  # 09:20-15:35 IST Mon-Fri (market-hours-liveness-alarm.tf).
-  actions_enabled = false
-  alarm_actions   = local.app_alarm_actions
-  # No ok_actions — would page on every off-hour transition.
-}
 
 # ---------------------------------------------------------------------------
 # 10. Order rejections — OMS or Dhan-side issue
@@ -462,7 +444,8 @@ output "app_cloudwatch_alarms" {
     aws_cloudwatch_metric_alarm.token_remaining_low.alarm_name,
     aws_cloudwatch_metric_alarm.spill_dropped.alarm_name,
     aws_cloudwatch_metric_alarm.dlq_ticks.alarm_name,
-    aws_cloudwatch_metric_alarm.aggregator_no_seals.alarm_name,
+    # aggregator_no_seals retired 2026-07-15 (Groww live-feed retirement —
+    # the seals metric lost its last live producer; see section 9 note).
     aws_cloudwatch_metric_alarm.orders_rejected.alarm_name,
     aws_cloudwatch_metric_alarm.clock_skew_high.alarm_name,
     aws_cloudwatch_metric_alarm.disk_watcher_respawn.alarm_name,

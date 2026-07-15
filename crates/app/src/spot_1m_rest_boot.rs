@@ -2262,8 +2262,13 @@ async fn fire_one_minute(
     // boot — the first set at the 09:16:01 IST fire IS the session-start
     // signal (a pre-registered 0 would satisfy the alarm while the legs
     // never fire); metrics-exporter-prometheus re-renders the last value
-    // on every scrape thereafter, so a wedged/dead process (or both legs
-    // dead) goes MISSING in-window and pages.
+    // on every scrape thereafter, so a wedged/dead process — or a session
+    // where NO leg ever fired — goes MISSING in-window and pages. HONEST
+    // BOUND (2026-07-15, R1-2): the re-render means legs dying MID-SESSION
+    // after the first fire keep the gauge published — that class is owned
+    // by the legs' own escalation pages, not this alarm. The 1.0 is a constant
+    // marker — only sample PRESENCE matters to the alarm. (The batch
+    // catch-up loop stamps the same gauge once per cycle — R2-3 fix.)
     metrics::gauge!("tv_rest_1m_fire_heartbeat").set(1.0);
     let trading_date = today_ist();
     let trading_date_nanos = minute_open_ist_nanos(trading_date, 0);
@@ -2994,6 +2999,20 @@ async fn run_batch_catchup_loop(
             u64::from(fire.saturating_sub(now)).saturating_mul(1_000) + SPOT_1M_REST_FIRE_DELAY_MS;
         tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
         last_fired = Some(fire);
+
+        // Market-hours liveness heartbeat — SAME gauge + idiom as the
+        // per-minute fire_one_minute site (set BEFORE token load / fetch:
+        // heartbeat = scheduler alive, not vendor healthy). 2026-07-15 fix
+        // round (R2-3): the batch loop previously NEVER set it, so a
+        // batch_catchup + Groww-spot-off config false-paged the liveness
+        // alarm daily. With this set, EVERY Dhan spot mode (per-minute AND
+        // batch) plus the Groww per-minute leg stamps the heartbeat.
+        // HONEST RESIDUAL: a batch first-cycle that lands AFTER the 09:20
+        // IST gate-open + 5x60s eval (possible when batch_interval_minutes
+        // pushes the first grid fire past ~09:25) still pages until that
+        // first cycle fires — per_minute is the supported default. The 1.0
+        // is a constant marker: only sample PRESENCE matters to the alarm.
+        metrics::gauge!("tv_rest_1m_fire_heartbeat").set(1.0);
 
         // A late wake is FINE in batch mode — the cycle's ceiling is
         // recomputed from the wall clock (catching up is the mode's whole

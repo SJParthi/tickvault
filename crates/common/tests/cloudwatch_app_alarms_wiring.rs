@@ -1062,10 +1062,18 @@ fn test_app_alarms_count_is_twenty_two() {
     // bridge + sidecar stall watchdog + lag publisher) were deleted with
     // the Groww live feed. Cost: -3 alarms (~-$0.30/mo) — dated note in
     // aws-budget.md (COST NOTE 2026-07-15).
+    // 11 (was 12) since 2026-07-15 (same PR, fix round): REMOVED
+    // tv_aggregator_seals_emitted_total (alarm
+    // tv-<env>-aggregator-no-seals) — the seals metric lost its LAST live
+    // producer with the Groww bridge deletion (the Dhan broadcast has been
+    // publisher-less since PR-C2), so the alarm was a permanently-dead
+    // monitor the window gate kept arming daily. Cost: -1 alarm
+    // (~-$0.10/mo) — dated notes in app-alarms.tf section 9 +
+    // aws-budget.md (COST NOTE 2026-07-15).
     let count = alarm_metric_names().len();
     assert_eq!(
-        count, 12,
-        "Z+ L2 VERIFY ratchet: expected exactly 12 app-level CloudWatch alarm \
+        count, 11,
+        "Z+ L2 VERIFY ratchet: expected exactly 11 app-level CloudWatch alarm \
          metric_name entries across app-alarms.tf + silent-feed-alarms.tf \
          (one per critical app signal). Found {count}. If you intentionally \
          added or removed one, update aws-budget.md custom-metric cost line \

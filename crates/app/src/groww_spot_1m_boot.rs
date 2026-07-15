@@ -1918,8 +1918,12 @@ async fn fire_one_minute(
     // boot — the first set at the 09:16:01 IST fire IS the session-start
     // signal (a pre-registered 0 would satisfy the alarm while the legs
     // never fire); metrics-exporter-prometheus re-renders the last value
-    // on every scrape thereafter, so a wedged/dead process (or both legs
-    // dead) goes MISSING in-window and pages.
+    // on every scrape thereafter, so a wedged/dead process — or a session
+    // where NO leg ever fired — goes MISSING in-window and pages. HONEST
+    // BOUND (2026-07-15, R1-2): the re-render means legs dying MID-SESSION
+    // after the first fire keep the gauge published — that class is owned
+    // by the legs' own escalation pages, not this alarm. The 1.0 is a
+    // constant marker — only sample PRESENCE matters.
     metrics::gauge!("tv_rest_1m_fire_heartbeat").set(1.0);
     let trading_date = today_ist();
     let trading_date_nanos = minute_open_ist_nanos(trading_date, 0);
