@@ -79,8 +79,8 @@ pub struct ReinjectOutcome {
 /// awaiting this helper. Without a live consumer, any replay larger than
 /// `FRAME_CHANNEL_CAPACITY` fills the channel, the next send stalls for the
 /// full `send_timeout`, and the run aborts NOT-clean — the WAL never
-/// archives and the re-replay storm loop is NOT broken. Ratcheted by
-/// `tests::ratchet_tick_processor_spawns_before_reinject_await`.
+/// archives and the re-replay storm loop is NOT broken.
+// TEST-EXEMPT: PR-C2 (2026-07-13) retired both main.rs re-injection call sites (and their ratchets) with the Dhan live-WS lane; the helper is retained un-consumed pending the Phase C module cleanup — behavior was pinned by the retired ratchets while consumers existed.
 pub async fn reinject_wal_frames(
     sender: &Sender<(u64, Bytes)>,
     frames: Vec<(u64, Bytes)>,
@@ -475,91 +475,23 @@ mod tests {
         );
     }
 
-    /// Ratchet/regression: the STAGE-C.2b blocks in main.rs must use the
-    /// bounded helper at BOTH call sites (fast boot + slow-boot mirror) and
-    /// must no longer contain the raw drop-on-full `try_send` loop. Also
-    /// pins the typed ErrorCode variant's existence in crates/common.
-    #[test]
-    fn ratchet_main_rs_uses_bounded_reinject_helper() {
-        let main_src = include_str!("main.rs");
-        let call_count = main_src.matches("reinject_wal_frames(").count();
-        assert!(
-            call_count >= 2,
-            "main.rs must call reinject_wal_frames( at both STAGE-C.2b sites \
-             (fast boot + start_dhan_lane mirror); found {call_count}"
-        );
-        assert_eq!(
-            main_src.matches("sender.try_send(frame)").count(),
-            0,
-            "the raw drop-on-full `sender.try_send(frame)` re-injection loop \
-             must not reappear in main.rs — it silently dropped 1,127,801 \
-             frames on 2026-07-03 (see ws-reinject-error-codes.md)"
-        );
+    // RETIRED (PR-C2, 2026-07-13 — Dhan live-WS lane deletion, operator
+    // retirement directive per websocket-connection-scope-lock.md
+    // "2026-07-13 Amendment" §B): ratchet_main_rs_uses_bounded_reinject_helper died with the wiring it pinned —
+    // both STAGE-C.2b re-injection call sites (fast boot + start_dhan_lane)
+    // were deleted with the lane; main.rs now drains residual LiveFeed WAL
+    // frames loudly at boot (counted + confirm_replayed) because no Dhan
+    // frame channel / tick processor exists to re-inject into. The
+    // `reinject_wal_frames` helper is retained un-consumed pending the
+    // Phase C module cleanup.
 
-        let error_code_src = include_str!("../../common/src/error_code.rs");
-        assert!(
-            error_code_src.contains("WsReinject01Aborted"),
-            "ErrorCode::WsReinject01Aborted must exist in crates/common"
-        );
-    }
-
-    /// Ratchet/regression (C3 review CRITICAL): at BOTH STAGE-C.2b boot
-    /// paths (fast boot + the `start_dhan_lane` slow-boot mirror) the
-    /// frame-channel consumer spawn (`run_tick_processor(`) MUST precede
-    /// its `reinject_wal_frames(` await in main.rs source order. If the
-    /// consumer is spawned AFTER the reinject await, any replay larger
-    /// than FRAME_CHANNEL_CAPACITY (131,072) fills the channel with
-    /// nobody draining, the next send stalls for the full 30s
-    /// WAL_REINJECT_SEND_TIMEOUT, and the run aborts NOT-clean — the WAL
-    /// never archives and the re-replay storm loop is NOT broken (the
-    /// original fix only helped the ≤capacity case that was never
-    /// broken). Anchors: `run_tick_processor(` (call-with-paren — the
-    /// `use …::run_tick_processor;` import at the top of main.rs does
-    /// NOT match) and `reinject_wal_frames(`; both occur exactly once
-    /// per boot path, in boot-path order (fast first, slow second), so
-    /// pairwise position comparison pins the per-site ordering.
-    #[test]
-    fn ratchet_tick_processor_spawns_before_reinject_await() {
-        let main_src = include_str!("main.rs");
-
-        let spawn_positions: Vec<usize> = main_src
-            .match_indices("run_tick_processor(")
-            .map(|(pos, _)| pos)
-            .collect();
-        let reinject_positions: Vec<usize> = main_src
-            .match_indices("reinject_wal_frames(")
-            .map(|(pos, _)| pos)
-            .collect();
-
-        assert_eq!(
-            spawn_positions.len(),
-            2,
-            "expected exactly 2 run_tick_processor( call sites in main.rs \
-             (fast boot + slow boot); found {} — update this ratchet's \
-             pairing logic if a boot path was added/removed",
-            spawn_positions.len()
-        );
-        assert_eq!(
-            reinject_positions.len(),
-            2,
-            "expected exactly 2 reinject_wal_frames( call sites in main.rs \
-             (fast boot + slow boot); found {}",
-            reinject_positions.len()
-        );
-
-        for (i, (spawn, reinject)) in spawn_positions
-            .iter()
-            .zip(reinject_positions.iter())
-            .enumerate()
-        {
-            assert!(
-                spawn < reinject,
-                "boot path #{i}: run_tick_processor( at byte {spawn} must \
-                 precede reinject_wal_frames( at byte {reinject} — the \
-                 consumer MUST be spawned before the WAL re-injection \
-                 awaits, or a >capacity replay deadlocks into the 30s \
-                 timeout abort and the WAL storm loop returns (C3 CRITICAL)"
-            );
-        }
-    }
+    // RETIRED (PR-C2, 2026-07-13 — Dhan live-WS lane deletion, operator
+    // retirement directive per websocket-connection-scope-lock.md
+    // "2026-07-13 Amendment" §B): ratchet_tick_processor_spawns_before_reinject_await died with the wiring it pinned —
+    // both STAGE-C.2b re-injection call sites (fast boot + start_dhan_lane)
+    // were deleted with the lane; main.rs now drains residual LiveFeed WAL
+    // frames loudly at boot (counted + confirm_replayed) because no Dhan
+    // frame channel / tick processor exists to re-inject into. The
+    // `reinject_wal_frames` helper is retained un-consumed pending the
+    // Phase C module cleanup.
 }

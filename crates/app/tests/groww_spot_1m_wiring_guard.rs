@@ -7,12 +7,12 @@
 //! 1. main.rs wraps the spawn in exactly ONE `spawn_groww_spot_1m_leg`
 //!    helper (the single `spawn_supervised_groww_spot_1m(` call site,
 //!    gated on `config.groww_spot_1m.enabled` — fail-safe: absent section
-//!    = off) and calls that helper from BOTH boot arms: once BEFORE the
-//!    fast crash-recovery arm's `return run_shutdown_fast` (a mid-market
-//!    crash restart must run the leg + its 15:31 sweep) and once in the
-//!    slow process-global prefix. Both call sites live OUTSIDE the
-//!    Dhan-gated `spawn_post_market_tasks` seam — a Dhan-off (Groww-only)
-//!    session must still run this leg.
+//!    = off) and calls that helper exactly once from the process-global
+//!    boot prefix. (PR-C2 re-shape, 2026-07-13: the original dual-site
+//!    fast-arm + slow-prefix pins and the Dhan-gated
+//!    `spawn_post_market_tasks` seam exclusion collapsed with the Dhan
+//!    live-WS lane deletion — main.rs has a single boot path and no
+//!    Dhan-gated spawning at all.)
 //! 2. Stub-guard: `groww_spot_1m_boot.rs` really does the work — hits the
 //!    Groww candles endpoint, reads the shared-minter token READ-ONLY,
 //!    drives the bounded ladder from the constant schedule, persists via
@@ -40,18 +40,21 @@ const SPAWN_CALL: &str = "spawn_supervised_groww_spot_1m(";
 const HELPER_NAME: &str = "spawn_groww_spot_1m_leg(";
 const HELPER_DEF: &str = "fn spawn_groww_spot_1m_leg(";
 const CONFIG_GATE: &str = "config.groww_spot_1m.enabled";
-const POST_MARKET_FN: &str = "fn spawn_post_market_tasks(";
-/// The STATEMENT form (leading newline + the fast-arm 8-space indent) —
-/// prose comments also mention `return run_shutdown_fast(...)`, so a bare
-/// needle would anchor on a comment far above the real exit.
-const FAST_RETURN: &str = "\n        return run_shutdown_fast(";
 
 #[test]
 fn ratchet_groww_spot1m_spawn_is_config_gated_and_dual_site() {
+    // PR-C2 re-shape (2026-07-13, operator retirement directive —
+    // websocket-connection-scope-lock.md "2026-07-13 Amendment"): the FAST
+    // crash-recovery boot arm and the Dhan-gated `spawn_post_market_tasks`
+    // seam were DELETED with the Dhan live-WS lane, so the original
+    // dual-site (fast arm + slow prefix) + seam-exclusion pins collapse to
+    // the single-boot-path shape: exactly ONE helper definition + exactly
+    // ONE helper call site in the process-global prefix, with the config
+    // gate inside the helper. The Dhan-independence contract survives by
+    // construction — main.rs performs no Dhan-gated spawning at all.
     let main_src = read_app_src("src/main.rs");
 
-    // Exactly ONE inner spawn call site — inside the shared helper, so the
-    // two boot-arm call sites can never drift apart in behaviour.
+    // Exactly ONE inner spawn call site — inside the shared helper.
     let spawn_positions: Vec<usize> = main_src
         .match_indices(SPAWN_CALL)
         .map(|(pos, _)| pos)
@@ -61,15 +64,13 @@ fn ratchet_groww_spot1m_spawn_is_config_gated_and_dual_site() {
         1,
         "expected exactly 1 `{SPAWN_CALL}` call site in main.rs (inside the \
          spawn_groww_spot_1m_leg helper); found {} — a second raw site \
-         would let the boot arms drift apart",
+         would double-spawn the leg",
         spawn_positions.len()
     );
     let spawn_pos = spawn_positions[0];
 
-    // Exactly one helper definition + exactly TWO helper CALL sites (the
-    // scoreboard dual-site pattern — hostile round 1 item 1): one on the
-    // FAST crash-recovery arm (before its `return run_shutdown_fast`) and
-    // one in the slow process-global prefix.
+    // Exactly one helper definition + exactly ONE helper CALL site (the
+    // single boot path since PR-C2).
     let def_positions: Vec<usize> = main_src
         .match_indices(HELPER_DEF)
         .map(|(pos, _)| pos)
@@ -89,57 +90,16 @@ fn ratchet_groww_spot1m_spawn_is_config_gated_and_dual_site() {
         .collect();
     assert_eq!(
         call_positions.len(),
-        2,
-        "expected exactly 2 `{HELPER_NAME}` call sites in main.rs (the FAST \
-         crash-recovery arm + the slow process-global prefix); found \
-         {call_positions:?} — losing either re-opens the mid-market \
-         crash-restart hole (no per-minute fetches, no 15:31 sweep)"
+        1,
+        "expected exactly 1 `{HELPER_NAME}` call site in main.rs (the single \
+         process-global boot path); found {call_positions:?} — losing it \
+         kills the per-minute fetches + the 15:31 sweep; a second site \
+         would double-spawn"
     );
-
-    // Position pin: the FIRST `return run_shutdown_fast(` in main.rs is the
-    // fast arm's exit. Exactly one helper call must precede it (the fast
-    // arm's own spawn) and one must follow it (the slow prefix's).
-    let fast_return_pos = main_src
-        .find(FAST_RETURN)
-        .expect("the fast crash-recovery arm's return must exist in main.rs");
-    let before = call_positions
-        .iter()
-        .filter(|pos| **pos < fast_return_pos)
-        .count();
-    let after = call_positions
-        .iter()
-        .filter(|pos| **pos > fast_return_pos)
-        .count();
-    assert_eq!(
-        (before, after),
-        (1, 1),
-        "expected 1 helper call BEFORE the fast arm's `{FAST_RETURN}` (at \
-         byte {fast_return_pos}) and 1 after (the slow prefix); got \
-         before={before}, after={after} at {call_positions:?}"
-    );
-
-    // Neither call site may live inside the Dhan-gated
-    // spawn_post_market_tasks seam: that seam's call sites are Dhan-gated,
-    // so nesting the Groww leg there would silently kill it on a
-    // Groww-only session.
-    let seam_pos = main_src
-        .find(POST_MARKET_FN)
-        .expect("spawn_post_market_tasks must exist in main.rs");
-    let seam_end = main_src[seam_pos + POST_MARKET_FN.len()..]
-        .find("\nfn ")
-        .map_or(main_src.len(), |off| seam_pos + POST_MARKET_FN.len() + off);
-    for pos in &call_positions {
-        assert!(
-            !(*pos > seam_pos && *pos < seam_end),
-            "the groww_spot_1m helper call at byte {pos} must NOT live \
-             inside the Dhan-gated spawn_post_market_tasks seam (fn spans \
-             bytes {seam_pos}..{seam_end}) — this leg is Dhan-independent"
-        );
-    }
 
     // The config gate lives INSIDE the helper, immediately before the
     // inner spawn (fail-safe: an absent [groww_spot_1m] section disables
-    // BOTH arms at once).
+    // the leg).
     let gate_positions: Vec<usize> = main_src
         .match_indices(CONFIG_GATE)
         .map(|(pos, _)| pos)

@@ -9,14 +9,16 @@
 # other time — including the 08:30 IST auto-start — auto-deploys the latest main.
 #
 # Five crons, all Mon–Fri:
-#   • 03:00 UTC = 08:30 IST → INSTANCE-START deploy. Fires the moment the box is
-#     scheduled to auto-start. deploy-aws SELF-STARTS a stopped box in the
-#     08:30-16:30 up-window (see "Ensure instance running" in deploy-aws.yml),
-#     so even if the 08:30 EventBridge instance-start silently fails, THIS cron
-#     still brings the box up + ships the latest main before 09:00 open. This is
-#     the belt-and-suspenders fix for the 2026-06-03 "box never auto-started"
-#     incident — it does not depend on the EC2 'running' event firing at all.
-#   • 03:15 UTC = 08:45 IST → PRE-MARKET backup, well before the 09:15 open.
+#   • 03:00 UTC = 08:30 IST + 03:15 UTC = 08:45 IST → HISTORICAL morning slots.
+#     SUPERSEDED by the PR-C3 prep-window suppression (2026-07-14): fired on
+#     time both land INSIDE the [08:15, 09:15) IST boot-critical band and are
+#     ALWAYS suppressed — they dispatch only when GitHub's scheduler delays
+#     them past 09:15 IST. Their pre-C3 roles (2026-06-03 "box never
+#     auto-started" belt-and-suspenders self-start + pre-market deploy of the
+#     latest main) are now owned by the box-start deploy-watchdog Lambda
+#     (scheduler-independent stale-binary catch + redeploy) and, for
+#     bot-merged (push-suppressed) commits, postmerge-catchup's overnight
+#     deploy-aws backfill.
 #   • 10:16 UTC = 15:46 IST → POST-MARKET window, just AFTER the 15:45 IST end of
 #     the no-deploy band (moved from 15:31 so it is no longer blocked by the
 #     guard). ~16 min after NSE close — redeploys anything merged during hours.
@@ -51,12 +53,32 @@
 #     HONEST ENVELOPE: cron redundancy REDUCES but cannot ELIMINATE GitHub
 #     scheduler risk — the scheduler is an external system and can drop any or
 #     all slots (as it did repo-wide on 2026-07-02). ⚠️
-#   - Merge over the weekend → auto-fires Monday 08:30 IST (instance-start) ✅
-#   - Merge before 08:30 IST on a weekday → auto-fires same day 08:30 IST ✅
-#   - Box failed to auto-start at 08:30 → the 08:30 cron self-starts it + deploys ✅
+#   - Merge over the weekend / before 08:30 IST on a weekday → the morning
+#     crons are prep-window-suppressed (PR-C3); the deploy lands via the
+#     deploy-watchdog Lambda at box start (it compares on-box provenance vs
+#     main HEAD and redeploys a stale binary) — or earlier via
+#     postmerge-catchup IF the merge was bot-made (push-suppressed, so no
+#     deploy-aws run exists for the HEAD; a HUMAN evening merge already has a
+#     green off-hours skip run, which postmerge-catchup deliberately counts
+#     as covered). ⚠️ latest-main-at-08:30-sharp is no longer promised.
+#   - Box failed to auto-start at 08:30 → deploy-aws runs dispatched OUTSIDE
+#     the prep window still self-start the box; inside the window the
+#     EventBridge start + deploy-watchdog own it.
 #   - NSE holiday: cron fires; deploy-aws's own market-hours guard is a no-op
 #     outside trading hours, so the deploy runs harmlessly on holiday windows.
 #   - No new commits → idempotent skip (no restart, no extra cost).
+#   - PR-C3 rider (2026-07-14): scheduled firings inside [08:15, 09:15) IST
+#     (the boot-critical prep band) suppress the DISPATCH — the 08:30/08:45
+#     IST crons no longer restart the app mid-prep. HONEST: fired on time
+#     those two crons land INSIDE the band and are ALWAYS suppressed — they
+#     dispatch only when the scheduler delays them past 09:15 IST (effectively
+#     inert otherwise); overnight deploy coverage is the box-start
+#     deploy-watchdog Lambda (all merges) + postmerge-catchup's deploy-aws
+#     backfill (bot merges — a human evening merge already has a green
+#     off-hours skip run, so the existence check counts it covered). Manual
+#     workflow_dispatch still overrides. ⚠️ envelope: this trades "latest
+#     main shipped at 08:30 sharp" for "no mid-prep restart"; a boot-critical
+#     fix merged 08:15-09:15 needs the operator's manual dispatch.
 # =============================================================================
 
 name: deploy-aws-after-close
@@ -94,8 +116,50 @@ jobs:
           fetch-depth: 1
           ref: main
 
+      # ── PRE-OPEN PREP-WINDOW SUPPRESSION (PR-C3 rider (b), 2026-07-14,
+      # coordinator-approved) ─────────────────────────────────────────────
+      # [08:15, 09:15) IST is the box's boot-critical prep band: the 08:30
+      # auto-start boot, the Groww watch build, the option-chain entitlement
+      # probe and the spot-1m warm-up all run in it. A deploy dispatched
+      # INSIDE the band restarts the app mid-prep — worse than deploying a
+      # few minutes later. This gate suppresses the DISPATCH only (the cron
+      # firing itself stays free): a merge landing in the band deploys via
+      # the next slot / the box-start deploy-watchdog Lambda (the
+      # scheduler-independent stale-binary catch; postmerge-catchup
+      # additionally covers BOT merges, whose push runs are suppressed —
+      # a human merge's green skip run counts as covered there). HONEST: the
+      # 03:00 UTC (08:30 IST) + 03:15 UTC (08:45 IST) morning crons fall
+      # INSIDE the band — fired on time they are ALWAYS suppressed and
+      # dispatch nothing; they act only when GitHub's scheduler DELAYS them
+      # past 03:45 UTC (09:15 IST), i.e. they are effectively inert unless
+      # scheduler-delayed. Overnight deploy coverage is postmerge-catchup's
+      # deploy-aws backfill; manual workflow_dispatch is NOT suppressed
+      # (operator override stays a real override).
+      - name: Pre-open prep-window gate (08:15-09:15 IST)
+        id: prepwindow
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "manual dispatch — prep-window gate bypassed (operator override)"
+            echo "suppressed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # IST = UTC+05:30 → [08:15, 09:15) IST = [02:45, 03:45) UTC.
+          # Single date read (no hour-boundary straddle between two calls);
+          # 10# forces base-10 so zero-padded "08"/"09" never parse as octal.
+          t=$(date -u +%H%M)
+          now_utc_mins=$(( 10#${t:0:2} * 60 + 10#${t:2} ))
+          if [ "$now_utc_mins" -ge 165 ] && [ "$now_utc_mins" -lt 225 ]; then
+            echo "::notice::inside the 08:15-09:15 IST boot-critical prep window — deploy dispatch suppressed (PR-C3 rider, 2026-07-14); the post-close crons / postmerge-catchup / deploy-watchdog cover this merge"
+            echo "suppressed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "outside the prep window — proceeding"
+            echo "suppressed=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Compare main HEAD vs last successful deploy
         id: check
+        if: steps.prepwindow.outputs.suppressed != 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -171,7 +235,9 @@ jobs:
           {
             echo "## Auto-deploy after market close"
             echo ""
-            if [ "${{ steps.check.outputs.dispatch }}" = "true" ]; then
+            if [ "${{ steps.prepwindow.outputs.suppressed }}" = "true" ]; then
+              echo "⏸️  Inside the 08:15-09:15 IST prep window — dispatch suppressed (PR-C3 rider, 2026-07-14)."
+            elif [ "${{ steps.check.outputs.dispatch }}" = "true" ]; then
               echo "✅ Dispatched \`deploy-aws.yml\` on \`main\` — operator sees green/red on the deploy-aws run."
             else
               echo "ℹ️  \`main\` is already deployed — no action taken (idempotent)."

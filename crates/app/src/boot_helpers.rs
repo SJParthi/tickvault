@@ -470,73 +470,21 @@ pub fn spawn_heartbeat_watchdog(
 //     compound dedup key (`STORAGE-GAP-01`) makes the drain idempotent —
 //     replaying the same WAL N times yields one row per logical record.
 //
-//   - OrderUpdate → the live `broadcast::Sender<OrderUpdate>` (available
-//     at line 1073/2705). Each recovered JSON frame is reparsed via
-//     `parse_order_update` and broadcast. If there are no subscribers
-//     yet the broadcast is a no-op — the raw JSON is still preserved in
-//     the WAL archive directory for forensic replay.
+//   - OrderUpdate → RETIRED in PR-C3 (2026-07-14).
+//     `drain_replayed_order_updates_to_broadcast` drained recovered JSON
+//     frames into the process-shared order-update broadcast — but after
+//     the 2026-07-14 Dhan noise lock (#1532) retired the order-update WS
+//     spawn AND the trading pipeline has zero spawn sites
+//     (order_side_wiring_guard), that broadcast was PERMANENTLY
+//     receiver-less: every send() returned Err and the drain was delivery
+//     theater. The helper (and the broadcast channel itself) were deleted;
+//     residual OrderUpdate WAL frames are now counted loudly
+//     (tv_ws_frame_wal_reinjected_dropped_total{ws_type="order_update"})
+//     and archived at STAGE-C.2b in main.rs — the raw JSON stays on disk
+//     in the WAL archive for the live-trading re-wire.
 //
-// All three helpers run once at boot and never block the critical path
-// beyond their own duration. They return counters for the caller to emit
-// Prometheus metrics.
-
-/// Drains recovered order-update JSON frames into the live broadcast
-/// channel. Runs once at boot, right after `order_update_sender` is
-/// created and before the live order-update WebSocket starts.
-///
-/// Returns `(parsed, broadcast_count, parse_errors)`. Broadcast count
-/// reflects successful `send()` calls; it may be zero if there are no
-/// subscribers yet — that is expected and non-fatal, because the raw
-/// JSON is already durable in the WAL archive for forensic replay.
-pub fn drain_replayed_order_updates_to_broadcast(
-    frames: Vec<Vec<u8>>,
-    sender: &tokio::sync::broadcast::Sender<tickvault_common::order_types::OrderUpdate>,
-) -> (u64, u64, u64) {
-    let mut parsed = 0u64;
-    let mut broadcast_count = 0u64;
-    let mut parse_errors = 0u64;
-
-    for frame in frames {
-        let text = match std::str::from_utf8(&frame) {
-            Ok(s) => s,
-            Err(err) => {
-                tracing::warn!(
-                    ?err,
-                    "STAGE-C.2b: order-update replay drain — frame is not valid UTF-8; skipping"
-                );
-                parse_errors += 1;
-                continue;
-            }
-        };
-
-        match tickvault_core::parser::order_update::parse_order_update(text) {
-            Ok(update) => {
-                parsed += 1;
-                // `send()` returns the number of subscribers that received
-                // the message. Zero subscribers is NOT an error during
-                // boot drain — live consumers attach seconds later. The
-                // raw JSON is already durable in the archive, so there
-                // is no data loss even if no one consumes the broadcast.
-                match sender.send(update) {
-                    Ok(_) => broadcast_count += 1,
-                    Err(_) => {
-                        // No receivers yet — not an error; frame remains in WAL archive.
-                    }
-                }
-            }
-            Err(err) => {
-                parse_errors += 1;
-                tracing::warn!(
-                    ?err,
-                    text_len = text.len(),
-                    "STAGE-C.2b: order-update replay drain — parse error; skipping"
-                );
-            }
-        }
-    }
-
-    (parsed, broadcast_count, parse_errors)
-}
+// The helpers run once at boot and never block the critical path
+// beyond their own duration.
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -1688,55 +1636,11 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // STAGE-C.2b: WAL replay drain helpers
+    // STAGE-C.2b: WAL replay drain helpers — the two
+    // drain_replayed_order_updates_to_broadcast tests were deleted in
+    // PR-C3 (2026-07-14) with the helper (permanently receiver-less
+    // broadcast — see the module doc block above).
     // -----------------------------------------------------------------------
-
-    /// The order-update drain helper parses a valid JSON frame and
-    /// broadcasts it to the live `tokio::sync::broadcast::Sender`. A
-    /// subscriber created before the drain must receive the replayed
-    /// update. Unit-testable with no I/O.
-    #[tokio::test]
-    async fn test_drain_replayed_order_updates_to_broadcast_parses_and_broadcasts() {
-        let (sender, mut receiver) =
-            tokio::sync::broadcast::channel::<tickvault_common::order_types::OrderUpdate>(16);
-
-        // Minimal Dhan order-update JSON — only `OrderNo` and `Status`
-        // are required by the serde deserializer; every other field
-        // uses `#[serde(default)]`. Matches the canonical minimal
-        // example in `crates/core/src/parser/order_update.rs`
-        // (`test_parse_order_update_minimal`).
-        let json = r#"{"Data": {"OrderNo": "ORD-TEST-001", "Status": "PENDING"}}"#;
-
-        let frames = vec![json.as_bytes().to_vec()];
-        let (parsed, broadcast_count, parse_errors) =
-            drain_replayed_order_updates_to_broadcast(frames, &sender);
-
-        assert_eq!(parsed, 1, "one valid frame must parse");
-        assert_eq!(
-            broadcast_count, 1,
-            "one subscriber attached before drain must receive broadcast"
-        );
-        assert_eq!(parse_errors, 0);
-
-        // The subscriber receives the replayed update synchronously in
-        // the test runtime.
-        let received = receiver.try_recv().expect("subscriber must receive update");
-        assert_eq!(received.order_no, "ORD-TEST-001");
-    }
-
-    /// Invalid JSON must be counted as a parse error and must NOT
-    /// broadcast. Good frames in the same batch still parse.
-    #[tokio::test]
-    async fn test_drain_replayed_order_updates_to_broadcast_skips_invalid_json() {
-        let (sender, _receiver) =
-            tokio::sync::broadcast::channel::<tickvault_common::order_types::OrderUpdate>(16);
-        let frames = vec![b"not-json".to_vec(), b"{\"incomplete\":".to_vec()];
-        let (parsed, broadcast_count, parse_errors) =
-            drain_replayed_order_updates_to_broadcast(frames, &sender);
-        assert_eq!(parsed, 0);
-        assert_eq!(broadcast_count, 0);
-        assert_eq!(parse_errors, 2);
-    }
 
     // -----------------------------------------------------------------------
     // should_emit_post_market_alert — Saturday/holiday gate

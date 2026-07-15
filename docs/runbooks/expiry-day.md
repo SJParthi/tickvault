@@ -64,9 +64,11 @@ branch of the planner.
 1. **Boot-time stock F&O subscribe** (Phase 1 before 09:00 IST)
 2. **09:13 IST Phase 2 dispatch** (with finalized 09:12 close prices)
 
-**Implementation pointers:**
-- Helper: `subscription_planner::select_stock_expiry_with_rollover`
-  (crates/core/src/instrument/subscription_planner.rs)
+**Implementation pointers (RETIRED — PR-C3 2026-07-14):**
+- Helper: `subscription_planner::select_stock_expiry_with_rollover` — the
+  planner module was DELETED with the Dhan instrument chain (operator
+  retirement directive 2026-07-13; no stock F&O subscription exists to
+  roll). Retained here as the historical record of the rollover rule.
 - Threshold constant: `STOCK_EXPIRY_ROLLOVER_TRADING_DAYS = 0` (was 1
   until 2026-04-28)
 - Trading-day math: `TradingCalendar::count_trading_days(from, to)`

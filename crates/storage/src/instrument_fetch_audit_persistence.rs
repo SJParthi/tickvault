@@ -93,8 +93,6 @@
 //! * `ErrorCode::InstrFetch01..04` — failure classes routed through
 //!   the matching `FetchOutcome::*` SYMBOL value.
 
-#![cfg(feature = "daily_universe_fetcher")]
-
 use std::time::Duration;
 
 use reqwest::Client;
