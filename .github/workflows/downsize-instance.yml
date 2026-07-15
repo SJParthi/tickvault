@@ -455,6 +455,9 @@ jobs:
       # both params (--with-decryption, deploy-aws.yml parity incl. the admin/quest
       # fallbacks) and run a `docker compose config -q` interpolation PREFLIGHT
       # before the recreate, so a creds/compose problem fails loudly and named.
+      # The creds are `export`ed once and INHERITED by the compose subshells
+      # (the aws-upgrade-instance.sh export-then-plain-compose pattern) — never
+      # re-assigned inline on the compose lines.
       # READINESS BOUND: the deploy lane expects systemd READY=1 within 180s of boot;
       # the 300s is-active loop below (60 x 5s) brackets that with margin — if the box
       # cannot go active well inside 180s on t4g.medium, that is itself a too-tight-
@@ -475,8 +478,8 @@ jobs:
               "chown ec2-user:ec2-user repo/deploy/docker/.env",
               "export TV_QUESTDB_PG_USER=$(aws ssm get-parameter --region ap-south-1 --name /tickvault/prod/questdb/pg-user --with-decryption --output text --query Parameter.Value 2>/dev/null || echo admin)",
               "export TV_QUESTDB_PG_PASSWORD=$(aws ssm get-parameter --region ap-south-1 --name /tickvault/prod/questdb/pg-password --with-decryption --output text --query Parameter.Value 2>/dev/null || echo quest)",
-              "(cd repo/deploy/docker && TV_QUESTDB_PG_USER=\"$TV_QUESTDB_PG_USER\" TV_QUESTDB_PG_PASSWORD=\"$TV_QUESTDB_PG_PASSWORD\" docker compose config -q) || { echo FATAL: compose interpolation preflight failed - QuestDB PG creds missing or compose file invalid; exit 1; }",
-              "(cd repo/deploy/docker && TV_QUESTDB_PG_USER=\"$TV_QUESTDB_PG_USER\" TV_QUESTDB_PG_PASSWORD=\"$TV_QUESTDB_PG_PASSWORD\" timeout 600 docker compose up -d --no-deps tv-questdb)",
+              "(cd repo/deploy/docker && docker compose config -q) || { echo FATAL: compose interpolation preflight failed - QuestDB PG creds missing or compose file invalid; exit 1; }",
+              "(cd repo/deploy/docker && timeout 600 docker compose up -d --no-deps tv-questdb)",
               "for i in 1 2 3 4 5 6; do if curl -fsS \"http://127.0.0.1:9000/exec?query=SELECT%201\" >/dev/null 2>&1; then echo QUESTDB-UP; break; fi; sleep 5; if [ $i -eq 6 ]; then echo FATAL: QuestDB not responding after retune; exit 1; fi; done",
               "QDB_LIMIT_BYTES=$(docker inspect tv-questdb --format \"{{.HostConfig.Memory}}\")",
               "echo MEMLIMIT=$QDB_LIMIT_BYTES",
