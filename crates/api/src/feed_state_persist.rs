@@ -234,9 +234,9 @@ pub fn load_feed_state(path: &Path) -> Option<PersistedFeedState> {
 /// directly unit-testable.
 ///
 /// - `None` (no/corrupt overlay) → the config default is returned unchanged.
-/// - `Some(p)` → the persisted GROWW flag wins (both directions, unchanged);
-///   the persisted DHAN flag can only ever NARROW the config, never WIDEN it:
-///   effective dhan = `config.dhan_enabled && p.dhan_enabled`.
+/// - `Some(p)` → BOTH persisted flags can only ever NARROW the config, never
+///   WIDEN it: effective dhan = `config.dhan_enabled && p.dhan_enabled`,
+///   effective groww = `config.groww_enabled && p.groww_enabled`.
 ///
 /// **Why the Dhan AND-gate (operator directive 2026-07-13):** the Dhan live
 /// WS feed was removed from the runtime ("now remove this entire Dhan live
@@ -247,23 +247,33 @@ pub fn load_feed_state(path: &Path) -> Option<PersistedFeedState> {
 /// resurrect the retired lane over the operator-locked config. Use
 /// [`dhan_overlay_suppressed`] at the application site to log the
 /// suppression (this fn stays pure).
+///
+/// **Why the Groww AND-gate (operator directive 2026-07-15):** the Groww
+/// LIVE feed was retired the same way ("remove the whole Groww live feed;
+/// keep only spot 1m and option chain for both brokers") — the prod box's
+/// stale `data/feed-state.json` (written while Groww WAS the live feed,
+/// `groww_enabled: true`) must not resurrect the retired feed over the
+/// production.toml flip (the boot-heartbeat false-page class). Persisted
+/// can only DISABLE, never re-enable a retired feed. Use
+/// [`groww_overlay_suppressed`] at the application site to log the
+/// suppression (this fn stays pure).
 #[must_use]
 pub fn overlay_feeds(config: FeedsConfig, persisted: Option<PersistedFeedState>) -> FeedsConfig {
     match persisted {
         None => config,
-        // The persisted overlay carries ONLY the runtime toggles; the
-        // `[feeds.groww]` tuning (auto-scale §34) always comes from config.
+        // The persisted overlay carries ONLY the runtime toggles.
         Some(p) => FeedsConfig {
             // 2026-07-13: narrow-only for Dhan — config-off wins over any
             // persisted-on (the retired live WS lane can never be
             // overlay-resurrected); config-on + persisted-off still honors
             // the operator's last disable (pre-Phase-A behaviour).
             dhan_enabled: config.dhan_enabled && p.dhan_enabled,
-            groww_enabled: p.groww_enabled,
-            groww: config.groww,
-            // PR-R1 (2026-07-04): the native-shadow flag is CONFIG-ONLY (no
-            // runtime toggle in R1) — always from config, never persisted.
-            groww_native_shadow: config.groww_native_shadow,
+            // 2026-07-15: narrow-only for Groww too — the live feed is
+            // retired (both brokers REST-only for market data); a stale
+            // persisted `groww_enabled: true` can never re-enable it over
+            // config-off. Persisted-off still honors the operator's last
+            // disable on a config-on boot.
+            groww_enabled: config.groww_enabled && p.groww_enabled,
         },
     }
 }
@@ -279,6 +289,20 @@ pub fn dhan_overlay_suppressed(
     persisted: Option<&PersistedFeedState>,
 ) -> bool {
     matches!(persisted, Some(p) if p.dhan_enabled && !config.dhan_enabled)
+}
+
+/// True when [`overlay_feeds`] would SUPPRESS a widening GROWW overlay —
+/// i.e. the persisted `data/feed-state.json` says `groww_enabled: true`
+/// while the config says `false`. Pure companion predicate (mirror of
+/// [`dhan_overlay_suppressed`]) so the boot site can log ONE `warn!`
+/// naming the 2026-07-15 Groww live-feed retirement without this module
+/// doing any I/O or logging.
+#[must_use]
+pub fn groww_overlay_suppressed(
+    config: &FeedsConfig,
+    persisted: Option<&PersistedFeedState>,
+) -> bool {
+    matches!(persisted, Some(p) if p.groww_enabled && !config.groww_enabled)
 }
 
 #[cfg(test)]
@@ -429,11 +453,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The boot overlay-read: a persisted choice OVERRIDES the config default.
+    /// The boot overlay-read: a persisted choice can only NARROW the config
+    /// (2026-07-15 — both live feeds are retired; the overlay never widens).
     #[test]
-    fn test_boot_overlay_read_overrides_config() {
+    fn test_boot_overlay_read_narrows_config() {
         // config says dhan ON / groww OFF; the persisted overlay says the
-        // opposite — the persisted choice must win.
+        // opposite — the narrow (dhan-off) sticks, the widen (groww-on) is
+        // suppressed by the 2026-07-15 Groww AND-gate.
         let config = FeedsConfig {
             dhan_enabled: true,
             groww_enabled: false,
@@ -445,8 +471,12 @@ mod tests {
             updated_at_ist: "2026-06-26 14:31:07".to_string(),
         });
         let effective = overlay_feeds(config, persisted);
-        assert!(!effective.dhan_enabled, "persisted dhan-off wins");
-        assert!(effective.groww_enabled, "persisted groww-on wins");
+        assert!(!effective.dhan_enabled, "persisted dhan-off narrows");
+        assert!(
+            !effective.groww_enabled,
+            "stale persisted groww-on must NOT widen a config-off Groww \
+             (2026-07-15: the Groww live feed is retired)"
+        );
     }
 
     /// No overlay → the config default is returned unchanged.
@@ -510,10 +540,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// `overlay_feeds` lets a persisted choice win and is identity for `None`
-    /// (named so the pub-fn-test-guard maps it directly to `overlay_feeds`).
+    /// `overlay_feeds` is narrow-only for BOTH feeds (2026-07-15) and is
+    /// identity for `None` (named so the pub-fn-test-guard maps it directly
+    /// to `overlay_feeds`).
     #[test]
-    fn test_overlay_feeds_persisted_wins_and_none_is_identity() {
+    fn test_overlay_feeds_narrows_only_and_none_is_identity() {
         let cfg = FeedsConfig {
             dhan_enabled: true,
             groww_enabled: false,
@@ -530,7 +561,8 @@ mod tests {
                 updated_at_ist: String::new(),
             }),
         );
-        assert!(!eff.dhan_enabled && eff.groww_enabled);
+        // dhan: persisted-off narrows; groww: persisted-on cannot widen.
+        assert!(!eff.dhan_enabled && !eff.groww_enabled);
     }
 
     /// A path that fails validation is rejected on BOTH read and write.
@@ -619,12 +651,14 @@ mod tests {
         );
     }
 
-    /// Groww overlay semantics are UNCHANGED by the 2026-07-13 Dhan
-    /// AND-gate: the persisted Groww choice wins in BOTH directions
-    /// (widen and narrow).
+    /// 2026-07-15 operator directive ("remove the whole Groww live feed;
+    /// keep only spot 1m and option chain for both brokers"): a STALE
+    /// overlay written while Groww WAS the live feed (`groww_enabled:
+    /// true`) must NOT widen a config-off Groww — the exact Dhan
+    /// 2026-07-13 AND-gate, mirrored. Effective groww = config && persisted.
     #[test]
-    fn test_overlay_feeds_groww_semantics_unchanged() {
-        // Widen: config groww-off + persisted groww-on → ON.
+    fn test_overlay_feeds_groww_and_gate_suppresses_stale_widen() {
+        // Widen: config groww-off + persisted groww-on → stays OFF.
         let widened = overlay_feeds(
             FeedsConfig {
                 dhan_enabled: false,
@@ -633,11 +667,15 @@ mod tests {
             },
             Some(PersistedFeedState {
                 dhan_enabled: false,
-                groww_enabled: true,
-                updated_at_ist: String::new(),
+                groww_enabled: true, // stale pre-retirement webpage toggle
+                updated_at_ist: "2026-07-14 15:00:00".to_string(),
             }),
         );
-        assert!(widened.groww_enabled, "persisted groww-on must still widen");
+        assert!(
+            !widened.groww_enabled,
+            "config groww-off must win over a stale persisted groww-on \
+             (2026-07-15 directive: the Groww live feed is retired)"
+        );
         // Narrow: config groww-on + persisted groww-off → OFF.
         let narrowed = overlay_feeds(
             FeedsConfig {
@@ -687,5 +725,38 @@ mod tests {
         assert!(!dhan_overlay_suppressed(&cfg_on, p(true).as_ref()));
         assert!(!dhan_overlay_suppressed(&cfg_on, p(false).as_ref()));
         assert!(!dhan_overlay_suppressed(&cfg_off, None));
+    }
+
+    /// `groww_overlay_suppressed` fires ONLY on the widening combination
+    /// (config off + persisted on) — the one the 2026-07-15 Groww AND-gate
+    /// suppresses — so the boot warn can never false-fire (mirror of the
+    /// Dhan predicate test).
+    #[test]
+    fn test_groww_overlay_suppressed_predicate() {
+        let cfg_off = FeedsConfig {
+            dhan_enabled: false,
+            groww_enabled: false,
+            ..Default::default()
+        };
+        let cfg_on = FeedsConfig {
+            dhan_enabled: false,
+            groww_enabled: true,
+            ..Default::default()
+        };
+        let p = |groww: bool| {
+            Some(PersistedFeedState {
+                dhan_enabled: false,
+                groww_enabled: groww,
+                updated_at_ist: String::new(),
+            })
+        };
+        assert!(
+            groww_overlay_suppressed(&cfg_off, p(true).as_ref()),
+            "config off + persisted on = suppressed (warn fires)"
+        );
+        assert!(!groww_overlay_suppressed(&cfg_off, p(false).as_ref()));
+        assert!(!groww_overlay_suppressed(&cfg_on, p(true).as_ref()));
+        assert!(!groww_overlay_suppressed(&cfg_on, p(false).as_ref()));
+        assert!(!groww_overlay_suppressed(&cfg_off, None));
     }
 }

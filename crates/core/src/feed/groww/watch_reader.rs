@@ -9,18 +9,9 @@
 //!
 //! Output: the NATS subject → tick identity map the read loop uses per MSG
 //! (identity is NOT in the tick payload — it comes from the subject, per the
-//! wheel's design; see `crate::feed::groww::subjects`).
-
-use std::collections::HashMap;
+//! wheel's design).
 
 use serde::Deserialize;
-use tickvault_common::types::ExchangeSegment;
-
-use crate::feed::groww::subjects;
-
-/// Canonical segment strings (the bridge contract — mirrors the sidecar's
-/// `SEGMENT_MAP` + `CANONICAL_INDEX_SEGMENT`).
-pub const SEGMENT_IDX: &str = "IDX_I";
 
 /// A watch-file entry as READ (the writer-side struct in `instruments.rs`
 /// carries extra optional provenance fields we ignore here).
@@ -70,31 +61,18 @@ pub struct WatchFileDoc {
     pub entries: Vec<WatchFileEntry>,
 }
 
-/// The identity a delivered MSG maps to. `Copy` — hot-path lookup value.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct TickIdentity {
-    /// The `security_id` the NDJSON line carries.
-    pub security_id: i64,
-    /// Canonical segment string (`NSE_EQ` / `NSE_FNO` / `BSE_EQ` / `BSE_FNO`
-    /// / `IDX_I`) — `&'static str` so the hot path never allocates.
-    pub segment: &'static str,
-}
-
 /// Why the watch file could not be used. Fail-closed: any problem means the
 /// shadow client does NOT subscribe a guessed universe.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WatchReadError {
     /// The JSON did not parse into the documented shape.
     Malformed(String),
-    /// The file parsed but produced zero usable subjects.
-    EmptySubjects,
 }
 
 impl core::fmt::Display for WatchReadError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::Malformed(e) => write!(f, "groww watch file: malformed: {e}"),
-            Self::EmptySubjects => f.write_str("groww watch file: zero usable subjects"),
         }
     }
 }
@@ -104,81 +82,6 @@ impl std::error::Error for WatchReadError {}
 /// Parse the watch-file JSON. Pure.
 pub fn parse_watch_file(json: &str) -> Result<WatchFileDoc, WatchReadError> {
     serde_json::from_str(json).map_err(|e| WatchReadError::Malformed(e.to_string()))
-}
-
-/// Map a stock/F&O entry's `(exchange, segment)` to our typed segment.
-/// Mirrors the sidecar's `SEGMENT_MAP`. `None` = unknown combination
-/// (skipped + counted by the caller, never a panic).
-#[must_use]
-pub fn stock_segment(exchange: &str, segment: &str) -> Option<ExchangeSegment> {
-    match (exchange, segment) {
-        ("NSE", "CASH") => Some(ExchangeSegment::NseEquity),
-        ("NSE", "FNO") => Some(ExchangeSegment::NseFno),
-        ("BSE", "CASH") => Some(ExchangeSegment::BseEquity),
-        ("BSE", "FNO") => Some(ExchangeSegment::BseFno),
-        _ => None,
-    }
-}
-
-/// Canonical NDJSON segment string for a stock segment.
-#[must_use]
-pub const fn canonical_segment_str(segment: ExchangeSegment) -> &'static str {
-    match segment {
-        ExchangeSegment::NseEquity => "NSE_EQ",
-        ExchangeSegment::NseFno => "NSE_FNO",
-        ExchangeSegment::BseEquity => "BSE_EQ",
-        ExchangeSegment::BseFno => "BSE_FNO",
-        _ => SEGMENT_IDX,
-    }
-}
-
-/// Build the subject → identity map (and the subject list to `SUB`).
-///
-/// Cold path (once per connect). Unknown exchange/segment combinations are
-/// skipped and counted in the returned `skipped`; duplicate subjects keep the
-/// FIRST entry (deterministic) and count as skipped.
-pub fn build_subject_map(
-    doc: &WatchFileDoc,
-) -> Result<(HashMap<String, TickIdentity>, usize), WatchReadError> {
-    let mut map: HashMap<String, TickIdentity> = HashMap::with_capacity(doc.entries.len());
-    let mut skipped = 0usize;
-    for entry in &doc.entries {
-        let subject = match entry.kind {
-            WatchFileKind::Ltp => match stock_segment(&entry.exchange, &entry.segment) {
-                Some(seg) => match subjects::live_price_subject(seg, &entry.exchange_token) {
-                    Some(subject) => (subject, canonical_segment_str(seg)),
-                    None => {
-                        skipped += 1;
-                        continue;
-                    }
-                },
-                None => {
-                    skipped += 1;
-                    continue;
-                }
-            },
-            WatchFileKind::IndexValue => (
-                subjects::index_value_subject(entry.exchange == "BSE", &entry.exchange_token),
-                SEGMENT_IDX,
-            ),
-        };
-        let (subject, segment) = subject;
-        if map.contains_key(&subject) {
-            skipped += 1;
-            continue;
-        }
-        map.insert(
-            subject,
-            TickIdentity {
-                security_id: entry.security_id,
-                segment,
-            },
-        );
-    }
-    if map.is_empty() {
-        return Err(WatchReadError::EmptySubjects);
-    }
-    Ok((map, skipped))
 }
 
 #[cfg(test)]
@@ -201,10 +104,11 @@ mod tests {
         ]
     }"#;
 
-    /// The reader parses the writer's exact contract (field names + snake_case
-    /// kind) and builds the subject map with the wheel-verified prefixes.
+    /// The reader parses the writer's exact contract (field names +
+    /// snake_case kind). (The NATS subject-map builder was retired
+    /// 2026-07-15 with the Groww live feed.)
     #[test]
-    fn test_parse_watch_file_and_build_subject_map() {
+    fn test_parse_watch_file_contract() {
         let doc = parse_watch_file(SAMPLE).expect("sample parses");
         assert_eq!(doc.trading_date_ist, "2026-07-04");
         assert_eq!(doc.entries.len(), 3);
@@ -213,29 +117,14 @@ mod tests {
         assert_eq!(doc.entries[2].index_name, None);
         assert_eq!(doc.entries[2].symbol_name, None);
 
-        let (map, skipped) = build_subject_map(&doc).expect("map builds");
-        assert_eq!(skipped, 0);
-        assert_eq!(
-            map.get("/ld/eq/nse/price.2885"),
-            Some(&TickIdentity {
-                security_id: 2885,
-                segment: "NSE_EQ"
-            })
-        );
-        assert_eq!(
-            map.get("/ld/eq/bse/price.500325"),
-            Some(&TickIdentity {
-                security_id: 500325,
-                segment: "BSE_EQ"
-            })
-        );
-        assert_eq!(
-            map.get("/ld/indices/nse/price.NIFTY"),
-            Some(&TickIdentity {
-                security_id: 4611686018427387917,
-                segment: "IDX_I"
-            })
-        );
+        assert_eq!(doc.entries[0].security_id, 2885);
+        assert_eq!(doc.entries[0].kind, WatchFileKind::Ltp);
+        assert_eq!(doc.entries[0].exchange, "NSE");
+        assert_eq!(doc.entries[1].security_id, 500325);
+        assert_eq!(doc.entries[1].exchange, "BSE");
+        assert_eq!(doc.entries[2].kind, WatchFileKind::IndexValue);
+        assert_eq!(doc.entries[2].security_id, 4_611_686_018_427_387_917);
+        assert_eq!(doc.entries[2].exchange_token, "NIFTY");
     }
 
     /// Round-trip against the REAL writer: serialize a watch set with the
@@ -286,16 +175,11 @@ mod tests {
         assert_eq!(doc.entries[0].symbol_name.as_deref(), Some("TEST"));
         assert_eq!(doc.entries[1].index_name.as_deref(), Some("BSE-SENSEX"));
         assert_eq!(doc.entries[1].symbol_name, None);
-        let (map, skipped) = build_subject_map(&doc).expect("map builds");
-        assert_eq!(skipped, 0);
-        assert!(map.contains_key("/ld/eq/nse/price.1234"));
-        assert_eq!(
-            map.get("/ld/indices/bse/price.1"),
-            Some(&TickIdentity {
-                security_id: 51,
-                segment: "IDX_I"
-            })
-        );
+        assert_eq!(doc.entries.len(), 2);
+        assert_eq!(doc.entries[0].exchange_token, "1234");
+        assert_eq!(doc.entries[0].kind, WatchFileKind::Ltp);
+        assert_eq!(doc.entries[1].kind, WatchFileKind::IndexValue);
+        assert_eq!(doc.entries[1].security_id, 51);
     }
 
     /// §36 (2026-07-08): an FNO index-future entry round-trips through the
@@ -358,50 +242,12 @@ mod tests {
             "FNO entry carries the provenance expiry"
         );
         let doc = parse_watch_file(&json).expect("writer output parses");
-        let (map, skipped) = build_subject_map(&doc).expect("map builds");
-        assert_eq!(skipped, 0);
-        assert_eq!(
-            map.get("/ld/fo/nse/price.61001"),
-            Some(&TickIdentity {
-                security_id: 61001,
-                segment: "NSE_FNO"
-            })
-        );
-        assert_eq!(
-            map.get("/ld/fo/bse/price.71001"),
-            Some(&TickIdentity {
-                security_id: 71001,
-                segment: "BSE_FNO"
-            })
-        );
-    }
-
-    /// Unknown segment combos + duplicate subjects are skipped-and-counted,
-    /// never a panic; an all-skipped file fails closed.
-    #[test]
-    fn test_watch_file_skips_unknown_and_duplicates() {
-        let doc = parse_watch_file(
-            r#"{
-            "trading_date_ist": "2026-07-04",
-            "entries": [
-                {"exchange": "MCX", "segment": "COMM", "exchange_token": "9",
-                 "kind": "ltp", "security_id": 9},
-                {"exchange": "NSE", "segment": "CASH", "exchange_token": "7",
-                 "kind": "ltp", "security_id": 7},
-                {"exchange": "NSE", "segment": "CASH", "exchange_token": "7",
-                 "kind": "ltp", "security_id": 8}
-            ]
-        }"#,
-        )
-        .expect("parses");
-        let (map, skipped) = build_subject_map(&doc).expect("one usable subject");
-        assert_eq!(map.len(), 1);
-        assert_eq!(skipped, 2);
-        // The FIRST entry for a duplicate subject wins (deterministic).
-        assert_eq!(
-            map.get("/ld/eq/nse/price.7").map(|i| i.security_id),
-            Some(7)
-        );
+        assert_eq!(doc.entries.len(), 3);
+        assert_eq!(doc.entries[0].segment, "FNO");
+        assert_eq!(doc.entries[0].security_id, 61001);
+        assert_eq!(doc.entries[1].exchange, "BSE");
+        assert_eq!(doc.entries[1].security_id, 71001);
+        assert_eq!(doc.entries[2].segment, "CASH");
     }
 
     #[test]
@@ -412,21 +258,9 @@ mod tests {
         ));
         let doc = parse_watch_file(r#"{"trading_date_ist": "2026-07-04", "entries": []}"#)
             .expect("parses");
-        assert_eq!(build_subject_map(&doc), Err(WatchReadError::EmptySubjects));
-    }
-
-    #[test]
-    fn test_stock_segment_mapping_matches_sidecar_segment_map() {
-        assert_eq!(
-            stock_segment("NSE", "CASH"),
-            Some(ExchangeSegment::NseEquity)
+        assert!(
+            doc.entries.is_empty(),
+            "empty entries parse to an empty doc"
         );
-        assert_eq!(stock_segment("NSE", "FNO"), Some(ExchangeSegment::NseFno));
-        assert_eq!(
-            stock_segment("BSE", "CASH"),
-            Some(ExchangeSegment::BseEquity)
-        );
-        assert_eq!(stock_segment("BSE", "FNO"), Some(ExchangeSegment::BseFno));
-        assert_eq!(stock_segment("MCX", "COMM"), None);
     }
 }

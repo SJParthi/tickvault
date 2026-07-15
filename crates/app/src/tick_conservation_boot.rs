@@ -719,8 +719,9 @@ pub async fn run_groww_tick_conservation_audit(
         delivery_residual,
         outcome = outcome.as_str(),
         partial_coverage,
-        "groww tick conservation: reconciled sidecar NDJSON delivered-count vs \
-         persisted feed='groww' ticks (feed='groww' row in tick_conservation_audit)"
+        "groww tick conservation: reconciled capture NDJSON delivered-count vs \
+         persisted feed='groww' ticks (DORMANT since 2026-07-15 — the live-feed \
+         capture producer was deleted; row lands in tick_conservation_audit)"
     );
 
     // 5. Forensic row (fail-soft).

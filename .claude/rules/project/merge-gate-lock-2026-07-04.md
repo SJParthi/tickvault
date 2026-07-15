@@ -44,7 +44,7 @@
 | 5 | Mutation PR trigger REMOVED — scheduled weekly full sweep + push-scoped runs remain; mutation stays a hard-fail gate on the SCHEDULED lane | `mutation.yml` |
 | 6 | `Repo Guards` job runs the self-contained source-scan hooks server-side (banned-pattern, data-integrity, O(1)/dedup, boot-symmetry) on every PR + push — closing the `--no-verify` bypass class. Ratchet-baseline guards (test-count, pub-fn-test, financial) stay local-only: their baselines are gitignored, so a CI run would establish a fresh baseline and pass vacuously (false-OK, audit Rule 11) | `ci.yml` `repo-guards` |
 | 7 | Weekly full-tree secret scan (every tracked scan-relevant file, not just diffs) | `secret-scan.yml` `secret-scan-full-tree` |
-| 8 | Groww QuestDB E2E gains a path-filtered PR lane (same paths as its push lane) | `groww-e2e.yml` |
+| 8 | Groww QuestDB E2E gains a path-filtered PR lane (same paths as its push lane) — **RETIRED 2026-07-15 with the Groww live feed** (operator directive, this PR's dated note below): its sole target `groww_live_pipeline_e2e.rs` was deleted, so the lane would hard-fail every triggering PR; `groww-e2e.yml` removed, retirement pinned by `crates/storage/tests/coverage_claim_honesty_guard.rs::groww_e2e_lane_retired_with_live_feed` | ~~`groww-e2e.yml`~~ (deleted) |
 | 9 | Branch protection on `main` (operator one-time click): required checks = Build & Verify, Security & Audit, Commit Lint, Secret Scan, **All Green**; require branches up to date; do not allow bypassing (enforce for admins) | GitHub Settings → Branches (no API tool available in-session) |
 
 ---
@@ -157,7 +157,7 @@ justification for a red pre-merge gate.
 
 - **Pre-merge gate = the fast battery** (build, clippy, the full 6-crate test suites incl. DHAT + proptest, security audit, coverage ratchet, source-scan guards, plan gate, secret diff-scan). Warm-cache PR wall-clock moves from ~4 min to ~8–10 min (coverage is the new critical path; ~20–25 min on a cold cache).
 - **Mutation / fuzz / ASan / TSan / cargo-careful stay SCHEDULED, not pre-merge — by physics, not laziness.** The full mutation sweep over core/trading/common is an ~18-hour-class job (hundreds of mutants, each a build+test cycle); fuzz is 1h/target by design; sanitizers rebuild the workspace with `-Z build-std` single-threaded (hours). None of these can complete inside a per-PR runner budget. They remain hard-fail on their weekly/scheduled lanes with auto-filed issues. Claiming they gate PRs (as mutation.yml's old header did) was a false-OK and is exactly what this lock forbids.
-- **`#[ignore]`d QuestDB/Docker tests still skip green inside the PR Test jobs** — the Groww E2E PR lane covers its slice non-vacuously; the chaos suite remains scheduled (and is separately known-broken; not fixed by this lock).
+- **`#[ignore]`d QuestDB/Docker tests still skip green inside the PR Test jobs** — the Groww E2E PR lane covered its slice non-vacuously until its 2026-07-15 retirement with the Groww live feed (no live pipeline remains to E2E); the chaos suite remains scheduled (and is separately known-broken; not fixed by this lock).
 - **Branch protection itself is a GitHub setting** — until the operator flips §3 row 9, the bot path is safe (arming waits for All Green) but an admin manual merge can still bypass (the #1390 58-second owner merge class). The click is the last brick.
 
 ---
@@ -172,7 +172,7 @@ justification for a red pre-merge gate.
 - Restores `cancel-in-progress: true` for push-to-main runs of ci.yml (or re-groups them so rapid merges cancel each other's post-merge gates).
 - Re-adds the mutation `pull_request` trigger as-is (without an `--in-diff` redesign + realistic timeout + dated operator quote).
 - Removes the `Repo Guards` job or any of its four source-scan steps, or converts a guard to `continue-on-error`.
-- Removes the weekly full-tree secret scan or the Groww E2E PR lane.
+- Removes the weekly full-tree secret scan. *(The Groww E2E PR lane half of this row is SUPERSEDED 2026-07-15 — the operator's Groww live-feed retirement directive deleted the lane's test target, so the lane itself was retired in the same PR; re-adding a Groww live E2E lane needs a fresh dated quote here first.)*
 - Treats `skipped` as success in the all-green evaluation for anything other than the PR-only jobs on push events.
 
 Any such PR MUST be rejected in review even if the operator approves verbally — the operator must update this rule file FIRST with a dated quote, only then can the PR land.
