@@ -87,12 +87,20 @@ fn test_configs_lock_dhan_live_ws_off() {
              updating this guard in the same PR"
         );
     }
-    // Groww stays THE live feed in prod.
+    // 2026-07-15: the Groww LIVE feed is retired too — prod is REST-only.
+    // (Supersedes the 2026-07-13 "Groww stays THE live feed" pin.)
     let prod = strip_line_comments(&read("config/production.toml"));
     assert!(
-        prod.contains("groww_enabled = true"),
-        "config/production.toml must keep `groww_enabled = true` — Groww is \
-         the live feed (operator directive 2026-07-13)"
+        prod.contains("groww_enabled = false"),
+        "config/production.toml must carry `groww_enabled = false` — the \
+         Groww live feed is retired (operator directive 2026-07-15; the \
+         REST-only boot emits tv_boot_completed directly)"
+    );
+    assert!(
+        !prod.contains("groww_enabled = true"),
+        "config/production.toml must NOT carry `groww_enabled = true` — \
+         re-enabling the retired Groww live lane requires a fresh dated \
+         operator quote + updating this guard in the same PR"
     );
 }
 

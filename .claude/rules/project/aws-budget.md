@@ -20,6 +20,11 @@ stop publishing):
 - **−3 alarms ≈ −$0.30/mo (Verified):** groww-ws-inactive +
   groww-stall-restart-storm (app-alarms.tf) + groww-exchange-lag-p99-high
   (silent-feed-alarms.tf S4).
+- **−1 alarm ≈ −$0.10/mo (Verified, same-PR fix round):**
+  aggregator-no-seals (app-alarms.tf section 9) — its metric lost its last
+  live producer with the bridge deletion (Dhan broadcast publisher-less
+  since PR-C2); a permanently-dead monitor the window gate kept arming
+  (window-gate ALARM_NAMES trimmed 5 → 4 in the same edit).
 - **−1 alarm + its fallback log metric filter ≈ −$0.10/mo + one sparse
   derived series (Verified):** the tv-<env>-feed-stall-restarts counter
   pager (feed-stall-restart-alarm.tf deleted whole).

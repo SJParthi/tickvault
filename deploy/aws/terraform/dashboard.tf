@@ -107,25 +107,9 @@ resource "aws_cloudwatch_dashboard" "operator" {
           period  = 300
         }
       },
-      {
-        type   = "metric"
-        x      = 8
-        y      = 8
-        width  = 8
-        height = 6
-        properties = {
-          # PR-C3 (2026-07-14): the per-SID tick-gap silent-count panel was
-          # replaced — its gauge producer (the tick-gap detector) was deleted
-          # with the Dhan WS lane (operator Q4-ii 2026-07-13). The FEED-level
-          # last-tick age is the surviving stall signal (FEED-STALL-01).
-          title   = "Feed last-tick age (s — feed-level stall signal)"
-          region  = local.dash_region
-          view    = "timeSeries"
-          metrics = [[local.dash_namespace, "tv_feed_last_tick_age_seconds"]]
-          period  = 60
-          stat    = "Maximum"
-        }
-      },
+      # ("Feed last-tick age" widget retired 2026-07-15 — its sole producer,
+      # the Groww bridge liveness stamp, was deleted with the Groww live feed;
+      # the series can never publish again.)
       {
         type   = "metric"
         x      = 16
@@ -342,7 +326,6 @@ resource "aws_cloudwatch_dashboard" "scoreboard" {
       # ----- Row 2 (PR-D): catch-up seals per feed -----
       # ("Feed helper restarts" widget retired 2026-07-15 — the stall-restart
       # counters died with the Groww live feed's stall watchdog.)
-      },
       {
         type   = "metric"
         x      = 12
@@ -354,8 +337,8 @@ resource "aws_cloudwatch_dashboard" "scoreboard" {
           region = local.dash_region
           view   = "timeSeries"
           metrics = [
-            [local.dash_namespace, "tv_boundary_catchup_total", "host", "tickvault-prod", "feed", "dhan"],
-            [local.dash_namespace, "tv_boundary_catchup_total", "host", "tickvault-prod", "feed", "groww"]
+            [local.dash_namespace, "tv_boundary_catchup_total", "host", "tickvault-prod", "feed", "dhan"]
+            # (feed=groww series retired 2026-07-15 — spawn_groww_catchup_seal deleted with the Groww live feed; groww rows can never increment again)
           ]
           period = 300
           stat   = "Sum"
