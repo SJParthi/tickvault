@@ -56,4 +56,7 @@ pub mod types;
 //   pub mod smart_orders;  // Smart Orders  (GROWW-OCO-*)
 //   pub mod portfolio;     // Portfolio     (GROWW-PORT-*)
 //   pub mod margin;        // Margin        (GROWW-MARG-*)
-//   pub mod user;          // User + Exceptions (GROWW-READY-*)
+
+/// User + Exceptions (readiness) — GROWW-READY-* prefix reserved; readiness
+/// reuses the existing SPOT1M codes per its design (§39.3).
+pub mod user;
