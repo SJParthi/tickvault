@@ -206,7 +206,7 @@ pub struct GaFailure {
 /// top-level `status` == `"FAILURE"`. SUCCESS / absent status / non-JSON →
 /// `None`. Mirror of #1539's app-side sniffer (crates/app is unimportable
 /// from trading); copy-drift pinned by identical test vectors
-/// (`test_ga_sanitizer_vectors_match_1539`).
+/// (`test_sniff_ga_failure_sanitizer_vectors_match_1539`).
 pub fn sniff_ga_failure(body: &str) -> Option<GaFailure> {
     let v: serde_json::Value = serde_json::from_str(body).ok()?;
     if v.get("status").and_then(|s| s.as_str()) != Some("FAILURE") {
@@ -1474,7 +1474,7 @@ mod tests {
     // -- pure classifier ----------------------------------------------------
 
     #[test]
-    fn test_classify_200_success_full_payload_green_observations() {
+    fn test_classify_response_200_success_full_payload_green_observations() {
         let obs = classify_response(200, None, NESTED_SUCCESS_BODY).expect("must be Ok");
         assert_eq!(obs.clear_cash_rupees, Some(5000.0));
         assert_eq!(obs.option_buy_balance_rupees, Some(800.0));
@@ -1625,7 +1625,7 @@ mod tests {
     }
 
     #[test]
-    fn test_classify_429_rate_limited_retryable_retry_after_captured_and_capped() {
+    fn test_classify_429_rate_limited_is_retryable_retry_after_captured_and_capped() {
         let err = classify_response(429, Some(30), "").expect_err("429 must fail");
         assert!(matches!(
             err,
@@ -1738,7 +1738,7 @@ mod tests {
     }
 
     #[test]
-    fn test_ga_sanitizer_vectors_match_1539() {
+    fn test_sniff_ga_failure_sanitizer_vectors_match_1539() {
         // Copy-drift pins vs `groww_spot_1m_boot.rs::parse_groww_ga_failure`.
         let ga = sniff_ga_failure(GA005_FAILURE_BODY).expect("must sniff");
         assert_eq!(ga.ga_code, "GA005");
@@ -1830,7 +1830,7 @@ mod tests {
     }
 
     #[test]
-    fn test_verdict_fold_green_red_degraded() {
+    fn test_verdict_for_fold_green_red_degraded() {
         let green = ProbeAttempt::Success {
             observations: Box::new(MarginObservations {
                 payload_parse_failed: true,
@@ -1927,7 +1927,7 @@ mod tests {
     // -- scheduling ---------------------------------------------------------
 
     #[test]
-    fn test_fire_decision_boundaries() {
+    fn test_readiness_fire_decision_boundaries() {
         let fire = READINESS_FIRE_SECS_OF_DAY_IST;
         let end = READINESS_FIRE_WINDOW_END_SECS_IST;
         assert_eq!(fire, 33_330);
@@ -1993,7 +1993,7 @@ mod tests {
     }
 
     #[test]
-    fn test_day_latch_monotonic_and_concurrent() {
+    fn test_day_latch_claim_monotonic_and_concurrent() {
         let latch = ReadinessDayLatch::new();
         assert!(latch.claim(20_000));
         assert!(!latch.claim(20_000), "same-day double claim refused");
@@ -2074,7 +2074,57 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_run_refuses_disabled_zero_http() {
+    async fn test_probe_once_success_and_transport_failure_single_request_each() {
+        // Direct single-attempt coverage: probe_once never retries, never
+        // sleeps — one request per call, classified through the pure core.
+        // (No market-hours gate here — that lives in run_readiness_probe.)
+        let responses = vec![http_response("200 OK", "", NESTED_SUCCESS_BODY)];
+        let (base_url, captured) = spawn_one_shot_server(responses).await;
+        let client = test_client();
+        let token = SecretString::from("tok");
+        let timing = fast_timing();
+        let attempt = probe_once(&client, &base_url, &token, &timing).await;
+        match &attempt {
+            ProbeAttempt::Success { observations, .. } => {
+                assert_eq!(observations.clear_cash_rupees, Some(5000.0));
+                assert!(!observations.payload_parse_failed);
+            }
+            other => panic!("expected Success, got {other:?}"),
+        }
+        assert_eq!(
+            captured
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+            1,
+            "probe_once issues exactly one request"
+        );
+        // Transport class: a freed localhost port refuses the connection —
+        // the send-leg error classifies Transport with a bounded, non-empty
+        // redacted detail.
+        let refused_base = {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind throwaway listener");
+            let addr = listener.local_addr().expect("throwaway listener addr");
+            drop(listener);
+            format!("http://{addr}")
+        };
+        let attempt = probe_once(&client, &refused_base, &token, &timing).await;
+        match attempt {
+            ProbeAttempt::Failure {
+                failure: ProbeFailure::Transport { detail },
+                ..
+            } => {
+                assert!(!detail.is_empty(), "transport detail must be captured");
+                assert!(detail.len() <= 320, "transport detail must be bounded");
+            }
+            other => panic!("expected Transport failure, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_run_readiness_probe_refuses_disabled_zero_http() {
         // The unroutable base URL proves no request is even attempted: a send
         // would surface as Ok(Degraded/transport), not Err(Disabled).
         let client = test_client();

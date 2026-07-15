@@ -130,6 +130,12 @@ This plan and every item in it carry the canonical **15-row 100% Guarantee Matri
       2 proptests (classifier + sniffer totality), fire-decision boundaries +
       market-hours-compliance pin, ist_day_number + monotonic day-latch race,
       refusal arms, bounded retry ladder (attempt cap, token re-fetch,
-      vendor-reject no-retry, oversize pre-read), operator_summary wording,
-      slug stability, 5 source-scan self-ratchets (GET-only, single-URL-literal,
-      expose_secret-once, no-unwrap/config/SSM/storage, error!-carries-code)
+      vendor-reject no-retry, oversize pre-read), direct probe_once
+      single-request success + transport-failure coverage, operator_summary
+      wording, slug stability, 5 source-scan self-ratchets (GET-only,
+      single-URL-literal, expose_secret-once, no-unwrap/config/SSM/storage,
+      error!-carries-code); test names embed their target pub fn names so the
+      pub-fn-test-guard 'all'-mode ratchet matches all 8 previously-unmatched
+      fns (sniff_ga_failure, classify_response, verdict_for,
+      readiness_fire_decision, claim, is_retryable, probe_once,
+      run_readiness_probe) with zero TEST-EXEMPT lines
