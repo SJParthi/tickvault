@@ -567,6 +567,17 @@ probe_and_report = true
 enabled = true
 
 # ===========================================================================
+# [groww_universe] — process-global daily Groww watch-set + shared-master
+# rider (2026-07-15 Groww live-feed retirement re-home): once per IST day,
+# build + write data/groww/groww-watch-<date>.json (the spot leg's VIX
+# resolver reads it) and fire-and-forget persist_groww_instruments (SEBI
+# feed='groww' master continuity). Base opts IN; the serde default stays OFF
+# (the house fail-safe pattern — an absent section disables the rider).
+# ===========================================================================
+[groww_universe]
+enabled = true
+
+# ===========================================================================
 # Groww per-minute option-chain REST leg (operator grant 2026-07-13 — PR-3
 # of the Groww per-minute REST plan). When enabled: every session minute —
 # sequenced right after the Groww spot fetch — pull the CURRENT-expiry

@@ -1785,6 +1785,25 @@ async fn main() -> Result<()> {
             ),
         );
 
+    // [groww_universe] daily Groww watch-set + shared-master rider —
+    // PROCESS-GLOBAL (2026-07-15 Groww live-feed retirement re-home, next to
+    // the sibling process-global monitors above): once per IST day, build +
+    // write data/groww/groww-watch-<date>.json (the spot leg's VIX resolver
+    // reads it) and fire-and-forget persist_groww_instruments (SEBI
+    // feed='groww' master continuity). Config-gated ([groww_universe]
+    // enabled, serde default OFF; base.toml opts in); disabled = one info! +
+    // nothing spawned. Independent of feeds.groww_enabled / the retired live
+    // lane — the REST-legs pattern (main.rs Groww REST spawns).
+    if config.groww_universe.enabled {
+        let _groww_universe_rider =
+            tickvault_app::groww_universe::spawn_groww_universe_rider(config.questdb.clone());
+    } else {
+        info!(
+            "[groww_universe] disabled — daily Groww watch-set rider not spawned \
+             (spot-leg VIX resolution + feed='groww' master continuity degrade)"
+        );
+    }
+
     // Daily 15:40 IST per-feed tick-conservation audit — PROCESS-GLOBAL
     // (2026-07-02 adversarial-sweep fix). Previously nested inside the
     // Dhan-gated `spawn_post_market_tasks`, so a Groww-only session ran ZERO
