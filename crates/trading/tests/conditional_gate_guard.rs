@@ -15,7 +15,12 @@
 //!    allowed), exactly TWO colon sites (the `: bool` field decl + the
 //!    `: false` constructor init — a `new_armed(.., armed)` parameterized
 //!    init is counted and refused), zero compound assignments
-//!    (`|=`/`&=`/`^=`), zero `&mut` borrows of the field.
+//!    (`|=`/`&=`/`^=`), zero `&mut` borrows of the field (round-7: the
+//!    borrow census covers the spaced `&mut self.…`, the no-space
+//!    `&mut(self.…)`, and the parenthesized `&mut (self.…)` shapes — the
+//!    latter two previously classified Read), and zero method/projection
+//!    sites on the field (round-7: `.clone_from(&true)` mutates through an
+//!    implicit auto-`&mut` with ZERO borrow token in the text).
 //! 3. Every `/alerts` URL-building sender checks the gate BEFORE any
 //!    URL/socket work. BOTH sides of the census count the SAME
 //!    comment-stripped production text — FULL-LINE comments AND trailing
@@ -79,9 +84,11 @@
 //! honest evidence surface).
 //!
 //! HONEST ENVELOPE: these are text ratchets. They pin every regression
-//! shape surfaced by the round-1..round-5 adversarial reviews (literal and
+//! shape surfaced by the round-1..round-7 adversarial reviews (literal and
 //! non-literal arms, parameterized constructors, compound assignments,
-//! `&mut` borrows, new senders, new constants, full-line AND trailing
+//! `&mut` borrows — spaced, no-space `&mut(…)`, and parenthesized
+//! `&mut (…)` alike — method-call mutations like `.clone_from(&true)`
+//! (round-7), new senders, new constants, full-line AND trailing
 //! comment-inflated counts, rogue-named /alerts constants with camouflage
 //! comments, UFCS/path/bare-call production callers, rogue-FILE senders on
 //! any `/alerts` subpath or via a `DHAN_ALERTS_*` constant import,
@@ -378,8 +385,20 @@ enum GateSiteKind {
     /// `alerts_gate_armed: <rhs>` — field declaration or struct-literal init.
     FieldColon,
     /// `&mut …alerts_gate_armed` — a mutable borrow (mutation vector, e.g.
-    /// `mem::replace(&mut self.alerts_gate_armed, true)`).
+    /// `mem::replace(&mut self.alerts_gate_armed, true)`). Round-7: also
+    /// covers the parenthesized `&mut (self.alerts_gate_armed)` and the
+    /// no-space `&mut(self.alerts_gate_armed)` shapes — both are `&mut`
+    /// borrows of the field that previously classified Read (the literal
+    /// `"&mut "` needle + a paren-less charset walk missed them).
     MutBorrow,
+    /// `alerts_gate_armed.<method>(…)` / `.field` — a method call or
+    /// projection on the field (round-7). A method taking `&mut self`
+    /// mutates through an implicit auto-`&mut` with ZERO borrow token in
+    /// the text — e.g. bool's std `Clone::clone_from(&true)` — so EVERY
+    /// projection site is counted as a mutation vector (none exist today;
+    /// a future legitimate read-via-method edits this guard in the same
+    /// PR).
+    MethodCall,
     /// Everything else (`if self.alerts_gate_armed {`, `== other`, asserts).
     Read,
 }
@@ -403,21 +422,40 @@ fn first_rhs_token(text: &str) -> String {
         .collect()
 }
 
-/// True when the identifier at `index` is reached through a `&mut ` borrow
-/// (only path segments / whitespace between the `&mut` and the field).
+/// True when the identifier at `index` is reached through a `&mut` borrow.
+/// Round-7 hardening: the borrow token is `&mut` as a WHOLE TOKEN (the next
+/// character must not be identifier-ish — so the no-space `&mut(self.…)`
+/// shape counts, while a longer identifier like `&mutx` never does), and
+/// the walk between the token and the field additionally admits grouping
+/// parens `(` and deref `*` (the parenthesized
+/// `mem::replace(&mut (self.alerts_gate_armed), true)` shape previously
+/// failed the charset walk and classified Read). Characters that would
+/// cross into a DIFFERENT expression (`,`, `)`, `;`, operators, …) still
+/// terminate the walk, so `swap(&mut other, self.alerts_gate_armed)` keeps
+/// its field site classified Read.
 fn preceded_by_mut_borrow(source: &str, index: usize) -> bool {
     let mut window_start = index.saturating_sub(48);
     while !source.is_char_boundary(window_start) {
         window_start += 1;
     }
     let window = &source[window_start..index];
-    match window.rfind("&mut ") {
-        Some(position) => window[position + "&mut ".len()..].chars().all(|character| {
-            character.is_ascii_alphanumeric()
-                || character == '_'
-                || character == '.'
-                || character.is_whitespace()
-        }),
+    match window.rfind("&mut") {
+        Some(position) => {
+            let between = &window[position + "&mut".len()..];
+            let whole_token = between
+                .chars()
+                .next()
+                .is_some_and(|character| !(character.is_ascii_alphanumeric() || character == '_'));
+            whole_token
+                && between.chars().all(|character| {
+                    character.is_ascii_alphanumeric()
+                        || character == '_'
+                        || character == '.'
+                        || character == '('
+                        || character == '*'
+                        || character.is_whitespace()
+                })
+        }
         None => false,
     }
 }
@@ -468,6 +506,12 @@ fn classify_gate_sites(source: &str) -> Vec<GateSite> {
             }
         } else if let Some(tail) = rest.strip_prefix(':') {
             (GateSiteKind::FieldColon, tail)
+        } else if rest.starts_with('.') && !rest.starts_with("..") {
+            // Round-7: a method call / projection on the field. A
+            // `&mut self` method (bool's std `Clone::clone_from(&true)`)
+            // mutates with ZERO borrow token in the text, so every
+            // projection site counts as a mutation vector.
+            (GateSiteKind::MethodCall, "")
         } else {
             (GateSiteKind::Read, "")
         };
@@ -684,7 +728,9 @@ fn test_alerts_gate_arm_is_cfg_test_only() {
     );
 
     // No mutable borrow of the field anywhere (`mem::replace`,
-    // `&mut client.alerts_gate_armed`, …).
+    // `&mut client.alerts_gate_armed`, the parenthesized
+    // `&mut (self.alerts_gate_armed)`, the no-space
+    // `&mut(self.alerts_gate_armed)`, …).
     assert!(
         sites
             .iter()
@@ -692,6 +738,22 @@ fn test_alerts_gate_arm_is_cfg_test_only() {
         "no `&mut …alerts_gate_armed` borrow may exist — a mutable borrow \
          is an arm vector (e.g. mem::replace) requiring a dated operator \
          quote FIRST"
+    );
+
+    // No method call / projection on the field anywhere (round-7). A
+    // `&mut self` method mutates through an implicit auto-`&mut` with
+    // ZERO borrow token in the text — `self.alerts_gate_armed
+    // .clone_from(&true)` is a production arm path the borrow census
+    // cannot see. Zero such sites exist today; a future legitimate
+    // read-via-method edits this guard in the same PR.
+    assert!(
+        sites
+            .iter()
+            .all(|site| site.kind != GateSiteKind::MethodCall),
+        "no method call / projection on alerts_gate_armed may exist — \
+         `.clone_from(&true)` mutates via implicit auto-&mut (no borrow \
+         token in the text) and is an arm vector requiring a dated \
+         operator quote FIRST"
     );
 }
 
@@ -1254,12 +1316,50 @@ fn test_gate_guard_scanner_self_test() {
     assert_eq!(sites.len(), 1);
     assert_eq!(sites[0].kind, GateSiteKind::MutBorrow);
 
-    // (7) Reads never count as writes: bare read, `==` compare, match arm.
+    // (6b) Parenthesized + no-space `&mut` borrows (round-7 — BOTH
+    //      previously classified Read: the `(` failed the paren-less
+    //      charset walk, and `&mut(` never matched the literal `"&mut "`
+    //      needle).
+    for planted_paren_borrow in [
+        "std::mem::replace(&mut (self.alerts_gate_armed), true)",
+        "std::mem::replace(&mut(self.alerts_gate_armed), true)",
+    ] {
+        let sites = classify_gate_sites(planted_paren_borrow);
+        assert_eq!(
+            sites.len(),
+            1,
+            "planted borrow must be seen: {planted_paren_borrow}"
+        );
+        assert_eq!(
+            sites[0].kind,
+            GateSiteKind::MutBorrow,
+            "parenthesized/no-space &mut borrow must classify MutBorrow: \
+             {planted_paren_borrow}"
+        );
+    }
+
+    // (6c) Method-call mutation vector (round-7 — previously classified
+    //      Read): bool's std `Clone::clone_from` mutates through an
+    //      implicit auto-`&mut` with ZERO borrow token in the text.
+    let planted_clone_from = "self.alerts_gate_armed.clone_from(&true);";
+    let sites = classify_gate_sites(planted_clone_from);
+    assert_eq!(sites.len(), 1);
+    assert_eq!(
+        sites[0].kind,
+        GateSiteKind::MethodCall,
+        "a method call on the gate field must classify MethodCall"
+    );
+
+    // (7) Reads never count as writes: bare read, `==` compare, match arm,
+    //     and (round-7) a `&mut` borrow of a SIBLING argument in the same
+    //     call — the `,` terminates the borrow walk, so the widened
+    //     paren/deref charset never taints an adjacent read.
     for read_shape in [
         "if self.alerts_gate_armed { }",
         "if self.alerts_gate_armed == other { }",
         "assert!(client.alerts_gate_armed);",
         "match x { alerts_gate_armed => {} }",
+        "swap(&mut other, self.alerts_gate_armed)",
     ] {
         let sites = classify_gate_sites(read_shape);
         assert_eq!(sites.len(), 1, "read shape must be seen: {read_shape}");

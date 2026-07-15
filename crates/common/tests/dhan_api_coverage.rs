@@ -7,7 +7,13 @@
 //! `test_charts_historical_constant_is_orphaned_post_phase_c3`), 19 inline
 //! path templates in api_client.rs (MEASURED by a source scan — round-3
 //! fix 2026-07-14: the inline count was previously a hardcoded scalar
-//! nothing reconciled against the actual file), 1 overlap (`/positions`),
+//! nothing reconciled against the actual file; round-7 fix 2026-07-15:
+//! the scan covers all three URL-build shapes — positional `"{}/…`,
+//! captured-identifier `"{base}/…`, and split-argument-literal
+//! `format!("{}{}", base, "/…")` — the latter two were previously
+//! invisible, so a new endpoint in either shape dodged the pinned-set
+//! equality; the residual uncovered shapes are disclosed on
+//! `extract_inline_url_templates`), 1 overlap (`/positions`),
 //! 2 WebSocket URLs, and 4 intentionally skipped endpoints. Prevents
 //! endpoint drift where new endpoints are added to api_client.rs using
 //! inline strings without this ledger (and its constants) being updated.
@@ -382,34 +388,139 @@ fn test_skipped_endpoints_documented() {
 // Test: OMS endpoints that use inline paths in api_client.rs
 // ---------------------------------------------------------------------------
 
+/// Normalizes every `{…}` placeholder run in a path template to the bare
+/// `{}` form, so a captured-identifier template
+/// (`"{base}/orders/{order_id}"`) and its positional twin
+/// (`"{}/orders/{}"`) yield the SAME ledger entry.
+fn normalize_placeholders(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars();
+    while let Some(character) = chars.next() {
+        if character == '{' {
+            for inner in chars.by_ref() {
+                if inner == '}' {
+                    break;
+                }
+            }
+            out.push_str("{}");
+        } else {
+            out.push(character);
+        }
+    }
+    out
+}
+
 /// Extracts the unique inline URL path TEMPLATES built in api_client.rs'
-/// production region: every string literal of the `"{}<path>"` URL-build
-/// shape (`format!("{}/orders/{}", self.base_url, order_id)` →
-/// `/orders/{}`). Query strings are cut at `?`; `{}` placeholders are kept
-/// so parameterized templates count distinctly; constants-backed sites
-/// (`format!("{}{}", base, constants::DHAN_*_PATH)`) carry NO literal path
-/// after the base placeholder and are deliberately NOT extracted (they are
-/// the constants side of the ledger). Returns a sorted, deduped set.
+/// production region. THREE URL-build shapes are extracted (round-7 —
+/// the original scan matched ONLY shape 1's `"{}/` needle, so a new
+/// endpoint written in shape 2 or 3 shipped invisible to the pinned-set
+/// equality this ledger's drift claim rests on):
+///
+/// 1. Positional base placeholder —
+///    `format!("{}/orders/{}", self.base_url, order_id)` → `/orders/{}`.
+/// 2. Captured-identifier base — `format!("{base}/orders/{order_id}")` →
+///    `/orders/{}` (placeholders normalized, so both spellings map to one
+///    entry).
+/// 3. Split-argument literal — `format!("{}{}", self.base_url, "/orders")`
+///    → `/orders` (the FIRST string literal argument of a `"{}{}`-prefixed
+///    concat format, when it starts with `/`).
+///
+/// Query strings are cut at `?`; placeholders are kept (normalized to
+/// `{}`) so parameterized templates count distinctly; constants-backed
+/// sites (`format!("{}{}", base, constants::DHAN_*_PATH)`) carry NO
+/// literal path argument and are deliberately NOT extracted (they are the
+/// constants side of the ledger). Returns a sorted, deduped set.
+///
+/// HONEST ENVELOPE: this is a text scan over the three shapes above, not
+/// a parser. NOT covered (a new endpoint in one of these shapes would
+/// dodge the pinned-set equality and must be caught by human review):
+/// byte-assembled / `push_str`-built URLs, `reqwest::Url::join`, a split
+/// literal that is not the first string literal of its statement, and a
+/// concat format string with a literal tail (`"{}{}/x"`). None exist in
+/// api_client.rs today; the `/alerts` family additionally has its own
+/// token-general census in
+/// `crates/trading/tests/conditional_gate_guard.rs`.
 fn extract_inline_url_templates(production: &str) -> Vec<String> {
     let mut templates = std::collections::BTreeSet::new();
-    let needle = "\"{}/";
+
+    // Shape 1: positional base placeholder — `"{}/…`.
+    let positional_needle = "\"{}/";
     let mut search_from = 0;
-    while let Some(position) = production[search_from..].find(needle) {
+    while let Some(position) = production[search_from..].find(positional_needle) {
         // Path starts at the '/' after the `"{}` base placeholder.
         let path_start = search_from + position + 3;
         let rest = &production[path_start..];
         let end = rest.find('"').unwrap_or(rest.len());
         let raw = &rest[..end];
         let template = raw.split('?').next().unwrap_or(raw);
-        templates.insert(template.to_string());
+        templates.insert(normalize_placeholders(template));
         search_from = path_start + end;
     }
+
+    // Shape 2: captured-identifier base — `"{base}/…` (round-7).
+    let mut search_from = 0;
+    while let Some(position) = production[search_from..].find("\"{") {
+        let ident_start = search_from + position + 2;
+        search_from = ident_start;
+        let ident_len = production[ident_start..]
+            .chars()
+            .take_while(|character| character.is_ascii_alphanumeric() || *character == '_')
+            .map(char::len_utf8)
+            .sum::<usize>();
+        if ident_len == 0 {
+            continue;
+        }
+        let rest = &production[ident_start + ident_len..];
+        let Some(after_brace) = rest.strip_prefix('}') else {
+            continue;
+        };
+        if !after_brace.starts_with('/') {
+            continue;
+        }
+        let end = after_brace.find('"').unwrap_or(after_brace.len());
+        let raw = &after_brace[..end];
+        let template = raw.split('?').next().unwrap_or(raw);
+        templates.insert(normalize_placeholders(template));
+    }
+
+    // Shape 3: split-argument literal — a `"{}{}`-prefixed concat format
+    // string whose argument list carries a string literal starting with
+    // `/` (round-7). The scan is bounded to the statement (`;`), and a
+    // constants-backed argument list carries no string literal at all.
+    let concat_needle = "\"{}{}";
+    let mut search_from = 0;
+    while let Some(position) = production[search_from..].find(concat_needle) {
+        let fmt_body_start = search_from + position + 1;
+        search_from = fmt_body_start + concat_needle.len();
+        let Some(fmt_close) = production[fmt_body_start..].find('"') else {
+            break;
+        };
+        let args_start = fmt_body_start + fmt_close + 1;
+        let statement_end = production[args_start..]
+            .find(';')
+            .map_or(production.len(), |offset| args_start + offset);
+        let args = &production[args_start..statement_end];
+        if let Some(literal_open) = args.find('"') {
+            let literal_body = &args[literal_open + 1..];
+            if literal_body.starts_with('/') {
+                let end = literal_body.find('"').unwrap_or(literal_body.len());
+                let raw = &literal_body[..end];
+                let template = raw.split('?').next().unwrap_or(raw);
+                templates.insert(normalize_placeholders(template));
+            }
+        }
+    }
+
     templates.into_iter().collect()
 }
 
 /// Self-test for [`extract_inline_url_templates`] (vacuous-pass defense):
-/// the extractor must see inline templates (incl. parameterized and
-/// query-string shapes), dedup repeats, and skip constants-backed sites.
+/// the extractor must see inline templates in ALL THREE URL-build shapes
+/// (positional, captured-identifier, split-argument literal — round-7:
+/// the latter two previously shipped invisible), normalize captured
+/// placeholders, dedup repeats, strip query strings, and skip
+/// constants-backed sites (single-line AND multi-line, with or without a
+/// query tail in the format string).
 #[test]
 fn test_inline_template_extractor_self_test() {
     let synthetic = concat!(
@@ -418,16 +529,36 @@ fn test_inline_template_extractor_self_test() {
         "let c = format!(\"{}/orders\", self.base_url);\n", // dup of a
         "let d = format!(\"{}/ledger?from-date={}&to-date={}\", self.base_url, f, t);\n",
         "let e = format!(\"{}{}\", self.base_url, constants::DHAN_HOLDINGS_PATH);\n",
+        // Shape 2 (round-7): captured-identifier base, with and without a
+        // captured path parameter — normalized to the positional spelling.
+        "let f = format!(\"{base}/margins\");\n",
+        "let g = format!(\"{base}/margins/{order_id}\");\n",
+        // Shape 3 (round-7): split-argument literal, single-line,
+        // multi-line, and with a query string inside the literal.
+        "let h = format!(\"{}{}\", self.base_url, \"/split\");\n",
+        "let i = format!(\n    \"{}{}\",\n    self.base_url,\n    \"/multiline\"\n);\n",
+        "let j = format!(\"{}{}\", self.base_url, \"/q?x=1\");\n",
+        // Constants-backed multi-line + query-tail concat sites carry NO
+        // literal argument and stay skipped (the constants side of the
+        // ledger).
+        "let k = format!(\n    \"{}{}\",\n    self.base_url,\n    constants::DHAN_POSITIONS_PATH\n);\n",
+        "let l = format!(\"{}{}?killSwitchStatus=ACTIVATE\", self.base_url, constants::DHAN_KILL_SWITCH_PATH);\n",
     );
     assert_eq!(
         extract_inline_url_templates(synthetic),
         vec![
             "/ledger".to_string(),
+            "/margins".to_string(),
+            "/margins/{}".to_string(),
+            "/multiline".to_string(),
             "/orders".to_string(),
-            "/orders/{}".to_string()
+            "/orders/{}".to_string(),
+            "/q".to_string(),
+            "/split".to_string(),
         ],
-        "extractor must dedup, strip query strings, keep {{}} params, and \
-         skip constants-backed sites"
+        "extractor must cover all three URL-build shapes, normalize \
+         captured placeholders, dedup, strip query strings, keep {{}} \
+         params, and skip constants-backed sites"
     );
 }
 
@@ -473,7 +604,13 @@ fn test_inline_template_extractor_self_test() {
 ///
 /// The inline templates are MEASURED from the file, so the ledger's
 /// drift-detection purpose is mechanical: a new inline endpoint (or a
-/// template change) fails the pinned-set equality below.
+/// template change) in any of the three extracted URL-build shapes —
+/// positional `"{}/…`, captured-identifier `"{base}/…`, or
+/// split-argument-literal `format!("{}{}", base, "/…")` (round-7) — fails
+/// the pinned-set equality below. Residual uncovered shapes
+/// (byte-assembled / `push_str` / `Url::join` builds) are disclosed on
+/// `extract_inline_url_templates` — human-review territory, not a
+/// mechanical claim.
 ///
 /// The 41 listed operations break down as:
 /// - Orders (9): place, modify, cancel, order-book, single-order, by-correlation, trade-book, trades-by-order, slicing
