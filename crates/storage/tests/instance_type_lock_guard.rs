@@ -1,20 +1,21 @@
 //! Sub-PR #1 of 2026-05-27 daily-universe expansion — source-scan ratchet
-//! pinning the **r8g.large instance type lock** documented in
+//! pinning the **t4g.medium instance type lock** documented in
 //! `.claude/rules/project/daily-universe-scope-expansion-2026-05-27.md` §7.
 //!
 //! Lock history: 2026-05-18 t4g.medium → 2026-05-27 t4g.large → 2026-05-29
-//! m8g.large (8 GiB) → 2026-06-30 **r8g.large** (Graviton4, 16 GiB RAM —
-//! operator Quote 7). The 2026-06-30 change DOUBLED RAM (8 → 16 GiB,
-//! memory-optimized r-family) for the upcoming both-feeds + larger-universe
-//! workload, and recomputed the §7 cost line (~₹2,058/mo → ~₹2,919/mo incl
-//! GST, 270 hrs, 30 GB EBS, +EIP kept). This guard fails the build if:
+//! m8g.large (8 GiB) → 2026-06-30 r8g.large (Graviton4, 16 GiB — operator
+//! Quote 7) → 2026-07-15 **t4g.medium** (Graviton2, 4 GiB RAM — operator
+//! Quote 8 downsize: QDB_MEM_LIMIT 4g → 1g, EBS 20 GB fresh-volume TARGET
+//! pre-staged as an executor decision while the live root stays 50 GB;
+//! INTERIM bill ~₹1,471/mo incl GST at 270 hrs). This guard fails the
+//! build if:
 //!
 //!  1. The new authoritative rule file disappears or stops pinning
-//!     `r8g.large`.
+//!     `t4g.medium`.
 //!  2. The four superseded rule files lose their SUPERSEDED-BY
 //!     markers (= future readers wouldn't find the new contract).
 //!  3. The instance-type lock value in any of the docs disagrees
-//!     with `r8g.large`.
+//!     with `t4g.medium`.
 //!
 //! See:
 //! - `.claude/rules/project/daily-universe-scope-expansion-2026-05-27.md`
@@ -41,9 +42,12 @@ fn read(path: &Path) -> String {
 }
 
 /// Section A — the new authoritative rule file MUST exist and pin
-/// `r8g.large` as the locked instance type.
+/// `t4g.medium` as the locked instance type (operator Quote 8, 2026-07-15).
+/// r8g.large itself must REMAIN greppable in the file (Quote 7 history is
+/// retained per house convention), so no `!contains("r8g.large")` assert —
+/// the §7 HEADING pin below is what forbids r8g.large as the CURRENT lock.
 #[test]
-fn instance_lock_authoritative_rule_file_pins_r8g_large() {
+fn instance_lock_authoritative_rule_file_pins_t4g_medium() {
     let root = repo_root();
     let path = root.join(".claude/rules/project/daily-universe-scope-expansion-2026-05-27.md");
     assert!(
@@ -53,16 +57,20 @@ fn instance_lock_authoritative_rule_file_pins_r8g_large() {
     );
     let body = read(&path);
     assert!(
-        body.contains("r8g.large"),
-        "daily-universe rule file must pin `r8g.large` as the new instance lock"
+        body.contains("t4g.medium"),
+        "daily-universe rule file must pin `t4g.medium` as the instance lock (Quote 8, 2026-07-15)"
     );
     assert!(
-        body.contains("**r8g.large**"),
-        "daily-universe rule file must bold-pin `r8g.large` in the §7 instance-spec table"
+        body.contains("**t4g.medium**"),
+        "daily-universe rule file must bold-pin `t4g.medium` in the §7 instance-spec table"
     );
     assert!(
-        body.contains("16 GiB RAM"),
-        "daily-universe rule file must pin 16 GiB RAM for r8g.large"
+        body.contains("4 GiB RAM"),
+        "daily-universe rule file must pin 4 GiB RAM for t4g.medium"
+    );
+    assert!(
+        body.contains("Instance lock — t4g.medium"),
+        "the §7 heading must lock t4g.medium (not r8g.large) as the CURRENT instance type"
     );
 }
 
@@ -86,6 +94,10 @@ fn instance_lock_supersession_markers_present_in_aws_budget() {
         body.contains("t4g.medium → t4g.large") || body.contains("t4g.large"),
         "aws-budget.md supersession marker must mention t4g.large upgrade"
     );
+    assert!(
+        body.contains("RE-SUPERSEDED → t4g.medium 2026-07-15"),
+        "aws-budget.md must carry the 2026-07-15 t4g.medium downsize banner (Quote 8)"
+    );
 }
 
 #[test]
@@ -99,6 +111,10 @@ fn instance_lock_supersession_markers_present_in_architecture_doc() {
     assert!(
         body.contains("daily-universe-scope-expansion-2026-05-27.md"),
         "architecture doc must link to the new authoritative rule file"
+    );
+    assert!(
+        body.contains("§5 RE-SUPERSEDED → t4g.medium 2026-07-15"),
+        "architecture doc must carry the 2026-07-15 t4g.medium downsize banner (Quote 8)"
     );
 }
 
@@ -131,18 +147,30 @@ fn instance_lock_supersession_markers_present_in_operator_charter() {
 }
 
 /// Section C — the bill in §7 must match the locked figure. Operator
-/// approved ~₹3,101/mo on 2026-07-13 (EBS 30 -> 50 GB disk-pressure grow,
-/// +~₹180/mo over the 2026-06-30 ~₹2,919/mo r8g.large figure; 270 hrs,
-/// 50 GB EBS, +EIP kept, incl. 18% GST). If someone re-tunes this in the
-/// rule file without operator approval, the build fails.
+/// approved the t4g.medium downsize 2026-07-15 (Quote 8); the pinned
+/// number is the honest INTERIM ~₹1,471/mo (270 hrs, EIP kept, incl.
+/// 18% GST, LIVE 50 GB root — gp3 cannot shrink tonight). ~₹1,197/mo is
+/// pinned only as the labelled post-20-GB-recreate figure, and ~₹986/mo
+/// only as the ~176-hr auto-schedule figure — the guard additionally
+/// requires those labels so the live bill is never misstated. If someone
+/// re-tunes any of this in the rule file without operator approval, the
+/// build fails.
 #[test]
-fn instance_lock_monthly_bill_pinned_to_rupees_3101() {
+fn instance_lock_monthly_bill_pinned_to_rupees_1471_interim() {
     let root = repo_root();
     let body =
         read(&root.join(".claude/rules/project/daily-universe-scope-expansion-2026-05-27.md"));
     assert!(
-        body.contains("~₹3,101/mo") || body.contains("Rs 3,101/mo"),
-        "rule file §7 must pin the ~₹3,101/mo bill (operator approved 2026-07-13: EBS 50 GB grow on r8g.large, 270 hrs, +EIP, incl GST)"
+        body.contains("~₹1,471/mo") || body.contains("Rs 1,471/mo"),
+        "rule file §7 must pin the INTERIM ~₹1,471/mo bill (operator approved 2026-07-15 Quote 8: t4g.medium, 270 hrs, live 50 GB EBS, +EIP, incl GST)"
+    );
+    assert!(
+        body.contains("~₹1,197/mo applies ONLY after the 20 GB fresh-volume recreate"),
+        "rule file §7 must label ~₹1,197/mo as the post-20-GB-recreate figure, never the current bill"
+    );
+    assert!(
+        body.contains("~176-hr"),
+        "rule file §7 must label ~₹986/mo as the ~176-hr auto-schedule figure, never the 270-hr one"
     );
 }
 
