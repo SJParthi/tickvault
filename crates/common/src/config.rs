@@ -1108,7 +1108,7 @@ impl Default for GrowwContract1mConfig {
 /// Extension point: every FUTURE field on this struct MUST also be
 /// `#[serde(default)]` so older TOMLs keep deserializing byte-identically
 /// (the `GrowwSpot1mConfig` / `Spot1mRestConfig` precedent).
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct GrowwOrdersConfig {
     /// Read-only order/trade GETs (list, detail, status, status-by-reference,
     /// trades). Default OFF. Market-hours-gated when enabled.
@@ -1134,6 +1134,56 @@ pub struct GrowwOrdersConfig {
     /// real enable is a separate future dated operator action.
     #[serde(default)]
     pub live_fire_requested: bool,
+    /// Read-only smart-order (GTT/OCO) GETs (get / list — the OCO reconcile
+    /// poller's read surface). Default OFF. Market-hours-gated when enabled.
+    /// (Smart Orders area, 2026-07-15.)
+    #[serde(default)]
+    pub smart_orders_read: bool,
+    /// Smart-order (GTT/OCO) MUTATION intent flag (create / modify /
+    /// cancel). Like `live_fire_requested`, IGNORED unless Gate 2 (the
+    /// `groww_orders` cargo feature) + Gate 3 (the
+    /// [`crate::constants::GROWW_ORDER_LIVE_FIRE`] const) are ALSO flipped —
+    /// a config value alone can NEVER fire a smart-order mutation.
+    /// Default OFF.
+    #[serde(default)]
+    pub smart_orders_write: bool,
+    /// OCO reconcile poller cadence in seconds (the GROWW-OCO-05 poller's
+    /// design value). Default 15.
+    #[serde(default = "default_groww_oco_reconcile_poll_secs")]
+    pub oco_reconcile_poll_secs: u64,
+    /// OCO sibling-leg cancel verification deadline in seconds — past it an
+    /// unverified sibling cancel is the GROWW-OCO-02 double-fill exposure
+    /// window. Default 30.
+    #[serde(default = "default_groww_oco_sibling_cancel_deadline_secs")]
+    pub oco_sibling_cancel_deadline_secs: u64,
+}
+
+fn default_groww_oco_reconcile_poll_secs() -> u64 {
+    15
+}
+
+fn default_groww_oco_sibling_cancel_deadline_secs() -> u64 {
+    30
+}
+
+impl Default for GrowwOrdersConfig {
+    /// MANUAL impl (2026-07-15, Smart Orders area): the derived `Default`
+    /// would zero the u64 cadences and break the Default↔serde-default
+    /// parity (an absent `[groww_orders]` section must produce exactly
+    /// these values). Every gate bool stays FALSE (Gate 1 dark default).
+    fn default() -> Self {
+        Self {
+            orders_read: false,
+            portfolio_read: false,
+            margin_read: false,
+            user_read: false,
+            live_fire_requested: false,
+            smart_orders_read: false,
+            smart_orders_write: false,
+            oco_reconcile_poll_secs: default_groww_oco_reconcile_poll_secs(),
+            oco_sibling_cancel_deadline_secs: default_groww_oco_sibling_cancel_deadline_secs(),
+        }
+    }
 }
 
 /// 🔷 DHAN pre-trade margin gate (`[dhan_margin_gate]`).
@@ -3271,6 +3321,23 @@ mod tests {
         assert!(
             !cfg.live_fire_requested,
             "live_fire_requested must default off — and is inert without Gate 3"
+        );
+        // Smart Orders area (2026-07-15): the two new gate bools default
+        // off; the two OCO cadences carry their design values (the manual
+        // impl Default — a derive would zero them and break the
+        // Default↔serde-default parity for an absent section).
+        assert!(!cfg.smart_orders_read, "smart_orders_read must default off");
+        assert!(
+            !cfg.smart_orders_write,
+            "smart_orders_write must default off"
+        );
+        assert_eq!(
+            cfg.oco_reconcile_poll_secs, 15,
+            "oco_reconcile_poll_secs must default to the 15s design value"
+        );
+        assert_eq!(
+            cfg.oco_sibling_cancel_deadline_secs, 30,
+            "oco_sibling_cancel_deadline_secs must default to the 30s design value"
         );
     }
 
