@@ -76,8 +76,8 @@ pub use executor::{
     StubExpiryResolver,
 };
 pub use expiry::{
-    DayLockedExpiryStore, ExpiryDate, ExpiryPolicy, global_expiry_store, policy_for,
-    resolve_policy_expiry,
+    DayLockedExpiryStore, ExpiryDate, ExpiryPolicy, RecordVerdict, UnderlyingExpiryView,
+    global_expiry_store, policy_for, resolve_policy_expiry,
 };
 pub use gate::{DhanGates, global_dhan_gates, init_global_dhan_gates};
 pub use runner::{CadenceRunnerDeps, SystemCadenceClock, spawn_supervised_cadence_runner};
