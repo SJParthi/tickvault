@@ -647,26 +647,13 @@ pub const GROWW_INSTRUMENT_CSV_URL: &str =
 /// Groww live-feed NATS-over-WebSocket endpoint (wheel `feed.py::_GROWW_SOCKET_URL`).
 pub const GROWW_SOCKET_URL: &str = "wss://socket-api.groww.in"; // APPROVED: constants.rs is the single WS-URL source
 
-/// Groww per-session socket-token mint endpoint (wheel `client.py::generate_socket_token`).
-///
-/// LIVE-FEED-AUTH class (the KEEP class of
-/// `no-rest-except-live-feed-2026-06-27.md` §2/§3 — recorded there 2026-07-04):
-/// consumes the SSM-read ACCESS token (`Authorization: Bearer …`) to mint a
-/// per-session NATS user JWT bound to a fresh ed25519 nkey. It does NOT mint
-/// the access token (shared-minter lock 2026-07-02 untouched) and carries NO
-/// market data. This is exactly the call the Python sidecar's SDK already
-/// makes on every feed (re)construction.
-pub const GROWW_SOCKET_TOKEN_URL: &str = "https://api.groww.in/v1/api/apex/v1/socket/token/create/"; // APPROVED: constants.rs is the single REST-URL source
-
+// (2026-07-15: GROWW_SOCKET_TOKEN_URL deleted — its sole caller, the native
+// shadow socket-token mint, was deleted with the Groww live feed.)
 /// Groww data directory (watch files, sidecar NDJSON, shadow NDJSON).
 pub const GROWW_DATA_DIR: &str = "data/groww";
 
-/// The native shadow client's OWN NDJSON capture file (same `GrowwTickLine`
-/// line schema as the sidecar's `data/groww/live-ticks.ndjson`), rotated to
-/// `rust-live-ticks-YYYYMMDD.ndjson` at the IST day boundary — mirrors the
-/// sidecar's rotation so the parity comparer sees symmetrical archives.
-pub const GROWW_NATIVE_SHADOW_NDJSON_PATH: &str = "data/groww/rust-live-ticks.ndjson";
-
+// (2026-07-15: GROWW_NATIVE_SHADOW_NDJSON_PATH deleted — the shadow client
+// producer was deleted with the Groww live feed.)
 /// First reconnect delay for the native shadow client (bounded expo backoff).
 pub const GROWW_NATIVE_RECONNECT_BASE_SECS: u64 = 5;
 
@@ -3683,6 +3670,123 @@ pub const fn g2_wall_clock_gate_accepts(wall_clock_ts_nanos_of_day: i64) -> bool
 }
 
 // ---------------------------------------------------------------------------
+// Groww REGULAR-orders constants (shared contracts PR-A0, operator
+// authorization 2026-07-14; live flip is a SEPARATE future dated quote).
+// The order-family REST base is a const (not config — house pattern); the
+// live-fire master switch `GROWW_ORDER_LIVE_FIRE` lives above (Gate 3) and is
+// NOT re-declared here. Self-caps are const-asserted ≤ the documented family
+// ceilings; the closed worst-case read arithmetic is asserted ≤ the reads
+// self-cap (the §10.7 granted number).
+// ---------------------------------------------------------------------------
+
+/// Order-family REST base URL. Bare host only — the `/v1/order/*` PATHS live
+/// ONLY in `oms/groww/api_client.rs` behind the 4-gate lattice (Gate 5).
+pub const GROWW_ORDER_API_BASE_URL: &str = "https://api.groww.in"; // APPROVED: constants.rs is the single static-URL source (same as GROWW_INSTRUMENT_CSV_URL)
+
+/// Self-cap: order MUTATIONS (place/modify/cancel) per second. Const-asserted
+/// ≤ the documented Orders family ceiling of 10/s.
+pub const GROWW_ORDER_MUTATIONS_PER_SECOND_CAP: u32 = 5;
+/// Self-cap: order MUTATIONS per minute. Const-asserted ≤ the 250/min ceiling.
+pub const GROWW_ORDER_MUTATIONS_PER_MINUTE_CAP: u32 = 100;
+/// Self-cap: order READS (status/list/detail/trades) per second. Const-asserted
+/// ≤ the documented Non-Trading family ceiling of 20/s.
+pub const GROWW_ORDER_READS_PER_SECOND_CAP: u32 = 8;
+/// Self-cap: order READS per minute. Const-asserted ≤ the 500/min ceiling; the
+/// closed worst-case (198/min) is asserted ≤ this value.
+pub const GROWW_ORDER_READS_PER_MINUTE_CAP: u32 = 200;
+/// Reads/min reserved for the ambiguity-resolution ladder — 1/s, outranks all
+/// routine polling so a co-tenant burst cannot starve resolution.
+pub const GROWW_ORDER_RESERVED_RESOLUTION_READS_PER_MIN: u32 = 60;
+
+/// Per-order HOT status-poll cadence (secs): the first 30s after a mutation.
+pub const GROWW_ORDER_STATUS_POLL_HOT_SECS: u64 = 2;
+/// Per-order WARM status-poll cadence (secs): until first fill / terminal.
+pub const GROWW_ORDER_STATUS_POLL_WARM_SECS: u64 = 5;
+/// Per-order STEADY status-poll cadence (secs): steady + hot/warm-overflow tier.
+pub const GROWW_ORDER_STATUS_POLL_STEADY_SECS: u64 = 15;
+/// One cheap status confirm this many ms after every mutation response.
+pub const GROWW_ORDER_POST_MUTATION_CONFIRM_DELAY_MS: u64 = 500;
+
+/// Concurrent non-terminal order cap (all tiers).
+pub const GROWW_ORDER_MAX_TRACKED_OPEN_ORDERS: usize = 8;
+/// HOT (2s) tier occupancy cap; overflow starts at STEADY 15s.
+pub const GROWW_ORDER_MAX_HOT_TIER_ORDERS: usize = 3;
+/// WARM (5s) tier occupancy cap; overflow demotes to STEADY 15s (build-lead
+/// approved spec delta 2026-07-15 — closes the warm-saturation read hole).
+pub const GROWW_ORDER_MAX_WARM_TIER_ORDERS: usize = 2;
+
+/// Reconcile list-sweep cadence (secs) while ≥1 non-terminal order is tracked.
+pub const GROWW_ORDER_RECONCILE_INTERVAL_SECS: u64 = 60;
+/// Idle reconcile-sweep cadence (secs) — session-gated.
+pub const GROWW_ORDER_RECONCILE_IDLE_INTERVAL_SECS: u64 = 300;
+
+/// Ambiguity-resolution ladder rungs (secs); after the last rung, 60s-paced to
+/// the [`GROWW_ORDER_AMBIGUITY_LADDER_MAX_SECS`] bound.
+pub const GROWW_ORDER_AMBIGUITY_LADDER_STEPS_SECS: [u64; 5] = [2, 5, 10, 30, 60];
+/// Ambiguity-ladder budget (secs). A 401/403-classified poll PAUSES this clock
+/// (auth-stale time does not consume the budget — GROWW-ORD-10 / F-5).
+pub const GROWW_ORDER_AMBIGUITY_LADDER_MAX_SECS: u64 = 600;
+/// Bounded replay/re-resolve iterations on the SAME reference_id.
+pub const GROWW_ORDER_AMBIGUITY_REPLAY_MAX: u32 = 2;
+
+/// Post-close EOD force-terminalize sweep time (IST, HH:MM:SS) — the bounded
+/// post-close carve-out of `no-rest-except-live-feed-2026-06-27.md` §10.7.
+pub const GROWW_ORDER_EOD_SWEEP_IST: &str = "15:35:00";
+/// Intent write-ahead ledger directory (canonical path; registered in
+/// observability-architecture.md's paths table; retained, no sweeper).
+pub const GROWW_ORDER_LEDGER_DIR: &str = "data/orders";
+/// Dhan-analog self-cap on modifications per order (Groww's own cap is
+/// Unknown — O-8; conservative fail-closed).
+pub const GROWW_ORDER_MAX_MODIFICATIONS_PER_ORDER: u32 = 25;
+
+// --- Const-asserts: self-caps stay ≤ the documented family ceilings ---
+const _: () = assert!(
+    GROWW_ORDER_MUTATIONS_PER_SECOND_CAP <= 10,
+    "order-mutation self-cap must stay <= the 10/s Orders family doc ceiling"
+);
+const _: () = assert!(
+    GROWW_ORDER_MUTATIONS_PER_MINUTE_CAP <= 250,
+    "order-mutation self-cap must stay <= the 250/min Orders family doc ceiling"
+);
+const _: () = assert!(
+    GROWW_ORDER_READS_PER_SECOND_CAP <= 20,
+    "order-read self-cap must stay <= the 20/s Non-Trading family doc ceiling"
+);
+const _: () = assert!(
+    GROWW_ORDER_READS_PER_MINUTE_CAP <= 500,
+    "order-read self-cap must stay <= the 500/min Non-Trading family doc ceiling"
+);
+const _: () = assert!(
+    GROWW_ORDER_MAX_WARM_TIER_ORDERS >= 1,
+    "the WARM status-poll tier must hold at least one order"
+);
+const _: () = assert!(
+    GROWW_ORDER_MAX_HOT_TIER_ORDERS + GROWW_ORDER_MAX_WARM_TIER_ORDERS
+        <= GROWW_ORDER_MAX_TRACKED_OPEN_ORDERS,
+    "hot + warm tier occupancy cannot exceed the tracked-open cap"
+);
+// Closed worst-case reads/min (the §10.7 granted number): 3 hot × 30 +
+// 2 warm × 12 + 3 steady × 4 + 60 resolution + 10 confirms + 2 sweeps = 198.
+const _: () = {
+    let hot_per_min = 60 / (GROWW_ORDER_STATUS_POLL_HOT_SECS as u32);
+    let warm_per_min = 60 / (GROWW_ORDER_STATUS_POLL_WARM_SECS as u32);
+    let steady_per_min = 60 / (GROWW_ORDER_STATUS_POLL_STEADY_SECS as u32);
+    let steady_slots = (GROWW_ORDER_MAX_TRACKED_OPEN_ORDERS
+        - GROWW_ORDER_MAX_HOT_TIER_ORDERS
+        - GROWW_ORDER_MAX_WARM_TIER_ORDERS) as u32;
+    let worst = (GROWW_ORDER_MAX_HOT_TIER_ORDERS as u32) * hot_per_min
+        + (GROWW_ORDER_MAX_WARM_TIER_ORDERS as u32) * warm_per_min
+        + steady_slots * steady_per_min
+        + GROWW_ORDER_RESERVED_RESOLUTION_READS_PER_MIN
+        + 10 // post-mutation confirms/min bound
+        + 2; // reconcile sweeps/min bound
+    assert!(
+        worst <= GROWW_ORDER_READS_PER_MINUTE_CAP,
+        "worst-case order-read load must stay within the reads/min self-cap (§10.7)"
+    );
+};
+
+// ---------------------------------------------------------------------------
 // Tests — Market Hours Constants
 // ---------------------------------------------------------------------------
 
@@ -4983,21 +5087,7 @@ mod tests {
     #[test]
     fn test_groww_native_constants_pinned() {
         assert_eq!(GROWW_SOCKET_URL, "wss://socket-api.groww.in");
-        assert_eq!(
-            GROWW_SOCKET_TOKEN_URL,
-            "https://api.groww.in/v1/api/apex/v1/socket/token/create/"
-        );
-        assert!(GROWW_SOCKET_TOKEN_URL.starts_with("https://"));
         assert_eq!(GROWW_DATA_DIR, "data/groww");
-        assert_eq!(
-            GROWW_NATIVE_SHADOW_NDJSON_PATH,
-            "data/groww/rust-live-ticks.ndjson"
-        );
-        assert!(GROWW_NATIVE_SHADOW_NDJSON_PATH.starts_with(GROWW_DATA_DIR));
-        assert_ne!(
-            GROWW_NATIVE_SHADOW_NDJSON_PATH, "data/groww/live-ticks.ndjson",
-            "shadow capture must never collide with the sidecar's file"
-        );
         assert_eq!(GROWW_NATIVE_RECONNECT_BASE_SECS, 5);
         assert_eq!(GROWW_NATIVE_RECONNECT_MAX_SECS, 60);
         assert!(GROWW_NATIVE_RECONNECT_BASE_SECS <= GROWW_NATIVE_RECONNECT_MAX_SECS);

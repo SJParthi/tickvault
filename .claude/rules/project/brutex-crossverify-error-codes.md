@@ -1,5 +1,12 @@
 # BruteX↔TickVault Daily Cross-Verification — Error Codes (BRUTEX-XVERIFY-01 / BRUTEX-XVERIFY-02)
 
+> **⚠ 2026-07-15 dormancy note (Groww live feed retired — operator Q1, received directly in this session:
+> *"remove the whole Groww live feed; keep only spot 1m and option chain for both brokers; go."*):** from
+> 2026-07-15 forward NO live `feed='groww'` `candles_1m` rows are produced (market data is REST-only for
+> both brokers), so daily runs honestly read `no_data`/blind on the live side per the §2 honest-envelope
+> semantics — never a clean verdict on an empty compare set. The S3 read leg, the forensic tables, and the
+> config (already DEFAULT-OFF) stay.
+
 > **Authority:** CLAUDE.md > `operator-charter-forever.md` §C/§F >
 > `groww-second-feed-scope-2026-06-19.md` §33 (Groww LIVE-FEED-ONLY — this
 > feature makes NO Groww API call of any kind; the comparison source is

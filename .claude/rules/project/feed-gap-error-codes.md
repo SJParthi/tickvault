@@ -1,5 +1,12 @@
 # Feed Gap-Episode Forensics — Error Codes (FEED-GAP-01)
 
+> **⚠ RETIRED 2026-07-15 (Groww live feed deleted — operator Q1, received directly in this session: *"remove
+> the whole Groww live feed; keep only spot 1m and option chain for both brokers; go."*):** the gap-episode
+> tracker (it rode the deleted bridge's liveness poll), the 15:45 dangling-close sweep step, and every
+> FEED-GAP-01 emit site are DELETED with the Groww live feed; the `feed_gap_audit` table is retained
+> (forensic). The `FeedGap01*` ErrorCode variant is RETAINED until the post-C4 variant sweep (this file
+> keeps satisfying the cross-ref test). Content below retained as historical audit.
+
 > **Authority:** CLAUDE.md > `operator-charter-forever.md` §C/§F >
 > `groww-second-feed-scope-2026-06-19.md` (Groww is the sole live feed) >
 > `live-feed-purity.md` (annotation NEVER repair — `candles_*` untouched) >

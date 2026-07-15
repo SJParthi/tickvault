@@ -1,5 +1,18 @@
 # Runbook — One-command instance upgrade (type + EBS + QuestDB retune)
 
+> **⚠ 2026-07-15 update (operator Quote 8 downsize):** the instance-type LOCK is
+> now **t4g.medium** (+ `QDB_MEM_LIMIT=1g`) per
+> `daily-universe-scope-expansion-2026-05-27.md` §7 — the "lock is still
+> m8g.large" line below and the m8g.large→r8g.large command examples are
+> RETAINED as historical usage of the tool only (the lock had already moved to
+> r8g.large on 2026-06-30). Current script defaults: `--from r8g.large --to
+> t4g.medium`; a t4g.medium target auto-defaults `--qdb-mem 1g` (r8g.large
+> auto-defaults 4g); the allowlist now includes t4g.medium + t4g.large. The
+> 2026-07-15 downsize itself executes via the guarded
+> `.github/workflows/downsize-instance.yml` — this script stays the MANUAL
+> fallback and the emergency roll-UP path
+> (`--from t4g.medium --to r8g.large --qdb-mem 4g`).
+>
 > **Tool:** `scripts/aws-upgrade-instance.sh`
 > **Authority:** `.claude/rules/project/daily-universe-scope-expansion-2026-05-27.md`
 > §7 Mechanical Rule 1 (instance-type lock) + Rule 7 (in-place upgrade).

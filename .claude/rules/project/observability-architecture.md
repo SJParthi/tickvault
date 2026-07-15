@@ -46,11 +46,9 @@ now exists (`deploy/aws/terraform/error-code-alarms.tf`).
 
 Filtered+alarmed codes (each = one `error_code_alerts` map entry):
 DH-901, DH-906 (term-match tripwire — no coded emit site
-exists yet), AUTH-GAP-04, FEED-STALL-01 (ERROR lines = the
-sidecar's own >5-restarts-per-5-min STORM escalation ONLY; per-restart lines
-are warn!-level and invisible here — the ≥3-restarts-per-15-min restart pager
-is the separate `tv_feed_sidecar_stall_restart_total` counter alarm,
-`feed-stall-restart-alarm.tf`; round-3 correction 2026-07-06),
+exists yet), AUTH-GAP-04 (the Groww stall-storm entry left this list
+2026-07-15 — its only ERROR-level emit site, the deleted sidecar stall
+watchdog, died with the Groww live feed; see "Retired paging entries" below),
 WS-REINJECT-01, PROC-01, **AGGREGATOR-DROP-01 (added 2026-07-09** — the
 audit found the Severity::Critical sealed-candle-drop code, the ONLY
 silent-data-loss path for sealed candles, paged nobody; it also gains a
@@ -118,7 +116,11 @@ emit module `cross_verify_1m_boot.rs` was deleted with the Dhan instrument
 chain (the 15:31 IST Dhan live-vs-historical cross-verify has no live side
 to compare — `cross-verify-1m-error-codes.md` retirement banner), so both
 filters could never match again; the tf map entries were removed in the
-same PR (dated note in `error-code-alarms.tf`).
+same PR (dated note in `error-code-alarms.tf`). The `feed-stall-01`
+filter+alarm AND the `tv-<env>-feed-stall-restarts` counter alarm
+(`feed-stall-restart-alarm.tf`) were RETIRED 2026-07-15 with the Groww live
+feed — their emit sites (the stall watchdog + sidecar supervisor) were
+deleted, so neither could ever fire again (dated notes in both tf files).
 
 > Removed from the filtered+alarmed set: the Dhan REST canary code
 > (RETIRED 2026-07-14 with its module + both spawn sites + the
@@ -269,6 +271,7 @@ summary file and drives the above flow.
 | `.claude/triage/error-rules.yaml` | triage classifier | Phase 6 |
 | `.claude/triage/claude-loop-prompt.md` | Claude-watches-logs runbook | Phase 7 |
 | `.claude/state/triage-seen.jsonl` | edge-trigger dedup | Phase 6 |
+| `data/orders/` (+ `groww-intents-YYYYMMDD.ndjson`) | Groww order intent write-ahead ledger (fsync-per-append; IST-midnight rotation; retained, no sweeper) | Groww orders (2026-07-15) |
 
 ## What future sessions MUST NOT do
 
