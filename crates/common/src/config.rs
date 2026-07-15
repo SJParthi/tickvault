@@ -9,7 +9,7 @@ use serde::Deserialize;
 
 use crate::constants::{
     CADENCE_CHAIN_MIN_SPACING_FLOOR_MS, CADENCE_GROWW_WAVE_STEP_MS,
-    CADENCE_LADDER_MAX_RUNGS_CEILING, CADENCE_SPOT_WINDOW_CAP_CEILING,
+    CADENCE_LADDER_MAX_RUNGS_CEILING, CADENCE_SPOT_WINDOW_CAP_CEILING, CADENCE_SPOT_WINDOW_MS,
     DHAN_DATA_API_DEFAULT_TARGET_RPS, DHAN_DATA_API_RPS_CEILING, DHAN_DATA_API_RPS_FLOOR,
     SEBI_MAX_ORDERS_PER_SECOND,
 };
@@ -751,6 +751,14 @@ pub struct TfConsistencyConfig {
 /// other field carries the judge-locked serde default, so an absent
 /// `[cadence]` section (or a TOML written before this PR) disables the
 /// scheduler entirely and deserializes the full locked cadence table.
+///
+/// Level-trigger note (verifier F8, dated 2026-07-15): the per-LANE
+/// enable flags the runner consults (the `/api/feeds` toggle atomics —
+/// NOT keys in this section) are read once per cycle per lane, so a
+/// mid-cycle disable keeps that cycle's remaining fires running for at
+/// most ONE cycle (~15s worst case, the Dhan lane cutoff) before the
+/// next boundary observes the flag. Stated plainly in
+/// `.claude/rules/project/cadence-error-codes.md` too.
 #[derive(Debug, Clone, Deserialize)]
 pub struct CadenceConfig {
     /// Master switch — DEFAULT OFF (fail-safe). Flipping the DEFAULT needs
@@ -841,6 +849,23 @@ pub struct CadenceConfig {
     /// strictest interpretation). Validated ≥ 3000.
     #[serde(default = "default_cadence_chain_min_spacing_ms")]
     pub chain_min_spacing_ms: i64,
+    /// Pre-market expiry-resolution retry cadence, ms (operator spec
+    /// 2026-07-15): the boot phase re-attempts each unresolved
+    /// (broker, underlying) expiry-list fetch at this interval — from
+    /// scheduler start on a trading day until the SESSION END (15:30
+    /// IST), never giving up mid-day. Default 60_000. Validated > 0.
+    #[serde(default = "default_cadence_expiry_retry_interval_ms")]
+    pub expiry_retry_interval_ms: i64,
+    /// Pre-market expiry-resolution PAGE deadline, IST seconds-of-day
+    /// (operator spec 2026-07-15): past this instant each still-unresolved
+    /// (broker, underlying) fires ONE edge-latched CADENCE-01
+    /// `expiry_unresolved` page per episode while the background retry
+    /// continues at the same cadence. The deadline gates the PAGE, not
+    /// the attempts — a boot AFTER it (e.g. a 10:00 restart) still
+    /// resolves immediately on first success. Default 32_100 (08:55 IST).
+    /// Validated < 86_400.
+    #[serde(default = "default_cadence_expiry_deadline_secs_of_day_ist")]
+    pub expiry_deadline_secs_of_day_ist: u32,
 }
 
 /// Serde default for [`CadenceConfig::dhan_chain_offsets_ms`] — the
@@ -930,6 +955,18 @@ fn default_cadence_chain_min_spacing_ms() -> i64 {
     3_000
 }
 
+/// Serde default for [`CadenceConfig::expiry_retry_interval_ms`] — one
+/// bounded expiry-list attempt per minute (operator spec 2026-07-15).
+fn default_cadence_expiry_retry_interval_ms() -> i64 {
+    60_000
+}
+
+/// Serde default for [`CadenceConfig::expiry_deadline_secs_of_day_ist`]
+/// — 08:55 IST (operator spec 2026-07-15; the pre-market page deadline).
+fn default_cadence_expiry_deadline_secs_of_day_ist() -> u32 {
+    8 * 3600 + 55 * 60
+}
+
 impl Default for CadenceConfig {
     /// Manual impl so `Default` matches the serde field defaults exactly
     /// (the `Spot1mRestConfig` precedent — a derived `Default` would zero
@@ -956,6 +993,8 @@ impl Default for CadenceConfig {
             groww_request_timeout_ms: default_cadence_groww_request_timeout_ms(),
             groww_lane_cutoff_ms: default_cadence_groww_lane_cutoff_ms(),
             chain_min_spacing_ms: default_cadence_chain_min_spacing_ms(),
+            expiry_retry_interval_ms: default_cadence_expiry_retry_interval_ms(),
+            expiry_deadline_secs_of_day_ist: default_cadence_expiry_deadline_secs_of_day_ist(),
         }
     }
 }
@@ -968,10 +1007,10 @@ impl CadenceConfig {
     ///
     /// # Errors
     /// Returns a descriptive error for the first violation found: chain
-    /// gaps under 3s, spot spacing under 334ms, negative clamps,
-    /// non-positive cutoffs/timeouts, rungs above the :50 floor, an
-    /// unknown recovery mode, or a Groww cutoff at/below the burst
-    /// verdict.
+    /// gaps under 3s, a spot window cap outside 1..=5, out-of-range spot
+    /// anchor / expiry knobs, negative clamps, non-positive
+    /// cutoffs/timeouts, rungs above the :50 floor, an unknown recovery
+    /// mode, or a Groww cutoff at/below the burst verdict.
     pub fn validate(&self) -> Result<()> {
         if self.chain_min_spacing_ms < CADENCE_CHAIN_MIN_SPACING_FLOOR_MS {
             bail!(
@@ -1015,6 +1054,29 @@ impl CadenceConfig {
             bail!(
                 "cadence.spot_min_post_close_ms ({}) must be >= 0 (a spot can never fire pre-close)",
                 self.spot_min_post_close_ms
+            );
+        }
+        // Range-validate the spot anchor (verifier fix package,
+        // 2026-07-15): a negative anchor would target pre-close spots
+        // (the clamp would silently rewrite every slot — refuse the
+        // degenerate config instead), and an anchor whose DEEPEST
+        // concurrency-ladder group (step 3 = base + 3 windows) lands
+        // at/after the Dhan cutoff could never fire its tail legs.
+        if self.dhan_spot_start_offset_ms < 0 {
+            bail!(
+                "cadence.dhan_spot_start_offset_ms ({}) must be >= 0 (the just-closed candle cannot exist pre-close)",
+                self.dhan_spot_start_offset_ms
+            );
+        }
+        let deepest_spot_group_ms = self
+            .dhan_spot_start_offset_ms
+            .saturating_add(3_i64.saturating_mul(CADENCE_SPOT_WINDOW_MS));
+        if deepest_spot_group_ms >= self.dhan_lane_cutoff_ms {
+            bail!(
+                "cadence.dhan_spot_start_offset_ms ({}) is too late: the deepest concurrency-ladder group (base + 3 windows = {}ms past T) must land strictly before dhan_lane_cutoff_ms ({})",
+                self.dhan_spot_start_offset_ms,
+                deepest_spot_group_ms,
+                self.dhan_lane_cutoff_ms
             );
         }
         if self.dhan_ladder_step_ms <= 0 {
@@ -1081,6 +1143,19 @@ impl CadenceConfig {
             bail!(
                 "cadence groww worst-case cycle tail ({}ms = worst shape verdict + 7 sequential fallback legs) must end strictly before the next minute's burst (60000ms)",
                 worst_groww_tail_ms
+            );
+        }
+        // Expiry-resolution boot phase knobs (operator spec 2026-07-15).
+        if self.expiry_retry_interval_ms <= 0 {
+            bail!(
+                "cadence.expiry_retry_interval_ms ({}) must be > 0 (the bounded pre-market retry cadence)",
+                self.expiry_retry_interval_ms
+            );
+        }
+        if self.expiry_deadline_secs_of_day_ist >= 86_400 {
+            bail!(
+                "cadence.expiry_deadline_secs_of_day_ist ({}) must be < 86400 (an IST seconds-of-day instant)",
+                self.expiry_deadline_secs_of_day_ist
             );
         }
         Ok(())
@@ -5260,6 +5335,9 @@ mod tests {
         assert_eq!(d.groww_request_timeout_ms, 1_500);
         assert_eq!(d.groww_lane_cutoff_ms, 6_000);
         assert_eq!(d.chain_min_spacing_ms, 3_000);
+        // The 2026-07-15 pre-market expiry-resolution knobs.
+        assert_eq!(d.expiry_retry_interval_ms, 60_000);
+        assert_eq!(d.expiry_deadline_secs_of_day_ist, 32_100); // 08:55 IST
         assert!(d.validate().is_ok(), "the shipped defaults must validate");
 
         #[derive(Deserialize)]
@@ -5402,6 +5480,61 @@ mod tests {
         cfg.recovery_mode = "step_back_one".to_string();
         cfg.dhan_ladder_max_rungs = 6;
         assert!(cfg.validate().is_err());
+    }
+
+    /// Cadence validate(): the 2026-07-15 range checks — the spot anchor
+    /// must be non-negative with its DEEPEST concurrency-ladder group
+    /// strictly inside the Dhan cutoff; a large negative Groww anchor is
+    /// rejected (pre-existing >= 0 rule, pinned here per the verifier's
+    /// unnumbered finding); the expiry knobs are bounded sane.
+    #[test]
+    fn test_cadence_config_validate_rejects_out_of_range_spot_anchor_and_expiry_knobs() {
+        // Negative spot anchor (pre-close target) is refused.
+        let mut cfg = CadenceConfig::default();
+        cfg.dhan_spot_start_offset_ms = -1;
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("dhan_spot_start_offset_ms"),
+            "unexpected error: {err}"
+        );
+        // An anchor whose deepest group (base + 3 windows) reaches the
+        // cutoff is refused (12000 + 3000 >= 15000).
+        cfg.dhan_spot_start_offset_ms = 12_000;
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("deepest concurrency-ladder group"),
+            "unexpected error: {err}"
+        );
+        // The boundary just inside is legal (11999 + 3000 < 15000).
+        cfg.dhan_spot_start_offset_ms = 11_999;
+        assert!(cfg.validate().is_ok());
+        // A LARGE NEGATIVE Groww anchor is rejected (the burst is a
+        // post-close fire — a pre-close burst would race the close).
+        cfg.dhan_spot_start_offset_ms = 3_000;
+        cfg.groww_anchor_offset_ms = -60_000;
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("groww_anchor_offset_ms"),
+            "unexpected error: {err}"
+        );
+        // Expiry knobs: a non-positive retry interval and a deadline
+        // outside the seconds-of-day domain are refused.
+        cfg.groww_anchor_offset_ms = 0;
+        cfg.expiry_retry_interval_ms = 0;
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("expiry_retry_interval_ms"),
+            "unexpected error: {err}"
+        );
+        cfg.expiry_retry_interval_ms = 60_000;
+        cfg.expiry_deadline_secs_of_day_ist = 86_400;
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("expiry_deadline_secs_of_day_ist"),
+            "unexpected error: {err}"
+        );
+        cfg.expiry_deadline_secs_of_day_ist = 32_100;
+        assert!(cfg.validate().is_ok());
     }
 
     /// PR-4 (Groww contract leg): the `[groww_contract_1m]` section is

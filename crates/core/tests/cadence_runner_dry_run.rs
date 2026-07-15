@@ -24,9 +24,11 @@ use tickvault_core::cadence::decision::{
     DecisionLatch, DecisionOutcome, DecisionSnapshot, SkipReason, emit_decision,
 };
 use tickvault_core::cadence::executor::{
-    CadenceExecutor, CadenceFetchError, ChainFetchOk, ChainFetchRequest, ExpiryResolver,
-    SpotFetchRequest, SpotSnapshot, SpotTarget, StubExpiryResolver,
+    CadenceExecutor, CadenceFetchError, ChainFetchOk, ChainFetchRequest, ExpiryListRequest,
+    ExpiryResolver, SpotFetchRequest, SpotSnapshot, SpotTarget, StubExpiryResolver,
 };
+use tickvault_core::cadence::expiry::DayLockedExpiryStore;
+use tickvault_core::cadence::gate::DhanGates;
 use tickvault_core::cadence::runner::{
     CadenceClock, CadenceRunnerDeps, LoopExit, run_cadence_loop, spawn_supervised_cadence_runner,
 };
@@ -136,6 +138,11 @@ struct RecordingExecutor {
     start: tokio::time::Instant,
     chain_verdict: fn(&ChainFetchRequest, usize) -> Result<ChainFetchOk, CadenceFetchError>,
     spot_verdict: fn(&SpotFetchRequest, usize) -> Result<SpotSnapshot, CadenceFetchError>,
+    /// Scripted expiry-list verdict (Workstream A, 2026-07-15): consulted
+    /// only when the deps carry an `expiry_store` (the resolution loop);
+    /// the legacy tests pass `expiry_store: None`, so `empty_expiry_list`
+    /// is never reached there.
+    expiry_verdict: fn(&ExpiryListRequest) -> Result<Vec<u32>, CadenceFetchError>,
 }
 
 impl RecordingExecutor {
@@ -225,6 +232,17 @@ impl CadenceExecutor for RecordingExecutor {
             verdict
         }
     }
+
+    fn fetch_expiry_list(
+        &self,
+        req: ExpiryListRequest,
+    ) -> impl std::future::Future<Output = Result<Vec<u32>, CadenceFetchError>> + Send {
+        let verdict = (self.expiry_verdict)(&req);
+        async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            verdict
+        }
+    }
 }
 
 /// 09:15:50 IST — 10s before the first joinable boundary (09:16:00).
@@ -241,14 +259,19 @@ fn deps_with(
     Arc<Notify>,
 ) {
     let shutdown = Arc::new(Notify::new());
+    let config = CadenceConfig::default();
+    let gates = test_gates(&config);
     let deps = CadenceRunnerDeps {
-        config: CadenceConfig::default(),
+        config,
         calendar: test_calendar(),
         dhan_executor: Arc::clone(&exec),
         groww_executor: exec,
         dhan_enabled: Arc::new(AtomicBool::new(dhan_on)),
         groww_enabled: Arc::new(AtomicBool::new(groww_on)),
         expiry_resolver: Arc::new(StubExpiryResolver),
+        expiry_store: None,
+        gates,
+        dry_run: false,
         shutdown: Arc::clone(&shutdown),
     };
     (deps, shutdown)
@@ -260,6 +283,19 @@ fn empty_chain(_req: &ChainFetchRequest, _prior: usize) -> Result<ChainFetchOk, 
 
 fn empty_spot(_req: &SpotFetchRequest, _prior: usize) -> Result<SpotSnapshot, CadenceFetchError> {
     Err(CadenceFetchError::Empty)
+}
+
+fn empty_expiry_list(_req: &ExpiryListRequest) -> Result<Vec<u32>, CadenceFetchError> {
+    Err(CadenceFetchError::Empty)
+}
+
+/// Fresh isolated Dhan gates for one test (production shares the
+/// process-global registry; tests must never contend across threads).
+fn test_gates(cfg: &CadenceConfig) -> Arc<DhanGates> {
+    Arc::new(DhanGates::new(
+        cfg.chain_min_spacing_ms,
+        cfg.spot_window_cap,
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -280,6 +316,7 @@ async fn test_cadence_runner_dry_run_full_cycle_emits_decisions_or_skips() {
         start: tokio::time::Instant::now(),
         chain_verdict: empty_chain,
         spot_verdict: empty_spot,
+        expiry_verdict: empty_expiry_list,
     });
     let (deps, shutdown) = deps_with(Arc::clone(&exec), true, true);
     let clock = Arc::new(TestClock {
@@ -452,6 +489,7 @@ async fn test_groww_burst_fallback_refetches_only_failures() {
         start: tokio::time::Instant::now(),
         chain_verdict,
         spot_verdict,
+        expiry_verdict: empty_expiry_list,
     });
     // Groww-only lane (Dhan disabled — isolates the burst semantics).
     let (deps, shutdown) = deps_with(Arc::clone(&exec), false, true);
@@ -556,7 +594,8 @@ fn test_honest_skip_at_cutoff_emits_alert_once() {
         spot_provenance: [None; ChainUnderlying::COUNT],
     };
     assert!(latch.try_latch(snap.lane, snap.cycle_minute_ist));
-    emit_decision(&snap); // one CADENCE-02-coded emission
+    emit_decision(&snap, false); // one CADENCE-02-coded emission
+    emit_decision(&snap, true); // F10: dry-run demotes to info! (no panic path)
     assert!(
         !latch.try_latch(snap.lane, snap.cycle_minute_ist),
         "a second cutoff/late-completion race can never re-emit"
@@ -584,6 +623,7 @@ async fn test_cadence_runner_reenable_after_both_disabled_park_still_cycles() {
         start: tokio::time::Instant::now(),
         chain_verdict: empty_chain,
         spot_verdict: empty_spot,
+        expiry_verdict: empty_expiry_list,
     });
     let shutdown = Arc::new(Notify::new());
     let groww_enabled = Arc::new(AtomicBool::new(false));
@@ -595,6 +635,9 @@ async fn test_cadence_runner_reenable_after_both_disabled_park_still_cycles() {
         dhan_enabled: Arc::new(AtomicBool::new(false)),
         groww_enabled: Arc::clone(&groww_enabled),
         expiry_resolver: Arc::new(StubExpiryResolver),
+        expiry_store: None,
+        gates: test_gates(&CadenceConfig::default()),
+        dry_run: false,
         shutdown: Arc::clone(&shutdown),
     };
     let clock = Arc::new(TestClock {
@@ -662,6 +705,7 @@ async fn test_cadence_supervisor_graceful_shutdown_not_respawning() {
         start: tokio::time::Instant::now(),
         chain_verdict: empty_chain,
         spot_verdict: empty_spot,
+        expiry_verdict: empty_expiry_list,
     });
     let (deps, shutdown) = deps_with(exec, false, false);
     let handle = spawn_supervised_cadence_runner(deps);
@@ -732,6 +776,7 @@ async fn test_cadence_expiry_resolver_stamps_requests_when_resolved() {
         start: tokio::time::Instant::now(),
         chain_verdict: empty_chain,
         spot_verdict: empty_spot,
+        expiry_verdict: empty_expiry_list,
     });
     let shutdown = Arc::new(Notify::new());
     let deps = CadenceRunnerDeps {
@@ -742,6 +787,9 @@ async fn test_cadence_expiry_resolver_stamps_requests_when_resolved() {
         dhan_enabled: Arc::new(AtomicBool::new(true)),
         groww_enabled: Arc::new(AtomicBool::new(true)),
         expiry_resolver: Arc::new(FixedExpiry),
+        expiry_store: None,
+        gates: test_gates(&CadenceConfig::default()),
+        dry_run: false,
         shutdown: Arc::clone(&shutdown),
     };
     let clock = Arc::new(TestClock {
@@ -814,6 +862,7 @@ async fn test_dhan_spot_ladder_rate_limit_mid_ladder_degrades_then_recovers() {
         start: tokio::time::Instant::now(),
         chain_verdict: chain_ok,
         spot_verdict,
+        expiry_verdict: empty_expiry_list,
     });
     // Dhan-only lane (isolates the spot ladder from the Groww shapes).
     let (deps, shutdown) = deps_with(Arc::clone(&exec), true, false);
@@ -913,6 +962,7 @@ async fn test_groww_three_choice_ladder_all_transitions_and_vix_waves() {
         start: tokio::time::Instant::now(),
         chain_verdict: chain_ok,
         spot_verdict,
+        expiry_verdict: empty_expiry_list,
     });
     // Groww-only lane (the shape ladder is independent of Dhan's).
     let (deps, shutdown) = deps_with(Arc::clone(&exec), false, true);
@@ -1011,4 +1061,353 @@ async fn test_groww_three_choice_ladder_all_transitions_and_vix_waves() {
             next_anchor
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Workstream A (2026-07-15): pre-market expiry resolution end-to-end
+// ---------------------------------------------------------------------------
+
+#[tokio::test(start_paused = true)]
+async fn test_cadence_runner_expiry_boot_phase_resolves_and_stamps() {
+    // The boot-phase resolution loop end-to-end: both brokers' expiry
+    // lists resolve at spawn (bounded retry never needed — first attempt
+    // succeeds), the day-locked store records the POLICY dates, and the
+    // FIRST cycle's chain requests are stamped per-underlying from the
+    // store's winning date — NIFTY/SENSEX = nearest active date;
+    // BANKNIFTY = the nearest active month's LAST date (never flat min).
+    fn expiry_list(_req: &ExpiryListRequest) -> Result<Vec<u32>, CadenceFetchError> {
+        // Unsorted vendor-raw list: weeklies 16/23 July + monthly-last 30
+        // July + an August date + garbage. Today = 2026-07-14 ⇒
+        // NearestActiveDate = 20260716; LastExpiryOfNearestActiveMonth =
+        // 20260730.
+        Ok(vec![
+            20_260_723, 20_260_716, 99_999_999, 20_260_730, 20_260_806,
+        ])
+    }
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let exec = Arc::new(RecordingExecutor {
+        log: Arc::clone(&log),
+        start: tokio::time::Instant::now(),
+        chain_verdict: empty_chain,
+        spot_verdict: empty_spot,
+        expiry_verdict: expiry_list,
+    });
+    let shutdown = Arc::new(Notify::new());
+    let store = Arc::new(DayLockedExpiryStore::new());
+    let config = CadenceConfig::default();
+    let gates = test_gates(&config);
+    let deps = CadenceRunnerDeps {
+        config,
+        calendar: test_calendar(),
+        dhan_executor: Arc::clone(&exec),
+        groww_executor: exec,
+        dhan_enabled: Arc::new(AtomicBool::new(true)),
+        groww_enabled: Arc::new(AtomicBool::new(true)),
+        // The store IS the resolver read facade (production wiring).
+        expiry_resolver: Arc::clone(&store) as Arc<dyn ExpiryResolver>,
+        expiry_store: Some(Arc::clone(&store)),
+        gates,
+        dry_run: false,
+        shutdown: Arc::clone(&shutdown),
+    };
+    let date = NaiveDate::from_ymd_opt(2026, 7, 14).expect("valid date"); // Tuesday
+    let clock = Arc::new(TestClock {
+        anchor: tokio::time::Instant::now(),
+        base_wall_ms: BASE_WALL_MS,
+        date,
+    });
+    let task = tokio::spawn(run_cadence_loop(clock, deps));
+    for _ in 0..30 {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+    shutdown.notify_waiters();
+    let exit = tokio::time::timeout(std::time::Duration::from_secs(120), task)
+        .await
+        .expect("runner must exit after shutdown")
+        .expect("runner task must not panic");
+    assert_eq!(exit, LoopExit::Shutdown);
+
+    // The store is day-locked with the POLICY dates per underlying.
+    let nifty = store.view(date, ChainUnderlying::Nifty);
+    let banknifty = store.view(date, ChainUnderlying::Banknifty);
+    assert_eq!(
+        nifty.winner.map(|d| d.yyyymmdd()),
+        Some(20_260_716),
+        "NIFTY = NearestActiveDate"
+    );
+    assert_eq!(
+        banknifty.winner.map(|d| d.yyyymmdd()),
+        Some(20_260_730),
+        "BANKNIFTY = the nearest active month's LAST date, never flat min"
+    );
+    assert!(!nifty.disagreement, "identical broker lists never disagree");
+    // Every chain request carries the store's winning stamp.
+    // APPROVED (test-only): poisoned mutex propagates the panic.
+    #[allow(clippy::unwrap_used)]
+    let calls = log.lock().unwrap().clone();
+    for c in &calls {
+        if let RecordedCall::Chain {
+            underlying,
+            expiry_yyyymmdd,
+            ..
+        } = c
+        {
+            let expected = match underlying {
+                ChainUnderlying::Banknifty => 20_260_730,
+                ChainUnderlying::Nifty | ChainUnderlying::Sensex => 20_260_716,
+            };
+            assert_eq!(
+                *expiry_yyyymmdd,
+                Some(expected),
+                "chain request for {underlying:?} must carry the day-locked policy date"
+            );
+        }
+    }
+    assert!(
+        calls
+            .iter()
+            .any(|c| matches!(c, RecordedCall::Chain { .. })),
+        "the cycle must have fired chains"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn test_cadence_runner_expiry_disagreement_dhan_wins_both_lanes() {
+    // The DISAGREEMENT arm (operator spec 2026-07-15): both brokers
+    // resolve, dates differ ⇒ Dhan WINS for keying BOTH lanes; the store
+    // records both raws + the disagreement verdict (the edge-latched
+    // CADENCE-01 `expiry_disagreement` fires once — asserted here via
+    // the store's latch, the log side is the tag-guard's domain).
+    fn expiry_list(req: &ExpiryListRequest) -> Result<Vec<u32>, CadenceFetchError> {
+        match req.broker {
+            Feed::Dhan => Ok(vec![20_260_716]),
+            Feed::Groww => Ok(vec![20_260_717]),
+        }
+    }
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let exec = Arc::new(RecordingExecutor {
+        log: Arc::clone(&log),
+        start: tokio::time::Instant::now(),
+        chain_verdict: empty_chain,
+        spot_verdict: empty_spot,
+        expiry_verdict: expiry_list,
+    });
+    let shutdown = Arc::new(Notify::new());
+    let store = Arc::new(DayLockedExpiryStore::new());
+    let config = CadenceConfig::default();
+    let gates = test_gates(&config);
+    let deps = CadenceRunnerDeps {
+        config,
+        calendar: test_calendar(),
+        dhan_executor: Arc::clone(&exec),
+        groww_executor: exec,
+        dhan_enabled: Arc::new(AtomicBool::new(true)),
+        groww_enabled: Arc::new(AtomicBool::new(true)),
+        expiry_resolver: Arc::clone(&store) as Arc<dyn ExpiryResolver>,
+        expiry_store: Some(Arc::clone(&store)),
+        gates,
+        dry_run: false,
+        shutdown: Arc::clone(&shutdown),
+    };
+    let date = NaiveDate::from_ymd_opt(2026, 7, 14).expect("valid date");
+    let clock = Arc::new(TestClock {
+        anchor: tokio::time::Instant::now(),
+        base_wall_ms: BASE_WALL_MS,
+        date,
+    });
+    let task = tokio::spawn(run_cadence_loop(clock, deps));
+    for _ in 0..30 {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+    shutdown.notify_waiters();
+    let exit = tokio::time::timeout(std::time::Duration::from_secs(120), task)
+        .await
+        .expect("runner must exit after shutdown")
+        .expect("runner task must not panic");
+    assert_eq!(exit, LoopExit::Shutdown);
+
+    let view = store.view(date, ChainUnderlying::Nifty);
+    assert_eq!(view.dhan_raw.map(|d| d.yyyymmdd()), Some(20_260_716));
+    assert_eq!(view.groww_raw.map(|d| d.yyyymmdd()), Some(20_260_717));
+    assert_eq!(
+        view.winner.map(|d| d.yyyymmdd()),
+        Some(20_260_716),
+        "Dhan WINS the disagreement"
+    );
+    assert!(view.disagreement, "the disagreement verdict is recorded");
+    // BOTH lanes' chain requests are keyed on the DHAN date.
+    // APPROVED (test-only): poisoned mutex propagates the panic.
+    #[allow(clippy::unwrap_used)]
+    let calls = log.lock().unwrap().clone();
+    let groww_chains: Vec<_> = calls
+        .iter()
+        .filter(|c| {
+            matches!(
+                c,
+                RecordedCall::Chain {
+                    feed: Feed::Groww,
+                    ..
+                }
+            )
+        })
+        .collect();
+    assert!(!groww_chains.is_empty(), "Groww chains must have fired");
+    assert!(
+        groww_chains.iter().all(|c| matches!(
+            c,
+            RecordedCall::Chain {
+                expiry_yyyymmdd: Some(20_260_716),
+                ..
+            }
+        )),
+        "the GROWW lane is keyed on the winning DHAN date"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Verifier F4 (2026-07-15): the verdict never refetches an in-flight leg
+// ---------------------------------------------------------------------------
+
+/// A Groww executor whose BANKNIFTY chain leg is SLOW (completes after
+/// the ~T+800ms verdict instant, before the lane cutoff) — the F4 probe.
+struct SlowLegExecutor {
+    log: Arc<Mutex<Vec<RecordedCall>>>,
+    start: tokio::time::Instant,
+}
+
+impl CadenceExecutor for SlowLegExecutor {
+    fn fetch_chain(
+        &self,
+        req: ChainFetchRequest,
+    ) -> impl std::future::Future<Output = Result<ChainFetchOk, CadenceFetchError>> + Send {
+        {
+            // APPROVED (test-only): poisoned mutex propagates the panic.
+            #[allow(clippy::unwrap_used)]
+            let mut log = self.log.lock().unwrap();
+            // APPROVED: paused-test elapsed fits i64 comfortably.
+            #[allow(clippy::cast_possible_truncation)]
+            log.push(RecordedCall::Chain {
+                feed: req.feed,
+                underlying: req.underlying,
+                cycle_minute_ist: req.cycle_minute_ist,
+                expiry_yyyymmdd: req.expiry_yyyymmdd,
+                at_ms: self.start.elapsed().as_millis() as i64,
+            });
+        }
+        let slow = req.underlying == ChainUnderlying::Banknifty;
+        async move {
+            // The slow leg is still IN FLIGHT at the verdict (~+800ms)
+            // and lands well inside the lane cutoff.
+            let delay = if slow { 3_000 } else { 50 };
+            tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+            Ok(ChainFetchOk {
+                underlying_spot: Some(24_500.0),
+                published_to_registry: false,
+            })
+        }
+    }
+
+    fn fetch_spot(
+        &self,
+        req: SpotFetchRequest,
+    ) -> impl std::future::Future<Output = Result<SpotSnapshot, CadenceFetchError>> + Send {
+        {
+            // APPROVED (test-only): poisoned mutex propagates the panic.
+            #[allow(clippy::unwrap_used)]
+            let mut log = self.log.lock().unwrap();
+            // APPROVED: paused-test elapsed fits i64 comfortably.
+            #[allow(clippy::cast_possible_truncation)]
+            log.push(RecordedCall::Spot {
+                feed: req.feed,
+                target: req.target,
+                cycle_minute_ist: req.cycle_minute_ist,
+                at_ms: self.start.elapsed().as_millis() as i64,
+            });
+        }
+        let minute = req.cycle_minute_ist;
+        async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            Ok(SpotSnapshot {
+                price: 24_500.0,
+                source_minute_ist: minute,
+                received_at_epoch_ms: 0,
+            })
+        }
+    }
+
+    fn fetch_expiry_list(
+        &self,
+        _req: ExpiryListRequest,
+    ) -> impl std::future::Future<Output = Result<Vec<u32>, CadenceFetchError>> + Send {
+        async move { Err(CadenceFetchError::Empty) }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn test_groww_verdict_skips_inflight_leg_never_duplicates() {
+    // Verifier F4 (2026-07-15): a leg whose ORIGINAL request is still in
+    // flight at the ~T+800ms verdict must NOT be refetched — the pre-fix
+    // "Err OR still pending" read fired a duplicate concurrent BANKNIFTY
+    // request here (count 2); the fix skips it (count stays 1) and the
+    // slow original still lands first-write-wins inside the cutoff.
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let exec = Arc::new(SlowLegExecutor {
+        log: Arc::clone(&log),
+        start: tokio::time::Instant::now(),
+    });
+    let shutdown = Arc::new(Notify::new());
+    let config = CadenceConfig::default();
+    let gates = test_gates(&config);
+    let deps = CadenceRunnerDeps {
+        config,
+        calendar: test_calendar(),
+        dhan_executor: Arc::clone(&exec),
+        groww_executor: exec,
+        // Groww-only lane (isolates the burst/verdict semantics).
+        dhan_enabled: Arc::new(AtomicBool::new(false)),
+        groww_enabled: Arc::new(AtomicBool::new(true)),
+        expiry_resolver: Arc::new(StubExpiryResolver),
+        expiry_store: None,
+        gates,
+        dry_run: false,
+        shutdown: Arc::clone(&shutdown),
+    };
+    let clock = Arc::new(TestClock {
+        anchor: tokio::time::Instant::now(),
+        base_wall_ms: BASE_WALL_MS,
+        date: NaiveDate::from_ymd_opt(2026, 7, 14).expect("valid date"),
+    });
+    let task = tokio::spawn(run_cadence_loop(clock, deps));
+    for _ in 0..30 {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+    shutdown.notify_waiters();
+    let exit = tokio::time::timeout(std::time::Duration::from_secs(120), task)
+        .await
+        .expect("runner must exit after shutdown")
+        .expect("runner task must not panic");
+    assert_eq!(exit, LoopExit::Shutdown);
+
+    // APPROVED (test-only): poisoned mutex propagates the panic.
+    #[allow(clippy::unwrap_used)]
+    let calls = log.lock().unwrap().clone();
+    let banknifty_first_cycle = calls
+        .iter()
+        .filter(|c| {
+            c.minute() == FIRST_CYCLE_MINUTE
+                && matches!(
+                    c,
+                    RecordedCall::Chain {
+                        feed: Feed::Groww,
+                        underlying: ChainUnderlying::Banknifty,
+                        ..
+                    }
+                )
+        })
+        .count();
+    assert_eq!(
+        banknifty_first_cycle, 1,
+        "the in-flight BANKNIFTY leg is NEVER refetched by the verdict \
+         (F4: no duplicate concurrent same-leg request)"
+    );
 }

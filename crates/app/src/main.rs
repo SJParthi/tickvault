@@ -11845,6 +11845,12 @@ async fn run_process_runloop(
 
     notifier.notify(NotificationEvent::ShutdownInitiated);
 
+    // Cadence runner graceful teardown (verifier F2, 2026-07-15): the
+    // spawn's Notify previously parked unnotified in a `_cadence_shutdown`
+    // binding — the runner never saw a graceful shutdown. No-op when the
+    // scheduler is disabled / never spawned.
+    tickvault_app::cadence_boot::notify_cadence_shutdown();
+
     // Second Ctrl+C → force exit.
     tokio::spawn(async {
         let _ = tokio::signal::ctrl_c().await;

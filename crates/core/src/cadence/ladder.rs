@@ -63,6 +63,7 @@ impl StreakLadder {
     /// `spot_window_cap` below the full group size floors the Dhan spot
     /// step via [`min_spot_step_for_cap`]).
     #[must_use]
+    // TEST-EXEMPT: covered by the StreakLadder unit tests (floor-start arms; guard name-pattern mismatch).
     pub fn starting_at(min_step: u8) -> Self {
         Self {
             step: min_step,
@@ -132,6 +133,7 @@ pub fn spot_group_index(step: u8, target_idx: usize) -> usize {
 /// (a cap of 4..=5 admits the full step-0 simultaneous group; 3 → step 1;
 /// 2 → step 2; 1 → fully sequential). Pure.
 #[must_use]
+// TEST-EXEMPT: covered by the spot-cap floor arms of the StreakLadder unit tests (guard name-pattern mismatch).
 pub fn min_spot_step_for_cap(cap: u32) -> u8 {
     match cap {
         0 | 1 => 3, // 0 is unreachable post-validate; fail-closed sequential
@@ -200,6 +202,21 @@ pub fn next_rung(cur: u8, verdict: CycleVerdict, max_rungs: u8) -> u8 {
 /// - `Auth` / `Malformed` do NOT arm it: neither is a pacing/serving-lag
 ///   signal (shifting the schedule earlier cannot fix a dead token or a
 ///   schema drift); both still degrade the lane loudly via CADENCE-01.
+/// - `QueueDelay` does NOT arm it (verifier F1(iii), dated 2026-07-15): a
+///   shared-limiter queue deadline miss is SELF-INFLICTED pacing — the
+///   scheduler's own composition with the `dhan_data_api_limiter` — not a
+///   vendor signal; arming on it would let our own defense-in-depth
+///   limiter walk the anchor earlier forever.
+///
+/// STRENGTHENED ASSUMED FLAG (verifier F7, dated 2026-07-15): the
+/// operator's verbatim rule arms the ladder on ANY arming failure in the
+/// cycle EVEN WHEN an in-cycle retry recovered the leg. Under a perfectly
+/// alternating fail/clean minute pattern this yields a permanent
+/// AMPLITUDE-1 rung oscillation (0 ↔ 1) — accepted as the CURRENT
+/// CONTRACT (pinned by
+/// `test_ladder_any_failure_arming_amplitude_1_oscillation`), flagged
+/// Assumed pending operator confirmation of a "recovered-in-cycle does
+/// not arm" refinement.
 #[must_use]
 pub fn failure_arms_ladder(err: &CadenceFetchError) -> bool {
     matches!(
@@ -324,8 +341,8 @@ mod tests {
         assert_eq!(next_rung(2, CycleVerdict::DhanFailed, 3), 3);
         assert_eq!(next_rung(3, CycleVerdict::DhanFailed, 3), 3);
         assert_eq!(next_rung(0, CycleVerdict::FloorExhausted, 3), 3);
-        // failure_arms_ladder is total over the 6-variant error enum —
-        // exactly 3 arm, 3 do not (a new variant must pick a side here).
+        // failure_arms_ladder is total over the 7-variant error enum —
+        // exactly 3 arm, 4 do not (a new variant must pick a side here).
         let arms = [
             failure_arms_ladder(&CadenceFetchError::RateLimited {
                 retry_after_ms: None,
@@ -333,11 +350,51 @@ mod tests {
             failure_arms_ladder(&CadenceFetchError::Timeout),
             failure_arms_ladder(&CadenceFetchError::Transport),
             failure_arms_ladder(&CadenceFetchError::Empty),
+            failure_arms_ladder(&CadenceFetchError::QueueDelay),
             failure_arms_ladder(&CadenceFetchError::Auth),
             failure_arms_ladder(&CadenceFetchError::Malformed),
         ];
         assert_eq!(arms.iter().filter(|a| **a).count(), 3);
-        assert_eq!(arms, [true, true, true, false, false, false]);
+        assert_eq!(arms, [true, true, true, false, false, false, false]);
+    }
+
+    #[test]
+    fn test_ladder_queue_delay_is_non_arming_but_retryable() {
+        // F1(iii), 2026-07-15: a shared-limiter queue deadline miss is
+        // SELF-INFLICTED pacing — it must NEVER walk the anchor ladder…
+        assert!(!failure_arms_ladder(&CadenceFetchError::QueueDelay));
+        // …but it IS retryable in-cycle (the pacing spill clears within
+        // the window; one more gated attempt is legitimate).
+        assert!(may_retry_in_cycle(
+            &CadenceFetchError::QueueDelay,
+            0,
+            1,
+            5_000,
+            1_500,
+            15_000
+        ));
+    }
+
+    #[test]
+    fn test_ladder_any_failure_arming_amplitude_1_oscillation() {
+        // F7, 2026-07-15 — CURRENT CONTRACT PIN (Assumed, flagged): the
+        // cycle verdict arms on ANY arming failure even when an in-cycle
+        // retry recovered the leg, so a perfectly alternating fail/clean
+        // minute pattern oscillates the anchor rung 0 ↔ 1 forever —
+        // amplitude 1, never runaway. This test DOCUMENTS the accepted
+        // oscillation; a future "recovered-in-cycle does not arm"
+        // refinement (operator decision) would change these assertions.
+        let max = 5;
+        let mut rung = 0u8;
+        for _ in 0..4 {
+            rung = next_rung(rung, CycleVerdict::DhanFailed, max);
+            assert_eq!(rung, 1, "failed minute shifts home → rung 1");
+            rung = next_rung(rung, CycleVerdict::Clean, max);
+            assert_eq!(rung, 0, "clean minute recovers rung 1 → home");
+        }
+        // The oscillation is bounded at amplitude 1: it can never walk
+        // deeper without CONSECUTIVE failing cycles.
+        assert!(rung <= 1);
     }
 
     #[test]
