@@ -136,15 +136,28 @@ pub enum EpisodeFamily {
     /// The Dhan per-minute REST candle/chain pulls as live-edited incident
     /// bubbles (2026-07-15 coordinator-relayed cleanliness directive): each
     /// leg's Degraded/Recovered pair folds into ONE bubble per
-    /// `(family, leg)` — `conn` 0 = spot pulls, 1 = option-chain pulls,
-    /// 8..=11 = per-index not-served slots (15 = unrecognized symbol).
-    /// Token Criticals stay LEGACY forever (Critical never episode-folds).
-    /// Dynamic like the WS families: snapshotted, tick-promoted,
-    /// tick-expired.
+    /// `(family, leg)`. The `conn` slot map (G10 doc sync, fix round 2 —
+    /// MUST stay lockstep with `events.rs::rest_slot` /
+    /// `events.rs::chain_rest_slot` and [`Self::slot_desc`]):
+    /// 0 = spot pulls, 1 = option-chain pulls,
+    /// 7 = CHAIN not-served catch-all,
+    /// 8..=11 = SPOT not-served (NIFTY / BANKNIFTY / SENSEX / INDIA VIX),
+    /// 12..=14 = CHAIN not-served (NIFTY / BANKNIFTY / SENSEX),
+    /// 15 = SPOT not-served catch-all. The spot and chain per-symbol
+    /// ranges are DISJOINT (F1) so one leg's recovery can never close the
+    /// other's bubble. Token Criticals stay LEGACY forever (Critical never
+    /// episode-folds). Dynamic like the WS families: snapshotted,
+    /// tick-promoted; Down bubbles are EXEMPT from stale expiry (G1 —
+    /// the routed REST emitters are once-per-episode edge-latched, so an
+    /// event-less hour is a still-failing incident, not a dead bubble).
     DhanRest,
     /// The Groww per-minute REST candle/chain/contract pulls — the Groww
-    /// twin of [`Self::DhanRest`]: `conn` 0 = spot, 1 = chain,
-    /// 2 = contracts, 8..=11 = per-underlying not-served slots.
+    /// twin of [`Self::DhanRest`], SAME slot map: `conn` 0 = spot,
+    /// 1 = chain, 2 = contracts, 12..=14 = per-underlying CHAIN
+    /// not-served (NIFTY / BANKNIFTY / SENSEX; catch-all 7). Slots
+    /// 8..=11/15 are RESERVED for a future Groww per-symbol SPOT pair —
+    /// they are unused today (G10: the pre-F1 doc wrongly claimed the
+    /// chain pairs lived on 8..=11).
     GrowwRest,
 }
 
@@ -290,6 +303,57 @@ impl EpisodeFamily {
         match self {
             Self::MainFeedWs | Self::OrderUpdateWs | Self::Boot => "attempts",
             Self::GrowwFeed | Self::DhanRest | Self::GrowwRest => "",
+        }
+    }
+
+    /// G1 (fix round 2, 2026-07-15): families whose DOWN bubbles are EXEMPT
+    /// from the [`EPISODE_DOWN_STALE_EXPIRE_SECS`] stale expiry.
+    ///
+    /// - `Boot`: a hung boot keeps honestly showing ⏳ (pre-existing arm).
+    /// - `DhanRest` / `GrowwRest`: every routed REST Degraded emitter is
+    ///   once-per-episode EDGE-LATCHED upstream (the escalation / not-served
+    ///   edges fire once and re-arm only on recovery), so a Down bubble
+    ///   legitimately receives ZERO further events for hours while the leg
+    ///   is STILL failing — stale-expiring it edits the phone's last word
+    ///   to "alert closed" mid-outage (Rule-11 false recovery) and strands
+    ///   the eventual Recovered on the legacy lane. Only a Resolve edge
+    ///   may close these bubbles.
+    ///
+    /// The WS/GrowwFeed families keep expiring: their Down bubbles receive
+    /// per-cooldown fold events while genuinely down, so an event-less
+    /// half hour there really does mean the incident stopped reporting.
+    #[must_use]
+    pub const fn down_stale_expiry_exempt(self) -> bool {
+        matches!(self, Self::Boot | Self::DhanRest | Self::GrowwRest)
+    }
+
+    /// G2 (fix round 2, 2026-07-15): per-slot qualifier naming WHICH pull a
+    /// REST-family bubble tracks — every post-first-page render is
+    /// otherwise family-generic, so concurrent per-slot bubbles (up to 10
+    /// per family under the F1 slot map) would render byte-identical and a
+    /// Resolve edit would erase the only leg/symbol naming. EMPTY for the
+    /// non-REST families (their renders stay byte-identical — ratcheted).
+    /// MUST stay lockstep with `events.rs::rest_slot` / `chain_rest_slot`.
+    #[must_use]
+    pub const fn slot_desc(self, conn: u8) -> &'static str {
+        match self {
+            Self::DhanRest | Self::GrowwRest => match conn {
+                0 => "spot pull",
+                1 => "chain pull",
+                2 => "contract pull",
+                7 => "chain pull (other index)",
+                8 => "spot pull (NIFTY)",
+                9 => "spot pull (BANKNIFTY)",
+                10 => "spot pull (SENSEX)",
+                11 => "spot pull (INDIA VIX)",
+                12 => "chain pull (NIFTY)",
+                13 => "chain pull (BANKNIFTY)",
+                14 => "chain pull (SENSEX)",
+                15 => "spot pull (other index)",
+                // Unknown future slot: honest generic, never a panic.
+                _ => "candle pull",
+            },
+            _ => "",
         }
     }
 }
@@ -1151,9 +1215,13 @@ impl EpisodeRegistry {
         let expired_keys: Vec<EpisodeKey> = inner
             .iter()
             .filter(|(_, st)| {
-                // Boot bubbles never stale-expire — a hung boot keeps
-                // honestly showing ⏳ (retire_boot owns the happy path).
-                st.key.family != EpisodeFamily::Boot
+                // Exempt families never stale-expire (G1, fix round 2):
+                // Boot keeps honestly showing ⏳ (retire_boot owns the
+                // happy path); the REST families' emitters are
+                // once-per-episode edge-latched, so an event-less Down
+                // bubble there is a STILL-FAILING incident — only a
+                // Resolve edge may close it.
+                !st.key.family.down_stale_expiry_exempt()
                     && st.phase == EpisodePhase::Down
                     && now_ms.saturating_sub(st.last_event_ms) >= stale_ms
             })
@@ -1289,9 +1357,21 @@ pub fn render_episode_first_page(event_body: &str) -> String {
     truncate_at_newline_boundary(event_body, EPISODE_FIRST_PAGE_MAX_CHARS)
 }
 
+/// The bubble's subject: the per-slot qualifier for REST families (G2 —
+/// concurrent per-slot bubbles must name WHICH pull), the family feed
+/// description everywhere else (non-REST renders stay byte-identical).
+fn slot_or_feed_desc(key: EpisodeKey) -> &'static str {
+    let slot = key.family.slot_desc(key.conn);
+    if slot.is_empty() {
+        key.family.feed_desc()
+    } else {
+        slot
+    }
+}
+
 fn render_status_lines(state: &EpisodeState, now_line: &str) -> String {
     let badge = state.key.family.badge();
-    let desc = state.key.family.feed_desc();
+    let desc = slot_or_feed_desc(state.key);
     // Per-family phrasing (2026-07-14 noise fold) — the WS families' strings
     // are the exact prior literals, so their render stays byte-identical.
     let headline = state.key.family.down_headline();
@@ -1345,13 +1425,14 @@ pub fn render_episode_recovering(state: &EpisodeState, _ctx: &EpisodeRenderCtx) 
 /// directive 2026-07-14: recovered / edge-cleared messages must carry the
 /// same tag as their trigger). The Boot family keeps its plain
 /// description (🚀 is a milestone marker, not a broker tag).
-fn badged_feed_desc(family: EpisodeFamily) -> String {
-    match family {
-        EpisodeFamily::Boot => family.feed_desc().to_string(),
+fn badged_feed_desc(key: EpisodeKey) -> String {
+    match key.family {
+        EpisodeFamily::Boot => key.family.feed_desc().to_string(),
         // "{badge} — {desc}" — the SAME format the DOWN bubble's status
         // lines lead with (render_status_lines), so the close line reads
-        // identically at a glance.
-        f => format!("{} — {}", f.badge(), f.feed_desc()),
+        // identically at a glance. G2: REST families substitute the
+        // per-slot qualifier so the close names WHICH pull recovered.
+        f => format!("{} — {}", f.badge(), slot_or_feed_desc(key)),
     }
 }
 
@@ -1363,7 +1444,7 @@ pub fn render_episode_stale_closed(state: &EpisodeState) -> String {
     let last = format_ist_12h(state.last_event_ms);
     format!(
         "\u{26aa} {desc} alert closed — no updates since {last} IST. Any new problem will open a fresh alert.",
-        desc = badged_feed_desc(state.key.family),
+        desc = badged_feed_desc(state.key),
     )
 }
 
@@ -1387,7 +1468,7 @@ pub fn render_episode_recovered(state: &EpisodeState, ctx: &EpisodeRenderCtx) ->
     };
     format!(
         "\u{2705} Recovered — {desc} {verb}. Down {dur}{attempts_segment} ({opened}–{closed} IST)",
-        desc = badged_feed_desc(state.key.family),
+        desc = badged_feed_desc(state.key),
         verb = state.key.family.recovered_verb(),
         dur = format_duration_human(down_secs),
     )
@@ -2136,6 +2217,118 @@ mod tests {
             &cfg(),
         );
         assert_eq!(d.action, EpisodeAction::SendFirstPage);
+    }
+
+    #[test]
+    fn test_down_stale_expiry_exempt_family_predicate() {
+        // G1 (fix round 2, 2026-07-15): Boot + the REST families are
+        // exempt; the WS/GrowwFeed families keep expiring (their Down
+        // bubbles receive per-cooldown folds while genuinely down).
+        for family in [
+            EpisodeFamily::Boot,
+            EpisodeFamily::DhanRest,
+            EpisodeFamily::GrowwRest,
+        ] {
+            assert!(family.down_stale_expiry_exempt(), "{family:?}");
+        }
+        for family in [
+            EpisodeFamily::MainFeedWs,
+            EpisodeFamily::OrderUpdateWs,
+            EpisodeFamily::GrowwFeed,
+        ] {
+            assert!(!family.down_stale_expiry_exempt(), "{family:?}");
+        }
+    }
+
+    #[test]
+    fn test_tick_never_stale_expires_rest_family_down_bubbles() {
+        // G1 (fix round 2, 2026-07-15): every routed REST Degraded emitter
+        // is once-per-episode edge-latched, so an event-less Down bubble is
+        // a STILL-FAILING incident — stale-expiring it would edit the
+        // phone's last word to "alert closed" mid-outage (Rule-11 false
+        // recovery). Only a Resolve edge may close these bubbles.
+        for family in [EpisodeFamily::DhanRest, EpisodeFamily::GrowwRest] {
+            let k = EpisodeKey { family, conn: 1 };
+            let reg = EpisodeRegistry::new();
+            let _ = reg.apply_event(k, EpisodeRole::Open, Severity::High, 0, NOW, &cfg());
+            reg.record_sent(k, Some(42), NOW);
+            // Hours past the stale bound: STILL live, never expired.
+            let far = NOW + (EPISODE_DOWN_STALE_EXPIRE_SECS + 7200) * 1000;
+            let outcome = reg.tick(far, &cfg());
+            assert!(
+                outcome.expired.is_empty(),
+                "{family:?} Down bubble must never stale-expire"
+            );
+            assert_eq!(reg.live_count(), 1, "{family:?}");
+            // The Resolve edge still closes it via the normal
+            // Recovering → stability-window → green path.
+            let d = reg.apply_event(k, EpisodeRole::Resolve, Severity::Info, 0, far, &cfg());
+            assert!(
+                matches!(d.action, EpisodeAction::Edit { .. }),
+                "{family:?} Resolve must edit the SAME bubble, got {:?}",
+                d.action
+            );
+            let outcome = reg.tick(far + EPISODE_STABILITY_SECS * 1000, &cfg());
+            assert_eq!(outcome.closed.len(), 1, "{family:?} green close");
+        }
+    }
+
+    #[test]
+    fn test_rest_renders_name_the_slot() {
+        // G2 (fix round 2, 2026-07-15): concurrent per-slot REST bubbles
+        // must name WHICH pull — every post-first-page render carries the
+        // per-slot qualifier, so a Resolve edit can never erase the only
+        // leg/symbol naming or read as whole-family recovery.
+        let k = EpisodeKey {
+            family: EpisodeFamily::DhanRest,
+            conn: 12,
+        };
+        let st = {
+            let mut st = EpisodeState::open(k, Severity::High, NOW);
+            st.message_id = Some(1);
+            st
+        };
+        let ctx = EpisodeRenderCtx {
+            now_ms: NOW + 60_000,
+        };
+        let steady = render_episode_steady(&st, &ctx);
+        assert!(
+            steady.contains("\u{1f537} DHAN — chain pull (NIFTY) failing"),
+            "steady must name the slot: {steady}"
+        );
+        let recovered = render_episode_recovered(&st, &ctx);
+        assert!(
+            recovered.contains("\u{1f537} DHAN — chain pull (NIFTY) pulling again"),
+            "green close must name the slot: {recovered}"
+        );
+        let stale = render_episode_stale_closed(&st);
+        assert!(
+            stale.contains("chain pull (NIFTY)"),
+            "stale close must name the slot: {stale}"
+        );
+        // A Groww spot-leg bubble names its own slot + broker.
+        let gk = EpisodeKey {
+            family: EpisodeFamily::GrowwRest,
+            conn: 0,
+        };
+        let gst = EpisodeState::open(gk, Severity::High, NOW);
+        let gsteady = render_episode_steady(&gst, &ctx);
+        assert!(
+            gsteady.contains("\u{1f7e2} GROWW — spot pull failing"),
+            "groww steady must name the slot: {gsteady}"
+        );
+        // Non-REST families keep the family description (byte-identical —
+        // the WS regression ratchet also pins this).
+        let wk = EpisodeKey {
+            family: EpisodeFamily::MainFeedWs,
+            conn: 0,
+        };
+        let wst = EpisodeState::open(wk, Severity::High, NOW);
+        let wsteady = render_episode_steady(&wst, &ctx);
+        assert!(
+            wsteady.contains("\u{1f537} DHAN — Live price feed DOWN"),
+            "WS render must stay family-generic: {wsteady}"
+        );
     }
 
     // The never-drop pin: FSM is total AND High/Critical Open/Progress

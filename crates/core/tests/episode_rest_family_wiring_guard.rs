@@ -473,6 +473,55 @@ fn guard_rest_family_badges_and_descriptions_name_the_broker() {
 }
 
 #[test]
+fn guard_rest_families_are_down_stale_expiry_exempt() {
+    // G1 (fix round 2, 2026-07-15): the routed REST Degraded emitters are
+    // once-per-episode edge-latched, so a Down bubble legitimately gets
+    // ZERO further events for hours mid-outage — stale-expiring it would
+    // edit the phone's last word to "alert closed" while the leg is STILL
+    // failing (Rule-11 false recovery). Only Resolve may close them.
+    assert!(EpisodeFamily::DhanRest.down_stale_expiry_exempt());
+    assert!(EpisodeFamily::GrowwRest.down_stale_expiry_exempt());
+    // The fold-fed families keep expiring (unchanged semantics).
+    assert!(!EpisodeFamily::MainFeedWs.down_stale_expiry_exempt());
+    assert!(!EpisodeFamily::OrderUpdateWs.down_stale_expiry_exempt());
+    assert!(!EpisodeFamily::GrowwFeed.down_stale_expiry_exempt());
+}
+
+#[test]
+fn guard_rest_slot_descs_match_the_routing_slot_table() {
+    // G2 (fix round 2): the per-slot bubble qualifier must stay lockstep
+    // with the events.rs slot table (rest_slot / chain_rest_slot) — a
+    // drifted label would mis-name which pull an edit/close refers to.
+    for family in [EpisodeFamily::DhanRest, EpisodeFamily::GrowwRest] {
+        for (conn, label) in [
+            (0_u8, "spot pull"),
+            (1, "chain pull"),
+            (2, "contract pull"),
+            (7, "chain pull (other index)"),
+            (8, "spot pull (NIFTY)"),
+            (9, "spot pull (BANKNIFTY)"),
+            (10, "spot pull (SENSEX)"),
+            (11, "spot pull (INDIA VIX)"),
+            (12, "chain pull (NIFTY)"),
+            (13, "chain pull (BANKNIFTY)"),
+            (14, "chain pull (SENSEX)"),
+            (15, "spot pull (other index)"),
+        ] {
+            assert_eq!(
+                family.slot_desc(conn),
+                label,
+                "{family:?} slot {conn} label drifted"
+            );
+        }
+        // Unknown future slot: honest generic, never a panic or empty.
+        assert_eq!(family.slot_desc(3), "candle pull");
+    }
+    // Non-REST families carry no slot qualifier (renders stay generic).
+    assert_eq!(EpisodeFamily::MainFeedWs.slot_desc(0), "");
+    assert_eq!(EpisodeFamily::GrowwFeed.slot_desc(0), "");
+}
+
+#[test]
 fn guard_rest_family_config_is_default() {
     // EpisodeConfig carries no PartialEq — Debug-compare pins the values.
     let default = format!("{:?}", EpisodeConfig::default());
