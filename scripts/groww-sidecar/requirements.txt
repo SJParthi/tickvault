@@ -1,9 +1,0 @@
-# Groww validation sidecar (LOCAL-ONLY, operator lock §32).
-# Every version exact-pinned per the project "every version pinned" rule.
-# growwapi==1.5.0 is the EXACT wheel the native proto/subjects were extracted
-# from (docs/groww-ref/README.md + 10-live-feed-mapping-verified.md).
-# boto3 is the READ-ONLY SSM consumer of the shared access token minted by the
-# bruteX groww-token-minter Lambda (lock 2026-07-02) — the TOTP dependency was
-# REMOVED with the mint path (this sidecar never mints a Groww token).
-growwapi==1.5.0
-boto3==1.35.36

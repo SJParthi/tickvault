@@ -1,5 +1,15 @@
 # Feed-Agnostic Sidecar Stall-Watchdog — Error Codes (FEED-STALL-01 / FEED-SUPERVISOR-01)
 
+> **⚠ RETIRED 2026-07-15 (Groww live feed deleted — operator Q1, received directly in this session: *"remove
+> the whole Groww live feed; keep only spot 1m and option chain for both brokers; go."*; approval Q2, typos
+> preserved: *"go aehad approv ed dude"*):** the sidecar, the stall watchdog, the never-streamed arm, and
+> every FEED-STALL-01 / FEED-SUPERVISOR-01 / FEED-REJECT-01 emit site are DELETED with the Groww live feed.
+> The `tv-<env>-feed-stall-restarts` counter alarm (`feed-stall-restart-alarm.tf`) and the errcode
+> `feed-stall-01` map entry (`error-code-alarms.tf`) are retired in the SAME PR — a filter with no possible
+> emit site is a dead filter per the paging drift guard. The `FeedStall01*` / `FeedSupervisor01*` /
+> `FeedReject01*` ErrorCode variants are RETAINED until the post-C4 variant sweep (this file keeps
+> satisfying the cross-ref test). Content below retained as historical audit.
+
 > **Authority:** CLAUDE.md > `operator-charter-forever.md` §C/§F >
 > `websocket-connection-scope-lock.md` (the 2-Dhan-WS lock is untouched) > this file.
 > **Operator directive (2026-06-30, live incident):** the Groww feed stopped at

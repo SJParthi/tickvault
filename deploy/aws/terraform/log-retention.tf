@@ -84,7 +84,9 @@ resource "aws_cloudwatch_metric_alarm" "logs_ingestion_runaway" {
 # and, per the 2026-07-07 review fix, ONLY after verifying the tv-app
 # instance is actually up (the open cron is holiday-blind; the box is OFF on
 # weekday NSE holidays, so a blind enable would false-page ~09:35 IST every
-# holiday). This alarm is the 4th member of its ALARM_NAMES list. The deploy
+# holiday). This alarm is the 2nd member of the 4-alarm ALARM_NAMES list
+# (ordinal corrected 2026-07-15 after the PR-C2/C3 + Groww live-feed
+# retirements trimmed the list). The deploy
 # workflow's LOG-INGESTION-SMOKE step is the independent per-deploy detector
 # for the same failure class.
 # ---------------------------------------------------------------------------
