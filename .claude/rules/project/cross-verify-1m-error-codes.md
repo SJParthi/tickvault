@@ -9,7 +9,12 @@
 
 ---
 
-> **⚠ RETIREMENT AUTHORIZED 2026-07-13 (deletion lands with the Phase C PRs):** the
+> **⚠ RETIREMENT AUTHORIZED 2026-07-13 — deletion LANDED in PR-C3 (2026-07-14):**
+> `cross_verify_1m_boot.rs` is DELETED (the parser-relocation obligation below was
+> satisfied by C1's `dhan_intraday_parse.rs` move — Verified: `spot_1m_rest_boot` +
+> `groww_spot_1m_boot` import from the relocated module); the two paging entries the
+> same-day automation-gaps PR added were retired with it (§2b banner). Original
+> authorization text follows:** the
 > 15:31 IST Dhan live-vs-historical 1m cross-verify — and with it `CROSS-VERIFY-1M-01`
 > (`CrossVerify1m01MismatchFound`) and `CROSS-VERIFY-1M-02`
 > (`CrossVerify1m02FetchDegraded`) — retires with the Dhan live WS: with no Dhan live
@@ -113,6 +118,37 @@ its requests clear this run's burst window (see
 
 **Source:** `crates/app/src/cross_verify_1m_boot.rs::run_cross_verify_1m`,
 `crates/common/src/error_code.rs::CrossVerify1m02FetchDegraded`.
+
+---
+
+## §2b. 2026-07-14 Update — CROSS-VERIFY-1M-01/-02 briefly PAGED (superseded HOURS later by the PR-C3 deletion)
+
+> **⚠ SUPERSEDED 2026-07-14 (PR-C3 — the header banner's authorized deletion
+> LANDED):** `cross_verify_1m_boot.rs` was deleted with the Dhan instrument
+> chain, and the two `error_code_alerts` entries this section describes were
+> RETIRED in the same PR (dated notes in `error-code-alarms.tf` +
+> `observability-architecture.md` "Retired paging entries") — a filter with
+> no possible emit site is a dead filter per the drift guard. Content below
+> retained as the historical record of the few-hour paging window.
+
+The 2026-07-10 automation audit found both codes emitted `error!` but were
+**log-sink-only** — neither had an `error_code_alerts` entry, so a 15:31
+IST mismatch or a degraded/blind run paged NOBODY. Both now route via the
+canonical errcode chain: `error!` → errors.jsonl → CloudWatch Logs
+`/tickvault/<env>/app` → filters `tv-<env>-errcode-cross-verify-1m-01` /
+`-02` (`deploy/aws/terraform/error-code-alarms.tf`) → alarm (≤5 min) →
+SNS → Telegram. `ok_recovery = false` on both: these are daily ONE-SHOT
+audit findings — the auto-OK ~15 min after the single datapoint ages out
+can never mean the mismatch/coverage gap was fixed (Rule-11
+false-recovery; the aggregator-drop-01 precedent); the real recovery
+signal is the NEXT trading day's clean run. Lockstep surfaces: the
+"Which codes page" list in `observability-architecture.md` + the
+bidirectional drift ratchet
+`crates/common/tests/error_code_paging_filter_drift_guard.rs` (whose
+production-region scanner was upgraded the same day to EXCISE mid-file
+`#[cfg(test)]` modules — `cross_verify_1m_boot.rs`'s
+`mod start_decision_tests` at ~line 134 previously truncated the scan and
+would have reported these emits as dead filters).
 
 ---
 

@@ -200,23 +200,9 @@ proptest! {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Property: Config feed_mode parsing never panics
-// ---------------------------------------------------------------------------
-
-proptest! {
-    #[test]
-    fn proptest_subscription_config_feed_mode_never_panics(
-        feed_mode in "[a-zA-Z0-9 ]{0,20}"
-    ) {
-        let config = tickvault_common::config::SubscriptionConfig {
-            feed_mode,
-            ..tickvault_common::config::SubscriptionConfig::default()
-        };
-        // parsed_feed_mode must not panic — it returns Result
-        let _ = config.parsed_feed_mode();
-    }
-}
+// (PR-C3 2026-07-14: the SubscriptionConfig feed-mode never-panics property
+// retired with the deleted subscription surface — scope-lock amendment §B
+// item 2.)
 
 // ---------------------------------------------------------------------------
 // Property: TradingCalendar::from_config never panics on invalid date strings

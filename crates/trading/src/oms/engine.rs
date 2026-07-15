@@ -253,25 +253,37 @@ impl OrderManagementSystem {
 
         // ---- LIVE MODE: actual Dhan REST API call ----
 
-        // Sandbox enforcement: block live orders before July 2026.
+        // Sandbox enforcement: block live orders until the sentinel deadline.
         // This is a mechanical safety gate — no real money should be at risk
-        // until the system is fully validated in production.
-        // 2026-07-01T00:00:00 UTC = 1_782_864_000 epoch seconds.
+        // until the operator explicitly re-arms for live.
         //
-        // FIX 2026-04-14 (session 8): the previous value 1_782_777_600 was
-        // ONE DAY TOO EARLY (it was 2026-06-30T00:00:00 UTC). Caught by
+        // 2026-07-14 re-arm (operator cluster-D directive via coordinator):
+        // the previous fn-local 2026-07-01 deadline (1_782_864_000) EXPIRED
+        // silently on 2026-07-01, leaving this gate a no-op. The constant now
+        // lives in `tickvault_common::constants::SANDBOX_DEADLINE_EPOCH_SECS`
+        // (single source of truth, 2099-12-31T00:00:00Z sentinel matching
+        // production.toml's sandbox_only_until) — going live requires editing
+        // that constant with a fresh dated operator quote.
+        //
+        // FIX 2026-04-14 (session 8, retained for history): the original
+        // value 1_782_777_600 was ONE DAY TOO EARLY (2026-06-30T00:00:00
+        // UTC). Caught by
         // `sandbox_enforcement_guard::test_sandbox_deadline_matches_known_utc_epoch`.
-        // Regression test now locks both the constant and the chrono-computed
-        // expected value so this class of bug cannot recur silently.
+        // The guard still locks the constant against a chrono-computed
+        // expected value so that class of bug cannot recur silently.
         #[cfg(not(test))]
         {
-            const SANDBOX_DEADLINE_EPOCH_SECS: i64 = 1_782_864_000;
+            use tickvault_common::constants::SANDBOX_DEADLINE_EPOCH_SECS;
             let now_secs = chrono::Utc::now().timestamp();
             if now_secs < SANDBOX_DEADLINE_EPOCH_SECS {
                 // Session 8 C4: count every block so Grafana can alert on
                 // unexpected live-mode attempts during the sandbox window.
                 metrics::counter!("tv_sandbox_gate_blocks_total").increment(1);
-                error!("SANDBOX ENFORCEMENT: live orders blocked until 2026-07-01");
+                error!(
+                    "SANDBOX ENFORCEMENT: live orders blocked pending explicit \
+                     re-arm (sentinel 2099-12-31; a dated operator quote + \
+                     constant edit are required to go live)"
+                );
                 return Err(OmsError::SandboxEnforcement);
             }
         }
@@ -316,6 +328,14 @@ impl OrderManagementSystem {
                 if !matches!(err, OmsError::DhanRateLimited) {
                     self.circuit_breaker.record_failure();
                 }
+                // C4 (2026-07-14): place-time API rejections and WS-reported
+                // REJECTED transitions are DISJOINT classes — this arm
+                // previously fired only the OrderRejected alert while the
+                // tv-<env>-orders-rejected alarm's counter moved only at the
+                // process_order_update REJECTED transition. Count BOTH
+                // classes so the alarm pages for the only class reachable at
+                // Phase-1 entry (the order-update WS is functional-dormant).
+                counter!("tv_orders_rejected_total").increment(1);
                 self.fire_alert(OmsAlert::OrderRejected {
                     correlation_id: correlation_id.clone(),
                     reason: format!("{err}"),
