@@ -300,6 +300,25 @@ Groww historical-candles"; `tv_groww_spot1m_vix_not_served_total`, plus
 Per-SID independence: the 3-minute escalation edge keys on the 3 CORE
 indices only — a VIX-only failure never pages, core-all-failed still does.
 
+**2026-07-14 — Groww 2xx GA-FAILURE misclassification fixed (empty →
+error) + `ga_code` forensics (coordinator-authorized 2026-07-14 build,
+G1):** a 2xx whose body is the Groww FAILURE envelope
+(`{"status":"FAILURE","error":{code,message}}` — GA000/GA001/GA003–GA007,
+`docs/groww-ref/16-orders-margins-portfolio.md` §5; the envelope wins over
+the HTTP status) previously rode the Groww SPOT leg's benign
+`outcome="empty"` class. It now classifies `outcome="error"` (feeds the
+minute_failed coalesced log, the escalation edge, and a named
+`rest_fetch_audit` row with `error_class="ga_failure"`), and the coded
+`SPOT1M-01` verdict lines carry a `ga_code` field (`"none"` when absent) +
+a redacted bounded message sample. The CHAIN leg (already error-classified)
+gains the same `ga_code=` forensics in its parse-failure msg. FORENSICS
+ONLY — policy never branches on the GA code (no short-circuit even on
+GA005; auth short-circuit stays HTTP-401/403-only). The spot SWEEP arm
+(~15:31 IST) applies the SAME sniff — a sweep-time GA FAILURE classifies
+`sweep_failed` with the real 200 status + ga_code, never dressed as vendor
+absence (`named_gap`). The CONTRACT leg is now the ONLY consumer of the
+shared parser's FAILURE-empty return — flagged follow-up.
+
 **2026-07-13 — the GROWW CONTRACT leg emits this SAME code with
 `leg = "contract_1m"` (no new variant):** the per-minute per-contract 1m
 candle leg (`crates/app/src/groww_contract_1m_boot.rs`, operator grant
@@ -352,6 +371,19 @@ the spot names under the `tv_groww_contract1m_*` prefix
 The typed pages are `GrowwContract1mFetchDegraded` /
 `GrowwContract1mFetchRecovered` (the 3-minute edge) +
 `GrowwContract1mBookUnresolved` (one HIGH per day).
+
+**2026-07-15 — the 14-day `empty_no_rows` root cause was OUR parse:** Dhan
+drifted `/v2/charts/intraday` `timestamp` serialization to
+scientific-notation floats (verbatim wire:
+`"timestamp":[1.7840871E9,1.78408716E9]`); the shared parser's `as_i64()`
+read rejected every float → every candle skipped → `rows_in_response=0` on
+all SIDs since the leg's first live session. The parser
+(`crates/app/src/dhan_intraday_parse.rs::timestamp_epoch_secs`) now
+dual-format-parses the timestamp (int OR finite ranged float — NaN/inf/
+negative/out-of-range floats skip that candle, per the existing skip
+conventions) — the #1524 diagnostics probes + the #1536 raw-body sample
+delivered the exact wire evidence. Dhan's same-day serving delay measured
+~1 s, not a cutoff; NOT an account condition.
 
 ## §2. SPOT1M-02 — spot_1m_rest persist failed
 
@@ -688,6 +720,16 @@ identically). HONEST NOTE: today's 14:54 incident class (empty vs drift)
 could not be discriminated after the fact — from this change forward it
 is, within one minute of occurrence
 (`mcp__tickvault-logs__tail_errors` shows the size + sample directly).
+
+**2026-07-14 — the DHAN chain leg emits this SAME code with the new
+stages** `underlying_not_served` (error, edge — the #1537 Groww mirror,
+Dhan emits field-less), `ladder_shrunk` (warn, edge-latched heuristic),
+`retry_skipped_ceiling` (warn, per refused retry — bounded ≤3/minute),
+`trading_day_flip_exit` (error, one-shot; + the SPOT1M-01 spot twin),
+plus the bounded retry counters
+(`tv_chain1m_retry_total{outcome="recovered"|"still_failed"|"skipped_ceiling"}`)
+— full contract + triage in
+`cross-source-chain-coverage-2026-07-14.md`.
 
 ## §2d. CHAIN-03 — option_chain_1m persist failed
 

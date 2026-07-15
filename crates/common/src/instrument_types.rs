@@ -946,83 +946,11 @@ pub struct FnoUniverse {
 }
 
 impl FnoUniverse {
-    /// PR #6b (2026-05-19) — static constructor for the 4-IDX_I LOCKED_UNIVERSE.
-    ///
-    /// Returns an `FnoUniverse` populated with exactly the 4 entries from
-    /// `LOCKED_UNIVERSE`: NIFTY (13), BANKNIFTY (25), SENSEX (51),
-    /// INDIA VIX (21) — all `IDX_I` segment. Replaces the heavy CSV
-    /// download/parse/validate pipeline (`universe_builder.rs`) under the
-    /// operator-locked 4-IDX_I scope (operator lock 2026-05-15).
-    ///
-    /// All non-index fields are empty:
-    /// - `underlyings` — empty (no F&O underlying stocks tracked)
-    /// - `derivative_contracts` — empty (no F&O contracts subscribed)
-    /// - `instrument_info` — populated only with the 4 IDX_I entries
-    /// - `option_chains` — empty (option-chain data comes via REST overlay, PR #8)
-    /// - `expiry_calendars` — empty (no expiries to track)
-    /// - `build_metadata` — synthetic record indicating "locked_universe" source
-    #[must_use]
-    pub fn locked_4_idx_i() -> Self {
-        use crate::locked_universe::LOCKED_UNIVERSE;
-        use crate::types::Exchange;
-
-        let mut subscribed_indices: Vec<SubscribedIndex> =
-            Vec::with_capacity(LOCKED_UNIVERSE.len());
-        let mut instrument_info: HashMap<SecurityId, InstrumentInfo> =
-            HashMap::with_capacity(LOCKED_UNIVERSE.len());
-
-        for &(security_id, symbol, _segment) in LOCKED_UNIVERSE {
-            let (category, subcategory) = if symbol == "INDIA VIX" {
-                (IndexCategory::DisplayIndex, IndexSubcategory::Volatility)
-            } else {
-                (IndexCategory::FnoUnderlying, IndexSubcategory::Fno)
-            };
-            // SENSEX is a BSE index; NIFTY/BANKNIFTY/INDIA VIX are NSE.
-            let exchange = if symbol == "SENSEX" {
-                Exchange::BombayStockExchange
-            } else {
-                Exchange::NationalStockExchange
-            };
-
-            subscribed_indices.push(SubscribedIndex {
-                symbol: symbol.to_string(),
-                security_id,
-                exchange,
-                category,
-                subcategory,
-            });
-
-            instrument_info.insert(
-                security_id,
-                InstrumentInfo::Index {
-                    security_id,
-                    symbol: symbol.to_string(),
-                    exchange,
-                },
-            );
-        }
-
-        Self {
-            underlyings: HashMap::new(),
-            derivative_contracts: HashMap::new(),
-            instrument_info,
-            option_chains: HashMap::new(),
-            expiry_calendars: HashMap::new(),
-            subscribed_indices,
-            build_metadata: UniverseBuildMetadata {
-                csv_source: "locked_universe".to_string(),
-                csv_row_count: 0,
-                parsed_row_count: LOCKED_UNIVERSE.len(),
-                index_count: LOCKED_UNIVERSE.len(),
-                equity_count: 0,
-                underlying_count: 0,
-                derivative_count: 0,
-                option_chain_count: 0,
-                build_duration: std::time::Duration::ZERO,
-                build_timestamp: chrono::DateTime::<chrono::FixedOffset>::default(),
-            },
-        }
-    }
+    // PR-C3 (2026-07-14): the `locked_4_idx_i()` static constructor was
+    // DELETED with `locked_universe.rs` (operator retirement directive
+    // 2026-07-13, scope-lock amendment §B item 2) — no Dhan WS subscription
+    // remains to seed a locked universe for. `FnoUniverse` itself survives
+    // as the registry-builder input shape.
 
     /// O(1) lookup: symbol → equity price feed security ID.
     /// For "RELIANCE" → 2885, for "NIFTY" → 13.
@@ -3628,78 +3556,6 @@ mod tests {
         assert!(err.to_string().contains("invalid expiry code"));
     }
 
-    // -------------------------------------------------------------------------
-    // PR #6b Slice 1 — FnoUniverse::locked_4_idx_i() constructor
-    // -------------------------------------------------------------------------
-
-    #[test]
-    fn test_locked_4_idx_i_has_exactly_four_subscribed_indices() {
-        let u = FnoUniverse::locked_4_idx_i();
-        assert_eq!(u.subscribed_indices.len(), 4);
-    }
-
-    #[test]
-    fn test_locked_4_idx_i_has_empty_derivatives_and_underlyings() {
-        let u = FnoUniverse::locked_4_idx_i();
-        assert!(u.derivative_contracts.is_empty());
-        assert!(u.underlyings.is_empty());
-        assert!(u.option_chains.is_empty());
-        assert!(u.expiry_calendars.is_empty());
-    }
-
-    #[test]
-    fn test_locked_4_idx_i_contains_nifty_banknifty_sensex_vix() {
-        let u = FnoUniverse::locked_4_idx_i();
-        let symbols: Vec<&str> = u
-            .subscribed_indices
-            .iter()
-            .map(|s| s.symbol.as_str())
-            .collect();
-        assert!(symbols.contains(&"NIFTY"));
-        assert!(symbols.contains(&"BANKNIFTY"));
-        assert!(symbols.contains(&"SENSEX"));
-        assert!(symbols.contains(&"INDIA VIX"));
-    }
-
-    #[test]
-    fn test_locked_4_idx_i_sensex_is_bse_others_nse() {
-        let u = FnoUniverse::locked_4_idx_i();
-        for idx in &u.subscribed_indices {
-            if idx.symbol == "SENSEX" {
-                assert_eq!(idx.exchange, crate::types::Exchange::BombayStockExchange);
-            } else {
-                assert_eq!(idx.exchange, crate::types::Exchange::NationalStockExchange);
-            }
-        }
-    }
-
-    #[test]
-    fn test_locked_4_idx_i_india_vix_is_display_index() {
-        let u = FnoUniverse::locked_4_idx_i();
-        let vix = u
-            .subscribed_indices
-            .iter()
-            .find(|s| s.symbol == "INDIA VIX")
-            .expect("INDIA VIX must be present");
-        assert_eq!(vix.category, IndexCategory::DisplayIndex);
-        assert_eq!(vix.subcategory, IndexSubcategory::Volatility);
-    }
-
-    #[test]
-    fn test_locked_4_idx_i_instrument_info_populated_with_four_entries() {
-        let u = FnoUniverse::locked_4_idx_i();
-        assert_eq!(u.instrument_info.len(), 4);
-        for sid in [13_u64, 25, 51, 21] {
-            assert!(u.instrument_info.contains_key(&sid), "missing SID {sid}");
-        }
-    }
-
-    #[test]
-    fn test_locked_4_idx_i_build_metadata_marks_locked_universe_source() {
-        let u = FnoUniverse::locked_4_idx_i();
-        assert_eq!(u.build_metadata.csv_source, "locked_universe");
-        assert_eq!(u.build_metadata.index_count, 4);
-        assert_eq!(u.build_metadata.equity_count, 0);
-        assert_eq!(u.build_metadata.derivative_count, 0);
-    }
+    // PR-C3 (2026-07-14): the `locked_4_idx_i()` constructor test family
+    // retired with the deleted constructor + `locked_universe.rs`.
 }

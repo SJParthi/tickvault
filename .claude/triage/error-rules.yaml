@@ -2286,6 +2286,28 @@ rules:
       backfill after fixing the underlying QuestDB condition (cross-check
       BOOT-01/02).
 
+  # FEED-GAP-01 (Groww hardening PR-3, 2026-07-14) = the feed gap-episode
+  # forensics machinery degraded — an OPEN/CLOSE row could not be persisted to
+  # the feed_gap_audit table (ensure-DDL / ILP append / flush), or the 15:45
+  # IST scoreboard dangling-close sweep failed. ANNOTATION ONLY: never on the
+  # feed recovery path or the tick hot path; the Telegram episode bubble still
+  # fires and re-appends are DEDUP-idempotent. Escalate (not silence): a
+  # failed forensic write usually means QuestDB ILP/HTTP was degraded at the
+  # gap edge (cross-check BOOT-01/02) and the operator should know the day's
+  # episode chain has a hole.
+  - name: feed-gap-01-episode-degraded-escalate
+    match:
+      code: FEED-GAP-01
+    action: escalate
+    runbook_path: .claude/rules/project/feed-gap-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 600
+    justification: >-
+      FEED-GAP-01 = the gap-episode forensics machinery degraded (best-effort
+      annotation-only side record). Capture, candles and the reconnect
+      machinery are unaffected; escalate so the operator knows the durable
+      episode row for that edge is missing until QuestDB recovers.
+
   # WAL-SUSPEND-01 (W2 PR#6 2026-07-10, audit follow-up row 10) = a QuestDB
   # table's WAL apply is SUSPENDED (post disk-full episode / apply error) —
   # ILP keeps ACKing rows while they silently stop becoming visible/applied.

@@ -153,84 +153,20 @@ resource "aws_cloudwatch_metric_alarm" "questdb_disconnected" {
 }
 
 # ---------------------------------------------------------------------------
-# 5. Many instruments silent — partial feed degradation
+# 5. RETIRED in PR-C3 (2026-07-14): tick-gap-instruments-silent
 #
-# RETUNED 2026-07-06 (silent-feed incident): Dhan degraded ALL day — 29-67 of
-# 776 instruments silent EVERY minute — and the old threshold=100 never
-# crossed, so zero pages. New tuning:
-#   - threshold 40 (fires at >=41), PROVISIONAL. Round-3 correction
-#     2026-07-08 (review finding 4): the first retune shipped 25, BELOW the
-#     codebase's own documented healthy always-silent floor — main.rs's
-#     2026-07-03 D2 note (live-verified) records "~33 illiquid/suspended
-#     SIDs are ALWAYS silent" under the ~775-SID DailyUniverse (NT-15 boot
-#     seeding makes every subscribed SID a tick-gap map key), and this gauge
-#     is set from the SAME scan with NO always-silent exclusion — so 25
-#     would have breached EVERY healthy in-session minute, latched within
-#     ~10-12 min of the 09:20 gate-open, and paged daily (alert-fatigue
-#     inversion of the zero-page incident). 40 clears the ~33 floor with
-#     margin and aligns with the sibling SLO-degraded alarm (freshness
-#     breaches <0.95 at >=39 silent of 776). HONEST COVERAGE LIMIT: the
-#     incident's 29-40-silent minutes are indistinguishable from the
-#     documented healthy floor by count alone — that marginal band is owned
-#     by the SLO-degraded (>=39-silent freshness) + lag-p99 alarms; this
-#     alarm pages on the sustained upper band (>40). PROVISIONAL + one
-#     trading-week soak of the in-session gauge distribution mandated
-#     (mirrors the boundary-storm 2000 soak); ratchet with a dated note.
-#     ABSOLUTE, not %-of-universe: no universe-size denominator exists in CW
-#     (tv_universe_size is kind-labeled and folds under the host-only EMF
-#     dimensions), and the universe is envelope-locked [100, 1200], so
-#     40 = 5.2% of today's ~776 / 3.3% at the 1200 cap. DATED REVISIT:
-#     re-tune if the universe re-scopes toward the 1200 cap.
-#   - M-of-N 10-of-12 at period=60/Maximum (1 datapoint per 60s agent scrape):
-#     a value flapping 39/41/39 neither pages nor lets one clean scrape erase
-#     9 minutes of evidence; a 1-3 min reconnect blip cannot reach 10 breaching
-#     minutes.
-#   - PRE-OPEN PIN (round-4 correction 2026-07-08, final-review findings
-#     1/2/4): the producer (main.rs tick-gap scan) pins the gauge to 0 during
-#     the NSE pre-open/auction window [09:00, 09:15) IST — the 09:08-09:15
-#     matching/buffer freeze makes the boot-seeded ~775 SIDs legitimately
-#     silent (values in the hundreds >> 40), and this alarm's 12-min lookback
-#     (the LONGEST of any gated alarm) at the 09:20 gate-open would otherwise
-#     hold ~7 guaranteed breaching pre-open datapoints (the gate Lambda's
-#     forced-OK does NOT purge datapoints) -> only ~3 open-ramp minutes > 40
-#     needed for a near-daily false page at ~09:21. Exact mirror of the SLO
-#     tick_freshness pre-open pin; ratcheted by
-#     test_tick_gap_silent_gauge_producer_pins_pre_open_to_zero. The mandated
-#     soak week additionally checks the 09:20-09:25 transition band, not just
-#     the steady-state distribution.
-#   - MARKET-HOURS GATE (audit-findings Rule 3, MANDATORY): the gauge is set
-#     only in-session (main.rs tick-gap scan gates on
-#     is_within_trading_session_ist), so the LAST in-session value keeps being
-#     re-scraped 15:30->16:30 IST — a stale post-close value must never page.
-#     Actions OFF by default; the shared market-hours gate Lambda
-#     (market-hours-liveness-alarm.tf) enables them 09:20-15:35 IST Mon-Fri.
-#   - 2026-07-10 §36.7 (FUTIDX all-months): far-month (non-nearest) index
-#     future SIDs are excluded at the GAUGE PRODUCER (main.rs
-#     far_month_future_sids exclusion set) — far monthly serials tick
-#     sparsely by nature and would lift the healthy ~33 always-silent floor
-#     toward this threshold. Threshold 40 and the ~33 floor therefore STAND
-#     unchanged; the excluded SIDs remain seeded in the detector, so the
-#     WS-GAP-06 per-SID log still names a never-ticking month.
+# The `tv-<env>-tick-gap-instruments-silent` alarm was DELETED with its
+# gauge producer — the per-SID tick-gap detector retired per the operator's
+# 2026-07-13 Q4-ii ruling (websocket-connection-scope-lock.md "2026-07-13
+# Amendment" §B item 4: the detector was fed only by the retired Dhan WS
+# lane, so `tv_tick_gap_instruments_silent` would never be written again —
+# keeping the alarm would orphan a dead monitor). Per-SID silence
+# visibility is now the scoreboard presence/coverage columns (15:45 IST);
+# FEED-level stall detection is FEED-STALL-01 (feed-stall-restart-alarm.tf).
+# The 2026-07-06/07-08 retune history (threshold 100 -> 40 PROVISIONAL,
+# pre-open pin, ~33 always-silent floor) is retained in git history.
 # ---------------------------------------------------------------------------
-resource "aws_cloudwatch_metric_alarm" "tick_gap_instruments_silent" {
-  alarm_name          = "tv-${var.environment}-tick-gap-instruments-silent"
-  alarm_description   = "> 40 instruments silent (tick-gap threshold, 30s default) sustained >=10 of 12 min in-market. Partial feed degradation — slow socket or Dhan segment outage. Threshold 40 is PROVISIONAL (2026-07-08: sits above the documented ~33 always-silent healthy floor — main.rs D2 note — with margin; observe one trading week of the in-session gauge distribution + ratchet with a dated note; the 29-40 marginal band is owned by the SLO-degraded + lag-p99 alarms). Actions gated to 09:20-15:35 IST Mon-Fri by the market-hours gate Lambda (the gauge is written in-session only, so its last value goes stale post-close). See WS-GAP-06 runbook."
-  comparison_operator = "GreaterThanThreshold"
-  evaluation_periods  = 12
-  datapoints_to_alarm = 10
-  metric_name         = "tv_tick_gap_instruments_silent"
-  namespace           = local.app_namespace
-  period              = 60
-  statistic           = "Maximum"
-  threshold           = 40
-  treat_missing_data  = "notBreaching"
-  dimensions          = local.app_dimensions
-  # Actions OFF by default; the market-hours gate Lambda flips them ON
-  # 09:20-15:35 IST Mon-Fri (market-hours-liveness-alarm.tf).
-  actions_enabled = false
-  alarm_actions   = local.app_alarm_actions
-  ok_actions      = local.app_alarm_ok
-}
+
 
 # ---------------------------------------------------------------------------
 # 6. JWT token expiring within 4h — must force-renew before SEBI 24h cap
@@ -579,14 +515,14 @@ resource "aws_cloudwatch_metric_alarm" "mem_used_high" {
 # ---------------------------------------------------------------------------
 
 output "app_cloudwatch_alarms" {
-  description = "15 application-level alarms in THIS file (13 Prometheus-via-CW-agent + 1 disk-used + 1 mem-used Metrics-Insights; PR-C2 2026-07-13 retired 5 Dhan-lane alarms — ws-pool-all-dead, ws-failed-connections, realtime-guarantee-critical, ws-frame-dropped-no-wal, ws-reconnect-gap-high — their emitters died with the Dhan live-WS lane; order-update-ws-inactive RETIRED 2026-07-14 per dhan-rest-only-noise-lock-2026-07-14.md, reconciled through the PR-C2 merge); 3 more silent-feed alarms live in silent-feed-alarms.tf (realtime-guarantee-degraded also retired PR-C2). tick-gap-instruments-silent was RETUNED 2026-07-06 (threshold 100 -> 40 PROVISIONAL, 10-of-12 min, market-hours-gated). Cost note: the PR-C2 retirement REMOVES 6 alarms + 5 selected custom-metric series and the 2026-07-14 noise lock a further alarm + the order-update gauge series from the pre-C2 bill (was ~$7.60/mo overage) — still well inside the $55 budget cap."
+  description = "14 application-level alarms in THIS file (12 Prometheus-via-CW-agent + 1 disk-used + 1 mem-used Metrics-Insights; PR-C2 2026-07-13 retired 5 Dhan-lane alarms — ws-pool-all-dead, ws-failed-connections, realtime-guarantee-critical, ws-frame-dropped-no-wal, ws-reconnect-gap-high — their emitters died with the Dhan live-WS lane; order-update-ws-inactive RETIRED 2026-07-14 per dhan-rest-only-noise-lock-2026-07-14.md; tick-gap-instruments-silent RETIRED in PR-C3 2026-07-14 — its gauge producer, the per-SID tick-gap detector, was deleted per operator Q4-ii 2026-07-13, so the gauge is never written again); 3 more silent-feed alarms live in silent-feed-alarms.tf (realtime-guarantee-degraded also retired PR-C2). Cost note: the PR-C2 retirement REMOVES 6 alarms + 5 selected custom-metric series, the 2026-07-14 noise lock a further alarm + the order-update gauge series, and PR-C3 one more alarm + the tick-gap gauge series from the pre-C2 bill (was ~$7.60/mo overage) — still well inside the $55 budget cap."
   value = [
     aws_cloudwatch_metric_alarm.disk_used_high.alarm_name,
     aws_cloudwatch_metric_alarm.mem_used_high.alarm_name,
     aws_cloudwatch_metric_alarm.groww_ws_inactive.alarm_name,
     aws_cloudwatch_metric_alarm.groww_stall_restart_storm.alarm_name,
     aws_cloudwatch_metric_alarm.questdb_disconnected.alarm_name,
-    aws_cloudwatch_metric_alarm.tick_gap_instruments_silent.alarm_name,
+    # tick_gap_instruments_silent retired in PR-C3 (2026-07-14).
     aws_cloudwatch_metric_alarm.token_remaining_low.alarm_name,
     aws_cloudwatch_metric_alarm.spill_dropped.alarm_name,
     aws_cloudwatch_metric_alarm.dlq_ticks.alarm_name,

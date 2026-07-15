@@ -374,7 +374,10 @@ resource "aws_lambda_function" "tv_market_hours_liveness_gate" {
       # see app-alarms.tf / silent-feed-alarms.tf dated notes).
       # 2026-07-14 (operator Dhan noise lock, reconciled through the PR-C2
       # merge): order-update-reconnect-storm also retired (the order-update
-      # WS spawn is deleted). The gate now arms 7 alarms.
+      # WS spawn is deleted).
+      # PR-C3 (2026-07-14): tick-gap-instruments-silent also retired — its
+      # gauge producer (the per-SID tick-gap detector) was deleted with the
+      # Dhan WS lane (operator Q4-ii 2026-07-13). The gate now arms 6 alarms.
       ALARM_NAMES = join(",", [
         aws_cloudwatch_metric_alarm.market_hours_liveness_missing.alarm_name,
         aws_cloudwatch_metric_alarm.aggregator_no_seals.alarm_name,
@@ -382,7 +385,7 @@ resource "aws_lambda_function" "tv_market_hours_liveness_gate" {
         # WS spawn (operator Dhan noise lock) — gate list is 7 alarms
         # post-PR-C2 (the 4 Dhan-lane alarms left the list 2026-07-13).
         aws_cloudwatch_metric_alarm.app_log_ingestion_silent.alarm_name,
-        aws_cloudwatch_metric_alarm.tick_gap_instruments_silent.alarm_name,
+        # tick_gap_instruments_silent retired in PR-C3 (2026-07-14).
         aws_cloudwatch_metric_alarm.boundary_catchup_storm_dhan.alarm_name,
         aws_cloudwatch_metric_alarm.dhan_exchange_lag_p99_high.alarm_name,
         aws_cloudwatch_metric_alarm.groww_exchange_lag_p99_high.alarm_name, # 2026-07-11 scoreboard PR-C
@@ -408,11 +411,13 @@ resource "aws_cloudwatch_log_group" "tv_market_hours_liveness_gate" {
 
 # ---------------------------------------------------------------------------
 # Watch the watchman (round-13, 2026-07-06): the gate Lambda's 09:20 IST open
-# invocation is the ONLY path that arms the 7 gated alarms (the ALARM_NAMES
+# invocation is the ONLY path that arms the 6 gated alarms (the ALARM_NAMES
 # env list above — the surviving 2026-07-06 silent-feed set; count 12 → 8 in
 # PR-C2 2026-07-14: realtime-guarantee-critical/-degraded + ws-pool-all-dead
 # + ws-failed-connections retired with the Dhan lane; → 7 same day via the
-# merged Dhan noise lock: the leg-3 order-update reconnect-storm pager
+# merged Dhan noise lock (→ 6 in PR-C3 2026-07-14: tick-gap-instruments-
+# silent retired with its deleted gauge producer): the leg-3
+# order-update reconnect-storm pager
 # retired with the order-update WS spawn). A gate failure
 # previously re-opened
 # the 2026-07-06 zero-page gap SILENTLY — the gated alarms simply stayed
@@ -424,8 +429,13 @@ resource "aws_cloudwatch_log_group" "tv_market_hours_liveness_gate" {
 # pins + the liveness alarms are the backstop.
 # ---------------------------------------------------------------------------
 resource "aws_cloudwatch_metric_alarm" "market_hours_gate_lambda_errors" {
-  alarm_name          = "tv-${var.environment}-market-hours-gate-errors"
-  alarm_description   = "The market-hours gate Lambda FAILED - its 09:20 IST open invocation is the ONLY path that arms the 7 gated alarms (market-hours-liveness-missing, aggregator-no-seals, app-log-ingestion-silent, tick-gap-instruments-silent, boundary-catchup-storm-dhan, dhan-exchange-lag-p99-high, groww-exchange-lag-p99-high - the Lambda's ALARM_NAMES env is the authoritative list; count 12 -> 8 in PR-C2 2026-07-14 with the 4 Dhan-lane alarms retired, -> 7 via the merged 2026-07-14 Dhan noise lock retiring order-update-reconnect-storm). A failed open leaves all 7 disarmed for the session (the 2026-07-06 leg-3 zero-page class); a failed close leaves them armed overnight (false-page risk). NO green OK page ever follows this alarm (ok_actions suppressed - the Lambda runs 2x/day, so an auto-OK is aged-out, never a fix): manually re-arm/verify the 7 gated alarms (enable_alarm_actions / disable_alarm_actions) REGARDLESS, after reading the gate Lambda's log group."
+  alarm_name = "tv-${var.environment}-market-hours-gate-errors"
+  # CloudWatch caps alarm_description at 1024 chars — the count history
+  # (12 -> 8 PR-C2, -> 7 Dhan noise lock, -> 6 PR-C3 2026-07-14 with
+  # tick-gap-instruments-silent retired alongside its deleted gauge
+  # producer) lives HERE in the comment; the description keeps only the
+  # operator-actionable core.
+  alarm_description   = "The market-hours gate Lambda FAILED - its 09:20 IST open invocation is the ONLY path that arms the 6 gated alarms (market-hours-liveness-missing, aggregator-no-seals, app-log-ingestion-silent, boundary-catchup-storm-dhan, dhan-exchange-lag-p99-high, groww-exchange-lag-p99-high - the Lambda's ALARM_NAMES env is the authoritative list; trimmed to 6 in PR-C3 2026-07-14). A failed open leaves all 6 disarmed for the session (the 2026-07-06 leg-3 zero-page class); a failed close leaves them armed overnight (false-page risk). NO green OK page ever follows this alarm (ok_actions suppressed - the Lambda runs 2x/day, so an auto-OK is aged-out, never a fix): manually re-arm/verify the 6 gated alarms (enable_alarm_actions / disable_alarm_actions) REGARDLESS, after reading the gate Lambda's log group."
   comparison_operator = "GreaterThanOrEqualToThreshold"
   evaluation_periods  = 1
   metric_name         = "Errors"
@@ -442,8 +452,9 @@ resource "aws_cloudwatch_metric_alarm" "market_hours_gate_lambda_errors" {
   # close), so the post-ALARM auto-OK is always AGED-OUT, never a fix — a
   # recurring Rule-11 false-recovery green per failure episode. Worse, for
   # THIS watchman the green also invited skipping the manual re-arm of the
-  # 7 gated alarms (the leg-3 reconnect-storm pager retired 2026-07-14) — the
-  # description above says: re-arm manually REGARDLESS.
+  # 6 gated alarms (the leg-3 reconnect-storm pager + PR-C3's tick-gap alarm
+  # retired 2026-07-14) — the description above says: re-arm manually
+  # REGARDLESS.
   ok_actions = []
 }
 
@@ -501,6 +512,6 @@ resource "aws_lambda_permission" "tv_market_hours_liveness_close" {
 }
 
 output "market_hours_liveness_alarm_name" {
-  description = "Market-hours liveness alarm (pages on a wedged/crash-looped/dead app OR a never-streamed Groww feed in the 09:20-15:35 IST window). Signal: the tv_groww_exchange_lag_p99_seconds gauge MISSING (treat_missing_data=breaching) — emitted every 10s in-session by the process-global Groww lag publisher in crates/app/src/main.rs, in the CW-agent filter (user-data.sh.tftpl). Moved off the Dhan-lane-owned tv_realtime_guarantee_score on 2026-07-13 (Phase A — the Dhan live WS lane, the score's only publisher, is retired per the operator directive). Takes over from the boot-heartbeat window at exactly 09:20 IST (2026-07-09 — the boot window close moved 09:10→09:20, so there is no seam over the 09:15 market open). The same gate Lambda also window-gates the other 7 ALARM_NAMES entries (aggregator-no-seals et al — the 2026-07-03 5 AM false-SOS fix, list trimmed to 8 in PR-C2 2026-07-14)."
+  description = "Market-hours liveness alarm (pages on a wedged/crash-looped/dead app OR a never-streamed Groww feed in the 09:20-15:35 IST window). Signal: the tv_groww_exchange_lag_p99_seconds gauge MISSING (treat_missing_data=breaching) — emitted every 10s in-session by the process-global Groww lag publisher in crates/app/src/main.rs, in the CW-agent filter (user-data.sh.tftpl). Moved off the Dhan-lane-owned tv_realtime_guarantee_score on 2026-07-13 (Phase A — the Dhan live WS lane, the score's only publisher, is retired per the operator directive). Takes over from the boot-heartbeat window at exactly 09:20 IST (2026-07-09 — the boot window close moved 09:10→09:20, so there is no seam over the 09:15 market open). The same gate Lambda also window-gates the other 5 ALARM_NAMES entries (aggregator-no-seals et al — the 2026-07-03 5 AM false-SOS fix; list trimmed to 8 in PR-C2 2026-07-14, to 7 by the same-day Dhan noise lock, and to 6 in PR-C3 2026-07-14 with the tick-gap alarm retired)."
   value       = aws_cloudwatch_metric_alarm.market_hours_liveness_missing.alarm_name
 }

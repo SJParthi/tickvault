@@ -276,7 +276,8 @@ fn test_prev_close_routing_nse_fno_from_quote_close_field_bytes_38_to_41() {
 /// §36 (2026-07-08) — BSE_FNO (SENSEX future) in **Quote mode**: same
 /// bytes-38-41 routing with segment byte 8. UNVERIFIED-LIVE caveat: no
 /// live BSE_FNO Quote packet has been observed yet (first enabled session
-/// is the probe; the tick-gap detector pages within 30s if silent) — this
+/// is the probe; the per-SID tick-gap detector that paged on silence was
+/// deleted in PR-C3, 2026-07-14, with the Dhan WS lane) — this
 /// ratchet pins the PARSER contract, not Dhan's live emission.
 #[test]
 fn test_prev_close_routing_bse_fno_from_quote_close_field_bytes_38_to_41() {

@@ -521,13 +521,21 @@ pub fn backfill_minute_nanos(
 /// The const-assert below pins the sweep strictly clear of that window.
 const SPOT_1M_REST_SWEEP_FIRE_SECS_OF_DAY_IST: u32 = 15 * 3600 + 33 * 60 + 30;
 
-// The sweep must clear the cross-verify burst: at least 150 s after the
-// 15:31:00 cross-verify trigger (burst observed through 15:33), and still
-// comfortably before the 16:30 IST box stop.
+/// Historical anchor: the 15:31:00 IST trigger of the RETIRED bulk 1m
+/// cross-verify (`cross_verify_1m_boot.rs`, DELETED in PR-C3 2026-07-14 per
+/// the 2026-07-13 operator retirement directive — the const was relocated
+/// here from that module). The 15:33:30 sweep instant was chosen to clear
+/// that run's observed 429 burst window; the TIMING IS KEPT UNCHANGED — the
+/// burst producer is gone, but the ≥150s margin + the 16:30 box-stop bound
+/// still document why 15:33:30 was chosen.
+const RETIRED_CROSS_VERIFY_TRIGGER_SECS_OF_DAY_IST: u32 = 15 * 3600 + 31 * 60; // 55_860
+
+// The sweep must clear the (retired) cross-verify burst window: at least
+// 150 s after the historical 15:31:00 trigger (burst observed through
+// 15:33), and still comfortably before the 16:30 IST box stop.
 const _: () = assert!(
-    SPOT_1M_REST_SWEEP_FIRE_SECS_OF_DAY_IST
-        >= crate::cross_verify_1m_boot::CROSS_VERIFY_TRIGGER_SECS_OF_DAY_IST + 150,
-    "post-session sweep must clear the 15:31-15:33 cross-verify burst window"
+    SPOT_1M_REST_SWEEP_FIRE_SECS_OF_DAY_IST >= RETIRED_CROSS_VERIFY_TRIGGER_SECS_OF_DAY_IST + 150,
+    "post-session sweep must clear the historical 15:31-15:33 cross-verify burst window"
 );
 const _: () = assert!(
     SPOT_1M_REST_SWEEP_FIRE_SECS_OF_DAY_IST < 16 * 3600 + 30 * 60,
@@ -1804,7 +1812,20 @@ pub async fn run_spot_1m_rest(params: Spot1mRestTaskParams) {
         // Audit Rule 3: re-read the wall clock + trading-day verdict EVERY
         // iteration (a suspend can cross midnight and stale the verdict).
         if !params.calendar.is_trading_day_today() {
-            info!("spot_1m_rest: no longer a trading day — exiting");
+            // 2026-07-14: loud + coded (was a bare info!) — a mid-session
+            // calendar flip silently stopping a capture leg must be
+            // greppable in errors.jsonl. Log-sink-only, NO Telegram (a
+            // calendar flip is not broker failure); a suspend that
+            // crossed IST midnight is a legitimate cause.
+            metrics::counter!("tv_spot1m_trading_day_flip_exit_total").increment(1);
+            error!(
+                code = ErrorCode::Spot1m01FetchDegraded.code_str(),
+                stage = "trading_day_flip_exit",
+                "SPOT1M-01: the trading-day verdict flipped mid-session — \
+                 exiting today's spot fire loop (a suspend that crossed \
+                 IST midnight is a legitimate cause; remaining minutes \
+                 stay absent, re-fetchable via backfill)"
+            );
             return;
         }
         // Groww Item-7 precedent (GAP-11 review MEDIUM 1): the trading
@@ -2937,7 +2958,17 @@ async fn run_batch_catchup_loop(
         // Audit Rule 3: re-read the wall clock + trading-day verdict every
         // iteration.
         if !params.calendar.is_trading_day_today() {
-            info!("spot_1m_rest: no longer a trading day — exiting batch loop");
+            // 2026-07-14: loud + coded (was a bare info!) — same class as
+            // the per-minute loop's flip exit; this names the BATCH loop.
+            metrics::counter!("tv_spot1m_trading_day_flip_exit_total").increment(1);
+            error!(
+                code = ErrorCode::Spot1m01FetchDegraded.code_str(),
+                stage = "trading_day_flip_exit",
+                "SPOT1M-01: the trading-day verdict flipped mid-session — \
+                 exiting the batch catch-up loop (a suspend that crossed \
+                 IST midnight is a legitimate cause; remaining cycles \
+                 stay absent, re-fetchable via backfill)"
+            );
             return false;
         }
         let now = ist_secs_of_day_now();
@@ -4009,7 +4040,7 @@ mod tests {
         // through 15:33) and before the 16:30 IST box stop.
         assert!(
             SPOT_1M_REST_SWEEP_FIRE_SECS_OF_DAY_IST
-                >= crate::cross_verify_1m_boot::CROSS_VERIFY_TRIGGER_SECS_OF_DAY_IST + 150
+                >= RETIRED_CROSS_VERIFY_TRIGGER_SECS_OF_DAY_IST + 150
         );
         assert!(SPOT_1M_REST_SWEEP_FIRE_SECS_OF_DAY_IST > SPOT_1M_REST_LAST_FIRE_SECS_OF_DAY_IST);
         assert!(SPOT_1M_REST_SWEEP_FIRE_SECS_OF_DAY_IST < 16 * 3600 + 30 * 60);
@@ -4548,9 +4579,10 @@ mod tests {
     fn test_probe_crossverify_request_byte_equality_fixture() {
         let date = NaiveDate::from_ymd_opt(2026, 7, 14).expect("valid date");
         let spot = spot_1m_day_request_body("13", date).to_string();
-        // The cross-verify call shape (cross_verify_1m_boot::compare_one_target
-        // for an index target): intraday_request_body(sid, segment,
-        // instrument, trading_date, trading_date.succ()).
+        // The (retired — PR-C3 2026-07-14) cross-verify call shape
+        // (`compare_one_target` for an index target):
+        // intraday_request_body(sid, segment, instrument, trading_date,
+        // trading_date.succ()). Kept as the live-proven day-window fixture.
         let next = date.succ_opt().expect("next day");
         let crossverify =
             intraday_request_body("13", SPOT_1M_REST_SEGMENT_IDX_I, "INDEX", date, next)
