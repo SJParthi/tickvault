@@ -69,19 +69,12 @@ fn guard_offhours_ws_disconnected_variant_exists() {
 // alongside Dhan historical fetch. `day_open` now derives from the first
 // observed live tick LTP via `DayOhlcTracker::update_tick` (auto-arm).
 
-#[test]
-fn guard_streaming_heartbeat_task_exists_in_main() {
-    // Commit de1784a — once-per-trading-day heartbeat at 09:15:30 IST.
-    let src = read_file("crates/app/src/main.rs");
-    assert!(
-        src.contains("MarketOpenStreamingConfirmation"),
-        "Streaming-live heartbeat task MUST be wired in main.rs (commit de1784a)."
-    );
-    assert!(
-        src.contains("09:15:30"),
-        "Heartbeat task must reference the 09:15:30 IST trigger time."
-    );
-}
+// RETIRED (PR-C2, 2026-07-13 - Dhan live-WS lane deletion, operator
+// retirement directive per websocket-connection-scope-lock.md
+// "2026-07-13 Amendment" S/B): guard_streaming_heartbeat_task_exists_in_main died with the machinery it pinned -
+// the 09:15:30 IST streaming heartbeat read the deleted Dhan
+// pool state and retired with the lane. The Groww feed's positive signals
+// are the feed-health surfaces + the 15:45 scorecard.
 
 // `guard_depth_command_initial_subscribe_variants_exist` retired —
 // `crates/core/src/websocket/depth_connection.rs` was deleted in PR #4

@@ -82,9 +82,10 @@ pub mod boot_probe;
 // Human-readable analyst console views (`ticks_named` / `candles_named`) —
 // plain QuestDB views LEFT-joining ticks/candles_1m against the
 // instrument_lifecycle master. Cold-path console tooling only (O(join) at
-// SELECT time, honestly O(N); zero hot-path impact). NOT feature-gated:
-// the DDL builders compile feature-free; the lifecycle-ensure call inside
-// is `#[cfg(feature = "daily_universe_fetcher")]`-gated.
+// SELECT time, honestly O(N); zero hot-path impact). (The
+// `daily_universe_fetcher` feature that once gated the lifecycle-ensure
+// call inside was deleted in PR-C3, 2026-07-14 — everything here is
+// unconditional now.)
 pub mod console_views;
 // C2 (2026-07-03): HTTP-CLIENT-01 — panic-free reqwest client construction.
 // Shared OnceLock probe client for the repeating QuestDB readiness probes
@@ -109,6 +110,7 @@ pub mod brutex_crossverify_persistence;
 /// EPISODE (disconnect / stall / process death) with the blame verdict
 /// persisted — the month-end "who caused it" system-of-record.
 pub mod feed_episode_audit_persistence;
+pub mod feed_gap_audit_persistence;
 pub mod feed_parity_1m_audit_persistence;
 /// Dual-feed scoreboard (operator 2026-07-10): the per-day per-feed
 /// scoreboard row + the per-instrument coverage detail table.
@@ -155,23 +157,23 @@ pub mod groww_candle_persistence;
 // (SP5) The Groww live-vs-backtest 1m parity audit module was MERGED into the
 // unified `feed_parity_1m_audit_persistence` above (one table, `feed` in the
 // DEDUP key). Its empty `groww_cross_verify_1m_audit` table is retained on disk.
-// §21. DDL + append helpers + Row struct land in Sub-PR #10b-ζ.
-#[cfg(feature = "daily_universe_fetcher")]
+// Instrument fetch-audit table (SEBI forensic — retained per the PR-C3
+// retirement banner in daily-universe-instr-fetch-error-codes.md).
+// PR-C3 (2026-07-14): compiles unconditionally — the `daily_universe_fetcher`
+// feature gate was deleted with the Dhan instrument chain.
 pub mod instrument_fetch_audit_persistence;
 // Lifecycle table contracts (§5/§6 SEBI never-delete) — schema constants
-// + DEDUP keys + LifecycleState/TransitionKind enums. Feature-gated per
-// rule §21. DDL + Row + append helpers land in follow-up sub-PRs.
-#[cfg(feature = "daily_universe_fetcher")]
+// + DEDUP keys + LifecycleState/TransitionKind enums + DDL/Row/append
+// helpers. PR-C3 (2026-07-14): compiles unconditionally (feature gate
+// deleted); the live writer is the Groww shared_master_writer.
 pub mod instrument_lifecycle_persistence;
 // §31 item 2 (NTM Map-A, 2026-06-06): full index→constituents mapping table —
 // queryable both directions. Map-only (does NOT change the subscription).
-// Feature-gated per rule §21.
-#[cfg(feature = "daily_universe_fetcher")]
+// PR-C3 (2026-07-14): compiles unconditionally (feature gate deleted).
 pub mod index_constituency_persistence;
-// Daily lifecycle reconciler — PURE decision logic (§5/§6/§23). The app
-// boot orchestrator owns the I/O loop and consumes these pure functions.
-// Feature-gated per rule §21.
-#[cfg(feature = "daily_universe_fetcher")]
+// Daily lifecycle reconciler — PURE decision logic (§5/§6/§23). PR-C3
+// (2026-07-14): compiles unconditionally (feature gate deleted); consumed
+// by the Groww shared_master_writer's classify_transition path.
 pub mod lifecycle_reconciler;
 // PR #3 (2026-05-19): `greeks_persistence` module DELETED. greeks
 // pipeline retired alongside the indices-only universe. The
@@ -195,6 +197,14 @@ pub mod partition_manager;
 // row-count- and size-verified; gated on [partition_retention]
 // archive_enabled (serde default false).
 pub mod partition_archive;
+// Cluster-C order-side observability (2026-07-14): SEBI 5y order-lifecycle
+// audit — rebuild of the table deleted in #T4 (2026-05-20) on the modern
+// ILP-over-HTTP template with event-in-key DEDUP (AUDIT-06).
+pub mod order_audit_persistence;
+// Cluster-C order-side observability (2026-07-14): daily P&L snapshot
+// audit — rebuild of the Phase-0 Item-25 table deleted in #T4 (2026-05-20);
+// the OnEod row is the daily heartbeat/denominator (STORAGE-GAP-03).
+pub mod pnl_audit_persistence;
 pub mod prev_day_ohlcv_persistence;
 pub mod questdb_health;
 pub mod seal_absorption;

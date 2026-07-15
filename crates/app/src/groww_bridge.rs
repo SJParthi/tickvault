@@ -53,6 +53,9 @@ use tickvault_common::types::ExchangeSegment;
 use tickvault_common::ws_event_types::{
     WS_EVENT_NO_DHAN_CODE, WsEventAuditRow, WsEventKind, WsType,
 };
+use tickvault_storage::feed_gap_audit_persistence::{
+    FeedGapAuditRow, FeedGapAuditWriter, ensure_feed_gap_audit_table,
+};
 use tickvault_storage::groww_persistence::{GrowwLiveTickRow, GrowwLiveTickWriter};
 use tickvault_storage::seal_writer_runner::global_seal_sender;
 use tickvault_trading::candles::{FeedStrategy, MultiTfAggregator};
@@ -613,6 +616,193 @@ pub(crate) fn liveness_ts_advanced(prev_max: &mut i64, wake_max_exchange_ts_nano
     } else {
         false
     }
+}
+
+// ---------------------------------------------------------------------------
+// Feed gap-episode tracker (FEED-GAP-01 — Groww hardening PR-3, 2026-07-14)
+// ---------------------------------------------------------------------------
+
+/// In-session feed-level last-tick age (whole seconds) at/above which a gap
+/// EPISODE opens (the 2026-07-14 34.999s incident class). Pinned by
+/// `test_feed_gap_episode_threshold_is_10s`. Deliberately BELOW the
+/// FEED-STALL-01 restart threshold — the episode names the gap before the
+/// watchdog's kill+relaunch resolves it.
+pub(crate) const FEED_GAP_EPISODE_THRESHOLD_SECS: u64 = 10;
+
+/// Floor (whole seconds) below which a measured inter-tick spacing is the
+/// NORMAL ≤1s universe cadence, not a gap — the unconditional
+/// `tv_feed_gap_seconds_total` counter accumulates every measured gap at or
+/// above this floor, INDEPENDENT of the 10s episode threshold (sub-episode
+/// micro-gaps stay visible as a trend without episode noise).
+pub(crate) const FEED_GAP_COUNTER_FLOOR_SECS: u64 = 2;
+
+/// Bound on the named partial 1-minute bucket labels carried by a CLOSE row
+/// (defense against a pathological multi-hour gap producing an unbounded
+/// string — entries beyond the bound collapse to a single ellipsis marker).
+pub(crate) const FEED_GAP_PARTIAL_MINUTES_MAX: usize = 10;
+
+/// One gap-episode EDGE decision from a tracker poll. Timestamps are IST
+/// epoch nanos (the bridge's receipt clock).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum FeedGapEdge {
+    /// No edge this wake.
+    None,
+    /// The last-tick age crossed the episode threshold in-session — the
+    /// episode OPENS (one OPEN row + one High Telegram, edge-latched by the
+    /// tracker's own `open` state).
+    Open {
+        /// Detection instant (this wake's clock).
+        detect_nanos: i64,
+        /// The last tick BEFORE the silence (now − age).
+        last_tick_nanos: i64,
+    },
+    /// Liveness advanced after an open episode — the episode CLOSES with the
+    /// measured last-tick-to-recovery gap.
+    Close {
+        /// Detection instant of the matching OPEN (the episode identity).
+        detect_nanos: i64,
+        /// The last tick BEFORE the gap.
+        last_tick_before_nanos: i64,
+        /// The recovery tick instant.
+        end_nanos: i64,
+        /// Measured gap in whole seconds (last-tick-before → recovery).
+        gap_secs: u64,
+    },
+}
+
+/// Pure gap-episode tracker: ONE `Open` per episode (edge-latched via the
+/// `open` state), `Close` on the liveness-advance recovery edge, and the
+/// unconditional counter contribution for EVERY measured gap ≥ the floor
+/// (threshold-independent). Driven from the bridge's existing ≤1s wake —
+/// NEVER the per-tick hot path. Never opens before the feed's first tick of
+/// the session (`age == None` — the never-streamed class belongs to
+/// FEED-STALL-01, not a gap).
+#[derive(Debug, Default)]
+pub(crate) struct FeedGapTracker {
+    /// `Some((last_tick_before_nanos, detect_nanos))` while an episode is open.
+    open: Option<(i64, i64)>,
+    /// Highest last-tick instant ever observed (0 = none yet) — the
+    /// liveness-advance reference for the unconditional gap counter.
+    prev_last_tick_nanos: i64,
+}
+
+impl FeedGapTracker {
+    /// One poll: `last_tick_nanos` = the RAW feed-level last-tick IST stamp
+    /// ([`tickvault_common::feed_health::FeedHealthRegistry::last_tick_ist_nanos`]
+    /// — NEVER a value reconstructed from the FLOORED age, whose discarded
+    /// sub-second remainder creeps the reconstruction forward every >1s poll
+    /// and fakes a liveness advance during a real gap; review CRITICAL
+    /// 2026-07-14), `None` until the first tick of the session; `now_nanos` =
+    /// this wake's IST receipt clock; `in_session` = the episode-OPEN gate
+    /// (an episode only OPENS in-session; a recovery CLOSE fires regardless
+    /// so a session-tail gap that recovers just after close is still
+    /// measured).
+    ///
+    /// Returns the edge (if any) + the whole-seconds contribution to the
+    /// unconditional `tv_feed_gap_seconds_total` counter.
+    pub(crate) fn poll(
+        &mut self,
+        last_tick_nanos: Option<i64>,
+        now_nanos: i64,
+        in_session: bool,
+    ) -> (FeedGapEdge, u64) {
+        let Some(last_tick_nanos) = last_tick_nanos else {
+            // Never streamed this session — no last tick, no gap to name.
+            return (FeedGapEdge::None, 0);
+        };
+        // Belt AND suspenders (review CRITICAL, 2026-07-14): the raw stamp
+        // only moves on a real tick, and the advanced branch ADDITIONALLY
+        // requires a full ≥1s advance (hysteresis) — so even a creeping /
+        // jittering input (sub-second forward drift per poll, the floored-age
+        // reconstruction shape) can never fake a recovery: it falls through
+        // to the silence branch, the age keeps growing, and OPEN latches.
+        if last_tick_nanos >= self.prev_last_tick_nanos.saturating_add(1_000_000_000) {
+            // Liveness ADVANCED by at least a full second (a genuinely newer
+            // tick; `prev == 0` = first observation, trivially satisfied).
+            let mut counter_add = 0u64;
+            if self.prev_last_tick_nanos != 0 {
+                let delta_secs = (last_tick_nanos.saturating_sub(self.prev_last_tick_nanos)
+                    / 1_000_000_000)
+                    .max(0) as u64;
+                if delta_secs >= FEED_GAP_COUNTER_FLOOR_SECS {
+                    counter_add = delta_secs;
+                }
+            }
+            self.prev_last_tick_nanos = last_tick_nanos;
+            if let Some((last_tick_before, detect_nanos)) = self.open.take() {
+                let gap_secs = (last_tick_nanos.saturating_sub(last_tick_before) / 1_000_000_000)
+                    .max(0) as u64;
+                return (
+                    FeedGapEdge::Close {
+                        detect_nanos,
+                        last_tick_before_nanos: last_tick_before,
+                        end_nanos: last_tick_nanos,
+                        gap_secs,
+                    },
+                    counter_add,
+                );
+            }
+            return (FeedGapEdge::None, counter_add);
+        }
+        // Liveness did NOT advance by a full second — silence continues (or
+        // a sub-second creep/jitter holds steady; treated as silence).
+        let age = (now_nanos.saturating_sub(last_tick_nanos).max(0) / 1_000_000_000) as u64;
+        if self.open.is_none() && in_session && age >= FEED_GAP_EPISODE_THRESHOLD_SECS {
+            self.open = Some((last_tick_nanos, now_nanos));
+            return (
+                FeedGapEdge::Open {
+                    detect_nanos: now_nanos,
+                    last_tick_nanos,
+                },
+                0,
+            );
+        }
+        (FeedGapEdge::None, 0)
+    }
+}
+
+/// IST "HH:MM" label for an IST-epoch-nanos instant (pure).
+pub(crate) fn ist_hhmm_label(ist_nanos: i64) -> String {
+    let secs_of_day = (ist_nanos / 1_000_000_000).rem_euclid(86_400);
+    // O(1) EXEMPT: cold path — gap-episode label builder, once per episode edge
+    format!(
+        "{:02}:{:02}",
+        secs_of_day / 3_600,
+        (secs_of_day % 3_600) / 60
+    )
+}
+
+/// Comma list of the 1-minute bucket labels overlapped by `[start, end]`
+/// (IST epoch nanos) — the NAMED partial bars a gap makes thin. Bounded to
+/// [`FEED_GAP_PARTIAL_MINUTES_MAX`] entries + a trailing `…` marker (a
+/// multi-hour gap can never produce an unbounded string). Pure + testable.
+/// Annotation only — the bars themselves are never touched (live-feed
+/// purity).
+pub(crate) fn partial_minute_labels(start_ist_nanos: i64, end_ist_nanos: i64) -> String {
+    if end_ist_nanos < start_ist_nanos {
+        // O(1) EXEMPT: cold path — gap-episode annotation, once per episode edge
+        return String::new();
+    }
+    const MINUTE_NANOS: i64 = 60 * 1_000_000_000;
+    let first = start_ist_nanos.div_euclid(MINUTE_NANOS);
+    let last = end_ist_nanos.div_euclid(MINUTE_NANOS);
+    // O(1) EXEMPT: cold path — bounded label list (FEED_GAP_PARTIAL_MINUTES_MAX), once per episode
+    let mut out = String::new();
+    let mut emitted = 0usize;
+    let mut bucket = first;
+    while bucket <= last {
+        if emitted >= FEED_GAP_PARTIAL_MINUTES_MAX {
+            out.push_str(",…");
+            break;
+        }
+        if emitted > 0 {
+            out.push(',');
+        }
+        out.push_str(&ist_hhmm_label(bucket * MINUTE_NANOS));
+        emitted += 1;
+        bucket += 1;
+    }
+    out
 }
 
 /// Pure per-wake read-budget decision (F3 hostile finding 2026-07-02): 0 when
@@ -2064,6 +2254,7 @@ pub fn rotate_stale_groww_capture_at_open_at(
     tick_file_path: &Path,
     today_ist_day: i64,
 ) -> Option<PathBuf> {
+    // O(1) EXEMPT: cold boot path — one-shot rotate-at-open before any spawn
     let meta = std::fs::metadata(tick_file_path).ok()?;
     if meta.len() == 0 {
         return None; // empty file — nothing worth archiving
@@ -2076,6 +2267,7 @@ pub fn rotate_stale_groww_capture_at_open_at(
     // APPROVED: mtime seconds fit i64 for any realistic wall clock; cold boot path.
     let mtime_ist_day = ist_day_from_unix_secs(mtime_secs.as_secs() as i64);
     // Best-effort snapshot read (sync — cold boot path, before any spawn).
+    // O(1) EXEMPT: cold boot path — one-shot snapshot read at rotate-at-open
     let snapshot_ist_day = std::fs::read_to_string(offset_snapshot_path(tick_file_path))
         .ok()
         .and_then(|raw| serde_json::from_str::<GrowwOffsetSnapshot>(&raw).ok())
@@ -2117,6 +2309,7 @@ pub fn rotate_stale_groww_capture_at_open_at(
                      (first-boot edge)"
                 );
             }
+            // O(1) EXEMPT: cold boot path — one-shot archive rename at rotate-at-open
             match std::fs::rename(tick_file_path, &target) {
                 Ok(()) => {
                     info!(
@@ -2774,6 +2967,25 @@ pub async fn run_groww_bridge(
     // (in-memory bars survive a bridge panic) and never leaks a duplicate
     // force-seal task. Parity with the Dhan IST-midnight force-seal (`main.rs`).
     let mut state = GrowwBridgeState::with_aggregator_and_seq(&qdb, aggregator, capture_seq);
+    // Feed gap-episode forensics (FEED-GAP-01, 2026-07-14): ensure the audit
+    // table once per bridge incarnation (idempotent DDL, best-effort — a
+    // failure logs FEED-GAP-01 and never blocks the bridge), and hold the
+    // tracker + a LAZY writer (constructed at the first edge; episodes are
+    // rare cold-path events).
+    {
+        // O(1) EXEMPT: cold path — once per bridge incarnation (ensure-DDL spawn)
+        let qdb_for_gap_ddl = qdb.clone();
+        tokio::spawn(async move {
+            ensure_feed_gap_audit_table(&qdb_for_gap_ddl).await;
+        });
+    }
+    let mut gap_tracker = FeedGapTracker::default();
+    // Shared slot for the lazy writer: the edge append+flush runs OFF this
+    // loop in `spawn_blocking` (review HIGH 2026-07-14), so the slot is an
+    // Arc<Mutex<Option<...>>> the blocking task locks per edge (cold path —
+    // once per episode edge; the Mutex is uncontended in practice).
+    let gap_writer: Arc<std::sync::Mutex<Option<FeedGapAuditWriter>>> =
+        Arc::new(std::sync::Mutex::new(None));
     // PR-3 (2026-07-02): resume from the persisted flushed-offset when it
     // provably belongs to the current capture file — otherwise byte-0 re-tail
     // (DEDUP-idempotent, the pre-PR-3 behavior).
@@ -3244,6 +3456,142 @@ pub async fn run_groww_bridge(
                     || metrics::gauge!("tv_feed_last_tick_age_seconds", "feed" => "groww"),
                 )
                 .set(age as f64);
+        }
+
+        // Feed gap-episode tracker (FEED-GAP-01, 2026-07-14): rides THIS ≤1s
+        // wake — NEVER the per-tick hot path. Every gap becomes a NAMED
+        // durable episode: OPEN row + ONE High Telegram at the ≥10s
+        // in-session threshold crossing, CLOSE row + Info Telegram (measured
+        // gap + named partial 1-minute bars) at the liveness-advance
+        // recovery edge, and the unconditional gap-seconds counter for
+        // sub-threshold micro-gaps. Annotation, never repair — candles are
+        // untouched; a failed write logs FEED-GAP-01 and never touches the
+        // recovery machinery.
+        {
+            let gap_now_nanos = receipt_ist_nanos();
+            // RAW stamp — never the floored age (review CRITICAL 2026-07-14:
+            // the sub-second remainder creeps a reconstruction forward every
+            // poll, so OPEN could never latch during a real gap).
+            let gap_last_tick = feed_health.last_tick_ist_nanos(Feed::Groww);
+            // Episode-OPEN gate (review HIGH 2026-07-14): BOTH the
+            // calendar-aware trading-session gate AND the exchange-session
+            // gate ([09:15, 15:30) IST via g1_exchange_gate_accepts — the
+            // §1b never-streamed precedent). Without the second gate the
+            // 09:08–09:15 pre-open auction-window silence would page a
+            // false gap most mornings. The unconditional gap-seconds
+            // counter is NOT gated (it accumulates in the advanced branch
+            // regardless) — only pages/episodes are ≥09:15.
+            let in_session = tickvault_common::market_hours::is_trading_session_now()
+                && tickvault_common::constants::g1_exchange_gate_accepts(
+                    gap_now_nanos.rem_euclid(86_400 * 1_000_000_000),
+                );
+            let (edge, counter_add_secs) =
+                gap_tracker.poll(gap_last_tick, gap_now_nanos, in_session);
+            if counter_add_secs > 0 {
+                metrics::counter!("tv_feed_gap_seconds_total", "feed" => "groww")
+                    .increment(counter_add_secs);
+            }
+            if !matches!(edge, FeedGapEdge::None) {
+                let nanos_per_day: i64 = 86_400 * 1_000_000_000;
+                let trading_date_ist_nanos =
+                    gap_now_nanos - gap_now_nanos.rem_euclid(nanos_per_day);
+                let feed_label = Feed::Groww.as_str();
+                let (row, event) = match &edge {
+                    FeedGapEdge::Open {
+                        detect_nanos,
+                        last_tick_nanos,
+                    } => (
+                        FeedGapAuditRow::open(
+                            gap_now_nanos,
+                            trading_date_ist_nanos,
+                            feed_label,
+                            *detect_nanos,
+                        ),
+                        tickvault_core::notification::NotificationEvent::FeedGapEpisodeOpened {
+                            feed: Feed::Groww.display_name().to_string(), // O(1) EXEMPT: cold path — once per gap episode
+                            start_hhmm_ist: ist_hhmm_label(*last_tick_nanos), // O(1) EXEMPT: cold path — once per gap episode
+                            // "No live orders exist" — the Dhan-disable
+                            // safety gate is wired to dry_run at boot and
+                            // flips false exactly when live orders can
+                            // exist, so it doubles as the paper-mode truth.
+                            dry_run: feed_runtime.can_disable_dhan(),
+                        },
+                    ),
+                    FeedGapEdge::Close {
+                        detect_nanos,
+                        last_tick_before_nanos,
+                        end_nanos,
+                        gap_secs,
+                    } => {
+                        let partial = partial_minute_labels(*last_tick_before_nanos, *end_nanos);
+                        (
+                            FeedGapAuditRow::closed(
+                                gap_now_nanos,
+                                trading_date_ist_nanos,
+                                feed_label,
+                                *detect_nanos,
+                                *end_nanos,
+                                (*gap_secs).min(i64::MAX as u64) as i64,
+                                // Kill count: the stall-watchdog restart
+                                // count lives only in a write-only metrics
+                                // counter — not cheaply readable in-process,
+                                // so the row carries the honest -1 sentinel
+                                // (never a fabricated 0).
+                                tickvault_storage::feed_gap_audit_persistence::GAP_SENTINEL_UNKNOWN,
+                                partial.clone(), // O(1) EXEMPT: cold path — once per gap episode
+                            ),
+                            tickvault_core::notification::NotificationEvent::FeedGapEpisodeClosed {
+                                feed: Feed::Groww.display_name().to_string(), // O(1) EXEMPT: cold path — once per gap episode
+                                gap_secs: *gap_secs,
+                                kill_count: tickvault_storage::feed_gap_audit_persistence::GAP_SENTINEL_UNKNOWN,
+                                partial_minutes: partial,
+                            },
+                        )
+                    }
+                    FeedGapEdge::None => unreachable!("gated by the matches! above"),
+                };
+                // Durable row FIRST (audit-first §24), best-effort — a
+                // failure is loud (FEED-GAP-01 + counter) and never blocks
+                // the Telegram bubble or the recovery machinery. The
+                // append+flush runs OFF this loop (`spawn_blocking`,
+                // fire-and-forget; review HIGH 2026-07-14): even with the
+                // bounded no-retry/5s-timeout ILP conf, a down QuestDB must
+                // never stall the NDJSON drain or the parse-time liveness
+                // stamp (a stalled stamp risks a false FEED-STALL-01 kill of
+                // a healthy sidecar). Episode edges are cold (once per
+                // episode), so the spawn cost is irrelevant.
+                let writer_slot = Arc::clone(&gap_writer);
+                let qdb_for_gap = qdb.clone(); // O(1) EXEMPT: cold path — once per gap episode
+                tokio::task::spawn_blocking(move || {
+                    let mut slot = writer_slot
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let writer = slot.get_or_insert_with(|| FeedGapAuditWriter::new(&qdb_for_gap));
+                    let write_result = writer.append_row(&row).and_then(|()| writer.flush());
+                    if let Err(err) = write_result {
+                        metrics::counter!(
+                            "tv_feed_gap_audit_write_errors_total",
+                            "stage" => "append_flush"
+                        )
+                        .increment(1);
+                        error!(
+                            code = "FEED-GAP-01",
+                            stage = "append_flush",
+                            ?err,
+                            outcome = row.outcome,
+                            "FEED-GAP-01: gap-episode row not persisted — the \
+                             Telegram bubble still fires; the next edge re-appends \
+                             (DEDUP-idempotent)"
+                        );
+                        // Drop the writer so the next edge rebuilds a fresh
+                        // sender instead of replaying a poisoned buffer.
+                        *slot = None;
+                    }
+                });
+                if let Some(notifier) = notifier_slot.as_ref().and_then(|slot| slot.load_full()) {
+                    notifier.notify(event);
+                }
+            }
         }
     }
 }
@@ -6241,5 +6589,172 @@ mod tests {
         );
         assert!(tick_file.exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // Feed gap-episode tracker (FEED-GAP-01, 2026-07-14)
+    // -----------------------------------------------------------------------
+
+    const GAP_NOW: i64 = 1_780_000_000_000_000_000;
+    const SEC: i64 = 1_000_000_000;
+
+    #[test]
+    fn test_feed_gap_episode_threshold_is_10s() {
+        // Operator-approved S4 design pin (2026-07-14): below the
+        // FEED-STALL-01 restart threshold, above the ≤1s wake cadence.
+        assert_eq!(FEED_GAP_EPISODE_THRESHOLD_SECS, 10);
+    }
+
+    #[test]
+    fn test_gap_tracker_never_streamed_never_opens() {
+        let mut t = FeedGapTracker::default();
+        let (edge, add) = t.poll(None, GAP_NOW, true);
+        assert_eq!(edge, FeedGapEdge::None);
+        assert_eq!(add, 0);
+    }
+
+    #[test]
+    fn test_gap_tracker_no_open_below_threshold() {
+        let mut t = FeedGapTracker::default();
+        // Seed liveness (raw last-tick stamp = now).
+        let _ = t.poll(Some(GAP_NOW), GAP_NOW, true);
+        let (edge, _) = t.poll(Some(GAP_NOW), GAP_NOW + 9 * SEC, true);
+        assert_eq!(edge, FeedGapEdge::None);
+    }
+
+    #[test]
+    fn test_gap_tracker_opens_at_threshold_once_per_episode() {
+        let mut t = FeedGapTracker::default();
+        let _ = t.poll(Some(GAP_NOW), GAP_NOW, true);
+        let (edge, _) = t.poll(Some(GAP_NOW), GAP_NOW + 10 * SEC, true);
+        assert!(
+            matches!(edge, FeedGapEdge::Open { last_tick_nanos, .. } if last_tick_nanos == GAP_NOW),
+            "expected Open at ≥10s, got {edge:?}"
+        );
+        // Silence continues — NO second Open (one bubble per episode).
+        let (edge2, _) = t.poll(Some(GAP_NOW), GAP_NOW + 20 * SEC, true);
+        assert_eq!(edge2, FeedGapEdge::None);
+    }
+
+    #[test]
+    fn test_gap_tracker_no_open_out_of_session() {
+        let mut t = FeedGapTracker::default();
+        let _ = t.poll(Some(GAP_NOW), GAP_NOW, false);
+        let (edge, _) = t.poll(Some(GAP_NOW), GAP_NOW + 60 * SEC, false);
+        assert_eq!(
+            edge,
+            FeedGapEdge::None,
+            "out-of-session silence is not a gap"
+        );
+    }
+
+    #[test]
+    fn test_gap_tracker_closes_on_liveness_advance_with_measured_gap() {
+        let mut t = FeedGapTracker::default();
+        let _ = t.poll(Some(GAP_NOW), GAP_NOW, true);
+        let _ = t.poll(Some(GAP_NOW), GAP_NOW + 12 * SEC, true); // Open
+        // Recovery: a fresh tick lands (raw stamp jumps to now+35s).
+        let (edge, add) = t.poll(Some(GAP_NOW + 35 * SEC), GAP_NOW + 35 * SEC, true);
+        match edge {
+            FeedGapEdge::Close {
+                last_tick_before_nanos,
+                end_nanos,
+                gap_secs,
+                ..
+            } => {
+                assert_eq!(last_tick_before_nanos, GAP_NOW);
+                assert_eq!(end_nanos, GAP_NOW + 35 * SEC);
+                assert_eq!(gap_secs, 35, "gap measured last-tick → recovery");
+            }
+            other => panic!("expected Close, got {other:?}"),
+        }
+        // The unconditional counter also accumulates the measured gap.
+        assert_eq!(add, 35);
+        // Fully re-armed: a later gap opens a NEW episode.
+        let (edge2, _) = t.poll(Some(GAP_NOW + 35 * SEC), GAP_NOW + 46 * SEC, true);
+        assert!(matches!(edge2, FeedGapEdge::Open { .. }));
+    }
+
+    #[test]
+    fn test_gap_tracker_counter_accumulates_sub_threshold_gaps() {
+        let mut t = FeedGapTracker::default();
+        let _ = t.poll(Some(GAP_NOW), GAP_NOW, true);
+        // 5s micro-gap: below the 10s episode threshold but ≥ the 2s floor —
+        // no episode, counter still accumulates (threshold-independent).
+        let (edge, add) = t.poll(Some(GAP_NOW + 5 * SEC), GAP_NOW + 5 * SEC, true);
+        assert_eq!(edge, FeedGapEdge::None);
+        assert_eq!(add, 5);
+        // 1s normal cadence: below the floor — never counted.
+        let (_, add2) = t.poll(Some(GAP_NOW + 6 * SEC), GAP_NOW + 6 * SEC, true);
+        assert_eq!(add2, 0);
+    }
+
+    #[test]
+    fn test_gap_tracker_floored_age_jitter_is_not_an_advance() {
+        // Review CRITICAL (2026-07-14): reconstructing the last-tick stamp
+        // from the FLOORED age (`now - age*1e9`) yields `T + (now-T) mod 1s`
+        // — a value that jitters inside [T, T+1s) on every poll. Under the
+        // old strict-`>` advance check that sub-second creep counted as a
+        // fresh tick each wake: OPEN never latched and jitter could flap
+        // open/close. The 1s hysteresis + raw-stamp contract must hold: the
+        // episode OPENS exactly once, never flap-closes, and the counter
+        // never accumulates from creep.
+        let mut t = FeedGapTracker::default();
+        let t0 = GAP_NOW;
+        let _ = t.poll(Some(t0), t0, true);
+        let mut opened = 0usize;
+        for i in 1..=20i64 {
+            // Uneven poll cadence so the modeled remainder actually moves.
+            let now = t0 + i * SEC + 300_000_000 * (i % 3);
+            let jittered = t0 + (now - t0).rem_euclid(SEC); // < t0 + 1s always
+            let (edge, add) = t.poll(Some(jittered), now, true);
+            assert_eq!(add, 0, "sub-second creep must never feed the counter");
+            match edge {
+                FeedGapEdge::Open { .. } => opened += 1,
+                FeedGapEdge::Close { .. } => {
+                    panic!("sub-second jitter flap-closed the episode at poll {i}")
+                }
+                FeedGapEdge::None => {}
+            }
+        }
+        assert_eq!(opened, 1, "episode must OPEN exactly once despite jitter");
+        // A REAL new tick (full ≥1s raw-stamp jump) closes it with the
+        // measured gap (~40s; the stored pre-gap reference carries the
+        // caller-supplied jittered stamp, so the floor lands on 39-40 —
+        // production callers pass RAW stamps, making it exact).
+        let (edge, _) = t.poll(Some(t0 + 40 * SEC), t0 + 40 * SEC, true);
+        assert!(
+            matches!(edge, FeedGapEdge::Close { gap_secs, .. } if (39..=40).contains(&gap_secs)),
+            "real recovery tick must Close with the measured gap, got {edge:?}"
+        );
+    }
+
+    #[test]
+    fn test_ist_hhmm_label() {
+        // 10:15:30 IST on some day: seconds-of-day 36930.
+        let nanos = (86_400 * 20_000 + 36_930) * SEC;
+        assert_eq!(ist_hhmm_label(nanos), "10:15");
+    }
+
+    #[test]
+    fn test_partial_minute_labels_overlap_and_bound() {
+        // Gap 10:15:50 → 10:17:05 overlaps buckets 10:15, 10:16, 10:17.
+        let day = 86_400 * 20_000 * SEC;
+        let start = day + (10 * 3_600 + 15 * 60 + 50) * SEC;
+        let end = day + (10 * 3_600 + 17 * 60 + 5) * SEC;
+        assert_eq!(partial_minute_labels(start, end), "10:15,10:16,10:17");
+        // Bound: a multi-hour gap collapses past the cap with an ellipsis.
+        let long_end = day + (12 * 3_600) * SEC;
+        let labels = partial_minute_labels(start, long_end);
+        assert!(
+            labels.ends_with(",…"),
+            "bounded list must end with ellipsis: {labels}"
+        );
+        assert_eq!(
+            labels.trim_end_matches(",…").split(',').count(),
+            FEED_GAP_PARTIAL_MINUTES_MAX
+        );
+        // Degenerate: end before start → empty.
+        assert_eq!(partial_minute_labels(end, start), "");
     }
 }

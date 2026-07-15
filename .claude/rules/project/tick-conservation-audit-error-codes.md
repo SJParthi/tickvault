@@ -78,6 +78,23 @@ this count. Dhan's feed is itself sampled (~2–4 updates/sec/SID), so
 - `crates/storage/src/tick_conservation_audit_persistence.rs`
 - `crates/storage/src/ws_frame_spill.rs::count_frames_for_ist_day`
 
+### 2026-07-14 Update — TICK-CONSERVE-01 now PAGES (delivery boundary closed)
+
+The 2026-07-10 automation audit found this High code emitted `error!` but
+was **log-sink-only** — a positive daily residual paged NOBODY. It now
+routes via the canonical errcode chain: `error!` → errors.jsonl →
+CloudWatch Logs `/tickvault/<env>/app` → the
+`tv-<env>-errcode-tick-conserve-01` log metric filter
+(`deploy/aws/terraform/error-code-alarms.tf`) → alarm (≤5 min) → SNS →
+Telegram. `ok_recovery = false`: the 15:40 IST audit fires its residual
+line once per day — a discrete data-accounting finding; the auto-OK
+~15 min after the datapoint ages out can never mean the accounting
+balanced (Rule-11 false-recovery; the aggregator-drop-01 precedent) —
+the real recovery signal is the next trading day's `balanced` row.
+Lockstep surfaces: the "Which codes page" list in
+`observability-architecture.md` + the bidirectional drift ratchet
+`crates/common/tests/error_code_paging_filter_drift_guard.rs`.
+
 ## §2. Trigger / auto-load
 
 This rule activates when editing:

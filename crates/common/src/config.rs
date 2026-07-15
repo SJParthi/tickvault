@@ -32,8 +32,11 @@ pub struct ApplicationConfig {
     pub logging: LoggingConfig,
     pub instrument: InstrumentConfig,
     pub api: ApiConfig,
-    #[serde(default)]
-    pub subscription: SubscriptionConfig,
+    // PR-C3 (2026-07-14): the `subscription` field (SubscriptionConfig /
+    // SubscriptionScope) was DELETED with the Dhan instrument-download +
+    // subscription chain (operator retirement directive 2026-07-13,
+    // scope-lock amendment §B item 2). Groww's watch set is built from its
+    // own master; there is no Dhan WS subscription to configure.
     #[serde(default)]
     pub notification: NotificationConfig,
     #[serde(default)]
@@ -164,6 +167,34 @@ pub struct ApplicationConfig {
     /// section ⇒ DISABLED (fail-safe default off).
     #[serde(default)]
     pub groww_contract_1m: GrowwContract1mConfig,
+    /// `[groww_orders]` — Groww ORDER-SIDE build gate (operator authorization
+    /// 2026-07-14, `.claude/rules/project/groww-second-feed-scope-2026-06-19.md`
+    /// §39). GATE 1 of the 4-gate live-fire lattice: every key default-OFF, so
+    /// an absent section leaves the entire Groww order-side dark. Read-only
+    /// order/portfolio/margin/user GETs are per-area config-gated + market-hours
+    /// -only when enabled; live order placement is hard-locked behind Gates
+    /// 2 (cargo feature) + 3 (the `GROWW_ORDER_LIVE_FIRE` const) regardless of
+    /// this config. Absent section ⇒ fully DISABLED (fail-safe default off).
+    #[serde(default)]
+    pub groww_orders: GrowwOrdersConfig,
+    /// `[dhan_margin_gate]` — 🔷 DHAN pre-trade margin gate (operator
+    /// directive 2026-07-14, relayed via the coordinator session — the
+    /// Funds & Margin surface runs as its own dedicated build; umbrella
+    /// plan cluster E2). Code-ready DEFAULT-OFF: even with
+    /// `enabled = true` the REST legs stay dark until the code-change
+    /// master lock `DHAN_MARGIN_GATE_REST_ALLOWED` (constants.rs) flips
+    /// with a fresh dated operator quote. Absent section ⇒ DISABLED
+    /// (fail-safe default off).
+    #[serde(default)]
+    pub dhan_margin_gate: DhanMarginGateConfig,
+    /// `[exit_orders]` — 🔷 DHAN exit-order execution layer (Cluster B,
+    /// 2026-07-14; `.claude/rules/project/dhan-exit-order-lockout-2026-07-14.md`).
+    /// LOCK #1 of the 4-lock OFF switch: default OFF; absent section =
+    /// disabled (fail-safe). The app-crate dispatcher drops every
+    /// `ExitCommand` while disabled; enabling activates DRY-RUN PAPER
+    /// behavior only (the engine's hardcoded `dry_run` blocks live POSTs).
+    #[serde(default)]
+    pub exit_orders: ExitOrdersConfig,
 }
 
 /// `[feeds]` — pluggable market-data feed selection (operator lock
@@ -708,6 +739,176 @@ impl Default for Spot1mRestConfig {
     }
 }
 
+/// Days after which the operator's freeze-limit review is considered
+/// stale (>90 days ⇒ one boot-time WARN at trading-pipeline init —
+/// design Ruling 6 amendment, 2026-07-14).
+const FREEZE_REVIEW_STALE_DAYS: i64 = 90;
+
+/// Serde default for [`ExitOrdersConfig::mpp_verify_deadline_secs`] — 30.
+fn default_mpp_verify_deadline_secs() -> u64 {
+    30
+}
+
+/// Serde default for [`ExitOrdersConfig::mpp_verify_max_attempts`] — 5
+/// (the 1, 2, 4, 8, 10 ladder: 25s cumulative inside the 30s deadline).
+fn default_mpp_verify_max_attempts() -> u32 {
+    5
+}
+
+/// `[exit_orders]` — 🔷 DHAN exit-order execution layer (Cluster B,
+/// 2026-07-14 — LOCK #1 of the 4-lock OFF switch;
+/// `.claude/rules/project/dhan-exit-order-lockout-2026-07-14.md`).
+///
+/// Fail-safe: absent section = disabled (every field is
+/// `#[serde(default)]`-safe). The app-crate dispatcher
+/// (`crates/app/src/exit_execution.rs`) drops every `ExitCommand` while
+/// `enabled = false`; flipping to `true` activates DRY-RUN PAPER behavior
+/// ONLY (the engine's hardcoded `dry_run: true` blocks every live POST) —
+/// a flip is never a silent no-op: one boot log line names the mode.
+/// The ENGINE stays config-free (per-call parameters only — policy lives
+/// in the app layer, design Ruling 8).
+#[derive(Debug, Clone, Deserialize)]
+pub struct ExitOrdersConfig {
+    /// Master switch for the exit-order dispatcher. Default OFF
+    /// (fail-safe) — `config/base.toml` carries the section with
+    /// `enabled = false` as the ratchet's non-vacuous scan surface.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Exchange freeze quantity (operator-supplied; NO Dhan-side constant
+    /// exists in-repo — Verified V10). `0` = unset; [`Self::validate`]
+    /// requires `>= 1` when `enabled`. The per-underlying MAP is deferred
+    /// to Cluster A (Ruling 6 amendment); a per-call `freeze_limit`
+    /// parameter on `place_order_sliced` always wins over this scalar.
+    #[serde(default)]
+    pub default_freeze_limit_qty: i64,
+    /// `"YYYY-MM-DD"` the operator last verified the freeze limit against
+    /// the NSE qtyfreeze file. `>90` days stale ⇒ one boot-time WARN
+    /// (via [`freeze_review_is_stale`], logged at trading-pipeline init).
+    #[serde(default)]
+    pub freeze_limits_reviewed_on: String,
+    /// MPP verify-after-place deadline (seconds) — past it a still-PENDING
+    /// order classifies `PendingAtLimit` (orders.md rule 18: a MARKET
+    /// order auto-converted to LIMIT is NEVER assumed filled).
+    #[serde(default = "default_mpp_verify_deadline_secs")]
+    pub mpp_verify_deadline_secs: u64,
+    /// Verify-ladder probe budget (1-indexed rungs of
+    /// `exit_rules::next_verify_backoff_secs`). Default 5 → the
+    /// 1, 2, 4, 8, 10 ladder (25s cumulative inside the 30s deadline).
+    #[serde(default = "default_mpp_verify_max_attempts")]
+    pub mpp_verify_max_attempts: u32,
+    /// Default trailing jump for brackets (`0.0` = no trailing).
+    #[serde(default)]
+    pub default_trailing_jump: f64,
+}
+
+impl Default for ExitOrdersConfig {
+    /// Manual impl so `Default` matches the serde field defaults exactly
+    /// (a derived `Default` would zero the verify deadline/attempts while
+    /// an empty `[exit_orders]` section deserializes them to 30/5).
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            default_freeze_limit_qty: 0,
+            freeze_limits_reviewed_on: String::new(),
+            mpp_verify_deadline_secs: default_mpp_verify_deadline_secs(),
+            mpp_verify_max_attempts: default_mpp_verify_max_attempts(),
+            default_trailing_jump: 0.0,
+        }
+    }
+}
+
+impl ExitOrdersConfig {
+    /// Boot-time validation (design §3.6).
+    ///
+    /// Always: `mpp_verify_deadline_secs` in `1..=300`;
+    /// `mpp_verify_max_attempts` in `1..=8`; `default_trailing_jump`
+    /// finite and `>= 0.0`. When `enabled`: `default_freeze_limit_qty >= 1`
+    /// and `freeze_limits_reviewed_on` parses as `%Y-%m-%d`.
+    ///
+    /// # Errors
+    /// Returns a descriptive error on the first violated bound.
+    pub fn validate(&self) -> Result<()> {
+        self.validate_with_today(ist_date_from_utc(chrono::Utc::now()))
+    }
+
+    /// Deterministic core of [`Self::validate`] — `today_ist` is INJECTED
+    /// so tests never read the wall clock (flake root-cause hardening,
+    /// refuter round 2 2026-07-14: the L2 future-review-date check
+    /// compared hardcoded test dates against `Utc::now()`, so a run on a
+    /// host clock before 2026-07-14 IST — skew, or a session straddling
+    /// IST midnight — could flip an enabled-config `validate()` verdict).
+    /// Production goes through [`Self::validate`], which supplies the
+    /// real IST calendar day.
+    ///
+    /// # Errors
+    /// Returns a descriptive error on the first violated bound.
+    pub fn validate_with_today(&self, today_ist: chrono::NaiveDate) -> Result<()> {
+        if !(1..=300).contains(&self.mpp_verify_deadline_secs) {
+            bail!(
+                "exit_orders.mpp_verify_deadline_secs ({}) must be within 1..=300",
+                self.mpp_verify_deadline_secs
+            );
+        }
+        if !(1..=8).contains(&self.mpp_verify_max_attempts) {
+            bail!(
+                "exit_orders.mpp_verify_max_attempts ({}) must be within 1..=8",
+                self.mpp_verify_max_attempts
+            );
+        }
+        if !(self.default_trailing_jump.is_finite() && self.default_trailing_jump >= 0.0) {
+            bail!(
+                "exit_orders.default_trailing_jump ({}) must be finite and >= 0.0",
+                self.default_trailing_jump
+            );
+        }
+        if self.enabled {
+            if self.default_freeze_limit_qty < 1 {
+                bail!(
+                    "exit_orders.default_freeze_limit_qty ({}) must be >= 1 when \
+                     exit_orders.enabled = true (operator-supplied exchange freeze quantity)",
+                    self.default_freeze_limit_qty
+                );
+            }
+            match chrono::NaiveDate::parse_from_str(&self.freeze_limits_reviewed_on, "%Y-%m-%d") {
+                Err(_) => {
+                    bail!(
+                        "exit_orders.freeze_limits_reviewed_on ('{}') must be a YYYY-MM-DD date \
+                         when exit_orders.enabled = true",
+                        self.freeze_limits_reviewed_on
+                    );
+                }
+                Ok(reviewed) => {
+                    // L2 (2026-07-14 hostile review): a FUTURE review date is
+                    // a typo/backdating error — it would silence the >90-day
+                    // staleness WARN forever. IST calendar day (market-hours
+                    // rule) — injected by the caller; `validate()` supplies
+                    // `ist_date_from_utc(Utc::now())`.
+                    if reviewed > today_ist {
+                        bail!(
+                            "exit_orders.freeze_limits_reviewed_on ('{}') is in the future \
+                             (IST today is {today_ist}) — the review date must be today or past",
+                            self.freeze_limits_reviewed_on
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Pure staleness check for the operator's freeze-limit review date
+/// (>[`FREEZE_REVIEW_STALE_DAYS`] days ⇒ stale). Empty or unparsable
+/// `reviewed_on` is STALE (fail-safe — the WARN fires rather than a
+/// silent pass). The WARN itself is logged at trading-pipeline init,
+/// not here (this function is pure — zero I/O).
+pub fn freeze_review_is_stale(reviewed_on: &str, today: chrono::NaiveDate) -> bool {
+    match chrono::NaiveDate::parse_from_str(reviewed_on, "%Y-%m-%d") {
+        Ok(reviewed) => (today - reviewed).num_days() > FREEZE_REVIEW_STALE_DAYS,
+        Err(_) => true,
+    }
+}
+
 /// `[tf_consistency]` — daily timeframe-consistency verifier (operator
 /// directive 2026-07-13). Cold path only — the live candle pipeline, tick
 /// capture and trading are untouched; the verifier READS `candles_*` and
@@ -876,6 +1077,162 @@ impl Default for GrowwContract1mConfig {
             enabled: false,
             strikes_each_side: default_groww_contract_1m_strikes_each_side(),
         }
+    }
+}
+
+/// `[groww_orders]` — Groww ORDER-SIDE build gate (operator authorization
+/// 2026-07-14; `.claude/rules/project/groww-second-feed-scope-2026-06-19.md`
+/// §39, `.claude/rules/project/no-rest-except-live-feed-2026-06-27.md` §10).
+///
+/// This is GATE 1 of the 4-gate live-fire lattice (§39.2). Every field is
+/// `#[serde(default)]` = `false`, so an absent `[groww_orders]` section (or a
+/// TOML written before this build) leaves the ENTIRE Groww order-side dark —
+/// no read-only order GET, no margin/portfolio poll, and (independently)
+/// NO mutating order request. `config/base.toml` ships the section with every
+/// key `false`.
+///
+/// Two independent classes of gate:
+/// - Per-area READ-ONLY GETs (`orders_read`, `portfolio_read`, `margin_read`,
+///   `user_read`) — order/trade list+detail+status, positions, holdings,
+///   margins, user profile. When flipped `true` these run CONFIG-GATED +
+///   MARKET-HOURS-ONLY (the cold-path scheduled-read discipline). They place
+///   NO order.
+/// - `live_fire_requested` — a DECLARED INTENT flag ONLY. It is IGNORED unless
+///   Gate 3 (the hardcoded [`crate::constants::GROWW_ORDER_LIVE_FIRE`] const)
+///   is ALSO flipped in source AND the `groww_orders` cargo feature (Gate 2)
+///   is built in. Setting it `true` alone fires nothing — a config value can
+///   never, by itself, place a live Groww order. Flipping the actual
+///   live-orders enable is a SEPARATE, future, dated operator action that
+///   edits §39 + Gate 3 first.
+///
+/// Extension point: every FUTURE field on this struct MUST also be
+/// `#[serde(default)]` so older TOMLs keep deserializing byte-identically
+/// (the `GrowwSpot1mConfig` / `Spot1mRestConfig` precedent).
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct GrowwOrdersConfig {
+    /// Read-only order/trade GETs (list, detail, status, status-by-reference,
+    /// trades). Default OFF. Market-hours-gated when enabled.
+    #[serde(default)]
+    pub orders_read: bool,
+    /// Read-only portfolio GETs (positions user + by-symbol, holdings).
+    /// Default OFF. Market-hours-gated when enabled.
+    #[serde(default)]
+    pub portfolio_read: bool,
+    /// Read-only margin GETs (user margin detail + margin calculator).
+    /// Default OFF. Market-hours-gated when enabled.
+    #[serde(default)]
+    pub margin_read: bool,
+    /// Read-only user-profile GET (the user-detail endpoint) + exceptions
+    /// surface.
+    /// Default OFF. Market-hours-gated when enabled.
+    #[serde(default)]
+    pub user_read: bool,
+    /// DECLARED-INTENT flag for placing live Groww orders. IGNORED unless the
+    /// hardcoded [`crate::constants::GROWW_ORDER_LIVE_FIRE`] const (Gate 3) is
+    /// ALSO `true` AND the `groww_orders` cargo feature (Gate 2) is built —
+    /// a config value alone can NEVER fire an order. Default OFF; flipping the
+    /// real enable is a separate future dated operator action.
+    #[serde(default)]
+    pub live_fire_requested: bool,
+}
+
+/// 🔷 DHAN pre-trade margin gate (`[dhan_margin_gate]`).
+///
+/// Fail-safe: an absent section deserializes to DISABLED. Even when
+/// `enabled = true`, the REST legs stay dark until the code-change master
+/// lock `DHAN_MARGIN_GATE_REST_ALLOWED` (constants.rs) flips with a fresh
+/// dated operator quote — config flips alone can never turn the REST legs on.
+///
+/// Shared-account safety (BruteX co-tenant on the same Dhan account):
+/// `tenant_budget_percent` caps EACH entry to at most half of the
+/// then-current pooled `availabelBalance` (per-entry, not cumulative);
+/// `rest_self_cap_per_sec` self-caps our funds/margin REST usage — the
+/// funds/margin endpoints' rate bucket is NOT named by Dhan's docs, so the
+/// budget is Assumed Non-Trading (20/sec); the 5/sec default stays ≤ 50%
+/// even under the more conservative 10/sec reading; live-probe before
+/// raising.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DhanMarginGateConfig {
+    /// Master config gate. Serde default FALSE (absent section = disabled).
+    #[serde(default)]
+    pub enabled: bool,
+    /// PER-ENTRY cap: percent of the THEN-CURRENT pooled account
+    /// `availabelBalance` a single entry may consume. Hard-capped at 50
+    /// (shared account — never assume the full account margin is ours).
+    /// CUMULATIVE our-share is NOT capped — sequential entries each
+    /// re-read the balance, so they can cumulatively consume more of the
+    /// pool (a cumulative tenant ledger is a flagged follow-up for the
+    /// OMS-wiring PR).
+    #[serde(default = "default_margin_gate_tenant_budget_percent")]
+    pub tenant_budget_percent: u8,
+    /// Self-imposed funds/margin REST ceiling (requests/sec). Default 5:
+    /// the funds/margin endpoints' rate bucket is NOT named by Dhan's docs
+    /// — Assumed Non-Trading (20/sec); a 5/sec default stays ≤ 50% even
+    /// under the more conservative 10/sec reading; live-probe before
+    /// raising. Hard-capped at 10; minimum 2 (one entry check issues two
+    /// REST calls in one burst).
+    #[serde(default = "default_margin_gate_rest_self_cap_per_sec")]
+    pub rest_self_cap_per_sec: u32,
+}
+
+/// Serde default for [`DhanMarginGateConfig::tenant_budget_percent`] — 50,
+/// the shared-account hard cap (half the pooled balance is the most our
+/// entries may ever consume).
+fn default_margin_gate_tenant_budget_percent() -> u8 {
+    50
+}
+
+/// Serde default for [`DhanMarginGateConfig::rest_self_cap_per_sec`] — 5.
+/// The funds/margin endpoints' rate bucket is NOT named by Dhan's docs —
+/// Assumed Non-Trading (20/sec); a 5/sec default stays ≤ 50% even under the
+/// more conservative 10/sec reading; live-probe before raising.
+fn default_margin_gate_rest_self_cap_per_sec() -> u32 {
+    5
+}
+
+impl Default for DhanMarginGateConfig {
+    /// Manual impl so `Default` matches the serde field defaults exactly
+    /// (a derived `Default` would zero the budget/cap fields while an
+    /// absent `[dhan_margin_gate]` section deserializes them to 50/5).
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            tenant_budget_percent: default_margin_gate_tenant_budget_percent(),
+            rest_self_cap_per_sec: default_margin_gate_rest_self_cap_per_sec(),
+        }
+    }
+}
+
+impl DhanMarginGateConfig {
+    /// Boot-time validation — the shared-account envelope must hold.
+    ///
+    /// # Errors
+    /// Returns a descriptive error when `tenant_budget_percent` is outside
+    /// `1..=50` (the Dhan account is pooled with the BruteX co-tenant, so
+    /// our entries may never claim more than half the pooled balance) or
+    /// when `rest_self_cap_per_sec` is outside `2..=10` (the ceiling is
+    /// half of the Assumed Non-Trading 20/sec bucket — the funds/margin
+    /// endpoints' bucket is NOT named by Dhan's docs; at least 2 because
+    /// one entry check issues two REST calls in one burst).
+    pub fn validate(&self) -> Result<()> {
+        if !(1..=50).contains(&self.tenant_budget_percent) {
+            bail!(
+                "dhan_margin_gate.tenant_budget_percent ({}) must be within 1..=50 — the Dhan \
+                 account is shared with the BruteX co-tenant, so our entries may never claim \
+                 more than half of the pooled available balance",
+                self.tenant_budget_percent
+            );
+        }
+        if !(2..=10).contains(&self.rest_self_cap_per_sec) {
+            bail!(
+                "dhan_margin_gate.rest_self_cap_per_sec ({}) must be within 2..=10 — the \
+                 ceiling is half of the ASSUMED Non-Trading 20/sec bucket (the funds/margin \
+                 endpoints' bucket is not named by Dhan's docs; the account is shared with \
+                 the BruteX co-tenant) and at least 2 (one entry check bursts two REST calls)",
+                self.rest_self_cap_per_sec
+            );
+        }
+        Ok(())
     }
 }
 
@@ -1175,8 +1532,9 @@ pub struct FeaturesConfig {
     pub ws_depth_ou_sleep_until_open: bool,
     /// Wave 2 Item 7 — fast-boot 60-second deadline with mid-market degraded mode.
     pub fast_boot_60s_deadline: bool,
-    /// Wave 2 Item 8 — tick-gap detector 60-second alert coalescing.
-    pub tick_gap_detector_60s_coalesce: bool,
+    // PR-C3 (2026-07-14): `tick_gap_detector_60s_coalesce` (Wave 2 Item 8)
+    // retired alongside the deleted tick-gap detector (operator Q4-ii
+    // 2026-07-13 — the detector was fed only by the retired Dhan WS lane).
     /// Wave 2 Item 9 — 6 audit tables (subscribe/disconnect/depth/etc).
     pub audit_tables_enabled: bool,
     /// Wave 3 Item 11 — Telegram bucket-coalescer + dispatcher hardening.
@@ -1198,7 +1556,6 @@ impl Default for FeaturesConfig {
             ws_main_sleep_until_open: true,
             ws_depth_ou_sleep_until_open: true,
             fast_boot_60s_deadline: true,
-            tick_gap_detector_60s_coalesce: true,
             audit_tables_enabled: true,
             telegram_bucket_coalescer: true,
             market_open_self_test: true,
@@ -1283,18 +1640,31 @@ pub struct StrategyConfig {
     pub mode: TradingMode,
     /// S6-Step4: Sandbox-only enforcement until this date. If the current
     /// date is BEFORE this value, `mode = Live` is forbidden — the boot
-    /// sequence panics. Format: `YYYY-MM-DD`. Default `2026-06-30` per
-    /// Parthiban's "no real orders until June end" requirement.
+    /// sequence panics. Format: `YYYY-MM-DD`. Default `2099-12-31`
+    /// (2026-07-14 re-arm — the old `2026-06-30` default EXPIRED silently;
+    /// the sentinel matches production.toml, so going live requires an
+    /// explicit config edit with a fresh dated operator quote).
     ///
-    /// Set to `1970-01-01` (or any past date) to disable the gate.
+    /// Set to `1970-01-01` to disable the gate — that EXACT sentinel is
+    /// exempt from the loud-expiry tripwire (`expired_live_gates`); any
+    /// OTHER configured past date warns at every boot as a likely silent
+    /// no-op (the 2026-06-30 incident class).
     #[serde(default = "default_sandbox_only_until")]
     pub sandbox_only_until: String,
 }
 
 fn default_sandbox_only_until() -> String {
-    // Per Parthiban — sandbox-only until June end 2026.
-    "2026-06-30".to_string()
+    // 2026-07-14 re-arm: sentinel matching production.toml — an absent key
+    // now means ARMED, never silently expired.
+    "2099-12-31".to_string()
 }
+
+/// The documented intentional-disable value for `[strategy]
+/// sandbox_only_until` (the field doc's canonical "disable this gate"
+/// sentinel). Exactly this value is exempt from the loud-expiry tripwire —
+/// any OTHER configured past date is treated as accidental expiry and
+/// warned about at every boot (review round 1, 2026-07-14).
+const SANDBOX_ONLY_UNTIL_DISABLE_SENTINEL: &str = "1970-01-01";
 
 impl Default for StrategyConfig {
     fn default() -> Self {
@@ -1448,10 +1818,9 @@ pub struct WebSocketConfig {
     /// 0 = no stagger (all spawn immediately). Only affects initial startup, not reconnects.
     pub connection_stagger_ms: u64,
 
-    /// Per-conn activity watchdog threshold in seconds. AWS-lifecycle
-    /// LOCKED (PR #7b) — under `SubscriptionScope::Indices4Only` main.rs
-    /// overrides this at boot to `WATCHDOG_THRESHOLD_IDX_I_SECS = 3` (the
-    /// expected 1–3 tick/sec window for IDX_I). Defaults to the legacy
+    /// Per-conn activity watchdog threshold in seconds. Historical: the
+    /// Dhan main-feed clamped this at boot (retired with the lane, PR-C2/
+    /// C3 2026-07-13/14). Defaults to the legacy
     /// `WATCHDOG_THRESHOLD_LIVE_AND_DEPTH_SECS = 50` value when unset
     /// in TOML.
     #[serde(default = "default_activity_watchdog_threshold_secs")]
@@ -1815,157 +2184,14 @@ impl Default for ObservabilityConfig {
     }
 }
 
-/// Subscription scope gate (Wave 5 Item 1).
-///
-/// Selects between the legacy full-universe subscription (216 stock F&O +
-/// 3 indices full chain ≈ 24,324 instruments) and the indices-only scope
-/// (NIFTY + BANKNIFTY + SENSEX with ALL future expiries + every strike;
-/// cash equities + IDX_I unchanged ≈ 10-11K instruments — see
-/// `subscription_planner.rs` Section 3 for the all-expiries policy
-/// reverted on 2026-05-02 per operator's term-structure-visibility
-/// requirement). Production count varies day-to-day with weekly expiry
-/// roll + new strike addition; range observed 9.5K–11.5K.
-///
-/// Single-variant enum. AWS-lifecycle LOCKED scope per
-/// `.claude/rules/project/websocket-connection-scope-lock.md` +
-/// operator-charter §I (lock 2026-05-15). PR #7b retired the 3 legacy
-/// variants (`FullUniverse`, `IndicesOnlyAllExpiries`,
-/// `IndicesUnderlyingsOnly`); the enum is preserved as a 1-variant
-/// type so future scope expansion must go through this rule file
-/// and a new enum variant (instead of a boolean flag).
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SubscriptionScope {
-    /// AWS-lifecycle LOCKED scope (operator lock 2026-05-15 §I).
-    /// Subscribe ONLY the 4 IDX_I SIDs: NIFTY=13, BANKNIFTY=25,
-    /// SENSEX=51, INDIA VIX=21. NO derivatives, NO sectoral display
-    /// indices, NO NSE_EQ. Target: 4 SIDs on a single main-feed
-    /// WebSocket connection.
-    #[default]
-    #[serde(rename = "indices_4_only")]
-    Indices4Only,
-
-    /// Daily-universe scope (operator lock 2026-05-27 — see
-    /// `.claude/rules/project/daily-universe-scope-expansion-2026-05-27.md`).
-    /// Subscribe ~250 SIDs daily-fetched from Dhan Detailed CSV: all
-    /// NSE `IDX_I` indices + 1 BSE SENSEX `IDX_I` index + every unique
-    /// `UNDERLYING_SECURITY_ID` referenced by `FUTSTK/OPTSTK/FUTIDX/
-    /// OPTIDX` rows (resolved to NSE_EQ spots). All in Quote mode
-    /// (request code 17, 50-byte response packets carrying day OHLC).
-    /// Target: ~250 SIDs on a single main-feed WebSocket connection
-    /// (Dhan cap = 5,000 SIDs/conn). Fully landed once Sub-PRs
-    /// #2-#13 of the 14-sub-PR sequence ship. Currently NOT the
-    /// `#[default]` — code path activation happens incrementally.
-    #[serde(rename = "daily_universe")]
-    DailyUniverse,
-}
-
-impl SubscriptionScope {
-    /// Stable string label used for tracing fields, the
-    /// `tv_subscription_scope` info-gauge, and audit rows.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Indices4Only => "indices_4_only",
-            Self::DailyUniverse => "daily_universe",
-        }
-    }
-}
-
-/// AWS-lifecycle LOCKED (PR #7b) — main-feed WebSocket connection pool
-/// size is ALWAYS 1 under the single-variant `Indices4Only` scope.
-/// 4 IDX_I SIDs fit comfortably on a single connection (Dhan cap =
-/// 5,000 instruments/conn). The `configured` parameter is preserved
-/// for call-site compatibility but is ignored — collapsing it would
-/// touch every `dhan.max_websocket_connections` plumbing site.
-///
-/// Pure function. Tested by
-/// `test_effective_main_feed_pool_size_is_always_one_under_indices4only`.
-#[inline]
-#[must_use]
-pub const fn effective_main_feed_pool_size(_scope: SubscriptionScope, _configured: usize) -> usize {
-    crate::constants::PHASE_0_MAIN_FEED_CONNECTION_COUNT
-}
-
-/// Subscription planner configuration.
-///
-/// Controls which instruments are subscribed and at what feed mode.
-/// Indices get full chain (all expiries, all strikes). Stocks get current
-/// expiry only with ATM ± N strike filtering.
-#[derive(Debug, Clone, Deserialize)]
-pub struct SubscriptionConfig {
-    /// AWS-lifecycle LOCKED scope. Single variant: `Indices4Only`.
-    /// See `websocket-connection-scope-lock.md`.
-    #[serde(default)]
-    pub scope: SubscriptionScope,
-
-    /// Feed mode for all subscriptions. Always Full for maximum data (LTP, OI, depth).
-    /// IDX_I instruments are forced to Ticker at connection level (Dhan limitation).
-    /// Valid values: "Ticker", "Quote", "Full".
-    pub feed_mode: String,
-
-    /// Whether to subscribe stock equity price feeds (NSE_EQ segment).
-    pub subscribe_stock_equities: bool,
-
-    /// Number of strikes above ATM for stock options.
-    pub stock_atm_strikes_above: usize,
-
-    /// Number of strikes below ATM for stock options.
-    pub stock_atm_strikes_below: usize,
-
-    /// Default LTP to use for ATM calculation when no live price is available.
-    /// When the system first starts, there are no live prices yet.
-    /// This fallback ensures we subscribe to a reasonable strike range.
-    /// Once live prices arrive, dynamic rebalancing (Phase 2) will adjust.
-    pub stock_default_atm_fallback_enabled: bool,
-
-    /// Enable 20-level depth feed (separate WebSocket, uses 1 of 5 connection slots).
-    /// Subscribes ATM ± 5 strikes for NIFTY and BANKNIFTY on the depth endpoint.
-    #[serde(default)]
-    pub enable_twenty_depth: bool,
-
-    /// Maximum instruments to subscribe on the 20-level depth feed (max 50 per connection).
-    /// Default 49 = ATM + 24 CE above + 24 PE below.
-    #[serde(default = "default_twenty_depth_max_instruments")]
-    pub twenty_depth_max_instruments: usize,
-}
-
-fn default_twenty_depth_max_instruments() -> usize {
-    49
-}
-
-impl Default for SubscriptionConfig {
-    fn default() -> Self {
-        Self {
-            scope: SubscriptionScope::default(),
-            feed_mode: "Full".to_string(),
-            subscribe_stock_equities: true,
-            stock_atm_strikes_above: 25,
-            stock_atm_strikes_below: 25,
-            stock_default_atm_fallback_enabled: true,
-            enable_twenty_depth: false,
-            twenty_depth_max_instruments: 49,
-        }
-    }
-}
-
-impl SubscriptionConfig {
-    /// Parses the feed_mode string into a `FeedMode` enum.
-    ///
-    /// # Errors
-    /// Returns error if the string is not a recognized feed mode.
-    pub fn parsed_feed_mode(&self) -> Result<crate::types::FeedMode> {
-        match self.feed_mode.as_str() {
-            "Ticker" => Ok(crate::types::FeedMode::Ticker),
-            "Quote" => Ok(crate::types::FeedMode::Quote),
-            "Full" => Ok(crate::types::FeedMode::Full),
-            other => bail!(
-                "subscription.feed_mode must be Ticker/Quote/Full, got '{}'",
-                other
-            ),
-        }
-    }
-}
+// PR-C3 (2026-07-14, operator retirement directive 2026-07-13 — scope-lock
+// amendment §B item 2): `SubscriptionScope` (the compile-time WS-scope
+// contract), `effective_main_feed_pool_size`, and `SubscriptionConfig`
+// (with the base.toml `[subscription]` section) were DELETED with the Dhan
+// subscription planner — there is no Dhan WS subscription left to scope.
+// Re-introducing ANY Dhan market-data subscription surface requires a
+// fresh dated operator quote in websocket-connection-scope-lock.md FIRST
+// (§D of the amendment).
 
 /// Historical data fetching configuration.
 ///
@@ -2377,6 +2603,22 @@ impl ApplicationConfig {
             }
         }
 
+        // LOUD-EXPIRY tripwire (2026-07-14 re-arm): every date safety gate
+        // that has silently passed its date is a no-op — the exact class bug
+        // that left all three gates dead between 2026-07-01 and 2026-07-14.
+        // One warn! per expired gate at every boot (runtime-only; no
+        // time-bomb ratchet — unit tests inject dates).
+        {
+            let today = ist_date_from_utc(chrono::Utc::now());
+            for gate in expired_live_gates(today, &self.strategy.sandbox_only_until) {
+                tracing::warn!(
+                    gate,
+                    "date safety gate {gate} is in the PAST — it is a silent \
+                     no-op; re-arm it with a dated operator quote"
+                );
+            }
+        }
+
         // Gap 6: URL format validation — fail-fast on invalid URLs.
         // Catches typos and misconfiguration at boot instead of cryptic runtime errors.
         let validate_url = |name: &str, url: &str, required_scheme: &str| -> Result<()> {
@@ -2428,6 +2670,16 @@ impl ApplicationConfig {
         self.dhan_data_api.validate()?;
         self.spot_1m_rest.validate()?;
 
+        // 2026-07-14 Dhan margin gate: the shared-account budget/self-cap
+        // envelope (≤50% of the pooled balance, ≤10 req/sec) is rejected at
+        // boot, BEFORE any gate could consult it.
+        self.dhan_margin_gate.validate()?;
+
+        // 🔷 DHAN exit-order layer (Cluster B, 2026-07-14): verify-ladder
+        // bounds always; freeze-limit + review-date sanity when enabled —
+        // rejected at boot, BEFORE the trading pipeline spawns.
+        self.exit_orders.validate()?;
+
         Ok(())
     }
 }
@@ -2455,6 +2707,71 @@ fn is_before_live_trading_earliest(
     earliest: chrono::NaiveDate,
 ) -> bool {
     today_ist < earliest
+}
+
+/// LOUD-EXPIRY tripwire (2026-07-14 re-arm): returns the names of the date
+/// safety gates whose date is strictly in the PAST relative to `today_ist` —
+/// i.e. gates that have become silent no-ops. All three gates expired
+/// unnoticed between 2026-07-01 and 2026-07-14; `validate()` now warns once
+/// per expired gate at every boot so that class of drift can never recur
+/// silently. Pure (date injected) so unit tests never depend on the wall
+/// clock — no time-bomb ratchets.
+///
+/// Gates checked (the single sources of truth):
+/// - `LIVE_TRADING_EARLIEST` — the `LIVE_TRADING_EARLIEST_*` constants
+///   (config-level Live-mode boot gate, strict `<` on IST date).
+/// - `SANDBOX_DEADLINE_EPOCH_SECS` — the OMS `place_order` epoch sentinel
+///   (converted to its UTC calendar date).
+/// - `sandbox_only_until_default` — the serde default for
+///   `[strategy] sandbox_only_until`.
+/// - `sandbox_only_until_configured` — the CONFIGURED `[strategy]
+///   sandbox_only_until` value (review round 1, 2026-07-14: the historical
+///   incident WAS the configured base.toml value `2026-06-30` expiring, not
+///   the compiled default). The documented disable sentinel
+///   [`SANDBOX_ONLY_UNTIL_DISABLE_SENTINEL`] (`1970-01-01`) is exempt —
+///   that expiry is intentional; a value equal to the compiled default is
+///   also skipped (gate 3 already covers that exact date — no double warn).
+///   An unparseable configured value is not this tripwire's job —
+///   `check_sandbox_window` rejects it on the Live path.
+fn expired_live_gates(
+    today_ist: chrono::NaiveDate,
+    configured_sandbox_only_until: &str,
+) -> Vec<&'static str> {
+    let mut expired = Vec::new();
+
+    if let Some(earliest) = chrono::NaiveDate::from_ymd_opt(
+        crate::constants::LIVE_TRADING_EARLIEST_YEAR,
+        crate::constants::LIVE_TRADING_EARLIEST_MONTH,
+        crate::constants::LIVE_TRADING_EARLIEST_DAY,
+    ) && earliest < today_ist
+    {
+        expired.push("LIVE_TRADING_EARLIEST");
+    }
+
+    if let Some(deadline_utc) =
+        chrono::DateTime::from_timestamp(crate::constants::SANDBOX_DEADLINE_EPOCH_SECS, 0)
+        && deadline_utc.date_naive() < today_ist
+    {
+        expired.push("SANDBOX_DEADLINE_EPOCH_SECS");
+    }
+
+    if let Ok(cutoff) = chrono::NaiveDate::parse_from_str(&default_sandbox_only_until(), "%Y-%m-%d")
+        && cutoff < today_ist
+    {
+        // NOTE: this label covers BOTH shapes — default-by-absence AND a CONFIGURED value explicitly equal to the (expired) default (gate 4's `!= default` dedup routes that shape here; pinned by test_expired_live_gates_all_at_2100).
+        expired.push("sandbox_only_until_default");
+    }
+
+    if configured_sandbox_only_until != default_sandbox_only_until()
+        && configured_sandbox_only_until != SANDBOX_ONLY_UNTIL_DISABLE_SENTINEL
+        && let Ok(cutoff) =
+            chrono::NaiveDate::parse_from_str(configured_sandbox_only_until, "%Y-%m-%d")
+        && cutoff < today_ist
+    {
+        expired.push("sandbox_only_until_configured");
+    }
+
+    expired
 }
 
 // ---------------------------------------------------------------------------
@@ -2545,9 +2862,10 @@ mod tests {
     }
 
     #[test]
-    fn test_sandbox_default_value_is_2026_06_30() {
-        // The default value is exactly the date Parthiban specified.
-        assert_eq!(default_sandbox_only_until(), "2026-06-30");
+    fn test_sandbox_default_value_is_2099_sentinel() {
+        // 2026-07-14 re-arm: the default is the 2099-12-31 sentinel matching
+        // production.toml — an absent key means ARMED, never silently expired.
+        assert_eq!(default_sandbox_only_until(), "2099-12-31");
     }
 
     #[test]
@@ -2703,6 +3021,116 @@ mod tests {
     }
 
     // =======================================================================
+    // LOUD-EXPIRY tripwire tests (2026-07-14 re-arm) — dates injected, never
+    // wall-clock-dependent (no time-bomb tests).
+    // =======================================================================
+
+    #[test]
+    fn test_expired_live_gates_empty_today() {
+        // At the re-arm date (2026-07-14) every gate carries the 2099-12-31
+        // sentinel — nothing is expired.
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 7, 14).unwrap();
+        assert!(
+            expired_live_gates(today, &default_sandbox_only_until()).is_empty(),
+            "no gate may read expired at the 2026-07-14 re-arm date"
+        );
+    }
+
+    #[test]
+    fn test_expired_live_gates_all_at_2100() {
+        // Past the sentinel, all three compile-time gates are silent no-ops —
+        // the tripwire must name every one of them. A configured value EQUAL
+        // to the compiled default must NOT double-warn (gate 3 already covers
+        // that exact date — no `sandbox_only_until_configured` entry).
+        let today = chrono::NaiveDate::from_ymd_opt(2100, 1, 1).unwrap();
+        let expired = expired_live_gates(today, &default_sandbox_only_until());
+        assert_eq!(
+            expired,
+            vec![
+                "LIVE_TRADING_EARLIEST",
+                "SANDBOX_DEADLINE_EPOCH_SECS",
+                "sandbox_only_until_default",
+            ],
+            "at 2100-01-01 all three date gates must be reported expired, \
+             with NO duplicate configured entry for the default value"
+        );
+    }
+
+    #[test]
+    fn test_expired_live_gates_per_gate_granularity() {
+        // The check is strictly-past per gate: ON the sentinel date itself no
+        // gate is expired; the DAY AFTER, every 2099-12-31 gate is.
+        let sentinel = chrono::NaiveDate::from_ymd_opt(2099, 12, 31).unwrap();
+        assert!(
+            expired_live_gates(sentinel, &default_sandbox_only_until()).is_empty(),
+            "a gate dated today is NOT expired (strictly-past check)"
+        );
+        let day_after = sentinel.succ_opt().unwrap();
+        assert_eq!(
+            expired_live_gates(day_after, &default_sandbox_only_until()).len(),
+            3,
+            "the day after the sentinel every gate reads expired"
+        );
+    }
+
+    #[test]
+    fn test_expired_live_gates_configured_past_date_warns() {
+        // Review round 1 (2026-07-14): the historical incident WAS the
+        // configured base.toml value (2026-06-30) expiring — a configured
+        // past date that is neither the default nor the disable sentinel
+        // MUST be named by the tripwire.
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 7, 14).unwrap();
+        assert_eq!(
+            expired_live_gates(today, "2026-06-30"),
+            vec!["sandbox_only_until_configured"],
+            "a configured past date (the 2026-06-30 incident class) must warn"
+        );
+    }
+
+    #[test]
+    fn test_expired_live_gates_configured_future_silent() {
+        // A configured FUTURE date (non-default) is an armed gate — silent.
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 7, 14).unwrap();
+        assert!(
+            expired_live_gates(today, "2097-01-01").is_empty(),
+            "a configured future date must not warn"
+        );
+    }
+
+    #[test]
+    fn test_expired_live_gates_disable_sentinel_silent() {
+        // The documented intentional-disable sentinel (exactly 1970-01-01)
+        // is exempt — that expiry is deliberate, not drift.
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 7, 14).unwrap();
+        assert!(
+            expired_live_gates(today, SANDBOX_ONLY_UNTIL_DISABLE_SENTINEL).is_empty(),
+            "the documented 1970-01-01 disable sentinel must not warn"
+        );
+        // But any OTHER ancient date is NOT the sentinel — it warns.
+        assert_eq!(
+            expired_live_gates(today, "1970-01-02"),
+            vec!["sandbox_only_until_configured"],
+            "only the exact documented sentinel is exempt"
+        );
+    }
+
+    #[test]
+    fn test_expired_live_gates_configured_and_default_both_named_when_distinct() {
+        // Past the default sentinel with a DIFFERENT configured past date:
+        // both the default gate and the configured gate must be named.
+        let today = chrono::NaiveDate::from_ymd_opt(2100, 1, 2).unwrap();
+        let expired = expired_live_gates(today, "2099-06-30");
+        assert!(
+            expired.contains(&"sandbox_only_until_default"),
+            "the expired compiled default must still be caught: {expired:?}"
+        );
+        assert!(
+            expired.contains(&"sandbox_only_until_configured"),
+            "the distinct expired configured value must also be caught: {expired:?}"
+        );
+    }
+
+    // =======================================================================
 
     /// Helper: creates a valid ApplicationConfig for testing.
     /// Modify individual fields to test specific validation failures.
@@ -2802,7 +3230,6 @@ mod tests {
                 port: 3001,
                 allowed_origins: default_allowed_origins(),
             },
-            subscription: SubscriptionConfig::default(),
             notification: NotificationConfig::default(),
             observability: ObservabilityConfig::default(),
             historical: HistoricalDataConfig::default(),
@@ -2825,7 +3252,26 @@ mod tests {
             groww_option_chain_1m: GrowwOptionChain1mConfig::default(),
             tf_consistency: TfConsistencyConfig::default(),
             groww_contract_1m: GrowwContract1mConfig::default(),
+            groww_orders: GrowwOrdersConfig::default(),
+            dhan_margin_gate: DhanMarginGateConfig::default(),
+            exit_orders: ExitOrdersConfig::default(),
         }
+    }
+
+    /// PR-0 (Groww order-side build, §39.2 Gate 1): every `[groww_orders]`
+    /// gate defaults OFF — the safe, dark default. A missing section must
+    /// produce exactly this.
+    #[test]
+    fn test_groww_orders_config_defaults_all_off() {
+        let cfg = GrowwOrdersConfig::default();
+        assert!(!cfg.orders_read, "orders_read must default off");
+        assert!(!cfg.portfolio_read, "portfolio_read must default off");
+        assert!(!cfg.margin_read, "margin_read must default off");
+        assert!(!cfg.user_read, "user_read must default off");
+        assert!(
+            !cfg.live_fire_requested,
+            "live_fire_requested must default off — and is inert without Gate 3"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -3321,163 +3767,12 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_feed_mode_ticker_passes() {
-        let config = SubscriptionConfig {
-            feed_mode: "Ticker".to_string(),
-            ..SubscriptionConfig::default()
-        };
-        assert!(config.parsed_feed_mode().is_ok());
-    }
-
-    #[test]
-    fn test_feed_mode_quote_passes() {
-        let config = SubscriptionConfig {
-            feed_mode: "Quote".to_string(),
-            ..SubscriptionConfig::default()
-        };
-        assert!(config.parsed_feed_mode().is_ok());
-    }
-
-    // AWS-lifecycle PR #7 Slice 1 — subscription.scope default is
-    // Indices4Only (LOCKED scope, 4 IDX_I SIDs only).
-    #[test]
-    fn test_subscription_scope_default_is_indices4only() {
-        let scope = SubscriptionScope::default();
-        assert_eq!(scope, SubscriptionScope::Indices4Only);
-        assert_eq!(scope.as_str(), "indices_4_only");
-        let cfg = SubscriptionConfig::default();
-        assert_eq!(cfg.scope, SubscriptionScope::Indices4Only);
-    }
-
-    // AWS-lifecycle PR #7 Slice 1 — `indices_4_only` round-trips via figment.
-    #[test]
-    fn test_indices4only_serde_roundtrip() {
-        use figment::Figment;
-        use figment::providers::{Format, Toml};
-
-        let toml_indices4 = r#"
-            [subscription]
-            scope = "indices_4_only"
-            feed_mode = "Ticker"
-            subscribe_stock_equities = false
-            stock_atm_strikes_above = 25
-            stock_atm_strikes_below = 25
-            stock_default_atm_fallback_enabled = true
-        "#;
-        #[derive(Deserialize)]
-        struct Wrapper {
-            subscription: SubscriptionConfig,
-        }
-        let wrapper: Wrapper = Figment::new()
-            .merge(Toml::string(toml_indices4))
-            .extract()
-            .expect("indices_4_only scope must round-trip");
-        assert_eq!(wrapper.subscription.scope, SubscriptionScope::Indices4Only);
-        assert_eq!(wrapper.subscription.scope.as_str(), "indices_4_only");
-    }
-
-    // Sub-PR #1 of 2026-05-27 daily-universe expansion — the enum
-    // grew from 1 to 2 variants. Adding/removing variants without
-    // updating this test fails the build (match exhaustiveness).
-    // See `.claude/rules/project/daily-universe-scope-expansion-2026-05-27.md`.
-    #[test]
-    fn test_subscription_scope_has_exactly_two_variants() {
-        // Compile-time guarantee: match must be exhaustive. If a
-        // third variant is added or one is removed without updating
-        // this test, the build fails.
-        for s in [
-            SubscriptionScope::Indices4Only,
-            SubscriptionScope::DailyUniverse,
-        ] {
-            let label = match s {
-                SubscriptionScope::Indices4Only => "indices_4_only",
-                SubscriptionScope::DailyUniverse => "daily_universe",
-            };
-            assert_eq!(label, s.as_str());
-        }
-    }
-
-    // Sub-PR #1 of 2026-05-27 — DailyUniverse variant exists and has
-    // the stable wire-format label "daily_universe". Pinned so any
-    // future rename forces a rule-file edit first.
-    #[test]
-    fn test_subscription_scope_daily_universe_label() {
-        assert_eq!(SubscriptionScope::DailyUniverse.as_str(), "daily_universe");
-    }
-
-    // Sub-PR #1 of 2026-05-27 — `daily_universe` round-trips via figment.
-    #[test]
-    fn test_daily_universe_serde_roundtrip() {
-        use figment::Figment;
-        use figment::providers::{Format, Toml};
-
-        let toml_daily = r#"
-            [subscription]
-            scope = "daily_universe"
-            feed_mode = "Quote"
-            subscribe_stock_equities = false
-            stock_atm_strikes_above = 25
-            stock_atm_strikes_below = 25
-            stock_default_atm_fallback_enabled = true
-        "#;
-        #[derive(Deserialize)]
-        struct Wrapper {
-            subscription: SubscriptionConfig,
-        }
-        let wrapper: Wrapper = Figment::new()
-            .merge(Toml::string(toml_daily))
-            .extract()
-            .expect("daily_universe scope must round-trip");
-        assert_eq!(wrapper.subscription.scope, SubscriptionScope::DailyUniverse);
-        assert_eq!(wrapper.subscription.scope.as_str(), "daily_universe");
-    }
-
-    // Sub-PR #1 of 2026-05-27 — default is STILL `Indices4Only` after
-    // this PR. Activation of `DailyUniverse` as default lands later
-    // once Sub-PRs #2-#13 wire the supporting code paths (CSV fetch,
-    // lifecycle table, universe builder, etc.). This test fails if
-    // someone flips the default prematurely.
-    #[test]
-    fn test_subscription_scope_default_still_indices4only_sub_pr_1() {
-        assert_eq!(
-            SubscriptionScope::default(),
-            SubscriptionScope::Indices4Only
-        );
-    }
-
-    // PR #7b — the 3 dead flags (subscribe_*_derivatives,
-    // subscribe_display_indices) were retired. Trying to set them in
-    // TOML must fail-loud (figment rejects unknown fields when the
-    // deserializer is strict — here we just confirm the fields are
-    // absent from the struct so the build of any old TOML test
-    // expecting them is impossible).
-    #[test]
-    fn test_subscription_config_has_no_derivatives_flags() {
-        let cfg = SubscriptionConfig::default();
-        // Field-access-by-name on a non-existent field is a compile
-        // error; this test is here to document the contract. Any
-        // future addition of `subscribe_*_derivatives` or
-        // `subscribe_display_indices` to SubscriptionConfig must
-        // delete this test first, which forces a rule-file review.
-        let _ = cfg.feed_mode;
-        let _ = cfg.scope;
-        let _ = cfg.subscribe_stock_equities;
-    }
-
-    // AWS-lifecycle PR #7 Slice 1 — Indices4Only pool size always 1
-    // (4 SIDs fit on a single main-feed connection).
-    #[test]
-    fn test_effective_main_feed_pool_size_is_always_one_under_indices4only() {
-        for configured in [0, 1, 2, 3, 4, 5, 10, 100] {
-            assert_eq!(
-                effective_main_feed_pool_size(SubscriptionScope::Indices4Only, configured),
-                crate::constants::PHASE_0_MAIN_FEED_CONNECTION_COUNT,
-                "Indices4Only must emit exactly {} main-feed conn regardless of configured={configured}",
-                crate::constants::PHASE_0_MAIN_FEED_CONNECTION_COUNT,
-            );
-        }
-    }
+    // PR-C3 (2026-07-14): the SubscriptionScope / SubscriptionConfig /
+    // effective_main_feed_pool_size test family (feed-mode parsing, scope
+    // serde round-trips, the 1-conn pool pin, the dead-flags contract)
+    // retired with the deleted subscription surface (scope-lock amendment
+    // §B item 2). The PHASE_0_MAIN_FEED_CONNECTION_COUNT constant pin
+    // survives below (historical capacity-math anchor).
 
     // PR #7b — `PHASE_0_MAIN_FEED_CONNECTION_COUNT` is locked at 1.
     #[test]
@@ -3499,37 +3794,6 @@ mod tests {
         // Dhan burst-rate calc.
         let cfg = make_valid_config();
         assert_eq!(cfg.websocket.connection_stagger_ms, 2000);
-    }
-
-    #[test]
-    fn test_feed_mode_full_passes() {
-        let config = SubscriptionConfig {
-            feed_mode: "Full".to_string(),
-            ..SubscriptionConfig::default()
-        };
-        assert!(config.parsed_feed_mode().is_ok());
-    }
-
-    #[test]
-    fn test_feed_mode_invalid_string_fails() {
-        let config = SubscriptionConfig {
-            feed_mode: "invalid".to_string(),
-            ..SubscriptionConfig::default()
-        };
-        let err = config.parsed_feed_mode().unwrap_err();
-        assert!(err.to_string().contains("Ticker/Quote/Full"));
-    }
-
-    #[test]
-    fn test_feed_mode_case_sensitive() {
-        let config = SubscriptionConfig {
-            feed_mode: "ticker".to_string(), // lowercase — must fail
-            ..SubscriptionConfig::default()
-        };
-        assert!(
-            config.parsed_feed_mode().is_err(),
-            "feed_mode is case-sensitive — 'ticker' should fail"
-        );
     }
 
     // =====================================================================
@@ -3748,30 +4012,11 @@ mod tests {
     }
 
     #[test]
-    fn test_subscription_config_default() {
-        let config = SubscriptionConfig::default();
-        assert_eq!(config.feed_mode, "Full");
-        assert!(config.subscribe_stock_equities);
-        assert_eq!(config.stock_atm_strikes_above, 25);
-        assert_eq!(config.stock_atm_strikes_below, 25);
-        assert!(config.stock_default_atm_fallback_enabled);
-    }
-
-    #[test]
     fn test_default_allowed_origins() {
         let origins = default_allowed_origins();
         assert_eq!(origins.len(), 2);
         assert!(origins.contains(&"http://localhost:3000".to_string()));
         assert!(origins.contains(&"http://localhost:3001".to_string()));
-    }
-
-    #[test]
-    fn test_feed_mode_empty_string_fails() {
-        let config = SubscriptionConfig {
-            feed_mode: String::new(),
-            ..SubscriptionConfig::default()
-        };
-        assert!(config.parsed_feed_mode().is_err());
     }
 
     #[test]
@@ -3835,7 +4080,10 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_sandbox_guard_blocks_live_before_july() {
+    fn test_sandbox_guard_blocks_live_before_earliest_date() {
+        // Renamed 2026-07-14 (was `..._before_july` — era-named; the earliest
+        // date is now the 2099-12-31 sentinel). Logic is constant-driven and
+        // self-adapts to whichever era "today" is in.
         // Date-robust (2026-07-02 coverage-gate fix): the previous version only
         // called validate() with Live INSIDE `if today < earliest`, so from
         // 2026-07-01 the entire D1 live-mode guard block silently fell out of
@@ -3901,39 +4149,6 @@ mod tests {
     // -------------------------------------------------------------------
 
     #[test]
-    fn test_subscription_config_default_has_depth_disabled() {
-        let config = SubscriptionConfig::default();
-        assert!(!config.enable_twenty_depth);
-    }
-
-    #[test]
-    fn test_subscription_config_default_depth_max_instruments() {
-        let config = SubscriptionConfig::default();
-        assert_eq!(config.twenty_depth_max_instruments, 49);
-    }
-
-    #[test]
-    fn test_subscription_config_depth_max_instruments_matches_dhan_limit() {
-        // Dhan docs: max 50 instruments per 20-level depth connection
-        // We use 49 = ATM + 24 CE above + 24 PE below
-        let config = SubscriptionConfig::default();
-        assert!(config.twenty_depth_max_instruments <= 50);
-    }
-
-    #[test]
-    fn test_subscription_config_all_fields_present() {
-        let config = SubscriptionConfig::default();
-        assert_eq!(config.feed_mode, "Full");
-        assert!(config.subscribe_stock_equities);
-        assert_eq!(config.stock_atm_strikes_above, 25);
-        assert_eq!(config.stock_atm_strikes_below, 25);
-        assert!(config.stock_default_atm_fallback_enabled);
-        // Depth fields
-        assert!(!config.enable_twenty_depth);
-        assert_eq!(config.twenty_depth_max_instruments, 49);
-    }
-
-    #[test]
     fn test_default_config_trading_mode_is_paper_not_live() {
         let config = make_valid_config();
         assert!(config.strategy.mode.is_paper());
@@ -3969,15 +4184,6 @@ mod tests {
         };
         let conf = config.build_ilp_conf_string();
         assert!(conf.contains("tcp::addr=10.0.1.5:19009;"));
-    }
-
-    #[test]
-    fn test_default_twenty_depth_max_instruments_is_49() {
-        // Covers the top-level `default_twenty_depth_max_instruments`
-        // fn referenced via `#[serde(default = ...)]` — never called
-        // directly in production, so we exercise it here. Per Dhan
-        // 20-level limit (max 50/conn) our policy is ATM ± 24 = 49.
-        assert_eq!(super::default_twenty_depth_max_instruments(), 49);
     }
 
     #[test]
@@ -4419,6 +4625,99 @@ mod tests {
         }
     }
 
+    /// 🔷 DHAN margin gate (2026-07-14): `[dhan_margin_gate]` is FAIL-SAFE
+    /// default OFF on every path — `Default`, a missing section, and an
+    /// empty section — with the shared-account defaults (50% tenant budget,
+    /// 5 req/sec self-cap — the funds/margin rate bucket is Assumed
+    /// Non-Trading, unnamed by Dhan's docs) intact on all of them.
+    #[test]
+    fn test_dhan_margin_gate_config_default_is_disabled() {
+        use figment::Figment;
+        use figment::providers::{Format, Toml};
+
+        let d = DhanMarginGateConfig::default();
+        assert!(!d.enabled, "margin gate must default OFF (fail-safe)");
+        assert_eq!(d.tenant_budget_percent, 50);
+        assert_eq!(d.rest_self_cap_per_sec, 5);
+
+        #[derive(Deserialize)]
+        struct Wrapper {
+            #[serde(default)]
+            dhan_margin_gate: DhanMarginGateConfig,
+        }
+        // Missing section entirely → disabled, never an error.
+        let missing: Wrapper = Figment::new()
+            .merge(Toml::string("[other]\nx = 1\n"))
+            .extract()
+            .expect("missing [dhan_margin_gate] must default, not error");
+        assert!(!missing.dhan_margin_gate.enabled);
+        assert_eq!(missing.dhan_margin_gate.tenant_budget_percent, 50);
+        assert_eq!(missing.dhan_margin_gate.rest_self_cap_per_sec, 5);
+        // Empty section (no keys) → disabled via the field-level default.
+        let empty: Wrapper = Figment::new()
+            .merge(Toml::string("[dhan_margin_gate]\n"))
+            .extract()
+            .expect("empty [dhan_margin_gate] must default, not error");
+        assert!(!empty.dhan_margin_gate.enabled);
+        assert_eq!(empty.dhan_margin_gate.tenant_budget_percent, 50);
+        assert_eq!(empty.dhan_margin_gate.rest_self_cap_per_sec, 5);
+    }
+
+    /// Shared-account tenant budget: 0% and >50% are REJECTED at boot
+    /// (the Dhan account is pooled with the BruteX co-tenant — our entries
+    /// may never claim more than half the pooled balance); the 1..=50
+    /// boundaries pass.
+    #[test]
+    fn test_dhan_margin_gate_validate_rejects_over_50_percent() {
+        for bad in [0_u8, 51, 100] {
+            let cfg = DhanMarginGateConfig {
+                tenant_budget_percent: bad,
+                ..DhanMarginGateConfig::default()
+            };
+            assert!(
+                cfg.validate().is_err(),
+                "tenant_budget_percent {bad} must be rejected (legal range 1..=50)"
+            );
+        }
+        for good in [1_u8, 50] {
+            let cfg = DhanMarginGateConfig {
+                tenant_budget_percent: good,
+                ..DhanMarginGateConfig::default()
+            };
+            assert!(
+                cfg.validate().is_ok(),
+                "tenant_budget_percent {good} must pass"
+            );
+        }
+    }
+
+    /// Funds/margin REST self-cap: 0/1 (below the 2-call entry burst) and
+    /// 11+ (over half of the ASSUMED Non-Trading 20/sec bucket — unnamed
+    /// by Dhan's docs) are REJECTED; the 2..=10 boundaries pass.
+    #[test]
+    fn test_dhan_margin_gate_validate_rejects_rest_cap_out_of_range() {
+        for bad in [0_u32, 1, 11, 100] {
+            let cfg = DhanMarginGateConfig {
+                rest_self_cap_per_sec: bad,
+                ..DhanMarginGateConfig::default()
+            };
+            assert!(
+                cfg.validate().is_err(),
+                "rest_self_cap_per_sec {bad} must be rejected (legal range 2..=10)"
+            );
+        }
+        for good in [2_u32, 10] {
+            let cfg = DhanMarginGateConfig {
+                rest_self_cap_per_sec: good,
+                ..DhanMarginGateConfig::default()
+            };
+            assert!(
+                cfg.validate().is_ok(),
+                "rest_self_cap_per_sec {good} must pass"
+            );
+        }
+    }
+
     /// 2026-07-14 fetch-mode flag: defaults to `per_minute` on every path
     /// (Default / missing key / pre-flag TOML), `batch_catchup` +
     /// `batch_interval_minutes` parse, and unknown mode strings are
@@ -4700,6 +4999,225 @@ mod tests {
             .expect("explicit values must round-trip");
         assert!(on.groww_contract_1m.enabled);
         assert_eq!(on.groww_contract_1m.strikes_each_side, 1);
+    }
+
+    /// 🔷 DHAN exit-order layer (Cluster B, 2026-07-14): the
+    /// `[exit_orders]` section is FAIL-SAFE default OFF — via `Default`,
+    /// a missing section, and an empty section — with the verify-ladder
+    /// defaults (30s deadline, 5 attempts) intact; explicit values
+    /// round-trip. LOCK #1 of the 4-lock OFF switch.
+    #[test]
+    fn test_exit_orders_config_defaults_off_and_round_trips() {
+        use figment::Figment;
+        use figment::providers::{Format, Toml};
+
+        let d = ExitOrdersConfig::default();
+        assert!(
+            !d.enabled,
+            "exit_orders must default OFF (LOCK #1 — fail-safe)"
+        );
+        assert_eq!(d.default_freeze_limit_qty, 0, "freeze default is UNSET");
+        assert!(d.freeze_limits_reviewed_on.is_empty());
+        assert_eq!(d.mpp_verify_deadline_secs, 30);
+        assert_eq!(d.mpp_verify_max_attempts, 5);
+        assert!((d.default_trailing_jump - 0.0).abs() < f64::EPSILON);
+
+        #[derive(Deserialize)]
+        struct Wrapper {
+            #[serde(default)]
+            exit_orders: ExitOrdersConfig,
+        }
+        // Missing section entirely → disabled, never an error.
+        let missing: Wrapper = Figment::new()
+            .merge(Toml::string("[other]\nx = 1\n"))
+            .extract()
+            .expect("missing [exit_orders] must default, not error");
+        assert!(!missing.exit_orders.enabled);
+        assert_eq!(missing.exit_orders.mpp_verify_deadline_secs, 30);
+        assert_eq!(missing.exit_orders.mpp_verify_max_attempts, 5);
+        // Empty section (no keys) → field-level defaults (the base.toml
+        // enabled = false shape must also parse).
+        let empty: Wrapper = Figment::new()
+            .merge(Toml::string("[exit_orders]\nenabled = false\n"))
+            .extract()
+            .expect("the base.toml [exit_orders] shape must parse");
+        assert!(!empty.exit_orders.enabled);
+        assert_eq!(empty.exit_orders.mpp_verify_deadline_secs, 30);
+        // Explicit values (the future dry-run-enable shape) round-trip.
+        let on: Wrapper = Figment::new()
+            .merge(Toml::string(
+                "[exit_orders]\nenabled = true\ndefault_freeze_limit_qty = 1800\n\
+                 freeze_limits_reviewed_on = \"2026-07-14\"\nmpp_verify_deadline_secs = 45\n\
+                 mpp_verify_max_attempts = 6\ndefault_trailing_jump = 0.5\n",
+            ))
+            .extract()
+            .expect("explicit values must round-trip");
+        assert!(on.exit_orders.enabled);
+        assert_eq!(on.exit_orders.default_freeze_limit_qty, 1800);
+        assert_eq!(on.exit_orders.freeze_limits_reviewed_on, "2026-07-14");
+        assert_eq!(on.exit_orders.mpp_verify_deadline_secs, 45);
+        assert_eq!(on.exit_orders.mpp_verify_max_attempts, 6);
+        assert!((on.exit_orders.default_trailing_jump - 0.5).abs() < f64::EPSILON);
+        // Deterministic (refuter round 2, 2026-07-14): injected today —
+        // this assertion must never depend on the host wall clock.
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 7, 14).unwrap_or_default();
+        assert!(on.exit_orders.validate_with_today(today).is_ok());
+    }
+
+    /// `ExitOrdersConfig::validate` — every bound, boundary-tested
+    /// (design §3.6): deadline 1..=300, attempts 1..=8, finite
+    /// non-negative trailing jump always; freeze >= 1 + parseable
+    /// review date only when enabled.
+    #[test]
+    fn test_exit_orders_config_validate_with_today_bounds_and_dates() {
+        // Disabled defaults are always valid (the shipped state).
+        assert!(ExitOrdersConfig::default().validate().is_ok());
+
+        // Deadline bounds — 0 and 301 reject, 1 and 300 pass.
+        for (deadline, ok) in [(0_u64, false), (301, false), (1, true), (300, true)] {
+            let cfg = ExitOrdersConfig {
+                mpp_verify_deadline_secs: deadline,
+                ..Default::default()
+            };
+            assert_eq!(
+                cfg.validate().is_ok(),
+                ok,
+                "deadline {deadline} boundary verdict must be {ok}"
+            );
+        }
+
+        // Attempt bounds — 0 and 9 reject, 1 and 8 pass.
+        for (attempts, ok) in [(0_u32, false), (9, false), (1, true), (8, true)] {
+            let cfg = ExitOrdersConfig {
+                mpp_verify_max_attempts: attempts,
+                ..Default::default()
+            };
+            assert_eq!(
+                cfg.validate().is_ok(),
+                ok,
+                "attempts {attempts} boundary verdict must be {ok}"
+            );
+        }
+
+        // Trailing jump — NaN / infinity / negative reject; 0.0 passes.
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -0.05] {
+            let cfg = ExitOrdersConfig {
+                default_trailing_jump: bad,
+                ..Default::default()
+            };
+            assert!(
+                cfg.validate().is_err(),
+                "trailing jump {bad} must reject (finite >= 0.0 required)"
+            );
+        }
+        let cfg = ExitOrdersConfig {
+            default_trailing_jump: 0.0,
+            ..Default::default()
+        };
+        assert!(cfg.validate().is_ok());
+
+        // Enabled-only gates: freeze must be >= 1 and the review date must
+        // parse — the DISABLED default (freeze 0, empty date) stays valid.
+        // Deterministic (refuter round 2, 2026-07-14): every enabled-arm
+        // assertion injects a fixed today so the hardcoded review dates
+        // can never flip against the host wall clock.
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 7, 14).unwrap_or_default();
+        let mut cfg = ExitOrdersConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        assert!(
+            cfg.validate_with_today(today).is_err(),
+            "enabled with freeze 0 (unset) must reject"
+        );
+        cfg.default_freeze_limit_qty = 1800;
+        assert!(
+            cfg.validate_with_today(today).is_err(),
+            "enabled with empty review date must reject"
+        );
+        cfg.freeze_limits_reviewed_on = "14-07-2026".to_string();
+        assert!(
+            cfg.validate_with_today(today).is_err(),
+            "enabled with non-%Y-%m-%d review date must reject"
+        );
+        cfg.freeze_limits_reviewed_on = "2026-07-14".to_string();
+        assert!(
+            cfg.validate_with_today(today).is_ok(),
+            "enabled with sane values must pass"
+        );
+        cfg.default_freeze_limit_qty = -5;
+        assert!(
+            cfg.validate_with_today(today).is_err(),
+            "negative freeze must reject"
+        );
+    }
+
+    /// L2 (2026-07-14 hostile review): a FUTURE `freeze_limits_reviewed_on`
+    /// rejects when enabled — a typo'd/backdated future review date would
+    /// silence the >90-day staleness WARN forever. Past dates (even stale
+    /// ones) stay valid — staleness is the WARN's job, not validate()'s.
+    #[test]
+    fn test_exit_orders_config_validate_rejects_future_review_date() {
+        // Deterministic (refuter round 2, 2026-07-14): injected today —
+        // the boundary assertions can never flip against the wall clock.
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 7, 14).unwrap_or_default();
+        let mut cfg = ExitOrdersConfig {
+            enabled: true,
+            default_freeze_limit_qty: 1800,
+            freeze_limits_reviewed_on: "2026-07-15".to_string(),
+            ..Default::default()
+        };
+        let err = cfg.validate_with_today(today).unwrap_err();
+        assert!(
+            err.to_string().contains("future"),
+            "error must name the future date, got: {err}"
+        );
+        // Same-day review is valid (today-or-past rule, strict >).
+        cfg.freeze_limits_reviewed_on = "2026-07-14".to_string();
+        assert!(cfg.validate_with_today(today).is_ok());
+        // A stale-but-past date validates (the staleness WARN handles it).
+        cfg.freeze_limits_reviewed_on = "2020-01-01".to_string();
+        assert!(cfg.validate_with_today(today).is_ok());
+        // Disabled configs never evaluate the date at all — proven through
+        // the PRODUCTION wall-clock entry point (also the pub-fn wiring
+        // call-site pin for `validate()` delegating to the injected core).
+        cfg.enabled = false;
+        cfg.freeze_limits_reviewed_on = "2999-01-01".to_string();
+        assert!(cfg.validate().is_ok());
+    }
+
+    /// `freeze_review_is_stale` — pure >90-day boundary + fail-safe on
+    /// empty/garbage input (stale ⇒ the boot WARN fires, never a silent
+    /// pass on an unparsable date).
+    #[test]
+    fn test_freeze_review_is_stale_boundary_and_fail_safe() {
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 7, 14).unwrap_or_default();
+        // Exactly 90 days old = NOT stale (strict > per the design).
+        assert!(!freeze_review_is_stale("2026-04-15", today));
+        // 91 days old = stale.
+        assert!(freeze_review_is_stale("2026-04-14", today));
+        // Same-day and future reviews are fresh.
+        assert!(!freeze_review_is_stale("2026-07-14", today));
+        // Empty / garbage / wrong format ⇒ STALE (fail-safe).
+        assert!(freeze_review_is_stale("", today));
+        assert!(freeze_review_is_stale("not-a-date", today));
+        assert!(freeze_review_is_stale("14-07-2026", today));
+    }
+
+    /// `ApplicationConfig::validate` rejects a bad `[exit_orders]`
+    /// section (the boot-time hook is actually wired).
+    #[test]
+    fn test_application_config_validate_rejects_bad_exit_orders() {
+        let mut config = make_valid_config();
+        config.exit_orders.mpp_verify_max_attempts = 0;
+        let err = config.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("mpp_verify_max_attempts"),
+            "error must name the violated exit_orders bound, got: {err}"
+        );
+        // And the valid default passes end-to-end.
+        let config = make_valid_config();
+        assert!(config.validate().is_ok());
     }
 
     /// A missing `[feeds]` section must fall back to the safe default

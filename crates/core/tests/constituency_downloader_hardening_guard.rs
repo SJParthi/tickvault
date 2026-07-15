@@ -1,65 +1,34 @@
-//! Source-scan ratchet pinning the NTM Sub-PR #3 constituency downloader
-//! hardening (mirrors the §18 hardening contract that `csv_downloader.rs`
-//! documents). Reads `downloader.rs` as text — no feature flag needed —
-//! and fails the build if any hardening property is removed.
+//! RETIRED GUARD — NTM constituency downloader hardening ratchet.
 //!
-//! Threats each pinned token defends: redirect-none (DNS-poison MITM),
-//! https_only (downgrade), body cap (DoS), connect/read timeouts (hung
-//! TCP / black-hole DNS), Content-Type allowlist (HTML 404 / JSON error
-//! body fed to the parser), browser User-Agent (niftyindices 403 bot-wall).
+//! **RETIRED in PR-C3 (2026-07-14).** The `index_constituency` module this
+//! guard read as text (`src/instrument/index_constituency/downloader.rs`)
+//! was DELETED with the Dhan instrument-download chain per the operator's
+//! 2026-07-13 retirement directive (Q3 — "hereafter no Dhan instrument
+//! download/parsing"; `websocket-connection-scope-lock.md` "2026-07-13
+//! Amendment" §B item 3). The niftyindices NTM list is now consumed ONLY
+//! by the Groww watch build through its own hardened client
+//! (`crates/core/src/feed/groww/instruments.rs` — redirect-none,
+//! HTTPS-only, timeouts, body cap; that client carries its own unit
+//! coverage), so the §18-hardening surface this guard pinned no longer
+//! exists in this repo.
+//!
+//! Retained as a dated tombstone per the C2 guard-retirement precedent
+//! (retire loudly with the authority cited, never delete silently). The
+//! single test below pins the RETIREMENT: the deleted module must STAY
+//! deleted.
 
-use std::fs;
 use std::path::PathBuf;
 
-fn downloader_src() -> String {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("src/instrument/index_constituency/downloader.rs");
-    fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("cannot read constituency downloader source {path:?}: {e}"))
-}
-
-const REQUIRED_HARDENING_TOKENS: &[(&str, &str)] = &[
-    (
-        "redirect::Policy::none()",
-        "redirect policy must be none (DNS-poison MITM)",
-    ),
-    (
-        "https_only(true)",
-        "client must be HTTPS-only (downgrade attack)",
-    ),
-    (
-        "connect_timeout(",
-        "connect timeout must be set (black-hole DNS)",
-    ),
-    (".timeout(", "whole-response timeout must be set (hung TCP)"),
-    ("MAX_CSV_BODY_BYTES", "response body must be capped (DoS)"),
-    (
-        "INDEX_CONSTITUENCY_USER_AGENT",
-        "browser User-Agent must be sent (403 bot-wall)",
-    ),
-    (
-        "ALLOWED_CONTENT_TYPES",
-        "Content-Type allowlist must be enforced",
-    ),
-];
-
+/// PR-C3 tombstone: the index_constituency module must stay deleted.
+/// Re-introducing a Dhan-side constituency downloader requires a fresh
+/// dated operator quote in
+/// `.claude/rules/project/websocket-connection-scope-lock.md` FIRST.
 #[test]
-fn constituency_downloader_retains_all_hardening() {
-    let src = downloader_src();
-    for (token, why) in REQUIRED_HARDENING_TOKENS {
-        assert!(
-            src.contains(token),
-            "constituency downloader hardening regressed — missing `{token}`: {why}"
-        );
-    }
-}
-
-#[test]
-fn constituency_downloader_rejects_html_content_type() {
-    // The allowlist must NOT contain text/html (the 404 / Cloudflare page).
-    let src = downloader_src();
+fn index_constituency_module_stays_deleted() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/instrument/index_constituency");
     assert!(
-        src.contains("\"text/csv\"") && !src.contains("\"text/html\""),
-        "constituency downloader must allow text/csv and never allow text/html"
+        !path.exists(),
+        "PR-C3 retirement violated: crates/core/src/instrument/\
+         index_constituency/ must stay DELETED (operator Q3, 2026-07-13)."
     );
 }

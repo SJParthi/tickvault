@@ -131,27 +131,28 @@ pub async fn set_feed(
         ));
     }
 
-    // Phase A refusal (operator directive 2026-07-13 — "now remove this entire
-    // Dhan live websocket feed instruments subscription even entire live
-    // websocket feed itself"): with the RAW boot TOML carrying
-    // `dhan_enabled = false` (`is_dhan_config_enabled` is seeded PRE-overlay
-    // — round-2 FIX A: a persisted runtime-OFF overlay on a config-ON boot
-    // is dormant-not-retired and stays re-enableable), the Dhan live WS lane
-    // is RETIRED — the runtime cold-start supervisor refuses to start it, so
-    // accepting this enable would be a false-OK (flag flipped +
-    // feed-state.json persisted + /feeds rendering ON while nothing can ever
-    // start). Refuse at the API layer in BOTH trading modes; do NOT flip the
-    // runtime flag, do NOT persist. Bearer-auth semantics are untouched
-    // (this handler already sits behind the unconditional bearer gate —
+    // Phase A refusal, made UNCONDITIONAL in PR-C2 (operator directive
+    // 2026-07-13 — "now remove this entire Dhan live websocket feed
+    // instruments subscription even entire live websocket feed itself"): the
+    // Dhan live WS lane is DELETED (PR-C2) — no pool, no cold-start, no
+    // dormant reconnect exists, on ANY config. Accepting an enable would be
+    // a false-OK (flag flipped + feed-state.json persisted + /feeds
+    // rendering ON while nothing can ever start). Refuse at the API layer in
+    // BOTH trading modes, regardless of the boot TOML (the pre-C2 gate was
+    // scoped to `!is_dhan_config_enabled()` because a config-ON lane could
+    // still cold-start; that path no longer exists). Do NOT flip the runtime
+    // flag, do NOT persist. Bearer-auth semantics are untouched (this
+    // handler already sits behind the unconditional bearer gate —
     // 2026-07-04 lock).
-    if feed == Feed::Dhan && req.enabled && !state.feed_runtime().is_dhan_config_enabled() {
+    if feed == Feed::Dhan && req.enabled {
         return Err((
             StatusCode::CONFLICT,
             Json(FeedErrorResponse {
                 error: "the Dhan live feed was retired by operator directive 2026-07-13 \
-                     (Dhan is REST-only now; Groww is the live feed) — enabling it at \
-                     runtime is refused because nothing would start; to re-enable, set \
-                     dhan_enabled = true in the config and restart the app"
+                     and its lane code was deleted (Dhan is REST-only now; Groww is the \
+                     live feed) — enabling it at runtime is permanently refused because \
+                     nothing exists to start; re-introducing the Dhan live WS requires a \
+                     fresh dated operator quote in the scope-lock rule file first"
                     .to_string(),
                 allowed: toggleable_except_dhan_labels(),
             }),
@@ -196,23 +197,9 @@ pub async fn set_feed(
              needed. It reports running once the watch-list is built (a few seconds)."
         );
     }
-    // PR-E / PR-2: honesty for Dhan. If Dhan was ENABLED at boot, the toggle is a
-    // true live pause/resume — the dormant Dhan activation watcher (PR-2) keeps
-    // the `dhan_lane_running` flag truthful both ways and the main-feed pool
-    // reconnects via the shared enable flag (PR-E in-loop dormancy), no restart.
-    // 2026-07-13: the boot-OFF (config dhan_enabled=false) enable case never
-    // reaches here anymore — the Phase A gate above refuses it with 409 — so
-    // this warn covers only the boot-ON transient where the lane is not (yet /
-    // any longer) marked running mid re-activation. The response carries
-    // `dhan_lane_running` so the page can tell the cases apart.
-    if feed == Feed::Dhan && req.enabled && !state.feed_runtime().is_dhan_lane_running() {
-        tracing::warn!(
-            "feed 'dhan' enabled via API while its lane is not marked running — \
-             the boot-ON activation watcher re-activates it (runtime \
-             pause/resume); the response carries dhan_lane_running for the page \
-             to poll"
-        );
-    }
+    // PR-C2 (2026-07-13): the Dhan-enable path never reaches here anymore —
+    // the unconditional 409 above owns it — so the old boot-ON
+    // "re-activation transient" warn is deleted with the lane.
     metrics::counter!(
         "tv_feed_runtime_toggle_total",
         "feed" => feed.as_str(),
@@ -283,6 +270,11 @@ pub struct FeedHealthRow {
     pub auth_rejected: bool,
     /// Seconds since the last tick; `null` = none yet.
     pub last_tick_age_secs: Option<u64>,
+    /// Additive read-only freshness verdict: `true` when the feed's last tick
+    /// is within the 60s decision-freshness bound (the §38.8 gate primitive,
+    /// `tickvault_common::live_bar_freshness::live_bar_is_fresh`). `None` age
+    /// (no tick seen) reads `false` — fail-closed, never a false-OK.
+    pub fresh_within_60s: bool,
     pub ticks_total: u64,
     pub candles_total: u64,
     pub drops_total: u64,
@@ -362,6 +354,19 @@ pub async fn get_feeds_health(State(state): State<SharedAppState>) -> Json<Feeds
                 lane_running: report.input.lane_running,
                 connected: report.input.connected,
                 last_tick_age_secs: report.input.last_tick_age_secs,
+                // Age → freshness via the shared primitive: an age of A secs is
+                // a bar stamped A secs ago, so fresh ⇔ live_bar_is_fresh(0, A, T).
+                // `None` (no tick yet) reads false — fail-closed (Rule 11).
+                fresh_within_60s: report.input.last_tick_age_secs.is_some_and(|age| {
+                    /// Read-only display bound for the /api/feeds/health page
+                    /// (mirrors the §38.8 ~60s decision-freshness threshold).
+                    const FEEDS_HEALTH_FRESH_SECS: u64 = 60;
+                    tickvault_common::live_bar_freshness::live_bar_is_fresh(
+                        0,
+                        age,
+                        FEEDS_HEALTH_FRESH_SECS,
+                    )
+                }),
                 ticks_total: report.input.ticks_total,
                 candles_total: report.input.candles_total,
                 drops_total: report.input.drops_total,
@@ -664,11 +669,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_set_feed_dhan_enable_always_allowed() {
-        // Enabling Dhan is allowed when the BOOT CONFIG has dhan_enabled=true
-        // (a boot-ON lane's runtime pause/resume) — even while live trading
-        // gates the disable direction. FeedsConfig::default() is config-ON,
-        // so the Phase A retirement gate (config-off) does not apply here.
+    async fn test_set_feed_dhan_enable_refused_even_when_config_on() {
+        // PR-C2 (2026-07-13): the Dhan live-WS lane is DELETED, so enabling
+        // Dhan at runtime is refused UNCONDITIONALLY — even on a (now
+        // illegal) config-ON boot. Pre-C2 this exact shape was ALLOWED (a
+        // boot-ON lane's runtime pause/resume); that path no longer exists.
         let state = test_state(FeedsConfig::default());
         state.feed_runtime().set_dhan_disable_allowed(false);
         state.feed_runtime().set_enabled(Feed::Dhan, false);
@@ -678,8 +683,14 @@ mod tests {
             Json(SetFeedRequest { enabled: true }),
         )
         .await;
-        let Json(resp) = res.expect("enabling a boot-ON dhan lane is allowed");
-        assert!(resp.dhan_enabled);
+        let Err((code, _body)) = res else {
+            panic!("enabling the deleted dhan lane must be refused on any config");
+        };
+        assert_eq!(code, StatusCode::CONFLICT);
+        assert!(
+            !state.feed_runtime().is_enabled(Feed::Dhan),
+            "the runtime flag must NOT flip on a refused enable"
+        );
     }
 
     /// Phase A (operator directive 2026-07-13): with the boot config carrying
@@ -707,9 +718,8 @@ mod tests {
         };
         assert_eq!(code, StatusCode::CONFLICT);
         assert!(
-            body.error.contains("2026-07-13") && body.error.contains("restart"),
-            "refusal must name the directive + the config-change-and-restart \
-             path: {}",
+            body.error.contains("2026-07-13") && body.error.contains("retired"),
+            "refusal must name the directive date + the retirement: {}",
             body.error
         );
         assert!(
@@ -761,71 +771,45 @@ mod tests {
         assert!(!state.feed_runtime().is_enabled(Feed::Dhan));
     }
 
-    /// Round-2 FIX A (2026-07-13): the 409 gate keys off the RAW pre-overlay
-    /// TOML value — a persisted runtime-OFF overlay on a config-ON boot must
-    /// NOT 409-lock the re-enable (the PR-E disable→restart→re-enable round
-    /// trip), and no overlay shape can un-retire a config-OFF lane.
+    /// PR-C2 (2026-07-13): the enable refusal is UNCONDITIONAL — neither the
+    /// raw pre-overlay TOML value nor any overlay shape can un-retire the
+    /// DELETED lane. (Pre-C2, round-2 FIX A keyed the gate off the raw
+    /// config so a config-ON overlay-dormant lane stayed re-enableable;
+    /// that lane no longer exists.)
+    /// test coverage (pub-fn-test-guard): is_dhan_config_enabled
     #[tokio::test]
-    async fn test_set_feed_dhan_enable_gate_keys_off_raw_config_not_overlay() {
-        // config-ON boot + persisted runtime-OFF overlay: effective
-        // dhan=false (runtime seeds OFF), raw=true (NOT retired).
-        let health = Arc::new(crate::state::SystemHealthStatus::new());
-        let state = SharedAppState::new_with_feed_runtime(
-            test_qdb(),
-            test_dhan(),
-            test_instrument(),
-            health,
-            Arc::new(FeedRuntimeState::from_config_with_dhan_config(
-                &FeedsConfig {
-                    dhan_enabled: false,
-                    groww_enabled: true,
-                    ..Default::default()
-                },
-                true,
-            )),
-        );
-        assert!(
-            !state.feed_runtime().is_enabled(Feed::Dhan),
-            "boots with the runtime flag OFF (the overlay's choice)"
-        );
-        let Json(resp) = set_feed(
-            State(state.clone()),
-            Path("dhan".to_string()),
-            Json(SetFeedRequest { enabled: true }),
-        )
-        .await
-        .expect("re-enabling a config-ON (overlay-dormant) dhan lane must be ALLOWED");
-        assert!(resp.dhan_enabled, "the round trip is restored");
-
-        // Defensive inverse (production-impossible: the overlay AND-gate can
-        // never widen raw=false to effective=true): raw=false stays 409
-        // regardless of the effective value — the overlay can flip the gate
-        // in NEITHER direction.
-        let health = Arc::new(crate::state::SystemHealthStatus::new());
-        let state = SharedAppState::new_with_feed_runtime(
-            test_qdb(),
-            test_dhan(),
-            test_instrument(),
-            health,
-            Arc::new(FeedRuntimeState::from_config_with_dhan_config(
-                &FeedsConfig {
-                    dhan_enabled: true,
-                    groww_enabled: true,
-                    ..Default::default()
-                },
-                false,
-            )),
-        );
-        let Err((code, _body)) = set_feed(
-            State(state),
-            Path("dhan".to_string()),
-            Json(SetFeedRequest { enabled: true }),
-        )
-        .await
-        else {
-            panic!("raw=false must keep the enable refused regardless of the effective value");
-        };
-        assert_eq!(code, StatusCode::CONFLICT);
+    async fn test_set_feed_dhan_enable_refused_on_every_raw_config_shape() {
+        for raw_config_on in [true, false] {
+            let health = Arc::new(crate::state::SystemHealthStatus::new());
+            let state = SharedAppState::new_with_feed_runtime(
+                test_qdb(),
+                test_dhan(),
+                test_instrument(),
+                health,
+                Arc::new(FeedRuntimeState::from_config_with_dhan_config(
+                    &FeedsConfig {
+                        dhan_enabled: false,
+                        groww_enabled: true,
+                        ..Default::default()
+                    },
+                    raw_config_on,
+                )),
+            );
+            let Err((code, _body)) = set_feed(
+                State(state.clone()),
+                Path("dhan".to_string()),
+                Json(SetFeedRequest { enabled: true }),
+            )
+            .await
+            else {
+                panic!(
+                    "enabling the deleted dhan lane must be refused \
+                     (raw_config_on={raw_config_on})"
+                );
+            };
+            assert_eq!(code, StatusCode::CONFLICT);
+            assert!(!state.feed_runtime().is_enabled(Feed::Dhan));
+        }
     }
 
     /// Groww toggles are UNAFFECTED by the Dhan retirement gate.

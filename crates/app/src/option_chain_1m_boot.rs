@@ -79,9 +79,10 @@ use tracing::{debug, error, info, warn};
 
 use tickvault_common::config::QuestDbConfig;
 use tickvault_common::constants::{
-    CHAIN_1M_CONSECUTIVE_FAIL_PAGE_THRESHOLD, CHAIN_1M_EXPIRYLIST_RETRY_BACKOFF_SECS,
-    CHAIN_1M_FALLBACK_DELAY_MS, CHAIN_1M_MAX_BODY_BYTES, CHAIN_1M_MIN_GAP_SECS,
-    CHAIN_1M_REQUEST_TIMEOUT_SECS, CHAIN_1M_UNDERLYING_BUDGET_SECS, CHAIN_1M_UNDERLYINGS,
+    CHAIN_1M_CONSECUTIVE_FAIL_PAGE_THRESHOLD, CHAIN_1M_DECISION_CEILING_SECS,
+    CHAIN_1M_EXPIRYLIST_RETRY_BACKOFF_SECS, CHAIN_1M_FALLBACK_DELAY_MS, CHAIN_1M_MAX_BODY_BYTES,
+    CHAIN_1M_MIN_GAP_SECS, CHAIN_1M_REQUEST_TIMEOUT_SECS, CHAIN_1M_UNDERLYING_BUDGET_SECS,
+    CHAIN_1M_UNDERLYING_NOT_SERVED_THRESHOLD, CHAIN_1M_UNDERLYINGS,
     DHAN_OPTION_CHAIN_EXPIRYLIST_PATH, DHAN_OPTION_CHAIN_PATH, IST_UTC_OFFSET_SECONDS,
     SECONDS_PER_DAY, SPOT_1M_REST_CONSECUTIVE_FAIL_PAGE_THRESHOLD,
 };
@@ -101,14 +102,19 @@ use tickvault_core::pipeline::chain_snapshot::{
 };
 use tickvault_storage::disk_health_watcher::classify_join_exit;
 use tickvault_storage::option_chain_1m_persistence::{
-    OPTION_CHAIN_1M_LEG_CE, OPTION_CHAIN_1M_LEG_PE, OPTION_CHAIN_1M_SEGMENT_IDX_I,
-    OptionChain1mRow, OptionChain1mWriter, ensure_option_chain_1m_table,
+    OPTION_CHAIN_1M_FEED_DHAN, OPTION_CHAIN_1M_LEG_CE, OPTION_CHAIN_1M_LEG_PE,
+    OPTION_CHAIN_1M_SEGMENT_IDX_I, OptionChain1mRow, OptionChain1mWriter,
+    ensure_option_chain_1m_table,
+};
+use tickvault_storage::rest_fetch_audit_persistence::{
+    REST_FETCH_LEG_CHAIN_1M, RestFetchAuditRow, RestFetchAuditWriter, RestFetchOutcome,
+    ensure_rest_fetch_audit_table,
 };
 
 use crate::spot_1m_rest_boot::{
     EdgeAction, FailureEdge, accumulation_within_cap, count_missed_boundaries,
     declared_len_within_cap, fire_is_fresh, format_minute_ist_12h, minute_open_ist_nanos,
-    next_fire_after, spot_1m_day_is_over,
+    next_fire_after, spot_1m_day_is_over, stamp_held_ok_rows,
 };
 
 /// Backoff before the supervisor respawns a dead/failed scheduler run.
@@ -247,6 +253,32 @@ pub fn stale_wake_backoff_ms(fire_secs_of_day: u32, woke_at_secs_of_day: u32) ->
     u64::from(fire_secs_of_day.saturating_sub(woke_at_secs_of_day)).saturating_mul(1_000)
 }
 
+/// A retry may LAUNCH only while the fire is still inside the decision
+/// ceiling — measured from the minute close, REAL wall clock, including
+/// the same-key min-gap wait still ahead of it (2026-07-14 hardening;
+/// runbook `cross-source-chain-coverage-2026-07-14.md` §2). Pure.
+#[must_use]
+pub fn chain_retry_allowed(elapsed_ms_since_close_at_launch: i64) -> bool {
+    elapsed_ms_since_close_at_launch >= 0
+        && elapsed_ms_since_close_at_launch
+            < (CHAIN_1M_DECISION_CEILING_SECS as i64) * MILLIS_PER_SEC
+}
+
+/// The REAL-clock elapsed-since-close a retry would LAUNCH at: now minus
+/// the minute close, PLUS the same-key ≥3s gap wait still ahead of it
+/// (the [`min_gap_wait_ms`] output) — the [`chain_retry_allowed`] input.
+/// Saturating so a pathological clock never wraps. Pure.
+#[must_use]
+pub fn retry_launch_elapsed_ms(
+    now_ms_of_day: i64,
+    minute_close_ms_of_day: i64,
+    gap_wait_ms: u64,
+) -> i64 {
+    now_ms_of_day
+        .saturating_sub(minute_close_ms_of_day)
+        .saturating_add(i64::try_from(gap_wait_ms).unwrap_or(i64::MAX))
+}
+
 /// `true` when the body parses as the documented Dhan error-JSON shape —
 /// a JSON OBJECT carrying an `errorCode` or `errorType` field
 /// (api-introduction.md rule 6: exactly 3 string fields, always present).
@@ -336,6 +368,9 @@ pub struct ParsedChain {
     /// Strikes past [`MAX_STRIKES_PER_CHAIN`] — dropped by the parse cap,
     /// counted by the caller (coalesced `error!`) — never silent.
     pub truncated_strikes: u32,
+    /// KEPT strike count (excludes invalid + truncated keys) — the
+    /// ladder-shrink watermark's input (2026-07-14 hardening).
+    pub strike_count: u32,
 }
 
 /// Tolerant numeric read: JSON number (int OR float) → f64; anything else
@@ -423,6 +458,8 @@ pub fn parse_option_chain(body: &str) -> Option<ParsedChain> {
             chain.legs.push(pe);
         }
     }
+    // Bounded by MAX_STRIKES_PER_CHAIN (400) — the cast can never clip.
+    chain.strike_count = u32::try_from(strikes_kept).unwrap_or(u32::MAX);
     Some(chain)
 }
 
@@ -1093,12 +1130,403 @@ async fn fetch_chain_bounded(
     }
 }
 
+/// What phase 2 does with ONE first-pass outcome (2026-07-14 hardening —
+/// runbook `cross-source-chain-coverage-2026-07-14.md` §2). Pure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RetryDecision {
+    /// Not retry-eligible (Found / Entitlement) — the first-pass outcome
+    /// stands. Persist failures happen in phase 3 (our side) and the
+    /// no-token minute never builds outcomes at all — neither can reach
+    /// this classifier.
+    Keep,
+    /// Eligible, but the decision ceiling refuses the LAUNCH — counted
+    /// (`tv_chain1m_retry_total{outcome="skipped_ceiling"}`) + coded,
+    /// never silent.
+    SkippedCeiling,
+    /// Launch the single bounded retry.
+    Launch,
+}
+
+/// Retry-eligibility + ceiling gate for one first-pass outcome: ONLY
+/// `Empty` and transport-`Failed` are eligible; the launch must sit
+/// inside [`chain_retry_allowed`]'s decision ceiling. Pure.
+fn chain_retry_decision(outcome: &ChainFetchOutcome, elapsed_ms_at_launch: i64) -> RetryDecision {
+    if !matches!(
+        outcome,
+        ChainFetchOutcome::Empty | ChainFetchOutcome::Failed(_)
+    ) {
+        return RetryDecision::Keep;
+    }
+    if chain_retry_allowed(elapsed_ms_at_launch) {
+        RetryDecision::Launch
+    } else {
+        RetryDecision::SkippedCeiling
+    }
+}
+
+/// Phase-2 bounded retry pass: at most ONE retry per underlying per
+/// minute for first-pass `Empty` / transport-`Failed` outcomes,
+/// SEQUENTIAL over the (≤3, usually ≤1) queue. Each retry honors the
+/// same-key ≥3s gap (the wait itself happens INSIDE the injected fetch —
+/// `fetch_chain_bounded`'s existing internal gap sleep) and may LAUNCH
+/// only inside the [`CHAIN_1M_DECISION_CEILING_SECS`] window measured on
+/// the REAL wall clock from the minute close INCLUDING that wait; a
+/// refused retry is counted + coded, never silent. The retry's outcome
+/// REPLACES the first pass's for ALL downstream processing (a retry
+/// answering with the entitlement class is honored exactly like a pass-1
+/// entitlement → the day-scoped CHAIN-01 stop). NEVER retried: `Found`,
+/// `Entitlement`, the no-token minute (no outcomes exist), persist
+/// failures (phase 3, our side). Generic over the fetch + clock so the
+/// unit tests below inject deterministic outcomes; production passes the
+/// real `fetch_chain_bounded` closure + `ist_millis_of_day_now`.
+async fn chain_retry_pass<N, F, Fut>(
+    outcomes: &mut [(usize, ChainFetchOutcome)],
+    targets: &[ResolvedUnderlying],
+    last_request_ms: &mut [Option<i64>],
+    minute_close_ms: i64,
+    minute_label: &str,
+    now_ms_of_day: N,
+    mut fetch: F,
+) where
+    N: Fn() -> i64,
+    F: FnMut(&ResolvedUnderlying, Option<i64>) -> Fut,
+    Fut: std::future::Future<Output = (ChainFetchOutcome, i64)>,
+{
+    for (idx, outcome) in outcomes.iter_mut() {
+        // Defensive: every idx comes from the phase-1 enumerate, so the
+        // lookup always succeeds — a miss just keeps the pass-1 outcome.
+        let Some(target) = targets.get(*idx) else {
+            continue;
+        };
+        let prior_request_ms = last_request_ms.get(*idx).copied().flatten();
+        let gap_wait_ms = min_gap_wait_ms(prior_request_ms, now_ms_of_day());
+        let elapsed_at_launch =
+            retry_launch_elapsed_ms(now_ms_of_day(), minute_close_ms, gap_wait_ms);
+        match chain_retry_decision(outcome, elapsed_at_launch) {
+            RetryDecision::Keep => continue,
+            RetryDecision::SkippedCeiling => {
+                metrics::counter!("tv_chain1m_retry_total", "outcome" => "skipped_ceiling")
+                    .increment(1);
+                let symbol = target.symbol;
+                warn!(
+                    code = ErrorCode::Chain02FetchDegraded.code_str(),
+                    stage = "retry_skipped_ceiling",
+                    symbol,
+                    elapsed_ms_at_launch = elapsed_at_launch,
+                    ceiling_secs = CHAIN_1M_DECISION_CEILING_SECS,
+                    minute = minute_label,
+                    "CHAIN-02: retry refused — the decision ceiling has \
+                     passed (counted, never silent; the minute's failure \
+                     rides the existing accounting)"
+                );
+                continue;
+            }
+            RetryDecision::Launch => {}
+        }
+        let (retry_outcome, requested_at_ms) = fetch(target, prior_request_ms).await;
+        if let Some(slot) = last_request_ms.get_mut(*idx) {
+            *slot = Some(requested_at_ms);
+        }
+        match &retry_outcome {
+            ChainFetchOutcome::Found { .. } => {
+                metrics::counter!("tv_chain1m_retry_total", "outcome" => "recovered").increment(1);
+            }
+            ChainFetchOutcome::Empty | ChainFetchOutcome::Failed(_) => {
+                metrics::counter!("tv_chain1m_retry_total", "outcome" => "still_failed")
+                    .increment(1);
+            }
+            // A retry answering with the entitlement class is neither
+            // recovered nor still-failed in the retry sense — it becomes
+            // the day-scoped stop; the minute-final fetch counter
+            // (phase 3's entitlement arm) records it.
+            ChainFetchOutcome::Entitlement(_) => {}
+        }
+        *outcome = retry_outcome;
+    }
+}
+
 /// The chain edge's "fully failed" verdict for one fired minute — no
 /// underlying succeeded, OR the persist leg (append/flush) failed. A
 /// fetched-but-never-persisted minute is NOT ok (the spot M1 precedent).
 #[must_use]
 pub fn chain_minute_fully_failed(ok_count: usize, persist_failed: bool) -> bool {
     ok_count == 0 || persist_failed
+}
+
+// ---------------------------------------------------------------------------
+// Pure per-underlying not-served detector (2026-07-14 — the Dhan mirror
+// of PR #1537's Groww detector; the NIFTY expiry-day vendor-cutoff
+// companion: Groww stopped serving the same-day-expiring NIFTY chain at
+// 14:54 IST while BANKNIFTY + SENSEX kept working, and the ok==0
+// escalation edge paged nobody all afternoon — the Dhan leg carried the
+// IDENTICAL blind spot).
+// FOLLOW-UP: duplicate-now-extract-later — once #1537 merges, extract
+// the shared tracker into one module consumed by both chain legs (the
+// FailureEdge import precedent).
+// ---------------------------------------------------------------------------
+
+/// What the caller must do for ONE underlying after recording a minute's
+/// per-underlying served verdicts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnderlyingEdgeAction {
+    /// Nothing to page for this underlying this minute.
+    None,
+    /// RISING edge: this underlying reached
+    /// [`CHAIN_1M_UNDERLYING_NOT_SERVED_THRESHOLD`] consecutive counted
+    /// not-served minutes (each with ≥1 sibling success) — page ONCE
+    /// (High), latched until this underlying's own recovery.
+    Page { consecutive: u32 },
+    /// FALLING edge: a paged underlying's chain was served again — one
+    /// Info ping; the latch re-arms.
+    Recover { not_served_minutes: u32 },
+}
+
+/// Per-underlying not-served state: consecutive COUNTED not-served
+/// minutes + the page latch.
+#[derive(Debug, Default)]
+struct UnderlyingServedState {
+    consecutive_not_served: u32,
+    paged: bool,
+}
+
+/// Per-underlying "is the vendor serving this chain?" tracker.
+/// Distinguishes vendor-not-serving-ONE-underlying from a global outage:
+///
+/// | This minute, this underlying | ≥1 OTHER underlying served? | Effect on this underlying |
+/// |---|---|---|
+/// | served (chain with strikes retrieved) | — | streak reset; `Recover` if paged |
+/// | not served (empty OR error) | yes | streak +1; `Page` once at the threshold |
+/// | not served | no (global outage) | HOLD — neither counts nor resets |
+///
+/// The global-outage HOLD keeps the two signals disjoint for the
+/// FETCH-failure class: a full fetch outage (ok == 0) is the
+/// [`FailureEdge`] escalation's page, this edge needs ≥1 OK — mutually
+/// exclusive per minute WITHIN that class. HONEST OVERLAP: a
+/// persist-failed minute with ok ≥ 1 can legitimately count toward BOTH
+/// edges (the M1 gate makes the escalation edge count it fully-failed
+/// while an empty sibling counts here) — two DISTINCT signals:
+/// persistence broken + vendor not serving one underlying. "Served" is
+/// FETCH-level (`Found`): the vendor-serving question — persist
+/// failures are OUR side and already feed the escalation edge via the
+/// spot-M1 persist gate. An underlying MISSING from a minute's verdicts
+/// (the unwind-build join-failure arm) is simply untouched — a
+/// per-underlying HOLD. Pure state machine — unit-tested without a
+/// clock. State is per scheduler run (session-scoped, same envelope as
+/// [`FailureEdge`] — a task respawn restarts the streak; the run itself
+/// is per trading day).
+#[derive(Debug, Default)]
+pub struct UnderlyingServedTracker {
+    per_underlying: std::collections::HashMap<&'static str, UnderlyingServedState>,
+}
+
+impl UnderlyingServedTracker {
+    /// Record one fired minute's per-underlying served verdicts
+    /// (`served` = a chain with strikes was retrieved for that underlying
+    /// this fire) and return one action per input underlying,
+    /// index-aligned with `verdicts`.
+    pub fn record_minute(
+        &mut self,
+        verdicts: &[(&'static str, bool)],
+    ) -> Vec<(&'static str, UnderlyingEdgeAction)> {
+        let any_served = verdicts.iter().any(|&(_, served)| served);
+        verdicts
+            .iter()
+            .map(|&(underlying, served)| {
+                let state = self.per_underlying.entry(underlying).or_default();
+                let action = if served {
+                    let not_served_minutes = state.consecutive_not_served;
+                    let was_paged = state.paged;
+                    state.consecutive_not_served = 0;
+                    state.paged = false;
+                    if was_paged {
+                        UnderlyingEdgeAction::Recover { not_served_minutes }
+                    } else {
+                        UnderlyingEdgeAction::None
+                    }
+                } else if any_served {
+                    state.consecutive_not_served = state.consecutive_not_served.saturating_add(1);
+                    if !state.paged
+                        && state.consecutive_not_served >= CHAIN_1M_UNDERLYING_NOT_SERVED_THRESHOLD
+                    {
+                        state.paged = true;
+                        UnderlyingEdgeAction::Page {
+                            consecutive: state.consecutive_not_served,
+                        }
+                    } else {
+                        UnderlyingEdgeAction::None
+                    }
+                } else {
+                    // Global-outage minute (no underlying served): HOLD.
+                    UnderlyingEdgeAction::None
+                };
+                (underlying, action)
+            })
+            .collect()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Strike-ladder day-max shrink watermark (2026-07-14 — log-only)
+// ---------------------------------------------------------------------------
+
+/// What one Found minute's strike count means for the ladder watermark.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LadderAction {
+    /// Not shrunk (day-max ratcheted as needed); silently clears the
+    /// episode latch.
+    Normal,
+    /// FIRST shrunk minute of an episode — the caller emits the ONE
+    /// edge-latched coded warn (+ the per-minute counter).
+    ShrunkFirst,
+    /// A further shrunk minute inside a latched episode — counter only.
+    ShrunkLatched,
+}
+
+/// `true` when a Found chain's kept-strike count dropped below HALF the
+/// day-max watermark (⌈day_max/2⌉). The day's FIRST Found never flags
+/// (`day_max == 0` seeds the watermark) — an all-day-small chain is the
+/// Empty/not-served territory, never this detector's. Pure.
+#[must_use]
+pub fn ladder_shrunk(day_max: u32, strikes: u32) -> bool {
+    day_max > 0 && strikes < day_max.div_ceil(2)
+}
+
+/// Per-underlying strike-ladder DAY-MAX watermark (log-only; runbook
+/// `cross-source-chain-coverage-2026-07-14.md` §3): counted per shrunk
+/// minute + ONE coded warn per episode; a silent (non-shrunk) recovery
+/// clears the latch. HEURISTIC evidence, NEVER a page — expiry-day
+/// ladder narrowing is legitimate vendor behavior and no expected-strike
+/// baseline exists. Intra-day only; a supervisor respawn resets it;
+/// shrink-to-ZERO strikes is the `Empty` class and never reaches this
+/// (Found-only input).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LadderWatermark {
+    day_max: u32,
+    shrunk_latched: bool,
+}
+
+impl LadderWatermark {
+    /// Feed one Found minute's kept-strike count; the returned action
+    /// says what the caller emits. Pure state machine.
+    pub fn observe(&mut self, strikes: u32) -> LadderAction {
+        let shrunk = ladder_shrunk(self.day_max, strikes);
+        self.day_max = self.day_max.max(strikes);
+        if shrunk {
+            if self.shrunk_latched {
+                LadderAction::ShrunkLatched
+            } else {
+                self.shrunk_latched = true;
+                LadderAction::ShrunkFirst
+            }
+        } else {
+            self.shrunk_latched = false;
+            LadderAction::Normal
+        }
+    }
+
+    /// The current day-max (log payloads).
+    #[must_use]
+    pub fn day_max(&self) -> u32 {
+        self.day_max
+    }
+}
+
+/// Per-run chain serving-health state (2026-07-14) — threaded into every
+/// fire as ONE bundled param: the per-underlying not-served tracker +
+/// the per-underlying (index-aligned with the resolved targets)
+/// strike-ladder watermarks. Same lifetime as the [`FailureEdge`]: this
+/// run, which is per trading day; a supervisor respawn restarts the
+/// streaks (documented ~10-minute re-detection envelope).
+#[derive(Debug, Default)]
+struct ChainServingHealth {
+    not_served: UnderlyingServedTracker,
+    ladders: [LadderWatermark; CHAIN_1M_UNDERLYINGS.len()],
+}
+
+// ---------------------------------------------------------------------------
+// GAP-11 forensics helpers (rest_fetch_audit, leg='chain_1m', feed='dhan')
+// ---------------------------------------------------------------------------
+
+/// Build one `rest_fetch_audit` row for a Dhan chain fetch — `leg =
+/// chain_1m`, `attempts = 1` for a ran fetch (live-snapshot semantics: the
+/// chain has no in-minute re-poll ladder), keyed on the UNDERLYING's
+/// stable identity + plain symbol (the Groww chain precedent). The Dhan
+/// chain fetch surfaces no per-attempt forensics struct
+/// (`fetch_chain_bounded` returns a typed outcome only), so
+/// `final_http_status` carries 200 for the 2xx-proven arms (Found/Empty)
+/// and the 0 sentinel otherwise, and `fetch_latency_ms` stays the -1
+/// sentinel (measured only into the `tv_chain1m_fetch_duration_ms`
+/// histogram — threading it out of the ladder is out of scope, stated
+/// honestly). Pure.
+#[allow(clippy::too_many_arguments)] // APPROVED: private forensics builder — a struct would be pure ceremony
+fn build_dhan_chain_audit_row(
+    target_minute_ist_nanos: i64,
+    trading_date_nanos: i64,
+    security_id: u64,
+    symbol: &'static str,
+    attempts: i64,
+    final_http_status: i64,
+    close_to_data_ms: i64,
+    outcome: RestFetchOutcome,
+    error_class: &'static str,
+) -> RestFetchAuditRow {
+    RestFetchAuditRow {
+        ts_ist_nanos: target_minute_ist_nanos,
+        trading_date_ist_nanos: trading_date_nanos,
+        feed: OPTION_CHAIN_1M_FEED_DHAN,
+        leg: REST_FETCH_LEG_CHAIN_1M,
+        // Unreachable overflow for the pinned 13/25/51 set — a visible
+        // sentinel, never a silent sid=0 (the spot-leg precedent).
+        security_id: i64::try_from(security_id).unwrap_or(i64::MAX),
+        exchange_segment: OPTION_CHAIN_1M_SEGMENT_IDX_I,
+        symbol,
+        attempts,
+        final_http_status,
+        fetch_latency_ms: -1,
+        close_to_data_ms,
+        close_to_persist_ms: -1,
+        rate_limited_count: 0,
+        outcome,
+        error_class,
+    }
+}
+
+/// Best-effort forensics append: a failure logs (coded, CHAIN-03
+/// `audit_append` stage) + counts and RETURNS — the fetch loop, the
+/// verdict and the failure edge are never affected by the forensics leg.
+/// Dhan emit sites stay field-less on the CHAIN codes per the rule-file
+/// convention (grep-split by `feed="groww"`).
+fn chain_audit_append_best_effort(
+    audit_writer: &mut RestFetchAuditWriter,
+    row: &RestFetchAuditRow,
+) {
+    if let Err(err) = audit_writer.append_row(row) {
+        metrics::counter!("tv_rest_fetch_audit_persist_errors_total", "stage" => "audit_append")
+            .increment(1);
+        error!(
+            code = ErrorCode::Chain03PersistFailed.code_str(),
+            stage = "audit_append",
+            ?err,
+            "CHAIN-03: rest_fetch_audit (chain_1m) row append failed \
+             (forensics only — the fetch loop is unaffected)"
+        );
+    }
+}
+
+/// Best-effort forensics flush (same never-affects-the-loop contract).
+fn chain_audit_flush_best_effort(audit_writer: &mut RestFetchAuditWriter) {
+    if let Err(err) = audit_writer.flush() {
+        metrics::counter!("tv_rest_fetch_audit_persist_errors_total", "stage" => "audit_flush")
+            .increment(1);
+        error!(
+            code = ErrorCode::Chain03PersistFailed.code_str(),
+            stage = "audit_flush",
+            ?err,
+            "CHAIN-03: rest_fetch_audit (chain_1m) ILP flush failed — \
+             pending forensics rows discarded (best-effort; the fetch loop \
+             is unaffected)"
+        );
+    }
 }
 
 /// What the run loop does after one fired minute.
@@ -1119,7 +1547,9 @@ async fn fire_one_chain_minute(
     targets: &[ResolvedUnderlying],
     last_request_ms: &mut [Option<i64>],
     writer: &mut OptionChain1mWriter,
+    audit_writer: &mut RestFetchAuditWriter,
     edge: &mut FailureEdge,
+    health: &mut ChainServingHealth,
     moneyness_latches: &mut MoneynessWarnLatches,
     fire_secs_of_day: u32,
 ) -> MinuteVerdict {
@@ -1141,12 +1571,36 @@ async fn fire_one_chain_minute(
     let mut persist_failed = false;
     let mut entitlement: Option<String> = None;
     let mut sample_failure: Option<String> = None;
+    // Per-underlying FETCH-level served verdicts (`Found` = served) for
+    // the not-served detector — the vendor-serving question, deliberately
+    // NOT persist-gated (persist failures are ours; the escalation edge
+    // owns them via the M1 gate). A no-token minute never builds the
+    // outcomes, so the verdicts stay EMPTY → the sink records nothing —
+    // a whole-fire tracker HOLD (the #1537 auth-abort mirror).
+    let mut served_verdicts: Vec<(&'static str, bool)> = Vec::with_capacity(targets.len());
+    // GAP-11 forensics: one row per (fired minute, underlying); `ok` rows
+    // are HELD here until the data flush ACK, then stamped with the real
+    // close_to_persist_ms (a failed flush converts them to flush_failed
+    // named-gap rows — never a false ok row).
+    let mut held_ok_rows: Vec<RestFetchAuditRow> = Vec::new();
+    let target_minute_nanos = minute_open_ist_nanos(trading_date, minute_open_secs);
+    let trading_date_nanos = minute_open_ist_nanos(trading_date, 0);
 
     if let Some(jwt) = jwt {
-        let target_minute_nanos = minute_open_ist_nanos(trading_date, minute_open_secs);
-        let trading_date_nanos = minute_open_ist_nanos(trading_date, 0);
         let minute_close_ms = i64::from(fire_secs_of_day).saturating_mul(MILLIS_PER_SEC);
 
+        // 2026-07-14 pacing decision (runbook
+        // `cross-source-chain-coverage-2026-07-14.md` §2): the JoinSet
+        // concurrency is KEPT — Dhan's option-chain rate-limit doc
+        // (quoted 2026-07-14): "Rate limit for Option Chain API is set to
+        // one unique request every 3 seconds. This means you can fetch
+        // entire option chain for multiple different underlying
+        // instrument or multiple expiries of same instrument concurrently
+        // every 3 seconds." The 3s bound is per unique (underlying,
+        // expiry) KEY — enforced by min_gap_wait_ms through the
+        // per-underlying last_request_ms stamps; DISTINCT underlyings go
+        // concurrently. A future sequentialization must be a deliberate,
+        // rule-edited change.
         let mut join_set = tokio::task::JoinSet::new();
         for (idx, target) in targets.iter().enumerate() {
             let client = client.clone();
@@ -1169,6 +1623,11 @@ async fn fire_one_chain_minute(
                 (idx, outcome, requested_at_ms)
             });
         }
+        // Phase 1 — drain the JoinSet into the first-pass outcomes
+        // (stamps last_request_ms exactly as before; the join-failure arm
+        // keeps its error accounting and pushes nothing — idx unknown;
+        // unwind-builds only, release panics abort).
+        let mut outcomes: Vec<(usize, ChainFetchOutcome)> = Vec::with_capacity(targets.len());
         while let Some(joined) = join_set.join_next().await {
             let Ok((idx, outcome, requested_at_ms)) = joined else {
                 error_count = error_count.saturating_add(1);
@@ -1181,9 +1640,47 @@ async fn fire_one_chain_minute(
             if let Some(slot) = last_request_ms.get_mut(idx) {
                 *slot = Some(requested_at_ms);
             }
+            outcomes.push((idx, outcome));
+        }
+        // Phase 2 — the bounded same-key retry pass (≤1 per underlying
+        // per minute, decision-ceiling-gated; refused retries counted).
+        chain_retry_pass(
+            &mut outcomes,
+            targets,
+            last_request_ms,
+            minute_close_ms,
+            &minute_label,
+            ist_millis_of_day_now,
+            |target, prior_request_ms| {
+                let body = chain_request_body(target.security_id, &target.expiry_str);
+                let jwt = jwt.clone();
+                async move {
+                    fetch_chain_bounded(
+                        client,
+                        chain_url,
+                        &jwt,
+                        &params.client_id,
+                        &body,
+                        minute_close_ms,
+                        prior_request_ms,
+                    )
+                    .await
+                }
+            },
+        )
+        .await;
+        // Phase 3 — process the FINAL post-retry outcomes (the per-outcome
+        // match below is the pre-2026-07-14 processing body, unchanged).
+        for (idx, outcome) in outcomes {
             let Some(target) = targets.get(idx) else {
                 continue;
             };
+            // ONE verdict line sees the FINAL post-retry outcome for every
+            // processed class (2026-07-14 not-served detector input).
+            served_verdicts.push((
+                target.symbol,
+                matches!(&outcome, ChainFetchOutcome::Found { .. }),
+            ));
             match outcome {
                 ChainFetchOutcome::Found {
                     chain,
@@ -1220,8 +1717,57 @@ async fn fire_one_chain_minute(
                              extra strikes dropped (counted, never silent)"
                         );
                     }
+                    // 2026-07-14 ladder visibility (log-only; runbook
+                    // `cross-source-chain-coverage-2026-07-14.md` §3): the
+                    // Dhan mirrors of the Groww per-chain size histograms
+                    // + the day-max strike-ladder shrink watermark.
+                    #[allow(clippy::cast_precision_loss)] // APPROVED: histogram samples only
+                    {
+                        metrics::histogram!("tv_chain1m_strikes_per_chain")
+                            .record(f64::from(chain.strike_count));
+                        metrics::histogram!("tv_chain1m_legs_per_chain")
+                            .record(chain.legs.len() as f64);
+                    }
+                    if let Some(ladder) = health.ladders.get_mut(idx) {
+                        let day_max_before = ladder.day_max();
+                        match ladder.observe(chain.strike_count) {
+                            LadderAction::ShrunkFirst => {
+                                metrics::counter!(
+                                    "tv_chain1m_ladder_shrunk_total",
+                                    "underlying" => target.symbol
+                                )
+                                .increment(1);
+                                warn!(
+                                    code = ErrorCode::Chain02FetchDegraded.code_str(),
+                                    stage = "ladder_shrunk",
+                                    underlying = target.symbol,
+                                    strikes = chain.strike_count,
+                                    day_max = day_max_before,
+                                    minute = %minute_label,
+                                    "CHAIN-02: this underlying's chain came back \
+                                     with under half its day-max strike count — a \
+                                     partial ladder (heuristic evidence; counted \
+                                     per minute, one warn per episode, NEVER a \
+                                     page — expiry-day narrowing is legitimate \
+                                     vendor behavior)"
+                                );
+                            }
+                            LadderAction::ShrunkLatched => {
+                                metrics::counter!(
+                                    "tv_chain1m_ladder_shrunk_total",
+                                    "underlying" => target.symbol
+                                )
+                                .increment(1);
+                            }
+                            LadderAction::Normal => {}
+                        }
+                    }
                     let expiry_nanos = minute_open_ist_nanos(target.expiry, 0);
                     let fetched_at = fetched_at_ist_nanos_now();
+                    // GAP-11: per-underlying append verdict — a poisoned
+                    // batch means the minute is a persist_failed named
+                    // gap for this underlying, never an ok row.
+                    let mut underlying_append_failed = false;
                     let underlying_sid = i64::try_from(target.security_id).unwrap_or_else(|_| {
                         // Unreachable for the pinned 13/25/51 set; loud +
                         // visible sentinel, never a silent sid=0.
@@ -1272,6 +1818,7 @@ async fn fire_one_chain_minute(
                         };
                         if let Err(err) = writer.append_row(&row) {
                             persist_failed = true;
+                            underlying_append_failed = true;
                             metrics::counter!(
                                 "tv_chain1m_persist_errors_total", "stage" => "append"
                             )
@@ -1291,6 +1838,39 @@ async fn fire_one_chain_minute(
                             // legs (the flush discard covers the rest).
                             break;
                         }
+                    }
+                    if underlying_append_failed {
+                        // GAP-11: fetched-but-lost — a persist failure,
+                        // never dressed as vendor absence (the spot-leg
+                        // round-2 LOW precedent).
+                        chain_audit_append_best_effort(
+                            audit_writer,
+                            &build_dhan_chain_audit_row(
+                                target_minute_nanos,
+                                trading_date_nanos,
+                                target.security_id,
+                                target.symbol,
+                                1,
+                                200,
+                                -1,
+                                RestFetchOutcome::NamedGap,
+                                "persist_failed",
+                            ),
+                        );
+                    } else {
+                        // GAP-11: HOLD the ok row until the data flush ACK
+                        // (close_to_persist_ms stamped post-flush).
+                        held_ok_rows.push(build_dhan_chain_audit_row(
+                            target_minute_nanos,
+                            trading_date_nanos,
+                            target.security_id,
+                            target.symbol,
+                            1,
+                            200,
+                            close_to_data_ms,
+                            RestFetchOutcome::Ok,
+                            "none",
+                        ));
                     }
                     // Moneyness observability (counters + day-latched
                     // advisory warns) THEN the RAM snapshot publish — the
@@ -1324,6 +1904,21 @@ async fn fire_one_chain_minute(
                             target.symbol
                         ));
                     }
+                    // GAP-11 forensics: 2xx-proven, zero strikes.
+                    chain_audit_append_best_effort(
+                        audit_writer,
+                        &build_dhan_chain_audit_row(
+                            target_minute_nanos,
+                            trading_date_nanos,
+                            target.security_id,
+                            target.symbol,
+                            1,
+                            200,
+                            -1,
+                            RestFetchOutcome::Empty,
+                            "empty_chain",
+                        ),
+                    );
                 }
                 ChainFetchOutcome::Entitlement(detail) => {
                     error_count = error_count.saturating_add(1);
@@ -1332,6 +1927,22 @@ async fn fire_one_chain_minute(
                     if entitlement.is_none() {
                         entitlement = Some(detail);
                     }
+                    // GAP-11 forensics: the entitlement class (no status
+                    // surfaced by the ladder — 0 sentinel).
+                    chain_audit_append_best_effort(
+                        audit_writer,
+                        &build_dhan_chain_audit_row(
+                            target_minute_nanos,
+                            trading_date_nanos,
+                            target.security_id,
+                            target.symbol,
+                            1,
+                            0,
+                            -1,
+                            RestFetchOutcome::Error,
+                            "entitlement",
+                        ),
+                    );
                 }
                 ChainFetchOutcome::Failed(reason) => {
                     error_count = error_count.saturating_add(1);
@@ -1339,10 +1950,28 @@ async fn fire_one_chain_minute(
                     if sample_failure.is_none() {
                         sample_failure = Some(format!("{}: {reason}", target.symbol));
                     }
+                    // GAP-11 forensics: transport / non-2xx / parse /
+                    // budget — the ladder surfaces no status (0 sentinel);
+                    // the coalesced verdict log carries the reason text.
+                    chain_audit_append_best_effort(
+                        audit_writer,
+                        &build_dhan_chain_audit_row(
+                            target_minute_nanos,
+                            trading_date_nanos,
+                            target.security_id,
+                            target.symbol,
+                            1,
+                            0,
+                            -1,
+                            RestFetchOutcome::Error,
+                            "error",
+                        ),
+                    );
                 }
             }
         }
-        if let Err(err) = writer.flush() {
+        let flush_result = writer.flush();
+        if let Err(err) = &flush_result {
             persist_failed = true;
             metrics::counter!("tv_chain1m_persist_errors_total", "stage" => "flush").increment(1);
             error!(
@@ -1356,16 +1985,58 @@ async fn fire_one_chain_minute(
             if sample_failure.is_none() {
                 sample_failure = Some(format!("persist flush failed: {err:#}"));
             }
+            // GAP-11: the underlyings whose legs were staged-but-lost at
+            // the flush become flush_failed named-gap rows (the fetch
+            // itself answered 200); the held ok rows are discarded below
+            // — never a false ok row.
+            for held in &held_ok_rows {
+                chain_audit_append_best_effort(
+                    audit_writer,
+                    &RestFetchAuditRow {
+                        close_to_data_ms: -1,
+                        outcome: RestFetchOutcome::NamedGap,
+                        error_class: "flush_failed",
+                        ..held.clone()
+                    },
+                );
+            }
+        }
+        // GAP-11: the ok rows land ONLY after (and stamped with) the data
+        // flush ACK — discarded on a failed flush.
+        for row in stamp_held_ok_rows(
+            held_ok_rows,
+            flush_result.is_ok(),
+            trading_date_nanos,
+            ist_millis_of_day_now(),
+        ) {
+            chain_audit_append_best_effort(audit_writer, &row);
         }
     } else {
         // No token at fire time — REST cannot succeed; the whole minute is
-        // a full miss (counted per underlying for honest rate math).
+        // a full miss (counted per underlying for honest rate math) + one
+        // no_token forensics row per underlying.
         error_count = targets.len();
         sample_failure = Some("no access token available at fire time".to_string());
-        for _ in 0..error_count {
+        for target in targets {
             metrics::counter!("tv_chain1m_fetch_total", "outcome" => "error").increment(1);
+            chain_audit_append_best_effort(
+                audit_writer,
+                &build_dhan_chain_audit_row(
+                    target_minute_nanos,
+                    trading_date_nanos,
+                    target.security_id,
+                    target.symbol,
+                    0,
+                    0,
+                    -1,
+                    RestFetchOutcome::NoToken,
+                    "no_token",
+                ),
+            );
         }
     }
+    // GAP-11 forensics: flush ONCE per fire (best-effort).
+    chain_audit_flush_best_effort(audit_writer);
 
     // An entitlement stop pages CHAIN-01 (once, day-scoped) at the caller
     // — skip the CHAIN-02 edge accounting for the same minute so one
@@ -1382,6 +2053,12 @@ async fn fire_one_chain_minute(
                 empty_count,
                 persist_failed,
                 sample_failure.as_deref(),
+            );
+            record_chain_underlying_verdicts(
+                params,
+                &mut health.not_served,
+                &served_verdicts,
+                &minute_label,
             );
             MinuteVerdict::Continue
         }
@@ -1453,20 +2130,98 @@ fn record_chain_minute_verdict(
     }
 }
 
+/// 2026-07-14 not-served companion (the #1537 Groww mirror; Dhan emits
+/// stay FIELD-LESS on `feed` — the Dhan-sites convention): feed one fired
+/// minute's per-underlying FETCH-level served verdicts into the
+/// [`UnderlyingServedTracker`] and emit the edge-latched per-underlying
+/// page / recovery ping + the per-counted-minute counter
+/// (`tv_chain1m_underlying_not_served_total{underlying}` — 3 static label
+/// values, the pinned plain symbols). Counting semantics live in the
+/// tracker doc. Skipped-boundary and no-token minutes deliberately never
+/// reach this sink (nothing was fetched for ANY underlying — the HOLD arm
+/// by construction); an EntitlementStop minute skips it too (CHAIN-01
+/// owns the day — the verdicts are discarded).
+fn record_chain_underlying_verdicts(
+    params: &OptionChain1mTaskParams,
+    not_served: &mut UnderlyingServedTracker,
+    verdicts: &[(&'static str, bool)],
+    minute_label: &str,
+) {
+    if verdicts.is_empty() {
+        return;
+    }
+    let any_served = verdicts.iter().any(|&(_, served)| served);
+    let actions = not_served.record_minute(verdicts);
+    for (&(underlying, served), &(_, action)) in verdicts.iter().zip(actions.iter()) {
+        if !served && any_served {
+            // One counted vendor-not-serving minute for this underlying
+            // (a global-outage minute is deliberately NOT counted here).
+            metrics::counter!(
+                "tv_chain1m_underlying_not_served_total", "underlying" => underlying
+            )
+            .increment(1);
+        }
+        match action {
+            UnderlyingEdgeAction::Page { consecutive } => {
+                error!(
+                    code = ErrorCode::Chain02FetchDegraded.code_str(),
+                    stage = "underlying_not_served",
+                    underlying,
+                    consecutive_minutes = consecutive,
+                    minute = minute_label,
+                    "CHAIN-02: Dhan is not serving this underlying's option \
+                     chain while the other underlyings succeed — paging once \
+                     per underlying (edge-latched; re-armed on this \
+                     underlying's own recovery)"
+                );
+                params
+                    .notifier
+                    .notify(NotificationEvent::Chain1mUnderlyingNotServed {
+                        underlying,
+                        empty_minutes: consecutive,
+                    });
+            }
+            UnderlyingEdgeAction::Recover { not_served_minutes } => {
+                info!(
+                    underlying,
+                    not_served_minutes,
+                    minute = minute_label,
+                    "option_chain_1m: this underlying's chain is being served \
+                     again after a paged not-served episode"
+                );
+                params
+                    .notifier
+                    .notify(NotificationEvent::Chain1mUnderlyingServedRecovered {
+                        underlying,
+                        empty_minutes: not_served_minutes,
+                    });
+            }
+            UnderlyingEdgeAction::None => {}
+        }
+    }
+}
+
 /// Loud accounting for minute boundaries that elapsed UNFETCHED (fire
 /// overrun / suspend / clock step) — the spot leg's H2 pattern with the
-/// chain's own counter + edge.
+/// chain's own counter + edge. GAP-11: each missed (boundary, underlying)
+/// pair also gets a `skipped` forensics row (the Groww chain precedent) —
+/// `first_missed_boundary_secs` is the FIRST missed fire boundary, so the
+/// rows key on the real missed minutes.
+#[allow(clippy::too_many_arguments)] // APPROVED: private accounting sink — a struct would be pure ceremony (Groww chain precedent)
 fn record_chain_skipped_boundaries(
     params: &OptionChain1mTaskParams,
     edge: &mut FailureEdge,
+    audit_writer: &mut RestFetchAuditWriter,
+    targets: &[ResolvedUnderlying],
     skipped: u32,
-    context_secs_of_day: u32,
+    first_missed_boundary_secs: u32,
+    iter_date: NaiveDate,
 ) {
     if skipped == 0 {
         return;
     }
     metrics::counter!("tv_chain1m_boundary_skipped_total").increment(u64::from(skipped));
-    let around = format_minute_ist_12h(context_secs_of_day);
+    let around = format_minute_ist_12h(first_missed_boundary_secs);
     error!(
         code = ErrorCode::Chain02FetchDegraded.code_str(),
         stage = "boundary_skipped",
@@ -1475,7 +2230,50 @@ fn record_chain_skipped_boundaries(
         "CHAIN-02: minute boundaries elapsed unfetched (fire overrun / \
          suspend) — those minutes stay absent (re-fetchable via backfill)"
     );
-    for _ in 0..skipped {
+    // GAP-11 (the Groww chain item-7 precedent): a wake that crossed IST
+    // midnight would stamp the missed PRE-SUSPEND session seconds onto the
+    // POST-WAKE date — wrong trading date on every row. The counter + the
+    // coalesced log already fired; skip the (mis-dated) forensics rows +
+    // edge accounting — the day is over for this run.
+    //
+    // DELIBERATE edge-accounting change (review MEDIUM 3, 2026-07-14):
+    // pre-GAP-11 this fn fed `edge.record_minute(true)` UNCONDITIONALLY for
+    // every missed boundary; post-guard a midnight-crossing wake feeds the
+    // edge NOTHING for those boundaries. Defensible by design: the trading
+    // day those boundaries belonged to is over, and an escalation page for
+    // yesterday's tail on the post-wake day would be noise, not signal.
+    let trading_date = today_ist();
+    if trading_date != iter_date {
+        warn!(
+            %iter_date,
+            %trading_date,
+            "option_chain_1m: wake crossed IST midnight — skipping the \
+             boundary-skip forensics rows (wrong trading date); the day is \
+             over for this run"
+        );
+        return;
+    }
+    let trading_date_nanos = minute_open_ist_nanos(trading_date, 0);
+    for i in 0..skipped {
+        let boundary = first_missed_boundary_secs.saturating_add(i.saturating_mul(60));
+        let minute_open_secs = boundary.saturating_sub(60);
+        let target_nanos = minute_open_ist_nanos(trading_date, minute_open_secs);
+        for target in targets {
+            chain_audit_append_best_effort(
+                audit_writer,
+                &build_dhan_chain_audit_row(
+                    target_nanos,
+                    trading_date_nanos,
+                    target.security_id,
+                    target.symbol,
+                    0,
+                    0,
+                    -1,
+                    RestFetchOutcome::Skipped,
+                    "boundary_skipped",
+                ),
+            );
+        }
         if let EdgeAction::Page { consecutive } = edge.record_minute(true) {
             error!(
                 code = ErrorCode::Chain02FetchDegraded.code_str(),
@@ -1493,6 +2291,7 @@ fn record_chain_skipped_boundaries(
                 });
         }
     }
+    chain_audit_flush_best_effort(audit_writer);
 }
 
 // ---------------------------------------------------------------------------
@@ -1568,6 +2367,9 @@ pub async fn run_option_chain_1m(
     // Idempotent DDL first (CREATE → ADD COLUMN self-heal → DEDUP ENABLE);
     // failures degrade loudly inside (CHAIN-03) and never block the run.
     ensure_option_chain_1m_table(&params.questdb).await;
+    // GAP-11 forensics: the shared rest_fetch_audit table (idempotent —
+    // the spot + Groww legs also ensure it; a second call is harmless).
+    ensure_rest_fetch_audit_table(&params.questdb).await;
 
     if !params.calendar.is_trading_day_today() {
         info!("option_chain_1m: non-trading day — skipping all minute fires");
@@ -1670,7 +2472,14 @@ pub async fn run_option_chain_1m(
     }
 
     let mut writer = OptionChain1mWriter::new(&params.questdb);
+    // GAP-11 forensics: best-effort per-fetch audit rows (never on the
+    // fetch/verdict/edge path).
+    let mut audit_writer = RestFetchAuditWriter::new(&params.questdb);
     let mut edge = FailureEdge::default();
+    // Per-underlying not-served tracker + ladder watermarks (2026-07-14)
+    // — same lifetime as the FailureEdge: this run, which is per trading
+    // day; a mid-day supervisor respawn restarts the streaks.
+    let mut health = ChainServingHealth::default();
     let mut moneyness_latches = MoneynessWarnLatches::default();
     let mut last_fired: Option<u32> = None;
     let mut last_request_ms: Vec<Option<i64>> = vec![None; targets.len()];
@@ -1685,9 +2494,26 @@ pub async fn run_option_chain_1m(
         // Audit Rule 3: re-read the wall clock + trading-day verdict EVERY
         // iteration (a suspend can cross midnight and stale the verdict).
         if !params.calendar.is_trading_day_today() {
-            info!("option_chain_1m: no longer a trading day — exiting");
+            // 2026-07-14: loud + coded (was a bare info!) — a mid-session
+            // calendar flip silently stopping a capture leg must be
+            // greppable in errors.jsonl. Log-sink-only, NO Telegram (a
+            // calendar flip is not broker failure); a suspend that
+            // crossed IST midnight is a legitimate cause.
+            metrics::counter!("tv_chain1m_trading_day_flip_exit_total").increment(1);
+            error!(
+                code = ErrorCode::Chain02FetchDegraded.code_str(),
+                stage = "trading_day_flip_exit",
+                "CHAIN-02: the trading-day verdict flipped mid-session — \
+                 exiting today's chain fire loop (a suspend that crossed \
+                 IST midnight is a legitimate cause; remaining minutes \
+                 stay absent, re-fetchable via backfill)"
+            );
             return;
         }
+        // GAP-11: the date this iteration's minute math is stamped with —
+        // the boundary-skip forensics guard compares it against a
+        // post-wake re-read (the Groww chain midnight-cross precedent).
+        let iter_date = today_ist();
         let now = ist_secs_of_day_now();
         let Some(fire) = next_fire_after(now, last_fired) else {
             info!("option_chain_1m: past 15:30 IST — today's minute fires complete");
@@ -1706,7 +2532,15 @@ pub async fn run_option_chain_1m(
                  (suspend/clock step?) — skipping this minute"
             );
             let missed = count_missed_boundaries(fire.saturating_sub(60), woke.saturating_sub(1));
-            record_chain_skipped_boundaries(&params, &mut edge, missed, fire);
+            record_chain_skipped_boundaries(
+                &params,
+                &mut edge,
+                &mut audit_writer,
+                &targets,
+                missed,
+                fire,
+                iter_date,
+            );
             if woke > fire {
                 last_fired = Some(
                     (woke.min(tickvault_common::constants::SPOT_1M_REST_LAST_FIRE_SECS_OF_DAY_IST)
@@ -1733,7 +2567,9 @@ pub async fn run_option_chain_1m(
             &targets,
             &mut last_request_ms,
             &mut writer,
+            &mut audit_writer,
             &mut edge,
+            &mut health,
             &mut moneyness_latches,
             fire,
         )
@@ -1760,7 +2596,15 @@ pub async fn run_option_chain_1m(
         // fire can never be fetched — count them loudly + feed the edge.
         let after = ist_secs_of_day_now();
         let missed = count_missed_boundaries(fire, after.saturating_sub(1));
-        record_chain_skipped_boundaries(&params, &mut edge, missed, fire);
+        record_chain_skipped_boundaries(
+            &params,
+            &mut edge,
+            &mut audit_writer,
+            &targets,
+            missed,
+            fire + 60,
+            iter_date,
+        );
         if missed > 0 {
             last_fired = Some(
                 (after.min(tickvault_common::constants::SPOT_1M_REST_LAST_FIRE_SECS_OF_DAY_IST)
@@ -2523,6 +3367,52 @@ mod tests {
         assert!(chain_minute_fully_failed(0, true));
     }
 
+    // ---- GAP-11 forensics row builder (rest_fetch_audit, leg='chain_1m') ----
+
+    #[test]
+    fn test_chain_audit_row_attempts_is_one_and_leg_chain_1m() {
+        let row = build_dhan_chain_audit_row(
+            1_000,
+            0,
+            13,
+            "NIFTY",
+            1,
+            200,
+            1_042,
+            RestFetchOutcome::Ok,
+            "none",
+        );
+        assert_eq!(row.leg, "chain_1m");
+        assert_eq!(row.feed, "dhan");
+        assert_eq!(row.exchange_segment, "IDX_I");
+        // Live-snapshot semantics: ONE request per (minute, underlying) —
+        // the chain has no in-minute re-poll ladder.
+        assert_eq!(row.attempts, 1);
+        assert_eq!(row.security_id, 13);
+        assert_eq!(row.close_to_data_ms, 1_042);
+        // Held-until-flush semantics: the builder always starts at the -1
+        // persist sentinel — `stamp_held_ok_rows` fills the real value
+        // post-flush-ACK (GAP-11).
+        assert_eq!(row.close_to_persist_ms, -1);
+        // The Dhan chain ladder surfaces no per-attempt latency — honest
+        // -1 sentinel (never a fabricated number).
+        assert_eq!(row.fetch_latency_ms, -1);
+        // sid overflow → visible i64::MAX sentinel, never a silent 0.
+        let overflow = build_dhan_chain_audit_row(
+            0,
+            0,
+            u64::MAX,
+            "X",
+            1,
+            0,
+            -1,
+            RestFetchOutcome::Error,
+            "error",
+        );
+        assert_eq!(overflow.security_id, i64::MAX);
+        assert_eq!(overflow.final_http_status, 0);
+    }
+
     /// The expirylist warmup fail-closed contract: with every attempt
     /// failing (unreachable server), the warmup ends `Failed` — never a
     /// guessed expiry, never a resolved set. Real-time (~9 s of constant
@@ -2557,5 +3447,547 @@ mod tests {
                 panic!("transport failure is not an entitlement verdict")
             }
         }
+    }
+
+    // ---- bounded retry + decision ceiling (2026-07-14 hardening) --------------
+
+    /// Test helper: one resolved underlying with a fixed expiry.
+    fn ru(symbol: &'static str, sid: u64) -> ResolvedUnderlying {
+        ResolvedUnderlying {
+            security_id: sid,
+            symbol,
+            expiry: d("2026-07-16"),
+            expiry_str: "2026-07-16".to_string(),
+        }
+    }
+
+    #[test]
+    fn test_chain_retry_allowed_below_ceiling() {
+        assert!(chain_retry_allowed(0));
+        assert!(chain_retry_allowed(1));
+        // The fast path: empties known ~2.8s, retry launch ~5.5s.
+        assert!(chain_retry_allowed(5_500));
+        // The worst timed-out first attempt (P1): 12.5s is still inside.
+        assert!(chain_retry_allowed(12_500));
+        assert!(chain_retry_allowed(
+            (CHAIN_1M_DECISION_CEILING_SECS as i64) * 1_000 - 1
+        ));
+    }
+
+    #[test]
+    fn test_chain_retry_allowed_refused_at_and_past_ceiling() {
+        let ceiling_ms = (CHAIN_1M_DECISION_CEILING_SECS as i64) * 1_000;
+        // The ceiling itself is EXCLUSIVE (a 15.000s launch is refused).
+        assert!(!chain_retry_allowed(ceiling_ms));
+        assert!(!chain_retry_allowed(ceiling_ms + 1));
+        assert!(!chain_retry_allowed(ceiling_ms + 60_000));
+        assert!(!chain_retry_allowed(i64::MAX));
+    }
+
+    #[test]
+    fn test_chain_retry_allowed_refused_negative_elapsed() {
+        // A clock step-back can only produce a negative elapsed — refuse
+        // (the stale-wake machinery owns that shape, never a retry).
+        assert!(!chain_retry_allowed(-1));
+        assert!(!chain_retry_allowed(-15_000));
+        assert!(!chain_retry_allowed(i64::MIN));
+    }
+
+    /// The FINAL fire (the 15:29 candle firing at the 15:30:00 boundary)
+    /// retains FULL retry rights: the ceiling is FIRE-relative (elapsed
+    /// since the minute close), never time-of-day-gated — the same math
+    /// as the tests above, derived here from the real last-fire boundary
+    /// so the final-fire edge case is pinned by name (plan Edge Cases,
+    /// 2026-07-14 adversarial review).
+    #[test]
+    fn test_chain_retry_allowed_final_fire_retains_full_rights() {
+        let close_ms =
+            i64::from(tickvault_common::constants::SPOT_1M_REST_LAST_FIRE_SECS_OF_DAY_IST)
+                * MILLIS_PER_SEC;
+        // 15:30:00 IST — the boundary that targets the 15:29 candle.
+        assert_eq!(close_ms, 55_800_000);
+        // A retry launching at 15:30:05.5 (the fast path) is ALLOWED…
+        assert!(chain_retry_allowed((close_ms + 5_500) - close_ms));
+        // …and one at 15:30:12.5 (worst timed-out first attempt) too.
+        assert!(chain_retry_allowed((close_ms + 12_500) - close_ms));
+        // The ceiling still applies fire-relative: 15:30:15.0 is refused.
+        assert!(!chain_retry_allowed((close_ms + 15_000) - close_ms));
+    }
+
+    /// The launch gate includes the same-key ≥3s gap wait STILL AHEAD of
+    /// the retry: a wall clock inside the ceiling whose pending gap wait
+    /// crosses it is REFUSED — the fetch never launches.
+    #[tokio::test]
+    async fn test_retry_gate_includes_min_gap_wait() {
+        let minute_close_ms = 1_000_000_i64;
+        // 12.6s after the close: inside the 15s ceiling ON ITS OWN…
+        let now_ms = minute_close_ms + 12_600;
+        assert!(chain_retry_allowed(now_ms - minute_close_ms));
+        // …but the same-key stamp 600ms ago forces a 2.4s gap wait, so
+        // the LAUNCH would land at exactly 15.0s — refused.
+        let gap_wait = min_gap_wait_ms(Some(now_ms - 600), now_ms);
+        assert_eq!(gap_wait, 2_400);
+        let elapsed_at_launch = retry_launch_elapsed_ms(now_ms, minute_close_ms, gap_wait);
+        assert_eq!(elapsed_at_launch, 15_000);
+        assert!(!chain_retry_allowed(elapsed_at_launch));
+
+        // The pass itself refuses: fetch is NEVER invoked, the outcome
+        // and the request stamp stay untouched.
+        let targets = vec![ru("NIFTY", 13)];
+        let mut outcomes = vec![(0_usize, ChainFetchOutcome::Empty)];
+        let mut last_request_ms = vec![Some(now_ms - 600)];
+        let mut calls = 0_u32;
+        chain_retry_pass(
+            &mut outcomes,
+            &targets,
+            &mut last_request_ms,
+            minute_close_ms,
+            "9:16 AM",
+            move || now_ms,
+            |_, _| {
+                calls += 1;
+                async move { (ChainFetchOutcome::Empty, 0_i64) }
+            },
+        )
+        .await;
+        assert_eq!(calls, 0, "ceiling-refused retry must never launch");
+        assert_eq!(outcomes[0].1, ChainFetchOutcome::Empty);
+        assert_eq!(last_request_ms[0], Some(now_ms - 600));
+    }
+
+    #[test]
+    fn test_retry_only_for_empty_or_failed_never_entitlement_or_found() {
+        let launchable = 5_000_i64; // well inside the ceiling
+        assert_eq!(
+            chain_retry_decision(&ChainFetchOutcome::Empty, launchable),
+            RetryDecision::Launch
+        );
+        assert_eq!(
+            chain_retry_decision(
+                &ChainFetchOutcome::Failed("send: x".to_string()),
+                launchable
+            ),
+            RetryDecision::Launch
+        );
+        // Found is final — never re-fetched.
+        assert_eq!(
+            chain_retry_decision(
+                &ChainFetchOutcome::Found {
+                    chain: ParsedChain::default(),
+                    close_to_data_ms: 1_500,
+                },
+                launchable
+            ),
+            RetryDecision::Keep
+        );
+        // Entitlement is a day-scoped account verdict — retrying it would
+        // earn the same reject (CHAIN-01 owns the day).
+        assert_eq!(
+            chain_retry_decision(
+                &ChainFetchOutcome::Entitlement("DH-902".to_string()),
+                launchable
+            ),
+            RetryDecision::Keep
+        );
+        // Eligible-but-late is the counted refusal.
+        assert_eq!(
+            chain_retry_decision(&ChainFetchOutcome::Empty, 15_000),
+            RetryDecision::SkippedCeiling
+        );
+    }
+
+    /// A recovered retry REPLACES the first-pass outcome for all
+    /// downstream processing, and stamps the same-key request time.
+    #[tokio::test]
+    async fn test_retry_found_replaces_first_pass_outcome() {
+        let minute_close_ms = 1_000_000_i64;
+        let targets = vec![ru("NIFTY", 13)];
+        let mut outcomes = vec![(0_usize, ChainFetchOutcome::Empty)];
+        // Prior request 4s ago — the gap is already clear.
+        let mut last_request_ms = vec![Some(minute_close_ms)];
+        let mut calls = 0_u32;
+        chain_retry_pass(
+            &mut outcomes,
+            &targets,
+            &mut last_request_ms,
+            minute_close_ms,
+            "9:16 AM",
+            move || minute_close_ms + 4_000,
+            |_, _| {
+                calls += 1;
+                async move {
+                    (
+                        ChainFetchOutcome::Found {
+                            chain: ParsedChain::default(),
+                            close_to_data_ms: 6_000,
+                        },
+                        1_007_000_i64,
+                    )
+                }
+            },
+        )
+        .await;
+        assert_eq!(calls, 1);
+        assert!(matches!(
+            outcomes[0].1,
+            ChainFetchOutcome::Found {
+                close_to_data_ms: 6_000,
+                ..
+            }
+        ));
+        assert_eq!(
+            last_request_ms[0],
+            Some(1_007_000),
+            "the retry stamps the same-key request time"
+        );
+    }
+
+    /// A retry answering with the ENTITLEMENT class is honored — the
+    /// final outcome becomes Entitlement, which the (unchanged) phase-3
+    /// match turns into MinuteVerdict::EntitlementStop exactly like a
+    /// pass-1 entitlement (CHAIN-01 owns the day).
+    #[tokio::test]
+    async fn test_retry_entitlement_outcome_becomes_entitlement_stop() {
+        let minute_close_ms = 1_000_000_i64;
+        let targets = vec![ru("BANKNIFTY", 25)];
+        let mut outcomes = vec![(0_usize, ChainFetchOutcome::Failed("http 500 …".to_string()))];
+        let mut last_request_ms = vec![None];
+        chain_retry_pass(
+            &mut outcomes,
+            &targets,
+            &mut last_request_ms,
+            minute_close_ms,
+            "9:16 AM",
+            move || minute_close_ms + 3_000,
+            |_, _| async move {
+                (
+                    ChainFetchOutcome::Entitlement("DH-902".to_string()),
+                    1_003_000_i64,
+                )
+            },
+        )
+        .await;
+        assert_eq!(
+            outcomes[0].1,
+            ChainFetchOutcome::Entitlement("DH-902".to_string()),
+            "the retry's entitlement verdict replaces the transport failure"
+        );
+        // And an Entitlement outcome is never itself retried.
+        assert_eq!(
+            chain_retry_decision(&outcomes[0].1, 3_000),
+            RetryDecision::Keep
+        );
+    }
+
+    /// The retry pass walks each first-pass outcome exactly once — at
+    /// most ONE retry per underlying per minute, even when every retry
+    /// still fails (a still-failed retry is never re-retried).
+    #[tokio::test]
+    async fn test_at_most_one_retry_per_underlying_per_minute() {
+        let minute_close_ms = 1_000_000_i64;
+        let targets = vec![ru("NIFTY", 13), ru("BANKNIFTY", 25), ru("SENSEX", 51)];
+        let mut outcomes = vec![
+            (0_usize, ChainFetchOutcome::Empty),
+            (
+                1_usize,
+                ChainFetchOutcome::Found {
+                    chain: ParsedChain::default(),
+                    close_to_data_ms: 1_500,
+                },
+            ),
+            (2_usize, ChainFetchOutcome::Failed("send: y".to_string())),
+        ];
+        let mut last_request_ms: Vec<Option<i64>> = vec![None, None, None];
+        let mut called: Vec<&'static str> = Vec::new();
+        chain_retry_pass(
+            &mut outcomes,
+            &targets,
+            &mut last_request_ms,
+            minute_close_ms,
+            "9:16 AM",
+            move || minute_close_ms + 3_000,
+            |target, _| {
+                called.push(target.symbol);
+                async move { (ChainFetchOutcome::Empty, 1_003_000_i64) }
+            },
+        )
+        .await;
+        // Exactly the two eligible underlyings, once each; the Found one
+        // is never re-fetched.
+        assert_eq!(called, vec!["NIFTY", "SENSEX"]);
+        // Still-failed retries keep the FINAL (retry) outcome and are not
+        // retried again within the pass.
+        assert_eq!(outcomes[0].1, ChainFetchOutcome::Empty);
+        assert!(matches!(outcomes[1].1, ChainFetchOutcome::Found { .. }));
+        assert_eq!(outcomes[2].1, ChainFetchOutcome::Empty);
+    }
+
+    // ---- per-underlying not-served tracker (2026-07-14, #1537 mirror) ---------
+
+    const NOT_SERVED_N: u32 = CHAIN_1M_UNDERLYING_NOT_SERVED_THRESHOLD;
+
+    /// The incident shape: ok=2/empty=1 for the full threshold → exactly
+    /// ONE page for the empty underlying at the threshold minute.
+    #[test]
+    fn test_underlying_tracker_pages_at_threshold_with_sibling_ok() {
+        let mut tracker = UnderlyingServedTracker::default();
+        let minute = [("NIFTY", false), ("BANKNIFTY", true), ("SENSEX", true)];
+        for i in 1..NOT_SERVED_N {
+            let actions = tracker.record_minute(&minute);
+            assert_eq!(
+                actions[0],
+                ("NIFTY", UnderlyingEdgeAction::None),
+                "no page below the threshold (counted minute {i})"
+            );
+            assert_eq!(actions[1].1, UnderlyingEdgeAction::None);
+            assert_eq!(actions[2].1, UnderlyingEdgeAction::None);
+        }
+        let actions = tracker.record_minute(&minute);
+        assert_eq!(
+            actions[0],
+            (
+                "NIFTY",
+                UnderlyingEdgeAction::Page {
+                    consecutive: NOT_SERVED_N
+                }
+            )
+        );
+    }
+
+    /// Global-failure minutes (zero served — the escalation edge's class)
+    /// interleaved mid-streak neither count nor reset: the streak
+    /// survives the blip and still pages after the SAME total of counted
+    /// minutes.
+    #[test]
+    fn test_underlying_tracker_global_outage_minute_holds() {
+        let mut tracker = UnderlyingServedTracker::default();
+        let counted = [("NIFTY", false), ("BANKNIFTY", true), ("SENSEX", true)];
+        let global = [("NIFTY", false), ("BANKNIFTY", false), ("SENSEX", false)];
+        for _ in 1..NOT_SERVED_N {
+            assert_eq!(
+                tracker.record_minute(&counted)[0].1,
+                UnderlyingEdgeAction::None
+            );
+            // The interleaved global-outage minute: HOLD for everyone.
+            for &(_, action) in &tracker.record_minute(&global) {
+                assert_eq!(action, UnderlyingEdgeAction::None);
+            }
+        }
+        // The streak survived every HOLD: the NEXT counted minute pages.
+        assert_eq!(
+            tracker.record_minute(&counted)[0].1,
+            UnderlyingEdgeAction::Page {
+                consecutive: NOT_SERVED_N
+            }
+        );
+    }
+
+    /// Recovery after the latch → exactly ONE Recover carrying the
+    /// episode length, latch cleared, and a NEW streak can page again.
+    #[test]
+    fn test_underlying_tracker_recovery_resets_and_pings_once() {
+        let mut tracker = UnderlyingServedTracker::default();
+        let counted = [("NIFTY", false), ("BANKNIFTY", true)];
+        for _ in 0..NOT_SERVED_N {
+            tracker.record_minute(&counted);
+        }
+        // Two more counted minutes while latched (episode length grows).
+        tracker.record_minute(&counted);
+        tracker.record_minute(&counted);
+        // NIFTY served again → ONE Recover with the full episode length.
+        let actions = tracker.record_minute(&[("NIFTY", true), ("BANKNIFTY", true)]);
+        assert_eq!(
+            actions[0],
+            (
+                "NIFTY",
+                UnderlyingEdgeAction::Recover {
+                    not_served_minutes: NOT_SERVED_N + 2
+                }
+            )
+        );
+        // A second served minute is NOT a second recovery.
+        let actions = tracker.record_minute(&[("NIFTY", true), ("BANKNIFTY", true)]);
+        assert_eq!(actions[0].1, UnderlyingEdgeAction::None);
+        // A fresh streak pages again at the full threshold.
+        for _ in 1..NOT_SERVED_N {
+            assert_eq!(
+                tracker.record_minute(&counted)[0].1,
+                UnderlyingEdgeAction::None
+            );
+        }
+        assert_eq!(
+            tracker.record_minute(&counted)[0].1,
+            UnderlyingEdgeAction::Page {
+                consecutive: NOT_SERVED_N
+            }
+        );
+    }
+
+    /// Minutes 11+ of a latched episode stay counted but never re-page.
+    #[test]
+    fn test_underlying_tracker_no_double_page_while_latched() {
+        let mut tracker = UnderlyingServedTracker::default();
+        let counted = [("SENSEX", false), ("NIFTY", true)];
+        for _ in 0..NOT_SERVED_N {
+            tracker.record_minute(&counted);
+        }
+        for _ in 0..5 {
+            let actions = tracker.record_minute(&counted);
+            assert_eq!(
+                actions[0].1,
+                UnderlyingEdgeAction::None,
+                "latched episode never re-pages"
+            );
+        }
+    }
+
+    /// An underlying ABSENT from a minute's verdicts (the unwind-build
+    /// join-failure arm) is untouched — a per-underlying HOLD: the streak
+    /// neither advances nor resets.
+    #[test]
+    fn test_underlying_tracker_missing_verdict_is_hold() {
+        let mut tracker = UnderlyingServedTracker::default();
+        let counted = [("NIFTY", false), ("BANKNIFTY", true)];
+        for _ in 1..NOT_SERVED_N {
+            tracker.record_minute(&counted);
+        }
+        // A minute where NIFTY has NO verdict at all (join failure) —
+        // its streak is untouched either way.
+        let actions = tracker.record_minute(&[("BANKNIFTY", true), ("SENSEX", false)]);
+        assert!(actions.iter().all(|&(u, _)| u != "NIFTY"));
+        // The next counted minute completes the ORIGINAL streak: page at
+        // exactly the threshold — the hold neither counted nor reset.
+        assert_eq!(
+            tracker.record_minute(&counted)[0].1,
+            UnderlyingEdgeAction::Page {
+                consecutive: NOT_SERVED_N
+            }
+        );
+    }
+
+    /// The two paging edges are disjoint for the FETCH-failure class: a
+    /// tracker-counted minute requires ok >= 1, which makes the
+    /// escalation edge's fully-failed verdict FALSE for the same minute
+    /// (absent a persist failure); a global-outage minute (the
+    /// escalation's class) is a tracker HOLD.
+    #[test]
+    fn test_underlying_tracker_disjoint_from_escalation_edge() {
+        // Tracker-counted shape: 1 ok + 1 empty → the escalation edge
+        // does NOT count it (fetch class).
+        assert!(!chain_minute_fully_failed(1, false));
+        let mut tracker = UnderlyingServedTracker::default();
+        let actions = tracker.record_minute(&[("NIFTY", false), ("BANKNIFTY", true)]);
+        assert_eq!(actions[0].1, UnderlyingEdgeAction::None); // counted, sub-threshold
+        // Escalation shape: ok == 0 → fully failed, and the tracker HOLDs.
+        assert!(chain_minute_fully_failed(0, false));
+        let mut hold = UnderlyingServedTracker::default();
+        for _ in 0..(NOT_SERVED_N * 2) {
+            for &(_, action) in &hold.record_minute(&[("NIFTY", false), ("BANKNIFTY", false)]) {
+                assert_eq!(action, UnderlyingEdgeAction::None, "global outage = HOLD");
+            }
+        }
+        // The honest documented overlap: persist-failed with ok >= 1
+        // makes the escalation edge count it (M1 gate) WHILE an empty
+        // sibling counts here — two distinct wanted signals.
+        assert!(chain_minute_fully_failed(1, true));
+    }
+
+    // ---- strike-ladder day-max shrink watermark (2026-07-14, log-only) --------
+
+    #[test]
+    fn test_ladder_watermark_ratchets_up() {
+        let mut ladder = LadderWatermark::default();
+        assert_eq!(ladder.observe(100), LadderAction::Normal);
+        assert_eq!(ladder.day_max(), 100);
+        assert_eq!(ladder.observe(150), LadderAction::Normal);
+        assert_eq!(ladder.day_max(), 150);
+        // A smaller (but not shrunk) count never lowers the watermark.
+        assert_eq!(ladder.observe(120), LadderAction::Normal);
+        assert_eq!(ladder.day_max(), 150);
+    }
+
+    #[test]
+    fn test_ladder_shrunk_below_half_day_max() {
+        // The pure predicate: strictly below ⌈day_max/2⌉.
+        assert!(!ladder_shrunk(0, 0), "day-first-Found seeds, never flags");
+        assert!(!ladder_shrunk(100, 50));
+        assert!(ladder_shrunk(100, 49));
+        // Odd day-max: ⌈151/2⌉ = 76 — 76 is fine, 75 is shrunk.
+        assert!(!ladder_shrunk(151, 76));
+        assert!(ladder_shrunk(151, 75));
+        // The watermark emits the FIRST shrunk minute of an episode.
+        let mut ladder = LadderWatermark::default();
+        assert_eq!(ladder.observe(160), LadderAction::Normal);
+        assert_eq!(ladder.observe(60), LadderAction::ShrunkFirst);
+        assert_eq!(ladder.observe(60), LadderAction::ShrunkLatched);
+    }
+
+    /// An all-day-small chain never flags: the day's first Found seeds
+    /// the watermark, and a steady small count stays Normal.
+    #[test]
+    fn test_ladder_day_start_small_never_flags() {
+        let mut ladder = LadderWatermark::default();
+        for _ in 0..10 {
+            assert_eq!(ladder.observe(12), LadderAction::Normal);
+        }
+        assert_eq!(ladder.day_max(), 12);
+    }
+
+    /// One warn per episode: shrunk minutes stay counter-only after the
+    /// first, and a silent (non-shrunk) recovery clears the latch so a
+    /// LATER shrink is a fresh episode.
+    #[test]
+    fn test_ladder_shrunk_latch_once_per_episode_clears_on_recovery() {
+        let mut ladder = LadderWatermark::default();
+        assert_eq!(ladder.observe(200), LadderAction::Normal);
+        assert_eq!(ladder.observe(80), LadderAction::ShrunkFirst);
+        assert_eq!(ladder.observe(70), LadderAction::ShrunkLatched);
+        assert_eq!(ladder.observe(90), LadderAction::ShrunkLatched);
+        // Recovery (>= half the day-max) silently clears the latch…
+        assert_eq!(ladder.observe(150), LadderAction::Normal);
+        // …and a later shrink is a NEW episode (one fresh warn).
+        assert_eq!(ladder.observe(80), LadderAction::ShrunkFirst);
+    }
+
+    // ---- ParsedChain.strike_count (the watermark's input) ----------------------
+
+    #[test]
+    fn test_parse_option_chain_counts_kept_strikes() {
+        let chain = parse_option_chain(SAMPLE_CHAIN).expect("parseable chain");
+        // SAMPLE_CHAIN carries two parseable strikes (25650 two-sided +
+        // 25700.5 with both legs absent — the strike still KEPT).
+        assert_eq!(chain.strike_count, 2);
+        // A zero-strike chain counts zero.
+        let empty = parse_option_chain(r#"{"data": {"last_price": 1.0, "oc": {}}}"#)
+            .expect("empty chain parses");
+        assert_eq!(empty.strike_count, 0);
+    }
+
+    #[test]
+    fn test_parse_strike_count_excludes_invalid_and_truncated() {
+        // Invalid keys are excluded from the kept count.
+        let bad_keys = r#"{"data": {"oc": {
+            "abc": {"ce": {"last_price": 1}},
+            "-5.000000": {"ce": {"last_price": 1}},
+            "100.000000": {"ce": {"last_price": 2}}
+        }}}"#;
+        let parsed = parse_option_chain(bad_keys).expect("parses");
+        assert_eq!(parsed.invalid_strikes, 2);
+        assert_eq!(parsed.strike_count, 1);
+        // Truncated strikes are excluded too: kept == the cap.
+        let mut entries: Vec<String> = Vec::new();
+        for i in 0..(MAX_STRIKES_PER_CHAIN + 3) {
+            entries.push(format!(
+                r#""{}.000000": {{"ce": {{"last_price": 1}}}}"#,
+                10_000 + i
+            ));
+        }
+        let body = format!(r#"{{"data": {{"oc": {{ {} }}}}}}"#, entries.join(","));
+        let parsed = parse_option_chain(&body).expect("parses");
+        assert_eq!(parsed.truncated_strikes, 3);
+        assert_eq!(
+            parsed.strike_count,
+            u32::try_from(MAX_STRIKES_PER_CHAIN).expect("cap fits u32")
+        );
     }
 }

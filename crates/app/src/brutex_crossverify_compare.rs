@@ -18,8 +18,9 @@
 //! Prices compare as integer paise (`(rupees * 100).round()`), matching the
 //! BRUTEX-XVERIFY-01 contract (`.claude/rules/project/
 //! brutex-crossverify-error-codes.md`). Timestamps are IST minute-bucket
-//! nanos — the same representation `cross_verify_1m_boot.rs` uses (IST
-//! wall-clock encoded as epoch seconds × 1e9, NO UTC offset arithmetic).
+//! nanos — the same representation the retired Dhan cross-verify used
+//! (`cross_verify_1m_boot.rs`, deleted PR-C3 2026-07-14: IST wall-clock
+//! encoded as epoch seconds × 1e9, NO UTC offset arithmetic).
 
 use std::collections::{BTreeMap, HashMap};
 
