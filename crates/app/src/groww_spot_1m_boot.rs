@@ -124,9 +124,7 @@ use tickvault_common::sanitize::capture_rest_error_body;
 use tickvault_common::trading_calendar::TradingCalendar;
 use tickvault_core::auth::secret_manager::fetch_groww_access_token;
 use tickvault_core::feed::groww::instruments::stable_index_security_id;
-use tickvault_core::feed::groww::native::watch_reader::{
-    WatchFileDoc, WatchFileKind, parse_watch_file,
-};
+use tickvault_core::feed::groww::watch_reader::{WatchFileDoc, WatchFileKind, parse_watch_file};
 use tickvault_core::instrument::index_extractor::canonicalize_index_symbol;
 use tickvault_core::notification::{NotificationEvent, NotificationService};
 use tickvault_storage::disk_health_watcher::classify_join_exit;
@@ -298,7 +296,7 @@ fn vix_target_from_watch_doc(doc: &WatchFileDoc, expected_date: &str) -> Option<
 // TEST-EXEMPT: thin fs-read shim — the parse + match + fail-closed arms are the pure vix_target_from_watch_doc, unit-tested below.
 fn try_resolve_vix_target(trading_date: NaiveDate) -> Option<GrowwSpotTarget> {
     let date = trading_date.format("%Y-%m-%d").to_string();
-    let path = crate::groww_native_shadow::watch_file_path_for(Path::new(GROWW_DATA_DIR), &date);
+    let path = crate::groww_watch_paths::watch_file_path_for(Path::new(GROWW_DATA_DIR), &date);
     let json = std::fs::read_to_string(&path).ok()?;
     let doc = parse_watch_file(&json).ok()?;
     vix_target_from_watch_doc(&doc, &date)

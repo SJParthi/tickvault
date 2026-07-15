@@ -21,3 +21,4 @@ pub mod proto;
 pub mod shard_cutter;
 pub mod shared_master_writer;
 pub mod subjects;
+pub mod watch_reader;

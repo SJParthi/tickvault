@@ -18,7 +18,7 @@
 //! so a panic can never silently end the shadow capture. Shadow-only: nothing
 //! here touches the production Dhan or Groww-sidecar chains.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Duration;
 
 use tickvault_common::constants::{
@@ -28,32 +28,16 @@ use tickvault_common::constants::{
 use tickvault_common::error_code::ErrorCode;
 use tickvault_core::feed::groww::native::client::run_native_shadow_client;
 use tickvault_core::feed::groww::native::shadow_writer::run_shadow_writer;
-use tickvault_core::feed::groww::native::watch_reader::{build_subject_map, parse_watch_file};
+use tickvault_core::feed::groww::watch_reader::{build_subject_map, parse_watch_file};
 use tracing::{error, info};
 
 /// Backoff between supervisor respawns of a dead runner task.
 const RESPAWN_BACKOFF_SECS: u64 = 5;
 
-/// Grace period past IST midnight before re-reading the watch file, so the
-/// daily watch build (which runs at activation time) has landed.
-const DAY_ROLL_GRACE_SECS: i64 = 120;
-
-/// Today's watch-file path under `cache_dir` — the exact naming the builder
-/// writes (`groww-watch-<YYYY-MM-DD>.json`). Pure.
-#[must_use]
-pub fn watch_file_path_for(cache_dir: &Path, trading_date_ist: &str) -> PathBuf {
-    cache_dir.join(format!("groww-watch-{trading_date_ist}.json"))
-}
-
-/// Seconds until the NEXT session recycle instant (IST midnight + grace) for
-/// a given UTC epoch second. Pure — the day-roll timer is testable math.
-#[must_use]
-pub fn secs_until_day_roll(now_utc_secs: i64) -> u64 {
-    let ist_secs = now_utc_secs + IST_UTC_OFFSET_SECONDS_I64;
-    let ist_midnight_next = (ist_secs.div_euclid(86_400) + 1) * 86_400;
-    let target = ist_midnight_next + DAY_ROLL_GRACE_SECS;
-    u64::try_from(target - ist_secs).unwrap_or(86_400)
-}
+// Re-homed 2026-07-15 (Groww live-feed retirement): the pure watch-path /
+// day-roll primitives now live in `crate::groww_watch_paths` so the KEEP
+// spot-1m REST leg does not depend on this shadow module.
+pub use crate::groww_watch_paths::{secs_until_day_roll, watch_file_path_for};
 
 /// Today's IST date as `YYYY-MM-DD` (computed per loop turn, never frozen at
 /// boot — an overnight run must roll to the new day's watch file).
@@ -164,34 +148,6 @@ async fn run_native_shadow_forever(cache_dir: PathBuf) {
 mod tests {
     use super::*;
 
-    /// The reader-side path matches the builder's naming byte-for-byte
-    /// (`instruments.rs` writes `cache_dir/groww-watch-<date>.json`).
-    #[test]
-    fn test_watch_file_path_for_matches_builder_naming() {
-        let p = watch_file_path_for(Path::new("data/groww"), "2026-07-04");
-        assert_eq!(p, PathBuf::from("data/groww/groww-watch-2026-07-04.json"));
-    }
-
-    /// The day-roll timer targets IST midnight + grace, from any UTC instant.
-    #[test]
-    fn test_secs_until_day_roll() {
-        // 2026-07-03 18:30:00 UTC == IST midnight exactly → next roll is a
-        // full day + grace away.
-        let ist_midnight_utc = 1_783_103_400i64;
-        assert_eq!(
-            secs_until_day_roll(ist_midnight_utc),
-            86_400 + u64::try_from(DAY_ROLL_GRACE_SECS).unwrap_or(0)
-        );
-        // One second before IST midnight → 1s + grace.
-        assert_eq!(
-            secs_until_day_roll(ist_midnight_utc - 1),
-            1 + u64::try_from(DAY_ROLL_GRACE_SECS).unwrap_or(0)
-        );
-        // Result is always positive and bounded by a day + grace.
-        for offset in [0i64, 1, 3_600, 43_200, 86_399] {
-            let s = secs_until_day_roll(ist_midnight_utc + offset);
-            assert!(s >= 1);
-            assert!(s <= 86_400 + u64::try_from(DAY_ROLL_GRACE_SECS).unwrap_or(0));
-        }
-    }
+    // watch_file_path_for / secs_until_day_roll tests moved to
+    // `crate::groww_watch_paths` with the fns (2026-07-15 re-home).
 }
