@@ -110,14 +110,12 @@ pub mod brutex_crossverify_persistence;
 /// EPISODE (disconnect / stall / process death) with the blame verdict
 /// persisted — the month-end "who caused it" system-of-record.
 pub mod feed_episode_audit_persistence;
-pub mod feed_gap_audit_persistence;
 pub mod feed_parity_1m_audit_persistence;
 /// Dual-feed scoreboard (operator 2026-07-10): the per-day per-feed
 /// scoreboard row + the per-instrument coverage detail table.
 pub mod feed_scoreboard_persistence;
 /// Groww auto-scale ladder forensic chain (§34, auto-scale PR-2 Item 8) —
 /// one row per ladder transition; feeds restart rehydration.
-pub mod groww_scale_audit_persistence;
 /// Daily timeframe-consistency verifier (operator 2026-07-13): one row per
 /// finding cell where a stored higher-TF candle disagrees with its
 /// recomputed-from-1m value (TF-VERIFY-01/02).
@@ -153,7 +151,6 @@ pub mod wal_suspension_watcher;
 // Isolated `groww_*` namespace; the Dhan path is untouched.
 pub mod groww_persistence;
 // Groww second-feed 1-minute candle persistence (operator lock §32).
-pub mod groww_candle_persistence;
 // (SP5) The Groww live-vs-backtest 1m parity audit module was MERGED into the
 // unified `feed_parity_1m_audit_persistence` above (one table, `feed` in the
 // DEDUP key). Its empty `groww_cross_verify_1m_audit` table is retained on disk.

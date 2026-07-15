@@ -31,7 +31,6 @@ slo_score_evaluate_degraded = 1000       # <1µs — Wave 3-D Item 13: degraded 
 
 # Silent-feed hardening Item 4 (2026-07-06 incident) — Dhan exchange-lag monitor.
 feed_lag_record_dhan_tick = 100          # <100ns — HOT PATH ring write (dwell check + clock alignment + two relaxed atomic stores + head bump + two relaxed day-histogram RMWs since scoreboard PR-C; zero-alloc, DHAT-ratcheted by dhat_feed_lag_ring.rs). Regression past this means an allocation or a lock entered the per-tick observation.
-feed_lag_record_groww_tick = 100         # <100ns — HOT PATH Groww fold (scoreboard PR-C: capture/staleness classify + ring write + two relaxed day-histogram RMWs; zero-alloc, DHAT-ratcheted by dhat_feed_lag_groww.rs). Same budget class as the Dhan target.
 feed_presence_record = 100               # <100ns — HOT PATH presence fold (scoreboard PR-D: enabled check + minute math + one lock-free papaya read + one relaxed fetch_or; zero-alloc, DHAT-ratcheted by dhat_feed_presence.rs). Same budget class as the feed_lag hot targets — the papaya hash+read dominates.
 feed_lag_p99_window = 5000000            # <5ms — COLD path: publisher p99 over a full 32,768-sample window via select_nth_unstable. Honestly O(N-window), NOT O(1) — runs on the supervised 10s task off the tick thread (cold-budget class; the former tick_gap_scan_gaps_full_universe peer budget retired in PR-C3, 2026-07-14).
 

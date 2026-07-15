@@ -2,7 +2,7 @@
 //! `ticks` ILP row, shared by BOTH live feeds (Dhan + Groww).
 //!
 //! Before C1 the Dhan writer (`tick_persistence::build_tick_row_seq`) and the
-//! Groww writer (`groww_persistence::GrowwLiveTickWriter::append_row`) each
+//! (formerly also the Groww live-tick writer, retired 2026-07-15) each
 //! hand-wrote a near-duplicate `ticks` ILP row. C1 converged that into the one
 //! `tick_row_builder::build_tick_row_for_feed`. This source-scan guard fails the
 //! build if a second hand-written `ticks` row-build path is re-introduced — the
@@ -68,16 +68,8 @@ fn exactly_one_ticks_row_builder_function_exists() {
         "Dhan writer must delegate to the shared `build_tick_row_for_feed`"
     );
 
-    // The Groww writer MUST delegate too — no `.table("ticks")` of its own.
-    let groww = read_src("groww_persistence.rs");
-    let groww_prod = production_region(&groww);
-    assert!(
-        !groww_prod.contains(".table(SHARED_TICKS_TABLE)"),
-        "Groww groww_persistence.rs must NOT hand-build a `ticks` ILP row — it must call the \
-         shared `build_tick_row_for_feed`"
-    );
-    assert!(
-        groww_prod.contains("build_tick_row_for_feed"),
-        "Groww writer must delegate to the shared `build_tick_row_for_feed`"
-    );
+    // The Groww live-tick writer section was RETIRED 2026-07-15 with the
+    // Groww live feed (the writer was deleted; groww_persistence.rs retains
+    // only the shared reconnect-ladder primitives). The shared-builder +
+    // Dhan pins above remain the ratchet.
 }
