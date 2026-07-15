@@ -53,7 +53,8 @@ fn dhat_record_dhan_tick_hot_path_zero_allocation() {
 
     // Pre-init the global ring BEFORE the profiler window so the one-time
     // boxed-array allocation does not count against the hot path (same
-    // pattern as dhat_tick_gap_detector's pre-seed).
+    // pre-seed pattern the retired dhat_tick_gap_detector used —
+    // that suite was deleted in PR-C3, 2026-07-14, with the detector).
     record_dhan_tick(t0_utc_nanos, t0_utc_nanos - 1_000_000, exchange_ist_secs);
 
     // Testing-mode profiler (house pattern — dhat_ws_reader_zero_alloc.rs):

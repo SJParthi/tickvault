@@ -521,13 +521,21 @@ pub fn backfill_minute_nanos(
 /// The const-assert below pins the sweep strictly clear of that window.
 const SPOT_1M_REST_SWEEP_FIRE_SECS_OF_DAY_IST: u32 = 15 * 3600 + 33 * 60 + 30;
 
-// The sweep must clear the cross-verify burst: at least 150 s after the
-// 15:31:00 cross-verify trigger (burst observed through 15:33), and still
-// comfortably before the 16:30 IST box stop.
+/// Historical anchor: the 15:31:00 IST trigger of the RETIRED bulk 1m
+/// cross-verify (`cross_verify_1m_boot.rs`, DELETED in PR-C3 2026-07-14 per
+/// the 2026-07-13 operator retirement directive — the const was relocated
+/// here from that module). The 15:33:30 sweep instant was chosen to clear
+/// that run's observed 429 burst window; the TIMING IS KEPT UNCHANGED — the
+/// burst producer is gone, but the ≥150s margin + the 16:30 box-stop bound
+/// still document why 15:33:30 was chosen.
+const RETIRED_CROSS_VERIFY_TRIGGER_SECS_OF_DAY_IST: u32 = 15 * 3600 + 31 * 60; // 55_860
+
+// The sweep must clear the (retired) cross-verify burst window: at least
+// 150 s after the historical 15:31:00 trigger (burst observed through
+// 15:33), and still comfortably before the 16:30 IST box stop.
 const _: () = assert!(
-    SPOT_1M_REST_SWEEP_FIRE_SECS_OF_DAY_IST
-        >= crate::cross_verify_1m_boot::CROSS_VERIFY_TRIGGER_SECS_OF_DAY_IST + 150,
-    "post-session sweep must clear the 15:31-15:33 cross-verify burst window"
+    SPOT_1M_REST_SWEEP_FIRE_SECS_OF_DAY_IST >= RETIRED_CROSS_VERIFY_TRIGGER_SECS_OF_DAY_IST + 150,
+    "post-session sweep must clear the historical 15:31-15:33 cross-verify burst window"
 );
 const _: () = assert!(
     SPOT_1M_REST_SWEEP_FIRE_SECS_OF_DAY_IST < 16 * 3600 + 30 * 60,
@@ -4009,7 +4017,7 @@ mod tests {
         // through 15:33) and before the 16:30 IST box stop.
         assert!(
             SPOT_1M_REST_SWEEP_FIRE_SECS_OF_DAY_IST
-                >= crate::cross_verify_1m_boot::CROSS_VERIFY_TRIGGER_SECS_OF_DAY_IST + 150
+                >= RETIRED_CROSS_VERIFY_TRIGGER_SECS_OF_DAY_IST + 150
         );
         assert!(SPOT_1M_REST_SWEEP_FIRE_SECS_OF_DAY_IST > SPOT_1M_REST_LAST_FIRE_SECS_OF_DAY_IST);
         assert!(SPOT_1M_REST_SWEEP_FIRE_SECS_OF_DAY_IST < 16 * 3600 + 30 * 60);
@@ -4548,9 +4556,10 @@ mod tests {
     fn test_probe_crossverify_request_byte_equality_fixture() {
         let date = NaiveDate::from_ymd_opt(2026, 7, 14).expect("valid date");
         let spot = spot_1m_day_request_body("13", date).to_string();
-        // The cross-verify call shape (cross_verify_1m_boot::compare_one_target
-        // for an index target): intraday_request_body(sid, segment,
-        // instrument, trading_date, trading_date.succ()).
+        // The (retired — PR-C3 2026-07-14) cross-verify call shape
+        // (`compare_one_target` for an index target):
+        // intraday_request_body(sid, segment, instrument, trading_date,
+        // trading_date.succ()). Kept as the live-proven day-window fixture.
         let next = date.succ_opt().expect("next day");
         let crossverify =
             intraday_request_body("13", SPOT_1M_REST_SEGMENT_IDX_I, "INDEX", date, next)

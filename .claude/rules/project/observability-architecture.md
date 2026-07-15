@@ -67,16 +67,16 @@ fires one edge-latched ERROR per (table, suspension episode) — a merely-DOWN
 QuestDB never fires it, the boot-probe escalation codes own the down-server
 page; recovery = the operator's
 `ALTER TABLE <t> RESUME WAL`, never auto-executed; runbook
-`.claude/rules/project/wal-suspension-error-codes.md`**)**, **CROSS-VERIFY-1M-01 +
-CROSS-VERIFY-1M-02 + TICK-CONSERVE-01 (added 2026-07-14, automation-gaps PR-3**
-— the 2026-07-10 automation audit found all three High post-market audit codes
-were log-sink-only: a 15:31 IST OHLCV mismatch / degraded cross-verify run and a
-15:40 IST tick-conservation residual paged nobody; all three are daily one-shot
-audit findings, so their alarms set `ok_recovery = false` — the auto-OK ~15 min
-after the datapoint ages out can never mean the mismatch/residual was fixed
-(Rule-11); recovery = the next trading day's clean run; runbooks
-`.claude/rules/project/cross-verify-1m-error-codes.md` +
-`.claude/rules/project/tick-conservation-audit-error-codes.md`**)**, **AUTH-GAP-05
+`.claude/rules/project/wal-suspension-error-codes.md`**)**, **TICK-CONSERVE-01
+(added 2026-07-14, automation-gaps PR-3** — the 2026-07-10 automation audit
+found the High post-market audit codes were log-sink-only: a 15:40 IST
+tick-conservation residual paged nobody; a daily one-shot audit finding, so
+its alarm sets `ok_recovery = false` — the auto-OK ~15 min after the
+datapoint ages out can never mean the residual was fixed (Rule-11); recovery
+= the next trading day's clean run; runbook
+`.claude/rules/project/tick-conservation-audit-error-codes.md`. The two
+sibling cross-verify entries added by the same PR retired hours later — see
+"Retired paging entries" below**)**, **AUTH-GAP-05
 (added 2026-07-14, REST-audit gap 01** — SCOPED to the mint-FAILURE arm only
 via `$.cooldown_skip IS FALSE` (the boolean field exists only on that
 emission; IS FALSE additionally excludes the same-day noise-lock H3
@@ -111,7 +111,14 @@ baseline — flagged crates follow-up).
 PR-C2 2026-07-13 — its only ERROR-level emit site (the main-feed
 frame-channel Closed arm in the deleted `connection.rs`) died with the Dhan
 live-WS lane, so the filter could never match again; the tf map entry was
-removed the same day (dated note in `error-code-alarms.tf`).
+removed the same day (dated note in `error-code-alarms.tf`). The
+`cross-verify-1m-01` + `cross-verify-1m-02` filters+alarms (added earlier
+the SAME day by automation-gaps PR-3) were RETIRED PR-C3 2026-07-14 — their
+emit module `cross_verify_1m_boot.rs` was deleted with the Dhan instrument
+chain (the 15:31 IST Dhan live-vs-historical cross-verify has no live side
+to compare — `cross-verify-1m-error-codes.md` retirement banner), so both
+filters could never match again; the tf map entries were removed in the
+same PR (dated note in `error-code-alarms.tf`).
 
 > Removed from the filtered+alarmed set: the Dhan REST canary code
 > (RETIRED 2026-07-14 with its module + both spawn sites + the

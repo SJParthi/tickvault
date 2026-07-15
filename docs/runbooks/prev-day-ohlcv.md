@@ -4,8 +4,11 @@
 > did it actually get yesterday's data for everything?"
 > **Authority:** `.claude/rules/project/live-feed-purity.md` rule 9 (the
 > bounded prev-day fetch).
-> **Code:** `crates/app/src/prev_day_ohlcv_boot.rs`, wired in
-> `crates/app/src/main.rs`.
+> **⚠ RETIRED (PR-C3, 2026-07-14):** the boot-time prev-day OHLCV fetch was
+> retired with the Dhan live-WS lane (operator 2026-07-13) and its module
+> `prev_day_ohlcv_boot.rs` was DELETED — the `prev_day_ohlcv` table is
+> retained (forensic). Content below is historical.
+> **Code (historical):** `prev_day_ohlcv_boot.rs` (deleted).
 > **Sibling:** `docs/runbooks/cross-verify-1m.md` (the post-market twin).
 
 ## TL;DR

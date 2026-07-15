@@ -89,8 +89,6 @@
 //! * `security-id-uniqueness.md` (I-P1-11) — composite `(security_id, exchange_segment)`
 //! * `gap-enforcement.md` (I-P1-08) — constant designated timestamp for UPSERT-one-row tables
 
-#![cfg(feature = "daily_universe_fetcher")]
-
 use std::time::Duration;
 
 use anyhow::Context;

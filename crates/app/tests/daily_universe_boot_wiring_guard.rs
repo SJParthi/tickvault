@@ -8,10 +8,10 @@
 //! orchestrator (`run_daily_universe_boot` + the three lifecycle-table
 //! ensures + the fail-closed §4 halt). The Step-6c call sites DIED with the
 //! Dhan lane: main.rs performs NO Dhan instrument fetch — the retained Dhan
-//! REST pulls run on the HARDCODED `SPOT_1M_REST_INDICES`. The
-//! `daily_universe_boot.rs` MODULE is retained un-consumed pending the
-//! Phase C deletion of the daily-universe fetch chain (scope-lock amendment
-//! §B item 3); its own in-module tests still compile it. The
+//! REST pulls run on the HARDCODED `SPOT_1M_REST_INDICES`. PR-C3
+//! (2026-07-14) then DELETED the `daily_universe_boot.rs` MODULE itself
+//! with the whole daily-universe fetch chain (scope-lock amendment §B
+//! item 3). The
 //! `instrument_lifecycle` / `instrument_lifecycle_audit` /
 //! `instrument_fetch_audit` TABLES survive (SEBI never-delete) and are
 //! ensured/written by the Groww shared-master writer
