@@ -4023,6 +4023,7 @@ name = "tickvault-common"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "arc-swap",
  "arrayvec",
  "aws-lc-rs",
  "aws-lc-sys",
