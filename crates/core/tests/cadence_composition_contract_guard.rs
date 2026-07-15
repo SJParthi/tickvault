@@ -134,6 +134,56 @@ fn test_cadence_gate_module_keeps_global_handle_fns() {
     );
 }
 
+/// The finalize guard call the "never a late Decided" ratchet pins
+/// (TRH-R2-1, 2026-07-15): the exact negated pure-fn gate + early return.
+const LATE_DECIDE_GUARD_NEEDLE: &str = "if !may_decide_at_completion(now_wall, cutoff)";
+
+#[test]
+fn test_cadence_finalize_pins_never_a_late_decided_guard() {
+    // TRH-R2-1 ratchet (2026-07-15): the locked-spec invariant "never a
+    // Decided past the lane cutoff" was previously enforced ONLY by an
+    // untested inline comparison in finalize_if_complete, while the
+    // zero-429 replay's matching assert is satisfied by its own MIRROR
+    // by construction — deleting or inverting the runner guard left the
+    // whole suite green. The comparison now routes through the pure,
+    // unit-pinned `decision::may_decide_at_completion` (boundary
+    // semantics pinned in decision.rs tests), and THIS scan pins the
+    // call site + early return so the guard can neither be deleted nor
+    // bypassed silently.
+    let start = RUNNER_RS
+        .find("fn finalize_if_complete")
+        .expect("TRH-R2-1 ratchet: finalize_if_complete fn is gone from runner.rs");
+    let body = &RUNNER_RS[start..];
+    // Bound the scan at the next top-level fn (the finalize body nests
+    // no `\nfn ` — closures open with `|`).
+    let end = body[1..].find("\nfn ").map_or(body.len(), |i| i + 1);
+    let body = &body[..end];
+    assert!(
+        body.contains(LATE_DECIDE_GUARD_NEEDLE),
+        "TRH-R2-1 ratchet: finalize_if_complete no longer gates on the pure \
+         `may_decide_at_completion(now_wall, cutoff)` — a completion popped \
+         past the lane cutoff could emit a late Decided (locked spec: the \
+         cutoff event owns resolution via honest skip)"
+    );
+    let guard_at = body.find(LATE_DECIDE_GUARD_NEEDLE).expect("checked above");
+    assert!(
+        body[guard_at..].contains("return;"),
+        "TRH-R2-1 ratchet: the late-completion guard arm no longer early- \
+         returns — the decide path is reachable past the cutoff"
+    );
+    // The guard must run BEFORE the decide path (decide_lane is the only
+    // emit door in this fn).
+    let decide_at = body.find("decide_lane(").expect(
+        "TRH-R2-1 ratchet: finalize_if_complete no longer routes through \
+         decide_lane — re-pin the emit door",
+    );
+    assert!(
+        guard_at < decide_at,
+        "TRH-R2-1 ratchet: the late-completion guard must precede the \
+         decide_lane emit door"
+    );
+}
+
 #[test]
 fn test_composition_contract_guard_needles_are_non_vacuous() {
     // Self-test (house convention): prove the needles discriminate — a
@@ -159,4 +209,8 @@ fn test_composition_contract_guard_needles_are_non_vacuous() {
     }
     let mutated_runner = RUNNER_RS.replace("try_acquire_expiry", "ungated_fire");
     assert!(!mutated_runner.contains("try_acquire_expiry"));
+    // TRH-R2-1 needle discriminates: a deleted/inverted guard no longer
+    // matches (an INVERSION rewrites the negated call text too).
+    let mutated_guard = RUNNER_RS.replace(LATE_DECIDE_GUARD_NEEDLE, "if true");
+    assert!(!mutated_guard.contains(LATE_DECIDE_GUARD_NEEDLE));
 }

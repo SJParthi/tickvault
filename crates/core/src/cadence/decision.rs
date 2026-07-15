@@ -188,6 +188,21 @@ impl DecisionLatch {
     }
 }
 
+/// The "never a late Decided" guard (locked spec; TRH-R2-1, 2026-07-15):
+/// TRUE when a lane completion processed at `now_wall_ms` may still run
+/// the decide path — i.e. at/before the lane's staleness cutoff. Past
+/// the cutoff there is NO decide path: the queued cutoff event owns
+/// resolution (honest skip, design §5), and a completion popped after
+/// the cutoff instant (unbiased select race / stalled runner) must
+/// return untouched instead of producing a late Decided. Pure — the
+/// runner's `finalize_if_complete` gates on this exact fn (pinned by
+/// the composition-contract source-scan ratchet), so the guard can
+/// neither be deleted nor inverted without failing the build.
+#[must_use]
+pub fn may_decide_at_completion(now_wall_ms: i64, lane_cutoff_abs_ms: i64) -> bool {
+    now_wall_ms <= lane_cutoff_abs_ms
+}
+
 /// Emit one decision snapshot to the DRY-RUN sink: structured `info!` +
 /// `tv_cadence_decision_total{lane,outcome}` (+ the latency histogram);
 /// a skip additionally fires the coded CADENCE-02 `error!` (Rule 11 — a
@@ -419,5 +434,26 @@ mod tests {
         };
         emit_decision(&decided, false);
         emit_decision(&decided, true);
+    }
+    #[test]
+    fn test_may_decide_at_completion_refuses_past_cutoff() {
+        // TRH-R2-1 (2026-07-15): the "never a late Decided" boundary is
+        // INCLUSIVE at the cutoff instant and refuses one ms past it —
+        // inverting or deleting the runner-side comparison fails here
+        // (plus the composition-contract source-scan pins the call site).
+        const CUTOFF: i64 = 36_006_000; // T + 6000 (the Groww cutoff shape)
+        assert!(may_decide_at_completion(CUTOFF - 1, CUTOFF));
+        assert!(
+            may_decide_at_completion(CUTOFF, CUTOFF),
+            "a completion AT the cutoff instant may still decide (<=, not <)"
+        );
+        assert!(
+            !may_decide_at_completion(CUTOFF + 1, CUTOFF),
+            "one ms past the cutoff must NEVER decide — the cutoff event owns \
+             resolution (honest skip)"
+        );
+        // Degenerate domains stay total: negative wall clocks compare sanely.
+        assert!(may_decide_at_completion(-5, -5));
+        assert!(!may_decide_at_completion(-4, -5));
     }
 }

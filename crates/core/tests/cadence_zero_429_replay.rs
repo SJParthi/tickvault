@@ -592,12 +592,17 @@ fn sim_dhan_cycle(
 
     // Decision: 3 chains + 3 underlying spots (VIX advisory — index 3).
     // MIRRORS the runner's finalize guard ("never a late decision",
-    // runner.rs finalize_if_complete now≤cutoff): only responses
-    // completing AT/BEFORE the cutoff contribute (the ok-flag gates
-    // above), and the Decided emit instant is the ACTUAL completion
-    // instant of the last required leg — never clamped to satisfy the
-    // assertion. Weakening the mirror (dropping the <= cutoff gates)
-    // fails the no-late-decision assert on late-completing permutations.
+    // runner.rs finalize_if_complete → decision::may_decide_at_completion,
+    // now≤cutoff): only responses completing AT/BEFORE the cutoff
+    // contribute (the ok-flag gates above), and the Decided emit instant
+    // is the ACTUAL completion instant of the last required leg — never
+    // clamped to satisfy the assertion. Weakening the mirror (dropping
+    // the <= cutoff gates) fails the no-late-decision assert on
+    // late-completing permutations. HONEST SCOPE (TRH-R2-1, 2026-07-15):
+    // this assert proves the MIRROR, not the runner — the RUNNER-side
+    // guard is pinned by the pure-fn boundary tests in decision.rs plus
+    // the call-site source-scan ratchet in
+    // cadence_composition_contract_guard.rs.
     let complete = chains_ok.iter().all(|c| *c) && spots_ok[..3].iter().all(|s| *s);
     let outcome = if complete {
         SimLaneOutcome {
