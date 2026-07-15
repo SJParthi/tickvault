@@ -14,9 +14,11 @@
 //!   uncertainty precedent).
 //! - Markers are ADVISORY: `rm data/state/daily/*` re-arms a day; no schema,
 //!   no config key.
-//! - Callers write a marker ONLY after a terminal-quality outcome
-//!   (pass / no-data). FAILURE-class outcomes must never write one, so a
-//!   restart re-runs AND re-pages.
+//! - Callers write a marker ONLY after a PASS outcome (G4a, fix round 2:
+//!   `no_data` no longer seals a day — a trading-day no_data can be a
+//!   silently-empty discovery dataset, the PR #1474 blind-since-birth
+//!   class, so a same-day restart must re-run). FAILURE-class outcomes
+//!   must never write one, so a restart re-runs AND re-pages.
 //! - Bounded growth: every write sweeps same-task markers older than
 //!   [`DAILY_MARKER_SWEEP_DAYS`].
 //!
@@ -127,8 +129,11 @@ pub fn daily_marker_exists(task: &str, date_ist: NaiveDate) -> bool {
 
 /// Best-effort "delivered today" marker write (advisory contents: build sha
 /// + the delivered IST date) plus the bounded old-marker sweep. Callers
-/// invoke this ONLY after a terminal-quality (pass / no-data) summary was
-/// dispatched — never on a FAILURE-class outcome.
+/// invoke this ONLY after a PASS summary was dispatched — never on a
+/// FAILURE-class outcome, and (G4a, fix round 2) never on `no_data`
+/// either: a trading-day no_data can be a silently-empty discovery
+/// dataset, so marker-sealing it would hide the day from every same-day
+/// restart's catch-up.
 pub fn write_daily_marker(task: &str, date_ist: NaiveDate) {
     write_marker_in(Path::new(DAILY_MARKER_DIR), task, date_ist);
 }

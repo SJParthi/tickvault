@@ -155,22 +155,35 @@ pub const GROWW_CATCHUP_MARGIN_SECS: u32 = 60;
 /// (`data/state/daily/tf-consistency-YYYY-MM-DD.marker` — Telegram
 /// cleanliness overhaul, coordinator-relayed directive 2026-07-15). ONLY the
 /// `RunCatchUp` arm consults it; the real 15:40 fire (`SleepThenRun`) and
-/// forced runs (`RunNow`) never do, and it is written ONLY after a
-/// terminal-quality (`pass` / `no_data`) summary was dispatched — a
-/// FAILURE-class day re-runs AND re-pages on restart (Rule 11).
+/// forced runs (`RunNow`) never do, and it is written ONLY after a `pass`
+/// summary was dispatched — a FAILURE-class day re-runs AND re-pages on
+/// restart (Rule 11), and a `no_data` day no longer seals it either (G4a,
+/// fix round 2: a trading-day no_data can be a silently-empty discovery
+/// dataset — the PR #1474 blind-since-birth class — so a same-day restart
+/// must re-run, not read "nothing to check" forever).
 const TF_CONSISTENCY_MARKER_TASK: &str = "tf-consistency";
 
 /// Pure notify predicate for the daily summary: a `no_data` day ("nothing to
 /// check" — feeds were off) is LOG-ONLY, never a Telegram card; every other
-/// verdict (pass / mismatch / degraded / blind) notifies. Name + semantics
-/// deliberately match the groww-live-off branch's planned predicate so a
-/// double landing merges as a trivial union.
+/// verdict (pass / mismatch / degraded / blind) notifies.
 ///
 /// F4 (2026-07-15 fix round): a FORCED run (`TICKVAULT_TF_VERIFY_NOW=1`)
 /// ALWAYS notifies, `no_data` included — the catch-up skip message itself
 /// tells the operator to force a run, and a forced run answering with
 /// silence would be a Rule-11 hole. Scheduled/catch-up runs keep `no_data`
 /// log-only.
+///
+/// MERGE-NOTE (G9a, fix round 2 — collision site 1 of 2 with the in-flight
+/// `claude/groww-live-off-rest-only` branch): that branch adds its OWN
+/// `pub(crate) fn should_notify_summary(status_label: &str) -> bool` —
+/// DIFFERENT arity, and its notify arm keeps the original un-tupled
+/// JoinHandle shape. This is NOT a trivial union: git conflicts on both
+/// sites, and resolving toward the 1-arg version silently LOSES the F4
+/// forced-run Rule-11 fix with no test failing on the surviving side.
+/// RESOLUTION RULE for whichever branch lands second: keep THIS 2-arg
+/// forced-aware version — forced runs always notify. (Site 2 is the
+/// `Ok(Ok(Some((s, forced_run))))` notify arm below; see also the plan
+/// file's "Merge coordination" section.)
 #[must_use]
 pub fn should_notify_summary(status_label: &str, forced_run: bool) -> bool {
     forced_run || status_label != "no_data"
@@ -2011,13 +2024,19 @@ pub fn spawn_tf_consistency_tasks(
                         TF_CONSISTENCY_MARKER_TASK,
                         today_ist,
                     ) {
+                        // G11 (fix round 2): name the EXACT honored marker
+                        // path so the operator hint is copy-pasteable.
+                        let marker_path = crate::daily_task_marker::daily_marker_path(
+                            TF_CONSISTENCY_MARKER_TASK,
+                            today_ist,
+                        );
                         info!(
                             marker_date = %today_ist,
+                            marker_path = %marker_path.display(),
                             "tf_consistency: today's summary was already delivered — \
                              honoring the {today_ist} delivery marker and skipping \
-                             the catch-up re-run (remove the day's marker under \
-                             data/state/daily/ or set TICKVAULT_TF_VERIFY_NOW=1 to \
-                             force)"
+                             the catch-up re-run (remove the marker file above or \
+                             set TICKVAULT_TF_VERIFY_NOW=1 to force)"
                         );
                         return Ok(None);
                     }
@@ -2044,6 +2063,14 @@ pub fn spawn_tf_consistency_tasks(
     tokio::spawn(async move {
         match inner.await {
             Ok(Ok(Some((s, forced_run)))) => {
+                // MERGE-NOTE (G9a, fix round 2 — collision site 2 of 2 with
+                // `claude/groww-live-off-rest-only`): that branch
+                // restructures this SAME notify arm around a 1-arg
+                // should_notify_summary and the un-tupled JoinHandle.
+                // RESOLUTION RULE: keep the tupled (summary, forced_run)
+                // shape + the 2-arg predicate — forced runs always notify
+                // (the F4 Rule-11 fix). See the fn doc + the plan file's
+                // "Merge coordination" section.
                 let status_label = s.status_label.clone();
                 // Marker keyed on the VERIFIED (Dhan) date, never blindly
                 // "today" — a forced past-date backfill must not suppress
@@ -2071,18 +2098,45 @@ pub fn spawn_tf_consistency_tasks(
                     // no_data is log-only (2026-07-15): "nothing to check"
                     // must never page — the suppressed send is replaced by
                     // this one visible line (never a silent skip).
-                    info!(
+                    //
+                    // G4b (fix round 2): warn!, not info! — this arm is
+                    // structurally TRADING-DAY-only (scheduled/catch-up
+                    // runs exist only on trading days per
+                    // decide_tf_verify_start; forced runs always notify),
+                    // and a trading-day "nothing to check" while Groww ran
+                    // (every prod day) can also be a silently-empty
+                    // discovery query (the PR #1474 blind-since-birth
+                    // class) — warn! keeps it above the info noise floor.
+                    //
+                    // G4c — RULE-CONTRACT TENSION, recorded deliberately
+                    // (see the plan file's Observability section):
+                    // `tf-consistency-error-codes.md` §3's delivery
+                    // contract reads "the typed TfConsistencySummary
+                    // Telegram (ONE per run — Info only when clean WITH
+                    // coverage or pure no-data)". This suppression
+                    // intentionally deviates for the scheduled/catch-up
+                    // no_data arm per the operator's direct 2026-07-15
+                    // cleanliness escalation — PENDING the rule-file
+                    // supersession the operator must land with a dated
+                    // quote. Rule files are not editable in this PR.
+                    warn!(
                         status = %status_label,
                         dhan_date = %s.dhan_date_ist,
                         groww_date = %s.groww_date_ist,
-                        "tf_consistency: nothing to check today — Telegram summary \
-                         suppressed (log-only; pass, failure and FORCED days \
-                         still notify)"
+                        "tf_consistency: nothing to check today (trading day) — \
+                         Telegram summary suppressed (log-only; pass, failure \
+                         and FORCED days still notify). If the feeds DID run \
+                         today, suspect an empty discovery query."
                     );
                 }
-                // Terminal-quality outcomes ONLY (pass / no_data) mark the
-                // day delivered; mismatch/degraded/blind leave the marker
-                // unwritten so a restart re-runs + re-pages (Rule 11).
+                // G4a (fix round 2): ONLY a "pass" marks the day delivered.
+                // no_data no longer seals the marker — a trading-day
+                // no_data can be a silently-empty discovery dataset (the
+                // PR #1474 class), and marker-sealing it made every
+                // same-day restart's catch-up skip too ("nothing to check"
+                // forever, zero operator signal). mismatch/degraded/blind
+                // ALSO leave the marker unwritten so a restart re-runs +
+                // re-pages (Rule 11).
                 //
                 // F5 HONEST RESIDUAL (fix round 1, 2026-07-15 — timeboxed
                 // decision): `notify()` is spawn-and-return with NO public
@@ -2098,7 +2152,7 @@ pub fn spawn_tf_consistency_tasks(
                 // needs a service.rs completion signal — deliberately not
                 // smuggled into this fix round (see the plan file's
                 // Failure Modes entry).
-                if (status_label == "pass" || status_label == "no_data")
+                if status_label == "pass"
                     && let Some(d) = marker_date
                 {
                     crate::daily_task_marker::write_daily_marker(TF_CONSISTENCY_MARKER_TASK, d);
