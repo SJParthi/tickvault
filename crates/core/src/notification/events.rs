@@ -624,6 +624,32 @@ pub enum NotificationEvent {
         failed_minutes: u32,
     },
 
+    /// Per-underlying not-served detector on the Groww chain leg
+    /// (2026-07-14 — the NIFTY expiry-day vendor-cutoff companion): ONE
+    /// underlying accumulated N consecutive empty/failed minutes in the
+    /// per-minute Groww option-chain pull WHILE the other underlyings
+    /// succeeded in those same minutes — the vendor is not serving THIS
+    /// underlying's chain, not a general outage. Fires ONCE per
+    /// underlying per episode (edge-latched, Rule 4); re-armed only by
+    /// that underlying's own recovery. Severity::High.
+    GrowwChain1mUnderlyingNotServed {
+        /// The affected underlying (a pinned plain symbol, e.g. "NIFTY").
+        underlying: &'static str,
+        /// How many counted minutes in a row this underlying's chain
+        /// went unserved.
+        empty_minutes: u32,
+    },
+
+    /// A previously-not-served underlying's chain is being served again
+    /// (falling edge — one Info ping; the missing minutes stay absent
+    /// until re-pulled, never fabricated).
+    GrowwChain1mUnderlyingServedRecovered {
+        /// The recovered underlying (a pinned plain symbol, e.g. "NIFTY").
+        underlying: &'static str,
+        /// How many counted minutes the underlying's chain went unserved.
+        empty_minutes: u32,
+    },
+
     /// The Groww chain leg could not resolve today's option expiry for one
     /// or more underlyings from the daily instruments list (list download
     /// failed after bounded tries, or the list carried no usable option
@@ -2127,11 +2153,13 @@ impl NotificationEvent {
             | Self::StaticIpBootCheckRetrying { .. }
             | Self::DualInstanceDetected { .. }
             // ── Dhan-scoped: order path (Dhan is the only broker with
-            //    orders) ──
+            //    orders; RiskHalt joins per cluster-C 2026-07-14 — the
+            //    risk engine halts the Dhan order path) ──
             | Self::OrderRejected { .. }
             | Self::CircuitBreakerOpened { .. }
             | Self::CircuitBreakerClosed
             | Self::RateLimitExhausted { .. }
+            | Self::RiskHalt { .. }
             | Self::OrphanPositionDetected { .. }
             | Self::OrphanPositionsClean => Some(FeedBadge::Dhan.badge()),
             // ── Groww-scoped ──
@@ -2762,6 +2790,45 @@ impl NotificationEvent {
                      again as of {minute_ist} IST, after {failed_minutes} \
                      failed minute(s). The minutes that failed stay blank in \
                      the record until re-pulled — nothing is made up."
+                )
+            }
+            Self::GrowwChain1mUnderlyingNotServed {
+                underlying,
+                empty_minutes,
+            } => {
+                format!(
+                    "\u{1f198} <b>Groww is not returning the option chain \
+                     for {underlying}</b>\n\
+                     For {empty_minutes} minutes in a row the per-minute \
+                     option chain for {underlying} came back empty from \
+                     Groww while the other indices came through fine — the \
+                     other indices are unaffected, so this looks like the \
+                     broker not serving THIS index's chain, not a general \
+                     outage.\n\
+                     Live streaming prices are NOT affected — only Groww's \
+                     per-minute option chain record for {underlying} is \
+                     missing; the same minutes may still be available from \
+                     the Dhan side.\n\
+                     What to do RIGHT NOW:\n\
+                     1. Nothing urgent — the other indices keep recording \
+                     normally.\n\
+                     2. On an expiry day this is usually the broker cutting \
+                     off the expiring chain early — it comes back with the \
+                     next expiry.\n\
+                     3. Missing minutes stay blank — nothing is made up."
+                )
+            }
+            Self::GrowwChain1mUnderlyingServedRecovered {
+                underlying,
+                empty_minutes,
+            } => {
+                format!(
+                    "\u{2705} <b>Groww is serving the option chain for \
+                     {underlying} again</b>\n\
+                     The per-minute option chain for {underlying} is working \
+                     again after {empty_minutes} empty minute(s). The \
+                     minutes that were missed stay blank in the record until \
+                     re-pulled — nothing is made up."
                 )
             }
             Self::GrowwChain1mExpiryUnresolved { detail } => {
@@ -3773,8 +3840,10 @@ impl NotificationEvent {
             Self::CircuitBreakerOpened {
                 consecutive_failures,
             } => {
+                // Cluster-C (2026-07-14): self-heal line appended so the
+                // operator knows no action is needed if a CLOSED follows.
                 format!(
-                    "<b>Circuit breaker OPENED</b>\nConsecutive failures: {consecutive_failures}\nOrder API calls halted"
+                    "<b>Circuit breaker OPENED</b>\nConsecutive failures: {consecutive_failures}\nOrder API calls halted\nThe system retries by itself in about a minute — if a CLOSED message follows, no action needed."
                 )
             }
             Self::CircuitBreakerClosed => {
@@ -3784,7 +3853,14 @@ impl NotificationEvent {
                 format!("<b>Rate limit EXHAUSTED</b>\nLimit: {limit_type}")
             }
             Self::RiskHalt { reason } => {
-                format!("<b>RISK HALT</b>\nTrading stopped: {}", html_escape(reason))
+                // Cluster-C (2026-07-14): APPEND-style action lines
+                // (Telegram commandment 7 — Critical needs "what to do
+                // RIGHT NOW"); the leading "RISK HALT" literal is kept so
+                // the 4 pinning contains()-tests survive.
+                format!(
+                    "<b>RISK HALT</b>\nTrading stopped: {}\nAll new orders are blocked.\nWhat you need to do RIGHT NOW:\n1. Open the broker app and check open positions.\n2. Decide: exit positions now, or accept no trading for the rest of the day.\n3. Trading stays blocked until the daily reset or a restart.",
+                    html_escape(reason)
+                )
             }
             Self::WebSocketReconnectionExhausted {
                 connection_index,
@@ -3970,6 +4046,10 @@ impl NotificationEvent {
             Self::Spot1mSidServedRecovered { .. } => "Spot1mSidServedRecovered",
             Self::GrowwChain1mFetchDegraded { .. } => "GrowwChain1mFetchDegraded",
             Self::GrowwChain1mFetchRecovered { .. } => "GrowwChain1mFetchRecovered",
+            Self::GrowwChain1mUnderlyingNotServed { .. } => "GrowwChain1mUnderlyingNotServed",
+            Self::GrowwChain1mUnderlyingServedRecovered { .. } => {
+                "GrowwChain1mUnderlyingServedRecovered"
+            }
             Self::GrowwChain1mExpiryUnresolved { .. } => "GrowwChain1mExpiryUnresolved",
             Self::GrowwChain1mProbeVerdict { .. } => "GrowwChain1mProbeVerdict",
             Self::GrowwContract1mFetchDegraded { .. } => "GrowwContract1mFetchDegraded",
@@ -4344,6 +4424,8 @@ impl NotificationEvent {
             Self::Spot1mSidServedRecovered { .. } => Severity::Info,
             Self::GrowwChain1mFetchDegraded { .. } => Severity::High,
             Self::GrowwChain1mFetchRecovered { .. } => Severity::Info,
+            Self::GrowwChain1mUnderlyingNotServed { .. } => Severity::High,
+            Self::GrowwChain1mUnderlyingServedRecovered { .. } => Severity::Info,
             // One page per day when an underlying's chain recording could
             // not start (never a guessed expiry) — actionable, not fatal.
             Self::GrowwChain1mExpiryUnresolved { .. } => Severity::High,
@@ -6372,6 +6454,9 @@ mod tests {
         let msg = event.to_message();
         assert!(msg.contains("OPENED"));
         assert!(msg.contains("halted"));
+        // Cluster-C (2026-07-14): the self-heal line — a lone OPENED page
+        // must tell the operator the system retries on its own.
+        assert!(msg.contains("retries by itself"));
         assert_eq!(event.severity(), Severity::High);
     }
 
@@ -6383,7 +6468,49 @@ mod tests {
         let msg = event.to_message();
         assert!(msg.contains("RISK HALT"));
         assert!(msg.contains("daily_loss_breach"));
+        // Cluster-C (2026-07-14): Critical bodies carry action lines
+        // (Telegram commandment 7).
+        assert!(msg.contains("What you need to do RIGHT NOW"));
+        assert!(msg.contains("All new orders are blocked"));
         assert_eq!(event.severity(), Severity::Critical);
+    }
+
+    /// Cluster-C (2026-07-14): the 5 OMS/risk events are Dhan-badged —
+    /// orders are Dhan-only today, so their pages must carry the same
+    /// feed badge as the order-update WS lifecycle events.
+    #[test]
+    fn test_oms_risk_events_are_dhan_badged() {
+        let events = [
+            NotificationEvent::OrderRejected {
+                correlation_id: "X".to_string(),
+                reason: "bad".to_string(),
+            },
+            NotificationEvent::CircuitBreakerOpened {
+                consecutive_failures: 3,
+            },
+            NotificationEvent::CircuitBreakerClosed,
+            NotificationEvent::RateLimitExhausted {
+                limit_type: "per_second".to_string(),
+            },
+            NotificationEvent::RiskHalt {
+                reason: "x".to_string(),
+            },
+        ];
+        for event in events {
+            let badge = event
+                .feed_badge()
+                .unwrap_or_else(|| panic!("{} must be feed-badged", event.topic()));
+            assert!(
+                badge.contains("DHAN"),
+                "{} must carry the Dhan badge, got {badge}",
+                event.topic()
+            );
+            assert!(
+                event.to_message().starts_with(badge),
+                "{} message must start with the badge",
+                event.topic()
+            );
+        }
     }
 
     #[test]
@@ -8583,6 +8710,51 @@ mod tests {
         assert!(msg.contains("recovered"), "got: {msg}");
         assert!(msg.contains("10:45 AM IST"), "got: {msg}");
         assert!(msg.contains("4 failed"), "got: {msg}");
+        // No false-OK: recovery never claims the missing minutes came back.
+        assert!(msg.contains("nothing is made up"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_groww_chain_1m_underlying_not_served_is_high_names_the_underlying() {
+        let event = NotificationEvent::GrowwChain1mUnderlyingNotServed {
+            underlying: "NIFTY",
+            empty_minutes: 10,
+        };
+        assert_eq!(event.topic(), "GrowwChain1mUnderlyingNotServed");
+        assert_eq!(event.severity(), Severity::High);
+        let msg = event.to_message();
+        // The operator-mandated plain-English core wording.
+        assert!(
+            msg.contains("not returning the option chain for NIFTY"),
+            "got: {msg}"
+        );
+        assert!(msg.contains("other indices are unaffected"), "got: {msg}");
+        assert!(msg.contains("10 minutes in a row"), "got: {msg}");
+        assert!(msg.contains("What to do RIGHT NOW"), "got: {msg}");
+        // Honest scope lines: the live WS pipeline is untouched, and the
+        // Dhan-side availability is stated as MAY (no false-OK — Dhan's
+        // chain leg has its own independent state).
+        assert!(msg.contains("NOT affected"), "got: {msg}");
+        assert!(
+            msg.contains("may still be available from the Dhan side"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_groww_chain_1m_underlying_served_recovered_is_info_positive_ping() {
+        let event = NotificationEvent::GrowwChain1mUnderlyingServedRecovered {
+            underlying: "NIFTY",
+            empty_minutes: 12,
+        };
+        assert_eq!(event.topic(), "GrowwChain1mUnderlyingServedRecovered");
+        assert_eq!(event.severity(), Severity::Info);
+        let msg = event.to_message();
+        assert!(
+            msg.contains("serving the option chain for NIFTY again"),
+            "got: {msg}"
+        );
+        assert!(msg.contains("12 empty"), "got: {msg}");
         // No false-OK: recovery never claims the missing minutes came back.
         assert!(msg.contains("nothing is made up"), "got: {msg}");
     }

@@ -54,54 +54,54 @@ fn test_questdb_reachable_round_trips() {
     );
 }
 
-/// Reads the production `main.rs` source and asserts the dead-signal
-/// regression cannot recur: `spawn_pool_watchdog_task` must take a QuestDB
-/// config AND call `set_questdb_reachable`, AND the Halt arm must read
-/// `health.questdb_reachable()` to feed the bare-reset classifier.
+/// Reads the production `main.rs` source and asserts the /health
+/// `questdb_reachable` flag keeps a PRODUCTION writer.
+///
+/// PR-C2 (2026-07-13): the Dhan pool watchdog — the original writer this
+/// guard pinned — is DELETED with the Dhan live-WS lane (operator
+/// retirement directive; websocket-connection-scope-lock.md "2026-07-13
+/// Amendment"). The flag's writer re-homed into the process-shared
+/// observability task (`run_slow_boot_observability`), whose 2s QuestDB
+/// /exec ping is now CADENCE-driven (a select! interval arm) and writes
+/// `health.set_questdb_reachable(connected)` on every ping. Without a
+/// production writer, `GET /health` (and overall_status) would report
+/// QuestDB down FOREVER — the Rule-11 false-degraded this guard exists
+/// to prevent.
 #[test]
-fn test_pool_watchdog_sets_questdb_reachable_from_production() {
+fn test_observability_task_sets_questdb_reachable_from_production() {
     let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     path.pop(); // crates/api -> crates
     path.push("app/src/main.rs");
     let src =
         std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
 
-    // The whole `set_questdb_reachable` call-site search must find at least
-    // one occurrence OUTSIDE a `#[cfg(test)]` module — main.rs has no
-    // `#[cfg(test)]` setter, so any hit here is a production call site.
+    // A production call site must exist — main.rs has no #[cfg(test)]
+    // setter, so any hit is a production write.
     assert!(
-        src.contains("set_questdb_reachable"),
-        "Fix-A-no-op-close regression: `spawn_pool_watchdog_task` no longer \
-         calls `set_questdb_reachable`. Without a production writer, \
-         `health.questdb_reachable()` stays permanently false and the \
-         reconnect-in-place gate (`is_bare_reset_class`) becomes dead code — \
-         the watchdog will exit and re-trigger the Dhan 429 restart storm."
+        src.contains("health.set_questdb_reachable(connected)"),
+        "PR-C2 regression: the observability task no longer writes \
+         `health.set_questdb_reachable(connected)`. Without a production \
+         writer, `health.questdb_reachable()` stays permanently false and \
+         GET /health reports QuestDB down forever (Rule-11 false-degraded)."
     );
 
-    // The watchdog must accept a QuestDB config so it can probe liveness.
+    // The writer must live in the surviving observability task, which must
+    // take the health handle so the wiring is real, not vestigial.
     assert!(
-        src.contains("fn spawn_pool_watchdog_task(")
-            && src.contains("questdb_config: tickvault_common::config::QuestDbConfig"),
-        "Fix-A-no-op-close regression: `spawn_pool_watchdog_task` no longer \
-         takes a `QuestDbConfig`. Without it the watchdog cannot probe \
-         QuestDB liveness to maintain the `questdb_reachable` signal."
+        src.contains("async fn run_slow_boot_observability(")
+            && src.contains("health: tickvault_api::state::SharedHealthStatus"),
+        "PR-C2 regression: `run_slow_boot_observability` no longer accepts \
+         the SharedHealthStatus handle — the questdb_reachable signal has \
+         lost its writer wiring."
     );
 
-    // The watchdog must actually probe QuestDB liveness via the canonical
-    // boot probe (reused, not hand-rolled), so the signal reflects reality.
+    // The ping must be cadence-driven (interval arm), not tick-gated: with
+    // the Dhan live WS retired the tick broadcast has no publisher, so a
+    // recv()-gated ping would never fire and the flag would go blind.
     assert!(
-        src.contains("wait_for_questdb_ready"),
-        "Fix-A-no-op-close regression: the watchdog accepts the QuestDB \
-         config but does not probe QuestDB liveness — a config passed but \
-         never used is the same as not wiring the signal at all."
-    );
-
-    // And the Halt arm must READ the signal back to feed the classifier, so
-    // the production gate actually consumes the wired value.
-    assert!(
-        src.contains("health.questdb_reachable()") && src.contains("is_bare_reset_class("),
-        "Fix A regression: the pool-watchdog Halt arm no longer reads \
-         `health.questdb_reachable()` to feed `is_bare_reset_class`. The \
-         wired signal must be consumed by the gate or it is inert."
+        src.contains("qdb_ping_ticker.tick()"),
+        "PR-C2 regression: the QuestDB health ping is no longer driven by \
+         its own interval — a tick-gated ping starves on the publisher-less \
+         broadcast and the /health flag goes permanently stale."
     );
 }

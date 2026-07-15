@@ -90,20 +90,12 @@ fn run_tick_processor_uses_canonical_secs_of_day_source() {
     );
 }
 
-#[test]
-fn main_rs_call_sites_pass_none_for_tick_enricher() {
-    let src = read("app/src/main.rs");
-    // Both main.rs call sites currently pass None (Phase 2.5 wiring is
-    // foundation-only; production attaches the enricher in a focused
-    // follow-up PR alongside prev_oi_cache load + BootOrderingGate
-    // marks). When that wire-up ships, this test is updated to pin
-    // `Some(...)` instead — drift here = main.rs forgot to update.
-    let count_none_for_enricher = src.matches("tick_enricher").count();
-    assert!(
-        count_none_for_enricher >= 2,
-        "main.rs must reference tick_enricher at both run_tick_processor call sites (slow + fast boot); current matches: {count_none_for_enricher}"
-    );
-}
+// RETIRED (PR-C2, 2026-07-13 — Dhan live-WS lane deletion, operator
+// retirement directive per websocket-connection-scope-lock.md
+// "2026-07-13 Amendment" §B): main_rs_call_sites_pass_none_for_tick_enricher died with the wiring it pinned — the
+// Dhan tick pipeline (frame channel → run_tick_processor → TickEnricher /
+// prev_oi lifecycle enrichment / L14 boot-ordering gate) was deleted from
+// main.rs with the lane; the Groww feed carries its own bridge path.
 
 #[test]
 fn tick_lifecycle_is_built_from_enriched_tick_in_processor() {

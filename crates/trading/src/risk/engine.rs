@@ -462,9 +462,9 @@ impl RiskEngine {
         if !self.halted {
             // ERROR level + typed code (2026-07-14: the previously-uncoded
             // halt error gains `code = RISK-GAP-01` per charter rule 5; the
-            // stale "via Loki → Grafana" routing claim is retired — the
-            // reachable page is the RiskAlertSink → NotificationService
-            // Telegram below, wired by the order runtime).
+            // stale legacy log-routing claim is retired — the reachable
+            // page is the RiskAlertSink → NotificationService Telegram
+            // below, wired by the order runtime).
             error!(
                 code = ErrorCode::RiskGapPreTrade.code_str(),
                 breach = ?breach,

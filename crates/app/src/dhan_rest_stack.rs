@@ -43,16 +43,24 @@
 //! 3. the token renewal loop + the mid-session profile watchdog (SILENT
 //!    since 2026-07-14 — coded errors/counters only; terminal re-mint
 //!    failure pages the family-(c) `AuthenticationFailed` Critical), the
-//!    GAP-02 900s stale-token sweep and the GAP-06 re-homed token-health
-//!    gauge poller (`dhan-rest-only-noise-lock-2026-07-14.md`);
+//!    GAP-02 900s stale-token sweep, the GAP-06 re-homed token-health
+//!    gauge poller (`dhan-rest-only-noise-lock-2026-07-14.md`), and — since
+//!    PR-C2 (2026-07-14) — the 10s /health token-block writer re-homed from
+//!    the deleted lane's `spawn_token_health_writer` (without it GET
+//!    /health would report the token invalid forever);
 //! 4. the per-minute `spot_1m_rest` scheduler and the per-minute
 //!    `option_chain_1m` scheduler / entitlement probe — mirroring
 //!    `main.rs::spawn_post_market_tasks` (incl. the spot→chain sequencing
 //!    watch channel and the existing `[spot_1m_rest]` /
 //!    `[option_chain_1m]` config gates);
-//! **Deliberately NOT spawned:** the WS pool, universe build / CSV
-//! download, prev-day OHLCV, the SLO publisher, the 15:31 cross-verify,
-//! the EOD digest, the orphan-position watchdog — AND, since 2026-07-14
+//! **Deliberately NOT spawned (PR-C2 truth-sync, 2026-07-14):** the
+//! prev-day OHLCV fetch (retained-dormant module — deletes in C3), the EOD
+//! digest (its `EndOfDayDigest` event variant survives emitterless in core;
+//! the emit died with the lane), and the WS pool / universe build / SLO
+//! publisher / the 15:31 cross-verify SPAWN — all DELETED in PR-C2 with the
+//! lane (the cross_verify_1m_boot.rs FILE deletion is C3). The
+//! orphan-position watchdog moved OFF this list in PR-C2 (RE-HOMED into
+//! this stack — see its spawn below). ALSO not spawned, since 2026-07-14
 //! (operator Dhan noise lock, `dhan-rest-only-noise-lock-2026-07-14.md` +
 //! `websocket-connection-scope-lock.md` §A.1), the ORDER-UPDATE WS (the
 //! PR-C1/Q4-i functional-dormant spawn is RETIRED: it opened a daily
@@ -64,18 +72,16 @@
 //! and the REST canary (retired the same day — the spot/chain legs
 //! self-detect REST death via their own escalation edges).
 //!
-//! **Mutual exclusion by construction:** this stack is spawned ONLY from the
-//! Dhan-OFF branch of main.rs (the `else` of `if config.feeds.dhan_enabled`)
-//! AND only when the RAW boot TOML retires the lane
-//! (`FeedRuntimeState::is_dhan_config_enabled() == false`, seeded
-//! PRE-overlay — round-2 FIX A, 2026-07-13). The same raw value makes the
-//! /api/feeds handler 409-refuse a Dhan enable and the runtime cold-start
-//! supervisor refuse a lane start — so the lane's own lock / TokenManager /
-//! post-market seam can never run alongside this stack. On a config-ON boot
-//! whose runtime overlay left Dhan off, this stack does NOT spawn (the lane
-//! is dormant, not retired — a runtime re-enable cold-starts the full lane,
-//! which owns the REST surface via `spawn_post_market_tasks`). A
-//! process-global once-guard additionally rejects a double spawn.
+//! **Single Dhan surface by construction (PR-C2, 2026-07-14):** with the
+//! lane DELETED, this stack is spawned UNCONDITIONALLY from main.rs' single
+//! boot path — there is no Dhan-ON branch left to exclude against. A raw
+//! boot TOML still carrying `dhan_enabled = true` is an illegal
+//! post-retirement config: main.rs logs it loudly and IGNORES it (no lane
+//! exists to start), and the /api/feeds handler 409-refuses a Dhan enable
+//! unconditionally. The pre-C2 mutual-exclusion machinery (spawn gated on
+//! the raw-TOML `is_dhan_config_enabled() == false`, the runtime
+//! cold-start supervisor refusal) died with the lane; a process-global
+//! once-guard still rejects a double spawn.
 //!
 //! **Panic honesty (the TICK-FLUSH-01 precedent):** the release profile sets
 //! `panic = "abort"`, so a panicked bring-up task aborts the PROCESS in
@@ -147,25 +153,25 @@ const DHAN_REST_STACK_TOKEN_RETRY_FLOOR_SECS: u64 = 130;
 /// families). First caller wins; later calls log INFO and return `None`.
 static DHAN_REST_STACK_SPAWNED: AtomicBool = AtomicBool::new(false);
 
-/// Process-global once-guard for the Dhan-REST SCHEDULED TASK FAMILY —
-/// SHARED between the lane path (`main.rs::spawn_post_market_tasks`: REST
-/// spot_1m_rest + option_chain_1m + the lane-only orphan watchdog
-/// / EOD digest / 1m cross-verify) and this REST-only stack's Phase 5
-/// (spot + chain; the canary was retired 2026-07-14).
+/// Process-global once-guard for the Dhan-REST SCHEDULED TASK FAMILY
+/// (spot_1m_rest + option_chain_1m; the REST canary left the family
+/// 2026-07-14 with the Dhan noise lock). PR-C2 (2026-07-14): the lane's
+/// `main.rs::spawn_post_market_tasks` — the guard's original second claimant
+/// — was DELETED with the lane, so this stack's Phase 5 is the SOLE claimant
+/// today.
 ///
-/// INVARIANT (2026-07-13 hostile-review MEDIUM): the family is spawned AT
-/// MOST ONCE per process, WHICHEVER path claims first — so a future
-/// relaxation of the runtime cold-start refusal (or any new path into
-/// `run_dhan_lane_cold_start` → `spawn_post_market_tasks`) can never
-/// double-spawn the spot/chain schedulers alongside this stack's
-/// (double Data-API pulls per minute close, double Telegram). Mutual
-/// exclusion by construction still holds today; this guard makes it
-/// mechanical instead of situational.
+/// INVARIANT (2026-07-13 hostile-review MEDIUM, still binding): the family
+/// is spawned AT MOST ONCE per process, WHICHEVER path claims first — kept
+/// post-C2 as the mechanical tripwire so any FUTURE second spawn path
+/// (e.g. a live-trading re-wire) can never double-spawn the spot/chain
+/// schedulers (double Data-API pulls per minute close, double Telegram).
+/// Sole-claimant by construction today; this guard makes it mechanical
+/// instead of situational.
 static POST_MARKET_TASK_FAMILY_CLAIMED: AtomicBool = AtomicBool::new(false);
 
 /// Claim the shared Dhan-REST task-family once-guard: `true` exactly once
-/// per process (first caller wins). Called by BOTH spawn paths — the
-/// lane's `spawn_post_market_tasks` (main.rs) and this stack's Phase 5.
+/// per process (first caller wins). Sole caller post-C2: this stack's
+/// Phase 5 (the lane's `spawn_post_market_tasks` claimant is deleted).
 #[must_use]
 pub fn claim_post_market_task_family_once() -> bool {
     !POST_MARKET_TASK_FAMILY_CLAIMED.swap(true, Ordering::SeqCst)
@@ -178,7 +184,8 @@ pub struct DhanRestStackParams {
     pub config: Arc<ApplicationConfig>,
     /// Telegram dispatcher (shared strict-init NotificationService).
     pub notifier: Arc<NotificationService>,
-    /// Trading calendar for the spot/chain trading-day gates.
+    /// Trading calendar for the spot/chain trading-day gates + the re-homed
+    /// 15:25 IST orphan-position watchdog.
     pub calendar: Arc<TradingCalendar>,
     /// Runtime feed-state — receives `set_live_token_manager` so the token
     /// gauges read this stack's manager.
@@ -192,7 +199,18 @@ pub struct DhanRestStackParams {
     >,
     /// Shared mark-gate flag (the Groww bridge's per-tick `Relaxed` load).
     pub marks_wanted: Arc<AtomicBool>,
+    /// Shared /health state (PR-C2, 2026-07-13): the stack owns the token
+    /// block writer (`token_remaining_secs` + `token_valid`) — the lane's
+    /// `spawn_token_health_writer` died with the lane, and without a writer
+    /// GET /health would report the token invalid forever.
+    pub health: tickvault_api::state::SharedHealthStatus,
 }
+
+/// Cadence (seconds) of the /health token-block writer (PR-C2 re-home of
+/// the deleted lane's `spawn_token_health_writer` — B3 round-2 lineage).
+/// Matches the former 10s cadence so the /health / READY / EOD token block
+/// stays within the same ≤10s staleness envelope the B3 plan documented.
+const TOKEN_HEALTH_WRITER_INTERVAL_SECS: u64 = 10;
 
 /// Bounded exponential backoff for the stack's retry-forever loops:
 /// 10s → 20s → 40s → 80s → 160s → 300s cap (attempt is 1-based; 0 is
@@ -651,6 +669,34 @@ async fn run_dhan_rest_stack(params: DhanRestStackParams) {
         "Dhan REST-only stack: stale-token sweep spawned (silent renewal-loop backstop)"
     );
 
+    // PR-C2 (2026-07-13): the 10s /health token-block writer re-homes HERE
+    // from the deleted lane's `spawn_token_health_writer` (B3 round-2
+    // lineage) — `token_remaining_secs` + `token_valid`, AND-composed with
+    // the profile-truth flag above (the F15 derivation), so GET /health
+    // keeps an honest token verdict on every boot. The Prometheus-side
+    // twin (tv_token_valid / tv_token_remaining_seconds) is the GAP-06
+    // supervised gauge poller above; this writer feeds the /health JSON.
+    let _token_health_writer_handle = {
+        let writer_manager = Arc::clone(&token_manager);
+        let writer_profile = Arc::clone(&token_profile_valid);
+        let writer_health = params.health.clone();
+        tokio::spawn(async move {
+            let mut interval =
+                tokio::time::interval(Duration::from_secs(TOKEN_HEALTH_WRITER_INTERVAL_SECS));
+            loop {
+                interval.tick().await;
+                let secs = writer_manager.seconds_until_expiry();
+                let profile_ok = writer_profile.load(Ordering::Acquire);
+                writer_health.set_token_remaining_secs(secs);
+                // F15 derivation: locally-valid (> 0, fail-closed at the
+                // expiry instant) AND the profile-truth flag — a Dhan-killed
+                // but locally-unexpired token can never read valid.
+                writer_health.set_token_valid(secs > 0 && profile_ok);
+            }
+        })
+    };
+    info!("Dhan REST-only stack: /health token-block writer spawned (10s cadence)");
+
     // -----------------------------------------------------------------------
     // Phase 4: Dhan client-id (the option-chain endpoints need the extra
     // `client-id` header — option-chain.md rule 3). Retry-forever like the
@@ -679,24 +725,26 @@ async fn run_dhan_rest_stack(params: DhanRestStackParams) {
     };
 
     // -----------------------------------------------------------------------
-    // Phase 5: the retained REST subsystems — the EXACT spawn shapes of
-    // main.rs::spawn_post_market_tasks (spot / chain arms only;
-    // orphan watchdog, EOD digest and cross-verify deliberately stay
-    // lane-only per the Phase A scope).
+    // Phase 5: the retained REST subsystems — spot / chain arms (spawn
+    // shapes inherited verbatim from the deleted
+    // main.rs::spawn_post_market_tasks), PLUS the orphan-position watchdog
+    // RE-HOMED here in PR-C2 (below). The EOD digest and the 15:31 1m
+    // cross-verify SPAWNS died with the lane (their retained-dormant
+    // modules delete in C3); the REST canary + the order-update WS spawn
+    // are RETIRED 2026-07-14 (operator Dhan noise lock — see the dated
+    // blocks below).
     // -----------------------------------------------------------------------
-    // Shared once-guard (2026-07-13 hostile-review MEDIUM): claim the
-    // Dhan-REST task family BEFORE spawning it, the SAME guard the lane's
-    // spawn_post_market_tasks claims — so a future relaxation of the
-    // runtime cold-start refusal can never run spot/chain TWICE in
-    // one process. Unreachable today (mutual exclusion by construction);
-    // if it ever fires, the invariant is broken — stay down loudly.
+    // Shared once-guard (2026-07-13 hostile-review MEDIUM; sole claimant
+    // post-C2): claim the Dhan-REST task family BEFORE spawning it — so any
+    // FUTURE second spawn path can never run spot/chain TWICE in one
+    // process. Unreachable today (sole claimant by construction); if it
+    // ever fires, the invariant is broken — stay down loudly.
     if !claim_post_market_task_family_once() {
         error!(
             "Dhan REST-only stack: the Dhan-REST scheduled task family is ALREADY \
-             claimed this process (the lane's spawn_post_market_tasks ran first) — \
-             refusing to double-spawn spot_1m_rest/option_chain_1m; the \
-             lane/stack mutual-exclusion invariant is broken, investigate (the \
-             stack stays DOWN: gauge remains 0)"
+             claimed this process — refusing to double-spawn \
+             spot_1m_rest/option_chain_1m; the sole-claimant invariant is broken, \
+             investigate (the stack stays DOWN: gauge remains 0)"
         );
         return;
     }
@@ -881,14 +929,28 @@ async fn run_dhan_rest_stack(params: DhanRestStackParams) {
         }
     }
 
+    // Phase 0 Item 20 note (merge resolution, 2026-07-14): the 15:25 IST
+    // orphan-position watchdog is NOT spawned from this stack. The PR-C2
+    // branch briefly re-homed it here (Static auth from this stack's token
+    // handle), but main's 2026-07-14 re-home (#1559-era `WatchdogAuth`) put
+    // the single spawn in main.rs's PROCESS-GLOBAL prefix with
+    // `GlobalAtFireTime` fire-time resolution — which covers every boot
+    // shape INCLUDING a stack that PARKED on AlreadyHeld before its token
+    // phase (a Static-in-stack spawn would silently never run there; the
+    // process-global spawn degrades LOUDLY instead). This stack's Phase 2/3
+    // `set_global_token_manager` + `set_live_token_manager` registrations
+    // are what the fire-time resolver finds. One topology, per the
+    // orphan_position_watchdog_wiring_guard contract.
+
     metrics::gauge!("tv_dhan_rest_stack_up").set(1.0);
     info!(
         spot_1m_rest_enabled = config.spot_1m_rest.enabled,
         option_chain_1m_enabled = config.option_chain_1m.enabled,
         option_chain_1m_probe = config.option_chain_1m.probe_and_report,
         "DHAN REST-ONLY STACK UP — lock + token + renewal + silent mid-session watchdog + \
-         token sweep + token-health gauge + spot_1m_rest + option_chain_1m arms spawned \
-         WITHOUT any Dhan WebSocket (operator directives 2026-07-13 + 2026-07-14)"
+         token sweep + token-health gauge + /health token writer + spot_1m_rest + \
+         option_chain_1m arms spawned WITHOUT any Dhan WebSocket (operator directives \
+         2026-07-13 + 2026-07-14; the 15:25 orphan watchdog is process-global in main.rs)"
     );
 
     // M3 (2026-07-14 fix round): with BOTH per-minute legs disabled the

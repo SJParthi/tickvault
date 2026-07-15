@@ -135,25 +135,10 @@ mod tests {
         );
     }
 
-    /// Regression guard: `connection_pool::spawn_all` MUST call
-    /// `defer_until_market_open_ist("main_feed", ...)` inside the per-task
-    /// `tokio::spawn` closure. If anyone removes the gate, this test fails
-    /// at `cargo test` time — before the flap ever reaches prod again.
-    #[test]
-    fn regression_main_feed_pool_wires_the_defer_gate() {
-        let src = include_str!("../../src/websocket/connection_pool.rs");
-        assert!(
-            src.contains("market_hours_gate::defer_until_market_open_ist"),
-            "connection_pool.rs MUST call \
-             crate::websocket::market_hours_gate::defer_until_market_open_ist \
-             before conn.run().await. Off-hours connect flap regression guard."
-        );
-        assert!(
-            src.contains("\"main_feed\""),
-            "connection_pool.rs MUST tag the defer call with ws_kind=\"main_feed\" \
-             so Prometheus can attribute the defer to the main feed pool."
-        );
-    }
+    // PR-C2 (2026-07-13): `regression_main_feed_pool_wires_the_defer_gate`
+    // retired — connection_pool.rs is DELETED with the Dhan live-WS lane
+    // (operator retirement directive). The order-update guard below is the
+    // surviving defer-gate ratchet.
 
     /// Regression guard: `order_update_connection::run_order_update_connection`
     /// MUST call the defer gate at task entry.
