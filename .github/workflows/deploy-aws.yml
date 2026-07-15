@@ -133,9 +133,29 @@ jobs:
           targets: aarch64-unknown-linux-musl
 
       - name: Install ARM64 musl build deps (cmake for aws-lc-rs + musl-tools)
+        # 2026-07-15: ports.ubuntu.com outage killed deploy runs 29430374817/29431100541 — retry then fall back to the Azure-local ports mirror.
         run: |
-          sudo apt-get update
-          sudo apt-get install -y cmake build-essential pkg-config musl-tools musl-dev
+          apt_install() {
+            sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=15 update \
+              && sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=15 \
+                   install -y --no-install-recommends \
+                   cmake build-essential pkg-config musl-tools musl-dev
+          }
+          if apt_install; then
+            exit 0
+          fi
+          echo "::warning::apt failed against the default mirror (ports.ubuntu.com) — switching sources to azure.ports.ubuntu.com and retrying."
+          if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then
+            sudo sed -i 's|://ports\.ubuntu\.com|://azure.ports.ubuntu.com|g' /etc/apt/sources.list.d/ubuntu.sources
+          fi
+          if [ -f /etc/apt/sources.list ]; then
+            sudo sed -i 's|://ports\.ubuntu\.com|://azure.ports.ubuntu.com|g' /etc/apt/sources.list
+          fi
+          if apt_install; then
+            exit 0
+          fi
+          echo "::error::apt install failed on BOTH mirrors (ports.ubuntu.com AND azure.ports.ubuntu.com) — cannot install ARM64 musl build deps."
+          exit 1
 
       - name: Cache cargo registry + target
         uses: actions/cache@v6
