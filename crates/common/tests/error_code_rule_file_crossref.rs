@@ -44,20 +44,9 @@ const TRACKED_PREFIXES: &[&str] = &[
     "STORAGE-GAP-",
     "DH-",
     "DATA-",
-    // §39.3 Portfolio area (2026-07-14): reverse-ratchet the GROWW-PORT-
-    // family so a runbook code without an enum variant fails the build.
-    "GROWW-PORT-",
-    // 2026-07-15 (Groww order fan-out contract stubs): the Smart Orders
-    // (GTT/OCO) family is reverse-tracked the same way, so a digit-shaped
-    // GROWW-OCO- string in rule text always names a real ErrorCode
-    // variant. Starred forms like `GROWW-OCO-*` (the §39.3 area table)
-    // never match: `looks_like_a_code` requires the tail to start with a
-    // digit.
-    "GROWW-OCO-",
-    // Groww order-side margin area (§39.3, 2026-07-15): the reverse-check
-    // now enforces enum variants for every GROWW-MARG-* mentioned in rule
-    // text.
-    "GROWW-MARG-",
+    // Groww orders shared contracts (PR-A0, 2026-07-15) — every GROWW-ORD-NN
+    // referenced in a rule file must have a matching enum variant.
+    "GROWW-ORD-",
 ];
 
 /// Codes mentioned in rule files that intentionally don't have an enum

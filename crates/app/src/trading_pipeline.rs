@@ -125,6 +125,12 @@ pub struct TradingPipelineConfig {
     pub client_id: String,
     /// Token handle for authentication.
     pub token_handle: TokenHandle,
+    /// `[oms_reconcile]` scheduled OMS reconciliation settings (default OFF).
+    pub oms_reconcile: OmsReconcileConfig,
+    /// NSE trading calendar for the reconcile gate (`None` ⇒ weekday-only
+    /// fallback — the pipeline must never fail to spawn over a holiday-list
+    /// parse problem).
+    pub trading_calendar: Option<std::sync::Arc<TradingCalendar>>,
     /// `[exit_orders]` — 🔷 DHAN exit-order layer (Cluster B, 2026-07-14).
     /// The `Signal::Exit` arm routes through
     /// `exit_execution::execute_exit_for_security` with this; disabled
@@ -989,6 +995,23 @@ pub fn init_trading_pipeline(
         },
         client_id: client_id.to_owned(),
         token_handle: token_handle.clone(),
+        oms_reconcile: config.oms_reconcile.clone(),
+        // Calendar-inside-init: build the NSE trading calendar for the
+        // reconcile gate HERE so main.rs stays untouched (both dhan-gated
+        // spawn sites flow through this fn). Err ⇒ weekday-only fallback —
+        // the pipeline must never fail to spawn over a holiday-list parse
+        // problem.
+        trading_calendar: match TradingCalendar::from_config(&config.trading) {
+            Ok(calendar) => Some(std::sync::Arc::new(calendar)),
+            Err(err) => {
+                warn!(
+                    ?err,
+                    "trading calendar unavailable for the reconcile gate — \
+                     falling back to a weekday-only trading-day check"
+                );
+                None
+            }
+        },
         exit_orders: config.exit_orders.clone(),
     };
 

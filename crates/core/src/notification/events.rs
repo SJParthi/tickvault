@@ -1376,6 +1376,84 @@ pub enum NotificationEvent {
         failed_checks_before_recovery: u32,
     },
 
+    // -----------------------------------------------------------------------
+    // Groww REGULAR-orders events (shared contracts PR-A0, operator
+    // authorization 2026-07-14; DORMANT/dry-run only). 10-commandments
+    // compliant, edge-triggered. Emit sites land in later serial Orders PRs.
+    // -----------------------------------------------------------------------
+    /// An order's outcome is UNCERTAIN — a mutation entered the ambiguity
+    /// resolution ladder and we are checking with the broker right now.
+    /// Edge-triggered (once per ambiguity episode). Severity::High.
+    GrowwOrderAmbiguous {
+        /// Local intent id (the `TV…` reference).
+        intent_id: String,
+        /// Which mutation ("place" / "modify" / "cancel").
+        op: &'static str,
+        /// The order's trading symbol.
+        symbol: String,
+    },
+
+    /// We could NOT confirm an order's fate — the resolution ladder exhausted
+    /// its bounded budget. The operator must open the Groww app NOW and check
+    /// the order book. Severity::Critical.
+    GrowwOrderAmbiguityUnresolved {
+        /// Local intent id (the `TV…` reference).
+        intent_id: String,
+        /// Which mutation ("place" / "modify" / "cancel").
+        op: &'static str,
+        /// The order's trading symbol.
+        symbol: String,
+        /// How long the ladder ran before giving up (seconds).
+        elapsed_secs: u64,
+    },
+
+    /// The broker rejected N order(s). Coalesced (one page per window) with a
+    /// plain-English sample reason. Severity::High.
+    GrowwOrderRejected {
+        /// How many rejects this page coalesces.
+        count: u32,
+        /// A plain-English sample rejection reason.
+        sample_reason: String,
+        /// A representative trading symbol.
+        symbol: String,
+    },
+
+    /// A cancel arrived too late — the order FILLED. A position now exists;
+    /// the operator must check it. Severity::High.
+    GrowwOrderCancelLostRace {
+        /// Local intent id (the `TV…` reference).
+        intent_id: String,
+        /// The order's trading symbol.
+        symbol: String,
+        /// The filled quantity that carried through despite the cancel.
+        filled_qty: i64,
+    },
+
+    /// Our order records and the broker's disagree — a reconcile mismatch is
+    /// being surfaced for operator judgment. Severity::High.
+    GrowwOrderReconcileMismatch {
+        /// The mismatch class ("status_drift" / "fill_drift" / "ghost_local"
+        /// / "ghost_broker" / "fill_monotonicity").
+        kind: &'static str,
+        /// How many orders show this mismatch class.
+        count: u32,
+        /// A representative trading symbol.
+        symbol: String,
+    },
+
+    /// Daily paper-mode digest of order activity. Sent ONLY when ≥1 paper
+    /// event occurred (Rule 11 — no false-OK). Severity::Info.
+    GrowwOrdersPaperDigest {
+        /// Orders placed in paper mode today.
+        placed: u32,
+        /// Orders that filled in paper mode today.
+        filled: u32,
+        /// Orders rejected in paper mode today.
+        rejected: u32,
+        /// Orders still open at digest time.
+        open: u32,
+    },
+
     /// W2 PR#5 (2026-07-10, audit follow-up row 15): the configured NSE
     /// holiday calendar's coverage horizon is running out (or already ran
     /// out). The holiday list covers one calendar year at a time and the
@@ -2074,7 +2152,14 @@ impl NotificationEvent {
             | Self::GrowwChain1mProbeVerdict { .. }
             | Self::GrowwContract1mFetchDegraded { .. }
             | Self::GrowwContract1mFetchRecovered { .. }
-            | Self::GrowwContract1mBookUnresolved { .. } => Some(FeedBadge::Groww.badge()),
+            | Self::GrowwContract1mBookUnresolved { .. }
+            // ── Groww-scoped: regular-orders lane (PR-A0) ──
+            | Self::GrowwOrderAmbiguous { .. }
+            | Self::GrowwOrderAmbiguityUnresolved { .. }
+            | Self::GrowwOrderRejected { .. }
+            | Self::GrowwOrderCancelLostRace { .. }
+            | Self::GrowwOrderReconcileMismatch { .. }
+            | Self::GrowwOrdersPaperDigest { .. } => Some(FeedBadge::Groww.badge()),
             // ── WS sleep/wake: badge follows the `feed` field, falling
             //    back to Dhan — the live values are "main"/"order_update"
             //    (both Dhan WebSocket types); a future feed value like
@@ -3738,6 +3823,78 @@ impl NotificationEvent {
                      No action needed unless this recurs."
                 )
             }
+            Self::GrowwOrderAmbiguous {
+                intent_id: _,
+                op,
+                symbol,
+            } => {
+                let symbol = html_escape(symbol);
+                format!(
+                    "⚠️ <b>Order outcome uncertain</b>\n\
+                     We are checking a {op} order for {symbol} with the broker right now."
+                )
+            }
+            Self::GrowwOrderAmbiguityUnresolved {
+                intent_id: _,
+                op,
+                symbol,
+                elapsed_secs,
+            } => {
+                let symbol = html_escape(symbol);
+                let mins = elapsed_secs / 60;
+                format!(
+                    "🆘 <b>Order fate UNCONFIRMED</b>\n\
+                     We could not confirm a {op} order for {symbol} after about {mins} min.\n\
+                     What you need to do RIGHT NOW:\n\
+                     1. Open the Groww app.\n\
+                     2. Check the order book for {symbol}.\n\
+                     3. Cancel or accept that order as needed."
+                )
+            }
+            Self::GrowwOrderRejected {
+                count,
+                sample_reason,
+                symbol,
+            } => {
+                let symbol = html_escape(symbol);
+                let sample_reason = html_escape(sample_reason);
+                format!("⚠️ <b>Broker rejected {count} order(s)</b>\n{symbol}: {sample_reason}")
+            }
+            Self::GrowwOrderCancelLostRace {
+                intent_id: _,
+                symbol,
+                filled_qty,
+            } => {
+                let symbol = html_escape(symbol);
+                format!(
+                    "⚠️ <b>Cancel too late — order FILLED</b>\n\
+                     A cancel for {symbol} arrived after {filled_qty} filled. \
+                     A position now exists — check it in the Groww app."
+                )
+            }
+            Self::GrowwOrderReconcileMismatch {
+                kind,
+                count,
+                symbol,
+            } => {
+                let symbol = html_escape(symbol);
+                format!(
+                    "⚠️ <b>Order records disagree</b>\n\
+                     {count} {symbol} order(s) show a {kind} mismatch between our \
+                     records and the broker — being reconciled."
+                )
+            }
+            Self::GrowwOrdersPaperDigest {
+                placed,
+                filled,
+                rejected,
+                open,
+            } => {
+                format!(
+                    "🟢 <b>Paper orders — daily summary</b>\n\
+                     Placed {placed} · Filled {filled} · Rejected {rejected} · Open {open}"
+                )
+            }
             Self::HolidayCalendarCoverageLow {
                 days_remaining,
                 coverage_end_display,
@@ -3888,6 +4045,12 @@ impl NotificationEvent {
             Self::RealtimeGuaranteeHealthy { .. } => "RealtimeGuaranteeHealthy",
             Self::RealtimeGuaranteeDegraded { .. } => "RealtimeGuaranteeDegraded",
             Self::RealtimeGuaranteeCritical { .. } => "RealtimeGuaranteeCritical",
+            Self::GrowwOrderAmbiguous { .. } => "GrowwOrderAmbiguous",
+            Self::GrowwOrderAmbiguityUnresolved { .. } => "GrowwOrderAmbiguityUnresolved",
+            Self::GrowwOrderRejected { .. } => "GrowwOrderRejected",
+            Self::GrowwOrderCancelLostRace { .. } => "GrowwOrderCancelLostRace",
+            Self::GrowwOrderReconcileMismatch { .. } => "GrowwOrderReconcileMismatch",
+            Self::GrowwOrdersPaperDigest { .. } => "GrowwOrdersPaperDigest",
             Self::HolidayCalendarCoverageLow { .. } => "HolidayCalendarCoverageLow",
             Self::Custom { .. } => "Custom",
             Self::CustomStatus { .. } => "CustomStatus",
@@ -4236,6 +4399,15 @@ impl NotificationEvent {
             Self::BarMismatchCrossCheckFailed { .. } => Severity::Critical,
             Self::StartupComplete { .. } => Severity::Info,
             Self::ShutdownComplete => Severity::Info,
+            // Groww regular-orders lane (PR-A0): the ambiguity-unresolved page
+            // is Critical (open the app NOW); the paper digest is Info; the
+            // rest are High.
+            Self::GrowwOrderAmbiguityUnresolved { .. } => Severity::Critical,
+            Self::GrowwOrdersPaperDigest { .. } => Severity::Info,
+            Self::GrowwOrderAmbiguous { .. }
+            | Self::GrowwOrderRejected { .. }
+            | Self::GrowwOrderCancelLostRace { .. }
+            | Self::GrowwOrderReconcileMismatch { .. } => Severity::High,
             // W2 PR#5 (2026-07-10): the holiday-calendar coverage cliff
             // demands operator action (paste the next NSE circular) — High
             // pages Telegram; the watchdog's per-IST-date latch bounds it

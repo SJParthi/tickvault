@@ -71,16 +71,13 @@ fn test_gate1_groww_orders_config_defaults_all_off() {
         !cfg.live_fire_requested,
         "live_fire_requested must default off — and is inert without Gate 3"
     );
-    // Smart Orders area (2026-07-15): the two new gate BOOLS default off.
-    // (The u64 OCO cadences are design values, not gates — their defaults
-    // are pinned by the config.rs inline defaults test.)
     assert!(
-        !cfg.smart_orders_read,
-        "smart_orders_read must default off (Gate 1)"
+        !cfg.paper_enabled,
+        "paper_enabled must default off (Gate 1)"
     );
-    assert!(
-        !cfg.smart_orders_write,
-        "smart_orders_write must default off (Gate 1)"
+    assert_eq!(
+        cfg.max_order_quantity, 0,
+        "max_order_quantity must default 0 (refuse-all) pending the PR-0′ operator answer"
     );
 }
 
@@ -99,9 +96,7 @@ fn test_gate1_base_toml_groww_orders_keys_all_false() {
         "margin_read",
         "user_read",
         "live_fire_requested",
-        // Smart Orders area (2026-07-15): the two new gate bools ship dark.
-        "smart_orders_read",
-        "smart_orders_write",
+        "paper_enabled",
     ] {
         let false_line = format!("{key} = false");
         let true_line = format!("{key} = true");
@@ -114,6 +109,11 @@ fn test_gate1_base_toml_groww_orders_keys_all_false() {
             "config/base.toml must NOT set `{true_line}` — Gate 1 ships dark."
         );
     }
+    // Non-bool fail-closed cap: refuse-all (0) pending the operator answer.
+    assert!(
+        toml.contains("max_order_quantity = 0"),
+        "config/base.toml [groww_orders] must set `max_order_quantity = 0` (Gate 1 refuse-all)."
+    );
 }
 
 // ---------------------------------------------------------------------------
