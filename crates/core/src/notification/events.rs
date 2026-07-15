@@ -1948,7 +1948,16 @@ fn compact_leg_label(leg: &str) -> &str {
 fn render_pulls_per_leg(rest_legs: &[RestLegScoreLine], feed: &str) -> Option<String> {
     let mut parts: Vec<String> = Vec::new();
     let mut gaps = 0i64;
-    let mut all_clean = true;
+    // R2 (fix round 3): the verdict mark is three-state and never
+    // fabricated — ✅ only when EVERY rendered leg is FULLY counted
+    // (ok >= 0 AND failed >= 0) and failure-free; ⚠️ when any counted
+    // failure / never-recovered gap exists (real trouble wins over
+    // partial data); NO mark when any rendered leg is latency-only or
+    // failed-count-unmeasured (the spot_1m_rest fallback exists exactly
+    // for forensics-writer outages, where failures are invisible — a
+    // green check there was a Rule-11 false-OK).
+    let mut any_failure = false;
+    let mut any_unmeasured = false;
     for l in rest_legs {
         if !l.feed.eq_ignore_ascii_case(feed) {
             continue;
@@ -1958,19 +1967,32 @@ fn render_pulls_per_leg(rest_legs: &[RestLegScoreLine], feed: &str) -> Option<St
         let p99 = (l.close_p99_ms >= 0 && l.close_samples > 0)
             .then(|| render_compact_secs(l.close_p99_ms));
         if l.ok_fetches >= 0 {
-            let total = l.ok_fetches.saturating_add(l.failed_fetches.max(0));
-            let counts = format!("{} {}/{total}", compact_leg_label(&l.leg), l.ok_fetches);
-            parts.push(match p99 {
-                Some(secs) => format!("{counts} ({secs})"),
-                None => counts,
-            });
-            if l.ok_fetches != total {
-                all_clean = false;
+            if l.failed_fetches >= 0 {
+                // Fully counted leg: the only shape that may render x/y.
+                let total = l.ok_fetches.saturating_add(l.failed_fetches);
+                let counts = format!("{} {}/{total}", compact_leg_label(&l.leg), l.ok_fetches);
+                parts.push(match p99 {
+                    Some(secs) => format!("{counts} ({secs})"),
+                    None => counts,
+                });
+                if l.ok_fetches != total {
+                    any_failure = true;
+                }
+            } else {
+                // Failure count unmeasured (-1 sentinel): "x/x" would
+                // imply zero failures — render the ok count alone.
+                let counts = format!("{} {} ok", compact_leg_label(&l.leg), l.ok_fetches);
+                parts.push(match p99 {
+                    Some(secs) => format!("{counts} ({secs})"),
+                    None => counts,
+                });
+                any_unmeasured = true;
             }
         } else if let Some(secs) = p99 {
             // Latency-only fallback leg (G6): the delay WAS measured —
             // render it count-less instead of dropping the measurement.
             parts.push(format!("{} ({secs})", compact_leg_label(&l.leg)));
+            any_unmeasured = true;
         }
         if l.named_gaps > 0 {
             gaps = gaps.saturating_add(l.named_gaps);
@@ -1979,12 +2001,18 @@ fn render_pulls_per_leg(rest_legs: &[RestLegScoreLine], feed: &str) -> Option<St
     if parts.is_empty() {
         return None;
     }
-    let mark = if all_clean && gaps == 0 {
-        "\u{2705}"
+    if gaps > 0 {
+        any_failure = true;
+    }
+    let mut seg = if any_failure {
+        format!("pulls {} \u{26a0}\u{fe0f}", parts.join(", "))
+    } else if any_unmeasured {
+        // Partially-unmeasured day: no verdict mark — the numbers shown
+        // are honest, but a clean/degraded verdict is unknowable.
+        format!("pulls {}", parts.join(", "))
     } else {
-        "\u{26a0}\u{fe0f}"
+        format!("pulls {} \u{2705}", parts.join(", "))
     };
-    let mut seg = format!("pulls {} {mark}", parts.join(", "));
     if gaps > 0 {
         seg.push_str(&format!("; {gaps} never recovered \u{26a0}\u{fe0f}"));
     }
@@ -10136,9 +10164,12 @@ mod tests {
 
     #[test]
     fn test_render_pulls_per_leg_skips_sentinel_legs_and_names_each_leg() {
-        // F3 (2026-07-15 fix round): per-LEG pulls segment — each measured
-        // leg named compactly; `-1` legs render nothing (omission, never a
+        // F3 (2026-07-15 fix round), verdict semantics tightened by R2
+        // (fix round 3): per-LEG pulls segment — each measured leg named
+        // compactly; `-1` legs render nothing (omission, never a
         // fabricated zero); named gaps append the honest warning once.
+        // A failed-unmeasured leg renders "N ok" (never "N/N", which
+        // would imply zero failures) and real failures win the ⚠️ mark.
         let legs = vec![
             RestLegScoreLine {
                 ok_fetches: 10,
@@ -10149,14 +10180,14 @@ mod tests {
             rest_line("Groww", "option chain"), // all -1: skipped
             RestLegScoreLine {
                 ok_fetches: 5,
-                failed_fetches: -1, // failed unmeasured: counts as 0
+                failed_fetches: -1, // failed unmeasured: "5 ok", never 5/5
                 ..rest_line("groww", "option contracts")
             },
         ];
         assert_eq!(
             render_pulls_per_leg(&legs, "Groww"),
             Some(
-                "pulls spot 10/12, contracts 5/5 \u{26a0}\u{fe0f}; \
+                "pulls spot 10/12, contracts 5 ok \u{26a0}\u{fe0f}; \
                  1 never recovered \u{26a0}\u{fe0f}"
                     .to_string()
             )
@@ -10164,8 +10195,8 @@ mod tests {
         // No measured legs for this feed → None (segment omitted).
         assert_eq!(render_pulls_per_leg(&legs, "Dhan"), None);
         assert_eq!(render_pulls_per_leg(&[], "Dhan"), None);
-        // All-clean legs earn the green mark; unknown legs keep their
-        // plain-English name.
+        // All-clean FULLY-COUNTED legs earn the green mark; unknown legs
+        // keep their plain-English name.
         let clean = vec![
             RestLegScoreLine {
                 ok_fetches: 3,
@@ -10181,6 +10212,88 @@ mod tests {
         assert_eq!(
             render_pulls_per_leg(&clean, "Dhan"),
             Some("pulls spot 3/3, expired options 7/7 \u{2705}".to_string())
+        );
+    }
+
+    #[test]
+    fn test_render_pulls_per_leg_never_fabricates_a_verdict_mark() {
+        // R2 (fix round 3): a leg with ANY unmeasured half renders NO
+        // verdict mark — a latency-only day (the forensics-writer-outage
+        // fallback, where failures are invisible) previously rendered a
+        // fabricated green ✅ (Rule-11 false-OK).
+        // (a) Latency-only leg alone: numbers shown, NO mark.
+        let latency_only = vec![RestLegScoreLine {
+            close_p99_ms: 1800,
+            close_samples: 350,
+            ..rest_line("Dhan", "spot candles")
+        }];
+        assert_eq!(
+            render_pulls_per_leg(&latency_only, "Dhan"),
+            Some("pulls spot (1.8s)".to_string())
+        );
+        // (b) Failed-unmeasured leg alone: "N ok", NO /total, NO mark.
+        let failed_unmeasured = vec![RestLegScoreLine {
+            ok_fetches: 735,
+            failed_fetches: -1,
+            close_p99_ms: 1800,
+            close_samples: 700,
+            ..rest_line("Dhan", "spot candles")
+        }];
+        assert_eq!(
+            render_pulls_per_leg(&failed_unmeasured, "Dhan"),
+            Some("pulls spot 735 ok (1.8s)".to_string())
+        );
+        // (c) Mixed clean-counted + latency-only: still NO mark — the
+        // unmeasured leg makes a clean verdict unknowable.
+        let mixed = vec![
+            RestLegScoreLine {
+                ok_fetches: 733,
+                failed_fetches: 0,
+                ..rest_line("Groww", "spot candles")
+            },
+            RestLegScoreLine {
+                close_p99_ms: 2100,
+                close_samples: 400,
+                ..rest_line("Groww", "option chain")
+            },
+        ];
+        assert_eq!(
+            render_pulls_per_leg(&mixed, "Groww"),
+            Some("pulls spot 733/733, chain (2.1s)".to_string())
+        );
+        // (d) Mixed counted-WITH-failures + latency-only: real trouble
+        // wins — the ⚠️ mark renders (honest "known trouble", partial
+        // data notwithstanding).
+        let mixed_failing = vec![
+            RestLegScoreLine {
+                ok_fetches: 700,
+                failed_fetches: 35,
+                ..rest_line("Groww", "spot candles")
+            },
+            RestLegScoreLine {
+                close_p99_ms: 2100,
+                close_samples: 400,
+                ..rest_line("Groww", "option chain")
+            },
+        ];
+        assert_eq!(
+            render_pulls_per_leg(&mixed_failing, "Groww"),
+            Some("pulls spot 700/735, chain (2.1s) \u{26a0}\u{fe0f}".to_string())
+        );
+        // (e) Never-recovered gaps on a latency-only day: ⚠️ + the gap
+        // suffix (a named gap is real, counted trouble).
+        let gaps_latency_only = vec![RestLegScoreLine {
+            close_p99_ms: 1800,
+            close_samples: 350,
+            named_gaps: 3,
+            ..rest_line("Dhan", "spot candles")
+        }];
+        assert_eq!(
+            render_pulls_per_leg(&gaps_latency_only, "Dhan"),
+            Some(
+                "pulls spot (1.8s) \u{26a0}\u{fe0f}; 3 never recovered \u{26a0}\u{fe0f}"
+                    .to_string()
+            )
         );
     }
 
