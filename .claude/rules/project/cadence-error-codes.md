@@ -34,7 +34,12 @@ lane as close to each minute close T as the brokers' rate rules allow:
 - **Dhan chains** pre-fire at T−5000 / T−2000 and post-fire at T+2000 (NIFTY /
   BANKNIFTY / SENSEX), every fire passing a per-underlying AND a global CAS
   min-spacing gate (≥3000 ms — the 1-unique-request-per-3s chain rule held as a
-  structural floor, monotonic domain).
+  structural floor, monotonic domain). CONSERVATIVE combined-denial behavior
+  (R2, 2026-07-15): a chain fire deferred by the 1s COMBINED per-second budget
+  re-fires only after the FULL 3s chain spacing — the already-acquired CAS
+  spacing slots stay CONSUMED on a combined denial (the carried retry instant
+  is the MAX of both constraints) — a deliberate conservative-safe trade (the
+  slower re-fire can never violate the broker window), never a violation.
 - **Dhan spots** (operator spec addition 2026-07-15) fire as 4 single-symbol
   calls grouped by the ADAPTIVE CONCURRENCY LADDER — step 0: all 4
   SIMULTANEOUS at T+3000; degraded steps split 3+1 / 2+2 / fully sequential
@@ -83,11 +88,18 @@ lane as close to each minute close T as the brokers' rate rules allow:
   mid-day. The IST deadline (`expiry_deadline_secs_of_day_ist`, default
   08:55) gates the edge-latched PAGE, never the attempts — a boot after the
   deadline still resolves on its first success, and the background retry
-  continues at the same cadence until session end; a process that BOOTS
+  continues at the same cadence until session end; IN-SESSION retry waves
+  anchor at MID-MINUTE (:30 — `next_expiry_wave_instant_ms`, R1 2026-07-15),
+  maximally far from the Dhan :55–:05 burst region and the Groww :00–:03
+  waves, so a vendor-outage retry cadence can never phase-lock into the
+  burst window and evict a NOMINAL fire from the combined budget (the L2
+  expiry gate stays the backstop); a process that BOOTS
   after the deadline requires ≥2 consecutive failed attempt waves
   (`POST_DEADLINE_BOOT_MIN_FAILED_WAVES`) before the page fires — never the
   first-wave hair trigger (E4, 2026-07-15; the pre-deadline path is
-  unchanged). The read facade the runner stamps requests from is
+  unchanged), and those waves count REAL dispatched attempts per
+  (broker, underlying) pair only (R3, 2026-07-15 — disabled-lane and
+  gate-deferred/conceded iterations never advance the threshold). The read facade the runner stamps requests from is
   DAY-CHECKED (E1 fix, 2026-07-15): the IST trading day is threaded from
   the injected clock into every `resolved_expiry` call, so a process
   crossing IST midnight whose morning re-resolution keeps FAILING stamps
@@ -149,7 +161,7 @@ EXCEPT `rate_limited`, which fires per-request by design (see below):
 | `chain_embedded_spot` | third-rung provenance: the chain response's own embedded underlying spot filled the cell (own path exhausted first, as above) |
 | `moneyness_unknown` | ≥1 underlying's fold classified Unknown (spot unusable / rows unclassifiable / registry snapshot refused by the decide-time guard: unconfirmed publish, wrong minute, stale, or the boot sentinel) |
 | `queue_delay` | a fetch was refused by the SHARED `dhan_data_api_limiter`'s queue deadline (SELF-INFLICTED pacing — our own defense-in-depth limiter, not the broker; F1(iii) 2026-07-15). Stage-tagged distinctly, NEVER folded into `fetch_failed`, NEVER arms any ladder |
-| `expiry_unresolved` | TWO emission points share this stage: (a) the per-cycle coalesced flag — ≥1 chain request was stamped `expiry_yyyymmdd = None` (the day-locked store has no policy date yet; the scheduler NEVER guesses — the executor impl may fall back to its warmup expiry; ALWAYS present in dry-run, where every expiry-list fetch returns Empty); (b) the resolution loop's EDGE-LATCHED deadline page — ONE `error!` per (broker, underlying) per IST day the instant `expiry_deadline_secs_of_day_ist` (default 08:55) passes unresolved; the lanes run degraded meanwhile and the background retry continues at `expiry_retry_interval_ms` until session end (the deadline gates the PAGE, never the attempts, and a post-deadline BOOT requires ≥2 consecutive failed waves before the page — E4, 2026-07-15). FALLING EDGE (E3, 2026-07-15): a LATER successful resolution for a pair whose page HAD fired emits one coded recovery `info!` (`stage = "expiry_resolved_late"` on the same CADENCE-01 code — no new variant) + `tv_cadence_expiry_resolved_late_total{broker, underlying}`, at most once per pair per day (first write wins) |
+| `expiry_unresolved` | TWO emission points share this stage: (a) the per-cycle coalesced flag — ≥1 chain request was stamped `expiry_yyyymmdd = None` (the day-locked store has no policy date yet; the scheduler NEVER guesses — the executor impl may fall back to its warmup expiry; ALWAYS present in dry-run, where every expiry-list fetch returns Empty); (b) the resolution loop's EDGE-LATCHED deadline page — ONE `error!` per (broker, underlying) per IST day the instant `expiry_deadline_secs_of_day_ist` (default 08:55) passes unresolved; the lanes run degraded meanwhile and the background retry continues at `expiry_retry_interval_ms` until session end (the deadline gates the PAGE, never the attempts, and a post-deadline BOOT requires ≥2 consecutive failed waves before the page — E4, 2026-07-15; R3, 2026-07-15: waves count REAL dispatched attempts per pair only — a disabled-lane or gate-deferred iteration never advances the threshold). FALLING EDGE (E3, 2026-07-15): a LATER successful resolution for a pair whose page HAD fired emits one coded recovery `info!` (`stage = "expiry_resolved_late"` on the same CADENCE-01 code — no new variant) + `tv_cadence_expiry_resolved_late_total{broker, underlying}`, at most once per pair per day (first write wins) |
 | `expiry_disagreement` | both brokers resolved the day's policy expiry for one underlying and the dates DIFFER — **Dhan WINS for keying BOTH lanes** (exchange-sourced expirylist authority); edge-latched ONCE per (underlying, day); both raw dates ride the payload + the store's provenance view (`tv_cadence_expiry_disagreement_total{underlying}`) |
 | `expiry_rate_limited` | an expiry-list fetch returned a broker 429 (verifier L2, 2026-07-15 — was `debug!`-only): one coded `warn!` per occurrence + `tv_cadence_expiry_rate_limited_total{broker}`; never blind-retried in-wave — the next `expiry_retry_interval_ms` wave re-attempts THROUGH the gates. Dhan expiry fires pass `DhanGates::try_acquire_expiry` (the L1 COMBINED 5-per-rolling-second budget + a 1-per-rolling-second expiry spacing) BEFORE dispatch, so a Dhan expiry 429 despite the gates is a gate-bug / shared-budget-co-tenant signal; a gate deferral skips the fire to the next wave (`tv_cadence_expiry_gate_deferred_total{broker}` — a deferral, never a violation). Groww expiry fires stay ungated by design (no Groww rate rule) |
 | `ladder_exhausted` | the failure ladder hit its max rung (5) — edge-latched ONCE per episode, re-armed by a clean cycle |
@@ -323,6 +335,18 @@ envelope per Groww cycle: ≤ 7 burst + ≤ 7 fallback = ≤ 14, with the fallba
 now bounded to GENUINELY-FAILED legs only — a slow-broker cycle no longer
 doubles a leg. Pinned by
 `test_groww_verdict_skips_inflight_leg_never_duplicates`.
+
+Two honesty notes on the deferred-fallback composition (R6/R7, dated
+2026-07-15): (a) an in-flight-skipped leg whose original request completes
+`RateLimited` gets its ONE deferred fallback dispatched at that completion
+instant — a zero-delay single bounded retry against a broker that just
+429'd (Groww lane only; Groww documents no rate rule, and the retry is
+bounded to exactly 1 per leg per cycle — never a storm); (b) deferred
+fallbacks run CONCURRENTLY with the deliberately-sequential verdict-fallback
+pass — they target DIFFERENT legs by construction (a leg is either
+verdict-failed or in-flight-skipped, never both), so no duplicate fire is
+possible, but this is a documented deviation from the strict
+second-1/second-2 fallback shape.
 
 ## §3d. Any-failure ladder arming — Assumed, amplitude-1 oscillation accepted (verifier F7, dated 2026-07-15)
 
