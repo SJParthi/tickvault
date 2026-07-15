@@ -378,51 +378,17 @@ fn storage_exposes_o1_warm_primitives() {
     );
 }
 
-#[test]
-fn boot_timing_proof_is_measured_and_surfaced() {
-    // The whole instrument load (fetch→build→reconcile) MUST be wall-clocked
-    // and carried back on the boot outcome, so the O(1) warm path has REAL
-    // daily evidence (not just a code-comment claim).
-    let boot = src("crates/app/src/daily_universe_boot.rs");
-    assert!(
-        boot.contains("use std::time::Instant;")
-            && boot.contains("let boot_timer = Instant::now();")
-            && boot.contains("pub elapsed_ms: u64"),
-        "run_daily_universe_boot must time the load and expose elapsed_ms"
-    );
-    assert!(
-        boot.contains("u64::try_from(boot_timer.elapsed().as_millis())"),
-        "elapsed_ms must be set from the boot_timer in the outcome construction"
-    );
-
-    // main.rs must surface the timing 3 ways: structured INFO log, Prometheus
-    // gauges (graphable trend), and an operator-facing Telegram line.
-    let main = src("crates/app/src/main.rs");
-    assert!(
-        main.contains("tv_instrument_load_duration_ms")
-            && main.contains("tv_instrument_load_warm_skipped")
-            && main.contains("tv_instrument_load_total_rows"),
-        "main.rs must emit the 3 boot-timing Prometheus gauges"
-    );
-    // 2026-07-09 (operator escalation — Telegram noise N3): the standalone
-    // boot-timing Telegram essay was DEMOTED to a structured log line; the
-    // operator-facing instrument count lives on the boot bubble's
-    // Instruments line. The pure formatter + its sentinel guard stay.
-    assert!(
-        main.contains("fn format_instrument_load_telegram")
-            && main.contains("demoted from Telegram 2026-07-09"),
-        "main.rs must log the boot-timing line via the pure formatter (demoted, log-only)"
-    );
-    assert!(
-        main.contains("O(1) warm-path proof"),
-        "the structured INFO log must label the O(1) warm-path proof"
-    );
-    // Sentinel-guard: Indices4Only (no daily fetch) must emit no Telegram.
-    assert!(
-        main.contains("if elapsed_ms == u64::MAX") || main.contains("== u64::MAX"),
-        "the formatter must suppress the Telegram when timing was not measured"
-    );
-}
+// RETIRED 2026-07-14 (PR-C2 — Dhan live-WS lane deletion): the
+// `boot_timing_proof_is_measured_and_surfaced` test pinned the boot-timing
+// surfacing chain (`tv_instrument_load_*` gauges + the demoted Telegram
+// formatter) that lived in main.rs' deleted Dhan boot arms. With the lane
+// gone, main.rs no longer runs the daily-universe boot and no longer emits
+// those gauges — the pins can never hold again. The dormant
+// `daily_universe_boot.rs` (still timing the load via `elapsed_ms`) and the
+// WHOLE universe fetch chain — this guard file with it — are deleted in
+// Phase C3 per `websocket-connection-scope-lock.md` "2026-07-13 Amendment"
+// §B item 3. The other tests in this file keep pinning the still-live §36
+// FUTIDX + storage-primitive contracts until C3.
 
 // ---------------------------------------------------------------------------
 // Section FUTIDX (§36 2026-07-08; §36.7 2026-07-10) — the index-futures grant

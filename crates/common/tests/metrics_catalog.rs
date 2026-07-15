@@ -112,38 +112,17 @@ const REQUIRED_METRICS: &[(&str, &str)] = &[
         "Free disk space on the spill directory, updated on every \
          open_spill_file call.",
     ),
-    // --- Session 2 A5 (graceful unsubscribe) ---
-    (
-        "tv_ws_graceful_unsub_total",
-        "Count of graceful-unsubscribe attempts by outcome \
-         (sent / send_failed / timeout) per WebSocket connection_id.",
-    ),
-    (
-        "tv_ws_graceful_shutdown_signalled_total",
-        "Total connections signalled by \
-         WebSocketConnectionPool::request_graceful_shutdown.",
-    ),
-    // --- Session 2 A4 (pool circuit breaker) ---
-    (
-        "tv_pool_degraded_seconds",
-        "How long the WebSocket pool has been FULLY degraded (all \
-         connections Reconnecting/Disconnected). 0 when healthy.",
-    ),
-    (
-        "tv_pool_degraded_alerts_total",
-        "Number of times the pool crossed the 60s degraded alert \
-         threshold. Each down-cycle increments this once.",
-    ),
-    (
-        "tv_pool_halts_total",
-        "Number of times the pool watchdog requested a process halt \
-         (down for >300s). The caller should exit the process when this \
-         fires — supervisor restart brings us back up.",
-    ),
-    (
-        "tv_pool_recoveries_total",
-        "Number of times the pool recovered from AllDown to Healthy.",
-    ),
+    // --- Session 2 A5 (graceful unsubscribe) + A4 (pool circuit breaker) ---
+    // RETIRED (PR-C2, 2026-07-13 — Dhan live-WS lane deletion, operator
+    // retirement directive per websocket-connection-scope-lock.md
+    // "2026-07-13 Amendment" §B): the 7 entries below died with the
+    // machinery that emitted them — tv_ws_graceful_unsub_total +
+    // tv_ws_graceful_shutdown_signalled_total (the deleted
+    // connection/connection_pool graceful-unsubscribe path) and
+    // tv_pool_degraded_seconds / tv_pool_degraded_alerts_total /
+    // tv_pool_halts_total / tv_pool_recoveries_total (the deleted
+    // pool_watchdog). tv_pool_self_halts_total (further down) retired with
+    // the WS-GAP-09 watchdog Halt path in main.rs.
     // --- Session 3 S3-1 (QuestDB health poller) ---
     (
         "tv_questdb_connected",
@@ -175,21 +154,19 @@ const REQUIRED_METRICS: &[(&str, &str)] = &[
     //     Grafana queries referring to them raise a missing-metric error
     //     loudly rather than silently returning 0.)
     // --- Session 4 S4-T1a (pool self halts) ---
-    (
-        "tv_pool_self_halts_total",
-        "Number of times the pool watchdog task fired a Halt verdict and \
-         called std::process::exit(2). Should be 0 in healthy operation; \
-         every increment is a supervisor-triggered restart.",
-    ),
+    // tv_pool_self_halts_total RETIRED (PR-C2, 2026-07-13) with the
+    // WS-GAP-09 pool-watchdog Halt path — deleted with the Dhan live-WS
+    // lane (see the block note above).
     // --- Session 4 S4-T1f (synth ticks forwarded to broadcast) ---
     // tv_backfill_ticks_forwarded_total + tv_backfill_ticks_persisted_total
     // removed with the BackfillWorker deletion on 2026-04-17. See above.
     // --- Session 4 S4-T4 (existing subsystem metrics catalogued for lockdown) ---
-    (
-        "tv_order_update_ws_active",
-        "S4-T4: Binary gauge for the order update WebSocket (1.0 = connected, \
-         0.0 = not). Goes to 0 when the reconnect loop is between retries.",
-    ),
+    // tv_order_update_ws_active REMOVED from the catalog 2026-07-14 (Dhan
+    // noise lock fix round M4): the order-update WS spawn is retired
+    // (scope-lock §A.1), so the gauge write site in the dormant
+    // order_update_connection.rs module has zero reachable callers. The
+    // EMF allowlist + dashboard panel + inactive alarm are removed in
+    // lockstep; re-cataloguing requires the live-trading re-wire quote.
     (
         "tv_order_update_reconnections_total",
         "S4-T4: Reconnection attempt counter for the order update WebSocket.",
