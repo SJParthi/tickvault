@@ -973,7 +973,7 @@ impl Default for GrowwContract1mConfig {
 /// Extension point: every FUTURE field on this struct MUST also be
 /// `#[serde(default)]` so older TOMLs keep deserializing byte-identically
 /// (the `GrowwSpot1mConfig` / `Spot1mRestConfig` precedent).
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct GrowwOrdersConfig {
     /// Read-only order/trade GETs (list, detail, status, status-by-reference,
     /// trades). Default OFF. Market-hours-gated when enabled.
@@ -999,6 +999,28 @@ pub struct GrowwOrdersConfig {
     /// real enable is a separate future dated operator action.
     #[serde(default)]
     pub live_fire_requested: bool,
+    /// Read-only smart-order (GTT/OCO) GETs (get / list — the OCO reconcile
+    /// poller's read surface). Default OFF. Market-hours-gated when enabled.
+    /// (Smart Orders area, 2026-07-15.)
+    #[serde(default)]
+    pub smart_orders_read: bool,
+    /// Smart-order (GTT/OCO) MUTATION intent flag (create / modify /
+    /// cancel). Like `live_fire_requested`, IGNORED unless Gate 2 (the
+    /// `groww_orders` cargo feature) + Gate 3 (the
+    /// [`crate::constants::GROWW_ORDER_LIVE_FIRE`] const) are ALSO flipped —
+    /// a config value alone can NEVER fire a smart-order mutation.
+    /// Default OFF.
+    #[serde(default)]
+    pub smart_orders_write: bool,
+    /// OCO reconcile poller cadence in seconds (the GROWW-OCO-05 poller's
+    /// design value). Default 15.
+    #[serde(default = "default_groww_oco_reconcile_poll_secs")]
+    pub oco_reconcile_poll_secs: u64,
+    /// OCO sibling-leg cancel verification deadline in seconds — past it an
+    /// unverified sibling cancel is the GROWW-OCO-02 double-fill exposure
+    /// window. Default 30.
+    #[serde(default = "default_groww_oco_sibling_cancel_deadline_secs")]
+    pub oco_sibling_cancel_deadline_secs: u64,
     /// Gates the zero-HTTP PAPER executor + intent ledger + paper reconciler
     /// (ledger-only). Default OFF. Deliberately SEPARATE from `orders_read`
     /// (which authorizes read GETs): paper mode makes ZERO HTTP calls,
@@ -1023,6 +1045,36 @@ pub struct GrowwOrdersConfig {
     /// hardcoded.
     #[serde(default)]
     pub max_order_quantity: i64,
+}
+
+fn default_groww_oco_reconcile_poll_secs() -> u64 {
+    15
+}
+
+fn default_groww_oco_sibling_cancel_deadline_secs() -> u64 {
+    30
+}
+
+impl Default for GrowwOrdersConfig {
+    /// MANUAL impl (2026-07-15, Smart Orders area): the derived `Default`
+    /// would zero the u64 cadences and break the Default↔serde-default
+    /// parity (an absent `[groww_orders]` section must produce exactly
+    /// these values). Every gate bool stays FALSE (Gate 1 dark default).
+    fn default() -> Self {
+        Self {
+            orders_read: false,
+            portfolio_read: false,
+            margin_read: false,
+            user_read: false,
+            live_fire_requested: false,
+            smart_orders_read: false,
+            smart_orders_write: false,
+            oco_reconcile_poll_secs: default_groww_oco_reconcile_poll_secs(),
+            oco_sibling_cancel_deadline_secs: default_groww_oco_sibling_cancel_deadline_secs(),
+            paper_enabled: false,
+            max_order_quantity: 0,
+        }
+    }
 }
 
 // NOTE: the pure `decide_orders_runtime(cfg, live_fire) -> RuntimeLanes`
@@ -3045,6 +3097,23 @@ mod tests {
             !cfg.live_fire_requested,
             "live_fire_requested must default off — and is inert without Gate 3"
         );
+        // Smart Orders area (2026-07-15): the two new gate bools default
+        // off; the two OCO cadences carry their design values (the manual
+        // impl Default — a derive would zero them and break the
+        // Default↔serde-default parity for an absent section).
+        assert!(!cfg.smart_orders_read, "smart_orders_read must default off");
+        assert!(
+            !cfg.smart_orders_write,
+            "smart_orders_write must default off"
+        );
+        assert_eq!(
+            cfg.oco_reconcile_poll_secs, 15,
+            "oco_reconcile_poll_secs must default to the 15s design value"
+        );
+        assert_eq!(
+            cfg.oco_sibling_cancel_deadline_secs, 30,
+            "oco_sibling_cancel_deadline_secs must default to the 30s design value"
+        );
         assert!(
             !cfg.paper_enabled,
             "paper_enabled must default off (Gate 1) — the zero-HTTP paper lane is dark by default"
@@ -3053,6 +3122,34 @@ mod tests {
             cfg.max_order_quantity, 0,
             "max_order_quantity must default 0 (refuse-all) pending the operator's 0-vs-1 answer"
         );
+    }
+
+    /// PR-0 / Smart Orders area (2026-07-15): an ABSENT `[groww_orders]`
+    /// section (empty TOML) must deserialize to EXACTLY `Default`. This pins
+    /// Default↔serde-default parity so a future removal of any
+    /// `#[serde(default…)]` attribute — which would make an absent field a
+    /// hard deserialize ERROR (the two OCO cadences) or silently zero a u64 —
+    /// fails the build. (`GrowwOrdersConfig` derives no `PartialEq`, so the
+    /// eleven fields are compared explicitly against `Default`.)
+    #[test]
+    fn test_groww_orders_config_absent_section_serde_parity() {
+        let parsed: GrowwOrdersConfig = toml::from_str("")
+            .expect("absent [groww_orders] section must parse via serde defaults");
+        let def = GrowwOrdersConfig::default();
+        assert_eq!(parsed.orders_read, def.orders_read);
+        assert_eq!(parsed.portfolio_read, def.portfolio_read);
+        assert_eq!(parsed.margin_read, def.margin_read);
+        assert_eq!(parsed.user_read, def.user_read);
+        assert_eq!(parsed.live_fire_requested, def.live_fire_requested);
+        assert_eq!(parsed.smart_orders_read, def.smart_orders_read);
+        assert_eq!(parsed.smart_orders_write, def.smart_orders_write);
+        assert_eq!(parsed.oco_reconcile_poll_secs, def.oco_reconcile_poll_secs);
+        assert_eq!(
+            parsed.oco_sibling_cancel_deadline_secs,
+            def.oco_sibling_cancel_deadline_secs
+        );
+        assert_eq!(parsed.paper_enabled, def.paper_enabled);
+        assert_eq!(parsed.max_order_quantity, def.max_order_quantity);
     }
 
     // -----------------------------------------------------------------------
