@@ -807,6 +807,30 @@ pub fn sidecar_restart_backoff(consecutive_failures: u32) -> Duration {
     Duration::from_secs(scaled.min(SIDECAR_RESTART_MAX_SECS))
 }
 
+/// Relaunch handshake grace (seconds) — the 2026-07-14 incident: a freshly
+/// relaunched sidecar inherits the FEED-level stale last-tick age, so the
+/// stall watchdog re-killed children mid-handshake (a 4-kill restart storm).
+/// See `feed-stall-watchdog-error-codes.md` §1 "2026-07-14 Update".
+pub const FEED_STALL_HANDSHAKE_GRACE_SECS: u64 = 15;
+
+/// Graced stall-restart decision: identical to [`should_restart_on_stall`],
+/// but refuses to kill a child younger than
+/// [`FEED_STALL_HANDSHAKE_GRACE_SECS`] — the relaunched child needs time to
+/// complete its auth + NATS handshake before it can possibly stream the
+/// first tick that clears the inherited stale age. Pure + O(1); the base
+/// decision fn is byte-identical and keeps its own ratchet tests.
+#[must_use]
+pub fn should_restart_on_stall_graced(
+    child_age_secs: u64,
+    last_tick_age_secs: Option<u64>,
+    market_open: bool,
+    enabled: bool,
+    threshold_secs: u64,
+) -> bool {
+    child_age_secs > FEED_STALL_HANDSHAKE_GRACE_SECS
+        && should_restart_on_stall(last_tick_age_secs, market_open, enabled, threshold_secs)
+}
+
 /// FEED-AGNOSTIC stall decision (FEED-STALL-01). Returns `true` ONLY when the
 /// feed is enabled, the market is open, a last-tick is KNOWN, and the feed-level
 /// last-tick age exceeds `threshold_secs`. Pure + O(1); takes the inputs for ANY
@@ -1577,6 +1601,9 @@ async fn supervise_child(
     // never count toward the threshold). Per-child by construction — a fresh
     // relaunched child gets the full threshold again, bounding the restart
     // cadence for a never-streaming feed to ~one per threshold window.
+    // Relaunch handshake grace anchor (2026-07-14): supervise_child runs once
+    // per child, so this resets on every relaunch by construction.
+    let child_spawned_at = std::time::Instant::now();
     let mut never_streamed_open_since: Option<u64> = None;
     loop {
         tokio::select! {
@@ -1620,7 +1647,7 @@ async fn supervise_child(
                 let enabled = feed_runtime.is_enabled(feed);
                 let market_open = tickvault_common::market_hours::is_within_market_hours_ist();
                 let age = feed_health.last_tick_age_secs(feed, now_ist_nanos());
-                if should_restart_on_stall(age, market_open, enabled, FEED_STALL_RESTART_SECS) {
+                if should_restart_on_stall_graced(child_spawned_at.elapsed().as_secs(), age, market_open, enabled, FEED_STALL_RESTART_SECS) {
                     let now_secs = (now_ist_nanos() / 1_000_000_000).max(0) as u64;
                     let is_storm = storm.record_and_is_storm(now_secs);
                     let stall_secs = age.unwrap_or(0);
@@ -3917,5 +3944,60 @@ mod tests {
                 "{spawn} must be handed a ws_event_audit sender (stall rows)"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod relaunch_grace_tests {
+    use super::*;
+
+    /// Args that make the BASE decision fn return true (stale + in-market +
+    /// enabled) — copied from
+    /// `test_should_restart_on_stall_true_when_stale_market_open_enabled`.
+    fn kill_args() -> (Option<u64>, bool, bool, u64) {
+        (
+            Some(FEED_STALL_RESTART_SECS + 1),
+            true,
+            true,
+            FEED_STALL_RESTART_SECS,
+        )
+    }
+
+    #[test]
+    fn replay_2026_07_14_feed31_child5_no_kill() {
+        // 2026-07-14 14:59 IST replay: feed-level age 31s (stale), child only
+        // 5s old (mid-handshake) — the grace must refuse the kill.
+        let (age, open, enabled, thr) = kill_args();
+        assert!(!should_restart_on_stall_graced(5, age, open, enabled, thr));
+    }
+
+    #[test]
+    fn feed31_child16_kills() {
+        // Same stale feed, child past the 15s grace — a genuinely dead
+        // relaunch still restarts.
+        let (age, open, enabled, thr) = kill_args();
+        assert!(should_restart_on_stall_graced(16, age, open, enabled, thr));
+    }
+
+    #[test]
+    fn boundary_child_age_equals_grace_no_kill() {
+        // Strict `>` boundary: child_age == grace must NOT kill.
+        let (age, open, enabled, thr) = kill_args();
+        assert!(!should_restart_on_stall_graced(
+            FEED_STALL_HANDSHAKE_GRACE_SECS,
+            age,
+            open,
+            enabled,
+            thr
+        ));
+    }
+
+    #[test]
+    fn grace_const_pinned() {
+        assert_eq!(FEED_STALL_HANDSHAKE_GRACE_SECS, 15);
+        assert!(
+            FEED_STALL_HANDSHAKE_GRACE_SECS > 5
+                && FEED_STALL_HANDSHAKE_GRACE_SECS < FEED_STALL_RESTART_SECS
+        );
     }
 }
