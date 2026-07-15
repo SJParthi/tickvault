@@ -165,9 +165,15 @@ const TF_CONSISTENCY_MARKER_TASK: &str = "tf-consistency";
 /// verdict (pass / mismatch / degraded / blind) notifies. Name + semantics
 /// deliberately match the groww-live-off branch's planned predicate so a
 /// double landing merges as a trivial union.
+///
+/// F4 (2026-07-15 fix round): a FORCED run (`TICKVAULT_TF_VERIFY_NOW=1`)
+/// ALWAYS notifies, `no_data` included — the catch-up skip message itself
+/// tells the operator to force a run, and a forced run answering with
+/// silence would be a Rule-11 hole. Scheduled/catch-up runs keep `no_data`
+/// log-only.
 #[must_use]
-pub fn should_notify_summary(status_label: &str) -> bool {
-    status_label != "no_data"
+pub fn should_notify_summary(status_label: &str, forced_run: bool) -> bool {
+    forced_run || status_label != "no_data"
 }
 
 // ---------------------------------------------------------------------------
@@ -1910,7 +1916,7 @@ pub fn spawn_tf_consistency_tasks(
     }
     let qcfg = config.questdb.clone();
     let calendar = std::sync::Arc::clone(trading_calendar);
-    let inner: tokio::task::JoinHandle<Result<Option<TfConsistencySummaryData>, String>> =
+    let inner: tokio::task::JoinHandle<Result<Option<(TfConsistencySummaryData, bool)>, String>> =
         tokio::spawn(async move {
             use chrono::{FixedOffset, TimeZone, Timelike, Utc};
             use tickvault_common::constants::IST_UTC_OFFSET_SECONDS;
@@ -2028,19 +2034,21 @@ pub fn spawn_tf_consistency_tasks(
             let groww_date = previous_trading_day(&calendar, target);
             let summary = run_tf_consistency(&qcfg, target, groww_date).await;
             info!("PROOF: tf_consistency verifier fired @ 15:40:00 IST");
-            Ok(Some(summary))
+            // F4: the forced flag rides along so the notify predicate can
+            // keep a forced run's answer LOUD (no_data included).
+            Ok(Some((summary, force_now)))
         });
     let tf_notifier = std::sync::Arc::clone(notifier);
     tokio::spawn(async move {
         match inner.await {
-            Ok(Ok(Some(s))) => {
+            Ok(Ok(Some((s, forced_run)))) => {
                 let status_label = s.status_label.clone();
                 // Marker keyed on the VERIFIED (Dhan) date, never blindly
                 // "today" — a forced past-date backfill must not suppress
                 // today's catch-up (2026-07-15 once-per-day gate).
                 let marker_date =
                     chrono::NaiveDate::parse_from_str(&s.dhan_date_ist, "%Y-%m-%d").ok();
-                if should_notify_summary(&status_label) {
+                if should_notify_summary(&status_label, forced_run) {
                     tf_notifier.notify(NotificationEvent::TfConsistencySummary {
                         dhan_date_ist: s.dhan_date_ist,
                         groww_date_ist: s.groww_date_ist,
@@ -2066,7 +2074,8 @@ pub fn spawn_tf_consistency_tasks(
                         dhan_date = %s.dhan_date_ist,
                         groww_date = %s.groww_date_ist,
                         "tf_consistency: nothing to check today — Telegram summary \
-                         suppressed (log-only; pass and failure days still notify)"
+                         suppressed (log-only; pass, failure and FORCED days \
+                         still notify)"
                     );
                 }
                 // Terminal-quality outcomes ONLY (pass / no_data) mark the
@@ -2149,9 +2158,23 @@ mod tests {
     #[test]
     fn test_should_notify_summary_suppresses_only_no_data() {
         assert!(
-            !should_notify_summary("no_data"),
-            "a nothing-to-check day is log-only"
+            !should_notify_summary("no_data", false),
+            "a nothing-to-check day is log-only on scheduled/catch-up runs"
         );
+    }
+
+    #[test]
+    fn test_should_notify_summary_forced_run_always_notifies() {
+        // F4 (2026-07-15 fix round): a FORCED run must never answer with
+        // silence — the catch-up skip message itself tells the operator to
+        // force one; no_data included.
+        assert!(
+            should_notify_summary("no_data", true),
+            "a forced run must notify even on no_data"
+        );
+        for label in ["pass", "mismatch", "degraded", "blind", ""] {
+            assert!(should_notify_summary(label, true), "{label} forced");
+        }
     }
 
     #[test]
@@ -2159,11 +2182,14 @@ mod tests {
         // Rule 11: every verdict with information content still notifies —
         // pass (positive daily signal) AND every failure class.
         for label in ["pass", "mismatch", "degraded", "blind"] {
-            assert!(should_notify_summary(label), "{label} must keep notifying");
+            assert!(
+                should_notify_summary(label, false),
+                "{label} must keep notifying"
+            );
         }
         // Fail-open on an unknown / drifted label: notify, never silence.
-        assert!(should_notify_summary("some_future_label"));
-        assert!(should_notify_summary(""));
+        assert!(should_notify_summary("some_future_label", false));
+        assert!(should_notify_summary("", false));
     }
 
     #[test]
