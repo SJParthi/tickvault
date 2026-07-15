@@ -412,9 +412,16 @@ the option-chain month policy here.
 > skew/jitter/failure/restart permutations — INCLUDING every concurrency-ladder
 > step and shape transition — and asserts zero chain-spacing violations, never
 > more than `spot_window_cap` spot fires in ANY rolling 1000ms window,
-> zero nominal-slot denials, exactly 1 decision per (lane, cycle), no DECIDED
-> outcome past the lane cutoff, exactly-once snapshot publication per
-> successful chain fetch, and a non-vacuous 64-full-cycle activity floor.
+> zero nominal-slot denials, exactly 1 decision per (lane, cycle),
+> exactly-once snapshot publication per successful chain fetch, and a
+> non-vacuous 64-full-cycle activity floor. The 'no DECIDED outcome past the
+> lane cutoff' invariant is enforced RUNNER-SIDE (TRH-R2-1 truth-sync,
+> 2026-07-15): the finalize guard routes through the pure, unit-pinned
+> `decision::may_decide_at_completion` (boundary tests in decision.rs) and
+> the call site + early return are source-scan-ratcheted by
+> `cadence_composition_contract_guard.rs::test_cadence_finalize_pins_never_a_late_decided_guard`
+> — the replay proptest's matching assert exercises its own honest MIRROR of
+> that guard (labeled as such in the sim), never the runner code path itself.
 > NOT claimed:
 > that the BROKER never 429s — a shared-budget co-tenant (BruteX) or a
 > broker-side tightening can still produce one, which is typed

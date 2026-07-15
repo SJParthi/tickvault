@@ -33,7 +33,7 @@ use super::assembly::{
 };
 use super::decision::{
     CadenceEvent, CadenceState, DecisionLatch, DecisionOutcome, DecisionSnapshot, SkipReason,
-    emit_decision, next_cadence_state,
+    emit_decision, may_decide_at_completion, next_cadence_state,
 };
 use super::executor::{
     CadenceExecutor, CadenceFetchError, ChainFetchOk, ChainFetchRequest, ExpiryListRequest,
@@ -2630,11 +2630,15 @@ fn finalize_if_complete<C: CadenceClock>(
     } else {
         slots.groww_cutoff_ms
     };
-    if now_wall > cutoff {
+    if !may_decide_at_completion(now_wall, cutoff) {
         // Past the cutoff there is NO decide path — the queued cutoff
         // event emits the honest skip ("never a late decision"). A
         // completion processed after the cutoff instant (unbiased select
-        // race / stalled runner) must not produce a late Decided.
+        // race / stalled runner) must not produce a late Decided. The
+        // comparison is the pure, unit-pinned
+        // `decision::may_decide_at_completion` and this call site is
+        // source-scan-ratcheted (TRH-R2-1, 2026-07-15) — deleting or
+        // inverting the guard fails the build.
         return;
     }
     if !lane.asm.is_data_complete() {
