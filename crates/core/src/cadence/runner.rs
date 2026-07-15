@@ -760,15 +760,20 @@ async fn run_expiry_resolution_loop<C, D, G>(
         // backstop. Boot-phase / non-trading / post-session waves keep
         // the plain configured interval — no bursts exist to collide
         // with. The wave itself (above) still runs immediately at spawn:
-        // only the SLEEP between waves is anchored.
+        // only the SLEEP between waves is anchored. R3-F1 belt (b),
+        // 2026-07-15: the anchor decision keys on where the PLAIN
+        // `now + interval` target would LAND (`expiry_wave_anchor_active`
+        // — pure, schedule.rs), so even if the validate() ≤60s ceiling
+        // (belt (a)) ever drifts, the LAST pre-era wake of a >60s
+        // interval clamps its FIRST in-era wake to the :30 anchor
+        // instead of sleeping straight into the session-entry burst
+        // window (65s @ 09:14:58 → 09:16:03, the spot-group instant).
         let now_ms_of_day = clock.ist_ms_of_day();
-        // APPROVED: ms-of-day / 1000 fits u32 (< 86_400) — the cast is safe.
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let post_wave_secs = (now_ms_of_day.max(0) / 1_000) as u32;
-        let anchor_mid_minute = deps.calendar.is_trading_day(today)
-            && post_wave_secs < super::schedule::CADENCE_LAST_CYCLE_BOUNDARY_SECS_OF_DAY_IST
-            && post_wave_secs.saturating_add(60)
-                >= super::schedule::CADENCE_FIRST_CYCLE_BOUNDARY_SECS_OF_DAY_IST;
+        let anchor_mid_minute = super::schedule::expiry_wave_anchor_active(
+            now_ms_of_day,
+            interval_ms,
+            deps.calendar.is_trading_day(today),
+        );
         let sleep_ms = super::schedule::next_expiry_wave_instant_ms(
             now_ms_of_day,
             interval_ms,
