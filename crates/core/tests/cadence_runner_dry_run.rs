@@ -1587,3 +1587,419 @@ async fn test_groww_deferred_fallback_refetches_inflight_skipped_leg_once() {
          dead-fallback bug; 3+ = a duplicate"
     );
 }
+// ---------------------------------------------------------------------------
+// CAD-CORR-1 (hostile round 1, 2026-07-15): a completion processed after a
+// suspend across IST midnight must ABANDON the cycle — never be folded
+// into the dead day's assembly / deferred-fallback / decision paths
+// ---------------------------------------------------------------------------
+
+/// A clock that crosses IST midnight at a scripted elapsed instant: the
+/// ms-of-day domain WRAPS to ~0 and the calendar date advances — the
+/// exact state a process suspend across midnight resumes into. The
+/// monotonic + epoch domains never wrap (they are suspend-immune).
+struct MidnightFlipClock {
+    anchor: tokio::time::Instant,
+    base_wall_ms: i64,
+    base_date: NaiveDate,
+    flip_at_elapsed_ms: i64,
+}
+
+impl MidnightFlipClock {
+    fn elapsed_ms(&self) -> i64 {
+        // APPROVED: paused-test elapsed fits i64 comfortably.
+        #[allow(clippy::cast_possible_truncation)]
+        {
+            self.anchor.elapsed().as_millis() as i64
+        }
+    }
+}
+
+impl CadenceClock for MidnightFlipClock {
+    fn ist_ms_of_day(&self) -> i64 {
+        let e = self.elapsed_ms();
+        if e < self.flip_at_elapsed_ms {
+            self.base_wall_ms + e
+        } else {
+            // Post-midnight: ms-of-day wrapped to just past 00:00.
+            e - self.flip_at_elapsed_ms
+        }
+    }
+
+    fn ist_date(&self) -> NaiveDate {
+        if self.elapsed_ms() < self.flip_at_elapsed_ms {
+            self.base_date
+        } else {
+            self.base_date.succ_opt().expect("next day exists")
+        }
+    }
+
+    fn monotonic_ms(&self) -> i64 {
+        self.elapsed_ms()
+    }
+
+    fn epoch_ms(&self) -> i64 {
+        self.base_wall_ms + self.elapsed_ms()
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn test_completion_after_midnight_suspend_abandons_cycle() {
+    // CAD-CORR-1: the biased select drains completions BEFORE the timer
+    // arm, so the IST-date-change abandon must exist on the COMPLETION
+    // arm too. Script: the BANKNIFTY burst leg is still in flight at the
+    // ~T+800ms verdict (skipped, F4); IST midnight flips at T+1000
+    // (elapsed 11_000); the leg's Err completion lands at ~T+1200 —
+    // processed FIRST by the biased select, BEFORE any timer wake (next
+    // chunk wake ~T+5800). Pre-fix, the wrapped ms-of-day (~200) passed
+    // the cutoff guards and the L3 deferred fallback dispatched a SECOND
+    // BANKNIFTY request against the dead day's cycle; post-fix the
+    // completion arm abandons and the count stays 1.
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let exec = Arc::new(SlowFailLegExecutor {
+        log: Arc::clone(&log),
+        start: tokio::time::Instant::now(),
+    });
+    let shutdown = Arc::new(Notify::new());
+    let config = CadenceConfig::default();
+    let gates = test_gates(&config);
+    let deps = CadenceRunnerDeps {
+        config,
+        calendar: test_calendar(),
+        dhan_executor: Arc::clone(&exec),
+        groww_executor: exec,
+        // Groww-only lane (isolates the burst/verdict/fallback path).
+        dhan_enabled: Arc::new(AtomicBool::new(false)),
+        groww_enabled: Arc::new(AtomicBool::new(true)),
+        expiry_resolver: Arc::new(StubExpiryResolver),
+        expiry_store: None,
+        gates,
+        dry_run: false,
+        shutdown: Arc::clone(&shutdown),
+    };
+    let clock = Arc::new(MidnightFlipClock {
+        anchor: tokio::time::Instant::now(),
+        base_wall_ms: BASE_WALL_MS,
+        base_date: NaiveDate::from_ymd_opt(2026, 7, 14).expect("valid date"),
+        // Groww burst fires at elapsed 10_000 (wall 09:16:00); midnight
+        // flips at 11_000 — after the ~10_800 verdict, before the
+        // ~11_200 slow-leg Err completion and before the next timer
+        // wake (~15_800).
+        flip_at_elapsed_ms: 11_000,
+    });
+    let task = tokio::spawn(run_cadence_loop(clock, deps));
+    for _ in 0..30 {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+    shutdown.notify_waiters();
+    let exit = tokio::time::timeout(std::time::Duration::from_secs(120), task)
+        .await
+        .expect("runner must exit after shutdown")
+        .expect("runner task must not panic");
+    assert_eq!(exit, LoopExit::Shutdown);
+
+    // APPROVED (test-only): poisoned mutex propagates the panic.
+    #[allow(clippy::unwrap_used)]
+    let calls = log.lock().unwrap().clone();
+    let banknifty_first_cycle = calls
+        .iter()
+        .filter(|c| {
+            c.minute() == FIRST_CYCLE_MINUTE
+                && matches!(
+                    c,
+                    RecordedCall::Chain {
+                        feed: Feed::Groww,
+                        underlying: ChainUnderlying::Banknifty,
+                        ..
+                    }
+                )
+        })
+        .count();
+    assert_eq!(
+        banknifty_first_cycle, 1,
+        "a completion resumed AFTER a suspend across IST midnight must \
+         abandon the cycle (CAD-CORR-1): 2 = the dead-day deferred \
+         fallback fired from the completion arm against the wrapped clock"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// CONC-NEW-1 (hostile round 1, 2026-07-15): the runtime lane toggles are
+// re-observed while the cycle is pristine AND at every dispatch instant —
+// never frozen at run_cycle entry
+// ---------------------------------------------------------------------------
+
+/// Entry wall clock ~2 minutes BEFORE the first anchor: run_cycle is
+/// entered immediately (the boundary is joinable) and idles in wake
+/// chunks — the window where the entry snapshot used to freeze the
+/// `/api/feeds` toggles.
+const PRE_ANCHOR_WALL_MS: i64 = (9 * 3600 + 14 * 60) * 1_000;
+
+#[tokio::test(start_paused = true)]
+async fn test_pristine_cycle_observes_disable_before_first_fire() {
+    // Disable the Dhan lane ~10s after run_cycle entry, ~105s BEFORE its
+    // first fire (the 09:15:55 chain anchor). Pre-fix the entry snapshot
+    // fired the full Dhan cycle anyway; post-fix the pristine re-arm
+    // drops the lane within one ~5s wake chunk — ZERO Dhan requests.
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let exec = Arc::new(RecordingExecutor {
+        log: Arc::clone(&log),
+        start: tokio::time::Instant::now(),
+        chain_verdict: empty_chain,
+        spot_verdict: empty_spot,
+        expiry_verdict: empty_expiry_list,
+    });
+    let shutdown = Arc::new(Notify::new());
+    let config = CadenceConfig::default();
+    let gates = test_gates(&config);
+    let dhan_enabled = Arc::new(AtomicBool::new(true));
+    let deps = CadenceRunnerDeps {
+        config,
+        calendar: test_calendar(),
+        dhan_executor: Arc::clone(&exec),
+        groww_executor: exec,
+        dhan_enabled: Arc::clone(&dhan_enabled),
+        groww_enabled: Arc::new(AtomicBool::new(true)),
+        expiry_resolver: Arc::new(StubExpiryResolver),
+        expiry_store: None,
+        gates,
+        dry_run: false,
+        shutdown: Arc::clone(&shutdown),
+    };
+    let clock = Arc::new(TestClock {
+        anchor: tokio::time::Instant::now(),
+        base_wall_ms: PRE_ANCHOR_WALL_MS,
+        date: NaiveDate::from_ymd_opt(2026, 7, 14).expect("valid date"),
+    });
+    let task = tokio::spawn(run_cadence_loop(clock, deps));
+    // ~10s in (pristine — first fire is at +115s), the operator disables
+    // the Dhan lane.
+    for _ in 0..10 {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+    dhan_enabled.store(false, std::sync::atomic::Ordering::Release);
+    // Let the whole first cycle elapse (cutoff at +135s) with margin.
+    for _ in 0..140 {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+    shutdown.notify_waiters();
+    let exit = tokio::time::timeout(std::time::Duration::from_secs(120), task)
+        .await
+        .expect("runner must exit after shutdown")
+        .expect("runner task must not panic");
+    assert_eq!(exit, LoopExit::Shutdown);
+
+    // APPROVED (test-only): poisoned mutex propagates the panic.
+    #[allow(clippy::unwrap_used)]
+    let calls = log.lock().unwrap().clone();
+    let dhan_calls = calls
+        .iter()
+        .filter(|c| {
+            matches!(
+                c,
+                RecordedCall::Chain {
+                    feed: Feed::Dhan,
+                    ..
+                } | RecordedCall::Spot {
+                    feed: Feed::Dhan,
+                    ..
+                }
+            )
+        })
+        .count();
+    assert_eq!(
+        dhan_calls, 0,
+        "a lane disabled BEFORE its first fire must fire NOTHING \
+         (CONC-NEW-1: the entry snapshot must not freeze the toggle)"
+    );
+    assert!(
+        calls.iter().any(|c| matches!(
+            c,
+            RecordedCall::Chain {
+                feed: Feed::Groww,
+                ..
+            }
+        )),
+        "the Groww lane must be unaffected by the Dhan disable"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn test_pristine_cycle_observes_enable_before_first_fire() {
+    // The mirror direction: the Dhan lane starts DISABLED at cycle entry
+    // and the operator enables it ~10s in, ~105s before the first fire.
+    // Pre-fix the disabled entry snapshot silently missed the whole
+    // first cycle; post-fix the pristine re-arm rebuilds the event list
+    // and the lane fires its 3 chain primaries in cycle 1.
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let exec = Arc::new(RecordingExecutor {
+        log: Arc::clone(&log),
+        start: tokio::time::Instant::now(),
+        chain_verdict: empty_chain,
+        spot_verdict: empty_spot,
+        expiry_verdict: empty_expiry_list,
+    });
+    let shutdown = Arc::new(Notify::new());
+    let config = CadenceConfig::default();
+    let gates = test_gates(&config);
+    let dhan_enabled = Arc::new(AtomicBool::new(false));
+    let deps = CadenceRunnerDeps {
+        config,
+        calendar: test_calendar(),
+        dhan_executor: Arc::clone(&exec),
+        groww_executor: exec,
+        dhan_enabled: Arc::clone(&dhan_enabled),
+        groww_enabled: Arc::new(AtomicBool::new(true)),
+        expiry_resolver: Arc::new(StubExpiryResolver),
+        expiry_store: None,
+        gates,
+        dry_run: false,
+        shutdown: Arc::clone(&shutdown),
+    };
+    let clock = Arc::new(TestClock {
+        anchor: tokio::time::Instant::now(),
+        base_wall_ms: PRE_ANCHOR_WALL_MS,
+        date: NaiveDate::from_ymd_opt(2026, 7, 14).expect("valid date"),
+    });
+    let task = tokio::spawn(run_cadence_loop(clock, deps));
+    for _ in 0..10 {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+    dhan_enabled.store(true, std::sync::atomic::Ordering::Release);
+    for _ in 0..140 {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+    shutdown.notify_waiters();
+    let exit = tokio::time::timeout(std::time::Duration::from_secs(120), task)
+        .await
+        .expect("runner must exit after shutdown")
+        .expect("runner task must not panic");
+    assert_eq!(exit, LoopExit::Shutdown);
+
+    // APPROVED (test-only): poisoned mutex propagates the panic.
+    #[allow(clippy::unwrap_used)]
+    let calls = log.lock().unwrap().clone();
+    let dhan_chains_cycle1 = calls
+        .iter()
+        .filter(|c| {
+            c.minute() == FIRST_CYCLE_MINUTE
+                && matches!(
+                    c,
+                    RecordedCall::Chain {
+                        feed: Feed::Dhan,
+                        ..
+                    }
+                )
+        })
+        .count();
+    assert!(
+        dhan_chains_cycle1 >= 3,
+        "a lane enabled BEFORE its first fire must join the CURRENT cycle \
+         (CONC-NEW-1 pristine re-arm): got {dhan_chains_cycle1} Dhan chain \
+         calls in cycle 1 (0 = the frozen disabled snapshot)"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn test_midcycle_disable_stops_not_yet_dispatched_fires() {
+    // Dispatch-time re-read: with fires already dispatched (the 3 chain
+    // primaries), a disable at wall T+2.5s must stop every LATER fire —
+    // the T+3s spot group and every retry — within the same cycle.
+    // Pre-fix the whole cycle kept firing (8 spot requests from a
+    // disabled lane).
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let exec = Arc::new(RecordingExecutor {
+        log: Arc::clone(&log),
+        start: tokio::time::Instant::now(),
+        chain_verdict: empty_chain,
+        spot_verdict: empty_spot,
+        expiry_verdict: empty_expiry_list,
+    });
+    let shutdown = Arc::new(Notify::new());
+    let config = CadenceConfig::default();
+    let gates = test_gates(&config);
+    let dhan_enabled = Arc::new(AtomicBool::new(true));
+    let deps = CadenceRunnerDeps {
+        config,
+        calendar: test_calendar(),
+        dhan_executor: Arc::clone(&exec),
+        groww_executor: exec,
+        dhan_enabled: Arc::clone(&dhan_enabled),
+        groww_enabled: Arc::new(AtomicBool::new(true)),
+        expiry_resolver: Arc::new(StubExpiryResolver),
+        expiry_store: None,
+        gates,
+        dry_run: false,
+        shutdown: Arc::clone(&shutdown),
+    };
+    let clock = Arc::new(TestClock {
+        anchor: tokio::time::Instant::now(),
+        base_wall_ms: BASE_WALL_MS,
+        date: NaiveDate::from_ymd_opt(2026, 7, 14).expect("valid date"),
+    });
+    let task = tokio::spawn(run_cadence_loop(clock, deps));
+    // Chains fire at elapsed 5_000 / 8_000 / 12_000 (wall :55/:58/:02);
+    // the spot group fires at 13_000 (wall :03). Disable at 12_500 —
+    // after the last chain primary, before any spot dispatch.
+    for _ in 0..12 {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    dhan_enabled.store(false, std::sync::atomic::Ordering::Release);
+    for _ in 0..20 {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+    shutdown.notify_waiters();
+    let exit = tokio::time::timeout(std::time::Duration::from_secs(120), task)
+        .await
+        .expect("runner must exit after shutdown")
+        .expect("runner task must not panic");
+    assert_eq!(exit, LoopExit::Shutdown);
+
+    // APPROVED (test-only): poisoned mutex propagates the panic.
+    #[allow(clippy::unwrap_used)]
+    let calls = log.lock().unwrap().clone();
+    let dhan_spots = calls
+        .iter()
+        .filter(|c| {
+            matches!(
+                c,
+                RecordedCall::Spot {
+                    feed: Feed::Dhan,
+                    ..
+                }
+            )
+        })
+        .count();
+    let dhan_chains = calls
+        .iter()
+        .filter(|c| {
+            matches!(
+                c,
+                RecordedCall::Chain {
+                    feed: Feed::Dhan,
+                    ..
+                }
+            )
+        })
+        .count();
+    assert!(
+        dhan_chains >= 3,
+        "the 3 chain primaries dispatched BEFORE the disable must have fired"
+    );
+    assert_eq!(
+        dhan_spots, 0,
+        "a mid-cycle disable must stop every not-yet-dispatched fire \
+         (CONC-NEW-1 dispatch-time re-read): 8 = the frozen entry snapshot \
+         firing the whole spot group + retries from a disabled lane"
+    );
+    assert!(
+        calls.iter().any(|c| matches!(
+            c,
+            RecordedCall::Chain {
+                feed: Feed::Groww,
+                ..
+            }
+        )),
+        "the Groww lane must be unaffected by the Dhan disable"
+    );
+}

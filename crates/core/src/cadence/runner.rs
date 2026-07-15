@@ -1353,20 +1353,11 @@ where
         dispatch_ran_late: demote_nominal,
         dhan_spot_dirty: false,
         groww_dirty: false,
+        dispatched_any: false,
     };
     // Anchor FSM arming (level-triggered per cycle per lane).
-    if cycle.dhan.enabled {
-        cycle.dhan.fsm(CadenceEvent::AnchorReached);
-    } else {
-        cycle.dhan.fsm(CadenceEvent::OffSessionOrDisabled);
-        cycle.dhan.resolved = true;
-    }
-    if cycle.groww.enabled {
-        cycle.groww.fsm(CadenceEvent::AnchorReached);
-    } else {
-        cycle.groww.fsm(CadenceEvent::OffSessionOrDisabled);
-        cycle.groww.resolved = true;
-    }
+    arm_lane(&mut cycle.dhan);
+    arm_lane(&mut cycle.groww);
     if cycle.dhan.resolved && cycle.groww.resolved {
         return CycleRun::Verdict {
             ladder: CycleVerdict::Clean,
@@ -1419,6 +1410,23 @@ where
                 return CycleRun::Shutdown;
             }
             Some(completion) = rx.recv() => {
+                // CAD-CORR-1 (hostile round 1, 2026-07-15): the mid-cycle
+                // IST-date-change defense must cover the COMPLETION arm
+                // too — the biased select drains completions BEFORE the
+                // timer arm, so an in-flight fetch resuming after a
+                // suspend across IST midnight was processed against the
+                // dead day's cycle: the wrapped ms-of-day passed the
+                // cutoff guards and could emit a wrong-day decision/skip
+                // (with a hugely negative latency sample) before the next
+                // timer wake abandoned. The completion is DROPPED (its
+                // data belongs to the dead day) and the cycle abandons
+                // exactly like the timer arm.
+                if clock.ist_date() != cycle_date {
+                    // `completion` is deliberately unused here — dropped
+                    // with the rest of the dead day's cycle state.
+                    abandon_dead_day_cycle(&mut cycle);
+                    return CycleRun::Abandoned;
+                }
                 handle_completion(
                     clock,
                     deps,
@@ -1435,15 +1443,36 @@ where
                 // day — drop the cycle (no partial emit) and let the
                 // day loop reset.
                 if clock.ist_date() != cycle_date {
-                    error!(
-                        code = ErrorCode::Cadence03SchedulerDegraded.code_str(),
-                        stage = "skew_clamped",
-                        "CADENCE-03: IST date changed mid-cycle — cycle \
-                         abandoned, day loop resets"
-                    );
-                    cycle.dhan.fsm(CadenceEvent::Shutdown);
-                    cycle.groww.fsm(CadenceEvent::Shutdown);
+                    abandon_dead_day_cycle(&mut cycle);
                     return CycleRun::Abandoned;
+                }
+                // CONC-NEW-1 (hostile round 1, 2026-07-15): while the
+                // cycle is PRISTINE (no event popped yet — the day's
+                // FIRST cycle is entered near IST midnight and waits
+                // ~9h for its 09:15:55 anchor), re-observe the runtime
+                // lane toggles every wake chunk and RE-ARM the cycle
+                // from the fresh flags on any change: lanes re-armed +
+                // the event list rebuilt, so a pre-fire `/api/feeds`
+                // toggle (either direction) is honored within one ~5s
+                // wake chunk instead of being frozen at cycle entry.
+                if !cycle.dispatched_any {
+                    let dhan_now = deps.dhan_enabled.load(Ordering::Acquire);
+                    let groww_now = deps.groww_enabled.load(Ordering::Acquire);
+                    if dhan_now != cycle.dhan.enabled || groww_now != cycle.groww.enabled {
+                        info!(
+                            dhan_enabled = dhan_now,
+                            groww_enabled = groww_now,
+                            "cadence: runtime lane toggle observed before the \
+                             cycle's first fire — cycle re-armed from the \
+                             fresh flags"
+                        );
+                        cycle.dhan = LaneRun::new(Feed::Dhan, dhan_now, slots);
+                        cycle.groww = LaneRun::new(Feed::Groww, groww_now, slots);
+                        arm_lane(&mut cycle.dhan);
+                        arm_lane(&mut cycle.groww);
+                        cycle.events = build_cycle_events(slots, dhan_now, groww_now);
+                        continue;
+                    }
                 }
                 let Some((target_ms, _)) = cycle.events.first().copied() else {
                     continue;
@@ -1454,6 +1483,7 @@ where
                     continue;
                 }
                 let (target_ms, action) = cycle.events.remove(0);
+                cycle.dispatched_any = true;
                 observe_wake_lateness(clock.as_ref(), target_ms, &mut cycle);
                 handle_action(clock, deps, gates, slots, action, &mut cycle, &tx, latch);
             }
@@ -1565,6 +1595,85 @@ struct CycleState {
     /// coordinator's "persistent failure/rate-limit" read as the
     /// rate-limit class only, mirroring the Dhan spot-dirty rule).
     groww_dirty: bool,
+    /// TRUE once the first cycle event has POPPED (CONC-NEW-1, hostile
+    /// round 1 2026-07-15): while false the cycle is PRISTINE — nothing
+    /// dispatched, no completion possible — so the timer arm may safely
+    /// RE-ARM the whole cycle from freshly re-read lane enable flags
+    /// (the day's first cycle is entered near IST midnight and waits
+    /// ~9h for its anchor; the entry snapshot alone froze the
+    /// `/api/feeds` toggles for that whole window).
+    dispatched_any: bool,
+}
+
+/// Arm one lane's FSM from its enable snapshot (`run_cycle` entry + the
+/// CONC-NEW-1 pristine re-arm share this): an enabled lane arms at the
+/// anchor; a disabled lane parks Idle and resolves immediately.
+fn arm_lane(lane: &mut LaneRun) {
+    if lane.enabled {
+        lane.fsm(CadenceEvent::AnchorReached);
+    } else {
+        lane.fsm(CadenceEvent::OffSessionOrDisabled);
+        lane.resolved = true;
+    }
+}
+
+/// Mid-cycle IST-date-change abandon (suspend across midnight): the
+/// ms-of-day domain wrapped, every remaining target — and every in-flight
+/// completion — belongs to the dead day, so the cycle is dropped with NO
+/// partial emit and the day loop resets. Shared by the timer arm (the
+/// original defense) and the completion arm (CAD-CORR-1, hostile round 1
+/// 2026-07-15 — the biased select drains completions FIRST, so the check
+/// must exist on both arms or a post-suspend completion is processed
+/// against the dead day's cycle).
+fn abandon_dead_day_cycle(cycle: &mut CycleState) {
+    error!(
+        code = ErrorCode::Cadence03SchedulerDegraded.code_str(),
+        stage = "skew_clamped",
+        "CADENCE-03: IST date changed mid-cycle — cycle \
+         abandoned, day loop resets"
+    );
+    cycle.dhan.fsm(CadenceEvent::Shutdown);
+    cycle.groww.fsm(CadenceEvent::Shutdown);
+}
+
+/// CONC-NEW-1 (hostile round 1, 2026-07-15): re-observe the runtime lane
+/// enable toggles at every dispatch/completion instant. `run_cycle` can
+/// be ENTERED long before its first fire, and even mid-day the next
+/// cycle's snapshot is taken ~45s before its first fire — the entry
+/// snapshot alone let an `/api/feeds` disable keep firing REST requests
+/// from a disabled lane. A lane observed DISABLED mid-cycle is dropped
+/// like a shutdown: FSM → Idle (no partial emit), resolved,
+/// `enabled = false` — no further fires (every dispatch arm re-checks),
+/// no degrade page, no Rollover; already-in-flight requests complete as
+/// audit-only late responses. The ENABLE direction pre-first-fire is the
+/// pristine re-arm in the `run_cycle` timer arm; post-first-fire an
+/// enable joins at the next minute boundary.
+fn observe_runtime_lane_toggles<D, G>(deps: &CadenceRunnerDeps<D, G>, cycle: &mut CycleState)
+where
+    D: CadenceExecutor + 'static,
+    G: CadenceExecutor + 'static,
+{
+    if cycle.dhan.enabled && !deps.dhan_enabled.load(Ordering::Acquire) {
+        drop_lane_runtime_disabled(&mut cycle.dhan);
+    }
+    if cycle.groww.enabled && !deps.groww_enabled.load(Ordering::Acquire) {
+        drop_lane_runtime_disabled(&mut cycle.groww);
+    }
+}
+
+/// Drop one lane mid-cycle after its runtime toggle flipped OFF
+/// (CONC-NEW-1): shutdown-shaped — never a partial emit, never a
+/// degrade page for a deliberately disabled lane.
+fn drop_lane_runtime_disabled(lane: &mut LaneRun) {
+    info!(
+        lane = lane.asm.feed.as_str(),
+        cycle_minute_ist = lane.asm.cycle_minute_ist,
+        "cadence: lane runtime-disabled mid-cycle — remaining fires \
+         dropped (no partial emit; in-flight requests complete audit-only)"
+    );
+    lane.fsm(CadenceEvent::Shutdown);
+    lane.resolved = true;
+    lane.enabled = false;
 }
 
 /// Record wake lateness (histogram always; CADENCE-03 once per cycle
@@ -1609,6 +1718,9 @@ fn handle_action<C, D, G>(
     D: CadenceExecutor + 'static,
     G: CadenceExecutor + 'static,
 {
+    // CONC-NEW-1: dispatch-time re-read of the runtime lane toggles — a
+    // lane disabled via /api/feeds after cycle entry must not fire.
+    observe_runtime_lane_toggles(deps, cycle);
     let now_mono = clock.monotonic_ms();
     let now_wall = clock.ist_ms_of_day();
     match action {
@@ -2082,6 +2194,12 @@ fn handle_completion<C, D, G>(
         "outcome" => outcome_label
     )
     .increment(1);
+
+    // CONC-NEW-1: completion-time re-read of the runtime lane toggles —
+    // a disable lands here BEFORE the retry/deferred-fallback paths can
+    // dispatch a fresh request from a disabled lane (the resolved flag
+    // this sets gates them), and before finalize can emit its decision.
+    observe_runtime_lane_toggles(deps, cycle);
 
     {
         let lane: &mut LaneRun = match lane_feed {
