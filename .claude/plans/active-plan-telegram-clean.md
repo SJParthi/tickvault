@@ -301,6 +301,35 @@ merge with that rule edit in view.
         crates/app/tests/tf_consistency_wiring_guard.rs
       — Tests: wiring-guard needle "daily_marker_path("
 
+### Fix round 3 (2026-07-15, review-round-3 confirmed — R1/R2)
+
+- [x] R1 — REST stale-expiry exemption narrowed to the three-condition
+      envelope: family-eligible AND `EpisodeState::reconfirmed` (in-process;
+      rehydrate() clears, any folded event sets; no snapshot-codec field —
+      back-compat by construction) AND in_ist_session ([09:15, 15:30) IST,
+      lockstep with the canonical MARKET_OPEN/CLOSE constants); rehydrate
+      resets the event-less clock so a continuing outage's re-fired edge
+      (~3-10 min) folds + reconfirms while a recovered-across-restart bubble
+      stale-closes 1800s after restart and the next outage pages FRESH;
+      Boot stays unconditional
+      — Files: crates/core/src/notification/episode.rs,
+        crates/core/src/notification/service.rs,
+        crates/core/tests/episode_rest_family_wiring_guard.rs
+      — Tests: test_rest_down_bubble_survives_restart_during_continuing_outage,
+        test_rest_down_bubble_recovered_across_restart_stale_closes_then_fresh_page,
+        test_rest_down_bubble_stale_closes_after_session_end,
+        test_rehydrate_clears_reconfirmed_and_resets_event_clock,
+        test_in_ist_session_bounds,
+        guard_rest_stale_expiry_exemption_is_the_three_condition_envelope
+- [x] R2 — pulls verdict mark never fabricated: green check only when every
+      rendered leg is FULLY counted and failure-free; warning on counted
+      failures / never-recovered gaps (real trouble wins); NO mark on
+      latency-only / failed-unmeasured legs; failed-unmeasured renders
+      "spot 735 ok (1.8s)" (never /total)
+      — Files: crates/core/src/notification/events.rs
+      — Tests: test_render_pulls_per_leg_never_fabricates_a_verdict_mark (5 arms),
+        re-pinned test_render_pulls_per_leg_skips_sentinel_legs_and_names_each_leg
+
 ## Merge coordination (G9c — REQUIRED READING for the coordinator)
 
 Two in-flight branches collide; **THIS branch (claude/telegram-clean-noise)
