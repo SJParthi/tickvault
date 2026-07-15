@@ -485,16 +485,19 @@ resource "aws_cloudwatch_metric_alarm" "late_tick_after_boundary" {
 
 # ---------------------------------------------------------------------------
 # 17. Host memory > 80% — the "time to upgrade" capacity signal.
-# Auto-DETECT, not auto-spend: this alarm tells the operator WHEN the r8g.large
-# 16 GiB box is running hot (e.g. both feeds at ~2K SIDs), so they can decide to
-# run scripts/aws-upgrade-instance.sh to a bigger type AFTER the dated-quote +
-# 4-file lock flip — it never resizes anything itself. Mirrors disk_used_high:
+# Auto-DETECT, not auto-spend: this alarm tells the operator WHEN the box is
+# running hot, so they can decide to run scripts/aws-upgrade-instance.sh to a
+# bigger type AFTER the dated-quote + 4-file lock flip — it never resizes
+# anything itself. 2026-07-15 note (Quote 8 downsize): the box is now
+# t4g.medium 4 GiB (was r8g.large 16 GiB) — this signal is MORE load-bearing
+# post-downsize (§7 Rule 2 headroom is ~0.9–1.7 GB budgeted, Assumed until
+# live-measured; t4g.large 8 GiB is the rip-cord). Mirrors disk_used_high:
 # a CloudWatch Metrics Insights query so we do NOT pin CWAgent mem dimensions.
 # CWAgent already publishes mem_used_percent (user-data.sh.tftpl metrics block).
 # ---------------------------------------------------------------------------
 resource "aws_cloudwatch_metric_alarm" "mem_used_high" {
   alarm_name          = "tv-${var.environment}-mem-used-high"
-  alarm_description   = "Host memory > 80% on r8g.large (16 GiB). Capacity signal — time to consider an instance upgrade. Run scripts/aws-upgrade-instance.sh --to <bigger-type> --ebs-size <GB> --qdb-mem <N>g AFTER the dated-quote + 4-file lock flip (daily-universe-scope-expansion-2026-05-27.md §7 Mechanical Rule 1). Auto-detect only — never auto-upgrades. See docs/runbooks/instance-upgrade.md."
+  alarm_description   = "Host memory > 80% on t4g.medium (4 GiB — 2026-07-15 downsize lock). Capacity signal — time to consider an instance upgrade (t4g.large 8 GiB is the rip-cord). Run scripts/aws-upgrade-instance.sh --to <bigger-type> --ebs-size <GB> --qdb-mem <N>g AFTER the dated-quote + 4-file lock flip (daily-universe-scope-expansion-2026-05-27.md §7 Mechanical Rule 1). Auto-detect only — never auto-upgrades. See docs/runbooks/instance-upgrade.md."
   comparison_operator = "GreaterThanThreshold"
   evaluation_periods  = 3
   threshold           = 80

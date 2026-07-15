@@ -227,6 +227,35 @@ fn deploy_terraform_files_exist() {
 
 const UPGRADE_SCRIPT: &str = "scripts/aws-upgrade-instance.sh";
 const APP_ALARMS_TF: &str = "deploy/aws/terraform/app-alarms.tf";
+const DOCKER_COMPOSE: &str = "deploy/docker/docker-compose.yml";
+
+/// The QuestDB-1g HALF of operator Quote 8 (2026-07-15, "Flip tonight:
+/// t4g.medium, QuestDB 1g, automated") — review round 6 ratchet. Two pins:
+///
+///   1. `deploy/docker/docker-compose.yml` must default the QuestDB container
+///      memory to `${QDB_MEM_LIMIT:-1g}` — a silent revert to `:-4g` would
+///      over-commit the 4 GiB t4g.medium host on any boot path that never
+///      wrote the on-box `.env` override.
+///   2. `scripts/aws-upgrade-instance.sh` must keep the per-target auto-default
+///      arm `t4g.medium) QDB_MEM="1g"` — the manual-fallback flip must couple
+///      the QuestDB ceiling to the instance size exactly like the workflow.
+#[test]
+fn deploy_questdb_mem_limit_pins_1g_for_t4g_medium() {
+    let compose = read(DOCKER_COMPOSE);
+    assert!(
+        compose.contains("${QDB_MEM_LIMIT:-1g}"),
+        "docker-compose.yml must default the QuestDB mem_limit to \
+         `${{QDB_MEM_LIMIT:-1g}}` (operator Quote 8, 2026-07-15 — the QuestDB-1g \
+         half of the t4g.medium downsize; a 4g default over-commits the 4 GiB host)."
+    );
+    let script = squish(&code_only(&read(UPGRADE_SCRIPT)));
+    assert!(
+        script.contains("t4g.medium) QDB_MEM=\"1g\""),
+        "aws-upgrade-instance.sh must keep the `t4g.medium) QDB_MEM=\"1g\"` \
+         auto-default arm (operator Quote 8, 2026-07-15) so the manual fallback \
+         couples QuestDB to 1g whenever the target is t4g.medium."
+    );
+}
 
 /// The in-place upgrade script MUST clear stop-protection before stopping —
 /// otherwise a stop on a still-`disable_api_stop=true` box fails mid-run
