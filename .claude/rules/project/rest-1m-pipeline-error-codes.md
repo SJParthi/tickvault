@@ -372,6 +372,19 @@ The typed pages are `GrowwContract1mFetchDegraded` /
 `GrowwContract1mFetchRecovered` (the 3-minute edge) +
 `GrowwContract1mBookUnresolved` (one HIGH per day).
 
+**2026-07-15 — the 14-day `empty_no_rows` root cause was OUR parse:** Dhan
+drifted `/v2/charts/intraday` `timestamp` serialization to
+scientific-notation floats (verbatim wire:
+`"timestamp":[1.7840871E9,1.78408716E9]`); the shared parser's `as_i64()`
+read rejected every float → every candle skipped → `rows_in_response=0` on
+all SIDs since the leg's first live session. The parser
+(`crates/app/src/dhan_intraday_parse.rs::timestamp_epoch_secs`) now
+dual-format-parses the timestamp (int OR finite ranged float — NaN/inf/
+negative/out-of-range floats skip that candle, per the existing skip
+conventions) — the #1524 diagnostics probes + the #1536 raw-body sample
+delivered the exact wire evidence. Dhan's same-day serving delay measured
+~1 s, not a cutoff; NOT an account condition.
+
 ## §2. SPOT1M-02 — spot_1m_rest persist failed
 
 **Severity:** High. **Auto-triage safe:** Yes (best-effort persist; the

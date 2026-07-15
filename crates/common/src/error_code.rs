@@ -896,31 +896,17 @@ pub enum ErrorCode {
     /// Severity::High, auto-triage-safe (the next trading day re-runs
     /// automatically; forced reruns are DEDUP-idempotent).
     TfVerify02RunDegraded,
-
-    // -----------------------------------------------------------------------
-    // 🔷 DHAN exit-order execution layer (Cluster B, 2026-07-14).
-    // Default-off behind FOUR independent locks (config default-off, no
-    // reachable live path, hardcoded dry_run, build-failing ratchet guard).
-    // Both codes are LOG-SINK-ONLY (no error_code_alerts map entry, no
-    // paging-list edit — the 2026-07-14 Dhan noise lock posture).
-    // See dhan-exit-order-lockout-2026-07-14.md.
-    // -----------------------------------------------------------------------
-    /// EXIT-ORDER-01: an exit engine call degraded — a validation refusal
-    /// on a dispatched command, a Dhan API error on a super/forever/sliced
-    /// order, an ENTRY_LEG cancel refused post-fill (the naked-position
-    /// race U4 — never exercised), or a slicing response anomaly.
-    /// Severity::High, auto-triage-safe (the dispatched command already
-    /// refused/degraded loudly; the operator inspects the correlation-id
-    /// forensic log line).
-    ExitOrder01ExecutionDegraded,
-    /// EXIT-VERIFY-01: the MPP verify ladder exhausted with a degraded
-    /// verdict — `PendingAtLimit` (MARKET→LIMIT auto-conversion resting on
-    /// the book past the deadline — orders.md rule 18; NEVER assumed
-    /// filled), a partial fill at budget (`needs_reconciliation` set — the
-    /// remainder is never silently forgotten), or an `Unknown` unparsable
-    /// status (fail-closed). Severity::High, auto-triage-safe (the order
-    /// stays tracked; reconcile + the caller's policy own the follow-up).
-    ExitVerify01Degraded,
+    /// FEED-GAP-01 (Groww hardening PR-3, 2026-07-14) — the feed GAP-EPISODE
+    /// forensics machinery DEGRADED: the tracker could not persist an
+    /// OPEN/CLOSE row to the `feed_gap_audit` table (ensure-DDL / ILP append /
+    /// flush), or the 15:45 IST scoreboard dangling-close sweep failed
+    /// (`stage` names the leg). ANNOTATION ONLY — never on the feed recovery
+    /// path or the tick hot path; the Telegram episode bubble still fires and
+    /// re-appends are DEDUP-idempotent (`ts, trading_date_ist, feed, start_ts,
+    /// outcome`). Telegram-episode-only delivery per the operator-approved
+    /// 2026-07-14 default (no CloudWatch filter). Severity::Medium,
+    /// auto-triage-safe.
+    FeedGap01EpisodeDegraded,
 }
 
 impl ErrorCode {
@@ -1098,8 +1084,8 @@ impl ErrorCode {
             // Daily timeframe-consistency verifier (operator 2026-07-13)
             Self::TfVerify01MismatchFound => "TF-VERIFY-01",
             Self::TfVerify02RunDegraded => "TF-VERIFY-02",
-            Self::ExitOrder01ExecutionDegraded => "EXIT-ORDER-01",
-            Self::ExitVerify01Degraded => "EXIT-VERIFY-01",
+            // Feed gap-episode forensics (Groww hardening PR-3, 2026-07-14)
+            Self::FeedGap01EpisodeDegraded => "FEED-GAP-01",
         }
     }
 
@@ -1325,12 +1311,10 @@ impl ErrorCode {
             // SCOREBOARD-01 (2026-07-10): best-effort daily forensic
             // aggregate degraded; feeds/capture/trading unaffected, the
             // DEDUP-idempotent re-run backfills. Medium.
-            | Self::Scoreboard01AggregationDegraded
-            // CADENCE-03 (operator 2026-07-14): the cadence scheduler
-            // degraded (ladder shift / late wake / boundary skip / respawn)
-            // — self-correcting scheduling telemetry, never data loss;
-            // the lane-level consequences page via CADENCE-01/02. Medium.
-            | Self::Cadence03SchedulerDegraded => Severity::Medium,
+            | Self::Scoreboard01AggregationDegraded => Severity::Medium,
+            // FEED-GAP-01 (2026-07-14): gap-episode forensics degraded —
+            // annotation-only side record; capture/recovery unaffected. Medium.
+            Self::FeedGap01EpisodeDegraded => Severity::Medium,
             // Low: trading-day / Dhan other
             // PR #6a (2026-05-19): I-P1-01 (DailyScheduler) + I-P1-02 (DeltaFieldCoverage) retired
             Self::InstrumentP2TradingDayGuard
@@ -1544,9 +1528,9 @@ impl ErrorCode {
             Self::TfVerify01MismatchFound | Self::TfVerify02RunDegraded => {
                 ".claude/rules/project/tf-consistency-error-codes.md"
             }
-            // 🔷 DHAN exit-order execution layer (Cluster B, 2026-07-14)
-            Self::ExitOrder01ExecutionDegraded | Self::ExitVerify01Degraded => {
-                ".claude/rules/project/dhan-exit-order-lockout-2026-07-14.md"
+            // Feed gap-episode forensics (Groww hardening PR-3, 2026-07-14)
+            Self::FeedGap01EpisodeDegraded => {
+                ".claude/rules/project/feed-gap-error-codes.md"
             }
         }
     }
@@ -1760,9 +1744,8 @@ impl ErrorCode {
             // Daily timeframe-consistency verifier (operator 2026-07-13)
             Self::TfVerify01MismatchFound,
             Self::TfVerify02RunDegraded,
-            // 🔷 DHAN exit-order execution layer (Cluster B, 2026-07-14)
-            Self::ExitOrder01ExecutionDegraded,
-            Self::ExitVerify01Degraded,
+            // Feed gap-episode forensics (Groww hardening PR-3, 2026-07-14)
+            Self::FeedGap01EpisodeDegraded,
         ]
     }
 }
@@ -2126,13 +2109,9 @@ mod tests {
         // recomputed-from-1m value — coalesced per (feed, date) pass,
         // manual triage) + TF-VERIFY-02 (the daily run degraded —
         // client/query/truncation/flush/budget stage taxonomy) => 148.
-        // 2026-07-14 (🔷 DHAN exit-order layer, Cluster B WP1): bumped
-        // 148 -> 150 for EXIT-ORDER-01 (exit engine call degraded —
-        // validation refusal / Dhan API error / post-fill ENTRY_LEG cancel
-        // refused / slicing anomaly) + EXIT-VERIFY-01 (MPP verify ladder
-        // exhausted with PendingAtLimit / partial-at-budget / Unknown —
-        // fail-closed, never assumed filled). Both log-sink-only.
-        assert_eq!(ErrorCode::all().len(), 150);
+        // 2026-07-14 (Groww hardening PR-3): FEED-GAP-01 (gap-episode
+        // forensics degraded — annotation-only side record) => 149.
+        assert_eq!(ErrorCode::all().len(), 149);
     }
 
     #[test]
@@ -2452,9 +2431,9 @@ mod tests {
                 || s.starts_with("CHAIN-")
                 // Operator 2026-07-13: daily timeframe-consistency verifier
                 || s.starts_with("TF-VERIFY-")
-                // 🔷 DHAN exit-order execution layer (Cluster B, 2026-07-14)
-                || s.starts_with("EXIT-ORDER-")
-                || s.starts_with("EXIT-VERIFY-");
+                // Groww hardening PR-3 (2026-07-14): feed gap-episode
+                // forensics.
+                || s.starts_with("FEED-GAP-");
             assert!(has_known_prefix, "unexpected code prefix: {s}");
         }
     }
