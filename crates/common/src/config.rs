@@ -8,9 +8,10 @@ use chrono::NaiveTime;
 use serde::Deserialize;
 
 use crate::constants::{
-    CADENCE_CHAIN_MIN_SPACING_FLOOR_MS, CADENCE_LADDER_MAX_RUNGS_CEILING,
-    CADENCE_SPOT_SPACING_FLOOR_MS, DHAN_DATA_API_DEFAULT_TARGET_RPS, DHAN_DATA_API_RPS_CEILING,
-    DHAN_DATA_API_RPS_FLOOR, SEBI_MAX_ORDERS_PER_SECOND,
+    CADENCE_CHAIN_MIN_SPACING_FLOOR_MS, CADENCE_GROWW_WAVE_STEP_MS,
+    CADENCE_LADDER_MAX_RUNGS_CEILING, CADENCE_SPOT_WINDOW_CAP_CEILING,
+    DHAN_DATA_API_DEFAULT_TARGET_RPS, DHAN_DATA_API_RPS_CEILING, DHAN_DATA_API_RPS_FLOOR,
+    SEBI_MAX_ORDERS_PER_SECOND,
 };
 use crate::trading_calendar::TradingCalendar;
 
@@ -768,12 +769,27 @@ pub struct CadenceConfig {
     /// pre-close).
     #[serde(default = "default_cadence_dhan_spot_start_offset_ms")]
     pub dhan_spot_start_offset_ms: i64,
-    /// Spacing between the 4 Dhan spot singles, ms. Default 400 (2.5 rps —
-    /// strictly under the shared limiter's 3 rps default so composition
-    /// never queues in steady state). Validated ≥ 334 (= exactly 3 rps,
-    /// the operator's recommended floor).
-    #[serde(default = "default_cadence_dhan_spot_spacing_ms")]
-    pub dhan_spot_spacing_ms: i64,
+    /// The Dhan spot ROLLING-1000ms-WINDOW gate cap (operator
+    /// spot-concurrency ladder addition 2026-07-15): at most this many
+    /// spot authorizations in ANY sliding 1000ms window. Default 4 (the
+    /// full simultaneous step-0 group); validated 1..=5 (the Dhan
+    /// Data-API hard cap is 5/sec). A cap below 4 structurally floors
+    /// the concurrency ladder's step so no group exceeds the cap.
+    #[serde(default = "default_cadence_spot_window_cap")]
+    pub spot_window_cap: u32,
+    /// Adaptive-concurrency degrade threshold (Assumed — default 2,
+    /// flagged for operator confirm): the Dhan spot-concurrency ladder
+    /// AND the Groww fallback-shape ladder degrade ONE step only after
+    /// this many CONSECUTIVE rate-limited-dirty cycles ("continuous",
+    /// never a one-off 429).
+    #[serde(default = "default_cadence_concurrency_degrade_after_dirty_cycles")]
+    pub concurrency_degrade_after_dirty_cycles: u32,
+    /// Adaptive-concurrency recovery threshold (Assumed — default 3,
+    /// flagged for operator confirm): both ladders climb back UP one
+    /// step after this many consecutive fully-clean cycles at the
+    /// current step (never permanently stuck from a one-off 429).
+    #[serde(default = "default_cadence_concurrency_recover_after_clean_cycles")]
+    pub concurrency_recover_after_clean_cycles: u32,
     /// Ladder clamp: a rung-shifted spot slot never lands earlier than
     /// T + this, ms. Default 300 — the proven house
     /// `SPOT_1M_REST_FIRE_DELAY_MS` post-close fire delay.
@@ -838,10 +854,22 @@ fn default_cadence_dhan_spot_start_offset_ms() -> i64 {
     3_000
 }
 
-/// Serde default for [`CadenceConfig::dhan_spot_spacing_ms`] — 400ms
-/// (2.5 rps, the operator's own example instants :03.0/:03.4/:03.8/:04.2).
-fn default_cadence_dhan_spot_spacing_ms() -> i64 {
-    400
+/// Serde default for [`CadenceConfig::spot_window_cap`] — 4 (the full
+/// step-0 simultaneous spot group, one under the Dhan 5/sec hard cap).
+fn default_cadence_spot_window_cap() -> u32 {
+    4
+}
+
+/// Serde default for [`CadenceConfig::concurrency_degrade_after_dirty_cycles`]
+/// — 2 (Assumed — flagged for operator confirm).
+fn default_cadence_concurrency_degrade_after_dirty_cycles() -> u32 {
+    2
+}
+
+/// Serde default for [`CadenceConfig::concurrency_recover_after_clean_cycles`]
+/// — 3 (Assumed — flagged for operator confirm).
+fn default_cadence_concurrency_recover_after_clean_cycles() -> u32 {
+    3
 }
 
 /// Serde default for [`CadenceConfig::spot_min_post_close_ms`] — the house
@@ -912,7 +940,11 @@ impl Default for CadenceConfig {
             enabled: false,
             dhan_chain_offsets_ms: default_cadence_dhan_chain_offsets_ms(),
             dhan_spot_start_offset_ms: default_cadence_dhan_spot_start_offset_ms(),
-            dhan_spot_spacing_ms: default_cadence_dhan_spot_spacing_ms(),
+            spot_window_cap: default_cadence_spot_window_cap(),
+            concurrency_degrade_after_dirty_cycles:
+                default_cadence_concurrency_degrade_after_dirty_cycles(),
+            concurrency_recover_after_clean_cycles:
+                default_cadence_concurrency_recover_after_clean_cycles(),
             spot_min_post_close_ms: default_cadence_spot_min_post_close_ms(),
             dhan_ladder_step_ms: default_cadence_dhan_ladder_step_ms(),
             dhan_ladder_max_rungs: default_cadence_dhan_ladder_max_rungs(),
@@ -963,11 +995,20 @@ impl CadenceConfig {
                 );
             }
         }
-        if self.dhan_spot_spacing_ms < CADENCE_SPOT_SPACING_FLOOR_MS {
+        if self.spot_window_cap == 0 || self.spot_window_cap > CADENCE_SPOT_WINDOW_CAP_CEILING {
             bail!(
-                "cadence.dhan_spot_spacing_ms ({}) must be >= {} (3 rps — the operator's recommended floor)",
-                self.dhan_spot_spacing_ms,
-                CADENCE_SPOT_SPACING_FLOOR_MS
+                "cadence.spot_window_cap ({}) must be in 1..={} (the Dhan Data-API hard cap is 5/sec)",
+                self.spot_window_cap,
+                CADENCE_SPOT_WINDOW_CAP_CEILING
+            );
+        }
+        if self.concurrency_degrade_after_dirty_cycles == 0
+            || self.concurrency_recover_after_clean_cycles == 0
+        {
+            bail!(
+                "cadence concurrency-ladder thresholds must be >= 1 (degrade_after_dirty {}, recover_after_clean {})",
+                self.concurrency_degrade_after_dirty_cycles,
+                self.concurrency_recover_after_clean_cycles
             );
         }
         if self.spot_min_post_close_ms < 0 {
@@ -1009,11 +1050,37 @@ impl CadenceConfig {
                 self.groww_request_timeout_ms
             );
         }
-        if self.groww_lane_cutoff_ms <= self.groww_burst_timeout_ms {
+        if self.groww_anchor_offset_ms < 0 {
             bail!(
-                "cadence.groww_lane_cutoff_ms ({}) must exceed groww_burst_timeout_ms ({}) — the fallback needs room inside the cutoff",
+                "cadence.groww_anchor_offset_ms ({}) must be >= 0 (the burst is a POST-close fire)",
+                self.groww_anchor_offset_ms
+            );
+        }
+        // The WORST fallback shape (choice 3: waves :01/:02/:03) must
+        // still reach its verdict strictly inside the lane cutoff — else
+        // the shape ladder's last resort could never resolve.
+        let worst_shape_verdict_ms = self
+            .groww_anchor_offset_ms
+            .saturating_add(3_i64.saturating_mul(CADENCE_GROWW_WAVE_STEP_MS))
+            .saturating_add(self.groww_burst_timeout_ms);
+        if self.groww_lane_cutoff_ms <= worst_shape_verdict_ms {
+            bail!(
+                "cadence.groww_lane_cutoff_ms ({}) must exceed the worst fallback shape's verdict instant ({}ms past T = anchor + 3 waves + burst timeout) — the choice-3 fallback needs room inside the cutoff",
                 self.groww_lane_cutoff_ms,
-                self.groww_burst_timeout_ms
+                worst_shape_verdict_ms
+            );
+        }
+        // NO-OVERLAP-INTO-NEXT-BURST structural bound: the worst shape's
+        // verdict plus a fully-sequential 7-leg fallback (each leg bounded
+        // by the per-request timeout) must complete strictly before the
+        // NEXT minute's burst anchor — fallback waves can never double-fire
+        // across the boundary.
+        let worst_groww_tail_ms = worst_shape_verdict_ms
+            .saturating_add(7_i64.saturating_mul(self.groww_request_timeout_ms));
+        if worst_groww_tail_ms >= 60_000 {
+            bail!(
+                "cadence groww worst-case cycle tail ({}ms = worst shape verdict + 7 sequential fallback legs) must end strictly before the next minute's burst (60000ms)",
+                worst_groww_tail_ms
             );
         }
         Ok(())
@@ -5179,7 +5246,9 @@ mod tests {
         // The judge-locked cadence table (design rev-8 §9).
         assert_eq!(d.dhan_chain_offsets_ms, vec![-5_000, -2_000, 2_000]);
         assert_eq!(d.dhan_spot_start_offset_ms, 3_000);
-        assert_eq!(d.dhan_spot_spacing_ms, 400);
+        assert_eq!(d.spot_window_cap, 4);
+        assert_eq!(d.concurrency_degrade_after_dirty_cycles, 2);
+        assert_eq!(d.concurrency_recover_after_clean_cycles, 3);
         assert_eq!(d.spot_min_post_close_ms, 300);
         assert_eq!(d.dhan_ladder_step_ms, 1_000);
         assert_eq!(d.dhan_ladder_max_rungs, 5);
@@ -5212,7 +5281,11 @@ mod tests {
             .expect("empty [cadence] must default, not error");
         assert!(!empty.cadence.enabled);
         assert_eq!(empty.cadence.dhan_chain_offsets_ms, d.dhan_chain_offsets_ms);
-        assert_eq!(empty.cadence.dhan_spot_spacing_ms, d.dhan_spot_spacing_ms);
+        assert_eq!(empty.cadence.spot_window_cap, d.spot_window_cap);
+        assert_eq!(
+            empty.cadence.concurrency_degrade_after_dirty_cycles,
+            d.concurrency_degrade_after_dirty_cycles
+        );
         assert_eq!(empty.cadence.groww_lane_cutoff_ms, d.groww_lane_cutoff_ms);
         // Explicit ON round-trips.
         let on: Wrapper = Figment::new()
@@ -5222,20 +5295,75 @@ mod tests {
         assert!(on.cadence.enabled);
     }
 
-    /// Cadence validate(): a spot spacing under the 334ms floor (3 rps)
-    /// is rejected at boot — the structural zero-429 spot floor.
+    /// Cadence validate(): the spot ROLLING-1000ms-WINDOW cap is bounded
+    /// 1..=5 (the Dhan Data-API hard cap is 5/sec) and the shared
+    /// concurrency-ladder streak thresholds must be >= 1 — the structural
+    /// zero-429 spot floor (operator spot-concurrency ladder 2026-07-15).
     #[test]
-    fn test_cadence_config_validate_rejects_sub_334_spacing() {
+    fn test_cadence_config_validate_rejects_bad_spot_window_cap() {
         let mut cfg = CadenceConfig::default();
-        cfg.dhan_spot_spacing_ms = 333;
+        cfg.spot_window_cap = 0;
         let err = cfg.validate().unwrap_err();
         assert!(
-            err.to_string().contains("dhan_spot_spacing_ms"),
+            err.to_string().contains("spot_window_cap"),
             "unexpected error: {err}"
         );
-        // The floor itself (334 = exactly 3 rps) is legal.
-        cfg.dhan_spot_spacing_ms = 334;
-        assert!(cfg.validate().is_ok());
+        cfg.spot_window_cap = 6;
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("spot_window_cap"),
+            "unexpected error: {err}"
+        );
+        // The whole legal range 1..=5 validates (a cap below 4 floors the
+        // concurrency ladder's step in `cadence::ladder` — never rejected
+        // here).
+        for cap in 1..=5u32 {
+            cfg.spot_window_cap = cap;
+            assert!(cfg.validate().is_ok(), "cap {cap} must be legal");
+        }
+        // The streak thresholds are Assumed operator knobs — but 0 would
+        // degrade/recover EVERY cycle (never "continuous"); refused.
+        cfg.spot_window_cap = 4;
+        cfg.concurrency_degrade_after_dirty_cycles = 0;
+        assert!(cfg.validate().is_err());
+        cfg.concurrency_degrade_after_dirty_cycles = 2;
+        cfg.concurrency_recover_after_clean_cycles = 0;
+        assert!(cfg.validate().is_err());
+    }
+
+    /// Cadence validate(): the Groww three-choice fallback-shape ladder's
+    /// structural bounds — the worst shape's verdict must fit inside the
+    /// lane cutoff, and the worst-case cycle tail (verdict + 7 sequential
+    /// fallback legs) must end strictly before the NEXT minute's burst
+    /// (the no-overlap-into-next-burst bound, coordinator 2026-07-15).
+    #[test]
+    fn test_cadence_config_validate_groww_shape_no_overlap_bounds() {
+        // The shipped defaults: worst verdict 0+3000+800 = 3800 < 6000
+        // cutoff; worst tail 3800 + 7*1500 = 14300 < 60000.
+        let d = CadenceConfig::default();
+        assert!(d.validate().is_ok());
+        // A cutoff at/below the choice-3 verdict is degenerate.
+        let mut cfg = CadenceConfig::default();
+        cfg.groww_lane_cutoff_ms = 3_800;
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("worst fallback shape"),
+            "unexpected error: {err}"
+        );
+        // A negative burst anchor (pre-close) is refused.
+        cfg.groww_lane_cutoff_ms = 6_000;
+        cfg.groww_anchor_offset_ms = -1;
+        assert!(cfg.validate().is_err());
+        // A request timeout that lets the sequential fallback spill into
+        // the next minute's burst is refused (7 legs * 8100ms > 56.2s
+        // after the choice-3 verdict).
+        cfg.groww_anchor_offset_ms = 0;
+        cfg.groww_request_timeout_ms = 8_100;
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("next minute's burst"),
+            "unexpected error: {err}"
+        );
     }
 
     /// Cadence validate(): chain slot offsets whose pairwise gap

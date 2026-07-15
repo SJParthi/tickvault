@@ -20,7 +20,7 @@ use tickvault_api::feed_state::FeedRuntimeState;
 use tickvault_common::config::ApplicationConfig;
 use tickvault_common::trading_calendar::TradingCalendar;
 use tickvault_core::cadence::{
-    CadenceRunnerDeps, DryRunLoggingExecutor, spawn_supervised_cadence_runner,
+    CadenceRunnerDeps, DryRunLoggingExecutor, StubExpiryResolver, spawn_supervised_cadence_runner,
 };
 use tokio::sync::Notify;
 use tracing::info;
@@ -60,6 +60,11 @@ pub fn spawn_cadence_scheduler(
         // toggle flips (dhan_flag/groww_flag), read per cycle per lane.
         dhan_enabled: feed_runtime.dhan_flag(),
         groww_enabled: feed_runtime.groww_flag(),
+        // ExpiryResolver seam (2026-07-15): day-1 stub — always
+        // unresolved (`None`); the scheduler NEVER guesses an expiry and
+        // the lanes carry the coalesced `expiry_unresolved` stage. The
+        // real resolution boot phase is a SEPARATE follow-up increment.
+        expiry_resolver: Arc::new(StubExpiryResolver),
         shutdown: Arc::clone(&shutdown),
     };
     // Fire-and-forget: the supervisor owns respawn; graceful teardown
@@ -67,8 +72,8 @@ pub fn spawn_cadence_scheduler(
     drop(spawn_supervised_cadence_runner(deps));
     info!(
         "cadence: supervised runner spawned (dry-run executors both lanes; \
-         chains pre-fire T-5s/T-2s + post T+2s, spots T+3s..T+4.2s, \
-         Groww burst T+0)"
+         chains pre-fire T-5s/T-2s + post T+2s, spots concurrency-laddered \
+         from T+3s, Groww waves shape-laddered from T+0)"
     );
     Some(shutdown)
 }

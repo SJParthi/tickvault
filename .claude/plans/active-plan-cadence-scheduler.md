@@ -12,9 +12,11 @@
 > **Honest 100% claim (envelope-qualified per operator-charter §F):**
 > 100% inside the tested envelope, with ratcheted regression coverage:
 > zero-429 is a STRUCTURAL property of the monotonic CAS gates (per-UL +
-> global chain gates 3000ms, dhan spot gate 400ms) proven by the
+> global chain gates 3000ms, dhan spot ROLLING-1000ms-WINDOW gate ≤
+> spot_window_cap — 2026-07-15 gate change) proven by the
 > deterministic replay proptest across 64-cycle permutations of skew,
-> jitter, GC pauses, latencies, failures, ladder walks and restarts;
+> jitter, GC pauses, latencies, failures, ladder walks (anchor rung +
+> concurrency step + Groww shape) and restarts;
 > the decide-path read is DHAT-pinned zero-alloc/O(1); default-OFF
 > config gate means byte-identical behavior until the operator flips
 > `[cadence] enabled`. NOT claimed: broker-side serving behavior
@@ -53,6 +55,50 @@ This PR ships NO REST caller — dry-run log sink only; merges AFTER #1540
 (hard dependency: `crates/common/src/moneyness.rs` +
 `crates/core/src/pipeline/chain_snapshot.rs`).
 
+**2026-07-15 operator spec ADDITION (adaptive ladders + window gate +
+resolver seam):** doc verification FIRST — NEITHER broker's
+historical-candle endpoint supports a multi-symbol batch in one HTTP
+request (Dhan `docs/dhan-ref/05-historical-data.md`: `securityId` is ONE
+string per request; Groww `docs/groww-ref/11-historical-candles.md` +
+the live `groww_spot_1m_boot.rs` caller: one `groww_symbol` per GET), so
+ladder step 0 = 4 SIMULTANEOUS single-symbol calls, never one batched
+request. (a) Dhan spot ADAPTIVE CONCURRENCY LADDER
+(`ladder.rs::StreakLadder` + `spot_group_index`): steps [[4]] → [[3],[1]]
+→ [[2],[2]] → [[1],[1],[1],[1]], groups at consecutive 1000ms-spaced
+anchors from the spot anchor slot; rung shift + post-close clamp apply to
+the group BASE. Degrade one step after 2 CONSECUTIVE spot-dirty
+(≥1 RateLimited spot outcome) cycles; recover one step after 3
+consecutive fully-clean-spot cycles — both config keys
+(`concurrency_degrade_after_dirty_cycles` = 2,
+`concurrency_recover_after_clean_cycles` = 3, BOTH Assumed pending
+operator confirm). (b) GATE CHANGE: the Dhan spot min-spacing gate is
+REPLACED by `gate.rs::RollingWindowGate` — max `spot_window_cap`
+(default 4, validate 1..=5 — Dhan hard cap 5/sec) authorizations in ANY
+sliding 1000ms window, same injected-clock monotonic-domain design,
+fixed 5-slot ring of the last authorization instants (O(1)); chain gates
+UNCHANGED. Honest composition note: the shared 3 rps
+`dhan_data_api_limiter` smooths a 4-simultaneous burst to ~3/sec — the
+window gate is the STRUCTURAL ceiling, the limiter defense-in-depth
+(documented, not fought). Failed-spot retries stay ≤1/instrument,
+APPENDED one full window after the last group anchor. (c) Groww
+THREE-CHOICE fallback-shape ladder (operator verbatim 2026-07-15,
+supersedes the same-day 3-wave note): choice 1 (default) = :00
+all-7-parallel; choice 2 = :01 all 3 chains / :02 ALL 4 spots (VIX
+included); choice 3 (last resort) = :01 chains / :02 core spots / :03
+VIX alone — its own `StreakLadder` (the SAME primitive as the spot
+ladder), same 2-dirty (any RateLimited Groww leg) / 3-clean rules. VIX
+absence NEVER blocks the Groww data-complete predicate
+(coordinator-confirmed 2026-07-15 — VIX stays advisory, surfaced via
+`vix_missing`). (d) ExpiryResolver seam (CONFIRMED minimal):
+`executor.rs::ExpiryResolver` trait (`resolved_expiry(broker,
+underlying) -> Option<u32>` yyyymmdd; None = unresolved — the scheduler
+NEVER guesses; the lane carries the coalesced CADENCE-01
+`expiry_unresolved` stage and the executor impl may fall back to its
+warmup expiry) + `ChainFetchRequest.expiry_yyyymmdd` stamped by the
+runner at request-build time + the day-1 `StubExpiryResolver` (always
+None) wired in `cadence_boot.rs`; the FULL resolution boot phase is a
+SEPARATE follow-up increment by a different worker.
+
 ## Edge Cases
 
 Minute-boundary races (wake at T±ε — no double fire, latch on
@@ -67,8 +113,16 @@ post_close=true); VIX advisory (never blocks a decision); spot exactly on
 a strike / exact midpoint tie (rounds UP per atm_strike_paise); zero /
 negative / NaN spot → every row Unknown, surfaced, all-3-Unknown ⇒
 Skipped; empty chain sentinel ⇒ not data-complete; 200-empty spot does
-NOT arm the ladder (Assumed, flagged); Groww burst partial failures
-(fallback re-fetches ONLY failures, chains-then-spots).
+NOT arm the ladder (Assumed, flagged); Groww wave partial failures
+(fallback re-fetches ONLY failures, chains-then-spots); concurrency
+ladders clamp to [structural floor for spot_window_cap, max step] and
+reset at day start; a spot_window_cap below 4 FLOORS the spot ladder's
+starting step (a cap of 2 cannot admit the 4-simultaneous group); at
+choice 2 the CoreSpots + VixSpot waves share the :02 anchor (all 4 spots
+together); Groww wave/fallback tails can NEVER overlap the next minute's
+:00 burst (validate() bounds the worst shape's verdict + 7 sequential
+request timeouts inside the 60s cycle, asserted again in the replay
+proof and the paused-time runner test).
 
 ## Failure Modes
 
@@ -109,12 +163,30 @@ test_cross_source_freshness_window_pre_close_chain_post_close_spot,
 test_spot_provenance_order_own_crossfill_chain_embedded,
 test_groww_burst_fallback_refetches_only_failures,
 test_cadence_config_default_off,
-test_cadence_config_validate_rejects_sub_334_spacing,
-test_cadence_config_validate_rejects_sub_3s_chain_gaps); the
+test_cadence_config_validate_rejects_bad_spot_window_cap,
+test_cadence_config_validate_groww_shape_no_overlap_bounds,
+test_cadence_config_validate_rejects_sub_3s_chain_gaps); the 2026-07-15
+ladder/gate/seam tests
+(test_spot_concurrency_ladder_degrades_after_2_dirty_recovers_after_3_clean,
+test_groww_shape_ladder_all_choice_transitions,
+test_spot_group_index_encodes_operator_groupings,
+test_groww_wave_indices_encode_three_choice_shapes,
+test_cadence_gate_rolling_window_cap_and_boundary,
+test_cadence_gate_rolling_window_monotonic_immune_and_reseed,
+test_cadence_schedule_spot_concurrency_groupings_per_step,
+test_cadence_schedule_groww_three_choice_wave_instants_no_overlap,
+test_cadence_expiry_resolver_stub_returns_none_scheduler_never_guesses,
+test_cadence_expiry_resolver_stamps_requests_when_resolved,
+test_dhan_spot_ladder_rate_limit_mid_ladder_degrades_then_recovers,
+test_groww_three_choice_ladder_all_transitions_and_vix_waves — runner
+end-to-end tier transitions 1→2, 2→3, 3→2, 2→1 + VIX wave placement +
+partial wave failures + the no-overlap-into-next-:00 assertion); the
 deterministic zero-429 replay proptest
 `crates/core/tests/cadence_zero_429_replay.rs::proptest_cadence_replay_zero_rate_violations`
 (SimClock, 64 consecutive cycles, skew/jitter/GC/latency/outcome/restart
-permutations — per-UL + GLOBAL chain deltas ≥3000ms, spot deltas ≥400ms,
+permutations FOLDING the real concurrency + shape ladders — per-UL +
+GLOBAL chain deltas ≥3000ms, NEVER more than spot_window_cap spot
+authorizations in ANY rolling 1000ms window,
 zero gate denials on nominal slots, ≤1 decision/lane/cycle, no decision
 past cutoff, every skip carries a reason); deterministic named tests
 (test_minute_boundary_race_no_double_fire,
@@ -167,7 +239,13 @@ tv_cadence_decision_total{lane,outcome}, tv_cadence_decision_latency_ms
 (histogram), tv_cadence_late_response_total{lane},
 tv_cadence_boundary_skipped_total, tv_cadence_late_wake_ms (histogram),
 tv_cadence_moneyness_unknown_total{lane,underlying},
-tv_cadence_runner_respawn_total{reason}. ErrorCodes CADENCE-01
+tv_cadence_runner_respawn_total{reason},
+tv_cadence_spot_concurrency_step (gauge) +
+tv_cadence_spot_concurrency_shifts_total{direction},
+tv_cadence_groww_shape_step (gauge) +
+tv_cadence_groww_shape_shifts_total{direction} (the 2026-07-15 adaptive
+ladders — CADENCE-03 stages spot_concurrency_shift / groww_shape_shift;
+CADENCE-01 gains the expiry_unresolved stage). ErrorCodes CADENCE-01
 (lane degraded, High), CADENCE-02 (decision skipped, High — the skip IS
 the fail-closed action), CADENCE-03 (scheduler degraded, Medium), all
 with stage fields, coalesced per-cycle, runbook

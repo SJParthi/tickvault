@@ -24,8 +24,8 @@ use tickvault_core::cadence::decision::{
     DecisionLatch, DecisionOutcome, DecisionSnapshot, SkipReason, emit_decision,
 };
 use tickvault_core::cadence::executor::{
-    CadenceExecutor, CadenceFetchError, ChainFetchOk, ChainFetchRequest, SpotFetchRequest,
-    SpotSnapshot, SpotTarget,
+    CadenceExecutor, CadenceFetchError, ChainFetchOk, ChainFetchRequest, ExpiryResolver,
+    SpotFetchRequest, SpotSnapshot, SpotTarget, StubExpiryResolver,
 };
 use tickvault_core::cadence::runner::{
     CadenceClock, CadenceRunnerDeps, LoopExit, run_cadence_loop, spawn_supervised_cadence_runner,
@@ -88,19 +88,44 @@ fn test_calendar() -> Arc<TradingCalendar> {
     Arc::new(TradingCalendar::from_config(&cfg).expect("calendar must build"))
 }
 
-/// One recorded executor call.
+/// One recorded executor call (`at_ms` = paused-tokio elapsed at the
+/// dispatch instant — under `start_paused` the runner wakes at EXACT
+/// slot targets, so wave/group instants are deterministically
+/// assertable: `wall = BASE_WALL_MS + at_ms`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum RecordedCall {
     Chain {
         feed: Feed,
         underlying: ChainUnderlying,
         cycle_minute_ist: u32,
+        expiry_yyyymmdd: Option<u32>,
+        at_ms: i64,
     },
     Spot {
         feed: Feed,
         target: SpotTarget,
         cycle_minute_ist: u32,
+        at_ms: i64,
     },
+}
+
+impl RecordedCall {
+    fn minute(&self) -> u32 {
+        match self {
+            Self::Chain {
+                cycle_minute_ist, ..
+            }
+            | Self::Spot {
+                cycle_minute_ist, ..
+            } => *cycle_minute_ist,
+        }
+    }
+
+    fn at_ms(&self) -> i64 {
+        match self {
+            Self::Chain { at_ms, .. } | Self::Spot { at_ms, .. } => *at_ms,
+        }
+    }
 }
 
 /// Scripted recording executor: logs every request; outcome decided by
@@ -108,6 +133,7 @@ enum RecordedCall {
 /// scripting).
 struct RecordingExecutor {
     log: Arc<Mutex<Vec<RecordedCall>>>,
+    start: tokio::time::Instant,
     chain_verdict: fn(&ChainFetchRequest, usize) -> Result<ChainFetchOk, CadenceFetchError>,
     spot_verdict: fn(&SpotFetchRequest, usize) -> Result<SpotSnapshot, CadenceFetchError>,
 }
@@ -146,14 +172,25 @@ impl CadenceExecutor for RecordingExecutor {
                         if *feed == req.feed && *underlying == req.underlying)
                 })
                 .count();
+            // APPROVED: paused-test elapsed fits i64 comfortably.
+            #[allow(clippy::cast_possible_truncation)]
             log.push(RecordedCall::Chain {
                 feed: req.feed,
                 underlying: req.underlying,
                 cycle_minute_ist: req.cycle_minute_ist,
+                expiry_yyyymmdd: req.expiry_yyyymmdd,
+                at_ms: self.start.elapsed().as_millis() as i64,
             });
         }
         let verdict = (self.chain_verdict)(&req, prior);
-        async move { verdict }
+        async move {
+            // Small paused-time latency: same-instant waves/groups all
+            // DISPATCH before any completion lands (the real-broker
+            // ordering) — instant completions would resolve the lane
+            // between two same-instant queue pops.
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            verdict
+        }
     }
 
     fn fetch_spot(
@@ -172,14 +209,21 @@ impl CadenceExecutor for RecordingExecutor {
                         if *feed == req.feed && *target == req.target)
                 })
                 .count();
+            // APPROVED: paused-test elapsed fits i64 comfortably.
+            #[allow(clippy::cast_possible_truncation)]
             log.push(RecordedCall::Spot {
                 feed: req.feed,
                 target: req.target,
                 cycle_minute_ist: req.cycle_minute_ist,
+                at_ms: self.start.elapsed().as_millis() as i64,
             });
         }
         let verdict = (self.spot_verdict)(&req, prior);
-        async move { verdict }
+        async move {
+            // See `fetch_chain` — dispatch-before-completion ordering.
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            verdict
+        }
     }
 }
 
@@ -204,6 +248,7 @@ fn deps_with(
         groww_executor: exec,
         dhan_enabled: Arc::new(AtomicBool::new(dhan_on)),
         groww_enabled: Arc::new(AtomicBool::new(groww_on)),
+        expiry_resolver: Arc::new(StubExpiryResolver),
         shutdown: Arc::clone(&shutdown),
     };
     (deps, shutdown)
@@ -232,6 +277,7 @@ async fn test_cadence_runner_dry_run_full_cycle_emits_decisions_or_skips() {
     let log = Arc::new(Mutex::new(Vec::new()));
     let exec = Arc::new(RecordingExecutor {
         log: Arc::clone(&log),
+        start: tokio::time::Instant::now(),
         chain_verdict: empty_chain,
         spot_verdict: empty_spot,
     });
@@ -357,6 +403,20 @@ async fn test_cadence_runner_dry_run_full_cycle_emits_decisions_or_skips() {
         }),
         "the runner must roll into the next cycle after a skipped one"
     );
+    // ExpiryResolver seam (2026-07-15): the day-1 stub is UNRESOLVED by
+    // design — every chain request is stamped `None` (the scheduler
+    // never guesses; the lane's coalesced CADENCE-01 carries the
+    // `expiry_unresolved` stage).
+    assert!(
+        !calls.iter().any(|c| matches!(
+            c,
+            RecordedCall::Chain {
+                expiry_yyyymmdd: Some(_),
+                ..
+            }
+        )),
+        "the StubExpiryResolver must stamp every chain request None"
+    );
 }
 
 #[tokio::test(start_paused = true)]
@@ -389,6 +449,7 @@ async fn test_groww_burst_fallback_refetches_only_failures() {
     let log = Arc::new(Mutex::new(Vec::new()));
     let exec = Arc::new(RecordingExecutor {
         log: Arc::clone(&log),
+        start: tokio::time::Instant::now(),
         chain_verdict,
         spot_verdict,
     });
@@ -520,6 +581,7 @@ async fn test_cadence_runner_reenable_after_both_disabled_park_still_cycles() {
     let log = Arc::new(Mutex::new(Vec::new()));
     let exec = Arc::new(RecordingExecutor {
         log: Arc::clone(&log),
+        start: tokio::time::Instant::now(),
         chain_verdict: empty_chain,
         spot_verdict: empty_spot,
     });
@@ -532,6 +594,7 @@ async fn test_cadence_runner_reenable_after_both_disabled_park_still_cycles() {
         groww_executor: Arc::clone(&exec),
         dhan_enabled: Arc::new(AtomicBool::new(false)),
         groww_enabled: Arc::clone(&groww_enabled),
+        expiry_resolver: Arc::new(StubExpiryResolver),
         shutdown: Arc::clone(&shutdown),
     };
     let clock = Arc::new(TestClock {
@@ -596,6 +659,7 @@ async fn test_cadence_supervisor_graceful_shutdown_not_respawning() {
     let log = Arc::new(Mutex::new(Vec::new()));
     let exec = Arc::new(RecordingExecutor {
         log,
+        start: tokio::time::Instant::now(),
         chain_verdict: empty_chain,
         spot_verdict: empty_spot,
     });
@@ -613,4 +677,338 @@ async fn test_cadence_supervisor_graceful_shutdown_not_respawning() {
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
     handle.await.expect("supervisor task must not panic");
+}
+
+// ---------------------------------------------------------------------------
+// 2026-07-15 adaptive ladders + ExpiryResolver seam (runner end-to-end)
+// ---------------------------------------------------------------------------
+
+/// Slot-instant tolerance, ms: paused-tokio wakes land at exact targets;
+/// a small allowance absorbs completion-processing interleaving.
+const SLOT_TOLERANCE_MS: i64 = 50;
+
+/// Expected `at_ms` (executor-elapsed) of a wave/group instant `offset_ms`
+/// after the boundary CLOSING `minute` (boundary = minute + 60s).
+fn expected_at(minute: u32, offset_ms: i64) -> i64 {
+    (i64::from(minute) + 60) * 1_000 - BASE_WALL_MS + offset_ms
+}
+
+fn assert_slot(actual: i64, minute: u32, offset_ms: i64, what: &str) {
+    let expected = expected_at(minute, offset_ms);
+    assert!(
+        actual >= expected && actual - expected <= SLOT_TOLERANCE_MS,
+        "{what}: fired at {actual}, expected {expected} (+{SLOT_TOLERANCE_MS}ms)"
+    );
+}
+
+/// Earliest (FIRST-attempt) dispatch instant among a cycle's calls
+/// matching `pred` — primaries fire at the wave/group instant; fallback
+/// re-fetches come strictly later.
+fn first_at(calls: &[RecordedCall], minute: u32, pred: impl Fn(&RecordedCall) -> bool) -> i64 {
+    calls
+        .iter()
+        .filter(|c| c.minute() == minute && pred(c))
+        .map(RecordedCall::at_ms)
+        .min()
+        .expect("the cycle must have fired the leg")
+}
+
+#[tokio::test(start_paused = true)]
+async fn test_cadence_expiry_resolver_stamps_requests_when_resolved() {
+    // The 2026-07-15 ExpiryResolver seam end-to-end: a RESOLVING
+    // resolver's yyyymmdd lands on EVERY chain request (both lanes —
+    // Dhan primaries/retries + Groww waves/fallback) at request-build
+    // time; the None passthrough is pinned by the stub assert in the
+    // full-cycle test above.
+    struct FixedExpiry;
+    impl ExpiryResolver for FixedExpiry {
+        fn resolved_expiry(&self, _b: Feed, _u: ChainUnderlying) -> Option<u32> {
+            Some(20_260_730)
+        }
+    }
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let exec = Arc::new(RecordingExecutor {
+        log: Arc::clone(&log),
+        start: tokio::time::Instant::now(),
+        chain_verdict: empty_chain,
+        spot_verdict: empty_spot,
+    });
+    let shutdown = Arc::new(Notify::new());
+    let deps = CadenceRunnerDeps {
+        config: CadenceConfig::default(),
+        calendar: test_calendar(),
+        dhan_executor: Arc::clone(&exec),
+        groww_executor: exec,
+        dhan_enabled: Arc::new(AtomicBool::new(true)),
+        groww_enabled: Arc::new(AtomicBool::new(true)),
+        expiry_resolver: Arc::new(FixedExpiry),
+        shutdown: Arc::clone(&shutdown),
+    };
+    let clock = Arc::new(TestClock {
+        anchor: tokio::time::Instant::now(),
+        base_wall_ms: BASE_WALL_MS,
+        date: NaiveDate::from_ymd_opt(2026, 7, 14).expect("valid date"),
+    });
+    let task = tokio::spawn(run_cadence_loop(clock, deps));
+    for _ in 0..30 {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+    shutdown.notify_waiters();
+    let exit = tokio::time::timeout(std::time::Duration::from_secs(120), task)
+        .await
+        .expect("runner must exit after shutdown")
+        .expect("runner task must not panic");
+    assert_eq!(exit, LoopExit::Shutdown);
+
+    // APPROVED (test-only): poisoned mutex propagates the panic.
+    #[allow(clippy::unwrap_used)]
+    let calls = log.lock().unwrap().clone();
+    let chains: Vec<_> = calls
+        .iter()
+        .filter(|c| matches!(c, RecordedCall::Chain { .. }))
+        .collect();
+    assert!(!chains.is_empty(), "the cycle must have fired chains");
+    assert!(
+        chains.iter().all(|c| matches!(
+            c,
+            RecordedCall::Chain {
+                expiry_yyyymmdd: Some(20_260_730),
+                ..
+            }
+        )),
+        "every chain request must carry the resolver's yyyymmdd stamp"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn test_dhan_spot_ladder_rate_limit_mid_ladder_degrades_then_recovers() {
+    // The 2026-07-15 Dhan spot CONCURRENCY ladder end-to-end, driven by
+    // rate limits MID-SPOT-LADDER: cycles 1-2 every spot leg 429s
+    // (spot-dirty ×2 consecutive → degrade one step) so cycle 3 runs
+    // step 1 ([[3],[1]] — group anchors 1000ms apart; cycle 3 stays
+    // dirty so the SECOND group is observable — a clean step-1 cycle
+    // resolves on the first group's data and honestly skips the rest);
+    // cycles 4-6 are fully clean (×3 consecutive → recover) so cycle 7
+    // is back at step 0 (all 4 SIMULTANEOUS single-symbol calls).
+    fn chain_ok(_req: &ChainFetchRequest, _p: usize) -> Result<ChainFetchOk, CadenceFetchError> {
+        Ok(ChainFetchOk {
+            underlying_spot: Some(24_500.0),
+            published_to_registry: false,
+        })
+    }
+    fn spot_verdict(req: &SpotFetchRequest, _p: usize) -> Result<SpotSnapshot, CadenceFetchError> {
+        if req.cycle_minute_ist < FIRST_CYCLE_MINUTE + 180 {
+            return Err(CadenceFetchError::RateLimited {
+                retry_after_ms: None,
+            });
+        }
+        Ok(SpotSnapshot {
+            price: 24_500.0,
+            source_minute_ist: req.cycle_minute_ist,
+            received_at_epoch_ms: 0,
+        })
+    }
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let exec = Arc::new(RecordingExecutor {
+        log: Arc::clone(&log),
+        start: tokio::time::Instant::now(),
+        chain_verdict: chain_ok,
+        spot_verdict,
+    });
+    // Dhan-only lane (isolates the spot ladder from the Groww shapes).
+    let (deps, shutdown) = deps_with(Arc::clone(&exec), true, false);
+    let clock = Arc::new(TestClock {
+        anchor: tokio::time::Instant::now(),
+        base_wall_ms: BASE_WALL_MS,
+        date: NaiveDate::from_ymd_opt(2026, 7, 14).expect("valid date"),
+    });
+    let task = tokio::spawn(run_cadence_loop(clock, deps));
+    for _ in 0..540 {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+    shutdown.notify_waiters();
+    let exit = tokio::time::timeout(std::time::Duration::from_secs(120), task)
+        .await
+        .expect("runner must exit after shutdown")
+        .expect("runner task must not panic");
+    assert_eq!(exit, LoopExit::Shutdown);
+
+    // APPROVED (test-only): poisoned mutex propagates the panic.
+    #[allow(clippy::unwrap_used)]
+    let calls = log.lock().unwrap().clone();
+    let spot_instants = |minute: u32| -> Vec<i64> {
+        let mut v: Vec<i64> = calls
+            .iter()
+            .filter(|c| c.minute() == minute && matches!(c, RecordedCall::Spot { .. }))
+            .map(RecordedCall::at_ms)
+            .collect();
+        v.sort_unstable();
+        v
+    };
+    // Cycle 1 (step 0, dirty): all 4 spots fired at ONE instant (a
+    // 429'd leg is never blind-retried, so exactly 4 calls).
+    let c1 = spot_instants(FIRST_CYCLE_MINUTE);
+    assert_eq!(c1.len(), 4, "cycle 1: 4 spot singles, no 429 retries");
+    assert!(c1[3] - c1[0] <= SLOT_TOLERANCE_MS, "step 0 = simultaneous");
+    // Cycle 3 (step 1 after 2 consecutive spot-dirty cycles; itself
+    // dirty so the lane never resolves early): groups [[3],[1]] — three
+    // together, the 4th one full window later.
+    let c3 = spot_instants(FIRST_CYCLE_MINUTE + 120);
+    assert_eq!(c3.len(), 4, "cycle 3: 4 spot singles, no 429 retries");
+    assert!(
+        c3[2] - c3[0] <= SLOT_TOLERANCE_MS,
+        "step 1 first group of 3"
+    );
+    assert!(
+        (c3[3] - c3[0] - 1_000).abs() <= SLOT_TOLERANCE_MS,
+        "step 1 second group exactly one 1000ms window later (got +{})",
+        c3[3] - c3[0]
+    );
+    // Cycle 7 (step 0 again after 3 consecutive clean cycles 4-6):
+    // recovered to the full simultaneous group (all 4 dispatch at the
+    // group anchor before any completion lands).
+    let c7 = spot_instants(FIRST_CYCLE_MINUTE + 360);
+    assert_eq!(c7.len(), 4, "cycle 7: 4 spot singles (clean)");
+    assert!(
+        c7[3] - c7[0] <= SLOT_TOLERANCE_MS,
+        "recovered to step 0 = simultaneous (span {})",
+        c7[3] - c7[0]
+    );
+}
+
+#[tokio::test(start_paused = true)]
+#[allow(clippy::too_many_lines)]
+async fn test_groww_three_choice_ladder_all_transitions_and_vix_waves() {
+    // The 2026-07-15 Groww THREE-CHOICE fallback-shape ladder end-to-end
+    // — ALL transitions (choice 1→2, 2→3, 3→2, 2→1) plus the VIX wave
+    // placement per choice: cycles 1-5 rate-limit every spot leg
+    // (dirty) so the ladder walks choice 1→2 (after cycle 2) →3 (after
+    // cycle 4), and cycle 5 — dirty — exercises choice 3 with the lane
+    // unresolved (a clean choice-3 cycle resolves on the core spots and
+    // honestly skips the trailing VIX wave); cycles 6+ are clean so it
+    // recovers 3→2 (after cycle 8) →1 (after cycle 11). PARTIAL WAVE
+    // FAILURES throughout: chains succeed while spots 429 — the verdict
+    // refetches only failures.
+    fn chain_ok(_req: &ChainFetchRequest, _p: usize) -> Result<ChainFetchOk, CadenceFetchError> {
+        Ok(ChainFetchOk {
+            underlying_spot: Some(24_500.0),
+            published_to_registry: false,
+        })
+    }
+    fn spot_verdict(req: &SpotFetchRequest, _p: usize) -> Result<SpotSnapshot, CadenceFetchError> {
+        if req.cycle_minute_ist < FIRST_CYCLE_MINUTE + 300 {
+            return Err(CadenceFetchError::RateLimited {
+                retry_after_ms: None,
+            });
+        }
+        Ok(SpotSnapshot {
+            price: 24_500.0,
+            source_minute_ist: req.cycle_minute_ist,
+            received_at_epoch_ms: 0,
+        })
+    }
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let exec = Arc::new(RecordingExecutor {
+        log: Arc::clone(&log),
+        start: tokio::time::Instant::now(),
+        chain_verdict: chain_ok,
+        spot_verdict,
+    });
+    // Groww-only lane (the shape ladder is independent of Dhan's).
+    let (deps, shutdown) = deps_with(Arc::clone(&exec), false, true);
+    let clock = Arc::new(TestClock {
+        anchor: tokio::time::Instant::now(),
+        base_wall_ms: BASE_WALL_MS,
+        date: NaiveDate::from_ymd_opt(2026, 7, 14).expect("valid date"),
+    });
+    let task = tokio::spawn(run_cadence_loop(clock, deps));
+    for _ in 0..780 {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+    shutdown.notify_waiters();
+    let exit = tokio::time::timeout(std::time::Duration::from_secs(120), task)
+        .await
+        .expect("runner must exit after shutdown")
+        .expect("runner task must not panic");
+    assert_eq!(exit, LoopExit::Shutdown);
+
+    // APPROVED (test-only): poisoned mutex propagates the panic.
+    #[allow(clippy::unwrap_used)]
+    let calls = log.lock().unwrap().clone();
+    let is_chain = |c: &RecordedCall| matches!(c, RecordedCall::Chain { .. });
+    let is_core_spot = |c: &RecordedCall| matches!(c, RecordedCall::Spot { target, .. } if target.chain_underlying().is_some());
+    let is_vix_spot = |c: &RecordedCall| {
+        matches!(
+            c,
+            RecordedCall::Spot {
+                target: SpotTarget::IndiaVix,
+                ..
+            }
+        )
+    };
+    // Cycle 1 — choice 1: ALL 7 in parallel at the :00 anchor.
+    let m1 = FIRST_CYCLE_MINUTE;
+    assert_slot(first_at(&calls, m1, is_chain), m1, 0, "c1 chains");
+    assert_slot(first_at(&calls, m1, is_core_spot), m1, 0, "c1 core spots");
+    assert_slot(first_at(&calls, m1, is_vix_spot), m1, 0, "c1 vix");
+    // Cycle 3 — choice 2 (degraded after 2 dirty): :01 all 3 chains,
+    // :02 ALL 4 spots (VIX INCLUDED — coordinator 2026-07-15).
+    let m3 = FIRST_CYCLE_MINUTE + 120;
+    assert_slot(first_at(&calls, m3, is_chain), m3, 1_000, "c3 chains");
+    assert_slot(
+        first_at(&calls, m3, is_core_spot),
+        m3,
+        2_000,
+        "c3 core spots",
+    );
+    assert_slot(
+        first_at(&calls, m3, is_vix_spot),
+        m3,
+        2_000,
+        "c3 vix with spots",
+    );
+    // Cycle 5 — choice 3 (degraded after 4 dirty): :01 chains, :02 core
+    // spots, :03 VIX ALONE (last resort only).
+    let m5 = FIRST_CYCLE_MINUTE + 240;
+    assert_slot(first_at(&calls, m5, is_chain), m5, 1_000, "c5 chains");
+    assert_slot(
+        first_at(&calls, m5, is_core_spot),
+        m5,
+        2_000,
+        "c5 core spots",
+    );
+    assert_slot(first_at(&calls, m5, is_vix_spot), m5, 3_000, "c5 vix alone");
+    // Cycle 9 — choice 2 again (recovered after 3 clean cycles 6-8):
+    // VIX rejoins the :02 spot wave.
+    let m9 = FIRST_CYCLE_MINUTE + 480;
+    assert_slot(first_at(&calls, m9, is_chain), m9, 1_000, "c9 chains");
+    assert_slot(
+        first_at(&calls, m9, is_vix_spot),
+        m9,
+        2_000,
+        "c9 vix with spots",
+    );
+    // Cycle 12 — choice 1 again (fully recovered): the :00 burst.
+    let m12 = FIRST_CYCLE_MINUTE + 660;
+    assert_slot(first_at(&calls, m12, is_chain), m12, 0, "c12 chains");
+    assert_slot(
+        first_at(&calls, m12, is_core_spot),
+        m12,
+        0,
+        "c12 core spots",
+    );
+    assert_slot(first_at(&calls, m12, is_vix_spot), m12, 0, "c12 vix");
+    // No wave (nor its sequential fallback tail) ever bleeds into the
+    // NEXT minute's :00 burst: every recorded dispatch for cycle N
+    // lands strictly before cycle N+1's boundary anchor.
+    for c in &calls {
+        let next_anchor = expected_at(c.minute() + 60, 0);
+        assert!(
+            c.at_ms() < next_anchor,
+            "a cycle-{} dispatch at {} overlaps the next :00 burst at {}",
+            c.minute(),
+            c.at_ms(),
+            next_anchor
+        );
+    }
 }
