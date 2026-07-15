@@ -1015,7 +1015,10 @@ impl CadenceConfig {
     /// gaps under 3s, a spot window cap outside 1..=5, out-of-range spot
     /// anchor / expiry knobs, negative clamps, non-positive
     /// cutoffs/timeouts, rungs above the :50 floor, an unknown recovery
-    /// mode, or a Groww cutoff at/below the burst verdict.
+    /// mode, a Groww cutoff at/below the burst verdict, a lane cutoff
+    /// at/above one minute, or chain offsets outside the feasible band
+    /// (last nominal slot at/after the Dhan cutoff, or a worst-case
+    /// ladder-shifted pre-fire anchor crossing a full minute back).
     pub fn validate(&self) -> Result<()> {
         if self.chain_min_spacing_ms < CADENCE_CHAIN_MIN_SPACING_FLOOR_MS {
             bail!(
@@ -1108,6 +1111,58 @@ impl CadenceConfig {
                 "cadence lane cutoffs must be > 0 (dhan {}, groww {})",
                 self.dhan_lane_cutoff_ms,
                 self.groww_lane_cutoff_ms
+            );
+        }
+        // Hostile-review round 1 (CAD-SEC-1, 2026-07-15): a lane cutoff
+        // at/above one minute makes EVERY cycle structurally overrun its
+        // boundary (run_cycle only breaks once the cutoff event pops), so
+        // each cycle fires a should-never boundary_skipped error and the
+        // cadence silently halves — refused as a degenerate schedule.
+        if self.dhan_lane_cutoff_ms >= 60_000 || self.groww_lane_cutoff_ms >= 60_000 {
+            bail!(
+                "cadence lane cutoffs must be < 60000ms — one cycle must resolve inside its own minute (dhan {}, groww {})",
+                self.dhan_lane_cutoff_ms,
+                self.groww_lane_cutoff_ms
+            );
+        }
+        // Hostile-review round 1 (CAD-NEW-3, 2026-07-15): a nominal chain
+        // slot at/after the Dhan cutoff sorts AFTER the DhanCutoff event —
+        // the cutoff skip resolves the lane FIRST and the runner's
+        // resolved-lane guard then silently discards the chain fire on
+        // EVERY cycle of the day (that underlying's mandated chain never
+        // dispatches, with the coded errors pointing at broker slowness
+        // instead of the degenerate schedule). Mirror of the spot-anchor
+        // feasibility check above.
+        if let Some(&last_chain_offset) = self.dhan_chain_offsets_ms.last() {
+            if last_chain_offset >= self.dhan_lane_cutoff_ms {
+                bail!(
+                    "cadence.dhan_chain_offsets_ms last slot ({}) must land strictly before dhan_lane_cutoff_ms ({}) — a nominal chain fire at/after the cutoff is silently discarded once the cutoff skip resolves the lane",
+                    last_chain_offset,
+                    self.dhan_lane_cutoff_ms
+                );
+            }
+        }
+        // CAD-NEW-3/CAD-SEC-1 lower bound: the anchor failure-ladder
+        // shifts the FIRST chain slot earlier by up to
+        // max_rungs * step_ms; a worst-case pre-fire anchor that crosses
+        // a full minute back lands in the PREVIOUS cycle, making
+        // next_joinable_boundary skip boundaries (or never find one) —
+        // a quietly-parked scheduler with no error at all. Refused.
+        let worst_prefire_ms = self
+            .dhan_chain_offsets_ms
+            .first()
+            .copied()
+            .unwrap_or(0)
+            .saturating_sub(
+                i64::from(self.dhan_ladder_max_rungs).saturating_mul(self.dhan_ladder_step_ms),
+            );
+        if worst_prefire_ms <= -60_000 {
+            bail!(
+                "cadence.dhan_chain_offsets_ms first slot ({}) shifted by the deepest failure-ladder rung ({} rungs x {}ms) reaches {}ms past T — the worst-case pre-fire anchor must stay strictly within the previous minute (> -60000ms)",
+                self.dhan_chain_offsets_ms.first().copied().unwrap_or(0),
+                self.dhan_ladder_max_rungs,
+                self.dhan_ladder_step_ms,
+                worst_prefire_ms
             );
         }
         if self.groww_burst_timeout_ms <= 0 || self.groww_request_timeout_ms <= 0 {
@@ -5491,6 +5546,69 @@ mod tests {
         cfg.recovery_mode = "step_back_one".to_string();
         cfg.dhan_ladder_max_rungs = 6;
         assert!(cfg.validate().is_err());
+    }
+
+    /// Cadence validate(): hostile-review round 1 bounds (CAD-NEW-3 +
+    /// CAD-SEC-1, 2026-07-15) — lane cutoffs must resolve inside one
+    /// minute, the LAST nominal chain slot must land strictly before the
+    /// Dhan cutoff (else its fire is silently discarded once the cutoff
+    /// skip resolves the lane), and the worst-case ladder-shifted
+    /// pre-fire anchor must stay strictly within the previous minute.
+    #[test]
+    fn test_cadence_config_validate_chain_offset_band_and_cutoff_ceiling() {
+        // A Dhan cutoff at/above one minute makes every cycle overrun.
+        let mut cfg = CadenceConfig {
+            dhan_lane_cutoff_ms: 120_000,
+            ..CadenceConfig::default()
+        };
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("< 60000ms"),
+            "unexpected error: {err}"
+        );
+        cfg.dhan_lane_cutoff_ms = 60_000;
+        assert!(cfg.validate().is_err(), "exactly 60000 is degenerate");
+        // Same ceiling on the Groww side.
+        cfg.dhan_lane_cutoff_ms = 15_000;
+        cfg.groww_lane_cutoff_ms = 60_000;
+        assert!(cfg.validate().is_err());
+        cfg.groww_lane_cutoff_ms = 6_000;
+        assert!(cfg.validate().is_ok());
+        // A nominal chain slot at/after the Dhan cutoff (CAD-NEW-3:
+        // -5000/-2000/16000 with the 15000 cutoff put the SENSEX chain
+        // fire past the cutoff — silently discarded every cycle).
+        cfg.dhan_chain_offsets_ms = vec![-5_000, -2_000, 16_000];
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("strictly before dhan_lane_cutoff_ms"),
+            "unexpected error: {err}"
+        );
+        cfg.dhan_chain_offsets_ms = vec![-5_000, -2_000, 15_000];
+        assert!(
+            cfg.validate().is_err(),
+            "a slot exactly AT the cutoff is equally discarded"
+        );
+        cfg.dhan_chain_offsets_ms = vec![-5_000, -2_000, 14_999];
+        assert!(cfg.validate().is_ok(), "just inside the cutoff is legal");
+        // A huge-negative offsets vector passes the pairwise-gap check but
+        // pushes the ladder-shifted pre-fire anchor into cycles PAST the
+        // previous minute — the scheduler would quietly park (CAD-SEC-1).
+        cfg.dhan_chain_offsets_ms = vec![-4_000_000, -3_997_000, -3_994_000];
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("previous minute"),
+            "unexpected error: {err}"
+        );
+        // The boundary case: first slot - 5 rungs * 1000ms == -60000
+        // exactly reaches the previous boundary — refused; one ms inside
+        // is legal.
+        cfg.dhan_chain_offsets_ms = vec![-55_000, -50_000, -45_000];
+        assert!(cfg.validate().is_err(), "-55000 - 5000 == -60000 refused");
+        cfg.dhan_chain_offsets_ms = vec![-54_999, -50_000, -45_000];
+        assert!(cfg.validate().is_ok(), "-54999 - 5000 == -59999 legal");
+        // The shipped defaults sit comfortably inside the band.
+        assert!(CadenceConfig::default().validate().is_ok());
     }
 
     /// Cadence validate(): the 2026-07-15 range checks — the spot anchor
