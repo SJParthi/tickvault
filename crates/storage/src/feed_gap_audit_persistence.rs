@@ -121,7 +121,7 @@ impl FeedGapAuditRow {
 
     /// Builds a CLOSED row (recovery edge; measurements carried).
     #[must_use]
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)] // APPROVED: audit-row builder — a params struct would be pure ceremony
     pub fn closed(
         ts_ist_nanos: i64,
         trading_date_ist_nanos: i64,

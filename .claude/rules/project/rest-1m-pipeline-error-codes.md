@@ -999,6 +999,11 @@ anchor stamps `underlying_spot = 0.0` + `moneyness = 'UNKNOWN'`; there is
 DELIBERATELY no contract-side moneyness counter — the existing
 `anchor_stale` / `selection_unresolved` counters + the `underlying_spot`
 column already name the cause per minute.
+**2026-07-15 update (hostile-review round 1 — supersedes the no-counter
+clause above):** the contract leg now DOES count stamped-UNKNOWN rows,
+once per fire, on the SAME `tv_moneyness_unknown_total` counter under the
+distinct static label value `feed="groww_contract"` — so contract-leg
+UNKNOWNs never conflate with the chain legs' `dhan`/`groww` series.
 
 **Chain-leg observability (three counters + latched warns, NO new
 ErrorCode):** `tv_moneyness_unknown_total{feed}` (one increment per UNKNOWN

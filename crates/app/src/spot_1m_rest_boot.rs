@@ -484,7 +484,7 @@ impl EmptyDiagnostics {
 pub fn ist_nanos_minute_label(minute_ist_nanos: i64, trading_date_nanos: i64) -> String {
     let secs_of_day = (minute_ist_nanos.saturating_sub(trading_date_nanos) / NANOS_PER_SEC)
         .clamp(0, i64::from(SECONDS_PER_DAY) - 1);
-    // APPROVED: clamped into [0, SECONDS_PER_DAY); the cast is safe.
+    // APPROVED: clamped into [0, SECONDS_PER_DAY) — the cast is safe.
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     format_minute_ist_12h(secs_of_day as u32)
 }

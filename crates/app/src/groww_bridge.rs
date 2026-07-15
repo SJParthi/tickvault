@@ -764,6 +764,7 @@ impl FeedGapTracker {
 /// IST "HH:MM" label for an IST-epoch-nanos instant (pure).
 pub(crate) fn ist_hhmm_label(ist_nanos: i64) -> String {
     let secs_of_day = (ist_nanos / 1_000_000_000).rem_euclid(86_400);
+    // O(1) EXEMPT: cold path — gap-episode label builder, once per episode edge
     format!(
         "{:02}:{:02}",
         secs_of_day / 3_600,
@@ -779,11 +780,13 @@ pub(crate) fn ist_hhmm_label(ist_nanos: i64) -> String {
 /// purity).
 pub(crate) fn partial_minute_labels(start_ist_nanos: i64, end_ist_nanos: i64) -> String {
     if end_ist_nanos < start_ist_nanos {
+        // O(1) EXEMPT: cold path — gap-episode annotation, once per episode edge
         return String::new();
     }
     const MINUTE_NANOS: i64 = 60 * 1_000_000_000;
     let first = start_ist_nanos.div_euclid(MINUTE_NANOS);
     let last = end_ist_nanos.div_euclid(MINUTE_NANOS);
+    // O(1) EXEMPT: cold path — bounded label list (FEED_GAP_PARTIAL_MINUTES_MAX), once per episode
     let mut out = String::new();
     let mut emitted = 0usize;
     let mut bucket = first;
@@ -2277,7 +2280,7 @@ pub fn rotate_stale_groww_capture_at_open_at(
     tick_file_path: &Path,
     today_ist_day: i64,
 ) -> Option<PathBuf> {
-    // O(1) EXEMPT: cold boot path — runs ONCE per process, strictly before the bridge + sidecar spawn.
+    // O(1) EXEMPT: cold boot path — one-shot rotate-at-open before any spawn
     let meta = std::fs::metadata(tick_file_path).ok()?;
     if meta.len() == 0 {
         return None; // empty file — nothing worth archiving
@@ -2290,7 +2293,7 @@ pub fn rotate_stale_groww_capture_at_open_at(
     // APPROVED: mtime seconds fit i64 for any realistic wall clock; cold boot path.
     let mtime_ist_day = ist_day_from_unix_secs(mtime_secs.as_secs() as i64);
     // Best-effort snapshot read (sync — cold boot path, before any spawn).
-    // O(1) EXEMPT: cold boot path — once per process, pre-spawn.
+    // O(1) EXEMPT: cold boot path — one-shot snapshot read at rotate-at-open
     let snapshot_ist_day = std::fs::read_to_string(offset_snapshot_path(tick_file_path))
         .ok()
         .and_then(|raw| serde_json::from_str::<GrowwOffsetSnapshot>(&raw).ok())
@@ -2332,7 +2335,7 @@ pub fn rotate_stale_groww_capture_at_open_at(
                      (first-boot edge)"
                 );
             }
-            // O(1) EXEMPT: cold boot path — one rename per boot, pre-spawn.
+            // O(1) EXEMPT: cold boot path — one-shot archive rename at rotate-at-open
             match std::fs::rename(tick_file_path, &target) {
                 Ok(()) => {
                     info!(
@@ -3015,6 +3018,7 @@ pub async fn run_groww_bridge(
     // tracker + a LAZY writer (constructed at the first edge; episodes are
     // rare cold-path events).
     {
+        // O(1) EXEMPT: cold path — once per bridge incarnation (ensure-DDL spawn)
         let qdb_for_gap_ddl = qdb.clone();
         tokio::spawn(async move {
             ensure_feed_gap_audit_table(&qdb_for_gap_ddl).await;
@@ -3579,7 +3583,7 @@ pub async fn run_groww_bridge(
                                 // so the row carries the honest -1 sentinel
                                 // (never a fabricated 0).
                                 tickvault_storage::feed_gap_audit_persistence::GAP_SENTINEL_UNKNOWN,
-                                partial.clone(),
+                                partial.clone(), // O(1) EXEMPT: cold path — once per gap episode
                             ),
                             tickvault_core::notification::NotificationEvent::FeedGapEpisodeClosed {
                                 feed: Feed::Groww.display_name().to_string(), // O(1) EXEMPT: cold path — once per gap episode
@@ -3602,7 +3606,7 @@ pub async fn run_groww_bridge(
                 // a healthy sidecar). Episode edges are cold (once per
                 // episode), so the spawn cost is irrelevant.
                 let writer_slot = Arc::clone(&gap_writer);
-                let qdb_for_gap = qdb.clone();
+                let qdb_for_gap = qdb.clone(); // O(1) EXEMPT: cold path — once per gap episode
                 tokio::task::spawn_blocking(move || {
                     let mut slot = writer_slot
                         .lock()

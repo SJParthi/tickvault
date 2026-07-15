@@ -568,8 +568,9 @@ jobs:
   # filesystem disagrees with the list below (a new/renamed file must be
   # added to the list). Side 2 — each cargo test step asserts the EXECUTED
   # target count ("Running tests/dhat_" lines) equals its expected count
-  # (10 core / 3 storage / 3 trading — PR-C3 2026-07-14 truth-sync; the
-  # deleted dhat_tick_gap_detector left core at 10), so a `--test` flag dropped from a
+  # (11 core / 3 storage / 3 trading — PR-C3 2026-07-14 truth-sync; the
+  # deleted dhat_tick_gap_detector left core at 10. The moneyness PR
+  # re-added one target (dhat_moneyness): 10 -> 11), so a `--test` flag dropped from a
   # run step (while the file + list entry survive) fails loudly instead of
   # silently un-gating that target (2026-07-09 adversarial-review HIGH).
   #
@@ -675,8 +676,9 @@ jobs:
           ran=$(grep -c 'Running.*tests/dhat_' /tmp/dhat-core.log || true)
           # PR-C3 (2026-07-14): 11 -> 10 — dhat_tick_gap_detector deleted
           # with the tick-gap detector (operator Q4-ii 2026-07-13).
-          if [ "$ran" -ne 10 ]; then
-            echo "::error::core DHAT step executed $ran targets, expected 10 — a --test flag was dropped from this step (drift list vs run step mismatch)."
+          # The moneyness PR re-added one target (dhat_moneyness): 10 -> 11.
+          if [ "$ran" -ne 11 ]; then
+            echo "::error::core DHAT step executed $ran targets, expected 11 — a --test flag was dropped from this step (drift list vs run step mismatch)."
             exit 1
           fi
 

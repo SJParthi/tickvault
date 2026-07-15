@@ -2338,18 +2338,18 @@ mod tests {
         // refused / slicing anomaly) + EXIT-VERIFY-01 (MPP verify ladder
         // exhausted with PendingAtLimit / partial-at-budget / Unknown —
         // fail-closed, never assumed filled). Both log-sink-only.
-        // 2026-07-15 (Groww order fan-out contract stubs): bumped
-        // 151 -> 165. Groww Portfolio 6c.1 contract stubs (§39.3,
-        // 2026-07-14): +4 for GROWW-PORT-01 (snapshot fetch degraded) +
-        // GROWW-PORT-02 (persist failed, best-effort) + GROWW-PORT-03
-        // (recon residual confirmed — manual triage, FUTIDX-02 precedent)
-        // + GROWW-PORT-04 (foreign position — never auto-exited). Plus
-        // +5 GROWW-OCO-01..05 (smart-order placement/sibling-cancel-
-        // unverified/reconcile/modify/poller) and +5 GROWW-MARG-01..05
-        // (margin fetch/persist/stale-gate/entry-refused/calc-divergence).
-        // All log-sink-only contract stubs; zero emit sites until the
-        // area code PRs land.
-        assert_eq!(ErrorCode::all().len(), 165);
+        // 2026-07-15 (C4 sweep — Dhan live-WS retirement, operator
+        // 2026-07-13): DROPPED 151 -> 129. The 22 zero-emit-site variants
+        // retained through Phases A/B/C1/C2/C3 were deleted:
+        // INSTR-FETCH-01..04, NTM-CONSTITUENCY-01, PREVDAY-01,
+        // CROSS-VERIFY-1M-01/-02, DHAN-LANE-01..04, WS-GAP-05..09,
+        // AUTH-GAP-06, REST-CANARY-01, SLO-01/02/03 (WS-GAP-04 +
+        // WS-GAP-10 survive — emitted by the retained-dormant
+        // order_update_connection.rs; main's FEED-GAP-01 landed
+        // mid-flight making the pre-merge base 149, and the exit-order
+        // pair #1566 landed during the merge train making it 151 —
+        // hence 151 -> 129, not 148 -> 126).
+        assert_eq!(ErrorCode::all().len(), 129);
     }
 
     #[test]
@@ -2558,196 +2558,6 @@ mod tests {
                 code.code_str()
             );
         }
-    }
-
-    #[test]
-    fn test_groww_port_codes_contract() {
-        // 🟢 GROWW order-side fan-out contract stubs (2026-07-15) —
-        // Portfolio family. All High; zero emit sites until the area PR.
-        for (code, s, auto_safe) in [
-            (
-                ErrorCode::GrowwPort01SnapshotDegraded,
-                "GROWW-PORT-01",
-                true,
-            ),
-            (ErrorCode::GrowwPort02PersistFailed, "GROWW-PORT-02", true),
-            // GROWW-PORT-03: broker-vs-local reconcile divergence is a
-            // data-comparability signal — the severity-independent
-            // override arm returns false (the FUTIDX-02 precedent).
-            (
-                ErrorCode::GrowwPort03ReconDivergence,
-                "GROWW-PORT-03",
-                false,
-            ),
-            (ErrorCode::GrowwPort04ForeignPosition, "GROWW-PORT-04", true),
-        ] {
-            assert_eq!(code.code_str(), s);
-            assert_eq!(s.parse::<ErrorCode>(), Ok(code));
-            assert_eq!(code.severity(), Severity::High);
-            assert_eq!(code.is_auto_triage_safe(), auto_safe);
-            assert_eq!(
-                code.runbook_path(),
-                ".claude/rules/project/groww-portfolio-error-codes.md"
-            );
-            assert!(ErrorCode::all().contains(&code));
-            // The runbook must exist on disk (cross-ref test parity).
-            let abs = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .parent()
-                .and_then(std::path::Path::parent)
-                .map(|root| root.join(code.runbook_path()))
-                .expect("workspace root");
-            let shown = abs.display().to_string();
-            assert!(abs.exists(), "{s} runbook missing on disk: {shown}");
-        }
-    }
-
-    #[test]
-    fn test_groww_oco_codes_contract() {
-        // 🟢 GROWW order-side fan-out contract stubs (2026-07-15) —
-        // Smart Orders (GTT/OCO) family.
-        for (code, s, sev, auto_safe) in [
-            (
-                ErrorCode::GrowwOco01PlacementFailed,
-                "GROWW-OCO-01",
-                Severity::High,
-                true,
-            ),
-            // GROWW-OCO-02: sibling-cancel UNVERIFIED past the deadline
-            // = a double-fill exposure window. Critical — auto-triage
-            // false via the Critical BLANKET (deliberately NOT an
-            // override-list entry; test_critical_codes_never_auto_triage
-            // also pins it).
-            (
-                ErrorCode::GrowwOco02SiblingCancelUnverified,
-                "GROWW-OCO-02",
-                Severity::Critical,
-                false,
-            ),
-            // GROWW-OCO-03: reconcile mismatch vs broker — the
-            // severity-independent override arm returns false (the
-            // FUTIDX-02 data-comparability precedent).
-            (
-                ErrorCode::GrowwOco03ReconcileMismatch,
-                "GROWW-OCO-03",
-                Severity::High,
-                false,
-            ),
-            (
-                ErrorCode::GrowwOco04ModifyRejected,
-                "GROWW-OCO-04",
-                Severity::Medium,
-                true,
-            ),
-            (
-                ErrorCode::GrowwOco05PollerDegraded,
-                "GROWW-OCO-05",
-                Severity::High,
-                true,
-            ),
-        ] {
-            assert_eq!(code.code_str(), s);
-            assert_eq!(s.parse::<ErrorCode>(), Ok(code));
-            assert_eq!(code.severity(), sev);
-            assert_eq!(code.is_auto_triage_safe(), auto_safe);
-            assert_eq!(
-                code.runbook_path(),
-                ".claude/rules/project/groww-oco-error-codes.md"
-            );
-            assert!(ErrorCode::all().contains(&code));
-            let abs = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .parent()
-                .and_then(std::path::Path::parent)
-                .map(|root| root.join(code.runbook_path()))
-                .expect("workspace root");
-            let shown = abs.display().to_string();
-            assert!(abs.exists(), "{s} runbook missing on disk: {shown}");
-        }
-    }
-
-    #[test]
-    fn test_groww_marg_codes_contract() {
-        // 🟢 GROWW order-side fan-out contract stubs (2026-07-15) —
-        // Margin family.
-        for (code, s, sev, auto_safe) in [
-            (
-                ErrorCode::GrowwMarg01FetchDegraded,
-                "GROWW-MARG-01",
-                Severity::High,
-                true,
-            ),
-            (
-                ErrorCode::GrowwMarg02PersistFailed,
-                "GROWW-MARG-02",
-                Severity::High,
-                true,
-            ),
-            // GROWW-MARG-03: fail-CLOSED for entries is the design
-            // working — the page is visibility; auto-triage may inspect.
-            (
-                ErrorCode::GrowwMarg03SnapshotStaleGateClosed,
-                "GROWW-MARG-03",
-                Severity::High,
-                true,
-            ),
-            // GROWW-MARG-04: spend authorization on the POOLED shared
-            // account is operator territory — the severity-independent
-            // override arm returns false (the funds-margin shared-account
-            // doctrine; the FUTIDX-02 precedent).
-            (
-                ErrorCode::GrowwMarg04EntryRejectedInsufficient,
-                "GROWW-MARG-04",
-                Severity::High,
-                false,
-            ),
-            (
-                ErrorCode::GrowwMarg05CalcDivergence,
-                "GROWW-MARG-05",
-                Severity::Medium,
-                true,
-            ),
-        ] {
-            assert_eq!(code.code_str(), s);
-            assert_eq!(s.parse::<ErrorCode>(), Ok(code));
-            assert_eq!(code.severity(), sev);
-            assert_eq!(code.is_auto_triage_safe(), auto_safe);
-            assert_eq!(
-                code.runbook_path(),
-                ".claude/rules/project/groww-margin-error-codes.md"
-            );
-            assert!(ErrorCode::all().contains(&code));
-            let abs = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .parent()
-                .and_then(std::path::Path::parent)
-                .map(|root| root.join(code.runbook_path()))
-                .expect("workspace root");
-            let shown = abs.display().to_string();
-            assert!(abs.exists(), "{s} runbook missing on disk: {shown}");
-        }
-    }
-
-    #[test]
-    fn test_prev_day_01_coverage_empty_contract() {
-        let code = ErrorCode::PrevDay01CoverageEmpty;
-        // Wire-format string + roundtrip via FromStr.
-        assert_eq!(code.code_str(), "PREVDAY-01");
-        assert_eq!("PREVDAY-01".parse::<ErrorCode>(), Ok(code));
-        // High (boot-data gap, not a halt) and therefore auto-triage-safe.
-        assert_eq!(code.severity(), Severity::High);
-        assert!(code.is_auto_triage_safe());
-        // Runbook points at the dedicated rule file and exists on disk.
-        assert_eq!(
-            code.runbook_path(),
-            ".claude/rules/project/prev-day-ohlcv-error-codes.md"
-        );
-        let abs = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .and_then(std::path::Path::parent)
-            .map(|root| root.join(code.runbook_path()))
-            .expect("workspace root");
-        let shown = abs.display().to_string();
-        assert!(abs.exists(), "PREVDAY-01 runbook missing on disk: {shown}");
-        // Listed in the catalogue.
-        assert!(ErrorCode::all().contains(&code));
     }
 
     #[test]

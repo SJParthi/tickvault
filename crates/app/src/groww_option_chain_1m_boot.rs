@@ -1222,6 +1222,11 @@ async fn fire_one_groww_chain_minute(
                             volume: leg.volume,
                             // No previous-day OI in the Groww payload.
                             previous_oi: 0,
+                            // RAW vendor ltp BY DESIGN: the DB
+                            // `underlying_spot` column mirrors the wire
+                            // verbatim, while the classification above used
+                            // the GUARDED `moneyness_spot` (0.0 when the
+                            // vendor omitted the ltp → every row UNKNOWN).
                             underlying_spot: chain.underlying_ltp,
                             fetched_at_ist_nanos: fetched_at,
                             moneyness: leg_moneyness.as_str(),
@@ -3569,6 +3574,7 @@ mod tests {
             &mut edge,
             &mut not_served,
             &mut token_cache,
+            &mut MoneynessWarnLatches::default(),
             9 * 3600 + 18 * 60,
         )
         .await;

@@ -1672,6 +1672,7 @@ async fn supervise_child(
                 // scheduler starvation could still miss the latch; the exit
                 // then counts as a plain relaunch, never a silent loss of the
                 // relaunch itself).
+                // APPROVED: 250ms drain-EOF scheduling headroom (S2) — cold relaunch path, documented above
                 tokio::time::sleep(std::time::Duration::from_millis(250)).await;
                 if escalation_exit_seen.load(std::sync::atomic::Ordering::Relaxed) {
                     // Mirror of the stall-watchdog kill (FEED-STALL-01): the
