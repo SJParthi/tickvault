@@ -42,6 +42,15 @@
 
 pub use tickvault_common::broker_order_events::{BrokerOrderEvent, BrokerOrderStatus, EventSource};
 
+// Orders-area PURE CORE (ORD-PR-2 — GROWW-ORD-*; no transport, no ErrorCode
+// emits yet — those land in ORD-PR-3 once the variants exist):
+pub mod intent_ledger;
+pub mod poll_tiers;
+pub mod reconcile;
+pub mod reference_id;
+pub mod state;
+pub mod types;
+
 // Area modules land in their own serial PRs, each behind this same feature:
 //   pub mod api_client;    // Orders        (GROWW-ORD-*)
 //   pub mod smart_orders;  // Smart Orders  (GROWW-OCO-*)
