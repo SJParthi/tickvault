@@ -74,7 +74,8 @@ fi
 # and the boot lands on the docker-run last resort or BOOT-02.
 # Same pin + official sha256 constants as the deploy-script copy — BUMP IN
 # LOCKSTEP (both recorded 2026-07-14 from the official docker/compose
-# release checksums.txt; box is r8g.large = aarch64, x86_64 kept for
+# release checksums.txt; box is aarch64 Graviton either way — t4g.medium
+# since the 2026-07-15 downsize lock, was r8g.large — x86_64 kept for
 # dev/DR parity). Download lands in /tmp first; ONLY a checksum-verified
 # file is installed (atomic install -m 0755, root). Bounded + fail-loud in
 # this provision log, but NON-fatal: provisioning must not brick on a

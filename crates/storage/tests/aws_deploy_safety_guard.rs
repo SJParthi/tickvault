@@ -175,20 +175,24 @@ fn deploy_eip_is_enabled_by_default() {
     );
 }
 
-/// EBS hot-window default is 50 GB (operator approval 2026-07-13 — prod
-/// disk-pressure grow 30 -> 50; history 10 -> 30 -> 50; S3 cold-tier
-/// archives partitions > 90d).
+/// EBS FRESH-PROVISION default is 20 GB (2026-07-15 downsize pre-stage —
+/// executor decision recorded in daily-universe-scope-expansion §0/§7 Rule 3,
+/// NOT operator-quoted scope). gp3 cannot SHRINK, so the LIVE root stays
+/// 50 GB tonight; 20 GB lands only via the terminate-and-recreate in the
+/// operator's erase window. History 10 -> 30 -> 50 -> 20 target; S3
+/// cold-tier archives partitions > 90d.
 #[test]
-fn deploy_ebs_default_is_50gb() {
+fn deploy_ebs_default_is_20gb() {
     let vars = squish(&read(VARIABLES_TF));
     assert!(
         vars.contains("variable \"ebs_gp3_size_gb\""),
         "variables.tf must declare `ebs_gp3_size_gb`."
     );
     assert!(
-        vars.contains("type = number default = 50"),
-        "ebs_gp3_size_gb must default to 50 GB (operator approval 2026-07-13 — \
-         disk-pressure grow; supersedes the 2026-05-29 §7 Quote 6 30 GB lock)."
+        vars.contains("type = number default = 20"),
+        "ebs_gp3_size_gb must default to 20 GB (2026-07-15 downsize pre-stage: \
+         fresh-volume replacement target only — the live 50 GB root cannot \
+         shrink in place; supersedes the 2026-07-13 50 GB grow default)."
     );
 }
 
@@ -223,6 +227,35 @@ fn deploy_terraform_files_exist() {
 
 const UPGRADE_SCRIPT: &str = "scripts/aws-upgrade-instance.sh";
 const APP_ALARMS_TF: &str = "deploy/aws/terraform/app-alarms.tf";
+const DOCKER_COMPOSE: &str = "deploy/docker/docker-compose.yml";
+
+/// The QuestDB-1g HALF of operator Quote 8 (2026-07-15, "Flip tonight:
+/// t4g.medium, QuestDB 1g, automated") — review round 6 ratchet. Two pins:
+///
+///   1. `deploy/docker/docker-compose.yml` must default the QuestDB container
+///      memory to `${QDB_MEM_LIMIT:-1g}` — a silent revert to `:-4g` would
+///      over-commit the 4 GiB t4g.medium host on any boot path that never
+///      wrote the on-box `.env` override.
+///   2. `scripts/aws-upgrade-instance.sh` must keep the per-target auto-default
+///      arm `t4g.medium) QDB_MEM="1g"` — the manual-fallback flip must couple
+///      the QuestDB ceiling to the instance size exactly like the workflow.
+#[test]
+fn deploy_questdb_mem_limit_pins_1g_for_t4g_medium() {
+    let compose = read(DOCKER_COMPOSE);
+    assert!(
+        compose.contains("${QDB_MEM_LIMIT:-1g}"),
+        "docker-compose.yml must default the QuestDB mem_limit to \
+         `${{QDB_MEM_LIMIT:-1g}}` (operator Quote 8, 2026-07-15 — the QuestDB-1g \
+         half of the t4g.medium downsize; a 4g default over-commits the 4 GiB host)."
+    );
+    let script = squish(&code_only(&read(UPGRADE_SCRIPT)));
+    assert!(
+        script.contains("t4g.medium) QDB_MEM=\"1g\""),
+        "aws-upgrade-instance.sh must keep the `t4g.medium) QDB_MEM=\"1g\"` \
+         auto-default arm (operator Quote 8, 2026-07-15) so the manual fallback \
+         couples QuestDB to 1g whenever the target is t4g.medium."
+    );
+}
 
 /// The in-place upgrade script MUST clear stop-protection before stopping —
 /// otherwise a stop on a still-`disable_api_stop=true` box fails mid-run

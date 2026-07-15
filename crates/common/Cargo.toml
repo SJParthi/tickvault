@@ -19,6 +19,11 @@ tracing = { workspace = true }
 secrecy = { workspace = true }
 uuid = { workspace = true }
 arrayvec = { workspace = true }
+# tokio (workspace-pinned): used ONLY for the `broker_order_events::push_active`
+# watch channel — the Session-3 order-update PUSH-active seam that lives in
+# `common` so a future core/app producer + a trading consumer share it without
+# either depending on `tickvault-trading` (Groww orders PR-A0, 2026-07-15).
+tokio = { workspace = true }
 
 # CVE pins (2026-04-22, Parthiban-authorised). Unused direct deps that
 # exist solely to force `cargo`'s lockfile resolver to pick patched

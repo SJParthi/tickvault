@@ -133,9 +133,61 @@ jobs:
           targets: aarch64-unknown-linux-musl
 
       - name: Install ARM64 musl build deps (cmake for aws-lc-rs + musl-tools)
+        # 2026-07-15: SUSTAINED ports.ubuntu.com outage killed deploy runs
+        # 29430374817 / 29431100541 / 29432110918 (IPv6 net-unreachable +
+        # IPv4 connect timeouts on 91.189.91.102/.103/.104). Hardening:
+        #   - Acquire::Retries=5 + 15s http/https timeouts + ForceIPv4 on
+        #     EVERY apt call (the IPv6 arm of the outage makes ForceIPv4
+        #     free insurance).
+        #   - Fallback chain (evidence 2026-07-15, PR #1586 verification):
+        #       1) default sources (http://ports.ubuntu.com)
+        #       2) http://azure.ports.ubuntu.com — VERIFIED serving the
+        #          genuine noble ubuntu-ports Release (Architectures incl.
+        #          arm64); the ecosystem-standard Azure-side ports mirror
+        #          (used by microsoft/vscode Azure pipelines, elementary/os
+        #          arm64 image builds, FWGS GHA arm64 scripts). NOTE: from
+        #          outside Azure it resolves to the SAME 91.189.91.x pool;
+        #          its value is Azure-side resolution on GitHub's
+        #          Azure-hosted runners — hence rung 3 below as well.
+        #       3) https://ports.ubuntu.com — TLS/443 observed answering
+        #          200 while plain :80 to the same pool timed out during
+        #          this outage (different port/path through the failure).
         run: |
-          sudo apt-get update
-          sudo apt-get install -y cmake build-essential pkg-config musl-tools musl-dev
+          apt_install() {
+            sudo apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=15 \
+                 -o Acquire::https::Timeout=15 -o Acquire::ForceIPv4=true update \
+              && sudo apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=15 \
+                   -o Acquire::https::Timeout=15 -o Acquire::ForceIPv4=true \
+                   install -y --no-install-recommends \
+                   cmake build-essential pkg-config musl-tools musl-dev
+          }
+          set_ports_mirror() {
+            # Idempotent: rewrites whatever ports mirror the sources currently
+            # carry (any scheme, azure-prefixed or not) to "$1". Handles the
+            # noble deb822 ubuntu.sources AND the legacy sources.list.
+            target="$1"
+            for f in /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list; do
+              if [ -f "$f" ]; then
+                sudo sed -i -E "s|https?://(azure\.)?ports\.ubuntu\.com|${target}|g" "$f"
+              fi
+            done
+            return 0
+          }
+          if apt_install; then
+            exit 0
+          fi
+          echo "::warning::apt failed against the default mirror (http://ports.ubuntu.com) — switching sources to http://azure.ports.ubuntu.com and retrying."
+          set_ports_mirror "http://azure.ports.ubuntu.com"
+          if apt_install; then
+            exit 0
+          fi
+          echo "::warning::apt failed against http://azure.ports.ubuntu.com — switching sources to https://ports.ubuntu.com (TLS/443) and retrying."
+          set_ports_mirror "https://ports.ubuntu.com"
+          if apt_install; then
+            exit 0
+          fi
+          echo "::error::apt install failed on ALL mirrors tried: http://ports.ubuntu.com (default), http://azure.ports.ubuntu.com, https://ports.ubuntu.com — cannot install ARM64 musl build deps."
+          exit 1
 
       - name: Cache cargo registry + target
         uses: actions/cache@v6
