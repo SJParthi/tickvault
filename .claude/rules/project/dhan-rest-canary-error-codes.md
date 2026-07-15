@@ -12,7 +12,8 @@
 > (`Spot1mFetchDegraded` / `ChainFetchDegraded`) — strictly better coverage
 > than 3 fixed daily probe slots. The `ErrorCode::RestCanary01ProbeFailed`
 > variant is RETAINED until the C4 variant sweep (this file keeps satisfying
-> the cross-ref test). Content below retained as historical audit.
+> the cross-ref test) — **variant DELETED in the C4 sweep (2026-07-15)**.
+> Content below retained as historical audit.
 
 > **Authority:** CLAUDE.md > `operator-charter-forever.md` §C > this file.
 > **Operator directive (2026-06-10, task DHAN-REST-400):** *"one cheap GET

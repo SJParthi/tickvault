@@ -97,49 +97,30 @@ fn makefile_coverage_target_uses_the_real_per_crate_gate() {
 /// require-QuestDB env switch. The pinned strings below are the ACTUAL run-step
 /// command lines — they appear ONLY inside the workflow's `run:` steps, never
 /// in its header comment, so deleting the real steps cannot pass this guard.
+/// 2026-07-15 (Groww live-feed retirement, operator directive — see
+/// `merge-gate-lock-2026-07-04.md` dated note + the S-stage PR): the
+/// QuestDB-backed Groww live-pipeline E2E (`groww_live_pipeline_e2e.rs`)
+/// was DELETED with the live feed, and its CI lane (`groww-e2e.yml`) was
+/// retired with it — a lane running `cargo test --test
+/// groww_live_pipeline_e2e` against a deleted target would hard-fail every
+/// triggering PR. This retirement ratchet replaces the two former
+/// existence/shape pins: BOTH artifacts must stay absent; re-introducing a
+/// Groww live E2E requires a fresh dated operator quote in the rule file
+/// first.
 #[test]
-fn groww_e2e_workflow_exists_with_no_skip_guard_and_proved_assertion() {
-    let wf = read(".github/workflows/groww-e2e.yml");
+fn groww_e2e_lane_retired_with_live_feed() {
+    let wf = repo_root().join(".github/workflows/groww-e2e.yml");
     assert!(
-        wf.contains("--test groww_live_pipeline_e2e"),
-        "groww-e2e.yml must run the groww_live_pipeline_e2e integration test \
-         via the actual `cargo test ... --test groww_live_pipeline_e2e` run \
-         step (B7 Groww CI lane)"
+        !wf.exists(),
+        "groww-e2e.yml was retired 2026-07-15 with the Groww live feed; \
+         re-adding it requires a fresh dated operator quote in \
+         merge-gate-lock-2026-07-04.md first"
     );
+    let e2e = repo_root().join("crates/app/tests/groww_live_pipeline_e2e.rs");
     assert!(
-        wf.contains("TV_REQUIRE_QDB=1 cargo test -p tickvault-app"),
-        "groww-e2e.yml must run the e2e as `TV_REQUIRE_QDB=1 cargo test -p \
-         tickvault-app ...` so an unreachable QuestDB fails the lane instead \
-         of skipping (audit Rule 11: no false-OK signals)"
-    );
-    assert!(
-        wf.contains("grep -q \"^SKIP \""),
-        "groww-e2e.yml must carry the literal `grep -q \"^SKIP \"` guard line \
-         that fails the job on any skip line — a skipped e2e is a vacuous pass \
-         (audit Rule 11)"
-    );
-    assert!(
-        wf.contains("grep -c \"PROVED:\""),
-        "groww-e2e.yml must carry the literal `grep -c \"PROVED:\"` count \
-         assertion (>=3) so a silently-deleted test cannot produce a vacuous \
-         green (audit Rule 11)"
-    );
-}
-
-/// The e2e test itself must carry the TV_REQUIRE_QDB hard-fail branch so the
-/// CI lane's guarantee is enforced inside the test process too.
-#[test]
-fn groww_e2e_has_tv_require_qdb_hard_fail_branch() {
-    let e2e = read("crates/app/tests/groww_live_pipeline_e2e.rs");
-    assert!(
-        e2e.contains("TV_REQUIRE_QDB"),
-        "groww_live_pipeline_e2e.rs lost the TV_REQUIRE_QDB hard-fail branch — \
-         with the env var set, an unreachable QuestDB must PANIC instead of \
-         skipping (B7 Groww CI lane / audit Rule 11)"
-    );
-    assert!(
-        e2e.contains("qdb_required"),
-        "groww_live_pipeline_e2e.rs must keep the qdb_required() helper gating \
-         the panic-vs-skip decision in every QuestDB-backed test (B7 Groww CI lane)"
+        !e2e.exists(),
+        "groww_live_pipeline_e2e.rs was deleted 2026-07-15 with the Groww \
+         live feed; a revived live-pipeline E2E needs a fresh dated operator \
+         quote first"
     );
 }

@@ -189,39 +189,18 @@ pub enum ErrorCode {
     // Wave 2 — resilience (Items 5–9)
     // -----------------------------------------------------------------------
     /// WS-GAP-04: a WebSocket entered post-close sleep-until-next-open mode.
+    /// KEPT in the C4 sweep (2026-07-15): still emitted by the
+    /// retained-dormant `order_update_connection.rs` (scope-lock §A.1).
     WsGap04PostCloseSleep,
-    /// WS-GAP-05: pool supervisor respawned a dead connection task.
-    WsGap05PoolRespawn,
-    /// WS-GAP-06: tick-gap detector fired a coalesced summary.
-    WsGap06TickGapSummary,
-    /// WS-GAP-07: the live-feed frame channel's receiver was dropped
-    /// (the tick-processing consumer died), so the WebSocket read loop
-    /// stops forwarding frames and returns. Serious mid-market condition —
-    /// no ticks reach the pipeline until the consumer/app restarts.
-    /// Severity::High.
-    WsGap07LiveChannelClosed,
-    /// WS-GAP-08: the Dhan-feed rate-limit (HTTP 429 / DATA-805 class)
-    /// cooldown is persisted to disk so it survives a `process::exit` +
-    /// supervisor restart. This variant tags two events: (a) a best-effort
-    /// persist-write failure at the 429 classification site (the in-memory
-    /// streak still applies for the running process), and (b) the boot-time
-    /// wait when a still-active persisted cooldown is honoured before the
-    /// first Dhan WS connect (preventing the instant-429 restart loop).
-    /// Severity::Low — the cooldown is an advisory, fail-open protection.
-    WsGap08RateLimitCooldown,
-    /// WS-GAP-09: the pool watchdog reached its `>300s all-down → Halt` verdict
-    /// but the down-cause classified as a benign bare-Dhan-transport-RST class
-    /// (every connection's rate-limit streak is `0`, no non-reconnectable Dhan
-    /// code was seen, the token is valid, and QuestDB is reachable). Instead of
-    /// `process::exit(2)` + a full 775-SID cold re-subscribe (which trips Dhan's
-    /// per-IP 429), the watchdog keeps the pool reconnecting IN PLACE
-    /// (per-connection backoff + `SubscribeRxGuard` preserve subscriptions). A
-    /// 15-minute second-tier ceiling falls back to the genuine-fatal exit if
-    /// zero frames recover, so the worst case strictly degrades to today's
-    /// behaviour. Tags two events: the benign in-place decision
-    /// (`reason="bare_dhan_reset"`) and the ceiling-exceeded fallback
-    /// (`reason="ceiling_exceeded"`). Severity::Low.
-    WsGap09WatchdogReconnectInPlace,
+    // C4 sweep (2026-07-15, Dhan live-WS retirement — operator 2026-07-13,
+    // websocket-connection-scope-lock.md "2026-07-13 Amendment"):
+    // WS-GAP-05 (pool respawn), WS-GAP-06 (tick-gap summary), WS-GAP-07
+    // (live frame channel closed), WS-GAP-08 (429 cooldown) and WS-GAP-09
+    // (watchdog reconnect-in-place) variants RETIRED — their only emit
+    // sites (the main-feed pool / tick-gap detector) were deleted in
+    // Phases C2/C3 (#1522/#1569). Rule-file history retained per the house
+    // banner convention (reverse-crossref allowlist entries carry the
+    // dated justifications).
     /// WS-GAP-10: the order-update WebSocket is in an in-market outage.
     /// Tags three events (see `reason` field): `in_market_outage` — the
     /// once-per-episode \[HIGH\] `OrderUpdateDisconnected` page fired from
@@ -318,19 +297,10 @@ pub enum ErrorCode {
     /// self-remediation; the standing CRITICAL profile page covers the
     /// unrecovered case. (2026-07-06.)
     AuthGap05ForcedRemintTriggered,
-    /// AUTH-GAP-06: fast-boot cached-token validation (2026-07-08 —
-    /// third morning cached-token outage, 08:32–09:06 IST on 2026-07-07).
-    /// The FAST crash-recovery boot arm validates the CACHED Dhan JWT with
-    /// ONE `GET /v2/profile` BEFORE any WebSocket spawn. A prefix-anchored
-    /// 401/403 rejection forces a re-mint through the existing TokenManager
-    /// machinery (RESILIENCE-03 in-flight tripwire preserved; the fast arm
-    /// passes `None` for the dual-instance lock flag — the documented §3
-    /// residual of `dual-instance-lock-2026-07-04.md`, unchanged). Any
-    /// other failure shape (transient network, REST-surface 400/429/5xx,
-    /// parse) proceeds with the cached token after ONE bounded retry —
-    /// loudly, never blocking boot. Severity::High — the re-mint /
-    /// degraded-proceed is the self-remediation; the operator must see it.
-    AuthGap06FastBootCachedTokenValidation,
+    // C4 sweep (2026-07-15): AUTH-GAP-06 variant RETIRED — the fast-boot
+    // cached-token validation module was deleted 2026-07-14 (operator Dhan
+    // noise lock, dhan-rest-only-noise-lock-2026-07-14.md; "variant
+    // retained until the C4 variant sweep" — this is that sweep).
     /// BOOT-01: slow-boot QuestDB readiness deadline approaching (>30s).
     Boot01QuestDbSlow,
     /// BOOT-02: boot deadline exceeded (>60s) — HALTING.
@@ -363,20 +333,12 @@ pub enum ErrorCode {
     /// SELFTEST-02: market-open self-test detected a Critical or Degraded
     /// failure — operator action required.
     Selftest02Failed,
-    /// SLO-01: composite real-time guarantee score recovered to healthy
-    /// (≥ 0.95) on the falling edge from a degraded period. Informational.
-    Slo01Healthy,
-    /// SLO-02: composite real-time guarantee score crossed below 0.95
-    /// (Degraded) or 0.80 (Critical). Edge-triggered on the rising edge
-    /// into a worse tier. Operator action required for `Critical`.
-    Slo02Degraded,
-    /// SLO-03: the SLO evaluator/publisher task (the 10s scheduler that
-    /// emits `tv_realtime_guarantee_score`) exited — panic, cancel, or
-    /// unexpected clean return — and the supervisor respawned it so the
-    /// guarantee-score metric stream can never vanish silently (live
-    /// incident 2026-07-03 10:35 IST: task died mid-market, alarm
-    /// false-OK'd on missing data).
-    Slo03PublisherRespawned,
+    // C4 sweep (2026-07-15): SLO-01 / SLO-02 / SLO-03 variants RETIRED —
+    // the 10s SLO evaluator/publisher was PARKED in PR-C2 (wave-3-d
+    // banner: "pending either a Groww-scoped SLO re-design with a fresh
+    // dated operator quote, or Phase C variant cleanup" — this is that
+    // cleanup; the caller-less slo_score.rs contract stub + its bench
+    // retired with them).
 
     // -----------------------------------------------------------------------
     // Wave 3 — Telegram dispatcher (Item 11)
@@ -590,71 +552,14 @@ pub enum ErrorCode {
     /// gate stays CLOSED. Operator must intervene. Severity::Critical.
     BarMismatch03CrossCheckFailed,
 
-    // -----------------------------------------------------------------------
-    // Sub-PR #9 of 2026-05-27 daily-universe expansion: lifecycle-fetch
-    // ErrorCodes for the boot-time CSV → universe-build chain. Emit
-    // sites land in Sub-PR #10 (boot orchestrator). NO production emit
-    // sites in THIS PR — contract stubs only, gated by the cross-ref
-    // test against rule-file mentions.
-    // -----------------------------------------------------------------------
-    /// INSTR-FETCH-01: Detailed CSV fetch hard-failed after retry
-    /// exhaustion. The §4 infinite-retry policy on this code is
-    /// operator-locked — the boot orchestrator keeps retrying with
-    /// escalating Telegram. This variant fires on EVERY attempt past
-    /// the §4 escalation table (Info at attempt 1-3, High at 4-10,
-    /// Critical at 11+). Severity::Critical.
-    InstrFetch01CsvHardFailed,
-
-    /// INSTR-FETCH-02: CSV parse / schema validation failed. The bytes
-    /// passed §18 hardening (Sub-PR #3) but failed §26 robustness
-    /// (Sub-PR #4) — mandatory-field validation triggered the >0.1%
-    /// row failure threshold OR a mandatory header column was missing.
-    /// Severity::Critical — operator must inspect raw CSV before
-    /// retry can succeed.
-    InstrFetch02SchemaValidationFailed,
-
-    /// INSTR-FETCH-03: F&O dangling-reference threshold exceeded.
-    /// More than 0.5% of FUTSTK/OPTSTK derivative rows referenced an
-    /// `UNDERLYING_SECURITY_ID` that didn't resolve to any NSE_EQ row
-    /// in the same CSV. Per Sub-PR #5 + §3 + §26. Severity::Critical
-    /// — boot HALTS until the upstream CSV is consistent.
-    InstrFetch03DanglingReferences,
-
-    /// INSTR-FETCH-04: Universe-size envelope violated. The built
-    /// universe contained `< MIN_DAILY_UNIVERSE_SIZE (100)` OR
-    /// `> MAX_DAILY_UNIVERSE_SIZE (1200)` instruments per Sub-PR #7's
-    /// envelope check. Either an upstream extractor returned partial
-    /// data (too small) or a regression let in extra rows (too large).
-    /// Severity::Critical — boot HALTS.
-    InstrFetch04UniverseSizeOutOfBounds,
-
-    /// NTM-CONSTITUENCY-01: the NIFTY Total Market constituent source
-    /// (niftyindices.com) failed at boot — fetch error, malformed CSV, or
-    /// `> 0.5%` dangling constituents vs the Dhan master. Per operator
-    /// AskUserQuestion 2026-06-06 the policy is **degrade + alert**: boot
-    /// PROCEEDS on the indices + F&O-underlyings core universe (the Dhan CSV
-    /// path stays fail-closed §4) and the ~500 cash-only NTM constituents are
-    /// absent for the day. Severity::Critical — the operator is paged that
-    /// today runs without the full NTM union. NOT a boot halt.
-    NtmConstituency01SourceDegraded,
-
-    // -----------------------------------------------------------------------
-    // Operator directive 2026-06-02: post-market 1-minute cross-verification.
-    // At 15:31 IST we compare every subscribed spot instrument's live
-    // candles_1m OHLCV against Dhan intraday 1-minute candles, EXACT match.
-    // Narrowed replacement for the deleted cross_verify chain (1m/spot/today).
-    // See cross-verify-1m-error-codes.md + live-feed-purity.md rule 11.
-    // -----------------------------------------------------------------------
-    /// CROSS-VERIFY-1M-01: one or more 1-minute OHLCV cells disagreed between
-    /// our `candles_1m` and Dhan intraday. Mismatches written to the
-    /// `cross_verify_1m_audit` table + CSV; the per-day count is the quality
-    /// signal. Severity::High (operator-visible; expected non-zero due to
-    /// sampled-feed vs full-tape — track the trend, not the absolute).
-    CrossVerify1m01MismatchFound,
-    /// CROSS-VERIFY-1M-02: the Dhan intraday fetch was degraded — REST errored
-    /// / rate-limited for a material fraction of spot SIDs, so the
-    /// verification could not vouch for the full universe. Severity::High.
-    CrossVerify1m02FetchDegraded,
+    // C4 sweep (2026-07-15, Dhan live-WS retirement): INSTR-FETCH-01..04 +
+    // NTM-CONSTITUENCY-01 variants RETIRED — the daily-universe fetch chain
+    // (CSV downloader/parser, universe build, NTM constituency) was deleted
+    // in Phase C3 (#1569; operator Q3 2026-07-13: "hereafter no Dhan
+    // instrument download/parsing"). CROSS-VERIFY-1M-01/-02 variants
+    // RETIRED — the 15:31 IST cross-verify module was deleted in C3 (no
+    // Dhan live side to compare); its `cross_verify_1m_audit` table + CSVs
+    // stay (forensic). Rule-file retirement banners carry the history.
 
     // -----------------------------------------------------------------------
     /// TICK-CONSERVE-01: the daily 15:40 IST end-to-end tick-conservation
@@ -665,15 +570,13 @@ pub enum ErrorCode {
     /// directive 2026-06-10 "Go ahead to achieve zero tick loss").
     TickConserve01DailyResidual,
 
-    // -----------------------------------------------------------------------
-    /// REST-CANARY-01: a scheduled REST-health probe (`GET /v2/profile` at
-    /// 09:05 / 12:00 / 15:25 IST) returned non-2xx or failed to send after a
-    /// retry. Carries the HTTP status, the final (token-redacted) request URL
-    /// and the bounded secret-redacted response body so the operator learns
-    /// WHY the Dhan REST surface is down the moment it dies — not at the
-    /// 15:31 cross-verify (DHAN-REST-400 incident, 2026-06-10).
-    /// Severity::High.
-    RestCanary01ProbeFailed,
+    // C4 sweep (2026-07-15): REST-CANARY-01 variant RETIRED — the canary
+    // module + both spawn sites + its CloudWatch entry were deleted
+    // 2026-07-14 (operator Dhan noise lock,
+    // dhan-rest-only-noise-lock-2026-07-14.md; "variant retained until the
+    // C4 variant sweep" — this is that sweep). The retained spot-1m +
+    // option-chain legs self-detect a dead Dhan REST surface via their own
+    // escalation edges.
 
     // -----------------------------------------------------------------------
     // OPTION-CHAIN-01..08 REMOVED 2026-06-28 along with the entire
@@ -702,42 +605,13 @@ pub enum ErrorCode {
     /// restart.
     IndexOhlc02DailyResetFailed,
 
-    // -----------------------------------------------------------------------
-    /// PREVDAY-01: the boot-time previous-day OHLCV fetch
-    /// (`run_prev_day_ohlcv_fetch`) returned ZERO yesterday candles for the
-    /// subscribed universe (`PrevDayCoverage::Empty`). Either Dhan returned
-    /// 200-with-empty-body for every symbol (the 774-silent-empties signature
-    /// observed 2026-06-26) or the universe was empty. Boot is fail-soft and
-    /// never blocks; the prev-day reference cache simply has no rows until the
-    /// next successful boot, so `*_pct_from_prev_day` columns read 0.
-    /// Severity::High — a real boot-data gap that an operator must see, but
-    /// NOT a halt. Auto-triage-safe (visibility-only; operator informs).
-    PrevDay01CoverageEmpty,
-    /// D2b (2026-06-26) — runtime Dhan-lane cold-start FAILED at the
-    /// daily-universe-build stage. `start_dhan_lane` returned its
-    /// universe-build boot-abort; the lane FSM is driven back to
-    /// `LaneState::Off` (NO half-running lane) and a bounded backoff retry is
-    /// scheduled. Severity::High. The `reason` carried in the `error!` line is
-    /// a FIXED enum discriminant, never a raw auth body (secret discipline).
-    DhanLane01UniverseBuildFailed,
-    /// D2b (2026-06-26) — runtime Dhan-lane cold-start FAILED at the main-feed
-    /// WS-pool create/spawn stage. `start_dhan_lane` returned its pool-spawn
-    /// boot-abort; every LANE handle spawned so far is dropped/aborted and the
-    /// FSM is driven back to `LaneState::Off` (no orphan sockets).
-    /// Severity::High.
-    DhanLane02WsPoolSpawnFailed,
-    /// D2b (2026-06-26) — runtime Dhan-lane cold-start FAILED at the auth /
-    /// IP-verify / static-IP / dual-instance boot gate (the inline spine's
-    /// `BootAbortClean` path). At RUNTIME this NEVER exits the process — the
-    /// FSM returns to `LaneState::Off` and the operator is paged; bounded
-    /// retry. Severity::High (reuses AUTH-GAP-* semantics).
-    DhanLane03AuthFailed,
-    /// D2b (2026-06-26) — Dhan-lane teardown (`stop_dhan_lane` →
-    /// `teardown_dhan_lane_tasks`) hit the bounded pool-supervisor drain
-    /// timeout and force-aborted the remaining WS handles. The lane still
-    /// reaches `LaneState::Off` (handles joined-or-force-aborted), so this is
-    /// degraded-but-recovered, not data loss. Severity::Medium.
-    DhanLane04TeardownTimeout,
+    // C4 sweep (2026-07-15): PREVDAY-01 variant RETIRED — the boot-time
+    // prev-day OHLCV fetch died with the Dhan lane (C3; the `prev_day_ohlcv`
+    // table stays, forensic). DHAN-LANE-01..04 variants RETIRED — the
+    // runtime lane FSM (`start_dhan_lane`/`stop_dhan_lane`/`LaneState`) was
+    // deleted in Phase C2 (#1522); auth-failure visibility for the retained
+    // Dhan REST surface lives in the `dhan_rest_stack` backoff arms + the
+    // AUTH-GAP-* codes (dhan-lane-error-codes.md retirement banner).
     /// GROWW-MASTER-01 (PR-A 2026-06-28) — the best-effort cold-path write of
     /// the Groww instrument set into the SHARED `instrument_lifecycle` /
     /// `index_constituency` master tables (tagged `feed='groww'`) failed
@@ -1026,6 +900,31 @@ pub enum ErrorCode {
     /// 2026-07-14 default (no CloudWatch filter). Severity::Medium,
     /// auto-triage-safe.
     FeedGap01EpisodeDegraded,
+
+    // -----------------------------------------------------------------------
+    // 🔷 DHAN exit-order execution layer (Cluster B, 2026-07-14).
+    // Default-off behind FOUR independent locks (config default-off, no
+    // reachable live path, hardcoded dry_run, build-failing ratchet guard).
+    // Both codes are LOG-SINK-ONLY (no error_code_alerts map entry, no
+    // paging-list edit — the 2026-07-14 Dhan noise lock posture).
+    // See dhan-exit-order-lockout-2026-07-14.md.
+    // -----------------------------------------------------------------------
+    /// EXIT-ORDER-01: an exit engine call degraded — a validation refusal
+    /// on a dispatched command, a Dhan API error on a super/forever/sliced
+    /// order, an ENTRY_LEG cancel refused post-fill (the naked-position
+    /// race U4 — never exercised), or a slicing response anomaly.
+    /// Severity::High, auto-triage-safe (the dispatched command already
+    /// refused/degraded loudly; the operator inspects the correlation-id
+    /// forensic log line).
+    ExitOrder01ExecutionDegraded,
+    /// EXIT-VERIFY-01: the MPP verify ladder exhausted with a degraded
+    /// verdict — `PendingAtLimit` (MARKET→LIMIT auto-conversion resting on
+    /// the book past the deadline — orders.md rule 18; NEVER assumed
+    /// filled), a partial fill at budget (`needs_reconciliation` set — the
+    /// remainder is never silently forgotten), or an `Unknown` unparsable
+    /// status (fail-closed). Severity::High, auto-triage-safe (the order
+    /// stays tracked; reconcile + the caller's policy own the follow-up).
+    ExitVerify01Degraded,
 }
 
 impl ErrorCode {
@@ -1079,11 +978,6 @@ impl ErrorCode {
             Self::PrevOi01CacheEmptyAtBoot => "PREVOI-01",
             // Wave 2
             Self::WsGap04PostCloseSleep => "WS-GAP-04",
-            Self::WsGap05PoolRespawn => "WS-GAP-05",
-            Self::WsGap06TickGapSummary => "WS-GAP-06",
-            Self::WsGap07LiveChannelClosed => "WS-GAP-07",
-            Self::WsGap08RateLimitCooldown => "WS-GAP-08",
-            Self::WsGap09WatchdogReconnectInPlace => "WS-GAP-09",
             Self::WsGap10OrderUpdateOutage => "WS-GAP-10",
             Self::DiskWatcher01Respawned => "DISK-WATCHER-01",
             Self::WsSpill01WriterRespawn => "WS-SPILL-01",
@@ -1095,7 +989,6 @@ impl ErrorCode {
             Self::AuthGap03TokenForceRenewedOnWake => "AUTH-GAP-03",
             Self::AuthGap04TotpRotatedExternally => "AUTH-GAP-04",
             Self::AuthGap05ForcedRemintTriggered => "AUTH-GAP-05",
-            Self::AuthGap06FastBootCachedTokenValidation => "AUTH-GAP-06",
             Self::Boot01QuestDbSlow => "BOOT-01",
             Self::Boot02DeadlineExceeded => "BOOT-02",
             Self::Boot03ClockSkewExceeded => "BOOT-03",
@@ -1116,9 +1009,6 @@ impl ErrorCode {
             Self::Selftest01Passed => "SELFTEST-01",
             Self::Selftest02Failed => "SELFTEST-02",
             // Wave 3-D — composite real-time guarantee score (Item 13)
-            Self::Slo01Healthy => "SLO-01",
-            Self::Slo02Degraded => "SLO-02",
-            Self::Slo03PublisherRespawned => "SLO-03",
             // Dhan Trading API
             Self::Dh901InvalidAuth => "DH-901",
             Self::Dh902NoApiAccess => "DH-902",
@@ -1166,26 +1056,13 @@ impl ErrorCode {
             Self::BarMismatch01CorrectedFromHistorical => "BAR-MISMATCH-01",
             Self::BarMismatch02CrossCheckInconclusive => "BAR-MISMATCH-02",
             Self::BarMismatch03CrossCheckFailed => "BAR-MISMATCH-03",
-            Self::InstrFetch01CsvHardFailed => "INSTR-FETCH-01",
-            Self::InstrFetch02SchemaValidationFailed => "INSTR-FETCH-02",
-            Self::InstrFetch03DanglingReferences => "INSTR-FETCH-03",
-            Self::InstrFetch04UniverseSizeOutOfBounds => "INSTR-FETCH-04",
-            Self::NtmConstituency01SourceDegraded => "NTM-CONSTITUENCY-01",
             // Operator 2026-06-02: post-market 1-minute cross-verification
-            Self::CrossVerify1m01MismatchFound => "CROSS-VERIFY-1M-01",
-            Self::CrossVerify1m02FetchDegraded => "CROSS-VERIFY-1M-02",
             Self::TickConserve01DailyResidual => "TICK-CONSERVE-01",
             // DHAN-REST-400 (2026-06-10): scheduled REST-health canary
-            Self::RestCanary01ProbeFailed => "REST-CANARY-01",
             // Day OHLC tracker for IDX_I
             Self::IndexOhlc02DailyResetFailed => "INDEX-OHLC-02",
             // Boot-time previous-day OHLCV fetch (PR4 2026-06-01)
-            Self::PrevDay01CoverageEmpty => "PREVDAY-01",
             // D2b — runtime Dhan-lane cold-start FSM (2026-06-26)
-            Self::DhanLane01UniverseBuildFailed => "DHAN-LANE-01",
-            Self::DhanLane02WsPoolSpawnFailed => "DHAN-LANE-02",
-            Self::DhanLane03AuthFailed => "DHAN-LANE-03",
-            Self::DhanLane04TeardownTimeout => "DHAN-LANE-04",
             // PR-A (2026-06-28): Groww shared-master persist
             Self::GrowwMaster01PersistFailed => "GROWW-MASTER-01",
             Self::FeedStall01SidecarRestarted => "FEED-STALL-01",
@@ -1225,6 +1102,8 @@ impl ErrorCode {
             Self::TfVerify02RunDegraded => "TF-VERIFY-02",
             // Feed gap-episode forensics (Groww hardening PR-3, 2026-07-14)
             Self::FeedGap01EpisodeDegraded => "FEED-GAP-01",
+            Self::ExitOrder01ExecutionDegraded => "EXIT-ORDER-01",
+            Self::ExitVerify01Degraded => "EXIT-VERIFY-01",
         }
     }
 
@@ -1255,12 +1134,6 @@ impl ErrorCode {
             | Self::BarMismatch01CorrectedFromHistorical
             | Self::BarMismatch02CrossCheckInconclusive
             | Self::BarMismatch03CrossCheckFailed
-            // Sub-PR #9 — all 4 INSTR-FETCH codes are HALT-class
-            | Self::InstrFetch01CsvHardFailed
-            | Self::InstrFetch02SchemaValidationFailed
-            | Self::InstrFetch03DanglingReferences
-            | Self::InstrFetch04UniverseSizeOutOfBounds
-            | Self::NtmConstituency01SourceDegraded
             // AUTH-P11 (2026-07-01) — TOTP secret rotated externally; auth is
             // dead until the SSM secret is reconciled (Critical, not auto-triage).
             | Self::AuthGap04TotpRotatedExternally
@@ -1277,14 +1150,7 @@ impl ErrorCode {
             | Self::GrowwScale05DualFleetDetected => Severity::Critical,
             // Info: positive-ping / lifecycle confirmations
             Self::Selftest01Passed
-            | Self::Slo01Healthy
             | Self::AggregatorHb01Heartbeat => Severity::Info,
-            // High: composite SLO degradation summary signal
-            Self::Slo02Degraded => Severity::High,
-            // High: the guarantee-score publisher died and was respawned —
-            // the respawn self-heals, but a dying publisher blinds the
-            // guarantee-critical alarm (missing→NonBreaching), so page.
-            Self::Slo03PublisherRespawned => Severity::High,
             // High: regulatory / order / risk / rate-limit
             Self::Dh904RateLimit
             | Self::Dh905InputException
@@ -1303,22 +1169,10 @@ impl ErrorCode {
             | Self::AggregatorLag01TickLagDropped
             // PR #2.5 — INDEX-OHLC-02 is High (carry-over wrong but recoverable)
             | Self::IndexOhlc02DailyResetFailed
-            // PR4 2026-06-01 — PREVDAY-01 is High (boot-data gap, not a halt)
-            | Self::PrevDay01CoverageEmpty
-            // Operator 2026-06-02 — post-market 1m cross-verify (both High)
-            | Self::CrossVerify1m01MismatchFound
-            | Self::CrossVerify1m02FetchDegraded
             // Operator 2026-06-10 — daily tick-conservation residual (High:
             // delivered-but-unaccounted ticks need operator eyes; the WAL
             // still holds them durably, so this is not Critical data loss)
             | Self::TickConserve01DailyResidual
-            // DHAN-REST-400 (2026-06-10) — REST canary probe failed (High:
-            // the data path may still be alive via WS; operator must inspect
-            // the captured body to decide between data-plan expiry, malformed
-            // URL, and Dhan-side outage)
-            | Self::RestCanary01ProbeFailed
-            // WS-GAP-07 — live frame channel closed (tick consumer died)
-            | Self::WsGap07LiveChannelClosed
             // WS-GAP-10 — order confirmations feed down in-market; the loop
             // self-retries but the operator must see it (2026-07-06 incident)
             | Self::WsGap10OrderUpdateOutage
@@ -1337,13 +1191,6 @@ impl ErrorCode {
             // (apply resumes them) — staleness + disk growth, not
             // permanent loss; but operator action IS required.
             | Self::WalSuspend01TableSuspended
-            // DHAN-LANE-01/02/03 — runtime Dhan-lane cold-start failures (D2b
-            // 2026-06-26): a failed cold-start returns the FSM to Off + pages
-            // the operator, never a half-running lane. High (operator must
-            // know the lane did not come up; bounded retry will re-attempt).
-            | Self::DhanLane01UniverseBuildFailed
-            | Self::DhanLane02WsPoolSpawnFailed
-            | Self::DhanLane03AuthFailed
             // FEED-STALL-01 / FEED-SUPERVISOR-01 (2026-06-30) — the feed-agnostic
             // stall-watchdog killed+relaunched a silently-stalled sidecar, or the
             // supervisor task itself was respawned. High (a real recovery action
@@ -1370,13 +1217,6 @@ impl ErrorCode {
             // (auto-triage safe); the existing CRITICAL profile page covers
             // the unrecovered case.
             | Self::AuthGap05ForcedRemintTriggered
-            // AUTH-GAP-06 (2026-07-08) — fast-boot cached-token validation:
-            // a Dhan-rejected cached token was re-minted before any WS
-            // spawn, or the validation degraded and boot proceeded loudly
-            // with the cached token. High: the action already self-applied;
-            // the operator must see every occurrence (a repeat every boot
-            // means the cache/mint chain is broken).
-            | Self::AuthGap06FastBootCachedTokenValidation
             // GROWW-SCALE-01/02 (§34 2026-07-03) — the auto-scale ladder
             // rolled back a failed rung / halved on fleet-wide failure. The
             // auto-correction already applied; the operator must see every
@@ -1420,6 +1260,13 @@ impl ErrorCode {
             // run could not vouch for it); never a halt — the live candle
             // pipeline is untouched and reruns are DEDUP-idempotent.
             Self::TfVerify01MismatchFound | Self::TfVerify02RunDegraded => Severity::High,
+            // EXIT-ORDER-01 / EXIT-VERIFY-01 (Cluster B, 2026-07-14) — the
+            // exit-order layer degraded / the MPP verify ladder exhausted
+            // without a clean fill. High: operator eyes on every occurrence
+            // (an unverified exit is open exposure); never a halt — the
+            // order stays tracked and reconcile owns the follow-up. Both
+            // LOG-SINK-ONLY (no pager entry — 2026-07-14 Dhan noise lock).
+            Self::ExitOrder01ExecutionDegraded | Self::ExitVerify01Degraded => Severity::High,
             // Medium: data pipeline correctness
             // PR #6b (2026-05-19): I-P0-01/02/04/05 retired with their modules.
             Self::InstrumentP1CrossSegmentCollision
@@ -1449,7 +1296,6 @@ impl ErrorCode {
             | Self::PrevClose02FirstSeenInconsistency
             | Self::PrevOi01CacheEmptyAtBoot
             | Self::PrevClose04CacheEmptyAtBoot
-            | Self::WsGap06TickGapSummary
             | Self::Audit02DepthRebalanceWriteFailed
             | Self::Audit03WsReconnectWriteFailed
             | Self::Audit04BootWriteFailed
@@ -1461,10 +1307,6 @@ impl ErrorCode {
             | Self::Telegram01Dropped
             | Self::AggregatorSeal01IlpFailed
             | Self::Boundary01CatchupSeal
-            // DHAN-LANE-04 — teardown drain timeout (D2b 2026-06-26): the lane
-            // still reaches Off (handles force-aborted), so degraded-but-
-            // recovered, not data loss. Medium.
-            | Self::DhanLane04TeardownTimeout
             // GROWW-MASTER-01 (PR-A 2026-06-28): best-effort cold-path master
             // write failed; feed + ticks unaffected, next boot re-runs. Medium.
             | Self::GrowwMaster01PersistFailed
@@ -1492,9 +1334,6 @@ impl ErrorCode {
             | Self::Dh910Other
             | Self::HotPath02WriterQueueDrop
             | Self::WsGap04PostCloseSleep
-            | Self::WsGap05PoolRespawn
-            | Self::WsGap08RateLimitCooldown
-            | Self::WsGap09WatchdogReconnectInPlace
             | Self::DiskWatcher01Respawned
             | Self::AuthGap03TokenForceRenewedOnWake
             | Self::Telegram02CoalescerStateInconsistency
@@ -1558,11 +1397,6 @@ impl ErrorCode {
                 ".claude/rules/project/wal-suspension-error-codes.md"
             }
             Self::WsGap04PostCloseSleep
-            | Self::WsGap05PoolRespawn
-            | Self::WsGap06TickGapSummary
-            | Self::WsGap07LiveChannelClosed
-            | Self::WsGap08RateLimitCooldown
-            | Self::WsGap09WatchdogReconnectInPlace
             | Self::WsGap10OrderUpdateOutage
             | Self::DiskWatcher01Respawned
             | Self::AuthGap03TokenForceRenewedOnWake
@@ -1584,9 +1418,6 @@ impl ErrorCode {
             | Self::Telegram03EpisodeDegraded => ".claude/rules/project/wave-3-error-codes.md",
             Self::Selftest01Passed | Self::Selftest02Failed => {
                 ".claude/rules/project/wave-3-c-error-codes.md"
-            }
-            Self::Slo01Healthy | Self::Slo02Degraded | Self::Slo03PublisherRespawned => {
-                ".claude/rules/project/wave-3-d-error-codes.md"
             }
             Self::Dh901InvalidAuth
             | Self::Dh902NoApiAccess
@@ -1626,9 +1457,6 @@ impl ErrorCode {
             // AUTH-GAP-05 (2026-07-06) — sustained mid-session token-invalid:
             // forced re-mint triggered (runbook §AUTH-GAP-05).
             | Self::AuthGap05ForcedRemintTriggered
-            // AUTH-GAP-06 (2026-07-08) — fast-boot cached-token validation
-            // (runbook §AUTH-GAP-06).
-            | Self::AuthGap06FastBootCachedTokenValidation
             // BP-08 (2026-07-01) — fd / RSS / spill-free early-warning monitors
             // (promotes the RESERVED RESOURCE-01/02/03 stubs).
             | Self::Resource01FdCountHigh
@@ -1646,43 +1474,13 @@ impl ErrorCode {
             | Self::BarMismatch03CrossCheckFailed => {
                 ".claude/rules/project/phase-0-items-15-28-29-error-codes.md"
             }
-            // Sub-PR #9 of 2026-05-27 daily-universe expansion
-            Self::InstrFetch01CsvHardFailed
-            | Self::InstrFetch02SchemaValidationFailed
-            | Self::InstrFetch03DanglingReferences
-            | Self::InstrFetch04UniverseSizeOutOfBounds => {
-                ".claude/rules/project/daily-universe-instr-fetch-error-codes.md"
-            }
-            // Sub-PR #10 of 2026-06-06 NTM turn-on (§31)
-            Self::NtmConstituency01SourceDegraded => {
-                ".claude/rules/project/ntm-constituency-error-codes.md"
-            }
-            // Operator 2026-06-02: post-market 1-minute cross-verification
-            Self::CrossVerify1m01MismatchFound | Self::CrossVerify1m02FetchDegraded => {
-                ".claude/rules/project/cross-verify-1m-error-codes.md"
-            }
             // Operator 2026-06-10: daily tick-conservation audit
             Self::TickConserve01DailyResidual => {
                 ".claude/rules/project/tick-conservation-audit-error-codes.md"
             }
-            // DHAN-REST-400 (2026-06-10): REST-health canary
-            Self::RestCanary01ProbeFailed => {
-                ".claude/rules/project/dhan-rest-canary-error-codes.md"
-            }
             // Day OHLC tracker for IDX_I
             Self::IndexOhlc02DailyResetFailed => {
                 ".claude/rules/project/index-day-ohlc-tracker-error-codes.md"
-            }
-            // Boot-time previous-day OHLCV fetch (PR4 2026-06-01)
-            Self::PrevDay01CoverageEmpty => {
-                ".claude/rules/project/prev-day-ohlcv-error-codes.md"
-            }
-            // D2b — runtime Dhan-lane cold-start FSM (2026-06-26)
-            Self::DhanLane01UniverseBuildFailed
-            | Self::DhanLane02WsPoolSpawnFailed
-            | Self::DhanLane03AuthFailed
-            | Self::DhanLane04TeardownTimeout => {
-                ".claude/rules/project/dhan-lane-error-codes.md"
             }
             // PR-A (2026-06-28): Groww shared-master persist
             Self::GrowwMaster01PersistFailed => {
@@ -1743,6 +1541,10 @@ impl ErrorCode {
             // Feed gap-episode forensics (Groww hardening PR-3, 2026-07-14)
             Self::FeedGap01EpisodeDegraded => {
                 ".claude/rules/project/feed-gap-error-codes.md"
+            }
+            // 🔷 DHAN exit-order execution layer (Cluster B, 2026-07-14)
+            Self::ExitOrder01ExecutionDegraded | Self::ExitVerify01Degraded => {
+                ".claude/rules/project/dhan-exit-order-lockout-2026-07-14.md"
             }
         }
     }
@@ -1857,11 +1659,6 @@ impl ErrorCode {
             Self::PrevOi01CacheEmptyAtBoot,
             Self::PrevClose04CacheEmptyAtBoot,
             Self::WsGap04PostCloseSleep,
-            Self::WsGap05PoolRespawn,
-            Self::WsGap06TickGapSummary,
-            Self::WsGap07LiveChannelClosed,
-            Self::WsGap08RateLimitCooldown,
-            Self::WsGap09WatchdogReconnectInPlace,
             Self::WsGap10OrderUpdateOutage,
             Self::DiskWatcher01Respawned,
             Self::WsSpill01WriterRespawn,
@@ -1873,7 +1670,6 @@ impl ErrorCode {
             Self::AuthGap03TokenForceRenewedOnWake,
             Self::AuthGap04TotpRotatedExternally,
             Self::AuthGap05ForcedRemintTriggered,
-            Self::AuthGap06FastBootCachedTokenValidation,
             Self::Boot01QuestDbSlow,
             Self::Boot02DeadlineExceeded,
             Self::Boot03ClockSkewExceeded,
@@ -1891,9 +1687,6 @@ impl ErrorCode {
             Self::Telegram03EpisodeDegraded,
             Self::Selftest01Passed,
             Self::Selftest02Failed,
-            Self::Slo01Healthy,
-            Self::Slo02Degraded,
-            Self::Slo03PublisherRespawned,
             Self::PrevClose03BootRoutingAssertion,
             Self::Volume01MonotonicityBreach,
             // PR #5 (2026-05-19): Phase2Ready01PreflightFailed retired.
@@ -1918,27 +1711,9 @@ impl ErrorCode {
             Self::BarMismatch01CorrectedFromHistorical,
             Self::BarMismatch02CrossCheckInconclusive,
             Self::BarMismatch03CrossCheckFailed,
-            // Sub-PR #9 of 2026-05-27 daily-universe expansion
-            Self::InstrFetch01CsvHardFailed,
-            Self::InstrFetch02SchemaValidationFailed,
-            Self::InstrFetch03DanglingReferences,
-            Self::InstrFetch04UniverseSizeOutOfBounds,
-            Self::NtmConstituency01SourceDegraded,
-            // Operator 2026-06-02: post-market 1-minute cross-verification
-            Self::CrossVerify1m01MismatchFound,
-            Self::CrossVerify1m02FetchDegraded,
             Self::TickConserve01DailyResidual,
-            // DHAN-REST-400 (2026-06-10) — REST-health canary
-            Self::RestCanary01ProbeFailed,
             // Day OHLC tracker for IDX_I (Ticker mode)
             Self::IndexOhlc02DailyResetFailed,
-            // Boot-time previous-day OHLCV fetch coverage (PR4 2026-06-01)
-            Self::PrevDay01CoverageEmpty,
-            // D2b — runtime Dhan-lane cold-start FSM (2026-06-26)
-            Self::DhanLane01UniverseBuildFailed,
-            Self::DhanLane02WsPoolSpawnFailed,
-            Self::DhanLane03AuthFailed,
-            Self::DhanLane04TeardownTimeout,
             // PR-A (2026-06-28): Groww shared-master persist
             Self::GrowwMaster01PersistFailed,
             // 2026-06-30: feed-agnostic sidecar stall-watchdog + supervisor respawn
@@ -1979,6 +1754,9 @@ impl ErrorCode {
             Self::TfVerify02RunDegraded,
             // Feed gap-episode forensics (Groww hardening PR-3, 2026-07-14)
             Self::FeedGap01EpisodeDegraded,
+            // 🔷 DHAN exit-order execution layer (Cluster B, 2026-07-14)
+            Self::ExitOrder01ExecutionDegraded,
+            Self::ExitVerify01Degraded,
         ]
     }
 }
@@ -2344,7 +2122,24 @@ mod tests {
         // client/query/truncation/flush/budget stage taxonomy) => 148.
         // 2026-07-14 (Groww hardening PR-3): FEED-GAP-01 (gap-episode
         // forensics degraded — annotation-only side record) => 149.
-        assert_eq!(ErrorCode::all().len(), 149);
+        // 2026-07-14 (🔷 DHAN exit-order layer, Cluster B WP1): bumped
+        // 149 -> 151 for EXIT-ORDER-01 (exit engine call degraded —
+        // validation refusal / Dhan API error / post-fill ENTRY_LEG cancel
+        // refused / slicing anomaly) + EXIT-VERIFY-01 (MPP verify ladder
+        // exhausted with PendingAtLimit / partial-at-budget / Unknown —
+        // fail-closed, never assumed filled). Both log-sink-only.
+        // 2026-07-15 (C4 sweep — Dhan live-WS retirement, operator
+        // 2026-07-13): DROPPED 151 -> 129. The 22 zero-emit-site variants
+        // retained through Phases A/B/C1/C2/C3 were deleted:
+        // INSTR-FETCH-01..04, NTM-CONSTITUENCY-01, PREVDAY-01,
+        // CROSS-VERIFY-1M-01/-02, DHAN-LANE-01..04, WS-GAP-05..09,
+        // AUTH-GAP-06, REST-CANARY-01, SLO-01/02/03 (WS-GAP-04 +
+        // WS-GAP-10 survive — emitted by the retained-dormant
+        // order_update_connection.rs; main's FEED-GAP-01 landed
+        // mid-flight making the pre-merge base 149, and the exit-order
+        // pair #1566 landed during the merge train making it 151 —
+        // hence 151 -> 129, not 148 -> 126).
+        assert_eq!(ErrorCode::all().len(), 129);
     }
 
     #[test]
@@ -2481,29 +2276,45 @@ mod tests {
         }
     }
 
+    // C4 sweep (2026-07-15): test_prev_day_01_coverage_empty_contract died
+    // with its PrevDay01CoverageEmpty variant (Dhan live-WS retirement).
+
     #[test]
-    fn test_prev_day_01_coverage_empty_contract() {
-        let code = ErrorCode::PrevDay01CoverageEmpty;
-        // Wire-format string + roundtrip via FromStr.
-        assert_eq!(code.code_str(), "PREVDAY-01");
-        assert_eq!("PREVDAY-01".parse::<ErrorCode>(), Ok(code));
-        // High (boot-data gap, not a halt) and therefore auto-triage-safe.
-        assert_eq!(code.severity(), Severity::High);
-        assert!(code.is_auto_triage_safe());
-        // Runbook points at the dedicated rule file and exists on disk.
-        assert_eq!(
-            code.runbook_path(),
-            ".claude/rules/project/prev-day-ohlcv-error-codes.md"
-        );
-        let abs = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .and_then(std::path::Path::parent)
-            .map(|root| root.join(code.runbook_path()))
-            .expect("workspace root");
-        let shown = abs.display().to_string();
-        assert!(abs.exists(), "PREVDAY-01 runbook missing on disk: {shown}");
-        // Listed in the catalogue.
-        assert!(ErrorCode::all().contains(&code));
+    fn test_exit_order_codes_contract() {
+        // 🔷 DHAN exit-order execution layer (Cluster B, 2026-07-14).
+        let e1 = ErrorCode::ExitOrder01ExecutionDegraded;
+        assert_eq!(e1.code_str(), "EXIT-ORDER-01");
+        assert_eq!("EXIT-ORDER-01".parse::<ErrorCode>(), Ok(e1));
+        assert_eq!(e1.severity(), Severity::High);
+        // The refusal/degrade already happened loudly; the operator
+        // inspects the correlation-id forensic line — auto-triage may look.
+        assert!(e1.is_auto_triage_safe());
+
+        let e2 = ErrorCode::ExitVerify01Degraded;
+        assert_eq!(e2.code_str(), "EXIT-VERIFY-01");
+        assert_eq!("EXIT-VERIFY-01".parse::<ErrorCode>(), Ok(e2));
+        assert_eq!(e2.severity(), Severity::High);
+        assert!(e2.is_auto_triage_safe());
+
+        for code in [e1, e2] {
+            assert!(ErrorCode::all().contains(&code));
+            assert_eq!(
+                code.runbook_path(),
+                ".claude/rules/project/dhan-exit-order-lockout-2026-07-14.md"
+            );
+            // The lockout rule file must exist on disk (cross-ref test 14).
+            let abs = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .and_then(std::path::Path::parent)
+                .map(|root| root.join(code.runbook_path()))
+                .unwrap_or_default();
+            let shown = abs.display().to_string();
+            assert!(
+                abs.exists(),
+                "{} runbook missing on disk: {shown}",
+                code.code_str()
+            );
+        }
     }
 
     #[test]
@@ -2560,15 +2371,11 @@ mod tests {
                 || s.starts_with("TELEGRAM-")
                 // Wave 3-C: market-open self-test prefix
                 || s.starts_with("SELFTEST-")
-                // Wave 3-D: composite real-time guarantee score
-                || s.starts_with("SLO-")
                 // Wave 5 (2026-05-01): core_affinity pinning.
                 // (Depth-20/200 dynamic selector prefixes retired by PR #4.)
                 || s.starts_with("CORE-PIN-")
                 // Wave 5 Item 26 L1: volume cumulative-monotonicity guard.
                 || s.starts_with("VOLUME-")
-                // DHAN-REST-400 (2026-06-10): scheduled REST-health canary.
-                || s.starts_with("REST-CANARY-")
                 // B6 (2026-07-03): off-thread tick ILP flush worker.
                 || s.starts_with("TICK-FLUSH-")
                 // W2 PR#6 (2026-07-10): per-table WAL-suspension probe.
@@ -2588,24 +2395,20 @@ mod tests {
                 || s.starts_with("BAR-MISMATCH-")
                 // PR #2.5 (AWS-lifecycle): Day OHLC tracker for IDX_I
                 || s.starts_with("INDEX-OHLC-")
-                // Sub-PR #9 of 2026-05-27 daily-universe expansion
-                || s.starts_with("INSTR-FETCH-")
-                // Operator 2026-06-02: post-market 1-minute cross-verification
-                || s.starts_with("CROSS-VERIFY-1M-")
                 // zero-tick-loss PR-5 (G3): supervised disk-health watcher
                 || s.starts_with("DISK-WATCHER-")
                 // zero-tick-loss 2026-06-09: WAL frame-spill writer hardening
                 || s.starts_with("WS-SPILL-")
                 // C3 2026-07-03: bounded chunked-backpressure WAL re-injection
                 || s.starts_with("WS-REINJECT-")
-                // NTM Sub-PR #10a (§31): niftyindices constituent source degrade
-                || s.starts_with("NTM-CONSTITUENCY-")
                 // Operator 2026-06-10: daily end-to-end tick-conservation audit
                 || s.starts_with("TICK-CONSERVE-")
-                // PR4 2026-06-01: boot-time previous-day OHLCV fetch coverage
-                || s.starts_with("PREVDAY-")
-                // D2b 2026-06-26: runtime Dhan-lane cold-start FSM
-                || s.starts_with("DHAN-LANE-")
+                // C4 sweep (2026-07-15): the SLO- / REST-CANARY- /
+                // INSTR-FETCH- / CROSS-VERIFY-1M- / NTM-CONSTITUENCY- /
+                // PREVDAY- / DHAN-LANE- family prefixes were REMOVED from
+                // this allowlist with their last variants — a future variant
+                // reusing a retired family must consciously re-add its
+                // prefix here (never silently).
                 // PR-A 2026-06-28: Groww shared-master persist
                 || s.starts_with("GROWW-MASTER-")
                 // §34 (2026-07-03): Groww multi-connection auto-scale ladder
@@ -2636,7 +2439,10 @@ mod tests {
                 || s.starts_with("TF-VERIFY-")
                 // Groww hardening PR-3 (2026-07-14): feed gap-episode
                 // forensics.
-                || s.starts_with("FEED-GAP-");
+                || s.starts_with("FEED-GAP-")
+                // 🔷 DHAN exit-order execution layer (Cluster B, 2026-07-14)
+                || s.starts_with("EXIT-ORDER-")
+                || s.starts_with("EXIT-VERIFY-");
             assert!(has_known_prefix, "unexpected code prefix: {s}");
         }
     }

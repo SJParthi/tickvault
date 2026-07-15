@@ -930,6 +930,19 @@ impl RunStatus {
     }
 }
 
+/// TRAP-B (2026-07-15, Groww live-feed retirement): should the daily
+/// 15:40 IST run page a `TfConsistencySummary` Telegram? With zero live
+/// candle producers every trading day legitimately reads `no_data` — an
+/// unconditional daily Info page carries nothing actionable (Telegram
+/// commandment 8: one message = one decision). NoData → log-only. EVERY
+/// other label stays loud — including `blind` (Rule 11: BLIND ≠ no-data; a
+/// blind run means candle rows EXISTED but zero compared — that must page)
+/// — and an unknown/drifted label notifies (fail-loud, never silent). Pure.
+#[must_use]
+pub(crate) fn should_notify_summary(status_label: &str) -> bool {
+    status_label != RunStatus::NoData.as_str()
+}
+
 /// Classify one pass. Precedence (design contract): `compared == 0` with
 /// rows seen or any degrade → Blind; `compared == 0` clean-and-empty →
 /// NoData; paging findings → MismatchFound; degraded → Degraded; else
@@ -1997,22 +2010,38 @@ pub fn spawn_tf_consistency_tasks(
     tokio::spawn(async move {
         match inner.await {
             Ok(Ok(Some(s))) => {
-                tf_notifier.notify(NotificationEvent::TfConsistencySummary {
-                    dhan_date_ist: s.dhan_date_ist,
-                    groww_date_ist: s.groww_date_ist,
-                    instruments: s.instruments,
-                    buckets_compared: s.buckets_compared,
-                    mismatches: s.mismatches,
-                    missing_tf_rows: s.missing_tf_rows,
-                    no_coverage: s.no_coverage,
-                    off_grid: s.off_grid,
-                    duplicates: s.duplicates,
-                    tail_unsealed: s.tail_unsealed,
-                    degraded: s.degraded,
-                    truncated: s.truncated,
-                    status_label: s.status_label,
-                    top_detail: s.top_detail,
-                });
+                if should_notify_summary(&s.status_label) {
+                    tf_notifier.notify(NotificationEvent::TfConsistencySummary {
+                        dhan_date_ist: s.dhan_date_ist,
+                        groww_date_ist: s.groww_date_ist,
+                        instruments: s.instruments,
+                        buckets_compared: s.buckets_compared,
+                        mismatches: s.mismatches,
+                        missing_tf_rows: s.missing_tf_rows,
+                        no_coverage: s.no_coverage,
+                        off_grid: s.off_grid,
+                        duplicates: s.duplicates,
+                        tail_unsealed: s.tail_unsealed,
+                        degraded: s.degraded,
+                        truncated: s.truncated,
+                        status_label: s.status_label,
+                        top_detail: s.top_detail,
+                    });
+                } else {
+                    // TRAP-B (2026-07-15, Groww live-feed retirement): a
+                    // NoData day (zero candle rows on BOTH sides, zero
+                    // failures) is the steady state with no live candle
+                    // producers — logged, never paged. Pass / mismatch /
+                    // degraded / BLIND days still page (Rule 11:
+                    // blind ≠ no-data).
+                    info!(
+                        dhan_date_ist = %s.dhan_date_ist,
+                        groww_date_ist = %s.groww_date_ist,
+                        status = %s.status_label,
+                        "tf_consistency: NoData day — summary logged only, \
+                         no Telegram"
+                    );
+                }
             }
             Ok(Ok(None)) => {} // non-trading-day skip / refused force — no page.
             Ok(Err(reason)) => {
@@ -2789,6 +2818,19 @@ mod tests {
         assert_eq!(classify_run_status(10, 1, true, true), MismatchFound);
         assert_eq!(classify_run_status(10, 0, true, true), Degraded);
         assert_eq!(classify_run_status(10, 0, false, true), Pass);
+    }
+
+    #[test]
+    fn test_should_notify_summary_nodata_is_log_only_all_other_arms_page() {
+        // TRAP-B (2026-07-15): NoData → log-only; Pass / MismatchFound /
+        // Degraded / Blind ALL page (Rule 11: blind ≠ no-data), and an
+        // unknown/drifted label fails LOUD (notifies) rather than silent.
+        assert!(!should_notify_summary(RunStatus::NoData.as_str()));
+        assert!(should_notify_summary(RunStatus::Pass.as_str()));
+        assert!(should_notify_summary(RunStatus::MismatchFound.as_str()));
+        assert!(should_notify_summary(RunStatus::Degraded.as_str()));
+        assert!(should_notify_summary(RunStatus::Blind.as_str()));
+        assert!(should_notify_summary("some_future_label"));
     }
 
     #[test]

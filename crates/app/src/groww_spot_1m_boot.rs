@@ -124,9 +124,7 @@ use tickvault_common::sanitize::capture_rest_error_body;
 use tickvault_common::trading_calendar::TradingCalendar;
 use tickvault_core::auth::secret_manager::fetch_groww_access_token;
 use tickvault_core::feed::groww::instruments::stable_index_security_id;
-use tickvault_core::feed::groww::native::watch_reader::{
-    WatchFileDoc, WatchFileKind, parse_watch_file,
-};
+use tickvault_core::feed::groww::watch_reader::{WatchFileDoc, WatchFileKind, parse_watch_file};
 use tickvault_core::instrument::index_extractor::canonicalize_index_symbol;
 use tickvault_core::notification::{NotificationEvent, NotificationService};
 use tickvault_storage::disk_health_watcher::classify_join_exit;
@@ -298,7 +296,7 @@ fn vix_target_from_watch_doc(doc: &WatchFileDoc, expected_date: &str) -> Option<
 // TEST-EXEMPT: thin fs-read shim — the parse + match + fail-closed arms are the pure vix_target_from_watch_doc, unit-tested below.
 fn try_resolve_vix_target(trading_date: NaiveDate) -> Option<GrowwSpotTarget> {
     let date = trading_date.format("%Y-%m-%d").to_string();
-    let path = crate::groww_native_shadow::watch_file_path_for(Path::new(GROWW_DATA_DIR), &date);
+    let path = crate::groww_watch_paths::watch_file_path_for(Path::new(GROWW_DATA_DIR), &date);
     let json = std::fs::read_to_string(&path).ok()?;
     let doc = parse_watch_file(&json).ok()?;
     vix_target_from_watch_doc(&doc, &date)
@@ -1913,6 +1911,20 @@ async fn fire_one_minute(
 ) {
     let minute_open_secs = fire_secs_of_day.saturating_sub(60);
     let minute_label = format_minute_ist_12h(minute_open_secs);
+    // TRAP-A (2026-07-15, Groww live-feed retirement): per-fire liveness
+    // heartbeat for the re-pointed market-hours liveness alarm
+    // (market-hours-liveness-alarm.tf, treat_missing_data = "breaching").
+    // Set ONCE per per-minute fire, deliberately NOT pre-registered at
+    // boot — the first set at the 09:16:01 IST fire IS the session-start
+    // signal (a pre-registered 0 would satisfy the alarm while the legs
+    // never fire); metrics-exporter-prometheus re-renders the last value
+    // on every scrape thereafter, so a wedged/dead process — or a session
+    // where NO leg ever fired — goes MISSING in-window and pages. HONEST
+    // BOUND (2026-07-15, R1-2): the re-render means legs dying MID-SESSION
+    // after the first fire keep the gauge published — that class is owned
+    // by the legs' own escalation pages, not this alarm. The 1.0 is a
+    // constant marker — only sample PRESENCE matters.
+    metrics::gauge!("tv_rest_1m_fire_heartbeat").set(1.0);
     let trading_date = today_ist();
     let trading_date_nanos = minute_open_ist_nanos(trading_date, 0);
     let target_nanos = minute_open_ist_nanos(trading_date, minute_open_secs);
