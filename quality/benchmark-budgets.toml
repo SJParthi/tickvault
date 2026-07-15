@@ -35,9 +35,6 @@ feed_lag_record_groww_tick = 100         # <100ns — HOT PATH Groww fold (score
 feed_presence_record = 100               # <100ns — HOT PATH presence fold (scoreboard PR-D: enabled check + minute math + one lock-free papaya read + one relaxed fetch_or; zero-alloc, DHAT-ratcheted by dhat_feed_presence.rs). Same budget class as the feed_lag hot targets — the papaya hash+read dominates.
 feed_lag_p99_window = 5000000            # <5ms — COLD path: publisher p99 over a full 32,768-sample window via select_nth_unstable. Honestly O(N-window), NOT O(1) — runs on the supervised 10s task off the tick thread (cold-budget class; the former tick_gap_scan_gaps_full_universe peer budget retired in PR-C3, 2026-07-14).
 
-# Moneyness classification (2026-07-14, operator directive) — one key, two benches.
-moneyness = 50                           # <50ns — matches moneyness/classify (2-arm label parse + three integer compares, zero-alloc) AND moneyness/snapshot_read (one lock-free arc-swap load — the token_handle/load class). DHAT-ratcheted by dhat_moneyness.rs. Key checked bidirectionally against every other budget key and bench name (incl. should_emit_snapshot — neither string contains the other); repo-wide grep for "moneyness" was zero hits before this feature.
-
 # Phase 12-runtime (2026-04-28) — Movers 22-TF primitives
 compute_swap_delta_150_30_overlap   = 50000   # <50µs — depth-20 dynamic top-150 set diff with 30-entry crossover (typical per-minute case).
 compute_swap_delta_full_overlap     = 50000   # <50µs — full 150 overlap (no-op delta path).
