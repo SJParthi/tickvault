@@ -284,8 +284,8 @@ pub enum ConditionalBuildError {
         /// The offending leg count.
         count: usize,
     },
-    /// Security ID empty or longer than 20 chars.
-    #[error("security_id invalid: must be 1..=20 chars")]
+    /// Security ID empty, overlong, or outside ASCII alphanumerics.
+    #[error("security_id invalid: must be 1..=20 ASCII alphanumeric chars")]
     BadSecurityId,
     /// Quantity outside 1..=i32::MAX.
     #[error("quantity must be 1..=i32::MAX, got {quantity}")]
@@ -352,7 +352,7 @@ pub struct TriggerOrderSpec {
     pub order_type: OrderType,
     /// Order validity.
     pub validity: OrderValidity,
-    /// Dhan security ID (1..=20 chars).
+    /// Dhan security ID (1..=20 ASCII alphanumeric chars).
     pub security_id: String,
     /// Quantity (1..=i32::MAX).
     pub quantity: i64,
@@ -378,7 +378,7 @@ pub struct MultiOrderLegSpec {
     pub order_type: OrderType,
     /// Order validity.
     pub validity: OrderValidity,
-    /// Dhan security ID (1..=20 chars).
+    /// Dhan security ID (1..=20 ASCII alphanumeric chars).
     pub security_id: String,
     /// Quantity (1..=i32::MAX).
     pub quantity: i64,
@@ -427,6 +427,27 @@ fn is_valid_exp_date_format(exp_date: &str) -> bool {
     })
 }
 
+/// Validates a Dhan `securityId`: 1..=20 ASCII alphanumeric chars. Real
+/// Dhan security IDs are numeric strings ("1333"); ASCII-alphanumeric-only
+/// refuses whitespace, control, BiDi and multi-byte garbage fail-closed
+/// (round-4 review — the prior length-only check let `" 1333"` /
+/// `"13\u{202E}33"` serialize verbatim into a guaranteed-invalid
+/// DATA-813-class order body), mirroring [`validate_dhan_client_id`] on the
+/// SAME request bodies. Byte length equals char count on the accepted set,
+/// so `len()` is the exact 20-char bound.
+fn validate_security_id(security_id: &str) -> Result<(), ConditionalBuildError> {
+    if security_id.is_empty() || security_id.len() > MAX_SECURITY_ID_CHARS {
+        return Err(ConditionalBuildError::BadSecurityId);
+    }
+    if !security_id
+        .chars()
+        .all(|character| character.is_ascii_alphanumeric())
+    {
+        return Err(ConditionalBuildError::BadSecurityId);
+    }
+    Ok(())
+}
+
 /// Validates the fields shared by conditional and multi order legs.
 fn validate_common_leg(
     security_id: &str,
@@ -437,9 +458,7 @@ fn validate_common_leg(
     trigger_price_paise: i64,
     disclosed_quantity: i64,
 ) -> Result<(), ConditionalBuildError> {
-    if security_id.is_empty() || security_id.chars().count() > MAX_SECURITY_ID_CHARS {
-        return Err(ConditionalBuildError::BadSecurityId);
-    }
+    validate_security_id(security_id)?;
     if quantity < 1 || quantity > i64::from(i32::MAX) {
         return Err(ConditionalBuildError::BadQuantity { quantity });
     }
@@ -606,12 +625,13 @@ fn validate_correlation_id(correlation_id: &str) -> Result<(), ConditionalBuildE
 /// frequency hardcoded "ONCE" (ship ONCE; yaml-only ALWAYS is tolerated on
 /// parse because the response field is a String).
 ///
-/// Validates: `security_id` 1..=20 chars; `exp_date` `YYYY-MM-DD` format-only
-/// (no clock — a past date is Dhan's to reject, documented);
-/// `comparing_value` finite.
+/// Validates: `security_id` 1..=20 ASCII alphanumeric chars; `exp_date`
+/// `YYYY-MM-DD` format-only (no clock — a past date is Dhan's to reject,
+/// documented); `comparing_value` finite.
 ///
 /// # Errors
-/// - [`ConditionalBuildError::BadSecurityId`] on empty / >20-char IDs
+/// - [`ConditionalBuildError::BadSecurityId`] on empty / >20-char /
+///   non-ASCII-alphanumeric IDs
 /// - [`ConditionalBuildError::BadExpDate`] on malformed dates
 /// - [`ConditionalBuildError::NonFiniteComparingValue`] on NaN / ±∞
 pub fn build_trigger_condition(
@@ -621,9 +641,7 @@ pub fn build_trigger_condition(
     exp_date: &str,
     user_note: Option<&str>,
 ) -> Result<TriggerCondition, ConditionalBuildError> {
-    if security_id.is_empty() || security_id.chars().count() > MAX_SECURITY_ID_CHARS {
-        return Err(ConditionalBuildError::BadSecurityId);
-    }
+    validate_security_id(security_id)?;
     if !is_valid_exp_date_format(exp_date) {
         return Err(ConditionalBuildError::BadExpDate);
     }
@@ -1028,6 +1046,43 @@ mod tests {
     }
 
     #[test]
+    fn test_build_trigger_condition_rejects_non_alphanumeric_security_id_content() {
+        // Round-4 review: length-only validation let whitespace/control/BiDi
+        // garbage serialize verbatim into the wire body (DATA-813 class).
+        let spec = TriggerConditionSpec::PriceWithValue {
+            operator: TriggerOperator::GreaterThan,
+            comparing_value: 250.0,
+        };
+        for garbage in [
+            " 1333",            // leading space
+            "13\u{202E}33",     // BiDi override
+            "\n\n\n",           // control chars
+            "13 33",            // interior space
+            "13-33",            // punctuation
+            "\u{202E}\u{202E}", // BiDi-only
+        ] {
+            assert!(
+                matches!(
+                    build_trigger_condition(
+                        ConditionalSegment::NseEq,
+                        garbage,
+                        &spec,
+                        "2026-08-24",
+                        None
+                    ),
+                    Err(ConditionalBuildError::BadSecurityId)
+                ),
+                "garbage security_id {garbage:?} must refuse fail-closed"
+            );
+        }
+        // Alphanumeric stays accepted (real Dhan IDs are numeric strings).
+        assert!(
+            build_trigger_condition(ConditionalSegment::NseEq, "1333", &spec, "2026-08-24", None)
+                .is_ok()
+        );
+    }
+
+    #[test]
     fn test_build_trigger_condition_rejects_malformed_exp_date() {
         let spec = TriggerConditionSpec::PriceWithValue {
             operator: TriggerOperator::GreaterThan,
@@ -1285,6 +1340,27 @@ mod tests {
             build_trigger_order(&spec),
             Err(ConditionalBuildError::BadSecurityId)
         ));
+        // Round-4: content garbage (whitespace/BiDi/control) refuses on BOTH
+        // leg builders — validate_common_leg is the shared choke point.
+        for garbage in [" 1333", "13\u{202E}33", "\n\n\n"] {
+            spec.security_id = garbage.to_string();
+            assert!(
+                matches!(
+                    build_trigger_order(&spec),
+                    Err(ConditionalBuildError::BadSecurityId)
+                ),
+                "trigger-leg garbage security_id {garbage:?} must refuse"
+            );
+            let mut multi_spec = multi_leg_spec();
+            multi_spec.security_id = garbage.to_string();
+            assert!(
+                matches!(
+                    build_multi_order_request("1106656882", &[multi_spec]),
+                    Err(ConditionalBuildError::BadSecurityId)
+                ),
+                "multi-leg garbage security_id {garbage:?} must refuse"
+            );
+        }
     }
 
     fn valid_condition() -> TriggerCondition {

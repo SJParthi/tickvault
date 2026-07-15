@@ -425,19 +425,25 @@ fn test_inline_template_extractor_self_test() {
 ///   constants are consumed ACROSS the workspace — api_client.rs for the
 ///   OMS families, but also core (auth/RenewToken/ip/charts) and app
 ///   (option-chain per-minute pull) — NOT all "in api_client.rs".
-/// * **38 per-method REST OPERATIONS** enumerated in the breakdown below
+/// * **41 per-method REST OPERATIONS** enumerated in the breakdown below
 ///   (several operations share one path, e.g. PUT/DELETE/GET on
 ///   /orders/{order-id}) — plus exit-all's DELETE reusing the shared
-///   /positions path as a 39th operation on an already-counted path. The
+///   /positions path as a 42nd operation on an already-counted path. The
 ///   operations list scopes the OMS/option-chain/portfolio/funds/control
 ///   families; the auth/ip/charts/profile constants are single-operation
-///   paths counted on the constants side.
+///   paths counted on the constants side. (Round-4 reconciliation: the
+///   round-3 "38" scalar counted trader's control PER-PATH (2) while this
+///   file's own annotations pin POST/GET /killswitch + POST/DELETE/GET
+///   /pnlExit = 5 method+path operations — matching api_client.rs' 6
+///   control fns, activate/deactivate sharing POST /killswitch via query
+///   param. The scalar is now MECHANICAL: the tally assert in the test
+///   body sums the family counts to 41.)
 ///
 /// The inline templates are MEASURED from the file, so the ledger's
 /// drift-detection purpose is mechanical: a new inline endpoint (or a
 /// template change) fails the pinned-set equality below.
 ///
-/// The 38 listed operations break down as:
+/// The 41 listed operations break down as:
 /// - Orders (9): place, modify, cancel, order-book, single-order, by-correlation, trade-book, trades-by-order, slicing
 /// - Super orders (4): place, modify, cancel, list
 /// - Forever orders (4): create, modify, delete, list
@@ -453,11 +459,17 @@ fn test_inline_template_extractor_self_test() {
 ///   prior "via constant" label was wrong for this one; exit-all is the
 ///   consumer of DHAN_POSITIONS_PATH, and the inline retrofit is a flagged
 ///   follow-up)
-/// - Funds/margin via constant (3): margin-calc, margin-multi, fund-limit
-/// - Trader's control via constant (2): killswitch, pnl-exit
+/// - Funds/margin via constant (3): margin-calc POST, margin-multi POST,
+///   fund-limit GET
+/// - Trader's control via constant (5): killswitch POST/GET, pnl-exit
+///   POST/DELETE/GET — per this file's own path annotations and
+///   api_client.rs' 6 control fns (activate_kill_switch /
+///   deactivate_kill_switch share POST /killswitch via query param;
+///   get_kill_switch_status; configure_pnl_exit / stop_pnl_exit /
+///   get_pnl_exit_status). The round-3 per-path "2" contradicted both.
 /// - Exit-all (DELETE /positions) reuses DHAN_POSITIONS_PATH — a distinct
 ///   operation on a path already inside the 37 (asserted below, not part
-///   of the 38-item list)
+///   of the 41-item list)
 ///
 /// Total unique path templates: 19 (constants — incl. /alerts/multi/orders
 /// added 2026-07-14 and the 2 option-chain constants, live since the
@@ -577,6 +589,42 @@ fn test_oms_inline_endpoint_paths_documented() {
     assert_eq!(
         DHAN_POSITIONS_PATH, "/positions",
         "Exit-all shares the /positions path (DELETE method)"
+    );
+
+    // --- Per-method OPERATIONS tally (MEASURED — round-4 fix 2026-07-14) ---
+    // The round-3 header's "38 operations" scalar was irreproducible
+    // narrative: it counted trader's control PER-PATH (2) while this file's
+    // own annotations pin POST/GET /killswitch + POST/DELETE/GET /pnlExit
+    // = 5 method+path operations (api_client.rs implements all 6 control
+    // fns; activate/deactivate share POST /killswitch via query param).
+    // The tally below makes the scalar mechanical: a drift in any family's
+    // operation count fails this assert instead of hiding in prose.
+    let listed_family_ops = order_paths.len()
+        + super_order_paths.len()
+        + forever_order_paths.len()
+        + conditional_paths.len()
+        + edis_paths.len()
+        + statement_paths.len();
+    assert_eq!(
+        listed_family_ops, 28,
+        "28 operations enumerated in the per-family lists above \
+         (9 orders + 4 super + 4 forever + 6 conditional/multi + 3 EDIS + \
+         2 statements)"
+    );
+    let option_chain_ops: usize = 2; // POST optionchain + POST expirylist (app-crate consumer)
+    let portfolio_ops: usize = 3; // GET holdings + GET positions (inline) + POST convert
+    let funds_margin_ops: usize = 3; // POST margincalculator + POST …/multi + GET fundlimit
+    let traders_control_ops: usize = 5; // POST/GET killswitch + POST/DELETE/GET pnlExit
+    let per_method_operations = listed_family_ops
+        + option_chain_ops
+        + portfolio_ops
+        + funds_margin_ops
+        + traders_control_ops;
+    assert_eq!(
+        per_method_operations, 41,
+        "41 per-method REST operations across the scoped families — plus \
+         exit-all's DELETE /positions as the 42nd operation on an \
+         already-counted path (asserted above)"
     );
 
     // --- Inline template census (MEASURED — round-3 fix 2026-07-14) ---

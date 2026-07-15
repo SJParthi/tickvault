@@ -267,7 +267,7 @@ Other clusters (checked off by their owning sessions' PRs, all referencing THIS 
     test_gate_guard_scanner_self_test, test_place_multi_order_success,
     test_place_multi_order_blocked_when_gate_disarmed_no_socket,
     test_place_multi_order_rate_limited_429, test_place_multi_order_dhan_error_400_records_metric,
-    test_place_multi_order_malformed_json_error, test_url_construction_multi_order_uses_alerts_multi_path,
+    test_place_multi_order_malformed_json_error, test_url_expression_multi_order_constant_joins_alerts_multi_path (renamed round-4 — the old test_url_construction_* name claimed sender behavior; the sender's actual POST + path is now wire-observed by test_place_multi_order_wire_sends_post_to_alerts_multi_path via the round-4 request-capturing mock),
     test_existing_conditional_fns_blocked_when_gate_disarmed, test_arm_alerts_gate_for_test_arms_gate,
     test_multi_order_request_serializes_camel_case_exact, test_conditional_vs_multi_price_type_split,
     test_multi_order_response_parses_unknown_order_status_modified_inactive_no_panic,

@@ -38,15 +38,22 @@
 //!    excluded. The activation PR edits THIS test alongside the operator
 //!    quote.
 //! 5. The order-leg segment enums stay equities-only fail-closed.
-//! 6. The `/alerts` paths have a single choke point (no rogue sender
-//!    files). Within the allowlist: constants.rs is under a
+//! 6. The `/alerts` FAMILY has a single choke point (no rogue sender
+//!    files). The workspace mention needle covers every known shape
+//!    (round-4): the general `/alerts` prefix (any subpath — the gate's
+//!    contract is the WHOLE family, not just orders/multi), the
+//!    slashless `alerts/orders`/`alerts/multi` literals, AND
+//!    `DHAN_ALERTS_`-prefixed constant identifiers (a rogue file
+//!    IMPORTING the existing constant previously shipped invisible).
+//!    Within the allowlist: constants.rs is under a
 //!    `DHAN_ALERTS_`-naming ratchet — every code line carrying `/alerts`
 //!    must DECLARE a `pub const DHAN_ALERTS_*` (the declared IDENTIFIER
 //!    is parsed, round-3: a rogue-named constant with a camouflage
 //!    `// DHAN_ALERTS_ family` trailing comment previously satisfied a
 //!    substring check), so a rogue-named constant cannot dodge test 3's
-//!    census — and types.rs / conditional.rs may mention the paths in
-//!    DOC COMMENTS ONLY.
+//!    census — and types.rs / conditional.rs may mention the family in
+//!    DOC COMMENTS ONLY (sole carve-out: types.rs' single
+//!    AlertsSurfaceDisarmed display line, pinned to one copy).
 //! 7. The scanner itself detects planted violations (vacuous-pass defense
 //!    — the 2026-07-06 lesson).
 //!
@@ -55,15 +62,17 @@
 //! honest evidence surface).
 //!
 //! HONEST ENVELOPE: these are text ratchets. They pin every regression
-//! shape surfaced by the round-1/round-2/round-3 adversarial reviews
-//! (literal and non-literal arms, parameterized constructors, compound
-//! assignments, `&mut` borrows, new senders, new constants, full-line AND
-//! trailing comment-inflated counts, rogue-named /alerts constants with
-//! camouflage comments, UFCS/path/bare-call production callers); they do
-//! NOT claim to stop deliberate obfuscation outside those shapes
-//! (byte-assembled strings, raw-string literals — none exist in the
-//! scanned production regions today — `unsafe` pointer writes) — such
-//! code fails human review + the operator-quote protocol, not this file.
+//! shape surfaced by the round-1/round-2/round-3/round-4 adversarial
+//! reviews (literal and non-literal arms, parameterized constructors,
+//! compound assignments, `&mut` borrows, new senders, new constants,
+//! full-line AND trailing comment-inflated counts, rogue-named /alerts
+//! constants with camouflage comments, UFCS/path/bare-call production
+//! callers, rogue-FILE senders on any `/alerts` subpath or via a
+//! `DHAN_ALERTS_*` constant import); they do NOT claim to stop deliberate
+//! obfuscation outside those shapes (byte-assembled strings, raw-string
+//! literals — none exist in the scanned production regions today —
+//! `unsafe` pointer writes) — such code fails human review + the
+//! operator-quote protocol, not this file.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -415,6 +424,22 @@ fn derive_alerts_sender_fns(code: &str) -> Vec<String> {
     names.sort_unstable();
     names.dedup();
     names
+}
+
+/// True when `source` mentions the Dhan `/alerts` family in ANY known
+/// shape: the GENERAL family prefix `/alerts` (matching test 3's census —
+/// the gate's contract covers the WHOLE family, incl. subpaths beyond
+/// orders/multi such as price/watchlist alerts), the slashless subpath
+/// literals `alerts/orders` / `alerts/multi` (a
+/// `format!("{base}/{}", "alerts/orders")` assembly carries no leading
+/// slash), or a `DHAN_ALERTS_`-prefixed constant identifier (round-4: the
+/// house-MANDATED constant-consumption style — a rogue file importing
+/// `DHAN_ALERTS_MULTI_ORDERS_PATH` previously shipped an ungated live
+/// sender invisible to the two-subpath needles).
+fn mentions_alerts_family(source: &str) -> bool {
+    ["/alerts", "alerts/orders", "alerts/multi", "DHAN_ALERTS_"]
+        .iter()
+        .any(|needle| source.contains(needle))
 }
 
 /// Lines of (comment-stripped) `code` that mention `/alerts` WITHOUT
@@ -793,8 +818,14 @@ fn test_alerts_paths_single_choke_point() {
         let Ok(source) = fs::read_to_string(&file) else {
             continue;
         };
-        let mentions_alerts = source.contains("alerts/orders") || source.contains("alerts/multi");
-        if !mentions_alerts {
+        // Round-4 hardening: the mention needle is the WHOLE `/alerts`
+        // FAMILY (general prefix + slashless subpaths + `DHAN_ALERTS_`
+        // constant identifiers), matching test 3's census — the previous
+        // two-subpath needles let (a) a new-file sender with a bare
+        // `/alerts` (or any other subpath) literal and (b) a new file
+        // IMPORTING the existing DHAN_ALERTS_MULTI_ORDERS_PATH constant
+        // ship ungated with all 7 guards green.
+        if !mentions_alerts_family(&source) {
             continue;
         }
         if !allowlist.iter().any(|allowed| path_text.ends_with(allowed)) {
@@ -803,8 +834,9 @@ fn test_alerts_paths_single_choke_point() {
     }
     assert!(
         violations.is_empty(),
-        "the /alerts paths have a single gated choke point — no new file may \
-         mention alerts/orders or alerts/multi. Violations:\n{}",
+        "the /alerts family has a single gated choke point — no new file may \
+         mention `/alerts` (any subpath), `alerts/orders`, `alerts/multi`, \
+         or a DHAN_ALERTS_* constant. Violations:\n{}",
         violations.join("\n")
     );
 
@@ -830,22 +862,44 @@ fn test_alerts_paths_single_choke_point() {
         naming_violations.join("\n")
     );
 
-    // (b) types.rs + conditional.rs may mention the /alerts paths in DOC
-    //     COMMENTS ONLY — zero comment-stripped code mentions, so neither
-    //     file can carry a path literal for a new sender to consume.
-    for path in ["src/oms/types.rs", CONDITIONAL_RS] {
+    // (b) types.rs + conditional.rs may mention the /alerts family in DOC
+    //     COMMENTS ONLY — zero comment-stripped code mentions in ANY family
+    //     shape (round-4: the general `/alerts` prefix + DHAN_ALERTS_*
+    //     constants, not just the two subpath literals), so neither file
+    //     can carry a path literal or constant for a new sender to consume.
+    //     The single allowed code mention is types.rs' AlertsSurfaceDisarmed
+    //     display attribute, excluded by its exact message prefix and
+    //     pinned to EXACTLY one copy (a second copy carrying a URL on the
+    //     same line could otherwise hide behind the carve-out).
+    const TYPES_REFUSAL_MESSAGE: &str = "alerts surface disarmed: /alerts";
+    for (path, allowed_refusal_lines) in [("src/oms/types.rs", 1usize), (CONDITIONAL_RS, 0)] {
         let source = fs::read_to_string(path)
             .unwrap_or_else(|_| panic!("{path} must be readable for the choke-point guard"));
         let file_code = strip_comments(production_region(&source));
-        for token in ["alerts/orders", "alerts/multi"] {
-            assert_eq!(
-                count_occurrences(&file_code, token),
-                0,
-                "{path} may mention `{token}` in doc comments ONLY — a code \
-                 (string-literal) mention is a rogue path source outside the \
-                 gated api_client.rs choke point"
-            );
-        }
+        let refusal_lines = file_code
+            .lines()
+            .filter(|line| line.contains(TYPES_REFUSAL_MESSAGE))
+            .count();
+        assert_eq!(
+            refusal_lines, allowed_refusal_lines,
+            "{path} must carry exactly {allowed_refusal_lines} \
+             `{TYPES_REFUSAL_MESSAGE}` display-message line(s) — the only \
+             allowed non-doc /alerts mention outside api_client.rs"
+        );
+        let code_mentions: Vec<String> = file_code
+            .lines()
+            .filter(|line| mentions_alerts_family(line))
+            .filter(|line| !line.contains(TYPES_REFUSAL_MESSAGE))
+            .map(|line| line.trim().to_string())
+            .collect();
+        assert!(
+            code_mentions.is_empty(),
+            "{path} may mention the /alerts family in doc comments ONLY — a \
+             code mention (string literal OR DHAN_ALERTS_* constant use) is \
+             a rogue path source outside the gated api_client.rs choke \
+             point. Violations:\n{}",
+            code_mentions.join("\n")
+        );
     }
 }
 
@@ -1154,6 +1208,37 @@ fn test_gate_guard_scanner_self_test() {
         strip_trailing_comment("let a = &'static str; // gone"),
         "let a = &'static str;",
         "a lifetime tick must not open a char literal"
+    );
+
+    // ------------------------------------------------------------------
+    // mentions_alerts_family — the round-4 workspace choke-point needle
+    // detects EVERY known family shape, not just the two subpaths.
+    // ------------------------------------------------------------------
+    assert!(
+        mentions_alerts_family("let url = format!(\"{}/alerts\", self.base_url);"),
+        "a bare `/alerts` family-prefix literal must be detected (round-4: \
+         a rogue price/watchlist-alert sender on any other subpath)"
+    );
+    assert!(
+        mentions_alerts_family("let u = format!(\"{}/alerts/settings\", b);"),
+        "an unforeseen /alerts subpath must be detected via the prefix"
+    );
+    assert!(
+        mentions_alerts_family("use tickvault_common::constants::DHAN_ALERTS_MULTI_ORDERS_PATH;"),
+        "a DHAN_ALERTS_* constant IMPORT must be detected (round-4: the \
+         house-mandated constant-consumption style is not obfuscation)"
+    );
+    assert!(
+        mentions_alerts_family("let u = format!(\"{}/{}\", b, \"alerts/multi\");"),
+        "a slashless subpath assembly must still be detected"
+    );
+    assert!(
+        mentions_alerts_family("let u = \"/alerts/orders\";"),
+        "the classic subpath literal must still be detected"
+    );
+    assert!(
+        !mentions_alerts_family("fn ok() { let u = \"/orders\"; }"),
+        "a non-alerts file must not be flagged"
     );
 
     // ------------------------------------------------------------------
