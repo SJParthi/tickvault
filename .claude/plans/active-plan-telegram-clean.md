@@ -1,6 +1,6 @@
 # Implementation Plan: Telegram Cleanliness Overhaul (S1–S4)
 
-**Status:** IN_PROGRESS
+**Status:** VERIFIED
 **Date:** 2026-07-15
 **Approved by:** directive relayed via the coordinator session 2026-07-15 — coordinator relay, not a direct in-session operator message; pending operator ratification on the PR
 
@@ -114,29 +114,29 @@ change; no cost delta.
 
 ## Plan Items
 
-- [ ] Item 0 — plan file added (the two stale groww plans were already
+- [x] Item 0 — plan file added (the two stale groww plans were already
       archived upstream in #1576; active-plan count stays ≤ 5)
       — Files: .claude/plans/active-plan-telegram-clean.md — Tests: plan-gate.sh PASS
-- [ ] Item 1 — daily_task_marker.rs + TF RunCatchUp gate + should_notify_summary
+- [x] Item 1 — daily_task_marker.rs + TF RunCatchUp gate + should_notify_summary
       — Files: crates/app/src/daily_task_marker.rs, crates/app/src/lib.rs,
         crates/app/src/tf_consistency_boot.rs,
         crates/app/tests/tf_consistency_wiring_guard.rs
       — Tests: test_daily_marker_path_shape, test_daily_marker_exists_*,
         test_write_daily_marker_*, test_should_notify_summary_*,
         wiring-guard needles
-- [ ] Item 2 — shutdown_class.rs + ShutdownClass payload + bodies + severities
+- [x] Item 2 — shutdown_class.rs + ShutdownClass payload + bodies + severities
       — Files: crates/app/src/shutdown_class.rs, crates/app/src/lib.rs,
         crates/app/src/main.rs, crates/core/src/notification/events.rs,
         crates/core/src/notification/service.rs (test constructions)
       — Tests: test_classify_shutdown_* truth table + window boundaries,
         test_shutdown_initiated_message_* ×3, per-class severity pins
-- [ ] Item 3 — scorecard rewrite + TF-pass one-liner + telegram_body_format_guard.rs
+- [x] Item 3 — scorecard rewrite + TF-pass one-liner + telegram_body_format_guard.rs
       — Files: crates/core/src/notification/events.rs,
         crates/core/tests/telegram_body_format_guard.rs,
         crates/core/tests/event_formatting_coverage.rs
       — Tests: aligned_feed_line / aggregate_pulls_per_feed suites, re-pointed
         scorecard body tests, TF pass one-liner tests, ~12 ratchet tests
-- [ ] Item 4 (SEVERABLE) — DhanRest/GrowwRest episode routing
+- [x] Item 4 (SEVERABLE) — DhanRest/GrowwRest episode routing
       — Files: crates/core/src/notification/events.rs,
         crates/core/src/notification/episode.rs,
         crates/core/tests/episode_rest_family_wiring_guard.rs,
