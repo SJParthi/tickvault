@@ -282,13 +282,30 @@ surfaces as a `tv_cadence_gate_deferred_total{key}` trend STORM, which the
 operator reads from the counter, not from a page. Do not treat a quiet page
 stream as proof of gate health — read the counter trend.
 
-**Level-triggered enable-flag note (verifier F8, dated 2026-07-15):** the
-`dhan_enabled` / `groww_enabled` lane flags are read per cycle per lane
-(level-triggered). A mid-cycle disable via `/api/feeds` therefore keeps the
-in-flight cycle firing for AT MOST one more cycle (~15s worst case — the
-Dhan lane cutoff); the NEXT boundary observes the flag. Never a bug report:
-this is the documented lifecycle envelope (the same wording lives on
-`CadenceConfig`'s doc).
+**Level-triggered enable-flag note (verifier F8, dated 2026-07-15 —
+HARDENED by CONC-NEW-1, hostile round 1 2026-07-15):** the original F8
+wording ("read once per cycle; a disable is observed within ~15s / at the
+next boundary") was WRONG in both directions: `run_cycle` is ENTERED the
+moment a joinable boundary exists — the day's FIRST cycle is joined near
+IST midnight and waits ~9h for the 09:15:55 anchor with the midnight flag
+snapshot frozen, and even mid-day the next cycle's snapshot was taken
+~45s before its first fire. The runner now (a) RE-OBSERVES the
+`dhan_enabled` / `groww_enabled` atomics every ~5s wake chunk while the
+cycle is PRISTINE (no fire dispatched) and re-arms the whole cycle from
+the fresh flags on any change — so a pre-fire toggle in EITHER direction
+is honored within ~5s, and an enable joins the CURRENT cycle; and (b)
+re-checks the atomics at every dispatch/completion instant — a mid-cycle
+disable stops every not-yet-dispatched fire (the lane drops
+shutdown-shaped: no partial emit, no degrade page, no decision).
+Already-IN-FLIGHT requests complete as audit-only late responses, and a
+completion-driven single deferred fallback racing the disable is bounded
+to at most one request. An enable AFTER the cycle's first fire joins at
+the next minute boundary (unchanged). Ratchets:
+`test_pristine_cycle_observes_disable_before_first_fire` /
+`test_pristine_cycle_observes_enable_before_first_fire` /
+`test_midcycle_disable_stops_not_yet_dispatched_fires` in
+`cadence_runner_dry_run.rs`. Never a bug report: this is the documented
+lifecycle envelope (the same wording lives on `CadenceConfig`'s doc).
 
 ## §3b. COMPOSITION CONTRACT (2026-07-15) — binding on every future executor impl
 

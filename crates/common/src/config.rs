@@ -874,12 +874,17 @@ pub struct TfConsistencyConfig {
 /// `[cadence]` section (or a TOML written before this PR) disables the
 /// scheduler entirely and deserializes the full locked cadence table.
 ///
-/// Level-trigger note (verifier F8, dated 2026-07-15): the per-LANE
-/// enable flags the runner consults (the `/api/feeds` toggle atomics —
-/// NOT keys in this section) are read once per cycle per lane, so a
-/// mid-cycle disable keeps that cycle's remaining fires running for at
-/// most ONE cycle (~15s worst case, the Dhan lane cutoff) before the
-/// next boundary observes the flag. Stated plainly in
+/// Level-trigger note (verifier F8, dated 2026-07-15; hardened by
+/// CONC-NEW-1, hostile round 1 2026-07-15): the per-LANE enable flags
+/// the runner consults (the `/api/feeds` toggle atomics — NOT keys in
+/// this section) are snapshotted at cycle entry, RE-OBSERVED every ~5s
+/// wake chunk while the cycle is still PRISTINE (no fire dispatched —
+/// the day's first cycle is entered near IST midnight and waits hours
+/// for its anchor), and re-checked at every dispatch/completion
+/// instant. A disable therefore stops every not-yet-dispatched fire
+/// within one ~5s wake chunk; already-in-flight requests complete
+/// audit-only. An enable joins the CURRENT cycle when nothing has fired
+/// yet, else the next minute boundary. Stated plainly in
 /// `.claude/rules/project/cadence-error-codes.md` too.
 #[derive(Debug, Clone, Deserialize)]
 pub struct CadenceConfig {
