@@ -137,6 +137,10 @@ pub mod groww_scale_lock;
 /// Groww Python-sidecar auto-launcher + supervisor (operator lock §32 +
 /// "no manual commands" 2026-06-19). Default-OFF.
 pub mod groww_sidecar_supervisor;
+/// `[groww_universe]` process-global daily Groww watch-set + shared-master
+/// rider (2026-07-15 live-feed retirement re-home of the activation daily
+/// build loop + the sole persist_groww_instruments caller).
+pub mod groww_universe;
 pub mod groww_watch_paths;
 pub mod scale_test_preflight;
 /// Shared per-seal routing for BOTH feeds (Dhan + Groww) — the single

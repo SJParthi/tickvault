@@ -167,6 +167,15 @@ pub struct ApplicationConfig {
     /// section ⇒ DISABLED (fail-safe default off).
     #[serde(default)]
     pub groww_contract_1m: GrowwContract1mConfig,
+    /// `[groww_universe]` — process-global daily Groww watch-set +
+    /// shared-master rider (2026-07-15 Groww live-feed retirement re-home of
+    /// the activation watcher's daily build loop): once per IST day, build +
+    /// write `data/groww/groww-watch-<date>.json` (the spot leg's VIX
+    /// resolver reads it) and fire-and-forget `persist_groww_instruments`
+    /// (SEBI `feed='groww'` master continuity). Absent section ⇒ DISABLED
+    /// (fail-safe default off); `config/base.toml` opts in.
+    #[serde(default)]
+    pub groww_universe: GrowwUniverseConfig,
     /// `[dhan_margin_gate]` — 🔷 DHAN pre-trade margin gate (operator
     /// directive 2026-07-14, relayed via the coordinator session — the
     /// Funds & Margin surface runs as its own dedicated build; umbrella
@@ -848,6 +857,24 @@ impl Default for GrowwOptionChain1mConfig {
             probe_and_report: default_chain_1m_probe_and_report(),
         }
     }
+}
+
+/// `[groww_universe]` — process-global daily Groww watch-set + shared-master
+/// rider (2026-07-15 Groww live-feed retirement, re-home of the retired
+/// activation watcher's daily `build_and_write_groww_watch` loop + the sole
+/// `persist_groww_instruments` caller). Cold path only — one build per IST
+/// day; never the tick hot path, never a WebSocket.
+///
+/// Fail-safe shape: `enabled` is `#[serde(default)]` = `false`, so an absent
+/// `[groww_universe]` section (or a TOML written before this PR) disables the
+/// rider entirely. `config/base.toml` ships the section with `enabled = true`
+/// (base opts in; the serde default stays OFF — the house fail-safe pattern).
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct GrowwUniverseConfig {
+    /// Master switch for the daily watch-set build + shared-master persist
+    /// rider. Default OFF (fail-safe).
+    #[serde(default)]
+    pub enabled: bool,
 }
 
 /// serde default for [`GrowwContract1mConfig::strikes_each_side`] — the
@@ -3003,6 +3030,7 @@ mod tests {
             groww_option_chain_1m: GrowwOptionChain1mConfig::default(),
             tf_consistency: TfConsistencyConfig::default(),
             groww_contract_1m: GrowwContract1mConfig::default(),
+            groww_universe: GrowwUniverseConfig::default(),
             dhan_margin_gate: DhanMarginGateConfig::default(),
         }
     }
