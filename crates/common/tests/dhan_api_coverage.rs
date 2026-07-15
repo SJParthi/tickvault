@@ -1,17 +1,21 @@
 //! Dhan API endpoint coverage tests.
 //!
 //! Verifies the 43 known Dhan API endpoint URLs/path templates: 19
-//! constants-backed paths, 19 inline path templates in api_client.rs
-//! (MEASURED by a source scan — round-3 fix 2026-07-14: the inline count
-//! was previously a hardcoded scalar nothing reconciled against the actual
-//! file), 1 overlap (`/positions`), 2 WebSocket URLs, and 4 intentionally
-//! skipped endpoints. Prevents endpoint drift where new endpoints are
-//! added to api_client.rs using inline strings without this ledger (and
-//! its constants) being updated.
+//! constants-backed paths (18 with LIVE consumers + 1 ORPHAN —
+//! `/charts/historical`, whose consumers were deleted by the merged Phase
+//! C-3 #1569; round-5 truth-sync 2026-07-15, MEASURED by
+//! `test_charts_historical_constant_is_orphaned_post_phase_c3`), 19 inline
+//! path templates in api_client.rs (MEASURED by a source scan — round-3
+//! fix 2026-07-14: the inline count was previously a hardcoded scalar
+//! nothing reconciled against the actual file), 1 overlap (`/positions`),
+//! 2 WebSocket URLs, and 4 intentionally skipped endpoints. Prevents
+//! endpoint drift where new endpoints are added to api_client.rs using
+//! inline strings without this ledger (and its constants) being updated.
 //!
 //! Reference: docs/dhan-ref/*.md (21 reference files)
 
 use std::fs;
+use std::path::{Path, PathBuf};
 
 use tickvault_common::constants::{
     // Conditional & Multi Order (1) — 2026-07-14
@@ -54,12 +58,20 @@ use tickvault_common::constants::{
 // Test: All Dhan REST endpoint constants are defined and have correct paths
 // ---------------------------------------------------------------------------
 
-/// Verifies that constants exist for all 19 implemented Dhan REST endpoints
-/// in constants.rs, and that each constant maps to the correct v2 API path.
+/// Verifies the 19 Dhan REST endpoint path constants in constants.rs, and
+/// that each constant maps to the correct v2 API path. 18 of the 19 have
+/// LIVE consumers; `/charts/historical` is ORPHANED (round-5 truth-sync
+/// 2026-07-15: the merged Phase C-3 deletion — #1569, the 2026-07-13
+/// Dhan-lane retirement — removed BOTH former consumers,
+/// `crates/app/src/prev_day_ohlcv_boot.rs` + `cross_verify_1m_boot.rs`;
+/// zero senders anywhere, pinned by
+/// `test_charts_historical_constant_is_orphaned_post_phase_c3`).
 ///
 /// Endpoint groups covered:
 /// - Authentication: generateAccessToken, RenewToken
-/// - Historical data: charts/intraday, charts/historical
+/// - Historical data: charts/intraday (LIVE — app spot-1m pull),
+///   charts/historical (ORPHANED — constant only, zero consumers since
+///   Phase C-3 #1569)
 /// - Option chain: optionchain, optionchain/expirylist (2026-07-12 §8
 ///   rebuild — LIVE consumers in crates/app/src/option_chain_1m_boot.rs,
 ///   the per-minute scheduled pull; NOT api_client.rs)
@@ -82,13 +94,23 @@ fn test_all_dhan_rest_endpoint_constants_defined() {
     );
 
     // --- Historical data (docs/dhan-ref/05-historical-data.md) ---
+    // charts/intraday: LIVE — sole consumer is
+    // crates/app/src/spot_1m_rest_boot.rs (the §8 per-minute scheduled
+    // pull; APP crate, not core — round-5 attribution truth-sync).
     assert_eq!(
         DHAN_CHARTS_INTRADAY_PATH, "/charts/intraday",
         "POST api.dhan.co/v2/charts/intraday"
     );
+    // charts/historical: ORPHANED — the merged Phase C-3 deletion (#1569,
+    // 2026-07-13 Dhan-lane retirement) removed both former consumers
+    // (prev_day_ohlcv_boot.rs + cross_verify_1m_boot.rs); the constant is
+    // retained with ZERO senders anywhere (measured by
+    // test_charts_historical_constant_is_orphaned_post_phase_c3). Retiring
+    // the constant OR re-consuming it updates this ledger in the same PR —
+    // never silently.
     assert_eq!(
         DHAN_CHARTS_HISTORICAL_PATH, "/charts/historical",
-        "POST api.dhan.co/v2/charts/historical"
+        "POST api.dhan.co/v2/charts/historical (ORPHANED — no live sender)"
     );
 
     // --- Option chain (docs/dhan-ref/06-option-chain.md) ---
@@ -172,7 +194,10 @@ fn test_all_dhan_rest_endpoint_constants_defined() {
     // (2026-07-14: +1 /alerts/multi/orders — Conditional & Multi Order family;
     // 2026-07-14 review fix: +2 option-chain constants — they were LIVE since
     // the 2026-07-12 §8 rebuild but absent from this ledger, which falsely
-    // claimed them "no longer implemented")
+    // claimed them "no longer implemented";
+    // 2026-07-15 round-5 truth-sync: DHAN_CHARTS_HISTORICAL_PATH stays in the
+    // 19 as a CONSTANTS census entry but is ORPHANED — zero consumers since
+    // the merged Phase C-3 #1569)
     let rest_paths: &[&str] = &[
         DHAN_GENERATE_TOKEN_PATH,
         DHAN_RENEW_TOKEN_PATH,
@@ -423,15 +448,22 @@ fn test_inline_template_extractor_self_test() {
 ///   BOTH inline in get_positions AND constants-backed in
 ///   exit_all_positions; the inline retrofit is a flagged follow-up). The
 ///   constants are consumed ACROSS the workspace — api_client.rs for the
-///   OMS families, but also core (auth/RenewToken/ip/charts) and app
-///   (option-chain per-minute pull) — NOT all "in api_client.rs".
+///   OMS families, but also core (auth/RenewToken/profile via
+///   token_manager.rs + ip via ip_verifier.rs) and app (charts/intraday
+///   spot-1m + option-chain per-minute pulls) — NOT all "in
+///   api_client.rs". `/charts/historical` has NO consumer at all
+///   (ORPHANED since the merged Phase C-3 #1569 — round-5 truth-sync
+///   2026-07-15; the prior "core (auth/RenewToken/ip/charts)" attribution
+///   was wrong for BOTH charts constants: intraday's consumer is the APP
+///   crate and historical's consumers are deleted).
 /// * **41 per-method REST OPERATIONS** enumerated in the breakdown below
 ///   (several operations share one path, e.g. PUT/DELETE/GET on
 ///   /orders/{order-id}) — plus exit-all's DELETE reusing the shared
 ///   /positions path as a 42nd operation on an already-counted path. The
 ///   operations list scopes the OMS/option-chain/portfolio/funds/control
 ///   families; the auth/ip/charts/profile constants are single-operation
-///   paths counted on the constants side. (Round-4 reconciliation: the
+///   paths counted on the constants side (charts/historical: ORPHANED —
+///   see above). (Round-4 reconciliation: the
 ///   round-3 "38" scalar counted trader's control PER-PATH (2) while this
 ///   file's own annotations pin POST/GET /killswitch + POST/DELETE/GET
 ///   /pnlExit = 5 method+path operations — matching api_client.rs' 6
@@ -477,6 +509,9 @@ fn test_inline_template_extractor_self_test() {
 /// (the /positions overlap) = 37
 /// Plus 2 WebSocket URLs (the two-WS lock — `test_all_websocket_urls_defined`
 /// in THIS file; the round-2 scalar 4 contradicted it) = 39 implemented
+/// URLs/templates — of which `/charts/historical` is ORPHANED (constant
+/// retained, ZERO consumers since the merged Phase C-3 #1569 — round-5
+/// truth-sync 2026-07-15), so 38 have live senders/consumers today.
 /// Grand ledger total: 43 = 39 implemented + 4 intentionally skipped
 #[test]
 fn test_oms_inline_endpoint_paths_documented() {
@@ -686,7 +721,10 @@ fn test_oms_inline_endpoint_paths_documented() {
     // 19 constants-backed REST endpoints (pinned by
     //   test_all_dhan_rest_endpoint_constants_defined; incl.
     //   /alerts/multi/orders 2026-07-14 + the 2 option-chain constants,
-    //   live since the 2026-07-12 §8 rebuild)
+    //   live since the 2026-07-12 §8 rebuild; /charts/historical is
+    //   ORPHANED — constant retained, zero consumers since Phase C-3
+    //   #1569, measured by
+    //   test_charts_historical_constant_is_orphaned_post_phase_c3)
     // + 19 inline templates in api_client.rs (MEASURED above)
     // − 1 overlap (/positions: inline get_positions + constants exit-all)
     // + 2 WebSocket endpoints (the two-WS lock —
@@ -709,7 +747,8 @@ fn test_oms_inline_endpoint_paths_documented() {
     assert_eq!(
         total_implemented, 39,
         "39 implemented endpoint URLs/templates (37 unique path templates \
-         + 2 WebSocket URLs)"
+         + 2 WebSocket URLs; incl. the ORPHANED /charts/historical — \
+         constant retained, zero consumers since Phase C-3 #1569)"
     );
 
     // Plus the 4 intentionally skipped = total Dhan API endpoints known
@@ -803,3 +842,95 @@ fn test_path_constants_are_paths_not_full_urls() {
 // PR #4 (2026-05-19): `test_depth_websocket_urls_correct_hostnames` retired
 // alongside the deleted 20/200-level depth WebSocket constants. See the
 // header comment after the imports for the operator lock reference.
+
+// ---------------------------------------------------------------------------
+// Test: /charts/historical is ORPHANED post-Phase-C-3 (measured, not narrated)
+// ---------------------------------------------------------------------------
+
+/// Recursively collects every `.rs` file under `dir` whose path contains
+/// `/src/` (production trees only — `target`, `tests/` and `benches/` dirs
+/// excluded). Mirror of the gate-guard walker in
+/// `crates/trading/tests/conditional_gate_guard.rs`.
+fn collect_workspace_src_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("");
+            if name == "target" || name == "tests" || name == "benches" {
+                continue;
+            }
+            collect_workspace_src_files(&path, out);
+        } else if path.extension().and_then(|ext| ext.to_str()) == Some("rs")
+            && path.to_string_lossy().contains("/src/")
+        {
+            out.push(path);
+        }
+    }
+}
+
+/// Pins the ORPHAN status of `DHAN_CHARTS_HISTORICAL_PATH` (round-5 ledger
+/// truth-sync, 2026-07-15): the merged Phase C-3 deletion (#1569, the
+/// 2026-07-13 Dhan-lane retirement) removed BOTH former consumers
+/// (`crates/app/src/prev_day_ohlcv_boot.rs` + `cross_verify_1m_boot.rs`),
+/// so the constant is retained with ZERO senders anywhere — a de-facto
+/// unimplemented endpoint that must not be silently re-consumed OR
+/// silently narrated as live. This scan makes the ledger's orphan
+/// annotations SELF-TRUING: re-adding a consumer (any
+/// `DHAN_CHARTS_HISTORICAL_PATH` use, or an inline `/charts/historical`
+/// literal on a CODE line) fails HERE until the annotations in this file
+/// move orphan → live in the same PR; deleting the constant instead fails
+/// `test_all_dhan_rest_endpoint_constants_defined` until the counts move.
+/// (The round-1 confirmed drift was the mirror image — option-chain
+/// endpoints narrated "no longer implemented" while LIVE; nothing
+/// mechanical pinned constants→consumer existence in either direction
+/// until this test.) FULL-LINE comment lines are excluded — several
+/// modules legitimately MENTION the retired endpoint in doc comments
+/// (tick_types.rs, prev_day_ohlcv_persistence.rs, …); a comment cannot
+/// send HTTP. A trailing-comment mention on a code line would over-count
+/// and fail LOUDLY — the conservative direction for an orphan pin.
+#[test]
+fn test_charts_historical_constant_is_orphaned_post_phase_c3() {
+    let mut files = Vec::new();
+    collect_workspace_src_files(Path::new("../../crates"), &mut files);
+    assert!(
+        files.len() > 50,
+        "the orphan scan must see the workspace production tree (found {} files)",
+        files.len()
+    );
+    let mut consumers = Vec::new();
+    for file in files {
+        let path_text = file.to_string_lossy().replace('\\', "/");
+        // The declaration site itself — separator-anchored (the gate-guard
+        // round-5 lesson: a bare ends_with would also skip a rogue
+        // `mycommon/src/constants.rs`).
+        if path_text.ends_with("/common/src/constants.rs") {
+            continue;
+        }
+        let Ok(source) = fs::read_to_string(&file) else {
+            continue;
+        };
+        let has_code_mention = source
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .any(|line| {
+                line.contains("DHAN_CHARTS_HISTORICAL_PATH") || line.contains("/charts/historical")
+            });
+        if has_code_mention {
+            consumers.push(path_text);
+        }
+    }
+    assert!(
+        consumers.is_empty(),
+        "DHAN_CHARTS_HISTORICAL_PATH is ORPHANED (the merged Phase C-3 \
+         #1569 deleted its consumers) — a new consumer/code mention must \
+         update this ledger's orphan annotations (orphan -> live) in the \
+         same PR. Found:\n{}",
+        consumers.join("\n")
+    );
+}

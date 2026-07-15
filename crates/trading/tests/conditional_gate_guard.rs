@@ -22,12 +22,17 @@
 //!    `//` comments outside string literals are stripped (round-3: a
 //!    trailing-comment decoy `… // self.require_alerts_gate(` could
 //!    previously inflate the gate side and balance a genuinely ungated
-//!    URL site), the URL census is GENERAL (any `/alerts` string shape +
-//!    any `DHAN_ALERTS_`-prefixed constant use), and the SENDER SET IS
-//!    DERIVED from the code (every `pub async fn` whose body touches
-//!    `/alerts` text or a `DHAN_ALERTS_*` constant) and pinned equal to
-//!    `ALERTS_SENDER_FNS` — a NEW 7th sender cannot ship without editing
-//!    this test and thereby entering the gate-before-HTTP ordering scan.
+//!    URL site), the URL census is TOKEN-GENERAL (round-5: any
+//!    slash-adjacent `alerts` token — covering `/alerts…` string shapes
+//!    AND the slashless subpath assembly
+//!    `format!("{}/{}", base, "alerts/orders")`, which the previous
+//!    `/alerts`-substring needle was blind to even though test 6's own
+//!    self-test classifies it in-family — plus any `DHAN_ALERTS_`-prefixed
+//!    constant use), and the SENDER SET IS DERIVED from the code (every
+//!    `pub async fn` whose body touches any of those family shapes) and
+//!    pinned equal to `ALERTS_SENDER_FNS` — a NEW 7th sender cannot ship
+//!    without editing this test and thereby entering the gate-before-HTTP
+//!    ordering scan.
 //! 4. NO production code calls any of the 6 sender fns (dormancy ratchet)
 //!    — api_client.rs' OWN production region INCLUDED (round-2: its
 //!    test-module call sites are excluded by the region split, never by a
@@ -40,11 +45,18 @@
 //! 5. The order-leg segment enums stay equities-only fail-closed.
 //! 6. The `/alerts` FAMILY has a single choke point (no rogue sender
 //!    files). The workspace mention needle covers every known shape
-//!    (round-4): the general `/alerts` prefix (any subpath — the gate's
-//!    contract is the WHOLE family, not just orders/multi), the
-//!    slashless `alerts/orders`/`alerts/multi` literals, AND
-//!    `DHAN_ALERTS_`-prefixed constant identifiers (a rogue file
-//!    IMPORTING the existing constant previously shipped invisible).
+//!    (round-4/round-5): the general `/alerts` prefix (any subpath — the
+//!    gate's contract is the WHOLE family, not just orders/multi), the
+//!    slashless `alerts/orders`/`alerts/multi` literals, ANY slash-adjacent
+//!    `alerts` token (round-5 — a slashless assembly on an UNFORESEEN
+//!    subpath like `format!("{}/{}", b, "alerts/settings")` matched none
+//!    of the four fixed needles), AND `DHAN_ALERTS_`-prefixed constant
+//!    identifiers (a rogue file IMPORTING the existing constant previously
+//!    shipped invisible). Allowlist matching is SEPARATOR-ANCHORED
+//!    (round-5): a rogue crate/dir whose name merely SUFFIX-COLLIDES with
+//!    an allowlisted component (`crates/xtrading/src/oms/api_client.rs`,
+//!    `crates/mycommon/src/constants.rs`) previously passed a bare
+//!    `ends_with` while the tightened sub-checks read only the REAL files.
 //!    Within the allowlist: constants.rs is under a
 //!    `DHAN_ALERTS_`-naming ratchet — every code line carrying `/alerts`
 //!    must DECLARE a `pub const DHAN_ALERTS_*` (the declared IDENTIFIER
@@ -62,17 +74,20 @@
 //! honest evidence surface).
 //!
 //! HONEST ENVELOPE: these are text ratchets. They pin every regression
-//! shape surfaced by the round-1/round-2/round-3/round-4 adversarial
-//! reviews (literal and non-literal arms, parameterized constructors,
-//! compound assignments, `&mut` borrows, new senders, new constants,
-//! full-line AND trailing comment-inflated counts, rogue-named /alerts
-//! constants with camouflage comments, UFCS/path/bare-call production
-//! callers, rogue-FILE senders on any `/alerts` subpath or via a
-//! `DHAN_ALERTS_*` constant import); they do NOT claim to stop deliberate
-//! obfuscation outside those shapes (byte-assembled strings, raw-string
-//! literals — none exist in the scanned production regions today —
-//! `unsafe` pointer writes) — such code fails human review + the
-//! operator-quote protocol, not this file.
+//! shape surfaced by the round-1..round-5 adversarial reviews (literal and
+//! non-literal arms, parameterized constructors, compound assignments,
+//! `&mut` borrows, new senders, new constants, full-line AND trailing
+//! comment-inflated counts, rogue-named /alerts constants with camouflage
+//! comments, UFCS/path/bare-call production callers, rogue-FILE senders on
+//! any `/alerts` subpath or via a `DHAN_ALERTS_*` constant import,
+//! slashless `format!("{}/{}", base, "alerts/…")` subpath assemblies,
+//! allowlist suffix-collision crate names); they do NOT claim to stop
+//! deliberate obfuscation outside those shapes (byte-assembled strings, a
+//! bare `"alerts"` literal with NO adjacent slash in ANY fragment — e.g.
+//! `format!("{}/{}/{}", base, "alerts", "orders")` — raw-string literals —
+//! none exist in the scanned production regions today — `unsafe` pointer
+//! writes) — such code fails human review + the operator-quote protocol,
+//! not this file.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -117,6 +132,59 @@ fn production_region(source: &str) -> &str {
 /// Counts non-overlapping occurrences of `needle` in `haystack`.
 fn count_occurrences(haystack: &str, needle: &str) -> usize {
     haystack.matches(needle).count()
+}
+
+/// Counts identifier-boundary `alerts` tokens ADJACENT TO A SLASH on either
+/// side — the TOKEN-GENERAL /alerts-family URL needle (round-5). Each of
+/// `/alerts/orders`, a bare `/alerts`, AND the slashless subpath assembly
+/// `format!("{}/{}", base, "alerts/orders")` counts exactly ONCE (the token,
+/// not the slashes around it), so the census cannot double-count and cannot
+/// be dodged by dropping the leading slash into the join separator. Non-URL
+/// uses (`alerts_gate_armed`, `require_alerts_gate`, the leading word of the
+/// `"alerts gate DISARMED…"` refusal prose) either fail the identifier
+/// boundary or have no adjacent slash and never count. HONEST ENVELOPE: a
+/// bare `"alerts"` fragment with NO slash in the SAME literal
+/// (`format!("{}/{}/{}", base, "alerts", "orders")`) is byte-assembly-class
+/// obfuscation outside this needle — see the file-header envelope.
+fn count_alerts_url_tokens(code: &str) -> usize {
+    const TOKEN: &str = "alerts";
+    let bytes = code.as_bytes();
+    code.match_indices(TOKEN)
+        .filter(|(index, _)| {
+            let before = index.checked_sub(1).map(|position| bytes[position] as char);
+            let after = bytes.get(index + TOKEN.len()).map(|byte| *byte as char);
+            let boundary_before = before
+                .is_none_or(|character| !(character.is_ascii_alphanumeric() || character == '_'));
+            let boundary_after = after
+                .is_none_or(|character| !(character.is_ascii_alphanumeric() || character == '_'));
+            boundary_before && boundary_after && (before == Some('/') || after == Some('/'))
+        })
+        .count()
+}
+
+/// True when `path_text` (forward-slash normalized) is one of the four
+/// allowlisted /alerts-family production files — SEPARATOR-ANCHORED
+/// (round-5): the previous bare `ends_with` let a rogue crate/dir whose
+/// NAME merely suffix-collides with an allowlisted component
+/// (`crates/xtrading/src/oms/api_client.rs`,
+/// `crates/mycommon/src/constants.rs`) be silently allowlisted, while the
+/// tightened sub-checks read only the REAL files' paths.
+fn is_alerts_allowlisted_path(path_text: &str) -> bool {
+    // The ONLY production files allowed to mention the /alerts family:
+    // constants.rs (the path constants), api_client.rs (the 6 senders),
+    // types.rs + conditional.rs (endpoint doc comments + the pinned
+    // refusal display line).
+    const ALLOWLIST: [&str; 4] = [
+        "common/src/constants.rs",
+        "trading/src/oms/api_client.rs",
+        "trading/src/oms/types.rs",
+        "trading/src/oms/conditional.rs",
+    ];
+    ALLOWLIST.iter().any(|allowed| {
+        path_text
+            .strip_suffix(allowed)
+            .is_some_and(|prefix| prefix.ends_with('/'))
+    })
 }
 
 /// Strips comments so a comment mention of a gate/URL token never counts:
@@ -399,9 +467,11 @@ fn classify_gate_sites(source: &str) -> Vec<GateSite> {
 
 /// Derives the alerts-sender fn set from `code` (comment-stripped
 /// production text): every `pub async fn` whose body region touches
-/// `/alerts` text or a `DHAN_ALERTS_`-prefixed constant. Returns sorted,
-/// deduped names — pinned against [`ALERTS_SENDER_FNS`] so a NEW sender
-/// cannot ship without editing this test.
+/// `/alerts` text, ANY slash-adjacent `alerts` token (round-5 — the
+/// slashless `format!("{}/{}", base, "alerts/orders")` assembly was
+/// previously invisible here), or a `DHAN_ALERTS_`-prefixed constant.
+/// Returns sorted, deduped names — pinned against [`ALERTS_SENDER_FNS`] so
+/// a NEW sender cannot ship without editing this test.
 fn derive_alerts_sender_fns(code: &str) -> Vec<String> {
     const DECL: &str = "pub async fn ";
     let mut names: Vec<String> = Vec::new();
@@ -417,7 +487,10 @@ fn derive_alerts_sender_fns(code: &str) -> Vec<String> {
             continue;
         }
         let region = sender_fn_region(code, &name);
-        if region.contains("/alerts") || region.contains("DHAN_ALERTS_") {
+        if region.contains("/alerts")
+            || region.contains("DHAN_ALERTS_")
+            || count_alerts_url_tokens(region) > 0
+        {
             names.push(name);
         }
     }
@@ -432,14 +505,21 @@ fn derive_alerts_sender_fns(code: &str) -> Vec<String> {
 /// orders/multi such as price/watchlist alerts), the slashless subpath
 /// literals `alerts/orders` / `alerts/multi` (a
 /// `format!("{base}/{}", "alerts/orders")` assembly carries no leading
-/// slash), or a `DHAN_ALERTS_`-prefixed constant identifier (round-4: the
+/// slash), ANY slash-adjacent `alerts` token (round-5 — generalizes the
+/// two fixed slashless needles to EVERY subpath: a slashless assembly on
+/// an unforeseen subpath like `format!("{}/{}", b, "alerts/settings")`
+/// previously matched none of the four needles and shipped invisible), or
+/// a `DHAN_ALERTS_`-prefixed constant identifier (round-4: the
 /// house-MANDATED constant-consumption style — a rogue file importing
 /// `DHAN_ALERTS_MULTI_ORDERS_PATH` previously shipped an ungated live
-/// sender invisible to the two-subpath needles).
+/// sender invisible to the two-subpath needles). The four substring
+/// needles are KEPT alongside the token check (strict-superset union —
+/// never a weakening).
 fn mentions_alerts_family(source: &str) -> bool {
     ["/alerts", "alerts/orders", "alerts/multi", "DHAN_ALERTS_"]
         .iter()
         .any(|needle| source.contains(needle))
+        || count_alerts_url_tokens(source) > 0
 }
 
 /// Lines of (comment-stripped) `code` that mention `/alerts` WITHOUT
@@ -628,14 +708,19 @@ fn test_every_alerts_sender_checks_gate_first() {
         ALERTS_SENDER_FNS.len()
     );
 
-    // URL-building census — GENERAL, not needle-per-shape: after stripping
-    // full-line comments, any `/alerts` text left in production code can
-    // only live inside a string literal (inline `"{}/alerts`, captured
-    // `"{base}/alerts`, and split-argument `"/alerts/..."` shapes all
-    // match), plus any `DHAN_ALERTS_`-PREFIXED constant use (so a new
-    // constant like DHAN_ALERTS_ORDERS_PATH is counted, not just the one
-    // known name). The gate's own refusal message is the single allowed
-    // non-URL `/alerts` mention and is excluded by its exact prefix.
+    // URL-building census — TOKEN-GENERAL, not needle-per-shape: after
+    // stripping comments, every /alerts-family URL fragment left in
+    // production code lives in a string literal whose `alerts` token is
+    // ADJACENT TO A SLASH — inline `"{}/alerts`, captured `"{base}/alerts`,
+    // split-argument `"/alerts/..."`, AND the slashless subpath assembly
+    // `format!("{}/{}", base, "alerts/orders")` (round-5: the previous
+    // `/alerts`-substring count was blind to the slashless shape, which
+    // test 6's own self-test classifies as an in-envelope family shape) —
+    // each counted exactly ONCE per token, plus any `DHAN_ALERTS_`-PREFIXED
+    // constant use (so a new constant like DHAN_ALERTS_ORDERS_PATH is
+    // counted, not just the one known name). The gate's own refusal message
+    // contributes exactly ONE slash-adjacent token (its `/alerts` mention)
+    // and is excluded by its exact prefix.
     let gate_refusal_mentions = count_occurrences(&code, "alerts gate DISARMED: /alerts");
     assert_eq!(
         gate_refusal_mentions, 1,
@@ -643,15 +728,15 @@ fn test_every_alerts_sender_checks_gate_first() {
          exist (inside require_alerts_gate) — a second copy could hide a \
          URL site from the census"
     );
-    let literal_url_sites = count_occurrences(&code, "/alerts") - gate_refusal_mentions;
+    let literal_url_sites = count_alerts_url_tokens(&code) - gate_refusal_mentions;
     let constant_url_sites = count_occurrences(&code, "DHAN_ALERTS_");
     let url_sites = literal_url_sites + constant_url_sites;
     assert_eq!(
         url_sites, gate_calls,
         "every /alerts URL-building site ({url_sites}) must be matched by a \
          require_alerts_gate call ({gate_calls}) — an ungated /alerts sender \
-         cannot be added silently (any string shape, any DHAN_ALERTS_* \
-         constant)"
+         cannot be added silently (any slash-adjacent string shape, slashed \
+         OR slashless, any DHAN_ALERTS_* constant)"
     );
 
     // The sender set is DERIVED from the code, never assumed (round-2): a
@@ -802,16 +887,6 @@ fn test_alerts_paths_single_choke_point() {
     let mut files = Vec::new();
     collect_src_rs_files(crates_dir, &mut files);
 
-    // The ONLY production files allowed to mention the /alerts paths:
-    // constants.rs (the path constant), api_client.rs (the 6 senders),
-    // types.rs + conditional.rs (endpoint doc comments).
-    let allowlist = [
-        "common/src/constants.rs",
-        "trading/src/oms/api_client.rs",
-        "trading/src/oms/types.rs",
-        "trading/src/oms/conditional.rs",
-    ];
-
     let mut violations = Vec::new();
     for file in files {
         let path_text = file.to_string_lossy().replace('\\', "/");
@@ -819,8 +894,9 @@ fn test_alerts_paths_single_choke_point() {
             continue;
         };
         // Round-4 hardening: the mention needle is the WHOLE `/alerts`
-        // FAMILY (general prefix + slashless subpaths + `DHAN_ALERTS_`
-        // constant identifiers), matching test 3's census — the previous
+        // FAMILY (general prefix + slashless subpaths + ANY slash-adjacent
+        // `alerts` token since round-5 + `DHAN_ALERTS_` constant
+        // identifiers), matching test 3's census — the previous
         // two-subpath needles let (a) a new-file sender with a bare
         // `/alerts` (or any other subpath) literal and (b) a new file
         // IMPORTING the existing DHAN_ALERTS_MULTI_ORDERS_PATH constant
@@ -828,7 +904,12 @@ fn test_alerts_paths_single_choke_point() {
         if !mentions_alerts_family(&source) {
             continue;
         }
-        if !allowlist.iter().any(|allowed| path_text.ends_with(allowed)) {
+        // Round-5 hardening: SEPARATOR-ANCHORED allowlist match — a rogue
+        // crate/dir suffix-colliding with an allowlisted component
+        // (crates/xtrading/src/oms/api_client.rs) previously passed a bare
+        // `ends_with` while the tightened sub-checks below read only the
+        // REAL files.
+        if !is_alerts_allowlisted_path(&path_text) {
             violations.push(path_text);
         }
     }
@@ -1019,6 +1100,62 @@ fn test_gate_guard_scanner_self_test() {
     let new_constant_shape =
         "let url = format!(\"{}{}\", base, constants::DHAN_ALERTS_ORDERS_PATH);";
     assert_eq!(count_occurrences(new_constant_shape, "DHAN_ALERTS_"), 1);
+
+    // ------------------------------------------------------------------
+    // count_alerts_url_tokens — the round-5 slash-adjacent token census
+    // test 3 now uses for the literal side: the SLASHLESS subpath assembly
+    // counts, a slashed literal counts exactly ONCE (token, not per-slash),
+    // and non-URL `alerts` identifiers/prose never count.
+    // ------------------------------------------------------------------
+    let slashless_assembly = "let url = format!(\"{}/{}\", self.base_url, \"alerts/orders\");";
+    assert_eq!(
+        count_alerts_url_tokens(&strip_comments(slashless_assembly)),
+        1,
+        "a slashless subpath assembly must count as ONE URL site (round-5: \
+         the /alerts-substring census was blind to it — an ungated \
+         `watch_alerts` sender built this way kept every ratchet green)"
+    );
+    assert_eq!(
+        count_alerts_url_tokens("let url = format!(\"{}/alerts/orders\", base);"),
+        1,
+        "a slashed /alerts/orders literal must count exactly ONCE (token, \
+         never double-counted for its two slashes)"
+    );
+    assert_eq!(
+        count_alerts_url_tokens("let u = format!(\"{}/alerts\", b);"),
+        1,
+        "a bare /alerts family-prefix literal must count"
+    );
+    assert_eq!(
+        count_alerts_url_tokens(
+            "self.require_alerts_gate(\"op\"); if self.alerts_gate_armed { } \
+             metrics::counter!(\"tv_alerts_gate_blocks_total\");"
+        ),
+        0,
+        "non-URL alerts identifiers must never count (identifier boundary / \
+         no adjacent slash)"
+    );
+    assert_eq!(
+        count_alerts_url_tokens(
+            "\"alerts gate DISARMED: /alerts request refused (dormant \
+             surface, no live conditional/multi orders)\""
+        ),
+        1,
+        "the refusal message must contribute exactly ONE slash-adjacent \
+         token — test 3 subtracts exactly one refusal mention"
+    );
+
+    // A slashless NEW sender is DERIVED (round-5 — previously invisible to
+    // the /alerts-substring derivation, so it dodged the pinned-set
+    // equality AND the ordering scan).
+    let slashless_sender = "    pub async fn watch_alerts(&self) {\n        \
+                            let url = format!(\"{}/{}\", self.base_url, \"alerts/orders\");\n        \
+                            let x = self.http.get(url);\n    }\n";
+    assert_eq!(
+        derive_alerts_sender_fns(slashless_sender),
+        vec!["watch_alerts".to_string()],
+        "sender derivation must catch a slashless subpath-assembly sender"
+    );
 
     // strip_comments removes doc mentions but keeps code —
     // including string literals carrying `://` (never a comment start).
@@ -1233,12 +1370,46 @@ fn test_gate_guard_scanner_self_test() {
         "a slashless subpath assembly must still be detected"
     );
     assert!(
+        mentions_alerts_family("let u = format!(\"{}/{}\", b, \"alerts/settings\");"),
+        "a slashless assembly on an UNFORESEEN subpath must be detected \
+         (round-5: it matched none of the four fixed needles and shipped a \
+         rogue-file sender invisible)"
+    );
+    assert!(
         mentions_alerts_family("let u = \"/alerts/orders\";"),
         "the classic subpath literal must still be detected"
     );
     assert!(
         !mentions_alerts_family("fn ok() { let u = \"/orders\"; }"),
         "a non-alerts file must not be flagged"
+    );
+
+    // ------------------------------------------------------------------
+    // is_alerts_allowlisted_path — SEPARATOR-ANCHORED (round-5): a
+    // crate/dir whose name merely SUFFIX-COLLIDES with an allowlisted
+    // component must NOT be allowlisted (the tightened sub-checks read
+    // only the REAL files, so a collision shipped /alerts literals
+    // invisible).
+    // ------------------------------------------------------------------
+    assert!(
+        is_alerts_allowlisted_path("../../crates/trading/src/oms/api_client.rs"),
+        "the real api_client.rs must stay allowlisted"
+    );
+    assert!(
+        is_alerts_allowlisted_path("../../crates/common/src/constants.rs"),
+        "the real constants.rs must stay allowlisted"
+    );
+    assert!(
+        !is_alerts_allowlisted_path("../../crates/xtrading/src/oms/api_client.rs"),
+        "a suffix-colliding crate name (xtrading) must NOT be allowlisted"
+    );
+    assert!(
+        !is_alerts_allowlisted_path("../../crates/mycommon/src/constants.rs"),
+        "a suffix-colliding crate name (mycommon) must NOT be allowlisted"
+    );
+    assert!(
+        !is_alerts_allowlisted_path("trading/src/oms/api_client.rs"),
+        "an exact-suffix path with no separator prefix must not match"
     );
 
     // ------------------------------------------------------------------
