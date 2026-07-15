@@ -112,6 +112,22 @@ marker write failure. Episode folds stay visible via
 `tv_telegram_episode_events_total{action}`. No new ErrorCode; no CloudWatch
 change; no cost delta.
 
+**Rule-contract tension, recorded deliberately (F3, fix round 1
+2026-07-15):** `dual-feed-scoreboard-error-codes.md` §2b mandates the four
+canonical rest-leg feed/leg pairs ALWAYS render on the daily card, an
+absent source reading "not measured yet". The operator's direct 2026-07-15
+escalation demanded suppressing unmeasured lines on the phone. Resolution
+shipped in this PR (rule files are NOT editable here): the card renders a
+compact per-LEG pulls segment per feed line ("pulls spot 735/735, chain
+733/735") on measured legs only, and the honest not-measured signal moves
+to the day's LOGS — `build_rest_leg_score_lines` emits one `info!` per
+unmeasured canonical pair ("rest-leg digest: <feed>/<leg> not measured").
+The §2b always-render contract is therefore satisfied in logs, not on the
+card, PENDING the rule-file supersession the operator must land with a
+dated quote. Code comments at `events.rs::render_pulls_per_leg` and
+`feed_scoreboard_boot.rs::build_rest_leg_score_lines` cross-reference this
+entry.
+
 ## Plan Items
 
 - [x] Item 0 — plan file added (the two stale groww plans were already

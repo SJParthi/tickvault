@@ -1882,51 +1882,73 @@ fn render_ms(ms: i64) -> String {
     format!("{ms} ms")
 }
 
-/// Aggregated official-minute-candle pull counts for ONE feed across its
-/// digest legs (Telegram cleanliness overhaul, 2026-07-15 — the per-leg
-/// `rest_leg_line` digest is retired; pulls fold into the feed stat line):
-/// `(ok, total, never_recovered_gaps)`. Legs whose pull counts carry the
-/// `-1` sentinel are SKIPPED (omission, never a fabricated zero — audit
-/// Rule 11); `None` when NO leg for the feed carries measured counts.
-fn aggregate_pulls_per_feed(rest_legs: &[RestLegScoreLine], feed: &str) -> Option<(i64, i64, i64)> {
-    let mut ok = 0i64;
-    let mut total = 0i64;
+/// Compact per-leg label for the pulls segment: the digest leg display
+/// names ("spot candles" / "option chain" / "option contracts") shorten
+/// to one word so the two feed lines never wrap; an unknown future leg
+/// keeps its full plain-English name (never a wire slug — commandment 2).
+fn compact_leg_label(leg: &str) -> &str {
+    match leg {
+        "spot candles" => "spot",
+        "option chain" => "chain",
+        "option contracts" => "contracts",
+        other => other,
+    }
+}
+
+/// PER-LEG official-minute-candle pull segment for ONE feed (F3,
+/// 2026-07-15 fix round): renders each MEASURED leg compactly —
+/// `pulls spot 735/735, chain 733/735 ✅` — with one overall mark and
+/// the never-recovered note. Legs whose pull counts carry the `-1`
+/// sentinel render NOTHING on the card (the operator's 2026-07-15
+/// escalation demanded suppressing unmeasured lines on the phone);
+/// `None` when NO leg for the feed carries measured counts.
+///
+/// RULE-CONTRACT TENSION, recorded deliberately (see the plan file's
+/// Observability section): `dual-feed-scoreboard-error-codes.md` §2b
+/// mandates the four canonical feed/leg pairs ALWAYS render, with an
+/// absent source reading "not measured yet". This card intentionally
+/// deviates per the operator's direct 2026-07-15 cleanliness escalation
+/// — the honest not-measured signal moves to the day's LOGS
+/// (`feed_scoreboard_boot::build_rest_leg_score_lines` emits one
+/// `info!` per unmeasured canonical pair) pending the rule-file
+/// supersession the operator must land. Rule files are not editable in
+/// this PR.
+fn render_pulls_per_leg(rest_legs: &[RestLegScoreLine], feed: &str) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
     let mut gaps = 0i64;
-    let mut measured = false;
+    let mut all_clean = true;
     for l in rest_legs {
         if !l.feed.eq_ignore_ascii_case(feed) {
             continue;
         }
         if l.ok_fetches >= 0 {
-            measured = true;
-            ok = ok.saturating_add(l.ok_fetches);
-            total = total
-                .saturating_add(l.ok_fetches)
-                .saturating_add(l.failed_fetches.max(0));
+            let total = l.ok_fetches.saturating_add(l.failed_fetches.max(0));
+            parts.push(format!(
+                "{} {}/{total}",
+                compact_leg_label(&l.leg),
+                l.ok_fetches
+            ));
+            if l.ok_fetches != total {
+                all_clean = false;
+            }
         }
         if l.named_gaps > 0 {
             gaps = gaps.saturating_add(l.named_gaps);
         }
     }
-    measured.then_some((ok, total, gaps))
-}
-
-/// Renders the aggregated pulls segment shared by the aligned feed stat
-/// line AND the feed-off line (F2, 2026-07-15 fix round): the OFF-day
-/// Dhan line must still carry the pull digest — on the current prod
-/// shape every day is a Dhan feed-off day while the spot-1m/chain pulls
-/// are the operator's most-watched signal.
-fn render_pulls_segment((ok, total, gaps): (i64, i64, i64)) -> String {
-    let mark = if ok == total && gaps == 0 {
+    if parts.is_empty() {
+        return None;
+    }
+    let mark = if all_clean && gaps == 0 {
         "\u{2705}"
     } else {
         "\u{26a0}\u{fe0f}"
     };
-    let mut pulls_seg = format!("pulls {ok}/{total} {mark}");
+    let mut seg = format!("pulls {} {mark}", parts.join(", "));
     if gaps > 0 {
-        pulls_seg.push_str(&format!("; {gaps} never recovered \u{26a0}\u{fe0f}"));
+        seg.push_str(&format!("; {gaps} never recovered \u{26a0}\u{fe0f}"));
     }
-    pulls_seg
+    Some(seg)
 }
 
 /// Compact tick-count renderer for the aligned feed stat line: millions
@@ -1956,11 +1978,7 @@ fn render_compact_secs(ms: i64) -> String {
 /// Unmeasured `-1` fields are OMITTED — never "?", never "not measured"; a
 /// feed with ZERO measured fields renders one honest plain line instead
 /// (never silent).
-fn aligned_feed_line(
-    f: &FeedScoreLine,
-    name_width: usize,
-    pulls: Option<(i64, i64, i64)>,
-) -> String {
+fn aligned_feed_line(f: &FeedScoreLine, name_width: usize, pulls: Option<String>) -> String {
     let mut segments: Vec<String> = Vec::new();
     if f.ticks >= 0 {
         segments.push(format!("{} ticks", render_compact_count(f.ticks)));
@@ -1972,7 +1990,7 @@ fn aligned_feed_line(
         segments.push(format!("drops {}", f.drops_market));
     }
     if let Some(p) = pulls {
-        segments.push(render_pulls_segment(p));
+        segments.push(p);
     }
     if segments.is_empty() {
         // Wholly unmeasured feed: honest, not silent (audit Rule 11).
@@ -3289,15 +3307,15 @@ impl NotificationEvent {
                         // signal. Omitted only when there are genuinely no
                         // measured pull rows for the feed.
                         let mut off_line = format!("{}: OFF today (excluded from verdict)", f.name);
-                        if let Some(p) = aggregate_pulls_per_feed(rest_legs, &f.name) {
-                            off_line.push_str(&format!(" \u{b7} {}", render_pulls_segment(p)));
+                        if let Some(p) = render_pulls_per_leg(rest_legs, &f.name) {
+                            off_line.push_str(&format!(" \u{b7} {p}"));
                         }
                         lines.push(off_line);
                     } else {
                         lines.push(aligned_feed_line(
                             f,
                             name_width,
-                            aggregate_pulls_per_feed(rest_legs, &f.name),
+                            render_pulls_per_leg(rest_legs, &f.name),
                         ));
                     }
                 }
@@ -9728,8 +9746,10 @@ mod tests {
             .find(|l| l.contains("Dhan: OFF today"))
             .unwrap_or_default();
         assert!(
-            off_line.contains("OFF today (excluded from verdict) \u{b7} pulls 1468/2205"),
-            "OFF line must carry the aggregated pull digest: {msg}"
+            off_line.contains(
+                "OFF today (excluded from verdict) \u{b7} pulls spot 735/1470, chain 733/735"
+            ),
+            "OFF line must carry the per-leg pull digest: {msg}"
         );
         assert!(
             off_line.contains("\u{26a0}\u{fe0f}"),
@@ -9804,11 +9824,13 @@ mod tests {
         };
         let msg = ev.to_message();
         assert!(
-            msg.contains("pulls 735/735 \u{2705}"),
+            msg.contains("pulls spot 735/735 \u{2705}"),
             "clean pulls segment wrong: {msg}"
         );
         assert!(
-            msg.contains("pulls 733/768 \u{26a0}\u{fe0f}; 2 never recovered \u{26a0}\u{fe0f}"),
+            msg.contains(
+                "pulls spot 700/733, chain 33/35 \u{26a0}\u{fe0f}; 2 never recovered \u{26a0}\u{fe0f}"
+            ),
             "degraded pulls segment wrong: {msg}"
         );
         // The retired per-leg digest section must never come back.
@@ -9886,7 +9908,10 @@ mod tests {
     // -- helper units (2026-07-15) ------------------------------------------
 
     #[test]
-    fn test_aggregate_pulls_per_feed_skips_sentinel_legs() {
+    fn test_render_pulls_per_leg_skips_sentinel_legs_and_names_each_leg() {
+        // F3 (2026-07-15 fix round): per-LEG pulls segment — each measured
+        // leg named compactly; `-1` legs render nothing (omission, never a
+        // fabricated zero); named gaps append the honest warning once.
         let legs = vec![
             RestLegScoreLine {
                 ok_fetches: 10,
@@ -9901,21 +9926,46 @@ mod tests {
                 ..rest_line("groww", "option contracts")
             },
         ];
-        assert_eq!(aggregate_pulls_per_feed(&legs, "Groww"), Some((15, 17, 1)));
+        assert_eq!(
+            render_pulls_per_leg(&legs, "Groww"),
+            Some(
+                "pulls spot 10/12, contracts 5/5 \u{26a0}\u{fe0f}; \
+                 1 never recovered \u{26a0}\u{fe0f}"
+                    .to_string()
+            )
+        );
         // No measured legs for this feed → None (segment omitted).
-        assert_eq!(aggregate_pulls_per_feed(&legs, "Dhan"), None);
-        assert_eq!(aggregate_pulls_per_feed(&[], "Dhan"), None);
+        assert_eq!(render_pulls_per_leg(&legs, "Dhan"), None);
+        assert_eq!(render_pulls_per_leg(&[], "Dhan"), None);
+        // All-clean legs earn the green mark; unknown legs keep their
+        // plain-English name.
+        let clean = vec![
+            RestLegScoreLine {
+                ok_fetches: 3,
+                failed_fetches: 0,
+                ..rest_line("Dhan", "spot candles")
+            },
+            RestLegScoreLine {
+                ok_fetches: 7,
+                failed_fetches: 0,
+                ..rest_line("Dhan", "expired options")
+            },
+        ];
+        assert_eq!(
+            render_pulls_per_leg(&clean, "Dhan"),
+            Some("pulls spot 3/3, expired options 7/7 \u{2705}".to_string())
+        );
     }
 
     #[test]
     fn test_aligned_feed_line_omits_each_sentinel_field() {
         let mut f = score_line("Dhan");
         f.lag_p99_ms = 1400;
-        let line = aligned_feed_line(&f, 5, Some((735, 735, 0)));
+        let line = aligned_feed_line(&f, 5, Some("pulls spot 735/735 \u{2705}".to_string()));
         assert_eq!(
             line,
             "<code>Dhan : 1.84M ticks \u{b7} delay 1.4s \u{b7} drops 3 \u{b7} \
-                 pulls 735/735 \u{2705}</code>"
+                 pulls spot 735/735 \u{2705}</code>"
         );
         let mut f = score_line("Dhan");
         f.ticks = -1;

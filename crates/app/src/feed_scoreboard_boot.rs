@@ -2853,7 +2853,50 @@ pub fn build_rest_leg_score_lines(
             out.push(to_line(&s.feed, &s.leg, Some(s)));
         }
     }
+    // F3 (2026-07-15 fix round) — RULE-CONTRACT TENSION, recorded
+    // deliberately: `dual-feed-scoreboard-error-codes.md` §2b mandates the
+    // four canonical feed/leg pairs ALWAYS render on the card, an absent
+    // source reading "not measured yet". The operator's direct 2026-07-15
+    // cleanliness escalation demanded suppressing unmeasured lines on the
+    // PHONE, so the honest not-measured signal moves HERE — one `info!`
+    // per unmeasured canonical pair in the day's logs — pending the
+    // rule-file supersession the operator must land (rule files are not
+    // editable in this PR). See the plan file's Observability section.
+    for (feed, leg) in unmeasured_canonical_rest_pairs(&out) {
+        info!(
+            %feed,
+            %leg,
+            "rest-leg digest: {feed}/{leg} not measured — omitted from the \
+             scorecard card per the 2026-07-15 cleanliness directive; the \
+             always-render contract is satisfied in logs pending the \
+             rule-file supersession"
+        );
+    }
     out
+}
+
+/// The CANONICAL card pairs (Dhan/Groww × spot candles/option chain) whose
+/// built lines carry the `-1` sentinel — i.e. pairs with NO measured pull
+/// source today. Pure so the F3 not-measured logging is unit-testable.
+#[must_use]
+pub fn unmeasured_canonical_rest_pairs(
+    lines: &[tickvault_core::notification::events::RestLegScoreLine],
+) -> Vec<(String, String)> {
+    const CANONICAL_DISPLAY: [(&str, &str); 4] = [
+        ("Dhan", "spot candles"),
+        ("Dhan", "option chain"),
+        ("Groww", "spot candles"),
+        ("Groww", "option chain"),
+    ];
+    CANONICAL_DISPLAY
+        .iter()
+        .filter(|(feed, leg)| {
+            !lines
+                .iter()
+                .any(|l| l.feed == *feed && l.leg == *leg && l.ok_fetches >= 0)
+        })
+        .map(|(feed, leg)| ((*feed).to_string(), (*leg).to_string()))
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -7201,6 +7244,63 @@ mod tests {
         assert_eq!(dhan_chain.close_samples, -1);
         // Empty summaries still render the four canonical placeholders.
         assert_eq!(build_rest_leg_score_lines(&[]).len(), 4);
+    }
+
+    #[test]
+    fn test_unmeasured_canonical_rest_pairs_names_only_sentinel_pairs() {
+        // F3 (2026-07-15 fix round): the card suppresses unmeasured pairs,
+        // so the honest not-measured signal moves to the logs — this pure
+        // helper names exactly the canonical pairs with no measured pull
+        // source (the §2b always-render contract's log-side leg).
+        let summaries = vec![RestLegDaySummary {
+            feed: "groww".to_string(),
+            leg: "spot_1m".to_string(),
+            ok_fetches: 1_496,
+            failed_fetches: 4,
+            named_gaps: 0,
+            rate_limited_hits: 0,
+            late_recovered: 2,
+            close_p50_ms: 1_400,
+            close_p99_ms: 3_200,
+            close_max_ms: 6_200,
+            close_samples: 1_494,
+        }];
+        let lines = build_rest_leg_score_lines(&summaries);
+        assert_eq!(
+            unmeasured_canonical_rest_pairs(&lines),
+            vec![
+                ("Dhan".to_string(), "spot candles".to_string()),
+                ("Dhan".to_string(), "option chain".to_string()),
+                ("Groww".to_string(), "option chain".to_string()),
+            ]
+        );
+        // Every canonical pair measured → nothing to log.
+        let all = ["spot_1m", "chain_1m"];
+        let full: Vec<RestLegDaySummary> = ["dhan", "groww"]
+            .iter()
+            .flat_map(|f| {
+                all.iter().map(|l| RestLegDaySummary {
+                    feed: (*f).to_string(),
+                    leg: (*l).to_string(),
+                    ok_fetches: 5,
+                    failed_fetches: 0,
+                    named_gaps: 0,
+                    rate_limited_hits: 0,
+                    late_recovered: 0,
+                    close_p50_ms: 900,
+                    close_p99_ms: 1_500,
+                    close_max_ms: 1_600,
+                    close_samples: 5,
+                })
+            })
+            .collect();
+        let lines = build_rest_leg_score_lines(&full);
+        assert!(unmeasured_canonical_rest_pairs(&lines).is_empty());
+        // Empty build → all four pairs named.
+        assert_eq!(
+            unmeasured_canonical_rest_pairs(&build_rest_leg_score_lines(&[])).len(),
+            4
+        );
     }
 
     // -----------------------------------------------------------------------
