@@ -70,10 +70,18 @@ fn scanned_roots() -> Vec<PathBuf> {
     vec![manifest.join("src"), manifest.join("../app/src")]
 }
 
-// Cov#1 — exactly the two known production callers use the choke point, and
+// Cov#1 — exactly the one known production caller uses the choke point, and
 // no production file outside the parser decodes OrderUpdateMessage directly.
+//
+// 2026-07-15 merge note: this pin was "exactly two callers
+// (order_update_connection.rs + boot_helpers.rs)" when authored. Main's
+// order-update spawn retirement (`websocket-connection-scope-lock.md` §A.1 /
+// the Phase C-2 lane deletion) removed boot_helpers.rs's WAL-replay decode
+// site, so the post-merge truth is exactly ONE caller —
+// order_update_connection.rs (the retained-dormant module). Re-adding a
+// second caller must go through this pin deliberately.
 #[test]
-fn ratchet_parse_order_update_has_exactly_two_production_callers() {
+fn ratchet_parse_order_update_has_exactly_one_production_caller() {
     let mut files = Vec::new();
     for root in scanned_roots() {
         collect_rs_files(&root, &mut files);
@@ -109,17 +117,14 @@ fn ratchet_parse_order_update_has_exactly_two_production_callers() {
     callers.sort();
     assert_eq!(
         callers.len(),
-        2,
-        "expected exactly 2 production callers of parse_order_update \
-         (order_update_connection.rs + boot_helpers.rs), found: {callers:?}"
+        1,
+        "expected exactly 1 production caller of parse_order_update \
+         (order_update_connection.rs — boot_helpers.rs's WAL-replay decode \
+         site retired with the order-update spawn, 2026-07-15), found: {callers:?}"
     );
     assert!(
-        callers[0].ends_with("app/src/boot_helpers.rs"),
-        "caller 1 must be boot_helpers.rs, found: {callers:?}"
-    );
-    assert!(
-        callers[1].ends_with("websocket/order_update_connection.rs"),
-        "caller 2 must be order_update_connection.rs, found: {callers:?}"
+        callers[0].ends_with("websocket/order_update_connection.rs"),
+        "the sole caller must be order_update_connection.rs, found: {callers:?}"
     );
 }
 
