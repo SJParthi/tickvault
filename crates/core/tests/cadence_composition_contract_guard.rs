@@ -23,6 +23,16 @@ const RULE_FILE_REL: &str = "../../.claude/rules/project/cadence-error-codes.md"
 const CONTRACT_HEADING_NEEDLE: &str = "COMPOSITION CONTRACT (2026-07-15)";
 const GLOBAL_HANDLE_NEEDLE: &str = "pub fn global_dhan_gates";
 const GLOBAL_INIT_NEEDLE: &str = "pub fn init_global_dhan_gates";
+/// §3b BODY needles (verifier nuance-a, 2026-07-15): the heading needle
+/// alone let a body-hollowing (heading kept, contract rows gutted) slip —
+/// and the `dhan_data_api_limiter` / `global_dhan_gates` whole-file
+/// checks match OTHER sections of the rule file too. These sentences are
+/// VERBATIM from the §3b contract body and appear nowhere else in it.
+const CONTRACT_BODY_NEEDLES: [&str; 3] = [
+    "Route every Dhan call through the shared `dhan_data_api_limiter`",
+    "Record/consult the PROCESS-GLOBAL gate registry",
+    "A queue delay is SELF-INFLICTED pacing",
+];
 
 fn rule_file_text() -> String {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(RULE_FILE_REL);
@@ -58,6 +68,54 @@ fn test_cadence_rule_file_pins_composition_contract_heading() {
         "F1(iv) ratchet: the composition contract no longer names the \
          global_dhan_gates handle"
     );
+    // Nuance-a (2026-07-15): body-hollowing defense — the §3b contract
+    // BODY must keep its three load-bearing sentences verbatim (the
+    // heading + whole-file substring checks above are satisfiable with
+    // the section body gutted).
+    for needle in CONTRACT_BODY_NEEDLES {
+        assert!(
+            text.contains(needle),
+            "F1(iv) ratchet (nuance-a): the §3b composition-contract BODY \
+             sentence '{needle}' is gone from cadence-error-codes.md — a \
+             hollowed section un-binds future executors from the shared \
+             budget. Restore the contract body (or update this guard WITH \
+             a fresh dated operator note)."
+        );
+    }
+}
+
+/// The runner source, pinned at compile time (verifier L2 wiring pin).
+const RUNNER_RS: &str = include_str!("../src/cadence/runner.rs");
+
+#[test]
+fn test_cadence_expiry_resolution_wiring_consults_dhan_gate() {
+    // Verifier L2 wiring pin (2026-07-15, flipped POSITIVE from the
+    // hostile source-scan): `resolve_broker_expiries` MUST consult the
+    // shared Dhan gate budget before an expiry-list fire — pre-L2 it
+    // fired UNGATED Dhan REST (worst case 8 Dhan requests in one rolling
+    // second when a retry wave collided with a cycle burst).
+    let start = RUNNER_RS
+        .find("async fn resolve_broker_expiries")
+        .expect("L2 wiring pin: resolve_broker_expiries fn is gone from runner.rs");
+    // Bound the scan at the next top-level section separator after the
+    // fn (the fn body ends before the following `// ----` banner).
+    let body = &RUNNER_RS[start..];
+    let end = body
+        .find("\n// ---------------------------------------------------------------------------")
+        .unwrap_or(body.len());
+    let body = &body[..end];
+    assert!(
+        body.contains("try_acquire_expiry"),
+        "L2 wiring pin: resolve_broker_expiries no longer consults \
+         DhanGates::try_acquire_expiry — Dhan expiry-list fires would be \
+         UNGATED Dhan REST again (verifier L2)"
+    );
+    assert!(
+        body.contains("tv_cadence_expiry_rate_limited_total"),
+        "L2 wiring pin: the expiry-leg 429 counter \
+         tv_cadence_expiry_rate_limited_total was removed from \
+         resolve_broker_expiries — expiry 429s go silent again"
+    );
 }
 
 #[test]
@@ -85,4 +143,20 @@ fn test_composition_contract_guard_needles_are_non_vacuous() {
     let mutated_gate = GATE_RS.replace("global_dhan_gates", "renamed_gates");
     assert!(!mutated_gate.contains(GLOBAL_HANDLE_NEEDLE));
     assert!(!mutated_gate.contains(GLOBAL_INIT_NEEDLE));
+    // Nuance-a body needles discriminate too (each present exactly once
+    // in the rule file — a hollowed §3b cannot be satisfied by another
+    // section's text), and the L2 runner needles discriminate.
+    let rule = rule_file_text();
+    for needle in CONTRACT_BODY_NEEDLES {
+        assert_eq!(
+            rule.matches(needle).count(),
+            1,
+            "nuance-a self-test: body needle '{needle}' must appear exactly \
+             once in the rule file"
+        );
+        let hollowed = rule.replace(needle, "BODY-GUTTED");
+        assert!(!hollowed.contains(needle));
+    }
+    let mutated_runner = RUNNER_RS.replace("try_acquire_expiry", "ungated_fire");
+    assert!(!mutated_runner.contains("try_acquire_expiry"));
 }
