@@ -2284,15 +2284,11 @@ mod tests {
                 || s.starts_with("TELEGRAM-")
                 // Wave 3-C: market-open self-test prefix
                 || s.starts_with("SELFTEST-")
-                // Wave 3-D: composite real-time guarantee score
-                || s.starts_with("SLO-")
                 // Wave 5 (2026-05-01): core_affinity pinning.
                 // (Depth-20/200 dynamic selector prefixes retired by PR #4.)
                 || s.starts_with("CORE-PIN-")
                 // Wave 5 Item 26 L1: volume cumulative-monotonicity guard.
                 || s.starts_with("VOLUME-")
-                // DHAN-REST-400 (2026-06-10): scheduled REST-health canary.
-                || s.starts_with("REST-CANARY-")
                 // B6 (2026-07-03): off-thread tick ILP flush worker.
                 || s.starts_with("TICK-FLUSH-")
                 // W2 PR#6 (2026-07-10): per-table WAL-suspension probe.
@@ -2312,24 +2308,20 @@ mod tests {
                 || s.starts_with("BAR-MISMATCH-")
                 // PR #2.5 (AWS-lifecycle): Day OHLC tracker for IDX_I
                 || s.starts_with("INDEX-OHLC-")
-                // Sub-PR #9 of 2026-05-27 daily-universe expansion
-                || s.starts_with("INSTR-FETCH-")
-                // Operator 2026-06-02: post-market 1-minute cross-verification
-                || s.starts_with("CROSS-VERIFY-1M-")
                 // zero-tick-loss PR-5 (G3): supervised disk-health watcher
                 || s.starts_with("DISK-WATCHER-")
                 // zero-tick-loss 2026-06-09: WAL frame-spill writer hardening
                 || s.starts_with("WS-SPILL-")
                 // C3 2026-07-03: bounded chunked-backpressure WAL re-injection
                 || s.starts_with("WS-REINJECT-")
-                // NTM Sub-PR #10a (§31): niftyindices constituent source degrade
-                || s.starts_with("NTM-CONSTITUENCY-")
                 // Operator 2026-06-10: daily end-to-end tick-conservation audit
                 || s.starts_with("TICK-CONSERVE-")
-                // PR4 2026-06-01: boot-time previous-day OHLCV fetch coverage
-                || s.starts_with("PREVDAY-")
-                // D2b 2026-06-26: runtime Dhan-lane cold-start FSM
-                || s.starts_with("DHAN-LANE-")
+                // C4 sweep (2026-07-15): the SLO- / REST-CANARY- /
+                // INSTR-FETCH- / CROSS-VERIFY-1M- / NTM-CONSTITUENCY- /
+                // PREVDAY- / DHAN-LANE- family prefixes were REMOVED from
+                // this allowlist with their last variants — a future variant
+                // reusing a retired family must consciously re-add its
+                // prefix here (never silently).
                 // PR-A 2026-06-28: Groww shared-master persist
                 || s.starts_with("GROWW-MASTER-")
                 // §34 (2026-07-03): Groww multi-connection auto-scale ladder
