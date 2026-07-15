@@ -29,7 +29,6 @@ fn read(rel: &str) -> String {
 }
 
 const MAIN_RS: &str = "crates/app/src/main.rs";
-const GROWW_RS: &str = "crates/app/src/groww_bridge.rs";
 const SEAL_ROUTING_RS: &str = "crates/app/src/seal_routing.rs";
 
 /// The shared `route_seal` body exists in `seal_routing.rs`.
@@ -58,15 +57,9 @@ fn test_dhan_call_sites_use_route_seal() {
 }
 
 /// The Groww call site routes through `route_seal`.
-#[test]
-fn test_groww_call_site_uses_route_seal() {
-    let src = read(GROWW_RS);
-    assert!(
-        src.contains("seal_routing::route_seal"),
-        "groww_bridge.rs must route its seal through `seal_routing::route_seal` \
-         (the one shared body) — not a re-inlined Groww-only routing closure."
-    );
-}
+// RETIRED 2026-07-15 (Groww live-feed deletion):
+// test_groww_call_site_uses_route_seal died with groww_bridge.rs — the Dhan
+// call-site + anti-inline pins below remain the C2 convergence contract.
 
 /// No call site hand-builds the seal-routing inline OUTSIDE `seal_routing.rs`.
 /// The signature of the inline routing is `BufferedSeal::new(` immediately
@@ -75,7 +68,7 @@ fn test_groww_call_site_uses_route_seal() {
 /// `seal_routing.rs`; the call sites pass `state` to `route_seal`.
 #[test]
 fn test_no_inline_seal_routing_outside_seal_routing_module() {
-    for rel in [MAIN_RS, GROWW_RS] {
+    for rel in [MAIN_RS] {
         let src = read(rel);
         assert!(
             !src.contains("BufferedSeal::new("),
