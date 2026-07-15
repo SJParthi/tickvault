@@ -122,6 +122,51 @@ fn test_cadence_boot_module_gate_guard_and_dry_run_executors() {
 }
 
 #[test]
+fn test_cadence_graceful_shutdown_chain_is_wired() {
+    // TRH-3 (hostile-review round 1, 2026-07-15): the F2 fix exists
+    // precisely because the pre-fix spawn returned the Notify into a
+    // never-notified `_cadence_shutdown` binding — graceful teardown
+    // never reached the runner. Deleting the single production notify
+    // call (or the parked-handle set) silently reverts to that exact
+    // defect, so BOTH legs of the chain are pinned here:
+    //
+    // (a) cadence_boot.rs parks the handle process-globally and exposes
+    //     the notifier.
+    let boot = app_src("src/cadence_boot.rs");
+    for needle in ["CADENCE_SHUTDOWN.set(", "pub fn notify_cadence_shutdown()"] {
+        assert!(
+            boot.contains(needle),
+            "cadence_boot.rs must contain `{needle}` — the F2 parked \
+             shutdown handle / notifier leg is missing."
+        );
+    }
+    // (b) main.rs fires the notifier from run_process_runloop's teardown
+    //     path, after the ShutdownInitiated notification.
+    let src = app_src("src/main.rs");
+    let call = "cadence_boot::notify_cadence_shutdown();";
+    let call_count = src.matches(call).count();
+    assert_eq!(
+        call_count, 1,
+        "main.rs must call `{call}` exactly once (the run_process_runloop \
+         teardown site); found {call_count}."
+    );
+    let runloop_at = src
+        .find("async fn run_process_runloop(")
+        .expect("main.rs must define run_process_runloop");
+    let shutdown_initiated_at = src[runloop_at..]
+        .find("NotificationEvent::ShutdownInitiated")
+        .map(|rel| runloop_at + rel)
+        .expect("run_process_runloop must emit ShutdownInitiated");
+    let call_at = src.find(call).expect("notify call site must exist");
+    assert!(
+        call_at > shutdown_initiated_at,
+        "notify_cadence_shutdown() (byte {call_at}) must sit in the \
+         teardown path AFTER the ShutdownInitiated notification (byte \
+         {shutdown_initiated_at}) inside run_process_runloop."
+    );
+}
+
+#[test]
 fn test_cadence_base_toml_ships_disabled() {
     // The [cadence] section must exist AND ship enabled = false — a
     // default-ON flip needs a fresh dated operator quote in the rule file
