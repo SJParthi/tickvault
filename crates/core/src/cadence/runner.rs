@@ -25,7 +25,7 @@ use tickvault_common::feed::Feed;
 use tickvault_common::trading_calendar::{TradingCalendar, ist_offset};
 use tokio::sync::{Notify, mpsc};
 use tokio::task::JoinHandle;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use super::assembly::{
     ChainCell, ChainProvenance, LaneAssembly, MoneynessFold, SpotProvenance,
@@ -40,7 +40,8 @@ use super::executor::{
     ExpiryResolver, SpotFetchRequest, SpotSnapshot, SpotTarget,
 };
 use super::expiry::{
-    DayLockedExpiryStore, expiry_page_due, naive_to_yyyymmdd, policy_for, resolve_policy_expiry,
+    DayLockedExpiryStore, expiry_page_due_after_wave, naive_to_yyyymmdd, policy_for,
+    resolve_policy_expiry,
 };
 use super::gate::{DhanGates, GateVerdict};
 use super::ladder::{
@@ -628,19 +629,30 @@ async fn run_expiry_resolution_loop<C, D, G>(
     let shutdown = Arc::clone(&deps.shutdown);
     let shutdown_fut = shutdown.notified();
     tokio::pin!(shutdown_fut);
+    // E4 (2026-07-15): was the loop's FIRST observation of the current
+    // day already past the deadline (a post-deadline crash-boot)? Such a
+    // day requires ≥2 consecutive failed waves before the page fires —
+    // never the first-wave hair trigger. `failed_waves` counts completed
+    // in-session attempt waves since the day was first observed (pairs
+    // resolve monotonically within a day, so an unresolved pair has
+    // failed every wave so far).
+    let mut booted_after_deadline = false;
+    let mut failed_waves: u32 = 0;
     loop {
         // IST trading-day identity via the injected clock (production:
         // `trading_calendar::ist_offset()` — NEVER UTC); the day flip is
         // the ONLY re-resolution trigger (the store re-keys inside
         // record_policy_date / the is_resolved day check).
         let today = clock.ist_date();
-        if paged_day != Some(today) {
-            paged_day = Some(today);
-            paged = [[false; ChainUnderlying::COUNT]; Feed::COUNT];
-        }
         // APPROVED: ms-of-day / 1000 fits u32 (< 86_400) — the cast is safe.
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let now_secs = (clock.ist_ms_of_day().max(0) / 1_000) as u32;
+        if paged_day != Some(today) {
+            paged_day = Some(today);
+            paged = [[false; ChainUnderlying::COUNT]; Feed::COUNT];
+            booted_after_deadline = now_secs >= deadline_secs;
+            failed_waves = 0;
+        }
         let session_over = now_secs >= super::schedule::CADENCE_LAST_CYCLE_BOUNDARY_SECS_OF_DAY_IST;
         if deps.calendar.is_trading_day(today) && !session_over {
             let dhan_on = deps.dhan_enabled.load(Ordering::Acquire);
@@ -650,8 +662,10 @@ async fn run_expiry_resolution_loop<C, D, G>(
                     clock.as_ref(),
                     deps.dhan_executor.as_ref(),
                     store.as_ref(),
+                    deps.gates.as_ref(),
                     Feed::Dhan,
                     today,
+                    paged[Feed::Dhan.index()],
                 )
                 .await;
             }
@@ -660,11 +674,15 @@ async fn run_expiry_resolution_loop<C, D, G>(
                     clock.as_ref(),
                     deps.groww_executor.as_ref(),
                     store.as_ref(),
+                    deps.gates.as_ref(),
                     Feed::Groww,
                     today,
+                    paged[Feed::Groww.index()],
                 )
                 .await;
             }
+            // E4: one attempt wave completed this iteration.
+            failed_waves = failed_waves.saturating_add(1);
             // The deadline PAGE (edge-latched per pair per day; disabled
             // lanes never page — nothing fires for them).
             for (feed, enabled) in [(Feed::Dhan, dhan_on), (Feed::Groww, groww_on)] {
@@ -674,7 +692,14 @@ async fn run_expiry_resolution_loop<C, D, G>(
                 for underlying in ChainUnderlying::ALL {
                     let resolved = store.is_resolved(today, feed, *underlying);
                     let latch = &mut paged[feed.index()][underlying.index()];
-                    if expiry_page_due(now_secs, deadline_secs, resolved, *latch) {
+                    if expiry_page_due_after_wave(
+                        now_secs,
+                        deadline_secs,
+                        resolved,
+                        *latch,
+                        booted_after_deadline,
+                        failed_waves,
+                    ) {
                         *latch = true;
                         metrics::counter!(
                             "tv_cadence_expiry_unresolved_total",
@@ -709,18 +734,44 @@ async fn run_expiry_resolution_loop<C, D, G>(
     }
 }
 
+/// Bounded gate-acquire attempts per Dhan expiry fire (verifier L2,
+/// 2026-07-15): the resolver sleeps to the carried deferral instant and
+/// retries a couple of times before conceding the fire to the next wave.
+const CADENCE_EXPIRY_GATE_ACQUIRE_ATTEMPTS: u32 = 3;
+
+/// Deferral-sleep cap per gate-acquire attempt (L2): the expiry spacing
+/// + combined window both clear within ~1s of quiet; a carried instant
+/// further out than TWO windows means a busy cycle burst — concede the
+/// fire to the next wave instead of camping on the budget.
+const CADENCE_EXPIRY_GATE_WAIT_CAP_MS: i64 = 2_000;
+
 /// One resolution ATTEMPT wave for `broker`: fetch the vendor expiry list
 /// for every still-unresolved underlying, apply the pure policy math, and
 /// record the day-locked verdict. A `newly_disagreeing` record fires the
 /// edge-latched CADENCE-01 `expiry_disagreement` (Dhan WINS for keying
 /// BOTH lanes — the store's read facade enforces it; the page carries
 /// both raws + the verdict).
+///
+/// GATING (verifier L2, 2026-07-15): a DHAN expiry-list fire is a Dhan
+/// Data-API request — it passes [`DhanGates::try_acquire_expiry`] (the
+/// COMBINED per-second budget + the 1-per-rolling-second expiry
+/// spacing) BEFORE dispatch, never an ungated REST fire that could
+/// stack a cycle burst past Dhan's 5/sec. A deferral sleeps to the
+/// carried instant (bounded) and retries; still deferred ⇒ the wave
+/// SKIPS the underlying (`tv_cadence_expiry_gate_deferred_total`) and
+/// the next `expiry_retry_interval_ms` wave re-attempts — a deferral,
+/// never a violation. Groww expiry fires stay ungated by design (no
+/// Groww rate rule; the Groww lane never touches [`DhanGates`]).
+// APPROVED: cold-path resolver wave — the deps are individually threaded (clock/exec/store/gates) so the pure attempt fn stays test-injectable.
+#[allow(clippy::too_many_arguments)]
 async fn resolve_broker_expiries<C, E>(
     clock: &C,
     exec: &E,
     store: &DayLockedExpiryStore,
+    gates: &DhanGates,
     broker: Feed,
     today: NaiveDate,
+    paged_row: [bool; ChainUnderlying::COUNT],
 ) where
     C: CadenceClock,
     E: CadenceExecutor,
@@ -731,6 +782,43 @@ async fn resolve_broker_expiries<C, E>(
     for underlying in ChainUnderlying::ALL {
         if store.is_resolved(today, broker, *underlying) {
             continue;
+        }
+        if broker == Feed::Dhan {
+            let mut acquired = false;
+            for _ in 0..CADENCE_EXPIRY_GATE_ACQUIRE_ATTEMPTS {
+                match gates.try_acquire_expiry(clock.monotonic_ms()) {
+                    GateVerdict::Acquired => {
+                        acquired = true;
+                        break;
+                    }
+                    GateVerdict::RetryAtMs(at_mono) => {
+                        let wait_ms = at_mono.saturating_sub(clock.monotonic_ms());
+                        if wait_ms <= 0 {
+                            continue;
+                        }
+                        if wait_ms > CADENCE_EXPIRY_GATE_WAIT_CAP_MS {
+                            break;
+                        }
+                        // APPROVED: clamped positive above — the cast is safe.
+                        #[allow(clippy::cast_sign_loss)]
+                        tokio::time::sleep(Duration::from_millis(wait_ms as u64)).await;
+                    }
+                }
+            }
+            if !acquired {
+                metrics::counter!(
+                    "tv_cadence_expiry_gate_deferred_total",
+                    "broker" => broker.as_str()
+                )
+                .increment(1);
+                debug!(
+                    broker = broker.as_str(),
+                    underlying = underlying.as_str(),
+                    "cadence: expiry-list fire gate-deferred — retrying next \
+                     wave (L2: never an ungated Dhan fire)"
+                );
+                continue;
+            }
         }
         let req = ExpiryListRequest {
             broker,
@@ -756,16 +844,43 @@ async fn resolve_broker_expiries<C, E>(
             "outcome" => outcome_label
         )
         .increment(1);
-        let Ok(raw_dates) = outcome else {
-            // Bounded-retry policy: the NEXT interval re-attempts; the
-            // deadline page (not this attempt) is the operator signal.
-            debug!(
-                broker = broker.as_str(),
-                underlying = underlying.as_str(),
-                outcome = outcome_label,
-                "cadence: expiry-list fetch failed — retrying next interval"
-            );
-            continue;
+        let raw_dates = match outcome {
+            Ok(dates) => dates,
+            Err(err) => {
+                if matches!(err, CadenceFetchError::RateLimited { .. }) {
+                    // L2 (2026-07-15): an expiry-leg 429 was debug!-only
+                    // — now counted + coded loud. For Dhan it arrives
+                    // DESPITE the gates (a gate-bug / shared-budget
+                    // co-tenant signal, the record_failure precedent);
+                    // never blind-retried in-wave — the next interval
+                    // wave re-attempts through the gates.
+                    metrics::counter!(
+                        "tv_cadence_expiry_rate_limited_total",
+                        "broker" => broker.as_str()
+                    )
+                    .increment(1);
+                    warn!(
+                        code = ErrorCode::Cadence01LaneDegraded.code_str(),
+                        stage = "expiry_rate_limited",
+                        broker = broker.as_str(),
+                        underlying = underlying.as_str(),
+                        "CADENCE-01: expiry-list fetch rate-limited — \
+                         retrying next wave through the gates (never \
+                         blind-retried in-wave)"
+                    );
+                } else {
+                    // Bounded-retry policy: the NEXT interval re-attempts;
+                    // the deadline page (not this attempt) is the operator
+                    // signal.
+                    debug!(
+                        broker = broker.as_str(),
+                        underlying = underlying.as_str(),
+                        outcome = outcome_label,
+                        "cadence: expiry-list fetch failed — retrying next interval"
+                    );
+                }
+                continue;
+            }
         };
         let Some(date) = resolve_policy_expiry(policy_for(*underlying), &raw_dates, today_yyyymmdd)
         else {
@@ -786,6 +901,26 @@ async fn resolve_broker_expiries<C, E>(
                 expiry = %date.as_iso_string(),
                 "cadence: expiry resolved + day-locked"
             );
+            // E3 (2026-07-15): the typed FALLING-EDGE recovery signal —
+            // fires only when the pre-market deadline page HAD fired for
+            // this (broker, underlying) pair (the paged latch). At most
+            // once per pair per day by construction (first write wins).
+            if paged_row[underlying.index()] {
+                metrics::counter!(
+                    "tv_cadence_expiry_resolved_late_total",
+                    "broker" => broker.as_str(),
+                    "underlying" => underlying.as_str()
+                )
+                .increment(1);
+                info!(
+                    code = ErrorCode::Cadence01LaneDegraded.code_str(),
+                    stage = "expiry_resolved_late",
+                    broker = broker.as_str(),
+                    underlying = underlying.as_str(),
+                    expiry = %date.as_iso_string(),
+                    "CADENCE-01 recovery: expiry resolved LATE — after the                      pre-market deadline page for this pair; the lanes                      re-key from the next fire (falling edge, at most once                      per broker+underlying per day)"
+                );
+            }
         }
         if verdict.newly_disagreeing {
             let view = store.view(today, *underlying);
@@ -997,15 +1132,28 @@ impl LaneRun {
         }
     }
 
-    /// Drive the FSM, refusing (and debug-asserting on) illegal moves.
+    /// Drive the FSM, refusing illegal moves LOUDLY — the state holds.
+    /// Should-never scheduler-logic signal, coded + counted instead of
+    /// the pre-fix `debug_assert!(false)` (verifier nuance-b,
+    /// 2026-07-15 — the F10 double-latch precedent: a debug_assert
+    /// aborted unwind test builds and was SILENT in release).
     fn fsm(&mut self, event: CadenceEvent) {
         if let Some(next) = next_cadence_state(self.state, event) {
             self.state = next;
         } else {
-            debug_assert!(
-                false,
-                "illegal cadence FSM move: {:?} + {:?}",
-                self.state, event
+            metrics::counter!(
+                "tv_cadence_illegal_fsm_move_total",
+                "lane" => self.asm.feed.as_str()
+            )
+            .increment(1);
+            error!(
+                code = ErrorCode::Cadence03SchedulerDegraded.code_str(),
+                stage = "illegal_fsm_move",
+                lane = self.asm.feed.as_str(),
+                state = ?self.state,
+                event = ?event,
+                "CADENCE-03: illegal cadence FSM move REFUSED (state held; \
+                 should-never scheduler-logic signal)"
             );
         }
     }
@@ -1200,13 +1348,13 @@ where
             }
             Some(completion) = rx.recv() => {
                 handle_completion(
-                    clock.as_ref(),
-                    &deps.config,
+                    clock,
+                    deps,
                     slots,
                     completion,
                     &mut cycle,
                     latch,
-                    deps.dry_run,
+                    &tx,
                 );
             }
             () = tokio::time::sleep(sleep_dur) => {
@@ -1303,10 +1451,8 @@ struct CycleState {
     groww_leg_ok: [bool; 7],
     /// Per-leg Groww completion count (burst = 1st, fallback = 2nd): a
     /// failure is TERMINAL for the leg only on its 2nd attempt (the
-    /// verdict refetches every failed leg exactly once) — or on its 1st
-    /// when it completes AFTER the verdict passed it by (still in flight
-    /// at the verdict instant — F4, 2026-07-15: never refetched
-    /// concurrently, so no 2nd attempt exists for it).
+    /// verdict — or the L3 DEFERRED per-leg fallback — refetches every
+    /// failed leg exactly once).
     groww_leg_attempts: [u8; 7],
     /// Per-leg dispatched-but-not-completed flags (F4, 2026-07-15): the
     /// verdict must NOT refetch a leg whose ORIGINAL request is still in
@@ -1315,8 +1461,12 @@ struct CycleState {
     /// still-in-flight leg is SKIPPED by the fallback (await-or-skip;
     /// first-write-wins on completion stays).
     groww_leg_inflight: [bool; 7],
-    /// The GrowwVerdict instant passed (F4): a leg completing Err after
-    /// it was skipped in flight is TERMINAL on its 1st attempt.
+    /// The GrowwVerdict instant passed (F4/L3): a leg completing Err on
+    /// its 1st attempt after it was skipped in flight has no later
+    /// verdict — the L3 DEFERRED fallback (2026-07-15) dispatches its one
+    /// fallback attempt AT that completion when it can still land inside
+    /// the lane cutoff; only when it cannot is the leg terminal on its
+    /// 1st attempt.
     groww_verdict_passed: bool,
     groww_fallback_launched: bool,
     late_wake_flagged: bool,
@@ -1404,7 +1554,9 @@ fn handle_action<C, D, G>(
             // NEVER guesses (the executor impl may fall back to its
             // warmup expiry) and the expiry-less fire rides the strictly
             // MORE conservative per-underlying gate alone (subsumption).
-            let expiry_yyyymmdd = deps.expiry_resolver.resolved_expiry(Feed::Dhan, underlying);
+            let expiry_yyyymmdd =
+                deps.expiry_resolver
+                    .resolved_expiry(Feed::Dhan, underlying, clock.ist_date());
             match gates.try_acquire_chain(underlying, expiry_yyyymmdd, now_mono) {
                 GateVerdict::Acquired => {
                     if cycle.dhan.state == CadenceState::Armed {
@@ -1510,9 +1662,11 @@ fn handle_action<C, D, G>(
                         // ExpiryResolver seam (2026-07-15): `None` =
                         // unresolved — never guessed; coalesced
                         // `expiry_unresolved` stage on the lane.
-                        let expiry_yyyymmdd = deps
-                            .expiry_resolver
-                            .resolved_expiry(Feed::Groww, *underlying);
+                        let expiry_yyyymmdd = deps.expiry_resolver.resolved_expiry(
+                            Feed::Groww,
+                            *underlying,
+                            clock.ist_date(),
+                        );
                         if expiry_yyyymmdd.is_none() {
                             cycle.groww.flags.expiry_unresolved = true;
                         }
@@ -1600,9 +1754,11 @@ fn handle_action<C, D, G>(
             let failed_chain_reqs: Vec<(usize, Option<u32>)> = failed_chains
                 .iter()
                 .map(|&i| {
-                    let expiry_yyyymmdd = deps
-                        .expiry_resolver
-                        .resolved_expiry(Feed::Groww, ChainUnderlying::ALL[i]);
+                    let expiry_yyyymmdd = deps.expiry_resolver.resolved_expiry(
+                        Feed::Groww,
+                        ChainUnderlying::ALL[i],
+                        clock.ist_date(),
+                    );
                     if expiry_yyyymmdd.is_none() {
                         cycle.groww.flags.expiry_unresolved = true;
                     }
@@ -1813,19 +1969,26 @@ async fn bound_spot_fetch<E: CadenceExecutor>(
     }
 }
 
-/// Handle one fetch completion: record, count, retry-policy, and attempt
+/// Handle one fetch completion: record, count, retry-policy (incl. the
+/// L3 DEFERRED Groww per-leg fallback, 2026-07-15), and attempt
 /// event-driven finalize for BOTH lanes (cross-fill runs inside).
-// APPROVED: the completion dispatcher threads the whole cycle state + the F10 dry-run mode — one private fn with one call site.
-#[allow(clippy::too_many_arguments)]
-fn handle_completion<C: CadenceClock>(
-    clock: &C,
-    cfg: &CadenceConfig,
+// APPROVED: the completion dispatcher threads the whole cycle state + the runner deps — one private fn with one call site.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn handle_completion<C, D, G>(
+    clock: &Arc<C>,
+    deps: &CadenceRunnerDeps<D, G>,
     slots: &CycleSlots,
     completion: Completion,
     cycle: &mut CycleState,
     latch: &mut DecisionLatch,
-    dry_run: bool,
-) {
+    tx: &mpsc::Sender<Completion>,
+) where
+    C: CadenceClock,
+    D: CadenceExecutor + 'static,
+    G: CadenceExecutor + 'static,
+{
+    let cfg = &deps.config;
+    let dry_run = deps.dry_run;
     let now_wall = clock.ist_ms_of_day();
     let lane_feed = completion.lane;
     let leg_label = match &completion.kind {
@@ -1946,20 +2109,79 @@ fn handle_completion<C: CadenceClock>(
                                 }
                             }
                         }
+                        // L3 (2026-07-15): the DEFERRED per-leg fallback
+                        // — a leg SKIPPED in flight at the verdict (F4)
+                        // whose original request completes Err AFTER the
+                        // verdict has no later verdict to refetch it. Its
+                        // ONE fallback attempt dispatches IMMEDIATELY at
+                        // this completion when it can still land inside
+                        // the lane cutoff (mirrors the verdict fallback:
+                        // any Err class, expiry resolved at dispatch,
+                        // first-write-wins on completion; never a
+                        // concurrent duplicate — the original already
+                        // completed).
+                        let mut deferred_fallback = false;
+                        if lane_feed == Feed::Groww
+                            && cycle.groww_verdict_passed
+                            && cycle.groww_leg_attempts[underlying_idx] == 1
+                            && !lane.resolved
+                            && now_wall.saturating_add(CADENCE_RETRY_LATENCY_ALLOWANCE_MS)
+                                <= slots.groww_cutoff_ms
+                        {
+                            deferred_fallback = true;
+                            lane.flags.groww_fallback = true;
+                            metrics::counter!(
+                                "tv_cadence_groww_fallback_total",
+                                "leg" => "chain"
+                            )
+                            .increment(1);
+                            debug!(
+                                underlying_idx,
+                                "cadence: groww chain DEFERRED fallback dispatched (L3)"
+                            );
+                            let expiry_yyyymmdd = deps.expiry_resolver.resolved_expiry(
+                                Feed::Groww,
+                                underlying,
+                                clock.ist_date(),
+                            );
+                            if expiry_yyyymmdd.is_none() {
+                                lane.flags.expiry_unresolved = true;
+                            }
+                            let req = ChainFetchRequest {
+                                feed: Feed::Groww,
+                                underlying,
+                                expiry_yyyymmdd,
+                                cycle_minute_ist: slots.cycle_minute_ist,
+                                deadline_epoch_ms: clock
+                                    .epoch_ms()
+                                    .saturating_add(deps.config.groww_request_timeout_ms),
+                            };
+                            lane.inflight = lane.inflight.saturating_add(1);
+                            cycle.groww_leg_inflight[underlying_idx] = true;
+                            spawn_chain_fetch(
+                                Arc::clone(&deps.groww_executor),
+                                tx.clone(),
+                                req,
+                                underlying_idx,
+                                deps.config.groww_request_timeout_ms,
+                            );
+                        }
                         // `fetch_failed` = the rule-file definition: a
                         // non-Empty failure AFTER the retry budget (Dhan:
                         // no retry admitted; Groww: the fallback attempt
-                        // itself failed, or the verdict already passed a
-                        // still-in-flight leg by — F4: no 2nd attempt
-                        // exists for it) with the cell still missing.
-                        // QueueDelay is stage-tagged distinctly (its own
-                        // coalesced stage; F1(iii)) — never conflated
-                        // with the transport-class fetch_failed.
+                        // itself failed, or no fallback could land — L3:
+                        // an in-flight-skipped leg whose deferred fallback
+                        // dispatched is NOT terminal on its 1st attempt)
+                        // with the cell still missing. QueueDelay is
+                        // stage-tagged distinctly (its own coalesced
+                        // stage; F1(iii)) — never conflated with the
+                        // transport-class fetch_failed.
                         let terminal = match lane_feed {
                             Feed::Dhan => !retry_scheduled,
                             Feed::Groww => {
-                                cycle.groww_leg_attempts[underlying_idx] >= 2
-                                    || cycle.groww_verdict_passed
+                                !deferred_fallback
+                                    && (cycle.groww_leg_attempts[underlying_idx] >= 2
+                                        || cycle.groww_verdict_passed)
                             }
                         };
                         if terminal
@@ -2043,11 +2265,54 @@ fn handle_completion<C: CadenceClock>(
                                 );
                             }
                         }
+                        // L3 (2026-07-15): the DEFERRED per-leg fallback
+                        // for an in-flight-skipped SPOT leg — see the
+                        // chain arm above.
+                        let mut deferred_fallback = false;
+                        if lane_feed == Feed::Groww
+                            && cycle.groww_verdict_passed
+                            && cycle.groww_leg_attempts[target_idx + ChainUnderlying::COUNT] == 1
+                            && !lane.resolved
+                            && now_wall.saturating_add(CADENCE_RETRY_LATENCY_ALLOWANCE_MS)
+                                <= slots.groww_cutoff_ms
+                        {
+                            deferred_fallback = true;
+                            lane.flags.groww_fallback = true;
+                            metrics::counter!(
+                                "tv_cadence_groww_fallback_total",
+                                "leg" => "spot"
+                            )
+                            .increment(1);
+                            debug!(
+                                target_idx,
+                                "cadence: groww spot DEFERRED fallback dispatched (L3)"
+                            );
+                            let req = SpotFetchRequest {
+                                feed: Feed::Groww,
+                                target,
+                                cycle_minute_ist: slots.cycle_minute_ist,
+                                deadline_epoch_ms: clock
+                                    .epoch_ms()
+                                    .saturating_add(deps.config.groww_request_timeout_ms),
+                            };
+                            lane.inflight = lane.inflight.saturating_add(1);
+                            cycle.groww_leg_inflight[target_idx + ChainUnderlying::COUNT] = true;
+                            spawn_spot_fetch(
+                                Arc::clone(&deps.groww_executor),
+                                tx.clone(),
+                                req,
+                                target_idx,
+                                deps.config.groww_request_timeout_ms,
+                            );
+                        }
                         let terminal = match lane_feed {
                             Feed::Dhan => !retry_scheduled,
                             Feed::Groww => {
-                                cycle.groww_leg_attempts[target_idx + ChainUnderlying::COUNT] >= 2
-                                    || cycle.groww_verdict_passed
+                                !deferred_fallback
+                                    && (cycle.groww_leg_attempts
+                                        [target_idx + ChainUnderlying::COUNT]
+                                        >= 2
+                                        || cycle.groww_verdict_passed)
                             }
                         };
                         let cell_missing = match target.chain_underlying() {
@@ -2076,8 +2341,24 @@ fn handle_completion<C: CadenceClock>(
     let dhan_exhausted = lane_own_path_exhausted(Feed::Dhan, cycle);
     let groww_exhausted = lane_own_path_exhausted(Feed::Groww, cycle);
     let CycleState { dhan, groww, .. } = cycle;
-    finalize_if_complete(clock, slots, dhan, groww, latch, dhan_exhausted, dry_run);
-    finalize_if_complete(clock, slots, groww, dhan, latch, groww_exhausted, dry_run);
+    finalize_if_complete(
+        clock.as_ref(),
+        slots,
+        dhan,
+        groww,
+        latch,
+        dhan_exhausted,
+        dry_run,
+    );
+    finalize_if_complete(
+        clock.as_ref(),
+        slots,
+        groww,
+        dhan,
+        latch,
+        groww_exhausted,
+        dry_run,
+    );
 }
 
 /// Is the lane's OWN fetch path exhausted for this cycle? TRUE when the

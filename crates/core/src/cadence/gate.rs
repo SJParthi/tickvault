@@ -96,29 +96,22 @@ impl MinSpacingGate {
     }
 }
 
-/// A ROLLING-WINDOW fire-authorization gate (operator spot-concurrency
-/// ladder gate change, 2026-07-15): at most `cap` authorizations in ANY
-/// sliding `window_ms` window, enforced over a fixed-size ring of the
-/// last `cap` authorization instants (cap ≤ 5 — the Dhan Data-API 5/sec
-/// hard cap — so the ring is O(1) fixed-size). Same injected-clock
-/// MONOTONIC-domain design as [`MinSpacingGate`]: the wall clock only
-/// picks TARGET instants, this gate is the structural floor. The ring
-/// lives behind an uncontended `Mutex` (the cadence runner is
-/// single-tasked per gate; the lock is poison-recovering and cold-path —
-/// a handful of acquires per minute).
+/// A fixed-size ROLLING-WINDOW authorization ring (operator
+/// spot-concurrency ladder gate change, 2026-07-15; combined-budget
+/// rework, verifier L1 2026-07-15): at most `cap` authorizations in ANY
+/// sliding window, over a ring of the last `cap` authorization instants
+/// (cap ≤ 5 — the Dhan Data-API 5/sec hard cap — so the ring is O(1)
+/// fixed-size). Same injected-clock MONOTONIC-domain design as
+/// [`MinSpacingGate`]: the wall clock only picks TARGET instants, the
+/// window rings are the structural floor. Rings live behind ONE
+/// poison-recovering `Mutex` inside [`DhanGates`] so a MULTI-ring
+/// admission (spot + combined) is checked-then-recorded ATOMICALLY —
+/// both-or-neither, no phantom consumption (cold path — a handful of
+/// acquires per minute).
 ///
 /// Boundary convention mirrors [`MinSpacingGate`]: an authorization at
 /// EXACTLY `oldest + window_ms` passes (the oldest instant falls out of
 /// the half-open window `(now − window_ms, now]` at that instant).
-#[derive(Debug)]
-pub struct RollingWindowGate {
-    /// The last `cap` authorization instants, oldest-first ring.
-    ring: Mutex<WindowRing>,
-    /// The sliding window length, ms.
-    window_ms: i64,
-}
-
-/// The fixed-size authorization ring (cap ≤ [`CADENCE_SPOT_WINDOW_CAP_CEILING`]).
 #[derive(Debug)]
 struct WindowRing {
     /// Authorization instants (monotonic ms), ring-indexed.
@@ -131,94 +124,95 @@ struct WindowRing {
     cap: usize,
 }
 
-impl RollingWindowGate {
-    /// A fresh gate: the first `cap` acquires always pass. `cap` is
+impl WindowRing {
+    /// A fresh ring: the first `cap` records always admit. `cap` is
     /// clamped to `1..=CADENCE_SPOT_WINDOW_CAP_CEILING` (validated at
     /// boot; the clamp is fail-closed defense).
-    #[must_use]
-    pub fn new(window_ms: i64, cap: u32) -> Self {
+    fn new(cap: u32) -> Self {
         let cap = cap.clamp(1, CADENCE_SPOT_WINDOW_CAP_CEILING) as usize;
         Self {
-            ring: Mutex::new(WindowRing {
-                slots: [i64::MIN; CADENCE_SPOT_WINDOW_CAP_CEILING as usize],
-                head: 0,
-                len: 0,
-                cap,
-            }),
-            window_ms,
+            slots: [i64::MIN; CADENCE_SPOT_WINDOW_CAP_CEILING as usize],
+            head: 0,
+            len: 0,
+            cap,
         }
     }
 
-    /// The sliding window length, ms.
-    #[must_use]
-    // TEST-EXEMPT: trivial field accessor consumed by the replay-proof assertions.
-    pub fn window_ms(&self) -> i64 {
-        self.window_ms
-    }
-
-    /// The enforced cap.
-    #[must_use]
-    pub fn cap(&self) -> usize {
-        self.ring
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .cap
-    }
-
-    /// Attempt to authorize a fire at monotonic instant
-    /// `now_monotonic_ms`: authorized iff fewer than `cap` prior
-    /// authorizations sit inside `(now − window_ms, now]` — equivalently,
-    /// iff the cap-th most recent authorization is at/older than
-    /// `now − window_ms`. A denial carries the earliest admissible
-    /// instant (`oldest_retained + window_ms`) — a DEFERRAL, never a
-    /// violation.
-    #[must_use]
-    pub fn try_acquire(&self, now_monotonic_ms: i64) -> GateVerdict {
-        let mut ring = self
-            .ring
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if ring.len == ring.cap {
-            let oldest = ring.slots[ring.head];
-            let earliest = oldest.saturating_add(self.window_ms);
+    /// Is a fire at `now` admissible WITHOUT recording it? Admissible
+    /// iff fewer than `cap` prior authorizations sit inside
+    /// `(now − window_ms, now]`. A denial carries the earliest
+    /// admissible instant (`oldest_retained + window_ms`) — a DEFERRAL,
+    /// never a violation.
+    fn admissible(&self, now_monotonic_ms: i64, window_ms: i64) -> Result<(), i64> {
+        if self.len == self.cap {
+            let oldest = self.slots[self.head];
+            let earliest = oldest.saturating_add(window_ms);
             if now_monotonic_ms < earliest {
-                return GateVerdict::RetryAtMs(earliest);
+                return Err(earliest);
             }
-            // The oldest instant falls out of the window; overwrite it.
-            let head = ring.head;
-            ring.slots[head] = now_monotonic_ms;
-            ring.head = (head + 1) % ring.cap;
-        } else {
-            let idx = (ring.head + ring.len) % ring.cap;
-            ring.slots[idx] = now_monotonic_ms;
-            ring.len += 1;
         }
-        GateVerdict::Acquired
+        Ok(())
+    }
+
+    /// Record an AUTHORIZED fire at `now` (callers check [`Self::admissible`]
+    /// first, under the same lock — atomic both-or-neither).
+    fn record(&mut self, now_monotonic_ms: i64) {
+        if self.len == self.cap {
+            // The oldest instant falls out of the window; overwrite it.
+            let head = self.head;
+            self.slots[head] = now_monotonic_ms;
+            self.head = (head + 1) % self.cap;
+        } else {
+            let idx = (self.head + self.len) % self.cap;
+            self.slots[idx] = now_monotonic_ms;
+            self.len += 1;
+        }
     }
 
     /// Conservative boot re-seed (the [`MinSpacingGate::reseed`] mirror):
     /// pretend a FULL window of authorizations just happened at `now` —
-    /// nothing is authorized for one whole window, wasting at most one
-    /// window against fires the OLD process may have issued just before
-    /// dying.
-    pub fn reseed(&self, now_monotonic_ms: i64) {
-        let mut ring = self
-            .ring
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let cap = ring.cap;
-        for slot in &mut ring.slots[..cap] {
+    /// nothing admits for one whole window, wasting at most one window
+    /// against fires the OLD process may have issued just before dying.
+    fn fill(&mut self, now_monotonic_ms: i64) {
+        let cap = self.cap;
+        for slot in &mut self.slots[..cap] {
             *slot = now_monotonic_ms;
         }
-        ring.head = 0;
-        ring.len = cap;
+        self.head = 0;
+        self.len = cap;
     }
 }
+
+/// The two rolling-window rings, under ONE lock so multi-ring
+/// admissions are atomic (no phantom consumption, verifier L1
+/// 2026-07-15).
+#[derive(Debug)]
+struct DhanWindows {
+    /// The Dhan SPOT window (cap = the configured `spot_window_cap`,
+    /// default 4).
+    spot: WindowRing,
+    /// The COMBINED Dhan per-second budget (verifier L1, 2026-07-15):
+    /// EVERY Dhan cadence fire — chain, spot AND expiry-list — records
+    /// here, cap = [`CADENCE_SPOT_WINDOW_CAP_CEILING`] (5 = Dhan's
+    /// Data-API per-second hard budget). Pre-L1 the spot window and the
+    /// chain spacing gates were independent, so a chain fire + a full
+    /// spot group could land 5 (or, at `spot_window_cap = 5`, 6) Dhan
+    /// requests in one rolling second — zero headroom vs Dhan's 5/sec.
+    combined: WindowRing,
+}
+
+/// One-expiry-fire-per-rolling-second spacing (verifier L2, 2026-07-15):
+/// bounds the expiry-resolution wave to ≤1 fire per window so the
+/// on-time nominal schedule's worst window (4 spots, or 1 chain) plus
+/// one expiry fire stays ≤ the combined 5/sec budget — an expiry wave
+/// can never gate-defer a nominal cycle slot.
+const CADENCE_EXPIRY_FIRE_SPACING_MS: i64 = CADENCE_SPOT_WINDOW_MS;
 
 /// The Dhan lane's gate set (design §4): one gate per chain underlying +
 /// one GLOBAL chain gate (the strictest interpretation of Dhan's
 /// 1-unique-request-per-3s option-chain rule) + the spot ROLLING-WINDOW
-/// gate.
+/// gate + the COMBINED chain+spot+expiry per-second budget (verifier L1,
+/// 2026-07-15) + the expiry-fire spacing gate (verifier L2, 2026-07-15).
 #[derive(Debug)]
 pub struct DhanGates {
     /// Per-underlying chain gates, indexed by [`ChainUnderlying::index`].
@@ -226,17 +220,27 @@ pub struct DhanGates {
     /// The global chain gate — EVERY chain fire (any underlying, primary
     /// or retry) must also pass this.
     chain_global: MinSpacingGate,
-    /// The Dhan spot ROLLING-1000ms-WINDOW gate (2026-07-15 gate change:
+    /// The expiry-list fire spacing gate (verifier L2, 2026-07-15): ≤1
+    /// Dhan expiry-list fire per rolling second, so a resolution wave
+    /// can never crowd a nominal cycle window out of the combined
+    /// budget. Deferral = the resolver sleeps to the instant or retries
+    /// next wave — never an ungated fire.
+    expiry_spacing: MinSpacingGate,
+    /// The Dhan SPOT rolling-1000ms window + the COMBINED per-second
+    /// budget, under ONE lock (2026-07-15 gate change + verifier L1):
     /// the concurrency ladder's step-0 group fires 4 spots at ONE
-    /// instant, which a min-spacing gate cannot admit — the window gate
-    /// is the structural ceiling instead: ≤ `spot_window_cap` in ANY
-    /// sliding 1000ms window, default 4, hard cap 5 = the Dhan Data-API
-    /// per-second budget). The shared `dhan_data_api_limiter` at the
-    /// executor seam remains the SECOND live floor — it will smooth a
+    /// instant, which a min-spacing gate cannot admit — the SPOT window
+    /// ring is the structural ceiling instead (≤ `spot_window_cap` in
+    /// ANY sliding 1000ms window, default 4, hard cap 5); the COMBINED
+    /// ring additionally caps chain+spot+expiry Dhan fires at 5 per
+    /// rolling second (Dhan's Data-API hard budget — pre-L1 a chain
+    /// fire + a full spot group could jointly hit 5-6/sec with zero
+    /// headroom). The shared `dhan_data_api_limiter` at the executor
+    /// seam remains the SECOND live floor — it will smooth a
     /// 4-simultaneous burst to ~3/sec (its default target rps); the
-    /// scheduler's window gate is the structural ceiling and the shared
-    /// limiter is defense-in-depth (composition documented, never
-    /// fought).
+    /// scheduler's window gates are the structural ceiling and the
+    /// shared limiter is defense-in-depth (composition documented,
+    /// never fought).
     ///
     /// HONEST COMPOSITION NOTE (verifier F6, dated 2026-07-15): "never
     /// queues" holds at the DEFAULT composition only (window cap 4 vs the
@@ -248,7 +252,7 @@ pub struct DhanGates {
     /// SELF-INFLICTED pacing, typed `CadenceFetchError::QueueDelay`,
     /// NON-ARMING for the ladders). Stated plainly so the composition is
     /// never mistaken for a violation.
-    spot: RollingWindowGate,
+    windows: Mutex<DhanWindows>,
     /// Per-(underlying, expiry) chain fire stamps (verifier F1(i), dated
     /// 2026-07-15): recorded on a FINAL `Acquired` when the caller knows
     /// the expiry it is firing for, consulted BEFORE the spacing gates on
@@ -272,7 +276,11 @@ impl DhanGates {
         Self {
             chain_per_underlying: std::array::from_fn(|_| MinSpacingGate::new(chain_spacing_ms)),
             chain_global: MinSpacingGate::new(chain_spacing_ms),
-            spot: RollingWindowGate::new(CADENCE_SPOT_WINDOW_MS, spot_window_cap),
+            expiry_spacing: MinSpacingGate::new(CADENCE_EXPIRY_FIRE_SPACING_MS),
+            windows: Mutex::new(DhanWindows {
+                spot: WindowRing::new(spot_window_cap),
+                combined: WindowRing::new(CADENCE_SPOT_WINDOW_CAP_CEILING),
+            }),
             chain_expiry_stamps: Mutex::new(HashMap::new()),
         }
     }
@@ -319,7 +327,32 @@ impl DhanGates {
             match self.chain_per_underlying[underlying.index()].try_acquire(now_monotonic_ms) {
                 GateVerdict::Acquired => {
                     match self.chain_global.try_acquire(now_monotonic_ms) {
-                        GateVerdict::Acquired => GateVerdict::Acquired,
+                        GateVerdict::Acquired => {
+                            // The COMBINED per-second budget (verifier
+                            // L1, 2026-07-15): checked+recorded
+                            // ATOMICALLY under the windows lock. A
+                            // combined denial leaves the (already
+                            // consumed) spacing slots binding at
+                            // now + spacing — the carried instant is the
+                            // MAX so the caller's next wake passes both.
+                            let mut w = self
+                                .windows
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            match w
+                                .combined
+                                .admissible(now_monotonic_ms, CADENCE_SPOT_WINDOW_MS)
+                            {
+                                Ok(()) => {
+                                    w.combined.record(now_monotonic_ms);
+                                    GateVerdict::Acquired
+                                }
+                                Err(combined_at) => {
+                                    let per_ul_at = now_monotonic_ms.saturating_add(spacing);
+                                    GateVerdict::RetryAtMs(combined_at.max(per_ul_at))
+                                }
+                            }
+                        }
                         GateVerdict::RetryAtMs(global_at) => {
                             // The per-underlying slot was conservatively
                             // consumed above: it now binds at now + spacing.
@@ -357,10 +390,57 @@ impl DhanGates {
             .copied()
     }
 
-    /// Authorize a Dhan spot fire.
+    /// Authorize a Dhan spot fire: the SPOT window AND the COMBINED
+    /// per-second budget (verifier L1, 2026-07-15), checked-then-recorded
+    /// ATOMICALLY under one lock — both-or-neither, no phantom
+    /// consumption. A denial carries the MAX of the failing rings'
+    /// earliest-admissible instants.
     #[must_use]
     pub fn try_acquire_spot(&self, now_monotonic_ms: i64) -> GateVerdict {
-        self.spot.try_acquire(now_monotonic_ms)
+        let mut w = self
+            .windows
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let spot_check = w.spot.admissible(now_monotonic_ms, CADENCE_SPOT_WINDOW_MS);
+        let combined_check = w
+            .combined
+            .admissible(now_monotonic_ms, CADENCE_SPOT_WINDOW_MS);
+        match (spot_check, combined_check) {
+            (Ok(()), Ok(())) => {
+                w.spot.record(now_monotonic_ms);
+                w.combined.record(now_monotonic_ms);
+                GateVerdict::Acquired
+            }
+            (Err(a), Ok(())) | (Ok(()), Err(a)) => GateVerdict::RetryAtMs(a),
+            (Err(a), Err(b)) => GateVerdict::RetryAtMs(a.max(b)),
+        }
+    }
+
+    /// Authorize a Dhan EXPIRY-LIST fire (verifier L2, 2026-07-15): the
+    /// COMBINED per-second budget + the 1-per-rolling-second expiry
+    /// spacing. Nothing is consumed on a denial (the combined ring is
+    /// only recorded AFTER the spacing gate acquires, all under the
+    /// windows lock — atomic vs the chain/spot recorders), so the
+    /// resolver can freely skip a deferred fire to its next wave.
+    #[must_use]
+    pub fn try_acquire_expiry(&self, now_monotonic_ms: i64) -> GateVerdict {
+        let mut w = self
+            .windows
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Err(at) = w
+            .combined
+            .admissible(now_monotonic_ms, CADENCE_SPOT_WINDOW_MS)
+        {
+            return GateVerdict::RetryAtMs(at);
+        }
+        match self.expiry_spacing.try_acquire(now_monotonic_ms) {
+            GateVerdict::Acquired => {
+                w.combined.record(now_monotonic_ms);
+                GateVerdict::Acquired
+            }
+            defer @ GateVerdict::RetryAtMs(_) => defer,
+        }
     }
 
     /// Conservative boot re-seed of EVERY gate (see
@@ -374,7 +454,15 @@ impl DhanGates {
             g.reseed(now_monotonic_ms);
         }
         self.chain_global.reseed(now_monotonic_ms);
-        self.spot.reseed(now_monotonic_ms);
+        self.expiry_spacing.reseed(now_monotonic_ms);
+        {
+            let mut w = self
+                .windows
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            w.spot.fill(now_monotonic_ms);
+            w.combined.fill(now_monotonic_ms);
+        }
         self.chain_expiry_stamps
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -478,53 +566,89 @@ mod tests {
 
     #[test]
     fn test_cadence_gate_rolling_window_cap_and_boundary() {
-        // Cap 4 in ANY sliding 1000ms window: a full simultaneous step-0
-        // group (4 at one instant) is authorized; the 5th in the same
-        // window defers to the earliest admissible instant.
-        let gate = RollingWindowGate::new(1_000, 4);
-        assert_eq!(gate.window_ms(), 1_000);
-        assert_eq!(gate.cap(), 4);
+        // Cap 4 in ANY sliding 1000ms window (through the spot path —
+        // the combined ring's cap-5 headroom never binds a pure-spot
+        // sequence at cap 4): a full simultaneous step-0 group (4 at one
+        // instant) is authorized; the 5th in the same window defers to
+        // the earliest admissible instant.
+        let gates = DhanGates::new(3_000, 4);
         for _ in 0..4 {
-            assert_eq!(gate.try_acquire(10_000), GateVerdict::Acquired);
+            assert_eq!(gates.try_acquire_spot(10_000), GateVerdict::Acquired);
         }
-        assert_eq!(gate.try_acquire(10_000), GateVerdict::RetryAtMs(11_000));
-        assert_eq!(gate.try_acquire(10_999), GateVerdict::RetryAtMs(11_000));
+        assert_eq!(
+            gates.try_acquire_spot(10_000),
+            GateVerdict::RetryAtMs(11_000)
+        );
+        assert_eq!(
+            gates.try_acquire_spot(10_999),
+            GateVerdict::RetryAtMs(11_000)
+        );
         // EXACTLY at oldest + window the oldest falls out (inclusive
         // boundary — the MinSpacingGate convention).
-        assert_eq!(gate.try_acquire(11_000), GateVerdict::Acquired);
+        assert_eq!(gates.try_acquire_spot(11_000), GateVerdict::Acquired);
         // The window slides per-instant: each later acquire ages one more
         // 10_000 auth out of ITS window…
-        assert_eq!(gate.try_acquire(11_100), GateVerdict::Acquired);
-        assert_eq!(gate.try_acquire(11_200), GateVerdict::Acquired);
-        assert_eq!(gate.try_acquire(11_300), GateVerdict::Acquired);
+        assert_eq!(gates.try_acquire_spot(11_100), GateVerdict::Acquired);
+        assert_eq!(gates.try_acquire_spot(11_200), GateVerdict::Acquired);
+        assert_eq!(gates.try_acquire_spot(11_300), GateVerdict::Acquired);
         // …until the retained set is {11_000, 11_100, 11_200, 11_300}:
         // the window (10_400, 11_400] already holds 4 → deny until the
         // oldest retained (11_000) ages out at 12_000.
-        assert_eq!(gate.try_acquire(11_400), GateVerdict::RetryAtMs(12_000));
-        assert_eq!(gate.try_acquire(12_000), GateVerdict::Acquired);
+        assert_eq!(
+            gates.try_acquire_spot(11_400),
+            GateVerdict::RetryAtMs(12_000)
+        );
+        assert_eq!(gates.try_acquire_spot(12_000), GateVerdict::Acquired);
     }
 
     #[test]
     fn test_cadence_gate_rolling_window_monotonic_immune_and_reseed() {
-        // The window gate never sees a wall clock — a regressed monotonic
+        // The window rings never see a wall clock — a regressed monotonic
         // input (impossible in production; defensive) is still refused
         // while the ring holds newer instants.
-        let gate = RollingWindowGate::new(1_000, 2);
-        assert_eq!(gate.try_acquire(50_000), GateVerdict::Acquired);
-        assert_eq!(gate.try_acquire(50_000), GateVerdict::Acquired);
-        assert_eq!(gate.try_acquire(10_000), GateVerdict::RetryAtMs(51_000));
-        assert_eq!(gate.try_acquire(50_999), GateVerdict::RetryAtMs(51_000));
-        assert_eq!(gate.try_acquire(51_000), GateVerdict::Acquired);
+        let gates = DhanGates::new(3_000, 2);
+        assert_eq!(gates.try_acquire_spot(50_000), GateVerdict::Acquired);
+        assert_eq!(gates.try_acquire_spot(50_000), GateVerdict::Acquired);
+        assert_eq!(
+            gates.try_acquire_spot(10_000),
+            GateVerdict::RetryAtMs(51_000)
+        );
+        assert_eq!(
+            gates.try_acquire_spot(50_999),
+            GateVerdict::RetryAtMs(51_000)
+        );
+        assert_eq!(gates.try_acquire_spot(51_000), GateVerdict::Acquired);
         // Reseed fills the whole window conservatively — nothing admits
         // for one full window, then the full cap flows again.
-        gate.reseed(80_000);
-        assert_eq!(gate.try_acquire(80_999), GateVerdict::RetryAtMs(81_000));
-        assert_eq!(gate.try_acquire(81_000), GateVerdict::Acquired);
-        assert_eq!(gate.try_acquire(81_000), GateVerdict::Acquired);
-        assert_eq!(gate.try_acquire(81_000), GateVerdict::RetryAtMs(82_000));
-        // The cap clamp is fail-closed (0 → 1; 9 → the 5/sec ceiling).
-        assert_eq!(RollingWindowGate::new(1_000, 0).cap(), 1);
-        assert_eq!(RollingWindowGate::new(1_000, 9).cap(), 5);
+        gates.reseed_all(80_000);
+        assert_eq!(
+            gates.try_acquire_spot(80_999),
+            GateVerdict::RetryAtMs(81_000)
+        );
+        assert_eq!(gates.try_acquire_spot(81_000), GateVerdict::Acquired);
+        assert_eq!(gates.try_acquire_spot(81_000), GateVerdict::Acquired);
+        assert_eq!(
+            gates.try_acquire_spot(81_000),
+            GateVerdict::RetryAtMs(82_000)
+        );
+        // The cap clamp is fail-closed: 0 → 1 (second same-instant spot
+        // refused)…
+        let clamped_low = DhanGates::new(3_000, 0);
+        assert_eq!(clamped_low.try_acquire_spot(5_000), GateVerdict::Acquired);
+        assert_eq!(
+            clamped_low.try_acquire_spot(5_000),
+            GateVerdict::RetryAtMs(6_000)
+        );
+        // …and 9 → the 5/sec ceiling (the 6th same-instant spot refused
+        // by BOTH the clamped spot ring and the combined budget).
+        let clamped_high = DhanGates::new(3_000, 9);
+        for _ in 0..5 {
+            assert_eq!(clamped_high.try_acquire_spot(5_000), GateVerdict::Acquired);
+        }
+        assert_eq!(
+            clamped_high.try_acquire_spot(5_000),
+            GateVerdict::RetryAtMs(6_000)
+        );
     }
 
     #[test]
@@ -559,8 +683,10 @@ mod tests {
 
     #[test]
     fn test_cadence_gate_try_acquire_chain_try_acquire_spot_independent_spacing_ms() {
-        // The spot window gate and the chain gates are INDEPENDENT
-        // floors: a chain fire never consumes a spot slot and vice versa.
+        // The SPECIFIC gates stay independent floors (a chain fire never
+        // consumes a SPOT-ring slot and vice versa) — but since L1
+        // (2026-07-15) both share the COMBINED 5-per-rolling-second
+        // budget, which never binds this low-volume sequence.
         let gates = DhanGates::new(3_000, 2);
         assert_eq!(
             gates.try_acquire_chain(ChainUnderlying::Sensex, None, 1_000),
@@ -572,6 +698,118 @@ mod tests {
         assert_eq!(gates.try_acquire_spot(2_010), GateVerdict::Acquired);
         // spacing_ms accessor reports the configured floor.
         assert_eq!(MinSpacingGate::new(400).spacing_ms(), 400);
+    }
+
+    #[test]
+    fn test_cadence_gate_combined_window_refuses_sixth_dhan_fire_per_rolling_second() {
+        // Verifier L1 (2026-07-15), INVERTED from the demonstrating
+        // hostile test: pre-fix a chain fire + a validation-legal
+        // spot_window_cap=5 group put SIX Dhan fires inside one rolling
+        // 1000ms window (Dhan's Data-API budget is 5/sec). Post-fix the
+        // COMBINED ring refuses the 6th — a DEFERRAL to the instant the
+        // chain fire ages out, never a violation.
+        let gates = DhanGates::new(3_000, 5);
+        let t = 1_000_000_i64;
+        assert_eq!(
+            gates.try_acquire_chain(ChainUnderlying::Sensex, None, t + 2_001),
+            GateVerdict::Acquired
+        );
+        for _ in 0..4 {
+            assert_eq!(gates.try_acquire_spot(t + 3_000), GateVerdict::Acquired);
+        }
+        // The 5th spot is legal per the SPOT ring (cap 5) but would be
+        // the 6th Dhan fire inside (t+2_001, t+3_001) — the combined
+        // budget defers it to EXACTLY the instant the chain fire ages
+        // out of the window (nothing consumed on the denial).
+        assert_eq!(
+            gates.try_acquire_spot(t + 3_000),
+            GateVerdict::RetryAtMs(t + 3_001)
+        );
+        assert_eq!(gates.try_acquire_spot(t + 3_001), GateVerdict::Acquired);
+        // The combined budget binds the CHAIN direction too: 4 spots +
+        // an expiry fire fill the window; a chain fire inside it is
+        // deferred (spacing slots conservatively consumed → the carried
+        // instant is the MAX so the next wake passes everything).
+        let gates2 = DhanGates::new(3_000, 4);
+        assert_eq!(gates2.try_acquire_expiry(t), GateVerdict::Acquired);
+        for _ in 0..4 {
+            assert_eq!(gates2.try_acquire_spot(t + 100), GateVerdict::Acquired);
+        }
+        assert_eq!(
+            gates2.try_acquire_chain(ChainUnderlying::Nifty, None, t + 500),
+            GateVerdict::RetryAtMs(t + 3_500)
+        );
+        assert_eq!(
+            gates2.try_acquire_chain(ChainUnderlying::Nifty, None, t + 3_500),
+            GateVerdict::Acquired
+        );
+    }
+
+    #[test]
+    fn test_cadence_gate_combined_window_admits_nominal_chain_then_spot_group() {
+        // Nominal-schedule feasibility pin (L1): the locked schedule's
+        // chain :02 fire + the FULL step-0 spot group at :03 (exactly one
+        // window later) pass the combined gate with ZERO deferrals — the
+        // chain fire sits at EXACTLY oldest+window when the group fires
+        // (the inclusive boundary), so the combined budget never defers
+        // an on-time nominal slot.
+        let gates = DhanGates::new(3_000, 4);
+        let t = 36_000_000_i64; // 10:00:00 as a monotonic stand-in
+        assert_eq!(
+            gates.try_acquire_chain(ChainUnderlying::Sensex, None, t + 2_000),
+            GateVerdict::Acquired
+        );
+        for _ in 0..4 {
+            assert_eq!(gates.try_acquire_spot(t + 3_000), GateVerdict::Acquired);
+        }
+    }
+
+    #[test]
+    fn test_cadence_gate_try_acquire_expiry_shares_combined_window_and_spacing() {
+        // Verifier L2 (2026-07-15): expiry-list fires ride the SAME
+        // combined per-second budget + their own 1-per-rolling-second
+        // spacing.
+        let gates = DhanGates::new(3_000, 4);
+        // First fire passes; a second inside the spacing window defers
+        // on the expiry spacing (nothing consumed on the denial).
+        assert_eq!(gates.try_acquire_expiry(10_000), GateVerdict::Acquired);
+        assert_eq!(
+            gates.try_acquire_expiry(10_500),
+            GateVerdict::RetryAtMs(11_000)
+        );
+        assert_eq!(gates.try_acquire_expiry(11_000), GateVerdict::Acquired);
+        // A full combined window (4 spots + 1 chain across one second)
+        // defers an expiry fire to the instant the oldest fire ages out.
+        let gates2 = DhanGates::new(3_000, 4);
+        assert_eq!(
+            gates2.try_acquire_chain(ChainUnderlying::Banknifty, None, 20_000),
+            GateVerdict::Acquired
+        );
+        for _ in 0..4 {
+            assert_eq!(gates2.try_acquire_spot(20_400), GateVerdict::Acquired);
+        }
+        assert_eq!(
+            gates2.try_acquire_expiry(20_800),
+            GateVerdict::RetryAtMs(21_000)
+        );
+        assert_eq!(gates2.try_acquire_expiry(21_000), GateVerdict::Acquired);
+        // An expiry fire COUNTS toward the combined budget for later
+        // spot fires too (the reverse direction): after the expiry fire
+        // at 21_000 the window (20_400, 21_400] holds 4 spots + 1 expiry
+        // = 5 → a spot at 21_100 is deferred until the 20_400 group ages
+        // out.
+        assert_eq!(
+            gates2.try_acquire_spot(21_100),
+            GateVerdict::RetryAtMs(21_400)
+        );
+        assert_eq!(gates2.try_acquire_spot(21_400), GateVerdict::Acquired);
+        // reseed_all covers the expiry spacing gate too.
+        gates2.reseed_all(50_000);
+        assert_eq!(
+            gates2.try_acquire_expiry(50_500),
+            GateVerdict::RetryAtMs(51_000)
+        );
+        assert_eq!(gates2.try_acquire_expiry(51_000), GateVerdict::Acquired);
     }
 
     #[test]

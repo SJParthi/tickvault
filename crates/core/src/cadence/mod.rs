@@ -26,9 +26,11 @@
 //!   boundary math reimplemented here — core cannot depend on
 //!   `crates/app`; drift is pinned by mirrored vectors + const-asserts
 //!   against the shared `SPOT_1M_REST_*` window constants)
-//! - `gate` — pure CAS [`gate::MinSpacingGate`] + the spot
-//!   [`gate::RollingWindowGate`] in the MONOTONIC time domain (injected
-//!   clock) — the structural zero-429 hard floor
+//! - `gate` — pure CAS [`gate::MinSpacingGate`] + the spot/COMBINED
+//!   rolling-window rings inside [`gate::DhanGates`] (chain+spot+expiry
+//!   ≤ 5 Dhan fires per rolling second — verifier L1, 2026-07-15) in
+//!   the MONOTONIC time domain (injected clock) — the structural
+//!   zero-429 hard floor
 //! - `ladder` — the Dhan failure ladder (rungs 0..=5, next-cycle anchor
 //!   shift, step-back-one recovery) + in-cycle retry policy + the
 //!   streak-driven concurrency/shape ladders ([`ladder::StreakLadder`])
@@ -76,8 +78,8 @@ pub use executor::{
     StubExpiryResolver,
 };
 pub use expiry::{
-    DayLockedExpiryStore, ExpiryDate, ExpiryPolicy, global_expiry_store, policy_for,
-    resolve_policy_expiry,
+    DayLockedExpiryStore, ExpiryDate, ExpiryPolicy, RecordVerdict, UnderlyingExpiryView,
+    global_expiry_store, policy_for, resolve_policy_expiry,
 };
 pub use gate::{DhanGates, global_dhan_gates, init_global_dhan_gates};
 pub use runner::{CadenceRunnerDeps, SystemCadenceClock, spawn_supervised_cadence_runner};

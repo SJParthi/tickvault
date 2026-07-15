@@ -766,7 +766,7 @@ async fn test_cadence_expiry_resolver_stamps_requests_when_resolved() {
     // full-cycle test above.
     struct FixedExpiry;
     impl ExpiryResolver for FixedExpiry {
-        fn resolved_expiry(&self, _b: Feed, _u: ChainUnderlying) -> Option<u32> {
+        fn resolved_expiry(&self, _b: Feed, _u: ChainUnderlying, _d: NaiveDate) -> Option<u32> {
             Some(20_260_730)
         }
     }
@@ -1297,8 +1297,14 @@ impl CadenceExecutor for SlowLegExecutor {
         let slow = req.underlying == ChainUnderlying::Banknifty;
         async move {
             // The slow leg is still IN FLIGHT at the verdict (~+800ms)
-            // and lands well inside the lane cutoff.
-            let delay = if slow { 3_000 } else { 50 };
+            // and lands Ok well inside the 1500ms per-request timeout
+            // (L3 truth-sync, 2026-07-15: the original 3000ms delay
+            // exceeded the request timeout, so the "Ok" never landed —
+            // it TIMED OUT into an Err, which post-L3 correctly earns a
+            // deferred fallback. 1200ms matches this test's stated
+            // intent: an Ok-completing in-flight leg, first-write-wins,
+            // never refetched).
+            let delay = if slow { 1_200 } else { 50 };
             tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
             Ok(ChainFetchOk {
                 underlying_spot: Some(24_500.0),
@@ -1409,5 +1415,175 @@ async fn test_groww_verdict_skips_inflight_leg_never_duplicates() {
         banknifty_first_cycle, 1,
         "the in-flight BANKNIFTY leg is NEVER refetched by the verdict \
          (F4: no duplicate concurrent same-leg request)"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Verifier L3 (2026-07-15): the DEFERRED per-leg fallback — a leg skipped
+// in flight at the verdict that later completes Err still gets its ONE
+// fallback attempt
+// ---------------------------------------------------------------------------
+
+/// A Groww executor whose BANKNIFTY chain leg FAILS SLOWLY on attempt 1
+/// (the Err lands ~T+1200ms — after the ~T+800ms verdict, inside the
+/// 1500ms per-request timeout, ~4.8s of room before the 6000ms lane
+/// cutoff) and succeeds fast on attempt 2 — the L3 probe.
+struct SlowFailLegExecutor {
+    log: Arc<Mutex<Vec<RecordedCall>>>,
+    start: tokio::time::Instant,
+}
+
+impl CadenceExecutor for SlowFailLegExecutor {
+    fn fetch_chain(
+        &self,
+        req: ChainFetchRequest,
+    ) -> impl std::future::Future<Output = Result<ChainFetchOk, CadenceFetchError>> + Send {
+        let prior;
+        {
+            // APPROVED (test-only): poisoned mutex propagates the panic.
+            #[allow(clippy::unwrap_used)]
+            let mut log = self.log.lock().unwrap();
+            prior = log
+                .iter()
+                .filter(|c| {
+                    matches!(c, RecordedCall::Chain { feed, underlying, .. }
+                        if *feed == req.feed && *underlying == req.underlying)
+                })
+                .count();
+            // APPROVED: paused-test elapsed fits i64 comfortably.
+            #[allow(clippy::cast_possible_truncation)]
+            log.push(RecordedCall::Chain {
+                feed: req.feed,
+                underlying: req.underlying,
+                cycle_minute_ist: req.cycle_minute_ist,
+                expiry_yyyymmdd: req.expiry_yyyymmdd,
+                at_ms: self.start.elapsed().as_millis() as i64,
+            });
+        }
+        let slow_fail = req.underlying == ChainUnderlying::Banknifty && prior == 0;
+        async move {
+            if slow_fail {
+                // Still IN FLIGHT at the ~+800ms verdict; fails at
+                // ~+1200ms — inside the 1500ms request timeout.
+                tokio::time::sleep(std::time::Duration::from_millis(1_200)).await;
+                Err(CadenceFetchError::Transport)
+            } else {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                Ok(ChainFetchOk {
+                    underlying_spot: Some(24_500.0),
+                    published_to_registry: false,
+                })
+            }
+        }
+    }
+
+    fn fetch_spot(
+        &self,
+        req: SpotFetchRequest,
+    ) -> impl std::future::Future<Output = Result<SpotSnapshot, CadenceFetchError>> + Send {
+        {
+            // APPROVED (test-only): poisoned mutex propagates the panic.
+            #[allow(clippy::unwrap_used)]
+            let mut log = self.log.lock().unwrap();
+            // APPROVED: paused-test elapsed fits i64 comfortably.
+            #[allow(clippy::cast_possible_truncation)]
+            log.push(RecordedCall::Spot {
+                feed: req.feed,
+                target: req.target,
+                cycle_minute_ist: req.cycle_minute_ist,
+                at_ms: self.start.elapsed().as_millis() as i64,
+            });
+        }
+        let minute = req.cycle_minute_ist;
+        async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            Ok(SpotSnapshot {
+                price: 24_500.0,
+                source_minute_ist: minute,
+                received_at_epoch_ms: 0,
+            })
+        }
+    }
+
+    fn fetch_expiry_list(
+        &self,
+        _req: ExpiryListRequest,
+    ) -> impl std::future::Future<Output = Result<Vec<u32>, CadenceFetchError>> + Send {
+        async move { Err(CadenceFetchError::Empty) }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn test_groww_deferred_fallback_refetches_inflight_skipped_leg_once() {
+    // Verifier L3 (2026-07-15): a leg still IN FLIGHT at the ~T+800ms
+    // verdict is SKIPPED (F4 — never a duplicate concurrent request).
+    // Pre-fix, when that leg later completed Err (~T+1200 here) there was
+    // NO later verdict — terminal on attempt 1, ZERO retries, despite
+    // ~4.8s of room inside the 6000ms Groww cutoff (the structurally-DEAD
+    // fallback for slow-FAILURE legs). Post-fix the DEFERRED per-leg
+    // fallback dispatches its ONE fallback attempt the instant the Err
+    // completion lands: EXACTLY 2 BANKNIFTY chain calls in the first
+    // cycle — never 1 (dead fallback) and never 3+ (no duplicates; the
+    // F4 no-duplicate test stays green beside this).
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let exec = Arc::new(SlowFailLegExecutor {
+        log: Arc::clone(&log),
+        start: tokio::time::Instant::now(),
+    });
+    let shutdown = Arc::new(Notify::new());
+    let config = CadenceConfig::default();
+    let gates = test_gates(&config);
+    let deps = CadenceRunnerDeps {
+        config,
+        calendar: test_calendar(),
+        dhan_executor: Arc::clone(&exec),
+        groww_executor: exec,
+        // Groww-only lane (isolates the burst/verdict semantics).
+        dhan_enabled: Arc::new(AtomicBool::new(false)),
+        groww_enabled: Arc::new(AtomicBool::new(true)),
+        expiry_resolver: Arc::new(StubExpiryResolver),
+        expiry_store: None,
+        gates,
+        dry_run: false,
+        shutdown: Arc::clone(&shutdown),
+    };
+    let clock = Arc::new(TestClock {
+        anchor: tokio::time::Instant::now(),
+        base_wall_ms: BASE_WALL_MS,
+        date: NaiveDate::from_ymd_opt(2026, 7, 14).expect("valid date"),
+    });
+    let task = tokio::spawn(run_cadence_loop(clock, deps));
+    for _ in 0..30 {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+    shutdown.notify_waiters();
+    let exit = tokio::time::timeout(std::time::Duration::from_secs(120), task)
+        .await
+        .expect("runner must exit after shutdown")
+        .expect("runner task must not panic");
+    assert_eq!(exit, LoopExit::Shutdown);
+
+    // APPROVED (test-only): poisoned mutex propagates the panic.
+    #[allow(clippy::unwrap_used)]
+    let calls = log.lock().unwrap().clone();
+    let banknifty_first_cycle = calls
+        .iter()
+        .filter(|c| {
+            c.minute() == FIRST_CYCLE_MINUTE
+                && matches!(
+                    c,
+                    RecordedCall::Chain {
+                        feed: Feed::Groww,
+                        underlying: ChainUnderlying::Banknifty,
+                        ..
+                    }
+                )
+        })
+        .count();
+    assert_eq!(
+        banknifty_first_cycle, 2,
+        "an in-flight-skipped leg completing Err inside the cutoff budget \
+         must get EXACTLY its one deferred fallback attempt (L3): 1 = the \
+         dead-fallback bug; 3+ = a duplicate"
     );
 }

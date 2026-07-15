@@ -187,6 +187,47 @@ pub fn expiry_page_due(
     now_secs_of_day >= deadline_secs_of_day && !resolved && !already_paged
 }
 
+/// E4 (2026-07-15): the minimum CONSECUTIVE failed attempt waves a
+/// process that BOOTED after the deadline must observe before the
+/// edge-latched `expiry_unresolved` page fires. A crash-boot at e.g.
+/// 11:00 IST previously paged on the very FIRST failed wave (hair
+/// trigger — one transient vendor blip at boot = a page); it now needs
+/// ≥2 consecutive failed waves. The pre-deadline path is unchanged: the
+/// deadline itself still gates the page (threshold 1 — an unresolved
+/// pair at the deadline crossing has, by loop construction, just failed
+/// its wave).
+pub const POST_DEADLINE_BOOT_MIN_FAILED_WAVES: u32 = 2;
+
+/// Wave-aware page decision (E4, 2026-07-15): [`expiry_page_due`] AND the
+/// boot-mode wave threshold — `booted_after_deadline` is whether the
+/// resolution loop's FIRST observation of this IST day was already past
+/// the deadline (a post-deadline crash-boot), in which case
+/// [`POST_DEADLINE_BOOT_MIN_FAILED_WAVES`] consecutive failed waves are
+/// required; otherwise 1 (the pre-deadline path, unchanged).
+#[must_use]
+// TEST-EXEMPT: covered by test_cadence_expiry_page_post_deadline_boot_needs_two_failed_waves (guard name-pattern mismatch).
+pub fn expiry_page_due_after_wave(
+    now_secs_of_day: u32,
+    deadline_secs_of_day: u32,
+    resolved: bool,
+    already_paged: bool,
+    booted_after_deadline: bool,
+    consecutive_failed_waves: u32,
+) -> bool {
+    let min_waves = if booted_after_deadline {
+        POST_DEADLINE_BOOT_MIN_FAILED_WAVES
+    } else {
+        1
+    };
+    consecutive_failed_waves >= min_waves
+        && expiry_page_due(
+            now_secs_of_day,
+            deadline_secs_of_day,
+            resolved,
+            already_paged,
+        )
+}
+
 /// One underlying's day-locked resolution view (the read API surface the
 /// future capture-leg delegation consumes — see the ONE-SOURCE-OF-TRUTH
 /// DELEGATION section of `cadence-error-codes.md`).
@@ -333,16 +374,26 @@ impl DayLockedExpiryStore {
         }
     }
 
-    /// The CURRENT locked day's winning expiry for `underlying` — the
-    /// [`ExpiryResolver`] read facade's core. Honest envelope: this reads
-    /// the day the RESOLUTION LOOP last keyed; across an IST midnight the
-    /// prior day's lock can linger for at most one retry interval before
-    /// the loop re-keys — outside session hours by construction (the
-    /// session ends 15:30 IST), so no chain request can consume it.
+    /// The winning expiry for `underlying` on the IST trading day `day` —
+    /// the [`ExpiryResolver`] read facade's core, DAY-CHECKED (E1 fix,
+    /// 2026-07-15): a `day` differing from the locked one returns `None`,
+    /// never a stale answer. Before this fix the facade read whatever day
+    /// the resolution loop LAST keyed — a process crossing IST midnight
+    /// whose morning re-resolution kept FAILING served YESTERDAY'S winner
+    /// (on day-after-expiry: the EXPIRED contract) until the first
+    /// SUCCESSFUL re-resolution, not "at most one retry interval" as the
+    /// old comment falsely claimed. Callers thread `day` from the SAME
+    /// injected-clock IST path the store's day keying uses
+    /// (`CadenceClock::ist_date` / `trading_calendar::ist_offset()` —
+    /// NEVER UTC).
     #[must_use]
-    // TEST-EXEMPT: covered by test_cadence_expiry_store_resolver_facade_reads_winner_for_both_brokers (guard name-pattern mismatch).
-    pub fn winning_expiry(&self, underlying: ChainUnderlying) -> Option<ExpiryDate> {
-        self.lock().view(underlying).winner
+    // TEST-EXEMPT: covered by test_cadence_expiry_winning_facade_never_serves_yesterdays_winner_across_day_flip + test_cadence_expiry_store_resolver_facade_reads_winner_for_both_brokers (guard name-pattern mismatch).
+    pub fn winning_expiry(
+        &self,
+        day: NaiveDate,
+        underlying: ChainUnderlying,
+    ) -> Option<ExpiryDate> {
+        self.view(day, underlying).winner
     }
 }
 
@@ -352,8 +403,14 @@ impl DayLockedExpiryStore {
 /// here — the disagreement rule keys BOTH lanes on the Dhan-preferred
 /// winner (design: the exchange-sourced expirylist is authoritative).
 impl ExpiryResolver for DayLockedExpiryStore {
-    fn resolved_expiry(&self, _broker: Feed, underlying: ChainUnderlying) -> Option<u32> {
-        self.winning_expiry(underlying).map(ExpiryDate::yyyymmdd)
+    fn resolved_expiry(
+        &self,
+        _broker: Feed,
+        underlying: ChainUnderlying,
+        day: NaiveDate,
+    ) -> Option<u32> {
+        self.winning_expiry(day, underlying)
+            .map(ExpiryDate::yyyymmdd)
     }
 }
 
@@ -498,6 +555,26 @@ mod tests {
     }
 
     #[test]
+    fn test_cadence_expiry_process_restart_reresolution_rolls_forward_when_vendor_drops_today() {
+        // E2 demo (verifier, 2026-07-15 — passes BY DESIGN, documenting
+        // the residual named in cadence-error-codes.md §0): the day lock
+        // is IN-MEMORY, so a mid-session process RESTART re-resolves
+        // from scratch. On expiry day, a vendor list that dropped
+        // today's date intraday makes the fresh resolution roll BOTH
+        // lanes forward to the next series mid-session — the pure policy
+        // math is doing exactly what it is told; only a persisted day
+        // lock (flagged follow-up) would pin the morning's verdict
+        // across a restart. Task RESPAWNS are covered (process-global
+        // store); process restarts are not.
+        let morning = [20_260_716, 20_260_723];
+        let held = resolve_policy_expiry(ExpiryPolicy::NearestActiveDate, &morning, 20_260_716);
+        assert_eq!(held.map(ExpiryDate::yyyymmdd), Some(20_260_716));
+        let intraday = [20_260_723];
+        let rolled = resolve_policy_expiry(ExpiryPolicy::NearestActiveDate, &intraday, 20_260_716);
+        assert_eq!(rolled.map(ExpiryDate::yyyymmdd), Some(20_260_723));
+    }
+
+    #[test]
     fn test_cadence_expiry_store_day_lock_first_write_wins_and_day_flip() {
         let store = DayLockedExpiryStore::new();
         let day = NaiveDate::from_ymd_opt(2026, 7, 15).expect("valid");
@@ -577,20 +654,55 @@ mod tests {
         let store = DayLockedExpiryStore::new();
         let day = NaiveDate::from_ymd_opt(2026, 7, 15).expect("valid");
         assert_eq!(
-            store.resolved_expiry(Feed::Dhan, ChainUnderlying::Banknifty),
+            store.resolved_expiry(Feed::Dhan, ChainUnderlying::Banknifty, day),
             None
         );
         let date = ExpiryDate::from_yyyymmdd(20_260_728).expect("valid");
         let _ = store.record_policy_date(day, Feed::Groww, ChainUnderlying::Banknifty, date);
         for broker in [Feed::Dhan, Feed::Groww] {
             assert_eq!(
-                store.resolved_expiry(broker, ChainUnderlying::Banknifty),
+                store.resolved_expiry(broker, ChainUnderlying::Banknifty, day),
                 Some(20_260_728)
             );
         }
         // The global handle exists and hands the SAME store to every
         // caller (the future capture-leg delegation seam).
         assert!(Arc::ptr_eq(global_expiry_store(), global_expiry_store()));
+    }
+
+    #[test]
+    fn test_cadence_expiry_winning_facade_never_serves_yesterdays_winner_across_day_flip() {
+        // E1 (verifier, 2026-07-15): Tuesday resolves + day-locks the
+        // expiry-day contract; Wednesday morning the vendor is DOWN, so
+        // no re-resolution ever lands. The read facade the runner stamps
+        // ChainFetchRequest.expiry_yyyymmdd from must return None for
+        // Wednesday — NEVER Tuesday's (now expired) winner.
+        let store = DayLockedExpiryStore::new();
+        let tue = NaiveDate::from_ymd_opt(2026, 7, 16).expect("valid");
+        let d = ExpiryDate::from_yyyymmdd(20_260_716).expect("valid");
+        let _ = store.record_policy_date(tue, Feed::Dhan, ChainUnderlying::Nifty, d);
+        // Same day: the facade serves the locked winner (both brokers —
+        // the Dhan-wins rule keys BOTH lanes on it).
+        assert_eq!(
+            store.resolved_expiry(Feed::Dhan, ChainUnderlying::Nifty, tue),
+            Some(20_260_716)
+        );
+        assert_eq!(store.winning_expiry(tue, ChainUnderlying::Nifty), Some(d));
+        // Wednesday: resolution failing (no record_policy_date ever runs
+        // for the new day) — the store is still keyed to Tuesday.
+        let wed = NaiveDate::from_ymd_opt(2026, 7, 17).expect("valid");
+        assert!(!store.is_resolved(wed, Feed::Dhan, ChainUnderlying::Nifty));
+        // The day-checked facade must fail closed: None, not the stale
+        // expired contract.
+        assert_eq!(
+            store.winning_expiry(wed, ChainUnderlying::Nifty),
+            None,
+            "the facade must never serve yesterday's winner across an IST day flip"
+        );
+        assert_eq!(
+            store.resolved_expiry(Feed::Dhan, ChainUnderlying::Nifty, wed),
+            None
+        );
     }
 
     #[test]
@@ -605,6 +717,42 @@ mod tests {
         // Resolved (even late — the deadline gates the PAGE, not the
         // attempts): never due.
         assert!(!expiry_page_due(40_000, 32_100, true, false));
+    }
+
+    #[test]
+    fn test_cadence_expiry_page_post_deadline_boot_needs_two_failed_waves() {
+        // E4 (2026-07-15): a process BOOTING after the deadline (e.g. a
+        // crash-boot at 11:00 IST) must observe ≥2 consecutive failed
+        // waves before the page fires — never the first-wave hair
+        // trigger.
+        assert_eq!(POST_DEADLINE_BOOT_MIN_FAILED_WAVES, 2);
+        // Post-deadline boot, first failed wave: NOT due.
+        assert!(!expiry_page_due_after_wave(
+            40_000, 32_100, false, false, true, 1
+        ));
+        // Second consecutive failed wave: due.
+        assert!(expiry_page_due_after_wave(
+            40_000, 32_100, false, false, true, 2
+        ));
+        // Pre-deadline boot path UNCHANGED: the deadline gates the page
+        // and one wave suffices.
+        assert!(expiry_page_due_after_wave(
+            32_100, 32_100, false, false, false, 1
+        ));
+        // Still never before the deadline, resolved, or already paged.
+        assert!(!expiry_page_due_after_wave(
+            32_099, 32_100, false, false, true, 9
+        ));
+        assert!(!expiry_page_due_after_wave(
+            40_000, 32_100, true, false, true, 9
+        ));
+        assert!(!expiry_page_due_after_wave(
+            40_000, 32_100, false, true, true, 9
+        ));
+        // Zero waves never page in either boot mode.
+        assert!(!expiry_page_due_after_wave(
+            40_000, 32_100, false, false, false, 0
+        ));
     }
 
     // -----------------------------------------------------------------
