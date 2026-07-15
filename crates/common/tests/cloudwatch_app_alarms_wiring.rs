@@ -156,13 +156,15 @@ fn test_emit_site_guard_ignores_comment_only_mentions() {
         "is_metric_emitted matched a name that appears ONLY in a comment — \
          the emit-site guard is vacuous again (comment stripping regressed)."
     );
-    // Positive control: the real FEED-STALL-01 multi-line emit in
-    // crates/app/src/groww_sidecar_supervisor.rs must still be found —
-    // proves comment stripping did not break REAL emit detection.
+    // Positive control (retuned 2026-07-15 — the FEED-STALL-01 emit died
+    // with the Groww live feed): the Trap-A heartbeat emit in
+    // crates/app/src/spot_1m_rest_boot.rs (+ groww_spot_1m_boot.rs) must be
+    // found — proves comment stripping did not break REAL emit detection,
+    // and pins the re-pointed liveness alarm's emit site.
     assert!(
-        is_metric_emitted("tv_feed_sidecar_stall_restart_total"),
-        "comment stripping broke detection of a REAL multi-line emit site \
-         (groww_sidecar_supervisor.rs FEED-STALL-01 counter)."
+        is_metric_emitted("tv_rest_1m_fire_heartbeat"),
+        "comment stripping broke detection of a REAL emit site \
+         (spot_1m_rest_boot.rs tv_rest_1m_fire_heartbeat gauge)."
     );
 }
 
@@ -373,17 +375,22 @@ fn test_emf_metric_selectors_name_count_is_pinned() {
     // — its gauge producer (the per-SID tick-gap detector) was deleted with
     // the Dhan WS lane, so the name would never be published again. Cost:
     // -1 custom metric series (~-$0.30/mo) — dated note in app-alarms.tf.
+    // 19 (was 22) since 2026-07-15 (Groww live-feed retirement): REMOVED the
+    // 4 Groww-live names whose producers died with the bridge / sidecar
+    // stall watchdog / lag publisher — tv_groww_ws_active,
+    // tv_feed_last_tick_age_seconds, tv_feed_sidecar_stall_restart_total,
+    // tv_groww_exchange_lag_p99_seconds — and ADDED tv_rest_1m_fire_heartbeat
+    // (the re-pointed market-hours liveness alarm's per-fire gauge). Net
+    // -3 series; dated note in aws-budget.md (COST NOTE 2026-07-15).
     let user_data = read("deploy/aws/terraform/user-data.sh.tftpl");
     let names = emf_declared_names(&user_data, "metric_selectors");
     assert_eq!(
         names.len(),
-        22,
-        "Z+ L2 VERIFY ratchet: expected exactly 22 names in the MAIN EMF \
-         metric_selectors list (27 pre-PR-C2 minus the 5 Dhan-lane names \
-         retired 2026-07-13 minus the order-update gauge removed 2026-07-14 \
-         M4 plus the 2 dormant order-side names 2026-07-14 cluster-C minus \
-         the tick-gap gauge removed in PR-C3 2026-07-14); \
-         found {}: {names:?}",
+        19,
+        "Z+ L2 VERIFY ratchet: expected exactly 19 names in the MAIN EMF \
+         metric_selectors list (22 post-PR-C3 minus the 4 Groww-live names \
+         retired 2026-07-15 plus the tv_rest_1m_fire_heartbeat liveness \
+         gauge); found {}: {names:?}",
         names.len()
     );
     for required in [
@@ -391,7 +398,7 @@ fn test_emf_metric_selectors_name_count_is_pinned() {
         "tv_subsystem_memory_estimated_bytes",
         "tv_dhan_exchange_lag_p99_seconds",
         "tv_dhan_lag_samples_excluded_total",
-        "tv_groww_exchange_lag_p99_seconds",
+        "tv_rest_1m_fire_heartbeat",
         // 2026-07-14 cluster-C order-side (dormant until cluster A / Phase-1):
         "tv_daily_pnl",
         "tv_order_fill_lag_seconds",
@@ -783,13 +790,15 @@ fn test_cw_agent_collects_machine_log_paths() {
 // the alarm it pinned — realtime_guarantee_degraded was removed from
 // silent-feed-alarms.tf because the SLO publisher is PARKED (wave-3-d
 // banner; no tv_realtime_guarantee_score is ever published again). The
-// SLO_WARN_THRESHOLD constant remains in the retained slo_score.rs contract
-// stub for a future Groww-scoped re-design.
+// slo_score.rs contract stub itself (with SLO_WARN_THRESHOLD and the
+// SLO-01/02/03 variants) was DELETED in the C4 sweep (2026-07-15) —
+// a future Groww-scoped SLO re-design starts fresh with its own dated
+// operator quote.
 
 #[test]
 fn test_silent_feed_alarms_are_window_gated() {
-    // All 4 silent-feed alarms (3 from the 2026-07-06 hardening + the
-    // 2026-07-11 scoreboard PR-C groww lag mirror) follow the house
+    // The remaining silent-feed alarms (2026-07-06 hardening; the 2026-07-11
+    // groww lag mirror retired 2026-07-15 with the Groww live feed) follow the house
     // market-hours-gate pattern
     // (Rule 3): actions_enabled=false + appended to the window-gate Lambda
     // ALARM_NAMES (09:20-15:35 IST Mon-Fri). The SLO publisher runs 24/7
@@ -800,11 +809,7 @@ fn test_silent_feed_alarms_are_window_gated() {
     let gate = read("deploy/aws/terraform/market-hours-liveness-alarm.tf");
     // PR-C2 (2026-07-13): realtime_guarantee_degraded left this list — the
     // alarm retired with the PARKed SLO publisher.
-    for name in [
-        "boundary_catchup_storm_dhan",
-        "dhan_exchange_lag_p99_high",
-        "groww_exchange_lag_p99_high",
-    ] {
+    for name in ["boundary_catchup_storm_dhan", "dhan_exchange_lag_p99_high"] {
         let block = alarm_resource_block(&tf, name);
         assert!(
             block_has_attr(&block, "actions_enabled", "false"),
@@ -818,49 +823,11 @@ fn test_silent_feed_alarms_are_window_gated() {
     }
 }
 
-#[test]
-fn test_groww_exchange_lag_alarm_shape_is_pinned() {
-    // Scoreboard PR-C (2026-07-11): the Groww lag alarm mirrors the Dhan S3
-    // discipline at Groww's finer resolution — threshold 5 (seconds; no 1s
-    // floor: Groww's exchange clock is millisecond-precise, receipt =
-    // sidecar capture one hop downstream of the socket), strict 10-of-10
-    // at 60s/Maximum (safe: the metric is itself a trailing-60s p99, so a
-    // one-burst transient decays out within ~60s), notBreaching (nightly
-    // box stop + the >=50-sample publish gate make missing data NORMAL —
-    // feed-dead is owned by tv_groww_ws_active + the feed-stall pagers).
-    let tf = read("deploy/aws/terraform/silent-feed-alarms.tf");
-    let block = alarm_resource_block(&tf, "groww_exchange_lag_p99_high");
-    assert!(
-        block.contains("metric_name         = \"tv_groww_exchange_lag_p99_seconds\""),
-        "the groww lag alarm must watch tv_groww_exchange_lag_p99_seconds \
-         (its OWN gauge name — never the Dhan gauge, never a feed label):\n{block}"
-    );
-    assert!(
-        block_has_attr(&block, "threshold", "5"),
-        "groww_exchange_lag_p99_high threshold must be 5 (seconds — ~10-50x \
-         above the healthy sub-second band at Groww's ms resolution):\n{block}"
-    );
-    assert!(
-        block_has_attr(&block, "comparison_operator", "\"GreaterThanThreshold\""),
-        "groww_exchange_lag_p99_high must use GreaterThanThreshold"
-    );
-    assert!(
-        block_has_attr(&block, "evaluation_periods", "10")
-            && block_has_attr(&block, "datapoints_to_alarm", "10"),
-        "groww_exchange_lag_p99_high must latch strict 10-of-10 (the metric \
-         is a trailing-60s p99 — the S3 rationale)"
-    );
-    assert!(
-        block_has_attr(&block, "period", "60")
-            && block_has_attr(&block, "statistic", "\"Maximum\""),
-        "groww_exchange_lag_p99_high must evaluate period=60/Maximum"
-    );
-    assert!(
-        block_has_attr(&block, "treat_missing_data", "\"notBreaching\""),
-        "groww_exchange_lag_p99_high must be notBreaching (nightly stop + \
-         the publish gates make missing data normal)"
-    );
-}
+// RETIRED (2026-07-15 — Groww live-feed retirement):
+// test_groww_exchange_lag_alarm_shape_is_pinned died with the alarm it
+// pinned — groww_exchange_lag_p99_high left silent-feed-alarms.tf (its
+// gauge's only sample producer, the Groww bridge, was deleted); the
+// market-hours liveness alarm was re-pointed to tv_rest_1m_fire_heartbeat.
 
 /// Strip `#`-comments from an HCL (terraform) body, STRING-AWARE: a `#`
 /// inside a double-quoted string (e.g. an alarm_description's "drop #1")
@@ -1088,10 +1055,27 @@ fn test_app_alarms_count_is_twenty_two() {
     // deleted, so the alarm would orphan a dead monitor). Cost: -1 alarm
     // (~-$0.10/mo) — dated notes in app-alarms.tf +
     // market-hours-liveness-alarm.tf.
+    // 12 (was 15) since 2026-07-15 (Groww live-feed retirement): REMOVED
+    // tv_groww_ws_active (alarm tv-<env>-groww-ws-inactive),
+    // tv_feed_sidecar_stall_restart_total (alarm
+    // tv-<env>-groww-stall-restart-storm) and
+    // tv_groww_exchange_lag_p99_seconds (alarm
+    // tv-<env>-groww-exchange-lag-p99-high) — their producers (the Groww
+    // bridge + sidecar stall watchdog + lag publisher) were deleted with
+    // the Groww live feed. Cost: -3 alarms (~-$0.30/mo) — dated note in
+    // aws-budget.md (COST NOTE 2026-07-15).
+    // 11 (was 12) since 2026-07-15 (same PR, fix round): REMOVED
+    // tv_aggregator_seals_emitted_total (alarm
+    // tv-<env>-aggregator-no-seals) — the seals metric lost its LAST live
+    // producer with the Groww bridge deletion (the Dhan broadcast has been
+    // publisher-less since PR-C2), so the alarm was a permanently-dead
+    // monitor the window gate kept arming daily. Cost: -1 alarm
+    // (~-$0.10/mo) — dated notes in app-alarms.tf section 9 +
+    // aws-budget.md (COST NOTE 2026-07-15).
     let count = alarm_metric_names().len();
     assert_eq!(
-        count, 15,
-        "Z+ L2 VERIFY ratchet: expected exactly 15 app-level CloudWatch alarm \
+        count, 11,
+        "Z+ L2 VERIFY ratchet: expected exactly 11 app-level CloudWatch alarm \
          metric_name entries across app-alarms.tf + silent-feed-alarms.tf \
          (one per critical app signal). Found {count}. If you intentionally \
          added or removed one, update aws-budget.md custom-metric cost line \

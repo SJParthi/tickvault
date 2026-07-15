@@ -26,12 +26,11 @@ phase2_compute_subscriptions = 1000000  # <1ms  — Plan item Q (2026-04-23): co
 # tick_gap_record_tick_steady_state / tick_gap_scan_gaps_full_universe budgets
 # removed in PR-C3 (2026-07-14) with the deleted tick-gap detector
 # (operator Q4-ii 2026-07-13).
-slo_score_evaluate_all_green = 1000      # <1µs — Wave 3-D Item 13: composite SLO score evaluator hot path (six clamps + five multiplies + 6-way min-scan). 1µs ceiling gives ~20× headroom over the measured median; regression past this size means a heap allocation or a powf entered the path.
-slo_score_evaluate_degraded = 1000       # <1µs — Wave 3-D Item 13: degraded path (find-weakest scan + threshold branches). Same budget as all-green.
+# slo_score_evaluate_* budgets removed in the C4 sweep (2026-07-15) with the
+# deleted slo_score.rs contract stub + its bench (wave-3-d PARK banner).
 
 # Silent-feed hardening Item 4 (2026-07-06 incident) — Dhan exchange-lag monitor.
 feed_lag_record_dhan_tick = 100          # <100ns — HOT PATH ring write (dwell check + clock alignment + two relaxed atomic stores + head bump + two relaxed day-histogram RMWs since scoreboard PR-C; zero-alloc, DHAT-ratcheted by dhat_feed_lag_ring.rs). Regression past this means an allocation or a lock entered the per-tick observation.
-feed_lag_record_groww_tick = 100         # <100ns — HOT PATH Groww fold (scoreboard PR-C: capture/staleness classify + ring write + two relaxed day-histogram RMWs; zero-alloc, DHAT-ratcheted by dhat_feed_lag_groww.rs). Same budget class as the Dhan target.
 feed_presence_record = 100               # <100ns — HOT PATH presence fold (scoreboard PR-D: enabled check + minute math + one lock-free papaya read + one relaxed fetch_or; zero-alloc, DHAT-ratcheted by dhat_feed_presence.rs). Same budget class as the feed_lag hot targets — the papaya hash+read dominates.
 feed_lag_p99_window = 5000000            # <5ms — COLD path: publisher p99 over a full 32,768-sample window via select_nth_unstable. Honestly O(N-window), NOT O(1) — runs on the supervised 10s task off the tick thread (cold-budget class; the former tick_gap_scan_gaps_full_universe peer budget retired in PR-C3, 2026-07-14).
 

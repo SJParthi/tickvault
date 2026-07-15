@@ -21,7 +21,7 @@
 ---
 
 > **⚠ RETIREMENT AUTHORIZED 2026-07-13 (Dhan live WS retired — deletion lands with the
-> Phase C PRs):** the runtime Dhan-lane cold-start FSM this file documents is retired with
+> Phase C PRs; all four variants DELETED in the C4 sweep, 2026-07-15):** the runtime Dhan-lane cold-start FSM this file documents is retired with
 > the Dhan live WS (operator directive 2026-07-13, verbatim in
 > `websocket-connection-scope-lock.md` "2026-07-13 Amendment"). Phase A already refuses the
 > runtime cold-start (raw-TOML gate + the /feeds 409); the Phase C code PRs DELETE the lane
