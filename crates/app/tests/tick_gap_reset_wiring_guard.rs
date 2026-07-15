@@ -1,13 +1,18 @@
-//! Wave-2-D Fix 2 — `TickGapDetector::reset_daily()` source-scan guard.
+//! RETIRED GUARD — Wave-2-D Fix 2 tick-gap daily-reset wiring guard.
 //!
-//! `crates/core/src/pipeline/tick_gap_detector.rs::reset_daily()` is
-//! defined and unit-tested but had no production call site in main.rs
-//! — a literal `audit-findings-2026-04-17.md` Rule 13 violation
-//! ("if a method exists + is tested but is never called, it IS a
-//! bug"). Wave-2-D wires a 15:35 IST scheduled task that calls
-//! `reset_daily()` once per day. This guard fails the build if a
-//! future change deletes the wiring — preventing silent regression
-//! to the pre-Wave-2-D leaky behaviour.
+//! **RETIRED in PR-C3 (2026-07-14).** The `TickGapDetector` (and with it
+//! the 15:35 IST `reset_daily()` task in main.rs this guard pinned) was
+//! DELETED per the operator's 2026-07-13 Q4-ii ruling ("tick-gap detector
+//! + WS-GAP-06 deleted; the Groww feed-stall watchdog owns stall
+//! detection" — `websocket-connection-scope-lock.md` "2026-07-13
+//! Amendment" §B item 4). The detector was fed ONLY by the retired Dhan
+//! WS pipeline (`record_tick_global` in tick_processor.rs), so after
+//! PR-C2 it was a no-input shell.
+//!
+//! This file is retained as a dated tombstone per the C2 guard-retirement
+//! precedent (retire loudly with the authority cited, never delete
+//! silently). The single test below pins the RETIREMENT: the detector
+//! module and its main.rs wiring must STAY deleted.
 
 use std::path::PathBuf;
 
@@ -20,55 +25,25 @@ fn read_main() -> String {
         .unwrap_or_else(|err| panic!("must be able to read {}: {err}", path.display()))
 }
 
+/// PR-C3 tombstone: the tick-gap detector wiring must stay deleted.
+/// Re-introducing `TickGapDetector` / its reset task in main.rs requires
+/// a fresh dated operator quote in
+/// `.claude/rules/project/websocket-connection-scope-lock.md` FIRST.
 #[test]
-fn tick_gap_detector_reset_daily_is_wired_in_main_rs() {
+fn tick_gap_detector_wiring_stays_deleted() {
     let src = read_main();
     assert!(
-        src.contains("reset_daily()"),
-        "Wave-2-D Fix 2 regression: `reset_daily()` call MUST be \
-         present in `crates/app/src/main.rs`. Without this 15:35 IST \
-         task the papaya `last_seen` map accumulates entries \
-         indefinitely across trading days — overnight silence will \
-         register as a tick gap on next-day market open. Rule 13."
+        !src.contains("set_global_tick_gap_detector"),
+        "PR-C3 retirement violated: the global TickGapDetector install \
+         reappeared in main.rs. The detector was deleted per operator \
+         Q4-ii (2026-07-13); re-introduction needs a fresh dated quote \
+         in websocket-connection-scope-lock.md first."
     );
-}
-
-#[test]
-fn tick_gap_reset_uses_pinned_constant_not_literal() {
-    let src = read_main();
+    let detector_path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../core/src/pipeline/tick_gap_detector.rs");
     assert!(
-        src.contains("TICK_GAP_RESET_TIME_IST"),
-        "Wave-2-D Fix 2: the 15:35 IST reset time MUST come from \
-         `tickvault_common::constants::TICK_GAP_RESET_TIME_IST`, not a \
-         hard-coded literal. Hardcoded times silently break when \
-         IST/DST rules change. See .claude/rules/project/rust-code.md \
-         (No Hardcoded Values)."
-    );
-}
-
-#[test]
-fn tick_gap_reset_emits_prometheus_counter() {
-    let src = read_main();
-    assert!(
-        src.contains("tv_tick_gap_daily_resets_total"),
-        "Wave-2-D Fix 2: the daily reset task MUST emit \
-         `tv_tick_gap_daily_resets_total` so the operator-health \
-         dashboard can verify the task is firing once per trading \
-         day. Without the counter, a silently-broken scheduler is \
-         invisible. See .claude/rules/project/observability-architecture.md."
-    );
-}
-
-#[test]
-fn tick_gap_reset_log_mentions_15_35_ist_for_grepability() {
-    let src = read_main();
-    assert!(
-        src.contains("15:35 IST")
-            || src.contains("15:35:00")
-            || src.contains("TICK_GAP_RESET_TIME_IST"),
-        "Wave-2-D Fix 2: the reset task's `info!` log must mention \
-         15:35 IST so operators can grep app logs for the daily reset \
-         signal. The constant reference at the call site satisfies \
-         this requirement."
+        !detector_path.exists(),
+        "PR-C3 retirement violated: crates/core/src/pipeline/\
+         tick_gap_detector.rs must stay DELETED (operator Q4-ii 2026-07-13)."
     );
 }

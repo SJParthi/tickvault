@@ -290,8 +290,9 @@ pub enum NotificationEvent {
         boot_path: BootPathLabel,
         boot_wall_clock_secs: f64,
         /// Age (secs) of the most-recent REAL tick across all instruments,
-        /// or `None` if zero real ticks captured yet. Sourced from
-        /// `TickGapDetector::freshest_tick_age_secs` (real ticks only —
+        /// or `None` if zero real ticks captured yet. Historically sourced
+        /// from the tick-gap detector's `freshest_tick_age_secs` (DELETED
+        /// in PR-C3, 2026-07-14, with the Dhan WS lane; real ticks only —
         /// never pings). Closes the 2026-06-02 false-OK where the per-feed
         /// "last update Xs ago" counted Dhan keep-alive pings and could
         /// read healthy while no real ticks were captured.
@@ -426,8 +427,10 @@ pub enum NotificationEvent {
         trading_date_ist: String,
         /// Final main-feed connection count at 15:31:30 IST.
         main_feed_active: usize,
-        /// Operator's expected total — same `effective_main_feed_pool_size`
-        /// value as `MarketOpenReadinessConfirmation` for parity.
+        /// Operator's expected total — historically the
+        /// `effective_main_feed_pool_size` value (fn deleted with the Dhan
+        /// subscription surface, PR-C3 2026-07-14); same source as
+        /// `MarketOpenReadinessConfirmation` for parity.
         main_feed_total: usize,
         /// JWT remaining lifetime in whole hours. The 24h SEBI cycle
         /// means anything < 12h after market close needs a TOTP-driven
@@ -759,6 +762,35 @@ pub enum NotificationEvent {
         /// Plain-English detail (already secret-redacted + bounded at the
         /// emit site).
         detail: String,
+    },
+
+    /// Per-underlying not-served detector on the DHAN chain leg
+    /// (2026-07-14 — the Dhan mirror of the Groww #1537 detector; the
+    /// NIFTY expiry-day vendor-cutoff companion): ONE underlying
+    /// accumulated N consecutive empty/failed minutes in the per-minute
+    /// Dhan option-chain pull WHILE the other underlyings succeeded in
+    /// those same minutes — the vendor is not serving THIS underlying's
+    /// chain, not a general outage. Fires ONCE per underlying per episode
+    /// (edge-latched, Rule 4); re-armed only by that underlying's own
+    /// recovery. Severity::High. Noise-lock family-(2) extension per
+    /// `dhan-rest-only-noise-lock-2026-07-14.md` §2.1.
+    Chain1mUnderlyingNotServed {
+        /// The affected underlying (a pinned plain symbol, e.g. "NIFTY").
+        underlying: &'static str,
+        /// How many counted minutes in a row this underlying's chain
+        /// went unserved.
+        empty_minutes: u32,
+    },
+
+    /// A previously-not-served underlying's Dhan chain is being served
+    /// again (falling edge — one Info ping; the missing minutes stay
+    /// absent until re-pulled, never fabricated, never copied across
+    /// brokers).
+    Chain1mUnderlyingServedRecovered {
+        /// The recovered underlying (a pinned plain symbol, e.g. "NIFTY").
+        underlying: &'static str,
+        /// How many counted minutes the underlying's chain went unserved.
+        empty_minutes: u32,
     },
 
     /// Once-per-trading-day Dhan-vs-Groww scorecard at 3:45 PM IST
@@ -2129,6 +2161,8 @@ impl NotificationEvent {
             | Self::Spot1mSidServedRecovered { .. }
             | Self::ChainFetchDegraded { .. }
             | Self::ChainFetchRecovered { .. }
+            | Self::Chain1mUnderlyingNotServed { .. }
+            | Self::Chain1mUnderlyingServedRecovered { .. }
             | Self::ChainEntitlementAbsent { .. }
             | Self::ChainEntitlementConfirmed
             | Self::ChainExpirylistFailed { .. }
@@ -3005,6 +3039,48 @@ impl NotificationEvent {
                      What to do RIGHT NOW:\n\
                      1. Check the Dhan data connection is healthy.\n\
                      2. If this repeats daily, contact Dhan."
+                )
+            }
+            Self::Chain1mUnderlyingNotServed {
+                underlying,
+                empty_minutes,
+            } => {
+                format!(
+                    "\u{1f198} <b>Dhan is not returning the option chain for \
+                     {underlying}</b>\n\
+                     For {empty_minutes} minutes in a row the per-minute \
+                     option chain for {underlying} came back empty from Dhan \
+                     while the other indices came through fine — the other \
+                     indices are unaffected, so this looks like the broker \
+                     not serving THIS index's chain, not a general outage.\n\
+                     Live streaming prices are NOT affected — only Dhan's \
+                     per-minute option chain record for {underlying} is \
+                     missing; the same minutes may still be coming in from \
+                     the second broker (\u{1f7e2} GROWW), which records into \
+                     the same book with its own label.\n\
+                     What to do RIGHT NOW:\n\
+                     1. Nothing urgent — the other indices keep recording \
+                     normally, and the Groww copy covers {underlying} for \
+                     these minutes IF Groww is serving it.\n\
+                     2. On an expiry day this is usually the broker cutting \
+                     off the expiring chain early — it comes back with the \
+                     next expiry.\n\
+                     3. Missing Dhan minutes stay blank — nothing is made up \
+                     and nothing is copied across brokers."
+                )
+            }
+            Self::Chain1mUnderlyingServedRecovered {
+                underlying,
+                empty_minutes,
+            } => {
+                format!(
+                    "\u{2705} <b>Dhan is serving the option chain for \
+                     {underlying} again</b>\n\
+                     The per-minute option chain for {underlying} from Dhan \
+                     is working again after {empty_minutes} empty minute(s). \
+                     The minutes that were missed stay blank in Dhan's record \
+                     — nothing is made up; check the Groww copy for those \
+                     minutes if they matter."
                 )
             }
             Self::DualFeedDailyScorecard {
@@ -4057,6 +4133,8 @@ impl NotificationEvent {
             Self::GrowwContract1mBookUnresolved { .. } => "GrowwContract1mBookUnresolved",
             Self::ChainFetchDegraded { .. } => "ChainFetchDegraded",
             Self::ChainFetchRecovered { .. } => "ChainFetchRecovered",
+            Self::Chain1mUnderlyingNotServed { .. } => "Chain1mUnderlyingNotServed",
+            Self::Chain1mUnderlyingServedRecovered { .. } => "Chain1mUnderlyingServedRecovered",
             Self::ChainEntitlementAbsent { .. } => "ChainEntitlementAbsent",
             Self::ChainEntitlementConfirmed => "ChainEntitlementConfirmed",
             Self::ChainExpirylistFailed { .. } => "ChainExpirylistFailed",
@@ -4440,6 +4518,10 @@ impl NotificationEvent {
             Self::GrowwContract1mBookUnresolved { .. } => Severity::High,
             Self::ChainFetchDegraded { .. } => Severity::High,
             Self::ChainFetchRecovered { .. } => Severity::Info,
+            // 2026-07-14 family-(2) extension (noise-lock §2.1): one HIGH
+            // page per underlying per not-served episode; Info recovery.
+            Self::Chain1mUnderlyingNotServed { .. } => Severity::High,
+            Self::Chain1mUnderlyingServedRecovered { .. } => Severity::Info,
             // HIGH only when the pipeline was ON and expected to record;
             // the probe-only verdict for a disabled pipeline is an Info
             // heads-up, never a page (the operator asked for a report).
@@ -10000,5 +10082,70 @@ mod tests {
             msg.contains("treated as trading days"),
             "past-cliff body must state the live consequence: {msg}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Chain1mUnderlyingNotServed + Chain1mUnderlyingServedRecovered
+    // (2026-07-14 — the Dhan mirror of the Groww #1537 per-underlying
+    // detector; noise-lock family-(2) extension per
+    // dhan-rest-only-noise-lock-2026-07-14.md §2.1)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_chain_1m_underlying_not_served_is_high_names_dhan_and_underlying() {
+        let event = NotificationEvent::Chain1mUnderlyingNotServed {
+            underlying: "NIFTY",
+            empty_minutes: 10,
+        };
+        assert_eq!(event.topic(), "Chain1mUnderlyingNotServed");
+        assert_eq!(event.severity(), Severity::High);
+        let msg = event.to_message();
+        // Broker-naming directive: the body names Dhan (never depends on
+        // the badge alone), and the badge layer stamps the Dhan badge.
+        assert!(
+            msg.contains("Dhan is not returning the option chain for NIFTY"),
+            "got: {msg}"
+        );
+        assert!(
+            msg.contains("not returning the option chain for"),
+            "got: {msg}"
+        );
+        assert!(msg.contains("other indices are unaffected"), "got: {msg}");
+        assert!(msg.contains("10 minutes in a row"), "got: {msg}");
+        assert!(msg.contains("What to do RIGHT NOW"), "got: {msg}");
+        // Honest scope lines: the live WS pipeline is untouched, the
+        // sibling broker is stated as MAY + the explicit IF (independent
+        // serving state — no false-OK), and nothing crosses feeds.
+        assert!(msg.contains("NOT affected"), "got: {msg}");
+        assert!(msg.contains("may still be coming in"), "got: {msg}");
+        assert!(msg.contains("IF Groww is serving it"), "got: {msg}");
+        assert!(msg.contains("nothing is made up"), "got: {msg}");
+        assert!(
+            msg.contains("nothing is copied across brokers"),
+            "got: {msg}"
+        );
+        // 10-commandment hygiene: no file paths / config extensions.
+        assert!(!msg.contains(".rs"), "no file paths in Telegram: {msg}");
+        assert!(!msg.contains(".toml"), "no config paths in Telegram: {msg}");
+    }
+
+    #[test]
+    fn test_chain_1m_underlying_served_recovered_is_info() {
+        let event = NotificationEvent::Chain1mUnderlyingServedRecovered {
+            underlying: "NIFTY",
+            empty_minutes: 12,
+        };
+        assert_eq!(event.topic(), "Chain1mUnderlyingServedRecovered");
+        assert_eq!(event.severity(), Severity::Info);
+        let msg = event.to_message();
+        assert!(
+            msg.contains("Dhan is serving the option chain for NIFTY again"),
+            "got: {msg}"
+        );
+        assert!(msg.contains("12 empty"), "got: {msg}");
+        // No false-OK: recovery never claims the missing minutes came
+        // back — the operator is pointed at the Groww copy instead.
+        assert!(msg.contains("nothing is made up"), "got: {msg}");
+        assert!(msg.contains("check the Groww copy"), "got: {msg}");
     }
 }

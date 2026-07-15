@@ -368,15 +368,21 @@ fn test_emf_metric_selectors_name_count_is_pinned() {
     // order-side, reconciled through the PR-C2 merge): +tv_daily_pnl
     // +tv_order_fill_lag_seconds — both DORMANT in dry-run (emit sites ship
     // with cluster A / Phase-1); $0 until data.
+    // 22 (was 23) since 2026-07-14 (PR-C3 — tick-gap detector deletion,
+    // operator Q4-ii 2026-07-13): REMOVED `tv_tick_gap_instruments_silent`
+    // — its gauge producer (the per-SID tick-gap detector) was deleted with
+    // the Dhan WS lane, so the name would never be published again. Cost:
+    // -1 custom metric series (~-$0.30/mo) — dated note in app-alarms.tf.
     let user_data = read("deploy/aws/terraform/user-data.sh.tftpl");
     let names = emf_declared_names(&user_data, "metric_selectors");
     assert_eq!(
         names.len(),
-        23,
-        "Z+ L2 VERIFY ratchet: expected exactly 23 names in the MAIN EMF \
+        22,
+        "Z+ L2 VERIFY ratchet: expected exactly 22 names in the MAIN EMF \
          metric_selectors list (27 pre-PR-C2 minus the 5 Dhan-lane names \
          retired 2026-07-13 minus the order-update gauge removed 2026-07-14 \
-         M4 plus the 2 dormant order-side names 2026-07-14 cluster-C); \
+         M4 plus the 2 dormant order-side names 2026-07-14 cluster-C minus \
+         the tick-gap gauge removed in PR-C3 2026-07-14); \
          found {}: {names:?}",
         names.len()
     );
@@ -760,112 +766,17 @@ fn test_cw_agent_collects_machine_log_paths() {
     }
 }
 
-#[test]
-fn test_tick_gap_silent_alarm_threshold_is_forty() {
-    // 2026-07-06 incident pin: 29-67 of 776 instruments were silent EVERY
-    // minute while the old threshold=100 never crossed — zero pages all day.
-    // Round-3 correction 2026-07-08 (review finding 4): the first retune
-    // shipped 25, BELOW the documented ~33 always-silent healthy floor
-    // (main.rs D2 note 2026-07-03 — the gauge is set from the same scan
-    // with no always-silent exclusion), so 25 would have breached every
-    // healthy in-session minute and paged daily. 40 (fires at >= 41,
-    // PROVISIONAL, one-trading-week soak mandated) clears the floor with
-    // margin and aligns with the SLO-degraded alarm's >= 39-silent
-    // freshness breach point; the 29-40 marginal band is owned by the
-    // SLO-degraded + lag-p99 alarms. 10-of-12 M-of-N at 60s/Maximum pages
-    // on the sustained upper band while a 1-3 min reconnect blip cannot
-    // reach 10 breaching minutes. Regressing ANY of these values either
-    // reproduces the zero-page miss (raise) or the daily-false-page
-    // inversion (lower below the floor).
-    let tf = read("deploy/aws/terraform/app-alarms.tf");
-    let block = alarm_resource_block(&tf, "tick_gap_instruments_silent");
-    assert!(
-        block_has_attr(&block, "threshold", "40"),
-        "tick_gap_instruments_silent threshold must be 40 (2026-07-08 round-3 \
-         retune — above the ~33 always-silent healthy floor):\n{block}"
-    );
-    assert!(
-        block_has_attr(&block, "comparison_operator", "\"GreaterThanThreshold\""),
-        "tick_gap_instruments_silent must use GreaterThanThreshold (fires at >= 41)"
-    );
-    assert!(
-        block_has_attr(&block, "evaluation_periods", "12")
-            && block_has_attr(&block, "datapoints_to_alarm", "10"),
-        "tick_gap_instruments_silent must latch M-of-N 10-of-12 (not strict-consecutive; \
-         a threshold-adjacent value flapping 39/41/39 must neither page nor let one clean \
-         scrape erase 9 min of evidence — the incident band was 29-67 silent/min)"
-    );
-    assert!(
-        block_has_attr(&block, "period", "60")
-            && block_has_attr(&block, "statistic", "\"Maximum\""),
-        "tick_gap_instruments_silent must evaluate period=60/Maximum (1 datapoint per 60s scrape)"
-    );
-    assert!(
-        block_has_attr(&block, "treat_missing_data", "\"notBreaching\""),
-        "tick_gap_instruments_silent must be notBreaching (nightly box stop)"
-    );
-}
-
-#[test]
-fn test_tick_gap_silent_alarm_is_window_gated() {
-    // Rule 3 (market-hours gate, MANDATORY): the silent-instruments gauge is
-    // written only in-session, so the LAST in-session value keeps being
-    // re-scraped 15:30->16:30 IST — a stale post-close value must never page.
-    // actions_enabled=false + the window-gate Lambda ALARM_NAMES entry is the
-    // enforcement pair; losing EITHER half re-opens the off-hours false-page.
-    let tf = read("deploy/aws/terraform/app-alarms.tf");
-    let block = alarm_resource_block(&tf, "tick_gap_instruments_silent");
-    assert!(
-        block_has_attr(&block, "actions_enabled", "false"),
-        "tick_gap_instruments_silent must ship actions_enabled=false (gate Lambda owns the window)"
-    );
-    let gate = read("deploy/aws/terraform/market-hours-liveness-alarm.tf");
-    assert!(
-        gate.contains("aws_cloudwatch_metric_alarm.tick_gap_instruments_silent.alarm_name"),
-        "tick_gap_instruments_silent must be in the window-gate Lambda ALARM_NAMES join \
-         (market-hours-liveness-alarm.tf) — without it the alarm stays actions-disabled forever"
-    );
-}
-
-#[test]
-fn test_tick_gap_silent_gauge_producer_pins_pre_open_to_zero() {
-    // Round-4 fix pin (2026-07-08, final-review findings 1/2/4): the
-    // tick-gap gauge producer in main.rs MUST pin the gauge to 0.0 during
-    // the NSE pre-open/auction window [09:00, 09:15) IST — the mirror of
-    // the round-3 SLO tick_freshness pre-open pin. Without it, the
-    // 09:08-09:15 matching/buffer freeze writes ~6-7 guaranteed breaching
-    // datapoints (boot-seeded ~775 SIDs silent, far above threshold 40)
-    // into the retuned alarm's 10-of-12 / 12-min lookback — the gate
-    // Lambda's forced-OK at 09:20 does NOT purge datapoints, so ~3
-    // open-ramp minutes > 40 would false-page at ~09:21 on ordinary days.
-    // This scan matches CODE only (comments stripped) so a comment mention
-    // can never satisfy it, and it asserts the UNPINNED raw write form is
-    // absent so the pin cannot be silently bypassed.
-    let body = fs::read_to_string(workspace_root().join("crates/app/src/main.rs"))
-        .expect("read crates/app/src/main.rs"); // APPROVED: test
-    let code_only = strip_line_comments(&body);
-    let compact: String = code_only.chars().filter(|c| !c.is_whitespace()).collect();
-    assert!(
-        compact.contains("constTICK_GAP_GAUGE_SESSION_OPEN_SECS_OF_DAY_IST:u32=9*3600+15*60"),
-        "main.rs must define TICK_GAP_GAUGE_SESSION_OPEN_SECS_OF_DAY_IST = 09:15:00 IST \
-         (the continuous-session open — the pre-open pin boundary)"
-    );
-    assert!(
-        compact.contains("now_ist_secs_of_day()<TICK_GAP_GAUGE_SESSION_OPEN_SECS_OF_DAY_IST"),
-        "main.rs must gate the tick-gap gauge value on now_ist_secs_of_day() < \
-         TICK_GAP_GAUGE_SESSION_OPEN_SECS_OF_DAY_IST (pre-open pin to 0.0)"
-    );
-    assert!(
-        compact.contains("gauge!(\"tv_tick_gap_instruments_silent\").set(gauge_silent)"),
-        "the tv_tick_gap_instruments_silent gauge write must use the pre-open-pinned \
-         gauge_silent value"
-    );
-    assert!(
-        !compact.contains("gauge!(\"tv_tick_gap_instruments_silent\").set(total_silent"),
-        "the tv_tick_gap_instruments_silent gauge must NOT be written from the raw \
-         total_silent count — that bypasses the [09:00, 09:15) IST pre-open pin"
-    );
-}
+// RETIRED (PR-C3, 2026-07-14 — tick-gap detector deletion, operator Q4-ii
+// 2026-07-13 per websocket-connection-scope-lock.md "2026-07-13 Amendment"
+// §B item 4): test_tick_gap_silent_alarm_threshold_is_forty,
+// test_tick_gap_silent_alarm_is_window_gated and
+// test_tick_gap_silent_gauge_producer_pins_pre_open_to_zero died with the
+// `tv-<env>-tick-gap-instruments-silent` alarm + its main.rs gauge producer
+// — the per-SID tick-gap detector was deleted (fed only by the retired Dhan
+// WS pipeline), so `tv_tick_gap_instruments_silent` is never written again
+// and keeping the alarm would orphan a dead monitor. The 2026-07-06/07-08
+// retune history (threshold 40, 10-of-12, pre-open pin) lives in git
+// history + the dated note in app-alarms.tf.
 
 // RETIRED (PR-C2, 2026-07-13 — Dhan live-WS lane deletion):
 // test_realtime_guarantee_degraded_alarm_threshold_matches_slo_warn died with
@@ -882,8 +793,9 @@ fn test_silent_feed_alarms_are_window_gated() {
     // market-hours-gate pattern
     // (Rule 3): actions_enabled=false + appended to the window-gate Lambda
     // ALARM_NAMES (09:20-15:35 IST Mon-Fri). The SLO publisher runs 24/7
-    // with off-hours dimension dips; the lag gauge + tick-gap gauge go stale
-    // after close — every one of them false-pages without the gate.
+    // with off-hours dimension dips; the lag gauges go stale after close
+    // (the tick-gap gauge peer retired in PR-C3, 2026-07-14) — every one
+    // of them false-pages without the gate.
     let tf = read("deploy/aws/terraform/silent-feed-alarms.tf");
     let gate = read("deploy/aws/terraform/market-hours-liveness-alarm.tf");
     // PR-C2 (2026-07-13): realtime_guarantee_degraded left this list — the
@@ -1170,10 +1082,16 @@ fn test_app_alarms_count_is_twenty_two() {
     // spawn; the alarm was missing-data-blind on dhan-off boots). Cost:
     // -1 alarm (~-$0.10/mo) — dated note in app-alarms.tf output
     // description.
+    // 15 (was 16) since 2026-07-14 (PR-C3 — tick-gap detector deletion,
+    // operator Q4-ii 2026-07-13): REMOVED `tv_tick_gap_instruments_silent`
+    // (alarm tv-<env>-tick-gap-instruments-silent — its gauge producer was
+    // deleted, so the alarm would orphan a dead monitor). Cost: -1 alarm
+    // (~-$0.10/mo) — dated notes in app-alarms.tf +
+    // market-hours-liveness-alarm.tf.
     let count = alarm_metric_names().len();
     assert_eq!(
-        count, 16,
-        "Z+ L2 VERIFY ratchet: expected exactly 16 app-level CloudWatch alarm \
+        count, 15,
+        "Z+ L2 VERIFY ratchet: expected exactly 15 app-level CloudWatch alarm \
          metric_name entries across app-alarms.tf + silent-feed-alarms.tf \
          (one per critical app signal). Found {count}. If you intentionally \
          added or removed one, update aws-budget.md custom-metric cost line \
