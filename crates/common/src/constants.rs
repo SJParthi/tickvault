@@ -647,26 +647,13 @@ pub const GROWW_INSTRUMENT_CSV_URL: &str =
 /// Groww live-feed NATS-over-WebSocket endpoint (wheel `feed.py::_GROWW_SOCKET_URL`).
 pub const GROWW_SOCKET_URL: &str = "wss://socket-api.groww.in"; // APPROVED: constants.rs is the single WS-URL source
 
-/// Groww per-session socket-token mint endpoint (wheel `client.py::generate_socket_token`).
-///
-/// LIVE-FEED-AUTH class (the KEEP class of
-/// `no-rest-except-live-feed-2026-06-27.md` §2/§3 — recorded there 2026-07-04):
-/// consumes the SSM-read ACCESS token (`Authorization: Bearer …`) to mint a
-/// per-session NATS user JWT bound to a fresh ed25519 nkey. It does NOT mint
-/// the access token (shared-minter lock 2026-07-02 untouched) and carries NO
-/// market data. This is exactly the call the Python sidecar's SDK already
-/// makes on every feed (re)construction.
-pub const GROWW_SOCKET_TOKEN_URL: &str = "https://api.groww.in/v1/api/apex/v1/socket/token/create/"; // APPROVED: constants.rs is the single REST-URL source
-
+// (2026-07-15: GROWW_SOCKET_TOKEN_URL deleted — its sole caller, the native
+// shadow socket-token mint, was deleted with the Groww live feed.)
 /// Groww data directory (watch files, sidecar NDJSON, shadow NDJSON).
 pub const GROWW_DATA_DIR: &str = "data/groww";
 
-/// The native shadow client's OWN NDJSON capture file (same `GrowwTickLine`
-/// line schema as the sidecar's `data/groww/live-ticks.ndjson`), rotated to
-/// `rust-live-ticks-YYYYMMDD.ndjson` at the IST day boundary — mirrors the
-/// sidecar's rotation so the parity comparer sees symmetrical archives.
-pub const GROWW_NATIVE_SHADOW_NDJSON_PATH: &str = "data/groww/rust-live-ticks.ndjson";
-
+// (2026-07-15: GROWW_NATIVE_SHADOW_NDJSON_PATH deleted — the shadow client
+// producer was deleted with the Groww live feed.)
 /// First reconnect delay for the native shadow client (bounded expo backoff).
 pub const GROWW_NATIVE_RECONNECT_BASE_SECS: u64 = 5;
 
@@ -5100,21 +5087,7 @@ mod tests {
     #[test]
     fn test_groww_native_constants_pinned() {
         assert_eq!(GROWW_SOCKET_URL, "wss://socket-api.groww.in");
-        assert_eq!(
-            GROWW_SOCKET_TOKEN_URL,
-            "https://api.groww.in/v1/api/apex/v1/socket/token/create/"
-        );
-        assert!(GROWW_SOCKET_TOKEN_URL.starts_with("https://"));
         assert_eq!(GROWW_DATA_DIR, "data/groww");
-        assert_eq!(
-            GROWW_NATIVE_SHADOW_NDJSON_PATH,
-            "data/groww/rust-live-ticks.ndjson"
-        );
-        assert!(GROWW_NATIVE_SHADOW_NDJSON_PATH.starts_with(GROWW_DATA_DIR));
-        assert_ne!(
-            GROWW_NATIVE_SHADOW_NDJSON_PATH, "data/groww/live-ticks.ndjson",
-            "shadow capture must never collide with the sidecar's file"
-        );
         assert_eq!(GROWW_NATIVE_RECONNECT_BASE_SECS, 5);
         assert_eq!(GROWW_NATIVE_RECONNECT_MAX_SECS, 60);
         assert!(GROWW_NATIVE_RECONNECT_BASE_SECS <= GROWW_NATIVE_RECONNECT_MAX_SECS);

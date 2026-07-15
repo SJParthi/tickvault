@@ -66,16 +66,16 @@ fn test_production_locks_dry_run_no_real_orders() {
 }
 
 #[test]
-fn test_production_groww_live_dhan_rest_only() {
-    // Operator directive 2026-07-13 (verbatim, relayed via the coordinator
-    // session): "now remove this entire Dhan live websocket feed instruments
-    // subscription even entire live websocket feed itself... As of now only
-    // Groww and Dhan historical api pull as we discussed last night along
-    // with option chain."
+fn test_production_rest_only_no_live_feeds() {
+    // Operator directive 2026-07-15 (relayed via the coordinator session):
+    // "remove the whole Groww live feed; keep only spot 1m and option chain
+    // for both brokers" — the runtime is REST-ONLY for BOTH brokers.
     //
-    // SUPERSEDES the 2026-06-30 both-feeds lock (the retired
-    // `test_production_runs_both_feeds`): the Dhan live WS lane is OFF by
-    // default; Groww is THE live feed; the Dhan REST retained surface
+    // SUPERSEDES the 2026-07-13 Groww-is-the-live-feed pin (the renamed
+    // `test_production_groww_live_dhan_rest_only`), which itself SUPERSEDED
+    // the 2026-06-30 both-feeds lock (the retired
+    // `test_production_runs_both_feeds`). The 2026-07-13 Dhan half stands:
+    // the Dhan live WS lane is OFF; the Dhan REST retained surface
     // (token/auth stack, spot_1m_rest, option_chain_1m + entitlement probe,
     // REST canary) runs WITHOUT the WS lane via
     // crates/app/src/dhan_rest_stack.rs. Phase A is a config flip +
@@ -94,9 +94,15 @@ fn test_production_groww_live_dhan_rest_only() {
          resurrects the retired lane (operator directive 2026-07-13)"
     );
     assert!(
-        prod.contains("groww_enabled = true"),
-        "production.toml must keep the Groww feed enabled — Groww is THE \
-         live feed (operator directive 2026-07-13)"
+        prod.contains("groww_enabled = false"),
+        "production.toml must keep the Groww live feed disabled — the runtime \
+         is REST-only (operator directive 2026-07-15: remove the whole Groww \
+         live feed; keep only spot 1m and option chain for both brokers)"
+    );
+    assert!(
+        !prod.contains("groww_enabled = true"),
+        "production.toml must not re-enable the retired Groww live feed \
+         (operator directive 2026-07-15)"
     );
 
     // base.toml carries the same Dhan-off default so a TV_ENVIRONMENT=dev/

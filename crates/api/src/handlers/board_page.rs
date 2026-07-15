@@ -365,37 +365,11 @@ const BOARD_HTML: &str = r##"<!DOCTYPE html>
     card.appendChild(meta);
     return card;
   }
-  function rustCard(sh) {
-    var card = el("div", "card");
-    var head = el("div", "head", "🦀 RUST (trial copy)");
-    var live = el("span", "live");
-    live.appendChild(el("span", "dot"));
-    live.appendChild(document.createTextNode("CAPTURING"));
-    head.appendChild(live);
-    card.appendChild(head);
-    var big = el("div", "bignum");
-    var num = el("span"); num.id = "ticks-rust";
-    big.appendChild(num);
-    big.appendChild(document.createTextNode(" "));
-    big.appendChild(el("small", null, sh.lines !== null ? "ticks captured today" : "MB captured today"));
-    card.appendChild(big);
-    countUp(num, sh.lines !== null ? sh.lines : Number(fmtMb(sh.file_bytes)));
-    var meta = el("div", "meta");
-    var span = el("span", null, "Last write ");
-    span.appendChild(el("b", "lastTick", fmtAge(sh.modified_age_secs)));
-    meta.appendChild(span);
-    if (sh.lines === null) {
-      meta.appendChild(el("span", null, "line count skipped (file over the read cap) — size shown instead"));
-    }
-    card.appendChild(meta);
-    return card;
-  }
   function renderFeeds(d) {
     var box = document.getElementById("feedCards");
     box.replaceChildren();
     var rows = (d.feeds && d.feeds.feeds) || [];
     rows.forEach(function (r) { box.appendChild(feedCard(r)); });
-    if (d.rust_shadow) box.appendChild(rustCard(d.rust_shadow));
     if (!box.firstChild) box.appendChild(el("div", "emptyNote", "No feed information yet."));
   }
 

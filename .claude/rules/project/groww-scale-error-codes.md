@@ -1,5 +1,12 @@
 # Groww Auto-Scale Ladder — Error Codes (GROWW-SCALE-01..05)
 
+> **⚠ RETIRED 2026-07-15 (Groww live feed deleted — operator Q1, received directly in this session: *"remove
+> the whole Groww live feed; keep only spot 1m and option chain for both brokers; go."*):** the auto-scale
+> ladder, the shard cutter, the fleet lock, and every GROWW-SCALE-01..05 emit path are DELETED with the
+> Groww live feed (the experiment was already dead per `groww-scale-aws-lockout-2026-07-06.md`; the code is
+> now deleted outright, not dormant). The `GrowwScale0*` ErrorCode variants are RETAINED until the post-C4
+> variant sweep (this file keeps satisfying the cross-ref test). Content below retained as historical audit.
+
 > **Authority:** CLAUDE.md > `operator-charter-forever.md` §C/§F >
 > `groww-second-feed-scope-2026-06-19.md` §34 (the multi-connection
 > authorization + tiers) > this file.
