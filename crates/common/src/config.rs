@@ -1212,6 +1212,21 @@ impl CadenceConfig {
                 self.expiry_retry_interval_ms
             );
         }
+        // R3-F1 belt (a), 2026-07-15: the in-session retry waves anchor
+        // at the :30-of-minute instant on a per-minute grid, so the
+        // interval must not exceed one minute — a slower interval lets
+        // the LAST pre-session wake sleep the PLAIN interval straight
+        // into the first session cycle's burst window (e.g. 65s @
+        // 09:14:58 -> 09:16:03, the spot-group instant -> one false
+        // gate_deferred_nominal page at session entry). Belt (b) — the
+        // runner-side transitional-wave clamp
+        // (`expiry_wave_anchor_active`) — survives validation drift.
+        if self.expiry_retry_interval_ms > 60_000 {
+            bail!(
+                "cadence.expiry_retry_interval_ms ({}) must be <= 60000 (one minute): retry waves anchor on the per-minute :30 grid, and a slower interval would sleep a transitional wave into the session-entry burst window",
+                self.expiry_retry_interval_ms
+            );
+        }
         if self.expiry_deadline_secs_of_day_ist >= 86_400 {
             bail!(
                 "cadence.expiry_deadline_secs_of_day_ist ({}) must be < 86400 (an IST seconds-of-day instant)",
@@ -5657,6 +5672,16 @@ mod tests {
             err.to_string().contains("expiry_retry_interval_ms"),
             "unexpected error: {err}"
         );
+        // R3-F1 belt (a): a burst-window-capable interval (> one
+        // minute) is refused — 65s @ a 09:14:58 wake would land the
+        // last pre-era wave at 09:16:03, the spot-group instant.
+        cfg.expiry_retry_interval_ms = 65_000;
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("expiry_retry_interval_ms"),
+            "unexpected error: {err}"
+        );
+        // The one-minute ceiling itself (the base.toml default) is legal.
         cfg.expiry_retry_interval_ms = 60_000;
         cfg.expiry_deadline_secs_of_day_ist = 86_400;
         let err = cfg.validate().unwrap_err();

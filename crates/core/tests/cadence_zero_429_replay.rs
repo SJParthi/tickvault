@@ -20,10 +20,17 @@
 //!   chain gates were independent and their SUM could hit 5-6/sec,
 //!   zero headroom vs Dhan's 5/sec; R4 2026-07-15: the
 //!   unresolved-expiry scenario arm drives `try_acquire_expiry` through
-//!   the SAME ledger, so the combined assertion is honest — and the
-//!   mid-minute (:30) wave anchor means expiry waves NEVER collide with
-//!   the burst window: zero nominal deferrals hold with waves active,
-//!   and every wave fires at its anchor with zero deferral)
+//!   the SAME ledger, so the combined assertion is honest. HONEST SCOPE
+//!   (R3-F2, 2026-07-15): the zero-deferral/zero-denial asserts do NOT
+//!   structurally prove anchor safety — a burst-window anchor value
+//!   would push the sim clock past the boundary and
+//!   `next_joinable_boundary` would SKIP the collided cycle entirely,
+//!   so the collision could never reach those asserts. Anchor safety
+//!   rests on the literal :30 phase pins in this file + the gate-level
+//!   collision doc test
+//!   (`test_cadence_gate_expiry_fire_in_burst_window_defers_fourth_nominal_spot`);
+//!   this arm proves the anchored waves share the combined ledger and
+//!   fire at their anchor)
 //! - zero gate denials on nominal slots (on-time dispatch)
 //! - exactly 1 decision per (lane, cycle) — the latch admits every fresh
 //!   pair and refuses every repeat
@@ -766,10 +773,18 @@ proptest! {
             // The unresolved-expiry scenario arm (R4, 2026-07-15): one
             // resolution retry wave per minute at the REAL pure fn's
             // mid-minute anchor, driven through the SAME gates + ledger.
-            // With the R1 anchor the wave can never collide with a burst
-            // fire: it must acquire at its anchor with ZERO deferral (and
-            // the zero-nominal-denial assert below now holds WITH expiry
-            // waves active).
+            // HONEST SCOPE (R3-F2, 2026-07-15): the zero-deferral assert
+            // below (and the run-level zero-nominal-denial assert) do
+            // NOT structurally prove anchor safety — a burst-window
+            // anchor value would advance the sim clock past the
+            // boundary and `next_joinable_boundary` would SKIP the
+            // collided cycle entirely, so the collision class can never
+            // reach these asserts. Anchor safety rests on the literal
+            // :30 phase pin below + the gate-level collision doc test
+            // (`test_cadence_gate_expiry_fire_in_burst_window_defers_fourth_nominal_spot`).
+            // What THIS arm proves: the anchored waves flow through the
+            // SAME combined ledger (the L1 budget honesty) and fire at
+            // their anchor instant.
             if expiry_unresolved {
                 let wave_at = next_expiry_wave_instant_ms(clock.wall_ms, 60_000, true);
                 prop_assert_eq!(
