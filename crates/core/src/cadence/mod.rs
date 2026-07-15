@@ -64,6 +64,7 @@
 pub mod assembly;
 pub mod decision;
 pub mod executor;
+pub mod expiry;
 pub mod gate;
 pub mod ladder;
 pub mod runner;
@@ -71,6 +72,12 @@ pub mod schedule;
 
 pub use executor::{
     CadenceExecutor, CadenceFetchError, ChainFetchOk, ChainFetchRequest, DryRunLoggingExecutor,
-    ExpiryResolver, SpotFetchRequest, SpotSnapshot, SpotTarget, StubExpiryResolver,
+    ExpiryListRequest, ExpiryResolver, SpotFetchRequest, SpotSnapshot, SpotTarget,
+    StubExpiryResolver,
 };
+pub use expiry::{
+    DayLockedExpiryStore, ExpiryDate, ExpiryPolicy, global_expiry_store, policy_for,
+    resolve_policy_expiry,
+};
+pub use gate::{DhanGates, global_dhan_gates, init_global_dhan_gates};
 pub use runner::{CadenceRunnerDeps, SystemCadenceClock, spawn_supervised_cadence_runner};

@@ -53,6 +53,7 @@ use tickvault_core::cadence::ladder::{
     CycleVerdict, GROWW_SHAPE_MAX_STEP, SPOT_CONCURRENCY_MAX_STEP, StreakLadder,
     failure_arms_ladder, may_retry_in_cycle, min_spot_step_for_cap, next_rung,
 };
+use tickvault_core::cadence::runner::{CycleAction, GrowwWaveLeg, build_cycle_events};
 use tickvault_core::cadence::schedule::{
     CADENCE_RETRY_LATENCY_ALLOWANCE_MS, CycleSlots, build_cycle_slots, next_joinable_boundary,
 };
@@ -241,7 +242,7 @@ fn sim_gated_chain_fire(
         *cycle_dispatched_late = true;
     }
     loop {
-        match gates.try_acquire_chain(underlying, clock.mono()) {
+        match gates.try_acquire_chain(underlying, None, clock.mono()) {
             GateVerdict::Acquired => {
                 ledger.per_underlying[underlying.index()].push(clock.wall_ms);
                 ledger.chain_global.push(clock.wall_ms);
@@ -380,23 +381,25 @@ fn sim_dhan_cycle(
                     arming = true;
                 }
                 // One gated retry admitted onto the retry grid, if it can
-                // land — fired AFTER the remaining primaries (below).
-                if next_retry_slot < slots.dhan_chain_retry_slots_ms.len()
-                    && may_retry_in_cycle(
+                // land — fired AFTER the remaining primaries (below). The
+                // admission tests the ACTUAL insertion instant (F9,
+                // 2026-07-15: a past grid slot clamps forward to `now`,
+                // exactly as the runner's `retry_at.max(now_wall)` does).
+                if next_retry_slot < slots.dhan_chain_retry_slots_ms.len() {
+                    let retry_fire =
+                        slots.dhan_chain_retry_slots_ms[next_retry_slot].max(clock.wall_ms);
+                    if may_retry_in_cycle(
                         &err,
                         retries_used_chain[i],
                         cfg.in_cycle_retry_max,
-                        slots.dhan_chain_retry_slots_ms[next_retry_slot],
+                        retry_fire,
                         CADENCE_RETRY_LATENCY_ALLOWANCE_MS,
                         slots.dhan_cutoff_ms,
-                    )
-                {
-                    retries_used_chain[i] += 1;
-                    retry_queue.push((
-                        slots.dhan_chain_retry_slots_ms[next_retry_slot],
-                        SimRetry::Chain { underlying_idx: i },
-                    ));
-                    next_retry_slot += 1;
+                    ) {
+                        retries_used_chain[i] += 1;
+                        retry_queue.push((retry_fire, SimRetry::Chain { underlying_idx: i }));
+                        next_retry_slot += 1;
+                    }
                 }
             }
         }
@@ -1121,4 +1124,233 @@ fn test_cadence_guarded_fold_reads_source_feed_slot_and_rejects_stale_minute() {
     );
     assert_eq!(stale.rows, 0);
     assert!(stale.all_unknown(), "stale snapshot = unusable, surfaced");
+}
+
+// ---------------------------------------------------------------------------
+// Verifier F3 (2026-07-15): the dispatch-order core driven DIRECTLY
+// ---------------------------------------------------------------------------
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(128))]
+
+    /// `build_cycle_events` is the runner's REAL dispatch-order core
+    /// (extracted per F3 — the pre-fix proptest simulated the ordering
+    /// through a hand-kept mirror that could drift silently). Driving it
+    /// directly across every (rung, spot step, groww shape, lane-enable)
+    /// permutation pins: time-sortedness, the exact per-lane event
+    /// multiset vs the slot tables, nominal marking, and cutoff-last
+    /// ordering per lane. A reorder in run_cycle's event construction now
+    /// fails HERE instead of drifting past the sim.
+    #[test]
+    fn proptest_cadence_build_cycle_events_dispatch_order_parity(
+        boundary_min in 0_u32..374,
+        rung in 0_u8..=5,
+        spot_step in 0_u8..=3,
+        groww_step in 0_u8..=2,
+        dhan_enabled in any::<bool>(),
+        groww_enabled in any::<bool>(),
+    ) {
+        let cfg = CadenceConfig::default();
+        let boundary = 9 * 3600 + 16 * 60 + boundary_min * 60;
+        let slots = build_cycle_slots(boundary, rung, spot_step, groww_step, &cfg);
+        let events = build_cycle_events(&slots, dhan_enabled, groww_enabled);
+
+        // Time-sorted, always.
+        for w in events.windows(2) {
+            prop_assert!(w[0].0 <= w[1].0, "events must be time-sorted");
+        }
+        // Exact per-lane multiset parity vs the slot tables.
+        let mut dhan_chain_targets: Vec<i64> = Vec::new();
+        for (ms, a) in &events {
+            if let CycleAction::DhanChain {
+                underlying_idx,
+                nominal,
+            } = a
+            {
+                prop_assert!(*nominal, "primaries are nominal");
+                prop_assert_eq!(
+                    *ms,
+                    slots.dhan_chain_slots_ms[*underlying_idx],
+                    "chain event target must equal its slot"
+                );
+                dhan_chain_targets.push(*ms);
+            }
+        }
+        let dhan_spot_count = events
+            .iter()
+            .filter(|(_, a)| matches!(a, CycleAction::DhanSpot { nominal: true, .. }))
+            .count();
+        let dhan_cutoffs = events
+            .iter()
+            .filter(|(_, a)| matches!(a, CycleAction::DhanCutoff))
+            .count();
+        if dhan_enabled {
+            prop_assert_eq!(dhan_chain_targets.len(), 3, "3 chain primaries");
+            prop_assert_eq!(dhan_spot_count, 4, "4 spot singles");
+            prop_assert_eq!(dhan_cutoffs, 1, "one Dhan cutoff");
+            // The cutoff is the lane's LAST event.
+            let last_dhan = events
+                .iter()
+                .rev()
+                .find(|(_, a)| {
+                    matches!(
+                        a,
+                        CycleAction::DhanChain { .. }
+                            | CycleAction::DhanSpot { .. }
+                            | CycleAction::DhanCutoff
+                    )
+                })
+                .map(|(_, a)| *a);
+            prop_assert_eq!(last_dhan, Some(CycleAction::DhanCutoff));
+        } else {
+            prop_assert_eq!(
+                dhan_chain_targets.len() + dhan_spot_count + dhan_cutoffs,
+                0,
+                "a disabled Dhan lane contributes NO events"
+            );
+        }
+        let groww_waves: Vec<(i64, GrowwWaveLeg)> = events
+            .iter()
+            .filter_map(|(ms, a)| match a {
+                CycleAction::GrowwWave { leg } => Some((*ms, *leg)),
+                _ => None,
+            })
+            .collect();
+        let groww_verdicts = events
+            .iter()
+            .filter(|(_, a)| matches!(a, CycleAction::GrowwVerdict))
+            .count();
+        let groww_cutoffs = events
+            .iter()
+            .filter(|(_, a)| matches!(a, CycleAction::GrowwCutoff))
+            .count();
+        if groww_enabled {
+            prop_assert_eq!(groww_waves.len(), 3, "three Groww waves");
+            prop_assert_eq!(groww_verdicts, 1, "one Groww verdict");
+            prop_assert_eq!(groww_cutoffs, 1, "one Groww cutoff");
+            // Wave targets equal their slot-table instants, per leg.
+            for (ms, leg) in &groww_waves {
+                let expected = match leg {
+                    GrowwWaveLeg::Chains => slots.groww_chain_wave_ms,
+                    GrowwWaveLeg::CoreSpots => slots.groww_spot_wave_ms,
+                    GrowwWaveLeg::VixSpot => slots.groww_vix_wave_ms,
+                };
+                prop_assert_eq!(*ms, expected, "wave target must equal its slot");
+            }
+            // The verdict sits AT/AFTER every wave; the cutoff last.
+            let max_wave = groww_waves.iter().map(|(ms, _)| *ms).max().unwrap_or(0);
+            prop_assert!(slots.groww_verdict_ms >= max_wave);
+            let last_groww = events
+                .iter()
+                .rev()
+                .find(|(_, a)| {
+                    matches!(
+                        a,
+                        CycleAction::GrowwWave { .. }
+                            | CycleAction::GrowwVerdict
+                            | CycleAction::GrowwCutoff
+                    )
+                })
+                .map(|(_, a)| *a);
+            prop_assert_eq!(last_groww, Some(CycleAction::GrowwCutoff));
+        } else {
+            prop_assert_eq!(
+                groww_waves.len() + groww_verdicts + groww_cutoffs,
+                0,
+                "a disabled Groww lane contributes NO events"
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// LADDER-INTERACTION (2026-07-15): anchor rung × concurrency step
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_cadence_anchor_and_concurrency_ladders_never_oscillate_against_each_other() {
+    // A failing streak that BOTH shifts the anchor rung AND steps the
+    // spot concurrency down, then a clean streak that recovers both:
+    // the two ladders must recover MONOTONICALLY (each moves toward home
+    // one condition at a time — neither ladder's motion re-dirties the
+    // other), and the step-back evaluates against the SHIFTED anchor —
+    // every intermediate (rung, step) pair builds a LEGAL slot table
+    // (spot groups inside the lane cutoff, chains before spots' windows
+    // close, all inside the cycle).
+    let cfg = CadenceConfig::default();
+    let spot_floor = min_spot_step_for_cap(cfg.spot_window_cap);
+    let mut rung = 0_u8;
+    let mut spot_ladder = StreakLadder::starting_at(spot_floor);
+    let boundary = 36_000_u32; // 10:00:00
+    let mut rung_history = vec![rung];
+    let mut step_history = vec![spot_ladder.step];
+
+    let assert_legal = |rung: u8, step: u8| {
+        let slots = build_cycle_slots(boundary, rung, step, 0, &cfg);
+        // Chains strictly ordered, spots inside the Dhan cutoff, the
+        // deepest spot group + its window still lands before the cutoff.
+        assert!(slots.dhan_chain_slots_ms[0] < slots.dhan_chain_slots_ms[1]);
+        assert!(slots.dhan_chain_slots_ms[1] < slots.dhan_chain_slots_ms[2]);
+        for slot in &slots.dhan_spot_slots_ms {
+            assert!(
+                *slot <= slots.dhan_cutoff_ms,
+                "(rung {rung}, step {step}): spot slot {slot} past cutoff {}",
+                slots.dhan_cutoff_ms
+            );
+        }
+    };
+
+    // 6 consecutive failing cycles: every cycle arms the anchor ladder
+    // (rung +1 toward the floor) AND marks the spot cycle dirty (step +1
+    // after each 2-streak).
+    for _ in 0..6 {
+        rung = next_rung(rung, CycleVerdict::DhanFailed, cfg.dhan_ladder_max_rungs);
+        let _ = spot_ladder.advance(
+            true,
+            cfg.concurrency_degrade_after_dirty_cycles,
+            cfg.concurrency_recover_after_clean_cycles,
+            spot_floor,
+            SPOT_CONCURRENCY_MAX_STEP,
+        );
+        rung_history.push(rung);
+        step_history.push(spot_ladder.step);
+        assert_legal(rung, spot_ladder.step);
+    }
+    assert_eq!(rung, 5, "anchor at the floor after 6 failing cycles");
+    assert_eq!(spot_ladder.step, 3, "concurrency fully sequential (6/2)");
+
+    // 20 consecutive clean cycles: BOTH ladders walk home and STAY there
+    // — recovery is monotone (never re-degrades without a dirty cycle:
+    // the ladders read INDEPENDENT signals, so one ladder's motion can
+    // never re-arm the other).
+    for _ in 0..20 {
+        rung = next_rung(rung, CycleVerdict::Clean, cfg.dhan_ladder_max_rungs);
+        let _ = spot_ladder.advance(
+            false,
+            cfg.concurrency_degrade_after_dirty_cycles,
+            cfg.concurrency_recover_after_clean_cycles,
+            spot_floor,
+            SPOT_CONCURRENCY_MAX_STEP,
+        );
+        rung_history.push(rung);
+        step_history.push(spot_ladder.step);
+        // The step-back evaluates against the SHIFTED anchor: whatever
+        // (rung, step) pair this clean cycle lands on, the NEXT cycle's
+        // slot table (built from BOTH) is legal.
+        assert_legal(rung, spot_ladder.step);
+    }
+    assert_eq!(rung, 0, "anchor recovered home");
+    assert_eq!(spot_ladder.step, spot_floor, "concurrency recovered home");
+    // Monotone recovery: once the failing streak ends, neither history
+    // ever increases again (no cross-ladder oscillation).
+    let fail_end = 7; // index of the first clean-cycle entry
+    for w in rung_history[fail_end..].windows(2) {
+        assert!(
+            w[1] <= w[0],
+            "anchor rung re-degraded during clean recovery"
+        );
+    }
+    for w in step_history[fail_end..].windows(2) {
+        assert!(w[1] <= w[0], "spot step re-degraded during clean recovery");
+    }
 }
