@@ -20,6 +20,7 @@ ROOT="${1:-$(cd "$(dirname "$0")/.." && pwd)}"
 FILES=(
   "$ROOT/.github/workflows/deploy-aws.yml"
   "$ROOT/.github/workflows/deploy-aws-after-close.yml"
+  "$ROOT/.github/workflows/downsize-instance.yml"
 )
 
 rc=0

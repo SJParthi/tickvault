@@ -127,9 +127,13 @@ kills are not re-reported.
    tickvault.
 3. Cross-check host memory pressure — the r8g.large 16 GiB budget
    (`aws-budget.md` / `daily-universe-scope-expansion-2026-05-27.md` §7) has
-   ~7.8 GB headroom, so a real OOM points at a leak or an unexpected working-set
-   spike; correlate with `tv_subsystem_memory_estimated_bytes{component=…}` +
-   the host `mem_used_high` alarm.
+   ~7.8 GB headroom *(SUPERSEDED 2026-07-15 → t4g.medium 4 GiB per §7 Quote 8:
+   budgeted headroom is only ~0.9–1.7 GB, Assumed until live-measured — an OOM
+   is now plausible from a plain working-set overrun, not just a leak; t4g.large
+   8 GiB is the rip-cord)*, so a real OOM points at a leak or an unexpected
+   working-set spike; correlate with
+   `tv_subsystem_memory_estimated_bytes{component=…}` + the host
+   `mem_used_high` alarm.
 4. A repeating PROC-01 (OOM-loop) during market hours needs operator action —
    the box will keep dying; investigate the offending subsystem before it
    starves the feeds.
