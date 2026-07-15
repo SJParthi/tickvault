@@ -1,6 +1,6 @@
 //! Dhan API endpoint coverage tests.
 //!
-//! Verifies the 43 known Dhan API endpoint URLs/path templates: 19
+//! Verifies the 45 known Dhan API endpoint URLs/path templates: 19
 //! constants-backed paths (18 with LIVE consumers + 1 ORPHAN —
 //! `/charts/historical`, whose consumers were deleted by the merged Phase
 //! C-3 #1569; round-5 truth-sync 2026-07-15, MEASURED by
@@ -14,9 +14,16 @@
 //! invisible, so a new endpoint in either shape dodged the pinned-set
 //! equality; the residual uncovered shapes are disclosed on
 //! `extract_inline_url_templates`), 1 overlap (`/positions`),
-//! 2 WebSocket URLs, and 4 intentionally skipped endpoints. Prevents
-//! endpoint drift where new endpoints are added to api_client.rs using
-//! inline strings without this ledger (and its constants) being updated.
+//! 2 live WebSocket URLs, 2 ORPHANED depth WebSocket URL constants
+//! (round-8 truth-sync 2026-07-15: `DHAN_TWENTY_DEPTH_WS_BASE_URL` +
+//! `DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL` are RETAINED pub consts in
+//! constants.rs with ZERO consumers since AWS-lifecycle PR #4 deleted the
+//! depth infrastructure — the prior header narrated the CONSTANTS
+//! THEMSELVES deleted and counted them nowhere; MEASURED by
+//! `test_depth_ws_url_constants_are_orphaned`), and 4 intentionally
+//! skipped endpoints — 45 in total. Prevents endpoint drift where new
+//! endpoints are added to api_client.rs using inline strings without this
+//! ledger (and its constants) being updated.
 //!
 //! Reference: docs/dhan-ref/*.md (21 reference files)
 
@@ -55,10 +62,16 @@ use tickvault_common::constants::{
     DHAN_USER_PROFILE_PATH,
 };
 
-// PR #4 (2026-05-19): The `DHAN_TWENTY_DEPTH_WS_BASE_URL` +
-// `DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL` constants were deleted alongside the
-// 20/200-level depth WebSocket infrastructure per the 4-IDX_I LOCKED_UNIVERSE
-// operator lock (.claude/rules/project/websocket-connection-scope-lock.md).
+// PR #4 (2026-05-19) deleted the 20/200-level depth WebSocket
+// INFRASTRUCTURE per the 4-IDX_I LOCKED_UNIVERSE operator lock
+// (.claude/rules/project/websocket-connection-scope-lock.md). The
+// `DHAN_TWENTY_DEPTH_WS_BASE_URL` + `DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL`
+// constants themselves were RETAINED (constants.rs) and are ORPHANED —
+// zero consumers anywhere (round-8 truth-sync 2026-07-15: this comment
+// previously narrated the constants deleted while both are live pub
+// consts on the tree — the mirror image of the round-1 option-chain
+// drift). Measured by `test_depth_ws_url_constants_are_orphaned` below;
+// depth re-introduction is FORBIDDEN without a scope-lock rule edit FIRST.
 
 // ---------------------------------------------------------------------------
 // Test: All Dhan REST endpoint constants are defined and have correct paths
@@ -261,10 +274,14 @@ fn test_all_dhan_rest_endpoint_constants_defined() {
 /// 1. Market feed (config-based): `wss://api-feed.dhan.co`
 /// 2. Order update (config-based): `wss://api-order-update.dhan.co`
 ///
-/// The previously-tested 20/200-level depth WS URL constants were deleted
-/// alongside the depth pipelines. The two URLs below live in `DhanConfig`
-/// (not in `constants.rs`) because they are per-environment configurable,
-/// so we verify them via a source scan of `config.rs`.
+/// The previously-tested 20/200-level depth WS URL CONSTANTS still exist
+/// in constants.rs but are ORPHANED — their consumers (the depth
+/// pipelines) were deleted by PR #4; see
+/// `test_depth_ws_url_constants_are_orphaned` (round-8 truth-sync
+/// 2026-07-15 — this doc previously narrated the constants deleted). The
+/// two LIVE URLs below live in `DhanConfig` (not in `constants.rs`)
+/// because they are per-environment configurable, so we verify them via a
+/// source scan of `config.rs`.
 #[test]
 fn test_all_websocket_urls_defined() {
     let config_source = include_str!("../src/config.rs");
@@ -644,12 +661,20 @@ fn test_inline_template_extractor_self_test() {
 /// added 2026-07-14 and the 2 option-chain constants, live since the
 /// 2026-07-12 §8 rebuild) + 19 (inline in api_client.rs, MEASURED) − 1
 /// (the /positions overlap) = 37
-/// Plus 2 WebSocket URLs (the two-WS lock — `test_all_websocket_urls_defined`
+/// Plus 2 LIVE WebSocket URLs (the two-WS lock —
+/// `test_all_websocket_urls_defined`
 /// in THIS file; the round-2 scalar 4 contradicted it) = 39 implemented
 /// URLs/templates — of which `/charts/historical` is ORPHANED (constant
 /// retained, ZERO consumers since the merged Phase C-3 #1569 — round-5
 /// truth-sync 2026-07-15), so 38 have live senders/consumers today.
-/// Grand ledger total: 43 = 39 implemented + 4 intentionally skipped
+/// Plus 2 ORPHANED depth WebSocket URL constants (round-8 truth-sync
+/// 2026-07-15: `DHAN_TWENTY_DEPTH_WS_BASE_URL` +
+/// `DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL` — retained pub consts, ZERO
+/// consumers since PR #4; NOT in the live websocket_count, which the
+/// two-WS lock pins at 2 CONNECTIONS; measured by
+/// `test_depth_ws_url_constants_are_orphaned`).
+/// Grand ledger total: 45 = 39 implemented + 2 orphaned depth WS
+/// constants + 4 intentionally skipped
 #[test]
 fn test_oms_inline_endpoint_paths_documented() {
     // --- Orders (docs/dhan-ref/07-orders.md) ---
@@ -867,10 +892,20 @@ fn test_oms_inline_endpoint_paths_documented() {
     // + 2 WebSocket endpoints (the two-WS lock —
     //   test_all_websocket_urls_defined; the round-2 scalar 4 contradicted
     //   that test in this same file)
+    // + 2 ORPHANED depth WebSocket URL constants (round-8 truth-sync
+    //   2026-07-15: DHAN_TWENTY_DEPTH_WS_BASE_URL +
+    //   DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL are RETAINED pub consts in
+    //   constants.rs with ZERO consumers since PR #4 deleted the depth
+    //   infrastructure — the prior census narrated them "deleted" and
+    //   counted these two KNOWN wss:// endpoints nowhere; measured by
+    //   test_depth_ws_url_constants_are_orphaned. Deliberately NOT in the
+    //   LIVE websocket_count — the two-WS lock pins 2 CONNECTIONS forever,
+    //   and depth re-introduction requires a scope-lock rule edit FIRST.)
     let constants_rest_count: usize = 19;
     let inline_template_count = inline_templates.len();
     let overlap_paths: usize = 1; // "/positions"
     let websocket_count: usize = 2;
+    let orphaned_depth_ws_constant_count: usize = 2;
     let skipped_count: usize = 4;
 
     let unique_path_templates = constants_rest_count + inline_template_count - overlap_paths;
@@ -888,11 +923,13 @@ fn test_oms_inline_endpoint_paths_documented() {
          constant retained, zero consumers since Phase C-3 #1569)"
     );
 
-    // Plus the 4 intentionally skipped = total Dhan API endpoints known
-    let total_known = total_implemented + skipped_count;
+    // Plus the 2 orphaned depth WS URL constants + the 4 intentionally
+    // skipped = total Dhan API endpoints known
+    let total_known = total_implemented + orphaned_depth_ws_constant_count + skipped_count;
     assert_eq!(
-        total_known, 43,
-        "43 total known Dhan API endpoint URLs/templates (39 implemented + 4 skipped)"
+        total_known, 45,
+        "45 total known Dhan API endpoint URLs/templates (39 implemented + \
+         2 orphaned depth WS constants + 4 skipped)"
     );
 }
 
@@ -977,8 +1014,11 @@ fn test_path_constants_are_paths_not_full_urls() {
 }
 
 // PR #4 (2026-05-19): `test_depth_websocket_urls_correct_hostnames` retired
-// alongside the deleted 20/200-level depth WebSocket constants. See the
-// header comment after the imports for the operator lock reference.
+// alongside the deleted 20/200-level depth WebSocket INFRASTRUCTURE (the
+// URL constants themselves remain, ORPHANED — see
+// `test_depth_ws_url_constants_are_orphaned` below; round-8 truth-sync
+// 2026-07-15). See the header comment after the imports for the operator
+// lock reference.
 
 // ---------------------------------------------------------------------------
 // Test: /charts/historical is ORPHANED post-Phase-C-3 (measured, not narrated)
@@ -1068,6 +1108,109 @@ fn test_charts_historical_constant_is_orphaned_post_phase_c3() {
          #1569 deleted its consumers) — a new consumer/code mention must \
          update this ledger's orphan annotations (orphan -> live) in the \
          same PR. Found:\n{}",
+        consumers.join("\n")
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test: the 2 depth WS URL constants are ORPHANED (measured, not narrated)
+// ---------------------------------------------------------------------------
+
+/// Production region of a source file: everything before the
+/// `#[cfg(test)]\nmod tests` module marker (mirror of the gate-guard
+/// splitter in `crates/trading/tests/conditional_gate_guard.rs`). Needed
+/// here because `crates/core/src/websocket/tls.rs` legitimately carries a
+/// `full-depth-api.dhan.co` literal inside a TEST assert message (the
+/// 2026-04-23 ALPN regression pin) — a test string cannot open a socket.
+fn production_region(source: &str) -> &str {
+    match source.find("#[cfg(test)]\nmod tests") {
+        Some(index) => &source[..index],
+        None => source,
+    }
+}
+
+/// Pins the ORPHAN status of the two depth WebSocket URL constants
+/// (round-8 ledger truth-sync, 2026-07-15): `DHAN_TWENTY_DEPTH_WS_BASE_URL`
+/// + `DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL` are RETAINED pub consts
+/// (constants.rs) whose consumers were deleted by AWS-lifecycle PR #4
+/// (2026-05-19, the depth-20/200 infrastructure removal). The prior ledger
+/// narrated the CONSTANTS THEMSELVES deleted — the mirror image of the
+/// round-1 confirmed drift (option-chain endpoints narrated "no longer
+/// implemented" while LIVE). This scan makes the orphan annotation
+/// SELF-TRUING, exactly like
+/// `test_charts_historical_constant_is_orphaned_post_phase_c3`: a new
+/// consumer (a constant reference, or an inline depth hostname literal on
+/// a production code line) fails HERE until the annotations move
+/// orphan -> live in the same PR — and depth re-introduction is separately
+/// FORBIDDEN FOREVER by
+/// `.claude/rules/project/websocket-connection-scope-lock.md`, which
+/// requires a rule edit BEFORE any such code, so a trip here is a
+/// scope-lock violation signal, not a formality. Deleting the constants
+/// instead fails the value assertions below (and the 45-endpoint census)
+/// until the counts move. FULL-LINE comment lines are excluded
+/// (ws_event_types.rs' WsType doc comments legitimately MENTION the depth
+/// URLs) and test modules are excluded via [`production_region`] (tls.rs'
+/// ALPN assert message). A trailing-comment mention on a code line would
+/// over-count and fail LOUDLY — the conservative direction for an orphan
+/// pin.
+#[test]
+fn test_depth_ws_url_constants_are_orphaned() {
+    use tickvault_common::constants::{
+        DHAN_TWENTY_DEPTH_WS_BASE_URL, DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL,
+    };
+    // The constants EXIST (retained, wss://, distinct depth hosts) — the
+    // census's 2 orphaned-depth-WS entries are these, reproducibly.
+    assert_eq!(
+        DHAN_TWENTY_DEPTH_WS_BASE_URL, "wss://depth-api-feed.dhan.co/twentydepth",
+        "20-level depth WS URL constant (ORPHANED — zero consumers)"
+    );
+    assert_eq!(
+        DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL, "wss://full-depth-api.dhan.co",
+        "200-level depth WS URL constant (ORPHANED — zero consumers; root \
+         path per the 2026-04-23 Python SDK verification)"
+    );
+
+    let mut files = Vec::new();
+    collect_workspace_src_files(Path::new("../../crates"), &mut files);
+    assert!(
+        files.len() > 50,
+        "the depth-orphan scan must see the workspace production tree \
+         (found {} files)",
+        files.len()
+    );
+    const DEPTH_NEEDLES: [&str; 4] = [
+        "DHAN_TWENTY_DEPTH_WS_BASE_URL",
+        "DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL",
+        "depth-api-feed.dhan.co",
+        "full-depth-api.dhan.co",
+    ];
+    let mut consumers = Vec::new();
+    for file in files {
+        let path_text = file.to_string_lossy().replace('\\', "/");
+        // The declaration site itself — separator-anchored (the gate-guard
+        // round-5 lesson).
+        if path_text.ends_with("/common/src/constants.rs") {
+            continue;
+        }
+        let Ok(source) = fs::read_to_string(&file) else {
+            continue;
+        };
+        let has_code_mention = production_region(&source)
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .any(|line| DEPTH_NEEDLES.iter().any(|needle| line.contains(needle)));
+        if has_code_mention {
+            consumers.push(path_text);
+        }
+    }
+    assert!(
+        consumers.is_empty(),
+        "the 2 depth WS URL constants are ORPHANED (PR #4 deleted their \
+         consumers; depth is FORBIDDEN FOREVER per \
+         websocket-connection-scope-lock.md) — a new consumer/code mention \
+         requires the scope-lock rule edit FIRST and must update this \
+         ledger's orphan annotations (orphan -> live) in the same PR. \
+         Found:\n{}",
         consumers.join("\n")
     );
 }

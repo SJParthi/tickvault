@@ -21,6 +21,20 @@
 //!    latter two previously classified Read), and zero method/projection
 //!    sites on the field (round-7: `.clone_from(&true)` mutates through an
 //!    implicit auto-`&mut` with ZERO borrow token in the text).
+//!    Round-8: the census runs on COMMENT-BLANKED text (offset-preserving
+//!    — comment bytes become spaces, so a comment mention never counts
+//!    and a comment can never hide a token from a walk);
+//!    DESTRUCTURING-assignment place expressions count as assignments
+//!    (`(self.alerts_gate_armed, _) = (true, ());` /
+//!    `[self.alerts_gate_armed] = [true];` — safe-Rust writes whose
+//!    identifier is followed by `,`/`]`/`)`, which the token-after
+//!    classification previously read as Read); the borrow walk's lookback
+//!    window is UNBOUNDED (a `&mut` pushed >48 bytes away by whitespace —
+//!    or by an interleaved `/* … */` comment, now blanked — previously
+//!    classified Read); and api_client.rs is pinned to ZERO `unsafe`
+//!    tokens (the gate field is private to that module, so the
+//!    `addr_of_mut!` raw-pointer arm vector is closed MECHANICALLY, no
+//!    longer by the envelope disclaimer).
 //! 3. Every `/alerts` URL-building sender checks the gate BEFORE any
 //!    URL/socket work. BOTH sides of the census count the SAME
 //!    comment-stripped production text — FULL-LINE comments AND trailing
@@ -84,11 +98,18 @@
 //! honest evidence surface).
 //!
 //! HONEST ENVELOPE: these are text ratchets. They pin every regression
-//! shape surfaced by the round-1..round-7 adversarial reviews (literal and
+//! shape surfaced by the round-1..round-8 adversarial reviews (literal and
 //! non-literal arms, parameterized constructors, compound assignments,
-//! `&mut` borrows — spaced, no-space `&mut(…)`, and parenthesized
-//! `&mut (…)` alike — method-call mutations like `.clone_from(&true)`
-//! (round-7), new senders, new constants, full-line AND trailing
+//! `&mut` borrows — spaced, no-space `&mut(…)`, parenthesized `&mut (…)`,
+//! comment-INTERLEAVED `&mut /* … */ self.…`, and beyond-48-byte
+//! far-window borrows alike (round-8) — method-call mutations like
+//! `.clone_from(&true)` (round-7), destructuring-assignment places
+//! `(self.alerts_gate_armed, _) = (true, ());` /
+//! `[self.alerts_gate_armed] = [true];` (round-8), `unsafe` raw-pointer
+//! arms (round-8: api_client.rs is pinned to ZERO `unsafe` tokens and the
+//! gate field is private to that module — the former envelope disclaimer
+//! is now a mechanical exclusion), new senders, new constants, full-line
+//! AND trailing
 //! comment-inflated counts, rogue-named /alerts constants with camouflage
 //! comments, UFCS/path/bare-call production callers, rogue-FILE senders on
 //! any `/alerts` subpath or via a `DHAN_ALERTS_*` constant import,
@@ -100,9 +121,8 @@
 //! deliberate obfuscation outside those shapes (byte-assembled strings, a
 //! bare `"alerts"` literal with NO adjacent slash in ANY fragment — e.g.
 //! `format!("{}/{}/{}", base, "alerts", "orders")` — raw-string literals —
-//! none exist in the scanned production regions today — `unsafe` pointer
-//! writes) — such code fails human review + the operator-quote protocol,
-//! not this file.
+//! none exist in the scanned production regions today) — such code fails
+//! human review + the operator-quote protocol, not this file.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -264,6 +284,115 @@ fn strip_trailing_comment(line: &str) -> &str {
         index += 1;
     }
     line
+}
+
+/// Replaces every COMMENT byte in `source` with a space (newlines kept) —
+/// OFFSET-PRESERVING, so census indices computed on the blanked text stay
+/// valid against the RAW file (round-8). Unlike [`strip_comments`] (which
+/// drops/cuts lines and is fine for token COUNTING), this is the text the
+/// gate census + `&mut` borrow walk run on: a comment can neither ADD a
+/// countable token nor HIDE one from a walk — the comment-interleaved
+/// `&mut /* dated-quote pending */ self.alerts_gate_armed` arm vector
+/// becomes plain whitespace between the borrow token and the field.
+/// Handles line comments (`//` / `///` / `//!` to end of line), NESTED
+/// block comments (`/* /* */ */`), double-quoted strings with `\` escapes
+/// (`//` or `/*` inside a string never opens a comment — the
+/// http_client_fallback_guard `://` lesson), and char literals
+/// (`'x'` / `'\x'`, incl. `'"'`); lifetime ticks fall through as code.
+/// Multi-byte chars inside comments are blanked byte-for-byte (every byte
+/// of the char sits inside the comment region), so the output stays valid
+/// UTF-8 at the same length.
+fn blank_comments(source: &str) -> String {
+    let bytes = source.as_bytes();
+    let mut out = bytes.to_vec();
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'"' => {
+                // String literal: skip to the unescaped closing quote.
+                index += 1;
+                while index < bytes.len() {
+                    match bytes[index] {
+                        b'\\' => index += 2,
+                        b'"' => {
+                            index += 1;
+                            break;
+                        }
+                        _ => index += 1,
+                    }
+                }
+            }
+            b'\'' => {
+                // Char literal ('x' / '\x') — anything else (a lifetime
+                // tick) falls through as ordinary code.
+                if index + 3 < bytes.len() && bytes[index + 1] == b'\\' && bytes[index + 3] == b'\''
+                {
+                    index += 4;
+                } else if index + 2 < bytes.len() && bytes[index + 2] == b'\'' {
+                    index += 3;
+                } else {
+                    index += 1;
+                }
+            }
+            b'/' if index + 1 < bytes.len() && bytes[index + 1] == b'/' => {
+                while index < bytes.len() && bytes[index] != b'\n' {
+                    out[index] = b' ';
+                    index += 1;
+                }
+            }
+            b'/' if index + 1 < bytes.len() && bytes[index + 1] == b'*' => {
+                let mut depth = 0usize;
+                while index < bytes.len() {
+                    if index + 1 < bytes.len() && bytes[index] == b'/' && bytes[index + 1] == b'*' {
+                        depth += 1;
+                        out[index] = b' ';
+                        out[index + 1] = b' ';
+                        index += 2;
+                        continue;
+                    }
+                    if index + 1 < bytes.len() && bytes[index] == b'*' && bytes[index + 1] == b'/' {
+                        depth = depth.saturating_sub(1);
+                        out[index] = b' ';
+                        out[index + 1] = b' ';
+                        index += 2;
+                        if depth == 0 {
+                            break;
+                        }
+                        continue;
+                    }
+                    if bytes[index] != b'\n' {
+                        out[index] = b' ';
+                    }
+                    index += 1;
+                }
+            }
+            _ => index += 1,
+        }
+    }
+    // Blanking only writes ASCII spaces over whole comment regions, so the
+    // buffer stays valid UTF-8; the fallback can only fire on a logic bug
+    // and degrades to the RAW text (over-counting direction — loud).
+    String::from_utf8(out).unwrap_or_else(|_| source.to_string())
+}
+
+/// Counts identifier-boundary occurrences of `token` in `code` (so
+/// `unsafely` never counts as `unsafe`).
+fn count_identifier_tokens(code: &str, token: &str) -> usize {
+    let bytes = code.as_bytes();
+    code.match_indices(token)
+        .filter(|(index, _)| {
+            let boundary_before = *index == 0 || {
+                let before = bytes[index - 1] as char;
+                !(before.is_ascii_alphanumeric() || before == '_')
+            };
+            let after = index + token.len();
+            let boundary_after = after >= bytes.len() || {
+                let following = bytes[after] as char;
+                !(following.is_ascii_alphanumeric() || following == '_')
+            };
+            boundary_before && boundary_after
+        })
+        .count()
 }
 
 /// Extracts the body region of a sender fn: from its `pub async fn` token
@@ -433,12 +562,18 @@ fn first_rhs_token(text: &str) -> String {
 /// cross into a DIFFERENT expression (`,`, `)`, `;`, operators, …) still
 /// terminate the walk, so `swap(&mut other, self.alerts_gate_armed)` keeps
 /// its field site classified Read.
+///
+/// Round-8 hardening: the lookback window is the WHOLE prefix — the
+/// previous fixed 48-byte window let ANY `&mut` pushed farther away (a
+/// long whitespace run — rustfmt-stable when produced by a blanked
+/// interleaved `/* … */` comment, which is exactly how
+/// `&mut /* dated-quote pending */ self.alerts_gate_armed` arrives here
+/// once [`blank_comments`] has run) classify Read. `rfind` still takes the
+/// NEAREST preceding `&mut`, and the between-charset walk still terminates
+/// on any expression-crossing character, so distance alone can never
+/// false-positive a read.
 fn preceded_by_mut_borrow(source: &str, index: usize) -> bool {
-    let mut window_start = index.saturating_sub(48);
-    while !source.is_char_boundary(window_start) {
-        window_start += 1;
-    }
-    let window = &source[window_start..index];
+    let window = &source[..index];
     match window.rfind("&mut") {
         Some(position) => {
             let between = &window[position + "&mut".len()..];
@@ -460,12 +595,68 @@ fn preceded_by_mut_borrow(source: &str, index: usize) -> bool {
     }
 }
 
+/// True when `rest` (the trimmed text FOLLOWING the identifier) places the
+/// identifier inside a DESTRUCTURING-ASSIGNMENT place expression (round-8)
+/// — `(self.alerts_gate_armed, _) = (true, ());` /
+/// `[self.alerts_gate_armed] = [true];` mutate the field in SAFE Rust
+/// while the identifier is followed by `,`/`)`/`]`, which the token-after
+/// classification previously read as Read. The walk moves FORWARD through
+/// characters that can appear inside a destructuring place list
+/// (identifiers, `_`, `.`, `,`, `*`, grouping `()[]`, whitespace); a PLAIN
+/// `=` at the end (not `==`/`=>`) makes the site a write and the post-`=`
+/// tail is returned for RHS capture. Any other character (`;`, `{`, `"`,
+/// operators, …) terminates the walk as a read — so
+/// `let pair = (self.alerts_gate_armed, other);` and the assert-message
+/// shape `assert!(!client.alerts_gate_armed, "…")` stay Reads. HONEST
+/// direction: an exotic READ that reaches a later `=` through only
+/// place-list characters (e.g. `arr[self.alerts_gate_armed as usize] = x`)
+/// would OVER-count as an assignment and fail the census LOUDLY — the
+/// conservative direction for a violation hunt; no such shape exists in
+/// the scanned file today.
+fn destructuring_assignment_tail(rest: &str) -> Option<&str> {
+    let bytes = rest.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        let character = bytes[index] as char;
+        if character.is_ascii_alphanumeric()
+            || character == '_'
+            || character == '.'
+            || character == ','
+            || character == '*'
+            || character == '('
+            || character == ')'
+            || character == '['
+            || character == ']'
+            || character.is_ascii_whitespace()
+        {
+            index += 1;
+            continue;
+        }
+        if character == '=' {
+            let next = bytes.get(index + 1).map(|byte| *byte as char);
+            if next != Some('=') && next != Some('>') {
+                return Some(&rest[index + 1..]);
+            }
+        }
+        return None;
+    }
+    None
+}
+
 /// TOTAL census of every `alerts_gate_armed` identifier site in `source`
 /// (identifier-boundary checked, so `alerts_gate_armed_x` never counts).
 /// Classification is by the token FOLLOWING the identifier, so a
 /// non-literal write (`= on`, `: armed`, `|= flag`) is counted exactly like
 /// a literal one — the round-2 hardening the literal-`true` needles lacked.
+/// Round-8: the census runs on COMMENT-BLANKED text (offset-preserving —
+/// [`blank_comments`]), so a comment mention of the field never counts AND
+/// a comment-interleaved `&mut /* … */ self.alerts_gate_armed` borrow
+/// cannot hide its `&mut` token from the walk (previously classified Read);
+/// destructuring-assignment places classify as assignments
+/// ([`destructuring_assignment_tail`]).
 fn classify_gate_sites(source: &str) -> Vec<GateSite> {
+    let blanked = blank_comments(source);
+    let source = blanked.as_str();
     let bytes = source.as_bytes();
     let mut sites = Vec::new();
     for (index, _) in source.match_indices(GATE_FIELD_IDENT) {
@@ -512,6 +703,16 @@ fn classify_gate_sites(source: &str) -> Vec<GateSite> {
             // mutates with ZERO borrow token in the text, so every
             // projection site counts as a mutation vector.
             (GateSiteKind::MethodCall, "")
+        } else if let Some(tail) = destructuring_assignment_tail(rest) {
+            // Round-8: a DESTRUCTURING-assignment place —
+            // `(self.alerts_gate_armed, _) = (true, ());` /
+            // `[self.alerts_gate_armed] = [true];` — is a safe-Rust WRITE
+            // whose identifier is followed by `,`/`)`/`]` (previously
+            // classified Read). This branch also catches the raw-pointer
+            // write shape `*addr_of_mut!(self.alerts_gate_armed) = true`
+            // (identifier → `)` → plain `=`) as defense in depth beside
+            // the zero-`unsafe` ratchet in test 2.
+            (GateSiteKind::Assignment, tail)
         } else {
             (GateSiteKind::Read, "")
         };
@@ -754,6 +955,24 @@ fn test_alerts_gate_arm_is_cfg_test_only() {
          `.clone_from(&true)` mutates via implicit auto-&mut (no borrow \
          token in the text) and is an arm vector requiring a dated \
          operator quote FIRST"
+    );
+
+    // Round-8: ZERO `unsafe` tokens anywhere in api_client.rs
+    // (comment-blanked, identifier-bounded). The gate field is PRIVATE to
+    // this module, so an unsafe raw-pointer arm
+    // (`unsafe { *std::ptr::addr_of_mut!(self.alerts_gate_armed) = true }`)
+    // is only writable from inside this file — banning the `unsafe` token
+    // here closes that vector MECHANICALLY instead of by the
+    // honest-envelope disclaimer (neither this crate nor the workspace
+    // carries forbid(unsafe_code)). A future legitimate unsafe block in
+    // api_client.rs edits this guard in the same PR.
+    assert_eq!(
+        count_identifier_tokens(&blank_comments(&source), "unsafe"),
+        0,
+        "api_client.rs must contain ZERO `unsafe` tokens — an unsafe \
+         raw-pointer write (std::ptr::addr_of_mut!) is an alerts-gate arm \
+         vector; introducing `unsafe` here requires a dated operator quote \
+         + editing this guard in the same PR"
     );
 }
 
@@ -1350,6 +1569,76 @@ fn test_gate_guard_scanner_self_test() {
         "a method call on the gate field must classify MethodCall"
     );
 
+    // (6d) DESTRUCTURING-assignment place expressions (round-8 — safe-Rust
+    //      writes whose identifier is followed by `,`/`]`/`)`; all
+    //      previously classified Read).
+    for planted_destructuring in [
+        "(self.alerts_gate_armed, _) = (true, ());",
+        "[self.alerts_gate_armed] = [true];",
+        "(a, (self.alerts_gate_armed, _)) = (1, (true, 2));",
+    ] {
+        let sites = classify_gate_sites(planted_destructuring);
+        assert_eq!(
+            sites.len(),
+            1,
+            "planted destructuring must be seen: {planted_destructuring}"
+        );
+        assert_eq!(
+            sites[0].kind,
+            GateSiteKind::Assignment,
+            "a destructuring-assignment place must classify Assignment: \
+             {planted_destructuring}"
+        );
+    }
+    // The raw-pointer write shape is caught by the SAME forward scan
+    // (identifier → `)` → plain `=`) — defense in depth beside test 2's
+    // zero-`unsafe` ratchet.
+    let planted_pointer_write = "unsafe { *std::ptr::addr_of_mut!(self.alerts_gate_armed) = true }";
+    let sites = classify_gate_sites(planted_pointer_write);
+    assert_eq!(sites.len(), 1);
+    assert_eq!(
+        sites[0].kind,
+        GateSiteKind::Assignment,
+        "the addr_of_mut! pointer-write shape must classify Assignment"
+    );
+
+    // (6e) Comment-interleaved + far-window `&mut` borrows (round-8 — the
+    //      raw-source walk saw the comment's `/` as an expression-crossing
+    //      character, and the previous 48-byte lookback lost any farther
+    //      `&mut` token; both classified Read).
+    let planted_interleaved_borrow =
+        "std::mem::replace(&mut /* dated-quote pending */ self.alerts_gate_armed, true);";
+    let sites = classify_gate_sites(planted_interleaved_borrow);
+    assert_eq!(sites.len(), 1);
+    assert_eq!(
+        sites[0].kind,
+        GateSiteKind::MutBorrow,
+        "a comment-interleaved &mut borrow must classify MutBorrow"
+    );
+    let planted_far_borrow = format!(
+        "std::mem::replace(&mut{}self.alerts_gate_armed, true);",
+        " ".repeat(100)
+    );
+    let sites = classify_gate_sites(&planted_far_borrow);
+    assert_eq!(sites.len(), 1);
+    assert_eq!(
+        sites[0].kind,
+        GateSiteKind::MutBorrow,
+        "a &mut borrow beyond the retired 48-byte window must classify \
+         MutBorrow (round-8: the lookback is unbounded)"
+    );
+
+    // A COMMENT mention of the field never censuses at all (round-8 — the
+    // census runs on comment-blanked text), in either comment style.
+    assert!(
+        classify_gate_sites("// self.alerts_gate_armed = true").is_empty(),
+        "a line-comment decoy assignment must not census"
+    );
+    assert!(
+        classify_gate_sites("/* self.alerts_gate_armed = true */").is_empty(),
+        "a block-comment decoy assignment must not census"
+    );
+
     // (7) Reads never count as writes: bare read, `==` compare, match arm,
     //     and (round-7) a `&mut` borrow of a SIBLING argument in the same
     //     call — the `,` terminates the borrow walk, so the widened
@@ -1358,8 +1647,15 @@ fn test_gate_guard_scanner_self_test() {
         "if self.alerts_gate_armed { }",
         "if self.alerts_gate_armed == other { }",
         "assert!(client.alerts_gate_armed);",
+        "assert!(!client.alerts_gate_armed, \"gate must default DISARMED\");",
         "match x { alerts_gate_armed => {} }",
         "swap(&mut other, self.alerts_gate_armed)",
+        // Destructuring-READ shapes (round-8): a tuple/array READ of the
+        // field never reaches a plain `=` through place-list characters —
+        // the `;` / `==` / `=>` terminate the forward scan.
+        "let pair = (self.alerts_gate_armed, other);",
+        "if (self.alerts_gate_armed, x) == y { }",
+        "match t { (alerts_gate_armed, _) => {} }",
     ] {
         let sites = classify_gate_sites(read_shape);
         assert_eq!(sites.len(), 1, "read shape must be seen: {read_shape}");
@@ -1380,6 +1676,67 @@ fn test_gate_guard_scanner_self_test() {
     let sites = classify_gate_sites(decl);
     assert_eq!(sites[0].kind, GateSiteKind::FieldColon);
     assert_eq!(sites[0].rhs, "bool");
+
+    // ------------------------------------------------------------------
+    // blank_comments — offset-preserving (round-8): comment bytes become
+    // spaces (length unchanged, so census indices stay valid against the
+    // RAW file), strings survive (incl. `//` inside them), NESTED block
+    // comments close correctly, and code after a block comment is kept.
+    // ------------------------------------------------------------------
+    let mixed = "let u = \"https://x\"; /* c /* n */ c */ let v = 1; // trailing";
+    let blanked = blank_comments(mixed);
+    assert_eq!(
+        blanked.len(),
+        mixed.len(),
+        "blanking must preserve byte offsets"
+    );
+    assert!(
+        blanked.contains("https://x"),
+        "a `://` string literal must survive blanking"
+    );
+    assert!(
+        blanked.contains("let v = 1;"),
+        "code after a NESTED block comment must survive"
+    );
+    assert!(
+        !blanked.contains("trailing") && !blanked.contains("/*"),
+        "comment text and delimiters must be blanked"
+    );
+    let multiline_block = "a\n/* x\ny */\nb";
+    let blanked_multiline = blank_comments(multiline_block);
+    assert_eq!(
+        blanked_multiline.matches('\n').count(),
+        multiline_block.matches('\n').count(),
+        "newlines inside block comments must be preserved"
+    );
+    assert!(
+        blanked_multiline.contains('b') && !blanked_multiline.contains('y'),
+        "block-comment content must be blanked across lines, code kept"
+    );
+
+    // ------------------------------------------------------------------
+    // count_identifier_tokens — the round-8 zero-`unsafe` ratchet's
+    // counter: a planted unsafe pointer write counts; a comment mention
+    // (blanked first, as test 2 does) and a longer identifier never do.
+    // ------------------------------------------------------------------
+    assert_eq!(
+        count_identifier_tokens(
+            "unsafe { *std::ptr::addr_of_mut!(self.alerts_gate_armed) = true }",
+            "unsafe"
+        ),
+        1,
+        "a planted unsafe block must be counted"
+    );
+    assert_eq!(
+        count_identifier_tokens(&blank_comments("// unsafe note"), "unsafe"),
+        0,
+        "a comment mention of unsafe must not count after blanking"
+    );
+    assert_eq!(
+        count_identifier_tokens("let unsafely = 1;", "unsafe"),
+        0,
+        "a longer identifier must not count (identifier boundary)"
+    );
 
     // ------------------------------------------------------------------
     // derive_alerts_sender_fns — a NEW /alerts-touching pub async fn is
