@@ -662,3 +662,23 @@ live_fire_requested = false
 enabled = false
 tenant_budget_percent = 50
 rest_self_cap_per_sec = 5
+
+# ===========================================================================
+# 🔷 DHAN exit-order execution layer (Cluster B, 2026-07-14 — LOCK #1 of
+# the 4-lock OFF switch; runbook + lockout contract in
+# .claude/rules/project/dhan-exit-order-lockout-2026-07-14.md). While
+# enabled = false the app-crate dispatcher drops every exit command
+# (counted, never silent). Flipping to true activates DRY-RUN PAPER
+# behavior ONLY — the engine's hardcoded dry_run = true blocks every live
+# POST, and one boot log line names the mode honestly (a flip is never a
+# silent no-op). Going live needs a code change + ratchet edit + rule-file
+# edit with a dated operator quote — never a config flip alone. This
+# section deliberately EXISTS with enabled = false: it is the lockout
+# guard's non-vacuous scan surface (the groww-scale-lockout pattern).
+# When enabling: default_freeze_limit_qty (>= 1, the NSE freeze quantity)
+# and freeze_limits_reviewed_on ("YYYY-MM-DD", warns when > 90 days old)
+# become mandatory; mpp_verify_deadline_secs (default 30) and
+# mpp_verify_max_attempts (default 5) drive the verify-after-place ladder.
+# ===========================================================================
+[exit_orders]
+enabled = false

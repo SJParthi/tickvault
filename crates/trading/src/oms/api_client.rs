@@ -35,7 +35,8 @@ use super::types::{
     DhanPlaceSuperOrderRequest, DhanPositionResponse, DhanSuperOrderResponse, DhanTradeEntry,
     EdisFormRequest, EdisInquiryResponse, FundLimitResponse, KillSwitchResponse,
     MarginCalculatorRequest, MarginCalculatorResponse, MultiMarginRequest, MultiMarginResponse,
-    OmsError, PnlExitRequest, PnlExitResponse, PnlExitStatusResponse,
+    OmsError, OrderLeg, PnlExitRequest, PnlExitResponse, PnlExitStatusResponse,
+    SUPER_ORDER_STATUS_ACCEPTED_UNPARSED_BODY, SlicingResponse,
 };
 
 // ---------------------------------------------------------------------------
@@ -61,6 +62,64 @@ fn record_dh_error_metric(body: &str) {
         if let Some(end) = after.find('"') {
             let code = &after[..end];
             metrics::counter!("tv_dhan_error_total", "code" => code.to_owned()).increment(1);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 2xx body tolerance for super-order mutations
+// ---------------------------------------------------------------------------
+
+/// Builds a synthetic [`DhanSuperOrderResponse`] carrying only a status label.
+///
+/// Used when Dhan accepted a super-order mutation (2xx) but sent no
+/// parsable body — the mutation already succeeded broker-side, so the
+/// caller must never see an error for it.
+fn synthetic_super_order_response(order_status: &str) -> DhanSuperOrderResponse {
+    DhanSuperOrderResponse {
+        order_id: String::new(),
+        order_status: order_status.to_owned(),
+        correlation_id: String::new(),
+        leg_details: Vec::new(),
+        filled_qty: 0,
+        average_traded_price: 0.0,
+        remaining_quantity: 0,
+        security_id: String::new(),
+        transaction_type: String::new(),
+        exchange_segment: String::new(),
+        oms_error_description: String::new(),
+    }
+}
+
+/// Parses a 2xx super-order mutation body TOLERANTLY.
+///
+/// The two official doc surfaces conflict on the cancel/modify response
+/// shape: the portal capture says "There is no body for request and
+/// response for this call. On successful completion of request
+/// '202 Accepted' response status code will appear"
+/// (`docs/dhan-ref/dhanhq-v2-upstream-2026-07-03/04-super-orders.md:151`),
+/// while the classic `docs/dhan-ref/07a-super-order.md` shows 200 + JSON.
+/// Which shape fires live is UNVERIFIED-LIVE (lockout-ledger U6) — handle
+/// BOTH now:
+/// - empty/whitespace body → synthetic success (`ACCEPTED_NO_BODY`)
+/// - unparsable body on 2xx → `warn!` + synthetic success
+///   (`ACCEPTED_UNPARSED_BODY`) — NEVER an error for an already-accepted
+///   mutation (a `JsonError` here would record a false circuit-breaker
+///   failure and invite a re-issued cancel).
+fn parse_2xx_body_tolerant(body: &str, endpoint: &'static str) -> DhanSuperOrderResponse {
+    if body.trim().is_empty() {
+        return synthetic_super_order_response("ACCEPTED_NO_BODY");
+    }
+    match serde_json::from_str(body) {
+        Ok(response) => response,
+        Err(err) => {
+            warn!(
+                endpoint = %endpoint,
+                error = %err,
+                "2xx super-order response body unparsable — treating as accepted \
+                 (202-no-body class per docs/dhan-ref/dhanhq-v2-upstream-2026-07-03/04-super-orders.md:151)"
+            );
+            synthetic_super_order_response(SUPER_ORDER_STATUS_ACCEPTED_UNPARSED_BODY)
         }
     }
 }
@@ -931,8 +990,15 @@ impl OrderApiClient {
     /// Restrictions: ENTRY_LEG=all fields, TARGET_LEG=targetPrice only,
     /// STOP_LOSS_LEG=stopLossPrice+trailingJump only.
     ///
+    /// The request BODY must carry `orderId` in addition to the URL path
+    /// (`docs/dhan-ref/dhanhq-v2-upstream-2026-07-03/04-super-orders.md:110`
+    /// — `orderId | string | Yes`); callers populate
+    /// `DhanModifySuperOrderRequest.order_id` from the same `order_id`
+    /// passed here. A 2xx response with an empty or unparsable body is a
+    /// SUCCESS (202-no-body class — see `parse_2xx_body_tolerant`).
+    ///
     /// Endpoint: `PUT /v2/super/orders/{order-id}`
-    // TEST-EXEMPT: requires live/sandbox Dhan API
+    // TEST-EXEMPT: requires live/sandbox Dhan API (mock tests cover the wire shape)
     pub async fn modify_super_order(
         &self,
         access_token: &str,
@@ -964,7 +1030,7 @@ impl OrderApiClient {
             });
         }
 
-        serde_json::from_str(&body).map_err(|err| OmsError::JsonError(err.to_string()))
+        Ok(parse_2xx_body_tolerant(&body, "modify_super_order"))
     }
 
     /// Cancels a super order leg.
@@ -972,15 +1038,26 @@ impl OrderApiClient {
     /// ENTRY_LEG cancellation = cancels ALL legs (entire super order).
     /// TARGET_LEG/STOP_LOSS_LEG = permanent removal, cannot re-add.
     ///
+    /// Success is a 2xx REGARDLESS of body: the portal capture documents
+    /// "no body for request and response … '202 Accepted'"
+    /// (`docs/dhan-ref/dhanhq-v2-upstream-2026-07-03/04-super-orders.md:151`)
+    /// while the classic doc shows 200 + JSON — the body is parsed
+    /// opportunistically when present (`parse_2xx_body_tolerant`).
+    ///
     /// Endpoint: `DELETE /v2/super/orders/{order-id}/{order-leg}`
-    // TEST-EXEMPT: requires live/sandbox Dhan API
+    // TEST-EXEMPT: requires live/sandbox Dhan API (mock tests cover the wire shape)
     pub async fn cancel_super_order_leg(
         &self,
         access_token: &str,
         order_id: &str,
-        leg: &str,
+        leg: OrderLeg,
     ) -> Result<DhanSuperOrderResponse, OmsError> {
-        let url = format!("{}/super/orders/{}/{}", self.base_url, order_id, leg);
+        let url = format!(
+            "{}/super/orders/{}/{}",
+            self.base_url,
+            order_id,
+            leg.as_str()
+        );
 
         let response = self
             .auth_headers(self.http.delete(&url), access_token)
@@ -1004,7 +1081,7 @@ impl OrderApiClient {
             });
         }
 
-        serde_json::from_str(&body).map_err(|err| OmsError::JsonError(err.to_string()))
+        Ok(parse_2xx_body_tolerant(&body, "cancel_super_order_leg"))
     }
 
     /// Lists all super orders for today.
@@ -1204,13 +1281,21 @@ impl OrderApiClient {
     /// Same request body as place_order. System automatically splits the
     /// order into multiple legs if quantity exceeds exchange freeze limit.
     ///
+    /// The response shape is ambiguous upstream: the portal capture says
+    /// "Sliced orders placed" — PLURAL —
+    /// (`docs/dhan-ref/dhanhq-v2-upstream-2026-07-03/03-orders.md:242`)
+    /// while its schema shows a single object, and the official Python SDK
+    /// returns a LIST. Both shapes parse via the untagged
+    /// [`SlicingResponse`] (`Many` wins the untagged race) — a `JsonError`
+    /// AFTER orders were placed would mean ghost orders.
+    ///
     /// Endpoint: `POST /v2/orders/slicing`
-    // TEST-EXEMPT: requires live/sandbox Dhan API
+    // TEST-EXEMPT: requires live/sandbox Dhan API (mock tests cover the wire shape)
     pub async fn place_order_slicing(
         &self,
         access_token: &str,
         request: &DhanPlaceOrderRequest,
-    ) -> Result<DhanPlaceOrderResponse, OmsError> {
+    ) -> Result<SlicingResponse, OmsError> {
         let url = format!("{}/orders/slicing", self.base_url);
 
         let response = self
@@ -1715,6 +1800,44 @@ mod tests {
         (base_url, handle)
     }
 
+    /// Starts a one-shot TCP mock server that returns the given status and
+    /// body, and yields the CAPTURED raw request (request line + headers +
+    /// body) through its join handle so tests can assert the wire shape.
+    #[allow(clippy::arithmetic_side_effects)] // APPROVED: test-only content-length arithmetic
+    async fn start_capturing_mock_server(
+        status: u16,
+        body: &str,
+    ) -> (String, tokio::task::JoinHandle<String>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base_url = format!("http://127.0.0.1:{}", addr.port());
+        let body = body.to_string();
+
+        let handle = tokio::spawn(async move {
+            let mut captured = String::new();
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 8192];
+                if let Ok(n) = stream.read(&mut buf).await {
+                    captured = String::from_utf8_lossy(&buf[..n]).into_owned();
+                }
+                let response = format!(
+                    "HTTP/1.1 {} Status\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    status,
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+            captured
+        });
+
+        (base_url, handle)
+    }
+
     /// Builds a test `OrderApiClient` pointing at the given mock base URL.
     fn make_test_client(base_url: &str) -> OrderApiClient {
         let http = Client::builder()
@@ -1755,6 +1878,21 @@ mod tests {
             trigger_price: 0.0,
             validity: "DAY".to_owned(),
             disclosed_quantity: 0,
+        }
+    }
+
+    /// Builds a minimal TARGET_LEG `DhanModifySuperOrderRequest` for test use.
+    fn make_test_modify_super_request() -> DhanModifySuperOrderRequest {
+        DhanModifySuperOrderRequest {
+            dhan_client_id: "100".to_owned(),
+            order_id: "SO-1".to_owned(),
+            leg_name: "TARGET_LEG".to_owned(),
+            order_type: None,
+            quantity: None,
+            price: None,
+            target_price: Some(1650.0),
+            stop_loss_price: None,
+            trailing_jump: None,
         }
     }
 
@@ -4615,6 +4753,7 @@ mod tests {
 
     // --- Order Slicing ---
 
+    // Single-object shape (the portal-documented schema) → SlicingResponse::One.
     #[tokio::test]
     async fn test_place_order_slicing_success() {
         let body = r#"{"orderId":"SL-1","orderStatus":"PENDING","correlationId":"c1"}"#;
@@ -4622,8 +4761,54 @@ mod tests {
         let client = make_test_client(&url);
         let req = make_test_place_request();
         let result = client.place_order_slicing("jwt", &req).await;
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap().order_id, "SL-1");
+        match result.unwrap() {
+            SlicingResponse::One(resp) => assert_eq!(resp.order_id, "SL-1"),
+            SlicingResponse::Many(list) => panic!("expected One, got Many: {list:?}"),
+        }
+        h.abort();
+    }
+
+    // Array shape ("Sliced orders placed" — plural, 03-orders.md:242; the
+    // SDK returns a list) → SlicingResponse::Many with EVERY order id.
+    #[tokio::test]
+    async fn test_place_order_slicing_array_response() {
+        let body = r#"[
+            {"orderId":"SL-1","orderStatus":"PENDING","correlationId":"c1"},
+            {"orderId":"SL-2","orderStatus":"PENDING","correlationId":"c1"}
+        ]"#;
+        let (url, h) = start_mock_server(200, body).await;
+        let client = make_test_client(&url);
+        let req = make_test_place_request();
+        let result = client.place_order_slicing("jwt", &req).await;
+        match result.unwrap() {
+            SlicingResponse::Many(list) => {
+                assert_eq!(list.len(), 2);
+                assert_eq!(list[0].order_id, "SL-1");
+                assert_eq!(list[1].order_id, "SL-2");
+            }
+            SlicingResponse::One(resp) => panic!("expected Many, got One: {resp:?}"),
+        }
+        h.abort();
+    }
+
+    // Non-2xx slicing keeps the error path unchanged.
+    #[tokio::test]
+    async fn test_place_order_slicing_api_error_400() {
+        let body = r#"{"errorCode":"DH-905","errorMessage":"input exception"}"#;
+        let (url, h) = start_mock_server(400, body).await;
+        let client = make_test_client(&url);
+        let req = make_test_place_request();
+        let result = client.place_order_slicing("jwt", &req).await;
+        match result.unwrap_err() {
+            OmsError::DhanApiError {
+                status_code,
+                message,
+            } => {
+                assert_eq!(status_code, 400);
+                assert!(message.contains("DH-905"));
+            }
+            other => panic!("expected DhanApiError, got: {other:?}"),
+        }
         h.abort();
     }
 
@@ -4699,6 +4884,7 @@ mod tests {
         let client = make_test_client(&url);
         let req = DhanModifySuperOrderRequest {
             dhan_client_id: "100".to_string(),
+            order_id: "SO-1".to_string(),
             leg_name: "TARGET_LEG".to_string(),
             order_type: None,
             quantity: None,
@@ -4712,6 +4898,62 @@ mod tests {
         h.abort();
     }
 
+    // Same 2xx-body tolerance as cancel (portal 04-super-orders.md:151 class).
+    #[tokio::test]
+    async fn test_modify_super_order_2xx_empty_body_is_success() {
+        let (url, h) = start_mock_server(202, "").await;
+        let client = make_test_client(&url);
+        let req = make_test_modify_super_request();
+        let result = client.modify_super_order("jwt", "SO-1", &req).await;
+        assert_eq!(result.unwrap().order_status, "ACCEPTED_NO_BODY");
+        h.abort();
+    }
+
+    #[tokio::test]
+    async fn test_modify_super_order_2xx_garbage_body_is_success() {
+        let (url, h) = start_mock_server(200, "<html>gateway</html>").await;
+        let client = make_test_client(&url);
+        let req = make_test_modify_super_request();
+        let result = client.modify_super_order("jwt", "SO-1", &req).await;
+        assert_eq!(result.unwrap().order_status, "ACCEPTED_UNPARSED_BODY");
+        h.abort();
+    }
+
+    // Non-2xx modify keeps the error path — tolerance is 2xx-only.
+    #[tokio::test]
+    async fn test_modify_super_order_api_error_400() {
+        let body = r#"{"errorCode":"DH-906","errorMessage":"order error"}"#;
+        let (url, h) = start_mock_server(400, body).await;
+        let client = make_test_client(&url);
+        let req = make_test_modify_super_request();
+        let result = client.modify_super_order("jwt", "SO-1", &req).await;
+        match result.unwrap_err() {
+            OmsError::DhanApiError { status_code, .. } => assert_eq!(status_code, 400),
+            other => panic!("expected DhanApiError, got: {other:?}"),
+        }
+        h.abort();
+    }
+
+    // The modify BODY must carry orderId (portal 04-super-orders.md:110 —
+    // `orderId | string | Yes`); assert the wire request the mock received.
+    #[tokio::test]
+    async fn test_modify_super_order_body_carries_order_id() {
+        let (url, h) = start_capturing_mock_server(202, "").await;
+        let client = make_test_client(&url);
+        let req = make_test_modify_super_request();
+        let result = client.modify_super_order("jwt", "SO-1", &req).await;
+        assert!(result.is_ok());
+        let captured = h.await.unwrap();
+        assert!(
+            captured.contains(r#""orderId":"SO-1""#),
+            "modify body missing orderId: {captured}"
+        );
+        assert!(
+            captured.contains(r#""legName":"TARGET_LEG""#),
+            "modify body missing legName: {captured}"
+        );
+    }
+
     #[tokio::test]
     async fn test_cancel_super_order_leg_success() {
         let body =
@@ -4719,10 +4961,76 @@ mod tests {
         let (url, h) = start_mock_server(200, body).await;
         let client = make_test_client(&url);
         let result = client
-            .cancel_super_order_leg("jwt", "SO-1", "ENTRY_LEG")
+            .cancel_super_order_leg("jwt", "SO-1", OrderLeg::EntryLeg)
+            .await;
+        assert_eq!(result.unwrap().order_status, "CANCELLED");
+        h.abort();
+    }
+
+    // Portal capture 04-super-orders.md:151: "no body for request and
+    // response … '202 Accepted'" — a 2xx with an empty body is a SUCCESS.
+    #[tokio::test]
+    async fn test_cancel_super_order_leg_202_empty_body_is_success() {
+        let (url, h) = start_mock_server(202, "").await;
+        let client = make_test_client(&url);
+        let result = client
+            .cancel_super_order_leg("jwt", "SO-1", OrderLeg::TargetLeg)
+            .await;
+        let resp = result.unwrap();
+        assert_eq!(resp.order_status, "ACCEPTED_NO_BODY");
+        assert!(resp.order_id.is_empty());
+        h.abort();
+    }
+
+    // A 2xx with an UNPARSABLE body is still a success (the broker already
+    // accepted the mutation) — never a JsonError / circuit-breaker failure.
+    #[tokio::test]
+    async fn test_cancel_super_order_leg_2xx_garbage_body_is_success() {
+        let (url, h) = start_mock_server(200, "not json at all").await;
+        let client = make_test_client(&url);
+        let result = client
+            .cancel_super_order_leg("jwt", "SO-1", OrderLeg::StopLossLeg)
+            .await;
+        assert_eq!(result.unwrap().order_status, "ACCEPTED_UNPARSED_BODY");
+        h.abort();
+    }
+
+    // Tolerance applies ONLY to 2xx — non-2xx keeps the error path.
+    #[tokio::test]
+    async fn test_cancel_super_order_leg_api_error_400() {
+        let body = r#"{"errorCode":"DH-905","errorMessage":"bad leg"}"#;
+        let (url, h) = start_mock_server(400, body).await;
+        let client = make_test_client(&url);
+        let result = client
+            .cancel_super_order_leg("jwt", "SO-1", OrderLeg::EntryLeg)
+            .await;
+        match result.unwrap_err() {
+            OmsError::DhanApiError {
+                status_code,
+                message,
+            } => {
+                assert_eq!(status_code, 400);
+                assert!(message.contains("DH-905"));
+            }
+            other => panic!("expected DhanApiError, got: {other:?}"),
+        }
+        h.abort();
+    }
+
+    // The DELETE URL must carry the typed leg's Dhan string (OrderLeg::as_str).
+    #[tokio::test]
+    async fn test_cancel_super_order_leg_url_carries_leg_string() {
+        let (url, h) = start_capturing_mock_server(202, "").await;
+        let client = make_test_client(&url);
+        let result = client
+            .cancel_super_order_leg("jwt", "SO-9", OrderLeg::StopLossLeg)
             .await;
         assert!(result.is_ok());
-        h.abort();
+        let captured = h.await.unwrap();
+        assert!(
+            captured.contains("DELETE /super/orders/SO-9/STOP_LOSS_LEG"),
+            "request line missing typed leg path: {captured}"
+        );
     }
 
     #[tokio::test]
