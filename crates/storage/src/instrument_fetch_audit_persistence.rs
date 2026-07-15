@@ -138,10 +138,10 @@ pub const DEDUP_KEY_INSTRUMENT_FETCH_AUDIT: &str = "trading_date_ist, outcome, a
 /// |---|---|---|
 /// | `Success` | terminal-ok | CSV fetched + parsed + universe built |
 /// | `HolidayObservation` | terminal-ok | Trading-calendar holiday — single non-retrying fetch attempt per §22 |
-/// | `CsvHardFailed` | retryable-failure | Maps to `ErrorCode::InstrFetch01CsvHardFailed` |
-/// | `SchemaValidationFailed` | retryable-failure | Maps to `ErrorCode::InstrFetch02SchemaValidationFailed` |
-/// | `DanglingReferences` | retryable-failure | Maps to `ErrorCode::InstrFetch03DanglingReferences` |
-/// | `UniverseSizeOutOfBounds` | retryable-failure | Maps to `ErrorCode::InstrFetch04UniverseSizeOutOfBounds` |
+/// | `CsvHardFailed` | retryable-failure | Historically mapped to `INSTR-FETCH-01` (variant retired in the C4 sweep, 2026-07-15) |
+/// | `SchemaValidationFailed` | retryable-failure | Historically mapped to `INSTR-FETCH-02` (variant retired, C4 sweep) |
+/// | `DanglingReferences` | retryable-failure | Historically mapped to `INSTR-FETCH-03` (variant retired, C4 sweep) |
+/// | `UniverseSizeOutOfBounds` | retryable-failure | Historically mapped to `INSTR-FETCH-04` (variant retired, C4 sweep) |
 /// | `OperatorOverride` | other | Operator paste of yesterday's SHA-256 per §20 escape valve |
 /// | `DryRun` | other | `--dry-run-universe` flag per §27 — fetch + validate but NO subscription dispatch |
 ///
@@ -268,10 +268,12 @@ pub struct InstrumentFetchAuditRow<'a> {
     /// §4 retry attempt number (1-based). Part of the DEDUP key so two
     /// same-kind failures on the same day are both preserved.
     pub attempt: u32,
-    /// The `ErrorCode` wire string (e.g. `"INSTR-FETCH-01"`) for failure
-    /// outcomes; empty string for `Success` / `HolidayObservation` /
-    /// `OperatorOverride` / `DryRun`. NOT escaped here —
-    /// `sanitize_audit_string` is applied internally.
+    /// The error-code wire string (e.g. `"INSTR-FETCH-01"` — a HISTORICAL
+    /// data-format literal; the enum variants behind these strings were
+    /// retired in the C4 sweep, 2026-07-15) for failure outcomes; empty
+    /// string for `Success` / `HolidayObservation` / `OperatorOverride` /
+    /// `DryRun`. NOT escaped here — `sanitize_audit_string` is applied
+    /// internally.
     pub error_code: &'a str,
     /// Raw CSV row count for this attempt (L3 reconcile baseline). 0 when
     /// the fetch failed before the row count was known.
@@ -517,88 +519,15 @@ pub async fn append_instrument_fetch_audit_row(
     Ok(())
 }
 
-/// Parse the QuestDB `/exec` `dataset` JSON for the single `source_csv_sha256`
-/// cell of the most-recent fetch-audit row. PURE — `dataset[0][0]` as a string,
-/// `None` for an empty/malformed dataset. Extracted for deterministic testing.
-#[must_use]
-pub fn parse_last_fetch_audit_sha(dataset: &serde_json::Value) -> Option<String> {
-    dataset
-        .as_array()?
-        .first()?
-        .as_array()?
-        .first()?
-        .as_str()
-        .map(std::string::ToString::to_string)
-}
-
-/// Read the `source_csv_sha256` of the most-recent fetch-audit row (one
-/// `SELECT … ORDER BY ts DESC LIMIT 1`). Powers the O(1) warm-boot skip: if it
-/// equals today's CSV SHA-256, the universe is unchanged and the full
-/// re-UPSERT is skipped. Returns `Ok(None)` when the table is empty (Day 1).
-/// A transport/QuestDB error is propagated so the caller falls through to a
-/// FULL reconcile (fail-safe — never skip on an unknown prior state).
-/// (Pure parser `parse_last_fetch_audit_sha` carries the unit coverage.)
-// TEST-EXEMPT: requires running QuestDB; tested via boot integration in CI.
-pub async fn read_last_fetch_audit_sha(
-    questdb_config: &QuestDbConfig,
-) -> anyhow::Result<Option<String>> {
-    let base_url = format!(
-        "http://{}:{}/exec",
-        questdb_config.host, questdb_config.http_port
-    );
-    let client = Client::builder()
-        .timeout(Duration::from_secs(QUESTDB_EXEC_TIMEOUT_SECS))
-        .build()?;
-    let sql = format!(
-        "SELECT source_csv_sha256 FROM {QUESTDB_TABLE_INSTRUMENT_FETCH_AUDIT} \
-         ORDER BY ts DESC LIMIT 1;"
-    );
-    let resp = client
-        .get(&base_url)
-        .query(&[("query", sql.as_str())])
-        .send()
-        .await?;
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body: String = resp
-            .text()
-            .await
-            .unwrap_or_default()
-            .chars()
-            .take(200)
-            .collect();
-        anyhow::bail!("instrument_fetch_audit sha read non-2xx ({status}): {body}");
-    }
-    let body = resp.text().await?;
-    let v: serde_json::Value = serde_json::from_str(&body)?;
-    Ok(parse_last_fetch_audit_sha(&v["dataset"]))
-}
+// C4 sweep (2026-07-15): the O(1) warm-boot SHA read
+// (`parse_last_fetch_audit_sha` + `read_last_fetch_audit_sha`) was DELETED —
+// caller-less since PR-C3 removed the lifecycle_reconcile warm-skip
+// orchestrator (the #1569 judgment call #2 deferred the decision to this
+// sweep). The `instrument_fetch_audit` SEBI table + its append fn stay.
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_parse_last_fetch_audit_sha_extracts_first_cell() {
-        let v = serde_json::json!({ "dataset": [["abc123def"]] });
-        assert_eq!(
-            parse_last_fetch_audit_sha(&v["dataset"]).as_deref(),
-            Some("abc123def")
-        );
-    }
-
-    #[test]
-    fn test_parse_last_fetch_audit_sha_empty_and_malformed_are_none() {
-        // Empty table (Day 1) → no warm-skip, full reconcile runs.
-        let empty = serde_json::json!({ "dataset": [] });
-        assert_eq!(parse_last_fetch_audit_sha(&empty["dataset"]), None);
-        // Non-string cell → None (never a false SHA-match).
-        let malformed = serde_json::json!({ "dataset": [[42]] });
-        assert_eq!(parse_last_fetch_audit_sha(&malformed["dataset"]), None);
-        // Missing dataset key → None.
-        let missing = serde_json::json!({});
-        assert_eq!(parse_last_fetch_audit_sha(&missing["dataset"]), None);
-    }
 
     /// Every wire-format variant the column SYMBOL set should ever
     /// carry. The audit-trail forensic guarantee depends on this list
