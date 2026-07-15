@@ -702,10 +702,24 @@ enabled = false
 # :55/:58/:02 — exactly 3, one per underlying, pairwise gaps validated
 # >= chain_min_spacing_ms).
 dhan_chain_offsets_ms = [-5000, -2000, 2000]
-# Dhan spot singles start at T+3000 (:03) spaced 400ms (2.5 rps — strictly
-# under the shared limiter's 3 rps so the cadence gate binds; >= 334).
+# Dhan spot group anchor at T+3000 (:03). The 2026-07-15 adaptive
+# concurrency ladder groups the 4 single-symbol spot calls per step —
+# step 0 fires all 4 SIMULTANEOUSLY at :03.0; degraded steps split
+# 3+1 / 2+2 / fully sequential across 1000ms-spaced group anchors (both
+# brokers' candle endpoints are single-symbol-per-request — a true
+# multi-symbol batch does not exist).
 dhan_spot_start_offset_ms = 3000
-dhan_spot_spacing_ms = 400
+# Rolling-1000ms-window spot gate: at most this many spot requests in ANY
+# sliding second (1..=5 — Dhan's hard cap is 5/sec; the shared 3 rps
+# dhan_data_api_limiter still smooths a 4-simultaneous burst to ~3/sec —
+# the window gate is the STRUCTURAL ceiling, the limiter defense-in-depth).
+spot_window_cap = 4
+# Adaptive-concurrency streaks (BOTH Assumed — operator confirm pending):
+# degrade one step after this many CONSECUTIVE spot-dirty (rate-limited)
+# cycles; recover one step after this many consecutive fully-clean cycles.
+# The same streaks drive the Groww three-choice fallback-shape ladder.
+concurrency_degrade_after_dirty_cycles = 2
+concurrency_recover_after_clean_cycles = 3
 # Ladder rung clamp: spots never fire earlier than T + this (house 300ms).
 spot_min_post_close_ms = 300
 # Failure ladder: chains shift wholesale -1000ms per rung, max 5 rungs.
@@ -717,8 +731,11 @@ recovery_mode = "step_back_one"
 # Lane staleness cutoffs past T: older data is stale for a next-minute fill.
 dhan_lane_cutoff_ms = 15000
 groww_lane_cutoff_ms = 6000
-# Groww burst: all 7 requests at T+0, verdict at T+800, 1500ms per request
-# on the sequential fallback.
+# Groww three-choice fallback-shape ladder (operator verbatim 2026-07-15):
+# choice 1 (default) = all 7 requests in parallel at T+0; choice 2 = :01
+# all 3 chains / :02 ALL 4 spots (VIX included); choice 3 (last resort) =
+# :01 chains / :02 core spots / :03 VIX alone. Verdict = last wave + the
+# burst timeout; 1500ms per request on the sequential fallback.
 groww_anchor_offset_ms = 0
 groww_burst_timeout_ms = 800
 groww_request_timeout_ms = 1500

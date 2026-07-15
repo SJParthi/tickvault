@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use chrono::{FixedOffset, NaiveDate, TimeZone, Timelike, Utc};
 use tickvault_common::config::CadenceConfig;
-use tickvault_common::constants::IST_UTC_OFFSET_SECONDS;
+use tickvault_common::constants::{CADENCE_SPOT_WINDOW_MS, IST_UTC_OFFSET_SECONDS};
 use tickvault_common::error_code::ErrorCode;
 use tickvault_common::feed::Feed;
 use tickvault_common::trading_calendar::TradingCalendar;
@@ -36,12 +36,13 @@ use super::decision::{
     emit_decision, next_cadence_state,
 };
 use super::executor::{
-    CadenceExecutor, CadenceFetchError, ChainFetchOk, ChainFetchRequest, SpotFetchRequest,
-    SpotSnapshot, SpotTarget,
+    CadenceExecutor, CadenceFetchError, ChainFetchOk, ChainFetchRequest, ExpiryResolver,
+    SpotFetchRequest, SpotSnapshot, SpotTarget,
 };
 use super::gate::{DhanGates, GateVerdict};
 use super::ladder::{
-    CycleVerdict, LadderState, failure_arms_ladder, may_retry_in_cycle, next_rung,
+    CycleVerdict, GROWW_SHAPE_MAX_STEP, LadderState, SPOT_CONCURRENCY_MAX_STEP, StreakLadder,
+    StreakShift, failure_arms_ladder, may_retry_in_cycle, min_spot_step_for_cap, next_rung,
 };
 use super::schedule::{
     CADENCE_RETRY_LATENCY_ALLOWANCE_MS, CycleSlots, build_cycle_slots, next_joinable_boundary,
@@ -182,6 +183,12 @@ pub struct CadenceRunnerDeps<D, G> {
     pub dhan_executor: Arc<D>,
     /// The Groww lane executor (the dry-run logger in this PR).
     pub groww_executor: Arc<G>,
+    /// The day-locked expiry lookup SEAM (2026-07-15; the
+    /// `StubExpiryResolver` in this PR — always unresolved). Stamped onto
+    /// every chain request at build time; the scheduler NEVER guesses.
+    /// `dyn` is deliberate cold-path dispatch (one lookup per chain
+    /// request, ~6/minute — never the tick hot path).
+    pub expiry_resolver: Arc<dyn ExpiryResolver>,
     /// Level-triggered Dhan lane enable flag (read per cycle per lane).
     pub dhan_enabled: Arc<AtomicBool>,
     /// Level-triggered Groww lane enable flag.
@@ -197,6 +204,7 @@ impl<D, G> Clone for CadenceRunnerDeps<D, G> {
             calendar: Arc::clone(&self.calendar),
             dhan_executor: Arc::clone(&self.dhan_executor),
             groww_executor: Arc::clone(&self.groww_executor),
+            expiry_resolver: Arc::clone(&self.expiry_resolver),
             dhan_enabled: Arc::clone(&self.dhan_enabled),
             groww_enabled: Arc::clone(&self.groww_enabled),
             shutdown: Arc::clone(&self.shutdown),
@@ -285,7 +293,7 @@ where
     tokio::pin!(shutdown_fut);
     let gates = Arc::new(DhanGates::new(
         cfg.chain_min_spacing_ms,
-        cfg.dhan_spot_spacing_ms,
+        cfg.spot_window_cap,
     ));
     // Conservative boot re-seed (belt-and-braces beside the structural
     // no-mid-cycle-join rule — design §4 case 4). The FIRST cycle after a
@@ -296,12 +304,21 @@ where
     let mut first_cycle_after_reseed = true;
 
     let mut ladder = LadderState::default();
+    // The adaptive concurrency ladders (operator spec addition 2026-07-15;
+    // day-scoped like the anchor rung). The Dhan spot ladder starts at
+    // the STRUCTURAL floor for the configured window cap (a cap below 4
+    // cannot admit the full step-0 simultaneous group).
+    let spot_step_floor = min_spot_step_for_cap(cfg.spot_window_cap);
+    let mut spot_ladder = StreakLadder::starting_at(spot_step_floor);
+    let mut groww_ladder = StreakLadder::starting_at(0);
     let mut latch = DecisionLatch::new();
     let mut last_boundary: Option<u32> = None;
     let mut current_date = clock.ist_date();
     let mut exhausted_episode = false;
     let mut lanes_parked = false;
     metrics::gauge!("tv_cadence_ladder_rung").set(f64::from(ladder.rung));
+    metrics::gauge!("tv_cadence_spot_concurrency_step").set(f64::from(spot_ladder.step));
+    metrics::gauge!("tv_cadence_groww_shape_step").set(f64::from(groww_ladder.step));
 
     loop {
         // Day-start reset: rung 0, fresh boundary horizon (design §1).
@@ -315,9 +332,13 @@ where
                 );
             }
             ladder = LadderState::default();
+            spot_ladder = StreakLadder::starting_at(spot_step_floor);
+            groww_ladder = StreakLadder::starting_at(0);
             exhausted_episode = false;
             last_boundary = None;
             metrics::gauge!("tv_cadence_ladder_rung").set(0.0);
+            metrics::gauge!("tv_cadence_spot_concurrency_step").set(f64::from(spot_ladder.step));
+            metrics::gauge!("tv_cadence_groww_shape_step").set(0.0);
         }
 
         // BOTH lanes disabled ⇒ PARK level-triggered WITHOUT consuming
@@ -385,7 +406,13 @@ where
         }
         last_boundary = Some(boundary);
 
-        let slots = build_cycle_slots(boundary, ladder.rung, &cfg);
+        let slots = build_cycle_slots(
+            boundary,
+            ladder.rung,
+            spot_ladder.step,
+            groww_ladder.step,
+            &cfg,
+        );
         let demote_nominal = first_cycle_after_reseed;
         first_cycle_after_reseed = false;
         let outcome = run_cycle(
@@ -398,14 +425,53 @@ where
             shutdown_fut.as_mut(),
         )
         .await;
-        let verdict = match outcome {
+        let (verdict, dhan_spot_dirty, groww_dirty) = match outcome {
             CycleRun::Shutdown => return LoopExit::Shutdown,
             // The IST calendar date changed mid-cycle (suspend across
             // midnight) — the cycle was dropped with no partial emit; the
             // loop top re-reads the date and resets the day state.
             CycleRun::Abandoned => continue,
-            CycleRun::Verdict(v) => v,
+            CycleRun::Verdict {
+                ladder: v,
+                dhan_spot_dirty,
+                groww_dirty,
+            } => (v, dhan_spot_dirty, groww_dirty),
         };
+        // Adaptive concurrency bookkeeping (2026-07-15): the spot/shape
+        // ladders fold their own rate-limit dirty flags — degrade after
+        // `concurrency_degrade_after_dirty_cycles` CONSECUTIVE dirty
+        // cycles, recover after `concurrency_recover_after_clean_cycles`
+        // consecutive clean ones (both Assumed defaults 2/3).
+        if let Some(shift) = spot_ladder.advance(
+            dhan_spot_dirty,
+            cfg.concurrency_degrade_after_dirty_cycles,
+            cfg.concurrency_recover_after_clean_cycles,
+            spot_step_floor,
+            SPOT_CONCURRENCY_MAX_STEP,
+        ) {
+            log_concurrency_shift(
+                "spot_concurrency_shift",
+                "tv_cadence_spot_concurrency_shifts_total",
+                shift,
+                spot_ladder.step,
+            );
+        }
+        metrics::gauge!("tv_cadence_spot_concurrency_step").set(f64::from(spot_ladder.step));
+        if let Some(shift) = groww_ladder.advance(
+            groww_dirty,
+            cfg.concurrency_degrade_after_dirty_cycles,
+            cfg.concurrency_recover_after_clean_cycles,
+            0,
+            GROWW_SHAPE_MAX_STEP,
+        ) {
+            log_concurrency_shift(
+                "groww_shape_shift",
+                "tv_cadence_groww_shape_shifts_total",
+                shift,
+                groww_ladder.step,
+            );
+        }
+        metrics::gauge!("tv_cadence_groww_shape_step").set(f64::from(groww_ladder.step));
         // Ladder bookkeeping (day-scoped, design §3/§7).
         let effective_verdict =
             if verdict == CycleVerdict::DhanFailed && ladder.rung == cfg.dhan_ladder_max_rungs {
@@ -449,6 +515,31 @@ where
     }
 }
 
+/// Log + count one adaptive-concurrency ladder shift (2026-07-15 —
+/// CADENCE-03 self-corrected machinery signal, the anchor `ladder_shift`
+/// mirror; `direction` follows the anchor convention: `up` = degraded
+/// toward less concurrency, `down` = recovered toward step 0).
+fn log_concurrency_shift(
+    stage: &'static str,
+    counter_name: &'static str,
+    shift: StreakShift,
+    to_step: u8,
+) {
+    let direction = match shift {
+        StreakShift::Degraded => "up",
+        StreakShift::Recovered => "down",
+    };
+    metrics::counter!(counter_name, "direction" => direction).increment(1);
+    error!(
+        code = ErrorCode::Cadence03SchedulerDegraded.code_str(),
+        stage = stage,
+        to_step,
+        direction,
+        "CADENCE-03: adaptive concurrency ladder shifted (the NEXT cycle \
+         uses the new spot grouping / Groww fallback shape)"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // One cycle
 // ---------------------------------------------------------------------------
@@ -461,8 +552,28 @@ enum CycleRun {
     /// the ms-of-day domain wrapped): the cycle is dropped with no
     /// partial emit and no ladder verdict; the day loop resets.
     Abandoned,
-    /// The whole-cycle ladder verdict.
-    Verdict(CycleVerdict),
+    /// The whole-cycle verdicts: the anchor-ladder verdict plus the
+    /// per-broker rate-limit dirty flags feeding the 2026-07-15 adaptive
+    /// concurrency ladders.
+    Verdict {
+        ladder: CycleVerdict,
+        dhan_spot_dirty: bool,
+        groww_dirty: bool,
+    },
+}
+
+/// Which legs one Groww wave fires (the 2026-07-15 three-choice ladder:
+/// shape 0 fires all three legs at ONE instant — the classic all-7
+/// burst; shapes 1/2 spread them across 1000ms-spaced waves).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GrowwWaveLeg {
+    /// All 3 option chains in parallel.
+    Chains,
+    /// The 3 core underlying spots (NIFTY/BANKNIFTY/SENSEX) in parallel.
+    CoreSpots,
+    /// The advisory INDIA VIX spot (alone last at choice 3 — deliberately
+    /// lowest priority, context-only).
+    VixSpot,
 }
 
 /// One scheduled instant inside the cycle.
@@ -475,9 +586,10 @@ enum CycleAction {
     },
     /// A Dhan spot fire (`nominal` = a primary schedule slot).
     DhanSpot { target_idx: usize, nominal: bool },
-    /// The Groww 7-parallel burst.
-    GrowwBurst,
-    /// The Groww burst-failure verdict + fallback launch.
+    /// One Groww primary wave (shape 0: three same-instant waves = the
+    /// all-7 burst).
+    GrowwWave { leg: GrowwWaveLeg },
+    /// The Groww wave-failure verdict + fallback launch.
     GrowwVerdict,
     /// The Groww lane staleness cutoff.
     GrowwCutoff,
@@ -520,6 +632,11 @@ struct DegradeFlags {
     cross_fill: bool,
     chain_embedded_spot: bool,
     moneyness_unknown: bool,
+    /// ≥1 chain request was stamped `expiry_yyyymmdd = None` (the
+    /// resolver seam is unresolved — the scheduler never guesses; the
+    /// executor impl may fall back to its warmup expiry). Always set in
+    /// dry-run (the `StubExpiryResolver` is unresolved by design).
+    expiry_unresolved: bool,
 }
 
 impl DegradeFlags {
@@ -532,6 +649,7 @@ impl DegradeFlags {
             || self.cross_fill
             || self.chain_embedded_spot
             || self.moneyness_unknown
+            || self.expiry_unresolved
     }
 
     /// Comma-joined stage list (cold path — one small allocation per
@@ -547,6 +665,7 @@ impl DegradeFlags {
             (self.cross_fill, "cross_fill"),
             (self.chain_embedded_spot, "chain_embedded_spot"),
             (self.moneyness_unknown, "moneyness_unknown"),
+            (self.expiry_unresolved, "expiry_unresolved"),
         ] {
             if flag {
                 if !s.is_empty() {
@@ -650,11 +769,18 @@ where
         late_wake_flagged: false,
         skew_flagged: false,
         last_observed_wall: i64::MIN,
+        // Spot retries APPEND at the next free window-gate instants after
+        // the LAST group: one full window past the last group anchor,
+        // stepping one window per appended retry — an appended retry can
+        // never contend a nominal group's window budget (2026-07-15 gate
+        // change; the pre-window design appended on the 400ms spacing).
         next_spot_retry_target_ms: slots.dhan_spot_slots_ms[3]
-            .saturating_add(deps.config.dhan_spot_spacing_ms),
+            .saturating_add(CADENCE_SPOT_WINDOW_MS),
         // Seeded TRUE on the first cycle after a gate reseed — the
         // reseed's one-slot hold is an EXPECTED deferral source.
         dispatch_ran_late: demote_nominal,
+        dhan_spot_dirty: false,
+        groww_dirty: false,
     };
     // Anchor FSM arming (level-triggered per cycle per lane).
     if cycle.dhan.enabled {
@@ -670,7 +796,11 @@ where
         cycle.groww.resolved = true;
     }
     if cycle.dhan.resolved && cycle.groww.resolved {
-        return CycleRun::Verdict(CycleVerdict::Clean);
+        return CycleRun::Verdict {
+            ladder: CycleVerdict::Clean,
+            dhan_spot_dirty: false,
+            groww_dirty: false,
+        };
     }
 
     if cycle.dhan.enabled {
@@ -697,9 +827,26 @@ where
             .push((slots.dhan_cutoff_ms, CycleAction::DhanCutoff));
     }
     if cycle.groww.enabled {
-        cycle
-            .events
-            .push((slots.groww_burst_ms, CycleAction::GrowwBurst));
+        // The shape ladder's waves (shape 0: all three at the burst
+        // anchor = the classic all-7 burst; shapes 1/2 spread them).
+        cycle.events.push((
+            slots.groww_chain_wave_ms,
+            CycleAction::GrowwWave {
+                leg: GrowwWaveLeg::Chains,
+            },
+        ));
+        cycle.events.push((
+            slots.groww_spot_wave_ms,
+            CycleAction::GrowwWave {
+                leg: GrowwWaveLeg::CoreSpots,
+            },
+        ));
+        cycle.events.push((
+            slots.groww_vix_wave_ms,
+            CycleAction::GrowwWave {
+                leg: GrowwWaveLeg::VixSpot,
+            },
+        ));
         cycle
             .events
             .push((slots.groww_verdict_ms, CycleAction::GrowwVerdict));
@@ -809,7 +956,11 @@ where
     } else {
         CycleVerdict::Clean
     };
-    CycleRun::Verdict(verdict)
+    CycleRun::Verdict {
+        ladder: verdict,
+        dhan_spot_dirty: cycle.dhan_spot_dirty,
+        groww_dirty: cycle.groww_dirty,
+    }
 }
 
 /// The whole per-cycle mutable state, threaded as ONE unit (borrow
@@ -834,10 +985,10 @@ struct CycleState {
     skew_flagged: bool,
     /// Highest wall instant observed this cycle (regression detector).
     last_observed_wall: i64,
-    /// The APPEND grid for Dhan spot retries: starts one spacing after
-    /// the LAST nominal spot single, stepping one spacing per scheduled
-    /// retry — an appended retry can never contend a nominal slot's gate
-    /// window (design §1 "spot retries appended on the 400ms gate").
+    /// The APPEND grid for Dhan spot retries: starts one FULL WINDOW
+    /// after the LAST group anchor, stepping one window per scheduled
+    /// retry — an appended retry can never contend a nominal group's
+    /// rolling-window budget (2026-07-15 gate change).
     next_spot_retry_target_ms: i64,
     /// Latched TRUE the first time a dispatch runs later than
     /// [`CADENCE_NOMINAL_DISPATCH_TOLERANCE_MS`] past its slot target —
@@ -845,6 +996,14 @@ struct CycleState {
     /// lateness compressed the wall gap), so they are demoted from the
     /// nominal-denial gate-bug signal.
     dispatch_ran_late: bool,
+    /// ≥1 Dhan SPOT outcome this cycle was RateLimited — feeds the
+    /// spot-concurrency ladder's dirty streak (2026-07-15).
+    dhan_spot_dirty: bool,
+    /// ≥1 Groww leg outcome this cycle was RateLimited — feeds the
+    /// fallback-shape ladder's dirty streak (2026-07-15; Assumed — the
+    /// coordinator's "persistent failure/rate-limit" read as the
+    /// rate-limit class only, mirroring the Dhan spot-dirty rule).
+    groww_dirty: bool,
 }
 
 /// Record wake lateness (histogram always; CADENCE-03 once per cycle
@@ -905,9 +1064,21 @@ fn handle_action<C, D, G>(
                     if cycle.dhan.state == CadenceState::Armed {
                         cycle.dhan.fsm(CadenceEvent::FirstFetchDispatched);
                     }
+                    // ExpiryResolver seam (2026-07-15): stamp the resolved
+                    // expiry at REQUEST-BUILD time; `None` = unresolved —
+                    // the scheduler NEVER guesses (the executor impl may
+                    // fall back to its warmup expiry) and the lane's
+                    // coalesced CADENCE-01 carries the
+                    // `expiry_unresolved` stage.
+                    let expiry_yyyymmdd =
+                        deps.expiry_resolver.resolved_expiry(Feed::Dhan, underlying);
+                    if expiry_yyyymmdd.is_none() {
+                        cycle.dhan.flags.expiry_unresolved = true;
+                    }
                     let req = ChainFetchRequest {
                         feed: Feed::Dhan,
                         underlying,
+                        expiry_yyyymmdd,
                         cycle_minute_ist: slots.cycle_minute_ist,
                         deadline_epoch_ms: clock
                             .epoch_ms()
@@ -977,48 +1148,75 @@ fn handle_action<C, D, G>(
                 }
             }
         }
-        CycleAction::GrowwBurst => {
+        CycleAction::GrowwWave { leg } => {
             if !cycle.groww.enabled || cycle.groww.resolved {
                 return;
             }
-            cycle.groww.fsm(CadenceEvent::FirstFetchDispatched);
-            // ALL 7 in parallel (gate-free lane by construction; design
-            // §4: the Groww arms never touch DhanGates).
-            for (i, underlying) in ChainUnderlying::ALL.iter().enumerate() {
-                let req = ChainFetchRequest {
-                    feed: Feed::Groww,
-                    underlying: *underlying,
-                    cycle_minute_ist: slots.cycle_minute_ist,
-                    deadline_epoch_ms: clock
-                        .epoch_ms()
-                        .saturating_add(deps.config.groww_request_timeout_ms),
-                };
-                cycle.groww.inflight = cycle.groww.inflight.saturating_add(1);
-                spawn_chain_fetch(
-                    Arc::clone(&deps.groww_executor),
-                    tx.clone(),
-                    req,
-                    i,
-                    deps.config.groww_request_timeout_ms,
-                );
+            if cycle.groww.state == CadenceState::Armed {
+                cycle.groww.fsm(CadenceEvent::FirstFetchDispatched);
             }
-            for (k, target) in SpotTarget::ALL.iter().enumerate() {
-                let req = SpotFetchRequest {
-                    feed: Feed::Groww,
-                    target: *target,
-                    cycle_minute_ist: slots.cycle_minute_ist,
-                    deadline_epoch_ms: clock
-                        .epoch_ms()
-                        .saturating_add(deps.config.groww_request_timeout_ms),
-                };
-                cycle.groww.inflight = cycle.groww.inflight.saturating_add(1);
-                spawn_spot_fetch(
-                    Arc::clone(&deps.groww_executor),
-                    tx.clone(),
-                    req,
-                    k,
-                    deps.config.groww_request_timeout_ms,
-                );
+            // Per-wave dispatch (gate-free lane by construction; design
+            // §4: the Groww arms never touch DhanGates). Shape 0 places
+            // all three waves at ONE instant (= the classic all-7 burst);
+            // shapes 1/2 spread them across 1000ms-spaced wave anchors
+            // (the 2026-07-15 three-choice fallback-shape ladder — at
+            // choice 2 CoreSpots + VixSpot share the :02 anchor, so ALL
+            // 4 spots still fire together).
+            match leg {
+                GrowwWaveLeg::Chains => {
+                    for (i, underlying) in ChainUnderlying::ALL.iter().enumerate() {
+                        // ExpiryResolver seam (2026-07-15): `None` =
+                        // unresolved — never guessed; coalesced
+                        // `expiry_unresolved` stage on the lane.
+                        let expiry_yyyymmdd = deps
+                            .expiry_resolver
+                            .resolved_expiry(Feed::Groww, *underlying);
+                        if expiry_yyyymmdd.is_none() {
+                            cycle.groww.flags.expiry_unresolved = true;
+                        }
+                        let req = ChainFetchRequest {
+                            feed: Feed::Groww,
+                            underlying: *underlying,
+                            expiry_yyyymmdd,
+                            cycle_minute_ist: slots.cycle_minute_ist,
+                            deadline_epoch_ms: clock
+                                .epoch_ms()
+                                .saturating_add(deps.config.groww_request_timeout_ms),
+                        };
+                        cycle.groww.inflight = cycle.groww.inflight.saturating_add(1);
+                        spawn_chain_fetch(
+                            Arc::clone(&deps.groww_executor),
+                            tx.clone(),
+                            req,
+                            i,
+                            deps.config.groww_request_timeout_ms,
+                        );
+                    }
+                }
+                GrowwWaveLeg::CoreSpots | GrowwWaveLeg::VixSpot => {
+                    let want_vix = leg == GrowwWaveLeg::VixSpot;
+                    for (k, target) in SpotTarget::ALL.iter().enumerate() {
+                        if target.chain_underlying().is_none() != want_vix {
+                            continue;
+                        }
+                        let req = SpotFetchRequest {
+                            feed: Feed::Groww,
+                            target: *target,
+                            cycle_minute_ist: slots.cycle_minute_ist,
+                            deadline_epoch_ms: clock
+                                .epoch_ms()
+                                .saturating_add(deps.config.groww_request_timeout_ms),
+                        };
+                        cycle.groww.inflight = cycle.groww.inflight.saturating_add(1);
+                        spawn_spot_fetch(
+                            Arc::clone(&deps.groww_executor),
+                            tx.clone(),
+                            req,
+                            k,
+                            deps.config.groww_request_timeout_ms,
+                        );
+                    }
+                }
             }
         }
         CycleAction::GrowwVerdict => {
@@ -1039,6 +1237,22 @@ fn handle_action<C, D, G>(
             }
             cycle.groww_fallback_launched = true;
             cycle.groww.flags.groww_fallback = true;
+            // ExpiryResolver seam (2026-07-15): the fallback task runs
+            // detached, so the expiry stamps + the coalesced
+            // `expiry_unresolved` flag are resolved HERE at launch time
+            // and moved into the task.
+            let failed_chain_reqs: Vec<(usize, Option<u32>)> = failed_chains
+                .iter()
+                .map(|&i| {
+                    let expiry_yyyymmdd = deps
+                        .expiry_resolver
+                        .resolved_expiry(Feed::Groww, ChainUnderlying::ALL[i]);
+                    if expiry_yyyymmdd.is_none() {
+                        cycle.groww.flags.expiry_unresolved = true;
+                    }
+                    (i, expiry_yyyymmdd)
+                })
+                .collect();
             for i in &failed_chains {
                 metrics::counter!("tv_cadence_groww_fallback_total", "leg" => "chain").increment(1);
                 debug!(underlying_idx = i, "cadence: groww chain fallback queued");
@@ -1063,10 +1277,11 @@ fn handle_action<C, D, G>(
                 // `groww_request_timeout_ms` bounds each individual
                 // request (design §0); a shared verdict-time base would
                 // hand legs 2..N already-consumed deadlines.
-                for i in failed_chains {
+                for (i, expiry_yyyymmdd) in failed_chain_reqs {
                     let req = ChainFetchRequest {
                         feed: Feed::Groww,
                         underlying: ChainUnderlying::ALL[i],
+                        expiry_yyyymmdd,
                         cycle_minute_ist: cycle_minute,
                         deadline_epoch_ms: task_clock.epoch_ms().saturating_add(timeout_ms),
                     };
@@ -1321,6 +1536,16 @@ fn handle_completion<C: CadenceClock>(
                             lane.flags.chain_empty = true;
                         }
                         record_failure(lane, &err);
+                        if lane_feed == Feed::Groww
+                            && matches!(err, CadenceFetchError::RateLimited { .. })
+                        {
+                            // Any RateLimited Groww leg (chain OR spot)
+                            // marks the fallback-shape cycle dirty
+                            // (2026-07-15). Dhan CHAIN 429s deliberately
+                            // do NOT feed the SPOT concurrency ladder —
+                            // the chain gates are unchanged.
+                            cycle.groww_dirty = true;
+                        }
                         let mut retry_scheduled = false;
                         if lane_feed == Feed::Dhan {
                             let earliest = slots
@@ -1394,10 +1619,22 @@ fn handle_completion<C: CadenceClock>(
                             lane.flags.spot_empty = true;
                         }
                         record_failure(lane, &err);
-                        // The retry is APPENDED on the 400ms spot gate
-                        // AFTER the last nominal spot single (design §1
-                        // "spot retries appended") — an appended retry can
-                        // never contend a nominal slot's gate window.
+                        if matches!(err, CadenceFetchError::RateLimited { .. }) {
+                            // Feed the streak ladders (2026-07-15): a
+                            // RateLimited SPOT outcome marks the Dhan
+                            // spot-concurrency cycle dirty; any
+                            // RateLimited Groww leg marks the
+                            // fallback-shape cycle dirty.
+                            match lane_feed {
+                                Feed::Dhan => cycle.dhan_spot_dirty = true,
+                                Feed::Groww => cycle.groww_dirty = true,
+                            }
+                        }
+                        // The retry is APPENDED at the next free
+                        // rolling-window instant AFTER the last group
+                        // anchor (design §1 "spot retries appended",
+                        // 2026-07-15 gate change) — an appended retry can
+                        // never contend a nominal group's window budget.
                         let mut retry_scheduled = false;
                         if lane_feed == Feed::Dhan {
                             let retry_target = cycle.next_spot_retry_target_ms.max(now_wall);
@@ -1411,7 +1648,7 @@ fn handle_completion<C: CadenceClock>(
                             ) {
                                 cycle.spot_retries_used[target_idx] += 1;
                                 cycle.next_spot_retry_target_ms =
-                                    retry_target.saturating_add(cfg.dhan_spot_spacing_ms);
+                                    retry_target.saturating_add(CADENCE_SPOT_WINDOW_MS);
                                 retry_scheduled = true;
                                 insert_event(
                                     &mut cycle.events,
@@ -1455,7 +1692,7 @@ fn handle_completion<C: CadenceClock>(
 
 /// Is the lane's OWN fetch path exhausted for this cycle? TRUE when the
 /// lane has no in-flight fetch AND no remaining scheduled own event
-/// (primaries, retries, the Groww burst/verdict — cutoffs are not own
+/// (primaries, retries, the Groww waves/verdict — cutoffs are not own
 /// work). Only then may the fallback rungs run before the cutoff.
 fn lane_own_path_exhausted(feed: Feed, cycle: &CycleState) -> bool {
     let lane = match feed {
@@ -1470,7 +1707,10 @@ fn lane_own_path_exhausted(feed: Feed, cycle: &CycleState) -> bool {
             action,
             CycleAction::DhanChain { .. } | CycleAction::DhanSpot { .. }
         ),
-        Feed::Groww => matches!(action, CycleAction::GrowwBurst | CycleAction::GrowwVerdict),
+        Feed::Groww => matches!(
+            action,
+            CycleAction::GrowwWave { .. } | CycleAction::GrowwVerdict
+        ),
     })
 }
 

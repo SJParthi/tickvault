@@ -13,9 +13,11 @@
 
 use tickvault_common::config::CadenceConfig;
 use tickvault_common::constants::{
-    SPOT_1M_REST_FIRST_FIRE_SECS_OF_DAY_IST, SPOT_1M_REST_LAST_FIRE_SECS_OF_DAY_IST,
+    CADENCE_GROWW_WAVE_STEP_MS, CADENCE_SPOT_WINDOW_MS, SPOT_1M_REST_FIRST_FIRE_SECS_OF_DAY_IST,
+    SPOT_1M_REST_LAST_FIRE_SECS_OF_DAY_IST,
 };
 
+use super::ladder::{groww_wave_indices, spot_group_index};
 use crate::pipeline::chain_snapshot::ChainUnderlying;
 
 /// First cadence cycle boundary of the session: T = 09:16:00 IST (the
@@ -152,13 +154,30 @@ pub struct CycleSlots {
     /// after the rung's LAST primary (rung 0 ⇒ :05/:08/:11; rung 5 ⇒
     /// :00/:03/:06).
     pub dhan_chain_retry_slots_ms: [i64; CADENCE_CHAIN_RETRY_SLOTS],
-    /// Dhan spot singles (NIFTY / BANKNIFTY / SENSEX / INDIA VIX order),
-    /// post-close-clamped: `max(T + spot_start − 1000·rung, T +
-    /// spot_min_post_close)` then `spacing`-stepped.
+    /// The Dhan spot-concurrency ladder step this table was built at
+    /// (2026-07-15: 0 = `[[4]]` all together … 3 = fully sequential).
+    pub spot_step: u8,
+    /// Dhan spot slots (NIFTY / BANKNIFTY / SENSEX / INDIA VIX order),
+    /// post-close-clamped base `max(T + spot_start − 1000·rung, T +
+    /// spot_min_post_close)`, then GROUPED per the concurrency step:
+    /// group anchors 1000ms apart (step 0: all 4 at the base; step 1:
+    /// 3 at base + VIX at base+1s; step 2: 2+2; step 3: singles at
+    /// base/+1s/+2s/+3s). In-group members share ONE instant — the
+    /// rolling-window spot gate is the structural ceiling.
     pub dhan_spot_slots_ms: [i64; 4],
-    /// Groww 7-parallel burst instant (T + anchor offset).
-    pub groww_burst_ms: i64,
-    /// Groww burst-failure verdict instant (burst + burst timeout).
+    /// The Groww fallback-shape ladder step this table was built at
+    /// (2026-07-15 three-choice ladder: 0 = `:00` all-7 burst;
+    /// 1 = `:01` chains / `:02` all 4 spots; 2 = `:01` / `:02` core
+    /// spots / `:03` VIX alone).
+    pub groww_shape: u8,
+    /// Groww chain-wave instant (all 3 chains in parallel).
+    pub groww_chain_wave_ms: i64,
+    /// Groww core-spot-wave instant (NIFTY/BANKNIFTY/SENSEX spots).
+    pub groww_spot_wave_ms: i64,
+    /// Groww VIX-spot-wave instant (equals the spot wave except at
+    /// choice 3, where VIX fires alone last — context-only priority).
+    pub groww_vix_wave_ms: i64,
+    /// Groww wave-failure verdict instant (LAST wave + burst timeout).
     pub groww_verdict_ms: i64,
     /// Dhan lane staleness cutoff (absolute).
     pub dhan_cutoff_ms: i64,
@@ -170,11 +189,18 @@ pub struct CycleSlots {
 }
 
 /// Build the full slot table for the cycle closing at
-/// `boundary_secs_of_day`, at ladder `rung`. Pure — shared by the runner
-/// AND the replay proof so the proven and executed schedules cannot
-/// diverge.
+/// `boundary_secs_of_day`, at anchor-ladder `rung`, spot-concurrency
+/// `spot_step` and Groww fallback-shape `groww_shape` (2026-07-15).
+/// Pure — shared by the runner AND the replay proof so the proven and
+/// executed schedules cannot diverge.
 #[must_use]
-pub fn build_cycle_slots(boundary_secs_of_day: u32, rung: u8, cfg: &CadenceConfig) -> CycleSlots {
+pub fn build_cycle_slots(
+    boundary_secs_of_day: u32,
+    rung: u8,
+    spot_step: u8,
+    groww_shape: u8,
+    cfg: &CadenceConfig,
+) -> CycleSlots {
     let t_ms = i64::from(boundary_secs_of_day) * MS_PER_SEC;
     let shift = i64::from(rung).saturating_mul(cfg.dhan_ladder_step_ms);
 
@@ -192,19 +218,34 @@ pub fn build_cycle_slots(boundary_secs_of_day: u32, rung: u8, cfg: &CadenceConfi
         *slot = last_primary.saturating_add(step);
     }
 
+    // The rung shift + post-close clamp apply to the GROUP BASE; the
+    // concurrency step then spreads the groups 1000ms apart.
     let spot_base = t_ms
         .saturating_add(cfg.dhan_spot_start_offset_ms)
         .saturating_sub(shift)
         .max(t_ms.saturating_add(cfg.spot_min_post_close_ms));
     let mut dhan_spot_slots_ms = [0_i64; 4];
     for (k, slot) in dhan_spot_slots_ms.iter_mut().enumerate() {
-        // APPROVED: k < 4 — the cast is safe.
+        // APPROVED: group index < 4 — the cast is safe.
         #[allow(clippy::cast_possible_wrap)]
-        let step = (k as i64).saturating_mul(cfg.dhan_spot_spacing_ms);
-        *slot = spot_base.saturating_add(step);
+        let group_offset =
+            (spot_group_index(spot_step, k) as i64).saturating_mul(CADENCE_SPOT_WINDOW_MS);
+        *slot = spot_base.saturating_add(group_offset);
     }
 
-    let groww_burst_ms = t_ms.saturating_add(cfg.groww_anchor_offset_ms);
+    let groww_anchor_ms = t_ms.saturating_add(cfg.groww_anchor_offset_ms);
+    let (chain_wave, spot_wave, vix_wave) = groww_wave_indices(groww_shape);
+    let wave_ms = |wave: usize| -> i64 {
+        // APPROVED: wave indices are 0..=3 — the cast is safe.
+        #[allow(clippy::cast_possible_wrap)]
+        groww_anchor_ms.saturating_add((wave as i64).saturating_mul(CADENCE_GROWW_WAVE_STEP_MS))
+    };
+    let groww_chain_wave_ms = wave_ms(chain_wave);
+    let groww_spot_wave_ms = wave_ms(spot_wave);
+    let groww_vix_wave_ms = wave_ms(vix_wave);
+    let last_wave_ms = groww_chain_wave_ms
+        .max(groww_spot_wave_ms)
+        .max(groww_vix_wave_ms);
     CycleSlots {
         boundary_secs_of_day,
         cycle_minute_ist: boundary_secs_of_day.saturating_sub(SECS_PER_CYCLE),
@@ -212,9 +253,13 @@ pub fn build_cycle_slots(boundary_secs_of_day: u32, rung: u8, cfg: &CadenceConfi
         rung,
         dhan_chain_slots_ms,
         dhan_chain_retry_slots_ms,
+        spot_step,
         dhan_spot_slots_ms,
-        groww_burst_ms,
-        groww_verdict_ms: groww_burst_ms.saturating_add(cfg.groww_burst_timeout_ms),
+        groww_shape,
+        groww_chain_wave_ms,
+        groww_spot_wave_ms,
+        groww_vix_wave_ms,
+        groww_verdict_ms: last_wave_ms.saturating_add(cfg.groww_burst_timeout_ms),
         dhan_cutoff_ms: t_ms.saturating_add(cfg.dhan_lane_cutoff_ms),
         groww_cutoff_ms: t_ms.saturating_add(cfg.groww_lane_cutoff_ms),
         post_close: boundary_secs_of_day == CADENCE_LAST_CYCLE_BOUNDARY_SECS_OF_DAY_IST,
@@ -236,9 +281,10 @@ mod tests {
 
     #[test]
     fn test_cadence_schedule_rung0_slots_match_operator_table() {
-        // T = 10:00:00 — a mid-session boundary; rung 0 = the operator's
-        // nominal table (design §1).
-        let slots = build_cycle_slots(10 * 3600, 0, &cfg());
+        // T = 10:00:00 — a mid-session boundary; rung 0 / step 0 /
+        // shape 0 = the operator's nominal table (design §1 + the
+        // 2026-07-15 concurrency-ladder step 0).
+        let slots = build_cycle_slots(10 * 3600, 0, 0, 0, &cfg());
         assert_eq!(slots.cycle_minute_ist, 10 * 3600 - 60);
         // Chains :55.0 / :58.0 / :02.0 (pre-close NIFTY/BANKNIFTY, SENSEX
         // post-close).
@@ -252,24 +298,127 @@ mod tests {
             slots.dhan_chain_retry_slots_ms,
             [ms(10, 0, 5, 0), ms(10, 0, 8, 0), ms(10, 0, 11, 0)]
         );
-        // Spots :03.0 / :03.4 / :03.8 / :04.2 (the operator's own example
-        // instants — 400ms spacing).
+        // Spots: step 0 = ALL 4 fired together at :03.0 (the operator's
+        // 2026-07-15 default — 4 SIMULTANEOUS single-symbol calls; both
+        // brokers' candle endpoints are single-symbol-per-request).
+        assert_eq!(slots.spot_step, 0);
         assert_eq!(
             slots.dhan_spot_slots_ms,
             [
                 ms(10, 0, 3, 0),
-                ms(10, 0, 3, 400),
-                ms(10, 0, 3, 800),
-                ms(10, 0, 4, 200)
+                ms(10, 0, 3, 0),
+                ms(10, 0, 3, 0),
+                ms(10, 0, 3, 0)
             ]
         );
-        // Groww burst at T+0, verdict at T+800.
-        assert_eq!(slots.groww_burst_ms, ms(10, 0, 0, 0));
+        // Groww shape 0 (choice 1): all waves at T+0, verdict at T+800.
+        assert_eq!(slots.groww_shape, 0);
+        assert_eq!(slots.groww_chain_wave_ms, ms(10, 0, 0, 0));
+        assert_eq!(slots.groww_spot_wave_ms, ms(10, 0, 0, 0));
+        assert_eq!(slots.groww_vix_wave_ms, ms(10, 0, 0, 0));
         assert_eq!(slots.groww_verdict_ms, ms(10, 0, 0, 800));
         // Cutoffs :06 / :15.
         assert_eq!(slots.groww_cutoff_ms, ms(10, 0, 6, 0));
         assert_eq!(slots.dhan_cutoff_ms, ms(10, 0, 15, 0));
         assert!(!slots.post_close);
+    }
+
+    #[test]
+    fn test_cadence_schedule_spot_concurrency_groupings_per_step() {
+        // The 2026-07-15 spot-concurrency ladder: groups fire at
+        // consecutive 1000ms-spaced anchors from the spot anchor slot.
+        let c = cfg();
+        // Step 1: 3 at :03.0 + 1 (VIX, the advisory) at :04.0.
+        let s1 = build_cycle_slots(10 * 3600, 0, 1, 0, &c);
+        assert_eq!(
+            s1.dhan_spot_slots_ms,
+            [
+                ms(10, 0, 3, 0),
+                ms(10, 0, 3, 0),
+                ms(10, 0, 3, 0),
+                ms(10, 0, 4, 0)
+            ]
+        );
+        // Step 2: 2+2 at :03.0 / :04.0.
+        let s2 = build_cycle_slots(10 * 3600, 0, 2, 0, &c);
+        assert_eq!(
+            s2.dhan_spot_slots_ms,
+            [
+                ms(10, 0, 3, 0),
+                ms(10, 0, 3, 0),
+                ms(10, 0, 4, 0),
+                ms(10, 0, 4, 0)
+            ]
+        );
+        // Step 3: fully sequential singles :03.0 / :04.0 / :05.0 / :06.0.
+        let s3 = build_cycle_slots(10 * 3600, 0, 3, 0, &c);
+        assert_eq!(
+            s3.dhan_spot_slots_ms,
+            [
+                ms(10, 0, 3, 0),
+                ms(10, 0, 4, 0),
+                ms(10, 0, 5, 0),
+                ms(10, 0, 6, 0)
+            ]
+        );
+        // The RUNG SHIFT still applies to the group base (rung 1 step 1:
+        // groups at :02.0 / :03.0)…
+        let r1s1 = build_cycle_slots(10 * 3600, 1, 1, 0, &c);
+        assert_eq!(r1s1.dhan_spot_slots_ms[0], ms(10, 0, 2, 0));
+        assert_eq!(r1s1.dhan_spot_slots_ms[3], ms(10, 0, 3, 0));
+        // …and so does the POST-CLOSE CLAMP (rung 5 step 3: base clamps
+        // at T+300, singles :00.3 / :01.3 / :02.3 / :03.3 — never
+        // pre-close on any step).
+        let r5s3 = build_cycle_slots(10 * 3600, 5, 3, 0, &c);
+        assert_eq!(
+            r5s3.dhan_spot_slots_ms,
+            [
+                ms(10, 0, 0, 300),
+                ms(10, 0, 1, 300),
+                ms(10, 0, 2, 300),
+                ms(10, 0, 3, 300)
+            ]
+        );
+        // Even the LAST single of the deepest step + a full retry round
+        // (window-stepped appends) sits inside the :15 Dhan cutoff.
+        assert!(s3.dhan_spot_slots_ms[3] + 4 * 1_000 <= s3.dhan_cutoff_ms);
+    }
+
+    #[test]
+    fn test_cadence_schedule_groww_three_choice_wave_instants_no_overlap() {
+        // The coordinator-relayed three-choice ladder (2026-07-15).
+        let c = cfg();
+        // Choice 2 (shape 1): :01 chains, :02 ALL 4 spots (VIX included);
+        // verdict = last wave + 800.
+        let s1 = build_cycle_slots(10 * 3600, 0, 0, 1, &c);
+        assert_eq!(s1.groww_shape, 1);
+        assert_eq!(s1.groww_chain_wave_ms, ms(10, 0, 1, 0));
+        assert_eq!(s1.groww_spot_wave_ms, ms(10, 0, 2, 0));
+        assert_eq!(s1.groww_vix_wave_ms, ms(10, 0, 2, 0));
+        assert_eq!(s1.groww_verdict_ms, ms(10, 0, 2, 800));
+        // Choice 3 (shape 2, LAST resort): :01 chains, :02 core spots,
+        // :03 VIX alone.
+        let s2 = build_cycle_slots(10 * 3600, 0, 0, 2, &c);
+        assert_eq!(s2.groww_chain_wave_ms, ms(10, 0, 1, 0));
+        assert_eq!(s2.groww_spot_wave_ms, ms(10, 0, 2, 0));
+        assert_eq!(s2.groww_vix_wave_ms, ms(10, 0, 3, 0));
+        assert_eq!(s2.groww_verdict_ms, ms(10, 0, 3, 800));
+        // NO-OVERLAP-INTO-NEXT-BURST: for EVERY shape, the last wave, the
+        // verdict, the cutoff AND the worst-case fully-sequential 7-leg
+        // fallback tail end strictly before the NEXT minute's burst
+        // anchor (the config validate() pins the same bound at boot).
+        let next_burst_ms = i64::from(10 * 3600 + 60) * 1_000 + c.groww_anchor_offset_ms;
+        for shape in 0..=2u8 {
+            let s = build_cycle_slots(10 * 3600, 0, 0, shape, &c);
+            let worst_tail = s.groww_verdict_ms + 7 * c.groww_request_timeout_ms;
+            assert!(s.groww_vix_wave_ms < next_burst_ms, "shape {shape} wave");
+            assert!(
+                s.groww_verdict_ms < s.groww_cutoff_ms,
+                "shape {shape} verdict"
+            );
+            assert!(s.groww_cutoff_ms < next_burst_ms, "shape {shape} cutoff");
+            assert!(worst_tail < next_burst_ms, "shape {shape} fallback tail");
+        }
     }
 
     #[test]
@@ -279,7 +428,7 @@ mod tests {
         // stepped after the rung's last primary (design §1 rung map).
         let c = cfg();
         for rung in 0..=5u8 {
-            let slots = build_cycle_slots(10 * 3600, rung, &c);
+            let slots = build_cycle_slots(10 * 3600, rung, 0, 0, &c);
             let [n, b, s] = slots.dhan_chain_slots_ms;
             assert_eq!(b - n, 3_000, "rung {rung}: NIFTY→BANKNIFTY gap");
             assert_eq!(s - b, 4_000, "rung {rung}: BANKNIFTY→SENSEX gap");
@@ -293,7 +442,7 @@ mod tests {
         }
         // Rung 5 spot-check against the design's literal row:
         // chains :50.0/:53.0/:57.0, retries :00/:03/:06.
-        let r5 = build_cycle_slots(10 * 3600, 5, &c);
+        let r5 = build_cycle_slots(10 * 3600, 5, 0, 0, &c);
         assert_eq!(
             r5.dhan_chain_slots_ms,
             [ms(9, 59, 50, 0), ms(9, 59, 53, 0), ms(9, 59, 57, 0)]
@@ -309,30 +458,27 @@ mod tests {
         let c = cfg();
         // Rungs 0..=2 shift the spot base normally (:03 → :02 → :01)…
         assert_eq!(
-            build_cycle_slots(10 * 3600, 1, &c).dhan_spot_slots_ms[0],
+            build_cycle_slots(10 * 3600, 1, 0, 0, &c).dhan_spot_slots_ms[0],
             ms(10, 0, 2, 0)
         );
         assert_eq!(
-            build_cycle_slots(10 * 3600, 2, &c).dhan_spot_slots_ms[0],
+            build_cycle_slots(10 * 3600, 2, 0, 0, &c).dhan_spot_slots_ms[0],
             ms(10, 0, 1, 0)
         );
         // …rungs 3..=5 CLAMP at T+300 (the just-closed candle cannot
-        // exist pre-close): :00.3 :00.7 :01.1 :01.5 per the design table.
+        // exist pre-close): the whole step-0 group at :00.3.
         for rung in 3..=5u8 {
-            let slots = build_cycle_slots(10 * 3600, rung, &c);
+            let slots = build_cycle_slots(10 * 3600, rung, 0, 0, &c);
             assert_eq!(
                 slots.dhan_spot_slots_ms,
-                [
-                    ms(10, 0, 0, 300),
-                    ms(10, 0, 0, 700),
-                    ms(10, 0, 1, 100),
-                    ms(10, 0, 1, 500)
-                ],
+                [ms(10, 0, 0, 300); 4],
                 "rung {rung} must clamp at T+300"
             );
-            // Never pre-close, on ANY rung.
-            for slot in slots.dhan_spot_slots_ms {
-                assert!(slot >= slots.boundary_ms + 300);
+            // Never pre-close, on ANY rung and ANY concurrency step.
+            for step in 0..=3u8 {
+                for slot in build_cycle_slots(10 * 3600, rung, step, 0, &c).dhan_spot_slots_ms {
+                    assert!(slot >= slots.boundary_ms + 300);
+                }
             }
         }
     }
@@ -368,8 +514,8 @@ mod tests {
         assert!(boundary_in_window(55_800)); // 15:30:00 — last, inclusive
         assert!(!boundary_in_window(55_860)); // 15:31:00 — past
         // The last cycle carries the post_close stamp.
-        assert!(build_cycle_slots(55_800, 0, &cfg()).post_close);
-        assert!(!build_cycle_slots(55_740, 0, &cfg()).post_close);
+        assert!(build_cycle_slots(55_800, 0, 0, 0, &cfg()).post_close);
+        assert!(!build_cycle_slots(55_740, 0, 0, 0, &cfg()).post_close);
     }
 
     #[test]
@@ -420,7 +566,7 @@ mod tests {
         let mut seen = 0_u32;
         while let Some(b) = boundary {
             assert!(boundary_in_window(b), "emitted boundary {b} in window");
-            let slots = build_cycle_slots(b, 0, &c);
+            let slots = build_cycle_slots(b, 0, 0, 0, &c);
             assert_eq!(slots.boundary_secs_of_day, b);
             assert_eq!(slots.cycle_minute_ist, b - 60);
             assert_eq!(slots.boundary_ms, i64::from(b) * 1_000);

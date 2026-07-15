@@ -31,10 +31,44 @@ pub struct ChainFetchRequest {
     /// The decided minute's MINUTE-OPEN, IST seconds-of-day (T − 60 for
     /// the cycle closing at boundary T).
     pub cycle_minute_ist: u32,
+    /// The day-locked expiry (`yyyymmdd`) stamped by the runner from the
+    /// injected [`ExpiryResolver`] at request-build time. `None` =
+    /// unresolved — the scheduler NEVER guesses an expiry (the lane logs
+    /// the coalesced CADENCE-01 `expiry_unresolved` stage); the executor
+    /// impl MAY fall back to its own warmup expiry. Consumer-side SEAM
+    /// only — the resolution itself is owned by the parallel
+    /// expiry-resolver session (interface pending their confirm).
+    pub expiry_yyyymmdd: Option<u32>,
     /// Absolute deadline for this ONE request, epoch milliseconds — the
     /// impl must give up (return [`CadenceFetchError::Timeout`]) at/before
     /// it; the runner never waits past the lane cutoff for it.
     pub deadline_epoch_ms: i64,
+}
+
+/// The day-locked expiry lookup SEAM (coordinator-confirmed minimal shape,
+/// 2026-07-15): the scheduler consumes a resolver handed in at boot;
+/// `None` = unresolved — the scheduler NEVER guesses (it stamps `None`
+/// through to the executor and logs a coded stage; the executor impl may
+/// fall back to its own warmup expiry). The FULL resolution machinery
+/// (async fetch, 08:30 day-lock store, retry, disagreement checks) is a
+/// SEPARATE follow-up increment owned by the parallel expiry-resolver
+/// session.
+pub trait ExpiryResolver: Send + Sync {
+    /// The day-locked expiry (`yyyymmdd`) for `(broker, underlying)`, or
+    /// `None` when unresolved.
+    fn resolved_expiry(&self, broker: Feed, underlying: ChainUnderlying) -> Option<u32>;
+}
+
+/// The day-1 resolver: always `None` (unresolved — the dry-run executors
+/// carry no expiry anyway; the real resolver lands with the parallel
+/// expiry-resolver session's increment).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct StubExpiryResolver;
+
+impl ExpiryResolver for StubExpiryResolver {
+    fn resolved_expiry(&self, _broker: Feed, _underlying: ChainUnderlying) -> Option<u32> {
+        None
+    }
 }
 
 /// The 4 cadence spot targets. INDIA VIX is spot-only (no chain) and
@@ -250,6 +284,42 @@ mod tests {
     }
 
     #[test]
+    fn test_cadence_expiry_resolver_stub_returns_none_scheduler_never_guesses() {
+        // The day-1 stub is unresolved for EVERY (broker, underlying)
+        // pair — the runner stamps `None` through (never a guessed
+        // expiry) and flags the coalesced CADENCE-01 `expiry_unresolved`
+        // stage; the executor impl may fall back to its own warmup
+        // expiry.
+        let stub = StubExpiryResolver;
+        for feed in [Feed::Dhan, Feed::Groww] {
+            for u in ChainUnderlying::ALL {
+                assert_eq!(stub.resolved_expiry(feed, *u), None);
+            }
+        }
+        // A resolved resolver's value is stamped verbatim onto the
+        // request (the runner's request-build contract, exercised
+        // end-to-end in cadence_runner_dry_run.rs).
+        struct Fixed;
+        impl ExpiryResolver for Fixed {
+            fn resolved_expiry(&self, _b: Feed, _u: ChainUnderlying) -> Option<u32> {
+                Some(20_260_716)
+            }
+        }
+        assert_eq!(
+            Fixed.resolved_expiry(Feed::Dhan, ChainUnderlying::Nifty),
+            Some(20_260_716)
+        );
+        let req = ChainFetchRequest {
+            feed: Feed::Dhan,
+            underlying: ChainUnderlying::Nifty,
+            cycle_minute_ist: 33_300,
+            expiry_yyyymmdd: Fixed.resolved_expiry(Feed::Dhan, ChainUnderlying::Nifty),
+            deadline_epoch_ms: 1,
+        };
+        assert_eq!(req.expiry_yyyymmdd, Some(20_260_716));
+    }
+
+    #[test]
     fn test_cadence_fetch_error_as_str_stable() {
         assert_eq!(
             CadenceFetchError::RateLimited {
@@ -274,6 +344,7 @@ mod tests {
                 feed: Feed::Dhan,
                 underlying: ChainUnderlying::Nifty,
                 cycle_minute_ist: 33_300,
+                expiry_yyyymmdd: None,
                 deadline_epoch_ms: 1,
             })
             .await;

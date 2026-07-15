@@ -10,7 +10,10 @@
 //! - per-underlying chain fire deltas ≥ 3000 ms (broker wall domain)
 //! - GLOBAL chain fire deltas ≥ 3000 ms — across underlyings, retries,
 //!   ladder rungs AND process restarts
-//! - Dhan spot fire deltas ≥ 400 ms
+//! - NEVER more than `spot_window_cap` Dhan spot authorizations in ANY
+//!   rolling 1000ms window — across every concurrency-ladder step,
+//!   step transition, anchor rung, retry and restart (the 2026-07-15
+//!   rolling-window gate change; Dhan hard cap 5/sec)
 //! - zero gate denials on nominal slots (on-time dispatch)
 //! - exactly 1 decision per (lane, cycle) — the latch admits every fresh
 //!   pair and refuses every repeat
@@ -36,6 +39,7 @@
 
 use proptest::prelude::*;
 use tickvault_common::config::CadenceConfig;
+use tickvault_common::constants::CADENCE_SPOT_WINDOW_MS;
 use tickvault_common::feed::Feed;
 use tickvault_common::moneyness::{Moneyness, OptionLeg};
 use tickvault_core::cadence::assembly::{
@@ -46,7 +50,8 @@ use tickvault_core::cadence::decision::{DecisionLatch, DecisionOutcome, SkipReas
 use tickvault_core::cadence::executor::{CadenceFetchError, SpotTarget};
 use tickvault_core::cadence::gate::{DhanGates, GateVerdict};
 use tickvault_core::cadence::ladder::{
-    CycleVerdict, failure_arms_ladder, may_retry_in_cycle, next_rung,
+    CycleVerdict, GROWW_SHAPE_MAX_STEP, SPOT_CONCURRENCY_MAX_STEP, StreakLadder,
+    failure_arms_ladder, may_retry_in_cycle, min_spot_step_for_cap, next_rung,
 };
 use tickvault_core::cadence::schedule::{
     CADENCE_RETRY_LATENCY_ALLOWANCE_MS, CycleSlots, build_cycle_slots, next_joinable_boundary,
@@ -158,7 +163,7 @@ struct FireLedger {
 }
 
 impl FireLedger {
-    fn assert_floors(&self, chain_spacing: i64, spot_spacing: i64, case: &str) {
+    fn assert_floors(&self, chain_spacing: i64, spot_window_cap: u32, case: &str) {
         for (i, fires) in self.per_underlying.iter().enumerate() {
             assert_sorted_deltas(fires, chain_spacing, &format!("{case}: per-UL chain #{i}"));
         }
@@ -167,7 +172,12 @@ impl FireLedger {
             chain_spacing,
             &format!("{case}: GLOBAL chain"),
         );
-        assert_sorted_deltas(&self.spot, spot_spacing, &format!("{case}: spot"));
+        assert_window_cap(
+            &self.spot,
+            CADENCE_SPOT_WINDOW_MS,
+            spot_window_cap,
+            &format!("{case}: spot"),
+        );
     }
 }
 
@@ -179,6 +189,24 @@ fn assert_sorted_deltas(fires: &[i64], min_delta: i64, what: &str) {
             w[1] - w[0],
             w[0],
             w[1]
+        );
+    }
+}
+
+/// The rolling-window invariant on a SORTED fire ledger: no sliding
+/// `window_ms` window may hold more than `cap` fires ⟺ every `cap + 1`
+/// consecutive fires span ≥ `window_ms` (2026-07-15 gate change).
+fn assert_window_cap(fires: &[i64], window_ms: i64, cap: u32, what: &str) {
+    let cap = cap as usize;
+    for w in fires.windows(cap + 1) {
+        assert!(
+            w[cap] - w[0] >= window_ms,
+            "{what}: {} fires inside one rolling {window_ms}ms window \
+             (wall {} → {} spans {})",
+            cap + 1,
+            w[0],
+            w[cap],
+            w[cap] - w[0]
         );
     }
 }
@@ -276,12 +304,14 @@ enum SimRetry {
 }
 
 /// Simulate ONE Dhan-lane cycle at `slots`: 3 gated chain primaries +
-/// 4 gated spot singles in slot order, then the merged (time-sorted)
-/// in-cycle retry grid — the production event-queue fire SEQUENCE.
-/// Every successful chain fetch records one registry "publish" into
-/// `publishes` (incl. LATE successes — audit-only for the decision,
-/// never dropped, never refetched). Returns
-/// (arming_failure_seen, lane outcome).
+/// 4 gated spot fires grouped by the cycle's concurrency-ladder step,
+/// then the merged (time-sorted) in-cycle retry grid — the production
+/// event-queue fire SEQUENCE. Every successful chain fetch records one
+/// registry "publish" into `publishes` (incl. LATE successes —
+/// audit-only for the decision, never dropped, never refetched).
+/// Returns (arming_failure_seen, spot_dirty_seen, lane outcome) —
+/// `spot_dirty` = ≥1 SPOT outcome RateLimited (the concurrency ladder's
+/// dirty signal, 2026-07-15).
 #[allow(clippy::too_many_lines)]
 #[allow(clippy::too_many_arguments)]
 fn sim_dhan_cycle(
@@ -295,12 +325,13 @@ fn sim_dhan_cycle(
     nominal_denials: &mut u32,
     post_reseed: bool,
     publishes: &mut Vec<(usize, u32)>,
-) -> (bool, SimLaneOutcome) {
+) -> (bool, bool, SimLaneOutcome) {
     // The first cycle after a boot/restart reseed demotes nominal
     // deferrals (the reseed's deliberate one-slot hold — the runner's
     // `demote_nominal` mirror).
     let mut dispatched_late = post_reseed;
     let mut arming = false;
+    let mut spot_dirty = false;
     let mut chains_ok = [false; ChainUnderlying::COUNT];
     let mut spots_ok = [false; 4];
     let mut retries_used_chain = [0_u32; ChainUnderlying::COUNT];
@@ -402,11 +433,14 @@ fn sim_dhan_cycle(
                 if failure_arms_ladder(&err) {
                     arming = true;
                 }
+                if matches!(err, CadenceFetchError::RateLimited { .. }) {
+                    spot_dirty = true;
+                }
                 spot_failures.push((k, err));
             }
         }
     }
-    let mut next_spot_retry_target = slots.dhan_spot_slots_ms[3] + cfg.dhan_spot_spacing_ms;
+    let mut next_spot_retry_target = slots.dhan_spot_slots_ms[3] + CADENCE_SPOT_WINDOW_MS;
     for (k, err) in spot_failures {
         let retry_target = next_spot_retry_target.max(clock.wall_ms);
         if may_retry_in_cycle(
@@ -418,7 +452,7 @@ fn sim_dhan_cycle(
             slots.dhan_cutoff_ms,
         ) {
             retries_used_spot[k] += 1;
-            next_spot_retry_target = retry_target + cfg.dhan_spot_spacing_ms;
+            next_spot_retry_target = retry_target + CADENCE_SPOT_WINDOW_MS;
             retry_queue.push((retry_target, SimRetry::Spot { target_idx: k }));
         }
     }
@@ -463,9 +497,11 @@ fn sim_dhan_cycle(
                     nominal_denials,
                 );
                 let latency = 10 + i64::try_from(rng.below(7_990)).unwrap_or(0);
-                if SimOutcome::draw(rng, fail_bias_pct) == SimOutcome::Ok
-                    && refired + latency <= slots.dhan_cutoff_ms
-                {
+                let outcome = SimOutcome::draw(rng, fail_bias_pct);
+                if outcome == SimOutcome::RateLimited {
+                    spot_dirty = true;
+                }
+                if outcome == SimOutcome::Ok && refired + latency <= slots.dhan_cutoff_ms {
                     spots_ok[target_idx] = true;
                     if target_idx < ChainUnderlying::COUNT {
                         decide_ready_at = decide_ready_at.max(refired + latency);
@@ -497,7 +533,7 @@ fn sim_dhan_cycle(
             emitted_at_wall: slots.dhan_cutoff_ms.max(clock.wall_ms),
         }
     };
-    (arming, outcome)
+    (arming, spot_dirty, outcome)
 }
 
 // ---------------------------------------------------------------------------
@@ -523,14 +559,21 @@ proptest! {
             wall_ms: 9 * 3_600_000 + 14 * 60_000, // 09:14:00 IST
             mono_origin: boot_skew,
         };
-        let mut gates = DhanGates::new(cfg.chain_min_spacing_ms, cfg.dhan_spot_spacing_ms);
+        let mut gates = DhanGates::new(cfg.chain_min_spacing_ms, cfg.spot_window_cap);
         gates.reseed_all(clock.mono());
         let mut ledger = FireLedger::default();
         let mut latch = DecisionLatch::new();
         let mut rung = 0_u8;
+        // The 2026-07-15 adaptive ladders, folded EXACTLY as the runner
+        // folds them — every step + transition drives real slot tables
+        // through the real gates.
+        let spot_step_floor = min_spot_step_for_cap(cfg.spot_window_cap);
+        let mut spot_ladder = StreakLadder::starting_at(spot_step_floor);
+        let mut groww_ladder = StreakLadder::starting_at(0);
         let mut last_boundary = None;
         let mut nominal_denials = 0_u32;
         let mut cycles = 0_u32;
+        let mut spot_steps_seen = [false; 4];
         let mut decisions_per_cycle: Vec<u32> = Vec::new();
         let mut publishes: Vec<(usize, u32)> = Vec::new();
         // Boot = a reseed: the first cycle demotes nominal deferrals (the
@@ -548,7 +591,7 @@ proptest! {
             if restart_every > 0 && cycles as usize % restart_every == restart_every - 1 {
                 let skew = i64::try_from(rng.below(4_000)).unwrap_or(0) - 2_000;
                 clock.restart(skew);
-                gates = DhanGates::new(cfg.chain_min_spacing_ms, cfg.dhan_spot_spacing_ms);
+                gates = DhanGates::new(cfg.chain_min_spacing_ms, cfg.spot_window_cap);
                 gates.reseed_all(clock.mono());
                 post_reseed = true;
             }
@@ -558,9 +601,20 @@ proptest! {
                 break; // session window exhausted for the day
             };
             last_boundary = Some(boundary);
-            let slots = build_cycle_slots(boundary, rung, &cfg);
+            let slots = build_cycle_slots(boundary, rung, spot_ladder.step, groww_ladder.step, &cfg);
+            spot_steps_seen[usize::from(spot_ladder.step.min(3))] = true;
+            // No-overlap invariant (coordinator 2026-07-15): even the
+            // WORST Groww shape's last wave + verdict + a full sequential
+            // fallback tail can never reach the next minute's :00 burst.
+            prop_assert!(
+                slots.groww_verdict_ms
+                    + 7 * cfg.groww_request_timeout_ms
+                    <= slots.boundary_ms + 60_000,
+                "groww fallback tail overlaps the next :00 burst (shape {})",
+                slots.groww_shape
+            );
 
-            let (arming, dhan) = sim_dhan_cycle(
+            let (arming, spot_dirty, dhan) = sim_dhan_cycle(
                 &mut clock,
                 &gates,
                 &mut ledger,
@@ -573,6 +627,26 @@ proptest! {
                 &mut publishes,
             );
             post_reseed = false;
+            // Fold the adaptive ladders exactly as the runner does: the
+            // Dhan spot ladder on REAL sim dirt; the Groww shape ladder
+            // on a scripted dirty draw (the sim fires no Groww requests
+            // — the SHAPE permutations are what must drive the slot
+            // table + no-overlap invariant above).
+            let _ = spot_ladder.advance(
+                spot_dirty,
+                cfg.concurrency_degrade_after_dirty_cycles,
+                cfg.concurrency_recover_after_clean_cycles,
+                spot_step_floor,
+                SPOT_CONCURRENCY_MAX_STEP,
+            );
+            let groww_dirty = rng.below(100) < fail_bias_pct;
+            let _ = groww_ladder.advance(
+                groww_dirty,
+                cfg.concurrency_degrade_after_dirty_cycles,
+                cfg.concurrency_recover_after_clean_cycles,
+                0,
+                GROWW_SHAPE_MAX_STEP,
+            );
 
             // Exactly-once decision latch per (lane, cycle); a DECIDED
             // outcome is never emitted past the lane cutoff (the sim's
@@ -634,10 +708,15 @@ proptest! {
             "spot fires below the 4-singles-per-cycle floor: {}",
             ledger.spot.len()
         );
-        // THE floors: per-UL ≥3000, GLOBAL ≥3000, spot ≥400 — including
-        // retries, rungs and restarts, in the broker wall domain.
-        ledger.assert_floors(cfg.chain_min_spacing_ms, cfg.dhan_spot_spacing_ms, "replay");
+        // THE floors: per-UL ≥3000, GLOBAL ≥3000, spot ≤ window cap per
+        // rolling 1000ms — including retries, ladder steps/transitions,
+        // rungs and restarts, in the broker wall domain.
+        ledger.assert_floors(cfg.chain_min_spacing_ms, cfg.spot_window_cap, "replay");
         prop_assert_eq!(nominal_denials, 0, "gate denials on nominal slots");
+        // The concurrency ladder starts at the cap's structural floor
+        // (step 0 for the default cap 4) — the full-parallel grouping is
+        // ALWAYS exercised, never a vacuous degraded-only run.
+        prop_assert!(spot_steps_seen[usize::from(spot_step_floor)]);
         // Exactly ONE decision per lane per cycle: the latch must ADMIT
         // every fresh (lane, minute) pair (a wrongly-refusing latch reads
         // < 2) — the ≤1 half is the immediate re-latch refusals above.
@@ -703,7 +782,7 @@ fn test_restart_mid_cycle_cannot_violate_spacing() {
         mono_origin: 0,
     };
     let mut ledger = FireLedger::default();
-    let gates = DhanGates::new(cfg.chain_min_spacing_ms, cfg.dhan_spot_spacing_ms);
+    let gates = DhanGates::new(cfg.chain_min_spacing_ms, cfg.spot_window_cap);
     gates.reseed_all(clock.mono() - cfg.chain_min_spacing_ms); // long-running: gates clear
     let mut late = false;
     let mut denials = 0;
@@ -721,7 +800,7 @@ fn test_restart_mid_cycle_cannot_violate_spacing() {
     // CRASH + instant reboot 100ms later: fresh gates, conservative reseed.
     clock.advance_to_wall(t_ms - 4_900);
     clock.restart(-1_234);
-    let gates = DhanGates::new(cfg.chain_min_spacing_ms, cfg.dhan_spot_spacing_ms);
+    let gates = DhanGates::new(cfg.chain_min_spacing_ms, cfg.spot_window_cap);
     gates.reseed_all(clock.mono());
     // The new process tries to fire NIFTY IMMEDIATELY (a hostile joiner —
     // the real runner would not even select this boundary, per
@@ -745,11 +824,7 @@ fn test_restart_mid_cycle_cannot_violate_spacing() {
     );
     // Broker-side (wall) delta between the two processes' NIFTY fires
     // still ≥ 3000 — reseed pushed the new fire to boot + spacing.
-    ledger.assert_floors(
-        cfg.chain_min_spacing_ms,
-        cfg.dhan_spot_spacing_ms,
-        "restart",
-    );
+    ledger.assert_floors(cfg.chain_min_spacing_ms, cfg.spot_window_cap, "restart");
     let nifty = &ledger.per_underlying[ChainUnderlying::Nifty.index()];
     assert_eq!(nifty.len(), 2);
     assert!(nifty[1] - nifty[0] >= cfg.chain_min_spacing_ms);
@@ -763,12 +838,12 @@ fn test_retry_through_gate_never_compresses_chain_spacing() {
     // when the retry target lands hostile-early.
     let cfg = CadenceConfig::default();
     let t = 36_000_u32;
-    let slots = build_cycle_slots(t, 0, &cfg);
+    let slots = build_cycle_slots(t, 0, 0, 0, &cfg);
     let mut clock = SimClock {
         wall_ms: slots.dhan_chain_slots_ms[0] - 10_000,
         mono_origin: 0,
     };
-    let gates = DhanGates::new(cfg.chain_min_spacing_ms, cfg.dhan_spot_spacing_ms);
+    let gates = DhanGates::new(cfg.chain_min_spacing_ms, cfg.spot_window_cap);
     gates.reseed_all(clock.mono());
     let mut ledger = FireLedger::default();
     let mut late = false;
@@ -810,7 +885,7 @@ fn test_retry_through_gate_never_compresses_chain_spacing() {
         &mut late,
         &mut denials,
     );
-    ledger.assert_floors(cfg.chain_min_spacing_ms, cfg.dhan_spot_spacing_ms, "retry");
+    ledger.assert_floors(cfg.chain_min_spacing_ms, cfg.spot_window_cap, "retry");
     assert_eq!(ledger.chain_global.len(), 4);
 }
 
