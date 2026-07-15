@@ -51,6 +51,14 @@ pub mod reference_id;
 pub mod state;
 pub mod types;
 
+// Orders-area TRANSPORT + BUDGET + EXECUTOR (ORD-PR-3 — GROWW-ORD-*). The
+// endpoint PATH strings + HTTP live ONLY in `api_client.rs` (Gate 5); the
+// executor/rate_budget/events lanes contain zero HTTP (paper-lane discipline).
+pub mod api_client;
+pub mod events;
+pub mod executor;
+pub mod rate_budget;
+
 // Area modules land in their own serial PRs, each behind this same feature:
 //   pub mod api_client;    // Orders        (GROWW-ORD-*)
 //   pub mod smart_orders;  // Smart Orders  (GROWW-OCO-*)
