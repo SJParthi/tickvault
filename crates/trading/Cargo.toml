@@ -38,6 +38,7 @@ tickvault-core = { path = "../core" }
 criterion = { workspace = true }
 dhat = { workspace = true }
 proptest = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
 
 [[bench]]
 name = "oms"
