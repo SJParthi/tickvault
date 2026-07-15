@@ -429,7 +429,7 @@ resource "aws_cloudwatch_log_group" "tv_market_hours_liveness_gate" {
 # pins + the liveness alarms are the backstop.
 # ---------------------------------------------------------------------------
 resource "aws_cloudwatch_metric_alarm" "market_hours_gate_lambda_errors" {
-  alarm_name          = "tv-${var.environment}-market-hours-gate-errors"
+  alarm_name = "tv-${var.environment}-market-hours-gate-errors"
   # CloudWatch caps alarm_description at 1024 chars — the count history
   # (12 -> 8 PR-C2, -> 7 Dhan noise lock, -> 6 PR-C3 2026-07-14 with
   # tick-gap-instruments-silent retired alongside its deleted gauge

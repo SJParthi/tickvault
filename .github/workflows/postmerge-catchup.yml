@@ -93,7 +93,15 @@ jobs:
         run: |
           set -euo pipefail
 
-          head_sha=$(gh api "repos/${GH_REPO}/commits/main" --jq .sha)
+          # Fail-safe (round-3 review LOW, 2026-07-14): a transient gh-api
+          # failure on the HEAD probe must not fail the step — every lane is
+          # HEAD-derived, so we skip the whole pass and let the next 30-min
+          # firing retry (same principle as the per-lane + tf_touched guards).
+          head_sha=$(gh api "repos/${GH_REPO}/commits/main" --jq .sha 2>/dev/null || echo "")
+          if ! [[ "${head_sha}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::warning::could not resolve main HEAD (transient API failure?) — skipping this catch-up pass; the next scheduled firing retries."
+            exit 0
+          fi
           echo "main HEAD = ${head_sha}"
 
           dispatched=0

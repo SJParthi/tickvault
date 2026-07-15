@@ -46,8 +46,8 @@ flate2 = { workspace = true }
 sha2 = { workspace = true }
 
 [features]
-# Sub-PR #10b-ε of 2026-05-27 daily-universe expansion: gates the
-# PR-C3 (2026-07-14): the `daily_universe_fetcher` feature was DELETED —
+# PR-C3 (2026-07-14): the `daily_universe_fetcher` feature (Sub-PR #10b-ε
+# of the 2026-05-27 daily-universe expansion) was DELETED —
 # the SEBI table persistence modules it gated (instrument_lifecycle /
 # index_constituency / instrument_fetch_audit + the pure lifecycle
 # reconciler) are KEEP items of the scope-lock §B seam and now compile
