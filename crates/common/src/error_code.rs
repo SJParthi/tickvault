@@ -989,26 +989,61 @@ pub enum ErrorCode {
     /// GROWW-OCO-05: the OCO reconcile poller (oco_reconcile_poll_secs =
     /// 15) degraded / was respawned. Severity::High, auto-triage-safe.
     GrowwOco05PollerDegraded,
-    /// GROWW-MARG-01: the user-margin detail fetch leg degraded (the
-    /// endpoint path lives ONLY in the gated `oms/groww/` area per the
-    /// Gate-5 lattice scan) — the next poll retries. Severity::High,
-    /// auto-triage-safe.
+    // -----------------------------------------------------------------------
+    // Groww pre-trade margin surface (§39.3 area slot #4, 2026-07-15) —
+    // `crates/trading/src/oms/groww/margin.rs`, feature `groww_orders`.
+    // Endpoint paths deliberately NOT spelled here (the order-side lattice
+    // Gate-5 scan bans them outside `oms/groww/`); the URL consts live in
+    // the sanctioned area file.
+    // -----------------------------------------------------------------------
+    /// GROWW-MARG-01 (Groww margin area, §39.3): the per-poll 60s
+    /// in-session user-margin fetch DEGRADED — `stage` ∈ transport /
+    /// timeout / status / auth / rate_limited / oversize / parse /
+    /// failure_envelope / shape_incomplete / sanity / no_token (in-file)
+    /// or token_read / client_build / task_respawn (app wiring), plus the
+    /// `stage="escalation"` 3-consecutive edge (one emit per episode,
+    /// re-armed by a successful poll). An invalid payload is NEVER stored —
+    /// the prior snapshot ages toward the GROWW-MARG-03 stale edge (shape
+    /// drift and outage collapse into ONE fail-closed path). 429 is
+    /// counted, never out-polled (pooled Non-Trading bucket shared with
+    /// the BruteX co-tenant). Severity::High, auto-triage-safe (the next
+    /// poll re-attempts automatically).
     GrowwMarg01FetchDegraded,
-    /// GROWW-MARG-02: the margin snapshot persist leg failed.
-    /// Severity::High, auto-triage-safe.
+    /// GROWW-MARG-02: the margin audit persist leg failed —
+    /// `margin_gate_audit` / `rest_fetch_audit` (`leg='margin_user'` /
+    /// `'margin_calc'`) ensure-DDL / ILP append / ILP-over-HTTP flush
+    /// (`stage` names the leg; failed flush discards pending — the
+    /// poisoned-buffer defense; a persist failure feeds the GROWW-MARG-01
+    /// edge, persist-gated per audit Rule 11). Gate decisions are RAM-only
+    /// and UNAFFECTED; re-appends are DEDUP-idempotent. Emit sites land
+    /// with the storage/integration PR (contracts-first). Severity::High,
+    /// auto-triage-safe.
     GrowwMarg02PersistFailed,
-    /// GROWW-MARG-03: the margin snapshot is older than stale_secs — the
-    /// gate fails CLOSED for entries (fail-closed working as designed;
-    /// the page is visibility). Severity::High, auto-triage-safe.
+    /// GROWW-MARG-03: the Groww margin snapshot went STALE and the entry
+    /// gate CLOSED fail-closed — age > `stale_secs` (default 180s = 3
+    /// missed polls), no snapshot, previous-IST-date, or the 09:14 IST
+    /// pre-open freshness check (a stale boot prime never suppresses it).
+    /// Edge-latched once per staleness episode; entries refuse (enforce) /
+    /// record (observe); EXITS ARE UNAFFECTED (`OrderIntent::Exit` is the
+    /// only bypass — §38.8 staleness discipline). Severity::High,
+    /// auto-triage-safe (the next fresh poll self-heals the gate).
     GrowwMarg03SnapshotStaleGateClosed,
-    /// GROWW-MARG-04: an entry was refused — insufficient margin after
-    /// buffer_pct + floor_paise. Severity::High, auto-triage NO
-    /// (severity-independent override — spend authorization on a pooled
-    /// shared account is operator territory; the funds-margin
-    /// shared-account doctrine + the FUTIDX-02 precedent).
+    /// GROWW-MARG-04: ENFORCE-mode entry REJECTED — insufficient usable
+    /// funds after the safety buffer + carry-across-swap pending ledger +
+    /// min-free floor on the SHARED (BruteX co-tenant) Groww account.
+    /// Observe-mode would-rejects never emit this code. Severity::High;
+    /// NEVER auto-triaged — severity-independent override arm in
+    /// `is_auto_triage_safe()` (the FUTIDX-02 / WAL-SUSPEND-01 precedent):
+    /// a funds verdict on a shared account is an OPERATOR judgment (top
+    /// up / resize / re-tune buffer / accept the no-trade).
     GrowwMarg04EntryRejectedInsufficient,
-    /// GROWW-MARG-05: margin-calculator vs user-margin divergence beyond
-    /// tolerance. Severity::Medium, auto-triage-safe.
+    /// GROWW-MARG-05: the cold-path margin-calculator verifier
+    /// (probe-gated daily, product-pinned, NEVER in the order path) found
+    /// the broker's total requirement diverging from the local
+    /// premium-with-buffers formula beyond tolerance. One coalesced
+    /// warn/day; the conservative local buffer stands; the enforce-flip is
+    /// BLOCKED until resolved (pre-flip checklist). Severity::Medium,
+    /// auto-triage-safe (visibility only).
     GrowwMarg05CalcDivergence,
 }
 
@@ -1196,13 +1231,14 @@ impl ErrorCode {
             Self::GrowwPort02PersistFailed => "GROWW-PORT-02",
             Self::GrowwPort03ReconDivergence => "GROWW-PORT-03",
             Self::GrowwPort04ForeignPosition => "GROWW-PORT-04",
-            // Groww Smart Orders (GTT/OCO) + Margin fan-out contract stubs
+            // Groww Smart Orders (GTT/OCO) fan-out contract stubs
             // (2026-07-15)
             Self::GrowwOco01PlacementFailed => "GROWW-OCO-01",
             Self::GrowwOco02SiblingCancelUnverified => "GROWW-OCO-02",
             Self::GrowwOco03ReconcileMismatch => "GROWW-OCO-03",
             Self::GrowwOco04ModifyRejected => "GROWW-OCO-04",
             Self::GrowwOco05PollerDegraded => "GROWW-OCO-05",
+            // Groww pre-trade margin surface (§39.3 area slot #4, 2026-07-15)
             Self::GrowwMarg01FetchDegraded => "GROWW-MARG-01",
             Self::GrowwMarg02PersistFailed => "GROWW-MARG-02",
             Self::GrowwMarg03SnapshotStaleGateClosed => "GROWW-MARG-03",
@@ -1389,17 +1425,20 @@ impl ErrorCode {
             | Self::GrowwPort02PersistFailed
             | Self::GrowwPort03ReconDivergence
             | Self::GrowwPort04ForeignPosition => Severity::High,
-            // GROWW-OCO-01/03/05 + GROWW-MARG-01..04 (Groww order fan-out
-            // contract stubs, 2026-07-15) — smart-order placement/reconcile/
-            // poller + margin fetch/persist/stale-gate/entry-refused
-            // degrades on the shared account. High: operator eyes on every
-            // occurrence; never a halt — every leg is cold-path behind the
-            // §39 4-gate live-fire lattice, and ZERO emit sites exist until
-            // the area code PRs land (log-sink-only contract stubs).
+            // GROWW-OCO-01/03/05 (Groww order fan-out contract stubs,
+            // 2026-07-15) — smart-order placement/reconcile/poller degrades.
+            // High: operator eyes on every occurrence; never a halt — every
+            // leg is cold-path behind the §39 4-gate live-fire lattice, and
+            // ZERO emit sites exist until the area code PRs land
+            // (log-sink-only contract stubs).
             Self::GrowwOco01PlacementFailed
             | Self::GrowwOco03ReconcileMismatch
-            | Self::GrowwOco05PollerDegraded
-            | Self::GrowwMarg01FetchDegraded
+            | Self::GrowwOco05PollerDegraded => Severity::High,
+            // Groww margin surface (§39.3 area slot #4, 2026-07-15): fetch
+            // degrade, audit persist, stale-gate-closed, enforce-mode
+            // rejection — all High (funds visibility / a blocked or
+            // refused entry on the shared account).
+            Self::GrowwMarg01FetchDegraded
             | Self::GrowwMarg02PersistFailed
             | Self::GrowwMarg03SnapshotStaleGateClosed
             | Self::GrowwMarg04EntryRejectedInsufficient => Severity::High,
@@ -1464,11 +1503,13 @@ impl ErrorCode {
             // FEED-GAP-01 (2026-07-14): gap-episode forensics degraded —
             // annotation-only side record; capture/recovery unaffected. Medium.
             Self::FeedGap01EpisodeDegraded => Severity::Medium,
-            // GROWW-OCO-04 / GROWW-MARG-05 (Groww order fan-out contract
-            // stubs, 2026-07-15): a broker-rejected smart-order modify /
-            // a calculator-vs-user margin divergence beyond tolerance —
-            // bounded, next-cycle-visible degrades. Medium.
-            Self::GrowwOco04ModifyRejected | Self::GrowwMarg05CalcDivergence => Severity::Medium,
+            // GROWW-OCO-04 (Groww order fan-out contract stubs, 2026-07-15):
+            // a broker-rejected smart-order modify — bounded,
+            // next-cycle-visible degrade. Medium.
+            Self::GrowwOco04ModifyRejected => Severity::Medium,
+            // GROWW-MARG-05 (2026-07-15): calculator divergence — visibility
+            // only; the conservative local buffer stands. Medium.
+            Self::GrowwMarg05CalcDivergence => Severity::Medium,
             // Low: trading-day / Dhan other
             // PR #6a (2026-05-19): I-P1-01 (DailyScheduler) + I-P1-02 (DeltaFieldCoverage) retired
             Self::InstrumentP2TradingDayGuard
@@ -1697,7 +1738,7 @@ impl ErrorCode {
             | Self::GrowwPort04ForeignPosition => {
                 ".claude/rules/project/groww-portfolio-error-codes.md"
             }
-            // Groww Smart Orders (GTT/OCO) + Margin fan-out contract stubs
+            // Groww Smart Orders (GTT/OCO) fan-out contract stubs
             // (2026-07-15): one runbook per §39.3 area.
             Self::GrowwOco01PlacementFailed
             | Self::GrowwOco02SiblingCancelUnverified
@@ -1706,6 +1747,7 @@ impl ErrorCode {
             | Self::GrowwOco05PollerDegraded => {
                 ".claude/rules/project/groww-oco-error-codes.md"
             }
+            // Groww pre-trade margin surface (§39.3 area slot #4, 2026-07-15)
             Self::GrowwMarg01FetchDegraded
             | Self::GrowwMarg02PersistFailed
             | Self::GrowwMarg03SnapshotStaleGateClosed
@@ -1740,10 +1782,11 @@ impl ErrorCode {
     /// - GROWW-PORT-03 (§39.3, 2026-07-14): a reconciliation verdict is an operator judgment — the FUTIDX-02 precedent.
     /// - GROWW-OCO-03 (2026-07-15): an OCO-pair reconcile mismatch vs the
     ///   broker is a data-comparability signal — the FUTIDX-02 precedent.
-    /// - GROWW-MARG-04 (2026-07-15): an insufficient-margin entry refusal
-    ///   on the POOLED shared account is spend-authorization territory —
-    ///   the funds-margin shared-account doctrine (the FUTIDX-02 override
-    ///   precedent).
+    /// - `GROWW-MARG-04` (Groww margin area, 2026-07-15): an
+    ///   insufficient-funds verdict on the SHARED (BruteX co-tenant) Groww
+    ///   account is an operator judgment — top up, resize, re-tune the
+    ///   buffer, or accept the no-trade; auto-triage must never act on a
+    ///   funds verdict (the FUTIDX-02 precedent).
     #[must_use]
     pub const fn is_auto_triage_safe(self) -> bool {
         if matches!(
@@ -1774,11 +1817,9 @@ impl ErrorCode {
                 // operator decides which side is wrong (the FUTIDX-02
                 // precedent).
                 | Self::GrowwOco03ReconcileMismatch
-                // GROWW-MARG-04 (2026-07-15): an insufficient-margin entry
-                // refusal on the POOLED shared account — spend
-                // authorization is operator territory (the funds-margin
-                // shared-account doctrine; the FUTIDX-02 override
-                // precedent).
+                // GROWW-MARG-04 (2026-07-15): a funds verdict on the shared
+                // account is an operator judgment — never auto-actioned
+                // despite High severity (the FUTIDX-02 precedent).
                 | Self::GrowwMarg04EntryRejectedInsufficient
         ) {
             return false;
@@ -1955,13 +1996,14 @@ impl ErrorCode {
             Self::GrowwPort02PersistFailed,
             Self::GrowwPort03ReconDivergence,
             Self::GrowwPort04ForeignPosition,
-            // Groww Smart Orders (GTT/OCO) + Margin fan-out contract stubs
+            // Groww Smart Orders (GTT/OCO) fan-out contract stubs
             // (2026-07-15)
             Self::GrowwOco01PlacementFailed,
             Self::GrowwOco02SiblingCancelUnverified,
             Self::GrowwOco03ReconcileMismatch,
             Self::GrowwOco04ModifyRejected,
             Self::GrowwOco05PollerDegraded,
+            // Groww pre-trade margin surface (§39.3 area slot #4, 2026-07-15)
             Self::GrowwMarg01FetchDegraded,
             Self::GrowwMarg02PersistFailed,
             Self::GrowwMarg03SnapshotStaleGateClosed,
@@ -2349,7 +2391,19 @@ mod tests {
         // mid-flight making the pre-merge base 149, and the exit-order
         // pair #1566 landed during the merge train making it 151 —
         // hence 151 -> 129, not 148 -> 126).
-        assert_eq!(ErrorCode::all().len(), 129);
+        // 2026-07-15 (Groww order fan-out contract stubs): bumped
+        // 129 -> 143. Groww Portfolio 6c.1 contract stubs (§39.3,
+        // 2026-07-14): +4 for GROWW-PORT-01 (snapshot fetch degraded) +
+        // GROWW-PORT-02 (persist failed, best-effort) + GROWW-PORT-03
+        // (recon residual confirmed — manual triage, FUTIDX-02 precedent)
+        // + GROWW-PORT-04 (foreign position — never auto-exited). Plus
+        // +5 GROWW-OCO-01..05 (smart-order placement/sibling-cancel-
+        // unverified/reconcile/modify/poller). All log-sink-only contract
+        // stubs; zero emit sites until the area code PRs land.
+        // 2026-07-15 (Groww margin area, §39.3 slot #4): GROWW-MARG-01..05
+        // (fetch degrade / audit persist / stale-gate-closed /
+        // entry-rejected [manual triage override] / calc divergence) => +5.
+        assert_eq!(ErrorCode::all().len(), 143);
     }
 
     #[test]
@@ -2561,6 +2615,169 @@ mod tests {
     }
 
     #[test]
+    fn test_groww_port_codes_contract() {
+        // 🟢 GROWW order-side fan-out contract stubs (2026-07-15) —
+        // Portfolio family. All High; zero emit sites until the area PR.
+        for (code, s, auto_safe) in [
+            (
+                ErrorCode::GrowwPort01SnapshotDegraded,
+                "GROWW-PORT-01",
+                true,
+            ),
+            (ErrorCode::GrowwPort02PersistFailed, "GROWW-PORT-02", true),
+            // GROWW-PORT-03: broker-vs-local reconcile divergence is a
+            // data-comparability signal — the severity-independent
+            // override arm returns false (the FUTIDX-02 precedent).
+            (
+                ErrorCode::GrowwPort03ReconDivergence,
+                "GROWW-PORT-03",
+                false,
+            ),
+            (ErrorCode::GrowwPort04ForeignPosition, "GROWW-PORT-04", true),
+        ] {
+            assert_eq!(code.code_str(), s);
+            assert_eq!(s.parse::<ErrorCode>(), Ok(code));
+            assert_eq!(code.severity(), Severity::High);
+            assert_eq!(code.is_auto_triage_safe(), auto_safe);
+            assert_eq!(
+                code.runbook_path(),
+                ".claude/rules/project/groww-portfolio-error-codes.md"
+            );
+            assert!(ErrorCode::all().contains(&code));
+            // The runbook must exist on disk (cross-ref test parity).
+            let abs = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .and_then(std::path::Path::parent)
+                .map(|root| root.join(code.runbook_path()))
+                .expect("workspace root");
+            let shown = abs.display().to_string();
+            assert!(abs.exists(), "{s} runbook missing on disk: {shown}");
+        }
+    }
+
+    #[test]
+    fn test_groww_oco_codes_contract() {
+        // 🟢 GROWW order-side fan-out contract stubs (2026-07-15) —
+        // Smart Orders (GTT/OCO) family.
+        for (code, s, sev, auto_safe) in [
+            (
+                ErrorCode::GrowwOco01PlacementFailed,
+                "GROWW-OCO-01",
+                Severity::High,
+                true,
+            ),
+            // GROWW-OCO-02: sibling-cancel UNVERIFIED past the deadline
+            // = a double-fill exposure window. Critical — auto-triage
+            // false via the Critical BLANKET (deliberately NOT an
+            // override-list entry; test_critical_codes_never_auto_triage
+            // also pins it).
+            (
+                ErrorCode::GrowwOco02SiblingCancelUnverified,
+                "GROWW-OCO-02",
+                Severity::Critical,
+                false,
+            ),
+            // GROWW-OCO-03: reconcile mismatch vs broker — the
+            // severity-independent override arm returns false (the
+            // FUTIDX-02 data-comparability precedent).
+            (
+                ErrorCode::GrowwOco03ReconcileMismatch,
+                "GROWW-OCO-03",
+                Severity::High,
+                false,
+            ),
+            (
+                ErrorCode::GrowwOco04ModifyRejected,
+                "GROWW-OCO-04",
+                Severity::Medium,
+                true,
+            ),
+            (
+                ErrorCode::GrowwOco05PollerDegraded,
+                "GROWW-OCO-05",
+                Severity::High,
+                true,
+            ),
+        ] {
+            assert_eq!(code.code_str(), s);
+            assert_eq!(s.parse::<ErrorCode>(), Ok(code));
+            assert_eq!(code.severity(), sev);
+            assert_eq!(code.is_auto_triage_safe(), auto_safe);
+            assert_eq!(
+                code.runbook_path(),
+                ".claude/rules/project/groww-oco-error-codes.md"
+            );
+            assert!(ErrorCode::all().contains(&code));
+            let abs = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .and_then(std::path::Path::parent)
+                .map(|root| root.join(code.runbook_path()))
+                .expect("workspace root");
+            let shown = abs.display().to_string();
+            assert!(abs.exists(), "{s} runbook missing on disk: {shown}");
+        }
+    }
+
+    #[test]
+    fn test_groww_marg_codes_contract() {
+        // Groww margin area (§39.3 slot #4, 2026-07-15): severities + the
+        // GROWW-MARG-04 severity-independent manual-triage override.
+        for (code, s, sev) in [
+            (
+                ErrorCode::GrowwMarg01FetchDegraded,
+                "GROWW-MARG-01",
+                Severity::High,
+            ),
+            (
+                ErrorCode::GrowwMarg02PersistFailed,
+                "GROWW-MARG-02",
+                Severity::High,
+            ),
+            (
+                ErrorCode::GrowwMarg03SnapshotStaleGateClosed,
+                "GROWW-MARG-03",
+                Severity::High,
+            ),
+            (
+                ErrorCode::GrowwMarg04EntryRejectedInsufficient,
+                "GROWW-MARG-04",
+                Severity::High,
+            ),
+            (
+                ErrorCode::GrowwMarg05CalcDivergence,
+                "GROWW-MARG-05",
+                Severity::Medium,
+            ),
+        ] {
+            assert_eq!(code.code_str(), s);
+            assert_eq!(s.parse::<ErrorCode>(), Ok(code));
+            assert_eq!(code.severity(), sev);
+            assert!(ErrorCode::all().contains(&code));
+            assert_eq!(
+                code.runbook_path(),
+                ".claude/rules/project/groww-margin-error-codes.md"
+            );
+            // The runbook must exist on disk (cross-ref test parity).
+            let abs = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .and_then(std::path::Path::parent)
+                .map(|root| root.join(code.runbook_path()))
+                .expect("workspace root");
+            let shown = abs.display().to_string();
+            assert!(abs.exists(), "{s} runbook missing on disk: {shown}");
+        }
+        // The override arm: High but NEVER auto-triaged — a funds verdict
+        // on the shared account is an operator judgment (the FUTIDX-02
+        // severity-independent override precedent).
+        assert!(!ErrorCode::GrowwMarg04EntryRejectedInsufficient.is_auto_triage_safe());
+        // The other four follow the blanket non-Critical derivation.
+        assert!(ErrorCode::GrowwMarg01FetchDegraded.is_auto_triage_safe());
+        assert!(ErrorCode::GrowwMarg02PersistFailed.is_auto_triage_safe());
+        assert!(ErrorCode::GrowwMarg03SnapshotStaleGateClosed.is_auto_triage_safe());
+        assert!(ErrorCode::GrowwMarg05CalcDivergence.is_auto_triage_safe());
+    }
+
+    #[test]
     fn test_ws_reinject_01_aborted_contract() {
         let code = ErrorCode::WsReinject01Aborted;
         // Wire-format string + roundtrip via FromStr.
@@ -2691,8 +2908,9 @@ mod tests {
                 // §39.3 Portfolio area (2026-07-14)
                 || s.starts_with("GROWW-PORT-")
                 // Groww order fan-out contract stubs (2026-07-15): Smart
-                // Orders (GTT/OCO) + Margin families.
+                // Orders (GTT/OCO) family.
                 || s.starts_with("GROWW-OCO-")
+                // Groww order-side margin area (§39.3 slot #4, 2026-07-15).
                 || s.starts_with("GROWW-MARG-");
             assert!(has_known_prefix, "unexpected code prefix: {s}");
         }

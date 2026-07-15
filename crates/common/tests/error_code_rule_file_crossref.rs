@@ -48,12 +48,15 @@ const TRACKED_PREFIXES: &[&str] = &[
     // family so a runbook code without an enum variant fails the build.
     "GROWW-PORT-",
     // 2026-07-15 (Groww order fan-out contract stubs): the Smart Orders
-    // (GTT/OCO) + Margin families are reverse-tracked the same way, so a
-    // digit-shaped GROWW-OCO-/GROWW-MARG- string in rule text always names
-    // a real ErrorCode variant. Starred forms like `GROWW-OCO-*` (the
-    // §39.3 area table) never match: `looks_like_a_code` requires the tail
-    // to start with a digit.
+    // (GTT/OCO) family is reverse-tracked the same way, so a digit-shaped
+    // GROWW-OCO- string in rule text always names a real ErrorCode
+    // variant. Starred forms like `GROWW-OCO-*` (the §39.3 area table)
+    // never match: `looks_like_a_code` requires the tail to start with a
+    // digit.
     "GROWW-OCO-",
+    // Groww order-side margin area (§39.3, 2026-07-15): the reverse-check
+    // now enforces enum variants for every GROWW-MARG-* mentioned in rule
+    // text.
     "GROWW-MARG-",
 ];
 

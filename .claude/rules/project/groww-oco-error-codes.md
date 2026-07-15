@@ -156,6 +156,12 @@ live-fire lattice (any Dhan-side page class by
 smart-order behaviour (status vocabulary, auto-cancel semantics,
 immutable-field set — all UNVERIFIED-LIVE until the first authorized
 session); any order fire (Gates 1–4 all closed; `dry_run` stays true).
+Write paths have NO transport retry (the double-send class) — any future
+write retry requires the GA007-idempotency-window probe answered first.
+Hardening notes (area-file discipline): `execute_write` re-checks Gate 3
+internally (defense-in-depth), response bodies are capped at 2 MiB
+pre-read, prices are validated strictly positive, and the HTTP client
+uses redirect `Policy::none`.
 
 ## §7. Trigger / auto-load
 

@@ -3612,6 +3612,32 @@ mod tests {
         );
     }
 
+    /// PR-0 / Smart Orders area (2026-07-15): an ABSENT `[groww_orders]`
+    /// section (empty TOML) must deserialize to EXACTLY `Default`. This pins
+    /// Default↔serde-default parity so a future removal of any
+    /// `#[serde(default…)]` attribute — which would make an absent field a
+    /// hard deserialize ERROR (the two OCO cadences) or silently zero a u64 —
+    /// fails the build. (`GrowwOrdersConfig` derives no `PartialEq`, so the
+    /// nine fields are compared explicitly against `Default`.)
+    #[test]
+    fn test_groww_orders_config_absent_section_serde_parity() {
+        let parsed: GrowwOrdersConfig = toml::from_str("")
+            .expect("absent [groww_orders] section must parse via serde defaults");
+        let def = GrowwOrdersConfig::default();
+        assert_eq!(parsed.orders_read, def.orders_read);
+        assert_eq!(parsed.portfolio_read, def.portfolio_read);
+        assert_eq!(parsed.margin_read, def.margin_read);
+        assert_eq!(parsed.user_read, def.user_read);
+        assert_eq!(parsed.live_fire_requested, def.live_fire_requested);
+        assert_eq!(parsed.smart_orders_read, def.smart_orders_read);
+        assert_eq!(parsed.smart_orders_write, def.smart_orders_write);
+        assert_eq!(parsed.oco_reconcile_poll_secs, def.oco_reconcile_poll_secs);
+        assert_eq!(
+            parsed.oco_sibling_cancel_deadline_secs,
+            def.oco_sibling_cancel_deadline_secs
+        );
+    }
+
     // -----------------------------------------------------------------------
     // TradingMode tests
     // -----------------------------------------------------------------------

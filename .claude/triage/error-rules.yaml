@@ -2443,9 +2443,20 @@ rules:
       is live (the sibling-verification window) per the runbook —
       nothing is safe to auto-fix.
 
-  # GROWW-MARG-01 = the /v1/margins/detail/user fetch leg degraded — the
-  # next poll retries; a sustained degrade ages the snapshot toward the
-  # MARG-03 fail-closed stale gate (the designed consequence).
+  # -----------------------------------------------------------------------
+  # Groww pre-trade margin surface (§39.3 area slot #4, 2026-07-15)
+  # -----------------------------------------------------------------------
+
+  # GROWW-MARG-01 = the per-poll 60s in-session Groww user-margin fetch
+  # degraded (stage names the leg: transport / timeout / status / auth /
+  # rate_limited / oversize / parse / failure_envelope / shape_incomplete /
+  # sanity / no_token, + the 3-consecutive escalation edge). Self-healing
+  # by construction — the next poll re-attempts; an invalid payload is
+  # never stored and the prior snapshot ages toward the GROWW-MARG-03
+  # fail-closed edge. Escalate for visibility: sustained auth = the shared
+  # token-minter Lambda; sustained rate_limited = the BruteX co-tenant is
+  # exhausting the pooled bucket — both are operator calls, never
+  # auto-fixed (no script can mint a token or out-poll a shared budget).
   - name: groww-marg-01-fetch-degraded-escalate
     match:
       code: GROWW-MARG-01
@@ -2454,13 +2465,16 @@ rules:
     confidence: 1.0
     cooldown_secs: 600
     justification: >-
-      GROWW-MARG-01 = margin fetch degraded. The next poll retries and
-      the stale gate fails closed for entries meanwhile; the operator
-      cross-checks the shared token + sibling Groww REST legs per the
-      runbook.
+      GROWW-MARG-01 = Groww margin fetch degraded. The poll loop already
+      self-heals (next 60s attempt; fail-closed staleness backstop); the
+      operator inspects the stage taxonomy for token/rate-limit/shape
+      causes per the runbook — nothing is safe to auto-fix.
 
-  # GROWW-MARG-02 = the margin snapshot persist leg failed (best-effort;
-  # DEDUP-idempotent re-append; the RAM gate input is persist-independent).
+  # GROWW-MARG-02 = the margin audit persist leg failed (ensure-DDL / ILP
+  # append / ILP-over-HTTP flush). Best-effort forensic write: gate
+  # decisions are RAM-only and unaffected; re-appends are DEDUP-idempotent.
+  # Escalate so the operator runs the Day-1 DEDUP-verify checklist and
+  # cross-checks QuestDB health (BOOT-01/02, WAL-SUSPEND-01).
   - name: groww-marg-02-persist-failed-escalate
     match:
       code: GROWW-MARG-02
@@ -2469,14 +2483,17 @@ rules:
     confidence: 1.0
     cooldown_secs: 600
     justification: >-
-      GROWW-MARG-02 = margin snapshot persist failed. Forensic rows for
-      the outage window are missing until QuestDB recovers (make
-      doctor); the gate's RAM input is unaffected — operator
-      inspection, never a blind auto-fix.
+      GROWW-MARG-02 = margin audit persist failed. Forensic rows for the
+      outage window are missing until QuestDB recovers; gate decisions
+      were never at risk. Operator checks QuestDB health + the DEDUP
+      window per the runbook.
 
-  # GROWW-MARG-03 = the margin snapshot exceeded stale_secs and the gate
-  # failed CLOSED for entries (exits are NEVER margin-gated). The page is
-  # visibility of the fail-closed design working — not an action request.
+  # GROWW-MARG-03 = the Groww margin snapshot went stale (>stale_secs /
+  # absent / previous-IST-date) and the entry gate CLOSED fail-closed.
+  # Exits are unaffected; the next fresh poll self-heals. Escalate: a
+  # stale-gate episode during market hours means entries are refused and
+  # the operator must know WHY polls are failing (cross-check
+  # GROWW-MARG-01) — force-opening the gate is never an option.
   - name: groww-marg-03-stale-gate-closed-escalate
     match:
       code: GROWW-MARG-03
@@ -2485,17 +2502,20 @@ rules:
     confidence: 1.0
     cooldown_secs: 600
     justification: >-
-      GROWW-MARG-03 = margin snapshot stale, entry gate closed
-      fail-closed. Entries resume automatically on a fresh snapshot;
-      the operator triages the upstream fetch degrade (GROWW-MARG-01)
-      — force-opening the gate is never an option.
+      GROWW-MARG-03 = margin snapshot stale, entry gate closed. The
+      fail-closed refusal IS the protection; only a fresh successful poll
+      re-opens it. Operator triages the underlying fetch health — nothing
+      is safe to auto-fix.
 
-  # GROWW-MARG-04 = an entry refused on insufficient margin after
-  # buffer_pct + floor_paise. is_auto_triage_safe = false
-  # (severity-independent override): spend authorization on the POOLED
-  # shared account is operator territory (funds-margin shared-account
-  # doctrine; FUTIDX-02 override precedent).
-  - name: groww-marg-04-entry-rejected-escalate
+  # GROWW-MARG-04 = ENFORCE-mode entry rejected — insufficient usable
+  # funds after the safety buffer + carry-across-swap pending ledger +
+  # min-free floor on the SHARED (BruteX co-tenant) Groww account.
+  # Escalate — NOT auto-triage safe (is_auto_triage_safe() == false
+  # severity-independent override, the FUTIDX-02 / WAL-SUSPEND-01
+  # precedent): whether to top up funds, shrink sizing, re-tune the
+  # buffer, or accept the no-trade is an operator judgment over a shared
+  # account; auto-triage must never act on a funds verdict.
+  - name: groww-marg-04-entry-rejected-insufficient-escalate
     match:
       code: GROWW-MARG-04
     action: escalate
@@ -2503,14 +2523,16 @@ rules:
     confidence: 1.0
     cooldown_secs: 600
     justification: >-
-      GROWW-MARG-04 = entry refused for insufficient pooled margin.
-      Never auto-actioned — the operator decides fund/resize/stand-down;
-      the co-tenant shares the balance so a refusal is never
-      auto-overridden.
+      GROWW-MARG-04 = enforce-mode entry rejected on insufficient usable
+      funds. A funds verdict on the shared account is an operator
+      judgment (severity-independent is_auto_triage_safe override);
+      the payload carries the full paise arithmetic for the decision.
 
-  # GROWW-MARG-05 = margin-calculator vs user-margin divergence beyond
-  # tolerance — a trend signal (neither side is ground truth, the §37
-  # doctrine); the next poll re-measures.
+  # GROWW-MARG-05 = the cold-path margin-calculator verifier found the
+  # broker's total requirement diverging from the local
+  # premium-with-buffers formula beyond tolerance. Visibility only — the
+  # conservative local buffer stands and the enforce-flip is BLOCKED
+  # until resolved; a dated operator note re-tunes, never an auto-fix.
   - name: groww-marg-05-calc-divergence-escalate
     match:
       code: GROWW-MARG-05
@@ -2519,6 +2541,7 @@ rules:
     confidence: 1.0
     cooldown_secs: 600
     justification: >-
-      GROWW-MARG-05 = calculator-vs-user margin divergence. Track the
-      trend per the runbook (rounding/timing skew vs parse drift) —
-      nothing is safe to auto-fix on a comparability signal.
+      GROWW-MARG-05 = calculator divergence from the local margin
+      formula. One coalesced warn per day; the operator compares the
+      local vs broker numbers per the runbook and re-tunes with a dated
+      note — nothing is auto-adjusted.
