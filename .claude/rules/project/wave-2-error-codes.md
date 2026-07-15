@@ -117,6 +117,20 @@ classify/backoff/terminal-behaviour unit + tokio tests beside it).
 
 ## WS-GAP-06 — tick-gap detector fired a coalesced summary
 
+> **⚠ RETIREMENT AUTHORIZED 2026-07-13 — deletion LANDED in PR-C3 (2026-07-14):** the
+> tick-gap detector and this code are DELETED with the Dhan live WS (operator Q4-ii
+> "agreed dude" — *tick-gap detector + WS-GAP-06 deleted; the Groww feed-stall watchdog
+> owns stall detection*, 2026-07-13; full contract in `websocket-connection-scope-lock.md`
+> "2026-07-13 Amendment"). The detector was fed ONLY by the Dhan WS pipeline
+> (`record_tick_global` at `tick_processor.rs`; the Groww bridge never recorded into it —
+> Phase B map, Verified), so post-retirement it is a no-input shell. Honest envelope of
+> the deletion: FEED-level stall detection for Groww is `FEED-STALL-01`
+> (`feed-stall-watchdog-error-codes.md`); PER-SID silence visibility moves to the
+> scoreboard presence/coverage columns (15:45 IST cadence) — there is deliberately NO 30s
+> per-SID page anymore. The `tv_tick_gap_instruments_silent` gauge, the WS-GAP-06 seeding,
+> and the §36 far-month alarm-gate exclusion die with it. Content below retained for
+> historical audit.
+
 **Trigger:** Item 8's `TickGapDetector` observed ≥1 instrument with
 silence ≥30s during the most recent 60s coalesce window.
 
@@ -349,6 +363,19 @@ and the ceiling fallback restarts exactly as the legacy Halt did).
 
 ## WS-GAP-10 — order-update WebSocket in-market outage (in-loop HIGH page)
 
+> **⚠ 2026-07-14 UPDATE (operator Dhan noise lock —
+> `dhan-rest-only-noise-lock-2026-07-14.md` +
+> `websocket-connection-scope-lock.md` §A.1):** the `dhan_rest_stack`
+> Phase 5a order-update spawn is CUT — NO live caller of
+> `run_order_update_connection` remains on a dhan-off boot (the legacy
+> fast-arm/lane sites are Dhan-gated dead code deleted by the Phase C-2
+> PR). The core module `order_update_connection.rs` is RETAINED DORMANT
+> (unit tests stay) for the live-trading re-wire, so this section's
+> WS-GAP-10 machinery is dormant code, not a live pager. The two
+> CloudWatch alarms (`tv-<env>-order-update-ws-inactive`,
+> `tv-<env>-order-update-reconnect-storm`) are DELETED with the spawn.
+> Content below retained as historical audit + the re-wire reference.
+
 **Trigger:** ≥ `ORDER_UPDATE_OUTAGE_PAGE_FAILURE_THRESHOLD` (3) consecutive
 in-market order-update reconnect failures → ONE
 `error!(code = "WS-GAP-10", reason = "in_market_outage")` + ONE `[HIGH]`
@@ -489,6 +516,44 @@ are SEBI-relevant — write failures must surface immediately.
 applies to this table.
 **Source:** `crates/storage/src/order_audit_persistence.rs`
 
+### 2026-07-14 rebuild (cluster-C order-side observability)
+
+The `order_audit` module was REBUILT on the modern
+`rest_fetch_audit_persistence.rs` template (the pre-deletion source is
+history only):
+
+- **DEDUP key (verbatim):** `ts, trading_date_ist, order_id, leg, event, feed`
+  — `order_id` is the identity (NOT `security_id`; the I-P1-11 pair does
+  not apply to order events — one order has one instrument, and two
+  lifecycle events for the same order at the same instant must BOTH
+  survive, hence `event` in-key). `feed` per the feed-in-key override.
+- **Transport:** ILP-over-HTTP with per-flush server ACK (the 2026-07-05
+  fire-and-forget lesson); failed flush → `discard_pending`
+  (poisoned-buffer defense, `tv_order_audit_rows_discarded_total`).
+- **Stages on the `error!` (`code = AUDIT-06`):** `ensure_client_build` /
+  `ensure_ddl` (HTTP-CLIENT-01-class duplicate-row window until a later
+  ensure succeeds) / `append` / `flush` / `sink_drop` (the bounded
+  order-side channel refused a message — the row AND its Telegram page
+  are lost for that one event; best-effort forensics, the order path is
+  unaffected).
+- **Delivery boundary (honest):** AUDIT-06 is **log-sink-only** — no
+  `error_code_alerts` map entry; the operator signals are the order-side
+  sink's typed Telegram events + the daily OMS-GAP-02 reconcile verdict.
+  Adding a CW log filter is a flagged follow-up.
+- **Counters:** `tv_order_audit_rows_total{event}`,
+  `tv_order_audit_persist_errors_total{stage}`,
+  `tv_order_audit_nonfinite_clamped_total`,
+  `tv_order_alert_dropped_total{reason}`.
+- Consumer: `crates/app/src/order_observability.rs` (paper rows TODAY —
+  `mode = "paper"` while `dry_run = true`).
+- **Rejection-class split (C4, 2026-07-14 hostile review):** place-time
+  API rejections (the `place_order` Err arm — OrderRejected Telegram +
+  `rejected` audit row + since the C4 fix `tv_orders_rejected_total`) and
+  WS-reported REJECTED transitions (`process_order_update` — counter/alarm
+  only, NO Telegram/row; a `fire_alert` at that transition is a Phase-1
+  follow-up) are DISJOINT classes — the orders-rejected alarm and the
+  OrderRejected Telegram are two routes, not one signal chain.
+
 ## STORAGE-GAP-03 — audit-table write failure (any table)
 
 **Trigger:** any audit-table writer hit an unrecoverable error after the
@@ -496,6 +561,26 @@ ring + spill backoff exhausted. Coalesces AUDIT-01..06.
 
 **Triage:** see specific AUDIT-NN code emitted alongside.
 **Source:** `crates/storage/src/{phase2,depth_rebalance,ws_reconnect,boot,selftest,order}_audit_persistence.rs`
+
+### 2026-07-14 note — pnl_audit rebuild emits this code (cluster-C)
+
+`crates/storage/src/pnl_audit_persistence.rs` (rebuilt on the same
+ILP-over-HTTP template as order_audit above) emits STORAGE-GAP-03 with
+stages `ensure_client_build` / `ensure_ddl` / `append` / `flush`. DEDUP
+key: `ts, trading_date_ist, security_id, exchange_segment, snapshot_kind,
+feed` (I-P1-11 pair + `snapshot_kind` + `feed` in-key). **OnEod heartbeat
+contract (honest envelope — C1 truth-sync, 2026-07-14):** WHILE the
+order-side consumer runs, it writes ≥1 `snapshot_kind = "on_eod"` row per
+trading day (aggregate sentinels `security_id = 0`, `exchange_segment =
+"ALL"`) at the market-close message — the positive "the pnl audit leg is
+alive" signal (audit Rule 11) and the daily reconcile denominator. The
+consumer + close signal are spawned by the trading pipeline, whose BOTH
+spawn sites are Dhan-lane-gated — the subsystem is code-ready but DORMANT
+while `feeds.dhan_enabled = false` (today's prod default): on a dhan-off
+boot no row lands and nothing false-pages (nothing runs); the contract
+activates whenever the Dhan lane / live trading runs. `on_fill` /
+`on_minute` are Phase-1 emits (documented, dormant). Log-sink-only
+delivery boundary, same as AUDIT-06.
 
 ## STORAGE-GAP-04 — S3 archive failure
 

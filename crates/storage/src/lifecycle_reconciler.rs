@@ -23,8 +23,6 @@
 //! * `instrument_lifecycle_persistence` — the table contracts + writers
 //!   these decisions feed.
 
-#![cfg(feature = "daily_universe_fetcher")]
-
 use crate::instrument_lifecycle_persistence::{LifecycleState, TransitionKind};
 
 /// §23 corporate-action (split / bonus) detection.

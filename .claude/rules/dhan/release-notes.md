@@ -5,6 +5,13 @@
 > **Cross-reference:** All other `docs/dhan-ref/` files
 >
 > **Note**: Version labels (v2.0-v2.5) are our internal mapping of Dhan's feature-dated releases. Dhan does not use formal version numbers.
+>
+> **2026-07-14 note (runner-crawled, Verified-live):** the live releases page NOW uses formal
+> "Version 2.x" headings — the "Dhan does not use formal version numbers" sentence above is
+> outdated. The v2.0–v2.5 numbers are upstream; only the repo's "v2.5.1 (Mar 17 2026)" remains
+> an internal label (absent from the live page — comms/SDK-sourced). Latest live entry:
+> Version 2.5, Feb 09 2026. See `docs/dhan-ref/16-release-notes.md` "2026-07-14 Upstream
+> Update".
 
 ## Mechanical Rules
 

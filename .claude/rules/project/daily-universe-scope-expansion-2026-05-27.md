@@ -1,5 +1,13 @@
 # Daily Universe Scope Expansion — Operator Lock 2026-05-27
 
+> **⚠ DHAN SUBSCRIPTION CONTRACT RETIRED 2026-07-13 (operator directive — see `websocket-connection-scope-lock.md` "2026-07-13 Amendment"):** the Dhan live main-feed WS is retired (operator verbatim Q1: *"now remove this entire Dhan live websocket feed instruments subscription even entire live websocket feed itself..."*; Q3: *"Just Dhan live websocket feed instruments download — I mean the entire process completely related to Dhan live websocket feed itself should be switched off entirely or removed"* + verbatim intent: *"hereafter no Dhan instrument download/parsing — just direct hardcoded security IDs passed to spot 1m and option chain"*). Effects on THIS lock:
+> **(a) The daily-universe SUBSCRIPTION contract is RETIRED** — the §1/§2 ~343-SID Quote-mode subscription, the §3 daily Detailed-CSV fetch, the §4 infinite-retry boot-block, the §9 L1–L7 fetch defense, the §10 Step-6c orchestrator, the §20/§22/§29 escape valves, and `SubscriptionScope::DailyUniverse` are all retired; the Phase C code PRs delete the chain (INSTR-FETCH-01..04 / NTM-CONSTITUENCY-01 retire with it). There is NO Dhan instrument download at all — the retained Dhan REST pulls use the hardcoded `SPOT_1M_REST_INDICES` (13/25/51).
+> **(b) `instrument_lifecycle` / `instrument_lifecycle_audit` / `index_constituency` SEBI retention STANDS UNCHANGED (§5/§6/§25)** — rows are NEVER deleted; `feed='dhan'` rows simply stop being written (retained as point-in-time history), the Groww `shared_master_writer` keeps writing `feed='groww'` rows, and the process-global ts-pin migration is KEPT.
+> **(c) Groww's watch build is UNAFFECTED** — it consumes its OWN master CSV + the niftyindices NTM list (Verified: zero Dhan-CSV consumption in `crates/core/src/feed/groww/`); the §31/§31.1 NTM contract lives on in the Groww resolver (`build_isin_token_map`).
+> **(d) §36 FUTIDX: the DHAN leg is RETIRED with the subscription contract; the GROWW leg STANDS** (§36.7 all-months, envelope ≤6/underlying, never-roll). The shared selector `index_futures.rs::select_index_future_expiries` becomes single-feed (must be DE-GATED from the `daily_universe_fetcher` cargo feature in Phase C or the Groww futures silently drop — scope violation); the FUTIDX-02 cross-feed parity comparator goes structurally DORMANT (fires only when both feeds record; variant retained — see `futidx-4-error-codes.md`).
+> **(e) The §7 instance/schedule/cost lock (r8g.large, 08:30–16:30 IST, ~₹2,919/mo) is UNTOUCHED by this banner.**
+> Sections below are retained as historical audit per house convention; where they conflict with the 2026-07-13 amendment, the amendment wins.
+
 > **Authority:** CLAUDE.md > `operator-charter-forever.md` §I > this file > `websocket-connection-scope-lock.md` (SUPERSEDED below) > `aws-budget.md` (SUPERSEDED below) > defaults.
 > **Scope:** PERMANENT. Every Phase. Every PR. Every future Claude/Cowork session.
 > **Operator-locked:** 2026-05-27 (verbatim quotes preserved below).
@@ -66,6 +74,7 @@
 - 2026-06-02: Operator WIDENED the schedule from 08:30–16:30 IST to **08:00–17:00 IST** (verbatim: "instead of 8.30 am make it as 8 am till 5 pm dude so that pre-market and post-market and deployment and all other activities can run without any worries"). Crons: start `cron(30 2 ? * MON-FRI *)` (02:30 UTC = 08:00 IST), stop `cron(30 11 ? * MON-FRI *)` (11:30 UTC = 17:00 IST). Cost: +1 hr/day (~+₹120/mo), still inside the ~₹2,058/mo envelope. This dated quote satisfies §7 Mechanical Rule 1 for the schedule change.
 - 2026-06-05: Operator NARROWED the schedule back from 08:00–17:00 IST to **08:30–16:30 IST** (verbatim: "make the aws instance start and stop from 8.30 am till 4.30 pm dude one and only when it is needed let me start it manually"). Crons: start `cron(0 3 ? * MON-FRI *)` (03:00 UTC = 08:30 IST), stop `cron(0 11 ? * MON-FRI *)` (11:00 UTC = 16:30 IST). The start-watchdog ping/check move to 08:30/08:45 IST; the GitHub-Actions after-close start cron + `aws-autopilot.sh`/`deploy-aws.yml` up-window move to 08:30–16:30 in lockstep. Cost: −1 hr/day (~−₹120/mo). The 08:30 start still gives the documented §10 boot budget before the 09:00 pre-open. This dated quote satisfies §7 Mechanical Rule 1 + §12 for the schedule change and supersedes the 2026-06-02 widening.
 - 2026-06-30: Approved instance UPGRADE m8g.large → **r8g.large** (Graviton4, 2 vCPU / 16 GiB) + EIP KEPT per Quote 7; bill ~₹2,058/mo → ~₹2,919/mo incl GST (270 hrs, 30 GB EBS, +EIP). The 2K-universe expansion is deferred to a separate later PR.
+- 2026-07-13: Approved EBS grow 30 GB -> 50 GB gp3 (+~₹170/mo incl GST) + instance-role S3 write on tv-prod-cold/groww-capture/* (Groww capture archival), per operator quote: "go ahead and merge everything once it is green - yes do whatever is the recommendation" (prod disk-pressure remediation - disk hit 82% on 2026-07-13 with zero reclamation). Note: the instance role's existing cold-bucket statement (main.tf, s3:GetObject/PutObject/ListBucket on the whole `tv-<env>-cold` bucket) ALREADY covers the groww-capture/* prefix — no IAM change was needed. Bill ~₹2,919/mo → ~₹3,101/mo incl GST (recomputed below).
 
 ---
 
@@ -208,14 +217,14 @@ r8g.large is the right family/size for 2 vCPU / 16 GiB. EBS-backed (NOT the
 | Tenancy | Default (Shared) |
 | Pricing | On-demand **$0.08258/hr** (live ap-south-1, 2026-06-30) — no Reserved / Savings Plan / Spot |
 | Schedule | **Trading weekdays only (Mon–Fri), 08:30–16:30 IST auto** (start `cron(0 3 ? * MON-FRI *)`, stop `cron(0 11 ? * MON-FRI *)`) — narrowed back from 08:00–17:00 on 2026-06-05 per operator ("make the aws instance start and stop from 8.30 am till 4.30 pm"; supersedes the 2026-06-02 widening). Out-of-window runs = operator manual start. Weekends + holidays = OFF unless manually started. |
-| EBS | gp3 30 GB (unchanged) |
+| EBS | gp3 **50 GB** (2026-07-13 grow; was 30) |
 | EIP | 1 (24/7) — **KEPT** (`enable_eip = true`, 2026-05-31 flip; without it the box has no public IP after a stop/modify/start → unreachable by SSM + Dhan) |
 | Network | ENA enabled by default |
 
-### Cost bill (LOCKED ~₹2,919/mo incl. 18% GST — 270 hrs, 30 GB EBS, +EIP)
+### Cost bill (LOCKED ~₹3,101/mo incl. 18% GST — 270 hrs, 50 GB EBS, +EIP; was ~₹2,919 at 30 GB pre-2026-07-13)
 
 Operator-set ceiling **270 running hours/month** (auto weekday schedule
-~176 hrs + manual runs). **EBS 30 GB** (Quote 6). **Elastic IP KEPT**
+~176 hrs + manual runs). **EBS 50 GB** (2026-07-13 grow; was 30 per Quote 6). **Elastic IP KEPT**
 (`enable_eip = true`, 2026-05-31 — the box needs a public IP at all). r8g.large
 @ $0.08258/hr, $1 ≈ ₹85. **Every running component is itemised below —
 monitoring, alerting, Docker, Lambdas, Telegram are all included and
@@ -225,7 +234,7 @@ free-tier.**
 |---|---|---|
 | EC2 r8g.large (hosts app + Docker + QuestDB) | $0.08258/hr × 270 hrs | $22.30 |
 | Elastic IP (24/7, KEPT) | $0.005/hr × 720 hrs | $3.60 |
-| EBS gp3 30 GB | $0.0912 × 30 | $2.74 |
+| EBS gp3 50 GB (2026-07-13 grow; was 30 → $2.74) | $0.0912 × 50 | $4.56 |
 | S3 cold (aged-out partitions) | tiny, grows over time | $0.18 |
 | Docker (QuestDB + tickvault containers) | runs on the EC2 host | $0.00 |
 | CloudWatch metrics (10 custom) | free tier = 10 | $0.00 |
@@ -236,21 +245,23 @@ free-tier.**
 | SNS → Telegram + Email fan-out | free tier (1M / 1k) | $0.00 |
 | SNS → SMS (optional) | ~100 India msgs | $0.28 |
 | Data transfer out | ~14 GB < 100 GB free egress | $0.00 |
-| **Subtotal (pre-GST)** | | **$29.10** |
-| **× ₹85/$** | | **₹2,474** |
-| **+ 18% GST (AWS India)** | | **~₹2,919/mo** |
+| **Subtotal (pre-GST)** | | **$30.92** |
+| **× ₹85/$** | | **₹2,628** |
+| **+ 18% GST (AWS India)** | | **~₹3,101/mo** |
 
-**Honest envelope:** ~**₹2,919/month all-in including GST** at the 270-hr
-ceiling, 30 GB EBS, with the EIP kept. The r8g.large upgrade adds ~₹420/mo over
+**Honest envelope:** ~**₹3,101/month all-in including GST** at the 270-hr
+ceiling, 50 GB EBS, with the EIP kept. The 2026-07-13 EBS grow adds ~₹180/mo
+(the EBS line moves $2.74 → $4.56). The r8g.large upgrade added ~₹420/mo over
 the prior m8g.large bill (the EC2 line moves $17.32 → $22.30) and the EIP adds
-~₹306/mo vs the superseded EIP-excluded figure — net ~₹2,919 vs the prior
-~₹2,058. **The entire observability stack — CloudWatch
+~₹306/mo vs the superseded EIP-excluded figure — the pre-grow bill was ~₹2,919
+vs the prior ~₹2,058. **The entire observability stack — CloudWatch
 metrics/alarms/logs/dashboards, all 3 Lambdas, and Telegram + Email alert
 fan-out — costs ₹0** (low-volume control-plane services sit inside AWS's
 permanent free tier per §7 Rule 5's CloudWatch-only design; only optional SMS
-is ~₹24). 30 GB chosen over 100 GB because the partition manager archives >90d
-data to S3 (~4× cheaper/GB), so EBS holds only the hot window; gp3 grows online
-if needed. The EIP is kept because an `aws ec2 modify-instance-attribute`
+is ~₹24). 30 GB was originally chosen over 100 GB because the partition manager
+archives >90d data to S3 (~4× cheaper/GB), so EBS holds only the hot window;
+gp3 grows online if needed — exercised 2026-07-13 with the 30→50 grow when the
+root fs hit 82% before any partition reached the 90-day archival age. The EIP is kept because an `aws ec2 modify-instance-attribute`
 instance-type flip (stop→modify→start) leaves the ENI with NO ephemeral public
 IP (auto-assign-public-IP is a fresh-launch-only attribute), so only the EIP
 gives the box an internet path to SSM + Dhan. **Tax:** 18% GST total (IGST
@@ -290,7 +301,7 @@ AWS list rates. Budget alarm ceiling = $35/mo pre-GST. Operator approved
    - **Total used: ~8.2 GB**
    - **Headroom: ~7.8 GB** — well above the 1 GB Linux kswapd floor; the doubled RAM is the reason for the r-family upgrade. (The 2K-universe expansion is a SEPARATE later PR — at ~2K SIDs the app working set grows toward ~6.4 GB and is re-measured before go-live.)
 
-3. **EBS = 30 GB gp3** (operator lock 2026-05-29 Quote 6, raised from 10 GB; 30 chosen over 100 to keep the all-in bill ~₹2,058/mo near the operator's <₹2,000 target). The partition manager auto-archives partitions >90d to the S3 cold bucket (~4× cheaper per GB than EBS), so EBS holds only the hot window. gp3 **grows online** (no stop, no data loss) — 30 GB is a floor; raise it live if the hot window grows. Internal/instance (m8gd local NVMe) storage is NOT used — it is wiped on every daily auto-stop, so it cannot hold QuestDB data. Terraform `ebs_gp3_size_gb` default = 30, range 10–200.
+3. **EBS = 50 GB gp3** (operator approval 2026-07-13 — "go ahead and merge everything once it is green - yes do whatever is the recommendation", prod disk-pressure remediation: root fs hit 82% on 2026-07-13 growing ~2.5–3.6 GB/day with zero reclamation. History: 10 GB → 30 GB per the 2026-05-29 Quote 6 lock [30 chosen over 100 to keep the then-bill ~₹2,058/mo near the <₹2,000 target] → 50 GB 2026-07-13). The partition manager auto-archives partitions >90d to the S3 cold bucket (~4× cheaper per GB than EBS), so EBS holds only the hot window. gp3 **grows online** (no stop, no data loss) — 50 GB is a floor; raise it live if the hot window grows. Internal/instance (m8gd local NVMe) storage is NOT used — it is wiped on every daily auto-stop, so it cannot hold QuestDB data. Terraform `ebs_gp3_size_gb` default = 50, range 10–200; the LIVE volume is grown out-of-band (`scripts/aws-upgrade-instance.sh --ebs-size 50`, online `aws ec2 modify-volume`) because `root_block_device[0].volume_size` is in the instance `lifecycle.ignore_changes` — `terraform apply` never touches the live volume.
 
 4. **No paid AWS services** (RDS, ElastiCache, NAT Gateway, ALB) without budget review.
 
@@ -1074,8 +1085,9 @@ futidx_scope_legacy_gate_still_false}`; the selector boundary + proptest suite i
 `test_select_index_future_expiries_drops_expired_month_next_morning`,
 `test_select_monthly_serial_flood_degrades_whole_underlying`,
 `test_cross_feed_parity_far_suffix_is_depth_only`, `test_cross_feed_parity_hole_is_divergence`);
-planner/snapshot/Groww ratchets per `.claude/plans/active-plan-futidx-4.md` +
-`.claude/plans/active-plan-futidx-allmonths.md` (2026-07-10).
+planner/snapshot/Groww ratchets per `.claude/plans/archive/2026-07-08-futidx-4.md` +
+`.claude/plans/archive/2026-07-10-futidx-allmonths.md` (2026-07-10; both archived from
+active 2026-07-13 per plan-enforcement rule 7).
 
 ## §36.6 Auto-driver explanation
 

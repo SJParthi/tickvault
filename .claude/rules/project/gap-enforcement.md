@@ -295,6 +295,24 @@ SSM; exactly one middleware OOB hint site).
 - Unknown Dhan status → skip (not panic), not counted in `total_checked`
 - Test: all `reconciliation::tests::*` + integration `oms_reconciliation::*`
 
+### 2026-07-14 note — order-side daily reconcile emit (cluster-C)
+
+The FIRST production OMS-GAP-02 emit site is the order-side consumer's
+daily reconcile (`crates/app/src/order_observability.rs`, fired at the
+market-close PnlEod message on trading days): a PROCESS-INTERNAL ledger
+verdict over the day's order-side messages —
+`received == appended + dropped` AND `dropped == 0` AND the OnEod pnl
+row flushed. `Mismatch` → `error!(code = OMS-GAP-02)` naming the three
+counters + the db_count (an INFORMATIONAL bounded `/exec`
+`select count(*) from order_audit where trading_date_ist IN '<date>'` —
+never part of the verdict: a mid-day restart or QuestDB outage makes the
+db count legitimately differ from the process ledger); an unreadable
+db_count classifies `Unverified`, never a false Mismatch. This is NOT
+the broker order-book REST reconcile above (that driver needs live mode
++ a `no-rest-except-live-feed` §3 ruling — flagged follow-up).
+Log-sink-only delivery boundary (no CW filter yet — flagged follow-up).
+Tests: `order_observability::tests::test_reconcile_verdict_*`.
+
 ## OMS-GAP-03: Circuit Breaker (3-State FSM)
 - Initial state must be `Closed`
 - Opens after `OMS_CIRCUIT_BREAKER_FAILURE_THRESHOLD` consecutive failures
@@ -364,6 +382,21 @@ SSM; exactly one middleware OOB hint site).
 - Position limit: `(current + new).abs() > max_lots` → reject
 - Order of checks: halt → daily loss → position limit
 - Test: integration `risk_engine::*`
+
+### 2026-07-14 note — first production RISK-GAP-01 coded emit (cluster-C)
+
+`crates/trading/src/risk/engine.rs::trigger_halt` now carries
+`code = ErrorCode::RiskGapPreTrade.code_str()` on its `error!` (the emit
+existed since Phase 0 but was UNCODED — invisible to coded-error triage;
+its stale "ERROR level triggers Telegram via Loki → Grafana" routing
+comment died with the CloudWatch-only migration and is deleted). The
+coded line is **log-sink-only**; the operator page is the order-side
+sink's typed **Critical RiskHalt** Telegram event (never session-gated,
+once per halt episode via trading's own `!self.halted` latch), plus the
+redundant counter-side `tv-<env>-daily-loss-breach` CW alarm
+(order-side-alarms.tf, arm-on-arrival — tv_daily_pnl is cluster A's
+emit). Ratchet:
+`crates/app/tests/order_side_wiring_guard.rs::test_risk_halt_error_is_coded_risk_gap_01`.
 
 ## RISK-GAP-02: Position & P&L Tracking
 - `record_fill()`: reducing fills → realized P&L computed correctly

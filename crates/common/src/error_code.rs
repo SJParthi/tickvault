@@ -905,6 +905,127 @@ pub enum ErrorCode {
     /// (`TICKVAULT_SCOREBOARD_NOW`) backfill the day. Severity::Medium,
     /// auto-triage-safe.
     Scoreboard01AggregationDegraded,
+    /// BRUTEX-XVERIFY-01 (BruteX↔TickVault daily cross-verify, 2026-07-12) —
+    /// the 15:50 IST run found ≥1 divergent cell (or missing-live /
+    /// missing-brutex minute) between the BruteX-produced Groww 1-minute
+    /// OHLCV CSVs (S3 `crossverify/groww/<date>/`) and the live
+    /// `candles_1m` (`feed='groww'`) — paise-integer compare, inclusive
+    /// tolerance. Each cell is a `brutex_crossverify_cell_audit` row; the
+    /// daily verdict row + Telegram summary carry the counts. Severity::High;
+    /// NOT auto-triage-safe (severity-independent override — a cross-system
+    /// data-comparability verdict is an OPERATOR judgment: which side's
+    /// pipeline drifted; the FUTIDX-02 precedent).
+    BrutexXverify01DivergenceFound,
+    /// BRUTEX-XVERIFY-02 (BruteX↔TickVault daily cross-verify, 2026-07-12) —
+    /// the 15:50 IST run itself DEGRADED: S3 list/get failed after bounded
+    /// retries, no objects appeared by the 16:05 IST wall-clock cap
+    /// (NO_DATA), CSV parse rejected, the symbol→security_id mapping read
+    /// failed, the live `candles_1m` read failed, or the forensic ILP write
+    /// was rejected. The day is stamped `no_data` / `blind` / `degraded` —
+    /// never a fabricated clean verdict (Rule 11). Best-effort cold path:
+    /// the live feeds, tick capture and trading are NEVER affected; the
+    /// DEDUP-idempotent tables let a healthy re-run backfill the day.
+    /// Severity::High, auto-triage-safe (the degrade already happened —
+    /// the operator inspects; the next trading day re-runs).
+    BrutexXverify02RunDegraded,
+    /// SPOT1M-01 (per-minute REST pipeline PR-2, operator grant 2026-07-12)
+    /// — the per-minute spot 1m REST fetch degraded: a whole minute failed
+    /// for one/all of the 3 IDX_I spot indices (transport error, non-2xx,
+    /// DH-904/429 after the bounded in-minute re-poll ladder, no token, or
+    /// a 200 whose body never carried the just-closed minute's candle —
+    /// `outcome="empty"`, counted, never silent). The ESCALATION emission
+    /// (the one that also pages the typed Telegram event) fires
+    /// edge-triggered after 3 consecutive fully-failed minutes; sub-edge
+    /// per-minute emissions are coalesced once per fire. Severity::High,
+    /// auto-triage-safe (the fetch already degraded; the next minute
+    /// re-attempts; the WS candle pipeline is untouched).
+    Spot1m01FetchDegraded,
+    /// SPOT1M-02 (per-minute REST pipeline PR-2, 2026-07-12) — the
+    /// `spot_1m_rest` QuestDB persist leg failed (ensure-DDL non-2xx /
+    /// unreachable, ILP append rejected, or the ILP-over-HTTP flush was
+    /// refused by the server ACK). Best-effort forensic write: the fetch
+    /// loop continues, rows stay buffered where possible, and re-appends
+    /// are DEDUP-idempotent (`ts, security_id, exchange_segment, feed`).
+    /// Severity::High, auto-triage-safe.
+    Spot1m02PersistFailed,
+    /// CHAIN-01 (per-minute REST pipeline PR-3, operator grant 2026-07-12)
+    /// — the option-chain Data-API ENTITLEMENT is absent: Dhan rejected an
+    /// expirylist / option-chain call with the DH-902 / DATA 806 class
+    /// (or a 401/403 whose body names the missing subscription). Fires
+    /// ONCE per day (edge-triggered); the chain pipeline stays DOWN for
+    /// the day — never a per-minute 401 storm. Severity::High,
+    /// auto-triage NO (severity-independent override: restoring the
+    /// entitlement is an operator/broker account decision, never a code
+    /// fix).
+    Chain01EntitlementAbsent,
+    /// CHAIN-02 (per-minute REST pipeline PR-3, 2026-07-12) — the
+    /// per-minute option-chain fetch degraded: a whole minute failed for
+    /// one/all of the 3 underlyings (transport error, non-2xx, budget
+    /// overrun, malformed body, or a 200 whose chain carried zero strikes
+    /// — `outcome="empty"`, counted, never silent). The ESCALATION
+    /// emission (the one that also pages the typed Telegram event) fires
+    /// edge-triggered after 3 consecutive fully-failed minutes (persist
+    /// failures count — a fetched-but-never-persisted minute is NOT ok).
+    /// Severity::High, auto-triage-safe (the next minute re-attempts;
+    /// the WS pipeline is untouched).
+    Chain02FetchDegraded,
+    /// CHAIN-03 (per-minute REST pipeline PR-3, 2026-07-12) — the
+    /// `option_chain_1m` QuestDB persist leg failed (ensure-DDL non-2xx /
+    /// unreachable, ILP append rejected, or the ILP-over-HTTP flush was
+    /// refused by the server ACK; failed flushes DISCARD pending rows —
+    /// the poisoned-buffer defense). Best-effort forensic write;
+    /// re-appends are DEDUP-idempotent. Severity::High, auto-triage-safe.
+    Chain03PersistFailed,
+    /// CHAIN-04 (per-minute REST pipeline PR-3, 2026-07-12) — the
+    /// day-start expirylist warmup failed after bounded retries (3
+    /// attempts, 3s/6s backoff): the chain pipeline degrades to
+    /// DISABLED-FOR-THE-DAY — expiry dates come ONLY from the API
+    /// (option-chain.md rule 9), NEVER guessed. One page per day.
+    /// Severity::High, auto-triage-safe (the next trading-day boot
+    /// re-attempts automatically).
+    Chain04ExpirylistFailed,
+
+    // -----------------------------------------------------------------------
+    // Operator 2026-07-13: daily timeframe-consistency verifier.
+    // "how will you guarantee that all our defined timeframes internally are
+    // correct — how do you identify whether any miscalculation or data
+    // issues" → at 15:40 IST every trading day, recompute every sealed
+    // higher-TF candle (2m..4h, both feeds) from its stored candles_1m
+    // constituents and compare exactly (integer-paise OHLC, exact i64
+    // volume). Dhan verifies TODAY; Groww verifies the PREVIOUS trading
+    // day (no close-time force-seal — its tails seal at IST midnight).
+    // See tf-consistency-error-codes.md.
+    // -----------------------------------------------------------------------
+    /// TF-VERIFY-01: the daily timeframe-consistency verifier found ≥1
+    /// paging finding for a (feed, date) pass — a higher-TF candle
+    /// disagrees with its recomputed-from-1m value (`mismatch`), a stored
+    /// TF row is missing where 1m data exists (`missing_tf_row`), a TF row
+    /// exists over zero 1m rows (`no_1m_coverage`), a stored TF ts is off
+    /// the 09:15-anchored grid (`off_grid_ts`), or duplicate rows share a
+    /// DEDUP key (`duplicate_key`). ONE coalesced emission per (feed, date)
+    /// pass, never per-row. Severity::High, auto-triage NO
+    /// (severity-independent override — a TF-definition verdict is an
+    /// operator data-integrity judgment, the Futidx02 precedent).
+    TfVerify01MismatchFound,
+    /// TF-VERIFY-02: the daily timeframe-consistency run DEGRADED — HTTP
+    /// client build failure, QuestDB unreachable, discovery failure, a
+    /// per-SID query failure, a LIMIT-hit truncation tripwire, an audit
+    /// flush failure (pending rows discarded — poisoned-buffer defense),
+    /// or the 900s wall-clock budget exceeded (`stage` names the leg).
+    /// Severity::High, auto-triage-safe (the next trading day re-runs
+    /// automatically; forced reruns are DEDUP-idempotent).
+    TfVerify02RunDegraded,
+    /// FEED-GAP-01 (Groww hardening PR-3, 2026-07-14) — the feed GAP-EPISODE
+    /// forensics machinery DEGRADED: the tracker could not persist an
+    /// OPEN/CLOSE row to the `feed_gap_audit` table (ensure-DDL / ILP append /
+    /// flush), or the 15:45 IST scoreboard dangling-close sweep failed
+    /// (`stage` names the leg). ANNOTATION ONLY — never on the feed recovery
+    /// path or the tick hot path; the Telegram episode bubble still fires and
+    /// re-appends are DEDUP-idempotent (`ts, trading_date_ist, feed, start_ts,
+    /// outcome`). Telegram-episode-only delivery per the operator-approved
+    /// 2026-07-14 default (no CloudWatch filter). Severity::Medium,
+    /// auto-triage-safe.
+    FeedGap01EpisodeDegraded,
 }
 
 impl ErrorCode {
@@ -1088,6 +1209,22 @@ impl ErrorCode {
             Self::Futidx02CrossFeedExpiryMismatch => "FUTIDX-02",
             // Dual-feed scoreboard PR-A (2026-07-10)
             Self::Scoreboard01AggregationDegraded => "SCOREBOARD-01",
+            // BruteX↔TickVault daily cross-verify (2026-07-12)
+            Self::BrutexXverify01DivergenceFound => "BRUTEX-XVERIFY-01",
+            Self::BrutexXverify02RunDegraded => "BRUTEX-XVERIFY-02",
+            // Per-minute spot 1m REST pipeline (operator grant 2026-07-12)
+            Self::Spot1m01FetchDegraded => "SPOT1M-01",
+            Self::Spot1m02PersistFailed => "SPOT1M-02",
+            // Per-minute option-chain REST pipeline (PR-3, 2026-07-12)
+            Self::Chain01EntitlementAbsent => "CHAIN-01",
+            Self::Chain02FetchDegraded => "CHAIN-02",
+            Self::Chain03PersistFailed => "CHAIN-03",
+            Self::Chain04ExpirylistFailed => "CHAIN-04",
+            // Daily timeframe-consistency verifier (operator 2026-07-13)
+            Self::TfVerify01MismatchFound => "TF-VERIFY-01",
+            Self::TfVerify02RunDegraded => "TF-VERIFY-02",
+            // Feed gap-episode forensics (Groww hardening PR-3, 2026-07-14)
+            Self::FeedGap01EpisodeDegraded => "FEED-GAP-01",
         }
     }
 
@@ -1246,13 +1383,43 @@ impl ErrorCode {
             // rollback (a repeat at the same rung = the discovered
             // server-side cap).
             | Self::GrowwScale01RollbackFired
-            | Self::GrowwScale02GlobalHalve => Severity::High,
+            | Self::GrowwScale02GlobalHalve
+            // SPOT1M-01/02 (operator grant 2026-07-12) — the per-minute
+            // spot 1m REST fetch/persist degraded. High: the operator must
+            // see a failing exchange-record pull (the escalation is
+            // edge-triggered at 3 consecutive fully-failed minutes); never
+            // a halt — the WS candle pipeline is untouched and re-appends
+            // are DEDUP-idempotent.
+            | Self::Spot1m01FetchDegraded
+            | Self::Spot1m02PersistFailed
+            // CHAIN-01..04 (PR-3, 2026-07-12) — the option-chain half of
+            // the per-minute REST pipeline. High: entitlement absence /
+            // sustained fetch degrade / persist failure / expirylist
+            // failure all need operator eyes; never a halt — the WS
+            // pipeline is untouched and re-appends are DEDUP-idempotent.
+            | Self::Chain01EntitlementAbsent
+            | Self::Chain02FetchDegraded
+            | Self::Chain03PersistFailed
+            | Self::Chain04ExpirylistFailed => Severity::High,
             // FUTIDX-01/02 (§36 2026-07-08) — per-underlying selection degrade
             // / cross-feed expiry divergence. Loud (Telegram High), never a
             // halt; the spot universe + both live feeds are unaffected.
             Self::Futidx01SelectionDegraded | Self::Futidx02CrossFeedExpiryMismatch => {
                 Severity::High
             }
+            // BRUTEX-XVERIFY-01/02 (2026-07-12) — daily cross-verify
+            // divergence / degraded run. Loud (Telegram High), never a
+            // halt; the live feeds + tick capture are unaffected.
+            Self::BrutexXverify01DivergenceFound | Self::BrutexXverify02RunDegraded => {
+                Severity::High
+            }
+            // TF-VERIFY-01/02 (operator 2026-07-13) — the daily
+            // timeframe-consistency verifier found a TF-vs-1m divergence /
+            // ran degraded. High: operator eyes required on every occurrence
+            // (a divergence questions the higher-TF candle store; a degraded
+            // run could not vouch for it); never a halt — the live candle
+            // pipeline is untouched and reruns are DEDUP-idempotent.
+            Self::TfVerify01MismatchFound | Self::TfVerify02RunDegraded => Severity::High,
             // Medium: data pipeline correctness
             // PR #6b (2026-05-19): I-P0-01/02/04/05 retired with their modules.
             Self::InstrumentP1CrossSegmentCollision
@@ -1316,6 +1483,9 @@ impl ErrorCode {
             // aggregate degraded; feeds/capture/trading unaffected, the
             // DEDUP-idempotent re-run backfills. Medium.
             | Self::Scoreboard01AggregationDegraded => Severity::Medium,
+            // FEED-GAP-01 (2026-07-14): gap-episode forensics degraded —
+            // annotation-only side record; capture/recovery unaffected. Medium.
+            Self::FeedGap01EpisodeDegraded => Severity::Medium,
             // Low: trading-day / Dhan other
             // PR #6a (2026-05-19): I-P1-01 (DailyScheduler) + I-P1-02 (DeltaFieldCoverage) retired
             Self::InstrumentP2TradingDayGuard
@@ -1550,6 +1720,30 @@ impl ErrorCode {
             Self::Scoreboard01AggregationDegraded => {
                 ".claude/rules/project/dual-feed-scoreboard-error-codes.md"
             }
+            // BruteX↔TickVault daily cross-verify (2026-07-12)
+            Self::BrutexXverify01DivergenceFound | Self::BrutexXverify02RunDegraded => {
+                ".claude/rules/project/brutex-crossverify-error-codes.md"
+            }
+            // Per-minute spot 1m REST pipeline (operator grant 2026-07-12)
+            Self::Spot1m01FetchDegraded | Self::Spot1m02PersistFailed => {
+                ".claude/rules/project/rest-1m-pipeline-error-codes.md"
+            }
+            // Per-minute option-chain REST pipeline (PR-3, 2026-07-12) —
+            // one runbook for the whole per-minute REST pipeline family.
+            Self::Chain01EntitlementAbsent
+            | Self::Chain02FetchDegraded
+            | Self::Chain03PersistFailed
+            | Self::Chain04ExpirylistFailed => {
+                ".claude/rules/project/rest-1m-pipeline-error-codes.md"
+            }
+            // Daily timeframe-consistency verifier (operator 2026-07-13)
+            Self::TfVerify01MismatchFound | Self::TfVerify02RunDegraded => {
+                ".claude/rules/project/tf-consistency-error-codes.md"
+            }
+            // Feed gap-episode forensics (Groww hardening PR-3, 2026-07-14)
+            Self::FeedGap01EpisodeDegraded => {
+                ".claude/rules/project/feed-gap-error-codes.md"
+            }
         }
     }
 
@@ -1570,11 +1764,28 @@ impl ErrorCode {
     ///   `ALTER TABLE <t> RESUME WAL` is an OPERATOR decision — resuming
     ///   into a still-broken disk replays the failure; auto-triage must
     ///   never execute it.
+    /// - `BRUTEX-XVERIFY-01` (2026-07-12): a cross-system (BruteX vs
+    ///   TickVault) data-comparability verdict is an operator judgment —
+    ///   the operator decides which capture chain is at fault (the
+    ///   FUTIDX-02 precedent); auto-triage must never act on it.
     #[must_use]
     pub const fn is_auto_triage_safe(self) -> bool {
         if matches!(
             self,
-            Self::Futidx02CrossFeedExpiryMismatch | Self::WalSuspend01TableSuspended
+            Self::Futidx02CrossFeedExpiryMismatch
+                | Self::WalSuspend01TableSuspended
+                | Self::BrutexXverify01DivergenceFound
+                // CHAIN-01 (PR-3, 2026-07-12): restoring the option-chain
+                // Data-API entitlement is an operator/broker ACCOUNT
+                // decision — never auto-actioned despite High severity.
+                | Self::Chain01EntitlementAbsent
+                // TF-VERIFY-01 (operator 2026-07-13): a TF-vs-1m divergence
+                // is a data-comparability VERDICT over the audit rows — the
+                // operator judges whether it is a restart window, a real
+                // aggregator bug, or a dead seal leg. An auto-triage rerun
+                // would re-stamp rows and could mask the evidence (the
+                // Futidx02 precedent).
+                | Self::TfVerify01MismatchFound
         ) {
             return false;
         }
@@ -1752,6 +1963,22 @@ impl ErrorCode {
             Self::Futidx02CrossFeedExpiryMismatch,
             // Dual-feed scoreboard PR-A (2026-07-10)
             Self::Scoreboard01AggregationDegraded,
+            // BruteX↔TickVault daily cross-verify (2026-07-12)
+            Self::BrutexXverify01DivergenceFound,
+            Self::BrutexXverify02RunDegraded,
+            // Per-minute spot 1m REST pipeline (operator grant 2026-07-12)
+            Self::Spot1m01FetchDegraded,
+            Self::Spot1m02PersistFailed,
+            // Per-minute option-chain REST pipeline (PR-3, 2026-07-12)
+            Self::Chain01EntitlementAbsent,
+            Self::Chain02FetchDegraded,
+            Self::Chain03PersistFailed,
+            Self::Chain04ExpirylistFailed,
+            // Daily timeframe-consistency verifier (operator 2026-07-13)
+            Self::TfVerify01MismatchFound,
+            Self::TfVerify02RunDegraded,
+            // Feed gap-episode forensics (Groww hardening PR-3, 2026-07-14)
+            Self::FeedGap01EpisodeDegraded,
         ]
     }
 }
@@ -2092,7 +2319,32 @@ mod tests {
         // SCOREBOARD-01 — the daily 15:45 IST Dhan-vs-Groww scoreboard
         // aggregation degraded (best-effort forensic aggregate; sentinels,
         // never fabricated zeros; DEDUP-idempotent re-run backfills).
-        assert_eq!(ErrorCode::all().len(), 138);
+        // 2026-07-12 (BruteX crossverify Commit 1): bumped 138 -> 140 for
+        // BRUTEX-XVERIFY-01 (daily BruteX-vs-live 1m divergence found —
+        // High, NOT auto-triage-safe: a data-comparability signal is never
+        // auto-actioned) + BRUTEX-XVERIFY-02 (run degraded — S3/CSV/QuestDB
+        // leg failed; keep-better guard + DEDUP-idempotent re-run backfills).
+        // 2026-07-12 (per-minute spot 1m REST pipeline PR-2): bumped
+        // 140 -> 142 for SPOT1M-01 (per-minute spot fetch degraded — edge-
+        // triggered escalation) + SPOT1M-02 (spot_1m_rest persist failed —
+        // best-effort, DEDUP-idempotent re-append).
+        // 2026-07-12 (per-minute option-chain REST pipeline PR-3): bumped
+        // for CHAIN-01 (entitlement absent — once-per-day edge,
+        // manual triage) + CHAIN-02 (per-minute chain fetch degraded —
+        // edge-triggered escalation) + CHAIN-03 (option_chain_1m persist
+        // failed — best-effort, DEDUP-idempotent) + CHAIN-04 (day-start
+        // expirylist warmup failed — pipeline disabled-for-the-day, never
+        // a guessed expiry).
+        // 2026-07-12 merge note: BRUTEX-XVERIFY (2) + SPOT1M (2) landed on
+        // this branch at 142; main's CHAIN-01..04 (4) merge in => 146.
+        // 2026-07-13 (daily timeframe-consistency verifier, merged from
+        // main): TF-VERIFY-01 (higher-TF candle disagrees with its
+        // recomputed-from-1m value — coalesced per (feed, date) pass,
+        // manual triage) + TF-VERIFY-02 (the daily run degraded —
+        // client/query/truncation/flush/budget stage taxonomy) => 148.
+        // 2026-07-14 (Groww hardening PR-3): FEED-GAP-01 (gap-episode
+        // forensics degraded — annotation-only side record) => 149.
+        assert_eq!(ErrorCode::all().len(), 149);
     }
 
     #[test]
@@ -2153,7 +2405,10 @@ mod tests {
         assert_eq!("FUTIDX-02".parse::<ErrorCode>(), Ok(f2));
         assert_eq!(f2.severity(), Severity::High);
         // Design contract (futidx-4-error-codes.md §2 + the R3-4 record in
-        // .claude/plans/active-plan-futidx-4.md — the in-repo authority;
+        // .claude/plans/archive/2026-07-08-futidx-4.md — the in-repo
+        // authority (archived from active-plan-futidx-4.md per
+        // plan-enforcement rule 7; path synced 2026-07-13, deferred from
+        // the Groww REST-1m PR-1);
         // round 4 replaced a dangling scratchpad "FINAL.md" citation that
         // never landed in the tree): a cross-feed comparability
         // verdict is NEVER auto-actioned despite being non-Critical — the
@@ -2163,6 +2418,67 @@ mod tests {
             f2.runbook_path(),
             ".claude/rules/project/futidx-4-error-codes.md"
         );
+    }
+
+    #[test]
+    fn test_chain_codes_contract() {
+        // Per-minute option-chain REST pipeline (PR-3, 2026-07-12).
+        let c1 = ErrorCode::Chain01EntitlementAbsent;
+        assert_eq!(c1.code_str(), "CHAIN-01");
+        assert_eq!("CHAIN-01".parse::<ErrorCode>(), Ok(c1));
+        assert_eq!(c1.severity(), Severity::High);
+        // Design contract: the entitlement is an operator/broker ACCOUNT
+        // decision — NEVER auto-actioned despite being non-Critical (the
+        // FUTIDX-02 severity-independent override precedent).
+        assert!(!c1.is_auto_triage_safe());
+
+        for (code, s) in [
+            (ErrorCode::Chain02FetchDegraded, "CHAIN-02"),
+            (ErrorCode::Chain03PersistFailed, "CHAIN-03"),
+            (ErrorCode::Chain04ExpirylistFailed, "CHAIN-04"),
+        ] {
+            assert_eq!(code.code_str(), s);
+            assert_eq!(s.parse::<ErrorCode>(), Ok(code));
+            assert_eq!(code.severity(), Severity::High);
+            // Degrades self-heal (next minute / next trading-day boot) —
+            // auto-triage may inspect.
+            assert!(code.is_auto_triage_safe());
+            assert!(ErrorCode::all().contains(&code));
+        }
+        // The whole family shares the per-minute REST pipeline runbook.
+        assert_eq!(
+            c1.runbook_path(),
+            ".claude/rules/project/rest-1m-pipeline-error-codes.md"
+        );
+    }
+
+    #[test]
+    fn test_tf_verify_codes_contract() {
+        // Daily timeframe-consistency verifier (operator 2026-07-13).
+        let v1 = ErrorCode::TfVerify01MismatchFound;
+        assert_eq!(v1.code_str(), "TF-VERIFY-01");
+        assert_eq!("TF-VERIFY-01".parse::<ErrorCode>(), Ok(v1));
+        assert_eq!(v1.severity(), Severity::High);
+        // Design contract: a TF-vs-1m divergence is a data-comparability
+        // VERDICT — NEVER auto-actioned despite being non-Critical (the
+        // FUTIDX-02 severity-independent override precedent).
+        assert!(!v1.is_auto_triage_safe());
+
+        let v2 = ErrorCode::TfVerify02RunDegraded;
+        assert_eq!(v2.code_str(), "TF-VERIFY-02");
+        assert_eq!("TF-VERIFY-02".parse::<ErrorCode>(), Ok(v2));
+        assert_eq!(v2.severity(), Severity::High);
+        // The degrade already happened; the next trading day re-runs and
+        // forced reruns are DEDUP-idempotent — auto-triage may inspect.
+        assert!(v2.is_auto_triage_safe());
+
+        for code in [v1, v2] {
+            assert!(ErrorCode::all().contains(&code));
+            assert_eq!(
+                code.runbook_path(),
+                ".claude/rules/project/tf-consistency-error-codes.md"
+            );
+        }
     }
 
     #[test]
@@ -2309,7 +2625,18 @@ mod tests {
                 // index futures.
                 || s.starts_with("FUTIDX-")
                 // Dual-feed scoreboard PR-A (2026-07-10).
-                || s.starts_with("SCOREBOARD-");
+                || s.starts_with("SCOREBOARD-")
+                // BruteX↔TickVault daily cross-verify (2026-07-12).
+                || s.starts_with("BRUTEX-XVERIFY-")
+                // Per-minute spot 1m REST pipeline (operator grant 2026-07-12).
+                || s.starts_with("SPOT1M-")
+                // Per-minute option-chain REST pipeline (PR-3, 2026-07-12).
+                || s.starts_with("CHAIN-")
+                // Operator 2026-07-13: daily timeframe-consistency verifier
+                || s.starts_with("TF-VERIFY-")
+                // Groww hardening PR-3 (2026-07-14): feed gap-episode
+                // forensics.
+                || s.starts_with("FEED-GAP-");
             assert!(has_known_prefix, "unexpected code prefix: {s}");
         }
     }

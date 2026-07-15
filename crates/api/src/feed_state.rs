@@ -20,7 +20,7 @@
 
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use tickvault_common::config::FeedsConfig;
 // D2c (C4 follow-up): the live lane-owned TokenManager handle. Stored here so the
@@ -32,123 +32,6 @@ use tickvault_core::auth::TokenManager;
 // so writers/aggregators/parity can use the SAME enum + label fn. Re-exported
 // here so existing `api::feed_state::Feed` call sites keep compiling unchanged.
 pub use tickvault_common::feed::Feed;
-
-/// The Dhan-lane lifecycle state machine (D2b). The single source of truth for
-/// where the runtime Dhan lane is — stored as an `AtomicU8` in
-/// [`FeedRuntimeState`] (M9 of the cold-start design) so the boot-ON inline
-/// start AND the runtime activation watcher read/write the SAME state.
-///
-/// `Running` is entered ONLY after `start_dhan_lane` returns `Ok` — closing the
-/// "phantom running" false-OK where a lane could report running with no pool.
-/// `Stopping → Off` happens ONLY after teardown awaits every WS/order-update/
-/// renewal handle join (no double pool). `Stopping → Starting` is rejected.
-///
-/// The numeric discriminants are the `tv_dhan_lane_state` gauge values
-/// (0=Off, 1=Starting, 2=Running, 3=Stopping) — stable wire format.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u8)]
-pub enum LaneState {
-    /// No pool, no Dhan tasks; the dormant watcher polls the enable flag.
-    Off = 0,
-    /// A `start_dhan_lane()` cold-start is in-flight (auth → universe → pool).
-    /// Reported as NOT running (no false-OK while the lane is coming up).
-    Starting = 1,
-    /// Pool spawned, ticks flowing, order-update + renewal + lane watchdogs up.
-    Running = 2,
-    /// A `stop_dhan_lane()` teardown is in-flight; pool conns NOT yet joined.
-    Stopping = 3,
-}
-
-impl LaneState {
-    /// Stable wire-format byte for the `tv_dhan_lane_state` gauge + the atomic.
-    #[must_use]
-    pub const fn as_u8(self) -> u8 {
-        self as u8
-    }
-
-    /// Inverse of [`Self::as_u8`]. Unknown bytes fail-closed to `Off` (the safe
-    /// "no lane" state) — there is no panic path, mirroring the no-panic
-    /// discipline of the Dhan binary-protocol `from_byte` helpers.
-    #[must_use]
-    pub const fn from_u8(byte: u8) -> Self {
-        match byte {
-            1 => Self::Starting,
-            2 => Self::Running,
-            3 => Self::Stopping,
-            // 0 and every unknown byte fail-closed to Off.
-            _ => Self::Off,
-        }
-    }
-
-    /// Whether this state means the lane is genuinely live (a real pool exists).
-    /// ONLY `Running` is live — `Starting` is honestly NOT-yet-running (no
-    /// false-OK), and `Stopping`/`Off` are not running.
-    #[must_use]
-    pub const fn is_running(self) -> bool {
-        matches!(self, Self::Running)
-    }
-}
-
-/// The events the lane FSM reacts to. Pure data — the FSM
-/// ([`next_lane_state`]) maps `(state, event) -> Option<LaneState>` with no I/O.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum LaneEvent {
-    /// The watcher observed desired-ON while `Off`; a cold-start begins.
-    StartRequested,
-    /// `start_dhan_lane` returned `Ok(handles)` — the lane is genuinely live.
-    StartSucceeded,
-    /// `start_dhan_lane` returned an error (auth / universe / pool stage).
-    StartFailed,
-    /// The in-flight start task was cancelled (desired-OFF mid-`Starting`).
-    StartCancelled,
-    /// The watcher observed a GATED desired-OFF while `Running`; teardown begins.
-    StopRequested,
-    /// Teardown awaited every lane handle join — the lane is fully down.
-    StopJoined,
-    /// `stop_dhan_lane` re-asserted the disable gate immediately before the
-    /// irreversible WS-close (H5), found it re-closed (an order opened
-    /// mid-teardown), and aborted the teardown → the lane stays up.
-    StopAborted,
-}
-
-/// The pure, total Dhan-lane FSM transition function (D2b). Returns the NEXT
-/// state for a legal `(current, event)` pair, or `None` for an illegal one —
-/// never panics. This mirrors `reconcile_lane_action`'s pure-and-total style so
-/// the watcher loop stays a trivial poll around a unit-tested decision.
-///
-/// Legal transitions (everything else is `None`):
-/// - `Off + StartRequested      -> Starting`
-/// - `Starting + StartSucceeded -> Running`
-/// - `Starting + StartFailed    -> Off`  (no half-running lane)
-/// - `Starting + StartCancelled -> Off`
-/// - `Running + StopRequested   -> Stopping`
-/// - `Stopping + StopJoined     -> Off`   (ONLY after all handles join — H6)
-/// - `Stopping + StopAborted    -> Running` (gate re-closed mid-teardown — H5)
-///
-/// Explicitly REJECTED (returns `None`):
-/// - `Running + StartRequested`  (idempotent — already running)
-/// - `Off + StartSucceeded` / `Off + StopRequested` / `Off + StopJoined`
-/// - `Stopping + StartRequested` (no Start while a teardown is draining — H6;
-///   Start is legal ONLY from a confirmed-empty `Off`)
-#[must_use]
-pub fn next_lane_state(current: LaneState, event: LaneEvent) -> Option<LaneState> {
-    use LaneEvent::{
-        StartCancelled, StartFailed, StartRequested, StartSucceeded, StopAborted, StopJoined,
-        StopRequested,
-    };
-    match (current, event) {
-        (LaneState::Off, StartRequested) => Some(LaneState::Starting),
-        (LaneState::Starting, StartSucceeded) => Some(LaneState::Running),
-        (LaneState::Starting, StartFailed | StartCancelled) => Some(LaneState::Off),
-        (LaneState::Running, StopRequested) => Some(LaneState::Stopping),
-        (LaneState::Stopping, StopJoined) => Some(LaneState::Off),
-        (LaneState::Stopping, StopAborted) => Some(LaneState::Running),
-        // Every other pair is illegal — including Running+StartRequested
-        // (idempotent), Stopping+StartRequested (H6 — no double pool), and any
-        // event fired from a state that cannot accept it.
-        _ => None,
-    }
-}
 
 /// A point-in-time snapshot of every feed's enabled state — the `GET /api/feeds`
 /// response payload (serialised by the handler).
@@ -224,6 +107,21 @@ pub struct GrowwScaleSnapshot {
 pub struct FeedRuntimeState {
     dhan: Arc<AtomicBool>,
     groww: Arc<AtomicBool>,
+    /// The IMMUTABLE RAW TOML value of `feeds.dhan_enabled` (Phase A,
+    /// operator directive 2026-07-13) — captured BEFORE the feed-state
+    /// overlay is applied (round-2 review MEDIUM, 2026-07-13). Distinct
+    /// from the mutable `dhan` runtime atomic: with the Dhan live WS lane
+    /// retired by config (`dhan_enabled = false` in base + production),
+    /// the runtime cold-start supervisor refuses a lane start — so the
+    /// `/api/feeds` handler must refuse a Dhan ENABLE at the API layer too
+    /// (409), instead of flipping a flag that can never take effect (a
+    /// Rule-11 false-OK: /feeds would show ON while nothing can start).
+    /// "Retired" is a statement about the CONFIG, never about the last
+    /// webpage toggle: seeding this from the POST-overlay effective value
+    /// would let a persisted runtime-OFF overlay permanently 409-lock a
+    /// config-ON boot with a misleading "config change + restart" message
+    /// (breaking the PR-E disable→restart→re-enable round trip).
+    dhan_config_enabled: bool,
     /// Set once by the boot wiring when the Groww bridge task is actually
     /// spawned (i.e. `groww_enabled` was true at boot). Read by the API to tell
     /// the operator honestly whether a runtime toggle will take effect.
@@ -242,12 +140,6 @@ pub struct FeedRuntimeState {
     /// PR-E: gate on the Dhan *disable* direction (orders-live safety). Seeded
     /// from `dry_run` at boot; defaults `true` (no-orders phase).
     dhan_disable_allowed: AtomicBool,
-    /// D2b: the Dhan-lane lifecycle FSM state (`LaneState` byte). The single
-    /// source of truth for where the runtime lane is (M9). The boot-ON inline
-    /// start, the dormant runtime watcher, and the `tv_dhan_lane_state` gauge
-    /// all read/write THIS atomic, so the lane state can never disagree between
-    /// the boot path and the watcher. Defaults `Off` (no lane yet).
-    dhan_lane_state: AtomicU8,
     /// D2c (C4 follow-up): the CURRENTLY-live lane-owned `TokenManager`. SET when
     /// `start_dhan_lane` succeeds (overwriting any prior, dead manager) and CLEARED
     /// at every lane→`Off` transition. The two PROCESS-level health gauges
@@ -278,9 +170,35 @@ impl FeedRuntimeState {
     /// to `dry_run` via [`Self::set_dhan_disable_allowed`].
     #[must_use]
     pub fn from_config(feeds: &FeedsConfig) -> Self {
+        // No-overlay path (tests / `Default`): the effective and RAW Dhan
+        // config values coincide, so the raw seed is `feeds.dhan_enabled`.
+        Self::from_config_with_dhan_config(feeds, feeds.dhan_enabled)
+    }
+
+    /// Build from the boot config + the RAW (pre-overlay) TOML value of
+    /// `feeds.dhan_enabled`. Production (main.rs) uses THIS constructor:
+    /// `feeds` is the POST-overlay EFFECTIVE state (it seeds the runtime
+    /// atomics), while `dhan_config_enabled_raw` is captured BEFORE
+    /// `overlay_feeds` is applied — the Phase A "lane retired" truth is a
+    /// CONFIG statement, so a persisted runtime-OFF overlay
+    /// (data/feed-state.json) on a config-ON boot must never 409-lock the
+    /// PR-E disable→restart→re-enable round trip, and no overlay shape can
+    /// un-retire a config-OFF lane (round-2 review MEDIUM, 2026-07-13; the
+    /// overlay AND-gate in `feed_state_persist` already narrows the
+    /// EFFECTIVE value — this keeps the refusal gate keyed off the config
+    /// alone, in BOTH directions).
+    #[must_use]
+    pub fn from_config_with_dhan_config(
+        feeds: &FeedsConfig,
+        dhan_config_enabled_raw: bool,
+    ) -> Self {
         Self {
             dhan: Arc::new(AtomicBool::new(feeds.dhan_enabled)),
             groww: Arc::new(AtomicBool::new(feeds.groww_enabled)),
+            // Phase A (2026-07-13): the RAW TOML Dhan value is retained
+            // immutably so the API can refuse a runtime enable of the
+            // retired lane (raw config-off is authoritative; round-2 FIX A).
+            dhan_config_enabled: dhan_config_enabled_raw,
             // The lane is not running until the boot wiring spawns it.
             groww_lane_running: AtomicBool::new(false),
             dhan_lane_running: AtomicBool::new(false),
@@ -289,7 +207,6 @@ impl FeedRuntimeState {
             dhan_disable_allowed: AtomicBool::new(true),
             // D2b: the lane FSM starts Off; the boot-ON inline start drives it
             // Off→Starting→Running, exactly like a runtime enable does.
-            dhan_lane_state: AtomicU8::new(LaneState::Off.as_u8()),
             // D2c (C4): no lane manager until `start_dhan_lane` installs one.
             live_lane_token_manager: Mutex::new(None),
             // §34 PR-3: no scale snapshot until the ladder publishes one.
@@ -369,6 +286,21 @@ impl FeedRuntimeState {
         self.dhan_disable_allowed.store(allowed, Ordering::Relaxed);
     }
 
+    /// Phase A (operator directive 2026-07-13): was `feeds.dhan_enabled`
+    /// TRUE in the RAW boot TOML (BEFORE the feed-state overlay — round-2
+    /// FIX A)? `false` means the Dhan live WS lane is retired for this
+    /// process — the runtime cold-start supervisor refuses a lane start, so
+    /// the `/api/feeds` handler refuses the enable direction (409) instead
+    /// of recording a flag that can never take effect. `true` with the
+    /// runtime flag off means dormant-not-retired (a persisted runtime-OFF
+    /// overlay): the toggle re-enable stays allowed. Immutable for the
+    /// process lifetime (config change + restart is the only way to change
+    /// it).
+    #[must_use]
+    pub fn is_dhan_config_enabled(&self) -> bool {
+        self.dhan_config_enabled
+    }
+
     /// PR-E: may the operator DISABLE Dhan right now? `false` once live trading
     /// is on — the handler rejects a Dhan-off toggle so the feed can't be killed
     /// mid-trade. Enabling Dhan is always allowed.
@@ -377,45 +309,11 @@ impl FeedRuntimeState {
         self.dhan_disable_allowed.load(Ordering::Relaxed)
     }
 
-    /// D2b: read the current Dhan-lane FSM state (the single source of truth).
-    /// `Relaxed`: the lane state is observed by the watcher poll + the API
-    /// snapshot, neither of which has an ordering dependency with other state.
-    #[must_use]
-    pub fn dhan_lane_state(&self) -> LaneState {
-        LaneState::from_u8(self.dhan_lane_state.load(Ordering::Relaxed))
-    }
-
-    /// D2b: force the Dhan-lane FSM to a specific state. Use ONLY for the
-    /// boot-ON inline path (which sets `Running` after the spine spawns the
-    /// pool) and tests. The runtime watcher uses [`Self::advance_dhan_lane`],
-    /// which goes through the pure FSM. Idempotent.
-    pub fn set_dhan_lane_state(&self, state: LaneState) {
-        self.dhan_lane_state.store(state.as_u8(), Ordering::Relaxed);
-    }
-
-    /// D2b: apply a lane [`LaneEvent`] through the pure [`next_lane_state`] FSM,
-    /// atomically (compare-and-swap on the observed current state). Returns
-    /// `Some(new_state)` if the transition was legal AND won the CAS race;
-    /// `None` if the event is illegal from the observed state OR another writer
-    /// raced us (the caller re-reads + retries, mirroring the watcher poll).
-    ///
-    /// This is the ONLY mutator the runtime watcher uses, so an illegal
-    /// transition (e.g. `Stopping → Starting`) can never be applied — the FSM
-    /// rejects it and the atomic is left untouched (H6 double-pool prevention).
-    pub fn advance_dhan_lane(&self, event: LaneEvent) -> Option<LaneState> {
-        let current = self.dhan_lane_state();
-        let next = next_lane_state(current, event)?;
-        // CAS so two concurrent advancers can't both "win" the same transition.
-        self.dhan_lane_state
-            .compare_exchange(
-                current.as_u8(),
-                next.as_u8(),
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            )
-            .ok()
-            .map(|_| next)
-    }
+    // PR-C2 (2026-07-13): the D2b `LaneState` FSM (enum + events +
+    // `next_lane_state` + the `dhan_lane_state` atomic and its accessors) is
+    // DELETED with the Dhan live-WS lane — no runtime cold-start exists to
+    // drive it. `dhan_lane_running` / `dhan_pool_present` (plain bools) stay
+    // for the /feeds page truthfulness.
 
     /// D2c (C4): install the CURRENTLY-live lane-owned `TokenManager`. Called by
     /// `start_dhan_lane` after a successful cold-start, OVERWRITING any prior
@@ -542,11 +440,11 @@ impl std::fmt::Debug for FeedRuntimeState {
         f.debug_struct("FeedRuntimeState")
             .field("dhan", &self.dhan)
             .field("groww", &self.groww)
+            .field("dhan_config_enabled", &self.dhan_config_enabled)
             .field("groww_lane_running", &self.groww_lane_running)
             .field("dhan_lane_running", &self.dhan_lane_running)
             .field("dhan_pool_present", &self.dhan_pool_present)
             .field("dhan_disable_allowed", &self.dhan_disable_allowed)
-            .field("dhan_lane_state", &self.dhan_lane_state)
             .field(
                 "live_lane_token_manager_present",
                 &live_token_manager_present,
@@ -597,6 +495,68 @@ mod tests {
         let state = FeedRuntimeState::from_config(&feeds);
         assert!(state.is_enabled(Feed::Dhan));
         assert!(state.is_enabled(Feed::Groww));
+        assert!(state.is_dhan_config_enabled());
+    }
+
+    #[test]
+    fn test_is_dhan_config_enabled_immutable_across_runtime_toggles() {
+        // Phase A (2026-07-13): the boot-config Dhan value is IMMUTABLE —
+        // runtime toggles flip the atomic, never the config snapshot the
+        // API refusal gate reads.
+        let feeds = FeedsConfig {
+            dhan_enabled: false,
+            groww_enabled: true,
+            ..Default::default()
+        };
+        let state = FeedRuntimeState::from_config(&feeds);
+        assert!(!state.is_dhan_config_enabled());
+        state.set_enabled(Feed::Dhan, true);
+        assert!(
+            !state.is_dhan_config_enabled(),
+            "runtime enable must not mutate the boot-config snapshot"
+        );
+    }
+
+    /// Round-2 FIX A (2026-07-13): the 409/refusal gate is seeded from the
+    /// RAW pre-overlay TOML value, and the feed-state overlay can flip it in
+    /// NEITHER direction.
+    /// test coverage (pub-fn-test-guard): from_config_with_dhan_config
+    #[test]
+    fn test_dhan_config_enabled_seeded_from_raw_toml_not_overlay() {
+        // config-ON boot + persisted runtime-OFF overlay: the EFFECTIVE
+        // feeds carry dhan=false (seeds the runtime atomic OFF) while the
+        // RAW TOML said true — the lane is dormant, NOT retired, so the
+        // refusal gate must stay open (pre-Phase-A round trip restored).
+        let effective_off = FeedsConfig {
+            dhan_enabled: false,
+            groww_enabled: true,
+            ..Default::default()
+        };
+        let state = FeedRuntimeState::from_config_with_dhan_config(&effective_off, true);
+        assert!(
+            !state.is_enabled(Feed::Dhan),
+            "the runtime atomic seeds from the EFFECTIVE (post-overlay) value"
+        );
+        assert!(
+            state.is_dhan_config_enabled(),
+            "the refusal gate reads the RAW TOML value — a runtime-OFF \
+             overlay must not 409-lock a config-ON lane"
+        );
+
+        // Defensive inverse (production-impossible: the overlay AND-gate can
+        // never widen raw=false to effective=true) — pins that the gate is
+        // keyed off the raw value ALONE, so no overlay shape can un-retire a
+        // config-OFF lane either.
+        let effective_on = FeedsConfig {
+            dhan_enabled: true,
+            ..Default::default()
+        };
+        let state = FeedRuntimeState::from_config_with_dhan_config(&effective_on, false);
+        assert!(state.is_enabled(Feed::Dhan));
+        assert!(
+            !state.is_dhan_config_enabled(),
+            "raw=false keeps the lane retired regardless of the effective value"
+        );
     }
 
     #[test]
@@ -829,241 +789,4 @@ mod tests {
     // atomic advance/CAS path). The watcher loops around `next_lane_state`,
     // so every legal + illegal transition is pinned here.
     // ---------------------------------------------------------------------
-
-    #[test]
-    fn next_lane_state_off_to_starting_on_start() {
-        assert_eq!(
-            next_lane_state(LaneState::Off, LaneEvent::StartRequested),
-            Some(LaneState::Starting)
-        );
-    }
-
-    #[test]
-    fn next_lane_state_starting_to_running_on_success() {
-        // Running is entered ONLY after start succeeds — the phantom-running fix.
-        assert_eq!(
-            next_lane_state(LaneState::Starting, LaneEvent::StartSucceeded),
-            Some(LaneState::Running)
-        );
-    }
-
-    #[test]
-    fn next_lane_state_starting_to_off_on_failure() {
-        assert_eq!(
-            next_lane_state(LaneState::Starting, LaneEvent::StartFailed),
-            Some(LaneState::Off),
-            "a failed cold-start returns the FSM to Off — never a half-running lane"
-        );
-    }
-
-    #[test]
-    fn next_lane_state_starting_to_off_on_cancel() {
-        assert_eq!(
-            next_lane_state(LaneState::Starting, LaneEvent::StartCancelled),
-            Some(LaneState::Off),
-            "a cancelled (desired-OFF mid-start) cold-start returns the FSM to Off"
-        );
-    }
-
-    #[test]
-    fn next_lane_state_running_to_stopping_on_disable() {
-        assert_eq!(
-            next_lane_state(LaneState::Running, LaneEvent::StopRequested),
-            Some(LaneState::Stopping)
-        );
-    }
-
-    #[test]
-    fn next_lane_state_stopping_to_off_only_after_handles_join() {
-        // H6: Stopping→Off ONLY on StopJoined (after the teardown awaits every
-        // handle join), never on a bare Notify-fire.
-        assert_eq!(
-            next_lane_state(LaneState::Stopping, LaneEvent::StopJoined),
-            Some(LaneState::Off)
-        );
-    }
-
-    #[test]
-    fn next_lane_state_stopping_to_running_on_gate_reclose() {
-        // H5: the disable gate re-closed mid-teardown (an order opened) → the
-        // teardown aborts and the lane returns to Running, never blinded.
-        assert_eq!(
-            next_lane_state(LaneState::Stopping, LaneEvent::StopAborted),
-            Some(LaneState::Running)
-        );
-    }
-
-    #[test]
-    fn next_lane_state_rejects_running_to_starting() {
-        // Idempotent: a Start while already Running must be a no-op (None).
-        assert_eq!(
-            next_lane_state(LaneState::Running, LaneEvent::StartRequested),
-            None
-        );
-    }
-
-    #[test]
-    fn next_lane_state_rejects_off_to_running() {
-        // Must pass through Starting — Off→Running directly is illegal.
-        assert_eq!(
-            next_lane_state(LaneState::Off, LaneEvent::StartSucceeded),
-            None
-        );
-    }
-
-    #[test]
-    fn next_lane_state_rejects_off_to_stopping() {
-        // Nothing to tear down from Off.
-        assert_eq!(
-            next_lane_state(LaneState::Off, LaneEvent::StopRequested),
-            None
-        );
-        assert_eq!(next_lane_state(LaneState::Off, LaneEvent::StopJoined), None);
-    }
-
-    #[test]
-    fn next_lane_state_rejects_stopping_to_starting() {
-        // H6 (double-pool prevention): NO Start while a teardown is draining.
-        // Start is legal ONLY from a confirmed-empty Off.
-        assert_eq!(
-            next_lane_state(LaneState::Stopping, LaneEvent::StartRequested),
-            None,
-            "Stopping→Starting must be rejected to prevent a double pool"
-        );
-    }
-
-    #[test]
-    fn next_lane_state_is_total_never_panics() {
-        // Property: every (state, event) pair returns Some|None and never
-        // panics. Exhaustively iterate the small finite product.
-        let states = [
-            LaneState::Off,
-            LaneState::Starting,
-            LaneState::Running,
-            LaneState::Stopping,
-        ];
-        let events = [
-            LaneEvent::StartRequested,
-            LaneEvent::StartSucceeded,
-            LaneEvent::StartFailed,
-            LaneEvent::StartCancelled,
-            LaneEvent::StopRequested,
-            LaneEvent::StopJoined,
-            LaneEvent::StopAborted,
-        ];
-        let mut legal = 0usize;
-        for s in states {
-            for e in events {
-                // The call itself must not panic; we only count outcomes.
-                if next_lane_state(s, e).is_some() {
-                    legal += 1;
-                }
-            }
-        }
-        // Exactly the 7 documented legal transitions.
-        assert_eq!(legal, 7, "exactly 7 legal transitions in the FSM");
-    }
-
-    #[test]
-    fn lane_state_byte_round_trips_and_unknown_fails_closed_to_off() {
-        for s in [
-            LaneState::Off,
-            LaneState::Starting,
-            LaneState::Running,
-            LaneState::Stopping,
-        ] {
-            assert_eq!(LaneState::from_u8(s.as_u8()), s);
-        }
-        // Unknown bytes fail-closed to Off (no panic).
-        assert_eq!(LaneState::from_u8(7), LaneState::Off);
-        assert_eq!(LaneState::from_u8(255), LaneState::Off);
-        // Only Running is "live".
-        assert!(LaneState::Running.is_running());
-        assert!(!LaneState::Starting.is_running());
-        assert!(!LaneState::Off.is_running());
-        assert!(!LaneState::Stopping.is_running());
-    }
-
-    #[test]
-    fn advance_dhan_lane_applies_the_pure_fsm_atomically() {
-        let state = FeedRuntimeState::default();
-        // Default lane state is Off.
-        assert_eq!(state.dhan_lane_state(), LaneState::Off);
-        // Off → Starting → Running (the boot-ON / runtime-enable path).
-        assert_eq!(
-            state.advance_dhan_lane(LaneEvent::StartRequested),
-            Some(LaneState::Starting)
-        );
-        assert_eq!(state.dhan_lane_state(), LaneState::Starting);
-        assert_eq!(
-            state.advance_dhan_lane(LaneEvent::StartSucceeded),
-            Some(LaneState::Running)
-        );
-        assert_eq!(state.dhan_lane_state(), LaneState::Running);
-        // Running → Stopping → Off (gated disable + teardown join).
-        assert_eq!(
-            state.advance_dhan_lane(LaneEvent::StopRequested),
-            Some(LaneState::Stopping)
-        );
-        assert_eq!(
-            state.advance_dhan_lane(LaneEvent::StopJoined),
-            Some(LaneState::Off)
-        );
-        assert_eq!(state.dhan_lane_state(), LaneState::Off);
-    }
-
-    #[test]
-    fn advance_dhan_lane_rejects_illegal_event_and_leaves_state_untouched() {
-        let state = FeedRuntimeState::default();
-        state.set_dhan_lane_state(LaneState::Stopping);
-        // H6: a Start while Stopping is rejected by the FSM — the atomic is
-        // NOT mutated (no double pool).
-        assert_eq!(state.advance_dhan_lane(LaneEvent::StartRequested), None);
-        assert_eq!(
-            state.dhan_lane_state(),
-            LaneState::Stopping,
-            "an illegal advance must leave the lane state untouched"
-        );
-    }
-
-    #[test]
-    fn test_dhan_lane_state_and_set_dhan_lane_state_round_trip() {
-        // Direct coverage of the `dhan_lane_state` reader + `set_dhan_lane_state`
-        // forced writer (used by the boot-ON inline path + tests).
-        let state = FeedRuntimeState::default();
-        assert_eq!(state.dhan_lane_state(), LaneState::Off);
-        for s in [
-            LaneState::Starting,
-            LaneState::Running,
-            LaneState::Stopping,
-            LaneState::Off,
-        ] {
-            state.set_dhan_lane_state(s);
-            assert_eq!(state.dhan_lane_state(), s);
-        }
-    }
-
-    #[test]
-    fn test_lane_state_as_u8_from_u8_and_is_running_accessors() {
-        // Direct coverage of LaneState::as_u8 / from_u8 / is_running.
-        assert_eq!(LaneState::Off.as_u8(), 0);
-        assert_eq!(LaneState::Starting.as_u8(), 1);
-        assert_eq!(LaneState::Running.as_u8(), 2);
-        assert_eq!(LaneState::Stopping.as_u8(), 3);
-        assert_eq!(LaneState::from_u8(2), LaneState::Running);
-        assert!(LaneState::Running.is_running());
-        assert!(!LaneState::Off.is_running());
-    }
-
-    #[test]
-    fn advance_dhan_lane_gate_reclose_returns_running_from_stopping() {
-        // H5: gate re-closed mid-teardown → StopAborted drives Stopping→Running.
-        let state = FeedRuntimeState::default();
-        state.set_dhan_lane_state(LaneState::Stopping);
-        assert_eq!(
-            state.advance_dhan_lane(LaneEvent::StopAborted),
-            Some(LaneState::Running)
-        );
-        assert_eq!(state.dhan_lane_state(), LaneState::Running);
-    }
 }

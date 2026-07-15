@@ -49,13 +49,9 @@ fn test_auth_and_profile_event_messages() {
     });
     assert!(m.contains("investigate before 09:15 IST"), "{m}");
 
-    let m = render(&NotificationEvent::MidSessionProfileInvalidated {
-        reason: "RSN-PROFILE-773".to_string(),
-    });
-    assert!(
-        m.contains("RSN-PROFILE-773") && m.contains("INVALIDATED"),
-        "{m}"
-    );
+    // MidSessionProfileInvalidated render coverage DELETED 2026-07-14 with
+    // the variant (Dhan noise lock) — the watchdog runs silently; a
+    // terminal re-mint failure routes through AuthenticationFailed.
 }
 
 #[test]
@@ -353,11 +349,8 @@ fn test_oms_and_questdb_event_messages() {
 
 #[test]
 fn test_misc_event_messages() {
-    let m = render(&NotificationEvent::NoLiveTicksDuringMarketHours {
-        silent_for_secs: 4250,
-        threshold_secs: 30,
-    });
-    assert!(m.contains("4250"), "{m}");
+    // RETIRED 2026-07-14: NoLiveTicksDuringMarketHours deleted with the
+    // no-tick watchdog (operator Dhan noise lock).
 
     // RETIRED 2026-06-12: LastTickAfterBoundary deleted (redundant with the live
     // tv_late_tick_after_boundary_total counter; wiring it = hot-path risk).
@@ -436,4 +429,224 @@ fn test_feed_down_and_recovered_message_coverage() {
         down_secs: 4253,
     });
     assert!(m.contains("4253") && m.contains("streaming again"), "{m}");
+}
+
+#[test]
+fn test_tf_consistency_summary_message_variants() {
+    use tickvault_core::notification::events::Severity;
+
+    // Clean PASS day → Info, PASS wording, both dates + counts rendered.
+    // H1: the Groww tail carve-out is NAMED on the pass wording (buckets
+    // never sealed on the prod schedule — not verified, never a page).
+    let clean = NotificationEvent::TfConsistencySummary {
+        dhan_date_ist: "2026-07-13".to_string(),
+        groww_date_ist: "2026-07-10".to_string(),
+        instruments: 343,
+        buckets_compared: 88_311,
+        mismatches: 0,
+        missing_tf_rows: 0,
+        no_coverage: 0,
+        off_grid: 0,
+        duplicates: 0,
+        tail_unsealed: 19,
+        degraded: false,
+        truncated: false,
+        status_label: "pass".to_string(),
+        top_detail: vec![],
+    };
+    let m = render(&clean);
+    assert!(
+        m.contains("PASS") && m.contains("2026-07-13") && m.contains("2026-07-10"),
+        "{m}"
+    );
+    assert!(m.contains("88311") || m.contains("88,311"), "{m}");
+    assert!(
+        m.contains("19 Groww end-of-day buckets are not sealed by design"),
+        "H1 tail carve-out must be named on the pass wording: {m}"
+    );
+    assert_eq!(clean.severity(), Severity::Info);
+    assert_eq!(clean.topic(), "TfConsistencySummary");
+
+    // Zero tail_unsealed → the note vanishes entirely.
+    let clean_no_tail = NotificationEvent::TfConsistencySummary {
+        dhan_date_ist: "2026-07-13".to_string(),
+        groww_date_ist: "2026-07-10".to_string(),
+        instruments: 343,
+        buckets_compared: 88_311,
+        mismatches: 0,
+        missing_tf_rows: 0,
+        no_coverage: 0,
+        off_grid: 0,
+        duplicates: 0,
+        tail_unsealed: 0,
+        degraded: false,
+        truncated: false,
+        status_label: "pass".to_string(),
+        top_detail: vec![],
+    };
+    let m = render(&clean_no_tail);
+    assert!(
+        !m.contains("not sealed by design"),
+        "no tail note when tail_unsealed == 0: {m}"
+    );
+
+    // Feed-off no_data day → Info, "nothing to check" wording, never PASS.
+    let no_data = NotificationEvent::TfConsistencySummary {
+        dhan_date_ist: "2026-07-13".to_string(),
+        groww_date_ist: "2026-07-10".to_string(),
+        instruments: 0,
+        buckets_compared: 0,
+        mismatches: 0,
+        missing_tf_rows: 0,
+        no_coverage: 0,
+        off_grid: 0,
+        duplicates: 0,
+        tail_unsealed: 0,
+        degraded: false,
+        truncated: false,
+        status_label: "no_data".to_string(),
+        top_detail: vec![],
+    };
+    let m = render(&no_data);
+    assert!(m.contains("nothing to check"), "{m}");
+    assert!(!m.contains("PASS"), "no_data must never claim PASS: {m}");
+    assert_eq!(no_data.severity(), Severity::Info);
+
+    // BLIND day (rows expected, zero compared) → High, BLIND wording.
+    // Refuter round 2: the Groww tail note must ride the BLIND wording
+    // too when tail_unsealed > 0.
+    let blind = NotificationEvent::TfConsistencySummary {
+        dhan_date_ist: "2026-07-13".to_string(),
+        groww_date_ist: "2026-07-10".to_string(),
+        instruments: 0,
+        buckets_compared: 0,
+        mismatches: 0,
+        missing_tf_rows: 0,
+        no_coverage: 0,
+        off_grid: 0,
+        duplicates: 0,
+        tail_unsealed: 3,
+        degraded: true,
+        truncated: false,
+        status_label: "blind".to_string(),
+        top_detail: vec![],
+    };
+    let m = render(&blind);
+    assert!(m.contains("BLIND") && m.contains("not a pass"), "{m}");
+    assert!(
+        m.contains("3 Groww end-of-day buckets are not sealed by design"),
+        "the Groww tail note must render on the BLIND wording too: {m}"
+    );
+    assert_eq!(blind.severity(), Severity::High);
+
+    // L6 pin: the blind-WITHOUT-degrade edge (rows seen, zero compared,
+    // zero paging counts, degraded=false). A count-derived re-check would
+    // have called the counts clean; the status_label verdict must win —
+    // High + BLIND wording, never Info, never PASS.
+    let blind_no_degrade = NotificationEvent::TfConsistencySummary {
+        dhan_date_ist: "2026-07-13".to_string(),
+        groww_date_ist: "2026-07-10".to_string(),
+        instruments: 12,
+        buckets_compared: 0,
+        mismatches: 0,
+        missing_tf_rows: 0,
+        no_coverage: 0,
+        off_grid: 0,
+        duplicates: 0,
+        tail_unsealed: 0,
+        degraded: false,
+        truncated: false,
+        status_label: "blind".to_string(),
+        top_detail: vec![],
+    };
+    let m = render(&blind_no_degrade);
+    assert!(
+        m.contains("BLIND") && !m.contains("PASS"),
+        "blind-without-degrade must render BLIND, never PASS: {m}"
+    );
+    assert_eq!(blind_no_degrade.severity(), Severity::High);
+
+    // L6 pin: a `degraded` verdict with clean-LOOKING counts (paging 0,
+    // compared > 0, degraded flag false) must still be High + needs
+    // attention — the label is the flush-adjusted truth.
+    let degraded_label = NotificationEvent::TfConsistencySummary {
+        dhan_date_ist: "2026-07-13".to_string(),
+        groww_date_ist: "2026-07-10".to_string(),
+        instruments: 343,
+        buckets_compared: 88_311,
+        mismatches: 0,
+        missing_tf_rows: 0,
+        no_coverage: 0,
+        off_grid: 0,
+        duplicates: 0,
+        tail_unsealed: 0,
+        degraded: false,
+        truncated: false,
+        status_label: "degraded".to_string(),
+        top_detail: vec![],
+    };
+    let m = render(&degraded_label);
+    assert!(
+        m.contains("NEEDS ATTENTION") && !m.contains("PASS"),
+        "a degraded status_label must never render PASS: {m}"
+    );
+    assert_eq!(degraded_label.severity(), Severity::High);
+
+    // Findings day → High, counts + top_detail lines rendered (escaped),
+    // truncated note present.
+    let findings = NotificationEvent::TfConsistencySummary {
+        dhan_date_ist: "2026-07-13".to_string(),
+        groww_date_ist: "2026-07-10".to_string(),
+        instruments: 343,
+        buckets_compared: 88_311,
+        mismatches: 4262,
+        missing_tf_rows: 4263,
+        no_coverage: 4264,
+        off_grid: 4265,
+        duplicates: 4266,
+        tail_unsealed: 7,
+        degraded: true,
+        truncated: true,
+        status_label: "mismatch".to_string(),
+        top_detail: vec!["DETAIL-TFV-901 <tag>".to_string()],
+    };
+    let m = render(&findings);
+    assert!(
+        m.contains("NEEDS ATTENTION")
+            && m.contains("4262")
+            && m.contains("4263")
+            && m.contains("4264")
+            && m.contains("4265")
+            && m.contains("4266"),
+        "{m}"
+    );
+    assert!(
+        m.contains("DETAIL-TFV-901") && m.contains("&lt;tag&gt;"),
+        "top_detail must render html-escaped: {m}"
+    );
+    assert!(m.contains("PARTIAL"), "degraded coverage note missing: {m}");
+    assert!(
+        m.contains("exceed the stored detail"),
+        "truncated note missing: {m}"
+    );
+    assert!(
+        m.contains("7 Groww end-of-day buckets are not sealed by design"),
+        "H1 tail carve-out note missing on the findings wording: {m}"
+    );
+    assert_eq!(findings.severity(), Severity::High);
+}
+
+#[test]
+fn test_tf_consistency_aborted_message() {
+    use tickvault_core::notification::events::Severity;
+    let ev = NotificationEvent::TfConsistencyAborted {
+        detail: "RSN-TFV-777 <b>".to_string(),
+    };
+    let m = render(&ev);
+    assert!(
+        m.contains("RSN-TFV-777") && m.contains("did NOT run") && m.contains("&lt;b&gt;"),
+        "{m}"
+    );
+    assert_eq!(ev.severity(), Severity::High);
+    assert_eq!(ev.topic(), "TfConsistencyAborted");
 }

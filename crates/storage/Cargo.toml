@@ -34,19 +34,29 @@ crossbeam-channel = { workspace = true }
 # ILP conf string is wrapped in `Secret<String>` so it is never logged
 # via Debug.
 secrecy = { workspace = true }
+# 2026-07-13 partition archive→verify→drop (disk-pressure remediation):
+# S3 upload/head for the verified partition archive (aws-sdk-s3 authorized
+# per groww-second-feed-scope §37 2026-07-12) + gzip for the streamed
+# QuestDB /exp CSV export (flate2 already in the lock via tower-http).
+aws-config = { workspace = true }
+aws-sdk-s3 = { workspace = true }
+flate2 = { workspace = true }
+# Review round 2 (2026-07-13): SHA-256 content identity for the S3
+# reuse/conflict decision (workspace-pinned; the app crate already uses it).
+sha2 = { workspace = true }
 
 [features]
-# Sub-PR #10b-ε of 2026-05-27 daily-universe expansion: gates the
-# `instrument_fetch_audit` table contract (schema constants + DEDUP key +
-# FetchOutcome enum). Mirrors the `tickvault-core` feature gate per
-# `.claude/rules/project/daily-universe-scope-expansion-2026-05-27.md` §21
-# — until Sub-PR #10b-ζ ships the DDL + append helpers AND the boot
-# orchestrator wires it, this feature is dormant and the gated code is
-# dead. No default feature.
-daily_universe_fetcher = []
+# PR-C3 (2026-07-14): the `daily_universe_fetcher` feature (Sub-PR #10b-ε
+# of the 2026-05-27 daily-universe expansion) was DELETED —
+# the SEBI table persistence modules it gated (instrument_lifecycle /
+# index_constituency / instrument_fetch_audit + the pure lifecycle
+# reconciler) are KEEP items of the scope-lock §B seam and now compile
+# unconditionally (the Groww shared-master writer is their live producer).
 
 [dev-dependencies]
 criterion = { workspace = true }
+# partition_archive_guard.rs parses config/base.toml to pin archive_enabled.
+toml = { workspace = true }
 dhat = { workspace = true }
 proptest = { workspace = true }
 tracing-subscriber = { workspace = true }

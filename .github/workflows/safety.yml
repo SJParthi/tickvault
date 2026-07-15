@@ -295,21 +295,83 @@ jobs:
           # the test exit 0 and falsely greens the workflow).
           ASAN_OPTIONS: "halt_on_error=1:abort_on_error=1:detect_leaks=0"
         run: |
-          cargo +${{ env.NIGHTLY_VERSION }} test --workspace \
-            --target x86_64-unknown-linux-gnu \
-            -Z build-std \
-            --lib --tests \
-            -- --test-threads=1 2>&1 || {
-            echo "test_failed=true" >> "$GITHUB_OUTPUT"
-            exit 1
+          # Per-crate loop (2026-07-14, #1494/#1495): the previous single
+          # `cargo test --workspace` invocation stopped at the FIRST failing
+          # test binary, so one plain test failure blinded the sanitizer
+          # scan for every remaining crate (run 29230855037 scanned ONLY
+          # tickvault-api). Each crate now runs its own suite with
+          # --no-fail-fast; failures accumulate and the per-crate PASS/FAIL
+          # summary below proves exactly which crates were scanned.
+          # Feature parity note (2026-07-14 hostile-review HIGH, then
+          # PR-C3 same day): the per-crate `--features daily_universe_fetcher`
+          # injections were REMOVED in PR-C3 — the feature was deleted with
+          # the Dhan instrument chain (the formerly-gated modules are now
+          # UN-GATED and always compiled, so default-feature runs scan
+          # them). The app crate still gets `--bins` because its bin target
+          # carries #[test] fns that `--lib --tests` never runs. Budget:
+          # ONE feature configuration — the -Z build-std artifacts build
+          # once and are reused across every crate.
+          set -o pipefail
+          : > /tmp/asan-test.log
+          declare -A verdict
+          failed=()
+          # Order retained from the two-configuration era (PR-C3 collapsed
+          # it to ONE configuration — the feature is deleted; order is now
+          # cosmetic).
+          crates="tickvault-common tickvault-trading tickvault-api tickvault-storage tickvault-core tickvault-app"
+          extra_args() {
+            case "$1" in
+              # PR-C3 (2026-07-14): the core/storage daily_universe_fetcher
+              # arm was removed — the feature is deleted; those modules are
+              # un-gated and scanned under default features.
+              # App bin target carries #[test] fns --lib --tests never runs.
+              tickvault-app) echo "--bins" ;;
+              *) echo "" ;;
+            esac
           }
+          for p in $crates; do
+            echo "::group::ASan: ${p}"
+            if cargo +${{ env.NIGHTLY_VERSION }} test -p "$p" \
+              --target x86_64-unknown-linux-gnu \
+              -Z build-std \
+              --lib --tests $(extra_args "$p") --no-fail-fast \
+              -- --test-threads=1 2>&1 | tee -a /tmp/asan-test.log; then
+              verdict[$p]=PASS
+            else
+              verdict[$p]=FAIL
+              failed+=("$p")
+            fi
+            echo "::endgroup::"
+          done
+          echo "=== ASan per-crate summary ==="
+          for p in $crates; do
+            printf '%-20s %s\n' "$p" "${verdict[$p]}"
+          done
+          # Honest issue filing: distinguish a REAL sanitizer finding from a
+          # plain test/harness failure under the sanitizer build.
+          if grep -q "ERROR: AddressSanitizer" /tmp/asan-test.log; then
+            echo "sanitizer_report=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "sanitizer_report=false" >> "$GITHUB_OUTPUT"
+          fi
+          if [ "${#failed[@]}" -gt 0 ]; then
+            echo "test_failed=true" >> "$GITHUB_OUTPUT"
+            echo "failed_crates=${failed[*]}" >> "$GITHUB_OUTPUT"
+            echo "::error::ASan lane failed in: ${failed[*]}"
+            exit 1
+          fi
 
       - name: Auto-close ASan runtime issue on green run
         if: steps.test.outcome == 'success'
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v7
         with:
           script: |
-            const title = '🔴 Safety Net: AddressSanitizer found memory issues';
+            // Close BOTH the real-finding title and the honest
+            // no-report-lane-failure title on a green run.
+            const titles = [
+              '🔴 Safety Net: AddressSanitizer found memory issues',
+              'safety: ASan lane failed (no sanitizer report — test/build failure)',
+            ];
             const { data: existing } = await github.rest.issues.listForRepo({
               owner: context.repo.owner,
               repo: context.repo.repo,
@@ -317,28 +379,42 @@ jobs:
               labels: 'safety',
               per_page: 100,
             });
-            const match = existing.find(i => i.title === title);
-            if (!match) { return; }
-            await github.rest.issues.createComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: match.number,
-              body: `Auto-closed: ASan green on \`${process.env.NIGHTLY_VERSION || 'current pin'}\`.\n\nSee: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
-            });
-            await github.rest.issues.update({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: match.number,
-              state: 'closed',
-              state_reason: 'completed',
-            });
+            for (const title of titles) {
+              const match = existing.find(i => i.title === title);
+              if (!match) { continue; }
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: match.number,
+                body: `Auto-closed: ASan green on \`${process.env.NIGHTLY_VERSION || 'current pin'}\`.\n\nSee: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+              });
+              await github.rest.issues.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: match.number,
+                state: 'closed',
+                state_reason: 'completed',
+              });
+            }
 
       - name: Create issue on test failure (deduplicated)
         if: failure() && steps.test.outputs.test_failed == 'true'
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v7
         with:
           script: |
-            const title = '🔴 Safety Net: AddressSanitizer found memory issues';
+            // Honest filing (#1495): only claim "found memory issues" when
+            // the captured log carries a real `ERROR: AddressSanitizer`
+            // banner; a plain test failure under the sanitizer build gets
+            // an honest title instead.
+            const hasReport = '${{ steps.test.outputs.sanitizer_report }}' === 'true';
+            const failedCrates = '${{ steps.test.outputs.failed_crates }}' || 'unknown';
+            const title = hasReport
+              ? '🔴 Safety Net: AddressSanitizer found memory issues'
+              : 'safety: ASan lane failed (no sanitizer report — test/build failure)';
+            const detail = hasReport
+              ? 'Weekly safety scan detected memory safety issues (use-after-free, buffer overflow, etc.).\n\nThis requires immediate investigation.'
+              : 'The ASan job failed, but the captured test log contains NO `ERROR: AddressSanitizer` banner — this is a plain test (or harness) failure under the sanitizer build, NOT a memory-safety finding. Fix the failing test; the sanitizer itself reported nothing.';
+            const labels = hasReport ? ['bug', 'safety', 'critical'] : ['bug', 'safety'];
             const { data: existing } = await github.rest.issues.listForRepo({
               owner: context.repo.owner,
               repo: context.repo.repo,
@@ -352,7 +428,7 @@ jobs:
                 owner: context.repo.owner,
                 repo: context.repo.repo,
                 issue_number: duplicate.number,
-                body: `Still reproducing as of ${new Date().toISOString()}.\n\nSee: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+                body: `Still reproducing as of ${new Date().toISOString()} (failed crates: ${failedCrates}).\n\nSee: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
               });
               return;
             }
@@ -360,8 +436,8 @@ jobs:
               owner: context.repo.owner,
               repo: context.repo.repo,
               title,
-              body: `Weekly safety scan detected memory safety issues (use-after-free, buffer overflow, etc.).\n\nSee: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}\n\nThis requires immediate investigation.`,
-              labels: ['bug', 'safety', 'critical'],
+              body: `${detail}\n\nFailed crates: ${failedCrates}\n\nSee: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+              labels,
             });
 
       - name: Create issue on build failure (deduplicated)
@@ -469,21 +545,83 @@ jobs:
           # load (the workspace test count is large).
           TSAN_OPTIONS: "halt_on_error=1:history_size=7"
         run: |
-          cargo +${{ env.NIGHTLY_VERSION }} test --workspace \
-            --target x86_64-unknown-linux-gnu \
-            -Z build-std \
-            --lib --tests \
-            -- --test-threads=1 2>&1 || {
-            echo "test_failed=true" >> "$GITHUB_OUTPUT"
-            exit 1
+          # Per-crate loop (2026-07-14, #1494/#1495): the previous single
+          # `cargo test --workspace` invocation stopped at the FIRST failing
+          # test binary, so one plain test failure blinded the sanitizer
+          # scan for every remaining crate (run 29230855037 scanned ONLY
+          # tickvault-api). Each crate now runs its own suite with
+          # --no-fail-fast; failures accumulate and the per-crate PASS/FAIL
+          # summary below proves exactly which crates were scanned.
+          # Feature parity note (2026-07-14 hostile-review HIGH, then
+          # PR-C3 same day): the per-crate `--features daily_universe_fetcher`
+          # injections were REMOVED in PR-C3 — the feature was deleted with
+          # the Dhan instrument chain (the formerly-gated modules are now
+          # UN-GATED and always compiled, so default-feature runs scan
+          # them). The app crate still gets `--bins` because its bin target
+          # carries #[test] fns that `--lib --tests` never runs. Budget:
+          # ONE feature configuration — the -Z build-std artifacts build
+          # once and are reused across every crate.
+          set -o pipefail
+          : > /tmp/tsan-test.log
+          declare -A verdict
+          failed=()
+          # Order retained from the two-configuration era (PR-C3 collapsed
+          # it to ONE configuration — the feature is deleted; order is now
+          # cosmetic).
+          crates="tickvault-common tickvault-trading tickvault-api tickvault-storage tickvault-core tickvault-app"
+          extra_args() {
+            case "$1" in
+              # PR-C3 (2026-07-14): the core/storage daily_universe_fetcher
+              # arm was removed — the feature is deleted; those modules are
+              # un-gated and scanned under default features.
+              # App bin target carries #[test] fns --lib --tests never runs.
+              tickvault-app) echo "--bins" ;;
+              *) echo "" ;;
+            esac
           }
+          for p in $crates; do
+            echo "::group::TSan: ${p}"
+            if cargo +${{ env.NIGHTLY_VERSION }} test -p "$p" \
+              --target x86_64-unknown-linux-gnu \
+              -Z build-std \
+              --lib --tests $(extra_args "$p") --no-fail-fast \
+              -- --test-threads=1 2>&1 | tee -a /tmp/tsan-test.log; then
+              verdict[$p]=PASS
+            else
+              verdict[$p]=FAIL
+              failed+=("$p")
+            fi
+            echo "::endgroup::"
+          done
+          echo "=== TSan per-crate summary ==="
+          for p in $crates; do
+            printf '%-20s %s\n' "$p" "${verdict[$p]}"
+          done
+          # Honest issue filing: distinguish a REAL sanitizer finding from a
+          # plain test/harness failure under the sanitizer build.
+          if grep -q "WARNING: ThreadSanitizer" /tmp/tsan-test.log; then
+            echo "sanitizer_report=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "sanitizer_report=false" >> "$GITHUB_OUTPUT"
+          fi
+          if [ "${#failed[@]}" -gt 0 ]; then
+            echo "test_failed=true" >> "$GITHUB_OUTPUT"
+            echo "failed_crates=${failed[*]}" >> "$GITHUB_OUTPUT"
+            echo "::error::TSan lane failed in: ${failed[*]}"
+            exit 1
+          fi
 
       - name: Auto-close TSan runtime issue on green run
         if: steps.test.outcome == 'success'
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v7
         with:
           script: |
-            const title = '🔴 Safety Net: ThreadSanitizer found data races';
+            // Close BOTH the real-finding title and the honest
+            // no-report-lane-failure title on a green run.
+            const titles = [
+              '🔴 Safety Net: ThreadSanitizer found data races',
+              'safety: TSan lane failed (no sanitizer report — test/build failure)',
+            ];
             const { data: existing } = await github.rest.issues.listForRepo({
               owner: context.repo.owner,
               repo: context.repo.repo,
@@ -491,28 +629,42 @@ jobs:
               labels: 'safety',
               per_page: 100,
             });
-            const match = existing.find(i => i.title === title);
-            if (!match) { return; }
-            await github.rest.issues.createComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: match.number,
-              body: `Auto-closed: TSan green on \`${process.env.NIGHTLY_VERSION || 'current pin'}\`.\n\nSee: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
-            });
-            await github.rest.issues.update({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: match.number,
-              state: 'closed',
-              state_reason: 'completed',
-            });
+            for (const title of titles) {
+              const match = existing.find(i => i.title === title);
+              if (!match) { continue; }
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: match.number,
+                body: `Auto-closed: TSan green on \`${process.env.NIGHTLY_VERSION || 'current pin'}\`.\n\nSee: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+              });
+              await github.rest.issues.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: match.number,
+                state: 'closed',
+                state_reason: 'completed',
+              });
+            }
 
       - name: Create issue on test failure (deduplicated)
         if: failure() && steps.test.outputs.test_failed == 'true'
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v7
         with:
           script: |
-            const title = '🔴 Safety Net: ThreadSanitizer found data races';
+            // Honest filing (#1495): only claim "found data races" when the
+            // captured log carries a real `WARNING: ThreadSanitizer` banner;
+            // a plain test failure under the sanitizer build gets an honest
+            // title instead.
+            const hasReport = '${{ steps.test.outputs.sanitizer_report }}' === 'true';
+            const failedCrates = '${{ steps.test.outputs.failed_crates }}' || 'unknown';
+            const title = hasReport
+              ? '🔴 Safety Net: ThreadSanitizer found data races'
+              : 'safety: TSan lane failed (no sanitizer report — test/build failure)';
+            const detail = hasReport
+              ? 'Weekly safety scan detected data race conditions.\n\nThis requires investigation — data races in trading systems can cause incorrect fills.'
+              : 'The TSan job failed, but the captured test log contains NO `WARNING: ThreadSanitizer` banner — this is a plain test (or harness) failure under the sanitizer build, NOT a data-race finding. Fix the failing test; the sanitizer itself reported nothing.';
+            const labels = hasReport ? ['bug', 'safety', 'critical'] : ['bug', 'safety'];
             const { data: existing } = await github.rest.issues.listForRepo({
               owner: context.repo.owner,
               repo: context.repo.repo,
@@ -526,7 +678,7 @@ jobs:
                 owner: context.repo.owner,
                 repo: context.repo.repo,
                 issue_number: duplicate.number,
-                body: `Still reproducing as of ${new Date().toISOString()}.\n\nSee: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+                body: `Still reproducing as of ${new Date().toISOString()} (failed crates: ${failedCrates}).\n\nSee: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
               });
               return;
             }
@@ -534,8 +686,8 @@ jobs:
               owner: context.repo.owner,
               repo: context.repo.repo,
               title,
-              body: `Weekly safety scan detected data race conditions.\n\nSee: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}\n\nThis requires investigation — data races in trading systems can cause incorrect fills.`,
-              labels: ['bug', 'safety', 'critical'],
+              body: `${detail}\n\nFailed crates: ${failedCrates}\n\nSee: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+              labels,
             });
 
       - name: Create issue on build failure (deduplicated)

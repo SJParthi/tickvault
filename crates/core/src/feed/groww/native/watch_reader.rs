@@ -36,6 +36,19 @@ pub struct WatchFileEntry {
     pub kind: WatchFileKind,
     /// The integer id stored in the shared `ticks` table / NDJSON lines.
     pub security_id: i64,
+    /// Writer-side cold-path provenance: the Groww `groww_symbol` for
+    /// indices (e.g. `NSE-NIFTY`) — absent for stocks. Read since
+    /// 2026-07-13 (Groww spot-leg INDIA VIX scope) so the per-minute REST
+    /// leg can RUNTIME-resolve the VIX candles identity from the day's
+    /// master instead of guessing a literal. Missing field → `None`
+    /// (additive JSON — old files parse unchanged).
+    #[serde(default)]
+    pub index_name: Option<String>,
+    /// Writer-side cold-path provenance: the Groww DISPLAY name (e.g.
+    /// "India Vix") — one of the two canonicalization keys the VIX
+    /// resolution matches on. Missing field → `None`.
+    #[serde(default)]
+    pub symbol_name: Option<String>,
 }
 
 /// Mirror of the writer's `WatchKind` (`#[serde(rename_all = "snake_case")]`).
@@ -195,6 +208,10 @@ mod tests {
         let doc = parse_watch_file(SAMPLE).expect("sample parses");
         assert_eq!(doc.trading_date_ist, "2026-07-04");
         assert_eq!(doc.entries.len(), 3);
+        // Additive JSON (2026-07-13): pre-existing files without the
+        // provenance keys still parse — the optional fields read None.
+        assert_eq!(doc.entries[2].index_name, None);
+        assert_eq!(doc.entries[2].symbol_name, None);
 
         let (map, skipped) = build_subject_map(&doc).expect("map builds");
         assert_eq!(skipped, 0);
@@ -261,6 +278,14 @@ mod tests {
         let json =
             crate::feed::groww::instruments::serialize_watch_file_for_test(&set, "2026-07-04");
         let doc = parse_watch_file(&json).expect("writer output parses");
+        // 2026-07-13 (Groww spot-leg INDIA VIX scope): the reader now
+        // surfaces the writer's cold-path provenance keys the runtime VIX
+        // resolution matches on — index_name (the groww_symbol) +
+        // symbol_name (the display name); absent fields parse to None.
+        assert_eq!(doc.entries[0].index_name, None);
+        assert_eq!(doc.entries[0].symbol_name.as_deref(), Some("TEST"));
+        assert_eq!(doc.entries[1].index_name.as_deref(), Some("BSE-SENSEX"));
+        assert_eq!(doc.entries[1].symbol_name, None);
         let (map, skipped) = build_subject_map(&doc).expect("map builds");
         assert_eq!(skipped, 0);
         assert!(map.contains_key("/ld/eq/nse/price.1234"));

@@ -24,95 +24,50 @@
 //!
 //! Plus structured INFO log lines at both sites for human readability.
 
-use std::path::PathBuf;
+// RETIRED (PR-C2, 2026-07-13 — Dhan live-WS lane deletion, operator
+// retirement directive per websocket-connection-scope-lock.md
+// "2026-07-13 Amendment" §B): phase2_12_main_rs_emits_lifecycle_enricher_attached_gauge died with the wiring it pinned — the
+// Dhan tick pipeline (frame channel → run_tick_processor → TickEnricher /
+// prev_oi lifecycle enrichment / L14 boot-ordering gate) was deleted from
+// main.rs with the lane; the Groww feed carries its own bridge path.
 
-fn workspace_root() -> PathBuf {
-    let me = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    me.parent()
-        .expect("tickvault root")
-        .parent()
-        .expect("workspace root")
-        .to_path_buf()
-        .join("crates")
-}
+// RETIRED (PR-C2, 2026-07-13 — Dhan live-WS lane deletion, operator
+// retirement directive per websocket-connection-scope-lock.md
+// "2026-07-13 Amendment" §B): phase2_12_fast_boot_sets_gauge_to_zero died with the wiring it pinned — the
+// Dhan tick pipeline (frame channel → run_tick_processor → TickEnricher /
+// prev_oi lifecycle enrichment / L14 boot-ordering gate) was deleted from
+// main.rs with the lane; the Groww feed carries its own bridge path.
 
-fn read(rel: &str) -> String {
-    let p = workspace_root().join(rel);
-    std::fs::read_to_string(&p).unwrap_or_else(|err| panic!("read {p:?}: {err}"))
-}
+// RETIRED (PR-C2, 2026-07-13 — Dhan live-WS lane deletion, operator
+// retirement directive per websocket-connection-scope-lock.md
+// "2026-07-13 Amendment" §B): phase2_12_slow_boot_sets_gauge_to_one died with the wiring it pinned — the
+// Dhan tick pipeline (frame channel → run_tick_processor → TickEnricher /
+// prev_oi lifecycle enrichment) was deleted from main.rs with the lane.
 
-#[test]
-fn phase2_12_main_rs_emits_lifecycle_enricher_attached_gauge() {
-    let src = read("app/src/main.rs");
-    assert!(
-        src.contains("tv_lifecycle_enricher_attached"),
-        "main.rs must emit tv_lifecycle_enricher_attached gauge at both boot sites"
-    );
-}
+// RETIRED (PR-C2, 2026-07-13 — Dhan live-WS lane deletion, operator
+// retirement directive per websocket-connection-scope-lock.md
+// "2026-07-13 Amendment" §B): phase2_12_fast_boot_logs_enricher_attached_false died with the wiring it pinned — the
+// Dhan tick pipeline (frame channel → run_tick_processor → TickEnricher /
+// prev_oi lifecycle enrichment / L14 boot-ordering gate) was deleted from
+// main.rs with the lane; the Groww feed carries its own bridge path.
 
-#[test]
-fn phase2_12_fast_boot_sets_gauge_to_zero() {
-    let src = read("app/src/main.rs");
-    assert!(
-        src.contains("\"boot_mode\" => \"fast\"") && src.contains(".set(0.0)"),
-        "fast boot must set gauge to 0.0 with boot_mode=fast label"
-    );
-}
+// RETIRED (PR-C2, 2026-07-13 — Dhan live-WS lane deletion, operator
+// retirement directive per websocket-connection-scope-lock.md
+// "2026-07-13 Amendment" §B): phase2_12_slow_boot_logs_enricher_attached_true died with the wiring it pinned — the
+// Dhan tick pipeline (frame channel → run_tick_processor → TickEnricher /
+// prev_oi lifecycle enrichment / L14 boot-ordering gate) was deleted from
+// main.rs with the lane; the Groww feed carries its own bridge path.
 
-#[test]
-fn phase2_12_slow_boot_sets_gauge_to_one() {
-    let src = read("app/src/main.rs");
-    assert!(
-        src.contains("\"boot_mode\" => \"slow\"") && src.contains(".set(1.0)"),
-        "slow boot must set gauge to 1.0 with boot_mode=slow label"
-    );
-}
+// RETIRED (PR-C2, 2026-07-13 — Dhan live-WS lane deletion, operator
+// retirement directive per websocket-connection-scope-lock.md
+// "2026-07-13 Amendment" §B): phase2_12_fast_boot_log_explains_lifecycle_columns_will_not_be_populated died with the wiring it pinned — the
+// Dhan tick pipeline (frame channel → run_tick_processor → TickEnricher /
+// prev_oi lifecycle enrichment / L14 boot-ordering gate) was deleted from
+// main.rs with the lane; the Groww feed carries its own bridge path.
 
-#[test]
-fn phase2_12_fast_boot_logs_enricher_attached_false() {
-    let src = read("app/src/main.rs");
-    assert!(
-        src.contains("boot_mode = \"fast\"") && src.contains("enricher_attached = false"),
-        "fast boot must log structured boot_mode=fast + enricher_attached=false"
-    );
-}
-
-#[test]
-fn phase2_12_slow_boot_logs_enricher_attached_true() {
-    let src = read("app/src/main.rs");
-    assert!(
-        src.contains("boot_mode = \"slow\"") && src.contains("enricher_attached = true"),
-        "slow boot must log structured boot_mode=slow + enricher_attached=true"
-    );
-}
-
-#[test]
-fn phase2_12_fast_boot_log_explains_lifecycle_columns_will_not_be_populated() {
-    let src = read("app/src/main.rs");
-    assert!(
-        src.contains("lifecycle columns will NOT be")
-            || src.contains("lifecycle columns will not be populated"),
-        "fast boot log must clearly state that lifecycle columns will NOT be populated \
-         (operator-visible context for the recovery path)"
-    );
-}
-
-#[test]
-fn phase2_12_slow_boot_log_lists_attached_subsystems() {
-    let src = read("app/src/main.rs");
-    // Slow boot's structured log line names the subsystems that get
-    // wired in: TickEnricher, prev_oi_cache, BootOrderingGate,
-    // midnight rollover, periodic refresh.
-    assert!(
-        src.contains("TickEnricher attached"),
-        "slow boot log must mention TickEnricher attached"
-    );
-    assert!(
-        src.contains("prev_oi_cache loaded"),
-        "slow boot log must mention prev_oi_cache loaded"
-    );
-    assert!(
-        src.contains("BootOrderingGate authorized"),
-        "slow boot log must mention BootOrderingGate authorized"
-    );
-}
+// RETIRED (PR-C2, 2026-07-13 — Dhan live-WS lane deletion, operator
+// retirement directive per websocket-connection-scope-lock.md
+// "2026-07-13 Amendment" §B): phase2_12_slow_boot_log_lists_attached_subsystems died with the wiring it pinned — the
+// Dhan tick pipeline (frame channel → run_tick_processor → TickEnricher /
+// prev_oi lifecycle enrichment / L14 boot-ordering gate) was deleted from
+// main.rs with the lane; the Groww feed carries its own bridge path.

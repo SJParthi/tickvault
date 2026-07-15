@@ -35,7 +35,7 @@
 # instead of as a residual).
 #
 # COUNTER SHAPE: identical model + identical honest residual as
-# feed-stall-restart-alarm.tf / order-update-reconnect-storm-alarm.tf — the
+# feed-stall-restart-alarm.tf / the retired order-update-reconnect-storm alarm — the
 # CW agent's prometheus pipeline converts COUNTER samples to PER-SCRAPE
 # DELTAS, so `Sum` over the window = seals dropped in the window. Not
 # live-verified from this sandbox; if the field ever proved CUMULATIVE, Sum

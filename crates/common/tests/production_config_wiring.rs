@@ -66,19 +66,84 @@ fn test_production_locks_dry_run_no_real_orders() {
 }
 
 #[test]
-fn test_production_runs_both_feeds() {
-    let content = std::fs::read_to_string(workspace_root().join("config").join("production.toml"))
+fn test_production_groww_live_dhan_rest_only() {
+    // Operator directive 2026-07-13 (verbatim, relayed via the coordinator
+    // session): "now remove this entire Dhan live websocket feed instruments
+    // subscription even entire live websocket feed itself... As of now only
+    // Groww and Dhan historical api pull as we discussed last night along
+    // with option chain."
+    //
+    // SUPERSEDES the 2026-06-30 both-feeds lock (the retired
+    // `test_production_runs_both_feeds`): the Dhan live WS lane is OFF by
+    // default; Groww is THE live feed; the Dhan REST retained surface
+    // (token/auth stack, spot_1m_rest, option_chain_1m + entitlement probe,
+    // REST canary) runs WITHOUT the WS lane via
+    // crates/app/src/dhan_rest_stack.rs. Phase A is a config flip +
+    // additive bootstrap — flipping dhan_enabled back to true requires a
+    // fresh dated operator quote HERE first.
+    let prod = std::fs::read_to_string(workspace_root().join("config").join("production.toml"))
         .expect("production.toml must be readable"); // APPROVED: test
-
-    // Both market-data feeds run under the single prod env (operator 2026-06-30).
-    // Neither places orders — dry_run=true gates all order placement.
     assert!(
-        content.contains("dhan_enabled = true"),
-        "production.toml must enable the Dhan feed (feed #1)"
+        prod.contains("dhan_enabled = false"),
+        "production.toml must DISABLE the Dhan live WS feed (operator \
+         directive 2026-07-13 — Dhan is REST-only; the WS lane is retired)"
     );
     assert!(
-        content.contains("groww_enabled = true"),
-        "production.toml must enable the Groww feed (feed #2)"
+        !prod.contains("dhan_enabled = true"),
+        "production.toml must NOT re-enable the Dhan live WS feed — that \
+         resurrects the retired lane (operator directive 2026-07-13)"
+    );
+    assert!(
+        prod.contains("groww_enabled = true"),
+        "production.toml must keep the Groww feed enabled — Groww is THE \
+         live feed (operator directive 2026-07-13)"
+    );
+
+    // base.toml carries the same Dhan-off default so a TV_ENVIRONMENT=dev/
+    // local boot (base-only merge) can never resurrect the retired lane.
+    let base = std::fs::read_to_string(workspace_root().join("config").join("base.toml"))
+        .expect("base.toml must be readable"); // APPROVED: test
+    assert!(
+        base.contains("dhan_enabled = false"),
+        "base.toml must DISABLE the Dhan live WS feed (operator directive \
+         2026-07-13 — Dhan is REST-only everywhere, not just in prod)"
+    );
+    assert!(
+        !base.contains("dhan_enabled = true"),
+        "base.toml must NOT re-enable the Dhan live WS feed (operator \
+         directive 2026-07-13)"
+    );
+}
+
+#[test]
+fn test_base_config_sandbox_only_until_is_2099_sentinel() {
+    // Refuter round 1 (2026-07-14, LOW): production.toml's 2099-12-31 pin
+    // above left config/base.toml UN-pinned — the historical incident was
+    // exactly base.toml's `sandbox_only_until = "2026-06-30"` EXPIRING
+    // silently on 2026-07-01. A silent revert to a past date must fail the
+    // BUILD, not just fire the runtime gate-4 boot warn. Comment-filtered
+    // (base.toml carries prose comments mentioning the sentinel date, so a
+    // bare `contains("2099-12-31")` would pass even after a revert).
+    let base = std::fs::read_to_string(workspace_root().join("config").join("base.toml"))
+        .expect("base.toml must be readable"); // APPROVED: test
+    let assignments: Vec<&str> = base
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.starts_with('#') && l.contains("sandbox_only_until"))
+        .collect();
+    assert_eq!(
+        assignments.len(),
+        1,
+        "base.toml must carry exactly ONE sandbox_only_until assignment; \
+         found {assignments:?}"
+    );
+    assert!(
+        assignments[0].starts_with("sandbox_only_until = \"2099-12-31\""),
+        "BASE LOCKDOWN: base.toml must set sandbox_only_until = \"2099-12-31\" \
+         (the far-future sentinel matching production.toml) — a past date \
+         silently disarms the sandbox window on every base-merged boot \
+         (the 2026-07-01 silent-expiry incident class); found: {}",
+        assignments[0]
     );
 }
 

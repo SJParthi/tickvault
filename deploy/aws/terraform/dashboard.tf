@@ -48,11 +48,14 @@ resource "aws_cloudwatch_dashboard" "operator" {
         width  = 8
         height = 6
         properties = {
-          title   = "Real-time guarantee score (1.0 = all healthy)"
+          # PR-C2 (2026-07-13): was the tv_realtime_guarantee_score gauge —
+          # retired with the PARKed SLO publisher (wave-3-d banner); the
+          # Groww lag p99 is the Phase-A liveness signal.
+          title   = "Groww exchange->capture lag p99 (seconds)"
           region  = local.dash_region
           view    = "gauge"
-          metrics = [[local.dash_namespace, "tv_realtime_guarantee_score"]]
-          yAxis   = { left = { min = 0, max = 1 } }
+          metrics = [[local.dash_namespace, "tv_groww_exchange_lag_p99_seconds"]]
+          yAxis   = { left = { min = 0, max = 10 } }
           period  = 60
           stat    = "Average"
         }
@@ -110,10 +113,14 @@ resource "aws_cloudwatch_dashboard" "operator" {
         width  = 8
         height = 6
         properties = {
-          title   = "Instruments silent (tick-gap — 0 = all streaming)"
+          # PR-C3 (2026-07-14): the per-SID tick-gap silent-count panel was
+          # replaced — its gauge producer (the tick-gap detector) was deleted
+          # with the Dhan WS lane (operator Q4-ii 2026-07-13). The FEED-level
+          # last-tick age is the surviving stall signal (FEED-STALL-01).
+          title   = "Feed last-tick age (s — feed-level stall signal)"
           region  = local.dash_region
           view    = "timeSeries"
-          metrics = [[local.dash_namespace, "tv_tick_gap_instruments_silent"]]
+          metrics = [[local.dash_namespace, "tv_feed_last_tick_age_seconds"]]
           period  = 60
           stat    = "Maximum"
         }
@@ -129,9 +136,12 @@ resource "aws_cloudwatch_dashboard" "operator" {
           region = local.dash_region
           view   = "timeSeries"
           metrics = [
+            # tv_order_update_ws_active panel row REMOVED 2026-07-14 (Dhan
+            # noise lock fix round M4): the order-update WS spawn is retired,
+            # so the gauge has zero reachable writers — a dead-metric panel
+            # would render as missing data and mislead triage.
             [local.dash_namespace, "tv_websocket_pool_all_dead", { label = "pool all dead (1=bad)" }],
-            [local.dash_namespace, "tv_websocket_failed_connections_count", { label = "failed conns" }],
-            [local.dash_namespace, "tv_order_update_ws_active", { label = "order-update WS active (1=good)" }]
+            [local.dash_namespace, "tv_websocket_failed_connections_count", { label = "failed conns" }]
           ]
           period = 60
           stat   = "Maximum"
@@ -224,17 +234,39 @@ resource "aws_cloudwatch_dashboard" "operator" {
         properties = {
           title = "Live alarm status (red = firing -> Telegram/Email/SMS already paged)"
           alarms = [
-            aws_cloudwatch_metric_alarm.ws_pool_all_dead.arn,
             aws_cloudwatch_metric_alarm.questdb_disconnected.arn,
             aws_cloudwatch_metric_alarm.token_remaining_low.arn,
-            aws_cloudwatch_metric_alarm.tick_gap_instruments_silent.arn,
-            aws_cloudwatch_metric_alarm.realtime_guarantee_critical.arn,
+            # tick_gap_instruments_silent retired in PR-C3 (2026-07-14).
             aws_cloudwatch_metric_alarm.spill_dropped.arn,
             aws_cloudwatch_metric_alarm.dlq_ticks.arn,
             aws_cloudwatch_metric_alarm.clock_skew_high.arn,
             aws_cloudwatch_metric_alarm.high_cpu.arn,
             aws_cloudwatch_metric_alarm.disk_used_high.arn
           ]
+        }
+      },
+
+      # ----- Row 6: order-side (cluster C, 2026-07-14) -----
+      # tv_orders_placed_delta_total = the DERIVED metrics-log-filter
+      # series from order-side-alarms.tf (dense from boot via the main.rs
+      # pre-registrations); tv_orders_rejected_total is EMF-published.
+      # ₹0 widget — appended to the EXISTING dashboard, free-tier slot 3
+      # deliberately NOT consumed.
+      {
+        type   = "metric"
+        x      = 0
+        y      = 30
+        width  = 12
+        height = 6
+        properties = {
+          title  = "Orders (paper mode until Phase-1) — placed vs rejected, 5m sums"
+          region = local.dash_region
+          view   = "timeSeries"
+          metrics = [
+            ["Tickvault/Prod", "tv_orders_placed_delta_total", "host", "tickvault-prod", { stat = "Sum" }],
+            ["Tickvault/Prod", "tv_orders_rejected_total", "host", "tickvault-prod", { stat = "Sum" }]
+          ]
+          period = 300
         }
       }
     ]
@@ -369,12 +401,10 @@ resource "aws_cloudwatch_dashboard" "scoreboard" {
         properties = {
           title = "Feed alarm status (red = firing -> already paged)"
           alarms = [
-            aws_cloudwatch_metric_alarm.ws_pool_all_dead.arn,
             aws_cloudwatch_metric_alarm.feed_stall_restarts.arn,
             aws_cloudwatch_metric_alarm.boundary_catchup_storm_dhan.arn,
             aws_cloudwatch_metric_alarm.dhan_exchange_lag_p99_high.arn,
-            aws_cloudwatch_metric_alarm.groww_exchange_lag_p99_high.arn,
-            aws_cloudwatch_metric_alarm.realtime_guarantee_degraded.arn
+            aws_cloudwatch_metric_alarm.groww_exchange_lag_p99_high.arn
           ]
         }
       },

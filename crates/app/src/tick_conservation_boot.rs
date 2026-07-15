@@ -75,9 +75,10 @@ pub fn ws_wal_dir() -> std::path::PathBuf {
     )
 }
 
-/// Decision for WHEN the conservation audit should fire. Mirrors
-/// `cross_verify_1m_boot::CrossVerifyStart` (whose own `SkipPastTrigger`
-/// is a SEPARATE design decision — cross-verify is untouched here).
+/// Decision for WHEN the conservation audit should fire. Historically
+/// mirrored the retired cross-verify's `CrossVerifyStart` (its
+/// `cross_verify_1m_boot.rs` module was deleted in PR-C3, 2026-07-14 —
+/// this audit's own start semantics are unchanged).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConservationStart {
     /// Not a trading day and not forced → do not run.

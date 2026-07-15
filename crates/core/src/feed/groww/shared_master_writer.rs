@@ -36,6 +36,9 @@ use super::instruments::{GrowwWatchSet, WatchEntry, WatchKind};
 /// §36 (2026-07-08): `YYYY-MM-DD` → IST-midnight nanos for the FUTIDX master
 /// rows (0 sentinel on empty/unparsable — same semantics as the Dhan-side
 /// `expiry_date_to_ist_nanos`). Cold path, once per daily master build.
+/// (PR-C3 2026-07-14: the short-lived `daily_universe_fetcher` gate from the
+/// PR-C2 r1 hygiene pass was deleted with the feature itself — this fn and
+/// its sole caller `build_groww_lifecycle_rows` compile unconditionally.)
 fn expiry_str_to_ist_midnight_nanos(expiry: &str) -> i64 {
     let trimmed = expiry.trim();
     if trimmed.is_empty() {
@@ -50,29 +53,22 @@ fn expiry_str_to_ist_midnight_nanos(expiry: &str) -> i64 {
     midnight.and_utc().timestamp_nanos_opt().unwrap_or(0)
 }
 
-// `Feed` / `ErrorCode` / the `error!`+`info!` macros are only used by the feature-gated
-// builders + persist impl (the shared master tables exist only under `daily_universe_fetcher`).
-#[cfg(feature = "daily_universe_fetcher")]
+// `Feed` / `ErrorCode` / the `error!`+`info!` macros are used by the builders +
+// persist impl (all unconditional since PR-C3 2026-07-14 — the
+// `daily_universe_fetcher` feature was deleted with the Dhan instrument chain).
 use tickvault_common::error_code::ErrorCode;
-#[cfg(feature = "daily_universe_fetcher")]
 use tickvault_common::feed::Feed;
-#[cfg(feature = "daily_universe_fetcher")]
 use tracing::{error, info};
 
 // Audit-chain (feed='groww') support — pure diff + prior-snapshot read-back.
 // Mirrors the Dhan reconciler (`crates/app/src/apply_reconcile_plan.rs`), but scoped
 // to `crates/core` to avoid a core→app dependency, and tagged `feed='groww'`.
-#[cfg(feature = "daily_universe_fetcher")]
 use serde_json::Value;
-#[cfg(feature = "daily_universe_fetcher")]
 use std::collections::HashMap;
-#[cfg(feature = "daily_universe_fetcher")]
 use std::time::Duration;
-#[cfg(feature = "daily_universe_fetcher")]
 use tickvault_storage::instrument_lifecycle_persistence::{
     InstrumentLifecycleAuditRow, LifecycleState, QUESTDB_TABLE_INSTRUMENT_LIFECYCLE, TransitionKind,
 };
-#[cfg(feature = "daily_universe_fetcher")]
 use tickvault_storage::lifecycle_reconciler::{
     ReconcileInput, classify_transition, is_stock_split,
 };
@@ -128,7 +124,6 @@ pub fn groww_segment_label(entry: &WatchEntry) -> &'static str {
 /// already validates `watch_date`, so this is defense-in-depth, never a panic).
 ///
 /// Feature-gated: only the (gated) persist path computes a designated `ts`.
-#[cfg(feature = "daily_universe_fetcher")]
 #[must_use]
 fn watch_date_to_ist_midnight_nanos(watch_date: &str) -> i64 {
     let Ok(date) = chrono::NaiveDate::parse_from_str(watch_date, "%Y-%m-%d") else {
@@ -172,7 +167,6 @@ fn should_skip_master_append(dry_run: bool) -> bool {
 /// of [`persist_groww_instruments`] in this module; the in-module `#[cfg(test)]`
 /// tests call it directly. Keeping it private is the correct shape for a
 /// module-local pure helper.
-#[cfg(feature = "daily_universe_fetcher")]
 #[must_use]
 fn classify_persist_failure(stage: &'static str) -> (&'static str, ErrorCode) {
     (stage, ErrorCode::GrowwMaster01PersistFailed)
@@ -181,18 +175,15 @@ fn classify_persist_failure(stage: &'static str) -> (&'static str, ErrorCode) {
 // ── FIX 13b (2026-07-04): readiness gate + bounded per-stage retry ──────────
 
 /// Max append attempts per master-table stage (1 initial + 2 retries).
-#[cfg(feature = "daily_universe_fetcher")]
 const MASTER_PERSIST_MAX_ATTEMPTS: u32 = 3;
 
 /// QUIET QuestDB readiness probe attempts before the persist gives up
 /// (`stage="readiness"` GROWW-MASTER-01). Deliberately NOT
 /// `wait_for_questdb_ready` — that fn emits BOOT-01/BOOT-02 pages reserved
 /// for the boot path; a cold-path master persist must never fire boot pages.
-#[cfg(feature = "daily_universe_fetcher")]
 const MASTER_READINESS_ATTEMPTS: u32 = 3;
 
 /// Backoff between readiness probe attempts.
-#[cfg(feature = "daily_universe_fetcher")]
 const MASTER_READINESS_BACKOFF_SECS: u64 = 5;
 
 /// Bounded wait for the `index_constituency` ts-pin migration gate (FIX 13a)
@@ -204,12 +195,10 @@ const MASTER_READINESS_BACKOFF_SECS: u64 = 5;
 /// ≥ 45s headroom. A timeout means the boot-prefix task is pathologically
 /// delayed; the append proceeds best-effort (rows re-persist next boot if
 /// the truncate lands after them).
-#[cfg(feature = "daily_universe_fetcher")]
 const CONSTITUENCY_MIGRATION_GATE_TIMEOUT_SECS: u64 = 120;
 
 /// PURE retry predicate: another attempt allowed after attempt `n`?
 /// (`n` is 1-based; retries happen while `n < MASTER_PERSIST_MAX_ATTEMPTS`.)
-#[cfg(feature = "daily_universe_fetcher")]
 #[must_use]
 fn master_persist_should_retry(attempt: u32) -> bool {
     attempt < MASTER_PERSIST_MAX_ATTEMPTS
@@ -218,7 +207,6 @@ fn master_persist_should_retry(attempt: u32) -> bool {
 /// PURE backoff ladder for stage retries: attempt 1 → 2s, attempt 2 → 4s
 /// (exponential, saturating; attempts beyond the ladder cap at 4s — total
 /// worst-case sleep per stage is bounded at ~6s).
-#[cfg(feature = "daily_universe_fetcher")]
 #[must_use]
 fn master_persist_backoff_secs(attempt: u32) -> u64 {
     2u64.saturating_mul(1u64 << attempt.saturating_sub(1).min(1))
@@ -229,7 +217,6 @@ fn master_persist_backoff_secs(attempt: u32) -> u64 {
 /// [`MASTER_READINESS_BACKOFF_SECS`] backoff between them. `true` = ready.
 /// Emits ONLY `warn!` per failed attempt (never BOOT-01/02 — see the const
 /// doc above).
-#[cfg(feature = "daily_universe_fetcher")]
 // TEST-EXEMPT: network I/O probe (live QuestDB) — the attempt/backoff constants + retry predicate are unit-tested; the probe body is a bounded loop over the storage-crate-tested shared_probe_client.
 async fn questdb_master_ready(questdb: &QuestDbConfig) -> bool {
     let url = format!(
@@ -280,9 +267,9 @@ async fn questdb_master_ready(questdb: &QuestDbConfig) -> bool {
 /// Borrows from `set`; the returned rows borrow `&'static` labels + the entry strings, so the
 /// caller keeps `set` alive for the append.
 ///
-/// Feature-gated behind `daily_universe_fetcher` — the storage `InstrumentLifecycleRow` type
-/// (and the whole `instrument_lifecycle` table machinery) only exists under that feature.
-#[cfg(feature = "daily_universe_fetcher")]
+/// PR-C3 (2026-07-14): compiles unconditionally — the storage
+/// `InstrumentLifecycleRow` type (and the whole `instrument_lifecycle` table
+/// machinery) is no longer feature-gated.
 #[must_use]
 pub fn build_groww_lifecycle_rows<'a>(
     set: &'a GrowwWatchSet,
@@ -384,9 +371,8 @@ pub fn build_groww_lifecycle_rows<'a>(
 /// Only stock (Ltp) entries with a retained `symbol_name` are constituents; index values are
 /// not their own constituents. `index_name` is `"NIFTY Total Market"` (the NTM membership all
 /// resolved Groww stocks belong to — the `GrowwWatchSet` stock set IS the NTM-resolved set per
-/// `instruments.rs`). `via_isin` is `true` (the Groww resolver joins by ISIN). Feature-gated
-/// behind `daily_universe_fetcher` (the storage row type lives there).
-#[cfg(feature = "daily_universe_fetcher")]
+/// `instruments.rs`). `via_isin` is `true` (the Groww resolver joins by ISIN).
+/// PR-C3 (2026-07-14): compiles unconditionally (the storage row type is un-gated).
 #[must_use]
 pub fn build_groww_constituency_rows<'a>(
     set: &'a GrowwWatchSet,
@@ -440,11 +426,9 @@ pub fn build_groww_constituency_rows<'a>(
 // `classify_transition`), tagged `feed='groww'`, scoped to `crates/core`.
 
 /// Composite identity per I-P1-11 — `security_id` ALONE is not unique.
-#[cfg(feature = "daily_universe_fetcher")]
 type GrowwLifecycleKey = (i64, String);
 
 /// HTTP timeout for the boot read-back SELECT of the prior `feed='groww'` snapshot.
-#[cfg(feature = "daily_universe_fetcher")]
 const GROWW_LIFECYCLE_QUERY_TIMEOUT_SECS: u64 = 15;
 
 /// Hard cap on the QuestDB `/exec` success-response body we will buffer before
@@ -453,12 +437,10 @@ const GROWW_LIFECYCLE_QUERY_TIMEOUT_SECS: u64 = 15;
 /// still bounds a malformed / runaway QuestDB response. Over the cap → degrade
 /// safe: return an error so the caller logs `GROWW-MASTER-01`, builds NO audit
 /// rows, and continues (the data UPSERT still runs; next boot re-emits).
-#[cfg(feature = "daily_universe_fetcher")]
 const MAX_GROWW_EXEC_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
 
 /// Prior per-instrument attributes (the `feed='groww'` snapshot) the diff classifier
 /// compares against today's set. Mirror of the Dhan `PrevLifecycleAttrs`, scoped here.
-#[cfg(feature = "daily_universe_fetcher")]
 #[derive(Debug, Clone, PartialEq)]
 pub struct GrowwPriorAttrs {
     pub state: LifecycleState,
@@ -475,7 +457,6 @@ pub struct GrowwPriorAttrs {
 }
 
 /// Today's primitive attributes for one Groww instrument (master-entry derived).
-#[cfg(feature = "daily_universe_fetcher")]
 #[derive(Debug, Clone, PartialEq)]
 pub struct GrowwTodayAttrs {
     pub security_id: i64,
@@ -489,7 +470,6 @@ pub struct GrowwTodayAttrs {
 /// Owned audit row so the pure diff can return `String`-backed values the async
 /// loop borrows from (the persistence struct holds `&str`). Mirror of the Dhan
 /// `OwnedLifecycleAuditRow`, `feed` fixed to `groww`.
-#[cfg(feature = "daily_universe_fetcher")]
 #[derive(Debug, Clone, PartialEq)]
 pub struct OwnedGrowwAuditRow {
     pub ts_nanos_ist: i64,
@@ -510,7 +490,6 @@ pub struct OwnedGrowwAuditRow {
     pub dry_run: bool,
 }
 
-#[cfg(feature = "daily_universe_fetcher")]
 impl OwnedGrowwAuditRow {
     /// Borrow as the persistence-layer row for one batched append. `field_deltas`
     /// / `operator_note` / snapshot-only columns are left empty/sentinel — the
@@ -543,7 +522,6 @@ impl OwnedGrowwAuditRow {
 /// Build the read-back SELECT for the prior `feed='groww'` lifecycle snapshot.
 /// PURE. Reads ALL rows (active AND expired) so the diff can detect reactivation;
 /// excludes §27 dry-run rows; scoped to `feed='groww'` so it never sees Dhan rows.
-#[cfg(feature = "daily_universe_fetcher")]
 #[must_use]
 pub fn build_groww_lifecycle_select_sql() -> String {
     // `cast(first_seen_date as long)` returns MICROS (the Dhan
@@ -576,7 +554,6 @@ pub fn build_groww_lifecycle_select_sql() -> String {
 ///
 /// PURE, zero-I/O — extracted so the table-missing → empty-prior decision is
 /// unit-testable without a live QuestDB.
-#[cfg(feature = "daily_universe_fetcher")]
 #[must_use]
 fn is_table_missing_response(is_client_error: bool, body: &str) -> bool {
     if !is_client_error {
@@ -591,7 +568,6 @@ fn is_table_missing_response(is_client_error: bool, body: &str) -> bool {
 /// Parse the QuestDB `dataset` array into the prior-attrs map. PURE — no I/O.
 /// Unknown `lifecycle_state` / malformed rows are SKIPPED (counted by the caller
 /// only implicitly — never guessed), mirroring the Dhan loader's discipline.
-#[cfg(feature = "daily_universe_fetcher")]
 #[must_use]
 pub fn parse_groww_lifecycle_dataset(
     dataset: &Value,
@@ -663,7 +639,6 @@ pub fn parse_groww_lifecycle_dataset(
 /// Cold-path O(1) lookup per master entry (the `(i64, String)` key needs one
 /// owned `String` per call — honestly O(n) allocations over the ~779-entry
 /// daily set, never per-tick).
-#[cfg(feature = "daily_universe_fetcher")]
 #[must_use]
 fn resolve_groww_first_seen_nanos(
     security_id: i64,
@@ -683,7 +658,6 @@ fn resolve_groww_first_seen_nanos(
 /// (`to_state` active) are covered by the full-row UPSERT; disappearance
 /// transitions (`Expired` / `SegmentMoved`) get an in-place feed-scoped
 /// state flip so the master row stops reading `active` forever.
-#[cfg(feature = "daily_universe_fetcher")]
 #[must_use]
 fn groww_disappearance_flips(rows: &[OwnedGrowwAuditRow]) -> Vec<&OwnedGrowwAuditRow> {
     rows.iter().filter(|r| !r.to_state.is_active()).collect()
@@ -694,7 +668,6 @@ fn groww_disappearance_flips(rows: &[OwnedGrowwAuditRow]) -> Vec<&OwnedGrowwAudi
 /// lifecycle-row + constituency builders, so the audit chain covers the whole
 /// universe regardless of the live-subscribe cap. Spot/index sentinels: `lot=0`,
 /// `tick=0.0`. `instrument_type` is `INDEX` for an index value else `EQUITY`.
-#[cfg(feature = "daily_universe_fetcher")]
 #[must_use]
 pub fn groww_today_attrs(set: &GrowwWatchSet) -> Vec<GrowwTodayAttrs> {
     set.master_entries
@@ -734,7 +707,6 @@ pub fn groww_today_attrs(set: &GrowwWatchSet) -> Vec<GrowwTodayAttrs> {
 /// `now_ist_nanos` stamps the audit `ts`; `today_ist_nanos` is the IST-midnight
 /// business/partition date. `dry_run` is stamped on every emitted row so the
 /// §27 isolation column is honest for any direct caller.
-#[cfg(feature = "daily_universe_fetcher")]
 #[must_use]
 pub fn build_groww_audit_rows(
     prior: &HashMap<GrowwLifecycleKey, GrowwPriorAttrs>,
@@ -845,7 +817,6 @@ pub fn build_groww_audit_rows(
 /// which the diff treats as "every today row is `appeared`").
 ///
 /// Cold path — called once per Groww master persist.
-#[cfg(feature = "daily_universe_fetcher")]
 // TEST-EXEMPT: live HTTP read-back; the pure SQL builder + parser are unit-tested.
 async fn load_prev_groww_lifecycle(
     questdb: &QuestDbConfig,
@@ -934,7 +905,6 @@ async fn load_prev_groww_lifecycle(
 ///   this run, so a state flip can never land without its forensic row —
 ///   otherwise tomorrow's diff would see the flipped state and NEVER re-emit
 ///   the lost transition. Next boot re-runs idempotently.
-#[cfg(feature = "daily_universe_fetcher")]
 // TEST-EXEMPT: cold-path ILP/HTTP orchestration; the pure diff/parser/builders + the degrade-safe failure arm (source-scanned) carry coverage; the bulk audit append is unit-tested + boot-integration-exercised in storage.
 async fn emit_groww_lifecycle_audit(
     questdb: &QuestDbConfig,
@@ -1005,11 +975,10 @@ async fn emit_groww_lifecycle_audit(
 ///
 /// `watch_date` is a validated `YYYY-MM-DD` IST date (the caller already validates it).
 ///
-/// Feature-gated impl: both shared master tables (`instrument_lifecycle`,
-/// `index_constituency`) and their row types / append fns live behind the storage
-/// `daily_universe_fetcher` feature. The non-gated stub below keeps the call site compiling
-/// when the feature is off (in which case the master tables themselves do not exist).
-#[cfg(feature = "daily_universe_fetcher")]
+/// PR-C3 (2026-07-14): compiles unconditionally — the `daily_universe_fetcher`
+/// feature (and the no-op stub that used to shadow this fn when it was off)
+/// was deleted with the Dhan instrument chain; the storage row types / append
+/// fns it reuses are unconditional too.
 // TEST-EXEMPT: cold-path ILP I/O orchestration; not unit-testable without live QuestDB. The pure builders (groww_segment_label / build_groww_lifecycle_rows / build_groww_constituency_rows) + the should_skip_master_append / classify_persist_failure gates are unit-tested below; the bulk append fns it reuses are unit-tested + boot-integration-exercised in the storage crate.
 pub async fn persist_groww_instruments(
     questdb: &QuestDbConfig,
@@ -1234,7 +1203,6 @@ pub async fn persist_groww_instruments(
 /// are prior-independent, and skipping them just because the LIFECYCLE prior
 /// read failed would widen the degrade beyond what the failure implies.
 /// Same degrade-safe GROWW-MASTER-01 contract (stage `constituency`).
-#[cfg(feature = "daily_universe_fetcher")]
 // TEST-EXEMPT: cold-path ILP I/O orchestration extracted verbatim from persist_groww_instruments (same coverage story: pure builders + retry gates unit-tested; bulk append unit-tested + boot-integration-exercised in storage).
 async fn persist_groww_constituency(
     questdb: &QuestDbConfig,
@@ -1317,26 +1285,15 @@ async fn persist_groww_constituency(
     }
 }
 
-/// No-op fallback when `daily_universe_fetcher` is OFF — the shared master tables (and their
-/// storage modules) don't exist in that build, so there is nothing to persist. Keeps the
-/// `groww_activation` call site compiling identically regardless of feature.
-#[cfg(not(feature = "daily_universe_fetcher"))]
-// TEST-EXEMPT: empty no-op stub (feature OFF — no master surface to write); exercised by test_persist_is_noop_when_feature_off.
-pub async fn persist_groww_instruments(
-    _questdb: &QuestDbConfig,
-    _set: &GrowwWatchSet,
-    _watch_date: &str,
-    _dry_run: bool,
-) {
-    // The `instrument_lifecycle` / `index_constituency` master tables are gated behind
-    // `daily_universe_fetcher`; without it there is no master surface to write.
-}
+// PR-C3 (2026-07-14): the `#[cfg(not(feature = "daily_universe_fetcher"))]`
+// no-op fallback of `persist_groww_instruments` was deleted with the feature
+// itself — the shared master tables' storage modules now compile
+// unconditionally, so the real writer above is the only definition.
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[cfg(feature = "daily_universe_fetcher")]
     #[test]
     fn test_master_writer_labels_fno_ltp_entries_futidx() {
         // §36 (2026-07-08): an FNO Ltp entry (index future) must be labeled
@@ -1423,7 +1380,6 @@ mod tests {
     use crate::feed::groww::instruments::{GrowwWatchSet, WatchEntry, WatchKind};
 
     // Used only by the feature-gated row-builder tests below.
-    #[cfg(feature = "daily_universe_fetcher")]
     fn stock(token: &str, isin: &str, symbol: &str) -> WatchEntry {
         WatchEntry {
             exchange: "NSE".to_string(),
@@ -1489,6 +1445,8 @@ mod tests {
     /// Builds a set where the live-subscribe `entries` is CAPPED to `entries`, but
     /// the master `master_entries` is the FULL pre-cap superset — the decoupling the
     /// row builders must honor. Used by the "uses master_entries not capped" tests.
+    /// (PR-C3 2026-07-14: the short-lived PR-C2 r1 feature gate on this helper
+    /// and its consuming tests was deleted with the feature — all unconditional.)
     fn capped_set(capped: Vec<WatchEntry>, full: Vec<WatchEntry>) -> GrowwWatchSet {
         let indices = full
             .iter()
@@ -1596,7 +1554,6 @@ mod tests {
 
     // ── build_groww_lifecycle_rows (feature-gated: storage row type) ──
 
-    #[cfg(feature = "daily_universe_fetcher")]
     #[test]
     fn test_build_groww_lifecycle_rows_feed_is_groww() {
         let set = set_of(vec![
@@ -1610,7 +1567,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "daily_universe_fetcher")]
     #[test]
     fn test_build_groww_lifecycle_rows_index_is_index_idx_i() {
         let set = set_of(vec![index("NIFTY", "NSE", 999)]);
@@ -1621,7 +1577,6 @@ mod tests {
         assert_eq!(rows[0].security_id, 999);
     }
 
-    #[cfg(feature = "daily_universe_fetcher")]
     #[test]
     fn test_build_groww_lifecycle_rows_stock_is_equity_nse_eq() {
         let set = set_of(vec![stock("2885", "INE002A01018", "RELIANCE")]);
@@ -1632,7 +1587,6 @@ mod tests {
         assert_eq!(rows[0].security_id, 2885);
     }
 
-    #[cfg(feature = "daily_universe_fetcher")]
     #[test]
     fn test_build_groww_lifecycle_rows_spot_sentinels() {
         let set = set_of(vec![stock("2885", "INE002A01018", "RELIANCE")]);
@@ -1650,7 +1604,6 @@ mod tests {
         assert!(r.lifecycle_state.is_active());
     }
 
-    #[cfg(feature = "daily_universe_fetcher")]
     #[test]
     fn test_no_row_has_empty_feed() {
         // A feed-less / empty-feed row must be impossible: the builder always stamps a
@@ -1668,7 +1621,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "daily_universe_fetcher")]
     #[test]
     fn test_regression_dhan_and_groww_same_id_distinct_under_composite_key() {
         // Regression: 2026-06-28 — feed-in-key. A Dhan row and a Groww row for the SAME
@@ -1701,7 +1653,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "daily_universe_fetcher")]
     #[test]
     fn test_watch_date_to_ist_midnight_nanos() {
         // 1970-01-02 = 1 day after epoch = 86400 * 1e9 IST-midnight nanos.
@@ -1715,7 +1666,6 @@ mod tests {
         assert_eq!(watch_date_to_ist_midnight_nanos("not-a-date"), 0);
     }
 
-    #[cfg(feature = "daily_universe_fetcher")]
     #[test]
     fn test_build_groww_constituency_rows_feed_is_groww() {
         let set = set_of(vec![
@@ -1738,7 +1688,6 @@ mod tests {
 
     // ── full-universe master: builders iterate master_entries, not capped entries ──
 
-    #[cfg(feature = "daily_universe_fetcher")]
     #[test]
     fn test_build_groww_lifecycle_rows_uses_master_entries_not_capped() {
         // Regression: the master must record the FULL pre-cap universe. Live
@@ -1762,7 +1711,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "daily_universe_fetcher")]
     #[test]
     fn test_build_groww_constituency_rows_uses_master_entries_not_capped() {
         // Same decoupling for constituency: full master has 4 stocks (+1 index);
@@ -1800,7 +1748,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "daily_universe_fetcher")]
     #[test]
     fn test_persist_dry_run_builds_rows_but_skips_append() {
         // Even when the append is skipped, the rows are still BUILT (so the
@@ -1828,7 +1775,6 @@ mod tests {
 
     // ── F2: persist-failure classifies GROWW-MASTER-01, degrade-safe (no abort) ──
 
-    #[cfg(feature = "daily_universe_fetcher")]
     #[test]
     fn test_persist_failure_classifies_groww_master_01_without_abort() {
         // Pure classifier is TOTAL — every stage maps to GROWW-MASTER-01, echoing
@@ -1845,8 +1791,11 @@ mod tests {
         }
         // Source-scan: the persist orchestration only log+count+returns on failure —
         // never aborts the feed. Scope the scan to the PRODUCTION fn body (between its
-        // signature and the `#[cfg(not(...))]` stub) so this test's own assertion
-        // strings — which necessarily NAME the banned tokens — are not self-matched.
+        // signature and the `#[cfg(test)] mod tests` boundary — the persist fn is the
+        // LAST production item in this module; re-anchored in PR-C3 2026-07-14 after
+        // the old `#[cfg(not(feature = ...))]` stub anchor was deleted with the
+        // feature) so this test's own assertion strings — which necessarily NAME the
+        // banned tokens — are not self-matched.
         let file = include_str!("shared_master_writer.rs");
         // NB: the needle is split with `concat!` so this assertion string does not
         // itself trip the pub-fn-test-guard's `pub async fn ` grep (it is a string
@@ -1855,9 +1804,9 @@ mod tests {
             .find(concat!("pub async f", "n persist_groww_instruments("))
             .expect("persist fn present");
         let end = file[start..]
-            .find("#[cfg(not(feature = \"daily_universe_fetcher\"))]")
+            .find("#[cfg(test)]\nmod tests {")
             .map(|o| start + o)
-            .expect("non-gated stub follows the gated impl");
+            .expect("the test module follows the persist impl");
         let persist_body = &file[start..end];
         for banned in [
             "panic!(",
@@ -1885,7 +1834,6 @@ mod tests {
 
     // ── F5: brownfield — a legacy feed=NULL/"" row never collides with dhan/groww ──
 
-    #[cfg(feature = "daily_universe_fetcher")]
     #[test]
     fn test_null_feed_row_distinct_from_groww_under_key() {
         // Regression: 2026-06-28 — feed-in-key brownfield. A backfilled/legacy row
@@ -1918,7 +1866,6 @@ mod tests {
 
     // ── F6: IST-midnight convention matches the Dhan reconciler date→nanos ──
 
-    #[cfg(feature = "daily_universe_fetcher")]
     #[test]
     fn test_groww_ist_midnight_matches_dhan_lifecycle_convention() {
         // The Dhan daily-universe orchestrator (crates/app/src/main.rs) computes the
@@ -1953,7 +1900,6 @@ mod tests {
         assert_eq!(watch_date_to_ist_midnight_nanos("not-a-date"), 0);
     }
 
-    #[cfg(feature = "daily_universe_fetcher")]
     #[test]
     fn test_groww_constituency_index_name_is_ntm_pinned() {
         // Pins the documented single-membership assumption: today the Groww watch
@@ -1975,7 +1921,6 @@ mod tests {
 
     // ── AUDIT CHAIN (feed='groww'): diff + parser ──────────────────────────
 
-    #[cfg(feature = "daily_universe_fetcher")]
     fn groww_prior(
         state: LifecycleState,
         locked: bool,
@@ -1995,7 +1940,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "daily_universe_fetcher")]
     #[test]
     fn test_groww_today_attrs_index_and_stock_shapes() {
         let set = set_of(vec![
@@ -2015,7 +1959,6 @@ mod tests {
         assert_eq!(stk.symbol_name, "RELIANCE");
     }
 
-    #[cfg(feature = "daily_universe_fetcher")]
     #[test]
     fn test_build_groww_audit_rows_day1_all_appeared() {
         // Empty prior (Day-1) → every today row is `appeared`, NO expired pass,
@@ -2041,7 +1984,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "daily_universe_fetcher")]
     #[test]
     fn test_build_groww_audit_rows_dry_run_propagates_to_as_row() {
         // §27 isolation: a dry-run build stamps dry_run=true on every emitted row,
@@ -2064,7 +2006,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "daily_universe_fetcher")]
     #[test]
     fn test_build_groww_audit_rows_unchanged_is_no_row() {
         // Present both days, no field change → NO audit row.
@@ -2079,7 +2020,6 @@ mod tests {
         assert!(rows.is_empty(), "unchanged active row → no audit row");
     }
 
-    #[cfg(feature = "daily_universe_fetcher")]
     #[test]
     fn test_build_groww_audit_rows_symbol_change_is_updated() {
         // symbol_name changed RELIANCE → RELIANCE-NEW → `updated`.
@@ -2097,7 +2037,6 @@ mod tests {
         assert_eq!(rows[0].symbol_name_after, "RELIANCE-NEW");
     }
 
-    #[cfg(feature = "daily_universe_fetcher")]
     #[test]
     fn test_build_groww_audit_rows_disappeared_is_expired() {
         // In prior, absent today → `expired`, carrying the prior attrs.
@@ -2117,7 +2056,6 @@ mod tests {
         assert_eq!(rows[0].symbol_name_after, "RELIANCE");
     }
 
-    #[cfg(feature = "daily_universe_fetcher")]
     #[test]
     fn test_build_groww_audit_rows_reactivation() {
         // Was expired, reappears today → `reactivated`.
@@ -2142,7 +2080,6 @@ mod tests {
         assert_eq!(rows[0].from_state, Some(LifecycleState::ExpiredFromFno));
     }
 
-    #[cfg(feature = "daily_universe_fetcher")]
     #[test]
     fn test_build_groww_audit_rows_locked_disappeared_skipped() {
         // A locked prior row that disappears must NOT auto-expire.
@@ -2162,7 +2099,6 @@ mod tests {
     /// A disappeared stock yields EXACTLY ONE `Expired` audit transition, and
     /// `groww_disappearance_flips` selects it (non-active `to_state`) for the
     /// feed-scoped DATA state-flip while present/appeared rows are excluded.
-    #[cfg(feature = "daily_universe_fetcher")]
     #[test]
     fn test_disappearance_yields_one_expired_transition_and_flip() {
         // Day 2: RELIANCE disappeared; INFY is still present.
@@ -2201,7 +2137,6 @@ mod tests {
     /// the DATA row is flipped to `expired_from_fno`, the NEXT day's diff (prior
     /// state now non-active, instrument still absent) emits ZERO transitions —
     /// no duplicate `Expired` audit row per day, and no further flips.
-    #[cfg(feature = "daily_universe_fetcher")]
     #[test]
     fn test_day_after_flip_emits_zero_duplicate_transitions() {
         let set = set_of(vec![]);
@@ -2230,7 +2165,6 @@ mod tests {
     /// `groww_disappearance_flips` is a pure filter on `to_state.is_active()`:
     /// active targets (appeared/updated/reactivated) are never flipped;
     /// non-active targets (expired/segment-moved-old-key) always are.
-    #[cfg(feature = "daily_universe_fetcher")]
     #[test]
     fn test_groww_disappearance_flips_filters_on_to_state() {
         let mk = |sid: i64, to_state: LifecycleState, kind: TransitionKind| OwnedGrowwAuditRow {
@@ -2258,7 +2192,6 @@ mod tests {
 
     // ── GAP-2 (2026-07-05): first_seen preservation across the daily UPSERT ──
 
-    #[cfg(feature = "daily_universe_fetcher")]
     #[test]
     fn test_resolve_groww_first_seen_preserves_prior_and_falls_back() {
         let mut prior = HashMap::new();
@@ -2295,7 +2228,6 @@ mod tests {
     /// the daily full-row UPSERT for an ALREADY-KNOWN instrument must carry the
     /// PRIOR `first_seen_date`, never reset it to today; a brand-new instrument
     /// gets today.
-    #[cfg(feature = "daily_universe_fetcher")]
     #[test]
     fn test_build_groww_lifecycle_rows_preserves_first_seen_on_day2() {
         let set = set_of(vec![
@@ -2333,7 +2265,6 @@ mod tests {
     /// via `groww_disappearance_flips`) AFTER the lifecycle DATA UPSERT — and the
     /// flip call carries the Groww feed label so a Dhan row sharing the composite
     /// key can never be mutated.
-    #[cfg(feature = "daily_universe_fetcher")]
     #[test]
     fn test_persist_wires_feed_scoped_disappearance_flips_after_upsert() {
         let file = include_str!("shared_master_writer.rs");
@@ -2361,7 +2292,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "daily_universe_fetcher")]
     #[test]
     fn test_build_groww_lifecycle_select_sql_scopes_to_groww_feed() {
         let sql = build_groww_lifecycle_select_sql();
@@ -2383,7 +2313,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "daily_universe_fetcher")]
     #[test]
     fn test_parse_groww_lifecycle_dataset_well_formed_and_skips() {
         let dataset = serde_json::json!([
@@ -2440,7 +2369,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "daily_universe_fetcher")]
     #[test]
     fn test_parse_groww_lifecycle_dataset_empty_and_non_array() {
         assert!(parse_groww_lifecycle_dataset(&serde_json::json!([])).is_empty());
@@ -2449,7 +2377,6 @@ mod tests {
 
     // ── FRESH-DB FIX: table-missing 4xx → empty prior (Day-1), not a hard bail ──
 
-    #[cfg(feature = "daily_universe_fetcher")]
     #[test]
     fn test_is_table_missing_response_classifies_questdb_missing_table() {
         // QuestDB returns 4xx + this body when the table has not been created yet
@@ -2470,7 +2397,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "daily_universe_fetcher")]
     #[test]
     fn test_is_table_missing_response_rejects_genuine_outage() {
         // A 5xx (server error / genuine QuestDB outage) is NOT table-missing even if
@@ -2497,7 +2423,6 @@ mod tests {
     /// diff classify EVERY Groww master entry as `appeared`, so a brand-new
     /// database DOES get its `instrument_lifecycle_audit` (feed='groww') rows on the
     /// first boot. This is the regression that was silently empty before this fix.
-    #[cfg(feature = "daily_universe_fetcher")]
     #[test]
     fn test_fresh_db_empty_prior_yields_day1_appeared_audit_rows() {
         // A representative Groww master set (indices + resolved stocks).
@@ -2532,7 +2457,6 @@ mod tests {
     /// `instrument_lifecycle` table BEFORE the audit emit reads its prior snapshot,
     /// so a fresh DB never reads a missing table. Pins the ordering so a future
     /// refactor cannot silently reintroduce the Day-1 empty-audit bug.
-    #[cfg(feature = "daily_universe_fetcher")]
     #[test]
     fn test_persist_ensures_lifecycle_table_before_audit_emit() {
         let file = include_str!("shared_master_writer.rs");
@@ -2576,7 +2500,6 @@ mod tests {
     /// affected the audit read. (The operator's "0 constituency rows" observation
     /// was a stale-binary artifact — the current main code, pinned here, writes
     /// constituency rows on the first boot.) Source-scan pins ensure-before-append.
-    #[cfg(feature = "daily_universe_fetcher")]
     #[test]
     fn test_persist_ensures_constituency_table_before_append() {
         let file = include_str!("shared_master_writer.rs");
@@ -2601,7 +2524,6 @@ mod tests {
     /// Groww stock set (the build itself is not the reason for 0 rows). A resolved
     /// stock always carries `symbol_name: Some(_)` (the resolver sets it), so every
     /// resolved stock becomes a constituency row.
-    #[cfg(feature = "daily_universe_fetcher")]
     #[test]
     fn test_constituency_build_is_nonempty_for_resolved_stock_set() {
         let set = set_of(vec![
@@ -2623,7 +2545,6 @@ mod tests {
     /// failure arms log+count+return, never panic/abort, and the `emit_*` call is
     /// wired audit-FIRST into the persist orchestration. Scoped to the production
     /// fn bodies so the assertion strings don't self-match.
-    #[cfg(feature = "daily_universe_fetcher")]
     #[test]
     fn test_groww_audit_emitter_is_degrade_safe_and_wired() {
         let file = include_str!("shared_master_writer.rs");
@@ -2681,30 +2602,19 @@ mod tests {
         );
     }
 
-    // ── F3: feature OFF — persist_groww_instruments is a compiled no-op ──
-
-    #[cfg(not(feature = "daily_universe_fetcher"))]
-    #[tokio::test]
-    async fn test_persist_is_noop_when_feature_off() {
-        // With `daily_universe_fetcher` OFF the shared master tables don't exist, so
-        // the stub must compile + return WITHOUT touching QuestDB. We call it with an
-        // empty set + a bogus questdb config; it must return cleanly (no connect, no
-        // panic). Proves the call site compiles identically regardless of feature.
-        use tickvault_common::config::QuestDbConfig;
-        let set = set_of(vec![]);
-        let questdb = QuestDbConfig {
-            host: "127.0.0.1".to_string(),
-            http_port: 9000,
-            pg_port: 8812,
-            ilp_port: 9009,
-        };
-        // Returns () without any network I/O — the stub body is empty.
-        persist_groww_instruments(&questdb, &set, "2026-06-28", false).await;
-    }
+    // ── F3 RETIRED in PR-C3 (2026-07-14): `test_persist_is_noop_when_feature_off`
+    // tested the cfg(not(feature = "daily_universe_fetcher")) NO-OP STUB of
+    // persist_groww_instruments. The feature and the stub were both deleted
+    // (the real fn now compiles unconditionally), so the test's cfg gate
+    // became permanently TRUE and it would have called the REAL persist —
+    // probing a live QuestDB at 127.0.0.1:9000 from a unit test (3×5s
+    // readiness waits + a coded GROWW-MASTER-01 error!, and real
+    // prior-snapshot reads on a dev box with local QuestDB). Deleted with
+    // the stub it tested; the real persist path is boot-exercised +
+    // covered by the pure-primitive tests around it. ──
 
     // ── FIX 13b (2026-07-04): readiness + bounded-retry primitives ──
 
-    #[cfg(feature = "daily_universe_fetcher")]
     #[test]
     fn test_master_persist_backoff_secs_ladder() {
         // attempt 1 → 2s, attempt 2 → 4s, beyond the ladder caps at 4s.
@@ -2716,7 +2626,6 @@ mod tests {
         assert_eq!(master_persist_backoff_secs(0), 2);
     }
 
-    #[cfg(feature = "daily_universe_fetcher")]
     #[test]
     fn test_master_persist_should_retry_boundaries() {
         assert!(master_persist_should_retry(1));
@@ -2728,7 +2637,6 @@ mod tests {
         assert_eq!(MASTER_PERSIST_MAX_ATTEMPTS, 3, "operator-locked 3 attempts");
     }
 
-    #[cfg(feature = "daily_universe_fetcher")]
     #[test]
     fn test_classify_persist_failure_readiness_stage() {
         let (stage, code) = classify_persist_failure("readiness");
@@ -2739,7 +2647,6 @@ mod tests {
     /// FIX 13a ratchet (source-scan): the constituency append must await the
     /// ts-pin migration gate FIRST, so the Dhan-lane TRUNCATE can never wipe
     /// just-written `feed='groww'` rows (QuestDB has no row-level DELETE).
-    #[cfg(feature = "daily_universe_fetcher")]
     #[test]
     fn ratchet_constituency_append_waits_for_migration_gate() {
         let src = include_str!("shared_master_writer.rs");
@@ -2761,7 +2668,6 @@ mod tests {
     /// on the dhan+groww profile AND under the D2b runtime-enable lifecycle —
     /// it misdirected triage), and MUST state the honest best-effort
     /// consequence instead.
-    #[cfg(feature = "daily_universe_fetcher")]
     #[test]
     fn ratchet_gate_timeout_warn_is_honest() {
         let src = include_str!("shared_master_writer.rs");

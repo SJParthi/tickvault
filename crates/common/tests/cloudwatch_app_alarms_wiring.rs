@@ -322,7 +322,7 @@ fn test_deployed_emf_source_labels_match_a_real_series_label() {
 }
 
 #[test]
-fn test_emf_metric_selectors_name_count_is_twenty_seven() {
+fn test_emf_metric_selectors_name_count_is_pinned() {
     // Pin the MAIN (host-only) EMF publish list: 19 alarm-backing signals
     // + 2 memory-measurement gauges added 2026-07-02 for the 2K-universe RAM
     // measurement (tv_process_rss_bytes — crates/storage/src/resource_monitor.rs;
@@ -350,15 +350,40 @@ fn test_emf_metric_selectors_name_count_is_twenty_seven() {
     // `tv_feed_sidecar_stall_restart_total` (FEED-STALL-01 stall-kill
     // counter — crates/app/src/groww_sidecar_supervisor.rs). Cost: +3
     // custom metrics ≈ +$0.90/mo per the app-alarms.tf header cost note.
+    // 22 (was 27) since 2026-07-13 (PR-C2 — Dhan live-WS lane deletion):
+    // RETIRED the 5 names whose emitters died with the lane —
+    // tv_websocket_pool_all_dead, tv_websocket_failed_connections_count,
+    // tv_realtime_guarantee_score (SLO publisher PARKED per the wave-3-d
+    // banner), tv_ws_frame_dropped_no_wal_total and
+    // tv_ws_reconnect_gap_seconds_total. Cost: -5 selected series
+    // (~-$1.50/mo) vs the pre-C2 bill.
+    // 21 (was 22 on this branch / 26 on main) since 2026-07-14 (Dhan noise
+    // lock fix round, M4, reconciled through the PR-C2 merge): REMOVED
+    // `tv_order_update_ws_active` — the order-update WS spawn is retired
+    // (scope-lock §A.1), so the gauge has zero reachable writers; shipping
+    // a dead name in the EMF list would publish nothing while implying
+    // coverage. Cost: -1 custom metric (~-$0.30/mo).
+    //
+    // 23 (was 21 on this branch / 28 on main) since 2026-07-14 (cluster-C
+    // order-side, reconciled through the PR-C2 merge): +tv_daily_pnl
+    // +tv_order_fill_lag_seconds — both DORMANT in dry-run (emit sites ship
+    // with cluster A / Phase-1); $0 until data.
+    // 22 (was 23) since 2026-07-14 (PR-C3 — tick-gap detector deletion,
+    // operator Q4-ii 2026-07-13): REMOVED `tv_tick_gap_instruments_silent`
+    // — its gauge producer (the per-SID tick-gap detector) was deleted with
+    // the Dhan WS lane, so the name would never be published again. Cost:
+    // -1 custom metric series (~-$0.30/mo) — dated note in app-alarms.tf.
     let user_data = read("deploy/aws/terraform/user-data.sh.tftpl");
     let names = emf_declared_names(&user_data, "metric_selectors");
     assert_eq!(
         names.len(),
-        27,
-        "Z+ L2 VERIFY ratchet: expected exactly 27 names in the MAIN EMF \
-         metric_selectors list (24 post-#1437 groww feed-down alerting + 2 \
-         silent-feed lag names 2026-07-06 + 1 groww lag gauge 2026-07-11 \
-         scoreboard PR-C); found {}: {names:?}",
+        22,
+        "Z+ L2 VERIFY ratchet: expected exactly 22 names in the MAIN EMF \
+         metric_selectors list (27 pre-PR-C2 minus the 5 Dhan-lane names \
+         retired 2026-07-13 minus the order-update gauge removed 2026-07-14 \
+         M4 plus the 2 dormant order-side names 2026-07-14 cluster-C minus \
+         the tick-gap gauge removed in PR-C3 2026-07-14); \
+         found {}: {names:?}",
         names.len()
     );
     for required in [
@@ -367,6 +392,9 @@ fn test_emf_metric_selectors_name_count_is_twenty_seven() {
         "tv_dhan_exchange_lag_p99_seconds",
         "tv_dhan_lag_samples_excluded_total",
         "tv_groww_exchange_lag_p99_seconds",
+        // 2026-07-14 cluster-C order-side (dormant until cluster A / Phase-1):
+        "tv_daily_pnl",
+        "tv_order_fill_lag_seconds",
     ] {
         assert!(
             names.iter().any(|n| n == required),
@@ -500,8 +528,10 @@ fn test_log_metric_filter_fallback_covers_both_liveness_alarm_metrics() {
     // events already flowing into /tickvault/<env>/metrics, publishing into
     // the EXACT namespace + host dimension the alarms watch. Deleting either
     // filter (or dropping the host dimension extraction) re-blinds the alarm.
+    // PR-C2 (2026-07-13): tv_realtime_guarantee_score left this list — its
+    // fallback filter retired with the PARKed SLO publisher.
     let tf = read("deploy/aws/terraform/metrics-log-metric-filters.tf");
-    for metric in ["tv_boot_completed", "tv_realtime_guarantee_score"] {
+    for metric in ["tv_boot_completed"] {
         assert!(
             tf.contains(&format!("{{ $.{metric} = * }}")),
             "fallback filter pattern for {metric} missing from \
@@ -736,159 +766,25 @@ fn test_cw_agent_collects_machine_log_paths() {
     }
 }
 
-#[test]
-fn test_tick_gap_silent_alarm_threshold_is_forty() {
-    // 2026-07-06 incident pin: 29-67 of 776 instruments were silent EVERY
-    // minute while the old threshold=100 never crossed — zero pages all day.
-    // Round-3 correction 2026-07-08 (review finding 4): the first retune
-    // shipped 25, BELOW the documented ~33 always-silent healthy floor
-    // (main.rs D2 note 2026-07-03 — the gauge is set from the same scan
-    // with no always-silent exclusion), so 25 would have breached every
-    // healthy in-session minute and paged daily. 40 (fires at >= 41,
-    // PROVISIONAL, one-trading-week soak mandated) clears the floor with
-    // margin and aligns with the SLO-degraded alarm's >= 39-silent
-    // freshness breach point; the 29-40 marginal band is owned by the
-    // SLO-degraded + lag-p99 alarms. 10-of-12 M-of-N at 60s/Maximum pages
-    // on the sustained upper band while a 1-3 min reconnect blip cannot
-    // reach 10 breaching minutes. Regressing ANY of these values either
-    // reproduces the zero-page miss (raise) or the daily-false-page
-    // inversion (lower below the floor).
-    let tf = read("deploy/aws/terraform/app-alarms.tf");
-    let block = alarm_resource_block(&tf, "tick_gap_instruments_silent");
-    assert!(
-        block_has_attr(&block, "threshold", "40"),
-        "tick_gap_instruments_silent threshold must be 40 (2026-07-08 round-3 \
-         retune — above the ~33 always-silent healthy floor):\n{block}"
-    );
-    assert!(
-        block_has_attr(&block, "comparison_operator", "\"GreaterThanThreshold\""),
-        "tick_gap_instruments_silent must use GreaterThanThreshold (fires at >= 41)"
-    );
-    assert!(
-        block_has_attr(&block, "evaluation_periods", "12")
-            && block_has_attr(&block, "datapoints_to_alarm", "10"),
-        "tick_gap_instruments_silent must latch M-of-N 10-of-12 (not strict-consecutive; \
-         a threshold-adjacent value flapping 39/41/39 must neither page nor let one clean \
-         scrape erase 9 min of evidence — the incident band was 29-67 silent/min)"
-    );
-    assert!(
-        block_has_attr(&block, "period", "60")
-            && block_has_attr(&block, "statistic", "\"Maximum\""),
-        "tick_gap_instruments_silent must evaluate period=60/Maximum (1 datapoint per 60s scrape)"
-    );
-    assert!(
-        block_has_attr(&block, "treat_missing_data", "\"notBreaching\""),
-        "tick_gap_instruments_silent must be notBreaching (nightly box stop)"
-    );
-}
+// RETIRED (PR-C3, 2026-07-14 — tick-gap detector deletion, operator Q4-ii
+// 2026-07-13 per websocket-connection-scope-lock.md "2026-07-13 Amendment"
+// §B item 4): test_tick_gap_silent_alarm_threshold_is_forty,
+// test_tick_gap_silent_alarm_is_window_gated and
+// test_tick_gap_silent_gauge_producer_pins_pre_open_to_zero died with the
+// `tv-<env>-tick-gap-instruments-silent` alarm + its main.rs gauge producer
+// — the per-SID tick-gap detector was deleted (fed only by the retired Dhan
+// WS pipeline), so `tv_tick_gap_instruments_silent` is never written again
+// and keeping the alarm would orphan a dead monitor. The 2026-07-06/07-08
+// retune history (threshold 40, 10-of-12, pre-open pin) lives in git
+// history + the dated note in app-alarms.tf.
 
-#[test]
-fn test_tick_gap_silent_alarm_is_window_gated() {
-    // Rule 3 (market-hours gate, MANDATORY): the silent-instruments gauge is
-    // written only in-session, so the LAST in-session value keeps being
-    // re-scraped 15:30->16:30 IST — a stale post-close value must never page.
-    // actions_enabled=false + the window-gate Lambda ALARM_NAMES entry is the
-    // enforcement pair; losing EITHER half re-opens the off-hours false-page.
-    let tf = read("deploy/aws/terraform/app-alarms.tf");
-    let block = alarm_resource_block(&tf, "tick_gap_instruments_silent");
-    assert!(
-        block_has_attr(&block, "actions_enabled", "false"),
-        "tick_gap_instruments_silent must ship actions_enabled=false (gate Lambda owns the window)"
-    );
-    let gate = read("deploy/aws/terraform/market-hours-liveness-alarm.tf");
-    assert!(
-        gate.contains("aws_cloudwatch_metric_alarm.tick_gap_instruments_silent.alarm_name"),
-        "tick_gap_instruments_silent must be in the window-gate Lambda ALARM_NAMES join \
-         (market-hours-liveness-alarm.tf) — without it the alarm stays actions-disabled forever"
-    );
-}
-
-#[test]
-fn test_tick_gap_silent_gauge_producer_pins_pre_open_to_zero() {
-    // Round-4 fix pin (2026-07-08, final-review findings 1/2/4): the
-    // tick-gap gauge producer in main.rs MUST pin the gauge to 0.0 during
-    // the NSE pre-open/auction window [09:00, 09:15) IST — the mirror of
-    // the round-3 SLO tick_freshness pre-open pin. Without it, the
-    // 09:08-09:15 matching/buffer freeze writes ~6-7 guaranteed breaching
-    // datapoints (boot-seeded ~775 SIDs silent, far above threshold 40)
-    // into the retuned alarm's 10-of-12 / 12-min lookback — the gate
-    // Lambda's forced-OK at 09:20 does NOT purge datapoints, so ~3
-    // open-ramp minutes > 40 would false-page at ~09:21 on ordinary days.
-    // This scan matches CODE only (comments stripped) so a comment mention
-    // can never satisfy it, and it asserts the UNPINNED raw write form is
-    // absent so the pin cannot be silently bypassed.
-    let body = fs::read_to_string(workspace_root().join("crates/app/src/main.rs"))
-        .expect("read crates/app/src/main.rs"); // APPROVED: test
-    let code_only = strip_line_comments(&body);
-    let compact: String = code_only.chars().filter(|c| !c.is_whitespace()).collect();
-    assert!(
-        compact.contains("constTICK_GAP_GAUGE_SESSION_OPEN_SECS_OF_DAY_IST:u32=9*3600+15*60"),
-        "main.rs must define TICK_GAP_GAUGE_SESSION_OPEN_SECS_OF_DAY_IST = 09:15:00 IST \
-         (the continuous-session open — the pre-open pin boundary)"
-    );
-    assert!(
-        compact.contains("now_ist_secs_of_day()<TICK_GAP_GAUGE_SESSION_OPEN_SECS_OF_DAY_IST"),
-        "main.rs must gate the tick-gap gauge value on now_ist_secs_of_day() < \
-         TICK_GAP_GAUGE_SESSION_OPEN_SECS_OF_DAY_IST (pre-open pin to 0.0)"
-    );
-    assert!(
-        compact.contains("gauge!(\"tv_tick_gap_instruments_silent\").set(gauge_silent)"),
-        "the tv_tick_gap_instruments_silent gauge write must use the pre-open-pinned \
-         gauge_silent value"
-    );
-    assert!(
-        !compact.contains("gauge!(\"tv_tick_gap_instruments_silent\").set(total_silent"),
-        "the tv_tick_gap_instruments_silent gauge must NOT be written from the raw \
-         total_silent count — that bypasses the [09:00, 09:15) IST pre-open pin"
-    );
-}
-
-#[test]
-fn test_realtime_guarantee_degraded_alarm_threshold_matches_slo_warn() {
-    // The degraded alarm's 0.95 threshold MUST equal SLO_WARN_THRESHOLD in
-    // crates/core/src/instrument/slo_score.rs — score == 0.95 is Healthy in
-    // Rust, and LessThanThreshold keeps it correctly non-breaching. If the
-    // Rust constant ever moves, this pin forces the alarm to move with it.
-    let slo = read("crates/core/src/instrument/slo_score.rs");
-    assert!(
-        slo.contains("pub const SLO_WARN_THRESHOLD: f64 = 0.95;"),
-        "SLO_WARN_THRESHOLD moved from 0.95 — update the realtime_guarantee_degraded \
-         alarm threshold in silent-feed-alarms.tf IN THE SAME PR, then update this pin"
-    );
-    let tf = read("deploy/aws/terraform/silent-feed-alarms.tf");
-    let block = alarm_resource_block(&tf, "realtime_guarantee_degraded");
-    assert!(
-        block_has_attr(&block, "threshold", "0.95"),
-        "realtime_guarantee_degraded threshold must equal SLO_WARN_THRESHOLD (0.95)"
-    );
-    assert!(
-        block_has_attr(&block, "comparison_operator", "\"LessThanThreshold\""),
-        "realtime_guarantee_degraded must use LessThanThreshold (score == 0.95 is Healthy)"
-    );
-    assert!(
-        block_has_attr(&block, "evaluation_periods", "15")
-            && block_has_attr(&block, "datapoints_to_alarm", "9"),
-        "realtime_guarantee_degraded must latch 9-of-15 (round-2 correction 2026-07-07: with \
-         universe 776, tick_freshness breaches < 0.95 only at >= 39 silent, so the incident's \
-         29-38-silent minutes SAMPLE Healthy on the once-per-60s point scrape — 12-of-15 could \
-         fail to latch on the very incident it closes; strict 15/15 would never latch on the \
-         125-crossing oscillation. 9-of-15 is the honest latch; a 2-3 min reconnect dip still \
-         cannot reach 9 breaching points)"
-    );
-    // Medium tier: the name/description must never carry a "critical" token —
-    // the < 0.80 sibling alarm owns that word.
-    for needle in ["alarm_name", "alarm_description"] {
-        let line = block
-            .lines()
-            .find(|l| l.trim_start().starts_with(needle))
-            .unwrap_or_else(|| panic!("{needle} missing from realtime_guarantee_degraded")); // APPROVED: test
-        assert!(
-            !line.to_lowercase().contains("critical"),
-            "realtime_guarantee_degraded {needle} must NOT contain a 'critical' token \
-             (Medium tier; the < 0.80 sibling owns Critical): {line}"
-        );
-    }
-}
+// RETIRED (PR-C2, 2026-07-13 — Dhan live-WS lane deletion):
+// test_realtime_guarantee_degraded_alarm_threshold_matches_slo_warn died with
+// the alarm it pinned — realtime_guarantee_degraded was removed from
+// silent-feed-alarms.tf because the SLO publisher is PARKED (wave-3-d
+// banner; no tv_realtime_guarantee_score is ever published again). The
+// SLO_WARN_THRESHOLD constant remains in the retained slo_score.rs contract
+// stub for a future Groww-scoped re-design.
 
 #[test]
 fn test_silent_feed_alarms_are_window_gated() {
@@ -897,12 +793,14 @@ fn test_silent_feed_alarms_are_window_gated() {
     // market-hours-gate pattern
     // (Rule 3): actions_enabled=false + appended to the window-gate Lambda
     // ALARM_NAMES (09:20-15:35 IST Mon-Fri). The SLO publisher runs 24/7
-    // with off-hours dimension dips; the lag gauge + tick-gap gauge go stale
-    // after close — every one of them false-pages without the gate.
+    // with off-hours dimension dips; the lag gauges go stale after close
+    // (the tick-gap gauge peer retired in PR-C3, 2026-07-14) — every one
+    // of them false-pages without the gate.
     let tf = read("deploy/aws/terraform/silent-feed-alarms.tf");
     let gate = read("deploy/aws/terraform/market-hours-liveness-alarm.tf");
+    // PR-C2 (2026-07-13): realtime_guarantee_degraded left this list — the
+    // alarm retired with the PARKed SLO publisher.
     for name in [
-        "realtime_guarantee_degraded",
         "boundary_catchup_storm_dhan",
         "dhan_exchange_lag_p99_high",
         "groww_exchange_lag_p99_high",
@@ -1086,66 +984,11 @@ fn test_hcl_stripper_and_join_locator_reject_commented_out_members() {
     );
 }
 
-#[test]
-fn test_ws_pool_alarms_are_window_gated_not_always_armed() {
-    // 2026-07-10 incident pin (pre-09:00 deferral false-page fix): the pool
-    // watchdog writes tv_websocket_pool_all_dead +
-    // tv_websocket_failed_connections_count unconditionally every 5s, while
-    // the pool DELIBERATELY opens zero Dhan sockets until 09:00 IST (the
-    // by-design pre-open connect deferral). ws-pool-all-dead was the ONLY
-    // liveness-class alarm not in the market-hours window gate, so it paged
-    // "ALL live market data connections are down" every trading morning
-    // ~08:34-09:00 and on overnight catch-up-deploy boots (observed
-    // 2026-07-10 at 02:45, 03:42, 08:34 IST); ws-failed-connections shares
-    // the same false class. Fix = the house pattern: actions_enabled=false
-    // + membership in the gate Lambda's ALARM_NAMES join (armed 09:20-15:35
-    // IST Mon-Fri; the open path's set_alarm_state(OK) resets a stale
-    // pre-open ALARM so no false page carries into the armed window).
-    // Losing EITHER half regresses: dropping actions_enabled=false restores
-    // the daily false pages; dropping the ALARM_NAMES entry leaves the
-    // alarm actions-disabled FOREVER (exists but is dead).
-    let tf = read("deploy/aws/terraform/app-alarms.tf");
-    let gate = read("deploy/aws/terraform/market-hours-liveness-alarm.tf");
-    // Scope the membership check to the COMMENT-STRIPPED ALARM_NAMES join
-    // body (2026-07-10 review hardening): a comment mention elsewhere in
-    // the gate file, a comment INSIDE the join (the trailing dated
-    // comments), or a stale commented-out copy of the join can never
-    // satisfy — or hijack — the check. Mutation-verified by
-    // test_hcl_stripper_and_join_locator_reject_commented_out_members.
-    let stripped_gate = strip_hcl_comments(&gate);
-    let join_body = alarm_names_join_body(&stripped_gate);
-    for name in ["ws_pool_all_dead", "ws_failed_connections"] {
-        let block = alarm_resource_block(&tf, name);
-        assert!(
-            block_has_attr(&block, "actions_enabled", "false"),
-            "{name} must ship actions_enabled=false (gate Lambda owns the 09:20-15:35 IST \
-             window; always-armed actions false-page during the by-design pre-09:00 IST \
-             Dhan connect deferral — 2026-07-10 incident):\n{block}"
-        );
-        assert!(
-            join_member_present(join_body, name),
-            "{name} must be INSIDE the window-gate Lambda ALARM_NAMES join \
-             (market-hours-liveness-alarm.tf, live line — commented out does NOT \
-             count) — without it the alarm stays actions-disabled forever. \
-             Join body was:\n{join_body}"
-        );
-    }
-    // Load-bearing companion pin (2026-07-10 review): the coverage claim
-    // "pages within ~2 min of window open" depends on the gate Lambda's
-    // open path resetting every gated alarm to OK — CloudWatch actions
-    // fire only on state TRANSITION, and ws_pool_all_dead is EXPECTED to
-    // sit in stale pre-open ALARM every morning (the 08:34-09:00 deferral
-    // window breaches it with actions disabled). Without the OK reset, a
-    // pool genuinely dead across 09:20 would page NEVER, not "in ~2 min".
-    // Matched on the comment-stripped body so the Lambda-source comment
-    // mentioning set_alarm_state can never satisfy it.
-    assert!(
-        stripped_gate.contains("cw.set_alarm_state(") && stripped_gate.contains("StateValue='OK'"),
-        "the gate Lambda's open path must keep the per-name set_alarm_state(OK) reset \
-         loop — without it a stale pre-open ALARM never transitions after arming and \
-         a real overnight-to-open outage pages NEVER"
-    );
-}
+// RETIRED (PR-C2, 2026-07-13 — Dhan live-WS lane deletion):
+// test_ws_pool_alarms_are_window_gated_not_always_armed died with the alarms
+// it pinned — ws_pool_all_dead + ws_failed_connections were removed from
+// app-alarms.tf (their pool-watchdog gauge emitters were deleted with the
+// lane; dated notes in app-alarms.tf + the gate ALARM_NAMES join).
 
 #[test]
 fn test_boundary_catchup_alarm_uses_per_feed_dimensions() {
@@ -1175,7 +1018,7 @@ fn test_boundary_catchup_alarm_uses_per_feed_dimensions() {
 }
 
 #[test]
-fn test_app_alarms_count_is_twenty_three() {
+fn test_app_alarms_count_is_twenty_two() {
     // Pin the count so future PRs that delete an alarm without updating
     // the rule files / PR body fail this guard. Cost note (aws-budget.md)
     // depends on this number — keeping the budget honest means keeping
@@ -1223,13 +1066,35 @@ fn test_app_alarms_count_is_twenty_three() {
     // lag signal at Groww's millisecond resolution, threshold 5s x10min,
     // window-gated). Cost: +1 custom metric series (~$0.30/mo) + 1 alarm
     // (~$0.10/mo) — dated note in aws-budget.md.
+    // 17 (was 23) since 2026-07-13 (PR-C2 — Dhan live-WS lane deletion,
+    // operator retirement directive): RETIRED the 6 entries whose emitters
+    // died with the lane — tv_websocket_pool_all_dead,
+    // tv_websocket_failed_connections_count, tv_realtime_guarantee_score
+    // (BOTH the critical + degraded alarms; the SLO publisher is PARKED per
+    // the wave-3-d banner), tv_ws_frame_dropped_no_wal_total and
+    // tv_ws_reconnect_gap_seconds_total. Cost: -6 alarms / -5 selected
+    // series vs the pre-C2 bill (dated notes in app-alarms.tf +
+    // silent-feed-alarms.tf).
+    // 16 (was 17 on this branch / 22 on main) since 2026-07-14 (operator
+    // Dhan noise lock, dhan-rest-only-noise-lock-2026-07-14.md, reconciled
+    // through the PR-C2 merge): REMOVED `tv_order_update_ws_active` (alarm
+    // tv-<env>-order-update-ws-inactive — deleted with the order-update WS
+    // spawn; the alarm was missing-data-blind on dhan-off boots). Cost:
+    // -1 alarm (~-$0.10/mo) — dated note in app-alarms.tf output
+    // description.
+    // 15 (was 16) since 2026-07-14 (PR-C3 — tick-gap detector deletion,
+    // operator Q4-ii 2026-07-13): REMOVED `tv_tick_gap_instruments_silent`
+    // (alarm tv-<env>-tick-gap-instruments-silent — its gauge producer was
+    // deleted, so the alarm would orphan a dead monitor). Cost: -1 alarm
+    // (~-$0.10/mo) — dated notes in app-alarms.tf +
+    // market-hours-liveness-alarm.tf.
     let count = alarm_metric_names().len();
     assert_eq!(
-        count, 23,
-        "Z+ L2 VERIFY ratchet: expected exactly 23 app-level CloudWatch alarm \
+        count, 15,
+        "Z+ L2 VERIFY ratchet: expected exactly 15 app-level CloudWatch alarm \
          metric_name entries across app-alarms.tf + silent-feed-alarms.tf \
-         (one per critical app signal; tv_realtime_guarantee_score counts twice — \
-         critical + degraded). Found {count}. If you intentionally added \
-         or removed one, update aws-budget.md custom-metric cost line AND this guard."
+         (one per critical app signal). Found {count}. If you intentionally \
+         added or removed one, update aws-budget.md custom-metric cost line \
+         AND this guard."
     );
 }

@@ -61,14 +61,12 @@ fn test_conservation_spawn_lives_in_common_path_not_post_market() {
          least once from main()'s process-global prefix (>= 2 textual mentions); \
          found {call_count}."
     );
-    // No conservation run may appear inside spawn_post_market_tasks: every
-    // run_*_tick_conservation_audit mention must live inside the dedicated
-    // spawn fn (which is defined AFTER spawn_post_market_tasks in the file) —
-    // i.e. after the post-market fn's definition point AND after the dedicated
-    // fn's definition point.
-    let post_market_def_idx = src
-        .find("fn spawn_post_market_tasks(")
-        .expect("spawn_post_market_tasks must exist in main.rs");
+    // Every run_*_tick_conservation_audit mention must live inside the
+    // dedicated spawn fn — i.e. after its definition point. (PR-C2,
+    // 2026-07-13: the Dhan-gated `spawn_post_market_tasks` seam this test
+    // originally ordered against was DELETED with the Dhan live-WS lane,
+    // so the anti-nesting anchor reduces to the dedicated-fn check — a
+    // Dhan-gated re-nesting target no longer exists in main.rs.)
     for pat in [
         "run_tick_conservation_audit(",
         "run_groww_tick_conservation_audit(",
@@ -77,10 +75,10 @@ fn test_conservation_spawn_lives_in_common_path_not_post_market() {
         while let Some(rel) = src[search_from..].find(pat) {
             let abs = search_from + rel;
             assert!(
-                abs > spawn_def_idx && abs > post_market_def_idx,
+                abs > spawn_def_idx,
                 "conservation run `{pat}` found at byte {abs}, before the \
                  dedicated spawn fn (byte {spawn_def_idx}) — a conservation run \
-                 must not be re-nested into a Dhan-gated path."
+                 must not be re-nested into a feed-gated path."
             );
             search_from = abs + pat.len();
         }
@@ -121,15 +119,29 @@ fn test_post_market_tasks_has_process_global_once_guard() {
     // Runtime Dhan cold-start re-invokes spawn_post_market_tasks on every
     // disable→enable cycle; without the once-guard, N cycles = N duplicate
     // EOD digests / cross-verifies / orphan watchdogs (2026-07-02 HIGH).
-    let src = main_rs_source();
+    //
+    // 2026-07-13 (Phase A FIX 4): the guard is now SHARED with the Dhan
+    // REST-only stack — the static lives in the lib
+    // (dhan_rest_stack::POST_MARKET_TASK_FAMILY_CLAIMED) so BOTH spawn
+    // paths (the lane's spawn_post_market_tasks AND the stack's Phase 5
+    // canary/spot/chain family) claim the SAME once-guard. This guard now
+    // pins both halves of that invariant.
+    // PR-C2 (2026-07-13): the lane's `spawn_post_market_tasks` caller (the
+    // main.rs half of the shared once-guard) was DELETED with the Dhan
+    // live-WS lane — the Dhan REST-only stack is now the SOLE claimant, so
+    // the surviving pins are the stack's claim + the atomic-swap shape.
+    let stack_src = {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/dhan_rest_stack.rs");
+        fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+    };
     assert!(
-        src.contains("POST_MARKET_TASKS_SPAWNED"),
-        "spawn_post_market_tasks must be protected by the process-global \
-         POST_MARKET_TASKS_SPAWNED once-guard."
+        stack_src.contains("POST_MARKET_TASK_FAMILY_CLAIMED.swap(true"),
+        "the shared once-guard must use an atomic swap(true) so exactly the \
+         FIRST caller proceeds and later re-entries no-op."
     );
     assert!(
-        src.contains("POST_MARKET_TASKS_SPAWNED.swap(true"),
-        "the once-guard must use an atomic swap(true) so exactly the FIRST \
-         caller proceeds and later cold-start re-entries no-op."
+        stack_src.contains("claim_post_market_task_family_once()"),
+        "the Dhan REST-only stack must claim the shared task-family \
+         once-guard before spawning canary/spot/chain (FIX 4 invariant)."
     );
 }

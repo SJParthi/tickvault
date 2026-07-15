@@ -33,6 +33,16 @@ REGION="${AWS_REGION:-${AWS_DEFAULT_REGION:-ap-south-1}}"
 COMPOSE_FILE="${TV_COMPOSE_FILE:-/opt/tickvault/repo/deploy/docker/docker-compose.yml}"
 IMAGE="questdb/questdb:9.3.5"
 
+# SERVICE-USER PATH hardening (2026-07-13, deploy-hang fix companion): under
+# the systemd unit (ExecStartPre, User=ec2-user) PATH can be the minimal
+# systemd default and miss /usr/local/bin — where `docker-compose` (v1) and
+# the aws CLI commonly live — so the fallback ladder below silently skipped
+# rungs in exactly the boot context that needs them most (post-nuke 08:30
+# boot with no container). Prepending the standard dirs is a no-op in an
+# SSM/root or operator shell that already has them.
+PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH}"
+export PATH
+
 log() { echo "ensure-questdb: $*"; }
 
 # Per-call timeout for every blocking `docker` invocation (2026-06-30): a wedged
@@ -95,7 +105,44 @@ ctimeout() {
   fi
 }
 
-# 3a. compose v2 plugin (`docker compose`).
+# 3-pre. Bounded image pre-pull with retry (2026-07-13, deploy-hang fix
+# companion). Every recreate rung below runs under the 90s
+# DOCKER_CALL_TIMEOUT_SECS wedged-daemon bound — but on a post-nuke box with
+# NO local image, `up -d` / `run -d` must first PULL ~hundreds of MB, which
+# routinely exceeds 90s, so EVERY rung timed out one after another and the
+# self-heal failed exactly when it mattered (tomorrow's 08:30 boot →
+# BOOT-02 halt). Pull the image EXPLICITLY first: skip instantly when the
+# image is already present (the normal case — a deploy must never wait on a
+# pull that is not pending), else up to 3 attempts, each hard-bounded, with
+# a short breather between attempts. A final pull failure logs LOUDLY and
+# still falls through to the recreate rungs (a partially-cached image may
+# still succeed; a real failure surfaces at the rung and exits non-zero).
+DOCKER_PULL_TIMEOUT_SECS="${DOCKER_PULL_TIMEOUT_SECS:-300}"
+if dtimeout image inspect "$IMAGE" >/dev/null 2>&1; then
+  log "image $IMAGE already present - skipping pull (nothing pending)"
+else
+  PULLED=no
+  for attempt in 1 2 3; do
+    log "pulling $IMAGE (attempt ${attempt}/3, bounded ${DOCKER_PULL_TIMEOUT_SECS}s)"
+    if DOCKER_CALL_TIMEOUT_SECS="$DOCKER_PULL_TIMEOUT_SECS" dtimeout pull "$IMAGE" >/dev/null 2>&1; then
+      log "image $IMAGE pulled"
+      PULLED=yes
+      break
+    fi
+    sleep 10
+  done
+  if [ "$PULLED" != "yes" ]; then
+    log "WARN: could not pull $IMAGE after 3 bounded attempts - continuing to the recreate rungs (they fail loudly if the image is truly absent)"
+  fi
+fi
+
+# 3a. compose v2 plugin (`docker compose`). Since 2026-07-14 the deploy
+#     script (.github/workflows/deploy-aws.yml SSM block) ENSURES this plugin
+#     on every deploy — pinned + sha256-verified static install to
+#     /usr/local/lib/docker/cli-plugins/docker-compose when the distro repo
+#     lacks it. That dir is the docker CLI's system-wide plugin dir, so
+#     `docker compose` works for ANY user here (service-user boot included);
+#     rung 3c below also probes that exact path directly as belt-and-braces.
 if dtimeout compose version >/dev/null 2>&1; then
   if ctimeout docker compose -f "$COMPOSE_FILE" up -d "$SVC"; then
     log "recreated via 'docker compose' (v2)"

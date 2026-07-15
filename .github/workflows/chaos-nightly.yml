@@ -117,15 +117,22 @@ jobs:
           {
             docker compose -f deploy/docker/docker-compose.yml up -d
             echo "Waiting for QuestDB to be ready..."
+            # Readiness probe = the same SELECT 1 /exec probe the app's own
+            # wait_for_questdb_ready boot gate uses (boot_probe.rs,
+            # BOOT-01/BOOT-02). QuestDB 9.x serves NO /status on the :9000
+            # main HTTP server — that path 404s forever even when the DB is
+            # healthy (/status lives on the min health server on :9003, which
+            # the compose file does not publish). Proven live in groww-e2e
+            # run 28649380025; this lane hit it in run 29164176526 (#1483).
             for i in {1..30}; do
-              if curl -fsS http://127.0.0.1:9000/status >/dev/null 2>&1; then
+              if curl -fsS "http://127.0.0.1:9000/exec?query=SELECT%201" >/dev/null 2>&1; then
                 echo "QuestDB ready on attempt $i"
                 break
               fi
               sleep 2
             done
-            curl -fsS http://127.0.0.1:9000/status || {
-              echo "QuestDB failed to come up after 60s"
+            curl -fsS "http://127.0.0.1:9000/exec?query=SELECT%201" || {
+              echo "QuestDB failed to come up after 60s (probe: http://127.0.0.1:9000/exec?query=SELECT+1)"
               docker compose -f deploy/docker/docker-compose.yml logs --tail=50
               exit 1
             }

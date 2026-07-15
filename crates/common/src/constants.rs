@@ -524,7 +524,7 @@ pub const TICK_GAP_ALERT_THRESHOLD_SECS: u32 = 30;
 /// showed 988 ERROR entries in 15 minutes for illiquid F&O options that
 /// legitimately don't trade for 2-5 minutes at a time. A real feed
 /// disconnect is detected by WS ping/pong within 40s (Dhan server
-/// timeout) plus the `no_tick_watchdog` in `crates/core/src/pipeline/`;
+/// timeout) plus the feed-level stall watchdogs;
 /// a 5-minute silence on ONE instrument while others keep ticking is
 /// illiquidity, not disconnect. The WARN band (30s threshold) still
 /// surfaces illiquidity to the aggregated 30s summary log.
@@ -1224,6 +1224,13 @@ pub const INDEX_SYMBOL_ALIASES: &[(&str, &str)] = &[
     ("NIFTY MIDCAP SELECT", "MIDCPNIFTY"),
     ("NIFTY MIDCAP 50", "NIFTYMCAP50"),
     ("NIFTY TOTAL MARKET", "NIFTY TOTAL MKT"),
+    // Groww→Dhan spelling bridge (2026-07-13, Groww spot-leg INDIA VIX
+    // scope addition): the live Groww master (2026-06-28 capture — the
+    // `REAL_GROWW_NSE_INDICES` fixture) publishes India VIX with the
+    // compact token `INDIAVIX` (display name "India Vix" already
+    // normalizes to the canonical "INDIA VIX"). Additive alias so the
+    // runtime VIX resolution matches on EITHER identity key.
+    ("INDIAVIX", "INDIA VIX"),
 ];
 
 // ---------------------------------------------------------------------------
@@ -1411,6 +1418,21 @@ pub const DHAN_CHARTS_INTRADAY_PATH: &str = "/charts/intraday";
 /// Endpoint: POST <https://api.dhan.co/v2/charts/historical>
 pub const DHAN_CHARTS_HISTORICAL_PATH: &str = "/charts/historical";
 
+/// Path for the full option chain (appended to rest_api_base_url).
+/// Endpoint: POST <https://api.dhan.co/v2/optionchain>
+/// Requires BOTH `access-token` AND `client-id` headers; rate limit is
+/// 1 unique request per 3 seconds (re-verified 2026-07-12 — UNCHANGED;
+/// multiple DISTINCT underlyings may go concurrently within the window).
+/// Re-added 2026-07-12 for the per-minute REST pipeline PR-3 — the
+/// 2026-06-28 deletion removed the prior `OPTION_CHAIN_*` constants with
+/// the retired subsystem; this is the §8 REBUILD, not a revival.
+pub const DHAN_OPTION_CHAIN_PATH: &str = "/optionchain";
+
+/// Path for the option-chain expiry list (appended to rest_api_base_url).
+/// Endpoint: POST <https://api.dhan.co/v2/optionchain/expirylist>
+/// Same headers + rate limit class as [`DHAN_OPTION_CHAIN_PATH`].
+pub const DHAN_OPTION_CHAIN_EXPIRYLIST_PATH: &str = "/optionchain/expirylist";
+
 // ---------------------------------------------------------------------------
 // Authentication — User Profile & IP Management Endpoints
 // ---------------------------------------------------------------------------
@@ -1463,6 +1485,16 @@ pub const DHAN_MARGIN_CALCULATOR_MULTI_PATH: &str = "/margincalculator/multi";
 /// Path for fund limit query (appended to rest_api_base_url).
 /// Endpoint: GET <https://api.dhan.co/v2/fundlimit>
 pub const DHAN_FUND_LIMIT_PATH: &str = "/fundlimit";
+
+/// Master code-change lock for the 🔷 DHAN margin-gate REST legs (fundlimit
+/// + margincalculator). The order-surface umbrella plan (cluster E2) holds
+/// the live funds/margin REST call for an explicit operator grant; until a
+/// fresh dated quote is recorded in `.claude/rules/dhan/funds-margin.md`,
+/// this stays `false` and `MarginGate` can never issue a REST call even if
+/// `[dhan_margin_gate] enabled = true` — config flips alone can never turn
+/// the REST legs on (the hardcoded-dry_run / GROWW_ORDER_LIVE_FIRE
+/// precedent). Change ONLY with explicit approval from Parthiban.
+pub const DHAN_MARGIN_GATE_REST_ALLOWED: bool = false;
 
 /// Path for kill switch activate/deactivate (appended to rest_api_base_url).
 /// Endpoint: POST <https://api.dhan.co/v2/killswitch?killSwitchStatus=ACTIVATE|DEACTIVATE>
@@ -1536,6 +1568,800 @@ pub const MARKET_LAST_CANDLE_START_IST: &str = "15:29:00";
 /// meaning the last candle returned starts at 15:29.
 pub const MARKET_CLOSE_TIME_IST_EXCLUSIVE: &str = "15:30:00";
 
+// ---------------------------------------------------------------------------
+// Spot 1m REST pipeline (operator grant 2026-07-12 — PR-2, the SPOT half)
+// ---------------------------------------------------------------------------
+
+/// The 4 IDX_I spot indices the per-minute REST pipeline fetches, as
+/// `(security_id, symbol)` pairs: NIFTY=13, BANKNIFTY=25, SENSEX=51,
+/// INDIA VIX=21. Segment is always `IDX_I`, instrument `INDEX`.
+///
+/// INDIA VIX joined on 2026-07-13 (operator scope addition 2026-07-13,
+/// relayed via the coordinator session: INDIA VIX joins the spot 1m pull,
+/// SPOT ONLY, no option chain) — the original 2026-07-12 grant covered the
+/// 3 tradeable major indices. The chain leg deliberately keeps its own
+/// 3-underlying [`CHAIN_1M_UNDERLYINGS`] subset (const-asserted below the
+/// chain constants), so VIX can never leak into the option-chain pipeline.
+///
+/// HONESTY — whether Dhan `/v2/charts/intraday` serves INDIA VIX 1m
+/// candles at all is a LIVE-PROBE UNKNOWN: per-SID independence of the
+/// fire (each SID rides its own budgeted ladder in its own JoinSet task,
+/// and the failure edge's "fully failed" = ZERO SIDs succeeded) means a
+/// never-serving VIX can never delay or fail the other 3; the per-SID
+/// persistent-empty detector ([`SPOT_1M_REST_SID_NOT_SERVED_THRESHOLD`])
+/// pages it loudly instead of letting it rot silently.
+///
+/// Rate budget with 4 SIDs: one fire = 4 concurrent initial requests (one
+/// per index) — inside the Data-API 5/sec budget; re-polls are staggered
+/// by the deterministic per-SID jitter (0/150/300/450 ms), so no ladder
+/// instant ever exceeds the initial 4-wide burst.
+pub const SPOT_1M_REST_INDICES: [(SecurityId, &str); 4] = [
+    (13, "NIFTY"),
+    (25, "BANKNIFTY"),
+    (51, "SENSEX"),
+    (INDIA_VIX_SECURITY_ID, "INDIA VIX"),
+];
+
+/// Consecutive counted not-served minutes for ONE SID before the ONE
+/// edge-latched per-SID `SPOT1M-01 stage="sid_not_served"` page fires
+/// (operator scope addition 2026-07-13 — the INDIA VIX live-probe
+/// companion). A minute COUNTS toward a SID's streak only when that SID
+/// failed/was empty while ≥1 OTHER SID succeeded in the SAME minute — a
+/// global-outage minute (zero SIDs served) neither counts nor resets, so
+/// this detector distinguishes vendor-not-serving-this-index from a
+/// general outage (which the [`SPOT_1M_REST_CONSECUTIVE_FAIL_PAGE_THRESHOLD`]
+/// edge owns). Re-armed only by that SID's own recovery.
+pub const SPOT_1M_REST_SID_NOT_SERVED_THRESHOLD: u32 = 10;
+
+/// Post-minute-close fire delay (ms): the fetcher wakes ~300 ms after each
+/// minute boundary so Dhan has a beat to seal the just-closed candle before
+/// the first poll. The docs do NOT document just-closed-minute availability
+/// latency — the bounded re-poll ladder below plus the
+/// `tv_spot1m_close_to_data_ms` histogram are the honest live probe.
+pub const SPOT_1M_REST_FIRE_DELAY_MS: u64 = 300;
+
+/// Bounded in-minute re-poll ladder: offsets (ms) FROM THE FIRST ATTEMPT at
+/// which the fetch is re-polled when the target minute's candle is not yet
+/// in the response (or the attempt errored). After the last offset the
+/// minute is counted failed/empty — never an unbounded in-minute retry.
+/// Strictly increasing; worst case the last poll fires ~6.3 s after the
+/// minute close (fire delay + final offset), well inside the next boundary.
+pub const SPOT_1M_REST_RETRY_OFFSETS_MS: [u64; 4] = [700, 1_500, 3_000, 6_000];
+
+/// Deterministic per-SID ladder jitter STEP (ms) — each spot SID shifts its
+/// whole re-poll schedule by `slot × step` (slot = the SID's fixed position
+/// in [`SPOT_1M_REST_INDICES`]), so the 4 concurrent ladders never re-poll
+/// Dhan in lockstep (429-coordination follow-up 2026-07-13: the first live
+/// session showed `/v2/charts/intraday` rate-limiting when consumers
+/// align). Deterministic + pure — no randomness anywhere.
+pub const SPOT_1M_REST_LADDER_JITTER_STEP_MS: u64 = 150;
+
+/// Number of distinct jitter slots (== the pinned [`SPOT_1M_REST_INDICES`]
+/// arity): worst-case jitter is `(slots - 1) × step` = 450 ms (4 slots
+/// since the 2026-07-13 INDIA VIX scope addition).
+pub const SPOT_1M_REST_LADDER_JITTER_SLOTS: u64 = 4;
+
+/// Extra bounded backoff (ms) applied before the NEXT ladder attempt after
+/// an HTTP 429 (DH-904 class) response — gives Dhan's rate-limit window a
+/// beat instead of re-polling straight back into it (429-coordination
+/// follow-up 2026-07-13). Applied at most once per remaining rung (≤ 4×);
+/// the rung COUNT is unchanged (never an extra retry), and the worst-case
+/// schedule still fits the hard per-SID budget (const-asserted below).
+/// 429s stay counted via the existing `tv_spot1m_rate_limited_total`.
+pub const SPOT_1M_REST_429_EXTRA_BACKOFF_MS: u64 = 2_000;
+
+/// First per-minute fire boundary, IST seconds-of-day: 09:16:00 — the
+/// close of the session's first (09:15) 1-minute candle.
+pub const SPOT_1M_REST_FIRST_FIRE_SECS_OF_DAY_IST: u32 = 9 * 3600 + 16 * 60;
+
+/// Last per-minute fire boundary, IST seconds-of-day: 15:30:00 — the close
+/// of the session's last (15:29) 1-minute candle. INCLUSIVE (the 15:30:00
+/// boundary itself fires, targeting the 15:29 candle).
+pub const SPOT_1M_REST_LAST_FIRE_SECS_OF_DAY_IST: u32 = 15 * 3600 + 30 * 60;
+
+/// Consecutive fully-failed minutes (no SID succeeded) before the ONE
+/// edge-triggered SPOT1M-01 escalation page fires. Re-armed only after a
+/// successful minute (audit-findings Rule 4 — edge-triggered alerts only).
+pub const SPOT_1M_REST_CONSECUTIVE_FAIL_PAGE_THRESHOLD: u32 = 3;
+
+/// A fire woken more than this many seconds past its minute boundary is
+/// SKIPPED (suspend / clock-step defense — the rest_canary
+/// `PROBE_STALE_GRACE_SECS` precedent scaled to the 60 s cadence).
+pub const SPOT_1M_REST_FIRE_STALE_GRACE_SECS: u32 = 30;
+
+/// Per-REQUEST HTTP timeout (secs) for a single intraday poll. Deliberately
+/// SHORT (5 s, not the 15 s house Dhan-charts value): the fire budget is one
+/// minute, and a black-holed peer must never let the ladder overrun it
+/// (2026-07-12 hostile-review H2 — the 15 s value made the worst-case
+/// ladder ~81 s).
+pub const SPOT_1M_REST_REQUEST_TIMEOUT_SECS: u64 = 5;
+
+/// HARD wall-clock budget (secs) for ONE index's whole in-minute ladder —
+/// enforced with `tokio::time::timeout` around the ladder, so no
+/// combination of stalls can push a fire past the next boundary. A budget
+/// overrun counts as that SID's failure for the minute.
+pub const SPOT_1M_REST_SID_BUDGET_SECS: u64 = 20;
+
+/// Maximum accepted response body size (bytes) for one intraday poll —
+/// one minute × one index is a few hundred bytes; even a grossly
+/// over-delivering full-day columnar response is well under 2 MiB. Bodies
+/// beyond the cap are rejected before buffering (the csv_downloader
+/// `MAX_CSV_BODY_BYTES` §18 hardening pattern).
+pub const SPOT_1M_REST_MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
+
+// Compile-time consistency: the fire window is anchored to the canonical
+// session gate — first fire = market open + 60 s (the 09:15 candle closes
+// at 09:16:00); last fire = the 15:30:00 close boundary itself.
+const _: () = assert!(
+    SPOT_1M_REST_FIRST_FIRE_SECS_OF_DAY_IST as i64 * 1_000_000_000
+        == MARKET_OPEN_IST_NANOS + 60 * 1_000_000_000,
+    "SPOT_1M first fire must be market open + 60s (09:16:00 IST)"
+);
+const _: () = assert!(
+    SPOT_1M_REST_LAST_FIRE_SECS_OF_DAY_IST as i64 * 1_000_000_000 == MARKET_CLOSE_IST_NANOS,
+    "SPOT_1M last fire must be the 15:30:00 IST close boundary"
+);
+const _: () = assert!(
+    SPOT_1M_REST_LADDER_JITTER_SLOTS == SPOT_1M_REST_INDICES.len() as u64,
+    "SPOT_1M jitter slot count must equal the pinned index arity"
+);
+const _: () = assert!(
+    SPOT_1M_REST_RETRY_OFFSETS_MS[0] < SPOT_1M_REST_RETRY_OFFSETS_MS[1]
+        && SPOT_1M_REST_RETRY_OFFSETS_MS[1] < SPOT_1M_REST_RETRY_OFFSETS_MS[2]
+        && SPOT_1M_REST_RETRY_OFFSETS_MS[2] < SPOT_1M_REST_RETRY_OFFSETS_MS[3],
+    "SPOT_1M retry offsets must be strictly increasing"
+);
+// The REAL in-minute budget math (2026-07-12 hostile-review H2 fix — the
+// earlier assert ignored per-request timeouts): the hard per-SID ladder
+// budget, plus the post-boundary fire delay, must finish inside the minute;
+// and the ladder's own schedule (last offset + one full request timeout)
+// must fit inside that budget so the timeout only fires on genuine stalls.
+const _: () = assert!(
+    SPOT_1M_REST_FIRE_DELAY_MS + SPOT_1M_REST_SID_BUDGET_SECS * 1_000 < 60_000,
+    "SPOT_1M per-SID ladder budget must finish inside the minute"
+);
+// 429-coordination follow-up (2026-07-13): the schedule bound now includes
+// the worst-case deterministic jitter ((slots-1) × step = 450 ms at the
+// 4-SID arity) AND a 429 extra backoff before EVERY remaining rung
+// (4 × 2 s = 8 s) — the fully hostile schedule (6 s + 0.45 s + 8 s + one
+// 5 s request timeout = 19.45 s) still fits the 20 s hard per-SID budget.
+const _: () = assert!(
+    SPOT_1M_REST_RETRY_OFFSETS_MS[3]
+        + (SPOT_1M_REST_LADDER_JITTER_SLOTS - 1) * SPOT_1M_REST_LADDER_JITTER_STEP_MS
+        + SPOT_1M_REST_RETRY_OFFSETS_MS.len() as u64 * SPOT_1M_REST_429_EXTRA_BACKOFF_MS
+        + SPOT_1M_REST_REQUEST_TIMEOUT_SECS * 1_000
+        < SPOT_1M_REST_SID_BUDGET_SECS * 1_000,
+    "SPOT_1M ladder schedule (last offset + max jitter + max 429 backoffs + one request timeout) must fit the budget"
+);
+
+// ---------------------------------------------------------------------------
+// Shared Dhan Data-API rate limiter + self-tuning (operator pacing directive
+// 2026-07-14, relayed via the coordinator session: pace Dhan to 3 requests/
+// sec — tunable DOWN to 2 — spread overflow into the next second(s), route
+// the option-chain API through the SAME limiter, with incremental/
+// decremental self-tuning: "if it accepts max 3 or 2, stick to that and
+// split it up"). Consumed by `crates/app/src/dhan_data_api_limiter.rs`.
+// Dhan-ONLY — the Groww legs have their own vendor budgets.
+// ---------------------------------------------------------------------------
+
+/// Hard FLOOR of the self-tuning ladder — the limiter never paces Dhan
+/// Data-API traffic below 2 requests/sec (the operator's "3 or 2" bound).
+pub const DHAN_DATA_API_RPS_FLOOR: u32 = 2;
+
+/// Hard CEILING of the config-legal `[dhan_data_api] target_rps` range —
+/// deliberately BELOW Dhan's published Data-API 5/sec budget so this
+/// process can never claim the whole account budget for the per-minute
+/// REST legs.
+pub const DHAN_DATA_API_RPS_CEILING: u32 = 4;
+
+/// Serde default for `[dhan_data_api] target_rps` — the operator-directed
+/// 3 requests/sec pacing (2026-07-14).
+pub const DHAN_DATA_API_DEFAULT_TARGET_RPS: u32 = 3;
+
+/// Rolling window (minutes) over which observed HTTP-429s accumulate
+/// toward a step-down decision.
+pub const DHAN_DATA_API_TUNER_429_WINDOW_MINUTES: u64 = 2;
+
+/// 429 count within the rolling window that trips ONE step-down to the
+/// [`DHAN_DATA_API_RPS_FLOOR`] (edge-logged once; window cleared on the
+/// transition so a single burst can never cascade).
+pub const DHAN_DATA_API_TUNER_429_STEP_DOWN_THRESHOLD: u32 = 3;
+
+/// Consecutive CLEAN minutes (zero 429s observed) at a reduced rate before
+/// ONE step back UP one level toward the config target.
+pub const DHAN_DATA_API_TUNER_CLEAN_MINUTES_FOR_STEP_UP: u32 = 10;
+
+/// Adaptive-degrade threshold for the spot-1m ladder (2026-07-14 retry
+/// shaping): after this many CONSECUTIVE no-data minutes (zero SIDs served
+/// their own just-closed candle), the ladder drops to a single attempt per
+/// minute (no re-polls) until ANY success re-arms the full ladder. The
+/// 2026-07-14 live regime (0/980 served, ~244 wasted 429s from ladder
+/// re-fires against all-empty responses) is the incident this bounds.
+pub const SPOT_1M_REST_DEGRADE_AFTER_CONSECUTIVE_NO_DATA_MINUTES: u32 = 5;
+
+// Compile-time consistency for the tuning ladder.
+const _: () = assert!(
+    DHAN_DATA_API_RPS_FLOOR >= 1
+        && DHAN_DATA_API_RPS_FLOOR <= DHAN_DATA_API_DEFAULT_TARGET_RPS
+        && DHAN_DATA_API_DEFAULT_TARGET_RPS <= DHAN_DATA_API_RPS_CEILING,
+    "Dhan Data-API rps ladder must satisfy 1 <= floor <= default <= ceiling"
+);
+const _: () = assert!(
+    DHAN_DATA_API_RPS_CEILING < 5,
+    "Dhan Data-API ceiling must stay below the published 5/sec account budget"
+);
+const _: () = assert!(
+    DHAN_DATA_API_TUNER_429_STEP_DOWN_THRESHOLD >= 1
+        && DHAN_DATA_API_TUNER_429_WINDOW_MINUTES >= 1
+        && DHAN_DATA_API_TUNER_CLEAN_MINUTES_FOR_STEP_UP >= 1,
+    "Dhan Data-API tuner thresholds must be non-degenerate"
+);
+const _: () = assert!(
+    SPOT_1M_REST_DEGRADE_AFTER_CONSECUTIVE_NO_DATA_MINUTES
+        >= SPOT_1M_REST_CONSECUTIVE_FAIL_PAGE_THRESHOLD,
+    "adaptive degrade must not pre-empt the SPOT1M-01 escalation edge"
+);
+
+// ---------------------------------------------------------------------------
+// Option-chain 1m REST pipeline (operator grant 2026-07-12 — PR-3, the
+// OPTION-CHAIN half). The 3 underlyings are the [`CHAIN_1M_UNDERLYINGS`]
+// subset below (NOT the full [`SPOT_1M_REST_INDICES`] set since the
+// 2026-07-13 INDIA VIX spot-only scope addition) and the fire boundaries
+// reuse SPOT_1M_REST_FIRST/LAST_FIRE_SECS_OF_DAY_IST — the chain leg is
+// sequenced immediately AFTER the spot leg each minute.
+// ---------------------------------------------------------------------------
+
+/// The 3 underlyings of the per-minute option-chain leg: NIFTY=13,
+/// BANKNIFTY=25, SENSEX=51 — the §8 grant's chain scope, UNCHANGED by the
+/// 2026-07-13 INDIA VIX spot addition (operator scope addition 2026-07-13,
+/// relayed via the coordinator session: INDIA VIX joins the spot 1m pull,
+/// SPOT ONLY, no option chain). The const-asserts below pin this as the
+/// VIX-free prefix of [`SPOT_1M_REST_INDICES`], so the spot set can never
+/// silently widen the chain scope.
+pub const CHAIN_1M_UNDERLYINGS: [(SecurityId, &str); 3] =
+    [(13, "NIFTY"), (25, "BANKNIFTY"), (51, "SENSEX")];
+
+// The chain scope is the strict SID prefix of the spot set…
+const _: () = assert!(
+    CHAIN_1M_UNDERLYINGS[0].0 == SPOT_1M_REST_INDICES[0].0
+        && CHAIN_1M_UNDERLYINGS[1].0 == SPOT_1M_REST_INDICES[1].0
+        && CHAIN_1M_UNDERLYINGS[2].0 == SPOT_1M_REST_INDICES[2].0,
+    "CHAIN_1M_UNDERLYINGS must stay the SID prefix of SPOT_1M_REST_INDICES"
+);
+// …and INDIA VIX (spot-only, 2026-07-13) can never enter the chain scope.
+const _: () = assert!(
+    CHAIN_1M_UNDERLYINGS[0].0 != INDIA_VIX_SECURITY_ID
+        && CHAIN_1M_UNDERLYINGS[1].0 != INDIA_VIX_SECURITY_ID
+        && CHAIN_1M_UNDERLYINGS[2].0 != INDIA_VIX_SECURITY_ID,
+    "INDIA VIX is SPOT-ONLY (2026-07-13 scope) — never an option-chain underlying"
+);
+
+/// Fallback post-boundary fire delay (ms) for the chain leg: the chain
+/// task normally wakes when the SPOT leg signals its minute complete
+/// (~0.3–1.5 s after the boundary); when the spot leg is disabled, dead,
+/// or slow, this timer fires the chain anyway — sequencing is best-effort,
+/// never a hard dependency ("never blocked forever if spot is dead").
+pub const CHAIN_1M_FALLBACK_DELAY_MS: u64 = 2_500;
+
+/// Defensive per-underlying minimum gap (secs) between two option-chain
+/// requests for the SAME underlying — Dhan's documented limit is 1 unique
+/// request per 3 seconds (option-chain.md rule 4; DISTINCT underlyings may
+/// go concurrently). One request per underlying per minute leaves ~60 s
+/// gaps, so this guard never engages in normal operation.
+pub const CHAIN_1M_MIN_GAP_SECS: u64 = 3;
+
+/// Per-REQUEST HTTP timeout (secs) for one option-chain / expirylist call.
+/// Chains are BIG (hundreds of strikes × 2 legs) — 10 s, double the spot
+/// leg's 5 s, still bounded well inside the minute by the budget below.
+pub const CHAIN_1M_REQUEST_TIMEOUT_SECS: u64 = 10;
+
+/// HARD wall-clock budget (secs) for ONE underlying's per-minute chain
+/// fetch (`tokio::time::timeout` around the whole leg) — overruns can
+/// never stack across boundaries; a budget trip is that underlying's
+/// failure for the minute.
+pub const CHAIN_1M_UNDERLYING_BUDGET_SECS: u64 = 20;
+
+/// Maximum accepted response body size (bytes) for one option-chain call —
+/// a full NIFTY chain (~150 strikes × 2 legs × ~17 fields) is ~200–400 KiB;
+/// 8 MiB bounds a hostile/misbehaving server (csv_downloader §18 pattern,
+/// streamed cap).
+pub const CHAIN_1M_MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
+
+/// Consecutive fully-failed chain minutes (no underlying succeeded, or the
+/// persist leg failed) before the ONE edge-triggered CHAIN-02 escalation
+/// page fires — mirrors [`SPOT_1M_REST_CONSECUTIVE_FAIL_PAGE_THRESHOLD`].
+pub const CHAIN_1M_CONSECUTIVE_FAIL_PAGE_THRESHOLD: u32 = 3;
+
+/// Bounded day-start expirylist retry backoffs (secs) BETWEEN attempts —
+/// 3 attempts total (first try + these two backoffs). Each backoff is ≥
+/// [`CHAIN_1M_MIN_GAP_SECS`]: a retry of the SAME unique request inside
+/// Dhan's 1-unique-per-3s window would earn the very rate-limit reject it
+/// retries (hostile-review L1). On final failure the chain pipeline
+/// degrades to disabled-for-the-day (CHAIN-04; NEVER a guessed expiry —
+/// option-chain.md rule 9).
+pub const CHAIN_1M_EXPIRYLIST_RETRY_BACKOFF_SECS: [u64; 2] = [3, 6];
+
+const _: () = assert!(
+    CHAIN_1M_EXPIRYLIST_RETRY_BACKOFF_SECS[0] >= CHAIN_1M_MIN_GAP_SECS
+        && CHAIN_1M_EXPIRYLIST_RETRY_BACKOFF_SECS[1] >= CHAIN_1M_MIN_GAP_SECS,
+    "expirylist retries must not re-enter Dhan's 1-unique-per-3s window"
+);
+
+// Compile-time consistency: the chain leg's whole fire (fallback delay +
+// per-underlying budget) must finish inside the minute, and the fallback
+// delay must be LONGER than the spot leg's post-boundary fire delay (the
+// chain is sequenced AFTER the spot fetch).
+const _: () = assert!(
+    CHAIN_1M_FALLBACK_DELAY_MS + CHAIN_1M_UNDERLYING_BUDGET_SECS * 1_000 < 60_000,
+    "CHAIN_1M fire (fallback delay + underlying budget) must finish inside the minute"
+);
+const _: () = assert!(
+    CHAIN_1M_FALLBACK_DELAY_MS > SPOT_1M_REST_FIRE_DELAY_MS,
+    "CHAIN_1M fallback delay must trail the spot leg's fire delay (chain fires after spot)"
+);
+const _: () = assert!(
+    CHAIN_1M_REQUEST_TIMEOUT_SECS < CHAIN_1M_UNDERLYING_BUDGET_SECS,
+    "CHAIN_1M per-request timeout must fit inside the per-underlying budget"
+);
+
+/// Hard wall-clock ceiling (secs after the minute close) past which a
+/// chain RETRY may no longer LAUNCH — the operator's ≤~15s decision-data
+/// window (2026-07-14 directive). Gates ONLY the retry pass; pass 1 is
+/// the unchanged concurrent fire (Dhan-documented: distinct underlyings
+/// concurrently; the 3s bound is per unique (underlying, expiry) key).
+pub const CHAIN_1M_DECISION_CEILING_SECS: u64 = 15;
+
+/// Per-underlying not-served threshold — pinned to the spot leg's value
+/// (and, transitively once #1537 merges, the Groww chain's).
+pub const CHAIN_1M_UNDERLYING_NOT_SERVED_THRESHOLD: u32 = 10;
+const _: () = assert!(
+    CHAIN_1M_UNDERLYING_NOT_SERVED_THRESHOLD == SPOT_1M_REST_SID_NOT_SERVED_THRESHOLD,
+    "one not-served threshold family across the REST legs"
+);
+
+// P1. A worst-case TIMED-OUT first attempt still leaves its retry
+// launchable inside the ceiling: 2.5s fallback + 10s request timeout
+// = 12.5s ≤ 15s (the 2.5s remainder is the modeled limiter-queue
+// headroom at 3 rps; at the 2 rps floor under a 429 storm the REAL-clock
+// gate may refuse — counted, never silent).
+const _: () = assert!(
+    CHAIN_1M_FALLBACK_DELAY_MS + CHAIN_1M_REQUEST_TIMEOUT_SECS * 1_000
+        <= CHAIN_1M_DECISION_CEILING_SECS * 1_000,
+    "a timed-out first attempt must leave the retry launchable inside the ceiling"
+);
+
+// P2. A ceiling-edge retry can never overrun the minute:
+// 15s launch + 20s per-underlying budget = 35s < 60s.
+const _: () = assert!(
+    (CHAIN_1M_DECISION_CEILING_SECS + CHAIN_1M_UNDERLYING_BUDGET_SECS) * 1_000 < 60_000,
+    "a ceiling-edge retry must not overrun the minute"
+);
+
+// P3. A FAST-FAIL first attempt's same-key ≥3s gap always leaves the
+// retry launchable: 3s gap < 15s − 2.5s fallback.
+const _: () = assert!(
+    CHAIN_1M_MIN_GAP_SECS * 1_000
+        < CHAIN_1M_DECISION_CEILING_SECS * 1_000 - CHAIN_1M_FALLBACK_DELAY_MS,
+    "the same-key retry gap must fit inside the decision ceiling"
+);
+
+// ---------------------------------------------------------------------------
+// Groww spot 1m REST leg (operator grant 2026-07-13 — PR-2 of the Groww
+// per-minute REST plan, `.claude/plans/active-plan-groww-rest-1m.md`;
+// authorization recorded in `groww-second-feed-scope-2026-06-19.md` §38 +
+// `no-rest-except-live-feed-2026-06-27.md` §9). Mirrors the Dhan spot leg
+// (`SPOT_1M_REST_*` above) onto Groww's `GET /v1/historical/candles`
+// endpoint. The fire boundaries, staleness grace and page threshold REUSE
+// the SPOT_1M_REST_* session constants (they are NSE-session facts, not
+// Dhan facts).
+// ---------------------------------------------------------------------------
+
+/// Groww historical/intraday candles endpoint (V2 — ground truth
+/// `docs/groww-ref/11-historical-candles.md`; SDK-verified `client.py:903`
+/// in the official `growwapi` 1.5.0 wheel). GET with query params
+/// `exchange` / `segment` / `groww_symbol` / `start_time` / `end_time` /
+/// `candle_interval`. Serves same-day 1-minute candles (the docs pose no
+/// previous-day-only restriction; just-closed-minute freshness is
+/// UNDOCUMENTED/UNVERIFIED-LIVE per `docs/groww-ref/99-UNKNOWNS.md` — the
+/// ladder + histogram are the probe).
+// APPROVED: constants.rs is the single static-URL source (same as GROWW_INSTRUMENT_CSV_URL)
+pub const GROWW_HISTORICAL_CANDLES_URL: &str = "https://api.groww.in/v1/historical/candles";
+
+/// Groww `candle_interval` literal for 1-minute candles (`"1minute"`, NOT
+/// the Dhan-style `"1"` — interval literals + the 30-days-per-request 1m
+/// range cap per `docs/groww-ref/11-historical-candles.md`; our
+/// day-granular windows are far inside the cap).
+pub const GROWW_CANDLE_INTERVAL_1MIN: &str = "1minute";
+
+/// Groww API version header name + value — sent on every trade-API call by
+/// the official SDK (`_build_headers`, `client.py:1362-1378`; header set
+/// reconciled in `docs/groww-ref/README.md`) alongside
+/// `Authorization: Bearer <token>`.
+pub const GROWW_API_VERSION_HEADER: &str = "x-api-version";
+/// Header value companion to [`GROWW_API_VERSION_HEADER`].
+pub const GROWW_API_VERSION_VALUE: &str = "1.0";
+
+/// The 3 CORE spot indices the Groww per-minute REST leg fetches, as
+/// `(groww_symbol, human symbol, exchange, segment)` — the SAME logical
+/// indices as [`SPOT_1M_REST_INDICES`] in Groww's identity space: the V2
+/// candles endpoint takes the `groww_symbol` (`NSE-NIFTY` — NOT the
+/// exchange token, NOT the bare trading symbol), with `segment=CASH` for
+/// indices (`docs/groww-ref/09-prompt-nse-indices-data.md` +
+/// `docs/groww-ref/11-historical-candles.md`). Persisted rows join the
+/// live lane via `stable_index_security_id(groww_symbol)` + `feed='groww'`.
+///
+/// 2026-07-13 (operator scope addition, relayed — the §38.6 grant in
+/// `groww-second-feed-scope-2026-06-19.md`): the Groww spot leg tracks a
+/// 4th index — [`GROWW_SPOT_1M_VIX_SYMBOL`] (INDIA VIX) — which is
+/// deliberately NOT in this const: its `groww_symbol` is RUNTIME-resolved
+/// from the day's ingested Groww master (the watch file), never guessed.
+/// This const stays the 3-CORE set; the escalation edge keys on it.
+pub const GROWW_SPOT_1M_SYMBOLS: [(&str, &str, &str, &str); 3] = [
+    ("NSE-NIFTY", "NIFTY", "NSE", "CASH"),
+    ("NSE-BANKNIFTY", "BANKNIFTY", "NSE", "CASH"),
+    ("BSE-SENSEX", "SENSEX", "BSE", "CASH"),
+];
+
+/// The 4th Groww spot-leg index — INDIA VIX (operator scope 2026-07-13,
+/// relayed via the coordinator session: "add India VIX to the per-minute
+/// spot pull on the Groww leg; resolve the correct Groww
+/// exchange/segment/groww_symbol for the VIX index from the Groww master —
+/// do NOT guess the literal"). This is the CANONICAL human symbol (the
+/// `NSE_INDEX_ALLOWLIST` member, same literal as `PHASE_0_IDX_I_SYMBOLS`);
+/// the Groww-side identity (`groww_symbol`/exchange/segment) is
+/// RUNTIME-resolved by matching the day's Groww master index rows through
+/// `canonicalize_index_symbol` (the live 2026-06-28 master lists it under
+/// NSE as token `INDIAVIX`, display name "India Vix" — see the
+/// `REAL_GROWW_NSE_INDICES` fixture in
+/// `crates/core/src/feed/groww/instruments.rs`). SPOT ONLY — no chain, no
+/// contracts; whether Groww's historical-candles endpoint SERVES India VIX
+/// is a live-probe UNKNOWN (persistent empty = named forensics rows + one
+/// daily coded warn, never silent).
+pub const GROWW_SPOT_1M_VIX_SYMBOL: &str = "INDIA VIX";
+
+// Arity guard: this CONST tracks the SAME 3 CORE logical indices as the
+// chain-scope subset [`CHAIN_1M_UNDERLYINGS`]. The 2026-07-13 INDIA VIX
+// scope addition put VIX on BOTH spot legs — the Dhan leg as the 4th
+// `SPOT_1M_REST_INDICES` entry (fixed IDX_I SID 21) and the Groww leg as
+// the runtime-resolved `GROWW_SPOT_1M_VIX_SYMBOL` target (deliberately NOT
+// in this const set — its Groww identity comes from the day's master).
+// VIX is SPOT ONLY on both legs; any FURTHER index needs a fresh dated
+// operator quote.
+const _: () = assert!(
+    GROWW_SPOT_1M_SYMBOLS.len() == 3 && GROWW_SPOT_1M_SYMBOLS.len() == CHAIN_1M_UNDERLYINGS.len(),
+    "GROWW_SPOT_1M_SYMBOLS must stay the 3 core indices (Groww VIX is runtime-resolved, not const)"
+);
+
+/// Post-minute-close fire delay (ms) for the Groww leg — mirrors
+/// [`SPOT_1M_REST_FIRE_DELAY_MS`]. Groww's just-closed-minute availability
+/// latency is undocumented; the ladder + histogram measure it.
+pub const GROWW_SPOT_1M_FIRE_DELAY_MS: u64 = 300;
+
+/// Bounded in-minute re-poll ladder for the Groww leg: offsets (ms) FROM
+/// the first attempt — mirrors [`SPOT_1M_REST_RETRY_OFFSETS_MS`].
+pub const GROWW_SPOT_1M_RETRY_OFFSETS_MS: [u64; 4] = [700, 1_500, 3_000, 6_000];
+
+/// Per-REQUEST HTTP timeout (secs) for one Groww candles poll — mirrors
+/// the Dhan leg's 5 s (bounded inside the minute; the SDK ships INFINITE
+/// default timeouts, so this bound is entirely ours).
+pub const GROWW_SPOT_1M_REQUEST_TIMEOUT_SECS: u64 = 5;
+
+/// HARD wall-clock budget (secs) for ONE symbol's whole in-minute ladder.
+/// 14 s (not the Dhan leg's 20 s — a DELIBERATE tightening; was 18 s at
+/// 3 targets, re-derived 2026-07-13 when INDIA VIX made it 4 targets): the
+/// Groww leg fetches its targets SEQUENTIALLY (the minute-boundary pacing
+/// rule of `docs/groww-ref/15-rate-limits-and-capacity.md` — the
+/// shared-token 10/s Live-Data bucket is TYPE-pooled and co-tenanted with
+/// bruteX, so each boundary burst is spread to at most ONE in-flight
+/// request at a time, far inside the ≤6 req/s ceiling), so the WHOLE fire
+/// is bounded by 4 × budget (3 core + the runtime-resolved INDIA VIX);
+/// 4 × 14 s + the fire delay still finishes inside the minute, and the
+/// ladder schedule (last 6 s offset + one 5 s request timeout = 11 s)
+/// still fits one budget — both const-asserted below.
+pub const GROWW_SPOT_1M_SYMBOL_BUDGET_SECS: u64 = 14;
+
+/// Maximum accepted response body size (bytes) for one Groww candles poll
+/// — a full-day 375-row tuple response is ~20 KB; 2 MiB bounds a
+/// hostile/misbehaving server (csv_downloader §18 streamed-cap pattern).
+pub const GROWW_SPOT_1M_MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
+
+/// Minimum spacing (secs) between SSM re-reads of the shared Groww access
+/// token after an auth-class reject — the token-minter lock's ≥60 s pacing
+/// (`groww-shared-token-minter-2026-07-02.md`): re-READ, never mint. The
+/// daily ~06:00 IST token expiry is OFFICIALLY documented
+/// (`docs/groww-ref/17-token-lifecycle.md`) — an in-session 401 means the
+/// minter re-minted or the token was invalidated; the fresh value arrives
+/// via the same SSM read.
+pub const GROWW_SPOT_1M_TOKEN_REREAD_FLOOR_SECS: u64 = 60;
+
+const _: () = assert!(
+    GROWW_SPOT_1M_RETRY_OFFSETS_MS[0] < GROWW_SPOT_1M_RETRY_OFFSETS_MS[1]
+        && GROWW_SPOT_1M_RETRY_OFFSETS_MS[1] < GROWW_SPOT_1M_RETRY_OFFSETS_MS[2]
+        && GROWW_SPOT_1M_RETRY_OFFSETS_MS[2] < GROWW_SPOT_1M_RETRY_OFFSETS_MS[3],
+    "GROWW_SPOT_1M retry offsets must be strictly increasing"
+);
+// SEQUENTIAL-fetch budget math: the whole fire (fire delay + 4 sequential
+// per-target ladder budgets — the 3 core symbols + 1 for the
+// runtime-resolved INDIA VIX target, 2026-07-13 operator scope) must
+// finish inside the minute, and the ladder's own schedule (last offset +
+// one full request timeout) must fit inside one symbol's budget so the
+// timeout only fires on genuine stalls.
+const _: () = assert!(
+    GROWW_SPOT_1M_FIRE_DELAY_MS
+        + (GROWW_SPOT_1M_SYMBOLS.len() as u64 + 1) * GROWW_SPOT_1M_SYMBOL_BUDGET_SECS * 1_000
+        < 60_000,
+    "GROWW_SPOT_1M sequential fire (delay + 4 x symbol budget incl. the runtime VIX target) must finish inside the minute"
+);
+const _: () = assert!(
+    GROWW_SPOT_1M_RETRY_OFFSETS_MS[3] + GROWW_SPOT_1M_REQUEST_TIMEOUT_SECS * 1_000
+        < GROWW_SPOT_1M_SYMBOL_BUDGET_SECS * 1_000,
+    "GROWW_SPOT_1M ladder schedule (last offset + one request timeout) must fit the budget"
+);
+
+// ---------------------------------------------------------------------------
+// Groww option-chain 1m REST leg (operator grant 2026-07-13 — PR-3 of the
+// Groww per-minute REST plan, `.claude/plans/active-plan-groww-rest-1m.md`;
+// authorization `groww-second-feed-scope-2026-06-19.md` §38 +
+// `no-rest-except-live-feed-2026-06-27.md` §9). Mirrors the Dhan chain leg
+// (`CHAIN_1M_*` above) onto Groww's option-chain endpoint. Session
+// boundaries, staleness grace and the page threshold REUSE the
+// SPOT_1M_REST_* session constants (NSE-session facts, not broker facts).
+// ---------------------------------------------------------------------------
+
+/// Groww option-chain REST endpoint prefix (documented + SDK-verified —
+/// `docs/groww-ref/14-option-chain.md` §1; `client.py:490` in the official
+/// `growwapi` 1.5.0 wheel). Full shape:
+/// `GET {prefix}/exchange/{exchange}/underlying/{underlying}?expiry_date=YYYY-MM-DD`
+/// — the `underlying` path param is the PLAIN symbol (`NIFTY`, NOT the
+/// `groww_symbol`). Bearer + `x-api-version: 1.0` headers, same as the
+/// candles endpoint. The response carries NO timestamp of any kind
+/// (Verified-absence, §3) — the snapshot moment is stamped client-side.
+// APPROVED: constants.rs is the single static-URL source (same as GROWW_INSTRUMENT_CSV_URL)
+pub const GROWW_OPTION_CHAIN_URL_PREFIX: &str = "https://api.groww.in/v1/option-chain";
+
+/// The 3 underlyings the Groww per-minute chain leg fetches, as
+/// `(plain underlying, exchange, groww_symbol)` — the SAME logical indices
+/// as [`GROWW_SPOT_1M_SYMBOLS`]: the chain endpoint takes the PLAIN symbol
+/// + exchange (`docs/groww-ref/14-option-chain.md` §1); the `groww_symbol`
+/// third element feeds `stable_index_security_id` so persisted rows carry
+/// the SAME ids the Groww live lane uses.
+pub const GROWW_CHAIN_1M_UNDERLYINGS: [(&str, &str, &str); 3] = [
+    ("NIFTY", "NSE", "NSE-NIFTY"),
+    ("BANKNIFTY", "NSE", "NSE-BANKNIFTY"),
+    ("SENSEX", "BSE", "BSE-SENSEX"),
+];
+
+// Arity guard: the Groww chain leg tracks the SAME 3 logical indices as
+// the CORE spot set — a 4th underlying needs a fresh dated operator
+// quote. 2026-07-13: the spot leg's 4th index (INDIA VIX,
+// GROWW_SPOT_1M_VIX_SYMBOL) is SPOT ONLY per the relayed operator scope
+// ("no chain, no contracts") — the chain leg deliberately stays 3.
+const _: () = assert!(
+    GROWW_CHAIN_1M_UNDERLYINGS.len() == GROWW_SPOT_1M_SYMBOLS.len(),
+    "GROWW_CHAIN_1M_UNDERLYINGS must mirror the 3-index CORE GROWW_SPOT_1M_SYMBOLS set"
+);
+
+/// Fallback post-boundary fire delay (ms) for the Groww chain leg —
+/// mirrors [`CHAIN_1M_FALLBACK_DELAY_MS`]: the chain task normally wakes
+/// when the GROWW spot leg signals its minute complete; when the spot leg
+/// is disabled, dead, or slow, this timer fires the chain anyway
+/// (sequencing is best-effort, never a hard dependency).
+pub const GROWW_CHAIN_1M_FALLBACK_DELAY_MS: u64 = 2_500;
+
+/// MECHANICAL cross-request minimum gap (ms) between ANY two consecutive
+/// Groww chain requests — ONE scalar stamp spans underlyings, so a fire's
+/// 3 requests spread over ≥ 2 s (chain leg ≤ 1 req/s sustained) instead
+/// of bursting back-to-back at the minute boundary (hostile-round-1
+/// MEDIUM-1). Groww documents NO chain-specific rate rule
+/// (`docs/groww-ref/14-option-chain.md` §4 — the family is UNDOCUMENTED,
+/// Unknown ≠ unlimited), so the VALUE is not doc-mandated (the Dhan
+/// 1-per-3s contrast): 1 s keeps the combined spot+chain boundary burst
+/// inside the ≤6 req/s pacing ceiling of
+/// `docs/groww-ref/15-rate-limits-and-capacity.md` with bruteX co-tenancy
+/// headroom. The wait runs INSIDE the per-underlying budget (the
+/// min-gap + timeout < budget const-assert below stays coherent).
+pub const GROWW_CHAIN_1M_MIN_GAP_MS: u64 = 1_000;
+
+/// Per-REQUEST HTTP timeout (secs) for one Groww chain call — chains are
+/// BIG (~100–300 KB per `docs/groww-ref/14-option-chain.md` §5, Assumed);
+/// mirrors the Dhan chain leg's 10 s.
+pub const GROWW_CHAIN_1M_REQUEST_TIMEOUT_SECS: u64 = 10;
+
+/// HARD wall-clock budget (secs) for ONE underlying's per-minute chain
+/// fetch (min-gap wait + one request). 15 s — DELIBERATELY tighter than
+/// the Dhan chain's 20 s: the Groww leg fetches its 3 underlyings
+/// SEQUENTIALLY (the ≤6 req/s shared-bucket pacing rule, the spot-leg
+/// precedent), so the whole fire is bounded by 3 × budget and must still
+/// finish inside the minute (const-asserted below).
+pub const GROWW_CHAIN_1M_UNDERLYING_BUDGET_SECS: u64 = 15;
+
+/// Maximum accepted response body size (bytes) for one Groww chain call —
+/// ~100–300 KB expected; 8 MiB bounds a hostile/misbehaving server
+/// (csv_downloader §18 streamed-cap pattern; mirrors the Dhan chain cap).
+pub const GROWW_CHAIN_1M_MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
+
+/// Consecutive fully-failed Groww chain minutes before the ONE
+/// edge-triggered escalation page fires — the chain leg REUSES the spot
+/// `FailureEdge`, so this MUST equal the spot threshold (const-asserted).
+pub const GROWW_CHAIN_1M_CONSECUTIVE_FAIL_PAGE_THRESHOLD: u32 = 3;
+
+/// Bounded warmup retry backoffs (secs) BETWEEN Groww instruments-master
+/// download attempts — 3 attempts total (first try + these two). The
+/// master is a public static CSV (`GROWW_INSTRUMENT_CSV_URL` — the §3/§9
+/// KEEP class, zero rate budget); on final failure the chain leg degrades
+/// to disabled-for-the-day (NEVER a guessed expiry).
+pub const GROWW_CHAIN_1M_MASTER_RETRY_BACKOFF_SECS: [u64; 2] = [3, 6];
+
+/// Consecutive counted not-served minutes for ONE underlying before the
+/// ONE edge-latched per-underlying `CHAIN-02 stage="underlying_not_served"`
+/// page fires (2026-07-14 — the NIFTY expiry-day vendor cutoff companion:
+/// Groww stopped serving the same-day-expiring NIFTY chain at 14:54 IST
+/// while BANKNIFTY + SENSEX kept working, and the ok==0 escalation edge
+/// paged nobody all afternoon). A minute COUNTS toward an underlying's
+/// streak only when that underlying's chain came back empty/failed while
+/// ≥1 OTHER underlying succeeded in the SAME minute — a global-outage
+/// minute (zero underlyings served) neither counts nor resets, so this
+/// detector distinguishes vendor-not-serving-this-underlying from a
+/// general outage (which the
+/// [`GROWW_CHAIN_1M_CONSECUTIVE_FAIL_PAGE_THRESHOLD`] edge owns — the two
+/// are mutually exclusive per minute). Re-armed only by that underlying's
+/// own recovery. Same value as the spot leg's
+/// [`SPOT_1M_REST_SID_NOT_SERVED_THRESHOLD`] (the pattern it mirrors).
+pub const GROWW_CHAIN_1M_UNDERLYING_NOT_SERVED_THRESHOLD: u32 = 10;
+
+const _: () = assert!(
+    GROWW_CHAIN_1M_CONSECUTIVE_FAIL_PAGE_THRESHOLD == SPOT_1M_REST_CONSECUTIVE_FAIL_PAGE_THRESHOLD,
+    "the Groww chain leg reuses the spot FailureEdge — thresholds must agree"
+);
+// SEQUENTIAL-fetch budget math: the whole chain fire (fallback delay + 3
+// sequential per-underlying budgets) must finish inside the minute; the
+// per-request timeout + min-gap must fit one underlying's budget; and the
+// fallback delay must TRAIL the Groww spot leg's post-boundary fire delay
+// (the chain is sequenced AFTER the spot fetch).
+const _: () = assert!(
+    GROWW_CHAIN_1M_FALLBACK_DELAY_MS
+        + (GROWW_CHAIN_1M_UNDERLYINGS.len() as u64) * GROWW_CHAIN_1M_UNDERLYING_BUDGET_SECS * 1_000
+        < 60_000,
+    "GROWW_CHAIN_1M sequential fire (fallback + 3 x underlying budget) must finish inside the minute"
+);
+const _: () = assert!(
+    GROWW_CHAIN_1M_MIN_GAP_MS + GROWW_CHAIN_1M_REQUEST_TIMEOUT_SECS * 1_000
+        < GROWW_CHAIN_1M_UNDERLYING_BUDGET_SECS * 1_000,
+    "GROWW_CHAIN_1M min-gap + one request timeout must fit the per-underlying budget"
+);
+const _: () = assert!(
+    GROWW_CHAIN_1M_FALLBACK_DELAY_MS > GROWW_SPOT_1M_FIRE_DELAY_MS,
+    "GROWW_CHAIN_1M fallback delay must trail the Groww spot leg's fire delay"
+);
+
+// ---------------------------------------------------------------------------
+// Groww per-contract 1m candle REST leg (operator grant 2026-07-13 — PR-4
+// of the Groww per-minute REST plan, the FILL-MODEL leg;
+// `.claude/plans/active-plan-groww-rest-1m.md`; authorization
+// `groww-second-feed-scope-2026-06-19.md` §38 +
+// `no-rest-except-live-feed-2026-06-27.md` §9). Same endpoint + headers +
+// interval literal + body cap as the Groww spot leg (`GROWW_HISTORICAL_
+// CANDLES_URL` / `GROWW_API_VERSION_*` / `GROWW_CANDLE_INTERVAL_1MIN` /
+// `GROWW_SPOT_1M_MAX_BODY_BYTES` — one request, one day-window body shape),
+// with `segment=FNO` and a per-contract `groww_symbol` identity like
+// `NSE-NIFTY-04Jan24-19200-CE`. Sequenced AFTER the Groww chain leg (its
+// per-minute `underlying_ltp` is the ATM anchor). Session boundaries,
+// staleness grace and the page threshold REUSE the SPOT_1M_REST_* session
+// constants (NSE-session facts, not broker facts).
+// ---------------------------------------------------------------------------
+
+/// Fallback post-boundary fire delay (ms) for the contract leg — the
+/// contract task normally wakes when the GROWW CHAIN leg signals its
+/// minute complete (spot → chain → contract sequencing); when the chain
+/// leg is dead or slow, this timer fires the contract leg anyway
+/// (sequencing is best-effort, never a hard dependency). 8 s trails the
+/// chain's NORMAL completion window (chain fallback 2.5 s + 3 sequential
+/// underlyings at the 1 s min-gap ≈ 5-7 s) so the fresh anchor usually
+/// exists by the time selection runs.
+pub const GROWW_CONTRACT_1M_FALLBACK_DELAY_MS: u64 = 8_000;
+
+/// MECHANICAL cross-request minimum gap (ms) between ANY two consecutive
+/// contract candle requests — the chain leg's min-gap PATTERN at a
+/// contract-sized value: 500 ms → the contract leg contributes at most
+/// 2.0 req/s. RE-DERIVED 2026-07-13 (was 300 ms) when INDIA VIX joined
+/// the spot leg (3 → 4 sequential targets, §38.7 of the groww-scope
+/// lock): the honest spot worst-SECOND is 3 requests (a fast-failing
+/// target's last ladder rung in the same second as the NEXT target's
+/// rung-0 + rung-1 at +0.7 s — the 4th target makes those transitions
+/// MORE FREQUENT, never faster), so at 300 ms the worst overlap was
+/// 3 + 1 + 3.33 = 7.33 req/s > the ≤6 req/s pacing ceiling of
+/// `docs/groww-ref/15-rate-limits-and-capacity.md`. At 500 ms:
+/// 3 + 1 + 2 = 6.00 req/s — exactly AT the self-imposed ceiling
+/// (const-asserted below with exact rational math), with the broker's
+/// documented 10/s hard ceiling far above. Pure pacing cost: 29 gaps ×
+/// 500 ms = 14.5 s of the 45 s fire budget — still bounded.
+pub const GROWW_CONTRACT_1M_MIN_GAP_MS: u64 = 500;
+
+/// Per-REQUEST HTTP timeout (secs) for one contract candles call — the
+/// spot leg's 5 s (same endpoint, same ~20 KB day-window body).
+pub const GROWW_CONTRACT_1M_REQUEST_TIMEOUT_SECS: u64 = 5;
+
+/// HARD envelope cap on contracts fetched per minute (the §38 "envelope
+/// cap on contracts per minute"). The default ATM window fills it exactly:
+/// (2 × 2 + 1) strikes × 2 legs × 3 underlyings = 30. A selection larger
+/// than the cap (config-widened window) is truncated DETERMINISTICALLY
+/// nearest-ATM-first — counted + one coded warn, never fetched past the
+/// cap, never silent.
+pub const GROWW_CONTRACT_1M_MAX_PER_MINUTE: usize = 30;
+
+/// HARD wall-clock deadline (secs) for ONE minute's whole contract fire:
+/// contracts not reached before the deadline are SKIPPED loudly (counted +
+/// forensics rows), never fetched into the next minute. Normal fires
+/// finish in ~10-20 s (cap × (min-gap + one round-trip)); the deadline
+/// only engages on a stalling peer.
+pub const GROWW_CONTRACT_1M_FIRE_BUDGET_SECS: u64 = 45;
+
+/// Default ATM window half-width (strikes each side of ATM) for the
+/// contract selection — the `[groww_contract_1m] strikes_each_side`
+/// config default. 2 each side → 5 strikes × CE+PE × 3 underlyings = 30
+/// contracts/minute = exactly the envelope cap (const-asserted below).
+pub const GROWW_CONTRACT_1M_DEFAULT_STRIKES_EACH_SIDE: u32 = 2;
+
+/// Maximum ATM-anchor age (minutes) the contract leg will still trust. A
+/// chain-leg anchor OLDER than this (the chain leg died or is silently
+/// failing while its last anchor sits frozen) makes the underlying
+/// UNRESOLVED for the minute — a NAMED skip (coded warn `anchor_stale` +
+/// counter + `rest_fetch_audit` rows), never a silently-frozen off-ATM
+/// fetch window (round-1 review M3; the §38.8 decision-freshness
+/// principle applied to the selection input). 5 minutes ≈ the 3-minute
+/// escalation edge + margin: the chain leg's own paging fires first.
+pub const GROWW_CONTRACT_1M_ANCHOR_MAX_AGE_MINUTES: u32 = 5;
+
+const _: () = assert!(
+    GROWW_CONTRACT_1M_FALLBACK_DELAY_MS > GROWW_CHAIN_1M_FALLBACK_DELAY_MS,
+    "the contract leg is sequenced AFTER the chain leg — its fallback must trail the chain's"
+);
+const _: () = assert!(
+    GROWW_CONTRACT_1M_FALLBACK_DELAY_MS + GROWW_CONTRACT_1M_FIRE_BUDGET_SECS * 1_000 < 60_000,
+    "GROWW_CONTRACT_1M fire (fallback + fire budget) must finish inside the minute"
+);
+// Boundary-burst pacing ceiling (§38.3, RE-DERIVED 2026-07-13 for the
+// VIX 4th spot target): the honest spot worst-SECOND is 3 requests
+// (sequential targets, ≤1 in-flight, but a fast-failing target's last
+// ladder rung can share one second with the next target's rung-0 +
+// rung-1 at +0.7 s; the 4th target makes such transitions more
+// frequent, never faster) + chain ≤ 1000/chain-gap req/s + contract ≤
+// 1000/contract-gap req/s, all inside the ≤6 req/s shared-bucket
+// ceiling even in the worst overlap. EXACT rational math via
+// cross-multiplication (round-1 review LOW: integer division rounds
+// 1000/gap DOWN — optimistic):
+//   3 + 1000/kg + 1000/cg ≤ 6  ⇔  1000·kg + 1000·cg ≤ 3·cg·kg
+// (all terms positive). Today: 1000·500 + 1000·1000 = 1.5M ≤
+// 3·1000·500 = 1.5M — the worst-overlap burst is 3 + 1 + 2 = 6.00
+// req/s, exactly AT the self-imposed ceiling (broker hard ceiling 10/s).
+const _: () = assert!(
+    1_000 * GROWW_CONTRACT_1M_MIN_GAP_MS + 1_000 * GROWW_CHAIN_1M_MIN_GAP_MS
+        <= 3 * GROWW_CHAIN_1M_MIN_GAP_MS * GROWW_CONTRACT_1M_MIN_GAP_MS,
+    "spot(3) + chain + contract worst-overlap boundary burst must stay inside the 6 req/s ceiling (exact rational math)"
+);
+// Per-minute request math (the §38.3 capacity envelope, re-derived
+// 2026-07-13 for the VIX 4th spot target): worst case 30 contracts +
+// the spot leg's 20 (3 core symbols + the runtime VIX target = 4 × 5
+// ladder rungs) + 3 chain = 53 requests/min ≈ 17.7% of the 300/min
+// shared budget (typical ≈ 37/min: 30 + 4 + 3). Const-asserted at ≤ 60
+// (20% of the budget) so a future cap raise cannot silently eat the
+// bruteX co-tenancy headroom.
+const _: () = assert!(
+    GROWW_CONTRACT_1M_MAX_PER_MINUTE
+        + (GROWW_SPOT_1M_SYMBOLS.len() + 1) * (GROWW_SPOT_1M_RETRY_OFFSETS_MS.len() + 1)
+        + GROWW_CHAIN_1M_UNDERLYINGS.len()
+        <= 60,
+    "the three Groww REST legs' worst-case per-minute request total must stay <= 20% of the 300/min budget"
+);
+// The DEFAULT ATM window fills the cap exactly — a wider default needs a
+// fresh dated operator quote AND a cap re-derivation.
+const _: () = assert!(
+    ((2 * GROWW_CONTRACT_1M_DEFAULT_STRIKES_EACH_SIDE as usize + 1) * 2)
+        * GROWW_CHAIN_1M_UNDERLYINGS.len()
+        <= GROWW_CONTRACT_1M_MAX_PER_MINUTE,
+    "the default ATM window (strikes x CE+PE x underlyings) must fit the per-minute contract cap"
+);
+
 /// Daily reset signal time (IST). After market close at 15:30,
 /// historical re-fetch + cross-verification runs. At 16:00 IST the daily
 /// reset signal fires (candle aggregator reset, indicator reset, etc.).
@@ -1543,28 +2369,12 @@ pub const MARKET_CLOSE_TIME_IST_EXCLUSIVE: &str = "15:30:00";
 /// For AWS instance lifecycle, use systemd timer or cron for restart.
 pub const APP_DAILY_RESET_TIME_IST: &str = "16:00:00";
 
-/// Wave-2-D (G19) — daily reset time for the `TickGapDetector`. Fires
-/// 5 minutes after market close so it cannot race the 15:30 close
-/// signal. The papaya `last_seen` map is cleared at this point so
-/// overnight silence does NOT register as a tick gap on next day's
-/// market open. Pinned constant; see
-/// `.claude/rules/project/disaster-recovery.md` Scenario 14
-/// (Overnight wake) for the operator-visible flow.
-pub const TICK_GAP_RESET_TIME_IST: &str = "15:35:00";
-
-/// Wave-2-D — short post-fire settle window for the daily tick-gap
-/// reset task. After firing `reset_daily()` at 15:35 IST, sleep this
-/// long before recomputing the next-fire delay so we cannot race the
-/// same boundary back into a near-zero sleep.
-pub const TICK_GAP_RESET_SETTLE_SECS: u64 = 60;
-
-/// Wave-2-D — bounded busy-loop avoidance for the daily tick-gap
-/// reset task. If the post-fire recomputed delay is still zero (e.g.
-/// the host clock is stuck), sleep this long before retrying so we
-/// don't burn CPU. One hour is short enough that the task self-heals
-/// within a single trading session if the clock recovers, and long
-/// enough that we don't spin on a stuck system.
-pub const TICK_GAP_RESET_BUSYLOOP_GUARD_SECS: u64 = 3600;
+// PR-C3 (2026-07-14): the Wave-2-D `TICK_GAP_RESET_*` constants (the
+// 15:35 IST daily-reset time + settle/busy-loop guards) were DELETED with
+// the tick-gap detector and its main.rs reset task (operator Q4-ii
+// 2026-07-13). The RISK-GAP-03 `TICK_GAP_ALERT/ERROR_THRESHOLD_SECS` +
+// `TICK_GAP_MIN_TICKS_BEFORE_ACTIVE` constants above are a DIFFERENT
+// component (`trading::risk::tick_gap_tracker`) and are KEPT.
 
 /// Number of 1-minute candles in the cross-verification window (09:15 to 15:29 = 375).
 ///
@@ -1974,9 +2784,35 @@ pub const IST_UTC_OFFSET_NANOS: i64 = 19_800_000_000_000;
 /// Earliest date (IST) when `mode = "live"` is permitted.
 /// Before this date, config validation rejects live mode at startup.
 /// Change these constants ONLY with explicit approval from Parthiban.
-pub const LIVE_TRADING_EARLIEST_YEAR: i32 = 2026;
-pub const LIVE_TRADING_EARLIEST_MONTH: u32 = 7;
-pub const LIVE_TRADING_EARLIEST_DAY: u32 = 1;
+///
+/// 2026-07-14 re-arm (operator cluster-D directive via coordinator): the
+/// 2026-07-01 date EXPIRED silently on 2026-07-01 leaving this gate a no-op;
+/// re-armed to the 2099-12-31 sentinel matching production.toml
+/// sandbox_only_until — going live now requires editing this constant with a
+/// fresh dated operator quote.
+pub const LIVE_TRADING_EARLIEST_YEAR: i32 = 2099;
+pub const LIVE_TRADING_EARLIEST_MONTH: u32 = 12;
+pub const LIVE_TRADING_EARLIEST_DAY: u32 = 31;
+
+/// Sandbox deadline for the OMS `place_order` live-mode gate, as UNIX epoch
+/// seconds: **2099-12-31T00:00:00Z** (= `4_102_358_400`; chrono-cross-checked
+/// by `crates/trading/tests/sandbox_enforcement_guard.rs`).
+///
+/// Consumed by `crates/trading/src/oms/engine.rs::place_order` (the
+/// `#[cfg(not(test))]` sandbox-enforcement block): any non-dry-run order
+/// while `Utc::now().timestamp() < SANDBOX_DEADLINE_EPOCH_SECS` returns
+/// `Err(OmsError::SandboxEnforcement)`. This gate is mode-INDEPENDENT — it is
+/// the last line even for hypothetical non-Live paths the config-level gates
+/// (`LIVE_TRADING_EARLIEST_*`, `sandbox_only_until`) never see.
+///
+/// MUST stay aligned with `LIVE_TRADING_EARLIEST_*` above (same 2099-12-31
+/// calendar day; this epoch is midnight UTC while the config gate compares
+/// IST calendar dates — the 5h30m nuance is inside the same day, and the
+/// alignment ratchet compares the UTC calendar date of this epoch against
+/// the `LIVE_TRADING_EARLIEST_*` NaiveDate). 2026-07-14 re-arm: the previous
+/// fn-local 2026-07-01 epoch in engine.rs expired silently; re-armed to the
+/// 2099-12-31 sentinel — going live requires a fresh dated operator quote.
+pub const SANDBOX_DEADLINE_EPOCH_SECS: i64 = 4_102_358_400;
 
 // ---------------------------------------------------------------------------
 // Periodic Health Check
@@ -1988,6 +2824,31 @@ pub const PERIODIC_HEALTH_CHECK_INTERVAL_SECS: u64 = 300;
 /// Maximum age for spill files after successful drain (7 days in seconds).
 /// Spill files older than this are auto-deleted during the periodic health check.
 pub const SPILL_FILE_MAX_AGE_SECS: u64 = 7 * 24 * 3600;
+
+/// Retention for confirmed-replay WAL segments in `<wal_dir>/archive/`
+/// (7 days in seconds, matching [`SPILL_FILE_MAX_AGE_SECS`]) — 2026-07-13
+/// disk-retention hardening; widened 2 → 7 days in review round 1 (F3).
+///
+/// Archived segments are POST-confirmed-replay copies: their frames were
+/// re-injected into the live pipeline AND durably persisted before
+/// `confirm_replayed` moved them out of `replaying/`. The only reader of
+/// `archive/` after that point is the same-day 15:40 IST tick-conservation
+/// audit (`count_frames_for_ist_day`), which counts frames for the CURRENT
+/// day only (with a 3-day segment-creation pre-filter) — so even 2 days
+/// was audit-safe. 7 days is chosen instead (F3) because the archive is
+/// ALSO the only remaining copy for the documented confirm-on-channel
+/// residual (`confirm_replayed` archives on frames-IN-CHANNEL, not
+/// frames-PERSISTED — a crash after the archive move but before the
+/// consumer drains leaves the archived segment as the sole triage source):
+/// a 2-day window could erase that copy across a long weekend (crash
+/// Friday → Monday prune) before anyone triaged; 7 days covers any
+/// weekend/holiday gap, matching the spill-file sweep. Before this
+/// retention existed, `archive/` grew ~0.15–0.6 GB/day unbounded on the
+/// prod 30 GB volume.
+pub const WS_WAL_ARCHIVE_RETENTION_SECS: u64 = 604_800;
+
+/// Cadence of the WAL archive prune task (6 hours in seconds).
+pub const WS_WAL_ARCHIVE_PRUNE_INTERVAL_SECS: u64 = 6 * 3600;
 
 // ---------------------------------------------------------------------------
 // Subscription Planner — ATM Strike Range
@@ -2059,6 +2920,22 @@ pub const TOKEN_SWEEP_INTERVAL_SECS: u64 = 4 * 3600;
 /// (main feed, depth, order update) so behaviour is uniform across all
 /// renewal triggers.
 pub const TOKEN_SWEEP_STALENESS_THRESHOLD_SECS: i64 = 4 * 3600;
+
+/// GAP-02 (2026-07-14, Dhan noise lock backstop): the Dhan REST-only
+/// stack's stale-token sweep cadence.
+///
+/// The lane's 4h token sweep dies with the lane (#1522); the REST-only
+/// stack (`dhan_rest_stack.rs` Phase 3) runs its OWN sweep every this
+/// many seconds, calling
+/// `force_renewal_if_stale(TOKEN_SWEEP_STALENESS_THRESHOLD_SECS)` —
+/// the renewal-loop-circuit-breaker-halt backstop. 900s (matching the
+/// mid-session watchdog cadence) instead of the lane's 4h: the stack's
+/// spot/chain legs die within minutes of a stale token, so the backstop
+/// must react on the same timescale. Silent on no-op/success; a failure
+/// logs via the renewal machinery's own paths. NOT market-hours gated
+/// (a token that goes stale overnight must heal before the 09:16 first
+/// fetch).
+pub const DHAN_REST_STACK_TOKEN_SWEEP_INTERVAL_SECS: u64 = 900;
 
 // DELETED: FRAME_SEND_TIMEOUT_SECS and FRAME_BACKPRESSURE_TIMEOUT_SECS
 // Removed per P1.3 — WS readers use non-blocking try_send() + WAL spill,
@@ -3494,6 +4371,340 @@ mod tests {
         assert_eq!(MARKET_CLOSE_IST_NANOS, 55_800_000_000_000);
     }
 
+    /// Spot 1m REST pipeline (operator grant 2026-07-12) — the index set
+    /// is pinned to NIFTY=13, BANKNIFTY=25, SENSEX=51 + INDIA VIX=21
+    /// (operator scope addition 2026-07-13, relayed via the coordinator
+    /// session: INDIA VIX joins the spot 1m pull, spot only, no option
+    /// chain), and the fire window is [09:16:00, 15:30:00] IST inclusive.
+    #[test]
+    fn test_spot_1m_rest_constants_pinned() {
+        assert_eq!(
+            SPOT_1M_REST_INDICES,
+            [
+                (13, "NIFTY"),
+                (25, "BANKNIFTY"),
+                (51, "SENSEX"),
+                (21, "INDIA VIX")
+            ]
+        );
+        assert_eq!(SPOT_1M_REST_INDICES[3].0, INDIA_VIX_SECURITY_ID);
+        // The chain leg stays the VIX-free 3-underlying §8 scope.
+        assert_eq!(
+            CHAIN_1M_UNDERLYINGS,
+            [(13, "NIFTY"), (25, "BANKNIFTY"), (51, "SENSEX")]
+        );
+        assert!(
+            CHAIN_1M_UNDERLYINGS
+                .iter()
+                .all(|&(sid, _)| sid != INDIA_VIX_SECURITY_ID),
+            "INDIA VIX is SPOT-ONLY — never a chain underlying"
+        );
+        // Per-SID not-served detector threshold (~10 minutes).
+        assert_eq!(SPOT_1M_REST_SID_NOT_SERVED_THRESHOLD, 10);
+        assert_eq!(SPOT_1M_REST_FIRST_FIRE_SECS_OF_DAY_IST, 33_360); // 09:16:00
+        assert_eq!(SPOT_1M_REST_LAST_FIRE_SECS_OF_DAY_IST, 55_800); // 15:30:00
+        // Both boundaries are exact minute marks.
+        assert_eq!(SPOT_1M_REST_FIRST_FIRE_SECS_OF_DAY_IST % 60, 0);
+        assert_eq!(SPOT_1M_REST_LAST_FIRE_SECS_OF_DAY_IST % 60, 0);
+        assert_eq!(SPOT_1M_REST_FIRE_DELAY_MS, 300);
+        assert_eq!(SPOT_1M_REST_RETRY_OFFSETS_MS, [700, 1_500, 3_000, 6_000]);
+        assert!(
+            SPOT_1M_REST_RETRY_OFFSETS_MS
+                .windows(2)
+                .all(|w| w[0] < w[1]),
+            "re-poll ladder must be strictly increasing"
+        );
+        assert_eq!(SPOT_1M_REST_CONSECUTIVE_FAIL_PAGE_THRESHOLD, 3);
+        assert!(u64::from(SPOT_1M_REST_FIRE_STALE_GRACE_SECS) * 1_000 < 60_000);
+        // 2026-07-12 H2 fix: the REAL minute budget — short per-request
+        // timeout + a hard per-SID ladder budget that fits the minute.
+        assert_eq!(SPOT_1M_REST_REQUEST_TIMEOUT_SECS, 5);
+        assert_eq!(SPOT_1M_REST_SID_BUDGET_SECS, 20);
+        assert!(
+            SPOT_1M_REST_FIRE_DELAY_MS + SPOT_1M_REST_SID_BUDGET_SECS * 1_000 < 60_000,
+            "budget must finish inside the minute"
+        );
+        assert!(
+            SPOT_1M_REST_RETRY_OFFSETS_MS[3] + SPOT_1M_REST_REQUEST_TIMEOUT_SECS * 1_000
+                < SPOT_1M_REST_SID_BUDGET_SECS * 1_000,
+            "ladder schedule must fit the budget"
+        );
+        // 429-coordination follow-up (2026-07-13): deterministic per-SID
+        // jitter + bounded 429 extra backoff, worst case still inside the
+        // hard 20 s per-SID budget (6 s + 0.45 s + 8 s + 5 s = 19.45 s at
+        // the 4-SID arity).
+        assert_eq!(SPOT_1M_REST_LADDER_JITTER_STEP_MS, 150);
+        assert_eq!(SPOT_1M_REST_LADDER_JITTER_SLOTS, 4);
+        assert_eq!(
+            SPOT_1M_REST_LADDER_JITTER_SLOTS as usize,
+            SPOT_1M_REST_INDICES.len(),
+            "jitter slots must equal the pinned index arity"
+        );
+        assert_eq!(SPOT_1M_REST_429_EXTRA_BACKOFF_MS, 2_000);
+        assert!(
+            SPOT_1M_REST_RETRY_OFFSETS_MS[3]
+                + (SPOT_1M_REST_LADDER_JITTER_SLOTS - 1) * SPOT_1M_REST_LADDER_JITTER_STEP_MS
+                + SPOT_1M_REST_RETRY_OFFSETS_MS.len() as u64 * SPOT_1M_REST_429_EXTRA_BACKOFF_MS
+                + SPOT_1M_REST_REQUEST_TIMEOUT_SECS * 1_000
+                < SPOT_1M_REST_SID_BUDGET_SECS * 1_000,
+            "worst-case jittered + 429-backed-off schedule must fit the budget"
+        );
+        assert_eq!(SPOT_1M_REST_MAX_BODY_BYTES, 2 * 1024 * 1024);
+    }
+
+    /// Option-chain 1m REST pipeline (operator grant 2026-07-12, PR-3) —
+    /// the endpoint paths + the chain leg's bounded timing envelope.
+    #[test]
+    fn test_chain_1m_constants_pinned() {
+        assert_eq!(DHAN_OPTION_CHAIN_PATH, "/optionchain");
+        assert_eq!(DHAN_OPTION_CHAIN_EXPIRYLIST_PATH, "/optionchain/expirylist");
+        assert!(DHAN_OPTION_CHAIN_PATH.starts_with('/'));
+        assert!(DHAN_OPTION_CHAIN_EXPIRYLIST_PATH.starts_with('/'));
+        // The chain fires AFTER the spot leg; its fallback timer trails the
+        // spot fire delay and the whole fire fits inside the minute.
+        assert_eq!(CHAIN_1M_FALLBACK_DELAY_MS, 2_500);
+        assert!(CHAIN_1M_FALLBACK_DELAY_MS > SPOT_1M_REST_FIRE_DELAY_MS);
+        assert_eq!(CHAIN_1M_REQUEST_TIMEOUT_SECS, 10);
+        assert_eq!(CHAIN_1M_UNDERLYING_BUDGET_SECS, 20);
+        assert!(CHAIN_1M_FALLBACK_DELAY_MS + CHAIN_1M_UNDERLYING_BUDGET_SECS * 1_000 < 60_000);
+        assert!(CHAIN_1M_REQUEST_TIMEOUT_SECS < CHAIN_1M_UNDERLYING_BUDGET_SECS);
+        // Dhan's documented option-chain limit: 1 unique request / 3s.
+        assert_eq!(CHAIN_1M_MIN_GAP_SECS, 3);
+        assert_eq!(CHAIN_1M_CONSECUTIVE_FAIL_PAGE_THRESHOLD, 3);
+        assert_eq!(CHAIN_1M_EXPIRYLIST_RETRY_BACKOFF_SECS, [3, 6]);
+        // Each expirylist retry backoff clears the 1-unique-per-3s window
+        // (retrying the SAME request inside it earns the reject it retries).
+        assert!(CHAIN_1M_EXPIRYLIST_RETRY_BACKOFF_SECS[0] >= CHAIN_1M_MIN_GAP_SECS);
+        assert_eq!(CHAIN_1M_MAX_BODY_BYTES, 8 * 1024 * 1024);
+    }
+
+    /// 2026-07-14 chain-capture hardening: the retry decision ceiling +
+    /// the per-underlying not-served threshold, pinned alongside their
+    /// existing schedule partners (2500ms fallback / 10s request timeout /
+    /// 20s budget) so the P1–P3 const-assert proofs stay meaningful.
+    #[test]
+    fn test_chain_decision_ceiling_constants_pinned() {
+        assert_eq!(CHAIN_1M_DECISION_CEILING_SECS, 15);
+        assert_eq!(CHAIN_1M_UNDERLYING_NOT_SERVED_THRESHOLD, 10);
+        assert_eq!(
+            CHAIN_1M_UNDERLYING_NOT_SERVED_THRESHOLD,
+            SPOT_1M_REST_SID_NOT_SERVED_THRESHOLD
+        );
+        // The schedule partners the ceiling proofs are computed against.
+        assert_eq!(CHAIN_1M_FALLBACK_DELAY_MS, 2_500);
+        assert_eq!(CHAIN_1M_REQUEST_TIMEOUT_SECS, 10);
+        assert_eq!(CHAIN_1M_UNDERLYING_BUDGET_SECS, 20);
+        // P1: a timed-out first attempt leaves the retry launchable.
+        assert!(
+            CHAIN_1M_FALLBACK_DELAY_MS + CHAIN_1M_REQUEST_TIMEOUT_SECS * 1_000
+                <= CHAIN_1M_DECISION_CEILING_SECS * 1_000
+        );
+        // P2: a ceiling-edge retry never overruns the minute.
+        assert!(
+            (CHAIN_1M_DECISION_CEILING_SECS + CHAIN_1M_UNDERLYING_BUDGET_SECS) * 1_000 < 60_000
+        );
+        // P3: the same-key ≥3s gap fits inside the ceiling.
+        assert!(
+            CHAIN_1M_MIN_GAP_SECS * 1_000
+                < CHAIN_1M_DECISION_CEILING_SECS * 1_000 - CHAIN_1M_FALLBACK_DELAY_MS
+        );
+    }
+
+    /// Groww spot 1m REST leg (operator grant 2026-07-13, PR-2 of the
+    /// Groww per-minute REST plan) — endpoint identity, the 3-symbol table,
+    /// the SEQUENTIAL-fetch timing envelope and the token re-read floor.
+    #[test]
+    fn test_groww_spot_1m_constants_pinned() {
+        assert_eq!(
+            GROWW_HISTORICAL_CANDLES_URL,
+            "https://api.groww.in/v1/historical/candles"
+        );
+        assert!(GROWW_HISTORICAL_CANDLES_URL.starts_with("https://"));
+        // The Groww interval literal — never the Dhan-style "1".
+        assert_eq!(GROWW_CANDLE_INTERVAL_1MIN, "1minute");
+        assert_eq!(GROWW_API_VERSION_HEADER, "x-api-version");
+        assert_eq!(GROWW_API_VERSION_VALUE, "1.0");
+        // The 3-CORE-symbol table mirrors the Dhan set in Groww identity
+        // space: groww_symbol (NOT token / bare trading symbol), segment
+        // CASH. 2026-07-13 operator scope (relayed): the 4th Groww spot
+        // index — INDIA VIX — is RUNTIME-resolved from the day's master
+        // (never a guessed const literal), so it is deliberately NOT here.
+        assert_eq!(
+            GROWW_SPOT_1M_SYMBOLS,
+            [
+                ("NSE-NIFTY", "NIFTY", "NSE", "CASH"),
+                ("NSE-BANKNIFTY", "BANKNIFTY", "NSE", "CASH"),
+                ("BSE-SENSEX", "SENSEX", "BSE", "CASH"),
+            ]
+        );
+        // The Groww CONST set stays the 3 core indices; the Dhan set is 4
+        // (VIX = the fixed 4th entry) and the Groww 4th target is the
+        // runtime-resolved VIX (2026-07-13 scope, both legs SPOT ONLY).
+        assert_eq!(GROWW_SPOT_1M_SYMBOLS.len(), 3);
+        assert_eq!(GROWW_SPOT_1M_SYMBOLS.len(), CHAIN_1M_UNDERLYINGS.len());
+        assert_eq!(SPOT_1M_REST_INDICES.len(), 4);
+        // The canonical VIX human symbol (2026-07-13 scope addition) — the
+        // NSE_INDEX_ALLOWLIST / PHASE_0_IDX_I_SYMBOLS literal, and NEVER a
+        // groww_symbol (the Groww identity is runtime-resolved).
+        assert_eq!(GROWW_SPOT_1M_VIX_SYMBOL, "INDIA VIX");
+        assert!(PHASE_0_IDX_I_SYMBOLS.contains(&GROWW_SPOT_1M_VIX_SYMBOL));
+        assert!(!GROWW_SPOT_1M_VIX_SYMBOL.contains('-'));
+        // Timing envelope mirrors the Dhan leg, tightened for the
+        // SEQUENTIAL 4-target fire (3 core + the runtime VIX target;
+        // pacing rule: ≤1 in-flight request). Budget re-derived 18 → 14 on
+        // 2026-07-13 so 4 sequential budgets + the fire delay still finish
+        // inside the minute.
+        assert_eq!(GROWW_SPOT_1M_FIRE_DELAY_MS, 300);
+        assert_eq!(GROWW_SPOT_1M_RETRY_OFFSETS_MS, [700, 1_500, 3_000, 6_000]);
+        assert!(
+            GROWW_SPOT_1M_RETRY_OFFSETS_MS
+                .windows(2)
+                .all(|w| w[0] < w[1]),
+            "offsets strictly increasing"
+        );
+        assert_eq!(GROWW_SPOT_1M_REQUEST_TIMEOUT_SECS, 5);
+        assert_eq!(GROWW_SPOT_1M_SYMBOL_BUDGET_SECS, 14);
+        assert!(
+            GROWW_SPOT_1M_FIRE_DELAY_MS
+                + (GROWW_SPOT_1M_SYMBOLS.len() as u64 + 1)
+                    * GROWW_SPOT_1M_SYMBOL_BUDGET_SECS
+                    * 1_000
+                < 60_000,
+            "sequential fire (incl. the runtime VIX target) must finish inside the minute"
+        );
+        assert!(
+            GROWW_SPOT_1M_RETRY_OFFSETS_MS[3] + GROWW_SPOT_1M_REQUEST_TIMEOUT_SECS * 1_000
+                < GROWW_SPOT_1M_SYMBOL_BUDGET_SECS * 1_000,
+            "ladder schedule must fit one symbol's budget"
+        );
+        assert_eq!(GROWW_SPOT_1M_MAX_BODY_BYTES, 2 * 1024 * 1024);
+        // Token-minter lock pacing: re-READ from SSM at ≥60 s, never mint.
+        assert_eq!(GROWW_SPOT_1M_TOKEN_REREAD_FLOOR_SECS, 60);
+    }
+
+    /// Constant pins — the Groww per-minute option-chain leg (PR-3 of the
+    /// Groww per-minute REST plan; every value grounded in
+    /// `docs/groww-ref/14-option-chain.md` + `15-rate-limits-and-capacity.md`
+    /// or the mirrored Dhan chain leg).
+    #[test]
+    fn test_groww_chain_1m_constants_pinned() {
+        // Documented + SDK-verified endpoint prefix; the token travels in
+        // the Authorization header, NEVER the URL.
+        assert_eq!(
+            GROWW_OPTION_CHAIN_URL_PREFIX,
+            "https://api.groww.in/v1/option-chain"
+        );
+        assert!(GROWW_OPTION_CHAIN_URL_PREFIX.starts_with("https://"));
+        assert!(!GROWW_OPTION_CHAIN_URL_PREFIX.contains("token"));
+        // The 3-underlying table: PLAIN symbol + exchange for the path
+        // params, groww_symbol for the stable live-lane id.
+        assert_eq!(
+            GROWW_CHAIN_1M_UNDERLYINGS,
+            [
+                ("NIFTY", "NSE", "NSE-NIFTY"),
+                ("BANKNIFTY", "NSE", "NSE-BANKNIFTY"),
+                ("SENSEX", "BSE", "BSE-SENSEX"),
+            ]
+        );
+        assert_eq!(
+            GROWW_CHAIN_1M_UNDERLYINGS.len(),
+            GROWW_SPOT_1M_SYMBOLS.len()
+        );
+        // Every chain groww_symbol matches its spot-leg twin (same stable
+        // id space — the persisted rows must join the live lane).
+        for ((_, _, chain_gs), (spot_gs, ..)) in GROWW_CHAIN_1M_UNDERLYINGS
+            .iter()
+            .zip(GROWW_SPOT_1M_SYMBOLS.iter())
+        {
+            assert_eq!(chain_gs, spot_gs, "chain/spot groww_symbol drift");
+        }
+        // Sequencing + pacing envelope (sequential 3-underlying fire).
+        assert_eq!(GROWW_CHAIN_1M_FALLBACK_DELAY_MS, 2_500);
+        assert!(GROWW_CHAIN_1M_FALLBACK_DELAY_MS > GROWW_SPOT_1M_FIRE_DELAY_MS);
+        assert_eq!(GROWW_CHAIN_1M_MIN_GAP_MS, 1_000);
+        assert_eq!(GROWW_CHAIN_1M_REQUEST_TIMEOUT_SECS, 10);
+        assert_eq!(GROWW_CHAIN_1M_UNDERLYING_BUDGET_SECS, 15);
+        assert!(
+            GROWW_CHAIN_1M_FALLBACK_DELAY_MS
+                + (GROWW_CHAIN_1M_UNDERLYINGS.len() as u64)
+                    * GROWW_CHAIN_1M_UNDERLYING_BUDGET_SECS
+                    * 1_000
+                < 60_000,
+            "sequential chain fire must finish inside the minute"
+        );
+        assert!(
+            GROWW_CHAIN_1M_MIN_GAP_MS + GROWW_CHAIN_1M_REQUEST_TIMEOUT_SECS * 1_000
+                < GROWW_CHAIN_1M_UNDERLYING_BUDGET_SECS * 1_000,
+            "min-gap + one request timeout must fit the underlying budget"
+        );
+        assert_eq!(GROWW_CHAIN_1M_MAX_BODY_BYTES, 8 * 1024 * 1024);
+        // The chain leg reuses the spot FailureEdge — thresholds agree.
+        assert_eq!(
+            GROWW_CHAIN_1M_CONSECUTIVE_FAIL_PAGE_THRESHOLD,
+            SPOT_1M_REST_CONSECUTIVE_FAIL_PAGE_THRESHOLD
+        );
+        // Warmup master-download retries: bounded, 3 attempts total.
+        assert_eq!(GROWW_CHAIN_1M_MASTER_RETRY_BACKOFF_SECS, [3, 6]);
+        // Per-underlying not-served detector threshold (~10 minutes) —
+        // mirrors the spot leg's per-SID detector (2026-07-14, the NIFTY
+        // expiry-day vendor-cutoff companion).
+        assert_eq!(GROWW_CHAIN_1M_UNDERLYING_NOT_SERVED_THRESHOLD, 10);
+        assert_eq!(
+            GROWW_CHAIN_1M_UNDERLYING_NOT_SERVED_THRESHOLD,
+            SPOT_1M_REST_SID_NOT_SERVED_THRESHOLD
+        );
+    }
+
+    /// PR-4 (Groww contract leg): the fill-model leg's pacing + envelope
+    /// constants — the cap, the ATM-window default, and the boundary-burst
+    /// math are all mechanical (the const asserts re-prove them at compile
+    /// time; this test pins the VALUES so a drift is a conscious edit).
+    #[test]
+    fn test_groww_contract_1m_constants_pinned() {
+        assert_eq!(GROWW_CONTRACT_1M_FALLBACK_DELAY_MS, 8_000);
+        assert!(GROWW_CONTRACT_1M_FALLBACK_DELAY_MS > GROWW_CHAIN_1M_FALLBACK_DELAY_MS);
+        assert_eq!(GROWW_CONTRACT_1M_MIN_GAP_MS, 500);
+        assert_eq!(GROWW_CONTRACT_1M_REQUEST_TIMEOUT_SECS, 5);
+        assert_eq!(GROWW_CONTRACT_1M_MAX_PER_MINUTE, 30);
+        assert_eq!(GROWW_CONTRACT_1M_FIRE_BUDGET_SECS, 45);
+        assert_eq!(GROWW_CONTRACT_1M_DEFAULT_STRIKES_EACH_SIDE, 2);
+        assert_eq!(GROWW_CONTRACT_1M_ANCHOR_MAX_AGE_MINUTES, 5);
+        // Fallback + fire budget fit the minute.
+        assert!(
+            GROWW_CONTRACT_1M_FALLBACK_DELAY_MS + GROWW_CONTRACT_1M_FIRE_BUDGET_SECS * 1_000
+                < 60_000
+        );
+        // Worst-overlap boundary burst inside the 6 req/s family ceiling
+        // (re-derived 2026-07-13 for the VIX 4th spot target): spot worst
+        // second = 3 requests (target-transition instant) + chain + contract.
+        // EXACT rational cross-multiplication:
+        //   3 + 1000/kg + 1000/cg <= 6  <=>  1000*kg + 1000*cg <= 3*cg*kg
+        // — today 1000*500 + 1000*1000 = 1.5M = 3*1000*500 exactly:
+        // 3 + 1 + 2 = 6.00 req/s AT the self-imposed ceiling.
+        assert!(
+            1_000 * GROWW_CONTRACT_1M_MIN_GAP_MS + 1_000 * GROWW_CHAIN_1M_MIN_GAP_MS
+                <= 3 * GROWW_CHAIN_1M_MIN_GAP_MS * GROWW_CONTRACT_1M_MIN_GAP_MS
+        );
+        // Per-minute request math (the capacity envelope): 30 contracts +
+        // the spot leg's worst 20 (3 core + the runtime VIX target = 4
+        // targets x 5 ladder rungs) + 3 chain = 53/min ~ 17.7% of the
+        // 300/min shared budget (typical ~37/min).
+        assert_eq!(
+            GROWW_CONTRACT_1M_MAX_PER_MINUTE
+                + (GROWW_SPOT_1M_SYMBOLS.len() + 1) * (GROWW_SPOT_1M_RETRY_OFFSETS_MS.len() + 1)
+                + GROWW_CHAIN_1M_UNDERLYINGS.len(),
+            53
+        );
+        // The default ATM window fills the cap exactly (5 strikes x 2 legs
+        // x 3 underlyings = 30) — a wider default needs a dated quote.
+        assert_eq!(
+            (2 * GROWW_CONTRACT_1M_DEFAULT_STRIKES_EACH_SIDE as usize + 1)
+                * 2
+                * GROWW_CHAIN_1M_UNDERLYINGS.len(),
+            GROWW_CONTRACT_1M_MAX_PER_MINUTE
+        );
+    }
+
     /// Constant pin — 60s grace after close.
     #[test]
     fn test_ws_grace_after_close_secs_pinned_at_60() {
@@ -3662,6 +4873,12 @@ mod tests {
         assert!(has("NIFTY MIDCAP SELECT", "MIDCPNIFTY"));
         assert!(has("NIFTY MIDCAP 50", "NIFTYMCAP50"));
         assert!(has("NIFTY TOTAL MARKET", "NIFTY TOTAL MKT"));
+        // 2026-07-13 (Groww spot-leg INDIA VIX scope): the live Groww
+        // master's compact token spelling must canonicalize to the
+        // allowlisted "INDIA VIX" so the runtime VIX resolution matches on
+        // the token key too (the display name "India Vix" already
+        // normalizes without an alias).
+        assert!(has("INDIAVIX", "INDIA VIX"));
     }
 
     // =======================================================================

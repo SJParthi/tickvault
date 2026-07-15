@@ -82,9 +82,10 @@ pub mod boot_probe;
 // Human-readable analyst console views (`ticks_named` / `candles_named`) —
 // plain QuestDB views LEFT-joining ticks/candles_1m against the
 // instrument_lifecycle master. Cold-path console tooling only (O(join) at
-// SELECT time, honestly O(N); zero hot-path impact). NOT feature-gated:
-// the DDL builders compile feature-free; the lifecycle-ensure call inside
-// is `#[cfg(feature = "daily_universe_fetcher")]`-gated.
+// SELECT time, honestly O(N); zero hot-path impact). (The
+// `daily_universe_fetcher` feature that once gated the lifecycle-ensure
+// call inside was deleted in PR-C3, 2026-07-14 — everything here is
+// unconditional now.)
 pub mod console_views;
 // C2 (2026-07-03): HTTP-CLIENT-01 — panic-free reqwest client construction.
 // Shared OnceLock probe client for the repeating QuestDB readiness probes
@@ -100,10 +101,16 @@ pub mod http_client;
 // Groww — both DELETED in SP5). Both feeds write here. See live-feed-purity.md
 // rule 11 + docs/design/sp5-unified-parity-audit-design.md. The two old physical
 // QuestDB tables are RETAINED on disk (SEBI 5y) but no longer written.
+/// BruteX↔TickVault daily cross-verification (operator 2026-07-11): the two
+/// forensic tables — one row per divergent CELL + one per-day summary row
+/// with a keep-better outcome guard — written via ILP-over-HTTP (per-flush
+/// server ACK). See `.claude/rules/project/brutex-crossverify-error-codes.md`.
+pub mod brutex_crossverify_persistence;
 /// Dual-feed scoreboard (operator 2026-07-10): one classified row per feed
 /// EPISODE (disconnect / stall / process death) with the blame verdict
 /// persisted — the month-end "who caused it" system-of-record.
 pub mod feed_episode_audit_persistence;
+pub mod feed_gap_audit_persistence;
 pub mod feed_parity_1m_audit_persistence;
 /// Dual-feed scoreboard (operator 2026-07-10): the per-day per-feed
 /// scoreboard row + the per-instrument coverage detail table.
@@ -111,6 +118,10 @@ pub mod feed_scoreboard_persistence;
 /// Groww auto-scale ladder forensic chain (§34, auto-scale PR-2 Item 8) —
 /// one row per ladder transition; feeds restart rehydration.
 pub mod groww_scale_audit_persistence;
+/// Daily timeframe-consistency verifier (operator 2026-07-13): one row per
+/// finding cell where a stored higher-TF candle disagrees with its
+/// recomputed-from-1m value (TF-VERIFY-01/02).
+pub mod tf_consistency_audit_persistence;
 pub mod tick_conservation_audit_persistence;
 pub mod ws_event_audit_persistence;
 // PR-E (2026-05-26): `candle_persistence` module deleted alongside the
@@ -146,23 +157,23 @@ pub mod groww_candle_persistence;
 // (SP5) The Groww live-vs-backtest 1m parity audit module was MERGED into the
 // unified `feed_parity_1m_audit_persistence` above (one table, `feed` in the
 // DEDUP key). Its empty `groww_cross_verify_1m_audit` table is retained on disk.
-// §21. DDL + append helpers + Row struct land in Sub-PR #10b-ζ.
-#[cfg(feature = "daily_universe_fetcher")]
+// Instrument fetch-audit table (SEBI forensic — retained per the PR-C3
+// retirement banner in daily-universe-instr-fetch-error-codes.md).
+// PR-C3 (2026-07-14): compiles unconditionally — the `daily_universe_fetcher`
+// feature gate was deleted with the Dhan instrument chain.
 pub mod instrument_fetch_audit_persistence;
 // Lifecycle table contracts (§5/§6 SEBI never-delete) — schema constants
-// + DEDUP keys + LifecycleState/TransitionKind enums. Feature-gated per
-// rule §21. DDL + Row + append helpers land in follow-up sub-PRs.
-#[cfg(feature = "daily_universe_fetcher")]
+// + DEDUP keys + LifecycleState/TransitionKind enums + DDL/Row/append
+// helpers. PR-C3 (2026-07-14): compiles unconditionally (feature gate
+// deleted); the live writer is the Groww shared_master_writer.
 pub mod instrument_lifecycle_persistence;
 // §31 item 2 (NTM Map-A, 2026-06-06): full index→constituents mapping table —
 // queryable both directions. Map-only (does NOT change the subscription).
-// Feature-gated per rule §21.
-#[cfg(feature = "daily_universe_fetcher")]
+// PR-C3 (2026-07-14): compiles unconditionally (feature gate deleted).
 pub mod index_constituency_persistence;
-// Daily lifecycle reconciler — PURE decision logic (§5/§6/§23). The app
-// boot orchestrator owns the I/O loop and consumes these pure functions.
-// Feature-gated per rule §21.
-#[cfg(feature = "daily_universe_fetcher")]
+// Daily lifecycle reconciler — PURE decision logic (§5/§6/§23). PR-C3
+// (2026-07-14): compiles unconditionally (feature gate deleted); consumed
+// by the Groww shared_master_writer's classify_transition path.
 pub mod lifecycle_reconciler;
 // PR #3 (2026-05-19): `greeks_persistence` module DELETED. greeks
 // pipeline retired alongside the indices-only universe. The
@@ -180,6 +191,20 @@ pub mod lifecycle_reconciler;
 // `movers_*` matviews + `movers_1s` base table are no longer recreated
 // either (the old `drop_bug3_retired_views` lived in this module).
 pub mod partition_manager;
+// 2026-07-13 disk-pressure remediation: partition archive→verify→drop —
+// the S3-archival leg partition_manager's honest boundary documented as
+// missing. Fail-closed: a partition is dropped ONLY after its S3 copy is
+// row-count- and size-verified; gated on [partition_retention]
+// archive_enabled (serde default false).
+pub mod partition_archive;
+// Cluster-C order-side observability (2026-07-14): SEBI 5y order-lifecycle
+// audit — rebuild of the table deleted in #T4 (2026-05-20) on the modern
+// ILP-over-HTTP template with event-in-key DEDUP (AUDIT-06).
+pub mod order_audit_persistence;
+// Cluster-C order-side observability (2026-07-14): daily P&L snapshot
+// audit — rebuild of the Phase-0 Item-25 table deleted in #T4 (2026-05-20);
+// the OnEod row is the daily heartbeat/denominator (STORAGE-GAP-03).
+pub mod pnl_audit_persistence;
 pub mod prev_day_ohlcv_persistence;
 pub mod questdb_health;
 pub mod seal_absorption;
@@ -195,6 +220,22 @@ pub mod generic_candle_writer;
 pub mod shadow_candle_writer;
 pub mod shadow_persistence;
 pub mod shadow_seal_columns;
+// Per-minute spot 1m REST pipeline (operator grant 2026-07-12, PR-2 — the
+// SPOT half; SPOT1M-02): the `spot_1m_rest` table DDL + ILP-over-HTTP writer.
+pub mod spot_1m_rest_persistence;
+// Per-minute option-chain REST pipeline (operator grant 2026-07-12, PR-3 —
+// the OPTION-CHAIN half; CHAIN-03): the `option_chain_1m` table DDL +
+// ILP-over-HTTP writer.
+pub mod option_chain_1m_persistence;
+// Per-contract 1m candle leg of the Groww per-minute REST pipeline
+// (operator grant 2026-07-13, PR-4 — the fill-model leg): the
+// `option_contract_1m_rest` table DDL + ILP-over-HTTP writer (feed in the
+// DEDUP key; retention registered in partition_manager.rs).
+pub mod option_contract_1m_rest_persistence;
+// Per-fetch forensics for the per-minute REST legs (operator scope addition
+// 2026-07-13, Groww REST plan PR-2): the `rest_fetch_audit` table DDL +
+// ILP-over-HTTP writer — one row per (target minute, symbol, feed, leg).
+pub mod rest_fetch_audit_persistence;
 // B6 (2026-07-03): off-thread tick ILP flush worker — keeps the blocking
 // questdb TCP flush off the tick-consumer thread (TICK-FLUSH-01).
 pub(crate) mod tick_flush_worker;

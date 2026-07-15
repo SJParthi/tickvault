@@ -322,21 +322,15 @@ fn fuzz_workflow_supports_tunable_duration() {
     );
 }
 
-#[test]
-fn subscription_planner_emits_per_id_collision_gauge() {
-    // PR #288 (#5b): subscription_planner.rs must emit one gauge per
-    // collision pair (labelled security_id + losing + winning) so the
-    // operator can see WHICH ids collided in Grafana.
-    let src = read("crates/core/src/instrument/subscription_planner.rs");
-    assert!(
-        src.contains("tv_instrument_registry_collision_pair"),
-        "subscription_planner must emit tv_instrument_registry_collision_pair gauge"
-    );
-    assert!(
-        src.contains("collision_pairs()"),
-        "subscription_planner must call registry.collision_pairs()"
-    );
-}
+// RETIRED (PR-C3, 2026-07-14 — Dhan instrument-chain deletion, operator
+// retirement directive 2026-07-13 per websocket-connection-scope-lock.md
+// "2026-07-13 Amendment" §B item 2):
+// `subscription_planner_emits_per_id_collision_gauge` pinned the PR #288
+// per-collision-pair gauge emit in `subscription_planner.rs`, which was
+// DELETED with the Dhan subscription surface — its boot-time gauge emit has
+// no plan build to run in anymore. The `InstrumentRegistry` collision
+// TRACKING (`collision_pairs()` / `cross_segment_collisions()`) survives in
+// `crates/common/src/instrument_registry.rs` with its own unit tests.
 
 #[test]
 fn chaos_nightly_workflow_wires_ignored_tests() {

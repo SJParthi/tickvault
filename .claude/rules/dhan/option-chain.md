@@ -2,6 +2,8 @@
 
 > **⚠ MODULE RETIRED 2026-06-28.** The `crates/core/src/option_chain/` REST subsystem (client + minute scheduler + expiry warmup + caches), its config, its `OPTION-CHAIN-01..08` error codes, and its notifications were DELETED per operator directive 2026-06-28 ("drop the option chain entire implementations and its table also"). It was disabled since 2026-06-02 (no Dhan Option Chain Data API entitlement) with no live consumer; its QuestDB table was dropped 2026-06-23. This enforcement file is retained for reference IF the option-chain REST API is ever re-introduced; the trigger paths below currently match no live code.
 >
+> **⚠ REBUILT 2026-07-12.** The option-chain REST surface is re-introduced as a NEW per-minute snapshot subsystem (`crates/app/src/option_chain_1m_boot.rs` + `crates/storage/src/option_chain_1m_persistence.rs`, config-gated **DEFAULT-OFF** pending the first-live-boot entitlement probe) per the 2026-07-12 operator directive recorded in `.claude/rules/project/no-rest-except-live-feed-2026-06-27.md` §8. This is a REBUILD, not a revival of the deleted 2026-06-28 code. The mechanical rules below apply to the new code. Rate limit re-verified 2026-07-12 against the live Dhan docs — UNCHANGED: 1 unique request per 3 seconds, concurrent DISTINCT underlyings/expiries allowed within the window. The `OPTION-CHAIN-01..08` ErrorCodes remain RETIRED — the rebuild uses new codes documented in `.claude/rules/project/rest-1m-pipeline-error-codes.md` (lands with the code PRs).
+>
 > **Ground truth:** `docs/dhan-ref/06-option-chain.md`
 > **Scope:** Any file touching option chain fetching, expiry list, strike parsing, or greeks.
 > **Cross-reference:** `docs/dhan-ref/08-annexure-enums.md` (ExchangeSegment), `docs/dhan-ref/09-instrument-master.md` (SecurityId)
@@ -48,4 +50,6 @@ This rule activates when editing files matching:
 - `crates/core/src/option_chain/*.rs`
 - `crates/trading/src/strategy/option_chain*.rs`
 - `crates/api/src/handlers/option_chain.rs`
-- Any file containing `OptionChainRequest`, `OptionChainResponse`, `OptionChainData`, `StrikeData`, `OptionData`, `Greeks`, `ExpiryListResponse`, `optionchain`, `UnderlyingScrip`, `UnderlyingSeg`, `implied_volatility`
+- `crates/app/src/option_chain_1m_boot.rs` (the 2026-07-12 rebuild)
+- `crates/storage/src/option_chain_1m_persistence.rs` (the 2026-07-12 rebuild)
+- Any file containing `OptionChainRequest`, `OptionChainResponse`, `OptionChainData`, `StrikeData`, `OptionData`, `Greeks`, `ExpiryListResponse`, `optionchain`, `UnderlyingScrip`, `UnderlyingSeg`, `implied_volatility`, `option_chain_1m`

@@ -45,6 +45,11 @@ chrono-tz = { workspace = true }
 rustls = { workspace = true }
 reqwest = { workspace = true }
 core_affinity = { workspace = true }
+# 2026-07-12 (BruteX crossverify Commit 2): the 15:50 IST daily task reads the
+# BruteX-produced Groww 1m CSVs from S3 (tv-prod-cold, read-only GET/List —
+# the instance role already holds the permissions; ZERO IAM change).
+aws-config = { workspace = true }
+aws-sdk-s3 = { workspace = true }
 # Event-driven (zero-poll) file watching for the Groww bridge tick-file tail
 # (operator 2026-06-28: "true zero latency, no polling"). Same crate + pin the
 # strategy hot-reloader uses (`crates/trading/src/strategy/hot_reload.rs`) —
@@ -52,23 +57,14 @@ core_affinity = { workspace = true }
 notify = { workspace = true }
 # Only the feature-gated daily-universe boot orchestrator hashes the CSV
 # (source_csv_sha256 provenance); optional so the default build stays lean.
-sha2 = { workspace = true, optional = true }
 
 [features]
-# GO-LIVE (PR-3, 2026-05-28): daily_universe_fetcher is now in `default` per
-# the operator full-go-live approval ("250 SIDs + new scope as production AND
-# local, everywhere"; boot fail-closed §4 "Block until CSV"). The §21
-# sequencing is satisfied — the fetcher chain + boot wiring (PR-1 #852) +
-# scope-aware subscription (PR-2 #853) all merged first. Paired with
-# `config/base.toml [subscription] scope = "daily_universe"`.
-default = ["daily_universe_fetcher"]
-# Forwards the gate to core (the INSTR-FETCH runner) and storage (the
-# instrument_fetch_audit writer) so the app-side audit-write seam compiles.
-daily_universe_fetcher = [
-    "dep:sha2",
-    "tickvault-core/daily_universe_fetcher",
-    "tickvault-storage/daily_universe_fetcher",
-]
+# PR-C3 (2026-07-14): the `daily_universe_fetcher` feature (and its sha2
+# optional dep) was DELETED with the Dhan instrument-download chain
+# (operator retirement directive 2026-07-13, scope-lock amendment §B). The
+# formerly-gated SEBI persistence modules in `tickvault-storage` are now
+# compiled unconditionally.
+default = []
 
 [package.metadata.cargo-machete]
 ignored = ["chrono-tz", "clap", "signal-hook"]

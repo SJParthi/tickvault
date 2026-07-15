@@ -45,8 +45,8 @@ migration (#O1/#O2/#O3) — the 2026-07-06 zero-page incident is why this list
 now exists (`deploy/aws/terraform/error-code-alarms.tf`).
 
 Filtered+alarmed codes (each = one `error_code_alerts` map entry):
-REST-CANARY-01, DH-901, DH-906 (term-match tripwire — no coded emit site
-exists yet), AUTH-GAP-04, WS-GAP-07, FEED-STALL-01 (ERROR lines = the
+DH-901, DH-906 (term-match tripwire — no coded emit site
+exists yet), AUTH-GAP-04, FEED-STALL-01 (ERROR lines = the
 sidecar's own >5-restarts-per-5-min STORM escalation ONLY; per-restart lines
 are warn!-level and invisible here — the ≥3-restarts-per-15-min restart pager
 is the separate `tv_feed_sidecar_stall_restart_total` counter alarm,
@@ -67,9 +67,65 @@ fires one edge-latched ERROR per (table, suspension episode) — a merely-DOWN
 QuestDB never fires it, the boot-probe escalation codes own the down-server
 page; recovery = the operator's
 `ALTER TABLE <t> RESUME WAL`, never auto-executed; runbook
-`.claude/rules/project/wal-suspension-error-codes.md`**)**. **Everything else
+`.claude/rules/project/wal-suspension-error-codes.md`**)**, **TICK-CONSERVE-01
+(added 2026-07-14, automation-gaps PR-3** — the 2026-07-10 automation audit
+found the High post-market audit codes were log-sink-only: a 15:40 IST
+tick-conservation residual paged nobody; a daily one-shot audit finding, so
+its alarm sets `ok_recovery = false` — the auto-OK ~15 min after the
+datapoint ages out can never mean the residual was fixed (Rule-11); recovery
+= the next trading day's clean run; runbook
+`.claude/rules/project/tick-conservation-audit-error-codes.md`. The two
+sibling cross-verify entries added by the same PR retired hours later — see
+"Retired paging entries" below**)**, **AUTH-GAP-05
+(added 2026-07-14, REST-audit gap 01** — SCOPED to the mint-FAILURE arm only
+via `$.cooldown_skip IS FALSE` (the boolean field exists only on that
+emission; IS FALSE additionally excludes the same-day noise-lock H3
+non-terminal mint-cooldown-skip lines, which self-retry at the next re-arm
+window and must never page); the
+trigger arm fires on every forced re-mint INCLUDING successful ~30-min
+self-heals and is operator-ruled noise — silent-when-healing,
+loud-only-when-unobtainable**)**, **SPOT1M-01 and CHAIN-02 (added
+2026-07-14, REST-audit gap 03** — SCOPED to the once-per-episode
+`stage="escalation"` edge lines only, covering the Dhan spot + Groww spot +
+Groww contract legs (SPOT1M-01) and both feeds' chain legs (CHAIN-02); the
+per-minute sub-edge lines are deliberately unmatched — a plain code filter
+would over-page every failed minute vs the designed 3-minute escalation;
+the persist-failure codes feed these edges persist-gated, so a persist
+outage still reaches the page**)**, **CHAIN-01 (added 2026-07-14** — plain
+coded filter; both stages are once-per-episode page-worthy and the
+probe-only path never emits it at ERROR**)**, and **CHAIN-04 (added
+2026-07-14** — SCOPED to the down-for-the-day `stage="warmup"` arm only;
+the probe_* / warmup_no_token stages are log-only-by-design
+transient/respawn arms**)**. **Everything else
 is log-sink-only** unless it has its own metric alarm (app-alarms.tf) or a
-typed `NotificationEvent`.
+typed `NotificationEvent`. Counter-side (non-errcode) pager added
+2026-07-14 (REST-audit gap 05): `tv-<env>-telegram-drops`
+(`telegram-drop-alarm.tf` — Sum ≥ 3 drops of `tv_telegram_dropped_total`
+per aligned 900s window via the metrics-log delta-extraction house
+pattern; a broken bot silently killed every typed-event page; honest
+residual: the counter is NOT yet pre-registered at 0 post-recorder-install,
+so the session's first drop per reason-series is eaten as the CW delta
+baseline — flagged crates follow-up).
+
+**Retired paging entries:** the `ws-gap-07` filter+alarm was RETIRED
+PR-C2 2026-07-13 — its only ERROR-level emit site (the main-feed
+frame-channel Closed arm in the deleted `connection.rs`) died with the Dhan
+live-WS lane, so the filter could never match again; the tf map entry was
+removed the same day (dated note in `error-code-alarms.tf`). The
+`cross-verify-1m-01` + `cross-verify-1m-02` filters+alarms (added earlier
+the SAME day by automation-gaps PR-3) were RETIRED PR-C3 2026-07-14 — their
+emit module `cross_verify_1m_boot.rs` was deleted with the Dhan instrument
+chain (the 15:31 IST Dhan live-vs-historical cross-verify has no live side
+to compare — `cross-verify-1m-error-codes.md` retirement banner), so both
+filters could never match again; the tf map entries were removed in the
+same PR (dated note in `error-code-alarms.tf`).
+
+> Removed from the filtered+alarmed set: the Dhan REST canary code
+> (RETIRED 2026-07-14 with its module + both spawn sites + the
+> `rest-canary-01` map entry, per the operator Dhan noise lock —
+> `dhan-rest-only-noise-lock-2026-07-14.md`; the retained spot-1m +
+> option-chain legs self-detect a dead Dhan REST surface within ~3-4 min
+> via their own escalation edges).
 
 ## The ErrorCode taxonomy (53 variants, 100% rule-synced)
 
