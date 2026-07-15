@@ -183,6 +183,24 @@ fn first_line(body: &str) -> &str {
 // ---------------------------------------------------------------------------
 
 #[test]
+fn guard_daily_cards_carry_the_compact_date() {
+    // G3 (fix round 2, 2026-07-15): past-day backfill/forced cards
+    // (TICKVAULT_SCOREBOARD_DATE / TICKVAULT_TF_VERIFY_DATE) must be
+    // distinguishable from today's — the scorecard header and the TF
+    // pass one-liner ALWAYS carry the compact verified date.
+    let body = scorecard_clean().to_message();
+    assert!(
+        first_line(&body).contains("Feed scorecard 3:45 PM \u{b7} 15 Jul"),
+        "scorecard header must carry the compact date: {body}"
+    );
+    let body = tf_pass(0).to_message();
+    assert!(
+        body.contains("Timeframe check 3:40 PM \u{b7} 15 Jul"),
+        "TF pass one-liner must carry the compact date: {body}"
+    );
+}
+
+#[test]
 fn guard_tf_pass_body_is_exactly_one_line() {
     for ev in [tf_pass(0), tf_pass(9)] {
         let body = ev.to_message();

@@ -1882,6 +1882,29 @@ fn render_ms(ms: i64) -> String {
     format!("{ms} ms")
 }
 
+/// Compact IST date for card headers (`"2026-07-14"` → `"14 Jul"`) so a
+/// past-day backfill / forced-run card is distinguishable from today's at
+/// a glance (G3, fix round 2 — the documented `TICKVAULT_SCOREBOARD_DATE`
+/// / `TICKVAULT_TF_VERIFY_DATE` triage flows produce past-day cards that
+/// previously rendered date-less). Fail-soft: an unparsable date renders
+/// verbatim — never dropped, never fabricated.
+fn render_compact_date_ist(date: &str) -> String {
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let mut parts = date.splitn(3, '-');
+    let (Some(_year), Some(month), Some(day)) = (parts.next(), parts.next(), parts.next()) else {
+        return date.to_string();
+    };
+    let day_trimmed = day.trim_start_matches('0');
+    match month.parse::<usize>() {
+        Ok(m) if (1..=12).contains(&m) && !day_trimmed.is_empty() => {
+            format!("{day_trimmed} {}", MONTHS[m - 1])
+        }
+        _ => date.to_string(),
+    }
+}
+
 /// Compact per-leg label for the pulls segment: the digest leg display
 /// names ("spot candles" / "option chain" / "option contracts") shorten
 /// to one word so the two feed lines never wrap; an unknown future leg
@@ -1897,22 +1920,31 @@ fn compact_leg_label(leg: &str) -> &str {
 
 /// PER-LEG official-minute-candle pull segment for ONE feed (F3,
 /// 2026-07-15 fix round): renders each MEASURED leg compactly —
-/// `pulls spot 735/735, chain 733/735 ✅` — with one overall mark and
-/// the never-recovered note. Legs whose pull counts carry the `-1`
-/// sentinel render NOTHING on the card (the operator's 2026-07-15
-/// escalation demanded suppressing unmeasured lines on the phone);
-/// `None` when NO leg for the feed carries measured counts.
+/// `pulls spot 735/735 (1.8s), chain 733/735 (2.1s) ✅` — with one
+/// overall mark and the never-recovered note. The bracketed figure is
+/// the leg's worst-1% (p99) seconds-after-close pull delay (G7, fix
+/// round 2 — restores the operator's Quote-2 "how many seconds
+/// precisely" answer on the card in ONE compact figure per leg). Legs
+/// on the documented latency-only fallback source (counts `-1`,
+/// latency MEASURED — the `spot_1m_rest` forensics-writer-outage /
+/// pre-2026-07-14 arm) render count-less as `spot (1.8s)` (G6 — never
+/// dropped, never logged "not measured"). Legs with NOTHING measured
+/// render NOTHING on the card (the operator's 2026-07-15 escalation
+/// demanded suppressing unmeasured lines on the phone); `None` when no
+/// leg for the feed carries any measurement.
 ///
 /// RULE-CONTRACT TENSION, recorded deliberately (see the plan file's
 /// Observability section): `dual-feed-scoreboard-error-codes.md` §2b
 /// mandates the four canonical feed/leg pairs ALWAYS render, with an
-/// absent source reading "not measured yet". This card intentionally
-/// deviates per the operator's direct 2026-07-15 cleanliness escalation
-/// — the honest not-measured signal moves to the day's LOGS
-/// (`feed_scoreboard_boot::build_rest_leg_score_lines` emits one
-/// `info!` per unmeasured canonical pair) pending the rule-file
-/// supersession the operator must land. Rule files are not editable in
-/// this PR.
+/// absent source reading "not measured yet" — and, with
+/// `rest-1m-pipeline-error-codes.md` §3, a per-leg p50/p99/max delay
+/// digest. This card intentionally deviates per the operator's direct
+/// 2026-07-15 cleanliness escalation — unmeasured pairs move to the
+/// day's LOGS (`feed_scoreboard_boot::log_rest_leg_measurement_gaps`,
+/// fired from the aggregation path on EVERY run) and the delay digest folds to
+/// the ONE p99 figure above — PENDING the rule-file supersession the
+/// operator must land with a dated quote. Rule files are not editable
+/// in this PR.
 fn render_pulls_per_leg(rest_legs: &[RestLegScoreLine], feed: &str) -> Option<String> {
     let mut parts: Vec<String> = Vec::new();
     let mut gaps = 0i64;
@@ -1921,16 +1953,24 @@ fn render_pulls_per_leg(rest_legs: &[RestLegScoreLine], feed: &str) -> Option<St
         if !l.feed.eq_ignore_ascii_case(feed) {
             continue;
         }
+        // p99 seconds-after-close, rendered only when genuinely measured
+        // (samples > 0 guards a zero-sample day from fabricating "0.0s").
+        let p99 = (l.close_p99_ms >= 0 && l.close_samples > 0)
+            .then(|| render_compact_secs(l.close_p99_ms));
         if l.ok_fetches >= 0 {
             let total = l.ok_fetches.saturating_add(l.failed_fetches.max(0));
-            parts.push(format!(
-                "{} {}/{total}",
-                compact_leg_label(&l.leg),
-                l.ok_fetches
-            ));
+            let counts = format!("{} {}/{total}", compact_leg_label(&l.leg), l.ok_fetches);
+            parts.push(match p99 {
+                Some(secs) => format!("{counts} ({secs})"),
+                None => counts,
+            });
             if l.ok_fetches != total {
                 all_clean = false;
             }
+        } else if let Some(secs) = p99 {
+            // Latency-only fallback leg (G6): the delay WAS measured —
+            // render it count-less instead of dropping the measurement.
+            parts.push(format!("{} ({secs})", compact_leg_label(&l.leg)));
         }
         if l.named_gaps > 0 {
             gaps = gaps.saturating_add(l.named_gaps);
@@ -2787,9 +2827,15 @@ impl NotificationEvent {
                     } else {
                         String::new()
                     };
+                    // G3 (fix round 2): the one-liner ALWAYS carries the
+                    // compact verified date (the run's Dhan-side target
+                    // day — the run's identity date) so a forced
+                    // TICKVAULT_TF_VERIFY_DATE past-day backfill's PASS
+                    // card is distinguishable from today's daily check.
+                    let date = render_compact_date_ist(dhan_date_ist);
                     format!(
-                        "\u{2705} Timeframe check 3:40 PM — {candles} candles across \
-                         {instruments_fmt} instruments, all match.{tail_inline}"
+                        "\u{2705} Timeframe check 3:40 PM \u{b7} {date} — {candles} candles \
+                         across {instruments_fmt} instruments, all match.{tail_inline}"
                     )
                 } else if status_label == "no_data" {
                     format!(
@@ -3257,7 +3303,7 @@ impl NotificationEvent {
                 )
             }
             Self::DualFeedDailyScorecard {
-                trading_date_ist: _,
+                trading_date_ist,
                 dhan,
                 groww,
                 session_minutes: _,
@@ -3290,10 +3336,29 @@ impl NotificationEvent {
                     verdict_emoji
                 };
                 let early = if *early_run { " (early run)" } else { "" };
+                // G3 (fix round 2): the header ALWAYS carries the compact
+                // trading date — a past-day backfill/rerun card
+                // (TICKVAULT_SCOREBOARD_DATE) is otherwise
+                // indistinguishable from today's and claims "won today".
+                let date = render_compact_date_ist(trading_date_ist);
                 let mut lines: Vec<String> = Vec::new();
                 lines.push(format!(
-                    "{emoji} <b>Feed scorecard 3:45 PM</b> \u{2014} {verdict_sentence}{early}"
+                    "{emoji} <b>Feed scorecard 3:45 PM \u{b7} {date}</b> \u{2014} \
+                     {verdict_sentence}{early}"
                 ));
+                // G8 (fix round 2): a broken pull-record READ renders an
+                // explicit token on the feed lines (incl. the feed-off
+                // line) — never silently omitted; previously only the
+                // shared floor caveat fired, indistinguishable from
+                // "no pull data exists" on the (permanent) Dhan
+                // feed-off day.
+                let pulls_for = |name: &str| -> Option<String> {
+                    if *rest_legs_read_failed {
+                        Some("pulls: records unreadable \u{26a0}\u{fe0f}".to_string())
+                    } else {
+                        render_pulls_per_leg(rest_legs, name)
+                    }
+                };
                 let name_width = dhan.name.chars().count().max(groww.name.chars().count());
                 for (off, f) in [(dhan_feed_off, dhan), (groww_feed_off, groww)] {
                     if *off {
@@ -3307,16 +3372,12 @@ impl NotificationEvent {
                         // signal. Omitted only when there are genuinely no
                         // measured pull rows for the feed.
                         let mut off_line = format!("{}: OFF today (excluded from verdict)", f.name);
-                        if let Some(p) = render_pulls_per_leg(rest_legs, &f.name) {
+                        if let Some(p) = pulls_for(&f.name) {
                             off_line.push_str(&format!(" \u{b7} {p}"));
                         }
                         lines.push(off_line);
                     } else {
-                        lines.push(aligned_feed_line(
-                            f,
-                            name_width,
-                            render_pulls_per_leg(rest_legs, &f.name),
-                        ));
+                        lines.push(aligned_feed_line(f, name_width, pulls_for(&f.name)));
                     }
                 }
                 // Incidents line: rendered ONLY when any blame/stall/
@@ -9433,7 +9494,7 @@ mod tests {
         let first = msg.lines().next().unwrap_or_default();
         assert_eq!(
             first,
-            "\u{1f3c6} <b>Feed scorecard 3:45 PM</b> \u{2014} Groww won today \
+            "\u{1f3c6} <b>Feed scorecard 3:45 PM \u{b7} 10 Jul</b> \u{2014} Groww won today \
                  (63 vs 14 solo minutes).",
             "rung-1 verdict-first line wrong: {msg}"
         );
@@ -9663,7 +9724,7 @@ mod tests {
         let first = msg.lines().next().unwrap_or_default();
         assert_eq!(
             first,
-            "\u{1f4ca} <b>Feed scorecard 3:45 PM</b> \u{2014} Dhan-only day."
+            "\u{1f4ca} <b>Feed scorecard 3:45 PM \u{b7} 10 Jul</b> \u{2014} Dhan-only day."
         );
         assert!(
             msg.contains("Groww: OFF today (excluded from verdict)"),
@@ -9839,6 +9900,172 @@ mod tests {
         // An empty rest_legs vec omits the pulls segment entirely.
         let msg = scorecard(score_line("Dhan"), score_line("Groww")).to_message();
         assert!(!msg.contains("pulls"), "{msg}");
+    }
+
+    #[test]
+    fn test_render_compact_date_ist_shapes() {
+        // G3 (fix round 2): compact card date — leading zero stripped,
+        // month name plain English, unparsable input rendered verbatim
+        // (fail-soft, never dropped).
+        assert_eq!(render_compact_date_ist("2026-07-14"), "14 Jul");
+        assert_eq!(render_compact_date_ist("2026-01-07"), "7 Jan");
+        assert_eq!(render_compact_date_ist("2026-12-31"), "31 Dec");
+        assert_eq!(render_compact_date_ist("garbage"), "garbage");
+        assert_eq!(render_compact_date_ist("2026-13-01"), "2026-13-01");
+        assert_eq!(render_compact_date_ist(""), "");
+    }
+
+    #[test]
+    fn test_dual_feed_scorecard_pulls_carry_p99_latency() {
+        // G7 (fix round 2): the pulls segment folds the measured worst-1%
+        // seconds-after-close delay into ONE compact bracketed figure per
+        // leg — the operator's Quote-2 latency answer back on the card.
+        let rest_legs = vec![
+            RestLegScoreLine {
+                ok_fetches: 735,
+                failed_fetches: 0,
+                close_p99_ms: 1_800,
+                close_samples: 730,
+                ..rest_line("Dhan", "spot candles")
+            },
+            RestLegScoreLine {
+                ok_fetches: 733,
+                failed_fetches: 2,
+                close_p99_ms: 2_100,
+                close_samples: 733,
+                ..rest_line("Dhan", "option chain")
+            },
+        ];
+        let ev = NotificationEvent::DualFeedDailyScorecard {
+            trading_date_ist: "2026-07-14".to_string(),
+            dhan: score_line("Dhan"),
+            groww: score_line("Groww"),
+            session_minutes: 375,
+            partial_coverage: false,
+            degraded: false,
+            early_run: false,
+            restart_partial: false,
+            dhan_feed_off: false,
+            groww_feed_off: false,
+            rest_legs,
+            rest_legs_read_failed: false,
+        };
+        let msg = ev.to_message();
+        assert!(
+            msg.contains("pulls spot 735/735 (1.8s), chain 733/735 (2.1s)"),
+            "pulls segment must carry per-leg p99 delay: {msg}"
+        );
+        // Zero-sample legs never fabricate a "0.0s" delay figure.
+        let rest_legs = vec![RestLegScoreLine {
+            ok_fetches: 735,
+            failed_fetches: 0,
+            close_p99_ms: 0,
+            close_samples: 0,
+            ..rest_line("Dhan", "spot candles")
+        }];
+        let ev = NotificationEvent::DualFeedDailyScorecard {
+            trading_date_ist: "2026-07-14".to_string(),
+            dhan: score_line("Dhan"),
+            groww: score_line("Groww"),
+            session_minutes: 375,
+            partial_coverage: false,
+            degraded: false,
+            early_run: false,
+            restart_partial: false,
+            dhan_feed_off: false,
+            groww_feed_off: false,
+            rest_legs,
+            rest_legs_read_failed: false,
+        };
+        let msg = ev.to_message();
+        assert!(
+            msg.contains("pulls spot 735/735 \u{2705}"),
+            "zero-sample leg must render counts without a delay figure: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_dual_feed_scorecard_latency_only_leg_renders_countless() {
+        // G6 (fix round 2): the documented spot_1m_rest latency-only
+        // fallback (counts -1, latency MEASURED — the forensics-writer
+        // outage / pre-2026-07-14 arm) renders a compact count-less
+        // segment — previously the measurement vanished from the card.
+        let rest_legs = vec![RestLegScoreLine {
+            close_p50_ms: 1_100,
+            close_p99_ms: 1_800,
+            close_max_ms: 5_000,
+            close_samples: 372,
+            ..rest_line("Dhan", "spot candles")
+        }];
+        let ev = NotificationEvent::DualFeedDailyScorecard {
+            trading_date_ist: "2026-07-14".to_string(),
+            dhan: score_line("Dhan"),
+            groww: score_line("Groww"),
+            session_minutes: 375,
+            partial_coverage: false,
+            degraded: false,
+            early_run: false,
+            restart_partial: false,
+            dhan_feed_off: false,
+            groww_feed_off: false,
+            rest_legs,
+            rest_legs_read_failed: false,
+        };
+        let msg = ev.to_message();
+        assert!(
+            msg.contains("pulls spot (1.8s)"),
+            "latency-only leg must render count-less, never vanish: {msg}"
+        );
+        // All-sentinel legs (nothing measured) still render nothing —
+        // the honest suppress-on-phone arm is unchanged.
+        let msg = scorecard(score_line("Dhan"), score_line("Groww")).to_message();
+        assert!(!msg.contains("pulls"), "{msg}");
+    }
+
+    #[test]
+    fn test_dual_feed_scorecard_read_failed_renders_unreadable_token() {
+        // G8 (fix round 2): a broken pull-record READ is an explicit
+        // per-feed token — distinguishable on the phone from "no pull
+        // data exists", including on the (permanent prod) feed-off line.
+        let mut d = score_line("Dhan");
+        d.ticks = 0;
+        let ev = NotificationEvent::DualFeedDailyScorecard {
+            trading_date_ist: "2026-07-14".to_string(),
+            dhan: d,
+            groww: score_line("Groww"),
+            session_minutes: 375,
+            partial_coverage: false,
+            degraded: false,
+            early_run: false,
+            restart_partial: false,
+            dhan_feed_off: true,
+            groww_feed_off: false,
+            rest_legs: vec![],
+            rest_legs_read_failed: true,
+        };
+        let msg = ev.to_message();
+        assert!(
+            msg.contains(
+                "Dhan: OFF today (excluded from verdict) \u{b7} pulls: records \
+                 unreadable \u{26a0}\u{fe0f}"
+            ),
+            "OFF line must carry the unreadable token on a read-failed day: {msg}"
+        );
+        let groww_line = msg
+            .lines()
+            .find(|l| l.contains("<code>Groww"))
+            .unwrap_or_default();
+        assert!(
+            groww_line.contains("pulls: records unreadable \u{26a0}\u{fe0f}"),
+            "the measured feed line must carry the unreadable token too: {msg}"
+        );
+        // The shared floor caveat still rides along (read-failed is a
+        // caveat class), and the line budget holds.
+        assert!(
+            msg.contains("Counts are a floor"),
+            "read-failed keeps the floor caveat: {msg}"
+        );
+        assert!(msg.lines().count() <= 6, "{msg}");
     }
 
     #[test]

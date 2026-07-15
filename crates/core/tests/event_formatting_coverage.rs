@@ -461,7 +461,10 @@ fn test_tf_consistency_summary_message_variants() {
         m.starts_with('\u{2705}'),
         "pass leads with the OK emoji: {m}"
     );
-    assert!(m.contains("Timeframe check 3:40 PM"), "{m}");
+    // G3 (fix round 2): the one-liner carries the compact verified date
+    // (the run's Dhan-side target day) so a forced past-day backfill's
+    // PASS card is distinguishable from today's daily check.
+    assert!(m.contains("Timeframe check 3:40 PM \u{b7} 13 Jul"), "{m}");
     assert!(m.contains("88,311 candles"), "{m}");
     assert!(m.contains("all match"), "{m}");
     assert_eq!(m.lines().count(), 1, "pass body is exactly one line: {m}");
