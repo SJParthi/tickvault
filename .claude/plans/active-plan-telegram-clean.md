@@ -80,6 +80,20 @@ on `episode_key` (String-payload variants) → the build-failing
 `dhat_telegram_dispatcher` test catches it. A dropped `notify` before the
 marker write leaves the marker unwritten → re-delivery, never a silent skip.
 
+**F5 honest residual (fix round 1, 2026-07-15 — timeboxed decision):** the
+daily marker records notify() DISPATCH, not DELIVERY — `notify()` is
+spawn-and-return and service.rs exposes no completion signal usable without
+touching its internals (checked: `shutdown_flush` is teardown-only,
+`initialize_strict` boot-only). A Telegram-TRANSPORT failure at 15:40 on a
+PASS day therefore writes the marker anyway, and every same-day restart
+skips — the operator gets NO card that day. Bounded by: (a) the TELEGRAM-01
+drop counter + the `tv-telegram-drops` CloudWatch alarm page on the
+transport failure itself; (b) the catch-up skip path logs one `info!`
+naming the honored marker date, so a suppressed day is diagnosable from
+logs; (c) the next trading day self-heals (fresh date, fresh marker).
+Gating the marker on a real delivery signal is a service.rs change —
+deliberately deferred, not smuggled into this fix round.
+
 ## Test Plan
 
 `cargo test -p tickvault-core -p tickvault-app`; `cargo test -p

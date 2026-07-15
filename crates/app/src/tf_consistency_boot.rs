@@ -2012,10 +2012,12 @@ pub fn spawn_tf_consistency_tasks(
                         today_ist,
                     ) {
                         info!(
+                            marker_date = %today_ist,
                             "tf_consistency: today's summary was already delivered — \
-                             skipping the catch-up re-run (remove the day's marker \
-                             under data/state/daily/ or set TICKVAULT_TF_VERIFY_NOW=1 \
-                             to force)"
+                             honoring the {today_ist} delivery marker and skipping \
+                             the catch-up re-run (remove the day's marker under \
+                             data/state/daily/ or set TICKVAULT_TF_VERIFY_NOW=1 to \
+                             force)"
                         );
                         return Ok(None);
                     }
@@ -2081,6 +2083,21 @@ pub fn spawn_tf_consistency_tasks(
                 // Terminal-quality outcomes ONLY (pass / no_data) mark the
                 // day delivered; mismatch/degraded/blind leave the marker
                 // unwritten so a restart re-runs + re-pages (Rule 11).
+                //
+                // F5 HONEST RESIDUAL (fix round 1, 2026-07-15 — timeboxed
+                // decision): `notify()` is spawn-and-return with NO public
+                // completion signal, so this marker records DISPATCH, not
+                // DELIVERY. A Telegram-transport failure on a PASS day
+                // still writes the marker, and every same-day restart then
+                // skips — the operator gets no card until the next trading
+                // day (self-heals). Bounded by: the TELEGRAM-01 drop
+                // counter + the tv-telegram-drops CloudWatch alarm cover
+                // transport-failure visibility, and the catch-up skip line
+                // above names the honored marker date so a suppressed day
+                // is diagnosable from logs. Gating the marker on delivery
+                // needs a service.rs completion signal — deliberately not
+                // smuggled into this fix round (see the plan file's
+                // Failure Modes entry).
                 if (status_label == "pass" || status_label == "no_data")
                     && let Some(d) = marker_date
                 {
