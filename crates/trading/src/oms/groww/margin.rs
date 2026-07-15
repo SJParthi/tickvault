@@ -82,8 +82,10 @@
 //!   2026-07-15). Every emit site below carries the REAL
 //!   `code = ErrorCode::GrowwMargNN...code_str()` field (the WIRING-TODO
 //!   flip was executed at the post-stubs rebase).
-//! - **Config** — the `[groww_margin_gate]` section is OPERATOR-HELD with
-//!   the stubs PR. Until it lands, the module-local
+//! - **Config** — the `[groww_margin_gate]` section stays OPERATOR-HELD
+//!   and lands with the area's FUTURE config PR (the stubs PR #1587
+//!   carried NO config section — the runbook header records the same).
+//!   Until that config PR lands, the module-local
 //!   [`GrowwMarginGateParams`] (same 9 knobs, same bounds, same fail-safe
 //!   disabled defaults) is the ONLY config surface; the module compiles
 //!   and defaults OFF with no config section anywhere.
@@ -169,8 +171,8 @@ const IST_OFFSET_SECS_U64: u64 = IST_UTC_OFFSET_SECONDS_I64 as u64;
 // ---------------------------------------------------------------------------
 
 /// 🟢 GROWW margin gate tuning knobs — the module-local mirror of the
-/// operator-held `[groww_margin_gate]` config section (which rides the
-/// central contract-stubs PR; see the module header). Same 9 knobs, same
+/// operator-held `[groww_margin_gate]` config section (which lands with
+/// the area's future config PR; see the module header). Same 9 knobs, same
 /// documented bounds, same fail-safe defaults: `Default` is fully
 /// DISABLED (`enabled = false`, `enforce = false`) with the safe tuning
 /// values, so the module is dark until the deferred wiring constructs an
@@ -1751,6 +1753,59 @@ mod tests {
 
     use super::*;
     use crate::oms::types::OmsError;
+
+    // -- source-scan ratchets -------------------------------------------------
+
+    /// Ratchet (hostile-review 2026-07-15, medium): the 7 flipped
+    /// `code = ErrorCode::GrowwMarg*` emit-site fields are pinned by NO
+    /// other build-failing gate — the tag guard fires only when the
+    /// `error!` MESSAGE text carries a literal tracked code string (none
+    /// of the 7 messages does), and the crossref test checks rule-file
+    /// mentions only. The structured `code` field is these log-sink-only
+    /// codes' ENTIRE operator surface (errors.jsonl grouping,
+    /// find_runbook_for_code, the triage YAML `code:` matchers), so this
+    /// production-region source scan (the margin_gate_off_guard.rs house
+    /// pattern: split at the first COLUMN-0 `#[cfg(test)]` line so this
+    /// test's own assertion literals are never scanned — the false-OK
+    /// class) fails the build if any field is silently removed. Exact
+    /// counts per the house ratchet convention: 4x GROWW-MARG-01,
+    /// 2x GROWW-MARG-04, 1x GROWW-MARG-03.
+    #[test]
+    fn test_ratchet_margin_emit_sites_carry_shared_errcode_fields() {
+        let src = include_str!("margin.rs");
+        // Production region = everything ABOVE the first column-0
+        // `#[cfg(test)]` (the tests-module attribute); `\n`-anchored so an
+        // indented mid-impl attribute could never truncate the scan early.
+        let production = src.split("\n#[cfg(test)]").next().unwrap_or_default();
+        assert!(
+            production.len() < src.len(),
+            "column-0 #[cfg(test)] split marker not found — the scan would \
+             cover the test region and pass vacuously"
+        );
+
+        let count = |needle: &str| production.matches(needle).count();
+
+        assert_eq!(
+            count("code = ErrorCode::GrowwMarg01FetchDegraded.code_str()"),
+            4,
+            "GROWW-MARG-01 emit sites must carry exactly 4 shared-errcode \
+             `code =` fields (per-poll degrade x3 + escalation edge) — a \
+             count drift means a field was removed (regression) or a new \
+             emit site landed (update this ratchet + the runbook together)"
+        );
+        assert_eq!(
+            count("code = ErrorCode::GrowwMarg04EntryRejectedInsufficient.code_str()"),
+            2,
+            "GROWW-MARG-04 emit sites must carry exactly 2 shared-errcode \
+             `code =` fields (enforce-mode rejection + stage=ledger_full)"
+        );
+        assert_eq!(
+            count("code = ErrorCode::GrowwMarg03SnapshotStaleGateClosed.code_str()"),
+            1,
+            "GROWW-MARG-03 emit site must carry exactly 1 shared-errcode \
+             `code =` field (the stale-gate-closed episode edge)"
+        );
+    }
 
     // -- test doubles ---------------------------------------------------------
 
