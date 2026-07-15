@@ -4,6 +4,8 @@
 >
 > **⚠ FURTHER SUPERSEDED → r8g.large 2026-06-30 (operator Quote 7 in [`daily-universe-scope-expansion-2026-05-27.md`](./daily-universe-scope-expansion-2026-05-27.md) §7):** instance upgraded m8g.large → **r8g.large** (Graviton4, 2 vCPU / 16 GiB), bill → ~₹2,919/mo incl GST (270 hrs, 30 GB EBS, +EIP kept). The current effective instance lock lives in that file's §7.
 >
+> **⚠ RE-SUPERSEDED → t4g.medium 2026-07-15 (operator Quote 8 in [`daily-universe-scope-expansion-2026-05-27.md`](./daily-universe-scope-expansion-2026-05-27.md) §7):** instance DOWNSIZED r8g.large → **t4g.medium** (Graviton2, 2 vCPU / 4 GiB), QuestDB QDB_MEM_LIMIT 4g → 1g. INTERIM bill → ~₹1,471/mo incl GST at 270 hrs with the live 50 GB root (gp3 cannot shrink; the 20 GB fresh-volume recreate — an executor pre-stage, NOT operator-quoted — drops it to ~₹1,197/mo; ~₹986/mo requires BOTH the ~176-hr auto-schedule basis AND the post-recreate 20 GB volume — on the live 50 GB root the ~176-hr figure is ~₹1,260, and ~₹986 is never the 270-hr one). EIP kept. The current effective instance lock lives in that file's §7. This file's original t4g.medium tables below remain 2026-05-18 historical audit (different universe/stack — do not reuse the ₹1,022 figure).
+>
 > **Authority:** Parthiban (architect). Non-negotiable.
 > **Ground truth:** `docs/architecture/aws-indices-only-locked-architecture.md` §5 (instance lock 2026-05-18) and the 2026-05-20 CloudWatch-only decision below.
 > **Scope:** Any file touching AWS deployment, infrastructure, Docker config, or cost-impacting changes.
