@@ -5639,8 +5639,10 @@ mod tests {
     /// zero-429 spot floor (operator spot-concurrency ladder 2026-07-15).
     #[test]
     fn test_cadence_config_validate_rejects_bad_spot_window_cap() {
-        let mut cfg = CadenceConfig::default();
-        cfg.spot_window_cap = 0;
+        let mut cfg = CadenceConfig {
+            spot_window_cap: 0,
+            ..CadenceConfig::default()
+        };
         let err = cfg.validate().unwrap_err();
         assert!(
             err.to_string().contains("spot_window_cap"),
@@ -5681,8 +5683,10 @@ mod tests {
         let d = CadenceConfig::default();
         assert!(d.validate().is_ok());
         // A cutoff at/below the choice-3 verdict is degenerate.
-        let mut cfg = CadenceConfig::default();
-        cfg.groww_lane_cutoff_ms = 3_800;
+        let mut cfg = CadenceConfig {
+            groww_lane_cutoff_ms: 3_800,
+            ..CadenceConfig::default()
+        };
         let err = cfg.validate().unwrap_err();
         assert!(
             err.to_string().contains("worst fallback shape"),
@@ -5709,9 +5713,11 @@ mod tests {
     /// `chain_min_spacing_ms` below the 3000ms floor itself.
     #[test]
     fn test_cadence_config_validate_rejects_sub_3s_chain_gaps() {
-        let mut cfg = CadenceConfig::default();
         // :55 / :57 — a 2s gap undercuts the 3s rule.
-        cfg.dhan_chain_offsets_ms = vec![-5_000, -3_000, 2_000];
+        let mut cfg = CadenceConfig {
+            dhan_chain_offsets_ms: vec![-5_000, -3_000, 2_000],
+            ..CadenceConfig::default()
+        };
         let err = cfg.validate().unwrap_err();
         assert!(
             err.to_string().contains("dhan_chain_offsets_ms"),
@@ -5750,8 +5756,10 @@ mod tests {
     #[test]
     fn test_cadence_config_validate_rejects_out_of_range_spot_anchor_and_expiry_knobs() {
         // Negative spot anchor (pre-close target) is refused.
-        let mut cfg = CadenceConfig::default();
-        cfg.dhan_spot_start_offset_ms = -1;
+        let mut cfg = CadenceConfig {
+            dhan_spot_start_offset_ms: -1,
+            ..CadenceConfig::default()
+        };
         let err = cfg.validate().unwrap_err();
         assert!(
             err.to_string().contains("dhan_spot_start_offset_ms"),

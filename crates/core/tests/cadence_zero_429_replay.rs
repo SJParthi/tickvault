@@ -14,11 +14,16 @@
 //!   rolling 1000ms window — across every concurrency-ladder step,
 //!   step transition, anchor rung, retry and restart (the 2026-07-15
 //!   rolling-window gate change; Dhan hard cap 5/sec)
-//! - NEVER more than 5 TOTAL Dhan fires (chain + spot COMBINED) in ANY
-//!   rolling 1000ms window (verifier L1, 2026-07-15: the combined
-//!   per-second budget — pre-L1 the spot window and the chain gates
-//!   were independent and their SUM could hit 5-6/sec, zero headroom
-//!   vs Dhan's 5/sec)
+//! - NEVER more than 5 TOTAL Dhan fires (chain + spot + EXPIRY-LIST
+//!   COMBINED) in ANY rolling 1000ms window (verifier L1, 2026-07-15:
+//!   the combined per-second budget — pre-L1 the spot window and the
+//!   chain gates were independent and their SUM could hit 5-6/sec,
+//!   zero headroom vs Dhan's 5/sec; R4 2026-07-15: the
+//!   unresolved-expiry scenario arm drives `try_acquire_expiry` through
+//!   the SAME ledger, so the combined assertion is honest — and the
+//!   mid-minute (:30) wave anchor means expiry waves NEVER collide with
+//!   the burst window: zero nominal deferrals hold with waves active,
+//!   and every wave fires at its anchor with zero deferral)
 //! - zero gate denials on nominal slots (on-time dispatch)
 //! - exactly 1 decision per (lane, cycle) — the latch admits every fresh
 //!   pair and refuses every repeat
@@ -60,7 +65,8 @@ use tickvault_core::cadence::ladder::{
 };
 use tickvault_core::cadence::runner::{CycleAction, GrowwWaveLeg, build_cycle_events};
 use tickvault_core::cadence::schedule::{
-    CADENCE_RETRY_LATENCY_ALLOWANCE_MS, CycleSlots, build_cycle_slots, next_joinable_boundary,
+    CADENCE_RETRY_LATENCY_ALLOWANCE_MS, CycleSlots, build_cycle_slots, next_expiry_wave_instant_ms,
+    next_joinable_boundary,
 };
 use tickvault_core::pipeline::chain_snapshot::{
     ChainMoneynessSnapshot, ChainUnderlying, SnapshotRow, load_chain_snapshot,
@@ -166,8 +172,13 @@ struct FireLedger {
     per_underlying: [Vec<i64>; ChainUnderlying::COUNT],
     chain_global: Vec<i64>,
     spot: Vec<i64>,
-    /// EVERY Dhan fire (chain AND spot), in acquisition order — the
-    /// COMBINED per-second budget ledger (verifier L1, 2026-07-15).
+    /// Dhan EXPIRY-LIST fires (the unresolved-expiry scenario arm, R4
+    /// 2026-07-15) — asserted against the 1-per-rolling-second expiry
+    /// spacing.
+    expiry: Vec<i64>,
+    /// EVERY Dhan fire (chain, spot AND expiry-list), in acquisition
+    /// order — the COMBINED per-second budget ledger (verifier L1 +
+    /// R4, 2026-07-15).
     combined: Vec<i64>,
 }
 
@@ -187,17 +198,25 @@ impl FireLedger {
             spot_window_cap,
             &format!("{case}: spot"),
         );
-        // The COMBINED budget (verifier L1, 2026-07-15): never more than
-        // 5 TOTAL Dhan fires — chain + spot, across retries, ladder
-        // steps, rungs and restarts — in ANY rolling 1000ms window. The
-        // pre-L1 gates asserted spot and chain floors SEPARATELY, so
-        // their SUM (a chain fire + a full spot group in one window) was
-        // never caught.
+        // Expiry-list fires: ≤1 per rolling second (the L2 spacing —
+        // asserted whenever the unresolved-expiry arm is active, R4).
+        assert_sorted_deltas(
+            &self.expiry,
+            CADENCE_SPOT_WINDOW_MS,
+            &format!("{case}: expiry-fire spacing"),
+        );
+        // The COMBINED budget (verifier L1 + R4, 2026-07-15): never more
+        // than 5 TOTAL Dhan fires — chain + spot + expiry-list, across
+        // retries, ladder steps, rungs, restarts AND expiry retry waves
+        // — in ANY rolling 1000ms window. The pre-L1 gates asserted spot
+        // and chain floors SEPARATELY, so their SUM (a chain fire + a
+        // full spot group in one window) was never caught; pre-R4 the
+        // combined ledger never saw an expiry fire at all.
         assert_window_cap(
             &self.combined,
             CADENCE_SPOT_WINDOW_MS,
             CADENCE_SPOT_WINDOW_CAP_CEILING,
-            &format!("{case}: COMBINED chain+spot"),
+            &format!("{case}: COMBINED chain+spot+expiry"),
         );
     }
 }
@@ -307,6 +326,34 @@ fn sim_gated_spot_fire(
                 if nominal && !*cycle_dispatched_late {
                     *nominal_denials += 1;
                 }
+                let wall_at = clock.wall_ms + (at_mono - clock.mono());
+                clock.advance_to_wall(wall_at);
+            }
+        }
+    }
+}
+
+/// One gated Dhan EXPIRY-LIST fire (the unresolved-expiry scenario arm,
+/// R4 2026-07-15): the resolution loop's in-session retry wave, driven
+/// through the SAME combined ledger the chain/spot fires record into —
+/// making the combined-cap assertion honest. Returns the acquired wall
+/// instant (the caller asserts zero deferral: the mid-minute anchor
+/// keeps waves a full ≥15s clear of any burst-window fire).
+fn sim_gated_expiry_fire(
+    clock: &mut SimClock,
+    gates: &DhanGates,
+    ledger: &mut FireLedger,
+    target_wall: i64,
+) -> i64 {
+    clock.advance_to_wall(target_wall);
+    loop {
+        match gates.try_acquire_expiry(clock.mono()) {
+            GateVerdict::Acquired => {
+                ledger.expiry.push(clock.wall_ms);
+                ledger.combined.push(clock.wall_ms);
+                return clock.wall_ms;
+            }
+            GateVerdict::RetryAtMs(at_mono) => {
                 let wall_at = clock.wall_ms + (at_mono - clock.mono());
                 clock.advance_to_wall(wall_at);
             }
@@ -577,6 +624,7 @@ proptest! {
         boot_skew in -2_000_i64..2_000,
         fail_bias_pct in 0_u64..60,
         restart_every in 0_usize..20,
+        expiry_unresolved in any::<bool>(),
     ) {
         let cfg = CadenceConfig::default();
         let mut rng = SimRng(seed);
@@ -715,6 +763,28 @@ proptest! {
             cycles += 1;
             // Move past the cycle tail before the next boundary pick.
             clock.advance_to_wall(slots.dhan_cutoff_ms);
+            // The unresolved-expiry scenario arm (R4, 2026-07-15): one
+            // resolution retry wave per minute at the REAL pure fn's
+            // mid-minute anchor, driven through the SAME gates + ledger.
+            // With the R1 anchor the wave can never collide with a burst
+            // fire: it must acquire at its anchor with ZERO deferral (and
+            // the zero-nominal-denial assert below now holds WITH expiry
+            // waves active).
+            if expiry_unresolved {
+                let wave_at = next_expiry_wave_instant_ms(clock.wall_ms, 60_000, true);
+                prop_assert_eq!(
+                    wave_at % 60_000,
+                    30_000,
+                    "in-session expiry waves anchor at :30"
+                );
+                let fired_at =
+                    sim_gated_expiry_fire(&mut clock, &gates, &mut ledger, wave_at);
+                prop_assert_eq!(
+                    fired_at,
+                    wave_at,
+                    "a mid-minute expiry wave must never defer (no burst collision)"
+                );
+            }
         }
 
         // MINIMUM-ACTIVITY floor (Rule 11 — the proof must never pass
@@ -733,11 +803,22 @@ proptest! {
             "spot fires below the 4-singles-per-cycle floor: {}",
             ledger.spot.len()
         );
+        // The expiry arm is never vacuous: active ⇒ one wave per cycle
+        // reached the ledger; inactive ⇒ none.
+        if expiry_unresolved {
+            prop_assert_eq!(ledger.expiry.len(), 64, "one expiry wave per cycle");
+        } else {
+            prop_assert_eq!(ledger.expiry.len(), 0);
+        }
         // THE floors: per-UL ≥3000, GLOBAL ≥3000, spot ≤ window cap per
         // rolling 1000ms — including retries, ladder steps/transitions,
         // rungs and restarts, in the broker wall domain.
         ledger.assert_floors(cfg.chain_min_spacing_ms, cfg.spot_window_cap, "replay");
-        prop_assert_eq!(nominal_denials, 0, "gate denials on nominal slots");
+        prop_assert_eq!(
+            nominal_denials,
+            0,
+            "gate denials on nominal slots (must hold even with expiry waves active)"
+        );
         // The concurrency ladder starts at the cap's structural floor
         // (step 0 for the default cap 4) — the full-parallel grouping is
         // ALWAYS exercised, never a vacuous degraded-only run.

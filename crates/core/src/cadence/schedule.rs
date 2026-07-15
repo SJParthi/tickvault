@@ -65,6 +65,54 @@ const MS_PER_SEC: i64 = 1_000;
 /// Seconds per cadence cycle (one exchange minute).
 const SECS_PER_CYCLE: u32 = 60;
 
+/// R1 (2026-07-15): the mid-minute anchor for IN-SESSION expiry retry
+/// waves — seconds-of-minute 30, maximally far from BOTH the Dhan
+/// :55–:05 burst region (chain pre-fires T−5000/T−2000, post-fire
+/// T+2000, spot group T+3000, in-cycle retry grid ≤ the T+15s cutoff)
+/// and the Groww :00–:03 waves. A free-running 60s retry interval was
+/// near phase-locked to the minute: an expiry fire landing in the burst
+/// window + routine ≥1ms chain wake jitter put 6 Dhan fires in the spot
+/// group's rolling second, so the 4th NOMINAL spot deferred — a false
+/// `gate_deferred_nominal` should-never page EVERY minute of a vendor
+/// outage (the collision class is pinned at the gate level by
+/// `test_cadence_gate_expiry_fire_in_burst_window_defers_fourth_nominal_spot`).
+pub const CADENCE_EXPIRY_WAVE_MID_MINUTE_ANCHOR_MS: i64 = 30_000;
+
+/// The next expiry-retry-wave fire instant (ms-of-day) — pure
+/// sleep-to-instant math (R1, 2026-07-15). Outside the cycle-burst era
+/// (`anchor_mid_minute = false`: pre-market boot-phase waves,
+/// non-trading days, post-session) the wave keeps the plain configured
+/// cadence (`now + interval` — no cycle bursts exist to collide with).
+/// In the burst era it snaps FORWARD to the next
+/// [`CADENCE_EXPIRY_WAVE_MID_MINUTE_ANCHOR_MS`] (:30-of-minute) anchor:
+/// a configured interval slower than the per-minute anchor grid honors
+/// whole-minute head-room first (a 120s interval fires every second
+/// anchor), and the returned instant is always STRICTLY after `now`.
+/// The L2 expiry gate stays the backstop either way — this fn only
+/// moves the waves OUT of the burst window so the backstop never has
+/// to defer a nominal fire.
+#[must_use]
+// TEST-EXEMPT: covered by test_cadence_expiry_wave_anchor_mid_minute_band_never_burst_window (guard name-pattern mismatch).
+pub fn next_expiry_wave_instant_ms(
+    now_ms_of_day: i64,
+    interval_ms: i64,
+    anchor_mid_minute: bool,
+) -> i64 {
+    let interval = interval_ms.max(1);
+    if !anchor_mid_minute {
+        return now_ms_of_day.saturating_add(interval);
+    }
+    const MINUTE_MS: i64 = 60 * MS_PER_SEC;
+    // Whole-minute head beyond the per-minute anchor cadence: slower
+    // configured intervals SKIP anchors, they never fire between them.
+    let head = (interval - MINUTE_MS).max(0);
+    let earliest = now_ms_of_day.saturating_add(head);
+    // The first :30 anchor STRICTLY after `earliest`.
+    let k = (earliest - CADENCE_EXPIRY_WAVE_MID_MINUTE_ANCHOR_MS).div_euclid(MINUTE_MS) + 1;
+    k.saturating_mul(MINUTE_MS)
+        .saturating_add(CADENCE_EXPIRY_WAVE_MID_MINUTE_ANCHOR_MS)
+}
+
 /// The next cycle boundary at-or-after `now_secs_of_day` on the IST
 /// seconds-of-day domain — the SAME calculus as the app's
 /// `next_minute_close_fire` (boundaries are the exact minute marks
@@ -277,6 +325,48 @@ mod tests {
     /// Helper: ms-of-day for HH:MM:SS.mmm literals.
     fn ms(h: i64, m: i64, s: i64, milli: i64) -> i64 {
         ((h * 3600 + m * 60 + s) * 1_000) + milli
+    }
+
+    #[test]
+    fn test_cadence_expiry_wave_anchor_mid_minute_band_never_burst_window() {
+        // R1 (2026-07-15): every IN-SESSION expiry retry wave lands at
+        // seconds-of-minute 30 — inside the mid-minute band [20, 50],
+        // therefore NEVER inside the burst region (chain pre-fires from
+        // :55, Groww waves :00–:03, spot group :03, retry grid ≤ :15) —
+        // for arbitrary wake phases and configured intervals.
+        for interval in [1_i64, 5_000, 60_000, 90_000, 120_000, 300_000] {
+            let mut now = ms(9, 16, 0, 0);
+            while now < ms(9, 26, 0, 0) {
+                let at = next_expiry_wave_instant_ms(now, interval, true);
+                assert!(at > now, "the anchor is always strictly after now");
+                let secs_of_minute = (at % 60_000) / 1_000;
+                assert_eq!(
+                    secs_of_minute, 30,
+                    "in-session waves fire at :30 exactly (interval {interval}, now {now})"
+                );
+                assert!(
+                    (20..=50).contains(&secs_of_minute),
+                    "mid-minute band [20, 50] — never the burst window"
+                );
+                // A slower-than-per-minute interval is honored to within
+                // one anchor-grid minute (waves skip anchors, never fire
+                // between them).
+                assert!(at - now >= (interval - 60_000).max(0));
+                now += 777; // sweep every wake phase across the minute
+            }
+        }
+        // Two consecutive in-session waves at the default 60s interval
+        // are exactly one anchor (one minute) apart.
+        let first = next_expiry_wave_instant_ms(ms(10, 0, 30, 0), 60_000, true);
+        assert_eq!(first, ms(10, 1, 30, 0));
+        assert_eq!(
+            next_expiry_wave_instant_ms(first, 60_000, true),
+            ms(10, 2, 30, 0)
+        );
+        // Boot-phase / non-trading waves keep the plain configured
+        // cadence — no cycle bursts exist to collide with.
+        assert_eq!(next_expiry_wave_instant_ms(1_000, 60_000, false), 61_000);
+        assert_eq!(next_expiry_wave_instant_ms(1_000, 0, false), 1_001);
     }
 
     #[test]
