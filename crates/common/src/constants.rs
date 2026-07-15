@@ -1904,6 +1904,47 @@ const _: () = assert!(
     "CHAIN_1M per-request timeout must fit inside the per-underlying budget"
 );
 
+/// Hard wall-clock ceiling (secs after the minute close) past which a
+/// chain RETRY may no longer LAUNCH — the operator's ≤~15s decision-data
+/// window (2026-07-14 directive). Gates ONLY the retry pass; pass 1 is
+/// the unchanged concurrent fire (Dhan-documented: distinct underlyings
+/// concurrently; the 3s bound is per unique (underlying, expiry) key).
+pub const CHAIN_1M_DECISION_CEILING_SECS: u64 = 15;
+
+/// Per-underlying not-served threshold — pinned to the spot leg's value
+/// (and, transitively once #1537 merges, the Groww chain's).
+pub const CHAIN_1M_UNDERLYING_NOT_SERVED_THRESHOLD: u32 = 10;
+const _: () = assert!(
+    CHAIN_1M_UNDERLYING_NOT_SERVED_THRESHOLD == SPOT_1M_REST_SID_NOT_SERVED_THRESHOLD,
+    "one not-served threshold family across the REST legs"
+);
+
+// P1. A worst-case TIMED-OUT first attempt still leaves its retry
+// launchable inside the ceiling: 2.5s fallback + 10s request timeout
+// = 12.5s ≤ 15s (the 2.5s remainder is the modeled limiter-queue
+// headroom at 3 rps; at the 2 rps floor under a 429 storm the REAL-clock
+// gate may refuse — counted, never silent).
+const _: () = assert!(
+    CHAIN_1M_FALLBACK_DELAY_MS + CHAIN_1M_REQUEST_TIMEOUT_SECS * 1_000
+        <= CHAIN_1M_DECISION_CEILING_SECS * 1_000,
+    "a timed-out first attempt must leave the retry launchable inside the ceiling"
+);
+
+// P2. A ceiling-edge retry can never overrun the minute:
+// 15s launch + 20s per-underlying budget = 35s < 60s.
+const _: () = assert!(
+    (CHAIN_1M_DECISION_CEILING_SECS + CHAIN_1M_UNDERLYING_BUDGET_SECS) * 1_000 < 60_000,
+    "a ceiling-edge retry must not overrun the minute"
+);
+
+// P3. A FAST-FAIL first attempt's same-key ≥3s gap always leaves the
+// retry launchable: 3s gap < 15s − 2.5s fallback.
+const _: () = assert!(
+    CHAIN_1M_MIN_GAP_SECS * 1_000
+        < CHAIN_1M_DECISION_CEILING_SECS * 1_000 - CHAIN_1M_FALLBACK_DELAY_MS,
+    "the same-key retry gap must fit inside the decision ceiling"
+);
+
 // ---------------------------------------------------------------------------
 // Groww spot 1m REST leg (operator grant 2026-07-13 — PR-2 of the Groww
 // per-minute REST plan, `.claude/plans/active-plan-groww-rest-1m.md`;
@@ -2151,6 +2192,23 @@ pub const GROWW_CHAIN_1M_CONSECUTIVE_FAIL_PAGE_THRESHOLD: u32 = 3;
 /// to disabled-for-the-day (NEVER a guessed expiry).
 pub const GROWW_CHAIN_1M_MASTER_RETRY_BACKOFF_SECS: [u64; 2] = [3, 6];
 
+/// Consecutive counted not-served minutes for ONE underlying before the
+/// ONE edge-latched per-underlying `CHAIN-02 stage="underlying_not_served"`
+/// page fires (2026-07-14 — the NIFTY expiry-day vendor cutoff companion:
+/// Groww stopped serving the same-day-expiring NIFTY chain at 14:54 IST
+/// while BANKNIFTY + SENSEX kept working, and the ok==0 escalation edge
+/// paged nobody all afternoon). A minute COUNTS toward an underlying's
+/// streak only when that underlying's chain came back empty/failed while
+/// ≥1 OTHER underlying succeeded in the SAME minute — a global-outage
+/// minute (zero underlyings served) neither counts nor resets, so this
+/// detector distinguishes vendor-not-serving-this-underlying from a
+/// general outage (which the
+/// [`GROWW_CHAIN_1M_CONSECUTIVE_FAIL_PAGE_THRESHOLD`] edge owns — the two
+/// are mutually exclusive per minute). Re-armed only by that underlying's
+/// own recovery. Same value as the spot leg's
+/// [`SPOT_1M_REST_SID_NOT_SERVED_THRESHOLD`] (the pattern it mirrors).
+pub const GROWW_CHAIN_1M_UNDERLYING_NOT_SERVED_THRESHOLD: u32 = 10;
+
 const _: () = assert!(
     GROWW_CHAIN_1M_CONSECUTIVE_FAIL_PAGE_THRESHOLD == SPOT_1M_REST_CONSECUTIVE_FAIL_PAGE_THRESHOLD,
     "the Groww chain leg reuses the spot FailureEdge — thresholds must agree"
@@ -2311,28 +2369,12 @@ const _: () = assert!(
 /// For AWS instance lifecycle, use systemd timer or cron for restart.
 pub const APP_DAILY_RESET_TIME_IST: &str = "16:00:00";
 
-/// Wave-2-D (G19) — daily reset time for the `TickGapDetector`. Fires
-/// 5 minutes after market close so it cannot race the 15:30 close
-/// signal. The papaya `last_seen` map is cleared at this point so
-/// overnight silence does NOT register as a tick gap on next day's
-/// market open. Pinned constant; see
-/// `.claude/rules/project/disaster-recovery.md` Scenario 14
-/// (Overnight wake) for the operator-visible flow.
-pub const TICK_GAP_RESET_TIME_IST: &str = "15:35:00";
-
-/// Wave-2-D — short post-fire settle window for the daily tick-gap
-/// reset task. After firing `reset_daily()` at 15:35 IST, sleep this
-/// long before recomputing the next-fire delay so we cannot race the
-/// same boundary back into a near-zero sleep.
-pub const TICK_GAP_RESET_SETTLE_SECS: u64 = 60;
-
-/// Wave-2-D — bounded busy-loop avoidance for the daily tick-gap
-/// reset task. If the post-fire recomputed delay is still zero (e.g.
-/// the host clock is stuck), sleep this long before retrying so we
-/// don't burn CPU. One hour is short enough that the task self-heals
-/// within a single trading session if the clock recovers, and long
-/// enough that we don't spin on a stuck system.
-pub const TICK_GAP_RESET_BUSYLOOP_GUARD_SECS: u64 = 3600;
+// PR-C3 (2026-07-14): the Wave-2-D `TICK_GAP_RESET_*` constants (the
+// 15:35 IST daily-reset time + settle/busy-loop guards) were DELETED with
+// the tick-gap detector and its main.rs reset task (operator Q4-ii
+// 2026-07-13). The RISK-GAP-03 `TICK_GAP_ALERT/ERROR_THRESHOLD_SECS` +
+// `TICK_GAP_MIN_TICKS_BEFORE_ACTIVE` constants above are a DIFFERENT
+// component (`trading::risk::tick_gap_tracker`) and are KEPT.
 
 /// Number of 1-minute candles in the cross-verification window (09:15 to 15:29 = 375).
 ///
@@ -4436,6 +4478,38 @@ mod tests {
         assert_eq!(CHAIN_1M_MAX_BODY_BYTES, 8 * 1024 * 1024);
     }
 
+    /// 2026-07-14 chain-capture hardening: the retry decision ceiling +
+    /// the per-underlying not-served threshold, pinned alongside their
+    /// existing schedule partners (2500ms fallback / 10s request timeout /
+    /// 20s budget) so the P1–P3 const-assert proofs stay meaningful.
+    #[test]
+    fn test_chain_decision_ceiling_constants_pinned() {
+        assert_eq!(CHAIN_1M_DECISION_CEILING_SECS, 15);
+        assert_eq!(CHAIN_1M_UNDERLYING_NOT_SERVED_THRESHOLD, 10);
+        assert_eq!(
+            CHAIN_1M_UNDERLYING_NOT_SERVED_THRESHOLD,
+            SPOT_1M_REST_SID_NOT_SERVED_THRESHOLD
+        );
+        // The schedule partners the ceiling proofs are computed against.
+        assert_eq!(CHAIN_1M_FALLBACK_DELAY_MS, 2_500);
+        assert_eq!(CHAIN_1M_REQUEST_TIMEOUT_SECS, 10);
+        assert_eq!(CHAIN_1M_UNDERLYING_BUDGET_SECS, 20);
+        // P1: a timed-out first attempt leaves the retry launchable.
+        assert!(
+            CHAIN_1M_FALLBACK_DELAY_MS + CHAIN_1M_REQUEST_TIMEOUT_SECS * 1_000
+                <= CHAIN_1M_DECISION_CEILING_SECS * 1_000
+        );
+        // P2: a ceiling-edge retry never overruns the minute.
+        assert!(
+            (CHAIN_1M_DECISION_CEILING_SECS + CHAIN_1M_UNDERLYING_BUDGET_SECS) * 1_000 < 60_000
+        );
+        // P3: the same-key ≥3s gap fits inside the ceiling.
+        assert!(
+            CHAIN_1M_MIN_GAP_SECS * 1_000
+                < CHAIN_1M_DECISION_CEILING_SECS * 1_000 - CHAIN_1M_FALLBACK_DELAY_MS
+        );
+    }
+
     /// Groww spot 1m REST leg (operator grant 2026-07-13, PR-2 of the
     /// Groww per-minute REST plan) — endpoint identity, the 3-symbol table,
     /// the SEQUENTIAL-fetch timing envelope and the token re-read floor.
@@ -4571,6 +4645,14 @@ mod tests {
         );
         // Warmup master-download retries: bounded, 3 attempts total.
         assert_eq!(GROWW_CHAIN_1M_MASTER_RETRY_BACKOFF_SECS, [3, 6]);
+        // Per-underlying not-served detector threshold (~10 minutes) —
+        // mirrors the spot leg's per-SID detector (2026-07-14, the NIFTY
+        // expiry-day vendor-cutoff companion).
+        assert_eq!(GROWW_CHAIN_1M_UNDERLYING_NOT_SERVED_THRESHOLD, 10);
+        assert_eq!(
+            GROWW_CHAIN_1M_UNDERLYING_NOT_SERVED_THRESHOLD,
+            SPOT_1M_REST_SID_NOT_SERVED_THRESHOLD
+        );
     }
 
     /// PR-4 (Groww contract leg): the fill-model leg's pacing + envelope

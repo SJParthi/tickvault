@@ -1,50 +1,35 @@
-//! Wave 2 Item 5 (G1) — main-feed WebSocket post-close sleep + token-aware
-//! wake resilience ratchets.
+//! Wave 2 Item 5 (G1) — post-close sleep calendar resilience ratchets.
 //!
-//! These tests pin six regression invariants. Invariants 1-5 are documented
-//! in `.claude/plans/active-plan-wave-2.md` Item 5.6; invariant 6 (W6-2) is
-//! the long-weekend holiday wake flagged "Outstanding (Wave-6)" by the
-//! per-wave-guarantee-matrix / wave-4-shared-preamble charter:
+//! PR-C2 trim (2026-07-13): the Dhan live main-feed WS + its pool were
+//! DELETED with the lane (operator retirement directive —
+//! `websocket-connection-scope-lock.md` "2026-07-13 Amendment"). The three
+//! main-feed-machinery ratchets retired WITH the machinery they pinned:
+//! - `test_pool_supervisor_respawns_dead_connection_within_5s`
+//!   (`WebSocketConnectionPool::supervise_pool` deleted),
+//! - `test_token_force_renewal_on_wake_when_stale` (connection.rs wake path
+//!   deleted; the order-update twin lives in `ws_sleep_resilience_b.rs`),
+//! - `test_no_reconnect_exhaustion_path_remains` (connection.rs deleted).
+//!
+//! The SURVIVING invariants below pin `TradingCalendar::
+//! secs_until_next_market_open` — the shared sleep-until-open primitive the
+//! order-update WS (WS-GAP-04) and the Groww dormancy gates still consume:
 //!
 //! 1. `test_main_feed_post_close_sleeps_until_next_open` — a Friday
-//!    16:00 IST snapshot must produce a `secs_until_next_market_open`
-//!    that lands exactly on the next 09:00 IST trading day (skipping
-//!    the weekend).
-//! 2. `test_pool_supervisor_respawns_dead_connection_within_5s` — the
-//!    `supervise_pool` future must drain a `ReconnectionExhausted`
-//!    handle in well under 5 s (it has no internal sleep — bounded by
-//!    `tokio::join`).
-//! 3. `test_token_force_renewal_on_wake_when_stale` — source-scan
-//!    ratchet: `connection.rs` MUST invoke
-//!    `force_renewal_if_stale(14_400)` from the post-sleep wake path.
-//!    Removing this restores the legacy "wake → reconnect → DH-901
-//!    → renew → reconnect" 30 s cascade.
-//! 4. `test_70h_sleep_then_connect_succeeds` — a Friday 16:00 IST
-//!    sleep target lands strictly under 100 hours and exactly equals
-//!    the next-Monday 09:00 IST anchor (65 h).
-//! 5. `test_no_reconnect_exhaustion_path_remains` — source-scan
-//!    ratchet: in the production reconnect-loop guard, the post-close
-//!    `return false` path must be reached ONLY through the `// Legacy
-//!    fallback` branch when no `TradingCalendar` is installed. The
-//!    primary path MUST sleep + return `true`.
-//! 6. `test_long_weekend_monday_holiday_sleep_wakes_on_tuesday` (W6-2) —
-//!    a Friday 16:00 IST close with the following Monday declared an NSE
-//!    holiday must wake on Tuesday 09:00 IST (89h), skipping Sat + Sun +
-//!    the Monday holiday, bounded under 120h.
+//!    16:00 IST snapshot must produce a wake exactly on the next 09:00 IST
+//!    trading day (skipping the weekend).
+//! 2. `test_70h_sleep_then_connect_succeeds` — the Fri→Mon window equals
+//!    65h and stays bounded under 100h.
+//! 3. `test_long_weekend_monday_holiday_sleep_wakes_on_tuesday` (W6-2) —
+//!    a Monday NSE holiday extends the wake to Tuesday 09:00 IST (89h),
+//!    bounded under 120h.
 
 #![allow(clippy::unwrap_used)] // APPROVED: test code
 #![allow(clippy::expect_used)] // APPROVED: test code
-
-use std::fs;
-use std::path::PathBuf;
-use std::time::Duration;
 
 use chrono::{Datelike, NaiveDate, Weekday};
 use tickvault_common::config::{NseHolidayEntry, TradingConfig};
 use tickvault_common::constants::IST_UTC_OFFSET_SECONDS;
 use tickvault_common::trading_calendar::TradingCalendar;
-use tickvault_core::websocket::WebSocketError;
-use tickvault_core::websocket::connection_pool::WebSocketConnectionPool;
 
 // ---------------------------------------------------------------------------
 // Local helpers — duplicated from trading_calendar.rs internal tests so the
@@ -76,19 +61,6 @@ fn make_calendar() -> TradingCalendar {
     TradingCalendar::from_config(&cfg).expect("valid trading config")
 }
 
-fn repo_path(rel: &str) -> PathBuf {
-    let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    p.pop();
-    p.pop();
-    p.push(rel);
-    p
-}
-
-fn read_repo_file(rel: &str) -> String {
-    let path = repo_path(rel);
-    fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -114,49 +86,6 @@ fn test_main_feed_post_close_sleeps_until_next_open() {
     );
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn test_pool_supervisor_respawns_dead_connection_within_5s() {
-    // supervise_pool drains JoinHandles via FuturesUnordered. Construct a
-    // single handle that exits immediately with ReconnectionExhausted and
-    // assert the supervisor returns within the 5 s budget. The handle
-    // has no work to do so we expect drain in microseconds — the 5 s
-    // bound is the regression budget.
-    let h = tokio::spawn(async move {
-        Err::<(), WebSocketError>(WebSocketError::ReconnectionExhausted {
-            connection_id: 0,
-            attempts: 60,
-        })
-    });
-
-    let res = tokio::time::timeout(
-        Duration::from_secs(5),
-        WebSocketConnectionPool::supervise_pool(vec![h]),
-    )
-    .await;
-    assert!(
-        res.is_ok(),
-        "supervise_pool must drain a dead connection within 5 s"
-    );
-}
-
-#[test]
-fn test_token_force_renewal_on_wake_when_stale() {
-    // Source-scan ratchet: the post-sleep wake path in connection.rs MUST
-    // call force_renewal_if_stale with a 4-hour threshold (14_400 secs)
-    // BEFORE attempting reconnect. Removing this re-introduces the
-    // legacy DH-901 cascade.
-    let src = read_repo_file("crates/core/src/websocket/connection.rs");
-    assert!(
-        src.contains("force_renewal_if_stale(14_400)"),
-        "connection.rs wake path must call force_renewal_if_stale(14_400) — \
-         removing this restores the wake-DH901-renew-reconnect cascade"
-    );
-    assert!(
-        src.contains("AuthGap03TokenForceRenewedOnWake"),
-        "connection.rs wake path must reference AUTH-GAP-03 ErrorCode"
-    );
-}
-
 #[test]
 fn test_70h_sleep_then_connect_succeeds() {
     // Worst-case overnight Fri→Mon sleep window must be bounded
@@ -177,33 +106,6 @@ fn test_70h_sleep_then_connect_succeeds() {
         secs,
         65 * 3600,
         "Fri 16:00 IST → Mon 09:00 IST must equal 65 hours"
-    );
-}
-
-#[test]
-fn test_no_reconnect_exhaustion_path_remains() {
-    // Source-scan ratchet: in the post-close branch of
-    // wait_with_backoff, the calendar-installed path MUST
-    // `return true` after sleep (NOT `return false`). The legacy
-    // `return false` is only reached when no calendar is installed
-    // (a tests-only fallback labelled with `// Legacy fallback`).
-    let src = read_repo_file("crates/core/src/websocket/connection.rs");
-
-    // Primary path: calendar-installed sleep loop returns true.
-    assert!(
-        src.contains("self.total_reconnections.store(0, Ordering::Release);")
-            && src.contains("return true;"),
-        "calendar-installed post-close branch must reset reconnection \
-         counter and return true (sleep + retry forever)"
-    );
-
-    // Fallback labelled — meaning the no-calendar path is the ONLY
-    // remaining `return false` post-close branch.
-    assert!(
-        src.contains("// Legacy fallback"),
-        "legacy `return false` post-close branch must be labelled \
-         `// Legacy fallback` so source-scan distinguishes it from \
-         a regression"
     );
 }
 

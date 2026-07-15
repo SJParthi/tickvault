@@ -15,8 +15,9 @@
 //!
 //! The 5-minute headroom before the 15:30 close lets the operator act.
 //!
-//! **Why this lives in `app` (not `trading`):** like `cross_verify_1m_boot`,
-//! the async runner is the composition root — it wires `trading`'s pure
+//! **Why this lives in `app` (not `trading`):** like the retired 15:31
+//! cross-verify runner was (`cross_verify_1m_boot.rs`, deleted PR-C3
+//! 2026-07-14), the async runner is the composition root — it wires `trading`'s pure
 //! evaluator + `OrderApiClient` to `core`'s `TokenHandle`/`NotificationService`
 //! and `common`'s `TradingCalendar`. The pure pieces stay in
 //! `tickvault_trading::orphan_position_watchdog`.
