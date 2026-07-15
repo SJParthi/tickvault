@@ -138,6 +138,51 @@ fn test_cadence_gate_module_keeps_global_handle_fns() {
 /// (TRH-R2-1, 2026-07-15): the exact negated pure-fn gate + early return.
 const LATE_DECIDE_GUARD_NEEDLE: &str = "if !may_decide_at_completion(now_wall, cutoff)";
 
+/// TRH-R3-1 (2026-07-15): the `finalize_if_complete` body slice the
+/// TRH-R2-1 scan operates on — bounded at the next top-level fn (the
+/// finalize body nests no `\nfn ` — closures open with `|`).
+fn finalize_body(runner: &str) -> &str {
+    let start = runner
+        .find("fn finalize_if_complete")
+        .expect("TRH-R2-1 ratchet: finalize_if_complete fn is gone from runner.rs");
+    let body = &runner[start..];
+    let end = body[1..].find("\nfn ").map_or(body.len(), |i| i + 1);
+    &body[..end]
+}
+
+/// TRH-R3-1 (2026-07-15): extract the late-decide guard's ARM — the
+/// `{ ... }` block opened by `LATE_DECIDE_GUARD_NEEDLE` — via a naive
+/// depth-counting brace match. Naive is safe here: the arm carries no
+/// brace characters inside strings/comments (and if a refactor ever
+/// introduces one, the ratchet fails LOUDLY rather than silently
+/// widening its scan window back to the whole fn — the TRH-R3-1
+/// vacuous-pass class this helper exists to close: the fn body has
+/// OTHER `return;` statements after the guard, so a whole-fn
+/// `contains("return;")` is satisfiable with the guard arm gutted).
+fn late_decide_guard_arm(body: &str) -> &str {
+    let guard_at = body
+        .find(LATE_DECIDE_GUARD_NEEDLE)
+        .expect("TRH-R3-1 ratchet: late-decide guard needle absent from finalize body");
+    let after = &body[guard_at..];
+    let open_rel = after
+        .find('{')
+        .expect("TRH-R3-1 ratchet: no `{` opens the late-decide guard arm");
+    let mut depth = 0usize;
+    for (i, ch) in after[open_rel..].char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return &after[open_rel..=open_rel + i];
+                }
+            }
+            _ => {}
+        }
+    }
+    panic!("TRH-R3-1 ratchet: unbalanced braces in the late-decide guard arm")
+}
+
 #[test]
 fn test_cadence_finalize_pins_never_a_late_decided_guard() {
     // TRH-R2-1 ratchet (2026-07-15): the locked-spec invariant "never a
@@ -150,14 +195,7 @@ fn test_cadence_finalize_pins_never_a_late_decided_guard() {
     // semantics pinned in decision.rs tests), and THIS scan pins the
     // call site + early return so the guard can neither be deleted nor
     // bypassed silently.
-    let start = RUNNER_RS
-        .find("fn finalize_if_complete")
-        .expect("TRH-R2-1 ratchet: finalize_if_complete fn is gone from runner.rs");
-    let body = &RUNNER_RS[start..];
-    // Bound the scan at the next top-level fn (the finalize body nests
-    // no `\nfn ` — closures open with `|`).
-    let end = body[1..].find("\nfn ").map_or(body.len(), |i| i + 1);
-    let body = &body[..end];
+    let body = finalize_body(RUNNER_RS);
     assert!(
         body.contains(LATE_DECIDE_GUARD_NEEDLE),
         "TRH-R2-1 ratchet: finalize_if_complete no longer gates on the pure \
@@ -166,10 +204,18 @@ fn test_cadence_finalize_pins_never_a_late_decided_guard() {
          cutoff event owns resolution via honest skip)"
     );
     let guard_at = body.find(LATE_DECIDE_GUARD_NEEDLE).expect("checked above");
+    // TRH-R3-1 (2026-07-15): scan the guard ARM ONLY — the fn body has
+    // two more `return;` statements between the guard and decide_lane
+    // (own_path_exhausted / is_data_complete), so a whole-fn
+    // `contains("return;")` was vacuously satisfiable with the guard
+    // arm gutted (condition kept, `return;` replaced with a no-op) —
+    // exactly the late-Decided defect this ratchet exists to block.
+    let arm = late_decide_guard_arm(body);
     assert!(
-        body[guard_at..].contains("return;"),
-        "TRH-R2-1 ratchet: the late-completion guard arm no longer early- \
-         returns — the decide path is reachable past the cutoff"
+        arm.contains("return;"),
+        "TRH-R3-1 ratchet: the late-completion guard ARM no longer early- \
+         returns (arm-scoped scan — a `return;` further down the fn cannot \
+         satisfy this) — the decide path is reachable past the cutoff"
     );
     // The guard must run BEFORE the decide path (decide_lane is the only
     // emit door in this fn).
@@ -213,4 +259,31 @@ fn test_composition_contract_guard_needles_are_non_vacuous() {
     // matches (an INVERSION rewrites the negated call text too).
     let mutated_guard = RUNNER_RS.replace(LATE_DECIDE_GUARD_NEEDLE, "if true");
     assert!(!mutated_guard.contains(LATE_DECIDE_GUARD_NEEDLE));
+    // TRH-R3-1 self-test: GUTTING the guard ARM (condition kept, its
+    // `return;` deleted) must fail the arm-scoped scan even though the
+    // fn's LATER `return;` statements (own_path_exhausted /
+    // is_data_complete arms) remain — the exact mutation the pre-R3-1
+    // whole-fn `contains("return;")` let through.
+    let body = finalize_body(RUNNER_RS);
+    let arm = late_decide_guard_arm(body);
+    assert!(arm.contains("return;"), "self-test precondition");
+    let gutted_arm = arm.replace("return;", "/* gutted */ ()");
+    assert!(!gutted_arm.contains("return;"));
+    let gutted_body = body.replace(arm, &gutted_arm);
+    // The mutation is real: later returns still live in the gutted fn,
+    // so the OLD whole-fn scan would have stayed green...
+    let guard_at = gutted_body
+        .find(LATE_DECIDE_GUARD_NEEDLE)
+        .expect("self-test: gutted body keeps the guard condition");
+    assert!(
+        gutted_body[guard_at..].contains("return;"),
+        "self-test precondition: the pre-R3-1 whole-fn scan is satisfied \
+         by the later returns — proving it was vacuous against this mutation"
+    );
+    // ...while the ARM-scoped scan fails it.
+    let gutted_arm_rescanned = late_decide_guard_arm(&gutted_body);
+    assert!(
+        !gutted_arm_rescanned.contains("return;"),
+        "TRH-R3-1 self-test: the arm-scoped scan must FAIL a gutted guard arm"
+    );
 }
