@@ -118,7 +118,7 @@ use tickvault_storage::rest_fetch_audit_persistence::{
     ensure_rest_fetch_audit_table,
 };
 
-use crate::groww_spot_1m_boot::GrowwTokenCache;
+use crate::groww_spot_1m_boot::{GrowwTokenCache, parse_groww_ga_failure};
 // Session-boundary scheduling primitives + edge tracker + body-cap helpers
 // are REUSED from the Dhan spot leg (NSE-session facts + pure state
 // machines); the sequencing wait core + strike bounds + the fully-failed
@@ -734,6 +734,24 @@ fn chain_audit_flush_best_effort(audit_writer: &mut RestFetchAuditWriter) {
     }
 }
 
+/// The bounded failure msg for an unparseable 2xx chain body. G1
+/// (2026-07-14): when the body is the Groww FAILURE envelope
+/// (`{"status":"FAILURE","error":{code,message}}` — the envelope wins over
+/// the HTTP status), the msg carries the GA wire code + the redacted
+/// message so the existing CHAIN-02 failure log/audit context names WHY.
+/// Forensics only — the (already correct) Failed classification is
+/// unchanged, and policy never branches on the GA code. Pure.
+fn chain_parse_failure_msg(body_text: &str) -> String {
+    match parse_groww_ga_failure(body_text) {
+        Some(ga) => format!(
+            "2xx FAILURE envelope ga_code={} msg={}",
+            ga.ga_code,
+            capture_rest_error_body(&ga.message)
+        ),
+        None => "2xx but the body was not a parseable option chain".to_string(),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Per-minute fire
 // ---------------------------------------------------------------------------
@@ -854,7 +872,7 @@ async fn fetch_groww_chain_bounded(
                         status: 200,
                         rate_limited: false,
                         auth_rejected: false,
-                        msg: "2xx but the body was not a parseable option chain".to_string(),
+                        msg: chain_parse_failure_msg(&body_text),
                     }),
                 }
             }
@@ -2491,6 +2509,32 @@ mod tests {
         assert!(empty.legs.is_empty());
         assert_eq!(empty.strikes_seen, 0, "a literally empty map saw nothing");
         assert_eq!(empty.strikes_kept, 0);
+    }
+
+    /// G1 (2026-07-14): the None-parse failure msg carries the GA wire code
+    /// + redacted message when the 2xx body is the Groww FAILURE envelope;
+    /// any other unparseable body keeps the generic msg. Forensics only —
+    /// the Failed classification itself was already correct.
+    #[test]
+    fn test_chain_parse_failure_msg_carries_ga_code() {
+        let msg = chain_parse_failure_msg(
+            r#"{"status":"FAILURE","error":{"code":"GA001","message":"bad request"}}"#,
+        );
+        assert!(
+            msg.contains("ga_code=GA001") && msg.contains("bad request"),
+            "got {msg:?}"
+        );
+        // Codeless FAILURE envelope → ga_code=none (tolerated).
+        let msg = chain_parse_failure_msg(r#"{"status":"FAILURE"}"#);
+        assert!(msg.contains("ga_code=none"), "got {msg:?}");
+        // Non-envelope unparseable bodies keep the generic msg.
+        for body in ["not json", "{}", r#"{"strikes": "x"}"#] {
+            assert_eq!(
+                chain_parse_failure_msg(body),
+                "2xx but the body was not a parseable option chain",
+                "body {body:?}"
+            );
+        }
     }
 
     #[test]

@@ -57,23 +57,19 @@ aws-sdk-s3 = { workspace = true }
 notify = { workspace = true }
 # Only the feature-gated daily-universe boot orchestrator hashes the CSV
 # (source_csv_sha256 provenance); optional so the default build stays lean.
-sha2 = { workspace = true, optional = true }
+
+[dev-dependencies]
+# start_paused virtual-time tests for the exit-execution verify ladder
+# (same pattern as crates/core + crates/api dev-deps).
+tokio = { workspace = true, features = ["test-util"] }
 
 [features]
-# GO-LIVE (PR-3, 2026-05-28): daily_universe_fetcher is now in `default` per
-# the operator full-go-live approval ("250 SIDs + new scope as production AND
-# local, everywhere"; boot fail-closed §4 "Block until CSV"). The §21
-# sequencing is satisfied — the fetcher chain + boot wiring (PR-1 #852) +
-# scope-aware subscription (PR-2 #853) all merged first. Paired with
-# `config/base.toml [subscription] scope = "daily_universe"`.
-default = ["daily_universe_fetcher"]
-# Forwards the gate to core (the INSTR-FETCH runner) and storage (the
-# instrument_fetch_audit writer) so the app-side audit-write seam compiles.
-daily_universe_fetcher = [
-    "dep:sha2",
-    "tickvault-core/daily_universe_fetcher",
-    "tickvault-storage/daily_universe_fetcher",
-]
+# PR-C3 (2026-07-14): the `daily_universe_fetcher` feature (and its sha2
+# optional dep) was DELETED with the Dhan instrument-download chain
+# (operator retirement directive 2026-07-13, scope-lock amendment §B). The
+# formerly-gated SEBI persistence modules in `tickvault-storage` are now
+# compiled unconditionally.
+default = []
 
 [package.metadata.cargo-machete]
 ignored = ["chrono-tz", "clap", "signal-hook"]

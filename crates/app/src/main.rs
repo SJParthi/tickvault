@@ -857,205 +857,19 @@ async fn main() -> Result<()> {
     // #T2b (2026-05-20): the periodic 15-min selftest-audit task was
     // removed with the selftest_audit table (QuestDB table cleanup).
 
-    // Wave 2 Item 8 (G4) — install the global tick-gap detector and
-    // spawn the 60s coalescing task. Recorded ticks live in a papaya
-    // map keyed by (security_id, segment) — composite per I-P1-11.
-    let tick_gap_detector = std::sync::Arc::new(tickvault_core::pipeline::TickGapDetector::new(
-        tickvault_core::pipeline::TICK_GAP_THRESHOLD_SECS_DEFAULT,
-    ));
-    if !tickvault_core::pipeline::tick_gap_detector::set_global_tick_gap_detector(
-        tick_gap_detector.clone(),
-    ) {
-        tracing::warn!("global TickGapDetector already installed — skipping");
-    }
-    {
-        let detector_for_task = tick_gap_detector.clone();
-        tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(
-                tickvault_core::pipeline::TICK_GAP_COALESCE_WINDOW_SECS_DEFAULT,
-            ));
-            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            loop {
-                ticker.tick().await;
-                let now = std::time::Instant::now();
-                // §36.7 (2026-07-10): full walk (cap = map size) instead of
-                // the old top-N cap — the far-month exclusion below must see
-                // EVERY silent entry to subtract the excluded ones. Same
-                // cold-path walk class as the 10s SLO loop; entries come
-                // back largest-gap-first, so the WS-GAP-06 top-10 sample
-                // below is unchanged.
-                let (gaps, total_silent) =
-                    detector_for_task.scan_gaps_top_n(now, detector_for_task.len());
-                // Wave-Holiday-Gate (2026-05-09): suppress WS-GAP-06
-                // emission on Saturday/Sunday boots (and outside
-                // market hours). NSE doesn't stream on weekends, so
-                // every IDX_I tracker reports >30s silence — the
-                // ERROR storm in the operator's 2026-05-09 logs was
-                // 60+ false positives. Inside trading session, the
-                // alert remains live.
-                if !tickvault_common::market_hours::is_within_trading_session_ist() {
-                    continue;
-                }
-                // Round-3 fix (2026-07-08, review finding 6): the gauge is
-                // written UNCONDITIONALLY every in-session scan — INCLUDING
-                // total_silent == 0. The previous zero-skip sat BEFORE this
-                // write, so a fully-recovered silence spike froze the gauge
-                // at its last breaching value (the /metrics exporter keeps
-                // re-serving the last set value): a ~90s full-feed outage
-                // wrote 776 once, the reconnect restored every SID, and the
-                // frozen 776 then accumulated the retuned alarm's 10-of-12
-                // ~10 minutes AFTER complete recovery — a false page held in
-                // ALARM until the next non-zero sub-threshold count happened
-                // to be written. The zero-skip below now guards ONLY the
-                // WS-GAP-06 error emission + summary counter.
-                //
-                // Round-4 fix (2026-07-08, final-review findings 1/2/4): pin
-                // the gauge to 0.0 during the NSE pre-open/auction window
-                // [09:00, 09:15) IST — the exact mirror of the round-3 SLO
-                // tick_freshness pre-open pin
-                // (SLO_TICK_FRESHNESS_SESSION_OPEN_SECS_OF_DAY_IST below).
-                // The session gate above admits [09:00, 15:30), so during
-                // the 09:08-09:15 matching/buffer freeze the boot-seeded
-                // ~775 SIDs are LEGITIMATELY silent and the genuine count
-                // (hundreds, far above the retuned alarm threshold 40)
-                // would be written for ~6-7 consecutive 60s CW datapoints.
-                // The window-gate Lambda's forced-OK at 09:20 does NOT
-                // purge datapoints, and the retuned alarm's 10-of-12
-                // lookback (12 min — the LONGEST of any gated alarm)
-                // reaches back to ~09:08 at its first gated evaluations:
-                // ~7 guaranteed pre-open breaching datapoints would need
-                // only ~3 open-ramp minutes > 40 (slow starters over the
-                // documented ~33 always-silent floor) to false-page at
-                // ~09:21 on ordinary days. Pre-open silence is not
-                // degradation; genuine counts start at the 09:15:00
-                // continuous-session open. The WS-GAP-06 error emission
-                // below is deliberately UNCHANGED (pre-existing behavior;
-                // it is a coalesced log, not an alarm datapoint).
-                const TICK_GAP_GAUGE_SESSION_OPEN_SECS_OF_DAY_IST: u32 = 9 * 3600 + 15 * 60;
-                // §36.7 far-month exclusion RETIRED in PR-C2 (2026-07-13):
-                // the exclusion set was seeded ONLY from the deleted Dhan
-                // lane's subscription plan (`seed_tick_gap_detector_from_plan`
-                // / `store_far_month_future_exclusions`), so post-retirement
-                // it was permanently empty — the filter is now the honest
-                // constant 0. The whole detector (this scan loop included)
-                // is deleted in PR-C3 with WS-GAP-06 (operator Q4-ii).
-                let excluded_silent = 0usize;
-                let gauge_silent = if tickvault_common::market_hours::now_ist_secs_of_day()
-                    < TICK_GAP_GAUGE_SESSION_OPEN_SECS_OF_DAY_IST
-                {
-                    0.0
-                } else {
-                    total_silent.saturating_sub(excluded_silent) as f64
-                };
-                metrics::gauge!("tv_tick_gap_instruments_silent").set(gauge_silent);
-                if total_silent == 0 {
-                    continue;
-                }
-                metrics::counter!("tv_tick_gap_summary_total").increment(1);
-                let top: Vec<(u64, &'static str, u64)> = gaps
-                    .iter()
-                    .take(10)
-                    .map(|(id, seg, gap)| (*id, seg.as_str(), *gap))
-                    .collect();
-                tracing::error!(
-                    silent_count = total_silent,
-                    top_10_samples = ?top,
-                    code = tickvault_common::error_code::ErrorCode::WsGap06TickGapSummary
-                        .code_str(),
-                    "WS-GAP-06 tick-gap detector coalesced summary — instruments silent ≥30s"
-                );
-            }
-        });
-    }
-
-    // Wave-2-D Fix 2 (G19) — daily 15:35 IST reset task. The
-    // coalescing detector accumulates per-(security_id, segment) entries
-    // forever; without this reset, expired/delisted contracts pollute
-    // tomorrow's scan and overnight silence (16:00 → next 09:15) reads
-    // as a tick gap. `reset_daily()` is defined + tested in
-    // `tick_gap_detector.rs` but had no production call site —
-    // satisfies audit-findings-2026-04-17.md Rule 13.
-    //
-    // Loop: sleep until 15:35 IST today (or tomorrow if past), call
-    // `reset_daily()`, then sleep ~24h until next 15:35 IST.
-    {
-        let detector_for_reset = tick_gap_detector.clone();
-        tokio::spawn(async move {
-            loop {
-                // 15:35:00 IST = 5min after market close. Use the same
-                // helper that `compute_market_close_sleep("15:30:00")`
-                // uses elsewhere — just shifted +5min so we don't race
-                // any 15:30-tied tasks.
-                let sleep_dur = compute_market_close_sleep(
-                    tickvault_common::constants::TICK_GAP_RESET_TIME_IST,
-                );
-                if sleep_dur.is_zero() {
-                    // Already past 15:35 IST today → settle 60s and
-                    // recompute. Avoids a hot-spin during the post-15:35
-                    // window.
-                    tokio::time::sleep(std::time::Duration::from_secs(
-                        tickvault_common::constants::TICK_GAP_RESET_SETTLE_SECS,
-                    ))
-                    .await;
-                    let recompute = compute_market_close_sleep(
-                        tickvault_common::constants::TICK_GAP_RESET_TIME_IST,
-                    );
-                    if recompute.is_zero() {
-                        // Still past 15:35 (clock stuck?) — bounded
-                        // busy-loop avoidance.
-                        tokio::time::sleep(std::time::Duration::from_secs(
-                            tickvault_common::constants::TICK_GAP_RESET_BUSYLOOP_GUARD_SECS,
-                        ))
-                        .await;
-                        continue;
-                    }
-                    tokio::time::sleep(recompute).await;
-                } else {
-                    tokio::time::sleep(sleep_dur).await;
-                }
-                // Wave-2-D adversarial review (MEDIUM) — idempotent
-                // per-day reset. NTP backward step or a Duration::ZERO
-                // recompute can otherwise race this loop into a
-                // double-fire. Compute current trading-date IST in
-                // epoch days; the detector's CAS guarantees a single
-                // real clear per day.
-                let now_secs = chrono::Utc::now().timestamp();
-                let now_ist_secs = now_secs.saturating_add(i64::from(
-                    tickvault_common::constants::IST_UTC_OFFSET_SECONDS,
-                ));
-                let trading_date_ist_days = now_ist_secs
-                    .div_euclid(i64::from(tickvault_common::constants::SECONDS_PER_DAY));
-                let actually_fired =
-                    detector_for_reset.reset_daily_idempotent(trading_date_ist_days);
-                if actually_fired {
-                    metrics::counter!("tv_tick_gap_daily_resets_total").increment(1);
-                    metrics::gauge!("tv_tick_gap_last_reset_date_ist_days")
-                        .set(trading_date_ist_days as f64);
-                    tracing::info!(
-                        map_size_after = detector_for_reset.len(),
-                        trading_date_ist_days,
-                        "WS-GAP-06 tick-gap detector daily reset fired @ 15:35 IST"
-                    );
-                } else {
-                    // Idempotent skip — another loop iteration in the
-                    // same trading day already cleared the map. Log
-                    // at debug; do NOT increment the counter or fire
-                    // a Telegram event.
-                    tracing::debug!(
-                        trading_date_ist_days,
-                        "WS-GAP-06 daily reset skipped — already fired today"
-                    );
-                }
-                // After reset, ensure we sleep past the 15:35 boundary
-                // so we don't race the same minute back into a
-                // near-zero sleep on the next loop iteration.
-                tokio::time::sleep(std::time::Duration::from_secs(
-                    tickvault_common::constants::TICK_GAP_RESET_SETTLE_SECS,
-                ))
-                .await;
-            }
-        });
-    }
+    // Tick-gap detector RETIRED in PR-C3 (2026-07-14, operator Q4-ii
+    // 2026-07-13 — websocket-connection-scope-lock.md "2026-07-13 Amendment"
+    // §B item 4): the Wave-2 Item-8 global TickGapDetector install, the 60s
+    // WS-GAP-06 coalescing scan task, and the 15:35 IST daily reset task
+    // that lived here are DELETED with the detector module. The detector
+    // was fed ONLY by the retired Dhan WS pipeline (`record_tick_global`
+    // in tick_processor.rs; the Groww bridge never recorded into it), so
+    // post-C2 it was a no-input shell emitting a permanently-zero gauge.
+    // FEED-level stall detection for Groww is FEED-STALL-01
+    // (feed-stall-watchdog-error-codes.md); per-SID silence visibility is
+    // the scoreboard presence/coverage columns (15:45 IST). The RISK-GAP-03
+    // `trading::risk::tick_gap_tracker` below is a DIFFERENT component and
+    // is KEPT.
 
     // -----------------------------------------------------------------------
     // STAGE-C: WebSocket frame WAL (write-ahead log) — durable spill
@@ -1110,14 +924,16 @@ async fn main() -> Result<()> {
                     total = live + ord,
                     live_feed = live,
                     order_update = ord,
-                    "STAGE-C: WAL replay recovered residual frames — LiveFeed will be \
-                     re-injected into pool mpsc; OrderUpdate drained into broadcast once \
-                     sender is created"
+                    "STAGE-C: WAL replay recovered residual frames — both types are \
+                     pre-retirement residue with no live consumer (PR-C3, 2026-07-14): \
+                     counted loudly at STAGE-C.2b, then archived (raw frames stay on disk)"
                 );
-                metrics::counter!("tv_ws_frame_wal_replay_total", "ws_type" => "live_feed")
-                    .increment(live);
-                metrics::counter!("tv_ws_frame_wal_replay_total", "ws_type" => "order_update")
-                    .increment(ord);
+                // PR-C3 round-2 review (2026-07-14, MEDIUM): the
+                // tv_ws_frame_wal_replay_total increments that lived HERE
+                // fired BEFORE observability::init_metrics installs the
+                // recorder — they hit the no-op recorder and were silently
+                // lost. They now fire at STAGE-C.2b (post-install), derived
+                // from the same recovered-frame vec lengths.
             }
         }
         Err(err) => {
@@ -1857,7 +1673,8 @@ async fn main() -> Result<()> {
     //
     // Build the PROCESS-shared infra ONCE here: notifier (+ Docker auto-start),
     // health registry, seal-writer (installs the process-wide global_seal_sender),
-    // the tick + order-update broadcasts, the obs / 21-TF aggregator / tick-storage
+    // the tick broadcast (the order-update broadcast retired in PR-C3,
+    // 2026-07-14), the obs / 21-TF aggregator / tick-storage
     // subscriber tasks, and the axum API server (incl. /api/feeds, so the
     // toggle endpoint exists regardless of feed state). The single
     // `run_process_runloop` below keeps the process alive.
@@ -1866,7 +1683,6 @@ async fn main() -> Result<()> {
         notifier,
         health_status,
         tick_broadcast_sender,
-        order_update_sender,
         api_handle,
     } = build_shared_infra(
         &config,
@@ -2109,46 +1925,56 @@ async fn main() -> Result<()> {
     );
 
     // =======================================================================
-    // STAGE-C.2b (PR-C2, 2026-07-13): WAL replay settlement — single path.
+    // STAGE-C.2b (PR-C2, 2026-07-13; order-update leg re-shaped in PR-C3,
+    // 2026-07-14): WAL replay settlement — single path, BOTH legs
+    // archive-only + loud.
     //
     // The Dhan live-WS lane (and with it the pool frame channel the LiveFeed
     // re-injection targeted) is DELETED per the operator's 2026-07-13
-    // retirement directive. Two legs remain:
-    //   - OrderUpdate frames drain into the PROCESS-shared broadcast created
-    //     by `build_shared_infra` (closing the C1 "boot-staged order-update
-    //     WAL segments remain undrained on dhan-off boots" residual — the
-    //     dhan_rest_stack's order-update WS + dormant drain consume the same
-    //     broadcast).
-    //   - Residual LiveFeed frames (possible only from a PRE-retirement
-    //     session's WAL) have NO live consumer anymore: they are counted +
-    //     logged loudly, then archived WITH the segments below — the raw
-    //     frames stay on disk in the WAL archive (forensic), and NOT
-    //     confirming would re-stage them every boot forever (the
-    //     WS-REINJECT-01 growth-storm class).
+    // retirement directive, and the order-update WS spawn + its dormant
+    // drain were retired by the 2026-07-14 Dhan noise lock (#1532,
+    // dhan-rest-only-noise-lock-2026-07-14.md) — so the process-shared
+    // order-update broadcast the C2 drain targeted became PERMANENTLY
+    // receiver-less (the trading pipeline has zero spawn sites until the
+    // live-trading re-wire; order_side_wiring_guard pins that). Draining
+    // into a receiver-less broadcast was delivery theater: every send
+    // returned Err and the frames went nowhere while the confirm archived
+    // them. PR-C3 makes both legs the SAME honest shape:
+    //   - Residual frames of EITHER type (possible only from a
+    //     PRE-retirement session's WAL) are counted + logged loudly, then
+    //     archived WITH the segments below — the raw frames stay on disk in
+    //     the WAL archive (forensic; `confirm_replayed` MOVES, never
+    //     deletes), and NOT confirming would re-stage them every boot
+    //     forever (the WS-REINJECT-01 growth-storm class). Durable
+    //     order-event capture returns with the live-trading re-wire.
     // =======================================================================
+    // Replay counters (moved here from the STAGE-C replay match in the PR-C3
+    // round-2 fix — this point is AFTER observability::init_metrics, so the
+    // increments land on the real recorder instead of the pre-install no-op).
+    if !ws_wal_replay_live_feed.is_empty() {
+        metrics::counter!("tv_ws_frame_wal_replay_total", "ws_type" => "live_feed")
+            .increment(ws_wal_replay_live_feed.len() as u64);
+    }
     if !ws_wal_replay_order_update.is_empty() {
-        let frames = std::mem::take(&mut ws_wal_replay_order_update);
-        let (parsed, broadcast_count, parse_errors) =
-            tickvault_app::boot_helpers::drain_replayed_order_updates_to_broadcast(
-                frames,
-                &order_update_sender,
-            );
-        info!(
-            parsed,
-            broadcast_count, parse_errors, "STAGE-C.2b: OrderUpdate WAL replay drain complete"
+        metrics::counter!("tv_ws_frame_wal_replay_total", "ws_type" => "order_update")
+            .increment(ws_wal_replay_order_update.len() as u64);
+    }
+    if !ws_wal_replay_order_update.is_empty() {
+        let dropped = ws_wal_replay_order_update.len() as u64;
+        warn!(
+            frames = dropped,
+            "STAGE-C.2b: residual OrderUpdate WAL frames from a pre-retirement session have \
+             no consumer (the order-update WS spawn + its drain were retired 2026-07-14 per \
+             the Dhan noise lock; the trading pipeline is dormant until the live-trading \
+             re-wire) — counted and archived with the WAL segments; the raw JSON frames \
+             remain on disk in the archive for forensic replay"
         );
         metrics::counter!(
-            "tv_ws_frame_wal_reinjected_total",
+            "tv_ws_frame_wal_reinjected_dropped_total",
             "ws_type" => "order_update"
         )
-        .increment(broadcast_count);
-        if parse_errors > 0 {
-            metrics::counter!(
-                "tv_ws_frame_wal_reinjected_parse_errors_total",
-                "ws_type" => "order_update"
-            )
-            .increment(parse_errors);
-        }
+        .increment(dropped);
+        ws_wal_replay_order_update.clear();
     }
     if !ws_wal_replay_live_feed.is_empty() {
         let dropped = ws_wal_replay_live_feed.len() as u64;
@@ -2166,9 +1992,15 @@ async fn main() -> Result<()> {
         ws_wal_replay_live_feed.clear();
     }
     {
-        // Both legs settled (drained or loudly archived) — archive the staged
-        // segments so they never re-stage. `confirm_replayed` MOVES segments
-        // into the WAL archive dir (never deletes).
+        // Both legs settled (loudly archived) — archive the staged segments
+        // so they never re-stage. `confirm_replayed` MOVES segments into the
+        // WAL archive dir (never deletes). Honest envelope (round-2 note,
+        // 2026-07-14): this confirm also runs when `replay_all` itself
+        // ERRORED above — segments staged but never read are archived with
+        // a zero count (raw frames preserved on disk, count lost).
+        // Acceptable post-retirement: no consumer exists to re-replay into,
+        // and NOT confirming would re-stage the unreadable segments forever
+        // (the WS-REINJECT-01 growth-storm class).
         let confirm_ws_wal_path = tickvault_app::tick_conservation_boot::ws_wal_dir();
         tickvault_storage::ws_frame_spill::confirm_replayed(&confirm_ws_wal_path);
     }
@@ -3034,9 +2866,12 @@ struct SharedInfraHandles {
     /// install + channel wiring stay publisher-ready; the C3 universe-chain
     /// deletion decides whether the idle consumers go too.
     tick_broadcast_sender: tokio::sync::broadcast::Sender<tickvault_common::tick_types::ParsedTick>,
-    /// The PROCESS-shared order-update broadcast (lane order-update WS publishes;
-    /// trading pipeline subscribes).
-    order_update_sender: tokio::sync::broadcast::Sender<tickvault_common::order_types::OrderUpdate>,
+    // PR-C3 (2026-07-14): the PROCESS-shared order-update broadcast
+    // (`order_update_sender`) was REMOVED — its publisher (the order-update
+    // WS, retired 2026-07-14 per the Dhan noise lock) and its subscriber
+    // (the trading pipeline, zero spawn sites — order_side_wiring_guard)
+    // are both gone, so the channel was a permanently receiver-less shell.
+    // The live-trading re-wire re-creates it alongside the pipeline spawn.
     /// The hoisted axum API server handle (binds exactly once, incl. /api/feeds).
     api_handle: tokio::task::JoinHandle<()>,
 }
@@ -3044,7 +2879,8 @@ struct SharedInfraHandles {
 /// Builds the PROCESS-shared infra ONCE for BOTH the Dhan-OFF and Dhan-ON-slow
 /// boot paths: strict notifier (+ optional coalescer), health registry,
 /// seal-writer (installs the process-wide `global_seal_sender`), the 21-TF
-/// Engine-B aggregator, the tick + order-update broadcast channels, the
+/// Engine-B aggregator, the tick broadcast channel (the order-update
+/// broadcast retired in PR-C3, 2026-07-14), the
 /// observability + tick-storage subscriber tasks (which `.subscribe()` to the
 /// tick broadcast BEFORE the lane's tick processor publishes — the
 /// subscribe-before-publish / zero-tick-loss invariant, preserved by
@@ -3136,7 +2972,7 @@ async fn build_shared_infra(
     // --- Seal-writer (installs the process-wide global_seal_sender) ---
     spawn_seal_writer_loop(&config.questdb);
 
-    // --- Tick + order-update broadcast channels (PROCESS-shared) ---
+    // --- Tick broadcast channel (PROCESS-shared) ---
     // Held for the process lifetime so the aggregator subscriber never wakes on
     // a disconnected channel. With Dhan OFF nothing publishes Dhan ticks into
     // the tick broadcast, but the channel + aggregator still run so the wiring
@@ -3145,10 +2981,8 @@ async fn build_shared_infra(
         tokio::sync::broadcast::channel::<tickvault_common::tick_types::ParsedTick>(
             tickvault_common::constants::TICK_BROADCAST_CAPACITY,
         );
-    let (order_update_sender, _order_update_receiver) =
-        tokio::sync::broadcast::channel::<tickvault_common::order_types::OrderUpdate>(
-            tickvault_common::constants::ORDER_UPDATE_BROADCAST_CAPACITY,
-        );
+    // PR-C3 (2026-07-14): the order-update broadcast channel was removed
+    // (publisher + subscriber both retired — see the SharedInfraHandles note).
 
     // --- Subscriber tasks: obs + 21-TF aggregator + tick-storage ---
     // ALL three `.subscribe()` to `tick_broadcast_sender` HERE, in the hoisted
@@ -3241,7 +3075,6 @@ async fn build_shared_infra(
         notifier,
         health_status,
         tick_broadcast_sender,
-        order_update_sender,
         api_handle,
     })
 }

@@ -53,15 +53,16 @@ use tickvault_common::config::{ApplicationConfig, FeaturesConfig};
 // PR #4 (2026-05-19): `depth_dynamic_top_volume` + `depth_dynamic_pipeline_v2`
 // retired alongside the depth-20 + depth-200 pipelines; count was 12.
 // PR-D (2026-05-26): `historical_fetch_enabled` retired alongside the
-// deleted Dhan historical fetch chain; count is now 11.
-const EXPECTED_FLAGS: [&str; 11] = [
+// deleted Dhan historical fetch chain; count was 11.
+// PR-C3 (2026-07-14): `tick_gap_detector_60s_coalesce` retired with the
+// deleted tick-gap detector (operator Q4-ii 2026-07-13); count is now 10.
+const EXPECTED_FLAGS: [&str; 10] = [
     "hotpath_async_writers",
     "phase2_emit_guard",
     "previous_close_persist",
     "ws_main_sleep_until_open",
     "ws_depth_ou_sleep_until_open",
     "fast_boot_60s_deadline",
-    "tick_gap_detector_60s_coalesce",
     "audit_tables_enabled",
     "telegram_bucket_coalescer",
     "market_open_self_test",
@@ -228,28 +229,10 @@ fn test_fast_boot_60s_deadline_default_is_safe() {
 }
 
 // ---------------------------------------------------------------------------
-// Item 8 — tick_gap_detector_60s_coalesce (Wave 2)
+// Item 8 — tick_gap_detector_60s_coalesce (Wave 2) — RETIRED in PR-C3
+// (2026-07-14) with the deleted tick-gap detector (operator Q4-ii
+// 2026-07-13); its 3 flag tests are removed with the flag.
 // ---------------------------------------------------------------------------
-
-#[test]
-fn test_tick_gap_detector_60s_coalesce_off_disables_path() {
-    let cfg = parse_features("tick_gap_detector_60s_coalesce = false");
-    assert!(!cfg.tick_gap_detector_60s_coalesce);
-}
-
-#[test]
-fn test_tick_gap_detector_60s_coalesce_on_enables_path() {
-    let cfg = parse_features("tick_gap_detector_60s_coalesce = true");
-    assert!(cfg.tick_gap_detector_60s_coalesce);
-}
-
-#[test]
-fn test_tick_gap_detector_60s_coalesce_default_is_safe() {
-    assert_default_is_true(
-        |c| c.tick_gap_detector_60s_coalesce,
-        "tick_gap_detector_60s_coalesce",
-    );
-}
 
 // ---------------------------------------------------------------------------
 // Item 9 — audit_tables_enabled (Wave 2)
@@ -364,7 +347,7 @@ fn test_all_features_default_to_true_no_silent_drift() {
     assert!(d.ws_main_sleep_until_open);
     assert!(d.ws_depth_ou_sleep_until_open);
     assert!(d.fast_boot_60s_deadline);
-    assert!(d.tick_gap_detector_60s_coalesce);
+    // d.tick_gap_detector_60s_coalesce retired in PR-C3 (2026-07-14).
     assert!(d.audit_tables_enabled);
     // d.preopen_movers retired 2026-05-03 — assertion removed.
     assert!(d.telegram_bucket_coalescer);
@@ -480,7 +463,7 @@ fn test_config_base_toml_lists_every_feature_flag() {
         "ws_main_sleep_until_open",
         "ws_depth_ou_sleep_until_open",
         "fast_boot_60s_deadline",
-        "tick_gap_detector_60s_coalesce",
+        // tick_gap_detector_60s_coalesce retired in PR-C3 (2026-07-14).
         "audit_tables_enabled",
         "telegram_bucket_coalescer",
         "market_open_self_test",

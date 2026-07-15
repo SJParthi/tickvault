@@ -32,6 +32,9 @@ ilp = "ilp"
 oms = "oms"
 sme = "sme"
 availabel = "availabel"
+# Dhan super-order API wire typo `totalQuatity` (missing 'n') — matched
+# verbatim via #[serde(rename)]; never "fixed" (2026-07-14, exit-order layer).
+quatity = "quatity"
 fo = "fo"
 indicat = "indicat"
 gcra = "gcra"

@@ -8,6 +8,11 @@
 
 ## WS-GAP-04 — main-feed WebSocket entered post-close sleep
 
+> **C4 sweep note (2026-07-15):** the `WsGap04PostCloseSleep` variant SURVIVES
+> — it is still emitted by the retained-dormant `order_update_connection.rs`
+> (scope-lock §A.1); only the main-feed emit sites described below died with
+> the lane. Content retained for historical audit.
+
 **Trigger:** the main-feed (or depth-20 / depth-200) WebSocket reached the
 post-close gate (≥15:30 IST + ≥3 consecutive failures) and is now sleeping
 until the next market open instead of giving up. Replaces the legacy
@@ -24,6 +29,13 @@ until the next market open instead of giving up. Replaces the legacy
 **Source:** `crates/core/src/websocket/connection.rs::wait_with_backoff`
 
 ## WS-GAP-05 — pool slot respawned after an unexpected clean exit
+
+> **⚠ VARIANT RETIRED in the C4 sweep (2026-07-15):** the `WsGap05PoolRespawn` ErrorCode
+> variant is DELETED — its only emit sites (the Dhan main-feed pool supervisor slot loop) were
+> deleted in Phases C2/C3 (#1522/#1569) with the Dhan live WS (operator
+> 2026-07-13, `websocket-connection-scope-lock.md` "2026-07-13 Amendment").
+> Content below retained for historical audit; the code string stays
+> reverse-crossref-allowlisted.
 
 > **2026-07-10 truth-sync (W2#8).** The pre-2026-07-10 text here described a
 > `respawn_dead_connections_loop` / `spawn_pool_supervisor_task` design that
@@ -117,7 +129,7 @@ classify/backoff/terminal-behaviour unit + tokio tests beside it).
 
 ## WS-GAP-06 — tick-gap detector fired a coalesced summary
 
-> **⚠ RETIREMENT AUTHORIZED 2026-07-13 (deletion lands with the Phase C PRs):** the
+> **⚠ RETIREMENT AUTHORIZED 2026-07-13 — deletion LANDED in PR-C3 (2026-07-14):** the
 > tick-gap detector and this code are DELETED with the Dhan live WS (operator Q4-ii
 > "agreed dude" — *tick-gap detector + WS-GAP-06 deleted; the Groww feed-stall watchdog
 > owns stall detection*, 2026-07-13; full contract in `websocket-connection-scope-lock.md`
@@ -129,7 +141,9 @@ classify/backoff/terminal-behaviour unit + tokio tests beside it).
 > scoreboard presence/coverage columns (15:45 IST cadence) — there is deliberately NO 30s
 > per-SID page anymore. The `tv_tick_gap_instruments_silent` gauge, the WS-GAP-06 seeding,
 > and the §36 far-month alarm-gate exclusion die with it. Content below retained for
-> historical audit.
+> historical audit. **C4 sweep (2026-07-15): the `WsGap06TickGapSummary` variant is now
+> DELETED** (retained through C3 only to keep the crossref green; the reverse check
+> allowlists the code string).
 
 **Trigger:** Item 8's `TickGapDetector` observed ≥1 instrument with
 silence ≥30s during the most recent 60s coalesce window.
@@ -145,6 +159,13 @@ silence ≥30s during the most recent 60s coalesce window.
 **Source:** `crates/core/src/pipeline/tick_gap_detector.rs::TickGapDetector::scan`
 
 ## WS-GAP-07 — live-feed frame channel closed (tick consumer died)
+
+> **⚠ VARIANT RETIRED in the C4 sweep (2026-07-15):** the `WsGap07LiveChannelClosed` ErrorCode
+> variant is DELETED — its only emit sites (the Dhan main-feed read loop's frame-channel Closed arm) were
+> deleted in Phases C2/C3 (#1522/#1569) with the Dhan live WS (operator
+> 2026-07-13, `websocket-connection-scope-lock.md` "2026-07-13 Amendment").
+> Content below retained for historical audit; the code string stays
+> reverse-crossref-allowlisted.
 
 **Trigger:** the main-feed read loop's `frame_sender.try_send(frame)`
 returned `TrySendError::Closed` — the downstream tick-processing consumer
@@ -178,6 +199,13 @@ mid-market (audit Rule 5 — drain failures must be `error!`).
 `TrySendError::Closed` arm of the live-feed `try_send`).
 
 ## WS-GAP-08 — Dhan 429 rate-limit cooldown persisted across a process restart
+
+> **⚠ VARIANT RETIRED in the C4 sweep (2026-07-15):** the `WsGap08RateLimitCooldown` ErrorCode
+> variant is DELETED — its only emit sites (the Dhan main-feed 429 classification + boot-wait sites) were
+> deleted in Phases C2/C3 (#1522/#1569) with the Dhan live WS (operator
+> 2026-07-13, `websocket-connection-scope-lock.md` "2026-07-13 Amendment").
+> Content below retained for historical audit; the code string stays
+> reverse-crossref-allowlisted.
 
 **Trigger:** the main-feed WebSocket connect was rate-limited by Dhan with
 HTTP 429 (DATA-805 "too many requests/connections" class). The in-memory
@@ -267,6 +295,13 @@ cooldown wait, plus a stub-guard that the wait keeps reading the persisted
 file and stays clamped to the cap.
 
 ## WS-GAP-09 — pool watchdog reconnected IN PLACE instead of `process::exit`
+
+> **⚠ VARIANT RETIRED in the C4 sweep (2026-07-15):** the `WsGap09WatchdogReconnectInPlace` ErrorCode
+> variant is DELETED — its only emit sites (the Dhan main-feed pool watchdog Halt arm) were
+> deleted in Phases C2/C3 (#1522/#1569) with the Dhan live WS (operator
+> 2026-07-13, `websocket-connection-scope-lock.md` "2026-07-13 Amendment").
+> Content below retained for historical audit; the code string stays
+> reverse-crossref-allowlisted.
 
 **Trigger:** the pool watchdog reached its `>300s all-down → Halt` verdict, but
 the down-cause classified as a **benign bare-Dhan-transport-RST** class rather

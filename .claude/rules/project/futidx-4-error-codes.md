@@ -23,13 +23,13 @@
 > (operator directive 2026-07-13, `websocket-connection-scope-lock.md` "2026-07-13
 > Amendment"), so the §36 grant's DHAN subscription leg (the ~08:45 daily-universe build,
 > the Dhan FUTIDX-01 emit site, `record_dhan_selection_from_universe`, the prev-day/
-> cross-verify skip counters) retires with it — deletion lands with the Phase C PRs. The
+> cross-verify skip counters) retires with it — deletion LANDED in PR-C3 (2026-07-14). The
 > GROWW leg is UNCHANGED (§36.7 all-months, watch-set extraction, Groww FUTIDX-01 arms,
-> cap-priority). Phase C obligation (scope-lock §B): the shared selector
-> `index_futures.rs` must be DE-GATED from the `daily_universe_fetcher` cargo feature or
-> the Groww futures silently drop. `FUTIDX-02` goes structurally DORMANT (below), and the
-> §3 far-month alarm-gate exclusion dies with the tick-gap detector (Q4-ii). Dhan-side
-> content retained for historical audit.
+> cap-priority). Phase C obligation (scope-lock §B) SATISFIED in PR-C3: the shared selector
+> `index_futures.rs` is DE-GATED (the `daily_universe_fetcher` cargo feature is deleted) so
+> the Groww futures cannot silently drop. `FUTIDX-02` is structurally DORMANT (below), and
+> the §3 far-month alarm-gate exclusion died with the tick-gap detector (Q4-ii — LANDED
+> PR-C3, 2026-07-14). Dhan-side content retained for historical audit.
 
 ## §0. Why these codes exist
 

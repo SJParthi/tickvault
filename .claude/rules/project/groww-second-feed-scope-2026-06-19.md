@@ -77,7 +77,7 @@ drift/missing-tick problem against an independent second source.
 - **Dhan pipeline, tables, boot path** — not modified. Groww default-OFF ⇒ zero behaviour change until explicitly enabled.
 - **The resilience architecture is REUSED, never redesigned** — WAL frame spill (`ws_frame_spill.rs`), rescue ring (`TICK_BUFFER_CAPACITY`), disk spill (NDJSON), DLQ, tick processor, 1-minute aggregator. Groww plugs into these as a second producer; it does not change their design.
 - **Composite uniqueness** `(security_id/symbol, exchange_segment)` per I-P1-11 + DEDUP UPSERT KEYS on the SHARED tables, now extended with `feed` so multi-feed rows never collide (`ticks` key = `(ts, security_id, segment, capture_seq, feed)`).
-- **Indicators/strategies boundary** (daily-universe lock §28) — untouched. Groww is feed + 1m candles + parity check only; it drives NO strategy and places NO order.
+- **Indicators/strategies boundary** (daily-universe lock §28) — untouched. Groww is feed + 1m candles + parity check only; it drives NO strategy and places NO order (superseded for the GATED order-side build by §39, 2026-07-14 — the order-side is BUILT behind the 4-gate live-fire lattice; live fire still locked, §28 strategy wiring still frozen).
 
 ---
 
@@ -89,7 +89,7 @@ drift/missing-tick problem against an independent second source.
 - Writes a Groww row to a shared table WITHOUT setting `feed='groww'`, OR omits `feed` from the `ticks` DEDUP key (would let a Groww tick overwrite a Dhan tick = silent loss).
 - Ships Groww **default ON** without a fresh dated operator quote (default is OFF; flipping it on by default changes prod behaviour).
 - Removes the per-feed enable/disable flags or makes a feed un-disableable.
-- Wires Groww into any strategy/order path (parity-check + observability ONLY in this scope).
+- Wires Groww into any strategy/order path (parity-check + observability ONLY in this scope) (superseded for the GATED order-side build by §39, 2026-07-14 — order-side integration is authorized behind the 4-gate live-fire lattice; strategy wiring + live order fire still locked).
 - Adds a NEW Dhan WebSocket endpoint (that remains forbidden by `websocket-connection-scope-lock.md`).
 - **Pulls, vendors, copies, or imports ANY code from the brutex repo (Python or otherwise).** brutex is a design/protocol REFERENCE ONLY — the Groww implementation is native tickvault Rust. A PR containing vendored brutex code, a `growwapi` Python dependency, or a Python sidecar process = REJECT.
 - Gives Groww a weaker resilience guarantee than Dhan (e.g. skips WAL-before-broadcast, skips reconnect, or allows a tick-drop path Dhan doesn't have). Groww MUST inherit the same bounded zero-tick-loss chain.
@@ -798,7 +798,7 @@ tasks only; the live WS capture chain, the tick hot path, and the Dhan legs are 
   `gdf-third-feed-scope-2026-07-13.md`).
 - Shipping the chain leg DEFAULT-ON before first-live-session verification AND a fresh dated
   quote recorded here.
-- Any hot-path / WS-read-loop / strategy / order involvement (cold-path only; §28 boundary).
+- Any hot-path / WS-read-loop / strategy / order involvement (cold-path only; §28 boundary) (the §38 REST legs stay cold-path-only; the separate GATED order-side build is §39, 2026-07-14 — live fire still locked).
 - Extending scope (a 4th index, stocks, non-current expiries, an unbounded contract set)
   without a fresh dated quote HERE first.
 
@@ -998,3 +998,132 @@ Summary of what changed on the Groww legs (the Dhan legs are untouched):
    backfill, the 15:31 sweep, the escalation edges, the token discipline and
    the §38.8 decision-freshness gate are ALL unchanged (never-skip capture
    stands; late rungs are record-only).
+
+---
+
+# §39 — Groww ORDER-SIDE build: gated live-fire lattice (operator authorization 2026-07-14)
+
+> **Authority:** this section EXTENDS the Groww feed scope. It is the first
+> authorization to BUILD any Groww order-side code. It PARTIALLY SUPERSEDES the
+> §1/§3/§4 "no order path / places NO order / no strategy wiring" clauses ONLY
+> for the GATED build below — live order fire remains LOCKED (a separate future
+> dated flip). The 2-Dhan-WS lock, the shared-table + feed-in-key model, the
+> token-minter lock (`groww-shared-token-minter-2026-07-02.md`), `dry_run =
+> true`, and the §28 strategy/indicator boundary are ALL unchanged. Companion
+> lock: `no-rest-except-live-feed-2026-06-27.md` §10. Build reference:
+> `docs/groww-ref/16-orders-margins-portfolio.md`. Companion plan:
+> `.claude/plans/active-plan-groww-order-build.md`.
+
+## §39.0 The verbatim operator authorization (2026-07-14 — preserve exactly, do not paraphrase)
+
+**Operative authorization — the operator's DIRECT dated in-thread confirmation (2026-07-14, typed by Parthiban into this session's thread, event `321350d4-cf70-4a1c-88fc-36584527c8fd`), verbatim:**
+
+> "confirm — apply the Groww order scope-unlock PR-0. Build only, behind the OFF switch, no live orders"
+
+**Originating build directive (same day, relayed verbatim via the coordinator session):**
+
+> "build design architect and even integrate everything entirely… only when I turn on/off or enable live orders then live orders should be placed."
+
+The direct in-thread confirmation is the operative authorization satisfying this
+file's §15-class scope-lock protocol (the §37 dated-quote precedent); the relayed
+directive is the originating intent it confirms — BUILD + INTEGRATE only, behind
+the OFF switch, NO live orders.
+
+## §39.1 The grant — one paragraph
+
+The Groww ORDER-SIDE — orders, smart orders (GTT/OCO), portfolio (positions +
+holdings), margins (user margin + calculator), and user profile + exceptions,
+per `docs/groww-ref/16-orders-margins-portfolio.md` — is authorized to be BUILT
+and INTEGRATED end-to-end, natively in tickvault Rust (brutex/SDK are reference
+only, no code pulled), **entirely behind a 4-gate live-fire lattice** (§39.2).
+MUTATING endpoints (order create/modify/cancel, smart-order create/modify/cancel)
+are HARD-LOCKED until the operator's explicit live-orders enable — a SEPARATE,
+FUTURE, DATED flip that edits this §39 + Gate 3 FIRST; a config value can never,
+by itself, place a live order. READ-ONLY order-side GETs (order list/detail/
+status/status-by-reference/trades, positions, holdings, margins, user profile)
+are per-area **config-gated DEFAULT-OFF + market-hours-only** (the cold-path
+scheduled-read discipline) — they place no order. Every area maps its broker
+payloads onto the neutral `tickvault_common::broker_order_events::BrokerOrderEvent`
+seam (the broker id REUSES the existing `Feed` enum — no duplicate). The Groww
+live feed + the §36/§38 REST legs + the tick hot path + the token-minter lock
+are UNTOUCHED. `dry_run` stays `true`; §28 stays frozen.
+
+## §39.2 The 4-gate live-fire lattice (LOCKED)
+
+Zero Groww order-side request fires until the operator's dated live-orders
+enable aligns all four gates. Each gate is independently BUILD-FAILURE-ratcheted
+by `crates/common/tests/groww_order_lattice_guard.rs`.
+
+| # | Gate | Mechanism | Default | Ratchet (all in `crates/common/tests/groww_order_lattice_guard.rs`) |
+|---|---|---|---|---|
+| 1 | Config default-OFF | `[groww_orders]` (`GrowwOrdersConfig`) — every key `#[serde(default)] = false`; read-only GETs run only per-area-true + market-hours; `live_fire_requested` inert without Gate 3 | all OFF | `test_gate1_groww_orders_config_defaults_all_off`, `test_gate1_base_toml_groww_orders_keys_all_false` |
+| 2 | Non-default cargo feature | `groww_orders = []` in BOTH `crates/common/Cargo.toml` + `crates/trading/Cargo.toml`; the `crates/trading/src/oms/groww/` subtree compiles ONLY under it; never in a `default = [...]` set | feature OFF | `test_gate2_groww_orders_feature_present_and_never_default` |
+| 3 | Hardcoded const | `pub const GROWW_ORDER_LIVE_FIRE: bool = false;` (`crates/common/src/constants.rs`) — every mutating order path fail-closed refuses while `false`, independent of config | `false` | `test_gate3_live_fire_const_is_false` |
+| 4 | Rule lock | this §39 + `no-rest-except-live-feed-2026-06-27.md` §10; flipping live fire needs a fresh dated quote editing §39 + Gate 3 first | locked | `test_gate4_rule_files_carry_the_lattice_markers` |
+
+Plus a workspace scan (`test_gate5_no_ungated_groww_order_side_call_site`): no
+Groww order-side path string may appear in `crates/*/src` outside the sanctioned
+`oms/groww/` subtree.
+
+## §39.3 Area collision contract (one owner per file — serial area PRs)
+
+Each order-side area lands as its OWN file on a non-overlapping path with its own
+error-code prefix, so two area PRs never touch the same file:
+
+| Area | File | Error codes |
+|---|---|---|
+| Orders | `crates/trading/src/oms/groww/api_client.rs` | `GROWW-ORD-*` |
+| Smart Orders (GTT/OCO) | `crates/trading/src/oms/groww/smart_orders.rs` | `GROWW-OCO-*` |
+| Portfolio (positions + holdings) | `crates/trading/src/oms/groww/portfolio.rs` | `GROWW-PORT-*` |
+| Margin (user + calculator) | `crates/trading/src/oms/groww/margin.rs` | `GROWW-MARG-*` |
+| User + Exceptions (readiness) | `crates/trading/src/oms/groww/user.rs` | `GROWW-READY-*` (readiness reuses the existing SPOT1M/CHAIN codes per its design) |
+
+**Shared files** touched SERIALLY by the build lead ONLY (never two area PRs at
+once): `crates/common/src/error_code.rs`, `crates/common/src/config.rs`,
+`config/base.toml`, `crates/core/src/notification/events.rs`,
+`crates/trading/src/oms/mod.rs`, `crates/trading/src/oms/groww/mod.rs`.
+
+## §39.4 What still REJECTS (even under this grant)
+
+- Any Groww mutating order request while ANY of Gates 1–3 is not aligned (config
+  `live_fire_requested`, the `groww_orders` feature, and `GROWW_ORDER_LIVE_FIRE`
+  must ALL be flipped, and §39 dated, before a single live order fires).
+- A Groww order-side call site OUTSIDE `crates/trading/src/oms/groww/` (Gate 5).
+- Placing an order without mapping through the neutral `BrokerOrderEvent` seam;
+  inventing a second broker id enum instead of reusing `Feed`.
+- Wiring the order-side into any strategy / indicator / risk path (§28 frozen) —
+  the order-side is plumbing only until a separate strategy scope authorizes it.
+- Minting a Groww token, or reading the credential params (token-minter lock).
+- Any bulk Groww historical / backtest fetch (§33) under cover of this grant.
+- Flipping any gate default (config key `true` in base.toml / feature in a
+  default set / the const `true`) without a fresh dated quote HERE first.
+
+Any such PR MUST be rejected in review even if the operator approves verbally —
+the operator must update THIS §39 first with a fresh dated quote.
+
+## §39.5 Honest envelope (mandatory per §5 / operator-charter §F)
+
+> "100% inside the tested envelope, with ratcheted regression coverage: the
+> Groww order-side ships DARK behind four build-failure-ratcheted gates; a
+> default build contains no Groww order code, and no order request can fire
+> until a dated operator live-orders enable aligns all four gates. The neutral
+> `BrokerOrderEvent` seam is pure data + total no-panic status mappers (garbage
+> → Unknown, raw string preserved). NOT claimed: LIVE Groww order behaviour —
+> the mappers, request shapes, and error handling are PAPER-MODE tested against
+> `docs/groww-ref/16` only; the live wire (status vocabulary incl. the
+> undocumented `OPEN`, timestamp formats, per-GA HTTP status, rate-limit family)
+> is UNVERIFIED-LIVE; and whether our Groww API key carries ORDER entitlement at
+> all is UNPROBED (the first authorized live session is the probe). dry_run
+> stays true; §28 stays frozen; the token-minter lock is untouched."
+
+## §39.6 Auto-driver / Insta-reel explanation
+
+> Sir, the juice shop is building an ORDERING counter for supplier Groww — the
+> machine, the pad, the receipt book, everything, fully installed. But there are
+> FOUR locks on the "send the order" lever, all closed: a switch on the wall
+> (config), a special part that isn't even fitted in a normal machine (the cargo
+> feature), a hard metal bolt welded shut inside (the const), and a written rule
+> on the door (the lock file). The boy can read the price cards and count stock
+> (read-only, only during shop hours), but he physically CANNOT send a single
+> real order until YOU, on a dated day, open all four locks yourself. Until then
+> the counter is built, tested, and completely silent.

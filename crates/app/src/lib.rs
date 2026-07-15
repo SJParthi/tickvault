@@ -23,9 +23,10 @@ pub mod bar_cache_loader;
 // coverage-horizon staleness watchdog - pages the operator BEFORE the
 // calendar runs off its year-end cliff into un-listed holidays.
 pub mod calendar_staleness;
-// Operator directive 2026-06-02: post-market (15:31 IST) 1-minute
-// cross-verification of live candles_1m vs Dhan intraday — CSV + audit + count.
-pub mod cross_verify_1m_boot;
+// PR-C3 (2026-07-14): `cross_verify_1m_boot` module DELETED — the 15:31 IST
+// Dhan live-vs-historical 1m cross-verify retired with the Dhan live WS
+// (operator 2026-07-13; cross-verify-1m-error-codes.md retirement banner).
+// Its parser lives on in `dhan_intraday_parse` (relocated in C1).
 // BruteX↔TickVault daily cross-verify (BRUTEX-XVERIFY, 2026-07-12): PURE
 // comparison core — CSV parse, symbol mapping, day compare. No I/O; the
 // boot/runner shell lives in brutex_crossverify_boot (Unit 5).
@@ -158,68 +159,40 @@ pub mod infra;
 // "only ticks and our 9 needed candle timeframes are available".
 // The 25 `movers_*` matviews + `movers_1s` base table are dropped at
 // boot by `materialized_views::drop_bug3_retired_views`.
-// PR #454 (2026-05-03): boot-time prev_oi cache loader. Wires
-// bhavcopy → cache extraction primitives into the boot path so the
-// in-memory cache (consumed by the cascade seal-time pct-stamping
-// path + tick enricher) is Dhan-precise from the first tick.
-pub mod prev_day_ohlcv_boot;
+// PR-C3 (2026-07-14): `prev_day_ohlcv_boot` module DELETED — the boot-time
+// previous-day OHLCV REST fetch retired with the Dhan live-WS lane (operator
+// 2026-07-13; prev-day-ohlcv-error-codes.md retirement banner). The
+// `prev_day_ohlcv` QuestDB table is retained (forensic).
 // F2 (Wave-5 #504e follow-up) — boot-time loader for `PrevDayCache`
 // so the cascade seal-time pct-stamping path (PR #520 / F1) sees
 // non-zero `prev_day_close` values from QuestDB's `previous_close`
 // table on cold boot.
 pub mod metrics_catalog;
-// Sub-PR #10b-ζ-2 (2026-05-27): maps INSTR-FETCH per-attempt + terminal
-// fetch outcomes → `instrument_fetch_audit` rows and writes them via the
-// storage helper. App crate owns this seam because `core` (the runner)
-// cannot depend on `storage` (the writer). Feature-gated under
-// `daily_universe_fetcher` per rule §21; boot callsite lands in the
-// final Sub-PR #10 orchestrator.
-#[cfg(feature = "daily_universe_fetcher")]
-pub mod instr_fetch_audit_writer;
-// §31 item 2 (NTM Map-B, 2026-06-06): boot population of the full
-// index→constituents mapping (all ~46 tracked indices). Map-only, decoupled,
-// degrade-safe — does NOT touch the live subscription. Feature-gated per §21.
-#[cfg(feature = "daily_universe_fetcher")]
-pub mod index_constituency_boot;
-// Boot-time read-back of yesterday's instrument_lifecycle rows — the
-// read-side primitive the daily reconciler I/O loop diffs against today's
-// CSV. Feature-gated per rule §21.
-#[cfg(feature = "daily_universe_fetcher")]
-pub mod lifecycle_cache_loader;
-// Daily reconcile-plan computation — pure diff of today's universe vs
-// yesterday's read-back into a list of state transitions to persist.
-// Feature-gated per rule §21.
-#[cfg(feature = "daily_universe_fetcher")]
-pub mod lifecycle_reconcile_plan;
-// Extract today's full per-instrument detail from the built DailyUniverse
-// (#845 parser detail) for the lifecycle-row UPSERT. Feature-gated §21.
-pub mod observability;
-#[cfg(feature = "daily_universe_fetcher")]
-pub mod today_instrument;
-// Pure value-resolution helpers for the reconciler apply step (expiry
-// date→nanos, first_seen preservation, UPSERT/UPDATE routing).
-// Feature-gated §21; the async apply loop is a follow-up.
-#[cfg(feature = "daily_universe_fetcher")]
-pub mod lifecycle_apply;
-// The async apply step: walks the reconcile plan applying §24 audit-first
-// ordering (append audit row → UPSERT present / UPDATE disappearance).
-// Feature-gated §21; boot wiring is a follow-up.
-#[cfg(feature = "daily_universe_fetcher")]
-pub mod apply_reconcile_plan;
-// App-side reconcile orchestrator: chains extract → load-prev → plan →
-// apply into one async entry point. Fail-closed on read-back error.
-// Feature-gated §21; the HTTP-fetch/retry/main.rs spawn is a follow-up.
-#[cfg(feature = "daily_universe_fetcher")]
-pub mod lifecycle_reconcile_orchestrator;
-// Outer daily-universe boot orchestrator: §4 fetch-runner → reconcile →
-// terminal fetch-audit, capturing CSV SHA-256 provenance. Feature-gated
-// §21; the main.rs Step-6c task spawn is the final wiring PR.
+// PR-C3 (2026-07-14, operator retirement directive 2026-07-13 — scope-lock
+// amendment §B): the Dhan lifecycle-reconcile + fetch-audit chain is
+// DELETED with the instrument-download chain and the
+// `daily_universe_fetcher` feature itself: `instr_fetch_audit_writer`,
+// `lifecycle_cache_loader`, `lifecycle_reconcile_plan`, `today_instrument`,
+// `lifecycle_apply`, `apply_reconcile_plan`,
+// `lifecycle_reconcile_orchestrator`, `daily_universe_boot`. The SEBI
+// tables they wrote (`instrument_lifecycle` / `instrument_lifecycle_audit`
+// / `instrument_fetch_audit` / `index_constituency`) are RETAINED
+// (never-delete) and keep their now-ungated storage persistence modules;
+// the Groww shared-master writer remains their live producer.
+// `index_constituency_boot` is KEPT (ungated) TRIMMED to its process-global
+// ts-pin migration half — load-bearing for the Groww append MigrationGate.
 /// W2#7 (2026-07-10): supervised SSM re-read loop so the operator can
 /// rotate the API bearer token (/tickvault/<env>/api/bearer-token) without
 /// an app restart — closes audit row 13.
 pub mod api_token_rotation;
-#[cfg(feature = "daily_universe_fetcher")]
-pub mod daily_universe_boot;
+/// 🔷 DHAN exit-order execution dispatcher (Cluster B, 2026-07-14) — the
+/// S6-G1 call-site hub for every engine exit method + LOCK #2's runtime
+/// `!cfg.enabled` gate. Future entry-side (Cluster A) work constructs
+/// `ExitCommand`s; only this module executes them (never the engine
+/// methods directly).
+pub mod exit_execution;
+pub mod index_constituency_boot;
+pub mod observability;
 /// Cluster-C order-side observability (2026-07-14): OmsAlertSink /
 /// RiskAlertSink bridges → Telegram + the rebuilt SEBI order_audit /
 /// pnl_audit tables via one bounded mpsc(1024) consumer task; daily

@@ -13,7 +13,10 @@
 
 ---
 
-> **⚠ RETIREMENT AUTHORIZED 2026-07-13 (deletion lands with the Phase C PRs):**
+> **⚠ RETIREMENT AUTHORIZED 2026-07-13 — deletion LANDED in PR-C3 (2026-07-14);
+> the `PrevDay01CoverageEmpty` variant DELETED in the C4 sweep (2026-07-15):
+> `prev_day_ohlcv_boot.rs` is DELETED; the `prev_day_ohlcv` table is retained
+> (forensic). Original authorization text follows:**
 > `PREVDAY-01` (`PrevDay01CoverageEmpty`) and the boot-time prev-day OHLCV fetch retire
 > with the Dhan live WS lane (Q1, 2026-07-13 — the fetch's universe input and its
 > `*_pct_from_prev_day` consumers are lane-only; `websocket-connection-scope-lock.md`
