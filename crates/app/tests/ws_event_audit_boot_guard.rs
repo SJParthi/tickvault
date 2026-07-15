@@ -47,9 +47,15 @@ fn test_spawn_ws_event_audit_consumer_wired_and_moved_intact() {
         src.contains("use tickvault_app::ws_audit_consumer::spawn_ws_event_audit_consumer;"),
         "main.rs must re-import the relocated consumer helper."
     );
+    // PR-C2 (2026-07-13, operator retirement directive —
+    // websocket-connection-scope-lock.md "2026-07-13 Amendment"): the Dhan
+    // main-feed pool (and its named `Some(ws_audit_tx)` sender) DIED with
+    // the lane. The surviving main.rs producers are the Groww bridge /
+    // fleet / sidecar-supervisor sites, each creating its own consumer
+    // inline via the shared helper (counted in the next test).
     assert!(
-        src.contains("Some(ws_audit_tx)"),
-        "the audit channel sender must be passed into the WebSocket pool."
+        src.contains("Some(spawn_ws_event_audit_consumer(config.questdb.clone()))"),
+        "the Groww producer sites must pass an inline consumer sender."
     );
 }
 
@@ -63,12 +69,10 @@ fn test_order_update_connection_is_audit_wired() {
         .count();
     assert!(
         helper_calls >= 2,
-        "the order-update spawn site(s) must call spawn_ws_event_audit_consumer too \
-         (found {helper_calls} call(s); expected the pool + at least one order-update site)."
-    );
-    assert!(
-        src.contains("ord_ws_audit_tx") || src.contains("ou_ws_audit_tx"),
-        "the order-update spawn must pass an audit sender into run_order_update_connection."
+        "the Groww producer sites must call spawn_ws_event_audit_consumer \
+         (found {helper_calls} call(s); expected the bridge + stall-watchdog \
+         sites). PR-C2 (2026-07-13): the legacy main.rs order-update spawn \
+         died with the lane — the stack pins below own that half now."
     );
     // 2026-07-14 operator Dhan noise lock: the PR-C1/Q4-i dhan_rest_stack
     // order-update spawn is RETIRED — the stack must no longer open the

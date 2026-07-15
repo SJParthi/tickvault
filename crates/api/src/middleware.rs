@@ -1673,8 +1673,12 @@ mod tests {
             .or_else(|_| std::fs::read_to_string("crates/app/src/main.rs"))
             .expect("main.rs must be readable from middleware test working dir");
 
-        // Both boot paths must hard-fail on SSM error via `.await.context(...)?`.
-        // Count occurrences — must be at least 2 (slow + fast boot).
+        // The boot path must hard-fail on SSM error via `.await.context(...)?`.
+        // PR-C2 (2026-07-13): the FAST crash-recovery boot arm was deleted
+        // with the Dhan live-WS lane, so the single surviving boot path
+        // (build_shared_infra) carries the one required call — the ratchet
+        // moves from >=2 (slow + fast) to >=1 without weakening the
+        // no-env-fallback contract (the negative ratchet below is unchanged).
         let ssm_calls = main_rs
             .matches("fetch_api_bearer_token()\n            .await\n            .context")
             .count()
@@ -1682,10 +1686,10 @@ mod tests {
                 .matches("fetch_api_bearer_token()\n        .await\n        .context")
                 .count();
         assert!(
-            ssm_calls >= 2,
-            "main.rs MUST call fetch_api_bearer_token().await.context(...) in both \
-             boot paths (slow + fast); found {ssm_calls} occurrence(s). Regressing \
-             this re-introduces an env-var fallback that violates project rule \
+            ssm_calls >= 1,
+            "main.rs MUST call fetch_api_bearer_token().await.context(...) in the \
+             boot path; found {ssm_calls} occurrence(s). Regressing this \
+             re-introduces an env-var fallback that violates project rule \
              'always real AWS, never mocks'."
         );
 

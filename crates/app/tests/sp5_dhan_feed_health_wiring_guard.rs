@@ -33,47 +33,16 @@ fn read_tick_processor() -> String {
     std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
 }
 
-/// `spawn_pool_watchdog_task` must accept the feed-health registry AND call
-/// `set_connected(Feed::Dhan, …)` so the Dhan connected slot is written.
-#[test]
-fn test_pool_watchdog_sets_dhan_connected() {
-    let src = read_app_main();
-    assert!(
-        src.contains("fn spawn_pool_watchdog_task(")
-            && src.contains("feed_health: Option<std::sync::Arc<tickvault_common::feed_health::FeedHealthRegistry>>"),
-        "SP5 regression: spawn_pool_watchdog_task no longer takes the feed-health \
-         registry — the Dhan connected state can't reach /api/feeds/health."
-    );
-    assert!(
-        src.contains("fh.set_connected(") && src.contains("tickvault_common::feed::Feed::Dhan"),
-        "SP5 regression: the watchdog accepts the registry but never calls \
-         set_connected(Feed::Dhan, …) — pass-through with no write is not wiring."
-    );
-}
-
-/// Both `run_tick_processor` calls AND both `spawn_pool_watchdog_task` calls
-/// must pass `Some(Arc::clone(&feed_health))` so BOTH boot paths report Dhan.
-#[test]
-fn test_both_boot_paths_pass_feed_health() {
-    let src = read_app_main();
-    // Each boot path (fast + slow) clones feed_health twice: once into the
-    // tick-processor coroutine (`let feed_health_for_processor = Arc::clone(...)`)
-    // and once inline into the watchdog call → ≥4 `Arc::clone(&feed_health)`,
-    // plus ≥2 `Some(feed_health_for_processor)` passes to run_tick_processor.
-    let clones = src.matches("std::sync::Arc::clone(&feed_health)").count();
-    assert!(
-        clones >= 4,
-        "SP5 regression: expected ≥4 `Arc::clone(&feed_health)` (fast+slow boot × \
-         tick_processor clone + watchdog); found {clones}. A missing wiring means \
-         one boot path reports Dhan as `unknown` forever."
-    );
-    let processor_passes = src.matches("Some(feed_health_for_processor)").count();
-    assert!(
-        processor_passes >= 2,
-        "SP5 regression: expected ≥2 `Some(feed_health_for_processor)` passes to \
-         run_tick_processor (fast+slow boot); found {processor_passes}."
-    );
-}
+// RETIRED (PR-C2, 2026-07-13 — Dhan live-WS lane deletion, operator
+// retirement directive per websocket-connection-scope-lock.md "2026-07-13
+// Amendment" §B): `test_pool_watchdog_sets_dhan_connected` and
+// `test_both_boot_paths_pass_feed_health` pinned the pool watchdog's
+// `set_connected(Feed::Dhan, …)` write and the fast+slow boot-path
+// feed-health plumbing — the pool watchdog, both boot arms, and the Dhan
+// tick-processor spawn are DELETED with the lane. /api/feeds/health now
+// honestly reports the Dhan MARKET-DATA feed as not-running (config-off,
+// retired); the retained tick_processor.rs / ws_frame_spill.rs record-site
+// pins below survive (the modules are retained pending Phase C).
 
 /// The tick processor must record the Dhan tick at the heartbeat block using the
 /// WALL-CLOCK receipt time converted to IST nanos (`+ IST_UTC_OFFSET_NANOS`).

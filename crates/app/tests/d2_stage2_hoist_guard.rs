@@ -1,18 +1,29 @@
 //! D2 Stage 2 — genuine shared-infra hoist guard (source-scan ratchet).
 //!
-//! Stage 2 hoists the 9 PROCESS-shared blocks (notifier, health, seal-writer,
-//! the tick + order-update broadcasts, the obs / 21-TF aggregator / tick-storage
-//! subscriber tasks, the API server) OUT of the Dhan-ON slow arm and into a
-//! single `build_shared_infra(...)` prefix shared by BOTH the Dhan-OFF and
-//! Dhan-ON-slow paths, deletes the D2-pre duplicate `run_shared_infra_only`, and
-//! wraps the Dhan lane in a single `if config.feeds.dhan_enabled { … }` whose
-//! value is `Option<DhanLaneRunHandles>`, then runs ONE `run_process_runloop`.
+//! Stage 2 hoisted the PROCESS-shared blocks (notifier, health, seal-writer,
+//! the tick + order-update broadcasts, the obs / 21-TF aggregator /
+//! tick-storage subscriber tasks, the API server) into a single
+//! `build_shared_infra(...)` prefix and deleted the D2-pre duplicate
+//! `run_shared_infra_only`.
 //!
-//! This SOURCE-SCAN ratchet (same pattern as the existing boot-isolation guards)
-//! reads the literal `crates/app/src/main.rs` and fails the build if a future
-//! edit re-introduces a duplicate shared-infra construction, removes the lane
-//! gate, double-binds the API, or breaks the subscribe-before-publish ordering
-//! (the zero-tick-loss invariant).
+//! ## PR-C2 re-shape (2026-07-13 — Dhan live-WS lane deletion, operator
+//! retirement directive per websocket-connection-scope-lock.md "2026-07-13
+//! Amendment" §B)
+//! The fast crash-recovery arm, the "SLOW BOOT PATH" marker, the
+//! `let dhan_lane: Option<DhanLaneRunHandles> = if config.feeds.dhan_enabled`
+//! gate, and the Dhan `run_tick_processor` publish site all DIED with the
+//! lane — main.rs has a SINGLE boot path. Retired tests:
+//! - `dhan_lane_is_wrapped_in_feed_gate` — the lane gate no longer exists;
+//!   the replacement Dhan shape (dhan_rest_stack spawn + no lane primitives)
+//!   is pinned by `per_feed_boot_isolation_guard.rs`.
+//! - the Dhan publish-ORDERING half of
+//!   `aggregator_subscribe_precedes_dhan_tick_publish` — there is no Dhan
+//!   tick publisher; the Groww bridge runs its OWN aggregator instance with
+//!   its own wiring guards. The builder-spawns-the-shared-pipeline half
+//!   SURVIVES below.
+//! The single-construction contract (ONE `build_shared_infra` call, the API
+//! bound once, the 21-TF aggregator spawned once) survives re-anchored on
+//! the whole file instead of the deleted slow-path slice.
 
 /// Read `crates/app/src/main.rs` regardless of the test's working directory.
 fn read_main_rs() -> String {
@@ -21,40 +32,35 @@ fn read_main_rs() -> String {
         .expect("main.rs must be readable from the app crate test working dir")
 }
 
-/// Slice of `main()` *after the fast crash-recovery arm* — i.e. the unified slow
-/// path: the hoisted `build_shared_infra` prefix + the Dhan lane + the run-loop.
-/// Bounded `[SLOW BOOT PATH .. first top-level fn after main]`. The fast arm
-/// (Dhan-ON-only, byte-identical by design L10/D2d) and the helper fn
-/// DEFINITIONS at the end of the file are both excluded, so counts reflect the
-/// slow-path CALL sites only.
-fn slow_path_of_main(src: &str) -> String {
-    let slow_marker = src.find("SLOW BOOT PATH").expect("slow-boot marker");
-    // `main()` ends at the first top-level `fn ` after it (column-0).
-    let main_end = src[slow_marker..]
-        .find("\nfn ")
-        .or_else(|| src[slow_marker..].find("\nasync fn "))
-        .map(|rel| slow_marker + rel)
+/// Body of `build_shared_infra` — from its `async fn` line to the next
+/// top-level `async fn` (or EOF).
+fn build_shared_infra_body(src: &str) -> &str {
+    let builder = src
+        .find("async fn build_shared_infra(")
+        .expect("build_shared_infra must exist");
+    let builder_end = src[builder..]
+        .find("\nasync fn ")
+        .map(|rel| builder + rel)
         .unwrap_or(src.len());
-    src[slow_marker..main_end].to_string()
+    &src[builder..builder_end]
 }
 
 #[test]
 fn run_shared_infra_only_is_deleted() {
-    // The D2-pre duplicate OFF-only shared-infra mirror FUNCTION is gone — Stage 2
-    // routes BOTH paths through the single `build_shared_infra` construction.
+    // The D2-pre duplicate OFF-only shared-infra mirror FUNCTION is gone — the
+    // single boot path routes through the one `build_shared_infra` construction.
     // (Comments may still REFERENCE the old name; we assert the definition + call
     // are gone, not the mere string.)
     let src = read_main_rs();
     assert!(
         !src.contains("fn run_shared_infra_only"),
         "D2 Stage 2: the `run_shared_infra_only` function (the D2-pre OFF-only \
-         duplicate) MUST be deleted — both the Dhan-OFF and Dhan-ON-slow paths now \
-         share the ONE `build_shared_infra` construction."
+         duplicate) MUST stay deleted — the boot path shares the ONE \
+         `build_shared_infra` construction."
     );
     assert!(
         !src.contains("run_shared_infra_only("),
-        "D2 Stage 2: there must be NO call to `run_shared_infra_only(...)` — the \
-         Dhan-OFF path falls through to the unified `build_shared_infra` prefix."
+        "D2 Stage 2: there must be NO call to `run_shared_infra_only(...)`."
     );
     assert!(
         src.contains("async fn build_shared_infra("),
@@ -64,110 +70,65 @@ fn run_shared_infra_only_is_deleted() {
 
 #[test]
 fn single_shared_infra_construction() {
-    // Exactly ONE shared-infra construction reachable from the slow boot path:
-    // the `axum::serve` API bind happens once (in build_shared_infra, CALLED once
-    // from the slow path), and `spawn_engine_b_aggregator` is CALLED once from the
-    // slow path (via build_shared_infra). (The fast arm has its own byte-identical
-    // copy by design L10/D2d — excluded; helper fn DEFINITIONS are excluded.)
+    // Exactly ONE shared-infra construction: one `build_shared_infra(` call
+    // beyond the definition, the API bound once (inside the builder), the
+    // 21-TF aggregator spawned once (inside the builder). PR-C2: re-anchored
+    // on the whole file — the fast/slow split no longer exists.
     let src = read_main_rs();
-    let slow = slow_path_of_main(&src);
 
-    // Exactly one `build_shared_infra(` CALL on the slow path.
-    let build_calls = slow.matches("build_shared_infra(").count();
+    let total = src.matches("build_shared_infra(").count();
+    let defs = src.matches("async fn build_shared_infra(").count();
+    assert_eq!(defs, 1, "exactly one build_shared_infra definition");
     assert_eq!(
-        build_calls, 1,
-        "D2 Stage 2: exactly ONE `build_shared_infra(...)` call must exist on the slow \
-         path. Found {build_calls}."
+        total - defs,
+        1,
+        "exactly ONE `build_shared_infra(...)` call must exist (found {}) — a \
+         second construction would double-spawn the shared pipeline.",
+        total - defs
     );
 
-    // The old slow-arm `axum::serve` bind is removed — the API now binds ONLY in
-    // build_shared_infra, so there is NO `axum::serve` call left in main()'s slow
-    // path (it moved into the helper fn).
-    let serve_calls = slow.matches("axum::serve(").count();
+    let builder_body = build_shared_infra_body(&src);
+
+    // The API binds exactly once, and that bind lives inside the builder.
+    let serve_total = src.matches("axum::serve(").count();
     assert_eq!(
-        serve_calls, 0,
-        "D2 Stage 2: the slow-arm `axum::serve` bind MUST be removed (the API now \
-         binds once inside `build_shared_infra`). Found {serve_calls} stray binds — a \
+        serve_total, 1,
+        "exactly one `axum::serve` bind may exist (found {serve_total}) — a \
          second bind would double-bind the port and break boot."
     );
-
-    // Likewise the old slow-arm `spawn_engine_b_aggregator` call is removed (it
-    // moved into build_shared_infra).
-    let aggregator_calls = slow.matches("spawn_engine_b_aggregator(").count();
     assert_eq!(
-        aggregator_calls, 0,
-        "D2 Stage 2: the slow-arm `spawn_engine_b_aggregator` call MUST be removed (it \
-         now runs once inside `build_shared_infra`). Found {aggregator_calls} stray \
-         calls — a second would double-spawn the 21-TF aggregator."
+        builder_body.matches("axum::serve(").count(),
+        1,
+        "the single `axum::serve` bind must live inside build_shared_infra."
+    );
+
+    // The 21-TF aggregator is spawned exactly once, inside the builder.
+    let agg_defs = src.matches("fn spawn_engine_b_aggregator(").count();
+    let agg_total = src.matches("spawn_engine_b_aggregator(").count();
+    assert_eq!(
+        agg_total - agg_defs,
+        1,
+        "exactly one `spawn_engine_b_aggregator` call may exist (found {}) — \
+         a second would double-spawn the 21-TF aggregator.",
+        agg_total - agg_defs
+    );
+    assert_eq!(
+        builder_body.matches("spawn_engine_b_aggregator(").count(),
+        1,
+        "the single aggregator spawn must live inside build_shared_infra."
     );
 }
 
 #[test]
-fn dhan_lane_is_wrapped_in_feed_gate() {
-    // The Dhan lane is a single `let dhan_lane: Option<DhanLaneRunHandles> =
-    // if config.feeds.dhan_enabled { … } else { None };` wrapper, sitting AFTER
-    // the fast arm and BEFORE the shared run-loop.
+fn shared_infra_builder_spawns_the_shared_pipeline() {
+    // The builder spawns the shared candle pipeline + subscribers for EVERY
+    // boot (Groww-only included). PR-C2: the Dhan publish-ordering half of
+    // the original `aggregator_subscribe_precedes_dhan_tick_publish` retired
+    // with the Dhan tick publisher; this builder-contents half survives —
+    // the subscribers still `.subscribe()` to the tick broadcast inside the
+    // builder, ahead of any future publisher.
     let src = read_main_rs();
-    let lane_gate = src
-        .find("let dhan_lane: Option<DhanLaneRunHandles> = if config.feeds.dhan_enabled")
-        .expect(
-            "D2 Stage 2: the Dhan lane MUST be wrapped in a single \
-                 `let dhan_lane: Option<DhanLaneRunHandles> = if config.feeds.dhan_enabled` \
-                 expression",
-        );
-    let slow_marker = src.find("SLOW BOOT PATH").expect("slow-boot marker");
-    assert!(
-        slow_marker < lane_gate,
-        "the Dhan lane gate MUST come after the slow-boot marker (the fast arm is separate)."
-    );
-    let runloop = src
-        .find("run_process_runloop(\n        dhan_lane,")
-        .expect("the shared `run_process_runloop(dhan_lane, …)` must exist");
-    assert!(
-        lane_gate < runloop,
-        "the shared `run_process_runloop(dhan_lane, …)` MUST come AFTER the lane gate."
-    );
-}
-
-#[test]
-fn aggregator_subscribe_precedes_dhan_tick_publish() {
-    // The zero-tick-loss invariant: the hoisted subscribers (obs + 21-TF
-    // aggregator + tick-storage) MUST `.subscribe()` to the tick broadcast BEFORE
-    // the lane's `run_tick_processor` (the only publisher) runs. After the hoist
-    // the subscribers live in `build_shared_infra` (the prefix) and the processor
-    // lives in the lane below, so the prefix-builder's body must precede the lane
-    // publish site in `main()`.
-    let src = read_main_rs();
-
-    // The hoisted prefix is built by the `build_shared_infra(...)` CALL in main()'s
-    // slow path (the destructuring `let SharedInfraHandles { … } = build_shared_infra(`).
-    let shared_call = src
-        .find("} = build_shared_infra(")
-        .expect("main() must destructure `build_shared_infra(...)` in its slow path");
-    // The SLOW lane's tick processor publishes into the broadcast. (The fast arm
-    // has its own earlier `run_tick_processor` — search from the slow-path
-    // build_shared_infra call so we anchor on the slow lane's publish site.)
-    let publish = src[shared_call..]
-        .find("run_tick_processor(")
-        .map(|rel| shared_call + rel)
-        .expect("the slow lane's run_tick_processor publish site must exist");
-    assert!(
-        shared_call < publish,
-        "D2 Stage 2: `build_shared_infra(...)` (which spawns the obs / aggregator / \
-         tick-storage subscribers, each `.subscribe()`d to the tick broadcast) MUST be \
-         called BEFORE the lane's `run_tick_processor` publishes — subscribe-before-\
-         publish, the zero-tick-loss invariant."
-    );
-
-    // And the builder itself contains the three subscriber sites + the seal-writer.
-    let builder = src
-        .find("async fn build_shared_infra(")
-        .expect("build_shared_infra must exist");
-    let builder_end = src[builder..]
-        .find("\nasync fn ")
-        .map(|rel| builder + rel)
-        .unwrap_or(src.len());
-    let body = &src[builder..builder_end];
+    let body = build_shared_infra_body(&src);
     for needle in [
         "run_slow_boot_observability",
         "spawn_engine_b_aggregator",
@@ -176,8 +137,8 @@ fn aggregator_subscribe_precedes_dhan_tick_publish() {
     ] {
         assert!(
             body.contains(needle),
-            "D2 Stage 2: build_shared_infra MUST spawn `{needle}` so the shared candle \
-             pipeline + subscribers run for BOTH the Dhan-OFF and Dhan-ON-slow paths."
+            "build_shared_infra MUST spawn `{needle}` so the shared candle \
+             pipeline + subscribers run for every boot."
         );
     }
 }

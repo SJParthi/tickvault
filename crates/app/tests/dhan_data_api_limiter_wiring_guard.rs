@@ -99,7 +99,14 @@ fn ratchet_chain_min_gap_layer_survives() {
 
 #[test]
 fn ratchet_both_spawn_seams_configure_the_limiter_from_config() {
-    for rel in ["src/main.rs", "src/dhan_rest_stack.rs"] {
+    // PR-C2 (2026-07-14 merge note): the lane's `spawn_post_market_tasks`
+    // seam in main.rs — the guard's original SECOND spawn seam — was
+    // DELETED with the Dhan live-WS lane, so `dhan_rest_stack.rs` is the
+    // SOLE spot/chain spawn seam (and therefore the sole configure site).
+    // The test name is kept (test-count ratchet stability); the loop now
+    // pins exactly the surviving seam. A re-added main.rs seam MUST be
+    // added back here in the same PR.
+    for rel in ["src/dhan_rest_stack.rs"] {
         let src = read_app_src(rel);
         let configure_pos = src
             .find(CONFIGURE)
