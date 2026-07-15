@@ -228,66 +228,8 @@ fn test_stress_concurrent_registry_access() {
 }
 
 // ---------------------------------------------------------------------------
-// Stress: subscription builder max load — 5000 instruments
+// Stress: subscription builder max load — RETIRED (PR-C2, 2026-07-13).
+// `build_subscription_messages` was deleted with the Dhan live main-feed WS
+// lane (operator retirement directive — websocket-connection-scope-lock.md
+// "2026-07-13 Amendment"); no surviving code path builds subscribe JSON.
 // ---------------------------------------------------------------------------
-
-#[test]
-fn test_stress_subscription_builder_max_load() {
-    use tickvault_common::types::{ExchangeSegment, FeedMode};
-    use tickvault_core::websocket::subscription_builder::build_subscription_messages;
-    use tickvault_core::websocket::types::InstrumentSubscription;
-
-    // Build 5000 instruments (max per connection).
-    let instruments: Vec<InstrumentSubscription> = (0..5000_u32)
-        .map(|i| InstrumentSubscription::new(ExchangeSegment::NseFno, 50000 + u64::from(i)))
-        .collect();
-
-    let start = Instant::now();
-    let messages = build_subscription_messages(&instruments, FeedMode::Full, 100);
-    let elapsed = start.elapsed();
-
-    // 5000 / 100 = 50 messages.
-    assert_eq!(
-        messages.len(),
-        50,
-        "5000 instruments at batch 100 = 50 messages"
-    );
-
-    // Verify all messages are valid JSON.
-    for (idx, msg) in messages.iter().enumerate() {
-        let parsed: serde_json::Value = serde_json::from_str(msg)
-            .unwrap_or_else(|e| panic!("message {idx} is not valid JSON: {e}"));
-        let instrument_count = parsed["InstrumentCount"]
-            .as_u64()
-            .unwrap_or_else(|| panic!("message {idx} missing InstrumentCount"));
-        assert!(
-            instrument_count <= 100,
-            "message {idx} has {instrument_count} instruments (max 100)"
-        );
-        assert_eq!(
-            parsed["RequestCode"].as_u64().unwrap(),
-            21,
-            "message {idx} must use Full mode RequestCode 21"
-        );
-    }
-
-    // Total instruments across all messages should be 5000.
-    let total_instruments: u64 = messages
-        .iter()
-        .map(|msg| {
-            let parsed: serde_json::Value = serde_json::from_str(msg).unwrap();
-            parsed["InstrumentCount"].as_u64().unwrap()
-        })
-        .sum();
-    assert_eq!(
-        total_instruments, 5000,
-        "total instruments across all messages must be 5000"
-    );
-
-    if !skip_perf_assertions() {
-        assert!(
-            elapsed < Duration::from_secs(1),
-            "building 50 subscription messages took {elapsed:?} — too slow (budget: 1s)"
-        );
-    }
-}

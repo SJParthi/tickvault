@@ -332,9 +332,10 @@ impl RiskEngine {
 
     fn trigger_halt(&mut self, breach: RiskBreach) {
         if !self.halted {
-            // Gap 2 fix: ERROR level triggers Telegram via Loki → Grafana.
-            // Previously WARN — operator was unaware trading was halted.
+            // RISK-GAP-01 coded emit (2026-07-14): log-sink-only; the
+            // Telegram page is the sink's Critical RiskHalt event.
             error!(
+                code = tickvault_common::error_code::ErrorCode::RiskGapPreTrade.code_str(),
                 breach = ?breach,
                 realized_pnl = self.total_realized_pnl,
                 "CRITICAL: RISK BREACH — trading HALTED. ALL orders blocked. \

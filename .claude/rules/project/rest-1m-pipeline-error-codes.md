@@ -250,6 +250,32 @@ re-appends UPSERT in place. Release-build panics abort the process
 (`panic = "abort"`) — the respawn arms are unwind-build/self-heal paths,
 the same honesty note as TICK-FLUSH-01.
 
+**2026-07-14 — once-per-day RAW-BODY SAMPLE (`stage="raw_body_sample"`) —
+the account-condition vs envelope-drift discriminator:** for ≥14 days BOTH
+`/v2/charts/intraday` AND `/v2/charts/historical` returned 2xx with ZERO
+parseable candles for ALL SIDs (the 2026-07-14 session ended
+`swept=0, still_missing=1500` — the ENTIRE day absent for all 4 spot
+indices) while the option-chain leg and the WS feed on the SAME
+token/account worked — the account-wide 200-empty verdict. No 2xx body was
+ever logged anywhere, so "Dhan serves an empty-but-well-formed columnar
+envelope" (account/data-plan condition — Dhan-support territory) was
+indistinguishable from "the envelope shape drifted and our parser sees
+nothing" (our bug). The FIRST `empty_no_rows`/`empty_stale` classification
+of each IST day now logs ONE structured `error!` (`SPOT1M-01`,
+`stage="raw_body_sample"`) carrying a bounded 600-char SECRET-REDACTED
+sample of the 2xx body (`capture_rest_raw_body_sample` — the
+`capture_rest_error_body` pipeline with the widened
+`REST_RAW_BODY_SAMPLE_MAX_CHARS` bound), the total body byte length, and
+the `Content-Type` header value. Edge-latched (CAS on an IST-day key —
+exactly one line per day per process, unconditional); the #1524
+diagnostics probes additionally carry `content_type`/`body_bytes`/
+`body_sample` per probe entry (diagnostics-gated by construction); the
+15:31 cross-verify's `dhan_intraday_fetch` mirrors the capture once per
+RUN under `CROSS-VERIFY-1M-02` `stage="raw_body_sample"` (dormant while
+the Dhan lane is retired — the 15:31 spawn is lane-only per the
+2026-07-13 retirement, so it rides any forced/re-enabled run). This line
+is the verbatim evidence block for the Dhan support ticket.
+
 **2026-07-13 — the GROWW spot leg emits this SAME code (no new variant):**
 the Groww per-minute spot 1m REST leg
 (`crates/app/src/groww_spot_1m_boot.rs`, operator grant 2026-07-13 —
@@ -420,8 +446,35 @@ collide. ADDITIONALLY (operator scope addition 2026-07-13): the NEW
 `(ts, trading_date_ist, feed, leg, security_id, exchange_segment, outcome)`
 — `outcome` in-key per phase-0 DEDUP rule 3 so TRANSITION rows BOTH
 survive: a sweep gap row never overwrites the minute's original ladder
-row; hostile round 1 item 5) is written BEST-EFFORT by the Groww leg (the
-Dhan leg's emit sites are a fast FOLLOW-UP after #1499 merges); its
+row; hostile round 1 item 5) is written BEST-EFFORT by the Groww leg —
+AND, since 2026-07-14 (GAP-11), by the DHAN legs too: the Dhan spot leg
+emits one row per (minute, SID) at every verdict/backfill/sweep/no-token
+point AND per skipped boundary (`outcome=skipped`/`boundary_skipped`,
+with the Groww midnight-cross date guard — review MEDIUM 1). Own-fire
+`ok` rows carry the MEASURED `close_to_data_ms` from the ladder verdict;
+since the same-day review HIGH fix the Dhan ladder threads a REAL
+per-ladder forensics struct (`DhanLadderForensics`), so `attempts` and
+`rate_limited_count` are the TRUE rung/429 counts and a terminal-429
+ladder classifies `outcome=rate_limited` (the Groww last-status rule) —
+a Dhan 429 storm can no longer read 0 on the scoreboard digest while
+`tv_spot1m_rate_limited_total` climbs. The REMAINING named sentinels:
+`final_http_status`/`fetch_latency_ms` stay 0/-1 (the Dhan
+`FetchFailure` carries no status/latency fields — that narrower
+follow-up stays flagged), and the budget-overrun arm honestly reads
+`attempts=0` (the timed-out ladder's partial state drops with its
+future). The Dhan CHAIN leg emits per (minute, underlying) with
+`leg='chain_1m'` (see the §2d 2026-07-14 note). NEW COLUMN `close_to_persist_ms` (2026-07-14):
+minute close → the DATA-table ILP flush-ACK instant in ms, stamped via
+the hold-then-stamp pattern (`stamp_held_ok_rows` in
+`spot_1m_rest_boot.rs`, shared by the Dhan spot/sweep, Groww spot fire
+and Dhan chain legs) — `ok` rows are HELD until the data flush ACK and
+stamped there; a FAILED flush DISCARDS the held ok rows (`outcome` is
+in the DEDUP key, so a pre-flush ok append would land ALONGSIDE the
+`flush_failed` named-gap rows and lie about the ok path). `-1` = not
+persisted / not measured (every non-ok row, pre-2026-07-14 rows, the
+Groww chain/contract legs pending their own stamping). Honest bound:
+the stamp is the ILP flush ACK of an async-batched write, NOT a per-row
+commit — QuestDB WAL apply can lag it. Its
 ensure/append/flush failures reuse SPOT1M-02 with stages
 `audit_ensure_client_build` / `audit_ensure_ddl` / `audit_append` /
 `audit_flush` + `tv_rest_fetch_audit_persist_errors_total{stage}` — a
@@ -435,7 +488,16 @@ fetch happened, 0 sentinel when none) and class slugs `named_gap` /
 AUDIT-ONLY — §38/§9 forbid a bulk backfill fetch) / `persist_failed`
 (fetched OK but the ILP APPEND failed — a persist failure, never dressed
 as vendor absence; round-2 LOW) / `flush_failed` (swept minutes lost at
-the ILP flush) / `no_token` — never a silent hole.
+the ILP flush) / `no_token` — never a silent hole. DEDUP honesty
+(2026-07-14 review LOW): `error_class` is NOT in the audit DEDUP key, so
+two named-gap rows sharing `(minute, SID, outcome)` with different
+class slugs (e.g. a fire's `persist_failed` then the sweep's
+`named_gap`) UPSERT in place — the LAST-written error_class wins for
+that key; the outcome-level truth is unaffected (`outcome` IS in-key).
+Also since 2026-07-14 (review MEDIUM 2, cross-feed symmetry): the GROWW
+spot backfill-Ok arm holds an `ok` row for the repaired minute (the Dhan
+backfill-row semantics — a backfill-repaired Groww minute no longer
+reads "failed, never recovered" in the digest).
 
 **2026-07-13 — the GROWW CONTRACT leg emits SPOT1M-02 with
 `leg = "contract_1m"` for the NEW `option_contract_1m_rest` table:** the
@@ -609,6 +671,81 @@ to `true` in base.toml — dated record in
 OFF (fail-safe) and `probe_and_report` stays `true` (inert while
 enabled; the rollback canary).
 
+**2026-07-14 — the GROWW leg gains a per-underlying not-served paging
+edge (`stage="underlying_not_served"`):** the motivating incident — on
+expiry day 2026-07-14 Groww stopped serving NIFTY's same-day-expiring
+chain at 14:54 IST (2xx, zero strikes, `outcome=empty`) while BANKNIFTY
++ SENSEX kept working (`ok=2 empty=1` per minute, ALL afternoon), and
+NOTHING paged: the `stage="escalation"` edge arms only on FULLY-failed
+minutes (ok == 0), so a single-underlying vendor cutoff was invisible.
+The new arm mirrors the spot leg's `sid_not_served` detector (§1 item
+5): a minute COUNTS toward an underlying's streak only when that
+underlying's chain came back empty/failed (FETCH-level — Empty AND
+error-class count the same; persist failures stay the escalation edge's
+M1 business) while ≥1 OTHER underlying was OK in the SAME minute; a
+global-failure minute (zero OK) neither counts nor resets — so within
+the FETCH-failure class the two edges are mutually exclusive per minute
+(the escalation edge needs ok == 0, this edge needs ≥1 OK). HONEST
+OVERLAP: a persist-failed minute with ok ≥ 1 can legitimately count
+toward BOTH edges (the M1 persist gate makes the escalation edge count
+it fully-failed while an empty sibling counts here) — two DISTINCT
+signals: persistence broken + vendor not serving one underlying. An
+auth-aborted fire (any 401 in the wave — a global token condition, even
+when a sibling underlying succeeded in the same wave; under the §9.7
+auto-ladder there is no sequential short-circuit, the HOLD is applied
+after the wave) is a tracker HOLD: neither counts nor resets. At
+`GROWW_CHAIN_1M_UNDERLYING_NOT_SERVED_THRESHOLD` (10) consecutive
+counted minutes: ONE `error!(code = CHAIN-02,
+stage = "underlying_not_served", feed = "groww", underlying,
+consecutive_minutes)` + ONE typed HIGH `GrowwChain1mUnderlyingNotServed`
+Telegram page per underlying per episode (edge-latched, Rule 4;
+re-armed only by that underlying's own recovery — falling edge = one
+Info `GrowwChain1mUnderlyingServedRecovered`). Counter:
+`tv_groww_chain1m_underlying_not_served_total{underlying}` (3 static
+label values — the pinned plain symbols), one increment per counted
+minute. The typed HIGH Telegram event IS the page — CHAIN-02 remains
+log-sink-only per §3. Streak state is per scheduler run (per trading
+day; a mid-day task respawn restarts it — the FailureEdge envelope).
+Source: `crates/app/src/groww_option_chain_1m_boot.rs`
+(`UnderlyingServedTracker` / `record_groww_chain_underlying_verdicts`).
+
+**2026-07-14 — the GROWW leg's zero-leg classifications are now
+SELF-EVIDENCING (empty-vs-`leg_shape_drift` split):** the same 2026-07-14
+incident's second finding — NIFTY (expiry day) classified `outcome=empty`
+every minute 14:54→15:29 IST with `errors=0` (every body WAS a parseable
+chain envelope whose `strikes` object yielded zero legs) — could NOT be
+discriminated retroactively: was the body ~40 B (a truly empty map) or
+~37 KB (entries our leg extraction dropped)? The evidence was STRUCTURALLY
+UNRECORDED — `tv_groww_chain1m_payload_bytes` + the `strikes_kept` /
+`invalid_strikes` counts were recorded ONLY on the Found arm; the Empty arm
+discarded the parsed struct and captured no body evidence (the payload
+histogram count simply dropped 3→2 at 14:55). Closed in two halves:
+(1) **EVIDENCE** — every zero-leg classification now carries
+`payload_bytes`, `strikes_seen` (RAW `strikes`-map entry count — a new
+parse diagnostic), `strikes_kept`, `invalid_strikes`, and a BOUNDED
+SANITIZED body sample (≤300 chars through the house
+`capture_rest_error_body` choke point — the exact sanitizer the failure
+arms use, so a token/credential can never leak) on ONE coded `error!` per
+affected underlying per fired minute (`stage="empty_chain"` /
+`stage="leg_shape_drift"`, `feed="groww"`), plus the new
+`tv_groww_chain1m_empty_payload_bytes` histogram (the Found-only
+`tv_groww_chain1m_payload_bytes` semantics never shift). (2) **HONEST
+RECLASSIFICATION** — the zero-legs case splits: `strikes_seen == 0` (map
+literally empty) stays `Empty` (`outcome="empty"`, audit
+`empty`/`error_class="empty_chain"` — unchanged wire values);
+`strikes_seen > 0` with zero extractable legs is now **`leg_shape_drift`**
+(the vendor served entries our leg extraction couldn't read — an ERROR,
+not an empty chain): it flows into the minute verdict's `errors` count,
+the same CHAIN-02 `minute_failed` accounting, its own
+`tv_groww_chain1m_leg_shape_drift_total` counter, and the audit row's
+EXISTING `error` outcome with `error_class="leg_shape_drift"` (no audit
+schema change, no new ErrorCode). The `underlying_not_served` detector is
+UNAFFECTED (empty and error-class minutes already counted not-served
+identically). HONEST NOTE: today's 14:54 incident class (empty vs drift)
+could not be discriminated after the fact — from this change forward it
+is, within one minute of occurrence
+(`mcp__tickvault-logs__tail_errors` shows the size + sample directly).
+
 ## §2d. CHAIN-03 — option_chain_1m persist failed
 
 **Severity:** High. **Auto-triage safe:** Yes (best-effort persist; the
@@ -682,11 +819,31 @@ ensure-DDL stages are shared — one table, one DDL), with a **`feed =
 ALTER-ADD self-heal for the Groww leg: `rho` (Groww supplies it; Dhan
 does not) and `close_to_data_ms` (per-row latency stamp — the ONLY
 freshness signal, since Groww's chain response carries NO timestamp).
-Dhan rows leave both NULL (the Dhan emit path is untouched). The Groww
+Dhan rows leave both NULL (the Dhan `option_chain_1m` emit path is
+untouched — `rho`/`close_to_data_ms` are Groww-leg columns). The Groww
 leg's `rest_fetch_audit` forensics failures reuse the SPOT1M-02 stage
 names `audit_append` / `audit_flush` but are coded CHAIN-03 with
 `leg='chain_1m'` context — a forensics write failure NEVER affects the
 fetch loop or the failure edge.
+
+**2026-07-14 — the DHAN chain leg now emits `rest_fetch_audit` rows too
+(GAP-11):** one row per (fired minute, underlying), `feed='dhan'`,
+`leg='chain_1m'`, `attempts=1` (live-snapshot semantics — no re-poll
+ladder), keyed on the underlying's SID/plain symbol (the Groww chain
+precedent): `ok` (real `close_to_data_ms`, held-until-flush-ACK
+`close_to_persist_ms` per the §2 hold-then-stamp contract) / `empty`
+(`empty_chain`, 200) / `error` (`error` or `entitlement` class; the
+Dhan chain ladder surfaces no HTTP status — 0 sentinel, honest) /
+`no_token` / `skipped` (`boundary_skipped`, per missed boundary, with
+the Groww midnight-cross date guard) / `named_gap`
+(`persist_failed`/`flush_failed` for fetched-but-lost minutes). Its
+forensics-write failures are coded CHAIN-03 `audit_append`/`audit_flush`
+(Dhan emit sites stay field-less — grep-split by `feed="groww"`).
+Deliberate edge-accounting change riding the midnight guard (review
+MEDIUM 3, same day): on a midnight-crossing wake the guard now also
+skips the per-boundary `edge.record_minute(true)` calls that pre-GAP-11
+ran unconditionally — the trading day those boundaries belonged to is
+over, so an escalation page for yesterday's tail would be noise.
 
 ## §2e. CHAIN-04 — day-start expirylist warmup failed (pipeline down for the day)
 
@@ -815,16 +972,36 @@ operator's enumerated scope — unifying them is a flagged follow-up).
 
 ## §3. Delivery boundary (honest — no false-OK)
 
-All six codes (SPOT1M-01/02 + CHAIN-01..04) are **log-sink-only today**: NO `error_code_alerts` map entry in
-`deploy/aws/terraform/error-code-alarms.tf` and NO mention in
-`observability-architecture.md`'s paging list (the paging drift guard pins
-those surfaces untouched). The operator page for a failing pipeline is the
-typed HIGH Telegram event at the 3-minute escalation edge (+ the Info
-recovery event) — and, for the chain half, the once-per-day
-`ChainEntitlementAbsent` / `ChainExpirylistFailed` HIGH pages + the
-probe-verdict Infos; the coded `error!` lines are the forensic WHY. Adding a
-CloudWatch filter+alarm is a flagged follow-up (one map entry + the doc
-paragraph + a cost note, per the FEED-REJECT-01 / SCOREBOARD-01 precedent).
+**2026-07-14 UPDATE (REST-audit GAP-03 —
+`docs/audits/2026-07-14-rest-pipeline-adversarial-audit.md`): the flagged
+CloudWatch follow-up below is now PARTIALLY LANDED.** Four SCOPED
+`error_code_alerts` entries exist in
+`deploy/aws/terraform/error-code-alarms.tf` (+ the doc paging list +
+`error_code_paging_filter_drift_guard.rs` pattern-shape extension for one
+extra `$.field` clause, all in lockstep):
+
+| Entry | Filter scope | Why scoped |
+|---|---|---|
+| `spot1m-01-escalation` | `$.stage = "escalation"` only | the per-minute `minute_failed`/`boundary_skipped` lines fire every failed minute — a plain code filter would over-page vs the designed 3-minute edge; covers the Dhan spot + Groww spot + Groww contract legs (same code) |
+| `chain-02-escalation` | `$.stage = "escalation"` only | same rationale, both feeds' chain legs |
+| `chain-01` | plain coded filter | both stages (warmup + mid_session) are once-per-episode page-worthy; the probe-only path never emits CHAIN-01 at ERROR |
+| `chain-04-warmup` | `$.stage = "warmup"` only | the probe_* / warmup_no_token stages are log-only-by-design transient/respawn arms (warmup_no_token repeats every ~30s until a token exists) |
+
+**Still log-sink-only (deliberate):** the persist codes SPOT1M-02 +
+CHAIN-03 have no direct filter — every persist failure feeds the
+persist-gated 3-minute escalation edge (the M1 rule), so a sustained
+persist outage still reaches the `spot1m-01-escalation` /
+`chain-02-escalation` pages; a direct filter on the per-minute persist
+lines would over-page. The Groww-leg CHAIN-04-class degrades
+(`expiry_unresolved` etc.) remain CHAIN-02-stage territory per §2c.
+
+The typed HIGH Telegram event at the 3-minute escalation edge (+ the Info
+recovery event) remains the primary operator page — and, for the chain
+half, the once-per-day `ChainEntitlementAbsent` / `ChainExpirylistFailed`
+HIGH pages + the probe-verdict Infos; the coded `error!` lines are the
+forensic WHY. The CloudWatch entries are the BACKSTOP leg that survives a
+dead app notifier / dropped Telegram (the audit's GAP-05 class — see also
+`telegram-drop-alarm.tf`).
 
 **Contract-leg honest envelope (2026-07-13, PR-4):** UNVERIFIED-LIVE —
 FNO per-contract 1m candle availability latency for the just-sealed
@@ -856,8 +1033,10 @@ scope.
 PR-5):** the 15:45 IST dual-feed scorecard now carries one plain-English
 "Official minute candles — how fast after each minute closed" line per
 (feed, leg), aggregated from the day's `rest_fetch_audit` rows (+ the
-`spot_1m_rest` latency-fallback column for the Dhan spot leg, whose
-forensics emits remain the flagged follow-up) — prompt-pull p50/p99/max
+`spot_1m_rest` latency-fallback column for the Dhan spot leg — the
+fallback is HISTORICAL/defensive since 2026-07-14: the Dhan spot + chain
+forensics rows are LIVE per the §2/§2d GAP-11 notes, so the digest's
+primary source now covers all four feed/leg pairs) — prompt-pull p50/p99/max
 seconds-after-close, ok/failed counts, rate-limit hits, late recoveries
 and never-recovered gaps, all MEASURED, `-1` sentinels rendering "not
 measured yet". Degrade stages `rest_leg_*` live under SCOREBOARD-01; full

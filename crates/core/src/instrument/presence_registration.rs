@@ -281,24 +281,21 @@ mod tests {
         assert_eq!(day.map(ist_day_from_date), Some(20_644));
     }
 
-    /// Wiring ratchet: BOTH Dhan boot seams (the cold orchestrator Step 3d
-    /// + the main.rs warm-snapshot path) must register the universe into
-    /// the presence registry — next to their `record_dhan_selection_from_
-    /// universe` calls (the FUTIDX-02 warm-path lesson: a seam wired on
-    /// only one path silently loses the other for the whole trading day).
+    /// Wiring ratchet (narrowed 2026-07-14, PR-C2 — Dhan live-WS lane
+    /// deletion): pre-C2 this pinned BOTH Dhan boot seams (the cold
+    /// orchestrator Step 3d + the main.rs warm-snapshot path). The main.rs
+    /// warm-snapshot path was DELETED with the lane, so its assertion is
+    /// unsatisfiable at head (caught on the first feature-mode run after
+    /// the r1 disk-full block cleared — this test is
+    /// `daily_universe_fetcher`-gated and never ran on the impl sweep).
+    /// The surviving pin: the retained-dormant orchestrator still
+    /// registers at Step 3d (module + this pin delete together in C3).
     #[test]
     fn test_dhan_presence_registration_sites_wired() {
         let orchestrator = include_str!("daily_universe_orchestrator.rs");
         assert!(
             orchestrator.contains("register_dhan_presence_from_universe("),
             "daily_universe_orchestrator.rs must register Dhan presence at Step 3d"
-        );
-        let main_rs = std::fs::read_to_string("../app/src/main.rs")
-            .or_else(|_| std::fs::read_to_string("crates/app/src/main.rs"))
-            .expect("main.rs must be readable");
-        assert!(
-            main_rs.contains("register_dhan_presence_from_universe("),
-            "main.rs warm-snapshot path must register Dhan presence"
         );
     }
 
