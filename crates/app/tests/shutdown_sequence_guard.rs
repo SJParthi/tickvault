@@ -41,32 +41,17 @@ fn tick_processor_rs() -> String {
 // Shutdown sequence must call notify_waiters
 // ============================================================================
 
-#[test]
-fn shutdown_sequence_fires_notify_waiters() {
-    let src = main_rs();
-    assert!(
-        src.contains("shutdown_notify.notify_waiters()"),
-        "Audit finding #12: run_shutdown_fast (or equivalent) MUST call \
-         `shutdown_notify.notify_waiters()` so long-lived tasks \
-         (pool watchdog, depth rebalancer) stop cleanly on SIGTERM. \
-         Missing this call = false-positive Halt alerts during intentional \
-         teardown."
-    );
-}
-
-#[test]
-fn shutdown_sequence_signals_graceful_websocket_disconnect() {
-    let src = main_rs();
-    assert!(
-        src.contains("request_graceful_shutdown()"),
-        "Audit finding #12: shutdown MUST call \
-         `pool.request_graceful_shutdown()` so each WebSocket sends \
-         RequestCode 12 to Dhan before the socket closes. Without this, \
-         Dhan's server holds our subscriptions open for 40s after our \
-         process exits, and the NEXT boot hits \
-         `MAX_WEBSOCKET_CONNECTIONS_PER_USER` (5 of 5 already consumed)."
-    );
-}
+// RETIRED (PR-C2, 2026-07-13 — Dhan live-WS lane deletion, operator
+// retirement directive per websocket-connection-scope-lock.md "2026-07-13
+// Amendment" §B): `shutdown_sequence_fires_notify_waiters` and
+// `shutdown_sequence_signals_graceful_websocket_disconnect` pinned the
+// lane-scoped shutdown fan-out — `shutdown_notify.notify_waiters()` woke
+// the pool watchdog/lane listeners, and `pool.request_graceful_shutdown()`
+// sent RequestCode 12 per main-feed socket so the next boot never hit
+// Dhan's 5-connection budget. The pool, its watchdog, and the lane
+// teardown are DELETED — no main-feed socket exists to disconnect, so the
+// SIGTERM false-Halt / connection-budget classes are structurally gone.
+// The surviving flush guards (tick processor writers) stay pinned below.
 
 // ============================================================================
 // Tick processor must force-flush ALL writers on shutdown
@@ -105,16 +90,11 @@ fn tick_processor_flushes_candle_writer_on_shutdown() {
 // Shutdown notifier is a single Arc<Notify> — not reconstructed per-task
 // ============================================================================
 
-#[test]
-fn shutdown_notify_is_arc_notify() {
-    let src = main_rs();
-    assert!(
-        src.contains("let shutdown_notify = std::sync::Arc::new(tokio::sync::Notify::new())"),
-        "Audit finding #12: shutdown_notify MUST be an Arc<Notify> \
-         initialised once at boot and cloned into each listener. \
-         A per-task Notify would never receive the shutdown signal."
-    );
-}
+// RETIRED (PR-C2, 2026-07-13): `shutdown_notify_is_arc_notify` pinned the
+// boot-once `Arc<Notify>` construction that fanned the lane shutdown — it
+// died with the lane teardown above. The Rule-16 Arc<Notify> convention
+// itself stands (audit-findings-2026-04-17.md Rule 16) for any future
+// long-lived listener chain.
 
 // ============================================================================
 // run_shutdown_fast is wired to wait_for_shutdown_signal

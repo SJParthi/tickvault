@@ -386,6 +386,43 @@ increment per wave skipped by the poisoned-watermark guard.
 `crates/app/src/groww_bridge.rs::spawn_groww_catchup_seal` (Groww, gated on
 `feed_runtime.is_enabled(Feed::Groww)` + `is_trading_day_today`).
 
+### 2026-07-14 Update — driver spawn sites RATCHETED; NO liveness floor (documented residual)
+
+The 2026-07-10 automation audit found the catch-up drivers' spawn sites
+were unpinned (only the routing-through-`catch_up_seal_all` behavior was
+guarded) — a refactor dropping either `tokio::spawn` compiled green and
+silently stalled BOUNDARY-01 sealing, and the only alarm
+(`boundary_catchup_storm_dhan`) is a CEILING (too many seals), never a
+floor. Both fixes landed:
+
+1. **Spawn wiring ratchet** (build-failing):
+   `crates/app/tests/aggregation_task_wiring_guard.rs` pins the main.rs
+   Task 4 block (spawn + `compute_catchup_cutoff` gate +
+   `catch_up_seal_all` + poll cadence + trading-day gate + the per-seal
+   counter), the Groww driver (defined AND called in the groww_bridge
+   production region, same load-bearing pieces), the Task 3 IST-midnight
+   force-seal spawn, AND the `force_seal_all(…)` → `reset_watermark()`
+   ordering inside BOTH midnight tasks (the §4b/F2 self-heal contract
+   this file mandates — losing or reordering the reset means a poisoned
+   watermark never self-heals).
+2. **Liveness-floor DECISION — deliberately NO CloudWatch floor alarm**
+   (evidence-based, recorded here so no future session re-litigates it
+   blind): `tv_boundary_catchup_total{feed}` increments only per ROUTED
+   catch-up seal and `tv_boundary_catchup_skipped_total` only during a
+   poisoning episode — on a healthy day both are legitimately ~0, so the
+   metrics are SPARSE and silence is ambiguous: a "0 in-market" floor
+   alarm would false-page every healthy low-lag day. And even a
+   registered counter keeps emitting per-scrape samples from the metrics
+   RECORDER regardless of the driver TASK's liveness, so metric presence
+   can never prove the task is alive. The only true floor would be a
+   dense per-wave heartbeat increment inside the driver loops — a src
+   behavior change deferred (flagged follow-up, not smuggled into the
+   ratchet PR). **Honest residual:** a catch-up driver that dies AT
+   RUNTIME (post-spawn panic/cancel) has no dedicated pager; the
+   compile-time ratchet closes the refactor class, FEED-STALL-01 owns the
+   dead-feed class, and the missing-candle symptom surfaces at the 15:31
+   IST cross-verify (CROSS-VERIFY-1M-01 — paging since 2026-07-14).
+
 ## AGGREGATOR-LAG-01 — candle aggregator tick-broadcast lagged (zero-tick-loss PR-8b, H2-lite)
 
 **Trigger:** the candle aggregator's `tokio::broadcast` receiver

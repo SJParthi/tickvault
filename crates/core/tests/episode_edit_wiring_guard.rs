@@ -311,33 +311,26 @@ fn guard_f_telegram01_retained_on_terminal_failure() {
 // (g) ws_event_audit choke points untouched by the episode machinery.
 #[test]
 fn guard_g_ws_audit_choke_points_untouched() {
-    let connection = fs::read_to_string(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/src/websocket/connection.rs"
-    ))
-    .expect("connection.rs must exist");
+    // PR-C2 re-shape (2026-07-13): the main-feed `connection.rs` choke point
+    // (`emit_ws_audit`) was DELETED with the Dhan live-WS lane (operator
+    // retirement directive — websocket-connection-scope-lock.md "2026-07-13
+    // Amendment" §B); the order-update choke point is the surviving core-side
+    // ws_event_audit producer this guard pins.
     let order_update = fs::read_to_string(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/src/websocket/order_update_connection.rs"
     ))
     .expect("order_update_connection.rs must exist");
-    // The audit emit choke points still exist…
-    assert!(
-        connection.contains("emit_ws_audit("),
-        "main-feed ws_event_audit choke point missing"
-    );
+    // The audit emit choke point still exists…
     assert!(
         order_update.contains("emit_order_update_ws_audit("),
         "order-update ws_event_audit choke point missing"
     );
-    // …and the episode machinery never reached into them (the bubbles are
+    // …and the episode machinery never reached into it (the bubbles are
     // a Telegram-surface concern; the forensic record is untouched).
     // The scan targets the episode-module identifiers — the plain English
     // word "episode" legitimately appears in WS-GAP-10 comments.
-    for (name, src) in [
-        ("connection.rs", &connection),
-        ("order_update_connection.rs", &order_update),
-    ] {
+    for (name, src) in [("order_update_connection.rs", &order_update)] {
         for ident in [
             "episode_key",
             "EpisodeKey",

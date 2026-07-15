@@ -117,6 +117,12 @@ Index: [`00-INDEX.md`](./00-INDEX.md).
 | [`17-token-lifecycle.md`](./17-token-lifecycle.md) | CORRECTED token lifecycle: 3 documented auth approaches, mint wire shapes, the OFFICIAL daily 6:00 AM expiry, the `expiry` response field the SDK discards, contradictions recorded |
 | [`99-UNKNOWNS.md`](./99-UNKNOWNS.md) | Consolidated U-1…U-24 open-questions table — exact support questions + live probes, blocking classification, priority ordering |
 
+### 2026-07-14 internal recovery (bruteX-capture read-out — no new crawl)
+
+| File | What it covers |
+|---|---|
+| [`18-smart-orders-schemas.md`](./18-smart-orders-schemas.md) | **Smart Orders (GTT/OCO) FULL schemas** recovered from the bruteX 2026-07-03 capture files (`17-BONUS-REST-smart-orders.md` + `03-smart-orders.md`, read in full this time): OCO create body (target/stop_loss legs, `net_position_quantity`), modify/cancel/get/list request+response schemas, the 6-value smart-order status enum + SDK constants, full GTT/OCO response field tables, recovered contradictions (CASH-OCO), and the numbered Day-0 live-probe checklist (P1–P10) for the residual Unknowns — **reference-only scope banner, NOT used by TickVault** |
+
 ### 2026-06 capture + reverse-read wire notes
 
 | File | What it covers |
