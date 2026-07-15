@@ -117,8 +117,9 @@ jobs:
       - name: Run Groww e2e (require-QuestDB switch on — no vacuous pass allowed)
         run: |
           set -o pipefail
+          # PR-C3 (2026-07-14): --features daily_universe_fetcher removed —
+          # the feature was deleted with the Dhan instrument chain.
           TV_REQUIRE_QDB=1 cargo test -p tickvault-app \
-            --features daily_universe_fetcher \
             --test groww_live_pipeline_e2e \
             -- --nocapture 2>&1 | tee groww-e2e.log
 

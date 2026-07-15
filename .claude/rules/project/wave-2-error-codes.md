@@ -117,7 +117,7 @@ classify/backoff/terminal-behaviour unit + tokio tests beside it).
 
 ## WS-GAP-06 — tick-gap detector fired a coalesced summary
 
-> **⚠ RETIREMENT AUTHORIZED 2026-07-13 (deletion lands with the Phase C PRs):** the
+> **⚠ RETIREMENT AUTHORIZED 2026-07-13 — deletion LANDED in PR-C3 (2026-07-14):** the
 > tick-gap detector and this code are DELETED with the Dhan live WS (operator Q4-ii
 > "agreed dude" — *tick-gap detector + WS-GAP-06 deleted; the Groww feed-stall watchdog
 > owns stall detection*, 2026-07-13; full contract in `websocket-connection-scope-lock.md`

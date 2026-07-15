@@ -52,10 +52,13 @@
 # slots + overnight lead time; the box-start watchdog is the AWS-native
 # (scheduler-independent) deterministic catch.
 #
-# Cost: one job, no checkout, 3 API reads + at most 3 dispatches per firing
+# Cost: one job, no checkout, ~5 API reads + at most 4 dispatches per firing
 # (~30s on ubuntu-latest) — negligible against free-tier minutes. Because the
 # check is head_sha-run-EXISTENCE (not deployed-state), each SHA triggers at most
-# ONE deploy-aws run ever — no overnight rebuild spam.
+# ONE deploy-aws run ever — no overnight rebuild spam. terraform-apply.yml
+# joined the backfill list 2026-07-14 (PR-C3 rider; path-guarded — see the
+# inline note) so a bot-merged terraform change is no longer the last
+# push-suppressed lane without dispatcher coverage.
 name: Post-Merge Catch-up Dispatcher
 
 on:
@@ -90,7 +93,15 @@ jobs:
         run: |
           set -euo pipefail
 
-          head_sha=$(gh api "repos/${GH_REPO}/commits/main" --jq .sha)
+          # Fail-safe (round-3 review LOW, 2026-07-14): a transient gh-api
+          # failure on the HEAD probe must not fail the step — every lane is
+          # HEAD-derived, so we skip the whole pass and let the next 30-min
+          # firing retry (same principle as the per-lane + tf_touched guards).
+          head_sha=$(gh api "repos/${GH_REPO}/commits/main" --jq .sha 2>/dev/null || echo "")
+          if ! [[ "${head_sha}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::warning::could not resolve main HEAD (transient API failure?) — skipping this catch-up pass; the next scheduled firing retries."
+            exit 0
+          fi
           echo "main HEAD = ${head_sha}"
 
           dispatched=0
@@ -99,20 +110,76 @@ jobs:
           # start, independent of the scheduler-drop-fragile deploy-aws-after-close
           # crons (2026-07-09 outage — see header). deploy-aws's OWN market-hours
           # guard + off-hours box-state skip are unchanged; this only TRIGGERS.
-          for wf in ci.yml bench.yml deploy-aws.yml; do
+          #
+          # terraform-apply.yml (added 2026-07-14, PR-C3 rider — merge-gate-lock
+          # §3.1 dated edit): its push trigger is PATH-FILTERED
+          # (deploy/aws/terraform/** + its own workflow file), so a bot-merged
+          # terraform change was the LAST push-suppressed lane with no
+          # dispatcher coverage — the 3 post-close crons are the same
+          # scheduler-drop-fragile class as the 2026-07-09 deploy-aws outage.
+          # Because the path filter makes "zero runs for HEAD" the NORMAL state
+          # for non-terraform merges, the existence check alone would dispatch
+          # an apply run on EVERY merge; the guard below therefore dispatches
+          # ONLY when the HEAD commit actually touched the filtered paths.
+          # Envelope: (a) the commit-files API returns up to 300 files — a
+          # >300-file merge whose terraform change sits past the cap is missed
+          # here; (b) HEAD-only coverage — a tf-touching bot merge that is
+          # SUPERSEDED by a non-tf merge inside one 30-min window is never
+          # backfilled by this lane (the new HEAD reads tf_touched=0 and old
+          # SHAs are never rechecked). Both cases fall back to terraform-apply's
+          # own post-close crons (fail-safe direction: a missed dispatch DEFERS
+          # the apply, never doubles it; the apply is plan-gated +
+          # DynamoDB-locked, so extras are free no-ops anyway).
+          # Fail-safe (hostile review 2026-07-14, HIGH): `.files` can be null/
+          # absent (truncated large-diff responses) and `gh api` can fail
+          # transiently — under `set -euo pipefail` a bare failure here would
+          # kill the WHOLE step and skip the ci/bench/deploy-aws backfills too
+          # (recreating the 2026-07-09 outage class). `(.files // [])` +
+          # `|| echo ""` + the numeric check degrade ONLY the terraform lane
+          # (tf_touched=0 → skip), never the other three.
+          tf_touched=$(gh api "repos/${GH_REPO}/commits/${head_sha}"             --jq '[ (.files // [])[].filename
+                    | select(startswith("deploy/aws/terraform/")
+                             or . == ".github/workflows/terraform-apply.yml") ]
+                  | length' 2>/dev/null || echo "")
+          [[ "${tf_touched}" =~ ^[0-9]+$ ]] || tf_touched=0
+          echo "terraform-filtered files in HEAD commit: ${tf_touched}"
+
+          for wf in ci.yml bench.yml deploy-aws.yml terraform-apply.yml; do
+            if [ "${wf}" = "terraform-apply.yml" ] && [ "${tf_touched}" -eq 0 ]; then
+              echo "terraform-apply.yml: HEAD commit touched no terraform-filtered paths — skipping (path-filtered lane)"
+              continue
+            fi
             # Any run (any event: push, pull_request, workflow_dispatch,
             # schedule; any status — queued/in_progress/success/failed/
             # cancelled) for this exact SHA counts as covered. So a deploy-aws
             # run that ends in a green off-hours no-op skip, or a market-hours
             # guard block, still counts — this dispatcher backfills MISSING runs,
             # it never re-runs (or re-builds) a SHA that already has one.
+            # Fail-safe (round-2 review 2026-07-14, MEDIUM): a transient API
+            # failure on ONE lane's existence probe must not kill the whole
+            # step under set -euo pipefail (the same class the tf_touched
+            # guard above closes) — and a non-numeric count must never fall
+            # through to "lane already covered" (false-OK direction). A
+            # failed probe SKIPS the lane loudly; the next 30-min firing
+            # retries (skipping is safe — a missed dispatch defers, while a
+            # blind dispatch could double-run deploy-aws).
             count=$(gh api \
               "repos/${GH_REPO}/actions/workflows/${wf}/runs?head_sha=${head_sha}&per_page=1" \
-              --jq .total_count)
+              --jq .total_count 2>/dev/null || echo "")
+            if ! [[ "${count}" =~ ^[0-9]+$ ]]; then
+              echo "::warning::existence probe for ${wf} failed (got '${count}') — skipping this lane; the next 30-min firing retries"
+              continue
+            fi
             if [ "${count}" -eq 0 ]; then
               echo "::warning::${wf} has ZERO runs for main HEAD ${head_sha} — a GITHUB_TOKEN bot merge (or a scheduler-dropped morning deploy cron) left it uncovered. Dispatching catch-up run on main."
-              gh workflow run "${wf}" --ref main
-              dispatched=$((dispatched + 1))
+              # A transient dispatch failure must not abort the REMAINING
+              # lanes (hostile review 2026-07-14, MEDIUM) — the next 30-min
+              # firing retries any lane still uncovered.
+              if gh workflow run "${wf}" --ref main; then
+                dispatched=$((dispatched + 1))
+              else
+                echo "::error::dispatch of ${wf} failed — the next 30-min firing retries"
+              fi
             else
               echo "${wf}: ${count} run(s) already exist for ${head_sha} — nothing to do"
             fi

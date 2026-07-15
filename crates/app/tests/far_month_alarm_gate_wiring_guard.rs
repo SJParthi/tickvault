@@ -11,15 +11,14 @@
 //! (`far_month_future_sids`). ALL of those sites died with the Dhan lane:
 //!
 //! - the exclusion set was seeded ONLY from the deleted Dhan subscription
-//!   plan, so post-retirement it is permanently empty — the surviving
-//!   tick-gap gauge loop in main.rs carries the honest
-//!   `let excluded_silent = 0usize;` constant with a dated inline note;
+//!   plan, so post-retirement it was permanently empty — the interim
+//!   PR-C2 gauge loop carried an honest `excluded_silent = 0` constant;
 //! - the SLO publisher (and its tick_freshness filter) is PARKED per the
 //!   wave-3-d-error-codes.md 2026-07-13 banner;
-//! - the whole tick-gap detector (the remaining gauge loop included) is
-//!   deleted in PR-C3 with WS-GAP-06 (operator Q4-ii "agreed dude" —
-//!   futidx-4-error-codes.md §3: the far-month alarm-gate exclusion "dies
-//!   with the tick-gap detector").
+//! - the whole tick-gap detector (the interim gauge loop included) was
+//!   deleted in PR-C3 (LANDED 2026-07-14) with WS-GAP-06 (operator Q4-ii
+//!   "agreed dude" — futidx-4-error-codes.md §3: the far-month alarm-gate
+//!   exclusion "dies with the tick-gap detector").
 //!
 //! The false-page class this guard prevented (~8 quiet far months lifting
 //! the ~33 always-silent floor toward alarm threshold 40) is structurally

@@ -290,8 +290,9 @@ pub enum NotificationEvent {
         boot_path: BootPathLabel,
         boot_wall_clock_secs: f64,
         /// Age (secs) of the most-recent REAL tick across all instruments,
-        /// or `None` if zero real ticks captured yet. Sourced from
-        /// `TickGapDetector::freshest_tick_age_secs` (real ticks only —
+        /// or `None` if zero real ticks captured yet. Historically sourced
+        /// from the tick-gap detector's `freshest_tick_age_secs` (DELETED
+        /// in PR-C3, 2026-07-14, with the Dhan WS lane; real ticks only —
         /// never pings). Closes the 2026-06-02 false-OK where the per-feed
         /// "last update Xs ago" counted Dhan keep-alive pings and could
         /// read healthy while no real ticks were captured.
@@ -426,8 +427,10 @@ pub enum NotificationEvent {
         trading_date_ist: String,
         /// Final main-feed connection count at 15:31:30 IST.
         main_feed_active: usize,
-        /// Operator's expected total — same `effective_main_feed_pool_size`
-        /// value as `MarketOpenReadinessConfirmation` for parity.
+        /// Operator's expected total — historically the
+        /// `effective_main_feed_pool_size` value (fn deleted with the Dhan
+        /// subscription surface, PR-C3 2026-07-14); same source as
+        /// `MarketOpenReadinessConfirmation` for parity.
         main_feed_total: usize,
         /// JWT remaining lifetime in whole hours. The 24h SEBI cycle
         /// means anything < 12h after market close needs a TOTP-driven
