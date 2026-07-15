@@ -173,17 +173,18 @@ const TF_CONSISTENCY_MARKER_TASK: &str = "tf-consistency";
 /// silence would be a Rule-11 hole. Scheduled/catch-up runs keep `no_data`
 /// log-only.
 ///
-/// MERGE-NOTE (G9a, fix round 2 — collision site 1 of 2 with the in-flight
-/// `claude/groww-live-off-rest-only` branch): that branch adds its OWN
-/// `pub(crate) fn should_notify_summary(status_label: &str) -> bool` —
-/// DIFFERENT arity, and its notify arm keeps the original un-tupled
-/// JoinHandle shape. This is NOT a trivial union: git conflicts on both
-/// sites, and resolving toward the 1-arg version silently LOSES the F4
-/// forced-run Rule-11 fix with no test failing on the surviving side.
-/// RESOLUTION RULE for whichever branch lands second: keep THIS 2-arg
-/// forced-aware version — forced runs always notify. (Site 2 is the
-/// `Ok(Ok(Some((s, forced_run))))` notify arm below; see also the plan
-/// file's "Merge coordination" section.)
+/// MERGE RESOLVED 2026-07-15 (G9a collision site 1 — roles swapped: main's
+/// #1581, the groww-live-off retirement, landed FIRST): main's 1-arg
+/// `pub(crate)` version of this predicate was superseded by this 2-arg
+/// forced-aware one per the recorded resolution rule — forced runs always
+/// notify (the F4 Rule-11 fix). Main's TRAP-B rationale is preserved: with
+/// the Groww live feed retired there are zero live candle producers, so a
+/// scheduled run legitimately reads `no_data` EVERY trading day — an
+/// unconditional daily Info card carries nothing actionable (commandment
+/// 8); NoData is therefore log-only on scheduled runs while `blind` still
+/// pages (Rule 11: BLIND ≠ no-data) and an unknown/drifted label fails
+/// LOUD (notifies). Adapted TRAP-B arm coverage:
+/// `test_should_notify_summary_nodata_is_log_only_all_other_arms_page`.
 #[must_use]
 pub fn should_notify_summary(status_label: &str, forced_run: bool) -> bool {
     forced_run || status_label != "no_data"
@@ -2063,14 +2064,12 @@ pub fn spawn_tf_consistency_tasks(
     tokio::spawn(async move {
         match inner.await {
             Ok(Ok(Some((s, forced_run)))) => {
-                // MERGE-NOTE (G9a, fix round 2 — collision site 2 of 2 with
-                // `claude/groww-live-off-rest-only`): that branch
-                // restructures this SAME notify arm around a 1-arg
-                // should_notify_summary and the un-tupled JoinHandle.
-                // RESOLUTION RULE: keep the tupled (summary, forced_run)
-                // shape + the 2-arg predicate — forced runs always notify
-                // (the F4 Rule-11 fix). See the fn doc + the plan file's
-                // "Merge coordination" section.
+                // MERGE RESOLVED 2026-07-15 (G9a collision site 2, roles
+                // swapped — #1581 landed first): main's un-tupled arm +
+                // 1-arg predicate were superseded by this tupled
+                // (summary, forced_run) shape — forced runs always notify
+                // (the F4 Rule-11 fix). Main's TRAP-B semantics are
+                // preserved by the 2-arg predicate's scheduled-run arm.
                 let status_label = s.status_label.clone();
                 // Marker keyed on the VERIFIED (Dhan) date, never blindly
                 // "today" — a forced past-date backfill must not suppress
@@ -2099,14 +2098,24 @@ pub fn spawn_tf_consistency_tasks(
                     // must never page — the suppressed send is replaced by
                     // this one visible line (never a silent skip).
                     //
+                    // TRAP-B (main #1581, preserved through the 2026-07-15
+                    // merge): with the Groww live feed retired there are
+                    // ZERO live candle producers, so a scheduled run
+                    // legitimately reads no_data EVERY trading day — an
+                    // unconditional daily Info page carries nothing
+                    // actionable. NoData → log-only; blind still pages
+                    // (Rule 11: BLIND ≠ no-data).
+                    //
                     // G4b (fix round 2): warn!, not info! — this arm is
                     // structurally TRADING-DAY-only (scheduled/catch-up
                     // runs exist only on trading days per
-                    // decide_tf_verify_start; forced runs always notify),
-                    // and a trading-day "nothing to check" while Groww ran
-                    // (every prod day) can also be a silently-empty
-                    // discovery query (the PR #1474 blind-since-birth
-                    // class) — warn! keeps it above the info noise floor.
+                    // decide_tf_verify_start; forced runs always notify).
+                    // Post-#1581 this is one EXPECTED warn line per
+                    // trading day (log-only, no spam); it stays warn!
+                    // rather than info! so the day any candle producer
+                    // returns, an unexpectedly-empty discovery query (the
+                    // PR #1474 blind-since-birth class) sits above the
+                    // info noise floor.
                     //
                     // G4c — RULE-CONTRACT TENSION, recorded deliberately
                     // (see the plan file's Observability section):
@@ -2981,6 +2990,25 @@ mod tests {
         assert_eq!(classify_run_status(10, 1, true, true), MismatchFound);
         assert_eq!(classify_run_status(10, 0, true, true), Degraded);
         assert_eq!(classify_run_status(10, 0, false, true), Pass);
+    }
+
+    #[test]
+    fn test_should_notify_summary_nodata_is_log_only_all_other_arms_page() {
+        // TRAP-B (2026-07-15, main #1581) adapted to the 2-arg forced-aware
+        // predicate (merge resolution): scheduled NoData → log-only;
+        // Pass / MismatchFound / Degraded / Blind ALL page (Rule 11:
+        // blind ≠ no-data); an unknown/drifted label fails LOUD; and a
+        // FORCED run notifies even on NoData (the F4 Rule-11 fix).
+        assert!(!should_notify_summary(RunStatus::NoData.as_str(), false));
+        assert!(should_notify_summary(RunStatus::Pass.as_str(), false));
+        assert!(should_notify_summary(
+            RunStatus::MismatchFound.as_str(),
+            false
+        ));
+        assert!(should_notify_summary(RunStatus::Degraded.as_str(), false));
+        assert!(should_notify_summary(RunStatus::Blind.as_str(), false));
+        assert!(should_notify_summary("some_future_label", false));
+        assert!(should_notify_summary(RunStatus::NoData.as_str(), true));
     }
 
     #[test]

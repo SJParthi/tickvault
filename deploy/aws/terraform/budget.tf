@@ -16,6 +16,13 @@
 # BUDGET_USD env in budget-guards.tf (the two MUST stay in sync — the digest's
 # "% used" reads BUDGET_USD, the kill happens at limit_amount).
 #
+# 2026-07-15 note (Quote 8 downsize — daily-universe §7): the instance lock is
+# now t4g.medium — INTERIM ~$14.67 pre-GST (~₹1,471/mo incl GST at 270 hrs on
+# the live 50 GB root). limit_amount stays $55 DELIBERATELY (the budget measures
+# TOTAL account spend and $55 is honest headroom either way); lowering it toward
+# ~$25 post-downsize is an optional follow-up with its own cost note in
+# aws-budget.md — remember the BUDGET_USD lockstep above if taken.
+#
 # NO cost_filter (un-blinded 2026-06-30): the budget previously filtered on the
 # `Project=tickvault` cost-allocation tag, but that tag was NEVER applied to the
 # actual billed resources (EC2/EBS/EIP), so the budget measured ~$0 against the

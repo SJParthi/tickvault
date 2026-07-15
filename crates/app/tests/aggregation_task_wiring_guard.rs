@@ -251,91 +251,12 @@ fn test_main_rs_spawns_watermark_catchup_driver() {
     }
 }
 
-// ---------------------------------------------------------------------
-// GAP-1a: groww_bridge.rs — the Groww catch-up seal driver
-// ---------------------------------------------------------------------
-
-#[test]
-fn test_groww_bridge_spawns_catchup_driver() {
-    let full = read_repo_file("src/groww_bridge.rs");
-    let prod = strip_line_comments(production_region(&full));
-    // The driver must be DEFINED …
-    assert!(
-        prod.contains("fn spawn_groww_catchup_seal("),
-        "groww_bridge.rs must define the spawn_groww_catchup_seal driver"
-    );
-    // … AND CALLED from BOTH runtime wrappers (2026-07-14 mutation-review
-    // FIX-3): a bare `calls >= 1` count was satisfiable by the call inside
-    // `spawn_supervised_groww_shard_bridges` — the scale-FLEET path that is
-    // DORMANT on main per groww-scale-aws-lockout-2026-07-06.md — so
-    // deleting the PRODUCTION single-conn call passed the guard while the
-    // live Groww catch-up driver silently never ran. Pin the call inside
-    // EACH wrapper's own window.
-    let single_conn = strip_line_comments(raw_window(
-        production_region(&full),
-        "pub fn spawn_supervised_groww_bridge(",
-        Some("pub fn spawn_supervised_groww_shard_bridges("),
-    ));
-    assert!(
-        single_conn.contains("spawn_groww_catchup_seal("),
-        "spawn_supervised_groww_bridge (the LIVE single-conn wrapper) must \
-         call spawn_groww_catchup_seal( — without it the Groww BOUNDARY-01 \
-         catch-up driver silently never runs on the production path (the \
-         fleet wrapper's call does not count: that path is dormant per \
-         groww-scale-aws-lockout-2026-07-06.md)"
-    );
-    let fleet = strip_line_comments(raw_window(
-        production_region(&full),
-        "pub fn spawn_supervised_groww_shard_bridges(",
-        None,
-    ));
-    assert!(
-        fleet.contains("spawn_groww_catchup_seal("),
-        "spawn_supervised_groww_shard_bridges (the fleet wrapper) must also \
-         call spawn_groww_catchup_seal( — a scale-enabled boot without it \
-         would run the fleet with no catch-up driver"
-    );
-    // The driver body must keep its load-bearing pieces.
-    let body = strip_line_comments(raw_window(
-        production_region(&full),
-        "fn spawn_groww_catchup_seal(",
-        None,
-    ));
-    for needle in [
-        "CATCHUP_SEAL_POLL_INTERVAL_SECS",
-        "compute_catchup_cutoff(",
-        "catch_up_seal_all(",
-        "tv_boundary_catchup_total",
-    ] {
-        assert!(
-            body.contains(needle),
-            "spawn_groww_catchup_seal must still carry `{needle}` (poll \
-             cadence / watermark gate / seal pass / per-seal counter)"
-        );
-    }
-}
-
-// ---------------------------------------------------------------------
-// GAP-2: groww_bridge.rs — midnight force-seal watermark-reset ordering
-// (the existing test_run_groww_bridge_spawns_ist_midnight_force_seal pins
-// the SPAWN; this pins the BOUNDARY-01 reset ordering it does not cover.)
-// ---------------------------------------------------------------------
-
-#[test]
-fn test_groww_midnight_force_seal_resets_watermark_after_seal() {
-    let full = read_repo_file("src/groww_bridge.rs");
-    let window = strip_line_comments(raw_window(
-        production_region(&full),
-        "fn spawn_groww_ist_midnight_force_seal(",
-        Some("fn spawn_groww_catchup_seal("),
-    ));
-    assert!(
-        ordered(&window, "force_seal_all(", ".reset_watermark()"),
-        "the Groww IST-midnight force-seal must call force_seal_all( and \
-         THEN reset_watermark() (BOUNDARY-01: the midnight reset is the \
-         ONLY self-heal for a poisoned Groww watermark)"
-    );
-}
+// RETIRED 2026-07-15 (Groww live-feed deletion): the GAP-1a Groww catch-up
+// driver test (test_groww_bridge_spawns_catchup_driver) and the GAP-2 Groww
+// midnight force-seal reset-ordering test
+// (test_groww_midnight_force_seal_resets_watermark_after_seal) died with
+// groww_bridge.rs — the Groww live lane (and its aggregator instance) is
+// deleted; the Dhan Task 3/3b/4 pins above are the surviving contract.
 
 // ---------------------------------------------------------------------
 // Anti-vacuity: the helpers must DETECT planted drift on synthetic input
@@ -425,7 +346,9 @@ fn test_synthetic_production_region_is_module_aware() {
 /// away from permanent vacuity.
 #[test]
 fn test_production_region_truncates_real_test_modules() {
-    for rel in ["src/main.rs", "src/groww_bridge.rs"] {
+    // (2026-07-15: groww_bridge.rs retired from the fixture list with the
+    // Groww live-feed deletion — main.rs remains the live scanned file.)
+    for rel in ["src/main.rs"] {
         let full = read_repo_file(rel);
         let prod = production_region(&full);
         assert!(

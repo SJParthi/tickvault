@@ -18,8 +18,6 @@
 //!   (`tickvault_common::build_info`), trading-session flag, `/proc` RSS.
 //! - feeds: the existing [`super::feeds::get_feeds_health`] response, reused
 //!   verbatim (no forked verdict logic).
-//! - rust shadow: `data/groww/rust-live-ticks.ndjson` size + age + a capped
-//!   line count (PR-R1 native-shadow capture file).
 //! - connections: `data/groww/shards/c*/groww-status.json` (scale runs) or
 //!   the single `data/groww/groww-status.json` (normal runs).
 //! - race: the newest `data/groww/parity-<date>.tsv` (PR-R2 comparer output).
@@ -40,8 +38,6 @@ use crate::state::SharedAppState;
 const GROWW_DIR_DEFAULT: &str = "data/groww";
 /// Env override for [`GROWW_DIR_DEFAULT`].
 const GROWW_DIR_ENV: &str = "TV_GROWW_DIR";
-/// The native Rust shadow client's NDJSON capture file (PR-R1).
-const RUST_SHADOW_FILENAME: &str = "rust-live-ticks.ndjson";
 /// Per-connection shard directories live under `data/groww/shards/c<NN>/`.
 const SHARDS_SUBDIR: &str = "shards";
 /// The sidecar connect+subscribe PROOF status file name (both layouts).
@@ -50,9 +46,6 @@ const STATUS_FILENAME: &str = "groww-status.json";
 const PARITY_PREFIX: &str = "parity-";
 const PARITY_SUFFIX: &str = ".tsv";
 
-/// Line-count read cap for the shadow NDJSON: files larger than this report
-/// `lines: null` instead of paying an unbounded read every 3s poll.
-const LINE_COUNT_CAP_BYTES: u64 = 8 * 1024 * 1024;
 /// A status JSON larger than this is malformed — skip it.
 const MAX_STATUS_FILE_BYTES: u64 = 64 * 1024;
 /// A parity TSV larger than this is not the expected summary — skip it.
@@ -77,17 +70,6 @@ pub struct BoardStatus {
     /// hosts without procfs (macOS dev). CPU% is deliberately OMITTED — no
     /// cheap dependency-free source exists, and we never fake a number.
     pub mem_rss_bytes: Option<u64>,
-}
-
-/// Native Rust shadow capture file status (PR-R1 `rust-live-ticks.ndjson`).
-#[derive(Debug, Serialize)]
-pub struct RustShadowStatus {
-    pub file_bytes: u64,
-    /// Seconds since the file was last written; `null` if mtime unreadable.
-    pub modified_age_secs: Option<u64>,
-    /// Captured tick lines; `null` when the file exceeds the 8 MiB count cap
-    /// (honest skip, never an estimate).
-    pub lines: Option<u64>,
 }
 
 /// One Groww connection row (from a sidecar `groww-status.json`).
@@ -129,8 +111,6 @@ pub struct BoardDataResponse {
     pub status: BoardStatus,
     /// The existing `/api/feeds/health` payload, embedded verbatim.
     pub feeds: super::feeds::FeedsHealthResponse,
-    /// `null` when the shadow capture file does not exist.
-    pub rust_shadow: Option<RustShadowStatus>,
     /// Empty when no groww status file exists (feed off / not started).
     pub connections: Vec<BoardConnRow>,
     /// `null` until a parity TSV exists → the page shows "race pending".
@@ -230,7 +210,6 @@ pub(crate) async fn compute_board_data(state: &SharedAppState) -> BoardDataRespo
             mem_rss_bytes: read_proc_rss_bytes(),
         },
         feeds,
-        rust_shadow: file_view.rust_shadow,
         connections: file_view.connections,
         race: file_view.race,
         dhan_clock_whole_seconds: true,
@@ -255,63 +234,15 @@ fn groww_dir() -> PathBuf {
 /// Everything read from disk for one poll (all best-effort).
 #[derive(Debug, Default)]
 struct FileView {
-    rust_shadow: Option<RustShadowStatus>,
     connections: Vec<BoardConnRow>,
     race: Option<ParityRace>,
 }
 
 fn collect_file_view(dir: &Path, now_ist_nanos: i64) -> FileView {
     FileView {
-        rust_shadow: rust_shadow_status(&dir.join(RUST_SHADOW_FILENAME)),
         connections: scan_connections(dir, now_ist_nanos),
         race: newest_parity_race(dir),
     }
-}
-
-/// Status of the native-shadow NDJSON capture file; `None` when absent.
-fn rust_shadow_status(path: &Path) -> Option<RustShadowStatus> {
-    let meta = std::fs::metadata(path).ok()?;
-    if !meta.is_file() {
-        return None;
-    }
-    let file_bytes = meta.len();
-    let modified_age_secs = meta
-        .modified()
-        .ok()
-        .and_then(|m| m.elapsed().ok())
-        .map(|d| d.as_secs());
-    let lines = if file_bytes <= LINE_COUNT_CAP_BYTES {
-        count_newlines_capped(path)
-    } else {
-        None
-    };
-    Some(RustShadowStatus {
-        file_bytes,
-        modified_age_secs,
-        lines,
-    })
-}
-
-/// Counts `\n` bytes in a file, aborting (→ `None`) past the read cap so a
-/// file that grew between the metadata check and the read stays bounded.
-fn count_newlines_capped(path: &Path) -> Option<u64> {
-    use std::io::Read;
-    let mut file = std::fs::File::open(path).ok()?;
-    let mut buf = [0u8; 64 * 1024];
-    let mut count: u64 = 0;
-    let mut total: u64 = 0;
-    loop {
-        let n = file.read(&mut buf).ok()?;
-        if n == 0 {
-            break;
-        }
-        total = total.saturating_add(n as u64);
-        if total > LINE_COUNT_CAP_BYTES {
-            return None;
-        }
-        count += buf[..n].iter().filter(|&&b| b == b'\n').count() as u64;
-    }
-    Some(count)
 }
 
 /// One row per Groww connection: shard layout (`shards/c<NN>/groww-status.json`)
@@ -801,23 +732,6 @@ mod tests {
             parse_status_json("{\"total\":3}", 0, 0).is_none(),
             "no event tag → skipped"
         );
-    }
-
-    #[test]
-    fn test_count_lines_capped_counts_and_respects_cap() {
-        let dir = scratch_dir("lines");
-        let path = dir.join(RUST_SHADOW_FILENAME);
-        std::fs::write(&path, "a\nb\nc\n").expect("write");
-        assert_eq!(count_newlines_capped(&path), Some(3));
-        let shadow = rust_shadow_status(&path).expect("present");
-        assert_eq!(shadow.file_bytes, 6);
-        assert_eq!(shadow.lines, Some(3));
-        assert!(shadow.modified_age_secs.is_some());
-        assert!(
-            rust_shadow_status(&dir.join("absent.ndjson")).is_none(),
-            "absent file → null section"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -15,47 +15,9 @@ fn read_repo_file(rel_from_app: &str) -> String {
     fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
 }
 
-#[test]
-fn test_groww_drop_arm_is_loud() {
-    let src = read_repo_file("src/groww_bridge.rs");
-    let lines: Vec<&str> = src.lines().collect();
-    let mut markers = 0usize;
-    for (i, line) in lines.iter().enumerate() {
-        if !line.contains("row dropped") {
-            continue;
-        }
-        markers += 1;
-        let start = i.saturating_sub(12);
-        let end = (i + 4).min(lines.len());
-        // CODE lines only — `//` comments may legitimately mention `debug!`
-        // (e.g. "upgraded from debug!"); only executable regressions fail.
-        let region = lines[start..end]
-            .iter()
-            .filter(|l| !l.trim_start().starts_with("//"))
-            .copied()
-            .collect::<Vec<&str>>()
-            .join("\n");
-        assert!(
-            region.contains("error!") && !region.contains("debug!"),
-            "groww_bridge.rs: drop arm near line {} must log at error! (not debug!) — \
-             silent drops are the 2026-07-05 regression class",
-            i + 1
-        );
-        assert!(
-            region.contains("AuditWs01EventWriteFailed"),
-            "groww_bridge.rs: drop arm near line {} must carry code = AUDIT-WS-01",
-            i + 1
-        );
-    }
-    assert!(
-        markers >= 1,
-        "groww_bridge.rs: expected at least one ws_event_audit drop-arm marker"
-    );
-    assert!(
-        src.contains("tv_ws_event_audit_dropped_total"),
-        "groww_bridge.rs: the drop arm must increment tv_ws_event_audit_dropped_total{{reason}}"
-    );
-}
+// RETIRED 2026-07-15 (Groww live-feed deletion): test_groww_drop_arm_is_loud
+// died with groww_bridge.rs (the app-side drop arms are gone); the storage
+// writer ILP-HTTP pin below survives.
 
 #[test]
 fn test_ws_event_audit_writer_uses_ilp_http() {
