@@ -271,6 +271,49 @@ jobs:
         run: cargo nextest run -p tickvault-${{ matrix.crate }} ${{ matrix.features }} --no-fail-fast --profile ci
 
   # -------------------------------------------------------------------------
+  # 2026-07-15 (Groww order build, §39.2 Gate-2): the groww_orders feature
+  # lane — area modules under crates/trading/src/oms/groww/ are compiled+tested
+  # ONLY here (the default suites build without the feature). Added to
+  # all-green needs per merge-gate-lock-2026-07-04 §5.
+  #
+  # UNCONDITIONAL (no `if:`, no path filter) — it runs on pull_request AND
+  # push/workflow_dispatch, so All Green's 'skipped'=failure rule needs no
+  # exception for it (the dhat-zero-alloc precedent). Modeled on the Test
+  # matrix job above: same runner, same pinned toolchain, same nextest
+  # invocation style, with `--features groww_orders` added. clippy is NOT
+  # duplicated here — it lives workspace-level in Build & Verify only.
+  # -------------------------------------------------------------------------
+  test-groww-orders:
+    name: "Test (trading, groww_orders)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7.0.0
+
+      - name: Install Rust toolchain 1.95.0
+        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # SHA-pinned (was @stable, supply-chain hardening 2026-04-25)
+        with:
+          toolchain: '1.95.0'
+
+      - name: Cache cargo registry + build
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-test-trading-groww-orders
+          cache-on-failure: true
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+
+      - name: cargo nextest run -p tickvault-trading --features groww_orders (lib + integration, profile=ci)
+        # Full trading suite WITH the groww_orders feature enabled — the
+        # feature-gated oms/groww area modules compile + test only in this
+        # lane. Same `#[ignore]` / profile-ci semantics as the Test matrix.
+        run: cargo nextest run -p tickvault-trading --features groww_orders --no-fail-fast --profile ci
+
+  # -------------------------------------------------------------------------
   # Security & Audit — delegated to security-audit.yml workflow.
   # Kept as a required check so branch protection continues to match; the
   # actual audit job lives in security-audit.yml to stay modular.
@@ -750,6 +793,9 @@ jobs:
       - deploy-lint
       - build-and-verify
       - test
+      # 2026-07-15 (Groww order build, §39.2 Gate-2): the groww_orders
+      # feature lane gates merges too — merge-gate-lock-2026-07-04 §5.
+      - test-groww-orders
       - security-and-audit
       - coverage-and-perf
       - repo-guards
