@@ -2,10 +2,15 @@
 //! §39.3 collision contract (operator authorization 2026-07-14/15).
 //!
 //! # Ground truth
-//! `docs/groww-ref/18-smart-orders-schemas.md` (the FULL recovered schemas —
-//! every wire field name below is verbatim from that capture) +
+//! `docs/groww-ref/18-smart-orders-schemas.md` (the recovered schemas) +
 //! `docs/groww-ref/16-orders-margins-portfolio.md` (endpoint inventory + GA
-//! error codes). Prices on the smart-order wire are DECIMAL STRINGS
+//! error codes). Provenance honesty: the OCO create/modify/cancel/get/list
+//! shapes are CAPTURE-VERBATIM (doc 18 §2–§7); the **GTT CREATE shape is
+//! INFERRED** — doc 18 §0 defers the GTT create schema to the capture it
+//! does not reproduce, and doc 16 carries no field table, so the
+//! [`GttCreateRequest`] field set is grounded in the capture's example JSON
+//! + schema prose only (doc 18 §9 probe P1/P4 class — verify on the first
+//! authorized live GTT round-trip). Prices on the smart-order wire are DECIMAL STRINGS
 //! ("All prices should be passed as decimal strings" — doc 18 §8.7);
 //! internally this module speaks INTEGER PAISE (`i64`) only, converted at
 //! the wire boundary by [`paise_to_decimal_string`] /
@@ -48,8 +53,12 @@
 //! The access token comes from a caller-supplied READ-ONLY provider (the
 //! shared-minter SSM read — `groww-shared-token-minter-2026-07-02.md`);
 //! this module NEVER mints, never logs the token, and never puts it in a
-//! URL. Error bodies are bounded + secret-redacted via the house
-//! [`capture_rest_error_body`] choke point.
+//! URL. EVERY broker-controlled string that can reach a log or a typed
+//! error — the GA `code`, the GA `message`, raw non-2xx bodies, the
+//! envelope `status`, and transport error text — routes through the house
+//! [`capture_rest_error_body`] redaction choke point (bounded ≤300 chars,
+//! JWT/URL-credential redacted). `bounded_echo` is used ONLY for
+//! caller-supplied validation inputs, never for broker output.
 
 use std::fmt;
 use std::sync::Arc;
@@ -86,12 +95,20 @@ const SMART_ORDER_STATUS_PATH_PREFIX: &str = "/v1/order-advance/status";
 /// `GET` — list smart orders with optional filters (doc 18 §5 [R:L405]).
 const SMART_ORDER_LIST_PATH: &str = "/v1/order-advance/list";
 
-/// Per-request timeout (seconds) — one bounded round-trip, no internal
-/// retry ladder (the §38 legs' pacing discipline; the future reconcile
-/// poller owns cadence).
+/// Per-request timeout (seconds) — each attempt is one bounded
+/// round-trip (the §38 legs' pacing discipline; the future reconcile
+/// poller owns cadence). Retry semantics live on [`RetryPolicy`]:
+/// READ paths get ONE bounded transport retry; WRITE paths get NONE
+/// (H-HIGH 2026-07-15 — this doc previously said "no internal retry
+/// ladder" while the send loop retried everything once; the write-side
+/// contradiction is resolved by removing the write retry entirely).
 const SMART_ORDER_REQUEST_TIMEOUT_SECS: u64 = 5;
-/// Delay before the SINGLE bounded retry on a TRANSPORT-class send error
-/// (never on any HTTP status — a 4xx/5xx is a broker verdict, not a blip).
+/// Delay before the SINGLE bounded READ-path retry on a TRANSPORT-class
+/// send error (never on any HTTP status — a 4xx/5xx is a broker verdict,
+/// not a blip). WRITE paths never reach this — a create whose first
+/// attempt reached the broker but whose response was lost would be
+/// DOUBLE-SENT, and the GA007 `reference_id` dedup window is UNKNOWN
+/// (doc 18 §9 probe P10).
 const SMART_ORDER_TRANSPORT_RETRY_DELAY_MS: u64 = 250;
 
 /// Wire literal for the OCO smart-order type (doc 18 §2).
@@ -160,11 +177,34 @@ impl From<&GrowwOrdersConfig> for GrowwSmartOrderSettings {
     // WIRING-EXEMPT: §39.3 area PR — the boot wiring that maps `[groww_orders]`
     // into this settings struct lands with the later orchestrator PR; tested inline.
     fn from(cfg: &GrowwOrdersConfig) -> Self {
+        // Defensive clamps (H-LOW, 2026-07-15): a 0 on either knob would
+        // hot-loop the poller / make every sibling-cancel check an instant
+        // Violation. 0 → the documented default, with one bounded warn! at
+        // construction (this mapper runs once at boot wiring).
+        let defaults = Self::default();
+        let reconcile_poll_secs = if cfg.oco_reconcile_poll_secs == 0 {
+            tracing::warn!(
+                clamped_to = defaults.reconcile_poll_secs,
+                "groww smart-orders: oco_reconcile_poll_secs = 0 clamped to default"
+            );
+            defaults.reconcile_poll_secs
+        } else {
+            cfg.oco_reconcile_poll_secs
+        };
+        let sibling_cancel_deadline_secs = if cfg.oco_sibling_cancel_deadline_secs == 0 {
+            tracing::warn!(
+                clamped_to = defaults.sibling_cancel_deadline_secs,
+                "groww smart-orders: oco_sibling_cancel_deadline_secs = 0 clamped to default"
+            );
+            defaults.sibling_cancel_deadline_secs
+        } else {
+            cfg.oco_sibling_cancel_deadline_secs
+        };
         Self {
             read_enabled: cfg.smart_orders_read,
             write_enabled: cfg.smart_orders_write,
-            reconcile_poll_secs: cfg.oco_reconcile_poll_secs,
-            sibling_cancel_deadline_secs: cfg.oco_sibling_cancel_deadline_secs,
+            reconcile_poll_secs,
+            sibling_cancel_deadline_secs,
         }
     }
 }
@@ -325,7 +365,9 @@ pub struct ModifyLeg {
 /// `segment` are routing-REQUIRED in the body ([R:L243–L244]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SmartOrderModifyRequest {
-    /// Routing-required: `OCO` / `GTT`.
+    /// Routing-required in the body ([R:L243–L244]). OCO ONLY today —
+    /// `validate_modify` fail-closes GTT (its modifiable set is a
+    /// different shape; see the H-MED note there).
     pub smart_order_type: &'static str,
     /// Routing-required: `FNO` / `CASH`.
     pub segment: String,
@@ -711,6 +753,14 @@ pub enum SmartOrderValidationError {
     /// A modify body with ZERO modifiable fields is a no-op — rejected.
     #[error("modify request carries no modifiable field")]
     EmptyModify,
+    /// Modify supports OCO only today — the GTT modifiable set is a
+    /// DIFFERENT shape not expressible with [`SmartOrderModifyRequest`]
+    /// (fail-closed; see `validate_modify`).
+    #[error("modify unsupported for smart_order_type `{smart_order_type}` — OCO only")]
+    UnsupportedModifyType {
+        /// The rejected smart-order type literal.
+        smart_order_type: &'static str,
+    },
     /// A path component (segment / smart_order_type / smart_order_id)
     /// failed the fail-closed charset check (URL-path injection defense).
     #[error("invalid {component}: {reason}")]
@@ -926,6 +976,18 @@ pub fn validate_gtt_create(
 /// Validates a modify body: at least one modifiable field present, and any
 /// supplied trigger price / quantity parses/passes its own rule.
 pub fn validate_modify(req: &SmartOrderModifyRequest) -> Result<(), SmartOrderValidationError> {
+    // OCO-ONLY, fail-closed (H-MED fix, 2026-07-15): the GTT modifiable
+    // set is DIFFERENT (quantity, trigger_price, trigger_direction,
+    // order.order_type, order.price, child_legs — doc 18 §3) and is NOT
+    // expressible with this OCO-shaped struct; accepting
+    // `smart_order_type = GTT` here would ship a mis-shaped request whose
+    // broker-side handling is unverified (probe class). A GTT-shaped
+    // modify type is a separate future addition.
+    if req.smart_order_type != SMART_ORDER_TYPE_OCO {
+        return Err(SmartOrderValidationError::UnsupportedModifyType {
+            smart_order_type: req.smart_order_type,
+        });
+    }
     if req.quantity.is_none()
         && req.duration.is_none()
         && req.product_type.is_none()
@@ -1079,6 +1141,28 @@ pub enum SmartOrderReadOutcome<T> {
     Fetched(T),
 }
 
+/// Internal HTTP method selector — exhaustive, so a typo'd method can never
+/// silently coerce to a GET (H-LOW fix, 2026-07-15; was a `&'static str`
+/// with a `_ => GET` fallback arm).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HttpMethod {
+    Get,
+    Post,
+    Put,
+}
+
+/// Transport-retry policy for one [`GrowwSmartOrderClient::send_request`]
+/// round-trip. WRITE paths MUST use [`RetryPolicy::Never`] — see the
+/// double-send rationale on `send_and_parse` (probe P10).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetryPolicy {
+    /// Exactly one attempt — a transport failure is returned typed,
+    /// never re-sent (the write-path law).
+    Never,
+    /// One bounded retry on a TRANSPORT-class error (idempotent reads).
+    TransportOnce,
+}
+
 /// Internal write-op classifier for error-code selection (create/cancel →
 /// `GROWW-OCO-01`; modify → `GROWW-OCO-04`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1143,6 +1227,16 @@ pub enum SmartOrderError {
         status: u16,
         /// Bounded + redacted body capture.
         body: String,
+    },
+    /// A 2xx envelope whose `status` is NEITHER `SUCCESS` nor `FAILURE`
+    /// (e.g. `PENDING`, empty, a drifted value) — Rule-11: a 2xx is never
+    /// treated as success without positive `SUCCESS` evidence.
+    #[error("anomalous 2xx envelope (http {http_status}) status `{envelope_status}`")]
+    AnomalousEnvelope {
+        /// The real HTTP status the envelope rode on.
+        http_status: u16,
+        /// Bounded + redacted envelope `status` string.
+        envelope_status: String,
     },
     /// A 2xx body that did not parse into the expected envelope/payload.
     #[error("parse: {0}")]
@@ -1235,14 +1329,45 @@ pub enum ReconcileVerdict {
         /// The absolute net position.
         abs_net_position: i64,
     },
+    /// A caller passed a NEGATIVE quantity/abs-position — nonsensical
+    /// inputs are never trusted (H-LOW fix, 2026-07-15): the verdict is a
+    /// typed mismatch-class arm the orchestrator escalates, never a
+    /// mislabeled comparison and never a silent `Consistent`.
+    InvalidInputs {
+        /// The offending OCO quantity.
+        oco_quantity: i64,
+        /// The offending "absolute" net position.
+        abs_net_position: i64,
+    },
 }
 
 /// Total OCO-vs-position quantity reconcile (pure comparison — the
 /// GROWW-OCO-03 emit site lands with the later orchestrator PR).
+///
+/// Negative inputs return [`ReconcileVerdict::InvalidInputs`] — the caller
+/// contract is `abs(net_position)`, but the function never trusts it.
+///
+/// # Orchestrator traps (for the later reconcile PR — read before wiring)
+/// - **Clock source:** the `secs_since_trigger` fed to
+///   [`sibling_cancel_verdict`] must be measured from the LEG-EXECUTION
+///   OBSERVATION instant (the poll/push that first showed the fill) on a
+///   monotonic-ish clock — never from order-create time and never from a
+///   wall clock that can step backwards across the deadline.
+/// - **Leg-status mapping:** NO leg `groww_order_id` linkage is documented
+///   anywhere on the smart-order surface (doc 18 §7 verified absence —
+///   probe **P5**), so mapping each leg to a [`BrokerOrderStatus`] must
+///   correlate via `reference_id`/`remark`/symbol+time until P5 resolves;
+///   a wrong-leg correlation would mis-verdict the sibling check.
 #[must_use]
 // WIRING-EXEMPT: §39.3 area PR — the reconcile-orchestrator consumer (the
 // GROWW-OCO-03 emit site) lands in its own later PR; tested inline.
 pub fn reconcile_verdict(oco_quantity: i64, abs_net_position: i64) -> ReconcileVerdict {
+    if oco_quantity < 0 || abs_net_position < 0 {
+        return ReconcileVerdict::InvalidInputs {
+            oco_quantity,
+            abs_net_position,
+        };
+    }
     match oco_quantity.cmp(&abs_net_position) {
         std::cmp::Ordering::Equal => ReconcileVerdict::Consistent,
         std::cmp::Ordering::Greater => ReconcileVerdict::OcoExceedsPosition {
@@ -1342,8 +1467,13 @@ impl GrowwSmartOrderClient {
         }
         // LIVE path — statically after BOTH gates; unreachable until the
         // dated Gate-3 flip.
-        self.execute_write("POST", &endpoint, Some(body_json), WriteOp::Create)
-            .await
+        self.execute_write(
+            HttpMethod::Post,
+            &endpoint,
+            Some(body_json),
+            WriteOp::Create,
+        )
+        .await
     }
 
     /// Creates a GTT smart order (same gate order as [`Self::create_oco`]).
@@ -1367,8 +1497,13 @@ impl GrowwSmartOrderClient {
                 body_json,
             });
         }
-        self.execute_write("POST", &endpoint, Some(body_json), WriteOp::Create)
-            .await
+        self.execute_write(
+            HttpMethod::Post,
+            &endpoint,
+            Some(body_json),
+            WriteOp::Create,
+        )
+        .await
     }
 
     /// Modifies a resting smart order (`PUT .../modify/{smart_order_id}`;
@@ -1396,7 +1531,7 @@ impl GrowwSmartOrderClient {
                 body_json,
             });
         }
-        self.execute_write("PUT", &endpoint, Some(body_json), WriteOp::Modify)
+        self.execute_write(HttpMethod::Put, &endpoint, Some(body_json), WriteOp::Modify)
             .await
     }
 
@@ -1429,7 +1564,7 @@ impl GrowwSmartOrderClient {
                 body_json: String::new(),
             });
         }
-        self.execute_write("POST", &endpoint, None, WriteOp::Cancel)
+        self.execute_write(HttpMethod::Post, &endpoint, None, WriteOp::Cancel)
             .await
     }
 
@@ -1512,7 +1647,7 @@ impl GrowwSmartOrderClient {
     /// (placement-class), modify → `GROWW-OCO-04`.
     async fn execute_write(
         &self,
-        method: &'static str,
+        method: HttpMethod,
         endpoint: &str,
         body_json: Option<String>,
         op: WriteOp,
@@ -1542,50 +1677,73 @@ impl GrowwSmartOrderClient {
         }
     }
 
-    /// Read-path GET → parsed payload.
+    /// Read-path GET → parsed payload. Reads keep the single bounded
+    /// transport retry: a GET is idempotent, so re-asking after a blip is
+    /// safe and keeps the reconcile poller's snapshot rate honest.
     async fn fetch_payload<T: DeserializeOwned>(
         &self,
         endpoint: &str,
         query: &[(&'static str, String)],
     ) -> Result<T, SmartOrderError> {
-        let (status, body) = self.send_request("GET", endpoint, query, None).await?;
+        let (status, body) = self
+            .send_request(
+                HttpMethod::Get,
+                endpoint,
+                query,
+                None,
+                RetryPolicy::TransportOnce,
+            )
+            .await?;
         parse_success_envelope::<T>(status, &body)
     }
 
-    /// Write-path send → parsed payload.
+    /// Write-path send → parsed payload. WRITES NEVER RETRY (H-HIGH fix,
+    /// 2026-07-15): a create whose first attempt REACHED the broker but
+    /// whose response was lost would be DOUBLE-SENT by a transport retry,
+    /// and whether the `reference_id` idempotency window (GA007) actually
+    /// dedups the second submission is UNKNOWN — doc 18 §9 probe **P10**.
+    /// A failed write returns the typed Transport outcome and the
+    /// caller/orchestrator decides (status-GET-first, never blind resend).
     async fn send_and_parse<T: DeserializeOwned>(
         &self,
-        method: &'static str,
+        method: HttpMethod,
         endpoint: &str,
         query: &[(&'static str, String)],
         body_json: Option<&str>,
     ) -> Result<T, SmartOrderError> {
         let (status, body) = self
-            .send_request(method, endpoint, query, body_json)
+            .send_request(method, endpoint, query, body_json, RetryPolicy::Never)
             .await?;
         parse_success_envelope::<T>(status, &body)
     }
 
     /// One bounded HTTP round-trip: bearer + `x-api-version: 1.0` +
     /// `Accept: application/json` headers (the `groww_spot_1m_boot` shape),
-    /// 5s per-request timeout, ONE bounded retry on TRANSPORT error only
-    /// (never on any HTTP status), 429 → typed + counted. Returns
-    /// `(status, raw body)` for every non-429 HTTP response.
+    /// 5s per-request timeout, transport retry per [`RetryPolicy`]
+    /// (READ paths: one bounded retry; WRITE paths: NEVER — the P10
+    /// double-send risk), never a retry on any HTTP status, 429 → typed +
+    /// counted. Returns `(status, raw body)` for every non-429 HTTP
+    /// response.
     async fn send_request(
         &self,
-        method: &'static str,
+        method: HttpMethod,
         url: &str,
         query: &[(&'static str, String)],
         body_json: Option<&str>,
+        retry: RetryPolicy,
     ) -> Result<(u16, String), SmartOrderError> {
         let token = (self.token_provider)().ok_or(SmartOrderError::NoToken)?;
+        let max_attempts: u8 = match retry {
+            RetryPolicy::Never => 1,
+            RetryPolicy::TransportOnce => 2,
+        };
         let mut attempt: u8 = 0;
         loop {
             attempt += 1;
             let mut builder = match method {
-                "POST" => self.http.post(url),
-                "PUT" => self.http.put(url),
-                _ => self.http.get(url),
+                HttpMethod::Get => self.http.get(url),
+                HttpMethod::Post => self.http.post(url),
+                HttpMethod::Put => self.http.put(url),
             };
             builder = builder
                 .timeout(Duration::from_secs(SMART_ORDER_REQUEST_TIMEOUT_SECS))
@@ -1601,12 +1759,14 @@ impl GrowwSmartOrderClient {
                     .body(body.to_owned());
             }
             match builder.send().await {
-                Err(_transport) if attempt == 1 => {
-                    // ONE bounded retry on transport error only — a 4xx/5xx
+                Err(_transport) if attempt < max_attempts => {
+                    // Transport retry — REACHABLE ONLY under
+                    // RetryPolicy::TransportOnce (read paths). Write paths
+                    // pass RetryPolicy::Never (max_attempts = 1), so this
+                    // arm is unreachable for them: a lost WRITE response
+                    // must never be blind-resent (probe P10 — the GA007
+                    // reference_id dedup window is unverified). A 4xx/5xx
                     // never reaches this arm (it is an Ok(response)).
-                    // (The first attempt's error is intentionally unlogged —
-                    // the retry either succeeds silently or the second
-                    // failure below carries the bounded + redacted capture.)
                     tokio::time::sleep(Duration::from_millis(SMART_ORDER_TRANSPORT_RETRY_DELAY_MS))
                         .await;
                     continue;
@@ -1652,7 +1812,11 @@ fn parse_success_envelope<T: DeserializeOwned>(
         {
             return Err(SmartOrderError::GaFailure {
                 http_status: status,
-                code: bounded_echo(&ga.code),
+                // BROKER-CONTROLLED strings (the GA code AND the message)
+                // BOTH route through the house redaction choke point —
+                // never a trust-the-broker echo (S-HIGH fix 2026-07-15:
+                // `code` previously went through bounded_echo only).
+                code: capture_rest_error_body(&ga.code),
                 message: capture_rest_error_body(&ga.message),
             });
         }
@@ -1667,8 +1831,18 @@ fn parse_success_envelope<T: DeserializeOwned>(
         let ga = envelope.error.unwrap_or_default();
         return Err(SmartOrderError::GaFailure {
             http_status: status,
-            code: bounded_echo(&ga.code),
+            code: capture_rest_error_body(&ga.code),
             message: capture_rest_error_body(&ga.message),
+        });
+    }
+    // Rule-11 (no false-OK): success requires POSITIVE evidence — the 2xx
+    // envelope must literally say SUCCESS. Any other status string on a 2xx
+    // ("PENDING", empty, a drifted value) is a typed anomaly, never treated
+    // as success (H-MED fix, 2026-07-15).
+    if !envelope.status.eq_ignore_ascii_case("SUCCESS") {
+        return Err(SmartOrderError::AnomalousEnvelope {
+            http_status: status,
+            envelope_status: capture_rest_error_body(&envelope.status),
         });
     }
     envelope
@@ -1725,6 +1899,60 @@ mod tests {
             4,
             "all four write methods carry the Gate-3 dry-run check"
         );
+        // C-MED (2026-07-15): every pub async method must be accounted for
+        // by exactly one gate — a 5th UNGATED write (or read) method makes
+        // the pub-async count exceed the gate count and fails here.
+        let pub_async = prod.matches("pub async fn ").count();
+        let write_gates = prod.matches("if !self.settings.write_enabled").count();
+        let read_gates = prod.matches("if !self.settings.read_enabled").count();
+        assert_eq!(write_gates, 4, "exactly four gated write methods");
+        assert_eq!(read_gates, 2, "exactly two gated read methods");
+        assert_eq!(
+            pub_async,
+            write_gates + read_gates,
+            "every pub async method must carry a config gate — an ungated \
+             5th write method (or read method) fails this ratchet"
+        );
+        // H-HIGH (2026-07-15): the retry-policy split is pinned
+        // BEHAVIORALLY by test_write_path_never_retries_transport_error /
+        // test_read_path_retries_transport_error_once below (a counting
+        // mock server observes the real attempt counts — mutation-hard).
+    }
+
+    // -- Observability contract ratchet (C-MED, 2026-07-15) -------------------
+
+    #[test]
+    fn ratchet_coded_emit_blocks_exist_in_production_region() {
+        // Mutation-hardness for the observability contract: the three emit
+        // blocks must exist in the PRODUCTION region with their exact
+        // `ErrorCode::...code_str()` tokens — deleting or re-coding any
+        // emit fails the build here, not in review.
+        let src = include_str!("smart_orders.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap_or("");
+        assert_eq!(
+            prod.matches("ErrorCode::GrowwOco01PlacementFailed.code_str()")
+                .count(),
+            1,
+            "GROWW-OCO-01 emit (create + cancel arm) must exist exactly once"
+        );
+        assert_eq!(
+            prod.matches("ErrorCode::GrowwOco04ModifyRejected.code_str()")
+                .count(),
+            1,
+            "GROWW-OCO-04 emit (modify arm) must exist exactly once"
+        );
+        assert_eq!(
+            prod.matches("ErrorCode::GrowwOco05PollerDegraded.code_str()")
+                .count(),
+            2,
+            "GROWW-OCO-05 emits (status get + list) must exist exactly twice"
+        );
+        // Each token must sit inside an error! macro carrying a `code =`
+        // field (the tag-guard convention).
+        assert!(
+            prod.matches("code = ErrorCode::GrowwOco").count() == 4,
+            "all four coded emits carry the `code = ErrorCode::...` field"
+        );
     }
 
     // -- Settings ------------------------------------------------------------
@@ -1757,6 +1985,33 @@ mod tests {
             GrowwSmartOrderSettings::from(&GrowwOrdersConfig::default()),
             GrowwSmartOrderSettings::default()
         );
+    }
+
+    #[test]
+    fn test_settings_from_config_clamps_zero_knobs_to_defaults() {
+        // H-LOW (2026-07-15): a 0 poll cadence would hot-loop the poller;
+        // a 0 sibling deadline would make every check an instant
+        // Violation — both clamp to the documented defaults (warn!-ed).
+        let cfg = GrowwOrdersConfig {
+            oco_reconcile_poll_secs: 0,
+            oco_sibling_cancel_deadline_secs: 0,
+            ..GrowwOrdersConfig::default()
+        };
+        let s = GrowwSmartOrderSettings::from(&cfg);
+        assert_eq!(s.reconcile_poll_secs, 15, "0 poll secs clamps to 15");
+        assert_eq!(
+            s.sibling_cancel_deadline_secs, 30,
+            "0 deadline secs clamps to 30"
+        );
+        // Non-zero values pass through unclamped.
+        let cfg = GrowwOrdersConfig {
+            oco_reconcile_poll_secs: 1,
+            oco_sibling_cancel_deadline_secs: 1,
+            ..GrowwOrdersConfig::default()
+        };
+        let s = GrowwSmartOrderSettings::from(&cfg);
+        assert_eq!(s.reconcile_poll_secs, 1);
+        assert_eq!(s.sibling_cancel_deadline_secs, 1);
     }
 
     // -- Money discipline -----------------------------------------------------
@@ -2043,10 +2298,16 @@ mod tests {
             validate_gtt_create(&req, 1),
             Err(SmartOrderValidationError::PricePresenceInvalid { leg: "order", .. })
         ));
-        // SL_M with price.
+        // SL_M with price — exact variant (C-LOW: no catch-all is_err).
         let mut req = doc_gtt_request();
         req.order.order_type = SmartLegOrderType::SlM;
-        assert!(validate_gtt_create(&req, 1).is_err());
+        assert!(matches!(
+            validate_gtt_create(&req, 1),
+            Err(SmartOrderValidationError::PricePresenceInvalid {
+                leg: "order",
+                reason: "price must be absent for MARKET/SL_M",
+            })
+        ));
         // FNO lot multiple.
         let mut req = doc_gtt_request();
         req.segment = "FNO".to_owned();
@@ -2055,10 +2316,16 @@ mod tests {
             validate_gtt_create(&req, 75),
             Err(SmartOrderValidationError::QuantityNotLotMultiple { .. })
         ));
-        // Bad trigger price string.
+        // Bad trigger price string — exact variant (>2dp).
         let mut req = doc_gtt_request();
         req.trigger_price = "3985.123".to_owned();
-        assert!(validate_gtt_create(&req, 1).is_err());
+        assert!(matches!(
+            validate_gtt_create(&req, 1),
+            Err(SmartOrderValidationError::InvalidPrice {
+                reason: "fraction must be 1-2 digits",
+                ..
+            })
+        ));
     }
 
     // -- Modify validation --------------------------------------------------------
@@ -2099,14 +2366,33 @@ mod tests {
             validate_modify(&bad_qty),
             Err(SmartOrderValidationError::NonPositiveQuantity { .. })
         ));
-        // Bad trigger price string rejected.
+        // Bad trigger price string — exact variant (non-digit).
         let bad_price = SmartOrderModifyRequest {
             target: Some(ModifyLeg {
                 trigger_price: "abc".to_owned(),
             }),
+            ..empty.clone()
+        };
+        assert!(matches!(
+            validate_modify(&bad_price),
+            Err(SmartOrderValidationError::InvalidPrice {
+                reason: "non-digit integer part",
+                ..
+            })
+        ));
+        // GTT modify is fail-closed UNSUPPORTED (H-MED: the OCO-shaped
+        // struct cannot express the GTT modifiable set); OCO passes.
+        let gtt_modify = SmartOrderModifyRequest {
+            smart_order_type: SMART_ORDER_TYPE_GTT,
+            quantity: Some(10),
             ..empty
         };
-        assert!(validate_modify(&bad_price).is_err());
+        assert!(matches!(
+            validate_modify(&gtt_modify),
+            Err(SmartOrderValidationError::UnsupportedModifyType {
+                smart_order_type: "GTT",
+            })
+        ));
     }
 
     // -- Wire shape: doc-verbatim field names ---------------------------------
@@ -2132,7 +2418,12 @@ mod tests {
     }
 
     #[test]
-    fn test_gtt_create_body_matches_doc_verbatim() {
+    fn test_gtt_create_body_matches_doc_example_inferred_schema() {
+        // Provenance honesty (H-MED, 2026-07-15): unlike the OCO shape
+        // (capture-verbatim, doc 18 §2), the GTT create field set is
+        // INFERRED — grounded in the capture's example JSON + schema prose
+        // only (doc 18 §0 defers the GTT table; doc 16 has none). Probe
+        // P1/P4 class: verify on the first authorized live GTT round-trip.
         let body = serde_json::to_value(doc_gtt_request()).unwrap();
         let expected = serde_json::json!({
             "reference_id": "sref-unique-123",
@@ -2265,6 +2556,44 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_success_envelope_anomalous_2xx_status_is_never_success() {
+        // Rule-11 (H-MED, 2026-07-15): a 2xx whose envelope status is NOT
+        // the positive `SUCCESS` literal must never parse as success —
+        // even when a payload is present.
+        let body = r#"{"status":"PENDING","payload":{"smart_order_id":"oco_a12bc3","smart_order_type":"OCO","status":"ACTIVE"}}"#;
+        let err = parse_success_envelope::<SmartOrderPayload>(200, body).unwrap_err();
+        match err {
+            SmartOrderError::AnomalousEnvelope {
+                http_status,
+                envelope_status,
+            } => {
+                assert_eq!(http_status, 200);
+                assert_eq!(envelope_status, "PENDING");
+            }
+            other => panic!("expected AnomalousEnvelope, got {other:?}"),
+        }
+        // Empty status string is equally anomalous.
+        let err = parse_success_envelope::<SmartOrderPayload>(
+            201,
+            r#"{"payload":{"smart_order_id":"x"}}"#,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            SmartOrderError::AnomalousEnvelope {
+                http_status: 201,
+                ..
+            }
+        ));
+        // Case-insensitive SUCCESS still parses.
+        let ok = parse_success_envelope::<SmartOrderPayload>(
+            200,
+            r#"{"status":"success","payload":{"smart_order_id":"gtt_91a7f4"}}"#,
+        );
+        assert!(ok.is_ok());
+    }
+
+    #[test]
     fn test_parse_success_envelope_unparseable_2xx() {
         let err = parse_success_envelope::<SmartOrderPayload>(200, "not json").unwrap_err();
         assert!(matches!(err, SmartOrderError::Parse(_)));
@@ -2293,7 +2622,7 @@ mod tests {
     // -- Status mapper -------------------------------------------------------------
 
     #[test]
-    fn test_smart_order_status_total_mapper() {
+    fn test_from_groww_smart_status_total_mapper() {
         // All six documented values (doc 18 §6), case/whitespace tolerant.
         assert_eq!(
             SmartOrderStatus::from_groww_smart_status("ACTIVE"),
@@ -2331,7 +2660,7 @@ mod tests {
     }
 
     #[test]
-    fn test_smart_order_status_as_str_and_terminal() {
+    fn test_smart_order_status_as_str_and_is_terminal() {
         assert_eq!(SmartOrderStatus::Active.as_str(), "ACTIVE");
         assert_eq!(SmartOrderStatus::Triggered.as_str(), "TRIGGERED");
         assert_eq!(SmartOrderStatus::Cancelled.as_str(), "CANCELLED");
@@ -2427,12 +2756,37 @@ mod tests {
             }
         );
         assert_eq!(reconcile_verdict(0, 0), ReconcileVerdict::Consistent);
+        // H-LOW (2026-07-15): negative inputs are never trusted — a caller
+        // passing a raw (signed) net position instead of its abs() gets a
+        // typed InvalidInputs verdict, never a mislabeled comparison and
+        // never a silent Consistent.
+        assert_eq!(
+            reconcile_verdict(50, -50),
+            ReconcileVerdict::InvalidInputs {
+                oco_quantity: 50,
+                abs_net_position: -50
+            }
+        );
+        assert_eq!(
+            reconcile_verdict(-50, 50),
+            ReconcileVerdict::InvalidInputs {
+                oco_quantity: -50,
+                abs_net_position: 50
+            }
+        );
+        assert_eq!(
+            reconcile_verdict(-1, -1),
+            ReconcileVerdict::InvalidInputs {
+                oco_quantity: -1,
+                abs_net_position: -1
+            }
+        );
     }
 
     // -- List query -----------------------------------------------------------------
 
     #[test]
-    fn test_list_query_pairs_and_bounds() {
+    fn test_to_query_pairs_and_bounds() {
         let q = SmartOrderListQuery {
             segment: Some("FNO".to_owned()),
             smart_order_type: Some("OCO".to_owned()),
@@ -2579,10 +2933,29 @@ mod tests {
         let outcome = client.create_gtt(&doc_gtt_request(), 1).await.unwrap();
         match outcome {
             SmartOrderOutcome::DryRun {
-                endpoint, method, ..
+                endpoint,
+                method,
+                body_json,
             } => {
                 assert_eq!(endpoint, "http://127.0.0.1:1/v1/order-advance/create");
                 assert_eq!(method, "POST");
+                // Full body assertion (C-LOW parity with the OCO dry-run
+                // test) — the inferred GTT shape, doc example values.
+                let body: serde_json::Value = serde_json::from_str(&body_json).unwrap();
+                let expected = serde_json::json!({
+                    "reference_id": "sref-unique-123",
+                    "smart_order_type": "GTT",
+                    "segment": "CASH",
+                    "trading_symbol": "TCS",
+                    "quantity": 10,
+                    "trigger_price": "3985.00",
+                    "trigger_direction": "DOWN",
+                    "order": {"order_type": "LIMIT", "price": "3990.00", "transaction_type": "BUY"},
+                    "product_type": "CNC",
+                    "exchange": "NSE",
+                    "duration": "DAY"
+                });
+                assert_eq!(body, expected);
             }
             other => panic!("expected DryRun, got {other:?}"),
         }
@@ -2595,7 +2968,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_modify_dry_run_endpoint_and_body() {
+    async fn test_modify_smart_order_dry_run_endpoint_and_body() {
         let client = unroutable_client(write_enabled_settings());
         let req = SmartOrderModifyRequest {
             smart_order_type: SMART_ORDER_TYPE_OCO,
@@ -2638,7 +3011,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_cancel_dry_run_bodyless() {
+    async fn test_cancel_smart_order_dry_run_bodyless() {
         let client = unroutable_client(write_enabled_settings());
         let outcome = client
             .cancel_smart_order("FNO", "OCO", "oco_a12bc3")
@@ -2664,7 +3037,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_get_and_list_gate_on_read_enabled() {
+    async fn test_get_smart_order_and_list_smart_orders_gate_on_read_enabled() {
         // read_enabled = false → DisabledByConfig, nothing sent.
         let dark = unroutable_client(GrowwSmartOrderSettings::default());
         assert_eq!(
@@ -2696,6 +3069,87 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, SmartOrderError::Transport(_)));
+    }
+
+    // -- Retry-policy split (H-HIGH, 2026-07-15): behavioral, counted ---------
+
+    /// A mock server that COUNTS every accepted connection and immediately
+    /// drops it (a transport-class failure for the client). The count is
+    /// the ground truth of how many attempts the client actually made.
+    async fn spawn_counting_conn_dropper() -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let count = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&count);
+        tokio::spawn(async move {
+            loop {
+                if let Ok((sock, _)) = listener.accept().await {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    drop(sock); // RST — the client sees a transport error
+                }
+            }
+        });
+        (format!("http://{addr}"), count)
+    }
+
+    #[tokio::test]
+    async fn test_write_path_never_retries_transport_error() {
+        use std::sync::atomic::Ordering;
+        let (base, count) = spawn_counting_conn_dropper().await;
+        let client = GrowwSmartOrderClient::new(
+            reqwest::Client::new(),
+            Some(base),
+            Arc::new(|| Some("test-token-never-logged".to_owned())),
+            GrowwSmartOrderSettings::default(),
+        );
+        // Drive the WRITE dispatcher directly (the public write methods
+        // stop at the dry-run gate, by design): RetryPolicy::Never must
+        // produce EXACTLY ONE attempt — a lost create response is never
+        // blind-resent (probe P10: the GA007 dedup window is unverified).
+        let err = client
+            .send_request(
+                HttpMethod::Post,
+                &format!("{}{}", client.base_url, SMART_ORDER_CREATE_PATH),
+                &[],
+                Some("{}"),
+                RetryPolicy::Never,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SmartOrderError::Transport(_)));
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            1,
+            "write path made more than ONE attempt — double-send risk (P10)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_read_path_retries_transport_error_once() {
+        use std::sync::atomic::Ordering;
+        let (base, count) = spawn_counting_conn_dropper().await;
+        let client = GrowwSmartOrderClient::new(
+            reqwest::Client::new(),
+            Some(base),
+            Arc::new(|| Some("test-token-never-logged".to_owned())),
+            GrowwSmartOrderSettings {
+                read_enabled: true,
+                ..GrowwSmartOrderSettings::default()
+            },
+        );
+        // The read path (idempotent GET) keeps the single bounded retry:
+        // exactly TWO attempts, never more.
+        let err = client
+            .get_smart_order("FNO", "OCO", "oco_a12bc3")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SmartOrderError::Transport(_)));
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            2,
+            "read path must attempt exactly twice (one bounded retry)"
+        );
     }
 
     #[tokio::test]
