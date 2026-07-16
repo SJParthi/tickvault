@@ -291,3 +291,88 @@ fn test_composition_contract_guard_needles_are_non_vacuous() {
         "TRH-R3-1 self-test: the arm-scoped scan must FAIL a gutted guard arm"
     );
 }
+
+// ---------------------------------------------------------------------------
+// RS10 consistency pin (verifier round 5, 2026-07-16): the LOCKED executor
+// seam's DOC region drifted stale twice across the post-close reshape (the
+// pre-reshape "never blind-retried" contract line, the shared-limiter
+// QueueDelay definition, the rev-8 per-spot slot order) — this pin breaks
+// the recurring doc-drift class by requiring the §0b supersession reference
+// IN executor.rs and banning the known-stale phrases from it. NOTE:
+// executor.rs carries NO explicitly-marked history block today; if one is
+// ever added, this scan must learn to excise it first (until then,
+// whole-file absence IS the contract).
+// ---------------------------------------------------------------------------
+
+/// The executor seam source, pinned at compile time.
+const EXECUTOR_RS: &str = include_str!("../src/cadence/executor.rs");
+
+/// Phrases that teach SUPERSEDED behavior as current (rule file §0b names
+/// them) — must never reappear in the executor seam outside a marked
+/// history block (of which there are none today).
+const EXECUTOR_STALE_NEEDLES: [&str; 4] = [
+    // Operator Correction 2 (2026-07-16): a RateLimited leg KEEPS one
+    // bounded runner-owned in-cycle retry — the exact inverse.
+    "never blind-retried",
+    // Coordinator ruling A (2026-07-16): cadence fires BYPASS the shared
+    // limiter — there is no shared-limiter queue on the cadence lane.
+    "The SHARED `dhan_data_api_limiter` queued the request",
+    // The retired rev-8 per-spot slot schedule (:03.0/:03.4/:03.8/:04.2).
+    ":03.0",
+    ":03.4",
+];
+
+#[test]
+fn test_executor_seam_docs_carry_the_0b_supersession() {
+    // Fresh needles: the executor doc region must cite the §0b reshape by
+    // date and name the burst/all-7 primary (the current schedule truth).
+    assert!(
+        EXECUTOR_RS.contains("§0b"),
+        "RS10 pin: executor.rs lost its `cadence-error-codes.md` §0b \
+         supersession reference — the seam docs have drifted off the \
+         2026-07-16 post-close reshape again"
+    );
+    assert!(
+        EXECUTOR_RS.contains("2026-07-16"),
+        "RS10 pin: executor.rs lost the dated 2026-07-16 supersession \
+         marker in its doc region"
+    );
+    assert!(
+        EXECUTOR_RS.contains("all-7") || EXECUTOR_RS.contains("burst"),
+        "RS10 pin: executor.rs no longer names the all-7 burst primary — \
+         the seam docs must teach the CURRENT schedule shape"
+    );
+    // Stale needles: the superseded phrases must be gone whole-file.
+    for needle in EXECUTOR_STALE_NEEDLES {
+        assert!(
+            !EXECUTOR_RS.contains(needle),
+            "RS10 pin: superseded phrase '{needle}' reappeared in \
+             executor.rs — it teaches pre-§0b behavior as current \
+             (rule file §0b, operator corrections 2026-07-16)"
+        );
+    }
+}
+
+#[test]
+fn test_executor_supersession_needles_are_non_vacuous() {
+    // Self-test (house convention): the fresh needles discriminate — a
+    // gutted haystack no longer matches...
+    for needle in ["§0b", "2026-07-16"] {
+        let hollowed = EXECUTOR_RS.replace(needle, "DOC-GUTTED");
+        assert!(
+            !hollowed.contains(needle),
+            "self-test: gutting '{needle}' must flip the fresh-needle check"
+        );
+    }
+    let hollowed_shape = EXECUTOR_RS.replace("all-7", "X").replace("burst", "Y");
+    assert!(!hollowed_shape.contains("all-7") && !hollowed_shape.contains("burst"));
+    // ...and the stale needles WOULD catch a reintroduction (each is a
+    // real phrase, not an accidentally-unmatchable literal).
+    for needle in EXECUTOR_STALE_NEEDLES {
+        let regressed = format!("{EXECUTOR_RS}\n// {needle}");
+        assert!(
+            regressed.contains(needle),
+            "self-test: stale needle '{needle}' must match a reintroduction"
+        );
+    }
+}
