@@ -163,15 +163,33 @@ if [ "$QUALITY_FRESH" = "false" ]; then
       echo "  PASS: cargo test" >&2
     fi
 
-    # 4d: Banned pattern scan (full workspace)
+    # 4d: Banned pattern scan (branch-scoped)
+    # 2026-07-16 gate-integrity fix (operator-approved): the scanner takes a
+    # NEWLINE-separated file list ($2) — the old `tr '\n' ' '` form made it
+    # scan ZERO files. Branch-scoped here; full tree runs in ci.yml Repo Guards.
     echo "  [4d/4e] Banned pattern scan..." >&2
-    ALL_RS=$(find crates -name '*.rs' -not -path '*/target/*' 2>/dev/null | tr '\n' ' ')
-    if [ -n "$ALL_RS" ] && [ -x "$HOOKS_DIR/banned-pattern-scanner.sh" ]; then
-      if ! timeout 60 "$HOOKS_DIR/banned-pattern-scanner.sh" "$CWD" "$ALL_RS" > /dev/null 2>&1; then
-        echo "  FAIL: Banned patterns found in workspace." >&2
+    PR_BASE=$(git merge-base origin/main HEAD 2>/dev/null || true)
+    if [ -n "$PR_BASE" ]; then
+      CHANGED_RS=$(git diff --name-only "$PR_BASE"..HEAD 2>/dev/null | grep -E '^crates/.*\.rs$' || true)
+    else
+      CHANGED_RS=$(find crates -name '*.rs' -not -path '*/target/*' 2>/dev/null | sort)
+    fi
+    RS_COUNT=$(printf '%s\n' "$CHANGED_RS" | sed '/^$/d' | wc -l | tr -d ' ')
+    if [ "$RS_COUNT" -eq 0 ]; then
+      echo "  PASS: Banned pattern scan (no .rs changes on branch; full tree scanned in CI)" >&2
+    elif [ -x "$HOOKS_DIR/banned-pattern-scanner.sh" ]; then
+      BANNED_TIMEOUT=$(( 60 + RS_COUNT / 2 ))
+      BANNED_OUT=$(timeout "$BANNED_TIMEOUT" "$HOOKS_DIR/banned-pattern-scanner.sh" "$CWD" "$CHANGED_RS" 2>&1)
+      BANNED_EXIT=$?
+      if [ "$BANNED_EXIT" -eq 124 ]; then
+        echo "  FAIL: Banned pattern scan timed out (${BANNED_TIMEOUT}s) — blocking" >&2
+        FAILED=1
+      elif [ "$BANNED_EXIT" -ne 0 ]; then
+        echo "$BANNED_OUT" | tail -20 >&2
+        echo "  FAIL: Banned patterns found in branch changes ($RS_COUNT .rs file(s) scanned)." >&2
         FAILED=1
       else
-        echo "  PASS: Banned pattern scan" >&2
+        echo "  PASS: Banned pattern scan ($RS_COUNT .rs file(s) on branch)" >&2
       fi
     else
       echo "  SKIP: Banned pattern scanner not available" >&2
