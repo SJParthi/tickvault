@@ -2826,6 +2826,16 @@ async fn build_shared_infra(
                  off persist-confirmed 1m bars; boot catch-up re-folds the stored \
                  month into all 21 timeframes (candles_1m..candles_1d populate again)"
             );
+        } else {
+            // LOW: first-wins refusal — a duplicate install means a second
+            // spawn attempt in one process (defensive; loud, never silent).
+            error!(
+                code = tickvault_common::error_code::ErrorCode::RestCandleFold01Degraded.code_str(),
+                stage = "sender_install",
+                "rest_candle_fold: global fold-bar sender was ALREADY installed — \
+                 duplicate fold spawn REFUSED (the first installation's task keeps \
+                 running; this receiver is dropped unused)"
+            );
         }
     } else {
         info!(

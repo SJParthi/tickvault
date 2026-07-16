@@ -73,9 +73,11 @@ O/H/L/C/ΣV given 1m bars):
    that day's `spot_1m_rest` rows and folds them through a FRESH throwaway engine,
    re-emitting completed buckets (DEDUP UPSERTs in place — the spec's "simplest honest
    choice"); when the dirty day is TODAY, the fresh engine REPLACES the live engine state
-   for that key, so open partial buckets heal too. Honest residual: an ILP-flushed row may
-   lag `/exec` visibility (QuestDB WAL apply) — a refold that misses it is repaired by a
-   later refold or the next boot catch-up; never silent loss (counters + coded logs).
+   for that key, so open partial buckets heal too. WAL-apply visibility is GATED (M2):
+   the dirty mark carries the triggering repair minute, and a refold whose `/exec` read
+   lacks that minute is NOT emitted (would regress correct candles) — it re-queues with
+   backoff (bounded 5 attempts), then degrades loudly (`refold_stale_read`); the next
+   boot's catch-up re-derives (never silent loss; counters + coded logs).
 5. **Config:** `[rest_candle_fold]` → `RestCandleFoldConfig { enabled (serde default
    FALSE — fail-safe), catchup_days (default 35, validated 1..=370 — headroom so a future retention widening never needs a validation-bound edit) }`; `config/base.toml`
    opts in with `enabled = true`, `catchup_days = 35`.
@@ -89,11 +91,18 @@ O/H/L/C/ΣV given 1m bars):
    at 90d.
 7. **Observability:** ErrorCode `FOLD-01` (`RestCandleFold01Degraded`, High,
    auto-triage-safe, log-sink-only — no `error_code_alerts` entry) with stage taxonomy
-   `client_build` / `catchup_query` / `catchup_parse` / `catchup_truncated` /
-   `refold_query` / `task_respawn`; counters `tv_rest_candle_fold_seals_total{feed}`,
+   `catchup_query` (incl. HTTP-client build failure) / `catchup_parse` /
+   `discovery_truncated` / `refold_stale_read` / `seal_send` / `volume_saturated` /
+   `receiver_lost` / `sender_install` / `task_respawn`; counters
+   `tv_rest_candle_fold_seals_total{feed}`,
    `tv_rest_candle_fold_catchup_rows_total{feed}`, `tv_rest_candle_fold_errors_total{stage}`,
-   `tv_rest_candle_fold_dropped_total{reason}`, `tv_rest_candle_fold_task_respawn_total{reason}`
-   (static bounded labels only — never per-TF); supervised task (house respawn pattern);
+   `tv_rest_candle_fold_dropped_total{reason}`, `tv_rest_candle_fold_paced_waits_total`,
+   `tv_rest_candle_fold_volume_saturated_total`, `tv_rest_candle_fold_refold_queued_total`,
+   `tv_rest_candle_fold_heartbeat_total` (the dense per-interval liveness signal — the
+   HIGH-3 positive progress series), `tv_rest_candle_fold_task_respawn_total{reason}`
+   (static bounded labels only — never per-TF); supervised task (house respawn pattern)
+   with an RAII receiver re-park guard (HIGH-2 — a respawn RESUMES bar consumption; a
+   lost receiver is a LOUD `receiver_lost` error, never a silent clean_exit);
    new rule file `.claude/rules/project/rest-candle-fold-error-codes.md` + triage rule.
 
 ## Edge Cases
@@ -115,15 +124,17 @@ O/H/L/C/ΣV given 1m bars):
   PAST days at the end of the pass.
 - **Duplicate delivery of the same minute:** minute ≤ last-folded → dirty-day refold
   (idempotent DEDUP re-emit) — never a double-count in RAM.
-- **Negative / overflowing volume:** clamped to 0 at intake (counted); Σ uses
-  saturating i64 (index spot volume is legitimately 0 anyway).
+- **Negative / overflowing volume:** clamped to 0 at intake (counted); Σ SATURATES at
+  `i64::MAX` in place (M3 — the fold stays atomic, never a torn bucket; counted +
+  one coalesced warn per (feed, sid, day); index spot volume is legitimately 0 anyway).
 - **Groww i64 ids:** `spot_1m_rest.security_id` is i64; negative values cannot map to
   `BufferedSeal.security_id: u64` → skipped + counted (defensive; today's ids are the
   4 IDX_I SIDs / stable Groww index ids, all positive).
 - **Segment strings from discovery:** re-validated against the exact
   `segment_str_to_code` allowlist before any follow-up query interpolation (the
   tf_consistency L8 second-order-injection defense).
-- **catchup_days = 0 / >120:** rejected at boot by `validate()`.
+- **catchup_days = 0 / >370:** rejected at boot by `validate()` (1..=370 — headroom
+  so a retention widening never needs a validation-bound edit).
 - **Fold disabled:** no sender installed; both legs' handoff is a no-op; behaviour
   byte-identical to today (candles stay producer-dead — the rollback state).
 
@@ -134,22 +145,37 @@ O/H/L/C/ΣV given 1m bars):
   (bars arrive over the mpsc); the next boot repairs via DEDUP-idempotent catch-up.
 - **HTTP client build fails:** FOLD-01 `stage="client_build"` (HTTP-CLIENT-01 class);
   catch-up + refold legs degrade, live folding continues.
-- **/exec query fails / malformed body / oversize:** that (feed, sid) is skipped with
-  FOLD-01 `stage="catchup_query"`/`"catchup_parse"` — never a partial silent fold.
-- **Query hits its LIMIT:** FOLD-01 `stage="catchup_truncated"` — the truncated slice
-  IS still folded (DEDUP makes later repair safe) but the truncation is loud.
-- **Seal channel full (seal writer behind):** `tv_rest_candle_fold_dropped_total{reason=
-  "seal_channel_full"}` counter (the route_seal DroppedFull precedent — the downstream
-  ring→spill→DLQ chain is the durable absorber; a dropped seal re-emerges at the next
-  refold/boot catch-up).
+- **/exec query fails / malformed body / oversize (streamed cap):** that (feed, sid)
+  is skipped with FOLD-01 `stage="catchup_query"`/`"catchup_parse"` — never a partial
+  silent fold. The 8 MiB response cap is enforced chunk-by-chunk during the streamed
+  read (M1 — a chunked-transfer body without Content-Length can never buffer
+  unbounded).
+- **Per-SID day query hits its LIMIT:** FOLD-01 `stage="catchup_parse"` — the WHOLE
+  (feed, sid, day) fold is SKIPPED loudly (a truncated day is never partially folded
+  — the tf_consistency tripwire discipline).
+- **Discovery hits its LIMIT:** FOLD-01 `stage="discovery_truncated"` — the whole
+  (feed, day) pass is skipped loudly (M4 — a partial instrument set is never trusted).
+- **Seal channel full (seal writer behind):** the BOOT catch-up path PACES — newest
+  days first, sleep-and-retry the SAME seal (100ms steps) up to a bounded per-day
+  budget (60s) before counting a drop (`tv_rest_candle_fold_paced_waits_total`;
+  HIGH-1). A drop past the budget is counted
+  (`tv_rest_candle_fold_dropped_total{reason="seal_channel_full"}`) + logged honestly
+  as underived until a later refold or the NEXT boot's catch-up (never a same-session
+  "re-derives them" claim). The LIVE path stays non-blocking try_send.
 - **Fold-bar mpsc full (fold task wedged):** legs drop the handoff with
-  `tv_rest_candle_fold_dropped_total{reason="bar_channel_full"}` — the spot legs are
-  NEVER blocked (their persist path is untouched); the boot catch-up repairs.
+  `tv_rest_candle_fold_dropped_total{reason="channel_full"}` (`channel_closed` when
+  the task is gone) — the spot legs are NEVER blocked (their persist path is
+  untouched); the boot catch-up repairs.
+- **Refold reads a stale /exec view (WAL apply lag):** the refold verifies the
+  triggering repair minute is present BEFORE emitting (M2); a stale read re-queues
+  the dirty mark (bounded 5 attempts) and exhaustion degrades loudly
+  (`stage="refold_stale_read"`); the next boot's catch-up re-derives.
 - **Fold task dies (unwind builds):** supervised respawn (5s backoff) + FOLD-01
   `stage="task_respawn"` + counter; release panics abort the process (panic="abort" —
   the TICK-FLUSH-01 honesty note); recovery = restart + boot catch-up.
-- **Refold read lags ILP visibility:** documented residual — repaired by later
-  refold/boot; DEDUP-idempotent.
+- **Refold read lags ILP visibility:** gated (M2) — the refold never emits without
+  the triggering minute visible; bounded re-queue, then loud degrade; the next boot's
+  catch-up repairs (DEDUP-idempotent).
 - **Retention edit risk:** raising market_data_hot_days 14→35 only SLOWS drops
   (fail-safe direction); moving the chain tables to 35d TIGHTENS their window — the
   archive→verify→drop leg is fail-closed (no verified S3 copy ⇒ no drop), and the
@@ -171,7 +197,7 @@ O/H/L/C/ΣV given 1m bars):
 - **Idempotency:** folding the same input twice through fresh engines yields identical
   seal sets (`test_fold_refold_same_input_identical_seals`).
 - **Config:** serde default OFF; empty-TOML deserialize disabled; base.toml sets
-  enabled=true + catchup_days=35; validate rejects 0 / 121
+  enabled=true + catchup_days=35; validate rejects 0 / 371
   (`test_rest_candle_fold_config_*`).
 - **Catch-up SQL/parse:** query shapes (micros window, LIMIT, feed/segment scoping),
   dataset parse skip-malformed + truncation flag.
@@ -206,9 +232,13 @@ O/H/L/C/ΣV given 1m bars):
 
 - **Counters:** `tv_rest_candle_fold_seals_total{feed}` (one per emitted BufferedSeal),
   `tv_rest_candle_fold_catchup_rows_total{feed}` (bars folded by the boot catch-up),
-  `tv_rest_candle_fold_errors_total{stage}` (client_build / catchup_query /
-  catchup_parse / catchup_truncated / refold_query), `tv_rest_candle_fold_dropped_total
-  {reason}` (bar_channel_full / seal_channel_full / bad_identity / out_of_session),
+  `tv_rest_candle_fold_errors_total{stage}` (catchup_query / catchup_parse /
+  discovery_truncated / refold_stale_read / seal_send / volume_saturated /
+  receiver_lost / sender_install / task_respawn), `tv_rest_candle_fold_dropped_total
+  {reason}` (channel_full / channel_closed / seal_channel_full / no_seal_sender /
+  bad_identity / out_of_session), `tv_rest_candle_fold_paced_waits_total`,
+  `tv_rest_candle_fold_volume_saturated_total`, `tv_rest_candle_fold_refold_queued_total`,
+  `tv_rest_candle_fold_heartbeat_total` (dense per-interval liveness),
   `tv_rest_candle_fold_task_respawn_total{reason}` — all static bounded labels.
 - **Coded logs:** every degrade is `error!(code = ErrorCode::RestCandleFold01Degraded
   .code_str(), stage = ...)` (tag-guard compliant); one coalesced boot-catch-up summary
@@ -252,6 +282,13 @@ O/H/L/C/ΣV given 1m bars):
 - [x] Item 8 — Wiring ratchet test
   - Files: crates/app/tests/rest_candle_fold_wiring_guard.rs
   - Tests: the guard itself (4+ pins)
+- [x] Item 9 — Hostile-review round-1 fixes (HIGH-1 paced newest-first catch-up,
+  HIGH-2 RAII receiver re-park guard, HIGH-3 dead-fold Blind classification +
+  heartbeat, M1 streamed body cap, M2 stale-read refold gate, M3 saturating volume,
+  M4 discovery truncation tripwire, M5 call-site guard anchor, M7 real golden
+  cross-implementation test)
+  - Files: crates/app/src/rest_candle_fold.rs, crates/app/src/tf_consistency_boot.rs, crates/app/src/main.rs, crates/app/tests/rest_candle_fold_wiring_guard.rs, .claude/rules/project/rest-candle-fold-error-codes.md, .claude/rules/project/tf-consistency-error-codes.md
+  - Tests: test_catchup_pace_action_budget_boundaries, test_catchup_day_offsets_newest_first, test_receiver_guard_take_reparks_on_panic_and_respawn_resumes, test_empty_candles_with_spot_rows_is_blind_vs_nodata, test_select_spot_1m_count_sql_and_parse_count_dataset, test_accumulate_capped_streamed_body_cap, test_should_requeue_refold_bounds, test_rows_contain_minute_stale_read_gate, test_volume_saturates_never_tears_the_fold, test_parse_spot_discovery_segment_allowlist_and_truncation, test_golden_fold_agrees_with_tf_consistency_recompute
 
 ## Scenarios
 

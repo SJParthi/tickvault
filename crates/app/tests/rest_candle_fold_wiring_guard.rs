@@ -53,9 +53,44 @@ fn count_occurrences(haystack: &str, needle: &str) -> usize {
 fn main_rs_spawns_fold_gated_after_seal_writer_install() {
     let main_rs = read_source("crates/app/src/main.rs");
 
-    let seal_writer_idx = main_rs
-        .find("spawn_seal_writer_loop(")
-        .expect("main.rs must install the global seal sender (spawn_seal_writer_loop)");
+    // M5 (hostile review 2026-07-16): anchor the ordering assertion on the
+    // CALL SITE, not the `fn spawn_seal_writer_loop(` DEFINITION — the
+    // definition sits above the boot spine, so matching it made the
+    // ordering check vacuous (deleting the call still passed). Collect
+    // every occurrence, drop the ones preceded by `fn ` (definitions),
+    // and require at least one real call whose LAST occurrence precedes
+    // the fold spawn.
+    //
+    // LOW-3 accepted residual (documented, not fixed): this is a textual
+    // source scan — a refactor that moves the seal-writer call (or the
+    // fold spawn) into a helper fn defined elsewhere in main.rs keeps the
+    // needle text present but the source-order comparison then tracks the
+    // helper's DEFINITION position, not its runtime call order. The house
+    // source-scan convention accepts this class (same as every sibling
+    // wiring guard); a call-graph-accurate check would need rustc.
+    let needle = "spawn_seal_writer_loop(";
+    let occurrences: Vec<usize> = main_rs.match_indices(needle).map(|(i, _)| i).collect();
+    assert!(
+        occurrences.len() >= 2,
+        "main.rs must carry BOTH the spawn_seal_writer_loop definition and \
+         at least one call site (found {})",
+        occurrences.len()
+    );
+    let call_sites: Vec<usize> = occurrences
+        .iter()
+        .copied()
+        .filter(|&idx| !main_rs[..idx].ends_with("fn "))
+        .collect();
+    assert!(
+        !call_sites.is_empty(),
+        "main.rs must CALL spawn_seal_writer_loop — the definition alone \
+         installs no global seal sender"
+    );
+    let seal_writer_call_idx = *call_sites
+        .iter()
+        .max()
+        .expect("non-empty call_sites has a max");
+
     let gate_idx = main_rs
         .find("config.rest_candle_fold.enabled")
         .expect("main.rs must gate the fold spawn on [rest_candle_fold] enabled");
@@ -67,10 +102,11 @@ fn main_rs_spawns_fold_gated_after_seal_writer_install() {
         .expect("main.rs must spawn the supervised fold task");
 
     assert!(
-        seal_writer_idx < spawn_idx,
-        "the seal-writer MUST be installed before the fold task spawns — \
-         otherwise the first fold emission hits the no_seal_sender drop arm \
-         (FOLD-01 stage=seal_send) on every boot"
+        seal_writer_call_idx < spawn_idx,
+        "the seal-writer CALL must precede the fold task spawn — otherwise \
+         the first fold emission hits the no_seal_sender drop arm \
+         (FOLD-01 stage=seal_send) on every boot (call at \
+         {seal_writer_call_idx}, spawn at {spawn_idx})"
     );
     assert!(
         gate_idx < sender_install_idx && sender_install_idx < spawn_idx,

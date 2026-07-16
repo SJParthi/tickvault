@@ -76,10 +76,15 @@ field):
 
 | stage | Meaning |
 |---|---|
-| `catchup_query` | a boot catch-up / dirty-day refold `/exec` read failed — HTTP client build failure, transport error, non-2xx, or the 8 MiB response cap refused the body. That day/feed is skipped (counted); the next dirty mark or the next boot retries. |
-| `catchup_parse` | the `/exec` body was unparsable, the explicit row LIMIT was hit (a truncated day is NEVER partially folded — the tf_consistency tripwire discipline), a poisoned segment value failed the allowlist (skipped, never re-queried), or a volume checked-add overflowed during a refold. |
-| `seal_send` | a sealed bucket could not be handed to the seal-writer channel (channel full / global sender missing), a confirmed-bar handoff was dropped (fold channel full/closed), or a LIVE volume checked-add overflowed (bucket dropped — the refold re-derives it). |
-| `task_respawn` | the supervised fold task died and was respawned (house pattern; `tv_rest_candle_fold_task_respawn_total{reason}`). |
+| `catchup_query` | a boot catch-up / dirty-day refold `/exec` read failed — HTTP client build failure, transport error, non-2xx, or the STREAMED 8 MiB response cap refused the body (the cap is enforced chunk-by-chunk during the read — a chunked-transfer response without Content-Length can never buffer unbounded). That day/feed is skipped (counted); the next dirty mark or the next boot retries. |
+| `catchup_parse` | the `/exec` body was unparsable, the explicit row LIMIT was hit (a truncated day is NEVER partially folded — the tf_consistency tripwire discipline), or a poisoned segment value failed the allowlist (skipped, never re-queried). |
+| `discovery_truncated` | the boot catch-up's per-feed instrument discovery hit ITS row LIMIT — a partial instrument set is never trusted; the whole (feed, day) fold pass is skipped LOUDLY (2026-07-16 hostile-review M4). |
+| `refold_stale_read` | a dirty-day refold's `/exec` read did NOT yet contain the triggering repair minute (ILP-flush-ACK → WAL-apply visibility lag) — the refold is NOT emitted (would regress correct candles) and the mark is re-queued, bounded at 5 attempts; this stage fires on the EXHAUSTED arm (2026-07-16 hostile-review M2). |
+| `seal_send` | a sealed bucket could not be handed to the seal-writer channel (channel full past the boot-path pacing budget / global sender missing), or a confirmed-bar handoff was dropped (fold channel full/closed). |
+| `volume_saturated` | a TF bucket's volume i64 add saturated at `i64::MAX` — the fold stays ATOMIC (never a torn bucket), the saturated value is emitted honestly, one coalesced warn per (feed, SID, day) (2026-07-16 hostile-review M3). |
+| `receiver_lost` | the fold task started but the shared receiver slot was EMPTY — a previous incarnation failed to re-park it (the RAII guard makes this near-unreachable); the task exits LOUDLY, never a silent clean_exit (2026-07-16 hostile-review HIGH-2). |
+| `sender_install` | main.rs could not install the global fold-bar sender (already installed — a double-spawn class bug); the hook sites would feed a stale channel (LOW, 2026-07-16). |
+| `task_respawn` | the supervised fold task died and was respawned (house pattern; `tv_rest_candle_fold_task_respawn_total{reason}`). Unwind builds only — release panics abort the process. |
 
 **Triage:**
 1. `mcp__tickvault-logs__tail_errors` — find `FOLD-01`; the payload names
@@ -112,9 +117,24 @@ field):
 - `tv_rest_candle_fold_dropped_total{reason}` —
   `channel_full` / `channel_closed` (confirmed-bar handoff),
   `seal_channel_full` / `no_seal_sender` (seal emission),
-  `out_of_session` (bars outside [09:15, 15:30) IST — skipped honestly).
+  `out_of_session` (bars outside [09:15, 15:30) IST — skipped honestly),
+  `bad_identity` (catch-up discovery rows whose SID does not fit the
+  seal-writer's id space — counted + coalesced warn, never silent).
 - `tv_rest_candle_fold_refold_queued_total` — dirty-day marks queued for
   the debounced refold.
+- `tv_rest_candle_fold_paced_waits_total` — boot-path seal emissions that
+  slept on a full seal channel (the 2026-07-16 HIGH-1 pacing: newest days
+  first, sleep-and-retry the SAME seal up to a bounded per-day budget
+  BEFORE counting any drop — a drop is real backpressure exhaustion, not
+  a burst artifact).
+- `tv_rest_candle_fold_volume_saturated_total` — saturating volume adds
+  (M3 — the fold never tears).
+- `tv_rest_candle_fold_heartbeat_total` — the DENSE positive progress
+  signal (HIGH-3): incremented every heartbeat interval by the live fold
+  loop REGARDLESS of bar traffic, so "the fold task is alive" is a
+  monotonically-advancing series alarm-ready for a future CloudWatch
+  floor (delivery today: metrics-local, no alarm — see the boundary
+  below).
 - `tv_rest_candle_fold_task_respawn_total{reason}` — supervisor respawns.
 
 **Honest envelope:** every degrade is RE-DERIVABLE — the `spot_1m_rest`
@@ -126,11 +146,21 @@ buckets folding over the bars that DO exist — same-shape-as-source, never
 fabricated. `tick_count`/`oi`/pct columns are honest zeros (documented in
 §0); consumers comparing REST-era vs live-era candles must expect that
 split. The dirty-day refold reads QuestDB, so the ILP-flush-ACK →
-`/exec`-visibility lag (WAL apply) can make an IMMEDIATE refold miss the
-newest row — the next dirty mark or the boot catch-up covers it (a
-documented residual, not silent loss). The boot catch-up is flagged
-O(days × SIDs × rows) COLD work (~35 days × 4 SIDs × ≤375 rows per feed —
-bounded, one-shot at boot); the per-bar live fold is O(21) constant work
+`/exec`-visibility lag (WAL apply) is gated (M2, 2026-07-16): the refold
+verifies the TRIGGERING repair minute is present in the read before
+emitting — a stale read is NEVER emitted (would regress correct candles);
+the mark re-queues with backoff, bounded at 5 attempts, then degrades
+loudly (`refold_stale_read`) and the next boot's catch-up re-derives the
+day. The boot catch-up is flagged O(days × SIDs × rows) COLD work
+(~35 days × 4 SIDs × ≤375 rows per feed — bounded, one-shot at boot),
+iterated NEWEST day first (HIGH-1 — under seal-channel backpressure the
+most recent, decision-relevant days are derived first) with paced
+emission (sleep-and-retry the SAME seal on a full channel, bounded per-day
+budget) so a catch-up burst larger than the seal channel never silently
+drops the tail; a drop past the budget is counted + logged honestly as
+LOST FOR THIS SESSION (re-derived only by the NEXT boot's catch-up — the
+old log's "boot catch-up re-derives them" same-session claim was
+circular and is retired). The per-bar live fold is O(21) constant work
 per minute. Release-build panics abort the process (`panic = "abort"`) —
 the respawn arms self-heal in unwind (dev/test) builds only (the
 TICK-FLUSH-01 precedent).
@@ -140,11 +170,15 @@ TICK-FLUSH-01 precedent).
 `deploy/aws/terraform/error-code-alarms.tf` and NO mention in
 `observability-architecture.md`'s paging list (the paging drift guard sees
 no drift). The operator's end-to-end signal for "are the candles there?"
-is the EXISTING 15:40 IST tf-consistency verifier (TF-VERIFY-01/02 — the
-recompute-vs-stored comparison covers fold output exactly like live
-output) plus the counters above. Adding a CloudWatch log-filter alarm is a
-flagged follow-up (one map entry + doc paragraph + cost note — the
-SCOREBOARD-01 / FEED-REJECT-01 precedent).
+is the EXISTING 15:40 IST tf-consistency verifier — which since 2026-07-16
+(HIGH-3) classifies a zero-candles day **Blind (High Telegram)** whenever
+`spot_1m_rest` carries rows for that (feed, day), so a silently-dead fold
+can never read as an Info NoData day (`tf-consistency-error-codes.md` §2
+dated note) — plus the counters above (the dense
+`tv_rest_candle_fold_heartbeat_total` series is the alarm-ready liveness
+floor for a future CloudWatch filter). Adding a CloudWatch log-filter
+alarm is a flagged follow-up (one map entry + doc paragraph + cost note —
+the SCOREBOARD-01 / FEED-REJECT-01 precedent).
 
 ## §2. What a PR that violates this contract looks like (REJECT)
 
