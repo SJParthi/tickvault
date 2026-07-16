@@ -591,22 +591,43 @@ where
             }
         }
         metrics::gauge!("tv_cadence_dhan_shape_step").set(f64::from(dhan_shape_ladder.step));
-        if dhan_dirty && dhan_at_max_before {
-            if !exhausted_episode {
-                exhausted_episode = true;
-                metrics::counter!("tv_cadence_ladder_exhausted_total").increment(1);
-                error!(
-                    code = ErrorCode::Cadence01LaneDegraded.code_str(),
-                    stage = "ladder_exhausted",
-                    step = dhan_shape_ladder.step,
-                    "CADENCE-01: Dhan shape ladder floor exhausted — \
-                     cross-source steady state until the first clean Dhan \
-                     cycle (edge-latched per episode)"
-                );
-            }
-        } else if !dhan_dirty {
-            exhausted_episode = false;
+        let (fire_exhausted, next_episode) =
+            exhausted_edge_step(exhausted_episode, dhan_dirty, dhan_at_max_before);
+        exhausted_episode = next_episode;
+        if fire_exhausted {
+            metrics::counter!("tv_cadence_ladder_exhausted_total").increment(1);
+            error!(
+                code = ErrorCode::Cadence01LaneDegraded.code_str(),
+                stage = "ladder_exhausted",
+                step = dhan_shape_ladder.step,
+                "CADENCE-01: Dhan shape ladder floor exhausted — \
+                 cross-source steady state until the first clean Dhan \
+                 cycle (edge-latched per episode)"
+            );
         }
+    }
+}
+
+/// The `ladder_exhausted` edge-latch step (rule file §1 `ladder_exhausted`
+/// — DHAN-SHAPE-ONLY by construction; RS12 pure test seam, 2026-07-16).
+///
+/// Inputs: the current episode latch, this cycle's Dhan dirty (rate-
+/// limited) verdict, and whether the shape ladder sat at its MAX rung
+/// BEFORE this cycle's streak advance (checked pre-advance so the shift
+/// cycle itself — the dirty cycle that CAUSES the demotion — never fires
+/// the edge). Returns `(fire, next_episode)`:
+/// - dirty AT max with the latch off ⇒ fire once + latch (rising edge);
+/// - dirty AT max with the latch on ⇒ hold silently (once per episode);
+/// - a CLEAN cycle ⇒ re-arm (the next dirty-at-max is a new episode);
+/// - dirty but NOT at max ⇒ hold the latch unchanged, never fire.
+#[must_use]
+pub fn exhausted_edge_step(episode: bool, dhan_dirty: bool, at_max_before: bool) -> (bool, bool) {
+    if dhan_dirty && at_max_before {
+        (!episode, true)
+    } else if !dhan_dirty {
+        (false, false)
+    } else {
+        (false, episode)
     }
 }
 

@@ -516,7 +516,15 @@ existing floors — never fight them, never bypass them:
    per-underlying 3s chain gate is ALWAYS enforced; when the expiry is known
    the per-(underlying, expiry) stamp is recorded/consulted too — an
    expiry-LESS fire is strictly MORE conservative (subsumption, pinned by
-   `test_cadence_gate_expiryless_fire_subsumes_expiry_stamp`).
+   `test_cadence_gate_expiryless_fire_subsumes_expiry_stamp`). Direction
+   clause (RS11, 2026-07-16): SCHEDULER-DRIVEN fires are ALREADY
+   acquired/recorded by the RUNNER before dispatch — an executor impl must
+   NOT re-acquire or re-record the gates for the same fire (a double
+   record double-consumes the spot + combined rolling-second ring;
+   self-throttling direction only — never a broker violation — but still
+   wrong). The registry-sharing obligation above binds executor-side FAST
+   PATHS and any second scheduler instance issuing fires the runner did
+   not gate.
 3. **Type self-inflicted pacing-queue deadline misses as
    `CadenceFetchError::QueueDelay`** — NEVER `Timeout`.
    A queue delay is SELF-INFLICTED pacing (our own machinery — e.g. a

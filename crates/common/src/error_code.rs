@@ -1133,11 +1133,13 @@ pub enum ErrorCode {
 
     // -----------------------------------------------------------------------
     // Cadence scheduler (operator cadence directive 2026-07-14, judge-locked
-    // design rev-8 — `crates/core/src/cadence/`). Dry-run decision-timing
-    // skeleton: per-minute Dhan (:55 pre-close serialized) + Groww (:00
-    // post-close burst) fetch cadence with structural zero-429 gates,
-    // failure ladder, event-driven per-lane decisions. DEFAULT-OFF.
-    // See cadence-error-codes.md.
+    // design rev-8 — `crates/core/src/cadence/`; reshaped POST-CLOSE by the
+    // 2026-07-16 operator directive, cadence-error-codes.md §0b: the rev-8
+    // ":55 pre-close serialized" Dhan schedule is RETIRED). Dry-run
+    // decision-timing skeleton: per-minute post-close fetch cadence on BOTH
+    // lanes (Dhan all-7 burst primary / split fallback; Groww all-7 at T+0)
+    // with structural zero-429 gates, shape ladder, event-driven per-lane
+    // decisions. DEFAULT-OFF. See cadence-error-codes.md.
     // -----------------------------------------------------------------------
     /// CADENCE-01: a cadence lane DEGRADED this cycle — a non-Empty fetch
     /// failure ended terminal after the retry budget
