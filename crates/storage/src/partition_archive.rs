@@ -13,7 +13,8 @@
 //!
 //! 1. **Eligibility** — partitions strictly older than the table's
 //!    retention-class hot window (market-data: `ticks` + the 21 `candles_*`
-//!    tables → `market_data_hot_days`, default 14; everything else →
+//!    tables → `market_data_hot_days`, default 35 (2026-07-16, was 14) —
+//!    incl. the per-minute chain tables since the same date; everything else →
 //!    `retention_days`, 90), clamped to a hard [`MIN_HOT_DAYS`] = 2 floor so
 //!    today's and yesterday's partitions are untouchable regardless of
 //!    config. Listed via the SAME `table_partitions()` mechanism + active-
@@ -161,20 +162,36 @@ pub const ARCHIVE_FEED_ALL: &str = "all";
 /// Retention class of a swept table.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RetentionClass {
-    /// High-volume market data (`ticks` + the 21 `candles_*` tables) —
-    /// `market_data_hot_days` hot window (default 14).
+    /// High-volume market data (`ticks` + the 21 `candles_*` tables + the
+    /// per-minute chain tables below) — `market_data_hot_days` hot window
+    /// (default 35 since 2026-07-16; was 14).
     MarketData,
     /// Everything else (audit / daily-data tables) — the existing
     /// `retention_days` window (default 90).
     Standard,
 }
 
+/// The two per-minute option-chain capture tables (operator directive
+/// 2026-07-16: *"for only spots we will have minimum one month data …
+/// but option only for the current day"* — the chain tables are the
+/// system's HEAVIEST daily volume (~70 MB/day for `option_chain_1m`), so
+/// they move from the 90-day Standard window into the `market_data_hot_days`
+/// class. 35 days is the smallest clean change (one existing knob covers
+/// ticks + candles + chain); tightening chain further toward current-day is
+/// a follow-up knob if disk pressure demands it.
+const CHAIN_MARKET_DATA_TABLES: [&str; 2] = [
+    crate::option_chain_1m_persistence::OPTION_CHAIN_1M_TABLE,
+    crate::option_contract_1m_rest_persistence::OPTION_CONTRACT_1M_REST_TABLE,
+];
+
 /// Maps a table to its retention class. Market data = the HOUR-partitioned
 /// high-frequency list (`ticks`) + the 21 live candle tables from the single
-/// source of truth (`candle_table_names()`); everything else is Standard.
+/// source of truth (`candle_table_names()`) + the two per-minute chain
+/// tables (2026-07-16); everything else is Standard.
 pub(crate) fn retention_class(table: &str) -> RetentionClass {
     if HOUR_PARTITIONED_TABLES.contains(&table)
         || crate::shadow_persistence::candle_table_names().contains(&table)
+        || CHAIN_MARKET_DATA_TABLES.contains(&table)
     {
         RetentionClass::MarketData
     } else {
@@ -1771,6 +1788,21 @@ mod tests {
     }
 
     #[test]
+    fn test_retention_class_chain_tables_are_market_data() {
+        // 2026-07-16 operator directive: the per-minute chain captures are
+        // the heaviest daily volume — they ride the market-data hot window
+        // (35d) instead of the 90d Standard class.
+        assert_eq!(
+            retention_class("option_chain_1m"),
+            RetentionClass::MarketData
+        );
+        assert_eq!(
+            retention_class("option_contract_1m_rest"),
+            RetentionClass::MarketData
+        );
+    }
+
+    #[test]
     fn test_retention_class_audit_tables_are_standard() {
         for table in [
             "ws_event_audit",
@@ -1778,7 +1810,6 @@ mod tests {
             "prev_day_ohlcv",
             "feed_scoreboard_daily",
             "spot_1m_rest",
-            "option_chain_1m",
             "partition_archive_audit",
         ] {
             assert_eq!(
