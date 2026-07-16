@@ -30,8 +30,8 @@ use tickvault_core::cadence::executor::{
 use tickvault_core::cadence::expiry::DayLockedExpiryStore;
 use tickvault_core::cadence::gate::DhanGates;
 use tickvault_core::cadence::runner::{
-    CadenceClock, CadenceRunnerDeps, LoopExit, emit_expiry_deadline_page, run_cadence_loop,
-    spawn_supervised_cadence_runner,
+    CadenceClock, CadenceRunnerDeps, LoopExit, emit_expiry_deadline_page, exhausted_edge_step,
+    run_cadence_loop, spawn_supervised_cadence_runner,
 };
 use tickvault_core::pipeline::chain_snapshot::ChainUnderlying;
 use tokio::sync::Notify;
@@ -2063,4 +2063,44 @@ async fn test_midcycle_disable_stops_not_yet_dispatched_fires() {
         )),
         "the Groww lane must be unaffected by the Dhan disable"
     );
+}
+
+#[test]
+fn test_exhausted_edge_step_fires_once_per_episode_and_rearms_on_clean() {
+    // RS12 (verifier round 5, 2026-07-16): the CADENCE-01
+    // `ladder_exhausted` edge-latch had zero test coverage. The pure
+    // step (runner.rs `exhausted_edge_step`) is walked through one full
+    // scenario: the SHIFT cycle never fires the edge, the first
+    // dirty-at-max cycle fires exactly once, the latch holds across
+    // sustained dirty cycles, a clean cycle re-arms, and the next
+    // dirty-at-max episode fires again.
+    //
+    // Shift cycle: dirty, but the shape ladder was NOT yet at max BEFORE
+    // this cycle's streak advance (this is the cycle whose dirty verdict
+    // CAUSES the demotion) — no fire, latch stays off (the "no
+    // double-fire across a shift cycle" half of the pin).
+    let (fire, ep) = exhausted_edge_step(false, true, false);
+    assert!(!fire, "the shift cycle itself must never fire the edge");
+    assert!(!ep, "the shift cycle must not latch an episode");
+    // First dirty cycle AT the max rung: the rising edge — fires ONCE.
+    let (fire, ep) = exhausted_edge_step(ep, true, true);
+    assert!(fire, "first dirty-at-max cycle fires the edge");
+    assert!(ep, "the episode latches on the rising edge");
+    // Sustained dirty at max: latched — never a second fire in-episode.
+    let (fire, ep) = exhausted_edge_step(ep, true, true);
+    assert!(!fire, "a latched episode never re-fires on sustained dirty");
+    assert!(ep, "the latch holds while the episode persists");
+    // A CLEAN cycle re-arms, even while the ladder still sits at max.
+    let (fire, ep) = exhausted_edge_step(ep, false, true);
+    assert!(!fire, "a clean cycle fires nothing");
+    assert!(!ep, "a clean cycle re-arms the episode latch");
+    // The next dirty-at-max is a NEW episode: the edge fires again.
+    let (fire, ep) = exhausted_edge_step(ep, true, true);
+    assert!(fire, "a fresh episode fires the edge again");
+    assert!(ep, "the new episode latches");
+    // Totality arm: dirty but NOT at max mid-episode holds the latch
+    // silently (conservative — a fire here would be a phantom edge).
+    let (fire, ep) = exhausted_edge_step(ep, true, false);
+    assert!(!fire, "dirty off-max never fires");
+    assert!(ep, "dirty off-max holds the latch unchanged");
 }
