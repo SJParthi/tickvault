@@ -37,11 +37,18 @@ use std::sync::{Arc, Mutex, PoisonError};
 use secrecy::SecretString;
 use tickvault_common::constants::GROWW_ORDER_LIVE_FIRE;
 
-use super::api_client::{NullTransport, OrderTransport, TransportOutcome};
-use super::intent_ledger::{IntentKind, IntentLedger, IntentPhase, NewIntent};
+use super::api_client::{NullTransport, OrderTransport, SmartOrderTransport, TransportOutcome};
+use super::intent_ledger::{IntentKind, IntentLedger, IntentPhase, NewIntent, SmartIntentContext};
 use super::rate_budget::{GrowwRateBudget, RateFamily};
 use super::reconcile::{EodAction, classify_eod_action};
 use super::reference_id::{IstDate, generate_reference_id};
+use super::smart_orders::{
+    SmartModifyFields, SmartOrderBook, SmartOrderCreate, SmartOrderError, SmartOrderGates,
+    SmartOrderStatus, SmartReconcileReport, SmartTransitionOutcome, TrackedSmartOrder,
+    ambiguity_stage, build_modify_body, count_mutation, emit_oco01, emit_oco04, emit_oco05,
+    evaluate_smart_transition, is_plausible_smart_order_id, log_safe_id, reconcile_pass,
+    validate_create_smart_order, validate_modify_fields,
+};
 use super::state::{
     ObservationSource, OrderObservation, TrackedOrderState, TransitionOutcome, evaluate_transition,
     is_terminal,
@@ -152,6 +159,9 @@ pub enum ExecError {
     /// A mutation was attempted outside the trading session window.
     #[error("market is closed — mutation refused")]
     MarketClosed,
+    /// A typed Smart-Orders (GTT/OCO) refusal (validation / gate / matrix).
+    #[error(transparent)]
+    Smart(#[from] SmartOrderError),
 }
 
 // ---------------------------------------------------------------------------
@@ -260,6 +270,13 @@ pub struct GrowwOrderExecutor<T: OrderTransport> {
     blocked: HashSet<String>,
     /// Monotone local counter over the ledger's replayed max sequence.
     next_seq: u32,
+    /// The Smart-Orders (GTT/OCO) area gates — fail-closed [`SmartOrderGates::disabled`]
+    /// until the boot layer injects the config slice via
+    /// [`GrowwOrderExecutor::set_smart_gates`].
+    smart_gates: SmartOrderGates,
+    /// The tracked smart-order book, shared with the reconcile loop
+    /// (`Arc<tokio::sync::Mutex<…>>` — cold path, never per-tick).
+    smart_book: Arc<tokio::sync::Mutex<SmartOrderBook>>,
 }
 
 impl GrowwOrderExecutor<NullTransport> {
@@ -338,7 +355,22 @@ impl<T: OrderTransport> GrowwOrderExecutor<T> {
             provenance: HashMap::new(),
             blocked: HashSet::new(),
             next_seq,
+            smart_gates: SmartOrderGates::disabled(),
+            smart_book: Arc::new(tokio::sync::Mutex::new(SmartOrderBook::default())),
         }
+    }
+
+    /// Inject the Smart-Orders area gates (the `[groww_orders]` slice — the
+    /// boot layer's single injection point). Fail-closed
+    /// [`SmartOrderGates::disabled`] until called.
+    pub fn set_smart_gates(&mut self, gates: SmartOrderGates) {
+        self.smart_gates = gates;
+    }
+
+    /// The shared smart-order book handle (for the standalone reconcile loop).
+    #[must_use]
+    pub fn smart_book(&self) -> Arc<tokio::sync::Mutex<SmartOrderBook>> {
+        Arc::clone(&self.smart_book)
     }
 
     /// The executor's execution mode.
@@ -420,6 +452,7 @@ impl<T: OrderTransport> GrowwOrderExecutor<T> {
             mode,
             ts_ms: now_ms,
             linked_intent_id: None,
+            smart_ctx: None,
         };
         let receipt = self
             .with_ledger(move |l| l.record_intent(new, date))
@@ -892,6 +925,7 @@ impl<T: OrderTransport> GrowwOrderExecutor<T> {
             mode,
             ts_ms: now_ms,
             linked_intent_id: None,
+            smart_ctx: None,
         };
         let receipt = self
             .with_ledger(move |l| l.record_intent(new, date))
@@ -1004,7 +1038,8 @@ impl<T: OrderTransport> GrowwOrderExecutor<T> {
                 .await?;
                 tracing::error!(
                     target: "groww_ord",
-                    order_id = %order_id,
+                    // round-2 finding 3: no lane logs an unvalidated broker id raw.
+                    order_id = %log_safe_id(order_id),
                     "groww order: mutation ambiguity UNRESOLVED — operator action required"
                 );
                 return Ok(MutationResult::Unresolved);
@@ -1037,7 +1072,7 @@ impl<T: OrderTransport> GrowwOrderExecutor<T> {
                     // GROWW-ORD-04-class "position exists" emit lands in ORD-PR-1.
                     tracing::error!(
                         target: "groww_ord",
-                        order_id = %order_id,
+                        order_id = %log_safe_id(order_id),
                         filled,
                         "groww order: cancel lost the race — POSITION EXISTS"
                     );
@@ -1240,6 +1275,708 @@ impl<T: OrderTransport> GrowwOrderExecutor<T> {
         );
         self.provenance
             .insert(provisional_order_id.to_owned(), PlaceProvenance::Unresolved);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Smart Orders (GTT/OCO) — the §39.3 area entry points (2026-07-16 directive)
+// ---------------------------------------------------------------------------
+
+impl<T: OrderTransport + SmartOrderTransport> GrowwOrderExecutor<T> {
+    /// The smart-order WRITE gate: `smart_orders_write` must be on for BOTH
+    /// lanes (the area config is the master switch), and a LIVE lane
+    /// additionally needs the operator's declared `live_fire_requested`
+    /// (Gate 1). Gate 3 (`GROWW_ORDER_LIVE_FIRE`, `false` today) is enforced
+    /// at CONSTRUCTION — `ExecutionMode::Live` is unreachable outside the
+    /// const-gated [`GrowwOrderExecutor::new_live`] (+ the `#[cfg(test)]`
+    /// bypass), and [`smart_live_send_permitted`] is the boot layer's pure
+    /// triple-check before any live spawn.
+    fn smart_write_gate(&self) -> Result<(), ExecError> {
+        if !self.smart_gates.smart_orders_write {
+            return Err(SmartOrderError::WriteGateClosed.into());
+        }
+        if self.mode == ExecutionMode::Live {
+            // Defense-in-depth (adversarial round 1, finding 6): Gate 3 is
+            // re-asserted PER SEND in production builds — a Live executor can
+            // only exist via `new_live` (const-gated at construction), but
+            // the send path refuses independently anyway. `cfg(test)` keeps
+            // the mock-transport live lane exercisable.
+            #[cfg(not(test))]
+            if !tickvault_common::constants::GROWW_ORDER_LIVE_FIRE {
+                return Err(SmartOrderError::WriteGateClosed.into());
+            }
+            if !self.smart_gates.live_fire_requested {
+                return Err(SmartOrderError::WriteGateClosed.into());
+            }
+        }
+        Ok(())
+    }
+
+    /// Place a GTT/OCO smart order. `req.reference_id` is OVERWRITTEN with a
+    /// freshly generated reference id (the executor owns idempotency); the
+    /// write-ahead intent (`smart_place`) is fsynced BEFORE any send.
+    ///
+    /// LIVE-lane honesty: smart-order responses carry NO `reference_id`
+    /// (verified doc absence), so an ambiguous create is UNRESOLVABLE by
+    /// reference — it fail-closes to [`PlaceResult::Unresolved`] (operator
+    /// action; NEVER an auto-replay, the double-send class).
+    ///
+    /// # Errors
+    /// Gate / validation / cap / ledger / budget / market-closed refusals.
+    pub async fn place_smart_order(
+        &mut self,
+        mut req: SmartOrderCreate,
+        date: IstDate,
+        now_ms: i64,
+        session_open: bool,
+    ) -> Result<PlaceResult, ExecError> {
+        if !session_open {
+            return Err(ExecError::MarketClosed);
+        }
+        self.smart_write_gate()?;
+        // Tracked-book cap (fail-closed BEFORE the ledger write).
+        let book = Arc::clone(&self.smart_book);
+        {
+            let guard = book.lock().await;
+            let cap = tickvault_common::constants::GROWW_ORDER_MAX_TRACKED_OPEN_ORDERS;
+            if guard.open_count() >= cap {
+                return Err(SmartOrderError::TrackedCapExceeded { cap }.into());
+            }
+        }
+        let seq = self.reserve_sequence();
+        let ref_id = generate_reference_id(date, seq, reference_id_salt());
+        req.set_reference_id(&ref_id);
+        validate_create_smart_order(&req, self.smart_gates.max_order_quantity)?;
+
+        let mode = self.mode.ledger_mode().to_owned();
+        let new = NewIntent {
+            intent_id: ref_id.clone(),
+            reference_id: ref_id.clone(),
+            kind: IntentKind::SmartPlace,
+            groww_order_id: None,
+            mode,
+            ts_ms: now_ms,
+            linked_intent_id: None,
+            // Restart context (finding 5): segment/type/symbol/qty persisted
+            // so a future rehydration can rebuild the book + GET paths.
+            smart_ctx: Some(SmartIntentContext {
+                segment: req.segment().as_str().to_owned(),
+                smart_order_type: req.smart_order_type().as_str().to_owned(),
+                trading_symbol: req.trading_symbol().to_owned(),
+                quantity: req.quantity(),
+            }),
+        };
+        let receipt = self
+            .with_ledger(move |l| l.record_intent(new, date))
+            .await?;
+
+        let tracked_from = |smart_order_id: String, req: &SmartOrderCreate, rid: &str| {
+            TrackedSmartOrder::new(
+                smart_order_id,
+                req.smart_order_type(),
+                req.segment(),
+                req.trading_symbol().to_owned(),
+                req.quantity(),
+                rid.to_owned(),
+            )
+        };
+
+        if self.mode == ExecutionMode::Paper {
+            let order_id = format!("PAPER-{ref_id}");
+            self.append_intent(
+                &ref_id,
+                IntentPhase::Acked,
+                now_ms,
+                date,
+                Some(order_id.clone()),
+                Some("paper-simulated smart ack".to_owned()),
+            )
+            .await?;
+            book.lock()
+                .await
+                .insert(tracked_from(order_id.clone(), &req, &ref_id));
+            count_mutation("create", "paper_ack");
+            return Ok(PlaceResult::PaperAccepted { order_id });
+        }
+
+        // Live: budget → sent → send → classify (no ambiguity ladder — see
+        // the doc-honesty note above).
+        if !self.budget.check_mutation().is_allowed() {
+            metrics::counter!("tv_groww_order_budget_denied_total", "family" => "orders")
+                .increment(1);
+            // Terminalize the write-ahead intent (finding 10): nothing was
+            // sent, so ResolvedNotLanded is provably true — a Recorded
+            // intent left open would block this order's mutation-in-flight
+            // index until restart.
+            self.append_intent(
+                &ref_id,
+                IntentPhase::ResolvedNotLanded,
+                now_ms,
+                date,
+                None,
+                Some("budget_denied".to_owned()),
+            )
+            .await?;
+            return Err(ExecError::RateBudgetExceeded(RateFamily::Orders));
+        }
+        self.append_intent(&ref_id, IntentPhase::Sent, now_ms, date, None, None)
+            .await?;
+        let outcome = self
+            .transport
+            .create_smart_order(&req, &self.token, &receipt)
+            .await;
+        match outcome {
+            TransportOutcome::Success(payload) => match payload.smart_order_id {
+                // Broker-returned id must be PLAUSIBLE before it enters the
+                // book / ledger / any later URL splice (adversarial round 1,
+                // finding 3) — an implausible echo is an unresolved place.
+                Some(order_id)
+                    if !order_id.trim().is_empty() && is_plausible_smart_order_id(&order_id) =>
+                {
+                    self.append_intent(
+                        &ref_id,
+                        IntentPhase::Acked,
+                        now_ms,
+                        date,
+                        Some(order_id.clone()),
+                        None,
+                    )
+                    .await?;
+                    book.lock()
+                        .await
+                        .insert(tracked_from(order_id.clone(), &req, &ref_id));
+                    count_mutation("create", "acked");
+                    Ok(PlaceResult::Accepted { order_id })
+                }
+                Some(_) => {
+                    // 2xx SUCCESS with an IMPLAUSIBLE id — never adopted.
+                    metrics::counter!("tv_groww_oco_implausible_ack_id_total").increment(1);
+                    self.smart_unresolved_place(&ref_id, now_ms, date, "2xx implausible smart id")
+                        .await
+                }
+                None => {
+                    // 2xx SUCCESS lacking a usable id — unresolvable (no
+                    // by-reference lookup exists on this surface).
+                    self.smart_unresolved_place(&ref_id, now_ms, date, "2xx missing smart id")
+                        .await
+                }
+            },
+            TransportOutcome::Rejected {
+                ga_code, message, ..
+            } => {
+                self.append_intent(
+                    &ref_id,
+                    IntentPhase::Rejected,
+                    now_ms,
+                    date,
+                    None,
+                    ga_code.clone(),
+                )
+                .await?;
+                emit_oco01(
+                    "create",
+                    "rejected",
+                    None,
+                    &format!(
+                        "{} {}",
+                        ga_code.as_deref().unwrap_or("no-ga"),
+                        message.as_deref().unwrap_or("")
+                    ),
+                );
+                count_mutation("create", "rejected");
+                Ok(PlaceResult::Rejected { ga_code })
+            }
+            TransportOutcome::RateLimited { .. } => {
+                metrics::counter!("tv_groww_order_rate_limited_total", "family" => "orders")
+                    .increment(1);
+                self.smart_unresolved_place(&ref_id, now_ms, date, "rate_limited")
+                    .await
+            }
+            TransportOutcome::AuthStale { http_status } => {
+                self.smart_unresolved_place(
+                    &ref_id,
+                    now_ms,
+                    date,
+                    &format!("auth_stale_{http_status}"),
+                )
+                .await
+            }
+            TransportOutcome::Ambiguous(reason) => {
+                self.smart_unresolved_place(&ref_id, now_ms, date, ambiguity_stage(&reason))
+                    .await
+            }
+        }
+    }
+
+    /// The fail-closed terminal for an unresolvable smart place: ledger
+    /// `unresolved` + the coded GROWW-OCO-01 emit + operator ownership.
+    async fn smart_unresolved_place(
+        &mut self,
+        ref_id: &str,
+        now_ms: i64,
+        date: IstDate,
+        detail: &str,
+    ) -> Result<PlaceResult, ExecError> {
+        self.append_intent(
+            ref_id,
+            IntentPhase::Unresolved,
+            now_ms,
+            date,
+            None,
+            Some(detail.to_owned()),
+        )
+        .await?;
+        emit_oco01("create", "unresolvable_ambiguity", None, detail);
+        count_mutation("create", "unresolved");
+        Ok(PlaceResult::Unresolved)
+    }
+
+    /// Modify a tracked smart order — validated against the PER-TYPE
+    /// modifiable-field matrix BEFORE any wire body is built (an
+    /// immutable-field attempt is the typed GROWW-OCO-04 refusal, never HTTP).
+    ///
+    /// # Errors
+    /// Gate / matrix / eligibility / cap / ledger / budget refusals.
+    pub async fn modify_smart_order(
+        &mut self,
+        smart_order_id: &str,
+        fields: SmartModifyFields,
+        date: IstDate,
+        now_ms: i64,
+        session_open: bool,
+    ) -> Result<MutationResult, ExecError> {
+        if !session_open {
+            return Err(ExecError::MarketClosed);
+        }
+        self.smart_write_gate()?;
+        if !is_plausible_smart_order_id(smart_order_id) {
+            return Err(SmartOrderError::ImplausibleSmartOrderId.into());
+        }
+        let book = Arc::clone(&self.smart_book);
+        let (smart_order_type, segment) = {
+            let guard = book.lock().await;
+            let Some(t) = guard.get(smart_order_id) else {
+                return Err(SmartOrderError::UnknownSmartOrder {
+                    smart_order_id: smart_order_id.to_owned(),
+                }
+                .into());
+            };
+            if t.status.is_terminal() {
+                // RAW terminal label — never a mislabeled catch-all (finding 7).
+                return Err(SmartOrderError::AlreadyTerminal {
+                    smart_order_id: smart_order_id.to_owned(),
+                    status: t.status.as_str().to_owned(),
+                }
+                .into());
+            }
+            let cap = tickvault_common::constants::GROWW_ORDER_MAX_MODIFICATIONS_PER_ORDER;
+            if t.modifications >= cap {
+                return Err(SmartOrderError::ModificationCapExceeded {
+                    smart_order_id: smart_order_id.to_owned(),
+                    cap,
+                }
+                .into());
+            }
+            (t.smart_order_type, t.segment)
+        };
+        if let Err(e) = validate_modify_fields(
+            smart_order_type,
+            segment,
+            &fields,
+            self.smart_gates.max_order_quantity,
+        ) {
+            if matches!(e, SmartOrderError::ImmutableField { .. }) {
+                emit_oco04("immutable_field", Some(smart_order_id), &e.to_string());
+            }
+            return Err(e.into());
+        }
+        let body = build_modify_body(smart_order_type, segment, &fields);
+
+        // Write-ahead intent (keyed on the smart order id — the ledger's
+        // MutationInFlight serialization applies across smart mutations too).
+        let seq = self.reserve_sequence();
+        let ref_id = generate_reference_id(date, seq, reference_id_salt());
+        let mode = self.mode.ledger_mode().to_owned();
+        let new = NewIntent {
+            intent_id: ref_id.clone(),
+            reference_id: ref_id.clone(),
+            kind: IntentKind::SmartModify,
+            groww_order_id: Some(smart_order_id.to_owned()),
+            mode,
+            ts_ms: now_ms,
+            linked_intent_id: None,
+            // Restart context (finding 5) — the GET-path parameters.
+            smart_ctx: Some(SmartIntentContext {
+                segment: segment.as_str().to_owned(),
+                smart_order_type: smart_order_type.as_str().to_owned(),
+                trading_symbol: String::new(),
+                quantity: 0,
+            }),
+        };
+        let receipt = self
+            .with_ledger(move |l| l.record_intent(new, date))
+            .await?;
+
+        if self.mode == ExecutionMode::Paper {
+            self.append_intent(
+                &ref_id,
+                IntentPhase::Acked,
+                now_ms,
+                date,
+                Some(smart_order_id.to_owned()),
+                Some("paper smart modify ack".to_owned()),
+            )
+            .await?;
+            if let Some(t) = book.lock().await.get_mut(smart_order_id) {
+                t.modifications = t.modifications.saturating_add(1);
+                if let Some(q) = fields.quantity {
+                    t.quantity = q;
+                }
+            }
+            count_mutation("modify", "paper_ack");
+            return Ok(MutationResult::Accepted);
+        }
+
+        if !self.budget.check_mutation().is_allowed() {
+            metrics::counter!("tv_groww_order_budget_denied_total", "family" => "orders")
+                .increment(1);
+            // Terminalize the write-ahead intent (finding 10): nothing was
+            // sent, so ResolvedNotLanded is provably true — a Recorded
+            // intent left open would block this order's mutation-in-flight
+            // index until restart.
+            self.append_intent(
+                &ref_id,
+                IntentPhase::ResolvedNotLanded,
+                now_ms,
+                date,
+                Some(smart_order_id.to_owned()),
+                Some("budget_denied".to_owned()),
+            )
+            .await?;
+            return Err(ExecError::RateBudgetExceeded(RateFamily::Orders));
+        }
+        self.append_intent(
+            &ref_id,
+            IntentPhase::Sent,
+            now_ms,
+            date,
+            Some(smart_order_id.to_owned()),
+            None,
+        )
+        .await?;
+        let outcome = self
+            .transport
+            .modify_smart_order(smart_order_id, &body, &self.token, &receipt)
+            .await;
+        match outcome {
+            TransportOutcome::Success(_) => {
+                self.append_intent(
+                    &ref_id,
+                    IntentPhase::Acked,
+                    now_ms,
+                    date,
+                    Some(smart_order_id.to_owned()),
+                    None,
+                )
+                .await?;
+                if let Some(t) = book.lock().await.get_mut(smart_order_id) {
+                    t.modifications = t.modifications.saturating_add(1);
+                    if let Some(q) = fields.quantity {
+                        t.quantity = q;
+                    }
+                }
+                count_mutation("modify", "acked");
+                Ok(MutationResult::Accepted)
+            }
+            TransportOutcome::Rejected {
+                ga_code, message, ..
+            } => {
+                self.append_intent(
+                    &ref_id,
+                    IntentPhase::Rejected,
+                    now_ms,
+                    date,
+                    Some(smart_order_id.to_owned()),
+                    ga_code.clone(),
+                )
+                .await?;
+                emit_oco04(
+                    "rejected",
+                    Some(smart_order_id),
+                    &format!(
+                        "{} {}",
+                        ga_code.as_deref().unwrap_or("no-ga"),
+                        message.as_deref().unwrap_or("")
+                    ),
+                );
+                count_mutation("modify", "rejected");
+                Ok(MutationResult::Rejected { ga_code })
+            }
+            other => {
+                let stage = smart_ambiguity_detail(&other);
+                self.append_intent(
+                    &ref_id,
+                    IntentPhase::Unresolved,
+                    now_ms,
+                    date,
+                    Some(smart_order_id.to_owned()),
+                    Some(stage.clone()),
+                )
+                .await?;
+                emit_oco04("ambiguous", Some(smart_order_id), &stage);
+                count_mutation("modify", "unresolved");
+                Ok(MutationResult::Unresolved)
+            }
+        }
+    }
+
+    /// Cancel a tracked smart order (path-params-only wire call, no body).
+    ///
+    /// # Errors
+    /// Gate / eligibility / ledger / budget refusals.
+    pub async fn cancel_smart_order(
+        &mut self,
+        smart_order_id: &str,
+        date: IstDate,
+        now_ms: i64,
+        session_open: bool,
+    ) -> Result<MutationResult, ExecError> {
+        if !session_open {
+            return Err(ExecError::MarketClosed);
+        }
+        self.smart_write_gate()?;
+        if !is_plausible_smart_order_id(smart_order_id) {
+            return Err(SmartOrderError::ImplausibleSmartOrderId.into());
+        }
+        let book = Arc::clone(&self.smart_book);
+        let (smart_order_type, segment) = {
+            let guard = book.lock().await;
+            let Some(t) = guard.get(smart_order_id) else {
+                return Err(SmartOrderError::UnknownSmartOrder {
+                    smart_order_id: smart_order_id.to_owned(),
+                }
+                .into());
+            };
+            if t.status.is_terminal() {
+                // RAW terminal label — never a mislabeled catch-all (finding 7).
+                return Err(SmartOrderError::AlreadyTerminal {
+                    smart_order_id: smart_order_id.to_owned(),
+                    status: t.status.as_str().to_owned(),
+                }
+                .into());
+            }
+            (t.smart_order_type, t.segment)
+        };
+        let seq = self.reserve_sequence();
+        let ref_id = generate_reference_id(date, seq, reference_id_salt());
+        let mode = self.mode.ledger_mode().to_owned();
+        let new = NewIntent {
+            intent_id: ref_id.clone(),
+            reference_id: ref_id.clone(),
+            kind: IntentKind::SmartCancel,
+            groww_order_id: Some(smart_order_id.to_owned()),
+            mode,
+            ts_ms: now_ms,
+            linked_intent_id: None,
+            // Restart context (finding 5) — the GET-path parameters.
+            smart_ctx: Some(SmartIntentContext {
+                segment: segment.as_str().to_owned(),
+                smart_order_type: smart_order_type.as_str().to_owned(),
+                trading_symbol: String::new(),
+                quantity: 0,
+            }),
+        };
+        let receipt = self
+            .with_ledger(move |l| l.record_intent(new, date))
+            .await?;
+
+        if self.mode == ExecutionMode::Paper {
+            self.append_intent(
+                &ref_id,
+                IntentPhase::Acked,
+                now_ms,
+                date,
+                Some(smart_order_id.to_owned()),
+                Some("paper smart cancel ack".to_owned()),
+            )
+            .await?;
+            if let Some(t) = book.lock().await.get_mut(smart_order_id) {
+                t.status = SmartOrderStatus::Cancelled;
+            }
+            count_mutation("cancel", "paper_ack");
+            return Ok(MutationResult::Accepted);
+        }
+
+        if !self.budget.check_mutation().is_allowed() {
+            metrics::counter!("tv_groww_order_budget_denied_total", "family" => "orders")
+                .increment(1);
+            // Terminalize the write-ahead intent (finding 10): nothing was
+            // sent, so ResolvedNotLanded is provably true — a Recorded
+            // intent left open would block this order's mutation-in-flight
+            // index until restart.
+            self.append_intent(
+                &ref_id,
+                IntentPhase::ResolvedNotLanded,
+                now_ms,
+                date,
+                Some(smart_order_id.to_owned()),
+                Some("budget_denied".to_owned()),
+            )
+            .await?;
+            return Err(ExecError::RateBudgetExceeded(RateFamily::Orders));
+        }
+        self.append_intent(
+            &ref_id,
+            IntentPhase::Sent,
+            now_ms,
+            date,
+            Some(smart_order_id.to_owned()),
+            None,
+        )
+        .await?;
+        let outcome = self
+            .transport
+            .cancel_smart_order(
+                segment,
+                smart_order_type,
+                smart_order_id,
+                &self.token,
+                &receipt,
+            )
+            .await;
+        match outcome {
+            TransportOutcome::Success(payload) => {
+                self.append_intent(
+                    &ref_id,
+                    IntentPhase::Acked,
+                    now_ms,
+                    date,
+                    Some(smart_order_id.to_owned()),
+                    None,
+                )
+                .await?;
+                // Identity guard, mirroring the reconcile-GET fix (round 3,
+                // finding 1): the "no unguarded broker echo" invariant holds
+                // across ALL echo sites. A cancel response carrying a
+                // DIFFERENT id (not exploitable on our own id-path, but
+                // symmetric) skips adoption — degrade + emit, never classify.
+                let id_mismatch = payload
+                    .smart_order_id
+                    .as_deref()
+                    .is_some_and(|other| other != smart_order_id);
+                if id_mismatch {
+                    emit_oco05(
+                        "id_mismatch",
+                        &format!(
+                            "cancel echo requested {} got {}",
+                            log_safe_id(smart_order_id),
+                            log_safe_id(payload.smart_order_id.as_deref().unwrap_or("")),
+                        ),
+                    );
+                } else {
+                    // Route the echoed status ("CANCELLED on success")
+                    // through the FSM (round 1, finding 8): forward adopts,
+                    // backward/unknown PARKS for the reconcile poller — never
+                    // a blind direct assignment.
+                    let echoed = payload
+                        .status
+                        .as_deref()
+                        .map(SmartOrderStatus::parse)
+                        .unwrap_or(SmartOrderStatus::Cancelled);
+                    if let Some(t) = book.lock().await.get_mut(smart_order_id) {
+                        match evaluate_smart_transition(&t.status, &echoed) {
+                            SmartTransitionOutcome::Transition => t.status = echoed,
+                            SmartTransitionOutcome::SameStatusRefresh
+                            | SmartTransitionOutcome::Park => {}
+                        }
+                    }
+                }
+                count_mutation("cancel", "acked");
+                Ok(MutationResult::Accepted)
+            }
+            TransportOutcome::Rejected {
+                ga_code, message, ..
+            } => {
+                self.append_intent(
+                    &ref_id,
+                    IntentPhase::Rejected,
+                    now_ms,
+                    date,
+                    Some(smart_order_id.to_owned()),
+                    ga_code.clone(),
+                )
+                .await?;
+                emit_oco01(
+                    "cancel",
+                    "rejected",
+                    Some(smart_order_id),
+                    &format!(
+                        "{} {}",
+                        ga_code.as_deref().unwrap_or("no-ga"),
+                        message.as_deref().unwrap_or("")
+                    ),
+                );
+                count_mutation("cancel", "rejected");
+                Ok(MutationResult::Rejected { ga_code })
+            }
+            other => {
+                let stage = smart_ambiguity_detail(&other);
+                self.append_intent(
+                    &ref_id,
+                    IntentPhase::Unresolved,
+                    now_ms,
+                    date,
+                    Some(smart_order_id.to_owned()),
+                    Some(stage.clone()),
+                )
+                .await?;
+                emit_oco01("cancel", "ambiguous", Some(smart_order_id), &stage);
+                count_mutation("cancel", "unresolved");
+                Ok(MutationResult::Unresolved)
+            }
+        }
+    }
+
+    /// One bounded reconcile pass over the tracked smart-order book (the
+    /// GROWW-OCO-02/-03/-05 emit driver). READ-gated (`smart_orders_read` +
+    /// market hours); the PAPER lane returns an empty report (its `PAPER-…`
+    /// ids have no broker side — polling would be a false degrade).
+    ///
+    /// # Errors
+    /// [`SmartOrderError::ReadGateClosed`] when the read gate is closed.
+    pub async fn reconcile_smart_orders(
+        &mut self,
+        now_ms: i64,
+        in_market_hours: bool,
+        positions: &HashMap<String, i64>,
+    ) -> Result<SmartReconcileReport, ExecError> {
+        if !self.smart_gates.smart_orders_read || !in_market_hours {
+            return Err(SmartOrderError::ReadGateClosed.into());
+        }
+        if self.mode == ExecutionMode::Paper {
+            return Ok(SmartReconcileReport::default());
+        }
+        let book = Arc::clone(&self.smart_book);
+        let mut guard = book.lock().await;
+        Ok(reconcile_pass(
+            &self.transport,
+            &self.token,
+            &mut guard,
+            self.smart_gates.sibling_cancel_deadline_secs,
+            now_ms,
+            positions,
+        )
+        .await)
+    }
+}
+
+/// Stable detail for a non-success/non-reject smart transport outcome.
+fn smart_ambiguity_detail<P>(outcome: &TransportOutcome<P>) -> String {
+    match outcome {
+        TransportOutcome::RateLimited { .. } => "rate_limited".to_owned(),
+        TransportOutcome::AuthStale { http_status } => format!("auth_stale_{http_status}"),
+        TransportOutcome::Ambiguous(reason) => ambiguity_stage(reason).to_owned(),
+        TransportOutcome::Success(_) | TransportOutcome::Rejected { .. } => "n/a".to_owned(),
     }
 }
 
