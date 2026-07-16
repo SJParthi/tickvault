@@ -115,10 +115,16 @@ fi
 # GATE 5: Secret scanner (runs on ALL staged files, not just .rs)
 # ─────────────────────────────────────────────
 echo "  [5/8] Secret scan..." >&2
-SECRET_OUT=$(timeout 60 "$HOOKS_DIR/secret-scanner.sh" "$CWD" "$ALL_STAGED" 2>&1)
+# 2026-07-16 operator-authorized: env knob + staged-count scaling (284 files→95s,
+# 10→61s); staged sets are small so /8 suffices (full-tree pre-push uses /2).
+# Findings always block; exit-124 still blocks; no skip path.
+STAGED_COUNT=$(printf '%s\n' "$ALL_STAGED" | sed '/^$/d' | wc -l | tr -d ' ')
+SECRET_TIMEOUT=$(( ${TICKVAULT_SECRET_SCAN_TIMEOUT_SECS:-60} + STAGED_COUNT / 8 ))
+[ "$SECRET_TIMEOUT" -lt 60 ] && SECRET_TIMEOUT=60
+SECRET_OUT=$(timeout "$SECRET_TIMEOUT" "$HOOKS_DIR/secret-scanner.sh" "$CWD" "$ALL_STAGED" 2>&1)
 SECRET_EXIT=$?
 if [ "$SECRET_EXIT" -eq 124 ]; then
-  echo "  FAIL: Secret scanner timed out (60s)" >&2
+  echo "  FAIL: Secret scanner timed out (${SECRET_TIMEOUT}s)" >&2
   FAILED=1
 elif [ "$SECRET_EXIT" -ne 0 ]; then
   echo "$SECRET_OUT" >&2

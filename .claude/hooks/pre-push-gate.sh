@@ -116,10 +116,21 @@ fi
 
 # Gate 2: Banned pattern scan (full workspace)
 echo "  [2/8] Banned pattern scan..." >&2
-ALL_RS=$(find crates -name '*.rs' -not -path '*/target/*' 2>/dev/null | tr '\n' ' ')
-if [ -n "$ALL_RS" ] && [ -x "$HOOKS_DIR/banned-pattern-scanner.sh" ]; then
-  if ! timeout 60 "$HOOKS_DIR/banned-pattern-scanner.sh" "$CWD" "$ALL_RS" > /dev/null 2>&1; then
-    echo "  FAIL: Banned patterns in workspace." >&2
+# The scanners iterate $2 as a newline here-string (`while read <<< "$files"`);
+# the old `tr '\n' ' '` space-joined form made the loop see one bogus
+# mega-filename → ZERO files scanned (2026-07-16 gate-integrity sweep).
+ALL_RS=$(find crates -name '*.rs' -not -path '*/target/*' 2>/dev/null | sort)
+RS_COUNT=$(printf '%s\n' "$ALL_RS" | sed '/^$/d' | wc -l | tr -d ' ')
+if [ -z "$ALL_RS" ]; then
+  echo "  FAIL: no .rs files found under crates/ — banned-pattern scan cannot run" >&2
+  FAILED=1
+elif [ -x "$HOOKS_DIR/banned-pattern-scanner.sh" ]; then
+  # measured ~0.3s/file worst-case for a real full-tree scan (2026-07-16) —
+  # count/2 gives 2x headroom; the old fixed 60s only "worked" because zero
+  # files were scanned
+  BANNED_TIMEOUT=$(( 60 + RS_COUNT / 2 ))
+  if ! timeout "$BANNED_TIMEOUT" "$HOOKS_DIR/banned-pattern-scanner.sh" "$CWD" "$ALL_RS" > /dev/null 2>&1; then
+    echo "  FAIL: Banned patterns in workspace (timeout ${BANNED_TIMEOUT}s)." >&2
     FAILED=1
   else
     echo "  PASS: Banned pattern scan" >&2
@@ -131,8 +142,12 @@ fi
 # Gate 3: Secret scan
 echo "  [3/8] Secret scan..." >&2
 if [ -x "$HOOKS_DIR/secret-scanner.sh" ]; then
-  if ! timeout 30 "$HOOKS_DIR/secret-scanner.sh" "$CWD" "$ALL_RS" > /dev/null 2>&1; then
-    echo "  FAIL: Secrets detected in workspace." >&2
+  # full-tree secret scan measured ~4m19s/551 files (2026-07-16) — env base
+  # (default 60s) + count/2; hard floor 60s; findings always block
+  SECRET_TIMEOUT=$(( ${TICKVAULT_SECRET_SCAN_TIMEOUT_SECS:-60} + RS_COUNT / 2 ))
+  [ "$SECRET_TIMEOUT" -lt 60 ] && SECRET_TIMEOUT=60
+  if ! timeout "$SECRET_TIMEOUT" "$HOOKS_DIR/secret-scanner.sh" "$CWD" "$ALL_RS" > /dev/null 2>&1; then
+    echo "  FAIL: Secrets detected in workspace (timeout ${SECRET_TIMEOUT}s)." >&2
     FAILED=1
   else
     echo "  PASS: Secret scan" >&2
