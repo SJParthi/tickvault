@@ -30,6 +30,7 @@
 /// ORD-PR-3 executor; only the pinning test references it today, so allow the
 /// otherwise-unused re-export in a feature build with tests excluded.
 #[allow(unused_imports)]
+// APPROVED: pinning-test-only re-export until the ORD-PR-3 executor consumes it
 pub(crate) use tickvault_common::constants::GROWW_ORDER_POST_MUTATION_CONFIRM_DELAY_MS as POST_MUTATION_CONFIRM_DELAY_MS;
 pub(crate) use tickvault_common::constants::{
     GROWW_ORDER_MAX_HOT_TIER_ORDERS as MAX_HOT, GROWW_ORDER_MAX_TRACKED_OPEN_ORDERS as MAX_TRACKED,
@@ -42,7 +43,7 @@ pub(crate) use tickvault_common::constants::{
 };
 
 /// HOT-tier residency window after a mutation (seconds). Genuinely module-local.
-#[allow(dead_code)] // consumed by the ORD-PR-3 executor (hot-window residency)
+#[allow(dead_code)] // APPROVED: consumed by the ORD-PR-3 executor (hot-window residency)
 pub(crate) const HOT_WINDOW_SECS: u64 = 30;
 /// Post-mutation confirm polls budget line (at the 10-mutations/min-class
 /// worst case — one +500ms confirm each). Genuinely module-local.
