@@ -1862,12 +1862,16 @@ pub struct PartitionRetentionConfig {
     #[serde(default = "default_retention_days")]
     pub retention_days: u32,
     /// Hot window in days for the HIGH-VOLUME market-data class (`ticks` +
-    /// the 21 `candles_*` tables, ~1.2–2 GB/day combined). 90 days of ticks
-    /// (~135+ GB) can never fit the 30 GB volume — the hot window must be
-    /// shorter, with S3 as the durable long-term store (aws-budget.md §5
-    /// hot-window-on-EBS doctrine; SEBI retention satisfied by the S3 copy).
-    /// Only consulted when `archive_enabled = true`; clamped to a hard
-    /// MIN_HOT_DAYS=2 floor at use (today + yesterday are untouchable).
+    /// the 21 `candles_*` tables + the per-minute chain tables since
+    /// 2026-07-16). 90 days of ticks (~135+ GB) can never fit the volume —
+    /// the hot window must be shorter, with S3 as the durable long-term
+    /// store (aws-budget.md §5 hot-window-on-EBS doctrine; SEBI retention
+    /// satisfied by the S3 copy). Default 35 since 2026-07-16 (was 14) —
+    /// the operator's minimum-one-month spot window demand ("our entire
+    /// one month should be stored and fetched from questdb even before
+    /// premarket"). Only consulted when `archive_enabled = true`; clamped
+    /// to a hard MIN_HOT_DAYS=2 floor at use (today + yesterday are
+    /// untouchable).
     #[serde(default = "default_market_data_hot_days")]
     pub market_data_hot_days: u32,
     /// Master gate for the archive→verify→drop leg. serde default FALSE so
@@ -1906,11 +1910,12 @@ const fn default_retention_days() -> u32 {
     90
 }
 
-/// Default market-data hot window: 14 days. Inert unless `archive_enabled`;
-/// safe-by-default because the archive→verify→drop flow is fail-closed
-/// (no verified S3 copy ⇒ no drop).
+/// Default market-data hot window: 35 days (2026-07-16 operator directive
+/// — one month of spot history + weekend slack; was 14). Inert unless
+/// `archive_enabled`; safe-by-default because the archive→verify→drop flow
+/// is fail-closed (no verified S3 copy ⇒ no drop).
 const fn default_market_data_hot_days() -> u32 {
-    14
+    35
 }
 
 /// Default per-run archive bound: 200 partitions. At ~8–24 hourly ticks
@@ -2907,7 +2912,8 @@ mod tests {
         let cfg: PartitionRetentionConfig =
             toml::from_str("retention_days = 90").expect("legacy section must parse");
         assert_eq!(cfg.retention_days, 90);
-        assert_eq!(cfg.market_data_hot_days, 14);
+        // 2026-07-16: default raised 14 → 35 (operator one-month spot window).
+        assert_eq!(cfg.market_data_hot_days, 35);
         assert!(!cfg.archive_enabled, "archive leg must default OFF");
         assert!(cfg.archive_bucket.is_empty(), "bucket must default derived");
         assert_eq!(cfg.max_partitions_per_run, 200);
@@ -2919,7 +2925,8 @@ mod tests {
         // `default -> true` mutants and pins the instant-rollback contract
         // (delete the key ⇒ detach-only legacy behaviour).
         assert!(!PartitionRetentionConfig::default().archive_enabled);
-        assert_eq!(default_market_data_hot_days(), 14);
+        // 2026-07-16: default raised 14 → 35 (operator one-month spot window).
+        assert_eq!(default_market_data_hot_days(), 35);
         assert_eq!(default_max_partitions_per_run(), 200);
         let cfg: PartitionRetentionConfig =
             toml::from_str("").expect("empty section must parse via defaults");
@@ -2929,12 +2936,12 @@ mod tests {
     #[test]
     fn test_partition_retention_full_section_parses() {
         let cfg: PartitionRetentionConfig = toml::from_str(
-            "retention_days = 90\nmarket_data_hot_days = 14\narchive_enabled = true\narchive_bucket = \"tv-prod-cold\"\nmax_partitions_per_run = 50\n",
+            "retention_days = 90\nmarket_data_hot_days = 35\narchive_enabled = true\narchive_bucket = \"tv-prod-cold\"\nmax_partitions_per_run = 50\n",
         )
         .expect("full section must parse");
         assert!(cfg.archive_enabled);
         assert_eq!(cfg.archive_bucket, "tv-prod-cold");
-        assert_eq!(cfg.market_data_hot_days, 14);
+        assert_eq!(cfg.market_data_hot_days, 35);
         assert_eq!(cfg.max_partitions_per_run, 50);
     }
 
