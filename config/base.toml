@@ -164,11 +164,16 @@ ilp_port = 9009
 [partition_retention]
 # STANDARD class (audit / daily-data tables) hot window.
 retention_days = 90
-# HIGH-VOLUME market-data class (ticks + 21 candles_* tables, ~1.2-2 GB/day).
-# 90d of ticks (~135+ GB) can never fit the 30 GB volume; 14d hot on EBS with
-# the verified S3 archive as the durable long-term store (SEBI retention is
-# satisfied by the S3 copy — aws-budget hot-window doctrine).
-market_data_hot_days = 14
+# HIGH-VOLUME market-data class (ticks + 21 candles_* tables + the per-minute
+# chain tables option_chain_1m/option_contract_1m_rest since 2026-07-16).
+# 35d hot on EBS (2026-07-16 operator directive — "our entire one month
+# should be stored and fetched from questdb even before premarket"; was 14),
+# with the verified S3 archive as the durable long-term store (SEBI retention
+# is satisfied by the S3 copy — aws-budget hot-window doctrine). The chain
+# tables moved here from the 90d Standard class the same day (the operator's
+# "option only for the current day" direction — 35d is the smallest clean
+# change; a tighter chain-only knob is a follow-up if disk pressure demands).
+market_data_hot_days = 35
 # Archive->verify->drop leg ON (2026-07-13 disk-pressure remediation).
 # Fail-closed: a partition is dropped ONLY after its S3 copy is row-count-
 # and size-verified. ROLLBACK: set false (or delete the key) to restore the
@@ -625,6 +630,22 @@ warm_up = true
 # ===========================================================================
 [tf_consistency]
 enabled = true
+
+# ===========================================================================
+# REST-era multi-TF candle derivation (operator directive 2026-07-16:
+# "why the fuck remaining candles 1m till 1day is not yet generated and
+# populated — resolve these"). Folds persist-confirmed spot_1m_rest 1m bars
+# into all 21 candles_* timeframes via the shared seal-writer channel, plus
+# a boot catch-up over the last `catchup_days` of stored bars (35 = the
+# operator's one-month spot window + weekend slack, 2026-07-16: "our entire
+# one month should be stored and fetched from questdb even before
+# premarket"). NEVER touches `ticks` (live-feed-purity; rule 10 carries the
+# dated candles_1d edit). Serde default is OFF (fail-safe) — this section
+# opts in; `enabled = false` is the rollback switch.
+# ===========================================================================
+[rest_candle_fold]
+enabled = true
+catchup_days = 35
 
 # ===========================================================================
 # Scheduled OMS order-book reconciliation (2026-07-14). Every

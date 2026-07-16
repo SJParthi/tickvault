@@ -83,11 +83,11 @@ pub fn spawn_groww_universe_rider(questdb: QuestDbConfig) -> tokio::task::JoinHa
             let inner_questdb = questdb.clone();
             let inner = tokio::spawn(run_groww_universe_rider(inner_questdb));
             let result = inner.await;
-            if let Err(join_err) = &result {
-                if join_err.is_cancelled() {
-                    // Graceful shutdown teardown — not an abort.
-                    return;
-                }
+            if let Err(join_err) = &result
+                && join_err.is_cancelled()
+            {
+                // Graceful shutdown teardown — not an abort.
+                return;
             }
             let reason = tickvault_storage::disk_health_watcher::classify_join_exit(&result);
             metrics::counter!("tv_groww_universe_respawn_total", "reason" => reason).increment(1);
