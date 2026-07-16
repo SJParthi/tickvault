@@ -648,6 +648,22 @@ enabled = true
 catchup_days = 35
 
 # ===========================================================================
+# RAM residency stores (operator directive 2026-07-16, PR-2 of the
+# data-completeness build): the month-deep SPOT bar rings (fed by the
+# rest_candle_fold emit path — zero new QuestDB reads) + the current-day
+# CHAIN minute ring (fed by the chain legs' publish path, boot-rehydrated
+# from today's option_chain_1m rows via bounded /exec windows). Cold path
+# only; reads are the FUTURE strategy read contract (§28 boundary — no
+# strategy consumer ships). An ABSENT section = disabled (fail-safe);
+# `enabled = false` is the rollback switch. RAMSTORE-01 runbook:
+# .claude/rules/project/ram-store-error-codes.md
+# ===========================================================================
+[market_ram_store]
+enabled = true
+spot_days = 35
+chain_row_cap = 1000
+
+# ===========================================================================
 # Scheduled OMS order-book reconciliation (2026-07-14). Every
 # `interval_secs` during the NSE session the trading pipeline reconciles
 # OMS state against the Dhan order book (the OMS-GAP-02 machinery gains a
