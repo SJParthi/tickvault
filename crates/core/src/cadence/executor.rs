@@ -11,8 +11,21 @@
 //! Executor CONTRACT (locked with the Dhan capture session): ONE bounded
 //! request per call; the deadline rides in the request; NO self-scheduling
 //! or re-poll ladder inside impls; a broker 429 is typed
-//! [`CadenceFetchError::RateLimited`] so it arms the failure ladder and is
-//! never blind-retried.
+//! [`CadenceFetchError::RateLimited`] so it arms the SHAPE ladder (the
+//! SOLE arming class). 2026-07-16 supersession (operator Correction 2 —
+//! `cadence-error-codes.md` §0b): the pre-reshape no-retry-in-cycle
+//! wording is SUPERSEDED — a RateLimited leg KEEPS exactly ONE bounded
+//! in-cycle retry, driven by the RUNNER through the gates after the
+//! per-key spacing (`ladder::may_retry_in_cycle`); impls themselves
+//! still never self-retry (the retry is runner-owned, never impl-side).
+//!
+//! Pacing note (coordinator ruling A, 2026-07-16 — §0b): cadence fires
+//! do NOT route through the shared `dhan_data_api_limiter`; the burst
+//! primary is all-7 concurrent at the burst second, packed by
+//! `ladder::spot_second_buckets` on the fallback shape, and paced by the
+//! cadence gates' combined rolling-second ring — never the 3 rps
+//! self-tuner (which stays the authority for the LEGACY per-minute
+//! paths only).
 
 use std::future::Future;
 
@@ -124,8 +137,14 @@ pub enum SpotTarget {
 }
 
 impl SpotTarget {
-    /// The single-source list, in the locked slot order (:03.0 / :03.4 /
-    /// :03.8 / :04.2 on the Dhan lane).
+    /// The single-source list. Ordering here is IDENTITY order only —
+    /// fire TIMING is owned by the schedule: since the 2026-07-16
+    /// post-close burst reshape (§0b), the Dhan primary fires ALL 7
+    /// requests (3 chains + these 4 spots) concurrently at the burst
+    /// second, and the fallback shape packs the spots into 1000ms
+    /// second buckets per `ladder::spot_second_buckets` (the single
+    /// pure source of the packing). The pre-reshape rev-8 per-spot
+    /// slot order this doc used to teach is RETIRED.
     pub const ALL: &'static [SpotTarget] = &[
         SpotTarget::Nifty,
         SpotTarget::BankNifty,
@@ -177,8 +196,12 @@ pub struct SpotFetchRequest {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CadenceFetchError {
     /// The broker rate-limited us (HTTP 429) DESPITE the gates — arms the
-    /// ladder (strongest signal), never blind-retried, and additionally a
-    /// gate-bug signal (design §4).
+    /// shape ladder (the SOLE arming class) and is additionally a
+    /// gate-bug signal (design §4). 2026-07-16 supersession (operator
+    /// Correction 2 — §0b): the leg KEEPS its ONE bounded in-cycle
+    /// retry, issued by the RUNNER through the gates after the per-key
+    /// spacing — never more than the bounded budget, never an impl-side
+    /// self-retry, never a blind storm.
     RateLimited {
         /// The broker's Retry-After hint, ms, when present.
         retry_after_ms: Option<i64>,
@@ -188,14 +211,20 @@ pub enum CadenceFetchError {
     /// A 2xx response carrying NO usable data (the Dhan 200-with-zero-
     /// candles class) — does NOT arm the ladder (Assumed, design §0).
     Empty,
-    /// The SHARED `dhan_data_api_limiter` queued the request past its
-    /// deadline (verifier F1 composition contract, 2026-07-15): a
-    /// SELF-INFLICTED pacing delay, NOT a broker failure — stage-tagged
-    /// distinctly from a real [`CadenceFetchError::Timeout`] and
-    /// NON-ARMING for the start ladder (`ladder::failure_arms_ladder`
-    /// returns `false`; shifting the anchor earlier cannot fix our own
-    /// queue). Executor impls MUST type a limiter-queue-induced deadline
-    /// miss as this, never as `Timeout`.
+    /// A SELF-INFLICTED pacing-queue deadline miss — our OWN machinery,
+    /// never the broker. Stage-tagged distinctly from a real
+    /// [`CadenceFetchError::Timeout`] and NON-ARMING for every ladder
+    /// (`ladder::failure_arms_ladder` returns `false`; reshaping cannot
+    /// fix our own queue). 2026-07-16 supersession (coordinator ruling A
+    /// — `cadence-error-codes.md` §0b): cadence fires do NOT route
+    /// through the shared `dhan_data_api_limiter` at all, so there is NO
+    /// shared-limiter queue on the cadence lane — the originally-named
+    /// source (verifier F1, 2026-07-15) can no longer produce this
+    /// variant here. It is unreachable-by-design today and RESERVED for
+    /// executor-side self-inflicted pacing sources (an impl-internal
+    /// queue etc.); impls MUST NOT wire the shared limiter back into a
+    /// cadence fire, and any such internal-queue deadline miss is typed
+    /// as this, never as `Timeout`.
     QueueDelay,
     /// An auth-class reject (dead token / entitlement) — the token
     /// machinery owns recovery; does not arm the ladder.
