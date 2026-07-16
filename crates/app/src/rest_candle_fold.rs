@@ -36,24 +36,38 @@
 //!   opens a later bucket); D1 + every open partial force-seals at/after the
 //!   15:30 close bar.
 //! - Out-of-order/duplicate bars (backfill/sweep repairs — 2026-07-16
-//!   round-2 HIGH redesign): every bar the process receives for the CURRENT
-//!   trading day ALSO lands in a per-(feed, sid, segment) in-RAM **day-map**
-//!   (minute → last-received bar, last-write-wins; ≤375 entries × 8 keys —
-//!   trivial memory). A repair bar for the current day (out-of-order minute
-//!   OR a value-UPDATE of an already-folded minute) updates the map and
-//!   synchronously REFOLDS the whole day from the map through a fresh
-//!   engine (≤375 bars × 21 TFs — microseconds, cold path), swaps the live
+//!   round-2 HIGH redesign; round-3 burst coalescing): every bar the
+//!   process receives for the CURRENT trading day ALSO lands in a
+//!   per-(feed, sid, segment) in-RAM **day-map** (minute → last-received
+//!   bar, last-write-wins; ≤375 entries × 8 keys — trivial memory). A
+//!   repair bar for the current day (out-of-order minute OR a value-UPDATE
+//!   of an already-folded minute) updates the map; the consumer loop
+//!   drains each arriving burst as ONE batch and refolds every dirty slot
+//!   ONCE per batch from its map through a fresh engine (≤375 bars ×
+//!   21 TFs — microseconds, cold path; a mid-day-outage sweep of N repairs
+//!   costs one refold per slot, never N full-day refolds), swaps the live
 //!   engine in place, and re-emits every bucket the refold closed (DEDUP
-//!   UPSERT heals in place). Lossless by construction — the map contains
-//!   every bar this process ever received for the day, so NO QuestDB read
-//!   and NO ILP-ACK → `/exec` WAL-apply visibility race exists on the
-//!   today path. Only a repair for a PAST day (the day-map has already
-//!   rolled) takes the bounded `/exec` refold path — it emits corrected
-//!   CLOSED-day seals only and NEVER touches a live engine (kills the
-//!   round-2 midnight-clobber class: "today" is the ENGINE's current day,
-//!   not the wall clock). Honest residual: the WAL-apply visibility lag
-//!   applies ONLY to that past-day cold path, where it is gated by the
-//!   trigger-minute presence check + bounded requeue.
+//!   UPSERT heals in place). Lossless for bars received IN-PROCESS THIS
+//!   INCARNATION — the map holds every such bar, so the today REPAIR path
+//!   performs NO QuestDB read and adds no ILP-ACK → `/exec` WAL-apply
+//!   visibility race of its own. Honest crash-restart residual (round-3
+//!   doc-honesty): the boot catch-up's TODAY seed IS an `/exec` read — a
+//!   minute persisted seconds before a crash-restart can be WAL-invisible
+//!   to that seed and stays out of the derived candles until the NEXT
+//!   boot's catch-up; the 15:40 IST tf-verify (Blind/mismatch) is the
+//!   pager for that window. A bar dated AFTER the wall-clock IST today
+//!   NEVER rolls the live day forward (the BOUNDARY-01 future-skew class —
+//!   dropped + counted, `reason="future_dated"`); with no current day yet
+//!   (failed/empty catch-up) only a TODAY-dated first bar is adopted — a
+//!   past-dated first bar routes to the past-day queue (a 1-bar adopted
+//!   refold would force-seal + DEDUP-clobber a previously-correct closed
+//!   day). Only a repair for a PAST day (the day-map has already rolled)
+//!   takes the bounded `/exec` refold path — it emits corrected CLOSED-day
+//!   seals only and NEVER touches a live engine (kills the round-2
+//!   midnight-clobber class: "today" is the ENGINE's current day, never
+//!   rolled past the wall clock). The remaining same-session WAL-apply
+//!   visibility lag applies ONLY to that past-day cold path, where it is
+//!   gated by the trigger-minute presence check + bounded requeue.
 //! - Boot catch-up: re-folds the last `catchup_days` (default 35) of
 //!   `spot_1m_rest` per feed through the same engines — past days
 //!   force-sealed, today's partials stay open for live continuation. Days
@@ -267,7 +281,8 @@ pub fn send_confirmed_bars(bars: &[ConfirmedBar]) {
             reason = "channel_full",
             dropped = dropped_full,
             "rest_candle_fold: confirmed-bar handoff channel FULL — bars dropped; \
-             the boot catch-up / dirty-day refold re-derives them from spot_1m_rest"
+             a dropped bar never enters the day-map, so the NEXT boot's catch-up \
+             re-derives it from spot_1m_rest (DEDUP-idempotent)"
         );
     }
     if dropped_closed > 0 {
@@ -582,8 +597,10 @@ pub fn refold_from_day_map(
     (engine, sealed)
 }
 
-/// What [`SidDayFold::apply_live_bar`] did with a bar (the live loop's
-/// dispatch surface — test-visible).
+/// What [`SidDayFold::apply_live_bar`] did with a bar (the single-bar
+/// dispatch surface — test-visible; the production loop drains bursts
+/// through [`apply_bar_batch`], which defers repairs and refolds each
+/// dirty slot ONCE per batch — round-3).
 #[derive(Debug)]
 pub enum LiveBarAction {
     /// In-order bar folded (includes the first bar of a NEW trading day,
@@ -595,22 +612,55 @@ pub enum LiveBarAction {
     /// engine was swapped; every bucket the refold closed is re-emitted
     /// (DEDUP-idempotent).
     Refolded(Vec<SealedBucket>),
-    /// Byte-identical redelivery of a bar already in the day-map — nothing
-    /// new to derive; counted, never refolded.
+    /// Value-identical redelivery of a bar already in the day-map
+    /// (`PartialEq` compare — a NaN field compares unequal and falls
+    /// through to a harmless idempotent refold) — nothing new to derive;
+    /// counted, never refolded.
     DuplicateNoop,
-    /// The bar belongs to a day OLDER than the engine's current day — the
-    /// caller queues the bounded PAST-day `/exec` refold (which never
+    /// The bar belongs to a day OLDER than the engine's current day (or,
+    /// round-3 LOW: a PAST-dated first bar while no current day exists) —
+    /// the caller queues the bounded PAST-day `/exec` refold (which never
     /// touches live engines).
     PastDay,
+    /// Round-3 (the BOUNDARY-01 future-skew class): the bar's IST date is
+    /// AFTER the wall-clock IST today — it must NEVER roll the live day
+    /// forward; dropped + counted (`reason="future_dated"`).
+    FutureDated,
     /// Outside [09:15, 15:30) IST (or an unrepresentable timestamp) —
     /// skipped + counted.
     OutOfSession,
 }
 
+/// Batch-mode dispatch (round-3 repair-burst coalescing): identical to
+/// [`LiveBarAction`] except a current-day repair is ABSORBED into the
+/// day-map and DEFERRED — the caller refolds each dirty slot ONCE per
+/// drained batch via [`SidDayFold::refold_current_day`], so a
+/// mid-day-outage sweep of N repairs costs one refold per slot, never N.
+#[derive(Debug)]
+pub enum DeferredBarAction {
+    /// In-order bar folded; seals ready to emit.
+    Folded(Vec<SealedBucket>),
+    /// Current-day repair (out-of-order minute or value-UPDATE) landed in
+    /// the day-map WITHOUT refolding — the slot is DIRTY; the caller
+    /// refolds it once at batch end.
+    RepairDeferred,
+    /// Value-identical redelivery (`PartialEq`; NaN-unequal falls through
+    /// to a harmless idempotent refold) — counted no-op.
+    DuplicateNoop,
+    /// Routes to the caller's bounded PAST-day `/exec` queue.
+    PastDay,
+    /// Future-dated (after the wall-clock IST today) — dropped + counted.
+    FutureDated,
+    /// Outside the session window — skipped + counted.
+    OutOfSession,
+}
+
 /// Per-(feed, sid, segment) LIVE state: the fold engine plus the current
-/// trading day's in-RAM bar map — the lossless refold source (round-2
-/// HIGH: today repairs never read QuestDB, so the ILP-ACK → `/exec`
-/// WAL-apply visibility lag cannot corrupt live buckets).
+/// trading day's in-RAM bar map — the lossless refold source for bars
+/// received in-process THIS INCARNATION (round-2 HIGH: today repairs
+/// never read QuestDB, so the ILP-ACK → `/exec` WAL-apply visibility lag
+/// cannot corrupt live buckets; the boot TODAY seed IS an `/exec` read —
+/// see the module doc's crash-restart residual, round-3).
 #[derive(Debug)]
 pub struct SidDayFold {
     pub engine: SidFoldState,
@@ -661,25 +711,40 @@ impl SidDayFold {
         self.current_day
     }
 
-    /// Applies one live confirmed bar (round-2 HIGH structural fix):
-    /// in-order bars fold into the live engine AND land in the day-map;
-    /// current-day repairs (out-of-order OR value-update) refold the whole
-    /// day from the map synchronously; a NEW day's first bar rolls the map
-    /// (the engine transition-seals the old day's residue exactly as
-    /// before); a PAST-day bar is routed to the bounded `/exec` path.
-    pub fn apply_live_bar(&mut self, bar: &ConfirmedBar) -> LiveBarAction {
+    /// Applies one live confirmed bar via the DEFERRED path (round-3
+    /// repair-burst coalescing): in-order bars fold into the live engine
+    /// AND land in the day-map; a current-day repair (out-of-order OR
+    /// value-update) is ABSORBED into the day-map and returned as
+    /// [`DeferredBarAction::RepairDeferred`] WITHOUT refolding — the
+    /// caller refolds each dirty slot ONCE per drained batch. A NEW day's
+    /// first bar rolls the map ONLY when `bar_date <= today` (round-3
+    /// future-skew clamp); a PAST-day bar routes to the bounded `/exec`
+    /// path. `today` is the wall-clock IST date the caller sampled.
+    pub fn apply_live_bar_deferred(
+        &mut self,
+        bar: &ConfirmedBar,
+        today: NaiveDate,
+    ) -> DeferredBarAction {
         let Ok(minute_secs) = u32::try_from(bar.minute_ts_ist_nanos / 1_000_000_000) else {
-            return LiveBarAction::OutOfSession;
+            return DeferredBarAction::OutOfSession;
         };
         if !in_session(minute_secs) {
-            return LiveBarAction::OutOfSession;
+            return DeferredBarAction::OutOfSession;
         }
         let Some(bar_date) = ist_date_of_nanos(bar.minute_ts_ist_nanos) else {
-            return LiveBarAction::OutOfSession;
+            return DeferredBarAction::OutOfSession;
         };
         match self.current_day {
-            Some(day) if bar_date < day => return LiveBarAction::PastDay,
+            Some(day) if bar_date < day => return DeferredBarAction::PastDay,
             Some(day) if bar_date > day => {
+                // Round-3 (the BOUNDARY-01 future-skew class): roll ONLY
+                // when bar_date <= the wall-clock IST today — a
+                // future-dated bar must never roll the live day forward
+                // (it would clear the real day's map and mis-home every
+                // later real bar).
+                if bar_date > today {
+                    return DeferredBarAction::FutureDated;
+                }
                 // Day roll: the fold below transition-seals every previous
                 // day's open bucket (a later-day minute is always > the
                 // watermark, so this bar folds in-order); the map restarts
@@ -687,32 +752,169 @@ impl SidDayFold {
                 self.day_map.clear();
                 self.current_day = Some(bar_date);
             }
-            None => self.current_day = Some(bar_date),
+            None => {
+                // Round-3 LOW: with no current day (failed/empty boot
+                // catch-up) adopt ONLY the wall-clock IST today. A
+                // PAST-dated first bar routes to the past-day `/exec`
+                // queue — adopting it would let a later 1-bar refold
+                // force-seal and DEDUP-clobber a previously-correct
+                // closed day; a FUTURE-dated first bar is dropped.
+                if bar_date > today {
+                    return DeferredBarAction::FutureDated;
+                }
+                if bar_date < today {
+                    return DeferredBarAction::PastDay;
+                }
+                self.current_day = Some(bar_date);
+            }
             Some(_) => {}
         }
         match self.engine.fold_bar(bar) {
             FoldOutcome::Folded(sealed) => {
                 self.day_map.insert(minute_secs, *bar);
-                LiveBarAction::Folded(sealed)
+                DeferredBarAction::Folded(sealed)
             }
             FoldOutcome::OutOfOrder => {
                 if self.day_map.get(&minute_secs) == Some(bar) {
-                    return LiveBarAction::DuplicateNoop;
+                    return DeferredBarAction::DuplicateNoop;
                 }
                 self.day_map.insert(minute_secs, *bar);
-                let (engine, sealed) = refold_from_day_map(
-                    self.engine.feed,
-                    self.engine.security_id,
-                    self.engine.exchange_segment_code,
-                    &self.day_map,
-                );
-                self.engine = engine;
-                LiveBarAction::Refolded(sealed)
+                DeferredBarAction::RepairDeferred
             }
             // Unreachable (session-checked above) — defensive.
-            FoldOutcome::OutOfSession => LiveBarAction::OutOfSession,
+            FoldOutcome::OutOfSession => DeferredBarAction::OutOfSession,
         }
     }
+
+    /// Refolds the WHOLE current day from the in-RAM day-map through a
+    /// fresh engine and swaps it live, returning every bucket the refold
+    /// closed (re-emitted DEDUP-idempotently). Round-3: called ONCE per
+    /// dirty slot per drained batch — never per repair bar.
+    pub fn refold_current_day(&mut self) -> Vec<SealedBucket> {
+        let (engine, sealed) = refold_from_day_map(
+            self.engine.feed,
+            self.engine.security_id,
+            self.engine.exchange_segment_code,
+            &self.day_map,
+        );
+        self.engine = engine;
+        sealed
+    }
+
+    /// Single-bar convenience surface (round-2 semantics preserved): a
+    /// current-day repair refolds IMMEDIATELY. The production loop uses
+    /// [`apply_bar_batch`] instead, which defers repairs and refolds each
+    /// dirty slot once per drained batch (round-3).
+    pub fn apply_live_bar(&mut self, bar: &ConfirmedBar, today: NaiveDate) -> LiveBarAction {
+        match self.apply_live_bar_deferred(bar, today) {
+            DeferredBarAction::Folded(sealed) => LiveBarAction::Folded(sealed),
+            DeferredBarAction::RepairDeferred => LiveBarAction::Refolded(self.refold_current_day()),
+            DeferredBarAction::DuplicateNoop => LiveBarAction::DuplicateNoop,
+            DeferredBarAction::PastDay => LiveBarAction::PastDay,
+            DeferredBarAction::FutureDated => LiveBarAction::FutureDated,
+            DeferredBarAction::OutOfSession => LiveBarAction::OutOfSession,
+        }
+    }
+}
+
+/// Finds or creates the (feed, sid, segment) live slot.
+fn slot_mut(
+    engines: &mut Vec<SidDayFold>,
+    feed: Feed,
+    security_id: SecurityId,
+    segment_code: u8,
+) -> &mut SidDayFold {
+    if let Some(pos) = engines.iter().position(|s| {
+        s.engine.feed == feed
+            && s.engine.security_id == security_id
+            && s.engine.exchange_segment_code == segment_code
+    }) {
+        return &mut engines[pos];
+    }
+    engines.push(SidDayFold::new(feed, security_id, segment_code));
+    let last = engines.len() - 1;
+    &mut engines[last]
+}
+
+/// One per-slot seal emission produced by [`apply_bar_batch`].
+#[derive(Debug)]
+pub struct BatchEmission {
+    pub feed: Feed,
+    pub security_id: SecurityId,
+    pub segment_code: u8,
+    pub sealed: Vec<SealedBucket>,
+    /// True when this group is a dirty-slot batch refold (counted once
+    /// per slot per batch under `tv_rest_candle_fold_day_refolds_total`).
+    pub is_refold: bool,
+}
+
+/// Outcome of applying one drained bar batch (round-3 burst coalescing).
+#[derive(Debug, Default)]
+pub struct BatchOutcome {
+    /// Ordered emissions: in-order folds per bar, then EXACTLY ONE refold
+    /// group per dirty slot.
+    pub emissions: Vec<BatchEmission>,
+    /// PAST-day bars for the caller's bounded `/exec` dirty queue.
+    pub past_day: Vec<ConfirmedBar>,
+    pub duplicates: u64,
+    pub out_of_session: u64,
+    /// Round-3: future-dated drops (a bar dated after the wall-clock IST
+    /// today never rolls the live day forward).
+    pub future_dated: u64,
+}
+
+/// Applies one drained batch of confirmed bars (round-3 repair-burst
+/// coalescing): every bar lands in its slot via the DEFERRED path, then
+/// each slot that took a current-day repair is refolded ONCE — a
+/// mid-day-outage sweep delivering N out-of-order repairs costs one
+/// full-day refold per slot instead of N. In-order seals emitted before a
+/// same-slot repair may momentarily carry pre-repair values; the
+/// batch-end refold re-emits them corrected (DEDUP UPSERT heals in place).
+pub fn apply_bar_batch(
+    engines: &mut Vec<SidDayFold>,
+    batch: &[ConfirmedBar],
+    today: NaiveDate,
+) -> BatchOutcome {
+    let mut out = BatchOutcome::default();
+    let mut dirty: Vec<(Feed, SecurityId, u8)> = Vec::new();
+    for bar in batch {
+        let slot = slot_mut(
+            engines,
+            bar.feed,
+            bar.security_id,
+            bar.exchange_segment_code,
+        );
+        match slot.apply_live_bar_deferred(bar, today) {
+            DeferredBarAction::Folded(sealed) => out.emissions.push(BatchEmission {
+                feed: bar.feed,
+                security_id: bar.security_id,
+                segment_code: bar.exchange_segment_code,
+                sealed,
+                is_refold: false,
+            }),
+            DeferredBarAction::RepairDeferred => {
+                let key = (bar.feed, bar.security_id, bar.exchange_segment_code);
+                if !dirty.contains(&key) {
+                    dirty.push(key);
+                }
+            }
+            DeferredBarAction::DuplicateNoop => out.duplicates += 1,
+            DeferredBarAction::PastDay => out.past_day.push(*bar),
+            DeferredBarAction::FutureDated => out.future_dated += 1,
+            DeferredBarAction::OutOfSession => out.out_of_session += 1,
+        }
+    }
+    for (feed, security_id, segment_code) in dirty {
+        let slot = slot_mut(engines, feed, security_id, segment_code);
+        out.emissions.push(BatchEmission {
+            feed,
+            security_id,
+            segment_code,
+            sealed: slot.refold_current_day(),
+            is_refold: true,
+        });
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -927,6 +1129,14 @@ impl FoldReceiverGuard {
             None => None,
         }
     }
+
+    /// Non-blocking drain of the next queued bar (round-3 burst batching:
+    /// the loop drains everything that arrived with the blocking recv so
+    /// a repair burst coalesces into one refold per slot). `None` = empty
+    /// OR closed (the next blocking `recv` reports the close).
+    pub fn try_recv(&mut self) -> Option<ConfirmedBar> {
+        self.receiver.as_mut()?.try_recv().ok()
+    }
 }
 
 impl Drop for FoldReceiverGuard {
@@ -976,28 +1186,11 @@ struct FoldRuntime {
     exec_url: String,
 }
 
-impl FoldRuntime {
-    fn day_fold_mut(
-        &mut self,
-        feed: Feed,
-        security_id: SecurityId,
-        segment_code: u8,
-    ) -> &mut SidDayFold {
-        if let Some(pos) = self.engines.iter().position(|s| {
-            s.engine.feed == feed
-                && s.engine.security_id == security_id
-                && s.engine.exchange_segment_code == segment_code
-        }) {
-            return &mut self.engines[pos];
-        }
-        self.engines
-            .push(SidDayFold::new(feed, security_id, segment_code));
-        let last = self.engines.len() - 1;
-        &mut self.engines[last]
-    }
-}
-
 /// Emits sealed buckets into the global seal channel; counts drops loudly.
+/// Round-3 LOW: a CLOSED channel (seal-writer gone — shutdown/teardown) is
+/// a DISTINCT condition from backpressure and is labeled
+/// `reason="seal_channel_closed"`, never conflated with
+/// `seal_channel_full` (consistent with the paced path).
 fn emit_seals(feed: Feed, security_id: SecurityId, segment_code: u8, sealed: &[SealedBucket]) {
     if sealed.is_empty() {
         return;
@@ -1015,30 +1208,46 @@ fn emit_seals(feed: Feed, security_id: SecurityId, segment_code: u8, sealed: &[S
         );
         return;
     };
-    let mut dropped = 0usize;
+    let mut dropped_full = 0usize;
+    let mut dropped_closed = 0usize;
     for s in sealed {
         let seal = sealed_bucket_to_seal(feed, security_id, segment_code, s);
-        if sender.try_send(seal).is_err() {
-            dropped += 1;
+        match sender.try_send(seal) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => dropped_full += 1,
+            Err(mpsc::error::TrySendError::Closed(_)) => dropped_closed += 1,
         }
     }
-    let delivered = sealed.len() - dropped;
+    let delivered = sealed.len() - dropped_full - dropped_closed;
     if delivered > 0 {
         counter!("tv_rest_candle_fold_seals_total", "feed" => feed.as_str())
             .increment(delivered as u64);
     }
-    if dropped > 0 {
+    if dropped_full > 0 {
         counter!("tv_rest_candle_fold_dropped_total", "reason" => "seal_channel_full")
-            .increment(dropped as u64);
+            .increment(dropped_full as u64);
         error!(
             code = ErrorCode::RestCandleFold01Degraded.code_str(),
             stage = "seal_send",
             reason = "seal_channel_full",
-            dropped,
+            dropped = dropped_full,
             "rest_candle_fold: seal-writer channel refused live seals — dropped; \
              the affected buckets stay underived THIS session unless a dirty \
              refold re-covers that day — otherwise only the NEXT boot's catch-up \
              re-derives them (DEDUP-idempotent)"
+        );
+    }
+    if dropped_closed > 0 {
+        counter!("tv_rest_candle_fold_dropped_total", "reason" => "seal_channel_closed")
+            .increment(dropped_closed as u64);
+        error!(
+            code = ErrorCode::RestCandleFold01Degraded.code_str(),
+            stage = "seal_send",
+            reason = "seal_channel_closed",
+            dropped = dropped_closed,
+            "rest_candle_fold: seal-writer channel CLOSED (shutdown/teardown) — \
+             live seals dropped; the NEXT boot's catch-up re-derives them \
+             (DEDUP-idempotent)"
         );
     }
 }
@@ -1095,7 +1304,8 @@ async fn emit_seals_paced(
         );
         return;
     };
-    let mut dropped = 0usize;
+    let mut dropped_full = 0usize;
+    let mut dropped_closed = 0usize;
     let mut delivered = 0usize;
     'seals: for s in sealed {
         let mut seal = sealed_bucket_to_seal(feed, security_id, segment_code, s);
@@ -1110,7 +1320,9 @@ async fn emit_seals_paced(
                     // EVERY remaining seal in this slice is undeliverable:
                     // count them ALL as dropped (round-2 LOW-1 — the old
                     // `dropped += 1` under-counted the abandoned tail).
-                    dropped = sealed.len() - delivered;
+                    // Round-3 LOW: labeled `seal_channel_closed`, distinct
+                    // from the budget-exhausted backpressure drops.
+                    dropped_closed = sealed.len() - delivered - dropped_full;
                     break 'seals;
                 }
                 Err(mpsc::error::TrySendError::Full(returned)) => {
@@ -1122,7 +1334,7 @@ async fn emit_seals_paced(
                             seal = returned;
                         }
                         PaceAction::GiveUp => {
-                            dropped += 1;
+                            dropped_full += 1;
                             break;
                         }
                     }
@@ -1134,19 +1346,32 @@ async fn emit_seals_paced(
         counter!("tv_rest_candle_fold_seals_total", "feed" => feed.as_str())
             .increment(delivered as u64);
     }
-    if dropped > 0 {
+    if dropped_full > 0 {
         counter!("tv_rest_candle_fold_dropped_total", "reason" => "seal_channel_full")
-            .increment(dropped as u64);
+            .increment(dropped_full as u64);
         error!(
             code = ErrorCode::RestCandleFold01Degraded.code_str(),
             stage = "seal_send",
             reason = "seal_channel_full",
-            dropped,
+            dropped = dropped_full,
             waited_ms = *waited_ms,
             "rest_candle_fold: seal-writer channel still refused seals after the \
              per-day paced-wait budget — dropped; the affected day's candles \
              remain UNDERIVED until a later dirty refold or the next boot's \
              catch-up re-runs (nothing re-derives them automatically this pass)"
+        );
+    }
+    if dropped_closed > 0 {
+        counter!("tv_rest_candle_fold_dropped_total", "reason" => "seal_channel_closed")
+            .increment(dropped_closed as u64);
+        error!(
+            code = ErrorCode::RestCandleFold01Degraded.code_str(),
+            stage = "seal_send",
+            reason = "seal_channel_closed",
+            dropped = dropped_closed,
+            "rest_candle_fold: seal-writer channel CLOSED during paced catch-up \
+             emission (shutdown) — the remaining seals of this slice were \
+             dropped; the NEXT boot's catch-up re-derives them (DEDUP-idempotent)"
         );
     }
 }
@@ -1651,58 +1876,96 @@ pub async fn run_rest_candle_fold(params: RestCandleFoldParams) {
             .map(|since| since + Duration::from_secs(FOLD_REFOLD_DEBOUNCE_SECS));
         tokio::select! {
             maybe_bar = receiver_guard.recv() => {
-                let Some(bar) = maybe_bar else {
+                let Some(first) = maybe_bar else {
                     // Every sender dropped — the OnceLock sender keeps one
                     // alive for the process lifetime, so this is shutdown.
                     info!("rest_candle_fold: bar channel closed — exiting");
                     return;
                 };
-                let feed = bar.feed;
-                let sid = bar.security_id;
-                let seg = bar.exchange_segment_code;
-                let action = runtime.day_fold_mut(feed, sid, seg).apply_live_bar(&bar);
-                match action {
-                    LiveBarAction::Folded(sealed) => {
-                        emit_seals(feed, sid, seg, &sealed);
-                    }
-                    LiveBarAction::Refolded(sealed) => {
+                // Round-3 (repair-burst coalescing): drain everything that
+                // arrived with this bar in ONE batch — a mid-day-outage
+                // sweep delivering N out-of-order repairs then costs one
+                // full-day refold per dirty slot instead of N. Bounded by
+                // the handoff channel capacity.
+                let mut batch = vec![first]; // O(1) EXEMPT: cold-path bounded drain
+                while let Some(more) = receiver_guard.try_recv() {
+                    batch.push(more);
+                }
+                let outcome = apply_bar_batch(&mut runtime.engines, &batch, today_ist());
+                for emission in &outcome.emissions {
+                    if emission.is_refold {
                         // Round-2 HIGH: a current-day repair refolded the
                         // whole day from the in-RAM day-map (lossless — no
                         // /exec, no WAL race); re-emit every closed bucket
-                        // (DEDUP UPSERT heals in place).
-                        counter!("tv_rest_candle_fold_day_refolds_total", "feed" => feed.as_str())
-                            .increment(1);
-                        emit_seals(feed, sid, seg, &sealed);
-                    }
-                    LiveBarAction::DuplicateNoop => {
-                        counter!("tv_rest_candle_fold_duplicate_bars_total").increment(1);
-                    }
-                    LiveBarAction::PastDay => {
-                        if let Some(date) = ist_date_of_nanos(bar.minute_ts_ist_nanos) {
-                            // M2: keep the NEWEST triggering minute — the
-                            // PAST-day refold must SEE that row before
-                            // re-emitting (the only residual WAL-lag gate).
-                            let key = (feed_ordinal(feed), sid, seg, date);
-                            let entry = runtime.dirty.entry(key).or_insert(DirtyMark {
-                                required_minute_nanos: bar.minute_ts_ist_nanos,
-                                attempts: 0,
-                            });
-                            entry.required_minute_nanos = entry
-                                .required_minute_nanos
-                                .max(bar.minute_ts_ist_nanos);
-                            if runtime.dirty_since.is_none() {
-                                runtime.dirty_since = Some(tokio::time::Instant::now());
-                            }
-                            counter!("tv_rest_candle_fold_refold_queued_total")
-                                .increment(1);
-                        }
-                    }
-                    LiveBarAction::OutOfSession => {
+                        // (DEDUP UPSERT heals in place). Round-3: one
+                        // refold per dirty slot per drained batch.
                         counter!(
-                            "tv_rest_candle_fold_dropped_total",
-                            "reason" => "out_of_session"
+                            "tv_rest_candle_fold_day_refolds_total",
+                            "feed" => emission.feed.as_str()
                         )
                         .increment(1);
+                    }
+                    emit_seals(
+                        emission.feed,
+                        emission.security_id,
+                        emission.segment_code,
+                        &emission.sealed,
+                    );
+                }
+                if outcome.duplicates > 0 {
+                    counter!("tv_rest_candle_fold_duplicate_bars_total")
+                        .increment(outcome.duplicates);
+                }
+                if outcome.out_of_session > 0 {
+                    counter!(
+                        "tv_rest_candle_fold_dropped_total",
+                        "reason" => "out_of_session"
+                    )
+                    .increment(outcome.out_of_session);
+                }
+                if outcome.future_dated > 0 {
+                    // Round-3 (the BOUNDARY-01 future-skew class): counted
+                    // per bar, ONE coalesced coded error per drained batch
+                    // that carried future-dated bars (≤1/minute at the
+                    // legs' fire cadence — never per-bar spam).
+                    counter!(
+                        "tv_rest_candle_fold_dropped_total",
+                        "reason" => "future_dated"
+                    )
+                    .increment(outcome.future_dated);
+                    error!(
+                        code = ErrorCode::RestCandleFold01Degraded.code_str(),
+                        stage = "future_dated",
+                        dropped = outcome.future_dated,
+                        "rest_candle_fold: future-dated bar(s) dropped — a bar \
+                         whose IST date is AFTER the wall-clock IST today can \
+                         never roll the live day forward (the BOUNDARY-01 \
+                         future-skew class); counted under reason=future_dated"
+                    );
+                }
+                for bar in &outcome.past_day {
+                    if let Some(date) = ist_date_of_nanos(bar.minute_ts_ist_nanos) {
+                        // M2: keep the NEWEST triggering minute — the
+                        // PAST-day refold must SEE that row before
+                        // re-emitting (the only residual WAL-lag gate).
+                        let key = (
+                            feed_ordinal(bar.feed),
+                            bar.security_id,
+                            bar.exchange_segment_code,
+                            date,
+                        );
+                        let entry = runtime.dirty.entry(key).or_insert(DirtyMark {
+                            required_minute_nanos: bar.minute_ts_ist_nanos,
+                            attempts: 0,
+                        });
+                        entry.required_minute_nanos = entry
+                            .required_minute_nanos
+                            .max(bar.minute_ts_ist_nanos);
+                        if runtime.dirty_since.is_none() {
+                            runtime.dirty_since = Some(tokio::time::Instant::now());
+                        }
+                        counter!("tv_rest_candle_fold_refold_queued_total")
+                            .increment(1);
                     }
                 }
             }
@@ -2335,10 +2598,26 @@ mod tests {
         }
     }
 
-    fn apply_all(state: &mut SidDayFold, bars: &[ConfirmedBar]) -> Vec<SealedBucket> {
+    /// The IST trading date of the synthetic DAY0 test day.
+    fn day0_date() -> NaiveDate {
+        ist_date_of_nanos(i64::from(OPEN) * 1_000_000_000).expect("day0 date")
+    }
+
+    /// The day after [`day0_date`] (the `next_day_bar_at` day).
+    fn day1_date() -> NaiveDate {
+        day0_date()
+            .checked_add_days(chrono::Days::new(1))
+            .expect("day1 date")
+    }
+
+    fn apply_all(
+        state: &mut SidDayFold,
+        bars: &[ConfirmedBar],
+        today: NaiveDate,
+    ) -> Vec<SealedBucket> {
         let mut out = Vec::new();
         for bar in bars {
-            match state.apply_live_bar(bar) {
+            match state.apply_live_bar(bar, today) {
                 LiveBarAction::Folded(sealed) | LiveBarAction::Refolded(sealed) => {
                     out.extend(sealed);
                 }
@@ -2363,12 +2642,13 @@ mod tests {
             })
             .collect();
         let mut state = SidDayFold::new(Feed::Dhan, 13, 0);
-        apply_all(&mut state, &bars);
+        apply_all(&mut state, &bars, day0_date());
         assert_eq!(state.day_map_len(), 60);
 
         // Repair minute 10 with NEW values (same minute — a value UPDATE).
         let repair = bar_at(10, 500.0, 600.0, 50.0, 550.0, 99);
-        let LiveBarAction::Refolded(refolded_seals) = state.apply_live_bar(&repair) else {
+        let LiveBarAction::Refolded(refolded_seals) = state.apply_live_bar(&repair, day0_date())
+        else {
             panic!("a current-day value-update must REFOLD from the day-map");
         };
         bars[10] = repair;
@@ -2407,8 +2687,8 @@ mod tests {
         let late = with_gap.remove(3);
 
         let mut state = SidDayFold::new(Feed::Groww, 25, 0);
-        apply_all(&mut state, &with_gap);
-        let LiveBarAction::Refolded(_) = state.apply_live_bar(&late) else {
+        apply_all(&mut state, &with_gap, day0_date());
+        let LiveBarAction::Refolded(_) = state.apply_live_bar(&late, day0_date()) else {
             panic!("a late previously-missing minute must refold");
         };
         let mut reference = SidFoldState::new(Feed::Groww, 25, 0);
@@ -2423,7 +2703,7 @@ mod tests {
         assert_eq!(state.day_map_len(), 0);
         assert_eq!(state.current_day(), None);
         assert!(matches!(
-            state.apply_live_bar(&bar_at(0, 1.0, 1.0, 1.0, 1.0, 1)),
+            state.apply_live_bar(&bar_at(0, 1.0, 1.0, 1.0, 1.0, 1), day0_date()),
             LiveBarAction::Folded(_)
         ));
         assert_eq!(state.day_map_len(), 1);
@@ -2435,12 +2715,14 @@ mod tests {
         let mut state = SidDayFold::new(Feed::Dhan, 13, 0);
         let bar = bar_at(0, 1.0, 2.0, 0.5, 1.5, 7);
         assert!(matches!(
-            state.apply_live_bar(&bar),
+            state.apply_live_bar(&bar, day0_date()),
             LiveBarAction::Folded(_)
         ));
-        // Byte-identical redelivery: nothing new — no refold, no re-emit.
+        // Value-identical redelivery (PartialEq — a NaN field compares
+        // unequal and falls through to a harmless idempotent refold):
+        // nothing new — no refold, no re-emit.
         assert!(matches!(
-            state.apply_live_bar(&bar),
+            state.apply_live_bar(&bar, day0_date()),
             LiveBarAction::DuplicateNoop
         ));
         assert_eq!(state.day_map_len(), 1);
@@ -2449,14 +2731,15 @@ mod tests {
     #[test]
     fn test_apply_live_bar_day_roll_clears_day_map_and_seals_residue() {
         let mut state = SidDayFold::new(Feed::Dhan, 13, 0);
-        apply_all(&mut state, &[bar_at(0, 1.0, 1.0, 1.0, 1.0, 1)]);
+        apply_all(&mut state, &[bar_at(0, 1.0, 1.0, 1.0, 1.0, 1)], day0_date());
         let day0 = state.current_day().expect("day set");
         assert_eq!(state.day_map_len(), 1);
 
         // First bar of the NEXT trading day: the fold transition-seals the
-        // old day's residue (incl. its D1) and the map restarts.
+        // old day's residue (incl. its D1) and the map restarts. Today has
+        // reached day1, so the roll is legal (round-3 clamp).
         let LiveBarAction::Folded(sealed) =
-            state.apply_live_bar(&next_day_bar_at(0, 2.0, 2.0, 2.0, 2.0, 1))
+            state.apply_live_bar(&next_day_bar_at(0, 2.0, 2.0, 2.0, 2.0, 1), day1_date())
         else {
             panic!("a new day's first bar folds in-order");
         };
@@ -2481,13 +2764,17 @@ mod tests {
         // the live engine or the day-map — the caller queues the bounded
         // /exec past-day refold instead.
         let mut state = SidDayFold::new(Feed::Dhan, 13, 0);
-        apply_all(&mut state, &[next_day_bar_at(5, 2.0, 2.0, 2.0, 2.0, 1)]);
+        apply_all(
+            &mut state,
+            &[next_day_bar_at(5, 2.0, 2.0, 2.0, 2.0, 1)],
+            day1_date(),
+        );
         assert_eq!(state.day_map_len(), 1);
         let open_before = state.engine.open_bucket_count();
 
         let yesterday_repair = bar_at(374, 9.0, 9.0, 9.0, 9.0, 1);
         assert!(matches!(
-            state.apply_live_bar(&yesterday_repair),
+            state.apply_live_bar(&yesterday_repair, day1_date()),
             LiveBarAction::PastDay
         ));
         assert_eq!(
@@ -2498,7 +2785,7 @@ mod tests {
         assert_eq!(state.engine.open_bucket_count(), open_before);
         // The live engine still folds the current day normally afterwards.
         assert!(matches!(
-            state.apply_live_bar(&next_day_bar_at(6, 3.0, 3.0, 3.0, 3.0, 1)),
+            state.apply_live_bar(&next_day_bar_at(6, 3.0, 3.0, 3.0, 3.0, 1), day1_date()),
             LiveBarAction::Folded(_)
         ));
     }
@@ -2521,7 +2808,7 @@ mod tests {
         // Repair a pre-restart minute — the refold must include ALL
         // seeded bars plus the repair.
         let repair = bar_at(4, 500.0, 900.0, 1.0, 450.0, 3);
-        let LiveBarAction::Refolded(_) = state.apply_live_bar(&repair) else {
+        let LiveBarAction::Refolded(_) = state.apply_live_bar(&repair, day) else {
             panic!("seeded state must refold current-day repairs");
         };
         let mut updated = bars.clone();
@@ -2568,5 +2855,171 @@ mod tests {
         assert_eq!(rows[0].volume, 20, "scientific-notation float volume");
         assert_eq!(rows[1].volume, 11, "fractional float rounds");
         assert_eq!(rows[2].volume, 0, "non-numeric degrades to 0, row kept");
+    }
+
+    // -----------------------------------------------------------------
+    // Round-3: repair-burst coalescing + future-date clamp + None-day arms
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn test_apply_bar_batch_repair_burst_coalesces_into_one_refold_per_slot() {
+        // Round-3 MEDIUM: 40 out-of-order repairs delivered as ONE drained
+        // batch must trigger exactly ONE refold for the slot (one refold
+        // emission — one refold's worth of re-emitted seals), with values
+        // exact vs a fresh in-order fold over the updated bar set.
+        let today = day0_date();
+        let mut bars: Vec<ConfirmedBar> = (0..60)
+            .map(|i| {
+                let base = 100.0 + f64::from(i);
+                bar_at(i, base, base + 1.0, base - 1.0, base + 0.5, 5)
+            })
+            .collect();
+        let mut engines: Vec<SidDayFold> = Vec::new();
+        let seed = apply_bar_batch(&mut engines, &bars, today);
+        assert!(
+            seed.emissions.iter().all(|e| !e.is_refold),
+            "in-order seeding must not refold"
+        );
+        assert_eq!(engines.len(), 1);
+
+        // 40 out-of-order repairs (minutes 0..40, NEW values), one batch.
+        let repairs: Vec<ConfirmedBar> = (0..40)
+            .map(|i| bar_at(i, 500.0 + f64::from(i), 600.0, 50.0, 550.0, 9))
+            .collect();
+        for (i, repair) in repairs.iter().enumerate() {
+            bars[i] = *repair;
+        }
+        let outcome = apply_bar_batch(&mut engines, &repairs, today);
+        let refolds: Vec<&BatchEmission> =
+            outcome.emissions.iter().filter(|e| e.is_refold).collect();
+        assert_eq!(
+            refolds.len(),
+            1,
+            "40 repairs in one batch must coalesce into ONE refold"
+        );
+        assert!(
+            outcome.emissions.iter().all(|e| e.is_refold),
+            "repairs must produce no in-order emissions"
+        );
+        // Exactly one refold's worth of re-emitted seals — value-exact vs
+        // a fresh in-order fold over the UPDATED bar set.
+        let mut reference = SidFoldState::new(Feed::Dhan, 13, 0);
+        let reference_seals = fold_all(&mut reference, &bars);
+        assert_eq!(refolds[0].sealed, reference_seals);
+        assert_eq!(
+            engines[0].engine.force_seal_open(),
+            reference.force_seal_open(),
+            "the swapped live engine must equal the reference engine"
+        );
+    }
+
+    #[test]
+    fn test_apply_live_bar_deferred_and_refold_current_day() {
+        // Round-3 primitives: a deferred repair updates the day-map WITHOUT
+        // refolding; refold_current_day then rebuilds once, exactly.
+        let today = day0_date();
+        let bars: Vec<ConfirmedBar> = (0..5)
+            .map(|i| bar_at(i, 10.0, 11.0, 9.0, 10.5, 1))
+            .collect();
+        let mut state = SidDayFold::new(Feed::Dhan, 13, 0);
+        apply_all(&mut state, &bars, today);
+
+        let repair = bar_at(1, 500.0, 600.0, 50.0, 550.0, 9);
+        assert!(matches!(
+            state.apply_live_bar_deferred(&repair, today),
+            DeferredBarAction::RepairDeferred
+        ));
+        assert_eq!(state.day_map_len(), 5, "repair landed in the map only");
+
+        let sealed = state.refold_current_day();
+        let mut updated = bars.clone();
+        updated[1] = repair;
+        let mut reference = SidFoldState::new(Feed::Dhan, 13, 0);
+        let reference_seals = fold_all(&mut reference, &updated);
+        assert_eq!(sealed, reference_seals);
+        assert_eq!(state.engine.force_seal_open(), reference.force_seal_open());
+    }
+
+    #[test]
+    fn test_apply_live_bar_future_dated_never_rolls_day() {
+        // Round-3 (BOUNDARY-01 future-skew class): a bar dated AFTER the
+        // wall-clock IST today neither rolls the day nor folds; real
+        // current-day bars keep working after it.
+        let today = day0_date();
+        let mut state = SidDayFold::new(Feed::Dhan, 13, 0);
+        apply_all(&mut state, &[bar_at(0, 1.0, 1.0, 1.0, 1.0, 1)], today);
+        let day_before = state.current_day();
+
+        assert!(matches!(
+            state.apply_live_bar(&next_day_bar_at(0, 9.0, 9.0, 9.0, 9.0, 1), today),
+            LiveBarAction::FutureDated
+        ));
+        assert_eq!(state.current_day(), day_before, "day must not roll");
+        assert_eq!(state.day_map_len(), 1, "day-map untouched");
+
+        // Real bars for the current day keep folding.
+        assert!(matches!(
+            state.apply_live_bar(&bar_at(1, 2.0, 2.0, 2.0, 2.0, 1), today),
+            LiveBarAction::Folded(_)
+        ));
+        // A legitimate roll works once the wall clock reaches the new day.
+        assert!(matches!(
+            state.apply_live_bar(&next_day_bar_at(0, 3.0, 3.0, 3.0, 3.0, 1), day1_date()),
+            LiveBarAction::Folded(_)
+        ));
+        assert_eq!(state.current_day(), Some(day1_date()));
+    }
+
+    #[test]
+    fn test_first_bar_none_day_adopts_today_only() {
+        // Round-3 LOW, arm 1: a TODAY-dated first bar is adopted.
+        let mut state = SidDayFold::new(Feed::Dhan, 13, 0);
+        assert!(matches!(
+            state.apply_live_bar(&bar_at(0, 1.0, 1.0, 1.0, 1.0, 1), day0_date()),
+            LiveBarAction::Folded(_)
+        ));
+        assert_eq!(state.current_day(), Some(day0_date()));
+
+        // Arm 2: a PAST-dated first bar routes to the past-day /exec queue
+        // (never adopted — adopting would let a later 1-bar refold
+        // force-seal + DEDUP-clobber a previously-correct closed day).
+        let mut past_state = SidDayFold::new(Feed::Dhan, 13, 0);
+        assert!(matches!(
+            past_state.apply_live_bar(&bar_at(0, 1.0, 1.0, 1.0, 1.0, 1), day1_date()),
+            LiveBarAction::PastDay
+        ));
+        assert_eq!(past_state.current_day(), None, "past bar must not adopt");
+        assert_eq!(past_state.day_map_len(), 0);
+
+        // Arm 3 (clamp): a FUTURE-dated first bar is dropped, never adopted.
+        let mut future_state = SidDayFold::new(Feed::Dhan, 13, 0);
+        let yesterday = day0_date()
+            .checked_sub_days(chrono::Days::new(1))
+            .expect("d-1");
+        assert!(matches!(
+            future_state.apply_live_bar(&bar_at(0, 1.0, 1.0, 1.0, 1.0, 1), yesterday),
+            LiveBarAction::FutureDated
+        ));
+        assert_eq!(future_state.current_day(), None);
+        assert_eq!(future_state.day_map_len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_receiver_guard_try_recv_drains_burst() {
+        // Round-3: the loop drains bursts via try_recv — non-blocking,
+        // FIFO, None on empty.
+        let (tx, rx) = mpsc::channel::<ConfirmedBar>(8);
+        let slot: SharedFoldReceiverSlot = Arc::new(Mutex::new(Some(rx)));
+        let mut guard = FoldReceiverGuard::take(&slot).expect("receiver present");
+        assert!(guard.try_recv().is_none(), "empty channel drains to None");
+        tx.send(bar_at(0, 1.0, 1.0, 1.0, 1.0, 1))
+            .await
+            .expect("send 1");
+        tx.send(bar_at(1, 2.0, 2.0, 2.0, 2.0, 1))
+            .await
+            .expect("send 2");
+        assert_eq!(guard.try_recv().map(|b| b.open), Some(1.0));
+        assert_eq!(guard.try_recv().map(|b| b.open), Some(2.0));
+        assert!(guard.try_recv().is_none());
     }
 }
