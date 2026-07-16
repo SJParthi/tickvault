@@ -122,6 +122,11 @@ pub mod dhan_rest_stack;
 /// build loop + the sole persist_groww_instruments caller).
 pub mod groww_universe;
 pub mod groww_watch_paths;
+/// RAM residency stores boot (operator directive 2026-07-16, PR-2):
+/// installs the month-deep spot bar rings + current-day chain minute ring,
+/// runs the bounded chain-day rehydrate, and publishes the depth gauges.
+/// RAMSTORE-01 runbook: `.claude/rules/project/ram-store-error-codes.md`.
+pub mod market_ram_store_boot;
 /// REST-era multi-TF candle derivation (operator directive 2026-07-16):
 /// folds persist-confirmed `spot_1m_rest` 1m bars into all 21 `candles_*`
 /// timeframes via the shared seal-writer channel + boot catch-up over the
