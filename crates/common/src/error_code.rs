@@ -907,6 +907,23 @@ pub enum ErrorCode {
     /// 2026-07-14 default (no CloudWatch filter). Severity::Medium,
     /// auto-triage-safe.
     FeedGap01EpisodeDegraded,
+    /// FOLD-01 (REST-era multi-TF candle derivation, operator directive
+    /// 2026-07-16) — a leg of the bar-fold candle writer DEGRADED: the boot
+    /// catch-up / dirty-day refold `/exec` query or parse failed
+    /// (`stage="catchup_query"` / `"catchup_parse"` — incl. the LIMIT
+    /// truncation tripwire and a segment-allowlist refusal), a sealed
+    /// bucket could not be handed to the seal-writer channel or a
+    /// confirmed-bar handoff was dropped (`stage="seal_send"`), or the
+    /// supervised fold task died and was respawned
+    /// (`stage="task_respawn"`). Every degrade is RE-DERIVABLE: the
+    /// `candles_*` DEDUP key (`ts, security_id, segment, feed`) makes the
+    /// dirty-day refold and the next boot's catch-up idempotent repairs —
+    /// no market data is lost (the `spot_1m_rest` source rows stand).
+    /// Cold path only; log-sink-only delivery (no CloudWatch filter — see
+    /// the runbook's delivery-boundary paragraph). Severity::High,
+    /// auto-triage-safe (the degrade already happened; catch-up/refold
+    /// self-heal — the operator inspects).
+    RestCandleFold01Degraded,
 
     // -----------------------------------------------------------------------
     // 🔷 DHAN exit-order execution layer (Cluster B, 2026-07-14).
@@ -1334,6 +1351,8 @@ impl ErrorCode {
             Self::TfVerify02RunDegraded => "TF-VERIFY-02",
             // Feed gap-episode forensics (Groww hardening PR-3, 2026-07-14)
             Self::FeedGap01EpisodeDegraded => "FEED-GAP-01",
+            // REST-era multi-TF candle derivation (operator 2026-07-16)
+            Self::RestCandleFold01Degraded => "FOLD-01",
             Self::ExitOrder01ExecutionDegraded => "EXIT-ORDER-01",
             Self::ExitVerify01Degraded => "EXIT-VERIFY-01",
             // Groww Portfolio area contract stubs (§39.3, 2026-07-14)
@@ -1535,6 +1554,13 @@ impl ErrorCode {
             // run could not vouch for it); never a halt — the live candle
             // pipeline is untouched and reruns are DEDUP-idempotent.
             Self::TfVerify01MismatchFound | Self::TfVerify02RunDegraded => Severity::High,
+            // FOLD-01 (REST-era candle derivation, operator 2026-07-16) —
+            // a fold leg degraded (catch-up query/parse, seal handoff, task
+            // respawn). High: operator eyes required — a silent fold degrade
+            // would starve the candles_* tables the operator demanded; never
+            // a halt (cold path; refold/catch-up are DEDUP-idempotent
+            // repairs and spot_1m_rest source rows stand). LOG-SINK-ONLY.
+            Self::RestCandleFold01Degraded => Severity::High,
             // EXIT-ORDER-01 / EXIT-VERIFY-01 (Cluster B, 2026-07-14) — the
             // exit-order layer degraded / the MPP verify ladder exhausted
             // without a clean fill. High: operator eyes on every occurrence
@@ -1880,6 +1906,10 @@ impl ErrorCode {
             Self::FeedGap01EpisodeDegraded => {
                 ".claude/rules/project/feed-gap-error-codes.md"
             }
+            // REST-era multi-TF candle derivation (operator 2026-07-16)
+            Self::RestCandleFold01Degraded => {
+                ".claude/rules/project/rest-candle-fold-error-codes.md"
+            }
             // 🔷 DHAN exit-order execution layer (Cluster B, 2026-07-14)
             Self::ExitOrder01ExecutionDegraded | Self::ExitVerify01Degraded => {
                 ".claude/rules/project/dhan-exit-order-lockout-2026-07-14.md"
@@ -2167,6 +2197,8 @@ impl ErrorCode {
             Self::TfVerify02RunDegraded,
             // Feed gap-episode forensics (Groww hardening PR-3, 2026-07-14)
             Self::FeedGap01EpisodeDegraded,
+            // REST-era multi-TF candle derivation (operator 2026-07-16)
+            Self::RestCandleFold01Degraded,
             // 🔷 DHAN exit-order execution layer (Cluster B, 2026-07-14)
             Self::ExitOrder01ExecutionDegraded,
             Self::ExitVerify01Degraded,
@@ -2569,9 +2601,10 @@ mod tests {
         // 2026-07-15 (merge of #1587 fan-out stubs + main's #1578
         // GROWW-ORD contracts): both families coexist — 129 base + 14
         // (PORT/OCO/MARG) + 10 (ORD) = 153, mechanically recounted.
-        // 2026-07-16 (rebase onto post-#1540 main): + CADENCE-01/02/03
-        // (cadence scheduler, operator directive 2026-07-14) => 156.
-        assert_eq!(ErrorCode::all().len(), 156);
+        // 2026-07-16 (REST-era candle derivation, operator directive):
+        // +1 FOLD-01 (RestCandleFold01Degraded — bar-fold writer degrade;
+        // log-sink-only, High, auto-triage-safe) => 154.
+        assert_eq!(ErrorCode::all().len(), 154);
     }
 
     #[test]
@@ -3033,6 +3066,8 @@ mod tests {
                 || s.starts_with("WS-REINJECT-")
                 // Operator 2026-06-10: daily end-to-end tick-conservation audit
                 || s.starts_with("TICK-CONSERVE-")
+                // Operator 2026-07-16: REST-era multi-TF candle derivation
+                || s.starts_with("FOLD-")
                 // C4 sweep (2026-07-15): the SLO- / REST-CANARY- /
                 // INSTR-FETCH- / CROSS-VERIFY-1M- / NTM-CONSTITUENCY- /
                 // PREVDAY- / DHAN-LANE- family prefixes were REMOVED from

@@ -135,6 +135,7 @@ use tickvault_common::constants::{
     SPOT_1M_REST_FIRST_FIRE_SECS_OF_DAY_IST, SPOT_1M_REST_LAST_FIRE_SECS_OF_DAY_IST,
 };
 use tickvault_common::error_code::ErrorCode;
+use tickvault_common::feed::Feed;
 use tickvault_common::sanitize::capture_rest_error_body;
 use tickvault_common::trading_calendar::TradingCalendar;
 use tickvault_core::auth::secret_manager::fetch_groww_access_token;
@@ -2003,6 +2004,9 @@ async fn fire_one_minute(
     // data flush ACK, then stamped with the real close_to_persist_ms (a
     // failed flush discards them — the flush_failed rows are the truth).
     let mut held_ok_rows: Vec<RestFetchAuditRow> = Vec::new();
+    // 2026-07-16 REST-era candle derivation: bars staged for the fold-writer
+    // handoff — sent ONLY after the flush ACK confirms persistence.
+    let mut confirmed_bars: Vec<crate::rest_candle_fold::ConfirmedBar> = Vec::new();
 
     if let Some(token) = token_cache.ensure_token().await {
         // 2026-07-14 auto-ladder: the WAVE — all targets fetch
@@ -2245,6 +2249,16 @@ async fn fire_one_minute(
                         held_ok_rows.push(row);
                     }
                     staged.push((security_id, candle.minute_ts_ist_nanos));
+                    if let Ok(sid_u64) = u64::try_from(security_id) {
+                        confirmed_bars.push(
+                            crate::rest_candle_fold::ConfirmedBar::from_minute_candle(
+                                Feed::Groww,
+                                sid_u64,
+                                tickvault_common::constants::EXCHANGE_SEGMENT_IDX_I,
+                                &candle,
+                            ),
+                        );
+                    }
                 }
             }
             if let Some(backfill) = backfill_candle {
@@ -2304,6 +2318,16 @@ async fn fire_one_minute(
                         "none",
                     ));
                     staged.push((security_id, backfill.minute_ts_ist_nanos));
+                    if let Ok(sid_u64) = u64::try_from(security_id) {
+                        confirmed_bars.push(
+                            crate::rest_candle_fold::ConfirmedBar::from_minute_candle(
+                                Feed::Groww,
+                                sid_u64,
+                                tickvault_common::constants::EXCHANGE_SEGMENT_IDX_I,
+                                &backfill,
+                            ),
+                        );
+                    }
                 }
             }
         }
@@ -2376,6 +2400,9 @@ async fn fire_one_minute(
             for (security_id, minute_nanos) in staged {
                 tracker.commit(security_id, minute_nanos);
             }
+            // 2026-07-16 REST-era candle derivation: the bars are now
+            // persist-CONFIRMED — hand them to the fold writer.
+            crate::rest_candle_fold::send_confirmed_bars(&confirmed_bars);
         }
         // GAP-11: the ok rows land ONLY after (and stamped with) the data
         // flush ACK — discarded on a failed flush.
@@ -2583,6 +2610,9 @@ async fn run_post_session_sweep(
     let mut still_missing: u64 = 0;
     let mut pre_boot_named: u64 = 0;
     let mut staged: Vec<(i64, i64)> = Vec::new();
+    // 2026-07-16 REST-era candle derivation: swept bars staged for the
+    // fold-writer handoff — sent ONLY after the flush ACK confirms.
+    let mut confirmed_bars: Vec<crate::rest_candle_fold::ConfirmedBar> = Vec::new();
     let mut persist_failed = false;
     for target in targets {
         let security_id = target.security_id;
@@ -2753,6 +2783,14 @@ async fn run_post_session_sweep(
             } else {
                 found_for_sid = found_for_sid.saturating_add(1);
                 staged.push((security_id, *minute_nanos));
+                if let Ok(sid_u64) = u64::try_from(security_id) {
+                    confirmed_bars.push(crate::rest_candle_fold::ConfirmedBar::from_minute_candle(
+                        Feed::Groww,
+                        sid_u64,
+                        tickvault_common::constants::EXCHANGE_SEGMENT_IDX_I,
+                        &candle,
+                    ));
+                }
             }
         }
         // NAMED GAPS: the finally-unrecovered minutes for this symbol —
@@ -2826,6 +2864,10 @@ async fn run_post_session_sweep(
         for (security_id, minute_nanos) in staged {
             tracker.commit(security_id, minute_nanos);
         }
+        // 2026-07-16 REST-era candle derivation: swept bars are now
+        // persist-CONFIRMED — hand them to the fold writer (out-of-order
+        // swept bars mark their day dirty for a refold).
+        crate::rest_candle_fold::send_confirmed_bars(&confirmed_bars);
     }
     audit_flush_best_effort(audit_writer);
     metrics::counter!("tv_groww_spot1m_sweep_backfilled_total").increment(swept);
