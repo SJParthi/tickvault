@@ -30,13 +30,15 @@ local pre-push/pre-commit gates were structurally vacuous or dishonest:
    FAIL + scaled timeout `60 + RS_COUNT/2` (measured ~0.3s/file worst-case;
    2x headroom), timeout value echoed in the FAIL message.
 3. **pre-push-gate.sh Gate 3 (secret scan):** full-tree scan measured
-   ~4m19s/551 files vs a fixed 30s timeout. Fix:
-   `${TICKVAULT_SECRET_SCAN_TIMEOUT_SECS:-60} + RS_COUNT/2`, hard floor 60s,
-   findings always block.
+   ~4m19s/551 files vs a fixed 30s timeout. Fix (as shipped, incl. review
+   rounds 1-2): push-scoped file list,
+   `${TICKVAULT_SECRET_SCAN_TIMEOUT_SECS:-60} + ALL_COUNT/2` (ALL_COUNT =
+   files changed in the push range; /2 per the measured ~0.3-0.5s/file),
+   hard floor 60s, findings always block.
 4. **pre-commit-gate.sh Gate 5 (secret scan):** same knob +
-   `STAGED_COUNT/8` scaling (staged sets are small; the full-tree pre-push
-   lane uses /2), hard floor 60s, computed timeout echoed in the exit-124
-   FAIL message. No skip path — exit 124 and findings both block.
+   `STAGED_COUNT/8` scaling (staged sets are small; the push-scoped
+   pre-push lane uses /2), hard floor 60s, computed timeout echoed in the
+   exit-124 FAIL message. No skip path — exit 124 and findings both block.
 
 Files: `.github/workflows/ci.yml`, `.claude/hooks/pre-push-gate.sh`,
 `.claude/hooks/pre-commit-gate.sh`. No `crates/` source is touched; no gate
@@ -111,12 +113,28 @@ so a revert must be paired with an issue re-flagging the Critical finding.
 - [x] pre-push-gate.sh Gate 3 env knob + count/2 scaling + 60s floor
   - Files: .claude/hooks/pre-push-gate.sh
   - Tests: bash -n, arithmetic stubs
-- [ ] pre-commit-gate.sh Gate 5 env knob + staged/8 scaling + 60s floor + computed value in the exit-124 message
+- [x] pre-commit-gate.sh Gate 5 env knob + staged/8 scaling + 60s floor + computed value in the exit-124 message
   - Files: .claude/hooks/pre-commit-gate.sh
   - Tests: bash -n, arithmetic stubs
-  - NOTE: edit NOT applied — blocked by the auto-mode permission classifier
-    (Self Modification of a hooks file); requires direct in-session user
-    approval before it can land.
+  - NOTE: applied in commit b0e7bc42 after operator approval landed (the
+    earlier "blocked by the auto-mode permission classifier" note was stale).
 - [x] Review round-1 fixes: push-scoped local scans (harness hook budget), sibling callers (scripts/git-hooks/pre-push, pre-pr-gate.sh), timeout-vs-findings messages, honesty comments
   - Files: .claude/hooks/pre-push-gate.sh, scripts/git-hooks/pre-push, .claude/hooks/pre-pr-gate.sh, CLAUDE.md
   - Tests: bash -n, push-range list-build replication, single-file scanner invocation
+- [x] Review round-2 fixes: fail-closed merge-base arm at all three sites (no full-tree fallback), pre-tool-dispatch harness timeout 300s + budget-honesty header note, secret-scan divisor ALL_COUNT/2, message + plan truthfulness
+  - Files: .claude/hooks/pre-push-gate.sh, .claude/hooks/pre-pr-gate.sh, scripts/git-hooks/pre-push, .claude/settings.json, .claude/plans/active-plan-ci-gate-integrity.md
+  - Tests: bash -n on all three scripts, JSON validity, push-range list-build replication
+
+## Per-Item Guarantee Matrix
+
+See `per-wave-guarantee-matrix.md` (`.claude/rules/project/`) — all 15 rows of
+the 100% Guarantee Matrix and all 7 rows of the Resilience Demand Matrix apply
+to every item in this plan. Plan-specific notes:
+
+- This plan changes CI/hook shell only (no `crates/` code): the hot-path,
+  DHAT/Criterion, and audit-table rows read `N/A — CI/hook shell change, no
+  runtime code path touched`; the "100% code checks" row is the DELIVERABLE
+  itself (the scanner now genuinely scans every file instead of 1).
+- Resilience rows: no tick-drop path, no WS/QuestDB path, and no DEDUP key is
+  touched; the change strictly STRENGTHENS enforcement (a previously-vacuous
+  gate now blocks real findings) and weakens nothing.

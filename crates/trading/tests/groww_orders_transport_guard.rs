@@ -74,7 +74,12 @@ fn production_region(source: &str) -> &str {
 
 #[test]
 fn test_gate6_paper_lane_zero_http_import_scan() {
-    for module in ["executor.rs", "rate_budget.rs", "events.rs"] {
+    for module in [
+        "executor.rs",
+        "rate_budget.rs",
+        "events.rs",
+        "smart_orders.rs",
+    ] {
         let code = strip_comments(&src(module));
         let prod = production_region(&code).to_ascii_lowercase();
         assert!(
@@ -92,6 +97,30 @@ fn test_gate6_paper_lane_zero_http_import_scan() {
         assert!(
             !prod.contains("/v1/order/"),
             "{module}: endpoint PATH strings are confined to api_client.rs (Gate 5)"
+        );
+        assert!(
+            !prod.contains("/v1/order-advance"),
+            "{module}: smart-order PATH strings are confined to api_client.rs (Gate 5)"
+        );
+    }
+}
+
+#[test]
+fn test_smart_order_paths_confined_to_api_client() {
+    // api_client.rs is the ONLY module allowed to carry the smart-order
+    // (`/v1/order-advance/*`) endpoint paths — the Gate-5 confinement for the
+    // GROWW-OCO area (2026-07-16 implementation).
+    let api = src("api_client.rs");
+    for path in [
+        "/v1/order-advance/create",
+        "/v1/order-advance/modify/",
+        "/v1/order-advance/cancel/",
+        "/v1/order-advance/status/",
+        "/v1/order-advance/list",
+    ] {
+        assert!(
+            api.contains(path),
+            "api_client must own the smart-order path {path}"
         );
     }
 }

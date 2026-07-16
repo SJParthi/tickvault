@@ -59,11 +59,11 @@ pub mod events;
 pub mod executor;
 pub mod rate_budget;
 
-// Area modules land in their own serial PRs, each behind this same feature:
-//   pub mod api_client;    // Orders        (GROWW-ORD-*)
-//   pub mod portfolio;     // Portfolio     (GROWW-PORT-*)
-//   pub mod margin;        // Margin        (GROWW-MARG-*)
-//   pub mod user;          // User + Exceptions (GROWW-READY-*)
+// Smart-Orders area (GROWW-OCO-*) — types + validation + per-type modify
+// matrix + open-set status FSM + sibling-verify/reconcile pure logic + the
+// spawnable reconcile loop (2026-07-16 implement-everything directive). Its
+// transport lives in `api_client.rs` (Gate 5).
+pub mod smart_orders;
 
 /// Smart Orders (GTT/OCO) area — `GROWW-OCO-*` (§39.3, 2026-07-15).
 pub mod smart_orders;

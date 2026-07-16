@@ -476,6 +476,7 @@ adding one records the cost note per `aws-budget.md`.
 | `crates/trading/src/risk/engine.rs` | Cluster A this round (lot_size fix + halt extraction); E2's margin gate REBASES after A merges | `check_order` gains OrderIntent in E2 only |
 | `crates/app/src/groww_bridge.rs` tick seam | Cluster A | marks tap (one guarded try_send block) |
 | Storage order-audit writers (`crates/storage/src/`) | Cluster C | A emits via a seam C fills in; A ships without tables (flagged follow-up) |
+| `crates/trading/src/oms/conditional.rs` (+ the api_client.rs conditional-family block :575-780 and the types.rs conditional/multi sections) | Cluster CT (this item) | New module — no other cluster touches it; api_client edits confined to the /alerts family block + end-appends; mod.rs gains one additive line |
 
 Build-lead: the cluster A session. Conflicts on any seam: the
 non-owner rebases; never a force-merge over an owner's in-flight PR.

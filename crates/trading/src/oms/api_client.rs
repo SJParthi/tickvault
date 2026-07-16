@@ -35,6 +35,8 @@ use super::error_taxonomy::{self, OrderEndpoint, OrderErrorPolicy};
 
 use super::types::{DhanMultiOrderRequest, DhanMultiOrderResponse};
 
+use super::types::{DhanMultiOrderRequest, DhanMultiOrderResponse};
+
 use super::types::{
     DhanConditionalTriggerRequest, DhanConditionalTriggerResponse, DhanConvertPositionRequest,
     DhanExitAllResponse, DhanForeverOrderRequest, DhanForeverOrderResponse,
@@ -319,8 +321,12 @@ pub struct OrderApiClient {
     base_url: String,
     /// Dhan client ID for the `client-id` header.
     client_id: String,
-    /// DATA-805 STOP-ALL cooldown latch (process-local, monotonic).
-    cooldown: error_taxonomy::BrokerCooldownLatch,
+    /// Hardcoded OFF switch for the /alerts/* family (Conditional & Multi
+    /// Order). DEFAULT: false (disarmed). Deliberately NO production arm
+    /// path — arming is #[cfg(test)]-only until a dated operator quote lands
+    /// a live-activation PR. Ratcheted by
+    /// `crates/trading/tests/conditional_gate_guard.rs`.
+    alerts_gate_armed: bool,
 }
 
 impl OrderApiClient {
@@ -335,7 +341,7 @@ impl OrderApiClient {
             http,
             base_url,
             client_id,
-            cooldown: error_taxonomy::BrokerCooldownLatch::new(),
+            alerts_gate_armed: false,
         }
     }
 

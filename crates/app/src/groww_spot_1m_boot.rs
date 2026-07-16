@@ -2322,22 +2322,33 @@ async fn fire_one_minute(
                         "none",
                     ));
                     staged.push((security_id, backfill.minute_ts_ist_nanos));
-                    if let Ok(sid_u64) = u64::try_from(security_id) {
-                        confirmed_bars.push(
-                            crate::rest_candle_fold::ConfirmedBar::from_minute_candle(
-                                Feed::Groww,
-                                sid_u64,
-                                tickvault_common::constants::EXCHANGE_SEGMENT_IDX_I,
-                                &backfill,
-                            ),
-                        );
-                    } else {
-                        // Round-2 LOW-6: never a silent skip — counted +
-                        // one coalesced warn (defensive; ids are positive).
-                        crate::rest_candle_fold::note_unfoldable_identity(Feed::Groww, security_id);
-                    }
                 }
             }
+        }
+        if any_auth_rejected {
+            // Item 12 (auto-ladder form): the wave already fired
+            // concurrently, so there are no "remaining" targets to
+            // short-circuit — each target's OWN ladder aborted on its
+            // 401/403 (≤ 4 doomed requests, not 4 × 5). Drop the dead
+            // token so the NEXT fire's ensure_token re-reads SSM at the
+            // ≥60 s floor (unchanged); NEVER a mint.
+            token_cache.note_auth_rejected();
+        }
+        if any_rate_limited && params.burst.note_rate_limited() {
+            // The session's DEMOTION EDGE (exactly once): the burst tier
+            // steps down for every subsequent minute — seven_concurrent →
+            // two_wave, two_wave → staggered two_wave. Boot restores the
+            // configured tier.
+            warn!(
+                code = ErrorCode::Spot1m01FetchDegraded.code_str(),
+                stage = "burst_demoted",
+                feed = SPOT_1M_REST_FEED_GROWW,
+                minute = %minute_label,
+                demoted_to = params.burst.effective_tier().as_str(),
+                "SPOT1M-01: HTTP 429 on the Groww spot wave — burst tier \
+                 auto-demoted for the rest of the session (restart restores \
+                 the configured tier)"
+            );
         }
         if any_auth_rejected {
             // Item 12 (auto-ladder form): the wave already fired

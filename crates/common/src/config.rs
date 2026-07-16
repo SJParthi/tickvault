@@ -197,6 +197,15 @@ pub struct ApplicationConfig {
     /// collapse it).
     #[serde(default)]
     pub groww_rest_burst: GrowwRestBurstConfig,
+    /// `[groww_universe]` — process-global daily Groww watch-set +
+    /// shared-master rider (2026-07-15 Groww live-feed retirement re-home of
+    /// the activation watcher's daily build loop): once per IST day, build +
+    /// write `data/groww/groww-watch-<date>.json` (the spot leg's VIX
+    /// resolver reads it) and fire-and-forget `persist_groww_instruments`
+    /// (SEBI `feed='groww'` master continuity). Absent section ⇒ DISABLED
+    /// (fail-safe default off); `config/base.toml` opts in.
+    #[serde(default)]
+    pub groww_rest_burst: GrowwRestBurstConfig,
     /// `[groww_orders]` — Groww ORDER-SIDE build gate (operator authorization
     /// 2026-07-14, `.claude/rules/project/groww-second-feed-scope-2026-06-19.md`
     /// §39). GATE 1 of the 4-gate live-fire lattice: every key default-OFF, so

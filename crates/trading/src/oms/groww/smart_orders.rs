@@ -1,547 +1,783 @@
-//! Groww Smart Orders (GTT / OCO) client — the `GROWW-OCO-*` area of the
-//! §39.3 collision contract (operator authorization 2026-07-14/15).
+//! Groww Smart Orders (GTT / OCO) — the §39.3 Smart Orders AREA module
+//! (`GROWW-OCO-*`), implemented per the operator's dated 2026-07-16 directive
+//! ("why stubs gaps — i clearly told you to implement and integrate
+//! everything").
 //!
-//! # Ground truth
-//! `docs/groww-ref/18-smart-orders-schemas.md` (the recovered schemas) +
-//! `docs/groww-ref/16-orders-margins-portfolio.md` (endpoint inventory + GA
-//! error codes). Provenance honesty: the OCO create/modify/cancel/get/list
-//! shapes are CAPTURE-VERBATIM (doc 18 §2–§7); the **GTT CREATE shape is
-//! INFERRED** — doc 18 §0 defers the GTT create schema to the capture it
-//! does not reproduce, and doc 16 carries no field table, so the
-//! [`GttCreateRequest`] field set is grounded in the capture's example JSON
-//! + schema prose only (doc 18 §9 probe P1/P4 class — verify on the first
-//! authorized live GTT round-trip). Prices on the smart-order wire are DECIMAL STRINGS
-//! ("All prices should be passed as decimal strings" — doc 18 §8.7);
-//! internally this module speaks INTEGER PAISE (`i64`) only, converted at
-//! the wire boundary by [`paise_to_decimal_string`] /
-//! [`decimal_string_to_paise`] — no `f64` anywhere.
+//! # Doc fidelity (the truth source)
+//! Every field / enum / status / modifiable-field rule below is
+//! field-for-field from `docs/groww-ref/18-smart-orders-schemas.md`
+//! (Verified-capture, 2026-07-14 recovery of the 2026-07-03 lossless
+//! official-docs capture) + `docs/groww-ref/16-orders-margins-portfolio.md`
+//! §5 (GA envelope). Where the stub rule file disagreed with the docs, the
+//! DOCS win — the corrections are recorded in
+//! `.claude/rules/project/groww-oco-error-codes.md` (2026-07-16 note).
 //!
-//! # The 4-gate live-fire lattice (§39.2 — the safety core)
-//! Every WRITE method (create OCO/GTT, modify, cancel) checks, IN ORDER:
-//! 1. `settings.write_enabled == false` → [`SmartOrderOutcome::DisabledByConfig`]
-//!    (Gate 1 — config default-OFF);
-//! 2. validation + serialization of the fully-typed body;
-//! 3. [`GROWW_ORDER_LIVE_FIRE`]` == false` → [`SmartOrderOutcome::DryRun`]
-//!    carrying the exact endpoint/method/body that WOULD have been sent
-//!    (Gate 3 — the hardcoded const).
+//! # What lives here vs `api_client.rs`
+//! This module holds TYPES, VALIDATION, the per-type modify matrix, the
+//! 6-value open-set status FSM, the sibling-verify + reconcile pure logic,
+//! the coded `GROWW-OCO-*` emit helpers, and the spawnable reconcile loop.
+//! ALL HTTP + the `/v1/order-advance/*` endpoint PATH strings live ONLY in
+//! `api_client.rs` (Gate 5 confinement — `groww_order_lattice_guard.rs` +
+//! the transport guard's zero-HTTP scan, which covers THIS file too).
 //!
-//! The `reqwest` send sits STATICALLY after both gates — while either gate
-//! is closed, no HTTP request is even constructed. Gate 2 is the
-//! non-default `groww_orders` cargo feature this whole subtree compiles
-//! under; Gate 4 is the rule lock (§39 / §10). READ methods (status get,
-//! list) gate on `settings.read_enabled` only — they place no order.
+//! # Money — integer paise at rest, DECIMAL STRINGS on this wire
+//! Unlike the regular-order endpoints (JSON numbers), every smart-order
+//! price crosses the wire as a decimal STRING (`"3985.00"`) — the doc's
+//! verbatim "All prices should be passed as decimal strings" (`ltp` is the
+//! only float, response-side). Conversion is pure integer math
+//! ([`paise_to_decimal_string`] / [`decimal_string_to_paise`]) — no float
+//! ever touches a smart-order price.
 //!
-//! # Gate-5 note
-//! The Groww order-side path strings (`/v1/order-advance/...`) are PRIVATE
-//! consts in THIS file — the lattice guard's workspace scan
-//! (`groww_order_lattice_guard::test_gate5_no_ungated_groww_order_side_call_site`)
-//! allows them ONLY inside `oms/groww/`.
-//!
-//! # Error codes (runbook `.claude/rules/project/groww-oco-error-codes.md`)
-//! - `GROWW-OCO-01` — placement-class write (create/cancel) failed at the
-//!   live HTTP leg (unreachable while Gate 3 is closed).
-//! - `GROWW-OCO-02` — sibling-cancel unverified past deadline: the VERDICT
-//!   type ([`SiblingVerdict::Violation`]) ships here; the EMIT site lands
-//!   with the later reconcile-orchestrator PR.
-//! - `GROWW-OCO-03` — OCO-vs-position reconcile mismatch: the VERDICT type
-//!   ([`ReconcileVerdict`]) ships here; the EMIT site lands with the later
-//!   reconcile-orchestrator PR.
-//! - `GROWW-OCO-04` — modify rejected (unreachable while Gate 3 is closed).
-//! - `GROWW-OCO-05` — status poller (read GET) degraded.
-//!
-//! # Token discipline
-//! The access token comes from a caller-supplied READ-ONLY provider (the
-//! shared-minter SSM read — `groww-shared-token-minter-2026-07-02.md`);
-//! this module NEVER mints, never logs the token, and never puts it in a
-//! URL. EVERY broker-controlled string that can reach a log or a typed
-//! error — the GA `code`, the GA `message`, raw non-2xx bodies, the
-//! envelope `status`, and transport error text — routes through the house
-//! [`capture_rest_error_body`] redaction choke point (bounded ≤300 chars,
-//! JWT/URL-credential redacted). `bounded_echo` is used ONLY for
-//! caller-supplied validation inputs, never for broker output.
+//! # Gate lattice
+//! Mutations are quadruple-gated: `[groww_orders].smart_orders_write` +
+//! `live_fire_requested` (Gate 1) · the non-default `groww_orders` cargo
+//! feature (Gate 2) · [`tickvault_common::constants::GROWW_ORDER_LIVE_FIRE`]
+//! (Gate 3, `false`) · the §39/§10 rule lock (Gate 4).
+//! [`smart_live_send_permitted`] is the boot layer's pure triple-check
+//! (Gate 1 knobs + Gate 3 const) before any LIVE spawn; per-send the
+//! executor re-checks the Gate-1 knobs, and `ExecutionMode::Live` itself is
+//! unreachable outside the const-gated constructor (the house engine.rs
+//! precedent). Paper mode simulates ACTIVE smart orders with
+//! `PAPER-` ids and ZERO HTTP. Write paths have NO transport retry (the
+//! double-send class — the `reference_id` idempotency window is unproven,
+//! probe P10).
 
-use std::fmt;
+use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
 
-use serde::de::DeserializeOwned;
-use serde::{Deserialize, Serialize};
-use tickvault_common::broker_order_events::BrokerOrderStatus;
+use secrecy::SecretString;
+use serde::{Serialize, Serializer};
+use thiserror::Error;
 use tickvault_common::config::GrowwOrdersConfig;
-use tickvault_common::constants::{
-    GROWW_API_VERSION_HEADER, GROWW_API_VERSION_VALUE, GROWW_ORDER_LIVE_FIRE,
-};
+use tickvault_common::constants::GROWW_ORDER_LIVE_FIRE;
 use tickvault_common::error_code::ErrorCode;
 use tickvault_common::sanitize::capture_rest_error_body;
-use tracing::error;
+use tracing::{error, info};
+
+use super::api_client::{AmbiguityReason, SmartOrderTransport, TransportOutcome};
+use super::types::{
+    GrowwExchange, GrowwOrderType, GrowwProduct, GrowwSegment, GrowwTransactionType, GrowwValidity,
+};
 
 // ---------------------------------------------------------------------------
-// Endpoint constants (PRIVATE — Gate-5: these strings may exist ONLY inside
-// oms/groww/; see the module doc)
+// Money — integer paise ⇄ decimal wire strings (pure integer math)
 // ---------------------------------------------------------------------------
 
-/// Production Groww REST base (doc 18 §1).
-const GROWW_SMART_ORDER_BASE_URL: &str = "https://api.groww.in"; // APPROVED: Gate-5 keeps every Groww order-side URL string inside oms/groww/ (constants.rs precedent)
-/// `POST` — create a GTT or OCO smart order (doc 18 §1 [R:L21]).
-const SMART_ORDER_CREATE_PATH: &str = "/v1/order-advance/create";
-/// `PUT {prefix}/{smart_order_id}` (doc 18 §1 [R:L194]).
-const SMART_ORDER_MODIFY_PATH_PREFIX: &str = "/v1/order-advance/modify";
-/// `POST {prefix}/{segment}/{smart_order_type}/{smart_order_id}` — path
-/// params only, no body (doc 18 §4 [R:L325]).
-const SMART_ORDER_CANCEL_PATH_PREFIX: &str = "/v1/order-advance/cancel";
-/// `GET {prefix}/{segment}/{smart_order_type}/internal/{smart_order_id}` —
-/// note the literal `internal` path segment (doc 18 §4 [R:L370]).
-const SMART_ORDER_STATUS_PATH_PREFIX: &str = "/v1/order-advance/status";
-/// `GET` — list smart orders with optional filters (doc 18 §5 [R:L405]).
-const SMART_ORDER_LIST_PATH: &str = "/v1/order-advance/list";
+/// Largest |paise| admitted on the smart-order wire — the same ₹1e10 band as
+/// the regular-order converter in `types.rs` (NSE-plausible; every value in
+/// the band round-trips exactly).
+pub const MAX_ABS_PAISE_FOR_DECIMAL_STRING: i64 = 1_000_000_000_000;
 
-/// Per-request timeout (seconds) — each attempt is one bounded
-/// round-trip (the §38 legs' pacing discipline; the future reconcile
-/// poller owns cadence). Retry semantics live on [`RetryPolicy`]:
-/// READ paths get ONE bounded transport retry; WRITE paths get NONE
-/// (H-HIGH 2026-07-15 — this doc previously said "no internal retry
-/// ladder" while the send loop retried everything once; the write-side
-/// contradiction is resolved by removing the write retry entirely).
-const SMART_ORDER_REQUEST_TIMEOUT_SECS: u64 = 5;
-/// Delay before the SINGLE bounded READ-path retry on a TRANSPORT-class
-/// send error (never on any HTTP status — a 4xx/5xx is a broker verdict,
-/// not a blip). WRITE paths never reach this — a create whose first
-/// attempt reached the broker but whose response was lost would be
-/// DOUBLE-SENT, and the GA007 `reference_id` dedup window is UNKNOWN
-/// (doc 18 §9 probe P10).
-const SMART_ORDER_TRANSPORT_RETRY_DELAY_MS: u64 = 250;
-
-/// Wire literal for the OCO smart-order type (doc 18 §2).
-pub const SMART_ORDER_TYPE_OCO: &str = "OCO";
-/// Wire literal for the GTT smart-order type (doc 18 §1).
-pub const SMART_ORDER_TYPE_GTT: &str = "GTT";
-/// The only smart-order segment OCO accepts today (doc 18 §8.1 — the CASH
-/// arm is intra-doc CONTRADICTED, so we fail closed on FNO-only).
-const OCO_SEGMENT_FNO: &str = "FNO";
-
-/// `reference_id` constraint (doc 18 §2: "alphanumeric string (8-20
-/// characters) ... with at most two hyphens (-) allowed").
-const REFERENCE_ID_MIN_LEN: usize = 8;
-/// See [`REFERENCE_ID_MIN_LEN`].
-const REFERENCE_ID_MAX_LEN: usize = 20;
-/// See [`REFERENCE_ID_MIN_LEN`].
-const REFERENCE_ID_MAX_HYPHENS: usize = 2;
-
-/// List pagination bounds (doc 18 §5: page min 0 / max 500; page_size
-/// min 1 / max 50).
-const LIST_PAGE_MAX: u32 = 500;
-/// See [`LIST_PAGE_MAX`].
-const LIST_PAGE_SIZE_MIN: u32 = 1;
-/// See [`LIST_PAGE_MAX`].
-const LIST_PAGE_SIZE_MAX: u32 = 50;
-
-/// Bound on any raw input echoed into a typed error (forensic, never a
-/// full-body dump; the [`capture_rest_error_body`] discipline for
-/// NON-broker strings).
-const ERROR_ECHO_MAX_CHARS: usize = 48;
-
-// ---------------------------------------------------------------------------
-// Settings (decoupled from config.rs — boot wiring maps config → this)
-// ---------------------------------------------------------------------------
-
-/// Runtime settings for the smart-order client — a config-DECOUPLED struct
-/// so this module never grows a hard dependency on `config.rs` evolution.
-/// Boot wiring builds it via the [`From<&GrowwOrdersConfig>`] mapper.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GrowwSmartOrderSettings {
-    /// Gate for the read-only GETs (status get + list). Default `false`.
-    pub read_enabled: bool,
-    /// Gate for the write methods (create/modify/cancel). Default `false`.
-    /// Even when `true`, writes stop at the [`GROWW_ORDER_LIVE_FIRE`]
-    /// dry-run gate (Gate 3).
-    pub write_enabled: bool,
-    /// Cadence (seconds) for the future OCO reconcile poller. Default 15.
-    pub reconcile_poll_secs: u64,
-    /// Seconds after one OCO leg executes within which the sibling must be
-    /// VERIFIED cancelled (else [`SiblingVerdict::Violation`]). Default 30.
-    pub sibling_cancel_deadline_secs: u64,
+/// Render integer paise as the decimal string the smart-order wire expects
+/// (`3985.00`). Total — pure integer math, no float, negative kept (callers
+/// validate positivity separately; the renderer never lies).
+#[must_use]
+pub fn paise_to_decimal_string(paise: i64) -> String {
+    let sign = if paise < 0 { "-" } else { "" };
+    let abs = paise.unsigned_abs();
+    format!("{sign}{}.{:02}", abs / 100, abs % 100)
 }
 
-impl Default for GrowwSmartOrderSettings {
-    fn default() -> Self {
-        Self {
-            read_enabled: false,
-            write_enabled: false,
-            reconcile_poll_secs: 15,
-            sibling_cancel_deadline_secs: 30,
+/// Parse a decimal wire string into integer paise. Total, no-panic:
+/// - checked integer math (overflow → `None`);
+/// - at most 2 SIGNIFICANT fraction digits (extra digits admitted only when
+///   zero — sub-paise precision is REFUSED, never silently truncated);
+/// - |paise| beyond the ₹1e10 band → `None`;
+/// - empty / non-digit / multi-dot garbage → `None`.
+#[must_use]
+pub fn decimal_string_to_paise(raw: &str) -> Option<i64> {
+    let trimmed = raw.trim();
+    let (neg, digits) = match trimmed.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, trimmed),
+    };
+    let (int_part, frac_part) = match digits.split_once('.') {
+        Some((i, f)) => (i, f),
+        None => (digits, ""),
+    };
+    if int_part.is_empty()
+        || !int_part.bytes().all(|b| b.is_ascii_digit())
+        || !frac_part.bytes().all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    let mut frac_paise: i64 = 0;
+    for (i, b) in frac_part.bytes().enumerate() {
+        let d = i64::from(b - b'0');
+        match i {
+            0 => frac_paise += d * 10,
+            1 => frac_paise += d,
+            // Sub-paise digits: refuse anything non-zero (never truncate).
+            _ if d != 0 => return None,
+            _ => {}
         }
     }
+    let int_val: i64 = int_part.parse().ok()?;
+    let paise = int_val.checked_mul(100)?.checked_add(frac_paise)?;
+    if paise > MAX_ABS_PAISE_FOR_DECIMAL_STRING {
+        return None;
+    }
+    Some(if neg { -paise } else { paise })
 }
 
-impl From<&GrowwOrdersConfig> for GrowwSmartOrderSettings {
-    // WIRING-EXEMPT: §39.3 area PR — the boot wiring that maps `[groww_orders]`
-    // into this settings struct lands with the later orchestrator PR; tested inline.
-    fn from(cfg: &GrowwOrdersConfig) -> Self {
-        // Defensive clamps (H-LOW, 2026-07-15): a 0 on either knob would
-        // hot-loop the poller / make every sibling-cancel check an instant
-        // Violation. 0 → the documented default, with one bounded warn! at
-        // construction (this mapper runs once at boot wiring).
-        let defaults = Self::default();
-        let reconcile_poll_secs = if cfg.oco_reconcile_poll_secs == 0 {
-            tracing::warn!(
-                clamped_to = defaults.reconcile_poll_secs,
-                "groww smart-orders: oco_reconcile_poll_secs = 0 clamped to default"
-            );
-            defaults.reconcile_poll_secs
-        } else {
-            cfg.oco_reconcile_poll_secs
-        };
-        let sibling_cancel_deadline_secs = if cfg.oco_sibling_cancel_deadline_secs == 0 {
-            tracing::warn!(
-                clamped_to = defaults.sibling_cancel_deadline_secs,
-                "groww smart-orders: oco_sibling_cancel_deadline_secs = 0 clamped to default"
-            );
-            defaults.sibling_cancel_deadline_secs
-        } else {
-            cfg.oco_sibling_cancel_deadline_secs
-        };
-        Self {
-            read_enabled: cfg.smart_orders_read,
-            write_enabled: cfg.smart_orders_write,
-            reconcile_poll_secs,
-            sibling_cancel_deadline_secs,
-        }
+/// Serialize a required paise field as a decimal wire string.
+fn ser_paise_decimal<S: Serializer>(v: &i64, s: S) -> Result<S::Ok, S::Error> {
+    s.serialize_str(&paise_to_decimal_string(*v))
+}
+
+/// Serialize an optional paise field as a decimal wire string or an EXPLICIT
+/// `null` (the doc's own SL_M example carries `"price": null` — the field is
+/// always present on leg objects, never skipped).
+fn ser_opt_paise_decimal<S: Serializer>(v: &Option<i64>, s: S) -> Result<S::Ok, S::Error> {
+    match v {
+        Some(p) => s.serialize_str(&paise_to_decimal_string(*p)),
+        None => s.serialize_none(),
     }
 }
 
 // ---------------------------------------------------------------------------
-// Wire enums (doc 18 §2/§6 verbatim values)
+// Wire enums (CLOSED on the request side)
 // ---------------------------------------------------------------------------
 
-/// Order type of a smart-order leg / embedded order. Wire values `LIMIT` /
-/// `MARKET` / `SL` / `SL_M` (doc 13 annexure + doc 18 §2).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum SmartLegOrderType {
-    /// `LIMIT` — requires an explicit `price`.
-    Limit,
-    /// `MARKET` — no `price`.
-    Market,
-    /// `SL` (stop-loss limit) — requires an explicit `price`.
-    Sl,
-    /// `SL_M` (stop-loss market) — `price` MUST be null (doc 18 §2 body
-    /// example shows `"price": null` for `SL_M`).
-    SlM,
+/// The two smart-order flows (`18` §1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+pub enum SmartOrderType {
+    /// Good-Till-Triggered — one trigger, one order leg.
+    #[serde(rename = "GTT")]
+    Gtt,
+    /// One-Cancels-Other — target + stop-loss exit pair.
+    #[serde(rename = "OCO")]
+    Oco,
 }
 
-/// Trade direction. Wire values `BUY` / `SELL`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum TransactionType {
-    /// `BUY` — for an OCO, the exit direction of a SHORT position.
-    Buy,
-    /// `SELL` — for an OCO, the exit direction of a LONG position.
-    Sell,
+impl SmartOrderType {
+    /// Stable wire/audit label (also the cancel/get PATH segment).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Gtt => "GTT",
+            Self::Oco => "OCO",
+        }
+    }
 }
 
-/// GTT trigger monitor direction. Wire values `UP` / `DOWN` (doc 18 §6).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+/// GTT trigger direction (`18` §1 / SDK constants).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 pub enum TriggerDirection {
-    /// `UP` — trigger when price crosses ABOVE the trigger price.
+    /// Trigger when price crosses UP through the trigger.
+    #[serde(rename = "UP")]
     Up,
-    /// `DOWN` — trigger when price crosses BELOW the trigger price.
+    /// Trigger when price crosses DOWN through the trigger.
+    #[serde(rename = "DOWN")]
     Down,
 }
 
+impl TriggerDirection {
+    /// Stable wire/audit label.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Up => "UP",
+            Self::Down => "DOWN",
+        }
+    }
+}
+
+/// OCO TARGET-leg order types (`18` §2: "Examples: LIMIT, MARKET") — CLOSED.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+pub enum TargetLegOrderType {
+    /// Limit target (price required).
+    #[serde(rename = "LIMIT")]
+    Limit,
+    /// Market target (no price).
+    #[serde(rename = "MARKET")]
+    Market,
+}
+
+impl TargetLegOrderType {
+    /// Stable wire/audit label.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Limit => "LIMIT",
+            Self::Market => "MARKET",
+        }
+    }
+}
+
+/// OCO STOP-LOSS-leg order types (`18` §2: "Examples: SL, SL_M") — CLOSED.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+pub enum StopLossLegOrderType {
+    /// Stop-loss LIMIT (price required).
+    #[serde(rename = "SL")]
+    Sl,
+    /// Stop-loss MARKET (`null` price — the doc's own body example).
+    #[serde(rename = "SL_M")]
+    SlM,
+}
+
+impl StopLossLegOrderType {
+    /// Stable wire/audit label.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Sl => "SL",
+            Self::SlM => "SL_M",
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
-// Request wire structs (snake_case field names verbatim from doc 18)
+// Create requests (field-for-field per 18-smart-orders-schemas §2.2/§2.3)
 // ---------------------------------------------------------------------------
 
-/// One OCO leg (`target` or `stop_loss`) — doc 18 §2 [R:L140–L159].
-/// `price` serializes as `null` when `None` (the doc's own SL_M example
-/// carries an explicit `"price": null`), so NO `skip_serializing_if`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct OcoLeg {
-    /// Trigger price as a DECIMAL STRING (e.g. `"120.50"`). Build it from
-    /// integer paise via [`paise_to_decimal_string`].
-    pub trigger_price: String,
-    /// Leg order type. Target legs: `LIMIT`/`MARKET`. Stop-loss legs:
-    /// `SL`/`SL_M` (validated by [`validate_oco_create`]).
-    pub order_type: SmartLegOrderType,
-    /// Leg limit price (decimal string). Required iff the leg order type
-    /// needs one (`LIMIT` / `SL`); MUST be `None` for `SL_M`.
-    pub price: Option<String>,
+/// The GTT `order` leg object — also the wire shape a GTT MODIFY sends when
+/// the leg is being changed (`order.transaction_type` is "required but not
+/// modifiable" per the doc, so the WHOLE leg travels).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct GttOrderLeg {
+    /// Leg order type (LIMIT | MARKET | SL | SL_M — the doc's modify note
+    /// names all four: "required for LIMIT/SL types; set to null for
+    /// MARKET/SL_M").
+    pub order_type: GrowwOrderType,
+    /// Leg limit price in integer paise; wire: decimal string or explicit
+    /// `null` (LIMIT/SL require it; MARKET/SL_M require null).
+    #[serde(serialize_with = "ser_opt_paise_decimal")]
+    pub price: Option<i64>,
+    /// BUY | SELL — required, NOT modifiable.
+    pub transaction_type: GrowwTransactionType,
 }
 
-/// `POST /v1/order-advance/create` body for an OCO — doc 18 §2 verbatim
-/// field names. OCO is EXIT-ONLY ("OCO orders are meant to exit an
-/// existing position" — doc 18 §2 [P:L178–L182]).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct OcoCreateRequest {
-    /// Idempotency key — see [`validate_reference_id`].
+/// `POST /v1/order-advance/create` — the GTT body (`18` §0 + `16` GTT table).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct GrowwCreateGttReq {
+    /// 8–20-alnum ≤2-hyphen idempotency key (the executor overwrites it with
+    /// a freshly generated `TV…` reference).
     pub reference_id: String,
-    /// Always [`SMART_ORDER_TYPE_OCO`].
-    pub smart_order_type: &'static str,
-    /// `FNO` only today ([`validate_oco_create`] rejects `CASH` — doc 18
-    /// §8.1 records an intra-doc contradiction on CASH OCO; we fail closed).
-    pub segment: String,
-    /// Exchange trading symbol (e.g. `NIFTY25OCT24000CE`).
-    pub trading_symbol: String,
-    /// Total quantity for BOTH legs — must be ≤ `abs(net_position_quantity)`
-    /// and a lot-size multiple (doc 18 §2).
-    pub quantity: i64,
-    /// Current net position in this symbol — "Used to derive leg directions
-    /// and validate quantity" (doc 18 §2).
-    pub net_position_quantity: i64,
-    /// "Direction of protection/exit for your position" (doc 18 §2).
-    pub transaction_type: TransactionType,
-    /// Take-profit leg (`LIMIT`/`MARKET`).
-    pub target: OcoLeg,
-    /// Stop-loss leg (`SL`/`SL_M`).
-    pub stop_loss: OcoLeg,
-    /// Product for the OCO (e.g. `MIS`, `NRML`).
-    pub product_type: String,
-    /// Exchange (e.g. `NSE`).
-    pub exchange: String,
-    /// Validity for both legs (e.g. `DAY` — the only documented value).
-    pub duration: String,
-}
-
-/// The GTT post-trigger embedded order — doc 18 / doc 16 GTT schema.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct GttEmbeddedOrder {
-    /// Post-trigger execution order type.
-    pub order_type: SmartLegOrderType,
-    /// Post-trigger limit price — "required if order.order_type is LIMIT
-    /// or SL" (doc); `None` (→ `null`) for `MARKET`/`SL_M`.
-    pub price: Option<String>,
-    /// `BUY` / `SELL`.
-    pub transaction_type: TransactionType,
-}
-
-/// `POST /v1/order-advance/create` body for a GTT — verbatim field names
-/// from the GTT create schema (doc 16 §1 row 14 / doc 18 §0).
-///
-/// `child_legs` is DELIBERATELY OMITTED: its object structure is UNKNOWN
-/// (doc 18 §9 probe **P1** — the schema says only "object … target/stop-loss"
-/// and every doc example shows `null`). Add the field ONLY after the live
-/// P1 probe resolves the accepted shape — never contract on a guess.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct GttCreateRequest {
-    /// Idempotency key — see [`validate_reference_id`].
-    pub reference_id: String,
-    /// Always [`SMART_ORDER_TYPE_GTT`].
-    pub smart_order_type: &'static str,
-    /// `CASH` or `FNO` (GTT supports both; COMMODITY never).
-    pub segment: String,
+    /// Always [`SmartOrderType::Gtt`] (validated).
+    pub smart_order_type: SmartOrderType,
+    /// CASH | FNO (COMMODITY is unsupported for smart orders — the closed
+    /// [`GrowwSegment`] enum has no commodity arm by construction).
+    pub segment: GrowwSegment,
     /// Exchange trading symbol.
     pub trading_symbol: String,
-    /// Quantity for the post-trigger order ("For FNO, must respect lot
-    /// size" — doc).
+    /// Order quantity ("For FNO, must respect lot size" — broker-validated).
     pub quantity: i64,
-    /// Trigger price as a decimal string.
-    pub trigger_price: String,
-    /// Direction to monitor relative to the trigger price.
+    /// Trigger price, integer paise (wire: decimal string).
+    #[serde(serialize_with = "ser_paise_decimal")]
+    pub trigger_price: i64,
+    /// UP | DOWN.
     pub trigger_direction: TriggerDirection,
-    /// The post-trigger order.
-    pub order: GttEmbeddedOrder,
-    /// Product for the post-trigger order (`CNC`/`MIS`/`NRML`).
-    pub product_type: String,
-    /// Exchange (e.g. `NSE`).
-    pub exchange: String,
-    /// Validity of the POST-TRIGGER order (doc: `DAY`).
-    pub duration: String,
-}
-
-/// A partial leg inside a modify body — doc 18 §3 shows legs sent
-/// partially: `"target": {"trigger_price": "122.00"}`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct ModifyLeg {
-    /// The new trigger price (decimal string).
-    pub trigger_price: String,
-}
-
-/// `PUT /v1/order-advance/modify/{smart_order_id}` body — ONLY the
-/// OCO-modifiable fields (doc 18 §3: `quantity`, `duration`,
-/// `product_type`, `target.trigger_price`, `stop_loss.trigger_price`).
-/// Leg `order_type`/`price` are NOT modifiable by the API
-/// ([P:L327–L331]) — use cancel + create for those. `smart_order_type` +
-/// `segment` are routing-REQUIRED in the body ([R:L243–L244]).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct SmartOrderModifyRequest {
-    /// Routing-required in the body ([R:L243–L244]). OCO ONLY today —
-    /// `validate_modify` fail-closes GTT (its modifiable set is a
-    /// different shape; see the H-MED note there).
-    pub smart_order_type: &'static str,
-    /// Routing-required: `FNO` / `CASH`.
-    pub segment: String,
-    /// New total quantity (absent = unchanged).
+    /// The single order leg fired at trigger.
+    pub order: GttOrderLeg,
+    /// Optional bracket child legs — structure UNDOCUMENTED (probe P1);
+    /// modeled as an opaque JSON value, never interpreted locally.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub quantity: Option<i64>,
-    /// New duration (absent = unchanged).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub duration: Option<String>,
-    /// New product (absent = unchanged; doc: "MIS ↔ NRML for FNO").
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub product_type: Option<String>,
-    /// New target trigger price (absent = unchanged).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub target: Option<ModifyLeg>,
-    /// New stop-loss trigger price (absent = unchanged).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub stop_loss: Option<ModifyLeg>,
+    pub child_legs: Option<serde_json::Value>,
+    /// Product (CNC | MIS | NRML).
+    pub product_type: GrowwProduct,
+    /// Exchange (NSE | BSE).
+    pub exchange: GrowwExchange,
+    /// DAY-only validity (wire field name is `duration` on this surface).
+    pub duration: GrowwValidity,
 }
 
-// ---------------------------------------------------------------------------
-// Response wire structs (#[serde(default)] tolerance everywhere — the
-// broker may add/omit fields; unknown fields are ignored by serde)
-// ---------------------------------------------------------------------------
-
-/// The GA error object inside a FAILURE envelope (doc 16 §5:
-/// `{"status":"FAILURE","error":{"code":"GA001","message":"..."}}`).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
-#[serde(default)]
-pub struct GaError {
-    /// GA wire code (`GA000`..`GA007`).
-    pub code: String,
-    /// Request-specific message (bounded + redacted before any log).
-    pub message: String,
+/// An OCO TARGET leg (create).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct OcoTargetLeg {
+    /// Take-profit trigger price, integer paise (wire: decimal string).
+    #[serde(serialize_with = "ser_paise_decimal")]
+    pub trigger_price: i64,
+    /// LIMIT | MARKET.
+    pub order_type: TargetLegOrderType,
+    /// Limit price (required iff LIMIT; explicit `null` otherwise).
+    #[serde(serialize_with = "ser_opt_paise_decimal")]
+    pub price: Option<i64>,
 }
 
-/// The generic Groww envelope: `{ "status": ..., "payload": ..., "error": ... }`.
-/// Tolerant: every field defaults, so a drifted body degrades to a typed
-/// parse verdict, never a panic.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
-pub struct GaEnvelope<T> {
-    /// `SUCCESS` / `FAILURE` (empty when absent).
-    #[serde(default)]
-    pub status: String,
-    /// The success payload (absent on failure).
-    #[serde(default = "Option::default")]
-    pub payload: Option<T>,
-    /// The failure object (absent on success).
-    #[serde(default)]
-    pub error: Option<GaError>,
+/// An OCO STOP-LOSS leg (create).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct OcoStopLossLeg {
+    /// Stop-loss trigger price, integer paise (wire: decimal string).
+    #[serde(serialize_with = "ser_paise_decimal")]
+    pub trigger_price: i64,
+    /// SL | SL_M.
+    pub order_type: StopLossLegOrderType,
+    /// Limit price (required iff SL; explicit `null` for SL_M — the doc's
+    /// own example).
+    #[serde(serialize_with = "ser_opt_paise_decimal")]
+    pub price: Option<i64>,
 }
 
-/// A deserialized leg on a smart-order RESPONSE (same shape as [`OcoLeg`]
-/// but fully tolerant — the broker may omit any field).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
-#[serde(default)]
-pub struct ResponseLeg {
-    /// Trigger price (decimal string) as echoed by the broker.
-    pub trigger_price: String,
-    /// Leg order type as a RAW string (kept verbatim — response tolerance;
-    /// an unknown future value must never fail the whole parse).
-    pub order_type: String,
-    /// Leg limit price (`null` for market-class legs).
-    pub price: Option<String>,
-}
-
-/// The smart-order object of the §7 response schemas (GTT + OCO fields
-/// unioned; GTT-only fields like `trigger_price` are `Option`). The
-/// response `ltp` (the schema's only non-string price, GTT-only) is
-/// deliberately NOT modeled — serde ignores it; nothing here consumes a
-/// float price.
-#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
-#[serde(default)]
-pub struct SmartOrderPayload {
-    /// Broker-assigned id (`gtt_…` / `oco_…`).
-    pub smart_order_id: String,
-    /// `GTT` / `OCO`.
-    pub smart_order_type: String,
-    /// RAW lifecycle status string — map via
-    /// [`SmartOrderStatus::from_groww_smart_status`].
-    pub status: String,
-    /// Trading symbol.
+/// `POST /v1/order-advance/create` — the OCO body (`18` §2). OCO is
+/// EXIT-ONLY: "OCO orders are meant to exit an existing position."
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct GrowwCreateOcoReq {
+    /// Idempotency key (executor-generated).
+    pub reference_id: String,
+    /// Always [`SmartOrderType::Oco`] (validated).
+    pub smart_order_type: SmartOrderType,
+    /// CASH | FNO. CASH-OCO availability is intra-doc CONTRADICTED (probe
+    /// P9); when CASH, the product MUST be MIS (both doc arms agree).
+    pub segment: GrowwSegment,
+    /// Exchange trading symbol.
     pub trading_symbol: String,
+    /// "Total quantity for both legs. Must be ≤ abs(net_position_quantity)."
+    pub quantity: i64,
+    /// "Your current net position in this symbol." — leg directions derive
+    /// from it; exit-only means it can never be 0.
+    pub net_position_quantity: i64,
+    /// "Direction of protection/exit for your position."
+    pub transaction_type: GrowwTransactionType,
+    /// The take-profit leg.
+    pub target: OcoTargetLeg,
+    /// The stop-loss leg.
+    pub stop_loss: OcoStopLossLeg,
+    /// Product ("For OCO in cash segment, only MIS is supported currently").
+    pub product_type: GrowwProduct,
     /// Exchange.
-    pub exchange: String,
-    /// Segment (GTT responses carry it; OCO's §7 schema does not).
-    pub segment: String,
-    /// Quantity (absent on the partial modify echo → `None`).
+    pub exchange: GrowwExchange,
+    /// DAY-only validity (wire name `duration`).
+    pub duration: GrowwValidity,
+}
+
+/// A create request for either flow — serializes as the inner body verbatim
+/// (`smart_order_type` discriminates on the wire, per the doc).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(untagged)]
+pub enum SmartOrderCreate {
+    /// A GTT create.
+    Gtt(GrowwCreateGttReq),
+    /// An OCO create.
+    Oco(GrowwCreateOcoReq),
+}
+
+impl SmartOrderCreate {
+    /// The flow discriminant.
+    #[must_use]
+    pub fn smart_order_type(&self) -> SmartOrderType {
+        match self {
+            Self::Gtt(_) => SmartOrderType::Gtt,
+            Self::Oco(_) => SmartOrderType::Oco,
+        }
+    }
+
+    /// The request's segment.
+    #[must_use]
+    pub fn segment(&self) -> GrowwSegment {
+        match self {
+            Self::Gtt(r) => r.segment,
+            Self::Oco(r) => r.segment,
+        }
+    }
+
+    /// The request's trading symbol.
+    #[must_use]
+    pub fn trading_symbol(&self) -> &str {
+        match self {
+            Self::Gtt(r) => &r.trading_symbol,
+            Self::Oco(r) => &r.trading_symbol,
+        }
+    }
+
+    /// The request's quantity.
+    #[must_use]
+    pub fn quantity(&self) -> i64 {
+        match self {
+            Self::Gtt(r) => r.quantity,
+            Self::Oco(r) => r.quantity,
+        }
+    }
+
+    /// The request's reference id.
+    #[must_use]
+    pub fn reference_id(&self) -> &str {
+        match self {
+            Self::Gtt(r) => &r.reference_id,
+            Self::Oco(r) => &r.reference_id,
+        }
+    }
+
+    /// Overwrite the reference id (the executor owns idempotency).
+    pub fn set_reference_id(&mut self, reference_id: &str) {
+        match self {
+            Self::Gtt(r) => reference_id.clone_into(&mut r.reference_id),
+            Self::Oco(r) => reference_id.clone_into(&mut r.reference_id),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Modify — the PER-TYPE modifiable-field matrix (the doc-corrected rule)
+// ---------------------------------------------------------------------------
+
+/// The caller's desired changes — validated against the PER-TYPE matrix
+/// BEFORE any wire body is built (an immutable-field attempt is a typed
+/// refusal, GROWW-OCO-04, never an HTTP call).
+///
+/// | Field | GTT | OCO |
+/// |---|---|---|
+/// | `quantity` | ✅ | ✅ |
+/// | `trigger_price` | ✅ | — (use the per-leg fields) |
+/// | `trigger_direction` | ✅ | ❌ (N/A) |
+/// | `order_leg` (order_type + price + txn) | ✅ | ❌ (leg type/price NOT modifiable) |
+/// | `child_legs` | ✅ | ❌ |
+/// | `duration` | ❌ | ✅ |
+/// | `product_type` | ❌ | ✅ |
+/// | `target_trigger_price` | ❌ | ✅ |
+/// | `stop_loss_trigger_price` | ❌ | ✅ |
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct SmartModifyFields {
+    /// New quantity (both flows).
     pub quantity: Option<i64>,
-    /// Product type.
-    pub product_type: String,
-    /// Duration.
-    pub duration: String,
-    /// GTT-only: trigger price (decimal string).
+    /// New GTT trigger price (paise).
+    pub trigger_price: Option<i64>,
+    /// New GTT trigger direction.
+    pub trigger_direction: Option<TriggerDirection>,
+    /// New GTT order leg (the whole leg travels — `transaction_type` is
+    /// required-but-not-modifiable, price shape follows the leg order type).
+    pub order_leg: Option<GttOrderLeg>,
+    /// New GTT child legs (opaque — "all child leg fields are modifiable").
+    pub child_legs: Option<serde_json::Value>,
+    /// New OCO duration.
+    pub duration: Option<GrowwValidity>,
+    /// New OCO product ("e.g., MIS ↔ NRML for FNO; CASH OCO only supports
+    /// MIS").
+    pub product_type: Option<GrowwProduct>,
+    /// New OCO target trigger price (paise).
+    pub target_trigger_price: Option<i64>,
+    /// New OCO stop-loss trigger price (paise).
+    pub stop_loss_trigger_price: Option<i64>,
+}
+
+impl SmartModifyFields {
+    /// Whether NO field is set (an empty modify is refused).
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.quantity.is_none()
+            && self.trigger_price.is_none()
+            && self.trigger_direction.is_none()
+            && self.order_leg.is_none()
+            && self.child_legs.is_none()
+            && self.duration.is_none()
+            && self.product_type.is_none()
+            && self.target_trigger_price.is_none()
+            && self.stop_loss_trigger_price.is_none()
+    }
+}
+
+/// `PUT /v1/order-advance/modify/{id}` — GTT wire body (routing fields +
+/// only-what-changes).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct GttModifyBody {
+    /// Routing-required flow discriminant.
+    pub smart_order_type: SmartOrderType,
+    /// Routing-required segment.
+    pub segment: GrowwSegment,
+    /// New quantity, when changing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quantity: Option<i64>,
+    /// New trigger price, when changing (skipped when absent; `Some` always
+    /// serializes as a decimal wire string, `None` is skipped before the
+    /// serializer is reached).
+    #[serde(
+        serialize_with = "ser_opt_paise_decimal",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub trigger_price: Option<i64>,
+    /// New trigger direction, when changing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trigger_direction: Option<TriggerDirection>,
+    /// The whole order leg, when changing it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub order: Option<GttOrderLeg>,
+    /// New child legs, when changing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub child_legs: Option<serde_json::Value>,
+}
+
+/// A trigger-price-only leg patch (OCO modify legs may be sent PARTIALLY —
+/// the doc's own example: `"target": {"trigger_price": "122.00"}`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct LegTriggerPatch {
+    /// The new leg trigger price (paise → decimal string).
+    #[serde(serialize_with = "ser_paise_decimal")]
+    pub trigger_price: i64,
+}
+
+/// `PUT /v1/order-advance/modify/{id}` — OCO wire body.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct OcoModifyBody {
+    /// Routing-required flow discriminant.
+    pub smart_order_type: SmartOrderType,
+    /// Routing-required segment.
+    pub segment: GrowwSegment,
+    /// New quantity, when changing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quantity: Option<i64>,
+    /// New duration, when changing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration: Option<GrowwValidity>,
+    /// New product, when changing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub product_type: Option<GrowwProduct>,
+    /// Partial target-leg patch, when changing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target: Option<LegTriggerPatch>,
+    /// Partial stop-loss-leg patch, when changing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop_loss: Option<LegTriggerPatch>,
+}
+
+/// A modify wire body for either flow (untagged — serializes the inner).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(untagged)]
+pub enum SmartModifyBody {
+    /// GTT modify body.
+    Gtt(GttModifyBody),
+    /// OCO modify body.
+    Oco(OcoModifyBody),
+}
+
+/// Build the wire modify body from VALIDATED fields ([`validate_modify_fields`]
+/// must have passed — this fn is shape-only).
+#[must_use]
+pub fn build_modify_body(
+    smart_order_type: SmartOrderType,
+    segment: GrowwSegment,
+    fields: &SmartModifyFields,
+) -> SmartModifyBody {
+    match smart_order_type {
+        SmartOrderType::Gtt => SmartModifyBody::Gtt(GttModifyBody {
+            smart_order_type,
+            segment,
+            quantity: fields.quantity,
+            trigger_price: fields.trigger_price,
+            trigger_direction: fields.trigger_direction,
+            order: fields.order_leg,
+            child_legs: fields.child_legs.clone(),
+        }),
+        SmartOrderType::Oco => SmartModifyBody::Oco(OcoModifyBody {
+            smart_order_type,
+            segment,
+            quantity: fields.quantity,
+            duration: fields.duration,
+            product_type: fields.product_type,
+            target: fields
+                .target_trigger_price
+                .map(|trigger_price| LegTriggerPatch { trigger_price }),
+            stop_loss: fields
+                .stop_loss_trigger_price
+                .map(|trigger_price| LegTriggerPatch { trigger_price }),
+        }),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// List query (explicit params — the OCO/ACTIVE defaults bite)
+// ---------------------------------------------------------------------------
+
+/// `GET /v1/order-advance/list` query. `smart_order_type` and `status` are
+/// EXPLICIT (the server defaults to `OCO` + `ACTIVE` — a reconcile poller
+/// must never rely on them). `page` clamps to 0..=500, `page_size` to
+/// 1..=50; the optional date window must span ≤ 1 month (server-validated).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SmartOrderListQuery {
+    /// Optional segment filter.
+    pub segment: Option<GrowwSegment>,
+    /// Explicit flow filter.
+    pub smart_order_type: SmartOrderType,
+    /// Explicit status filter (wire literal, e.g. `"ACTIVE"`).
+    pub status: &'static str,
+    /// Page (0-based; server max 500).
+    pub page: u32,
+    /// Page size (server 1..=50, default 10).
+    pub page_size: u32,
+}
+
+impl SmartOrderListQuery {
+    /// ACTIVE-page-0 query for one flow (the reconcile poller's shape).
+    #[must_use]
+    pub fn active(smart_order_type: SmartOrderType) -> Self {
+        Self {
+            segment: None,
+            smart_order_type,
+            status: "ACTIVE",
+            page: 0,
+            page_size: 50,
+        }
+    }
+
+    /// Render the query pairs, clamped to the documented bounds. Pure.
+    #[must_use]
+    pub fn to_query_pairs(&self) -> Vec<(&'static str, String)> {
+        let mut pairs = Vec::with_capacity(5);
+        if let Some(seg) = self.segment {
+            pairs.push(("segment", seg.as_str().to_owned()));
+        }
+        pairs.push((
+            "smart_order_type",
+            self.smart_order_type.as_str().to_owned(),
+        ));
+        pairs.push(("status", self.status.to_owned()));
+        pairs.push(("page", self.page.min(500).to_string()));
+        pairs.push(("page_size", self.page_size.clamp(1, 50).to_string()));
+        pairs
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Response payloads — ALL fields Option; prices RAW strings (tolerant)
+// ---------------------------------------------------------------------------
+
+/// A response leg echo (GTT `order` / OCO `target` / `stop_loss`). Prices
+/// stay RAW wire strings — nothing downstream decides on them (the reconcile
+/// compares status + quantity only), so a drifted price format can never
+/// fail the parse.
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+pub struct SmartOrderLegEcho {
+    /// Leg trigger price (raw decimal string).
+    #[serde(default)]
     pub trigger_price: Option<String>,
-    /// GTT-only: `UP`/`DOWN` (raw).
+    /// Leg order type (raw string).
+    #[serde(default)]
+    pub order_type: Option<String>,
+    /// Leg limit price (raw decimal string / null).
+    #[serde(default)]
+    pub price: Option<String>,
+    /// Leg transaction type (raw string — GTT `order` only).
+    #[serde(default)]
+    pub transaction_type: Option<String>,
+}
+
+/// The full smart-order response object (`18` §7 — GTT + OCO field union;
+/// every field `Option`, enum-valued fields raw strings, timestamps raw
+/// ISO-8601-no-timezone strings). NOTE (verified doc absence): NO
+/// `reference_id` and NO leg `groww_order_id` appear in either schema —
+/// an ambiguous create is therefore UNRESOLVABLE by reference (see the
+/// executor's fail-closed handling) and post-trigger leg linkage is
+/// undocumented (probe P5).
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+pub struct SmartOrderPayload {
+    /// Broker-assigned smart-order id (`gtt_…` / `oco_…`).
+    #[serde(default)]
+    pub smart_order_id: Option<String>,
+    /// `GTT` / `OCO` (raw).
+    #[serde(default)]
+    pub smart_order_type: Option<String>,
+    /// Lifecycle status (raw — parsed via [`SmartOrderStatus::parse`]).
+    #[serde(default)]
+    pub status: Option<String>,
+    /// Trading symbol.
+    #[serde(default)]
+    pub trading_symbol: Option<String>,
+    /// Exchange (raw).
+    #[serde(default)]
+    pub exchange: Option<String>,
+    /// Quantity.
+    #[serde(default)]
+    pub quantity: Option<i64>,
+    /// Product (raw).
+    #[serde(default)]
+    pub product_type: Option<String>,
+    /// Duration (raw).
+    #[serde(default)]
+    pub duration: Option<String>,
+    /// GTT trigger price (raw decimal string).
+    #[serde(default)]
+    pub trigger_price: Option<String>,
+    /// GTT trigger direction (raw).
+    #[serde(default)]
     pub trigger_direction: Option<String>,
-    /// GTT-only: the embedded post-trigger order (raw-tolerant).
-    pub order: Option<ResponseLeg>,
-    /// OCO-only: target leg.
-    pub target: Option<ResponseLeg>,
-    /// OCO-only: stop-loss leg.
-    pub stop_loss: Option<ResponseLeg>,
-    /// Per-order capability flag (doc 18 §7).
-    pub is_cancellation_allowed: Option<bool>,
-    /// Per-order capability flag (doc 18 §7).
-    pub is_modification_allowed: Option<bool>,
-    /// ISO 8601 string, no timezone suffix (doc 18 §7).
-    pub created_at: Option<String>,
-    /// ISO 8601 string (`null` on OCO create — doc 18 §2).
-    pub expire_at: Option<String>,
-    /// ISO 8601 string (`null` until triggered).
-    pub triggered_at: Option<String>,
-    /// ISO 8601 string.
-    pub updated_at: Option<String>,
-    /// GTT-only: remark / status message.
+    /// GTT order leg echo.
+    #[serde(default)]
+    pub order: Option<SmartOrderLegEcho>,
+    /// OCO target leg echo.
+    #[serde(default)]
+    pub target: Option<SmartOrderLegEcho>,
+    /// OCO stop-loss leg echo.
+    #[serde(default)]
+    pub stop_loss: Option<SmartOrderLegEcho>,
+    /// LTP — the ONLY float price on this surface (GTT get/list only).
+    #[serde(default)]
+    pub ltp: Option<f64>,
+    /// Broker remark / status message.
+    #[serde(default)]
     pub remark: Option<String>,
+    /// Display name.
+    #[serde(default)]
+    pub display_name: Option<String>,
+    /// Whether cancellation is currently allowed.
+    #[serde(default)]
+    pub is_cancellation_allowed: Option<bool>,
+    /// Whether modification is currently allowed.
+    #[serde(default)]
+    pub is_modification_allowed: Option<bool>,
+    /// Creation timestamp (raw).
+    #[serde(default)]
+    pub created_at: Option<String>,
+    /// Expiry timestamp (raw; GTT ≈ create+1y example-derived, OCO null).
+    #[serde(default)]
+    pub expire_at: Option<String>,
+    /// Trigger timestamp (raw; null until triggered).
+    #[serde(default)]
+    pub triggered_at: Option<String>,
+    /// Last-update timestamp (raw).
+    #[serde(default)]
+    pub updated_at: Option<String>,
 }
 
-/// `GET /v1/order-advance/list` payload: `{"orders":[…]}` (doc 18 §5).
-#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
-#[serde(default)]
+/// `GET /v1/order-advance/list` payload: `{"orders":[…]}`.
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
 pub struct SmartOrderListPayload {
-    /// Full smart-order objects, one per row.
-    pub orders: Vec<SmartOrderPayload>,
+    /// The rows (absent tolerated → empty downstream).
+    #[serde(default)]
+    pub orders: Option<Vec<SmartOrderPayload>>,
 }
 
 // ---------------------------------------------------------------------------
-// Smart-order lifecycle status (doc 18 §6 — the 6-value enum, DISTINCT
-// from the 12-value regular-order enum)
+// Status — the 6-value OPEN-SET lifecycle enum (distinct from regular orders)
 // ---------------------------------------------------------------------------
 
-/// Smart-order lifecycle status — total no-panic mapping of the doc 18 §6
-/// enum. An unrecognized wire value maps to [`SmartOrderStatus::Unknown`]
-/// carrying the (trimmed) raw string verbatim, mirroring the
-/// [`BrokerOrderStatus::from_groww_status`] raw-preservation discipline.
+/// Smart-order lifecycle status (`18` §6 — 6 documented values) + the
+/// open-set `Unknown` arm preserving the raw wire string. Parsing NEVER
+/// panics; an unknown status PARKS (never transitions, counted).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum SmartOrderStatus {
-    /// `ACTIVE` — monitoring trigger conditions.
+    /// "Order is monitoring trigger conditions".
     Active,
-    /// `TRIGGERED` — trigger condition met, order placed.
+    /// "Trigger condition met, order placed" — arms the OCO sibling-verify.
     Triggered,
-    /// `CANCELLED` — user cancelled (terminal).
+    /// "User cancelled the order" (terminal).
     Cancelled,
-    /// `EXPIRED` — time/date expiry (terminal).
+    /// "Order expired due to time/date expiry" (terminal).
     Expired,
-    /// `FAILED` — placement or trigger failed (terminal).
+    /// "Order placement or trigger failed" (terminal).
     Failed,
-    /// `COMPLETED` — successfully completed (terminal).
+    /// "Order successfully completed" (terminal).
     Completed,
-    /// Outside the documented vocabulary — raw string preserved.
+    /// Any other wire value — raw preserved for audit; PARKED.
     Unknown(String),
 }
 
 impl SmartOrderStatus {
-    /// Total, no-panic mapper from the raw wire string. Case-insensitive +
-    /// whitespace-trimmed (the [`BrokerOrderStatus::from_groww_status`]
-    /// style); anything unrecognized → [`Self::Unknown`] with the trimmed
-    /// original preserved.
+    /// Parse a wire status — case-insensitive, whitespace-trimmed, total.
     #[must_use]
-    pub fn from_groww_smart_status(raw: &str) -> Self {
-        match raw.trim().to_ascii_uppercase().as_str() {
+    pub fn parse(raw: &str) -> Self {
+        let trimmed = raw.trim();
+        match trimmed.to_ascii_uppercase().as_str() {
             "ACTIVE" => Self::Active,
             "TRIGGERED" => Self::Triggered,
             "CANCELLED" => Self::Cancelled,
             "EXPIRED" => Self::Expired,
             "FAILED" => Self::Failed,
             "COMPLETED" => Self::Completed,
-            _ => Self::Unknown(raw.trim().to_owned()),
+            _ => Self::Unknown(trimmed.to_owned()),
         }
     }
 
-    /// Stable label (audit / metric-label use). `Unknown` echoes its
-    /// preserved raw string.
+    /// Stable audit/metric label (`Unknown` reports the fixed `"UNKNOWN"` —
+    /// the raw string never rides a metric label).
     #[must_use]
     pub fn as_str(&self) -> &str {
         match self {
@@ -551,15 +787,11 @@ impl SmartOrderStatus {
             Self::Expired => "EXPIRED",
             Self::Failed => "FAILED",
             Self::Completed => "COMPLETED",
-            Self::Unknown(raw) => raw.as_str(),
+            Self::Unknown(_) => "UNKNOWN",
         }
     }
 
-    /// Terminal = no further lifecycle transition expected. `TRIGGERED` is
-    /// NOT terminal (the fired leg may still be working; the
-    /// TRIGGERED-vs-COMPLETED boundary prose is undocumented — doc 18 §6).
-    /// `Unknown` is NOT terminal (we cannot assert done-ness from a string
-    /// we did not understand).
+    /// Whether the status is a settled terminal.
     #[must_use]
     pub fn is_terminal(&self) -> bool {
         matches!(
@@ -567,2648 +799,2556 @@ impl SmartOrderStatus {
             Self::Cancelled | Self::Expired | Self::Failed | Self::Completed
         )
     }
-}
 
-// ---------------------------------------------------------------------------
-// Money discipline — integer paise ↔ decimal strings, exact, no float
-// ---------------------------------------------------------------------------
-
-/// Renders integer paise as the wire's decimal string with EXACTLY two
-/// decimals — pure integer arithmetic, no float anywhere.
-/// `1_950_050` → `"19500.50"`; `5` → `"0.05"`. Negative paise render with
-/// a leading `-` (total function; validation layers reject negatives where
-/// prices must be positive).
-#[must_use]
-pub fn paise_to_decimal_string(paise: i64) -> String {
-    // unsigned_abs handles i64::MIN without overflow.
-    let abs = paise.unsigned_abs();
-    let rupees = abs / 100;
-    let frac = abs % 100;
-    if paise < 0 {
-        format!("-{rupees}.{frac:02}")
-    } else {
-        format!("{rupees}.{frac:02}")
-    }
-}
-
-/// Parses a wire decimal string into integer paise — fail-closed:
-/// - at most 2 decimal digits (`>2dp` rejected — paise are the atom);
-/// - digits + at most one `.` only (so `NaN`/`inf`/exponents/signs are
-///   rejected by charset, never parsed via float);
-/// - negatives rejected (no negative price exists on this surface);
-/// - checked arithmetic (overflow → typed error, never wraparound).
-pub fn decimal_string_to_paise(raw: &str) -> Result<i64, SmartOrderValidationError> {
-    let trimmed = raw.trim();
-    let echo = || bounded_echo(raw);
-    if trimmed.is_empty() {
-        return Err(SmartOrderValidationError::InvalidPrice {
-            raw: echo(),
-            reason: "empty",
-        });
-    }
-    if trimmed.starts_with('-') {
-        return Err(SmartOrderValidationError::InvalidPrice {
-            raw: echo(),
-            reason: "negative not allowed",
-        });
-    }
-    let (int_part, frac_part) = match trimmed.split_once('.') {
-        Some((i, f)) => (i, Some(f)),
-        None => (trimmed, None),
-    };
-    if int_part.is_empty() || !int_part.bytes().all(|b| b.is_ascii_digit()) {
-        return Err(SmartOrderValidationError::InvalidPrice {
-            raw: echo(),
-            reason: "non-digit integer part",
-        });
-    }
-    let frac_paise: i64 = match frac_part {
-        None => 0,
-        Some(f) => {
-            if f.is_empty() || f.len() > 2 || !f.bytes().all(|b| b.is_ascii_digit()) {
-                return Err(SmartOrderValidationError::InvalidPrice {
-                    raw: echo(),
-                    reason: "fraction must be 1-2 digits",
-                });
-            }
-            // "5" means 50 paise; "05" means 5 paise.
-            let mut v: i64 = 0;
-            for b in f.bytes() {
-                v = v * 10 + i64::from(b - b'0');
-            }
-            if f.len() == 1 { v * 10 } else { v }
-        }
-    };
-    let int_rupees: i64 =
-        int_part
-            .parse()
-            .map_err(|_| SmartOrderValidationError::InvalidPrice {
-                raw: echo(),
-                reason: "integer part overflow",
-            })?;
-    int_rupees
-        .checked_mul(100)
-        .and_then(|p| p.checked_add(frac_paise))
-        .ok_or(SmartOrderValidationError::InvalidPrice {
-            raw: echo(),
-            reason: "paise overflow",
-        })
-}
-
-/// Bounds a raw input echoed into a typed error (char-boundary safe).
-fn bounded_echo(raw: &str) -> String {
-    let trimmed = raw.trim();
-    if trimmed.chars().count() <= ERROR_ECHO_MAX_CHARS {
-        trimmed.to_owned()
-    } else {
-        trimmed.chars().take(ERROR_ECHO_MAX_CHARS).collect()
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Validation (pure, fail-closed)
-// ---------------------------------------------------------------------------
-
-/// Typed, total validation errors — every reject names WHY.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub enum SmartOrderValidationError {
-    /// `reference_id` violates the doc contract (8-20 chars, `[A-Za-z0-9-]`,
-    /// ≤2 hyphens, alphanumeric content).
-    #[error("invalid reference_id: {reason}")]
-    InvalidReferenceId {
-        /// Which constraint failed.
-        reason: &'static str,
-    },
-    /// OCO is exit-only F&O today — CASH rejected fail-closed (doc 18 §8.1).
-    #[error("unsupported OCO segment `{segment}` — FNO only")]
-    UnsupportedOcoSegment {
-        /// The offending (bounded) segment string.
-        segment: String,
-    },
-    /// Quantity must be strictly positive.
-    #[error("quantity must be > 0 (got {quantity})")]
-    NonPositiveQuantity {
-        /// The offending quantity.
-        quantity: i64,
-    },
-    /// OCO quantity may not exceed `abs(net_position_quantity)` (doc 18 §2).
-    #[error("quantity {quantity} exceeds abs(net_position_quantity) {abs_net_position}")]
-    QuantityExceedsPosition {
-        /// The requested OCO quantity.
-        quantity: i64,
-        /// The absolute net position.
-        abs_net_position: i64,
-    },
-    /// Lot size must be strictly positive (caller-supplied).
-    #[error("lot_size must be > 0 (got {lot_size})")]
-    NonPositiveLotSize {
-        /// The offending lot size.
-        lot_size: i64,
-    },
-    /// FNO quantity must be a lot-size multiple (doc: "must respect lot size").
-    #[error("quantity {quantity} is not a multiple of lot_size {lot_size}")]
-    QuantityNotLotMultiple {
-        /// The requested quantity.
-        quantity: i64,
-        /// The instrument lot size.
-        lot_size: i64,
-    },
-    /// Target leg order type must be `LIMIT` or `MARKET` (doc 18 §2).
-    #[error("target leg order_type must be LIMIT or MARKET")]
-    TargetOrderTypeInvalid,
-    /// Stop-loss leg order type must be `SL` or `SL_M` (doc 18 §2).
-    #[error("stop_loss leg order_type must be SL or SL_M")]
-    StopLossOrderTypeInvalid,
-    /// A leg/order price is required for this order type but absent —
-    /// or present where it must be null.
-    #[error("price presence wrong for {leg} ({reason})")]
-    PricePresenceInvalid {
-        /// Which leg/order.
-        leg: &'static str,
-        /// Which direction the presence rule failed.
-        reason: &'static str,
-    },
-    /// A decimal price string failed to parse (bounded echo).
-    #[error("invalid decimal price `{raw}`: {reason}")]
-    InvalidPrice {
-        /// Bounded echo of the offending input.
-        raw: String,
-        /// Which parse rule failed.
-        reason: &'static str,
-    },
-    /// OCO trigger geometry inverted for the exit direction — OUR OWN
-    /// fail-closed guard, not doc-mandated (see
-    /// [`validate_oco_trigger_geometry`]).
-    #[error(
-        "OCO trigger geometry invalid for {transaction:?}: target {target_trigger_paise} vs stop-loss {sl_trigger_paise} paise"
-    )]
-    TriggerGeometryInvalid {
-        /// The exit direction.
-        transaction: TransactionType,
-        /// Target trigger, integer paise.
-        target_trigger_paise: i64,
-        /// Stop-loss trigger, integer paise.
-        sl_trigger_paise: i64,
-    },
-    /// A modify body with ZERO modifiable fields is a no-op — rejected.
-    #[error("modify request carries no modifiable field")]
-    EmptyModify,
-    /// Modify supports OCO only today — the GTT modifiable set is a
-    /// DIFFERENT shape not expressible with [`SmartOrderModifyRequest`]
-    /// (fail-closed; see `validate_modify`).
-    #[error("modify unsupported for smart_order_type `{smart_order_type}` — OCO only")]
-    UnsupportedModifyType {
-        /// The rejected smart-order type literal.
-        smart_order_type: &'static str,
-    },
-    /// A path component (segment / smart_order_type / smart_order_id)
-    /// failed the fail-closed charset check (URL-path injection defense).
-    #[error("invalid {component}: {reason}")]
-    InvalidPathComponent {
-        /// Which path component.
-        component: &'static str,
-        /// Which constraint failed.
-        reason: &'static str,
-    },
-    /// A list-pagination bound was violated (doc 18 §5 min/max).
-    #[error("list pagination out of bounds: {reason}")]
-    ListPaginationOutOfBounds {
-        /// Which bound failed.
-        reason: &'static str,
-    },
-}
-
-/// Validates the `reference_id` idempotency key: 8-20 chars, charset
-/// `[A-Za-z0-9-]`, at most two hyphens, and at least one alphanumeric
-/// character ("alphanumeric string … with at most two hyphens" — doc 18 §2).
-pub fn validate_reference_id(reference_id: &str) -> Result<(), SmartOrderValidationError> {
-    let len = reference_id.chars().count();
-    if !(REFERENCE_ID_MIN_LEN..=REFERENCE_ID_MAX_LEN).contains(&len) {
-        return Err(SmartOrderValidationError::InvalidReferenceId {
-            reason: "length must be 8-20 characters",
-        });
-    }
-    if !reference_id
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '-')
-    {
-        return Err(SmartOrderValidationError::InvalidReferenceId {
-            reason: "only [A-Za-z0-9-] allowed",
-        });
-    }
-    if reference_id.chars().filter(|c| *c == '-').count() > REFERENCE_ID_MAX_HYPHENS {
-        return Err(SmartOrderValidationError::InvalidReferenceId {
-            reason: "at most two hyphens allowed",
-        });
-    }
-    if !reference_id.chars().any(|c| c.is_ascii_alphanumeric()) {
-        return Err(SmartOrderValidationError::InvalidReferenceId {
-            reason: "must contain alphanumeric content",
-        });
-    }
-    Ok(())
-}
-
-/// OUR OWN fail-closed sanity guard on OCO trigger geometry — NOT
-/// doc-mandated (the doc says only "leg directions are derived from your
-/// net position"). For a `SELL` exit of a LONG position the take-profit
-/// trigger must sit ABOVE the stop-loss trigger; for a `BUY` exit of a
-/// SHORT position, BELOW. Equal triggers are always invalid (the two legs
-/// would race).
-pub fn validate_oco_trigger_geometry(
-    transaction_type: TransactionType,
-    target_trigger_paise: i64,
-    sl_trigger_paise: i64,
-) -> Result<(), SmartOrderValidationError> {
-    let ok = match transaction_type {
-        TransactionType::Sell => target_trigger_paise > sl_trigger_paise,
-        TransactionType::Buy => target_trigger_paise < sl_trigger_paise,
-    };
-    if ok {
-        Ok(())
-    } else {
-        Err(SmartOrderValidationError::TriggerGeometryInvalid {
-            transaction: transaction_type,
-            target_trigger_paise,
-            sl_trigger_paise,
-        })
-    }
-}
-
-/// Full fail-closed validation of an OCO create body (doc 18 §2 rules +
-/// our own geometry guard). `lot_size` is CALLER-SUPPLIED (from the
-/// instrument master) and must be > 0.
-pub fn validate_oco_create(
-    req: &OcoCreateRequest,
-    lot_size: i64,
-) -> Result<(), SmartOrderValidationError> {
-    validate_reference_id(&req.reference_id)?;
-    // OCO is exit-only F&O: the CASH arm is intra-doc CONTRADICTED
-    // (doc 18 §8.1 — header ban vs "CASH OCO only supports MIS"), so we
-    // fail closed on FNO-only until probe P9 resolves it live.
-    if req.segment != OCO_SEGMENT_FNO {
-        return Err(SmartOrderValidationError::UnsupportedOcoSegment {
-            segment: bounded_echo(&req.segment),
-        });
-    }
-    if req.quantity <= 0 {
-        return Err(SmartOrderValidationError::NonPositiveQuantity {
-            quantity: req.quantity,
-        });
-    }
-    let abs_net_position = req.net_position_quantity.unsigned_abs();
-    if req.quantity.unsigned_abs() > abs_net_position {
-        return Err(SmartOrderValidationError::QuantityExceedsPosition {
-            quantity: req.quantity,
-            abs_net_position: i64::try_from(abs_net_position).unwrap_or(i64::MAX),
-        });
-    }
-    if lot_size <= 0 {
-        return Err(SmartOrderValidationError::NonPositiveLotSize { lot_size });
-    }
-    if req.quantity % lot_size != 0 {
-        return Err(SmartOrderValidationError::QuantityNotLotMultiple {
-            quantity: req.quantity,
-            lot_size,
-        });
-    }
-    // Target leg: LIMIT/MARKET; price present iff LIMIT (MARKET-with-price
-    // is OUR fail-closed reading — the doc marks price "required if LIMIT"
-    // and its own MARKET-class examples carry null).
-    match req.target.order_type {
-        SmartLegOrderType::Limit => {
-            let price = req.target.price.as_deref().ok_or(
-                SmartOrderValidationError::PricePresenceInvalid {
-                    leg: "target",
-                    reason: "price required for LIMIT",
-                },
-            )?;
-            decimal_string_to_paise(price)?;
-        }
-        SmartLegOrderType::Market => {
-            if req.target.price.is_some() {
-                return Err(SmartOrderValidationError::PricePresenceInvalid {
-                    leg: "target",
-                    reason: "price must be absent for MARKET",
-                });
-            }
-        }
-        SmartLegOrderType::Sl | SmartLegOrderType::SlM => {
-            return Err(SmartOrderValidationError::TargetOrderTypeInvalid);
-        }
-    }
-    // Stop-loss leg: SL (price required) / SL_M (price MUST be None —
-    // the doc example carries an explicit null).
-    match req.stop_loss.order_type {
-        SmartLegOrderType::Sl => {
-            let price = req.stop_loss.price.as_deref().ok_or(
-                SmartOrderValidationError::PricePresenceInvalid {
-                    leg: "stop_loss",
-                    reason: "price required for SL",
-                },
-            )?;
-            decimal_string_to_paise(price)?;
-        }
-        SmartLegOrderType::SlM => {
-            if req.stop_loss.price.is_some() {
-                return Err(SmartOrderValidationError::PricePresenceInvalid {
-                    leg: "stop_loss",
-                    reason: "price must be absent for SL_M",
-                });
-            }
-        }
-        SmartLegOrderType::Limit | SmartLegOrderType::Market => {
-            return Err(SmartOrderValidationError::StopLossOrderTypeInvalid);
-        }
-    }
-    // Trigger prices parse + geometry sanity (our own guard).
-    let target_trigger = decimal_string_to_paise(&req.target.trigger_price)?;
-    let sl_trigger = decimal_string_to_paise(&req.stop_loss.trigger_price)?;
-    validate_oco_trigger_geometry(req.transaction_type, target_trigger, sl_trigger)
-}
-
-/// Fail-closed validation of a GTT create body: reference_id, positive
-/// quantity + lot-multiple (pass `lot_size = 1` for CASH), parseable
-/// trigger price, and the embedded order's price-presence rule
-/// (`LIMIT`/`SL` require a price; `MARKET`/`SL_M` must carry none).
-pub fn validate_gtt_create(
-    req: &GttCreateRequest,
-    lot_size: i64,
-) -> Result<(), SmartOrderValidationError> {
-    validate_reference_id(&req.reference_id)?;
-    if req.quantity <= 0 {
-        return Err(SmartOrderValidationError::NonPositiveQuantity {
-            quantity: req.quantity,
-        });
-    }
-    if lot_size <= 0 {
-        return Err(SmartOrderValidationError::NonPositiveLotSize { lot_size });
-    }
-    if req.quantity % lot_size != 0 {
-        return Err(SmartOrderValidationError::QuantityNotLotMultiple {
-            quantity: req.quantity,
-            lot_size,
-        });
-    }
-    decimal_string_to_paise(&req.trigger_price)?;
-    match req.order.order_type {
-        SmartLegOrderType::Limit | SmartLegOrderType::Sl => {
-            let price = req.order.price.as_deref().ok_or(
-                SmartOrderValidationError::PricePresenceInvalid {
-                    leg: "order",
-                    reason: "price required for LIMIT/SL",
-                },
-            )?;
-            decimal_string_to_paise(price)?;
-        }
-        SmartLegOrderType::Market | SmartLegOrderType::SlM => {
-            if req.order.price.is_some() {
-                return Err(SmartOrderValidationError::PricePresenceInvalid {
-                    leg: "order",
-                    reason: "price must be absent for MARKET/SL_M",
-                });
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Validates a modify body: at least one modifiable field present, and any
-/// supplied trigger price / quantity parses/passes its own rule.
-pub fn validate_modify(req: &SmartOrderModifyRequest) -> Result<(), SmartOrderValidationError> {
-    // OCO-ONLY, fail-closed (H-MED fix, 2026-07-15): the GTT modifiable
-    // set is DIFFERENT (quantity, trigger_price, trigger_direction,
-    // order.order_type, order.price, child_legs — doc 18 §3) and is NOT
-    // expressible with this OCO-shaped struct; accepting
-    // `smart_order_type = GTT` here would ship a mis-shaped request whose
-    // broker-side handling is unverified (probe class). A GTT-shaped
-    // modify type is a separate future addition.
-    if req.smart_order_type != SMART_ORDER_TYPE_OCO {
-        return Err(SmartOrderValidationError::UnsupportedModifyType {
-            smart_order_type: req.smart_order_type,
-        });
-    }
-    if req.quantity.is_none()
-        && req.duration.is_none()
-        && req.product_type.is_none()
-        && req.target.is_none()
-        && req.stop_loss.is_none()
-    {
-        return Err(SmartOrderValidationError::EmptyModify);
-    }
-    if let Some(q) = req.quantity
-        && q <= 0
-    {
-        return Err(SmartOrderValidationError::NonPositiveQuantity { quantity: q });
-    }
-    if let Some(leg) = &req.target {
-        decimal_string_to_paise(&leg.trigger_price)?;
-    }
-    if let Some(leg) = &req.stop_loss {
-        decimal_string_to_paise(&leg.trigger_price)?;
-    }
-    Ok(())
-}
-
-/// URL-path-injection defense: a path component (segment / type / id) must
-/// be non-empty ASCII `[A-Za-z0-9_-]` (covers `gtt_91a7f4` / `oco_a12bc3` /
-/// `FNO` / `OCO`), bounded ≤ 64 chars.
-fn validate_path_component(
-    component: &'static str,
-    value: &str,
-) -> Result<(), SmartOrderValidationError> {
-    if value.is_empty() || value.len() > 64 {
-        return Err(SmartOrderValidationError::InvalidPathComponent {
-            component,
-            reason: "must be 1-64 characters",
-        });
-    }
-    if !value
-        .bytes()
-        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
-    {
-        return Err(SmartOrderValidationError::InvalidPathComponent {
-            component,
-            reason: "only [A-Za-z0-9_-] allowed",
-        });
-    }
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// List query
-// ---------------------------------------------------------------------------
-
-/// Optional filters for `GET /v1/order-advance/list` (doc 18 §5). Every
-/// field absent = the broker's documented default.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct SmartOrderListQuery {
-    /// `FNO` / `CASH`.
-    pub segment: Option<String>,
-    /// `OCO` / `GTT` (broker default: `OCO`).
-    pub smart_order_type: Option<String>,
-    /// e.g. `ACTIVE` / `CANCELLED` / `COMPLETED` (broker default: `ACTIVE`).
-    pub status: Option<String>,
-    /// Page, 0-based (doc: min 0, max 500).
-    pub page: Option<u32>,
-    /// Page size (doc: min 1, max 50; default 10).
-    pub page_size: Option<u32>,
-    /// Inclusive ISO8601 `YYYY-MM-DDThh:mm:ss` window start.
-    pub start_date_time: Option<String>,
-    /// Inclusive window end (window must not exceed one month — broker-side
-    /// validation; we pass it through).
-    pub end_date_time: Option<String>,
-}
-
-impl SmartOrderListQuery {
-    /// Validates the documented pagination bounds (fail-closed before any
-    /// request), then renders the present filters as query pairs.
-    pub fn to_query_pairs(&self) -> Result<Vec<(&'static str, String)>, SmartOrderValidationError> {
-        if let Some(page) = self.page
-            && page > LIST_PAGE_MAX
-        {
-            return Err(SmartOrderValidationError::ListPaginationOutOfBounds {
-                reason: "page must be 0-500",
-            });
-        }
-        if let Some(size) = self.page_size
-            && !(LIST_PAGE_SIZE_MIN..=LIST_PAGE_SIZE_MAX).contains(&size)
-        {
-            return Err(SmartOrderValidationError::ListPaginationOutOfBounds {
-                reason: "page_size must be 1-50",
-            });
-        }
-        let mut pairs = Vec::with_capacity(7);
-        if let Some(v) = &self.segment {
-            pairs.push(("segment", v.clone()));
-        }
-        if let Some(v) = &self.smart_order_type {
-            pairs.push(("smart_order_type", v.clone()));
-        }
-        if let Some(v) = &self.status {
-            pairs.push(("status", v.clone()));
-        }
-        if let Some(v) = self.page {
-            pairs.push(("page", v.to_string()));
-        }
-        if let Some(v) = self.page_size {
-            pairs.push(("page_size", v.to_string()));
-        }
-        if let Some(v) = &self.start_date_time {
-            pairs.push(("start_date_time", v.clone()));
-        }
-        if let Some(v) = &self.end_date_time {
-            pairs.push(("end_date_time", v.clone()));
-        }
-        Ok(pairs)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Outcomes + errors (typed — no bools)
-// ---------------------------------------------------------------------------
-
-/// Typed outcome of a WRITE method (create/modify/cancel).
-#[derive(Debug, Clone, PartialEq)]
-pub enum SmartOrderOutcome {
-    /// `settings.write_enabled == false` (Gate 1) — nothing validated,
-    /// nothing serialized, nothing sent.
-    DisabledByConfig,
-    /// [`GROWW_ORDER_LIVE_FIRE`]` == false` (Gate 3) — the request was
-    /// FULLY validated + serialized, and this carries exactly what WOULD
-    /// have been sent. No HTTP was constructed.
-    DryRun {
-        /// The absolute endpoint URL.
-        endpoint: String,
-        /// The HTTP method (`POST`/`PUT`).
-        method: &'static str,
-        /// The serialized JSON body (empty string for the body-less cancel).
-        body_json: String,
-    },
-    /// LIVE path only (unreachable until the dated Gate-3 flip): the broker
-    /// accepted the request and returned this payload (boxed — the payload
-    /// is large relative to the other variants; cold path, so the one
-    /// allocation is fine).
-    Accepted(Box<SmartOrderPayload>),
-}
-
-/// Typed outcome of a READ method (status get / list).
-#[derive(Debug, Clone, PartialEq)]
-pub enum SmartOrderReadOutcome<T> {
-    /// `settings.read_enabled == false` — nothing sent.
-    DisabledByConfig,
-    /// The broker returned this payload.
-    Fetched(T),
-}
-
-/// Internal HTTP method selector — exhaustive, so a typo'd method can never
-/// silently coerce to a GET (H-LOW fix, 2026-07-15; was a `&'static str`
-/// with a `_ => GET` fallback arm).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum HttpMethod {
-    Get,
-    Post,
-    Put,
-}
-
-/// Transport-retry policy for one [`GrowwSmartOrderClient::send_request`]
-/// round-trip. WRITE paths MUST use [`RetryPolicy::Never`] — see the
-/// double-send rationale on `send_and_parse` (probe P10).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RetryPolicy {
-    /// Exactly one attempt — a transport failure is returned typed,
-    /// never re-sent (the write-path law).
-    Never,
-    /// One bounded retry on a TRANSPORT-class error (idempotent reads).
-    TransportOnce,
-}
-
-/// Internal write-op classifier for error-code selection (create/cancel →
-/// `GROWW-OCO-01`; modify → `GROWW-OCO-04`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WriteOp {
-    Create,
-    Modify,
-    Cancel,
-}
-
-impl WriteOp {
-    const fn as_str(self) -> &'static str {
+    /// Lifecycle rank for the monotone FSM (`None` = unrankable Unknown).
+    fn rank(&self) -> Option<u8> {
         match self {
-            Self::Create => "create",
-            Self::Modify => "modify",
-            Self::Cancel => "cancel",
+            Self::Active => Some(1),
+            Self::Triggered => Some(2),
+            Self::Cancelled | Self::Expired | Self::Failed | Self::Completed => Some(3),
+            Self::Unknown(_) => None,
         }
     }
 }
 
-/// Typed client errors. Every embedded broker/transport string is bounded
-/// + secret-redacted via [`capture_rest_error_body`] at capture time; the
-/// bearer token can never appear (it travels only in the header).
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+/// The FSM verdict for one observation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SmartTransitionOutcome {
+    /// Legal forward move — adopt the observed status.
+    Transition,
+    /// Same status — refresh only.
+    SameStatusRefresh,
+    /// Illegal (backward / out-of-terminal / unknown) — PARK, reconcile owns
+    /// it (never silently normalized).
+    Park,
+}
+
+/// Rank-monotone open-set transition evaluation — TOTAL over every
+/// (current × observed) pair:
+/// - observed `Unknown` → Park (vocabulary drift; raw preserved upstream);
+/// - current `Unknown` (parked) → any KNOWN observation recovers (Transition);
+/// - same status → refresh;
+/// - current terminal → Park (out-of-terminal is illegal, terminal→terminal
+///   included);
+/// - forward rank → Transition; backward rank → Park.
+#[must_use]
+pub fn evaluate_smart_transition(
+    current: &SmartOrderStatus,
+    observed: &SmartOrderStatus,
+) -> SmartTransitionOutcome {
+    if matches!(observed, SmartOrderStatus::Unknown(_)) {
+        return SmartTransitionOutcome::Park;
+    }
+    if matches!(current, SmartOrderStatus::Unknown(_)) {
+        return SmartTransitionOutcome::Transition;
+    }
+    if current == observed {
+        return SmartTransitionOutcome::SameStatusRefresh;
+    }
+    if current.is_terminal() {
+        return SmartTransitionOutcome::Park;
+    }
+    match (current.rank(), observed.rank()) {
+        (Some(c), Some(o)) if o > c => SmartTransitionOutcome::Transition,
+        _ => SmartTransitionOutcome::Park,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Errors
+// ---------------------------------------------------------------------------
+
+/// Typed Smart-Orders area error (pre-HTTP refusals + gate refusals).
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum SmartOrderError {
-    /// Fail-closed validation reject (nothing sent).
-    #[error("validation: {0}")]
-    Validation(#[from] SmartOrderValidationError),
-    /// The token provider returned no token (nothing sent; the shared
-    /// minter has not populated SSM — never minted here).
-    #[error("no Groww access token available (read-only provider returned none)")]
-    NoToken,
-    /// Serialization of the typed body failed (should be unreachable for
-    /// these plain structs; typed for totality).
-    #[error("serialize: {0}")]
-    Serialize(String),
-    /// Transport-class failure after the single bounded retry (bounded +
-    /// redacted message).
-    #[error("transport: {0}")]
-    Transport(String),
-    /// HTTP 429 — typed, counted (`tv_groww_smart_order_rate_limited_total`),
-    /// NEVER retried here (pacing belongs to the caller/poller).
-    #[error("rate limited (HTTP 429, retry-after header present: {retry_after_present})")]
-    RateLimited {
-        /// Whether the broker sent a `retry-after` header.
-        retry_after_present: bool,
+    /// A request field failed local validation.
+    #[error("invalid smart-order field: {0}")]
+    InvalidField(String),
+    /// A modify carried a field the flow's API declares immutable
+    /// (GROWW-OCO-04 — "Use cancel + create when you need changes outside
+    /// of these lists").
+    #[error("{smart_order_type} modify refused: `{field}` is not modifiable (cancel + create)")]
+    ImmutableField {
+        /// The flow (`GTT` / `OCO`).
+        smart_order_type: &'static str,
+        /// The refused field.
+        field: &'static str,
     },
-    /// The GA FAILURE envelope (any HTTP status incl. 2xx — the G1 lesson:
-    /// a 2xx body can carry `status: FAILURE`).
-    #[error("groww GA failure (http {http_status}) {code}: {message}")]
-    GaFailure {
-        /// The real HTTP status the envelope rode on.
-        http_status: u16,
-        /// GA wire code (`GA000`..`GA007`; empty when absent).
-        code: String,
-        /// Bounded + redacted broker message.
-        message: String,
+    /// Quantity exceeds the configured `max_order_quantity` gate.
+    #[error("smart-order quantity {quantity} refused (max_order_quantity = {max})")]
+    QuantityRefused {
+        /// Requested quantity.
+        quantity: i64,
+        /// Configured ceiling (0 = refuse all).
+        max: i64,
     },
-    /// Non-2xx without a parseable GA envelope (bounded + redacted body).
-    #[error("http {status}: {body}")]
-    HttpStatus {
-        /// The HTTP status.
-        status: u16,
-        /// Bounded + redacted body capture.
-        body: String,
+    /// OCO quantity exceeds |net position| (exit-only semantics).
+    #[error("OCO quantity {quantity} exceeds |net position| {net_position_quantity}")]
+    QuantityExceedsPosition {
+        /// Requested quantity.
+        quantity: i64,
+        /// The declared net position.
+        net_position_quantity: i64,
     },
-    /// A 2xx envelope whose `status` is NEITHER `SUCCESS` nor `FAILURE`
-    /// (e.g. `PENDING`, empty, a drifted value) — Rule-11: a 2xx is never
-    /// treated as success without positive `SUCCESS` evidence.
-    #[error("anomalous 2xx envelope (http {http_status}) status `{envelope_status}`")]
-    AnomalousEnvelope {
-        /// The real HTTP status the envelope rode on.
-        http_status: u16,
-        /// Bounded + redacted envelope `status` string.
-        envelope_status: String,
+    /// An invalid reference id (violates the 8–20-alnum-≤2-hyphens contract).
+    #[error("invalid smart-order reference_id: {0}")]
+    InvalidReferenceId(String),
+    /// CASH-segment OCO with a non-MIS product — BOTH doc arms agree CASH
+    /// OCO is MIS-only (availability itself is the contradicted P9 probe).
+    #[error("CASH-segment OCO requires product MIS (got {product})")]
+    CashOcoProductNotMis {
+        /// The refused product label.
+        product: &'static str,
     },
-    /// A 2xx body that did not parse into the expected envelope/payload.
-    #[error("parse: {0}")]
-    Parse(String),
+    /// The targeted smart order is not tracked locally — mutations are
+    /// refused fail-closed (never a blind wire call on a guessed id).
+    #[error("smart order {smart_order_id} is not tracked; mutation refused")]
+    UnknownSmartOrder {
+        /// The unknown id.
+        smart_order_id: String,
+    },
+    /// The targeted smart order is already terminal.
+    #[error("smart order {smart_order_id} is terminal ({status}); mutation refused")]
+    AlreadyTerminal {
+        /// The terminal order.
+        smart_order_id: String,
+        /// Its RAW terminal status label (adversarial round 1, finding 7 —
+        /// never a mislabeled catch-all).
+        status: String,
+    },
+    /// The tracked-book cap refused a new smart place.
+    #[error("tracked smart-order cap {cap} reached; new place refused")]
+    TrackedCapExceeded {
+        /// The cap.
+        cap: usize,
+    },
+    /// The per-order modification cap refused a further modify.
+    #[error("smart order {smart_order_id} reached the modification cap {cap}")]
+    ModificationCapExceeded {
+        /// The capped order.
+        smart_order_id: String,
+        /// The cap.
+        cap: u32,
+    },
+    /// A LIVE smart-order mutation was attempted without the full write
+    /// gate (`GROWW_ORDER_LIVE_FIRE` + `live_fire_requested` +
+    /// `smart_orders_write`) — defense-in-depth over Gates 2/3.
+    #[error("smart-order live write gate is closed (lattice §39.2)")]
+    WriteGateClosed,
+    /// A smart-order READ was attempted with `smart_orders_read` off or
+    /// outside market hours.
+    #[error("smart-order read gate is closed (smart_orders_read / market hours)")]
+    ReadGateClosed,
+    /// A broker-supplied smart-order id failed the path-segment shape check
+    /// (defense-in-depth — ids ride URL paths).
+    #[error("implausible smart_order_id shape; refused")]
+    ImplausibleSmartOrderId,
 }
 
 // ---------------------------------------------------------------------------
-// Pure decision helpers for the FUTURE reconcile orchestrator (§39.3 —
-// the GROWW-OCO-02 / GROWW-OCO-03 emit sites land with that PR; only the
-// verdict types + total functions ship here)
+// Gates
 // ---------------------------------------------------------------------------
 
-/// Verdict on the one-cancels-other invariant after leg execution.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SiblingVerdict {
-    /// Invariant holds: nothing executed yet, or the sibling is verified
-    /// cancelled / terminally unable to execute.
-    Ok,
-    /// One leg executed; the sibling is not yet terminal but the deadline
-    /// has not elapsed — keep polling.
-    AwaitingCancel,
-    /// The invariant is UNVERIFIED-BROKEN: both legs executed, or the
-    /// sibling is still live past the deadline (the GROWW-OCO-02
-    /// condition — potential double exposure).
-    Violation,
+/// The Smart-Orders slice of `[groww_orders]` — passed into the executor
+/// entry points (the `ExecutorConfig` struct is the Orders area's and stays
+/// untouched).
+#[derive(Debug, Clone, Copy)]
+pub struct SmartOrderGates {
+    /// Read-only get/list surface (market-hours-gated when enabled).
+    pub smart_orders_read: bool,
+    /// Mutation INTENT (inert without Gates 2+3).
+    pub smart_orders_write: bool,
+    /// The operator's declared live intent (inert without Gate 3).
+    pub live_fire_requested: bool,
+    /// Fail-closed per-order quantity cap (0 = refuse all).
+    pub max_order_quantity: i64,
+    /// GROWW-OCO-02 sibling-cancel verification deadline (seconds).
+    pub sibling_cancel_deadline_secs: u64,
+    /// Reconcile poller cadence (seconds).
+    pub reconcile_poll_secs: u64,
 }
 
-/// Total, no-panic sibling-cancel verdict ("If a leg executes, the other
-/// cancels automatically" — doc 18 §8.2; the cancel LOCUS and partial-fill
-/// behavior are UNDOCUMENTED, so a `PartiallyFilled` leg is treated as
-/// executed-class FAIL-CLOSED — it starts the deadline clock rather than
-/// being ignored).
-#[must_use]
-// WIRING-EXEMPT: §39.3 area PR — the reconcile-orchestrator consumer (the
-// GROWW-OCO-02 emit site) lands in its own later PR; tested inline.
-pub fn sibling_cancel_verdict(
-    leg_a: &BrokerOrderStatus,
-    leg_b: &BrokerOrderStatus,
-    secs_since_trigger: u64,
-    deadline_secs: u64,
-) -> SiblingVerdict {
-    let executed = |s: &BrokerOrderStatus| {
-        matches!(
-            s,
-            BrokerOrderStatus::Filled | BrokerOrderStatus::PartiallyFilled
-        )
-    };
-    match (executed(leg_a), executed(leg_b)) {
-        // Both legs executed — the OCO invariant is broken outright,
-        // regardless of any deadline.
-        (true, true) => SiblingVerdict::Violation,
-        // Nothing executed yet — nothing to verify.
-        (false, false) => SiblingVerdict::Ok,
-        (a_exec, _) => {
-            let sibling = if a_exec { leg_b } else { leg_a };
-            if matches!(sibling, BrokerOrderStatus::Cancelled) {
-                // The documented auto-cancel landed — verified.
-                SiblingVerdict::Ok
-            } else if sibling.is_terminal() {
-                // Rejected / Failed / Expired: the sibling can no longer
-                // execute, so no double-exposure risk remains.
-                SiblingVerdict::Ok
-            } else if secs_since_trigger <= deadline_secs {
-                SiblingVerdict::AwaitingCancel
-            } else {
-                SiblingVerdict::Violation
-            }
-        }
-    }
-}
-
-/// Verdict of the OCO-quantity-vs-net-position reconcile.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ReconcileVerdict {
-    /// The protective OCO exactly covers the net position.
-    Consistent,
-    /// The OCO would exit MORE than the position holds (over-exit risk —
-    /// the GROWW-OCO-03 condition).
-    OcoExceedsPosition {
-        /// The active OCO quantity.
-        oco_quantity: i64,
-        /// The absolute net position.
-        abs_net_position: i64,
-    },
-    /// Part of the position is UNPROTECTED by the OCO (under-coverage —
-    /// also a GROWW-OCO-03 condition; the operator judges).
-    PositionExceedsOco {
-        /// The active OCO quantity.
-        oco_quantity: i64,
-        /// The absolute net position.
-        abs_net_position: i64,
-    },
-    /// A caller passed a NEGATIVE quantity/abs-position — nonsensical
-    /// inputs are never trusted (H-LOW fix, 2026-07-15): the verdict is a
-    /// typed mismatch-class arm the orchestrator escalates, never a
-    /// mislabeled comparison and never a silent `Consistent`.
-    InvalidInputs {
-        /// The offending OCO quantity.
-        oco_quantity: i64,
-        /// The offending "absolute" net position.
-        abs_net_position: i64,
-    },
-}
-
-/// Total OCO-vs-position quantity reconcile (pure comparison — the
-/// GROWW-OCO-03 emit site lands with the later orchestrator PR).
-///
-/// Negative inputs return [`ReconcileVerdict::InvalidInputs`] — the caller
-/// contract is `abs(net_position)`, but the function never trusts it.
-///
-/// # Orchestrator traps (for the later reconcile PR — read before wiring)
-/// - **Clock source:** the `secs_since_trigger` fed to
-///   [`sibling_cancel_verdict`] must be measured from the LEG-EXECUTION
-///   OBSERVATION instant (the poll/push that first showed the fill) on a
-///   monotonic-ish clock — never from order-create time and never from a
-///   wall clock that can step backwards across the deadline.
-/// - **Leg-status mapping:** NO leg `groww_order_id` linkage is documented
-///   anywhere on the smart-order surface (doc 18 §7 verified absence —
-///   probe **P5**), so mapping each leg to a [`BrokerOrderStatus`] must
-///   correlate via `reference_id`/`remark`/symbol+time until P5 resolves;
-///   a wrong-leg correlation would mis-verdict the sibling check.
-#[must_use]
-// WIRING-EXEMPT: §39.3 area PR — the reconcile-orchestrator consumer (the
-// GROWW-OCO-03 emit site) lands in its own later PR; tested inline.
-pub fn reconcile_verdict(oco_quantity: i64, abs_net_position: i64) -> ReconcileVerdict {
-    if oco_quantity < 0 || abs_net_position < 0 {
-        return ReconcileVerdict::InvalidInputs {
-            oco_quantity,
-            abs_net_position,
-        };
-    }
-    match oco_quantity.cmp(&abs_net_position) {
-        std::cmp::Ordering::Equal => ReconcileVerdict::Consistent,
-        std::cmp::Ordering::Greater => ReconcileVerdict::OcoExceedsPosition {
-            oco_quantity,
-            abs_net_position,
-        },
-        std::cmp::Ordering::Less => ReconcileVerdict::PositionExceedsOco {
-            oco_quantity,
-            abs_net_position,
-        },
-    }
-}
-
-// ---------------------------------------------------------------------------
-// The client
-// ---------------------------------------------------------------------------
-
-/// READ-ONLY access-token provider — returns the current shared-minter
-/// token (or `None` when SSM has not been populated). NEVER mints
-/// (`groww-shared-token-minter-2026-07-02.md`).
-pub type GrowwAccessTokenProvider = Arc<dyn Fn() -> Option<String> + Send + Sync>;
-
-/// The Groww Smart Orders (GTT/OCO) REST client — every write hard-gated
-/// behind the §39.2 live-fire lattice (see the module doc).
-pub struct GrowwSmartOrderClient {
-    http: reqwest::Client,
-    base_url: String,
-    token_provider: GrowwAccessTokenProvider,
-    settings: GrowwSmartOrderSettings,
-}
-
-impl fmt::Debug for GrowwSmartOrderClient {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("GrowwSmartOrderClient")
-            .field("base_url", &self.base_url)
-            .field("settings", &self.settings)
-            .field("token_provider", &"<redacted fn>")
-            .finish()
-    }
-}
-
-impl GrowwSmartOrderClient {
-    /// Builds the client. `base_url_override` exists for tests (an
-    /// unroutable localhost proves no accidental send); production passes
-    /// `None` → [`GROWW_SMART_ORDER_BASE_URL`]. Trailing slashes on the
-    /// override are trimmed so path joins stay canonical.
+impl SmartOrderGates {
+    /// The fail-closed default: everything OFF, quantity cap 0 (refuse all),
+    /// deadlines at the documented config defaults.
     #[must_use]
-    // WIRING-EXEMPT: §39.3 area PR — the boot wiring that constructs this
-    // client lands with the later orchestrator PR; tested inline.
-    pub fn new(
-        http: reqwest::Client,
-        base_url_override: Option<String>,
-        token_provider: GrowwAccessTokenProvider,
-        settings: GrowwSmartOrderSettings,
-    ) -> Self {
-        let base_url = base_url_override
-            .map(|u| u.trim_end_matches('/').to_owned())
-            .unwrap_or_else(|| GROWW_SMART_ORDER_BASE_URL.to_owned());
+    pub const fn disabled() -> Self {
         Self {
-            http,
-            base_url,
-            token_provider,
-            settings,
+            smart_orders_read: false,
+            smart_orders_write: false,
+            live_fire_requested: false,
+            max_order_quantity: 0,
+            sibling_cancel_deadline_secs: 30,
+            reconcile_poll_secs: 15,
         }
     }
 
-    /// The effective settings (read-only view).
+    /// Build from the boot config (the single source of the knob values).
     #[must_use]
-    // WIRING-EXEMPT: §39.3 area PR — orchestrator introspection; tested inline.
-    pub fn settings(&self) -> &GrowwSmartOrderSettings {
-        &self.settings
+    pub fn from_config(cfg: &GrowwOrdersConfig) -> Self {
+        Self {
+            smart_orders_read: cfg.smart_orders_read,
+            smart_orders_write: cfg.smart_orders_write,
+            live_fire_requested: cfg.live_fire_requested,
+            max_order_quantity: cfg.max_order_quantity,
+            sibling_cancel_deadline_secs: cfg.oco_sibling_cancel_deadline_secs,
+            reconcile_poll_secs: cfg.oco_reconcile_poll_secs,
+        }
     }
+}
 
-    // -- WRITE methods (Gate 1 → validate/serialize → Gate 3 → HTTP) -------
+/// The smart-order LIVE write permission — Gate 3 (`GROWW_ORDER_LIVE_FIRE`,
+/// `false` today) AND the operator's `live_fire_requested` AND the
+/// area-specific `smart_orders_write`. `false` unless ALL THREE align.
+#[must_use]
+pub const fn smart_live_send_permitted(
+    live_fire_requested: bool,
+    smart_orders_write: bool,
+) -> bool {
+    GROWW_ORDER_LIVE_FIRE && live_fire_requested && smart_orders_write
+}
 
-    /// Creates an OCO smart order. Gate order per the module doc: config
-    /// gate → full validation + serialization → dry-run gate → (live only)
-    /// HTTP. `lot_size` comes from the instrument master.
-    pub async fn create_oco(
-        &self,
-        req: &OcoCreateRequest,
-        lot_size: i64,
-    ) -> Result<SmartOrderOutcome, SmartOrderError> {
-        if !self.settings.write_enabled {
-            return Ok(SmartOrderOutcome::DisabledByConfig);
-        }
-        validate_oco_create(req, lot_size)?;
-        let body_json =
-            serde_json::to_string(req).map_err(|e| SmartOrderError::Serialize(e.to_string()))?;
-        let endpoint = format!("{}{}", self.base_url, SMART_ORDER_CREATE_PATH);
-        if !GROWW_ORDER_LIVE_FIRE {
-            return Ok(SmartOrderOutcome::DryRun {
-                endpoint,
-                method: "POST",
-                body_json,
-            });
-        }
-        // LIVE path — statically after BOTH gates; unreachable until the
-        // dated Gate-3 flip.
-        self.execute_write(
-            HttpMethod::Post,
-            &endpoint,
-            Some(body_json),
-            WriteOp::Create,
-        )
-        .await
+/// Path-segment plausibility for a broker-supplied smart-order id (ids ride
+/// URL paths on cancel/get — a hostile id must never traverse). Pure.
+#[must_use]
+pub fn is_plausible_smart_order_id(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 64
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+// ---------------------------------------------------------------------------
+// Validation (financial boundaries — pure, pre-HTTP)
+// ---------------------------------------------------------------------------
+
+fn require_positive_paise(name: &'static str, v: i64) -> Result<(), SmartOrderError> {
+    if v <= 0 {
+        return Err(SmartOrderError::InvalidField(format!(
+            "{name} must be > 0 paise (got {v})"
+        )));
     }
-
-    /// Creates a GTT smart order (same gate order as [`Self::create_oco`]).
-    /// Pass `lot_size = 1` for CASH instruments.
-    pub async fn create_gtt(
-        &self,
-        req: &GttCreateRequest,
-        lot_size: i64,
-    ) -> Result<SmartOrderOutcome, SmartOrderError> {
-        if !self.settings.write_enabled {
-            return Ok(SmartOrderOutcome::DisabledByConfig);
-        }
-        validate_gtt_create(req, lot_size)?;
-        let body_json =
-            serde_json::to_string(req).map_err(|e| SmartOrderError::Serialize(e.to_string()))?;
-        let endpoint = format!("{}{}", self.base_url, SMART_ORDER_CREATE_PATH);
-        if !GROWW_ORDER_LIVE_FIRE {
-            return Ok(SmartOrderOutcome::DryRun {
-                endpoint,
-                method: "POST",
-                body_json,
-            });
-        }
-        self.execute_write(
-            HttpMethod::Post,
-            &endpoint,
-            Some(body_json),
-            WriteOp::Create,
-        )
-        .await
+    // Upper band on the REQUEST side (adversarial round 1, finding 12): a
+    // price past the decimal-string band must be refused HERE, before it can
+    // reach serialization (where it would error at the serde boundary).
+    if v > MAX_ABS_PAISE_FOR_DECIMAL_STRING {
+        return Err(SmartOrderError::InvalidField(format!(
+            "{name} exceeds the {MAX_ABS_PAISE_FOR_DECIMAL_STRING}-paise band (got {v})"
+        )));
     }
+    Ok(())
+}
 
-    /// Modifies a resting smart order (`PUT .../modify/{smart_order_id}`;
-    /// only the doc-modifiable fields — see [`SmartOrderModifyRequest`]).
-    pub async fn modify_smart_order(
-        &self,
-        smart_order_id: &str,
-        req: &SmartOrderModifyRequest,
-    ) -> Result<SmartOrderOutcome, SmartOrderError> {
-        if !self.settings.write_enabled {
-            return Ok(SmartOrderOutcome::DisabledByConfig);
-        }
-        validate_path_component("smart_order_id", smart_order_id)?;
-        validate_modify(req)?;
-        let body_json =
-            serde_json::to_string(req).map_err(|e| SmartOrderError::Serialize(e.to_string()))?;
-        let endpoint = format!(
-            "{}{}/{}",
-            self.base_url, SMART_ORDER_MODIFY_PATH_PREFIX, smart_order_id
-        );
-        if !GROWW_ORDER_LIVE_FIRE {
-            return Ok(SmartOrderOutcome::DryRun {
-                endpoint,
-                method: "PUT",
-                body_json,
-            });
-        }
-        self.execute_write(HttpMethod::Put, &endpoint, Some(body_json), WriteOp::Modify)
-            .await
+/// Validate a GTT/OCO leg's (order-type, price) SHAPE: price-carrying types
+/// (LIMIT / SL) require a strictly-positive price; market types (MARKET /
+/// SL_M) require an explicit-null price ("required for LIMIT/SL types; set
+/// to null for MARKET/SL_M").
+pub fn validate_leg_price_shape(
+    leg_name: &'static str,
+    price_required: bool,
+    order_type_label: &'static str,
+    price: Option<i64>,
+) -> Result<(), SmartOrderError> {
+    match (price_required, price) {
+        // Positive AND inside the decimal-string band (finding 12) — an
+        // out-of-band price is refused pre-serialization.
+        (true, Some(p)) if p > 0 && p <= MAX_ABS_PAISE_FOR_DECIMAL_STRING => Ok(()),
+        (true, Some(p)) => Err(SmartOrderError::InvalidField(format!(
+            "{leg_name} price must be > 0 and <= {MAX_ABS_PAISE_FOR_DECIMAL_STRING} paise \
+             for {order_type_label} (got {p})"
+        ))),
+        (true, None) => Err(SmartOrderError::InvalidField(format!(
+            "{leg_name} price required for {order_type_label}"
+        ))),
+        (false, Some(_)) => Err(SmartOrderError::InvalidField(format!(
+            "{leg_name} price must be null for {order_type_label}"
+        ))),
+        (false, None) => Ok(()),
     }
+}
 
-    /// Cancels a smart order (`POST .../cancel/{segment}/{type}/{id}` —
-    /// path params only, no body; the dry-run `body_json` is empty).
-    pub async fn cancel_smart_order(
-        &self,
-        segment: &str,
-        smart_order_type: &str,
-        smart_order_id: &str,
-    ) -> Result<SmartOrderOutcome, SmartOrderError> {
-        if !self.settings.write_enabled {
-            return Ok(SmartOrderOutcome::DisabledByConfig);
-        }
-        validate_path_component("segment", segment)?;
-        validate_path_component("smart_order_type", smart_order_type)?;
-        validate_path_component("smart_order_id", smart_order_id)?;
-        let endpoint = format!(
-            "{}{}/{}/{}/{}",
-            self.base_url,
-            SMART_ORDER_CANCEL_PATH_PREFIX,
-            segment,
-            smart_order_type,
-            smart_order_id
-        );
-        if !GROWW_ORDER_LIVE_FIRE {
-            return Ok(SmartOrderOutcome::DryRun {
-                endpoint,
-                method: "POST",
-                body_json: String::new(),
-            });
-        }
-        self.execute_write(HttpMethod::Post, &endpoint, None, WriteOp::Cancel)
-            .await
+const fn gtt_leg_price_required(order_type: GrowwOrderType) -> bool {
+    matches!(order_type, GrowwOrderType::Limit | GrowwOrderType::Sl)
+}
+
+fn validate_common(
+    reference_id: &str,
+    trading_symbol: &str,
+    quantity: i64,
+    max_order_quantity: i64,
+) -> Result<(), SmartOrderError> {
+    if trading_symbol.trim().is_empty() {
+        return Err(SmartOrderError::InvalidField(
+            "trading_symbol is empty".to_owned(),
+        ));
     }
+    if quantity < 1 {
+        return Err(SmartOrderError::InvalidField(format!(
+            "quantity {quantity} < 1"
+        )));
+    }
+    if quantity > max_order_quantity {
+        return Err(SmartOrderError::QuantityRefused {
+            quantity,
+            max: max_order_quantity,
+        });
+    }
+    if !super::reference_id::is_valid_reference_id(reference_id) {
+        return Err(SmartOrderError::InvalidReferenceId(reference_id.to_owned()));
+    }
+    Ok(())
+}
 
-    // -- READ methods (gate on read_enabled only) ---------------------------
-
-    /// Fetches one smart order's full object
-    /// (`GET .../status/{segment}/{type}/internal/{id}` — note the literal
-    /// `internal` path segment, doc 18 §4).
-    pub async fn get_smart_order(
-        &self,
-        segment: &str,
-        smart_order_type: &str,
-        smart_order_id: &str,
-    ) -> Result<SmartOrderReadOutcome<SmartOrderPayload>, SmartOrderError> {
-        if !self.settings.read_enabled {
-            return Ok(SmartOrderReadOutcome::DisabledByConfig);
-        }
-        validate_path_component("segment", segment)?;
-        validate_path_component("smart_order_type", smart_order_type)?;
-        validate_path_component("smart_order_id", smart_order_id)?;
-        let endpoint = format!(
-            "{}{}/{}/{}/internal/{}",
-            self.base_url,
-            SMART_ORDER_STATUS_PATH_PREFIX,
-            segment,
-            smart_order_type,
-            smart_order_id
-        );
-        match self
-            .fetch_payload::<SmartOrderPayload>(&endpoint, &[])
-            .await
-        {
-            Ok(payload) => Ok(SmartOrderReadOutcome::Fetched(payload)),
-            Err(err) => {
-                // GROWW-OCO-05: the reconcile poller's snapshot for this
-                // cycle is missing; the next poll re-attempts.
-                error!(
-                    code = ErrorCode::GrowwOco05PollerDegraded.code_str(),
-                    op = "status_get",
-                    error = %err,
-                    "groww smart-order status poll degraded"
-                );
-                Err(err)
+/// Validate a smart-order create against the pure financial boundaries.
+/// Deliberately NOT enforced (the docs state none — never invented): any
+/// RELATIVE ordering between target/stop-loss/trigger prices.
+pub fn validate_create_smart_order(
+    req: &SmartOrderCreate,
+    max_order_quantity: i64,
+) -> Result<(), SmartOrderError> {
+    match req {
+        SmartOrderCreate::Gtt(g) => {
+            if g.smart_order_type != SmartOrderType::Gtt {
+                return Err(SmartOrderError::InvalidField(
+                    "GTT body must carry smart_order_type GTT".to_owned(),
+                ));
             }
-        }
-    }
-
-    /// Lists smart orders with optional filters (doc 18 §5).
-    pub async fn list_smart_orders(
-        &self,
-        query: &SmartOrderListQuery,
-    ) -> Result<SmartOrderReadOutcome<SmartOrderListPayload>, SmartOrderError> {
-        if !self.settings.read_enabled {
-            return Ok(SmartOrderReadOutcome::DisabledByConfig);
-        }
-        let pairs = query.to_query_pairs()?;
-        let endpoint = format!("{}{}", self.base_url, SMART_ORDER_LIST_PATH);
-        match self
-            .fetch_payload::<SmartOrderListPayload>(&endpoint, &pairs)
-            .await
-        {
-            Ok(payload) => Ok(SmartOrderReadOutcome::Fetched(payload)),
-            Err(err) => {
-                error!(
-                    code = ErrorCode::GrowwOco05PollerDegraded.code_str(),
-                    op = "list",
-                    error = %err,
-                    "groww smart-order list poll degraded"
-                );
-                Err(err)
-            }
-        }
-    }
-
-    // -- Internals -----------------------------------------------------------
-
-    /// LIVE write leg (unreachable while Gate 3 is closed — every caller
-    /// returns [`SmartOrderOutcome::DryRun`] first). On failure emits the
-    /// op-appropriate coded error: create/cancel → `GROWW-OCO-01`
-    /// (placement-class), modify → `GROWW-OCO-04`.
-    async fn execute_write(
-        &self,
-        method: HttpMethod,
-        endpoint: &str,
-        body_json: Option<String>,
-        op: WriteOp,
-    ) -> Result<SmartOrderOutcome, SmartOrderError> {
-        match self
-            .send_and_parse::<SmartOrderPayload>(method, endpoint, &[], body_json.as_deref())
-            .await
-        {
-            Ok(payload) => Ok(SmartOrderOutcome::Accepted(Box::new(payload))),
-            Err(err) => {
-                match op {
-                    WriteOp::Create | WriteOp::Cancel => error!(
-                        code = ErrorCode::GrowwOco01PlacementFailed.code_str(),
-                        op = op.as_str(),
-                        error = %err,
-                        "groww smart-order write failed"
-                    ),
-                    WriteOp::Modify => error!(
-                        code = ErrorCode::GrowwOco04ModifyRejected.code_str(),
-                        op = op.as_str(),
-                        error = %err,
-                        "groww smart-order modify rejected"
-                    ),
-                }
-                Err(err)
-            }
-        }
-    }
-
-    /// Read-path GET → parsed payload. Reads keep the single bounded
-    /// transport retry: a GET is idempotent, so re-asking after a blip is
-    /// safe and keeps the reconcile poller's snapshot rate honest.
-    async fn fetch_payload<T: DeserializeOwned>(
-        &self,
-        endpoint: &str,
-        query: &[(&'static str, String)],
-    ) -> Result<T, SmartOrderError> {
-        let (status, body) = self
-            .send_request(
-                HttpMethod::Get,
-                endpoint,
-                query,
-                None,
-                RetryPolicy::TransportOnce,
+            validate_common(
+                &g.reference_id,
+                &g.trading_symbol,
+                g.quantity,
+                max_order_quantity,
+            )?;
+            require_positive_paise("trigger_price", g.trigger_price)?;
+            validate_leg_price_shape(
+                "order",
+                gtt_leg_price_required(g.order.order_type),
+                g.order.order_type.as_str(),
+                g.order.price,
             )
-            .await?;
-        parse_success_envelope::<T>(status, &body)
+        }
+        SmartOrderCreate::Oco(o) => {
+            if o.smart_order_type != SmartOrderType::Oco {
+                return Err(SmartOrderError::InvalidField(
+                    "OCO body must carry smart_order_type OCO".to_owned(),
+                ));
+            }
+            validate_common(
+                &o.reference_id,
+                &o.trading_symbol,
+                o.quantity,
+                max_order_quantity,
+            )?;
+            // Exit-only: a zero net position has nothing to exit.
+            if o.net_position_quantity == 0 {
+                return Err(SmartOrderError::InvalidField(
+                    "OCO is exit-only: net_position_quantity must be non-zero".to_owned(),
+                ));
+            }
+            // `unsigned_abs`, never `abs` — `i64::MIN.abs()` aborts under
+            // overflow-checks (adversarial round 1, finding 4).
+            if o.quantity.unsigned_abs() > o.net_position_quantity.unsigned_abs() {
+                return Err(SmartOrderError::QuantityExceedsPosition {
+                    quantity: o.quantity,
+                    net_position_quantity: o.net_position_quantity,
+                });
+            }
+            // CASH OCO: MIS-only (both doc arms agree; availability = P9).
+            if o.segment == GrowwSegment::Cash && o.product_type != GrowwProduct::Mis {
+                return Err(SmartOrderError::CashOcoProductNotMis {
+                    product: o.product_type.as_str(),
+                });
+            }
+            require_positive_paise("target.trigger_price", o.target.trigger_price)?;
+            validate_leg_price_shape(
+                "target",
+                o.target.order_type == TargetLegOrderType::Limit,
+                o.target.order_type.as_str(),
+                o.target.price,
+            )?;
+            require_positive_paise("stop_loss.trigger_price", o.stop_loss.trigger_price)?;
+            validate_leg_price_shape(
+                "stop_loss",
+                o.stop_loss.order_type == StopLossLegOrderType::Sl,
+                o.stop_loss.order_type.as_str(),
+                o.stop_loss.price,
+            )
+        }
+    }
+}
+
+/// Validate a modify against the PER-TYPE modifiable-field matrix (the
+/// 2026-07-16 doc correction — GTT and OCO differ; see the
+/// [`SmartModifyFields`] table). An immutable-field attempt is the typed
+/// GROWW-OCO-04 refusal BEFORE any HTTP.
+pub fn validate_modify_fields(
+    smart_order_type: SmartOrderType,
+    segment: GrowwSegment,
+    fields: &SmartModifyFields,
+    max_order_quantity: i64,
+) -> Result<(), SmartOrderError> {
+    if fields.is_empty() {
+        return Err(SmartOrderError::InvalidField(
+            "modify carries no modifiable field".to_owned(),
+        ));
+    }
+    match smart_order_type {
+        SmartOrderType::Gtt => {
+            // OCO-only fields are IMMUTABLE on GTT.
+            for (present, field) in [
+                (fields.duration.is_some(), "duration"),
+                (fields.product_type.is_some(), "product_type"),
+                (
+                    fields.target_trigger_price.is_some(),
+                    "target.trigger_price",
+                ),
+                (
+                    fields.stop_loss_trigger_price.is_some(),
+                    "stop_loss.trigger_price",
+                ),
+            ] {
+                if present {
+                    return Err(SmartOrderError::ImmutableField {
+                        smart_order_type: "GTT",
+                        field,
+                    });
+                }
+            }
+            if let Some(t) = fields.trigger_price {
+                require_positive_paise("trigger_price", t)?;
+            }
+            if let Some(leg) = &fields.order_leg {
+                validate_leg_price_shape(
+                    "order",
+                    gtt_leg_price_required(leg.order_type),
+                    leg.order_type.as_str(),
+                    leg.price,
+                )?;
+            }
+        }
+        SmartOrderType::Oco => {
+            // GTT-only fields are IMMUTABLE on OCO (leg order_type/price are
+            // "(not modifiable)"; trigger_direction is N/A).
+            for (present, field) in [
+                (fields.trigger_price.is_some(), "trigger_price"),
+                (fields.trigger_direction.is_some(), "trigger_direction"),
+                (fields.order_leg.is_some(), "order (leg order_type/price)"),
+                (fields.child_legs.is_some(), "child_legs"),
+            ] {
+                if present {
+                    return Err(SmartOrderError::ImmutableField {
+                        smart_order_type: "OCO",
+                        field,
+                    });
+                }
+            }
+            if let Some(t) = fields.target_trigger_price {
+                require_positive_paise("target.trigger_price", t)?;
+            }
+            if let Some(t) = fields.stop_loss_trigger_price {
+                require_positive_paise("stop_loss.trigger_price", t)?;
+            }
+            // A CASH OCO product_type change must re-assert MIS-only,
+            // mirroring create's CashOcoProductNotMis (adversarial round 2,
+            // LOW-2 — modify previously lacked the segment to check).
+            if let Some(p) = fields.product_type
+                && segment == GrowwSegment::Cash
+                && p != GrowwProduct::Mis
+            {
+                return Err(SmartOrderError::CashOcoProductNotMis {
+                    product: p.as_str(),
+                });
+            }
+        }
+    }
+    if let Some(q) = fields.quantity {
+        if q < 1 {
+            return Err(SmartOrderError::InvalidField(format!("quantity {q} < 1")));
+        }
+        if q > max_order_quantity {
+            return Err(SmartOrderError::QuantityRefused {
+                quantity: q,
+                max: max_order_quantity,
+            });
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Sibling-cancel verification (GROWW-OCO-02) — pure decision core
+// ---------------------------------------------------------------------------
+
+/// The sibling-verify verdict for one OCO trigger episode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SiblingVerifyVerdict {
+    /// No trigger episode is armed.
+    NotArmed,
+    /// Triggered; still inside the verification deadline.
+    Pending,
+    /// The smart-order OBJECT settled terminal — the strongest observable
+    /// proof no live sibling remains (leg-level ids are undocumented, P5).
+    Verified,
+    /// The deadline elapsed without a settled terminal — the GROWW-OCO-02
+    /// double-fill exposure window.
+    DeadlineExceeded {
+        /// Milliseconds since the trigger was first observed.
+        elapsed_ms: i64,
+    },
+}
+
+/// Evaluate one OCO trigger episode — PURE (paused-clock testable).
+///
+/// HONEST ENVELOPE: the smart-order schemas expose NO per-leg order ids or
+/// per-leg statuses (verified doc absence — probe P5), so "sibling observed
+/// CANCELLED" is verifiable only at the smart-order-OBJECT level: a settled
+/// terminal (COMPLETED / CANCELLED / EXPIRED / FAILED) within the deadline
+/// counts as verified; a TRIGGERED (or unreadable) order past the deadline
+/// is UNVERIFIED = the exposure page.
+#[must_use]
+pub fn evaluate_sibling_verify(
+    triggered_at_ms: Option<i64>,
+    now_ms: i64,
+    deadline_secs: u64,
+    latest: &SmartOrderStatus,
+) -> SiblingVerifyVerdict {
+    if latest.is_terminal() {
+        return SiblingVerifyVerdict::Verified;
+    }
+    let Some(t0) = triggered_at_ms else {
+        return SiblingVerifyVerdict::NotArmed;
+    };
+    let elapsed_ms = now_ms.saturating_sub(t0).max(0);
+    let deadline_ms = i64::try_from(deadline_secs.saturating_mul(1_000)).unwrap_or(i64::MAX);
+    if elapsed_ms > deadline_ms {
+        SiblingVerifyVerdict::DeadlineExceeded { elapsed_ms }
+    } else {
+        SiblingVerifyVerdict::Pending
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tracked book
+// ---------------------------------------------------------------------------
+
+/// One locally-tracked smart order.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TrackedSmartOrder {
+    /// Broker smart-order id (or the `PAPER-…` synthetic id).
+    pub smart_order_id: String,
+    /// GTT | OCO.
+    pub smart_order_type: SmartOrderType,
+    /// Segment (routing for cancel/get paths).
+    pub segment: GrowwSegment,
+    /// Trading symbol.
+    pub trading_symbol: String,
+    /// Last adopted lifecycle status.
+    pub status: SmartOrderStatus,
+    /// Tracked quantity.
+    pub quantity: i64,
+    /// Our reference id (the write-ahead intent key).
+    pub reference_id: String,
+    /// When TRIGGERED was first observed (OCO sibling-verify episode start).
+    pub triggered_at_ms: Option<i64>,
+    /// Once-per-episode GROWW-OCO-02 latch.
+    pub sibling_unverified_paged: bool,
+    /// Modify count (capped at `GROWW_ORDER_MAX_MODIFICATIONS_PER_ORDER`).
+    pub modifications: u32,
+    /// Consecutive reconcile sweeps where the broker could not find this
+    /// order (ghost-local grace, 2 sweeps).
+    pub missing_sweeps: u8,
+    /// The last broker quantity a QuantityDrift finding was flagged for —
+    /// the per-(order, qty) latch so an UNADOPTED drift is found ONCE, not
+    /// re-fired every poll pass (adversarial round 1, finding 11).
+    pub drift_flagged_qty: Option<i64>,
+}
+
+impl TrackedSmartOrder {
+    /// A freshly adopted (ACTIVE) tracked order.
+    #[must_use]
+    pub fn new(
+        smart_order_id: String,
+        smart_order_type: SmartOrderType,
+        segment: GrowwSegment,
+        trading_symbol: String,
+        quantity: i64,
+        reference_id: String,
+    ) -> Self {
+        Self {
+            smart_order_id,
+            smart_order_type,
+            segment,
+            trading_symbol,
+            status: SmartOrderStatus::Active,
+            quantity,
+            reference_id,
+            triggered_at_ms: None,
+            sibling_unverified_paged: false,
+            modifications: 0,
+            missing_sweeps: 0,
+            drift_flagged_qty: None,
+        }
+    }
+}
+
+/// The in-memory smart-order book (per-executor; shared with the reconcile
+/// loop via `Arc<tokio::sync::Mutex<…>>`).
+#[derive(Debug, Default)]
+pub struct SmartOrderBook {
+    orders: HashMap<String, TrackedSmartOrder>,
+}
+
+impl SmartOrderBook {
+    /// Insert / replace a tracked order.
+    pub fn insert(&mut self, order: TrackedSmartOrder) {
+        self.orders.insert(order.smart_order_id.clone(), order);
+        metrics::gauge!("tv_groww_smart_orders_open").set(self.open_count() as f64);
     }
 
-    /// Write-path send → parsed payload. WRITES NEVER RETRY (H-HIGH fix,
-    /// 2026-07-15): a create whose first attempt REACHED the broker but
-    /// whose response was lost would be DOUBLE-SENT by a transport retry,
-    /// and whether the `reference_id` idempotency window (GA007) actually
-    /// dedups the second submission is UNKNOWN — doc 18 §9 probe **P10**.
-    /// A failed write returns the typed Transport outcome and the
-    /// caller/orchestrator decides (status-GET-first, never blind resend).
-    async fn send_and_parse<T: DeserializeOwned>(
-        &self,
-        method: HttpMethod,
-        endpoint: &str,
-        query: &[(&'static str, String)],
-        body_json: Option<&str>,
-    ) -> Result<T, SmartOrderError> {
-        let (status, body) = self
-            .send_request(method, endpoint, query, body_json, RetryPolicy::Never)
-            .await?;
-        parse_success_envelope::<T>(status, &body)
+    /// Read a tracked order.
+    #[must_use]
+    pub fn get(&self, smart_order_id: &str) -> Option<&TrackedSmartOrder> {
+        self.orders.get(smart_order_id)
     }
 
-    /// One bounded HTTP round-trip: bearer + `x-api-version: 1.0` +
-    /// `Accept: application/json` headers (the `groww_spot_1m_boot` shape),
-    /// 5s per-request timeout, transport retry per [`RetryPolicy`]
-    /// (READ paths: one bounded retry; WRITE paths: NEVER — the P10
-    /// double-send risk), never a retry on any HTTP status, 429 → typed +
-    /// counted. Returns `(status, raw body)` for every non-429 HTTP
-    /// response.
-    async fn send_request(
-        &self,
-        method: HttpMethod,
-        url: &str,
-        query: &[(&'static str, String)],
-        body_json: Option<&str>,
-        retry: RetryPolicy,
-    ) -> Result<(u16, String), SmartOrderError> {
-        let token = (self.token_provider)().ok_or(SmartOrderError::NoToken)?;
-        let max_attempts: u8 = match retry {
-            RetryPolicy::Never => 1,
-            RetryPolicy::TransportOnce => 2,
+    /// Mutate a tracked order.
+    pub fn get_mut(&mut self, smart_order_id: &str) -> Option<&mut TrackedSmartOrder> {
+        self.orders.get_mut(smart_order_id)
+    }
+
+    /// Non-terminal tracked ids (the reconcile poll set).
+    #[must_use]
+    pub fn non_terminal_ids(&self) -> Vec<String> {
+        let mut ids: Vec<String> = self
+            .orders
+            .values()
+            .filter(|o| !o.status.is_terminal())
+            .map(|o| o.smart_order_id.clone())
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    /// Count of non-terminal tracked orders.
+    #[must_use]
+    pub fn open_count(&self) -> usize {
+        self.orders
+            .values()
+            .filter(|o| !o.status.is_terminal())
+            .count()
+    }
+
+    /// Whether a broker id is tracked.
+    #[must_use]
+    pub fn contains(&self, smart_order_id: &str) -> bool {
+        self.orders.contains_key(smart_order_id)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Coded emit helpers (the GROWW-OCO-* live emit sites — log-sink-only per
+// the rule file §6; every error! carries `code` + `stage`)
+// ---------------------------------------------------------------------------
+
+/// Sanitize an order id for LOG display (adversarial round 1, finding 3):
+/// plausible ids pass verbatim; anything else is control-stripped +
+/// length-capped through the house sanitize choke point — never raw hostile
+/// bytes in a log line.
+pub(crate) fn log_safe_id(id: &str) -> std::borrow::Cow<'_, str> {
+    if is_plausible_smart_order_id(id) {
+        std::borrow::Cow::Borrowed(id)
+    } else {
+        std::borrow::Cow::Owned(capture_rest_error_body(id))
+    }
+}
+
+/// GROWW-OCO-01 — a create/cancel leg failed (definitive reject or an
+/// unresolvable ambiguity). `detail` passes the sanitize choke point.
+pub(crate) fn emit_oco01(leg: &'static str, stage: &'static str, id: Option<&str>, detail: &str) {
+    error!(
+        target: "groww_oco",
+        code = ErrorCode::GrowwOco01PlacementFailed.code_str(),
+        stage,
+        leg,
+        smart_order_id = %log_safe_id(id.unwrap_or("n/a")),
+        detail = %capture_rest_error_body(detail),
+        "groww smart order: {leg} leg failed"
+    );
+}
+
+/// GROWW-OCO-02 — sibling-cancel UNVERIFIED past the deadline (Critical;
+/// once per trigger episode, latched by the caller).
+pub(crate) fn emit_oco02(smart_order_id: &str, elapsed_ms: i64, deadline_secs: u64) {
+    error!(
+        target: "groww_oco",
+        code = ErrorCode::GrowwOco02SiblingCancelUnverified.code_str(),
+        stage = "deadline_exceeded",
+        smart_order_id = %log_safe_id(smart_order_id),
+        elapsed_ms,
+        deadline_secs,
+        "groww smart order: OCO sibling cancel UNVERIFIED past the deadline — \
+         verify the sibling on the broker book NOW (double-fill exposure)"
+    );
+}
+
+/// GROWW-OCO-03 — reconcile findings (ONE coalesced emit per pass; ≤5 sample
+/// lines; each finding also rides the findings counter).
+pub(crate) fn emit_oco03(findings: &[SmartReconcileFinding]) {
+    let samples: Vec<String> = findings
+        .iter()
+        .take(5)
+        .map(|f| {
+            format!(
+                "{} {} {}",
+                log_safe_id(&f.smart_order_id),
+                f.kind.as_str(),
+                capture_rest_error_body(&f.detail)
+            )
+        })
+        .collect();
+    error!(
+        target: "groww_oco",
+        code = ErrorCode::GrowwOco03ReconcileMismatch.code_str(),
+        stage = "reconcile_pass",
+        findings = findings.len(),
+        samples = ?samples,
+        "groww smart order: reconcile found local-vs-broker divergence — \
+         never auto-normalized; operator decides which side is wrong"
+    );
+}
+
+/// GROWW-OCO-04 — a modify was refused (immutable field, pre-HTTP) or
+/// rejected/ambiguous at the broker.
+pub(crate) fn emit_oco04(stage: &'static str, id: Option<&str>, detail: &str) {
+    error!(
+        target: "groww_oco",
+        code = ErrorCode::GrowwOco04ModifyRejected.code_str(),
+        stage,
+        smart_order_id = %log_safe_id(id.unwrap_or("n/a")),
+        detail = %capture_rest_error_body(detail),
+        "groww smart order: modify refused/rejected"
+    );
+}
+
+/// GROWW-OCO-05 — the get/list reconcile poller degraded (transport / token
+/// / rate-limit / decode).
+pub(crate) fn emit_oco05(stage: &'static str, detail: &str) {
+    metrics::counter!("tv_groww_oco_poller_errors_total", "stage" => stage).increment(1);
+    error!(
+        target: "groww_oco",
+        code = ErrorCode::GrowwOco05PollerDegraded.code_str(),
+        stage,
+        detail = %capture_rest_error_body(detail),
+        "groww smart order: reconcile poller degraded — next tick retries"
+    );
+}
+
+/// The mutation-outcome counter (static labels only).
+pub(crate) fn count_mutation(leg: &'static str, outcome: &'static str) {
+    metrics::counter!(
+        "tv_groww_oco_mutations_total",
+        "leg" => leg,
+        "outcome" => outcome
+    )
+    .increment(1);
+}
+
+// ---------------------------------------------------------------------------
+// Reconcile — pure classification + one bounded pass + the spawnable loop
+// ---------------------------------------------------------------------------
+
+/// Reconcile finding kinds (static metric labels).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SmartFindingKind {
+    /// Observed status is an illegal backward / out-of-terminal move.
+    StatusRegression,
+    /// Observed quantity differs from the tracked quantity.
+    QuantityDrift,
+    /// Broker could not find a tracked non-terminal order on 2 consecutive
+    /// sweeps.
+    GhostLocal,
+    /// Tracked OCO quantity exceeds |net position| (when a position map is
+    /// supplied by the caller — the future wiring PR's portfolio snapshot).
+    QtyExceedsPosition,
+    /// The broker served a status outside the documented vocabulary — the
+    /// order is PARKED (raw preserved on the finding detail).
+    UnknownStatus,
+}
+
+impl SmartFindingKind {
+    /// Stable metric label.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::StatusRegression => "status_regression",
+            Self::QuantityDrift => "quantity_drift",
+            Self::GhostLocal => "ghost_local",
+            Self::QtyExceedsPosition => "qty_exceeds_position",
+            Self::UnknownStatus => "unknown_status",
+        }
+    }
+}
+
+/// One reconcile finding.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SmartReconcileFinding {
+    /// The affected smart order.
+    pub smart_order_id: String,
+    /// The finding class.
+    pub kind: SmartFindingKind,
+    /// Bounded human detail (sanitized at emit time).
+    pub detail: String,
+}
+
+/// The report of one reconcile pass.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct SmartReconcileReport {
+    /// Tracked orders polled this pass.
+    pub polled: usize,
+    /// Fail-closed findings (GROWW-OCO-03).
+    pub findings: Vec<SmartReconcileFinding>,
+    /// OCO ids whose sibling verification exceeded the deadline THIS pass
+    /// (GROWW-OCO-02, once per episode).
+    pub sibling_unverified: Vec<String>,
+    /// Poller degrade stages observed (GROWW-OCO-05).
+    pub degraded: Vec<&'static str>,
+    /// Broker ACTIVE rows not tracked locally — counted, NEVER acted on
+    /// (smart-order responses carry no reference id, so attribution is
+    /// impossible; foreign = the co-tenant or a pre-boot order).
+    pub foreign_untracked: usize,
+}
+
+/// Classify one observation of a tracked order — PURE.
+#[must_use]
+pub fn classify_smart_observation(
+    tracked: &TrackedSmartOrder,
+    observed_status: &SmartOrderStatus,
+    observed_quantity: Option<i64>,
+    net_position: Option<i64>,
+) -> (SmartTransitionOutcome, Vec<SmartReconcileFinding>) {
+    let outcome = evaluate_smart_transition(&tracked.status, observed_status);
+    let mut findings = Vec::new();
+    if outcome == SmartTransitionOutcome::Park {
+        if let SmartOrderStatus::Unknown(raw) = observed_status {
+            findings.push(SmartReconcileFinding {
+                smart_order_id: tracked.smart_order_id.clone(),
+                kind: SmartFindingKind::UnknownStatus,
+                detail: format!("unknown status {raw:?} parked"),
+            });
+        } else {
+            findings.push(SmartReconcileFinding {
+                smart_order_id: tracked.smart_order_id.clone(),
+                kind: SmartFindingKind::StatusRegression,
+                detail: format!(
+                    "illegal {} -> {}",
+                    tracked.status.as_str(),
+                    observed_status.as_str()
+                ),
+            });
+        }
+    }
+    if let Some(q) = observed_quantity
+        && q != tracked.quantity
+        // A legal forward Transition that ALSO changed qty is NOT a
+        // divergence — `apply_observation` adopts the broker qty (round 3,
+        // finding 2); only a NON-adopting outcome (SameStatusRefresh / Park)
+        // is a real drift.
+        && outcome != SmartTransitionOutcome::Transition
+        // Per-(order, qty) latch (finding 11): the SAME unadopted drift is
+        // found once, not re-fired every poll pass; a NEW drifted value
+        // re-fires.
+        && tracked.drift_flagged_qty != Some(q)
+    {
+        findings.push(SmartReconcileFinding {
+            smart_order_id: tracked.smart_order_id.clone(),
+            kind: SmartFindingKind::QuantityDrift,
+            detail: format!("local qty {} vs broker qty {q}", tracked.quantity),
+        });
+    }
+    if tracked.smart_order_type == SmartOrderType::Oco
+        && let Some(net) = net_position
+        // `unsigned_abs`, never `abs` — `i64::MIN.abs()` aborts under
+        // overflow-checks (adversarial round 1, finding 4).
+        && tracked.quantity.unsigned_abs() > net.unsigned_abs()
+    {
+        findings.push(SmartReconcileFinding {
+            smart_order_id: tracked.smart_order_id.clone(),
+            kind: SmartFindingKind::QtyExceedsPosition,
+            detail: format!(
+                "OCO qty {} vs |net position| {}",
+                tracked.quantity,
+                net.unsigned_abs()
+            ),
+        });
+    }
+    (outcome, findings)
+}
+
+/// Consecutive ghost-local sweeps before the finding fires (grace — one
+/// missing snapshot is not proof of absence).
+pub const SMART_GHOST_LOCAL_CONFIRM_SWEEPS: u8 = 2;
+
+/// Apply one observation to a tracked order (transition adoption + sibling
+/// episode arming + OCO-02 evaluation). Returns the sibling verdict.
+fn apply_observation(
+    tracked: &mut TrackedSmartOrder,
+    observed_status: &SmartOrderStatus,
+    observed_quantity: Option<i64>,
+    outcome: SmartTransitionOutcome,
+    now_ms: i64,
+    deadline_secs: u64,
+) -> SiblingVerifyVerdict {
+    tracked.missing_sweeps = 0;
+    match outcome {
+        SmartTransitionOutcome::Transition => {
+            tracked.status = observed_status.clone();
+            if let Some(q) = observed_quantity {
+                tracked.quantity = q;
+            }
+        }
+        SmartTransitionOutcome::SameStatusRefresh | SmartTransitionOutcome::Park => {}
+    }
+    // Maintain the QuantityDrift latch (finding 11): a still-drifted broker
+    // qty latches (found once); an agreeing qty clears the latch. A
+    // Transition that ADOPTED the broker qty lands in the agreeing arm.
+    if let Some(q) = observed_quantity {
+        tracked.drift_flagged_qty = if q != tracked.quantity { Some(q) } else { None };
+    }
+    // Arm the OCO sibling episode on the first observed TRIGGERED.
+    if tracked.smart_order_type == SmartOrderType::Oco
+        && tracked.status == SmartOrderStatus::Triggered
+        && tracked.triggered_at_ms.is_none()
+    {
+        tracked.triggered_at_ms = Some(now_ms);
+    }
+    let verdict = if tracked.smart_order_type == SmartOrderType::Oco {
+        evaluate_sibling_verify(
+            tracked.triggered_at_ms,
+            now_ms,
+            deadline_secs,
+            &tracked.status,
+        )
+    } else {
+        SiblingVerifyVerdict::NotArmed
+    };
+    if verdict == SiblingVerifyVerdict::Verified && tracked.sibling_unverified_paged {
+        info!(
+            target: "groww_oco",
+            smart_order_id = %log_safe_id(&tracked.smart_order_id),
+            "groww smart order: OCO settled terminal — sibling exposure episode closed"
+        );
+        tracked.sibling_unverified_paged = false;
+        tracked.triggered_at_ms = None;
+    }
+    verdict
+}
+
+/// One bounded reconcile pass over the tracked book — per-tracked GET +
+/// one ACTIVE list per flow (foreign counting). Emits GROWW-OCO-02/-03/-05
+/// per the report; NEVER mutates broker state.
+pub async fn reconcile_pass<T: SmartOrderTransport>(
+    transport: &T,
+    token: &SecretString,
+    book: &mut SmartOrderBook,
+    deadline_secs: u64,
+    now_ms: i64,
+    positions: &HashMap<String, i64>,
+) -> SmartReconcileReport {
+    let mut report = SmartReconcileReport::default();
+    let ids = book.non_terminal_ids();
+    'poll: for id in &ids {
+        let Some(snapshot) = book.get(id).cloned() else {
+            continue;
         };
-        let mut attempt: u8 = 0;
-        loop {
-            attempt += 1;
-            let mut builder = match method {
-                HttpMethod::Get => self.http.get(url),
-                HttpMethod::Post => self.http.post(url),
-                HttpMethod::Put => self.http.put(url),
-            };
-            builder = builder
-                .timeout(Duration::from_secs(SMART_ORDER_REQUEST_TIMEOUT_SECS))
-                .bearer_auth(&token)
-                .header(GROWW_API_VERSION_HEADER, GROWW_API_VERSION_VALUE)
-                .header(reqwest::header::ACCEPT, "application/json");
-            if !query.is_empty() {
-                builder = builder.query(query);
-            }
-            if let Some(body) = body_json {
-                builder = builder
-                    .header(reqwest::header::CONTENT_TYPE, "application/json")
-                    .body(body.to_owned());
-            }
-            match builder.send().await {
-                Err(_transport) if attempt < max_attempts => {
-                    // Transport retry — REACHABLE ONLY under
-                    // RetryPolicy::TransportOnce (read paths). Write paths
-                    // pass RetryPolicy::Never (max_attempts = 1), so this
-                    // arm is unreachable for them: a lost WRITE response
-                    // must never be blind-resent (probe P10 — the GA007
-                    // reference_id dedup window is unverified). A 4xx/5xx
-                    // never reaches this arm (it is an Ok(response)).
-                    tokio::time::sleep(Duration::from_millis(SMART_ORDER_TRANSPORT_RETRY_DELAY_MS))
-                        .await;
+        if !is_plausible_smart_order_id(id) {
+            // Never build a URL path from an implausible id.
+            report.degraded.push("implausible_id");
+            continue;
+        }
+        report.polled += 1;
+        let obs = transport
+            .get_smart_order(snapshot.segment, snapshot.smart_order_type, id, token)
+            .await;
+        match obs {
+            TransportOutcome::Success(p) => {
+                // Identity guard (adversarial round 2, HIGH): the ONLY
+                // unguarded broker echo. A GET response carrying a DIFFERENT
+                // `smart_order_id` must NEVER be classified/applied under
+                // `id` — a foreign echo could silently terminalize a live
+                // OCO (dropping it from the non-terminal set → the OCO-02
+                // double-fill guard is silenced) or false-arm an episode.
+                if let Some(other) = p.smart_order_id.as_deref()
+                    && other != id.as_str()
+                {
+                    report.degraded.push("id_mismatch");
+                    emit_oco05(
+                        "id_mismatch",
+                        &format!("requested {} got {}", log_safe_id(id), log_safe_id(other)),
+                    );
                     continue;
                 }
-                Err(e) => {
-                    return Err(SmartOrderError::Transport(capture_rest_error_body(
-                        &e.to_string(),
-                    )));
+                let observed_status = p
+                    .status
+                    .as_deref()
+                    .map_or(SmartOrderStatus::Unknown(String::new()), |s| {
+                        SmartOrderStatus::parse(s)
+                    });
+                let net = positions.get(&snapshot.trading_symbol).copied();
+                let (outcome, findings) =
+                    classify_smart_observation(&snapshot, &observed_status, p.quantity, net);
+                for f in &findings {
+                    metrics::counter!(
+                        "tv_groww_oco_reconcile_findings_total",
+                        "kind" => f.kind.as_str()
+                    )
+                    .increment(1);
                 }
-                Ok(resp) => {
-                    let status = resp.status();
-                    if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-                        let retry_after_present = resp.headers().contains_key("retry-after");
-                        metrics::counter!("tv_groww_smart_order_rate_limited_total").increment(1);
-                        return Err(SmartOrderError::RateLimited {
-                            retry_after_present,
-                        });
+                report.findings.extend(findings);
+                if let Some(tracked) = book.get_mut(id) {
+                    let verdict = apply_observation(
+                        tracked,
+                        &observed_status,
+                        p.quantity,
+                        outcome,
+                        now_ms,
+                        deadline_secs,
+                    );
+                    if let SiblingVerifyVerdict::DeadlineExceeded { elapsed_ms } = verdict
+                        && !tracked.sibling_unverified_paged
+                    {
+                        tracked.sibling_unverified_paged = true;
+                        emit_oco02(id, elapsed_ms, deadline_secs);
+                        metrics::counter!(
+                            "tv_groww_oco_reconcile_findings_total",
+                            "kind" => "sibling_unverified"
+                        )
+                        .increment(1);
+                        report.sibling_unverified.push(id.clone());
                     }
-                    let status_u16 = status.as_u16();
-                    let body = resp.text().await.map_err(|e| {
-                        SmartOrderError::Transport(capture_rest_error_body(&e.to_string()))
-                    })?;
-                    return Ok((status_u16, body));
+                }
+            }
+            TransportOutcome::Rejected {
+                http_status,
+                ga_code,
+                ..
+            } if http_status == 404 || ga_code.as_deref() == Some("GA004") => {
+                if let Some(tracked) = book.get_mut(id) {
+                    tracked.missing_sweeps = tracked.missing_sweeps.saturating_add(1);
+                    if tracked.missing_sweeps >= SMART_GHOST_LOCAL_CONFIRM_SWEEPS {
+                        let finding = SmartReconcileFinding {
+                            smart_order_id: id.clone(),
+                            kind: SmartFindingKind::GhostLocal,
+                            detail: format!(
+                                "broker cannot find it ({} consecutive sweeps)",
+                                tracked.missing_sweeps
+                            ),
+                        };
+                        metrics::counter!(
+                            "tv_groww_oco_reconcile_findings_total",
+                            "kind" => SmartFindingKind::GhostLocal.as_str()
+                        )
+                        .increment(1);
+                        report.findings.push(finding);
+                    }
+                }
+            }
+            TransportOutcome::Rejected { ga_code, .. } => {
+                report.degraded.push("rejected_read");
+                emit_oco05("rejected_read", ga_code.as_deref().unwrap_or("no-ga"));
+            }
+            TransportOutcome::AuthStale { http_status } => {
+                // The token is dead for EVERY read — abort the pass.
+                report.degraded.push("token");
+                emit_oco05("token", &format!("auth stale {http_status}"));
+                break 'poll;
+            }
+            TransportOutcome::RateLimited { .. } => {
+                // Never out-polled — stop the pass; the next tick retries.
+                report.degraded.push("rate_limited");
+                emit_oco05("rate_limited", "429 on smart-order read");
+                break 'poll;
+            }
+            TransportOutcome::Ambiguous(reason) => {
+                report.degraded.push("transport");
+                emit_oco05("transport", reason.as_str());
+            }
+        }
+    }
+
+    // Deadline sweep over UNREADABLE triggered OCOs (a GET failure must not
+    // silence the exposure page — TRIGGERED-or-unreadable past the deadline
+    // pages).
+    for id in &ids {
+        let Some(tracked) = book.get_mut(id) else {
+            continue;
+        };
+        if tracked.smart_order_type != SmartOrderType::Oco || tracked.sibling_unverified_paged {
+            continue;
+        }
+        if let SiblingVerifyVerdict::DeadlineExceeded { elapsed_ms } = evaluate_sibling_verify(
+            tracked.triggered_at_ms,
+            now_ms,
+            deadline_secs,
+            &tracked.status,
+        ) {
+            tracked.sibling_unverified_paged = true;
+            emit_oco02(id, elapsed_ms, deadline_secs);
+            metrics::counter!(
+                "tv_groww_oco_reconcile_findings_total",
+                "kind" => "sibling_unverified"
+            )
+            .increment(1);
+            if !report.sibling_unverified.contains(id) {
+                report.sibling_unverified.push(id.clone());
+            }
+        }
+    }
+
+    // Foreign counting: one ACTIVE list per flow. Untracked rows are counted
+    // and NEVER acted on (no reference id exists on smart-order responses —
+    // attribution is impossible; co-tenant discipline).
+    if !report.degraded.contains(&"token") && !report.degraded.contains(&"rate_limited") {
+        for flow in [SmartOrderType::Gtt, SmartOrderType::Oco] {
+            let q = SmartOrderListQuery::active(flow);
+            match transport.list_smart_orders(&q, token).await {
+                TransportOutcome::Success(list) => {
+                    for row in list.orders.unwrap_or_default() {
+                        if let Some(id) = row.smart_order_id
+                            && !book.contains(&id)
+                        {
+                            report.foreign_untracked += 1;
+                        }
+                    }
+                }
+                TransportOutcome::AuthStale { http_status } => {
+                    report.degraded.push("token");
+                    emit_oco05("token", &format!("auth stale {http_status} on list"));
+                    break;
+                }
+                TransportOutcome::RateLimited { .. } => {
+                    report.degraded.push("rate_limited");
+                    emit_oco05("rate_limited", "429 on smart-order list");
+                    break;
+                }
+                TransportOutcome::Rejected { ga_code, .. } => {
+                    report.degraded.push("rejected_read");
+                    emit_oco05("rejected_read", ga_code.as_deref().unwrap_or("no-ga"));
+                }
+                TransportOutcome::Ambiguous(reason) => {
+                    report.degraded.push("transport");
+                    emit_oco05("transport", reason.as_str());
                 }
             }
         }
     }
+
+    if !report.findings.is_empty() {
+        emit_oco03(&report.findings);
+    }
+    report
 }
 
-/// Classifies + parses a `(status, body)` pair into the typed payload:
-/// - non-2xx with a parseable GA envelope → [`SmartOrderError::GaFailure`];
-/// - non-2xx otherwise → [`SmartOrderError::HttpStatus`] (bounded body);
-/// - 2xx carrying `status: FAILURE` / an `error` object → `GaFailure`
-///   (the G1 lesson: a 2xx can carry the FAILURE envelope);
-/// - 2xx SUCCESS without a payload → [`SmartOrderError::Parse`].
-fn parse_success_envelope<T: DeserializeOwned>(
-    status: u16,
-    body: &str,
-) -> Result<T, SmartOrderError> {
-    if !(200..300).contains(&status) {
-        if let Ok(envelope) = serde_json::from_str::<GaEnvelope<serde_json::Value>>(body)
-            && let Some(ga) = envelope.error
-        {
-            return Err(SmartOrderError::GaFailure {
-                http_status: status,
-                // BROKER-CONTROLLED strings (the GA code AND the message)
-                // BOTH route through the house redaction choke point —
-                // never a trust-the-broker echo (S-HIGH fix 2026-07-15:
-                // `code` previously went through bounded_echo only).
-                code: capture_rest_error_body(&ga.code),
-                message: capture_rest_error_body(&ga.message),
-            });
+/// The spawnable OCO reconcile poller (the margin-loop house pattern:
+/// interval = `reconcile_poll_secs`, shutdown watch). HONESTY (adversarial
+/// round 1, finding 9): `gates` is moved BY VALUE at spawn time — the
+/// per-turn check re-reads the CAPTURED copy, so a runtime config flip
+/// needs a loop respawn to take effect (only `in_market_hours` and the
+/// token are genuinely re-read each turn). The spawn site is the FUTURE
+/// wiring PR — no crates/app code in
+/// this area PR. `token_provider` returns the CURRENT shared-minter token
+/// (SSM-read upstream; NEVER minted here).
+// WIRING-EXEMPT: the spawn site is the deferred app-integration PR (§39
+// live-flip scope); the pass it drives is exercised through the executor +
+// unit tests.
+pub async fn run_smart_order_reconcile_loop<T, P, M>(
+    transport: T,
+    token_provider: P,
+    book: Arc<tokio::sync::Mutex<SmartOrderBook>>,
+    gates: SmartOrderGates,
+    in_market_hours: M,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) where
+    T: SmartOrderTransport,
+    P: Fn() -> Option<SecretString>,
+    M: Fn() -> bool,
+{
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(
+        gates.reconcile_poll_secs.max(1),
+    ));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            _ = interval.tick() => {}
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    info!(target: "groww_oco", "smart-order reconcile loop: shutdown observed — exiting");
+                    return;
+                }
+                continue;
+            }
         }
-        return Err(SmartOrderError::HttpStatus {
-            status,
-            body: capture_rest_error_body(body),
-        });
+        if *shutdown.borrow() {
+            info!(target: "groww_oco", "smart-order reconcile loop: shutdown observed — exiting");
+            return;
+        }
+        // Read gate: the CAPTURED gates copy + the live market-hours closure
+        // (a runtime gate flip needs a respawn — see the fn doc, finding 9).
+        if !gates.smart_orders_read || !in_market_hours() {
+            continue;
+        }
+        let Some(token) = token_provider() else {
+            emit_oco05("token", "no access token available this turn");
+            continue;
+        };
+        let now_ms = epoch_now_ms();
+        let mut guard = book.lock().await;
+        let _report = reconcile_pass(
+            &transport,
+            &token,
+            &mut guard,
+            gates.sibling_cancel_deadline_secs,
+            now_ms,
+            &HashMap::new(),
+        )
+        .await;
     }
-    let envelope: GaEnvelope<T> = serde_json::from_str(body)
-        .map_err(|e| SmartOrderError::Parse(capture_rest_error_body(&e.to_string())))?;
-    if envelope.status.eq_ignore_ascii_case("FAILURE") || envelope.error.is_some() {
-        let ga = envelope.error.unwrap_or_default();
-        return Err(SmartOrderError::GaFailure {
-            http_status: status,
-            code: capture_rest_error_body(&ga.code),
-            message: capture_rest_error_body(&ga.message),
-        });
-    }
-    // Rule-11 (no false-OK): success requires POSITIVE evidence — the 2xx
-    // envelope must literally say SUCCESS. Any other status string on a 2xx
-    // ("PENDING", empty, a drifted value) is a typed anomaly, never treated
-    // as success (H-MED fix, 2026-07-15).
-    if !envelope.status.eq_ignore_ascii_case("SUCCESS") {
-        return Err(SmartOrderError::AnomalousEnvelope {
-            http_status: status,
-            envelope_status: capture_rest_error_body(&envelope.status),
-        });
-    }
-    envelope
-        .payload
-        .ok_or_else(|| SmartOrderError::Parse("2xx SUCCESS envelope without payload".to_owned()))
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
+/// Wall-clock epoch milliseconds (cold path; 0 on a pre-1970 clock).
+fn epoch_now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|d| i64::try_from(d.as_millis()).ok())
+        .unwrap_or(0)
+}
+
+/// Map an ambiguity reason to the OCO-01/-04 stage taxonomy.
+pub(crate) const fn ambiguity_stage(reason: &AmbiguityReason) -> &'static str {
+    match reason {
+        AmbiguityReason::ConnectPhase => "connect_phase",
+        AmbiguityReason::Timeout => "timeout",
+        AmbiguityReason::ServerError(_) => "server_error",
+        AmbiguityReason::Decode => "decode",
+        AmbiguityReason::GaOnNonRejectStatus(_) => "ga_on_non_reject_status",
+        AmbiguityReason::MissingPayload => "missing_payload",
+        AmbiguityReason::SendFailed => "send_failed",
+    }
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::oms::groww::api_client::AmbiguityReason;
+    use crate::oms::groww::intent_ledger::IntentReceipt;
+    use proptest::prelude::*;
+    use std::sync::Mutex as StdMutex;
 
-    // -- Source-scan ratchet: no unwrap/expect in the production region ----
-
-    #[test]
-    fn ratchet_no_unwrap_or_expect_in_production_region() {
-        let src = include_str!("smart_orders.rs");
-        let marker = "#[cfg(test)]";
-        let prod = src.split(marker).next().unwrap_or("");
-        assert!(
-            !prod.contains(".unwrap("),
-            "production region of smart_orders.rs must not call unwrap"
-        );
-        assert!(
-            !prod.contains(".expect("),
-            "production region of smart_orders.rs must not call expect"
-        );
-    }
+    // -- money: paise <-> decimal wire strings (financial boundaries) -------
 
     #[test]
-    fn ratchet_reqwest_send_sits_after_both_gates() {
-        // Statically: every write method's `send` lives ONLY inside
-        // send_request, which is reachable ONLY past the write_enabled
-        // check and the GROWW_ORDER_LIVE_FIRE dry-run return. Pin the
-        // shape: exactly ONE `.send().await` call site in the whole file,
-        // and every write method carries both gate literals.
-        let src = include_str!("smart_orders.rs");
-        let prod = src.split("#[cfg(test)]").next().unwrap_or("");
-        assert_eq!(
-            prod.matches(".send().await").count(),
-            1,
-            "exactly one reqwest send site (inside send_request)"
-        );
-        assert_eq!(
-            prod.matches("if !self.settings.write_enabled").count(),
-            4,
-            "all four write methods carry the Gate-1 config check"
-        );
-        assert_eq!(
-            prod.matches("if !GROWW_ORDER_LIVE_FIRE").count(),
-            4,
-            "all four write methods carry the Gate-3 dry-run check"
-        );
-        // C-MED (2026-07-15): every pub async method must be accounted for
-        // by exactly one gate — a 5th UNGATED write (or read) method makes
-        // the pub-async count exceed the gate count and fails here.
-        let pub_async = prod.matches("pub async fn ").count();
-        let write_gates = prod.matches("if !self.settings.write_enabled").count();
-        let read_gates = prod.matches("if !self.settings.read_enabled").count();
-        assert_eq!(write_gates, 4, "exactly four gated write methods");
-        assert_eq!(read_gates, 2, "exactly two gated read methods");
-        assert_eq!(
-            pub_async,
-            write_gates + read_gates,
-            "every pub async method must carry a config gate — an ungated \
-             5th write method (or read method) fails this ratchet"
-        );
-        // H-HIGH (2026-07-15): the retry-policy split is pinned
-        // BEHAVIORALLY by test_write_path_never_retries_transport_error /
-        // test_read_path_retries_transport_error_once below (a counting
-        // mock server observes the real attempt counts — mutation-hard).
-    }
-
-    // -- Observability contract ratchet (C-MED, 2026-07-15) -------------------
-
-    #[test]
-    fn ratchet_coded_emit_blocks_exist_in_production_region() {
-        // Mutation-hardness for the observability contract: the three emit
-        // blocks must exist in the PRODUCTION region with their exact
-        // `ErrorCode::...code_str()` tokens — deleting or re-coding any
-        // emit fails the build here, not in review.
-        let src = include_str!("smart_orders.rs");
-        let prod = src.split("#[cfg(test)]").next().unwrap_or("");
-        assert_eq!(
-            prod.matches("ErrorCode::GrowwOco01PlacementFailed.code_str()")
-                .count(),
-            1,
-            "GROWW-OCO-01 emit (create + cancel arm) must exist exactly once"
-        );
-        assert_eq!(
-            prod.matches("ErrorCode::GrowwOco04ModifyRejected.code_str()")
-                .count(),
-            1,
-            "GROWW-OCO-04 emit (modify arm) must exist exactly once"
-        );
-        assert_eq!(
-            prod.matches("ErrorCode::GrowwOco05PollerDegraded.code_str()")
-                .count(),
-            2,
-            "GROWW-OCO-05 emits (status get + list) must exist exactly twice"
-        );
-        // Each token must sit inside an error! macro carrying a `code =`
-        // field (the tag-guard convention).
-        assert!(
-            prod.matches("code = ErrorCode::GrowwOco").count() == 4,
-            "all four coded emits carry the `code = ErrorCode::...` field"
-        );
-    }
-
-    // -- Settings ------------------------------------------------------------
-
-    #[test]
-    fn test_settings_default_all_off_with_documented_knobs() {
-        let s = GrowwSmartOrderSettings::default();
-        assert!(!s.read_enabled);
-        assert!(!s.write_enabled);
-        assert_eq!(s.reconcile_poll_secs, 15);
-        assert_eq!(s.sibling_cancel_deadline_secs, 30);
-    }
-
-    #[test]
-    fn test_settings_from_config_maps_all_four_fields() {
-        let cfg = GrowwOrdersConfig {
-            smart_orders_read: true,
-            smart_orders_write: true,
-            oco_reconcile_poll_secs: 7,
-            oco_sibling_cancel_deadline_secs: 99,
-            ..GrowwOrdersConfig::default()
-        };
-        let s = GrowwSmartOrderSettings::from(&cfg);
-        assert!(s.read_enabled);
-        assert!(s.write_enabled);
-        assert_eq!(s.reconcile_poll_secs, 7);
-        assert_eq!(s.sibling_cancel_deadline_secs, 99);
-        // And the config default maps to the settings default.
-        assert_eq!(
-            GrowwSmartOrderSettings::from(&GrowwOrdersConfig::default()),
-            GrowwSmartOrderSettings::default()
-        );
-    }
-
-    #[test]
-    fn test_settings_from_config_clamps_zero_knobs_to_defaults() {
-        // H-LOW (2026-07-15): a 0 poll cadence would hot-loop the poller;
-        // a 0 sibling deadline would make every check an instant
-        // Violation — both clamp to the documented defaults (warn!-ed).
-        let cfg = GrowwOrdersConfig {
-            oco_reconcile_poll_secs: 0,
-            oco_sibling_cancel_deadline_secs: 0,
-            ..GrowwOrdersConfig::default()
-        };
-        let s = GrowwSmartOrderSettings::from(&cfg);
-        assert_eq!(s.reconcile_poll_secs, 15, "0 poll secs clamps to 15");
-        assert_eq!(
-            s.sibling_cancel_deadline_secs, 30,
-            "0 deadline secs clamps to 30"
-        );
-        // Non-zero values pass through unclamped.
-        let cfg = GrowwOrdersConfig {
-            oco_reconcile_poll_secs: 1,
-            oco_sibling_cancel_deadline_secs: 1,
-            ..GrowwOrdersConfig::default()
-        };
-        let s = GrowwSmartOrderSettings::from(&cfg);
-        assert_eq!(s.reconcile_poll_secs, 1);
-        assert_eq!(s.sibling_cancel_deadline_secs, 1);
-    }
-
-    // -- Money discipline -----------------------------------------------------
-
-    #[test]
-    fn test_paise_to_decimal_string_exact() {
-        assert_eq!(paise_to_decimal_string(1_950_050), "19500.50");
-        assert_eq!(paise_to_decimal_string(5), "0.05");
+    fn test_paise_to_decimal_string_renders_doc_examples() {
+        assert_eq!(paise_to_decimal_string(398_500), "3985.00");
+        assert_eq!(paise_to_decimal_string(12_200), "122.00");
         assert_eq!(paise_to_decimal_string(0), "0.00");
-        assert_eq!(paise_to_decimal_string(100), "1.00");
-        assert_eq!(paise_to_decimal_string(12_050), "120.50");
-        assert_eq!(paise_to_decimal_string(9_500), "95.00");
-        // Negative renders with sign (total function).
+        assert_eq!(paise_to_decimal_string(5), "0.05");
         assert_eq!(paise_to_decimal_string(-5), "-0.05");
-        // i64::MIN must not panic (unsigned_abs path).
-        assert_eq!(paise_to_decimal_string(i64::MIN), "-92233720368547758.08");
-        assert_eq!(paise_to_decimal_string(i64::MAX), "92233720368547758.07");
+        assert_eq!(paise_to_decimal_string(1), "0.01");
+        assert_eq!(
+            paise_to_decimal_string(MAX_ABS_PAISE_FOR_DECIMAL_STRING),
+            "10000000000.00"
+        );
     }
 
     #[test]
-    fn test_decimal_string_to_paise_round_trips() {
-        for paise in [0_i64, 5, 100, 9_500, 12_050, 1_950_050, i64::MAX] {
-            let s = paise_to_decimal_string(paise);
-            assert_eq!(
-                decimal_string_to_paise(&s),
-                Ok(paise),
-                "round trip failed for {paise} (string `{s}`)"
-            );
-        }
-        // Single fractional digit means tenths: "3985.5" == 3985.50.
-        assert_eq!(decimal_string_to_paise("3985.5"), Ok(398_550));
-        assert_eq!(decimal_string_to_paise("3985"), Ok(398_500));
-        assert_eq!(decimal_string_to_paise(" 120.50 "), Ok(12_050));
-        assert_eq!(decimal_string_to_paise("0.05"), Ok(5));
-    }
-
-    #[test]
-    fn test_decimal_string_to_paise_rejects_bad_inputs() {
-        // >2dp rejected.
-        assert!(matches!(
-            decimal_string_to_paise("1.234"),
-            Err(SmartOrderValidationError::InvalidPrice { .. })
-        ));
-        // Negative rejected.
-        assert!(matches!(
-            decimal_string_to_paise("-1.00"),
-            Err(SmartOrderValidationError::InvalidPrice { .. })
-        ));
-        // NaN / inf / exponent / signs rejected by charset.
+    fn test_decimal_string_to_paise_boundaries() {
+        assert_eq!(decimal_string_to_paise("3985.00"), Some(398_500));
+        assert_eq!(decimal_string_to_paise("3985"), Some(398_500));
+        assert_eq!(decimal_string_to_paise("3985.5"), Some(398_550));
+        assert_eq!(decimal_string_to_paise(" 3985.50 "), Some(398_550));
+        assert_eq!(decimal_string_to_paise("-0.01"), Some(-1));
+        assert_eq!(decimal_string_to_paise("0"), Some(0));
+        // Sub-paise precision is REFUSED (never truncated) — zeros tolerated.
+        assert_eq!(decimal_string_to_paise("3985.505"), None);
+        assert_eq!(decimal_string_to_paise("3985.500"), Some(398_550));
+        // Band edges.
+        assert_eq!(
+            decimal_string_to_paise("10000000000.00"),
+            Some(MAX_ABS_PAISE_FOR_DECIMAL_STRING)
+        );
+        assert_eq!(decimal_string_to_paise("10000000000.01"), None);
+        // Garbage / overflow.
         for bad in [
-            "NaN", "inf", "1e5", "+1.00", "", "  ", ".", ".5", "1.", "1..2", "1,00",
+            "",
+            ".",
+            "-",
+            "1e3",
+            "1.2.3",
+            "abc",
+            "1 2",
+            "--1",
+            "99999999999999999999",
+            "0x10",
         ] {
-            assert!(
-                decimal_string_to_paise(bad).is_err(),
-                "`{bad}` must be rejected"
-            );
+            assert_eq!(decimal_string_to_paise(bad), None, "{bad:?}");
         }
-        // Overflow via checked math (i64::MAX rupees * 100 overflows).
-        assert!(matches!(
-            decimal_string_to_paise("92233720368547758080.00"),
-            Err(SmartOrderValidationError::InvalidPrice { .. })
-        ));
-        assert!(matches!(
-            decimal_string_to_paise("92233720368547759.00"),
-            Err(SmartOrderValidationError::InvalidPrice { .. })
-        ));
     }
 
-    // -- reference_id ----------------------------------------------------------
+    proptest! {
+        #[test]
+        fn prop_paise_decimal_roundtrip(p in -MAX_ABS_PAISE_FOR_DECIMAL_STRING..=MAX_ABS_PAISE_FOR_DECIMAL_STRING) {
+            let s = paise_to_decimal_string(p);
+            prop_assert_eq!(decimal_string_to_paise(&s), Some(p));
+        }
 
-    #[test]
-    fn test_validate_reference_id_edges() {
-        // Valid: 8-20 chars, ≤2 hyphens.
-        assert!(validate_reference_id("sref-unique-456").is_ok());
-        assert!(validate_reference_id("abcd1234").is_ok()); // exactly 8
-        assert!(validate_reference_id("a1234567890123456789").is_ok()); // exactly 20
-        // Length violations.
-        assert!(validate_reference_id("abc1234").is_err()); // 7
-        assert!(validate_reference_id("a12345678901234567890").is_err()); // 21
-        // Charset violations.
-        assert!(validate_reference_id("abcd 1234").is_err());
-        assert!(validate_reference_id("abcd_1234").is_err());
-        assert!(validate_reference_id("abcd!1234").is_err());
-        // Hyphen count: 2 ok, 3 rejected.
-        assert!(validate_reference_id("ab-cd-1234").is_ok());
-        assert!(validate_reference_id("a-b-c-1234").is_err());
+        #[test]
+        fn prop_decimal_parse_never_panics(s in "\\PC*") {
+            let _ = decimal_string_to_paise(&s);
+        }
+
+        #[test]
+        fn prop_status_parse_total_never_panics(s in "\\PC*") {
+            let parsed = SmartOrderStatus::parse(&s);
+            // The label is always one of the 7 fixed strings.
+            let label = parsed.as_str().to_owned();
+            prop_assert!([
+                "ACTIVE", "TRIGGERED", "CANCELLED", "EXPIRED", "FAILED",
+                "COMPLETED", "UNKNOWN"
+            ]
+            .contains(&label.as_str()));
+        }
     }
 
-    // -- OCO validation ----------------------------------------------------------
+    // -- serde wire shape ----------------------------------------------------
 
-    /// The doc 18 §2 body example, verbatim.
-    fn doc_oco_request() -> OcoCreateRequest {
-        OcoCreateRequest {
-            reference_id: "sref-unique-456".to_owned(),
-            smart_order_type: SMART_ORDER_TYPE_OCO,
-            segment: "FNO".to_owned(),
-            trading_symbol: "NIFTY25OCT24000CE".to_owned(),
-            quantity: 50,
-            net_position_quantity: 50,
-            transaction_type: TransactionType::Sell,
-            target: OcoLeg {
-                trigger_price: "120.50".to_owned(),
-                order_type: SmartLegOrderType::Limit,
-                price: Some("121.00".to_owned()),
+    fn gtt_req() -> GrowwCreateGttReq {
+        GrowwCreateGttReq {
+            reference_id: "TV2607160001ABCD".to_owned(),
+            smart_order_type: SmartOrderType::Gtt,
+            segment: GrowwSegment::Cash,
+            trading_symbol: "RELIANCE".to_owned(),
+            quantity: 10,
+            trigger_price: 398_500,
+            trigger_direction: TriggerDirection::Up,
+            order: GttOrderLeg {
+                order_type: GrowwOrderType::Market,
+                price: None,
+                transaction_type: GrowwTransactionType::Sell,
             },
-            stop_loss: OcoLeg {
-                trigger_price: "95.00".to_owned(),
-                order_type: SmartLegOrderType::SlM,
+            child_legs: None,
+            product_type: GrowwProduct::Cnc,
+            exchange: GrowwExchange::Nse,
+            duration: GrowwValidity::Day,
+        }
+    }
+
+    fn oco_req() -> GrowwCreateOcoReq {
+        GrowwCreateOcoReq {
+            reference_id: "TV2607160002ABCD".to_owned(),
+            smart_order_type: SmartOrderType::Oco,
+            segment: GrowwSegment::Fno,
+            trading_symbol: "NIFTY26JUL28500CE".to_owned(),
+            quantity: 75,
+            net_position_quantity: 75,
+            transaction_type: GrowwTransactionType::Sell,
+            target: OcoTargetLeg {
+                trigger_price: 12_200,
+                order_type: TargetLegOrderType::Limit,
+                price: Some(12_150),
+            },
+            stop_loss: OcoStopLossLeg {
+                trigger_price: 9_800,
+                order_type: StopLossLegOrderType::SlM,
                 price: None,
             },
-            product_type: "MIS".to_owned(),
-            exchange: "NSE".to_owned(),
-            duration: "DAY".to_owned(),
+            product_type: GrowwProduct::Nrml,
+            exchange: GrowwExchange::Nse,
+            duration: GrowwValidity::Day,
         }
     }
 
     #[test]
-    fn test_validate_oco_create_doc_example_passes() {
-        assert_eq!(validate_oco_create(&doc_oco_request(), 25), Ok(()));
+    fn test_gtt_create_wire_shape_decimal_strings_and_explicit_null_price() {
+        let v = serde_json::to_value(SmartOrderCreate::Gtt(gtt_req())).expect("serialize");
+        assert_eq!(v["smart_order_type"], "GTT");
+        assert_eq!(v["segment"], "CASH");
+        assert_eq!(v["trigger_price"], "3985.00"); // decimal STRING
+        assert_eq!(v["trigger_direction"], "UP");
+        assert_eq!(v["duration"], "DAY");
+        // MARKET leg: `price` PRESENT and explicitly null (never skipped).
+        let order = v["order"].as_object().expect("order leg");
+        assert!(order.contains_key("price"));
+        assert!(order["price"].is_null());
+        assert_eq!(order["order_type"], "MARKET");
+        assert_eq!(order["transaction_type"], "SELL");
+        // Absent child_legs is SKIPPED (untouched-key discipline).
+        assert!(!v.as_object().expect("map").contains_key("child_legs"));
     }
 
     #[test]
-    fn test_validate_oco_create_rejects_cash_segment() {
-        let mut req = doc_oco_request();
-        req.segment = "CASH".to_owned();
-        assert!(matches!(
-            validate_oco_create(&req, 25),
-            Err(SmartOrderValidationError::UnsupportedOcoSegment { .. })
-        ));
+    fn test_oco_create_wire_shape_matches_doc_example() {
+        let v = serde_json::to_value(SmartOrderCreate::Oco(oco_req())).expect("serialize");
+        assert_eq!(v["smart_order_type"], "OCO");
+        assert_eq!(v["segment"], "FNO");
+        assert_eq!(v["net_position_quantity"], 75);
+        assert_eq!(v["target"]["trigger_price"], "122.00");
+        assert_eq!(v["target"]["order_type"], "LIMIT");
+        assert_eq!(v["target"]["price"], "121.50");
+        assert_eq!(v["stop_loss"]["trigger_price"], "98.00");
+        assert_eq!(v["stop_loss"]["order_type"], "SL_M");
+        assert!(v["stop_loss"]["price"].is_null()); // the doc's own example
     }
 
     #[test]
-    fn test_validate_oco_create_quantity_rules() {
-        let mut req = doc_oco_request();
-        req.quantity = 0;
-        assert!(matches!(
-            validate_oco_create(&req, 25),
-            Err(SmartOrderValidationError::NonPositiveQuantity { .. })
-        ));
-        let mut req = doc_oco_request();
-        req.quantity = 75;
-        req.net_position_quantity = 50;
-        assert!(matches!(
-            validate_oco_create(&req, 25),
-            Err(SmartOrderValidationError::QuantityExceedsPosition { .. })
-        ));
-        // Short position: negative net qty, abs() applies.
-        let mut req = doc_oco_request();
-        req.quantity = 50;
-        req.net_position_quantity = -50;
-        req.transaction_type = TransactionType::Buy;
-        // Buy exit: target below SL.
-        req.target.trigger_price = "95.00".to_owned();
-        req.target.price = Some("94.50".to_owned());
-        req.stop_loss.trigger_price = "120.50".to_owned();
-        assert_eq!(validate_oco_create(&req, 25), Ok(()));
-        // Lot-size multiple.
-        let mut req = doc_oco_request();
-        req.quantity = 30;
-        req.net_position_quantity = 50;
-        assert!(matches!(
-            validate_oco_create(&req, 25),
-            Err(SmartOrderValidationError::QuantityNotLotMultiple { .. })
-        ));
-        // Non-positive lot size fail-closed.
-        assert!(matches!(
-            validate_oco_create(&doc_oco_request(), 0),
-            Err(SmartOrderValidationError::NonPositiveLotSize { .. })
-        ));
-    }
-
-    #[test]
-    fn test_validate_oco_create_leg_rules() {
-        // LIMIT target without price.
-        let mut req = doc_oco_request();
-        req.target.price = None;
-        assert!(matches!(
-            validate_oco_create(&req, 25),
-            Err(SmartOrderValidationError::PricePresenceInvalid { leg: "target", .. })
-        ));
-        // MARKET target with price.
-        let mut req = doc_oco_request();
-        req.target.order_type = SmartLegOrderType::Market;
-        assert!(matches!(
-            validate_oco_create(&req, 25),
-            Err(SmartOrderValidationError::PricePresenceInvalid { leg: "target", .. })
-        ));
-        // SL/SL_M as target rejected.
-        let mut req = doc_oco_request();
-        req.target.order_type = SmartLegOrderType::Sl;
-        assert!(matches!(
-            validate_oco_create(&req, 25),
-            Err(SmartOrderValidationError::TargetOrderTypeInvalid)
-        ));
-        // SL_M with a price rejected.
-        let mut req = doc_oco_request();
-        req.stop_loss.price = Some("95.00".to_owned());
-        assert!(matches!(
-            validate_oco_create(&req, 25),
-            Err(SmartOrderValidationError::PricePresenceInvalid {
-                leg: "stop_loss",
-                ..
-            })
-        ));
-        // SL without a price rejected.
-        let mut req = doc_oco_request();
-        req.stop_loss.order_type = SmartLegOrderType::Sl;
-        req.stop_loss.price = None;
-        assert!(matches!(
-            validate_oco_create(&req, 25),
-            Err(SmartOrderValidationError::PricePresenceInvalid {
-                leg: "stop_loss",
-                ..
-            })
-        ));
-        // LIMIT/MARKET as stop-loss rejected.
-        let mut req = doc_oco_request();
-        req.stop_loss.order_type = SmartLegOrderType::Limit;
-        req.stop_loss.price = Some("95.00".to_owned());
-        assert!(matches!(
-            validate_oco_create(&req, 25),
-            Err(SmartOrderValidationError::StopLossOrderTypeInvalid)
-        ));
-    }
-
-    #[test]
-    fn test_validate_oco_trigger_geometry_both_sides() {
-        // SELL exit of a long: target above SL — ok.
-        assert!(validate_oco_trigger_geometry(TransactionType::Sell, 12_050, 9_500).is_ok());
-        // Inverted for SELL — rejected.
-        assert!(matches!(
-            validate_oco_trigger_geometry(TransactionType::Sell, 9_500, 12_050),
-            Err(SmartOrderValidationError::TriggerGeometryInvalid { .. })
-        ));
-        // BUY exit of a short: target below SL — ok.
-        assert!(validate_oco_trigger_geometry(TransactionType::Buy, 9_500, 12_050).is_ok());
-        // Inverted for BUY — rejected.
-        assert!(matches!(
-            validate_oco_trigger_geometry(TransactionType::Buy, 12_050, 9_500),
-            Err(SmartOrderValidationError::TriggerGeometryInvalid { .. })
-        ));
-        // Equal triggers always rejected (both directions).
-        assert!(validate_oco_trigger_geometry(TransactionType::Sell, 100, 100).is_err());
-        assert!(validate_oco_trigger_geometry(TransactionType::Buy, 100, 100).is_err());
-    }
-
-    // -- GTT validation ----------------------------------------------------------
-
-    /// The doc's GTT create example (doc 16/18 GTT schema).
-    fn doc_gtt_request() -> GttCreateRequest {
-        GttCreateRequest {
-            reference_id: "sref-unique-123".to_owned(),
-            smart_order_type: SMART_ORDER_TYPE_GTT,
-            segment: "CASH".to_owned(),
-            trading_symbol: "TCS".to_owned(),
-            quantity: 10,
-            trigger_price: "3985.00".to_owned(),
-            trigger_direction: TriggerDirection::Down,
-            order: GttEmbeddedOrder {
-                order_type: SmartLegOrderType::Limit,
-                price: Some("3990.00".to_owned()),
-                transaction_type: TransactionType::Buy,
+    fn test_modify_body_sends_only_what_changes() {
+        let gtt = build_modify_body(
+            SmartOrderType::Gtt,
+            GrowwSegment::Cash,
+            &SmartModifyFields {
+                quantity: Some(20),
+                ..Default::default()
             },
-            product_type: "CNC".to_owned(),
-            exchange: "NSE".to_owned(),
-            duration: "DAY".to_owned(),
-        }
-    }
-
-    #[test]
-    fn test_validate_gtt_create_rules() {
-        assert_eq!(validate_gtt_create(&doc_gtt_request(), 1), Ok(()));
-        // LIMIT without price.
-        let mut req = doc_gtt_request();
-        req.order.price = None;
-        assert!(matches!(
-            validate_gtt_create(&req, 1),
-            Err(SmartOrderValidationError::PricePresenceInvalid { leg: "order", .. })
-        ));
-        // MARKET with price.
-        let mut req = doc_gtt_request();
-        req.order.order_type = SmartLegOrderType::Market;
-        assert!(matches!(
-            validate_gtt_create(&req, 1),
-            Err(SmartOrderValidationError::PricePresenceInvalid { leg: "order", .. })
-        ));
-        // SL_M with price — exact variant (C-LOW: no catch-all is_err).
-        let mut req = doc_gtt_request();
-        req.order.order_type = SmartLegOrderType::SlM;
-        assert!(matches!(
-            validate_gtt_create(&req, 1),
-            Err(SmartOrderValidationError::PricePresenceInvalid {
-                leg: "order",
-                reason: "price must be absent for MARKET/SL_M",
-            })
-        ));
-        // FNO lot multiple.
-        let mut req = doc_gtt_request();
-        req.segment = "FNO".to_owned();
-        req.quantity = 40;
-        assert!(matches!(
-            validate_gtt_create(&req, 75),
-            Err(SmartOrderValidationError::QuantityNotLotMultiple { .. })
-        ));
-        // Bad trigger price string — exact variant (>2dp).
-        let mut req = doc_gtt_request();
-        req.trigger_price = "3985.123".to_owned();
-        assert!(matches!(
-            validate_gtt_create(&req, 1),
-            Err(SmartOrderValidationError::InvalidPrice {
-                reason: "fraction must be 1-2 digits",
-                ..
-            })
-        ));
-    }
-
-    // -- Modify validation --------------------------------------------------------
-
-    #[test]
-    fn test_validate_modify_rules() {
-        // Empty modify rejected.
-        let empty = SmartOrderModifyRequest {
-            smart_order_type: SMART_ORDER_TYPE_OCO,
-            segment: "FNO".to_owned(),
-            quantity: None,
-            duration: None,
-            product_type: None,
-            target: None,
-            stop_loss: None,
-        };
-        assert!(matches!(
-            validate_modify(&empty),
-            Err(SmartOrderValidationError::EmptyModify)
-        ));
-        // Partial-leg modify (the doc example): both trigger prices.
-        let partial = SmartOrderModifyRequest {
-            target: Some(ModifyLeg {
-                trigger_price: "122.00".to_owned(),
-            }),
-            stop_loss: Some(ModifyLeg {
-                trigger_price: "97.50".to_owned(),
-            }),
-            ..empty.clone()
-        };
-        assert_eq!(validate_modify(&partial), Ok(()));
-        // Non-positive quantity rejected.
-        let bad_qty = SmartOrderModifyRequest {
-            quantity: Some(0),
-            ..empty.clone()
-        };
-        assert!(matches!(
-            validate_modify(&bad_qty),
-            Err(SmartOrderValidationError::NonPositiveQuantity { .. })
-        ));
-        // Bad trigger price string — exact variant (non-digit).
-        let bad_price = SmartOrderModifyRequest {
-            target: Some(ModifyLeg {
-                trigger_price: "abc".to_owned(),
-            }),
-            ..empty.clone()
-        };
-        assert!(matches!(
-            validate_modify(&bad_price),
-            Err(SmartOrderValidationError::InvalidPrice {
-                reason: "non-digit integer part",
-                ..
-            })
-        ));
-        // GTT modify is fail-closed UNSUPPORTED (H-MED: the OCO-shaped
-        // struct cannot express the GTT modifiable set); OCO passes.
-        let gtt_modify = SmartOrderModifyRequest {
-            smart_order_type: SMART_ORDER_TYPE_GTT,
-            quantity: Some(10),
-            ..empty
-        };
-        assert!(matches!(
-            validate_modify(&gtt_modify),
-            Err(SmartOrderValidationError::UnsupportedModifyType {
-                smart_order_type: "GTT",
-            })
-        ));
-    }
-
-    // -- Wire shape: doc-verbatim field names ---------------------------------
-
-    #[test]
-    fn test_oco_create_body_matches_doc_18_verbatim() {
-        let body = serde_json::to_value(doc_oco_request()).unwrap();
-        let expected = serde_json::json!({
-            "reference_id": "sref-unique-456",
-            "smart_order_type": "OCO",
-            "segment": "FNO",
-            "trading_symbol": "NIFTY25OCT24000CE",
-            "quantity": 50,
-            "net_position_quantity": 50,
-            "transaction_type": "SELL",
-            "target": {"trigger_price": "120.50", "order_type": "LIMIT", "price": "121.00"},
-            "stop_loss": {"trigger_price": "95.00", "order_type": "SL_M", "price": null},
-            "product_type": "MIS",
-            "exchange": "NSE",
-            "duration": "DAY"
-        });
-        assert_eq!(body, expected);
-    }
-
-    #[test]
-    fn test_gtt_create_body_matches_doc_example_inferred_schema() {
-        // Provenance honesty (H-MED, 2026-07-15): unlike the OCO shape
-        // (capture-verbatim, doc 18 §2), the GTT create field set is
-        // INFERRED — grounded in the capture's example JSON + schema prose
-        // only (doc 18 §0 defers the GTT table; doc 16 has none). Probe
-        // P1/P4 class: verify on the first authorized live GTT round-trip.
-        let body = serde_json::to_value(doc_gtt_request()).unwrap();
-        let expected = serde_json::json!({
-            "reference_id": "sref-unique-123",
-            "smart_order_type": "GTT",
-            "segment": "CASH",
-            "trading_symbol": "TCS",
-            "quantity": 10,
-            "trigger_price": "3985.00",
-            "trigger_direction": "DOWN",
-            "order": {"order_type": "LIMIT", "price": "3990.00", "transaction_type": "BUY"},
-            "product_type": "CNC",
-            "exchange": "NSE",
-            "duration": "DAY"
-        });
-        assert_eq!(body, expected);
-        // child_legs deliberately absent (probe P1 — never a guessed shape).
-        assert!(body.get("child_legs").is_none());
-    }
-
-    #[test]
-    fn test_modify_body_skips_absent_fields() {
-        let req = SmartOrderModifyRequest {
-            smart_order_type: SMART_ORDER_TYPE_OCO,
-            segment: "FNO".to_owned(),
-            quantity: Some(40),
-            duration: None,
-            product_type: None,
-            target: Some(ModifyLeg {
-                trigger_price: "122.00".to_owned(),
-            }),
-            stop_loss: None,
-        };
-        let body = serde_json::to_value(&req).unwrap();
-        let expected = serde_json::json!({
-            "smart_order_type": "OCO",
-            "segment": "FNO",
-            "quantity": 40,
-            "target": {"trigger_price": "122.00"}
-        });
-        assert_eq!(body, expected);
-    }
-
-    // -- Envelope parsing -------------------------------------------------------
-
-    #[test]
-    fn test_parse_success_envelope_gtt_create_response() {
-        // The doc 18 §0 / doc 16 GTT 201 response, abridged verbatim.
-        let body = r#"{
-            "status": "SUCCESS",
-            "payload": {
-                "smart_order_id": "gtt_91a7f4",
-                "smart_order_type": "GTT",
-                "status": "ACTIVE",
-                "trading_symbol": "TCS",
-                "exchange": "NSE",
-                "quantity": 10,
-                "product_type": "CNC",
-                "duration": "DAY",
-                "order": {"order_type": "LIMIT", "price": "3990.00", "transaction_type": "BUY"},
-                "trigger_direction": "DOWN",
-                "trigger_price": "3985.00",
-                "is_cancellation_allowed": true,
-                "is_modification_allowed": true,
-                "created_at": "2025-09-30T07:00:00",
-                "expire_at": "2026-09-30T07:00:00",
-                "triggered_at": null,
-                "updated_at": "2025-09-30T07:00:00"
-            }
-        }"#;
-        let payload = parse_success_envelope::<SmartOrderPayload>(201, body).unwrap();
-        assert_eq!(payload.smart_order_id, "gtt_91a7f4");
-        assert_eq!(
-            SmartOrderStatus::from_groww_smart_status(&payload.status),
-            SmartOrderStatus::Active
         );
-        assert_eq!(payload.quantity, Some(10));
-        assert_eq!(payload.is_cancellation_allowed, Some(true));
-        assert_eq!(payload.triggered_at, None);
-        assert_eq!(payload.trigger_price.as_deref(), Some("3985.00"));
-    }
-
-    #[test]
-    fn test_parse_success_envelope_tolerates_partial_modify_echo() {
-        // The 202 modify echo is a PARTIAL object (doc 18 §3).
-        let body = r#"{"status":"SUCCESS","payload":{"smart_order_id":"oco_a12bc3","smart_order_type":"OCO","status":"ACTIVE","quantity":40}}"#;
-        let payload = parse_success_envelope::<SmartOrderPayload>(202, body).unwrap();
-        assert_eq!(payload.smart_order_id, "oco_a12bc3");
-        assert_eq!(payload.quantity, Some(40));
-        assert_eq!(payload.created_at, None);
-        assert_eq!(payload.trading_symbol, "");
-    }
-
-    #[test]
-    fn test_parse_success_envelope_ga_failure_on_4xx() {
-        let body = r#"{"status":"FAILURE","error":{"code":"GA007","message":"Duplicate order reference id","metadata":null}}"#;
-        let err = parse_success_envelope::<SmartOrderPayload>(400, body).unwrap_err();
-        match err {
-            SmartOrderError::GaFailure {
-                http_status, code, ..
-            } => {
-                assert_eq!(http_status, 400);
-                assert_eq!(code, "GA007");
-            }
-            other => panic!("expected GaFailure, got {other:?}"),
+        let v = serde_json::to_value(&gtt).expect("serialize");
+        let map = v.as_object().expect("map");
+        assert_eq!(v["smart_order_type"], "GTT");
+        assert_eq!(v["segment"], "CASH");
+        assert_eq!(v["quantity"], 20);
+        for absent in ["trigger_price", "trigger_direction", "order", "child_legs"] {
+            assert!(!map.contains_key(absent), "{absent} must be skipped");
         }
+
+        let oco = build_modify_body(
+            SmartOrderType::Oco,
+            GrowwSegment::Fno,
+            &SmartModifyFields {
+                target_trigger_price: Some(12_200),
+                ..Default::default()
+            },
+        );
+        let v = serde_json::to_value(&oco).expect("serialize");
+        assert_eq!(v["target"]["trigger_price"], "122.00"); // doc's partial-leg patch
+        assert!(!v.as_object().expect("map").contains_key("stop_loss"));
+        assert!(!v.as_object().expect("map").contains_key("quantity"));
     }
 
     #[test]
-    fn test_parse_success_envelope_ga_failure_on_2xx_body() {
-        // The G1 lesson: a 2xx can carry the FAILURE envelope.
-        let body = r#"{"status":"FAILURE","error":{"code":"GA001","message":"Bad request"}}"#;
-        let err = parse_success_envelope::<SmartOrderPayload>(200, body).unwrap_err();
-        assert!(matches!(
-            err,
-            SmartOrderError::GaFailure {
-                http_status: 200,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn test_parse_success_envelope_non_2xx_without_ga_envelope() {
-        let err =
-            parse_success_envelope::<SmartOrderPayload>(502, "<html>gateway</html>").unwrap_err();
-        assert!(matches!(
-            err,
-            SmartOrderError::HttpStatus { status: 502, .. }
-        ));
-    }
-
-    #[test]
-    fn test_parse_success_envelope_anomalous_2xx_status_is_never_success() {
-        // Rule-11 (H-MED, 2026-07-15): a 2xx whose envelope status is NOT
-        // the positive `SUCCESS` literal must never parse as success —
-        // even when a payload is present.
-        let body = r#"{"status":"PENDING","payload":{"smart_order_id":"oco_a12bc3","smart_order_type":"OCO","status":"ACTIVE"}}"#;
-        let err = parse_success_envelope::<SmartOrderPayload>(200, body).unwrap_err();
-        match err {
-            SmartOrderError::AnomalousEnvelope {
-                http_status,
-                envelope_status,
-            } => {
-                assert_eq!(http_status, 200);
-                assert_eq!(envelope_status, "PENDING");
-            }
-            other => panic!("expected AnomalousEnvelope, got {other:?}"),
-        }
-        // Empty status string is equally anomalous.
-        let err = parse_success_envelope::<SmartOrderPayload>(
-            201,
-            r#"{"payload":{"smart_order_id":"x"}}"#,
+    fn test_smart_order_payload_tolerates_minimal_and_full_bodies() {
+        // The cancel echo (a documented SUBSET of the full object).
+        let echo: SmartOrderPayload = serde_json::from_str(
+            r#"{"smart_order_id":"gtt_91a7f4","smart_order_type":"GTT","status":"CANCELLED"}"#,
         )
-        .unwrap_err();
-        assert!(matches!(
-            err,
-            SmartOrderError::AnomalousEnvelope {
-                http_status: 201,
-                ..
-            }
-        ));
-        // Case-insensitive SUCCESS still parses.
-        let ok = parse_success_envelope::<SmartOrderPayload>(
-            200,
-            r#"{"status":"success","payload":{"smart_order_id":"gtt_91a7f4"}}"#,
-        );
-        assert!(ok.is_ok());
-    }
-
-    #[test]
-    fn test_parse_success_envelope_unparseable_2xx() {
-        let err = parse_success_envelope::<SmartOrderPayload>(200, "not json").unwrap_err();
-        assert!(matches!(err, SmartOrderError::Parse(_)));
-        // SUCCESS without payload is a typed parse error, never a default
-        // payload (no false-OK).
-        let err = parse_success_envelope::<SmartOrderPayload>(200, r#"{"status":"SUCCESS"}"#)
-            .unwrap_err();
-        assert!(matches!(err, SmartOrderError::Parse(_)));
-    }
-
-    #[test]
-    fn test_parse_list_envelope() {
-        let body = r#"{"status":"SUCCESS","payload":{"orders":[
-            {"smart_order_id":"oco_a12bc3","smart_order_type":"OCO","status":"ACTIVE"},
-            {"smart_order_id":"gtt_91a7f4","smart_order_type":"GTT","status":"WEIRD_2027"}
-        ]}}"#;
-        let payload = parse_success_envelope::<SmartOrderListPayload>(200, body).unwrap();
-        assert_eq!(payload.orders.len(), 2);
-        // Unknown-status tolerance: raw preserved, no panic, no parse fail.
+        .expect("subset parses");
+        assert_eq!(echo.smart_order_id.as_deref(), Some("gtt_91a7f4"));
+        assert_eq!(echo.status.as_deref(), Some("CANCELLED"));
+        // A drifted price format NEVER fails the parse (raw strings).
+        let full: SmartOrderPayload = serde_json::from_str(
+            r#"{"smart_order_id":"oco_1","status":"ACTIVE","quantity":75,
+                "target":{"trigger_price":"122.000000","order_type":"LIMIT"},
+                "ltp":121.35,"child_legs":null,"unknown_future_field":1}"#,
+        )
+        .expect("tolerant parse");
+        assert_eq!(full.quantity, Some(75));
         assert_eq!(
-            SmartOrderStatus::from_groww_smart_status(&payload.orders[1].status),
-            SmartOrderStatus::Unknown("WEIRD_2027".to_owned())
+            full.target.expect("target").trigger_price.as_deref(),
+            Some("122.000000")
         );
+        // Empty list payload tolerated.
+        let list: SmartOrderListPayload = serde_json::from_str("{}").expect("empty list");
+        assert!(list.orders.is_none());
     }
 
-    // -- Status mapper -------------------------------------------------------------
+    // -- list query -----------------------------------------------------------
 
     #[test]
-    fn test_from_groww_smart_status_total_mapper() {
-        // All six documented values (doc 18 §6), case/whitespace tolerant.
+    fn test_list_query_is_explicit_and_clamped() {
+        let q = SmartOrderListQuery::active(SmartOrderType::Gtt);
+        let pairs = q.to_query_pairs();
+        // Explicit flow + status (the server defaults are OCO/ACTIVE — never
+        // relied on).
+        assert!(pairs.contains(&("smart_order_type", "GTT".to_owned())));
+        assert!(pairs.contains(&("status", "ACTIVE".to_owned())));
+        let q = SmartOrderListQuery {
+            segment: Some(GrowwSegment::Fno),
+            smart_order_type: SmartOrderType::Oco,
+            status: "CANCELLED",
+            page: 9_999,
+            page_size: 0,
+        };
+        let pairs = q.to_query_pairs();
+        assert!(pairs.contains(&("segment", "FNO".to_owned())));
+        assert!(pairs.contains(&("page", "500".to_owned()))); // clamped
+        assert!(pairs.contains(&("page_size", "1".to_owned()))); // clamped
+        let q = SmartOrderListQuery {
+            page_size: 500,
+            ..SmartOrderListQuery::active(SmartOrderType::Oco)
+        };
+        assert!(q.to_query_pairs().contains(&("page_size", "50".to_owned())));
+    }
+
+    // -- status parse + FSM totality ------------------------------------------
+
+    #[test]
+    fn test_status_parse_case_insensitive_and_open_set() {
         assert_eq!(
-            SmartOrderStatus::from_groww_smart_status("ACTIVE"),
+            SmartOrderStatus::parse(" active "),
             SmartOrderStatus::Active
         );
         assert_eq!(
-            SmartOrderStatus::from_groww_smart_status(" triggered "),
+            SmartOrderStatus::parse("Triggered"),
             SmartOrderStatus::Triggered
         );
         assert_eq!(
-            SmartOrderStatus::from_groww_smart_status("Cancelled"),
+            SmartOrderStatus::parse("CANCELLED"),
             SmartOrderStatus::Cancelled
         );
         assert_eq!(
-            SmartOrderStatus::from_groww_smart_status("EXPIRED"),
+            SmartOrderStatus::parse("expired"),
             SmartOrderStatus::Expired
         );
+        assert_eq!(SmartOrderStatus::parse("FAILED"), SmartOrderStatus::Failed);
         assert_eq!(
-            SmartOrderStatus::from_groww_smart_status("FAILED"),
-            SmartOrderStatus::Failed
-        );
-        assert_eq!(
-            SmartOrderStatus::from_groww_smart_status("COMPLETED"),
+            SmartOrderStatus::parse("completed"),
             SmartOrderStatus::Completed
         );
-        // Garbage / empty → Unknown with raw preserved; never a panic.
+        // Open set: raw preserved, fixed metric label.
+        let u = SmartOrderStatus::parse("PARTIALLY_TRIGGERED");
         assert_eq!(
-            SmartOrderStatus::from_groww_smart_status(""),
-            SmartOrderStatus::Unknown(String::new())
+            u,
+            SmartOrderStatus::Unknown("PARTIALLY_TRIGGERED".to_owned())
         );
-        assert_eq!(
-            SmartOrderStatus::from_groww_smart_status("\u{0}garbage\u{feff}"),
-            SmartOrderStatus::Unknown("\u{0}garbage\u{feff}".to_owned())
-        );
+        assert_eq!(u.as_str(), "UNKNOWN");
+        assert!(!u.is_terminal());
     }
 
-    #[test]
-    fn test_smart_order_status_as_str_and_is_terminal() {
-        assert_eq!(SmartOrderStatus::Active.as_str(), "ACTIVE");
-        assert_eq!(SmartOrderStatus::Triggered.as_str(), "TRIGGERED");
-        assert_eq!(SmartOrderStatus::Cancelled.as_str(), "CANCELLED");
-        assert_eq!(SmartOrderStatus::Expired.as_str(), "EXPIRED");
-        assert_eq!(SmartOrderStatus::Failed.as_str(), "FAILED");
-        assert_eq!(SmartOrderStatus::Completed.as_str(), "COMPLETED");
-        assert_eq!(SmartOrderStatus::Unknown("X_9".to_owned()).as_str(), "X_9");
-        for s in [
+    fn known_statuses() -> Vec<SmartOrderStatus> {
+        vec![
+            SmartOrderStatus::Active,
+            SmartOrderStatus::Triggered,
             SmartOrderStatus::Cancelled,
             SmartOrderStatus::Expired,
             SmartOrderStatus::Failed,
             SmartOrderStatus::Completed,
-        ] {
-            assert!(s.is_terminal(), "{} must be terminal", s.as_str());
-        }
-        for s in [
-            SmartOrderStatus::Active,
-            SmartOrderStatus::Triggered,
-            SmartOrderStatus::Unknown("NEW_THING".to_owned()),
-        ] {
-            assert!(!s.is_terminal(), "{} must not be terminal", s.as_str());
-        }
-    }
-
-    // -- Verdict helpers -----------------------------------------------------------
-
-    #[test]
-    fn test_sibling_cancel_verdict_table() {
-        use BrokerOrderStatus as S;
-        // Nothing executed → Ok regardless of clock.
-        assert_eq!(
-            sibling_cancel_verdict(&S::Open, &S::Open, 999, 30),
-            SiblingVerdict::Ok
-        );
-        // One filled + sibling cancelled → Ok.
-        assert_eq!(
-            sibling_cancel_verdict(&S::Filled, &S::Cancelled, 5, 30),
-            SiblingVerdict::Ok
-        );
-        // One filled + sibling terminal-non-fill (Rejected) → Ok (no exposure).
-        assert_eq!(
-            sibling_cancel_verdict(&S::Filled, &S::Rejected, 5, 30),
-            SiblingVerdict::Ok
-        );
-        // One filled + sibling still open inside deadline → AwaitingCancel.
-        assert_eq!(
-            sibling_cancel_verdict(&S::Filled, &S::Open, 30, 30),
-            SiblingVerdict::AwaitingCancel
-        );
-        // Same, symmetric legs.
-        assert_eq!(
-            sibling_cancel_verdict(&S::Open, &S::Filled, 10, 30),
-            SiblingVerdict::AwaitingCancel
-        );
-        // Past the deadline → Violation.
-        assert_eq!(
-            sibling_cancel_verdict(&S::Filled, &S::Open, 31, 30),
-            SiblingVerdict::Violation
-        );
-        // Both executed → Violation immediately.
-        assert_eq!(
-            sibling_cancel_verdict(&S::Filled, &S::Filled, 0, 30),
-            SiblingVerdict::Violation
-        );
-        // Partial fill counts as executed-class (fail-closed — partial-fill
-        // behavior is UNDOCUMENTED, doc 18 §8.2).
-        assert_eq!(
-            sibling_cancel_verdict(&S::PartiallyFilled, &S::Open, 31, 30),
-            SiblingVerdict::Violation
-        );
-        // Unknown sibling status is NOT terminal → clock applies.
-        assert_eq!(
-            sibling_cancel_verdict(&S::Filled, &S::Unknown, 0, 30),
-            SiblingVerdict::AwaitingCancel
-        );
+        ]
     }
 
     #[test]
-    fn test_reconcile_verdict_table() {
-        assert_eq!(reconcile_verdict(50, 50), ReconcileVerdict::Consistent);
-        assert_eq!(
-            reconcile_verdict(75, 50),
-            ReconcileVerdict::OcoExceedsPosition {
-                oco_quantity: 75,
-                abs_net_position: 50
+    fn test_fsm_totality_over_every_pair() {
+        let unknown = SmartOrderStatus::Unknown("X".to_owned());
+        let mut all = known_statuses();
+        all.push(unknown.clone());
+        for current in &all {
+            for observed in &all {
+                let out = evaluate_smart_transition(current, observed);
+                // Totality: every pair lands on exactly one verdict.
+                if matches!(observed, SmartOrderStatus::Unknown(_)) {
+                    assert_eq!(
+                        out,
+                        SmartTransitionOutcome::Park,
+                        "{current:?}->{observed:?}"
+                    );
+                } else if matches!(current, SmartOrderStatus::Unknown(_)) {
+                    assert_eq!(out, SmartTransitionOutcome::Transition);
+                } else if current == observed {
+                    assert_eq!(out, SmartTransitionOutcome::SameStatusRefresh);
+                } else if current.is_terminal() {
+                    // Out-of-terminal (incl. terminal->terminal) is illegal.
+                    assert_eq!(
+                        out,
+                        SmartTransitionOutcome::Park,
+                        "{current:?}->{observed:?}"
+                    );
+                } else {
+                    let fwd = observed.rank() > current.rank();
+                    let expected = if fwd {
+                        SmartTransitionOutcome::Transition
+                    } else {
+                        SmartTransitionOutcome::Park
+                    };
+                    assert_eq!(out, expected, "{current:?}->{observed:?}");
+                }
             }
-        );
-        assert_eq!(
-            reconcile_verdict(25, 50),
-            ReconcileVerdict::PositionExceedsOco {
-                oco_quantity: 25,
-                abs_net_position: 50
-            }
-        );
-        assert_eq!(reconcile_verdict(0, 0), ReconcileVerdict::Consistent);
-        // H-LOW (2026-07-15): negative inputs are never trusted — a caller
-        // passing a raw (signed) net position instead of its abs() gets a
-        // typed InvalidInputs verdict, never a mislabeled comparison and
-        // never a silent Consistent.
-        assert_eq!(
-            reconcile_verdict(50, -50),
-            ReconcileVerdict::InvalidInputs {
-                oco_quantity: 50,
-                abs_net_position: -50
-            }
-        );
-        assert_eq!(
-            reconcile_verdict(-50, 50),
-            ReconcileVerdict::InvalidInputs {
-                oco_quantity: -50,
-                abs_net_position: 50
-            }
-        );
-        assert_eq!(
-            reconcile_verdict(-1, -1),
-            ReconcileVerdict::InvalidInputs {
-                oco_quantity: -1,
-                abs_net_position: -1
-            }
-        );
+        }
     }
-
-    // -- List query -----------------------------------------------------------------
 
     #[test]
-    fn test_to_query_pairs_and_bounds() {
-        let q = SmartOrderListQuery {
-            segment: Some("FNO".to_owned()),
-            smart_order_type: Some("OCO".to_owned()),
-            status: Some("ACTIVE".to_owned()),
-            page: Some(0),
-            page_size: Some(10),
-            start_date_time: Some("2025-01-16T09:15:00".to_owned()),
-            end_date_time: Some("2025-01-16T15:30:00".to_owned()),
-        };
-        let pairs = q.to_query_pairs().unwrap();
-        assert_eq!(pairs.len(), 7);
-        assert_eq!(pairs[0], ("segment", "FNO".to_owned()));
-        assert_eq!(pairs[3], ("page", "0".to_owned()));
-        // Empty query = empty pairs.
-        assert!(
-            SmartOrderListQuery::default()
-                .to_query_pairs()
-                .unwrap()
-                .is_empty()
+    fn test_fsm_poll_skip_active_to_completed_is_one_legal_edge() {
+        // A 15s poller can skip TRIGGERED entirely.
+        assert_eq!(
+            evaluate_smart_transition(&SmartOrderStatus::Active, &SmartOrderStatus::Completed),
+            SmartTransitionOutcome::Transition
         );
-        // Bounds: page > 500 rejected; page_size 0 / 51 rejected.
-        assert!(
-            SmartOrderListQuery {
-                page: Some(501),
-                ..SmartOrderListQuery::default()
-            }
-            .to_query_pairs()
-            .is_err()
-        );
-        assert!(
-            SmartOrderListQuery {
-                page_size: Some(0),
-                ..SmartOrderListQuery::default()
-            }
-            .to_query_pairs()
-            .is_err()
-        );
-        assert!(
-            SmartOrderListQuery {
-                page_size: Some(51),
-                ..SmartOrderListQuery::default()
-            }
-            .to_query_pairs()
-            .is_err()
+        // Backward TRIGGERED -> ACTIVE parks.
+        assert_eq!(
+            evaluate_smart_transition(&SmartOrderStatus::Triggered, &SmartOrderStatus::Active),
+            SmartTransitionOutcome::Park
         );
     }
 
-    // -- Path-component injection defense ---------------------------------------
+    // -- gates + id plausibility ----------------------------------------------
 
     #[test]
-    fn test_validate_path_component_rejects_injection() {
-        assert!(validate_path_component("smart_order_id", "gtt_91a7f4").is_ok());
-        assert!(validate_path_component("segment", "FNO").is_ok());
-        for bad in ["", "a/b", "../x", "a b", "a?b", "a#b", "abc%2e"] {
-            assert!(
-                validate_path_component("smart_order_id", bad).is_err(),
-                "`{bad}` must be rejected"
-            );
-        }
-        let too_long = "a".repeat(65);
-        assert!(validate_path_component("smart_order_id", &too_long).is_err());
-    }
-
-    // -- Client gating (the safety core) ------------------------------------------
-
-    /// A client whose base_url is UNROUTABLE — any accidental send errors
-    /// loudly instead of reaching a real host.
-    fn unroutable_client(settings: GrowwSmartOrderSettings) -> GrowwSmartOrderClient {
-        GrowwSmartOrderClient::new(
-            reqwest::Client::new(),
-            Some("http://127.0.0.1:1".to_owned()),
-            Arc::new(|| Some("test-token-never-logged".to_owned())),
-            settings,
-        )
-    }
-
-    fn write_enabled_settings() -> GrowwSmartOrderSettings {
-        GrowwSmartOrderSettings {
-            write_enabled: true,
-            ..GrowwSmartOrderSettings::default()
-        }
-    }
-
-    #[tokio::test]
-    async fn test_create_oco_disabled_by_config_before_anything() {
-        let client = unroutable_client(GrowwSmartOrderSettings::default());
-        // Even an INVALID request returns DisabledByConfig — the config
-        // gate sits before validation (nothing runs while Gate 1 is shut).
-        let mut req = doc_oco_request();
-        req.segment = "CASH".to_owned();
-        let outcome = client.create_oco(&req, 25).await.unwrap();
-        assert_eq!(outcome, SmartOrderOutcome::DisabledByConfig);
-    }
-
-    #[tokio::test]
-    async fn test_create_oco_dry_run_carries_exact_doc_body() {
-        let client = unroutable_client(write_enabled_settings());
-        let outcome = client.create_oco(&doc_oco_request(), 25).await.unwrap();
-        match outcome {
-            SmartOrderOutcome::DryRun {
-                endpoint,
-                method,
-                body_json,
-            } => {
-                assert_eq!(endpoint, "http://127.0.0.1:1/v1/order-advance/create");
-                assert_eq!(method, "POST");
-                let body: serde_json::Value = serde_json::from_str(&body_json).unwrap();
-                // The serialized field names match doc 18 verbatim.
-                let expected = serde_json::json!({
-                    "reference_id": "sref-unique-456",
-                    "smart_order_type": "OCO",
-                    "segment": "FNO",
-                    "trading_symbol": "NIFTY25OCT24000CE",
-                    "quantity": 50,
-                    "net_position_quantity": 50,
-                    "transaction_type": "SELL",
-                    "target": {"trigger_price": "120.50", "order_type": "LIMIT", "price": "121.00"},
-                    "stop_loss": {"trigger_price": "95.00", "order_type": "SL_M", "price": null},
-                    "product_type": "MIS",
-                    "exchange": "NSE",
-                    "duration": "DAY"
-                });
-                assert_eq!(body, expected);
+    fn test_smart_live_send_permitted_is_false_today_in_every_combination() {
+        // Gate 3 (GROWW_ORDER_LIVE_FIRE) is false — no config combination can
+        // open the live write gate.
+        for a in [false, true] {
+            for b in [false, true] {
+                assert!(!smart_live_send_permitted(a, b), "({a},{b})");
             }
-            other => panic!("expected DryRun, got {other:?}"),
         }
     }
 
-    #[tokio::test]
-    async fn test_create_oco_validation_fires_before_dry_run() {
-        let client = unroutable_client(write_enabled_settings());
-        let mut req = doc_oco_request();
-        req.segment = "CASH".to_owned();
-        let err = client.create_oco(&req, 25).await.unwrap_err();
+    #[test]
+    fn test_gates_disabled_is_fail_closed() {
+        let g = SmartOrderGates::disabled();
+        assert!(!g.smart_orders_read);
+        assert!(!g.smart_orders_write);
+        assert!(!g.live_fire_requested);
+        assert_eq!(g.max_order_quantity, 0);
+    }
+
+    #[test]
+    fn test_smart_order_id_path_plausibility() {
+        assert!(is_plausible_smart_order_id("gtt_91a7f4"));
+        assert!(is_plausible_smart_order_id("oco-1_A"));
+        assert!(is_plausible_smart_order_id("PAPER-TV2607160001ABCD"));
+        assert!(!is_plausible_smart_order_id(""));
+        assert!(!is_plausible_smart_order_id(&"a".repeat(65)));
+        for hostile in ["a/b", "../x", "a?x=1", "a b", "a\u{202E}b", "a%2f"] {
+            assert!(!is_plausible_smart_order_id(hostile), "{hostile:?}");
+        }
+    }
+
+    // -- create validation (financial boundaries) ------------------------------
+
+    #[test]
+    fn test_validate_gtt_create_boundaries() {
+        let ok = SmartOrderCreate::Gtt(gtt_req());
+        assert!(validate_create_smart_order(&ok, 10).is_ok()); // qty == max
+        // Quantity boundaries.
+        let mut g = gtt_req();
+        g.quantity = 0;
+        assert!(validate_create_smart_order(&SmartOrderCreate::Gtt(g), 10).is_err());
+        let mut g = gtt_req();
+        g.quantity = 11;
         assert!(matches!(
-            err,
-            SmartOrderError::Validation(SmartOrderValidationError::UnsupportedOcoSegment { .. })
+            validate_create_smart_order(&SmartOrderCreate::Gtt(g), 10),
+            Err(SmartOrderError::QuantityRefused {
+                quantity: 11,
+                max: 10
+            })
+        ));
+        // max_order_quantity = 0 refuses ALL (the fail-closed default).
+        assert!(matches!(
+            validate_create_smart_order(&SmartOrderCreate::Gtt(gtt_req()), 0),
+            Err(SmartOrderError::QuantityRefused { .. })
+        ));
+        // Trigger price boundaries.
+        for bad in [0, -1] {
+            let mut g = gtt_req();
+            g.trigger_price = bad;
+            assert!(validate_create_smart_order(&SmartOrderCreate::Gtt(g), 10).is_err());
+        }
+        let mut g = gtt_req();
+        g.trigger_price = 1;
+        assert!(validate_create_smart_order(&SmartOrderCreate::Gtt(g), 10).is_ok());
+        // Leg price shape: MARKET must be null; LIMIT must be > 0.
+        let mut g = gtt_req();
+        g.order.price = Some(100);
+        assert!(validate_create_smart_order(&SmartOrderCreate::Gtt(g), 10).is_err());
+        let mut g = gtt_req();
+        g.order.order_type = GrowwOrderType::Limit;
+        g.order.price = None;
+        assert!(validate_create_smart_order(&SmartOrderCreate::Gtt(g), 10).is_err());
+        let mut g = gtt_req();
+        g.order.order_type = GrowwOrderType::Limit;
+        g.order.price = Some(0);
+        assert!(validate_create_smart_order(&SmartOrderCreate::Gtt(g), 10).is_err());
+        let mut g = gtt_req();
+        g.order.order_type = GrowwOrderType::Sl;
+        g.order.price = Some(1);
+        assert!(validate_create_smart_order(&SmartOrderCreate::Gtt(g), 10).is_ok());
+        // Wrong discriminant / empty symbol / bad reference id.
+        let mut g = gtt_req();
+        g.smart_order_type = SmartOrderType::Oco;
+        assert!(validate_create_smart_order(&SmartOrderCreate::Gtt(g), 10).is_err());
+        let mut g = gtt_req();
+        g.trading_symbol = "  ".to_owned();
+        assert!(validate_create_smart_order(&SmartOrderCreate::Gtt(g), 10).is_err());
+        let mut g = gtt_req();
+        g.reference_id = "no".to_owned();
+        assert!(matches!(
+            validate_create_smart_order(&SmartOrderCreate::Gtt(g), 10),
+            Err(SmartOrderError::InvalidReferenceId(_))
         ));
     }
 
-    #[tokio::test]
-    async fn test_create_gtt_dry_run() {
-        let client = unroutable_client(write_enabled_settings());
-        let outcome = client.create_gtt(&doc_gtt_request(), 1).await.unwrap();
-        match outcome {
-            SmartOrderOutcome::DryRun {
-                endpoint,
-                method,
-                body_json,
-            } => {
-                assert_eq!(endpoint, "http://127.0.0.1:1/v1/order-advance/create");
-                assert_eq!(method, "POST");
-                // Full body assertion (C-LOW parity with the OCO dry-run
-                // test) — the inferred GTT shape, doc example values.
-                let body: serde_json::Value = serde_json::from_str(&body_json).unwrap();
-                let expected = serde_json::json!({
-                    "reference_id": "sref-unique-123",
-                    "smart_order_type": "GTT",
-                    "segment": "CASH",
-                    "trading_symbol": "TCS",
-                    "quantity": 10,
-                    "trigger_price": "3985.00",
-                    "trigger_direction": "DOWN",
-                    "order": {"order_type": "LIMIT", "price": "3990.00", "transaction_type": "BUY"},
-                    "product_type": "CNC",
-                    "exchange": "NSE",
-                    "duration": "DAY"
-                });
-                assert_eq!(body, expected);
-            }
-            other => panic!("expected DryRun, got {other:?}"),
-        }
-        // Disabled by default.
-        let dark = unroutable_client(GrowwSmartOrderSettings::default());
-        assert_eq!(
-            dark.create_gtt(&doc_gtt_request(), 1).await.unwrap(),
-            SmartOrderOutcome::DisabledByConfig
-        );
+    #[test]
+    fn test_validate_oco_create_exit_only_and_cash_mis_boundaries() {
+        assert!(validate_create_smart_order(&SmartOrderCreate::Oco(oco_req()), 100).is_ok());
+        // Exit-only: zero net position refused.
+        let mut o = oco_req();
+        o.net_position_quantity = 0;
+        assert!(validate_create_smart_order(&SmartOrderCreate::Oco(o), 100).is_err());
+        // qty > |net| refused; qty == |net| ok (short position too).
+        let mut o = oco_req();
+        o.net_position_quantity = -75;
+        assert!(validate_create_smart_order(&SmartOrderCreate::Oco(o), 100).is_ok());
+        let mut o = oco_req();
+        o.quantity = 76;
+        assert!(matches!(
+            validate_create_smart_order(&SmartOrderCreate::Oco(o), 100),
+            Err(SmartOrderError::QuantityExceedsPosition {
+                quantity: 76,
+                net_position_quantity: 75
+            })
+        ));
+        // CASH OCO: MIS-only (both doc arms agree; availability = probe P9).
+        let mut o = oco_req();
+        o.segment = GrowwSegment::Cash;
+        assert!(matches!(
+            validate_create_smart_order(&SmartOrderCreate::Oco(o), 100),
+            Err(SmartOrderError::CashOcoProductNotMis { product: "NRML" })
+        ));
+        let mut o = oco_req();
+        o.segment = GrowwSegment::Cash;
+        o.product_type = GrowwProduct::Mis;
+        assert!(validate_create_smart_order(&SmartOrderCreate::Oco(o), 100).is_ok());
+        // Leg boundaries: SL requires price; SL_M requires null; LIMIT target
+        // requires price; MARKET target requires null.
+        let mut o = oco_req();
+        o.stop_loss.order_type = StopLossLegOrderType::Sl;
+        o.stop_loss.price = None;
+        assert!(validate_create_smart_order(&SmartOrderCreate::Oco(o), 100).is_err());
+        let mut o = oco_req();
+        o.stop_loss.price = Some(9_700);
+        assert!(validate_create_smart_order(&SmartOrderCreate::Oco(o), 100).is_err());
+        let mut o = oco_req();
+        o.target.order_type = TargetLegOrderType::Market;
+        o.target.price = None;
+        assert!(validate_create_smart_order(&SmartOrderCreate::Oco(o), 100).is_ok());
+        // Trigger boundaries.
+        let mut o = oco_req();
+        o.target.trigger_price = 0;
+        assert!(validate_create_smart_order(&SmartOrderCreate::Oco(o), 100).is_err());
+        let mut o = oco_req();
+        o.stop_loss.trigger_price = -1;
+        assert!(validate_create_smart_order(&SmartOrderCreate::Oco(o), 100).is_err());
     }
 
-    #[tokio::test]
-    async fn test_modify_smart_order_dry_run_endpoint_and_body() {
-        let client = unroutable_client(write_enabled_settings());
-        let req = SmartOrderModifyRequest {
-            smart_order_type: SMART_ORDER_TYPE_OCO,
-            segment: "FNO".to_owned(),
-            quantity: Some(40),
-            duration: None,
-            product_type: None,
-            target: Some(ModifyLeg {
-                trigger_price: "122.00".to_owned(),
-            }),
-            stop_loss: Some(ModifyLeg {
-                trigger_price: "97.50".to_owned(),
-            }),
+    // -- per-type modify matrix TOTALITY ---------------------------------------
+
+    /// Every `SmartModifyFields` field, exercised one-at-a-time against BOTH
+    /// flows — the full 9x2 matrix of the doc's modify tables.
+    #[test]
+    fn test_modify_matrix_totality_gtt_vs_oco() {
+        let legal_leg = GttOrderLeg {
+            order_type: GrowwOrderType::Limit,
+            price: Some(100),
+            transaction_type: GrowwTransactionType::Buy,
         };
-        let outcome = client.modify_smart_order("oco_a12bc3", &req).await.unwrap();
-        match outcome {
-            SmartOrderOutcome::DryRun {
-                endpoint,
-                method,
-                body_json,
-            } => {
-                assert_eq!(
-                    endpoint,
-                    "http://127.0.0.1:1/v1/order-advance/modify/oco_a12bc3"
+        // (field-setter, allowed-on-GTT, allowed-on-OCO)
+        let cases: Vec<(&str, SmartModifyFields, bool, bool)> = vec![
+            (
+                "quantity",
+                SmartModifyFields {
+                    quantity: Some(1),
+                    ..Default::default()
+                },
+                true,
+                true,
+            ),
+            (
+                "trigger_price",
+                SmartModifyFields {
+                    trigger_price: Some(1),
+                    ..Default::default()
+                },
+                true,
+                false,
+            ),
+            (
+                "trigger_direction",
+                SmartModifyFields {
+                    trigger_direction: Some(TriggerDirection::Down),
+                    ..Default::default()
+                },
+                true,
+                false,
+            ),
+            (
+                "order_leg",
+                SmartModifyFields {
+                    order_leg: Some(legal_leg),
+                    ..Default::default()
+                },
+                true,
+                false,
+            ),
+            (
+                "child_legs",
+                SmartModifyFields {
+                    child_legs: Some(serde_json::json!({})),
+                    ..Default::default()
+                },
+                true,
+                false,
+            ),
+            (
+                "duration",
+                SmartModifyFields {
+                    duration: Some(GrowwValidity::Day),
+                    ..Default::default()
+                },
+                false,
+                true,
+            ),
+            (
+                "product_type",
+                SmartModifyFields {
+                    product_type: Some(GrowwProduct::Mis),
+                    ..Default::default()
+                },
+                false,
+                true,
+            ),
+            (
+                "target_trigger_price",
+                SmartModifyFields {
+                    target_trigger_price: Some(1),
+                    ..Default::default()
+                },
+                false,
+                true,
+            ),
+            (
+                "stop_loss_trigger_price",
+                SmartModifyFields {
+                    stop_loss_trigger_price: Some(1),
+                    ..Default::default()
+                },
+                false,
+                true,
+            ),
+        ];
+        for (name, fields, gtt_ok, oco_ok) in cases {
+            let g = validate_modify_fields(SmartOrderType::Gtt, GrowwSegment::Fno, &fields, 100);
+            let o = validate_modify_fields(SmartOrderType::Oco, GrowwSegment::Fno, &fields, 100);
+            assert_eq!(g.is_ok(), gtt_ok, "GTT {name}: {g:?}");
+            assert_eq!(o.is_ok(), oco_ok, "OCO {name}: {o:?}");
+            // A refusal is the TYPED immutable-field error, never a generic.
+            if !gtt_ok {
+                assert!(
+                    matches!(
+                        g,
+                        Err(SmartOrderError::ImmutableField {
+                            smart_order_type: "GTT",
+                            ..
+                        })
+                    ),
+                    "GTT {name}"
                 );
-                assert_eq!(method, "PUT");
-                let body: serde_json::Value = serde_json::from_str(&body_json).unwrap();
-                assert_eq!(body["target"]["trigger_price"], "122.00");
-                assert_eq!(body["stop_loss"]["trigger_price"], "97.50");
-                assert_eq!(body["quantity"], 40);
             }
-            other => panic!("expected DryRun, got {other:?}"),
+            if !oco_ok {
+                assert!(
+                    matches!(
+                        o,
+                        Err(SmartOrderError::ImmutableField {
+                            smart_order_type: "OCO",
+                            ..
+                        })
+                    ),
+                    "OCO {name}"
+                );
+            }
         }
-        // Path injection rejected before anything.
-        let err = client
-            .modify_smart_order("oco/../evil", &req)
-            .await
-            .unwrap_err();
-        assert!(matches!(err, SmartOrderError::Validation(_)));
     }
 
-    #[tokio::test]
-    async fn test_cancel_smart_order_dry_run_bodyless() {
-        let client = unroutable_client(write_enabled_settings());
-        let outcome = client
-            .cancel_smart_order("FNO", "OCO", "oco_a12bc3")
-            .await
-            .unwrap();
-        assert_eq!(
-            outcome,
-            SmartOrderOutcome::DryRun {
-                endpoint: "http://127.0.0.1:1/v1/order-advance/cancel/FNO/OCO/oco_a12bc3"
-                    .to_owned(),
-                method: "POST",
-                body_json: String::new(),
-            }
-        );
-        // Disabled by default.
-        let dark = unroutable_client(GrowwSmartOrderSettings::default());
-        assert_eq!(
-            dark.cancel_smart_order("FNO", "OCO", "oco_a12bc3")
-                .await
-                .unwrap(),
-            SmartOrderOutcome::DisabledByConfig
-        );
-    }
-
-    #[tokio::test]
-    async fn test_get_smart_order_and_list_smart_orders_gate_on_read_enabled() {
-        // read_enabled = false → DisabledByConfig, nothing sent.
-        let dark = unroutable_client(GrowwSmartOrderSettings::default());
-        assert_eq!(
-            dark.get_smart_order("FNO", "OCO", "oco_a12bc3")
-                .await
-                .unwrap(),
-            SmartOrderReadOutcome::DisabledByConfig
-        );
-        assert_eq!(
-            dark.list_smart_orders(&SmartOrderListQuery::default())
-                .await
-                .unwrap(),
-            SmartOrderReadOutcome::DisabledByConfig
-        );
-        // read_enabled = true against the unroutable base → a LOUD
-        // transport error (proving the read path does attempt the GET,
-        // after the single bounded retry).
-        let lit = unroutable_client(GrowwSmartOrderSettings {
-            read_enabled: true,
-            ..GrowwSmartOrderSettings::default()
-        });
-        let err = lit
-            .get_smart_order("FNO", "OCO", "oco_a12bc3")
-            .await
-            .unwrap_err();
-        assert!(matches!(err, SmartOrderError::Transport(_)));
-        let err = lit
-            .list_smart_orders(&SmartOrderListQuery::default())
-            .await
-            .unwrap_err();
-        assert!(matches!(err, SmartOrderError::Transport(_)));
-    }
-
-    // -- Retry-policy split (H-HIGH, 2026-07-15): behavioral, counted ---------
-
-    /// A mock server that COUNTS every accepted connection and immediately
-    /// drops it (a transport-class failure for the client). The count is
-    /// the ground truth of how many attempts the client actually made.
-    async fn spawn_counting_conn_dropper() -> (String, Arc<std::sync::atomic::AtomicUsize>) {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let count = Arc::new(AtomicUsize::new(0));
-        let counter = Arc::clone(&count);
-        tokio::spawn(async move {
-            loop {
-                if let Ok((sock, _)) = listener.accept().await {
-                    counter.fetch_add(1, Ordering::SeqCst);
-                    drop(sock); // RST — the client sees a transport error
-                }
-            }
-        });
-        (format!("http://{addr}"), count)
-    }
-
-    #[tokio::test]
-    async fn test_write_path_never_retries_transport_error() {
-        use std::sync::atomic::Ordering;
-        let (base, count) = spawn_counting_conn_dropper().await;
-        let client = GrowwSmartOrderClient::new(
-            reqwest::Client::new(),
-            Some(base),
-            Arc::new(|| Some("test-token-never-logged".to_owned())),
-            GrowwSmartOrderSettings::default(),
-        );
-        // Drive the WRITE dispatcher directly (the public write methods
-        // stop at the dry-run gate, by design): RetryPolicy::Never must
-        // produce EXACTLY ONE attempt — a lost create response is never
-        // blind-resent (probe P10: the GA007 dedup window is unverified).
-        let err = client
-            .send_request(
-                HttpMethod::Post,
-                &format!("{}{}", client.base_url, SMART_ORDER_CREATE_PATH),
-                &[],
-                Some("{}"),
-                RetryPolicy::Never,
+    #[test]
+    fn test_modify_validation_boundaries() {
+        // Empty modify refused.
+        assert!(
+            validate_modify_fields(
+                SmartOrderType::Gtt,
+                GrowwSegment::Fno,
+                &SmartModifyFields::default(),
+                100
             )
-            .await
-            .unwrap_err();
-        assert!(matches!(err, SmartOrderError::Transport(_)));
-        assert_eq!(
-            count.load(Ordering::SeqCst),
-            1,
-            "write path made more than ONE attempt — double-send risk (P10)"
+            .is_err()
+        );
+        // Quantity boundaries (both flows share them).
+        for (q, ok) in [(0, false), (1, true), (100, true), (101, false)] {
+            let f = SmartModifyFields {
+                quantity: Some(q),
+                ..Default::default()
+            };
+            assert_eq!(
+                validate_modify_fields(SmartOrderType::Oco, GrowwSegment::Fno, &f, 100).is_ok(),
+                ok,
+                "quantity {q}"
+            );
+        }
+        // Price boundaries on the flow-legal fields.
+        let f = SmartModifyFields {
+            trigger_price: Some(0),
+            ..Default::default()
+        };
+        assert!(validate_modify_fields(SmartOrderType::Gtt, GrowwSegment::Fno, &f, 100).is_err());
+        let f = SmartModifyFields {
+            target_trigger_price: Some(0),
+            ..Default::default()
+        };
+        assert!(validate_modify_fields(SmartOrderType::Oco, GrowwSegment::Fno, &f, 100).is_err());
+        let f = SmartModifyFields {
+            stop_loss_trigger_price: Some(-1),
+            ..Default::default()
+        };
+        assert!(validate_modify_fields(SmartOrderType::Oco, GrowwSegment::Fno, &f, 100).is_err());
+        // A GTT leg patch is shape-validated (MARKET leg with a price refused).
+        let f = SmartModifyFields {
+            order_leg: Some(GttOrderLeg {
+                order_type: GrowwOrderType::Market,
+                price: Some(1),
+                transaction_type: GrowwTransactionType::Buy,
+            }),
+            ..Default::default()
+        };
+        assert!(validate_modify_fields(SmartOrderType::Gtt, GrowwSegment::Fno, &f, 100).is_err());
+    }
+
+    // -- adversarial round 2, LOW-2: modify re-asserts CASH-OCO MIS-only -------
+
+    #[test]
+    fn test_modify_cash_oco_product_change_must_be_mis() {
+        // CASH OCO: a product_type change to a non-MIS value is refused
+        // (mirrors create's CashOcoProductNotMis).
+        let bad = SmartModifyFields {
+            product_type: Some(GrowwProduct::Nrml),
+            ..Default::default()
+        };
+        assert!(matches!(
+            validate_modify_fields(SmartOrderType::Oco, GrowwSegment::Cash, &bad, 100),
+            Err(SmartOrderError::CashOcoProductNotMis { product: "NRML" })
+        ));
+        // CASH OCO with MIS is fine.
+        let ok = SmartModifyFields {
+            product_type: Some(GrowwProduct::Mis),
+            ..Default::default()
+        };
+        assert!(validate_modify_fields(SmartOrderType::Oco, GrowwSegment::Cash, &ok, 100).is_ok());
+        // FNO OCO: NRML product change is allowed (the CASH rule is
+        // segment-scoped) — unchanged behavior.
+        assert!(
+            validate_modify_fields(SmartOrderType::Oco, GrowwSegment::Fno, &bad, 100).is_ok(),
+            "FNO OCO product change must NOT trip the CASH-only rule"
         );
     }
 
-    #[tokio::test]
-    async fn test_read_path_retries_transport_error_once() {
-        use std::sync::atomic::Ordering;
-        let (base, count) = spawn_counting_conn_dropper().await;
-        let client = GrowwSmartOrderClient::new(
-            reqwest::Client::new(),
-            Some(base),
-            Arc::new(|| Some("test-token-never-logged".to_owned())),
-            GrowwSmartOrderSettings {
-                read_enabled: true,
-                ..GrowwSmartOrderSettings::default()
-            },
-        );
-        // The read path (idempotent GET) keeps the single bounded retry:
-        // exactly TWO attempts, never more.
-        let err = client
-            .get_smart_order("FNO", "OCO", "oco_a12bc3")
-            .await
-            .unwrap_err();
-        assert!(matches!(err, SmartOrderError::Transport(_)));
+    // -- sibling verify (paused-clock pure core) --------------------------------
+
+    #[test]
+    fn test_sibling_verify_edges() {
+        let deadline = 30_u64;
+        // Not armed.
         assert_eq!(
-            count.load(Ordering::SeqCst),
-            2,
-            "read path must attempt exactly twice (one bounded retry)"
+            evaluate_sibling_verify(None, 1_000, deadline, &SmartOrderStatus::Active),
+            SiblingVerifyVerdict::NotArmed
+        );
+        // Terminal is Verified even mid-episode.
+        assert_eq!(
+            evaluate_sibling_verify(Some(0), 999_999, deadline, &SmartOrderStatus::Completed),
+            SiblingVerifyVerdict::Verified
+        );
+        // Exactly AT the deadline is still Pending (strict >).
+        assert_eq!(
+            evaluate_sibling_verify(Some(0), 30_000, deadline, &SmartOrderStatus::Triggered),
+            SiblingVerifyVerdict::Pending
+        );
+        // One ms past pages.
+        assert_eq!(
+            evaluate_sibling_verify(Some(0), 30_001, deadline, &SmartOrderStatus::Triggered),
+            SiblingVerifyVerdict::DeadlineExceeded { elapsed_ms: 30_001 }
+        );
+        // A backwards clock never yields a negative elapsed.
+        assert_eq!(
+            evaluate_sibling_verify(Some(1_000), 500, deadline, &SmartOrderStatus::Triggered),
+            SiblingVerifyVerdict::Pending
+        );
+        // A huge deadline never overflows.
+        assert_eq!(
+            evaluate_sibling_verify(Some(0), i64::MAX, u64::MAX, &SmartOrderStatus::Triggered),
+            SiblingVerifyVerdict::Pending
         );
     }
 
-    #[tokio::test]
-    async fn test_no_token_is_typed_and_nothing_sent() {
-        let client = GrowwSmartOrderClient::new(
-            reqwest::Client::new(),
-            Some("http://127.0.0.1:1".to_owned()),
-            Arc::new(|| None),
-            GrowwSmartOrderSettings {
-                read_enabled: true,
-                ..GrowwSmartOrderSettings::default()
-            },
-        );
-        let err = client
-            .get_smart_order("FNO", "OCO", "oco_a12bc3")
-            .await
-            .unwrap_err();
-        assert!(matches!(err, SmartOrderError::NoToken));
+    // -- classification + observation application -------------------------------
+
+    fn tracked(id: &str, ty: SmartOrderType) -> TrackedSmartOrder {
+        TrackedSmartOrder::new(
+            id.to_owned(),
+            ty,
+            GrowwSegment::Fno,
+            "NIFTY26JUL28500CE".to_owned(),
+            75,
+            "TV2607160009ABCD".to_owned(),
+        )
     }
 
     #[test]
-    fn test_client_debug_redacts_token_provider_and_settings_accessor() {
-        let client = unroutable_client(GrowwSmartOrderSettings::default());
-        let dbg = format!("{client:?}");
-        assert!(dbg.contains("<redacted fn>"));
-        assert!(!dbg.contains("test-token-never-logged"));
-        assert!(!client.settings().write_enabled);
-        // Trailing-slash trim on the override.
-        let trimmed = GrowwSmartOrderClient::new(
-            reqwest::Client::new(),
-            Some("http://127.0.0.1:1///".to_owned()),
-            Arc::new(|| None),
-            GrowwSmartOrderSettings::default(),
-        );
-        assert_eq!(trimmed.base_url, "http://127.0.0.1:1");
-        // No override → the production base.
-        let prod = GrowwSmartOrderClient::new(
-            reqwest::Client::new(),
+    fn test_classify_smart_observation_findings() {
+        let t = tracked("oco_1", SmartOrderType::Oco);
+        // Quantity drift.
+        let (_, f) = classify_smart_observation(&t, &SmartOrderStatus::Active, Some(50), None);
+        assert!(f.iter().any(|x| x.kind == SmartFindingKind::QuantityDrift));
+        // Unknown status parks + finding.
+        let (out, f) = classify_smart_observation(
+            &t,
+            &SmartOrderStatus::Unknown("WEIRD".to_owned()),
+            Some(75),
             None,
-            Arc::new(|| None),
-            GrowwSmartOrderSettings::default(),
         );
-        assert_eq!(prod.base_url, GROWW_SMART_ORDER_BASE_URL);
+        assert_eq!(out, SmartTransitionOutcome::Park);
+        assert!(f.iter().any(|x| x.kind == SmartFindingKind::UnknownStatus));
+        // Regression finding on a backward move.
+        let mut trig = tracked("oco_2", SmartOrderType::Oco);
+        trig.status = SmartOrderStatus::Triggered;
+        let (out, f) = classify_smart_observation(&trig, &SmartOrderStatus::Active, Some(75), None);
+        assert_eq!(out, SmartTransitionOutcome::Park);
+        assert!(
+            f.iter()
+                .any(|x| x.kind == SmartFindingKind::StatusRegression)
+        );
+        // OCO qty > |net| when a position map is supplied.
+        let (_, f) = classify_smart_observation(&t, &SmartOrderStatus::Active, Some(75), Some(-50));
+        assert!(
+            f.iter()
+                .any(|x| x.kind == SmartFindingKind::QtyExceedsPosition)
+        );
+        // A GTT never raises the position finding.
+        let g = tracked("gtt_1", SmartOrderType::Gtt);
+        let (_, f) = classify_smart_observation(&g, &SmartOrderStatus::Active, Some(75), Some(0));
+        assert!(
+            !f.iter()
+                .any(|x| x.kind == SmartFindingKind::QtyExceedsPosition)
+        );
     }
 
-    // -- bounded_echo edge (helper coverage) --------------------------------------
+    // -- round 3, finding 2: a Transition adopts broker qty, never QtyDrift ----
 
     #[test]
-    fn test_bounded_echo_truncates_char_safely() {
-        let long = "é".repeat(100);
-        let echoed = bounded_echo(&long);
-        assert_eq!(echoed.chars().count(), ERROR_ECHO_MAX_CHARS);
-        assert_eq!(bounded_echo("  ok  "), "ok");
+    fn test_forward_transition_with_qty_change_is_not_quantity_drift() {
+        // tracked() is ACTIVE @ qty 75. Observing TRIGGERED @ qty 60 is a legal
+        // forward move (Transition) that ALSO changed qty — `apply_observation`
+        // ADOPTS the broker qty, so this must NOT raise a QuantityDrift finding.
+        let t = tracked("oco_fwd", SmartOrderType::Oco);
+        let (out, f) = classify_smart_observation(&t, &SmartOrderStatus::Triggered, Some(60), None);
+        assert_eq!(out, SmartTransitionOutcome::Transition);
+        assert!(
+            !f.iter().any(|x| x.kind == SmartFindingKind::QuantityDrift),
+            "a forward Transition that changes qty adopts the broker value, not a drift"
+        );
+        // Contrast: a SameStatusRefresh at a drifted qty DOES raise the finding
+        // (the non-adopting path is the real divergence).
+        let (out2, f2) = classify_smart_observation(&t, &SmartOrderStatus::Active, Some(60), None);
+        assert_eq!(out2, SmartTransitionOutcome::SameStatusRefresh);
+        assert!(f2.iter().any(|x| x.kind == SmartFindingKind::QuantityDrift));
+    }
+
+    // -- adversarial round 1, finding 4: i64::MIN never aborts --------------
+
+    #[test]
+    fn test_i64_min_net_position_never_aborts() {
+        // Reconcile classify: OCO qty vs an i64::MIN net position — `abs()`
+        // would abort under overflow-checks; unsigned_abs must not (the same
+        // arithmetic guards the create-side validate).
+        let mut t = tracked("oco_min", SmartOrderType::Oco);
+        t.quantity = 50;
+        let (_, f) =
+            classify_smart_observation(&t, &SmartOrderStatus::Active, Some(50), Some(i64::MIN));
+        // |i64::MIN| = 2^63 > 50 — no exceed finding, and no abort.
+        assert!(
+            !f.iter()
+                .any(|x| x.kind == SmartFindingKind::QtyExceedsPosition)
+        );
+    }
+
+    // -- adversarial round 1, finding 11: drift latch ------------------------
+
+    #[test]
+    fn test_quantity_drift_latch_fires_once_per_value() {
+        let deadline = 30_u64;
+        let mut t = tracked("gtt_drift", SmartOrderType::Gtt);
+        t.quantity = 100;
+        // First SameStatusRefresh pass with a drifted qty: finding fires.
+        let (out, f) = classify_smart_observation(&t, &SmartOrderStatus::Active, Some(75), None);
+        assert_eq!(out, SmartTransitionOutcome::SameStatusRefresh);
+        assert!(f.iter().any(|x| x.kind == SmartFindingKind::QuantityDrift));
+        apply_observation(
+            &mut t,
+            &SmartOrderStatus::Active,
+            Some(75),
+            out,
+            1_000,
+            deadline,
+        );
+        assert_eq!(t.drift_flagged_qty, Some(75));
+        // Second pass, SAME drifted qty: latched — no re-finding.
+        let (_, f) = classify_smart_observation(&t, &SmartOrderStatus::Active, Some(75), None);
+        assert!(!f.iter().any(|x| x.kind == SmartFindingKind::QuantityDrift));
+        // A NEW drifted value re-fires.
+        let (out, f) = classify_smart_observation(&t, &SmartOrderStatus::Active, Some(60), None);
+        assert!(f.iter().any(|x| x.kind == SmartFindingKind::QuantityDrift));
+        apply_observation(
+            &mut t,
+            &SmartOrderStatus::Active,
+            Some(60),
+            out,
+            2_000,
+            deadline,
+        );
+        assert_eq!(t.drift_flagged_qty, Some(60));
+        // A Transition ADOPTING the broker qty clears the latch.
+        let (out, _) = classify_smart_observation(&t, &SmartOrderStatus::Triggered, Some(60), None);
+        assert_eq!(out, SmartTransitionOutcome::Transition);
+        apply_observation(
+            &mut t,
+            &SmartOrderStatus::Triggered,
+            Some(60),
+            out,
+            3_000,
+            deadline,
+        );
+        assert_eq!(t.quantity, 60);
+        assert_eq!(t.drift_flagged_qty, None);
+    }
+
+    // -- adversarial round 1, finding 12: request-side upper band ------------
+
+    #[test]
+    fn test_price_upper_band_refused_before_serialization() {
+        // require_positive_paise: i64::MAX and band+1 refused; band edge ok.
+        assert!(require_positive_paise("p", i64::MAX).is_err());
+        assert!(require_positive_paise("p", MAX_ABS_PAISE_FOR_DECIMAL_STRING + 1).is_err());
+        assert!(require_positive_paise("p", MAX_ABS_PAISE_FOR_DECIMAL_STRING).is_ok());
+        // validate_leg_price_shape: same band on price-carrying legs.
+        assert!(validate_leg_price_shape("leg", true, "LIMIT", Some(i64::MAX)).is_err());
+        assert!(
+            validate_leg_price_shape(
+                "leg",
+                true,
+                "LIMIT",
+                Some(MAX_ABS_PAISE_FOR_DECIMAL_STRING + 1)
+            )
+            .is_err()
+        );
+        assert!(
+            validate_leg_price_shape("leg", true, "LIMIT", Some(MAX_ABS_PAISE_FOR_DECIMAL_STRING))
+                .is_ok()
+        );
+    }
+
+    // -- adversarial round 1, finding 3: log-safe id --------------------------
+
+    #[test]
+    fn test_log_safe_id_passes_plausible_and_sanitizes_hostile() {
+        assert_eq!(log_safe_id("GMOCO-1_a"), "GMOCO-1_a");
+        let hostile = format!("x\u{0}y{}", "z".repeat(400));
+        let safe = log_safe_id(&hostile);
+        assert!(!safe.contains('\u{0}'), "control chars stripped");
+        assert!(safe.len() < hostile.len(), "length-capped");
     }
 
     #[test]
-    fn test_write_op_labels() {
-        assert_eq!(WriteOp::Create.as_str(), "create");
-        assert_eq!(WriteOp::Modify.as_str(), "modify");
-        assert_eq!(WriteOp::Cancel.as_str(), "cancel");
+    fn test_apply_observation_arms_pages_and_closes_the_oco_episode() {
+        let deadline = 30_u64;
+        let mut t = tracked("oco_1", SmartOrderType::Oco);
+        // TRIGGERED observation arms the episode at now_ms.
+        let v = apply_observation(
+            &mut t,
+            &SmartOrderStatus::Triggered,
+            Some(75),
+            SmartTransitionOutcome::Transition,
+            10_000,
+            deadline,
+        );
+        assert_eq!(t.triggered_at_ms, Some(10_000));
+        assert_eq!(v, SiblingVerifyVerdict::Pending);
+        // Past the deadline: exceeded (the caller latches + pages once).
+        let v = apply_observation(
+            &mut t,
+            &SmartOrderStatus::Triggered,
+            Some(75),
+            SmartTransitionOutcome::SameStatusRefresh,
+            50_000,
+            deadline,
+        );
+        assert_eq!(
+            v,
+            SiblingVerifyVerdict::DeadlineExceeded { elapsed_ms: 40_000 }
+        );
+        t.sibling_unverified_paged = true;
+        // Terminal settles: Verified + episode closed (latch re-armed).
+        let v = apply_observation(
+            &mut t,
+            &SmartOrderStatus::Completed,
+            Some(75),
+            SmartTransitionOutcome::Transition,
+            60_000,
+            deadline,
+        );
+        assert_eq!(v, SiblingVerifyVerdict::Verified);
+        assert!(!t.sibling_unverified_paged);
+        assert_eq!(t.triggered_at_ms, None);
+        assert_eq!(t.status, SmartOrderStatus::Completed);
+        // A GTT never arms.
+        let mut g = tracked("gtt_1", SmartOrderType::Gtt);
+        let v = apply_observation(
+            &mut g,
+            &SmartOrderStatus::Triggered,
+            None,
+            SmartTransitionOutcome::Transition,
+            10_000,
+            deadline,
+        );
+        assert_eq!(v, SiblingVerifyVerdict::NotArmed);
+        assert_eq!(g.triggered_at_ms, None);
+    }
+
+    // -- reconcile_pass against a scripted transport ------------------------------
+
+    #[derive(Default)]
+    struct SmartScript {
+        get: StdMutex<Vec<TransportOutcome<SmartOrderPayload>>>,
+        list: StdMutex<Vec<TransportOutcome<SmartOrderListPayload>>>,
+        get_ids: StdMutex<Vec<String>>,
+    }
+
+    impl SmartOrderTransport for SmartScript {
+        async fn create_smart_order(
+            &self,
+            _req: &SmartOrderCreate,
+            _token: &SecretString,
+            _receipt: &IntentReceipt,
+        ) -> TransportOutcome<SmartOrderPayload> {
+            TransportOutcome::Ambiguous(AmbiguityReason::ConnectPhase)
+        }
+        async fn modify_smart_order(
+            &self,
+            _smart_order_id: &str,
+            _body: &SmartModifyBody,
+            _token: &SecretString,
+            _receipt: &IntentReceipt,
+        ) -> TransportOutcome<SmartOrderPayload> {
+            TransportOutcome::Ambiguous(AmbiguityReason::ConnectPhase)
+        }
+        async fn cancel_smart_order(
+            &self,
+            _segment: GrowwSegment,
+            _smart_order_type: SmartOrderType,
+            _smart_order_id: &str,
+            _token: &SecretString,
+            _receipt: &IntentReceipt,
+        ) -> TransportOutcome<SmartOrderPayload> {
+            TransportOutcome::Ambiguous(AmbiguityReason::ConnectPhase)
+        }
+        async fn get_smart_order(
+            &self,
+            _segment: GrowwSegment,
+            _smart_order_type: SmartOrderType,
+            smart_order_id: &str,
+            _token: &SecretString,
+        ) -> TransportOutcome<SmartOrderPayload> {
+            self.get_ids.lock().unwrap().push(smart_order_id.to_owned());
+            let mut q = self.get.lock().unwrap();
+            if q.is_empty() {
+                TransportOutcome::Ambiguous(AmbiguityReason::Timeout)
+            } else {
+                q.remove(0)
+            }
+        }
+        async fn list_smart_orders(
+            &self,
+            _query: &SmartOrderListQuery,
+            _token: &SecretString,
+        ) -> TransportOutcome<SmartOrderListPayload> {
+            let mut q = self.list.lock().unwrap();
+            if q.is_empty() {
+                TransportOutcome::Success(SmartOrderListPayload { orders: None })
+            } else {
+                q.remove(0)
+            }
+        }
+    }
+
+    fn payload(id: &str, status: &str, qty: i64) -> TransportOutcome<SmartOrderPayload> {
+        TransportOutcome::Success(SmartOrderPayload {
+            smart_order_id: Some(id.to_owned()),
+            smart_order_type: None,
+            status: Some(status.to_owned()),
+            trading_symbol: None,
+            exchange: None,
+            quantity: Some(qty),
+            product_type: None,
+            duration: None,
+            trigger_price: None,
+            trigger_direction: None,
+            order: None,
+            target: None,
+            stop_loss: None,
+            ltp: None,
+            remark: None,
+            display_name: None,
+            is_cancellation_allowed: None,
+            is_modification_allowed: None,
+            created_at: None,
+            expire_at: None,
+            triggered_at: None,
+            updated_at: None,
+        })
+    }
+
+    fn rt() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("rt")
+    }
+
+    #[test]
+    fn test_reconcile_pass_arms_then_pages_oco02_once_per_episode() {
+        let mut book = SmartOrderBook::default();
+        book.insert(tracked("oco_1", SmartOrderType::Oco));
+        let tok = SecretString::from("t");
+        let positions = HashMap::new();
+        rt().block_on(async {
+            // Pass 1: TRIGGERED arms the episode at now=10_000.
+            let t = SmartScript::default();
+            t.get
+                .lock()
+                .unwrap()
+                .push(payload("oco_1", "TRIGGERED", 75));
+            let r = reconcile_pass(&t, &tok, &mut book, 30, 10_000, &positions).await;
+            assert!(r.sibling_unverified.is_empty());
+            assert_eq!(r.polled, 1);
+            // Pass 2: still TRIGGERED past the deadline — pages ONCE.
+            let t = SmartScript::default();
+            t.get
+                .lock()
+                .unwrap()
+                .push(payload("oco_1", "TRIGGERED", 75));
+            let r = reconcile_pass(&t, &tok, &mut book, 30, 50_000, &positions).await;
+            assert_eq!(r.sibling_unverified, vec!["oco_1".to_owned()]);
+            // Pass 3: latched — never re-pages the same episode.
+            let t = SmartScript::default();
+            t.get
+                .lock()
+                .unwrap()
+                .push(payload("oco_1", "TRIGGERED", 75));
+            let r = reconcile_pass(&t, &tok, &mut book, 30, 90_000, &positions).await;
+            assert!(r.sibling_unverified.is_empty());
+            // Pass 4: settled terminal closes the episode (Verified).
+            let t = SmartScript::default();
+            t.get
+                .lock()
+                .unwrap()
+                .push(payload("oco_1", "COMPLETED", 75));
+            let r = reconcile_pass(&t, &tok, &mut book, 30, 95_000, &positions).await;
+            assert!(r.findings.is_empty());
+            assert!(!book.get("oco_1").unwrap().sibling_unverified_paged);
+        });
+    }
+
+    #[test]
+    fn test_reconcile_pass_deadline_sweep_pages_when_get_is_unreadable() {
+        // A GET failure must not silence the exposure page: the tracked order
+        // is armed + past deadline, transport ambiguous.
+        let mut book = SmartOrderBook::default();
+        let mut t0 = tracked("oco_1", SmartOrderType::Oco);
+        t0.status = SmartOrderStatus::Triggered;
+        t0.triggered_at_ms = Some(0);
+        book.insert(t0);
+        let tok = SecretString::from("t");
+        rt().block_on(async {
+            let t = SmartScript::default(); // GET queue empty -> Timeout
+            let r = reconcile_pass(&t, &tok, &mut book, 30, 60_000, &HashMap::new()).await;
+            assert_eq!(r.sibling_unverified, vec!["oco_1".to_owned()]);
+            assert!(r.degraded.contains(&"transport"));
+        });
+    }
+
+    #[test]
+    fn test_reconcile_pass_ghost_local_needs_two_sweeps() {
+        let mut book = SmartOrderBook::default();
+        book.insert(tracked("gtt_9", SmartOrderType::Gtt));
+        let tok = SecretString::from("t");
+        let rejected_404 = || TransportOutcome::Rejected {
+            http_status: 404,
+            ga_code: Some("GA004".to_owned()),
+            message: None,
+        };
+        rt().block_on(async {
+            let t = SmartScript::default();
+            t.get.lock().unwrap().push(rejected_404());
+            let r = reconcile_pass(&t, &tok, &mut book, 30, 1_000, &HashMap::new()).await;
+            assert!(r.findings.is_empty(), "one missing sweep is grace");
+            let t = SmartScript::default();
+            t.get.lock().unwrap().push(rejected_404());
+            let r = reconcile_pass(&t, &tok, &mut book, 30, 2_000, &HashMap::new()).await;
+            assert!(
+                r.findings
+                    .iter()
+                    .any(|f| f.kind == SmartFindingKind::GhostLocal)
+            );
+            // A successful read resets the ghost counter.
+            let t = SmartScript::default();
+            t.get.lock().unwrap().push(payload("gtt_9", "ACTIVE", 75));
+            let _ = reconcile_pass(&t, &tok, &mut book, 30, 3_000, &HashMap::new()).await;
+            assert_eq!(book.get("gtt_9").unwrap().missing_sweeps, 0);
+        });
+    }
+
+    #[test]
+    fn test_reconcile_pass_auth_stale_aborts_and_rate_limit_never_out_polls() {
+        let mut book = SmartOrderBook::default();
+        book.insert(tracked("gtt_1", SmartOrderType::Gtt));
+        book.insert(tracked("gtt_2", SmartOrderType::Gtt));
+        let tok = SecretString::from("t");
+        rt().block_on(async {
+            let t = SmartScript::default();
+            t.get
+                .lock()
+                .unwrap()
+                .push(TransportOutcome::AuthStale { http_status: 401 });
+            let r = reconcile_pass(&t, &tok, &mut book, 30, 1_000, &HashMap::new()).await;
+            // Aborted after the first poll — the second id was never fetched,
+            // and the list leg is skipped.
+            assert_eq!(r.polled, 1);
+            assert!(r.degraded.contains(&"token"));
+            assert_eq!(t.get_ids.lock().unwrap().len(), 1);
+            assert_eq!(r.foreign_untracked, 0);
+
+            let t = SmartScript::default();
+            t.get.lock().unwrap().push(TransportOutcome::RateLimited {
+                http_status: 429,
+                retry_after_secs: Some(3),
+                body_excerpt: None,
+            });
+            let r = reconcile_pass(&t, &tok, &mut book, 30, 2_000, &HashMap::new()).await;
+            assert!(r.degraded.contains(&"rate_limited"));
+            assert_eq!(t.get_ids.lock().unwrap().len(), 1, "never out-polled");
+        });
+    }
+
+    #[test]
+    fn test_reconcile_pass_counts_foreign_untracked_never_acts() {
+        let mut book = SmartOrderBook::default();
+        book.insert(tracked("oco_mine", SmartOrderType::Oco));
+        let tok = SecretString::from("t");
+        rt().block_on(async {
+            let t = SmartScript::default();
+            t.get
+                .lock()
+                .unwrap()
+                .push(payload("oco_mine", "ACTIVE", 75));
+            // GTT list: one foreign row; OCO list: our own row (not foreign).
+            let foreign = match payload("gtt_cotenant", "ACTIVE", 10) {
+                TransportOutcome::Success(p) => p,
+                _ => unreachable!(),
+            };
+            let mine = match payload("oco_mine", "ACTIVE", 75) {
+                TransportOutcome::Success(p) => p,
+                _ => unreachable!(),
+            };
+            t.list
+                .lock()
+                .unwrap()
+                .push(TransportOutcome::Success(SmartOrderListPayload {
+                    orders: Some(vec![foreign]),
+                }));
+            t.list
+                .lock()
+                .unwrap()
+                .push(TransportOutcome::Success(SmartOrderListPayload {
+                    orders: Some(vec![mine]),
+                }));
+            let r = reconcile_pass(&t, &tok, &mut book, 30, 1_000, &HashMap::new()).await;
+            assert_eq!(r.foreign_untracked, 1);
+            // The foreign id was never adopted into the book.
+            assert!(!book.contains("gtt_cotenant"));
+        });
+    }
+
+    #[test]
+    fn test_reconcile_pass_refuses_implausible_id_before_any_url() {
+        let mut book = SmartOrderBook::default();
+        book.insert(tracked("bad/../id", SmartOrderType::Gtt));
+        let tok = SecretString::from("t");
+        rt().block_on(async {
+            let t = SmartScript::default();
+            let r = reconcile_pass(&t, &tok, &mut book, 30, 1_000, &HashMap::new()).await;
+            assert!(r.degraded.contains(&"implausible_id"));
+            assert_eq!(r.polled, 0);
+            assert!(t.get_ids.lock().unwrap().is_empty(), "no transport call");
+        });
+    }
+
+    // -- book + ambiguity stage ---------------------------------------------------
+
+    #[test]
+    fn test_smart_order_book_open_count_and_non_terminal_ids() {
+        let mut book = SmartOrderBook::default();
+        book.insert(tracked("b", SmartOrderType::Gtt));
+        book.insert(tracked("a", SmartOrderType::Oco));
+        let mut done = tracked("z", SmartOrderType::Gtt);
+        done.status = SmartOrderStatus::Completed;
+        book.insert(done);
+        assert_eq!(book.open_count(), 2);
+        assert_eq!(
+            book.non_terminal_ids(),
+            vec!["a".to_owned(), "b".to_owned()]
+        );
+        assert!(book.contains("z"));
+        assert!(!book.contains("missing"));
+    }
+
+    #[test]
+    fn test_ambiguity_stage_covers_every_reason() {
+        for (reason, label) in [
+            (AmbiguityReason::ConnectPhase, "connect_phase"),
+            (AmbiguityReason::Timeout, "timeout"),
+            (AmbiguityReason::ServerError(503), "server_error"),
+            (AmbiguityReason::Decode, "decode"),
+            (
+                AmbiguityReason::GaOnNonRejectStatus("GA003".to_owned()),
+                "ga_on_non_reject_status",
+            ),
+            (AmbiguityReason::MissingPayload, "missing_payload"),
+            (AmbiguityReason::SendFailed, "send_failed"),
+        ] {
+            assert_eq!(ambiguity_stage(&reason), label);
+        }
+    }
+
+    // -- emit ratchet: every GROWW-OCO code has exactly one live emit site ------
+
+    #[test]
+    fn test_ratchet_all_five_oco_codes_have_coded_emit_sites() {
+        let src = include_str!("smart_orders.rs");
+        let prod = &src[..src.find("mod tests").expect("tests module")];
+        for needle in [
+            "ErrorCode::GrowwOco01PlacementFailed.code_str()",
+            "ErrorCode::GrowwOco02SiblingCancelUnverified.code_str()",
+            "ErrorCode::GrowwOco03ReconcileMismatch.code_str()",
+            "ErrorCode::GrowwOco04ModifyRejected.code_str()",
+            "ErrorCode::GrowwOco05PollerDegraded.code_str()",
+        ] {
+            assert_eq!(
+                prod.matches(needle).count(),
+                1,
+                "exactly one coded emit site for {needle}"
+            );
+        }
+        // Gate-5 discipline: NO endpoint path string in this module's code.
+        assert!(!prod.contains("\"/v1/order"), "paths live in api_client.rs");
     }
 }

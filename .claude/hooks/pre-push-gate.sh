@@ -13,7 +13,7 @@
 # ci.yml Repo Guards job on every PR/push):
 #   1. cargo fmt --check          [fast: ~2s]
 #   2. Banned pattern scan        [push-scoped; timeout 60s + count/2]
-#   3. Secret scan                [push-scoped; timeout 60s + count/8]
+#   3. Secret scan                [push-scoped; timeout 60s + count/2]
 #   4. Test count guard (ratchet) [fast: ~1s]
 #   5. Data integrity guard       [fast: ~2s, pattern scan]
 #   6. Pub fn test guard          [fast: ~3s, pattern scan]
@@ -22,6 +22,10 @@
 #
 # Heavy gates (clippy, test, audit, deny, coverage, loom) are CI-only.
 # Branch protection blocks merge if any CI check fails.
+#
+# NOTE: the harness dispatch budget bounds this hook's wall-clock; very large
+# pushes (hundreds of changed files) may exceed it — CI Repo Guards remains
+# the full authority.
 #
 # On success, writes state file for pre-PR gate optimization.
 
@@ -127,7 +131,11 @@ PUSH_BASE=$(git merge-base origin/main HEAD 2>/dev/null || true)
 if [ -n "$PUSH_BASE" ]; then
   CHANGED_ALL=$(git diff --name-only "$PUSH_BASE"..HEAD 2>/dev/null || true)
 else
-  CHANGED_ALL=$(find crates -name '*.rs' -not -path '*/target/*' | sort)
+  # fail-closed (review r2 F1): a degraded clone (missing origin/main) must
+  # never fall back to a full-tree scan — that re-creates the killed-hook
+  # fail-open on exactly the clones where the range cannot be proven.
+  echo "  FAIL: cannot resolve push range (origin/main missing) — run: git fetch origin main" >&2
+  exit 2
 fi
 CHANGED_RS=$(printf '%s\n' "$CHANGED_ALL" | grep -E '^crates/.*\.rs$' || true)
 RS_COUNT=$(printf '%s\n' "$CHANGED_RS" | sed '/^$/d' | wc -l | tr -d ' ')
@@ -157,10 +165,11 @@ fi
 # so scanning ALL changed files is a superset of the old .rs-only list)
 echo "  [3/8] Secret scan..." >&2
 if [ "$ALL_COUNT" -eq 0 ]; then
-  echo "  PASS: Secret scan (no changes in push range; full tree scanned in CI)" >&2
+  echo "  PASS: Secret scan (no changed files in push range; CI scans changed files per PR, weekly sweep covers the full tree)" >&2
 elif [ -x "$HOOKS_DIR/secret-scanner.sh" ]; then
-  # env base (default 60s) + count/8; hard floor 60s; findings always block
-  SECRET_TIMEOUT=$(( ${TICKVAULT_SECRET_SCAN_TIMEOUT_SECS:-60} + ALL_COUNT / 8 ))
+  # env base (default 60s) + count/2 (measured ~0.3-0.5s/file — /8 under-allowed);
+  # hard floor 60s; findings always block
+  SECRET_TIMEOUT=$(( ${TICKVAULT_SECRET_SCAN_TIMEOUT_SECS:-60} + ALL_COUNT / 2 ))
   [ "$SECRET_TIMEOUT" -lt 60 ] && SECRET_TIMEOUT=60
   SECRET_OUT=$(timeout "$SECRET_TIMEOUT" "$HOOKS_DIR/secret-scanner.sh" "$CWD" "$CHANGED_ALL" 2>&1)
   SECRET_EXIT=$?
