@@ -1,0 +1,312 @@
+# Implementation Plan: REST-Era Multi-TF Candle Derivation (bar-fold writer)
+
+**Status:** APPROVED
+**Date:** 2026-07-16
+**Approved by:** Parthiban (operator directive 2026-07-16, verbatim quotes below)
+
+> **Operator authority (2026-07-16, verbatim):**
+> 1. *"why the fuck remaining candles 1m till 1day is not yet generated and populated — resolve these"*
+> 2. *"for only spots we will have minimum one month data because anyhow based on underlying spots alone only trading decision will be entered or exited — but option only for the current day"*
+> 3. *"everything should be always available in our own questdb right — our entire one month should be stored and fetched from questdb even before premarket"*
+
+Crates touched: **crates/app** (new `crates/app/src/rest_candle_fold.rs`, edits to
+`crates/app/src/spot_1m_rest_boot.rs`, `crates/app/src/groww_spot_1m_boot.rs`,
+`crates/app/src/main.rs`, new test `crates/app/tests/rest_candle_fold_wiring_guard.rs`),
+**crates/common** (`crates/common/src/config.rs` — new `RestCandleFoldConfig`;
+`crates/common/src/error_code.rs` — new `RestCandleFold01Degraded` / `FOLD-01`),
+**crates/storage** (`crates/storage/src/partition_archive.rs` — retention-class edit),
+plus `config/base.toml`, rule files, and `.claude/triage/error-rules.yaml`.
+
+## Design
+
+The 21 `candles_*` tables are PRODUCER-DEAD on main (Verified by the 2026-07-16 audit,
+`scratchpad/candle-truth.md`): the 21-TF aggregator + seal writer spawn but the tick
+broadcast is publisher-less (Dhan input severed by #1522, Groww by #1581). The operator
+demands candles_1m..candles_1d generated + a month of spot depth resident in QuestDB
+before pre-market.
+
+**The fix is a cold-path BAR-FOLD writer** (new module `crates/app/src/rest_candle_fold.rs`),
+NOT tick synthesis (live-feed-purity forbids synthesized ticks; a bar fold is EXACT for
+O/H/L/C/ΣV given 1m bars):
+
+1. **Input** = confirmed `spot_1m_rest` 1-minute bars, per feed (`dhan` + `groww`), per
+   SID (4 IDX_I spot indices each). Two legs:
+   - **Live handoff:** both spot REST legs (`spot_1m_rest_boot.rs` Dhan fire + sweep;
+     `groww_spot_1m_boot.rs` fire + sweep) collect a `ConfirmedBar` alongside each
+     `staged.push(...)` and — ONLY after the ILP flush ACK (the same `flush_result.is_ok()`
+     gate that advances the persisted watermark) — hand them to the fold task via
+     `rest_candle_fold::send_confirmed_bars(...)`. The sender is a process-global
+     bounded mpsc behind a `OnceLock` (`set_global_fold_bar_sender` — the
+     `global_seal_sender` house precedent), so NO param-struct cascade through
+     `DhanRestStackParams` / `Spot1mRestTaskParams` / `GrowwSpot1mTaskParams` is needed;
+     a disabled fold (no sender installed) makes the handoff a zero-cost no-op.
+   - **Boot catch-up:** at boot (after a quiet QuestDB readiness probe), for each feed,
+     discover the `(security_id, exchange_segment)` identities present in `spot_1m_rest`
+     over the last `catchup_days` (default 35), then per SID read the bars (bounded
+     `/exec` SELECTs — micros WHERE window, nanos-projected ts, explicit LIMIT with loud
+     truncation, 8 MiB response cap, segment allowlist re-check — the hardened
+     `tf_consistency_boot.rs` read shapes) and fold them through the SAME engine,
+     emitting seals. DEDUP-idempotent (`ts, security_id, segment, feed`), so re-runs
+     UPSERT in place. This is what backfills candles_* from whatever spot_1m_rest
+     history exists — the month-deep-in-QuestDB requirement.
+2. **The fold core is pure** (`SidFoldState::fold_bar`): per (feed, sid, segment), 21
+   per-TF open buckets keyed by `TfIndex::bucket_start` (the 09:15-anchored grid); fold
+   semantics = o=first, h=max, l=min, c=last, vol=Σ (i64 checked/saturating, negatives
+   clamped at intake — matches the Groww i64 volume discipline). A TF bucket SEALS when
+   (a) a folded bar's minute-end reaches the bucket's session-truncated effective end
+   (`min(start + tf_secs, 15:30)` — covers final partials AND the 1d bucket, which
+   seals at session close), or (b) a bar belonging to a LATER bucket arrives (covers
+   gaps + day boundaries). Golden-tested to agree EXACTLY with
+   `tf_consistency_boot::recompute_window` over the same synthetic day.
+3. **Emission** = `BufferedSeal::new(sid, segment_code, tf, state, feed)` into the
+   EXISTING `global_seal_sender`, so the proven ring→spill→DLQ→ILP chain
+   (`ShadowCandleWriter`, DEDUP `ts, security_id, segment, feed`) is reused unchanged.
+   `tick_count` written 0 honestly (unknowable from REST bars); `oi` 0; pct columns
+   0.0 fail-soft (the PREVDAY-01 precedent). D1 is EMITTED (no drop_d1) per the
+   operator's "1m till 1day" demand + the dated live-feed-purity rule-10 edit riding
+   this PR — the fold does NOT route through `route_seal` (whose Dhan policy drops D1
+   and inflates live-aggregator counters); it try_sends directly with its own
+   `tv_rest_candle_fold_*` counters.
+4. **Out-of-order bars (backfill/sweep repairs):** a bar with minute ≤ the engine's
+   last-folded minute is NEVER folded in RAM (no double-count risk); it marks that
+   (feed, sid, segment, day) DIRTY. A debounced refold pass (every 5s when dirty) re-reads
+   that day's `spot_1m_rest` rows and folds them through a FRESH throwaway engine,
+   re-emitting completed buckets (DEDUP UPSERTs in place — the spec's "simplest honest
+   choice"); when the dirty day is TODAY, the fresh engine REPLACES the live engine state
+   for that key, so open partial buckets heal too. Honest residual: an ILP-flushed row may
+   lag `/exec` visibility (QuestDB WAL apply) — a refold that misses it is repaired by a
+   later refold or the next boot catch-up; never silent loss (counters + coded logs).
+5. **Config:** `[rest_candle_fold]` → `RestCandleFoldConfig { enabled (serde default
+   FALSE — fail-safe), catchup_days (default 35, validated 1..=120) }`; `config/base.toml`
+   opts in with `enabled = true`, `catchup_days = 35`.
+6. **Retention (the month-hot ruling + the 30 GB disk constraint,
+   `scratchpad/retention-truth.md`):** `market_data_hot_days` default + base.toml 14 → 35
+   (candles_* month-hot; `ticks` shares the class but is frozen post-2026-07-15, so no
+   growth impact), AND `option_chain_1m` + `option_contract_1m_rest` MOVE from the 90d
+   Standard class into the 35d MarketData class (smallest clean change: two table names
+   added to `retention_class`) per the operator's "option only for the current day" +
+   month-for-verification ruling — month-hot chain ≈ 3.0–3.2 GB both feeds vs ~8.6 GB
+   at 90d.
+7. **Observability:** ErrorCode `FOLD-01` (`RestCandleFold01Degraded`, High,
+   auto-triage-safe, log-sink-only — no `error_code_alerts` entry) with stage taxonomy
+   `client_build` / `catchup_query` / `catchup_parse` / `catchup_truncated` /
+   `refold_query` / `task_respawn`; counters `tv_rest_candle_fold_seals_total{feed}`,
+   `tv_rest_candle_fold_catchup_rows_total{feed}`, `tv_rest_candle_fold_errors_total{stage}`,
+   `tv_rest_candle_fold_dropped_total{reason}`, `tv_rest_candle_fold_task_respawn_total{reason}`
+   (static bounded labels only — never per-TF); supervised task (house respawn pattern);
+   new rule file `.claude/rules/project/rest-candle-fold-error-codes.md` + triage rule.
+
+## Edge Cases
+
+- **Session window:** only minutes in `[09:15:00, 15:30:00)` IST fold; out-of-session
+  bars are counted + skipped (never a bucket). Session constants const-asserted against
+  the canonical common-crate nanos gates (the tf_consistency discipline).
+- **09:15 open / 15:30 close boundaries:** first bucket of every TF starts exactly
+  09:15; the 15:29 bar completes the M1 bucket AND every final partial (2m..4h, 1d) via
+  the effective-end rule — no timer needed.
+- **Final partial buckets:** H4 `[13:15, 17:15)` truncates to 15:30; sealed on the
+  15:29 bar (or on the next day's first bar if 15:29 is absent — honest late seal).
+- **Missing session tail (no 15:29 bar):** final buckets stay open until the next
+  bar transitions them (next trading day's 09:15 bar seals yesterday's partials); a
+  later sweep repair of the tail triggers the dirty-day refold which re-emits corrected
+  buckets.
+- **Day boundary / D1:** `bucket_start(D1)` = the day's 09:15 (day-anchored), so a new
+  day's bar transitions + seals the previous D1; catch-up force-seals open buckets of
+  PAST days at the end of the pass.
+- **Duplicate delivery of the same minute:** minute ≤ last-folded → dirty-day refold
+  (idempotent DEDUP re-emit) — never a double-count in RAM.
+- **Negative / overflowing volume:** clamped to 0 at intake (counted); Σ uses
+  saturating i64 (index spot volume is legitimately 0 anyway).
+- **Groww i64 ids:** `spot_1m_rest.security_id` is i64; negative values cannot map to
+  `BufferedSeal.security_id: u64` → skipped + counted (defensive; today's ids are the
+  4 IDX_I SIDs / stable Groww index ids, all positive).
+- **Segment strings from discovery:** re-validated against the exact
+  `segment_str_to_code` allowlist before any follow-up query interpolation (the
+  tf_consistency L8 second-order-injection defense).
+- **catchup_days = 0 / >120:** rejected at boot by `validate()`.
+- **Fold disabled:** no sender installed; both legs' handoff is a no-op; behaviour
+  byte-identical to today (candles stay producer-dead — the rollback state).
+
+## Failure Modes
+
+- **QuestDB unreachable at boot catch-up:** quiet bounded readiness probe fails →
+  FOLD-01 `stage="catchup_query"` per feed, catch-up skipped, LIVE folding continues
+  (bars arrive over the mpsc); the next boot repairs via DEDUP-idempotent catch-up.
+- **HTTP client build fails:** FOLD-01 `stage="client_build"` (HTTP-CLIENT-01 class);
+  catch-up + refold legs degrade, live folding continues.
+- **/exec query fails / malformed body / oversize:** that (feed, sid) is skipped with
+  FOLD-01 `stage="catchup_query"`/`"catchup_parse"` — never a partial silent fold.
+- **Query hits its LIMIT:** FOLD-01 `stage="catchup_truncated"` — the truncated slice
+  IS still folded (DEDUP makes later repair safe) but the truncation is loud.
+- **Seal channel full (seal writer behind):** `tv_rest_candle_fold_dropped_total{reason=
+  "seal_channel_full"}` counter (the route_seal DroppedFull precedent — the downstream
+  ring→spill→DLQ chain is the durable absorber; a dropped seal re-emerges at the next
+  refold/boot catch-up).
+- **Fold-bar mpsc full (fold task wedged):** legs drop the handoff with
+  `tv_rest_candle_fold_dropped_total{reason="bar_channel_full"}` — the spot legs are
+  NEVER blocked (their persist path is untouched); the boot catch-up repairs.
+- **Fold task dies (unwind builds):** supervised respawn (5s backoff) + FOLD-01
+  `stage="task_respawn"` + counter; release panics abort the process (panic="abort" —
+  the TICK-FLUSH-01 honesty note); recovery = restart + boot catch-up.
+- **Refold read lags ILP visibility:** documented residual — repaired by later
+  refold/boot; DEDUP-idempotent.
+- **Retention edit risk:** raising market_data_hot_days 14→35 only SLOWS drops
+  (fail-safe direction); moving the chain tables to 35d TIGHTENS their window — the
+  archive→verify→drop leg is fail-closed (no verified S3 copy ⇒ no drop), and the
+  MIN_HOT_DAYS=2 floor is untouched.
+
+## Test Plan
+
+- **Golden fold-vs-recompute test:** synthetic trading day of 1m bars → fold engine
+  seals must agree EXACTLY (o/h/l/c/vol) with `tf_consistency_boot::recompute_window`
+  over `bucket_grid` windows for every TF 1m..4h + the 1d session fold
+  (`test_golden_fold_agrees_with_tf_consistency_recompute`).
+- **Bucket boundary tests:** 09:15 open anchoring, 15:30 close truncation, final
+  partials (M30/H1/H4), D1 seals at close, M1 seals every bar, gap (missing minute)
+  transition-seal, day-boundary transition (`test_fold_*` family).
+- **Order tolerance:** out-of-order bar → `FoldOutcome::OutOfOrder` (never folded);
+  duplicate same-minute bar → OutOfOrder; out-of-session bar → OutOfSession.
+- **Volume semantics:** i64 Σ, negative clamp, u64 conversion clamp
+  (`test_fold_volume_i64_clamp_semantics`).
+- **Idempotency:** folding the same input twice through fresh engines yields identical
+  seal sets (`test_fold_refold_same_input_identical_seals`).
+- **Config:** serde default OFF; empty-TOML deserialize disabled; base.toml sets
+  enabled=true + catchup_days=35; validate rejects 0 / 121
+  (`test_rest_candle_fold_config_*`).
+- **Catch-up SQL/parse:** query shapes (micros window, LIMIT, feed/segment scoping),
+  dataset parse skip-malformed + truncation flag.
+- **Retention:** `retention_class` maps option_chain_1m + option_contract_1m_rest +
+  every candle table + ticks to MarketData; default 35 pinned; base.toml pinned.
+- **Wiring ratchet:** `crates/app/tests/rest_candle_fold_wiring_guard.rs` pins the
+  main.rs shared-infra spawn (config-gated, REST-only-boot reachable), the
+  `set_global_fold_bar_sender` install, BOTH spot legs' `send_confirmed_bars(` handoff
+  sites (flush-gated), and the boot catch-up call inside the fold module's production
+  region.
+- **Error-code chain:** crossref both directions green (`FOLD-` added to
+  TRACKED_PREFIXES), tag guard, triage full-coverage guard (new escalate rule),
+  paging drift guard untouched (log-sink-only — no tf entry).
+- **Gates:** cargo fmt, clippy -D warnings -W clippy::perf, `cargo test --workspace`
+  (crates/common touched → escalation per testing-scope.md), banned-pattern scanner,
+  pub-fn guards, plan-verify.
+
+## Rollback
+
+- **Config rollback (no code change):** `[rest_candle_fold] enabled = false` (or delete
+  the section — serde default OFF) ⇒ no sender installed, no catch-up, both legs'
+  handoff no-ops; behaviour byte-identical to pre-PR (candles_* stay unwritten).
+- **Retention rollback:** set `market_data_hot_days = 14` in base.toml to restore the
+  old window (config-only); the chain-table class move reverts with a 2-line
+  `retention_class` edit. Nothing already dropped is lost — every drop was preceded by
+  a verified S3 copy (`questdb-partitions/<table>/<partition>.csv.gz`).
+- **Full revert:** the PR is additive (new module + hook sites + config); `git revert`
+  of the squash commit restores main exactly; folded candle rows remain in QuestDB as
+  inert data (DEDUP-keyed, feed-tagged) and age out under the retention window.
+
+## Observability
+
+- **Counters:** `tv_rest_candle_fold_seals_total{feed}` (one per emitted BufferedSeal),
+  `tv_rest_candle_fold_catchup_rows_total{feed}` (bars folded by the boot catch-up),
+  `tv_rest_candle_fold_errors_total{stage}` (client_build / catchup_query /
+  catchup_parse / catchup_truncated / refold_query), `tv_rest_candle_fold_dropped_total
+  {reason}` (bar_channel_full / seal_channel_full / bad_identity / out_of_session),
+  `tv_rest_candle_fold_task_respawn_total{reason}` — all static bounded labels.
+- **Coded logs:** every degrade is `error!(code = ErrorCode::RestCandleFold01Degraded
+  .code_str(), stage = ...)` (tag-guard compliant); one coalesced boot-catch-up summary
+  `info!` per feed (bars folded, seals emitted, sids); one `info!` per dirty-day refold.
+- **Delivery boundary (honest):** FOLD-01 is log-sink-only — NO `error_code_alerts`
+  terraform entry, NO observability-architecture paging-list entry (the paging drift
+  guard sees no drift). The operator-facing verification signal is the EXISTING 15:40
+  IST tf-consistency verifier (which recomputes candles_* from candles_1m and pages
+  TF-VERIFY-01 on divergence) + the `candles_*` row counts via
+  `mcp__tickvault-logs__questdb_sql`. A CloudWatch filter is a flagged follow-up.
+- **Runbook:** `.claude/rules/project/rest-candle-fold-error-codes.md` (new, rides this
+  PR) + a dated rule-10 edit in `live-feed-purity.md` + triage rule in
+  `.claude/triage/error-rules.yaml`.
+
+## Plan Items
+
+- [x] Item 0 — This plan file (Status APPROVED, operator quotes recorded)
+  - Files: .claude/plans/active-plan-rest-candle-derivation.md
+  - Tests: (docs only)
+- [x] Item 1 — Fold module: pure core + global sender + catch-up + refold + supervised task
+  - Files: crates/app/src/rest_candle_fold.rs, crates/app/src/lib.rs
+  - Tests: test_golden_fold_agrees_with_tf_consistency_recompute, test_fold_seals_m1_every_bar_and_final_partials_at_close, test_fold_out_of_order_and_out_of_session, test_fold_refold_same_input_identical_seals, test_fold_volume_i64_clamp_semantics, test_catchup_sql_shapes_and_parse
+- [x] Item 2 — Config: RestCandleFoldConfig (serde default OFF) + validate + base.toml opt-in
+  - Files: crates/common/src/config.rs, config/base.toml
+  - Tests: test_rest_candle_fold_config_default_off, test_rest_candle_fold_config_validate_bounds
+- [x] Item 3 — Spot-leg handoffs (flush-ACK-gated) in both feeds' fire + sweep paths
+  - Files: crates/app/src/spot_1m_rest_boot.rs, crates/app/src/groww_spot_1m_boot.rs
+  - Tests: rest_candle_fold_wiring_guard (handoff pins)
+- [x] Item 4 — main.rs shared-infra spawn (config-gated, REST-only-boot reachable)
+  - Files: crates/app/src/main.rs
+  - Tests: rest_candle_fold_wiring_guard (spawn pin)
+- [x] Item 5 — ErrorCode FOLD-01 + rule file + triage rule + crossref prefix
+  - Files: crates/common/src/error_code.rs, .claude/rules/project/rest-candle-fold-error-codes.md, .claude/triage/error-rules.yaml, crates/common/tests/error_code_rule_file_crossref.rs
+  - Tests: error_code_rule_file_crossref, triage_rules_full_coverage_guard, test_code_str_follows_expected_prefix_pattern
+- [x] Item 6 — Retention: market_data_hot_days 14→35 + chain tables into the 35d class + dated notes
+  - Files: crates/storage/src/partition_archive.rs, crates/common/src/config.rs, config/base.toml
+  - Tests: test_retention_class_chain_tables_are_market_data, config default/parse pins
+- [x] Item 7 — live-feed-purity rule 10 dated edit (REST-era bar-fold 1d permission)
+  - Files: .claude/rules/project/live-feed-purity.md
+  - Tests: (docs; scanner-clean)
+- [x] Item 8 — Wiring ratchet test
+  - Files: crates/app/tests/rest_candle_fold_wiring_guard.rs
+  - Tests: the guard itself (4+ pins)
+
+## Scenarios
+
+| # | Scenario | Expected |
+|---|----------|----------|
+| 1 | Boot at 08:30 with 20 days of spot_1m_rest history | catch-up folds both feeds' bars, candles_1m..1d populate for every past day, DEDUP-idempotent |
+| 2 | Live minute confirms at 09:16:01 | M1 seal emitted within the fire; higher TFs seal at their bucket ends |
+| 3 | 15:30:00 fire (15:29 bar) | every open bucket incl. final partials + 1d seals |
+| 4 | Sweep repairs 10:20 at 15:33 | dirty-day refold re-emits affected buckets; today's engine replaced with healed state |
+| 5 | QuestDB down at boot | catch-up degrades loudly (FOLD-01), live folding continues |
+| 6 | Fold disabled | byte-identical to today; zero sends, zero spawns |
+| 7 | Re-run catch-up twice | identical rows (DEDUP UPSERT), no duplicates |
+| 8 | Chain partitions age past 35d | archived→verified→dropped (was 90d); disk fits the 30 GB constraint |
+
+## Per-Item Guarantee Matrix (15-row + 7-row, per `.claude/rules/project/per-wave-guarantee-matrix.md`)
+
+### 15-row 100% Guarantee Matrix
+
+| Demand | Mechanical proof artefact | Real-time check | Per-item gate |
+|---|---|---|---|
+| 100% code coverage | fold core + config + retention fully unit-tested; `quality/crate-coverage-thresholds.toml` ratcheted floors | post-merge llvm-cov | tests listed per item above |
+| 100% audit coverage | output lands in the DEDUP-keyed `candles_*` tables (ts, security_id, segment, feed); every degrade coded FOLD-01 in errors.jsonl | `mcp__tickvault-logs__questdb_sql` | seal chain reused unchanged |
+| 100% testing coverage | 22-category standard scoped to app/common/storage/trading; golden + boundary + property-style idempotency tests | `cargo test --workspace` green | Test Plan section |
+| 100% code checks | banned-pattern + pub-fn-test + pub-fn-wiring + plan-verify + secret-scan + pre-commit gates | pre-push mandatory | all gates run before PR |
+| 100% code performance | cold path (≤8 bars/min live; boot catch-up bounded SELECTs) — no hot-path involvement; zero per-tick cost | n/a (not hot path) | N/A — cold/per-minute path (no DHAT/Criterion per spec) |
+| 100% monitoring | tv_rest_candle_fold_* counters + coded logs + the existing seal-chain counters + tf-consistency verifier downstream | `mcp__tickvault-logs__run_doctor` | Observability section |
+| 100% logging | every error path `error!` with `code = FOLD-01` (tag-guard); coalesced info summaries | errors.jsonl hourly | tag-guard green |
+| 100% alerting | log-sink-only by design (honest delivery boundary — no false claim of paging); downstream TF-VERIFY-01 pages on fold divergence | paging drift guard green | documented in rule file §delivery |
+| 100% security | no secrets touched (QuestDB /exec local reads only); segment allowlist re-check blocks second-order injection; no URL/token logging | `cargo audit` | catch-up SQL scoping tests |
+| 100% security hardening | bounded LIMIT + 8 MiB response cap + timeout + redirect-none client | post-deploy | constants pinned in module |
+| 100% bugs fixing | adversarial review by the parent session (hostile review before PR opens per task contract) | pre-PR | parent-session review |
+| 100% scenarios covering | Scenarios table (8) + Edge Cases section each mapped to a test or documented residual | scoped tests | Test Plan |
+| 100% functionalities covering | every new pub fn has a call site + test (pub-fn guards) | pre-push gates 6+11 | guards green |
+| 100% code review | parent session runs the hostile review pass on the diff before opening the draft PR | per-PR | task contract |
+| 100% extreme check | rest_candle_fold_wiring_guard + retention-class tests + config-default pins fail the build on regression | every commit | Item 8 |
+
+### 7-row Resilience Demand Matrix
+
+| Demand | Honest envelope | Per-item proof |
+|---|---|---|
+| Zero ticks lost | NO tick path touched — bars fold only AFTER the spot legs' flush ACK; a dropped fold bar is repaired by boot catch-up (DEDUP-idempotent), never data loss | handoff sits strictly post-flush (wiring guard) |
+| WS never disconnects | no WebSocket involvement (REST-only runtime); no reconnect machinery touched | n/a |
+| Never slow/locked/hanged | cold path: ≤8 bars/min live, bounded boot SELECTs with LIMIT + caps + timeouts; legs use try_send (never block) | constants + wiring guard |
+| QuestDB never fails | ABSORB: seals ride the existing ring→spill→DLQ chain; catch-up degrades loudly and re-runs next boot | Failure Modes section |
+| O(1) latency | O(21) per folded bar (fixed TF array), O(1) engine lookup per (feed,sid,segment); the boot catch-up is honestly O(days×minutes) — flagged O(N), cold, bounded by catchup_days | fold core structure |
+| Uniqueness + dedup | composite (security_id, exchange_segment) + feed in the candles DEDUP key — reused unchanged; refold/catch-up re-emits UPSERT in place | DEDUP key tests already pin it |
+| Real-time proof | seals visible in candles_* within one seal-writer drain cycle (~100ms); counters per seal; the 15:40 tf-consistency verifier is the daily exact-match proof | Observability section |
+
+## Honest 100% claim
+
+100% inside the tested envelope, with ratcheted regression coverage: the fold is EXACT
+for O/H/L/C/ΣV given confirmed 1m REST bars (golden-tested against the tripwire-tested
+`recompute_window`); persistence rides the existing ring→spill→DLQ seal chain with
+feed-in-key DEDUP idempotency; the boot catch-up re-derives all 21 TFs from whatever
+`spot_1m_rest` history exists (bounded by `catchup_days`). NOT claimed: intra-minute
+fidelity (state granularity is honestly 1 minute — `tick_count` written 0, never faked);
+minutes the vendors never served (absent bars stay absent — the SPOT1M named-gap
+machinery owns that visibility); pct-from-prev-day columns (written 0.0 fail-soft).
