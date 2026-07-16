@@ -78,8 +78,11 @@ const SECS_PER_CYCLE: u32 = 60;
 /// in the burst window + routine ≥1ms wake jitter put 6 Dhan fires in
 /// one rolling second, so a NOMINAL fire deferred — a false
 /// `gate_deferred_nominal` should-never page EVERY minute of a vendor
-/// outage (the collision class is pinned at the gate level by
-/// `test_cadence_gate_expiry_fire_in_burst_window_defers_fourth_nominal_spot`).
+/// outage (the collision class is documented at the gate level by
+/// `test_cadence_gate_expiry_invasion_tolerance_and_cap5_backstop` —
+/// the 2026-07-16 two-bucket re-derivation of the retired
+/// burst-window-defers pin: invasion-tolerant at the default cap 4,
+/// colliding again at cap 5, where this :30 anchor stays the fix).
 pub const CADENCE_EXPIRY_WAVE_MID_MINUTE_ANCHOR_MS: i64 = 30_000;
 
 /// The next expiry-retry-wave fire instant (ms-of-day) — pure

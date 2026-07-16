@@ -816,7 +816,9 @@ proptest! {
             // collided cycle entirely, so the collision class can never
             // reach these asserts. Anchor safety rests on the literal
             // :30 phase pin below + the gate-level collision doc test
-            // (`test_cadence_gate_expiry_fire_in_burst_window_defers_fourth_nominal_spot`).
+            // (`test_cadence_gate_expiry_invasion_tolerance_and_cap5_backstop`
+            // — the 2026-07-16 two-bucket re-derivation of the retired
+            // burst-window-defers pin).
             // What THIS arm proves: the anchored waves flow through the
             // SAME combined ledger (the L1 budget honesty) and fire at
             // their anchor instant.
