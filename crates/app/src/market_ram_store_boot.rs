@@ -33,9 +33,12 @@
 //!    actually in RAM?" question reads — honest fill level, never a
 //!    fabricated month (audit Rule 11).
 //!
-//! Every degrade is a coded RAMSTORE-01 `error!` (log-sink-only delivery
-//! boundary per the runbook) — QuestDB remains the durable truth; a RAM
-//! degrade re-fills at the next boot.
+//! Every degrade is a coded RAMSTORE-01 `error!`/`warn!` (the boot/
+//! rehydrate/task degrades here are `error!`; the chain store's own
+//! row-cap / day-drop / minute-cap degrades are `warn!` — PR-2 round-1
+//! doc alignment). Log-sink-only delivery boundary per the runbook —
+//! QuestDB remains the durable truth; a RAM degrade re-fills at the next
+//! boot.
 
 use std::time::Duration;
 
@@ -162,7 +165,11 @@ pub struct ChainRehydrateRow {
 
 /// SQL for one (feed, underlying, window) slice of today's chain rows —
 /// the hardened `/exec` shape (micros WHERE window, nanos projections,
-/// explicit LIMIT tripwire).
+/// explicit LIMIT tripwire). The emitted `LIMIT` is `limit + 1` — ONE
+/// extra row past the trusted bound (PR-2 round-1 fix): a returned
+/// dataset of exactly `limit` rows is a legitimately-complete
+/// exact-boundary window, while `> limit` rows proves genuine
+/// truncation ([`parse_chain_rehydrate_rows`] flags on `len > limit`).
 #[must_use]
 pub fn chain_rehydrate_sql(
     feed: &str,
@@ -173,6 +180,7 @@ pub fn chain_rehydrate_sql(
 ) -> String {
     let start_micros = window_start_nanos / 1_000;
     let end_micros = window_end_nanos / 1_000;
+    let fetch_limit = limit.saturating_add(1);
     format!(
         "SELECT (ts / 1) * 1000 AS ts_nanos, strike, leg, last_price, moneyness, \
          underlying_spot, (expiry / 1) * 1000 AS expiry_nanos, \
@@ -180,13 +188,16 @@ pub fn chain_rehydrate_sql(
          FROM option_chain_1m \
          WHERE feed = '{feed}' AND underlying_symbol = '{underlying_symbol}' \
          AND ts >= {start_micros} AND ts < {end_micros} \
-         ORDER BY ts ASC LIMIT {limit}"
+         ORDER BY ts ASC LIMIT {fetch_limit}"
     )
 }
 
 /// Parses a rehydrate `/exec` dataset. Returns `(rows, truncated)` —
-/// `truncated` means the explicit LIMIT was hit (a partial window is NEVER
-/// trusted; the caller skips it loudly).
+/// `truncated` means MORE than `limit` rows came back (the query fetches
+/// `limit + 1`, so `len > limit` proves genuine truncation while an
+/// exact-boundary `len == limit` window is legitimately complete — PR-2
+/// round-1 fix). A truncated window is NEVER trusted; the caller skips
+/// it loudly.
 #[must_use]
 pub fn parse_chain_rehydrate_rows(
     body: &str,
@@ -194,7 +205,7 @@ pub fn parse_chain_rehydrate_rows(
 ) -> Option<(Vec<ChainRehydrateRow>, bool)> {
     let value: serde_json::Value = serde_json::from_str(body).ok()?;
     let dataset = value.get("dataset")?.as_array()?;
-    let truncated = dataset.len() >= limit;
+    let truncated = dataset.len() > limit;
     let mut rows = Vec::with_capacity(dataset.len());
     for row in dataset {
         let cells = row.as_array()?;
@@ -431,7 +442,14 @@ async fn run_chain_day_rehydrate(questdb: QuestDbConfig) {
                     continue;
                 }
                 for snap in build_minute_snapshots(feed, underlying, &rows) {
-                    if store.record_rehydrated(snap) == ChainRecordOutcome::Recorded {
+                    // PR-2 round-1 LOW: a row-cap-truncated minute is STILL a
+                    // stored minute — count it (the truncation itself is
+                    // separately loud via tv_ram_store_dropped_total
+                    // reason="row_cap" + the chain_truncated warn).
+                    if matches!(
+                        store.record_rehydrated(snap),
+                        ChainRecordOutcome::Recorded | ChainRecordOutcome::RecordedTruncated
+                    ) {
                         feed_minutes += 1;
                     }
                 }
@@ -443,13 +461,25 @@ async fn run_chain_day_rehydrate(questdb: QuestDbConfig) {
         }
         total_minutes += feed_minutes;
     }
-    info!(
-        minutes = total_minutes,
-        windows = starts.len(),
-        "market_ram_store: chain day rehydrate complete — today's already-\
-         captured chain minutes are RAM-resident (live minutes always outrank \
-         rehydrated ones)"
-    );
+    if total_minutes == 0 {
+        // PR-2 round-1 LOW: zero minutes is DEGRADED/EMPTY, never worded as
+        // a clean completion (audit Rule 11 — no false-OK phrasing).
+        info!(
+            windows = starts.len(),
+            "market_ram_store: chain day rehydrate finished with ZERO minutes \
+             rehydrated — either no chain rows were captured today yet, or \
+             every window degraded (check RAMSTORE-01 rehydrate_* stages); \
+             live publishes fill forward"
+        );
+    } else {
+        info!(
+            minutes = total_minutes,
+            windows = starts.len(),
+            "market_ram_store: chain day rehydrate complete — today's already-\
+             captured chain minutes are RAM-resident (live minutes always outrank \
+             rehydrated ones)"
+        );
+    }
 }
 
 /// Spawns the ONE-SHOT chain-day rehydrate with a join classifier — a
@@ -493,6 +523,13 @@ fn publish_ram_store_stats() {
             gauge!("tv_ram_store_spot_days_depth", "feed" => feed.as_str())
                 .set(f64::from(stats.min_depth_days_per_feed[feed.index()]));
         }
+        // PR-2 round-1 HIGH: the spot store is a pure ring core with NO emit
+        // sites — its lifetime over-window drop total was previously an
+        // UNPUBLISHED stat. Publish it here as a counter-style monotonic
+        // gauge so spot drops are a real signal, not a runbook fiction
+        // (chain-side drops keep their own tv_ram_store_dropped_total
+        // reasons: row_cap / day_drop / minute_cap).
+        gauge!("tv_ram_store_spot_dropped_over_window").set(stats.dropped_over_window as f64);
         estimated_bytes += stats.estimated_bytes;
     }
     if let Some(store) = chain_day_store() {
@@ -578,7 +615,9 @@ mod tests {
         assert!(sql.contains("feed = 'dhan'"));
         assert!(sql.contains("underlying_symbol = 'NIFTY'"));
         assert!(sql.contains("ts >= 2000 AND ts < 3000"));
-        assert!(sql.contains("ORDER BY ts ASC LIMIT 30000"));
+        // PR-2 round-1: the query fetches LIMIT+1 — one extra row as the
+        // truncation tripwire, so an exact-boundary window is not flagged.
+        assert!(sql.contains("ORDER BY ts ASC LIMIT 30001"));
         assert!(sql.contains("moneyness"));
         assert!(sql.contains("underlying_spot"));
     }
@@ -597,9 +636,16 @@ mod tests {
         // NULL moneyness (pre-moneyness-column rows) tolerated as UNKNOWN.
         assert_eq!(rows[1].moneyness, "UNKNOWN");
         assert_eq!(rows[1].ts_nanos, 1_000_000_000);
-        // Truncation tripwire: dataset length reaching the LIMIT flags it.
-        let (_, truncated2) = parse_chain_rehydrate_rows(body, 2).expect("parses");
-        assert!(truncated2, "dataset.len() >= limit must flag truncated");
+        // Truncation tripwire (PR-2 round-1, LIMIT+1 semantics): an
+        // EXACT-boundary dataset (len == limit) is legitimately complete —
+        // only len > limit (the +1 fetch row came back) proves truncation.
+        let (_, exact_boundary) = parse_chain_rehydrate_rows(body, 2).expect("parses");
+        assert!(
+            !exact_boundary,
+            "dataset.len() == limit is a COMPLETE exact-boundary window"
+        );
+        let (_, truncated2) = parse_chain_rehydrate_rows(body, 1).expect("parses");
+        assert!(truncated2, "dataset.len() > limit must flag truncated");
         // Malformed rows fail the whole parse (never a partial trust).
         assert!(parse_chain_rehydrate_rows(r#"{"dataset":[[1]]}"#, 10).is_none());
         assert!(parse_chain_rehydrate_rows("not json", 10).is_none());
