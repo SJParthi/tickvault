@@ -2949,6 +2949,40 @@ mod tests {
     }
 
     // =======================================================================
+    // [rest_candle_fold] — RestCandleFoldConfig pins (rest-candle plan Item 2)
+    // =======================================================================
+
+    #[test]
+    fn test_rest_candle_fold_config_default_off() {
+        // Fail-safe pin: the fold is OFF unless a config explicitly turns
+        // it on — `Default` and the serde default (absent keys) must agree.
+        assert!(!RestCandleFoldConfig::default().enabled);
+        assert_eq!(RestCandleFoldConfig::default().catchup_days, 35);
+        let cfg: RestCandleFoldConfig = toml::from_str("")
+            .expect("empty [rest_candle_fold] section must parse via serde defaults");
+        assert!(!cfg.enabled, "absent enabled key must deserialize to false");
+        assert_eq!(cfg.catchup_days, 35, "serde catchup_days default is 35");
+    }
+
+    #[test]
+    fn test_rest_candle_fold_config_validate_bounds() {
+        // The 1..=370 catch-up envelope: both edges accepted, both
+        // neighbours rejected (a 0/371 window is a config typo, not a
+        // legitimate ask).
+        let cfg = |catchup_days: u32| RestCandleFoldConfig {
+            enabled: true,
+            catchup_days,
+        };
+        assert!(cfg(1).validate().is_ok(), "lower edge 1 must be accepted");
+        assert!(
+            cfg(370).validate().is_ok(),
+            "upper edge 370 must be accepted"
+        );
+        assert!(cfg(0).validate().is_err(), "0 must be rejected");
+        assert!(cfg(371).validate().is_err(), "371 must be rejected");
+    }
+
+    // =======================================================================
     // B6 mutation kills: live-trading sandbox gate pure helpers
     // =======================================================================
 
