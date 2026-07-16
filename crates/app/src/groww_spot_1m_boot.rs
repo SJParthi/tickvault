@@ -66,19 +66,34 @@
 //! `outcome="empty"` — counted, edge-tracked, forensics-rowed, never
 //! silent (Rule 11).
 //!
-//! ## Rate budget + pacing (the plan's capacity verdict)
-//! Per `docs/groww-ref/15-rate-limits-and-capacity.md` (official limits +
-//! capacity math + the §6 live-probe measurement plan): Groww's Live-Data
+//! ## Rate budget + pacing — the 2026-07-14 burst AUTO-LADDER
+//! (operator approval "approved and go ahead with the recommendation";
+//! contract `no-rest-except-live-feed-2026-06-27.md` §9.7 +
+//! `groww-second-feed-scope-2026-06-19.md` §38.9). Groww's Live-Data
 //! bucket is 10/s + 300/min, TYPE-pooled, shared with bruteX on the ONE
 //! minter token; which bucket `/historical/*` counts against is
-//! UNVERIFIED (Assumed Live Data — `docs/groww-ref/99-UNKNOWNS.md`). That
-//! binds the minute-boundary pacing rule: the 3 symbols are fetched
-//! SEQUENTIALLY, so at most ONE request is in flight at any instant
-//! (ladder re-polls are ≥700 ms apart) — far inside the ≤6 req/s
-//! boundary-burst ceiling. Worst case ~15 requests/minute (3 symbols × 5
-//! ladder rungs) ≈ 5% of the 300/min budget. Every 429 is counted + its
-//! shape captured (timestamp, endpoint, Retry-After presence, sanitized
-//! body) — the live-probe (e) requirement.
+//! UNVERIFIED (Assumed Live Data — `docs/groww-ref/99-UNKNOWNS.md`).
+//! The 4 targets fire CONCURRENTLY as ONE WAVE at a TIER-dependent
+//! post-boundary delay: `two_wave` (the shipped default) fires the spot
+//! wave at close+1,350 ms — more than one rolling second after the chain
+//! leg's close+300 ms wave, so the boundary burst never exceeds 4 req/s;
+//! the probe-gated `seven_concurrent` tier fires it at close+300 ms with
+//! the chain wave (7 req/s). Any Groww-leg HTTP 429 AUTO-DEMOTES the
+//! session (`crate::groww_rest_burst`; a demoted two_wave staggers wave
+//! slots by 350 ms — the ladder rung offsets are measured from each
+//! target's own first attempt, so the stagger propagates into every
+//! re-poll rung wave). Worst case ~20 requests/minute (4 targets × 5
+//! ladder rungs) ≈ 7% of the 300/min budget; the honest vendor-lag
+//! rolling-second worst (two adjacent rung waves) is 8 req/s solo —
+//! const-asserted ≤ the 10/s ceiling in `constants.rs`. Every 429 is
+//! counted + its shape captured (timestamp, endpoint, Retry-After
+//! presence, sanitized body) — the live-probe (e) requirement.
+//!
+//! ## Pre-boundary warm-up (config `[groww_rest_burst] warm_up`)
+//! At minute boundary − 4 s the leg sends ONE unauthenticated GET on its
+//! own client (3 s-bounded, response discarded) so an idle-closed TLS/H2
+//! connection is re-established before the critical window — see
+//! `crate::groww_rest_burst::send_warmup_get` for the no-token rationale.
 //!
 //! ## Token (the minter lock)
 //! The shared Groww access token is read READ-ONLY from SSM via the
@@ -113,8 +128,8 @@ use tracing::{error, info, warn};
 use tickvault_common::config::QuestDbConfig;
 use tickvault_common::constants::{
     GROWW_API_VERSION_HEADER, GROWW_API_VERSION_VALUE, GROWW_CANDLE_INTERVAL_1MIN, GROWW_DATA_DIR,
-    GROWW_HISTORICAL_CANDLES_URL, GROWW_SPOT_1M_FIRE_DELAY_MS, GROWW_SPOT_1M_MAX_BODY_BYTES,
-    GROWW_SPOT_1M_REQUEST_TIMEOUT_SECS, GROWW_SPOT_1M_RETRY_OFFSETS_MS,
+    GROWW_HISTORICAL_CANDLES_URL, GROWW_REST_RUNG_JITTER_STEP_MS, GROWW_REST_WARMUP_LEAD_SECS,
+    GROWW_SPOT_1M_MAX_BODY_BYTES, GROWW_SPOT_1M_REQUEST_TIMEOUT_MS, GROWW_SPOT_1M_RETRY_OFFSETS_MS,
     GROWW_SPOT_1M_SYMBOL_BUDGET_SECS, GROWW_SPOT_1M_SYMBOLS, GROWW_SPOT_1M_TOKEN_REREAD_FLOOR_SECS,
     GROWW_SPOT_1M_VIX_SYMBOL, IST_UTC_OFFSET_SECONDS, SECONDS_PER_DAY,
     SPOT_1M_REST_FIRST_FIRE_SECS_OF_DAY_IST, SPOT_1M_REST_LAST_FIRE_SECS_OF_DAY_IST,
@@ -139,6 +154,13 @@ use tickvault_storage::spot_1m_rest_persistence::{
 };
 
 use crate::dhan_intraday_parse::MinuteCandle;
+// The 2026-07-14 burst auto-ladder: shared tier/demotion state, the
+// tier-dependent wave delay + stagger schedule, and the pre-boundary
+// warm-up sender.
+use crate::groww_rest_burst::{
+    GrowwRestBurstState, intra_wave_stagger_ms, send_warmup_get, spot_wave_fire_delay_ms,
+    wave_sleep_from_now_ms,
+};
 // The session-boundary scheduling primitives + edge tracker + body-cap
 // helpers are REUSED from the Dhan spot leg (they are NSE-session facts and
 // pure state machines — the option_chain_1m_boot precedent).
@@ -185,14 +207,12 @@ pub struct GrowwSpot1mTaskParams {
     pub calendar: Arc<TradingCalendar>,
     /// QuestDB target for the `spot_1m_rest` + `rest_fetch_audit` tables.
     pub questdb: QuestDbConfig,
-    /// Chain-leg sequencing signal (PR-3): the boundary seconds-of-day this
-    /// leg just finished firing, published UNCONDITIONALLY at the END of
-    /// every fire — success OR failure — via `send_replace` (never errors;
-    /// the Dhan seam's exact semantics: the chain must never block on a
-    /// failing spot leg, and its own fallback timer covers a dead/disabled
-    /// one). `None` when the chain leg is disabled — zero publishes, the
-    /// loop stays byte-identical to PR-2.
-    pub minute_done_tx: Option<tokio::sync::watch::Sender<Option<u32>>>,
+    /// The shared 2026-07-14 burst auto-ladder state (tier + session
+    /// demotion flag + warm-up toggle) — one `Arc` across the spot, chain
+    /// and contract legs so a 429 on ANY leg demotes them all. (The PR-3
+    /// spot→chain minute-done signal was RETIRED by the auto-ladder — the
+    /// chain leg fires on its own minute-boundary timer.)
+    pub burst: Arc<GrowwRestBurstState>,
 }
 
 // ---------------------------------------------------------------------------
@@ -888,6 +908,22 @@ fn groww_retry_sleep_deltas_ms() -> [u64; 4] {
     ]
 }
 
+/// The sleep before ladder attempt `attempt` (1-based rung index), with
+/// the HIGH-1 (2026-07-14) per-target rung jitter folded in: the jitter
+/// is added ONCE, before the FIRST rung, which shifts the target's
+/// ENTIRE rung schedule by `rung_jitter_ms` (rung k lands at
+/// `offset_k + jitter` — the Dhan-leg slot-jitter precedent), so the 4
+/// concurrent targets never re-poll in lockstep on a correlated
+/// vendor-lag minute. Applied in ALL tiers. Pure.
+fn rung_sleep_delta_ms(deltas: &[u64; 4], attempt: usize, rung_jitter_ms: u64) -> u64 {
+    let base = deltas[attempt - 1];
+    if attempt == 1 {
+        base.saturating_add(rung_jitter_ms)
+    } else {
+        base
+    }
+}
+
 /// `true` when an SSM re-read of the shared token is allowed — the
 /// token-minter lock's ≥60 s pacing (never hammer SSM on a 401 storm;
 /// NEVER mint). A never-read cache is always allowed. Pure.
@@ -1282,6 +1318,7 @@ async fn fetch_minute_with_ladder(
     target_minute_ist_nanos: i64,
     backfill_minute_ist_nanos: Option<i64>,
     minute_close_ms_of_day: i64,
+    rung_jitter_ms: u64,
 ) -> (SymbolFetchOutcome, LadderForensics) {
     let deltas = groww_retry_sleep_deltas_ms();
     let mut last_error: Option<String> = None;
@@ -1296,7 +1333,12 @@ async fn fetch_minute_with_ladder(
     };
     for attempt in 0..=deltas.len() {
         if attempt > 0 {
-            tokio::time::sleep(Duration::from_millis(deltas[attempt - 1])).await;
+            tokio::time::sleep(Duration::from_millis(rung_sleep_delta_ms(
+                &deltas,
+                attempt,
+                rung_jitter_ms,
+            )))
+            .await;
         }
         let started = std::time::Instant::now();
         let result = groww_fetch_once(client, url, query, token).await;
@@ -1420,6 +1462,7 @@ async fn fetch_minute_bounded(
     target_minute_ist_nanos: i64,
     backfill_minute_ist_nanos: Option<i64>,
     minute_close_ms_of_day: i64,
+    rung_jitter_ms: u64,
 ) -> (SymbolFetchOutcome, LadderForensics) {
     match tokio::time::timeout(
         Duration::from_secs(GROWW_SPOT_1M_SYMBOL_BUDGET_SECS),
@@ -1431,6 +1474,7 @@ async fn fetch_minute_bounded(
             target_minute_ist_nanos,
             backfill_minute_ist_nanos,
             minute_close_ms_of_day,
+            rung_jitter_ms,
         ),
     )
     .await
@@ -1540,40 +1584,6 @@ fn build_fetch_audit_row(
     }
 }
 
-/// Forensics rows for the targets SKIPPED after an auth-class reject
-/// short-circuited the fire (hostile round 1 item 12): no request is ever
-/// sent for them with the dead token — outcome `no_token`, class `auth`,
-/// 0/-1 sentinels (no HTTP happened). Pure — unit-tested below.
-fn build_auth_short_circuit_rows(
-    remaining: &[GrowwSpotTarget],
-    target_minute_ist_nanos: i64,
-    trading_date_nanos: i64,
-) -> Vec<RestFetchAuditRow> {
-    let forensics = LadderForensics {
-        attempts: 0,
-        rate_limited_count: 0,
-        final_http_status: 0,
-        final_latency_ms: -1,
-        error_class: "auth",
-        auth_rejected: true,
-    };
-    remaining
-        .iter()
-        .map(|target| {
-            build_fetch_audit_row(
-                target_minute_ist_nanos,
-                trading_date_nanos,
-                target.security_id,
-                target.symbol,
-                &forensics,
-                RestFetchOutcome::NoToken,
-                -1,
-                "auth",
-            )
-        })
-        .collect()
-}
-
 /// Best-effort forensics append: a failure logs (coded) + counts and
 /// RETURNS — the fetch loop, the verdict and the failure edge are never
 /// affected by the forensics leg.
@@ -1630,7 +1640,7 @@ pub async fn run_groww_spot_1m(params: GrowwSpot1mTaskParams) {
     // the exact TLS/resolver churn HTTP-CLIENT-01 §0 condemns); NEVER a
     // `Client::new()` panic fallback.
     let client = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(GROWW_SPOT_1M_REQUEST_TIMEOUT_SECS))
+        .timeout(Duration::from_millis(GROWW_SPOT_1M_REQUEST_TIMEOUT_MS))
         .redirect(reqwest::redirect::Policy::none())
         .build()
     {
@@ -1675,10 +1685,12 @@ pub async fn run_groww_spot_1m(params: GrowwSpot1mTaskParams) {
     let mut first_covered: Option<i64> = None;
     info!(
         core_symbols = GROWW_SPOT_1M_SYMBOLS.len(),
+        tier = params.burst.effective_tier().as_str(),
+        warm_up = params.burst.warm_up_enabled(),
         "groww_spot_1m: per-minute fetch loop armed (fires each minute close \
-         09:16:00-15:30:00 IST, ~0.3-1.3s after the boundary; sequential \
-         target pacing; INDIA VIX joins as the 4th target once \
-         runtime-resolved — 2026-07-13 operator scope)"
+         09:16:00-15:30:00 IST as ONE concurrent wave at the tier delay — \
+         2026-07-14 burst auto-ladder; INDIA VIX joins as the 4th target \
+         once runtime-resolved — 2026-07-13 operator scope)"
     );
 
     loop {
@@ -1715,9 +1727,52 @@ pub async fn run_groww_spot_1m(params: GrowwSpot1mTaskParams) {
             .await;
             return;
         };
-        let sleep_ms =
-            u64::from(fire.saturating_sub(now)).saturating_mul(1_000) + GROWW_SPOT_1M_FIRE_DELAY_MS;
-        tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
+        // 2026-07-14 auto-ladder: the spot wave fires at the TIER delay
+        // (two_wave: close+1,350 ms — more than a rolling second after the
+        // chain wave; seven_concurrent: close+300 ms). The optional
+        // pre-boundary warm-up GET (boundary−4 s, 3 s-bounded,
+        // unauthenticated — see `send_warmup_get`) re-establishes an
+        // idle-closed TLS connection before the critical window.
+        // CRITICAL-1 (2026-07-14 fix round): EVERY wake instant — the
+        // warm-up lead AND the wave itself — is computed from the
+        // MILLISECOND clock (`wave_sleep_from_now_ms`), never by summing
+        // a whole-second boundary gap with the delay: the pre-fix else
+        // branch woke at `fire + frac(now) + delay`, and the two legs'
+        // independent fractional offsets could collapse the load-bearing
+        // 1,050 ms wave separation to ~51 ms.
+        let wave_delay_ms = spot_wave_fire_delay_ms(params.burst.effective_tier());
+        let warmup_lead_ms = GROWW_REST_WARMUP_LEAD_SECS.saturating_mul(1_000);
+        let warmup_sleep_ms = wave_sleep_from_now_ms(
+            fire,
+            -i64::try_from(warmup_lead_ms).unwrap_or(0),
+            ist_millis_of_day_now(),
+        );
+        if params.burst.warm_up_enabled() && warmup_sleep_ms > 0 {
+            tokio::time::sleep(Duration::from_millis(warmup_sleep_ms)).await;
+            if let Some(first) = targets.first() {
+                let warmup_query = groww_candles_query(
+                    &first.groww_symbol,
+                    &first.exchange,
+                    &first.segment,
+                    iter_date,
+                );
+                send_warmup_get(
+                    &client,
+                    GROWW_HISTORICAL_CANDLES_URL,
+                    &warmup_query,
+                    "spot_1m",
+                )
+                .await;
+            }
+        }
+        let remaining_ms = wave_sleep_from_now_ms(
+            fire,
+            i64::try_from(wave_delay_ms).unwrap_or(0),
+            ist_millis_of_day_now(),
+        );
+        if remaining_ms > 0 {
+            tokio::time::sleep(Duration::from_millis(remaining_ms)).await;
+        }
 
         // Staleness gate: a suspend / clock step can wake us far past the
         // boundary. Skip + recompute; every boundary that elapsed while
@@ -1768,13 +1823,6 @@ pub async fn run_groww_spot_1m(params: GrowwSpot1mTaskParams) {
         )
         .await;
         last_fired = Some(fire);
-        // Chain-leg sequencing (PR-3): publish this fire's boundary
-        // UNCONDITIONALLY — success OR failure (the chain must never block
-        // on a failing spot leg; the Dhan seam's semantics). `send_replace`
-        // never errors; no receiver = no cost.
-        if let Some(tx) = &params.minute_done_tx {
-            tx.send_replace(Some(fire));
-        }
         // H2 overrun accounting: boundaries that fully elapsed DURING the
         // fire can never be fetched — count them loudly + feed the edge.
         let after = ist_secs_of_day_now();
@@ -1961,8 +2009,16 @@ async fn fire_one_minute(
     let mut confirmed_bars: Vec<crate::rest_candle_fold::ConfirmedBar> = Vec::new();
 
     if let Some(token) = token_cache.ensure_token().await {
+        // 2026-07-14 auto-ladder: the WAVE — all targets fetch
+        // CONCURRENTLY (JoinSet; each task owns cheap handle clones), a
+        // demoted two_wave session staggers slots by 350 ms. The 429
+        // demotion + tier counter are recorded from the collected
+        // forensics below.
+        let tier = params.burst.effective_tier();
+        metrics::counter!("tv_groww_rest_burst_tier_total", "tier" => tier.as_str()).increment(1);
+        let mut wave: tokio::task::JoinSet<(usize, SymbolFetchOutcome, LadderForensics)> =
+            tokio::task::JoinSet::new();
         for (idx, target) in targets.iter().enumerate() {
-            let security_id = target.security_id;
             let query = groww_candles_query(
                 &target.groww_symbol,
                 &target.exchange,
@@ -1970,20 +2026,91 @@ async fn fire_one_minute(
                 trading_date,
             );
             let backfill_nanos = backfill_minute_nanos(
-                tracker.last_persisted(security_id),
+                tracker.last_persisted(target.security_id),
                 target_nanos,
                 session_first_nanos,
             );
-            let (outcome, forensics) = fetch_minute_bounded(
-                client,
-                GROWW_HISTORICAL_CANDLES_URL,
-                &query,
-                &token,
-                target_nanos,
-                backfill_nanos,
-                minute_close_ms,
-            )
-            .await;
+            let wave_client = client.clone();
+            let wave_token = token.clone();
+            // The sequential floor spans a whole per-target budget per
+            // slot (review MEDIUM-1 2026-07-14).
+            let stagger_ms =
+                intra_wave_stagger_ms(tier, idx, GROWW_SPOT_1M_SYMBOL_BUDGET_SECS * 1_000);
+            // HIGH-1 (2026-07-14): deterministic per-target rung jitter
+            // in ALL tiers — slot j shifts its rung schedule by j×150 ms
+            // so correlated vendor-lag re-polls never fire in lockstep.
+            let rung_jitter_ms = (idx as u64).saturating_mul(GROWW_REST_RUNG_JITTER_STEP_MS);
+            wave.spawn(async move {
+                if stagger_ms > 0 {
+                    tokio::time::sleep(Duration::from_millis(stagger_ms)).await;
+                }
+                let (outcome, forensics) = fetch_minute_bounded(
+                    &wave_client,
+                    GROWW_HISTORICAL_CANDLES_URL,
+                    &query,
+                    &wave_token,
+                    target_nanos,
+                    backfill_nanos,
+                    minute_close_ms,
+                    rung_jitter_ms,
+                )
+                .await;
+                (idx, outcome, forensics)
+            });
+        }
+        // Collect the wave back into TARGET ORDER so the persist / audit
+        // / verdict pipeline below stays deterministic.
+        let mut results: Vec<Option<(SymbolFetchOutcome, LadderForensics)>> =
+            (0..targets.len()).map(|_| None).collect();
+        while let Some(joined) = wave.join_next().await {
+            match joined {
+                Ok((idx, outcome, forensics)) => {
+                    if let Some(slot) = results.get_mut(idx) {
+                        *slot = Some((outcome, forensics));
+                    }
+                }
+                Err(join_err) => {
+                    // Unwind builds only (release aborts on panic): the
+                    // lost slot stays None and is synthesized as a Failed
+                    // outcome below — never a silent missing target.
+                    error!(
+                        code = ErrorCode::Spot1m01FetchDegraded.code_str(),
+                        stage = "wave_task_failed",
+                        feed = SPOT_1M_REST_FEED_GROWW,
+                        ?join_err,
+                        "SPOT1M-01: a wave fetch task failed to join — its \
+                         target counts as failed for this minute"
+                    );
+                }
+            }
+        }
+        let mut any_auth_rejected = false;
+        let mut any_rate_limited = false;
+        for (idx, target) in targets.iter().enumerate() {
+            let security_id = target.security_id;
+            let (outcome, forensics) =
+                results
+                    .get_mut(idx)
+                    .and_then(Option::take)
+                    .unwrap_or_else(|| {
+                        (
+                            SymbolFetchOutcome::Failed {
+                                reason: "wave fetch task failed to join".to_string(),
+                                ga_code: None,
+                                backfill_candle: None,
+                            },
+                            LadderForensics {
+                                attempts: 0,
+                                rate_limited_count: 0,
+                                final_http_status: 0,
+                                final_latency_ms: -1,
+                                error_class: "task_failed",
+                                auth_rejected: false,
+                            },
+                        )
+                    });
+            any_auth_rejected |= forensics.auth_rejected;
+            any_rate_limited |= forensics.rate_limited_count > 0;
 
             // Forensics row (success AND failure) — best-effort, the
             // verdict below is computed independently. GAP-11 persist
@@ -2211,32 +2338,31 @@ async fn fire_one_minute(
                     }
                 }
             }
-            if forensics.auth_rejected {
-                // Item 12: drop the dead token NOW and short-circuit the
-                // remaining symbols for THIS fire — every further request
-                // with the same rejected token is a doomed 401 (~15 wasted
-                // rejects worst case). The next fire's ensure_token
-                // re-reads SSM at the ≥60s floor (unchanged); NEVER a mint.
-                token_cache.note_auth_rejected();
-                let remaining = &targets[idx + 1..];
-                if !remaining.is_empty() {
-                    error_count = error_count.saturating_add(remaining.len());
-                    warn!(
-                        skipped_symbols = remaining.len(),
-                        "groww_spot_1m: auth-class reject — remaining symbols \
-                         short-circuited for this fire (no doomed requests); \
-                         forensics rows still emitted"
-                    );
-                    for row in
-                        build_auth_short_circuit_rows(remaining, target_nanos, trading_date_nanos)
-                    {
-                        metrics::counter!("tv_groww_spot1m_fetch_total", "outcome" => "error")
-                            .increment(1);
-                        audit_append_best_effort(audit_writer, &row);
-                    }
-                }
-                break;
-            }
+        }
+        if any_auth_rejected {
+            // Item 12 (auto-ladder form): the wave already fired
+            // concurrently, so there are no "remaining" targets to
+            // short-circuit — each target's OWN ladder aborted on its
+            // 401/403 (≤ 4 doomed requests, not 4 × 5). Drop the dead
+            // token so the NEXT fire's ensure_token re-reads SSM at the
+            // ≥60 s floor (unchanged); NEVER a mint.
+            token_cache.note_auth_rejected();
+        }
+        if any_rate_limited && params.burst.note_rate_limited() {
+            // The session's DEMOTION EDGE (exactly once): the burst tier
+            // steps down for every subsequent minute — seven_concurrent →
+            // two_wave, two_wave → staggered two_wave. Boot restores the
+            // configured tier.
+            warn!(
+                code = ErrorCode::Spot1m01FetchDegraded.code_str(),
+                stage = "burst_demoted",
+                feed = SPOT_1M_REST_FEED_GROWW,
+                minute = %minute_label,
+                demoted_to = params.burst.effective_tier().as_str(),
+                "SPOT1M-01: HTTP 429 on the Groww spot wave — burst tier \
+                 auto-demoted for the rest of the session (restart restores \
+                 the configured tier)"
+            );
         }
         let flush_result = writer.flush();
         if let Err(err) = &flush_result {
@@ -3488,6 +3614,27 @@ mod tests {
         }
     }
 
+    /// HIGH-1 (2026-07-14): the per-target rung jitter is added ONCE,
+    /// before the first rung, shifting the target's whole rung schedule
+    /// by `slot × 150 ms` — rung k reconstructs to `offset_k + jitter`
+    /// for every slot, and slot 0 is byte-identical to the unjittered
+    /// schedule.
+    #[test]
+    fn test_rung_sleep_delta_applies_slot_jitter_to_whole_schedule() {
+        let deltas = groww_retry_sleep_deltas_ms();
+        for slot in 0..GROWW_SPOT_1M_SYMBOLS.len() as u64 + 1 {
+            let jitter = slot * GROWW_REST_RUNG_JITTER_STEP_MS;
+            let mut cumulative = 0u64;
+            for (attempt, offset) in (1..=deltas.len()).zip(GROWW_SPOT_1M_RETRY_OFFSETS_MS.iter()) {
+                cumulative += rung_sleep_delta_ms(&deltas, attempt, jitter);
+                assert_eq!(cumulative, *offset + jitter);
+            }
+        }
+        // Slot 0 (jitter 0) reproduces the raw deltas exactly.
+        assert_eq!(rung_sleep_delta_ms(&deltas, 1, 0), deltas[0]);
+        assert_eq!(rung_sleep_delta_ms(&deltas, 2, 0), deltas[1]);
+    }
+
     #[test]
     fn test_should_reread_token_respects_60s_floor() {
         // Never read → always allowed.
@@ -3796,31 +3943,6 @@ mod tests {
         }
     }
 
-    /// Item 12 (fire-level): the symbols skipped after an auth reject get
-    /// `no_token`/`auth` forensics rows with 0/-1 sentinels — never a
-    /// doomed request, never a silent skip.
-    #[test]
-    fn test_build_auth_short_circuit_rows_names_remaining_symbols() {
-        // 2026-07-13: the short-circuit slice is target-typed now, so a
-        // resolved INDIA VIX target is skipped + forensics-rowed exactly
-        // like the core symbols.
-        let targets = core_spot_targets();
-        let rows = build_auth_short_circuit_rows(&targets[1..], 900, 0);
-        assert_eq!(rows.len(), 2, "two targets remain after the first");
-        for (row, target) in rows.iter().zip(&targets[1..]) {
-            assert_eq!(row.outcome, RestFetchOutcome::NoToken);
-            assert_eq!(row.error_class, "auth");
-            assert_eq!(row.final_http_status, 0, "no HTTP happened");
-            assert_eq!(row.attempts, 0);
-            assert_eq!(row.fetch_latency_ms, -1);
-            assert_eq!(row.close_to_data_ms, -1);
-            assert_eq!(row.ts_ist_nanos, 900);
-            assert_eq!(row.security_id, target.security_id);
-            assert_eq!(row.symbol, target.symbol);
-        }
-        assert!(build_auth_short_circuit_rows(&[], 900, 0).is_empty());
-    }
-
     /// Spawn a one-response-per-connection mock HTTP server; returns the
     /// candles URL pointing at it.
     async fn spawn_mock_candles_server(response: &'static str) -> String {
@@ -3862,7 +3984,7 @@ mod tests {
         let query = groww_candles_query("NSE-NIFTY", "NSE", "CASH", date);
         let token = SecretString::from("test-token");
         let (outcome, forensics) =
-            fetch_minute_with_ladder(&client, &url, &query, &token, 900, None, 0).await;
+            fetch_minute_with_ladder(&client, &url, &query, &token, 900, None, 0, 0).await;
         assert_eq!(
             forensics.attempts, 1,
             "auth reject must abort the ladder on the first rung"
@@ -3890,7 +4012,7 @@ mod tests {
         let query = groww_candles_query("NSE-NIFTY", "NSE", "CASH", date);
         let token = SecretString::from("test-token");
         let (outcome, forensics) =
-            fetch_minute_with_ladder(&client, &url, &query, &token, 900, None, 0).await;
+            fetch_minute_with_ladder(&client, &url, &query, &token, 900, None, 0, 0).await;
         assert_eq!(
             forensics.attempts,
             GROWW_SPOT_1M_RETRY_OFFSETS_MS.len() as u32 + 1,
@@ -3958,9 +4080,12 @@ mod tests {
                 pg_port: 1,
                 ilp_port: 1,
             },
-            // PR-3 rebase reconciliation: the chain leg's minute-done
-            // sequencing sender — None in these fixtures (chain off).
-            minute_done_tx: None,
+            // 2026-07-14 auto-ladder: the shared burst state — the
+            // rate-safe default shape, warm-up off in fixtures.
+            burst: GrowwRestBurstState::new(
+                tickvault_common::config::GrowwRestBurstTier::TwoWave,
+                false,
+            ),
         }
     }
 
@@ -4165,6 +4290,7 @@ mod tests {
             target_nanos,
             Some(backfill_nanos),
             0,
+            0,
         )
         .await;
         assert_eq!(forensics.attempts, 1, "found on the first rung");
@@ -4190,6 +4316,7 @@ mod tests {
             &token,
             target_nanos,
             Some(backfill_nanos),
+            0,
             0,
         )
         .await;

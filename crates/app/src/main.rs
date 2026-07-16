@@ -3585,17 +3585,18 @@ fn spawn_groww_spot_1m_leg(
     notifier: &std::sync::Arc<NotificationService>,
     trading_calendar: &std::sync::Arc<TradingCalendar>,
 ) {
-    // PR-3 sequencing: the spot→chain minute-done watch channel exists
-    // ONLY when BOTH Groww REST legs are enabled — chain-off keeps the
-    // spot leg byte-identical to PR-2 (no sender, no publishes; the Dhan
-    // seam's precedent).
+    // 2026-07-14 auto-ladder (operator approval — the two-wave / seven
+    // burst tiers): the spot→chain sequencing channel is RETIRED — each
+    // Groww REST leg fires on its OWN minute-boundary timer; the shared
+    // session-scoped burst state below carries the configured tier + the
+    // 429 auto-demote latch across ALL Groww REST legs (one pooled Groww
+    // rate bucket ⇒ one demotion signal). Boot resets to the configured
+    // tier by construction (fresh state per process).
     let chain_enabled = config.groww_option_chain_1m.enabled;
-    let (minute_done_tx, spot_minute_done) = if config.groww_spot_1m.enabled && chain_enabled {
-        let (tx, rx) = tokio::sync::watch::channel::<Option<u32>>(None);
-        (Some(tx), Some(rx))
-    } else {
-        (None, None)
-    };
+    let burst = tickvault_app::groww_rest_burst::GrowwRestBurstState::new(
+        config.groww_rest_burst.tier,
+        config.groww_rest_burst.warm_up,
+    );
     // PR-4 sequencing + selection handoff: the chain→contract channel +
     // anchor store exist ONLY when BOTH legs are on (contract-off keeps
     // the chain leg byte-identical to PR-3). The contract leg DEPENDS on
@@ -3629,21 +3630,24 @@ fn spawn_groww_spot_1m_leg(
                     notifier: notifier.clone(),
                     calendar: std::sync::Arc::clone(trading_calendar),
                     questdb: config.questdb.clone(),
-                    minute_done_tx,
+                    burst: std::sync::Arc::clone(&burst),
                 },
             );
         info!(
+            tier = config.groww_rest_burst.tier.as_str(),
             "groww_spot_1m: Groww per-minute spot 1m REST leg spawned \
-             (fires each minute close 09:16:00-15:30:00 IST; sequential \
-             symbol pacing)"
+             (fires each minute close 09:16:00-15:30:00 IST; concurrent \
+             spot wave per the configured burst tier)"
         );
     } else {
         info!("groww_spot_1m: disabled by config — Groww per-minute spot fetch not spawned");
     }
-    // Groww per-minute option-chain leg (PR-3): sequenced after the spot
-    // fire via the watch signal + fallback timer; DEFAULT-OFF pending the
-    // first live probe — the probe-and-report path runs instead while
-    // disabled (one bounded chain call per underlying, Info verdict).
+    // Groww per-minute option-chain leg: fires on its OWN minute-boundary
+    // timer (2026-07-14 auto-ladder — the spot→chain sequencing wait is
+    // retired); concurrent underlying wave per the shared burst tier.
+    // DEFAULT-OFF pending the first live probe — the probe-and-report
+    // path runs instead while disabled (one bounded chain call per
+    // underlying, Info verdict).
     if chain_enabled {
         let _groww_chain1m_supervisor =
             tickvault_app::groww_option_chain_1m_boot::spawn_supervised_groww_chain_1m(
@@ -3651,15 +3655,16 @@ fn spawn_groww_spot_1m_leg(
                     notifier: notifier.clone(),
                     calendar: std::sync::Arc::clone(trading_calendar),
                     questdb: config.questdb.clone(),
-                    spot_minute_done,
+                    burst: std::sync::Arc::clone(&burst),
                     minute_done_tx: chain_minute_done_tx,
                     anchor_store: contract_anchor_store.clone(),
                 },
             );
         info!(
+            tier = config.groww_rest_burst.tier.as_str(),
             "groww_chain_1m: Groww per-minute option-chain leg spawned \
-             (fires each minute close right after the Groww spot fetch; \
-             sequential underlying pacing)"
+             (fires each minute close on its own timer; concurrent \
+             underlying wave per the configured burst tier)"
         );
         // Groww per-contract 1m leg (PR-4, the fill-model leg): sequenced
         // after the chain fire via the watch signal + fallback timer;
@@ -3675,6 +3680,7 @@ fn spawn_groww_spot_1m_leg(
                         chain_minute_done: chain_minute_done_rx,
                         anchor_store: contract_anchor_store,
                         strikes_each_side: config.groww_contract_1m.strikes_each_side,
+                        burst: std::sync::Arc::clone(&burst),
                     },
                 );
             info!(
@@ -3696,7 +3702,7 @@ fn spawn_groww_spot_1m_leg(
                     notifier: notifier.clone(),
                     calendar: std::sync::Arc::clone(trading_calendar),
                     questdb: config.questdb.clone(),
-                    spot_minute_done: None,
+                    burst: std::sync::Arc::clone(&burst),
                     minute_done_tx: None,
                     anchor_store: None,
                 },
@@ -3708,6 +3714,23 @@ fn spawn_groww_spot_1m_leg(
         );
     } else {
         info!("groww_chain_1m: disabled by config (probe off) — nothing spawned");
+    }
+    // 2026-07-14 off-hours rate probe (env-gated, DEFAULT OFF): arm with
+    // TICKVAULT_GROWW_RATE_PROBE=1 on an off-hours run to measure
+    // Groww's real burst tolerance (4→6→8→11 req/s steps). Refused
+    // inside the [08:30, 16:00) IST wall-clock blackout on ANY day
+    // (SECURITY-MEDIUM 2026-07-14 — no calendar dependency, so a stale
+    // holiday list can never fire the burst mid-session); the operator
+    // must also coordinate the run with BruteX's nightly bulk window
+    // (§9.7). Results are structured logs + counters only — NO data
+    // tables.
+    if std::env::var(tickvault_app::groww_rate_probe::GROWW_RATE_PROBE_ENV).as_deref() == Ok("1") {
+        tokio::spawn(tickvault_app::groww_rate_probe::run_groww_rate_probe());
+        info!(
+            "groww_rate_probe: armed via TICKVAULT_GROWW_RATE_PROBE=1 — \
+             escalating off-hours burst probe spawned (refuses to run \
+             inside the [08:30, 16:00) IST wall-clock blackout window)"
+        );
     }
 }
 

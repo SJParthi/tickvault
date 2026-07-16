@@ -458,7 +458,7 @@ impl DailyLagHistogram {
             .buckets
             .iter()
             .map(|b| b.load(Ordering::Relaxed))
-            .collect();
+            .collect(); // APPROVED: cold path — once per 15:45 scoreboard run (O(96)), never per-tick
         let total: u64 = counts.iter().sum();
         if (usize::try_from(total).unwrap_or(usize::MAX)) < MIN_LAG_SAMPLES {
             return None;

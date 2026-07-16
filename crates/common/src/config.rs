@@ -183,6 +183,19 @@ pub struct ApplicationConfig {
     /// section ⇒ DISABLED (fail-safe default off).
     #[serde(default)]
     pub groww_contract_1m: GrowwContract1mConfig,
+    /// `[groww_rest_burst]` — the 2026-07-14 Groww REST burst auto-ladder
+    /// (operator approval "approved and go ahead with the recommendation";
+    /// `no-rest-except-live-feed-2026-06-27.md` §9.7): which burst tier the
+    /// per-minute Groww REST legs fire in (`two_wave` default /
+    /// `seven_concurrent` probe-gated) + the pre-boundary TLS warm-up
+    /// toggle. Absent section ⇒ `two_wave` + warm-up off — rate-safe
+    /// because the wave instants are computed from the millisecond clock
+    /// (`wave_sleep_from_now_ms`), so the > 1 s two_wave separation holds
+    /// with or without the warm-up recompute (LOW-1 wording fix
+    /// 2026-07-14; the pre-CRITICAL-1 whole-second else-branch could
+    /// collapse it).
+    #[serde(default)]
+    pub groww_rest_burst: GrowwRestBurstConfig,
     /// `[groww_universe]` — process-global daily Groww watch-set +
     /// shared-master rider (2026-07-15 Groww live-feed retirement re-home of
     /// the activation watcher's daily build loop): once per IST day, build +
@@ -1089,6 +1102,37 @@ impl Default for GrowwContract1mConfig {
     }
 }
 
+/// The Groww REST burst tier (2026-07-14 auto-ladder — operator approval
+/// "approved and go ahead with the recommendation", relayed via the
+/// coordinator session; contract `no-rest-except-live-feed-2026-06-27.md`
+/// §9.7). Selects how the per-minute Groww spot + chain waves fire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum GrowwRestBurstTier {
+    /// The SHIPPED default: 3 chain requests concurrently at minute close
+    /// + 300 ms, 4 spot requests concurrently at close + 1,350 ms — the
+    /// > 1 s wave separation keeps every rolling second single-wave
+    /// (boundary burst ≤ 4 req/s).
+    #[default]
+    TwoWave,
+    /// The operator-preferred burst — all 7 requests concurrently at
+    /// close + 300 ms. PROBE-GATED: promotion requires the off-hours rate
+    /// probe verdict + a fresh dated note in the §9.7 rule file; a live
+    /// 429 auto-demotes the session back to `two_wave`.
+    SevenConcurrent,
+}
+
+impl GrowwRestBurstTier {
+    /// Static metric-label value (`tv_groww_rest_burst_tier_total{tier}`).
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::TwoWave => "two_wave",
+            Self::SevenConcurrent => "seven_concurrent",
+        }
+    }
+}
+
 /// `[groww_orders]` — Groww ORDER-SIDE build gate (operator authorization
 /// 2026-07-14; `.claude/rules/project/groww-second-feed-scope-2026-06-19.md`
 /// §39, `.claude/rules/project/no-rest-except-live-feed-2026-06-27.md` §10).
@@ -1293,6 +1337,24 @@ impl Default for DhanMarginGateConfig {
             rest_self_cap_per_sec: default_margin_gate_rest_self_cap_per_sec(),
         }
     }
+}
+
+/// `[groww_rest_burst]` — burst-tier + warm-up selection for the
+/// per-minute Groww REST legs (2026-07-14 auto-ladder). Fail-safe shape:
+/// every field is `#[serde(default)]`, so an absent section (or a TOML
+/// written before this PR) means `two_wave` + warm-up OFF;
+/// `config/base.toml` opts warm-up in explicitly.
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+pub struct GrowwRestBurstConfig {
+    /// The configured burst tier (boot value — a live 429 demotes the
+    /// SESSION, never this config; restart restores it).
+    #[serde(default)]
+    pub tier: GrowwRestBurstTier,
+    /// Pre-boundary TLS warm-up: one unauthenticated GET per leg client at
+    /// minute boundary − 4 s (3 s-bounded, response discarded). Default
+    /// OFF (fail-safe); base.toml turns it on.
+    #[serde(default)]
+    pub warm_up: bool,
 }
 
 impl DhanMarginGateConfig {
@@ -3269,6 +3331,7 @@ mod tests {
             option_chain_1m: OptionChain1mConfig::default(),
             groww_spot_1m: GrowwSpot1mConfig::default(),
             groww_option_chain_1m: GrowwOptionChain1mConfig::default(),
+            groww_rest_burst: GrowwRestBurstConfig::default(),
             tf_consistency: TfConsistencyConfig::default(),
             rest_candle_fold: RestCandleFoldConfig::default(),
             groww_contract_1m: GrowwContract1mConfig::default(),
@@ -4976,6 +5039,73 @@ mod tests {
             .expect("explicit values must round-trip");
         assert!(on.groww_option_chain_1m.enabled);
         assert!(!on.groww_option_chain_1m.probe_and_report);
+    }
+
+    /// 2026-07-14 Groww REST burst auto-ladder: the `[groww_rest_burst]`
+    /// section is fail-safe — absent/empty sections default to the
+    /// rate-safe `two_wave` tier with warm-up OFF; explicit values (incl.
+    /// the probe-gated `seven_concurrent` flip shape) round-trip; an
+    /// unknown tier string is a loud config error, never a silent default.
+    #[test]
+    fn test_groww_rest_burst_config_defaults_and_round_trips() {
+        use figment::Figment;
+        use figment::providers::{Format, Toml};
+
+        let d = GrowwRestBurstConfig::default();
+        assert_eq!(d.tier, GrowwRestBurstTier::TwoWave);
+        assert!(!d.warm_up, "warm-up must default OFF (base.toml opts in)");
+        assert_eq!(GrowwRestBurstTier::TwoWave.as_str(), "two_wave");
+        assert_eq!(
+            GrowwRestBurstTier::SevenConcurrent.as_str(),
+            "seven_concurrent"
+        );
+
+        #[derive(Deserialize)]
+        struct Wrapper {
+            #[serde(default)]
+            groww_rest_burst: GrowwRestBurstConfig,
+        }
+        let missing: Wrapper = Figment::new()
+            .merge(Toml::string("[other]\nx = 1\n"))
+            .extract()
+            .expect("missing [groww_rest_burst] must default, not error");
+        assert_eq!(missing.groww_rest_burst.tier, GrowwRestBurstTier::TwoWave);
+        assert!(!missing.groww_rest_burst.warm_up);
+        let empty: Wrapper = Figment::new()
+            .merge(Toml::string("[groww_rest_burst]\n"))
+            .extract()
+            .expect("empty [groww_rest_burst] must default, not error");
+        assert_eq!(empty.groww_rest_burst.tier, GrowwRestBurstTier::TwoWave);
+        assert!(!empty.groww_rest_burst.warm_up);
+        let base_shape: Wrapper = Figment::new()
+            .merge(Toml::string(
+                "[groww_rest_burst]\ntier = \"two_wave\"\nwarm_up = true\n",
+            ))
+            .extract()
+            .expect("the base.toml shape must round-trip");
+        assert_eq!(
+            base_shape.groww_rest_burst.tier,
+            GrowwRestBurstTier::TwoWave
+        );
+        assert!(base_shape.groww_rest_burst.warm_up);
+        let seven: Wrapper = Figment::new()
+            .merge(Toml::string(
+                "[groww_rest_burst]\ntier = \"seven_concurrent\"\n",
+            ))
+            .extract()
+            .expect("the probe-gated promotion shape must round-trip");
+        assert_eq!(
+            seven.groww_rest_burst.tier,
+            GrowwRestBurstTier::SevenConcurrent
+        );
+        // A typo'd tier is refused loudly — never silently two_wave.
+        let bad: Result<Wrapper, _> = Figment::new()
+            .merge(Toml::string("[groww_rest_burst]\ntier = \"seven\"\n"))
+            .extract();
+        assert!(
+            bad.is_err(),
+            "an unknown tier string must be a config error"
+        );
     }
 
     /// Daily timeframe-consistency verifier (operator 2026-07-13): the
