@@ -44,7 +44,8 @@ use super::types::{
 // ---------------------------------------------------------------------------
 
 /// Groww API base URL (`16` §1 header).
-// moves to tickvault-common GROWW_ORDER_* in ORD-PR-1
+// moves to tickvault-common GROWW_ORDER_* in ORD-PR-1 (whose twin already carries its own marker)
+// APPROVED: single static base-url source for the order transport until ORD-PR-1
 pub(crate) const GROWW_ORDER_API_BASE_URL: &str = "https://api.groww.in";
 
 const PATH_CREATE: &str = "/v1/order/create";
@@ -332,7 +333,7 @@ fn is_bidi_or_zero_width(c: char) -> bool {
 ///
 /// Native `async fn` in a trait (edition 2024) — the executor holds a concrete
 /// `T: OrderTransport` (no `dyn`), so no `Send` future bound is imposed here.
-#[allow(async_fn_in_trait)] // executor is generic (no dyn); futures awaited inline.
+#[allow(async_fn_in_trait)] // APPROVED: executor is generic (no dyn); futures awaited inline.
 pub trait OrderTransport {
     /// `POST /v1/order/create`.
     async fn create_order(

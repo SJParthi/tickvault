@@ -411,7 +411,7 @@ impl VerifyFailure {
 /// (b) S3 ContentLength present AND equal to the local gzip length.
 /// (Check (c), the line-count-vs-file equivalence, is structural: the
 /// newline count was taken over the exact bytes fed to the encoder.)
-#[allow(clippy::too_many_arguments)] // pure decision fn; every input is a distinct verified fact
+#[allow(clippy::too_many_arguments)] // APPROVED: pure decision fn; every input is a distinct verified fact
 pub(crate) fn verify_archive(
     table: &str,
     partition: &str,

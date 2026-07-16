@@ -132,7 +132,7 @@ impl VolumeDeltaTracker {
     /// session boundary).
     pub fn clear_for_new_day(&self) {
         let guard = self.inner.guard();
-        let keys: Vec<TrackerKey> = self.inner.keys(&guard).copied().collect();
+        let keys: Vec<TrackerKey> = self.inner.keys(&guard).copied().collect(); // APPROVED: cold-path daily reset at IST midnight, never per-tick
         for k in keys {
             self.inner.remove(&k, &guard);
         }
