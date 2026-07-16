@@ -2418,6 +2418,19 @@ mod tests {
     }
 
     #[test]
+    fn test_day_map_len_and_current_day_accessors() {
+        let mut state = SidDayFold::new(Feed::Dhan, 13, 0);
+        assert_eq!(state.day_map_len(), 0);
+        assert_eq!(state.current_day(), None);
+        assert!(matches!(
+            state.apply_live_bar(&bar_at(0, 1.0, 1.0, 1.0, 1.0, 1)),
+            LiveBarAction::Folded(_)
+        ));
+        assert_eq!(state.day_map_len(), 1);
+        assert!(state.current_day().is_some());
+    }
+
+    #[test]
     fn test_apply_live_bar_duplicate_bar_is_noop() {
         let mut state = SidDayFold::new(Feed::Dhan, 13, 0);
         let bar = bar_at(0, 1.0, 2.0, 0.5, 1.5, 7);
