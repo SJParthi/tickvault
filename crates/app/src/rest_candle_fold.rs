@@ -112,6 +112,7 @@ use tickvault_common::error_code::ErrorCode;
 use tickvault_common::feed::Feed;
 use tickvault_common::types::SecurityId;
 use tickvault_trading::candles::{BufferedSeal, LiveCandleState, TF_COUNT, TfIndex};
+use tickvault_trading::in_mem::spot_bar_store::{RamBar, SlotKey, spot_bar_store};
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
@@ -1240,6 +1241,114 @@ struct FoldRuntime {
     exec_url: String,
 }
 
+/// PR-2 RAM residency: one sealed bucket as its 48-byte RAM bar.
+fn sealed_bucket_to_ram_bar(s: &SealedBucket) -> RamBar {
+    RamBar {
+        bucket_start_ist_secs: s.bucket.bucket_start_ist_secs,
+        open: s.bucket.open,
+        high: s.bucket.high,
+        low: s.bucket.low,
+        close: s.bucket.close,
+        volume: s.bucket.volume,
+    }
+}
+
+/// PR-2 RAM residency LIVE hook: mirror sealed buckets into the month-deep
+/// `SpotBarStore` (operator 2026-07-16 — spots month-deep in RAM for
+/// entry/exit decisions). Upsert-by-ts, so a current-day refold re-emit
+/// REPLACES the resident bar in place instead of duplicating it. No-op
+/// when `[market_ram_store]` is disabled (store not installed). Runs
+/// BEFORE the seal-channel send — RAM residency is independent of the
+/// seal-channel outcome (a dropped seal still leaves the bar readable in
+/// RAM; QuestDB heals at the next boot's catch-up).
+fn ram_store_upsert_seals(
+    feed: Feed,
+    security_id: SecurityId,
+    segment_code: u8,
+    sealed: &[SealedBucket],
+) {
+    let Some(store) = spot_bar_store() else {
+        return;
+    };
+    ram_store_upsert_seals_into(store, feed, security_id, segment_code, sealed);
+}
+
+/// Store-parameterized body of the live hook (unit-testable against a
+/// non-global store — the catch-up-equals-live equality test).
+fn ram_store_upsert_seals_into(
+    store: &tickvault_trading::in_mem::spot_bar_store::SpotBarStore,
+    feed: Feed,
+    security_id: SecurityId,
+    segment_code: u8,
+    sealed: &[SealedBucket],
+) {
+    let key = SlotKey {
+        feed,
+        security_id,
+        exchange_segment_code: segment_code,
+    };
+    for s in sealed {
+        let _ = store.append_sealed(key, s.tf, sealed_bucket_to_ram_bar(s));
+    }
+}
+
+/// PR-2 RAM residency CATCH-UP hook: record one whole refolded day's seals
+/// as per-TF blocks. The boot catch-up iterates days NEWEST→OLDEST, so a
+/// per-seal upsert would front-insert entire older days (O(ring) memmove
+/// per bar) — `record_day_block` detects the all-older-than-front shape
+/// and block-PREPENDS in O(day) instead; a resident-day repair refold
+/// falls through to per-bar upsert (replace in place). No-op when the
+/// store is not installed.
+///
+/// HONEST divergence note (PR-2 round-1): this hook records the fold
+/// OUTPUT unconditionally, while the paced seal emission alongside it can
+/// `PaceAction::GiveUp` (per-day wait budget) and drop the SAME seals from
+/// the `candles_*` write path — so RAM may transiently hold bars the
+/// candle tables dropped, until the next boot's catch-up re-folds them
+/// from the durable `spot_1m_rest` source (QuestDB remains the durable
+/// truth; the divergence is bounded to one session and self-heals).
+fn ram_store_record_day(
+    feed: Feed,
+    security_id: SecurityId,
+    segment_code: u8,
+    day_seals: &[SealedBucket],
+) {
+    let Some(store) = spot_bar_store() else {
+        return;
+    };
+    ram_store_record_day_into(store, feed, security_id, segment_code, day_seals);
+}
+
+/// Store-parameterized body of the catch-up hook (unit-testable against a
+/// non-global store — the catch-up-equals-live equality test).
+fn ram_store_record_day_into(
+    store: &tickvault_trading::in_mem::spot_bar_store::SpotBarStore,
+    feed: Feed,
+    security_id: SecurityId,
+    segment_code: u8,
+    day_seals: &[SealedBucket],
+) {
+    if day_seals.is_empty() {
+        return;
+    }
+    let key = SlotKey {
+        feed,
+        security_id,
+        exchange_segment_code: segment_code,
+    };
+    for tf in TfIndex::ALL {
+        let mut bars: Vec<RamBar> = Vec::with_capacity(day_seals.len());
+        for s in day_seals {
+            if s.tf == tf {
+                bars.push(sealed_bucket_to_ram_bar(s));
+            }
+        }
+        if !bars.is_empty() {
+            let _ = store.record_day_block(key, tf, &bars);
+        }
+    }
+}
+
 /// Emits sealed buckets into the global seal channel; counts drops loudly.
 /// Round-3 LOW: a CLOSED channel (seal-writer gone — shutdown/teardown) is
 /// a DISTINCT condition from backpressure and is labeled
@@ -1249,6 +1358,8 @@ fn emit_seals(feed: Feed, security_id: SecurityId, segment_code: u8, sealed: &[S
     if sealed.is_empty() {
         return;
     }
+    // PR-2: RAM residency mirror BEFORE the channel send (see the hook doc).
+    ram_store_upsert_seals(feed, security_id, segment_code, sealed);
     let Some(sender) = tickvault_storage::seal_writer_runner::global_seal_sender() else {
         counter!("tv_rest_candle_fold_dropped_total", "reason" => "no_seal_sender")
             .increment(sealed.len() as u64);
@@ -1534,6 +1645,10 @@ async fn refold_day(
     let mut engine = SidFoldState::new(feed, security_id, segment_code);
     let mut rows_folded = 0u64;
     let mut folded_bars: Vec<ConfirmedBar> = Vec::new();
+    // PR-2 RAM residency: the whole day's seals, recorded as per-TF blocks
+    // AFTER the fold (newest→oldest day order needs the block-prepend path).
+    // ~4 seals/bar across the 21 TFs — cold-path, bounded by the row LIMIT.
+    let mut day_seals: Vec<SealedBucket> = Vec::with_capacity(rows.len().saturating_mul(4));
     for row in &rows {
         let bar = ConfirmedBar {
             feed,
@@ -1552,6 +1667,7 @@ async fn refold_day(
                 if is_today {
                     folded_bars.push(bar);
                 }
+                day_seals.extend_from_slice(&sealed);
                 emit_seals_paced(feed, security_id, segment_code, &sealed, &mut waited_ms).await;
             }
             FoldOutcome::OutOfOrder | FoldOutcome::OutOfSession => {
@@ -1562,13 +1678,19 @@ async fn refold_day(
     counter!("tv_rest_candle_fold_catchup_rows_total", "feed" => feed.as_str())
         .increment(rows_folded);
     if is_today {
+        // PR-2: today's already-sealed buckets land in RAM here; the still-
+        // open partials seal later through the LIVE emit_seals hook.
+        ram_store_record_day(feed, security_id, segment_code, &day_seals);
         Ok(Some(TodayCatchup {
             engine,
             bars: folded_bars,
         }))
     } else {
         let sealed = engine.force_seal_open();
+        day_seals.extend_from_slice(&sealed);
         emit_seals_paced(feed, security_id, segment_code, &sealed, &mut waited_ms).await;
+        // PR-2: the whole closed day (incl. force-sealed tails) into RAM.
+        ram_store_record_day(feed, security_id, segment_code, &day_seals);
         Ok(None)
     }
 }
@@ -2158,6 +2280,47 @@ mod tests {
         assert_eq!(m5.bucket.close, 104.0);
         assert_eq!(m5.bucket.volume, 150);
         assert_eq!(m5.bucket.bucket_start_ist_secs, OPEN);
+    }
+
+    #[test]
+    fn test_ram_hook_catchup_equals_live_fold_ring() {
+        use tickvault_trading::in_mem::spot_bar_store::SpotBarStore;
+        // PR-2 equality contract: the SAME full-session bar set through the
+        // LIVE per-seal upsert hook and the CATCH-UP day-block hook must
+        // leave IDENTICAL rings (rehydration-equals-live-fold).
+        let mut bars = Vec::new();
+        for m in 0..375u32 {
+            let px = 100.0 + f64::from(m) * 0.05;
+            bars.push(bar_at(m, px, px + 0.5, px - 0.5, px + 0.1, i64::from(m)));
+        }
+        // LIVE path: per-emit upsert (the emit_seals hook semantics).
+        let live_store = SpotBarStore::new(35);
+        let mut live_engine = SidFoldState::new(Feed::Dhan, 13, 0);
+        for bar in &bars {
+            if let FoldOutcome::Folded(sealed) = live_engine.fold_bar(bar) {
+                ram_store_upsert_seals_into(&live_store, Feed::Dhan, 13, 0, &sealed);
+            }
+        }
+        // CATCH-UP path: whole-day fold, then one day-block record (the
+        // refold_day past-day shape incl. force_seal_open).
+        let catchup_store = SpotBarStore::new(35);
+        let mut catchup_engine = SidFoldState::new(Feed::Dhan, 13, 0);
+        let mut day_seals = fold_all(&mut catchup_engine, &bars);
+        day_seals.extend(catchup_engine.force_seal_open());
+        ram_store_record_day_into(&catchup_store, Feed::Dhan, 13, 0, &day_seals);
+        // Ring parity per TF (the 15:29 close bar seals everything live too,
+        // so both paths cover all 21 TFs).
+        let key = SlotKey {
+            feed: Feed::Dhan,
+            security_id: 13,
+            exchange_segment_code: 0,
+        };
+        for tf in TfIndex::ALL {
+            let live = live_store.latest_n(key, tf, 10_000);
+            let catchup = catchup_store.latest_n(key, tf, 10_000);
+            assert!(!live.is_empty(), "live ring populated for {tf:?}");
+            assert_eq!(live, catchup, "RAM ring parity live vs catch-up for {tf:?}");
+        }
     }
 
     #[test]

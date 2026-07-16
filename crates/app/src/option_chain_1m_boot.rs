@@ -694,7 +694,7 @@ pub fn publish_chain_moneyness_snapshot(
         spot_missing = cls.spot_paise == 0,
         "chain moneyness snapshot published (RAM decision surface)"
     );
-    publish_chain_snapshot(ChainMoneynessSnapshot {
+    let snapshot = ChainMoneynessSnapshot {
         feed,
         underlying,
         minute_ts_ist_nanos,
@@ -705,7 +705,19 @@ pub fn publish_chain_moneyness_snapshot(
         expiry_ist_nanos,
         spot_missing: cls.spot_paise == 0,
         rows: cls.snap_rows,
-    });
+    };
+    // PR-2 RAM residency: mirror the minute into the CURRENT-DAY chain
+    // store (operator 2026-07-16 — "option only for the current day").
+    // One clone per (feed, underlying) per minute, cold path, only when
+    // the store is installed (`[market_ram_store]` enabled). The
+    // latest-minute registry publish below is UNCHANGED and stays the
+    // moneyness decision source of truth.
+    let day_store = tickvault_core::pipeline::chain_day_store::chain_day_store();
+    let day_copy = day_store.map(|_| snapshot.clone());
+    publish_chain_snapshot(snapshot);
+    if let (Some(store), Some(copy)) = (day_store, day_copy) {
+        let _ = store.record_live(copy);
+    }
 }
 
 // ---------------------------------------------------------------------------

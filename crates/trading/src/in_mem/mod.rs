@@ -52,6 +52,7 @@ pub mod day_ohlc_tracker;
 pub mod pct_change_cache;
 pub mod prev_day_cache;
 pub mod reset_scheduler;
+pub mod spot_bar_store;
 pub mod tick_storage;
 
 pub use bar_cache::{BarCache, CompactBar, bar_cache_clear_before_threshold};

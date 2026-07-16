@@ -924,6 +924,24 @@ pub enum ErrorCode {
     /// auto-triage-safe (the degrade already happened; catch-up/refold
     /// self-heal — the operator inspects).
     RestCandleFold01Degraded,
+    /// RAMSTORE-01 (RAM residency stores, operator directive 2026-07-16 —
+    /// PR-2 of the data-completeness build) — a leg of the RAM residency
+    /// machinery DEGRADED: the chain day-store boot rehydrate `/exec` query
+    /// or parse failed (`stage="rehydrate_query"` / `"rehydrate_parse"` /
+    /// `"rehydrate_truncated"` — the LIMIT tripwire), a published chain
+    /// snapshot exceeded the per-minute row cap and was truncated loudly
+    /// (`stage="chain_truncated"`), a stale older-day chain publish was
+    /// dropped (`stage="day_drop"`), a store install was refused
+    /// (`stage="install"`), or the supervised stats/rehydrate task died and
+    /// was respawned (`stage="task_respawn"`). Every degrade is
+    /// RE-DERIVABLE: QuestDB remains the durable truth (`candles_*` +
+    /// `option_chain_1m` DEDUP rows stand) and the next boot re-fills RAM
+    /// via PR-1's catch-up + the bounded chain rehydrate — no market data
+    /// is ever lost from a RAM degrade. Cold path only; log-sink-only
+    /// delivery (no CloudWatch filter — see the runbook's delivery-boundary
+    /// paragraph). Severity::High, auto-triage-safe (the degrade already
+    /// happened; rehydrate/live-fill self-heal — the operator inspects).
+    RamStore01Degraded,
 
     // -----------------------------------------------------------------------
     // 🔷 DHAN exit-order execution layer (Cluster B, 2026-07-14).
@@ -1355,6 +1373,8 @@ impl ErrorCode {
             Self::FeedGap01EpisodeDegraded => "FEED-GAP-01",
             // REST-era multi-TF candle derivation (operator 2026-07-16)
             Self::RestCandleFold01Degraded => "FOLD-01",
+            // RAM residency stores (operator 2026-07-16, PR-2)
+            Self::RamStore01Degraded => "RAMSTORE-01",
             Self::ExitOrder01ExecutionDegraded => "EXIT-ORDER-01",
             Self::ExitVerify01Degraded => "EXIT-VERIFY-01",
             // Groww Portfolio area contract stubs (§39.3, 2026-07-14)
@@ -1563,6 +1583,14 @@ impl ErrorCode {
             // a halt (cold path; refold/catch-up are DEDUP-idempotent
             // repairs and spot_1m_rest source rows stand). LOG-SINK-ONLY.
             Self::RestCandleFold01Degraded => Severity::High,
+            // RAMSTORE-01 (RAM residency stores, operator 2026-07-16 PR-2)
+            // — a RAM-store leg degraded (chain rehydrate query/parse,
+            // row-cap truncation, stale-day drop, task respawn). High:
+            // operator eyes required — a silently-thin RAM store would
+            // undermine the operator's "believe it is in RAM" demand; never
+            // a halt (cold path; QuestDB stays the durable truth and the
+            // next boot re-fills). LOG-SINK-ONLY.
+            Self::RamStore01Degraded => Severity::High,
             // EXIT-ORDER-01 / EXIT-VERIFY-01 (Cluster B, 2026-07-14) — the
             // exit-order layer degraded / the MPP verify ladder exhausted
             // without a clean fill. High: operator eyes on every occurrence
@@ -1912,6 +1940,8 @@ impl ErrorCode {
             Self::RestCandleFold01Degraded => {
                 ".claude/rules/project/rest-candle-fold-error-codes.md"
             }
+            // RAM residency stores (operator 2026-07-16, PR-2)
+            Self::RamStore01Degraded => ".claude/rules/project/ram-store-error-codes.md",
             // 🔷 DHAN exit-order execution layer (Cluster B, 2026-07-14)
             Self::ExitOrder01ExecutionDegraded | Self::ExitVerify01Degraded => {
                 ".claude/rules/project/dhan-exit-order-lockout-2026-07-14.md"
@@ -2206,6 +2236,8 @@ impl ErrorCode {
             Self::FeedGap01EpisodeDegraded,
             // REST-era multi-TF candle derivation (operator 2026-07-16)
             Self::RestCandleFold01Degraded,
+            // RAM residency stores (operator 2026-07-16, PR-2)
+            Self::RamStore01Degraded,
             // 🔷 DHAN exit-order execution layer (Cluster B, 2026-07-14)
             Self::ExitOrder01ExecutionDegraded,
             Self::ExitVerify01Degraded,
@@ -2615,11 +2647,18 @@ mod tests {
         // log-sink-only, High, auto-triage-safe) => 155 (both 153->154
         // bumps — Cluster F + FOLD-01 — landed concurrently; mechanically
         // recounted at this merge).
+        // 2026-07-16 (RAM residency stores, PR-2 of the same directive):
+        // +1 RAMSTORE-01 (RamStore01Degraded — spot/chain RAM store
+        // degrade; log-sink-only, High, auto-triage-safe) => 156
+        // (mechanically recounted at this rebase onto main's 155).
         // 2026-07-16 (merge of origin/main into cadence-scheduler-v2):
         // + CADENCE-01/02/03 (cadence scheduler, operator directive
         // 2026-07-14) on top of main's 155 => 158, mechanically recounted
         // against the merged all() vec at this merge.
-        assert_eq!(ErrorCode::all().len(), 158);
+        // 2026-07-16 merge note: RAMSTORE-01 (this branch, 156) + main's
+        // CADENCE-01/02/03 (158) coexist — 155 base + 1 + 3 = 159,
+        // mechanically recounted against the merged all() vec.
+        assert_eq!(ErrorCode::all().len(), 159);
     }
 
     #[test]
@@ -3100,6 +3139,8 @@ mod tests {
                 || s.starts_with("TICK-CONSERVE-")
                 // Operator 2026-07-16: REST-era multi-TF candle derivation
                 || s.starts_with("FOLD-")
+                // Operator 2026-07-16 (PR-2): RAM residency stores
+                || s.starts_with("RAMSTORE-")
                 // C4 sweep (2026-07-15): the SLO- / REST-CANARY- /
                 // INSTR-FETCH- / CROSS-VERIFY-1M- / NTM-CONSTITUENCY- /
                 // PREVDAY- / DHAN-LANE- family prefixes were REMOVED from
