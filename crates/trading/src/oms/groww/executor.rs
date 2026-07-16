@@ -38,14 +38,15 @@ use secrecy::SecretString;
 use tickvault_common::constants::GROWW_ORDER_LIVE_FIRE;
 
 use super::api_client::{NullTransport, OrderTransport, SmartOrderTransport, TransportOutcome};
-use super::intent_ledger::{IntentKind, IntentLedger, IntentPhase, NewIntent};
+use super::intent_ledger::{IntentKind, IntentLedger, IntentPhase, NewIntent, SmartIntentContext};
 use super::rate_budget::{GrowwRateBudget, RateFamily};
 use super::reconcile::{EodAction, classify_eod_action};
 use super::reference_id::{IstDate, generate_reference_id};
 use super::smart_orders::{
     SmartModifyFields, SmartOrderBook, SmartOrderCreate, SmartOrderError, SmartOrderGates,
-    SmartOrderStatus, SmartReconcileReport, TrackedSmartOrder, ambiguity_stage, build_modify_body,
-    count_mutation, emit_oco01, emit_oco04, is_plausible_smart_order_id, reconcile_pass,
+    SmartOrderStatus, SmartReconcileReport, SmartTransitionOutcome, TrackedSmartOrder,
+    ambiguity_stage, build_modify_body, count_mutation, emit_oco01, emit_oco04,
+    evaluate_smart_transition, is_plausible_smart_order_id, reconcile_pass,
     validate_create_smart_order, validate_modify_fields,
 };
 use super::state::{
@@ -451,6 +452,7 @@ impl<T: OrderTransport> GrowwOrderExecutor<T> {
             mode,
             ts_ms: now_ms,
             linked_intent_id: None,
+            smart_ctx: None,
         };
         let receipt = self
             .with_ledger(move |l| l.record_intent(new, date))
@@ -923,6 +925,7 @@ impl<T: OrderTransport> GrowwOrderExecutor<T> {
             mode,
             ts_ms: now_ms,
             linked_intent_id: None,
+            smart_ctx: None,
         };
         let receipt = self
             .with_ledger(move |l| l.record_intent(new, date))
@@ -1291,8 +1294,19 @@ impl<T: OrderTransport + SmartOrderTransport> GrowwOrderExecutor<T> {
         if !self.smart_gates.smart_orders_write {
             return Err(SmartOrderError::WriteGateClosed.into());
         }
-        if self.mode == ExecutionMode::Live && !self.smart_gates.live_fire_requested {
-            return Err(SmartOrderError::WriteGateClosed.into());
+        if self.mode == ExecutionMode::Live {
+            // Defense-in-depth (adversarial round 1, finding 6): Gate 3 is
+            // re-asserted PER SEND in production builds — a Live executor can
+            // only exist via `new_live` (const-gated at construction), but
+            // the send path refuses independently anyway. `cfg(test)` keeps
+            // the mock-transport live lane exercisable.
+            #[cfg(not(test))]
+            if !tickvault_common::constants::GROWW_ORDER_LIVE_FIRE {
+                return Err(SmartOrderError::WriteGateClosed.into());
+            }
+            if !self.smart_gates.live_fire_requested {
+                return Err(SmartOrderError::WriteGateClosed.into());
+            }
         }
         Ok(())
     }
@@ -1342,6 +1356,14 @@ impl<T: OrderTransport + SmartOrderTransport> GrowwOrderExecutor<T> {
             mode,
             ts_ms: now_ms,
             linked_intent_id: None,
+            // Restart context (finding 5): segment/type/symbol/qty persisted
+            // so a future rehydration can rebuild the book + GET paths.
+            smart_ctx: Some(SmartIntentContext {
+                segment: req.segment().as_str().to_owned(),
+                smart_order_type: req.smart_order_type().as_str().to_owned(),
+                trading_symbol: req.trading_symbol().to_owned(),
+                quantity: req.quantity(),
+            }),
         };
         let receipt = self
             .with_ledger(move |l| l.record_intent(new, date))
@@ -1381,6 +1403,19 @@ impl<T: OrderTransport + SmartOrderTransport> GrowwOrderExecutor<T> {
         if !self.budget.check_mutation().is_allowed() {
             metrics::counter!("tv_groww_order_budget_denied_total", "family" => "orders")
                 .increment(1);
+            // Terminalize the write-ahead intent (finding 10): nothing was
+            // sent, so ResolvedNotLanded is provably true — a Recorded
+            // intent left open would block this order's mutation-in-flight
+            // index until restart.
+            self.append_intent(
+                &ref_id,
+                IntentPhase::ResolvedNotLanded,
+                now_ms,
+                date,
+                None,
+                Some("budget_denied".to_owned()),
+            )
+            .await?;
             return Err(ExecError::RateBudgetExceeded(RateFamily::Orders));
         }
         self.append_intent(&ref_id, IntentPhase::Sent, now_ms, date, None, None)
@@ -1391,7 +1426,12 @@ impl<T: OrderTransport + SmartOrderTransport> GrowwOrderExecutor<T> {
             .await;
         match outcome {
             TransportOutcome::Success(payload) => match payload.smart_order_id {
-                Some(order_id) if !order_id.trim().is_empty() => {
+                // Broker-returned id must be PLAUSIBLE before it enters the
+                // book / ledger / any later URL splice (adversarial round 1,
+                // finding 3) — an implausible echo is an unresolved place.
+                Some(order_id)
+                    if !order_id.trim().is_empty() && is_plausible_smart_order_id(&order_id) =>
+                {
                     self.append_intent(
                         &ref_id,
                         IntentPhase::Acked,
@@ -1407,7 +1447,13 @@ impl<T: OrderTransport + SmartOrderTransport> GrowwOrderExecutor<T> {
                     count_mutation("create", "acked");
                     Ok(PlaceResult::Accepted { order_id })
                 }
-                _ => {
+                Some(_) => {
+                    // 2xx SUCCESS with an IMPLAUSIBLE id — never adopted.
+                    metrics::counter!("tv_groww_oco_implausible_ack_id_total").increment(1);
+                    self.smart_unresolved_place(&ref_id, now_ms, date, "2xx implausible smart id")
+                        .await
+                }
+                None => {
                     // 2xx SUCCESS lacking a usable id — unresolvable (no
                     // by-reference lookup exists on this surface).
                     self.smart_unresolved_place(&ref_id, now_ms, date, "2xx missing smart id")
@@ -1515,14 +1561,10 @@ impl<T: OrderTransport + SmartOrderTransport> GrowwOrderExecutor<T> {
                 .into());
             };
             if t.status.is_terminal() {
+                // RAW terminal label — never a mislabeled catch-all (finding 7).
                 return Err(SmartOrderError::AlreadyTerminal {
                     smart_order_id: smart_order_id.to_owned(),
-                    status: match t.status.as_str() {
-                        "CANCELLED" => "CANCELLED",
-                        "EXPIRED" => "EXPIRED",
-                        "FAILED" => "FAILED",
-                        _ => "COMPLETED",
-                    },
+                    status: t.status.as_str().to_owned(),
                 }
                 .into());
             }
@@ -1561,6 +1603,13 @@ impl<T: OrderTransport + SmartOrderTransport> GrowwOrderExecutor<T> {
             mode,
             ts_ms: now_ms,
             linked_intent_id: None,
+            // Restart context (finding 5) — the GET-path parameters.
+            smart_ctx: Some(SmartIntentContext {
+                segment: segment.as_str().to_owned(),
+                smart_order_type: smart_order_type.as_str().to_owned(),
+                trading_symbol: String::new(),
+                quantity: 0,
+            }),
         };
         let receipt = self
             .with_ledger(move |l| l.record_intent(new, date))
@@ -1589,6 +1638,19 @@ impl<T: OrderTransport + SmartOrderTransport> GrowwOrderExecutor<T> {
         if !self.budget.check_mutation().is_allowed() {
             metrics::counter!("tv_groww_order_budget_denied_total", "family" => "orders")
                 .increment(1);
+            // Terminalize the write-ahead intent (finding 10): nothing was
+            // sent, so ResolvedNotLanded is provably true — a Recorded
+            // intent left open would block this order's mutation-in-flight
+            // index until restart.
+            self.append_intent(
+                &ref_id,
+                IntentPhase::ResolvedNotLanded,
+                now_ms,
+                date,
+                Some(smart_order_id.to_owned()),
+                Some("budget_denied".to_owned()),
+            )
+            .await?;
             return Err(ExecError::RateBudgetExceeded(RateFamily::Orders));
         }
         self.append_intent(
@@ -1694,14 +1756,10 @@ impl<T: OrderTransport + SmartOrderTransport> GrowwOrderExecutor<T> {
                 .into());
             };
             if t.status.is_terminal() {
+                // RAW terminal label — never a mislabeled catch-all (finding 7).
                 return Err(SmartOrderError::AlreadyTerminal {
                     smart_order_id: smart_order_id.to_owned(),
-                    status: match t.status.as_str() {
-                        "CANCELLED" => "CANCELLED",
-                        "EXPIRED" => "EXPIRED",
-                        "FAILED" => "FAILED",
-                        _ => "COMPLETED",
-                    },
+                    status: t.status.as_str().to_owned(),
                 }
                 .into());
             }
@@ -1718,6 +1776,13 @@ impl<T: OrderTransport + SmartOrderTransport> GrowwOrderExecutor<T> {
             mode,
             ts_ms: now_ms,
             linked_intent_id: None,
+            // Restart context (finding 5) — the GET-path parameters.
+            smart_ctx: Some(SmartIntentContext {
+                segment: segment.as_str().to_owned(),
+                smart_order_type: smart_order_type.as_str().to_owned(),
+                trading_symbol: String::new(),
+                quantity: 0,
+            }),
         };
         let receipt = self
             .with_ledger(move |l| l.record_intent(new, date))
@@ -1743,6 +1808,19 @@ impl<T: OrderTransport + SmartOrderTransport> GrowwOrderExecutor<T> {
         if !self.budget.check_mutation().is_allowed() {
             metrics::counter!("tv_groww_order_budget_denied_total", "family" => "orders")
                 .increment(1);
+            // Terminalize the write-ahead intent (finding 10): nothing was
+            // sent, so ResolvedNotLanded is provably true — a Recorded
+            // intent left open would block this order's mutation-in-flight
+            // index until restart.
+            self.append_intent(
+                &ref_id,
+                IntentPhase::ResolvedNotLanded,
+                now_ms,
+                date,
+                Some(smart_order_id.to_owned()),
+                Some("budget_denied".to_owned()),
+            )
+            .await?;
             return Err(ExecError::RateBudgetExceeded(RateFamily::Orders));
         }
         self.append_intent(
@@ -1775,17 +1853,21 @@ impl<T: OrderTransport + SmartOrderTransport> GrowwOrderExecutor<T> {
                     None,
                 )
                 .await?;
-                // Adopt the echoed status ("CANCELLED on success"); an unknown
-                // echo is left for the reconcile poller to park.
+                // Route the echoed status ("CANCELLED on success") through
+                // the FSM (adversarial round 1, finding 8): forward adopts,
+                // backward/unknown PARKS for the reconcile poller — never a
+                // blind direct assignment.
                 let echoed = payload
                     .status
                     .as_deref()
                     .map(SmartOrderStatus::parse)
                     .unwrap_or(SmartOrderStatus::Cancelled);
-                if let Some(t) = book.lock().await.get_mut(smart_order_id)
-                    && !matches!(echoed, SmartOrderStatus::Unknown(_))
-                {
-                    t.status = echoed;
+                if let Some(t) = book.lock().await.get_mut(smart_order_id) {
+                    match evaluate_smart_transition(&t.status, &echoed) {
+                        SmartTransitionOutcome::Transition => t.status = echoed,
+                        SmartTransitionOutcome::SameStatusRefresh
+                        | SmartTransitionOutcome::Park => {}
+                    }
                 }
                 count_mutation("cancel", "acked");
                 Ok(MutationResult::Accepted)

@@ -1239,3 +1239,156 @@ async fn smart_live_cancel_adopts_the_cancelled_echo() {
         SmartOrderStatus::Cancelled
     );
 }
+
+// -- adversarial round 1 fixes ------------------------------------------------
+
+#[tokio::test]
+async fn smart_live_place_implausible_ack_id_is_unresolved_never_adopted() {
+    // Finding 3: a 2xx SUCCESS echoing an IMPLAUSIBLE broker id must never
+    // enter the book (it would later be spliced into a URL path).
+    let st = SmartScriptState {
+        create: VecDeque::from([smart_payload("..%2Fevil", "ACTIVE")]),
+        ..Default::default()
+    };
+    let mut exec = live_smart_exec(st, "sm-live-badid");
+    let out = exec
+        .place_smart_order(oco_create(), DATE, NOW_MS, true)
+        .await
+        .unwrap();
+    assert_eq!(out, PlaceResult::Unresolved);
+    let book = exec.smart_book();
+    assert_eq!(book.lock().await.open_count(), 0, "implausible id never adopted");
+}
+
+#[tokio::test]
+async fn smart_modify_already_terminal_carries_the_raw_status() {
+    // Finding 7: the AlreadyTerminal refusal names the REAL terminal status
+    // (FAILED here), never a mislabeled catch-all.
+    let st = SmartScriptState {
+        create: VecDeque::from([smart_payload("oco_term1", "ACTIVE")]),
+        ..Default::default()
+    };
+    let mut exec = live_smart_exec(st, "sm-live-term");
+    exec.place_smart_order(oco_create(), DATE, NOW_MS, true)
+        .await
+        .unwrap();
+    {
+        let book = exec.smart_book();
+        book.lock().await.get_mut("oco_term1").expect("tracked").status =
+            SmartOrderStatus::Failed;
+    }
+    let err = exec
+        .modify_smart_order(
+            "oco_term1",
+            SmartModifyFields {
+                quantity: Some(25),
+                ..Default::default()
+            },
+            DATE,
+            NOW_MS,
+            true,
+        )
+        .await
+        .unwrap_err();
+    match err {
+        ExecError::Smart(SmartOrderError::AlreadyTerminal { status, .. }) => {
+            assert_eq!(status, "FAILED", "raw terminal label, never COMPLETED");
+        }
+        other => panic!("expected AlreadyTerminal, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn smart_live_cancel_backward_echo_is_parked_not_adopted() {
+    // Finding 8: a cancel-success echo carrying a BACKWARD status must be
+    // parked by the FSM, never blindly assigned.
+    let st = SmartScriptState {
+        create: VecDeque::from([smart_payload("oco_back1", "ACTIVE")]),
+        cancel: VecDeque::from([smart_payload("oco_back1", "ACTIVE")]),
+        ..Default::default()
+    };
+    let mut exec = live_smart_exec(st, "sm-live-back");
+    exec.place_smart_order(oco_create(), DATE, NOW_MS, true)
+        .await
+        .unwrap();
+    {
+        let book = exec.smart_book();
+        book.lock().await.get_mut("oco_back1").expect("tracked").status =
+            SmartOrderStatus::Triggered;
+    }
+    let out = exec
+        .cancel_smart_order("oco_back1", DATE, NOW_MS, true)
+        .await
+        .unwrap();
+    assert_eq!(out, MutationResult::Accepted);
+    let book = exec.smart_book();
+    assert_eq!(
+        book.lock().await.get("oco_back1").expect("tracked").status,
+        SmartOrderStatus::Triggered,
+        "backward echo parked — reconcile owns the divergence"
+    );
+}
+
+#[tokio::test]
+async fn smart_budget_denial_terminalizes_the_intent() {
+    // Finding 10: a budget-denied smart mutation must NOT leave a
+    // forever-open Recorded intent (it would block the order's
+    // mutation-in-flight index until restart).
+    let dir = temp_ledger_dir("sm-budget");
+    let ledger = IntentLedger::open(&dir, DATE).expect("ledger open");
+    let mut exec = GrowwOrderExecutor::new_live_for_test(
+        SmartScriptedTransport {
+            st: StdMutex::new(SmartScriptState {
+                // Enough scripted ACKs for every send that passes the budget.
+                create: VecDeque::from(
+                    (0..12)
+                        .map(|i| smart_payload(&format!("oco_b{i}"), "ACTIVE"))
+                        .collect::<Vec<_>>(),
+                ),
+                ..Default::default()
+            }),
+            create_refs: StdMutex::new(Vec::new()),
+        },
+        SecretString::from("test-token"),
+        cfg(),
+        ledger,
+    );
+    exec.set_smart_gates(smart_gates_on());
+    let mut denied = false;
+    for _ in 0..12 {
+        match exec.place_smart_order(oco_create(), DATE, NOW_MS, true).await {
+            Err(ExecError::RateBudgetExceeded(_)) => {
+                denied = true;
+                break;
+            }
+            Ok(_) => {}
+            Err(other) => panic!("unexpected error: {other:?}"),
+        }
+    }
+    assert!(denied, "the 5/sec mutation self-cap must deny within 12 rapid places");
+    drop(exec);
+    // Replay the ledger file: every SmartPlace intent must be TERMINAL —
+    // the denied one as resolved_not_landed, the sent ones as acked.
+    let file = std::fs::read_dir(&dir)
+        .expect("dir")
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| p.extension().is_some_and(|x| x == "ndjson"))
+        .expect("ledger file");
+    let buf = std::fs::read(&file).expect("read ledger");
+    let replay = crate::oms::groww::intent_ledger::replay_bytes(&buf).expect("replay");
+    let mut not_landed = 0_usize;
+    for s in replay.intents.values() {
+        assert_eq!(s.kind, IntentKind::SmartPlace);
+        assert!(
+            s.last_phase.is_terminal(),
+            "no forever-open intent after budget denial (got {:?})",
+            s.last_phase
+        );
+        if s.last_phase == IntentPhase::ResolvedNotLanded {
+            not_landed += 1;
+        }
+    }
+    assert_eq!(not_landed, 1, "exactly the denied place is resolved_not_landed");
+    let _ = std::fs::remove_dir_all(&dir);
+}

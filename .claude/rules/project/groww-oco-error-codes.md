@@ -122,6 +122,29 @@ sibling is not a verified sibling). ONCE per episode per order
 3. Post-incident: check the reconcile poller health (GROWW-OCO-05) — a
    degraded poller lengthens the verification window.
 
+**Honest envelope additions (2026-07-16, adversarial round 1 — plain
+statements, never softened):**
+- **Restart blind window (finding 5):** the tracked smart-order book is
+  process-RAM — a restart mid-OCO-episode EMPTIES it, and OCO-02 CANNOT
+  fire for pre-restart orders until book rehydration lands. What IS
+  persisted since 2026-07-16: every SmartPlace/SmartModify/SmartCancel
+  intent line carries a `smart_ctx` record (segment + smart_order_type +
+  trading_symbol + quantity, folded into the replay summary) — the full
+  status-GET path is rebuildable from the ledger, so the future wiring
+  PR's rehydration is a replay-seam read, not a schema change. Until it
+  ships, a restart during a triggered-but-unverified OCO episode leaves
+  the double-fill exposure UNPAGED — the operator's mitigation is the
+  broker app check after any in-session restart with live OCOs.
+- **Session-tail blind window (finding 13):** the reconcile loop runs
+  in-market only — an OCO that TRIGGERS within
+  `oco_sibling_cancel_deadline_secs` (30s) of the 15:30 close may never
+  reach its sibling-verify deadline before the box stops; the episode
+  resumes only if the order is still tracked (same process) next session.
+- **Elapsed undercount (finding 13):** the episode clock arms at the
+  OBSERVATION of TRIGGERED (poll time), not the broker-side trigger
+  instant — the reported elapsed undercounts by up to one poll interval
+  (`oco_reconcile_poll_secs`, 15s).
+
 ## §3. GROWW-OCO-03 — smart-order reconcile mismatch
 
 **Severity:** High. **Auto-triage safe:** **No — severity-independent
@@ -204,7 +227,10 @@ counter `tv_groww_oco_poller_errors_total{stage}`:
 
 The loop is `smart_orders::run_smart_order_reconcile_loop` (cadence
 `oco_reconcile_poll_secs` = 15; read-gated on `smart_orders_read`;
-paper mode = zero-HTTP no-op). **Honest boundary:** the loop is spawnable
+paper mode = zero-HTTP no-op). Gates are captured BY VALUE at spawn time
+(finding 9) — a runtime gate flip needs a loop respawn; only the
+market-hours closure and the token are re-read per turn. **Honest
+boundary:** the loop is spawnable
 but NOT yet spawned by any boot path (the §0 no-production-caller
 ratchet); supervised-respawn wiring is the future wiring PR's duty — until
 then a dead loop is impossible because no loop runs.
@@ -241,9 +267,19 @@ smart CREATE additionally has NO reference-status lookup, so ambiguity is
 fail-closed-parked (§1), never resolved by resend. Wire prices are
 DECIMAL STRINGS on the smart surface (regular orders use JSON numbers) —
 integer paise at rest, sub-paise refused, ±1e12-paise band.
-`execute`-side hardening carried over from the regular lane: response
-bodies capped pre-read, redirect `Policy::none`, ids plausibility-checked
-before entering a URL path (rejects `/`, `..`, control chars). No order
+Transport hardening (adversarial round 1, 2026-07-16 — code-verified, the
+claims below are RATCHETED by
+`api_client.rs::ratchet_client_builder_has_no_redirects_and_oversize_caps`):
+the shared order-surface reqwest client pins redirect `Policy::none`;
+`send_and_classify` refuses a response on the DECLARED Content-Length
+pre-read AND post-read past `ORDER_MAX_RESPONSE_BYTES` (2 MiB — the
+margin.rs oversize pattern); smart-order ids are plausibility-checked IN
+THE TRANSPORT itself before any URL splice (modify/cancel/get — an
+implausible id is a typed never-sent refusal, `refuse_implausible_smart_id`)
+in addition to the executor-side checks; a broker-ACK id must ALSO pass
+plausibility before entering the tracked book (an implausible echo is an
+unresolved place, `tv_groww_oco_implausible_ack_id_total`); log lines
+route ids through the `log_safe_id` sanitize choke point. No order
 fire is possible: Gates 1–4 all closed (`dry_run` stays true; paper mode
 returns deterministic `PAPER-<reference_id>` ids with zero HTTP — ratcheted by
 `groww_orders_transport_guard.rs`'s gate-6 scan, which now includes

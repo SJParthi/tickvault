@@ -916,8 +916,9 @@ pub enum SmartOrderError {
     AlreadyTerminal {
         /// The terminal order.
         smart_order_id: String,
-        /// Its terminal status label.
-        status: &'static str,
+        /// Its RAW terminal status label (adversarial round 1, finding 7 —
+        /// never a mislabeled catch-all).
+        status: String,
     },
     /// The tracked-book cap refused a new smart place.
     #[error("tracked smart-order cap {cap} reached; new place refused")]
@@ -1026,13 +1027,20 @@ pub fn is_plausible_smart_order_id(s: &str) -> bool {
 // ---------------------------------------------------------------------------
 
 fn require_positive_paise(name: &'static str, v: i64) -> Result<(), SmartOrderError> {
-    if v > 0 {
-        Ok(())
-    } else {
-        Err(SmartOrderError::InvalidField(format!(
+    if v <= 0 {
+        return Err(SmartOrderError::InvalidField(format!(
             "{name} must be > 0 paise (got {v})"
-        )))
+        )));
     }
+    // Upper band on the REQUEST side (adversarial round 1, finding 12): a
+    // price past the decimal-string band must be refused HERE, before it can
+    // reach serialization (where it would error at the serde boundary).
+    if v > MAX_ABS_PAISE_FOR_DECIMAL_STRING {
+        return Err(SmartOrderError::InvalidField(format!(
+            "{name} exceeds the {MAX_ABS_PAISE_FOR_DECIMAL_STRING}-paise band (got {v})"
+        )));
+    }
+    Ok(())
 }
 
 /// Validate a GTT/OCO leg's (order-type, price) SHAPE: price-carrying types
@@ -1046,9 +1054,12 @@ pub fn validate_leg_price_shape(
     price: Option<i64>,
 ) -> Result<(), SmartOrderError> {
     match (price_required, price) {
-        (true, Some(p)) if p > 0 => Ok(()),
+        // Positive AND inside the decimal-string band (finding 12) — an
+        // out-of-band price is refused pre-serialization.
+        (true, Some(p)) if p > 0 && p <= MAX_ABS_PAISE_FOR_DECIMAL_STRING => Ok(()),
         (true, Some(p)) => Err(SmartOrderError::InvalidField(format!(
-            "{leg_name} price must be > 0 paise for {order_type_label} (got {p})"
+            "{leg_name} price must be > 0 and <= {MAX_ABS_PAISE_FOR_DECIMAL_STRING} paise \
+             for {order_type_label} (got {p})"
         ))),
         (true, None) => Err(SmartOrderError::InvalidField(format!(
             "{leg_name} price required for {order_type_label}"
@@ -1138,7 +1149,9 @@ pub fn validate_create_smart_order(
                     "OCO is exit-only: net_position_quantity must be non-zero".to_owned(),
                 ));
             }
-            if o.quantity > o.net_position_quantity.abs() {
+            // `unsigned_abs`, never `abs` — `i64::MIN.abs()` aborts under
+            // overflow-checks (adversarial round 1, finding 4).
+            if o.quantity.unsigned_abs() > o.net_position_quantity.unsigned_abs() {
                 return Err(SmartOrderError::QuantityExceedsPosition {
                     quantity: o.quantity,
                     net_position_quantity: o.net_position_quantity,
@@ -1336,6 +1349,10 @@ pub struct TrackedSmartOrder {
     /// Consecutive reconcile sweeps where the broker could not find this
     /// order (ghost-local grace, 2 sweeps).
     pub missing_sweeps: u8,
+    /// The last broker quantity a QuantityDrift finding was flagged for —
+    /// the per-(order, qty) latch so an UNADOPTED drift is found ONCE, not
+    /// re-fired every poll pass (adversarial round 1, finding 11).
+    pub drift_flagged_qty: Option<i64>,
 }
 
 impl TrackedSmartOrder {
@@ -1361,6 +1378,7 @@ impl TrackedSmartOrder {
             sibling_unverified_paged: false,
             modifications: 0,
             missing_sweeps: 0,
+            drift_flagged_qty: None,
         }
     }
 }
@@ -1424,6 +1442,18 @@ impl SmartOrderBook {
 // the rule file §6; every error! carries `code` + `stage`)
 // ---------------------------------------------------------------------------
 
+/// Sanitize an order id for LOG display (adversarial round 1, finding 3):
+/// plausible ids pass verbatim; anything else is control-stripped +
+/// length-capped through the house sanitize choke point — never raw hostile
+/// bytes in a log line.
+pub(crate) fn log_safe_id(id: &str) -> std::borrow::Cow<'_, str> {
+    if is_plausible_smart_order_id(id) {
+        std::borrow::Cow::Borrowed(id)
+    } else {
+        std::borrow::Cow::Owned(capture_rest_error_body(id))
+    }
+}
+
 /// GROWW-OCO-01 — a create/cancel leg failed (definitive reject or an
 /// unresolvable ambiguity). `detail` passes the sanitize choke point.
 pub(crate) fn emit_oco01(leg: &'static str, stage: &'static str, id: Option<&str>, detail: &str) {
@@ -1432,7 +1462,7 @@ pub(crate) fn emit_oco01(leg: &'static str, stage: &'static str, id: Option<&str
         code = ErrorCode::GrowwOco01PlacementFailed.code_str(),
         stage,
         leg,
-        smart_order_id = id.unwrap_or("n/a"),
+        smart_order_id = %log_safe_id(id.unwrap_or("n/a")),
         detail = %capture_rest_error_body(detail),
         "groww smart order: {leg} leg failed"
     );
@@ -1445,7 +1475,7 @@ pub(crate) fn emit_oco02(smart_order_id: &str, elapsed_ms: i64, deadline_secs: u
         target: "groww_oco",
         code = ErrorCode::GrowwOco02SiblingCancelUnverified.code_str(),
         stage = "deadline_exceeded",
-        smart_order_id,
+        smart_order_id = %log_safe_id(smart_order_id),
         elapsed_ms,
         deadline_secs,
         "groww smart order: OCO sibling cancel UNVERIFIED past the deadline — \
@@ -1462,7 +1492,7 @@ pub(crate) fn emit_oco03(findings: &[SmartReconcileFinding]) {
         .map(|f| {
             format!(
                 "{} {} {}",
-                f.smart_order_id,
+                log_safe_id(&f.smart_order_id),
                 f.kind.as_str(),
                 capture_rest_error_body(&f.detail)
             )
@@ -1486,7 +1516,7 @@ pub(crate) fn emit_oco04(stage: &'static str, id: Option<&str>, detail: &str) {
         target: "groww_oco",
         code = ErrorCode::GrowwOco04ModifyRejected.code_str(),
         stage,
-        smart_order_id = id.unwrap_or("n/a"),
+        smart_order_id = %log_safe_id(id.unwrap_or("n/a")),
         detail = %capture_rest_error_body(detail),
         "groww smart order: modify refused/rejected"
     );
@@ -1611,6 +1641,10 @@ pub fn classify_smart_observation(
     }
     if let Some(q) = observed_quantity
         && q != tracked.quantity
+        // Per-(order, qty) latch (finding 11): the SAME unadopted drift is
+        // found once, not re-fired every poll pass; a NEW drifted value
+        // re-fires.
+        && tracked.drift_flagged_qty != Some(q)
     {
         findings.push(SmartReconcileFinding {
             smart_order_id: tracked.smart_order_id.clone(),
@@ -1620,7 +1654,9 @@ pub fn classify_smart_observation(
     }
     if tracked.smart_order_type == SmartOrderType::Oco
         && let Some(net) = net_position
-        && tracked.quantity > net.abs()
+        // `unsigned_abs`, never `abs` — `i64::MIN.abs()` aborts under
+        // overflow-checks (adversarial round 1, finding 4).
+        && tracked.quantity.unsigned_abs() > net.unsigned_abs()
     {
         findings.push(SmartReconcileFinding {
             smart_order_id: tracked.smart_order_id.clone(),
@@ -1628,7 +1664,7 @@ pub fn classify_smart_observation(
             detail: format!(
                 "OCO qty {} vs |net position| {}",
                 tracked.quantity,
-                net.abs()
+                net.unsigned_abs()
             ),
         });
     }
@@ -1659,6 +1695,12 @@ fn apply_observation(
         }
         SmartTransitionOutcome::SameStatusRefresh | SmartTransitionOutcome::Park => {}
     }
+    // Maintain the QuantityDrift latch (finding 11): a still-drifted broker
+    // qty latches (found once); an agreeing qty clears the latch. A
+    // Transition that ADOPTED the broker qty lands in the agreeing arm.
+    if let Some(q) = observed_quantity {
+        tracked.drift_flagged_qty = if q != tracked.quantity { Some(q) } else { None };
+    }
     // Arm the OCO sibling episode on the first observed TRIGGERED.
     if tracked.smart_order_type == SmartOrderType::Oco
         && tracked.status == SmartOrderStatus::Triggered
@@ -1679,7 +1721,7 @@ fn apply_observation(
     if verdict == SiblingVerifyVerdict::Verified && tracked.sibling_unverified_paged {
         info!(
             target: "groww_oco",
-            smart_order_id = %tracked.smart_order_id,
+            smart_order_id = %log_safe_id(&tracked.smart_order_id),
             "groww smart order: OCO settled terminal — sibling exposure episode closed"
         );
         tracked.sibling_unverified_paged = false;
@@ -1878,8 +1920,12 @@ pub async fn reconcile_pass<T: SmartOrderTransport>(
 }
 
 /// The spawnable OCO reconcile poller (the margin-loop house pattern:
-/// interval = `reconcile_poll_secs`, gates re-read per turn, shutdown
-/// watch). The spawn site is the FUTURE wiring PR — no crates/app code in
+/// interval = `reconcile_poll_secs`, shutdown watch). HONESTY (adversarial
+/// round 1, finding 9): `gates` is moved BY VALUE at spawn time — the
+/// per-turn check re-reads the CAPTURED copy, so a runtime config flip
+/// needs a loop respawn to take effect (only `in_market_hours` and the
+/// token are genuinely re-read each turn). The spawn site is the FUTURE
+/// wiring PR — no crates/app code in
 /// this area PR. `token_provider` returns the CURRENT shared-minter token
 /// (SSM-read upstream; NEVER minted here).
 // WIRING-EXEMPT: the spawn site is the deferred app-integration PR (§39
@@ -1916,7 +1962,8 @@ pub async fn run_smart_order_reconcile_loop<T, P, M>(
             info!(target: "groww_oco", "smart-order reconcile loop: shutdown observed — exiting");
             return;
         }
-        // Read gate: smart_orders_read + market hours, re-read every turn.
+        // Read gate: the CAPTURED gates copy + the live market-hours closure
+        // (a runtime gate flip needs a respawn — see the fn doc, finding 9).
         if !gates.smart_orders_read || !in_market_hours() {
             continue;
         }
@@ -2722,6 +2769,110 @@ mod tests {
             !f.iter()
                 .any(|x| x.kind == SmartFindingKind::QtyExceedsPosition)
         );
+    }
+
+    // -- adversarial round 1, finding 4: i64::MIN never aborts --------------
+
+    #[test]
+    fn test_i64_min_net_position_never_aborts() {
+        // Reconcile classify: OCO qty vs an i64::MIN net position — `abs()`
+        // would abort under overflow-checks; unsigned_abs must not (the same
+        // arithmetic guards the create-side validate).
+        let mut t = tracked("oco_min", SmartOrderType::Oco);
+        t.quantity = 50;
+        let (_, f) =
+            classify_smart_observation(&t, &SmartOrderStatus::Active, Some(50), Some(i64::MIN));
+        // |i64::MIN| = 2^63 > 50 — no exceed finding, and no abort.
+        assert!(
+            !f.iter()
+                .any(|x| x.kind == SmartFindingKind::QtyExceedsPosition)
+        );
+    }
+
+    // -- adversarial round 1, finding 11: drift latch ------------------------
+
+    #[test]
+    fn test_quantity_drift_latch_fires_once_per_value() {
+        let deadline = 30_u64;
+        let mut t = tracked("gtt_drift", SmartOrderType::Gtt);
+        t.quantity = 100;
+        // First SameStatusRefresh pass with a drifted qty: finding fires.
+        let (out, f) = classify_smart_observation(&t, &SmartOrderStatus::Active, Some(75), None);
+        assert_eq!(out, SmartTransitionOutcome::SameStatusRefresh);
+        assert!(f.iter().any(|x| x.kind == SmartFindingKind::QuantityDrift));
+        apply_observation(
+            &mut t,
+            &SmartOrderStatus::Active,
+            Some(75),
+            out,
+            1_000,
+            deadline,
+        );
+        assert_eq!(t.drift_flagged_qty, Some(75));
+        // Second pass, SAME drifted qty: latched — no re-finding.
+        let (_, f) = classify_smart_observation(&t, &SmartOrderStatus::Active, Some(75), None);
+        assert!(!f.iter().any(|x| x.kind == SmartFindingKind::QuantityDrift));
+        // A NEW drifted value re-fires.
+        let (out, f) = classify_smart_observation(&t, &SmartOrderStatus::Active, Some(60), None);
+        assert!(f.iter().any(|x| x.kind == SmartFindingKind::QuantityDrift));
+        apply_observation(
+            &mut t,
+            &SmartOrderStatus::Active,
+            Some(60),
+            out,
+            2_000,
+            deadline,
+        );
+        assert_eq!(t.drift_flagged_qty, Some(60));
+        // A Transition ADOPTING the broker qty clears the latch.
+        let (out, _) = classify_smart_observation(&t, &SmartOrderStatus::Triggered, Some(60), None);
+        assert_eq!(out, SmartTransitionOutcome::Transition);
+        apply_observation(
+            &mut t,
+            &SmartOrderStatus::Triggered,
+            Some(60),
+            out,
+            3_000,
+            deadline,
+        );
+        assert_eq!(t.quantity, 60);
+        assert_eq!(t.drift_flagged_qty, None);
+    }
+
+    // -- adversarial round 1, finding 12: request-side upper band ------------
+
+    #[test]
+    fn test_price_upper_band_refused_before_serialization() {
+        // require_positive_paise: i64::MAX and band+1 refused; band edge ok.
+        assert!(require_positive_paise("p", i64::MAX).is_err());
+        assert!(require_positive_paise("p", MAX_ABS_PAISE_FOR_DECIMAL_STRING + 1).is_err());
+        assert!(require_positive_paise("p", MAX_ABS_PAISE_FOR_DECIMAL_STRING).is_ok());
+        // validate_leg_price_shape: same band on price-carrying legs.
+        assert!(validate_leg_price_shape("leg", true, "LIMIT", Some(i64::MAX)).is_err());
+        assert!(
+            validate_leg_price_shape(
+                "leg",
+                true,
+                "LIMIT",
+                Some(MAX_ABS_PAISE_FOR_DECIMAL_STRING + 1)
+            )
+            .is_err()
+        );
+        assert!(
+            validate_leg_price_shape("leg", true, "LIMIT", Some(MAX_ABS_PAISE_FOR_DECIMAL_STRING))
+                .is_ok()
+        );
+    }
+
+    // -- adversarial round 1, finding 3: log-safe id --------------------------
+
+    #[test]
+    fn test_log_safe_id_passes_plausible_and_sanitizes_hostile() {
+        assert_eq!(log_safe_id("GMOCO-1_a"), "GMOCO-1_a");
+        let hostile = format!("x\u{0}y{}", "z".repeat(400));
+        let safe = log_safe_id(&hostile);
+        assert!(!safe.contains('\u{0}'), "control chars stripped");
+        assert!(safe.len() < hostile.len(), "length-capped");
     }
 
     #[test]
