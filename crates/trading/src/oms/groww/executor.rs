@@ -46,7 +46,7 @@ use super::smart_orders::{
     SmartModifyFields, SmartOrderBook, SmartOrderCreate, SmartOrderError, SmartOrderGates,
     SmartOrderStatus, SmartReconcileReport, SmartTransitionOutcome, TrackedSmartOrder,
     ambiguity_stage, build_modify_body, count_mutation, emit_oco01, emit_oco04,
-    evaluate_smart_transition, is_plausible_smart_order_id, reconcile_pass,
+    evaluate_smart_transition, is_plausible_smart_order_id, log_safe_id, reconcile_pass,
     validate_create_smart_order, validate_modify_fields,
 };
 use super::state::{
@@ -1038,7 +1038,8 @@ impl<T: OrderTransport> GrowwOrderExecutor<T> {
                 .await?;
                 tracing::error!(
                     target: "groww_ord",
-                    order_id = %order_id,
+                    // round-2 finding 3: no lane logs an unvalidated broker id raw.
+                    order_id = %log_safe_id(order_id),
                     "groww order: mutation ambiguity UNRESOLVED — operator action required"
                 );
                 return Ok(MutationResult::Unresolved);
@@ -1071,7 +1072,7 @@ impl<T: OrderTransport> GrowwOrderExecutor<T> {
                     // GROWW-ORD-04-class "position exists" emit lands in ORD-PR-1.
                     tracing::error!(
                         target: "groww_ord",
-                        order_id = %order_id,
+                        order_id = %log_safe_id(order_id),
                         filled,
                         "groww order: cancel lost the race — POSITION EXISTS"
                     );
@@ -1580,6 +1581,7 @@ impl<T: OrderTransport + SmartOrderTransport> GrowwOrderExecutor<T> {
         };
         if let Err(e) = validate_modify_fields(
             smart_order_type,
+            segment,
             &fields,
             self.smart_gates.max_order_quantity,
         ) {

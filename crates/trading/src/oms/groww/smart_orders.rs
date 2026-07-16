@@ -1187,6 +1187,7 @@ pub fn validate_create_smart_order(
 /// GROWW-OCO-04 refusal BEFORE any HTTP.
 pub fn validate_modify_fields(
     smart_order_type: SmartOrderType,
+    segment: GrowwSegment,
     fields: &SmartModifyFields,
     max_order_quantity: i64,
 ) -> Result<(), SmartOrderError> {
@@ -1250,6 +1251,17 @@ pub fn validate_modify_fields(
             }
             if let Some(t) = fields.stop_loss_trigger_price {
                 require_positive_paise("stop_loss.trigger_price", t)?;
+            }
+            // A CASH OCO product_type change must re-assert MIS-only,
+            // mirroring create's CashOcoProductNotMis (adversarial round 2,
+            // LOW-2 — modify previously lacked the segment to check).
+            if let Some(p) = fields.product_type
+                && segment == GrowwSegment::Cash
+                && p != GrowwProduct::Mis
+            {
+                return Err(SmartOrderError::CashOcoProductNotMis {
+                    product: p.as_str(),
+                });
             }
         }
     }
@@ -1758,6 +1770,22 @@ pub async fn reconcile_pass<T: SmartOrderTransport>(
             .await;
         match obs {
             TransportOutcome::Success(p) => {
+                // Identity guard (adversarial round 2, HIGH): the ONLY
+                // unguarded broker echo. A GET response carrying a DIFFERENT
+                // `smart_order_id` must NEVER be classified/applied under
+                // `id` — a foreign echo could silently terminalize a live
+                // OCO (dropping it from the non-terminal set → the OCO-02
+                // double-fill guard is silenced) or false-arm an episode.
+                if let Some(other) = p.smart_order_id.as_deref()
+                    && other != id.as_str()
+                {
+                    report.degraded.push("id_mismatch");
+                    emit_oco05(
+                        "id_mismatch",
+                        &format!("requested {} got {}", log_safe_id(id), log_safe_id(other)),
+                    );
+                    continue;
+                }
                 let observed_status = p
                     .status
                     .as_deref()
@@ -2603,8 +2631,8 @@ mod tests {
             ),
         ];
         for (name, fields, gtt_ok, oco_ok) in cases {
-            let g = validate_modify_fields(SmartOrderType::Gtt, &fields, 100);
-            let o = validate_modify_fields(SmartOrderType::Oco, &fields, 100);
+            let g = validate_modify_fields(SmartOrderType::Gtt, GrowwSegment::Fno, &fields, 100);
+            let o = validate_modify_fields(SmartOrderType::Oco, GrowwSegment::Fno, &fields, 100);
             assert_eq!(g.is_ok(), gtt_ok, "GTT {name}: {g:?}");
             assert_eq!(o.is_ok(), oco_ok, "OCO {name}: {o:?}");
             // A refusal is the TYPED immutable-field error, never a generic.
@@ -2639,8 +2667,13 @@ mod tests {
     fn test_modify_validation_boundaries() {
         // Empty modify refused.
         assert!(
-            validate_modify_fields(SmartOrderType::Gtt, &SmartModifyFields::default(), 100)
-                .is_err()
+            validate_modify_fields(
+                SmartOrderType::Gtt,
+                GrowwSegment::Fno,
+                &SmartModifyFields::default(),
+                100
+            )
+            .is_err()
         );
         // Quantity boundaries (both flows share them).
         for (q, ok) in [(0, false), (1, true), (100, true), (101, false)] {
@@ -2649,7 +2682,7 @@ mod tests {
                 ..Default::default()
             };
             assert_eq!(
-                validate_modify_fields(SmartOrderType::Oco, &f, 100).is_ok(),
+                validate_modify_fields(SmartOrderType::Oco, GrowwSegment::Fno, &f, 100).is_ok(),
                 ok,
                 "quantity {q}"
             );
@@ -2659,17 +2692,17 @@ mod tests {
             trigger_price: Some(0),
             ..Default::default()
         };
-        assert!(validate_modify_fields(SmartOrderType::Gtt, &f, 100).is_err());
+        assert!(validate_modify_fields(SmartOrderType::Gtt, GrowwSegment::Fno, &f, 100).is_err());
         let f = SmartModifyFields {
             target_trigger_price: Some(0),
             ..Default::default()
         };
-        assert!(validate_modify_fields(SmartOrderType::Oco, &f, 100).is_err());
+        assert!(validate_modify_fields(SmartOrderType::Oco, GrowwSegment::Fno, &f, 100).is_err());
         let f = SmartModifyFields {
             stop_loss_trigger_price: Some(-1),
             ..Default::default()
         };
-        assert!(validate_modify_fields(SmartOrderType::Oco, &f, 100).is_err());
+        assert!(validate_modify_fields(SmartOrderType::Oco, GrowwSegment::Fno, &f, 100).is_err());
         // A GTT leg patch is shape-validated (MARKET leg with a price refused).
         let f = SmartModifyFields {
             order_leg: Some(GttOrderLeg {
@@ -2679,7 +2712,35 @@ mod tests {
             }),
             ..Default::default()
         };
-        assert!(validate_modify_fields(SmartOrderType::Gtt, &f, 100).is_err());
+        assert!(validate_modify_fields(SmartOrderType::Gtt, GrowwSegment::Fno, &f, 100).is_err());
+    }
+
+    // -- adversarial round 2, LOW-2: modify re-asserts CASH-OCO MIS-only -------
+
+    #[test]
+    fn test_modify_cash_oco_product_change_must_be_mis() {
+        // CASH OCO: a product_type change to a non-MIS value is refused
+        // (mirrors create's CashOcoProductNotMis).
+        let bad = SmartModifyFields {
+            product_type: Some(GrowwProduct::Nrml),
+            ..Default::default()
+        };
+        assert!(matches!(
+            validate_modify_fields(SmartOrderType::Oco, GrowwSegment::Cash, &bad, 100),
+            Err(SmartOrderError::CashOcoProductNotMis { product: "NRML" })
+        ));
+        // CASH OCO with MIS is fine.
+        let ok = SmartModifyFields {
+            product_type: Some(GrowwProduct::Mis),
+            ..Default::default()
+        };
+        assert!(validate_modify_fields(SmartOrderType::Oco, GrowwSegment::Cash, &ok, 100).is_ok());
+        // FNO OCO: NRML product change is allowed (the CASH rule is
+        // segment-scoped) — unchanged behavior.
+        assert!(
+            validate_modify_fields(SmartOrderType::Oco, GrowwSegment::Fno, &bad, 100).is_ok(),
+            "FNO OCO product change must NOT trip the CASH-only rule"
+        );
     }
 
     // -- sibling verify (paused-clock pure core) --------------------------------

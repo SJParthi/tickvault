@@ -972,6 +972,7 @@ struct SmartScriptState {
     create: VecDeque<TransportOutcome<SmartOrderPayload>>,
     modify: VecDeque<TransportOutcome<SmartOrderPayload>>,
     cancel: VecDeque<TransportOutcome<SmartOrderPayload>>,
+    get: VecDeque<TransportOutcome<SmartOrderPayload>>,
 }
 
 #[derive(Default)]
@@ -1104,7 +1105,12 @@ impl crate::oms::groww::api_client::SmartOrderTransport for SmartScriptedTranspo
         _smart_order_id: &str,
         _token: &SecretString,
     ) -> TransportOutcome<SmartOrderPayload> {
-        TransportOutcome::Ambiguous(AmbiguityReason::Timeout)
+        self.st
+            .lock()
+            .unwrap()
+            .get
+            .pop_front()
+            .unwrap_or(TransportOutcome::Ambiguous(AmbiguityReason::Timeout))
     }
     async fn list_smart_orders(
         &self,
@@ -1391,4 +1397,54 @@ async fn smart_budget_denial_terminalizes_the_intent() {
     }
     assert_eq!(not_landed, 1, "exactly the denied place is resolved_not_landed");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// -- adversarial round 2, HIGH: reconcile GET id-mismatch is never adopted ----
+
+#[tokio::test]
+async fn smart_reconcile_foreign_id_echo_never_terminalizes_tracked_order() {
+    // A status GET response carrying a DIFFERENT smart_order_id than the one
+    // requested must be counted/degraded and dropped — never classified or
+    // applied (a foreign COMPLETED echo would silently terminalize a live OCO
+    // and silence the OCO-02 double-fill guard).
+    let st = SmartScriptState {
+        create: VecDeque::from([smart_payload("oco_hi1", "TRIGGERED")]),
+        // The GET returns a FOREIGN id with a terminal status.
+        get: VecDeque::from([smart_payload("oco_FOREIGN", "COMPLETED")]),
+        ..Default::default()
+    };
+    let mut exec = live_smart_exec(st, "sm-reconcile-idmm");
+    exec.place_smart_order(oco_create(), DATE, NOW_MS, true)
+        .await
+        .unwrap();
+    // Arm the episode: the tracked order is TRIGGERED (live, non-terminal).
+    {
+        let book = exec.smart_book();
+        let mut g = book.lock().await;
+        let t = g.get_mut("oco_hi1").expect("tracked");
+        t.status = SmartOrderStatus::Triggered;
+        t.triggered_at_ms = Some(NOW_MS);
+    }
+    let report = exec
+        .reconcile_smart_orders(NOW_MS + 1_000, true, &HashMap::new())
+        .await
+        .unwrap();
+    // Degraded with id_mismatch; the foreign payload never became a finding.
+    assert!(
+        report.degraded.contains(&"id_mismatch"),
+        "id mismatch must degrade the pass: {report:?}"
+    );
+    assert!(
+        report.findings.is_empty(),
+        "a mismatched payload must never be classified: {report:?}"
+    );
+    // The tracked order stays TRIGGERED (live) — NOT terminalized.
+    let book = exec.smart_book();
+    let g = book.lock().await;
+    let t = g.get("oco_hi1").expect("still tracked");
+    assert_eq!(
+        t.status,
+        SmartOrderStatus::Triggered,
+        "foreign COMPLETED echo must NOT terminalize the live OCO"
+    );
 }
