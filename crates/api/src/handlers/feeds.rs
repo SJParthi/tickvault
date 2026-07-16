@@ -149,10 +149,34 @@ pub async fn set_feed(
             StatusCode::CONFLICT,
             Json(FeedErrorResponse {
                 error: "the Dhan live feed was retired by operator directive 2026-07-13 \
-                     and its lane code was deleted (Dhan is REST-only now; Groww is the \
-                     live feed) — enabling it at runtime is permanently refused because \
+                     and its lane code was deleted (both brokers are REST-only since the \
+                     2026-07-15 Groww retirement) — enabling it at runtime is permanently refused because \
                      nothing exists to start; re-introducing the Dhan live WS requires a \
                      fresh dated operator quote in the scope-lock rule file first"
+                    .to_string(),
+                allowed: toggleable_except_dhan_labels(),
+            }),
+        ));
+    }
+
+    // S2b refusal (operator directive 2026-07-15 — "remove the whole Groww
+    // live feed; keep only spot 1m and option chain for both brokers"): the
+    // Groww live feed machinery (sidecar, bridge, activation lane) is
+    // DELETED — nothing exists to start, on ANY config. Accepting an enable
+    // would be a false-OK (flag flipped + persisted while no lane can ever
+    // run). Mirrors the Dhan 2026-07-13 refusal above. The REST legs are
+    // config-gated ([groww_spot_1m] / [groww_option_chain_1m] /
+    // [groww_contract_1m]) and independent of this flag.
+    if feed == Feed::Groww && req.enabled {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(FeedErrorResponse {
+                error: "the Groww live feed was retired by operator directive 2026-07-15 \
+                     and its lane code was deleted (the per-minute REST legs are \
+                     config-gated and unaffected) — enabling it at runtime is permanently \
+                     refused because nothing exists to start; re-introducing the Groww \
+                     live feed requires a fresh dated operator quote in the scope rule \
+                     file first"
                     .to_string(),
                 allowed: toggleable_except_dhan_labels(),
             }),
@@ -184,19 +208,9 @@ pub async fn set_feed(
         enabled = req.enabled,
         "feed runtime toggled via API"
     );
-    // Honesty (3-agent hostile review): the Groww lane is spawned dormant at boot
-    // and the activation watcher cold-STARTS it at runtime on enable — NO restart
-    // needed (PR-1). `groww_lane_running` is still false at this instant because
-    // activation (tables + auth + watch-list build) takes a few seconds; the
-    // response carries it so the truth is machine-readable and the page polls
-    // until it flips to running. This is an info, not a "needs restart".
-    if feed == Feed::Groww && req.enabled && !state.feed_runtime().is_groww_lane_running() {
-        info!(
-            "feed 'groww' enabled via API — the dormant lane is cold-starting now \
-             (ensuring tables, auth smoke-check, building the watch-list); no restart \
-             needed. It reports running once the watch-list is built (a few seconds)."
-        );
-    }
+    // S2b (2026-07-15): the Groww-enable path never reaches here anymore —
+    // the unconditional 409 above owns it; only DISABLE (both feeds) and the
+    // legacy Dhan-disable gate flow through.
     // PR-C2 (2026-07-13): the Dhan-enable path never reaches here anymore —
     // the unconditional 409 above owns it — so the old boot-ON
     // "re-activation transient" warn is deleted with the lane.
@@ -270,6 +284,11 @@ pub struct FeedHealthRow {
     pub auth_rejected: bool,
     /// Seconds since the last tick; `null` = none yet.
     pub last_tick_age_secs: Option<u64>,
+    /// Additive read-only freshness verdict: `true` when the feed's last tick
+    /// is within the 60s decision-freshness bound (the §38.8 gate primitive,
+    /// `tickvault_common::live_bar_freshness::live_bar_is_fresh`). `None` age
+    /// (no tick seen) reads `false` — fail-closed, never a false-OK.
+    pub fresh_within_60s: bool,
     pub ticks_total: u64,
     pub candles_total: u64,
     pub drops_total: u64,
@@ -294,11 +313,6 @@ pub struct FeedHealthRow {
 pub struct FeedsHealthResponse {
     pub market_open: bool,
     pub feeds: Vec<FeedHealthRow>,
-    /// §34 PR-3 (Item 12): the Groww auto-scale panel (ladder state + one
-    /// health row per connection). `null` / absent when scale mode is off or
-    /// the ladder has not published yet.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub groww_scale: Option<crate::feed_state::GrowwScaleSnapshot>,
 }
 
 /// Current IST epoch nanos (Utc::now + IST offset) for last-tick-age math.
@@ -349,6 +363,19 @@ pub async fn get_feeds_health(State(state): State<SharedAppState>) -> Json<Feeds
                 lane_running: report.input.lane_running,
                 connected: report.input.connected,
                 last_tick_age_secs: report.input.last_tick_age_secs,
+                // Age → freshness via the shared primitive: an age of A secs is
+                // a bar stamped A secs ago, so fresh ⇔ live_bar_is_fresh(0, A, T).
+                // `None` (no tick yet) reads false — fail-closed (Rule 11).
+                fresh_within_60s: report.input.last_tick_age_secs.is_some_and(|age| {
+                    /// Read-only display bound for the /api/feeds/health page
+                    /// (mirrors the §38.8 ~60s decision-freshness threshold).
+                    const FEEDS_HEALTH_FRESH_SECS: u64 = 60;
+                    tickvault_common::live_bar_freshness::live_bar_is_fresh(
+                        0,
+                        age,
+                        FEEDS_HEALTH_FRESH_SECS,
+                    )
+                }),
                 ticks_total: report.input.ticks_total,
                 candles_total: report.input.candles_total,
                 drops_total: report.input.drops_total,
@@ -363,11 +390,7 @@ pub async fn get_feeds_health(State(state): State<SharedAppState>) -> Json<Feeds
         })
         .collect();
 
-    Json(FeedsHealthResponse {
-        market_open,
-        feeds,
-        groww_scale: runtime.groww_scale_snapshot().map(|s| (*s).clone()),
-    })
+    Json(FeedsHealthResponse { market_open, feeds })
 }
 
 #[cfg(test)]
@@ -487,60 +510,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_feeds_health_includes_connections_array() {
-        // §34 PR-3 (Item 12): once the ladder publishes a scale snapshot, the
-        // health payload carries it — ladder state + one row per connection.
-        // test coverage (pub-fn-test-guard lines): set_groww_scale_snapshot groww_scale_snapshot
-        use crate::feed_state::{GrowwScaleConnRow, GrowwScaleSnapshot};
-        let state = test_state(FeedsConfig {
-            dhan_enabled: false,
-            groww_enabled: true,
-            ..Default::default()
-        });
-        // Before the ladder publishes: absent (None), serialized away entirely.
-        let Json(before) = get_feeds_health(State(state.clone())).await;
-        assert!(before.groww_scale.is_none(), "no snapshot before publish");
-        // The ladder publishes a 2-conn snapshot.
-        state
-            .feed_runtime()
-            .set_groww_scale_snapshot(Arc::new(GrowwScaleSnapshot {
-                ladder_state: "holding",
-                desired_conns: 2,
-                target_conns: 10,
-                probe_mode: false,
-                smoke: false,
-                connections: vec![
-                    GrowwScaleConnRow {
-                        conn_id: 0,
-                        desired: true,
-                        subscribed_proof: true,
-                        tick_file_bytes: 4096,
-                        last_capture_age_secs: Some(3),
-                    },
-                    GrowwScaleConnRow {
-                        conn_id: 1,
-                        desired: true,
-                        subscribed_proof: false,
-                        tick_file_bytes: 0,
-                        last_capture_age_secs: None,
-                    },
-                ],
-            }));
-        let Json(resp) = get_feeds_health(State(state)).await;
-        let scale = resp.groww_scale.expect("snapshot after publish");
-        assert_eq!(scale.ladder_state, "holding");
-        assert_eq!(scale.desired_conns, 2);
-        assert_eq!(scale.connections.len(), 2);
-        assert_eq!(scale.connections[0].conn_id, 0);
-        assert!(scale.connections[0].subscribed_proof);
-        assert_eq!(scale.connections[1].tick_file_bytes, 0);
-        // The JSON shape the /feeds page reads: `connections` array present.
-        let json = serde_json::to_value(&scale).expect("serializes");
-        assert!(json["connections"].is_array());
-        assert_eq!(json["connections"].as_array().map(Vec::len), Some(2));
-    }
-
-    #[tokio::test]
     async fn test_get_feeds_reports_seeded_state() {
         let state = test_state(FeedsConfig {
             dhan_enabled: true,
@@ -552,8 +521,11 @@ mod tests {
         assert!(!resp.groww_enabled);
     }
 
+    /// S2b (2026-07-15): the Groww live feed is retired — enabling it at
+    /// runtime is permanently refused with 409 (the Dhan 2026-07-13
+    /// precedent), and the runtime flag is NEVER flipped or persisted.
     #[tokio::test]
-    async fn test_set_feed_groww_enable_flips_state() {
+    async fn test_set_feed_groww_enable_refused_409_after_retirement() {
         let state = test_state(FeedsConfig {
             dhan_enabled: true,
             groww_enabled: false,
@@ -565,9 +537,20 @@ mod tests {
             Json(SetFeedRequest { enabled: true }),
         )
         .await;
-        let Json(resp) = res.expect("groww enable must succeed");
-        assert!(resp.groww_enabled, "groww now enabled");
-        assert!(state.feed_runtime().is_enabled(Feed::Groww));
+        let Err((code, Json(body))) = res else {
+            panic!("groww enable must be refused after the 2026-07-15 retirement");
+        };
+        assert_eq!(code, StatusCode::CONFLICT);
+        assert!(
+            body.error
+                .contains("retired by operator directive 2026-07-15"),
+            "got: {}",
+            body.error
+        );
+        assert!(
+            !state.feed_runtime().is_enabled(Feed::Groww),
+            "the refused enable must not flip the runtime flag"
+        );
     }
 
     #[tokio::test]
@@ -586,31 +569,6 @@ mod tests {
         let Json(resp) = res.expect("groww disable must succeed");
         assert!(!resp.groww_enabled);
         assert!(!state.feed_runtime().is_enabled(Feed::Groww));
-    }
-
-    #[tokio::test]
-    async fn test_enabling_groww_reports_lane_not_yet_running_during_cold_start() {
-        // Honesty: enabling Groww via API records the flag and the dormant lane
-        // cold-starts at runtime (PR-1, no restart). Immediately after the call the
-        // lane is not YET running (activation takes a few seconds), so the response
-        // reports groww_lane_running=false — an honest transient, not "needs restart".
-        let state = test_state(FeedsConfig {
-            dhan_enabled: true,
-            groww_enabled: false,
-            ..Default::default()
-        });
-        let Json(resp) = set_feed(
-            State(state),
-            Path("groww".to_string()),
-            Json(SetFeedRequest { enabled: true }),
-        )
-        .await
-        .expect("enable accepted");
-        assert!(resp.groww_enabled, "flag recorded");
-        assert!(
-            !resp.groww_lane_running,
-            "lane not yet running this instant — it cold-starts within seconds (no restart)"
-        );
     }
 
     #[tokio::test]
@@ -794,22 +752,15 @@ mod tests {
         }
     }
 
-    /// Groww toggles are UNAFFECTED by the Dhan retirement gate.
+    /// A Groww DISABLE is UNAFFECTED by the Dhan retirement gate (and by the
+    /// 2026-07-15 Groww-enable refusal — disable narrows, never widens).
     #[tokio::test]
-    async fn test_set_feed_groww_toggles_unaffected_when_dhan_config_off() {
+    async fn test_set_feed_groww_disable_unaffected_when_dhan_config_off() {
         let state = test_state(FeedsConfig {
             dhan_enabled: false,
-            groww_enabled: false,
+            groww_enabled: true,
             ..Default::default()
         });
-        let Json(on) = set_feed(
-            State(state.clone()),
-            Path("groww".to_string()),
-            Json(SetFeedRequest { enabled: true }),
-        )
-        .await
-        .expect("groww enable unaffected");
-        assert!(on.groww_enabled);
         let Json(off) = set_feed(
             State(state.clone()),
             Path("groww".to_string()),

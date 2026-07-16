@@ -96,9 +96,9 @@ harness = false
 # [[bench]] tick_gap_detector removed in PR-C3 (2026-07-14) with the
 # deleted tick-gap detector module (operator Q4-ii 2026-07-13).
 
-[[bench]]
-name = "slo_score"
-harness = false
+# [[bench]] slo_score removed in the C4 sweep (2026-07-15) with the deleted
+# slo_score.rs contract stub + the SLO-01/02/03 variants (wave-3-d PARK
+# banner: "Phase C variant cleanup").
 
 [[bench]]
 name = "feed_lag_ring"
@@ -106,6 +106,10 @@ harness = false
 
 [[bench]]
 name = "feed_presence"
+harness = false
+
+[[bench]]
+name = "moneyness"
 harness = false
 
 # PR-C3 (2026-07-14): the `ntm_subscription_proof` example entry was deleted

@@ -58,6 +58,11 @@ notify = { workspace = true }
 # Only the feature-gated daily-universe boot orchestrator hashes the CSV
 # (source_csv_sha256 provenance); optional so the default build stays lean.
 
+[dev-dependencies]
+# start_paused virtual-time tests for the exit-execution verify ladder
+# (same pattern as crates/core + crates/api dev-deps).
+tokio = { workspace = true, features = ["test-util"] }
+
 [features]
 # PR-C3 (2026-07-14): the `daily_universe_fetcher` feature (and its sha2
 # optional dep) was DELETED with the Dhan instrument-download chain

@@ -7,7 +7,8 @@
 
 ---
 
-> **⚠ RETIREMENT AUTHORIZED 2026-07-13 (deletion lands with the Phase C PRs):**
+> **⚠ RETIREMENT AUTHORIZED 2026-07-13 (deletion lands with the Phase C PRs) —
+> variant DELETED in the C4 sweep (2026-07-15):**
 > `NTM-CONSTITUENCY-01` (`NtmConstituency01SourceDegraded`) retires with the Dhan live WS
 > — its emit site is the DHAN-side universe-build degrade path (Q1/Q3, 2026-07-13;
 > `websocket-connection-scope-lock.md` "2026-07-13 Amendment"). The §31 NTM contract

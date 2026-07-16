@@ -43,6 +43,8 @@ else
   echo "Other places the same result shows up:"
   echo "  - QuestDB table : $TABLE  (open 'make questdb' → localhost:9000)"
   echo "  - Telegram      : a per-day summary at ~15:31 IST (compared / mismatches / missing)"
-  echo "  - Logs          : CROSS-VERIFY-1M-01 (mismatch) / -02 (fetch degraded) in errors.jsonl"
+  echo "  - Logs          : CROSS-VERIFY-1M-01/-02 lines exist only in HISTORICAL errors.jsonl"
+  echo "                    (the cross-verify module retired 2026-07-13 with the Dhan live WS;"
+  echo "                    its ErrorCode variants were deleted in the C4 sweep 2026-07-15)"
 fi
 echo "========================================================================="

@@ -36,12 +36,13 @@ use tracing::{debug, error, info, warn};
 /// network) and many signals were missed.
 const TRADING_PIPELINE_LAG_ERROR_THRESHOLD: u64 = 1_000;
 
-use tickvault_common::config::ApplicationConfig;
+use tickvault_common::config::{ApplicationConfig, OmsReconcileConfig};
 use tickvault_common::constants::{IST_UTC_OFFSET_SECONDS, MAX_INDICATOR_INSTRUMENTS};
 use tickvault_common::order_types::{
     OrderType, OrderUpdate, OrderValidity, ProductType, TransactionType,
 };
 use tickvault_common::tick_types::ParsedTick;
+use tickvault_common::trading_calendar::TradingCalendar;
 use tickvault_core::auth::token_manager::TokenHandle;
 
 use tickvault_trading::indicator::{IndicatorEngine, IndicatorParams};
@@ -129,6 +130,21 @@ pub struct TradingPipelineConfig {
     pub client_id: String,
     /// Token handle for authentication.
     pub token_handle: TokenHandle,
+    /// `[oms_reconcile]` scheduled OMS reconciliation settings (default OFF).
+    pub oms_reconcile: OmsReconcileConfig,
+    /// NSE trading calendar for the reconcile gate (`None` ⇒ weekday-only
+    /// fallback — the pipeline must never fail to spawn over a holiday-list
+    /// parse problem).
+    pub trading_calendar: Option<std::sync::Arc<TradingCalendar>>,
+    /// `[exit_orders]` — 🔷 DHAN exit-order layer (Cluster B, 2026-07-14).
+    /// The `Signal::Exit` arm routes through
+    /// `exit_execution::execute_exit_for_security` with this; disabled
+    /// (the default) ⇒ behavior-equivalent legacy cancel+close behavior
+    /// (identical control flow and API calls; log fields upgraded to
+    /// redacted rendering per the M1 fix).
+    /// Field appended at the END per the Cluster A/B field-append
+    /// discipline (design §4).
+    pub exit_orders: tickvault_common::config::ExitOrdersConfig,
 }
 
 /// Spawns the trading pipeline as a background task.
@@ -296,6 +312,35 @@ async fn run_trading_pipeline(
         warn!("LIVE TRADING MODE — real orders WILL be placed");
     }
 
+    // 🔷 DHAN exit-order layer boot honesty (Cluster B, design §7): a
+    // config flip is never a silent no-op — one line names the mode; the
+    // live path stays gated by the engine's hardcoded dry_run (LOCK #3).
+    info!(
+        enabled = config.exit_orders.enabled,
+        "exit-order layer: {} (dry-run paper mode — live path gated by hardcoded dry_run)",
+        if config.exit_orders.enabled {
+            "ENABLED"
+        } else {
+            "disabled"
+        }
+    );
+    if config.exit_orders.enabled {
+        let today_ist = (chrono::Utc::now()
+            + chrono::TimeDelta::seconds(i64::from(IST_UTC_OFFSET_SECONDS)))
+        .date_naive();
+        if tickvault_common::config::freeze_review_is_stale(
+            &config.exit_orders.freeze_limits_reviewed_on,
+            today_ist,
+        ) {
+            warn!(
+                reviewed_on = %config.exit_orders.freeze_limits_reviewed_on,
+                "exit-order freeze-limit review is STALE (>90 days old or unparsable) — \
+                 re-verify [exit_orders].default_freeze_limit_qty against the NSE \
+                 quantity-freeze file before trusting sliced closes"
+            );
+        }
+    }
+
     let mut ticks_processed: u64 = 0;
     let mut signals_generated: u64 = 0;
 
@@ -319,6 +364,27 @@ async fn run_trading_pipeline(
     let m_pipeline_heartbeat = metrics::gauge!("tv_trading_pipeline_heartbeat");
     // O4: Lagged ticks counter — tracks ticks permanently lost to broadcast lag.
     let m_pipeline_lagged = metrics::counter!("tv_trading_pipeline_ticks_lagged_total");
+
+    // Scheduled OMS reconcile (config-gated, DEFAULT-OFF). The timer exists
+    // only when enabled; the select! arm pends forever otherwise (the
+    // make_reset_future house pattern — zero timer, zero cost).
+    let reconcile_cfg = config.oms_reconcile;
+    let trading_calendar = config.trading_calendar;
+    let mut reconcile_interval = make_reconcile_interval(&reconcile_cfg);
+    let mut reconcile_failure_streak: u32 = 0;
+    // Static-label outcome counters, pre-registered at 0 (first-sample-
+    // baseline discipline; /metrics-local, not CloudWatch-shipped).
+    let m_reconcile_ok = metrics::counter!("tv_oms_reconcile_runs_total", "outcome" => "ok");
+    let m_reconcile_ok_dry_run =
+        metrics::counter!("tv_oms_reconcile_runs_total", "outcome" => "ok_dry_run");
+    let m_reconcile_failed =
+        metrics::counter!("tv_oms_reconcile_runs_total", "outcome" => "failed");
+    let m_reconcile_skipped =
+        metrics::counter!("tv_oms_reconcile_runs_total", "outcome" => "skipped_gate");
+    m_reconcile_ok.absolute(0);
+    m_reconcile_ok_dry_run.absolute(0);
+    m_reconcile_failed.absolute(0);
+    m_reconcile_skipped.absolute(0);
 
     loop {
         // O3: Heartbeat on every loop iteration.
@@ -529,99 +595,36 @@ async fn run_trading_pipeline(
                                         strategy = %strategy.definition().name,
                                         "EXIT signal"
                                     );
-                                    // Step 1: Cancel active (unfilled/pending) orders for this security
-                                    let active: Vec<String> = oms
-                                        .active_orders()
-                                        .iter()
-                                        .filter(|o| o.security_id == tick.security_id)
-                                        .map(|o| o.order_id.clone())
-                                        .collect();
-                                    for order_id in active {
-                                        match oms.cancel_order(&order_id).await {
-                                            Ok(()) => {
-                                                order_side_send(&order_side, OrderSideMsg::Cancelled {
-                                                    order_id,
-                                                });
-                                            }
-                                            Err(err) => {
-                                                warn!(
-                                                    ?err,
-                                                    order_id = %order_id,
-                                                    "EXIT signal → cancel failed"
-                                                );
-                                                order_side_send(&order_side, OrderSideMsg::CancelFailed {
-                                                    order_id,
-                                                    detail: format!("exit cancel: {err}"),
-                                                });
-                                            }
-                                        }
-                                    }
-                                    // Step 2: Close open position (if any filled lots exist)
-                                    let net_lots = risk_engine.net_lots_for(tick.security_id);
-                                    if net_lots != 0 {
-                                        let close_type = if net_lots > 0 {
-                                            TransactionType::Sell
-                                        } else {
-                                            TransactionType::Buy
-                                        };
-                                        let close_qty = net_lots.unsigned_abs() as i64;
-                                        info!(
-                                            security_id = tick.security_id,
-                                            net_lots,
-                                            close_type = ?close_type,
-                                            "EXIT signal → placing closing order for open position"
-                                        );
-                                        let close_request = PlaceOrderRequest {
-                                            security_id: tick.security_id,
-                                            transaction_type: close_type,
-                                            order_type: OrderType::Market,
-                                            product_type: ProductType::Intraday,
-                                            validity: OrderValidity::Day,
-                                            quantity: close_qty,
-                                            price: 0.0,
-                                            trigger_price: 0.0,
-                                            lot_size: 1,
-                                            expiry_date: None,
-                                        };
-                                        match oms.place_order(close_request).await {
-                                            Ok(order_id) => {
-                                                info!(
-                                                    order_id = %order_id,
-                                                    security_id = tick.security_id,
-                                                    net_lots,
-                                                    "EXIT signal → closing order placed"
-                                                );
-                                                order_side_send(&order_side, OrderSideMsg::Placed {
-                                                    order_id,
-                                                    correlation_id: String::new(),
-                                                    security_id: tick.security_id,
-                                                    exchange_segment:
-                                                        tickvault_common::segment::segment_code_to_str(
-                                                            tick.exchange_segment_code,
-                                                        ),
-                                                    transaction_type: if net_lots > 0 {
-                                                        "SELL"
-                                                    } else {
-                                                        "BUY"
-                                                    },
-                                                    quantity: close_qty,
-                                                    price: 0.0,
-                                                });
-                                            }
-                                            Err(err) => {
-                                                warn!(
-                                                    ?err,
-                                                    security_id = tick.security_id,
-                                                    "EXIT signal → closing order placement failed"
-                                                );
-                                                order_side_send(&order_side, OrderSideMsg::PlaceFailed {
-                                                    correlation_id: String::new(),
-                                                    security_id: tick.security_id,
-                                                    detail: format!("exit close: {err}"),
-                                                });
-                                            }
-                                        }
-                                    }
+                                    // 🔷 DHAN exit-order layer (Cluster B, design §3.10):
+                                    // disabled (the shipped default) ⇒ the delegate runs the
+                                    // behavior-equivalent legacy cancel+close body (identical
+                                    // control flow and API calls; redacted log rendering per
+                                    // the M1 fix); enabled ⇒
+                                    // ExitCommand::CloseAll through the dispatcher (super-
+                                    // order-aware cancel + sliced close + MPP verify ladder).
+                                    // The delegate carries the cluster-C order-side
+                                    // observability (#1554) so the exit cancels/closes still
+                                    // land in order_audit — audit-row-only, no Telegram.
+                                    //
+                                    // HONEST BLOCKING ENVELOPE (H3, 2026-07-14 hostile
+                                    // review): while [exit_orders] is ENABLED this await
+                                    // stalls THE STRATEGY TASK for up to
+                                    // ~mpp_verify_deadline_secs per close order (the
+                                    // CloseAll verify budget bounds the multi-slice case to
+                                    // ONE deadline) — ticks buffer in the broadcast channel
+                                    // meanwhile and order updates may lag. Accepted for the
+                                    // dry-run layer; the PRE-LIVE design change is a
+                                    // SPAWNED exit executor (rule-file §4 enable-time
+                                    // protocol).
+                                    crate::exit_execution::execute_exit_for_security(
+                                        &mut oms,
+                                        &mut risk_engine,
+                                        tick.security_id,
+                                        &config.exit_orders,
+                                        &order_side,
+                                        tick.exchange_segment_code,
+                                    )
+                                    .await;
                                 }
                             }
                         }
@@ -784,6 +787,135 @@ async fn run_trading_pipeline(
                 // Re-arm the signal for the next day (if app runs overnight).
                 wait_for_reset = make_reset_future(&daily_reset_signal);
             }
+
+            // Scheduled OMS reconcile (config-gated, DEFAULT-OFF). With the
+            // loop disabled there is no timer and this arm pends forever.
+            // `interval_at(now + period)` skipped the boot-instant tick and
+            // MissedTickBehavior::Skip prevents a catch-up burst.
+            _ = async {
+                match reconcile_interval.as_mut() {
+                    Some(interval) => {
+                        interval.tick().await;
+                    }
+                    None => std::future::pending::<()>().await,
+                }
+            } => {
+                // Rule 3 market-hours gate, re-checked on every tick.
+                let now_utc = chrono::Utc::now().timestamp();
+                let now_ist = now_utc.saturating_add(i64::from(IST_UTC_OFFSET_SECONDS));
+                let ist_secs_of_day = now_ist.rem_euclid(86_400) as u32;
+                let calendar_says_trading_day = trading_calendar
+                    .as_ref()
+                    .map(|calendar| calendar.is_trading_day_today());
+                let weekday_is_mon_to_fri = chrono::DateTime::from_timestamp(now_ist, 0)
+                    .is_some_and(|ist_wall_clock| {
+                        chrono::Datelike::weekday(&ist_wall_clock).num_days_from_monday() < 5
+                    });
+                if should_run_scheduled_reconcile(
+                    // The timer only exists when the config enabled the loop.
+                    true,
+                    reconcile_cfg.trading_hours_only,
+                    calendar_says_trading_day,
+                    weekday_is_mon_to_fri,
+                    ist_secs_of_day,
+                ) {
+                    // Deliberately NO rate-limiter / circuit-breaker
+                    // participation: reconcile() bypasses both by design
+                    // (no starvation of live cancels, no breaker poisoning)
+                    // and dry-run short-circuits before any HTTP.
+                    //
+                    // M2 (flagged follow-up, OMS build lead): the scheduled
+                    // reconcile applies broker-snapshot corrections that can
+                    // race FRESHER local state from the live order-update WS
+                    // — including terminal states — between the GET and the
+                    // apply. The engine-side ordering guard is a follow-up;
+                    // this arm only bounds and counts the run.
+                    //
+                    // E1 honest envelope: in live mode reconcile() performs a
+                    // GET that would otherwise block THIS select! loop —
+                    // tick/fill draining included — for up to the ~5s OMS
+                    // HTTP timeout. The 2s bound + the ≥60s interval floor
+                    // caps the stall duty; the structural home for this call
+                    // moves to the order runtime actor post-rebase. A timeout
+                    // elapse counts as a FAILED run (outcome="failed").
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(RECONCILE_ARM_TIMEOUT_SECS),
+                        oms.reconcile(),
+                    )
+                    .await
+                    {
+                        Ok(Ok(report)) => {
+                            reconcile_failure_streak = 0;
+                            // Cov#3: a dry-run "success" reconciled NOTHING
+                            // (the engine short-circuits pre-HTTP) — count it
+                            // under its own static outcome so the "ok" series
+                            // only ever means a real broker-snapshot compare.
+                            if oms.is_dry_run() {
+                                m_reconcile_ok_dry_run.increment(1);
+                            } else {
+                                m_reconcile_ok.increment(1);
+                            }
+                            debug!(
+                                total_checked = report.total_checked,
+                                dry_run = oms.is_dry_run(),
+                                "scheduled OMS reconcile run completed"
+                            );
+                        }
+                        Ok(Err(err)) => {
+                            m_reconcile_failed.increment(1);
+                            let (next_streak, fire_edge) =
+                                advance_reconcile_failure_streak(reconcile_failure_streak);
+                            reconcile_failure_streak = next_streak;
+                            warn!(
+                                ?err,
+                                consecutive = reconcile_failure_streak,
+                                "scheduled OMS reconcile run failed — the next interval retries"
+                            );
+                            if fire_edge {
+                                // Edge-latched: fires ONCE at the rising edge of
+                                // 3 consecutive failures; re-armed on success.
+                                error!(
+                                    code = tickvault_common::error_code::ErrorCode::OmsGapReconciliation.code_str(),
+                                    stage = "fetch_failed_streak",
+                                    consecutive = reconcile_failure_streak,
+                                    "OMS-GAP-02: scheduled reconcile failed 3 consecutive runs — \
+                                     OMS state may diverge from the Dhan order book until a run succeeds"
+                                );
+                            }
+                        }
+                        Err(_elapsed) => {
+                            // E1: the run outlived the arm bound — counted as
+                            // a failed run so the streak/edge semantics are
+                            // identical to a typed OMS error.
+                            m_reconcile_failed.increment(1);
+                            let (next_streak, fire_edge) =
+                                advance_reconcile_failure_streak(reconcile_failure_streak);
+                            reconcile_failure_streak = next_streak;
+                            warn!(
+                                timeout_secs = RECONCILE_ARM_TIMEOUT_SECS,
+                                consecutive = reconcile_failure_streak,
+                                "scheduled OMS reconcile timed out — counted as failed; \
+                                 the next interval retries"
+                            );
+                            if fire_edge {
+                                error!(
+                                    code = tickvault_common::error_code::ErrorCode::OmsGapReconciliation.code_str(),
+                                    stage = "fetch_failed_streak",
+                                    consecutive = reconcile_failure_streak,
+                                    "OMS-GAP-02: scheduled reconcile failed 3 consecutive runs — \
+                                     OMS state may diverge from the Dhan order book until a run succeeds"
+                                );
+                            }
+                        }
+                    }
+                } else {
+                    m_reconcile_skipped.increment(1);
+                    debug!(
+                        ist_secs_of_day,
+                        "scheduled OMS reconcile skipped by the trading-hours gate"
+                    );
+                }
+            }
         }
     }
 
@@ -863,9 +995,97 @@ pub fn init_trading_pipeline(
         },
         client_id: client_id.to_owned(),
         token_handle: token_handle.clone(),
+        oms_reconcile: config.oms_reconcile.clone(),
+        // Calendar-inside-init: build the NSE trading calendar for the
+        // reconcile gate HERE so main.rs stays untouched (both dhan-gated
+        // spawn sites flow through this fn). Err ⇒ weekday-only fallback —
+        // the pipeline must never fail to spawn over a holiday-list parse
+        // problem.
+        trading_calendar: match TradingCalendar::from_config(&config.trading) {
+            Ok(calendar) => Some(std::sync::Arc::new(calendar)),
+            Err(err) => {
+                warn!(
+                    ?err,
+                    "trading calendar unavailable for the reconcile gate — \
+                     falling back to a weekday-only trading-day check"
+                );
+                None
+            }
+        },
+        exit_orders: config.exit_orders.clone(),
     };
 
     Some((pipeline_config, hot_reloader))
+}
+
+// ---------------------------------------------------------------------------
+// Scheduled OMS reconcile — timer + pure gate helpers
+// ---------------------------------------------------------------------------
+
+/// Consecutive scheduled-reconcile failures at which the ONE edge-latched
+/// ERROR (code OMS-GAP-02) fires; the latch re-arms on the next success.
+const RECONCILE_FAILURE_EDGE_THRESHOLD: u32 = 3;
+
+/// Hard bound on a single scheduled reconcile run (E1). Honest envelope: in
+/// live mode `reconcile()` performs a GET against the Dhan REST API and
+/// otherwise blocks the trading-pipeline `select!` loop — tick/fill draining
+/// included — for up to the ~5s OMS HTTP timeout. The 2s bound plus the
+/// ≥60s interval floor caps the stall duty cycle; the structural home for
+/// this call moves to the order runtime actor post-rebase (flagged
+/// follow-up). A timeout elapse counts as a FAILED run (outcome="failed",
+/// streak advanced).
+const RECONCILE_ARM_TIMEOUT_SECS: u64 = 2;
+
+/// Builds the scheduled-reconcile timer, or `None` when the loop is
+/// disabled (the select! arm then awaits `std::future::pending()` — the
+/// `make_reset_future` house pattern: zero timer, zero cost).
+///
+/// `interval_at(now + period, period)` skips the immediate t=0 tick (no
+/// boot-instant reconcile before the OMS/WS are warm) and
+/// `MissedTickBehavior::Skip` prevents a catch-up burst after a
+/// suspend/stall.
+fn make_reconcile_interval(cfg: &OmsReconcileConfig) -> Option<tokio::time::Interval> {
+    if !cfg.enabled {
+        return None;
+    }
+    let period = std::time::Duration::from_secs(cfg.interval_secs.max(1));
+    let mut interval = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    Some(interval)
+}
+
+/// Pure per-tick gate for the scheduled OMS reconcile arm.
+///
+/// Allows a run when the loop is enabled AND (when `trading_hours_only`)
+/// today is an NSE trading day — the calendar answer when available,
+/// else the chrono weekday fallback — AND the IST wall clock is inside
+/// [09:15:00, 15:30:00) (33_300..55_800 seconds-of-day, the file's
+/// existing session literal).
+fn should_run_scheduled_reconcile(
+    enabled: bool,
+    trading_hours_only: bool,
+    calendar_says_trading_day: Option<bool>,
+    weekday_is_mon_to_fri: bool,
+    ist_secs_of_day: u32,
+) -> bool {
+    if !enabled {
+        return false;
+    }
+    if !trading_hours_only {
+        return true;
+    }
+    let day_ok = calendar_says_trading_day.unwrap_or(weekday_is_mon_to_fri);
+    // 09:15:00 = 33300s, 15:29:59 = 55799s
+    day_ok && (33_300..55_800).contains(&ist_secs_of_day)
+}
+
+/// Advances the consecutive-failure streak. Returns `(next_streak,
+/// fire_edge)` where `fire_edge` is true ONLY at the rising edge
+/// (`next_streak == RECONCILE_FAILURE_EDGE_THRESHOLD`) so the ERROR fires
+/// once per failing episode, never per failure (audit Rule 4).
+fn advance_reconcile_failure_streak(streak: u32) -> (u32, bool) {
+    let next = streak.saturating_add(1);
+    (next, next == RECONCILE_FAILURE_EDGE_THRESHOLD)
 }
 
 // ---------------------------------------------------------------------------
@@ -1216,6 +1436,8 @@ threshold = 70.0
     fn test_trading_pipeline_config_fields_are_accessible() {
         let handle = make_token_handle_with_value("test");
         let config = TradingPipelineConfig {
+            oms_reconcile: OmsReconcileConfig::default(),
+            trading_calendar: None,
             indicator_params: IndicatorParams::default(),
             strategies: Vec::new(),
             max_daily_loss_percent: 2.0,
@@ -1226,9 +1448,14 @@ threshold = 70.0
             rest_api_base_url: "https://api.dhan.co/v2".to_owned(),
             client_id: "test_client".to_owned(),
             token_handle: handle,
+            exit_orders: tickvault_common::config::ExitOrdersConfig::default(),
         };
 
         assert!(config.dry_run, "dry_run must be true for safety");
+        assert!(
+            !config.exit_orders.enabled,
+            "exit-order layer must default OFF (LOCK #1)"
+        );
         assert!((config.max_daily_loss_percent - 2.0).abs() < f64::EPSILON);
         assert_eq!(config.max_position_lots, 10);
         assert!((config.capital - 500_000.0).abs() < f64::EPSILON);
@@ -1288,6 +1515,8 @@ threshold = 25.0
             .collect();
 
         let config = TradingPipelineConfig {
+            oms_reconcile: OmsReconcileConfig::default(),
+            trading_calendar: None,
             indicator_params: params,
             strategies,
             max_daily_loss_percent: 3.0,
@@ -1298,6 +1527,7 @@ threshold = 25.0
             rest_api_base_url: "https://api.dhan.co/v2".to_owned(),
             client_id: "client_123".to_owned(),
             token_handle: handle,
+            exit_orders: tickvault_common::config::ExitOrdersConfig::default(),
         };
 
         assert_eq!(config.strategies.len(), 2);
@@ -1715,6 +1945,8 @@ threshold = 25.0
     fn test_pipeline_config_with_zero_capital() {
         let handle = make_token_handle_with_value("jwt");
         let config = TradingPipelineConfig {
+            oms_reconcile: OmsReconcileConfig::default(),
+            trading_calendar: None,
             indicator_params: IndicatorParams::default(),
             strategies: Vec::new(),
             max_daily_loss_percent: 2.0,
@@ -1725,6 +1957,7 @@ threshold = 25.0
             rest_api_base_url: "https://api.dhan.co/v2".to_owned(),
             client_id: "test".to_owned(),
             token_handle: handle,
+            exit_orders: tickvault_common::config::ExitOrdersConfig::default(),
         };
         // Zero capital is technically allowed at construction — risk engine
         // will handle this by immediately breaching daily loss threshold.
@@ -1736,6 +1969,8 @@ threshold = 25.0
         let handle = make_token_handle_with_value("jwt");
         // 100% daily loss limit (extreme)
         let config = TradingPipelineConfig {
+            oms_reconcile: OmsReconcileConfig::default(),
+            trading_calendar: None,
             indicator_params: IndicatorParams::default(),
             strategies: Vec::new(),
             max_daily_loss_percent: 100.0,
@@ -1746,6 +1981,7 @@ threshold = 25.0
             rest_api_base_url: "https://api.dhan.co/v2".to_owned(),
             client_id: "test".to_owned(),
             token_handle: handle,
+            exit_orders: tickvault_common::config::ExitOrdersConfig::default(),
         };
         assert!((config.max_daily_loss_percent - 100.0).abs() < f64::EPSILON);
     }
@@ -1765,6 +2001,8 @@ threshold = 25.0
             bollinger_multiplier: 1.5,
         };
         let config = TradingPipelineConfig {
+            oms_reconcile: OmsReconcileConfig::default(),
+            trading_calendar: None,
             indicator_params: custom_params,
             strategies: Vec::new(),
             max_daily_loss_percent: 2.0,
@@ -1775,6 +2013,7 @@ threshold = 25.0
             rest_api_base_url: "https://api.dhan.co/v2".to_owned(),
             client_id: "test".to_owned(),
             token_handle: handle,
+            exit_orders: tickvault_common::config::ExitOrdersConfig::default(),
         };
         assert_eq!(config.indicator_params.ema_fast_period, 5);
         assert_eq!(config.indicator_params.ema_slow_period, 10);
@@ -1788,6 +2027,8 @@ threshold = 25.0
         // This tests the opposite path from the safety default.
         let handle = make_token_handle_with_value("jwt");
         let config = TradingPipelineConfig {
+            oms_reconcile: OmsReconcileConfig::default(),
+            trading_calendar: None,
             indicator_params: IndicatorParams::default(),
             strategies: Vec::new(),
             max_daily_loss_percent: 1.0,
@@ -1798,6 +2039,7 @@ threshold = 25.0
             rest_api_base_url: "https://api.dhan.co/v2".to_owned(),
             client_id: "live_client".to_owned(),
             token_handle: handle,
+            exit_orders: tickvault_common::config::ExitOrdersConfig::default(),
         };
         assert!(
             !config.dry_run,
@@ -1810,6 +2052,8 @@ threshold = 25.0
     fn test_pipeline_config_with_one_order_per_second() {
         let handle = make_token_handle_with_value("jwt");
         let config = TradingPipelineConfig {
+            oms_reconcile: OmsReconcileConfig::default(),
+            trading_calendar: None,
             indicator_params: IndicatorParams::default(),
             strategies: Vec::new(),
             max_daily_loss_percent: 2.0,
@@ -1820,6 +2064,7 @@ threshold = 25.0
             rest_api_base_url: "https://api.dhan.co/v2".to_owned(),
             client_id: "test".to_owned(),
             token_handle: handle,
+            exit_orders: tickvault_common::config::ExitOrdersConfig::default(),
         };
         assert_eq!(config.max_orders_per_second, 1);
     }
@@ -2095,6 +2340,8 @@ threshold = 70.0
         let (_order_tx, order_rx) = broadcast::channel::<OrderUpdate>(16);
 
         let config = TradingPipelineConfig {
+            oms_reconcile: OmsReconcileConfig::default(),
+            trading_calendar: None,
             indicator_params: params,
             strategies,
             max_daily_loss_percent: 2.0,
@@ -2105,6 +2352,7 @@ threshold = 70.0
             rest_api_base_url: "https://api.dhan.co/v2".to_owned(),
             client_id: "test".to_owned(),
             token_handle: handle,
+            exit_orders: tickvault_common::config::ExitOrdersConfig::default(),
         };
 
         let task_handle = spawn_trading_pipeline(config, tick_rx, order_rx, None);
@@ -2142,6 +2390,8 @@ threshold = 70.0
         let (order_tx, order_rx) = broadcast::channel::<OrderUpdate>(16);
 
         let config = TradingPipelineConfig {
+            oms_reconcile: OmsReconcileConfig::default(),
+            trading_calendar: None,
             indicator_params: IndicatorParams::default(),
             strategies: Vec::new(),
             max_daily_loss_percent: 2.0,
@@ -2152,6 +2402,7 @@ threshold = 70.0
             rest_api_base_url: "https://api.dhan.co/v2".to_owned(),
             client_id: "test".to_owned(),
             token_handle: handle,
+            exit_orders: tickvault_common::config::ExitOrdersConfig::default(),
         };
 
         let task_handle = spawn_trading_pipeline(config, tick_rx, order_rx, None);
@@ -2189,6 +2440,8 @@ threshold = 70.0
         let (order_tx, order_rx) = broadcast::channel::<OrderUpdate>(16);
 
         let config = TradingPipelineConfig {
+            oms_reconcile: OmsReconcileConfig::default(),
+            trading_calendar: None,
             indicator_params: IndicatorParams::default(),
             strategies: Vec::new(),
             max_daily_loss_percent: 2.0,
@@ -2199,6 +2452,7 @@ threshold = 70.0
             rest_api_base_url: "https://api.dhan.co/v2".to_owned(),
             client_id: "test".to_owned(),
             token_handle: handle,
+            exit_orders: tickvault_common::config::ExitOrdersConfig::default(),
         };
 
         let task_handle = spawn_trading_pipeline(config, tick_rx, order_rx, None);
@@ -2352,6 +2606,8 @@ threshold = 70.0
         let (_order_tx, order_rx) = broadcast::channel::<OrderUpdate>(16);
 
         let config = TradingPipelineConfig {
+            oms_reconcile: OmsReconcileConfig::default(),
+            trading_calendar: None,
             indicator_params: IndicatorParams::default(),
             strategies: Vec::new(),
             max_daily_loss_percent: 2.0,
@@ -2362,6 +2618,7 @@ threshold = 70.0
             rest_api_base_url: "https://api.dhan.co/v2".to_owned(),
             client_id: "test".to_owned(),
             token_handle: handle,
+            exit_orders: tickvault_common::config::ExitOrdersConfig::default(),
         };
 
         let task_handle = spawn_trading_pipeline(config, tick_rx, order_rx, None);
@@ -2384,6 +2641,8 @@ threshold = 70.0
         let (_order_tx, order_rx) = broadcast::channel::<OrderUpdate>(16);
 
         let config = TradingPipelineConfig {
+            oms_reconcile: OmsReconcileConfig::default(),
+            trading_calendar: None,
             indicator_params: IndicatorParams::default(),
             strategies: Vec::new(),
             max_daily_loss_percent: 2.0,
@@ -2394,6 +2653,7 @@ threshold = 70.0
             rest_api_base_url: "https://api.dhan.co/v2".to_owned(),
             client_id: "test".to_owned(),
             token_handle: handle,
+            exit_orders: tickvault_common::config::ExitOrdersConfig::default(),
         };
 
         let task_handle = spawn_trading_pipeline(config, tick_rx, order_rx, None);
@@ -2481,6 +2741,11 @@ threshold = 70.0
         let (pipeline_config, _hot_reloader) = result.unwrap();
         assert!(pipeline_config.dry_run, "dry_run must default to true");
         assert_eq!(pipeline_config.strategies.len(), 1);
+        assert!(
+            !pipeline_config.exit_orders.enabled,
+            "base.toml carries [exit_orders] enabled = false (LOCK #1) — \
+             init_trading_pipeline must thread it through"
+        );
 
         let _ = std::fs::remove_file(&config_path);
         let _ = std::fs::remove_dir(&tmp_dir);
@@ -2553,6 +2818,8 @@ threshold = 70.0
         let (order_tx, order_rx) = broadcast::channel::<OrderUpdate>(2);
 
         let config = TradingPipelineConfig {
+            oms_reconcile: OmsReconcileConfig::default(),
+            trading_calendar: None,
             indicator_params: IndicatorParams::default(),
             strategies: Vec::new(),
             max_daily_loss_percent: 2.0,
@@ -2563,6 +2830,7 @@ threshold = 70.0
             rest_api_base_url: "https://api.dhan.co/v2".to_owned(),
             client_id: "test".to_owned(),
             token_handle: handle,
+            exit_orders: tickvault_common::config::ExitOrdersConfig::default(),
         };
 
         let task_handle = spawn_trading_pipeline(config, tick_rx, order_rx, None);
@@ -2596,6 +2864,8 @@ threshold = 70.0
         let (_order_tx, order_rx) = broadcast::channel::<OrderUpdate>(16);
 
         let config = TradingPipelineConfig {
+            oms_reconcile: OmsReconcileConfig::default(),
+            trading_calendar: None,
             indicator_params: IndicatorParams::default(),
             strategies: Vec::new(),
             max_daily_loss_percent: 2.0,
@@ -2606,6 +2876,7 @@ threshold = 70.0
             rest_api_base_url: "https://api.dhan.co/v2".to_owned(),
             client_id: "test".to_owned(),
             token_handle: handle,
+            exit_orders: tickvault_common::config::ExitOrdersConfig::default(),
         };
 
         let task_handle = spawn_trading_pipeline(config, tick_rx, order_rx, None);
@@ -2634,6 +2905,8 @@ threshold = 70.0
         let (order_tx, order_rx) = broadcast::channel::<OrderUpdate>(16);
 
         let config = TradingPipelineConfig {
+            oms_reconcile: OmsReconcileConfig::default(),
+            trading_calendar: None,
             indicator_params: IndicatorParams::default(),
             strategies: Vec::new(),
             max_daily_loss_percent: 2.0,
@@ -2644,6 +2917,7 @@ threshold = 70.0
             rest_api_base_url: "https://api.dhan.co/v2".to_owned(),
             client_id: "test".to_owned(),
             token_handle: handle,
+            exit_orders: tickvault_common::config::ExitOrdersConfig::default(),
         };
 
         let task_handle = spawn_trading_pipeline(config, tick_rx, order_rx, None);
@@ -2732,6 +3006,8 @@ threshold = 70.0
         let (_order_tx, order_rx) = broadcast::channel::<OrderUpdate>(16);
 
         let config = TradingPipelineConfig {
+            oms_reconcile: OmsReconcileConfig::default(),
+            trading_calendar: None,
             indicator_params: IndicatorParams::default(),
             strategies: Vec::new(),
             max_daily_loss_percent: 2.0,
@@ -2742,6 +3018,7 @@ threshold = 70.0
             rest_api_base_url: "https://api.dhan.co/v2".to_owned(),
             client_id: "test".to_owned(),
             token_handle: handle,
+            exit_orders: tickvault_common::config::ExitOrdersConfig::default(),
         };
 
         assert!(config.dry_run, "must be paper trading mode");
@@ -2760,6 +3037,8 @@ threshold = 70.0
         let (_order_tx, order_rx) = broadcast::channel::<OrderUpdate>(16);
 
         let config = TradingPipelineConfig {
+            oms_reconcile: OmsReconcileConfig::default(),
+            trading_calendar: None,
             indicator_params: IndicatorParams::default(),
             strategies: Vec::new(),
             max_daily_loss_percent: 2.0,
@@ -2770,6 +3049,7 @@ threshold = 70.0
             rest_api_base_url: "https://api.dhan.co/v2".to_owned(),
             client_id: "test".to_owned(),
             token_handle: handle,
+            exit_orders: tickvault_common::config::ExitOrdersConfig::default(),
         };
 
         assert!(!config.dry_run, "must be live mode");
@@ -3066,6 +3346,8 @@ threshold = 30.0
         let (_order_tx, order_rx) = broadcast::channel::<OrderUpdate>(16);
 
         let config = TradingPipelineConfig {
+            oms_reconcile: OmsReconcileConfig::default(),
+            trading_calendar: None,
             indicator_params: params,
             strategies,
             max_daily_loss_percent: 2.0,
@@ -3076,6 +3358,7 @@ threshold = 30.0
             rest_api_base_url: "https://api.dhan.co/v2".to_owned(),
             client_id: "test".to_owned(),
             token_handle: handle,
+            exit_orders: tickvault_common::config::ExitOrdersConfig::default(),
         };
 
         let task_handle = spawn_trading_pipeline(config, tick_rx, order_rx, None);
@@ -3198,6 +3481,8 @@ threshold = 30.0
     fn test_pipeline_config_rest_api_base_url_is_v2() {
         let handle = make_token_handle_with_value("jwt");
         let config = TradingPipelineConfig {
+            oms_reconcile: OmsReconcileConfig::default(),
+            trading_calendar: None,
             indicator_params: IndicatorParams::default(),
             strategies: Vec::new(),
             max_daily_loss_percent: 2.0,
@@ -3208,6 +3493,7 @@ threshold = 30.0
             rest_api_base_url: "https://api.dhan.co/v2".to_owned(),
             client_id: "test".to_owned(),
             token_handle: handle,
+            exit_orders: tickvault_common::config::ExitOrdersConfig::default(),
         };
         assert!(
             config.rest_api_base_url.contains("/v2"),
@@ -3327,6 +3613,8 @@ threshold = 70.0
         let (_order_tx, order_rx) = broadcast::channel::<OrderUpdate>(16);
 
         let config = TradingPipelineConfig {
+            oms_reconcile: OmsReconcileConfig::default(),
+            trading_calendar: None,
             indicator_params: params,
             strategies,
             max_daily_loss_percent: 2.0,
@@ -3337,6 +3625,7 @@ threshold = 70.0
             rest_api_base_url: "https://api.dhan.co/v2".to_owned(),
             client_id: "test".to_owned(),
             token_handle: handle,
+            exit_orders: tickvault_common::config::ExitOrdersConfig::default(),
         };
 
         // Pass the reloader to the pipeline — exercises the `if let Some(ref reloader)` path
@@ -3410,6 +3699,8 @@ threshold = 50.0
         let (_order_tx, order_rx) = broadcast::channel::<OrderUpdate>(16);
 
         let config = TradingPipelineConfig {
+            oms_reconcile: OmsReconcileConfig::default(),
+            trading_calendar: None,
             indicator_params: params,
             strategies,
             max_daily_loss_percent: 5.0,
@@ -3420,6 +3711,7 @@ threshold = 50.0
             rest_api_base_url: "https://api.dhan.co/v2".to_owned(),
             client_id: "test".to_owned(),
             token_handle: handle,
+            exit_orders: tickvault_common::config::ExitOrdersConfig::default(),
         };
 
         let task_handle = spawn_trading_pipeline(config, tick_rx, order_rx, None);
@@ -3464,6 +3756,8 @@ threshold = 50.0
         let (order_tx, order_rx) = broadcast::channel::<OrderUpdate>(16);
 
         let config = TradingPipelineConfig {
+            oms_reconcile: OmsReconcileConfig::default(),
+            trading_calendar: None,
             indicator_params: IndicatorParams::default(),
             strategies: Vec::new(),
             max_daily_loss_percent: 2.0,
@@ -3474,6 +3768,7 @@ threshold = 50.0
             rest_api_base_url: "https://api.dhan.co/v2".to_owned(),
             client_id: "test".to_owned(),
             token_handle: handle,
+            exit_orders: tickvault_common::config::ExitOrdersConfig::default(),
         };
 
         let task_handle = spawn_trading_pipeline(config, tick_rx, order_rx, None);
@@ -3598,6 +3893,8 @@ threshold = 65.0
         let (_order_tx, order_rx) = broadcast::channel::<OrderUpdate>(16);
 
         let config = TradingPipelineConfig {
+            oms_reconcile: OmsReconcileConfig::default(),
+            trading_calendar: None,
             indicator_params: params,
             strategies,
             max_daily_loss_percent: 5.0,
@@ -3608,6 +3905,7 @@ threshold = 65.0
             rest_api_base_url: "https://api.dhan.co/v2".to_owned(),
             client_id: "test".to_owned(),
             token_handle: handle,
+            exit_orders: tickvault_common::config::ExitOrdersConfig::default(),
         };
 
         let task_handle = spawn_trading_pipeline(config, tick_rx, order_rx, None);
@@ -3677,6 +3975,8 @@ threshold = 35.0
         let (_order_tx, order_rx) = broadcast::channel::<OrderUpdate>(16);
 
         let config = TradingPipelineConfig {
+            oms_reconcile: OmsReconcileConfig::default(),
+            trading_calendar: None,
             indicator_params: params,
             strategies,
             max_daily_loss_percent: 5.0,
@@ -3687,6 +3987,7 @@ threshold = 35.0
             rest_api_base_url: "https://api.dhan.co/v2".to_owned(),
             client_id: "test".to_owned(),
             token_handle: handle,
+            exit_orders: tickvault_common::config::ExitOrdersConfig::default(),
         };
 
         let task_handle = spawn_trading_pipeline(config, tick_rx, order_rx, None);
@@ -3722,6 +4023,8 @@ threshold = 35.0
         let (_order_tx, order_rx) = broadcast::channel::<OrderUpdate>(16);
 
         let config = TradingPipelineConfig {
+            oms_reconcile: OmsReconcileConfig::default(),
+            trading_calendar: None,
             indicator_params: IndicatorParams::default(),
             strategies: Vec::new(),
             max_daily_loss_percent: 2.0,
@@ -3732,6 +4035,7 @@ threshold = 35.0
             rest_api_base_url: "https://api.dhan.co/v2".to_owned(),
             client_id: "test".to_owned(),
             token_handle: handle,
+            exit_orders: tickvault_common::config::ExitOrdersConfig::default(),
         };
 
         let task_handle = spawn_trading_pipeline(config, tick_rx, order_rx, None);
@@ -3750,6 +4054,8 @@ threshold = 35.0
         let (order_tx, order_rx) = broadcast::channel::<OrderUpdate>(16);
 
         let config = TradingPipelineConfig {
+            oms_reconcile: OmsReconcileConfig::default(),
+            trading_calendar: None,
             indicator_params: IndicatorParams::default(),
             strategies: Vec::new(),
             max_daily_loss_percent: 2.0,
@@ -3760,6 +4066,7 @@ threshold = 35.0
             rest_api_base_url: "https://api.dhan.co/v2".to_owned(),
             client_id: "test".to_owned(),
             token_handle: handle,
+            exit_orders: tickvault_common::config::ExitOrdersConfig::default(),
         };
 
         let task_handle = spawn_trading_pipeline(config, tick_rx, order_rx, None);
@@ -3994,5 +4301,206 @@ threshold = 70.0
             matches!(err, tickvault_trading::oms::OmsError::TokenExpired),
             "expired token must be TokenExpired, got: {err}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Scheduled OMS reconcile — gate / timer / edge-latch
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_reconcile_gate_allows_boundaries() {
+        // Disabled wins over everything.
+        assert!(!should_run_scheduled_reconcile(
+            false,
+            true,
+            Some(true),
+            true,
+            40_000
+        ));
+        // trading_hours_only=false runs any time (still requires enabled).
+        assert!(should_run_scheduled_reconcile(true, false, None, false, 0));
+        // In-session boundaries: 09:15:00 = 33300 inclusive, 15:30:00 = 55800 exclusive.
+        assert!(!should_run_scheduled_reconcile(
+            true,
+            true,
+            Some(true),
+            true,
+            33_299
+        ));
+        assert!(should_run_scheduled_reconcile(
+            true,
+            true,
+            Some(true),
+            true,
+            33_300
+        ));
+        assert!(should_run_scheduled_reconcile(
+            true,
+            true,
+            Some(true),
+            true,
+            55_799
+        ));
+        assert!(!should_run_scheduled_reconcile(
+            true,
+            true,
+            Some(true),
+            true,
+            55_800
+        ));
+        // Calendar says holiday → blocked even in-session.
+        assert!(!should_run_scheduled_reconcile(
+            true,
+            true,
+            Some(false),
+            true,
+            40_000
+        ));
+        // No calendar: weekday fallback — Sat/Sun blocked, Mon-Fri allowed.
+        assert!(!should_run_scheduled_reconcile(
+            true, true, None, false, 40_000
+        ));
+        assert!(should_run_scheduled_reconcile(
+            true, true, None, true, 40_000
+        ));
+    }
+
+    #[test]
+    fn test_reconcile_failure_streak_edge_latches_once_per_episode() {
+        // Rising edge fires exactly at the threshold, never before or after.
+        let mut streak = 0_u32;
+        let mut fired = Vec::new();
+        for _ in 0..5 {
+            let (next, fire) = advance_reconcile_failure_streak(streak);
+            streak = next;
+            fired.push(fire);
+        }
+        assert_eq!(
+            fired,
+            vec![false, false, true, false, false],
+            "the ERROR must fire ONCE at 3 consecutive failures"
+        );
+        // Success resets the latch; a new episode re-fires at 3 again.
+        streak = 0;
+        let (s1, f1) = advance_reconcile_failure_streak(streak);
+        let (s2, f2) = advance_reconcile_failure_streak(s1);
+        let (_s3, f3) = advance_reconcile_failure_streak(s2);
+        assert!(!f1 && !f2 && f3, "a fresh episode re-arms the edge");
+    }
+
+    #[test]
+    fn test_make_reconcile_interval_disabled_builds_no_timer() {
+        // (The enabled-timer Skip/interval_at semantics are asserted by
+        // test_timer_first_tick_delayed_and_skip_no_burst below.)
+        let disabled = OmsReconcileConfig::default();
+        assert!(
+            make_reconcile_interval(&disabled).is_none(),
+            "default-OFF config must build NO timer (pending() arm)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_timeout_elapse_maps_to_failed_streak() {
+        // E1: a run that outlives the arm timeout is a FAILED run — the
+        // Err(Elapsed) arm advances the SAME streak the Err(OmsError) arm
+        // does, so 3 consecutive timeouts fire the OMS-GAP-02 edge.
+        let elapsed = tokio::time::timeout(
+            std::time::Duration::from_millis(10),
+            std::future::pending::<Result<(), ()>>(),
+        )
+        .await;
+        assert!(elapsed.is_err(), "a hung run must map to Err(Elapsed)");
+
+        let mut streak = 0_u32;
+        let mut fired = Vec::new();
+        for _ in 0..3 {
+            let (next, fire) = advance_reconcile_failure_streak(streak);
+            streak = next;
+            fired.push(fire);
+        }
+        assert_eq!(
+            fired,
+            vec![false, false, true],
+            "3 consecutive timeout-mapped failures fire the edge once"
+        );
+        // The production bound: 2s against the ~5s OMS HTTP timeout.
+        assert_eq!(RECONCILE_ARM_TIMEOUT_SECS, 2);
+    }
+
+    #[tokio::test]
+    async fn test_disabled_reconcile_future_pends() {
+        // (tokio's test-util paused clock is not enabled in this workspace,
+        // so this uses a short real-time probe on the pending future.)
+        let mut interval = make_reconcile_interval(&OmsReconcileConfig::default());
+        assert!(interval.is_none());
+        // The select! arm shape: no timer → pend forever.
+        let fut = async {
+            match interval.as_mut() {
+                Some(iv) => {
+                    iv.tick().await;
+                }
+                None => std::future::pending::<()>().await,
+            }
+        };
+        let outcome = tokio::time::timeout(std::time::Duration::from_millis(100), fut).await;
+        assert!(
+            outcome.is_err(),
+            "disabled reconcile arm must pend (never complete)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_timer_first_tick_delayed_and_skip_no_burst() {
+        // The 60s config floor does not bind here — make_reconcile_interval
+        // is exercised directly with a 1s period so the delayed-first-tick
+        // property is observable in real time (no tokio test-util clock in
+        // this workspace).
+        let cfg = OmsReconcileConfig {
+            enabled: true,
+            interval_secs: 1,
+            trading_hours_only: true,
+        };
+        let mut interval = make_reconcile_interval(&cfg).expect("enabled config builds a timer");
+        assert_eq!(
+            interval.missed_tick_behavior(),
+            tokio::time::MissedTickBehavior::Skip,
+            "missed ticks must be skipped — no catch-up burst"
+        );
+        // interval_at skips the immediate t=0 tick: nothing fires instantly.
+        let early = tokio::time::timeout(std::time::Duration::from_millis(300), interval.tick());
+        assert!(early.await.is_err(), "no boot-instant reconcile tick");
+        // The first tick lands at the full period.
+        let first = tokio::time::timeout(std::time::Duration::from_millis(1500), interval.tick());
+        assert!(first.await.is_ok(), "first tick fires at ~1 period");
+    }
+
+    #[test]
+    fn test_init_trading_pipeline_plumbs_oms_reconcile_config_and_calendar() {
+        let tmp_dir = std::env::temp_dir().join("tv_test_init_pipeline_reconcile");
+        let _ = std::fs::create_dir_all(&tmp_dir);
+        let config_path = tmp_dir.join("reconcile_plumb_strategies.toml");
+        // File just needs to exist — an empty strategy file falls back to
+        // defaults inside init_trading_pipeline without aborting.
+        std::fs::write(&config_path, "").expect("write temp strategy file");
+
+        let mut config =
+            build_test_application_config(config_path.to_str().expect("utf-8 tmp path"));
+        config.oms_reconcile.enabled = true;
+        config.oms_reconcile.interval_secs = 600;
+        let handle = make_token_handle_with_value("jwt");
+
+        let (pipeline_config, _reloader) =
+            init_trading_pipeline(&config, &handle, "client").expect("init must succeed");
+        assert!(
+            pipeline_config.oms_reconcile.enabled,
+            "oms_reconcile config must be plumbed through init"
+        );
+        assert_eq!(pipeline_config.oms_reconcile.interval_secs, 600);
+        assert!(
+            pipeline_config.trading_calendar.is_some(),
+            "init must build the trading calendar for the reconcile gate"
+        );
+
+        let _ = std::fs::remove_file(&config_path);
     }
 }

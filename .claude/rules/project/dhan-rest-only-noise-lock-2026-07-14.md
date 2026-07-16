@@ -39,9 +39,22 @@ self-heals SILENTLY.**
 | # | Allowed Dhan alert | Variant(s) / route | Fires when |
 |---|---|---|---|
 | 1 | Spot-1m pull failing / recovered | `Spot1mFetchDegraded` (High) / `Spot1mFetchRecovered` (Info) / `Spot1mSidNotServed` (High) / `Spot1mSidServedRecovered` (Info) | the per-minute spot leg's persist-gated 3-minute escalation edge (`rest-1m-pipeline-error-codes.md`) |
-| 2 | Option-chain pull failing / recovered | `ChainFetchDegraded` (High) / `ChainFetchRecovered` (Info) / `ChainEntitlementAbsent`/`Confirmed` / `ChainExpirylistFailed` (High) | the chain leg's own edges (`rest-1m-pipeline-error-codes.md`) |
+| 2 | Option-chain pull failing / recovered | `ChainFetchDegraded` (High) / `ChainFetchRecovered` (Info) / `ChainEntitlementAbsent`/`Confirmed` / `ChainExpirylistFailed` (High) / **`Chain1mUnderlyingNotServed` (High) / `Chain1mUnderlyingServedRecovered` (Info) — added 2026-07-14 per the §2.1 dated directive (the Dhan mirror of the Groww #1537 per-underlying detector)** | the chain leg's own edges (`rest-1m-pipeline-error-codes.md`) |
 | 3 | Token could not be obtained | `AuthenticationFailed` / `TokenRenewalFailed` (both Critical; reworded 2026-07-14 to plain English naming DHAN + the consequence: "the Dhan spot-1m and option-chain pulls will stop until this is fixed") | mint/renewal is TERMINALLY dead — the mid-session watchdog pages **ONCE PER FAILING EPISODE** (H1a latch, 2026-07-14 fix round — never the pre-fix ~30-min repeat) on EITHER (a) a forced re-mint failing terminally OR (b) the H1b attempt cap: `REMINT_MAX_ATTEMPTS_PER_EPISODE` (= 3) re-mints all "succeeded" yet the profile stayed REAL-invalid (dead-dataPlan/segment class — the body names the N re-logins + that the spot-1m/chain pulls are blocked). The latch resets on a clean profile cycle. (Its terminal arm emits `AuthenticationFailed` directly, since `force_renewal` -> `acquire_token` pages nothing on a non-RESILIENCE-03 permanent failure; the Telegram body is redacted + truncated via the house sanitizer — M2.) |
 | 4 | Token expires soon (4h early warning) | CloudWatch alarm `tv-<env>-token-remaining-low` on `tv_token_remaining_seconds` → SNS → Telegram Lambda | the renewal loop stopped renewing (the watchdog-of-the-renewal-loop). The Lambda's wording is ANOTHER session's scope. |
+
+**§2.1 — 2026-07-14 (same day, second directive): the family-(2) row gains the per-underlying
+not-served pair.** Coordinator-relayed operator directive (verbatim intent, labeled as such —
+the §38.0-Context-3 convention): *"make the Dhan option-chain capture complete and precise,
+cross-cover the Groww gaps, and be loud on any empty or partial chain — never a silent gap."*
+The motivating incident is the 2026-07-14 Groww NIFTY expiry-day cutoff (14:54 IST, 2xx/zero
+strikes, `ok=2/empty=1` all afternoon, ZERO pages — PR #1537); the Dhan chain leg carries the
+IDENTICAL blind spot (`chain_minute_fully_failed` requires `ok == 0`). Per this directive the
+family-(2) row is extended with `Chain1mUnderlyingNotServed` (High, one page per underlying per
+episode, edge-latched, ~10-minute detection latency) + `Chain1mUnderlyingServedRecovered` (Info,
+falling edge). This is a variant EXTENSION of family (2), not a 5th family: it still means
+"the Dhan option-chain pull is failing" — scoped to one index. Everything else in §2 stands;
+the deleted/silenced table is untouched.
 
 **Deleted or silenced 2026-07-14 (everything else Dhan):**
 
@@ -52,12 +65,37 @@ self-heals SILENTLY.**
 | REST-stack stale-token sweep (GAP-02, 2026-07-14 backstop) | **ADDED, silent:** `dhan_rest_stack` Phase 3 runs `force_renewal_if_stale(14400)` every 900s (`DHAN_REST_STACK_TOKEN_SWEEP_INTERVAL_SECS`) — the renewal-loop-halt backstop the lane's 4h sweep used to be. Not market-hours-gated. Terminal failure pages via family-(3). SUPERVISED (fix round: the house respawn pattern — a silent sweep death would re-open the audited gap; unwind-build self-heal only, release panics abort). Honest wording note (fix round): the ~23h renewal loop is NOT an independent retry — it HALTS PERMANENTLY after its circuit-breaker cycles; this sweep + the AUTH-GAP-05 watchdog are the retries. |
 | Shared mint-cooldown gate (H3, 2026-07-14 fix round) | **ADDED, silent:** `TokenManager::renew_with_fallback` — the ONE shared re-mint entry (watchdog + GAP-02 sweep + renewal loop + `force_renewal*`) — SKIPS the `generateAccessToken` fallback with a coded warn + typed refusal (`mint-cooldown` prefix; never a page, never burns the episode latch) while a previous mint ATTEMPT is younger than the ~125s Dhan cooldown. Closes the AG5-R2-1 flagged residual the 900s sweep had tightened 16x. The boot-time `initialize` retry loop is deliberately UNGATED (calls `acquire_token` directly; owns its own >=130s floor — no boot deadlock; source-scan pinned). |
 | Token-health gauge poller supervision + pre-#1522 residual (GAP-06 + M6, fix round) | The re-homed poller is SUPERVISED like the sweep. **ACCEPTED residual (M6):** on a hypothetical `dhan_enabled=true` boot BEFORE #1522 merges, the LANE path no longer spawns the poller (its main.rs spawn sites are deleted) and the stack does not run — so `tv_token_valid` would go unpublished for that boot shape. Accepted because prod is dhan-OFF (config + the Phase-A 409 refusal) and #1522 (which deletes the lane's fast arm) merges FIRST; this PR rebases after. |
-| REST canary (`rest_canary_boot.rs`, REST-CANARY-01 probes 09:05/12:00/15:25 IST) | **Module + both spawn sites + the `rest-canary-01` CloudWatch filter/alarm DELETED.** The legs self-detect REST death in ~3-4 min via their own escalation edges — strictly better than 3 fixed slots. `ErrorCode::RestCanary01ProbeFailed` variant retained until C4. |
+| REST canary (`rest_canary_boot.rs`, REST-CANARY-01 probes 09:05/12:00/15:25 IST) | **Module + both spawn sites + the `rest-canary-01` CloudWatch filter/alarm DELETED.** The legs self-detect REST death in ~3-4 min via their own escalation edges — strictly better than 3 fixed slots. `ErrorCode::RestCanary01ProbeFailed` variant retained until C4 — **DELETED in the C4 sweep (2026-07-15)**. |
 | No-tick watchdog (`no_tick_watchdog.rs`, `NoLiveTicksDuringMarketHours` Critical) | **Module + variant + both spawn sites DELETED.** Its heartbeat was fed ONLY by the retired Dhan tick pipeline; Groww stall detection is FEED-STALL-01 + the market-hours-liveness alarm. |
-| Fast-boot cached-token validation (`fast_boot_validation.rs`, AUTH-GAP-06) | **Module + sole call site DELETED** (the Dhan-gated fast arm is dead with `dhan_enabled=false` and dies in #1522). `ErrorCode::AuthGap06…` variant retained until C4. |
+| Fast-boot cached-token validation (`fast_boot_validation.rs`, AUTH-GAP-06) | **Module + sole call site DELETED** (the Dhan-gated fast arm is dead with `dhan_enabled=false` and dies in #1522). `ErrorCode::AuthGap06…` variant retained until C4 — **DELETED in the C4 sweep (2026-07-15)**. |
 | Token-health gauge poller (`token_health_gauge.rs`, `tv_token_valid` + live `tv_token_remaining_seconds`) | **RE-HOMED (GAP-06, 2026-07-14 — supersedes the same-day delete ruling):** the module is KEPT; the lane/fast-arm spawn sites in main.rs are DELETED; `dhan_rest_stack` Phase 3 spawns it, so the gauges stay alive on dhan-off boots even after a renewal-loop circuit-breaker halt (which kills the 30s in-loop gauge writer) — keeping alarm #4 sighted. |
 | Order-update WS spawn (`dhan_rest_stack` Phase 5a) + its 2 alarms (`tv-<env>-order-update-ws-inactive`, `tv-<env>-order-update-reconnect-storm`) | **Spawn + alarms DELETED** per `websocket-connection-scope-lock.md` §A.1. The core module `order_update_connection.rs` is RETAINED DORMANT (unit tests stay) for the live-trading re-wire — re-spawn or module deletion needs a fresh dated quote in the scope-lock file first. |
 | `observability-architecture.md` paging list | REST-CANARY-01 removed from the Filtered+alarmed set (dated note; the paging drift guard pins tf↔doc↔emit). |
+
+### §2a. Order-execution family (cluster C, PR #1554 — a SEPARATE landed family, NOT a Dhan REST alert)
+
+The §2 4-item set is the **Dhan REST-only surface** (spot-1m / option-chain /
+token). Distinct from it, the **order-execution family** — the cluster-C
+order-side observability that landed on `main` in **PR #1554** — dispatches its
+OWN typed Telegram events from `crates/app/src/order_observability.rs`
+(the order-side consumer's `OmsAlertBridge` / `RiskAlertBridge` sinks):
+`NotificationEvent::OrderRejected`, `NotificationEvent::CircuitBreakerOpened`,
+and `NotificationEvent::RiskHalt`. These fire on the OMS order path (order
+rejects, circuit-breaker transitions, risk halts) in the paper/dry-run layer —
+NOT on the Dhan REST data-pull surface — so they are **outside** the §2 count
+and are NOT governed by the §3 "new Dhan-scoped REST Telegram page" REJECT.
+
+**This subsection is a rebase-reconciliation note (2026-07-14):** it DOCUMENTS
+the pre-existing, landed #1554 dispatch sites so the exit-order lockout guard
+(`dhan_exit_order_lockout_guard::exit_layer_emits_no_telegram_dispatch`) — which
+requires this file to carry an `order execution` family row once any order-path
+`NotificationEvent` dispatch site exists — reconciles cleanly with `main`. It
+introduces NO new emit. **The 🔷 DHAN exit-order layer itself stays
+Telegram-free** (engine exit region + `exit_rules.rs` + `exit_execution.rs` are
+sink-free; EXIT-ORDER-01 / EXIT-VERIFY-01 remain log-sink-only) — the guard's
+part (a) still enforces that verbatim. Any FUTURE change that routes the exit
+layer's own signals to Telegram remains a REJECT under §3 until an operator
+dated quote lands here.
 
 ---
 
@@ -88,7 +126,11 @@ Any such PR MUST be rejected in review even if the operator approves verbally
 
 > "100% inside the tested envelope, with ratcheted regression coverage: a dead
 > Dhan token is detected within minutes by the legs' own persist-gated
-> escalation edges (SPOT1M-01 / CHAIN-02 → the family-(1)/(2) High pages) and
+> escalation edges (SPOT1M-01 / CHAIN-02 → the family-(1)/(2) High pages), and
+> a SINGLE-underlying vendor cutoff (the 2026-07-14 class) pages within ~10
+> counted minutes via the family-(2) `Chain1mUnderlyingNotServed` edge (a
+> mid-day task respawn restarts the streak — worst case ~doubles that
+> latency), and it
 > self-heals SILENTLY via three retained mechanisms (the 900s profile probe's
 > AUTH-GAP-05 forced re-mint with the GAP-04 ~30-min latch re-arm, the GAP-02
 > 900s `force_renewal_if_stale(4h)` stack sweep, and the ~23h renewal loop);

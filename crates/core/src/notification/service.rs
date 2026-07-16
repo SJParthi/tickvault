@@ -1585,7 +1585,9 @@ async fn rehydrate_episodes(episodes: &EpisodeRegistry, path: &std::path::Path) 
         return;
     }
     let entries = episode_snapshot::decode(&json, epoch_ms_now(), today_ist_date());
-    episodes.rehydrate(entries);
+    // R1 (fix round 3): rehydrated entries start unreconfirmed with a
+    // fresh event-less clock — see EpisodeRegistry::rehydrate.
+    episodes.rehydrate(entries, epoch_ms_now());
 }
 
 /// The drain-ticker half of the episode machinery: promotes stable
@@ -2962,7 +2964,9 @@ mod tests {
             down_secs: 0,
             attempts: 0,
         });
-        service.notify(NotificationEvent::ShutdownInitiated);
+        service.notify(NotificationEvent::ShutdownInitiated {
+            class: crate::notification::events::ShutdownClass::ExternalStop,
+        });
         // PR-D (2026-05-26): HistoricalFetchFailed + CandleVerificationFailed
         // notify calls removed alongside the deleted variants.
 
@@ -3519,7 +3523,9 @@ mod tests {
             down_secs: 0,
             attempts: 0,
         });
-        service.notify(NotificationEvent::ShutdownInitiated);
+        service.notify(NotificationEvent::ShutdownInitiated {
+            class: crate::notification::events::ShutdownClass::ExternalStop,
+        });
         service.notify(NotificationEvent::ShutdownComplete);
     }
 

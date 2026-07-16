@@ -10,7 +10,7 @@
 > (day CSVs, `cross_verify_1m_audit` table, the read-only debug endpoint)
 > are retained; nothing writes new ones. Content below is historical.
 > **Code (historical):** `cross_verify_1m_boot.rs` (deleted),
-> `crates/storage/src/feed_parity_1m_audit_persistence.rs`.
+> `feed_parity_1m_audit_persistence.rs` (storage crate — DELETED 2026-07-15).
 
 ## TL;DR
 

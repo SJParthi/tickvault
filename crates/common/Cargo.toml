@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+arc-swap = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }
@@ -19,6 +20,11 @@ tracing = { workspace = true }
 secrecy = { workspace = true }
 uuid = { workspace = true }
 arrayvec = { workspace = true }
+# tokio (workspace-pinned): used ONLY for the `broker_order_events::push_active`
+# watch channel — the Session-3 order-update PUSH-active seam that lives in
+# `common` so a future core/app producer + a trading consumer share it without
+# either depending on `tickvault-trading` (Groww orders PR-A0, 2026-07-15).
+tokio = { workspace = true }
 
 # CVE pins (2026-04-22, Parthiban-authorised). Unused direct deps that
 # exist solely to force `cargo`'s lockfile resolver to pick patched
@@ -48,6 +54,13 @@ aws-lc-sys = "0.42.0"
 aws-lc-rs = "1.17.0"
 rustls-webpki = "0.103.13"
 rand = "0.10.1"
+
+[features]
+# Gate 2 of the Groww order-side live-fire lattice (groww-second-feed-scope
+# §39.2). NON-DEFAULT — the broker_order_events seam is always compiled, but
+# this feature marks the order-side build surface so the lattice guard can
+# assert it exists in BOTH manifests and is never in a `default = [...]` set.
+groww_orders = []
 
 [dev-dependencies]
 criterion = { workspace = true }

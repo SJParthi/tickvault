@@ -16,7 +16,8 @@
 #   metric -> alarm (<=5 min) -> SNS tv-alerts -> Telegram webhook Lambda.
 #
 # HONEST ALARM COUNT: this file takes the REAL total from 33 -> 41 alarms
-# (45 with the reconnect-storm + feed-stall-restarts + readiness-lambda-errors
+# (45 with the reconnect-storm + feed-stall-restarts [pager retired
+# 2026-07-15 with the Groww live feed] + readiness-lambda-errors
 # + market-hours-gate-errors alarms landing in the same PR). Overage above the
 # 10 free-tier alarms moves $2.30 -> $3.50/mo. The rule-file "10 alarms free
 # tier" claims were already stale pre-PR. (2026-07-09: +2 more alarms —
@@ -180,34 +181,13 @@ locals {
     # was deleted with the lane, so the filter could never match again
     # (dead paging filter). The WsGap07 variant retirement is Phase C
     # variant cleanup.
-    # FEED-STALL-01 (round-3 review fix, 2026-07-06): the ONLY ERROR-level
-    # FEED-STALL-01 emission is the sidecar's own STORM escalation — the 6th+
-    # rapid restart inside a 300s ANCHORED-RESET window
-    # (>STALL_RESTART_STORM_MAX=5, groww_sidecar_supervisor.rs — the window
-    # start resets when it elapses; round-13 correction: NOT a sliding
-    # window, so a burst straddling the anchor can defer the escalation by
-    # up to ~one extra 300s window). Per-restart emissions are warn!-level
-    # and NEVER reach the ERROR-only errors.jsonl sink, so this filter counts
-    # storm-escalation LINES, not restarts. The earlier "Sum >= 3 restarts per
-    # 15 min" tuning could therefore never see 3-5 restarts/15 min (zero ERROR
-    # lines) — a Rule-11 false-OK envelope. Retuned: ONE storm line pages
-    # (threshold 1 per 300s; the Rust detector already debounces at >5
-    # restarts/5 min, so a single self-heal restart still never pages).
-    # Tripwire floor (span math, round-13 — the earlier "~50s" used 300/6
-    # average-rate math): 6 restarts span 5 gaps <= the 300s window, so
-    # cycles <= ~60s can escalate. The
-    # ">=3 restarts per 15 min" pager — counting EVERY restart, warn! + error!
-    # alike — is the separate tv-<env>-feed-stall-restarts counter alarm
-    # (feed-stall-restart-alarm.tf).
-    "feed-stall-01" = {
-      pattern     = "{ $.code = \"FEED-STALL-01\" && $.level = \"ERROR\" }"
-      period      = 300
-      threshold   = 1
-      eval        = 3
-      dta         = 1
-      ok_recovery = true
-      desc        = "FEED-STALL-01 STORM escalation: the Groww sidecar's own storm detector fired (>5 stall-restarts within a 5-min ANCHORED-reset window - the 6th+ rapid restart emits the only ERROR-level FEED-STALL-01 line; per-restart emissions are warn!-level and invisible to this filter). The provider keeps closing the socket at <=~60s/cycle (span math: 6 restarts span 5 gaps <= 300s; anchored-reset, not sliding - a burst straddling the anchor can defer the escalation by up to ~one extra 300s window). A single self-heal restart never pages. The >=3-restarts-per-15-min pager (all restart cadences) is tv-<env>-feed-stall-restarts (feed-stall-restart-alarm.tf). Check credential/entitlement. Runbook: .claude/rules/project/feed-stall-watchdog-error-codes.md"
-    }
+    # RETIRED (2026-07-15 — Groww live-feed retirement): the "feed-stall-01"
+    # entry — its ONLY ERROR-level emit site (the sidecar stall watchdog's
+    # storm escalation in the deleted groww_sidecar_supervisor.rs) died with
+    # the Groww live feed, so the filter could never match again (dead
+    # paging filter; the ws-gap-07 precedent above). The companion
+    # >=3-restarts-per-15-min counter pager was deleted whole in the same PR
+    # (feed-stall-restart-alarm.tf). Variant retirement is the post-C4 sweep.
     "ws-reinject-01" = {
       pattern     = "{ $.code = \"WS-REINJECT-01\" && $.level = \"ERROR\" }"
       period      = 300
@@ -442,8 +422,9 @@ resource "aws_cloudwatch_metric_alarm" "error_code" {
   # formats every OK as a green message (it reads only NewStateValue - no
   # OldStateValue filter). Expect up to ~5 one-time green "recovered" pages
   # the apply evening (canonical count, round-14): the 4 ok_recovery=true
-  # codes here (dh-901, auth-gap-04, feed-stall-01; ws-gap-07 retired PR-C2 2026-07-13) +
-  # feed-stall-restarts. Exempt: the reconnect-storm alarm via
+  # codes here (dh-901, auth-gap-04; ws-gap-07 retired PR-C2 2026-07-13;
+  # feed-stall-01 + the feed-stall-restarts counter pager retired
+  # 2026-07-15 with the Groww live feed). Exempt: the reconnect-storm alarm via
   # actions_enabled=false, and BOTH AWS/Lambda Errors watchman alarms
   # (readiness-errors + market-hours-gate-errors) via ok_actions=[]
   # (round-14 — their auto-OK is aged-out, never a fix).

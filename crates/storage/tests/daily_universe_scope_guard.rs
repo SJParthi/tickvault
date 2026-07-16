@@ -81,32 +81,15 @@ fn lifecycle_persistence_uses_ilp_not_exec_url() {
 }
 
 // ---------------------------------------------------------------------------
-// O(1) WARM-BOOT storage primitives (2026-05-29). PR-C3 (2026-07-14): the
-// app-side warm-skip orchestrator test (`reconcile_has_o1_warm_skip_on_
-// unchanged_sha`) retired with the deleted `lifecycle_reconcile_orchestrator`;
-// the storage primitives it consumed stay pinned below (retained SEBI-table
-// surface — the C4 sweep owns any caller-less-fn cleanup decision).
+// RETIRED in the C4 sweep (2026-07-15): `storage_exposes_o1_warm_primitives`
+// pinned the O(1) WARM-BOOT storage primitives (`build_bump_active_last_seen_sql`
+// / `bump_active_last_seen` / `read_last_fetch_audit_sha`) that PR-C3
+// (2026-07-14) left caller-less when it deleted the app-side warm-skip
+// orchestrator; this section's own comment deferred the cleanup decision to
+// the C4 sweep, which DELETED the primitives (the #1569 judgment call #2).
+// The `instrument_lifecycle` / `instrument_fetch_audit` SEBI tables and
+// every other persistence fn stay pinned by the surviving tests below.
 // ---------------------------------------------------------------------------
-#[test]
-fn storage_exposes_o1_warm_primitives() {
-    let lc = src("crates/storage/src/instrument_lifecycle_persistence.rs");
-    assert!(
-        lc.contains("pub fn build_bump_active_last_seen_sql")
-            && lc.contains("pub async fn bump_active_last_seen"),
-        "storage must expose the single-statement last_seen bump"
-    );
-    // The bump is ONE UPDATE scoped to active rows — never a per-row INSERT.
-    assert!(
-        lc.contains("WHERE lifecycle_state = '{active}'"),
-        "the warm bump must be a single active-scoped UPDATE"
-    );
-    let fa = src("crates/storage/src/instrument_fetch_audit_persistence.rs");
-    assert!(
-        fa.contains("pub async fn read_last_fetch_audit_sha")
-            && fa.contains("ORDER BY ts DESC LIMIT 1"),
-        "storage must read the last fetch-audit SHA in one bounded SELECT"
-    );
-}
 
 // RETIRED 2026-07-14 (PR-C2 — Dhan live-WS lane deletion): the
 // `boot_timing_proof_is_measured_and_surfaced` test pinned the boot-timing
