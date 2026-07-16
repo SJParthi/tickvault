@@ -175,6 +175,23 @@ rules:
       auto-reset — the operator must diagnose whether the underlying
       issue is authentication, rate limiting, or a bad order payload.
 
+  # -----------------------------------------------------------------------
+  # Cluster B — live order refused by the fail-closed order-readiness gate
+  # -----------------------------------------------------------------------
+
+  - name: order-ready-01-gate-refused-escalate
+    match:
+      code: ORDER-READY-01
+    action: escalate
+    runbook_path: .claude/rules/project/order-readiness-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 0
+    justification: >-
+      A live order was refused by the fail-closed readiness gate (no probe,
+      stale probe, invalid Dhan dataPlan/segment, or low token headroom).
+      Never auto-action — the operator must confirm the Dhan data plan,
+      Derivative segment and token before orders are re-enabled.
+
   # =======================================================================
   # MILESTONE 2 — full ErrorCode coverage (48 new rules, total 54 codes)
   #
