@@ -2779,6 +2779,36 @@ async fn build_shared_infra(
          committed C-phase follow-up)"
     );
 
+    // --- RAM residency stores (operator directive 2026-07-16, PR-2) ---
+    // Installed BEFORE the fold spawn below so PR-1's boot catch-up
+    // populates the month-deep spot rings (pre-market spot rehydration IS
+    // the catch-up — zero new spot reads); the chain-day rehydrate +
+    // stats/heartbeat tasks ride alongside. Config-gated (fail-safe serde
+    // default OFF; base.toml opts in); cold path only.
+    // RAMSTORE-01 runbook: .claude/rules/project/ram-store-error-codes.md
+    if config.market_ram_store.enabled {
+        tickvault_app::market_ram_store_boot::install_market_ram_stores(
+            &config.market_ram_store,
+            config.rest_candle_fold.catchup_days,
+        );
+        let _ram_store_rehydrate =
+            tickvault_app::market_ram_store_boot::spawn_chain_day_rehydrate(config.questdb.clone());
+        let _ram_store_stats = tickvault_app::market_ram_store_boot::spawn_ram_store_stats_task();
+        info!(
+            spot_days = config.market_ram_store.spot_days,
+            chain_row_cap = config.market_ram_store.chain_row_cap,
+            "market_ram_store: RAM residency ARMED — spots month-deep (filled by \
+             the fold catch-up + live seals), options current-day (chain publishes \
+             + boot rehydrate); depth gauges show the honest fill level"
+        );
+    } else {
+        info!(
+            "market_ram_store: disabled by config ([market_ram_store] enabled = false) \
+             — spot/chain RAM residency stores NOT installed this boot (QuestDB \
+             remains the only read surface)"
+        );
+    }
+
     // --- REST-era candle derivation (operator directive 2026-07-16) ---
     // Folds persist-confirmed `spot_1m_rest` 1m bars into all 21 `candles_*`
     // timeframes through the shared seal-writer channel installed just above
