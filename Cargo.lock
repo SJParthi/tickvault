@@ -4129,6 +4129,7 @@ dependencies = [
  "chrono-tz",
  "criterion",
  "dhat",
+ "futures-util",
  "governor",
  "loom",
  "metrics",

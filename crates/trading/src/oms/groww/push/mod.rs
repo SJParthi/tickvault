@@ -19,10 +19,11 @@
 //! - No order mutation exists anywhere in this module — it mints a
 //!   per-session socket token, performs the NATS `INFO`→`CONNECT` handshake,
 //!   frames/parses NATS protocol bytes, and decodes the order/position
-//!   protobuf payloads. The runner/supervisor that opens the socket is a
-//!   LATER stage.
+//!   protobuf payloads. Stage C adds the RECEIVE-ONLY supervised runner
+//!   ([`runner`]) — the Stage D app consumer wires its spawn behind the
+//!   `order_push_enabled` config gate; nothing in this crate spawns it.
 //!
-//! # Module layout (7 files)
+//! # Module layout (9 files)
 //! | File | Contents |
 //! |---|---|
 //! | [`nats`] | bounds-checked NATS text-protocol framing parser + frame builders |
@@ -31,6 +32,9 @@
 //! | [`socket_token`] | per-session socket-token mint (`POST /v1/api/apex/v1/socket/token/create/`) |
 //! | [`subjects`] | order/position update subject builders (`…updates.apex.<subscriptionId>`) |
 //! | [`proto`] | protobuf decoders for `OrderDetailsBroadCastDto` + `PositionDetailProto` |
+//! | [`order_mapper`] | pure total mapper: `OrderDetailsBroadCastDto` → the neutral `BrokerOrderEvent` seam (Stage C) |
+//! | [`position`] | position updates: decode + count + log ONLY (the table write is a later session; Stage C) |
+//! | [`runner`] | the supervised bootstrap + read-loop runner (`GROWW-PUSH-01..04` taxonomy; Stage C) |
 //!
 //! # Secrets
 //! The SSM-read access token and the minted NATS user JWT are
@@ -47,7 +51,10 @@
 pub mod connect;
 pub mod nats;
 pub mod nkey;
+pub mod order_mapper;
+pub mod position;
 pub mod proto;
+pub mod runner;
 pub mod socket_token;
 pub mod subjects;
 
@@ -55,3 +62,9 @@ pub use nats::NatsParseError;
 pub use nkey::{KeypairError, NkeyError};
 pub use proto::ProtoDecodeError;
 pub use socket_token::SocketTokenError;
+
+// Stage C (2026-07-16): the mapper + position handler + supervised runner
+// surface the future Stage D app consumer speaks.
+pub use order_mapper::{map_order_broadcast, map_order_detail};
+pub use position::{PositionHandleOutcome, handle_position_payload};
+pub use runner::{GrowwAccessTokenProvider, run_groww_push_supervised};

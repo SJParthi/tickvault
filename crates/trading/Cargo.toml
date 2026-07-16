@@ -29,6 +29,11 @@ loom = { workspace = true, optional = true }
 # `oms/groww/push` module — optional, pulled in ONLY by `groww_orders`.
 aws-lc-rs = { workspace = true, optional = true }
 tokio-tungstenite = { workspace = true, optional = true }
+# Order-push Stage C (2026-07-16): SinkExt/StreamExt for the supervised
+# runner's split WebSocket read/write halves. Already workspace-pinned
+# (0.3.32, used by tickvault-core) — optional, pulled in ONLY by
+# `groww_orders`.
+futures-util = { workspace = true, optional = true }
 
 [features]
 loom = ["dep:loom"]
@@ -36,7 +41,7 @@ loom = ["dep:loom"]
 # §39.2). NON-DEFAULT: a default build excludes the entire
 # crates/trading/src/oms/groww subtree. Order-push Stage B adds the transport
 # deps (ed25519 nkey signing + the WS client for Stage C).
-groww_orders = ["dep:aws-lc-rs", "dep:tokio-tungstenite"]
+groww_orders = ["dep:aws-lc-rs", "dep:tokio-tungstenite", "dep:futures-util"]
 
 [dev-dependencies]
 tickvault-core = { path = "../core" }
