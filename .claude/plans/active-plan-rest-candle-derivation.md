@@ -106,15 +106,21 @@ O/H/L/C/ΣV given 1m bars):
    `reason="no_http_client"` past-day-marks drop) / `catchup_parse` /
    `discovery_truncated` / `refold_stale_read` (counter per failed ATTEMPT, `error!` on
    exhaustion — round-2 LOW-7 wording; past-day path only) / `seal_send` /
-   `volume_saturated` / `bad_identity` (round-2 LOW-6 — the handoff-site coalesced
-   warn) / `receiver_lost` / `sender_install` / `task_respawn`; counters
+   `future_dated` (round-3 — the BOUNDARY-01 future-skew clamp; one coalesced coded
+   error per drained batch) / `volume_saturated` / `bad_identity` (round-2 LOW-6 — the
+   handoff-site coalesced warn) / `receiver_lost` / `sender_install` / `task_respawn`;
+   counters
    `tv_rest_candle_fold_seals_total{feed}`,
    `tv_rest_candle_fold_catchup_rows_total{feed}`, `tv_rest_candle_fold_errors_total{stage}`,
    `tv_rest_candle_fold_dropped_total{reason}` (round-2 adds `no_http_client`; LOW-1: a
-   CLOSED seal channel counts every remaining seal of the slice),
-   `tv_rest_candle_fold_day_refolds_total{feed}` (round-2 — one per current-day day-map
-   refold), `tv_rest_candle_fold_duplicate_bars_total` (byte-identical redeliveries —
-   no-op), `tv_rest_candle_fold_paced_waits_total` (budget is per (feed, SID, day) —
+   CLOSED seal channel counts every remaining seal of the slice; round-3 adds
+   `seal_channel_closed` — closed is its own reason on both live + paced paths — and
+   `future_dated`),
+   `tv_rest_candle_fold_day_refolds_total{feed}` (round-2 — current-day day-map
+   refolds; round-3: one per DIRTY SLOT per drained repair batch, never per repair
+   bar), `tv_rest_candle_fold_duplicate_bars_total` (value-identical redeliveries
+   (PartialEq; NaN-unequal falls through to a harmless idempotent refold) — no-op),
+   `tv_rest_candle_fold_paced_waits_total` (budget is per (feed, SID, day) —
    round-2 LOW-7), `tv_rest_candle_fold_volume_saturated_total`,
    `tv_rest_candle_fold_refold_queued_total` (PAST-day marks only since round-2),
    `tv_rest_candle_fold_heartbeat_total` (the dense per-interval liveness signal — the
@@ -141,9 +147,11 @@ O/H/L/C/ΣV given 1m bars):
 - **Day boundary / D1:** `bucket_start(D1)` = the day's 09:15 (day-anchored), so a new
   day's bar transitions + seals the previous D1; catch-up force-seals open buckets of
   PAST days at the end of the pass.
-- **Duplicate delivery of the same minute:** a byte-identical redelivery is a counted
-  no-op (`duplicate_bars_total`); a SAME-minute value-UPDATE refolds the day from the
-  day-map (idempotent DEDUP re-emit) — never a double-count in RAM (round-2).
+- **Duplicate delivery of the same minute:** a value-identical redelivery (PartialEq;
+  a NaN field compares unequal and falls through to a harmless idempotent refold) is a
+  counted no-op (`duplicate_bars_total`); a SAME-minute value-UPDATE refolds the day
+  from the day-map (idempotent DEDUP re-emit; round-3: once per dirty slot per drained
+  batch) — never a double-count in RAM (round-2).
 - **Negative / overflowing volume:** clamped to 0 at intake (counted); Σ SATURATES at
   `i64::MAX` in place (M3 — the fold stays atomic, never a torn bucket; counted +
   one coalesced warn per (feed, sid, day); index spot volume is legitimately 0 anyway).
@@ -186,9 +194,27 @@ O/H/L/C/ΣV given 1m bars):
   `tv_rest_candle_fold_dropped_total{reason="channel_full"}` (`channel_closed` when
   the task is gone) — the spot legs are NEVER blocked (their persist path is
   untouched); the boot catch-up repairs.
-- **Current-day repair (round-2 HIGH):** refolds from the in-RAM day-map — lossless,
-  no `/exec` read, no WAL race; the swapped engine equals a fresh in-order fold over
-  the updated bar set (unit-pinned against the recompute-golden-tested fold).
+- **Current-day repair (round-2 HIGH; round-3 burst coalescing):** refolds from the
+  in-RAM day-map — no `/exec` read, no WAL race on the repair path; the consumer loop
+  drains each burst as ONE batch and refolds every dirty slot ONCE per batch (a
+  mid-day-outage sweep of N repairs costs one refold per slot, never N×~450 seals);
+  the swapped engine equals a fresh in-order fold over the updated bar set
+  (unit-pinned against the recompute-golden-tested fold). Lossless claim scoped to
+  bars received in-process this incarnation.
+- **Crash-restart WAL residual on the TODAY seed (round-3 doc-honesty):** the boot
+  catch-up's TODAY seed IS an `/exec` read — a minute persisted seconds before a
+  crash-restart can be WAL-invisible to that seed and stays out of the derived candles
+  until the NEXT boot's catch-up; the 15:40 IST tf-verify (Blind/mismatch) is the
+  pager for that window.
+- **Future-dated bar (round-3 — the BOUNDARY-01 future-skew class):** a bar whose IST
+  date is after the wall-clock IST today NEVER rolls the live day forward — dropped +
+  counted (`dropped{reason="future_dated"}`) + one coalesced coded error per drained
+  batch. With no current day yet (failed/empty catch-up), only a TODAY-dated first bar
+  is adopted; a past-dated first bar routes to the past-day `/exec` queue (prevents a
+  1-bar refold force-sealing + DEDUP-clobbering a previously-correct closed day).
+- **Seal channel CLOSED (shutdown/teardown):** labeled distinctly
+  (`dropped{reason="seal_channel_closed"}`) on BOTH the live and paced paths — never
+  conflated with backpressure (round-3).
 - **PAST-day refold reads a stale /exec view (WAL apply lag — the only residual
   WAL-lag surface):** the refold verifies the triggering repair minute is present
   BEFORE emitting (M2); a stale read re-queues the dirty mark (bounded 5 attempts,
@@ -225,13 +251,21 @@ O/H/L/C/ΣV given 1m bars):
 - **Order tolerance:** out-of-order bar → `FoldOutcome::OutOfOrder` (never folded
   directly); at the `SidDayFold` layer (round-2): current-day repair → day-map refold
   (`test_apply_live_bar_value_update_repair_refolds_to_recompute`,
-  `test_apply_live_bar_late_missing_minute_refolds_losslessly`), byte-identical
+  `test_apply_live_bar_late_missing_minute_refolds_losslessly`), value-identical
   duplicate → no-op (`test_apply_live_bar_duplicate_bar_is_noop`), day roll clears the
   map + seals residue (`test_apply_live_bar_day_roll_clears_day_map_and_seals_residue`),
   past-day bar routes to the /exec queue without touching live state
   (`test_apply_live_bar_past_day_routes_to_exec_queue_not_live_state`), mid-session
   restart seeding (`test_apply_live_bar_after_from_catchup_seeding_refolds_losslessly`,
   `test_refold_from_day_map_matches_direct_fold`); out-of-session bar → OutOfSession.
+- **Round-3 hardening:** repair-burst coalescing — 40 out-of-order repairs in one
+  drained batch = exactly ONE refold's worth of re-emitted seals per slot, value-exact
+  vs a fresh fold (`test_apply_bar_batch_repair_burst_coalesces_into_one_refold_per_slot`,
+  `test_apply_live_bar_deferred_and_refold_current_day`); future-date clamp — never
+  rolls the day, real bars keep working (`test_apply_live_bar_future_dated_never_rolls_day`);
+  None-current-day adoption arms — today adopts, past routes to the /exec queue,
+  future drops (`test_first_bar_none_day_adopts_today_only`); burst drain primitive
+  (`test_receiver_guard_try_recv_drains_burst`).
 - **Volume semantics:** i64 Σ, negative clamp, u64 conversion clamp
   (`test_fold_volume_i64_clamp_semantics`).
 - **Idempotency:** folding the same input twice through fresh engines yields identical
