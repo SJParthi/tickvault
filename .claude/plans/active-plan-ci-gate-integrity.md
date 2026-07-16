@@ -41,7 +41,9 @@ local pre-push/pre-commit gates were structurally vacuous or dishonest:
    exit-124 FAIL message. No skip path — exit 124 and findings both block.
 
 Files: `.github/workflows/ci.yml`, `.claude/hooks/pre-push-gate.sh`,
-`.claude/hooks/pre-commit-gate.sh`. No `crates/` source is touched; no gate
+`.claude/hooks/pre-commit-gate.sh`. No `crates/` source is touched except the
+comment-only APPROVED token on `crates/trading/src/oms/groww/api_client.rs`
+(item 7); no gate
 is weakened — every change makes a previously-vacuous or
 guaranteed-to-time-out scan real and honestly bounded.
 
@@ -82,8 +84,9 @@ guaranteed-to-time-out scan real and honestly bounded.
 - Arithmetic stubs: evaluate the `SECRET_TIMEOUT` / `BANNED_TIMEOUT`
   expressions with representative counts (551 → 335s; staged 284 → 95s;
   staged 10 → 61s / floor cases) in a throwaway shell.
-- `bash .claude/hooks/plan-gate.sh` — passes (no `crates/*/src/*.rs`
-  changed; plan count at cap 5).
+- `bash .claude/hooks/plan-gate.sh` — passes (the only `crates/*/src/*.rs`
+  change is the comment-only APPROVED token of item 7, and this plan
+  references that crate/file; plan count at cap 5).
 
 ## Rollback
 
@@ -127,6 +130,9 @@ so a revert must be paired with an issue re-flagging the Critical finding.
 - [x] Approve main's #[allow(async_fn_in_trait)] (from merged #1602) exposed by the now-honest scanner
   - Files: crates/trading/src/oms/groww/api_client.rs
   - Tests: N/A (comment-only APPROVED token, scanner contract)
+- [x] Final-review fixes: fail-closed on git-diff errors at all three range-scan sites (B-MED), 120s timeout clamp in pre-push-gate.sh (B-LOW), plan self-consistency on the item-7 crates change (A-LOW)
+  - Files: .claude/hooks/pre-push-gate.sh, .claude/hooks/pre-pr-gate.sh, scripts/git-hooks/pre-push, .claude/plans/active-plan-ci-gate-integrity.md
+  - Tests: bash -n on all three scripts, push-range list-build replication
 
 ## Per-Item Guarantee Matrix
 

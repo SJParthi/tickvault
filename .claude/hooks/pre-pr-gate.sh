@@ -177,9 +177,16 @@ if [ "$QUALITY_FRESH" = "false" ]; then
       echo "  FAIL: cannot resolve branch range (origin/main missing) — run: git fetch origin main" >&2
       FAILED=1
     else
-      CHANGED_RS=$(git diff --name-only "$PR_BASE"..HEAD 2>/dev/null | grep -E '^crates/.*\.rs$' || true)
+      # fail-closed (final review B-MED): a git-diff failure (partial clone
+      # offline, corrupt object) must never masquerade as "no changes" → PASS
+      CHANGED_BRANCH_ALL=$(git diff --name-only "$PR_BASE"..HEAD 2>/dev/null)
+      DIFF_EXIT=$?
+      CHANGED_RS=$(printf '%s\n' "$CHANGED_BRANCH_ALL" | grep -E '^crates/.*\.rs$' || true)
       RS_COUNT=$(printf '%s\n' "$CHANGED_RS" | sed '/^$/d' | wc -l | tr -d ' ')
-      if [ "$RS_COUNT" -eq 0 ]; then
+      if [ "$DIFF_EXIT" -ne 0 ]; then
+        echo "  FAIL: git diff failed (exit $DIFF_EXIT) — cannot enumerate branch range; refusing to skip scans" >&2
+        FAILED=1
+      elif [ "$RS_COUNT" -eq 0 ]; then
         echo "  PASS: Banned pattern scan (no .rs changes on branch; full tree scanned in CI)" >&2
       elif [ -x "$HOOKS_DIR/banned-pattern-scanner.sh" ]; then
         BANNED_TIMEOUT=$(( 60 + RS_COUNT / 2 ))
