@@ -1,6 +1,6 @@
 # Implementation Plan: Groww Smart Orders (GTT/OCO) — full implementation behind the 4-gate lattice
 
-**Status:** APPROVED
+**Status:** VERIFIED
 **Date:** 2026-07-16
 **Approved by:** Parthiban (operator) — dated directive 2026-07-16: "why stubs gaps — i clearly told you to implement and integrate everything."
 

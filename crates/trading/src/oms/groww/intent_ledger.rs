@@ -70,6 +70,12 @@ pub enum IntentKind {
     Modify,
     /// `POST /v1/order/cancel`.
     Cancel,
+    /// Smart-order (GTT/OCO) create (`/v1/order-advance` surface).
+    SmartPlace,
+    /// Smart-order modify.
+    SmartModify,
+    /// Smart-order cancel.
+    SmartCancel,
 }
 
 impl IntentKind {
@@ -80,7 +86,18 @@ impl IntentKind {
             Self::Place => "place",
             Self::Modify => "modify",
             Self::Cancel => "cancel",
+            Self::SmartPlace => "smart_place",
+            Self::SmartModify => "smart_modify",
+            Self::SmartCancel => "smart_cancel",
         }
+    }
+
+    /// Whether this kind is a PLACE-class intent (regular or smart) — the
+    /// class whose reference id joins the open-place dedup index (a duplicate
+    /// open place on the same reference id is refused).
+    #[must_use]
+    pub const fn is_place_class(self) -> bool {
+        matches!(self, Self::Place | Self::SmartPlace)
     }
 }
 
@@ -639,7 +656,7 @@ impl IntentLedger {
 
     fn index_summary(&mut self, summary: IntentSummary) {
         if !summary.last_phase.is_terminal() {
-            if summary.kind == IntentKind::Place {
+            if summary.kind.is_place_class() {
                 self.open_place_refs
                     .insert(summary.reference_id.clone(), summary.intent_id.clone());
             }
@@ -671,7 +688,7 @@ impl IntentLedger {
                 new.intent_id
             )));
         }
-        if new.kind == IntentKind::Place && self.open_place_refs.contains_key(&new.reference_id) {
+        if new.kind.is_place_class() && self.open_place_refs.contains_key(&new.reference_id) {
             return Err(GrowwOmsError::DuplicateIntent {
                 reference_id: new.reference_id,
             });
@@ -781,7 +798,7 @@ impl IntentLedger {
             return Ok(()); // unreachable by construction; fail-soft
         };
         if phase.is_terminal() {
-            if kind == IntentKind::Place {
+            if kind.is_place_class() {
                 self.open_place_refs.remove(&reference_id);
             }
             if let Some(order_id) = &prior_order_id {
@@ -933,6 +950,62 @@ mod tests {
     #[test]
     fn test_ledger_file_name_shape() {
         assert_eq!(ledger_file_name(DATE), "groww-intents-20260715.ndjson");
+    }
+
+    // --- smart-order intent kinds (2026-07-16) ---
+
+    #[test]
+    fn test_intent_kind_place_class_and_labels_cover_smart_kinds() {
+        assert!(IntentKind::Place.is_place_class());
+        assert!(IntentKind::SmartPlace.is_place_class());
+        for k in [
+            IntentKind::Modify,
+            IntentKind::Cancel,
+            IntentKind::SmartModify,
+            IntentKind::SmartCancel,
+        ] {
+            assert!(!k.is_place_class(), "{k:?}");
+        }
+        assert_eq!(IntentKind::SmartPlace.as_str(), "smart_place");
+        assert_eq!(IntentKind::SmartModify.as_str(), "smart_modify");
+        assert_eq!(IntentKind::SmartCancel.as_str(), "smart_cancel");
+        // NDJSON wire labels roundtrip (snake_case serde).
+        for k in [
+            IntentKind::SmartPlace,
+            IntentKind::SmartModify,
+            IntentKind::SmartCancel,
+        ] {
+            let s = serde_json::to_string(&k).unwrap();
+            assert_eq!(s, format!("\"{}\"", k.as_str()));
+            let back: IntentKind = serde_json::from_str(&s).unwrap();
+            assert_eq!(back, k);
+        }
+    }
+
+    #[test]
+    fn test_smart_place_joins_the_open_place_dedup_index() {
+        let dir = temp_ledger_dir("smart-dedup");
+        let mut ledger = IntentLedger::open(&dir, DATE).unwrap();
+        let mut new = place_intent(41);
+        new.kind = IntentKind::SmartPlace;
+        let rid = new.reference_id.clone();
+        ledger.record_intent(new, DATE).unwrap();
+        // A second OPEN place-class intent on the SAME reference id is refused
+        // (regular or smart — one open-place index).
+        let dup = NewIntent {
+            intent_id: format!("{rid}X"),
+            reference_id: rid,
+            kind: IntentKind::SmartPlace,
+            groww_order_id: None,
+            mode: "paper".to_owned(),
+            ts_ms: 2,
+            linked_intent_id: None,
+        };
+        assert!(matches!(
+            ledger.record_intent(dup, DATE),
+            Err(GrowwOmsError::DuplicateIntent { .. })
+        ));
+        cleanup(&dir);
     }
 
     // --- roundtrip: record + phases survive close/reopen ---

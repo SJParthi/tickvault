@@ -1,6 +1,8 @@
 //! Groww order-side transport — the ONLY file allowed to contain
-//! HTTP/`reqwest` and the `/v1/order/*` endpoint PATH strings (Gate 5 of the
-//! live-fire lattice — `groww_order_lattice_guard.rs`). Design §4.3; ORD-PR-3.
+//! HTTP/`reqwest` and the `/v1/order/*` + `/v1/order-advance/*` endpoint PATH
+//! strings (Gate 5 of the live-fire lattice — `groww_order_lattice_guard.rs`).
+//! Design §4.3; ORD-PR-3; smart-order transport per the 2026-07-16
+//! implement-everything directive (`smart_orders.rs` is the type/logic home).
 //!
 //! # Shape
 //! - [`OrderTransport`] — the async transport trait (typed request → classified
@@ -24,6 +26,10 @@
 use secrecy::{ExposeSecret, SecretString};
 
 use super::intent_ledger::IntentReceipt;
+use super::smart_orders::{
+    SmartModifyBody, SmartOrderCreate, SmartOrderListPayload, SmartOrderListQuery,
+    SmartOrderPayload, SmartOrderType,
+};
 use super::types::{
     GrowwCancelOrderReq, GrowwCreateOrderReq, GrowwEnvelope, GrowwModifyOrderReq,
     GrowwMutationRespPayload, GrowwOrderDetailPayload, GrowwOrderStatusPayload, GrowwSegment,
@@ -49,6 +55,15 @@ const PATH_STATUS_BY_REF: &str = "/v1/order/status/reference/";
 const PATH_DETAIL: &str = "/v1/order/detail/";
 const PATH_LIST: &str = "/v1/order/list";
 const PATH_TRADES: &str = "/v1/order/trades/";
+
+// Smart-order (GTT/OCO) paths — `18-smart-orders-schemas.md` §1
+// (Verified-capture). NOTE the literal `/internal/` segment on GET and the
+// path-param-only (no body) cancel.
+const PATH_SMART_CREATE: &str = "/v1/order-advance/create";
+const PATH_SMART_MODIFY: &str = "/v1/order-advance/modify/";
+const PATH_SMART_CANCEL: &str = "/v1/order-advance/cancel/";
+const PATH_SMART_STATUS: &str = "/v1/order-advance/status/";
+const PATH_SMART_LIST: &str = "/v1/order-advance/list";
 
 /// x-api-version header value (live house pattern `groww_spot_1m_boot.rs`).
 const API_VERSION_HEADER: &str = "x-api-version";
@@ -382,6 +397,61 @@ pub trait OrderTransport {
     ) -> TransportOutcome<Vec<GrowwTradeRow>>;
 }
 
+/// The Groww SMART-order (GTT/OCO) transport — the `/v1/order-advance/*`
+/// surface (`18-smart-orders-schemas.md` §1). Same discipline as
+/// [`OrderTransport`]: mutating fns take `&IntentReceipt` (write-ahead proof),
+/// classification is the SAME pure [`classify_response`] taxonomy, and the
+/// executor stays generic (no `dyn`). All five endpoints return the tolerant
+/// all-`Option` [`SmartOrderPayload`] family — the cancel/modify echoes are
+/// documented subsets of the full object.
+#[allow(async_fn_in_trait)] // executor is generic (no dyn); futures awaited inline.
+pub trait SmartOrderTransport {
+    /// `POST /v1/order-advance/create` (GTT or OCO body).
+    async fn create_smart_order(
+        &self,
+        req: &SmartOrderCreate,
+        token: &SecretString,
+        receipt: &IntentReceipt,
+    ) -> TransportOutcome<SmartOrderPayload>;
+
+    /// `PUT /v1/order-advance/modify/{smart_order_id}`.
+    async fn modify_smart_order(
+        &self,
+        smart_order_id: &str,
+        body: &SmartModifyBody,
+        token: &SecretString,
+        receipt: &IntentReceipt,
+    ) -> TransportOutcome<SmartOrderPayload>;
+
+    /// `POST /v1/order-advance/cancel/{segment}/{smart_order_type}/{id}` —
+    /// path params only, NO body (doc §4).
+    async fn cancel_smart_order(
+        &self,
+        segment: GrowwSegment,
+        smart_order_type: SmartOrderType,
+        smart_order_id: &str,
+        token: &SecretString,
+        receipt: &IntentReceipt,
+    ) -> TransportOutcome<SmartOrderPayload>;
+
+    /// `GET /v1/order-advance/status/{segment}/{smart_order_type}/internal/{id}`.
+    async fn get_smart_order(
+        &self,
+        segment: GrowwSegment,
+        smart_order_type: SmartOrderType,
+        smart_order_id: &str,
+        token: &SecretString,
+    ) -> TransportOutcome<SmartOrderPayload>;
+
+    /// `GET /v1/order-advance/list?…` — EXPLICIT flow/status params (the
+    /// server defaults to OCO+ACTIVE; the query type never relies on them).
+    async fn list_smart_orders(
+        &self,
+        query: &SmartOrderListQuery,
+        token: &SecretString,
+    ) -> TransportOutcome<SmartOrderListPayload>;
+}
+
 // ---------------------------------------------------------------------------
 // NullTransport — the paper lane's ZERO-HTTP transport
 // ---------------------------------------------------------------------------
@@ -461,6 +531,52 @@ impl OrderTransport for NullTransport {
         _page_size: u32,
         _token: &SecretString,
     ) -> TransportOutcome<Vec<GrowwTradeRow>> {
+        TransportOutcome::Ambiguous(AmbiguityReason::ConnectPhase)
+    }
+}
+
+impl SmartOrderTransport for NullTransport {
+    async fn create_smart_order(
+        &self,
+        _req: &SmartOrderCreate,
+        _token: &SecretString,
+        _receipt: &IntentReceipt,
+    ) -> TransportOutcome<SmartOrderPayload> {
+        TransportOutcome::Ambiguous(AmbiguityReason::ConnectPhase)
+    }
+    async fn modify_smart_order(
+        &self,
+        _smart_order_id: &str,
+        _body: &SmartModifyBody,
+        _token: &SecretString,
+        _receipt: &IntentReceipt,
+    ) -> TransportOutcome<SmartOrderPayload> {
+        TransportOutcome::Ambiguous(AmbiguityReason::ConnectPhase)
+    }
+    async fn cancel_smart_order(
+        &self,
+        _segment: GrowwSegment,
+        _smart_order_type: SmartOrderType,
+        _smart_order_id: &str,
+        _token: &SecretString,
+        _receipt: &IntentReceipt,
+    ) -> TransportOutcome<SmartOrderPayload> {
+        TransportOutcome::Ambiguous(AmbiguityReason::ConnectPhase)
+    }
+    async fn get_smart_order(
+        &self,
+        _segment: GrowwSegment,
+        _smart_order_type: SmartOrderType,
+        _smart_order_id: &str,
+        _token: &SecretString,
+    ) -> TransportOutcome<SmartOrderPayload> {
+        TransportOutcome::Ambiguous(AmbiguityReason::ConnectPhase)
+    }
+    async fn list_smart_orders(
+        &self,
+        _query: &SmartOrderListQuery,
+        _token: &SecretString,
+    ) -> TransportOutcome<SmartOrderListPayload> {
         TransportOutcome::Ambiguous(AmbiguityReason::ConnectPhase)
     }
 }
@@ -691,6 +807,73 @@ impl OrderTransport for GrowwOrderApiClient {
             token,
         )
         .await
+    }
+}
+
+impl SmartOrderTransport for GrowwOrderApiClient {
+    async fn create_smart_order(
+        &self,
+        req: &SmartOrderCreate,
+        token: &SecretString,
+        _receipt: &IntentReceipt,
+    ) -> TransportOutcome<SmartOrderPayload> {
+        self.send_and_classify(self.http.post(self.url(PATH_SMART_CREATE)).json(req), token)
+            .await
+    }
+
+    async fn modify_smart_order(
+        &self,
+        smart_order_id: &str,
+        body: &SmartModifyBody,
+        token: &SecretString,
+        _receipt: &IntentReceipt,
+    ) -> TransportOutcome<SmartOrderPayload> {
+        let path = format!("{PATH_SMART_MODIFY}{smart_order_id}");
+        self.send_and_classify(self.http.put(self.url(&path)).json(body), token)
+            .await
+    }
+
+    async fn cancel_smart_order(
+        &self,
+        segment: GrowwSegment,
+        smart_order_type: SmartOrderType,
+        smart_order_id: &str,
+        token: &SecretString,
+        _receipt: &IntentReceipt,
+    ) -> TransportOutcome<SmartOrderPayload> {
+        // Path params only — NO body (doc §4).
+        let path = format!(
+            "{PATH_SMART_CANCEL}{}/{}/{smart_order_id}",
+            segment.as_str(),
+            smart_order_type.as_str()
+        );
+        self.send_and_classify(self.http.post(self.url(&path)), token)
+            .await
+    }
+
+    async fn get_smart_order(
+        &self,
+        segment: GrowwSegment,
+        smart_order_type: SmartOrderType,
+        smart_order_id: &str,
+        token: &SecretString,
+    ) -> TransportOutcome<SmartOrderPayload> {
+        // NOTE the literal `/internal/` path segment (doc §4).
+        let path = format!(
+            "{PATH_SMART_STATUS}{}/{}/internal/{smart_order_id}",
+            segment.as_str(),
+            smart_order_type.as_str()
+        );
+        self.get_read(&path, &[], token).await
+    }
+
+    async fn list_smart_orders(
+        &self,
+        query: &SmartOrderListQuery,
+        token: &SecretString,
+    ) -> TransportOutcome<SmartOrderListPayload> {
+        self.get_read(PATH_SMART_LIST, &query.to_query_pairs(), token)
+            .await
     }
 }
 
