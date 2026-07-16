@@ -1,6 +1,8 @@
 //! Groww order-side transport — the ONLY file allowed to contain
-//! HTTP/`reqwest` and the `/v1/order/*` endpoint PATH strings (Gate 5 of the
-//! live-fire lattice — `groww_order_lattice_guard.rs`). Design §4.3; ORD-PR-3.
+//! HTTP/`reqwest` and the `/v1/order/*` + `/v1/order-advance/*` endpoint PATH
+//! strings (Gate 5 of the live-fire lattice — `groww_order_lattice_guard.rs`).
+//! Design §4.3; ORD-PR-3; smart-order transport per the 2026-07-16
+//! implement-everything directive (`smart_orders.rs` is the type/logic home).
 //!
 //! # Shape
 //! - [`OrderTransport`] — the async transport trait (typed request → classified
@@ -24,6 +26,10 @@
 use secrecy::{ExposeSecret, SecretString};
 
 use super::intent_ledger::IntentReceipt;
+use super::smart_orders::{
+    SmartModifyBody, SmartOrderCreate, SmartOrderListPayload, SmartOrderListQuery,
+    SmartOrderPayload, SmartOrderType, is_plausible_smart_order_id,
+};
 use super::types::{
     GrowwCancelOrderReq, GrowwCreateOrderReq, GrowwEnvelope, GrowwModifyOrderReq,
     GrowwMutationRespPayload, GrowwOrderDetailPayload, GrowwOrderStatusPayload, GrowwSegment,
@@ -51,6 +57,15 @@ const PATH_DETAIL: &str = "/v1/order/detail/";
 const PATH_LIST: &str = "/v1/order/list";
 const PATH_TRADES: &str = "/v1/order/trades/";
 
+// Smart-order (GTT/OCO) paths — `18-smart-orders-schemas.md` §1
+// (Verified-capture). NOTE the literal `/internal/` segment on GET and the
+// path-param-only (no body) cancel.
+const PATH_SMART_CREATE: &str = "/v1/order-advance/create";
+const PATH_SMART_MODIFY: &str = "/v1/order-advance/modify/";
+const PATH_SMART_CANCEL: &str = "/v1/order-advance/cancel/";
+const PATH_SMART_STATUS: &str = "/v1/order-advance/status/";
+const PATH_SMART_LIST: &str = "/v1/order-advance/list";
+
 /// x-api-version header value (live house pattern `groww_spot_1m_boot.rs`).
 const API_VERSION_HEADER: &str = "x-api-version";
 const API_VERSION_VALUE: &str = "1.0";
@@ -59,6 +74,12 @@ const API_VERSION_VALUE: &str = "1.0";
 const CONNECT_TIMEOUT_SECS: u64 = 3;
 const REQUEST_TIMEOUT_SECS: u64 = 5;
 const POOL_IDLE_TIMEOUT_SECS: u64 = 90;
+
+/// Oversize defense (adversarial round 1, finding 1): the largest legitimate
+/// order-side response is a full order list page (~tens of KiB) — a body past
+/// this cap is hostile/malfunctioning and is REFUSED, pre-read on the declared
+/// Content-Length and again post-read (the margin.rs oversize pattern).
+const ORDER_MAX_RESPONSE_BYTES: u64 = 2 * 1024 * 1024;
 
 /// Max sanitized response-body excerpt kept on a failure classification.
 const MAX_BODY_EXCERPT_CHARS: usize = 300;
@@ -383,6 +404,61 @@ pub trait OrderTransport {
     ) -> TransportOutcome<Vec<GrowwTradeRow>>;
 }
 
+/// The Groww SMART-order (GTT/OCO) transport — the `/v1/order-advance/*`
+/// surface (`18-smart-orders-schemas.md` §1). Same discipline as
+/// [`OrderTransport`]: mutating fns take `&IntentReceipt` (write-ahead proof),
+/// classification is the SAME pure [`classify_response`] taxonomy, and the
+/// executor stays generic (no `dyn`). All five endpoints return the tolerant
+/// all-`Option` [`SmartOrderPayload`] family — the cancel/modify echoes are
+/// documented subsets of the full object.
+#[allow(async_fn_in_trait)] // executor is generic (no dyn); futures awaited inline.
+pub trait SmartOrderTransport {
+    /// `POST /v1/order-advance/create` (GTT or OCO body).
+    async fn create_smart_order(
+        &self,
+        req: &SmartOrderCreate,
+        token: &SecretString,
+        receipt: &IntentReceipt,
+    ) -> TransportOutcome<SmartOrderPayload>;
+
+    /// `PUT /v1/order-advance/modify/{smart_order_id}`.
+    async fn modify_smart_order(
+        &self,
+        smart_order_id: &str,
+        body: &SmartModifyBody,
+        token: &SecretString,
+        receipt: &IntentReceipt,
+    ) -> TransportOutcome<SmartOrderPayload>;
+
+    /// `POST /v1/order-advance/cancel/{segment}/{smart_order_type}/{id}` —
+    /// path params only, NO body (doc §4).
+    async fn cancel_smart_order(
+        &self,
+        segment: GrowwSegment,
+        smart_order_type: SmartOrderType,
+        smart_order_id: &str,
+        token: &SecretString,
+        receipt: &IntentReceipt,
+    ) -> TransportOutcome<SmartOrderPayload>;
+
+    /// `GET /v1/order-advance/status/{segment}/{smart_order_type}/internal/{id}`.
+    async fn get_smart_order(
+        &self,
+        segment: GrowwSegment,
+        smart_order_type: SmartOrderType,
+        smart_order_id: &str,
+        token: &SecretString,
+    ) -> TransportOutcome<SmartOrderPayload>;
+
+    /// `GET /v1/order-advance/list?…` — EXPLICIT flow/status params (the
+    /// server defaults to OCO+ACTIVE; the query type never relies on them).
+    async fn list_smart_orders(
+        &self,
+        query: &SmartOrderListQuery,
+        token: &SecretString,
+    ) -> TransportOutcome<SmartOrderListPayload>;
+}
+
 // ---------------------------------------------------------------------------
 // NullTransport — the paper lane's ZERO-HTTP transport
 // ---------------------------------------------------------------------------
@@ -466,6 +542,52 @@ impl OrderTransport for NullTransport {
     }
 }
 
+impl SmartOrderTransport for NullTransport {
+    async fn create_smart_order(
+        &self,
+        _req: &SmartOrderCreate,
+        _token: &SecretString,
+        _receipt: &IntentReceipt,
+    ) -> TransportOutcome<SmartOrderPayload> {
+        TransportOutcome::Ambiguous(AmbiguityReason::ConnectPhase)
+    }
+    async fn modify_smart_order(
+        &self,
+        _smart_order_id: &str,
+        _body: &SmartModifyBody,
+        _token: &SecretString,
+        _receipt: &IntentReceipt,
+    ) -> TransportOutcome<SmartOrderPayload> {
+        TransportOutcome::Ambiguous(AmbiguityReason::ConnectPhase)
+    }
+    async fn cancel_smart_order(
+        &self,
+        _segment: GrowwSegment,
+        _smart_order_type: SmartOrderType,
+        _smart_order_id: &str,
+        _token: &SecretString,
+        _receipt: &IntentReceipt,
+    ) -> TransportOutcome<SmartOrderPayload> {
+        TransportOutcome::Ambiguous(AmbiguityReason::ConnectPhase)
+    }
+    async fn get_smart_order(
+        &self,
+        _segment: GrowwSegment,
+        _smart_order_type: SmartOrderType,
+        _smart_order_id: &str,
+        _token: &SecretString,
+    ) -> TransportOutcome<SmartOrderPayload> {
+        TransportOutcome::Ambiguous(AmbiguityReason::ConnectPhase)
+    }
+    async fn list_smart_orders(
+        &self,
+        _query: &SmartOrderListQuery,
+        _token: &SecretString,
+    ) -> TransportOutcome<SmartOrderListPayload> {
+        TransportOutcome::Ambiguous(AmbiguityReason::ConnectPhase)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // GrowwOrderApiClient — the reqwest impl (live lane)
 // ---------------------------------------------------------------------------
@@ -503,6 +625,10 @@ impl GrowwOrderApiClient {
             .connect_timeout(std::time::Duration::from_secs(CONNECT_TIMEOUT_SECS))
             .timeout(std::time::Duration::from_secs(REQUEST_TIMEOUT_SECS))
             .pool_idle_timeout(std::time::Duration::from_secs(POOL_IDLE_TIMEOUT_SECS))
+            // No redirects EVER on the order surface: a redirected mutation
+            // could replay the bearer token to an attacker-influenced host
+            // (adversarial round 1, finding 1 — the csv-downloader precedent).
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|e| ApiClientError::ClientBuild(e.to_string()))?;
         Ok(Self {
@@ -576,6 +702,15 @@ impl GrowwOrderApiClient {
                 .get(reqwest::header::RETRY_AFTER)
                 .and_then(|v| v.to_str().ok()),
         );
+        // Oversize defense: refuse on the DECLARED Content-Length BEFORE the
+        // body is read at all, and again post-read for chunked/undeclared
+        // bodies (the margin.rs pattern). An over-cap body is unusable —
+        // outcome unknown, classified Ambiguous(Decode), never parsed.
+        if let Some(declared) = resp.content_length()
+            && declared > ORDER_MAX_RESPONSE_BYTES
+        {
+            return TransportOutcome::Ambiguous(AmbiguityReason::Decode);
+        }
         let body = match resp.text().await {
             Ok(b) => b,
             Err(_) => {
@@ -583,6 +718,9 @@ impl GrowwOrderApiClient {
                 return TransportOutcome::Ambiguous(AmbiguityReason::Decode);
             }
         };
+        if u64::try_from(body.len()).unwrap_or(u64::MAX) > ORDER_MAX_RESPONSE_BYTES {
+            return TransportOutcome::Ambiguous(AmbiguityReason::Decode);
+        }
         let excerpt = if !(200..=299).contains(&status) {
             Some(body_excerpt_of(&body))
         } else {
@@ -692,6 +830,100 @@ impl OrderTransport for GrowwOrderApiClient {
             token,
         )
         .await
+    }
+}
+
+/// Transport-side id refusal (adversarial round 1, finding 2): an implausible
+/// `smart_order_id` must NEVER be spliced into a URL path (path-traversal /
+/// request-smuggling surface). Nothing left the box, so the typed outcome is
+/// `Ambiguous(ConnectPhase)` — "never sent". The raw id is NOT logged; only
+/// its length.
+fn refuse_implausible_smart_id<T>(smart_order_id: &str) -> Option<TransportOutcome<T>> {
+    if is_plausible_smart_order_id(smart_order_id) {
+        None
+    } else {
+        tracing::warn!(
+            target: "groww_ord",
+            id_len = smart_order_id.len(),
+            "groww smart transport: implausible smart_order_id refused before URL splice"
+        );
+        Some(TransportOutcome::Ambiguous(AmbiguityReason::ConnectPhase))
+    }
+}
+
+impl SmartOrderTransport for GrowwOrderApiClient {
+    async fn create_smart_order(
+        &self,
+        req: &SmartOrderCreate,
+        token: &SecretString,
+        _receipt: &IntentReceipt,
+    ) -> TransportOutcome<SmartOrderPayload> {
+        self.send_and_classify(self.http.post(self.url(PATH_SMART_CREATE)).json(req), token)
+            .await
+    }
+
+    async fn modify_smart_order(
+        &self,
+        smart_order_id: &str,
+        body: &SmartModifyBody,
+        token: &SecretString,
+        _receipt: &IntentReceipt,
+    ) -> TransportOutcome<SmartOrderPayload> {
+        if let Some(refused) = refuse_implausible_smart_id(smart_order_id) {
+            return refused;
+        }
+        let path = format!("{PATH_SMART_MODIFY}{smart_order_id}");
+        self.send_and_classify(self.http.put(self.url(&path)).json(body), token)
+            .await
+    }
+
+    async fn cancel_smart_order(
+        &self,
+        segment: GrowwSegment,
+        smart_order_type: SmartOrderType,
+        smart_order_id: &str,
+        token: &SecretString,
+        _receipt: &IntentReceipt,
+    ) -> TransportOutcome<SmartOrderPayload> {
+        if let Some(refused) = refuse_implausible_smart_id(smart_order_id) {
+            return refused;
+        }
+        // Path params only — NO body (doc §4).
+        let path = format!(
+            "{PATH_SMART_CANCEL}{}/{}/{smart_order_id}",
+            segment.as_str(),
+            smart_order_type.as_str()
+        );
+        self.send_and_classify(self.http.post(self.url(&path)), token)
+            .await
+    }
+
+    async fn get_smart_order(
+        &self,
+        segment: GrowwSegment,
+        smart_order_type: SmartOrderType,
+        smart_order_id: &str,
+        token: &SecretString,
+    ) -> TransportOutcome<SmartOrderPayload> {
+        if let Some(refused) = refuse_implausible_smart_id(smart_order_id) {
+            return refused;
+        }
+        // NOTE the literal `/internal/` path segment (doc §4).
+        let path = format!(
+            "{PATH_SMART_STATUS}{}/{}/internal/{smart_order_id}",
+            segment.as_str(),
+            smart_order_type.as_str()
+        );
+        self.get_read(&path, &[], token).await
+    }
+
+    async fn list_smart_orders(
+        &self,
+        query: &SmartOrderListQuery,
+        token: &SecretString,
+    ) -> TransportOutcome<SmartOrderListPayload> {
+        self.get_read(PATH_SMART_LIST, &query.to_query_pairs(), token)
+            .await
     }
 }
 
@@ -898,5 +1130,61 @@ mod tests {
                 TransportOutcome::Ambiguous(AmbiguityReason::ConnectPhase)
             );
         });
+    }
+
+    // -- adversarial round 1, finding 1: builder shape + oversize cap ratchet --
+
+    #[test]
+    fn ratchet_client_builder_has_no_redirects_and_oversize_caps() {
+        // Source-scan of THIS module's production region (everything before
+        // the tests module): the builder must pin Policy::none() and the
+        // read path must consult ORDER_MAX_RESPONSE_BYTES pre-read
+        // (content_length) AND post-read (body.len()).
+        let src = include_str!("api_client.rs");
+        let prod = &src[..src.find("mod tests").expect("tests module")];
+        assert!(
+            prod.contains(".redirect(reqwest::redirect::Policy::none())"),
+            "GrowwOrderApiClient builder must pin redirect Policy::none()"
+        );
+        assert!(
+            prod.contains("const ORDER_MAX_RESPONSE_BYTES: u64 = 2 * 1024 * 1024;"),
+            "the 2 MiB oversize cap constant must exist"
+        );
+        assert!(
+            prod.contains("resp.content_length()")
+                && prod.contains("declared > ORDER_MAX_RESPONSE_BYTES"),
+            "send_and_classify must refuse on the DECLARED Content-Length pre-read"
+        );
+        assert!(
+            prod.contains(
+                "u64::try_from(body.len()).unwrap_or(u64::MAX) > ORDER_MAX_RESPONSE_BYTES"
+            ),
+            "send_and_classify must refuse an over-cap body post-read"
+        );
+    }
+
+    // -- adversarial round 1, finding 2: implausible id never spliced ----------
+
+    #[test]
+    fn implausible_smart_id_refused_before_url_splice() {
+        for bad in [
+            "",
+            "../etc",
+            "a/b",
+            "id with space",
+            "x\u{0}y",
+            &"g".repeat(65),
+        ] {
+            let refused = refuse_implausible_smart_id::<SmartOrderPayload>(bad);
+            assert_eq!(
+                refused,
+                Some(TransportOutcome::Ambiguous(AmbiguityReason::ConnectPhase)),
+                "implausible id {bad:?} must be refused"
+            );
+        }
+        assert!(
+            refuse_implausible_smart_id::<SmartOrderPayload>("GMOCO-1234_ab").is_none(),
+            "a plausible id must pass through"
+        );
     }
 }

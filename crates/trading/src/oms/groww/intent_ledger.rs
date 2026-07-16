@@ -70,6 +70,12 @@ pub enum IntentKind {
     Modify,
     /// `POST /v1/order/cancel`.
     Cancel,
+    /// Smart-order (GTT/OCO) create (`/v1/order-advance` surface).
+    SmartPlace,
+    /// Smart-order modify.
+    SmartModify,
+    /// Smart-order cancel.
+    SmartCancel,
 }
 
 impl IntentKind {
@@ -80,7 +86,18 @@ impl IntentKind {
             Self::Place => "place",
             Self::Modify => "modify",
             Self::Cancel => "cancel",
+            Self::SmartPlace => "smart_place",
+            Self::SmartModify => "smart_modify",
+            Self::SmartCancel => "smart_cancel",
         }
+    }
+
+    /// Whether this kind is a PLACE-class intent (regular or smart) — the
+    /// class whose reference id joins the open-place dedup index (a duplicate
+    /// open place on the same reference id is refused).
+    #[must_use]
+    pub const fn is_place_class(self) -> bool {
+        matches!(self, Self::Place | Self::SmartPlace)
     }
 }
 
@@ -140,6 +157,23 @@ impl IntentPhase {
     }
 }
 
+/// Smart-order context persisted on SMART intent lines (adversarial round 1,
+/// finding 5): enough to rebuild the status-GET path (segment + type) and a
+/// tracked-book row (symbol + qty) after a restart. `None` on regular-order
+/// lines and on pre-2026-07-16 ledger files (serde default — replay-compatible
+/// both directions).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SmartIntentContext {
+    /// Segment label (`CASH` / `FNO`) — the cancel/get path parameter.
+    pub segment: String,
+    /// `GTT` / `OCO` — the cancel/get path parameter.
+    pub smart_order_type: String,
+    /// Trading symbol (tracked-book display / audit).
+    pub trading_symbol: String,
+    /// Order quantity at intent time.
+    pub quantity: i64,
+}
+
 /// One NDJSON ledger line — an intent-phase event.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IntentRecord {
@@ -166,6 +200,9 @@ pub struct IntentRecord {
     /// The prior intent this one supersedes/links (cancel resend chain).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub linked_intent_id: Option<String>,
+    /// Smart-order restart context (finding 5) — `None` on regular lines.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub smart_ctx: Option<SmartIntentContext>,
 }
 
 /// Ledger-level failure.
@@ -237,6 +274,8 @@ pub struct NewIntent {
     pub ts_ms: i64,
     /// Optional link to a prior intent (cancel resend chain, F-15).
     pub linked_intent_id: Option<String>,
+    /// Smart-order restart context (finding 5) — `None` for regular orders.
+    pub smart_ctx: Option<SmartIntentContext>,
 }
 
 /// In-memory summary of one replayed/journaled intent (the twin).
@@ -254,6 +293,8 @@ pub struct IntentSummary {
     pub groww_order_id: Option<String>,
     /// ts of the last line.
     pub last_ts_ms: i64,
+    /// Smart-order restart context (finding 5) — first `Some` wins on fold.
+    pub smart_ctx: Option<SmartIntentContext>,
 }
 
 /// Boot classification of an intent after replay (design §4.5/§4.9).
@@ -375,6 +416,9 @@ pub fn replay_bytes(buf: &[u8]) -> Result<LedgerReplay, LedgerError> {
                         if rec.groww_order_id.is_some() {
                             entry.groww_order_id = rec.groww_order_id;
                         }
+                        if entry.smart_ctx.is_none() && rec.smart_ctx.is_some() {
+                            entry.smart_ctx = rec.smart_ctx;
+                        }
                     }
                     None => {
                         intents.insert(
@@ -386,6 +430,7 @@ pub fn replay_bytes(buf: &[u8]) -> Result<LedgerReplay, LedgerError> {
                                 last_phase: rec.phase,
                                 groww_order_id: rec.groww_order_id,
                                 last_ts_ms: rec.ts_ms,
+                                smart_ctx: rec.smart_ctx,
                             },
                         );
                     }
@@ -639,7 +684,7 @@ impl IntentLedger {
 
     fn index_summary(&mut self, summary: IntentSummary) {
         if !summary.last_phase.is_terminal() {
-            if summary.kind == IntentKind::Place {
+            if summary.kind.is_place_class() {
                 self.open_place_refs
                     .insert(summary.reference_id.clone(), summary.intent_id.clone());
             }
@@ -671,7 +716,7 @@ impl IntentLedger {
                 new.intent_id
             )));
         }
-        if new.kind == IntentKind::Place && self.open_place_refs.contains_key(&new.reference_id) {
+        if new.kind.is_place_class() && self.open_place_refs.contains_key(&new.reference_id) {
             return Err(GrowwOmsError::DuplicateIntent {
                 reference_id: new.reference_id,
             });
@@ -695,6 +740,7 @@ impl IntentLedger {
             ts_ms: new.ts_ms,
             detail: None,
             linked_intent_id: new.linked_intent_id.clone(),
+            smart_ctx: new.smart_ctx.clone(),
         };
         self.append_fsync(&record)
             .map_err(|e| GrowwOmsError::LedgerUnavailable(e.to_string()))?;
@@ -708,6 +754,7 @@ impl IntentLedger {
             last_phase: IntentPhase::Recorded,
             groww_order_id: new.groww_order_id,
             last_ts_ms: new.ts_ms,
+            smart_ctx: new.smart_ctx,
         });
         Ok(IntentReceipt {
             intent_id: new.intent_id,
@@ -762,6 +809,7 @@ impl IntentLedger {
             ts_ms,
             detail,
             linked_intent_id: None,
+            smart_ctx: None, // context is stamped ONCE on the recorded line
         };
         self.append_fsync(&record)
             .map_err(|e| GrowwOmsError::LedgerUnavailable(e.to_string()))?;
@@ -781,7 +829,7 @@ impl IntentLedger {
             return Ok(()); // unreachable by construction; fail-soft
         };
         if phase.is_terminal() {
-            if kind == IntentKind::Place {
+            if kind.is_place_class() {
                 self.open_place_refs.remove(&reference_id);
             }
             if let Some(order_id) = &prior_order_id {
@@ -927,12 +975,117 @@ mod tests {
             mode: "paper".to_owned(),
             ts_ms: 1_760_000_000_000 + i64::from(seq),
             linked_intent_id: None,
+            smart_ctx: None,
         }
     }
 
     #[test]
     fn test_ledger_file_name_shape() {
         assert_eq!(ledger_file_name(DATE), "groww-intents-20260715.ndjson");
+    }
+
+    // --- smart-order intent kinds (2026-07-16) ---
+
+    #[test]
+    fn test_intent_kind_place_class_and_labels_cover_smart_kinds() {
+        assert!(IntentKind::Place.is_place_class());
+        assert!(IntentKind::SmartPlace.is_place_class());
+        for k in [
+            IntentKind::Modify,
+            IntentKind::Cancel,
+            IntentKind::SmartModify,
+            IntentKind::SmartCancel,
+        ] {
+            assert!(!k.is_place_class(), "{k:?}");
+        }
+        assert_eq!(IntentKind::SmartPlace.as_str(), "smart_place");
+        assert_eq!(IntentKind::SmartModify.as_str(), "smart_modify");
+        assert_eq!(IntentKind::SmartCancel.as_str(), "smart_cancel");
+        // NDJSON wire labels roundtrip (snake_case serde).
+        for k in [
+            IntentKind::SmartPlace,
+            IntentKind::SmartModify,
+            IntentKind::SmartCancel,
+        ] {
+            let s = serde_json::to_string(&k).unwrap();
+            assert_eq!(s, format!("\"{}\"", k.as_str()));
+            let back: IntentKind = serde_json::from_str(&s).unwrap();
+            assert_eq!(back, k);
+        }
+    }
+
+    #[test]
+    fn test_smart_ctx_persists_roundtrip_and_tolerates_absent_field() {
+        // Finding 5 (adversarial round 1): the smart context must survive an
+        // NDJSON roundtrip, fold into the replay summary, and its ABSENCE on
+        // pre-2026-07-16 lines must parse cleanly (serde default).
+        let ctx = SmartIntentContext {
+            segment: "FNO".to_owned(),
+            smart_order_type: "OCO".to_owned(),
+            trading_symbol: "NIFTY25JUL25000CE".to_owned(),
+            quantity: 75,
+        };
+        let rec = IntentRecord {
+            intent_id: "TV1".to_owned(),
+            reference_id: "TV1".to_owned(),
+            kind: IntentKind::SmartPlace,
+            phase: IntentPhase::Recorded,
+            groww_order_id: None,
+            mode: "paper".to_owned(),
+            ts_ms: 1,
+            detail: None,
+            linked_intent_id: None,
+            smart_ctx: Some(ctx.clone()),
+        };
+        let line = serde_json::to_string(&rec).expect("serialize");
+        let back: IntentRecord = serde_json::from_str(&line).expect("roundtrip");
+        assert_eq!(back.smart_ctx.as_ref(), Some(&ctx));
+        // Replay fold: the Recorded line's ctx survives a later ctx-less
+        // phase line (first Some wins).
+        let phase_line = serde_json::to_string(&IntentRecord {
+            phase: IntentPhase::Acked,
+            groww_order_id: Some("GMOCO1".to_owned()),
+            smart_ctx: None,
+            ts_ms: 2,
+            ..rec.clone()
+        })
+        .expect("serialize");
+        let buf = format!("{line}\n{phase_line}\n");
+        let replay = replay_bytes(buf.as_bytes()).expect("replay");
+        let s = replay.intents.get("TV1").expect("summary");
+        assert_eq!(s.smart_ctx.as_ref(), Some(&ctx));
+        assert_eq!(s.last_phase, IntentPhase::Acked);
+        // A LEGACY line WITHOUT the field parses cleanly to None.
+        let legacy = r#"{"intent_id":"TV2","reference_id":"TV2","kind":"place","phase":"recorded","mode":"paper","ts_ms":1}"#;
+        let back: IntentRecord = serde_json::from_str(legacy).expect("legacy parse");
+        assert_eq!(back.smart_ctx, None);
+    }
+
+    #[test]
+    fn test_smart_place_joins_the_open_place_dedup_index() {
+        let dir = temp_ledger_dir("smart-dedup");
+        let mut ledger = IntentLedger::open(&dir, DATE).unwrap();
+        let mut new = place_intent(41);
+        new.kind = IntentKind::SmartPlace;
+        let rid = new.reference_id.clone();
+        ledger.record_intent(new, DATE).unwrap();
+        // A second OPEN place-class intent on the SAME reference id is refused
+        // (regular or smart — one open-place index).
+        let dup = NewIntent {
+            intent_id: format!("{rid}X"),
+            reference_id: rid,
+            kind: IntentKind::SmartPlace,
+            groww_order_id: None,
+            mode: "paper".to_owned(),
+            ts_ms: 2,
+            linked_intent_id: None,
+            smart_ctx: None,
+        };
+        assert!(matches!(
+            ledger.record_intent(dup, DATE),
+            Err(GrowwOmsError::DuplicateIntent { .. })
+        ));
+        cleanup(&dir);
     }
 
     // --- roundtrip: record + phases survive close/reopen ---
@@ -1046,6 +1199,7 @@ mod tests {
                     mode: "paper".to_owned(),
                     ts_ms: 1,
                     linked_intent_id: None,
+                    smart_ctx: None,
                 },
                 DATE,
             )
@@ -1063,6 +1217,7 @@ mod tests {
                 mode: "paper".to_owned(),
                 ts_ms: 2,
                 linked_intent_id: None,
+                smart_ctx: None,
             },
             DATE,
         ) {
@@ -1086,6 +1241,7 @@ mod tests {
                         mode: "paper".to_owned(),
                         ts_ms: 4,
                         linked_intent_id: None,
+                        smart_ctx: None,
                     },
                     DATE
                 )
@@ -1162,6 +1318,7 @@ mod tests {
                 ts_ms: 9,
                 detail: None,
                 linked_intent_id: None,
+                smart_ctx: None,
             };
             let mut line = serde_json::to_vec(&good).unwrap();
             line.push(b'\n');
@@ -1229,6 +1386,7 @@ mod tests {
                 ts_ms: 5,
                 detail: None,
                 linked_intent_id: None,
+                smart_ctx: None,
             };
             let line = serde_json::to_vec(&torn).unwrap(); // NO newline push
             let mut f = OpenOptions::new().append(true).open(&path).unwrap();
@@ -1475,6 +1633,7 @@ mod tests {
                         mode: "paper".to_owned(),
                         ts_ms: 1,
                         linked_intent_id: None,
+                        smart_ctx: None,
                     },
                     DAY1,
                 )
@@ -1492,6 +1651,7 @@ mod tests {
                         mode: "paper".to_owned(),
                         ts_ms: 3,
                         linked_intent_id: None,
+                        smart_ctx: None,
                     },
                     DAY1,
                 )
@@ -1514,6 +1674,7 @@ mod tests {
                 mode: "paper".to_owned(),
                 ts_ms: 5,
                 linked_intent_id: None,
+                smart_ctx: None,
             },
             DATE,
         ) {
@@ -1534,6 +1695,7 @@ mod tests {
                     mode: "paper".to_owned(),
                     ts_ms: 6,
                     linked_intent_id: None,
+                    smart_ctx: None,
                 },
                 DATE,
             ),
@@ -1580,6 +1742,7 @@ mod tests {
                     mode: "paper".to_owned(),
                     ts_ms: 10,
                     linked_intent_id: None,
+                    smart_ctx: None,
                 },
                 day2,
             )
@@ -1677,6 +1840,7 @@ mod tests {
                         mode: "paper".to_owned(),
                         ts_ms: 1,
                         linked_intent_id: None,
+                        smart_ctx: None,
                     },
                     DAY1,
                 )
@@ -1708,6 +1872,7 @@ mod tests {
                 ts_ms: 99,
                 detail: None,
                 linked_intent_id: None,
+                smart_ctx: None,
             };
             let mut line = serde_json::to_vec(&stale).unwrap();
             line.push(b'\n');
@@ -1739,6 +1904,7 @@ mod tests {
                         mode: "paper".to_owned(),
                         ts_ms: 100,
                         linked_intent_id: None,
+                        smart_ctx: None,
                     },
                     DATE,
                 )
@@ -1758,6 +1924,7 @@ mod tests {
                         mode: "paper".to_owned(),
                         ts_ms: 101,
                         linked_intent_id: None,
+                        smart_ctx: None,
                     },
                     DATE,
                 )
@@ -1812,6 +1979,7 @@ mod tests {
                 ts_ms: ts,
                 detail,
                 linked_intent_id: None,
+                smart_ctx: None,
             };
             let line = serde_json::to_vec(&rec).unwrap();
             let back: IntentRecord = serde_json::from_slice(&line).unwrap();
@@ -1847,6 +2015,7 @@ mod tests {
                 ts_ms: 1,
                 detail: None,
                 linked_intent_id: None,
+                smart_ctx: None,
             };
             let mut buf = serde_json::to_vec(&rec).unwrap();
             buf.push(b'\n');
