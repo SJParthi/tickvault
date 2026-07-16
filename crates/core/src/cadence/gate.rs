@@ -156,6 +156,14 @@ impl WindowRing {
 
     /// Record an AUTHORIZED fire at `now` (callers check [`Self::admissible`]
     /// first, under the same lock — atomic both-or-neither).
+    ///
+    /// Defensive note (RS7, 2026-07-16): the head-is-oldest invariant
+    /// assumes non-decreasing `now` values (the monotonic domain every
+    /// caller lives in); a REGRESSED input would leave the ring ordered
+    /// by insertion, not by instant — `admissible` then compares against
+    /// an instant that may not be the true oldest, erring toward
+    /// OVER-admission by at most the regression skew. Production-
+    /// unreachable (all call sites pass monotonic instants).
     fn record(&mut self, now_monotonic_ms: i64) {
         if self.len == self.cap {
             // The oldest instant falls out of the window; overwrite it.
