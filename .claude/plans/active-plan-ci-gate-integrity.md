@@ -120,3 +120,17 @@ so a revert must be paired with an issue re-flagging the Critical finding.
 - [x] Review round-1 fixes: push-scoped local scans (harness hook budget), sibling callers (scripts/git-hooks/pre-push, pre-pr-gate.sh), timeout-vs-findings messages, honesty comments
   - Files: .claude/hooks/pre-push-gate.sh, scripts/git-hooks/pre-push, .claude/hooks/pre-pr-gate.sh, CLAUDE.md
   - Tests: bash -n, push-range list-build replication, single-file scanner invocation
+
+## Per-Item Guarantee Matrix
+
+See `per-wave-guarantee-matrix.md` (`.claude/rules/project/`) — all 15 rows of
+the 100% Guarantee Matrix and all 7 rows of the Resilience Demand Matrix apply
+to every item in this plan. Plan-specific notes:
+
+- This plan changes CI/hook shell only (no `crates/` code): the hot-path,
+  DHAT/Criterion, and audit-table rows read `N/A — CI/hook shell change, no
+  runtime code path touched`; the "100% code checks" row is the DELIVERABLE
+  itself (the scanner now genuinely scans every file instead of 1).
+- Resilience rows: no tick-drop path, no WS/QuestDB path, and no DEDUP key is
+  touched; the change strictly STRENGTHENS enforcement (a previously-vacuous
+  gate now blocks real findings) and weakens nothing.
