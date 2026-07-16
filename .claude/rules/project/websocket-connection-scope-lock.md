@@ -200,6 +200,21 @@ as historical audit; THIS table is the effective contract.
 > consumer; durable order-event capture returns with live trading (the OMS wiring), and
 > boot-staged order-update WAL segments remain undrained on dhan-off boots (pre-existing
 > Phase A residual, C2 target).
+>
+> **2026-07-14 Amendment (order-runtime dry-run PR — SOCKET-FREE under the same-day
+> §A.1 noise lock):** with `[order_runtime].enabled = true` (base.toml ON; the serde
+> default stays OFF) the dhan-OFF REST stack spawns the DRY-RUN ORDER RUNTIME
+> (`.claude/rules/project/order-runtime-dryrun.md`) — a paper OMS + RiskEngine fed by
+> paper fills and Groww marks, `dry_run` hard-true, ZERO live orders. It opens NO Dhan
+> WebSocket and performs NO order-update WAL capture/drain: the runtime's order-update
+> broadcast channel is created with ZERO producers, honoring the §A.1 spawn retirement.
+> The LIVE RE-ARM is one quoted follow-up unit — (1) the order-update socket spawn with
+> the runtime consumer wired, (2) durable WAL frame capture + the boot drain/conditional
+> confirm, (3) the two CloudWatch order-update alarms §A.1 deleted — re-armed together
+> only after a fresh dated operator quote lands in
+> `dhan-rest-only-noise-lock-2026-07-14.md` §3 + §A.1 here. Ratchets:
+> `test_rest_stack_spawns_no_order_update_ws_and_no_canary` (the socket ban) +
+> `test_rest_stack_wires_order_runtime` (the socket-free/WAL-free runtime shape).
 
 ### §A.1 — 2026-07-14 subsection: Dhan REST-only NOISE lock (order-update spawn retired; Dhan alert surface narrowed to 4)
 

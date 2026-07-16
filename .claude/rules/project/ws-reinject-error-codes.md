@@ -161,6 +161,24 @@ consumer-side acknowledgement watermark).
 
 ---
 
+## §1.5. 2026-07-14 Update — the planned `confirm_deferred_stale_livefeed` defer arm was CUT (socket-free re-scope)
+
+The dry-run order runtime PR originally added a THIRD confirm site — the
+dhan-OFF REST stack draining boot-staged ORDER-UPDATE WAL frames into its
+broadcast with a conditional confirm (defer reason
+`confirm_deferred_stale_livefeed`, warn-level). That whole drain/confirm leg
+was CUT at the merge with the same-day operator Dhan noise lock
+(`dhan-rest-only-noise-lock-2026-07-14.md` §3 — the stack opens no
+order-update socket and touches no order-update WAL). The boot-staged
+order-update segments therefore remain the documented Phase-A residual on
+dhan-off boots (undrained in `replaying/`, zero loss, re-globbed each boot)
+until the gated live re-arm restores the socket + WAL capture + drain in
+one quoted follow-up unit. The §1 abort semantics (`channel_closed` /
+`send_timeout`, error-level, paging) are UNCHANGED; no new reason string
+exists in code today.
+
+---
+
 ## §2. Trigger / auto-load
 
 This rule activates when editing:

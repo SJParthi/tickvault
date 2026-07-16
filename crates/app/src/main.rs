@@ -511,6 +511,38 @@ async fn main() -> Result<()> {
              feed-gating PR lands"
         );
     }
+    // ── Order-runtime mark bridge (dry-run PR, 2026-07-14; re-homed
+    // 2026-07-16 after the Groww live feed retired in #1581) ────────────────
+    // Built in the PROCESS-GLOBAL boot prefix so the mark source exists
+    // before any REST-leg spawn. `[order_runtime].enabled = false` → all
+    // three slots stay empty/None and every downstream path is
+    // byte-identical. The receiver is stashed in a take-once slot for the
+    // Dhan REST-only stack's Phase 5a (`spawn_dhan_rest_stack` — the
+    // runtime's single spawn site); the forwarder now rides into the Groww
+    // per-minute REST legs (spot + contract — the live-tick bridge tap died
+    // with the retired Groww live feed): marks are the OWN-FIRE just-closed
+    // 1m candle closes, forwarded at each leg's persist-confirm choke point.
+    let (order_runtime_mark_forwarder, order_runtime_mark_rx_slot, order_runtime_marks_wanted) =
+        if config.order_runtime.enabled {
+            let (mark_tx, mark_rx) = tokio::sync::mpsc::channel::<
+                tickvault_app::order_runtime::MarkUpdate,
+            >(config.order_runtime.mark_channel_capacity);
+            let marks_wanted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            (
+                Some(tickvault_app::order_runtime::MarkForwarder {
+                    marks_wanted: std::sync::Arc::clone(&marks_wanted),
+                    tx: mark_tx,
+                }),
+                std::sync::Arc::new(std::sync::Mutex::new(Some(mark_rx))),
+                marks_wanted,
+            )
+        } else {
+            (
+                None,
+                std::sync::Arc::new(std::sync::Mutex::new(None)),
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            )
+        };
     // ── per-instrument presence registry init — PROCESS-GLOBAL boot prefix ──
     // Scoreboard PR-D fix round 1 (review HIGH; 2026-07-15: the Groww
     // activation watcher this originally ordered against retired with the
@@ -1597,7 +1629,15 @@ async fn main() -> Result<()> {
     // Groww 1m OHLCV for the 3 spot indices and persists to `spot_1m_rest`
     // tagged feed='groww' (+ `rest_fetch_audit` forensics rows). See
     // `spawn_groww_spot_1m_leg`.
-    spawn_groww_spot_1m_leg(&config, &notifier, &trading_calendar);
+    // Order-runtime mark tap (re-homed 2026-07-16): the forwarder rides
+    // into the Groww REST legs (spot + contract) — the only mark sources
+    // since the live bridge retired. `None` when `[order_runtime]` is off.
+    spawn_groww_spot_1m_leg(
+        &config,
+        &notifier,
+        &trading_calendar,
+        order_runtime_mark_forwarder,
+    );
 
     // Daily 15:40 IST timeframe-consistency verifier — PROCESS-GLOBAL like
     // the conservation audit + scoreboard above (operator 2026-07-13):
@@ -1800,6 +1840,16 @@ async fn main() -> Result<()> {
             notifier: std::sync::Arc::clone(&notifier),
             calendar: std::sync::Arc::clone(&trading_calendar),
             feed_runtime: std::sync::Arc::clone(&feed_runtime),
+            // Order-runtime dry-run PR (2026-07-14, SOCKET-FREE per the
+            // same-day operator Dhan noise lock): only the mark bridge
+            // rides in — no order-update WS, no WAL capture / boot drain
+            // (both gated behind a fresh dated operator quote in
+            // dhan-rest-only-noise-lock-2026-07-14 §3). Post-C2 the stack
+            // spawns UNCONDITIONALLY, so `[order_runtime]` is never inert
+            // on any boot shape (the pre-C2 E6 dhan-ON warn is retired
+            // with the lane).
+            mark_rx_slot: std::sync::Arc::clone(&order_runtime_mark_rx_slot),
+            marks_wanted: std::sync::Arc::clone(&order_runtime_marks_wanted),
             // PR-C2: the stack owns the /health token-block writer.
             health: health_status.clone(),
         },
@@ -3604,6 +3654,10 @@ fn spawn_groww_spot_1m_leg(
     config: &ApplicationConfig,
     notifier: &std::sync::Arc<NotificationService>,
     trading_calendar: &std::sync::Arc<TradingCalendar>,
+    // Order-runtime mark tap (re-homed 2026-07-16 — the live-bridge tap
+    // died with the retired Groww live feed): rides into the spot +
+    // contract legs; `None` ⇒ `[order_runtime]` disabled, taps inert.
+    mark_forwarder: Option<tickvault_app::order_runtime::MarkForwarder>,
 ) {
     // 2026-07-14 auto-ladder (operator approval — the two-wave / seven
     // burst tiers): the spot→chain sequencing channel is RETIRED — each
@@ -3651,6 +3705,8 @@ fn spawn_groww_spot_1m_leg(
                     calendar: std::sync::Arc::clone(trading_calendar),
                     questdb: config.questdb.clone(),
                     burst: std::sync::Arc::clone(&burst),
+                    // OWN-FIRE spot closes → the dry-run runtime's marks.
+                    mark_forwarder: mark_forwarder.clone(),
                 },
             );
         info!(
@@ -3701,6 +3757,8 @@ fn spawn_groww_spot_1m_leg(
                         anchor_store: contract_anchor_store,
                         strikes_each_side: config.groww_contract_1m.strikes_each_side,
                         burst: std::sync::Arc::clone(&burst),
+                        // OWN-FIRE contract closes → the option-leg marks.
+                        mark_forwarder: mark_forwarder.clone(),
                     },
                 );
             info!(
