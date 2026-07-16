@@ -30,7 +30,8 @@ use tickvault_core::cadence::executor::{
 use tickvault_core::cadence::expiry::DayLockedExpiryStore;
 use tickvault_core::cadence::gate::DhanGates;
 use tickvault_core::cadence::runner::{
-    CadenceClock, CadenceRunnerDeps, LoopExit, run_cadence_loop, spawn_supervised_cadence_runner,
+    CadenceClock, CadenceRunnerDeps, LoopExit, emit_expiry_deadline_page, run_cadence_loop,
+    spawn_supervised_cadence_runner,
 };
 use tickvault_core::pipeline::chain_snapshot::ChainUnderlying;
 use tokio::sync::Notify;
@@ -603,6 +604,24 @@ fn test_honest_skip_at_cutoff_emits_alert_once() {
     );
     if let DecisionOutcome::Skipped(reason) = snap.outcome {
         assert_eq!(reason.as_str(), "cutoff");
+    }
+}
+
+#[test]
+fn test_emit_expiry_deadline_page_dry_run_demotion_both_arms() {
+    // RS9 (2026-07-16, the F10 demotion pattern applied to the expiry
+    // DEADLINE page arm): under dry-run executors expiry resolution can
+    // never succeed (every expiry-list fetch returns Empty), so the
+    // ~08:55 IST deadline page would fire 3-6 coded error! lines every
+    // dry-run day of pure expected-shape noise. dry_run=false keeps the
+    // coded CADENCE-01 error!; dry_run=true demotes to info! with a
+    // dry_run=true field (counter unchanged — the trend survives). The
+    // F10 test shape: both arms exercised, no panic path, per-arm
+    // semantics pinned by the emit fn's branch (source: runner.rs
+    // emit_expiry_deadline_page).
+    for underlying in ChainUnderlying::ALL {
+        emit_expiry_deadline_page(false, Feed::Dhan, *underlying, 32_100); // coded error! arm
+        emit_expiry_deadline_page(true, Feed::Groww, *underlying, 32_100); // RS9: info! demotion arm
     }
 }
 

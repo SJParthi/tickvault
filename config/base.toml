@@ -769,7 +769,11 @@ concurrency_recover_after_clean_cycles = 3
 # Spot clamp: spots never fire earlier than T + this (house 300ms —
 # structurally inert at the default 1000ms burst offset).
 spot_min_post_close_ms = 300
-# At most one in-cycle retry per failed request (RateLimited never retried).
+# At most one in-cycle retry per failed request, through the gates. A
+# RateLimited leg KEEPS its one bounded in-cycle retry (after the per-key
+# spacing) — one of the operator's "multiple attempts" before any shape
+# demotion (2026-07-16 Correction 2; supersedes the earlier "RateLimited
+# never retried" wording, which was the exact inverse).
 in_cycle_retry_max = 1
 # Lane staleness cutoffs past T: older data is stale for a next-minute fill.
 dhan_lane_cutoff_ms = 15000

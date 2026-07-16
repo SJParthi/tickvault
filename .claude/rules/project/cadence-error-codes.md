@@ -54,7 +54,9 @@ lane as close to each minute close T as the brokers' rate rules allow:
   BURST second beside the 3 chains (the operator's literal "all 7
   parallel at first second"; cap-legal under the two-bucket model — 4
   spot fires ≤ the Data-API 5/sec bucket, the 3 chains in the
-  option-chain API's own per-key budget); shape 1 bases all 4 in the
+  option-chain API's own per-key budget — where the chain-bucket
+  exemption itself is the §0b RS1 Assumed/UNVERIFIED-LIVE marker, not
+  established fact); shape 1 bases all 4 in the
   second after the burst. The 2026-07-15 ADAPTIVE CONCURRENCY tiers then
   cap spots-per-second at 4/3/2/1, greedy overflow spilling to later
   buckets (both brokers' candle endpoints are single-symbol-per-request —
@@ -210,7 +212,11 @@ edge-latched CADENCE-01 `rung0_reentry_cap_latched` log per day; the
 IST day-start reset re-arms it) — a one-bucket wire can never
 oscillate the shape 0⇄1 all day, and the pre-cap `ladder_exhausted`
 blind spot (rung 1 stays clean, so the exhausted edge never fires
-during a 0⇄1 oscillation) is closed by the same cap.
+during a 0⇄1 oscillation) is closed by the same cap. Honest envelope:
+the cap's latch is runner-TASK-local, so an unwind-build task respawn
+resets it — bounded (release builds abort on panic per `panic =
+"abort"`, making the respawn arm release-unreachable, and respawn
+storms are independently paged via `tv_cadence_runner_respawn_total`).
 The combined ring is therefore RE-SCOPED to spot + expiry-list fires
 ONLY; chain fires are governed solely by the per-key ≥3s CAS gate.
 
@@ -230,7 +236,7 @@ One retry per leg per cycle, never more.
 
 | Broker | Rung | Second 1 | Second 2 | Second 3 |
 |---|---|---|---|---|
-| Dhan | 0 (primary) | ALL 7 CONCURRENT — 3 chains + all 4 spots (the operator's "all 7 parallel at first second"; two-bucket cap-legal) | — | — |
+| Dhan | 0 (primary) | ALL 7 CONCURRENT — 3 chains + all 4 spots (the operator's "all 7 parallel at first second"; two-bucket cap-legal, resting on the §0b RS1 Assumed/UNVERIFIED-LIVE chain-bucket exemption) | — | — |
 | Dhan | 1 (fallback) | 3 chains concurrent | ALL 4 spots | — |
 | Groww | 0 (primary) | all 7 requests parallel at T+0 | — | — |
 | Groww | 1 (fallback) | 3 chains at :01 | all 4 spots at :02 | — |
@@ -443,9 +449,12 @@ self-corrected or self-reported; the operator inspects trends).
    builds abort on panic (`panic = "abort"`) — the respawn arms are
    unwind-build self-heal paths, the TICK-FLUSH-01 honesty note.
 4. `gate_deferred_nominal` — do NOT widen spacings; the 2026-07-16 all-7
-   burst is validated cap-legal at boot (`dhan_burst_offset_ms` band +
-   the two-bucket split: 4 nominal spots ≤ the combined spot+expiry cap,
-   chains per-key only — by construction), so a live occurrence implies a
+   burst is validated cap-legal at boot AGAINST OUR OWN GATES ONLY
+   (`dhan_burst_offset_ms` band + the two-bucket split: 4 nominal spots ≤
+   the combined spot+expiry cap, chains per-key only — a structural check
+   of the schedule vs our gate math, NOT a claim the broker's wire
+   accepts the burst; the chain-bucket exemption stays the §0b RS1
+   Assumed/UNVERIFIED-LIVE marker), so a live occurrence implies a
    runtime retry interleaving bug — file it.
 
 **Honest-envelope note — `tv_cadence_gate_deferred_total` is TREND-ONLY

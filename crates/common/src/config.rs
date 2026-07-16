@@ -226,12 +226,17 @@ pub struct ApplicationConfig {
     #[serde(default)]
     pub exit_orders: ExitOrdersConfig,
     /// `[cadence]` — broker-agnostic fetch-cadence + decision-timing
-    /// scheduler (operator cadence directive 2026-07-14, judge-locked
-    /// design rev-8 — `crates/core/src/cadence/`). Dry-run decision-timing
-    /// skeleton: per-minute Dhan (:55 pre-close serialized chains + :03
-    /// post-close spots) + Groww (:00 post-close 7-parallel burst) with
-    /// structural zero-429 gates, a Dhan failure ladder, and event-driven
-    /// per-lane decisions. This PR ships NO REST caller — the dry-run
+    /// scheduler (operator cadence directive 2026-07-14, reshaped by the
+    /// 2026-07-16 post-close burst directive — `crates/core/src/cadence/`;
+    /// supersedes the rev-8 pre-close schedule — 2026-07-16). Dry-run
+    /// decision-timing skeleton: per minute close T, BOTH lanes fire
+    /// POST-CLOSE — primary (rung 0) = ALL 7 requests concurrent in the
+    /// burst second (3 chains + 4 spots; Dhan at T +
+    /// `dhan_burst_offset_ms`, Groww at T+0); fallback (rung 1) = chains
+    /// in second 1, all 4 spots in second 2. Demotion is
+    /// RateLimited-ONLY after 2 consecutive dirty cycles (operator
+    /// Correction 2); structural zero-429 gates + event-driven per-lane
+    /// decisions throughout. This PR ships NO REST caller — the dry-run
     /// executors log fires and return Empty. Absent section ⇒ DISABLED
     /// (fail-safe default off).
     #[serde(default)]
@@ -891,12 +896,108 @@ pub struct RestCandleFoldConfig {
     /// Default OFF (fail-safe) — `config/base.toml` turns it on explicitly.
     #[serde(default)]
     pub enabled: bool,
-    /// Boot catch-up window in IST days: the fold re-derives all 21 TFs
-    /// from the last `catchup_days` of `spot_1m_rest` rows per feed.
-    /// Default 35 (one month of spot history + weekend slack — the
-    /// operator's 2026-07-16 minimum-one-month demand).
-    #[serde(default = "default_rest_candle_fold_catchup_days")]
-    pub catchup_days: u32,
+    /// The Dhan BURST second offset from the minute-close instant T, ms
+    /// (operator directive 2026-07-16 — ALL fires are POST-close now).
+    /// Default 1000 (second 1): shape rung 0 fires ALL 7 requests here
+    /// concurrently (3 chains + 4 spots — the operator's same-day all-7
+    /// correction; the spots in the Data-API bucket, the chains in the
+    /// option-chain API's own per-key budget); rung 1 fires the 3
+    /// chains here and all 4 spots one window later. Validated > 0 and
+    /// feasible against the Dhan lane cutoff (the deepest spot bucket
+    /// must land inside it).
+    #[serde(default = "default_cadence_dhan_burst_offset_ms")]
+    pub dhan_burst_offset_ms: i64,
+    /// The Dhan spot ROLLING-1000ms-WINDOW gate cap (operator
+    /// spot-concurrency ladder addition 2026-07-15): at most this many
+    /// spot authorizations in ANY sliding 1000ms window. Default 4 (the
+    /// full step-0 per-second spot group); validated 1..=5 (the Dhan
+    /// Data-API hard cap is 5/sec). A cap below 4 structurally floors
+    /// the concurrency ladder's step so no SECOND BUCKET's spot count
+    /// exceeds the cap.
+    #[serde(default = "default_cadence_spot_window_cap")]
+    pub spot_window_cap: u32,
+    /// Adaptive-concurrency degrade threshold (Assumed — default 2,
+    /// flagged for operator confirm): the Dhan spot-concurrency ladder
+    /// AND the Groww fallback-shape ladder degrade ONE step only after
+    /// this many CONSECUTIVE rate-limited-dirty cycles ("continuous",
+    /// never a one-off 429).
+    #[serde(default = "default_cadence_concurrency_degrade_after_dirty_cycles")]
+    pub concurrency_degrade_after_dirty_cycles: u32,
+    /// Adaptive-concurrency recovery threshold (Assumed — default 3,
+    /// flagged for operator confirm): both ladders climb back UP one
+    /// step after this many consecutive fully-clean cycles at the
+    /// current step (never permanently stuck from a one-off 429).
+    #[serde(default = "default_cadence_concurrency_recover_after_clean_cycles")]
+    pub concurrency_recover_after_clean_cycles: u32,
+    /// Post-close clamp: a spot second-bucket base never lands earlier
+    /// than T + this, ms. Default 300 — the proven house
+    /// `SPOT_1M_REST_FIRE_DELAY_MS` post-close fire delay (structurally
+    /// inert at the default burst offset of 1000).
+    #[serde(default = "default_cadence_spot_min_post_close_ms")]
+    pub spot_min_post_close_ms: i64,
+    /// Maximum in-cycle retries per failed request (Assumed — default 1).
+    /// Retries fire ONLY through the gates and only when landing before
+    /// the lane cutoff. A RateLimited leg KEEPS its one bounded in-cycle
+    /// retry (through the gates, after the per-key spacing) — one of the
+    /// operator's "multiple attempts" before any shape demotion
+    /// (2026-07-16 Correction 2; supersedes the earlier "a RateLimited is
+    /// NEVER retried in-cycle" wording, which was the exact inverse).
+    #[serde(default = "default_cadence_in_cycle_retry_max")]
+    pub in_cycle_retry_max: u32,
+    /// Dhan lane staleness cutoff, ms after T (Assumed — default 15000:
+    /// the burst completes by ~T+2s, the chain retry grid by ~T+4s, and
+    /// the deepest spot spill + spot retries well inside :15). Past it ⇒
+    /// HONEST-SKIP + CADENCE-02, never a late decision.
+    #[serde(default = "default_cadence_dhan_lane_cutoff_ms")]
+    pub dhan_lane_cutoff_ms: i64,
+    /// Groww lane anchor offset from T, ms. Default 0 (T+0 post-close
+    /// burst).
+    #[serde(default)]
+    pub groww_anchor_offset_ms: i64,
+    /// Groww burst-failure verdict instant, ms after the burst anchor
+    /// (Assumed — default 800): a leg FAILED iff it completed Err by
+    /// here; every failed leg gets ONE sequential fallback refetch. A
+    /// leg still IN FLIGHT here is SKIPPED (F4, 2026-07-15 — never a
+    /// duplicate concurrent same-leg request); if its original request
+    /// later completes Err before the lane cutoff, its one fallback
+    /// attempt dispatches IMMEDIATELY at that completion (the L3
+    /// DEFERRED per-leg fallback, 2026-07-15).
+    #[serde(default = "default_cadence_groww_burst_timeout_ms")]
+    pub groww_burst_timeout_ms: i64,
+    /// Per-request bound on every individual Groww request incl. fallback
+    /// fetches, ms (Assumed — default 1500).
+    #[serde(default = "default_cadence_groww_request_timeout_ms")]
+    pub groww_request_timeout_ms: i64,
+    /// Groww lane staleness cutoff, ms after T (Assumed — default 6000:
+    /// admits the fallback path AND Dhan's ~T+4.5s completion cross-filling
+    /// a frozen Groww lane). Validated > `groww_burst_timeout_ms`.
+    #[serde(default = "default_cadence_groww_lane_cutoff_ms")]
+    pub groww_lane_cutoff_ms: i64,
+    /// Minimum spacing enforced by the per-(underlying, expiry) chain
+    /// gates, ms. Default 3000 (Dhan's 1-unique-request-per-3s rule —
+    /// per the 2026-07-16 operator directive it applies to the SAME
+    /// (underlying, expiry) key ONLY; different underlyings fire
+    /// concurrently and the retired GLOBAL chain gate is gone).
+    /// Validated ≥ 3000.
+    #[serde(default = "default_cadence_chain_min_spacing_ms")]
+    pub chain_min_spacing_ms: i64,
+    /// Pre-market expiry-resolution retry cadence, ms (operator spec
+    /// 2026-07-15): the boot phase re-attempts each unresolved
+    /// (broker, underlying) expiry-list fetch at this interval — from
+    /// scheduler start on a trading day until the SESSION END (15:30
+    /// IST), never giving up mid-day. Default 60_000. Validated > 0.
+    #[serde(default = "default_cadence_expiry_retry_interval_ms")]
+    pub expiry_retry_interval_ms: i64,
+    /// Pre-market expiry-resolution PAGE deadline, IST seconds-of-day
+    /// (operator spec 2026-07-15): past this instant each still-unresolved
+    /// (broker, underlying) fires ONE edge-latched CADENCE-01
+    /// `expiry_unresolved` page per episode while the background retry
+    /// continues at the same cadence. The deadline gates the PAGE, not
+    /// the attempts — a boot AFTER it (e.g. a 10:00 restart) still
+    /// resolves immediately on first success. Default 32_100 (08:55 IST).
+    /// Validated < 86_400.
+    #[serde(default = "default_cadence_expiry_deadline_secs_of_day_ist")]
+    pub expiry_deadline_secs_of_day_ist: u32,
 }
 
 impl Default for RestCandleFoldConfig {

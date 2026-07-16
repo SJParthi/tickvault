@@ -772,24 +772,7 @@ async fn run_expiry_resolution_loop<C, D, G>(
                         failed_waves[feed.index()][underlying.index()],
                     ) {
                         *latch = true;
-                        metrics::counter!(
-                            "tv_cadence_expiry_unresolved_total",
-                            "broker" => feed.as_str(),
-                            "underlying" => underlying.as_str()
-                        )
-                        .increment(1);
-                        error!(
-                            code = ErrorCode::Cadence01LaneDegraded.code_str(),
-                            stage = "expiry_unresolved",
-                            broker = feed.as_str(),
-                            underlying = underlying.as_str(),
-                            deadline_secs_of_day_ist = deadline_secs,
-                            "CADENCE-01: expiry unresolved past the pre-market \
-                             deadline — lanes run degraded (chains fire without \
-                             an expiry key); background retry continues at the \
-                             same cadence until session end (edge-latched per \
-                             broker+underlying per day)"
-                        );
+                        emit_expiry_deadline_page(deps.dry_run, feed, *underlying, deadline_secs);
                     }
                 }
             }
@@ -847,6 +830,57 @@ const CADENCE_EXPIRY_GATE_ACQUIRE_ATTEMPTS: u32 = 3;
 /// further out than TWO windows means a busy cycle burst — concede the
 /// fire to the next wave instead of camping on the budget.
 const CADENCE_EXPIRY_GATE_WAIT_CAP_MS: i64 = 2_000;
+
+/// The edge-latched expiry DEADLINE page emit — ONE per (broker,
+/// underlying) per IST day; the caller owns the latch, this fn only
+/// counts + logs.
+///
+/// `dry_run` (RS9, 2026-07-16 — the verifier-F10 demotion pattern):
+/// under DRY-RUN executors expiry resolution can NEVER succeed (every
+/// expiry-list fetch structurally returns `Empty`), so the ~08:55 IST
+/// deadline page firing for every enabled (broker, underlying) pair is
+/// the EXPECTED shape — 3-6 coded `error!` lines every dry-run day of
+/// pure noise. A dry-run deadline page therefore logs at `info!` with a
+/// `dry_run = true` field (counter unchanged — the trend survives);
+/// REAL executor wirings keep the coded `error!`.
+pub fn emit_expiry_deadline_page(
+    dry_run: bool,
+    broker: Feed,
+    underlying: ChainUnderlying,
+    deadline_secs: u32,
+) {
+    metrics::counter!(
+        "tv_cadence_expiry_unresolved_total",
+        "broker" => broker.as_str(),
+        "underlying" => underlying.as_str()
+    )
+    .increment(1);
+    if dry_run {
+        info!(
+            dry_run = true,
+            stage = "expiry_unresolved",
+            broker = broker.as_str(),
+            underlying = underlying.as_str(),
+            deadline_secs_of_day_ist = deadline_secs,
+            "cadence expiry deadline passed under DRY-RUN executors \
+             (expected shape — resolution cannot succeed on Empty \
+             expiry-list fetches; F10/RS9 demotion)"
+        );
+    } else {
+        error!(
+            code = ErrorCode::Cadence01LaneDegraded.code_str(),
+            stage = "expiry_unresolved",
+            broker = broker.as_str(),
+            underlying = underlying.as_str(),
+            deadline_secs_of_day_ist = deadline_secs,
+            "CADENCE-01: expiry unresolved past the pre-market \
+             deadline — lanes run degraded (chains fire without \
+             an expiry key); background retry continues at the \
+             same cadence until session end (edge-latched per \
+             broker+underlying per day)"
+        );
+    }
+}
 
 /// One resolution ATTEMPT wave for `broker`: fetch the vendor expiry list
 /// for every still-unresolved underlying, apply the pure policy math, and
