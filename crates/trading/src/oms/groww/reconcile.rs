@@ -708,6 +708,7 @@ mod tests {
             last_phase: crate::oms::groww::intent_ledger::IntentPhase::Ambiguous,
             groww_order_id: None,
             last_ts_ms: 1,
+            smart_ctx: None,
         };
         // A second open intent whose order IS tracked must NOT be orphaned.
         let tracked_rid = generate_reference_id(DATE, 10, 9);
@@ -718,6 +719,7 @@ mod tests {
             last_phase: crate::oms::groww::intent_ledger::IntentPhase::Sent,
             groww_order_id: Some("G1".to_owned()),
             last_ts_ms: 2,
+            smart_ctx: None,
         };
         let locals = [local("G1", GrowwOrderStatus::Open, 0, 1, 0)];
         let snap = [row("G1", "OPEN", 0, None)];
@@ -1002,6 +1004,7 @@ mod tests {
                 last_phase: phase,
                 groww_order_id: None,
                 last_ts_ms: 1,
+                smart_ctx: None,
             }
         };
         let open = [
@@ -1036,6 +1039,7 @@ mod tests {
                 last_phase: IntentPhase::Sent,
                 groww_order_id: None,
                 last_ts_ms: 1,
+                smart_ctx: None,
             },
             BootIntentClass::NeedsResolution,
         )];
@@ -1077,6 +1081,7 @@ mod tests {
             last_phase: crate::oms::groww::intent_ledger::IntentPhase::Ambiguous,
             groww_order_id: None,
             last_ts_ms: 1,
+            smart_ctx: None,
         };
         let r = reconcile_groww_orders(&[], &[], &[orphan.clone(), orphan], PARAMS);
         assert_eq!(r.orphan_intents, vec![rid], "one ladder route per intent");

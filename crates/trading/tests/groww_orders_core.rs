@@ -82,6 +82,7 @@ fn test_place_chain_validate_journal_track_reconcile() {
                 mode: "paper".to_owned(),
                 ts_ms: 1,
                 linked_intent_id: None,
+                smart_ctx: None,
             },
             DATE,
         )
@@ -166,6 +167,7 @@ fn test_kill9_replay_blocks_new_mutations_until_resolution() {
                     mode: "paper".to_owned(),
                     ts_ms: 1,
                     linked_intent_id: None,
+                    smart_ctx: None,
                 },
                 DATE,
             )
@@ -203,6 +205,7 @@ fn test_kill9_replay_blocks_new_mutations_until_resolution() {
             mode: "paper".to_owned(),
             ts_ms: 3,
             linked_intent_id: None,
+            smart_ctx: None,
         },
         DATE,
     );
@@ -291,6 +294,7 @@ fn test_day_rollover_ledger_feeds_cross_close_producer() {
                     mode: "paper".to_owned(),
                     ts_ms: 1,
                     linked_intent_id: None,
+                    smart_ctx: None,
                 },
                 day1,
             )
@@ -323,6 +327,7 @@ fn test_day_rollover_ledger_feeds_cross_close_producer() {
                 mode: "paper".to_owned(),
                 ts_ms: 9,
                 linked_intent_id: None,
+                smart_ctx: None,
             },
             DATE,
         )
