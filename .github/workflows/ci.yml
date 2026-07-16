@@ -623,8 +623,9 @@ jobs:
   # added to the list). Side 2 — each cargo test step asserts the EXECUTED
   # target count ("Running tests/dhat_" lines) equals its expected count
   # (11 core / 3 storage / 3 trading — PR-C3 2026-07-14 truth-sync; the
-  # deleted dhat_tick_gap_detector left core at 10. The moneyness PR
-  # re-added one target (dhat_moneyness): 10 -> 11), so a `--test` flag dropped from a
+  # deleted dhat_tick_gap_detector left core at 10, the Groww live-feed
+  # retirement at 9; the moneyness PR re-added dhat_moneyness (9 -> 10)
+  # and the cadence PR adds dhat_cadence_decide (10 -> 11)), so a `--test` flag dropped from a
   # run step (while the file + list entry survive) fails loudly instead of
   # silently un-gating that target (2026-07-09 adversarial-review HIGH).
   #
@@ -730,8 +731,12 @@ jobs:
           # with the tick-gap detector (operator Q4-ii 2026-07-13).
           # 2026-07-15: 10 -> 9 — dhat_feed_lag_groww deleted with the Groww
           # live feed.
-          if [ "$ran" -ne 9 ]; then
-            echo "::error::core DHAT step executed $ran targets, expected 9 — a --test flag was dropped from this step (drift list vs run step mismatch)."
+          # 2026-07-15 (merge-train reconcile): the moneyness PR re-added one
+          # target (dhat_moneyness): 9 -> 10.
+          # 2026-07-16 (cadence rebase onto post-#1540 main): the cadence PR
+          # adds dhat_cadence_decide: 10 -> 11.
+          if [ "$ran" -ne 11 ]; then
+            echo "::error::core DHAT step executed $ran targets, expected 11 — a --test flag was dropped from this step (drift list vs run step mismatch)."
             exit 1
           fi
 

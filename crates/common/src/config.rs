@@ -216,6 +216,17 @@ pub struct ApplicationConfig {
     /// behavior only (the engine's hardcoded `dry_run` blocks live POSTs).
     #[serde(default)]
     pub exit_orders: ExitOrdersConfig,
+    /// `[cadence]` — broker-agnostic fetch-cadence + decision-timing
+    /// scheduler (operator cadence directive 2026-07-14, judge-locked
+    /// design rev-8 — `crates/core/src/cadence/`). Dry-run decision-timing
+    /// skeleton: per-minute Dhan (:55 pre-close serialized chains + :03
+    /// post-close spots) + Groww (:00 post-close 7-parallel burst) with
+    /// structural zero-429 gates, a Dhan failure ladder, and event-driven
+    /// per-lane decisions. This PR ships NO REST caller — the dry-run
+    /// executors log fires and return Empty. Absent section ⇒ DISABLED
+    /// (fail-safe default off).
+    #[serde(default)]
+    pub cadence: CadenceConfig,
 }
 
 /// `[feeds]` — pluggable market-data feed selection (operator lock
@@ -3180,6 +3191,11 @@ impl ApplicationConfig {
         // bounds always; freeze-limit + review-date sanity when enabled —
         // rejected at boot, BEFORE the trading pipeline spawns.
         self.exit_orders.validate()?;
+        // Cadence scheduler (operator 2026-07-14): the structural zero-429
+        // spacing floors are validated at boot, BEFORE the runner spawns
+        // (fail-closed; the default cadence.enabled=false section is always
+        // valid, so today's boot is unaffected).
+        self.cadence.validate()?;
 
         Ok(())
     }
@@ -3759,6 +3775,7 @@ mod tests {
             groww_orders: GrowwOrdersConfig::default(),
             dhan_margin_gate: DhanMarginGateConfig::default(),
             exit_orders: ExitOrdersConfig::default(),
+            cadence: CadenceConfig::default(),
         }
     }
 

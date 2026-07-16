@@ -38,9 +38,6 @@ tickvault-core = { path = "../core" }
 criterion = { workspace = true }
 dhat = { workspace = true }
 proptest = { workspace = true }
-# Cluster B: enable tokio paused-time (`start_paused`) for deterministic,
-# flake-free ladder/cooldown-latch tests — feature-only, no new crate (mirrors
-# crates/api + crates/core dev-deps). Workspace-pinned per cargo rules.
 tokio = { workspace = true, features = ["test-util"] }
 
 [[bench]]
