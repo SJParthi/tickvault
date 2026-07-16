@@ -201,15 +201,6 @@ Other clusters (checked off by their owning sessions' PRs, all referencing THIS 
 - [ ] C1 — order_audit-family QuestDB persistence revival (feed-in-key DEDUP)
   - Files: crates/storage/src/ (new *_audit_persistence.rs modules)
   - Tests: TBD by owning session (8-element template ratchets)
-- [ ] D1 — orphan-watchdog re-homing + expired date-gate re-arm (PR #1545)
-  - Files: crates/app/src/main.rs, crates/trading/src/oms/engine.rs, crates/common/src/constants.rs
-  - Tests: TBD by cluster D session (watchdog wiring source-scan guard)
-- [ ] E1 — exit-order layer (Super Order/OCO wiring, MPP verify, slicing) — serial after A
-  - Files: crates/trading/src/oms/ (engine.rs, api_client.rs call sites), crates/app/src/order_runtime.rs
-  - Tests: TBD by owning session
-- [ ] E2 — portfolio + margin gate (OrderIntent in RiskEngine::check_order; design-only until the operator REST grant)
-  - Files: crates/trading/src/risk/engine.rs, crates/trading/src/oms/api_client.rs
-  - Tests: TBD by owning session (exit-never-gated invariant test mandatory)
 - [x] CT1 — Conditional & Multi Order surface (dhanhq v2 /alerts family): typed constructors +
       `POST /alerts/multi/orders` wrapper, dormant behind the hardcoded alerts gate,
       Equities/Indices fail-closed segment lock
@@ -292,6 +283,15 @@ Other clusters (checked off by their owning sessions' PRs, all referencing THIS 
     multi-order/gate tests, 23 conditional.rs constructor tests (incl. the proptest),
     14 types.rs wire-shape tests, 3 dhan_api_coverage.rs orphan/extractor tests —
     58 total.
+- [ ] D1 — orphan-watchdog re-homing + expired date-gate re-arm (PR #1545)
+  - Files: crates/app/src/main.rs, crates/trading/src/oms/engine.rs, crates/common/src/constants.rs
+  - Tests: TBD by cluster D session (watchdog wiring source-scan guard)
+- [ ] E1 — exit-order layer (Super Order/OCO wiring, MPP verify, slicing) — serial after A
+  - Files: crates/trading/src/oms/ (engine.rs, api_client.rs call sites), crates/app/src/order_runtime.rs
+  - Tests: TBD by owning session
+- [ ] E2 — portfolio + margin gate (OrderIntent in RiskEngine::check_order; design-only until the operator REST grant)
+  - Files: crates/trading/src/risk/engine.rs, crates/trading/src/oms/api_client.rs
+  - Tests: TBD by owning session (exit-never-gated invariant test mandatory)
 
 ## Hard invariants (every Dhan-order PR states these)
 

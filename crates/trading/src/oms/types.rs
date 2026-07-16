@@ -909,6 +909,254 @@ pub struct DhanConditionalTriggerResponse {
 }
 
 // ---------------------------------------------------------------------------
+// Multi Order + Conditional Detail Types — 2026-07-14 (07c §multi + portal/yaml)
+// ---------------------------------------------------------------------------
+
+/// Tolerant Dhan numeric: bare number OR quoted decimal string on the wire
+/// (comparingValue is number-in-request / string-in-response; lastPrice is
+/// string-in-example / number-in-yaml). Round-trips verbatim; never panics.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(untagged)]
+pub enum DhanNumeric {
+    /// Bare JSON number (e.g. `245.5`).
+    Num(f64),
+    /// Quoted decimal string (e.g. `"245.50"`), preserved verbatim.
+    Text(String),
+}
+
+impl DhanNumeric {
+    /// Best-effort f64 view; `None` for unparsable text.
+    pub fn as_f64(&self) -> Option<f64> {
+        match self {
+            Self::Num(value) => Some(*value),
+            Self::Text(text) => text.trim().parse().ok(),
+        }
+    }
+
+    /// Best-effort i64 view; `None` for unparsable text. A fractional value
+    /// truncates toward zero and an out-of-range value saturates (Rust `as`
+    /// casts never panic) — response-echo use only, never a request input.
+    pub fn as_i64(&self) -> Option<i64> {
+        match self {
+            Self::Num(value) => Some(*value as i64),
+            Self::Text(text) => {
+                let trimmed = text.trim();
+                trimmed
+                    .parse::<i64>()
+                    .ok()
+                    .or_else(|| trimmed.parse::<f64>().ok().map(|value| value as i64))
+            }
+        }
+    }
+}
+
+/// Deserializes a possibly-explicit-`null` field into `T::default()`.
+///
+/// `#[serde(default)]` alone tolerates only a MISSING key; the /alerts GET
+/// echo family emits EXPLICIT `null` for unset fields (verbatim doc example:
+/// `"triggeredTime": null`), which would otherwise brick the WHOLE GET /
+/// GET-all parse over one non-conforming leg. Response-only mirrors use this
+/// on every defaulted non-`Option` field.
+fn null_to_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Default + serde::Deserialize<'de>,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
+}
+
+/// Deserializes a quantity echo that may arrive as a bare number, a quoted
+/// decimal string (the family's documented number/string wobble class —
+/// `comparingValue` / `lastPrice`), or explicit `null`. Unparsable text
+/// degrades to 0 — response-only mirror, never a request input.
+fn tolerant_quantity<'de, D>(deserializer: D) -> Result<i64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<DhanNumeric>::deserialize(deserializer)?
+        .and_then(|value| value.as_i64())
+        .unwrap_or_default())
+}
+
+/// Response-only mirror of [`TriggerCondition`] — every field defaulted /
+/// optional, `comparing_value` tolerant (the GET response carries
+/// `"comparingValue": "250.00"` as a STRING; parsing it into the request
+/// struct's `Option<f64>` would fail).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TriggerConditionDetail {
+    /// Comparison type echo.
+    #[serde(default, deserialize_with = "null_to_default")]
+    pub comparison_type: String,
+    /// Exchange segment echo.
+    #[serde(default, deserialize_with = "null_to_default")]
+    pub exchange_segment: String,
+    /// Security ID echo.
+    #[serde(default, deserialize_with = "null_to_default")]
+    pub security_id: String,
+    /// Indicator name echo (TECHNICAL_WITH_* only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub indicator_name: Option<String>,
+    /// Timeframe echo (TECHNICAL_WITH_* only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time_frame: Option<String>,
+    /// Operator echo.
+    #[serde(default, deserialize_with = "null_to_default")]
+    pub operator: String,
+    /// Comparing value — number in the request, STRING in the GET response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comparing_value: Option<DhanNumeric>,
+    /// Second indicator echo (TECHNICAL_WITH_INDICATOR only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comparing_indicator_name: Option<String>,
+    /// Expiry date echo (YYYY-MM-DD).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exp_date: Option<String>,
+    /// Frequency: "ONCE" | yaml-only "ALWAYS" | anything — String tolerates all.
+    #[serde(default, deserialize_with = "null_to_default")]
+    pub frequency: String,
+    /// User note echo.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_note: Option<String>,
+}
+
+/// Response-only mirror of [`TriggerOrder`] — every field defaulted and the
+/// price-family fields tolerant ([`DhanNumeric`]). The GET / GET-all order
+/// echo must be parsed DEFENSIVELY: the OpenAPI yaml marks NO order
+/// sub-field required (an alert created via Dhan's web/app UI can omit the
+/// request-optional `triggerPrice`/`discQuantity`), and the family's
+/// documented number/string wobble (`comparingValue`/`lastPrice`) applies
+/// to the leg's `price` fields too. Parsing the echo with the strict
+/// request-side struct would fail the ENTIRE response — and the whole
+/// account list on GET-all — over ONE such leg.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TriggerOrderDetail {
+    /// "BUY" or "SELL" echo.
+    #[serde(default, deserialize_with = "null_to_default")]
+    pub transaction_type: String,
+    /// Exchange segment echo.
+    #[serde(default, deserialize_with = "null_to_default")]
+    pub exchange_segment: String,
+    /// Product type echo.
+    #[serde(default, deserialize_with = "null_to_default")]
+    pub product_type: String,
+    /// Order type echo.
+    #[serde(default, deserialize_with = "null_to_default")]
+    pub order_type: String,
+    /// Security ID echo.
+    #[serde(default, deserialize_with = "null_to_default")]
+    pub security_id: String,
+    /// Quantity echo — number, quoted decimal string (the family's
+    /// documented wobble class), or explicit `null` all tolerated.
+    #[serde(default, deserialize_with = "tolerant_quantity")]
+    pub quantity: i64,
+    /// Validity echo.
+    #[serde(default, deserialize_with = "null_to_default")]
+    pub validity: String,
+    /// Price — STRING in the doc example ("250.00"); tolerant to a bare
+    /// number (the family's documented wobble class).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub price: Option<DhanNumeric>,
+    /// Disclosed quantity echo (STRING "0" in the doc example).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disc_quantity: Option<DhanNumeric>,
+    /// Trigger price echo — request-optional, so the echo may omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger_price: Option<DhanNumeric>,
+}
+
+/// Multi-order WIRE leg — DISTINCT schema from [`TriggerOrder`] (07c §9.1
+/// traps): `disclosedQuantity` INT (vs `discQuantity` STRING), `price` /
+/// `triggerPrice` FLOAT (vs STRING), plus `sequence` / `correlationId` /
+/// `afterMarketOrder` / `amoTime`. NEVER merge the two structs.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MultiOrderLeg {
+    /// Sequence number "1".."15" — constructor-assigned (STRING on the wire).
+    pub sequence: String,
+    /// User-generated tracking ID (<= 30 chars, `[a-zA-Z0-9 _-]`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub correlation_id: Option<String>,
+    /// "BUY" or "SELL".
+    pub transaction_type: String,
+    /// Exchange segment — constructor-locked to "NSE_EQ"/"BSE_EQ".
+    pub exchange_segment: String,
+    /// Product type.
+    pub product_type: String,
+    /// Order type.
+    pub order_type: String,
+    /// Validity: "DAY" or "IOC".
+    pub validity: String,
+    /// Dhan security ID (STRING).
+    pub security_id: String,
+    /// Quantity.
+    pub quantity: i64,
+    /// After-market-order flag — coupled with `amo_time` by the builder.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_market_order: Option<bool>,
+    /// AMO timing (`AmoTime::as_str()`); coupled with the flag by the builder.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub amo_time: Option<String>,
+    /// Price — FLOAT here, vs STRING on conditional legs.
+    pub price: f64,
+    /// Trigger price — FLOAT here, vs STRING on conditional legs.
+    pub trigger_price: f64,
+    /// Disclosed quantity — INT `disclosedQuantity`, vs STRING `discQuantity`.
+    pub disclosed_quantity: i64,
+}
+// NOTE: yaml marks only sequence/transactionType/exchangeSegment required; our
+// builder always emits full legs, so the remaining fields are concrete (not
+// Option). Documented divergence, request-side only.
+
+/// Place Multi Order request. Endpoint: `POST /v2/alerts/multi/orders`
+/// (PORTAL-only page). Order legs: Equities ONLY, fail-closed (see
+/// `oms::conditional`).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DhanMultiOrderRequest {
+    /// Dhan client ID.
+    pub dhan_client_id: String,
+    /// Order legs (1..=15, builder-enforced).
+    pub orders: Vec<MultiOrderLeg>,
+}
+
+/// Multi-order response — YAML-ONLY schema, UNVERIFIED-LIVE. Parse
+/// tolerantly. `Default` (empty `orders`) is the documented-plausible
+/// BODYLESS-200 arm: the PORTAL page documents NO response body at all
+/// ("200 Successful operation" only), and `place_multi_order` degrades an
+/// empty/whitespace 200 body to this default instead of a `JsonError`
+/// brick — a parse error for an already-placed batch would push callers
+/// toward a double-placing retry.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DhanMultiOrderResponse {
+    /// Per-leg order results (`null` tolerated → empty — a 200 body means
+    /// the legs are ALREADY placed at the broker; a parse brick here would
+    /// hide which legs went live).
+    #[serde(default, deserialize_with = "null_to_default")]
+    pub orders: Vec<MultiOrderLegResult>,
+}
+
+/// One per-leg result in the multi-order response.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MultiOrderLegResult {
+    /// Dhan order ID for this leg — a REJECTED leg plausibly echoes
+    /// `"orderId": null` (yaml-only, UNVERIFIED-LIVE); tolerated as `""`.
+    #[serde(default, deserialize_with = "null_to_default")]
+    pub order_id: String,
+    /// Sequence number echo.
+    #[serde(default, deserialize_with = "null_to_default")]
+    pub sequence: String,
+    /// 10-value yaml enum (TRANSIT PENDING REJECTED CANCELLED PART_TRADED
+    /// TRADED EXPIRED MODIFIED TRIGGERED INACTIVE) — UNVERIFIED-LIVE; kept a
+    /// plain String so unknown values NEVER panic (annexure rule 15).
+    #[serde(default, deserialize_with = "null_to_default")]
+    pub order_status: String,
+}
+
+// ---------------------------------------------------------------------------
 // EDIS Types (07d-edis.md)
 // ---------------------------------------------------------------------------
 
@@ -1566,254 +1814,6 @@ pub struct ReconciliationReport {
 
 /// Exchange segment for NSE F&O (the only segment this system trades).
 pub const EXCHANGE_SEGMENT_NSE_FNO: &str = "NSE_FNO";
-
-// ---------------------------------------------------------------------------
-// Multi Order + Conditional Detail Types — 2026-07-14 (07c §multi + portal/yaml)
-// ---------------------------------------------------------------------------
-
-/// Tolerant Dhan numeric: bare number OR quoted decimal string on the wire
-/// (comparingValue is number-in-request / string-in-response; lastPrice is
-/// string-in-example / number-in-yaml). Round-trips verbatim; never panics.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-#[serde(untagged)]
-pub enum DhanNumeric {
-    /// Bare JSON number (e.g. `245.5`).
-    Num(f64),
-    /// Quoted decimal string (e.g. `"245.50"`), preserved verbatim.
-    Text(String),
-}
-
-impl DhanNumeric {
-    /// Best-effort f64 view; `None` for unparsable text.
-    pub fn as_f64(&self) -> Option<f64> {
-        match self {
-            Self::Num(value) => Some(*value),
-            Self::Text(text) => text.trim().parse().ok(),
-        }
-    }
-
-    /// Best-effort i64 view; `None` for unparsable text. A fractional value
-    /// truncates toward zero and an out-of-range value saturates (Rust `as`
-    /// casts never panic) — response-echo use only, never a request input.
-    pub fn as_i64(&self) -> Option<i64> {
-        match self {
-            Self::Num(value) => Some(*value as i64),
-            Self::Text(text) => {
-                let trimmed = text.trim();
-                trimmed
-                    .parse::<i64>()
-                    .ok()
-                    .or_else(|| trimmed.parse::<f64>().ok().map(|value| value as i64))
-            }
-        }
-    }
-}
-
-/// Deserializes a possibly-explicit-`null` field into `T::default()`.
-///
-/// `#[serde(default)]` alone tolerates only a MISSING key; the /alerts GET
-/// echo family emits EXPLICIT `null` for unset fields (verbatim doc example:
-/// `"triggeredTime": null`), which would otherwise brick the WHOLE GET /
-/// GET-all parse over one non-conforming leg. Response-only mirrors use this
-/// on every defaulted non-`Option` field.
-fn null_to_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
-where
-    D: serde::Deserializer<'de>,
-    T: Default + serde::Deserialize<'de>,
-{
-    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
-}
-
-/// Deserializes a quantity echo that may arrive as a bare number, a quoted
-/// decimal string (the family's documented number/string wobble class —
-/// `comparingValue` / `lastPrice`), or explicit `null`. Unparsable text
-/// degrades to 0 — response-only mirror, never a request input.
-fn tolerant_quantity<'de, D>(deserializer: D) -> Result<i64, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    Ok(Option::<DhanNumeric>::deserialize(deserializer)?
-        .and_then(|value| value.as_i64())
-        .unwrap_or_default())
-}
-
-/// Response-only mirror of [`TriggerCondition`] — every field defaulted /
-/// optional, `comparing_value` tolerant (the GET response carries
-/// `"comparingValue": "250.00"` as a STRING; parsing it into the request
-/// struct's `Option<f64>` would fail).
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TriggerConditionDetail {
-    /// Comparison type echo.
-    #[serde(default, deserialize_with = "null_to_default")]
-    pub comparison_type: String,
-    /// Exchange segment echo.
-    #[serde(default, deserialize_with = "null_to_default")]
-    pub exchange_segment: String,
-    /// Security ID echo.
-    #[serde(default, deserialize_with = "null_to_default")]
-    pub security_id: String,
-    /// Indicator name echo (TECHNICAL_WITH_* only).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub indicator_name: Option<String>,
-    /// Timeframe echo (TECHNICAL_WITH_* only).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub time_frame: Option<String>,
-    /// Operator echo.
-    #[serde(default, deserialize_with = "null_to_default")]
-    pub operator: String,
-    /// Comparing value — number in the request, STRING in the GET response.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub comparing_value: Option<DhanNumeric>,
-    /// Second indicator echo (TECHNICAL_WITH_INDICATOR only).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub comparing_indicator_name: Option<String>,
-    /// Expiry date echo (YYYY-MM-DD).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub exp_date: Option<String>,
-    /// Frequency: "ONCE" | yaml-only "ALWAYS" | anything — String tolerates all.
-    #[serde(default, deserialize_with = "null_to_default")]
-    pub frequency: String,
-    /// User note echo.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub user_note: Option<String>,
-}
-
-/// Response-only mirror of [`TriggerOrder`] — every field defaulted and the
-/// price-family fields tolerant ([`DhanNumeric`]). The GET / GET-all order
-/// echo must be parsed DEFENSIVELY: the OpenAPI yaml marks NO order
-/// sub-field required (an alert created via Dhan's web/app UI can omit the
-/// request-optional `triggerPrice`/`discQuantity`), and the family's
-/// documented number/string wobble (`comparingValue`/`lastPrice`) applies
-/// to the leg's `price` fields too. Parsing the echo with the strict
-/// request-side struct would fail the ENTIRE response — and the whole
-/// account list on GET-all — over ONE such leg.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TriggerOrderDetail {
-    /// "BUY" or "SELL" echo.
-    #[serde(default, deserialize_with = "null_to_default")]
-    pub transaction_type: String,
-    /// Exchange segment echo.
-    #[serde(default, deserialize_with = "null_to_default")]
-    pub exchange_segment: String,
-    /// Product type echo.
-    #[serde(default, deserialize_with = "null_to_default")]
-    pub product_type: String,
-    /// Order type echo.
-    #[serde(default, deserialize_with = "null_to_default")]
-    pub order_type: String,
-    /// Security ID echo.
-    #[serde(default, deserialize_with = "null_to_default")]
-    pub security_id: String,
-    /// Quantity echo — number, quoted decimal string (the family's
-    /// documented wobble class), or explicit `null` all tolerated.
-    #[serde(default, deserialize_with = "tolerant_quantity")]
-    pub quantity: i64,
-    /// Validity echo.
-    #[serde(default, deserialize_with = "null_to_default")]
-    pub validity: String,
-    /// Price — STRING in the doc example ("250.00"); tolerant to a bare
-    /// number (the family's documented wobble class).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub price: Option<DhanNumeric>,
-    /// Disclosed quantity echo (STRING "0" in the doc example).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub disc_quantity: Option<DhanNumeric>,
-    /// Trigger price echo — request-optional, so the echo may omit it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub trigger_price: Option<DhanNumeric>,
-}
-
-/// Multi-order WIRE leg — DISTINCT schema from [`TriggerOrder`] (07c §9.1
-/// traps): `disclosedQuantity` INT (vs `discQuantity` STRING), `price` /
-/// `triggerPrice` FLOAT (vs STRING), plus `sequence` / `correlationId` /
-/// `afterMarketOrder` / `amoTime`. NEVER merge the two structs.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct MultiOrderLeg {
-    /// Sequence number "1".."15" — constructor-assigned (STRING on the wire).
-    pub sequence: String,
-    /// User-generated tracking ID (<= 30 chars, `[a-zA-Z0-9 _-]`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub correlation_id: Option<String>,
-    /// "BUY" or "SELL".
-    pub transaction_type: String,
-    /// Exchange segment — constructor-locked to "NSE_EQ"/"BSE_EQ".
-    pub exchange_segment: String,
-    /// Product type.
-    pub product_type: String,
-    /// Order type.
-    pub order_type: String,
-    /// Validity: "DAY" or "IOC".
-    pub validity: String,
-    /// Dhan security ID (STRING).
-    pub security_id: String,
-    /// Quantity.
-    pub quantity: i64,
-    /// After-market-order flag — coupled with `amo_time` by the builder.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub after_market_order: Option<bool>,
-    /// AMO timing (`AmoTime::as_str()`); coupled with the flag by the builder.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub amo_time: Option<String>,
-    /// Price — FLOAT here, vs STRING on conditional legs.
-    pub price: f64,
-    /// Trigger price — FLOAT here, vs STRING on conditional legs.
-    pub trigger_price: f64,
-    /// Disclosed quantity — INT `disclosedQuantity`, vs STRING `discQuantity`.
-    pub disclosed_quantity: i64,
-}
-// NOTE: yaml marks only sequence/transactionType/exchangeSegment required; our
-// builder always emits full legs, so the remaining fields are concrete (not
-// Option). Documented divergence, request-side only.
-
-/// Place Multi Order request. Endpoint: `POST /v2/alerts/multi/orders`
-/// (PORTAL-only page). Order legs: Equities ONLY, fail-closed (see
-/// `oms::conditional`).
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct DhanMultiOrderRequest {
-    /// Dhan client ID.
-    pub dhan_client_id: String,
-    /// Order legs (1..=15, builder-enforced).
-    pub orders: Vec<MultiOrderLeg>,
-}
-
-/// Multi-order response — YAML-ONLY schema, UNVERIFIED-LIVE. Parse
-/// tolerantly. `Default` (empty `orders`) is the documented-plausible
-/// BODYLESS-200 arm: the PORTAL page documents NO response body at all
-/// ("200 Successful operation" only), and `place_multi_order` degrades an
-/// empty/whitespace 200 body to this default instead of a `JsonError`
-/// brick — a parse error for an already-placed batch would push callers
-/// toward a double-placing retry.
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct DhanMultiOrderResponse {
-    /// Per-leg order results (`null` tolerated → empty — a 200 body means
-    /// the legs are ALREADY placed at the broker; a parse brick here would
-    /// hide which legs went live).
-    #[serde(default, deserialize_with = "null_to_default")]
-    pub orders: Vec<MultiOrderLegResult>,
-}
-
-/// One per-leg result in the multi-order response.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct MultiOrderLegResult {
-    /// Dhan order ID for this leg — a REJECTED leg plausibly echoes
-    /// `"orderId": null` (yaml-only, UNVERIFIED-LIVE); tolerated as `""`.
-    #[serde(default, deserialize_with = "null_to_default")]
-    pub order_id: String,
-    /// Sequence number echo.
-    #[serde(default, deserialize_with = "null_to_default")]
-    pub sequence: String,
-    /// 10-value yaml enum (TRANSIT PENDING REJECTED CANCELLED PART_TRADED
-    /// TRADED EXPIRED MODIFIED TRIGGERED INACTIVE) — UNVERIFIED-LIVE; kept a
-    /// plain String so unknown values NEVER panic (annexure rule 15).
-    #[serde(default, deserialize_with = "null_to_default")]
-    pub order_status: String,
-}
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -3204,82 +3204,6 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Trade Book + DhanTradeEntry Tests
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_trade_entry_deserialize_with_tax_breakdown() {
-        let json = r#"{"dhanClientId":"1","orderId":"ORD-1","exchangeOrderId":"E1","exchangeTradeId":"T1","transactionType":"BUY","exchangeSegment":"NSE_EQ","productType":"INTRADAY","orderType":"MARKET","tradingSymbol":"NIFTY","customSymbol":"","securityId":"11536","tradedQuantity":50,"tradedPrice":24500.0,"isin":"INE1234","instrument":"OPTIDX","sebiTax":0.5,"stt":12.25,"brokerageCharges":20.0,"serviceTax":3.6,"exchangeTransactionCharges":2.0,"stampDuty":0.1,"drvExpiryDate":"2026-03-27","drvOptionType":"CE","drvStrikePrice":24500.0,"exchangeTime":"2026-03-27 10:30:45"}"#;
-        let entry: DhanTradeEntry = serde_json::from_str(json).unwrap();
-        assert_eq!(entry.traded_quantity, 50);
-        assert!((entry.stt - 12.25).abs() < f64::EPSILON);
-        assert!((entry.stamp_duty - 0.1).abs() < f64::EPSILON);
-        assert_eq!(entry.drv_option_type, "CE");
-    }
-
-    // -----------------------------------------------------------------------
-    // EDIS Types Tests
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_edis_form_request_serialize() {
-        let req = EdisFormRequest {
-            isin: "INE733E01010".to_string(),
-            qty: 100,
-            exchange: "NSE".to_string(),
-            segment: "EQ".to_string(),
-            bulk: false,
-        };
-        let json = serde_json::to_string(&req).unwrap();
-        assert!(json.contains("INE733E01010"));
-        assert!(json.contains("\"bulk\":false"));
-    }
-
-    #[test]
-    fn test_edis_inquiry_response_deserialize() {
-        let json = r#"{"totalQty":100,"aprvdQty":50,"status":"APPROVED"}"#;
-        let resp: EdisInquiryResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(resp.total_qty, 100);
-        assert_eq!(resp.aprvd_qty, 50);
-        assert_eq!(resp.status, "APPROVED");
-    }
-
-    // -----------------------------------------------------------------------
-    // Statement Types Tests
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_ledger_entry_string_debit_credit() {
-        // CRITICAL: debit and credit are STRINGS, not floats
-        let json = r#"{"dhanClientId":"1","narration":"test","voucherdate":"Jun 22, 2022","exchange":"NSE","voucherdesc":"desc","vouchernumber":"V1","debit":"1500.50","credit":"0.00","runbal":"50000.00"}"#;
-        let entry: DhanLedgerEntry = serde_json::from_str(json).unwrap();
-        assert_eq!(entry.debit, "1500.50"); // String, not float
-        assert_eq!(entry.credit, "0.00"); // String, not float
-        assert_eq!(entry.voucherdate, "Jun 22, 2022"); // Human-readable format
-    }
-
-    #[test]
-    fn test_historical_trade_entry_deserialize() {
-        let json = r#"{"dhanClientId":"1","orderId":"O1","exchangeOrderId":"E1","exchangeTradeId":"T1","transactionType":"BUY","exchangeSegment":"NSE_EQ","productType":"CNC","orderType":"LIMIT","tradingSymbol":"RELIANCE","customSymbol":"","securityId":"2885","tradedQuantity":10,"tradedPrice":2500.0,"isin":"INE002A01018","instrument":"EQUITY","sebiTax":0.01,"stt":2.5,"brokerageCharges":0.0,"serviceTax":0.0,"exchangeTransactionCharges":0.5,"stampDuty":0.02,"drvExpiryDate":"NA","drvOptionType":"","drvStrikePrice":0.0,"exchangeTime":"2026-03-25 14:30:00"}"#;
-        let entry: DhanHistoricalTradeEntry = serde_json::from_str(json).unwrap();
-        assert_eq!(entry.traded_quantity, 10);
-        assert_eq!(entry.drv_expiry_date, "NA"); // "NA" for non-derivatives
-        assert_eq!(entry.exchange_time, "2026-03-25 14:30:00"); // IST string
-    }
-
-    // -----------------------------------------------------------------------
-    // Cancel Order Response Tests
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_cancel_order_response_deserialize() {
-        let json = r#"{"orderId":"ORD-123","orderStatus":"CANCELLED"}"#;
-        let resp: DhanCancelOrderResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(resp.order_id, "ORD-123");
-        assert_eq!(resp.order_status, "CANCELLED");
-    }
-
-    // -----------------------------------------------------------------------
     // Multi Order + Conditional Detail Types Tests (2026-07-14)
     // -----------------------------------------------------------------------
 
@@ -3617,5 +3541,81 @@ mod tests {
         let null_orders: DhanMultiOrderResponse =
             serde_json::from_str(r#"{"orders":null}"#).unwrap();
         assert!(null_orders.orders.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Trade Book + DhanTradeEntry Tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_trade_entry_deserialize_with_tax_breakdown() {
+        let json = r#"{"dhanClientId":"1","orderId":"ORD-1","exchangeOrderId":"E1","exchangeTradeId":"T1","transactionType":"BUY","exchangeSegment":"NSE_EQ","productType":"INTRADAY","orderType":"MARKET","tradingSymbol":"NIFTY","customSymbol":"","securityId":"11536","tradedQuantity":50,"tradedPrice":24500.0,"isin":"INE1234","instrument":"OPTIDX","sebiTax":0.5,"stt":12.25,"brokerageCharges":20.0,"serviceTax":3.6,"exchangeTransactionCharges":2.0,"stampDuty":0.1,"drvExpiryDate":"2026-03-27","drvOptionType":"CE","drvStrikePrice":24500.0,"exchangeTime":"2026-03-27 10:30:45"}"#;
+        let entry: DhanTradeEntry = serde_json::from_str(json).unwrap();
+        assert_eq!(entry.traded_quantity, 50);
+        assert!((entry.stt - 12.25).abs() < f64::EPSILON);
+        assert!((entry.stamp_duty - 0.1).abs() < f64::EPSILON);
+        assert_eq!(entry.drv_option_type, "CE");
+    }
+
+    // -----------------------------------------------------------------------
+    // EDIS Types Tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_edis_form_request_serialize() {
+        let req = EdisFormRequest {
+            isin: "INE733E01010".to_string(),
+            qty: 100,
+            exchange: "NSE".to_string(),
+            segment: "EQ".to_string(),
+            bulk: false,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("INE733E01010"));
+        assert!(json.contains("\"bulk\":false"));
+    }
+
+    #[test]
+    fn test_edis_inquiry_response_deserialize() {
+        let json = r#"{"totalQty":100,"aprvdQty":50,"status":"APPROVED"}"#;
+        let resp: EdisInquiryResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.total_qty, 100);
+        assert_eq!(resp.aprvd_qty, 50);
+        assert_eq!(resp.status, "APPROVED");
+    }
+
+    // -----------------------------------------------------------------------
+    // Statement Types Tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_ledger_entry_string_debit_credit() {
+        // CRITICAL: debit and credit are STRINGS, not floats
+        let json = r#"{"dhanClientId":"1","narration":"test","voucherdate":"Jun 22, 2022","exchange":"NSE","voucherdesc":"desc","vouchernumber":"V1","debit":"1500.50","credit":"0.00","runbal":"50000.00"}"#;
+        let entry: DhanLedgerEntry = serde_json::from_str(json).unwrap();
+        assert_eq!(entry.debit, "1500.50"); // String, not float
+        assert_eq!(entry.credit, "0.00"); // String, not float
+        assert_eq!(entry.voucherdate, "Jun 22, 2022"); // Human-readable format
+    }
+
+    #[test]
+    fn test_historical_trade_entry_deserialize() {
+        let json = r#"{"dhanClientId":"1","orderId":"O1","exchangeOrderId":"E1","exchangeTradeId":"T1","transactionType":"BUY","exchangeSegment":"NSE_EQ","productType":"CNC","orderType":"LIMIT","tradingSymbol":"RELIANCE","customSymbol":"","securityId":"2885","tradedQuantity":10,"tradedPrice":2500.0,"isin":"INE002A01018","instrument":"EQUITY","sebiTax":0.01,"stt":2.5,"brokerageCharges":0.0,"serviceTax":0.0,"exchangeTransactionCharges":0.5,"stampDuty":0.02,"drvExpiryDate":"NA","drvOptionType":"","drvStrikePrice":0.0,"exchangeTime":"2026-03-25 14:30:00"}"#;
+        let entry: DhanHistoricalTradeEntry = serde_json::from_str(json).unwrap();
+        assert_eq!(entry.traded_quantity, 10);
+        assert_eq!(entry.drv_expiry_date, "NA"); // "NA" for non-derivatives
+        assert_eq!(entry.exchange_time, "2026-03-25 14:30:00"); // IST string
+    }
+
+    // -----------------------------------------------------------------------
+    // Cancel Order Response Tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_cancel_order_response_deserialize() {
+        let json = r#"{"orderId":"ORD-123","orderStatus":"CANCELLED"}"#;
+        let resp: DhanCancelOrderResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.order_id, "ORD-123");
+        assert_eq!(resp.order_status, "CANCELLED");
     }
 }
