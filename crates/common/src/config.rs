@@ -275,6 +275,19 @@ pub struct ApplicationConfig {
     pub cadence: CadenceConfig,
 }
 
+/// `[order_runtime]` — dry-run order-runtime configuration (2026-07-14).
+///
+/// Fail-safe shape: every field `#[serde(default)]`-driven; an absent
+/// section (or a TOML written before this PR) keeps the current dormant
+/// boot byte-identical.
+#[derive(Debug, Clone, Deserialize)]
+pub struct OrderRuntimeConfig {
+    /// Master switch. Default OFF (fail-safe) — `config/base.toml` turns it
+    /// on explicitly so the machinery RUNS in prod.
+    #[serde(default)]
+    pub cadence: CadenceConfig,
+}
+
 /// `[feeds]` — pluggable market-data feed selection (operator lock
 /// 2026-06-19, Groww second feed). Each feed provider is independently
 /// enable/disable-able so the operator can run Dhan-only (default),
@@ -5750,6 +5763,147 @@ mod tests {
             .extract()
             .expect("explicit enabled = true must round-trip");
         assert!(on.tf_consistency.enabled);
+    }
+
+    /// Cadence scheduler (operator 2026-07-14): the `[cadence]` section is
+    /// fail-safe DEFAULT-OFF (the design's ratchet
+    /// `!CadenceConfig::default().enabled`) — via `Default`, via a missing
+    /// section, and via an empty section — and every field of the empty
+    /// section deserializes to the judge-locked cadence table.
+    #[test]
+    fn test_cadence_config_default_off() {
+        use figment::Figment;
+        use figment::providers::{Format, Toml};
+
+        let d = CadenceConfig::default();
+        assert!(
+            !d.enabled,
+            "cadence must default OFF (fail-safe; the operator flips it)"
+        );
+        // The locked cadence table (2026-07-16 post-close shape).
+        assert_eq!(d.dhan_burst_offset_ms, 1_000);
+        assert_eq!(d.spot_window_cap, 4);
+        assert_eq!(d.concurrency_degrade_after_dirty_cycles, 2);
+        assert_eq!(d.concurrency_recover_after_clean_cycles, 3);
+        assert_eq!(d.spot_min_post_close_ms, 300);
+        assert_eq!(d.in_cycle_retry_max, 1);
+        assert_eq!(d.dhan_lane_cutoff_ms, 15_000);
+        assert_eq!(d.groww_anchor_offset_ms, 0);
+        assert_eq!(d.groww_burst_timeout_ms, 800);
+        assert_eq!(d.groww_request_timeout_ms, 1_500);
+        assert_eq!(d.groww_lane_cutoff_ms, 6_000);
+        assert_eq!(d.chain_min_spacing_ms, 3_000);
+        // The 2026-07-15 pre-market expiry-resolution knobs.
+        assert_eq!(d.expiry_retry_interval_ms, 60_000);
+        assert_eq!(d.expiry_deadline_secs_of_day_ist, 32_100); // 08:55 IST
+        assert!(d.validate().is_ok(), "the shipped defaults must validate");
+
+        #[derive(Deserialize)]
+        struct Wrapper {
+            #[serde(default)]
+            cadence: CadenceConfig,
+        }
+        // Missing section entirely → disabled, never an error.
+        let missing: Wrapper = Figment::new()
+            .merge(Toml::string("[other]\nx = 1\n"))
+            .extract()
+            .expect("missing [cadence] must default, not error");
+        assert!(!missing.cadence.enabled);
+        // Empty section (no keys) → disabled + the full locked table via
+        // the field-level serde defaults (must equal `Default`).
+        let empty: Wrapper = Figment::new()
+            .merge(Toml::string("[cadence]\n"))
+            .extract()
+            .expect("empty [cadence] must default, not error");
+        assert!(!empty.cadence.enabled);
+        assert_eq!(empty.cadence.dhan_burst_offset_ms, d.dhan_burst_offset_ms);
+        assert_eq!(empty.cadence.spot_window_cap, d.spot_window_cap);
+        assert_eq!(
+            empty.cadence.concurrency_degrade_after_dirty_cycles,
+            d.concurrency_degrade_after_dirty_cycles
+        );
+        assert_eq!(empty.cadence.groww_lane_cutoff_ms, d.groww_lane_cutoff_ms);
+        // Explicit ON round-trips.
+        let on: Wrapper = Figment::new()
+            .merge(Toml::string("[cadence]\nenabled = true\n"))
+            .extract()
+            .expect("explicit enabled = true must round-trip");
+        assert!(on.cadence.enabled);
+    }
+
+    /// Cadence validate(): the spot ROLLING-1000ms-WINDOW cap is bounded
+    /// 1..=5 (the Dhan Data-API hard cap is 5/sec) and the shared
+    /// concurrency-ladder streak thresholds must be >= 1 — the structural
+    /// zero-429 spot floor (operator spot-concurrency ladder 2026-07-15).
+    #[test]
+    fn test_cadence_config_validate_rejects_bad_spot_window_cap() {
+        let mut cfg = CadenceConfig {
+            spot_window_cap: 0,
+            ..CadenceConfig::default()
+        };
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("spot_window_cap"),
+            "unexpected error: {err}"
+        );
+        cfg.spot_window_cap = 6;
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("spot_window_cap"),
+            "unexpected error: {err}"
+        );
+        // The whole legal range 1..=5 validates (a cap below 4 floors the
+        // concurrency ladder's step in `cadence::ladder` — never rejected
+        // here).
+        for cap in 1..=5u32 {
+            cfg.spot_window_cap = cap;
+            assert!(cfg.validate().is_ok(), "cap {cap} must be legal");
+        }
+        // The streak thresholds are Assumed operator knobs — but 0 would
+        // degrade/recover EVERY cycle (never "continuous"); refused.
+        cfg.spot_window_cap = 4;
+        cfg.concurrency_degrade_after_dirty_cycles = 0;
+        assert!(cfg.validate().is_err());
+        cfg.concurrency_degrade_after_dirty_cycles = 2;
+        cfg.concurrency_recover_after_clean_cycles = 0;
+        assert!(cfg.validate().is_err());
+    }
+
+    /// Cadence validate(): the Groww three-choice fallback-shape ladder's
+    /// structural bounds — the worst shape's verdict must fit inside the
+    /// lane cutoff, and the worst-case cycle tail (verdict + 7 sequential
+    /// fallback legs) must end strictly before the NEXT minute's burst
+    /// (the no-overlap-into-next-burst bound, coordinator 2026-07-15).
+    #[test]
+    fn test_cadence_config_validate_groww_shape_no_overlap_bounds() {
+        // The shipped defaults: worst verdict 0+3000+800 = 3800 < 6000
+        // cutoff; worst tail 3800 + 7*1500 = 14300 < 60000.
+        let d = CadenceConfig::default();
+        assert!(d.validate().is_ok());
+        // A cutoff at/below the choice-3 verdict is degenerate.
+        let mut cfg = CadenceConfig {
+            groww_lane_cutoff_ms: 3_800,
+            ..CadenceConfig::default()
+        };
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("worst fallback shape"),
+            "unexpected error: {err}"
+        );
+        // A negative burst anchor (pre-close) is refused.
+        cfg.groww_lane_cutoff_ms = 6_000;
+        cfg.groww_anchor_offset_ms = -1;
+        assert!(cfg.validate().is_err());
+        // A request timeout that lets the sequential fallback spill into
+        // the next minute's burst is refused (7 legs * 8100ms > 56.2s
+        // after the choice-3 verdict).
+        cfg.groww_anchor_offset_ms = 0;
+        cfg.groww_request_timeout_ms = 8_100;
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("next minute's burst"),
+            "unexpected error: {err}"
+        );
     }
 
     /// Cadence scheduler (operator 2026-07-14): the `[cadence]` section is

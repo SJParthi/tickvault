@@ -1148,27 +1148,50 @@ pub enum ErrorCode {
     /// in-flight mutation stays ambiguous with the ladder clock paused.
     /// Severity::High, auto-triage-safe.
     GrowwOrd10AuthStale,
-    /// GROWW-PUSH-01 (order-push Stage A, 2026-07-16) — the order/position
-    /// push channel's NATS-over-WS connect / reconnect failed at the
-    /// transport level (auth-class CONNECT rejects are GROWW-PUSH-02).
-    /// Bounded backoff reconnect self-heals. Severity::High,
-    /// auto-triage-safe.
-    GrowwPush01ConnectFailed,
-    /// GROWW-PUSH-02 (order-push Stage A, 2026-07-16) — the per-session
-    /// socket-token mint or the NATS CONNECT was auth-rejected: the access
-    /// token is RE-READ from SSM at floor pacing, NEVER minted
-    /// (token-minter lock 2026-07-02). Severity::High, auto-triage-safe.
-    GrowwPush02AuthFailed,
-    /// GROWW-PUSH-03 (order-push Stage A, 2026-07-16) — a push frame /
-    /// protobuf payload failed decode or arrived on an unknown subject:
-    /// counted + skipped, never a panic (annexure rule 15 discipline).
-    /// Severity::Medium, auto-triage-safe.
-    GrowwPush03DecodeFailed,
-    /// GROWW-PUSH-04 (order-push Stage A, 2026-07-16) — the supervised
-    /// push-channel task died and was respawned (the WS-GAP-05 /
-    /// FEED-SUPERVISOR-01 house pattern). Severity::High,
-    /// auto-triage-safe.
-    GrowwPush04SupervisorRespawned,
+
+    // -----------------------------------------------------------------------
+    // Cadence scheduler (operator cadence directive 2026-07-14, judge-locked
+    // design rev-8 — `crates/core/src/cadence/`; reshaped POST-CLOSE by the
+    // 2026-07-16 operator directive, cadence-error-codes.md §0b: the rev-8
+    // ":55 pre-close serialized" Dhan schedule is RETIRED). Dry-run
+    // decision-timing skeleton: per-minute post-close fetch cadence on BOTH
+    // lanes (Dhan all-7 burst primary / split fallback; Groww all-7 at T+0)
+    // with structural zero-429 gates, shape ladder, event-driven per-lane
+    // decisions. DEFAULT-OFF. See cadence-error-codes.md.
+    // -----------------------------------------------------------------------
+    /// CADENCE-01: a cadence lane DEGRADED this cycle — a non-Empty fetch
+    /// failure ended terminal after the retry budget
+    /// (`stage="fetch_failed"`), a 429 arrived despite the gates
+    /// (`stage="rate_limited"` — also a gate-bug signal), a spot returned
+    /// 200-empty (`stage="spot_empty"`, either lane), a chain returned
+    /// 200-empty (`stage="chain_empty"`, either lane), the Groww burst
+    /// fell back (`stage="groww_fallback"`), a lane borrowed the other
+    /// broker's data after its own path exhausted (`stage="cross_fill"`),
+    /// a spot resolved from the chain-embedded price
+    /// (`stage="chain_embedded_spot"`), moneyness classified Unknown
+    /// (`stage="moneyness_unknown"`), or the failure ladder exhausted its
+    /// floor (`stage="ladder_exhausted"`, edge-latched per episode). ONE
+    /// coalesced emission per (lane, cycle), never per-request.
+    /// Severity::High, auto-triage-safe (the next cycle re-attempts; the
+    /// ladder + cross-fill are the self-corrections).
+    Cadence01LaneDegraded,
+    /// CADENCE-02: a cadence lane's decision was HONEST-SKIPPED — the lane
+    /// was incomplete at its cutoff (`stage="cutoff"`), both brokers were
+    /// dead (`stage="both_sources_dead"`), or every underlying classified
+    /// Unknown (`stage="all_unknown"`). Exactly one per (lane, cycle);
+    /// never a late decision, never a decision on missing/stale data.
+    /// Severity::High, auto-triage-safe (the skip IS the fail-closed
+    /// action; the operator inspects the stage at leisure).
+    Cadence02DecisionSkipped,
+    /// CADENCE-03: the cadence scheduler itself DEGRADED — the failure
+    /// ladder shifted a rung (`stage="ladder_shift"`), a wake landed late
+    /// past a slot (`stage="late_wake"`), one or more minute boundaries
+    /// were skipped (`stage="boundary_skipped"`), a clock skew was clamped
+    /// (`stage="skew_clamped"`), the supervised runner respawned
+    /// (`stage="respawn"`), or a gate deferred a NOMINAL slot
+    /// (`stage="gate_deferred_nominal"` — a should-never scheduling-math
+    /// signal). Severity::Medium, auto-triage-safe.
+    Cadence03SchedulerDegraded,
 }
 
 impl ErrorCode {
@@ -1383,11 +1406,10 @@ impl ErrorCode {
             Self::GrowwOrd08AuditWriteFailed => "GROWW-ORD-08",
             Self::GrowwOrd09QuantityRefused => "GROWW-ORD-09",
             Self::GrowwOrd10AuthStale => "GROWW-ORD-10",
-            // Groww order/position push channel (Stage A, 2026-07-16)
-            Self::GrowwPush01ConnectFailed => "GROWW-PUSH-01",
-            Self::GrowwPush02AuthFailed => "GROWW-PUSH-02",
-            Self::GrowwPush03DecodeFailed => "GROWW-PUSH-03",
-            Self::GrowwPush04SupervisorRespawned => "GROWW-PUSH-04",
+            // Cadence scheduler (operator directive 2026-07-14)
+            Self::Cadence01LaneDegraded => "CADENCE-01",
+            Self::Cadence02DecisionSkipped => "CADENCE-02",
+            Self::Cadence03SchedulerDegraded => "CADENCE-03",
         }
     }
 
@@ -1971,13 +1993,11 @@ impl ErrorCode {
             | Self::GrowwOrd10AuthStale => {
                 ".claude/rules/project/groww-orders-error-codes.md"
             }
-            // Groww order/position push channel (Stage A, 2026-07-16) — one
-            // runbook for the whole GROWW-PUSH-* family.
-            Self::GrowwPush01ConnectFailed
-            | Self::GrowwPush02AuthFailed
-            | Self::GrowwPush03DecodeFailed
-            | Self::GrowwPush04SupervisorRespawned => {
-                ".claude/rules/project/groww-order-push-error-codes.md"
+            // Cadence scheduler (operator directive 2026-07-14)
+            Self::Cadence01LaneDegraded
+            | Self::Cadence02DecisionSkipped
+            | Self::Cadence03SchedulerDegraded => {
+                ".claude/rules/project/cadence-error-codes.md"
             }
         }
     }
@@ -2259,11 +2279,10 @@ impl ErrorCode {
             Self::GrowwOrd08AuditWriteFailed,
             Self::GrowwOrd09QuantityRefused,
             Self::GrowwOrd10AuthStale,
-            // Groww order/position push channel (Stage A, 2026-07-16)
-            Self::GrowwPush01ConnectFailed,
-            Self::GrowwPush02AuthFailed,
-            Self::GrowwPush03DecodeFailed,
-            Self::GrowwPush04SupervisorRespawned,
+            // Cadence scheduler (operator directive 2026-07-14)
+            Self::Cadence01LaneDegraded,
+            Self::Cadence02DecisionSkipped,
+            Self::Cadence03SchedulerDegraded,
         ]
     }
 }
@@ -3175,8 +3194,8 @@ mod tests {
                 // auto-accept via any other GROWW-* arm (GROWW-MASTER-/SCALE-/
                 // NATIVE- are enumerated separately) — this arm is required.
                 || s.starts_with("GROWW-ORD-")
-                // Groww order/position push channel (Stage A, 2026-07-16).
-                || s.starts_with("GROWW-PUSH-");
+                // Operator 2026-07-14: broker-agnostic fetch-cadence scheduler
+                || s.starts_with("CADENCE-");
             assert!(has_known_prefix, "unexpected code prefix: {s}");
         }
     }
