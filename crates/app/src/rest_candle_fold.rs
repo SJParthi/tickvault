@@ -2812,7 +2812,7 @@ mod tests {
     }
 
     #[test]
-    fn test_same_batch_day_roll_routes_displaced_repair_to_past_day_queue() {
+    fn test_same_batch_day_roll_take_displaced_repair_routes_to_past_day_queue() {
         // 2026-07-16 fix round: a batch carrying [old-day repair (deferred),
         // new-day first bar (rolls the map)] must NOT silently drop the
         // repair — the displaced OLD-day repair routes to the past-day

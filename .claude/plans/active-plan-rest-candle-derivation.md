@@ -403,7 +403,7 @@ O/H/L/C/ΣV given 1m bars):
     .claude/plans/active-plan-rest-candle-derivation.md
   - Tests: test_rest_candle_fold_config_default_off,
     test_rest_candle_fold_config_validate_bounds,
-    test_same_batch_day_roll_routes_displaced_repair_to_past_day_queue
+    test_same_batch_day_roll_take_displaced_repair_routes_to_past_day_queue
 
 ## Scenarios
 
