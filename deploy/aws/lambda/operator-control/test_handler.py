@@ -127,6 +127,27 @@ class ParseView(unittest.TestCase):
         self.assertEqual(out["recent_errors"], [])
 
 
+class HonestHeroHtml(unittest.TestCase):
+    """Review fix M4 (2026-07-16): _sum_counts promises the hero "shows
+    nothing rather than a fabricated 0", but the JS did
+    countUp(..., j.rows_today_total||'0') — a stopped/unreachable box
+    rendered an animated 0. The hero + Data-tab bars must degrade to '—'."""
+
+    def test_hero_never_renders_fabricated_zero(self) -> None:
+        html = handler._console_html()
+        self.assertNotIn("j.rows_today_total||'0'", html)
+        self.assertIn("$('ticksbig').textContent='—'", html)
+        # countUp still runs on a REAL total (the count-up animation stays).
+        self.assertIn("countUp($('ticksbig'), j.rows_today_total)", html)
+
+    def test_bars_render_dash_for_unreadable_counts(self) -> None:
+        html = handler._console_html()
+        # An empty per-table count maps to null (never parseInt→0)…
+        self.assertIn(".trim()===''?null:", html)
+        # …and bar() renders '—' for a null count instead of a 0 bar.
+        self.assertIn("(miss?'—':n.toLocaleString())", html)
+
+
 class GetServesPublicHtml(unittest.TestCase):
     def test_get_returns_html_without_token(self) -> None:
         ev = {"requestContext": {"http": {"method": "GET"}}}
@@ -525,7 +546,9 @@ class WipeGate(unittest.TestCase):
         # PR-5 H-1 (2026-07-02 security MEDIUM): a scripted call with a stolen
         # bearer + force=true must be 409'd unless it carries the SAME typed
         # word the portal makes the operator type — verified SERVER-side for
-        # ALL THREE legacy destructive actions (wipe-groww already had this).
+        # all three destructive actions (wipe-questdb / docker-reset /
+        # docker-nuke-bare; the wipe-groww action that pioneered this gate
+        # was removed 2026-07-16 with the Groww live feed).
         for resp in (
             self._wipe(force=True, confirm=""),
             self._wipe(force=True, confirm="wipe"),
@@ -601,10 +624,31 @@ class WipeGate(unittest.TestCase):
             wipe_block,
         )
         self.assertIn("t in live_rest", wipe_block)
-        # Honest completion now ALSO requires spot_1m_rest == 0.
-        self.assertIn("FROM%20spot_1m_rest", wipe_block)
+        # Review fix M2 (2026-07-16): honest completion verifies EVERY
+        # truncate-target family — the legacy pair AND all FOUR live REST
+        # tables (a TRUNCATE-FAILED on option_chain_1m /
+        # option_contract_1m_rest / rest_fetch_audit previously still
+        # printed WIPE-COMPLETE — false-OK, audit Rule 11).
+        for t in (
+            "ticks",
+            "candles_1m",
+            "spot_1m_rest",
+            "option_chain_1m",
+            "option_contract_1m_rest",
+            "rest_fetch_audit",
+        ):
+            self.assertIn(f"$(qc {t})", wipe_block, t)
         self.assertIn("spot_1m_rest=${S:-?}", wipe_block)
-        self.assertIn("${S:-1}", wipe_block)
+        # Review fix M2: a missing/erroring count defaults to 0 (absent
+        # table = nothing left = wiped). The old default-to-1 made EVERY
+        # post-nuke wipe read WIPE-PARTIAL forever, because nothing
+        # recreates ticks/candles_1m on the REST-only runtime (their
+        # ensure-DDL has zero callers). The per-table TRUNCATE-FAILED lines
+        # remain the loud failure path for a live-table truncate error.
+        for default in ("${T:-0}", "${C:-0}", "${S:-0}", "${O:-0}", "${K:-0}", "${A:-0}"):
+            self.assertIn(default, wipe_block, default)
+            self.assertNotIn(default.replace(":-0", ":-1"), wipe_block, default)
+        self.assertIn("TRUNCATE-FAILED", wipe_block)
 
     def test_docker_reset_and_bare_nuke_remove_feed_capture_sources(self) -> None:
         # The full nuke + bare nuke must ALSO sweep the feed capture/replay
@@ -926,6 +970,49 @@ class FeedsView(unittest.TestCase):
         self.assertEqual(out["rest_audit"], {})
 
 
+class FeedsViewCommandsPinned(unittest.TestCase):
+    """Review fixes M1 + M5 (2026-07-16): the feeds-card snapshot commands
+    were unpinned (a revert to the retired ticks/subscribed counters would
+    have passed the suite) and the SSM budget sat BELOW the worst-case curl
+    total, so a slow-but-RUNNING box read as the FALSE "box unreachable".
+    The SQL literals below appear RAW in the commands — `curl -G
+    --data-urlencode` does the URL-encoding at request time."""
+
+    def test_feeds_timeout_budget_exceeds_curl_max_time_sum(self) -> None:
+        # M1: parse every --max-time out of the command strings (drift-proof
+        # — adding a curl without raising the budget fails this test).
+        import re
+
+        total = sum(
+            int(m)
+            for c in handler._FEEDS_VIEW_COMMANDS
+            for m in re.findall(r"--max-time\s+(\d+)", c)
+        )
+        self.assertEqual(total, 24)  # 2×8s app curls + 2×4s audit curls
+        self.assertGreater(handler._FEEDS_TIMEOUT_SECS, total)
+        self.assertEqual(handler._FEEDS_TIMEOUT_SECS, 28.0)
+
+    def test_rest_audit_curl_targets_todays_fetch_log(self) -> None:
+        cmd = next(c for c in handler._FEEDS_VIEW_COMMANDS if "REST_AUDIT=" in c)
+        self.assertIn("from rest_fetch_audit", cmd)
+        self.assertIn("ts in today()", cmd)
+        self.assertIn("group by feed, outcome", cmd)
+        self.assertIn("--data-urlencode", cmd)
+
+    def test_rest_lat_hour_curl_ist_timebase_ok_filter_and_sentinel(self) -> None:
+        cmd = next(c for c in handler._FEEDS_VIEW_COMMANDS if "REST_LAT_HOUR=" in c)
+        # IST timebase: ts is IST-shifted while QuestDB now() is UTC — the
+        # window compares against dateadd('m', 330, now()) (2026-07-07 lesson).
+        self.assertIn("dateadd('m', 330, now())", cmd)
+        self.assertIn("dateadd('h', -1,", cmd)
+        # Successful pulls only + the -1 not-measured sentinel excluded.
+        self.assertIn("outcome = 'ok'", cmd)
+        self.assertIn("close_to_data_ms >= 0", cmd)
+        self.assertIn("from rest_fetch_audit", cmd)
+        self.assertIn("approx_percentile(close_to_data_ms, 0.5, 3)", cmd)
+        self.assertIn("approx_percentile(close_to_data_ms, 0.99, 3)", cmd)
+
+
 class FeedToggleValidation(unittest.TestCase):
     def test_valid_feed_and_bool_accepted(self) -> None:
         self.assertEqual(handler._validate_feed_toggle("dhan", True), "")
@@ -1096,9 +1183,27 @@ class FeedsCardHtml(unittest.TestCase):
         self.assertNotIn("row('groww'", html)
 
     def test_disable_asks_for_confirmation(self) -> None:
+        # Review fix M3 (2026-07-16): the confirm dialog speaks REST-lane
+        # truth — there is no live feed and no ticks; turning a broker off
+        # stops its official-candle pulls.
         html = handler._console_html()
-        self.assertIn("Turn OFF the ", html)
         self.assertIn("confirm(", html)
+        self.assertIn(
+            "official-candle pulls (spot + option chain) stop until you turn it back on",
+            html,
+        )
+        self.assertNotIn("live feed? Ticks", html)
+
+    def test_failed_bucket_excludes_never_attempted_minutes(self) -> None:
+        # Review fix L4 (2026-07-16): skipped / boundary_skipped audit rows
+        # are minutes the leg never ATTEMPTED (trading-day gate, missed
+        # boundaries) — lumping them into "failed" inflated the failure
+        # count. no_token IS a real failure and stays counted.
+        html = handler._console_html()
+        self.assertIn("k!=='skipped'", html)
+        self.assertIn("k!=='boundary_skipped'", html)
+        # no_token must NOT be excluded from the failed fold.
+        self.assertNotIn("k!=='no_token'", html)
 
     def test_errors_render_verbatim_through_esc(self) -> None:
         html = handler._console_html()
@@ -1206,7 +1311,7 @@ class DataDestructiveMarketHoursLock(unittest.TestCase):
         # the box on 2026-07-02 — must be 409'd for every destructive action.
         confirms = {
             "wipe-questdb": "WIPE",
-            "docker-reset": "NUKE",
+            "docker-reset": "NUKE-DOCKER",
             "docker-nuke-bare": "ERASE",
         }
         self.assertEqual(set(confirms), handler._DATA_DESTRUCTIVE)
@@ -1312,6 +1417,27 @@ class LegacyLiveFeedPanelsRemoved(unittest.TestCase):
         self.assertNotIn("percentile_winners", src_text)
         self.assertNotIn("tv_tick_processing_duration_ns", src_text)
         self.assertNotIn("tv_wire_to_done_duration_ns", src_text)
+
+    def test_retired_ws_probe_hosts_absent_from_code(self) -> None:
+        # Review fix L1 (2026-07-16): the retired WS probe hosts legitimately
+        # appear in dated retirement COMMENTS, so scan the source with
+        # #-comments stripped (tokenize — never a naive '#' split, which
+        # would also eat CSS colours inside string literals) and assert the
+        # hosts appear NOWHERE in code (strings, URLs, commands).
+        import io
+        import tokenize
+
+        src_text = Path(handler.__file__).read_text(encoding="utf-8")
+        code_only = " ".join(
+            tok.string
+            for tok in tokenize.generate_tokens(io.StringIO(src_text).readline)
+            if tok.type != tokenize.COMMENT
+        )
+        for host in ("api-feed.dhan.co", "socket-api.groww.in"):
+            self.assertNotIn(host, code_only, host)
+            # Sanity: the scan is non-vacuous — the host IS still present in
+            # the raw source (inside the dated retirement comments).
+            self.assertIn(host, src_text, host)
 
     def test_html_panels_gone(self) -> None:
         html = handler._console_html()
