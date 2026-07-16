@@ -135,12 +135,6 @@ fn ser_opt_paise_decimal<S: Serializer>(v: &Option<i64>, s: S) -> Result<S::Ok, 
     }
 }
 
-/// Serialize an optional paise field as a decimal string, SKIPPED when
-/// absent (modify bodies send only what changes).
-fn ser_opt_paise_decimal_skip<S: Serializer>(v: &Option<i64>, s: S) -> Result<S::Ok, S::Error> {
-    ser_opt_paise_decimal(v, s)
-}
-
 // ---------------------------------------------------------------------------
 // Wire enums (CLOSED on the request side)
 // ---------------------------------------------------------------------------
@@ -483,9 +477,11 @@ pub struct GttModifyBody {
     /// New quantity, when changing.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub quantity: Option<i64>,
-    /// New trigger price, when changing.
+    /// New trigger price, when changing (skipped when absent; `Some` always
+    /// serializes as a decimal wire string, `None` is skipped before the
+    /// serializer is reached).
     #[serde(
-        serialize_with = "ser_opt_paise_decimal_skip",
+        serialize_with = "ser_opt_paise_decimal",
         skip_serializing_if = "Option::is_none"
     )]
     pub trigger_price: Option<i64>,
@@ -1653,6 +1649,11 @@ pub fn classify_smart_observation(
     }
     if let Some(q) = observed_quantity
         && q != tracked.quantity
+        // A legal forward Transition that ALSO changed qty is NOT a
+        // divergence — `apply_observation` adopts the broker qty (round 3,
+        // finding 2); only a NON-adopting outcome (SameStatusRefresh / Park)
+        // is a real drift.
+        && outcome != SmartTransitionOutcome::Transition
         // Per-(order, qty) latch (finding 11): the SAME unadopted drift is
         // found once, not re-fired every poll pass; a NEW drifted value
         // re-fires.
@@ -2830,6 +2831,27 @@ mod tests {
             !f.iter()
                 .any(|x| x.kind == SmartFindingKind::QtyExceedsPosition)
         );
+    }
+
+    // -- round 3, finding 2: a Transition adopts broker qty, never QtyDrift ----
+
+    #[test]
+    fn test_forward_transition_with_qty_change_is_not_quantity_drift() {
+        // tracked() is ACTIVE @ qty 75. Observing TRIGGERED @ qty 60 is a legal
+        // forward move (Transition) that ALSO changed qty — `apply_observation`
+        // ADOPTS the broker qty, so this must NOT raise a QuantityDrift finding.
+        let t = tracked("oco_fwd", SmartOrderType::Oco);
+        let (out, f) = classify_smart_observation(&t, &SmartOrderStatus::Triggered, Some(60), None);
+        assert_eq!(out, SmartTransitionOutcome::Transition);
+        assert!(
+            !f.iter().any(|x| x.kind == SmartFindingKind::QuantityDrift),
+            "a forward Transition that changes qty adopts the broker value, not a drift"
+        );
+        // Contrast: a SameStatusRefresh at a drifted qty DOES raise the finding
+        // (the non-adopting path is the real divergence).
+        let (out2, f2) = classify_smart_observation(&t, &SmartOrderStatus::Active, Some(60), None);
+        assert_eq!(out2, SmartTransitionOutcome::SameStatusRefresh);
+        assert!(f2.iter().any(|x| x.kind == SmartFindingKind::QuantityDrift));
     }
 
     // -- adversarial round 1, finding 4: i64::MIN never aborts --------------

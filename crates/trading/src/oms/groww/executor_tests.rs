@@ -1263,7 +1263,11 @@ async fn smart_live_place_implausible_ack_id_is_unresolved_never_adopted() {
         .unwrap();
     assert_eq!(out, PlaceResult::Unresolved);
     let book = exec.smart_book();
-    assert_eq!(book.lock().await.open_count(), 0, "implausible id never adopted");
+    assert_eq!(
+        book.lock().await.open_count(),
+        0,
+        "implausible id never adopted"
+    );
 }
 
 #[tokio::test]
@@ -1280,8 +1284,11 @@ async fn smart_modify_already_terminal_carries_the_raw_status() {
         .unwrap();
     {
         let book = exec.smart_book();
-        book.lock().await.get_mut("oco_term1").expect("tracked").status =
-            SmartOrderStatus::Failed;
+        book.lock()
+            .await
+            .get_mut("oco_term1")
+            .expect("tracked")
+            .status = SmartOrderStatus::Failed;
     }
     let err = exec
         .modify_smart_order(
@@ -1319,8 +1326,11 @@ async fn smart_live_cancel_backward_echo_is_parked_not_adopted() {
         .unwrap();
     {
         let book = exec.smart_book();
-        book.lock().await.get_mut("oco_back1").expect("tracked").status =
-            SmartOrderStatus::Triggered;
+        book.lock()
+            .await
+            .get_mut("oco_back1")
+            .expect("tracked")
+            .status = SmartOrderStatus::Triggered;
     }
     let out = exec
         .cancel_smart_order("oco_back1", DATE, NOW_MS, true)
@@ -1362,7 +1372,10 @@ async fn smart_budget_denial_terminalizes_the_intent() {
     exec.set_smart_gates(smart_gates_on());
     let mut denied = false;
     for _ in 0..12 {
-        match exec.place_smart_order(oco_create(), DATE, NOW_MS, true).await {
+        match exec
+            .place_smart_order(oco_create(), DATE, NOW_MS, true)
+            .await
+        {
             Err(ExecError::RateBudgetExceeded(_)) => {
                 denied = true;
                 break;
@@ -1371,7 +1384,10 @@ async fn smart_budget_denial_terminalizes_the_intent() {
             Err(other) => panic!("unexpected error: {other:?}"),
         }
     }
-    assert!(denied, "the 5/sec mutation self-cap must deny within 12 rapid places");
+    assert!(
+        denied,
+        "the 5/sec mutation self-cap must deny within 12 rapid places"
+    );
     drop(exec);
     // Replay the ledger file: every SmartPlace intent must be TERMINAL —
     // the denied one as resolved_not_landed, the sent ones as acked.
@@ -1395,7 +1411,10 @@ async fn smart_budget_denial_terminalizes_the_intent() {
             not_landed += 1;
         }
     }
-    assert_eq!(not_landed, 1, "exactly the denied place is resolved_not_landed");
+    assert_eq!(
+        not_landed, 1,
+        "exactly the denied place is resolved_not_landed"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1446,5 +1465,46 @@ async fn smart_reconcile_foreign_id_echo_never_terminalizes_tracked_order() {
         t.status,
         SmartOrderStatus::Triggered,
         "foreign COMPLETED echo must NOT terminalize the live OCO"
+    );
+}
+
+// -- round 3, finding 1: cancel-success foreign-id echo is never adopted ------
+
+#[tokio::test]
+async fn smart_cancel_foreign_id_echo_never_adopted() {
+    // Symmetric to the reconcile-GET guard: a cancel-success response carrying
+    // a DIFFERENT smart_order_id than the one cancelled must skip FSM adoption
+    // (a foreign COMPLETED/CANCELLED echo could otherwise terminalize the wrong
+    // tracked order). The mutation still Accepts (our cancel was acked); the
+    // echo is degrade-logged (OCO-05), never applied.
+    let st = SmartScriptState {
+        create: VecDeque::from([smart_payload("oco_fc1", "ACTIVE")]),
+        // Cancel echo returns a FOREIGN id with a terminal status.
+        cancel: VecDeque::from([smart_payload("oco_FOREIGN", "COMPLETED")]),
+        ..Default::default()
+    };
+    let mut exec = live_smart_exec(st, "sm-cancel-idmm");
+    exec.place_smart_order(oco_create(), DATE, NOW_MS, true)
+        .await
+        .unwrap();
+    {
+        let book = exec.smart_book();
+        book.lock()
+            .await
+            .get_mut("oco_fc1")
+            .expect("tracked")
+            .status = SmartOrderStatus::Triggered;
+    }
+    let out = exec
+        .cancel_smart_order("oco_fc1", DATE, NOW_MS, true)
+        .await
+        .unwrap();
+    assert_eq!(out, MutationResult::Accepted);
+    // The tracked order keeps its live status — the foreign echo never adopted.
+    let book = exec.smart_book();
+    assert_eq!(
+        book.lock().await.get("oco_fc1").expect("tracked").status,
+        SmartOrderStatus::Triggered,
+        "foreign cancel echo must NOT terminalize the tracked order"
     );
 }

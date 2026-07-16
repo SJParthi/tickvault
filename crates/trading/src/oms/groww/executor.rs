@@ -45,7 +45,7 @@ use super::reference_id::{IstDate, generate_reference_id};
 use super::smart_orders::{
     SmartModifyFields, SmartOrderBook, SmartOrderCreate, SmartOrderError, SmartOrderGates,
     SmartOrderStatus, SmartReconcileReport, SmartTransitionOutcome, TrackedSmartOrder,
-    ambiguity_stage, build_modify_body, count_mutation, emit_oco01, emit_oco04,
+    ambiguity_stage, build_modify_body, count_mutation, emit_oco01, emit_oco04, emit_oco05,
     evaluate_smart_transition, is_plausible_smart_order_id, log_safe_id, reconcile_pass,
     validate_create_smart_order, validate_modify_fields,
 };
@@ -601,7 +601,7 @@ impl<T: OrderTransport> GrowwOrderExecutor<T> {
     /// the budget; auth-stale PAUSES the clock; a strict not-landed replays
     /// ONCE on the SAME reference id (bounded); exhaustion ⇒ Unresolved
     /// (Critical).
-    #[allow(clippy::too_many_arguments)] // the ladder needs the full mutation context
+    #[allow(clippy::too_many_arguments)] // APPROVED: the ladder needs the full mutation context
     async fn resolve_place(
         &mut self,
         ref_id: &str,
@@ -763,7 +763,7 @@ impl<T: OrderTransport> GrowwOrderExecutor<T> {
     /// Re-send a place with the SAME reference id and classify the replay
     /// (design §4.7: GA007 ⇒ first landed after all ⇒ adopt; Success ⇒ landed;
     /// else keep laddering). Bounded by the caller's replay counter.
-    #[allow(clippy::too_many_arguments)] // the replay needs the full mutation context
+    #[allow(clippy::too_many_arguments)] // APPROVED: the replay needs the full mutation context
     async fn replay_place(
         &mut self,
         ref_id: &str,
@@ -1855,20 +1855,40 @@ impl<T: OrderTransport + SmartOrderTransport> GrowwOrderExecutor<T> {
                     None,
                 )
                 .await?;
-                // Route the echoed status ("CANCELLED on success") through
-                // the FSM (adversarial round 1, finding 8): forward adopts,
-                // backward/unknown PARKS for the reconcile poller — never a
-                // blind direct assignment.
-                let echoed = payload
-                    .status
+                // Identity guard, mirroring the reconcile-GET fix (round 3,
+                // finding 1): the "no unguarded broker echo" invariant holds
+                // across ALL echo sites. A cancel response carrying a
+                // DIFFERENT id (not exploitable on our own id-path, but
+                // symmetric) skips adoption — degrade + emit, never classify.
+                let id_mismatch = payload
+                    .smart_order_id
                     .as_deref()
-                    .map(SmartOrderStatus::parse)
-                    .unwrap_or(SmartOrderStatus::Cancelled);
-                if let Some(t) = book.lock().await.get_mut(smart_order_id) {
-                    match evaluate_smart_transition(&t.status, &echoed) {
-                        SmartTransitionOutcome::Transition => t.status = echoed,
-                        SmartTransitionOutcome::SameStatusRefresh
-                        | SmartTransitionOutcome::Park => {}
+                    .is_some_and(|other| other != smart_order_id);
+                if id_mismatch {
+                    emit_oco05(
+                        "id_mismatch",
+                        &format!(
+                            "cancel echo requested {} got {}",
+                            log_safe_id(smart_order_id),
+                            log_safe_id(payload.smart_order_id.as_deref().unwrap_or("")),
+                        ),
+                    );
+                } else {
+                    // Route the echoed status ("CANCELLED on success")
+                    // through the FSM (round 1, finding 8): forward adopts,
+                    // backward/unknown PARKS for the reconcile poller — never
+                    // a blind direct assignment.
+                    let echoed = payload
+                        .status
+                        .as_deref()
+                        .map(SmartOrderStatus::parse)
+                        .unwrap_or(SmartOrderStatus::Cancelled);
+                    if let Some(t) = book.lock().await.get_mut(smart_order_id) {
+                        match evaluate_smart_transition(&t.status, &echoed) {
+                            SmartTransitionOutcome::Transition => t.status = echoed,
+                            SmartTransitionOutcome::SameStatusRefresh
+                            | SmartTransitionOutcome::Park => {}
+                        }
                     }
                 }
                 count_mutation("cancel", "acked");
