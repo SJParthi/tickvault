@@ -87,7 +87,7 @@ mod tests {
     }
 
     #[test]
-    fn valid_position_frame_is_counted() {
+    fn test_handle_position_payload_counts_a_valid_frame() {
         assert_eq!(
             handle_position_payload(&valid_position_bytes()),
             PositionHandleOutcome::Counted

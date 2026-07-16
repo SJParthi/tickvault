@@ -374,7 +374,7 @@ mod push_fanout_tests {
     }
 
     #[test]
-    fn fan_out_delivers_full_fidelity_events_to_every_sink() {
+    fn test_deliver_sends_full_fidelity_events_to_every_sink() {
         let seen_a = Arc::new(AtomicUsize::new(0));
         let seen_b = Arc::new(AtomicUsize::new(0));
         let fan_out = GrowwPushFanOut::new(vec![
@@ -406,7 +406,7 @@ mod push_fanout_tests {
     }
 
     #[test]
-    fn empty_fan_out_is_a_safe_no_op() {
+    fn test_sink_count_and_empty_fan_out_safe_no_op() {
         let fan_out = GrowwPushFanOut::new(Vec::new());
         assert_eq!(fan_out.sink_count(), 0);
         fan_out.deliver(&sample_event()); // must not panic
