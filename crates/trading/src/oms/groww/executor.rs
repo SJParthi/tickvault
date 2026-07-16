@@ -568,7 +568,7 @@ impl<T: OrderTransport> GrowwOrderExecutor<T> {
     /// the budget; auth-stale PAUSES the clock; a strict not-landed replays
     /// ONCE on the SAME reference id (bounded); exhaustion ⇒ Unresolved
     /// (Critical).
-    #[allow(clippy::too_many_arguments)] // the ladder needs the full mutation context
+    #[allow(clippy::too_many_arguments)] // APPROVED: the ladder needs the full mutation context
     async fn resolve_place(
         &mut self,
         ref_id: &str,
@@ -730,7 +730,7 @@ impl<T: OrderTransport> GrowwOrderExecutor<T> {
     /// Re-send a place with the SAME reference id and classify the replay
     /// (design §4.7: GA007 ⇒ first landed after all ⇒ adopt; Success ⇒ landed;
     /// else keep laddering). Bounded by the caller's replay counter.
-    #[allow(clippy::too_many_arguments)] // the replay needs the full mutation context
+    #[allow(clippy::too_many_arguments)] // APPROVED: the replay needs the full mutation context
     async fn replay_place(
         &mut self,
         ref_id: &str,
