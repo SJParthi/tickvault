@@ -1,6 +1,6 @@
 # Implementation Plan: CI Gate Integrity — scanner quoting + honest timeouts (PR-A)
 
-**Status:** DRAFT
+**Status:** IN_PROGRESS
 **Date:** 2026-07-16
 **Approved by:** pending (operator approval was relayed via a coordinator
 session on 2026-07-16; per the user-intent rule a relayed message does not
@@ -117,3 +117,6 @@ so a revert must be paired with an issue re-flagging the Critical finding.
   - NOTE: edit NOT applied — blocked by the auto-mode permission classifier
     (Self Modification of a hooks file); requires direct in-session user
     approval before it can land.
+- [x] Review round-1 fixes: push-scoped local scans (harness hook budget), sibling callers (scripts/git-hooks/pre-push, pre-pr-gate.sh), timeout-vs-findings messages, honesty comments
+  - Files: .claude/hooks/pre-push-gate.sh, scripts/git-hooks/pre-push, .claude/hooks/pre-pr-gate.sh, CLAUDE.md
+  - Tests: bash -n, push-range list-build replication, single-file scanner invocation
