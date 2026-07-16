@@ -2779,6 +2779,37 @@ async fn build_shared_infra(
          committed C-phase follow-up)"
     );
 
+    // --- REST-era candle derivation (operator directive 2026-07-16) ---
+    // Folds persist-confirmed `spot_1m_rest` 1m bars into all 21 `candles_*`
+    // timeframes through the shared seal-writer channel installed just above
+    // (the seal chain is no longer dormant — this is its REST-era producer),
+    // plus a boot catch-up over the stored month. Config-gated (fail-safe
+    // serde default OFF; base.toml opts in); supervised; cold path only.
+    // FOLD-01 runbook: .claude/rules/project/rest-candle-fold-error-codes.md
+    if config.rest_candle_fold.enabled {
+        let (fold_bar_tx, fold_bar_rx) =
+            tokio::sync::mpsc::channel(tickvault_app::rest_candle_fold::FOLD_BAR_CHANNEL_CAPACITY);
+        if tickvault_app::rest_candle_fold::set_global_fold_bar_sender(fold_bar_tx) {
+            let _rest_candle_fold_supervisor =
+                tickvault_app::rest_candle_fold::spawn_supervised_rest_candle_fold(
+                    config.rest_candle_fold.clone(),
+                    config.questdb.clone(),
+                    fold_bar_rx,
+                );
+            info!(
+                catchup_days = config.rest_candle_fold.catchup_days,
+                "rest_candle_fold: REST-era candle derivation ARMED — spot legs hand \
+                 off persist-confirmed 1m bars; boot catch-up re-folds the stored \
+                 month into all 21 timeframes (candles_1m..candles_1d populate again)"
+            );
+        }
+    } else {
+        info!(
+            "rest_candle_fold: disabled by config ([rest_candle_fold] enabled = false) \
+             — candles_* stay REST-underived this boot"
+        );
+    }
+
     // --- HTTP API server (incl. /api/feeds toggle routes) — C1 fix ---
     let api_state = SharedAppState::new_with_feed_runtime_and_health(
         config.questdb.clone(),

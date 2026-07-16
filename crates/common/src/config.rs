@@ -159,6 +159,16 @@ pub struct ApplicationConfig {
     /// Absent section ⇒ DISABLED (fail-safe default off).
     #[serde(default)]
     pub tf_consistency: TfConsistencyConfig,
+    /// `[rest_candle_fold]` — REST-era multi-TF candle derivation (operator
+    /// directive 2026-07-16: *"why the fuck remaining candles 1m till 1day
+    /// is not yet generated and populated — resolve these"*). Folds
+    /// persist-confirmed `spot_1m_rest` 1m bars into all 21 `candles_*`
+    /// timeframes via the shared seal-writer channel, with a boot catch-up
+    /// over the last `catchup_days` of stored bars. Cold path only. Absent
+    /// section ⇒ DISABLED (fail-safe default off); `config/base.toml` opts
+    /// in.
+    #[serde(default)]
+    pub rest_candle_fold: RestCandleFoldConfig,
     /// `[groww_contract_1m]` — Groww per-minute PER-CONTRACT 1m candle REST
     /// leg (operator grant 2026-07-13,
     /// `.claude/plans/active-plan-groww-rest-1m.md` PR-4 — the fill-model
@@ -846,6 +856,63 @@ pub struct TfConsistencyConfig {
     /// explicitly.
     #[serde(default)]
     pub enabled: bool,
+}
+
+/// `[rest_candle_fold]` — REST-era multi-TF candle derivation (operator
+/// directive 2026-07-16). Cold path only — folds persist-confirmed
+/// `spot_1m_rest` 1m bars into the 21 `candles_*` tables through the shared
+/// seal-writer channel; NEVER touches `ticks` (live-feed-purity rules 1-6
+/// stand; rule 10 carries the dated 2026-07-16 candles_1d edit).
+///
+/// Fail-safe shape: `enabled` is `#[serde(default)]` = `false`, so an
+/// absent `[rest_candle_fold]` section (or a TOML written before this PR)
+/// disables the fold entirely. `config/base.toml` explicitly sets
+/// `enabled = true` + `catchup_days = 35` (the operator's one-month spot
+/// window demand, 2026-07-16).
+#[derive(Debug, Clone, Deserialize)]
+pub struct RestCandleFoldConfig {
+    /// Master switch for the REST-era bar-fold candle derivation.
+    /// Default OFF (fail-safe) — `config/base.toml` turns it on explicitly.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Boot catch-up window in IST days: the fold re-derives all 21 TFs
+    /// from the last `catchup_days` of `spot_1m_rest` rows per feed.
+    /// Default 35 (one month of spot history + weekend slack — the
+    /// operator's 2026-07-16 minimum-one-month demand).
+    #[serde(default = "default_rest_candle_fold_catchup_days")]
+    pub catchup_days: u32,
+}
+
+impl Default for RestCandleFoldConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            catchup_days: default_rest_candle_fold_catchup_days(),
+        }
+    }
+}
+
+/// serde default for [`RestCandleFoldConfig::catchup_days`] — 35 days.
+fn default_rest_candle_fold_catchup_days() -> u32 {
+    35
+}
+
+impl RestCandleFoldConfig {
+    /// Boot-time sanity validation — rejected BEFORE the fold task spawns.
+    /// The window must be ≥1 day and ≤370 (~one year — the envelope bound;
+    /// a larger window is a config typo, not a legitimate ask).
+    ///
+    /// # Errors
+    /// Returns a descriptive error when `catchup_days` is outside `1..=370`.
+    pub fn validate(&self) -> Result<()> {
+        if !(1..=370).contains(&self.catchup_days) {
+            bail!(
+                "rest_candle_fold.catchup_days ({}) must be within 1..=370",
+                self.catchup_days
+            );
+        }
+        Ok(())
+    }
 }
 
 /// `[option_chain_1m]` — per-minute option-chain REST pipeline (operator
@@ -2582,6 +2649,11 @@ impl ApplicationConfig {
         // rejected at boot, BEFORE the trading pipeline spawns.
         self.exit_orders.validate()?;
 
+        // 2026-07-16 REST-era candle derivation: the boot catch-up window
+        // must be a sane 1..=370-day envelope — rejected at boot, BEFORE
+        // the fold task spawns.
+        self.rest_candle_fold.validate()?;
+
         Ok(())
     }
 }
@@ -3154,6 +3226,7 @@ mod tests {
             groww_spot_1m: GrowwSpot1mConfig::default(),
             groww_option_chain_1m: GrowwOptionChain1mConfig::default(),
             tf_consistency: TfConsistencyConfig::default(),
+            rest_candle_fold: RestCandleFoldConfig::default(),
             groww_contract_1m: GrowwContract1mConfig::default(),
             groww_universe: GrowwUniverseConfig::default(),
             groww_orders: GrowwOrdersConfig::default(),

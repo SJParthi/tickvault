@@ -604,6 +604,22 @@ strikes_each_side = 2
 enabled = true
 
 # ===========================================================================
+# REST-era multi-TF candle derivation (operator directive 2026-07-16:
+# "why the fuck remaining candles 1m till 1day is not yet generated and
+# populated — resolve these"). Folds persist-confirmed spot_1m_rest 1m bars
+# into all 21 candles_* timeframes via the shared seal-writer channel, plus
+# a boot catch-up over the last `catchup_days` of stored bars (35 = the
+# operator's one-month spot window + weekend slack, 2026-07-16: "our entire
+# one month should be stored and fetched from questdb even before
+# premarket"). NEVER touches `ticks` (live-feed-purity; rule 10 carries the
+# dated candles_1d edit). Serde default is OFF (fail-safe) — this section
+# opts in; `enabled = false` is the rollback switch.
+# ===========================================================================
+[rest_candle_fold]
+enabled = true
+catchup_days = 35
+
+# ===========================================================================
 # Scheduled OMS order-book reconciliation (2026-07-14). Every
 # `interval_secs` during the NSE session the trading pipeline reconciles
 # OMS state against the Dhan order book (the OMS-GAP-02 machinery gains a

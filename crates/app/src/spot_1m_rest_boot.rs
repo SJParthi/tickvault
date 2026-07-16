@@ -146,6 +146,7 @@ use tickvault_common::constants::{
     SPOT_1M_REST_SID_NOT_SERVED_THRESHOLD,
 };
 use tickvault_common::error_code::ErrorCode;
+use tickvault_common::feed::Feed;
 use tickvault_common::sanitize::{capture_rest_error_body, redact_url_params};
 use tickvault_common::trading_calendar::TradingCalendar;
 use tickvault_common::types::SecurityId;
@@ -2304,6 +2305,10 @@ async fn fire_one_minute(
     // data flush ACK, then stamped with the real close_to_persist_ms (a
     // failed flush discards them — the flush_failed rows are the truth).
     let mut held_ok_rows: Vec<RestFetchAuditRow> = Vec::new();
+    // 2026-07-16 REST-era candle derivation: bars staged for the fold-writer
+    // handoff — sent ONLY after the flush ACK confirms persistence (a bar
+    // that never persisted must not derive candles).
+    let mut confirmed_bars: Vec<crate::rest_candle_fold::ConfirmedBar> = Vec::new();
     // 2026-07-13 VIX companion: per-SID served verdicts for THIS minute
     // (served = the SID's OWN target-minute candle was retrieved). A
     // join-failed task leaves its SID unrecorded (HOLD); the no-token arm
@@ -2526,6 +2531,12 @@ async fn fire_one_minute(
                         "none",
                     ));
                     staged.push((security_id, candle.minute_ts_ist_nanos, forensics));
+                    confirmed_bars.push(crate::rest_candle_fold::ConfirmedBar::from_minute_candle(
+                        Feed::Dhan,
+                        security_id,
+                        tickvault_common::constants::EXCHANGE_SEGMENT_IDX_I,
+                        &candle,
+                    ));
                 }
             }
             if let Some(backfill) = backfill_candle {
@@ -2590,6 +2601,12 @@ async fn fire_one_minute(
                         "none",
                     ));
                     staged.push((security_id, backfill.minute_ts_ist_nanos, forensics));
+                    confirmed_bars.push(crate::rest_candle_fold::ConfirmedBar::from_minute_candle(
+                        Feed::Dhan,
+                        security_id,
+                        tickvault_common::constants::EXCHANGE_SEGMENT_IDX_I,
+                        &backfill,
+                    ));
                 }
             }
         }
@@ -2634,6 +2651,10 @@ async fn fire_one_minute(
             for (security_id, minute_nanos, _forensics) in staged {
                 tracker.commit(security_id, minute_nanos);
             }
+            // 2026-07-16 REST-era candle derivation: the bars are now
+            // persist-CONFIRMED — hand them to the fold writer (best-effort
+            // try_send; a disabled fold is a silent no-op by design).
+            crate::rest_candle_fold::send_confirmed_bars(&confirmed_bars);
         }
         // GAP-11: the ok rows land ONLY after (and stamped with) the data
         // flush ACK — discarded on a failed flush (the flush_failed rows
@@ -2753,6 +2774,9 @@ async fn sweep_sids_above_watermark(
     // GAP-11 persist stamping: swept `ok` forensics rows are HELD until
     // the data flush ACK (stamped then; discarded on a failed flush).
     let mut held_ok_rows: Vec<RestFetchAuditRow> = Vec::new();
+    // 2026-07-16 REST-era candle derivation: swept bars staged for the
+    // fold-writer handoff — sent ONLY after the flush ACK confirms.
+    let mut confirmed_bars: Vec<crate::rest_candle_fold::ConfirmedBar> = Vec::new();
     for (security_id, symbol) in SPOT_1M_REST_INDICES {
         let missing = sweep_missing_minutes(
             tracker.last_persisted(security_id),
@@ -2885,6 +2909,12 @@ async fn sweep_sids_above_watermark(
                     ));
                 }
                 staged.push((security_id, *minute_nanos));
+                confirmed_bars.push(crate::rest_candle_fold::ConfirmedBar::from_minute_candle(
+                    Feed::Dhan,
+                    security_id,
+                    tickvault_common::constants::EXCHANGE_SEGMENT_IDX_I,
+                    &candle,
+                ));
             }
         }
         stats.swept = stats.swept.saturating_add(found_for_sid);
@@ -2926,6 +2956,10 @@ async fn sweep_sids_above_watermark(
         for (security_id, minute_nanos) in staged {
             tracker.commit(security_id, minute_nanos);
         }
+        // 2026-07-16 REST-era candle derivation: swept bars are now
+        // persist-CONFIRMED — hand them to the fold writer (an
+        // out-of-order swept bar marks its day dirty for a refold).
+        crate::rest_candle_fold::send_confirmed_bars(&confirmed_bars);
     }
     if let Some(w) = audit {
         // GAP-11: swept ok rows land ONLY after (and stamped with) the data
