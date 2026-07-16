@@ -119,7 +119,7 @@ mod tests {
     }
 
     #[test]
-    fn maps_the_full_fidelity_fields() {
+    fn test_map_order_detail_maps_the_full_fidelity_fields() {
         let detail = sample_detail();
         let ev = map_order_detail(&detail, 1_700_000_000_123);
         assert_eq!(ev.broker, Feed::Groww);
@@ -213,7 +213,7 @@ mod tests {
     }
 
     #[test]
-    fn broadcast_without_order_detail_maps_to_none() {
+    fn test_map_order_broadcast_without_order_detail_maps_to_none() {
         let dto = OrderDetailsBroadCastDto::default();
         assert_eq!(map_order_broadcast(&dto, 0), None);
     }
