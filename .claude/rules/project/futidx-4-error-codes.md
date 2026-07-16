@@ -30,6 +30,12 @@
 > the Groww futures cannot silently drop. `FUTIDX-02` is structurally DORMANT (below), and
 > the §3 far-month alarm-gate exclusion died with the tick-gap detector (Q4-ii — LANDED
 > PR-C3, 2026-07-14). Dhan-side content retained for historical audit.
+>
+> **2026-07-15 amendment (Groww live retired):** the "GROWW LEG STANDS" above is AMENDED —
+> the Groww LIVE SUBSCRIPTION of the §36 futures is retired with the Groww live feed
+> (operator directive 2026-07-15, REST-only for both brokers). The futures rows REMAIN in
+> the daily watch file (built by the `[groww_universe]` rider) for REST contract-identity
+> resolution; the Groww FUTIDX-01 selection arms live on in that build path.
 
 ## §0. Why these codes exist
 

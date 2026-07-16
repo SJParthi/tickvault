@@ -315,47 +315,16 @@ auto_start_docker = true
 [feeds]
 dhan_enabled = false
 groww_enabled = false
-# Groww NATIVE-RUST SHADOW client (PR-R1 of the parity migration, operator
-# "go" 2026-07-04 — groww-second-feed-scope-2026-06-19.md §35). Default OFF.
-# When true, the native Rust client runs ALONGSIDE the Python sidecar (same
-# watch set) and writes its own NDJSON capture file
-# (data/groww/rust-live-ticks.ndjson) for the exact per-tick parity comparer.
-# No shared-table writes, no strategy/order wiring, no sidecar changes.
-groww_native_shadow = false
-
-# Groww capture-archive S3 offload (2026-07-13 disk-retention hardening).
-# Rotated sidecar capture archives (data/groww/live-ticks-YYYYMMDD.ndjson)
-# are uploaded to s3://<bucket>/<prefix>/<filename>, VERIFIED (head_object
-# size match), and only then deleted locally after a grace window. Empty
-# bucket = archival OFF (archives kept on disk — the dev-Mac behaviour);
-# the sidecar NEVER deletes a file without a verified S3 copy.
-[feeds.groww]
-capture_archive_s3_bucket = "tv-prod-cold"
-capture_archive_s3_prefix = "groww-capture"
-
-# Groww multi-connection AUTO-SCALE ladder (operator authorization 2026-07-03,
-# §34 of .claude/rules/project/groww-second-feed-scope-2026-06-19.md).
-# enabled = false (the default) keeps the single-connection sidecar path
-# byte-identical. Tier A ceiling = 10 connections (Monday); raising
-# target_connections beyond the current tier requires the §34.2 gate evidence.
-[feeds.groww.scale]
-enabled = false
-target_connections = 10
-instruments_per_conn = 1000
-ladder = [1, 2, 5, 10]
-gate_hold_minutes = 15
-gate_max_cpu_pct = 70.0
-gate_min_disk_free_pct = 20.0
-gate_max_capture_lag_ms = 30000
-rollback_hold_base_minutes = 10
-advance_window_ist = ["09:20", "14:30"]
-# Cap-probe mode (PR-3): exactly 2 conns x 600 instruments + a
-# per-conn-vs-per-account verdict, then hold at 2. Scale-test harness only.
-probe_mode = false
-# Weekend SMOKE mode (PR-3): when the market is CLOSED, exercise the full
-# scale machinery with tick gates honestly SKIPPED (labelled SMOKE).
-# No effect while the market is open. Scale-test harness only.
-weekend_smoke = false
+# The Groww LIVE feed was RETIRED 2026-07-15 (operator directive: "remove
+# the whole Groww live feed; keep only spot 1m and option chain for both
+# brokers"). groww_enabled above does NOT gate the Groww REST legs (each is
+# section-gated by its own [groww_spot_1m] / [groww_option_chain_1m] /
+# contract-leg `enabled` key); it feeds the boot-completed feed gate, the
+# scoreboard feed_off day classification, and the /feeds page display only
+# (verified 2026-07-15 — the live feed itself is retired). The daily
+# watch-set build lives under [groww_universe]. The retired keys
+# (groww_native_shadow, [feeds.groww] capture archive, [feeds.groww.scale])
+# were removed with the live machinery.
 
 # [movers] section retired in PR #2 (2026-05-18) alongside the deleted
 # movers pipeline. Under the 4-IDX_I-only universe top-N gainers/losers/
@@ -567,6 +536,17 @@ probe_and_report = true
 enabled = true
 
 # ===========================================================================
+# [groww_universe] — process-global daily Groww watch-set + shared-master
+# rider (2026-07-15 Groww live-feed retirement re-home): once per IST day,
+# build + write data/groww/groww-watch-<date>.json (the spot leg's VIX
+# resolver reads it) and fire-and-forget persist_groww_instruments (SEBI
+# feed='groww' master continuity). Base opts IN; the serde default stays OFF
+# (the house fail-safe pattern — an absent section disables the rider).
+# ===========================================================================
+[groww_universe]
+enabled = true
+
+# ===========================================================================
 # Groww per-minute option-chain REST leg (operator grant 2026-07-13 — PR-3
 # of the Groww per-minute REST plan). When enabled: every session minute —
 # sequenced right after the Groww spot fetch — pull the CURRENT-expiry
@@ -647,6 +627,21 @@ warm_up = true
 enabled = true
 
 # ===========================================================================
+# Scheduled OMS order-book reconciliation (2026-07-14). Every
+# `interval_secs` during the NSE session the trading pipeline reconciles
+# OMS state against the Dhan order book (the OMS-GAP-02 machinery gains a
+# scheduled caller). DEFAULT-OFF until live trading — the OMS dry-run
+# short-circuit makes an enabled run a zero-HTTP no-op anyway. An ABSENT
+# section = disabled (fail-safe); `enabled = false` is the rollback switch.
+# ===========================================================================
+[oms_reconcile]
+enabled = false
+interval_secs = 300
+# NOTE: `trading_hours_only = false` skips the SESSION-WINDOW gate AND the
+# trading-DAY (calendar/weekday) gate — runs then fire on weekends/holidays too.
+trading_hours_only = true
+
+# ===========================================================================
 # Groww ORDER-SIDE build gate (operator authorization 2026-07-14 —
 # groww-second-feed-scope-2026-06-19.md §39, no-rest-except-live-feed §10).
 # GATE 1 of the 4-gate live-fire lattice. EVERY key is false: the entire
@@ -664,6 +659,16 @@ portfolio_read = false
 margin_read = false
 user_read = false
 live_fire_requested = false
+smart_orders_read = false # read-only GTT/OCO get/list (the OCO reconcile poller's read surface)
+smart_orders_write = false # smart-order create/modify/cancel INTENT — inert without Gates 2+3
+oco_reconcile_poll_secs = 15 # OCO reconcile poller cadence (seconds; Smart Orders area design value)
+oco_sibling_cancel_deadline_secs = 30 # sibling-cancel verification deadline (seconds) — past it = GROWW-OCO-02
+# paper_enabled: the zero-HTTP paper executor + intent ledger lane. Default
+# OFF; makes ZERO HTTP calls (incl. GETs) when on — separate from orders_read.
+paper_enabled = false
+# max_order_quantity: fail-closed cap; 0 = refuse-all (pending the operator's
+# 0-vs-1 answer). A larger requested qty is refused before any HTTP (GROWW-ORD-09).
+max_order_quantity = 0
 
 # ===========================================================================
 # 🔷 DHAN pre-trade margin gate (operator directive 2026-07-14, relayed via

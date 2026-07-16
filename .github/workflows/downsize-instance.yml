@@ -1,0 +1,772 @@
+# downsize-instance.yml — one-shot guarded downsize of the prod box.
+#
+#   r8g.large -> t4g.medium  +  QDB_MEM_LIMIT 4g -> 1g (on-box .env)
+#   + root-volume snapshot taken AFTER the (benign, reversible) stop — a clean
+#     rollback image with no in-flight writes. ⚠ NO snapshot auto-delete exists:
+#     manual deletion is required after the rollback window (~$2.5/mo on the
+#     50 GB snapshot until deleted; tagged tv-delete-after=<creation+7d>).
+#
+# Authorization: operator Quote 8, 2026-07-15 ("Flip tonight: t4g.medium,
+# QuestDB 1g, automated") — recorded in
+# .claude/rules/project/daily-universe-scope-expansion-2026-05-27.md §0/§7.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# ⚠ EBS 50 GB -> 20 GB CANNOT BE DONE IN THIS WORKFLOW (executor decision,
+#   NOT operator-quoted scope — see the rule file §7 Rule 3)
+# ─────────────────────────────────────────────────────────────────────────────
+# AWS FORBIDS shrinking EBS: `modify-volume` grows only, and `create-volume
+# --snapshot-id <50GB snap> --size 20` is REJECTED (volume size must be >= the
+# snapshot size). So a "fresh 20 GB volume FROM the snapshot" is IMPOSSIBLE.
+# TONIGHT: instance-type flip + QDB 1g ONLY; the root stays 50 GB. The 20 GB
+# root lands via terraform terminate-and-recreate (user-data cattle-provision)
+# in the operator's post-market erase window, with tonight's snapshot as the
+# rollback. Deferral cost ~= +$2.74/mo pre-GST until replaced. Step 6 below is
+# a deliberate NO-OP that records this decision in the run log.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# POST-FLIP FAILURE PLAYBOOK (review round 1 — every failure arm has a path)
+# ─────────────────────────────────────────────────────────────────────────────
+# Failures BEFORE step 5 (confirm/creds/probe/guard/stop/snapshot): nothing
+#   irreversible happened — the stop is benign/reversible (step 9b reports the
+#   TRUE final power state; an initially-running box left stopped by a failure
+#   is reported honestly, never auto-restarted post-failure). Fix the named
+#   cause and re-dispatch. The IAM probe (step 0) covers EVERY action this
+#   workflow actually calls — --dry-run probes for the EC2 mutations it
+#   performs (CreateSnapshot/CreateTags/Stop/Modify/Start) + real READ probes
+#   (DescribeInstances/Volumes/Addresses/Snapshots/InstanceStatus,
+#   ssm:DescribeInstanceInformation) + sns:Publish, BEFORE any mutation — so a
+#   missing permission is discovered pre-flip, not post-flip.
+# Start failure on t4g.medium (step 7, full mode): AUTO-ROLLBACK to r8g.large,
+#   then the rollback is VERIFIED (live type + power state re-read) before any
+#   Telegram claims it — an unconfirmed rollback pages "ROLLBACK NOT CONFIRMED"
+#   with the actual state and the manual commands.
+# Failures AFTER the type flip (status-ok timeout / EIP mismatch / SSM agent
+#   offline / retune command failed / app not active): the box is t4g.medium
+#   but the QuestDB retune may NOT have landed (the on-box .env may still say
+#   4g — over-commit on a 4 GiB host). RECOVERY = RE-DISPATCH THIS WORKFLOW:
+#   step 2 detects the box is already t4g.medium and continues in RETUNE-ONLY
+#   mode (skips snapshot/stop/modify, re-runs start + retune + verify — the
+#   .env upsert is an idempotent sed). Manual alternatives: finish by hand
+#   (scripts/aws-upgrade-instance.sh --from t4g.medium --to t4g.medium is not
+#   needed — just --qdb-mem 1g --apply-ssm), or roll back up with
+#   scripts/aws-upgrade-instance.sh --from t4g.medium --to r8g.large (the
+#   allowlist keeps r8g.large for exactly this). The failure Telegram always
+#   reports the ACTUAL live type + power state — it never claims a rollback
+#   that did not happen.
+# Power-state restore (step 9b) runs on SUCCESS AND FAILURE (if: always()):
+#   a box that was stopped at workflow start is re-stopped even when a later
+#   step failed — a stopped box cannot OOM on the un-retuned 4g limit, and
+#   leaving it running would burn hours until the next 16:30 IST weekday cron.
+#   A FAILED re-stop MARKS THE RUN FAILED (no success Telegram may claim
+#   "switched off again" while the box runs); an initially-RUNNING box that a
+#   failure left STOPPED is reported as stopped + why — it is deliberately NOT
+#   auto-restarted after a failed flip (the 08:30 IST cron / operator restarts).
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# FLIP-TIMING INTEL (deploy-diagnosis session, 2026-07-15)
+# ─────────────────────────────────────────────────────────────────────────────
+#   - The box is normally STOPPED post-16:30 IST (daily self-stop). Step 2
+#     records the initial state; step 3 skips the stop when already stopped
+#     (the snapshot in step 4 is then taken immediately — the box is already
+#     in the clean stopped state); step 9b makes the final power-state
+#     decision explicit.
+#   - Two QUEUED deploy-aws dispatches (run ids 29409568521 / 29411020997,
+#     both head 8b5ae476) may each briefly self-start the box; after-close
+#     crons fire at 16:16/17:01 IST. Step 1b waits out in-flight deploy runs
+#     (bounded ~45 min, then proceeds loudly). A flip landing mid-deploy only
+#     fails THAT deploy run harmlessly (self-heals via the next cron /
+#     postmerge-catchup).
+#   - VERIFIED ASSUMPTION: the deployed ARM binary is t4g-compatible — r8g
+#     and t4g are BOTH aarch64 Graviton; NO rebuild is needed.
+#   - Deploy readiness gate: systemd READY=1 within 180s of boot; the 300s
+#     is-active loop in step 8 brackets that with margin.
+#
+# CREDENTIALS (credential_mode input — review round 6): the deploy-aws.yml
+# OIDC role (secrets.AWS_ROLE_ARN) has ZERO EC2 mutation grants today —
+# dispatching this workflow on it would die at step 0 by design (no IAM grant
+# ships with this workflow; granting the role EC2 mutations is an operator
+# decision NOT taken here). Default credential_mode = "bootstrap-keys":
+# configure with secrets.AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY ONLY (the
+# account bootstrap keys — the only stored credentials that carry the EC2
+# mutation grants), failing loudly at step -1 if those secrets are absent.
+# "oidc-role" stays selectable for a future role that gains the grants; the
+# step-0 probe names any missing action and aborts pre-mutation either way.
+# SSM pattern, Telegram pattern, IST-window math and state-poll loops are
+# copied 1:1 from .github/workflows/deploy-aws.yml.
+# SECURITY: workflow_dispatch inputs are NEVER template-interpolated into
+# run: scripts — every input flows through a step env: block (GitHub script
+# injection class; the ${{ }} expansion is text substitution before bash).
+# (credential_mode is a fixed-choice input consumed only in step `if:`
+# expressions — never in a run: script.)
+
+name: downsize-instance
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type the EXACT instance id (i-0b956d0209231a48b) to confirm the downsize.'
+        required: true
+      force_market_hours:
+        description: 'Override the post-market guard? Type "yes" only for an emergency.'
+        required: false
+        default: 'no'
+      credential_mode:
+        description: 'AWS credentials. bootstrap-keys (default) = AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY (the only stored creds with EC2 mutation grants). oidc-role = secrets.AWS_ROLE_ARN (ZERO EC2 mutation grants today — step 0 aborts pre-mutation).'
+        required: false
+        default: 'bootstrap-keys'
+        type: choice
+        options:
+          - bootstrap-keys
+          - oidc-role
+
+concurrency:
+  group: downsize-instance-prod
+  cancel-in-progress: false # never interrupt an in-flight stop/modify/start
+
+permissions:
+  id-token: write # OIDC — used ONLY when credential_mode=oidc-role is dispatched
+  contents: read
+  actions: read # step 1b `gh run list --workflow deploy-aws.yml` — without this
+  # the explicit permissions block zeroes the scope, every poll 403s, and the
+  # in-flight-deploy guard silently degrades to a fixed 45-min stall (round 2).
+
+env:
+  REGION: ${{ vars.AWS_REGION || 'ap-south-1' }}
+  IID: i-0b956d0209231a48b # pinned; must equal secrets.EC2_INSTANCE_ID
+  EXPECTED_EIP: 13.234.145.177 # Dhan static-IP — abort loudly if it changes
+  FROM_TYPE: r8g.large
+  TO_TYPE: t4g.medium
+  QDB_MEM: 1g
+
+jobs:
+  downsize:
+    name: Snapshot + downsize + QDB retune (one-shot, guarded)
+    runs-on: ubuntu-24.04
+    environment: prod
+    steps:
+      - name: Confirm input matches the pinned instance id
+        env:
+          CONFIRM_INPUT: ${{ github.event.inputs.confirm }}
+          SECRET_IID: ${{ secrets.EC2_INSTANCE_ID }}
+        run: |
+          if [ "$CONFIRM_INPUT" != "$IID" ]; then
+            echo "::error::confirm input does not match the pinned instance id — refusing."
+            exit 1
+          fi
+          if [ "$SECRET_IID" != "$IID" ]; then
+            echo "::error::secrets.EC2_INSTANCE_ID does not match the pinned id — repo secret drift; refusing."
+            exit 1
+          fi
+
+      # ── STEP -1: credential selection (review round 6 HIGH). The deploy-aws.yml
+      # OIDC role has ZERO EC2 mutation grants — always-preferring it would kill
+      # every dispatch at step 0. Default = bootstrap-keys; the keys MUST exist
+      # or we fail loudly HERE with the named cause. Action SHA-pinned to the
+      # commit the floating v4 tag resolved to on 2026-07-15 (supply-chain
+      # hardening — the dtolnay/rust-toolchain precedent; deploy-aws.yml still
+      # uses the floating @v4).
+      - name: Assert bootstrap keys exist (credential_mode=bootstrap-keys)
+        if: github.event.inputs.credential_mode != 'oidc-role'
+        env:
+          HAS_KEY: ${{ secrets.AWS_ACCESS_KEY_ID != '' }}
+          HAS_SECRET: ${{ secrets.AWS_SECRET_ACCESS_KEY != '' }}
+        run: |
+          if [ "$HAS_KEY" != "true" ] || [ "$HAS_SECRET" != "true" ]; then
+            echo "::error::credential_mode is bootstrap-keys but the two bootstrap-key repo secrets (the access-key-id + secret-access-key pair) are NOT set. Those bootstrap keys are the ONLY stored credentials with EC2 mutation grants (the OIDC role has none) — seed the repo secrets, or re-dispatch choosing the oidc-role credential mode AFTER granting that role the EC2 actions step 0 probes. NOTHING was changed."
+            exit 1
+          fi
+          echo "bootstrap keys present — configuring with access keys ONLY (no role assumption)"
+
+      - name: Configure AWS credentials (bootstrap keys)
+        if: github.event.inputs.credential_mode != 'oidc-role'
+        uses: aws-actions/configure-aws-credentials@ff717079ee2060e4bcee96c4779b553acc87447c # v4 tag commit, 2026-07-15
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ vars.AWS_REGION || 'ap-south-1' }}
+
+      - name: Configure AWS credentials (OIDC role — has ZERO EC2 mutation grants today)
+        if: github.event.inputs.credential_mode == 'oidc-role'
+        uses: aws-actions/configure-aws-credentials@ff717079ee2060e4bcee96c4779b553acc87447c # v4 tag commit, 2026-07-15
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION || 'ap-south-1' }}
+          role-session-name: tv-github-downsize-${{ github.run_id }}
+
+      - name: Resolve AWS account id at runtime # = deploy-aws.yml (SNS topic ARN)
+        id: acct
+        run: echo "id=$(aws sts get-caller-identity --query Account --output text)" >> "$GITHUB_OUTPUT"
+
+      # ── STEP 0: IAM capability probe — FAIL GRACEFULLY naming the missing action.
+      # Probes EVERY action this workflow ACTUALLY USES (review round 6 — the
+      # old draft dry-ran Create/Detach/Attach/DeleteVolume, actions the NO-OP
+      # volume step never calls, while skipping reads it does call):
+      #   --dry-run mutations: CreateSnapshot, CreateTags, StopInstances,
+      #     ModifyInstanceAttribute, StartInstances.
+      #   real READS: DescribeInstances, DescribeVolumes, DescribeAddresses,
+      #     DescribeSnapshots, DescribeInstanceStatus,
+      #     ssm:DescribeInstanceInformation (the canary for the SSM family;
+      #     deploy-aws.yml proves SendCommand/GetCommandInvocation work in
+      #     prod on the same credentials).
+      #   sns:Publish: a real preflight Telegram line, which doubles as the
+      #     "downsize starting" ping.
+      # A missing permission fails HERE, pre-mutation.
+      - name: IAM capability probe (every action actually used, FIRST)
+        env:
+          ACCT_ID: ${{ steps.acct.outputs.id }}
+        run: |
+          set -uo pipefail
+          # Round-2 CRITICAL fix: GitHub runs steps as `bash -e {0}`, and
+          # `set -uo pipefail` does NOT clear the inherited -e. Every probe
+          # below EXPECTS a non-zero exit (DryRunOperation = 254), so errexit
+          # would abort the step on the FIRST probe's assignment with the
+          # error text swallowed into $OUT. This step manages its own error
+          # handling (explicit exit 1 arms) — disable errexit explicitly.
+          set +e
+          FAILED=()
+          probe() { # $1=label  $2...=aws cli args (with --dry-run where supported)
+            local label="$1"; shift
+            local OUT RC
+            # errexit-safe even if -e ever returns: assignment in condition context.
+            if OUT=$("$@" 2>&1); then RC=0; else RC=$?; fi
+            if [ $RC -eq 0 ]; then echo "  ok $label (unexpectedly succeeded without --dry-run? check)"; return; fi
+            case "$OUT" in
+              *DryRunOperation*)        echo "  ok $label — authorized (DryRunOperation)";;
+              *UnauthorizedOperation*|*AccessDenied*) echo "  MISSING $label — IAM action not granted"; FAILED+=("$label");;
+              *) echo "  ? $label — non-IAM error (treated as pass-with-warning): ${OUT:0:200}";;
+            esac
+          }
+          probe_read() { # $1=label  $2...=aws cli args (READ-ONLY, real call — used by later steps)
+            local label="$1"; shift
+            local OUT RC
+            if OUT=$("$@" 2>&1); then RC=0; else RC=$?; fi
+            if [ $RC -eq 0 ]; then echo "  ok $label — read succeeded"; return; fi
+            case "$OUT" in
+              *UnauthorizedOperation*|*AccessDenied*|*not\ authorized*) echo "  MISSING $label — IAM action not granted"; FAILED+=("$label");;
+              *) echo "  ? $label — non-IAM error (treated as pass-with-warning): ${OUT:0:200}";;
+            esac
+          }
+          # Read probe (no dry-run flag — a real call, read-only):
+          aws ec2 describe-instances --region "$REGION" --instance-ids "$IID" \
+            --query 'Reservations[0].Instances[0].[InstanceId,InstanceType,State.Name]' --output text \
+            || { echo "::error::ec2:DescribeInstances failed — cannot even read the instance"; exit 1; }
+          ROOT_VOL=$(aws ec2 describe-instances --region "$REGION" --instance-ids "$IID" \
+            --query 'Reservations[0].Instances[0].BlockDeviceMappings[0].Ebs.VolumeId' --output text)
+          # With errexit off, a failed read above would otherwise flow garbage into the probes:
+          case "$ROOT_VOL" in vol-*) : ;; *) echo "::error::could not resolve the root volume id (got: ${ROOT_VOL:0:120})"; exit 1;; esac
+          # Reads the later steps depend on (step 2 record + step 3/9b waits + EIP checks):
+          probe_read "ec2:DescribeVolumes"    aws ec2 describe-volumes   --region "$REGION" --volume-ids "$ROOT_VOL" --query 'Volumes[0].Size' --output text
+          probe_read "ec2:DescribeAddresses"  aws ec2 describe-addresses --region "$REGION" --filters "Name=instance-id,Values=$IID" --query 'Addresses[0].PublicIp' --output text
+          probe_read "ec2:DescribeSnapshots"  aws ec2 describe-snapshots --region "$REGION" --owner-ids self --max-items 1 --query 'Snapshots[0].SnapshotId' --output text
+          probe_read "ec2:DescribeInstanceStatus" aws ec2 describe-instance-status --region "$REGION" --instance-ids "$IID" --include-all-instances --query 'InstanceStatuses[0].InstanceState.Name' --output text
+          # Mutations actually performed (dry-run):
+          probe "ec2:CreateSnapshot"          aws ec2 create-snapshot --dry-run --region "$REGION" --volume-id "$ROOT_VOL" --description probe
+          probe "ec2:CreateTags"              aws ec2 create-tags     --dry-run --region "$REGION" --resources "$IID" --tags Key=tv-downsize-probe,Value=probe
+          probe "ec2:StopInstances"           aws ec2 stop-instances  --dry-run --region "$REGION" --instance-ids "$IID"
+          probe "ec2:ModifyInstanceAttribute" aws ec2 modify-instance-attribute --dry-run --region "$REGION" --instance-id "$IID" --instance-type "{\"Value\":\"$TO_TYPE\"}"
+          probe "ec2:StartInstances"          aws ec2 start-instances --dry-run --region "$REGION" --instance-ids "$IID"
+          # SSM family canary (no dry-run exists for SSM; this is a real READ):
+          if ! SSM_OUT=$(aws ssm describe-instance-information --region "$REGION" \
+                --filters "Key=InstanceIds,Values=$IID" \
+                --query 'InstanceInformationList[0].PingStatus' --output text 2>&1); then
+            case "$SSM_OUT" in
+              *AccessDenied*|*UnauthorizedOperation*|*not\ authorized*) echo "  MISSING ssm:DescribeInstanceInformation"; FAILED+=("ssm:DescribeInstanceInformation");;
+              *) echo "  ? ssm:DescribeInstanceInformation — non-IAM error: ${SSM_OUT:0:200}";;
+            esac
+          else
+            echo "  ok ssm:DescribeInstanceInformation — PingStatus=$SSM_OUT (the post-flip retune depends on the SSM family)"
+          fi
+          # sns:Publish probe = the real preflight ping (also tells the operator we started):
+          if ! SNS_OUT=$(aws sns publish --region "$REGION" \
+                --topic-arn "arn:aws:sns:$REGION:$ACCT_ID:tv-prod-alerts" \
+                --subject "🔔 downsize preflight" \
+                --message "🔔 Server downsize preflight started at $(TZ='Asia/Kolkata' date +'%I:%M %p IST') — permission checks running, nothing changed yet. Run: ${{ github.run_id }}" 2>&1); then
+            case "$SNS_OUT" in
+              *AccessDenied*|*AuthorizationError*|*not\ authorized*) echo "  MISSING sns:Publish"; FAILED+=("sns:Publish");;
+              *) echo "  ? sns:Publish — non-IAM error: ${SNS_OUT:0:200}";;
+            esac
+          else
+            echo "  ok sns:Publish — preflight Telegram sent"
+          fi
+          if [ ${#FAILED[@]} -gt 0 ]; then
+            echo "::error::Missing IAM actions for the executing credentials: ${FAILED[*]} — re-dispatch with credential_mode=bootstrap-keys (the default; the OIDC role has ZERO EC2 mutation grants), or grant these to the dispatched role first. NOTHING was changed."
+            exit 1
+          fi
+          # NOTE: ssm:SendCommand/GetCommandInvocation cannot be probed read-only — the
+          # DescribeInstanceInformation canary + deploy-aws.yml prod evidence cover them.
+          # logs:FilterLogEvents (step 9 smoke) is deliberately unprobed — that step is
+          # non-fatal by design.
+
+      # ── STEP 1: post-market guard (aws-upgrade-instance.sh style, IST math from deploy-aws.yml) ──
+      - name: Post-market guard — refuse 09:00-15:35 IST Mon-Fri
+        env:
+          FORCE_MARKET_HOURS: ${{ github.event.inputs.force_market_hours }}
+        run: |
+          if [ "$FORCE_MARKET_HOURS" = "yes" ]; then
+            echo "operator force override — proceeding despite market hours"; exit 0
+          fi
+          DOW=$(TZ='Asia/Kolkata' date +%u); HHMM=$(TZ='Asia/Kolkata' date +%H%M); HHMM=$((10#$HHMM))
+          if [ "$DOW" -le 5 ] && [ "$HHMM" -ge 900 ] && [ "$HHMM" -le 1535 ]; then
+            echo "::error::Refusing: within 09:00-15:35 IST Mon-Fri (a stop interrupts the live session). Re-run post-market or set force_market_hours=yes."
+            exit 1
+          fi
+          echo "outside the market window (dow=$DOW $HHMM IST) — safe"
+
+      # ── STEP 1b: wait out any IN-FLIGHT deploy-aws run BEFORE stopping/modifying ──
+      - name: Wait for deploy-aws to be idle (bounded ~45 min, then proceed loudly)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          # Round-2 fix: a gh failure (e.g. a missing actions:read scope) is a
+          # DISTINCT loud arm — never conflated with "busy" (which used to burn
+          # the full 45 min on every run and left the guard non-functional).
+          # This step runs BEFORE any mutation, so failing here is always safe.
+          GH_ERRS=0
+          for i in $(seq 1 45); do
+            if BUSY=$(gh run list --repo "${{ github.repository }}" --workflow deploy-aws.yml \
+              --json status --jq '[.[] | select(.status=="in_progress" or .status=="queued")] | length' 2>&1); then
+              GH_ERRS=0
+            else
+              GH_ERRS=$((GH_ERRS + 1))
+              echo "::warning::poll $i/45: gh run list FAILED (attempt $GH_ERRS/3): ${BUSY:0:200}"
+              if [ "$GH_ERRS" -ge 3 ]; then
+                echo "::error::gh run list failed 3x in a row — the in-flight-deploy guard CANNOT function (missing actions:read scope? token drift?). Refusing to blind-wait; NOTHING was changed — fix the token scope and re-dispatch."
+                exit 1
+              fi
+              sleep 60; continue
+            fi
+            case "$BUSY" in
+              0) echo "no deploy-aws run in_progress/queued — proceeding"; exit 0;;
+              ''|*[!0-9]*)
+                echo "::error::unexpected gh output '$BUSY' — the deploy-idle guard cannot function; refusing to blind-wait. NOTHING was changed."
+                exit 1;;
+            esac
+            echo "poll $i/45: deploy-aws runs in_progress/queued = $BUSY — waiting 60s"
+            sleep 60
+          done
+          echo "::warning::deploy-aws still busy after ~45 min — PROCEEDING ANYWAY. A flip mid-deploy fails that ONE deploy run harmlessly (self-heals via the next after-close cron / postmerge-catchup); expect a red deploy-aws run and ignore it."
+
+      # ── STEP 2: record current state + pick the RUN MODE.
+      #   full        — box is r8g.large: snapshot + stop + modify + start + retune.
+      #   retune_only — box is ALREADY t4g.medium (a previous run flipped the type
+      #                 but failed before/at the retune): skip snapshot/stop/modify
+      #                 and re-run start + SSM retune + verify. The .env upsert is
+      #                 an idempotent sed, so this continuation is safe to repeat.
+      #                 (Review round 1: the old draft refused here, dead-ending
+      #                 the box on t4g.medium with the 4g QuestDB limit.)
+      - name: Record instance type / root volume / AZ / EIP + pick mode
+        id: rec
+        run: |
+          set -euo pipefail
+          read -r CUR_TYPE STATE AZ <<<"$(aws ec2 describe-instances --region "$REGION" --instance-ids "$IID" \
+            --query 'Reservations[0].Instances[0].[InstanceType,State.Name,Placement.AvailabilityZone]' --output text)"
+          ROOT_DEV=$(aws ec2 describe-instances --region "$REGION" --instance-ids "$IID" \
+            --query 'Reservations[0].Instances[0].RootDeviceName' --output text)
+          VOL_ID=$(aws ec2 describe-instances --region "$REGION" --instance-ids "$IID" \
+            --query "Reservations[0].Instances[0].BlockDeviceMappings[?DeviceName=='${ROOT_DEV}'].Ebs.VolumeId | [0]" --output text)
+          VOL_SIZE=$(aws ec2 describe-volumes --region "$REGION" --volume-ids "$VOL_ID" --query 'Volumes[0].Size' --output text)
+          EIP=$(aws ec2 describe-addresses --region "$REGION" --filters "Name=instance-id,Values=$IID" \
+            --query 'Addresses[0].PublicIp' --output text)
+          echo "type=$CUR_TYPE state=$STATE az=$AZ root=$ROOT_DEV vol=$VOL_ID size=${VOL_SIZE}GB eip=$EIP"
+          if [ "$CUR_TYPE" = "$FROM_TYPE" ]; then
+            MODE=full
+          elif [ "$CUR_TYPE" = "$TO_TYPE" ]; then
+            MODE=retune_only
+            echo "box is ALREADY $TO_TYPE — continuing in RETUNE-ONLY mode (start + QDB retune + verify; no snapshot/stop/modify)"
+          else
+            echo "::error::expected $FROM_TYPE or $TO_TYPE, found $CUR_TYPE — refusing (unknown state; investigate manually)"
+            exit 1
+          fi
+          [ "$EIP" = "$EXPECTED_EIP" ] || { echo "::error::EIP is $EIP, expected $EXPECTED_EIP — Dhan static-IP drift; refusing"; exit 1; }
+          case "$STATE" in
+            running|stopped) echo "initial power state: $STATE (both tolerated)";;
+            *) echo "::error::instance is mid-transition ($STATE) — re-dispatch once it settles"; exit 1;;
+          esac
+          { echo "vol_id=$VOL_ID"; echo "az=$AZ"; echo "vol_size=$VOL_SIZE"; echo "initial_state=$STATE"; echo "mode=$MODE"; } >> "$GITHUB_OUTPUT"
+
+      # ── STEP 3: stop FIRST (clear stop-protection — aws-upgrade-instance.sh
+      # pattern); full mode only. Review round 6: the stop now PRECEDES the
+      # snapshot — a stop is benign/reversible (EBS + data survive; step 9b
+      # restores/reports the power state), and snapshotting a STOPPED volume
+      # gives a clean, crash-consistency-free rollback image with no in-flight
+      # writes. SKIPPED when already stopped (the normal post-16:30 IST state).
+      # The LIVE state is re-read here (not steps.rec) because a queued
+      # deploy-aws dispatch can self-start the box between the record step and now.
+      - name: Stop instance (no-op if already stopped; snapshot follows the stop)
+        if: steps.rec.outputs.mode == 'full'
+        run: |
+          set -euo pipefail
+          CUR=$(aws ec2 describe-instances --region "$REGION" --instance-ids "$IID" \
+            --query 'Reservations[0].Instances[0].State.Name' --output text)
+          if [ "$CUR" = "stopped" ]; then
+            echo "already stopped — snapshot proceeds immediately on the clean stopped volume"
+            exit 0
+          fi
+          aws ec2 modify-instance-attribute --region "$REGION" --instance-id "$IID" --no-disable-api-stop
+          aws ec2 stop-instances --region "$REGION" --instance-ids "$IID" >/dev/null
+          aws ec2 wait instance-stopped --region "$REGION" --instance-ids "$IID"
+          echo "stopped — snapshot next (clean rollback image)"
+
+      # ── STEP 4: snapshot AFTER the stop (rollback artifact) — full mode only.
+      # ⚠ NO auto-delete exists: the snapshot costs ~$2.5/mo on 50 GB until the
+      # operator deletes it manually after the rollback window (tagged
+      # tv-delete-after=<creation+7d> as the reminder).
+      - name: Snapshot stopped root volume + wait completed + tag
+        id: snap
+        if: steps.rec.outputs.mode == 'full'
+        run: |
+          set -euo pipefail
+          DELETE_AFTER=$(date -u -d "+7 days" +%F)
+          SNAP_ID=$(aws ec2 create-snapshot --region "$REGION" \
+            --volume-id "${{ steps.rec.outputs.vol_id }}" \
+            --description "tickvault pre-downsize rollback $(date -u +%F) run=${{ github.run_id }}" \
+            --tag-specifications "ResourceType=snapshot,Tags=[{Key=Name,Value=tv-prod-pre-downsize-rollback},{Key=tv-rollback,Value=keep-1-week},{Key=tv-delete-after,Value=$DELETE_AFTER},{Key=tv-run,Value=${{ github.run_id }}}]" \
+            --query SnapshotId --output text)
+          # Record the id IMMEDIATELY (before the wait) so a wait-timeout still
+          # leaves the snapshot id in the run outputs + failure Telegram.
+          echo "snap_id=$SNAP_ID" >> "$GITHUB_OUTPUT"
+          echo "snapshot: $SNAP_ID (delete-after $DELETE_AFTER, manual) — waiting for completed (can take many minutes on 50 GB)"
+          # aws ec2 wait snapshot-completed budget = 40 polls x 15s = 10 min; loop it up to 6x (~60 min).
+          for i in 1 2 3 4 5 6; do
+            if aws ec2 wait snapshot-completed --region "$REGION" --snapshot-ids "$SNAP_ID"; then echo done; break; fi
+            [ "$i" = 6 ] && { echo "::error::snapshot not completed within ~60 min — aborting BEFORE the type change (the box is stopped — benign/reversible; step 9b reports/restores the power state; the type is unchanged)"; exit 1; }
+            echo "…still snapshotting (round $i)"
+          done
+
+      - name: Telegram — snapshot done
+        if: steps.rec.outputs.mode == 'full'
+        run: |
+          aws sns publish --region "$REGION" \
+            --topic-arn "arn:aws:sns:$REGION:${{ steps.acct.outputs.id }}:tv-prod-alerts" \
+            --subject "🔔 downsize step 4/9 done" \
+            --message "🔔 The box is stopped and the rollback snapshot ${{ steps.snap.outputs.snap_id }} of the 50 GB disk is COMPLETE at $(TZ='Asia/Kolkata' date +'%I:%M %p IST') — a clean image (no in-flight writes). It is NOT auto-deleted: delete it manually after the rollback week (it costs about ₹210 a month on 50 GB until deleted). Next: the size change. Run: ${{ github.run_id }}"
+
+      # ── STEP 5: modify type — full mode only. The type is READ BACK before
+      # any start (review round 6 — closes the stop→modify race: a modify that
+      # silently did not land must never reach the start step).
+      - name: Modify instance type -> t4g.medium (read-back verified)
+        if: steps.rec.outputs.mode == 'full'
+        run: |
+          set -euo pipefail
+          aws ec2 modify-instance-attribute --region "$REGION" --instance-id "$IID" \
+            --instance-type "{\"Value\":\"$TO_TYPE\"}"
+          POST_TYPE=$(aws ec2 describe-instances --region "$REGION" --instance-ids "$IID" \
+            --query 'Reservations[0].Instances[0].InstanceType' --output text)
+          if [ "$POST_TYPE" != "$TO_TYPE" ]; then
+            echo "::error::type read-back after modify is $POST_TYPE (expected $TO_TYPE) — the modify did NOT land; refusing to start. The box is stopped and unmodified-or-partial: investigate, then re-dispatch."
+            exit 1
+          fi
+          echo "modify landed — instance type reads back $POST_TYPE"
+
+      # ── STEP 6: volume replacement — DELIBERATE NO-OP (see header decision) ──
+      - name: Volume replacement decision record (NO-OP tonight)
+        if: steps.rec.outputs.mode == 'full'
+        run: |
+          cat <<'NOTE'
+          EBS 50->20 GB is NOT performed here: a 50 GB snapshot cannot restore into a
+          20 GB volume (AWS forbids shrink), and a blank 20 GB volume needs an OS on it.
+          Chosen path (executor decision, not operator-quoted): keep the 50 GB root
+          tonight; do the 20 GB volume via terraform terminate-and-recreate (user-data
+          cattle-provision) in the operator post-market erase window, with tonight
+          snapshot as the rollback. Deferral cost: ~+$2.74/mo pre-GST until replaced.
+          NOTE
+
+      # ── STEP 7: start + verify + EIP identity (BOTH modes — the SSM retune needs
+      # the box up; start-instances on a running box is a harmless no-op) ──
+      - name: Start on t4g.medium, wait running + status-ok, verify EIP
+        env:
+          MODE: ${{ steps.rec.outputs.mode }}
+          ACCT_ID: ${{ steps.acct.outputs.id }}
+        run: |
+          set -uo pipefail
+          if ! aws ec2 start-instances --region "$REGION" --instance-ids "$IID" >/dev/null \
+             || ! aws ec2 wait instance-running --region "$REGION" --instance-ids "$IID"; then
+            if [ "$MODE" != "full" ]; then
+              echo "::error::start on $TO_TYPE FAILED in retune-only mode — no flip happened this run, so there is nothing to roll back. Investigate capacity / instance state; the failure Telegram carries the live state."
+              exit 1
+            fi
+            echo "::error::start on $TO_TYPE FAILED (likely capacity) — attempting rollback to $FROM_TYPE"
+            # Review round 6: a failed start can leave the instance in `pending`/
+            # `stopping` — modify-instance-attribute requires `stopped`. Drive it
+            # to stopped first so the rollback cannot die on mere ordering.
+            aws ec2 stop-instances --region "$REGION" --instance-ids "$IID" >/dev/null 2>&1 || true
+            aws ec2 wait instance-stopped --region "$REGION" --instance-ids "$IID" || true
+            aws ec2 modify-instance-attribute --region "$REGION" --instance-id "$IID" --instance-type "{\"Value\":\"$FROM_TYPE\"}" || true
+            aws ec2 start-instances --region "$REGION" --instance-ids "$IID" >/dev/null || true
+            aws ec2 wait instance-running --region "$REGION" --instance-ids "$IID" || true
+            # Review round 1: VERIFY the rollback actually landed before claiming it.
+            RB_TYPE=$(aws ec2 describe-instances --region "$REGION" --instance-ids "$IID" \
+              --query 'Reservations[0].Instances[0].InstanceType' --output text 2>/dev/null || echo unknown)
+            RB_STATE=$(aws ec2 describe-instances --region "$REGION" --instance-ids "$IID" \
+              --query 'Reservations[0].Instances[0].State.Name' --output text 2>/dev/null || echo unknown)
+            if [ "$RB_TYPE" = "$FROM_TYPE" ] && [ "$RB_STATE" = "running" ]; then
+              aws sns publish --region "$REGION" --topic-arn "arn:aws:sns:$REGION:$ACCT_ID:tv-prod-alerts" \
+                --subject "🆘 downsize FAILED — rolled back (verified)" \
+                --message "🆘 The smaller server type could not start (capacity). VERIFIED rolled back: the box is $RB_TYPE and running, unchanged. Nothing else was modified. Run: ${{ github.run_id }}"
+            else
+              aws sns publish --region "$REGION" --topic-arn "arn:aws:sns:$REGION:$ACCT_ID:tv-prod-alerts" \
+                --subject "🆘 downsize FAILED — ROLLBACK NOT CONFIRMED" \
+                --message "🆘 The smaller server type could not start AND the rollback could NOT be confirmed. The box is currently type $RB_TYPE, power $RB_STATE. Manual action needed: set the type back to $FROM_TYPE and start it (aws ec2 modify-instance-attribute then start-instances), or re-run scripts/aws-upgrade-instance.sh --from $TO_TYPE --to $FROM_TYPE --force. Run: ${{ github.run_id }}"
+            fi
+            exit 1
+          fi
+          # instance-status-ok wait budget = 40 polls x 15s = 10 min; a COLD t4g
+          # first boot can exceed one budget — loop up to 3x (~30 min) before
+          # declaring failure (review round 6).
+          STATUS_OK=no
+          for i in 1 2 3; do
+            if aws ec2 wait instance-status-ok --region "$REGION" --instance-ids "$IID"; then STATUS_OK=yes; break; fi
+            echo "…still waiting for instance-status-ok (round $i/3 — cold boot can exceed one wait budget)"
+          done
+          if [ "$STATUS_OK" != yes ]; then
+            echo "::error::instance-status-ok not reached within ~30 min on $TO_TYPE — the box is running but unhealthy; re-dispatch retries retune-only, or investigate the console"
+            exit 1
+          fi
+          NEW_TYPE=$(aws ec2 describe-instances --region "$REGION" --instance-ids "$IID" \
+            --query 'Reservations[0].Instances[0].InstanceType' --output text)
+          [ "$NEW_TYPE" = "$TO_TYPE" ] || { echo "::error::post-flip type is $NEW_TYPE"; exit 1; }
+          EIP_AFTER=$(aws ec2 describe-addresses --region "$REGION" --filters "Name=instance-id,Values=$IID" \
+            --query 'Addresses[0].PublicIp' --output text)
+          if [ "$EIP_AFTER" != "$EXPECTED_EIP" ]; then
+            aws sns publish --region "$REGION" --topic-arn "arn:aws:sns:$REGION:$ACCT_ID:tv-prod-alerts" \
+              --subject "🆘 downsize: STATIC IP CHANGED" \
+              --message "🆘 After the resize the box public IP is $EIP_AFTER, expected $EXPECTED_EIP. The Dhan static-IP whitelist is broken — re-associate $EXPECTED_EIP IMMEDIATELY. Run: ${{ github.run_id }}"
+            echo "::error::EIP changed ($EIP_AFTER) — aborting loudly"
+            exit 1
+          fi
+          # SSM agent online wait (deploy-aws.yml pattern)
+          PING=None
+          for _ in $(seq 1 36); do
+            PING=$(aws ssm describe-instance-information --region "$REGION" \
+              --filters "Key=InstanceIds,Values=$IID" \
+              --query 'InstanceInformationList[0].PingStatus' --output text 2>/dev/null || echo None)
+            [ "$PING" = "Online" ] && break; sleep 5
+          done
+          [ "$PING" = "Online" ] || { echo "::error::SSM agent not Online within 3 min — re-dispatch this workflow to retry (retune-only mode)"; exit 1; }
+
+      # ── STEP 8: SSM — set QDB_MEM_LIMIT=1g in on-box .env + restart stack ──
+      # Pattern = aws-upgrade-instance.sh Step 8 (env upsert) + deploy-aws.yml SSM rules:
+      # single-line commands, escaped quotes only, NO apostrophes; manual poll, never `ssm wait`.
+      # QUESTDB PG CREDS (review round 4 CRITICAL; hardened round 6): docker-compose.yml
+      # HARD-REQUIRES TV_QUESTDB_PG_USER / TV_QUESTDB_PG_PASSWORD ("${VAR:?...}"
+      # interpolations, docker-compose.yml lines ~168-169) on EVERY compose
+      # invocation — they are NEVER persisted to the on-box .env; every proven
+      # bring-up path fetches them from SSM at invocation time (deploy-aws.yml
+      # ~L634, ensure-questdb.sh, infra.rs). Without them the recreate below fails
+      # whole-file interpolation and the retune is unreachable in BOTH full and
+      # retune-only mode. So: fetch both params (--with-decryption) and FAIL LOUDLY
+      # on any SSM fetch failure or empty value (round 6 — the old `|| echo admin`
+      # / `|| echo quest` fallbacks could silently RECREATE PROD QUESTDB ON DEFAULT
+      # CREDS; a failed fetch now aborts named, and the workflow failure Telegram
+      # fires). A `docker compose config -q` interpolation PREFLIGHT still runs
+      # before the recreate. The creds are `export`ed once and INHERITED by the
+      # compose subshells (the aws-upgrade-instance.sh export-then-plain-compose
+      # pattern) — never re-assigned inline on the compose lines.
+      # RESTART VERIFY (round 6): `systemctl restart --no-block` + an immediate
+      # is-active poll could false-pass on the PRE-restart process — the script
+      # captures the pre-restart MainPID and requires is-active AND a CHANGED,
+      # non-zero MainPID before declaring the app up.
+      # READINESS BOUND: the deploy lane expects systemd READY=1 within 180s of boot;
+      # the 300s is-active loop below (60 x 5s) brackets that with margin — if the box
+      # cannot go active well inside 180s on t4g.medium, that is itself a too-tight-
+      # downsize signal, and the step fails loudly. The QuestDB HTTP readiness loop
+      # is 24 x 10s = 240s (round 6 — was 30s, too tight next to the app's 300s
+      # budget for a cold container on a burstable box).
+      - name: SSM — QDB_MEM_LIMIT=1g + recreate questdb + restart app
+        id: ssm
+        run: |
+          CMD_ID=$(aws ssm send-command \
+            --region "$REGION" --instance-ids "$IID" \
+            --document-name "AWS-RunShellScript" \
+            --comment "tickvault downsize qdb-retune run=${{ github.run_id }}" \
+            --parameters 'commands=[
+              "set -euo pipefail",
+              "cd /opt/tickvault",
+              "touch repo/deploy/docker/.env",
+              "grep -q \"^QDB_MEM_LIMIT=\" repo/deploy/docker/.env && sed -i \"s/^QDB_MEM_LIMIT=.*/QDB_MEM_LIMIT=1g/\" repo/deploy/docker/.env || echo \"QDB_MEM_LIMIT=1g\" >> repo/deploy/docker/.env",
+              "if [ -f deploy/docker/.env ]; then grep -q \"^QDB_MEM_LIMIT=\" deploy/docker/.env && sed -i \"s/^QDB_MEM_LIMIT=.*/QDB_MEM_LIMIT=1g/\" deploy/docker/.env || echo \"QDB_MEM_LIMIT=1g\" >> deploy/docker/.env; fi",
+              "chown ec2-user:ec2-user repo/deploy/docker/.env",
+              "TV_QUESTDB_PG_USER=$(aws ssm get-parameter --region ap-south-1 --name /tickvault/prod/questdb/pg-user --with-decryption --output text --query Parameter.Value) || { echo FATAL: SSM fetch of /tickvault/prod/questdb/pg-user FAILED - refusing to recreate prod QuestDB on default creds; exit 1; }",
+              "TV_QUESTDB_PG_PASSWORD=$(aws ssm get-parameter --region ap-south-1 --name /tickvault/prod/questdb/pg-password --with-decryption --output text --query Parameter.Value) || { echo FATAL: SSM fetch of /tickvault/prod/questdb/pg-password FAILED - refusing to recreate prod QuestDB on default creds; exit 1; }",
+              "if [ -z \"$TV_QUESTDB_PG_USER\" ] || [ -z \"$TV_QUESTDB_PG_PASSWORD\" ]; then echo FATAL: SSM returned an EMPTY QuestDB credential - refusing to recreate prod QuestDB on default creds; exit 1; fi",
+              "export TV_QUESTDB_PG_USER TV_QUESTDB_PG_PASSWORD",
+              "(cd repo/deploy/docker && docker compose config -q) || { echo FATAL: compose interpolation preflight failed - QuestDB PG creds missing or compose file invalid; exit 1; }",
+              "(cd repo/deploy/docker && timeout 600 docker compose up -d --no-deps tv-questdb)",
+              "for i in $(seq 1 24); do if curl -fsS \"http://127.0.0.1:9000/exec?query=SELECT%201\" >/dev/null 2>&1; then echo QUESTDB-UP; break; fi; sleep 10; if [ $i -eq 24 ]; then echo FATAL: QuestDB not responding within 240s after retune; exit 1; fi; done",
+              "QDB_LIMIT_BYTES=$(docker inspect tv-questdb --format \"{{.HostConfig.Memory}}\")",
+              "echo MEMLIMIT=$QDB_LIMIT_BYTES",
+              "if [ \"$QDB_LIMIT_BYTES\" != \"1073741824\" ]; then echo FATAL: QuestDB container memory limit is $QDB_LIMIT_BYTES bytes but 1073741824 = 1g was required. The .env upsert or compose recreate did NOT take effect; exit 1; fi",
+              "systemctl daemon-reload",
+              "OLD_PID=$(systemctl show -p MainPID --value tickvault 2>/dev/null || echo 0)",
+              "systemctl restart tickvault --no-block",
+              "READY_OK=no; for i in $(seq 1 60); do NEW_PID=$(systemctl show -p MainPID --value tickvault 2>/dev/null || echo 0); if systemctl is-active --quiet tickvault && [ \"$NEW_PID\" != \"0\" ] && [ \"$NEW_PID\" != \"$OLD_PID\" ]; then READY_OK=yes; break; fi; sleep 5; done",
+              "if [ \"$READY_OK\" != yes ]; then echo FATAL: tickvault not active as a FRESH process within 300s - is-active alone can reflect the pre-restart PID so both is-active and a changed MainPID are required; journalctl -u tickvault.service -n 120 --no-pager --output=cat || true; exit 1; fi",
+              "echo APP-RESTARTED old_pid=$OLD_PID new_pid=$NEW_PID",
+              "curl -fsS --max-time 5 http://127.0.0.1:3001/health || echo \"WARN: on-box health probe failed (API may be auth-gated or still warming)\"",
+              "echo DOWNSIZE-BOX-OK"
+            ]' \
+            --query 'Command.CommandId' --output text)
+          echo "command_id=$CMD_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for SSM completion (manual poll, ~25 min budget) # = deploy-aws.yml pattern
+        continue-on-error: true
+        run: |
+          for i in $(seq 1 240); do
+            STATUS=$(aws ssm get-command-invocation --region "$REGION" \
+              --command-id "${{ steps.ssm.outputs.command_id }}" --instance-id "$IID" \
+              --query Status --output text 2>/dev/null || echo Pending)
+            echo "poll $i/240: $STATUS"
+            case "$STATUS" in Success|Failed|Cancelled|TimedOut) exit 0;; esac
+            sleep 5
+          done
+
+      - name: Fetch SSM output + fail loudly on box-side error # = deploy-aws.yml pattern
+        if: always() && steps.ssm.outputs.command_id != ''
+        run: |
+          STATUS=$(aws ssm get-command-invocation --region "$REGION" \
+            --command-id "${{ steps.ssm.outputs.command_id }}" --instance-id "$IID" --query Status --output text)
+          echo "===== status: $STATUS ====="
+          BOX_OUT=$(aws ssm get-command-invocation --region "$REGION" \
+            --command-id "${{ steps.ssm.outputs.command_id }}" --instance-id "$IID" \
+            --query StandardOutputContent --output text || true)
+          echo "$BOX_OUT"
+          aws ssm get-command-invocation --region "$REGION" \
+            --command-id "${{ steps.ssm.outputs.command_id }}" --instance-id "$IID" \
+            --query StandardErrorContent --output text || true
+          [ "$STATUS" = "Success" ] || { echo "::error::on-box retune/restart failed — re-dispatch this workflow (retune-only mode) once the cause is fixed"; exit 1; }
+          # Round-2 fix (Rule-11 false-OK class): the success Telegram claims the
+          # database cap "is now confirmed at 1 GB" — CONFIRM it here, workflow-side,
+          # on top of the on-box assertion (defense in depth against a truncated /
+          # rewritten on-box script silently skipping the check).
+          case "$BOX_OUT" in
+            *MEMLIMIT=1073741824*) echo "QuestDB 1g limit CONFIRMED (MEMLIMIT=1073741824 in the box output)";;
+            *) echo "::error::box output does not carry MEMLIMIT=1073741824 — the QuestDB 1g retune is NOT confirmed; refusing to report success. Re-dispatch this workflow (retune-only mode)."; exit 1;;
+          esac
+
+      # ── STEP 9: health verify. deploy-aws.yml has NO /health-over-EIP pattern
+      # (the SG does not expose :3001 publicly); the honest verify is the SSM
+      # systemd probe (inside the command above) + the LOG-INGESTION smoke below.
+      - name: Log-ingestion smoke (non-fatal) # = deploy-aws.yml pattern
+        run: |
+          set +e
+          START_MS=$(date +%s%3N); FOUND=0
+          for i in $(seq 1 12); do
+            sleep 25
+            COUNT=$(aws logs filter-log-events --region "$REGION" \
+              --log-group-name /tickvault/prod/app --log-stream-names "$IID/app" \
+              --start-time "$START_MS" --limit 1 --query 'length(events)' --output text 2>/dev/null || echo 0)
+            [ "${COUNT:-0}" != "0" ] && [ "${COUNT:-0}" != "None" ] && FOUND=1 && break
+          done
+          [ "$FOUND" -eq 1 ] && echo "log shipper alive" || echo "::warning::no fresh app log events within ~5 min — check CW agent"
+          exit 0
+
+      # ── STEP 9b: explicit FINAL power-state decision — runs on SUCCESS AND
+      # FAILURE (review round 1: was success-only, which left an initially-
+      # stopped box burning overnight on any post-start failure). A stopped box
+      # also cannot OOM on an un-retuned 4g QuestDB limit. Review round 6:
+      #   - a FAILED re-stop now FAILS THE RUN (exit 1) so the success Telegram
+      #     can never claim "switched off again" while the box runs (the failure
+      #     Telegram reports the real live state instead);
+      #   - the final LIVE state is read back and exported as `final_state` for
+      #     the success message (never assumed from intent);
+      #   - an initially-RUNNING box that a failure left STOPPED is reported
+      #     honestly as stopped + why — deliberately NOT auto-restarted after a
+      #     failed flip (operator/08:30 IST cron restarts it consciously).
+      - name: Restore initial power state (stop again if stopped at start)
+        id: pwr
+        if: always()
+        env:
+          INITIAL_STATE: ${{ steps.rec.outputs.initial_state }}
+        run: |
+          set -uo pipefail
+          if [ -z "${INITIAL_STATE:-}" ]; then
+            echo "record step never ran — nothing was started by this run; no power-state decision to make"
+            exit 0
+          fi
+          read_live() {
+            aws ec2 describe-instances --region "$REGION" --instance-ids "$IID" \
+              --query 'Reservations[0].Instances[0].State.Name' --output text 2>/dev/null || echo unknown
+          }
+          if [ "$INITIAL_STATE" = "stopped" ]; then
+            echo "initial state was stopped — stopping the box again (schedule parity; applies on success AND failure)"
+            RESTOP_OK=yes
+            aws ec2 stop-instances --region "$REGION" --instance-ids "$IID" >/dev/null || RESTOP_OK=no
+            if [ "$RESTOP_OK" = "yes" ]; then
+              aws ec2 wait instance-stopped --region "$REGION" --instance-ids "$IID" || RESTOP_OK=no
+            fi
+            LIVE=$(read_live)
+            echo "final_state=$LIVE" >> "$GITHUB_OUTPUT"
+            if [ "$RESTOP_OK" != "yes" ] || [ "$LIVE" != "stopped" ]; then
+              echo "::error::re-stop did NOT land — the box is '$LIVE'. Marking the run FAILED so no success message can claim it was switched off; stop it manually (aws ec2 stop-instances) or it burns hours until the next 16:30 IST weekday cron."
+              exit 1
+            fi
+            echo "stopped (verified) — next self-start per the 08:30 IST weekday cron / a queued deploy dispatch"
+          else
+            LIVE=$(read_live)
+            echo "final_state=$LIVE" >> "$GITHUB_OUTPUT"
+            if [ "$LIVE" = "running" ]; then
+              echo "initial state was running — leaving the box running (16:30 IST cron / operator owns it)"
+            else
+              echo "::warning::initial state was RUNNING but the box is '$LIVE' now — a failed step left it that way. Deliberately NOT auto-restarting after a failed flip (restart consciously: aws ec2 start-instances, a re-dispatch of this workflow, or the 08:30 IST weekday cron)."
+            fi
+          fi
+
+      # ── STEP 10: final Telegram. The power line reports the VERIFIED live
+      # state from step 9b (a failed re-stop fails the run, so this success
+      # message can never claim "off" while the box runs — round 6).
+      - name: Telegram — downsize complete
+        if: success()
+        env:
+          SNAP_ID: ${{ steps.snap.outputs.snap_id }}
+          INITIAL_STATE: ${{ steps.rec.outputs.initial_state }}
+          MODE: ${{ steps.rec.outputs.mode }}
+          FINAL_STATE: ${{ steps.pwr.outputs.final_state }}
+        run: |
+          IST_TIME="$(TZ='Asia/Kolkata' date +'%I:%M %p IST')"
+          SNAP="${SNAP_ID:-none this run (retune-only continuation — the flip run took it)}"
+          FINAL="${FINAL_STATE:-unknown}"
+          if [ "${INITIAL_STATE}" = "stopped" ]; then
+            if [ "$FINAL" = "stopped" ]; then
+              FINAL_LINE="The box was off before this change and is verified OFF again — it will come up on its own at the usual 8:30 AM start."
+            else
+              FINAL_LINE="⚠ The box was off before this change but currently reads ${FINAL} — check it and switch it off manually if you do not want it running."
+            fi
+          else
+            FINAL_LINE="The box stays running (verified ${FINAL}) and will switch off on its usual 4:30 PM schedule."
+          fi
+          if [ "$MODE" = "retune_only" ]; then
+            HEAD_LINE="✅ Retune-only continuation finished: the server was already the smaller size (t4g.medium); the database cap is now confirmed at 1 GB"
+          else
+            HEAD_LINE="✅ The server is now the smaller size (t4g.medium) with the database capped at 1 GB"
+          fi
+          aws sns publish --region "$REGION" \
+            --topic-arn "arn:aws:sns:$REGION:${{ steps.acct.outputs.id }}:tv-prod-alerts" \
+            --subject "✅ server downsized" \
+            --message "${HEAD_LINE}, done at ${IST_TIME}. Static IP unchanged. Rollback snapshot: ${SNAP} — NOT auto-deleted: delete it manually after the rollback week (about ₹210 a month on 50 GB until you do). Disk stays 50 GB tonight — the 20 GB fresh-disk step happens in your erase window. ${FINAL_LINE} Run: ${{ github.run_id }}"
+
+      # Review round 1: the failure Telegram reports the ACTUAL live end state
+      # (type + power), never a blanket rollback claim — a post-flip failure
+      # leaves the box on t4g.medium WITHOUT a rollback, and the message says so
+      # plus how to finish (re-dispatch = retune-only mode).
+      - name: Telegram — failure (reports ACTUAL end state)
+        if: failure()
+        env:
+          SNAP_ID: ${{ steps.snap.outputs.snap_id }}
+        run: |
+          IST_TIME="$(TZ='Asia/Kolkata' date +'%I:%M %p IST')"
+          LIVE_TYPE=$(aws ec2 describe-instances --region "$REGION" --instance-ids "$IID" \
+            --query 'Reservations[0].Instances[0].InstanceType' --output text 2>/dev/null || echo unknown)
+          LIVE_STATE=$(aws ec2 describe-instances --region "$REGION" --instance-ids "$IID" \
+            --query 'Reservations[0].Instances[0].State.Name' --output text 2>/dev/null || echo unknown)
+          SNAP="${SNAP_ID:-not created this run}"
+          case "$LIVE_TYPE" in
+            "$TO_TYPE")   NEXT_LINE="The box IS on the new smaller size but the database retune may NOT have landed — re-run this workflow: it continues safely in retune-only mode. Do not leave it running long with the old 4 GB database cap." ;;
+            "$FROM_TYPE") NEXT_LINE="The box is still the ORIGINAL size — nothing irreversible happened; fix the named cause in the run log and re-dispatch." ;;
+            *)            NEXT_LINE="The box size could not be read — check the AWS console before acting." ;;
+          esac
+          aws sns publish --region "$REGION" \
+            --topic-arn "arn:aws:sns:$REGION:${{ steps.acct.outputs.id }}:tv-prod-alerts" \
+            --subject "🆘 downsize FAILED" \
+            --message "🆘 The server downsize hit a problem at ${IST_TIME}. Actual state right now: size ${LIVE_TYPE}, power ${LIVE_STATE}. ${NEXT_LINE} Rollback snapshot: ${SNAP} (safe either way). Run: ${{ github.run_id }}" || true

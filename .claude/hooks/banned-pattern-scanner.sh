@@ -135,14 +135,15 @@ scan_prod_code() {
 #   crates/storage/src/tick_persistence.rs  — per-tick ILP append
 #   crates/storage/src/tick_row_builder.rs  — per-tick ILP row build
 #   crates/storage/src/ws_frame_spill.rs    — per-frame WAL append
-#   crates/app/src/groww_bridge.rs          — per-tick Groww NDJSON consume path
+# (crates/app/src/groww_bridge.rs — the per-tick Groww NDJSON consume path — was
+#  DELETED 2026-07-15 with the Groww live feed; its alternative is removed below.)
 # Cold path within core (auth/, instrument/, notification/, historical/) is NOT hot path.
 # Cold path within trading (oms/) — order placement is network-I/O-bound, not
 # per-tick latency-critical (pre-existing documented exclusion, kept).
 # NOTE: keep this regex a flat '|'-separated list of alternatives with NO
 # nested groups — hot-path-scanner-selftest.sh splits it on '|' to verify
 # every alternative matches at least one real file.
-HOT_PATH_INCLUDE_REGEX='^crates/core/src/parser/|^crates/core/src/pipeline/|^crates/core/src/websocket/|^crates/trading/|^crates/storage/src/tick_persistence\.rs$|^crates/storage/src/tick_row_builder\.rs$|^crates/storage/src/ws_frame_spill\.rs$|^crates/app/src/groww_bridge\.rs$'
+HOT_PATH_INCLUDE_REGEX='^crates/core/src/parser/|^crates/core/src/pipeline/|^crates/core/src/websocket/|^crates/trading/|^crates/storage/src/tick_persistence\.rs$|^crates/storage/src/tick_row_builder\.rs$|^crates/storage/src/ws_frame_spill\.rs$'
 HOT_PATH_EXCLUDE_REGEX='^crates/trading/src/oms/'
 
 scan_hot_path() {

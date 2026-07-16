@@ -94,6 +94,12 @@ pub mod day_ohlc_orchestrator;
 // cross-check retired under 4-IDX_I LOCKED_UNIVERSE (operator lock 2026-05-15).
 // Bhavcopy is NSE_FNO-only; no F&O subscriptions remain to cross-check.
 pub mod boot_helpers;
+/// Once-per-trading-day delivery markers for daily scheduled tasks
+/// (Telegram cleanliness overhaul, coordinator-relayed directive
+/// 2026-07-15). Fail-open advisory files under `data/state/daily/` —
+/// the 15:40 timeframe check's catch-up arm consults them so a
+/// post-15:40 restart never re-fires an already-delivered daily card.
+pub mod daily_task_marker;
 /// Dhan runtime activation watcher (PR-2) — dormant supervisor that keeps the
 /// Dhan lane's running flag honest across runtime toggles and enforces the
 /// Dhan-disable safety gate at the supervisor layer (operator 2026-06-21/24).
@@ -117,36 +123,18 @@ pub mod dhan_intraday_parse;
 /// TokenManager → renewal + mid-session watchdog → REST canary +
 /// spot_1m_rest + option_chain_1m — WITHOUT any WebSocket lane.
 pub mod dhan_rest_stack;
-/// Groww runtime activation watcher — feed toggle cold-starts/teardowns the
-/// whole Groww lane live (operator 2026-06-24). Default-OFF; dormant until enabled.
-pub mod groww_activation;
-/// Groww second-feed bridge — consumer side (operator lock §32). Default-OFF.
-pub mod groww_bridge;
-/// Fleet-scoped Telegram alert coalescing for the Groww auto-scale fleet
-/// (§34, exam-fix 2026-07-06): reject/connected transitions across ALL fleet
-/// connections aggregate into at most ONE Telegram per 60s window per
-/// direction; single-connection semantics untouched.
-pub mod groww_fleet_alerts;
-/// Groww NATIVE-RUST shadow client runner (PR-R1 parity migration, operator
-/// "go" 2026-07-04 — `groww-second-feed-scope-2026-06-19.md` §35). Default-OFF
-/// behind `[feeds] groww_native_shadow`.
-pub mod groww_native_shadow;
-/// Groww auto-scale ladder FSM + gates + restart rehydration (§34, PR-2 of
-/// `.claude/plans/active-plan-groww-autoscale.md`). Default-OFF behind
-/// `[feeds.groww.scale] enabled`.
-pub mod groww_scale_ladder;
-/// Groww scale-FLEET dual-instance SSM lock gate (Session-B fix #1,
-/// operator go 2026-07-04): refuses the multi-connection fleet spawn when a
-/// peer instance already holds `/tickvault/<env>/instance-lock-groww-scale`
-/// (GROWW-SCALE-05, fail-closed; single-connection fallback).
-pub mod groww_scale_lock;
-/// Groww Python-sidecar auto-launcher + supervisor (operator lock §32 +
-/// "no manual commands" 2026-06-19). Default-OFF.
-pub mod groww_sidecar_supervisor;
-pub mod scale_test_preflight;
+/// `[groww_universe]` process-global daily Groww watch-set + shared-master
+/// rider (2026-07-15 live-feed retirement re-home of the activation daily
+/// build loop + the sole persist_groww_instruments caller).
+pub mod groww_universe;
+pub mod groww_watch_paths;
 /// Shared per-seal routing for BOTH feeds (Dhan + Groww) — the single
 /// `route_seal` body the two `on_seal` call sites invoke (C2, behavior-preserving).
 pub mod seal_routing;
+/// Pure shutdown classifier (Telegram cleanliness overhaul, 2026-07-15):
+/// signal kind × runtime source × IST clock × trading calendar →
+/// `ShutdownClass`. Fails toward ExternalStop (loud) on any doubt.
+pub mod shutdown_class;
 // PR #4 (2026-05-19): depth-20 / depth-200 modules DELETED (operator-locked
 // per websocket-connection-scope-lock.md — 4-IDX_I uses 1 main-feed conn
 // + 1 order-update conn only).

@@ -108,6 +108,10 @@ harness = false
 name = "feed_presence"
 harness = false
 
+[[bench]]
+name = "moneyness"
+harness = false
+
 # PR-C3 (2026-07-14): the `ntm_subscription_proof` example entry was deleted
 # with the Dhan instrument chain + the `daily_universe_fetcher` feature
 # (operator retirement directive 2026-07-13, scope-lock amendment §B).

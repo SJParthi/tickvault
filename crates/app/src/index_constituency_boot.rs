@@ -131,24 +131,26 @@ mod tests {
     // order against. The F14 main.rs source-order ratchet + the F13 bound
     // pin SURVIVE below (the MigrationGate contract is unchanged).
 
-    /// F14 ratchet (source-scan on main.rs, wal_reinject ordering pattern):
-    /// the process-global boot-prefix ts-pin migration task MUST be spawned
-    /// BEFORE the Groww activation watcher in `main()` source order, so the
-    /// gate the Groww writer awaits is driven by a task that exists on EVERY
-    /// boot mode — the Groww append gate wait (120s) depends on it.
+    /// F14 ratchet (source-scan on main.rs, wal_reinject ordering pattern),
+    /// retuned 2026-07-15 (Groww live-feed deletion): the activation watcher
+    /// died with the live lane; the surviving gate consumer is the
+    /// `[groww_universe]` daily rider (persist_groww_instruments), so the
+    /// process-global boot-prefix ts-pin migration task MUST still be spawned
+    /// BEFORE the rider spawn in `main()` source order — the Groww writer's
+    /// bounded 120s migration-gate wait depends on it.
     #[test]
-    fn ratchet_ts_pin_migration_spawns_before_groww_watcher() {
+    fn ratchet_ts_pin_migration_spawns_before_groww_universe_rider() {
         let src = include_str!("main.rs");
         let migration = src
             .find("run_index_constituency_ts_pin_migration_at_boot(")
             .expect("the boot-prefix ts-pin migration spawn must exist in main.rs");
-        let watcher = src
-            .find("run_groww_activation_watcher(")
-            .expect("the Groww activation watcher spawn must exist in main.rs");
+        let rider = src
+            .find("spawn_groww_universe_rider(")
+            .expect("the [groww_universe] daily rider spawn must exist in main.rs");
         assert!(
-            migration < watcher,
+            migration < rider,
             "F13/F14 regression: the process-global ts-pin migration task must be \
-             spawned BEFORE the Groww activation watcher in main.rs source order"
+             spawned BEFORE the [groww_universe] daily rider in main.rs source order"
         );
     }
 

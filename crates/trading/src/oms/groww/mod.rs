@@ -42,9 +42,32 @@
 
 pub use tickvault_common::broker_order_events::{BrokerOrderEvent, BrokerOrderStatus, EventSource};
 
+// Orders-area PURE CORE (ORD-PR-2 — GROWW-ORD-*; no transport, no ErrorCode
+// emits yet — those land in ORD-PR-3 once the variants exist):
+pub mod intent_ledger;
+pub mod poll_tiers;
+pub mod reconcile;
+pub mod reference_id;
+pub mod state;
+pub mod types;
+
+// Orders-area TRANSPORT + BUDGET + EXECUTOR (ORD-PR-3 — GROWW-ORD-*). The
+// endpoint PATH strings + HTTP live ONLY in `api_client.rs` (Gate 5); the
+// executor/rate_budget/events lanes contain zero HTTP (paper-lane discipline).
+pub mod api_client;
+pub mod events;
+pub mod executor;
+pub mod rate_budget;
+
 // Area modules land in their own serial PRs, each behind this same feature:
 //   pub mod api_client;    // Orders        (GROWW-ORD-*)
 //   pub mod smart_orders;  // Smart Orders  (GROWW-OCO-*)
-//   pub mod portfolio;     // Portfolio     (GROWW-PORT-*)
-//   pub mod margin;        // Margin        (GROWW-MARG-*)
-//   pub mod user;          // User + Exceptions (GROWW-READY-*)
+
+pub mod margin; // Margin (GROWW-MARG-*)
+
+/// Portfolio area (`GROWW-PORT-*`) — field-inventory probe (item 6c.2).
+pub mod portfolio;
+
+/// User + Exceptions (readiness) — GROWW-READY-* prefix reserved; readiness
+/// reuses the existing SPOT1M codes per its design (§39.3).
+pub mod user;
