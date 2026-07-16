@@ -2791,7 +2791,100 @@ pub fn build_rest_leg_score_lines(
             out.push(to_line(&s.feed, &s.leg, Some(s)));
         }
     }
+    // G6 (fix round 2): the F3 not-measured `info!` moved OUT of this
+    // builder into the AGGREGATION path (`log_rest_leg_measurement_gaps`,
+    // called right after `aggregate_rest_leg_day`) — this builder was
+    // only invoked on the telegram-enabled branch of main.rs, so on a
+    // telegram-disabled boot the §2b always-render contract was satisfied
+    // neither on the card nor in logs.
     out
+}
+
+/// The CANONICAL card pairs whose lines carry MEASURED latency but NO
+/// pull counts (`ok_fetches == -1`, `close_samples > 0`) — the documented
+/// `spot_1m_rest` latency-only fallback source (a forensics-writer outage
+/// window or a pre-2026-07-14 backfill day). These pairs RENDER count-less
+/// on the card (G6, fix round 2) and are logged as latency-only — never
+/// as "not measured" (that log statement was false for exactly this arm).
+#[must_use]
+pub fn latency_only_canonical_rest_pairs(
+    lines: &[tickvault_core::notification::events::RestLegScoreLine],
+) -> Vec<(String, String)> {
+    CANONICAL_DISPLAY
+        .iter()
+        .filter(|(feed, leg)| {
+            let counts_measured = lines
+                .iter()
+                .any(|l| l.feed == *feed && l.leg == *leg && l.ok_fetches >= 0);
+            let latency_measured = lines
+                .iter()
+                .any(|l| l.feed == *feed && l.leg == *leg && l.close_samples > 0);
+            !counts_measured && latency_measured
+        })
+        .map(|(feed, leg)| ((*feed).to_string(), (*leg).to_string()))
+        .collect()
+}
+
+/// F3 log-side always-render contract, re-homed to the AGGREGATION path
+/// (G6, fix round 2) so it fires even when the scorecard Telegram is
+/// disabled — one truthful `info!` per canonical pair that is either
+/// wholly unmeasured (nothing on the card) or latency-only (renders a
+/// count-less delay segment). See the RULE-CONTRACT TENSION note on
+/// `unmeasured_canonical_rest_pairs`.
+pub fn log_rest_leg_measurement_gaps(summaries: &[RestLegDaySummary]) {
+    let lines = build_rest_leg_score_lines(summaries);
+    for (feed, leg) in unmeasured_canonical_rest_pairs(&lines) {
+        info!(
+            %feed,
+            %leg,
+            "rest-leg digest: {feed}/{leg} not measured — omitted from the \
+             scorecard card per the 2026-07-15 cleanliness directive; the \
+             always-render contract is satisfied in logs pending the \
+             rule-file supersession"
+        );
+    }
+    for (feed, leg) in latency_only_canonical_rest_pairs(&lines) {
+        info!(
+            %feed,
+            %leg,
+            "rest-leg digest: {feed}/{leg} latency measured, pull counts \
+             missing (the spot_1m_rest latency-only fallback source) — \
+             renders a count-less delay segment on the scorecard card"
+        );
+    }
+}
+
+/// The four canonical card pairs (display names) the §2b contract names.
+const CANONICAL_DISPLAY: [(&str, &str); 4] = [
+    ("Dhan", "spot candles"),
+    ("Dhan", "option chain"),
+    ("Groww", "spot candles"),
+    ("Groww", "option chain"),
+];
+
+/// The CANONICAL card pairs (Dhan/Groww × spot candles/option chain) with
+/// NOTHING measured today — no pull counts AND no latency samples. Pure so
+/// the F3 not-measured logging is unit-testable.
+///
+/// G6 (fix round 2): a pair on the documented `spot_1m_rest` latency-only
+/// fallback (`ok_fetches == -1`, `close_samples > 0`) is MEASURED — it was
+/// previously misclassified unmeasured here (a false log statement while
+/// its real latency sat in the same lines vec) and simultaneously dropped
+/// from the card. Latency-only pairs are named separately by
+/// [`latency_only_canonical_rest_pairs`].
+#[must_use]
+pub fn unmeasured_canonical_rest_pairs(
+    lines: &[tickvault_core::notification::events::RestLegScoreLine],
+) -> Vec<(String, String)> {
+    CANONICAL_DISPLAY
+        .iter()
+        .filter(|(feed, leg)| {
+            !lines.iter().any(|l| {
+                l.feed == *feed && l.leg == *leg && (l.ok_fetches >= 0 || l.close_samples > 0)
+            })
+        })
+        .map(|(feed, leg)| ((*feed).to_string(), (*leg).to_string()))
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -3719,6 +3812,10 @@ pub async fn run_feed_scoreboard(
         }
     };
     let rest_legs = aggregate_rest_leg_day(&audit_lite, &spot_latency_fallback);
+    // F3 log-side always-render contract (re-homed here by G6, fix
+    // round 2): fires on EVERY aggregation run — including
+    // telegram-disabled boots, where the card never renders at all.
+    log_rest_leg_measurement_gaps(&rest_legs);
     // Dashboard gauge (plan PR-5 "+ dashboard gauge") — /metrics-local
     // (NOT CloudWatch-shipped; the tv_index_futures_selected precedent, so
     // zero alarm/cost impact), set on SAME-DAY runs only (a backfill's
@@ -7049,4 +7146,118 @@ mod tests {
         // Empty summaries still render the four canonical placeholders.
         assert_eq!(build_rest_leg_score_lines(&[]).len(), 4);
     }
+
+    #[test]
+    fn test_unmeasured_canonical_rest_pairs_names_only_sentinel_pairs() {
+        // F3 (2026-07-15 fix round): the card suppresses unmeasured pairs,
+        // so the honest not-measured signal moves to the logs — this pure
+        // helper names exactly the canonical pairs with no measured pull
+        // source (the §2b always-render contract's log-side leg).
+        let summaries = vec![RestLegDaySummary {
+            feed: "groww".to_string(),
+            leg: "spot_1m".to_string(),
+            ok_fetches: 1_496,
+            failed_fetches: 4,
+            named_gaps: 0,
+            rate_limited_hits: 0,
+            late_recovered: 2,
+            close_p50_ms: 1_400,
+            close_p99_ms: 3_200,
+            close_max_ms: 6_200,
+            close_samples: 1_494,
+        }];
+        let lines = build_rest_leg_score_lines(&summaries);
+        assert_eq!(
+            unmeasured_canonical_rest_pairs(&lines),
+            vec![
+                ("Dhan".to_string(), "spot candles".to_string()),
+                ("Dhan".to_string(), "option chain".to_string()),
+                ("Groww".to_string(), "option chain".to_string()),
+            ]
+        );
+        // Every canonical pair measured → nothing to log.
+        let all = ["spot_1m", "chain_1m"];
+        let full: Vec<RestLegDaySummary> = ["dhan", "groww"]
+            .iter()
+            .flat_map(|f| {
+                all.iter().map(|l| RestLegDaySummary {
+                    feed: (*f).to_string(),
+                    leg: (*l).to_string(),
+                    ok_fetches: 5,
+                    failed_fetches: 0,
+                    named_gaps: 0,
+                    rate_limited_hits: 0,
+                    late_recovered: 0,
+                    close_p50_ms: 900,
+                    close_p99_ms: 1_500,
+                    close_max_ms: 1_600,
+                    close_samples: 5,
+                })
+            })
+            .collect();
+        let lines = build_rest_leg_score_lines(&full);
+        assert!(unmeasured_canonical_rest_pairs(&lines).is_empty());
+        // Empty build → all four pairs named.
+        assert_eq!(
+            unmeasured_canonical_rest_pairs(&build_rest_leg_score_lines(&[])).len(),
+            4
+        );
+    }
+
+    #[test]
+    fn test_latency_only_pair_is_measured_not_unmeasured() {
+        // G6 (fix round 2): the documented spot_1m_rest latency-only
+        // fallback (counts -1, latency measured) must classify MEASURED —
+        // logging it "not measured" was a false statement during exactly
+        // the forensics-writer-outage window the fallback exists for. It
+        // is named separately as latency-only instead.
+        let summaries = vec![RestLegDaySummary {
+            feed: "dhan".to_string(),
+            leg: "spot_1m".to_string(),
+            ok_fetches: -1,
+            failed_fetches: -1,
+            named_gaps: -1,
+            rate_limited_hits: -1,
+            late_recovered: -1,
+            close_p50_ms: 1_100,
+            close_p99_ms: 1_800,
+            close_max_ms: 5_000,
+            close_samples: 372,
+        }];
+        let lines = build_rest_leg_score_lines(&summaries);
+        let unmeasured = unmeasured_canonical_rest_pairs(&lines);
+        assert!(
+            !unmeasured.contains(&("Dhan".to_string(), "spot candles".to_string())),
+            "a latency-only pair must never be logged 'not measured': {unmeasured:?}"
+        );
+        // The other three canonical pairs stay honestly unmeasured.
+        assert_eq!(unmeasured.len(), 3);
+        // ...and the latency-only classifier names exactly this pair.
+        assert_eq!(
+            latency_only_canonical_rest_pairs(&lines),
+            vec![("Dhan".to_string(), "spot candles".to_string())]
+        );
+        // A counts-measured pair is never latency-only.
+        let counted = vec![RestLegDaySummary {
+            feed: "dhan".to_string(),
+            leg: "spot_1m".to_string(),
+            ok_fetches: 735,
+            failed_fetches: 0,
+            named_gaps: 0,
+            rate_limited_hits: 0,
+            late_recovered: 0,
+            close_p50_ms: 1_100,
+            close_p99_ms: 1_800,
+            close_max_ms: 5_000,
+            close_samples: 372,
+        }];
+        let lines = build_rest_leg_score_lines(&counted);
+        assert!(latency_only_canonical_rest_pairs(&lines).is_empty());
+    }
+
+    // MERGE RESOLVED 2026-07-15: the FEED-GAP-01 dangling-close sweep
+    // tests died here with their production fns (the gap-episode
+    // machinery retired with the Groww live feed, main #1581); the G6
+    // measurement-gap tests above are KEPT (their fns + the
+    // aggregation-path log call survive the REST-only runtime).
 }

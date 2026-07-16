@@ -70,7 +70,12 @@
       "our parser ignores both fields" is WRONG — the production `OrderUpdateData`
       (`crates/common/src/order_types.rs:306-310`) parses `refLtp`/`tickSize` camelCase-ONLY
       via `#[serde(rename)]`; zero impact holds only because no consumer reads them for
-      decisions. Follow-up (code, not this docs PR): `#[serde(alias)]` for both casings. Also:
+      decisions. Follow-up (code, not this docs PR): `#[serde(alias)]` for both casings.
+      (2026-07-14 follow-up LANDED — implemented NOT via #[serde(alias)] (which
+      duplicate-field-errors on the live both-casings frame) but via the parse-time
+      Value-stage normalizer in crates/core/src/parser/order_update.rs,
+      single-choke-point ratcheted by crates/core/tests/order_update_choke_point_guard.rs.)
+      Also:
       `AlgoOrdNo` is typed `float` on the live table (stable upstream typing error — keep
       tolerant `Option<String>` parsing). See
       `docs/dhan-ref/10-live-order-update-websocket.md` "2026-07-14 Upstream Update".

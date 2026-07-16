@@ -87,7 +87,29 @@ pub const EPISODE_EDIT_FAILURES_FALLBACK_THRESHOLD: u8 = 2;
 /// fresh page and no SMS. Expiry closes the bubble neutrally and writes
 /// NO tombstone, so the next outage opens a FRESH first page (with the
 /// SNS-SMS leg).
+///
+/// R1 (fix round 3, 2026-07-15): the G1 REST-family exemption from this
+/// expiry is NARROWED to the exact case it was built for — see
+/// [`EpisodeFamily::down_stale_expiry_exempt`] for the three-condition
+/// envelope. The restart edge this constant's paragraph describes is
+/// therefore covered again for the REST families too: a rehydrated
+/// REST Down bubble that never receives a post-rehydrate event stale-
+/// closes within this window of the restart (rehydrate resets the
+/// event-less clock), and a later same-day outage opens a FRESH page.
 pub const EPISODE_DOWN_STALE_EXPIRE_SECS: u64 = 1800;
+
+/// NSE session bounds in IST seconds-of-day, derived from the canonical
+/// nanos constants in `tickvault_common::constants` (lockstep by
+/// construction — a bounds change there propagates here at compile time).
+/// Used by the R1 stale-expiry exemption envelope: outside
+/// `[09:15, 15:30)` IST the per-minute REST legs stop firing, so an
+/// event-less REST Down bubble out of session is stale by definition.
+pub const SESSION_START_SECS_OF_DAY_IST: u32 =
+    (tickvault_common::constants::MARKET_OPEN_IST_NANOS / 1_000_000_000) as u32;
+
+/// Exclusive end of the NSE session in IST seconds-of-day (15:30:00).
+pub const SESSION_END_SECS_OF_DAY_IST: u32 =
+    (tickvault_common::constants::MARKET_CLOSE_IST_NANOS / 1_000_000_000) as u32;
 
 /// Boot-bubble render ceiling — characters (2026-07-09 operator escalation:
 /// ONE consolidated boot bubble per boot). Larger than the WS steady ceiling
@@ -133,6 +155,32 @@ pub enum EpisodeFamily {
     /// ≤1 notify/60s upstream. Dynamic like the WS families: snapshotted,
     /// tick-promoted, tick-expired.
     GrowwFeed,
+    /// The Dhan per-minute REST candle/chain pulls as live-edited incident
+    /// bubbles (2026-07-15 coordinator-relayed cleanliness directive): each
+    /// leg's Degraded/Recovered pair folds into ONE bubble per
+    /// `(family, leg)`. The `conn` slot map (G10 doc sync, fix round 2 —
+    /// MUST stay lockstep with `events.rs::rest_slot` /
+    /// `events.rs::chain_rest_slot` and [`Self::slot_desc`]):
+    /// 0 = spot pulls, 1 = option-chain pulls,
+    /// 7 = CHAIN not-served catch-all,
+    /// 8..=11 = SPOT not-served (NIFTY / BANKNIFTY / SENSEX / INDIA VIX),
+    /// 12..=14 = CHAIN not-served (NIFTY / BANKNIFTY / SENSEX),
+    /// 15 = SPOT not-served catch-all. The spot and chain per-symbol
+    /// ranges are DISJOINT (F1) so one leg's recovery can never close the
+    /// other's bubble. Token Criticals stay LEGACY forever (Critical never
+    /// episode-folds). Dynamic like the WS families: snapshotted,
+    /// tick-promoted; Down bubbles are EXEMPT from stale expiry (G1 —
+    /// the routed REST emitters are once-per-episode edge-latched, so an
+    /// event-less hour is a still-failing incident, not a dead bubble).
+    DhanRest,
+    /// The Groww per-minute REST candle/chain/contract pulls — the Groww
+    /// twin of [`Self::DhanRest`], SAME slot map: `conn` 0 = spot,
+    /// 1 = chain, 2 = contracts, 12..=14 = per-underlying CHAIN
+    /// not-served (NIFTY / BANKNIFTY / SENSEX; catch-all 7). Slots
+    /// 8..=11/15 are RESERVED for a future Groww per-symbol SPOT pair —
+    /// they are unused today (G10: the pre-F1 doc wrongly claimed the
+    /// chain pairs lived on 8..=11).
+    GrowwRest,
 }
 
 impl EpisodeFamily {
@@ -141,9 +189,9 @@ impl EpisodeFamily {
     #[must_use]
     pub const fn badge(self) -> &'static str {
         match self {
-            Self::MainFeedWs | Self::OrderUpdateWs => "\u{1f537} DHAN", // 🔷
-            Self::Boot => "\u{1f680}",                                  // 🚀
-            Self::GrowwFeed => "\u{1f7e2} GROWW",                       // 🟢
+            Self::MainFeedWs | Self::OrderUpdateWs | Self::DhanRest => "\u{1f537} DHAN", // 🔷
+            Self::Boot => "\u{1f680}",                                                   // 🚀
+            Self::GrowwFeed | Self::GrowwRest => "\u{1f7e2} GROWW",                      // 🟢
         }
     }
 
@@ -155,6 +203,8 @@ impl EpisodeFamily {
             Self::OrderUpdateWs => "Order confirmations feed",
             Self::Boot => "System boot",
             Self::GrowwFeed => "Groww price feed",
+            Self::DhanRest => "Per-minute candle pull",
+            Self::GrowwRest => "Groww per-minute candle pull",
         }
     }
 
@@ -166,6 +216,8 @@ impl EpisodeFamily {
             Self::OrderUpdateWs => "order_update_ws",
             Self::Boot => "boot",
             Self::GrowwFeed => "groww_feed",
+            Self::DhanRest => "dhan_rest",
+            Self::GrowwRest => "groww_rest",
         }
     }
 
@@ -178,6 +230,8 @@ impl EpisodeFamily {
             "order_update_ws" => Some(Self::OrderUpdateWs),
             "boot" => Some(Self::Boot),
             "groww_feed" => Some(Self::GrowwFeed),
+            "dhan_rest" => Some(Self::DhanRest),
+            "groww_rest" => Some(Self::GrowwRest),
             _ => None,
         }
     }
@@ -199,6 +253,7 @@ impl EpisodeFamily {
         match self {
             Self::MainFeedWs | Self::OrderUpdateWs | Self::Boot => "DOWN",
             Self::GrowwFeed => "not receiving prices",
+            Self::DhanRest | Self::GrowwRest => "failing",
         }
     }
 
@@ -208,6 +263,7 @@ impl EpisodeFamily {
         match self {
             Self::MainFeedWs | Self::OrderUpdateWs | Self::Boot => "drops",
             Self::GrowwFeed => "rejections",
+            Self::DhanRest | Self::GrowwRest => "failed pulls",
         }
     }
 
@@ -221,7 +277,10 @@ impl EpisodeFamily {
     pub const fn counter_noun(self) -> &'static str {
         match self {
             Self::MainFeedWs | Self::OrderUpdateWs | Self::Boot => "reconnect attempts",
-            Self::GrowwFeed => "",
+            // Same FIX-F honesty rationale: the folded NOTIFY count
+            // undercounts the REST legs' real per-minute retry cadence —
+            // the bubble shows only the failed-pull occurrence count.
+            Self::GrowwFeed | Self::DhanRest | Self::GrowwRest => "",
         }
     }
 
@@ -233,6 +292,7 @@ impl EpisodeFamily {
                 "Now: reconnecting automatically"
             }
             Self::GrowwFeed => "Now: retrying automatically",
+            Self::DhanRest | Self::GrowwRest => "Now: retrying every minute",
         }
     }
 
@@ -242,6 +302,7 @@ impl EpisodeFamily {
         match self {
             Self::MainFeedWs | Self::OrderUpdateWs | Self::Boot => "Now: reconnected — confirming…",
             Self::GrowwFeed => "Now: prices arriving again — confirming…",
+            Self::DhanRest | Self::GrowwRest => "Now: pulls succeeding again — confirming…",
         }
     }
 
@@ -251,6 +312,7 @@ impl EpisodeFamily {
         match self {
             Self::MainFeedWs | Self::OrderUpdateWs | Self::Boot => "back",
             Self::GrowwFeed => "streaming again",
+            Self::DhanRest | Self::GrowwRest => "pulling again",
         }
     }
 
@@ -262,7 +324,78 @@ impl EpisodeFamily {
     pub const fn recovered_noun(self) -> &'static str {
         match self {
             Self::MainFeedWs | Self::OrderUpdateWs | Self::Boot => "attempts",
-            Self::GrowwFeed => "",
+            Self::GrowwFeed | Self::DhanRest | Self::GrowwRest => "",
+        }
+    }
+
+    /// G1 (fix round 2, 2026-07-15), NARROWED by R1 (fix round 3): families
+    /// whose DOWN bubbles are ELIGIBLE for exemption from the
+    /// [`EPISODE_DOWN_STALE_EXPIRE_SECS`] stale expiry.
+    ///
+    /// - `Boot`: a hung boot keeps honestly showing ⏳ (pre-existing arm —
+    ///   UNCONDITIONAL in `tick()`; Boot bubbles are never snapshotted and
+    ///   a hung 08:30 boot sits outside the session window by design).
+    /// - `DhanRest` / `GrowwRest`: every routed REST Degraded emitter is
+    ///   once-per-episode EDGE-LATCHED upstream (the escalation / not-served
+    ///   edges fire once and re-arm only on recovery), so a Down bubble
+    ///   legitimately receives ZERO further events for hours while the leg
+    ///   is STILL failing — stale-expiring it edits the phone's last word
+    ///   to "alert closed" mid-outage (Rule-11 false recovery) and strands
+    ///   the eventual Recovered on the legacy lane. Only a Resolve edge
+    ///   may close these bubbles WHILE the exemption envelope holds.
+    ///
+    /// **R1 — the three-condition envelope (applied in `tick()`, not
+    /// here):** a REST Down bubble is exempt only while ALL of:
+    /// 1. this predicate (family eligibility);
+    /// 2. [`EpisodeState::reconfirmed`] — the bubble was created or last
+    ///    received a REAL event in THIS process. The edge latches
+    ///    (FailureEdge / UnderlyingServedTracker) are process-local, so
+    ///    "event-less = still failing" holds only in-process: a REHYDRATED
+    ///    bubble whose leg recovered while the process was down never gets
+    ///    its Resolve — without this condition it would show "failing" all
+    ///    day (Rule-11 false alarm) and swallow the next real outage's
+    ///    page/SMS as a silent edit. A continuing outage re-fires its edge
+    ///    within minutes of restart; the fold reconfirms the bubble.
+    /// 3. in-session ([`in_ist_session`]) — outside `[09:15, 15:30)` IST
+    ///    the per-minute REST legs stop firing, so an event-less Down
+    ///    bubble is stale by definition; a bubble open at session end
+    ///    closes neutrally ~30 min after its last event.
+    ///
+    /// The WS/GrowwFeed families keep expiring: their Down bubbles receive
+    /// per-cooldown fold events while genuinely down, so an event-less
+    /// half hour there really does mean the incident stopped reporting.
+    #[must_use]
+    pub const fn down_stale_expiry_exempt(self) -> bool {
+        matches!(self, Self::Boot | Self::DhanRest | Self::GrowwRest)
+    }
+
+    /// G2 (fix round 2, 2026-07-15): per-slot qualifier naming WHICH pull a
+    /// REST-family bubble tracks — every post-first-page render is
+    /// otherwise family-generic, so concurrent per-slot bubbles (up to 10
+    /// per family under the F1 slot map) would render byte-identical and a
+    /// Resolve edit would erase the only leg/symbol naming. EMPTY for the
+    /// non-REST families (their renders stay byte-identical — ratcheted).
+    /// MUST stay lockstep with `events.rs::rest_slot` / `chain_rest_slot`.
+    #[must_use]
+    pub const fn slot_desc(self, conn: u8) -> &'static str {
+        match self {
+            Self::DhanRest | Self::GrowwRest => match conn {
+                0 => "spot pull",
+                1 => "chain pull",
+                2 => "contract pull",
+                7 => "chain pull (other index)",
+                8 => "spot pull (NIFTY)",
+                9 => "spot pull (BANKNIFTY)",
+                10 => "spot pull (SENSEX)",
+                11 => "spot pull (INDIA VIX)",
+                12 => "chain pull (NIFTY)",
+                13 => "chain pull (BANKNIFTY)",
+                14 => "chain pull (SENSEX)",
+                15 => "spot pull (other index)",
+                // Unknown future slot: honest generic, never a panic.
+                _ => "candle pull",
+            },
+            _ => "",
         }
     }
 }
@@ -290,9 +423,11 @@ pub const BOOT_EPISODE_KEY: EpisodeKey = EpisodeKey {
 #[must_use]
 pub fn episode_config_for(family: EpisodeFamily) -> EpisodeConfig {
     match family {
-        EpisodeFamily::MainFeedWs | EpisodeFamily::OrderUpdateWs | EpisodeFamily::GrowwFeed => {
-            EpisodeConfig::default()
-        }
+        EpisodeFamily::MainFeedWs
+        | EpisodeFamily::OrderUpdateWs
+        | EpisodeFamily::GrowwFeed
+        | EpisodeFamily::DhanRest
+        | EpisodeFamily::GrowwRest => EpisodeConfig::default(),
         EpisodeFamily::Boot => EpisodeConfig {
             edit_min_interval_secs: 0,
             ..EpisodeConfig::default()
@@ -374,6 +509,15 @@ pub struct EpisodeState {
     pub edit_failures: u8,
     /// Down vs Recovering.
     pub phase: EpisodePhase,
+    /// R1 (fix round 3, 2026-07-15): `true` while the episode was created
+    /// or last received a REAL event in THIS process. Cleared by
+    /// [`EpisodeRegistry::rehydrate`]; set again by any folded event.
+    /// Governs the REST-family stale-expiry exemption envelope (see
+    /// [`EpisodeFamily::down_stale_expiry_exempt`]). NOT persisted in the
+    /// snapshot — rehydrate clears it unconditionally, so old snapshots
+    /// need no field and back-compat holds by construction (a rehydrated
+    /// bubble always starts unconfirmed — the safe direction).
+    pub reconfirmed: bool,
 }
 
 impl EpisodeState {
@@ -393,6 +537,7 @@ impl EpisodeState {
             last_edit_ms: 0,
             edit_failures: 0,
             phase: EpisodePhase::Down,
+            reconfirmed: true,
         }
     }
 }
@@ -963,6 +1108,10 @@ impl EpisodeRegistry {
         let state = match inner.get_mut(&key) {
             Some(st) => {
                 st.last_event_ms = now_ms;
+                // R1: a real event landed in THIS process — the bubble is
+                // reconfirmed (restores the REST stale-expiry exemption
+                // for a rehydrated bubble whose outage is continuing).
+                st.reconfirmed = true;
                 st.severity_peak = st.severity_peak.max(severity);
                 match role {
                     EpisodeRole::Open | EpisodeRole::Progress => {
@@ -1119,12 +1268,27 @@ impl EpisodeRegistry {
         // live incident view (typical cause: restart whose clean first
         // connect emits no recovery event). NO tombstone on purpose.
         let stale_ms = cfg.down_stale_expire_secs.saturating_mul(MS_PER_SEC);
+        // R1 (fix round 3): the session check is per-tick, once.
+        let in_session = in_ist_session(now_ms);
         let expired_keys: Vec<EpisodeKey> = inner
             .iter()
             .filter(|(_, st)| {
-                // Boot bubbles never stale-expire — a hung boot keeps
-                // honestly showing ⏳ (retire_boot owns the happy path).
-                st.key.family != EpisodeFamily::Boot
+                // Exemption envelope (G1 narrowed by R1):
+                // - Boot is UNCONDITIONAL — a hung boot keeps honestly
+                //   showing ⏳ (retire_boot owns the happy path; boot
+                //   bubbles are never snapshotted, and an 08:30 boot sits
+                //   outside the session window by design).
+                // - REST families are exempt only while the bubble was
+                //   created / last fed in THIS process (`reconfirmed` —
+                //   the edge latches are process-local, so "event-less =
+                //   still failing" holds only in-process) AND the clock is
+                //   inside the [09:15, 15:30) IST session (outside it the
+                //   REST legs stop firing, so event-less = stale).
+                let exempt = match st.key.family {
+                    EpisodeFamily::Boot => true,
+                    f => f.down_stale_expiry_exempt() && st.reconfirmed && in_session,
+                };
+                !exempt
                     && st.phase == EpisodePhase::Down
                     && now_ms.saturating_sub(st.last_event_ms) >= stale_ms
             })
@@ -1150,9 +1314,20 @@ impl EpisodeRegistry {
     }
 
     /// Rehydrates the registry from decoded snapshot entries (boot path).
-    pub fn rehydrate(&self, entries: Vec<EpisodeState>) {
+    ///
+    /// R1 (fix round 3, 2026-07-15): every rehydrated entry starts
+    /// UNRECONFIRMED (the process-local edge latches restarted, so an
+    /// event-less rehydrated Down bubble may be a recovered leg) and its
+    /// event-less clock is RESET to `now_ms` — the new process's re-fired
+    /// edge (a continuing outage re-escalates within minutes) gets the
+    /// full [`EPISODE_DOWN_STALE_EXPIRE_SECS`] window to fold in and
+    /// reconfirm the bubble; a recovered-while-down leg stale-closes
+    /// neutrally that long after the restart instead of at the first tick.
+    pub fn rehydrate(&self, entries: Vec<EpisodeState>, now_ms: u64) {
         let mut inner = self.lock_inner();
-        for st in entries {
+        for mut st in entries {
+            st.reconfirmed = false;
+            st.last_event_ms = now_ms;
             inner.entry(st.key).or_insert(st);
         }
     }
@@ -1191,6 +1366,30 @@ pub fn fnv1a_hash(s: &str) -> u64 {
 pub struct EpisodeRenderCtx {
     /// Wall-clock epoch milliseconds at render time (injected).
     pub now_ms: u64,
+}
+
+/// `true` when the epoch-ms instant falls inside the NSE session window
+/// `[09:15, 15:30)` IST. Pure — no clock reads. Used by the R1
+/// stale-expiry exemption envelope; a failed IST conversion reads OUT of
+/// session (fail toward the neutral stale close, never an immortal
+/// false-alarm bubble).
+#[must_use]
+pub fn in_ist_session(epoch_ms: u64) -> bool {
+    use chrono::Timelike;
+    let secs = (epoch_ms / MS_PER_SEC) as i64;
+    let Some(offset) =
+        chrono::FixedOffset::east_opt(tickvault_common::constants::IST_UTC_OFFSET_SECONDS)
+    else {
+        return false;
+    };
+    let Some(utc) = chrono::DateTime::<chrono::Utc>::from_timestamp(secs, 0) else {
+        return false;
+    };
+    let secs_of_day = utc
+        .with_timezone(&offset)
+        .time()
+        .num_seconds_from_midnight();
+    (SESSION_START_SECS_OF_DAY_IST..SESSION_END_SECS_OF_DAY_IST).contains(&secs_of_day)
 }
 
 /// Formats an epoch-ms instant as IST 12-hour wall-clock ("10:02 AM").
@@ -1260,9 +1459,21 @@ pub fn render_episode_first_page(event_body: &str) -> String {
     truncate_at_newline_boundary(event_body, EPISODE_FIRST_PAGE_MAX_CHARS)
 }
 
+/// The bubble's subject: the per-slot qualifier for REST families (G2 —
+/// concurrent per-slot bubbles must name WHICH pull), the family feed
+/// description everywhere else (non-REST renders stay byte-identical).
+fn slot_or_feed_desc(key: EpisodeKey) -> &'static str {
+    let slot = key.family.slot_desc(key.conn);
+    if slot.is_empty() {
+        key.family.feed_desc()
+    } else {
+        slot
+    }
+}
+
 fn render_status_lines(state: &EpisodeState, now_line: &str) -> String {
     let badge = state.key.family.badge();
-    let desc = state.key.family.feed_desc();
+    let desc = slot_or_feed_desc(state.key);
     // Per-family phrasing (2026-07-14 noise fold) — the WS families' strings
     // are the exact prior literals, so their render stays byte-identical.
     let headline = state.key.family.down_headline();
@@ -1316,13 +1527,14 @@ pub fn render_episode_recovering(state: &EpisodeState, _ctx: &EpisodeRenderCtx) 
 /// directive 2026-07-14: recovered / edge-cleared messages must carry the
 /// same tag as their trigger). The Boot family keeps its plain
 /// description (🚀 is a milestone marker, not a broker tag).
-fn badged_feed_desc(family: EpisodeFamily) -> String {
-    match family {
-        EpisodeFamily::Boot => family.feed_desc().to_string(),
+fn badged_feed_desc(key: EpisodeKey) -> String {
+    match key.family {
+        EpisodeFamily::Boot => key.family.feed_desc().to_string(),
         // "{badge} — {desc}" — the SAME format the DOWN bubble's status
         // lines lead with (render_status_lines), so the close line reads
-        // identically at a glance.
-        f => format!("{} — {}", f.badge(), f.feed_desc()),
+        // identically at a glance. G2: REST families substitute the
+        // per-slot qualifier so the close names WHICH pull recovered.
+        f => format!("{} — {}", f.badge(), slot_or_feed_desc(key)),
     }
 }
 
@@ -1334,7 +1546,7 @@ pub fn render_episode_stale_closed(state: &EpisodeState) -> String {
     let last = format_ist_12h(state.last_event_ms);
     format!(
         "\u{26aa} {desc} alert closed — no updates since {last} IST. Any new problem will open a fresh alert.",
-        desc = badged_feed_desc(state.key.family),
+        desc = badged_feed_desc(state.key),
     )
 }
 
@@ -1358,7 +1570,7 @@ pub fn render_episode_recovered(state: &EpisodeState, ctx: &EpisodeRenderCtx) ->
     };
     format!(
         "\u{2705} Recovered — {desc} {verb}. Down {dur}{attempts_segment} ({opened}–{closed} IST)",
-        desc = badged_feed_desc(state.key.family),
+        desc = badged_feed_desc(state.key),
         verb = state.key.family.recovered_verb(),
         dur = format_duration_human(down_secs),
     )
@@ -1690,6 +1902,18 @@ mod tests {
 
     fn cfg() -> EpisodeConfig {
         EpisodeConfig::default()
+    }
+
+    /// Epoch ms for 2026-07-15 (a Wednesday trading day) at the given IST
+    /// wall clock — R1 tests need IN-SESSION instants (`NOW` above lands
+    /// at ~21:43 IST, outside the session window).
+    fn ist_ms(h: u32, m: u32) -> u64 {
+        use chrono::TimeZone;
+        let offset =
+            chrono::FixedOffset::east_opt(tickvault_common::constants::IST_UTC_OFFSET_SECONDS)
+                .unwrap();
+        let dt = offset.with_ymd_and_hms(2026, 7, 15, h, m, 0).unwrap();
+        u64::try_from(dt.timestamp_millis()).unwrap()
     }
 
     fn live_state(message_id: Option<i64>) -> EpisodeState {
@@ -2109,6 +2333,283 @@ mod tests {
         assert_eq!(d.action, EpisodeAction::SendFirstPage);
     }
 
+    #[test]
+    fn test_down_stale_expiry_exempt_family_predicate() {
+        // G1 (fix round 2, 2026-07-15): Boot + the REST families are
+        // exempt; the WS/GrowwFeed families keep expiring (their Down
+        // bubbles receive per-cooldown folds while genuinely down).
+        for family in [
+            EpisodeFamily::Boot,
+            EpisodeFamily::DhanRest,
+            EpisodeFamily::GrowwRest,
+        ] {
+            assert!(family.down_stale_expiry_exempt(), "{family:?}");
+        }
+        for family in [
+            EpisodeFamily::MainFeedWs,
+            EpisodeFamily::OrderUpdateWs,
+            EpisodeFamily::GrowwFeed,
+        ] {
+            assert!(!family.down_stale_expiry_exempt(), "{family:?}");
+        }
+    }
+
+    #[test]
+    fn test_tick_never_stale_expires_rest_family_down_bubbles() {
+        // G1 (fix round 2) narrowed by R1 (fix round 3): an IN-PROCESS
+        // (reconfirmed), IN-SESSION REST Down bubble never stale-expires —
+        // the routed emitters are once-per-episode edge-latched, so an
+        // event-less Down bubble here is a STILL-FAILING incident. Only a
+        // Resolve edge may close it while the envelope holds.
+        for family in [EpisodeFamily::DhanRest, EpisodeFamily::GrowwRest] {
+            let k = EpisodeKey { family, conn: 1 };
+            let reg = EpisodeRegistry::new();
+            let opened = ist_ms(9, 30);
+            let _ = reg.apply_event(k, EpisodeRole::Open, Severity::High, 0, opened, &cfg());
+            reg.record_sent(k, Some(42), opened);
+            // Hours past the stale bound, still in-session: STILL live.
+            let far = ist_ms(13, 30);
+            assert!(
+                far - opened > EPISODE_DOWN_STALE_EXPIRE_SECS * 1000,
+                "test setup: must be past the stale bound"
+            );
+            let outcome = reg.tick(far, &cfg());
+            assert!(
+                outcome.expired.is_empty(),
+                "{family:?} reconfirmed in-session Down bubble must never stale-expire"
+            );
+            assert_eq!(reg.live_count(), 1, "{family:?}");
+            // The Resolve edge still closes it via the normal
+            // Recovering → stability-window → green path.
+            let d = reg.apply_event(k, EpisodeRole::Resolve, Severity::Info, 0, far, &cfg());
+            assert!(
+                matches!(d.action, EpisodeAction::Edit { .. }),
+                "{family:?} Resolve must edit the SAME bubble, got {:?}",
+                d.action
+            );
+            let outcome = reg.tick(far + EPISODE_STABILITY_SECS * 1000, &cfg());
+            assert_eq!(outcome.closed.len(), 1, "{family:?} green close");
+        }
+    }
+
+    #[test]
+    fn test_rest_down_bubble_survives_restart_during_continuing_outage() {
+        // R1 scenario 1 (fix round 3): continuing outage across a restart —
+        // the rehydrated bubble starts unreconfirmed with a fresh
+        // event-less clock; the new process's re-fired edge (~3-10 min)
+        // folds into the SAME bubble, reconfirms it, and the exemption is
+        // restored — the bubble lives.
+        let k = EpisodeKey {
+            family: EpisodeFamily::DhanRest,
+            conn: 12,
+        };
+        let reg = EpisodeRegistry::new();
+        let opened = ist_ms(10, 0);
+        let _ = reg.apply_event(k, EpisodeRole::Open, Severity::High, 0, opened, &cfg());
+        reg.record_sent(k, Some(77), opened);
+        // Snapshot round-trip (the real restart path).
+        let json = episode_snapshot::encode(&reg.snapshot());
+        let restart = ist_ms(11, 0);
+        let decoded = episode_snapshot::decode(&json, restart, ist_date_of(restart));
+        assert_eq!(decoded.len(), 1);
+        let reg2 = EpisodeRegistry::new();
+        reg2.rehydrate(decoded, restart);
+        // The re-fired edge lands 8 minutes after restart and FOLDS
+        // (peak was persisted High → no escalation re-page; same bubble).
+        let refire = restart + 8 * 60 * 1000;
+        let d = reg2.apply_event(k, EpisodeRole::Open, Severity::High, 0, refire, &cfg());
+        assert_eq!(
+            d.action,
+            EpisodeAction::Edit {
+                message_id: 77,
+                close: false
+            },
+            "the re-fired edge folds into the rehydrated bubble"
+        );
+        assert!(d.state.reconfirmed, "the fold reconfirms the bubble");
+        // Hours later, in-session, event-less: the exemption is restored —
+        // the bubble lives until its Resolve.
+        let outcome = reg2.tick(ist_ms(15, 0), &cfg());
+        assert!(outcome.expired.is_empty(), "reconfirmed bubble lives");
+        assert_eq!(reg2.live_count(), 1);
+    }
+
+    #[test]
+    fn test_rest_down_bubble_recovered_across_restart_stale_closes_then_fresh_page() {
+        // R1 scenario 2 (fix round 3): the leg recovered while the process
+        // was down (the restart itself fixing it is the common case) — no
+        // post-rehydrate event arrives, so the unreconfirmed bubble
+        // stale-closes neutrally EPISODE_DOWN_STALE_EXPIRE_SECS after the
+        // restart, and a LATER real outage opens a FRESH episode with a
+        // fresh first page (the stale expiry writes NO tombstone).
+        let k = EpisodeKey {
+            family: EpisodeFamily::GrowwRest,
+            conn: 3,
+        };
+        let reg = EpisodeRegistry::new();
+        let opened = ist_ms(10, 0);
+        let _ = reg.apply_event(k, EpisodeRole::Open, Severity::High, 0, opened, &cfg());
+        reg.record_sent(k, Some(88), opened);
+        let json = episode_snapshot::encode(&reg.snapshot());
+        let restart = ist_ms(11, 0);
+        let reg2 = EpisodeRegistry::new();
+        reg2.rehydrate(
+            episode_snapshot::decode(&json, restart, ist_date_of(restart)),
+            restart,
+        );
+        // Just under the window (in-session): still live — the grace for a
+        // continuing outage's re-fired edge.
+        let outcome = reg2.tick(restart + EPISODE_DOWN_STALE_EXPIRE_SECS * 1000 - 1, &cfg());
+        assert!(outcome.expired.is_empty());
+        // At the window (in-session, no event since restart): neutral
+        // stale close.
+        let expire_at = restart + EPISODE_DOWN_STALE_EXPIRE_SECS * 1000;
+        let outcome = reg2.tick(expire_at, &cfg());
+        assert_eq!(outcome.expired.len(), 1, "unreconfirmed bubble expires");
+        assert_eq!(reg2.live_count(), 0);
+        // A LATER same-day REAL outage pages FRESH (no tombstone fold).
+        let d = reg2.apply_event(
+            k,
+            EpisodeRole::Open,
+            Severity::High,
+            0,
+            expire_at + 10 * 60 * 1000,
+            &cfg(),
+        );
+        assert_eq!(
+            d.action,
+            EpisodeAction::SendFirstPage,
+            "a later real outage opens a FRESH episode with a fresh page"
+        );
+    }
+
+    #[test]
+    fn test_rest_down_bubble_stale_closes_after_session_end() {
+        // R1 scenario 3 (fix round 3): the pulls stop at 15:30 IST, so a
+        // Down bubble open at session end never gets another event — it
+        // stale-closes ~30 min after its last event once outside the
+        // session window (even though it is reconfirmed in-process).
+        let k = EpisodeKey {
+            family: EpisodeFamily::DhanRest,
+            conn: 7,
+        };
+        let reg = EpisodeRegistry::new();
+        let opened = ist_ms(15, 4); // the 2026-07-14 expiry-day cutoff class
+        let _ = reg.apply_event(k, EpisodeRole::Open, Severity::High, 0, opened, &cfg());
+        reg.record_sent(k, Some(99), opened);
+        // 15:29 IST (in-session, under the bound): live.
+        let outcome = reg.tick(ist_ms(15, 29), &cfg());
+        assert!(outcome.expired.is_empty());
+        // 15:40 IST: out of session but the bound (15:34) already passed —
+        // the session gate lifts the exemption and the bubble closes.
+        let after_close = ist_ms(15, 40);
+        assert!(
+            after_close - opened >= EPISODE_DOWN_STALE_EXPIRE_SECS * 1000,
+            "test setup: past the stale bound"
+        );
+        let outcome = reg.tick(after_close, &cfg());
+        assert_eq!(
+            outcome.expired.len(),
+            1,
+            "session-end Down bubble stale-closes once out of session"
+        );
+    }
+
+    #[test]
+    fn test_rehydrate_clears_reconfirmed_and_resets_event_clock() {
+        // R1 mechanics: rehydrated entries start unreconfirmed with
+        // last_event_ms reset to the rehydrate instant (the fresh grace
+        // window); fresh + folded episodes are reconfirmed.
+        let fresh = EpisodeState::open(key(), Severity::High, NOW);
+        assert!(fresh.reconfirmed, "fresh episodes start reconfirmed");
+        let reg = EpisodeRegistry::new();
+        let mut st = live_state(Some(5));
+        st.last_event_ms = NOW - 3_600_000;
+        reg.rehydrate(vec![st], NOW);
+        let snap = reg.snapshot();
+        assert!(!snap[0].reconfirmed, "rehydrated entries are unconfirmed");
+        assert_eq!(
+            snap[0].last_event_ms, NOW,
+            "rehydrate resets the event-less clock to the restart instant"
+        );
+        // Any folded event reconfirms.
+        let d = reg.apply_event(key(), EpisodeRole::Progress, Severity::High, 0, NOW, &cfg());
+        assert!(d.state.reconfirmed, "a folded event reconfirms");
+    }
+
+    #[test]
+    fn test_in_ist_session_bounds() {
+        // [09:15, 15:30) IST, inclusive-exclusive; lockstep with the
+        // canonical MARKET_OPEN/CLOSE nanos constants.
+        assert_eq!(SESSION_START_SECS_OF_DAY_IST, 9 * 3600 + 15 * 60);
+        assert_eq!(SESSION_END_SECS_OF_DAY_IST, 15 * 3600 + 30 * 60);
+        assert!(in_ist_session(ist_ms(9, 15)));
+        assert!(in_ist_session(ist_ms(12, 0)));
+        assert!(in_ist_session(ist_ms(15, 29)));
+        assert!(!in_ist_session(ist_ms(15, 30)));
+        assert!(!in_ist_session(ist_ms(9, 14)));
+        assert!(!in_ist_session(ist_ms(21, 43)));
+        assert!(!in_ist_session(0));
+    }
+
+    #[test]
+    fn test_rest_renders_name_the_slot() {
+        // G2 (fix round 2, 2026-07-15): concurrent per-slot REST bubbles
+        // must name WHICH pull — every post-first-page render carries the
+        // per-slot qualifier, so a Resolve edit can never erase the only
+        // leg/symbol naming or read as whole-family recovery.
+        let k = EpisodeKey {
+            family: EpisodeFamily::DhanRest,
+            conn: 12,
+        };
+        let st = {
+            let mut st = EpisodeState::open(k, Severity::High, NOW);
+            st.message_id = Some(1);
+            st
+        };
+        let ctx = EpisodeRenderCtx {
+            now_ms: NOW + 60_000,
+        };
+        let steady = render_episode_steady(&st, &ctx);
+        assert!(
+            steady.contains("\u{1f537} DHAN — chain pull (NIFTY) failing"),
+            "steady must name the slot: {steady}"
+        );
+        let recovered = render_episode_recovered(&st, &ctx);
+        assert!(
+            recovered.contains("\u{1f537} DHAN — chain pull (NIFTY) pulling again"),
+            "green close must name the slot: {recovered}"
+        );
+        let stale = render_episode_stale_closed(&st);
+        assert!(
+            stale.contains("chain pull (NIFTY)"),
+            "stale close must name the slot: {stale}"
+        );
+        // A Groww spot-leg bubble names its own slot + broker.
+        let gk = EpisodeKey {
+            family: EpisodeFamily::GrowwRest,
+            conn: 0,
+        };
+        let gst = EpisodeState::open(gk, Severity::High, NOW);
+        let gsteady = render_episode_steady(&gst, &ctx);
+        assert!(
+            gsteady.contains("\u{1f7e2} GROWW — spot pull failing"),
+            "groww steady must name the slot: {gsteady}"
+        );
+        // Non-REST families keep the family description (byte-identical —
+        // the WS regression ratchet also pins this).
+        let wk = EpisodeKey {
+            family: EpisodeFamily::MainFeedWs,
+            conn: 0,
+        };
+        let wst = EpisodeState::open(wk, Severity::High, NOW);
+        let wsteady = render_episode_steady(&wst, &ctx);
+        assert!(
+            wsteady.contains("\u{1f537} DHAN — Live price feed DOWN"),
+            "WS render must stay family-generic: {wsteady}"
+        );
+    }
+
     // The never-drop pin: FSM is total AND High/Critical Open/Progress
     // never maps to Ignore, for arbitrary state/tombstone/clock inputs.
     proptest::proptest! {
@@ -2421,7 +2922,7 @@ mod tests {
     fn test_registry_rehydrate_and_attempts_hint() {
         let reg = EpisodeRegistry::new();
         let st = live_state(Some(5));
-        reg.rehydrate(vec![st]);
+        reg.rehydrate(vec![st], NOW);
         assert_eq!(reg.live_count(), 1);
         // Rehydrated state edits, not re-sends.
         let d = reg.apply_event(
@@ -2495,6 +2996,8 @@ mod tests {
             EpisodeFamily::OrderUpdateWs,
             EpisodeFamily::Boot,
             EpisodeFamily::GrowwFeed,
+            EpisodeFamily::DhanRest,
+            EpisodeFamily::GrowwRest,
         ] {
             assert_eq!(
                 EpisodeFamily::from_snapshot_label(family.snapshot_label()),
@@ -2507,7 +3010,9 @@ mod tests {
             EpisodeFamily::MainFeedWs
             | EpisodeFamily::OrderUpdateWs
             | EpisodeFamily::Boot
-            | EpisodeFamily::GrowwFeed => (),
+            | EpisodeFamily::GrowwFeed
+            | EpisodeFamily::DhanRest
+            | EpisodeFamily::GrowwRest => (),
         };
         assert_eq!(EpisodeFamily::from_snapshot_label("alien_ws"), None);
         for phase in [EpisodePhase::Down, EpisodePhase::Recovering] {
