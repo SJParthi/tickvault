@@ -269,6 +269,44 @@ jobs:
           path: dist/
           retention-days: 7
 
+      - name: Configure AWS credentials for failure notify (OIDC preferred, keys fallback)
+        # 2026-07-16 gate-integrity sweep: failure-path only — the build job
+        # needs AWS creds solely to publish the SNS page below. Mirror of the
+        # deploy job's credential step (same action + inputs) so it works both
+        # pre- and post-OIDC-migration.
+        if: failure()
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ vars.AWS_REGION || 'ap-south-1' }}
+          role-session-name: tv-github-build-notify-${{ github.run_id }}
+
+      - name: Resolve AWS account id for failure notify
+        # Mirror of the deploy job's `id: acct` step — derives the account id
+        # from the live credentials so the SNS topic ARN needs no secret.
+        if: failure()
+        id: acct_build
+        run: echo "id=$(aws sts get-caller-identity --query Account --output text)" >> "$GITHUB_OUTPUT"
+
+      - name: Notify Telegram on build failure
+        # 2026-07-16 gate-integrity sweep: a BUILD-job failure previously paged
+        # nobody — the only failure notifier lived in the deploy job, so a
+        # compile error / size-cap breach / artifact-upload failure stayed
+        # silent until the ~24h stale-binary-sha watchdog. Mirror of the
+        # deploy job's "Notify Telegram on failure" step.
+        if: failure()
+        run: |
+          SHORT_SHA="${GITHUB_SHA:0:7}"
+          IST_TIME="$(TZ='Asia/Kolkata' date +'%I:%M %p IST')"
+          MSG="🆘 Build FAILED at ${IST_TIME} (version ${SHORT_SHA}) — the new code never reached the box; it keeps running the previous version. What you need to do RIGHT NOW: open the run, read the build error, fix and push. Run: ${{ github.run_id }}"
+          aws sns publish \
+            --region ${{ vars.AWS_REGION || 'ap-south-1' }} \
+            --topic-arn arn:aws:sns:${{ vars.AWS_REGION || 'ap-south-1' }}:${{ steps.acct_build.outputs.id }}:tv-prod-alerts \
+            --subject "🆘 tickvault build FAILED" \
+            --message "$MSG"
+
   guard_market_hours:
     name: Market-hours guard
     runs-on: ubuntu-24.04
