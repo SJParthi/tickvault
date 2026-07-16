@@ -79,39 +79,47 @@ class Authorization(unittest.TestCase):
 
 class ParseView(unittest.TestCase):
     def test_parses_labeled_snapshot(self) -> None:
+        # REST-era snapshot (2026-07-16): today's rows in the three LIVE
+        # tables, totals + per-feed split, the 4-column dedup-key count.
         stdout = (
             "APP=active\n"
-            "TICKS_TODAY=152340\n"
-            'TICKS_BY_FEED="dhan",152000;"groww",340;\n'
-            "C1M=372\n"
-            "C5M=75\n"
-            "C15M=25\n"
-            "C60M=6\n"
-            "C1D=4\n"
-            "DEDUP_KEYS=5\n"
-            "MAX_TPS=5\n"
+            "SPOT_TODAY=1125\n"
+            "CHAIN_TODAY=42000\n"
+            "CONTRACT_TODAY=9000\n"
+            'SPOT_BY_FEED="dhan",750;"groww",375;\n'
+            'CHAIN_BY_FEED="dhan",21000;"groww",21000;\n'
+            'CONTRACT_BY_FEED="groww",9000;\n'
+            "DEDUP_KEYS=4\n"
             "ERRORS_BEGIN\n"
             "Jun 01 11:00 tickvault: WARN something\n"
             "ERRORS_END\n"
         )
         out = handler._parse_view(stdout)
         self.assertEqual(out["app"], "active")
-        self.assertEqual(out["ticks_today"], "152340")
-        self.assertEqual(out["ticks_by_feed"], {"dhan": "152000", "groww": "340"})
-        self.assertEqual(out["candles"]["1m"], "372")
-        self.assertEqual(out["candles"]["1d"], "4")
-        self.assertEqual(out["dedup_key_columns"], "5")
-        self.assertEqual(out["max_ticks_per_second"], "5")
+        self.assertEqual(out["rows_today"], {"spot": "1125", "chain": "42000", "contracts": "9000"})
+        self.assertEqual(out["rows_today_total"], "52125")
+        self.assertEqual(out["rows_by_feed"]["spot"], {"dhan": "750", "groww": "375"})
+        self.assertEqual(out["rows_by_feed"]["chain"], {"dhan": "21000", "groww": "21000"})
+        self.assertEqual(out["rows_by_feed"]["contracts"], {"groww": "9000"})
+        self.assertEqual(out["dedup_key_columns"], "4")
         self.assertEqual(len(out["recent_errors"]), 1)
         self.assertIn("WARN something", out["recent_errors"][0])
 
     def test_empty_stdout_yields_blank_fields(self) -> None:
+        # Box stopped: NO fabricated zeros — the hero shows nothing.
         out = handler._parse_view("")
         self.assertEqual(out["app"], "")
         self.assertEqual(out["dedup_key_columns"], "")
-        self.assertEqual(out["max_ticks_per_second"], "")
-        self.assertEqual(out["ticks_by_feed"], {})
+        self.assertEqual(out["rows_today"], {"spot": "", "chain": "", "contracts": ""})
+        self.assertEqual(out["rows_today_total"], "")
+        self.assertEqual(out["rows_by_feed"], {"spot": {}, "chain": {}, "contracts": {}})
         self.assertEqual(out["recent_errors"], [])
+
+    def test_partial_counts_sum_only_parseable(self) -> None:
+        # One table unreachable (empty value) — the total sums the rest,
+        # never treating an unreachable count as 0-and-green.
+        out = handler._parse_view("SPOT_TODAY=100\nCHAIN_TODAY=\nCONTRACT_TODAY=23\n")
+        self.assertEqual(out["rows_today_total"], "123")
 
     def test_no_error_lines_between_markers(self) -> None:
         out = handler._parse_view("APP=inactive\nERRORS_BEGIN\nERRORS_END\n")
@@ -172,488 +180,138 @@ class ViewCommands(unittest.TestCase):
         self.assertIn("upsertKey%3Dtrue", dedup_cmd)
         self.assertNotIn("upsertKey=true", dedup_cmd)
 
+    def test_dedup_key_query_targets_spot_1m_rest(self) -> None:
+        # REST-era repoint (2026-07-16): the shield reads spot_1m_rest's
+        # 4-column key (ts, security_id, exchange_segment, feed per
+        # DEDUP_KEY_SPOT_1M_REST), not the retired ticks 5-column key.
+        dedup_cmd = next(c for c in handler._VIEW_COMMANDS if "DEDUP_KEYS=" in c)
+        self.assertIn("table_columns(%27spot_1m_rest%27)", dedup_cmd)
+        self.assertNotIn("'ticks'", dedup_cmd)
 
-class Latency(unittest.TestCase):
+    def test_view_commands_target_live_rest_tables(self) -> None:
+        joined = "\n".join(handler._VIEW_COMMANDS)
+        for live in ("spot_1m_rest", "option_chain_1m", "option_contract_1m_rest"):
+            self.assertIn(live, joined, live)
+        # Today windows use the house `ts IN today()` convention.
+        self.assertIn("ts%20IN%20today()", joined)
+
+    def test_db_console_default_query_targets_live_table(self) -> None:
+        html = handler._console_html()
+        self.assertIn("SELECT * FROM spot_1m_rest ORDER BY ts DESC LIMIT 50", html)
+        self.assertNotIn("SELECT * FROM ticks ORDER BY ts DESC LIMIT 50", html)
+
+
+class RestLatency(unittest.TestCase):
+    """REST-era latency snapshot (2026-07-16 cleanup): per-(feed, leg)
+    prompt-pull percentiles from rest_fetch_audit + the KEPT box-wide probes
+    (QuestDB RTT, clock skew, dormant order-placement histogram). The old
+    per-feed WS TCP/TLS probe table, the exchange->received lag-percentile
+    grid over `ticks`, and the tick-path histogram machinery measured
+    retired edges / dead emitters and are gone (see
+    LegacyLiveFeedPanelsRemoved)."""
+
     def test_avg_ns(self) -> None:
         self.assertEqual(handler._avg_ns("1000", "10"), 100.0)
         self.assertIsNone(handler._avg_ns("1000", "0"))
         self.assertIsNone(handler._avg_ns("", ""))
 
-    @staticmethod
-    def _health_json(rows: list) -> str:
-        import json as _json
+    def test_rest_latency_sql_filters_ok_and_sentinel(self) -> None:
+        # outcome='ok' rows only; close_to_data_ms >= 0 drops the -1
+        # not-measured sentinel AND satisfies approx_percentile's
+        # non-negative-input requirement; today window + per-(feed, leg).
+        sql = handler._rest_latency_sql()
+        self.assertIn("from rest_fetch_audit", sql)
+        self.assertIn("outcome = 'ok'", sql)
+        self.assertIn("close_to_data_ms >= 0", sql)
+        self.assertIn("approx_percentile(close_to_data_ms, 0.5, 3)", sql)
+        self.assertIn("approx_percentile(close_to_data_ms, 0.99, 3)", sql)
+        self.assertIn("ts in today()", sql)
+        self.assertIn("group by feed, leg", sql)
 
-        return _json.dumps({"market_open": True, "feeds": rows})
+    def test_latency_commands_rest_era_bounded(self) -> None:
+        joined = "\n".join(handler._LATENCY_COMMANDS)
+        # The audit aggregate is re-emitted as RESTLAT_ROW= labeled lines,
+        # every curl is --max-time bounded, and the box-wide probes are kept.
+        self.assertIn("RESTLAT_ROW=", joined)
+        self.assertIn("rest_fetch_audit", joined)
+        self.assertIn("--max-time", joined)
+        self.assertIn("QDB=", joined)
+        self.assertIn("SKEW=", joined)
+        self.assertIn("tv_order_placement_duration_ns", joined)
+        # The retired live-feed probes must never be dialed again.
+        self.assertNotIn("api-feed.dhan.co", joined)
+        self.assertNotIn("socket-api.groww.in", joined)
+        self.assertNotIn("FROM ticks", joined)
+        self.assertNotIn("received_at", joined)
+
+    def test_latency_timeout_reduced_with_margin(self) -> None:
+        # No 25s WS-probe fan-out anymore — worst case is one 3s metrics curl
+        # + one 3s QDB probe + one 4s audit read + SSM registration.
+        self.assertEqual(handler._LATENCY_TIMEOUT_SECS, 15.0)
+        self.assertEqual(handler._REST_LAT_QUERY_MAX_SECS, 4)
+
+    def test_parse_rest_lat_row_happy(self) -> None:
+        row = handler._parse_rest_lat_row('"dhan","spot_1m",370,1450.04,5200.55')
+        self.assertEqual(
+            row,
+            {"feed": "dhan", "leg": "spot_1m", "ok_rows": 370, "p50_ms": 1450.0, "p99_ms": 5200.6},
+        )
+
+    def test_parse_rest_lat_row_null_percentiles_degrade_to_none(self) -> None:
+        row = handler._parse_rest_lat_row("groww,chain_1m,0,null,NaN")
+        self.assertEqual(row["ok_rows"], 0)
+        self.assertIsNone(row["p50_ms"])
+        self.assertIsNone(row["p99_ms"])
+
+    def test_parse_rest_lat_row_rejects_malformed_and_bad_tokens(self) -> None:
+        # Malformed on-box output yields NOTHING — never a fabricated row.
+        for bad in (
+            "",
+            "a,b",
+            "dhan,spot_1m,x,1,2",
+            "DH AN,leg,1,2,3",
+            "<script>,leg,1,2,3",
+            "dhan,<b>leg</b>,1,2,3",
+            "dhan,leg,-5,1,2",
+            "dhan,leg,1,2,3,4",
+        ):
+            self.assertIsNone(handler._parse_rest_lat_row(bad), repr(bad))
 
     def test_parse_latency_full(self) -> None:
         stdout = (
-            "T0=100.0\n"
-            "FEEDS_T0_BEGIN\n"
-            + self._health_json(
-                [
-                    {"feed": "dhan", "ticks_total": 1000, "subscribed_total": 776,
-                     "last_tick_age_secs": 1, "verdict": "ok", "enabled": True},
-                    {"feed": "groww", "ticks_total": 2000, "subscribed_total": 768,
-                     "last_tick_age_secs": 0, "verdict": "ok", "enabled": True},
-                ]
-            )
-            + "\n"
-            "FEEDS_T0_END\n"
-            "PROBE_dhan_BEGIN\n"
-            "0.012 0.030\n"
-            "0.009 0.025\n"
-            "PROBE_dhan_END\n"
-            "PROBE_groww_BEGIN\n"
-            "0.007 0.020\n"
-            "x x\n"
-            "PROBE_groww_END\n"
+            "METRICS_BEGIN\n"
+            "tv_order_placement_duration_ns_sum 5000\n"
+            "tv_order_placement_duration_ns_count 10\n"
+            "METRICS_END\n"
             "QDB=0.0021\n"
             "SKEW=0.000123\n"
-            "T1=110.0\n"
-            "METRICS_BEGIN\n"
-            "tv_tick_processing_duration_ns_sum 50000\n"
-            "tv_tick_processing_duration_ns_count 1000\n"
-            "tv_wire_to_done_duration_ns_sum 8000000\n"
-            "tv_wire_to_done_duration_ns_count 1000\n"
-            "METRICS_END\n"
-            "FEEDS_T1_BEGIN\n"
-            + self._health_json(
-                [
-                    {"feed": "dhan", "ticks_total": 1050, "subscribed_total": 776,
-                     "last_tick_age_secs": 1, "verdict": "ok", "enabled": True},
-                    {"feed": "groww", "ticks_total": 2200, "subscribed_total": 768,
-                     "last_tick_age_secs": 0, "verdict": "ok", "enabled": True},
-                ]
-            )
-            + "\n"
-            "FEEDS_T1_END\n"
+            'RESTLAT_ROW="dhan","chain_1m",374,1300.0,2100.0\n'
+            'RESTLAT_ROW="groww","spot_1m",372,900.0,1600.0\n'
         )
         out = handler._parse_latency(stdout)
         self.assertEqual(out["questdb_ms"], "2.1")
         self.assertEqual(out["clock_skew_ms"], "0.1")
-        self.assertEqual(out["tick_process_avg_ns"], 50.0)
-        self.assertEqual(out["wire_to_done_avg_ns"], 8000.0)
-        self.assertIsNone(out["order_place_avg_ns"])
-        self.assertEqual(out["tick_count"], "1000")
-        # Per-feed rows: dynamic — driven by the app's health response.
-        rows = {r["feed"]: r for r in out["feeds"]}
-        self.assertEqual(set(rows), {"dhan", "groww"})
-        self.assertEqual(rows["dhan"]["tcp_ms"], "9.0")  # min of the samples
-        self.assertEqual(rows["dhan"]["tls_ms"], "25.0")
-        self.assertTrue(rows["dhan"]["endpoint_known"])
-        # groww's failed sample ('x x') is skipped, not fabricated.
-        self.assertEqual(rows["groww"]["tcp_ms"], "7.0")
-        # ticks/sec = Δticks_total / (T1-T0): dhan 50/10, groww 200/10.
-        self.assertEqual(rows["dhan"]["ticks_per_sec"], 5.0)
-        self.assertEqual(rows["groww"]["ticks_per_sec"], 20.0)
-        self.assertEqual(rows["dhan"]["subscribed_total"], 776)
-        self.assertEqual(out["feeds_error"], "")
-        # Winners: groww strictly faster + busier; subscribed goes to dhan.
-        self.assertEqual(out["winners"]["tcp_ms"], "groww")
-        self.assertEqual(out["winners"]["ticks_per_sec"], "groww")
-        self.assertEqual(out["winners"]["subscribed_total"], "dhan")
+        self.assertEqual(out["order_place_avg_ns"], 500.0)
+        rows = {(r["feed"], r["leg"]): r for r in out["rest_latency"]}
+        self.assertEqual(set(rows), {("dhan", "chain_1m"), ("groww", "spot_1m")})
+        self.assertEqual(rows[("dhan", "chain_1m")]["ok_rows"], 374)
+        self.assertEqual(rows[("dhan", "chain_1m")]["p99_ms"], 2100.0)
+        self.assertEqual(rows[("groww", "spot_1m")]["p50_ms"], 900.0)
 
     def test_parse_latency_empty(self) -> None:
+        # Box stopped -> empty table + blank shields, never fabricated numbers.
         out = handler._parse_latency("")
-        self.assertEqual(out["feeds"], [])
-        self.assertTrue(out["feeds_error"])  # honest reason, never fake rows
-        self.assertEqual(out["winners"], {})
-        self.assertIsNone(out["tick_process_avg_ns"])
-        self.assertEqual(out["tick_count"], "")
-        # Windowed fields degrade to None / 0 with no scrapes at all.
-        self.assertIsNone(out["tick_p50_ns"])
-        self.assertIsNone(out["tick_p99_ns"])
-        self.assertEqual(out["tick_window_count"], 0)
+        self.assertEqual(out["rest_latency"], [])
+        self.assertEqual(out["questdb_ms"], "")
+        self.assertEqual(out["clock_skew_ms"], "")
+        self.assertIsNone(out["order_place_avg_ns"])
 
-    def test_parse_latency_unknown_third_feed_row_appears(self) -> None:
-        # A future feed #3 the app reports but the probe map doesn't know:
-        # its row STILL appears (app-side metrics) with endpoint_known=False
-        # and blank probe cells — "endpoint unknown", never fake numbers.
-        stdout = (
-            "T0=100.0\n"
-            "FEEDS_T1_BEGIN\n"
-            + self._health_json(
-                [
-                    {"feed": "dhan", "ticks_total": 10, "subscribed_total": 776},
-                    {"feed": "groww", "ticks_total": 20, "subscribed_total": 768},
-                    {"feed": "zerodha", "ticks_total": 5, "subscribed_total": 100},
-                ]
-            )
-            + "\n"
-            "FEEDS_T1_END\n"
+    def test_parse_latency_malformed_rest_rows_skipped(self) -> None:
+        out = handler._parse_latency(
+            "RESTLAT_ROW=garbage\nRESTLAT_ROW=dhan,spot_1m,10,1.0,2.0\n"
         )
-        out = handler._parse_latency(stdout)
-        rows = {r["feed"]: r for r in out["feeds"]}
-        self.assertEqual(set(rows), {"dhan", "groww", "zerodha"})
-        self.assertFalse(rows["zerodha"]["endpoint_known"])
-        self.assertIsNone(rows["zerodha"]["endpoint"])
-        self.assertEqual(rows["zerodha"]["tcp_ms"], "")
-        self.assertEqual(rows["zerodha"]["tls_ms"], "")
-        # Known feeds keep their mapping even with no probe samples in stdout.
-        self.assertTrue(rows["dhan"]["endpoint_known"])
-        self.assertTrue(rows["groww"]["endpoint_known"])
-
-    def test_ticks_per_sec_counter_reset_is_none(self) -> None:
-        # App restarted mid-window → T1 ticks_total BELOW T0 → tps must be
-        # None (never a fabricated negative/huge rate).
-        rows = handler._feed_latency_rows(
-            {"feeds": [{"feed": "dhan", "ticks_total": 5000}]},
-            {"feeds": [{"feed": "dhan", "ticks_total": 10}]},
-            {},
-            "10.0",
-        )
-        self.assertIsNone(rows[0]["ticks_per_sec"])
-
-    def test_ticks_per_sec_missing_t0_is_none(self) -> None:
-        rows = handler._feed_latency_rows(
-            None,
-            {"feeds": [{"feed": "dhan", "ticks_total": 10}]},
-            {},
-            "10.0",
-        )
-        self.assertEqual(len(rows), 1)
-        self.assertIsNone(rows[0]["ticks_per_sec"])
-
-    def test_feed_comparison_winners_lower_and_higher_better(self) -> None:
-        rows = [
-            {"feed": "dhan", "tcp_ms": "9.0", "tls_ms": "30.0",
-             "last_tick_age_secs": 1, "ticks_per_sec": 5.0, "subscribed_total": 776},
-            {"feed": "groww", "tcp_ms": "7.0", "tls_ms": "20.0",
-             "last_tick_age_secs": 0, "ticks_per_sec": 20.0, "subscribed_total": 768},
-        ]
-        w = handler._feed_comparison_winners(rows)
-        self.assertEqual(w["tcp_ms"], "groww")  # lower is better
-        self.assertEqual(w["tls_ms"], "groww")
-        self.assertEqual(w["last_tick_age_secs"], "groww")
-        self.assertEqual(w["ticks_per_sec"], "groww")  # higher is better
-        self.assertEqual(w["subscribed_total"], "dhan")
-
-    def test_feed_comparison_winners_tie_and_single_feed_no_winner(self) -> None:
-        # Tie at the best value → no single winner claimed.
-        tied = [
-            {"feed": "dhan", "tcp_ms": "9.0"},
-            {"feed": "groww", "tcp_ms": "9.0"},
-        ]
-        self.assertNotIn("tcp_ms", handler._feed_comparison_winners(tied))
-        # Only one feed has a comparable value → nothing to compare → no winner.
-        single = [
-            {"feed": "dhan", "tcp_ms": "9.0"},
-            {"feed": "groww", "tcp_ms": ""},
-        ]
-        self.assertNotIn("tcp_ms", handler._feed_comparison_winners(single))
-        self.assertEqual(handler._feed_comparison_winners([]), {})
-
-    def test_latency_commands_probe_all_mapped_feeds_in_parallel(self) -> None:
-        cmds = handler._LATENCY_COMMANDS
-        joined = "\n".join(cmds)
-        for feed, host in handler._FEED_LIVE_HOSTS.items():
-            self.assertIn(f"PROBE_{feed}_BEGIN", joined)
-            self.assertIn(f"https://{host}/", joined)
-        # Parallel background probes + wait, each curl time-bounded — one
-        # dead feed endpoint can never hang the whole measure.
-        self.assertIn(") &", joined)
-        self.assertIn("wait", cmds)
-        for c in cmds:
-            if "https://" in c:
-                self.assertIn(f"--max-time {handler._FEED_PROBE_MAX_SECS}", c)
-        # The feed LIST is discovered from the app at measure time (twice —
-        # bracketing the window for the ticks/sec delta).
-        self.assertEqual(joined.count("/api/feeds/health"), 2)
-
-    # ---- windowed percentile math (operator directive 2026-06-10) ----
-
-    @staticmethod
-    def _two_scrape_stdout() -> str:
-        """T0 → 1000 ticks lifetime; T1 → 1200 ticks. The 200-tick window:
-        100 ticks ≤1000ns, 190 ≤5000ns, 200 ≤10000ns (10 in the 5–10µs
-        bucket), so p50=1000ns exactly and p99 lands inside (5000,10000]."""
-        return (
-            "T0=100.0\n"
-            "METRICS_T0_BEGIN\n"
-            'tv_tick_processing_duration_ns_bucket{le="1000"} 500\n'
-            'tv_tick_processing_duration_ns_bucket{le="5000"} 900\n'
-            'tv_tick_processing_duration_ns_bucket{le="10000"} 1000\n'
-            'tv_tick_processing_duration_ns_bucket{le="+Inf"} 1000\n'
-            "tv_tick_processing_duration_ns_sum 2000000\n"
-            "tv_tick_processing_duration_ns_count 1000\n"
-            "METRICS_T0_END\n"
-            "PROBE_dhan_BEGIN\n"
-            "0.012 0.030\n"
-            "PROBE_dhan_END\n"
-            "QDB=0.0021\n"
-            "SKEW=0.000123\n"
-            "T1=110.0\n"
-            "METRICS_BEGIN\n"
-            'tv_tick_processing_duration_ns_bucket{le="1000"} 600\n'
-            'tv_tick_processing_duration_ns_bucket{le="5000"} 1090\n'
-            'tv_tick_processing_duration_ns_bucket{le="10000"} 1200\n'
-            'tv_tick_processing_duration_ns_bucket{le="+Inf"} 1200\n'
-            "tv_tick_processing_duration_ns_sum 2400000\n"
-            "tv_tick_processing_duration_ns_count 1200\n"
-            "METRICS_END\n"
-        )
-
-    def test_parse_latency_windowed_fields(self) -> None:
-        out = handler._parse_latency(self._two_scrape_stdout())
-        # Window: 200 ticks, Δsum=400000 → windowed avg 2000ns.
-        self.assertEqual(out["tick_window_count"], 200)
-        self.assertEqual(out["tick_window_avg_ns"], 2000.0)
-        # p50: target=100 of 200; first bucket delta (le=1000) = 100 → cum
-        # reaches target exactly at le=1000 → interpolation lands on 1000.
-        self.assertEqual(out["tick_p50_ns"], 1000.0)
-        # p99: target=198; cum ≤5000 is 190; lands in (5000,10000] bucket
-        # with width 10 ticks → 5000 + (198-190)/10 * 5000 = 9000.
-        self.assertEqual(out["tick_p99_ns"], 9000.0)
-        self.assertEqual(out["window_secs"], "10.0")
-        # Lifetime fields still served from the second scrape (back-compat).
-        self.assertEqual(out["tick_process_avg_ns"], 2000.0)
-        self.assertEqual(out["tick_count"], "1200")
-
-    def test_percentile_from_bucket_deltas_interpolates(self) -> None:
-        deltas = {"buckets": {100.0: 0.0, 500.0: 50.0, 1000.0: 100.0}, "sum": 1.0, "count": 100.0}
-        # p50 → target 50 → reached exactly at le=500.
-        self.assertEqual(handler._percentile_from_bucket_deltas(deltas, 0.50), 500.0)
-        # p75 → target 75 → halfway through the (500,1000] bucket → 750.
-        self.assertEqual(handler._percentile_from_bucket_deltas(deltas, 0.75), 750.0)
-
-    def test_percentile_empty_window_returns_none(self) -> None:
-        self.assertIsNone(handler._percentile_from_bucket_deltas(None, 0.5))
-        self.assertIsNone(
-            handler._bucket_deltas(
-                {"buckets": {100.0: 5.0}, "sum": 10.0, "count": 5.0},
-                {"buckets": {100.0: 5.0}, "sum": 10.0, "count": 5.0},
-            )
-        )
-
-    def test_percentile_counter_reset_returns_none(self) -> None:
-        # T1 counts BELOW T0 (app restarted mid-window) → whole window invalid.
-        self.assertIsNone(
-            handler._bucket_deltas(
-                {"buckets": {100.0: 500.0}, "sum": 100.0, "count": 500.0},
-                {"buckets": {100.0: 20.0}, "sum": 5.0, "count": 30.0},
-            )
-        )
-
-    def test_percentile_inf_bucket_clamps(self) -> None:
-        # All window samples beyond the last finite bucket → clamp to it.
-        deltas = {
-            "buckets": {100.0: 0.0, float("inf"): 10.0},
-            "sum": 1.0,
-            "count": 10.0,
-        }
-        self.assertEqual(handler._percentile_from_bucket_deltas(deltas, 0.99), 100.0)
-
-    # ---- per-feed exchange→received lag percentile grid (2026-07-03) ----
-
-    def test_parse_pctl_row_converts_micros_to_ms(self) -> None:
-        feed, row = handler._parse_pctl_row(
-            "groww,48213,3,1500.0,42000.5,90000,250000,1817000,12"
-        )
-        self.assertEqual(feed, "groww")
-        self.assertEqual(row["rows"], 48213)
-        self.assertEqual(row["neg_clamped"], 3)
-        self.assertEqual(row["p50_ms"], 1.5)
-        self.assertEqual(row["p90_ms"], 42.0)
-        self.assertEqual(row["p95_ms"], 90.0)
-        self.assertEqual(row["p99_ms"], 250.0)
-        self.assertEqual(row["max_ms"], 1817.0)
-        # Rule-11 companion: the replay-excluded count is a COUNT (not µs).
-        self.assertEqual(row["replay_excluded"], 12)
-
-    def test_parse_pctl_row_zero_rows_and_nulls_degrade_to_none(self) -> None:
-        # Feed present in the prune window's DISTINCT but with no rows
-        # RECEIVED in the last 120s: count 0, aggregates null → None cells,
-        # never fake zeros ("no rows received" is rendered, not 0-lag).
-        feed, row = handler._parse_pctl_row("dhan,0,,,,,,,")
-        self.assertEqual(feed, "dhan")
-        self.assertEqual(row["rows"], 0)
-        self.assertEqual(row["neg_clamped"], 0)
-        # Empty replay cell → None (n/a), never a fake verified-0
-        # (finding 10: the excluder is dhan-only; non-dhan feeds emit a
-        # NULL leg, and a degraded dhan tail is "unknown", not "0").
-        self.assertIsNone(row["replay_excluded"])
-        for col in handler._PCTL_COLS:
-            self.assertIsNone(row[col])
-        # Mixed null/NaN spellings are handled per cell.
-        _, row = handler._parse_pctl_row("dhan,100,0,null,NaN,,5000,9000,null")
-        self.assertIsNone(row["p50_ms"])
-        self.assertIsNone(row["p90_ms"])
-        self.assertIsNone(row["p95_ms"])
-        self.assertEqual(row["p99_ms"], 5.0)
-        self.assertEqual(row["max_ms"], 9.0)
-        self.assertIsNone(row["replay_excluded"])
-        # An explicit 0 stays 0 (a dhan window with genuinely nothing
-        # excluded is a real measurement, distinct from n/a).
-        _, row = handler._parse_pctl_row("dhan,100,0,1,1,1,1,1,0")
-        self.assertEqual(row["replay_excluded"], 0)
-        # groww: NULL leg by construction → None → the page renders "—".
-        _, row = handler._parse_pctl_row("groww,100,0,1,1,1,1,1,null")
-        self.assertIsNone(row["replay_excluded"])
-
-    def test_parse_pctl_row_rejects_malformed_and_bad_tokens(self) -> None:
-        # A failed on-box query leaves an empty tail → skipped, not fabricated.
-        self.assertEqual(handler._parse_pctl_row("dhan,"), (None, None))
-        self.assertEqual(handler._parse_pctl_row(""), (None, None))
-        # Pre-2026-07-07 8-field shape (no replay_excluded column) → rejected
-        # rather than misparsed against the new 9-field contract.
-        self.assertEqual(
-            handler._parse_pctl_row("dhan,1,0,1,1,1,1,1"), (None, None)
-        )
-        # Feed token outside the [a-z0-9_-]{1,32} allowlist → rejected
-        # (defense in depth — mirrors the shell-side grep allowlist).
-        self.assertEqual(
-            handler._parse_pctl_row("Feed$;drop,1,0,1,1,1,1,1,0"), (None, None)
-        )
-        # Non-numeric row count → rejected.
-        self.assertEqual(
-            handler._parse_pctl_row("dhan,abc,0,1,1,1,1,1,0"), (None, None)
-        )
-
-    def test_percentile_winners_lower_is_better_strict(self) -> None:
-        pctl = {
-            "dhan": {"rows": 100, "neg_clamped": 0, "p50_ms": 500.0,
-                     "p90_ms": 800.0, "p95_ms": 900.0, "p99_ms": 990.0,
-                     "max_ms": 1200.0},
-            "groww": {"rows": 200, "neg_clamped": 0, "p50_ms": 60.0,
-                      "p90_ms": 110.0, "p95_ms": 900.0, "p99_ms": None,
-                      "max_ms": 300.0},
-        }
-        w = handler._percentile_winners(pctl)
-        self.assertEqual(w["p50_ms"], "groww")  # lower lag wins
-        self.assertEqual(w["p90_ms"], "groww")
-        self.assertNotIn("p95_ms", w)  # tie — no single winner
-        self.assertNotIn("p99_ms", w)  # only one comparable value
-        self.assertEqual(w["max_ms"], "groww")
-
-    def test_percentile_winners_zero_row_feed_excluded(self) -> None:
-        # A feed with 0 receive-stamped rows never wins (nothing measured),
-        # and a single remaining comparable feed yields no winner either.
-        pctl = {
-            "dhan": {"rows": 100, "neg_clamped": 0, "p50_ms": 500.0,
-                     "p90_ms": None, "p95_ms": None, "p99_ms": None,
-                     "max_ms": None},
-            "ghost": {"rows": 0, "neg_clamped": 0, "p50_ms": 1.0,
-                      "p90_ms": None, "p95_ms": None, "p99_ms": None,
-                      "max_ms": None},
-        }
-        self.assertEqual(handler._percentile_winners(pctl), {})
-        self.assertEqual(handler._percentile_winners({}), {})
-
-    def test_parse_latency_percentile_block(self) -> None:
-        stdout = (
-            "T0=100.0\n"
-            "PCTL_ROW=dhan,50000,0,500000,800000,900000,990000,1200000,3117\n"
-            "PCTL_ROW=groww,48213,3,1500,42000,90000,250000,1817000,0\n"
-            "PCTL_ROW=badline\n"
-            "QDB=0.0021\n"
-            "T1=110.0\n"
-        )
-        out = handler._parse_latency(stdout)
-        self.assertEqual(set(out["percentiles"]), {"dhan", "groww"})
-        self.assertEqual(out["percentiles"]["groww"]["p50_ms"], 1.5)
-        self.assertEqual(out["percentiles"]["dhan"]["p50_ms"], 500.0)
-        # Rule-11 companion count surfaces per feed (rendered on the page).
-        self.assertEqual(out["percentiles"]["dhan"]["replay_excluded"], 3117)
-        self.assertEqual(out["percentiles"]["groww"]["replay_excluded"], 0)
-        self.assertEqual(out["percentile_winners"]["p50_ms"], "groww")
-        # dhan's max (1200ms) is lower than groww's (1817ms) — lower wins.
-        self.assertEqual(out["percentile_winners"]["max_ms"], "dhan")
-        self.assertEqual(
-            out["percentile_recv_window_secs"], handler._PCTL_RECV_WINDOW_SECS
-        )
-        self.assertEqual(
-            out["percentile_ts_prune_hours"], handler._PCTL_TS_PRUNE_HOURS
-        )
-        self.assertEqual(out["percentile_sample_cap"], handler._PCTL_SAMPLE_CAP)
-        # PCTL_ROW lines are intercepted BEFORE the generic K=V branch — the
-        # ordinary fields still parse and nothing leaks into them.
-        self.assertEqual(out["questdb_ms"], "2.1")
-        # No PCTL rows at all → empty dict + empty winners, honestly.
-        empty = handler._parse_latency("")
-        self.assertEqual(empty["percentiles"], {})
-        self.assertEqual(empty["percentile_winners"], {})
-
-    def test_latency_commands_percentile_block_bounded_and_sanitized(self) -> None:
-        joined = "\n".join(handler._LATENCY_COMMANDS)
-        # Verified QuestDB syntax: approx_percentile(value, q, precision).
-        self.assertIn("approx_percentile(lag_us, 0.5, 3)", joined)
-        self.assertIn("approx_percentile(lag_us, 0.99, 3)", joined)
-        # Bounded sample — never an unbounded scan.
-        self.assertIn(f"limit {handler._PCTL_SAMPLE_CAP}", joined)
-        self.assertIn("select distinct feed from ticks", joined)
-        # Only receive-stamped rows enter the lag math.
-        self.assertIn("received_at != null", joined)
-        # approx_percentile requires non-negative input → clamp, counted.
-        self.assertIn("case when received_at - ts < 0 then 0", joined)
-        # IST timebase fix (2026-07-07): ts/received_at are stored
-        # IST-SHIFTED while QuestDB now() is UTC — every window predicate
-        # compares against IST_now = dateadd('m', 330, now()), never bare
-        # now(). (The old `ts > dateadd('m', -10, now())` was a ~5h40m
-        # window — the 2026-07-06 replay-conflation root cause.)
-        self.assertIn("dateadd('m', 330, now())", joined)
-        self.assertNotIn("dateadd('m', -10, now())", joined)  # the old bug
-        # Population = RECEIVE time (K=120s) — an exchange-time window would
-        # lag-censor (Rule-11): rows lagged beyond the window would vanish.
-        self.assertIn(
-            f"received_at >= dateadd('s', -{handler._PCTL_RECV_WINDOW_SECS}, "
-            "dateadd('m', 330, now()))",
-            joined,
-        )
-        # 6h ts bound = partition pruning ONLY (ticks is PARTITION BY HOUR
-        # on ts; received_at is not the designated timestamp).
-        self.assertIn(
-            f"ts > dateadd('h', -{handler._PCTL_TS_PRUNE_HOURS}, "
-            "dateadd('m', 330, now()))",
-            joined,
-        )
-        # EXACT replay excluder — DHAN ONLY (finding 10): capture_seq is a
-        # UTC-wall-nanos receipt stamp only for dhan (groww capture_seq is
-        # exchange-ts-seeded, so the predicate would censor genuine groww
-        # lag >60s and exclude nothing replayed). The shell branches per
-        # feed: dhan gets the excluder + counted complement; every other
-        # feed gets NO excluder and a NULL replay_excluded leg (n/a).
-        self.assertIn('if [ "$f" = dhan ]; then', joined)
-        self.assertIn(
-            "cast(capture_seq / 1000 + 19800000000 as timestamp)", joined
-        )
-        self.assertIn(
-            f"received_at < dateadd('s', {handler._PCTL_REPLAY_DWELL_SECS}, "
-            "cast(capture_seq / 1000 + 19800000000 as timestamp))",
-            joined,
-        )
-        self.assertIn("count() replay_excluded", joined)
-        self.assertIn(
-            f"received_at >= dateadd('s', {handler._PCTL_REPLAY_DWELL_SECS}, "
-            "cast(capture_seq / 1000 + 19800000000 as timestamp))",
-            joined,
-        )
-        self.assertIn(
-            "cast(null as long) replay_excluded from long_sequence(1)", joined
-        )
-        # The non-dhan SQL variant must carry NO capture-based predicate.
-        plain = handler._pctl_feed_sql(replay_excluder=False)
-        self.assertNotIn("capture_seq", plain)
-        # Sample bound ordered by the population's own key (finding 2):
-        # receive time, never exchange-ts (which would evict the
-        # most-lagged rows first when the 50K cap binds).
-        for sql in (plain, handler._pctl_feed_sql(replay_excluder=True)):
-            self.assertIn(
-                f"order by received_at desc limit {handler._PCTL_SAMPLE_CAP}",
-                sql,
-            )
-            self.assertNotIn("order by ts desc", sql)
-        # Feed tokens from the DB are allowlist-validated BEFORE they are
-        # interpolated into the per-feed SQL, and the loop is capped.
-        self.assertIn(handler._PCTL_FEED_TOKEN_RE, joined)
-        self.assertIn(f"head -{handler._PCTL_MAX_FEEDS}", joined)
-        # NO hardcoded feed name in the percentile SQL — shell var only.
-        self.assertIn("feed = '$f'", joined)
-        # Runs concurrently with the probes (launched before the shared
-        # wait), and its output is surfaced after that wait.
-        self.assertLess(joined.index("PCTL_FEEDS="), joined.index("\nwait\n"))
-        self.assertIn("cat /tmp/tv-pctl.out", joined)
-        # Every percentile curl is time-bounded.
-        self.assertIn(f"--max-time {handler._PCTL_QUERY_MAX_SECS}", joined)
+        self.assertEqual(len(out["rest_latency"]), 1)
+        self.assertEqual(out["rest_latency"][0]["feed"], "dhan")
 
 
 class ParseStorage(unittest.TestCase):
@@ -777,7 +435,7 @@ class DbConsoleTab(unittest.TestCase):
         html = handler._console_html()
         self.assertNotIn('data-t="db"', html)
         data_section = html.split('<section data-tab="data"', 1)[1].split("</section>", 1)[0]
-        for needle in ('id="dbtables"', 'id="dbsql"', 'id="dbout"', 'id="dbcols"', 'id="bars"', 'id="cvshields"'):
+        for needle in ('id="dbtables"', 'id="dbsql"', 'id="dbout"', 'id="dbcols"', 'id="bars"'):
             self.assertIn(needle, data_section, needle)
 
     def test_db_tab_shows_read_only_badge(self) -> None:
@@ -926,6 +584,27 @@ class WipeGate(unittest.TestCase):
         # (d) honest completion marker — never a fake OK.
         self.assertIn("WIPE-COMPLETE", wipe_block)
         self.assertIn("WIPE-PARTIAL", wipe_block)
+
+    def test_wipe_questdb_truncates_live_rest_tables_too(self) -> None:
+        # 2026-07-16 destructive-surface extension (called out in the commit
+        # body): a "fresh start" must also drop today's official minute
+        # candles + the fetch log — the four LIVE tables the REST pulls
+        # write. rest_fetch_audit is per-fetch forensics, NOT a SEBI
+        # never-delete table; the SEBI *_audit family stays preserved by the
+        # dynamic filter (it matches only the named targets).
+        import inspect
+
+        src = inspect.getsource(handler)
+        wipe_block = src.split('action == "wipe-questdb"', 1)[1].split('action == "docker-reset"', 1)[0]
+        self.assertIn(
+            "{'spot_1m_rest', 'option_chain_1m', 'option_contract_1m_rest', 'rest_fetch_audit'}",
+            wipe_block,
+        )
+        self.assertIn("t in live_rest", wipe_block)
+        # Honest completion now ALSO requires spot_1m_rest == 0.
+        self.assertIn("FROM%20spot_1m_rest", wipe_block)
+        self.assertIn("spot_1m_rest=${S:-?}", wipe_block)
+        self.assertIn("${S:-1}", wipe_block)
 
     def test_docker_reset_and_bare_nuke_remove_feed_capture_sources(self) -> None:
         # The full nuke + bare nuke must ALSO sweep the feed capture/replay
@@ -1093,57 +772,53 @@ class HtmlWipeButton(unittest.TestCase):
         self.assertIn("redeploy", html)
 
 
-class ParseCrossVerify(unittest.TestCase):
-    def test_parse_cross_verify(self) -> None:
-        stdout = (
-            "CV_DATE=2026-06-10\n"
-            "CV_MISMATCH_ROWS=0\n"
-            "CV_INSTRUMENTS=243\n"
-            "CV_COMPARED=91230\n"
-            "CV_MISSING=0\n"
-            "CV_DEGRADED=False\n"
+class RemovedActionsReturn400(unittest.TestCase):
+    """2026-07-16 cleanup: the cross-verify card (its producer was deleted in
+    PR-C3 2026-07-14 — the card sat frozen at a 2026-07-13 FAIL forever) and
+    the groww-only wipe (it rewrote only the frozen legacy ticks/candles_*
+    tables) are REMOVED. Their POST actions fall through to the
+    unknown-action 400 — never a silent success."""
+
+    def setUp(self) -> None:
+        self._orig = handler._control_secret
+        handler._control_secret = lambda: "s3cret-token"  # type: ignore[assignment]
+        self._orig_mkt = handler._is_market_hours
+        handler._is_market_hours = lambda _now: False  # type: ignore[assignment]
+
+    def tearDown(self) -> None:
+        handler._control_secret = self._orig  # type: ignore[assignment]
+        handler._is_market_hours = self._orig_mkt  # type: ignore[assignment]
+
+    def _post(self, action: str, extra: dict | None = None):
+        return handler.lambda_handler(
+            {
+                "requestContext": {"http": {"method": "POST"}},
+                "headers": {"authorization": "Bearer s3cret-token"},
+                "body": json.dumps({"action": action, **(extra or {})}),
+            },
+            None,
         )
-        got = handler._parse_cross_verify(stdout)
-        self.assertEqual(got["date"], "2026-06-10")
-        self.assertEqual(got["mismatch_rows"], "0")
-        self.assertEqual(got["instruments"], "243")
-        self.assertEqual(got["compared"], "91230")
-        self.assertEqual(got["missing"], "0")
-        self.assertEqual(got["degraded"], "False")
 
-    def test_parse_cross_verify_empty_stdout_yields_blank_fields(self) -> None:
-        # Box stopped / app down / no run yet → blank fields → the card
-        # shows a truthful "no run yet", never a fabricated PASS.
-        got = handler._parse_cross_verify("")
-        self.assertEqual(got["date"], "")
-        self.assertEqual(got["compared"], "")
-        self.assertEqual(got["degraded"], "")
+    def test_cross_verify_action_removed(self) -> None:
+        resp = self._post("cross_verify")
+        self.assertEqual(resp["statusCode"], 400)
+        self.assertIn("unknown action", json.loads(resp["body"])["error"])
 
+    def test_wipe_groww_action_removed(self) -> None:
+        # Even the historically-correct payload (force + typed confirm) must
+        # 400 — the action no longer exists and never reaches SSM.
+        orig_shell = handler._ssm_shell
+        handler._ssm_shell = lambda cmds: self.fail("SSM must not be called for a removed action")  # type: ignore[assignment]
+        try:
+            resp = self._post("wipe-groww", {"force": True, "confirm": "GROWW"})
+        finally:
+            handler._ssm_shell = orig_shell  # type: ignore[assignment]
+        self.assertEqual(resp["statusCode"], 400)
+        self.assertIn("unknown action", json.loads(resp["body"])["error"])
 
-class CrossVerifyCard(unittest.TestCase):
-    def test_html_has_cross_verify_card(self) -> None:
-        html = handler._console_html()
-        self.assertIn("loadCrossVerify()", html)
-        self.assertIn('id="cvshields"', html)
-        self.assertIn("cross-verify — daily candle check vs exchange record", html)
-        self.assertIn("3:31 PM IST", html)
-
-    def test_card_renders_values_through_esc(self) -> None:
-        # 2026-06-10 pre-impl security review (S-H1): every box-derived
-        # string field in the card must pass through esc() before landing
-        # in innerHTML.
-        html = handler._console_html()
-        for field in ("j.date", "j.instruments", "j.compared", "j.mismatch_rows", "j.missing"):
-            self.assertIn(f"esc({field}", html, f"{field} must be esc()-wrapped")
-
-    def test_card_pass_requires_compared_positive(self) -> None:
-        # False-OK guard parity with the Telegram event severity: PASS
-        # requires compared>0 — "nothing compared" must never render PASS.
-        html = handler._console_html()
-        self.assertIn("compared>0", html)
-
-    def test_cross_verify_action_is_read_only(self) -> None:
-        # Read-only action: must NOT be market-hours-blocked.
+    def test_removed_actions_left_the_destructive_sets(self) -> None:
+        self.assertNotIn("wipe-groww", handler._DESTRUCTIVE)
+        self.assertNotIn("wipe-groww", handler._DATA_DESTRUCTIVE)
         self.assertNotIn("cross_verify", handler._DESTRUCTIVE)
 
 
@@ -1158,10 +833,15 @@ class FeedCounts(unittest.TestCase):
         self.assertEqual(handler._parse_feed_counts(";;"), {})
         self.assertEqual(handler._parse_feed_counts("garbage-without-comma"), {})
 
-    def test_view_commands_query_ticks_grouped_by_feed(self) -> None:
-        cmd = next(c for c in handler._VIEW_COMMANDS if "TICKS_BY_FEED=" in c)
-        self.assertIn("GROUP%20BY%20feed", cmd)
-        self.assertIn("FROM%20ticks", cmd)
+    def test_view_commands_query_live_tables_grouped_by_feed(self) -> None:
+        for label, table in (
+            ("SPOT_BY_FEED=", "spot_1m_rest"),
+            ("CHAIN_BY_FEED=", "option_chain_1m"),
+            ("CONTRACT_BY_FEED=", "option_contract_1m_rest"),
+        ):
+            cmd = next(c for c in handler._VIEW_COMMANDS if label in c)
+            self.assertIn("GROUP%20BY%20feed", cmd)
+            self.assertIn(f"FROM%20{table}", cmd)
 
 
 class FeedsView(unittest.TestCase):
@@ -1213,6 +893,37 @@ class FeedsView(unittest.TestCase):
         self.assertIn("invalid JSON", out["feeds_error"])
         self.assertEqual(out["health"], {})
         self.assertEqual(out["health_error"], "")
+
+    def test_parse_feeds_view_rest_lane_fields(self) -> None:
+        # The REST-lane pulse rides the same snapshot as labeled lines
+        # OUTSIDE the marker blocks (2026-07-16).
+        stdout = (
+            "FEEDS_BEGIN\n{}\nFEEDS_END\n"
+            "FEEDS_HEALTH_BEGIN\n{}\nFEEDS_HEALTH_END\n"
+            'REST_AUDIT="dhan","ok",370;"dhan","error",3;"groww","ok",372;"groww","rate_limited",2;\n'
+            'REST_LAT_HOUR="dhan",1450.04,5200.55;"groww",900.0,1600.0;\n'
+        )
+        out = handler._parse_feeds_view(stdout)
+        self.assertEqual(out["rest_audit"]["dhan"], {"ok": 370, "error": 3})
+        self.assertEqual(out["rest_audit"]["groww"], {"ok": 372, "rate_limited": 2})
+        self.assertEqual(out["rest_lat_hour"]["dhan"], {"p50_ms": 1450.0, "p99_ms": 5200.6})
+        self.assertEqual(out["rest_lat_hour"]["groww"], {"p50_ms": 900.0, "p99_ms": 1600.0})
+
+    def test_parse_feeds_view_rest_lane_empty_or_garbage_is_empty(self) -> None:
+        # Empty/absent/garbage values yield {} — the card then says
+        # "no pulls recorded today", never fabricated zeros (Rule 11).
+        out = handler._parse_feeds_view("FEEDS_BEGIN\n{}\nFEEDS_END\n")
+        self.assertEqual(out["rest_audit"], {})
+        self.assertEqual(out["rest_lat_hour"], {})
+        self.assertEqual(handler._parse_rest_audit(";;garbage;a,b;<x>,ok,3;dhan,ok,x;"), {})
+        self.assertEqual(handler._parse_rest_lat_hour(";;garbage;dhan,null,null;"), {})
+
+    def test_parse_feeds_view_json_body_never_mistaken_for_labeled_line(self) -> None:
+        # A '=' inside the marker-delimited JSON must not leak into the
+        # labeled-line scan.
+        stdout = 'FEEDS_BEGIN\n{"note": "REST_AUDIT=fake"}\nFEEDS_END\n'
+        out = handler._parse_feeds_view(stdout)
+        self.assertEqual(out["rest_audit"], {})
 
 
 class FeedToggleValidation(unittest.TestCase):
@@ -1339,25 +1050,27 @@ class FeedTogglePassthrough(unittest.TestCase):
         self.assertEqual(body["app_response"]["error"], self.DHAN_GUARD)
 
 
-class DedupFiveColumnCheck(unittest.TestCase):
-    def test_view_comment_names_the_five_real_key_columns(self) -> None:
-        # The dedup comment must name the REAL 5-column upsert key
-        # (ts, security_id, segment, capture_seq, feed) — not the stale
-        # 4-column (received_at) wording.
+class DedupKeyShield(unittest.TestCase):
+    """The dedup shield reads spot_1m_rest's REAL 4-column upsert key
+    (ts, security_id, exchange_segment, feed per DEDUP_KEY_SPOT_1M_REST in
+    crates/storage/src/spot_1m_rest_persistence.rs) — repointed 2026-07-16
+    from the retired ticks 5-column key."""
+
+    def test_view_comment_names_the_four_real_key_columns(self) -> None:
         src = Path(handler.__file__).read_text(encoding="utf-8")
-        self.assertIn("(ts, security_id, segment, capture_seq, feed)", src)
-        self.assertNotIn("(ts, security_id, segment, received_at)", src)
+        self.assertIn("(ts, security_id, exchange_segment, feed)", src)
+        self.assertIn("DEDUP_KEY_SPOT_1M_REST", src)
 
     def test_html_distinguishes_ok_disabled_drift_unreachable(self) -> None:
         html = handler._console_html()
-        # 5 = OK (green): the check compares against 5, not the stale 4.
-        self.assertIn("dkN===5", html)
-        self.assertNotIn("==='4'", html)
+        # 4 = OK (green): the check compares against 4, not the stale 5.
+        self.assertIn("dkN===4", html)
+        self.assertNotIn("dkN===5", html)
         # 0 = DEDUP disabled entirely (RED).
         self.assertIn("DEDUP disabled!", html)
         self.assertIn("'bad'", html)
         # other = schema drift (amber).
-        self.assertIn("schema drift (expected 5)", html)
+        self.assertIn("schema drift (expected 4)", html)
         # fetch failure = "unreachable" (amber), never a fake 0/OLD.
         self.assertIn("'unreachable'", html)
 
@@ -1392,173 +1105,76 @@ class FeedsCardHtml(unittest.TestCase):
         self.assertIn("esc(j.feeds_error", html)
         self.assertIn("j.app_response.error", html)
 
+    def test_feeds_card_shows_rest_pull_line_not_tick_counters(self) -> None:
+        # 2026-07-16: the per-feed detail line is today's fetch-log pulse
+        # (ok/failed/rate-limited + last-hour p50/p99 after minute close),
+        # sourced from rest_fetch_audit — the old ticks/subscribed counters
+        # read frozen live-feed registries and are GONE.
+        html = handler._console_html()
+        self.assertIn("j.rest_audit", html)
+        self.assertIn("j.rest_lat_hour", html)
+        self.assertIn("pulls today:", html)
+        self.assertIn("rate-limited", html)
+        self.assertIn("after minute close", html)
+        self.assertIn("no official-candle pulls recorded today", html)
+        self.assertNotIn("ticks_total", html)
+        self.assertNotIn("subscribed_total", html)
+        self.assertNotIn("' · ticks '", html)
+        self.assertNotIn("' · subscribed '", html)
+
 
 class LatencyCardHtml(unittest.TestCase):
-    """Per-feed latency comparison card (operator demand 2026-07-03)."""
+    """REST-era latency card (2026-07-16): per-(broker, pull type) prompt-pull
+    percentiles from today's fetch log + the kept box-wide shields."""
 
     @staticmethod
     def _load_latency_js() -> str:
         html = handler._console_html()
         return html.split("async function loadLatency()", 1)[1].split("async function act(", 1)[0]
 
-    def test_html_has_per_feed_table_and_instrument_load_line(self) -> None:
+    def test_html_has_rest_latency_table(self) -> None:
         html = handler._console_html()
-        self.assertIn('id="latfeeds"', html)
-        self.assertIn('id="latload"', html)
-        self.assertIn("instrument load", html)
-        self.assertIn("endpoint unknown", html)
-        self.assertIn("td.win", html)  # green best-per-column highlight style
+        self.assertIn('id="latrest"', html)
+        self.assertIn("how fast each official minute candle arrives", html)
+        self.assertIn("pull type", html)
+        self.assertIn("ok pulls today", html)
+        self.assertIn("p50 after close", html)
+        self.assertIn("p99 after close", html)
 
-    def test_latency_card_iterates_feed_list_no_hardcoded_names(self) -> None:
-        # Future-feeds ratchet: the table renders whatever j.feeds carries
-        # (the app's own /api/feeds/health list) and highlights via the
-        # server-computed winners map — NO feed name may be hardcoded in the
-        # portal JS, so a future feed #3 needs zero portal changes.
+    def test_latency_card_iterates_rows_no_hardcoded_names(self) -> None:
+        # Future-feeds ratchet: the table renders whatever j.rest_latency
+        # carries (feed+leg discovered from the fetch log at measure time) —
+        # NO feed/leg name may be hardcoded in the portal JS.
         js = self._load_latency_js()
-        self.assertIn("j.feeds", js)
-        self.assertIn("j.winners", js)
+        self.assertIn("j.rest_latency", js)
         self.assertNotIn("dhan", js.lower())
         self.assertNotIn("groww", js.lower())
+        self.assertNotIn("spot_1m", js)
+        self.assertNotIn("chain_1m", js)
+
+    def test_empty_table_is_honest_not_fake_zero(self) -> None:
+        html = handler._console_html()
+        self.assertIn("no successful pulls recorded today", html)
+        self.assertIn("never fake", html)
 
     def test_box_wide_cards_labeled_honestly(self) -> None:
-        # Tick processing / QuestDB RTT / clock skew carry NO feed label in
-        # the app's metrics — the card must say "box-wide", never fake a
-        # per-feed processing split.
+        # QuestDB RTT / clock skew carry NO feed label — the card must say
+        # "box-wide"; the dormant order-placement shield is KEPT and reads
+        # "—" until live trading returns.
         html = handler._console_html()
-        self.assertIn("box-wide (shared by all feeds)", html)
+        self.assertIn("box-wide (shared by all pulls)", html)
         self.assertIn("QuestDB round-trip (box-wide)", html)
         self.assertIn("Clock skew (box-wide)", html)
-
-
-class _FakeEc2:
-    """Minimal describe_instances stub for the box-must-be-running gate."""
-
-    def __init__(self, state: str) -> None:
-        self._state = state
-
-    def describe_instances(self, InstanceIds):  # noqa: N803 — boto3 casing
-        return {"Reservations": [{"Instances": [{"State": {"Name": self._state}}]}]}
-
-
-class WipeGrowwGate(unittest.TestCase):
-    def setUp(self) -> None:
-        self._orig_secret = handler._control_secret
-        handler._control_secret = lambda: "s3cret-token"  # type: ignore[assignment]
-        # Off-hours pin — see WipeGate.setUp (audit-fix-#2 hard lock).
-        self._orig_mkt = handler._is_market_hours
-        handler._is_market_hours = lambda _now: False  # type: ignore[assignment]
-
-    def tearDown(self) -> None:
-        handler._control_secret = self._orig_secret  # type: ignore[assignment]
-        handler._is_market_hours = self._orig_mkt  # type: ignore[assignment]
-
-    def _wipe_groww(self, force: bool = True, confirm: str = "GROWW"):
-        return handler.lambda_handler(
-            {
-                "requestContext": {"http": {"method": "POST"}},
-                "headers": {"authorization": "Bearer s3cret-token"},
-                "body": json.dumps({"action": "wipe-groww", "force": force, "confirm": confirm}),
-            },
-            None,
-        )
-
-    def test_wipe_groww_is_in_destructive_set(self) -> None:
-        # Membership = market-hours-blocked during 09:15-15:30 IST Mon-Fri.
-        self.assertIn("wipe-groww", handler._DESTRUCTIVE)
-
-    def test_wipe_groww_without_confirm_token_is_blocked(self) -> None:
-        # The server-side confirm token is the anti-bypass guard: even a
-        # forced, authenticated call without {"confirm": "GROWW"} is 409 and
-        # never reaches boto3/SSM.
-        for bad in ("", "WIPE", "groww", "NUKE"):
-            resp = self._wipe_groww(force=True, confirm=bad)
-            self.assertEqual(resp["statusCode"], 409, repr(bad))
-            self.assertIn("GROWW", json.loads(resp["body"])["error"])
-
-    def test_wipe_groww_requires_running_box(self) -> None:
-        # Dispatching the rewrite to a stopped box would silently no-op —
-        # the gate must 409 with the real state and never call SSM.
-        orig_client = handler._client
-        orig_shell = handler._ssm_shell
-        handler._client = lambda name, region="": _FakeEc2("stopped")  # type: ignore[assignment]
-        handler._ssm_shell = lambda cmds: self.fail("SSM must not be called for a stopped box")  # type: ignore[assignment]
-        try:
-            resp = self._wipe_groww(force=True)
-        finally:
-            handler._client = orig_client  # type: ignore[assignment]
-            handler._ssm_shell = orig_shell  # type: ignore[assignment]
-        self.assertEqual(resp["statusCode"], 409)
-        self.assertIn("stopped", json.loads(resp["body"])["error"])
-
-    def test_wipe_groww_forced_is_surgical_and_scoped(self) -> None:
-        # The dispatched command list must be groww-SCOPED and SURGICAL:
-        # exact-DDL per-table rewrite, dhan replay sources untouched, SEBI
-        # tables never named, honest completion markers.
-        captured: dict = {}
-        orig_client = handler._client
-        orig_shell = handler._ssm_shell
-        handler._client = lambda name, region="": _FakeEc2("running")  # type: ignore[assignment]
-        handler._ssm_shell = lambda cmds: (captured.__setitem__("cmds", cmds) or "cmd-groww")  # type: ignore[assignment]
-        try:
-            resp = self._wipe_groww(force=True)
-        finally:
-            handler._client = orig_client  # type: ignore[assignment]
-            handler._ssm_shell = orig_shell  # type: ignore[assignment]
-        self.assertEqual(resp["statusCode"], 200)
-        self.assertEqual(json.loads(resp["body"])["command_id"], "cmd-groww")
-        joined = "\n".join(captured["cmds"])
-        # app stopped first; app restarted after (sidecar pkill retired 2026-07-15).
-        self.assertIn("systemctl stop tickvault", joined)
-        self.assertIn("systemctl start tickvault", joined)
-        # ONLY the groww capture dir removed (capture file + status + bridge
-        # offset snapshot) — the resurrection vector, removed BEFORE restart.
-        self.assertIn("rm -rf /opt/tickvault/data/groww", joined)
-        # Dhan replay sources + caches MUST survive a groww-only wipe.
-        for keep in ("/ws_wal", "/spill", "/dlq", "instrument-cache"):
-            self.assertNotIn(keep, joined, f"groww-only wipe must NOT touch {keep}")
-        # Surgical rewrite, never TRUNCATE (that would kill dhan rows too).
-        self.assertNotIn("TRUNCATE", joined)
-        # Dynamic candles_* discovery — nothing hardcoded to rot.
-        self.assertIn("SELECT table_name FROM tables()", joined)
-        self.assertIn("t.startswith('candles_')", joined)
-        # Exact canonical DDL anchors (mirrored from tick_persistence.rs +
-        # shadow_persistence.rs) incl. the real DEDUP keys.
-        self.assertIn("TIMESTAMP(ts) PARTITION BY HOUR WAL", joined)
-        self.assertIn("DEDUP ENABLE UPSERT KEYS(%s)", joined)
-        self.assertIn("'ts, security_id, segment, capture_seq, feed'", joined)
-        self.assertIn("timestamp(ts) PARTITION BY DAY DEDUP UPSERT KEYS(ts, security_id, segment, feed)", joined)
-        # Keep-filter preserves NULL-feed legacy dhan rows.
-        self.assertIn("feed != 'groww' OR feed IS NULL", joined)
-        # Verified copy-before-drop + honest completion markers.
-        self.assertIn("GWIPE-ABORT", joined)
-        self.assertIn("ORIGINAL UNTOUCHED", joined)
-        self.assertIn("GROWW-WIPE-COMPLETE", joined)
-        self.assertIn("GROWW-WIPE-PARTIAL", joined)
-        # SEBI scope lock: the never-delete tables are never named.
-        for sebi in ("_audit", "instrument_lifecycle", "index_constituency", "prev_day_ohlcv", "ws_event"):
-            self.assertNotIn(sebi, joined, f"groww wipe must never name {sebi}")
-
-    def test_wipe_groww_never_drops_original_before_verify(self) -> None:
-        # Ordering ratchet inside the embedded rewrite: INSERT copy → count
-        # verify (with the abort path) → only then DROP the original table.
-        py = handler._GROWW_WIPE_PY
-        i_insert = py.index("INSERT INTO %s (%s) SELECT")
-        i_verify = py.index("copy verify failed")
-        i_drop = py.index("q('DROP TABLE %s' % table)")
-        self.assertLess(i_insert, i_verify)
-        self.assertLess(i_verify, i_drop)
-        # The abort path drops the TEMP table, never the original.
-        self.assertIn("DROP TABLE IF EXISTS %s' % new", py)
-        # The worst-case swap failure names the safe copy + the manual fix.
-        self.assertIn("GWIPE-CRITICAL", py)
-        self.assertIn("RENAME TABLE %s TO %s", py)
+        self.assertIn("'Order placement'", html)
+        self.assertIn("dormant", html)
 
 
 class DataDestructiveMarketHoursLock(unittest.TestCase):
-    """Audit fix #2 (operator incident 2026-07-02 15:05 IST): the four
-    data-destructive actions have NO force escape during market hours.
-    A mid-market forced wipe-ALL + docker-reset deleted ~4.5M rows and 77s
-    of live feed — upstream ticks in that window are unrecoverable."""
+    """Audit fix #2 (operator incident 2026-07-02 15:05 IST): the
+    data-destructive actions (three since the 2026-07-16 wipe-groww removal)
+    have NO force escape during market hours. A mid-market forced wipe-ALL +
+    docker-reset deleted ~4.5M rows and 77s of live feed — upstream data in
+    that window is unrecoverable."""
 
     def setUp(self) -> None:
         self._orig_secret = handler._control_secret
@@ -1590,7 +1206,6 @@ class DataDestructiveMarketHoursLock(unittest.TestCase):
         # the box on 2026-07-02 — must be 409'd for every destructive action.
         confirms = {
             "wipe-questdb": "WIPE",
-            "wipe-groww": "GROWW",
             "docker-reset": "NUKE",
             "docker-nuke-bare": "ERASE",
         }
@@ -1674,23 +1289,64 @@ class _FakeLifecycleEc2:
         return {}
 
 
-class HtmlWipeGrowwButton(unittest.TestCase):
-    def test_html_has_wipe_groww_button(self) -> None:
-        html = handler._console_html()
-        self.assertIn("wipeGroww()", html)
-        self.assertIn("Wipe GROWW data only", html)
-        # Confirm prompt: the operator must type GROWW.
-        self.assertIn("Type GROWW to confirm", html)
-        # The explanatory line must spell out the scope honestly.
-        self.assertIn("Dhan data untouched", html)
-        self.assertIn("SEBI", html)
+class LegacyLiveFeedPanelsRemoved(unittest.TestCase):
+    """2026-07-16 REST-only cleanup ratchet: the live-feed-era helpers and
+    panels must not resurrect — their producers were deleted with the live
+    feeds (Dhan WS 2026-07-13 PR-C2/C3, Groww WS 2026-07-15)."""
 
-    def test_wipe_groww_sends_confirm_token_and_polls_real_outcome(self) -> None:
+    def test_backend_helpers_gone(self) -> None:
+        for name in (
+            "_classify_tick_conservation",
+            "_parse_conserve_rows",
+            "_CONSERVATION_ENVELOPE",
+            "_parse_cross_verify",
+            "_CROSS_VERIFY_COMMANDS",
+            "_GROWW_WIPE_PY",
+            "_wipe_groww_commands",
+            "_FEED_LIVE_HOSTS",
+        ):
+            self.assertFalse(hasattr(handler, name), name)
+        # The pctl/windowed-histogram machinery is gone from the source too.
+        src_text = Path(handler.__file__).read_text(encoding="utf-8")
+        self.assertNotIn("_pctl_", src_text)
+        self.assertNotIn("percentile_winners", src_text)
+        self.assertNotIn("tv_tick_processing_duration_ns", src_text)
+        self.assertNotIn("tv_wire_to_done_duration_ns", src_text)
+
+    def test_html_panels_gone(self) -> None:
         html = handler._console_html()
-        self.assertIn("confirm:'GROWW'", html)
-        # Truthful async outcome via the shared command-status poller.
-        self.assertIn("GROWW-WIPE-COMPLETE", html)
-        self.assertIn("GROWW-WIPE-PARTIAL", html)
+        for dead in (
+            "drawSpark",
+            'id="spark"',
+            'id="p_tps"',
+            "peak ticks/sec",
+            "loadCrossVerify",
+            'id="cvshields"',
+            "wipeGroww",
+            'value="groww"',
+            'id="latfeeds"',
+            'id="latpctl"',
+            "Tick conservation",
+            "Sub-second fix",
+            "Peak ticks / second",
+            "ticks captured today",
+            "GROWW-WIPE-COMPLETE",
+        ):
+            self.assertNotIn(dead, html, dead)
+
+    def test_view_sql_targets_no_dead_tables(self) -> None:
+        joined = "\n".join(handler._VIEW_COMMANDS)
+        for dead in (
+            "FROM%20ticks",
+            "candles_1m",
+            "tick_conservation_audit",
+            "ws_event_audit",
+            "MAX_TPS",
+            "TICKS_TODAY",
+            "CONSERVE",
+            "WS_DISC",
+        ):
+            self.assertNotIn(dead, joined, dead)
 
 
 class RedesignThreeTabs(unittest.TestCase):
@@ -1751,13 +1407,15 @@ class RedesignThreeTabs(unittest.TestCase):
             handler._control_secret = orig_secret  # type: ignore[assignment]
 
     def test_danger_zone_collapsed_by_default(self) -> None:
-        # The four destructive wipes live inside a <details> WITHOUT the open
+        # The three destructive wipes live inside a <details> WITHOUT the open
         # attribute — collapsed until the operator deliberately taps it.
+        # (The groww-only wipe left with the Groww live feed, 2026-07-16.)
         html = handler._console_html()
         self.assertIn('<details class="fold" id="danger">', html)
         danger = html.split('<details class="fold" id="danger">', 1)[1].split("</details>", 1)[0]
-        for needle in ('value="groww"', 'value="wipe"', 'value="nuke"', 'value="erase"', "dangerExecute()"):
+        for needle in ('value="wipe"', 'value="nuke"', 'value="erase"', "dangerExecute()"):
             self.assertIn(needle, danger, needle)
+        self.assertNotIn('value="groww"', danger)
         # No <details ... open> anywhere (both folds start collapsed).
         self.assertNotIn("<details open", html)
         self.assertNotIn('id="danger" open', html)
@@ -1774,15 +1432,14 @@ class RedesignThreeTabs(unittest.TestCase):
     def test_danger_summary_names_its_contents(self) -> None:
         html = handler._console_html()
         summary = html.split('<details class="fold" id="danger">', 1)[1].split("</summary>", 1)[0]
-        self.assertIn("(contains: Wipe GROWW · Wipe ALL · Docker reset · Bare nuke)", summary)
+        self.assertIn("(contains: Wipe ALL · Docker reset · Bare nuke)", summary)
 
     def test_severity_picker_maps_each_choice_to_action_and_token(self) -> None:
         html = handler._console_html()
         # One dispatch map, radio value → the UNCHANGED per-action function.
-        self.assertIn("{groww:wipeGroww, wipe:wipeData, nuke:dockerReset, erase:bareNuke}", html)
+        self.assertIn("{wipe:wipeData, nuke:dockerReset, erase:bareNuke}", html)
         # Each function still demands its OWN typed confirm token — the picker
         # introduces no token-bypass path.
-        self.assertIn("Type GROWW to confirm:')!=='GROWW'", html)
         self.assertIn("Type WIPE to confirm:')!=='WIPE'", html)
         self.assertIn("Type NUKE-DOCKER to confirm:')!=='NUKE-DOCKER'", html)
         self.assertIn("Type ERASE to confirm:')!=='ERASE'", html)
@@ -1807,14 +1464,14 @@ class RedesignThreeTabs(unittest.TestCase):
         self.assertIn('id="stoppedbanner"', html)
         self.assertIn("Box stopped (auto-stops 16:30 IST, auto-starts 08:30 Mon–Fri) — guarantees resume on start", html)
         self.assertIn("$('stoppedbanner').hidden=running", html)
-        # …and the shields grey out as "—" ONLY when the box is not running.
+        # …and the shield greys out as "—" ONLY when the box is not running.
         self.assertIn("shieldIdle", html)
         self.assertIn("if(!running){", html)
         # The REAL warning paths for a RUNNING box must still exist (a stopped
         # banner must never hide genuine failures while running).
         self.assertIn("'unreachable'", html)
         self.assertIn("DEDUP disabled!", html)
-        self.assertIn("schema drift (expected 5)", html)
+        self.assertIn("schema drift (expected 4)", html)
 
     def test_overview_has_aws_strip_and_latency_card(self) -> None:
         html = handler._console_html()
@@ -1828,7 +1485,7 @@ class RedesignThreeTabs(unittest.TestCase):
         self.assertIn("loadLatency()", overview)
         self.assertIn("Measure now", overview)
         self.assertIn('id="latnet"', overview)
-        self.assertIn('id="latproc"', overview)
+        self.assertIn('id="latrest"', overview)
         # Strip is fed by the same aws_status action the old AWS tab used.
         self.assertIn("call('aws_status')", html)
 
@@ -1844,167 +1501,6 @@ class RedesignThreeTabs(unittest.TestCase):
         # context-aware button on Overview owns instance lifecycle now.
         self.assertNotIn("act('start')", admin)
         self.assertNotIn("act('stop')", admin)
-
-
-class TickConservationShield(unittest.TestCase):
-    """Audit fix #1 — the shield is a conservation-backed verdict, not a
-    liveness heuristic. One test per state + the precedence ratchet +
-    the false-OK-is-dead ratchet."""
-
-    # Raw CONSERVE snapshots (QuestDB /exp CSV rows, ';'-joined, header
-    # already skipped on the box).
-    _BALANCED = '"dhan","2026-07-01T00:00:00.000000Z",0,0,false,"balanced";"groww","2026-07-01T00:00:00.000000Z",0,0,false,"balanced";'
-    _RESIDUAL = '"dhan","2026-07-01T00:00:00.000000Z",42,0,false,"leak";'
-    _PARTIAL = '"dhan","2026-07-01T00:00:00.000000Z",0,0,true,"partial";'
-
-    def _classify(self, raw: str, disc: str, market_hours: bool, tps: str) -> dict:
-        return handler._classify_tick_conservation(handler._parse_conserve_rows(raw), disc, market_hours, tps)
-
-    # ---- one test per shield state ----
-    def test_state_balanced_market_open_decorated_with_liveness(self) -> None:
-        tc = self._classify(self._BALANCED, "0", True, "500")
-        self.assertEqual(tc["state"], "balanced")
-        self.assertTrue(tc["good"])
-        self.assertEqual(tc["cls"], "ok")
-        self.assertIn("BALANCED ✅", tc["label"])
-        self.assertIn("capturing (500 ticks/sec)", tc["label"])
-
-    def test_state_balanced_market_closed_names_audit_date(self) -> None:
-        tc = self._classify(self._BALANCED, "0", False, "0")
-        self.assertEqual(tc["state"], "balanced")
-        self.assertEqual(tc["label"], "BALANCED ✅ (audit 2026-07-01)")
-
-    def test_state_residual_is_red_and_counts_ticks(self) -> None:
-        tc = self._classify(self._RESIDUAL, "0", True, "500")
-        self.assertEqual(tc["state"], "residual")
-        self.assertFalse(tc["good"])
-        self.assertEqual(tc["cls"], "bad")
-        self.assertIn("RESIDUAL: 42", tc["label"])
-        self.assertIn("2026-07-01", tc["label"])
-
-    def test_state_partial_is_amber(self) -> None:
-        tc = self._classify(self._PARTIAL, "0", True, "500")
-        self.assertEqual(tc["state"], "partial")
-        self.assertFalse(tc["good"])
-        self.assertEqual(tc["cls"], "warn")
-        self.assertIn("partial coverage", tc["label"])
-
-    def test_state_disconnects_today_blocks_green_despite_balanced_audit(self) -> None:
-        # Yesterday's audit was balanced, but the socket dropped twice TODAY —
-        # upstream ticks in those windows never reached the box, so the shield
-        # must NOT claim green (the honest capture-at-receipt envelope).
-        tc = self._classify(self._BALANCED, "2", True, "500")
-        self.assertEqual(tc["state"], "disconnects")
-        self.assertFalse(tc["good"])
-        self.assertEqual(tc["cls"], "warn")
-        self.assertIn("2 disconnect(s) today", tc["label"])
-        self.assertIn("unverifiable", tc["label"])
-
-    def test_state_idle_market_closed_no_audit(self) -> None:
-        tc = self._classify("", "0", False, "0")
-        self.assertEqual(tc["state"], "idle")
-        self.assertEqual(tc["label"], "idle (market closed)")
-
-    def test_state_no_audit_market_open_is_amber_never_green(self) -> None:
-        # Fresh box: tick_conservation_audit table absent → CONSERVE empty.
-        tc = self._classify("", "0", True, "500")
-        self.assertEqual(tc["state"], "no_audit")
-        self.assertFalse(tc["good"])
-        self.assertEqual(tc["cls"], "warn")
-        self.assertIn("no audit yet", tc["label"])
-
-    def test_state_unreachable_when_no_source_answers(self) -> None:
-        tc = self._classify("", "", True, "")
-        self.assertEqual(tc["state"], "unreachable")
-        self.assertFalse(tc["good"])
-        self.assertEqual(tc["label"], "unreachable")
-
-    # ---- the precedence ratchet: residual > partial > disconnects > balanced
-    def test_precedence_residual_beats_partial_and_disconnects(self) -> None:
-        raw = (
-            '"dhan","2026-07-01T00:00:00.000000Z",0,7,false,"leak";'
-            '"groww","2026-07-01T00:00:00.000000Z",0,0,true,"partial";'
-        )
-        tc = self._classify(raw, "3", True, "500")
-        self.assertEqual(tc["state"], "residual")
-
-    def test_precedence_partial_beats_disconnects(self) -> None:
-        tc = self._classify(self._PARTIAL, "3", True, "500")
-        self.assertEqual(tc["state"], "partial")
-
-    def test_precedence_disconnects_beats_balanced(self) -> None:
-        tc = self._classify(self._BALANCED, "1", True, "500")
-        self.assertEqual(tc["state"], "disconnects")
-
-    # ---- the false-OK is DEAD: a tick rate alone can never produce green
-    def test_tick_rate_alone_never_produces_balanced(self) -> None:
-        for raw, disc in (("", "0"), ("", ""), (self._PARTIAL, "0"), (self._BALANCED, "5")):
-            tc = self._classify(raw, disc, True, "9999")
-            self.assertNotEqual(tc["state"], "balanced", f"raw={raw!r} disc={disc!r}")
-            self.assertFalse(tc["good"] and tc["state"] != "idle", f"raw={raw!r} disc={disc!r}")
-
-    def test_only_latest_trading_day_rows_count(self) -> None:
-        # Yesterday had a residual; TODAY's audit is balanced — the shield
-        # reports the latest day's verdict (yesterday's row is history).
-        raw = (
-            '"dhan","2026-07-02T00:00:00.000000Z",0,0,false,"balanced";'
-            '"dhan","2026-07-01T00:00:00.000000Z",42,0,false,"leak";'
-        )
-        tc = self._classify(raw, "0", False, "0")
-        self.assertEqual(tc["state"], "balanced")
-        self.assertEqual(tc["audit_date"], "2026-07-02")
-
-    def test_envelope_sentence_is_carried_on_every_verdict(self) -> None:
-        for raw, disc in ((self._BALANCED, "0"), (self._RESIDUAL, "0"), ("", "")):
-            tc = self._classify(raw, disc, True, "5")
-            self.assertEqual(
-                tc["envelope"],
-                "Proves every tick that REACHED the box is stored. Ticks Dhan sent "
-                "during a disconnect window never arrived and are outside this proof.",
-            )
-
-    # ---- parser ----
-    def test_parse_conserve_rows_happy_and_malformed(self) -> None:
-        rows = handler._parse_conserve_rows(self._BALANCED + "garbage;1,2;")
-        self.assertEqual(len(rows), 2)
-        self.assertEqual(rows[0]["feed"], "dhan")
-        self.assertEqual(rows[0]["date"], "2026-07-01")
-        self.assertEqual(rows[0]["outcome"], "balanced")
-        self.assertFalse(rows[0]["partial_coverage"])
-        self.assertEqual(handler._parse_conserve_rows(""), [])
-
-    # ---- view plumbing ----
-    def test_parse_view_carries_conservation_fields(self) -> None:
-        out = handler._parse_view(f"CONSERVE={self._BALANCED}\nWS_DISC=0\n")
-        self.assertEqual(len(out["conservation_rows"]), 2)
-        self.assertEqual(out["ws_disconnects_today"], "0")
-        # Empty stdout (box stopped) degrades honestly.
-        empty = handler._parse_view("")
-        self.assertEqual(empty["conservation_rows"], [])
-        self.assertEqual(empty["ws_disconnects_today"], "")
-
-    def test_view_commands_query_both_audit_tables(self) -> None:
-        conserve = next(c for c in handler._VIEW_COMMANDS if "CONSERVE=" in c)
-        self.assertIn("tick_conservation_audit", conserve)
-        # `>` must be URL-encoded (%3E) and the CSV header skipped.
-        self.assertIn("ts%20%3E%20dateadd", conserve)
-        self.assertIn("tail -n +2", conserve)
-        disc = next(c for c in handler._VIEW_COMMANDS if "WS_DISC=" in c)
-        self.assertIn("ws_event_audit", disc)
-        # `=` encoded as %3D (the DEDUP_KEYS lesson) + in-market kind only.
-        self.assertIn("event_kind%3D%27disconnected%27", disc)
-        self.assertNotIn("event_kind='disconnected'", disc)
-
-    # ---- the UI no longer holds shield logic ----
-    def test_html_renames_shield_and_drops_liveness_heuristic(self) -> None:
-        html = handler._console_html()
-        self.assertIn("Tick conservation", html)
-        self.assertNotIn("No tick lost", html)
-        # The old always-green path — capOk driving a WORKING ✅ shield — is gone.
-        self.assertNotIn("WORKING ✅", html)
-        # The UI renders the server verdict + its envelope tooltip.
-        self.assertIn("j.tick_conservation", html)
-        self.assertIn("tc.envelope", html)
 
 
 class QdbConsoleUrlAction(unittest.TestCase):
