@@ -2936,6 +2936,49 @@ pub const DH904_BACKOFF_SECS: &[u64] = &[10, 20, 40, 80];
 /// `usize` constant for ergonomic use in loop conditions.
 pub const DH904_MAX_RETRY_ATTEMPTS: usize = DH904_BACKOFF_SECS.len();
 
+// --- Dhan order-path error taxonomy (annexure-enums.md rules 11-12) ---
+/// DATA-805 "too many requests/connections" — every order-API call is refused
+/// for this window, then resumes passively (annexure rule 12 STOP ALL).
+pub const DATA_805_STOP_ALL_COOLDOWN_SECS: u64 = 60;
+/// DH-901/DATA-807-809: wait between the rotation request and the single retry
+/// (gives the async renewal machinery a chance to swap the arc-swap token).
+pub const DH901_ROTATE_RETRY_DELAY_SECS: u64 = 5;
+/// DH-901: rotate token -> retry ONCE -> HALT (annexure rule 11). Never more.
+pub const DH901_ROTATE_MAX_RETRIES: u32 = 1;
+/// Cancel-only single transient retry delay (908/909/800/5xx/transport classes).
+/// Cancel is exposure-REDUCING and double-cancel is a benign terminal error.
+pub const DHAN_CANCEL_TRANSIENT_RETRY_DELAY_SECS: u64 = 2;
+/// Bounded scan window for Dhan error-body classification (hostile/huge bodies).
+pub const DHAN_ERROR_BODY_SCAN_CAP_BYTES: usize = 4_096;
+/// Max accepted length of an extracted/sanitized Dhan errorCode token.
+pub const DHAN_ERROR_CODE_MAX_LEN: usize = 32;
+
+// --- Order-readiness gate (dhan-ref/02-authentication.md rule 10) ---
+/// 08:45 IST pre-market readiness probe trigger (8*3600 + 45*60, secs-of-day IST).
+pub const ORDER_READINESS_PREMARKET_TRIGGER_SECS_OF_DAY_IST: u32 = 31_500;
+/// In-session readiness re-probe cadence. Mirrors MID_SESSION_CHECK_INTERVAL_SECS
+/// (900) deliberately as a SEPARATE const so the watchdog can retune independently.
+pub const ORDER_READINESS_REFRESH_INTERVAL_SECS: u64 = 900;
+/// Fail-closed staleness bound: 2 missed probes + 300s margin. Older verdict => REFUSE.
+pub const ORDER_READINESS_MAX_AGE_SECS: u64 = 2_100;
+/// Minimum effective token headroom for a live order (mirrors pre_market_check's
+/// 4h AUTH-GAP-01 threshold; strict `<` refuses). Decayed per-order from the probe snapshot.
+pub const ORDER_TOKEN_HEADROOM_MIN_SECS: u64 = 14_400;
+/// Backoff before the order-readiness refresher supervisor respawns a dead
+/// probe-loop task (mirrors the house `spawn_supervised_*` 5s cadence —
+/// WS-GAP-05 / DISK-WATCHER-01). A panicking app-supplied probe is caught and
+/// the loop respawned so the fail-closed gate never silently stops refreshing.
+pub const ORDER_READINESS_REFRESHER_RESPAWN_BACKOFF_SECS: u64 = 5;
+
+const _: () = assert!(
+    ORDER_READINESS_MAX_AGE_SECS > 2 * ORDER_READINESS_REFRESH_INTERVAL_SECS,
+    "readiness staleness bound must exceed two full refresh cycles"
+);
+const _: () = assert!(
+    (ORDER_READINESS_PREMARKET_TRIGGER_SECS_OF_DAY_IST as u64) < SECONDS_PER_DAY as u64,
+    "readiness pre-market trigger must be a valid secs-of-day"
+);
+
 /// Phase 0 Item 22f (2026-05-15) — Self-trade prevention cooldown
 /// window in seconds. Per SEBI Circular SEBI/HO/MIRSD/DOP/CIR/P/2018/153
 /// (wash-trade prevention), an account placing both legs of a trade
@@ -4176,6 +4219,35 @@ mod tests {
     #[test]
     fn test_sebi_max_orders_per_second() {
         assert_eq!(SEBI_MAX_ORDERS_PER_SECOND, 10);
+    }
+
+    #[test]
+    fn test_order_taxonomy_constants() {
+        assert_eq!(DATA_805_STOP_ALL_COOLDOWN_SECS, 60);
+        assert_eq!(DH901_ROTATE_RETRY_DELAY_SECS, 5);
+        assert_eq!(DH901_ROTATE_MAX_RETRIES, 1);
+        assert_eq!(DHAN_CANCEL_TRANSIENT_RETRY_DELAY_SECS, 2);
+        assert_eq!(DHAN_ERROR_BODY_SCAN_CAP_BYTES, 4_096);
+        assert_eq!(DHAN_ERROR_CODE_MAX_LEN, 32);
+    }
+
+    #[test]
+    fn test_order_readiness_constants_and_relations() {
+        assert_eq!(ORDER_READINESS_PREMARKET_TRIGGER_SECS_OF_DAY_IST, 31_500);
+        assert_eq!(ORDER_READINESS_REFRESH_INTERVAL_SECS, 900);
+        assert_eq!(ORDER_READINESS_MAX_AGE_SECS, 2_100);
+        assert_eq!(ORDER_TOKEN_HEADROOM_MIN_SECS, 14_400);
+        // staleness bound must exceed two full refresh cycles (fail-closed)
+        assert!(ORDER_READINESS_MAX_AGE_SECS > 2 * ORDER_READINESS_REFRESH_INTERVAL_SECS);
+        // 08:45 IST = 8*3600 + 45*60
+        assert_eq!(
+            ORDER_READINESS_PREMARKET_TRIGGER_SECS_OF_DAY_IST,
+            8 * 3600 + 45 * 60
+        );
+        assert!(
+            u64::from(ORDER_READINESS_PREMARKET_TRIGGER_SECS_OF_DAY_IST)
+                < u64::from(SECONDS_PER_DAY)
+        );
     }
 
     #[test]

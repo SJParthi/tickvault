@@ -128,6 +128,12 @@ pub mod dhan_rest_stack;
 /// build loop + the sole persist_groww_instruments caller).
 pub mod groww_universe;
 pub mod groww_watch_paths;
+/// REST-era multi-TF candle derivation (operator directive 2026-07-16):
+/// folds persist-confirmed `spot_1m_rest` 1m bars into all 21 `candles_*`
+/// timeframes via the shared seal-writer channel + boot catch-up over the
+/// stored month. FOLD-01 runbook:
+/// `.claude/rules/project/rest-candle-fold-error-codes.md`.
+pub mod rest_candle_fold;
 /// Shared per-seal routing for BOTH feeds (Dhan + Groww) — the single
 /// `route_seal` body the two `on_seal` call sites invoke (C2, behavior-preserving).
 pub mod seal_routing;

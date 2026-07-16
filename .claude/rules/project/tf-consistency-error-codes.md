@@ -175,12 +175,24 @@ repairs the day once the cause is fixed; the operator inspects first).
 | `oversize` | an /exec response exceeded the 8 MiB `TF_VERIFY_MAX_RESPONSE_BYTES` cap — refused on the DECLARED Content-Length BEFORE the body is read at all (refuter round 2), and again post-read BEFORE the JSON parse |
 | `truncated` | a query hit its explicit LIMIT (500 1m / 2,000 TF-union / 3,000 discovery rows) — a partial compare is NEVER trusted; the SID/pass reads degraded |
 | `flush_failed` | the audit ILP-over-HTTP flush was refused by the per-request server ACK — pending rows DISCARDED (poisoned-buffer defense, `tv_tf_verify_audit_rows_discarded_total`) |
+| `source_without_candles` | (2026-07-16, HIGH-3) candle discovery came back EMPTY for a (feed, day) while `spot_1m_rest` carries rows for the SAME window — the bar-fold (the sole candles_* author) derived nothing; the pass classifies Blind, never NoData. Triage: check the fold's `tv_rest_candle_fold_heartbeat_total` liveness + FOLD-01 lines (`rest-candle-fold-error-codes.md`) |
 | `budget_exceeded` | the 900s run budget elapsed between SIDs — remaining instruments skipped, ONE coalesced error |
 
 **RunStatus honesty (audit Rule 11):** `compared == 0` while candle rows
 EXISTED classifies **Blind** — the Telegram says BLIND, never PASS.
 `compared == 0` with NO rows on either side is **NoData** (Info — an
-off-day, not a failure). Any paging finding → MismatchFound; any degrade →
+off-day, not a failure). **2026-07-16 note (dead-fold false-OK closed —
+the REST candle-fold hostile review HIGH-3):** with the REST-era bar-fold
+(`rest_candle_fold.rs`) as the SOLE `candles_*` author, "no candle rows"
+alone no longer proves an off-day — a silently-dead fold leaves candles
+empty while `spot_1m_rest` keeps filling. The empty-discovery arm now
+runs ONE bounded `SELECT count(*) FROM spot_1m_rest` for the (feed, day)
+window (`select_spot_1m_count_sql` / `parse_count_dataset` /
+`empty_candles_with_spot_rows_is_blind`): source rows WITHOUT candles ⇒
+the pass marks the source seen and classifies **Blind** (High Telegram,
+`stage="source_without_candles"` TF-VERIFY-02 error), NEVER NoData; a
+failed count read degrades the pass (which also classifies Blind at zero
+compared); only zero-candles + zero-spot-rows still reads NoData. Any paging finding → MismatchFound; any degrade →
 Degraded; else Pass. `tv_tf_verify_runs_total{status}` records the verdict
 AFTER the final audit flush (L5 fix — a failed flush can never record
 `status="pass"` for a run that reports degraded), and the Telegram
