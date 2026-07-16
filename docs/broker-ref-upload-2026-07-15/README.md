@@ -36,6 +36,18 @@ Each provider folder carries `00-INDEX.md` (file map) and `SOURCES.md`
 - Known upstream gaps (gated/not publicly available) are recorded — never
   fabricated — in `UPSTREAM-README.md` and the per-provider `SOURCES.md`.
 
+## Synthesized data catalogs (added 2026-07-16 — NOT raw vendor docs)
+
+- `catalog-truedata.md` and `catalog-gfdl.md` are **SYNTHESIZED** catalogs,
+  compiled 2026-07-16: 10-category field-level data catalogs with verbatim
+  citations into the `truedata/` and `globaldatafeeds/` raw docs in this
+  folder plus cited web sources. They are reconciled indexes INTO the raw
+  capture — they are NOT raw vendor docs and carry the same
+  non-authoritative status as the rest of this folder.
+- Both catalogs conclude the vendor's push WebSocket is a **~1-second
+  conflated L1 snapshot stream, not tick-by-tick** — consistent with the
+  `docs/gdf-ref/README.md` reconciled claims table.
+
 ## Follow-up (separate task, NOT this import)
 
 A reconciliation pass should diff this capture against `docs/dhan-ref/` /
