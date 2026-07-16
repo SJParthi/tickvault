@@ -2656,11 +2656,18 @@ mod tests {
         // log-sink-only, High, auto-triage-safe) => 155 (both 153->154
         // bumps — Cluster F + FOLD-01 — landed concurrently; mechanically
         // recounted at this merge).
+        // 2026-07-16 (RAM residency stores, PR-2 of the same directive):
+        // +1 RAMSTORE-01 (RamStore01Degraded — spot/chain RAM store
+        // degrade; log-sink-only, High, auto-triage-safe) => 156
+        // (mechanically recounted at this rebase onto main's 155).
         // 2026-07-16 (merge of origin/main into cadence-scheduler-v2):
         // + CADENCE-01/02/03 (cadence scheduler, operator directive
         // 2026-07-14) on top of main's 155 => 158, mechanically recounted
         // against the merged all() vec at this merge.
-        assert_eq!(ErrorCode::all().len(), 158);
+        // 2026-07-16 merge note: RAMSTORE-01 (this branch, 156) + main's
+        // CADENCE-01/02/03 (158) coexist — 155 base + 1 + 3 = 159,
+        // mechanically recounted against the merged all() vec.
+        assert_eq!(ErrorCode::all().len(), 159);
     }
 
     #[test]

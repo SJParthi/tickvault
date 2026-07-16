@@ -285,7 +285,55 @@ pub struct OrderRuntimeConfig {
     /// Master switch. Default OFF (fail-safe) — `config/base.toml` turns it
     /// on explicitly so the machinery RUNS in prod.
     #[serde(default)]
-    pub cadence: CadenceConfig,
+    pub enabled: bool,
+    /// Next-mark paper filler (effective only while the OMS is dry-run —
+    /// a pending `PAPER-n` order fills at the next Groww mark for its sid).
+    #[serde(default = "default_order_runtime_paper_fill")]
+    pub paper_fill: bool,
+    /// Once-daily gated end-to-end paper self-test (place → fill → P&L →
+    /// close → flat), [09:20, 15:00) IST trading days, latched once per day.
+    #[serde(default = "default_order_runtime_self_test")]
+    pub self_test: bool,
+    /// Reconcile scheduler cadence (seconds). Dry-run cycles are HONEST
+    /// heartbeats ("broker reconcile SKIPPED") + the local Σfills==net_lots
+    /// invariant check. Validation floor: ≥ 60.
+    #[serde(default = "default_order_runtime_reconcile_interval_secs")]
+    pub reconcile_interval_secs: u64,
+    /// Bounded mark-forward channel capacity (Groww bridge → runtime).
+    /// Validation range: [256, 65536].
+    #[serde(default = "default_order_runtime_mark_channel_capacity")]
+    pub mark_channel_capacity: usize,
+}
+
+fn default_order_runtime_paper_fill() -> bool {
+    true
+}
+
+fn default_order_runtime_self_test() -> bool {
+    true
+}
+
+fn default_order_runtime_reconcile_interval_secs() -> u64 {
+    300
+}
+
+fn default_order_runtime_mark_channel_capacity() -> usize {
+    8_192
+}
+
+impl Default for OrderRuntimeConfig {
+    /// Manual impl so `Default` matches the serde field defaults exactly
+    /// (the Spot1mRestConfig precedent — an empty `[order_runtime]` section
+    /// and an ABSENT section must deserialize identically).
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            paper_fill: default_order_runtime_paper_fill(),
+            self_test: default_order_runtime_self_test(),
+            reconcile_interval_secs: default_order_runtime_reconcile_interval_secs(),
+            mark_channel_capacity: default_order_runtime_mark_channel_capacity(),
+        }
+    }
 }
 
 /// `[feeds]` — pluggable market-data feed selection (operator lock
@@ -5763,6 +5811,95 @@ mod tests {
             .extract()
             .expect("explicit enabled = true must round-trip");
         assert!(on.tf_consistency.enabled);
+    }
+
+    /// Order runtime (2026-07-14, cluster A): the `[order_runtime]` section
+    /// is FAIL-SAFE default OFF — an absent section, an empty section, and
+    /// an older TOML all deserialize to disabled with the pinned field
+    /// defaults (paper_fill/self_test ON, 300s reconcile, 8192 marks);
+    /// explicit values round-trip.
+    #[test]
+    fn test_order_runtime_config_defaults_off() {
+        use figment::Figment;
+        use figment::providers::{Format, Toml};
+
+        let d = OrderRuntimeConfig::default();
+        assert!(!d.enabled, "order_runtime must default OFF (fail-safe)");
+        assert!(d.paper_fill);
+        assert!(d.self_test);
+        assert_eq!(d.reconcile_interval_secs, 300);
+        assert_eq!(d.mark_channel_capacity, 8_192);
+
+        #[derive(Deserialize)]
+        struct Wrapper {
+            #[serde(default)]
+            order_runtime: OrderRuntimeConfig,
+        }
+        // Missing section entirely → disabled, never an error.
+        let missing: Wrapper = Figment::new()
+            .merge(Toml::string("[other]\nx = 1\n"))
+            .extract()
+            .expect("missing [order_runtime] must default, not error");
+        assert!(!missing.order_runtime.enabled);
+        // Empty section (no keys) → the SAME defaults as Default (the
+        // Spot1mRestConfig manual-Default precedent).
+        let empty: Wrapper = Figment::new()
+            .merge(Toml::string("[order_runtime]\n"))
+            .extract()
+            .expect("empty [order_runtime] must default, not error");
+        assert!(!empty.order_runtime.enabled);
+        assert!(empty.order_runtime.paper_fill);
+        assert_eq!(empty.order_runtime.reconcile_interval_secs, 300);
+        assert_eq!(empty.order_runtime.mark_channel_capacity, 8_192);
+        // Explicit ON (the base.toml shape) round-trips.
+        let on: Wrapper = Figment::new()
+            .merge(Toml::string(
+                "[order_runtime]\nenabled = true\npaper_fill = false\n\
+                 self_test = false\nreconcile_interval_secs = 120\n\
+                 mark_channel_capacity = 4096\n",
+            ))
+            .extract()
+            .expect("explicit values must round-trip");
+        assert!(on.order_runtime.enabled);
+        assert!(!on.order_runtime.paper_fill);
+        assert!(!on.order_runtime.self_test);
+        assert_eq!(on.order_runtime.reconcile_interval_secs, 120);
+        assert_eq!(on.order_runtime.mark_channel_capacity, 4_096);
+    }
+
+    /// Order runtime validation: the 60s reconcile floor + the bounded
+    /// [256, 65536] mark-channel envelope apply ONLY when enabled (a
+    /// disabled section is never rejected — rollback safety).
+    #[test]
+    fn test_order_runtime_config_validation() {
+        let mut config = make_valid_config();
+        config.order_runtime.enabled = true;
+        config.order_runtime.reconcile_interval_secs = 59;
+        assert!(
+            config.validate().is_err(),
+            "reconcile interval < 60 must be rejected when enabled"
+        );
+        config.order_runtime.reconcile_interval_secs = 60;
+        config.order_runtime.mark_channel_capacity = 255;
+        assert!(
+            config.validate().is_err(),
+            "mark channel capacity < 256 must be rejected when enabled"
+        );
+        config.order_runtime.mark_channel_capacity = 65_537;
+        assert!(
+            config.validate().is_err(),
+            "mark channel capacity > 65536 must be rejected when enabled"
+        );
+        config.order_runtime.mark_channel_capacity = 8_192;
+        assert!(config.validate().is_ok(), "sane enabled config validates");
+        // Disabled: even out-of-range values never block boot (rollback).
+        config.order_runtime.enabled = false;
+        config.order_runtime.reconcile_interval_secs = 1;
+        config.order_runtime.mark_channel_capacity = 1;
+        assert!(
+            config.validate().is_ok(),
+            "a DISABLED order_runtime section is never rejected"
+        );
     }
 
     /// Cadence scheduler (operator 2026-07-14): the `[cadence]` section is

@@ -73,23 +73,12 @@ fn order_side_send(handle: &OrderSideHandle, msg: OrderSideMsg) {
 }
 
 // ---------------------------------------------------------------------------
-// TokenProvider bridge — connects core::TokenHandle to trading::TokenProvider
+// TokenProvider bridge — EXTRACTED to `crate::oms_wiring::TokenHandleBridge`
+// (order-runtime dry-run PR, 2026-07-14) so this pipeline and the dhan-off
+// `order_runtime` share ONE adapter + ONE pinned-timeout client builder.
 // ---------------------------------------------------------------------------
 
-/// Cluster-C (2026-07-14): the live order-side channel handle the
-/// call-site captures use — `None` when the order-side wiring is absent
-/// (tests / callers that pass `order_side = None`).
-type OrderSideHandle = Option<(
-    tokio::sync::mpsc::Sender<OrderSideMsg>,
-    std::sync::Arc<OrderSideDayStats>,
-)>;
-
-/// Counted, non-blocking order-side capture — no-op without wiring.
-fn order_side_send(handle: &OrderSideHandle, msg: OrderSideMsg) {
-    if let Some((tx, stats)) = handle {
-        try_send_order_side(tx, stats, msg);
-    }
-}
+use crate::oms_wiring::TokenHandleBridge;
 
 // ---------------------------------------------------------------------------
 // TokenProvider bridge — EXTRACTED to `crate::oms_wiring::TokenHandleBridge`

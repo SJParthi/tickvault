@@ -4010,27 +4010,41 @@ mod tests {
             parse_segment_chars("NSE", "D"),
             Some(ExchangeSegment::NseFno)
         );
+        assert_eq!(
+            parse_segment_chars("BSE", "D"),
+            Some(ExchangeSegment::BseFno)
+        );
+        assert_eq!(
+            parse_segment_chars("NSE", "E"),
+            Some(ExchangeSegment::NseEquity)
+        );
+        assert_eq!(
+            parse_segment_chars("BSE", "E"),
+            Some(ExchangeSegment::BseEquity)
+        );
+        // Indices: any exchange with segment "I" maps to IDX_I (both NSE and
+        // BSE indices live in the IDX_I segment per annexure rule 2).
+        assert_eq!(parse_segment_chars("NSE", "I"), Some(ExchangeSegment::IdxI));
+        assert_eq!(parse_segment_chars("BSE", "I"), Some(ExchangeSegment::IdxI));
+        // Unknown / empty / currency / commodity → None, never panic.
+        assert_eq!(parse_segment_chars("", ""), None);
+        assert_eq!(parse_segment_chars("NSE", "C"), None);
+        assert_eq!(parse_segment_chars("MCX", "M"), None);
+        assert_eq!(parse_segment_chars("NSE", "X"), None);
     }
 
     #[test]
-    fn test_modify_request_alert_id_present_when_set() {
-        let req = DhanConditionalTriggerRequest {
-            dhan_client_id: "1".to_string(),
-            condition: TriggerCondition {
-                comparison_type: "PRICE_WITH_VALUE".to_string(),
-                exchange_segment: "NSE_EQ".to_string(),
-                security_id: "1333".to_string(),
-                indicator_name: None,
-                time_frame: None,
-                operator: "GREATER_THAN".to_string(),
-                comparing_value: Some(250.0),
-                comparing_indicator_name: None,
-                exp_date: None,
-                frequency: "ONCE".to_string(),
-                user_note: None,
-            },
-            orders: vec![],
-            alert_id: Some("12345".to_string()),
+    fn test_fill_event_carries_segment_sentinel_for_unknown() {
+        // The engine maps a None from parse_segment_chars to the sentinel;
+        // pin the sentinel value so downstream consumers can rely on it.
+        assert_eq!(SEGMENT_CODE_UNKNOWN, u8::MAX);
+        let fill = FillEvent {
+            security_id: 13,
+            segment_code: SEGMENT_CODE_UNKNOWN,
+            fill_lots: 1,
+            avg_price: 100.0,
+            lot_size: 1,
+            order_id: "PAPER-1".to_string(),
         };
         assert_eq!(fill.segment_code, SEGMENT_CODE_UNKNOWN);
         assert_eq!(fill.fill_lots, 1);
