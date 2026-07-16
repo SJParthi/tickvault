@@ -39,7 +39,9 @@ lane as close to each minute close T as the brokers' rate rules allow:
   parallel. Every fire still passes the per-(underlying, expiry) CAS
   min-spacing gate (≥3000 ms, monotonic domain) — in-cycle retries re-fire
   at burst + 3s, each a different key, so retries are concurrent too.
-  TWO-BUCKET budget model (the 2026-07-16 all-7 correction — §0b): chain
+  TWO-BUCKET budget model (the 2026-07-16 all-7 correction — §0b; the
+  chain-bucket exemption is **Assumed / UNVERIFIED-LIVE**, see the §0b
+  RS1 honesty marker): chain
   fires are governed SOLELY by that per-key gate (the option-chain API's
   OWN budget); they neither consult nor consume the Data-API COMBINED
   ring, so the R2 (2026-07-15) combined-denial arm is SUPERSEDED for
@@ -182,11 +184,33 @@ Correction 1 — the Dhan primary is ALL 7 CONCURRENT (the interim "honest
 > second one and only when it fails or rate limited alone only then this
 > option chain first second and spot second."
 
-All-7 is cap-legal via the TWO-BUCKET budget model: the 4 spot fires sit
-in the Data-API 5/sec bucket (4 ≤ 5, enforced by the COMBINED
+All-7 is taken as cap-legal via the TWO-BUCKET budget model: the 4 spot
+fires sit in the Data-API 5/sec bucket (4 ≤ 5, enforced by the COMBINED
 spot+expiry rolling ring); the 3 chain fires sit in the option-chain
 API's OWN per-(underlying, expiry) budget (different underlyings
-explicitly concurrent per the directive) — the burst breaches NEITHER.
+explicitly concurrent per the directive). **The chain-bucket EXEMPTION
+is Assumed / UNVERIFIED-LIVE (RS1 honesty marker, 2026-07-16 —
+supersedes this section's earlier "breaches NEITHER documented budget"
+assertion of fact):** whether Dhan exempts `optionchain` fires from the
+Data-API 5/sec bucket is documented nowhere we can cite — the
+counter-evidence is that `dhan/api-introduction.md` rule 10 lists
+Option Chain under Data APIs (5/sec), and the §8 grant math
+(`no-rest-except-live-feed-2026-06-27.md` §8.1) historically counted
+chains + spots jointly against one budget. The DISCRIMINATOR: the
+2026-07-16 15:35 IST post-market wire probe (all-7 concurrent on both
+brokers + the per-(underlying, expiry) 3s test) is the first live
+evidence — if it confirms the exemption, this marker upgrades to
+Verified-live with the probe evidence cited here. If the wire instead
+enforces ONE bucket, the burst 429s, the RateLimited-only shape ladder
+demotes to the split fallback — and the per-IST-day rung-0 RE-ENTRY
+CAP (`CADENCE_DHAN_RUNG0_REENTRY_CAP_PER_DAY` = 3, `ladder.rs`) stays
+as the BELT either way: after 3 same-day recoveries back to rung 0,
+the next demotion HOLDS rung 1 for the rest of the session (ONE
+edge-latched CADENCE-01 `rung0_reentry_cap_latched` log per day; the
+IST day-start reset re-arms it) — a one-bucket wire can never
+oscillate the shape 0⇄1 all day, and the pre-cap `ladder_exhausted`
+blind spot (rung 1 stays clean, so the exhausted edge never fires
+during a 0⇄1 oscillation) is closed by the same cap.
 The combined ring is therefore RE-SCOPED to spot + expiry-list fires
 ONLY; chain fires are governed solely by the per-key ≥3s CAS gate.
 
@@ -301,6 +325,7 @@ EXCEPT `rate_limited`, which fires per-request by design (see below):
 | `expiry_disagreement` | both brokers resolved the day's policy expiry for one underlying and the dates DIFFER — **Dhan WINS for keying BOTH lanes** (exchange-sourced expirylist authority); edge-latched ONCE per (underlying, day); both raw dates ride the payload + the store's provenance view (`tv_cadence_expiry_disagreement_total{underlying}`). SINCE 2026-07-16 (R6) the same edge ALSO dispatches the REAL typed `CadenceExpiryDisagreement` HIGH Telegram page (authority: `dhan-rest-only-noise-lock-2026-07-14.md` §2.2) — the ONE cadence signal that pages directly today |
 | `expiry_rate_limited` | an expiry-list fetch returned a broker 429 (verifier L2, 2026-07-15 — was `debug!`-only): one coded `warn!` per occurrence + `tv_cadence_expiry_rate_limited_total{broker}`; never blind-retried in-wave — the next `expiry_retry_interval_ms` wave re-attempts THROUGH the gates. Dhan expiry fires pass `DhanGates::try_acquire_expiry` (the L1 COMBINED 5-per-rolling-second budget + a 1-per-rolling-second expiry spacing) BEFORE dispatch, so a Dhan expiry 429 despite the gates is a gate-bug / shared-budget-co-tenant signal; a gate deferral skips the fire to the next wave (`tv_cadence_expiry_gate_deferred_total{broker}` — a deferral, never a violation). Groww expiry fires stay ungated by design (no Groww rate rule) |
 | `ladder_exhausted` | the failure ladder hit its max rung (5) — edge-latched ONCE per episode, re-armed by a clean cycle |
+| `rung0_reentry_cap_latched` | the Dhan shape ladder's per-IST-day rung-0 RE-ENTRY CAP latched (RS1(b), 2026-07-16): after `CADENCE_DHAN_RUNG0_REENTRY_CAP_PER_DAY` (3) same-day recoveries back to the all-7 rung, the NEXT demotion holds rung 1 for the rest of the session — the termination belt for the Assumed/UNVERIFIED-LIVE chain-bucket exemption (§0b): a one-bucket wire would otherwise oscillate the shape 0⇄1 all day with `ladder_exhausted` never firing (rung 1 stays clean). Edge-latched ONCE per IST day; the day-start reset re-arms. Counter: `tv_cadence_dhan_rung0_reentry_cap_latched_total` |
 
 **Dry-run note (honest — not an incident; DEMOTED per verifier F10, dated
 2026-07-15):** with the `DryRunLoggingExecutor` every fire returns Empty, so

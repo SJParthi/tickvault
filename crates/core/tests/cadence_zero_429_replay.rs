@@ -786,7 +786,14 @@ proptest! {
 
             // The Dhan SHAPE ladder walks on arming-failure dirty
             // streaks, recovers on clean streaks (2026-07-16 — the
-            // runner's fold, mirrored exactly).
+            // runner's fold, mirrored exactly EXCEPT the RS1(b)
+            // per-IST-day rung-0 re-entry cap, deliberately NOT
+            // mirrored: the cap only PINS the shape at rung 1 (a shape
+            // whose slot tables this replay already proves legal at
+            // every transition), so the uncapped sim exercises a STRICT
+            // SUPERSET of the capped runner's shape sequences — never
+            // an unbounded-recovery assertion (the cap's termination
+            // property is unit-pinned in ladder.rs).
             let _ = dhan_shape_ladder.advance(
                 arming,
                 cfg.concurrency_degrade_after_dirty_cycles,

@@ -45,8 +45,9 @@ use super::expiry::{
 };
 use super::gate::{DhanGates, GateVerdict};
 use super::ladder::{
-    DHAN_SHAPE_MAX_STEP, GROWW_SHAPE_MAX_STEP, SPOT_CONCURRENCY_MAX_STEP, StreakLadder,
-    StreakShift, failure_arms_ladder, may_retry_in_cycle, min_spot_step_for_cap,
+    CADENCE_DHAN_RUNG0_REENTRY_CAP_PER_DAY, DHAN_SHAPE_MAX_STEP, DhanRung0ReentryCap,
+    GROWW_SHAPE_MAX_STEP, SPOT_CONCURRENCY_MAX_STEP, StreakLadder, StreakShift,
+    failure_arms_ladder, may_retry_in_cycle, min_spot_step_for_cap,
 };
 use super::schedule::{
     CADENCE_RETRY_LATENCY_ALLOWANCE_MS, CycleSlots, build_cycle_slots, next_joinable_boundary,
@@ -361,6 +362,13 @@ where
     // multiple times"); dirty = RateLimited ONLY — the sole arming
     // class per the operator's rate-limit-only correction.
     let mut dhan_shape_ladder = StreakLadder::starting_at(0);
+    // RS1(b) (2026-07-16): the per-IST-day rung-0 RE-ENTRY cap — the
+    // termination belt for the UNVERIFIED-LIVE chain-bucket exemption
+    // (rule file §0b). After CADENCE_DHAN_RUNG0_REENTRY_CAP_PER_DAY
+    // same-day recoveries to rung 0, the next demotion holds rung 1 for
+    // the rest of the session (the day-start reset below re-arms it) —
+    // a one-bucket wire can never oscillate the shape 0⇄1 all day.
+    let mut dhan_rung0_cap = DhanRung0ReentryCap::default();
     // The adaptive concurrency ladders (operator spec addition 2026-07-15;
     // day-scoped like the shape rung). The Dhan spot ladder starts at
     // the STRUCTURAL floor for the configured window cap (a cap below 4
@@ -389,6 +397,8 @@ where
                 );
             }
             dhan_shape_ladder = StreakLadder::starting_at(0);
+            // RS1(b): the day-start reset re-arms the rung-0 re-entry cap.
+            dhan_rung0_cap = DhanRung0ReentryCap::default();
             spot_ladder = StreakLadder::starting_at(spot_step_floor);
             groww_ladder = StreakLadder::starting_at(0);
             exhausted_episode = false;
@@ -549,7 +559,10 @@ where
             dhan_dirty,
             cfg.concurrency_degrade_after_dirty_cycles,
             cfg.concurrency_recover_after_clean_cycles,
-            0,
+            // RS1(b): once the per-day rung-0 re-entry cap latched, the
+            // floor rises to rung 1 (clamp-safe — the latch fires ON a
+            // demotion, so the ladder already sits at rung 1).
+            dhan_rung0_cap.min_step(),
             DHAN_SHAPE_MAX_STEP,
         ) {
             log_concurrency_shift(
@@ -558,6 +571,24 @@ where
                 shift,
                 dhan_shape_ladder.step,
             );
+            if dhan_rung0_cap.record_shift(shift) {
+                // RS1(b): the demotion after the cap-th same-day re-entry
+                // to rung 0 — hold the split fallback for the rest of the
+                // session. Edge-latched ONCE per IST day by construction
+                // (record_shift returns true at most once per day-reset).
+                metrics::counter!("tv_cadence_dhan_rung0_reentry_cap_latched_total").increment(1);
+                error!(
+                    code = ErrorCode::Cadence01LaneDegraded.code_str(),
+                    stage = "rung0_reentry_cap_latched",
+                    reentry_cap = CADENCE_DHAN_RUNG0_REENTRY_CAP_PER_DAY,
+                    "CADENCE-01: Dhan shape ladder rung-0 re-entry cap \
+                     latched — holding the split fallback (rung 1) for the \
+                     rest of the session (the chain-bucket exemption is \
+                     UNVERIFIED-LIVE; a one-bucket wire would otherwise \
+                     oscillate the burst shape 0⇄1 all day). The IST \
+                     day-start reset re-arms the cap"
+                );
+            }
         }
         metrics::gauge!("tv_cadence_dhan_shape_step").set(f64::from(dhan_shape_ladder.step));
         if dhan_dirty && dhan_at_max_before {
