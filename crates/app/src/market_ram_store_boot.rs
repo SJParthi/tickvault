@@ -99,8 +99,7 @@ const RAM_CHAIN_REHYDRATE_HTTP_TIMEOUT_SECS: u64 = 15;
 /// Installs BOTH process-global stores (first-wins). Called from the boot
 /// path BEFORE the fold task spawns (`ram_store_wiring_guard` pins the
 /// order) so the catch-up's seals land in the spot rings.
-// TEST-EXEMPT: process-global OnceLock installs — behaviour is pinned by the
-// store crates' own first-wins tests + the ram_store_wiring_guard source scan.
+// TEST-EXEMPT: process-global OnceLock installs — pinned by the store crates' first-wins tests + ram_store_wiring_guard.
 pub fn install_market_ram_stores(cfg: &MarketRamStoreConfig, catchup_days: u32) {
     let spot_ok = install_spot_bar_store(cfg.spot_days);
     let chain_ok = install_chain_day_store(cfg.chain_row_cap as usize);
@@ -457,9 +456,7 @@ async fn run_chain_day_rehydrate(questdb: QuestDbConfig) {
 /// panicking incarnation (unwind builds) is reported loudly, never
 /// silently lost; it is NOT respawned (the rehydrate is boot-scoped and
 /// idempotent at the NEXT boot; live publishes fill forward meanwhile).
-// TEST-EXEMPT: tokio spawn + live QuestDB read — the pure legs
-// (chain_rehydrate_sql / parse / build_minute_snapshots / window starts)
-// carry the unit tests; wiring pinned by ram_store_wiring_guard.
+// TEST-EXEMPT: tokio spawn + live QuestDB read — the pure legs carry the unit tests; wiring pinned by ram_store_wiring_guard.
 pub fn spawn_chain_day_rehydrate(questdb: QuestDbConfig) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let handle = tokio::spawn(run_chain_day_rehydrate(questdb));
@@ -524,8 +521,7 @@ async fn run_ram_store_stats_loop() {
 /// Spawns the SUPERVISED stats/heartbeat task (house respawn pattern —
 /// DISK-WATCHER-01 family; unwind builds self-heal, release builds abort
 /// per `panic = "abort"` — the honest TICK-FLUSH-01 envelope).
-// TEST-EXEMPT: tokio spawn loop — the gauge names are pinned by
-// ram_store_wiring_guard; the stats math is tested in the store crates.
+// TEST-EXEMPT: tokio spawn loop — gauge names pinned by ram_store_wiring_guard; stats math tested in the store crates.
 pub fn spawn_ram_store_stats_task() -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
