@@ -37,11 +37,18 @@
 //! - Worst case ≈ 375 min × 6 slots × 1_000 rows × 24 B ≈ 54 MB —
 //!   test-asserted < 120 MB.
 //!
-//! ## Day roll
-//! The store holds ONLY the current IST day: a publish for a NEWER IST
-//! day clears the slot (options are current-day per the operator scope);
-//! a STALE older-day publish is DROPPED loudly (RAMSTORE-01
-//! `stage="day_drop"`) — it can never clear the live day.
+//! ## Day roll (pre-open honesty)
+//! The store holds the LATEST PUBLISHED IST day: a publish for a NEWER
+//! IST day clears the slot (options are current-day per the operator
+//! scope); a STALE older-day publish is DROPPED loudly (RAMSTORE-01
+//! `stage="day_drop"`) — it can never clear the live day. There is
+//! deliberately NO clock-based clearing (simple + deterministic), so an
+//! overnight-surviving process serves the PRIOR session pre-open until
+//! the first ~09:16 publish rolls the day — any future consumer MUST
+//! check [`ChainDayStore::day`] against today before trusting a read
+//! (the §38.8 decision-freshness gate); every returned snapshot also
+//! carries its own `minute_ts_ist_nanos` (day-derivable via
+//! [`epoch_day_of_ist_nanos`]).
 //!
 //! ## Durability (audit Rule 11 honesty)
 //! PROCESS-LOCAL. QuestDB (`option_chain_1m`) is and remains the durable
@@ -197,6 +204,10 @@ impl ChainDayStore {
         if snapshot.rows.len() > self.chain_row_cap {
             let over = snapshot.rows.len();
             snapshot.rows.truncate(self.chain_row_cap);
+            // PR-2 round-1 LOW: truncate keeps the ORIGINAL over-cap Vec
+            // capacity resident — release it (cold, loud-path only; the
+            // whole point of the cap is bounding resident bytes).
+            snapshot.rows.shrink_to_fit();
             truncated = true;
             self.truncated_publishes.fetch_add(1, Ordering::Relaxed);
             metrics::counter!("tv_ram_store_dropped_total", "reason" => "row_cap").increment(1);
@@ -298,6 +309,24 @@ impl ChainDayStore {
             out.push(Arc::clone(snap)); // O(1) EXEMPT: Arc refcount bump on a cold read path, not a data copy
         }
         out
+    }
+
+    /// The slot's resident IST epoch-day ordinal (`0` = nothing recorded
+    /// yet). PRE-OPEN HONESTY (PR-2 round-1): the store holds the LATEST
+    /// PUBLISHED day — before the first ~09:16 publish of a new session,
+    /// an overnight-surviving process still serves the PRIOR session's
+    /// minutes, so any future consumer MUST compare this against today's
+    /// IST epoch-day (the §38.8 decision-freshness gate) before trusting
+    /// `minute_snapshot` / `latest_minutes` reads. Each returned snapshot
+    /// additionally carries its own `minute_ts_ist_nanos`, day-derivable
+    /// via [`epoch_day_of_ist_nanos`] — the read surface exposes the day
+    /// both ways.
+    #[must_use]
+    pub fn day(&self, feed: Feed, underlying: ChainUnderlying) -> i64 {
+        self.slots[slot_index(feed, underlying)]
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .day
     }
 
     /// Resident minutes for one feed (summed over its underlyings).
@@ -671,6 +700,43 @@ mod tests {
         assert_eq!(stats.truncated_publishes, 0);
         assert_eq!(stats.day_drops, 0);
         assert_eq!(stats.minute_cap_drops, 0);
+    }
+
+    #[test]
+    fn test_chain_day_store_day_exposes_resident_day() {
+        // PR-2 round-1: the read surface exposes the slot's resident IST
+        // epoch-day so a pre-open consumer can detect the PRIOR session
+        // (the §38.8 freshness gate input). 0 = nothing recorded yet.
+        let store = ChainDayStore::new(1_000);
+        let day = 20_650;
+        assert_eq!(store.day(Feed::Dhan, ChainUnderlying::Nifty), 0);
+        store.record_live(snap(
+            Feed::Dhan,
+            ChainUnderlying::Nifty,
+            minute_on_day(day, 556),
+            2,
+        ));
+        assert_eq!(store.day(Feed::Dhan, ChainUnderlying::Nifty), day);
+        // Slot isolation: other slots still read unset.
+        assert_eq!(store.day(Feed::Groww, ChainUnderlying::Nifty), 0);
+        // Day roll advances the resident day; a stale drop never regresses it.
+        store.record_live(snap(
+            Feed::Dhan,
+            ChainUnderlying::Nifty,
+            minute_on_day(day + 1, 556),
+            2,
+        ));
+        assert_eq!(store.day(Feed::Dhan, ChainUnderlying::Nifty), day + 1);
+        assert_eq!(
+            store.record_live(snap(
+                Feed::Dhan,
+                ChainUnderlying::Nifty,
+                minute_on_day(day, 700),
+                2
+            )),
+            ChainRecordOutcome::DroppedOlderDay
+        );
+        assert_eq!(store.day(Feed::Dhan, ChainUnderlying::Nifty), day + 1);
     }
 
     #[test]
