@@ -317,14 +317,14 @@ EXCEPT `rate_limited`, which fires per-request by design (see below):
 | `spot_empty` | a spot leg returned 2xx-without-data (the Dhan 200-empty saga class; EITHER lane — dry-run returns Empty on every fire by design, see the dry-run note below); does NOT arm the ladder |
 | `chain_empty` | a chain leg returned 2xx-without-usable-data (EITHER lane); does NOT arm the ladder — kept distinct from `fetch_failed` so a 200-empty is never misread as a transport failure |
 | `groww_fallback` | the Groww T+800 verdict found failed burst legs — the sequential fallback engaged |
-| `cross_fill` | the lane's OWN fetch path exhausted (every own fire completed/failed, retries spent) without the cell; the OTHER lane's fresh same-minute data filled it (provenance stamped `CrossSource`). The freshness floor is LENDER-aware (CADENCE-XFILL-RUNG-1, 2026-07-15): the base T−5000 window widens to the Dhan lender's rung-shifted earliest chain pre-fire (`cross_fill_freshness_floor_ms`), so an anchor-ladder-shifted same-minute Dhan chain is never refused as stale while driving Dhan's own decision; the Groww lender keeps the base floor. The fallback rungs run only on own-path exhaustion or at the cutoff — never preempting a still-scheduled own fire (design §5 resolution order) |
+| `cross_fill` | the lane's OWN fetch path exhausted (every own fire completed/failed, retries spent) without the cell; the OTHER lane's fresh same-minute data filled it (provenance stamped `CrossSource`). Freshness floor: the plain base T−5000 window for BOTH lenders (`CADENCE_CROSS_FILL_FRESHNESS_FLOOR_MS`). *(Superseded 2026-07-16: the LENDER-aware widening — CADENCE-XFILL-RUNG-1, 2026-07-15, which widened the window to the Dhan lender's rung-shifted earliest chain PRE-fire — was RETIRED with the pre-close anchor ladder in the §0b reshape; every fire is post-close now, so the pre-fire instant it widened for no longer exists and the base floor suffices — §0b RETIRED-machinery list.)* The fallback rungs run only on own-path exhaustion or at the cutoff — never preempting a still-scheduled own fire (design §5 resolution order) |
 | `chain_embedded_spot` | third-rung provenance: the chain response's own embedded underlying spot filled the cell (own path exhausted first, as above) |
 | `moneyness_unknown` | ≥1 underlying's fold classified Unknown (spot unusable / rows unclassifiable / registry snapshot refused by the decide-time guard: unconfirmed publish, wrong minute, stale, or the boot sentinel) |
-| `queue_delay` | a fetch was refused by the SHARED `dhan_data_api_limiter`'s queue deadline (SELF-INFLICTED pacing — our own defense-in-depth limiter, not the broker; F1(iii) 2026-07-15). Stage-tagged distinctly, NEVER folded into `fetch_failed`, NEVER arms any ladder |
+| `queue_delay` | a fetch was refused by a SELF-INFLICTED pacing-queue deadline — our own machinery (e.g. an executor-internal queue), never the broker (F1(iii) 2026-07-15). *(Superseded 2026-07-16, coordinator ruling A: cadence fires no longer route through the shared `dhan_data_api_limiter` at all — §0b/§3b item 1 — so the originally-named shared-limiter source can no longer produce this stage on the cadence lane; the typing is KEPT for any future executor-side self-inflicted pacing source.)* Stage-tagged distinctly, NEVER folded into `fetch_failed`, NEVER arms any ladder |
 | `expiry_unresolved` | TWO emission points share this stage: (a) the per-cycle coalesced flag — ≥1 chain request was stamped `expiry_yyyymmdd = None` (the day-locked store has no policy date yet; the scheduler NEVER guesses — the executor impl may fall back to its warmup expiry; ALWAYS present in dry-run, where every expiry-list fetch returns Empty); (b) the resolution loop's EDGE-LATCHED deadline page — ONE `error!` per (broker, underlying) per IST day the instant `expiry_deadline_secs_of_day_ist` (default 08:55) passes unresolved; the lanes run degraded meanwhile and the background retry continues at `expiry_retry_interval_ms` until session end (the deadline gates the PAGE, never the attempts, and a post-deadline BOOT requires ≥2 consecutive failed waves before the page — E4, 2026-07-15; R3, 2026-07-15: waves count REAL dispatched attempts per pair only — a disabled-lane or gate-deferred iteration never advances the threshold). FALLING EDGE (E3, 2026-07-15): a LATER successful resolution for a pair whose page HAD fired emits one coded recovery `info!` (`stage = "expiry_resolved_late"` on the same CADENCE-01 code — no new variant) + `tv_cadence_expiry_resolved_late_total{broker, underlying}`, at most once per pair per day (first write wins) |
 | `expiry_disagreement` | both brokers resolved the day's policy expiry for one underlying and the dates DIFFER — **Dhan WINS for keying BOTH lanes** (exchange-sourced expirylist authority); edge-latched ONCE per (underlying, day); both raw dates ride the payload + the store's provenance view (`tv_cadence_expiry_disagreement_total{underlying}`). SINCE 2026-07-16 (R6) the same edge ALSO dispatches the REAL typed `CadenceExpiryDisagreement` HIGH Telegram page (authority: `dhan-rest-only-noise-lock-2026-07-14.md` §2.2) — the ONE cadence signal that pages directly today |
 | `expiry_rate_limited` | an expiry-list fetch returned a broker 429 (verifier L2, 2026-07-15 — was `debug!`-only): one coded `warn!` per occurrence + `tv_cadence_expiry_rate_limited_total{broker}`; never blind-retried in-wave — the next `expiry_retry_interval_ms` wave re-attempts THROUGH the gates. Dhan expiry fires pass `DhanGates::try_acquire_expiry` (the L1 COMBINED 5-per-rolling-second budget + a 1-per-rolling-second expiry spacing) BEFORE dispatch, so a Dhan expiry 429 despite the gates is a gate-bug / shared-budget-co-tenant signal; a gate deferral skips the fire to the next wave (`tv_cadence_expiry_gate_deferred_total{broker}` — a deferral, never a violation). Groww expiry fires stay ungated by design (no Groww rate rule) |
-| `ladder_exhausted` | the failure ladder hit its max rung (5) — edge-latched ONCE per episode, re-armed by a clean cycle |
+| `ladder_exhausted` | a dirty (rate-limited) cycle while the Dhan SHAPE ladder is ALREADY at its max rung — **rung 1, the split fallback** *(superseded 2026-07-16: the earlier "max rung (5)" wording described the RETIRED pre-close anchor ladder — §0b)* — edge-latched ONCE per episode, re-armed by a clean cycle. Per-ladder precision: this edge is DHAN-SHAPE-ONLY by construction (runner.rs folds only the Dhan shape ladder into it); the Groww fallback-shape ladder tops out at its own max rung 2 (the choice-3 last resort) with NO exhausted edge — its last rung IS the bounded degrade, reported via the lane's own stages — and the Dhan spot-concurrency ladder (max step 3, fully sequential) likewise has no exhausted edge |
 | `rung0_reentry_cap_latched` | the Dhan shape ladder's per-IST-day rung-0 RE-ENTRY CAP latched (RS1(b), 2026-07-16): after `CADENCE_DHAN_RUNG0_REENTRY_CAP_PER_DAY` (3) same-day recoveries back to the all-7 rung, the NEXT demotion holds rung 1 for the rest of the session — the termination belt for the Assumed/UNVERIFIED-LIVE chain-bucket exemption (§0b): a one-bucket wire would otherwise oscillate the shape 0⇄1 all day with `ladder_exhausted` never firing (rung 1 stays clean). Edge-latched ONCE per IST day; the day-start reset re-arms. Counter: `tv_cadence_dhan_rung0_reentry_cap_latched_total` |
 
 **Dry-run note (honest — not an incident; DEMOTED per verifier F10, dated
@@ -350,8 +350,10 @@ executors). The REAL-executor PR flips the flag to `false`.
    co-tenancy note in `no-rest-except-live-feed-2026-06-27.md` §9.3) — read
    `tv_cadence_gate_denials_total` (must stay 0 on nominal slots) and the
    ladder gauge before touching any spacing constant.
-4. A sustained `ladder_exhausted` (rung pinned at 5) means the broker cannot
-   serve even maximally-early fires — the decision quality is already degraded
+4. A sustained `ladder_exhausted` (the Dhan shape rung pinned at 1 — the
+   split fallback; *superseded 2026-07-16: "rung pinned at 5" described the
+   retired anchor ladder's max*) means the broker keeps rate-limiting even
+   the chains-then-spots split — the decision quality is already degraded
    honestly via CADENCE-02 skips; investigate the broker surface, not the
    scheduler.
 
@@ -534,17 +536,34 @@ verdict-failed or in-flight-skipped, never both), so no duplicate fire is
 possible, but this is a documented deviation from the strict
 second-1/second-2 fallback shape.
 
-## §3d. Any-failure ladder arming — Assumed, amplitude-1 oscillation accepted (verifier F7, dated 2026-07-15)
+## §3d. Any-failure ladder arming — SUPERSEDED 2026-07-16 (RateLimited-only arming; the F7 amplitude-1 oscillation is retired with the anchor ladder)
 
-The operator's verbatim rule arms the anchor ladder on ANY arming failure in
-the cycle EVEN WHEN an in-cycle retry recovered the leg. Under a perfectly
-alternating fail/clean minute pattern this yields a PERMANENT AMPLITUDE-1
-rung oscillation (0 ↔ 1, one `ladder_shift` pair per two minutes) — accepted
-as the CURRENT CONTRACT and pinned by
-`test_ladder_any_failure_arming_amplitude_1_oscillation`; it can never walk
-deeper without CONSECUTIVE failing cycles. Flagged **Assumed** pending
-operator confirmation of a "recovered-in-cycle does not arm" refinement (the
-flag also lives on `failure_arms_ladder`'s doc + the plan file).
+*(Superseded 2026-07-16 by the §0b operator corrections — retained as dated
+history per the house convention; the paragraph below described the
+2026-07-15 contract, which is NO LONGER CURRENT.)* The F7 finding
+(2026-07-15) recorded the then-current contract of the RETIRED pre-close
+ANCHOR ladder: it armed on ANY arming failure in the cycle even when an
+in-cycle retry recovered the leg, and under a perfectly alternating
+fail/clean minute pattern this yielded an accepted PERMANENT AMPLITUDE-1
+rung oscillation (0 ↔ 1, one `ladder_shift` pair per two minutes), pinned
+by the then-test `test_ladder_any_failure_arming_amplitude_1_oscillation`
+(DELETED with the anchor ladder). BOTH halves are superseded by the
+2026-07-16 operator corrections (§0b): (a) arming is **RateLimited-ONLY**
+(*"rate limited alone alone fallback"* — Timeout / Transport / Empty /
+Auth / Malformed / QueueDelay never reshape), and (b) the shape ladder's
+2-CONSECUTIVE-dirty streak threshold means an alternating pattern never
+reshapes AT ALL — the replacement pin
+`test_dhan_shape_ladder_alternating_pattern_never_degrades` (`ladder.rs`)
+proves the OPPOSITE of the old contract (the shape holds rung 0 forever
+under alternation); the deleted test's name is retained above as history
+only, never a live citation. The "recovered-in-cycle does not arm"
+refinement the F7 flag awaited is MOOT under the new contract at the
+CYCLE level (a RateLimited leg whose bounded retry recovered still marks
+the cycle dirty — the operator's "tried that multiple times" counts
+attempts, not final outcomes); the 2-dirty/3-clean streak thresholds
+remain **Assumed** pending operator confirm (the flag lives on the
+`concurrency_*` config docs), and the RS1(b) per-day rung-0 re-entry cap
+(§0b) bounds the residual streak-driven oscillation.
 
 ## §3e. ONE-SOURCE-OF-TRUTH DELEGATION (2026-07-15, pending)
 
