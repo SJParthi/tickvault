@@ -12,10 +12,11 @@
 //!    inside the `spawn_groww_spot_1m_leg` helper body, gated on
 //!    `config.groww_option_chain_1m.enabled` / `.probe_and_report`
 //!    (fail-safe: absent section = pipeline off + probe on).
-//! 2. The spot→chain sequencing watch channel is created ONLY when BOTH
-//!    legs are enabled (chain-off keeps the spot leg byte-identical to
-//!    PR-2), and the Groww spot boot module PUBLISHES the minute-done
-//!    signal unconditionally after every fire.
+//! 2. 2026-07-14 auto-ladder (operator approval): the spot→chain
+//!    sequencing channel is RETIRED — the chain leg fires on its OWN
+//!    minute-boundary timer; the helper creates ONE shared
+//!    `GrowwRestBurstState` and threads it into every Groww REST leg.
+//!    The chain→contract minute-done publish is KEPT unchanged.
 //! 3. Stub-guard: `groww_option_chain_1m_boot.rs` really does the work —
 //!    hits the Groww chain endpoint, resolves expiries from the
 //!    instruments master (never an expiry REST endpoint), reads the
@@ -124,47 +125,75 @@ fn ratchet_groww_chain1m_spawn_and_probe_are_config_gated_inside_the_dual_arm_he
     );
 }
 
-/// Sequencing pin: the watch channel exists ONLY when both legs are on,
-/// and the Groww spot leg publishes the minute-done signal
-/// UNCONDITIONALLY after every fire (success OR failure — the chain must
-/// never block on a failing spot leg; the Dhan seam's exact semantics).
+/// 2026-07-14 auto-ladder pin: the spot→chain sequencing channel is
+/// RETIRED (each Groww REST leg fires on its OWN minute-boundary timer);
+/// the helper creates ONE shared burst state and threads it into every
+/// Groww REST leg; the chain→contract minute-done publish is KEPT.
 #[test]
-fn ratchet_groww_chain1m_sequencing_channel_and_spot_publish() {
+fn ratchet_groww_chain1m_auto_ladder_own_timer_and_burst_wiring() {
     let main_src = read_app_src("src/main.rs");
     let (def_pos, end) = helper_span(&main_src);
     let helper_body = &main_src[def_pos..end];
+
+    // The retired spot→chain channel gate must NOT come back — a re-added
+    // sequencing wait would silently re-impose the ~2.5s chain delay the
+    // auto-ladder deleted.
     assert!(
-        helper_body.contains("config.groww_spot_1m.enabled && chain_enabled"),
-        "the watch channel must be created ONLY when BOTH Groww REST legs \
-         are enabled (chain-off keeps the spot leg byte-identical to PR-2)"
+        !helper_body.contains("config.groww_spot_1m.enabled && chain_enabled"),
+        "the retired spot→chain watch-channel gate reappeared in \
+         spawn_groww_spot_1m_leg — the 2026-07-14 auto-ladder fires each \
+         leg on its OWN timer (no spot→chain sequencing channel)"
+    );
+    // ONE shared burst state, built from the config section, threaded into
+    // the legs (spot + chain + contract + probe all take `burst:`).
+    assert!(
+        helper_body.contains("GrowwRestBurstState::new("),
+        "the helper must build the shared GrowwRestBurstState from \
+         [groww_rest_burst] config"
     );
     assert!(
-        helper_body.contains("tokio::sync::watch::channel::<Option<u32>>(None)"),
-        "the spot→chain minute-done watch channel must be created in the helper"
+        helper_body.contains("config.groww_rest_burst.tier")
+            && helper_body.contains("config.groww_rest_burst.warm_up"),
+        "the burst state must be built from the [groww_rest_burst] config \
+         fields (tier + warm_up)"
     );
     assert!(
-        helper_body.contains("minute_done_tx") && helper_body.contains("spot_minute_done"),
-        "the sender must flow into the spot params and the receiver into \
-         the chain params"
+        helper_body
+            .matches("burst: std::sync::Arc::clone(&burst)")
+            .count()
+            >= 3,
+        "the shared burst handle must flow into the spot, chain and \
+         contract params (plus the probe path)"
+    );
+    // The chain→contract sequencing channel is KEPT (the contract leg's
+    // selection depends on the chain's per-minute anchors).
+    assert!(
+        helper_body.contains("chain_minute_done_tx"),
+        "the chain→contract minute-done channel must still be created in \
+         the helper (contract sequencing is unchanged)"
     );
 
-    // The spot boot module publishes unconditionally at the end of every
-    // fire (the option_chain_1m_wiring_guard precedent on the Dhan side).
-    let spot_src = read_app_src("src/groww_spot_1m_boot.rs");
-    assert!(
-        spot_src.contains("tx.send_replace(Some(fire))"),
-        "groww_spot_1m_boot.rs must publish the minute-done signal after \
-         every fire via send_replace"
-    );
-    let publish_pos = spot_src
+    // The chain boot module still publishes the chain→contract signal
+    // unconditionally AFTER every fire.
+    let chain_src = read_app_src("src/groww_option_chain_1m_boot.rs");
+    let publish_pos = chain_src
         .find("tx.send_replace(Some(fire))")
-        .expect("publish site exists");
-    let fire_call_pos = spot_src
-        .find("fire_one_minute(")
-        .expect("fire_one_minute call exists");
+        .expect("the chain→contract publish site must exist");
+    let fire_call_pos = chain_src
+        .find("fire_one_groww_chain_minute(")
+        .expect("fire call exists");
     assert!(
         publish_pos > fire_call_pos,
-        "the publish must come AFTER the fire (spot first, chain right after)"
+        "the chain→contract publish must come AFTER the chain fire"
+    );
+
+    // The spot leg no longer publishes any minute-done signal (its
+    // downstream consumer — the chain wait — is retired).
+    let spot_src = read_app_src("src/groww_spot_1m_boot.rs");
+    assert!(
+        !spot_src.contains("send_replace"),
+        "groww_spot_1m_boot.rs must NOT publish a minute-done signal — the \
+         spot→chain sequencing is retired (2026-07-14 auto-ladder)"
     );
 }
 
@@ -185,11 +214,15 @@ fn ratchet_groww_chain1m_boot_module_is_not_a_stub() {
         "select_current_option_expiry",
         // The shared-minter token is read READ-ONLY (chain-routed cache).
         "GrowwTokenCache::new_chain",
-        // Sequencing: the reused Dhan wait core + the Groww fallback const.
-        "wait_for_signal_or_fallback",
-        "GROWW_CHAIN_1M_FALLBACK_DELAY_MS",
-        // Defensive pacing + bounded budget (no unbounded retry).
-        "groww_min_gap_wait_ms",
+        // 2026-07-14 auto-ladder: the chain fires on its OWN minute
+        // boundary + a concurrent underlying wave; a 429 demotes the
+        // shared session tier (edge-latched).
+        "GROWW_CHAIN_1M_FIRE_DELAY_MS",
+        "intra_wave_stagger_ms",
+        "tv_groww_rest_burst_tier_total",
+        "note_rate_limited",
+        "burst_demoted",
+        // Bounded per-underlying budget (no unbounded retry).
         "GROWW_CHAIN_1M_UNDERLYING_BUDGET_SECS",
         // Persist through the feed-parameterized writer WITH the
         // rho/close_to_data_ms extension; the live-lane id is reused.

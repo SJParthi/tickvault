@@ -28,6 +28,10 @@ loom = { workspace = true, optional = true }
 
 [features]
 loom = ["dep:loom"]
+# Gate 2 of the Groww order-side live-fire lattice (groww-second-feed-scope
+# §39.2). NON-DEFAULT: a default build excludes the entire
+# crates/trading/src/oms/groww subtree.
+groww_orders = []
 
 [dev-dependencies]
 tickvault-core = { path = "../core" }

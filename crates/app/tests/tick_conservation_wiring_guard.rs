@@ -34,15 +34,11 @@ fn test_dhan_tick_conservation_audit_is_wired_into_main() {
     );
 }
 
-#[test]
-fn test_groww_tick_conservation_audit_is_wired_into_main() {
-    let src = main_rs_source();
-    assert!(
-        src.contains("run_groww_tick_conservation_audit("),
-        "main.rs must call run_groww_tick_conservation_audit(...) at 15:40 IST — \
-         otherwise the Groww feed writes ticks but no daily conservation row."
-    );
-}
+// RETIRED 2026-07-15 (Groww live-feed deletion):
+// test_groww_tick_conservation_audit_is_wired_into_main died with the Groww
+// NDJSON leg — the sidecar that produced the NDJSON delivered-count is
+// deleted, so main.rs no longer calls run_groww_tick_conservation_audit
+// (the Dhan WAL-vs-DB audit below is the surviving daily conservation row).
 
 #[test]
 fn test_conservation_spawn_lives_in_common_path_not_post_market() {
@@ -61,26 +57,23 @@ fn test_conservation_spawn_lives_in_common_path_not_post_market() {
          least once from main()'s process-global prefix (>= 2 textual mentions); \
          found {call_count}."
     );
-    // No conservation run may appear inside spawn_post_market_tasks: every
-    // run_*_tick_conservation_audit mention must live inside the dedicated
-    // spawn fn (which is defined AFTER spawn_post_market_tasks in the file) —
-    // i.e. after the post-market fn's definition point AND after the dedicated
-    // fn's definition point.
-    let post_market_def_idx = src
-        .find("fn spawn_post_market_tasks(")
-        .expect("spawn_post_market_tasks must exist in main.rs");
-    for pat in [
-        "run_tick_conservation_audit(",
-        "run_groww_tick_conservation_audit(",
-    ] {
+    // Every run_*_tick_conservation_audit mention must live inside the
+    // dedicated spawn fn — i.e. after its definition point. (PR-C2,
+    // 2026-07-13: the Dhan-gated `spawn_post_market_tasks` seam this test
+    // originally ordered against was DELETED with the Dhan live-WS lane,
+    // so the anti-nesting anchor reduces to the dedicated-fn check — a
+    // Dhan-gated re-nesting target no longer exists in main.rs.)
+    // (2026-07-15: the run_groww_tick_conservation_audit pattern retired
+    // with the Groww NDJSON leg — Dhan is the sole surviving run.)
+    for pat in ["run_tick_conservation_audit("] {
         let mut search_from = 0;
         while let Some(rel) = src[search_from..].find(pat) {
             let abs = search_from + rel;
             assert!(
-                abs > spawn_def_idx && abs > post_market_def_idx,
+                abs > spawn_def_idx,
                 "conservation run `{pat}` found at byte {abs}, before the \
                  dedicated spawn fn (byte {spawn_def_idx}) — a conservation run \
-                 must not be re-nested into a Dhan-gated path."
+                 must not be re-nested into a feed-gated path."
             );
             search_from = abs + pat.len();
         }
@@ -88,31 +81,16 @@ fn test_conservation_spawn_lives_in_common_path_not_post_market() {
 }
 
 #[test]
-fn test_both_feed_gates_present_and_groww_after_dhan() {
-    // Each lane's 15:40 run is gated on the truthful runtime feed flag so a
-    // disabled lane writes no misleading zero-balanced row; the Groww run is
-    // sequenced after the Dhan run in the same task (same IST day/window).
+fn test_dhan_feed_gate_present() {
+    // The Dhan lane's 15:40 run is gated on the truthful runtime feed flag so
+    // a disabled lane writes no misleading zero-balanced row. (2026-07-15:
+    // the Groww gate + Groww-after-Dhan ordering pins retired with the Groww
+    // NDJSON conservation leg.)
     let src = main_rs_source();
     assert!(
         src.contains("is_enabled(tickvault_common::feed::Feed::Dhan)"),
         "the Dhan conservation run must be gated on \
          feed_runtime.is_enabled(Feed::Dhan)."
-    );
-    assert!(
-        src.contains("is_enabled(tickvault_common::feed::Feed::Groww)"),
-        "the Groww conservation run must be gated on \
-         feed_runtime.is_enabled(Feed::Groww)."
-    );
-    let dhan_idx = src
-        .find("run_tick_conservation_audit(")
-        .expect("Dhan conservation run must exist in main.rs");
-    let groww_idx = src
-        .find("run_groww_tick_conservation_audit(")
-        .expect("Groww conservation run must exist in main.rs");
-    assert!(
-        groww_idx > dhan_idx,
-        "the Groww conservation run must be sequenced AFTER the Dhan run inside \
-         the same 15:40 IST task so both reconcile the same IST day."
     );
 }
 
@@ -128,13 +106,10 @@ fn test_post_market_tasks_has_process_global_once_guard() {
     // paths (the lane's spawn_post_market_tasks AND the stack's Phase 5
     // canary/spot/chain family) claim the SAME once-guard. This guard now
     // pins both halves of that invariant.
-    let src = main_rs_source();
-    assert!(
-        src.contains("!tickvault_app::dhan_rest_stack::claim_post_market_task_family_once()"),
-        "spawn_post_market_tasks must be protected by the SHARED \
-         claim_post_market_task_family_once once-guard (lib static shared \
-         with the Dhan REST-only stack)."
-    );
+    // PR-C2 (2026-07-13): the lane's `spawn_post_market_tasks` caller (the
+    // main.rs half of the shared once-guard) was DELETED with the Dhan
+    // live-WS lane — the Dhan REST-only stack is now the SOLE claimant, so
+    // the surviving pins are the stack's claim + the atomic-swap shape.
     let stack_src = {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/dhan_rest_stack.rs");
         fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))

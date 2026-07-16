@@ -35,40 +35,34 @@
 //! cannot resolve DEGRADES for the day (coded error + forensics row +
 //! counter + one HIGH page) — never a guessed expiry.
 //!
-//! ## Sequencing (spot first, chain right after — best-effort, bounded)
-//! The Groww spot leg publishes a `tokio::sync::watch` signal at the END
-//! of each of its fires (success or failure). This task sleeps to each
-//! minute boundary + [`GROWW_CHAIN_1M_FALLBACK_DELAY_MS`] but wakes EARLY
-//! when the spot signal reaches its minute — the Dhan-identical semantics
-//! (`option_chain_1m_boot.rs`, whose `wait_for_signal_or_fallback` core is
-//! REUSED): a disabled, dead, or slow spot leg never blocks chain capture.
+//! ## Scheduling — the 2026-07-14 burst AUTO-LADDER (own-timer fire)
+//! (operator approval "approved and go ahead with the recommendation";
+//! contract `no-rest-except-live-feed-2026-06-27.md` §9.7 +
+//! `groww-second-feed-scope-2026-06-19.md` §38.9). This task fires on its
+//! OWN minute-boundary timer at close + [`GROWW_CHAIN_1M_FIRE_DELAY_MS`]
+//! (300 ms) — the PR-3 spot→chain watch-signal sequencing, its 2.5 s
+//! fallback timer, and the 1 s inter-underlying min-gap are RETIRED
+//! (~4.5 s of self-imposed latency deleted; the measured chain round-trip
+//! is ~0.2 s per the 2026-07-13 live probe). The chain is a live
+//! snapshot — the freshest possible decision data is the whole point.
 //!
 //! ## Rate budget + pacing
 //! Groww documents NO chain-specific rate rule
 //! (`docs/groww-ref/14-option-chain.md` §4 — the limit family is
-//! UNDOCUMENTED; Unknown ≠ unlimited). The 3 underlyings are fetched
-//! SEQUENTIALLY (at most ONE in-flight request — the ≤6 req/s
-//! minute-boundary pacing ceiling of
-//! `docs/groww-ref/15-rate-limits-and-capacity.md`, shared-token bucket
-//! co-tenanted with bruteX), one request per underlying per minute (NO
-//! in-minute re-poll ladder — the chain is a live snapshot, not a sealing
-//! candle), plus a MECHANICAL cross-request
-//! [`GROWW_CHAIN_1M_MIN_GAP_MS`] guard: ONE scalar last-request stamp
-//! spans consecutive chain requests (any underlying), so within a fire
-//! the 2nd/3rd requests each wait out the remaining gap instead of
-//! bursting back-to-back at the boundary.
-//!
-//! Spacing math (hostile-round-1 MEDIUM-1): with a 1,000 ms min gap the
-//! 3 requests of one fire spread over ≥ 2 × 1,000 ms = 2 s → the chain
-//! leg contributes at most 1 req/s sustained. The fallback wake trails
-//! the spot fire by [`GROWW_CHAIN_1M_FALLBACK_DELAY_MS`] (2.5 s), and
-//! even in the worst overlap (spot still laddering when the chain's
-//! fallback fires) the combined boundary burst is spot's ≤1 in-flight
-//! request + the chain's ≤1 req/s — comfortably inside the ≤6 req/s
-//! family ceiling and the ~3 req/s bruteX co-tenancy headroom. Every 429
-//! is counted + shape-captured (the live-probe (e) requirement); payload
-//! bytes + strike/leg counts are histogrammed (the live-probe (d)
-//! requirement — chain size is undocumented, U-12).
+//! UNDOCUMENTED; Unknown ≠ unlimited). The 3 underlyings fetch
+//! CONCURRENTLY as ONE WAVE (no in-minute re-poll ladder — a live
+//! snapshot, not a sealing candle). Under the DEFAULT `two_wave` tier the
+//! chain wave (3 req) and the spot wave (4 req at close+1,350 ms) are
+//! more than a rolling second apart, so the boundary burst never exceeds
+//! 4 req/s; the probe-gated `seven_concurrent` tier fires both waves
+//! together (7 req/s). Any Groww-leg HTTP 429 AUTO-DEMOTES the session
+//! (`crate::groww_rest_burst` — a demoted two_wave staggers wave slots by
+//! 350 ms). Every 429 is counted + shape-captured (the live-probe (e)
+//! requirement); payload bytes + strike/leg counts are histogrammed (the
+//! live-probe (d) requirement — chain size is undocumented, U-12). An
+//! optional pre-boundary warm-up GET (boundary−4 s, 3 s-bounded,
+//! unauthenticated) re-establishes an idle-closed TLS connection before
+//! the critical window.
 //!
 //! ## Config semantics (mirrors the Dhan `[option_chain_1m]` gate)
 //! - `enabled = true` → run the pipeline.
@@ -98,14 +92,15 @@ use tracing::{error, info, warn};
 
 use tickvault_common::config::QuestDbConfig;
 use tickvault_common::constants::{
-    GROWW_API_VERSION_HEADER, GROWW_API_VERSION_VALUE, GROWW_CHAIN_1M_FALLBACK_DELAY_MS,
+    GROWW_API_VERSION_HEADER, GROWW_API_VERSION_VALUE, GROWW_CHAIN_1M_FIRE_DELAY_MS,
     GROWW_CHAIN_1M_MASTER_RETRY_BACKOFF_SECS, GROWW_CHAIN_1M_MAX_BODY_BYTES,
-    GROWW_CHAIN_1M_MIN_GAP_MS, GROWW_CHAIN_1M_REQUEST_TIMEOUT_SECS,
-    GROWW_CHAIN_1M_UNDERLYING_BUDGET_SECS, GROWW_CHAIN_1M_UNDERLYINGS,
-    GROWW_OPTION_CHAIN_URL_PREFIX, IST_UTC_OFFSET_SECONDS, SECONDS_PER_DAY,
-    SPOT_1M_REST_LAST_FIRE_SECS_OF_DAY_IST,
+    GROWW_CHAIN_1M_REQUEST_TIMEOUT_MS, GROWW_CHAIN_1M_UNDERLYING_BUDGET_SECS,
+    GROWW_CHAIN_1M_UNDERLYING_NOT_SERVED_THRESHOLD, GROWW_CHAIN_1M_UNDERLYINGS,
+    GROWW_OPTION_CHAIN_URL_PREFIX, GROWW_REST_WARMUP_LEAD_SECS, IST_UTC_OFFSET_SECONDS,
+    SECONDS_PER_DAY, SPOT_1M_REST_LAST_FIRE_SECS_OF_DAY_IST,
 };
 use tickvault_common::error_code::ErrorCode;
+use tickvault_common::feed::Feed;
 use tickvault_common::sanitize::capture_rest_error_body;
 use tickvault_common::trading_calendar::TradingCalendar;
 use tickvault_core::feed::groww::instruments::{
@@ -124,15 +119,20 @@ use tickvault_storage::rest_fetch_audit_persistence::{
     ensure_rest_fetch_audit_table,
 };
 
-use crate::groww_spot_1m_boot::GrowwTokenCache;
+use crate::groww_spot_1m_boot::{GrowwTokenCache, parse_groww_ga_failure};
 // Session-boundary scheduling primitives + edge tracker + body-cap helpers
 // are REUSED from the Dhan spot leg (NSE-session facts + pure state
 // machines); the sequencing wait core + strike bounds + the fully-failed
 // verdict are REUSED from the Dhan chain leg (one implementation, two
 // feeds).
+// The 2026-07-14 burst auto-ladder: shared tier/demotion state, the
+// intra-wave stagger schedule, and the pre-boundary warm-up sender.
+use crate::groww_rest_burst::{
+    GrowwRestBurstState, intra_wave_stagger_ms, send_warmup_get, wave_sleep_from_now_ms,
+};
 use crate::option_chain_1m_boot::{
-    MAX_PLAUSIBLE_STRIKE, MAX_STRIKES_PER_CHAIN, chain_minute_fully_failed, stale_wake_backoff_ms,
-    wait_for_signal_or_fallback,
+    MAX_PLAUSIBLE_STRIKE, MAX_STRIKES_PER_CHAIN, MoneynessWarnLatches, chain_minute_fully_failed,
+    classify_chain_legs, publish_chain_moneyness_snapshot, record_chain_moneyness_observability,
 };
 use crate::spot_1m_rest_boot::{
     EdgeAction, FailureEdge, accumulation_within_cap, count_missed_boundaries,
@@ -142,6 +142,10 @@ use crate::spot_1m_rest_boot::{
 
 /// Backoff before the supervisor respawns a dead/failed scheduler run.
 const GROWW_CHAIN_1M_RESPAWN_BACKOFF_SECS: u64 = 30;
+/// Boot-probe inter-call pacing (ms) — the probe is a cold one-shot
+/// measurement, deliberately paced at 1 s per underlying (the retired
+/// live-fire min-gap does not apply to the auto-ladder waves).
+const GROWW_CHAIN_PROBE_PACING_MS: u64 = 1_000;
 /// Milliseconds per second / per day (wall-clock latency math).
 const MILLIS_PER_SEC: i64 = 1_000;
 const MILLIS_PER_DAY: i64 = 86_400_000;
@@ -164,10 +168,12 @@ pub struct GrowwChain1mTaskParams {
     pub calendar: Arc<TradingCalendar>,
     /// QuestDB target for the `option_chain_1m` + `rest_fetch_audit` tables.
     pub questdb: QuestDbConfig,
-    /// GROWW spot-leg "minute completed" signal (the boundary
-    /// seconds-of-day the spot leg just finished firing). `None` when the
-    /// spot leg is disabled — the fallback timer then paces every fire.
-    pub spot_minute_done: Option<tokio::sync::watch::Receiver<Option<u32>>>,
+    /// The shared 2026-07-14 burst auto-ladder state (tier + session
+    /// demotion flag + warm-up toggle) — one `Arc` across the spot, chain
+    /// and contract legs so a 429 on ANY leg demotes them all. (The PR-3
+    /// spot→chain minute-done signal was RETIRED by the auto-ladder — this
+    /// leg fires on its own minute-boundary timer.)
+    pub burst: Arc<GrowwRestBurstState>,
     /// PR-4 sequencing: the boundary seconds-of-day THIS leg just finished
     /// firing, published UNCONDITIONALLY at the END of every chain fire —
     /// success OR failure — via `send_replace` (the spot leg's exact
@@ -268,6 +274,12 @@ pub struct GrowwParsedChain {
     /// a panic; whether both sides are always present is Unknown, so the
     /// `Option<>` discipline is defensive).
     pub legs: Vec<GrowwParsedLeg>,
+    /// RAW entry count of the `strikes` map — every map entry increments
+    /// it BEFORE the invalid/cap/kept triage (2026-07-14 NIFTY expiry-day
+    /// incident: the empty-vs-drift discriminator; `strikes_seen ==
+    /// strikes_kept + invalid_strikes + truncated_strikes` by
+    /// construction).
+    pub strikes_seen: u32,
     /// Strikes kept (the U-12 chain-size probe input).
     pub strikes_kept: u32,
     /// Strike keys that did not parse as numbers OR parsed to an
@@ -354,6 +366,7 @@ pub fn parse_groww_option_chain(body: &str) -> Option<GrowwParsedChain> {
         ..GrowwParsedChain::default()
     };
     for (strike_key, legs) in strikes {
+        chain.strikes_seen = chain.strikes_seen.saturating_add(1);
         let Ok(strike) = strike_key.trim().parse::<f64>() else {
             chain.invalid_strikes = chain.invalid_strikes.saturating_add(1);
             continue;
@@ -383,25 +396,9 @@ pub fn parse_groww_option_chain(body: &str) -> Option<GrowwParsedChain> {
 // Pure pacing / classification helpers
 // ---------------------------------------------------------------------------
 
-/// Mechanical cross-request pacing: milliseconds still to wait so ANY two
-/// CONSECUTIVE chain requests (across underlyings — one scalar stamp, the
-/// hostile-round-1 MEDIUM-1 fix) are ≥ [`GROWW_CHAIN_1M_MIN_GAP_MS`]
-/// apart. This is what spreads one fire's 3 requests over ≥ 2 s instead
-/// of a back-to-back boundary burst (Groww documents no chain rule, but
-/// the ≤6 req/s family ceiling + bruteX co-tenancy demand real spacing).
-/// A midnight-wrapped/backwards clock yields 0 (never a long spurious
-/// sleep). Pure.
-#[must_use]
-pub fn groww_min_gap_wait_ms(last_request_ms_of_day: Option<i64>, now_ms_of_day: i64) -> u64 {
-    let Some(last) = last_request_ms_of_day else {
-        return 0;
-    };
-    if now_ms_of_day < last {
-        return 0;
-    }
-    let elapsed = now_ms_of_day - last;
-    u64::try_from((GROWW_CHAIN_1M_MIN_GAP_MS as i64).saturating_sub(elapsed)).unwrap_or(0)
-}
+// (The pre-2026-07-14 `groww_min_gap_wait_ms` cross-request pacing was
+// RETIRED with the auto-ladder — the wave fires concurrently; the demoted
+// stagger schedule lives in `crate::groww_rest_burst`.)
 
 /// Bounded failure slug for the forensics row — NEVER raw body text. Pure.
 #[must_use]
@@ -739,9 +736,81 @@ fn chain_audit_flush_best_effort(audit_writer: &mut RestFetchAuditWriter) {
     }
 }
 
+/// The bounded failure msg for an unparseable 2xx chain body. G1
+/// (2026-07-14): when the body is the Groww FAILURE envelope
+/// (`{"status":"FAILURE","error":{code,message}}` — the envelope wins over
+/// the HTTP status), the msg carries the GA wire code + the redacted
+/// message so the existing CHAIN-02 failure log/audit context names WHY.
+/// Forensics only — the (already correct) Failed classification is
+/// unchanged, and policy never branches on the GA code. Pure.
+fn chain_parse_failure_msg(body_text: &str) -> String {
+    match parse_groww_ga_failure(body_text) {
+        Some(ga) => format!(
+            "2xx FAILURE envelope ga_code={} msg={}",
+            ga.ga_code,
+            capture_rest_error_body(&ga.message)
+        ),
+        None => "2xx but the body was not a parseable option chain".to_string(),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Per-minute fire
 // ---------------------------------------------------------------------------
+
+/// Zero-leg evidence bundle (2026-07-14 NIFTY expiry-day incident): the
+/// discriminator the 14:54→15:29 IST window structurally lacked — the
+/// Empty arm discarded the parsed struct and captured no body evidence,
+/// so "~40 B truly-empty map" vs "~37 KB of entries our leg extraction
+/// dropped" was unanswerable retroactively. Recorded on EVERY zero-leg
+/// classification so the next occurrence is self-evidencing within one
+/// minute of occurrence.
+#[derive(Clone, Debug, PartialEq)]
+struct ChainZeroLegEvidence {
+    /// Raw 2xx body size in bytes (the decisive size discriminator).
+    payload_bytes: usize,
+    /// RAW `strikes` map entry count (0 = genuinely empty chain).
+    strikes_seen: u32,
+    /// Entries that survived the key-plausibility triage.
+    strikes_kept: u32,
+    /// Entries dropped by the key-plausibility triage.
+    invalid_strikes: u32,
+    /// BOUNDED SANITIZED body sample — the EXACT house choke point the
+    /// failure arms use ([`capture_rest_error_body`]: control-char strip
+    /// → URL/credential-param redaction → JWT-shape redaction →
+    /// credential-JSON-field redaction → ≤300-char truncation), so a
+    /// token/credential can never leak into the log line.
+    body_sample: String,
+}
+
+/// Pure zero-leg classifier (the 2026-07-14 empty-vs-drift split): a
+/// parseable 2xx chain whose leg extraction yielded ZERO legs is
+/// - `Empty` when the `strikes` map was LITERALLY empty (a genuinely
+///   empty chain — the pre-existing `outcome="empty"` semantics), or
+/// - `LegShapeDrift` when the vendor SERVED strike entries but our leg
+///   extraction could read none of them (null/non-object CE+PE, or every
+///   key implausible) — that is an ERROR class, not an empty chain.
+///
+/// Both carry the full evidence bundle. Pure (testable without I/O).
+#[must_use]
+fn zero_leg_outcome(
+    chain: &GrowwParsedChain,
+    payload_bytes: usize,
+    body_text: &str,
+) -> GrowwChainFetchOutcome {
+    let evidence = ChainZeroLegEvidence {
+        payload_bytes,
+        strikes_seen: chain.strikes_seen,
+        strikes_kept: chain.strikes_kept,
+        invalid_strikes: chain.invalid_strikes,
+        body_sample: capture_rest_error_body(body_text),
+    };
+    if chain.strikes_seen == 0 {
+        GrowwChainFetchOutcome::Empty(evidence)
+    } else {
+        GrowwChainFetchOutcome::LegShapeDrift(evidence)
+    }
+}
 
 /// One underlying's per-minute chain verdict.
 #[derive(Clone, Debug, PartialEq)]
@@ -754,17 +823,23 @@ enum GrowwChainFetchOutcome {
         close_to_data_ms: i64,
         payload_bytes: usize,
     },
-    /// A parseable 2xx whose chain carried ZERO strikes — counted
-    /// `outcome="empty"`, included in the failure edge, never silent.
-    Empty,
+    /// A parseable 2xx whose `strikes` map was LITERALLY empty — counted
+    /// `outcome="empty"`, included in the failure edge, never silent;
+    /// carries the 2026-07-14 evidence bundle.
+    Empty(ChainZeroLegEvidence),
+    /// A parseable 2xx that SERVED strike entries but yielded ZERO
+    /// extractable legs (vendor leg-shape drift) — an ERROR, not an
+    /// empty chain: flows into the minute verdict's `errors` count and
+    /// the audit's `error`/`leg_shape_drift` class (2026-07-14 split).
+    LegShapeDrift(ChainZeroLegEvidence),
     /// Transport / non-2xx / malformed body / budget overrun.
     Failed(GrowwChainFetchFailure),
 }
 
-/// One underlying's bounded per-minute fetch: the defensive min-gap wait,
-/// then ONE request (NO in-minute ladder — the chain is a live snapshot),
-/// hard-bounded by [`GROWW_CHAIN_1M_UNDERLYING_BUDGET_SECS`]. Returns the
-/// verdict + the request instant (ms-of-day, min-gap bookkeeping) + the
+/// One underlying's bounded per-minute fetch: ONE request (NO in-minute
+/// ladder — the chain is a live snapshot; the 2026-07-14 auto-ladder
+/// retired the min-gap wait), hard-bounded by
+/// [`GROWW_CHAIN_1M_UNDERLYING_BUDGET_SECS`]. Returns the verdict + the
 /// final round-trip latency.
 async fn fetch_groww_chain_bounded(
     client: &reqwest::Client,
@@ -772,14 +847,8 @@ async fn fetch_groww_chain_bounded(
     expiry_date: &str,
     token: &SecretString,
     minute_close_ms_of_day: i64,
-    last_request_ms: Option<i64>,
-) -> (GrowwChainFetchOutcome, i64, i64) {
+) -> (GrowwChainFetchOutcome, i64) {
     let attempt = async {
-        let wait_ms = groww_min_gap_wait_ms(last_request_ms, ist_millis_of_day_now());
-        if wait_ms > 0 {
-            tokio::time::sleep(Duration::from_millis(wait_ms)).await;
-        }
-        let requested_at_ms = ist_millis_of_day_now();
         let started = std::time::Instant::now();
         let result = groww_chain_fetch_once(client, url, expiry_date, token).await;
         let latency_ms = i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX);
@@ -789,7 +858,9 @@ async fn fetch_groww_chain_bounded(
             Ok(body_text) => {
                 let payload_bytes = body_text.len();
                 match parse_groww_option_chain(&body_text) {
-                    Some(chain) if chain.legs.is_empty() => GrowwChainFetchOutcome::Empty,
+                    Some(chain) if chain.legs.is_empty() => {
+                        zero_leg_outcome(&chain, payload_bytes, &body_text)
+                    }
                     Some(chain) => {
                         let close_to_data_ms =
                             (ist_millis_of_day_now() - minute_close_ms_of_day).max(0);
@@ -803,13 +874,13 @@ async fn fetch_groww_chain_bounded(
                         status: 200,
                         rate_limited: false,
                         auth_rejected: false,
-                        msg: "2xx but the body was not a parseable option chain".to_string(),
+                        msg: chain_parse_failure_msg(&body_text),
                     }),
                 }
             }
             Err(failure) => GrowwChainFetchOutcome::Failed(failure),
         };
-        (outcome, requested_at_ms, latency_ms)
+        (outcome, latency_ms)
     };
     match tokio::time::timeout(
         Duration::from_secs(GROWW_CHAIN_1M_UNDERLYING_BUDGET_SECS),
@@ -829,29 +900,138 @@ async fn fetch_groww_chain_bounded(
                         "chain budget exceeded ({GROWW_CHAIN_1M_UNDERLYING_BUDGET_SECS}s) — peer stalling"
                     ),
                 }),
-                ist_millis_of_day_now(),
                 -1,
             )
         }
     }
 }
 
-/// One minute-close fire: SEQUENTIAL bounded chain fetches for the
-/// resolved underlyings (pacing rule — at most one in-flight request) →
-/// per-leg rows via `append_row_ext` (rho + measured close→data delay) →
-/// one flush → forensics rows → counters → edge accounting. An auth-class
-/// reject short-circuits the remaining underlyings for THIS fire (the
-/// spot item-12 discipline — no doomed requests with a dead token).
+// ---------------------------------------------------------------------------
+// Pure per-underlying not-served detector (2026-07-14 — the NIFTY
+// expiry-day vendor-cutoff companion: Groww stopped serving the
+// same-day-expiring NIFTY chain at 14:54 IST while BANKNIFTY + SENSEX
+// kept working, and the ok==0 escalation edge paged nobody all
+// afternoon; mirrors the spot leg's SidServedTracker)
+// ---------------------------------------------------------------------------
+
+/// What the caller must do for ONE underlying after recording a minute's
+/// per-underlying served verdicts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnderlyingEdgeAction {
+    /// Nothing to page for this underlying this minute.
+    None,
+    /// RISING edge: this underlying reached
+    /// [`GROWW_CHAIN_1M_UNDERLYING_NOT_SERVED_THRESHOLD`] consecutive
+    /// counted not-served minutes (each with ≥1 sibling success) — page
+    /// ONCE (High), latched until this underlying's own recovery.
+    Page { consecutive: u32 },
+    /// FALLING edge: a paged underlying's chain was served again — one
+    /// Info ping; the latch re-arms.
+    Recover { not_served_minutes: u32 },
+}
+
+/// Per-underlying not-served state: consecutive COUNTED not-served
+/// minutes + the page latch.
+#[derive(Debug, Default)]
+struct UnderlyingServedState {
+    consecutive_not_served: u32,
+    paged: bool,
+}
+
+/// Per-underlying "is the vendor serving this chain?" tracker.
+/// Distinguishes vendor-not-serving-ONE-underlying from a global outage:
+///
+/// | This minute, this underlying | ≥1 OTHER underlying served? | Effect on this underlying |
+/// |---|---|---|
+/// | served (chain with strikes retrieved) | — | streak reset; `Recover` if paged |
+/// | not served (empty OR error) | yes | streak +1; `Page` once at the threshold |
+/// | not served | no (global outage) | HOLD — neither counts nor resets |
+///
+/// The global-outage HOLD keeps the two signals disjoint for the
+/// FETCH-failure class: a full fetch outage (ok == 0) is the
+/// [`FailureEdge`] escalation's page, this edge needs ≥1 OK — mutually
+/// exclusive per minute WITHIN that class. HONEST OVERLAP: a
+/// persist-failed minute with ok ≥ 1 can legitimately count toward BOTH
+/// edges (the M1 gate makes the escalation edge count it fully-failed
+/// while an empty sibling counts here) — two DISTINCT signals:
+/// persistence broken + vendor not serving one underlying. "Served" is
+/// FETCH-level (`Found`): the vendor-serving question — persist
+/// failures are OUR side and already feed the escalation edge via the
+/// spot-M1 persist gate. Pure state machine — unit-tested without a
+/// clock. State is per scheduler run (session-scoped, same envelope as
+/// [`FailureEdge`] — a task respawn restarts the streak; the run itself
+/// is per trading day).
+#[derive(Debug, Default)]
+pub struct UnderlyingServedTracker {
+    per_underlying: std::collections::HashMap<&'static str, UnderlyingServedState>,
+}
+
+impl UnderlyingServedTracker {
+    /// Record one fired minute's per-underlying served verdicts
+    /// (`served` = a chain with strikes was retrieved for that underlying
+    /// this fire) and return one action per input underlying,
+    /// index-aligned with `verdicts`.
+    pub fn record_minute(
+        &mut self,
+        verdicts: &[(&'static str, bool)],
+    ) -> Vec<(&'static str, UnderlyingEdgeAction)> {
+        let any_served = verdicts.iter().any(|&(_, served)| served);
+        verdicts
+            .iter()
+            .map(|&(underlying, served)| {
+                let state = self.per_underlying.entry(underlying).or_default();
+                let action = if served {
+                    let not_served_minutes = state.consecutive_not_served;
+                    let was_paged = state.paged;
+                    state.consecutive_not_served = 0;
+                    state.paged = false;
+                    if was_paged {
+                        UnderlyingEdgeAction::Recover { not_served_minutes }
+                    } else {
+                        UnderlyingEdgeAction::None
+                    }
+                } else if any_served {
+                    state.consecutive_not_served = state.consecutive_not_served.saturating_add(1);
+                    if !state.paged
+                        && state.consecutive_not_served
+                            >= GROWW_CHAIN_1M_UNDERLYING_NOT_SERVED_THRESHOLD
+                    {
+                        state.paged = true;
+                        UnderlyingEdgeAction::Page {
+                            consecutive: state.consecutive_not_served,
+                        }
+                    } else {
+                        UnderlyingEdgeAction::None
+                    }
+                } else {
+                    // Global-outage minute (no underlying served): HOLD.
+                    UnderlyingEdgeAction::None
+                };
+                (underlying, action)
+            })
+            .collect()
+    }
+}
+
+/// One minute-close fire (2026-07-14 auto-ladder): CONCURRENT bounded
+/// chain fetches for the resolved underlyings (ONE wave; a demoted
+/// two_wave session staggers slots by 350 ms) → per-leg rows via
+/// `append_row_ext` (rho + measured close→data delay) → one flush →
+/// forensics rows → counters → edge accounting. An auth-class reject
+/// drops the token cache AFTER the wave (each request's own 401 is its
+/// forensics row — no sequential short-circuit exists in a wave); a 429
+/// demotes the session burst tier (one coded warn on the edge).
 #[allow(clippy::too_many_arguments)] // APPROVED: private fire sink over the run loop's owned state — a struct would be pure ceremony (spot precedent)
 async fn fire_one_groww_chain_minute(
     params: &GrowwChain1mTaskParams,
     client: &reqwest::Client,
     targets: &[GrowwChainTarget],
-    last_request_ms: &mut Option<i64>,
     writer: &mut OptionChain1mWriter,
     audit_writer: &mut RestFetchAuditWriter,
     edge: &mut FailureEdge,
+    not_served: &mut UnderlyingServedTracker,
     token_cache: &mut GrowwTokenCache,
+    moneyness_latches: &mut MoneynessWarnLatches,
     fire_secs_of_day: u32,
 ) {
     let minute_open_secs = fire_secs_of_day.saturating_sub(60);
@@ -868,22 +1048,96 @@ async fn fire_one_groww_chain_minute(
     // persisted minute is NOT ok — a day-long QuestDB outage must page.
     let mut persist_failed = false;
     let mut sample_failure: Option<String> = None;
+    // Per-underlying FETCH-level served verdicts (`Found` = served) for
+    // the not-served detector — the vendor-serving question, deliberately
+    // NOT persist-gated (persist failures are ours; the escalation edge
+    // owns them via the M1 gate).
+    let mut served_verdicts: Vec<(&'static str, bool)> = Vec::with_capacity(targets.len());
+    // An auth-class abort is a GLOBAL token condition: even when an
+    // earlier underlying succeeded, the skipped remainder must not gain
+    // counted not-served minutes — the whole fire becomes a tracker HOLD
+    // (the sink is skipped below; neither count nor reset for anyone).
+    let mut auth_aborted = false;
 
     if let Some(token) = token_cache.ensure_token().await {
+        // 2026-07-14 auto-ladder: the WAVE — all underlyings fetch
+        // CONCURRENTLY (JoinSet; each task owns cheap handle clones), a
+        // demoted two_wave session staggers slots by 350 ms. Results are
+        // collected back into TARGET ORDER so the persist / audit /
+        // verdict pipeline below stays deterministic.
+        let tier = params.burst.effective_tier();
+        metrics::counter!("tv_groww_rest_burst_tier_total", "tier" => tier.as_str()).increment(1);
+        let mut wave: tokio::task::JoinSet<(usize, GrowwChainFetchOutcome, i64)> =
+            tokio::task::JoinSet::new();
         for (idx, target) in targets.iter().enumerate() {
-            let (outcome, requested_at_ms, latency_ms) = fetch_groww_chain_bounded(
-                client,
-                &target.url,
-                &target.expiry_str,
-                &token,
-                minute_close_ms,
-                // ONE scalar across consecutive requests — the min-gap
-                // engages BETWEEN underlyings too (MEDIUM-1: 3 requests
-                // spread ≥ 2 s, never a back-to-back boundary burst).
-                *last_request_ms,
-            )
-            .await;
-            *last_request_ms = Some(requested_at_ms);
+            let wave_client = client.clone();
+            let wave_token = token.clone();
+            let url = target.url.clone();
+            let expiry_str = target.expiry_str.clone();
+            // The sequential floor spans a whole per-underlying budget
+            // per slot (review MEDIUM-1 2026-07-14).
+            let stagger_ms =
+                intra_wave_stagger_ms(tier, idx, GROWW_CHAIN_1M_UNDERLYING_BUDGET_SECS * 1_000);
+            wave.spawn(async move {
+                if stagger_ms > 0 {
+                    tokio::time::sleep(Duration::from_millis(stagger_ms)).await;
+                }
+                let (outcome, latency_ms) = fetch_groww_chain_bounded(
+                    &wave_client,
+                    &url,
+                    &expiry_str,
+                    &wave_token,
+                    minute_close_ms,
+                )
+                .await;
+                (idx, outcome, latency_ms)
+            });
+        }
+        let mut results: Vec<Option<(GrowwChainFetchOutcome, i64)>> =
+            (0..targets.len()).map(|_| None).collect();
+        while let Some(joined) = wave.join_next().await {
+            match joined {
+                Ok((idx, outcome, latency_ms)) => {
+                    if let Some(slot) = results.get_mut(idx) {
+                        *slot = Some((outcome, latency_ms));
+                    }
+                }
+                Err(join_err) => {
+                    // Unwind builds only (release aborts on panic): the
+                    // lost slot stays None and is synthesized as a Failed
+                    // outcome below — never a silent missing underlying.
+                    error!(
+                        code = ErrorCode::Chain02FetchDegraded.code_str(),
+                        stage = "wave_task_failed",
+                        feed = OPTION_CHAIN_1M_FEED_GROWW,
+                        ?join_err,
+                        "CHAIN-02: a wave fetch task failed to join — its \
+                         underlying counts as failed for this minute"
+                    );
+                }
+            }
+        }
+        let mut any_auth_rejected = false;
+        let mut any_rate_limited = false;
+        for (idx, target) in targets.iter().enumerate() {
+            let (outcome, latency_ms) =
+                results
+                    .get_mut(idx)
+                    .and_then(Option::take)
+                    .unwrap_or_else(|| {
+                        (
+                            GrowwChainFetchOutcome::Failed(GrowwChainFetchFailure {
+                                status: 0,
+                                rate_limited: false,
+                                auth_rejected: false,
+                                msg: "wave fetch task failed to join".to_string(),
+                            }),
+                            -1,
+                        )
+                    });
+            if let GrowwChainFetchOutcome::Failed(failure) = &outcome {
+                any_rate_limited |= failure.rate_limited;
+            }
             let mut auth_rejected = false;
             match outcome {
                 GrowwChainFetchOutcome::Found {
@@ -892,6 +1146,7 @@ async fn fire_one_groww_chain_minute(
                     payload_bytes,
                 } => {
                     ok_count = ok_count.saturating_add(1);
+                    served_verdicts.push((target.underlying, true));
                     // PR-4: hand the contract leg its ATM anchor — only a
                     // REAL vendor LTP updates it (an omitted/zero LTP never
                     // erases a previous good anchor). The observation stamp
@@ -974,7 +1229,23 @@ async fn fire_one_groww_chain_minute(
                     }
                     let expiry_nanos = minute_open_ist_nanos(target.expiry, 0);
                     let fetched_at = fetched_at_ist_nanos_now();
-                    for leg in &chain.legs {
+                    // Moneyness (2026-07-14): the vendor-omitted-spot flag
+                    // short-circuits to 0.0 (mirrors the anchor-store gate
+                    // above — a missing/zero LTP never classifies), which
+                    // the guarded conversion maps to UNKNOWN for every
+                    // row. RAM snapshot rows are built BEFORE the persist
+                    // loop (a persist failure never degrades RAM).
+                    let moneyness_spot = if chain.underlying_ltp_missing {
+                        0.0
+                    } else {
+                        chain.underlying_ltp
+                    };
+                    let cls = classify_chain_legs(
+                        target.underlying,
+                        moneyness_spot,
+                        chain.legs.iter().map(|l| (l.strike, l.leg, l.ltp)),
+                    );
+                    for (leg, leg_moneyness) in chain.legs.iter().zip(cls.row_moneyness.iter()) {
                         let row = OptionChain1mRow {
                             ts_ist_nanos: target_minute_nanos,
                             trading_date_ist_nanos: trading_date_nanos,
@@ -997,8 +1268,14 @@ async fn fire_one_groww_chain_minute(
                             volume: leg.volume,
                             // No previous-day OI in the Groww payload.
                             previous_oi: 0,
+                            // RAW vendor ltp BY DESIGN: the DB
+                            // `underlying_spot` column mirrors the wire
+                            // verbatim, while the classification above used
+                            // the GUARDED `moneyness_spot` (0.0 when the
+                            // vendor omitted the ltp → every row UNKNOWN).
                             underlying_spot: chain.underlying_ltp,
                             fetched_at_ist_nanos: fetched_at,
+                            moneyness: leg_moneyness.as_str(),
                         };
                         if let Err(err) = writer.append_row_ext(&row, leg.rho, close_to_data_ms) {
                             persist_failed = true;
@@ -1023,6 +1300,28 @@ async fn fire_one_groww_chain_minute(
                             break;
                         }
                     }
+                    // Moneyness observability (counters + day-latched
+                    // advisory warns) THEN the RAM snapshot publish — the
+                    // decision source of truth, independent of any
+                    // persist outcome above.
+                    record_chain_moneyness_observability(
+                        Feed::Groww.as_str(),
+                        target.underlying,
+                        idx,
+                        trading_date,
+                        &minute_label,
+                        &cls,
+                        moneyness_latches,
+                    );
+                    publish_chain_moneyness_snapshot(
+                        Feed::Groww,
+                        target.underlying,
+                        target_minute_nanos,
+                        fetched_at,
+                        moneyness_spot,
+                        expiry_nanos,
+                        cls,
+                    );
                     let audit_row = build_chain_audit_row(
                         target_minute_nanos,
                         trading_date_nanos,
@@ -1038,14 +1337,40 @@ async fn fire_one_groww_chain_minute(
                     );
                     chain_audit_append_best_effort(audit_writer, &audit_row);
                 }
-                GrowwChainFetchOutcome::Empty => {
+                GrowwChainFetchOutcome::Empty(evidence) => {
                     empty_count = empty_count.saturating_add(1);
+                    served_verdicts.push((target.underlying, false));
                     metrics::counter!("tv_groww_chain1m_fetch_total", "outcome" => "empty")
                         .increment(1);
+                    // 2026-07-14 evidence discipline: the payload size of
+                    // an EMPTY classification is recorded (its own series —
+                    // the Found-only tv_groww_chain1m_payload_bytes
+                    // semantics never shift) and the full evidence bundle
+                    // rides ONE coded line per empty underlying per fired
+                    // minute (bounded ≤3/min; errors.jsonl-visible).
+                    #[allow(clippy::cast_precision_loss)] // APPROVED: histogram sample only
+                    metrics::histogram!("tv_groww_chain1m_empty_payload_bytes")
+                        .record(evidence.payload_bytes as f64);
+                    error!(
+                        code = ErrorCode::Chain02FetchDegraded.code_str(),
+                        stage = "empty_chain",
+                        feed = OPTION_CHAIN_1M_FEED_GROWW,
+                        symbol = target.underlying,
+                        minute = %minute_label,
+                        payload_bytes = evidence.payload_bytes,
+                        strikes_seen = evidence.strikes_seen,
+                        strikes_kept = evidence.strikes_kept,
+                        invalid_strikes = evidence.invalid_strikes,
+                        body_sample = %evidence.body_sample,
+                        "CHAIN-02: 2xx chain carried a literally EMPTY \
+                         strikes map — evidence recorded (2026-07-14 \
+                         discipline: an empty minute is self-evidencing)"
+                    );
                     if sample_failure.is_none() {
                         sample_failure = Some(format!(
-                            "{}: 2xx but the chain carried zero strikes",
-                            target.underlying
+                            "{}: 2xx but the chain carried zero strikes \
+                             (payload_bytes={}, strikes_seen=0)",
+                            target.underlying, evidence.payload_bytes
                         ));
                     }
                     let audit_row = build_chain_audit_row(
@@ -1063,8 +1388,56 @@ async fn fire_one_groww_chain_minute(
                     );
                     chain_audit_append_best_effort(audit_writer, &audit_row);
                 }
+                GrowwChainFetchOutcome::LegShapeDrift(evidence) => {
+                    // 2026-07-14 split: the vendor SERVED strike entries
+                    // but our leg extraction read none — an ERROR (drift),
+                    // never an "empty chain". Flows into the errors count
+                    // + the minute_failed accounting like any failure.
+                    error_count = error_count.saturating_add(1);
+                    served_verdicts.push((target.underlying, false));
+                    metrics::counter!("tv_groww_chain1m_fetch_total", "outcome" => "error")
+                        .increment(1);
+                    metrics::counter!("tv_groww_chain1m_leg_shape_drift_total").increment(1);
+                    error!(
+                        code = ErrorCode::Chain02FetchDegraded.code_str(),
+                        stage = "leg_shape_drift",
+                        feed = OPTION_CHAIN_1M_FEED_GROWW,
+                        symbol = target.underlying,
+                        minute = %minute_label,
+                        payload_bytes = evidence.payload_bytes,
+                        strikes_seen = evidence.strikes_seen,
+                        strikes_kept = evidence.strikes_kept,
+                        invalid_strikes = evidence.invalid_strikes,
+                        body_sample = %evidence.body_sample,
+                        "CHAIN-02: 2xx chain served strike entries but ZERO \
+                         legs were extractable — vendor leg-shape drift (an \
+                         ERROR, not an empty chain; evidence recorded)"
+                    );
+                    if sample_failure.is_none() {
+                        sample_failure = Some(format!(
+                            "{}: 2xx served {} strike entries but zero legs \
+                             extracted (leg-shape drift, payload_bytes={})",
+                            target.underlying, evidence.strikes_seen, evidence.payload_bytes
+                        ));
+                    }
+                    let audit_row = build_chain_audit_row(
+                        target_minute_nanos,
+                        trading_date_nanos,
+                        target.security_id,
+                        target.underlying,
+                        1,
+                        200,
+                        latency_ms,
+                        -1,
+                        0,
+                        RestFetchOutcome::Error,
+                        "leg_shape_drift",
+                    );
+                    chain_audit_append_best_effort(audit_writer, &audit_row);
+                }
                 GrowwChainFetchOutcome::Failed(failure) => {
                     error_count = error_count.saturating_add(1);
+                    served_verdicts.push((target.underlying, false));
                     metrics::counter!("tv_groww_chain1m_fetch_total", "outcome" => "error")
                         .increment(1);
                     if sample_failure.is_none() {
@@ -1094,43 +1467,37 @@ async fn fire_one_groww_chain_minute(
                     chain_audit_append_best_effort(audit_writer, &audit_row);
                 }
             }
-            if auth_rejected {
-                // The spot item-12 discipline: drop the dead token NOW and
-                // short-circuit the remaining underlyings for THIS fire —
-                // every further request with the same rejected token is a
-                // doomed 401. The next fire's ensure_token re-reads SSM at
-                // the ≥60s floor; NEVER a mint.
-                token_cache.note_auth_rejected();
-                let remaining = &targets[idx + 1..];
-                if !remaining.is_empty() {
-                    error_count = error_count.saturating_add(remaining.len());
-                    warn!(
-                        skipped_underlyings = remaining.len(),
-                        "groww_chain_1m: auth-class reject — remaining \
-                         underlyings short-circuited for this fire (no doomed \
-                         requests); forensics rows still emitted"
-                    );
-                    for skipped in remaining {
-                        metrics::counter!("tv_groww_chain1m_fetch_total", "outcome" => "error")
-                            .increment(1);
-                        let row = build_chain_audit_row(
-                            target_minute_nanos,
-                            trading_date_nanos,
-                            skipped.security_id,
-                            skipped.underlying,
-                            0,
-                            0,
-                            -1,
-                            -1,
-                            0,
-                            RestFetchOutcome::NoToken,
-                            "auth",
-                        );
-                        chain_audit_append_best_effort(audit_writer, &row);
-                    }
-                }
-                break;
-            }
+            any_auth_rejected |= auth_rejected;
+        }
+        if any_auth_rejected {
+            // The spot item-12 discipline (auto-ladder form): the wave
+            // already fired concurrently, so there are no "remaining"
+            // underlyings to short-circuit — each request's own 401 is its
+            // forensics row (≤ 3 doomed requests). Drop the dead token so
+            // the NEXT fire's ensure_token re-reads SSM at the ≥60s floor;
+            // NEVER a mint. An auth reject is a GLOBAL token condition
+            // (OUR side, not the vendor's) — the fire becomes a not-served
+            // tracker HOLD below (PR #1537 semantics preserved under the
+            // wave: nobody's streak counts or resets on an auth-rejected
+            // fire).
+            auth_aborted = true;
+            token_cache.note_auth_rejected();
+        }
+        if any_rate_limited && params.burst.note_rate_limited() {
+            // The session's DEMOTION EDGE (exactly once): the burst tier
+            // steps down for every subsequent minute — seven_concurrent →
+            // two_wave, two_wave → staggered two_wave. Boot restores the
+            // configured tier.
+            warn!(
+                code = ErrorCode::Chain02FetchDegraded.code_str(),
+                stage = "burst_demoted",
+                feed = OPTION_CHAIN_1M_FEED_GROWW,
+                minute = %minute_label,
+                demoted_to = params.burst.effective_tier().as_str(),
+                "CHAIN-02: HTTP 429 on the Groww chain wave — burst tier \
+                 auto-demoted for the rest of the session (restart restores \
+                 the configured tier)"
+            );
         }
         if let Err(err) = writer.flush() {
             persist_failed = true;
@@ -1156,6 +1523,9 @@ async fn fire_one_groww_chain_minute(
         error_count = targets.len();
         sample_failure = Some("no shared Groww access token available at fire time".to_string());
         for target in targets {
+            // All not-served with zero served siblings → the tracker's
+            // global-outage HOLD arm (neither counts nor resets).
+            served_verdicts.push((target.underlying, false));
             metrics::counter!("tv_groww_chain1m_fetch_total", "outcome" => "error").increment(1);
             let row = build_chain_audit_row(
                 target_minute_nanos,
@@ -1185,6 +1555,9 @@ async fn fire_one_groww_chain_minute(
         persist_failed,
         sample_failure.as_deref(),
     );
+    if !auth_aborted {
+        record_groww_chain_underlying_verdicts(params, not_served, &served_verdicts, &minute_label);
+    }
 }
 
 /// Coalesced per-minute verdict: ONE coded log per fired minute with any
@@ -1251,6 +1624,76 @@ fn record_groww_chain_minute_verdict(
                     "CHAIN-02: Groww per-minute chain fetch degraded for this minute"
                 );
             }
+        }
+    }
+}
+
+/// 2026-07-14 not-served companion: feed one fired minute's
+/// per-underlying FETCH-level served verdicts into the
+/// [`UnderlyingServedTracker`] and emit the edge-latched per-underlying
+/// page / recovery ping + the per-counted-minute counter
+/// (`tv_groww_chain1m_underlying_not_served_total{underlying}` — 3
+/// static label values, the pinned plain symbols). Counting semantics
+/// live in the tracker doc. Skipped-boundary minutes deliberately never
+/// reach this sink (nothing was fetched for ANY underlying — the HOLD
+/// arm by construction).
+fn record_groww_chain_underlying_verdicts(
+    params: &GrowwChain1mTaskParams,
+    not_served: &mut UnderlyingServedTracker,
+    verdicts: &[(&'static str, bool)],
+    minute_label: &str,
+) {
+    if verdicts.is_empty() {
+        return;
+    }
+    let any_served = verdicts.iter().any(|&(_, served)| served);
+    let actions = not_served.record_minute(verdicts);
+    for (&(underlying, served), &(_, action)) in verdicts.iter().zip(actions.iter()) {
+        if !served && any_served {
+            // One counted vendor-not-serving minute for this underlying
+            // (a global-outage minute is deliberately NOT counted here).
+            metrics::counter!(
+                "tv_groww_chain1m_underlying_not_served_total", "underlying" => underlying
+            )
+            .increment(1);
+        }
+        match action {
+            UnderlyingEdgeAction::Page { consecutive } => {
+                error!(
+                    code = ErrorCode::Chain02FetchDegraded.code_str(),
+                    stage = "underlying_not_served",
+                    feed = OPTION_CHAIN_1M_FEED_GROWW,
+                    underlying,
+                    consecutive_minutes = consecutive,
+                    minute = minute_label,
+                    "CHAIN-02: Groww is not serving this underlying's option \
+                     chain while the other underlyings succeed — paging once \
+                     per underlying (edge-latched; re-armed on this \
+                     underlying's own recovery)"
+                );
+                params
+                    .notifier
+                    .notify(NotificationEvent::GrowwChain1mUnderlyingNotServed {
+                        underlying,
+                        empty_minutes: consecutive,
+                    });
+            }
+            UnderlyingEdgeAction::Recover { not_served_minutes } => {
+                info!(
+                    underlying,
+                    not_served_minutes,
+                    minute = minute_label,
+                    "groww_chain_1m: this underlying's chain is being served \
+                     again after a paged not-served episode"
+                );
+                params
+                    .notifier
+                    .notify(NotificationEvent::GrowwChain1mUnderlyingServedRecovered {
+                        underlying,
+                        empty_minutes: not_served_minutes,
+                    });
+            }
+            UnderlyingEdgeAction::None => {}
         }
     }
 }
@@ -1370,7 +1813,7 @@ pub async fn run_groww_chain_1m(
     // ONE long-lived client for the whole session (per-minute rebuild is
     // the exact TLS/resolver churn HTTP-CLIENT-01 §0 condemns).
     let client = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(GROWW_CHAIN_1M_REQUEST_TIMEOUT_SECS))
+        .timeout(Duration::from_millis(GROWW_CHAIN_1M_REQUEST_TIMEOUT_MS))
         .redirect(reqwest::redirect::Policy::none())
         .build()
     {
@@ -1525,7 +1968,7 @@ async fn resolve_and_cache_chain_targets(
 /// The armed per-minute fire loop (split from `run_groww_chain_1m` by the
 /// MEDIUM-4 warmup-cache refactor — the body is the pre-split loop,
 /// unchanged).
-// TEST-EXEMPT: live-deps scheduler loop — every decision inside is a unit-tested pure fn (next_fire_after / fire_is_fresh / count_missed_boundaries / stale_wake_backoff_ms / groww_min_gap_wait_ms).
+// TEST-EXEMPT: live-deps scheduler loop — every decision inside is a unit-tested pure fn (next_fire_after / fire_is_fresh / count_missed_boundaries / the groww_rest_burst schedule fns).
 async fn run_groww_chain_minute_loop(
     params: &GrowwChain1mTaskParams,
     client: &reqwest::Client,
@@ -1538,17 +1981,20 @@ async fn run_groww_chain_minute_loop(
     );
     let mut audit_writer = RestFetchAuditWriter::new(&params.questdb);
     let mut edge = FailureEdge::default();
+    // Per-underlying not-served detector (2026-07-14) — same lifetime as
+    // the FailureEdge: this run, which is per trading day (the loop exits
+    // past 15:30 IST; a mid-day supervisor respawn restarts the streak).
+    let mut not_served = UnderlyingServedTracker::default();
     let mut token_cache = GrowwTokenCache::new_chain();
+    let mut moneyness_latches = MoneynessWarnLatches::default();
     let mut last_fired: Option<u32> = None;
-    // ONE scalar spanning consecutive chain requests (any underlying) —
-    // the cross-request min-gap pacing state (MEDIUM-1).
-    let mut last_request_ms: Option<i64> = None;
-    let mut spot_rx = params.spot_minute_done.clone();
     info!(
         underlyings = targets.len(),
+        tier = params.burst.effective_tier().as_str(),
+        warm_up = params.burst.warm_up_enabled(),
         "groww_chain_1m: per-minute chain fetch loop armed (fires each \
-         minute close 09:16:00-15:30:00 IST, right after the Groww spot leg; \
-         sequential underlying pacing)"
+         minute close 09:16:00-15:30:00 IST on its own timer at \
+         close+300ms as ONE concurrent wave — 2026-07-14 burst auto-ladder)"
     );
 
     loop {
@@ -1564,11 +2010,39 @@ async fn run_groww_chain_minute_loop(
             info!("groww_chain_1m: past 15:30 IST — today's minute fires complete");
             return;
         };
-        // Sequenced wake: the Groww spot leg's minute-done signal, bounded
-        // by the fallback timer (the reused Dhan wait core).
-        let sleep_ms = u64::from(fire.saturating_sub(now)).saturating_mul(1_000)
-            + GROWW_CHAIN_1M_FALLBACK_DELAY_MS;
-        wait_for_signal_or_fallback(sleep_ms, fire, &mut spot_rx).await;
+        // 2026-07-14 auto-ladder: OWN minute-boundary timer — the chain
+        // wave fires at close + 300 ms (no spot signal, no fallback timer,
+        // no min-gap). The optional pre-boundary warm-up GET (boundary−4 s,
+        // 3 s-bounded, unauthenticated — no expiry param; the 400/401
+        // reply still warms the connection) re-establishes an idle-closed
+        // TLS session before the critical window.
+        // CRITICAL-1 (2026-07-14 fix round): EVERY wake instant — the
+        // warm-up lead AND the wave itself — is computed from the
+        // MILLISECOND clock (`wave_sleep_from_now_ms`), never by summing
+        // a whole-second boundary gap with the delay: the pre-fix else
+        // branch woke at `fire + frac(now) + 300 ms`, and the two legs'
+        // independent fractional offsets could collapse the load-bearing
+        // 1,050 ms wave separation to ~51 ms.
+        let warmup_lead_ms = GROWW_REST_WARMUP_LEAD_SECS.saturating_mul(1_000);
+        let warmup_sleep_ms = wave_sleep_from_now_ms(
+            fire,
+            -i64::try_from(warmup_lead_ms).unwrap_or(0),
+            ist_millis_of_day_now(),
+        );
+        if params.burst.warm_up_enabled() && warmup_sleep_ms > 0 {
+            tokio::time::sleep(Duration::from_millis(warmup_sleep_ms)).await;
+            if let Some(first) = targets.first() {
+                send_warmup_get(client, &first.url, &[], "chain_1m").await;
+            }
+        }
+        let remaining_ms = wave_sleep_from_now_ms(
+            fire,
+            i64::try_from(GROWW_CHAIN_1M_FIRE_DELAY_MS).unwrap_or(0),
+            ist_millis_of_day_now(),
+        );
+        if remaining_ms > 0 {
+            tokio::time::sleep(Duration::from_millis(remaining_ms)).await;
+        }
 
         // Staleness gate (suspend / clock-step defense): skip + recompute,
         // never fetch a long-gone minute.
@@ -1593,14 +2067,6 @@ async fn run_groww_chain_minute_loop(
             if woke > fire {
                 last_fired = Some((woke.min(SPOT_1M_REST_LAST_FIRE_SECS_OF_DAY_IST) / 60) * 60);
             }
-            let backoff_ms = stale_wake_backoff_ms(fire, woke);
-            if backoff_ms > 0 {
-                // Clock stepped BACK across the boundary: the already-
-                // satisfied spot signal would make the next wait return
-                // with ZERO awaits — sleep up to the fire moment instead
-                // of busy-spinning (the Dhan chain H1 defense).
-                tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
-            }
             continue;
         }
 
@@ -1608,11 +2074,12 @@ async fn run_groww_chain_minute_loop(
             params,
             client,
             &targets,
-            &mut last_request_ms,
             &mut writer,
             &mut audit_writer,
             &mut edge,
+            &mut not_served,
             &mut token_cache,
+            &mut moneyness_latches,
             fire,
         )
         .await;
@@ -1778,7 +2245,7 @@ pub async fn run_groww_chain_1m_probe(params: GrowwChain1mTaskParams) {
         return;
     }
     let client = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(GROWW_CHAIN_1M_REQUEST_TIMEOUT_SECS))
+        .timeout(Duration::from_millis(GROWW_CHAIN_1M_REQUEST_TIMEOUT_MS))
         .redirect(reqwest::redirect::Policy::none())
         .build()
     {
@@ -1833,8 +2300,10 @@ pub async fn run_groww_chain_1m_probe(params: GrowwChain1mTaskParams) {
     }
     for (idx, target) in targets.iter().enumerate() {
         let url = &target.url;
-        // Sequential + min-gap paced (one boot-time call per underlying).
-        tokio::time::sleep(Duration::from_millis(GROWW_CHAIN_1M_MIN_GAP_MS)).await;
+        // Sequential + paced (one boot-time call per underlying) — the
+        // probe keeps its own 1 s spacing (it is a cold boot measurement,
+        // not a wave; the retired live-fire min-gap does not apply here).
+        tokio::time::sleep(Duration::from_millis(GROWW_CHAIN_PROBE_PACING_MS)).await;
         let started = std::time::Instant::now();
         let result = groww_chain_fetch_once(&client, url, &target.expiry_str, &token).await;
         let latency_ms = i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX);
@@ -2087,7 +2556,34 @@ mod tests {
         let empty = parse_groww_option_chain(r#"{"payload":{"underlying_ltp":1.0,"strikes":{}}}"#)
             .expect("empty chain parses");
         assert!(empty.legs.is_empty());
+        assert_eq!(empty.strikes_seen, 0, "a literally empty map saw nothing");
         assert_eq!(empty.strikes_kept, 0);
+    }
+
+    /// G1 (2026-07-14): the None-parse failure msg carries the GA wire code
+    /// + redacted message when the 2xx body is the Groww FAILURE envelope;
+    /// any other unparseable body keeps the generic msg. Forensics only —
+    /// the Failed classification itself was already correct.
+    #[test]
+    fn test_chain_parse_failure_msg_carries_ga_code() {
+        let msg = chain_parse_failure_msg(
+            r#"{"status":"FAILURE","error":{"code":"GA001","message":"bad request"}}"#,
+        );
+        assert!(
+            msg.contains("ga_code=GA001") && msg.contains("bad request"),
+            "got {msg:?}"
+        );
+        // Codeless FAILURE envelope → ga_code=none (tolerated).
+        let msg = chain_parse_failure_msg(r#"{"status":"FAILURE"}"#);
+        assert!(msg.contains("ga_code=none"), "got {msg:?}");
+        // Non-envelope unparseable bodies keep the generic msg.
+        for body in ["not json", "{}", r#"{"strikes": "x"}"#] {
+            assert_eq!(
+                chain_parse_failure_msg(body),
+                "2xx but the body was not a parseable option chain",
+                "body {body:?}"
+            );
+        }
     }
 
     #[test]
@@ -2106,6 +2602,7 @@ mod tests {
         let chain = parse_groww_option_chain(body).expect("parses");
         // Decimal strike keys parse (the U-11 Unknown, handled); the
         // hostile keys are skipped + counted, never a row.
+        assert_eq!(chain.strikes_seen, 4, "every raw map entry is counted");
         assert_eq!(chain.strikes_kept, 1);
         assert_eq!(chain.invalid_strikes, 3);
         assert_eq!(chain.legs.len(), 1);
@@ -2126,29 +2623,132 @@ mod tests {
         }
         let body = format!(r#"{{"payload":{{"underlying_ltp":1.0,"strikes":{{{strikes}}}}}}}"#);
         let chain = parse_groww_option_chain(&body).expect("parses");
+        assert_eq!(chain.strikes_seen as usize, MAX_STRIKES_PER_CHAIN + 25);
         assert_eq!(chain.strikes_kept as usize, MAX_STRIKES_PER_CHAIN);
         assert_eq!(chain.truncated_strikes, 25);
         assert_eq!(chain.legs.len(), MAX_STRIKES_PER_CHAIN);
     }
 
-    // ---- pacing / classification ------------------------------------------
+    // ---- zero-leg classification matrix (2026-07-14 empty-vs-drift) --------
 
+    /// The body-class → classification matrix the 14:54 incident demanded:
+    /// (a) literally-empty map → Empty (strikes_seen=0);
+    /// (b) entries with null/non-object legs → LegShapeDrift;
+    /// (c) all-implausible keys → LegShapeDrift (kept=0);
+    /// (d) a normal body → Found (unchanged);
+    /// (e) a FAILURE envelope → parse-Failed (unchanged, `None`).
     #[test]
-    fn test_groww_min_gap_wait_ms_engages_only_inside_gap() {
-        // Never requested → no wait.
-        assert_eq!(groww_min_gap_wait_ms(None, 1_000), 0);
-        // Well past the gap (the normal ~60s cadence) → no wait.
-        assert_eq!(groww_min_gap_wait_ms(Some(1_000), 62_000), 0);
-        // Inside the gap → the remainder.
-        assert_eq!(groww_min_gap_wait_ms(Some(1_000), 1_400), 600);
-        // Exactly at the gap boundary → no wait.
+    fn test_zero_leg_outcome_matrix_empty_vs_drift() {
+        // (a) literally empty strikes map → Empty with full evidence.
+        let empty_body = r#"{"payload":{"underlying_ltp":1.0,"strikes":{}}}"#;
+        let chain = parse_groww_option_chain(empty_body).expect("parses");
+        assert!(chain.legs.is_empty());
+        match zero_leg_outcome(&chain, empty_body.len(), empty_body) {
+            GrowwChainFetchOutcome::Empty(ev) => {
+                assert_eq!(ev.payload_bytes, empty_body.len());
+                assert_eq!(ev.strikes_seen, 0);
+                assert_eq!(ev.strikes_kept, 0);
+                assert_eq!(ev.invalid_strikes, 0);
+                assert!(
+                    ev.body_sample.contains("strikes"),
+                    "the sanitized sample keeps the (non-secret) body text: {}",
+                    ev.body_sample
+                );
+            }
+            other => panic!("expected Empty, got {other:?}"),
+        }
+
+        // (b) 2 VALID strike entries whose CE/PE are null/non-object →
+        // drift: strikes_seen=2, strikes_kept=2, zero legs.
+        let drift_body = r#"{"payload":{"underlying_ltp":100.0,"strikes":{
+            "100": {"CE": null, "PE": null},
+            "110": {"CE": "not-an-object"}
+        }}}"#;
+        let chain = parse_groww_option_chain(drift_body).expect("parses");
+        assert!(chain.legs.is_empty(), "no extractable legs");
+        match zero_leg_outcome(&chain, drift_body.len(), drift_body) {
+            GrowwChainFetchOutcome::LegShapeDrift(ev) => {
+                assert_eq!(ev.strikes_seen, 2);
+                assert_eq!(ev.strikes_kept, 2);
+                assert_eq!(ev.invalid_strikes, 0);
+                assert_eq!(ev.payload_bytes, drift_body.len());
+            }
+            other => panic!("expected LegShapeDrift, got {other:?}"),
+        }
+
+        // (c) entries present but EVERY key implausible → still drift
+        // (the vendor served SOMETHING our extraction dropped).
+        let implausible = r#"{"payload":{"strikes":{
+            "not-a-number": {"CE": {"ltp": 1.0}},
+            "-5": {"CE": {"ltp": 1.0}}
+        }}}"#;
+        let chain = parse_groww_option_chain(implausible).expect("parses");
+        assert!(chain.legs.is_empty());
+        match zero_leg_outcome(&chain, implausible.len(), implausible) {
+            GrowwChainFetchOutcome::LegShapeDrift(ev) => {
+                assert_eq!(ev.strikes_seen, 2);
+                assert_eq!(ev.strikes_kept, 0);
+                assert_eq!(ev.invalid_strikes, 2);
+            }
+            other => panic!("expected LegShapeDrift, got {other:?}"),
+        }
+
+        // (d) a normal body never reaches the zero-leg classifier — its
+        // legs are non-empty (Found arm unchanged).
+        let found = parse_groww_option_chain(SAMPLE_WRAPPED).expect("parses");
+        assert!(!found.legs.is_empty());
+
+        // (e) the FAILURE envelope stays the parse-Failed arm (`None` —
+        // never classified empty OR drift).
         assert_eq!(
-            groww_min_gap_wait_ms(Some(1_000), 1_000 + GROWW_CHAIN_1M_MIN_GAP_MS as i64),
-            0
+            parse_groww_option_chain(
+                r#"{"status":"FAILURE","error":{"code":"GA001","message":"x"}}"#
+            ),
+            None
         );
-        // Backwards clock (midnight wrap) → never a long spurious sleep.
-        assert_eq!(groww_min_gap_wait_ms(Some(50_000), 1_000), 0);
     }
+
+    /// (f) The evidence body sample is length-bounded AND rides the house
+    /// sanitize choke point: a JWT-shaped token can never survive into the
+    /// log line, and a 37-KB body truncates to ≤ the 300-char capture cap.
+    #[test]
+    fn test_zero_leg_outcome_body_sample_bounded_and_sanitized() {
+        use tickvault_common::sanitize::REST_BODY_CAPTURE_MAX_CHARS;
+        // A huge zero-leg body carrying a JWT-shaped credential.
+        let token = format!(
+            "eyJ{}.eyJ{}.sig{}",
+            "a".repeat(40),
+            "b".repeat(40),
+            "c".repeat(20)
+        );
+        let filler: String = std::iter::repeat_n("\"pad\":0,", 8_000).collect();
+        let body = format!(
+            r#"{{"payload":{{"token":"{token}","strikes":{{"100":{{"CE":null}}}},{filler}"end":1}}}}"#
+        );
+        let chain = parse_groww_option_chain(&body).expect("parses");
+        assert!(chain.legs.is_empty());
+        match zero_leg_outcome(&chain, body.len(), &body) {
+            GrowwChainFetchOutcome::LegShapeDrift(ev) => {
+                assert!(
+                    ev.body_sample.chars().count() <= REST_BODY_CAPTURE_MAX_CHARS,
+                    "sample must be bounded to the capture cap; got {} chars",
+                    ev.body_sample.chars().count()
+                );
+                assert!(
+                    !ev.body_sample.contains("eyJ"),
+                    "a JWT-shaped token must never survive the sanitizer: {}",
+                    ev.body_sample
+                );
+                assert_eq!(ev.payload_bytes, body.len(), "the REAL size is kept");
+            }
+            other => panic!("expected LegShapeDrift, got {other:?}"),
+        }
+    }
+
+    // ---- classification -----------------------------------------------
+    // (The pre-2026-07-14 min-gap pacing test retired with
+    // `groww_min_gap_wait_ms` — the auto-ladder wave has no min-gap; the
+    // stagger schedule is unit-tested in `crate::groww_rest_burst`.)
 
     #[test]
     fn test_chain_error_class_slugs_bounded() {
@@ -2350,39 +2950,9 @@ mod tests {
         assert!(probe_out_of_hours_caveat(true, true).is_none());
     }
 
-    // ---- sequencing (the reused wait core with the GROWW fallback) ---------
-
-    /// The GROWW chain leg reuses the Dhan wait core with its OWN fallback
-    /// constant: no receiver (spot disabled) → the fallback timer paces;
-    /// a spot signal for the minute wakes it early.
-    #[tokio::test]
-    async fn test_groww_chain_wait_fallback_paces_and_signal_wakes_early() {
-        use tokio::sync::watch;
-        let fire = 10 * 3600;
-        const FALLBACK_MS: u64 = 150;
-        let fb = Duration::from_millis(FALLBACK_MS);
-
-        // (a) No receiver: the fallback timer owns pacing.
-        let started = std::time::Instant::now();
-        wait_for_signal_or_fallback(FALLBACK_MS, fire, &mut None).await;
-        assert!(started.elapsed() >= fb, "must wait the full fallback");
-
-        // (b) The Groww spot leg signals this minute → early wake.
-        let (tx, rx) = watch::channel::<Option<u32>>(None);
-        let mut rx_opt = Some(rx);
-        let waiter = tokio::spawn(async move {
-            let started = std::time::Instant::now();
-            wait_for_signal_or_fallback(FALLBACK_MS, fire, &mut rx_opt).await;
-            started.elapsed()
-        });
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        tx.send_replace(Some(fire));
-        let waited = waiter.await.expect("waiter completes");
-        assert!(
-            waited < fb,
-            "signal must wake before the fallback: {waited:?}"
-        );
-    }
+    // (The pre-2026-07-14 spot→chain wait-core test retired with the
+    // auto-ladder — the chain leg fires on its own minute-boundary timer;
+    // the Dhan module keeps its own `wait_for_signal_or_fallback` tests.)
 
     // ---- HTTP leg (hermetic mock server — round-1 coverage battery) --------
 
@@ -2433,8 +3003,8 @@ mod tests {
             .into_boxed_str(),
         );
         let url = spawn_chain_mock(resp).await;
-        let (outcome, requested_at_ms, latency_ms) =
-            fetch_groww_chain_bounded(&test_client(), &url, "2026-07-16", &token, 0, None).await;
+        let (outcome, latency_ms) =
+            fetch_groww_chain_bounded(&test_client(), &url, "2026-07-16", &token, 0).await;
         match outcome {
             GrowwChainFetchOutcome::Found {
                 chain,
@@ -2448,7 +3018,6 @@ mod tests {
             }
             other => panic!("expected Found, got {other:?}"),
         }
-        assert!(requested_at_ms >= 0);
         assert!(latency_ms >= 0);
 
         // (b) A parseable 2xx with ZERO strikes → Empty (never silent).
@@ -2461,14 +3030,53 @@ mod tests {
             .into_boxed_str(),
         );
         let url = spawn_chain_mock(empty_resp).await;
-        let (outcome, _, _) =
-            fetch_groww_chain_bounded(&test_client(), &url, "2026-07-16", &token, 0, None).await;
-        assert_eq!(outcome, GrowwChainFetchOutcome::Empty);
+        let (outcome, _) =
+            fetch_groww_chain_bounded(&test_client(), &url, "2026-07-16", &token, 0).await;
+        match outcome {
+            GrowwChainFetchOutcome::Empty(ev) => {
+                // 2026-07-14 discipline: the Empty arm carries the full
+                // evidence bundle instead of discarding the parsed struct.
+                assert_eq!(ev.payload_bytes, empty_body.len());
+                assert_eq!(ev.strikes_seen, 0);
+                assert_eq!(ev.strikes_kept, 0);
+                assert_eq!(ev.invalid_strikes, 0);
+                assert!(
+                    !ev.body_sample.is_empty(),
+                    "the sanitized sample rides along"
+                );
+            }
+            other => panic!("expected Empty, got {other:?}"),
+        }
+
+        // (b') A parseable 2xx that SERVED entries but yielded zero legs →
+        // LegShapeDrift (the 2026-07-14 split — an error, never "empty").
+        let drift_body =
+            r#"{"payload":{"underlying_ltp":1.0,"strikes":{"100":{"CE":null,"PE":null}}}}"#;
+        let drift_resp: &'static str = Box::leak(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{drift_body}",
+                drift_body.len()
+            )
+            .into_boxed_str(),
+        );
+        let url = spawn_chain_mock(drift_resp).await;
+        let (outcome, _) =
+            fetch_groww_chain_bounded(&test_client(), &url, "2026-07-16", &token, 0).await;
+        match outcome {
+            GrowwChainFetchOutcome::LegShapeDrift(ev) => {
+                assert_eq!(ev.payload_bytes, drift_body.len());
+                assert_eq!(ev.strikes_seen, 1);
+                assert_eq!(ev.strikes_kept, 1);
+                assert_eq!(ev.invalid_strikes, 0);
+                assert!(ev.body_sample.contains("strikes"));
+            }
+            other => panic!("expected LegShapeDrift, got {other:?}"),
+        }
 
         // (c) A 2xx that is not a parseable option chain → Failed(200).
         let url = spawn_chain_mock("HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\nnot-json").await;
-        let (outcome, _, _) =
-            fetch_groww_chain_bounded(&test_client(), &url, "2026-07-16", &token, 0, None).await;
+        let (outcome, _) =
+            fetch_groww_chain_bounded(&test_client(), &url, "2026-07-16", &token, 0).await;
         match outcome {
             GrowwChainFetchOutcome::Failed(f) => {
                 assert_eq!(f.status, 200);
@@ -2591,7 +3199,10 @@ mod tests {
                 pg_port: 8812,
                 ilp_port: 9009,
             },
-            spot_minute_done: None,
+            burst: GrowwRestBurstState::new(
+                tickvault_common::config::GrowwRestBurstTier::TwoWave,
+                false,
+            ),
             minute_done_tx: None,
             anchor_store: None,
         }
@@ -2634,23 +3245,24 @@ mod tests {
     async fn test_fire_no_token_arm_counts_misses_and_writes_forensics() {
         let params = test_params();
         let targets = vec![test_target("NIFTY", "NSE"), test_target("SENSEX", "BSE")];
-        let mut last_request_ms: Option<i64> = None;
         let mut writer = OptionChain1mWriter::for_test_with_feed(
             OPTION_CHAIN_1M_FEED_GROWW,
             OPTION_CHAIN_1M_SOURCE_GROWW_CHAIN,
         );
         let mut audit_writer = RestFetchAuditWriter::for_test();
         let mut edge = FailureEdge::default();
+        let mut not_served = UnderlyingServedTracker::default();
         let mut token_cache = GrowwTokenCache::for_test_paced_out(epoch_ms_now());
         fire_one_groww_chain_minute(
             &params,
             &test_client(),
             &targets,
-            &mut last_request_ms,
             &mut writer,
             &mut audit_writer,
             &mut edge,
+            &mut not_served,
             &mut token_cache,
+            &mut MoneynessWarnLatches::default(),
             9 * 3600 + 16 * 60,
         )
         .await;
@@ -2659,10 +3271,6 @@ mod tests {
         // writer discards on flush — so pending is 0 AND the appends are
         // proven via the edge below (one fully-failed minute recorded).
         assert_eq!(audit_writer.pending(), 0, "flush ran (best-effort discard)");
-        assert!(
-            last_request_ms.is_none(),
-            "no request happened — the pacing stamp must stay unset"
-        );
         // The fire fed the edge EXACTLY one fully-failed minute: two more
         // failed minutes reach the 3-threshold page on the third total.
         assert!(matches!(edge.record_minute(true), EdgeAction::None));
@@ -2670,6 +3278,21 @@ mod tests {
             edge.record_minute(true),
             EdgeAction::Page { consecutive: 3 }
         ));
+        // A no-token fire is a GLOBAL miss (zero served) → the not-served
+        // tracker HELD: a subsequent counted streak still needs the FULL
+        // threshold before paging (had the fire counted, the page below
+        // would land one minute early).
+        let n = GROWW_CHAIN_1M_UNDERLYING_NOT_SERVED_THRESHOLD;
+        for i in 1..n {
+            let actions = not_served.record_minute(&[("NIFTY", false), ("SENSEX", true)]);
+            assert_eq!(
+                actions[0].1,
+                UnderlyingEdgeAction::None,
+                "no page below the threshold (counted minute {i})"
+            );
+        }
+        let actions = not_served.record_minute(&[("NIFTY", false), ("SENSEX", true)]);
+        assert_eq!(actions[0].1, UnderlyingEdgeAction::Page { consecutive: n });
     }
 
     fn non_trading_params() -> GrowwChain1mTaskParams {
@@ -2727,9 +3350,11 @@ mod tests {
 
     /// The token-path fire against a hermetic mock (target-carried URL):
     /// a Found underlying (with a vendor-omitted underlying_ltp — the
-    /// LOW-5 warn arm) + an Empty underlying. The disconnected test
-    /// writer's flush fails, so the persist gate counts the minute fully
-    /// failed (M1) even though the fetch found a chain.
+    /// LOW-5 warn arm) + an Empty underlying + a LegShapeDrift underlying
+    /// (the 2026-07-14 split: entries served, zero legs extractable — an
+    /// error, never "empty"). The disconnected test writer's flush fails,
+    /// so the persist gate counts the minute fully failed (M1) even
+    /// though the fetch found a chain.
     #[tokio::test]
     async fn test_fire_token_path_found_and_empty_via_mock() {
         let params = test_params();
@@ -2753,34 +3378,42 @@ mod tests {
             .into_boxed_str(),
         );
         let empty_url = spawn_chain_mock(empty_resp).await;
+        let drift_body =
+            r#"{"payload":{"underlying_ltp":1.0,"strikes":{"100":{"CE":null,"PE":null}}}}"#;
+        let drift_resp: &'static str = Box::leak(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{drift_body}",
+                drift_body.len()
+            )
+            .into_boxed_str(),
+        );
+        let drift_url = spawn_chain_mock(drift_resp).await;
         let targets = vec![
             test_target_with_url("NIFTY", "NSE", found_url),
             test_target_with_url("SENSEX", "BSE", empty_url),
+            test_target_with_url("BANKNIFTY", "NSE", drift_url),
         ];
-        let mut last_request_ms: Option<i64> = None;
         let mut writer = OptionChain1mWriter::for_test_with_feed(
             OPTION_CHAIN_1M_FEED_GROWW,
             OPTION_CHAIN_1M_SOURCE_GROWW_CHAIN,
         );
         let mut audit_writer = RestFetchAuditWriter::for_test();
         let mut edge = FailureEdge::default();
+        let mut not_served = UnderlyingServedTracker::default();
         let mut token_cache = GrowwTokenCache::for_test_with_token(SecretString::from("t"));
         fire_one_groww_chain_minute(
             &params,
             &test_client(),
             &targets,
-            &mut last_request_ms,
             &mut writer,
             &mut audit_writer,
             &mut edge,
+            &mut not_served,
             &mut token_cache,
+            &mut MoneynessWarnLatches::default(),
             9 * 3600 + 16 * 60,
         )
         .await;
-        assert!(
-            last_request_ms.is_some(),
-            "requests happened — the cross-request pacing stamp advanced"
-        );
         // The fetch side found a chain (ok_count = 1) BUT the disconnected
         // test writer's flush fails → the persist gate (the spot M1
         // discipline) honestly counts the minute FULLY FAILED: the edge
@@ -2790,21 +3423,42 @@ mod tests {
             edge.record_minute(true),
             EdgeAction::Page { consecutive: 3 }
         ));
+        // The not-served tracker is FETCH-level: NIFTY was served (Found),
+        // SENSEX was not (empty) and BANKNIFTY was not (leg-shape drift —
+        // the 2026-07-14 error class counts not-served EXACTLY like empty,
+        // so PR #1537's tracker semantics are unaffected by the split) —
+        // both streaks hold 1 counted minute; threshold-1 more counted
+        // minutes page each (had the fire NOT counted, the pages would
+        // land one late).
+        let n = GROWW_CHAIN_1M_UNDERLYING_NOT_SERVED_THRESHOLD;
+        for _ in 2..n {
+            let actions = not_served.record_minute(&[
+                ("NIFTY", true),
+                ("SENSEX", false),
+                ("BANKNIFTY", false),
+            ]);
+            assert_eq!(actions[1].1, UnderlyingEdgeAction::None);
+            assert_eq!(actions[2].1, UnderlyingEdgeAction::None);
+        }
+        let actions =
+            not_served.record_minute(&[("NIFTY", true), ("SENSEX", false), ("BANKNIFTY", false)]);
+        assert_eq!(actions[1].1, UnderlyingEdgeAction::Page { consecutive: n });
+        assert_eq!(actions[2].1, UnderlyingEdgeAction::Page { consecutive: n });
     }
 
-    /// The token-path fire's auth short-circuit (the item-12 mirror): a
-    /// 401 on the FIRST underlying drops the token, skips the remaining
-    /// underlyings (no doomed requests), and the minute counts fully
-    /// failed.
+    /// The token-path fire's auth handling under the concurrent wave
+    /// (2026-07-14 auto-ladder): a 401 on one underlying no longer skips
+    /// the others (both fetch concurrently — the per-ladder self-abort is
+    /// each task's own); the token is dropped ONCE after the wave and the
+    /// minute counts fully failed (401 + transport error).
     #[tokio::test]
-    async fn test_fire_token_path_auth_reject_short_circuits_via_mock() {
+    async fn test_fire_token_path_auth_reject_drops_token_after_wave_via_mock() {
         let params = test_params();
         let url_401 =
             spawn_chain_mock("HTTP/1.1 401 Unauthorized\r\nContent-Length: 2\r\n\r\n{}").await;
-        // The second target's port is CLOSED — a request there would be a
-        // transport error; the short-circuit must never send it at all
-        // (nothing observable would distinguish — the skip is proven by
-        // the forensics count in the no-token test's pattern + coverage).
+        // The second target's port is CLOSED — its concurrent request is a
+        // fast transport error (a counted failure, no longer skipped: the
+        // wave has no cross-target short-circuit by design).
         let dead = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind");
@@ -2818,33 +3472,126 @@ mod tests {
                 format!("http://127.0.0.1:{dead_port}/v1/option-chain"),
             ),
         ];
-        let mut last_request_ms: Option<i64> = None;
         let mut writer = OptionChain1mWriter::for_test_with_feed(
             OPTION_CHAIN_1M_FEED_GROWW,
             OPTION_CHAIN_1M_SOURCE_GROWW_CHAIN,
         );
         let mut audit_writer = RestFetchAuditWriter::for_test();
         let mut edge = FailureEdge::default();
+        let mut not_served = UnderlyingServedTracker::default();
         let mut token_cache = GrowwTokenCache::for_test_with_token(SecretString::from("t"));
         fire_one_groww_chain_minute(
             &params,
             &test_client(),
             &targets,
-            &mut last_request_ms,
             &mut writer,
             &mut audit_writer,
             &mut edge,
+            &mut not_served,
             &mut token_cache,
+            &mut MoneynessWarnLatches::default(),
             9 * 3600 + 17 * 60,
         )
         .await;
-        // Fully failed (401 + skipped) → the edge holds ONE failed minute:
-        // the page fires on the third total.
+        // Fully failed (401 + transport error) → the edge holds ONE failed
+        // minute: the page fires on the third total.
         assert!(matches!(edge.record_minute(true), EdgeAction::None));
         assert!(matches!(
             edge.record_minute(true),
             EdgeAction::Page { consecutive: 3 }
         ));
+        // 401 + transport error = an auth-ABORTED fire (the wave's
+        // `auth_aborted` flag) → the sink is skipped entirely and the
+        // not-served tracker HELD (no streak started for either
+        // underlying): a full fresh threshold is still required.
+        let n = GROWW_CHAIN_1M_UNDERLYING_NOT_SERVED_THRESHOLD;
+        for _ in 1..n {
+            let actions = not_served.record_minute(&[("NIFTY", false), ("SENSEX", true)]);
+            assert_eq!(actions[0].1, UnderlyingEdgeAction::None);
+        }
+        let actions = not_served.record_minute(&[("NIFTY", false), ("SENSEX", true)]);
+        assert_eq!(actions[0].1, UnderlyingEdgeAction::Page { consecutive: n });
+    }
+
+    /// The 2026-07-14 review-fix pin (wave form): a 401 in the SAME wave
+    /// as a Found underlying (ok ≥ 1 + auth reject) is a tracker HOLD —
+    /// the sink is skipped for the whole fire, so no underlying gains a
+    /// counted not-served minute (and therefore no counter increment —
+    /// the sink is the only increment site), and NOBODY's streak advances
+    /// or resets (not even the Found underlying's).
+    #[tokio::test]
+    async fn test_fire_auth_abort_after_found_is_tracker_hold() {
+        let params = test_params();
+        let body = r#"{"payload":{"underlying_ltp":1.0,"strikes":{"100":{"CE":{"ltp":1.5},"PE":{"ltp":2.5}}}}}"#;
+        let found_resp: &'static str = Box::leak(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            )
+            .into_boxed_str(),
+        );
+        let found_url = spawn_chain_mock(found_resp).await;
+        let url_401 =
+            spawn_chain_mock("HTTP/1.1 401 Unauthorized\r\nContent-Length: 2\r\n\r\n{}").await;
+        // The third target's port is CLOSED — under the concurrent wave it
+        // is a fast transport error (a counted Failed verdict; the wave
+        // has no cross-target short-circuit by design — the auth HOLD is
+        // applied AFTER the wave via `auth_aborted`).
+        let dead = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let dead_port = dead.local_addr().expect("addr").port();
+        drop(dead);
+        let targets = vec![
+            test_target_with_url("NIFTY", "NSE", found_url),
+            test_target_with_url("BANKNIFTY", "NSE", url_401),
+            test_target_with_url(
+                "SENSEX",
+                "BSE",
+                format!("http://127.0.0.1:{dead_port}/v1/option-chain"),
+            ),
+        ];
+        let mut writer = OptionChain1mWriter::for_test_with_feed(
+            OPTION_CHAIN_1M_FEED_GROWW,
+            OPTION_CHAIN_1M_SOURCE_GROWW_CHAIN,
+        );
+        let mut audit_writer = RestFetchAuditWriter::for_test();
+        let mut edge = FailureEdge::default();
+        let mut not_served = UnderlyingServedTracker::default();
+        let mut token_cache = GrowwTokenCache::for_test_with_token(SecretString::from("t"));
+        // Pre-seed: NIFTY + SENSEX each carry a 3-counted-minute streak
+        // going into the auth-aborted fire.
+        let seed = [("NIFTY", false), ("SENSEX", false), ("BANKNIFTY", true)];
+        for _ in 0..3 {
+            not_served.record_minute(&seed);
+        }
+        fire_one_groww_chain_minute(
+            &params,
+            &test_client(),
+            &targets,
+            &mut writer,
+            &mut audit_writer,
+            &mut edge,
+            &mut not_served,
+            &mut token_cache,
+            &mut MoneynessWarnLatches::default(),
+            9 * 3600 + 18 * 60,
+        )
+        .await;
+        // HOLD proven both directions: the streaks neither ADVANCED (the
+        // auth-skipped SENSEX did not gain a counted minute) nor RESET
+        // (NIFTY's Found in the aborted fire did not clear its streak) —
+        // exactly threshold-3 more counted minutes page BOTH, at the full
+        // threshold, together.
+        let n = GROWW_CHAIN_1M_UNDERLYING_NOT_SERVED_THRESHOLD;
+        for _ in 3..n - 1 {
+            let actions = not_served.record_minute(&seed);
+            assert_eq!(actions[0].1, UnderlyingEdgeAction::None, "NIFTY sub-edge");
+            assert_eq!(actions[1].1, UnderlyingEdgeAction::None, "SENSEX sub-edge");
+        }
+        let actions = not_served.record_minute(&seed);
+        assert_eq!(actions[0].1, UnderlyingEdgeAction::Page { consecutive: n });
+        assert_eq!(actions[1].1, UnderlyingEdgeAction::Page { consecutive: n });
     }
 
     /// The verdict sink's three edge arms execute without panicking and
@@ -2878,6 +3625,225 @@ mod tests {
         // (the spot M1 discipline — pure fn already pins it; this pins the
         // sink wiring).
         record_groww_chain_minute_verdict(&params, &mut edge, "9:22 AM", 2, 0, 0, true, None);
+    }
+
+    // -----------------------------------------------------------------------
+    // UnderlyingServedTracker (2026-07-14 — the NIFTY expiry-day
+    // vendor-cutoff companion; the spot SidServedTracker test style)
+    // -----------------------------------------------------------------------
+
+    const NOT_SERVED_N: u32 = GROWW_CHAIN_1M_UNDERLYING_NOT_SERVED_THRESHOLD;
+
+    /// The incident shape: ok=2/empty=1 for the full threshold → exactly
+    /// ONE page for the empty underlying at the threshold minute; later
+    /// counted minutes stay latched (no re-page).
+    #[test]
+    fn test_underlying_not_served_pages_once_at_threshold_then_stays_latched() {
+        let mut tracker = UnderlyingServedTracker::default();
+        let minute = [("NIFTY", false), ("BANKNIFTY", true), ("SENSEX", true)];
+        for i in 1..NOT_SERVED_N {
+            let actions = tracker.record_minute(&minute);
+            assert_eq!(
+                actions[0],
+                ("NIFTY", UnderlyingEdgeAction::None),
+                "no page below the threshold (counted minute {i})"
+            );
+            assert_eq!(actions[1].1, UnderlyingEdgeAction::None);
+            assert_eq!(actions[2].1, UnderlyingEdgeAction::None);
+        }
+        let actions = tracker.record_minute(&minute);
+        assert_eq!(
+            actions[0],
+            (
+                "NIFTY",
+                UnderlyingEdgeAction::Page {
+                    consecutive: NOT_SERVED_N
+                }
+            )
+        );
+        // Minutes 11+: latched — counted but never re-paged.
+        for _ in 0..3 {
+            let actions = tracker.record_minute(&minute);
+            assert_eq!(actions[0].1, UnderlyingEdgeAction::None);
+        }
+    }
+
+    /// Global-failure minutes (zero served — the escalation edge's class)
+    /// interleaved mid-streak neither count nor reset: the streak
+    /// survives the blip and still pages after the SAME total of counted
+    /// minutes. Within the FETCH-failure class this is the
+    /// no-double-fire proof (the escalation edge needs ok == 0, this
+    /// edge needs ≥1 OK); the honest persist-failed overlap (ok ≥ 1 +
+    /// persist failure counting toward BOTH edges) is documented on the
+    /// tracker.
+    #[test]
+    fn test_underlying_not_served_global_failure_neither_counts_nor_resets() {
+        let mut tracker = UnderlyingServedTracker::default();
+        let counted = [("NIFTY", false), ("BANKNIFTY", true), ("SENSEX", true)];
+        let global = [("NIFTY", false), ("BANKNIFTY", false), ("SENSEX", false)];
+        for _ in 1..NOT_SERVED_N {
+            assert_eq!(
+                tracker.record_minute(&counted)[0].1,
+                UnderlyingEdgeAction::None
+            );
+            // The interleaved global-outage minute: HOLD for everyone.
+            for &(_, action) in &tracker.record_minute(&global) {
+                assert_eq!(action, UnderlyingEdgeAction::None);
+            }
+        }
+        // The streak survived every HOLD: the NEXT counted minute pages.
+        let actions = tracker.record_minute(&counted);
+        assert_eq!(
+            actions[0].1,
+            UnderlyingEdgeAction::Page {
+                consecutive: NOT_SERVED_N
+            }
+        );
+    }
+
+    /// Recovery after the latch → exactly ONE Recover carrying the
+    /// episode length, latch cleared, and a NEW streak can page again.
+    #[test]
+    fn test_underlying_not_served_recovery_rearms_the_latch() {
+        let mut tracker = UnderlyingServedTracker::default();
+        let counted = [("NIFTY", false), ("BANKNIFTY", true)];
+        for _ in 0..NOT_SERVED_N {
+            tracker.record_minute(&counted);
+        }
+        // Two more counted minutes while latched (episode length grows).
+        tracker.record_minute(&counted);
+        tracker.record_minute(&counted);
+        // NIFTY served again → ONE Recover with the full episode length.
+        let actions = tracker.record_minute(&[("NIFTY", true), ("BANKNIFTY", true)]);
+        assert_eq!(
+            actions[0],
+            (
+                "NIFTY",
+                UnderlyingEdgeAction::Recover {
+                    not_served_minutes: NOT_SERVED_N + 2
+                }
+            )
+        );
+        // A second served minute is NOT a second recovery.
+        let actions = tracker.record_minute(&[("NIFTY", true), ("BANKNIFTY", true)]);
+        assert_eq!(actions[0].1, UnderlyingEdgeAction::None);
+        // A fresh streak pages again at the full threshold.
+        for _ in 1..NOT_SERVED_N {
+            assert_eq!(
+                tracker.record_minute(&counted)[0].1,
+                UnderlyingEdgeAction::None
+            );
+        }
+        assert_eq!(
+            tracker.record_minute(&counted)[0].1,
+            UnderlyingEdgeAction::Page {
+                consecutive: NOT_SERVED_N
+            }
+        );
+    }
+
+    /// Two underlyings empty simultaneously while the third is OK → both
+    /// count and both page independently at their own thresholds.
+    #[test]
+    fn test_underlying_not_served_two_empty_simultaneously_page_independently() {
+        let mut tracker = UnderlyingServedTracker::default();
+        // BANKNIFTY starts failing one minute after NIFTY.
+        tracker.record_minute(&[("NIFTY", false), ("BANKNIFTY", true), ("SENSEX", true)]);
+        let both = [("NIFTY", false), ("BANKNIFTY", false), ("SENSEX", true)];
+        for _ in 2..NOT_SERVED_N {
+            let actions = tracker.record_minute(&both);
+            assert_eq!(actions[0].1, UnderlyingEdgeAction::None);
+            assert_eq!(actions[1].1, UnderlyingEdgeAction::None);
+        }
+        // NIFTY reaches the threshold first…
+        let actions = tracker.record_minute(&both);
+        assert_eq!(
+            actions[0].1,
+            UnderlyingEdgeAction::Page {
+                consecutive: NOT_SERVED_N
+            }
+        );
+        assert_eq!(actions[1].1, UnderlyingEdgeAction::None);
+        // …BANKNIFTY one minute later, independently.
+        let actions = tracker.record_minute(&both);
+        assert_eq!(actions[0].1, UnderlyingEdgeAction::None);
+        assert_eq!(
+            actions[1].1,
+            UnderlyingEdgeAction::Page {
+                consecutive: NOT_SERVED_N
+            }
+        );
+    }
+
+    /// A sub-threshold streak at day end fires nothing, and a fresh
+    /// tracker (fresh day / fresh run) starts from zero. Error-class
+    /// not-served minutes count exactly like empty ones — the tracker
+    /// takes the SAME `served = false` verdict for both (the fire fn maps
+    /// Empty AND Failed to not-served; vendor not serving U either way).
+    #[test]
+    fn test_underlying_not_served_error_class_counts_like_empty() {
+        let mut tracker = UnderlyingServedTracker::default();
+        let counted = [("NIFTY", false), ("BANKNIFTY", true)];
+        // Sub-threshold streak → nothing fires…
+        for _ in 1..NOT_SERVED_N {
+            assert_eq!(
+                tracker.record_minute(&counted)[0].1,
+                UnderlyingEdgeAction::None
+            );
+        }
+        // …and a fresh tracker (day end → fresh day) holds no carryover:
+        // the full threshold is required again from zero.
+        let mut fresh = UnderlyingServedTracker::default();
+        for _ in 1..NOT_SERVED_N {
+            assert_eq!(
+                fresh.record_minute(&counted)[0].1,
+                UnderlyingEdgeAction::None
+            );
+        }
+        assert_eq!(
+            fresh.record_minute(&counted)[0].1,
+            UnderlyingEdgeAction::Page {
+                consecutive: NOT_SERVED_N
+            }
+        );
+    }
+
+    /// The per-underlying emission sink's three arms execute without
+    /// panicking and advance the tracker exactly as the pure contract
+    /// says (page at the threshold, recover on the next served minute);
+    /// an empty verdicts slice is a no-op.
+    #[test]
+    fn test_record_underlying_verdicts_page_and_recover_arms() {
+        let params = test_params();
+        let mut tracker = UnderlyingServedTracker::default();
+        record_groww_chain_underlying_verdicts(&params, &mut tracker, &[], "9:16 AM");
+        let counted = [("NIFTY", false), ("BANKNIFTY", true), ("SENSEX", true)];
+        for _ in 0..NOT_SERVED_N {
+            // The threshold-th call executes the Page arm inside.
+            record_groww_chain_underlying_verdicts(&params, &mut tracker, &counted, "2:55 PM");
+        }
+        // Latched: one more counted minute is the None arm.
+        record_groww_chain_underlying_verdicts(&params, &mut tracker, &counted, "3:05 PM");
+        // Served again: the Recover arm.
+        record_groww_chain_underlying_verdicts(
+            &params,
+            &mut tracker,
+            &[("NIFTY", true), ("BANKNIFTY", true), ("SENSEX", true)],
+            "3:06 PM",
+        );
+        // The tracker really did recover: a fresh full streak is needed.
+        for _ in 1..NOT_SERVED_N {
+            assert_eq!(
+                tracker.record_minute(&counted)[0].1,
+                UnderlyingEdgeAction::None
+            );
+        }
+        assert_eq!(
+            tracker.record_minute(&counted)[0].1,
+            UnderlyingEdgeAction::Page {
+                consecutive: NOT_SERVED_N
+            }
+        );
     }
 
     /// Boundary-skip accounting: zero skips is a no-op; a real skip writes

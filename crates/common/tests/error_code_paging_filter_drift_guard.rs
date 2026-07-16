@@ -4,7 +4,8 @@
 //! The three surfaces:
 //! 1. The `error_code_alerts` map in
 //!    `deploy/aws/terraform/error-code-alarms.tf` (the filters + alarms
-//!    that actually page — 9 entries as of 2026-07-09).
+//!    that actually page — 15 entries as of 2026-07-14: +5 REST-audit
+//!    entries per docs/audits/2026-07-14-rest-pipeline-adversarial-audit.md).
 //! 2. The documented paging list in
 //!    `.claude/rules/project/observability-architecture.md`
 //!    ("Which codes page" → the "Filtered+alarmed codes" paragraph).
@@ -22,7 +23,16 @@
 //! - a coded pattern that deviates from the errors.jsonl line shape
 //!   `{ $.code = "X" && $.level = "ERROR" }` (the tracing JSON layer's
 //!   `flatten_event(true)` top-level fields — a malformed pattern
-//!   silently never matches);
+//!   silently never matches). 2026-07-14 extension (REST-audit
+//!   GAP-01/GAP-03): ONE optional extra `$.field`-referencing scoping
+//!   clause is additionally accepted after the pinned code+level pair —
+//!   `{ $.code = "X" && $.level = "ERROR" && <extra> }` — used by the
+//!   once-per-episode sub-filters (`$.stage = "escalation"` /
+//!   `$.stage = "warmup"` / the AUTH-GAP-05 `$.cooldown_skip IS FALSE`
+//!   failure-arm scope). Honest limit: the extra clause's field name/value cannot be
+//!   validated against the enum (stage strings are not derivable from
+//!   `ErrorCode`) — a typo'd stage value silently never matches; the
+//!   emit-site check still guarantees the CODE has a real `error!` emit;
 //! - an ALLOWLISTED no-emit tripwire (DH-906) silently GAINING a coded
 //!   emit site (the allowlist + the "no coded emit site exists yet" doc
 //!   note + the term-match filter would all be stale — retire together).
@@ -205,11 +215,14 @@ fn is_test_cfg(attr: &str) -> bool {
 ///   while bringing this guard up on 2026-07-10).
 /// - NOT a truncation at the first test-gated MODULE either (the
 ///   2026-07-10 shape of this function): `crates/app/src/
-///   cross_verify_1m_boot.rs` carries a MID-FILE `#[cfg(test)] mod
+///   cross_verify_1m_boot.rs` carried a MID-FILE `#[cfg(test)] mod
 ///   start_decision_tests` at line ~134 with the real
 ///   CROSS-VERIFY-1M-01/-02 `error!` emits AFTER it — truncating there
 ///   reported both codes as dead filters (a FALSE dead found on
-///   2026-07-14 while adding their paging entries). Test-gated modules
+///   2026-07-14 while adding their paging entries; that module and its
+///   paging entries have since RETIRED — PR-C3 the same day — but the
+///   excision shape stays load-bearing for ANY mid-file test module).
+///   Test-gated modules
 ///   are now EXCISED via string-aware brace matching, so production
 ///   code before AND after a mid-file test module stays visible while
 ///   needles inside any test module never count.
@@ -488,13 +501,32 @@ enum PatternShape {
 }
 
 fn classify_pattern(pattern: &str) -> PatternShape {
-    // Coded shape, pinned EXACTLY (spacing included — the 9 live entries
-    // and the emit convention both use this byte shape).
+    // Coded shape, pinned EXACTLY (spacing included — the live entries
+    // and the emit convention both use this byte shape), with the
+    // 2026-07-14 extension: ONE optional extra scoping clause after the
+    // pinned code+level pair (` && <extra>` before the closing ` }`),
+    // where <extra> is non-empty, references a JSON field (`$.`), and
+    // does not smuggle a second `$.code` clause (which could shadow the
+    // extracted code and defeat the validity/emit-site checks).
     if let Some(rest) = pattern.strip_prefix("{ $.code = \"")
         && let Some(code_end) = rest.find('"')
     {
         let code = &rest[..code_end];
-        if rest[code_end..] == *"\" && $.level = \"ERROR\" }" && !code.is_empty() {
+        if code.is_empty() {
+            return PatternShape::Malformed;
+        }
+        let Some(tail) = rest[code_end..].strip_prefix("\" && $.level = \"ERROR\"") else {
+            return PatternShape::Malformed;
+        };
+        if tail == " }" {
+            return PatternShape::Coded(code.to_string());
+        }
+        if let Some(extra) = tail.strip_prefix(" && ")
+            && let Some(extra) = extra.strip_suffix(" }")
+            && !extra.is_empty()
+            && extra.contains("$.")
+            && !extra.contains("$.code")
+        {
             return PatternShape::Coded(code.to_string());
         }
         return PatternShape::Malformed;
@@ -659,9 +691,12 @@ fn live_tf_entries() -> Vec<AlertEntry> {
 #[test]
 fn every_tf_pattern_extracts_a_valid_known_code_with_pinned_shape() {
     let entries = live_tf_entries();
+    // Floor 10 -> 9 -> 8: ws-gap-07 retired PR-C2 2026-07-13 (emit site died
+    // with the Dhan live-WS lane) AND rest-canary-01 retired 2026-07-14
+    // (operator Dhan noise lock) — both landed through the PR-C2 merge.
     assert!(
-        entries.len() >= 9,
-        "parser self-check: expected >= 9 error_code_alerts entries, got {} — \
+        entries.len() >= 8,
+        "parser self-check: expected >= 8 error_code_alerts entries, got {} — \
          either entries were removed (update this ratchet with a dated note) or \
          the parser broke on a formatting change: {entries:?}",
         entries.len()
@@ -773,9 +808,11 @@ fn tf_map_and_doc_paging_list_agree_bidirectionally() {
     let mut doc_codes =
         parse_doc_paging_codes(&read(".claude/rules/project/observability-architecture.md"));
     doc_codes.sort();
+    // Floor 9 -> 8 (PR-C2 merge, 2026-07-14): ws-gap-07 + rest-canary-01 both
+    // left the paging list (see the tf-entries floor note above).
     assert!(
-        doc_codes.len() >= 9,
-        "doc parser self-check: expected >= 9 codes in the 'Filtered+alarmed \
+        doc_codes.len() >= 8,
+        "doc parser self-check: expected >= 8 codes in the 'Filtered+alarmed \
          codes' paragraph, got {doc_codes:?} — the section moved or the parser broke"
     );
     let missing_in_doc: Vec<&String> = tf_codes.iter().filter(|c| !doc_codes.contains(c)).collect();
@@ -881,6 +918,44 @@ fn synthetic_shape_classifier_detects_planted_drift() {
         classify_pattern(r#"{ $.code = "PROC-01" && $.level = "WARN" }"#),
         PatternShape::Malformed
     );
+    // 2026-07-14 extension: ONE extra $.field scoping clause is Coded —
+    // the stage-scoped once-per-episode sub-filters and the AUTH-GAP-05
+    // $.cooldown_skip failure-arm scope (the field exists only on the
+    // mint-failure emission; IS FALSE excludes the noise-lock H3
+    // non-terminal cooldown-skip lines).
+    assert_eq!(
+        classify_pattern(
+            r#"{ $.code = "SPOT1M-01" && $.level = "ERROR" && $.stage = "escalation" }"#
+        ),
+        PatternShape::Coded("SPOT1M-01".into())
+    );
+    assert_eq!(
+        classify_pattern(
+            r#"{ $.code = "AUTH-GAP-05" && $.level = "ERROR" && $.cooldown_skip IS FALSE }"#
+        ),
+        PatternShape::Coded("AUTH-GAP-05".into())
+    );
+    // The extra clause must reference a JSON field…
+    assert_eq!(
+        classify_pattern(r#"{ $.code = "PROC-01" && $.level = "ERROR" && true }"#),
+        PatternShape::Malformed
+    );
+    // …must not be empty…
+    assert_eq!(
+        classify_pattern(r#"{ $.code = "PROC-01" && $.level = "ERROR" &&  }"#),
+        PatternShape::Malformed
+    );
+    // …and must not smuggle a SECOND $.code clause (which could shadow
+    // the extracted code and defeat the validity/emit-site checks).
+    assert_eq!(
+        classify_pattern(r#"{ $.code = "PROC-01" && $.level = "ERROR" && $.code = "FAKE-99" }"#),
+        PatternShape::Malformed
+    );
+    // The level clause is still mandatory even with a stage clause:
+    assert_eq!(
+        classify_pattern(r#"{ $.code = "PROC-01" && $.stage = "escalation" }"#),
+        PatternShape::Malformed
+    );
     // A typo'd code is Coded(...) but must fail validity:
     assert!(variant_name_for("PROC-99-TYPO").is_none());
     assert!(variant_name_for("PROC-01").is_some());
@@ -888,10 +963,13 @@ fn synthetic_shape_classifier_detects_planted_drift() {
 
 #[test]
 fn synthetic_doc_parser_detects_a_missing_code() {
+    // Fixture codes must be VALID variants (the parser filters on
+    // `ErrorCode::all()`). C4 sweep (2026-07-15): REST-CANARY-01 was
+    // retired with its variant, so the fixture uses FEED-STALL-01.
     let doc = "### Which codes page (2026-07-06)\n\nFiltered+alarmed codes: \
-               REST-CANARY-01, DH-901, PROC-01. **Everything else** is log-sink-only.\n";
+               FEED-STALL-01, DH-901, PROC-01. **Everything else** is log-sink-only.\n";
     let codes = parse_doc_paging_codes(doc);
-    assert_eq!(codes, vec!["REST-CANARY-01", "DH-901", "PROC-01"]);
+    assert_eq!(codes, vec!["FEED-STALL-01", "DH-901", "PROC-01"]);
     // A tf set containing AGGREGATOR-DROP-01 vs this doc must diff:
     assert!(
         !codes.contains(&"AGGREGATOR-DROP-01".to_string()),
@@ -975,8 +1053,9 @@ fn synthetic_emit_detector_ignores_comments_and_test_regions() {
         "cfg(not(test)) gates PRODUCTION code — it must never truncate"
     );
     // Regression pin (2026-07-14, the CROSS-VERIFY-1M false-dead found
-    // while adding its paging entry): a MID-FILE cfg(test) module —
-    // cross_verify_1m_boot.rs's `mod start_decision_tests` at ~line 134 —
+    // while adding its then-live paging entry; the module + entries have
+    // since retired — PR-C3 the same day): a MID-FILE cfg(test) module —
+    // the deleted cross_verify_1m_boot.rs's `mod start_decision_tests` —
     // must be EXCISED, never TRUNCATED AT: the real production emit AFTER
     // it must stay visible, while a needle INSIDE the mid-file module
     // still never counts. Both directions:

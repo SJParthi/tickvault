@@ -127,9 +127,13 @@ kills are not re-reported.
    tickvault.
 3. Cross-check host memory pressure — the r8g.large 16 GiB budget
    (`aws-budget.md` / `daily-universe-scope-expansion-2026-05-27.md` §7) has
-   ~7.8 GB headroom, so a real OOM points at a leak or an unexpected working-set
-   spike; correlate with `tv_subsystem_memory_estimated_bytes{component=…}` +
-   the host `mem_used_high` alarm.
+   ~7.8 GB headroom *(SUPERSEDED 2026-07-15 → t4g.medium 4 GiB per §7 Quote 8:
+   budgeted headroom is only ~0.9–1.7 GB, Assumed until live-measured — an OOM
+   is now plausible from a plain working-set overrun, not just a leak; t4g.large
+   8 GiB is the rip-cord)*, so a real OOM points at a leak or an unexpected
+   working-set spike; correlate with
+   `tv_subsystem_memory_estimated_bytes{component=…}` + the host
+   `mem_used_high` alarm.
 4. A repeating PROC-01 (OOM-loop) during market hours needs operator action —
    the box will keep dying; investigate the offending subsystem before it
    starves the feeds.
@@ -329,6 +333,38 @@ live WS feed.
 `crates/core/src/auth/mid_session_watchdog.rs` (`decide_remint` + the
 Trigger/RefuseLockLost arms), `crates/core/src/auth/token_health_gauge.rs`
 (the honest gauges), `crates/core/src/auth/token_manager.rs::dual_instance_lock_held`.
+
+### 2026-07-14 Update — the mint-FAILURE arm now PAGES via CloudWatch (REST-audit GAP-01)
+
+The 2026-07-14 adversarial audit
+(`docs/audits/2026-07-14-rest-pipeline-adversarial-audit.md`, GAP-01 HIGH)
+found AUTH-GAP-05's page was app-emitted Telegram ONLY — a dead app
+notifier (or Telegram bot) silenced the mid-session token-death page
+entirely, and per GAP-02/GAP-04 a FAILED single mint leaves the token dead
+for the rest of the session (retry-once latch; the 4h sweep backstop is
+lane-only). A CloudWatch log-filter alarm now backstops it:
+`tv-<env>-errcode-auth-gap-05-remint-failed`
+(`deploy/aws/terraform/error-code-alarms.tf`) — errors.jsonl → CW Logs
+`/tickvault/<env>/app` → filter
+`{ $.code = "AUTH-GAP-05" && $.level = "ERROR" && $.cooldown_skip IS FALSE }`
+→ alarm (≤5 min) → SNS → Telegram.
+**SCOPED to the mint-FAILURE arm** via the `$.cooldown_skip` boolean field,
+which exists ONLY on the "forced re-mint failed" emission (the
+`flatten_event(true)` JSON layer hoists event fields top-level in
+errors.jsonl; `IS FALSE` additionally excludes the same-day Dhan-noise-lock
+H3 mint-cooldown-skip lines — a TokenManager cooldown skip is NOT terminal,
+the next re-arm window retries, and the app Telegram is equally gated
+`!permanent && !cooldown_skip`): the TRIGGER arm ("forcing re-mint") fires
+on every episode
+INCLUDING successful ~30-min self-heals and is operator-ruled noise —
+silent-when-healing, loud-only-when-unobtainable — so it deliberately does
+NOT page here (the HIGH `TokenForcedRemintTriggered` Telegram remains its
+app-side signal). `ok_recovery = false` (once-per-episode emitter — the
+auto-OK ~15 min after the datapoint ages out can never mean the token came
+back; real recovery = `tv_token_valid` returning to 1 / the next clean
+watchdog cycle). Triage step 1 above ("app Telegram only" era) is
+superseded accordingly: the CloudWatch page names the same errors.jsonl
+line to read.
 
 ## AUTH-GAP-06 — fast-boot cached-token validation (live 2026-07-08)
 

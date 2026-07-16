@@ -4,9 +4,75 @@
 >
 > **⚠ FURTHER SUPERSEDED → r8g.large 2026-06-30 (operator Quote 7 in [`daily-universe-scope-expansion-2026-05-27.md`](./daily-universe-scope-expansion-2026-05-27.md) §7):** instance upgraded m8g.large → **r8g.large** (Graviton4, 2 vCPU / 16 GiB), bill → ~₹2,919/mo incl GST (270 hrs, 30 GB EBS, +EIP kept). The current effective instance lock lives in that file's §7.
 >
+> **⚠ RE-SUPERSEDED → t4g.medium 2026-07-15 (operator Quote 8 in [`daily-universe-scope-expansion-2026-05-27.md`](./daily-universe-scope-expansion-2026-05-27.md) §7):** instance DOWNSIZED r8g.large → **t4g.medium** (Graviton2, 2 vCPU / 4 GiB), QuestDB QDB_MEM_LIMIT 4g → 1g. INTERIM bill → ~₹1,471/mo incl GST at 270 hrs with the live 50 GB root (gp3 cannot shrink; the 20 GB fresh-volume recreate — an executor pre-stage, NOT operator-quoted — drops it to ~₹1,197/mo; ~₹986/mo requires BOTH the ~176-hr auto-schedule basis AND the post-recreate 20 GB volume — on the live 50 GB root the ~176-hr figure is ~₹1,260, and ~₹986 is never the 270-hr one). EIP kept. The current effective instance lock lives in that file's §7. This file's original t4g.medium tables below remain 2026-05-18 historical audit (different universe/stack — do not reuse the ₹1,022 figure).
+>
 > **Authority:** Parthiban (architect). Non-negotiable.
 > **Ground truth:** `docs/architecture/aws-indices-only-locked-architecture.md` §5 (instance lock 2026-05-18) and the 2026-05-20 CloudWatch-only decision below.
 > **Scope:** Any file touching AWS deployment, infrastructure, Docker config, or cost-impacting changes.
+
+## COST NOTE 2026-07-15 — Groww live-feed retirement (Trap-A lockstep; net reduction)
+
+The Groww live feed (sidecar + bridge + stall watchdog + lag publisher) is
+retired (operator 2026-07-15: "remove the whole Groww live feed; keep only
+spot 1m and option chain for both brokers; go"). Alarm/metric deltas
+(Verified against the terraform diff in this PR; billing magnitudes Assumed
+at CloudWatch list rates — active-series-hours decay to $0 once producers
+stop publishing):
+
+- **−3 alarms ≈ −$0.30/mo (Verified):** groww-ws-inactive +
+  groww-stall-restart-storm (app-alarms.tf) + groww-exchange-lag-p99-high
+  (silent-feed-alarms.tf S4).
+- **−1 alarm ≈ −$0.10/mo (Verified, same-PR fix round):**
+  aggregator-no-seals (app-alarms.tf section 9) — its metric lost its last
+  live producer with the bridge deletion (Dhan broadcast publisher-less
+  since PR-C2); a permanently-dead monitor the window gate kept arming
+  (window-gate ALARM_NAMES trimmed 5 → 4 in the same edit).
+- **−1 alarm + its fallback log metric filter ≈ −$0.10/mo + one sparse
+  derived series (Verified):** the tv-<env>-feed-stall-restarts counter
+  pager (feed-stall-restart-alarm.tf deleted whole).
+- **−1 errcode alarm ≈ −$0.10/mo (Verified):** the "feed-stall-01"
+  error_code_alerts entry (its ERROR-level emit site died with the stall
+  watchdog; observability-architecture.md paging list updated in lockstep).
+- **−4 EMF allowlist names ≈ −$1.20/mo at full in-session density (names
+  Verified; billing Assumed):** tv_groww_ws_active,
+  tv_feed_last_tick_age_seconds, tv_feed_sidecar_stall_restart_total,
+  tv_groww_exchange_lag_p99_seconds.
+- **+1 EMF name ≈ +$0.30/mo (Assumed):** tv_rest_1m_fire_heartbeat — the
+  per-fire liveness gauge replacing the lag gauge **1:1 under the EXISTING
+  tv-<env>-market-hours-liveness-missing alarm** (metric_name-only swap;
+  0 new alarms; treat_missing_data="breaching" + the 09:20–15:35 IST window
+  gate unchanged).
+
+Net ≈ **−$0.50/mo alarms/filters + ≈ −$0.90/mo series (Assumed)** — inside
+the $35/mo pre-GST budget alarm ceiling; the real saving is the ~30K-LoC
+delete, not dollars. Honest residual (design Assumed sound, not
+live-simulated): the heartbeat is deliberately NOT pre-registered at boot —
+the first set at the 09:16:01 IST fire is the session-start signal; a day
+where BOTH per-minute REST spot legs are disabled/dead pages the liveness
+alarm ~09:25 IST — the designed loud outcome (zero in-session capture), not
+a false page.
+
+## COST NOTE 2026-07-14 — REST-audit alarm gaps (GAP-01/03/05, +~$0.60/mo)
+
+The 2026-07-14 REST-pipeline adversarial audit
+(`docs/audits/2026-07-14-rest-pipeline-adversarial-audit.md`) found the
+REST-leg paging chain was app-emitted Telegram ONLY (GAP-01/GAP-03) with no
+alarm on Telegram drops themselves (GAP-05). Added:
+
+- **+5 errcode log-filter alarms ≈ $0.50/mo** (`error-code-alarms.tf`):
+  `auth-gap-05-remint-failed` (mint-FAILURE arm only — `$.cooldown_skip
+  IS FALSE` scoped; excludes the noise-lock H3 non-terminal
+  cooldown-skip lines), `spot1m-01-escalation` + `chain-02-escalation`
+  (`stage="escalation"` once-per-episode edges only), `chain-01`,
+  `chain-04-warmup`. Their log-derived metrics are sparse/dimensionless
+  (billed only in hours a code fires — near-free).
+- **+1 counter-delta alarm ≈ $0.10/mo** (`telegram-drop-alarm.tf`):
+  `tv-<env>-telegram-drops` on `tv_telegram_dropped_total` (Sum ≥ 3 per
+  900s, metrics-log delta-extraction house pattern). The derived metric is
+  sparse until the flagged crates-side pre-registration lands (near-free).
+
+Total **≈ $0.60/mo pre-GST (~₹60/mo incl. 18% GST at ₹85/$)** — inside the
+$35/mo pre-GST budget alarm ceiling and the ~₹3,101/mo envelope.
 
 ## COST NOTE 2026-07-06 — Silent-feed alerting hardening (+~$1.50/mo)
 
@@ -46,6 +112,15 @@ The dual-feed scoreboard PR-C added, per `deploy/aws/terraform/silent-feed-alarm
 Total **≈ $0.40/mo pre-GST (~₹40/mo incl. 18% GST at ₹85/$)** — inside the
 $35/mo pre-GST budget alarm ceiling and the ~₹2,919/mo envelope.
 
+## COST NOTE 2026-07-14 — PR-C3 tick-gap retirement (−~$0.40/mo)
+
+PR-C3 (tick-gap detector deletion, operator Q4-ii 2026-07-13) removed the
+`tv-<env>-tick-gap-instruments-silent` alarm (−1 alarm ≈ −$0.10/mo) and the
+`tv_tick_gap_instruments_silent` custom-metric series from the EMF allowlist
+(−1 series ≈ −$0.30/mo) — the gauge producer was deleted with the Dhan WS
+lane, so both would have been dead monitors. Dated notes in
+`deploy/aws/terraform/app-alarms.tf` + `market-hours-liveness-alarm.tf`.
+
 ## COST NOTE 2026-07-13 — EBS 30→50 GB (+~₹170/mo incl GST)
 
 Prod disk-pressure remediation (operator pre-approved 2026-07-13): the root fs
@@ -60,6 +135,30 @@ effective contract lives in `daily-universe-scope-expansion-2026-05-27.md` §7
 (Mechanical Rule 3); the live grow is `scripts/aws-upgrade-instance.sh
 --ebs-size 50` (online) — terraform's `ebs_gp3_size_gb=50` documents
 fresh-provision intent only (`volume_size` is in `lifecycle.ignore_changes`).
+
+## COST NOTE 2026-07-14 — Order-side observability, cluster C (+~$0.60/mo now, ~$1.20/mo ceiling at Phase-1)
+
+Order-side audit tables + alert-sink wiring + alarms (order_audit/pnl_audit rebuild, OMS→Telegram
+bridge, orders-placed storm pager, arm-on-arrival fill-lag/daily-loss alarms), per
+`deploy/aws/terraform/order-side-alarms.tf`:
+
+- **+1 custom-metric series ≈ $0.30/mo:** `tv_orders_placed_delta_total` (derived, metrics-log
+  filter on `/tickvault/<env>/metrics` — dense from the main.rs pre-registrations; the log filter
+  itself is free). NO new EMF-published series bill today: the 2 new allowlist names
+  (`tv_daily_pnl`, `tv_order_fill_lag_seconds`) are DORMANT — their emit sites ship with
+  cluster A / Phase-1, so zero datapoints = $0.00 until then, then ≈ +$0.60/mo (noted here in
+  advance so that PR needs no new cost note for them).
+- **+3 alarms ≈ $0.30/mo:** orders-placed-storm (armed), daily-loss-breach (armed, structurally
+  silent in dry-run — missing gauge + notBreaching), order-fill-lag-high (actions_enabled = false
+  until Phase-1 arming). The pre-existing orders-rejected alarm is fixed at $0 (ok_actions
+  removed + counter pre-registered — it was dead for single-rejection sessions).
+- **Dashboard: ₹0** — one widget row appended to the EXISTING `tv-<env>-operator` dashboard;
+  free-tier dashboard slot 3 deliberately NOT consumed.
+- **Log-ingestion delta:** 3 newly-dense counter series ≈ a few hundred bytes/min into the
+  metrics log group — noise inside the 5 GB free tier.
+
+Total **≈ $0.60/mo pre-GST now (~₹51/mo incl. 18% GST at ₹85/$), ≈ $1.20/mo at Phase-1** —
+inside the $35/mo pre-GST budget alarm ceiling and the ~₹3,101/mo envelope.
 
 ## OPERATOR DECISION 2026-05-20 — Observability stack → CloudWatch-only
 

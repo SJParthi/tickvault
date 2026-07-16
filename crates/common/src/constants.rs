@@ -647,26 +647,13 @@ pub const GROWW_INSTRUMENT_CSV_URL: &str =
 /// Groww live-feed NATS-over-WebSocket endpoint (wheel `feed.py::_GROWW_SOCKET_URL`).
 pub const GROWW_SOCKET_URL: &str = "wss://socket-api.groww.in"; // APPROVED: constants.rs is the single WS-URL source
 
-/// Groww per-session socket-token mint endpoint (wheel `client.py::generate_socket_token`).
-///
-/// LIVE-FEED-AUTH class (the KEEP class of
-/// `no-rest-except-live-feed-2026-06-27.md` §2/§3 — recorded there 2026-07-04):
-/// consumes the SSM-read ACCESS token (`Authorization: Bearer …`) to mint a
-/// per-session NATS user JWT bound to a fresh ed25519 nkey. It does NOT mint
-/// the access token (shared-minter lock 2026-07-02 untouched) and carries NO
-/// market data. This is exactly the call the Python sidecar's SDK already
-/// makes on every feed (re)construction.
-pub const GROWW_SOCKET_TOKEN_URL: &str = "https://api.groww.in/v1/api/apex/v1/socket/token/create/"; // APPROVED: constants.rs is the single REST-URL source
-
+// (2026-07-15: GROWW_SOCKET_TOKEN_URL deleted — its sole caller, the native
+// shadow socket-token mint, was deleted with the Groww live feed.)
 /// Groww data directory (watch files, sidecar NDJSON, shadow NDJSON).
 pub const GROWW_DATA_DIR: &str = "data/groww";
 
-/// The native shadow client's OWN NDJSON capture file (same `GrowwTickLine`
-/// line schema as the sidecar's `data/groww/live-ticks.ndjson`), rotated to
-/// `rust-live-ticks-YYYYMMDD.ndjson` at the IST day boundary — mirrors the
-/// sidecar's rotation so the parity comparer sees symmetrical archives.
-pub const GROWW_NATIVE_SHADOW_NDJSON_PATH: &str = "data/groww/rust-live-ticks.ndjson";
-
+// (2026-07-15: GROWW_NATIVE_SHADOW_NDJSON_PATH deleted — the shadow client
+// producer was deleted with the Groww live feed.)
 /// First reconnect delay for the native shadow client (bounded expo backoff).
 pub const GROWW_NATIVE_RECONNECT_BASE_SECS: u64 = 5;
 
@@ -1505,6 +1492,18 @@ pub const DHAN_KILL_SWITCH_PATH: &str = "/killswitch";
 pub const DHAN_PNL_EXIT_PATH: &str = "/pnlExit";
 
 // ---------------------------------------------------------------------------
+// Conditional & Multi Order — REST API Endpoint Paths
+// ---------------------------------------------------------------------------
+
+/// Path for Place Multi Order (appended to rest_api_base_url).
+/// Endpoint: POST <https://api.dhan.co/v2/alerts/multi/orders> — Place Multi
+/// Order (Conditional & Multi Order family; max 15 sequence-keyed orders).
+/// PORTAL-only page; response schema is OpenAPI-yaml-only — UNVERIFIED-LIVE.
+/// Equities-only fail-closed policy enforced in
+/// `tickvault_trading::oms::conditional`.
+pub const DHAN_ALERTS_MULTI_ORDERS_PATH: &str = "/alerts/multi/orders";
+
+// ---------------------------------------------------------------------------
 // Full Market Depth — WebSocket Base URLs
 // ---------------------------------------------------------------------------
 
@@ -1904,6 +1903,47 @@ const _: () = assert!(
     "CHAIN_1M per-request timeout must fit inside the per-underlying budget"
 );
 
+/// Hard wall-clock ceiling (secs after the minute close) past which a
+/// chain RETRY may no longer LAUNCH — the operator's ≤~15s decision-data
+/// window (2026-07-14 directive). Gates ONLY the retry pass; pass 1 is
+/// the unchanged concurrent fire (Dhan-documented: distinct underlyings
+/// concurrently; the 3s bound is per unique (underlying, expiry) key).
+pub const CHAIN_1M_DECISION_CEILING_SECS: u64 = 15;
+
+/// Per-underlying not-served threshold — pinned to the spot leg's value
+/// (and, transitively once #1537 merges, the Groww chain's).
+pub const CHAIN_1M_UNDERLYING_NOT_SERVED_THRESHOLD: u32 = 10;
+const _: () = assert!(
+    CHAIN_1M_UNDERLYING_NOT_SERVED_THRESHOLD == SPOT_1M_REST_SID_NOT_SERVED_THRESHOLD,
+    "one not-served threshold family across the REST legs"
+);
+
+// P1. A worst-case TIMED-OUT first attempt still leaves its retry
+// launchable inside the ceiling: 2.5s fallback + 10s request timeout
+// = 12.5s ≤ 15s (the 2.5s remainder is the modeled limiter-queue
+// headroom at 3 rps; at the 2 rps floor under a 429 storm the REAL-clock
+// gate may refuse — counted, never silent).
+const _: () = assert!(
+    CHAIN_1M_FALLBACK_DELAY_MS + CHAIN_1M_REQUEST_TIMEOUT_SECS * 1_000
+        <= CHAIN_1M_DECISION_CEILING_SECS * 1_000,
+    "a timed-out first attempt must leave the retry launchable inside the ceiling"
+);
+
+// P2. A ceiling-edge retry can never overrun the minute:
+// 15s launch + 20s per-underlying budget = 35s < 60s.
+const _: () = assert!(
+    (CHAIN_1M_DECISION_CEILING_SECS + CHAIN_1M_UNDERLYING_BUDGET_SECS) * 1_000 < 60_000,
+    "a ceiling-edge retry must not overrun the minute"
+);
+
+// P3. A FAST-FAIL first attempt's same-key ≥3s gap always leaves the
+// retry launchable: 3s gap < 15s − 2.5s fallback.
+const _: () = assert!(
+    CHAIN_1M_MIN_GAP_SECS * 1_000
+        < CHAIN_1M_DECISION_CEILING_SECS * 1_000 - CHAIN_1M_FALLBACK_DELAY_MS,
+    "the same-key retry gap must fit inside the decision ceiling"
+);
+
 // ---------------------------------------------------------------------------
 // Groww spot 1m REST leg (operator grant 2026-07-13 — PR-2 of the Groww
 // per-minute REST plan, `.claude/plans/active-plan-groww-rest-1m.md`;
@@ -1991,33 +2031,45 @@ const _: () = assert!(
     "GROWW_SPOT_1M_SYMBOLS must stay the 3 core indices (Groww VIX is runtime-resolved, not const)"
 );
 
-/// Post-minute-close fire delay (ms) for the Groww leg — mirrors
-/// [`SPOT_1M_REST_FIRE_DELAY_MS`]. Groww's just-closed-minute availability
-/// latency is undocumented; the ladder + histogram measure it.
+/// Post-minute-close fire delay (ms) for the Groww SPOT leg under the
+/// probe-gated `seven_concurrent` burst tier (2026-07-14 auto-ladder —
+/// `no-rest-except-live-feed-2026-06-27.md` §9.7): both waves fire at
+/// close + this delay. Under the DEFAULT `two_wave` tier the spot wave
+/// fires at [`GROWW_SPOT_1M_TWO_WAVE_FIRE_DELAY_MS`] instead. Groww's
+/// just-closed-minute availability latency is undocumented; the ladder +
+/// histogram measure it.
 pub const GROWW_SPOT_1M_FIRE_DELAY_MS: u64 = 300;
+
+/// Post-minute-close fire delay (ms) for the Groww SPOT wave under the
+/// SHIPPED-DEFAULT `two_wave` burst tier (2026-07-14 auto-ladder): the
+/// chain wave fires at [`GROWW_CHAIN_1M_FIRE_DELAY_MS`] (300 ms) and the
+/// spot wave 1,050 ms later — a separation STRICTLY > 1,000 ms
+/// (const-asserted below), so no rolling 1-second window contains both
+/// waves and the boundary burst never exceeds max(3 chain, 4 spot) =
+/// 4 req/s.
+pub const GROWW_SPOT_1M_TWO_WAVE_FIRE_DELAY_MS: u64 = 1_350;
 
 /// Bounded in-minute re-poll ladder for the Groww leg: offsets (ms) FROM
 /// the first attempt — mirrors [`SPOT_1M_REST_RETRY_OFFSETS_MS`].
 pub const GROWW_SPOT_1M_RETRY_OFFSETS_MS: [u64; 4] = [700, 1_500, 3_000, 6_000];
 
-/// Per-REQUEST HTTP timeout (secs) for one Groww candles poll — mirrors
-/// the Dhan leg's 5 s (bounded inside the minute; the SDK ships INFINITE
-/// default timeouts, so this bound is entirely ours).
-pub const GROWW_SPOT_1M_REQUEST_TIMEOUT_SECS: u64 = 5;
+/// Per-REQUEST HTTP timeout (ms) for one Groww candles poll — TIGHTENED
+/// 5 s → 3.5 s by the 2026-07-14 auto-ladder (measured round-trip is
+/// ~0.2 s per the 2026-07-13 live probe; a stalling peer must fail fast
+/// so the ladder's next rung — or the record-only backfill/sweep — takes
+/// over inside the decision window). The SDK ships INFINITE default
+/// timeouts, so this bound is entirely ours.
+pub const GROWW_SPOT_1M_REQUEST_TIMEOUT_MS: u64 = 3_500;
 
 /// HARD wall-clock budget (secs) for ONE symbol's whole in-minute ladder.
-/// 14 s (not the Dhan leg's 20 s — a DELIBERATE tightening; was 18 s at
-/// 3 targets, re-derived 2026-07-13 when INDIA VIX made it 4 targets): the
-/// Groww leg fetches its targets SEQUENTIALLY (the minute-boundary pacing
-/// rule of `docs/groww-ref/15-rate-limits-and-capacity.md` — the
-/// shared-token 10/s Live-Data bucket is TYPE-pooled and co-tenanted with
-/// bruteX, so each boundary burst is spread to at most ONE in-flight
-/// request at a time, far inside the ≤6 req/s ceiling), so the WHOLE fire
-/// is bounded by 4 × budget (3 core + the runtime-resolved INDIA VIX);
-/// 4 × 14 s + the fire delay still finishes inside the minute, and the
-/// ladder schedule (last 6 s offset + one 5 s request timeout = 11 s)
-/// still fits one budget — both const-asserted below.
-pub const GROWW_SPOT_1M_SYMBOL_BUDGET_SECS: u64 = 14;
+/// RE-DERIVED 2026-07-14 (was 14 s under the sequential-target loop): the
+/// auto-ladder fetches the 4 targets CONCURRENTLY (one wave), so the
+/// budget bounds ONE ladder, not a sequential sum — the ladder schedule
+/// (last 6 s offset + one 3.5 s request timeout = 9.5 s) fits 11 s with
+/// margin, and the WHOLE fire (worst wave delay + intra-wave stagger +
+/// ONE budget) finishes far inside the minute — both const-asserted
+/// below.
+pub const GROWW_SPOT_1M_SYMBOL_BUDGET_SECS: u64 = 11;
 
 /// Maximum accepted response body size (bytes) for one Groww candles poll
 /// — a full-day 375-row tuple response is ~20 KB; 2 MiB bounds a
@@ -2039,22 +2091,36 @@ const _: () = assert!(
         && GROWW_SPOT_1M_RETRY_OFFSETS_MS[2] < GROWW_SPOT_1M_RETRY_OFFSETS_MS[3],
     "GROWW_SPOT_1M retry offsets must be strictly increasing"
 );
-// SEQUENTIAL-fetch budget math: the whole fire (fire delay + 4 sequential
-// per-target ladder budgets — the 3 core symbols + 1 for the
-// runtime-resolved INDIA VIX target, 2026-07-13 operator scope) must
-// finish inside the minute, and the ladder's own schedule (last offset +
-// one full request timeout) must fit inside one symbol's budget so the
-// timeout only fires on genuine stalls.
+// CONCURRENT-wave budget math (2026-07-14 auto-ladder): the whole spot
+// fire (worst-case two_wave delay + the demoted intra-wave stagger across
+// the 4 targets — 3 core + the runtime-resolved INDIA VIX — + ONE ladder
+// budget, since the targets run concurrently) must finish inside the
+// minute, and the ladder's own schedule (last offset + one full request
+// timeout) must fit inside one symbol's budget so the timeout only fires
+// on genuine stalls.
 const _: () = assert!(
-    GROWW_SPOT_1M_FIRE_DELAY_MS
-        + (GROWW_SPOT_1M_SYMBOLS.len() as u64 + 1) * GROWW_SPOT_1M_SYMBOL_BUDGET_SECS * 1_000
+    GROWW_SPOT_1M_TWO_WAVE_FIRE_DELAY_MS
+        + (GROWW_SPOT_1M_SYMBOLS.len() as u64) * GROWW_REST_BURST_INTRA_WAVE_STAGGER_MS
+        + GROWW_SPOT_1M_SYMBOL_BUDGET_SECS * 1_000
         < 60_000,
-    "GROWW_SPOT_1M sequential fire (delay + 4 x symbol budget incl. the runtime VIX target) must finish inside the minute"
+    "GROWW_SPOT_1M concurrent fire (two_wave delay + demoted stagger + one ladder budget) must finish inside the minute"
 );
+// The ladder budget also absorbs the worst-case per-target rung jitter
+// ((targets − 1) × step = 3 × 150 = 450 ms — HIGH-1 fix 2026-07-14):
+// 6,000 + 450 + 3,500 = 9,950 ms < 11 s.
 const _: () = assert!(
-    GROWW_SPOT_1M_RETRY_OFFSETS_MS[3] + GROWW_SPOT_1M_REQUEST_TIMEOUT_SECS * 1_000
+    GROWW_SPOT_1M_RETRY_OFFSETS_MS[3]
+        + (GROWW_SPOT_1M_SYMBOLS.len() as u64) * GROWW_REST_RUNG_JITTER_STEP_MS
+        + GROWW_SPOT_1M_REQUEST_TIMEOUT_MS
         < GROWW_SPOT_1M_SYMBOL_BUDGET_SECS * 1_000,
-    "GROWW_SPOT_1M ladder schedule (last offset + one request timeout) must fit the budget"
+    "GROWW_SPOT_1M ladder schedule (last offset + max rung jitter + one request timeout) must fit the budget"
+);
+// The two_wave separation is the load-bearing rate-safety fact: STRICTLY
+// more than 1,000 ms between the chain wave and the spot wave means no
+// rolling 1-second window ever contains both initial waves.
+const _: () = assert!(
+    GROWW_SPOT_1M_TWO_WAVE_FIRE_DELAY_MS > GROWW_CHAIN_1M_FIRE_DELAY_MS + 1_000,
+    "two_wave: the spot wave must trail the chain wave by MORE than one rolling second"
 );
 
 // ---------------------------------------------------------------------------
@@ -2100,39 +2166,32 @@ const _: () = assert!(
     "GROWW_CHAIN_1M_UNDERLYINGS must mirror the 3-index CORE GROWW_SPOT_1M_SYMBOLS set"
 );
 
-/// Fallback post-boundary fire delay (ms) for the Groww chain leg —
-/// mirrors [`CHAIN_1M_FALLBACK_DELAY_MS`]: the chain task normally wakes
-/// when the GROWW spot leg signals its minute complete; when the spot leg
-/// is disabled, dead, or slow, this timer fires the chain anyway
-/// (sequencing is best-effort, never a hard dependency).
-pub const GROWW_CHAIN_1M_FALLBACK_DELAY_MS: u64 = 2_500;
+/// Post-minute-close fire delay (ms) for the Groww CHAIN wave — BOTH
+/// burst tiers (2026-07-14 auto-ladder,
+/// `no-rest-except-live-feed-2026-06-27.md` §9.7): the chain leg fires on
+/// its OWN minute-boundary timer at close + this delay. REPLACES the
+/// retired `GROWW_CHAIN_1M_FALLBACK_DELAY_MS` (2.5 s spot→chain
+/// serialization) and the retired `GROWW_CHAIN_1M_MIN_GAP_MS` (1 s
+/// inter-underlying gap) — the ~4.5 s of self-imposed pacing the operator
+/// approved deleting; the 3 underlyings now fetch CONCURRENTLY within the
+/// wave (a demoted `two_wave` session staggers them by
+/// [`GROWW_REST_BURST_INTRA_WAVE_STAGGER_MS`] each).
+pub const GROWW_CHAIN_1M_FIRE_DELAY_MS: u64 = 300;
 
-/// MECHANICAL cross-request minimum gap (ms) between ANY two consecutive
-/// Groww chain requests — ONE scalar stamp spans underlyings, so a fire's
-/// 3 requests spread over ≥ 2 s (chain leg ≤ 1 req/s sustained) instead
-/// of bursting back-to-back at the minute boundary (hostile-round-1
-/// MEDIUM-1). Groww documents NO chain-specific rate rule
-/// (`docs/groww-ref/14-option-chain.md` §4 — the family is UNDOCUMENTED,
-/// Unknown ≠ unlimited), so the VALUE is not doc-mandated (the Dhan
-/// 1-per-3s contrast): 1 s keeps the combined spot+chain boundary burst
-/// inside the ≤6 req/s pacing ceiling of
-/// `docs/groww-ref/15-rate-limits-and-capacity.md` with bruteX co-tenancy
-/// headroom. The wait runs INSIDE the per-underlying budget (the
-/// min-gap + timeout < budget const-assert below stays coherent).
-pub const GROWW_CHAIN_1M_MIN_GAP_MS: u64 = 1_000;
-
-/// Per-REQUEST HTTP timeout (secs) for one Groww chain call — chains are
-/// BIG (~100–300 KB per `docs/groww-ref/14-option-chain.md` §5, Assumed);
-/// mirrors the Dhan chain leg's 10 s.
-pub const GROWW_CHAIN_1M_REQUEST_TIMEOUT_SECS: u64 = 10;
+/// Per-REQUEST HTTP timeout (ms) for one Groww chain call — TIGHTENED
+/// 10 s → 4.5 s by the 2026-07-14 auto-ladder: the 2026-07-13 live probe
+/// measured ~0.2 s per chain (36–69 KB); a stalling peer must fail fast
+/// so the minute's verdict lands inside the decision window (the chain is
+/// a live snapshot — there is no re-poll rung to wait for).
+pub const GROWW_CHAIN_1M_REQUEST_TIMEOUT_MS: u64 = 4_500;
 
 /// HARD wall-clock budget (secs) for ONE underlying's per-minute chain
-/// fetch (min-gap wait + one request). 15 s — DELIBERATELY tighter than
-/// the Dhan chain's 20 s: the Groww leg fetches its 3 underlyings
-/// SEQUENTIALLY (the ≤6 req/s shared-bucket pacing rule, the spot-leg
-/// precedent), so the whole fire is bounded by 3 × budget and must still
-/// finish inside the minute (const-asserted below).
-pub const GROWW_CHAIN_1M_UNDERLYING_BUDGET_SECS: u64 = 15;
+/// fetch (one request; no min-gap since the 2026-07-14 auto-ladder).
+/// RE-DERIVED 2026-07-14 (was 15 s under the sequential loop): one 4.5 s
+/// request timeout fits 6 s with margin, and the whole CONCURRENT fire
+/// (wave delay + demoted stagger + ONE budget) finishes far inside the
+/// minute (const-asserted below).
+pub const GROWW_CHAIN_1M_UNDERLYING_BUDGET_SECS: u64 = 6;
 
 /// Maximum accepted response body size (bytes) for one Groww chain call —
 /// ~100–300 KB expected; 8 MiB bounds a hostile/misbehaving server
@@ -2151,29 +2210,260 @@ pub const GROWW_CHAIN_1M_CONSECUTIVE_FAIL_PAGE_THRESHOLD: u32 = 3;
 /// to disabled-for-the-day (NEVER a guessed expiry).
 pub const GROWW_CHAIN_1M_MASTER_RETRY_BACKOFF_SECS: [u64; 2] = [3, 6];
 
+/// Consecutive counted not-served minutes for ONE underlying before the
+/// ONE edge-latched per-underlying `CHAIN-02 stage="underlying_not_served"`
+/// page fires (2026-07-14 — the NIFTY expiry-day vendor cutoff companion:
+/// Groww stopped serving the same-day-expiring NIFTY chain at 14:54 IST
+/// while BANKNIFTY + SENSEX kept working, and the ok==0 escalation edge
+/// paged nobody all afternoon). A minute COUNTS toward an underlying's
+/// streak only when that underlying's chain came back empty/failed while
+/// ≥1 OTHER underlying succeeded in the SAME minute — a global-outage
+/// minute (zero underlyings served) neither counts nor resets, so this
+/// detector distinguishes vendor-not-serving-this-underlying from a
+/// general outage (which the
+/// [`GROWW_CHAIN_1M_CONSECUTIVE_FAIL_PAGE_THRESHOLD`] edge owns — the two
+/// are mutually exclusive per minute). Re-armed only by that underlying's
+/// own recovery. Same value as the spot leg's
+/// [`SPOT_1M_REST_SID_NOT_SERVED_THRESHOLD`] (the pattern it mirrors).
+pub const GROWW_CHAIN_1M_UNDERLYING_NOT_SERVED_THRESHOLD: u32 = 10;
+
 const _: () = assert!(
     GROWW_CHAIN_1M_CONSECUTIVE_FAIL_PAGE_THRESHOLD == SPOT_1M_REST_CONSECUTIVE_FAIL_PAGE_THRESHOLD,
     "the Groww chain leg reuses the spot FailureEdge — thresholds must agree"
 );
-// SEQUENTIAL-fetch budget math: the whole chain fire (fallback delay + 3
-// sequential per-underlying budgets) must finish inside the minute; the
-// per-request timeout + min-gap must fit one underlying's budget; and the
-// fallback delay must TRAIL the Groww spot leg's post-boundary fire delay
-// (the chain is sequenced AFTER the spot fetch).
+// CONCURRENT-wave budget math (2026-07-14 auto-ladder): the whole chain
+// fire (wave delay + the demoted intra-wave stagger across 3 underlyings
+// + ONE per-underlying budget, since they run concurrently) must finish
+// inside the minute; one request timeout must fit the budget.
 const _: () = assert!(
-    GROWW_CHAIN_1M_FALLBACK_DELAY_MS
+    GROWW_CHAIN_1M_FIRE_DELAY_MS
+        + (GROWW_CHAIN_1M_UNDERLYINGS.len() as u64 - 1) * GROWW_REST_BURST_INTRA_WAVE_STAGGER_MS
+        + GROWW_CHAIN_1M_UNDERLYING_BUDGET_SECS * 1_000
+        < 60_000,
+    "GROWW_CHAIN_1M concurrent fire (wave delay + demoted stagger + one budget) must finish inside the minute"
+);
+const _: () = assert!(
+    GROWW_CHAIN_1M_REQUEST_TIMEOUT_MS < GROWW_CHAIN_1M_UNDERLYING_BUDGET_SECS * 1_000,
+    "GROWW_CHAIN_1M one request timeout must fit the per-underlying budget"
+);
+
+// ---------------------------------------------------------------------------
+// Groww REST burst auto-ladder (operator approval 2026-07-14 — "approved
+// and go ahead with the recommendation", relayed via the coordinator
+// session; contract: `no-rest-except-live-feed-2026-06-27.md` §9.7 +
+// `groww-second-feed-scope-2026-06-19.md` §38.9). Two burst tiers
+// (`[groww_rest_burst] tier`): `two_wave` (SHIPPED DEFAULT — 3 chain
+// requests at close+300 ms, 4 spot at close+1,350 ms) and
+// `seven_concurrent` (operator preference, PROBE-GATED — all 7 at
+// close+300 ms). Any Groww-leg HTTP 429 auto-demotes the session.
+// ---------------------------------------------------------------------------
+
+/// Intra-wave stagger (ms) applied per request slot when a `two_wave`
+/// session has been DEMOTED by a live 429 (`seven_concurrent` demotes to
+/// plain `two_wave` first; a further 429 drops to the fully-sequential
+/// floor — review MEDIUM-1 2026-07-14): request k of a wave starts
+/// k × this many ms into the wave. Because each spot target's re-poll
+/// ladder offsets are measured from ITS OWN first attempt, the stagger
+/// propagates into every rung wave too — combined with the per-target
+/// rung jitter below, the demoted vendor-lag rung worst case drops from
+/// 6 req/s (jittered undemoted) to ≤ 4 req/s in any rolling second
+/// (rung instant = 350j stagger + offset_k + 150j jitter = offset_k
+/// + 500j; hand-checked worst window holds 4).
+pub const GROWW_REST_BURST_INTRA_WAVE_STAGGER_MS: u64 = 350;
+
+/// Deterministic per-target RUNG jitter step (ms) — HIGH-1 fix
+/// 2026-07-14, the Dhan-leg [`SPOT_1M_REST_LADDER_JITTER_STEP_MS`]
+/// precedent applied to the Groww spot wave: target slot j shifts its
+/// ENTIRE re-poll rung schedule by j × this step, in ALL tiers
+/// (undemoted included — the pre-fix rungs fired in 4-target lockstep,
+/// an 8 req/s rung burst on a correlated vendor-lag minute whose 429
+/// could land on the co-tenant BruteX so our auto-demote never fired).
+/// With the jitter the undemoted rung worst rolling second is 6
+/// (const-computed below), and the seven_concurrent lag-worst drops
+/// 11 → 9 req/s solo. NO randomness — slot × step, same as the Dhan leg.
+pub const GROWW_REST_RUNG_JITTER_STEP_MS: u64 = 150;
+
+/// Compile-time worst-case count of spot RUNG requests — across the 4
+/// concurrent targets (3 core + the runtime VIX), each rung schedule
+/// jittered by slot × [`GROWW_REST_RUNG_JITTER_STEP_MS`] — inside any
+/// rolling 1,000 ms window (UNDEMOTED tiers; the demoted shapes only
+/// spread further). Evaluates to 6 with the shipped offsets/jitter; the
+/// const fn keeps the ceiling assert honest if either ever changes.
+const fn groww_spot_rung_worst_rolling_second() -> u64 {
+    const RUNGS: usize = GROWW_SPOT_1M_RETRY_OFFSETS_MS.len();
+    const TARGETS: usize = GROWW_SPOT_1M_SYMBOLS.len() + 1; // + runtime VIX
+    let mut instants = [0u64; RUNGS * TARGETS];
+    let mut k = 0;
+    while k < RUNGS {
+        let mut j = 0;
+        while j < TARGETS {
+            instants[k * TARGETS + j] =
+                GROWW_SPOT_1M_RETRY_OFFSETS_MS[k] + (j as u64) * GROWW_REST_RUNG_JITTER_STEP_MS;
+            j += 1;
+        }
+        k += 1;
+    }
+    let mut worst = 0u64;
+    let mut a = 0;
+    while a < RUNGS * TARGETS {
+        let mut count = 0u64;
+        let mut b = 0;
+        while b < RUNGS * TARGETS {
+            if instants[b] >= instants[a] && instants[b] < instants[a] + 1_000 {
+                count += 1;
+            }
+            b += 1;
+        }
+        if count > worst {
+            worst = count;
+        }
+        a += 1;
+    }
+    worst
+}
+
+/// Compile-time count of jittered spot rung requests landing inside the
+/// FIRST rolling second after the wave instant (rung instant < 1,000 ms
+/// from the wave) — the `seven_concurrent` vendor-lag addend on top of
+/// the 7 initial requests. Evaluates to 2 with the shipped
+/// offsets/jitter (rungs at 700 and 850 ms).
+const fn groww_spot_rungs_in_first_second() -> u64 {
+    const RUNGS: usize = GROWW_SPOT_1M_RETRY_OFFSETS_MS.len();
+    const TARGETS: usize = GROWW_SPOT_1M_SYMBOLS.len() + 1; // + runtime VIX
+    let mut count = 0u64;
+    let mut k = 0;
+    while k < RUNGS {
+        let mut j = 0;
+        while j < TARGETS {
+            if GROWW_SPOT_1M_RETRY_OFFSETS_MS[k] + (j as u64) * GROWW_REST_RUNG_JITTER_STEP_MS
+                < 1_000
+            {
+                count += 1;
+            }
+            j += 1;
+        }
+        k += 1;
+    }
+    count
+}
+
+/// WARM-UP lead (secs): at minute boundary − this lead, each enabled
+/// Groww REST leg sends ONE lightweight UNAUTHENTICATED GET on its own
+/// long-lived client, response discarded — the 401/400 reply still
+/// re-establishes an idle-closed TLS/H2 connection before the critical
+/// window (the ~60 s idle gap between fires can outlive server-side idle
+/// close; client-side `pool_idle_timeout` alone cannot prove the server
+/// kept the socket). ≤ 2 requests (one per leg) in a second that NEVER
+/// overlaps the waves (const-asserted below). Deliberately no
+/// Authorization header and no token-cache touch: an SSM read failure
+/// 4 s before the fire would burn the ≥ 60 s token re-read pacing floor
+/// and turn the fire into a no_token miss.
+pub const GROWW_REST_WARMUP_LEAD_SECS: u64 = 4;
+
+/// WARM-UP hard timeout (secs) — strictly less than the lead, so a
+/// black-holed warm-up can never push the fire late (const-asserted).
+pub const GROWW_REST_WARMUP_TIMEOUT_SECS: u64 = 3;
+
+/// Off-hours rate-probe escalation steps (requests per second, one
+/// 1-second burst per step): 4 → 6 → 8 → 11. The 11 top step was sized
+/// for the PRE-jitter `seven_concurrent` vendor-lag worst shape
+/// (initial 7 + a lockstep first rung wave of 4 = 11 in one rolling
+/// second); with the 2026-07-14 HIGH-1 rung jitter that worst shape is
+/// 9 — the 11 step is KEPT as deliberate over-test margin. The probe's
+/// 429 verdict is the ONLY gate that can promote `seven_concurrent`
+/// (§9.7(5)).
+pub const GROWW_RATE_PROBE_STEPS_RPS: [u32; 4] = [4, 6, 8, 11];
+
+/// Off-hours rate-probe rounds (max) — 2 × (4+6+8+11) = 58 requests
+/// total, bounded by construction.
+pub const GROWW_RATE_PROBE_ROUNDS: u32 = 2;
+
+/// Pause (secs) between rate-probe steps — lets any pooled-bucket state
+/// drain so each step measures a clean burst.
+pub const GROWW_RATE_PROBE_PAUSE_SECS: u64 = 10;
+
+/// Rate-probe blackout window (IST seconds-of-day) — [08:30, 16:00),
+/// enforced on ANY day, trading day or not (SECURITY-MEDIUM fix
+/// 2026-07-14): the pre-fix gate was `trading_day && [09:00, 15:35)`,
+/// keyed solely on `TradingCalendar` — a stale holiday list could fire
+/// the 58-request probe burst mid-session. The widened unconditional
+/// wall-clock window needs NO calendar lookup at all (nothing to
+/// fail-open on), covers the whole session + the 15:31–15:33
+/// sweep/cross-verify window + boot/deploy margins, and costs only that
+/// a weekend/holiday probe must also run outside [08:30, 16:00) IST —
+/// acceptable for an operator-triggered off-hours tool.
+pub const GROWW_RATE_PROBE_BLACKOUT_START_SECS_OF_DAY_IST: u32 = 8 * 3600 + 30 * 60;
+pub const GROWW_RATE_PROBE_BLACKOUT_END_SECS_OF_DAY_IST: u32 = 16 * 3600;
+
+const _: () = assert!(
+    GROWW_REST_WARMUP_TIMEOUT_SECS < GROWW_REST_WARMUP_LEAD_SECS,
+    "the warm-up timeout must be strictly inside its lead so a fire can never start late"
+);
+// The warm-up second (boundary − 4 s) and the first wave (boundary
+// + 300 ms) are > 1 rolling second apart — the ≤ 2 warm-up requests never
+// stack onto a wave burst.
+const _: () = assert!(
+    GROWW_REST_WARMUP_LEAD_SECS * 1_000 + GROWW_CHAIN_1M_FIRE_DELAY_MS > 1_000,
+    "the warm-up instant must be more than one rolling second before the first wave"
+);
+// seven_concurrent initial wave: 4 spot (3 core + runtime VIX) + 3 chain
+// = 7 concurrent ≤ the documented 10/s broker ceiling SOLO. HONEST
+// vendor-lag math (recomputed 2026-07-14 with the HIGH-1 rung jitter): a
+// lag minute adds the jittered first-rung stragglers inside the wave's
+// rolling second — 7 + 2 = 9 SOLO (const-asserted below; pre-jitter this
+// was 7 + 4 = 11, ABOVE the ceiling). The probe's 11 rps top step is
+// KEPT — it over-tests the retired pre-jitter shape as deliberate
+// margin. HONEST residual (hot-path review 2026-07-14): the static
+// asserts cover SOLO shapes only — with the assumed BruteX ~3/s
+// co-tenancy anchor the seven lag-worst is 9 + 3 = 12 and even the
+// healthy wave is 7 + 3 = 10 with ZERO margin; co-tenancy safety has NO
+// static assert and relies on the probe gate + the runtime 429
+// demotion ladder — the reason seven_concurrent is probe-gated, never
+// the default.
+const _: () = assert!(
+    (GROWW_SPOT_1M_SYMBOLS.len() as u64 + 1) + (GROWW_CHAIN_1M_UNDERLYINGS.len() as u64) <= 10,
+    "seven_concurrent initial wave (4 spot + 3 chain) must not exceed the documented 10/s ceiling"
+);
+// seven_concurrent vendor-lag worst rolling second SOLO (2026-07-14
+// jitter fix): the initial 7 + the jittered rung stragglers inside the
+// wave's first second (const-computed: 2) = 9 ≤ 10.
+const _: () = assert!(
+    (GROWW_SPOT_1M_SYMBOLS.len() as u64 + 1)
+        + (GROWW_CHAIN_1M_UNDERLYINGS.len() as u64)
+        + groww_spot_rungs_in_first_second()
+        <= 10,
+    "seven_concurrent vendor-lag worst rolling second (initial 7 + jittered first-second rungs) must not exceed the 10/s ceiling SOLO"
+);
+// two_wave vendor-lag worst rolling second (UNDEMOTED, recomputed
+// 2026-07-14 with the HIGH-1 rung jitter): the jittered rung schedule's
+// const-computed worst window holds 6 requests (pre-jitter: two aligned
+// 4-target rung waves 800 ms apart = 8); the config-OFF contract leg
+// adds ≤ 1000/min-gap = 2 more when enabled — 8 total, 2 under the
+// documented 10/s ceiling SOLO (pre-jitter this sat AT the ceiling with
+// zero margin over the assumed BruteX ~3/s anchor; with the anchor the
+// jittered worst is 11 — still above, which is why the 429 auto-demote
+// ladder exists: staggered drops the rung worst to ≤ 4/s, sequential
+// removes overlap entirely). Initial waves stay ≤ 4/s by the
+// wave-separation assert above.
+const _: () = assert!(
+    groww_spot_rung_worst_rolling_second() + 1_000 / GROWW_CONTRACT_1M_MIN_GAP_MS <= 10,
+    "two_wave vendor-lag worst rolling second (jittered spot rungs + the contract leg) must not exceed the 10/s ceiling"
+);
+// The demotion ladder's SEQUENTIAL floor (review MEDIUM-1 2026-07-14):
+// slot j of a wave starts j × the leg's whole per-slot budget into the
+// wave, so requests never overlap — the fire must still finish inside
+// the minute on both legs.
+const _: () = assert!(
+    GROWW_SPOT_1M_TWO_WAVE_FIRE_DELAY_MS
+        + (GROWW_SPOT_1M_SYMBOLS.len() as u64 + 1) * GROWW_SPOT_1M_SYMBOL_BUDGET_SECS * 1_000
+        < 60_000,
+    "sequential-floor spot fire (two_wave delay + 4 whole per-target budgets) must finish inside the minute"
+);
+const _: () = assert!(
+    GROWW_CHAIN_1M_FIRE_DELAY_MS
         + (GROWW_CHAIN_1M_UNDERLYINGS.len() as u64) * GROWW_CHAIN_1M_UNDERLYING_BUDGET_SECS * 1_000
         < 60_000,
-    "GROWW_CHAIN_1M sequential fire (fallback + 3 x underlying budget) must finish inside the minute"
-);
-const _: () = assert!(
-    GROWW_CHAIN_1M_MIN_GAP_MS + GROWW_CHAIN_1M_REQUEST_TIMEOUT_SECS * 1_000
-        < GROWW_CHAIN_1M_UNDERLYING_BUDGET_SECS * 1_000,
-    "GROWW_CHAIN_1M min-gap + one request timeout must fit the per-underlying budget"
-);
-const _: () = assert!(
-    GROWW_CHAIN_1M_FALLBACK_DELAY_MS > GROWW_SPOT_1M_FIRE_DELAY_MS,
-    "GROWW_CHAIN_1M fallback delay must trail the Groww spot leg's fire delay"
+    "sequential-floor chain fire (wave delay + 3 whole per-underlying budgets) must finish inside the minute"
 );
 
 // ---------------------------------------------------------------------------
@@ -2197,9 +2487,11 @@ const _: () = assert!(
 /// minute complete (spot → chain → contract sequencing); when the chain
 /// leg is dead or slow, this timer fires the contract leg anyway
 /// (sequencing is best-effort, never a hard dependency). 8 s trails the
-/// chain's NORMAL completion window (chain fallback 2.5 s + 3 sequential
-/// underlyings at the 1 s min-gap ≈ 5-7 s) so the fresh anchor usually
-/// exists by the time selection runs.
+/// chain's NORMAL completion window (since the 2026-07-14 auto-ladder:
+/// chain wave at close+300 ms + concurrent ~0.2 s round-trips, worst
+/// case the 6 s per-underlying budget + demoted stagger ≈ 7 s —
+/// const-asserted below) so the fresh anchor usually exists by the time
+/// selection runs.
 pub const GROWW_CONTRACT_1M_FALLBACK_DELAY_MS: u64 = 8_000;
 
 /// MECHANICAL cross-request minimum gap (ms) between ANY two consecutive
@@ -2217,6 +2509,12 @@ pub const GROWW_CONTRACT_1M_FALLBACK_DELAY_MS: u64 = 8_000;
 /// (const-asserted below with exact rational math), with the broker's
 /// documented 10/s hard ceiling far above. Pure pacing cost: 29 gaps ×
 /// 500 ms = 14.5 s of the 45 s fire budget — still bounded.
+///
+/// 2026-07-14 note: the contract leg KEEPS this min-gap under the
+/// auto-ladder (its 30-request fire is a sustained stream, not a wave);
+/// the ≤6 req/s cross-multiplication math above is historical — the
+/// operative ceiling assert is the rewritten rolling-second block in the
+/// burst-auto-ladder section (spot rung waves + this leg's 2/s ≤ 10/s).
 pub const GROWW_CONTRACT_1M_MIN_GAP_MS: u64 = 500;
 
 /// Per-REQUEST HTTP timeout (secs) for one contract candles call — the
@@ -2230,6 +2528,32 @@ pub const GROWW_CONTRACT_1M_REQUEST_TIMEOUT_SECS: u64 = 5;
 /// nearest-ATM-first — counted + one coded warn, never fetched past the
 /// cap, never silent.
 pub const GROWW_CONTRACT_1M_MAX_PER_MINUTE: usize = 30;
+
+/// GATE 3 of the Groww order-side 4-gate live-fire lattice (operator
+/// authorization 2026-07-14 — `.claude/rules/project/groww-second-feed-scope-2026-06-19.md`
+/// §39.2, `.claude/rules/project/no-rest-except-live-feed-2026-06-27.md` §10).
+///
+/// The HARDCODED master live-fire switch for placing REAL Groww orders. While
+/// `false`, every Groww mutating order path (order create / modify / cancel
+/// and the smart-order family) MUST refuse to send — fail-closed, at
+/// compile-reasoned certainty, independent of any config value. A
+/// `[groww_orders] live_fire_requested = true` in config is INERT unless this
+/// const is ALSO flipped to `true` in source AND the non-default `groww_orders`
+/// cargo feature (Gate 2) is built.
+///
+/// Flipping this to `true` is a SEPARATE, FUTURE, DATED operator action: it
+/// requires editing §39 with a fresh dated live-orders-enable quote FIRST, and
+/// is caught by the lattice ratchet
+/// (`crates/common/tests/groww_order_lattice_guard.rs`), which pins this
+/// literal at `false` until that dated edit lands. It stays `false` here — the
+/// operator's 2026-07-14 authorization ("confirm — apply the Groww order
+/// scope-unlock PR-0. Build only, behind the OFF switch, no live orders") was
+/// to BUILD + INTEGRATE the order-side behind the lattice, explicitly NOT to
+/// fire live orders.
+///
+/// `dry_run` (StrategyConfig) stays `true` and the §28 strategy/indicator
+/// boundary stays frozen — this const does not touch either.
+pub const GROWW_ORDER_LIVE_FIRE: bool = false;
 
 /// HARD wall-clock deadline (secs) for ONE minute's whole contract fire:
 /// contracts not reached before the deadline are SKIPPED loudly (counted +
@@ -2255,45 +2579,38 @@ pub const GROWW_CONTRACT_1M_DEFAULT_STRIKES_EACH_SIDE: u32 = 2;
 pub const GROWW_CONTRACT_1M_ANCHOR_MAX_AGE_MINUTES: u32 = 5;
 
 const _: () = assert!(
-    GROWW_CONTRACT_1M_FALLBACK_DELAY_MS > GROWW_CHAIN_1M_FALLBACK_DELAY_MS,
-    "the contract leg is sequenced AFTER the chain leg — its fallback must trail the chain's"
+    GROWW_CONTRACT_1M_FALLBACK_DELAY_MS
+        > GROWW_CHAIN_1M_FIRE_DELAY_MS
+            + (GROWW_CHAIN_1M_UNDERLYINGS.len() as u64 - 1)
+                * GROWW_REST_BURST_INTRA_WAVE_STAGGER_MS
+            + GROWW_CHAIN_1M_UNDERLYING_BUDGET_SECS * 1_000,
+    "the contract leg is sequenced AFTER the chain leg — its fallback must trail the chain's worst-case fire window"
 );
 const _: () = assert!(
     GROWW_CONTRACT_1M_FALLBACK_DELAY_MS + GROWW_CONTRACT_1M_FIRE_BUDGET_SECS * 1_000 < 60_000,
     "GROWW_CONTRACT_1M fire (fallback + fire budget) must finish inside the minute"
 );
-// Boundary-burst pacing ceiling (§38.3, RE-DERIVED 2026-07-13 for the
-// VIX 4th spot target): the honest spot worst-SECOND is 3 requests
-// (sequential targets, ≤1 in-flight, but a fast-failing target's last
-// ladder rung can share one second with the next target's rung-0 +
-// rung-1 at +0.7 s; the 4th target makes such transitions more
-// frequent, never faster) + chain ≤ 1000/chain-gap req/s + contract ≤
-// 1000/contract-gap req/s, all inside the ≤6 req/s shared-bucket
-// ceiling even in the worst overlap. EXACT rational math via
-// cross-multiplication (round-1 review LOW: integer division rounds
-// 1000/gap DOWN — optimistic):
-//   3 + 1000/kg + 1000/cg ≤ 6  ⇔  1000·kg + 1000·cg ≤ 3·cg·kg
-// (all terms positive). Today: 1000·500 + 1000·1000 = 1.5M ≤
-// 3·1000·500 = 1.5M — the worst-overlap burst is 3 + 1 + 2 = 6.00
-// req/s, exactly AT the self-imposed ceiling (broker hard ceiling 10/s).
-const _: () = assert!(
-    1_000 * GROWW_CONTRACT_1M_MIN_GAP_MS + 1_000 * GROWW_CHAIN_1M_MIN_GAP_MS
-        <= 3 * GROWW_CHAIN_1M_MIN_GAP_MS * GROWW_CONTRACT_1M_MIN_GAP_MS,
-    "spot(3) + chain + contract worst-overlap boundary burst must stay inside the 6 req/s ceiling (exact rational math)"
-);
+// Boundary-burst ceiling — REWRITTEN 2026-07-14 for the auto-ladder
+// shapes (the pre-2026-07-14 "≤6 req/s via sequential targets + min-gap
+// cross-multiplication" block is retired with the min-gap itself; the
+// dated math + honest caveats live with the wave/rung asserts in the
+// "Groww REST burst auto-ladder" section above — seven wave 7 ≤ 10,
+// two_wave wave separation > 1 s ⇒ initial burst ≤ 4/s, vendor-lag rung
+// worst 8 + contract 2 ≤ 10, BruteX ~3/s co-tenancy documented there).
 // Per-minute request math (the §38.3 capacity envelope, re-derived
-// 2026-07-13 for the VIX 4th spot target): worst case 30 contracts +
-// the spot leg's 20 (3 core symbols + the runtime VIX target = 4 × 5
-// ladder rungs) + 3 chain = 53 requests/min ≈ 17.7% of the 300/min
-// shared budget (typical ≈ 37/min: 30 + 4 + 3). Const-asserted at ≤ 60
-// (20% of the budget) so a future cap raise cannot silently eat the
-// bruteX co-tenancy headroom.
+// 2026-07-14 for the auto-ladder): worst case 30 contracts + the spot
+// leg's 20 (3 core symbols + the runtime VIX target = 4 × 5 ladder
+// rungs) + 3 chain + 2 warm-up GETs (one per leg client) = 55
+// requests/min ≈ 18.3% of the 300/min shared budget (typical ≈ 39/min:
+// 30 + 4 + 3 + 2). Const-asserted at ≤ 60 (20% of the budget) so a
+// future cap raise cannot silently eat the bruteX co-tenancy headroom.
 const _: () = assert!(
     GROWW_CONTRACT_1M_MAX_PER_MINUTE
         + (GROWW_SPOT_1M_SYMBOLS.len() + 1) * (GROWW_SPOT_1M_RETRY_OFFSETS_MS.len() + 1)
         + GROWW_CHAIN_1M_UNDERLYINGS.len()
+        + 2
         <= 60,
-    "the three Groww REST legs' worst-case per-minute request total must stay <= 20% of the 300/min budget"
+    "the Groww REST legs' worst-case per-minute request total (incl. the 2 warm-up GETs) must stay <= 20% of the 300/min budget"
 );
 // The DEFAULT ATM window fills the cap exactly — a wider default needs a
 // fresh dated operator quote AND a cap re-derivation.
@@ -2311,28 +2628,12 @@ const _: () = assert!(
 /// For AWS instance lifecycle, use systemd timer or cron for restart.
 pub const APP_DAILY_RESET_TIME_IST: &str = "16:00:00";
 
-/// Wave-2-D (G19) — daily reset time for the `TickGapDetector`. Fires
-/// 5 minutes after market close so it cannot race the 15:30 close
-/// signal. The papaya `last_seen` map is cleared at this point so
-/// overnight silence does NOT register as a tick gap on next day's
-/// market open. Pinned constant; see
-/// `.claude/rules/project/disaster-recovery.md` Scenario 14
-/// (Overnight wake) for the operator-visible flow.
-pub const TICK_GAP_RESET_TIME_IST: &str = "15:35:00";
-
-/// Wave-2-D — short post-fire settle window for the daily tick-gap
-/// reset task. After firing `reset_daily()` at 15:35 IST, sleep this
-/// long before recomputing the next-fire delay so we cannot race the
-/// same boundary back into a near-zero sleep.
-pub const TICK_GAP_RESET_SETTLE_SECS: u64 = 60;
-
-/// Wave-2-D — bounded busy-loop avoidance for the daily tick-gap
-/// reset task. If the post-fire recomputed delay is still zero (e.g.
-/// the host clock is stuck), sleep this long before retrying so we
-/// don't burn CPU. One hour is short enough that the task self-heals
-/// within a single trading session if the clock recovers, and long
-/// enough that we don't spin on a stuck system.
-pub const TICK_GAP_RESET_BUSYLOOP_GUARD_SECS: u64 = 3600;
+// PR-C3 (2026-07-14): the Wave-2-D `TICK_GAP_RESET_*` constants (the
+// 15:35 IST daily-reset time + settle/busy-loop guards) were DELETED with
+// the tick-gap detector and its main.rs reset task (operator Q4-ii
+// 2026-07-13). The RISK-GAP-03 `TICK_GAP_ALERT/ERROR_THRESHOLD_SECS` +
+// `TICK_GAP_MIN_TICKS_BEFORE_ACTIVE` constants above are a DIFFERENT
+// component (`trading::risk::tick_gap_tracker`) and are KEPT.
 
 /// Number of 1-minute candles in the cross-verification window (09:15 to 15:29 = 375).
 ///
@@ -3658,6 +3959,123 @@ pub const fn g2_wall_clock_gate_accepts(wall_clock_ts_nanos_of_day: i64) -> bool
 }
 
 // ---------------------------------------------------------------------------
+// Groww REGULAR-orders constants (shared contracts PR-A0, operator
+// authorization 2026-07-14; live flip is a SEPARATE future dated quote).
+// The order-family REST base is a const (not config — house pattern); the
+// live-fire master switch `GROWW_ORDER_LIVE_FIRE` lives above (Gate 3) and is
+// NOT re-declared here. Self-caps are const-asserted ≤ the documented family
+// ceilings; the closed worst-case read arithmetic is asserted ≤ the reads
+// self-cap (the §10.7 granted number).
+// ---------------------------------------------------------------------------
+
+/// Order-family REST base URL. Bare host only — the `/v1/order/*` PATHS live
+/// ONLY in `oms/groww/api_client.rs` behind the 4-gate lattice (Gate 5).
+pub const GROWW_ORDER_API_BASE_URL: &str = "https://api.groww.in"; // APPROVED: constants.rs is the single static-URL source (same as GROWW_INSTRUMENT_CSV_URL)
+
+/// Self-cap: order MUTATIONS (place/modify/cancel) per second. Const-asserted
+/// ≤ the documented Orders family ceiling of 10/s.
+pub const GROWW_ORDER_MUTATIONS_PER_SECOND_CAP: u32 = 5;
+/// Self-cap: order MUTATIONS per minute. Const-asserted ≤ the 250/min ceiling.
+pub const GROWW_ORDER_MUTATIONS_PER_MINUTE_CAP: u32 = 100;
+/// Self-cap: order READS (status/list/detail/trades) per second. Const-asserted
+/// ≤ the documented Non-Trading family ceiling of 20/s.
+pub const GROWW_ORDER_READS_PER_SECOND_CAP: u32 = 8;
+/// Self-cap: order READS per minute. Const-asserted ≤ the 500/min ceiling; the
+/// closed worst-case (198/min) is asserted ≤ this value.
+pub const GROWW_ORDER_READS_PER_MINUTE_CAP: u32 = 200;
+/// Reads/min reserved for the ambiguity-resolution ladder — 1/s, outranks all
+/// routine polling so a co-tenant burst cannot starve resolution.
+pub const GROWW_ORDER_RESERVED_RESOLUTION_READS_PER_MIN: u32 = 60;
+
+/// Per-order HOT status-poll cadence (secs): the first 30s after a mutation.
+pub const GROWW_ORDER_STATUS_POLL_HOT_SECS: u64 = 2;
+/// Per-order WARM status-poll cadence (secs): until first fill / terminal.
+pub const GROWW_ORDER_STATUS_POLL_WARM_SECS: u64 = 5;
+/// Per-order STEADY status-poll cadence (secs): steady + hot/warm-overflow tier.
+pub const GROWW_ORDER_STATUS_POLL_STEADY_SECS: u64 = 15;
+/// One cheap status confirm this many ms after every mutation response.
+pub const GROWW_ORDER_POST_MUTATION_CONFIRM_DELAY_MS: u64 = 500;
+
+/// Concurrent non-terminal order cap (all tiers).
+pub const GROWW_ORDER_MAX_TRACKED_OPEN_ORDERS: usize = 8;
+/// HOT (2s) tier occupancy cap; overflow starts at STEADY 15s.
+pub const GROWW_ORDER_MAX_HOT_TIER_ORDERS: usize = 3;
+/// WARM (5s) tier occupancy cap; overflow demotes to STEADY 15s (build-lead
+/// approved spec delta 2026-07-15 — closes the warm-saturation read hole).
+pub const GROWW_ORDER_MAX_WARM_TIER_ORDERS: usize = 2;
+
+/// Reconcile list-sweep cadence (secs) while ≥1 non-terminal order is tracked.
+pub const GROWW_ORDER_RECONCILE_INTERVAL_SECS: u64 = 60;
+/// Idle reconcile-sweep cadence (secs) — session-gated.
+pub const GROWW_ORDER_RECONCILE_IDLE_INTERVAL_SECS: u64 = 300;
+
+/// Ambiguity-resolution ladder rungs (secs); after the last rung, 60s-paced to
+/// the [`GROWW_ORDER_AMBIGUITY_LADDER_MAX_SECS`] bound.
+pub const GROWW_ORDER_AMBIGUITY_LADDER_STEPS_SECS: [u64; 5] = [2, 5, 10, 30, 60];
+/// Ambiguity-ladder budget (secs). A 401/403-classified poll PAUSES this clock
+/// (auth-stale time does not consume the budget — GROWW-ORD-10 / F-5).
+pub const GROWW_ORDER_AMBIGUITY_LADDER_MAX_SECS: u64 = 600;
+/// Bounded replay/re-resolve iterations on the SAME reference_id.
+pub const GROWW_ORDER_AMBIGUITY_REPLAY_MAX: u32 = 2;
+
+/// Post-close EOD force-terminalize sweep time (IST, HH:MM:SS) — the bounded
+/// post-close carve-out of `no-rest-except-live-feed-2026-06-27.md` §10.7.
+pub const GROWW_ORDER_EOD_SWEEP_IST: &str = "15:35:00";
+/// Intent write-ahead ledger directory (canonical path; registered in
+/// observability-architecture.md's paths table; retained, no sweeper).
+pub const GROWW_ORDER_LEDGER_DIR: &str = "data/orders";
+/// Dhan-analog self-cap on modifications per order (Groww's own cap is
+/// Unknown — O-8; conservative fail-closed).
+pub const GROWW_ORDER_MAX_MODIFICATIONS_PER_ORDER: u32 = 25;
+
+// --- Const-asserts: self-caps stay ≤ the documented family ceilings ---
+const _: () = assert!(
+    GROWW_ORDER_MUTATIONS_PER_SECOND_CAP <= 10,
+    "order-mutation self-cap must stay <= the 10/s Orders family doc ceiling"
+);
+const _: () = assert!(
+    GROWW_ORDER_MUTATIONS_PER_MINUTE_CAP <= 250,
+    "order-mutation self-cap must stay <= the 250/min Orders family doc ceiling"
+);
+const _: () = assert!(
+    GROWW_ORDER_READS_PER_SECOND_CAP <= 20,
+    "order-read self-cap must stay <= the 20/s Non-Trading family doc ceiling"
+);
+const _: () = assert!(
+    GROWW_ORDER_READS_PER_MINUTE_CAP <= 500,
+    "order-read self-cap must stay <= the 500/min Non-Trading family doc ceiling"
+);
+const _: () = assert!(
+    GROWW_ORDER_MAX_WARM_TIER_ORDERS >= 1,
+    "the WARM status-poll tier must hold at least one order"
+);
+const _: () = assert!(
+    GROWW_ORDER_MAX_HOT_TIER_ORDERS + GROWW_ORDER_MAX_WARM_TIER_ORDERS
+        <= GROWW_ORDER_MAX_TRACKED_OPEN_ORDERS,
+    "hot + warm tier occupancy cannot exceed the tracked-open cap"
+);
+// Closed worst-case reads/min (the §10.7 granted number): 3 hot × 30 +
+// 2 warm × 12 + 3 steady × 4 + 60 resolution + 10 confirms + 2 sweeps = 198.
+const _: () = {
+    let hot_per_min = 60 / (GROWW_ORDER_STATUS_POLL_HOT_SECS as u32);
+    let warm_per_min = 60 / (GROWW_ORDER_STATUS_POLL_WARM_SECS as u32);
+    let steady_per_min = 60 / (GROWW_ORDER_STATUS_POLL_STEADY_SECS as u32);
+    let steady_slots = (GROWW_ORDER_MAX_TRACKED_OPEN_ORDERS
+        - GROWW_ORDER_MAX_HOT_TIER_ORDERS
+        - GROWW_ORDER_MAX_WARM_TIER_ORDERS) as u32;
+    let worst = (GROWW_ORDER_MAX_HOT_TIER_ORDERS as u32) * hot_per_min
+        + (GROWW_ORDER_MAX_WARM_TIER_ORDERS as u32) * warm_per_min
+        + steady_slots * steady_per_min
+        + GROWW_ORDER_RESERVED_RESOLUTION_READS_PER_MIN
+        + 10 // post-mutation confirms/min bound
+        + 2; // reconcile sweeps/min bound
+    assert!(
+        worst <= GROWW_ORDER_READS_PER_MINUTE_CAP,
+        "worst-case order-read load must stay within the reads/min self-cap (§10.7)"
+    );
+};
+
+// ---------------------------------------------------------------------------
 // Tests — Market Hours Constants
 // ---------------------------------------------------------------------------
 
@@ -3774,6 +4192,17 @@ mod boot_constants_tests {
 #[allow(clippy::assertions_on_constants)] // APPROVED: S4 — schema-stability tests intentionally assert on compile-time constants as a regression guard against silent protocol-value drift. Converting to `const { assert!(..) }` blocks compiles away the check message which defeats the guard purpose.
 mod tests {
     use super::*;
+
+    /// GATE 3 (§39.2): the hardcoded Groww live-fire switch MUST be false
+    /// until a dated operator live-orders-enable edits §39 + this const
+    /// together.
+    #[test]
+    fn test_groww_order_live_fire_is_off() {
+        assert!(
+            !GROWW_ORDER_LIVE_FIRE,
+            "GROWW_ORDER_LIVE_FIRE must stay false — see groww-second-feed-scope §39.2 Gate 3"
+        );
+    }
 
     #[test]
     fn test_ist_offset_seconds_is_5h30m() {
@@ -4354,6 +4783,7 @@ mod tests {
             DHAN_MARGIN_CALCULATOR_PATH,
             DHAN_MARGIN_CALCULATOR_MULTI_PATH,
             DHAN_FUND_LIMIT_PATH,
+            DHAN_ALERTS_MULTI_ORDERS_PATH,
         ];
         for path in paths {
             assert!(
@@ -4508,6 +4938,38 @@ mod tests {
         assert_eq!(CHAIN_1M_MAX_BODY_BYTES, 8 * 1024 * 1024);
     }
 
+    /// 2026-07-14 chain-capture hardening: the retry decision ceiling +
+    /// the per-underlying not-served threshold, pinned alongside their
+    /// existing schedule partners (2500ms fallback / 10s request timeout /
+    /// 20s budget) so the P1–P3 const-assert proofs stay meaningful.
+    #[test]
+    fn test_chain_decision_ceiling_constants_pinned() {
+        assert_eq!(CHAIN_1M_DECISION_CEILING_SECS, 15);
+        assert_eq!(CHAIN_1M_UNDERLYING_NOT_SERVED_THRESHOLD, 10);
+        assert_eq!(
+            CHAIN_1M_UNDERLYING_NOT_SERVED_THRESHOLD,
+            SPOT_1M_REST_SID_NOT_SERVED_THRESHOLD
+        );
+        // The schedule partners the ceiling proofs are computed against.
+        assert_eq!(CHAIN_1M_FALLBACK_DELAY_MS, 2_500);
+        assert_eq!(CHAIN_1M_REQUEST_TIMEOUT_SECS, 10);
+        assert_eq!(CHAIN_1M_UNDERLYING_BUDGET_SECS, 20);
+        // P1: a timed-out first attempt leaves the retry launchable.
+        assert!(
+            CHAIN_1M_FALLBACK_DELAY_MS + CHAIN_1M_REQUEST_TIMEOUT_SECS * 1_000
+                <= CHAIN_1M_DECISION_CEILING_SECS * 1_000
+        );
+        // P2: a ceiling-edge retry never overruns the minute.
+        assert!(
+            (CHAIN_1M_DECISION_CEILING_SECS + CHAIN_1M_UNDERLYING_BUDGET_SECS) * 1_000 < 60_000
+        );
+        // P3: the same-key ≥3s gap fits inside the ceiling.
+        assert!(
+            CHAIN_1M_MIN_GAP_SECS * 1_000
+                < CHAIN_1M_DECISION_CEILING_SECS * 1_000 - CHAIN_1M_FALLBACK_DELAY_MS
+        );
+    }
+
     /// Groww spot 1m REST leg (operator grant 2026-07-13, PR-2 of the
     /// Groww per-minute REST plan) — endpoint identity, the 3-symbol table,
     /// the SEQUENTIAL-fetch timing envelope and the token re-read floor.
@@ -4547,12 +5009,18 @@ mod tests {
         assert_eq!(GROWW_SPOT_1M_VIX_SYMBOL, "INDIA VIX");
         assert!(PHASE_0_IDX_I_SYMBOLS.contains(&GROWW_SPOT_1M_VIX_SYMBOL));
         assert!(!GROWW_SPOT_1M_VIX_SYMBOL.contains('-'));
-        // Timing envelope mirrors the Dhan leg, tightened for the
-        // SEQUENTIAL 4-target fire (3 core + the runtime VIX target;
-        // pacing rule: ≤1 in-flight request). Budget re-derived 18 → 14 on
-        // 2026-07-13 so 4 sequential budgets + the fire delay still finish
-        // inside the minute.
+        // Timing envelope — RE-DERIVED 2026-07-14 for the auto-ladder's
+        // CONCURRENT 4-target wave (3 core + the runtime VIX target):
+        // seven_concurrent fires at close+300 ms, the DEFAULT two_wave
+        // spot wave at close+1,350 ms (> 1 rolling second after the chain
+        // wave), timeout tightened 5 s → 3.5 s, budget re-derived 14 → 11
+        // (one ladder, not a sequential sum).
         assert_eq!(GROWW_SPOT_1M_FIRE_DELAY_MS, 300);
+        assert_eq!(GROWW_SPOT_1M_TWO_WAVE_FIRE_DELAY_MS, 1_350);
+        assert!(
+            GROWW_SPOT_1M_TWO_WAVE_FIRE_DELAY_MS > GROWW_CHAIN_1M_FIRE_DELAY_MS + 1_000,
+            "two_wave spot wave must trail the chain wave by more than a rolling second"
+        );
         assert_eq!(GROWW_SPOT_1M_RETRY_OFFSETS_MS, [700, 1_500, 3_000, 6_000]);
         assert!(
             GROWW_SPOT_1M_RETRY_OFFSETS_MS
@@ -4560,18 +5028,17 @@ mod tests {
                 .all(|w| w[0] < w[1]),
             "offsets strictly increasing"
         );
-        assert_eq!(GROWW_SPOT_1M_REQUEST_TIMEOUT_SECS, 5);
-        assert_eq!(GROWW_SPOT_1M_SYMBOL_BUDGET_SECS, 14);
+        assert_eq!(GROWW_SPOT_1M_REQUEST_TIMEOUT_MS, 3_500);
+        assert_eq!(GROWW_SPOT_1M_SYMBOL_BUDGET_SECS, 11);
         assert!(
-            GROWW_SPOT_1M_FIRE_DELAY_MS
-                + (GROWW_SPOT_1M_SYMBOLS.len() as u64 + 1)
-                    * GROWW_SPOT_1M_SYMBOL_BUDGET_SECS
-                    * 1_000
+            GROWW_SPOT_1M_TWO_WAVE_FIRE_DELAY_MS
+                + (GROWW_SPOT_1M_SYMBOLS.len() as u64) * GROWW_REST_BURST_INTRA_WAVE_STAGGER_MS
+                + GROWW_SPOT_1M_SYMBOL_BUDGET_SECS * 1_000
                 < 60_000,
-            "sequential fire (incl. the runtime VIX target) must finish inside the minute"
+            "concurrent fire (worst wave delay + demoted stagger + one ladder budget) must finish inside the minute"
         );
         assert!(
-            GROWW_SPOT_1M_RETRY_OFFSETS_MS[3] + GROWW_SPOT_1M_REQUEST_TIMEOUT_SECS * 1_000
+            GROWW_SPOT_1M_RETRY_OFFSETS_MS[3] + GROWW_SPOT_1M_REQUEST_TIMEOUT_MS
                 < GROWW_SPOT_1M_SYMBOL_BUDGET_SECS * 1_000,
             "ladder schedule must fit one symbol's budget"
         );
@@ -4616,24 +5083,25 @@ mod tests {
         {
             assert_eq!(chain_gs, spot_gs, "chain/spot groww_symbol drift");
         }
-        // Sequencing + pacing envelope (sequential 3-underlying fire).
-        assert_eq!(GROWW_CHAIN_1M_FALLBACK_DELAY_MS, 2_500);
-        assert!(GROWW_CHAIN_1M_FALLBACK_DELAY_MS > GROWW_SPOT_1M_FIRE_DELAY_MS);
-        assert_eq!(GROWW_CHAIN_1M_MIN_GAP_MS, 1_000);
-        assert_eq!(GROWW_CHAIN_1M_REQUEST_TIMEOUT_SECS, 10);
-        assert_eq!(GROWW_CHAIN_1M_UNDERLYING_BUDGET_SECS, 15);
+        // Auto-ladder envelope (2026-07-14): the chain leg fires on its
+        // OWN minute-boundary timer (the 2.5 s spot→chain fallback and
+        // the 1 s min-gap are retired), the 3 underlyings CONCURRENT
+        // within the wave, timeout tightened 10 s → 4.5 s, budget
+        // re-derived 15 → 6.
+        assert_eq!(GROWW_CHAIN_1M_FIRE_DELAY_MS, 300);
+        assert_eq!(GROWW_CHAIN_1M_REQUEST_TIMEOUT_MS, 4_500);
+        assert_eq!(GROWW_CHAIN_1M_UNDERLYING_BUDGET_SECS, 6);
         assert!(
-            GROWW_CHAIN_1M_FALLBACK_DELAY_MS
-                + (GROWW_CHAIN_1M_UNDERLYINGS.len() as u64)
-                    * GROWW_CHAIN_1M_UNDERLYING_BUDGET_SECS
-                    * 1_000
+            GROWW_CHAIN_1M_FIRE_DELAY_MS
+                + (GROWW_CHAIN_1M_UNDERLYINGS.len() as u64 - 1)
+                    * GROWW_REST_BURST_INTRA_WAVE_STAGGER_MS
+                + GROWW_CHAIN_1M_UNDERLYING_BUDGET_SECS * 1_000
                 < 60_000,
-            "sequential chain fire must finish inside the minute"
+            "concurrent chain fire must finish inside the minute"
         );
         assert!(
-            GROWW_CHAIN_1M_MIN_GAP_MS + GROWW_CHAIN_1M_REQUEST_TIMEOUT_SECS * 1_000
-                < GROWW_CHAIN_1M_UNDERLYING_BUDGET_SECS * 1_000,
-            "min-gap + one request timeout must fit the underlying budget"
+            GROWW_CHAIN_1M_REQUEST_TIMEOUT_MS < GROWW_CHAIN_1M_UNDERLYING_BUDGET_SECS * 1_000,
+            "one request timeout must fit the underlying budget"
         );
         assert_eq!(GROWW_CHAIN_1M_MAX_BODY_BYTES, 8 * 1024 * 1024);
         // The chain leg reuses the spot FailureEdge — thresholds agree.
@@ -4643,6 +5111,58 @@ mod tests {
         );
         // Warmup master-download retries: bounded, 3 attempts total.
         assert_eq!(GROWW_CHAIN_1M_MASTER_RETRY_BACKOFF_SECS, [3, 6]);
+        // Per-underlying not-served detector threshold (~10 minutes) —
+        // mirrors the spot leg's per-SID detector (2026-07-14, the NIFTY
+        // expiry-day vendor-cutoff companion).
+        assert_eq!(GROWW_CHAIN_1M_UNDERLYING_NOT_SERVED_THRESHOLD, 10);
+        assert_eq!(
+            GROWW_CHAIN_1M_UNDERLYING_NOT_SERVED_THRESHOLD,
+            SPOT_1M_REST_SID_NOT_SERVED_THRESHOLD
+        );
+    }
+
+    /// Constant pins — the 2026-07-14 Groww REST burst auto-ladder
+    /// (operator "approved and go ahead with the recommendation";
+    /// `no-rest-except-live-feed-2026-06-27.md` §9.7). Values are also
+    /// compile-time-proven by the const asserts; this test pins them so a
+    /// drift is a conscious dated edit.
+    #[test]
+    fn test_groww_rest_burst_auto_ladder_constants_pinned() {
+        assert_eq!(GROWW_REST_BURST_INTRA_WAVE_STAGGER_MS, 350);
+        assert_eq!(GROWW_REST_WARMUP_LEAD_SECS, 4);
+        assert_eq!(GROWW_REST_WARMUP_TIMEOUT_SECS, 3);
+        assert!(GROWW_REST_WARMUP_TIMEOUT_SECS < GROWW_REST_WARMUP_LEAD_SECS);
+        // Probe plan: 4→6→8→11 rps, 2 rounds, 58 requests total, bounded.
+        assert_eq!(GROWW_RATE_PROBE_STEPS_RPS, [4, 6, 8, 11]);
+        assert_eq!(GROWW_RATE_PROBE_ROUNDS, 2);
+        assert_eq!(GROWW_RATE_PROBE_PAUSE_SECS, 10);
+        let per_round: u32 = GROWW_RATE_PROBE_STEPS_RPS.iter().sum();
+        assert_eq!(per_round * GROWW_RATE_PROBE_ROUNDS, 58);
+        // Blackout window (SECURITY-MEDIUM 2026-07-14): [08:30, 16:00)
+        // IST on ANY day — no calendar dependency; covers the whole
+        // capture session incl. the 15:31-15:33 sweep/cross-verify
+        // burst window plus boot/deploy margins.
+        assert_eq!(
+            GROWW_RATE_PROBE_BLACKOUT_START_SECS_OF_DAY_IST,
+            8 * 3600 + 30 * 60
+        );
+        assert_eq!(GROWW_RATE_PROBE_BLACKOUT_END_SECS_OF_DAY_IST, 16 * 3600);
+        // seven_concurrent initial wave: 4 spot + 3 chain = 7 <= 10.
+        assert_eq!(
+            (GROWW_SPOT_1M_SYMBOLS.len() + 1) + GROWW_CHAIN_1M_UNDERLYINGS.len(),
+            7
+        );
+        // HIGH-1 (2026-07-14): per-target rung jitter — 150 ms step, the
+        // Dhan-leg precedent; the jittered rung schedule's worst rolling
+        // second is 6 (was a lockstep 8) and the seven-tier lag addend
+        // inside the wave second is 2 (was 4).
+        assert_eq!(GROWW_REST_RUNG_JITTER_STEP_MS, 150);
+        assert_eq!(
+            GROWW_REST_RUNG_JITTER_STEP_MS,
+            SPOT_1M_REST_LADDER_JITTER_STEP_MS
+        );
+        assert_eq!(groww_spot_rung_worst_rolling_second(), 6);
+        assert_eq!(groww_spot_rungs_in_first_second(), 2);
     }
 
     /// PR-4 (Groww contract leg): the fill-model leg's pacing + envelope
@@ -4652,7 +5172,16 @@ mod tests {
     #[test]
     fn test_groww_contract_1m_constants_pinned() {
         assert_eq!(GROWW_CONTRACT_1M_FALLBACK_DELAY_MS, 8_000);
-        assert!(GROWW_CONTRACT_1M_FALLBACK_DELAY_MS > GROWW_CHAIN_1M_FALLBACK_DELAY_MS);
+        // 2026-07-14 auto-ladder: the contract fallback must trail the
+        // chain leg's worst-case CONCURRENT fire window (wave delay +
+        // demoted stagger + one underlying budget).
+        assert!(
+            GROWW_CONTRACT_1M_FALLBACK_DELAY_MS
+                > GROWW_CHAIN_1M_FIRE_DELAY_MS
+                    + (GROWW_CHAIN_1M_UNDERLYINGS.len() as u64 - 1)
+                        * GROWW_REST_BURST_INTRA_WAVE_STAGGER_MS
+                    + GROWW_CHAIN_1M_UNDERLYING_BUDGET_SECS * 1_000
+        );
         assert_eq!(GROWW_CONTRACT_1M_MIN_GAP_MS, 500);
         assert_eq!(GROWW_CONTRACT_1M_REQUEST_TIMEOUT_SECS, 5);
         assert_eq!(GROWW_CONTRACT_1M_MAX_PER_MINUTE, 30);
@@ -4664,26 +5193,29 @@ mod tests {
             GROWW_CONTRACT_1M_FALLBACK_DELAY_MS + GROWW_CONTRACT_1M_FIRE_BUDGET_SECS * 1_000
                 < 60_000
         );
-        // Worst-overlap boundary burst inside the 6 req/s family ceiling
-        // (re-derived 2026-07-13 for the VIX 4th spot target): spot worst
-        // second = 3 requests (target-transition instant) + chain + contract.
-        // EXACT rational cross-multiplication:
-        //   3 + 1000/kg + 1000/cg <= 6  <=>  1000*kg + 1000*cg <= 3*cg*kg
-        // — today 1000*500 + 1000*1000 = 1.5M = 3*1000*500 exactly:
-        // 3 + 1 + 2 = 6.00 req/s AT the self-imposed ceiling.
+        // Worst-overlap rolling second — REWRITTEN 2026-07-14 for the
+        // auto-ladder, RECOMPUTED same day with the HIGH-1 rung jitter:
+        // the jittered spot rung schedule's worst window holds 6 (was a
+        // lockstep 8) + the contract leg's 1000/500 = 2 req/s = 8, two
+        // under the documented 10/s ceiling SOLO (a live 429 still
+        // auto-demotes: staggered <= 4/s rungs, sequential no overlap).
+        // LOW-2 honest note (2026-07-14): the contract leg starts ~2-6 s
+        // earlier than pre-Stage-1 (chain completes faster), so its 2/s
+        // stream stacks INSIDE the spot rung windows — counted in this
+        // assert; zero co-tenant margin beyond it, accepted by design.
         assert!(
-            1_000 * GROWW_CONTRACT_1M_MIN_GAP_MS + 1_000 * GROWW_CHAIN_1M_MIN_GAP_MS
-                <= 3 * GROWW_CHAIN_1M_MIN_GAP_MS * GROWW_CONTRACT_1M_MIN_GAP_MS
+            groww_spot_rung_worst_rolling_second() + 1_000 / GROWW_CONTRACT_1M_MIN_GAP_MS <= 10
         );
-        // Per-minute request math (the capacity envelope): 30 contracts +
-        // the spot leg's worst 20 (3 core + the runtime VIX target = 4
-        // targets x 5 ladder rungs) + 3 chain = 53/min ~ 17.7% of the
-        // 300/min shared budget (typical ~37/min).
+        // Per-minute request math (the capacity envelope, 2026-07-14): 30
+        // contracts + the spot leg's worst 20 (3 core + the runtime VIX
+        // target = 4 targets x 5 ladder rungs) + 3 chain + 2 warm-up GETs
+        // = 55/min ~ 18.3% of the 300/min shared budget (typical ~39/min).
         assert_eq!(
             GROWW_CONTRACT_1M_MAX_PER_MINUTE
                 + (GROWW_SPOT_1M_SYMBOLS.len() + 1) * (GROWW_SPOT_1M_RETRY_OFFSETS_MS.len() + 1)
-                + GROWW_CHAIN_1M_UNDERLYINGS.len(),
-            53
+                + GROWW_CHAIN_1M_UNDERLYINGS.len()
+                + 2,
+            55
         );
         // The default ATM window fills the cap exactly (5 strikes x 2 legs
         // x 3 underlyings = 30) — a wider default needs a dated quote.
@@ -4936,21 +5468,7 @@ mod tests {
     #[test]
     fn test_groww_native_constants_pinned() {
         assert_eq!(GROWW_SOCKET_URL, "wss://socket-api.groww.in");
-        assert_eq!(
-            GROWW_SOCKET_TOKEN_URL,
-            "https://api.groww.in/v1/api/apex/v1/socket/token/create/"
-        );
-        assert!(GROWW_SOCKET_TOKEN_URL.starts_with("https://"));
         assert_eq!(GROWW_DATA_DIR, "data/groww");
-        assert_eq!(
-            GROWW_NATIVE_SHADOW_NDJSON_PATH,
-            "data/groww/rust-live-ticks.ndjson"
-        );
-        assert!(GROWW_NATIVE_SHADOW_NDJSON_PATH.starts_with(GROWW_DATA_DIR));
-        assert_ne!(
-            GROWW_NATIVE_SHADOW_NDJSON_PATH, "data/groww/live-ticks.ndjson",
-            "shadow capture must never collide with the sidecar's file"
-        );
         assert_eq!(GROWW_NATIVE_RECONNECT_BASE_SECS, 5);
         assert_eq!(GROWW_NATIVE_RECONNECT_MAX_SECS, 60);
         assert!(GROWW_NATIVE_RECONNECT_BASE_SECS <= GROWW_NATIVE_RECONNECT_MAX_SECS);

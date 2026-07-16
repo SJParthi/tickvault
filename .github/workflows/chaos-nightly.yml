@@ -78,9 +78,10 @@ jobs:
       TV_SLOW_CHAOS: ${{ github.event.inputs.include_slow == 'true' && '1' || '' }}
       # ubuntu-latest is amd64; the compose file's tv-questdb defaults to
       # `platform: linux/arm64` (prod Graviton parity), which exec-format-
-      # fails on amd64 runners — the exact failure .github/workflows/
-      # groww-e2e.yml:12-16 documents (it works around it with a bare
-      # `docker run`). questdb/questdb:9.3.5 is a multi-arch manifest list
+      # fails on amd64 runners — the exact failure the RETIRED groww-e2e.yml
+      # lane documented (deleted 2026-07-15 with the Groww live feed; it
+      # worked around it with a bare `docker run`). questdb/questdb:9.3.5
+      # is a multi-arch manifest list
       # (amd64 + arm64 verified 2026-07-11), so overriding the platform is
       # a clean native pull, not an emulation hack.
       TV_QDB_PLATFORM: linux/amd64
@@ -122,8 +123,9 @@ jobs:
             # BOOT-01/BOOT-02). QuestDB 9.x serves NO /status on the :9000
             # main HTTP server — that path 404s forever even when the DB is
             # healthy (/status lives on the min health server on :9003, which
-            # the compose file does not publish). Proven live in groww-e2e
-            # run 28649380025; this lane hit it in run 29164176526 (#1483).
+            # the compose file does not publish). Proven live in the retired
+            # groww-e2e lane's run 28649380025 (lane deleted 2026-07-15);
+            # this lane hit it in run 29164176526 (#1483).
             for i in {1..30}; do
               if curl -fsS "http://127.0.0.1:9000/exec?query=SELECT%201" >/dev/null 2>&1; then
                 echo "QuestDB ready on attempt $i"

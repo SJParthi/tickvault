@@ -36,74 +36,13 @@
 # =============================================================================
 
 # ---------------------------------------------------------------------------
-# S1. Composite real-time guarantee score degraded (Medium) — sustained < 0.95
-#
-# Closes the exact 0.80-0.95 dead band of the 2026-07-06 incident: the in-app
-# SLO-02 emission is Telegram-suppressed (log-only) since 2026-05-11, and the
-# sibling < 0.80 alarm (app-alarms.tf #11, UNTOUCHED) is mathematically
-# unreachable for feed degradation — tick_freshness alone bottoms out at
-# 1 - 67/776 ≈ 0.914.
-#
-# Threshold 0.95 == SLO_WARN_THRESHOLD (crates/core/src/instrument/
-# slo_score.rs); score == 0.95 is Healthy and correctly non-breaching under
-# LessThanThreshold. statistic=Minimum: the publisher runs every 10s but the
-# CW agent scrapes once per 60s -> 1 datapoint/period today (Min == Max);
-# Minimum is future-proof and mirrors the sibling < 0.80 alarm.
-#
-# M-of-N 9-of-15 (round-2 correction 2026-07-07 — the first cut shipped
-# 12-of-15 justified by "the incident's tick_freshness 0.914-0.963 satisfies
-# it"; that claim was WRONG): with universe 776, tick_freshness breaches
-# < 0.95 only at >= 39 silent instruments (1 - 38/776 ≈ 0.9510 samples
-# Healthy), while the incident band was 29-67 silent EVERY minute — the band
-# STRADDLES the threshold, and the CW agent point-samples the oscillating
-# 10s-cadence gauge ONCE per 60s period (125 crossings that day). Any
-# 15-min window with > 3 minutes sampled in the 29-38-silent sub-band could
-# never accumulate 12 breaching datapoints — 12/15 could reproduce the
-# exact zero-page miss on the marginal band (Rule-11 false-OK). 9/15 (60%)
-# latches whenever >= 60% of sampled minutes breach, while a 2-3 min
-# single-reconnect dip (<= 3 breaching points) still cannot reach 9. A
-# strict 15/15 remains rejected (would likely never latch on an oscillating
-# signal). Honest coverage split (round-3 correction 2026-07-08, review
-# finding 4): the 26-38-silent sub-band is NOT count-detectable — it
-# overlaps the documented ~33 always-silent healthy floor (main.rs D2 note,
-# 2026-07-03), which is also why the tick-gap alarm was re-raised from 25
-# to 40 PROVISIONAL; the lag-p99 alarm owns that marginal band — this
-# alarm's UNIQUE coverage is >= 39-silent freshness degradation plus every
-# OTHER-dimension partial degradation (WS pool fraction, QuestDB, token,
-# spill, Phase 2) inside the 0.80-0.95 dead band.
-# M=9 is threshold-adjacent and PROVISIONAL: observe one trading week and
-# ratchet with a dated note if healthy-day windows approach 9 breaching
-# minutes.
-#
-# Metric is ALREADY CW-exported (cloudwatch-agent.json emf allowlist + the
-# log-metric-filter fallback in metrics-log-metric-filters.tf): ZERO Rust,
-# ZERO allowlist change for this alarm. The publisher runs 24/7 with
-# off-hours dimension dips, hence the market-hours action gate.
-# ok_actions gives the falling-edge recovery note (Rule 4).
-#
-# Medium-tier VISUAL rendering is a flagged follow-up: the telegram-webhook
-# Lambda handler.py stamps the same emoji on any ALARM today.
+# RETIRED (PR-C2, 2026-07-13): `realtime_guarantee_degraded`
+# (tv_realtime_guarantee_score 0.80-0.95 dead-band) — the SLO
+# evaluator/publisher was deleted per the operator PARK ruling
+# (wave-3-d-error-codes.md banner), so the score is never published again.
+# Removed with its window-gate entry. The 2026-07-06 silent-feed dead-band
+# coverage lives on in the per-feed lag + catch-up-storm alarms below.
 # ---------------------------------------------------------------------------
-resource "aws_cloudwatch_metric_alarm" "realtime_guarantee_degraded" {
-  alarm_name          = "tv-${var.environment}-realtime-guarantee-degraded"
-  alarm_description   = "Composite real-time guarantee score degraded (Medium) — < 0.95 for >= 9 of the last 15 in-market minutes (M=9 PROVISIONAL, 2026-07-07: freshness-only breach needs >= 39 of 776 silent, so the incident's 29-38-silent minutes sample Healthy — a stricter latch could miss the marginal band; observe one trading week + ratchet with a dated note). At least one dimension (WS, QuestDB, tick freshness, token, spill, Phase 2) is persistently degraded but above the 0.80 sibling alarm's floor (the exact dead band of the 2026-07-06 all-day silent-feed incident). Actions gated to 09:20-15:35 IST Mon-Fri by the market-hours gate Lambda. See SLO-02 runbook."
-  comparison_operator = "LessThanThreshold"
-  evaluation_periods  = 15
-  datapoints_to_alarm = 9
-  metric_name         = "tv_realtime_guarantee_score"
-  namespace           = local.app_namespace
-  period              = 60
-  statistic           = "Minimum"
-  threshold           = 0.95
-  treat_missing_data  = "notBreaching"
-  dimensions          = local.app_dimensions
-  # Actions OFF by default; the market-hours gate Lambda flips them ON
-  # 09:20-15:35 IST Mon-Fri (market-hours-liveness-alarm.tf).
-  actions_enabled = false
-  alarm_actions   = local.app_alarm_actions
-  ok_actions      = local.app_alarm_ok
-}
-
 # ---------------------------------------------------------------------------
 # S2. BOUNDARY-01 catch-up seal STORM on the Dhan feed
 #
@@ -134,6 +73,16 @@ resource "aws_cloudwatch_metric_alarm" "realtime_guarantee_degraded" {
 # MANDATED FOLLOW-UP: observe the exported per-feed Sum(5m) distribution for
 # one trading week and ratchet the threshold with a dated note if the healthy
 # floor approaches 2000.
+#
+# DORMANT SINCE PR-C2 (2026-07-14, Dhan live-WS lane deletion): the feed=dhan
+# `tv_boundary_catchup_total` series lost ALL writers with the lane — the
+# Dhan Engine-B aggregator instance has zero tick publishers, so its catch-up
+# driver can never seal (and the whole universe chain deletes in C3). The
+# alarm is dormant-SAFE (treat_missing_data=notBreaching + actions off by
+# default under the window gate), never a false page. Its removal-vs-retain
+# decision lands in PR-C3 alongside the detector/aggregator-chain deletion —
+# NOT silently dropped here (merge-gate discipline: writer-less alarms get a
+# dated note or a same-PR retirement; C3 owns this one's fate).
 # ---------------------------------------------------------------------------
 resource "aws_cloudwatch_metric_alarm" "boundary_catchup_storm_dhan" {
   alarm_name          = "tv-${var.environment}-boundary-catchup-storm-dhan"
@@ -190,6 +139,15 @@ resource "aws_cloudwatch_metric_alarm" "boundary_catchup_storm_dhan" {
 # transient decays out of the window within ~60s and cannot hold 10
 # consecutive breaching minutes. The incident's all-day p99 46s pages at
 # minute 10.
+#
+# DORMANT SINCE PR-C2 (2026-07-14, Dhan live-WS lane deletion): the Dhan half
+# of the feed-lag monitor (`run_dhan_lag_publisher` / `record_dhan_tick`)
+# lost its spawn site + tick source with the lane, so
+# `tv_dhan_exchange_lag_p99_seconds` is never published again. The alarm is
+# dormant-SAFE (treat_missing_data=notBreaching + actions off by default
+# under the window gate), never a false page. Its removal-vs-retain decision
+# lands in PR-C3 with the rest of the Dhan-lag detector surface — NOT
+# silently dropped here (dated-note-or-same-PR-retirement discipline).
 # ---------------------------------------------------------------------------
 resource "aws_cloudwatch_metric_alarm" "dhan_exchange_lag_p99_high" {
   alarm_name          = "tv-${var.environment}-dhan-exchange-lag-p99-high"
@@ -212,61 +170,23 @@ resource "aws_cloudwatch_metric_alarm" "dhan_exchange_lag_p99_high" {
 }
 
 # ---------------------------------------------------------------------------
-# S4. Groww exchange->capture lag p99 high (scoreboard PR-C, 2026-07-11)
-#
-# The Groww mirror of S3: tv_groww_exchange_lag_p99_seconds is published by
-# the supervised Groww lag publisher (feed_lag_monitor.rs, spawned once from
-# the main.rs process-global boot prefix — every boot mode): trailing 60s
-# window over the sidecar drain's capture-at-receipt samples, recomputed
-# every 10s, in-session only, >= 50 samples or nothing published (Rule 11 —
-# a Groww-disabled/quiet session publishes NOTHING; feed-dead is owned by
-# tv_groww_ws_active + the feed-stall pagers via notBreaching). Unlabeled,
-# groww-only NAME — the same EMF label-folding trap sidestep as S3.
-#
-# SEMANTICS HONESTY (threshold judgment): Groww's exchange stamp is
-# MILLISECOND-precision (healthy p99 reads ~0.1-0.5s — no 1s floor) and its
-# receipt clock is the sidecar's NATS-callback capture_ns — one hop
-# DOWNSTREAM of the socket, so the value includes sidecar dwell. Old-line /
-# re-tail replays are excluded at record time (no-capture + >=60s-stale
-# discriminators), so a re-tail wave cannot fake a lag storm. Threshold 5s
-# sits ~10-50x above the healthy sub-second band (mirroring S3's 10x-over-
-# floor discipline at Groww's finer resolution) while still catching the
-# 2026-07-06 incident class (tens of seconds) at half the Dhan threshold.
-# Strict 10-of-10 is safe for the same reason as S3 (the metric is itself a
-# trailing-60s p99 — a one-burst transient decays out within ~60s).
-#
-# COST (dated 2026-07-11, scoreboard PR-C): +1 CloudWatch custom-metric
-# series (tv_groww_exchange_lag_p99_seconds, ~$0.30/mo — the 27th EMF
-# allowlist name) + 1 alarm (~$0.10/mo) ≈ $0.40/mo — inside the $35/mo
-# pre-GST budget alarm ceiling. aws-budget.md carries the matching dated
-# note. The Groww exclusion/clamp counters stay /metrics-only (₹0).
+# S4 RETIRED (2026-07-15 — Groww live-feed retirement): the
+# groww_exchange_lag_p99_high alarm watched tv_groww_exchange_lag_p99_seconds,
+# whose ONLY sample producer (record_groww_tick in the deleted Groww bridge)
+# died with the Groww live feed — the gauge is never published again, so the
+# alarm was a permanently-missing-data dead monitor. Removed with its
+# window-gate ALARM_NAMES row, EMF allowlist entry and dashboard widgets; the
+# market-hours liveness alarm was re-pointed to tv_rest_1m_fire_heartbeat in
+# the same PR (market-hours-liveness-alarm.tf). Dated cost note in
+# aws-budget.md (COST NOTE 2026-07-15).
 # ---------------------------------------------------------------------------
-resource "aws_cloudwatch_metric_alarm" "groww_exchange_lag_p99_high" {
-  alarm_name          = "tv-${var.environment}-groww-exchange-lag-p99-high"
-  alarm_description   = "Groww exchange->capture lag p99 > 5s for 10 consecutive in-market minutes (scoreboard PR-C, 2026-07-11 — the Groww mirror of the 2026-07-06 Dhan lag signal). Trailing-60s p99 over the sidecar's capture-at-receipt samples; no-capture (old-format/reconcile) lines + >=60s-stale re-tail replays excluded at record time; >= 50 samples required. NOTE: Groww's price clock is millisecond-precise (healthy p99 reads sub-second — no 1s floor), and its receipt clock is the sidecar capture instant one hop downstream of the socket (includes sidecar dwell). Actions gated to 09:20-15:35 IST Mon-Fri. See the dual-feed-scoreboard runbook + feed_lag_monitor module docs."
-  comparison_operator = "GreaterThanThreshold"
-  evaluation_periods  = 10
-  datapoints_to_alarm = 10
-  metric_name         = "tv_groww_exchange_lag_p99_seconds"
-  namespace           = local.app_namespace
-  period              = 60
-  statistic           = "Maximum"
-  threshold           = 5
-  treat_missing_data  = "notBreaching"
-  dimensions          = local.app_dimensions
-  # Actions OFF by default; the market-hours gate Lambda flips them ON
-  # 09:20-15:35 IST Mon-Fri (market-hours-liveness-alarm.tf).
-  actions_enabled = false
-  alarm_actions   = local.app_alarm_actions
-  ok_actions      = local.app_alarm_ok
-}
+
 
 output "silent_feed_cloudwatch_alarms" {
-  description = "4 silent-feed degradation alarms (2026-07-06 incident hardening + scoreboard PR-C): SLO 0.80-0.95 dead-band (9-of-15 min, PROVISIONAL), per-feed BOUNDARY-01 catch-up storm (dhan, PROVISIONAL 2000/5m x2), Dhan exchange->receive lag p99 > 10s x10min, Groww exchange->capture lag p99 > 5s x10min. All market-hours-gated via the window-gate Lambda; the retuned tick-gap alarm (threshold 100 -> 40 PROVISIONAL, 10-of-12) stays in app-alarms.tf."
+  description = "2 silent-feed degradation alarms (2026-07-06 incident hardening; the SLO 0.80-0.95 dead-band alarm retired PR-C2 2026-07-13 with the PARKed SLO publisher; the Groww lag mirror retired 2026-07-15 with the Groww live feed): per-feed BOUNDARY-01 catch-up storm (dhan, PROVISIONAL 2000/5m x2), Dhan exchange->receive lag p99 > 10s x10min. All market-hours-gated via the window-gate Lambda; the retuned tick-gap alarm history stays in app-alarms.tf."
   value = [
-    aws_cloudwatch_metric_alarm.realtime_guarantee_degraded.alarm_name,
     aws_cloudwatch_metric_alarm.boundary_catchup_storm_dhan.alarm_name,
     aws_cloudwatch_metric_alarm.dhan_exchange_lag_p99_high.alarm_name,
-    aws_cloudwatch_metric_alarm.groww_exchange_lag_p99_high.alarm_name,
+    # groww_exchange_lag_p99_high retired 2026-07-15 (Groww live feed).
   ]
 }

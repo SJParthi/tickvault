@@ -373,65 +373,6 @@ fn test_misc_event_messages() {
 }
 
 #[test]
-fn test_feed_down_and_recovered_message_coverage() {
-    // 2026-07-06 Groww feed-down alerting: exercise to_message + severity +
-    // dispatch_policy for both new variants (in-market + off-hours forms).
-    let m = render(&NotificationEvent::FeedDown {
-        feed: "Groww".to_string(),
-        reason: "RSN-FEEDDOWN-901".to_string(),
-        market_open: true,
-        operator_initiated: false,
-    });
-    assert!(
-        m.contains("RSN-FEEDDOWN-901") && m.contains("will not flow"),
-        "{m}"
-    );
-
-    let m = render(&NotificationEvent::FeedDown {
-        feed: "Groww".to_string(),
-        reason: "RSN-FEEDDOWN-902".to_string(),
-        market_open: false,
-        operator_initiated: false,
-    });
-    assert!(
-        m.contains("RSN-FEEDDOWN-902") && m.contains("idle is normal"),
-        "{m}"
-    );
-
-    // Operator-initiated forms (2026-07-06 fix): the body names the
-    // re-enable action instead of a false auto-retry claim.
-    let m = render(&NotificationEvent::FeedDown {
-        feed: "Groww".to_string(),
-        reason: "RSN-FEEDDOWN-903".to_string(),
-        market_open: true,
-        operator_initiated: true,
-    });
-    assert!(
-        m.contains("RSN-FEEDDOWN-903") && m.contains("re-enable it from the feeds page"),
-        "{m}"
-    );
-
-    let m = render(&NotificationEvent::FeedDown {
-        feed: "Groww".to_string(),
-        reason: "RSN-FEEDDOWN-904".to_string(),
-        market_open: false,
-        operator_initiated: true,
-    });
-    assert!(
-        m.contains("RSN-FEEDDOWN-904")
-            && m.contains("idle is normal")
-            && m.contains("re-enable it from the feeds page"),
-        "{m}"
-    );
-
-    let m = render(&NotificationEvent::FeedRecovered {
-        feed: "Groww".to_string(),
-        down_secs: 4253,
-    });
-    assert!(m.contains("4253") && m.contains("streaming again"), "{m}");
-}
-
-#[test]
 fn test_tf_consistency_summary_message_variants() {
     use tickvault_core::notification::events::Severity;
 
@@ -455,14 +396,22 @@ fn test_tf_consistency_summary_message_variants() {
         top_detail: vec![],
     };
     let m = render(&clean);
+    // 2026-07-15 cleanliness overhaul: a green daily check is ONE line —
+    // verdict-first, comma-formatted count, H1 tail carve-out inline.
     assert!(
-        m.contains("PASS") && m.contains("2026-07-13") && m.contains("2026-07-10"),
-        "{m}"
+        m.starts_with('\u{2705}'),
+        "pass leads with the OK emoji: {m}"
     );
-    assert!(m.contains("88311") || m.contains("88,311"), "{m}");
+    // G3 (fix round 2): the one-liner carries the compact verified date
+    // (the run's Dhan-side target day) so a forced past-day backfill's
+    // PASS card is distinguishable from today's daily check.
+    assert!(m.contains("Timeframe check 3:40 PM \u{b7} 13 Jul"), "{m}");
+    assert!(m.contains("88,311 candles"), "{m}");
+    assert!(m.contains("all match"), "{m}");
+    assert_eq!(m.lines().count(), 1, "pass body is exactly one line: {m}");
     assert!(
-        m.contains("19 Groww end-of-day buckets are not sealed by design"),
-        "H1 tail carve-out must be named on the pass wording: {m}"
+        m.contains("(19 end-of-day candles unverified)"),
+        "H1 tail carve-out must ride the pass one-liner: {m}"
     );
     assert_eq!(clean.severity(), Severity::Info);
     assert_eq!(clean.topic(), "TfConsistencySummary");
@@ -486,9 +435,10 @@ fn test_tf_consistency_summary_message_variants() {
     };
     let m = render(&clean_no_tail);
     assert!(
-        !m.contains("not sealed by design"),
+        !m.contains("unverified"),
         "no tail note when tail_unsealed == 0: {m}"
     );
+    assert_eq!(m.lines().count(), 1, "pass body is exactly one line: {m}");
 
     // Feed-off no_data day → Info, "nothing to check" wording, never PASS.
     let no_data = NotificationEvent::TfConsistencySummary {

@@ -9,7 +9,14 @@
 
 ---
 
-> **⚠ RETIREMENT AUTHORIZED 2026-07-13 (deletion lands with the Phase C PRs):** the
+> **⚠ RETIREMENT AUTHORIZED 2026-07-13 — deletion LANDED in PR-C3 (2026-07-14);
+> the `CrossVerify1m01MismatchFound` / `CrossVerify1m02FetchDegraded` variants
+> DELETED in the C4 sweep (2026-07-15):**
+> `cross_verify_1m_boot.rs` is DELETED (the parser-relocation obligation below was
+> satisfied by C1's `dhan_intraday_parse.rs` move — Verified: `spot_1m_rest_boot` +
+> `groww_spot_1m_boot` import from the relocated module); the two paging entries the
+> same-day automation-gaps PR added were retired with it (§2b banner). Original
+> authorization text follows:** the
 > 15:31 IST Dhan live-vs-historical 1m cross-verify — and with it `CROSS-VERIFY-1M-01`
 > (`CrossVerify1m01MismatchFound`) and `CROSS-VERIFY-1M-02`
 > (`CrossVerify1m02FetchDegraded`) — retires with the Dhan live WS: with no Dhan live
@@ -116,7 +123,15 @@ its requests clear this run's burst window (see
 
 ---
 
-## §2b. 2026-07-14 Update — CROSS-VERIFY-1M-01/-02 now PAGE (delivery boundary closed)
+## §2b. 2026-07-14 Update — CROSS-VERIFY-1M-01/-02 briefly PAGED (superseded HOURS later by the PR-C3 deletion)
+
+> **⚠ SUPERSEDED 2026-07-14 (PR-C3 — the header banner's authorized deletion
+> LANDED):** `cross_verify_1m_boot.rs` was deleted with the Dhan instrument
+> chain, and the two `error_code_alerts` entries this section describes were
+> RETIRED in the same PR (dated notes in `error-code-alarms.tf` +
+> `observability-architecture.md` "Retired paging entries") — a filter with
+> no possible emit site is a dead filter per the drift guard. Content below
+> retained as the historical record of the few-hour paging window.
 
 The 2026-07-10 automation audit found both codes emitted `error!` but were
 **log-sink-only** — neither had an `error_code_alerts` entry, so a 15:31

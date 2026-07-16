@@ -8,11 +8,15 @@
 > `named_views_ensure` degrade row),
 > `.claude/rules/project/security-id-uniqueness.md` (I-P1-11),
 > `.claude/rules/project/data-integrity.md` (feed-in-key).
-> **Code:** `crates/storage/src/console_views.rs::ensure_named_views`,
-> wired in BOTH Dhan boot paths of `crates/app/src/main.rs` (after the
-> base-table ensure join) AND in the Groww activation
-> (`crates/app/src/groww_activation.rs::activate_groww_lane`) so
-> Groww-only boots (`feeds.dhan_enabled = false`) create them too.
+> **Code:** `crates/storage/src/console_views.rs::ensure_named_views`.
+> **2026-07-15 (Groww live-feed retirement):** BOTH former wiring sites —
+> the Dhan boot paths (retired with the Dhan lane) and the Groww
+> activation (`activate_groww_lane`, deleted with the Groww live feed) —
+> are GONE, so the views are no longer auto-created at boot. The module
+> is RETAINED DORMANT (the underlying `ticks`/`candles_1m` tables are
+> themselves dormant on the REST-only runtime); re-ensure manually via
+> the QuestDB console if needed, or re-wire in the committed C-phase
+> candle-machinery follow-up.
 
 ## TL;DR
 

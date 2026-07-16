@@ -35,7 +35,9 @@ use tickvault_common::trading_calendar::{TradingCalendar, ist_offset};
 use tickvault_storage::ws_frame_spill::{AppendOutcome, WsFrameSpill, WsType};
 
 use crate::auth::TokenHandle;
-use crate::parser::order_update::{build_order_update_login, parse_order_update};
+use crate::parser::order_update::{
+    OrderUpdateParseError, build_order_update_login, parse_order_update,
+};
 
 /// PR-E: poll cadence (secs) while the Dhan feed is disabled at runtime — the
 /// order-update WS idles, re-checking the enable flag at this interval.
@@ -427,13 +429,26 @@ fn emit_order_update_ws_audit(
     // the dropped row, whose pre-redaction reason must never reach a log
     // (security review).
     if let Err(err) = tx.try_send(row) {
-        let drop_reason = super::connection::ws_audit_drop_reason(&err);
+        let drop_reason = ws_audit_drop_reason(&err);
         error!(
             code = tickvault_common::error_code::ErrorCode::AuditWs01EventWriteFailed.code_str(),
             reason = drop_reason,
             "order-update ws_event_audit channel full/closed — row dropped (log+Telegram still fired)"
         );
         metrics::counter!("tv_ws_event_audit_dropped_total", "reason" => drop_reason).increment(1);
+    }
+}
+
+/// Maps a ws_event_audit channel `TrySendError` to its static drop-reason
+/// label. Pure, no allocation. Relocated from the deleted main-feed
+/// `connection.rs` in PR-C2 (2026-07-13) — the order-update WS (and the
+/// Groww bridge's own copy) are the surviving AUDIT-WS-01 drop sites.
+pub(crate) fn ws_audit_drop_reason(
+    err: &tokio::sync::mpsc::error::TrySendError<tickvault_common::ws_event_types::WsEventAuditRow>,
+) -> &'static str {
+    match err {
+        tokio::sync::mpsc::error::TrySendError::Full(_) => "full",
+        tokio::sync::mpsc::error::TrySendError::Closed(_) => "closed",
     }
 }
 
@@ -865,6 +880,23 @@ async fn connect_and_listen(
                             );
                         }
                     }
+                    Err(OrderUpdateParseError::FrameTooLarge { len }) => {
+                        // Refuter-A M1 (2026-07-14): an oversized frame must
+                        // NEVER be re-parsed by classify_auth_response — a
+                        // hostile/garbage frame past the size cap could
+                        // classify AuthFailed and break the connection loop.
+                        // Bounded fields only (frame length, never content).
+                        metrics::counter!(
+                            "tv_order_update_frames_dropped_total",
+                            "reason" => "too_large"
+                        )
+                        .increment(1);
+                        warn!(
+                            frame_len = len,
+                            "order update frame dropped — exceeds the frame-size cap; \
+                             skipped without auth classification"
+                        );
+                    }
                     Err(err) => {
                         // Not a valid order update — check if it's an auth error.
                         match classify_auth_response(&text) {
@@ -889,7 +921,9 @@ async fn connect_and_listen(
                                 );
                                 debug!(
                                     ?err,
-                                    text_preview = &text[..text.len().min(200)],
+                                    // Char-boundary-safe truncation (the raw
+                                    // byte slice could panic mid-codepoint).
+                                    text_preview = truncate_for_log(&text, 200),
                                     "non-order JSON message"
                                 );
                             }
@@ -2338,6 +2372,52 @@ mod tests {
             ORDER_UPDATE_RECONNECT_STABILITY_SECS < WATCHDOG_THRESHOLD_ORDER_UPDATE_SECS,
             "the stability window must complete well before the activity \
              watchdog could kill a healthy idle socket"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Refuter-A M1 (2026-07-14) — oversized frames never reach auth classify
+    // -----------------------------------------------------------------------
+
+    /// `FrameTooLarge` is a distinct, matchable variant — the read-loop's
+    /// early arm depends on matching it BEFORE the generic parse-error arm.
+    #[test]
+    fn test_frame_too_large_error_variant_is_matchable() {
+        let oversized = "x".repeat(crate::parser::order_update::ORDER_UPDATE_MAX_FRAME_BYTES + 1);
+        match parse_order_update(&oversized) {
+            Err(OrderUpdateParseError::FrameTooLarge { len }) => {
+                assert_eq!(len, oversized.len());
+            }
+            other => panic!("expected FrameTooLarge, got {other:?}"),
+        }
+    }
+
+    /// Source-order ratchet: inside the read-loop frame arm, the
+    /// `FrameTooLarge` early match must precede the
+    /// `classify_auth_response(&text)` call — an oversized/hostile frame
+    /// must never be re-parsed into a false `AuthFailed` that breaks the
+    /// connection loop.
+    #[test]
+    fn test_frame_too_large_arm_precedes_auth_classification() {
+        let src = include_str!("order_update_connection.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("test marker present")];
+        let arm_region = &prod[prod
+            .find("match parse_order_update(&text)")
+            .expect("frame parse match must exist in the read loop")..];
+        let too_large = arm_region
+            .find("OrderUpdateParseError::FrameTooLarge")
+            .expect("FrameTooLarge arm must exist in the frame match");
+        let classify = arm_region
+            .find("classify_auth_response(&text)")
+            .expect("auth classification call must exist");
+        assert!(
+            too_large < classify,
+            "the FrameTooLarge arm must be matched BEFORE \
+             classify_auth_response — never auth-classify an oversized frame"
+        );
+        assert!(
+            arm_region[too_large..classify].contains("tv_order_update_frames_dropped_total"),
+            "the FrameTooLarge arm must count the dropped frame"
         );
     }
 }

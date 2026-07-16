@@ -24,6 +24,14 @@ const SECONDS_PER_MINUTE: i64 = 60;
 /// Nanoseconds per second (local const — mirrors the previous home's literal).
 const NANOS_PER_SEC: i64 = 1_000_000_000;
 
+/// Plausible epoch-seconds window for the float-timestamp fallback sanity
+/// check (2026-07-15 wire drift — see [`timestamp_epoch_secs`]): 1e9 =
+/// 2001-09-09, 4e9 = 2096-10-02. A float outside this window (incl. NaN /
+/// ±inf / negative / zero) is garbage, never a Dhan candle timestamp.
+const EPOCH_SECS_FLOAT_MIN: f64 = 1.0e9;
+/// Upper bound of the float-timestamp sanity window (see above).
+const EPOCH_SECS_FLOAT_MAX: f64 = 4.0e9;
+
 /// One 1-minute candle, keyed by its IST-minute bucket. `volume` is `i64`
 /// (exact integer compare). Prices are `f64` (our `candles_1m` and Dhan REST
 /// are both f64 — exact compare per the operator's "exact match").
@@ -72,9 +80,38 @@ pub fn intraday_utc_secs_to_ist_minute_nanos(utc_epoch_secs: i64) -> i64 {
     minute_floor.saturating_mul(NANOS_PER_SEC)
 }
 
+/// Tolerant epoch-seconds read for the `timestamp` array: JSON int OR float.
+///
+/// **2026-07-15 wire drift (probe-verified):** Dhan `/v2/charts/intraday`
+/// started serializing `timestamp` as scientific-notation JSON floats
+/// (verbatim wire: `"timestamp":[1.7840871E9,1.78408716E9]`). `as_i64()`
+/// returns `None` for ANY float number, so every candle was skipped —
+/// 14 days of 0-row spot-1m capture (`empty_no_rows` on all SIDs every
+/// minute). Mirror of the pre-existing `volume` float fallback, PLUS a
+/// sanity window: a float timestamp must be finite and inside
+/// [`EPOCH_SECS_FLOAT_MIN`, `EPOCH_SECS_FLOAT_MAX`] (rejects NaN / inf /
+/// negative / zero / absurd), then rounds to whole seconds (f64 represents
+/// these epoch magnitudes exactly). A failing value returns `None` → the
+/// caller's existing per-candle skip arm (callers count parsed rows and
+/// classify empty — never silent). Integer timestamps are unchanged
+/// (back-compat). Pure — never panics.
+fn timestamp_epoch_secs(v: &serde_json::Value) -> Option<i64> {
+    if let Some(i) = v.as_i64() {
+        return Some(i);
+    }
+    let f = v.as_f64()?;
+    if !f.is_finite() || !(EPOCH_SECS_FLOAT_MIN..=EPOCH_SECS_FLOAT_MAX).contains(&f) {
+        return None;
+    }
+    // Bounded by the range check above (≤ 4e9 ≪ i64::MAX) — safe cast.
+    Some(f.round() as i64)
+}
+
 /// Parse Dhan's columnar intraday response into `MinuteCandle`s. Parallel
 /// arrays `open/high/low/close/volume/timestamp`; all must be the same
 /// non-zero length. Returns empty on malformed/empty. Pure — never panics.
+/// `timestamp` entries accept int OR finite ranged float per
+/// [`timestamp_epoch_secs`] (the 2026-07-15 Dhan wire drift).
 #[must_use]
 pub fn parse_intraday_1m_candles(body: &str) -> Vec<MinuteCandle> {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else {
@@ -108,7 +145,7 @@ pub fn parse_intraday_1m_candles(body: &str) -> Vec<MinuteCandle> {
             high[i].as_f64(),
             low[i].as_f64(),
             close[i].as_f64(),
-            ts[i].as_i64(),
+            timestamp_epoch_secs(&ts[i]),
         ) else {
             continue;
         };
@@ -189,5 +226,85 @@ mod tests {
         let c = parse_intraday_1m_candles(body);
         assert_eq!(c.len(), 1);
         assert_eq!(c[0].volume, 12345);
+    }
+
+    /// 2026-07-15 wire drift: the VERBATIM captured Dhan body (SENSEX,
+    /// raw_body_sample 09:16:01 IST) — `timestamp` as scientific-notation
+    /// floats. Both candles MUST parse, with exact epoch seconds
+    /// 1784087100 (09:15 IST) and 1784087160 (09:16 IST).
+    #[test]
+    fn parse_intraday_1m_candles_float_scientific_timestamps_verbatim_wire() {
+        let body = r#"{"open":[57643.75,57694.9],"high":[57751.65,57699.85],"low":[57616.95,57691.05],"close":[57695.15,57691.05],"volume":[4340422.0,19095.0],"timestamp":[1.7840871E9,1.78408716E9]}"#;
+        let c = parse_intraday_1m_candles(body);
+        assert_eq!(c.len(), 2, "both float-timestamp candles parse");
+        assert_eq!(
+            c[0].minute_ts_ist_nanos,
+            intraday_utc_secs_to_ist_minute_nanos(1_784_087_100),
+            "1.7840871E9 == exactly 1784087100 epoch seconds"
+        );
+        assert_eq!(
+            c[1].minute_ts_ist_nanos,
+            intraday_utc_secs_to_ist_minute_nanos(1_784_087_160),
+            "1.78408716E9 == exactly 1784087160 epoch seconds"
+        );
+        assert_eq!(c[0].open, 57643.75);
+        assert_eq!(c[0].volume, 4_340_422);
+        assert_eq!(c[1].close, 57691.05);
+        assert_eq!(c[1].volume, 19_095);
+    }
+
+    /// Back-compat: an INTEGER timestamp and its float form yield the
+    /// identical minute bucket (the pre-drift wire shape keeps working).
+    #[test]
+    fn parse_intraday_1m_candles_int_and_float_timestamps_agree() {
+        let int_body = r#"{"open":[1.0],"high":[1.0],"low":[1.0],"close":[1.0],"volume":[1],"timestamp":[1784087100]}"#;
+        let float_body = r#"{"open":[1.0],"high":[1.0],"low":[1.0],"close":[1.0],"volume":[1],"timestamp":[1.7840871E9]}"#;
+        let i = parse_intraday_1m_candles(int_body);
+        let f = parse_intraday_1m_candles(float_body);
+        assert_eq!(i.len(), 1);
+        assert_eq!(f.len(), 1);
+        assert_eq!(i[0].minute_ts_ist_nanos, f[0].minute_ts_ist_nanos);
+    }
+
+    /// Hostile float timestamps: negative, zero, and out-of-range (5e9)
+    /// floats fail the sanity window and skip THAT candle only — the good
+    /// candle in the same body still parses (per-candle skip, never a
+    /// whole-body reject).
+    #[test]
+    fn parse_intraday_1m_candles_float_timestamp_sanity_window() {
+        let body = r#"{"open":[1.0,2.0,3.0,4.0],"high":[1.0,2.0,3.0,4.0],"low":[1.0,2.0,3.0,4.0],"close":[1.0,2.0,3.0,4.0],"volume":[1,2,3,4],"timestamp":[-1.7840871E9,0.0,5.0E9,1.7840871E9]}"#;
+        let c = parse_intraday_1m_candles(body);
+        assert_eq!(c.len(), 1, "only the in-range float survives");
+        assert_eq!(c[0].open, 4.0, "the surviving candle is the 4th column");
+        assert_eq!(
+            c[0].minute_ts_ist_nanos,
+            intraday_utc_secs_to_ist_minute_nanos(1_784_087_100)
+        );
+    }
+
+    /// Hostile overflow: `1e999` overflows f64. serde_json rejects the
+    /// number at parse time (non-finite Numbers are unrepresentable), so
+    /// the whole body degrades to empty; if a future serde ever yielded
+    /// inf instead, the `is_finite()` gate skips the candle. Either way:
+    /// zero bogus rows.
+    #[test]
+    fn parse_intraday_1m_candles_float_timestamp_overflow_yields_no_rows() {
+        let body = r#"{"open":[1.0],"high":[1.0],"low":[1.0],"close":[1.0],"volume":[1],"timestamp":[1e999]}"#;
+        assert!(parse_intraday_1m_candles(body).is_empty());
+    }
+
+    /// A fractional float timestamp rounds to the nearest whole second
+    /// (defensive — Dhan epochs are whole seconds; f64 is exact at these
+    /// magnitudes).
+    #[test]
+    fn parse_intraday_1m_candles_float_timestamp_fractional_rounds() {
+        let body = r#"{"open":[1.0],"high":[1.0],"low":[1.0],"close":[1.0],"volume":[1],"timestamp":[1784087099.9]}"#;
+        let c = parse_intraday_1m_candles(body);
+        assert_eq!(c.len(), 1);
+        assert_eq!(
+            c[0].minute_ts_ist_nanos,
+            intraday_utc_secs_to_ist_minute_nanos(1_784_087_100),
+            "rounds to 1784087100, not truncates to ...099"
+        );
     }
 }

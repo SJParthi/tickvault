@@ -4,9 +4,13 @@
 > cross-verification?" — and "is it even running?"
 > **Authority:** `.claude/rules/project/live-feed-purity.md` rule 11,
 > `.claude/rules/project/cross-verify-1m-error-codes.md`.
-> **Code:** `crates/app/src/cross_verify_1m_boot.rs`,
-> `crates/storage/src/feed_parity_1m_audit_persistence.rs`, wired in
-> `crates/app/src/main.rs`.
+> **⚠ RETIRED (PR-C3, 2026-07-14):** the 15:31 IST Dhan live-vs-historical
+> cross-verify was retired with the Dhan live WS (operator 2026-07-13) and
+> its module `cross_verify_1m_boot.rs` was DELETED — the forensic artifacts
+> (day CSVs, `cross_verify_1m_audit` table, the read-only debug endpoint)
+> are retained; nothing writes new ones. Content below is historical.
+> **Code (historical):** `cross_verify_1m_boot.rs` (deleted),
+> `feed_parity_1m_audit_persistence.rs` (storage crate — DELETED 2026-07-15).
 
 ## TL;DR
 
@@ -60,7 +64,7 @@ time) but **not** correctness: on a quiet day with no `candles_1m`, it
 produces an empty/degraded report — never invented data.
 
 The scheduling decision is a pure, unit-tested function
-(`decide_cross_verify_start` in `cross_verify_1m_boot.rs`); the env var only
+(`decide_cross_verify_start` in the deleted `cross_verify_1m_boot.rs`); the env var only
 flips its `force_now` input.
 
 ## Cross-references

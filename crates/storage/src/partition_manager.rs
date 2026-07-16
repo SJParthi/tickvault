@@ -90,10 +90,6 @@ pub(crate) const DAY_PARTITIONED_TABLES: &[&str] = &[
     // both feeds write here, `feed` is in the DEDUP key. Same SEBI-audit class +
     // DAY partitioning as the two siloed tables it merges.
     "feed_parity_1m_audit",
-    // GROWW-SCALE-01..04 (2026-07-03, auto-scale ladder PR-2): one row per
-    // ladder rung transition — same SEBI-audit class + DAY partitioning as
-    // ws_event_audit; `feed` is in the DEDUP key.
-    "groww_scale_audit",
     // SCOREBOARD-01 (2026-07-10, dual-feed scoreboard PR-A): one row per
     // (trading day, feed) verdict / per (trading day, feed) coverage snapshot /
     // per outage episode — same SEBI-audit class + DAY partitioning as the
@@ -141,6 +137,15 @@ pub(crate) const DAY_PARTITIONED_TABLES: &[&str] = &[
     // TF_VERIFY_MAX_AUDIT_ROWS_PER_RUN, normally ~0; same SEBI-audit class
     // + DAY partitioning as cross_verify_1m_audit; `feed` is in the DEDUP key.
     "tf_consistency_audit",
+    // AUDIT-06 / STORAGE-GAP-03 (2026-07-14, cluster-C order-side): one row
+    // per order lifecycle event / per P&L snapshot — the strict SEBI 5y
+    // order-audit class (disaster-recovery.md: "order_audit is the strict
+    // 5y SEBI-mandate table"): 90d hot in QuestDB, then the DAY sweep's
+    // detach→S3-archive leg owns the cold path exactly like the audit
+    // tables above. Tiny in dry-run (a handful of paper rows/day + 1 OnEod
+    // pnl heartbeat row); `feed` is in both DEDUP keys.
+    "order_audit",
+    "pnl_audit",
 ];
 
 /// Tables EXEMPT from retention sweeping — NEVER detached or dropped.

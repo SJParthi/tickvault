@@ -22,49 +22,24 @@ fn app_src(rel: &str) -> String {
     fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
 }
 
-/// Byte offset of the CODE-form fast-arm return. The literal
-/// `return run_shutdown_fast(` ALSO appears inside a doc comment earlier in
-/// main.rs (as `return run_shutdown_fast(...)`), so the code form is anchored
-/// by the trailing newline — the real call site is a multi-line call whose
-/// opening paren ends the line.
-fn fast_arm_return_offset(src: &str) -> usize {
-    src.find("return run_shutdown_fast(\n")
-        .expect("main.rs must contain the FAST-arm `return run_shutdown_fast(` call")
-}
-
 #[test]
 fn test_spawn_tf_consistency_tasks_is_wired_into_both_main_boot_paths() {
+    // PR-C2 re-shape (2026-07-13, operator retirement directive —
+    // websocket-connection-scope-lock.md "2026-07-13 Amendment"): the FAST
+    // crash-recovery arm (and its `return run_shutdown_fast(` exit) DIED
+    // with the Dhan live-WS lane, so the scoreboard dual-spawn shape
+    // collapses to the single process-global prefix call. The
+    // dual-spawn-safe once-guard inside the boot module is unchanged.
     let src = app_src("src/main.rs");
     // The fn is DEFINED in tf_consistency_boot.rs, so every main.rs mention
-    // is a call site. Exactly two: fast arm + process-global prefix.
+    // is a call site. Exactly one on the single boot path.
     let call_count = src.matches("spawn_tf_consistency_tasks(").count();
     assert_eq!(
-        call_count, 2,
-        "main.rs must call spawn_tf_consistency_tasks(...) EXACTLY twice \
-         (fast crash-recovery arm + process-global prefix — the scoreboard \
-         dual-spawn precedent); found {call_count}."
-    );
-
-    // Ordering: one call BEFORE the fast arm's `return run_shutdown_fast(`
-    // (else a mid-market crash-restart session never runs the 15:40 check)
-    // and one AFTER it (the process-global prefix for normal boots).
-    let fast_return = fast_arm_return_offset(&src);
-    let first = src
-        .find("spawn_tf_consistency_tasks(")
-        .expect("first call site must exist");
-    let last = src
-        .rfind("spawn_tf_consistency_tasks(")
-        .expect("second call site must exist");
-    assert!(
-        first < fast_return,
-        "one spawn_tf_consistency_tasks call must precede the FAST-arm \
-         `return run_shutdown_fast(` (byte {fast_return}), else a crash-restart \
-         boot never spawns the verifier; first call at byte {first}."
-    );
-    assert!(
-        last > fast_return,
-        "one spawn_tf_consistency_tasks call must follow the FAST-arm return \
-         (the process-global prefix site); last call at byte {last}."
+        call_count, 1,
+        "main.rs must call spawn_tf_consistency_tasks(...) EXACTLY once \
+         (the single process-global boot prefix since PR-C2); found \
+         {call_count} — zero kills the 15:40 verifier; two would rely on \
+         the once-guard instead of the boot shape."
     );
 }
 
@@ -88,7 +63,8 @@ fn test_spawn_tf_consistency_tasks_threads_config_calendar_notifier() {
         checked += 1;
         from = abs + 1;
     }
-    assert_eq!(checked, 2, "expected exactly 2 call sites to check");
+    // PR-C2 (2026-07-13): single call site on the single boot path.
+    assert_eq!(checked, 1, "expected exactly 1 call site to check");
 }
 
 #[test]
@@ -115,6 +91,11 @@ fn test_tf_consistency_boot_module_is_not_a_stub() {
         "TfVerify02RunDegraded",     // TF-VERIFY-02 emit site
         "TfConsistencySummary",      // the one-per-run Telegram summary
         "TfConsistencyAborted",      // the supervisor abort page
+        "daily_marker_exists(",      // once-per-day RunCatchUp gate (2026-07-15)
+        "write_daily_marker(",       // marker written on PASS only (G4a, fix round 2)
+        "should_notify_summary(",    // no_data log-only predicate (2026-07-15)
+        "daily_marker_path(",        // G11: the skip line names the exact marker path
+        r#"status_label == "pass""#, // G4a: PASS is the ONLY marker-sealing verdict
     ] {
         assert!(
             src.contains(needle),
@@ -123,6 +104,16 @@ fn test_tf_consistency_boot_module_is_not_a_stub() {
              hollowed into a stub)."
         );
     }
+    // G4a (fix round 2): no_data must NEVER seal the daily marker again —
+    // a trading-day no_data can be a silently-empty discovery dataset
+    // (the PR #1474 blind-since-birth class); marker-sealing it made
+    // every same-day restart read "nothing to check" forever.
+    assert!(
+        !src.contains(r#"status_label == "no_data") "#)
+            && !src.contains(r#"|| status_label == "no_data""#),
+        "the marker write must be gated on PASS only — a no_data disjunct \
+         re-opens the silently-sealed-blind-day hole (G4a)."
+    );
 }
 
 #[test]

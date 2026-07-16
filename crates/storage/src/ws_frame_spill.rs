@@ -10,7 +10,7 @@
 //     [MAGIC:4="TVW1"][ws_type:u8][len:u32 LE][frame:len bytes][crc32:u32 LE]
 // CRC32 is computed over ws_type || len || frame.
 
-use std::fs::{File, OpenOptions};
+use std::fs::{File, OpenOptions}; // O(1) EXEMPT: import line only — uses are the cold writer thread + boot replay
 use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -170,17 +170,17 @@ impl WsFrameSpill {
     // TEST-EXEMPT: covered by test_append_spill_and_replay_roundtrip + test_drop_counter_increments_when_channel_full (both construct)
     pub fn new<P: AsRef<Path>>(wal_dir: P) -> anyhow::Result<Self> {
         let wal_dir = wal_dir.as_ref().to_path_buf();
-        std::fs::create_dir_all(&wal_dir)
+        std::fs::create_dir_all(&wal_dir) // O(1) EXEMPT: one-shot constructor, not the per-frame append
             .map_err(|e| anyhow::anyhow!("create WAL dir {:?}: {e}", wal_dir))?;
 
         let (tx, rx) = bounded::<WalRecord>(SPILL_CHANNEL_CAPACITY);
         let drop_critical = Arc::new(AtomicU64::new(0));
         let persisted_total = Arc::new(AtomicU64::new(0));
 
-        let persisted_for_thread = persisted_total.clone();
-        let wal_dir_for_thread = wal_dir.clone();
+        let persisted_for_thread = persisted_total.clone(); // APPROVED: Arc clone in the one-shot constructor
+        let wal_dir_for_thread = wal_dir.clone(); // APPROVED: one-shot constructor, not per-frame
         thread::Builder::new()
-            .name("ws-frame-spill-writer".to_string())
+            .name("ws-frame-spill-writer".to_string()) // APPROVED: one-shot constructor (thread name)
             .spawn(move || {
                 // Supervisor loop (mirrors WS-GAP-05 pool supervisor +
                 // DISK-WATCHER-01). A panic or a fatal return from the writer
@@ -593,7 +593,7 @@ fn open_new_segment(wal_dir: &Path) -> anyhow::Result<BufWriter<File>> {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    let path = wal_dir.join(format!("ws-frames-{:020}.wal", nanos));
+    let path = wal_dir.join(format!("ws-frames-{:020}.wal", nanos)); // APPROVED: segment rotation on the background writer thread, not the per-frame append
     let f = OpenOptions::new()
         .create(true)
         .append(true)
@@ -738,7 +738,7 @@ pub fn count_frames_for_ist_day<P: AsRef<Path>>(
     let wal_dir = wal_dir.as_ref();
     let mut counts = WalDayFrameCounts::default();
 
-    let mut segments: Vec<PathBuf> = Vec::new();
+    let mut segments: Vec<PathBuf> = Vec::new(); // APPROVED: cold path — once per trading day
     // Scan the live dir, the IN-PROGRESS staging dir (un-confirmed segments
     // from a crashed boot still carry real frames for the day), AND the
     // confirmed archive — so the audit never silently under-counts a frame
@@ -748,6 +748,7 @@ pub fn count_frames_for_ist_day<P: AsRef<Path>>(
         wal_dir.join(REPLAYING_SUBDIR),
         wal_dir.join(ARCHIVE_SUBDIR),
     ] {
+        // O(1) EXEMPT: once-per-day count fn, cold path
         let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
         };
@@ -773,7 +774,7 @@ pub fn count_frames_for_ist_day<P: AsRef<Path>>(
             segments.push(path);
         }
     }
-    segments.sort();
+    segments.sort(); // O(1) EXEMPT: once-per-day count fn, bounded segment list
 
     for path in &segments {
         match replay_segment(path) {
@@ -842,7 +843,7 @@ const ARCHIVE_SUBDIR: &str = "archive";
 pub fn replay_all<P: AsRef<Path>>(wal_dir: P) -> anyhow::Result<Vec<ReplayedFrame>> {
     let wal_dir = wal_dir.as_ref();
     if !wal_dir.exists() {
-        return Ok(Vec::new());
+        return Ok(Vec::new()); // APPROVED: boot-time WAL replay, cold path
     }
 
     // Re-glob BOTH the in-progress staging dir (un-confirmed leftovers from a
@@ -864,9 +865,9 @@ pub fn replay_all<P: AsRef<Path>>(wal_dir: P) -> anyhow::Result<Vec<ReplayedFram
     // never changed). Sort on the FILE NAME (the zero-padded nanos), NOT the
     // full path — the full path would order by parent dir (`replaying/` vs the
     // bare live dir) instead of by capture time, breaking cross-source FIFO.
-    segments.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
+    segments.sort_by(|a, b| a.file_name().cmp(&b.file_name())); // O(1) EXEMPT: boot replay — this sort IS the FIFO-order invariant
 
-    let mut frames = Vec::new();
+    let mut frames = Vec::new(); // APPROVED: boot-time WAL replay, cold path
     let mut corrupted = 0usize;
 
     for path in &segments {
@@ -903,14 +904,14 @@ pub fn replay_all<P: AsRef<Path>>(wal_dir: P) -> anyhow::Result<Vec<ReplayedFram
     // They remain re-globbable next boot until `confirm_replayed` is called.
     // Best-effort, like the prior archive move: a failed move leaves the
     // segment as `*.wal`, which is STILL re-globbed next boot — never worse.
-    drop(std::fs::create_dir_all(&replaying_dir));
+    drop(std::fs::create_dir_all(&replaying_dir)); // O(1) EXEMPT: boot replay staging move, cold path
     for seg in &segments {
         if let Some(name) = seg.file_name() {
             let dst = replaying_dir.join(name);
             // A leftover that was re-read from `replaying/` renames onto
             // itself / is overwritten by identical bytes — safe.
             if seg != &dst {
-                drop(std::fs::rename(seg, dst));
+                drop(std::fs::rename(seg, dst)); // O(1) EXEMPT: boot replay staging move, cold path
             }
         }
     }
@@ -921,14 +922,15 @@ pub fn replay_all<P: AsRef<Path>>(wal_dir: P) -> anyhow::Result<Vec<ReplayedFram
 /// Lists the `*.wal` segment files directly under `dir` (NOT recursive).
 /// Returns an empty Vec for a missing/unreadable dir.
 fn wal_segments_in(dir: &Path) -> Vec<PathBuf> {
+    // O(1) EXEMPT: boot replay helper — cold path, bounded segment listing
     let Ok(entries) = std::fs::read_dir(dir) else {
-        return Vec::new();
+        return Vec::new(); // APPROVED: boot replay helper, cold path
     };
     entries
         .filter_map(|e| e.ok())
         .map(|e| e.path())
         .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("wal"))
-        .collect()
+        .collect() // APPROVED: boot replay helper, cold path
 }
 
 /// CRASH-SAFETY confirm step: move every segment in `<wal_dir>/replaying/` to
@@ -948,11 +950,12 @@ pub fn confirm_replayed<P: AsRef<Path>>(wal_dir: P) {
         return;
     }
     let archive_dir = wal_dir.join(ARCHIVE_SUBDIR);
-    drop(std::fs::create_dir_all(&archive_dir));
+    drop(std::fs::create_dir_all(&archive_dir)); // O(1) EXEMPT: boot-time confirm step, cold path
     let mut confirmed = 0u64;
     for seg in &staged {
         if let Some(name) = seg.file_name() {
             let dst = archive_dir.join(name);
+            // O(1) EXEMPT: boot-time confirm step, cold path
             match std::fs::rename(seg, &dst) {
                 Ok(()) => confirmed += 1,
                 Err(err) => {
@@ -1019,6 +1022,7 @@ pub fn prune_archived_segments_at<P: AsRef<Path>>(
 ) -> ArchivePruneOutcome {
     let archive_dir = wal_dir.as_ref().join(ARCHIVE_SUBDIR);
     let mut outcome = ArchivePruneOutcome::default();
+    // O(1) EXEMPT: periodic cold archive prune, never the per-frame append
     let Ok(entries) = std::fs::read_dir(&archive_dir) else {
         return outcome; // missing archive dir — nothing to prune
     };
@@ -1035,6 +1039,7 @@ pub fn prune_archived_segments_at<P: AsRef<Path>>(
             .ok()
             .and_then(|mtime| now.duration_since(mtime).ok());
         match age {
+            // O(1) EXEMPT: periodic cold archive prune, never the per-frame append
             Some(age) if age > cutoff => match std::fs::remove_file(&path) {
                 Ok(()) => outcome.deleted += 1,
                 Err(err) => {
@@ -1078,10 +1083,10 @@ pub fn prune_archived_segments<P: AsRef<Path>>(
 
 fn replay_segment(path: &Path) -> anyhow::Result<Vec<ReplayedFrame>> {
     let mut f = File::open(path)?;
-    let mut buf = Vec::new();
+    let mut buf = Vec::new(); // APPROVED: boot-time WAL replay, cold path
     f.read_to_end(&mut buf)?;
 
-    let mut out = Vec::new();
+    let mut out = Vec::new(); // APPROVED: boot-time WAL replay, cold path
     let mut i = 0usize;
     // Smallest record is v1 (13 bytes); v2 is 21. Gate the OUTER loop on the v1
     // minimum, then re-check the version-specific minimum after the magic check

@@ -4,19 +4,37 @@
 //! since the order lifecycle is a straightforward DAG with no entry/exit actions.
 //! `statig` is available if the FSM grows more complex in Phase 2.
 //!
-//! # Valid Transitions (from Phase 1 spec §10)
+//! # Valid Transitions (23 total — Phase 1 spec §10 + Cluster B 2026-07-14)
 //! ```text
-//! Transit   → Pending     (reached exchange)
-//! Transit   → Rejected    (exchange rejected immediately)
-//! Pending   → Confirmed   (exchange accepted)
-//! Pending   → Traded      (immediate fill, skips Confirmed)
-//! Pending   → Cancelled   (cancelled before confirmation)
-//! Pending   → Rejected    (exchange rejected after pending)
-//! Pending   → Expired     (order expired while pending)
-//! Confirmed → Traded      (fully filled)
-//! Confirmed → Cancelled   (user cancelled)
-//! Confirmed → Expired     (end of validity)
+//! Transit    → Pending     (reached exchange)
+//! Transit    → Rejected    (exchange rejected immediately)
+//! Pending    → Confirmed   (exchange accepted)
+//! Pending    → PartTraded  (partial fill)
+//! Pending    → Traded      (immediate fill, skips Confirmed)
+//! Pending    → Cancelled   (cancelled before confirmation)
+//! Pending    → Rejected    (exchange rejected after pending)
+//! Pending    → Expired     (order expired while pending)
+//! Pending    → Closed      (super order fully closed — Ruling 4, 2026-07-14)
+//! Confirmed  → PartTraded  (partial fill)
+//! Confirmed  → Traded      (fully filled)
+//! Confirmed  → Cancelled   (user cancelled)
+//! Confirmed  → Expired     (end of validity)
+//! Confirmed  → Closed      (super order fully closed — Ruling 4, 2026-07-14)
+//! PartTraded → Traded      (fully filled)
+//! PartTraded → Cancelled   (remainder cancelled)
+//! PartTraded → Expired     (remainder expired)
+//! PartTraded → Closed      (super order fully closed — Ruling 4, 2026-07-14)
+//! Triggered  → Pending     (Forever/Super trigger fired)
+//! Triggered  → Traded      (triggered and filled)
+//! Triggered  → Cancelled   (cancelled while armed)
+//! Triggered  → Rejected    (rejected after trigger)
+//! Triggered  → Closed      (super order fully closed — Ruling 4, 2026-07-14)
 //! ```
+//!
+//! Deliberately NOT valid: `Traded → Closed` (Traded is terminal — the
+//! super-order top-level PENDING→TRADED→TRIGGERED→CLOSED walk is tracked
+//! on `ManagedSuperOrder` as raw strings, BYPASSING this state machine),
+//! and no transition INTO `Triggered` for the same reason.
 
 use tickvault_common::order_types::OrderStatus;
 
@@ -54,6 +72,12 @@ pub fn is_valid_transition(from: OrderStatus, to: OrderStatus) -> bool {
             | (OrderStatus::Triggered, OrderStatus::Traded)
             | (OrderStatus::Triggered, OrderStatus::Cancelled)
             | (OrderStatus::Triggered, OrderStatus::Rejected)
+            // Closed (super/forever order fully closed — Cluster B Ruling 4,
+            // 2026-07-14): exactly FOUR sources; NEVER from Traded (terminal).
+            | (OrderStatus::Pending, OrderStatus::Closed)
+            | (OrderStatus::Confirmed, OrderStatus::Closed)
+            | (OrderStatus::PartTraded, OrderStatus::Closed)
+            | (OrderStatus::Triggered, OrderStatus::Closed)
     )
 }
 
@@ -235,6 +259,76 @@ mod tests {
             OrderStatus::Triggered,
             OrderStatus::Cancelled
         ));
+    }
+
+    // --- Into Closed (Cluster B Ruling 4, 2026-07-14) ---
+
+    #[test]
+    fn pending_to_closed_valid() {
+        assert!(is_valid_transition(
+            OrderStatus::Pending,
+            OrderStatus::Closed
+        ));
+    }
+
+    #[test]
+    fn confirmed_to_closed_valid() {
+        assert!(is_valid_transition(
+            OrderStatus::Confirmed,
+            OrderStatus::Closed
+        ));
+    }
+
+    #[test]
+    fn part_traded_to_closed_valid() {
+        assert!(is_valid_transition(
+            OrderStatus::PartTraded,
+            OrderStatus::Closed
+        ));
+    }
+
+    #[test]
+    fn triggered_to_closed_valid() {
+        assert!(is_valid_transition(
+            OrderStatus::Triggered,
+            OrderStatus::Closed
+        ));
+    }
+
+    #[test]
+    fn traded_to_closed_invalid() {
+        // Traded stays sealed — the super-order top-level TRADED→CLOSED
+        // walk is tracked on ManagedSuperOrder raw strings, deliberately
+        // bypassing this state machine (Ruling 4).
+        assert!(!is_valid_transition(
+            OrderStatus::Traded,
+            OrderStatus::Closed
+        ));
+    }
+
+    #[test]
+    fn transition_count_is_exactly_23() {
+        // Ruling 4 (2026-07-14): 19 pre-existing + 4 into Closed = 23.
+        // Enumerating the full 10x10 matrix pins the DAG size so a silent
+        // arm addition/removal fails this test.
+        let all_statuses = [
+            OrderStatus::Transit,
+            OrderStatus::Pending,
+            OrderStatus::Confirmed,
+            OrderStatus::PartTraded,
+            OrderStatus::Traded,
+            OrderStatus::Cancelled,
+            OrderStatus::Rejected,
+            OrderStatus::Expired,
+            OrderStatus::Closed,
+            OrderStatus::Triggered,
+        ];
+        let valid_count = all_statuses
+            .iter()
+            .flat_map(|from| all_statuses.iter().map(move |to| (*from, *to)))
+            .filter(|(from, to)| is_valid_transition(*from, *to))
+            .count();
+        assert_eq!(valid_count, 23);
     }
 
     // --- Closed is terminal ---

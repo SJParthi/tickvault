@@ -25,13 +25,13 @@ variable "environment" {
 }
 
 variable "instance_type" {
-  description = "EC2 instance type. MUST be r8g.large per operator lock 2026-06-30 (Graviton4, 2 vCPU / 16 GiB, $0.08258/hr ap-south-1; see daily-universe-scope-expansion-2026-05-27.md §7 Quote 7, which supersedes the 2026-05-29 m8g.large + 2026-05-27 t4g.large + 2026-05-18 t4g.medium locks)."
+  description = "EC2 instance type. MUST be t4g.medium per operator lock 2026-07-15 (Graviton2 burstable, 2 vCPU / 4 GiB, $0.0224/hr ap-south-1; see daily-universe-scope-expansion-2026-05-27.md §7 Quote 8, which supersedes the 2026-06-30 r8g.large + 2026-05-29 m8g.large + 2026-05-27 t4g.large locks)."
   type        = string
-  default     = "r8g.large"
+  default     = "t4g.medium"
 
   validation {
-    condition     = var.instance_type == "r8g.large"
-    error_message = "Instance type is pinned to r8g.large (Graviton4, 16 GiB) per operator lock 2026-06-30 (Quote 7) — DOUBLED RAM from m8g.large for the both-feeds + larger-universe workload. This SUPERSEDES the 2026-05-29 m8g.large lock. See daily-universe-scope-expansion-2026-05-27.md section 7."
+    condition     = var.instance_type == "t4g.medium"
+    error_message = "Instance type is pinned to t4g.medium (Graviton2, 4 GiB) per operator lock 2026-07-15 (Quote 8 downsize — the Groww-only runtime no longer needs the 16 GiB memory-optimized host; QuestDB is re-capped at 1g in lockstep). This SUPERSEDES the 2026-06-30 lock. See daily-universe-scope-expansion-2026-05-27.md section 7."
   }
 }
 
@@ -64,13 +64,13 @@ variable "enable_eip" {
 }
 
 variable "ebs_gp3_size_gb" {
-  description = "Root EBS volume size in GB. 50 per operator approval 2026-07-13 (prod disk-pressure remediation — root fs hit 82% on 2026-07-13 growing ~2.5-3.6 GB/day with zero reclamation; grown 30 -> 50 as the pressure-relief backstop alongside the retention-code fixes; supersedes the 2026-05-29 §7 Quote 6 30 GB lock — history 10 -> 30 -> 50). Bill impact ~+₹180/mo incl GST (~₹2,919 -> ~₹3,101, still under the $35/mo pre-GST budget alarm). The partition manager archives partitions >90d to the cheaper S3 cold bucket (~4x cheaper than EBS/GB), so EBS holds only hot data. gp3 grows online (no stop, no data loss) — raise this anytime the hot window needs more. root_block_device[0].volume_size is in the instance lifecycle.ignore_changes so a `terraform apply` does NOT touch the LIVE volume (and cannot revert a script-grown disk — gp3 cannot shrink anyway). This var documents the intended size for a FRESH provision; the LIVE grow is done out-of-band via scripts/aws-upgrade-instance.sh --ebs-size 50 (online aws ec2 modify-volume, no stop), with the filesystem grown by cloud-init growpart/resizefs at the next daily 08:30 IST boot or immediately via the in-guest growpart + xfs_growfs one-liner the script prints."
+  description = "Root EBS volume size in GB. 20 per the 2026-07-15 downsize pre-stage (executor decision recorded in daily-universe-scope-expansion-2026-05-27.md §0 under Quote 8 + §7 Rule 3 — NOT operator-quoted scope): gp3 can NEVER shrink (`modify-volume` grows only, and a 50 GB snapshot cannot restore into a 20 GB volume), so the LIVE root stays 50 GB until a deliberate terminate-and-recreate in the operator's post-market data-erase window replaces it (the box is fully cattle-provisioned by user-data.sh.tftpl; the pre-downsize snapshot is the rollback). History: 10 -> 30 (2026-05-29 Quote 6) -> 50 (2026-07-13 disk-pressure grow) -> 20 target (2026-07-15). The partition manager archives partitions >90d to the cheaper S3 cold bucket, so 20 GB holds the hot window on the erased fresh volume. root_block_device[0].volume_size is in the instance lifecycle.ignore_changes so a `terraform apply` does NOT touch the LIVE volume. This var documents the intended size for a FRESH provision only; any LIVE grow stays out-of-band via scripts/aws-upgrade-instance.sh --ebs-size (online aws ec2 modify-volume, no stop)."
   type        = number
-  default     = 50
+  default     = 20
 
   validation {
     condition     = var.ebs_gp3_size_gb >= 10 && var.ebs_gp3_size_gb <= 200
-    error_message = "EBS is sized 10-200 GB. 50 GB default per operator approval 2026-07-13 (disk-pressure grow; was 30 per the 2026-05-29 lock). gp3 grows online beyond this if needed."
+    error_message = "EBS is sized 10-200 GB. 20 GB default per the 2026-07-15 downsize pre-stage (fresh-volume replacement target; the live root stays 50 GB — gp3 cannot shrink; was 50 per the 2026-07-13 grow). gp3 grows online beyond this if needed."
   }
 }
 
@@ -162,4 +162,11 @@ variable "portal_git_sha" {
   description = "Git SHA of the repo tree terraform/lambda zips were applied from (B9 deploy provenance — set by CI via TF_VAR_portal_git_sha=github.sha; local applies default to \"unknown\"). Surfaces in the operator-portal footer as `portal <sha7>` and in the portal_git_sha output."
   type        = string
   default     = "unknown"
+}
+
+variable "daily_loss_alarm_inr" {
+  # = config/base.toml [risk] max_daily_loss_percent (2.0) × capital (1000000.0) = ₹20,000. Two sources of truth by necessity (terraform cannot read TOML); update BOTH together.
+  description = "Daily loss alarm threshold in INR (positive number; the daily-loss-breach alarm fires when tv_daily_pnl Minimum < -1 x this). Lockstep with config/base.toml [risk] max_daily_loss_percent x capital."
+  type        = number
+  default     = 20000
 }

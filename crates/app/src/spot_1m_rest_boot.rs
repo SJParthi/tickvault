@@ -521,13 +521,21 @@ pub fn backfill_minute_nanos(
 /// The const-assert below pins the sweep strictly clear of that window.
 const SPOT_1M_REST_SWEEP_FIRE_SECS_OF_DAY_IST: u32 = 15 * 3600 + 33 * 60 + 30;
 
-// The sweep must clear the cross-verify burst: at least 150 s after the
-// 15:31:00 cross-verify trigger (burst observed through 15:33), and still
-// comfortably before the 16:30 IST box stop.
+/// Historical anchor: the 15:31:00 IST trigger of the RETIRED bulk 1m
+/// cross-verify (`cross_verify_1m_boot.rs`, DELETED in PR-C3 2026-07-14 per
+/// the 2026-07-13 operator retirement directive — the const was relocated
+/// here from that module). The 15:33:30 sweep instant was chosen to clear
+/// that run's observed 429 burst window; the TIMING IS KEPT UNCHANGED — the
+/// burst producer is gone, but the ≥150s margin + the 16:30 box-stop bound
+/// still document why 15:33:30 was chosen.
+const RETIRED_CROSS_VERIFY_TRIGGER_SECS_OF_DAY_IST: u32 = 15 * 3600 + 31 * 60; // 55_860
+
+// The sweep must clear the (retired) cross-verify burst window: at least
+// 150 s after the historical 15:31:00 trigger (burst observed through
+// 15:33), and still comfortably before the 16:30 IST box stop.
 const _: () = assert!(
-    SPOT_1M_REST_SWEEP_FIRE_SECS_OF_DAY_IST
-        >= crate::cross_verify_1m_boot::CROSS_VERIFY_TRIGGER_SECS_OF_DAY_IST + 150,
-    "post-session sweep must clear the 15:31-15:33 cross-verify burst window"
+    SPOT_1M_REST_SWEEP_FIRE_SECS_OF_DAY_IST >= RETIRED_CROSS_VERIFY_TRIGGER_SECS_OF_DAY_IST + 150,
+    "post-session sweep must clear the historical 15:31-15:33 cross-verify burst window"
 );
 const _: () = assert!(
     SPOT_1M_REST_SWEEP_FIRE_SECS_OF_DAY_IST < 16 * 3600 + 30 * 60,
@@ -1804,7 +1812,20 @@ pub async fn run_spot_1m_rest(params: Spot1mRestTaskParams) {
         // Audit Rule 3: re-read the wall clock + trading-day verdict EVERY
         // iteration (a suspend can cross midnight and stale the verdict).
         if !params.calendar.is_trading_day_today() {
-            info!("spot_1m_rest: no longer a trading day — exiting");
+            // 2026-07-14: loud + coded (was a bare info!) — a mid-session
+            // calendar flip silently stopping a capture leg must be
+            // greppable in errors.jsonl. Log-sink-only, NO Telegram (a
+            // calendar flip is not broker failure); a suspend that
+            // crossed IST midnight is a legitimate cause.
+            metrics::counter!("tv_spot1m_trading_day_flip_exit_total").increment(1);
+            error!(
+                code = ErrorCode::Spot1m01FetchDegraded.code_str(),
+                stage = "trading_day_flip_exit",
+                "SPOT1M-01: the trading-day verdict flipped mid-session — \
+                 exiting today's spot fire loop (a suspend that crossed \
+                 IST midnight is a legitimate cause; remaining minutes \
+                 stay absent, re-fetchable via backfill)"
+            );
             return;
         }
         // Groww Item-7 precedent (GAP-11 review MEDIUM 1): the trading
@@ -2234,6 +2255,21 @@ async fn fire_one_minute(
 ) -> usize {
     let minute_open_secs = fire_secs_of_day.saturating_sub(60);
     let minute_label = format_minute_ist_12h(minute_open_secs);
+    // TRAP-A (2026-07-15, Groww live-feed retirement): per-fire liveness
+    // heartbeat for the re-pointed market-hours liveness alarm
+    // (market-hours-liveness-alarm.tf, treat_missing_data = "breaching").
+    // Set ONCE per per-minute fire, deliberately NOT pre-registered at
+    // boot — the first set at the 09:16:01 IST fire IS the session-start
+    // signal (a pre-registered 0 would satisfy the alarm while the legs
+    // never fire); metrics-exporter-prometheus re-renders the last value
+    // on every scrape thereafter, so a wedged/dead process — or a session
+    // where NO leg ever fired — goes MISSING in-window and pages. HONEST
+    // BOUND (2026-07-15, R1-2): the re-render means legs dying MID-SESSION
+    // after the first fire keep the gauge published — that class is owned
+    // by the legs' own escalation pages, not this alarm. The 1.0 is a constant
+    // marker — only sample PRESENCE matters to the alarm. (The batch
+    // catch-up loop stamps the same gauge once per cycle — R2-3 fix.)
+    metrics::gauge!("tv_rest_1m_fire_heartbeat").set(1.0);
     let trading_date = today_ist();
     let trading_date_nanos = minute_open_ist_nanos(trading_date, 0);
 
@@ -2937,7 +2973,17 @@ async fn run_batch_catchup_loop(
         // Audit Rule 3: re-read the wall clock + trading-day verdict every
         // iteration.
         if !params.calendar.is_trading_day_today() {
-            info!("spot_1m_rest: no longer a trading day — exiting batch loop");
+            // 2026-07-14: loud + coded (was a bare info!) — same class as
+            // the per-minute loop's flip exit; this names the BATCH loop.
+            metrics::counter!("tv_spot1m_trading_day_flip_exit_total").increment(1);
+            error!(
+                code = ErrorCode::Spot1m01FetchDegraded.code_str(),
+                stage = "trading_day_flip_exit",
+                "SPOT1M-01: the trading-day verdict flipped mid-session — \
+                 exiting the batch catch-up loop (a suspend that crossed \
+                 IST midnight is a legitimate cause; remaining cycles \
+                 stay absent, re-fetchable via backfill)"
+            );
             return false;
         }
         let now = ist_secs_of_day_now();
@@ -2953,6 +2999,20 @@ async fn run_batch_catchup_loop(
             u64::from(fire.saturating_sub(now)).saturating_mul(1_000) + SPOT_1M_REST_FIRE_DELAY_MS;
         tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
         last_fired = Some(fire);
+
+        // Market-hours liveness heartbeat — SAME gauge + idiom as the
+        // per-minute fire_one_minute site (set BEFORE token load / fetch:
+        // heartbeat = scheduler alive, not vendor healthy). 2026-07-15 fix
+        // round (R2-3): the batch loop previously NEVER set it, so a
+        // batch_catchup + Groww-spot-off config false-paged the liveness
+        // alarm daily. With this set, EVERY Dhan spot mode (per-minute AND
+        // batch) plus the Groww per-minute leg stamps the heartbeat.
+        // HONEST RESIDUAL: a batch first-cycle that lands AFTER the 09:20
+        // IST gate-open + 5x60s eval (possible when batch_interval_minutes
+        // pushes the first grid fire past ~09:25) still pages until that
+        // first cycle fires — per_minute is the supported default. The 1.0
+        // is a constant marker: only sample PRESENCE matters to the alarm.
+        metrics::gauge!("tv_rest_1m_fire_heartbeat").set(1.0);
 
         // A late wake is FINE in batch mode — the cycle's ceiling is
         // recomputed from the wall clock (catching up is the mode's whole
@@ -4009,7 +4069,7 @@ mod tests {
         // through 15:33) and before the 16:30 IST box stop.
         assert!(
             SPOT_1M_REST_SWEEP_FIRE_SECS_OF_DAY_IST
-                >= crate::cross_verify_1m_boot::CROSS_VERIFY_TRIGGER_SECS_OF_DAY_IST + 150
+                >= RETIRED_CROSS_VERIFY_TRIGGER_SECS_OF_DAY_IST + 150
         );
         assert!(SPOT_1M_REST_SWEEP_FIRE_SECS_OF_DAY_IST > SPOT_1M_REST_LAST_FIRE_SECS_OF_DAY_IST);
         assert!(SPOT_1M_REST_SWEEP_FIRE_SECS_OF_DAY_IST < 16 * 3600 + 30 * 60);
@@ -4548,9 +4608,10 @@ mod tests {
     fn test_probe_crossverify_request_byte_equality_fixture() {
         let date = NaiveDate::from_ymd_opt(2026, 7, 14).expect("valid date");
         let spot = spot_1m_day_request_body("13", date).to_string();
-        // The cross-verify call shape (cross_verify_1m_boot::compare_one_target
-        // for an index target): intraday_request_body(sid, segment,
-        // instrument, trading_date, trading_date.succ()).
+        // The (retired — PR-C3 2026-07-14) cross-verify call shape
+        // (`compare_one_target` for an index target):
+        // intraday_request_body(sid, segment, instrument, trading_date,
+        // trading_date.succ()). Kept as the live-proven day-window fixture.
         let next = date.succ_opt().expect("next day");
         let crossverify =
             intraday_request_body("13", SPOT_1M_REST_SEGMENT_IDX_I, "INDEX", date, next)

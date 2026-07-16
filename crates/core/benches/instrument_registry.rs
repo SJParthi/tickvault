@@ -1,17 +1,20 @@
-//! Benchmark: InstrumentRegistry O(1) lookup and subscription builder.
+//! Benchmark: InstrumentRegistry O(1) lookup.
 //!
-//! Measures the hot-path operations for instrument resolution and
-//! WebSocket subscription message generation.
-//! Budget: registry.get() < 50ns, build_subscription_messages() < 1ms/batch.
+//! Measures the hot-path operations for instrument resolution.
+//! Budget: registry.get() < 50ns (`quality/benchmark-budgets.toml` registry_get).
+//!
+//! PR-C2 trim (2026-07-13): the two `subscription/build_messages_*` benches
+//! retired with `subscription_builder.rs` — deleted with the Dhan live
+//! main-feed WS lane (operator retirement directive —
+//! `websocket-connection-scope-lock.md` "2026-07-13 Amendment"). No budget
+//! key referenced them.
 
 use std::hint::black_box;
 
 use criterion::{Criterion, criterion_group, criterion_main};
 
 use tickvault_common::instrument_registry::{InstrumentRegistry, make_display_index_instrument};
-use tickvault_common::types::{ExchangeSegment, FeedMode};
-use tickvault_core::websocket::subscription_builder::build_subscription_messages;
-use tickvault_core::websocket::types::InstrumentSubscription;
+use tickvault_common::types::FeedMode;
 
 /// Build a registry with N instruments for benchmarking.
 fn build_registry(count: usize) -> InstrumentRegistry {
@@ -49,46 +52,10 @@ fn bench_registry_contains(c: &mut Criterion) {
     });
 }
 
-fn bench_subscription_messages_100(c: &mut Criterion) {
-    let instruments: Vec<InstrumentSubscription> = (0..100)
-        .map(|i: u64| {
-            InstrumentSubscription::new(ExchangeSegment::NseFno, 10000_u64.saturating_add(i))
-        })
-        .collect();
-    c.bench_function("subscription/build_messages_100", |b| {
-        b.iter(|| {
-            build_subscription_messages(
-                black_box(&instruments),
-                black_box(FeedMode::Ticker),
-                black_box(100),
-            )
-        });
-    });
-}
-
-fn bench_subscription_messages_5000(c: &mut Criterion) {
-    let instruments: Vec<InstrumentSubscription> = (0..5000)
-        .map(|i: u64| {
-            InstrumentSubscription::new(ExchangeSegment::NseFno, 10000_u64.saturating_add(i))
-        })
-        .collect();
-    c.bench_function("subscription/build_messages_5000", |b| {
-        b.iter(|| {
-            build_subscription_messages(
-                black_box(&instruments),
-                black_box(FeedMode::Ticker),
-                black_box(100),
-            )
-        });
-    });
-}
-
 criterion_group!(
     benches,
     bench_registry_get_hit,
     bench_registry_get_miss,
     bench_registry_contains,
-    bench_subscription_messages_100,
-    bench_subscription_messages_5000,
 );
 criterion_main!(benches);
