@@ -1,39 +1,50 @@
 //! Broker-agnostic fetch-cadence + decision-timing scheduler (operator
-//! cadence directive 2026-07-14, judge-locked design rev-8 FINAL).
+//! cadence directive 2026-07-14, judge-locked design rev-8 FINAL;
+//! reshaped POST-CLOSE by the operator directive 2026-07-16).
 //!
 //! Per trading-day minute-close instant T in `[09:16:00, 15:30:00]` IST:
-//! Dhan pre-fires its 3 serialized option chains at :55/:58/:02 (rate-gated
-//! 1-per-3s per-underlying AND globally) and fetches 4 post-close intraday
-//! spot singles grouped by the ADAPTIVE CONCURRENCY LADDER (operator spec
-//! addition 2026-07-15 — step 0: all 4 SIMULTANEOUS at :03.0; degraded
-//! steps split 3+1 / 2+2 / fully sequential across 1000ms-spaced group
-//! anchors; both brokers' candle endpoints are single-symbol-per-request,
-//! so step 0 is 4 parallel single-symbol calls, never one batched HTTP
-//! request), each fire passing the spot ROLLING-1000ms-WINDOW gate (≤
-//! `spot_window_cap` per sliding second); Groww fires per its
-//! THREE-CHOICE fallback-shape ladder (coordinator 2026-07-15 — choice 1:
-//! all 7 requests in parallel at :00, gate-free lane; choice 2: :01
-//! chains / :02 all 4 spots; choice 3: :01 / :02 core spots / :03 VIX
-//! alone) with a last-wave+timeout verdict + sequential fallback. Each
-//! lane's decision fires the INSTANT its data-complete predicate flips
+//! Dhan fires POST-CLOSE per its SHAPE ladder (2026-07-16 + the
+//! same-day all-7 correction — rung 0 primary: ALL 7 requests
+//! concurrent at the burst second T+1, 3 chains + 4 spots, exactly the
+//! operator's "all 7 parallel at first second"; rung 1 fallback: chains
+//! at T+1, ALL 4 spots at T+2), the spot seconds further split by the
+//! 2026-07-15 ADAPTIVE CONCURRENCY tiers (per-second-group caps
+//! 4/3/2/1, greedy overflow to later 1000ms buckets; both brokers'
+//! candle endpoints are single-symbol-per-request — never one batched
+//! HTTP call). The TWO-BUCKET budget model makes all-7 legal: the 4
+//! spot fires pass the spot + COMBINED rolling-1000ms rings (the
+//! Data-API 5/sec bucket, 4 ≤ 5); the 3 chain fires pass ONLY the
+//! per-(underlying, expiry) ≥3s chain gate (the option-chain API's own
+//! budget — the 3s rule is per-SAME-chain-expiry only, different
+//! underlyings explicitly concurrent). Groww fires
+//! per its fallback-shape ladder (2026-07-16 two-rung prescription +
+//! the retained choice-3 last resort — rung 0: all 7 requests in
+//! parallel at :00, gate-free lane; rung 1: :01 chains / :02 all 4
+//! spots; rung 2: :01 / :02 core spots / :03 VIX alone) with a
+//! last-wave+timeout verdict + sequential fallback. Each lane's
+//! decision fires the INSTANT its data-complete predicate flips
 //! (event-driven, latched exactly-once per (lane, cycle)); past its
 //! cutoff the lane HONEST-SKIPS with a coded loud log — never a late
 //! decision, never a decision on missing/stale data.
 //!
 //! # Modules
 //! - `schedule` — pure IST minute-boundary + slot-table calculus (per
-//!   broker anchor + ladder rung + concurrency step + fallback shape;
-//!   boundary math reimplemented here — core cannot depend on
+//!   broker burst offset + shape rung + concurrency step + fallback
+//!   shape; boundary math reimplemented here — core cannot depend on
 //!   `crates/app`; drift is pinned by mirrored vectors + const-asserts
 //!   against the shared `SPOT_1M_REST_*` window constants)
-//! - `gate` — pure CAS [`gate::MinSpacingGate`] + the spot/COMBINED
-//!   rolling-window rings inside [`gate::DhanGates`] (chain+spot+expiry
-//!   ≤ 5 Dhan fires per rolling second — verifier L1, 2026-07-15) in
-//!   the MONOTONIC time domain (injected clock) — the structural
-//!   zero-429 hard floor
-//! - `ladder` — the Dhan failure ladder (rungs 0..=5, next-cycle anchor
-//!   shift, step-back-one recovery) + in-cycle retry policy + the
-//!   streak-driven concurrency/shape ladders ([`ladder::StreakLadder`])
+//! - `gate` — pure CAS [`gate::MinSpacingGate`] (per-(underlying,
+//!   expiry) chains + per-expiry waves) + the spot/COMBINED
+//!   rolling-window rings inside [`gate::DhanGates`] (spot+expiry ≤ 5
+//!   Dhan Data-API fires per rolling second; chains solely per-key —
+//!   the two-bucket model, THE binding cadence-lane pacing per the
+//!   2026-07-16 coordinator ruling) in the MONOTONIC time domain
+//!   (injected clock) — the structural zero-429 hard floor
+//! - `ladder` — the streak-driven shape/concurrency ladders
+//!   ([`ladder::StreakLadder`]: the 2026-07-16 Dhan shape rung 0⇄1,
+//!   the spot tiers, the Groww fallback shapes) + the per-second spot
+//!   bucket math ([`ladder::spot_second_buckets`]) + in-cycle retry
+//!   policy
 //! - `executor` — the LOCKED [`executor::CadenceExecutor`] seam (this PR
 //!   ships NO REST caller; [`executor::DryRunLoggingExecutor`] logs fires
 //!   and returns `Err(Empty)` — never synthesizes prices)

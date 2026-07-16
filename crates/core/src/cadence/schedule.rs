@@ -1,4 +1,5 @@
-//! Pure IST minute-boundary + slot-table calculus (design §1).
+//! Pure IST minute-boundary + slot-table calculus (design §1; reshaped by
+//! the 2026-07-16 operator directive — ALL fires are POST-close now).
 //!
 //! REIMPLEMENTED here (core cannot depend on `crates/app`, where the
 //! proven boundary calculus lives in `spot_1m_rest_boot.rs`); drift is
@@ -7,7 +8,7 @@
 //! plus mirrored hand-typed test vectors matching the app module's
 //! literals (`test_cadence_schedule_boundary_vectors_mirror_spot_1m_rest`).
 //!
-//! Everything here is a pure function of (boundary, rung, config) — no
+//! Everything here is a pure function of (boundary, shape, config) — no
 //! clock, no I/O; the runner + the replay proof share it, so the proven
 //! schedule and the executed schedule cannot diverge.
 
@@ -17,7 +18,7 @@ use tickvault_common::constants::{
     SPOT_1M_REST_LAST_FIRE_SECS_OF_DAY_IST,
 };
 
-use super::ladder::{groww_wave_indices, spot_group_index};
+use super::ladder::{groww_wave_indices, spot_second_buckets};
 use crate::pipeline::chain_snapshot::ChainUnderlying;
 
 /// First cadence cycle boundary of the session: T = 09:16:00 IST (the
@@ -49,15 +50,13 @@ const _: () = assert!(
 /// design also uses for the Groww per-request timeout.
 pub const CADENCE_RETRY_LATENCY_ALLOWANCE_MS: i64 = 1_500;
 
-/// Cross-fill freshness floor (design §5): the BASE of the borrow
-/// window — a foreign snapshot is valid for the borrowing lane only
-/// when fetched at/after T − this. At anchor-ladder rung 0 the window
-/// spans Dhan's PRE-close :55 chain and Groww's POST-close :00 burst
-/// exactly; at rung ≥ 1 the Dhan chains pre-fire EARLIER
-/// (T − 5000 − rung·step), so the effective floor is the LENDER-aware
-/// `assembly::cross_fill_freshness_floor_ms` — the base widened to the
-/// Dhan lender's earliest scheduled chain slot (CADENCE-XFILL-RUNG-1,
-/// 2026-07-15); the Groww lender keeps this base.
+/// Cross-fill freshness floor (design §5): a foreign snapshot is valid
+/// for the borrowing lane only when fetched at/after T − this. Since the
+/// 2026-07-16 reshape ALL fires on both lanes are POST-close (Dhan burst
+/// second 1–2, Groww waves :00–:03), so every same-cycle completion
+/// trivially passes; the floor is a belt against cross-CYCLE staleness
+/// (the retired pre-close schedule needed a lender-aware widening —
+/// CADENCE-XFILL-RUNG-1, 2026-07-15 — which is retired with it).
 pub const CADENCE_CROSS_FILL_FRESHNESS_FLOOR_MS: i64 = 5_000;
 
 /// Number of Dhan chain in-cycle retry slots (≤1 per failed underlying,
@@ -71,13 +70,13 @@ const MS_PER_SEC: i64 = 1_000;
 const SECS_PER_CYCLE: u32 = 60;
 
 /// R1 (2026-07-15): the mid-minute anchor for IN-SESSION expiry retry
-/// waves — seconds-of-minute 30, maximally far from BOTH the Dhan
-/// :55–:05 burst region (chain pre-fires T−5000/T−2000, post-fire
-/// T+2000, spot group T+3000, in-cycle retry grid ≤ the T+15s cutoff)
-/// and the Groww :00–:03 waves. A free-running 60s retry interval was
-/// near phase-locked to the minute: an expiry fire landing in the burst
-/// window + routine ≥1ms chain wake jitter put 6 Dhan fires in the spot
-/// group's rolling second, so the 4th NOMINAL spot deferred — a false
+/// waves — seconds-of-minute 30, maximally far from BOTH brokers' burst
+/// region (the 2026-07-16 shape packs every fire into T+0..≈T+5s: the
+/// Groww :00–:03 waves and the Dhan second-1/second-2 burst + the
+/// in-cycle retry grid ≤ the T+15s cutoff). A free-running 60s retry
+/// interval was near phase-locked to the minute: an expiry fire landing
+/// in the burst window + routine ≥1ms wake jitter put 6 Dhan fires in
+/// one rolling second, so a NOMINAL fire deferred — a false
 /// `gate_deferred_nominal` should-never page EVERY minute of a vendor
 /// outage (the collision class is pinned at the gate level by
 /// `test_cadence_gate_expiry_fire_in_burst_window_defers_fourth_nominal_spot`).
@@ -129,8 +128,8 @@ pub fn next_expiry_wave_instant_ms(
 /// `expiry_retry_interval_ms` ≤ 60s (belt (a)), but even under future
 /// validation drift the LAST pre-era wake of a >60s interval must not
 /// sleep the plain interval straight into the first session cycle's
-/// burst window (65s @ 09:14:58 → a plain wake at 09:16:03 = the
-/// spot-group instant → one false `gate_deferred_nominal` page at
+/// burst window (65s @ 09:14:58 → a plain wake at 09:16:03 = inside the
+/// first burst's fire region → one false `gate_deferred_nominal` page at
 /// session entry). Boot-phase / non-trading / post-session wakes keep
 /// the plain configured cadence — no cycle bursts exist to collide
 /// with. Pure.
@@ -167,19 +166,19 @@ pub fn next_cycle_boundary(now_secs_of_day: u32) -> Option<u32> {
 
 /// NO-MID-CYCLE-JOIN (design §4 case 4 — the restart-safety structural
 /// rule): a booting/waking process arms only at a boundary whose EARLIEST
-/// pre-fire instant (the Dhan chain anchor at the current rung) is still
-/// strictly in the future — it never joins a cycle whose pre-close fires
-/// have already begun. Also enforces strictly-after-`last_boundary` so an
-/// instant-completing cycle can never re-select its own boundary (the
-/// spot_1m_rest H1-fix mirror). Pure.
+/// fire instant (all fires are POST-close since 2026-07-16 — the smaller
+/// of the Groww burst anchor and the Dhan burst second) is still strictly
+/// in the future — it never joins a cycle whose fires have already begun.
+/// Also enforces strictly-after-`last_boundary` so an instant-completing
+/// cycle can never re-select its own boundary (the spot_1m_rest H1-fix
+/// mirror). Pure.
 #[must_use]
 pub fn next_joinable_boundary(
     now_ms_of_day: i64,
     last_boundary: Option<u32>,
-    rung: u8,
     cfg: &CadenceConfig,
 ) -> Option<u32> {
-    let earliest_prefire_offset_ms = earliest_prefire_offset_ms(rung, cfg);
+    let earliest_offset_ms = cfg.groww_anchor_offset_ms.min(cfg.dhan_burst_offset_ms);
     // Horizon: strictly after the last completed boundary.
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     // APPROVED: ms-of-day / 1000 is within [0, 86_400) — fits u32.
@@ -189,25 +188,13 @@ pub fn next_joinable_boundary(
     }
     let mut candidate = next_cycle_boundary(candidate_from)?;
     loop {
-        let anchor_ms = i64::from(candidate) * MS_PER_SEC + earliest_prefire_offset_ms;
+        let anchor_ms = i64::from(candidate) * MS_PER_SEC + earliest_offset_ms;
         if anchor_ms > now_ms_of_day {
             return Some(candidate);
         }
-        // This boundary's pre-fires already began — skip to the next.
+        // This boundary's fires already began — skip to the next.
         candidate = next_cycle_boundary(candidate.saturating_add(1))?;
     }
-}
-
-/// The earliest pre-fire offset (ms, negative = pre-close) of a cycle at
-/// `rung` — the first Dhan chain slot after the ladder shift. Pure.
-#[must_use]
-pub fn earliest_prefire_offset_ms(rung: u8, cfg: &CadenceConfig) -> i64 {
-    let shift = i64::from(rung).saturating_mul(cfg.dhan_ladder_step_ms);
-    cfg.dhan_chain_offsets_ms
-        .first()
-        .copied()
-        .unwrap_or(0)
-        .saturating_sub(shift)
 }
 
 /// Is `boundary_secs_of_day` inside the session window
@@ -228,26 +215,29 @@ pub struct CycleSlots {
     pub cycle_minute_ist: u32,
     /// T as absolute IST ms-of-day.
     pub boundary_ms: i64,
-    /// The ladder rung this table was built at.
-    pub rung: u8,
-    /// Dhan chain primaries (NIFTY / BANKNIFTY / SENSEX order — one slot
-    /// per [`ChainUnderlying`], shifted wholesale by −1000·rung ms; the
-    /// pairwise gaps are shift-invariant).
+    /// The Dhan SHAPE rung this table was built at (2026-07-16: 0 = the
+    /// ALL-7 concurrent primary; 1 = the split fallback).
+    pub dhan_shape: u8,
+    /// Dhan chain slots (NIFTY / BANKNIFTY / SENSEX order) — ALL THREE at
+    /// the burst second (T + `dhan_burst_offset_ms`): the 2026-07-16
+    /// directive makes different underlyings explicitly CONCURRENT (the
+    /// broker's 3s rule is per-(underlying, expiry) only).
     pub dhan_chain_slots_ms: [i64; ChainUnderlying::COUNT],
-    /// Dhan chain in-cycle retry grid: `chain_min_spacing_ms`-stepped
-    /// after the rung's LAST primary (rung 0 ⇒ :05/:08/:11; rung 5 ⇒
-    /// :00/:03/:06).
+    /// Dhan chain in-cycle retry grid: ALL slots at burst +
+    /// `chain_min_spacing_ms` (T+4s nominal) — each failed underlying's
+    /// retry is a DIFFERENT (underlying, expiry) key, so the retries are
+    /// concurrent too; the per-key gate admits each at exactly +3s.
     pub dhan_chain_retry_slots_ms: [i64; CADENCE_CHAIN_RETRY_SLOTS],
     /// The Dhan spot-concurrency ladder step this table was built at
-    /// (2026-07-15: 0 = `[[4]]` all together … 3 = fully sequential).
+    /// (2026-07-15: 0 = 4-per-second … 3 = fully sequential).
     pub spot_step: u8,
     /// Dhan spot slots (NIFTY / BANKNIFTY / SENSEX / INDIA VIX order),
-    /// post-close-clamped base `max(T + spot_start − 1000·rung, T +
-    /// spot_min_post_close)`, then GROUPED per the concurrency step:
-    /// group anchors 1000ms apart (step 0: all 4 at the base; step 1:
-    /// 3 at base + VIX at base+1s; step 2: 2+2; step 3: singles at
-    /// base/+1s/+2s/+3s). In-group members share ONE instant — the
-    /// rolling-window spot gate is the structural ceiling.
+    /// per the SECOND-BUCKET assignment `spot_second_buckets(dhan_shape,
+    /// spot_step)`: shape 0 bases NIFTY+BANKNIFTY in the burst second and
+    /// SENSEX+VIX in the next; shape 1 bases all 4 in second 2; the tier
+    /// step caps per-second spot counts, greedy overflow spilling to
+    /// later 1000ms buckets. Base clamped ≥ T + `spot_min_post_close_ms`
+    /// (the just-closed candle cannot exist pre-close).
     pub dhan_spot_slots_ms: [i64; 4],
     /// The Groww fallback-shape ladder step this table was built at
     /// (2026-07-15 three-choice ladder: 0 = `:00` all-7 burst;
@@ -273,48 +263,43 @@ pub struct CycleSlots {
 }
 
 /// Build the full slot table for the cycle closing at
-/// `boundary_secs_of_day`, at anchor-ladder `rung`, spot-concurrency
-/// `spot_step` and Groww fallback-shape `groww_shape` (2026-07-15).
-/// Pure — shared by the runner AND the replay proof so the proven and
-/// executed schedules cannot diverge.
+/// `boundary_secs_of_day`, at Dhan shape rung `dhan_shape`,
+/// spot-concurrency `spot_step` and Groww fallback-shape `groww_shape`
+/// (2026-07-16 shape). Pure — shared by the runner AND the replay proof
+/// so the proven and executed schedules cannot diverge.
 #[must_use]
 pub fn build_cycle_slots(
     boundary_secs_of_day: u32,
-    rung: u8,
+    dhan_shape: u8,
     spot_step: u8,
     groww_shape: u8,
     cfg: &CadenceConfig,
 ) -> CycleSlots {
     let t_ms = i64::from(boundary_secs_of_day) * MS_PER_SEC;
-    let shift = i64::from(rung).saturating_mul(cfg.dhan_ladder_step_ms);
 
-    let mut dhan_chain_slots_ms = [0_i64; ChainUnderlying::COUNT];
-    for (i, slot) in dhan_chain_slots_ms.iter_mut().enumerate() {
-        let offset = cfg.dhan_chain_offsets_ms.get(i).copied().unwrap_or(0);
-        *slot = t_ms.saturating_add(offset).saturating_sub(shift);
-    }
-    let last_primary = dhan_chain_slots_ms[ChainUnderlying::COUNT - 1];
-    let mut dhan_chain_retry_slots_ms = [0_i64; CADENCE_CHAIN_RETRY_SLOTS];
-    for (j, slot) in dhan_chain_retry_slots_ms.iter_mut().enumerate() {
-        // APPROVED: j < 3 — the cast is safe.
-        #[allow(clippy::cast_possible_wrap)]
-        let step = (j as i64 + 1).saturating_mul(cfg.chain_min_spacing_ms);
-        *slot = last_primary.saturating_add(step);
-    }
+    // The Dhan burst second: 3 chains, ALL concurrent (2026-07-16 — the
+    // 3s rule is per-(underlying, expiry); different underlyings fire
+    // together).
+    let burst_ms = t_ms.saturating_add(cfg.dhan_burst_offset_ms);
+    let dhan_chain_slots_ms = [burst_ms; ChainUnderlying::COUNT];
+    // Retries: each failed underlying re-fires at burst + spacing — the
+    // per-(underlying, expiry) gate admits each at exactly +3s
+    // (inclusive boundary), and the combined window holds ≤4 fires there
+    // (3 chain retries + ≤1 spot-grid fire) — never past the cap.
+    let retry_ms = burst_ms.saturating_add(cfg.chain_min_spacing_ms);
+    let dhan_chain_retry_slots_ms = [retry_ms; CADENCE_CHAIN_RETRY_SLOTS];
 
-    // The rung shift + post-close clamp apply to the GROUP BASE; the
-    // concurrency step then spreads the groups 1000ms apart.
-    let spot_base = t_ms
-        .saturating_add(cfg.dhan_spot_start_offset_ms)
-        .saturating_sub(shift)
-        .max(t_ms.saturating_add(cfg.spot_min_post_close_ms));
+    // Spot slots: second buckets from (shape rung × tier step), the base
+    // clamped post-close (structurally inert at the default burst
+    // offset — validate() pins burst ≥ spot_min_post_close).
+    let spot_base = burst_ms.max(t_ms.saturating_add(cfg.spot_min_post_close_ms));
+    let buckets = spot_second_buckets(dhan_shape, spot_step);
     let mut dhan_spot_slots_ms = [0_i64; 4];
     for (k, slot) in dhan_spot_slots_ms.iter_mut().enumerate() {
-        // APPROVED: group index < 4 — the cast is safe.
+        // APPROVED: bucket index ≤ 4 — the cast is safe.
         #[allow(clippy::cast_possible_wrap)]
-        let group_offset =
-            (spot_group_index(spot_step, k) as i64).saturating_mul(CADENCE_SPOT_WINDOW_MS);
-        *slot = spot_base.saturating_add(group_offset);
+        let bucket_offset = (buckets[k] as i64).saturating_mul(CADENCE_SPOT_WINDOW_MS);
+        *slot = spot_base.saturating_add(bucket_offset);
     }
 
     let groww_anchor_ms = t_ms.saturating_add(cfg.groww_anchor_offset_ms);
@@ -334,7 +319,7 @@ pub fn build_cycle_slots(
         boundary_secs_of_day,
         cycle_minute_ist: boundary_secs_of_day.saturating_sub(SECS_PER_CYCLE),
         boundary_ms: t_ms,
-        rung,
+        dhan_shape,
         dhan_chain_slots_ms,
         dhan_chain_retry_slots_ms,
         spot_step,
@@ -367,11 +352,11 @@ mod tests {
     fn test_cadence_expiry_wave_anchor_mid_minute_band_never_burst_window() {
         // R1 (2026-07-15): every IN-SESSION expiry retry wave lands at
         // seconds-of-minute 30 EXACTLY — therefore NEVER inside the
-        // burst region (chain pre-fires from :55, Groww waves :00–:03,
-        // spot group :03, retry grid ≤ :15) — for arbitrary wake phases
-        // and configured intervals. The exact ==30 pin IS the band
-        // assertion (any band check after it would be dead code —
-        // R3 nit, 2026-07-15).
+        // burst region (2026-07-16 shape: Groww waves :00–:03, Dhan
+        // burst seconds 1–2, retry grid ≤ the :15 cutoff) — for
+        // arbitrary wake phases and configured intervals. The exact
+        // ==30 pin IS the band assertion (any band check after it would
+        // be dead code — R3 nit, 2026-07-15).
         for interval in [1_i64, 5_000, 60_000, 90_000, 120_000, 300_000] {
             let mut now = ms(9, 16, 0, 0);
             while now < ms(9, 26, 0, 0) {
@@ -408,16 +393,16 @@ mod tests {
     /// runner's fixed one-minute look-ahead: the LAST pre-era wake
     /// (≤ 09:14:59) slept the PLAIN interval and landed ONE
     /// transitional wave inside the FIRST session cycle's burst window
-    /// (65s @ 09:14:58 → 09:16:03 = the spot-group instant → one false
-    /// `gate_deferred_nominal` page at session entry). The predicate
-    /// now keys on where the PLAIN target would LAND, so the first
-    /// in-era wake snaps to a :30 anchor instead.
+    /// (65s @ 09:14:58 → 09:16:03 = inside the first burst's fire
+    /// region → one false `gate_deferred_nominal` page at session
+    /// entry). The predicate now keys on where the PLAIN target would
+    /// LAND, so the first in-era wake snaps to a :30 anchor instead.
     #[test]
     fn test_expiry_wave_anchor_active_clamps_first_in_era_wake_to_anchor() {
         let now = ms(9, 14, 58, 0);
         let interval = 65_000_i64;
-        // The bug shape: the plain target IS the spot-group instant of
-        // the first session cycle (boundary 09:16:00, spot group T+3s).
+        // The bug shape: the plain target lands inside the first session
+        // cycle's burst window (boundary 09:16:00 + fires within ~T+5s).
         assert_eq!(now + interval, ms(9, 16, 3, 0));
         // The clamp turns the anchor ON for this wake…
         assert!(expiry_wave_anchor_active(now, interval, true));
@@ -446,36 +431,26 @@ mod tests {
 
     #[test]
     fn test_cadence_schedule_rung0_slots_match_operator_table() {
-        // T = 10:00:00 — a mid-session boundary; rung 0 / step 0 /
-        // shape 0 = the operator's nominal table (design §1 + the
-        // 2026-07-15 concurrency-ladder step 0).
+        // T = 10:00:00 — a mid-session boundary; shape 0 / step 0 /
+        // groww 0 = the operator's 2026-07-16 primary table (same-day
+        // correction: "all 7 parallel at first second"): second 1 =
+        // 3 chains + ALL 4 spots concurrent — the spots sit in the
+        // Data-API bucket (4 ≤ 5), the chains in the option-chain API's
+        // own per-(underlying, expiry) budget (two-bucket model).
         let slots = build_cycle_slots(10 * 3600, 0, 0, 0, &cfg());
         assert_eq!(slots.cycle_minute_ist, 10 * 3600 - 60);
-        // Chains :55.0 / :58.0 / :02.0 (pre-close NIFTY/BANKNIFTY, SENSEX
-        // post-close).
-        assert_eq!(
-            slots.dhan_chain_slots_ms,
-            [ms(9, 59, 55, 0), ms(9, 59, 58, 0), ms(10, 0, 2, 0)]
-        );
-        // Chain retries :05 / :08 / :11 (3s-stepped after the last
-        // primary).
-        assert_eq!(
-            slots.dhan_chain_retry_slots_ms,
-            [ms(10, 0, 5, 0), ms(10, 0, 8, 0), ms(10, 0, 11, 0)]
-        );
-        // Spots: step 0 = ALL 4 fired together at :03.0 (the operator's
-        // 2026-07-15 default — 4 SIMULTANEOUS single-symbol calls; both
-        // brokers' candle endpoints are single-symbol-per-request).
+        assert_eq!(slots.dhan_shape, 0);
+        // Chains: ALL THREE concurrent at the burst second T+1.0
+        // (different underlyings are explicitly concurrent — the 3s rule
+        // is per-(underlying, expiry) only).
+        assert_eq!(slots.dhan_chain_slots_ms, [ms(10, 0, 1, 0); 3]);
+        // Chain retries: all at burst + 3s = T+4.0 (per-key gates admit
+        // each at exactly +3s; chains never touch the Data-API ring).
+        assert_eq!(slots.dhan_chain_retry_slots_ms, [ms(10, 0, 4, 0); 3]);
+        // Spots: ALL FOUR share the burst second with the 3 chains —
+        // the operator's all-7 primary.
         assert_eq!(slots.spot_step, 0);
-        assert_eq!(
-            slots.dhan_spot_slots_ms,
-            [
-                ms(10, 0, 3, 0),
-                ms(10, 0, 3, 0),
-                ms(10, 0, 3, 0),
-                ms(10, 0, 3, 0)
-            ]
-        );
+        assert_eq!(slots.dhan_spot_slots_ms, [ms(10, 0, 1, 0); 4]);
         // Groww shape 0 (choice 1): all waves at T+0, verdict at T+800.
         assert_eq!(slots.groww_shape, 0);
         assert_eq!(slots.groww_chain_wave_ms, ms(10, 0, 0, 0));
@@ -489,64 +464,99 @@ mod tests {
     }
 
     #[test]
+    fn test_cadence_schedule_rung1_split_fallback_slots() {
+        // Shape rung 1 (the operator's 2026-07-16 fallback): second 1 =
+        // 3 chains only; second 2 = ALL 4 spots.
+        let slots = build_cycle_slots(10 * 3600, 1, 0, 0, &cfg());
+        assert_eq!(slots.dhan_shape, 1);
+        assert_eq!(slots.dhan_chain_slots_ms, [ms(10, 0, 1, 0); 3]);
+        assert_eq!(slots.dhan_chain_retry_slots_ms, [ms(10, 0, 4, 0); 3]);
+        assert_eq!(slots.dhan_spot_slots_ms, [ms(10, 0, 2, 0); 4]);
+        // The chain slots are IDENTICAL across rungs — the shape ladder
+        // reshapes only the SPOT packing (chains are per-key-gated, not
+        // rescheduled).
+        let s0 = build_cycle_slots(10 * 3600, 0, 0, 0, &cfg());
+        assert_eq!(s0.dhan_chain_slots_ms, slots.dhan_chain_slots_ms);
+        assert_eq!(
+            s0.dhan_chain_retry_slots_ms,
+            slots.dhan_chain_retry_slots_ms
+        );
+    }
+
+    #[test]
     fn test_cadence_schedule_spot_concurrency_groupings_per_step() {
-        // The 2026-07-15 spot-concurrency ladder: groups fire at
-        // consecutive 1000ms-spaced anchors from the spot anchor slot.
+        // The 2026-07-15 spot-concurrency tiers compose with the
+        // 2026-07-16 shape rungs via the per-second-group bucket fill.
         let c = cfg();
-        // Step 1: 3 at :03.0 + 1 (VIX, the advisory) at :04.0.
+        // Shape 0: tier degradation happens WITHIN the burst group,
+        // greedy overflow spilling to the next 1000ms buckets; tier 3
+        // spills to singles T+1/2/3/4.
         let s1 = build_cycle_slots(10 * 3600, 0, 1, 0, &c);
         assert_eq!(
             s1.dhan_spot_slots_ms,
             [
-                ms(10, 0, 3, 0),
-                ms(10, 0, 3, 0),
-                ms(10, 0, 3, 0),
-                ms(10, 0, 4, 0)
+                ms(10, 0, 1, 0),
+                ms(10, 0, 1, 0),
+                ms(10, 0, 1, 0),
+                ms(10, 0, 2, 0)
             ]
         );
-        // Step 2: 2+2 at :03.0 / :04.0.
         let s2 = build_cycle_slots(10 * 3600, 0, 2, 0, &c);
         assert_eq!(
             s2.dhan_spot_slots_ms,
             [
-                ms(10, 0, 3, 0),
-                ms(10, 0, 3, 0),
-                ms(10, 0, 4, 0),
-                ms(10, 0, 4, 0)
+                ms(10, 0, 1, 0),
+                ms(10, 0, 1, 0),
+                ms(10, 0, 2, 0),
+                ms(10, 0, 2, 0)
             ]
         );
-        // Step 3: fully sequential singles :03.0 / :04.0 / :05.0 / :06.0.
         let s3 = build_cycle_slots(10 * 3600, 0, 3, 0, &c);
         assert_eq!(
             s3.dhan_spot_slots_ms,
             [
+                ms(10, 0, 1, 0),
+                ms(10, 0, 2, 0),
+                ms(10, 0, 3, 0),
+                ms(10, 0, 4, 0)
+            ]
+        );
+        // Shape 1: tier degradation happens WITHIN second 2, spilling
+        // overflow to later seconds (per-second-group tier math).
+        let r1s1 = build_cycle_slots(10 * 3600, 1, 1, 0, &c);
+        assert_eq!(
+            r1s1.dhan_spot_slots_ms,
+            [
+                ms(10, 0, 2, 0),
+                ms(10, 0, 2, 0),
+                ms(10, 0, 2, 0),
+                ms(10, 0, 3, 0)
+            ]
+        );
+        let r1s2 = build_cycle_slots(10 * 3600, 1, 2, 0, &c);
+        assert_eq!(
+            r1s2.dhan_spot_slots_ms,
+            [
+                ms(10, 0, 2, 0),
+                ms(10, 0, 2, 0),
+                ms(10, 0, 3, 0),
+                ms(10, 0, 3, 0)
+            ]
+        );
+        let r1s3 = build_cycle_slots(10 * 3600, 1, 3, 0, &c);
+        assert_eq!(
+            r1s3.dhan_spot_slots_ms,
+            [
+                ms(10, 0, 2, 0),
                 ms(10, 0, 3, 0),
                 ms(10, 0, 4, 0),
-                ms(10, 0, 5, 0),
-                ms(10, 0, 6, 0)
+                ms(10, 0, 5, 0)
             ]
         );
-        // The RUNG SHIFT still applies to the group base (rung 1 step 1:
-        // groups at :02.0 / :03.0)…
-        let r1s1 = build_cycle_slots(10 * 3600, 1, 1, 0, &c);
-        assert_eq!(r1s1.dhan_spot_slots_ms[0], ms(10, 0, 2, 0));
-        assert_eq!(r1s1.dhan_spot_slots_ms[3], ms(10, 0, 3, 0));
-        // …and so does the POST-CLOSE CLAMP (rung 5 step 3: base clamps
-        // at T+300, singles :00.3 / :01.3 / :02.3 / :03.3 — never
-        // pre-close on any step).
-        let r5s3 = build_cycle_slots(10 * 3600, 5, 3, 0, &c);
-        assert_eq!(
-            r5s3.dhan_spot_slots_ms,
-            [
-                ms(10, 0, 0, 300),
-                ms(10, 0, 1, 300),
-                ms(10, 0, 2, 300),
-                ms(10, 0, 3, 300)
-            ]
-        );
-        // Even the LAST single of the deepest step + a full retry round
-        // (window-stepped appends) sits inside the :15 Dhan cutoff.
-        assert!(s3.dhan_spot_slots_ms[3] + 4 * 1_000 <= s3.dhan_cutoff_ms);
+        // Even the LAST single of the deepest shape × tier + a full
+        // retry round (window-stepped appends) sits inside the :15 Dhan
+        // cutoff.
+        assert!(r1s3.dhan_spot_slots_ms[3] + 4 * 1_000 <= r1s3.dhan_cutoff_ms);
     }
 
     #[test]
@@ -587,62 +597,62 @@ mod tests {
     }
 
     #[test]
-    fn test_cadence_schedule_rung_shift_preserves_chain_gaps() {
-        // The wholesale −1000·r shift keeps the pairwise 3.0s/4.0s gaps
-        // shift-invariant on EVERY rung, and the retry grid stays 3s-
-        // stepped after the rung's last primary (design §1 rung map).
+    fn test_cadence_schedule_burst_packing_never_exceeds_broker_cap() {
+        // 2026-07-16 cap reconciliation (two-bucket model, same-day
+        // all-7 correction): at EVERY (shape × tier) permutation, no
+        // single second carries more than 4 SPOT fires — the Data-API
+        // bucket (4 ≤ the broker's 5/sec cap, with one slot of expiry
+        // headroom). The 3 concurrent chains sit in the option-chain
+        // API's OWN per-(underlying, expiry) budget and never count
+        // against the Data-API bucket.
         let c = cfg();
-        for rung in 0..=5u8 {
-            let slots = build_cycle_slots(10 * 3600, rung, 0, 0, &c);
-            let [n, b, s] = slots.dhan_chain_slots_ms;
-            assert_eq!(b - n, 3_000, "rung {rung}: NIFTY→BANKNIFTY gap");
-            assert_eq!(s - b, 4_000, "rung {rung}: BANKNIFTY→SENSEX gap");
-            // The rung-r NIFTY anchor is exactly 1000·r earlier.
-            assert_eq!(n, ms(9, 59, 55, 0) - i64::from(rung) * 1_000);
-            // Retry grid: last primary + 3/6/9s.
-            assert_eq!(
-                slots.dhan_chain_retry_slots_ms,
-                [s + 3_000, s + 6_000, s + 9_000]
-            );
+        for shape in 0..=1u8 {
+            for step in 0..=3u8 {
+                let s = build_cycle_slots(10 * 3600, shape, step, 0, &c);
+                let burst = s.dhan_chain_slots_ms[0];
+                for probe in 0..=5i64 {
+                    let second = burst + probe * 1_000;
+                    let spots = s
+                        .dhan_spot_slots_ms
+                        .iter()
+                        .filter(|m| **m == second)
+                        .count();
+                    assert!(
+                        spots <= 4,
+                        "shape {shape} step {step} second {second}: {spots} spots"
+                    );
+                }
+                // Every chain fires concurrently at the burst instant.
+                assert_eq!(s.dhan_chain_slots_ms, [burst; 3]);
+                // All fires are POST-close — no pre-fire exists anymore.
+                for slot in s
+                    .dhan_chain_slots_ms
+                    .iter()
+                    .chain(s.dhan_spot_slots_ms.iter())
+                {
+                    assert!(*slot > s.boundary_ms, "post-close only");
+                }
+            }
         }
-        // Rung 5 spot-check against the design's literal row:
-        // chains :50.0/:53.0/:57.0, retries :00/:03/:06.
-        let r5 = build_cycle_slots(10 * 3600, 5, 0, 0, &c);
-        assert_eq!(
-            r5.dhan_chain_slots_ms,
-            [ms(9, 59, 50, 0), ms(9, 59, 53, 0), ms(9, 59, 57, 0)]
-        );
-        assert_eq!(
-            r5.dhan_chain_retry_slots_ms,
-            [ms(10, 0, 0, 0), ms(10, 0, 3, 0), ms(10, 0, 6, 0)]
-        );
     }
 
     #[test]
     fn test_cadence_schedule_spot_clamp_never_pre_close() {
-        let c = cfg();
-        // Rungs 0..=2 shift the spot base normally (:03 → :02 → :01)…
-        assert_eq!(
-            build_cycle_slots(10 * 3600, 1, 0, 0, &c).dhan_spot_slots_ms[0],
-            ms(10, 0, 2, 0)
-        );
-        assert_eq!(
-            build_cycle_slots(10 * 3600, 2, 0, 0, &c).dhan_spot_slots_ms[0],
-            ms(10, 0, 1, 0)
-        );
-        // …rungs 3..=5 CLAMP at T+300 (the just-closed candle cannot
-        // exist pre-close): the whole step-0 group at :00.3.
-        for rung in 3..=5u8 {
-            let slots = build_cycle_slots(10 * 3600, rung, 0, 0, &c);
-            assert_eq!(
-                slots.dhan_spot_slots_ms,
-                [ms(10, 0, 0, 300); 4],
-                "rung {rung} must clamp at T+300"
-            );
-            // Never pre-close, on ANY rung and ANY concurrency step.
+        // The post-close clamp is structural at the default config
+        // (burst 1000 ≥ min_post_close 300) but must hold under raw
+        // config drift: a burst offset BELOW the spot floor clamps the
+        // spot base (chains keep the raw burst — they are live
+        // snapshots, not just-closed candles).
+        let mut c = cfg();
+        c.dhan_burst_offset_ms = 100;
+        let s = build_cycle_slots(10 * 3600, 0, 0, 0, &c);
+        assert_eq!(s.dhan_chain_slots_ms, [ms(10, 0, 0, 100); 3]);
+        assert_eq!(s.dhan_spot_slots_ms, [ms(10, 0, 0, 300); 4]);
+        // Never pre-close, on ANY shape and ANY concurrency step.
+        for shape in 0..=1u8 {
             for step in 0..=3u8 {
-                for slot in build_cycle_slots(10 * 3600, rung, step, 0, &c).dhan_spot_slots_ms {
-                    assert!(slot >= slots.boundary_ms + 300);
+                for slot in build_cycle_slots(10 * 3600, shape, step, 0, &c).dhan_spot_slots_ms {
+                    assert!(slot >= s.boundary_ms + 300);
                 }
             }
         }
@@ -686,39 +696,31 @@ mod tests {
     #[test]
     fn test_cadence_schedule_next_joinable_boundary_no_mid_cycle_join() {
         let c = cfg();
-        // 09:59:56.0 — the 10:00:00 cycle's :55 pre-fire ALREADY began
-        // (rung 0 anchor = 09:59:55) → a booting process must skip to
-        // 10:01:00.
+        // All fires are POST-close (2026-07-16): the earliest fire of
+        // the 10:00:00 cycle is the Groww burst at T+0 exactly — a boot
+        // AT 10:00:00.000 must skip to 10:01:00…
+        let now = ms_of(10, 0, 0, 0);
+        assert_eq!(next_joinable_boundary(now, None, &c), Some(36_060));
+        // …while a boot 1ms earlier still joins 10:00:00.
+        let now = ms_of(9, 59, 59, 999);
+        assert_eq!(next_joinable_boundary(now, None, &c), Some(36_000));
+        // No pre-close fire exists anymore: even :56 of the previous
+        // minute joins the imminent boundary (the retired :55 pre-fire
+        // would have forced a skip here).
         let now = ms_of(9, 59, 56, 0);
-        assert_eq!(next_joinable_boundary(now, None, 0, &c), Some(36_060));
-        // 09:59:54.0 — the anchor is still in the future → 10:00:00 joins.
-        let now = ms_of(9, 59, 54, 0);
-        assert_eq!(next_joinable_boundary(now, None, 0, &c), Some(36_000));
-        // Rung 5 widens the pre-fire to :50 — 09:59:51 must skip.
-        let now = ms_of(9, 59, 51, 0);
-        assert_eq!(next_joinable_boundary(now, None, 5, &c), Some(36_060));
+        assert_eq!(next_joinable_boundary(now, None, &c), Some(36_000));
         // Strictly-after-last: an instant-completing cycle never
         // re-selects its own boundary.
         let now = ms_of(10, 0, 20, 0);
-        assert_eq!(
-            next_joinable_boundary(now, Some(36_000), 0, &c),
-            Some(36_060)
-        );
+        assert_eq!(next_joinable_boundary(now, Some(36_000), &c), Some(36_060));
         // Past the session window → None.
         let now = ms_of(15, 30, 1, 0);
-        assert_eq!(next_joinable_boundary(now, Some(55_800), 0, &c), None);
+        assert_eq!(next_joinable_boundary(now, Some(55_800), &c), None);
     }
 
     /// Helper alias for the joinable-boundary vectors.
     fn ms_of(h: i64, m: i64, s: i64, milli: i64) -> i64 {
         ((h * 3600 + m * 60 + s) * 1_000) + milli
-    }
-
-    #[test]
-    fn test_cadence_schedule_earliest_prefire_offset_ms_tracks_rung() {
-        let c = cfg();
-        assert_eq!(earliest_prefire_offset_ms(0, &c), -5_000);
-        assert_eq!(earliest_prefire_offset_ms(5, &c), -10_000);
     }
 
     #[test]

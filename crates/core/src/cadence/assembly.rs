@@ -235,8 +235,8 @@ impl LaneAssembly {
     }
 
     /// TRUE when ANY resolved cell is non-own-provenance (the decision is
-    /// stamped `DecidedDegraded`, never hidden — incl. the deliberate
-    /// pre-close-chain ↔ post-close-spot mix, design §5).
+    /// stamped `DecidedDegraded`, never hidden — cross-fill and
+    /// chain-embedded fallbacks, design §5).
     #[must_use]
     pub fn any_degraded_provenance(&self) -> bool {
         self.chains
@@ -285,9 +285,9 @@ impl LaneAssembly {
 
     /// Second rung: cross-fill still-missing cells from the OTHER lane's
     /// same-cycle assembly, freshness-checked per [`cross_fill_fresh`]
-    /// against the caller-supplied `freshness_floor_abs_ms` (the
-    /// LENDER-aware floor from [`cross_fill_freshness_floor_ms`] —
-    /// CADENCE-XFILL-RUNG-1, 2026-07-15). Returns
+    /// against the caller-supplied `freshness_floor_abs_ms` (the base
+    /// floor from [`cross_fill_freshness_floor_ms`] — simplified
+    /// 2026-07-16 with the pre-close schedule's retirement). Returns
     /// `(spots_filled, chains_filled)`.
     pub fn cross_fill_from(
         &mut self,
@@ -341,13 +341,11 @@ impl LaneAssembly {
 /// a foreign snapshot is valid iff its `minute_ts` equals the borrowing
 /// cycle's minute AND it was fetched at/after `freshness_floor_abs_ms`
 /// AND the borrow happens at/before the borrowing lane's cutoff. The
-/// floor is the LENDER-aware absolute instant from
-/// [`cross_fill_freshness_floor_ms`]: the base T − 5000ms window,
-/// widened when the Dhan anchor ladder has shifted the lender's chains
-/// earlier (CADENCE-XFILL-RUNG-1, 2026-07-15) — so it always spans
-/// Dhan's ACTUAL scheduled pre-close chains AND Groww's POST-close :00
-/// burst; any pre-close-chain ↔ post-close-spot mix is stamped
-/// `DecidedDegraded`, never hidden. Pure.
+/// floor is the absolute instant from
+/// [`cross_fill_freshness_floor_ms`]: the plain base T − 5000ms window
+/// (2026-07-16 — every fire on both lanes is POST-close, so same-cycle
+/// completions trivially pass; the floor belts against cross-CYCLE
+/// staleness). Pure.
 #[must_use]
 pub fn cross_fill_fresh(
     foreign_minute_ist: u32,
@@ -362,34 +360,20 @@ pub fn cross_fill_fresh(
         && now_ms <= borrowing_cutoff_abs_ms
 }
 
-/// The LENDER-aware cross-fill freshness floor (absolute IST ms-of-day)
-/// for borrowing FROM `lender_feed` in the cycle described by `slots`
-/// (CADENCE-XFILL-RUNG-1, 2026-07-15). Base = T − 5000ms
-/// ([`CADENCE_CROSS_FILL_FRESHNESS_FLOOR_MS`]). When the lender is the
-/// DHAN lane the floor widens to the lane's EARLIEST scheduled chain
-/// pre-fire: the anchor ladder shifts the chain slots wholesale by
-/// −1000·rung ms (rung ≥ 1 fires NIFTY at T − 5000 − rung·step), and a
-/// fixed floor would refuse those same-minute chains as "stale" while
-/// the SAME data drives Dhan's OWN decision — an inconsistent staleness
-/// standard. The Groww lender (post-close :00 burst, never rung-shifted)
-/// keeps the base floor. Completions at/after their own scheduled fire
-/// instant therefore always pass the floor regardless of rung. Pure.
+/// The cross-fill freshness floor (absolute IST ms-of-day) for the
+/// cycle described by `slots`: the plain base T − 5000ms
+/// ([`CADENCE_CROSS_FILL_FRESHNESS_FLOOR_MS`]). SIMPLIFIED 2026-07-16
+/// (coordinator addendum item 3): retiring the pre-close schedule + the
+/// anchor-shift ladder removed the rung-shifted PRE-fires the
+/// lender-aware widening (CADENCE-XFILL-RUNG-1, 2026-07-15) was built
+/// around — every fire on both lanes is POST-close now, so any
+/// same-cycle completion trivially satisfies the base floor and the
+/// floor is a belt against cross-CYCLE staleness only. Pure.
 #[must_use]
-pub fn cross_fill_freshness_floor_ms(slots: &CycleSlots, lender_feed: Feed) -> i64 {
-    let base = slots
+pub fn cross_fill_freshness_floor_ms(slots: &CycleSlots) -> i64 {
+    slots
         .boundary_ms
-        .saturating_sub(CADENCE_CROSS_FILL_FRESHNESS_FLOOR_MS);
-    if lender_feed == Feed::Dhan {
-        let earliest_chain = slots
-            .dhan_chain_slots_ms
-            .iter()
-            .copied()
-            .min()
-            .unwrap_or(base);
-        base.min(earliest_chain)
-    } else {
-        base
-    }
+        .saturating_sub(CADENCE_CROSS_FILL_FRESHNESS_FLOOR_MS)
 }
 
 /// One underlying's moneyness classification counts over the registry
@@ -487,6 +471,39 @@ pub fn chain_snapshot_fresh_for_cycle(
         return false;
     }
     (0..=CADENCE_CHAIN_SNAPSHOT_MAX_AGE_SECS).contains(&snap.age_secs(now_ist_nanos))
+}
+
+/// The CHAIN-ROW moneyness anchor (R5, 2026-07-16): the chain's OWN
+/// embedded underlying spot FIRST (same-response coherence — the
+/// embedded `last_price` is same-instant with the rows it anchors),
+/// the lane's resolved spot cell as the FALLBACK, Unknown-anchor
+/// `(0, 0)` last. The OwnFetch spot serves the SPOT SERIES, not chain
+/// moneyness. Either returned operand may be 0 (guard failed /
+/// unresolvable step), in which case every row classifies Unknown —
+/// SURFACED, never dropped (the total-classifier contract).
+///
+/// # Performance
+/// O(1), zero allocation (one guarded paise conversion + one grid
+/// round per call; cold decide-time path).
+#[must_use]
+pub fn chain_moneyness_anchor(
+    underlying: ChainUnderlying,
+    chain: Option<&ChainCell>,
+    spot: Option<&SpotCell>,
+) -> (i64, i64) {
+    if let Some(embedded) = chain.and_then(|c| c.embedded_spot)
+        && let Some(spot_paise) = price_to_paise_guarded(embedded)
+        && spot_paise > 0
+    {
+        let atm_paise = strike_step_paise(underlying.as_str())
+            .and_then(|step| atm_strike_paise(spot_paise, step))
+            .unwrap_or(0);
+        return (spot_paise, atm_paise);
+    }
+    // Fallback: the lane's resolved spot cell (own fetch / cross-fill /
+    // chain-embedded fill) — paise + ATM were computed once at record
+    // time; absent cell = the Unknown anchor.
+    spot.map_or((0, 0), |s| (s.spot_paise, s.atm_paise))
 }
 
 /// GUARDED decide-time fold over the resolved chain cell (design §5/§6):
@@ -599,9 +616,10 @@ mod tests {
     const BASE_FLOOR_MS: i64 = T_MS - CADENCE_CROSS_FILL_FRESHNESS_FLOOR_MS;
 
     #[test]
-    fn test_cross_source_freshness_window_pre_close_chain_post_close_spot() {
-        // Dhan's :55 pre-close chain (fetched T−5000) IS fresh for the
-        // borrowing lane's same cycle — the window deliberately spans it.
+    fn test_cross_source_freshness_window_spans_the_base_floor() {
+        // Data fetched at the floor edge (T−5000) IS fresh for the
+        // borrowing lane's same cycle — the window deliberately keeps
+        // the 5s slack even though every 2026-07-16 fire is post-close.
         assert!(cross_fill_fresh(
             MINUTE,
             MINUTE,
@@ -610,7 +628,7 @@ mod tests {
             T_MS + 900,
             T_MS + 6_000
         ));
-        // Groww's :00 post-close spot likewise.
+        // Groww's :00 spot (all fires are post-close) likewise.
         assert!(cross_fill_fresh(
             MINUTE,
             MINUTE,
@@ -649,60 +667,55 @@ mod tests {
     }
 
     #[test]
-    fn test_cross_fill_freshness_floor_ms_is_rung_aware_for_dhan_lender() {
-        // CADENCE-XFILL-RUNG-1 (2026-07-15): the borrow floor must span
-        // the LENDER's actual scheduled pre-fire. At rung 0 the floor is
-        // the base T − 5000; at rung r the Dhan chains fire wholesale
-        // −1000·r earlier, so the floor widens with them. The Groww
-        // lender (post-close, never rung-shifted) keeps the base floor.
+    fn test_cross_fill_freshness_floor_ms_is_the_plain_base_floor() {
+        // 2026-07-16 (coordinator addendum item 3): the lender-aware
+        // widening (CADENCE-XFILL-RUNG-1) retired with the pre-close
+        // schedule — the floor is the PLAIN base T − 5000 for every
+        // shape/tier permutation, and every POST-close completion
+        // (fetched at/after its own scheduled fire ≥ T+0) trivially
+        // passes it.
         use super::super::schedule::build_cycle_slots;
         use tickvault_common::config::CadenceConfig;
         let cfg = CadenceConfig::default();
         let boundary_secs = 10 * 3600; // 10:00:00 IST — matches T_MS.
 
-        let slots0 = build_cycle_slots(boundary_secs, 0, 0, 0, &cfg);
-        assert_eq!(
-            cross_fill_freshness_floor_ms(&slots0, Feed::Dhan),
-            BASE_FLOOR_MS,
-            "rung 0: floor == the base T − 5000"
-        );
-        assert_eq!(
-            cross_fill_freshness_floor_ms(&slots0, Feed::Groww),
-            BASE_FLOOR_MS,
-            "Groww lender: base floor at every rung"
-        );
-
-        let slots3 = build_cycle_slots(boundary_secs, 3, 0, 0, &cfg);
-        assert_eq!(
-            cross_fill_freshness_floor_ms(&slots3, Feed::Dhan),
-            T_MS - 8_000,
-            "rung 3: NIFTY pre-fires at T − 5000 − 3·1000 — the floor spans it"
-        );
-        assert_eq!(
-            cross_fill_freshness_floor_ms(&slots3, Feed::Groww),
-            BASE_FLOOR_MS,
-            "the Groww lender floor is rung-independent"
-        );
-
-        // The rung-3 Dhan NIFTY completion (fetched at/after its own
-        // scheduled fire) is FRESH under the widened floor and would be
-        // WRONGLY refused under the fixed base floor — the exact
-        // CADENCE-XFILL-RUNG-1 failure shape.
-        let rung3_fetch = T_MS - 7_900;
+        for shape in 0..=1u8 {
+            for step in 0..=3u8 {
+                let slots = build_cycle_slots(boundary_secs, shape, step, 0, &cfg);
+                assert_eq!(
+                    cross_fill_freshness_floor_ms(&slots),
+                    BASE_FLOOR_MS,
+                    "shape {shape} step {step}: the floor is the plain base"
+                );
+                // Every scheduled fire instant is post-close, so a
+                // completion at its own slot always clears the floor.
+                for slot in slots
+                    .dhan_chain_slots_ms
+                    .iter()
+                    .chain(slots.dhan_spot_slots_ms.iter())
+                {
+                    assert!(*slot >= BASE_FLOOR_MS);
+                }
+            }
+        }
+        // A same-minute completion at T+900 is FRESH under the base
+        // floor; a PREVIOUS-cycle leftover (fetched a minute earlier)
+        // is refused — the cross-CYCLE staleness belt the floor exists
+        // for.
         assert!(cross_fill_fresh(
             MINUTE,
             MINUTE,
-            rung3_fetch,
-            cross_fill_freshness_floor_ms(&slots3, Feed::Dhan),
             T_MS + 900,
+            BASE_FLOOR_MS,
+            T_MS + 1_000,
             T_MS + 6_000
         ));
         assert!(!cross_fill_fresh(
             MINUTE,
             MINUTE,
-            rung3_fetch,
+            T_MS - 59_000,
             BASE_FLOOR_MS,
-            T_MS + 900,
+            T_MS + 1_000,
             T_MS + 6_000
         ));
     }
@@ -1002,5 +1015,72 @@ mod tests {
         );
         assert_eq!(fold, MoneynessFold::default());
         assert!(fold.all_unknown(), "an unconfirmed publish is unusable");
+    }
+
+    #[test]
+    fn test_chain_moneyness_anchor_prefers_embedded_spot_then_own_fetch_then_unknown() {
+        // R5 (2026-07-16): chain rows anchor on the chain's OWN embedded
+        // underlying spot FIRST — the OwnFetch spot cell serves the spot
+        // series, not chain moneyness.
+        let mut a = asm(Feed::Dhan);
+        // OwnFetch spot at 24_500 vs a chain-embedded spot at 25_000 —
+        // the anchor must be the EMBEDDED value (25_000.00 → 2_500_000
+        // paise; NIFTY step 50_00 paise ⇒ ATM 2_500_000).
+        a.record_spot(
+            SpotTarget::Nifty,
+            24_500.0,
+            SpotProvenance::OwnFetch,
+            T_MS + 200,
+            MINUTE,
+        );
+        a.record_chain(
+            ChainUnderlying::Nifty,
+            own_chain(Feed::Dhan, MINUTE, T_MS + 100, Some(25_000.0)),
+        );
+        let (spot, atm) = chain_moneyness_anchor(
+            ChainUnderlying::Nifty,
+            a.chain(ChainUnderlying::Nifty),
+            a.spot(ChainUnderlying::Nifty),
+        );
+        assert_eq!(spot, 2_500_000, "embedded spot wins over the OwnFetch cell");
+        assert_eq!(atm, 2_500_000, "ATM derives from the EMBEDDED anchor");
+
+        // Fallback: no embedded spot ⇒ the resolved spot cell's
+        // record-time (paise, ATM).
+        let mut b = asm(Feed::Dhan);
+        b.record_spot(
+            SpotTarget::Nifty,
+            24_500.0,
+            SpotProvenance::OwnFetch,
+            T_MS + 200,
+            MINUTE,
+        );
+        b.record_chain(
+            ChainUnderlying::Nifty,
+            own_chain(Feed::Dhan, MINUTE, T_MS + 100, None),
+        );
+        let (spot, atm) = chain_moneyness_anchor(
+            ChainUnderlying::Nifty,
+            b.chain(ChainUnderlying::Nifty),
+            b.spot(ChainUnderlying::Nifty),
+        );
+        assert_eq!(spot, 2_450_000, "OwnFetch fallback when no embedded spot");
+        assert_eq!(atm, 2_450_000);
+
+        // An INVALID embedded spot (NaN — guard fails) also falls back,
+        // never a poisoned anchor.
+        let (spot, _) = chain_moneyness_anchor(
+            ChainUnderlying::Nifty,
+            Some(&own_chain(Feed::Dhan, MINUTE, T_MS + 100, Some(f64::NAN))),
+            b.spot(ChainUnderlying::Nifty),
+        );
+        assert_eq!(spot, 2_450_000, "NaN embedded spot falls back to the cell");
+
+        // Unknown LAST: no chain, no spot ⇒ the (0, 0) anchor — every
+        // row then classifies Unknown (total, surfaced, never dropped).
+        assert_eq!(
+            chain_moneyness_anchor(ChainUnderlying::Nifty, None, None),
+            (0, 0)
+        );
     }
 }

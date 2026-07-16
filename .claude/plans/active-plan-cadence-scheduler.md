@@ -11,11 +11,13 @@
 
 > **Honest 100% claim (envelope-qualified per operator-charter §F):**
 > 100% inside the tested envelope, with ratcheted regression coverage:
-> zero-429 is a STRUCTURAL property of the monotonic CAS gates (per-UL +
-> global chain gates 3000ms, dhan spot ROLLING-1000ms-WINDOW gate ≤
-> spot_window_cap — 2026-07-15 gate change) proven by the
+> zero-429 is a STRUCTURAL property of the monotonic CAS gates
+> (per-(underlying, expiry) chain gate 3000ms, dhan spot
+> ROLLING-1000ms-WINDOW gate ≤ spot_window_cap, the combined cap-5
+> rolling-second ring — the 2026-07-16 binding cadence-lane pacing per
+> coordinator ruling A) proven by the
 > deterministic replay proptest across 64-cycle permutations of skew,
-> jitter, GC pauses, latencies, failures, ladder walks (anchor rung +
+> jitter, GC pauses, latencies, failures, ladder walks (Dhan shape rung +
 > concurrency step + Groww shape) and restarts;
 > the decide-path read is DHAT-pinned zero-alloc/O(1); default-OFF
 > config gate means byte-identical behavior until the operator flips
@@ -155,6 +157,75 @@ counter. Unnumbered: `dhan_spot_start_offset_ms` +
 TRUTH DELEGATION (pending) recorded in the rule file naming the 3
 duplicate expiry-selection sites to be delegated to the policy module.
 
+**2026-07-16 POST-CLOSE BURST RESHAPE (operator directive 2026-07-16,
+relayed via the coordinator; verbatim quote + full contract in
+`cadence-error-codes.md` §0b):** the Dhan lane moves ENTIRELY POST-CLOSE
+and the pre-close machinery retires. The new cadence per minute close T:
+
+| Broker | Rung | Second 1 (T+1s Dhan / T+0 Groww) | Second 2 | Second 3 |
+|---|---|---|---|---|
+| Dhan | 0 (primary) | ALL 7 CONCURRENT — 3 chains + all 4 spots (the same-day all-7 correction; two-bucket cap-legal) | — | — |
+| Dhan | 1 (fallback) | 3 chains concurrent | ALL 4 spots | — |
+| Groww | 0 (primary) | all 7 parallel at T+0 | — | — |
+| Groww | 1 (fallback) | chains :01 | all 4 spots :02 | — |
+| Groww | 2 (retained last resort — coordinator addendum item 1) | chains :01 | core spots :02 | VIX alone :03 |
+
+RETIRED: the :55/:58/:02 pre-close chain instants
+(`dhan_chain_offsets_ms`), the T+3s spot anchor
+(`dhan_spot_start_offset_ms`), the anchor-shift failure ladder
+(`LadderState`/`CycleVerdict`/`next_rung`/`dhan_ladder_step_ms`/
+`dhan_ladder_max_rungs`/`recovery_mode`), the GLOBAL 3s chain gate (the
+directive: the 3s rule binds the SAME chain expiry only — different
+underlyings are explicitly concurrent), and the lender-aware cross-fill
+floor widening (CADENCE-XFILL-RUNG-1 — plain base T−5000 now; addendum
+item 3). REPLACED BY: `dhan_burst_offset_ms` (default 1000) + a Dhan
+SHAPE `StreakLadder` (rung 0⇄1, same 2-dirty/3-clean streaks as the
+concurrency ladders; stage `dhan_shape_shift`, gauge
+`tv_cadence_dhan_shape_step`, counter
+`tv_cadence_dhan_shape_shifts_total`; the `ladder_exhausted` CADENCE-01
+edge keeps firing on a dirty cycle AT the fallback rung). The spot tiers
+compose with the shape via the pure `spot_second_buckets(shape, tier)`
+per-second-group bucket math (addendum item 4), proptested per
+(shape × tier × failure) permutation in the replay proof. PACING
+(coordinator ruling A): cadence fires are governed by the combined cap-5
+ring — NOT routed through the shared 3 rps `dhan_data_api_limiter`
+(which stays the authority for the legacy per-minute paths; mirrored
+dated note in `rest-1m-pipeline-error-codes.md` §2f). COEXISTENCE
+(coordinator ruling B): `AppConfig::validate()` fail-closes cadence
+enabled + a broker lane active + that broker's per-minute capture legs
+enabled (mutual exclusion, tested both directions); full subsumption is
+the flagged follow-up. Decisions unchanged (event-driven, Groww 6000ms /
+Dhan 15000ms cutoffs, exactly-once latch, VIX advisory).
+
+**2026-07-16 SAME-DAY RULING CORRECTIONS (coordinator-relayed operator
+verbatim; full quotes in `cadence-error-codes.md` §0b):**
+(1) *"i clearly told you for dhan also as the primary all 7 parallel at
+first second one and only when it fails or rate limited alone only then
+this option chain first second and spot second."* — Dhan rung 0 = ALL 7
+concurrent at the burst second (the interim 5+2 packing is RETIRED as
+primary; `spot_second_buckets` shape-0 base = `[0,0,0,0]`). Cap-legal
+via the TWO-BUCKET model: the combined rolling-1000ms cap-5 ring is
+RE-SCOPED to SPOT + EXPIRY-LIST fires only (Data-API bucket, 4 ≤ 5);
+CHAIN fires are governed SOLELY by the per-(underlying, expiry) ≥3s CAS
+gate (the option-chain API's own budget — different underlyings
+explicitly concurrent).
+(2) *"see that too instantly dont commit — one and only when you tried
+that multiple times and gets rate limited alone alone fallback."* —
+`RateLimited` is the SOLE ladder-arming class (Timeout / Transport /
+Empty / QueueDelay never reshape); "multiple times" = the existing
+2-consecutive-dirty-cycles trigger; and a rate-limited leg KEEPS its ONE
+bounded in-cycle retry through the gates (reversing the first pass's
+"429 never blind-retried in-cycle" rule) — one retry per leg per cycle,
+never more.
+ALSO landed with the corrections: R5 — chain-row moneyness anchors the
+chain's OWN embedded underlying spot FIRST (assembly
+`chain_moneyness_anchor`: chain-embedded → OwnFetch fallback → Unknown
+last; wired into the decide-time fold); R6 — the expiry cross-broker
+disagreement is a REAL typed `CadenceExpiryDisagreement` HIGH Telegram
+page (edge-latched once per underlying per day; sink threaded
+boot → `CadenceRunnerDeps.notifier`; dated authority row in
+`dhan-rest-only-noise-lock-2026-07-14.md` §2.2).
+
 ## Edge Cases
 
 Minute-boundary races (wake at T±ε — no double fire, latch on
@@ -233,32 +304,33 @@ decision double-latch (structurally unreachable) is a coded CADENCE-03
 
 Full judge-locked matrix: unit tests inline per module
 (test_cadence_schedule_rung0_slots_match_operator_table,
-test_cadence_schedule_rung_shift_preserves_chain_gaps,
+test_cadence_schedule_rung1_split_fallback_slots,
+test_cadence_schedule_burst_packing_never_exceeds_broker_cap,
 test_cadence_schedule_spot_clamp_never_pre_close,
 test_cadence_schedule_boundary_vectors_mirror_spot_1m_rest,
 test_cadence_schedule_window_09_16_to_15_30_inclusive,
 test_cadence_gate_min_spacing_acquire_and_defer,
 test_cadence_gate_monotonic_immune_to_wall_regression,
 test_cadence_gate_boot_reseed_conservative,
-test_ladder_walks_55_to_50_and_recovers_one_per_clean_cycle,
-test_ladder_429_arms_immediately_never_blind_retry,
+test_dhan_shape_ladder_rung0_rung1_transitions_under_streak_rules,
+test_ladder_rate_limited_sole_arming_class_with_bounded_retry,
 test_ladder_spot_200_empty_does_not_arm,
 test_may_retry_in_cycle_respects_gate_and_cutoff,
 test_cadence_assembly_predicate_3_chains_3_spots_vix_advisory,
 test_cadence_decision_latch_one_per_lane_per_cycle,
 test_decision_fires_instant_predicate_completes,
 test_honest_skip_at_cutoff_emits_alert_once,
-test_cross_source_freshness_window_pre_close_chain_post_close_spot,
+test_cross_source_freshness_window_spans_the_base_floor,
 test_spot_provenance_order_own_crossfill_chain_embedded,
 test_groww_burst_fallback_refetches_only_failures,
 test_cadence_config_default_off,
 test_cadence_config_validate_rejects_bad_spot_window_cap,
 test_cadence_config_validate_groww_shape_no_overlap_bounds,
-test_cadence_config_validate_rejects_sub_3s_chain_gaps); the 2026-07-15
+test_cadence_config_validate_rejects_sub_3s_chain_spacing); the 2026-07-15
 ladder/gate/seam tests
 (test_spot_concurrency_ladder_degrades_after_2_dirty_recovers_after_3_clean,
 test_groww_shape_ladder_all_choice_transitions,
-test_spot_group_index_encodes_operator_groupings,
+test_spot_second_buckets_encodes_rung_and_tier_groupings,
 test_groww_wave_indices_encode_three_choice_shapes,
 test_cadence_gate_rolling_window_cap_and_boundary,
 test_cadence_gate_rolling_window_monotonic_immune_and_reseed,
@@ -311,7 +383,7 @@ contract source-scan ratchet
   - Files: .claude/plans/archive/2026-07-14-telegram-groww-episode-fold.md
 - [x] CadenceConfig + validate + ErrorCode variants + rule file
   - Files: crates/common/src/config.rs, crates/common/src/error_code.rs, .claude/rules/project/cadence-error-codes.md
-  - Tests: test_cadence_config_default_off, test_cadence_config_validate_rejects_sub_334_spacing, test_cadence_config_validate_rejects_sub_3s_chain_gaps
+  - Tests: test_cadence_config_default_off, test_cadence_config_validate_rejects_sub_334_spacing, test_cadence_config_validate_rejects_sub_3s_chain_spacing
 - [x] crates/core/src/cadence/ module (schedule/gate/ladder/executor/assembly/decision/runner)
   - Files: crates/core/src/cadence/mod.rs, crates/core/src/cadence/schedule.rs, crates/core/src/cadence/gate.rs, crates/core/src/cadence/ladder.rs, crates/core/src/cadence/executor.rs, crates/core/src/cadence/assembly.rs, crates/core/src/cadence/decision.rs, crates/core/src/cadence/runner.rs, crates/core/src/lib.rs
   - Tests: the full unit matrix above
@@ -326,7 +398,7 @@ contract source-scan ratchet
   - Tests: test_cadence_expiry_policy_for_underlyings_locked_mapping, test_cadence_expiry_nearest_active_date_unsorted_vendor_list, test_cadence_expiry_banknifty_month_last_never_flat_min, test_cadence_expiry_empty_and_garbage_lists_fail_closed, test_cadence_expiry_store_day_lock_first_write_wins_and_day_flip, test_cadence_expiry_store_disagreement_dhan_wins_edge_latched, test_cadence_expiry_store_resolver_facade_reads_winner_for_both_brokers, test_cadence_expiry_page_due_edge_latch_deadline_gates_page_not_attempts, test_cadence_expiry_date_yyyymmdd_iso_naive_helpers, proptest_cadence_expiry_nearest_active_is_min_geq_today, proptest_cadence_expiry_banknifty_group_last_is_active_and_group_max, proptest_cadence_expiry_all_past_or_garbage_never_selected, proptest_cadence_expiry_day_holds_then_rolls_next_group, test_cadence_runner_expiry_boot_phase_resolves_and_stamps, test_cadence_runner_expiry_disagreement_dhan_wins_both_lanes
 - [x] Increment 2 Workstream B: verifier fixes F1–F10 + unnumbered config validation
   - Files: crates/core/src/cadence/gate.rs, crates/core/src/cadence/ladder.rs, crates/core/src/cadence/decision.rs, crates/core/src/cadence/runner.rs, crates/app/src/cadence_boot.rs, crates/app/src/main.rs, crates/common/src/config.rs, crates/core/tests/cadence_composition_contract_guard.rs, crates/core/tests/cadence_zero_429_replay.rs, crates/core/tests/cadence_runner_dry_run.rs, .claude/rules/project/cadence-error-codes.md
-  - Tests: test_cadence_gate_expiry_stamp_recorded_and_consulted, test_cadence_gate_expiryless_fire_subsumes_expiry_stamp, test_cadence_gate_global_handle_first_write_wins_and_shared, test_ladder_queue_delay_is_non_arming_but_retryable, test_ladder_any_failure_arming_amplitude_1_oscillation, proptest_cadence_build_cycle_events_dispatch_order_parity, test_cadence_anchor_and_concurrency_ladders_never_oscillate_against_each_other, test_groww_verdict_skips_inflight_leg_never_duplicates, test_cadence_rule_file_pins_composition_contract_heading, test_cadence_gate_module_keeps_global_handle_fns, test_composition_contract_guard_needles_are_non_vacuous
+  - Tests: test_cadence_gate_expiry_stamp_recorded_and_consulted, test_cadence_gate_expiryless_fire_subsumes_expiry_stamp, test_cadence_gate_global_handle_first_write_wins_and_shared, test_ladder_queue_delay_is_non_arming_but_retryable, test_cadence_ladder_failure_arms_ladder_is_total, proptest_cadence_build_cycle_events_dispatch_order_parity, test_cadence_shape_and_concurrency_ladders_never_oscillate_against_each_other, test_groww_verdict_skips_inflight_leg_never_duplicates, test_cadence_rule_file_pins_composition_contract_heading, test_cadence_gate_module_keeps_global_handle_fns, test_composition_contract_guard_needles_are_non_vacuous
 
 ## Rollback
 

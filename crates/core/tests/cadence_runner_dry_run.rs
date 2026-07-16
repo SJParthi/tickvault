@@ -272,6 +272,7 @@ fn deps_with(
         expiry_store: None,
         gates,
         dry_run: false,
+        notifier: None,
         shutdown: Arc::clone(&shutdown),
     };
     (deps, shutdown)
@@ -638,6 +639,7 @@ async fn test_cadence_runner_reenable_after_both_disabled_park_still_cycles() {
         expiry_store: None,
         gates: test_gates(&CadenceConfig::default()),
         dry_run: false,
+        notifier: None,
         shutdown: Arc::clone(&shutdown),
     };
     let clock = Arc::new(TestClock {
@@ -790,6 +792,7 @@ async fn test_cadence_expiry_resolver_stamps_requests_when_resolved() {
         expiry_store: None,
         gates: test_gates(&CadenceConfig::default()),
         dry_run: false,
+        notifier: None,
         shutdown: Arc::clone(&shutdown),
     };
     let clock = Arc::new(TestClock {
@@ -830,14 +833,17 @@ async fn test_cadence_expiry_resolver_stamps_requests_when_resolved() {
 
 #[tokio::test(start_paused = true)]
 async fn test_dhan_spot_ladder_rate_limit_mid_ladder_degrades_then_recovers() {
-    // The 2026-07-15 Dhan spot CONCURRENCY ladder end-to-end, driven by
-    // rate limits MID-SPOT-LADDER: cycles 1-2 every spot leg 429s
-    // (spot-dirty ×2 consecutive → degrade one step) so cycle 3 runs
-    // step 1 ([[3],[1]] — group anchors 1000ms apart; cycle 3 stays
-    // dirty so the SECOND group is observable — a clean step-1 cycle
-    // resolves on the first group's data and honestly skips the rest);
-    // cycles 4-6 are fully clean (×3 consecutive → recover) so cycle 7
-    // is back at step 0 (all 4 SIMULTANEOUS single-symbol calls).
+    // The 2026-07-15 Dhan spot CONCURRENCY ladder end-to-end under the
+    // 2026-07-16 all-7 shape, driven by rate limits MID-SPOT-LADDER:
+    // cycles 1-2 every spot leg 429s (dirty ×2 consecutive → BOTH the
+    // spot tier AND the Dhan shape ladder degrade one step — RateLimited
+    // is the SOLE arming class, and per the same-day correction each
+    // 429'd leg KEEPS its one bounded in-cycle retry) so cycle 3 runs
+    // shape 1 + step 1 (buckets [1,1,1,2]: three spots together in the
+    // rung-1 spot second, the 4th one window later; cycle 3 stays dirty
+    // so the overflow bucket is observable); cycles 4-6 are fully clean
+    // (×3 consecutive → recover) so cycle 7 is back at shape 0 + step 0
+    // (the all-7 primary: ALL 4 spots concurrent in the burst second).
     fn chain_ok(_req: &ChainFetchRequest, _p: usize) -> Result<ChainFetchOk, CadenceFetchError> {
         Ok(ChainFetchOk {
             underlying_spot: Some(24_500.0),
@@ -894,33 +900,55 @@ async fn test_dhan_spot_ladder_rate_limit_mid_ladder_degrades_then_recovers() {
         v.sort_unstable();
         v
     };
-    // Cycle 1 (step 0, dirty): all 4 spots fired at ONE instant (a
-    // 429'd leg is never blind-retried, so exactly 4 calls).
+    // Cycle 1 (shape 0 = ALL-7, step 0, dirty): 4 nominal spots
+    // CONCURRENT in the burst second, plus 4 appended in-cycle retries
+    // (Correction 2: a 429'd leg keeps its ONE bounded retry) stepping
+    // one 1000ms window each past the last nominal slot.
     let c1 = spot_instants(FIRST_CYCLE_MINUTE);
-    assert_eq!(c1.len(), 4, "cycle 1: 4 spot singles, no 429 retries");
-    assert!(c1[3] - c1[0] <= SLOT_TOLERANCE_MS, "step 0 = simultaneous");
-    // Cycle 3 (step 1 after 2 consecutive spot-dirty cycles; itself
-    // dirty so the lane never resolves early): groups [[3],[1]] — three
-    // together, the 4th one full window later.
+    assert_eq!(c1.len(), 8, "cycle 1: 4 nominal spots + 4 bounded retries");
+    assert!(
+        c1[3] - c1[0] <= SLOT_TOLERANCE_MS,
+        "shape 0 = all-7: ALL 4 spots in the burst second (spread {})",
+        c1[3] - c1[0]
+    );
+    assert!(
+        (c1[4] - c1[0] - 1_000).abs() <= SLOT_TOLERANCE_MS,
+        "first appended retry one 1000ms window past the burst (got +{})",
+        c1[4] - c1[0]
+    );
+    assert!(
+        (c1[7] - c1[4] - 3_000).abs() <= SLOT_TOLERANCE_MS,
+        "retries step one window each (retry spread {})",
+        c1[7] - c1[4]
+    );
+    // Cycle 3 (shape 1 + step 1 after 2 consecutive dirty cycles;
+    // itself dirty so the lane never resolves early): buckets
+    // [1,1,1,2] — three together in the rung-1 spot second, the 4th
+    // one full window later, plus the 4 appended retries.
     let c3 = spot_instants(FIRST_CYCLE_MINUTE + 120);
-    assert_eq!(c3.len(), 4, "cycle 3: 4 spot singles, no 429 retries");
+    assert_eq!(c3.len(), 8, "cycle 3: 4 nominal spots + 4 bounded retries");
     assert!(
         c3[2] - c3[0] <= SLOT_TOLERANCE_MS,
-        "step 1 first group of 3"
+        "shape 1 + step 1: first group of 3"
     );
     assert!(
         (c3[3] - c3[0] - 1_000).abs() <= SLOT_TOLERANCE_MS,
-        "step 1 second group exactly one 1000ms window later (got +{})",
+        "step-1 overflow bucket exactly one 1000ms window later (got +{})",
         c3[3] - c3[0]
     );
-    // Cycle 7 (step 0 again after 3 consecutive clean cycles 4-6):
-    // recovered to the full simultaneous group (all 4 dispatch at the
-    // group anchor before any completion lands).
+    assert!(
+        (c3[4] - c3[3] - 1_000).abs() <= SLOT_TOLERANCE_MS,
+        "first appended retry one window past the overflow bucket (got +{})",
+        c3[4] - c3[3]
+    );
+    // Cycle 7 (shape 0 + step 0 again after 3 consecutive clean cycles
+    // 4-6): recovered to the all-7 primary — 4 spots, all burst, no
+    // retries (clean).
     let c7 = spot_instants(FIRST_CYCLE_MINUTE + 360);
-    assert_eq!(c7.len(), 4, "cycle 7: 4 spot singles (clean)");
+    assert_eq!(c7.len(), 4, "cycle 7: 4 spot singles (clean, no retries)");
     assert!(
         c7[3] - c7[0] <= SLOT_TOLERANCE_MS,
-        "recovered to step 0 = simultaneous (span {})",
+        "recovered to shape 0 = all-7 burst (spread {})",
         c7[3] - c7[0]
     );
 }
@@ -1108,6 +1136,7 @@ async fn test_cadence_runner_expiry_boot_phase_resolves_and_stamps() {
         expiry_store: Some(Arc::clone(&store)),
         gates,
         dry_run: false,
+        notifier: None,
         shutdown: Arc::clone(&shutdown),
     };
     let date = NaiveDate::from_ymd_opt(2026, 7, 14).expect("valid date"); // Tuesday
@@ -1207,6 +1236,7 @@ async fn test_cadence_runner_expiry_disagreement_dhan_wins_both_lanes() {
         expiry_store: Some(Arc::clone(&store)),
         gates,
         dry_run: false,
+        notifier: None,
         shutdown: Arc::clone(&shutdown),
     };
     let date = NaiveDate::from_ymd_opt(2026, 7, 14).expect("valid date");
@@ -1341,11 +1371,11 @@ impl CadenceExecutor for SlowLegExecutor {
         }
     }
 
-    fn fetch_expiry_list(
+    async fn fetch_expiry_list(
         &self,
         _req: ExpiryListRequest,
-    ) -> impl std::future::Future<Output = Result<Vec<u32>, CadenceFetchError>> + Send {
-        async move { Err(CadenceFetchError::Empty) }
+    ) -> Result<Vec<u32>, CadenceFetchError> {
+        Err(CadenceFetchError::Empty)
     }
 }
 
@@ -1376,6 +1406,7 @@ async fn test_groww_verdict_skips_inflight_leg_never_duplicates() {
         expiry_store: None,
         gates,
         dry_run: false,
+        notifier: None,
         shutdown: Arc::clone(&shutdown),
     };
     let clock = Arc::new(TestClock {
@@ -1505,11 +1536,11 @@ impl CadenceExecutor for SlowFailLegExecutor {
         }
     }
 
-    fn fetch_expiry_list(
+    async fn fetch_expiry_list(
         &self,
         _req: ExpiryListRequest,
-    ) -> impl std::future::Future<Output = Result<Vec<u32>, CadenceFetchError>> + Send {
-        async move { Err(CadenceFetchError::Empty) }
+    ) -> Result<Vec<u32>, CadenceFetchError> {
+        Err(CadenceFetchError::Empty)
     }
 }
 
@@ -1545,6 +1576,7 @@ async fn test_groww_deferred_fallback_refetches_inflight_skipped_leg_once() {
         expiry_store: None,
         gates,
         dry_run: false,
+        notifier: None,
         shutdown: Arc::clone(&shutdown),
     };
     let clock = Arc::new(TestClock {
@@ -1674,6 +1706,7 @@ async fn test_completion_after_midnight_suspend_abandons_cycle() {
         expiry_store: None,
         gates,
         dry_run: false,
+        notifier: None,
         shutdown: Arc::clone(&shutdown),
     };
     let clock = Arc::new(MidnightFlipClock {
@@ -1736,8 +1769,9 @@ const PRE_ANCHOR_WALL_MS: i64 = (9 * 3600 + 14 * 60) * 1_000;
 
 #[tokio::test(start_paused = true)]
 async fn test_pristine_cycle_observes_disable_before_first_fire() {
-    // Disable the Dhan lane ~10s after run_cycle entry, ~105s BEFORE its
-    // first fire (the 09:15:55 chain anchor). Pre-fix the entry snapshot
+    // Disable the Dhan lane ~10s after run_cycle entry, ~110s BEFORE its
+    // first fire (the 09:16:00 Groww burst / 09:16:01 Dhan burst).
+    // Pre-fix the entry snapshot
     // fired the full Dhan cycle anyway; post-fix the pristine re-arm
     // drops the lane within one ~5s wake chunk — ZERO Dhan requests.
     let log = Arc::new(Mutex::new(Vec::new()));
@@ -1763,6 +1797,7 @@ async fn test_pristine_cycle_observes_disable_before_first_fire() {
         expiry_store: None,
         gates,
         dry_run: false,
+        notifier: None,
         shutdown: Arc::clone(&shutdown),
     };
     let clock = Arc::new(TestClock {
@@ -1771,8 +1806,8 @@ async fn test_pristine_cycle_observes_disable_before_first_fire() {
         date: NaiveDate::from_ymd_opt(2026, 7, 14).expect("valid date"),
     });
     let task = tokio::spawn(run_cadence_loop(clock, deps));
-    // ~10s in (pristine — first fire is at +115s), the operator disables
-    // the Dhan lane.
+    // ~10s in (pristine — the first fire is at +120s), the operator
+    // disables the Dhan lane.
     for _ in 0..10 {
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     }
@@ -1853,6 +1888,7 @@ async fn test_pristine_cycle_observes_enable_before_first_fire() {
         expiry_store: None,
         gates,
         dry_run: false,
+        notifier: None,
         shutdown: Arc::clone(&shutdown),
     };
     let clock = Arc::new(TestClock {
@@ -1901,9 +1937,11 @@ async fn test_pristine_cycle_observes_enable_before_first_fire() {
 
 #[tokio::test(start_paused = true)]
 async fn test_midcycle_disable_stops_not_yet_dispatched_fires() {
-    // Dispatch-time re-read: with fires already dispatched (the 3 chain
-    // primaries), a disable at wall T+2.5s must stop every LATER fire —
-    // the T+3s spot group and every retry — within the same cycle.
+    // Dispatch-time re-read: with the ALL-7 burst second already
+    // dispatched (3 chain primaries + all 4 spots), a disable at wall
+    // T+1.5s must stop every LATER fire — the appended per-leg spot
+    // retries (Empty is retryable under the 2026-07-16 bounded-retry
+    // policy) and the chain retry slot — within the same cycle.
     // Pre-fix the whole cycle kept firing (8 spot requests from a
     // disabled lane).
     let log = Arc::new(Mutex::new(Vec::new()));
@@ -1929,6 +1967,7 @@ async fn test_midcycle_disable_stops_not_yet_dispatched_fires() {
         expiry_store: None,
         gates,
         dry_run: false,
+        notifier: None,
         shutdown: Arc::clone(&shutdown),
     };
     let clock = Arc::new(TestClock {
@@ -1937,10 +1976,11 @@ async fn test_midcycle_disable_stops_not_yet_dispatched_fires() {
         date: NaiveDate::from_ymd_opt(2026, 7, 14).expect("valid date"),
     });
     let task = tokio::spawn(run_cadence_loop(clock, deps));
-    // Chains fire at elapsed 5_000 / 8_000 / 12_000 (wall :55/:58/:02);
-    // the spot group fires at 13_000 (wall :03). Disable at 12_500 —
-    // after the last chain primary, before any spot dispatch.
-    for _ in 0..12 {
+    // The ALL-7 burst second fires at elapsed 11_000 (wall T+1s:
+    // 3 chains + all 4 spots); the appended spot retries start at
+    // 12_000 (T+2s) and the chain retry slot sits at 14_000 (T+4s).
+    // Disable at 11_500 — after the burst second, before any retry.
+    for _ in 0..11 {
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     }
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -1982,15 +2022,17 @@ async fn test_midcycle_disable_stops_not_yet_dispatched_fires() {
             )
         })
         .count();
-    assert!(
-        dhan_chains >= 3,
-        "the 3 chain primaries dispatched BEFORE the disable must have fired"
+    assert_eq!(
+        dhan_chains, 3,
+        "the 3 chain primaries dispatched BEFORE the disable must have \
+         fired; the T+4s chain retry slot must have been stopped"
     );
     assert_eq!(
-        dhan_spots, 0,
+        dhan_spots, 4,
         "a mid-cycle disable must stop every not-yet-dispatched fire \
-         (CONC-NEW-1 dispatch-time re-read): 8 = the frozen entry snapshot \
-         firing the whole spot group + retries from a disabled lane"
+         (CONC-NEW-1 dispatch-time re-read): only the 4 all-7 \
+         burst-second spots fired; 8 = the frozen entry snapshot firing \
+         the appended retries from a disabled lane"
     );
     assert!(
         calls.iter().any(|c| matches!(

@@ -4,23 +4,29 @@
 //! schedule (`next_joinable_boundary` / `build_cycle_slots`), the CAS
 //! gates (`DhanGates`), the failure ladder and the decision latch —
 //! through 64-cycle days under boot-skew / wake-jitter / GC-pause /
-//! latency / failure-outcome / restart permutations and asserts the
-//! STRUCTURAL rate floors:
+//! latency / failure-outcome / restart permutations — every cycle's
+//! slot table built at the cycle's LIVE (Dhan shape rung × spot tier ×
+//! Groww shape) ladder state, so the 2026-07-16 ALL-7 burst (the
+//! same-day correction — 3 chains + 4 spots concurrent at T+1) AND its
+//! tier/shape degradations all flow through the real gates — and
+//! asserts the STRUCTURAL rate floors:
 //!
-//! - per-underlying chain fire deltas ≥ 3000 ms (broker wall domain)
-//! - GLOBAL chain fire deltas ≥ 3000 ms — across underlyings, retries,
-//!   ladder rungs AND process restarts
+//! - per-(underlying, expiry) chain fire deltas ≥ 3000 ms (broker wall
+//!   domain — the 2026-07-16 directive: the broker's 3s rule binds the
+//!   SAME chain expiry only; different underlyings fire CONCURRENTLY,
+//!   so there is deliberately NO global-chain spacing assert anymore)
 //! - NEVER more than `spot_window_cap` Dhan spot authorizations in ANY
 //!   rolling 1000ms window — across every concurrency-ladder step,
-//!   step transition, anchor rung, retry and restart (the 2026-07-15
+//!   step transition, shape rung, retry and restart (the 2026-07-15
 //!   rolling-window gate change; Dhan hard cap 5/sec)
-//! - NEVER more than 5 TOTAL Dhan fires (chain + spot + EXPIRY-LIST
-//!   COMBINED) in ANY rolling 1000ms window (verifier L1, 2026-07-15:
-//!   the combined per-second budget — pre-L1 the spot window and the
-//!   chain gates were independent and their SUM could hit 5-6/sec,
-//!   zero headroom vs Dhan's 5/sec; R4 2026-07-15: the
-//!   unresolved-expiry scenario arm drives `try_acquire_expiry` through
-//!   the SAME ledger, so the combined assertion is honest. HONEST SCOPE
+//! - NEVER more than 5 Dhan DATA-API fires (spot + EXPIRY-LIST
+//!   COMBINED) in ANY rolling 1000ms window (verifier L1 2026-07-15,
+//!   RE-SCOPED by the operator's 2026-07-16 all-7 correction: chain
+//!   fires live in the option-chain API's OWN per-(underlying, expiry)
+//!   budget — the TWO-BUCKET model — so they are deliberately OUTSIDE
+//!   this ledger; R4 2026-07-15: the unresolved-expiry scenario arm
+//!   drives `try_acquire_expiry` through the SAME ledger, so the
+//!   combined assertion is honest. HONEST SCOPE
 //!   (R3-F2, 2026-07-15): the zero-deferral/zero-denial asserts do NOT
 //!   structurally prove anchor safety — a burst-window anchor value
 //!   would push the sim clock past the boundary and
@@ -28,7 +34,7 @@
 //!   so the collision could never reach those asserts. Anchor safety
 //!   rests on the literal :30 phase pins in this file + the gate-level
 //!   collision doc test
-//!   (`test_cadence_gate_expiry_fire_in_burst_window_defers_fourth_nominal_spot`);
+//!   (`test_cadence_gate_expiry_invasion_tolerance_and_cap5_backstop`);
 //!   this arm proves the anchored waves share the combined ledger and
 //!   fire at their anchor)
 //! - zero gate denials on nominal slots (on-time dispatch)
@@ -67,8 +73,8 @@ use tickvault_core::cadence::decision::{DecisionLatch, DecisionOutcome, SkipReas
 use tickvault_core::cadence::executor::{CadenceFetchError, SpotTarget};
 use tickvault_core::cadence::gate::{DhanGates, GateVerdict};
 use tickvault_core::cadence::ladder::{
-    CycleVerdict, GROWW_SHAPE_MAX_STEP, SPOT_CONCURRENCY_MAX_STEP, StreakLadder,
-    failure_arms_ladder, may_retry_in_cycle, min_spot_step_for_cap, next_rung,
+    DHAN_SHAPE_MAX_STEP, GROWW_SHAPE_MAX_STEP, SPOT_CONCURRENCY_MAX_STEP, StreakLadder,
+    failure_arms_ladder, may_retry_in_cycle, min_spot_step_for_cap,
 };
 use tickvault_core::cadence::runner::{CycleAction, GrowwWaveLeg, build_cycle_events};
 use tickvault_core::cadence::schedule::{
@@ -177,15 +183,23 @@ impl SimOutcome {
 #[derive(Default)]
 struct FireLedger {
     per_underlying: [Vec<i64>; ChainUnderlying::COUNT],
-    chain_global: Vec<i64>,
+    /// EVERY chain fire (all underlyings, primaries + retries) — the
+    /// activity-floor count ledger. NOT spacing-asserted and NOT in the
+    /// combined ledger: the global chain gate retired 2026-07-16
+    /// (concurrent distinct underlyings are the directive) and the
+    /// same-day all-7 correction moved chains OUT of the Data-API
+    /// bucket entirely (the two-bucket model — chains are governed
+    /// solely by the per-(underlying, expiry) stamps asserted above).
+    chain_all: Vec<i64>,
     spot: Vec<i64>,
     /// Dhan EXPIRY-LIST fires (the unresolved-expiry scenario arm, R4
     /// 2026-07-15) — asserted against the 1-per-rolling-second expiry
     /// spacing.
     expiry: Vec<i64>,
-    /// EVERY Dhan fire (chain, spot AND expiry-list), in acquisition
-    /// order — the COMBINED per-second budget ledger (verifier L1 +
-    /// R4, 2026-07-15).
+    /// Every Dhan DATA-API fire (spot AND expiry-list), in acquisition
+    /// order — the COMBINED per-second budget ledger (verifier L1 + R4
+    /// 2026-07-15; chains excluded per the 2026-07-16 two-bucket
+    /// re-scope).
     combined: Vec<i64>,
 }
 
@@ -194,11 +208,6 @@ impl FireLedger {
         for (i, fires) in self.per_underlying.iter().enumerate() {
             assert_sorted_deltas(fires, chain_spacing, &format!("{case}: per-UL chain #{i}"));
         }
-        assert_sorted_deltas(
-            &self.chain_global,
-            chain_spacing,
-            &format!("{case}: GLOBAL chain"),
-        );
         assert_window_cap(
             &self.spot,
             CADENCE_SPOT_WINDOW_MS,
@@ -212,18 +221,19 @@ impl FireLedger {
             CADENCE_SPOT_WINDOW_MS,
             &format!("{case}: expiry-fire spacing"),
         );
-        // The COMBINED budget (verifier L1 + R4, 2026-07-15): never more
-        // than 5 TOTAL Dhan fires — chain + spot + expiry-list, across
-        // retries, ladder steps, rungs, restarts AND expiry retry waves
-        // — in ANY rolling 1000ms window. The pre-L1 gates asserted spot
-        // and chain floors SEPARATELY, so their SUM (a chain fire + a
-        // full spot group in one window) was never caught; pre-R4 the
-        // combined ledger never saw an expiry fire at all.
+        // The COMBINED Data-API budget (verifier L1 + R4 2026-07-15,
+        // re-scoped 2026-07-16): never more than 5 Dhan DATA-API fires
+        // — spot + expiry-list, across retries, ladder steps, rungs,
+        // restarts AND expiry retry waves — in ANY rolling 1000ms
+        // window. Chains are deliberately NOT here (the two-bucket
+        // model): their budget is the per-key ≥3s deltas asserted
+        // above, and counting them would refuse the operator's all-7
+        // burst against a cap neither documented budget imposes.
         assert_window_cap(
             &self.combined,
             CADENCE_SPOT_WINDOW_MS,
             CADENCE_SPOT_WINDOW_CAP_CEILING,
-            &format!("{case}: COMBINED chain+spot+expiry"),
+            &format!("{case}: COMBINED spot+expiry"),
         );
     }
 }
@@ -291,8 +301,9 @@ fn sim_gated_chain_fire(
         match gates.try_acquire_chain(underlying, None, clock.mono()) {
             GateVerdict::Acquired => {
                 ledger.per_underlying[underlying.index()].push(clock.wall_ms);
-                ledger.chain_global.push(clock.wall_ms);
-                ledger.combined.push(clock.wall_ms);
+                // Chains record NO combined-ledger entry (two-bucket
+                // model, 2026-07-16 correction).
+                ledger.chain_all.push(clock.wall_ms);
                 return clock.wall_ms;
             }
             GateVerdict::RetryAtMs(at_mono) => {
@@ -486,7 +497,7 @@ fn sim_dhan_cycle(
     // single, never contending a nominal slot's gate window — the
     // runner's `next_spot_retry_target_ms` mirror).
     let mut spot_failures: Vec<(usize, CadenceFetchError)> = Vec::new();
-    for k in 0..4 {
+    for (k, spot_ok) in spots_ok.iter_mut().enumerate() {
         let jitter = i64::try_from(rng.below(500)).unwrap_or(0);
         let fired_at = sim_gated_spot_fire(
             clock,
@@ -502,7 +513,7 @@ fn sim_dhan_cycle(
         let outcome = SimOutcome::draw(rng, fail_bias_pct);
         match outcome.as_error() {
             None if fired_at + latency <= slots.dhan_cutoff_ms => {
-                spots_ok[k] = true;
+                *spot_ok = true;
                 if k < ChainUnderlying::COUNT {
                     decide_ready_at = decide_ready_at.max(fired_at + latency);
                 }
@@ -648,10 +659,12 @@ proptest! {
         gates.reseed_all(clock.mono());
         let mut ledger = FireLedger::default();
         let mut latch = DecisionLatch::new();
-        let mut rung = 0_u8;
-        // The 2026-07-15 adaptive ladders, folded EXACTLY as the runner
-        // folds them — every step + transition drives real slot tables
-        // through the real gates.
+        // The 2026-07-16 Dhan SHAPE ladder + the 2026-07-15 adaptive
+        // concurrency ladders, folded EXACTLY as the runner folds them —
+        // every (shape rung × tier step × Groww shape) transition drives
+        // real slot tables through the real gates.
+        let mut dhan_shape_ladder = StreakLadder::starting_at(0);
+        let mut dhan_shapes_seen = [false; 2];
         let spot_step_floor = min_spot_step_for_cap(cfg.spot_window_cap);
         let mut spot_ladder = StreakLadder::starting_at(spot_step_floor);
         let mut groww_ladder = StreakLadder::starting_at(0);
@@ -681,13 +694,20 @@ proptest! {
                 post_reseed = true;
             }
             let Some(boundary) =
-                next_joinable_boundary(clock.wall_ms, last_boundary, rung, &cfg)
+                next_joinable_boundary(clock.wall_ms, last_boundary, &cfg)
             else {
                 break; // session window exhausted for the day
             };
             last_boundary = Some(boundary);
-            let slots = build_cycle_slots(boundary, rung, spot_ladder.step, groww_ladder.step, &cfg);
+            let slots = build_cycle_slots(
+                boundary,
+                dhan_shape_ladder.step,
+                spot_ladder.step,
+                groww_ladder.step,
+                &cfg,
+            );
             spot_steps_seen[usize::from(spot_ladder.step.min(3))] = true;
+            dhan_shapes_seen[usize::from(dhan_shape_ladder.step.min(1))] = true;
             // No-overlap invariant (coordinator 2026-07-15): even the
             // WORST Groww shape's last wave + verdict + a full sequential
             // fallback tail can never reach the next minute's :00 burst.
@@ -764,14 +784,17 @@ proptest! {
             }
             decisions_per_cycle.push(emitted);
 
-            // The ladder walks on arming failures, recovers on clean.
-            let verdict = if arming {
-                CycleVerdict::DhanFailed
-            } else {
-                CycleVerdict::Clean
-            };
-            rung = next_rung(rung, verdict, cfg.dhan_ladder_max_rungs);
-            prop_assert!(rung <= cfg.dhan_ladder_max_rungs);
+            // The Dhan SHAPE ladder walks on arming-failure dirty
+            // streaks, recovers on clean streaks (2026-07-16 — the
+            // runner's fold, mirrored exactly).
+            let _ = dhan_shape_ladder.advance(
+                arming,
+                cfg.concurrency_degrade_after_dirty_cycles,
+                cfg.concurrency_recover_after_clean_cycles,
+                0,
+                DHAN_SHAPE_MAX_STEP,
+            );
+            prop_assert!(dhan_shape_ladder.step <= DHAN_SHAPE_MAX_STEP);
             cycles += 1;
             // Move past the cycle tail before the next boundary pick.
             clock.advance_to_wall(slots.dhan_cutoff_ms);
@@ -814,9 +837,9 @@ proptest! {
         // silently produced zero (or partial) activity fails HERE.
         prop_assert_eq!(cycles, 64, "the replay must complete all 64 cycles");
         prop_assert!(
-            ledger.chain_global.len() >= 3 * 64,
+            ledger.chain_all.len() >= 3 * 64,
             "chain fires below the 3-primaries-per-cycle floor: {}",
-            ledger.chain_global.len()
+            ledger.chain_all.len()
         );
         prop_assert!(
             ledger.spot.len() >= 4 * 64,
@@ -830,9 +853,10 @@ proptest! {
         } else {
             prop_assert_eq!(ledger.expiry.len(), 0);
         }
-        // THE floors: per-UL ≥3000, GLOBAL ≥3000, spot ≤ window cap per
-        // rolling 1000ms — including retries, ladder steps/transitions,
-        // rungs and restarts, in the broker wall domain.
+        // THE floors: per-UL ≥3000 (the option-chain bucket), spot ≤
+        // window cap + spot+expiry ≤ 5 per rolling 1000ms (the Data-API
+        // bucket) — including retries, ladder steps/transitions, rungs
+        // and restarts, in the broker wall domain.
         ledger.assert_floors(cfg.chain_min_spacing_ms, cfg.spot_window_cap, "replay");
         prop_assert_eq!(
             nominal_denials,
@@ -841,8 +865,11 @@ proptest! {
         );
         // The concurrency ladder starts at the cap's structural floor
         // (step 0 for the default cap 4) — the full-parallel grouping is
-        // ALWAYS exercised, never a vacuous degraded-only run.
+        // ALWAYS exercised, never a vacuous degraded-only run; likewise
+        // the Dhan shape ladder starts at rung 0, so the ALL-7 primary
+        // burst is always driven through the gates.
         prop_assert!(spot_steps_seen[usize::from(spot_step_floor)]);
+        prop_assert!(dhan_shapes_seen[0]);
         // Exactly ONE decision per lane per cycle: the latch must ADMIT
         // every fresh (lane, minute) pair (a wrongly-refusing latch reads
         // < 2) — the ≤1 half is the immediate re-latch refusals above.
@@ -878,18 +905,19 @@ fn test_minute_boundary_race_no_double_fire() {
     let t = 36_000; // 10:00:00
     let t_ms = i64::from(t) * 1_000;
     // Wake 1ms BEFORE T with the previous boundary already completed —
-    // T's pre-fires began long ago (T−5000) → T is NOT joinable; skip.
+    // every fire is post-close (earliest at T+0, the Groww anchor), so
+    // T IS still joinable: nothing has begun.
     assert_eq!(
-        next_joinable_boundary(t_ms - 1, Some(t - 60), 0, &cfg),
-        Some(t + 60)
+        next_joinable_boundary(t_ms - 1, Some(t - 60), &cfg),
+        Some(t)
     );
-    // Wake 1ms AFTER T, same story.
+    // Wake 1ms AFTER T: T's earliest fire (T+0) already began → skip.
     assert_eq!(
-        next_joinable_boundary(t_ms + 1, Some(t - 60), 0, &cfg),
+        next_joinable_boundary(t_ms + 1, Some(t - 60), &cfg),
         Some(t + 60)
     );
     // An instant-completing cycle AT T never re-selects T.
-    assert_eq!(next_joinable_boundary(t_ms, Some(t), 0, &cfg), Some(t + 60));
+    assert_eq!(next_joinable_boundary(t_ms, Some(t), &cfg), Some(t + 60));
     // A double latch of the same (lane, minute) is refused.
     let mut latch = DecisionLatch::new();
     assert!(latch.try_latch(Feed::Dhan, t - 60));
@@ -898,13 +926,15 @@ fn test_minute_boundary_race_no_double_fire() {
 
 #[test]
 fn test_restart_mid_cycle_cannot_violate_spacing() {
-    // Old process fires NIFTY at :55 and DIES 100ms later. The new
-    // process cannot know that fire (fresh monotonic domain) — the
-    // conservative reseed + no-mid-cycle-join still hold the floor.
+    // Old process fires NIFTY at its T+1s burst slot and DIES 100ms
+    // later. The new process cannot know that fire (fresh monotonic
+    // domain) — the conservative reseed + no-mid-cycle-join still hold
+    // the per-(underlying, expiry) floor.
     let cfg = CadenceConfig::default();
     let t_ms = 36_000_000_i64; // 10:00:00
+    let burst_ms = t_ms + cfg.dhan_burst_offset_ms;
     let mut clock = SimClock {
-        wall_ms: t_ms - 5_000,
+        wall_ms: burst_ms,
         mono_origin: 0,
     };
     let mut ledger = FireLedger::default();
@@ -917,14 +947,14 @@ fn test_restart_mid_cycle_cannot_violate_spacing() {
         &gates,
         &mut ledger,
         ChainUnderlying::Nifty,
-        t_ms - 5_000,
+        burst_ms,
         0,
         true,
         &mut late,
         &mut denials,
     );
     // CRASH + instant reboot 100ms later: fresh gates, conservative reseed.
-    clock.advance_to_wall(t_ms - 4_900);
+    clock.advance_to_wall(burst_ms + 100);
     clock.restart(-1_234);
     let gates = DhanGates::new(cfg.chain_min_spacing_ms, cfg.spot_window_cap);
     gates.reseed_all(clock.mono());
@@ -932,7 +962,7 @@ fn test_restart_mid_cycle_cannot_violate_spacing() {
     // the real runner would not even select this boundary, per
     // no-mid-cycle-join, asserted next).
     assert_eq!(
-        next_joinable_boundary(clock.wall_ms, None, 0, &cfg),
+        next_joinable_boundary(clock.wall_ms, None, &cfg),
         Some(36_060),
         "no-mid-cycle-join skips the in-flight cycle"
     );
@@ -958,10 +988,11 @@ fn test_restart_mid_cycle_cannot_violate_spacing() {
 
 #[test]
 fn test_retry_through_gate_never_compresses_chain_spacing() {
-    // A failed :55 NIFTY primary retried on the retry grid (after the
-    // :02 SENSEX primary) passes BOTH its per-UL gate and the GLOBAL
-    // gate — the merged fire sequence keeps every delta ≥ 3000ms even
-    // when the retry target lands hostile-early.
+    // A failed burst-second NIFTY primary retried on the T+4s retry
+    // grid passes its per-(underlying, expiry) gate + the combined
+    // cap-5 window — the fire sequence keeps every per-key delta ≥
+    // 3000ms even when the retry target lands hostile-early (1ms after
+    // the concurrent primaries).
     let cfg = CadenceConfig::default();
     let t = 36_000_u32;
     let slots = build_cycle_slots(t, 0, 0, 0, &cfg);
@@ -989,8 +1020,9 @@ fn test_retry_through_gate_never_compresses_chain_spacing() {
         );
     }
     assert_eq!(denials, 0, "nominal primaries never gate-deferred");
-    // NIFTY retry attempted HOSTILE-EARLY (1ms after SENSEX) — the gates
-    // defer it; the retry-policy check also proves the grid slot lands.
+    // NIFTY retry attempted HOSTILE-EARLY (1ms after the concurrent
+    // burst) — the per-key gate defers it a full 3s past its own
+    // primary; the retry-policy check also proves the grid slot lands.
     let err = CadenceFetchError::Transport;
     assert!(may_retry_in_cycle(
         &err,
@@ -1012,7 +1044,7 @@ fn test_retry_through_gate_never_compresses_chain_spacing() {
         &mut denials,
     );
     ledger.assert_floors(cfg.chain_min_spacing_ms, cfg.spot_window_cap, "retry");
-    assert_eq!(ledger.chain_global.len(), 4);
+    assert_eq!(ledger.chain_all.len(), 4);
 }
 
 // ---------------------------------------------------------------------------
@@ -1259,15 +1291,15 @@ proptest! {
     /// `build_cycle_events` is the runner's REAL dispatch-order core
     /// (extracted per F3 — the pre-fix proptest simulated the ordering
     /// through a hand-kept mirror that could drift silently). Driving it
-    /// directly across every (rung, spot step, groww shape, lane-enable)
-    /// permutation pins: time-sortedness, the exact per-lane event
-    /// multiset vs the slot tables, nominal marking, and cutoff-last
-    /// ordering per lane. A reorder in run_cycle's event construction now
-    /// fails HERE instead of drifting past the sim.
+    /// directly across every (Dhan shape rung, spot tier step, Groww
+    /// shape, lane-enable) permutation pins: time-sortedness, the exact
+    /// per-lane event multiset vs the slot tables, nominal marking, and
+    /// cutoff-last ordering per lane. A reorder in run_cycle's event
+    /// construction now fails HERE instead of drifting past the sim.
     #[test]
     fn proptest_cadence_build_cycle_events_dispatch_order_parity(
         boundary_min in 0_u32..374,
-        rung in 0_u8..=5,
+        dhan_shape in 0_u8..=1,
         spot_step in 0_u8..=3,
         groww_step in 0_u8..=2,
         dhan_enabled in any::<bool>(),
@@ -1275,7 +1307,7 @@ proptest! {
     ) {
         let cfg = CadenceConfig::default();
         let boundary = 9 * 3600 + 16 * 60 + boundary_min * 60;
-        let slots = build_cycle_slots(boundary, rung, spot_step, groww_step, &cfg);
+        let slots = build_cycle_slots(boundary, dhan_shape, spot_step, groww_step, &cfg);
         let events = build_cycle_events(&slots, dhan_enabled, groww_enabled);
 
         // Time-sorted, always.
@@ -1387,47 +1419,56 @@ proptest! {
 }
 
 // ---------------------------------------------------------------------------
-// LADDER-INTERACTION (2026-07-15): anchor rung × concurrency step
+// LADDER-INTERACTION (2026-07-16): Dhan shape rung × concurrency step
 // ---------------------------------------------------------------------------
 
 #[test]
-fn test_cadence_anchor_and_concurrency_ladders_never_oscillate_against_each_other() {
-    // A failing streak that BOTH shifts the anchor rung AND steps the
-    // spot concurrency down, then a clean streak that recovers both:
+fn test_cadence_shape_and_concurrency_ladders_never_oscillate_against_each_other() {
+    // A failing streak that BOTH shifts the Dhan shape rung AND steps
+    // the spot concurrency down, then a clean streak that recovers both:
     // the two ladders must recover MONOTONICALLY (each moves toward home
-    // one condition at a time — neither ladder's motion re-dirties the
-    // other), and the step-back evaluates against the SHIFTED anchor —
-    // every intermediate (rung, step) pair builds a LEGAL slot table
-    // (spot groups inside the lane cutoff, chains before spots' windows
-    // close, all inside the cycle).
+    // one streak at a time — neither ladder's motion re-dirties the
+    // other), and every intermediate (shape, step) pair builds a LEGAL
+    // slot table (chains all concurrent at the burst second, spots
+    // inside the lane cutoff).
     let cfg = CadenceConfig::default();
     let spot_floor = min_spot_step_for_cap(cfg.spot_window_cap);
-    let mut rung = 0_u8;
+    let mut shape_ladder = StreakLadder::starting_at(0);
     let mut spot_ladder = StreakLadder::starting_at(spot_floor);
     let boundary = 36_000_u32; // 10:00:00
-    let mut rung_history = vec![rung];
+    let mut shape_history = vec![shape_ladder.step];
     let mut step_history = vec![spot_ladder.step];
 
-    let assert_legal = |rung: u8, step: u8| {
-        let slots = build_cycle_slots(boundary, rung, step, 0, &cfg);
-        // Chains strictly ordered, spots inside the Dhan cutoff, the
-        // deepest spot group + its window still lands before the cutoff.
-        assert!(slots.dhan_chain_slots_ms[0] < slots.dhan_chain_slots_ms[1]);
-        assert!(slots.dhan_chain_slots_ms[1] < slots.dhan_chain_slots_ms[2]);
+    let assert_legal = |shape: u8, step: u8| {
+        let slots = build_cycle_slots(boundary, shape, step, 0, &cfg);
+        // Chains all CONCURRENT at the burst second (2026-07-16); every
+        // spot bucket still lands before the Dhan cutoff.
+        assert!(
+            slots
+                .dhan_chain_slots_ms
+                .iter()
+                .all(|c| *c == slots.dhan_chain_slots_ms[0]),
+            "(shape {shape}, step {step}): chains must share the burst second"
+        );
         for slot in &slots.dhan_spot_slots_ms {
             assert!(
                 *slot <= slots.dhan_cutoff_ms,
-                "(rung {rung}, step {step}): spot slot {slot} past cutoff {}",
+                "(shape {shape}, step {step}): spot slot {slot} past cutoff {}",
                 slots.dhan_cutoff_ms
             );
         }
     };
 
-    // 6 consecutive failing cycles: every cycle arms the anchor ladder
-    // (rung +1 toward the floor) AND marks the spot cycle dirty (step +1
-    // after each 2-streak).
+    // 6 consecutive failing cycles: every cycle marks BOTH ladders dirty
+    // (each steps +1 after every 2-dirty streak, clamped at its max).
     for _ in 0..6 {
-        rung = next_rung(rung, CycleVerdict::DhanFailed, cfg.dhan_ladder_max_rungs);
+        let _ = shape_ladder.advance(
+            true,
+            cfg.concurrency_degrade_after_dirty_cycles,
+            cfg.concurrency_recover_after_clean_cycles,
+            0,
+            DHAN_SHAPE_MAX_STEP,
+        );
         let _ = spot_ladder.advance(
             true,
             cfg.concurrency_degrade_after_dirty_cycles,
@@ -1435,11 +1476,14 @@ fn test_cadence_anchor_and_concurrency_ladders_never_oscillate_against_each_othe
             spot_floor,
             SPOT_CONCURRENCY_MAX_STEP,
         );
-        rung_history.push(rung);
+        shape_history.push(shape_ladder.step);
         step_history.push(spot_ladder.step);
-        assert_legal(rung, spot_ladder.step);
+        assert_legal(shape_ladder.step, spot_ladder.step);
     }
-    assert_eq!(rung, 5, "anchor at the floor after 6 failing cycles");
+    assert_eq!(
+        shape_ladder.step, DHAN_SHAPE_MAX_STEP,
+        "shape at the split fallback after 6 failing cycles"
+    );
     assert_eq!(spot_ladder.step, 3, "concurrency fully sequential (6/2)");
 
     // 20 consecutive clean cycles: BOTH ladders walk home and STAY there
@@ -1447,7 +1491,13 @@ fn test_cadence_anchor_and_concurrency_ladders_never_oscillate_against_each_othe
     // the ladders read INDEPENDENT signals, so one ladder's motion can
     // never re-arm the other).
     for _ in 0..20 {
-        rung = next_rung(rung, CycleVerdict::Clean, cfg.dhan_ladder_max_rungs);
+        let _ = shape_ladder.advance(
+            false,
+            cfg.concurrency_degrade_after_dirty_cycles,
+            cfg.concurrency_recover_after_clean_cycles,
+            0,
+            DHAN_SHAPE_MAX_STEP,
+        );
         let _ = spot_ladder.advance(
             false,
             cfg.concurrency_degrade_after_dirty_cycles,
@@ -1455,23 +1505,19 @@ fn test_cadence_anchor_and_concurrency_ladders_never_oscillate_against_each_othe
             spot_floor,
             SPOT_CONCURRENCY_MAX_STEP,
         );
-        rung_history.push(rung);
+        shape_history.push(shape_ladder.step);
         step_history.push(spot_ladder.step);
-        // The step-back evaluates against the SHIFTED anchor: whatever
-        // (rung, step) pair this clean cycle lands on, the NEXT cycle's
-        // slot table (built from BOTH) is legal.
-        assert_legal(rung, spot_ladder.step);
+        // Whatever (shape, step) pair this clean cycle lands on, the
+        // NEXT cycle's slot table (built from BOTH) is legal.
+        assert_legal(shape_ladder.step, spot_ladder.step);
     }
-    assert_eq!(rung, 0, "anchor recovered home");
+    assert_eq!(shape_ladder.step, 0, "shape recovered home");
     assert_eq!(spot_ladder.step, spot_floor, "concurrency recovered home");
     // Monotone recovery: once the failing streak ends, neither history
     // ever increases again (no cross-ladder oscillation).
     let fail_end = 7; // index of the first clean-cycle entry
-    for w in rung_history[fail_end..].windows(2) {
-        assert!(
-            w[1] <= w[0],
-            "anchor rung re-degraded during clean recovery"
-        );
+    for w in shape_history[fail_end..].windows(2) {
+        assert!(w[1] <= w[0], "shape rung re-degraded during clean recovery");
     }
     for w in step_history[fail_end..].windows(2) {
         assert!(w[1] <= w[0], "spot step re-degraded during clean recovery");

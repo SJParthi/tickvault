@@ -1,31 +1,41 @@
-//! The Dhan failure ladder (design §3) + the in-cycle retry policy +
-//! the ADAPTIVE CONCURRENCY ladders (operator spec addition 2026-07-15).
+//! The ADAPTIVE ladders (operator directives 2026-07-15 + 2026-07-16) +
+//! the in-cycle retry policy.
 //!
-//! The ANCHOR ladder shifts the NEXT cycle's Dhan anchor 1s earlier per
-//! failing cycle (:55 → :54 → … → :50 floor at rung 5 — you cannot rewind
-//! time inside a cycle) and steps back ONE rung per fully-clean cycle
-//! (hysteresis — a reset-to-:55 would oscillate full-amplitude against a
-//! flapping vendor; unanimous designer choice, Assumed pending operator
-//! confirm). The rung resets to 0 at day start / process boot (the ladder
-//! is a day-scoped in-memory variable, NOT a cycle FSM state).
+//! All three ladders share ONE primitive — the streak-driven
+//! [`StreakLadder`]: degrade one step after
+//! `concurrency_degrade_after_dirty_cycles` (default 2, Assumed — flagged
+//! for operator confirm) CONSECUTIVE dirty cycles, recover one step after
+//! `concurrency_recover_after_clean_cycles` (default 3, Assumed)
+//! consecutive fully-clean cycles — never permanently stuck from a
+//! one-off 429. Every ladder is day-scoped (reset at day start / boot).
 //!
-//! The CONCURRENCY ladders (2026-07-15, [`StreakLadder`]) are streak-driven:
-//! - **Dhan spot concurrency** — steps encode the spot GROUPINGS
-//!   `[[4]] → [[3],[1]] → [[2],[2]] → [[1],[1],[1],[1]]` (groups fire at
-//!   consecutive 1000ms-spaced anchors from the spot anchor slot).
-//! - **Groww fallback shape** — the coordinator-relayed three-choice
-//!   ladder (2026-07-15): choice 1 = `:00` all-7-parallel; choice 2 =
-//!   `:01` chains / `:02` ALL 4 spots; choice 3 (last resort) = `:01`
-//!   chains / `:02` core spots / `:03` VIX alone.
-//!
-//! Both degrade ONE step after `concurrency_degrade_after_dirty_cycles`
-//! (default 2, Assumed — flagged for operator confirm) CONSECUTIVE
-//! rate-limited-dirty cycles and recover one step after
-//! `concurrency_recover_after_clean_cycles` (default 3, Assumed — flagged
-//! for operator confirm) consecutive fully-clean cycles — never
-//! permanently stuck from a one-off 429. Day-scoped like the anchor rung.
+//! - **Dhan SHAPE ladder** (2026-07-16 — replaces the retired pre-close
+//!   `:55 → :50` anchor-shift ladder): rung 0 (primary) = second 1 →
+//!   ALL 7 requests concurrent (3 chains + 4 spots — the operator's
+//!   same-day correction; the interim 5+2 packing is SUPERSEDED, §0b of
+//!   the rule file); rung 1 (fallback) = second 1 → 3 chains, second 2
+//!   → all 4 spots. Both rungs are fully POST-close — no pre-fire
+//!   exists anymore.
+//! - **Dhan spot-concurrency ladder** — tier steps 0..=3 encode the
+//!   per-second spot capacity `4 → 3 → 2 → 1`; the shape rung's
+//!   second-buckets and the tier capacity compose via
+//!   [`spot_second_buckets`] (greedy per-second-group fill — degradation
+//!   happens WITHIN each second group, spilling overflow to later
+//!   1000ms-spaced seconds).
+//! - **Groww fallback-shape ladder** — the three-choice ladder
+//!   (2026-07-15): choice 1 = `:00` all-7-parallel (the operator's
+//!   primary); choice 2 = `:01` chains / `:02` ALL 4 spots (the
+//!   operator's 2026-07-16 split fallback); choice 3 (last resort,
+//!   BEYOND the operator's two-rung prescription — a more-conservative
+//!   final bounded degrade, dated note in the rule file) = `:01` chains
+//!   / `:02` core spots / `:03` VIX alone.
 
 use super::executor::CadenceFetchError;
+
+/// Highest Dhan SHAPE step — step 1 = the operator's split fallback
+/// (chains second 1, all spots second 2). Step 0 is the ALL-7 concurrent
+/// burst (2026-07-16 directive + same-day correction).
+pub const DHAN_SHAPE_MAX_STEP: u8 = 1;
 
 /// Highest Dhan spot-concurrency step — step 3 = fully sequential 1×4.
 pub const SPOT_CONCURRENCY_MAX_STEP: u8 = 3;
@@ -34,11 +44,11 @@ pub const SPOT_CONCURRENCY_MAX_STEP: u8 = 3;
 /// (choice 3, the LAST resort).
 pub const GROWW_SHAPE_MAX_STEP: u8 = 2;
 
-/// A streak-driven adaptive ladder (shared primitive of the Dhan
-/// spot-concurrency ladder and the Groww fallback-shape ladder): degrade
-/// ONE step after N consecutive dirty cycles, recover one step after M
-/// consecutive clean cycles. Steps are clamped to `[min_step, max_step]`
-/// at every transition.
+/// A streak-driven adaptive ladder (shared primitive of the Dhan shape
+/// ladder, the Dhan spot-concurrency ladder and the Groww fallback-shape
+/// ladder): degrade ONE step after N consecutive dirty cycles, recover
+/// one step after M consecutive clean cycles. Steps are clamped to
+/// `[min_step, max_step]` at every transition.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct StreakLadder {
     /// Current step (0 = the most concurrent shape).
@@ -112,26 +122,58 @@ impl StreakLadder {
     }
 }
 
-/// The Dhan spot-concurrency GROUPING: which 1000ms-spaced group anchor
-/// (0-based, from the spot anchor slot) spot target `target_idx`
-/// (`SpotTarget::ALL` order: NIFTY/BANKNIFTY/SENSEX/INDIA VIX) fires at,
-/// per ladder step. Steps: 0 = `[[4]]`, 1 = `[[3],[1]]` (VIX alone
-/// second), 2 = `[[2],[2]]`, 3 = `[[1],[1],[1],[1]]`. Steps past the max
-/// clamp to fully sequential. Pure.
+/// The Dhan spot SECOND-BUCKET assignment (2026-07-16): which
+/// 1000ms-spaced second bucket (0-based from the burst second) spot
+/// target `target_idx` (`SpotTarget::ALL` order:
+/// NIFTY/BANKNIFTY/SENSEX/INDIA VIX) fires in, composed from the SHAPE
+/// rung and the spot-concurrency TIER step.
+///
+/// - Shape rung 0 (the operator's ALL-7 primary — correction
+///   2026-07-16: *"for dhan also as the primary all 7 parallel at first
+///   second"*; the interim 5+2 packing is SUPERSEDED, recorded in the
+///   rule file's §0b) bases ALL 4 spots in bucket 0 — the burst second,
+///   alongside the 3 concurrent chains.
+/// - Shape rung ≥1 (split fallback — chains second 1, spots second 2)
+///   bases ALL 4 spots in bucket 1.
+/// - The tier step caps the per-bucket SPOT count at `4 − step`
+///   (clamped ≥1): degradation happens WITHIN each second group, greedy
+///   overflow spilling to the NEXT 1000ms bucket (per-second-group tier
+///   math, coordinator addendum item 4).
+///
+/// Budget safety (the TWO-BUCKET model, operator correction 2026-07-16):
+/// the burst second is 3 chains + ≤4 spots. The 4 spot fires sit in the
+/// Data-API 5/sec bucket (4 ≤ 5); the 3 chain fires sit in the
+/// option-chain API's OWN per-(underlying, expiry) budget (different
+/// underlyings explicitly concurrent per Dhan's documented rule) — so
+/// all-7 breaches NEITHER documented budget. Assignments are
+/// non-decreasing in `target_idx`. Pure, zero-alloc.
 #[must_use]
-pub fn spot_group_index(step: u8, target_idx: usize) -> usize {
-    match step {
-        0 => 0,
-        1 => usize::from(target_idx >= 3),
-        2 => target_idx / 2,
-        _ => target_idx,
+pub fn spot_second_buckets(dhan_shape: u8, spot_step: u8) -> [usize; 4] {
+    let base: [usize; 4] = if dhan_shape == 0 {
+        [0, 0, 0, 0]
+    } else {
+        [1, 1, 1, 1]
+    };
+    // Per-bucket spot capacity at this tier: 4 → 3 → 2 → 1 (clamped ≥1).
+    let cap = usize::from(4u8.saturating_sub(spot_step.min(3)).max(1));
+    // Max reachable bucket: base 1 + 3 overflow steps = 4 (< 8).
+    let mut counts = [0usize; 8];
+    let mut out = [0usize; 4];
+    for (k, slot) in out.iter_mut().enumerate() {
+        let mut b = base[k];
+        while counts[b] >= cap {
+            b += 1;
+        }
+        counts[b] += 1;
+        *slot = b;
     }
+    out
 }
 
 /// The STRUCTURAL concurrency-step floor for a configured
-/// `spot_window_cap`: no step-`s` group may exceed the rolling-window cap
-/// (a cap of 4..=5 admits the full step-0 simultaneous group; 3 → step 1;
-/// 2 → step 2; 1 → fully sequential). Pure.
+/// `spot_window_cap`: no second-bucket's SPOT count may exceed the
+/// rolling-window cap (a cap of 4..=5 admits the full step-0 group;
+/// 3 → step 1; 2 → step 2; 1 → fully sequential). Pure.
 #[must_use]
 // TEST-EXEMPT: covered by the spot-cap floor arms of the StreakLadder unit tests (guard name-pattern mismatch).
 pub fn min_spot_step_for_cap(cap: u32) -> u8 {
@@ -158,95 +200,60 @@ pub const fn groww_wave_indices(shape: u8) -> (usize, usize, usize) {
     }
 }
 
-/// The per-day Dhan ladder state (design §7: separate from the cycle FSM).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct LadderState {
-    /// Current rung, 0..=`dhan_ladder_max_rungs` (0 = nominal :55 anchor).
-    pub rung: u8,
-}
-
-/// The whole-cycle verdict feeding the ladder transition.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CycleVerdict {
-    /// No arming Dhan failure this cycle → recover one rung toward 0.
-    Clean,
-    /// ≥1 arming Dhan failure this cycle → shift one rung toward the floor.
-    DhanFailed,
-    /// The floor rung failed again → hold at the floor (cross-source
-    /// steady state; exits on the first clean Dhan cycle).
-    FloorExhausted,
-}
-
-/// Pure ladder transition: `Clean → −1 (min 0)`, `DhanFailed → +1
-/// (max `max_rungs`)`, `FloorExhausted → hold max_rungs` (design §7).
-#[must_use]
-pub fn next_rung(cur: u8, verdict: CycleVerdict, max_rungs: u8) -> u8 {
-    match verdict {
-        CycleVerdict::Clean => cur.saturating_sub(1),
-        CycleVerdict::DhanFailed => cur.saturating_add(1).min(max_rungs),
-        CycleVerdict::FloorExhausted => max_rungs,
-    }
-}
-
-/// Does this fetch failure ARM the ladder? (design §3(c), Assumed —
-/// flagged for operator confirm.)
+/// Does this fetch failure ARM the ladders? (operator correction
+/// 2026-07-16, verbatim: *"see that too instantly dont commit — one and
+/// only when you tried that multiple times and gets rate limited alone
+/// alone fallback"*.)
 ///
-/// - `RateLimited` (a 429 — the strongest arming signal), `Timeout` and
-///   `Transport` (5xx folds into `Transport` at the executor seam) ARM it
-///   — "both buckets" per the operator's rule for genuine failures.
-/// - `Empty` (Dhan spot 200-with-zero-candles) does NOT arm it: an
-///   earlier start moves the request EARLIER relative to close, REDUCING
-///   serving-lag headroom — arming on the 14-day 200-empty saga would
-///   drive the schedule the wrong direction every minute (judge ruling,
-///   design §0 — flagged Assumed deviation).
-/// - `Auth` / `Malformed` do NOT arm it: neither is a pacing/serving-lag
-///   signal (shifting the schedule earlier cannot fix a dead token or a
-///   schema drift); both still degrade the lane loudly via CADENCE-01.
-/// - `QueueDelay` does NOT arm it (verifier F1(iii), dated 2026-07-15): a
-///   shared-limiter queue deadline miss is SELF-INFLICTED pacing — the
-///   scheduler's own composition with the `dhan_data_api_limiter` — not a
-///   vendor signal; arming on it would let our own defense-in-depth
-///   limiter walk the anchor earlier forever.
-///
-/// STRENGTHENED ASSUMED FLAG (verifier F7, dated 2026-07-15): the
-/// operator's verbatim rule arms the ladder on ANY arming failure in the
-/// cycle EVEN WHEN an in-cycle retry recovered the leg. Under a perfectly
-/// alternating fail/clean minute pattern this yields a permanent
-/// AMPLITUDE-1 rung oscillation (0 ↔ 1) — accepted as the CURRENT
-/// CONTRACT (pinned by
-/// `test_ladder_any_failure_arming_amplitude_1_oscillation`), flagged
-/// Assumed pending operator confirmation of a "recovered-in-cycle does
-/// not arm" refinement.
+/// - `RateLimited` (a 429) is the SOLE arming class — the fallback shape
+///   exists to relieve broker rate pressure and nothing else.
+/// - `Timeout` / `Transport` do NOT arm (operator correction 2026-07-16
+///   — supersedes the interim "both buckets" reading that armed them):
+///   a slow/flaky vendor is not rate pressure; reshaping the burst
+///   cannot fix it. Both still degrade the lane loudly via CADENCE-01.
+/// - `Empty` (Dhan spot 200-with-zero-candles) does NOT arm: a shape
+///   degrade cannot fix a vendor serving-lag saga — arming on the 14-day
+///   200-empty class would flap the shape every minute (judge ruling,
+///   design §0).
+/// - `Auth` / `Malformed` do NOT arm: neither is a pacing signal
+///   (reshaping the burst cannot fix a dead token or a schema drift);
+///   both still degrade the lane loudly via CADENCE-01.
+/// - `QueueDelay` does NOT arm (verifier F1(iii), dated 2026-07-15): a
+///   nominal gate deferral is SELF-INFLICTED pacing — the scheduler's
+///   own composition with its gates — not a vendor signal; arming on it
+///   would let our own defense-in-depth walk the shape down forever.
 #[must_use]
 pub fn failure_arms_ladder(err: &CadenceFetchError) -> bool {
-    matches!(
-        err,
-        CadenceFetchError::RateLimited { .. }
-            | CadenceFetchError::Timeout
-            | CadenceFetchError::Transport
-    )
+    matches!(err, CadenceFetchError::RateLimited { .. })
 }
 
-/// May a failed request be retried IN-CYCLE? (design §3(b), Assumed.)
+/// May a failed request be retried IN-CYCLE? (design §3(b); RateLimited
+/// arm reversed by the operator's 2026-07-16 correction.)
 ///
-/// - A `RateLimited` is NEVER retried blind in-cycle — it kills the leg
-///   for the cycle and arms the ladder.
-/// - At most `retry_max` retries per failed request.
+/// - A `RateLimited` leg KEEPS its bounded in-cycle retry — the retry
+///   (through the gates, after the per-key spacing) is one of the
+///   operator's "tried that multiple times" attempts; only the
+///   multi-attempt rate-limited streak demotes the shape. (The interim
+///   "429 kills the leg for the cycle" behavior is REVERSED — recorded
+///   in the rule file's §0b.)
+/// - At most `retry_max` retries per failed request (default 1 — one
+///   retry per leg per cycle, never more).
 /// - The retry must LAND: the gate's earliest-allowed fire instant plus
 ///   the p95 latency allowance must sit at/before the lane's cutoff —
 ///   otherwise the retry could only produce a late (discarded) response.
 #[must_use]
 pub fn may_retry_in_cycle(
-    err: &CadenceFetchError,
+    // Every failure class shares ONE bounded retry budget — including
+    // RateLimited (2026-07-16 correction) and QueueDelay (non-arming
+    // but retryable, F1(iii)); the class parameter stays as the policy
+    // seam (a future class-specific budget changes ONLY this fn).
+    _err: &CadenceFetchError,
     retries_used: u32,
     retry_max: u32,
     earliest_fire_ms: i64,
     latency_allowance_ms: i64,
     lane_cutoff_abs_ms: i64,
 ) -> bool {
-    if matches!(err, CadenceFetchError::RateLimited { .. }) {
-        return false;
-    }
     if retries_used >= retry_max {
         return false;
     }
@@ -258,36 +265,60 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_ladder_walks_55_to_50_and_recovers_one_per_clean_cycle() {
-        let max = 5;
-        // Failing cycles walk :55 → :54 → :53 → :52 → :51 → :50 (rung 5).
-        let mut rung = 0;
-        for expected in 1..=5u8 {
-            rung = next_rung(rung, CycleVerdict::DhanFailed, max);
-            assert_eq!(rung, expected);
+    fn test_dhan_shape_ladder_rung0_rung1_transitions_under_streak_rules() {
+        // 2026-07-16: the Dhan SHAPE ladder replaces the retired anchor
+        // ladder — rung 0 (5+2 primary) ⇄ rung 1 (split fallback), under
+        // the SAME 2-dirty / 3-clean streak thresholds the Groww shape
+        // ladder uses.
+        let mut l = StreakLadder::starting_at(0);
+        // One-off arming failure never degrades…
+        assert_eq!(l.advance(true, 2, 3, 0, DHAN_SHAPE_MAX_STEP), None);
+        assert_eq!(l.step, 0);
+        // …a clean cycle resets the dirty streak…
+        assert_eq!(l.advance(false, 2, 3, 0, DHAN_SHAPE_MAX_STEP), None);
+        assert_eq!(l.advance(true, 2, 3, 0, DHAN_SHAPE_MAX_STEP), None);
+        assert_eq!(l.step, 0, "dirty-clean-dirty is never 'continuous'");
+        // …2 CONSECUTIVE dirty cycles degrade rung 0 → rung 1.
+        assert_eq!(
+            l.advance(true, 2, 3, 0, DHAN_SHAPE_MAX_STEP),
+            Some(StreakShift::Degraded)
+        );
+        assert_eq!(l.step, 1);
+        // Dirty AT the max rung holds (there is no rung 2 — the shape
+        // ladder tops out at the operator's split fallback).
+        for _ in 0..4 {
+            assert_eq!(l.advance(true, 2, 3, 0, DHAN_SHAPE_MAX_STEP), None);
         }
-        // Failing AT the floor holds the floor.
-        assert_eq!(next_rung(rung, CycleVerdict::DhanFailed, max), 5);
-        assert_eq!(next_rung(rung, CycleVerdict::FloorExhausted, max), 5);
-        // Recovery steps back ONE rung per fully-clean cycle (hysteresis)
-        // and converges home in ≤5 clean minutes.
-        for expected in (0..=4u8).rev() {
-            rung = next_rung(rung, CycleVerdict::Clean, max);
-            assert_eq!(rung, expected);
+        assert_eq!(l.step, DHAN_SHAPE_MAX_STEP);
+        // 3 CONSECUTIVE clean cycles recover rung 1 → rung 0.
+        assert_eq!(l.advance(false, 2, 3, 0, DHAN_SHAPE_MAX_STEP), None);
+        assert_eq!(l.advance(false, 2, 3, 0, DHAN_SHAPE_MAX_STEP), None);
+        assert_eq!(
+            l.advance(false, 2, 3, 0, DHAN_SHAPE_MAX_STEP),
+            Some(StreakShift::Recovered)
+        );
+        assert_eq!(l.step, 0);
+        // Clean at rung 0 stays home (never underflows).
+        for _ in 0..5 {
+            assert_eq!(l.advance(false, 2, 3, 0, DHAN_SHAPE_MAX_STEP), None);
         }
-        // Clean at rung 0 stays home (saturating, never underflows).
-        assert_eq!(next_rung(0, CycleVerdict::Clean, max), 0);
+        assert_eq!(l.step, 0);
     }
 
     #[test]
-    fn test_ladder_429_arms_immediately_never_blind_retry() {
+    fn test_ladder_rate_limited_sole_arming_class_with_bounded_retry() {
+        // Operator correction 2026-07-16 ("tried that multiple times and
+        // gets rate limited alone alone fallback"): RateLimited is the
+        // SOLE arming class…
         let rate_limited = CadenceFetchError::RateLimited {
             retry_after_ms: Some(2_000),
         };
-        // The strongest arming signal…
         assert!(failure_arms_ladder(&rate_limited));
-        // …and NEVER retried in-cycle, regardless of budget or room.
-        assert!(!may_retry_in_cycle(
+        // …and a rate-limited leg KEEPS its ONE bounded in-cycle retry
+        // (through the gates, after the per-key spacing) — the retry is
+        // one of the operator's "multiple attempts"; the interim
+        // "429 kills the leg for the cycle" behavior is REVERSED.
+        assert!(may_retry_in_cycle(
             &rate_limited,
             0,
             1,
@@ -295,10 +326,20 @@ mod tests {
             1_500,
             60_000
         ));
-        // Timeout / Transport (incl. 5xx at the seam) also arm.
-        assert!(failure_arms_ladder(&CadenceFetchError::Timeout));
-        assert!(failure_arms_ladder(&CadenceFetchError::Transport));
-        // Auth / Malformed degrade loudly but do not shift the schedule.
+        // One retry per leg per cycle, never more.
+        assert!(!may_retry_in_cycle(
+            &rate_limited,
+            1,
+            1,
+            5_000,
+            1_500,
+            60_000
+        ));
+        // Timeout / Transport (incl. 5xx at the seam) NEVER arm — they
+        // degrade the lane loudly via CADENCE-01 but never reshape.
+        assert!(!failure_arms_ladder(&CadenceFetchError::Timeout));
+        assert!(!failure_arms_ladder(&CadenceFetchError::Transport));
+        // Auth / Malformed degrade loudly but do not reshape the burst.
         assert!(!failure_arms_ladder(&CadenceFetchError::Auth));
         assert!(!failure_arms_ladder(&CadenceFetchError::Malformed));
     }
@@ -306,8 +347,8 @@ mod tests {
     #[test]
     fn test_ladder_spot_200_empty_does_not_arm() {
         // Assumed-rule pin (design §0 flagged deviation): a 200-empty spot
-        // must NOT walk the anchor earlier — that reduces serving-lag
-        // headroom in the very saga it would react to.
+        // must NOT degrade the shape — a reshape cannot fix the vendor
+        // serving-lag saga it would react to.
         assert!(!failure_arms_ladder(&CadenceFetchError::Empty));
         // An Empty IS still retryable in-cycle (one gated attempt).
         assert!(may_retry_in_cycle(
@@ -335,14 +376,11 @@ mod tests {
     }
 
     #[test]
-    fn test_cadence_ladder_next_rung_clamps_and_failure_arms_ladder_is_total() {
-        // next_rung respects a NON-default max (config can lower the
-        // ceiling below 5): the clamp is the configured value.
-        assert_eq!(next_rung(2, CycleVerdict::DhanFailed, 3), 3);
-        assert_eq!(next_rung(3, CycleVerdict::DhanFailed, 3), 3);
-        assert_eq!(next_rung(0, CycleVerdict::FloorExhausted, 3), 3);
+    fn test_cadence_ladder_failure_arms_ladder_is_total() {
         // failure_arms_ladder is total over the 7-variant error enum —
-        // exactly 3 arm, 4 do not (a new variant must pick a side here).
+        // exactly ONE arms (RateLimited — the operator's 2026-07-16
+        // rate-limit-only correction), 6 do not (a new variant must pick
+        // a side here).
         let arms = [
             failure_arms_ladder(&CadenceFetchError::RateLimited {
                 retry_after_ms: None,
@@ -354,14 +392,14 @@ mod tests {
             failure_arms_ladder(&CadenceFetchError::Auth),
             failure_arms_ladder(&CadenceFetchError::Malformed),
         ];
-        assert_eq!(arms.iter().filter(|a| **a).count(), 3);
-        assert_eq!(arms, [true, true, true, false, false, false, false]);
+        assert_eq!(arms.iter().filter(|a| **a).count(), 1);
+        assert_eq!(arms, [true, false, false, false, false, false, false]);
     }
 
     #[test]
     fn test_ladder_queue_delay_is_non_arming_but_retryable() {
-        // F1(iii), 2026-07-15: a shared-limiter queue deadline miss is
-        // SELF-INFLICTED pacing — it must NEVER walk the anchor ladder…
+        // F1(iii), 2026-07-15: a nominal gate deferral is SELF-INFLICTED
+        // pacing — it must NEVER degrade the shape…
         assert!(!failure_arms_ladder(&CadenceFetchError::QueueDelay));
         // …but it IS retryable in-cycle (the pacing spill clears within
         // the window; one more gated attempt is legitimate).
@@ -376,25 +414,20 @@ mod tests {
     }
 
     #[test]
-    fn test_ladder_any_failure_arming_amplitude_1_oscillation() {
-        // F7, 2026-07-15 — CURRENT CONTRACT PIN (Assumed, flagged): the
-        // cycle verdict arms on ANY arming failure even when an in-cycle
-        // retry recovered the leg, so a perfectly alternating fail/clean
-        // minute pattern oscillates the anchor rung 0 ↔ 1 forever —
-        // amplitude 1, never runaway. This test DOCUMENTS the accepted
-        // oscillation; a future "recovered-in-cycle does not arm"
-        // refinement (operator decision) would change these assertions.
-        let max = 5;
-        let mut rung = 0u8;
-        for _ in 0..4 {
-            rung = next_rung(rung, CycleVerdict::DhanFailed, max);
-            assert_eq!(rung, 1, "failed minute shifts home → rung 1");
-            rung = next_rung(rung, CycleVerdict::Clean, max);
-            assert_eq!(rung, 0, "clean minute recovers rung 1 → home");
+    fn test_dhan_shape_ladder_alternating_pattern_never_degrades() {
+        // 2026-07-16 transform of the retired F7 amplitude-1 pin: the old
+        // anchor ladder shifted on ANY single failing cycle (amplitude-1
+        // oscillation under an alternating pattern). The shape ladder's
+        // streak thresholds SUBSUME that concern — a perfectly
+        // alternating fail/clean minute pattern never reaches 2
+        // consecutive dirty cycles, so the shape holds rung 0 forever.
+        let mut l = StreakLadder::starting_at(0);
+        for _ in 0..8 {
+            assert_eq!(l.advance(true, 2, 3, 0, DHAN_SHAPE_MAX_STEP), None);
+            assert_eq!(l.step, 0, "one dirty cycle never reshapes");
+            assert_eq!(l.advance(false, 2, 3, 0, DHAN_SHAPE_MAX_STEP), None);
+            assert_eq!(l.step, 0);
         }
-        // The oscillation is bounded at amplitude 1: it can never walk
-        // deeper without CONSECUTIVE failing cycles.
-        assert!(rung <= 1);
     }
 
     #[test]
@@ -493,27 +526,44 @@ mod tests {
     }
 
     #[test]
-    fn test_spot_group_index_encodes_operator_groupings() {
-        // Step 0: [[4]] — all 4 at the anchor slot.
-        for k in 0..4 {
-            assert_eq!(spot_group_index(0, k), 0);
+    fn test_spot_second_buckets_encodes_rung_and_tier_groupings() {
+        // Rung 0 (the operator's ALL-7 primary, 2026-07-16 correction):
+        // every spot shares the burst second with the 3 chains.
+        assert_eq!(spot_second_buckets(0, 0), [0, 0, 0, 0]);
+        // Tier degradation happens WITHIN the burst group, greedy
+        // overflow spilling to the next 1000ms buckets.
+        assert_eq!(spot_second_buckets(0, 1), [0, 0, 0, 1]);
+        assert_eq!(spot_second_buckets(0, 2), [0, 0, 1, 1]);
+        // Rung 0 fully sequential (tier 3): one spot per second, greedy
+        // spill forward — [T+1, T+2, T+3, T+4] relative buckets.
+        assert_eq!(spot_second_buckets(0, 3), [0, 1, 2, 3]);
+        // Rung 1 (split fallback): all 4 spots in second 2 at tier 0;
+        // tier degradation happens WITHIN the second group, spilling
+        // overflow to later 1000ms buckets.
+        assert_eq!(spot_second_buckets(1, 0), [1, 1, 1, 1]);
+        assert_eq!(spot_second_buckets(1, 1), [1, 1, 1, 2]);
+        assert_eq!(spot_second_buckets(1, 2), [1, 1, 2, 2]);
+        assert_eq!(spot_second_buckets(1, 3), [1, 2, 3, 4]);
+        // Tier steps past the max clamp to fully sequential.
+        assert_eq!(spot_second_buckets(0, 9), [0, 1, 2, 3]);
+        assert_eq!(spot_second_buckets(9, 9), [1, 2, 3, 4]);
+        // Two-bucket budget safety (2026-07-16 correction): the burst
+        // second holds ≤4 SPOTS — the Data-API bucket (4 ≤ 5); the 3
+        // concurrent chains sit in the option-chain API's OWN
+        // per-(underlying, expiry) budget and never count here.
+        for shape in 0..=1u8 {
+            for step in 0..=SPOT_CONCURRENCY_MAX_STEP {
+                let buckets = spot_second_buckets(shape, step);
+                let burst_spots = buckets.iter().filter(|b| **b == 0).count();
+                assert!(burst_spots <= 4, "shape {shape} step {step}");
+                // Assignments are non-decreasing in target order.
+                for w in buckets.windows(2) {
+                    assert!(w[0] <= w[1]);
+                }
+            }
         }
-        // Step 1: [[3],[1]] — VIX (idx 3, the advisory) alone second.
-        assert_eq!(spot_group_index(1, 0), 0);
-        assert_eq!(spot_group_index(1, 1), 0);
-        assert_eq!(spot_group_index(1, 2), 0);
-        assert_eq!(spot_group_index(1, 3), 1);
-        // Step 2: [[2],[2]].
-        assert_eq!(spot_group_index(2, 0), 0);
-        assert_eq!(spot_group_index(2, 1), 0);
-        assert_eq!(spot_group_index(2, 2), 1);
-        assert_eq!(spot_group_index(2, 3), 1);
-        // Step 3 (and any clamp past it): fully sequential.
-        for k in 0..4 {
-            assert_eq!(spot_group_index(3, k), k);
-            assert_eq!(spot_group_index(9, k), k);
-        }
-        // The structural floor per window cap: no group may exceed the cap.
+        // The structural floor per window cap: no BUCKET's spot count may
+        // exceed the cap, at either shape rung.
         assert_eq!(min_spot_step_for_cap(5), 0);
         assert_eq!(min_spot_step_for_cap(4), 0);
         assert_eq!(min_spot_step_for_cap(3), 1);
@@ -522,15 +572,16 @@ mod tests {
         assert_eq!(min_spot_step_for_cap(0), 3, "fail-closed sequential");
         for cap in 1..=5u32 {
             let floor = min_spot_step_for_cap(cap);
-            for step in floor..=SPOT_CONCURRENCY_MAX_STEP {
-                for group in 0..4 {
-                    let size = (0..4)
-                        .filter(|k| spot_group_index(step, *k) == group)
-                        .count();
-                    assert!(
-                        size as u32 <= cap,
-                        "cap {cap} step {step} group {group} size {size}"
-                    );
+            for shape in 0..=DHAN_SHAPE_MAX_STEP {
+                for step in floor..=SPOT_CONCURRENCY_MAX_STEP {
+                    let buckets = spot_second_buckets(shape, step);
+                    for bucket in 0..=4usize {
+                        let size = buckets.iter().filter(|b| **b == bucket).count();
+                        assert!(
+                            size as u32 <= cap,
+                            "cap {cap} shape {shape} step {step} bucket {bucket} size {size}"
+                        );
+                    }
                 }
             }
         }

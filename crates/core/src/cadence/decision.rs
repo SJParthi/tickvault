@@ -150,9 +150,8 @@ pub struct DecisionSnapshot {
     /// TRUE for the session's last cycle (T = 15:30:00) — kept in
     /// dry-run, log-only (design §1 "Day edges").
     pub post_close: bool,
-    /// Decision latency: emit instant − T, ms (negative only for Dhan's
-    /// theoretical pre-close completion — not reachable with post-close
-    /// spots).
+    /// Decision latency: emit instant − T, ms (never negative under the
+    /// 2026-07-16 shape — every fire is post-close).
     pub latency_ms: i64,
     /// Per-underlying moneyness folds (NIFTY / BANKNIFTY / SENSEX order).
     pub moneyness: [MoneynessFold; ChainUnderlying::COUNT],

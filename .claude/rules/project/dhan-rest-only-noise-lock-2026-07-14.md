@@ -56,7 +56,21 @@ falling edge). This is a variant EXTENSION of family (2), not a 5th family: it s
 "the Dhan option-chain pull is failing" — scoped to one index. Everything else in §2 stands;
 the deleted/silenced table is untouched.
 
-**Deleted or silenced 2026-07-14 (everything else Dhan):**
+**§2.2 — 2026-07-16: the cadence expiry cross-broker DISAGREEMENT page joins the allowed
+set.** Coordinator ruling 2026-07-16 (verbatim, the authority this lock's §3 demands before
+any new Dhan-scoped page): *"R6 — expiry cross-broker disagreement must be a REAL typed
+NotificationEvent Telegram page (not log-only) + a dated 2026-07-16 row in
+dhan-rest-only-noise-lock-2026-07-14.md §2."* The cadence scheduler's pre-market expiry
+resolution (`cadence-error-codes.md` §0) can find Dhan's and Groww's contract lists
+DISAGREEING on today's policy expiry for one underlying — Dhan's exchange-sourced date WINS
+and keys BOTH lanes. The new page is `NotificationEvent::CadenceExpiryDisagreement` (High):
+edge-latched ONCE per underlying per day (the day-locked store's `newly_disagreeing` latch),
+body names BOTH brokers + both dates + that the Dhan date now keys both lanes (plain English
+per the 10 commandments). This is a CROSS-BROKER data-integrity page, not a Dhan-failure
+family: it fires only when both brokers resolved and their answers split — never per wave,
+never on a single-broker outage (those stay the log-only `expiry_unresolved` stage + the
+pre-market deadline page). Emit site: the `newly_disagreeing` arm in
+`crates/core/src/cadence/runner.rs`; sink threaded from boot via `cadence_boot.rs`.
 
 | Component | Disposition |
 |---|---|
