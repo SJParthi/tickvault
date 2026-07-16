@@ -1299,6 +1299,14 @@ fn ram_store_upsert_seals_into(
 /// and block-PREPENDS in O(day) instead; a resident-day repair refold
 /// falls through to per-bar upsert (replace in place). No-op when the
 /// store is not installed.
+///
+/// HONEST divergence note (PR-2 round-1): this hook records the fold
+/// OUTPUT unconditionally, while the paced seal emission alongside it can
+/// `PaceAction::GiveUp` (per-day wait budget) and drop the SAME seals from
+/// the `candles_*` write path — so RAM may transiently hold bars the
+/// candle tables dropped, until the next boot's catch-up re-folds them
+/// from the durable `spot_1m_rest` source (QuestDB remains the durable
+/// truth; the divergence is bounded to one session and self-heals).
 fn ram_store_record_day(
     feed: Feed,
     security_id: SecurityId,
