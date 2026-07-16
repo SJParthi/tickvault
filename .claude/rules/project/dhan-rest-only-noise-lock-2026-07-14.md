@@ -25,16 +25,19 @@
 
 ## §1. The rule (one line)
 
-**The ONLY Dhan Telegram alerts that can ever fire are: (1) the DHAN spot-1m
-pull failing/recovered, (2) the DHAN option-chain pull failing/recovered,
-(3) the DHAN token-unobtainable Critical, and (4) the CloudWatch 4h
-token-remaining early-warning — every other Dhan-era page, probe, watchdog
+**The ONLY Dhan-scoped Telegram alerts that can ever fire are: (1) the DHAN
+spot-1m pull failing/recovered, (2) the DHAN option-chain pull
+failing/recovered, (3) the DHAN token-unobtainable Critical, (4) the
+CloudWatch 4h token-remaining early-warning, and (5 — added 2026-07-16 per
+the §2.2 dated row) the cadence expiry cross-broker DISAGREEMENT page (a
+cross-broker data-integrity page naming BOTH brokers, not a Dhan-failure
+family) — every other Dhan-era page, probe, watchdog
 Telegram, and dead alarm is deleted or silenced; the token machinery
 self-heals SILENTLY.**
 
 ---
 
-## §2. The contract table (the final 4-item Dhan alert set)
+## §2. The contract table (the final 4-item Dhan alert set + the §2.2 2026-07-16 cross-broker addition)
 
 | # | Allowed Dhan alert | Variant(s) / route | Fires when |
 |---|---|---|---|
@@ -57,8 +60,12 @@ falling edge). This is a variant EXTENSION of family (2), not a 5th family: it s
 the deleted/silenced table is untouched.
 
 **§2.2 — 2026-07-16: the cadence expiry cross-broker DISAGREEMENT page joins the allowed
-set.** Coordinator ruling 2026-07-16 (verbatim, the authority this lock's §3 demands before
-any new Dhan-scoped page): *"R6 — expiry cross-broker disagreement must be a REAL typed
+set.** Authority: the OPERATOR's 2026-07-16 cadence/expiry-disagreement directive, relayed
+via the coordinator session (verbatim intent, labeled as such per the house §38.0-Context-3
+convention — this dated row is the rule-file edit §3 demands before any new Dhan-scoped
+page): a cross-broker expiry split must page the operator as a real Telegram alert, never a
+log-only line. The coordinator's implementation ruling relaying it (verbatim): *"R6 —
+expiry cross-broker disagreement must be a REAL typed
 NotificationEvent Telegram page (not log-only) + a dated 2026-07-16 row in
 dhan-rest-only-noise-lock-2026-07-14.md §2."* The cadence scheduler's pre-market expiry
 resolution (`cadence-error-codes.md` §0) can find Dhan's and Groww's contract lists

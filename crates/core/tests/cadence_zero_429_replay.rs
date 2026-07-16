@@ -786,7 +786,14 @@ proptest! {
 
             // The Dhan SHAPE ladder walks on arming-failure dirty
             // streaks, recovers on clean streaks (2026-07-16 — the
-            // runner's fold, mirrored exactly).
+            // runner's fold, mirrored exactly EXCEPT the RS1(b)
+            // per-IST-day rung-0 re-entry cap, deliberately NOT
+            // mirrored: the cap only PINS the shape at rung 1 (a shape
+            // whose slot tables this replay already proves legal at
+            // every transition), so the uncapped sim exercises a STRICT
+            // SUPERSET of the capped runner's shape sequences — never
+            // an unbounded-recovery assertion (the cap's termination
+            // property is unit-pinned in ladder.rs).
             let _ = dhan_shape_ladder.advance(
                 arming,
                 cfg.concurrency_degrade_after_dirty_cycles,
@@ -809,7 +816,9 @@ proptest! {
             // collided cycle entirely, so the collision class can never
             // reach these asserts. Anchor safety rests on the literal
             // :30 phase pin below + the gate-level collision doc test
-            // (`test_cadence_gate_expiry_fire_in_burst_window_defers_fourth_nominal_spot`).
+            // (`test_cadence_gate_expiry_invasion_tolerance_and_cap5_backstop`
+            // — the 2026-07-16 two-bucket re-derivation of the retired
+            // burst-window-defers pin).
             // What THIS arm proves: the anchored waves flow through the
             // SAME combined ledger (the L1 budget honesty) and fire at
             // their anchor instant.

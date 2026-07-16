@@ -2747,25 +2747,36 @@ impl ApplicationConfig {
         // scheduler and the legacy per-minute RECORD-capture legs would
         // place DOUBLE demand on the same broker rate budgets if both ran
         // for one broker — no double demand is ever legal. Enabling the
-        // cadence for a broker lane requires that lane's legacy legs to
-        // stand down FIRST; full subsumption (the cadence feeding the
-        // capture tables) is the flagged follow-up PR. base.toml today
-        // (legacy legs on, cadence off) stays valid.
+        // cadence requires the legacy legs to stand down FIRST; full
+        // subsumption (the cadence feeding the capture tables) is the
+        // flagged follow-up PR. base.toml today (legacy legs on, cadence
+        // off) stays valid.
+        //
+        // RS3 (2026-07-16): keyed on the LEG configs ALONE — deliberately
+        // NOT on `feeds.*_enabled`. The cadence lanes activate on the
+        // RUNTIME feed atomics (one toggle away from the boot flags),
+        // while the legacy legs spawn on their OWN config gates
+        // regardless of the feed flags — so the earlier boot-time key on
+        // `feeds.*_enabled` admitted cadence=ON + feed=OFF + legs=ON, one
+        // runtime feed enable away from reconstructing the forbidden
+        // double demand. (Today both enable directions happen to be
+        // unconditionally 409'd at the API — the PR-C2/S2b retired-lane
+        // refusals — but those refusals exist for unrelated reasons and
+        // must not be this invariant's only wall.) Fail-closed at the
+        // root: cadence + ANY legacy leg of the same broker is refused,
+        // whatever the feed flags say.
         if self.cadence.enabled {
-            if self.feeds.dhan_enabled
-                && (self.spot_1m_rest.enabled || self.option_chain_1m.enabled)
-            {
+            if self.spot_1m_rest.enabled || self.option_chain_1m.enabled {
                 bail!(
-                    "cadence.enabled with the Dhan lane active requires the legacy Dhan per-minute legs to stand down first: set [spot_1m_rest].enabled = false and [option_chain_1m].enabled = false (no double demand on the Dhan Data-API budget is ever legal — coordinator ruling B, 2026-07-16)"
+                    "cadence.enabled requires the legacy Dhan per-minute legs to stand down first: set [spot_1m_rest].enabled = false and [option_chain_1m].enabled = false (no double demand on the Dhan Data-API budget is ever legal — coordinator ruling B, 2026-07-16; keyed on the leg configs alone since RS3, regardless of feeds.dhan_enabled)"
                 );
             }
-            if self.feeds.groww_enabled
-                && (self.groww_spot_1m.enabled
-                    || self.groww_option_chain_1m.enabled
-                    || self.groww_contract_1m.enabled)
+            if self.groww_spot_1m.enabled
+                || self.groww_option_chain_1m.enabled
+                || self.groww_contract_1m.enabled
             {
                 bail!(
-                    "cadence.enabled with the Groww lane active requires the legacy Groww per-minute legs to stand down first: set [groww_spot_1m].enabled = false, [groww_option_chain_1m].enabled = false and [groww_contract_1m].enabled = false (no double demand on the shared Groww rate budget is ever legal — coordinator ruling B, 2026-07-16)"
+                    "cadence.enabled requires the legacy Groww per-minute legs to stand down first: set [groww_spot_1m].enabled = false, [groww_option_chain_1m].enabled = false and [groww_contract_1m].enabled = false (no double demand on the shared Groww rate budget is ever legal — coordinator ruling B, 2026-07-16; keyed on the leg configs alone since RS3, regardless of feeds.groww_enabled)"
                 );
             }
         }
@@ -5730,15 +5741,18 @@ mod tests {
     }
 
     /// CAPTURE-LEG MUTUAL EXCLUSION (coordinator ruling B, 2026-07-16 —
-    /// SUBSUME, NEVER SHARE, interim fail-closed path): enabling the
-    /// cadence for a broker lane while that lane's legacy per-minute
-    /// RECORD-capture legs are still enabled is a validation ERROR (no
-    /// double demand on one broker's rate budget is ever legal); cadence
-    /// on with the legs off is legal; cadence off with the legs on (the
-    /// base.toml shape today) stays legal.
+    /// SUBSUME, NEVER SHARE, interim fail-closed path; RS3 hardening
+    /// same day): enabling the cadence while ANY legacy per-minute
+    /// RECORD-capture leg is still enabled is a validation ERROR (no
+    /// double demand on one broker's rate budget is ever legal) —
+    /// REGARDLESS of `feeds.*_enabled`, because the cadence lanes key on
+    /// the RUNTIME feed atomics while the legacy legs spawn on their own
+    /// config gates, so the boot-time feed flags bound neither side.
+    /// Cadence on with the legs off is legal; cadence off with the legs
+    /// on (the base.toml shape today) stays legal.
     #[test]
     fn test_application_config_validate_cadence_capture_leg_mutual_exclusion() {
-        // Cadence ON + Dhan lane active + a legacy Dhan leg ON → error.
+        // Cadence ON + a legacy Dhan leg ON → error (feed flag irrelevant).
         let mut config = make_valid_config();
         config.cadence.enabled = true;
         config.feeds.dhan_enabled = true;
@@ -5752,7 +5766,7 @@ mod tests {
         config.spot_1m_rest.enabled = false;
         config.option_chain_1m.enabled = true;
         assert!(config.validate().is_err(), "chain leg alone also refuses");
-        // Cadence ON + Groww lane active + a legacy Groww leg ON → error.
+        // Cadence ON + a legacy Groww leg ON → error (feed flag irrelevant).
         let mut config = make_valid_config();
         config.cadence.enabled = true;
         config.feeds.groww_enabled = true;
@@ -5783,8 +5797,12 @@ mod tests {
             config.validate().is_ok(),
             "cadence off + legacy legs on is today's valid shape"
         );
-        // A DISABLED lane's legs never block the OTHER lane's cadence:
-        // Groww lane off ⇒ its legs are inert for the exclusion.
+        // RS3 (2026-07-16): a boot-time-DISABLED feed lane's legs DO
+        // block the cadence now — the pre-RS3 key on `feeds.*_enabled`
+        // admitted cadence=ON + feed=OFF + legs=ON, which sat one
+        // runtime /api/feeds enable away from reconstructing the
+        // forbidden double demand (the cadence lanes key on the RUNTIME
+        // atomics, not the boot flags). Fail-closed at the root.
         let mut config = make_valid_config();
         config.cadence.enabled = true;
         config.feeds.dhan_enabled = true;
@@ -5792,9 +5810,21 @@ mod tests {
         config.spot_1m_rest.enabled = false;
         config.option_chain_1m.enabled = false;
         config.groww_spot_1m.enabled = true;
+        let err = config.validate().unwrap_err();
         assert!(
-            config.validate().is_ok(),
-            "an inactive lane's legs do not double-demand"
+            err.to_string().contains("Groww"),
+            "RS3: a runtime-reachable lane's legs must refuse regardless \
+             of the boot feed flag, got: {err}"
+        );
+        // Same in the Dhan direction: feeds.dhan_enabled=false does not
+        // exempt the Dhan legs from the exclusion.
+        let mut config = make_valid_config();
+        config.cadence.enabled = true;
+        config.feeds.dhan_enabled = false;
+        config.spot_1m_rest.enabled = true;
+        assert!(
+            config.validate().is_err(),
+            "RS3: Dhan legs refuse with feeds.dhan_enabled=false too"
         );
     }
 

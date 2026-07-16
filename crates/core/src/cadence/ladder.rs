@@ -37,6 +37,19 @@ use super::executor::CadenceFetchError;
 /// burst (2026-07-16 directive + same-day correction).
 pub const DHAN_SHAPE_MAX_STEP: u8 = 1;
 
+/// Per-IST-day cap on Dhan shape-ladder RE-ENTRIES to rung 0 (RS1(b),
+/// 2026-07-16 — the termination BELT for the UNVERIFIED-LIVE chain-bucket
+/// exemption, rule file §0b): if the wire enforces ONE Data-API bucket,
+/// every recovered all-7 burst 429s again and the streak ladder would
+/// oscillate 0⇄1 ALL DAY (recover after 3 clean rung-1 cycles → 429 → 2
+/// dirty → demote → repeat), re-armed every morning by the day-start
+/// reset — and `ladder_exhausted` never fires because rung 1 stays clean.
+/// After this many same-day re-entries to rung 0, the NEXT demotion is
+/// FINAL for the IST day: the ladder HOLDS rung 1 (the split fallback)
+/// until the day-start reset re-arms it, and the runner emits ONE
+/// edge-latched CADENCE-01 `rung0_reentry_cap_latched` log for the day.
+pub const CADENCE_DHAN_RUNG0_REENTRY_CAP_PER_DAY: u32 = 3;
+
 /// Highest Dhan spot-concurrency step — step 3 = fully sequential 1×4.
 pub const SPOT_CONCURRENCY_MAX_STEP: u8 = 3;
 
@@ -122,6 +135,52 @@ impl StreakLadder {
     }
 }
 
+/// Day-scoped bookkeeping for [`CADENCE_DHAN_RUNG0_REENTRY_CAP_PER_DAY`]
+/// (RS1(b), 2026-07-16). Pure state fold — no I/O; the runner resets it
+/// (alongside the ladders) at the IST day start, which re-arms the cap.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DhanRung0ReentryCap {
+    /// Recoveries back to rung 0 observed this IST day.
+    reentries_today: u32,
+    /// The cap latched — rung 1 is held for the rest of the session.
+    latched: bool,
+}
+
+impl DhanRung0ReentryCap {
+    /// Fold one Dhan shape-ladder shift. Returns `true` exactly ONCE per
+    /// IST day — at the demotion that follows the cap-th re-entry (the
+    /// moment the hold becomes binding) — so the caller can emit the
+    /// edge-latched `rung0_reentry_cap_latched` log. Below the cap this
+    /// is pure bookkeeping and behavior is unchanged.
+    pub fn record_shift(&mut self, shift: StreakShift) -> bool {
+        match shift {
+            StreakShift::Recovered => {
+                self.reentries_today = self.reentries_today.saturating_add(1);
+                false
+            }
+            StreakShift::Degraded => {
+                if self.reentries_today >= CADENCE_DHAN_RUNG0_REENTRY_CAP_PER_DAY && !self.latched {
+                    self.latched = true;
+                    true
+                } else {
+                    false
+                }
+            }
+        }
+    }
+
+    /// The EFFECTIVE min step for the Dhan shape ladder: rung 1
+    /// ([`DHAN_SHAPE_MAX_STEP`]) once latched — recovery back to rung 0
+    /// is refused for the rest of the IST day — else 0. Passing this as
+    /// `min_step` into [`StreakLadder::advance`] is clamp-safe: the
+    /// latch only fires ON a demotion, so the ladder already sits AT
+    /// rung 1 when the floor rises (the defensive clamp is a no-op).
+    #[must_use]
+    pub fn min_step(&self) -> u8 {
+        if self.latched { DHAN_SHAPE_MAX_STEP } else { 0 }
+    }
+}
+
 /// The Dhan spot SECOND-BUCKET assignment (2026-07-16): which
 /// 1000ms-spaced second bucket (0-based from the burst second) spot
 /// target `target_idx` (`SpotTarget::ALL` order:
@@ -140,13 +199,22 @@ impl StreakLadder {
 ///   overflow spilling to the NEXT 1000ms bucket (per-second-group tier
 ///   math, coordinator addendum item 4).
 ///
-/// Budget safety (the TWO-BUCKET model, operator correction 2026-07-16):
-/// the burst second is 3 chains + ≤4 spots. The 4 spot fires sit in the
-/// Data-API 5/sec bucket (4 ≤ 5); the 3 chain fires sit in the
-/// option-chain API's OWN per-(underlying, expiry) budget (different
-/// underlyings explicitly concurrent per Dhan's documented rule) — so
-/// all-7 breaches NEITHER documented budget. Assignments are
-/// non-decreasing in `target_idx`. Pure, zero-alloc.
+/// Budget safety (the TWO-BUCKET model, operator correction 2026-07-16 —
+/// the chain-bucket EXEMPTION is **Assumed / UNVERIFIED-LIVE**, RS1
+/// honesty marker in the rule file §0b): the burst second is 3 chains +
+/// ≤4 spots. The 4 spot fires sit in the Data-API 5/sec bucket (4 ≤ 5);
+/// the 3 chain fires are gated ONLY by the option-chain API's
+/// per-(underlying, expiry) rule (different underlyings explicitly
+/// concurrent per Dhan's documented rule) — but whether Dhan ALSO counts
+/// chain fires against the Data-API 5/sec bucket is UNVERIFIED
+/// (counter-evidence: `dhan/api-introduction.md` rule 10 lists Option
+/// Chain under Data APIs 5/sec, and the §8 grant math historically
+/// counted chains + spots jointly). The 2026-07-16 15:35 IST post-market
+/// wire probe is the first live evidence; if the wire enforces ONE
+/// bucket, the RateLimited-armed shape ladder demotes and the per-day
+/// rung-0 re-entry cap ([`CADENCE_DHAN_RUNG0_REENTRY_CAP_PER_DAY`])
+/// bounds the oscillation. Assignments are non-decreasing in
+/// `target_idx`. Pure, zero-alloc.
 #[must_use]
 pub fn spot_second_buckets(dhan_shape: u8, spot_step: u8) -> [usize; 4] {
     let base: [usize; 4] = if dhan_shape == 0 {
@@ -411,6 +479,132 @@ mod tests {
             1_500,
             15_000
         ));
+    }
+
+    /// Drive one full demote-then-recover oscillation of the Dhan shape
+    /// ladder through the cap: 2 dirty cycles (Degraded), then 3 clean
+    /// cycles (Recovered). Returns the latch verdicts of the two shifts.
+    fn oscillate_once(l: &mut StreakLadder, cap: &mut DhanRung0ReentryCap) -> (bool, bool) {
+        assert_eq!(
+            l.advance(true, 2, 3, cap.min_step(), DHAN_SHAPE_MAX_STEP),
+            None
+        );
+        let demote = l
+            .advance(true, 2, 3, cap.min_step(), DHAN_SHAPE_MAX_STEP)
+            .expect("2 consecutive dirty cycles must demote");
+        assert_eq!(demote, StreakShift::Degraded);
+        let demote_latched = cap.record_shift(demote);
+        assert_eq!(
+            l.advance(false, 2, 3, cap.min_step(), DHAN_SHAPE_MAX_STEP),
+            None
+        );
+        assert_eq!(
+            l.advance(false, 2, 3, cap.min_step(), DHAN_SHAPE_MAX_STEP),
+            None
+        );
+        let recover = l
+            .advance(false, 2, 3, cap.min_step(), DHAN_SHAPE_MAX_STEP)
+            .expect("3 consecutive clean cycles below the cap must recover");
+        assert_eq!(recover, StreakShift::Recovered);
+        let recover_latched = cap.record_shift(recover);
+        (demote_latched, recover_latched)
+    }
+
+    #[test]
+    fn test_dhan_rung0_reentry_cap_record_shift_below_cap_behavior_unchanged() {
+        // RS1(b) test (iii): below the cap, oscillation behavior is
+        // byte-identical to the uncapped ladder — 3 full demote-recover
+        // oscillations complete, min_step stays 0, the latch never fires.
+        let mut l = StreakLadder::starting_at(0);
+        let mut cap = DhanRung0ReentryCap::default();
+        for _ in 0..usize::try_from(CADENCE_DHAN_RUNG0_REENTRY_CAP_PER_DAY).unwrap() {
+            let (demote_latched, recover_latched) = oscillate_once(&mut l, &mut cap);
+            assert!(!demote_latched, "no latch below the cap");
+            assert!(!recover_latched, "a recovery never latches");
+            assert_eq!(l.step, 0, "recovery back to rung 0 admitted below the cap");
+            assert_eq!(cap.min_step(), 0, "floor unchanged below the cap");
+        }
+    }
+
+    #[test]
+    fn test_dhan_rung0_reentry_cap_min_step_holds_rung1_and_latches_once() {
+        // RS1(b) test (i): 3 demote-recover oscillations, then the 4th
+        // demotion latches the cap EXACTLY ONCE — the 4th recovery
+        // attempt is refused and the ladder holds rung 1 all session.
+        let mut l = StreakLadder::starting_at(0);
+        let mut cap = DhanRung0ReentryCap::default();
+        for _ in 0..usize::try_from(CADENCE_DHAN_RUNG0_REENTRY_CAP_PER_DAY).unwrap() {
+            oscillate_once(&mut l, &mut cap);
+        }
+        // The 4th demotion (2 consecutive dirty cycles) latches the cap.
+        assert_eq!(
+            l.advance(true, 2, 3, cap.min_step(), DHAN_SHAPE_MAX_STEP),
+            None
+        );
+        let demote = l
+            .advance(true, 2, 3, cap.min_step(), DHAN_SHAPE_MAX_STEP)
+            .expect("the 4th demotion still happens");
+        assert_eq!(demote, StreakShift::Degraded);
+        assert!(
+            cap.record_shift(demote),
+            "the cap-exhausting demotion latches"
+        );
+        assert_eq!(
+            cap.min_step(),
+            DHAN_SHAPE_MAX_STEP,
+            "rung 1 is the floor now"
+        );
+        // The 4th recovery attempt is REFUSED — any run of clean cycles
+        // holds rung 1 for the rest of the session.
+        for _ in 0..10 {
+            assert_eq!(
+                l.advance(false, 2, 3, cap.min_step(), DHAN_SHAPE_MAX_STEP),
+                None,
+                "recovery to rung 0 refused after the cap latched"
+            );
+            assert_eq!(l.step, DHAN_SHAPE_MAX_STEP, "rung held at 1");
+        }
+        // The latch fires exactly once: further dirty cycles at the held
+        // rung produce NO shift (step pinned), so record_shift is never
+        // fed another Degraded — and even a hypothetical one is a no-op.
+        for _ in 0..4 {
+            assert_eq!(
+                l.advance(true, 2, 3, cap.min_step(), DHAN_SHAPE_MAX_STEP),
+                None
+            );
+        }
+        assert!(
+            !cap.record_shift(StreakShift::Degraded),
+            "the latch never fires a second time in the same day"
+        );
+    }
+
+    #[test]
+    fn test_dhan_rung0_reentry_cap_day_start_reset_rearms() {
+        // RS1(b) test (ii): the IST day-start reset (the runner assigns
+        // fresh `Default`/`starting_at(0)` values, mirrored here) re-arms
+        // the cap — the next day oscillates freely below the cap again.
+        let mut l = StreakLadder::starting_at(0);
+        let mut cap = DhanRung0ReentryCap::default();
+        for _ in 0..usize::try_from(CADENCE_DHAN_RUNG0_REENTRY_CAP_PER_DAY).unwrap() {
+            oscillate_once(&mut l, &mut cap);
+        }
+        assert_eq!(
+            l.advance(true, 2, 3, cap.min_step(), DHAN_SHAPE_MAX_STEP),
+            None
+        );
+        let demote = l
+            .advance(true, 2, 3, cap.min_step(), DHAN_SHAPE_MAX_STEP)
+            .expect("the cap-exhausting demotion");
+        assert!(cap.record_shift(demote));
+        assert_eq!(cap.min_step(), DHAN_SHAPE_MAX_STEP);
+        // Day-start reset (the runner's exact reset statements).
+        l = StreakLadder::starting_at(0);
+        cap = DhanRung0ReentryCap::default();
+        assert_eq!(cap.min_step(), 0, "fresh day: floor re-armed to rung 0");
+        let (demote_latched, recover_latched) = oscillate_once(&mut l, &mut cap);
+        assert!(!demote_latched && !recover_latched);
+        assert_eq!(l.step, 0, "fresh day: oscillation admitted again");
     }
 
     #[test]

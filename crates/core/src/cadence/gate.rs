@@ -156,6 +156,14 @@ impl WindowRing {
 
     /// Record an AUTHORIZED fire at `now` (callers check [`Self::admissible`]
     /// first, under the same lock — atomic both-or-neither).
+    ///
+    /// Defensive note (RS7, 2026-07-16): the head-is-oldest invariant
+    /// assumes non-decreasing `now` values (the monotonic domain every
+    /// caller lives in); a REGRESSED input would leave the ring ordered
+    /// by insertion, not by instant — `admissible` then compares against
+    /// an instant that may not be the true oldest, erring toward
+    /// OVER-admission by at most the regression skew. Production-
+    /// unreachable (all call sites pass monotonic instants).
     fn record(&mut self, now_monotonic_ms: i64) {
         if self.len == self.cap {
             // The oldest instant falls out of the window; overwrite it.
@@ -197,12 +205,22 @@ struct DhanWindows {
     /// [`CADENCE_SPOT_WINDOW_CAP_CEILING`] (5 = Dhan's Data-API per-
     /// second hard budget). CHAIN fires do NOT touch this ring — the
     /// TWO-BUCKET model: the option-chain API carries its OWN documented
-    /// budget (1 unique request per 3s per SAME (underlying, expiry)
-    /// key; different underlyings explicitly concurrent), enforced
-    /// solely by the per-(underlying, expiry) CAS stamps. Counting
-    /// chains here would self-refuse the operator's all-7 burst
-    /// (3 chains + 4 spots = 7 > 5) against a cap neither budget
-    /// actually imposes on the mix.
+    /// per-key budget (1 unique request per 3s per SAME (underlying,
+    /// expiry) key; different underlyings explicitly concurrent),
+    /// enforced solely by the per-(underlying, expiry) CAS stamps.
+    /// HONESTY (RS1, 2026-07-16): whether Dhan EXEMPTS optionchain
+    /// fires from the Data-API 5/sec bucket is **Assumed /
+    /// UNVERIFIED-LIVE** — counter-evidence: `dhan/api-introduction.md`
+    /// rule 10 lists Option Chain under Data APIs (5/sec), and the §8
+    /// grant math historically counted chains + spots jointly. Counting
+    /// chains here would self-refuse the operator's mandated all-7
+    /// burst (3 chains + 4 spots = 7 > 5), so the exemption is taken as
+    /// the operator's reading pending the 2026-07-16 15:35 IST
+    /// post-market wire probe (the first live evidence). If the wire
+    /// enforces ONE bucket, the RateLimited-armed shape ladder demotes
+    /// and the per-IST-day rung-0 re-entry cap
+    /// (`ladder::CADENCE_DHAN_RUNG0_REENTRY_CAP_PER_DAY`) holds rung 1
+    /// for the session — the oscillation belt either way.
     combined: WindowRing,
 }
 
