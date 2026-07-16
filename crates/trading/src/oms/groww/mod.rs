@@ -65,5 +65,19 @@ pub mod rate_budget;
 // transport lives in `api_client.rs` (Gate 5).
 pub mod smart_orders;
 
-/// Smart Orders (GTT/OCO) area — `GROWW-OCO-*` (§39.3, 2026-07-15).
-pub mod smart_orders;
+pub mod margin; // Margin (GROWW-MARG-*)
+
+/// Portfolio area (`GROWW-PORT-*`) — field-inventory probe (item 6c.2).
+pub mod portfolio;
+
+/// User + Exceptions (readiness) — GROWW-READY-* prefix reserved; readiness
+/// reuses the existing SPOT1M codes per its design (§39.3).
+pub mod user;
+
+/// Order/position PUSH transport (order-push Stage B, 2026-07-16 —
+/// `GROWW-PUSH-*` codes reserved in Stage A). The NATS-over-WS primitives
+/// retired with the Groww live feed (2026-07-15), restored here receive-only
+/// for the order-update/position-update push channel. Inherits the
+/// `groww_orders` feature gate at the `oms/mod.rs` declaration site — a
+/// default build contains none of this code.
+pub mod push;
