@@ -113,6 +113,18 @@ honored trivially at one request per underlying per minute + a defensive
 row to `option_chain_1m` (DEDUP `(ts, underlying_security_id,
 exchange_segment, expiry, strike, leg, feed)`).
 
+**2026-07-14 — the GROWW legs' sequencing is now the AUTO-LADDER (Dhan
+unchanged):** the paragraph above continues to describe the DHAN chain leg
+verbatim. The GROWW spot + chain legs no longer sequence chain-after-spot —
+they fire in rate-safe CONCURRENT burst waves on their own minute-boundary
+timers (`two_wave` default / probe-gated `seven_concurrent`, 429
+auto-demote, optional pre-boundary warm-up, env-gated off-hours rate
+probe). Operator authorization 2026-07-14 ("approved and go ahead with the
+recommendation", relayed via the coordinator session); full contract in
+`no-rest-except-live-feed-2026-06-27.md` §9.7 +
+`groww-second-feed-scope-2026-06-19.md` §38.9; the new stage strings
+(`burst_demoted`) + counters are documented in §1/§2c below.
+
 ## §1. SPOT1M-01 — per-minute spot fetch degraded
 
 **Severity:** High. **Auto-triage safe:** Yes (the degrade already
@@ -284,6 +296,36 @@ under the `tv_groww_spot1m_*` prefix (`fetch_total{outcome}`,
 `ts_form_total{form}` — the UNVERIFIED-LIVE timestamp wire-format probe).
 The typed pages are the Groww-specific `GrowwSpot1mFetchDegraded` /
 `GrowwSpot1mFetchRecovered` Telegram events (same 3-minute edge).
+
+**2026-07-14 auto-ladder update (operator "approved and go ahead with the
+recommendation", relayed via the coordinator session —
+`no-rest-except-live-feed-2026-06-27.md` §9.7 /
+`groww-second-feed-scope-2026-06-19.md` §38.9):** the Groww spot targets
+now fetch CONCURRENTLY per fire (the sequential loop + the old auth
+short-circuit skip rows are gone — every target gets a REAL forensics
+row), at a TIER-dependent post-boundary delay (`two_wave` default:
+close+1,350 ms; probe-gated `seven_concurrent`: close+300 ms), with a
+deterministic per-target RUNG jitter (slot × 150 ms, ALL tiers — the
+same-day fix-round HIGH-1: the 4 ladders never re-poll in lockstep on a
+correlated vendor-lag minute). New SPOT1M-01 stages:
+`stage="burst_demoted"` (`warn!`-level, edge-latched ONCE PER DEMOTION
+LEVEL — a live Groww-leg HTTP 429 steps the session one shape down the
+`two_wave → staggered → fully-sequential` ladder (fix-round MEDIUM-1;
+`seven_concurrent` enters at the top); counter
+`tv_groww_rest_burst_demoted_total{level}`; the contract leg's demotion
+edge emits the same stage with `leg="contract_1m"`) and
+`stage="wave_task_failed"` (`error!`-level, unwind builds only — release
+aborts on panic: a wave fetch task failed to JOIN; the lost target is
+synthesized as a Failed outcome for the minute, never a silent missing
+target — fix-round MEDIUM-3 documentation). New counters:
+`tv_groww_rest_burst_tier_total{tier}` (which shape fired) +
+`tv_groww_rest_warmup_total{leg, outcome}` (the pre-boundary
+unauthenticated TLS warm-up GET — best-effort, never coded/paged) +
+`tv_groww_rate_probe_requests_total{outcome}` /
+`tv_groww_rate_probe_rate_limited_total` (the env-gated off-hours rate
+probe — log-lines only, refused inside the [08:30, 16:00) IST wall-clock
+blackout on ANY day, writes no tables). Everything else in the spot
+taxonomy (ladder, backfill, sweep, edges, forensics) is unchanged.
 
 **2026-07-13 scope note — the Groww spot leg covers 4 indices (INDIA VIX
 added, SPOT ONLY; `groww-second-feed-scope-2026-06-19.md` §38.7):** the
@@ -625,11 +667,25 @@ that underlying degrades for the day, coded + counted by
 `stage="strikes_truncated"` (a hostile/oversized chain body hit the
 strike cap — truncated + counted, never unbounded). `stage="token_read"`
 lives on the shared token cache (`tv_groww_chain1m_token_read_failed_total`
-— re-read paced ≥60 s, NEVER minted). Sequencing mirrors the Dhan leg:
+— re-read paced ≥60 s, NEVER minted). ~~Sequencing mirrors the Dhan leg:
 the chain fires on the spot leg's watch signal after every spot fire,
 bounded by the ~2.5 s fallback timer; one request per underlying per
 minute, sequential, with a defensive 1 s min-gap (Groww documents no
-chain-specific rate rule). Groww counters mirror the Dhan names under the
+chain-specific rate rule).~~ **SUPERSEDED 2026-07-14 (the auto-ladder —
+`no-rest-except-live-feed-2026-06-27.md` §9.7):** the Groww chain leg
+fires on its OWN minute-boundary timer at close+300 ms — no spot signal,
+no fallback timer, no min-gap; the 3 underlyings fetch CONCURRENTLY
+within the wave (a demoted `two_wave` session adds a 350 ms intra-wave
+stagger; a FURTHER 429 drops to fully-sequential-within-wave — one whole
+per-underlying budget per slot, the fix-round MEDIUM-1 ladder floor).
+New CHAIN-02 stages: `stage="burst_demoted"` (`warn!`-level, edge-latched
+once per demotion level — a chain-leg HTTP 429 stepped the session's
+burst tier down; `tv_groww_rest_burst_demoted_total{level}`) and
+`stage="wave_task_failed"` (`error!`-level, unwind builds only — a wave
+fetch task failed to join; that underlying counts as failed for the
+minute, never silent — fix-round MEDIUM-3 documentation); the boot
+probe's inter-call pacing keeps its own 1 s spacing. Groww counters
+mirror the Dhan names under the
 `tv_groww_chain1m_*` prefix (`fetch_total{outcome}`, `close_to_data_ms`,
 `fetch_duration_ms`, `strikes_per_chain`, `legs_per_chain`,
 `payload_bytes`, `rate_limited_total`, `boundary_skipped_total`,
@@ -647,52 +703,43 @@ to `true` in base.toml — dated record in
 OFF (fail-safe) and `probe_and_report` stays `true` (inert while
 enabled; the rollback canary).
 
-**2026-07-14 — the DHAN chain leg emits this SAME code with the new
-stages** `underlying_not_served` (error, edge — the #1537 Groww mirror,
-Dhan emits field-less), `ladder_shrunk` (warn, edge-latched heuristic),
-`retry_skipped_ceiling` (warn, per refused retry — bounded ≤3/minute),
-`trading_day_flip_exit` (error, one-shot; + the SPOT1M-01 spot twin),
-plus the bounded retry counters
-(`tv_chain1m_retry_total{outcome="recovered"|"still_failed"|"skipped_ceiling"}`)
-— full contract + triage in
-`cross-source-chain-coverage-2026-07-14.md`.
-
-**2026-07-14 — the GROWW leg's zero-leg classifications are now
-SELF-EVIDENCING (empty-vs-`leg_shape_drift` split):** the same 2026-07-14
-incident's second finding — NIFTY (expiry day) classified `outcome=empty`
-every minute 14:54→15:29 IST with `errors=0` (every body WAS a parseable
-chain envelope whose `strikes` object yielded zero legs) — could NOT be
-discriminated retroactively: was the body ~40 B (a truly empty map) or
-~37 KB (entries our leg extraction dropped)? The evidence was STRUCTURALLY
-UNRECORDED — `tv_groww_chain1m_payload_bytes` + the `strikes_kept` /
-`invalid_strikes` counts were recorded ONLY on the Found arm; the Empty arm
-discarded the parsed struct and captured no body evidence (the payload
-histogram count simply dropped 3→2 at 14:55). Closed in two halves:
-(1) **EVIDENCE** — every zero-leg classification now carries
-`payload_bytes`, `strikes_seen` (RAW `strikes`-map entry count — a new
-parse diagnostic), `strikes_kept`, `invalid_strikes`, and a BOUNDED
-SANITIZED body sample (≤300 chars through the house
-`capture_rest_error_body` choke point — the exact sanitizer the failure
-arms use, so a token/credential can never leak) on ONE coded `error!` per
-affected underlying per fired minute (`stage="empty_chain"` /
-`stage="leg_shape_drift"`, `feed="groww"`), plus the new
-`tv_groww_chain1m_empty_payload_bytes` histogram (the Found-only
-`tv_groww_chain1m_payload_bytes` semantics never shift). (2) **HONEST
-RECLASSIFICATION** — the zero-legs case splits: `strikes_seen == 0` (map
-literally empty) stays `Empty` (`outcome="empty"`, audit
-`empty`/`error_class="empty_chain"` — unchanged wire values);
-`strikes_seen > 0` with zero extractable legs is now **`leg_shape_drift`**
-(the vendor served entries our leg extraction couldn't read — an ERROR,
-not an empty chain): it flows into the minute verdict's `errors` count,
-the same CHAIN-02 `minute_failed` accounting, its own
-`tv_groww_chain1m_leg_shape_drift_total` counter, and the audit row's
-EXISTING `error` outcome with `error_class="leg_shape_drift"` (no audit
-schema change, no new ErrorCode). The `underlying_not_served` detector is
-UNAFFECTED (empty and error-class minutes already counted not-served
-identically). HONEST NOTE: today's 14:54 incident class (empty vs drift)
-could not be discriminated after the fact — from this change forward it
-is, within one minute of occurrence
-(`mcp__tickvault-logs__tail_errors` shows the size + sample directly).
+**2026-07-14 — the GROWW leg gains a per-underlying not-served paging
+edge (`stage="underlying_not_served"`):** the motivating incident — on
+expiry day 2026-07-14 Groww stopped serving NIFTY's same-day-expiring
+chain at 14:54 IST (2xx, zero strikes, `outcome=empty`) while BANKNIFTY
++ SENSEX kept working (`ok=2 empty=1` per minute, ALL afternoon), and
+NOTHING paged: the `stage="escalation"` edge arms only on FULLY-failed
+minutes (ok == 0), so a single-underlying vendor cutoff was invisible.
+The new arm mirrors the spot leg's `sid_not_served` detector (§1 item
+5): a minute COUNTS toward an underlying's streak only when that
+underlying's chain came back empty/failed (FETCH-level — Empty AND
+error-class count the same; persist failures stay the escalation edge's
+M1 business) while ≥1 OTHER underlying was OK in the SAME minute; a
+global-failure minute (zero OK) neither counts nor resets — so within
+the FETCH-failure class the two edges are mutually exclusive per minute
+(the escalation edge needs ok == 0, this edge needs ≥1 OK). HONEST
+OVERLAP: a persist-failed minute with ok ≥ 1 can legitimately count
+toward BOTH edges (the M1 persist gate makes the escalation edge count
+it fully-failed while an empty sibling counts here) — two DISTINCT
+signals: persistence broken + vendor not serving one underlying. An
+auth-aborted fire (any 401 in the wave — a global token condition, even
+when a sibling underlying succeeded in the same wave; under the §9.7
+auto-ladder there is no sequential short-circuit, the HOLD is applied
+after the wave) is a tracker HOLD: neither counts nor resets. At
+`GROWW_CHAIN_1M_UNDERLYING_NOT_SERVED_THRESHOLD` (10) consecutive
+counted minutes: ONE `error!(code = CHAIN-02,
+stage = "underlying_not_served", feed = "groww", underlying,
+consecutive_minutes)` + ONE typed HIGH `GrowwChain1mUnderlyingNotServed`
+Telegram page per underlying per episode (edge-latched, Rule 4;
+re-armed only by that underlying's own recovery — falling edge = one
+Info `GrowwChain1mUnderlyingServedRecovered`). Counter:
+`tv_groww_chain1m_underlying_not_served_total{underlying}` (3 static
+label values — the pinned plain symbols), one increment per counted
+minute. The typed HIGH Telegram event IS the page — CHAIN-02 remains
+log-sink-only per §3. Streak state is per scheduler run (per trading
+day; a mid-day task respawn restarts it — the FailureEdge envelope).
+Source: `crates/app/src/groww_option_chain_1m_boot.rs`
+(`UnderlyingServedTracker` / `record_groww_chain_underlying_verdicts`).
 
 **2026-07-14 — the GROWW leg's zero-leg classifications are now
 SELF-EVIDENCING (empty-vs-`leg_shape_drift` split):** the same 2026-07-14

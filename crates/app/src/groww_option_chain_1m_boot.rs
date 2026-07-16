@@ -35,40 +35,34 @@
 //! cannot resolve DEGRADES for the day (coded error + forensics row +
 //! counter + one HIGH page) — never a guessed expiry.
 //!
-//! ## Sequencing (spot first, chain right after — best-effort, bounded)
-//! The Groww spot leg publishes a `tokio::sync::watch` signal at the END
-//! of each of its fires (success or failure). This task sleeps to each
-//! minute boundary + [`GROWW_CHAIN_1M_FALLBACK_DELAY_MS`] but wakes EARLY
-//! when the spot signal reaches its minute — the Dhan-identical semantics
-//! (`option_chain_1m_boot.rs`, whose `wait_for_signal_or_fallback` core is
-//! REUSED): a disabled, dead, or slow spot leg never blocks chain capture.
+//! ## Scheduling — the 2026-07-14 burst AUTO-LADDER (own-timer fire)
+//! (operator approval "approved and go ahead with the recommendation";
+//! contract `no-rest-except-live-feed-2026-06-27.md` §9.7 +
+//! `groww-second-feed-scope-2026-06-19.md` §38.9). This task fires on its
+//! OWN minute-boundary timer at close + [`GROWW_CHAIN_1M_FIRE_DELAY_MS`]
+//! (300 ms) — the PR-3 spot→chain watch-signal sequencing, its 2.5 s
+//! fallback timer, and the 1 s inter-underlying min-gap are RETIRED
+//! (~4.5 s of self-imposed latency deleted; the measured chain round-trip
+//! is ~0.2 s per the 2026-07-13 live probe). The chain is a live
+//! snapshot — the freshest possible decision data is the whole point.
 //!
 //! ## Rate budget + pacing
 //! Groww documents NO chain-specific rate rule
 //! (`docs/groww-ref/14-option-chain.md` §4 — the limit family is
-//! UNDOCUMENTED; Unknown ≠ unlimited). The 3 underlyings are fetched
-//! SEQUENTIALLY (at most ONE in-flight request — the ≤6 req/s
-//! minute-boundary pacing ceiling of
-//! `docs/groww-ref/15-rate-limits-and-capacity.md`, shared-token bucket
-//! co-tenanted with bruteX), one request per underlying per minute (NO
-//! in-minute re-poll ladder — the chain is a live snapshot, not a sealing
-//! candle), plus a MECHANICAL cross-request
-//! [`GROWW_CHAIN_1M_MIN_GAP_MS`] guard: ONE scalar last-request stamp
-//! spans consecutive chain requests (any underlying), so within a fire
-//! the 2nd/3rd requests each wait out the remaining gap instead of
-//! bursting back-to-back at the boundary.
-//!
-//! Spacing math (hostile-round-1 MEDIUM-1): with a 1,000 ms min gap the
-//! 3 requests of one fire spread over ≥ 2 × 1,000 ms = 2 s → the chain
-//! leg contributes at most 1 req/s sustained. The fallback wake trails
-//! the spot fire by [`GROWW_CHAIN_1M_FALLBACK_DELAY_MS`] (2.5 s), and
-//! even in the worst overlap (spot still laddering when the chain's
-//! fallback fires) the combined boundary burst is spot's ≤1 in-flight
-//! request + the chain's ≤1 req/s — comfortably inside the ≤6 req/s
-//! family ceiling and the ~3 req/s bruteX co-tenancy headroom. Every 429
-//! is counted + shape-captured (the live-probe (e) requirement); payload
-//! bytes + strike/leg counts are histogrammed (the live-probe (d)
-//! requirement — chain size is undocumented, U-12).
+//! UNDOCUMENTED; Unknown ≠ unlimited). The 3 underlyings fetch
+//! CONCURRENTLY as ONE WAVE (no in-minute re-poll ladder — a live
+//! snapshot, not a sealing candle). Under the DEFAULT `two_wave` tier the
+//! chain wave (3 req) and the spot wave (4 req at close+1,350 ms) are
+//! more than a rolling second apart, so the boundary burst never exceeds
+//! 4 req/s; the probe-gated `seven_concurrent` tier fires both waves
+//! together (7 req/s). Any Groww-leg HTTP 429 AUTO-DEMOTES the session
+//! (`crate::groww_rest_burst` — a demoted two_wave staggers wave slots by
+//! 350 ms). Every 429 is counted + shape-captured (the live-probe (e)
+//! requirement); payload bytes + strike/leg counts are histogrammed (the
+//! live-probe (d) requirement — chain size is undocumented, U-12). An
+//! optional pre-boundary warm-up GET (boundary−4 s, 3 s-bounded,
+//! unauthenticated) re-establishes an idle-closed TLS connection before
+//! the critical window.
 //!
 //! ## Config semantics (mirrors the Dhan `[option_chain_1m]` gate)
 //! - `enabled = true` → run the pipeline.
@@ -98,11 +92,11 @@ use tracing::{error, info, warn};
 
 use tickvault_common::config::QuestDbConfig;
 use tickvault_common::constants::{
-    GROWW_API_VERSION_HEADER, GROWW_API_VERSION_VALUE, GROWW_CHAIN_1M_FALLBACK_DELAY_MS,
+    GROWW_API_VERSION_HEADER, GROWW_API_VERSION_VALUE, GROWW_CHAIN_1M_FIRE_DELAY_MS,
     GROWW_CHAIN_1M_MASTER_RETRY_BACKOFF_SECS, GROWW_CHAIN_1M_MAX_BODY_BYTES,
-    GROWW_CHAIN_1M_MIN_GAP_MS, GROWW_CHAIN_1M_REQUEST_TIMEOUT_SECS,
-    GROWW_CHAIN_1M_UNDERLYING_BUDGET_SECS, GROWW_CHAIN_1M_UNDERLYING_NOT_SERVED_THRESHOLD,
-    GROWW_CHAIN_1M_UNDERLYINGS, GROWW_OPTION_CHAIN_URL_PREFIX, IST_UTC_OFFSET_SECONDS,
+    GROWW_CHAIN_1M_REQUEST_TIMEOUT_MS, GROWW_CHAIN_1M_UNDERLYING_BUDGET_SECS,
+    GROWW_CHAIN_1M_UNDERLYING_NOT_SERVED_THRESHOLD, GROWW_CHAIN_1M_UNDERLYINGS,
+    GROWW_OPTION_CHAIN_URL_PREFIX, GROWW_REST_WARMUP_LEAD_SECS, IST_UTC_OFFSET_SECONDS,
     SECONDS_PER_DAY, SPOT_1M_REST_LAST_FIRE_SECS_OF_DAY_IST,
 };
 use tickvault_common::error_code::ErrorCode;
@@ -131,10 +125,13 @@ use crate::groww_spot_1m_boot::{GrowwTokenCache, parse_groww_ga_failure};
 // machines); the sequencing wait core + strike bounds + the fully-failed
 // verdict are REUSED from the Dhan chain leg (one implementation, two
 // feeds).
+// The 2026-07-14 burst auto-ladder: shared tier/demotion state, the
+// intra-wave stagger schedule, and the pre-boundary warm-up sender.
+use crate::groww_rest_burst::{
+    GrowwRestBurstState, intra_wave_stagger_ms, send_warmup_get, wave_sleep_from_now_ms,
+};
 use crate::option_chain_1m_boot::{
-    MAX_PLAUSIBLE_STRIKE, MAX_STRIKES_PER_CHAIN, MoneynessWarnLatches, chain_minute_fully_failed,
-    classify_chain_legs, publish_chain_moneyness_snapshot, record_chain_moneyness_observability,
-    stale_wake_backoff_ms, wait_for_signal_or_fallback,
+    MAX_PLAUSIBLE_STRIKE, MAX_STRIKES_PER_CHAIN, chain_minute_fully_failed,
 };
 use crate::spot_1m_rest_boot::{
     EdgeAction, FailureEdge, accumulation_within_cap, count_missed_boundaries,
@@ -144,6 +141,10 @@ use crate::spot_1m_rest_boot::{
 
 /// Backoff before the supervisor respawns a dead/failed scheduler run.
 const GROWW_CHAIN_1M_RESPAWN_BACKOFF_SECS: u64 = 30;
+/// Boot-probe inter-call pacing (ms) — the probe is a cold one-shot
+/// measurement, deliberately paced at 1 s per underlying (the retired
+/// live-fire min-gap does not apply to the auto-ladder waves).
+const GROWW_CHAIN_PROBE_PACING_MS: u64 = 1_000;
 /// Milliseconds per second / per day (wall-clock latency math).
 const MILLIS_PER_SEC: i64 = 1_000;
 const MILLIS_PER_DAY: i64 = 86_400_000;
@@ -166,10 +167,12 @@ pub struct GrowwChain1mTaskParams {
     pub calendar: Arc<TradingCalendar>,
     /// QuestDB target for the `option_chain_1m` + `rest_fetch_audit` tables.
     pub questdb: QuestDbConfig,
-    /// GROWW spot-leg "minute completed" signal (the boundary
-    /// seconds-of-day the spot leg just finished firing). `None` when the
-    /// spot leg is disabled — the fallback timer then paces every fire.
-    pub spot_minute_done: Option<tokio::sync::watch::Receiver<Option<u32>>>,
+    /// The shared 2026-07-14 burst auto-ladder state (tier + session
+    /// demotion flag + warm-up toggle) — one `Arc` across the spot, chain
+    /// and contract legs so a 429 on ANY leg demotes them all. (The PR-3
+    /// spot→chain minute-done signal was RETIRED by the auto-ladder — this
+    /// leg fires on its own minute-boundary timer.)
+    pub burst: Arc<GrowwRestBurstState>,
     /// PR-4 sequencing: the boundary seconds-of-day THIS leg just finished
     /// firing, published UNCONDITIONALLY at the END of every chain fire —
     /// success OR failure — via `send_replace` (the spot leg's exact
@@ -392,25 +395,9 @@ pub fn parse_groww_option_chain(body: &str) -> Option<GrowwParsedChain> {
 // Pure pacing / classification helpers
 // ---------------------------------------------------------------------------
 
-/// Mechanical cross-request pacing: milliseconds still to wait so ANY two
-/// CONSECUTIVE chain requests (across underlyings — one scalar stamp, the
-/// hostile-round-1 MEDIUM-1 fix) are ≥ [`GROWW_CHAIN_1M_MIN_GAP_MS`]
-/// apart. This is what spreads one fire's 3 requests over ≥ 2 s instead
-/// of a back-to-back boundary burst (Groww documents no chain rule, but
-/// the ≤6 req/s family ceiling + bruteX co-tenancy demand real spacing).
-/// A midnight-wrapped/backwards clock yields 0 (never a long spurious
-/// sleep). Pure.
-#[must_use]
-pub fn groww_min_gap_wait_ms(last_request_ms_of_day: Option<i64>, now_ms_of_day: i64) -> u64 {
-    let Some(last) = last_request_ms_of_day else {
-        return 0;
-    };
-    if now_ms_of_day < last {
-        return 0;
-    }
-    let elapsed = now_ms_of_day - last;
-    u64::try_from((GROWW_CHAIN_1M_MIN_GAP_MS as i64).saturating_sub(elapsed)).unwrap_or(0)
-}
+// (The pre-2026-07-14 `groww_min_gap_wait_ms` cross-request pacing was
+// RETIRED with the auto-ladder — the wave fires concurrently; the demoted
+// stagger schedule lives in `crate::groww_rest_burst`.)
 
 /// Bounded failure slug for the forensics row — NEVER raw body text. Pure.
 #[must_use]
@@ -848,10 +835,10 @@ enum GrowwChainFetchOutcome {
     Failed(GrowwChainFetchFailure),
 }
 
-/// One underlying's bounded per-minute fetch: the defensive min-gap wait,
-/// then ONE request (NO in-minute ladder — the chain is a live snapshot),
-/// hard-bounded by [`GROWW_CHAIN_1M_UNDERLYING_BUDGET_SECS`]. Returns the
-/// verdict + the request instant (ms-of-day, min-gap bookkeeping) + the
+/// One underlying's bounded per-minute fetch: ONE request (NO in-minute
+/// ladder — the chain is a live snapshot; the 2026-07-14 auto-ladder
+/// retired the min-gap wait), hard-bounded by
+/// [`GROWW_CHAIN_1M_UNDERLYING_BUDGET_SECS`]. Returns the verdict + the
 /// final round-trip latency.
 async fn fetch_groww_chain_bounded(
     client: &reqwest::Client,
@@ -859,14 +846,8 @@ async fn fetch_groww_chain_bounded(
     expiry_date: &str,
     token: &SecretString,
     minute_close_ms_of_day: i64,
-    last_request_ms: Option<i64>,
-) -> (GrowwChainFetchOutcome, i64, i64) {
+) -> (GrowwChainFetchOutcome, i64) {
     let attempt = async {
-        let wait_ms = groww_min_gap_wait_ms(last_request_ms, ist_millis_of_day_now());
-        if wait_ms > 0 {
-            tokio::time::sleep(Duration::from_millis(wait_ms)).await;
-        }
-        let requested_at_ms = ist_millis_of_day_now();
         let started = std::time::Instant::now();
         let result = groww_chain_fetch_once(client, url, expiry_date, token).await;
         let latency_ms = i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX);
@@ -898,7 +879,7 @@ async fn fetch_groww_chain_bounded(
             }
             Err(failure) => GrowwChainFetchOutcome::Failed(failure),
         };
-        (outcome, requested_at_ms, latency_ms)
+        (outcome, latency_ms)
     };
     match tokio::time::timeout(
         Duration::from_secs(GROWW_CHAIN_1M_UNDERLYING_BUDGET_SECS),
@@ -918,7 +899,6 @@ async fn fetch_groww_chain_bounded(
                         "chain budget exceeded ({GROWW_CHAIN_1M_UNDERLYING_BUDGET_SECS}s) — peer stalling"
                     ),
                 }),
-                ist_millis_of_day_now(),
                 -1,
             )
         }
@@ -1032,18 +1012,19 @@ impl UnderlyingServedTracker {
     }
 }
 
-/// One minute-close fire: SEQUENTIAL bounded chain fetches for the
-/// resolved underlyings (pacing rule — at most one in-flight request) →
-/// per-leg rows via `append_row_ext` (rho + measured close→data delay) →
-/// one flush → forensics rows → counters → edge accounting. An auth-class
-/// reject short-circuits the remaining underlyings for THIS fire (the
-/// spot item-12 discipline — no doomed requests with a dead token).
+/// One minute-close fire (2026-07-14 auto-ladder): CONCURRENT bounded
+/// chain fetches for the resolved underlyings (ONE wave; a demoted
+/// two_wave session staggers slots by 350 ms) → per-leg rows via
+/// `append_row_ext` (rho + measured close→data delay) → one flush →
+/// forensics rows → counters → edge accounting. An auth-class reject
+/// drops the token cache AFTER the wave (each request's own 401 is its
+/// forensics row — no sequential short-circuit exists in a wave); a 429
+/// demotes the session burst tier (one coded warn on the edge).
 #[allow(clippy::too_many_arguments)] // APPROVED: private fire sink over the run loop's owned state — a struct would be pure ceremony (spot precedent)
 async fn fire_one_groww_chain_minute(
     params: &GrowwChain1mTaskParams,
     client: &reqwest::Client,
     targets: &[GrowwChainTarget],
-    last_request_ms: &mut Option<i64>,
     writer: &mut OptionChain1mWriter,
     audit_writer: &mut RestFetchAuditWriter,
     edge: &mut FailureEdge,
@@ -1078,20 +1059,84 @@ async fn fire_one_groww_chain_minute(
     let mut auth_aborted = false;
 
     if let Some(token) = token_cache.ensure_token().await {
+        // 2026-07-14 auto-ladder: the WAVE — all underlyings fetch
+        // CONCURRENTLY (JoinSet; each task owns cheap handle clones), a
+        // demoted two_wave session staggers slots by 350 ms. Results are
+        // collected back into TARGET ORDER so the persist / audit /
+        // verdict pipeline below stays deterministic.
+        let tier = params.burst.effective_tier();
+        metrics::counter!("tv_groww_rest_burst_tier_total", "tier" => tier.as_str()).increment(1);
+        let mut wave: tokio::task::JoinSet<(usize, GrowwChainFetchOutcome, i64)> =
+            tokio::task::JoinSet::new();
         for (idx, target) in targets.iter().enumerate() {
-            let (outcome, requested_at_ms, latency_ms) = fetch_groww_chain_bounded(
-                client,
-                &target.url,
-                &target.expiry_str,
-                &token,
-                minute_close_ms,
-                // ONE scalar across consecutive requests — the min-gap
-                // engages BETWEEN underlyings too (MEDIUM-1: 3 requests
-                // spread ≥ 2 s, never a back-to-back boundary burst).
-                *last_request_ms,
-            )
-            .await;
-            *last_request_ms = Some(requested_at_ms);
+            let wave_client = client.clone();
+            let wave_token = token.clone();
+            let url = target.url.clone();
+            let expiry_str = target.expiry_str.clone();
+            // The sequential floor spans a whole per-underlying budget
+            // per slot (review MEDIUM-1 2026-07-14).
+            let stagger_ms =
+                intra_wave_stagger_ms(tier, idx, GROWW_CHAIN_1M_UNDERLYING_BUDGET_SECS * 1_000);
+            wave.spawn(async move {
+                if stagger_ms > 0 {
+                    tokio::time::sleep(Duration::from_millis(stagger_ms)).await;
+                }
+                let (outcome, latency_ms) = fetch_groww_chain_bounded(
+                    &wave_client,
+                    &url,
+                    &expiry_str,
+                    &wave_token,
+                    minute_close_ms,
+                )
+                .await;
+                (idx, outcome, latency_ms)
+            });
+        }
+        let mut results: Vec<Option<(GrowwChainFetchOutcome, i64)>> =
+            (0..targets.len()).map(|_| None).collect();
+        while let Some(joined) = wave.join_next().await {
+            match joined {
+                Ok((idx, outcome, latency_ms)) => {
+                    if let Some(slot) = results.get_mut(idx) {
+                        *slot = Some((outcome, latency_ms));
+                    }
+                }
+                Err(join_err) => {
+                    // Unwind builds only (release aborts on panic): the
+                    // lost slot stays None and is synthesized as a Failed
+                    // outcome below — never a silent missing underlying.
+                    error!(
+                        code = ErrorCode::Chain02FetchDegraded.code_str(),
+                        stage = "wave_task_failed",
+                        feed = OPTION_CHAIN_1M_FEED_GROWW,
+                        ?join_err,
+                        "CHAIN-02: a wave fetch task failed to join — its \
+                         underlying counts as failed for this minute"
+                    );
+                }
+            }
+        }
+        let mut any_auth_rejected = false;
+        let mut any_rate_limited = false;
+        for (idx, target) in targets.iter().enumerate() {
+            let (outcome, latency_ms) =
+                results
+                    .get_mut(idx)
+                    .and_then(Option::take)
+                    .unwrap_or_else(|| {
+                        (
+                            GrowwChainFetchOutcome::Failed(GrowwChainFetchFailure {
+                                status: 0,
+                                rate_limited: false,
+                                auth_rejected: false,
+                                msg: "wave fetch task failed to join".to_string(),
+                            }),
+                            -1,
+                        )
+                    });
+            if let GrowwChainFetchOutcome::Failed(failure) = &outcome {
+                any_rate_limited |= failure.rate_limited;
+            }
             let mut auth_rejected = false;
             match outcome {
                 GrowwChainFetchOutcome::Found {
@@ -1421,45 +1466,37 @@ async fn fire_one_groww_chain_minute(
                     chain_audit_append_best_effort(audit_writer, &audit_row);
                 }
             }
-            if auth_rejected {
-                // The spot item-12 discipline: drop the dead token NOW and
-                // short-circuit the remaining underlyings for THIS fire —
-                // every further request with the same rejected token is a
-                // doomed 401. The next fire's ensure_token re-reads SSM at
-                // the ≥60s floor; NEVER a mint.
-                auth_aborted = true;
-                token_cache.note_auth_rejected();
-                let remaining = &targets[idx + 1..];
-                if !remaining.is_empty() {
-                    error_count = error_count.saturating_add(remaining.len());
-                    warn!(
-                        skipped_underlyings = remaining.len(),
-                        "groww_chain_1m: auth-class reject — remaining \
-                         underlyings short-circuited for this fire (no doomed \
-                         requests); forensics rows still emitted"
-                    );
-                    for skipped in remaining {
-                        served_verdicts.push((skipped.underlying, false));
-                        metrics::counter!("tv_groww_chain1m_fetch_total", "outcome" => "error")
-                            .increment(1);
-                        let row = build_chain_audit_row(
-                            target_minute_nanos,
-                            trading_date_nanos,
-                            skipped.security_id,
-                            skipped.underlying,
-                            0,
-                            0,
-                            -1,
-                            -1,
-                            0,
-                            RestFetchOutcome::NoToken,
-                            "auth",
-                        );
-                        chain_audit_append_best_effort(audit_writer, &row);
-                    }
-                }
-                break;
-            }
+            any_auth_rejected |= auth_rejected;
+        }
+        if any_auth_rejected {
+            // The spot item-12 discipline (auto-ladder form): the wave
+            // already fired concurrently, so there are no "remaining"
+            // underlyings to short-circuit — each request's own 401 is its
+            // forensics row (≤ 3 doomed requests). Drop the dead token so
+            // the NEXT fire's ensure_token re-reads SSM at the ≥60s floor;
+            // NEVER a mint. An auth reject is a GLOBAL token condition
+            // (OUR side, not the vendor's) — the fire becomes a not-served
+            // tracker HOLD below (PR #1537 semantics preserved under the
+            // wave: nobody's streak counts or resets on an auth-rejected
+            // fire).
+            auth_aborted = true;
+            token_cache.note_auth_rejected();
+        }
+        if any_rate_limited && params.burst.note_rate_limited() {
+            // The session's DEMOTION EDGE (exactly once): the burst tier
+            // steps down for every subsequent minute — seven_concurrent →
+            // two_wave, two_wave → staggered two_wave. Boot restores the
+            // configured tier.
+            warn!(
+                code = ErrorCode::Chain02FetchDegraded.code_str(),
+                stage = "burst_demoted",
+                feed = OPTION_CHAIN_1M_FEED_GROWW,
+                minute = %minute_label,
+                demoted_to = params.burst.effective_tier().as_str(),
+                "CHAIN-02: HTTP 429 on the Groww chain wave — burst tier \
+                 auto-demoted for the rest of the session (restart restores \
+                 the configured tier)"
+            );
         }
         if let Err(err) = writer.flush() {
             persist_failed = true;
@@ -1775,7 +1812,7 @@ pub async fn run_groww_chain_1m(
     // ONE long-lived client for the whole session (per-minute rebuild is
     // the exact TLS/resolver churn HTTP-CLIENT-01 §0 condemns).
     let client = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(GROWW_CHAIN_1M_REQUEST_TIMEOUT_SECS))
+        .timeout(Duration::from_millis(GROWW_CHAIN_1M_REQUEST_TIMEOUT_MS))
         .redirect(reqwest::redirect::Policy::none())
         .build()
     {
@@ -1930,7 +1967,7 @@ async fn resolve_and_cache_chain_targets(
 /// The armed per-minute fire loop (split from `run_groww_chain_1m` by the
 /// MEDIUM-4 warmup-cache refactor — the body is the pre-split loop,
 /// unchanged).
-// TEST-EXEMPT: live-deps scheduler loop — every decision inside is a unit-tested pure fn (next_fire_after / fire_is_fresh / count_missed_boundaries / stale_wake_backoff_ms / groww_min_gap_wait_ms).
+// TEST-EXEMPT: live-deps scheduler loop — every decision inside is a unit-tested pure fn (next_fire_after / fire_is_fresh / count_missed_boundaries / the groww_rest_burst schedule fns).
 async fn run_groww_chain_minute_loop(
     params: &GrowwChain1mTaskParams,
     client: &reqwest::Client,
@@ -1950,15 +1987,13 @@ async fn run_groww_chain_minute_loop(
     let mut token_cache = GrowwTokenCache::new_chain();
     let mut moneyness_latches = MoneynessWarnLatches::default();
     let mut last_fired: Option<u32> = None;
-    // ONE scalar spanning consecutive chain requests (any underlying) —
-    // the cross-request min-gap pacing state (MEDIUM-1).
-    let mut last_request_ms: Option<i64> = None;
-    let mut spot_rx = params.spot_minute_done.clone();
     info!(
         underlyings = targets.len(),
+        tier = params.burst.effective_tier().as_str(),
+        warm_up = params.burst.warm_up_enabled(),
         "groww_chain_1m: per-minute chain fetch loop armed (fires each \
-         minute close 09:16:00-15:30:00 IST, right after the Groww spot leg; \
-         sequential underlying pacing)"
+         minute close 09:16:00-15:30:00 IST on its own timer at \
+         close+300ms as ONE concurrent wave — 2026-07-14 burst auto-ladder)"
     );
 
     loop {
@@ -1974,11 +2009,39 @@ async fn run_groww_chain_minute_loop(
             info!("groww_chain_1m: past 15:30 IST — today's minute fires complete");
             return;
         };
-        // Sequenced wake: the Groww spot leg's minute-done signal, bounded
-        // by the fallback timer (the reused Dhan wait core).
-        let sleep_ms = u64::from(fire.saturating_sub(now)).saturating_mul(1_000)
-            + GROWW_CHAIN_1M_FALLBACK_DELAY_MS;
-        wait_for_signal_or_fallback(sleep_ms, fire, &mut spot_rx).await;
+        // 2026-07-14 auto-ladder: OWN minute-boundary timer — the chain
+        // wave fires at close + 300 ms (no spot signal, no fallback timer,
+        // no min-gap). The optional pre-boundary warm-up GET (boundary−4 s,
+        // 3 s-bounded, unauthenticated — no expiry param; the 400/401
+        // reply still warms the connection) re-establishes an idle-closed
+        // TLS session before the critical window.
+        // CRITICAL-1 (2026-07-14 fix round): EVERY wake instant — the
+        // warm-up lead AND the wave itself — is computed from the
+        // MILLISECOND clock (`wave_sleep_from_now_ms`), never by summing
+        // a whole-second boundary gap with the delay: the pre-fix else
+        // branch woke at `fire + frac(now) + 300 ms`, and the two legs'
+        // independent fractional offsets could collapse the load-bearing
+        // 1,050 ms wave separation to ~51 ms.
+        let warmup_lead_ms = GROWW_REST_WARMUP_LEAD_SECS.saturating_mul(1_000);
+        let warmup_sleep_ms = wave_sleep_from_now_ms(
+            fire,
+            -i64::try_from(warmup_lead_ms).unwrap_or(0),
+            ist_millis_of_day_now(),
+        );
+        if params.burst.warm_up_enabled() && warmup_sleep_ms > 0 {
+            tokio::time::sleep(Duration::from_millis(warmup_sleep_ms)).await;
+            if let Some(first) = targets.first() {
+                send_warmup_get(client, &first.url, &[], "chain_1m").await;
+            }
+        }
+        let remaining_ms = wave_sleep_from_now_ms(
+            fire,
+            i64::try_from(GROWW_CHAIN_1M_FIRE_DELAY_MS).unwrap_or(0),
+            ist_millis_of_day_now(),
+        );
+        if remaining_ms > 0 {
+            tokio::time::sleep(Duration::from_millis(remaining_ms)).await;
+        }
 
         // Staleness gate (suspend / clock-step defense): skip + recompute,
         // never fetch a long-gone minute.
@@ -2003,14 +2066,6 @@ async fn run_groww_chain_minute_loop(
             if woke > fire {
                 last_fired = Some((woke.min(SPOT_1M_REST_LAST_FIRE_SECS_OF_DAY_IST) / 60) * 60);
             }
-            let backoff_ms = stale_wake_backoff_ms(fire, woke);
-            if backoff_ms > 0 {
-                // Clock stepped BACK across the boundary: the already-
-                // satisfied spot signal would make the next wait return
-                // with ZERO awaits — sleep up to the fire moment instead
-                // of busy-spinning (the Dhan chain H1 defense).
-                tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
-            }
             continue;
         }
 
@@ -2018,7 +2073,6 @@ async fn run_groww_chain_minute_loop(
             params,
             client,
             &targets,
-            &mut last_request_ms,
             &mut writer,
             &mut audit_writer,
             &mut edge,
@@ -2190,7 +2244,7 @@ pub async fn run_groww_chain_1m_probe(params: GrowwChain1mTaskParams) {
         return;
     }
     let client = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(GROWW_CHAIN_1M_REQUEST_TIMEOUT_SECS))
+        .timeout(Duration::from_millis(GROWW_CHAIN_1M_REQUEST_TIMEOUT_MS))
         .redirect(reqwest::redirect::Policy::none())
         .build()
     {
@@ -2245,8 +2299,10 @@ pub async fn run_groww_chain_1m_probe(params: GrowwChain1mTaskParams) {
     }
     for (idx, target) in targets.iter().enumerate() {
         let url = &target.url;
-        // Sequential + min-gap paced (one boot-time call per underlying).
-        tokio::time::sleep(Duration::from_millis(GROWW_CHAIN_1M_MIN_GAP_MS)).await;
+        // Sequential + paced (one boot-time call per underlying) — the
+        // probe keeps its own 1 s spacing (it is a cold boot measurement,
+        // not a wave; the retired live-fire min-gap does not apply here).
+        tokio::time::sleep(Duration::from_millis(GROWW_CHAIN_PROBE_PACING_MS)).await;
         let started = std::time::Instant::now();
         let result = groww_chain_fetch_once(&client, url, &target.expiry_str, &token).await;
         let latency_ms = i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX);
@@ -2688,24 +2744,10 @@ mod tests {
         }
     }
 
-    // ---- pacing / classification ------------------------------------------
-
-    #[test]
-    fn test_groww_min_gap_wait_ms_engages_only_inside_gap() {
-        // Never requested → no wait.
-        assert_eq!(groww_min_gap_wait_ms(None, 1_000), 0);
-        // Well past the gap (the normal ~60s cadence) → no wait.
-        assert_eq!(groww_min_gap_wait_ms(Some(1_000), 62_000), 0);
-        // Inside the gap → the remainder.
-        assert_eq!(groww_min_gap_wait_ms(Some(1_000), 1_400), 600);
-        // Exactly at the gap boundary → no wait.
-        assert_eq!(
-            groww_min_gap_wait_ms(Some(1_000), 1_000 + GROWW_CHAIN_1M_MIN_GAP_MS as i64),
-            0
-        );
-        // Backwards clock (midnight wrap) → never a long spurious sleep.
-        assert_eq!(groww_min_gap_wait_ms(Some(50_000), 1_000), 0);
-    }
+    // ---- classification -----------------------------------------------
+    // (The pre-2026-07-14 min-gap pacing test retired with
+    // `groww_min_gap_wait_ms` — the auto-ladder wave has no min-gap; the
+    // stagger schedule is unit-tested in `crate::groww_rest_burst`.)
 
     #[test]
     fn test_chain_error_class_slugs_bounded() {
@@ -2907,39 +2949,9 @@ mod tests {
         assert!(probe_out_of_hours_caveat(true, true).is_none());
     }
 
-    // ---- sequencing (the reused wait core with the GROWW fallback) ---------
-
-    /// The GROWW chain leg reuses the Dhan wait core with its OWN fallback
-    /// constant: no receiver (spot disabled) → the fallback timer paces;
-    /// a spot signal for the minute wakes it early.
-    #[tokio::test]
-    async fn test_groww_chain_wait_fallback_paces_and_signal_wakes_early() {
-        use tokio::sync::watch;
-        let fire = 10 * 3600;
-        const FALLBACK_MS: u64 = 150;
-        let fb = Duration::from_millis(FALLBACK_MS);
-
-        // (a) No receiver: the fallback timer owns pacing.
-        let started = std::time::Instant::now();
-        wait_for_signal_or_fallback(FALLBACK_MS, fire, &mut None).await;
-        assert!(started.elapsed() >= fb, "must wait the full fallback");
-
-        // (b) The Groww spot leg signals this minute → early wake.
-        let (tx, rx) = watch::channel::<Option<u32>>(None);
-        let mut rx_opt = Some(rx);
-        let waiter = tokio::spawn(async move {
-            let started = std::time::Instant::now();
-            wait_for_signal_or_fallback(FALLBACK_MS, fire, &mut rx_opt).await;
-            started.elapsed()
-        });
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        tx.send_replace(Some(fire));
-        let waited = waiter.await.expect("waiter completes");
-        assert!(
-            waited < fb,
-            "signal must wake before the fallback: {waited:?}"
-        );
-    }
+    // (The pre-2026-07-14 spot→chain wait-core test retired with the
+    // auto-ladder — the chain leg fires on its own minute-boundary timer;
+    // the Dhan module keeps its own `wait_for_signal_or_fallback` tests.)
 
     // ---- HTTP leg (hermetic mock server — round-1 coverage battery) --------
 
@@ -2990,8 +3002,8 @@ mod tests {
             .into_boxed_str(),
         );
         let url = spawn_chain_mock(resp).await;
-        let (outcome, requested_at_ms, latency_ms) =
-            fetch_groww_chain_bounded(&test_client(), &url, "2026-07-16", &token, 0, None).await;
+        let (outcome, latency_ms) =
+            fetch_groww_chain_bounded(&test_client(), &url, "2026-07-16", &token, 0).await;
         match outcome {
             GrowwChainFetchOutcome::Found {
                 chain,
@@ -3005,7 +3017,6 @@ mod tests {
             }
             other => panic!("expected Found, got {other:?}"),
         }
-        assert!(requested_at_ms >= 0);
         assert!(latency_ms >= 0);
 
         // (b) A parseable 2xx with ZERO strikes → Empty (never silent).
@@ -3018,8 +3029,8 @@ mod tests {
             .into_boxed_str(),
         );
         let url = spawn_chain_mock(empty_resp).await;
-        let (outcome, _, _) =
-            fetch_groww_chain_bounded(&test_client(), &url, "2026-07-16", &token, 0, None).await;
+        let (outcome, _) =
+            fetch_groww_chain_bounded(&test_client(), &url, "2026-07-16", &token, 0).await;
         match outcome {
             GrowwChainFetchOutcome::Empty(ev) => {
                 // 2026-07-14 discipline: the Empty arm carries the full
@@ -3048,8 +3059,8 @@ mod tests {
             .into_boxed_str(),
         );
         let url = spawn_chain_mock(drift_resp).await;
-        let (outcome, _, _) =
-            fetch_groww_chain_bounded(&test_client(), &url, "2026-07-16", &token, 0, None).await;
+        let (outcome, _) =
+            fetch_groww_chain_bounded(&test_client(), &url, "2026-07-16", &token, 0).await;
         match outcome {
             GrowwChainFetchOutcome::LegShapeDrift(ev) => {
                 assert_eq!(ev.payload_bytes, drift_body.len());
@@ -3063,8 +3074,8 @@ mod tests {
 
         // (c) A 2xx that is not a parseable option chain → Failed(200).
         let url = spawn_chain_mock("HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\nnot-json").await;
-        let (outcome, _, _) =
-            fetch_groww_chain_bounded(&test_client(), &url, "2026-07-16", &token, 0, None).await;
+        let (outcome, _) =
+            fetch_groww_chain_bounded(&test_client(), &url, "2026-07-16", &token, 0).await;
         match outcome {
             GrowwChainFetchOutcome::Failed(f) => {
                 assert_eq!(f.status, 200);
@@ -3187,7 +3198,10 @@ mod tests {
                 pg_port: 8812,
                 ilp_port: 9009,
             },
-            spot_minute_done: None,
+            burst: GrowwRestBurstState::new(
+                tickvault_common::config::GrowwRestBurstTier::TwoWave,
+                false,
+            ),
             minute_done_tx: None,
             anchor_store: None,
         }
@@ -3230,7 +3244,6 @@ mod tests {
     async fn test_fire_no_token_arm_counts_misses_and_writes_forensics() {
         let params = test_params();
         let targets = vec![test_target("NIFTY", "NSE"), test_target("SENSEX", "BSE")];
-        let mut last_request_ms: Option<i64> = None;
         let mut writer = OptionChain1mWriter::for_test_with_feed(
             OPTION_CHAIN_1M_FEED_GROWW,
             OPTION_CHAIN_1M_SOURCE_GROWW_CHAIN,
@@ -3243,7 +3256,6 @@ mod tests {
             &params,
             &test_client(),
             &targets,
-            &mut last_request_ms,
             &mut writer,
             &mut audit_writer,
             &mut edge,
@@ -3258,10 +3270,6 @@ mod tests {
         // writer discards on flush — so pending is 0 AND the appends are
         // proven via the edge below (one fully-failed minute recorded).
         assert_eq!(audit_writer.pending(), 0, "flush ran (best-effort discard)");
-        assert!(
-            last_request_ms.is_none(),
-            "no request happened — the pacing stamp must stay unset"
-        );
         // The fire fed the edge EXACTLY one fully-failed minute: two more
         // failed minutes reach the 3-threshold page on the third total.
         assert!(matches!(edge.record_minute(true), EdgeAction::None));
@@ -3384,7 +3392,6 @@ mod tests {
             test_target_with_url("SENSEX", "BSE", empty_url),
             test_target_with_url("BANKNIFTY", "NSE", drift_url),
         ];
-        let mut last_request_ms: Option<i64> = None;
         let mut writer = OptionChain1mWriter::for_test_with_feed(
             OPTION_CHAIN_1M_FEED_GROWW,
             OPTION_CHAIN_1M_SOURCE_GROWW_CHAIN,
@@ -3397,7 +3404,6 @@ mod tests {
             &params,
             &test_client(),
             &targets,
-            &mut last_request_ms,
             &mut writer,
             &mut audit_writer,
             &mut edge,
@@ -3407,10 +3413,6 @@ mod tests {
             9 * 3600 + 16 * 60,
         )
         .await;
-        assert!(
-            last_request_ms.is_some(),
-            "requests happened — the cross-request pacing stamp advanced"
-        );
         // The fetch side found a chain (ok_count = 1) BUT the disconnected
         // test writer's flush fails → the persist gate (the spot M1
         // discipline) honestly counts the minute FULLY FAILED: the edge
@@ -3443,19 +3445,19 @@ mod tests {
         assert_eq!(actions[2].1, UnderlyingEdgeAction::Page { consecutive: n });
     }
 
-    /// The token-path fire's auth short-circuit (the item-12 mirror): a
-    /// 401 on the FIRST underlying drops the token, skips the remaining
-    /// underlyings (no doomed requests), and the minute counts fully
-    /// failed.
+    /// The token-path fire's auth handling under the concurrent wave
+    /// (2026-07-14 auto-ladder): a 401 on one underlying no longer skips
+    /// the others (both fetch concurrently — the per-ladder self-abort is
+    /// each task's own); the token is dropped ONCE after the wave and the
+    /// minute counts fully failed (401 + transport error).
     #[tokio::test]
-    async fn test_fire_token_path_auth_reject_short_circuits_via_mock() {
+    async fn test_fire_token_path_auth_reject_drops_token_after_wave_via_mock() {
         let params = test_params();
         let url_401 =
             spawn_chain_mock("HTTP/1.1 401 Unauthorized\r\nContent-Length: 2\r\n\r\n{}").await;
-        // The second target's port is CLOSED — a request there would be a
-        // transport error; the short-circuit must never send it at all
-        // (nothing observable would distinguish — the skip is proven by
-        // the forensics count in the no-token test's pattern + coverage).
+        // The second target's port is CLOSED — its concurrent request is a
+        // fast transport error (a counted failure, no longer skipped: the
+        // wave has no cross-target short-circuit by design).
         let dead = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind");
@@ -3469,7 +3471,6 @@ mod tests {
                 format!("http://127.0.0.1:{dead_port}/v1/option-chain"),
             ),
         ];
-        let mut last_request_ms: Option<i64> = None;
         let mut writer = OptionChain1mWriter::for_test_with_feed(
             OPTION_CHAIN_1M_FEED_GROWW,
             OPTION_CHAIN_1M_SOURCE_GROWW_CHAIN,
@@ -3482,7 +3483,6 @@ mod tests {
             &params,
             &test_client(),
             &targets,
-            &mut last_request_ms,
             &mut writer,
             &mut audit_writer,
             &mut edge,
@@ -3492,17 +3492,17 @@ mod tests {
             9 * 3600 + 17 * 60,
         )
         .await;
-        // Fully failed (401 + skipped) → the edge holds ONE failed minute:
-        // the page fires on the third total.
+        // Fully failed (401 + transport error) → the edge holds ONE failed
+        // minute: the page fires on the third total.
         assert!(matches!(edge.record_minute(true), EdgeAction::None));
         assert!(matches!(
             edge.record_minute(true),
             EdgeAction::Page { consecutive: 3 }
         ));
-        // 401 + auth-skipped = an auth-ABORTED fire → the sink is
-        // skipped entirely and the not-served tracker HELD (no streak
-        // started for either underlying): a full fresh threshold is
-        // still required.
+        // 401 + transport error = an auth-ABORTED fire (the wave's
+        // `auth_aborted` flag) → the sink is skipped entirely and the
+        // not-served tracker HELD (no streak started for either
+        // underlying): a full fresh threshold is still required.
         let n = GROWW_CHAIN_1M_UNDERLYING_NOT_SERVED_THRESHOLD;
         for _ in 1..n {
             let actions = not_served.record_minute(&[("NIFTY", false), ("SENSEX", true)]);
@@ -3512,13 +3512,12 @@ mod tests {
         assert_eq!(actions[0].1, UnderlyingEdgeAction::Page { consecutive: n });
     }
 
-    /// The 2026-07-14 review-fix pin: a mid-fire 401 AFTER an earlier
-    /// underlying succeeded (ok ≥ 1 + auth-skip) is a tracker HOLD — the
-    /// sink is skipped for the whole fire, so the auth-skipped
-    /// underlyings gain NO counted not-served minute (and therefore no
-    /// counter increment — the sink is the only increment site), and
-    /// NOBODY's streak advances or resets (not even the Found
-    /// underlying's).
+    /// The 2026-07-14 review-fix pin (wave form): a 401 in the SAME wave
+    /// as a Found underlying (ok ≥ 1 + auth reject) is a tracker HOLD —
+    /// the sink is skipped for the whole fire, so no underlying gains a
+    /// counted not-served minute (and therefore no counter increment —
+    /// the sink is the only increment site), and NOBODY's streak advances
+    /// or resets (not even the Found underlying's).
     #[tokio::test]
     async fn test_fire_auth_abort_after_found_is_tracker_hold() {
         let params = test_params();
@@ -3533,8 +3532,10 @@ mod tests {
         let found_url = spawn_chain_mock(found_resp).await;
         let url_401 =
             spawn_chain_mock("HTTP/1.1 401 Unauthorized\r\nContent-Length: 2\r\n\r\n{}").await;
-        // The third target's port is CLOSED — the auth short-circuit must
-        // never send to it (the item-12 discipline).
+        // The third target's port is CLOSED — under the concurrent wave it
+        // is a fast transport error (a counted Failed verdict; the wave
+        // has no cross-target short-circuit by design — the auth HOLD is
+        // applied AFTER the wave via `auth_aborted`).
         let dead = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind");
@@ -3549,7 +3550,6 @@ mod tests {
                 format!("http://127.0.0.1:{dead_port}/v1/option-chain"),
             ),
         ];
-        let mut last_request_ms: Option<i64> = None;
         let mut writer = OptionChain1mWriter::for_test_with_feed(
             OPTION_CHAIN_1M_FEED_GROWW,
             OPTION_CHAIN_1M_SOURCE_GROWW_CHAIN,
@@ -3568,7 +3568,6 @@ mod tests {
             &params,
             &test_client(),
             &targets,
-            &mut last_request_ms,
             &mut writer,
             &mut audit_writer,
             &mut edge,

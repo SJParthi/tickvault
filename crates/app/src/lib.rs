@@ -58,6 +58,12 @@ pub mod spot_1m_rest_boot;
 // chain for the 3 underlyings via POST /v2/optionchain and persist to the
 // `option_chain_1m` table (CHAIN-01..04).
 pub mod option_chain_1m_boot;
+// Groww REST burst auto-ladder (operator approval 2026-07-14): the shared
+// tier/demotion state + wave schedule for the per-minute Groww REST legs,
+// plus the env-gated off-hours rate probe that gates the
+// seven_concurrent promotion.
+pub mod groww_rate_probe;
+pub mod groww_rest_burst;
 // Groww per-minute spot 1m REST leg (operator grant 2026-07-13 — PR-2 of
 // the Groww per-minute REST plan): the just-closed minute's official Groww
 // 1m OHLCV for the 3 spot indices → `spot_1m_rest` feed='groww' + the

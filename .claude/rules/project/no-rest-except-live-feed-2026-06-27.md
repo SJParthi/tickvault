@@ -240,7 +240,7 @@ patterns (the Dhan PR #1499 pattern, pending merge).
 | Endpoint | Scope (LOCKED) | Cadence | Destination table | Gate |
 |---|---|---|---|---|
 | `GET api.groww.in/v1/historical/candles` (spot) | 4 Groww spot indices ONLY (was 3; INDIA VIX added 2026-07-13 per `groww-second-feed-scope-2026-06-19.md` §38.7 — runtime-resolved from the day's Groww master, SPOT ONLY): `NSE-NIFTY` / `NSE-BANKNIFTY` / `BSE-SENSEX` + the resolved INDIA VIX groww_symbol, segment CASH; `candle_interval="1minute"`; day-granular window + client-side minute filter; `Authorization: Bearer <shared-minter SSM read-only token>` + `x-api-version: 1.0` | once per minute close, [09:15, 15:30) IST trading days, + one bounded 15:31 sweep (the Dhan PR #1499 pattern, pending merge) | `spot_1m_rest` ONLY, `feed='groww'` (never `ticks`/`candles_*`/`historical_candles`) | `[groww_spot_1m]` config, serde default OFF, base.toml opts in |
-| `GET api.groww.in/v1/option-chain/exchange/{e}/underlying/{u}?expiry_date=...` | the SAME 3 underlyings, CURRENT (nearest ≥ today) expiry only, from the already-ingested Groww instruments CSV | once per minute, SEQUENCED after the Groww spot fetch; own min-gap pacing | `option_chain_1m` ONLY, `feed='groww'` | `[groww_option_chain_1m]` config — **DEFAULT-OFF** pending first-live-session verification + a dated note; **flipped ON in base.toml 2026-07-13 after the live probe PASSED (§38.6 of the groww-scope file; the serde DEFAULT stays OFF)** |
+| `GET api.groww.in/v1/option-chain/exchange/{e}/underlying/{u}?expiry_date=...` | the SAME 3 underlyings, CURRENT (nearest ≥ today) expiry only, from the already-ingested Groww instruments CSV | ~~once per minute, SEQUENCED after the Groww spot fetch; own min-gap pacing~~ **SUPERSEDED 2026-07-14 by the §9.7 auto-ladder:** once per minute on the chain leg's OWN minute-boundary timer (close + 300 ms), the 3 underlyings CONCURRENT within the wave (min-gap deleted) | `option_chain_1m` ONLY, `feed='groww'` | `[groww_option_chain_1m]` config — **DEFAULT-OFF** pending first-live-session verification + a dated note; **flipped ON in base.toml 2026-07-13 after the live probe PASSED (§38.6 of the groww-scope file; the serde DEFAULT stays OFF)** |
 | `GET api.groww.in/v1/historical/candles` (contracts) | a BOUNDED selected set of active option contracts (`segment=FNO`, `groww_symbol` like `NSE-NIFTY-04Jan24-19200-CE`; envelope cap per minute; selection fed by the chain snapshot / instruments master) | once per minute, after the chain leg | NEW `option_contract_1m_rest` ONLY (`feed` in DEDUP key; retention registered) | config-gated, serde default OFF |
 
 ## §9.3 Honest envelope (mandatory per operator-charter §F)
@@ -272,6 +272,27 @@ patterns (the Dhan PR #1499 pattern, pending merge).
 - Cold-path only; zero hot-path involvement; zero new WebSocket; token READ-ONLY from SSM
   (never minted — `groww-shared-token-minter-2026-07-02.md`); §28 indicators/strategies
   boundary untouched.
+- **Burst arithmetic (2026-07-14 auto-ladder — supersedes the "≤6 req/s" pacing line
+  above for the Groww legs; full contract in §9.7; numbers RECOMPUTED the same day for
+  the fix-round HIGH-1 rung jitter):** the shipped `two_wave` tier bursts ≤ 4 req/s at
+  the boundary (3 chain at close+300 ms, 4 spot at close+1,350 ms — the 1,050 ms wave
+  separation keeps every rolling second single-wave, and both legs compute the wake from
+  the MILLISECOND clock so the separation holds exactly — fix-round CRITICAL-1; the
+  original whole-second else-branch could collapse it to ~51 ms); the probe-gated
+  `seven_concurrent` tier bursts 7 req/s. Each spot target's re-poll rung schedule is
+  jittered by slot × 150 ms in ALL tiers (fix-round HIGH-1 — the Dhan-leg precedent), so
+  the honest vendor-lag worst case (jittered rung stragglers inside one rolling second)
+  is 6 req/s solo for the rungs, 8 with the contract leg's 2/s (pre-jitter: 8 and 10 —
+  AT the ceiling), and 9 for the seven tier's initial-wave-plus-rungs (pre-jitter 11,
+  above the ceiling) — all const-asserted; still zero margin over the assumed BruteX
+  ~3/s co-tenancy, which is why any live 429 AUTO-DEMOTES the tier down the §9.7(3)
+  ladder (one coded warn per level + `tv_groww_rest_burst_demoted_total{level}`), never
+  out-polled. LOW-2 honest note (same fix round): the contract leg now starts ~2–6 s
+  earlier than pre-Stage-1 (the chain leg completes faster), so its 2/s stream stacks
+  INSIDE the spot rung windows — counted inside the solo const-assert, zero co-tenant
+  margin beyond it, accepted by design. Per-minute totals stay ≤ 55 (30 contract + 20
+  spot + 3 chain + 2 warm-up) ≈ 18% of the 300/min budget — const-asserted in
+  `crates/common/src/constants.rs`.
 - **Decision-freshness gate (2026-07-13, recorded with PR-4 — the operator's verbatim
   intent: "we cannot rely on backfill — within the particular second or few seconds it
   should definitely be pulled for TRADING DECISIONS; we need precise filling"):**
@@ -322,6 +343,78 @@ must update this §9 FIRST with a dated quote.
 Covered by the §6 trigger list (extended 2026-07-13 with the `groww_spot_1m` /
 `groww_option_chain_1m` / `option_contract_1m_rest` / `v1/historical/candles` /
 `v1/option-chain` strings and the §9 module paths).
+
+## §9.7 — 2026-07-14: rate-safe AUTO-LADDER replaces the sequenced-after-spot cadence (dated amendment)
+
+**Operator authorization (2026-07-14, relayed verbatim via the coordinator
+session):** *"approved and go ahead with the recommendation"* — the
+recommendation being the rate-safe auto-ladder rebuild of the per-minute Groww
+REST legs so worst-case DECISION data lands < 5 s after minute close, with the
+operator's stated preference for the 7-concurrent burst held PROBE-GATED
+behind the off-hours rate probe (the shipped default is the safer two-wave
+shape).
+
+**What changes (the §9.1/§9.2 "sequenced after the Groww spot fetch" +
+"own min-gap pacing" cadence contract is SUPERSEDED for the Groww legs):**
+
+1. **Self-imposed pacing DELETED.** The chain leg no longer waits for the
+   spot leg's minute-done signal nor the 2.5 s fallback timer — it fires on
+   its OWN minute-boundary timer; the 1,000 ms inter-underlying chain min-gap
+   is deleted; the spot targets fetch CONCURRENTLY instead of sequentially.
+   (~4.5 s of self-imposed latency removed; measured chain round-trip is
+   ~0.2 s per the 2026-07-13 live probe.)
+2. **Two burst tiers (`[groww_rest_burst] tier`):**
+   - `two_wave` (the SHIPPED default; serde default too): 3 chain requests
+     concurrently at close + 300 ms; 4 spot requests concurrently at
+     close + 1,350 ms. The 1,050 ms wave separation keeps every rolling
+     1-second window single-wave ⇒ boundary burst ≤ 4 req/s.
+   - `seven_concurrent` (the operator preference — PROBE-GATED, never the
+     default): all 7 requests concurrently at close + 300 ms (7/10 of the
+     documented ceiling solo; zero margin at the assumed BruteX ~3/s
+     co-tenancy anchor). Promotion = a config flip + a fresh dated note HERE
+     after the §9.7(5) probe passes.
+3. **AUTO-DEMOTE (a LADDER since the same-day fix round — review
+   MEDIUM-1):** any HTTP 429 on any Groww REST leg (spot / chain /
+   contract) steps the session ONE shape down
+   `seven_concurrent → two_wave → two_wave + 350 ms intra-wave stagger →
+   fully-sequential-within-wave` (the sequential floor spaces wave slots
+   a whole per-slot hard budget apart — the pre-Stage-1 one-at-a-time
+   pacing shape; a 429 at the floor is a no-op). One coded warn per
+   demotion LEVEL (SPOT1M-01 / CHAIN-02 `stage="burst_demoted"` — no new
+   ErrorCode variants) + `tv_groww_rest_burst_demoted_total{level}`; boot
+   resets to the configured tier.
+4. **WARM-UP (`[groww_rest_burst] warm_up`, base.toml ON):** at minute
+   boundary − 4 s each leg sends ONE lightweight UNAUTHENTICATED GET on its
+   own client (response discarded; the 401/400 still re-establishes an
+   idle-closed TLS/H2 connection before the critical window), bounded by its
+   own 3 s timeout so a fire can never start late. ≤ 2 requests in a second
+   that never overlaps the waves — counted in the budget arithmetic.
+5. **OFF-HOURS RATE PROBE (env-gated `TICKVAULT_GROWW_RATE_PROBE=1`, default
+   OFF — OPERATOR-TRIGGERED, never scheduled):** escalating bursts
+   4 → 6 → 8 → 11 req/s (one second each, ~10 s pause between steps, max 2
+   rounds, ~58 requests total) against the granted candles endpoint;
+   REFUSED inside the [08:30, 16:00) IST wall-clock blackout window on ANY
+   day — trading day or not (same-day fix round, SECURITY-MEDIUM: the
+   original `trading_day && [09:00, 15:35)` gate depended solely on the
+   trading calendar, so a stale holiday list could fire the burst
+   mid-session; the unconditional wall-clock window has no calendar lookup
+   to fail-open on). CO-TENANCY (review MEDIUM-2): BruteX's bulk pulls are
+   nightly/post-market (§9.3) and the blackout cannot see BruteX's
+   schedule — the operator MUST coordinate the probe run with BruteX's
+   nightly window before arming the env var. Per-step 429 count + latency
+   as structured log lines + counters; writes NO data tables. Its verdict
+   is the ONLY gate that can promote `seven_concurrent`. (The probe's
+   11 req/s top step over-tests: with the fix-round rung jitter the
+   seven-tier lag-worst shape is 9 req/s — the 11 step is kept as
+   deliberate margin.)
+6. **What does NOT change:** the KEEP endpoints, destination tables, DEDUP
+   keys, token discipline (SSM read-only, never minted), the bounded spot
+   re-poll ladder + backfill + 15:31 sweep (never-skip capture is a hard
+   constraint — rungs landing after the decision window are record-only),
+   the per-leg escalation edges, the Dhan legs (completely untouched), the
+   chain→contract sequencing, and the §38.8 decision-freshness gate.
+   Timeouts TIGHTEN: chain 10 s → 4.5 s, spot 5 s → 3.5 s (per-leg budgets
+   re-derived and const-asserted).
 
 ---
 

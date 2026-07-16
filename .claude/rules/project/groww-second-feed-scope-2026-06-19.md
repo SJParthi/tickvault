@@ -749,7 +749,8 @@ tasks only; the live WS capture chain, the tick hot path, and the Dhan legs are 
 | Token | shared-minter SSM READ-ONLY via the existing `fetch_groww_access_token` (`/tickvault/<env>/groww/access-token`) — NEVER minted, never logged, never in URLs; `Authorization: Bearer <token>` + `x-api-version: 1.0`. The token's ~06:00 IST daily expiry is OFFICIALLY documented (upgraded from assumption, 2026-07-13 docs research); the bruteX minter Lambda re-mints ~06:05 IST |
 | Tables | SAME shared tables + feed-in-key: `spot_1m_rest` + `option_chain_1m` tagged `feed='groww'` (their DEDUP keys already carry `feed`); the per-contract leg gets ONE new table (proposal `option_contract_1m_rest`) with `feed` in its DEDUP key + retention registration. NEVER `ticks` / `candles_*` / `historical_candles` |
 | Expiry source | the already-ingested daily Groww instruments CSV (nearest expiry ≥ today; never-roll) — no new expiry REST endpoint |
-| Rate budget | ~6–12 requests/min in-session against the documented Live Data 10/sec + 300/min type bucket (the `/historical/*` + `/option-chain/*` bucket is UNNAMED in the docs → conservatively assumed Live Data); own min-gap pacing on the chain/contract legs |
+| Rate budget | ~6–12 requests/min in-session against the documented Live Data 10/sec + 300/min type bucket (the `/historical/*` + `/option-chain/*` bucket is UNNAMED in the docs → conservatively assumed Live Data); ~~own min-gap pacing on the chain/contract legs~~ **AMENDED 2026-07-14 (§38.9 auto-ladder):** the spot+chain legs burst in rate-safe CONCURRENT waves (two_wave default ≤ 4 req/s at the boundary; seven_concurrent probe-gated) with 429 auto-demote; the contract leg keeps its 500 ms min-gap |
+| Burst tiers (2026-07-14, §38.9) | `[groww_rest_burst] tier` — `two_wave` (DEFAULT: 3 chain requests at close+300 ms, 4 spot at close+1,350 ms; 1,050 ms wave separation ⇒ ≤ 4 req/s boundary burst) / `seven_concurrent` (operator preference, PROBE-GATED: all 7 at close+300 ms). Any Groww-leg HTTP 429 steps the session down the demotion ladder (`tv_groww_rest_burst_demoted_total{level}` + one coded warn per level — staggered, then fully sequential; fix-round MEDIUM-1); optional pre-boundary warm-up GET per leg (`warm_up`, base.toml ON); off-hours rate probe env-gated `TICKVAULT_GROWW_RATE_PROBE=1` (blackout [08:30, 16:00) IST ANY day — fix-round SECURITY-MEDIUM) |
 | Latency mandate (Quote 2) | per-fetch close-to-data latency stored PER-ROW + histograms (`tv_groww_spot1m_close_to_data_ms` / `tv_groww_chain1m_close_to_data_ms`) + a plain-English daily digest/scorecard line per feed per leg |
 | Config gates | `[groww_spot_1m]` / `[groww_option_chain_1m]` / the contract-leg section — all serde default OFF; base.toml opts in per leg; the chain leg's DEFAULT stayed OFF pending first-live-session verification + a dated note — **verified + flipped ON in base.toml 2026-07-13 after the live probe PASSED (§38.6; the serde DEFAULT stays OFF)** |
 
@@ -773,6 +774,29 @@ tasks only; the live WS capture chain, the tick hot path, and the Dhan legs are 
 > (minute-boundary bursts spread to ≤6 req/s against the shared 10/s ceiling) and timeouts
 > are entirely ours; worst-case ~18 req/min ≈ 6% of the 300/min budget solo, ~66% with
 > in-session BruteX co-tenancy — still inside."
+
+> **2026-07-14 envelope amendment (§38.9 auto-ladder — supersedes the "spread to ≤6
+> req/s" pacing sentence above for the spot+chain legs; numbers RECOMPUTED same day for
+> the fix-round HIGH-1 rung jitter):** the shipped `two_wave` tier bursts ≤ 4 req/s at
+> the boundary (wave separation > 1 s, const-asserted; wake instants are
+> MILLISECOND-precise on both legs — fix-round CRITICAL-1, so the separation can never
+> be collapsed by whole-second fractional drift); the probe-gated `seven_concurrent`
+> tier bursts 7 req/s. Each spot target's rung schedule carries a deterministic
+> slot × 150 ms jitter in ALL tiers (fix-round HIGH-1 — the Dhan-leg precedent), so the
+> HONEST vendor-lag worst cases are: jittered spot rungs 6 req/s solo (pre-jitter 8),
+> 8 with the contract leg's 2/s (pre-jitter 10, AT the ceiling), and
+> `seven_concurrent`'s initial wave plus jittered rung stragglers 9 req/s solo
+> (pre-jitter 11, ABOVE the ceiling) — all const-asserted; the off-hours probe's
+> 11 req/s top step is KEPT as deliberate over-test margin, and a live 429 auto-demotes
+> down the ladder within the session (staggered, then fully sequential — fix-round
+> MEDIUM-1). LOW-2 honest note (same fix round): the contract leg starts ~2–6 s earlier
+> than pre-Stage-1 and stacks its 2/s stream inside the spot rung windows — counted
+> inside the solo const-assert, zero co-tenant margin beyond it, accepted by design.
+> Per-minute totals ≤ 55 (≈ 18% of the 300/min budget) const-asserted. Timeouts
+> tightened (chain 4.5 s, spot 3.5 s); the < 5 s decision-data claim is BY CONSTRUCTION
+> for the request schedule and MEASURED live by the unchanged `close_to_data_ms`
+> histograms — vendor sealing lag stays UNVERIFIED-LIVE and is recovered record-only by
+> the unchanged ladder/backfill/sweep."
 
 ## §38.4 What a violating PR looks like (REJECT)
 
@@ -947,6 +971,49 @@ note, and §38.7 is the VIX spot-leg grant, all of which predate this
 subsection on `main`.) Mirrored (one
 paragraph each) into `no-rest-except-live-feed-2026-06-27.md` §9 and
 `rest-1m-pipeline-error-codes.md` §3.
+
+## §38.9 — 2026-07-14: rate-safe AUTO-LADDER for the Groww per-minute REST legs (dated amendment)
+
+**Operator authorization (2026-07-14, relayed verbatim via the coordinator
+session):** *"approved and go ahead with the recommendation"* — the auto-ladder
+rebuild of the §38 spot + chain legs so worst-case DECISION data lands < 5 s
+after minute close, with the operator's stated 7-concurrent preference held
+PROBE-GATED (the shipped default is the two-wave shape). Full contract:
+`no-rest-except-live-feed-2026-06-27.md` §9.7 (the twin dated amendment);
+stage strings + observability: `rest-1m-pipeline-error-codes.md`.
+
+Summary of what changed on the Groww legs (the Dhan legs are untouched):
+
+1. Self-imposed pacing DELETED — the chain leg fires on its OWN
+   minute-boundary timer (the spot→chain watch signal + 2.5 s fallback and
+   the 1,000 ms chain inter-underlying min-gap are gone); spot targets fetch
+   CONCURRENTLY. The chain→contract sequencing signal is UNCHANGED.
+2. `[groww_rest_burst] tier` — `two_wave` (DEFAULT: chain wave at
+   close+300 ms, spot wave at close+1,350 ms; ≤ 4 req/s boundary burst) /
+   `seven_concurrent` (all 7 at close+300 ms; promotion needs the probe
+   verdict + a fresh dated note here and in §9.7).
+3. AUTO-DEMOTE on any Groww-leg 429 — a session-scoped LADDER since the
+   same-day fix round (MEDIUM-1): seven_concurrent → two_wave → two_wave
+   + 350 ms intra-wave stagger → fully-sequential-within-wave (one whole
+   per-slot budget between wave slots — the pre-Stage-1 pacing shape);
+   one coded warn per level, `tv_groww_rest_burst_demoted_total{level}`;
+   boot resets to the configured tier.
+4. WARM-UP (`warm_up`, base.toml ON): one unauthenticated pre-boundary GET
+   per leg client at boundary−4 s (3 s-bounded) to re-establish idle-closed
+   TLS before the critical window.
+5. OFF-HOURS RATE PROBE (`TICKVAULT_GROWW_RATE_PROBE=1`, default OFF;
+   OPERATOR-TRIGGERED): escalating 4→6→8→11 req/s bursts, ≤ 2 rounds, ~58
+   requests, log-lines + counters only, no tables. Refused inside the
+   [08:30, 16:00) IST wall-clock blackout on ANY day (fix-round
+   SECURITY-MEDIUM — no trading-calendar dependency, so a stale holiday
+   list can never fire the burst mid-session); the operator MUST
+   coordinate the run with BruteX's nightly bulk window (fix-round
+   MEDIUM-2 — the blackout cannot see BruteX's schedule).
+6. Timeouts tightened (chain 10 s → 4.5 s; spot 5 s → 3.5 s); per-leg
+   budgets re-derived + const-asserted; the bounded re-poll ladder, the
+   backfill, the 15:31 sweep, the escalation edges, the token discipline and
+   the §38.8 decision-freshness gate are ALL unchanged (never-skip capture
+   stands; late rungs are record-only).
 
 ---
 
