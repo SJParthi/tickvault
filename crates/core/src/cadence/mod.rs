@@ -3,19 +3,20 @@
 //! reshaped POST-CLOSE by the operator directive 2026-07-16).
 //!
 //! Per trading-day minute-close instant T in `[09:16:00, 15:30:00]` IST:
-//! Dhan fires POST-CLOSE per its SHAPE ladder (2026-07-16 — rung 0
-//! primary: all 3 chains CONCURRENT at the burst second T+1 plus the 2
-//! decision-critical spots (NIFTY, BANKNIFTY), the remaining 2 spots
-//! (SENSEX, INDIA VIX) at T+2 — the honest 5+2 packing of the
-//! operator's "all 7 first second" under the broker's 5/sec cap; rung 1
-//! fallback: chains at T+1, ALL 4 spots at T+2), the spot seconds
-//! further split by the 2026-07-15 ADAPTIVE CONCURRENCY tiers
-//! (per-second-group caps 4/3/2/1, greedy overflow to later 1000ms
-//! buckets; both brokers' candle endpoints are single-symbol-per-request
-//! — never one batched HTTP call), every fire passing the
-//! per-(underlying, expiry) ≥3s chain gate + the COMBINED
-//! rolling-1000ms cap-5 window (the 3s rule is per-SAME-chain-expiry
-//! only — different underlyings are explicitly concurrent); Groww fires
+//! Dhan fires POST-CLOSE per its SHAPE ladder (2026-07-16 + the
+//! same-day all-7 correction — rung 0 primary: ALL 7 requests
+//! concurrent at the burst second T+1, 3 chains + 4 spots, exactly the
+//! operator's "all 7 parallel at first second"; rung 1 fallback: chains
+//! at T+1, ALL 4 spots at T+2), the spot seconds further split by the
+//! 2026-07-15 ADAPTIVE CONCURRENCY tiers (per-second-group caps
+//! 4/3/2/1, greedy overflow to later 1000ms buckets; both brokers'
+//! candle endpoints are single-symbol-per-request — never one batched
+//! HTTP call). The TWO-BUCKET budget model makes all-7 legal: the 4
+//! spot fires pass the spot + COMBINED rolling-1000ms rings (the
+//! Data-API 5/sec bucket, 4 ≤ 5); the 3 chain fires pass ONLY the
+//! per-(underlying, expiry) ≥3s chain gate (the option-chain API's own
+//! budget — the 3s rule is per-SAME-chain-expiry only, different
+//! underlyings explicitly concurrent). Groww fires
 //! per its fallback-shape ladder (2026-07-16 two-rung prescription +
 //! the retained choice-3 last resort — rung 0: all 7 requests in
 //! parallel at :00, gate-free lane; rung 1: :01 chains / :02 all 4
@@ -34,10 +35,11 @@
 //!   against the shared `SPOT_1M_REST_*` window constants)
 //! - `gate` — pure CAS [`gate::MinSpacingGate`] (per-(underlying,
 //!   expiry) chains + per-expiry waves) + the spot/COMBINED
-//!   rolling-window rings inside [`gate::DhanGates`] (chain+spot+expiry
-//!   ≤ 5 Dhan fires per rolling second — THE binding cadence-lane
-//!   pacing per the 2026-07-16 coordinator ruling) in the MONOTONIC
-//!   time domain (injected clock) — the structural zero-429 hard floor
+//!   rolling-window rings inside [`gate::DhanGates`] (spot+expiry ≤ 5
+//!   Dhan Data-API fires per rolling second; chains solely per-key —
+//!   the two-bucket model, THE binding cadence-lane pacing per the
+//!   2026-07-16 coordinator ruling) in the MONOTONIC time domain
+//!   (injected clock) — the structural zero-429 hard floor
 //! - `ladder` — the streak-driven shape/concurrency ladders
 //!   ([`ladder::StreakLadder`]: the 2026-07-16 Dhan shape rung 0⇄1,
 //!   the spot tiers, the Groww fallback shapes) + the per-second spot

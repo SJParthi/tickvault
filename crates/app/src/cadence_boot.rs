@@ -23,6 +23,7 @@ use tickvault_core::cadence::{
     CadenceRunnerDeps, DryRunLoggingExecutor, global_expiry_store, init_global_dhan_gates,
     spawn_supervised_cadence_runner,
 };
+use tickvault_core::notification::NotificationService;
 use tokio::sync::Notify;
 use tracing::info;
 
@@ -61,6 +62,7 @@ pub fn spawn_cadence_scheduler(
     config: &ApplicationConfig,
     trading_calendar: &Arc<TradingCalendar>,
     feed_runtime: &Arc<FeedRuntimeState>,
+    notifier: &Arc<NotificationService>,
 ) -> Option<Arc<Notify>> {
     if !config.cadence.enabled {
         info!("cadence: disabled by [cadence] config — nothing spawned");
@@ -111,6 +113,10 @@ pub fn spawn_cadence_scheduler(
         // the High coded error! storm. Flip to false with the REAL
         // executor PR.
         dry_run: true,
+        // R6 (2026-07-16): the typed Telegram sink for the expiry
+        // cross-broker disagreement page (`CadenceExpiryDisagreement`,
+        // edge-latched once per underlying per day).
+        notifier: Some(Arc::clone(notifier)),
         shutdown: Arc::clone(&shutdown),
     };
     // Fire-and-forget: the supervisor owns respawn; graceful teardown
@@ -118,8 +124,9 @@ pub fn spawn_cadence_scheduler(
     drop(spawn_supervised_cadence_runner(deps));
     info!(
         "cadence: supervised runner spawned (dry-run executors both lanes; \
-         chains pre-fire T-5s/T-2s + post T+2s, spots concurrency-laddered \
-         from T+3s, Groww waves shape-laddered from T+0)"
+         post-close all-7 burst at T+1s — 3 chains + 4 spots concurrent, \
+         shape/concurrency-laddered on rate limits; Groww all-7 at T+0, \
+         wave shape-laddered)"
     );
     Some(shutdown)
 }

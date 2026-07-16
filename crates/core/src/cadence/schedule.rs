@@ -216,7 +216,7 @@ pub struct CycleSlots {
     /// T as absolute IST ms-of-day.
     pub boundary_ms: i64,
     /// The Dhan SHAPE rung this table was built at (2026-07-16: 0 = the
-    /// primary 5+2 packing; 1 = the split fallback).
+    /// ALL-7 concurrent primary; 1 = the split fallback).
     pub dhan_shape: u8,
     /// Dhan chain slots (NIFTY / BANKNIFTY / SENSEX order) — ALL THREE at
     /// the burst second (T + `dhan_burst_offset_ms`): the 2026-07-16
@@ -432,10 +432,11 @@ mod tests {
     #[test]
     fn test_cadence_schedule_rung0_slots_match_operator_table() {
         // T = 10:00:00 — a mid-session boundary; shape 0 / step 0 /
-        // groww 0 = the operator's 2026-07-16 primary table: second 1 =
-        // 3 chains + 2 decision-critical spots; second 2 = the remaining
-        // 2 spots (the honest 5+2 packing of "all 7 first second"
-        // against the broker's documented 5/sec Data-API cap).
+        // groww 0 = the operator's 2026-07-16 primary table (same-day
+        // correction: "all 7 parallel at first second"): second 1 =
+        // 3 chains + ALL 4 spots concurrent — the spots sit in the
+        // Data-API bucket (4 ≤ 5), the chains in the option-chain API's
+        // own per-(underlying, expiry) budget (two-bucket model).
         let slots = build_cycle_slots(10 * 3600, 0, 0, 0, &cfg());
         assert_eq!(slots.cycle_minute_ist, 10 * 3600 - 60);
         assert_eq!(slots.dhan_shape, 0);
@@ -444,20 +445,12 @@ mod tests {
         // is per-(underlying, expiry) only).
         assert_eq!(slots.dhan_chain_slots_ms, [ms(10, 0, 1, 0); 3]);
         // Chain retries: all at burst + 3s = T+4.0 (per-key gates admit
-        // each at exactly +3s; the combined window holds ≤4 there).
+        // each at exactly +3s; chains never touch the Data-API ring).
         assert_eq!(slots.dhan_chain_retry_slots_ms, [ms(10, 0, 4, 0); 3]);
-        // Spots: NIFTY + BANKNIFTY share the burst second (with the 3
-        // chains — exactly 5 fires = the cap); SENSEX + VIX at T+2.0.
+        // Spots: ALL FOUR share the burst second with the 3 chains —
+        // the operator's all-7 primary.
         assert_eq!(slots.spot_step, 0);
-        assert_eq!(
-            slots.dhan_spot_slots_ms,
-            [
-                ms(10, 0, 1, 0),
-                ms(10, 0, 1, 0),
-                ms(10, 0, 2, 0),
-                ms(10, 0, 2, 0)
-            ]
-        );
+        assert_eq!(slots.dhan_spot_slots_ms, [ms(10, 0, 1, 0); 4]);
         // Groww shape 0 (choice 1): all waves at T+0, verdict at T+800.
         assert_eq!(slots.groww_shape, 0);
         assert_eq!(slots.groww_chain_wave_ms, ms(10, 0, 0, 0));
@@ -495,21 +488,29 @@ mod tests {
         // The 2026-07-15 spot-concurrency tiers compose with the
         // 2026-07-16 shape rungs via the per-second-group bucket fill.
         let c = cfg();
-        // Shape 0 tiers 1..=2 keep the 2+2 packing (per-bucket capacity
-        // still admits pairs); tier 3 spills to singles T+1/2/3/4.
-        for step in 1..=2u8 {
-            let s = build_cycle_slots(10 * 3600, 0, step, 0, &c);
-            assert_eq!(
-                s.dhan_spot_slots_ms,
-                [
-                    ms(10, 0, 1, 0),
-                    ms(10, 0, 1, 0),
-                    ms(10, 0, 2, 0),
-                    ms(10, 0, 2, 0)
-                ],
-                "shape 0 step {step}"
-            );
-        }
+        // Shape 0: tier degradation happens WITHIN the burst group,
+        // greedy overflow spilling to the next 1000ms buckets; tier 3
+        // spills to singles T+1/2/3/4.
+        let s1 = build_cycle_slots(10 * 3600, 0, 1, 0, &c);
+        assert_eq!(
+            s1.dhan_spot_slots_ms,
+            [
+                ms(10, 0, 1, 0),
+                ms(10, 0, 1, 0),
+                ms(10, 0, 1, 0),
+                ms(10, 0, 2, 0)
+            ]
+        );
+        let s2 = build_cycle_slots(10 * 3600, 0, 2, 0, &c);
+        assert_eq!(
+            s2.dhan_spot_slots_ms,
+            [
+                ms(10, 0, 1, 0),
+                ms(10, 0, 1, 0),
+                ms(10, 0, 2, 0),
+                ms(10, 0, 2, 0)
+            ]
+        );
         let s3 = build_cycle_slots(10 * 3600, 0, 3, 0, &c);
         assert_eq!(
             s3.dhan_spot_slots_ms,
@@ -597,10 +598,13 @@ mod tests {
 
     #[test]
     fn test_cadence_schedule_burst_packing_never_exceeds_broker_cap() {
-        // 2026-07-16 cap reconciliation: at EVERY (shape × tier)
-        // permutation, no single second carries more than 5 Dhan fires
-        // (3 chains + spots sharing the burst second), and the burst
-        // second carries the chains + at most 2 spots.
+        // 2026-07-16 cap reconciliation (two-bucket model, same-day
+        // all-7 correction): at EVERY (shape × tier) permutation, no
+        // single second carries more than 4 SPOT fires — the Data-API
+        // bucket (4 ≤ the broker's 5/sec cap, with one slot of expiry
+        // headroom). The 3 concurrent chains sit in the option-chain
+        // API's OWN per-(underlying, expiry) budget and never count
+        // against the Data-API bucket.
         let c = cfg();
         for shape in 0..=1u8 {
             for step in 0..=3u8 {
@@ -608,21 +612,18 @@ mod tests {
                 let burst = s.dhan_chain_slots_ms[0];
                 for probe in 0..=5i64 {
                     let second = burst + probe * 1_000;
-                    let chains = s
-                        .dhan_chain_slots_ms
-                        .iter()
-                        .filter(|m| **m == second)
-                        .count();
                     let spots = s
                         .dhan_spot_slots_ms
                         .iter()
                         .filter(|m| **m == second)
                         .count();
                     assert!(
-                        chains + spots <= 5,
-                        "shape {shape} step {step} second {second}: {chains}+{spots}"
+                        spots <= 4,
+                        "shape {shape} step {step} second {second}: {spots} spots"
                     );
                 }
+                // Every chain fires concurrently at the burst instant.
+                assert_eq!(s.dhan_chain_slots_ms, [burst; 3]);
                 // All fires are POST-close — no pre-fire exists anymore.
                 for slot in s
                     .dhan_chain_slots_ms
@@ -646,15 +647,7 @@ mod tests {
         c.dhan_burst_offset_ms = 100;
         let s = build_cycle_slots(10 * 3600, 0, 0, 0, &c);
         assert_eq!(s.dhan_chain_slots_ms, [ms(10, 0, 0, 100); 3]);
-        assert_eq!(
-            s.dhan_spot_slots_ms,
-            [
-                ms(10, 0, 0, 300),
-                ms(10, 0, 0, 300),
-                ms(10, 0, 1, 300),
-                ms(10, 0, 1, 300)
-            ]
-        );
+        assert_eq!(s.dhan_spot_slots_ms, [ms(10, 0, 0, 300); 4]);
         // Never pre-close, on ANY shape and ANY concurrency step.
         for shape in 0..=1u8 {
             for step in 0..=3u8 {

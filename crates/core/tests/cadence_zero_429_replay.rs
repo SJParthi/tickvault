@@ -6,7 +6,8 @@
 //! through 64-cycle days under boot-skew / wake-jitter / GC-pause /
 //! latency / failure-outcome / restart permutations — every cycle's
 //! slot table built at the cycle's LIVE (Dhan shape rung × spot tier ×
-//! Groww shape) ladder state, so the 2026-07-16 5+2 packing AND its
+//! Groww shape) ladder state, so the 2026-07-16 ALL-7 burst (the
+//! same-day correction — 3 chains + 4 spots concurrent at T+1) AND its
 //! tier/shape degradations all flow through the real gates — and
 //! asserts the STRUCTURAL rate floors:
 //!
@@ -18,13 +19,14 @@
 //!   rolling 1000ms window — across every concurrency-ladder step,
 //!   step transition, shape rung, retry and restart (the 2026-07-15
 //!   rolling-window gate change; Dhan hard cap 5/sec)
-//! - NEVER more than 5 TOTAL Dhan fires (chain + spot + EXPIRY-LIST
-//!   COMBINED) in ANY rolling 1000ms window (verifier L1, 2026-07-15:
-//!   the combined per-second budget — pre-L1 the spot window and the
-//!   chain gates were independent and their SUM could hit 5-6/sec,
-//!   zero headroom vs Dhan's 5/sec; R4 2026-07-15: the
-//!   unresolved-expiry scenario arm drives `try_acquire_expiry` through
-//!   the SAME ledger, so the combined assertion is honest. HONEST SCOPE
+//! - NEVER more than 5 Dhan DATA-API fires (spot + EXPIRY-LIST
+//!   COMBINED) in ANY rolling 1000ms window (verifier L1 2026-07-15,
+//!   RE-SCOPED by the operator's 2026-07-16 all-7 correction: chain
+//!   fires live in the option-chain API's OWN per-(underlying, expiry)
+//!   budget — the TWO-BUCKET model — so they are deliberately OUTSIDE
+//!   this ledger; R4 2026-07-15: the unresolved-expiry scenario arm
+//!   drives `try_acquire_expiry` through the SAME ledger, so the
+//!   combined assertion is honest. HONEST SCOPE
 //!   (R3-F2, 2026-07-15): the zero-deferral/zero-denial asserts do NOT
 //!   structurally prove anchor safety — a burst-window anchor value
 //!   would push the sim clock past the boundary and
@@ -32,7 +34,7 @@
 //!   so the collision could never reach those asserts. Anchor safety
 //!   rests on the literal :30 phase pins in this file + the gate-level
 //!   collision doc test
-//!   (`test_cadence_gate_expiry_fire_in_burst_window_defers_fourth_nominal_spot`);
+//!   (`test_cadence_gate_expiry_invasion_tolerance_and_cap5_backstop`);
 //!   this arm proves the anchored waves share the combined ledger and
 //!   fire at their anchor)
 //! - zero gate denials on nominal slots (on-time dispatch)
@@ -182,19 +184,22 @@ impl SimOutcome {
 struct FireLedger {
     per_underlying: [Vec<i64>; ChainUnderlying::COUNT],
     /// EVERY chain fire (all underlyings, primaries + retries) — the
-    /// activity-floor count ledger. NOT spacing-asserted: the global
-    /// chain gate retired 2026-07-16 (concurrent distinct underlyings
-    /// are the directive; the combined cap-5 ring below is the binding
-    /// cross-key budget).
+    /// activity-floor count ledger. NOT spacing-asserted and NOT in the
+    /// combined ledger: the global chain gate retired 2026-07-16
+    /// (concurrent distinct underlyings are the directive) and the
+    /// same-day all-7 correction moved chains OUT of the Data-API
+    /// bucket entirely (the two-bucket model — chains are governed
+    /// solely by the per-(underlying, expiry) stamps asserted above).
     chain_all: Vec<i64>,
     spot: Vec<i64>,
     /// Dhan EXPIRY-LIST fires (the unresolved-expiry scenario arm, R4
     /// 2026-07-15) — asserted against the 1-per-rolling-second expiry
     /// spacing.
     expiry: Vec<i64>,
-    /// EVERY Dhan fire (chain, spot AND expiry-list), in acquisition
-    /// order — the COMBINED per-second budget ledger (verifier L1 +
-    /// R4, 2026-07-15).
+    /// Every Dhan DATA-API fire (spot AND expiry-list), in acquisition
+    /// order — the COMBINED per-second budget ledger (verifier L1 + R4
+    /// 2026-07-15; chains excluded per the 2026-07-16 two-bucket
+    /// re-scope).
     combined: Vec<i64>,
 }
 
@@ -216,18 +221,19 @@ impl FireLedger {
             CADENCE_SPOT_WINDOW_MS,
             &format!("{case}: expiry-fire spacing"),
         );
-        // The COMBINED budget (verifier L1 + R4, 2026-07-15): never more
-        // than 5 TOTAL Dhan fires — chain + spot + expiry-list, across
-        // retries, ladder steps, rungs, restarts AND expiry retry waves
-        // — in ANY rolling 1000ms window. The pre-L1 gates asserted spot
-        // and chain floors SEPARATELY, so their SUM (a chain fire + a
-        // full spot group in one window) was never caught; pre-R4 the
-        // combined ledger never saw an expiry fire at all.
+        // The COMBINED Data-API budget (verifier L1 + R4 2026-07-15,
+        // re-scoped 2026-07-16): never more than 5 Dhan DATA-API fires
+        // — spot + expiry-list, across retries, ladder steps, rungs,
+        // restarts AND expiry retry waves — in ANY rolling 1000ms
+        // window. Chains are deliberately NOT here (the two-bucket
+        // model): their budget is the per-key ≥3s deltas asserted
+        // above, and counting them would refuse the operator's all-7
+        // burst against a cap neither documented budget imposes.
         assert_window_cap(
             &self.combined,
             CADENCE_SPOT_WINDOW_MS,
             CADENCE_SPOT_WINDOW_CAP_CEILING,
-            &format!("{case}: COMBINED chain+spot+expiry"),
+            &format!("{case}: COMBINED spot+expiry"),
         );
     }
 }
@@ -295,8 +301,9 @@ fn sim_gated_chain_fire(
         match gates.try_acquire_chain(underlying, None, clock.mono()) {
             GateVerdict::Acquired => {
                 ledger.per_underlying[underlying.index()].push(clock.wall_ms);
+                // Chains record NO combined-ledger entry (two-bucket
+                // model, 2026-07-16 correction).
                 ledger.chain_all.push(clock.wall_ms);
-                ledger.combined.push(clock.wall_ms);
                 return clock.wall_ms;
             }
             GateVerdict::RetryAtMs(at_mono) => {
@@ -490,7 +497,7 @@ fn sim_dhan_cycle(
     // single, never contending a nominal slot's gate window — the
     // runner's `next_spot_retry_target_ms` mirror).
     let mut spot_failures: Vec<(usize, CadenceFetchError)> = Vec::new();
-    for k in 0..4 {
+    for (k, spot_ok) in spots_ok.iter_mut().enumerate() {
         let jitter = i64::try_from(rng.below(500)).unwrap_or(0);
         let fired_at = sim_gated_spot_fire(
             clock,
@@ -506,7 +513,7 @@ fn sim_dhan_cycle(
         let outcome = SimOutcome::draw(rng, fail_bias_pct);
         match outcome.as_error() {
             None if fired_at + latency <= slots.dhan_cutoff_ms => {
-                spots_ok[k] = true;
+                *spot_ok = true;
                 if k < ChainUnderlying::COUNT {
                     decide_ready_at = decide_ready_at.max(fired_at + latency);
                 }
@@ -846,9 +853,10 @@ proptest! {
         } else {
             prop_assert_eq!(ledger.expiry.len(), 0);
         }
-        // THE floors: per-UL ≥3000, GLOBAL ≥3000, spot ≤ window cap per
-        // rolling 1000ms — including retries, ladder steps/transitions,
-        // rungs and restarts, in the broker wall domain.
+        // THE floors: per-UL ≥3000 (the option-chain bucket), spot ≤
+        // window cap + spot+expiry ≤ 5 per rolling 1000ms (the Data-API
+        // bucket) — including retries, ladder steps/transitions, rungs
+        // and restarts, in the broker wall domain.
         ledger.assert_floors(cfg.chain_min_spacing_ms, cfg.spot_window_cap, "replay");
         prop_assert_eq!(
             nominal_denials,
@@ -858,8 +866,8 @@ proptest! {
         // The concurrency ladder starts at the cap's structural floor
         // (step 0 for the default cap 4) — the full-parallel grouping is
         // ALWAYS exercised, never a vacuous degraded-only run; likewise
-        // the Dhan shape ladder starts at rung 0, so the primary 5+2
-        // packing is always driven through the gates.
+        // the Dhan shape ladder starts at rung 0, so the ALL-7 primary
+        // burst is always driven through the gates.
         prop_assert!(spot_steps_seen[usize::from(spot_step_floor)]);
         prop_assert!(dhan_shapes_seen[0]);
         // Exactly ONE decision per lane per cycle: the latch must ADMIT

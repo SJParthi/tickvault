@@ -893,11 +893,13 @@ pub struct CadenceConfig {
     pub enabled: bool,
     /// The Dhan BURST second offset from the minute-close instant T, ms
     /// (operator directive 2026-07-16 — ALL fires are POST-close now).
-    /// Default 1000 (second 1): shape rung 0 fires 3 chains + the 2
-    /// decision-critical spots (NIFTY, BANKNIFTY) here and the remaining
-    /// 2 spots one window later; rung 1 fires the 3 chains here and all
-    /// 4 spots one window later. Validated > 0 and feasible against the
-    /// Dhan lane cutoff (the deepest spot bucket must land inside it).
+    /// Default 1000 (second 1): shape rung 0 fires ALL 7 requests here
+    /// concurrently (3 chains + 4 spots — the operator's same-day all-7
+    /// correction; the spots in the Data-API bucket, the chains in the
+    /// option-chain API's own per-key budget); rung 1 fires the 3
+    /// chains here and all 4 spots one window later. Validated > 0 and
+    /// feasible against the Dhan lane cutoff (the deepest spot bucket
+    /// must land inside it).
     #[serde(default = "default_cadence_dhan_burst_offset_ms")]
     pub dhan_burst_offset_ms: i64,
     /// The Dhan spot ROLLING-1000ms-WINDOW gate cap (operator

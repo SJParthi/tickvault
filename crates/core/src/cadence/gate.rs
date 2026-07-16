@@ -191,32 +191,38 @@ struct DhanWindows {
     /// The Dhan SPOT window (cap = the configured `spot_window_cap`,
     /// default 4).
     spot: WindowRing,
-    /// The COMBINED Dhan per-second budget (verifier L1, 2026-07-15):
-    /// EVERY Dhan cadence fire — chain, spot AND expiry-list — records
-    /// here, cap = [`CADENCE_SPOT_WINDOW_CAP_CEILING`] (5 = Dhan's
-    /// Data-API per-second hard budget). Pre-L1 the spot window and the
-    /// chain spacing gates were independent, so a chain fire + a full
-    /// spot group could land 5 (or, at `spot_window_cap = 5`, 6) Dhan
-    /// requests in one rolling second — zero headroom vs Dhan's 5/sec.
+    /// The COMBINED Dhan DATA-API per-second budget (verifier L1
+    /// 2026-07-15, RE-SCOPED by the operator's 2026-07-16 all-7
+    /// correction): SPOT + EXPIRY-LIST fires record here, cap =
+    /// [`CADENCE_SPOT_WINDOW_CAP_CEILING`] (5 = Dhan's Data-API per-
+    /// second hard budget). CHAIN fires do NOT touch this ring — the
+    /// TWO-BUCKET model: the option-chain API carries its OWN documented
+    /// budget (1 unique request per 3s per SAME (underlying, expiry)
+    /// key; different underlyings explicitly concurrent), enforced
+    /// solely by the per-(underlying, expiry) CAS stamps. Counting
+    /// chains here would self-refuse the operator's all-7 burst
+    /// (3 chains + 4 spots = 7 > 5) against a cap neither budget
+    /// actually imposes on the mix.
     combined: WindowRing,
 }
 
 /// One-expiry-fire-per-rolling-second spacing (verifier L2, 2026-07-15):
 /// bounds the expiry-resolution wave to ≤1 fire per window so the
-/// on-time nominal schedule's worst window (4 spots, or 1 chain) plus
-/// one expiry fire stays ≤ the combined 5/sec budget — an expiry wave
-/// can never gate-defer a nominal cycle slot.
+/// on-time nominal schedule's worst Data-API window (4 spots) plus one
+/// expiry fire stays ≤ the combined 5/sec budget — an expiry wave can
+/// never gate-defer a nominal cycle slot.
 const CADENCE_EXPIRY_FIRE_SPACING_MS: i64 = CADENCE_SPOT_WINDOW_MS;
 
-/// The Dhan lane's gate set (design §4, reshaped 2026-07-16): one gate
-/// per chain underlying + the per-(underlying, expiry) stamps (Dhan's
-/// 1-unique-request-per-3s option-chain rule is per SAME (underlying,
-/// expiry) KEY only — the operator's 2026-07-16 directive; the retired
-/// GLOBAL chain gate serialized different underlyings, which are
-/// explicitly concurrent now) + the spot ROLLING-WINDOW gate + the
-/// COMBINED chain+spot+expiry per-second budget (verifier L1,
-/// 2026-07-15 — THE binding Dhan enforcement) + the expiry-fire spacing
-/// gate (verifier L2, 2026-07-15).
+/// The Dhan lane's gate set (design §4, reshaped 2026-07-16 — the
+/// TWO-BUCKET model of the operator's same-day all-7 correction):
+/// one gate per chain underlying + the per-(underlying, expiry) stamps
+/// (Dhan's 1-unique-request-per-3s option-chain rule is per SAME
+/// (underlying, expiry) KEY only — different underlyings explicitly
+/// concurrent; the retired GLOBAL chain gate serialized them) = the
+/// OPTION-CHAIN bucket, PLUS the spot ROLLING-WINDOW gate + the
+/// COMBINED spot+expiry per-second budget (the Data-API 5/sec bucket;
+/// verifier L1 2026-07-15, re-scoped 2026-07-16) + the expiry-fire
+/// spacing gate (verifier L2, 2026-07-15).
 #[derive(Debug)]
 pub struct DhanGates {
     /// Per-underlying chain gates, indexed by [`ChainUnderlying::index`].
@@ -227,16 +233,16 @@ pub struct DhanGates {
     /// budget. Deferral = the resolver sleeps to the instant or retries
     /// next wave — never an ungated fire.
     expiry_spacing: MinSpacingGate,
-    /// The Dhan SPOT rolling-1000ms window + the COMBINED per-second
-    /// budget, under ONE lock (2026-07-15 gate change + verifier L1):
-    /// the concurrency ladder's step-0 group fires 4 spots at ONE
-    /// instant, which a min-spacing gate cannot admit — the SPOT window
-    /// ring is the structural ceiling instead (≤ `spot_window_cap` in
-    /// ANY sliding 1000ms window, default 4, hard cap 5); the COMBINED
-    /// ring additionally caps chain+spot+expiry Dhan fires at 5 per
-    /// rolling second (Dhan's Data-API hard budget — pre-L1 a chain
-    /// fire + a full spot group could jointly hit 5-6/sec with zero
-    /// headroom).
+    /// The Dhan SPOT rolling-1000ms window + the COMBINED Data-API
+    /// per-second budget, under ONE lock (2026-07-15 gate change +
+    /// verifier L1): the concurrency ladder's step-0 group fires 4
+    /// spots at ONE instant, which a min-spacing gate cannot admit —
+    /// the SPOT window ring is the structural ceiling instead
+    /// (≤ `spot_window_cap` in ANY sliding 1000ms window, default 4,
+    /// hard cap 5); the COMBINED ring additionally caps SPOT + EXPIRY
+    /// Dhan fires at 5 per rolling second (Dhan's Data-API hard budget;
+    /// CHAIN fires are OUTSIDE it per the 2026-07-16 two-bucket
+    /// re-scope — see the [`DhanWindows::combined`] doc).
     ///
     /// PACING AUTHORITY (coordinator ruling A, 2026-07-16 — supersedes
     /// the 2026-07-15 F6 composition note for the CADENCE LANE): cadence
@@ -284,22 +290,19 @@ impl DhanGates {
     /// Authorize a chain fire for `underlying` (optionally keyed to a
     /// resolved `expiry_yyyymmdd`): the per-(underlying, expiry) stamp is
     /// consulted FIRST when the expiry is known (F1(i), 2026-07-15), then
-    /// the per-underlying gate, then the COMBINED per-second budget.
-    /// There is NO global chain gate anymore (2026-07-16 operator
-    /// directive: the 3s rule is per-(underlying, expiry) ONLY —
-    /// different underlyings fire concurrently; the combined cap-5 ring
-    /// is THE binding cross-underlying Dhan enforcement). On a combined
-    /// denial the per-underlying slot was conservatively consumed and
-    /// the fire DEFERS — a deferral, never a violation (design §4); the
-    /// carried retry instant is the MAX of both constraints (the
-    /// consumed per-underlying slot now binds at `now + spacing`), so
-    /// the caller's next wake cannot arrive before it can actually pass.
-    /// On a FINAL `Acquired` with a known expiry, the (underlying,
-    /// expiry) stamp is recorded. An expiry-less fire (`None` —
-    /// boot-degraded lane) consults NO stamp but still passes the
-    /// per-underlying gate, which is strictly MORE conservative (it
-    /// spaces ALL expiries of the underlying at once — subsumption,
-    /// pinned by `test_cadence_gate_expiryless_fire_subsumes_expiry_stamp`).
+    /// the per-underlying gate. There is NO global chain gate anymore
+    /// (2026-07-16 operator directive: the 3s rule is per-(underlying,
+    /// expiry) ONLY — different underlyings fire concurrently), and —
+    /// the same-day all-7 correction's TWO-BUCKET model — chain fires do
+    /// NOT touch the combined Data-API ring either: the option-chain API
+    /// carries its OWN documented budget, enforced entirely by the
+    /// per-key CAS stamps here. On a FINAL `Acquired` with a known
+    /// expiry, the (underlying, expiry) stamp is recorded. An expiry-less
+    /// fire (`None` — boot-degraded lane) consults NO stamp but still
+    /// passes the per-underlying gate, which is strictly MORE
+    /// conservative (it spaces ALL expiries of the underlying at once —
+    /// subsumption, pinned by
+    /// `test_cadence_gate_expiryless_fire_subsumes_expiry_stamp`).
     #[must_use]
     pub fn try_acquire_chain(
         &self,
@@ -320,35 +323,7 @@ impl DhanGates {
                 }
             }
         }
-        let verdict =
-            match self.chain_per_underlying[underlying.index()].try_acquire(now_monotonic_ms) {
-                GateVerdict::Acquired => {
-                    // The COMBINED per-second budget (verifier L1,
-                    // 2026-07-15): checked+recorded ATOMICALLY under the
-                    // windows lock. A combined denial leaves the
-                    // (already consumed) per-underlying slot binding at
-                    // now + spacing — the carried instant is the MAX so
-                    // the caller's next wake passes both.
-                    let mut w = self
-                        .windows
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    match w
-                        .combined
-                        .admissible(now_monotonic_ms, CADENCE_SPOT_WINDOW_MS)
-                    {
-                        Ok(()) => {
-                            w.combined.record(now_monotonic_ms);
-                            GateVerdict::Acquired
-                        }
-                        Err(combined_at) => {
-                            let per_ul_at = now_monotonic_ms.saturating_add(spacing);
-                            GateVerdict::RetryAtMs(combined_at.max(per_ul_at))
-                        }
-                    }
-                }
-                defer @ GateVerdict::RetryAtMs(_) => defer,
-            };
+        let verdict = self.chain_per_underlying[underlying.index()].try_acquire(now_monotonic_ms);
         if verdict == GateVerdict::Acquired
             && let Some(expiry) = expiry_yyyymmdd
         {
@@ -406,7 +381,7 @@ impl DhanGates {
     /// COMBINED per-second budget + the 1-per-rolling-second expiry
     /// spacing. Nothing is consumed on a denial (the combined ring is
     /// only recorded AFTER the spacing gate acquires, all under the
-    /// windows lock — atomic vs the chain/spot recorders), so the
+    /// windows lock — atomic vs the spot recorder), so the
     /// resolver can freely skip a deferred fire to its next wave.
     #[must_use]
     pub fn try_acquire_expiry(&self, now_monotonic_ms: i64) -> GateVerdict {
@@ -643,7 +618,8 @@ mod tests {
         // retired GLOBAL chain gate no longer exists.
         let gates = DhanGates::new(3_000, 4);
         // All THREE underlyings at the SAME instant: every one acquires
-        // (the combined cap-5 ring admits 3).
+        // (chains never touch the combined Data-API ring — the
+        // 2026-07-16 two-bucket re-scope).
         for ul in [
             ChainUnderlying::Nifty,
             ChainUnderlying::Banknifty,
@@ -679,9 +655,9 @@ mod tests {
     #[test]
     fn test_cadence_gate_try_acquire_chain_try_acquire_spot_independent_spacing_ms() {
         // The SPECIFIC gates stay independent floors (a chain fire never
-        // consumes a SPOT-ring slot and vice versa) — but since L1
-        // (2026-07-15) both share the COMBINED 5-per-rolling-second
-        // budget, which never binds this low-volume sequence.
+        // consumes a SPOT-ring slot and vice versa) — and under the
+        // 2026-07-16 two-bucket model a chain fire consumes NO Data-API
+        // budget at all.
         let gates = DhanGates::new(3_000, 2);
         assert_eq!(
             gates.try_acquire_chain(ChainUnderlying::Sensex, None, 1_000),
@@ -696,59 +672,54 @@ mod tests {
     }
 
     #[test]
-    fn test_cadence_gate_combined_window_refuses_sixth_dhan_fire_per_rolling_second() {
-        // Verifier L1 (2026-07-15), INVERTED from the demonstrating
-        // hostile test: pre-fix a chain fire + a validation-legal
-        // spot_window_cap=5 group put SIX Dhan fires inside one rolling
-        // 1000ms window (Dhan's Data-API budget is 5/sec). Post-fix the
-        // COMBINED ring refuses the 6th — a DEFERRAL to the instant the
-        // chain fire ages out, never a violation.
+    fn test_cadence_gate_combined_window_scopes_to_spot_and_expiry_only() {
+        // TWO-BUCKET re-scope (operator all-7 correction, 2026-07-16):
+        // a CHAIN fire consumes NO Data-API budget — a validation-legal
+        // spot_window_cap=5 group admits IN FULL alongside a chain fire
+        // in the same rolling second (pre-correction the combined ring
+        // deferred the 5th spot as a phantom "6th Dhan fire").
         let gates = DhanGates::new(3_000, 5);
         let t = 1_000_000_i64;
         assert_eq!(
-            gates.try_acquire_chain(ChainUnderlying::Sensex, None, t + 2_001),
+            gates.try_acquire_chain(ChainUnderlying::Sensex, None, t + 3_000),
             GateVerdict::Acquired
         );
-        for _ in 0..4 {
+        for _ in 0..5 {
             assert_eq!(gates.try_acquire_spot(t + 3_000), GateVerdict::Acquired);
         }
-        // The 5th spot is legal per the SPOT ring (cap 5) but would be
-        // the 6th Dhan fire inside (t+2_001, t+3_001) — the combined
-        // budget defers it to EXACTLY the instant the chain fire ages
-        // out of the window (nothing consumed on the denial).
+        // The 6th SPOT defers on the spot/combined rings themselves.
         assert_eq!(
             gates.try_acquire_spot(t + 3_000),
-            GateVerdict::RetryAtMs(t + 3_001)
+            GateVerdict::RetryAtMs(t + 4_000)
         );
-        assert_eq!(gates.try_acquire_spot(t + 3_001), GateVerdict::Acquired);
-        // The combined budget binds the CHAIN direction too: 4 spots +
-        // an expiry fire fill the window; a chain fire inside it is
-        // deferred (spacing slots conservatively consumed → the carried
-        // instant is the MAX so the next wake passes everything).
-        let gates2 = DhanGates::new(3_000, 4);
+        // The Data-API budget still binds SPOT + EXPIRY jointly: an
+        // expiry fire + 4 spots fill the combined window; a 5th spot
+        // defers to the instant the expiry fire ages out…
+        let gates2 = DhanGates::new(3_000, 5);
         assert_eq!(gates2.try_acquire_expiry(t), GateVerdict::Acquired);
         for _ in 0..4 {
             assert_eq!(gates2.try_acquire_spot(t + 100), GateVerdict::Acquired);
         }
         assert_eq!(
-            gates2.try_acquire_chain(ChainUnderlying::Nifty, None, t + 500),
-            GateVerdict::RetryAtMs(t + 3_500)
+            gates2.try_acquire_spot(t + 500),
+            GateVerdict::RetryAtMs(t + 1_000)
         );
+        // …while a CHAIN fire inside that SAME full Data-API window
+        // ACQUIRES — the option-chain bucket is its own budget.
         assert_eq!(
-            gates2.try_acquire_chain(ChainUnderlying::Nifty, None, t + 3_500),
+            gates2.try_acquire_chain(ChainUnderlying::Nifty, None, t + 500),
             GateVerdict::Acquired
         );
+        assert_eq!(gates2.try_acquire_spot(t + 1_000), GateVerdict::Acquired);
     }
 
     #[test]
     fn test_cadence_gate_combined_window_admits_nominal_burst_packing() {
-        // Nominal-schedule feasibility pin (L1, re-derived for the
-        // 2026-07-16 shape): the rung-0 burst — 3 chains + 2 spots at
-        // ONE instant (exactly 5 = the combined cap) — admits in full,
-        // and the second-2 pair admits with ZERO deferrals because the
-        // burst fires sit at EXACTLY oldest+window then (the half-open
-        // window convention: an authorization at `oldest + window_ms`
-        // passes).
+        // Nominal-schedule feasibility pin (re-derived for the ALL-7
+        // primary, 2026-07-16 correction): the rung-0 burst — 3 chains
+        // + ALL 4 spots at ONE instant — admits IN FULL under the
+        // two-bucket model (4 spots ≤ the Data-API cap; the 3 chains in
+        // the option-chain bucket, per-key concurrent).
         let gates = DhanGates::new(3_000, 4);
         let t = 36_000_000_i64; // 10:00:00 as a monotonic stand-in
         for ul in [
@@ -761,19 +732,18 @@ mod tests {
                 GateVerdict::Acquired
             );
         }
-        for _ in 0..2 {
+        for _ in 0..4 {
             assert_eq!(gates.try_acquire_spot(t + 1_000), GateVerdict::Acquired);
         }
-        // A 6th fire in the burst second WOULD defer (the cap is exactly
-        // filled)…
+        // A 5th SPOT in the burst second defers on the spot ring
+        // (cap 4) — never on the chains.
         assert_eq!(
             gates.try_acquire_spot(t + 1_000),
             GateVerdict::RetryAtMs(t + 2_000)
         );
-        // …and the nominal second-2 pair admits exactly at T+2000.
-        for _ in 0..2 {
-            assert_eq!(gates.try_acquire_spot(t + 2_000), GateVerdict::Acquired);
-        }
+        // A retried spot admits exactly one window later (half-open
+        // convention: an authorization at `oldest + window_ms` passes).
+        assert_eq!(gates.try_acquire_spot(t + 2_000), GateVerdict::Acquired);
         // Rung-1 shape on fresh gates: 3 chains at the burst second,
         // ALL 4 spots exactly one window later — zero deferrals.
         let gates1 = DhanGates::new(3_000, 4);
@@ -806,90 +776,79 @@ mod tests {
             GateVerdict::RetryAtMs(11_000)
         );
         assert_eq!(gates.try_acquire_expiry(11_000), GateVerdict::Acquired);
-        // A full combined window (4 spots + 1 chain across one second)
-        // defers an expiry fire to the instant the oldest fire ages out.
-        let gates2 = DhanGates::new(3_000, 4);
-        assert_eq!(
-            gates2.try_acquire_chain(ChainUnderlying::Banknifty, None, 20_000),
-            GateVerdict::Acquired
-        );
-        for _ in 0..4 {
+        // A full Data-API window (a validation-legal 5-spot group)
+        // defers an expiry fire to the instant the oldest fire ages out
+        // (chains no longer count here — two-bucket re-scope).
+        let gates2 = DhanGates::new(3_000, 5);
+        for _ in 0..5 {
             assert_eq!(gates2.try_acquire_spot(20_400), GateVerdict::Acquired);
         }
         assert_eq!(
             gates2.try_acquire_expiry(20_800),
-            GateVerdict::RetryAtMs(21_000)
-        );
-        assert_eq!(gates2.try_acquire_expiry(21_000), GateVerdict::Acquired);
-        // An expiry fire COUNTS toward the combined budget for later
-        // spot fires too (the reverse direction): after the expiry fire
-        // at 21_000 the window (20_400, 21_400] holds 4 spots + 1 expiry
-        // = 5 → a spot at 21_100 is deferred until the 20_400 group ages
-        // out.
-        assert_eq!(
-            gates2.try_acquire_spot(21_100),
             GateVerdict::RetryAtMs(21_400)
         );
-        assert_eq!(gates2.try_acquire_spot(21_400), GateVerdict::Acquired);
-        // reseed_all covers the expiry spacing gate too.
-        gates2.reseed_all(50_000);
+        assert_eq!(gates2.try_acquire_expiry(21_400), GateVerdict::Acquired);
+        // An expiry fire COUNTS toward the combined budget for later
+        // spot fires too (the reverse direction): 1 expiry + 4 spots
+        // fill a rolling second; the next spot defers until the expiry
+        // fire ages out even though the SPOT ring itself has room.
+        let gates3 = DhanGates::new(3_000, 5);
+        assert_eq!(gates3.try_acquire_expiry(30_000), GateVerdict::Acquired);
+        for _ in 0..4 {
+            assert_eq!(gates3.try_acquire_spot(30_100), GateVerdict::Acquired);
+        }
         assert_eq!(
-            gates2.try_acquire_expiry(50_500),
+            gates3.try_acquire_spot(30_200),
+            GateVerdict::RetryAtMs(31_000)
+        );
+        assert_eq!(gates3.try_acquire_spot(31_000), GateVerdict::Acquired);
+        // reseed_all covers the expiry spacing gate too.
+        gates3.reseed_all(50_000);
+        assert_eq!(
+            gates3.try_acquire_expiry(50_500),
             GateVerdict::RetryAtMs(51_000)
         );
-        assert_eq!(gates2.try_acquire_expiry(51_000), GateVerdict::Acquired);
+        assert_eq!(gates3.try_acquire_expiry(51_000), GateVerdict::Acquired);
     }
 
     #[test]
-    fn test_cadence_gate_expiry_fire_in_burst_window_defers_fourth_nominal_spot() {
-        // R1 (2026-07-15) — DOCUMENTATION of the collision class the
-        // mid-minute wave anchor exists to prevent (verifier round-2
-        // reproducer, gate-level — the slot values are a generic
-        // demonstration, independent of the live schedule): an
-        // expiry-list retry fire invading a cycle burst window consumes
-        // one COMBINED-budget slot, so a jittered chain fire + the
-        // invading expiry fire + a 4-spot group one window later puts
-        // SIX Dhan fires in the group's rolling second — the 4th
-        // NOMINAL spot DEFERS, which the runner reports as the
-        // should-never `gate_deferred_nominal` CADENCE-03 error + the
-        // must-stay-0 `tv_cadence_gate_denials_total`. The gate behaves
-        // CORRECTLY here (a deferral, never a broker violation) — the
-        // FIX is scheduling: in-session expiry retry waves anchor at
-        // mid-minute (:30, `next_expiry_wave_instant_ms`), so they can
-        // never share a rolling second with the T+0..≈T+5s burst
-        // region; this L2 gate stays the backstop the assertion
-        // exercises.
+    fn test_cadence_gate_expiry_invasion_tolerance_and_cap5_backstop() {
+        // R1 (2026-07-15) collision-class DOCUMENTATION, re-derived for
+        // the 2026-07-16 two-bucket model: chains no longer consume
+        // Data-API budget, so at the DEFAULT spot_window_cap = 4 an
+        // invading expiry retry fire + the nominal all-7 burst's 4
+        // spots = 5 ≤ the Data-API cap — the default nominal schedule
+        // is invasion-TOLERANT now (a strict improvement).
         let g = DhanGates::new(3_000, 4);
         let t = 10_000_i64; // an arbitrary boundary in the monotonic domain
-        // Nominal chain post-fire at T+2000 with routine 1ms jitter.
         assert_eq!(
-            g.try_acquire_chain(ChainUnderlying::Nifty, None, t + 2_001),
+            g.try_acquire_chain(ChainUnderlying::Nifty, None, t + 1_001),
             GateVerdict::Acquired
         );
-        // The invading expiry retry fire inside the burst window.
-        assert_eq!(g.try_acquire_expiry(t + 2_500), GateVerdict::Acquired);
-        // The nominal step-0 spot group at T+3000: the combined budget
-        // (cap 5) already carries chain+expiry — only THREE spots admit.
-        assert_eq!(g.try_acquire_spot(t + 3_000), GateVerdict::Acquired);
-        assert_eq!(g.try_acquire_spot(t + 3_000), GateVerdict::Acquired);
-        assert_eq!(g.try_acquire_spot(t + 3_000), GateVerdict::Acquired);
-        // The 4th NOMINAL spot defers to the chain fire's window exit —
-        // the false should-never page, every minute of a vendor outage,
-        // if the retry waves were allowed to phase-lock into the burst.
-        assert_eq!(
-            g.try_acquire_spot(t + 3_000),
-            GateVerdict::RetryAtMs(t + 3_001)
-        );
-        // CONTRAST: without the expiry invasion the SAME nominal cycle
-        // admits in full (chain + 4 spots = 5 ≤ the combined budget).
-        let clean = DhanGates::new(3_000, 4);
-        assert_eq!(
-            clean.try_acquire_chain(ChainUnderlying::Nifty, None, t + 2_001),
-            GateVerdict::Acquired
-        );
+        // The invading expiry retry fire just before the burst second.
+        assert_eq!(g.try_acquire_expiry(t + 500), GateVerdict::Acquired);
+        // The nominal all-7 burst's 4-spot group admits IN FULL.
         for _ in 0..4 {
-            assert_eq!(clean.try_acquire_spot(t + 3_000), GateVerdict::Acquired);
+            assert_eq!(g.try_acquire_spot(t + 1_001), GateVerdict::Acquired);
         }
+        // At spot_window_cap = 5 the collision class SURVIVES: a
+        // validation-legal 5-spot group + the invading expiry fire = 6
+        // > the Data-API cap — the 5th NOMINAL spot defers (the runner
+        // reports the should-never `gate_deferred_nominal` CADENCE-03
+        // error + the must-stay-0 `tv_cadence_gate_denials_total`), so
+        // the mid-minute (:30, `next_expiry_wave_instant_ms`) expiry
+        // wave anchor stays the scheduling fix and this L2 gate the
+        // backstop.
+        let g5 = DhanGates::new(3_000, 5);
+        assert_eq!(g5.try_acquire_expiry(t + 500), GateVerdict::Acquired);
+        for _ in 0..4 {
+            assert_eq!(g5.try_acquire_spot(t + 1_001), GateVerdict::Acquired);
+        }
+        assert_eq!(
+            g5.try_acquire_spot(t + 1_001),
+            GateVerdict::RetryAtMs(t + 1_500)
+        );
+        assert_eq!(g5.try_acquire_spot(t + 1_500), GateVerdict::Acquired);
     }
 
     #[test]

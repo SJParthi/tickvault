@@ -10,11 +10,12 @@
 //! one-off 429. Every ladder is day-scoped (reset at day start / boot).
 //!
 //! - **Dhan SHAPE ladder** (2026-07-16 — replaces the retired pre-close
-//!   `:55 → :50` anchor-shift ladder): rung 0 (primary) = second 1 → 3
-//!   chains + 2 decision-critical spots (NIFTY, BANKNIFTY), second 2 →
-//!   the remaining 2 spots (SENSEX, INDIA VIX); rung 1 (fallback) =
-//!   second 1 → 3 chains, second 2 → all 4 spots. Both rungs are fully
-//!   POST-close — no pre-fire exists anymore.
+//!   `:55 → :50` anchor-shift ladder): rung 0 (primary) = second 1 →
+//!   ALL 7 requests concurrent (3 chains + 4 spots — the operator's
+//!   same-day correction; the interim 5+2 packing is SUPERSEDED, §0b of
+//!   the rule file); rung 1 (fallback) = second 1 → 3 chains, second 2
+//!   → all 4 spots. Both rungs are fully POST-close — no pre-fire
+//!   exists anymore.
 //! - **Dhan spot-concurrency ladder** — tier steps 0..=3 encode the
 //!   per-second spot capacity `4 → 3 → 2 → 1`; the shape rung's
 //!   second-buckets and the tier capacity compose via
@@ -32,8 +33,8 @@
 use super::executor::CadenceFetchError;
 
 /// Highest Dhan SHAPE step — step 1 = the operator's split fallback
-/// (chains second 1, all spots second 2). Step 0 is the primary 5+2
-/// packing (2026-07-16 directive).
+/// (chains second 1, all spots second 2). Step 0 is the ALL-7 concurrent
+/// burst (2026-07-16 directive + same-day correction).
 pub const DHAN_SHAPE_MAX_STEP: u8 = 1;
 
 /// Highest Dhan spot-concurrency step — step 3 = fully sequential 1×4.
@@ -127,23 +128,29 @@ impl StreakLadder {
 /// NIFTY/BANKNIFTY/SENSEX/INDIA VIX) fires in, composed from the SHAPE
 /// rung and the spot-concurrency TIER step.
 ///
-/// - Shape rung 0 (primary 5+2 packing) bases the two decision-critical
-///   spots (NIFTY, BANKNIFTY) in bucket 0 — the burst second, alongside
-///   the 3 chains — and SENSEX + INDIA VIX in bucket 1.
-/// - Shape rung ≥1 (split fallback) bases ALL 4 spots in bucket 1.
+/// - Shape rung 0 (the operator's ALL-7 primary — correction
+///   2026-07-16: *"for dhan also as the primary all 7 parallel at first
+///   second"*; the interim 5+2 packing is SUPERSEDED, recorded in the
+///   rule file's §0b) bases ALL 4 spots in bucket 0 — the burst second,
+///   alongside the 3 concurrent chains.
+/// - Shape rung ≥1 (split fallback — chains second 1, spots second 2)
+///   bases ALL 4 spots in bucket 1.
 /// - The tier step caps the per-bucket SPOT count at `4 − step`
 ///   (clamped ≥1): degradation happens WITHIN each second group, greedy
 ///   overflow spilling to the NEXT 1000ms bucket (per-second-group tier
 ///   math, coordinator addendum item 4).
 ///
-/// Structural safety: bucket 0 can never hold more than 2 spots (only 2
-/// targets base there), so the burst second is 3 chains + ≤2 spots =
-/// ≤5 fires — exactly the broker's documented 5/sec Data-API cap.
-/// Assignments are non-decreasing in `target_idx`. Pure, zero-alloc.
+/// Budget safety (the TWO-BUCKET model, operator correction 2026-07-16):
+/// the burst second is 3 chains + ≤4 spots. The 4 spot fires sit in the
+/// Data-API 5/sec bucket (4 ≤ 5); the 3 chain fires sit in the
+/// option-chain API's OWN per-(underlying, expiry) budget (different
+/// underlyings explicitly concurrent per Dhan's documented rule) — so
+/// all-7 breaches NEITHER documented budget. Assignments are
+/// non-decreasing in `target_idx`. Pure, zero-alloc.
 #[must_use]
 pub fn spot_second_buckets(dhan_shape: u8, spot_step: u8) -> [usize; 4] {
     let base: [usize; 4] = if dhan_shape == 0 {
-        [0, 0, 1, 1]
+        [0, 0, 0, 0]
     } else {
         [1, 1, 1, 1]
     };
@@ -193,16 +200,21 @@ pub const fn groww_wave_indices(shape: u8) -> (usize, usize, usize) {
     }
 }
 
-/// Does this fetch failure ARM the ladders? (design §3(c), Assumed —
-/// flagged for operator confirm.)
+/// Does this fetch failure ARM the ladders? (operator correction
+/// 2026-07-16, verbatim: *"see that too instantly dont commit — one and
+/// only when you tried that multiple times and gets rate limited alone
+/// alone fallback"*.)
 ///
-/// - `RateLimited` (a 429 — the strongest arming signal), `Timeout` and
-///   `Transport` (5xx folds into `Transport` at the executor seam) ARM
-///   them — "both buckets" per the operator's rule for genuine failures.
+/// - `RateLimited` (a 429) is the SOLE arming class — the fallback shape
+///   exists to relieve broker rate pressure and nothing else.
+/// - `Timeout` / `Transport` do NOT arm (operator correction 2026-07-16
+///   — supersedes the interim "both buckets" reading that armed them):
+///   a slow/flaky vendor is not rate pressure; reshaping the burst
+///   cannot fix it. Both still degrade the lane loudly via CADENCE-01.
 /// - `Empty` (Dhan spot 200-with-zero-candles) does NOT arm: a shape
 ///   degrade cannot fix a vendor serving-lag saga — arming on the 14-day
 ///   200-empty class would flap the shape every minute (judge ruling,
-///   design §0 — flagged Assumed deviation).
+///   design §0).
 /// - `Auth` / `Malformed` do NOT arm: neither is a pacing signal
 ///   (reshaping the burst cannot fix a dead token or a schema drift);
 ///   both still degrade the lane loudly via CADENCE-01.
@@ -212,34 +224,36 @@ pub const fn groww_wave_indices(shape: u8) -> (usize, usize, usize) {
 ///   would let our own defense-in-depth walk the shape down forever.
 #[must_use]
 pub fn failure_arms_ladder(err: &CadenceFetchError) -> bool {
-    matches!(
-        err,
-        CadenceFetchError::RateLimited { .. }
-            | CadenceFetchError::Timeout
-            | CadenceFetchError::Transport
-    )
+    matches!(err, CadenceFetchError::RateLimited { .. })
 }
 
-/// May a failed request be retried IN-CYCLE? (design §3(b), Assumed.)
+/// May a failed request be retried IN-CYCLE? (design §3(b); RateLimited
+/// arm reversed by the operator's 2026-07-16 correction.)
 ///
-/// - A `RateLimited` is NEVER retried blind in-cycle — it kills the leg
-///   for the cycle and arms the ladder.
-/// - At most `retry_max` retries per failed request.
+/// - A `RateLimited` leg KEEPS its bounded in-cycle retry — the retry
+///   (through the gates, after the per-key spacing) is one of the
+///   operator's "tried that multiple times" attempts; only the
+///   multi-attempt rate-limited streak demotes the shape. (The interim
+///   "429 kills the leg for the cycle" behavior is REVERSED — recorded
+///   in the rule file's §0b.)
+/// - At most `retry_max` retries per failed request (default 1 — one
+///   retry per leg per cycle, never more).
 /// - The retry must LAND: the gate's earliest-allowed fire instant plus
 ///   the p95 latency allowance must sit at/before the lane's cutoff —
 ///   otherwise the retry could only produce a late (discarded) response.
 #[must_use]
 pub fn may_retry_in_cycle(
-    err: &CadenceFetchError,
+    // Every failure class shares ONE bounded retry budget — including
+    // RateLimited (2026-07-16 correction) and QueueDelay (non-arming
+    // but retryable, F1(iii)); the class parameter stays as the policy
+    // seam (a future class-specific budget changes ONLY this fn).
+    _err: &CadenceFetchError,
     retries_used: u32,
     retry_max: u32,
     earliest_fire_ms: i64,
     latency_allowance_ms: i64,
     lane_cutoff_abs_ms: i64,
 ) -> bool {
-    if matches!(err, CadenceFetchError::RateLimited { .. }) {
-        return false;
-    }
     if retries_used >= retry_max {
         return false;
     }
@@ -292,14 +306,19 @@ mod tests {
     }
 
     #[test]
-    fn test_ladder_429_arms_immediately_never_blind_retry() {
+    fn test_ladder_rate_limited_sole_arming_class_with_bounded_retry() {
+        // Operator correction 2026-07-16 ("tried that multiple times and
+        // gets rate limited alone alone fallback"): RateLimited is the
+        // SOLE arming class…
         let rate_limited = CadenceFetchError::RateLimited {
             retry_after_ms: Some(2_000),
         };
-        // The strongest arming signal…
         assert!(failure_arms_ladder(&rate_limited));
-        // …and NEVER retried in-cycle, regardless of budget or room.
-        assert!(!may_retry_in_cycle(
+        // …and a rate-limited leg KEEPS its ONE bounded in-cycle retry
+        // (through the gates, after the per-key spacing) — the retry is
+        // one of the operator's "multiple attempts"; the interim
+        // "429 kills the leg for the cycle" behavior is REVERSED.
+        assert!(may_retry_in_cycle(
             &rate_limited,
             0,
             1,
@@ -307,9 +326,19 @@ mod tests {
             1_500,
             60_000
         ));
-        // Timeout / Transport (incl. 5xx at the seam) also arm.
-        assert!(failure_arms_ladder(&CadenceFetchError::Timeout));
-        assert!(failure_arms_ladder(&CadenceFetchError::Transport));
+        // One retry per leg per cycle, never more.
+        assert!(!may_retry_in_cycle(
+            &rate_limited,
+            1,
+            1,
+            5_000,
+            1_500,
+            60_000
+        ));
+        // Timeout / Transport (incl. 5xx at the seam) NEVER arm — they
+        // degrade the lane loudly via CADENCE-01 but never reshape.
+        assert!(!failure_arms_ladder(&CadenceFetchError::Timeout));
+        assert!(!failure_arms_ladder(&CadenceFetchError::Transport));
         // Auth / Malformed degrade loudly but do not reshape the burst.
         assert!(!failure_arms_ladder(&CadenceFetchError::Auth));
         assert!(!failure_arms_ladder(&CadenceFetchError::Malformed));
@@ -349,7 +378,9 @@ mod tests {
     #[test]
     fn test_cadence_ladder_failure_arms_ladder_is_total() {
         // failure_arms_ladder is total over the 7-variant error enum —
-        // exactly 3 arm, 4 do not (a new variant must pick a side here).
+        // exactly ONE arms (RateLimited — the operator's 2026-07-16
+        // rate-limit-only correction), 6 do not (a new variant must pick
+        // a side here).
         let arms = [
             failure_arms_ladder(&CadenceFetchError::RateLimited {
                 retry_after_ms: None,
@@ -361,8 +392,8 @@ mod tests {
             failure_arms_ladder(&CadenceFetchError::Auth),
             failure_arms_ladder(&CadenceFetchError::Malformed),
         ];
-        assert_eq!(arms.iter().filter(|a| **a).count(), 3);
-        assert_eq!(arms, [true, true, true, false, false, false, false]);
+        assert_eq!(arms.iter().filter(|a| **a).count(), 1);
+        assert_eq!(arms, [true, false, false, false, false, false, false]);
     }
 
     #[test]
@@ -496,16 +527,13 @@ mod tests {
 
     #[test]
     fn test_spot_second_buckets_encodes_rung_and_tier_groupings() {
-        // Rung 0 (primary 5+2 packing): NIFTY + BANKNIFTY share the burst
-        // second (with the 3 chains); SENSEX + VIX take second 2 — for
-        // every tier whose per-bucket capacity admits pairs.
-        for step in 0..=2u8 {
-            assert_eq!(
-                spot_second_buckets(0, step),
-                [0, 0, 1, 1],
-                "rung 0 step {step}"
-            );
-        }
+        // Rung 0 (the operator's ALL-7 primary, 2026-07-16 correction):
+        // every spot shares the burst second with the 3 chains.
+        assert_eq!(spot_second_buckets(0, 0), [0, 0, 0, 0]);
+        // Tier degradation happens WITHIN the burst group, greedy
+        // overflow spilling to the next 1000ms buckets.
+        assert_eq!(spot_second_buckets(0, 1), [0, 0, 0, 1]);
+        assert_eq!(spot_second_buckets(0, 2), [0, 0, 1, 1]);
         // Rung 0 fully sequential (tier 3): one spot per second, greedy
         // spill forward — [T+1, T+2, T+3, T+4] relative buckets.
         assert_eq!(spot_second_buckets(0, 3), [0, 1, 2, 3]);
@@ -519,13 +547,15 @@ mod tests {
         // Tier steps past the max clamp to fully sequential.
         assert_eq!(spot_second_buckets(0, 9), [0, 1, 2, 3]);
         assert_eq!(spot_second_buckets(9, 9), [1, 2, 3, 4]);
-        // Structural cap-5 safety: bucket 0 (the chain burst second) can
-        // never hold more than 2 spots — 3 chains + ≤2 spots ≤ 5.
+        // Two-bucket budget safety (2026-07-16 correction): the burst
+        // second holds ≤4 SPOTS — the Data-API bucket (4 ≤ 5); the 3
+        // concurrent chains sit in the option-chain API's OWN
+        // per-(underlying, expiry) budget and never count here.
         for shape in 0..=1u8 {
             for step in 0..=SPOT_CONCURRENCY_MAX_STEP {
                 let buckets = spot_second_buckets(shape, step);
                 let burst_spots = buckets.iter().filter(|b| **b == 0).count();
-                assert!(burst_spots <= 2, "shape {shape} step {step}");
+                assert!(burst_spots <= 4, "shape {shape} step {step}");
                 // Assignments are non-decreasing in target order.
                 for w in buckets.windows(2) {
                     assert!(w[0] <= w[1]);

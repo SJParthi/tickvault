@@ -61,7 +61,9 @@ fn test_spawn_cadence_scheduler_threads_config_calendar_feed_runtime() {
     while let Some(rel) = src[from..].find("spawn_cadence_scheduler(") {
         let abs = from + rel;
         let window = &src[abs..(abs + 400).min(src.len())];
-        for needle in ["&config", "&trading_calendar", "&feed_runtime"] {
+        // `&notifier` = the R6 (2026-07-16) typed Telegram sink for the
+        // expiry cross-broker disagreement page.
+        for needle in ["&config", "&trading_calendar", "&feed_runtime", "&notifier"] {
             assert!(
                 window.contains(needle),
                 "spawn_cadence_scheduler call at byte {abs} must pass \

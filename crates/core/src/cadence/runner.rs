@@ -29,7 +29,7 @@ use tracing::{debug, error, info, warn};
 
 use super::assembly::{
     ChainCell, ChainProvenance, LaneAssembly, MoneynessFold, SpotProvenance,
-    cross_fill_freshness_floor_ms, fold_chain_cell_moneyness,
+    chain_moneyness_anchor, cross_fill_freshness_floor_ms, fold_chain_cell_moneyness,
 };
 use super::decision::{
     CadenceEvent, CadenceState, DecisionLatch, DecisionOutcome, DecisionSnapshot, SkipReason,
@@ -219,6 +219,12 @@ pub struct CadenceRunnerDeps<D, G> {
     pub dhan_enabled: Arc<AtomicBool>,
     /// Level-triggered Groww lane enable flag.
     pub groww_enabled: Arc<AtomicBool>,
+    /// Typed Telegram sink (R6, 2026-07-16): the expiry cross-broker
+    /// DISAGREEMENT page (`CadenceExpiryDisagreement`, edge-latched once
+    /// per underlying per day) dispatches through this handle. `None` =
+    /// log-only (the dry-run integration tests); production wiring
+    /// passes the boot `NotificationService`.
+    pub notifier: Option<Arc<crate::notification::NotificationService>>,
     /// Graceful-shutdown signal (`notify_waiters` at teardown).
     pub shutdown: Arc<Notify>,
 }
@@ -236,6 +242,7 @@ impl<D, G> Clone for CadenceRunnerDeps<D, G> {
             dry_run: self.dry_run,
             dhan_enabled: Arc::clone(&self.dhan_enabled),
             groww_enabled: Arc::clone(&self.groww_enabled),
+            notifier: self.notifier.as_ref().map(Arc::clone),
             shutdown: Arc::clone(&self.shutdown),
         }
     }
@@ -346,12 +353,13 @@ where
         )))
     });
 
-    // The Dhan SHAPE ladder (operator directive 2026-07-16): rung 0 =
-    // the primary 5+2 burst packing (chains + 2 decision-critical spots
-    // in the burst second, remaining 2 spots the next second); rung 1 =
-    // the split fallback (chains in second 1, ALL 4 spots in second 2).
-    // Same streak thresholds as the concurrency ladders; dirty =
-    // arming-rule failure classes (RateLimited / Timeout / Transport).
+    // The Dhan SHAPE ladder (operator directive 2026-07-16 + the
+    // same-day corrections): rung 0 = the ALL-7 primary (3 chains + 4
+    // spots concurrent in the burst second); rung 1 = the split
+    // fallback (chains in second 1, ALL 4 spots in second 2). Same
+    // streak thresholds as the concurrency ladders ("tried that
+    // multiple times"); dirty = RateLimited ONLY — the sole arming
+    // class per the operator's rate-limit-only correction.
     let mut dhan_shape_ladder = StreakLadder::starting_at(0);
     // The adaptive concurrency ladders (operator spec addition 2026-07-15;
     // day-scoped like the shape rung). The Dhan spot ladder starts at
@@ -685,6 +693,7 @@ async fn run_expiry_resolution_loop<C, D, G>(
                     Feed::Dhan,
                     today,
                     paged[Feed::Dhan.index()],
+                    deps.notifier.as_ref(),
                 )
                 .await;
             }
@@ -697,6 +706,7 @@ async fn run_expiry_resolution_loop<C, D, G>(
                     Feed::Groww,
                     today,
                     paged[Feed::Groww.index()],
+                    deps.notifier.as_ref(),
                 )
                 .await;
             }
@@ -840,6 +850,7 @@ async fn resolve_broker_expiries<C, E>(
     broker: Feed,
     today: NaiveDate,
     paged_row: [bool; ChainUnderlying::COUNT],
+    notifier: Option<&Arc<crate::notification::NotificationService>>,
 ) -> [bool; ChainUnderlying::COUNT]
 where
     C: CadenceClock,
@@ -1024,6 +1035,24 @@ where
                  WINS for keying BOTH lanes (edge-latched per underlying \
                  per day; both raws recorded for provenance)"
             );
+            // R6 (2026-07-16): the REAL typed Telegram page — rides the
+            // SAME `newly_disagreeing` edge latch (once per underlying
+            // per day; the store latches, never per wave). `None` sink =
+            // log-only (test wiring); production threads the boot
+            // NotificationService. Dated authority row:
+            // `dhan-rest-only-noise-lock-2026-07-14.md` §2.2.
+            if let Some(sink) = notifier {
+                let iso = |d: Option<super::expiry::ExpiryDate>| {
+                    d.map_or_else(|| "unknown".to_owned(), |d| d.as_iso_string())
+                };
+                sink.notify(
+                    crate::notification::NotificationEvent::CadenceExpiryDisagreement {
+                        underlying: underlying.as_str().to_owned(),
+                        dhan_date: iso(view.dhan_raw),
+                        groww_date: iso(view.groww_raw),
+                    },
+                );
+            }
         }
     }
     attempted
@@ -1041,10 +1070,11 @@ enum CycleRun {
     /// the ms-of-day domain wrapped): the cycle is dropped with no
     /// partial emit and no ladder verdict; the day loop resets.
     Abandoned,
-    /// The whole-cycle dirty flags: `dhan_dirty` (arming-rule failure
-    /// classes) feeds the 2026-07-16 Dhan SHAPE ladder; the per-broker
-    /// rate-limit flags feed the 2026-07-15 adaptive concurrency
-    /// ladders.
+    /// The whole-cycle dirty flags: `dhan_dirty` (≥1 RateLimited Dhan
+    /// outcome — the SOLE arming class per the operator's 2026-07-16
+    /// rate-limit-only correction) feeds the Dhan SHAPE ladder; the
+    /// per-broker rate-limit flags feed the 2026-07-15 adaptive
+    /// concurrency ladders.
     Verdict {
         dhan_dirty: bool,
         dhan_spot_dirty: bool,
@@ -2588,8 +2618,9 @@ fn record_failure(lane: &mut LaneRun, err: &CadenceFetchError) {
             stage = "rate_limited",
             lane = lane.asm.feed.as_str(),
             cycle_minute_ist = lane.asm.cycle_minute_ist,
-            "CADENCE-01: broker 429 despite the gates — arms the ladder, \
-             never blind-retried (gate-bug signal)"
+            "CADENCE-01: broker 429 despite the gates — arms the shape \
+             ladder; ONE bounded in-cycle retry through the gates \
+             (gate-bug / co-tenant signal)"
         );
     }
     if matches!(err, CadenceFetchError::QueueDelay) {
@@ -2711,9 +2742,13 @@ fn decide_lane<C: CadenceClock>(
     let mut provenance: [Option<SpotProvenance>; ChainUnderlying::COUNT] =
         [None; ChainUnderlying::COUNT];
     for u in ChainUnderlying::ALL {
-        let (spot_paise, atm_paise, prov) = lane.asm.spot(*u).map_or((0, 0, None), |s| {
-            (s.spot_paise, s.atm_paise, Some(s.provenance))
-        });
+        let prov = lane.asm.spot(*u).map(|s| s.provenance);
+        // CHAIN-ROW anchor order (R5, 2026-07-16): the chain's OWN
+        // embedded underlying spot FIRST (same-response coherence),
+        // the resolved spot cell as the fallback, Unknown last — the
+        // OwnFetch spot serves the SPOT SERIES, not chain moneyness.
+        let (spot_paise, atm_paise) =
+            chain_moneyness_anchor(*u, lane.asm.chain(*u), lane.asm.spot(*u));
         // GUARDED fold over the resolved cell: reads the cell's SOURCE
         // feed's registry slot (the lender's for a cross-filled chain),
         // refuses an unconfirmed publish and a stale / wrong-minute /

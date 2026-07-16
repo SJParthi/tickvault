@@ -1624,6 +1624,7 @@ async fn main() -> Result<()> {
         &config,
         &trading_calendar,
         &feed_runtime,
+        &notifier,
     );
 
     // -----------------------------------------------------------------------
