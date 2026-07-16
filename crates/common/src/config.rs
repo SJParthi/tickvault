@@ -1092,6 +1092,29 @@ impl CadenceConfig {
                 self.dhan_lane_cutoff_ms
             );
         }
+        // Hostile-review round 4 (SEC-CAD-1, 2026-07-16): the post-close
+        // clamp knob is the ONE spot-schedule input the check above does
+        // not cover — build_cycle_slots computes
+        // spot_base = max(anchor - shift, T + spot_min_post_close_ms), so
+        // a large spot_min_post_close_ms (e.g. 20000 vs the 15000 Dhan
+        // cutoff) clamps ALL nominal spot slots past the cutoff: the
+        // DhanCutoff event resolves the lane first and every later-popping
+        // nominal DhanSpot action is silently discarded on the
+        // resolved-lane guard — the lane honest-skips `cutoff` every
+        // minute with the coded errors pointing at broker slowness instead
+        // of the degenerate schedule (the exact CAD-NEW-3 class). Mirror
+        // of the anchor feasibility check above on the clamp side.
+        let deepest_clamped_spot_group_ms = self
+            .spot_min_post_close_ms
+            .saturating_add(3_i64.saturating_mul(CADENCE_SPOT_WINDOW_MS));
+        if deepest_clamped_spot_group_ms >= self.dhan_lane_cutoff_ms {
+            bail!(
+                "cadence.spot_min_post_close_ms ({}) is too late: the post-close clamp's deepest concurrency-ladder group (clamp + 3 windows = {}ms past T) must land strictly before dhan_lane_cutoff_ms ({}) — a clamped nominal spot fire at/after the cutoff is silently discarded once the cutoff skip resolves the lane",
+                self.spot_min_post_close_ms,
+                deepest_clamped_spot_group_ms,
+                self.dhan_lane_cutoff_ms
+            );
+        }
         if self.dhan_ladder_step_ms <= 0 {
             bail!(
                 "cadence.dhan_ladder_step_ms ({}) must be > 0",
@@ -5659,6 +5682,28 @@ mod tests {
         // The boundary just inside is legal (11999 + 3000 < 15000).
         cfg.dhan_spot_start_offset_ms = 11_999;
         assert!(cfg.validate().is_ok());
+        // SEC-CAD-1 (round 4, 2026-07-16): the post-close CLAMP knob is
+        // bound the same way — build_cycle_slots takes
+        // max(anchor - shift, T + spot_min_post_close_ms), so a clamp of
+        // 20000 vs the 15000 cutoff would push ALL nominal spot slots
+        // past the cutoff (silently discarded on the resolved-lane
+        // guard). Refused; the exact-cutoff boundary is refused too; one
+        // ms inside is legal.
+        cfg.dhan_spot_start_offset_ms = 3_000;
+        cfg.spot_min_post_close_ms = 20_000;
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("spot_min_post_close_ms"),
+            "unexpected error: {err}"
+        );
+        cfg.spot_min_post_close_ms = 12_000;
+        assert!(
+            cfg.validate().is_err(),
+            "clamp deepest group exactly AT the cutoff (12000 + 3000 == 15000) is equally discarded"
+        );
+        cfg.spot_min_post_close_ms = 11_999;
+        assert!(cfg.validate().is_ok(), "just inside the cutoff is legal");
+        cfg.spot_min_post_close_ms = 300;
         // A LARGE NEGATIVE Groww anchor is rejected (the burst is a
         // post-close fire — a pre-close burst would race the close).
         cfg.dhan_spot_start_offset_ms = 3_000;
