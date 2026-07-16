@@ -2131,6 +2131,10 @@ async fn fire_one_minute(
                                 &candle,
                             ),
                         );
+                    } else {
+                        // Round-2 LOW-6: never a silent skip — counted +
+                        // one coalesced warn (defensive; ids are positive).
+                        crate::rest_candle_fold::note_unfoldable_identity(Feed::Groww, security_id);
                     }
                 }
             }
@@ -2200,6 +2204,10 @@ async fn fire_one_minute(
                                 &backfill,
                             ),
                         );
+                    } else {
+                        // Round-2 LOW-6: never a silent skip — counted +
+                        // one coalesced warn (defensive; ids are positive).
+                        crate::rest_candle_fold::note_unfoldable_identity(Feed::Groww, security_id);
                     }
                 }
             }
@@ -2664,6 +2672,10 @@ async fn run_post_session_sweep(
                         tickvault_common::constants::EXCHANGE_SEGMENT_IDX_I,
                         &candle,
                     ));
+                } else {
+                    // Round-2 LOW-6: never a silent skip — counted + one
+                    // coalesced warn (defensive; ids are positive).
+                    crate::rest_candle_fold::note_unfoldable_identity(Feed::Groww, security_id);
                 }
             }
         }

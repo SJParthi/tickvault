@@ -876,9 +876,12 @@ pub struct RestCandleFoldConfig {
     #[serde(default)]
     pub enabled: bool,
     /// Boot catch-up window in IST days: the fold re-derives all 21 TFs
-    /// from the last `catchup_days` of `spot_1m_rest` rows per feed.
-    /// Default 35 (one month of spot history + weekend slack — the
-    /// operator's 2026-07-16 minimum-one-month demand).
+    /// from the last `catchup_days` calendar days of `spot_1m_rest` rows
+    /// per feed — today plus `catchup_days - 1` past days, EXACTLY
+    /// `catchup_days` days total (round-2 LOW-3: the code matches this
+    /// wording; the old range folded one extra day). Default 35 (one month
+    /// of spot history + weekend slack — the operator's 2026-07-16
+    /// minimum-one-month demand).
     #[serde(default = "default_rest_candle_fold_catchup_days")]
     pub catchup_days: u32,
 }
