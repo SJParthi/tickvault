@@ -400,6 +400,27 @@ is a DISTINCT instrument class (index FUTURES serials, §36.7 all-months) —
 its month rule stands and must not be conflated with (or contradicted by)
 the option-chain month policy here.
 
+## §3f. Flagged follow-ups from the round-4 rebase verdict (dated 2026-07-16)
+
+Recorded at the post-#1540 rebase (verifier round-4 verdict) — not a
+silent-failure class; a belt on an already-LOUD arm:
+
+1. **`validate()` still admits cross-cycle overlap.** A config with
+   `spot_offset = 56_000` + a 59_999 cutoff lets THIS cycle's spot fires
+   land at :56–:59 while the NEXT cycle's chain pre-fires open at :55–:58 —
+   two cycles' legs interleave in wall-clock time. The consequence today is
+   a LOUD `gate_deferred_nominal` (CADENCE-03 — the should-never
+   scheduling-math signal), never a silent 429 or a silent skip; a future
+   `validate()` belt should reject offset/cutoff pairs whose fire bands
+   cross the minute boundary into the sibling cycle's band.
+
+(The verdict's second item — the graceful-shutdown boot-wiring guard
+scanning the WHOLE of main.rs instead of its production region — was
+IMPLEMENTED in the same 2026-07-16 pass: the guard now splits main.rs at
+the first column-0 `#[cfg(test)]` line, the house production-region
+pattern, so a test-module mention of the notify call can never satisfy or
+double-count the production pin.)
+
 ## §4. Honest envelope (mandatory per operator-charter §F)
 
 > "100% inside the tested envelope, with ratcheted regression coverage: the

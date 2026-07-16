@@ -25,6 +25,18 @@ fn app_src(rel: &str) -> String {
     fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
 }
 
+/// The PRODUCTION region of a source file: everything above the first
+/// column-0 `#[cfg(test)]` line (the house production-region split — the
+/// margin_gate_off_guard / seal-writer ratchet precedent). A test-module
+/// mention of a pinned needle can never satisfy or double-count a
+/// production pin.
+fn production_region(src: &str) -> &str {
+    match src.find("\n#[cfg(test)]") {
+        Some(at) => &src[..at],
+        None => src,
+    }
+}
+
 #[test]
 fn test_spawn_cadence_scheduler_is_wired_into_main_boot_path() {
     let src = app_src("src/main.rs");
@@ -119,8 +131,12 @@ fn test_cadence_graceful_shutdown_chain_is_wired() {
         );
     }
     // (b) main.rs fires the notifier from run_process_runloop's teardown
-    //     path, after the ShutdownInitiated notification.
-    let src = app_src("src/main.rs");
+    //     path, after the ShutdownInitiated notification. Scan the
+    //     PRODUCTION region only (split at the first column-0
+    //     `#[cfg(test)]`) so a test-module mention can never satisfy or
+    //     double-count this pin (2026-07-16, verifier round-4 item 2).
+    let whole = app_src("src/main.rs");
+    let src = production_region(&whole);
     let call = "cadence_boot::notify_cadence_shutdown();";
     let call_count = src.matches(call).count();
     assert_eq!(
