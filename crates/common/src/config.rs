@@ -983,6 +983,12 @@ pub struct MarketRamStoreConfig {
     /// 1_000 — above the structural 800-row publish bound
     /// (`MAX_STRIKES_PER_CHAIN` 400 × 2 legs), so truncation fires only on
     /// a hostile/runaway snapshot, LOUDLY (counted + coded warn).
+    /// Validated 200..=5_000 (PR-2 round-1): the chain-rehydrate window
+    /// LIMIT is derived from this cap, so a foot-gun tiny value would make
+    /// every rehydrate window hit its LIMIT tripwire — permanently
+    /// truncated, never rehydrating. Values in 200..800 are legal but can
+    /// still flag genuinely full chains' windows truncated (visible,
+    /// never silent).
     #[serde(default = "default_market_ram_store_chain_row_cap")]
     pub chain_row_cap: u32,
 }
@@ -1013,7 +1019,10 @@ impl MarketRamStoreConfig {
     /// # Errors
     /// Returns a descriptive error when `spot_days` is outside `1..=370`
     /// (the same ~one-year envelope bound as `rest_candle_fold.catchup_days`)
-    /// or `chain_row_cap` is outside `1..=10_000`.
+    /// or `chain_row_cap` is outside `200..=5_000` (floor: the chain
+    /// rehydrate's window LIMIT derives from the cap — a tiny value would
+    /// make EVERY rehydrate window permanently hit its truncation
+    /// tripwire; ceiling: bounds worst-case resident chain bytes).
     pub fn validate(&self) -> Result<()> {
         if !(1..=370).contains(&self.spot_days) {
             bail!(
@@ -1021,9 +1030,9 @@ impl MarketRamStoreConfig {
                 self.spot_days
             );
         }
-        if !(1..=10_000).contains(&self.chain_row_cap) {
+        if !(200..=5_000).contains(&self.chain_row_cap) {
             bail!(
-                "market_ram_store.chain_row_cap ({}) must be within 1..=10000",
+                "market_ram_store.chain_row_cap ({}) must be within 200..=5000",
                 self.chain_row_cap
             );
         }
@@ -3172,15 +3181,20 @@ mod tests {
     #[test]
     fn test_market_ram_store_config_validate_bounds() {
         // spot_days shares the 1..=370 envelope with
-        // rest_candle_fold.catchup_days; chain_row_cap is 1..=10_000.
+        // rest_candle_fold.catchup_days; chain_row_cap is 200..=5_000
+        // (PR-2 round-1: a foot-gun tiny cap would make every chain
+        // rehydrate window permanently hit its LIMIT tripwire).
         let cfg = |spot_days: u32, chain_row_cap: u32| MarketRamStoreConfig {
             enabled: true,
             spot_days,
             chain_row_cap,
         };
-        assert!(cfg(1, 1).validate().is_ok(), "lower edges must be accepted");
         assert!(
-            cfg(370, 10_000).validate().is_ok(),
+            cfg(1, 200).validate().is_ok(),
+            "lower edges must be accepted"
+        );
+        assert!(
+            cfg(370, 5_000).validate().is_ok(),
             "upper edges must be accepted"
         );
         assert!(cfg(0, 1_000).validate().is_err(), "spot_days 0 rejected");
@@ -3188,10 +3202,14 @@ mod tests {
             cfg(371, 1_000).validate().is_err(),
             "spot_days 371 rejected"
         );
+        assert!(
+            cfg(35, 199).validate().is_err(),
+            "chain_row_cap 199 rejected (rehydrate-tripwire floor)"
+        );
         assert!(cfg(35, 0).validate().is_err(), "chain_row_cap 0 rejected");
         assert!(
-            cfg(35, 10_001).validate().is_err(),
-            "chain_row_cap 10001 rejected"
+            cfg(35, 5_001).validate().is_err(),
+            "chain_row_cap 5001 rejected"
         );
     }
 
