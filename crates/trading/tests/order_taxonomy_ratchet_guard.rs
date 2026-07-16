@@ -1,4 +1,4 @@
-//! Source-scan ratchets for the Cluster B Dhan order-path error taxonomy,
+//! Source-scan ratchets for the Cluster F Dhan order-path error taxonomy,
 //! the fail-closed order-readiness gate and the DH-904 backoff ladder.
 //!
 //! House pattern (`api_token_rotation_wiring_guard.rs` /
@@ -55,10 +55,20 @@ fn strip_line_comments(body: &str) -> String {
     out
 }
 
-/// Production region only: everything before the `#[cfg(test)]` module.
+/// Production region only: everything before the COLUMN-0 `#[cfg(test)]`
+/// line that opens the tests module (the house source-scan convention —
+/// funds-margin ratchet precedent). Comments are stripped BEFORE the cut so
+/// a `#[cfg(test)]` literal inside a doc/line comment can never truncate the
+/// region, and the column-0 anchor skips INDENTED test-only items (e.g.
+/// api_client's `#[cfg(test)] fn arm_alerts_gate_for_tests`, merged from
+/// main 2026-07-16) that live mid-impl above `run_order_ladder`.
 fn production_region(body: &str) -> String {
-    let cut = body.find("#[cfg(test)]").unwrap_or(body.len());
-    strip_line_comments(&body[..cut])
+    let stripped = strip_line_comments(body);
+    let cut = stripped
+        .find("\n#[cfg(test)]")
+        .map(|i| i.saturating_add(1))
+        .unwrap_or(stripped.len());
+    stripped[..cut].to_string()
 }
 
 /// Whitespace fully removed — so a method call split across lines by rustfmt is

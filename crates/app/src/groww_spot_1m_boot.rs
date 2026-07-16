@@ -2322,6 +2322,20 @@ async fn fire_one_minute(
                         "none",
                     ));
                     staged.push((security_id, backfill.minute_ts_ist_nanos));
+                    if let Ok(sid_u64) = u64::try_from(security_id) {
+                        confirmed_bars.push(
+                            crate::rest_candle_fold::ConfirmedBar::from_minute_candle(
+                                Feed::Groww,
+                                sid_u64,
+                                tickvault_common::constants::EXCHANGE_SEGMENT_IDX_I,
+                                &backfill,
+                            ),
+                        );
+                    } else {
+                        // Round-2 LOW-6: never a silent skip — counted +
+                        // one coalesced warn (defensive; ids are positive).
+                        crate::rest_candle_fold::note_unfoldable_identity(Feed::Groww, security_id);
+                    }
                 }
             }
         }

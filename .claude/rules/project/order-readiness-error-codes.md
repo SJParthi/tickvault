@@ -180,6 +180,42 @@ ambiguous-outcome classes (908/909/800/5xx/transport). Transport is treated as a
 whole-class ambiguous error (the NeverSent/SentOrUnknown split is a flagged
 follow-up requiring construction-site access to `reqwest::Error`).
 
+### §4a. Flagged follow-ups (deliberately out of scope; documented in the PR body)
+
+- **SECURITY MEDIUM — `pre_market_check` Derivative-segment fail-OPEN.**
+  `crates/core/src/auth/token_manager.rs::pre_market_check` matches the
+  Derivative segment with `activeSegment.contains("D")` — a SUBSTRING test that
+  fail-OPENS on tokens like `"DISABLED"` / `"CURRENCY_D_LEG"`. That file is the
+  Cluster D auth-gate seam (NOT edited here). This PR ships a strict,
+  delimiter-aware `tickvault_trading::oms::order_readiness::segment_has_derivative`
+  (exact token match against `{"D","Derivative"}`, with tests) for the app-side
+  `ReadinessProbe` seam owner to wire; migrating `pre_market_check` itself to the
+  strict check is a Cluster D follow-up.
+- **F-F — `correlationId` is a TRACKING tag, not a server-side idempotency key.**
+  The DH-901 / 807/808/809 retries re-send the SAME request struct (same
+  `correlationId`). Duplicate-order safety rests ENTIRELY on the assumption that
+  Dhan rejects auth-layer errors PRE-order-processing (request rejected before an
+  order is created). An in-code comment at the retry site records this; the
+  correlation-probe adopt-or-flag (§4 above) is the real net for genuinely
+  ambiguous outcomes.
+- **F-C / F-D — daily-rate-slot accounting under retry.** `rate_limiter.check()`
+  runs ONCE per logical call (before the gates), but the DH-904 ladder can issue
+  up to 5 HTTP attempts (1 + 4 rungs), plus 1 on an auth rotate-retry, and cancel
+  can reach ~6. So the `DailyRequestTracker` (7000/day) counts logical operations,
+  not real Dhan HTTP calls; a heavy-DH-904 day can exceed Dhan's real daily budget
+  while the local tracker believes it is within limit. Additionally, a fail-closed
+  refusal (readiness None/stale, or a halt) is consumed AFTER `rate_limiter.check()`
+  (a pinned gate order — CB < gate < token), so a refused order still burns a
+  per-second + daily slot; a strategy hammering `place_order` against an unwired
+  seam can self-exhaust the daily budget and then even `cancel_order` (also
+  rate-checked) is blocked. Both are documented semantics, not fixed here
+  (moving the rate consume after the gates would touch the pinned gate order).
+- **F-G — `start_mock_server_seq` deviation.** The `*_with_policy` wrappers'
+  real DH-904 retry OVER A SOCKET is proven by the pure `run_order_ladder`
+  closure tests (paused clock) + the source-scan ratchet, not by a loop-accept
+  sequential mock (the closure form avoids the paused-clock-vs-real-TCP flake
+  class). Accepted deviation.
+
 ## §5. Trigger / auto-load
 
 This rule activates when editing:

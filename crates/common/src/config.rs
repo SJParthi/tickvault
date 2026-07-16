@@ -2924,6 +2924,16 @@ impl ApplicationConfig {
         // store installs.
         self.market_ram_store.validate()?;
 
+        // 2026-07-16 REST-era candle derivation: the boot catch-up window
+        // must be a sane 1..=370-day envelope — rejected at boot, BEFORE
+        // the fold task spawns.
+        self.rest_candle_fold.validate()?;
+
+        // 2026-07-16 RAM residency stores (PR-2): spot ring depth + chain
+        // per-minute row cap must be sane — rejected at boot, BEFORE any
+        // store installs.
+        self.market_ram_store.validate()?;
+
         Ok(())
     }
 }

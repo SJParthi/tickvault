@@ -2109,6 +2109,22 @@ pub enum OmsError {
     #[error("max modifications ({max}) exceeded for order {order_id}")]
     MaxModificationsExceeded { order_id: String, max: u32 },
 
+    /// Cluster F: a live order was refused by the order-readiness gate
+    /// (fail-closed on never-probed / stale / invalid profile / token headroom).
+    #[error("order readiness gate refused: {reason} (ORDER-READY-01)")]
+    OrderReadinessRefused { reason: &'static str },
+
+    /// Cluster F: the OMS order path is HALTED (DH-901 post-retry / DH-902 /
+    /// DH-903 / DATA-810). Cleared only by an operator (`clear_order_halt`) or
+    /// a process restart — never by `reset_daily`. Field is `cause` (not
+    /// `source`) because `&'static str` is not an `std::error::Error`.
+    #[error("OMS order path HALTED by {cause} — operator action required")]
+    OrderPathHalted { cause: &'static str },
+
+    /// Cluster F: DATA-805 stop-all cooldown is active — every order-API call is
+    /// refused for the remaining window, then resumes passively.
+    #[error("Dhan DATA-805 stop-all cooldown active ({remaining_secs}s remaining)")]
+    StopAllCooldown { remaining_secs: u64 },
     /// The /alerts/* client surface is DISARMED (hardcoded default). No HTTP was
     /// attempted. Arming is #[cfg(test)]-only until a dated operator-quote
     /// activation PR exists.

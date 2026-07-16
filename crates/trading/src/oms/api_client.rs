@@ -35,8 +35,6 @@ use super::error_taxonomy::{self, OrderEndpoint, OrderErrorPolicy};
 
 use super::types::{DhanMultiOrderRequest, DhanMultiOrderResponse};
 
-use super::types::{DhanMultiOrderRequest, DhanMultiOrderResponse};
-
 use super::types::{
     DhanConditionalTriggerRequest, DhanConditionalTriggerResponse, DhanConvertPositionRequest,
     DhanExitAllResponse, DhanForeverOrderRequest, DhanForeverOrderResponse,
@@ -67,185 +65,14 @@ const HTTP_TOO_MANY_REQUESTS: u16 = 429;
 /// This prevents an attacker-controllable label-cardinality bomb (R23) — a
 /// hostile error body can no longer inject arbitrary metric-label values.
 fn record_dh_error_metric(body: &str) {
-    let label: &'static str = super::error_taxonomy::extract_dhan_error_code(body)
-        .and_then(super::error_taxonomy::class_for_code_token)
+    // Shape-gated token extraction handles BOTH the quoted (`"errorCode":"DH-905"`)
+    // and bare-numeric (`"errorCode":805`) forms so DATA-8xx codes (Dhan sends
+    // them numeric) get a proper closed-set label instead of "unknown".
+    let label: &'static str = super::error_taxonomy::extract_dhan_error_code_token(body)
+        .and_then(|token| super::error_taxonomy::class_for_code_token(&token))
         .map(|class| super::error_taxonomy::error_code_for(class).code_str())
         .unwrap_or("unknown");
     metrics::counter!("tv_dhan_error_total", "code" => label).increment(1);
-}
-
-// ---------------------------------------------------------------------------
-// 2xx body tolerance for super-order mutations
-// ---------------------------------------------------------------------------
-
-/// Builds a synthetic [`DhanSuperOrderResponse`] carrying only a status label.
-///
-/// Used when Dhan accepted a super-order mutation (2xx) but sent no
-/// parsable body — the mutation already succeeded broker-side, so the
-/// caller must never see an error for it.
-fn synthetic_super_order_response(order_status: &str) -> DhanSuperOrderResponse {
-    DhanSuperOrderResponse {
-        order_id: String::new(),
-        order_status: order_status.to_owned(),
-        correlation_id: String::new(),
-        leg_details: Vec::new(),
-        filled_qty: 0,
-        average_traded_price: 0.0,
-        remaining_quantity: 0,
-        security_id: String::new(),
-        transaction_type: String::new(),
-        exchange_segment: String::new(),
-        oms_error_description: String::new(),
-    }
-}
-
-/// Parses a 2xx super-order mutation body TOLERANTLY.
-///
-/// The two official doc surfaces conflict on the cancel/modify response
-/// shape: the portal capture says "There is no body for request and
-/// response for this call. On successful completion of request
-/// '202 Accepted' response status code will appear"
-/// (`docs/dhan-ref/dhanhq-v2-upstream-2026-07-03/04-super-orders.md:151`),
-/// while the classic `docs/dhan-ref/07a-super-order.md` shows 200 + JSON.
-/// Which shape fires live is UNVERIFIED-LIVE (lockout-ledger U6) — handle
-/// BOTH now:
-/// - empty/whitespace body → synthetic success (`ACCEPTED_NO_BODY`)
-/// - unparsable body on 2xx → `warn!` + synthetic success
-///   (`ACCEPTED_UNPARSED_BODY`) — NEVER an error for an already-accepted
-///   mutation (a `JsonError` here would record a false circuit-breaker
-///   failure and invite a re-issued cancel).
-fn parse_2xx_body_tolerant(body: &str, endpoint: &'static str) -> DhanSuperOrderResponse {
-    if body.trim().is_empty() {
-        return synthetic_super_order_response("ACCEPTED_NO_BODY");
-    }
-    match serde_json::from_str(body) {
-        Ok(response) => response,
-        Err(err) => {
-            warn!(
-                endpoint = %endpoint,
-                error = %err,
-                "2xx super-order response body unparsable — treating as accepted \
-                 (202-no-body class per docs/dhan-ref/dhanhq-v2-upstream-2026-07-03/04-super-orders.md:151)"
-            );
-            synthetic_super_order_response("ACCEPTED_UNPARSED_BODY")
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// 2xx body tolerance for super-order mutations
-// ---------------------------------------------------------------------------
-
-/// Builds a synthetic [`DhanSuperOrderResponse`] carrying only a status label.
-///
-/// Used when Dhan accepted a super-order mutation (2xx) but sent no
-/// parsable body — the mutation already succeeded broker-side, so the
-/// caller must never see an error for it.
-fn synthetic_super_order_response(order_status: &str) -> DhanSuperOrderResponse {
-    DhanSuperOrderResponse {
-        order_id: String::new(),
-        order_status: order_status.to_owned(),
-        correlation_id: String::new(),
-        leg_details: Vec::new(),
-        filled_qty: 0,
-        average_traded_price: 0.0,
-        remaining_quantity: 0,
-        security_id: String::new(),
-        transaction_type: String::new(),
-        exchange_segment: String::new(),
-        oms_error_description: String::new(),
-    }
-}
-
-/// Parses a 2xx super-order mutation body TOLERANTLY.
-///
-/// The two official doc surfaces conflict on the cancel/modify response
-/// shape: the portal capture says "There is no body for request and
-/// response for this call. On successful completion of request
-/// '202 Accepted' response status code will appear"
-/// (`docs/dhan-ref/dhanhq-v2-upstream-2026-07-03/04-super-orders.md:151`),
-/// while the classic `docs/dhan-ref/07a-super-order.md` shows 200 + JSON.
-/// Which shape fires live is UNVERIFIED-LIVE (lockout-ledger U6) — handle
-/// BOTH now:
-/// - empty/whitespace body → synthetic success (`ACCEPTED_NO_BODY`)
-/// - unparsable body on 2xx → `warn!` + synthetic success
-///   (`ACCEPTED_UNPARSED_BODY`) — NEVER an error for an already-accepted
-///   mutation (a `JsonError` here would record a false circuit-breaker
-///   failure and invite a re-issued cancel).
-fn parse_2xx_body_tolerant(body: &str, endpoint: &'static str) -> DhanSuperOrderResponse {
-    if body.trim().is_empty() {
-        return synthetic_super_order_response("ACCEPTED_NO_BODY");
-    }
-    match serde_json::from_str(body) {
-        Ok(response) => response,
-        Err(err) => {
-            warn!(
-                endpoint = %endpoint,
-                error = %err,
-                "2xx super-order response body unparsable — treating as accepted \
-                 (202-no-body class per docs/dhan-ref/dhanhq-v2-upstream-2026-07-03/04-super-orders.md:151)"
-            );
-            synthetic_super_order_response(SUPER_ORDER_STATUS_ACCEPTED_UNPARSED_BODY)
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// 2xx body tolerance for super-order mutations
-// ---------------------------------------------------------------------------
-
-/// Builds a synthetic [`DhanSuperOrderResponse`] carrying only a status label.
-///
-/// Used when Dhan accepted a super-order mutation (2xx) but sent no
-/// parsable body — the mutation already succeeded broker-side, so the
-/// caller must never see an error for it.
-fn synthetic_super_order_response(order_status: &str) -> DhanSuperOrderResponse {
-    DhanSuperOrderResponse {
-        order_id: String::new(),
-        order_status: order_status.to_owned(),
-        correlation_id: String::new(),
-        leg_details: Vec::new(),
-        filled_qty: 0,
-        average_traded_price: 0.0,
-        remaining_quantity: 0,
-        security_id: String::new(),
-        transaction_type: String::new(),
-        exchange_segment: String::new(),
-        oms_error_description: String::new(),
-    }
-}
-
-/// Parses a 2xx super-order mutation body TOLERANTLY.
-///
-/// The two official doc surfaces conflict on the cancel/modify response
-/// shape: the portal capture says "There is no body for request and
-/// response for this call. On successful completion of request
-/// '202 Accepted' response status code will appear"
-/// (`docs/dhan-ref/dhanhq-v2-upstream-2026-07-03/04-super-orders.md:151`),
-/// while the classic `docs/dhan-ref/07a-super-order.md` shows 200 + JSON.
-/// Which shape fires live is UNVERIFIED-LIVE (lockout-ledger U6) — handle
-/// BOTH now:
-/// - empty/whitespace body → synthetic success (`ACCEPTED_NO_BODY`)
-/// - unparsable body on 2xx → `warn!` + synthetic success
-///   (`ACCEPTED_UNPARSED_BODY`) — NEVER an error for an already-accepted
-///   mutation (a `JsonError` here would record a false circuit-breaker
-///   failure and invite a re-issued cancel).
-fn parse_2xx_body_tolerant(body: &str, endpoint: &'static str) -> DhanSuperOrderResponse {
-    if body.trim().is_empty() {
-        return synthetic_super_order_response("ACCEPTED_NO_BODY");
-    }
-    match serde_json::from_str(body) {
-        Ok(response) => response,
-        Err(err) => {
-            warn!(
-                endpoint = %endpoint,
-                error = %err,
-                "2xx super-order response body unparsable — treating as accepted \
-                 (202-no-body class per docs/dhan-ref/dhanhq-v2-upstream-2026-07-03/04-super-orders.md:151)"
-            );
-            synthetic_super_order_response(SUPER_ORDER_STATUS_ACCEPTED_UNPARSED_BODY)
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -321,6 +148,8 @@ pub struct OrderApiClient {
     base_url: String,
     /// Dhan client ID for the `client-id` header.
     client_id: String,
+    /// DATA-805 STOP-ALL cooldown latch (process-local, monotonic).
+    cooldown: error_taxonomy::BrokerCooldownLatch,
     /// Hardcoded OFF switch for the /alerts/* family (Conditional & Multi
     /// Order). DEFAULT: false (disarmed). Deliberately NO production arm
     /// path — arming is #[cfg(test)]-only until a dated operator quote lands
@@ -341,6 +170,7 @@ impl OrderApiClient {
             http,
             base_url,
             client_id,
+            cooldown: error_taxonomy::BrokerCooldownLatch::new(),
             alerts_gate_armed: false,
         }
     }
@@ -1996,7 +1826,7 @@ impl OrderApiClient {
 
     // -----------------------------------------------------------------------
     // Order-path policy wrappers + DH-904 ladder + DATA-805 STOP-ALL latch
-    // (Cluster B). Strictly additive — the methods above are untouched.
+    // (Cluster F). Strictly additive — the methods above are untouched.
     // -----------------------------------------------------------------------
 
     /// O(1) DATA-805 STOP-ALL pre-check. `Err(StopAllCooldown{..})` if latched.
@@ -6070,7 +5900,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Cluster B: DH-904 ladder + STOP-ALL latch + policy wrappers
+    // Cluster F: DH-904 ladder + STOP-ALL latch + policy wrappers
     // -----------------------------------------------------------------------
 
     const DH904_BODY: &str = r#"{"errorCode":"DH-904"}"#;
@@ -6368,14 +6198,17 @@ mod tests {
 
     #[test]
     fn test_record_dh_error_metric_label_closed_set_and_unknown() {
-        // The label rebase maps a known code to its code_str, junk to "unknown".
+        // Mirrors record_dh_error_metric's production extraction path exactly
+        // (shape-gated token, quoted + numeric).
         let label = |body: &str| -> String {
-            error_taxonomy::extract_dhan_error_code(body)
-                .and_then(error_taxonomy::class_for_code_token)
+            error_taxonomy::extract_dhan_error_code_token(body)
+                .and_then(|t| error_taxonomy::class_for_code_token(&t))
                 .map(|c| error_taxonomy::error_code_for(c).code_str().to_owned())
                 .unwrap_or_else(|| "unknown".to_owned())
         };
         assert_eq!(label(DH905_BODY), "DH-905");
+        // F-H fix: a bare-numeric DATA code now gets its real label, not "unknown".
+        assert_eq!(label(r#"{"errorType":"x","errorCode":807}"#), "DATA-807");
         assert_eq!(label(r#"{"errorCode":"DH-999"}"#), "unknown");
         assert_eq!(label(r#"{"foo":"bar"}"#), "unknown");
         // record_dh_error_metric must never panic on a hostile / empty body.

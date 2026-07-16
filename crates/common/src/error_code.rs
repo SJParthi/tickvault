@@ -1277,7 +1277,7 @@ impl ErrorCode {
             Self::Data812InvalidDateFormat => "DATA-812",
             Self::Data813InvalidSecurityId => "DATA-813",
             Self::Data814InvalidRequest => "DATA-814",
-            // Cluster B (2026-07-14) — order-readiness gate
+            // Cluster F (2026-07-14) — order-readiness gate
             Self::OrderReady01GateRefused => "ORDER-READY-01",
             // Wave 5 Item 13 — prev-close routing
             Self::PrevClose03BootRoutingAssertion => "PREVCLOSE-03",
@@ -2029,6 +2029,11 @@ impl ErrorCode {
                 // would re-stamp rows and could mask the evidence (the
                 // Futidx02 precedent).
                 | Self::TfVerify01MismatchFound
+                // ORDER-READY-01 (Cluster F, 2026-07-14): restoring
+                // dataPlan/segment/token is an operator/broker ACCOUNT decision
+                // (CHAIN-01 precedent); no auto-triage action may ever touch the
+                // ORDER path, so this is severity-independently operator-only.
+                | Self::OrderReady01GateRefused
                 // GROWW-PORT-03 (§39.3, 2026-07-14): NO — severity-independent
                 // override arm (FUTIDX-02 precedent: data-comparability
                 // divergence is never auto-actioned). The operator judges
@@ -2625,11 +2630,18 @@ mod tests {
         // 2026-07-15 (merge of #1587 fan-out stubs + main's #1578
         // GROWW-ORD contracts): both families coexist — 129 base + 14
         // (PORT/OCO/MARG) + 10 (ORD) = 153, mechanically recounted.
-        // 2026-07-16 (Groww order-push Stage A): bumped 153 -> 157 for
-        // GROWW-PUSH-01..04 (connect-failed / auth-failed / decode-failed
-        // / supervisor-respawned) — receive-only push-channel
-        // observability, all log-sink-only.
-        assert_eq!(ErrorCode::all().len(), 157);
+        // 2026-07-14 (Cluster F, merged 2026-07-16): ORDER-READY-01
+        // (order-readiness gate) => 154.
+        // 2026-07-16 (REST-era candle derivation, operator directive):
+        // +1 FOLD-01 (RestCandleFold01Degraded — bar-fold writer degrade;
+        // log-sink-only, High, auto-triage-safe) => 155 (both 153->154
+        // bumps — Cluster F + FOLD-01 — landed concurrently; mechanically
+        // recounted at this merge).
+        // 2026-07-16 (RAM residency stores, PR-2 of the same directive):
+        // +1 RAMSTORE-01 (RamStore01Degraded — spot/chain RAM store
+        // degrade; log-sink-only, High, auto-triage-safe) => 156
+        // (mechanically recounted at this rebase onto main's 155).
+        assert_eq!(ErrorCode::all().len(), 156);
     }
 
     #[test]
@@ -3004,52 +3016,20 @@ mod tests {
     }
 
     #[test]
-    fn test_groww_push_codes_contract() {
-        // Groww order/position push channel (Stage A, 2026-07-16):
-        // severities + the blanket non-Critical auto-triage derivation
-        // (deliberately NO severity-independent override — every degrade
-        // self-heals via reconnect / re-read / respawn).
-        for (code, s, sev) in [
-            (
-                ErrorCode::GrowwPush01ConnectFailed,
-                "GROWW-PUSH-01",
-                Severity::High,
-            ),
-            (
-                ErrorCode::GrowwPush02AuthFailed,
-                "GROWW-PUSH-02",
-                Severity::High,
-            ),
-            (
-                ErrorCode::GrowwPush03DecodeFailed,
-                "GROWW-PUSH-03",
-                Severity::Medium,
-            ),
-            (
-                ErrorCode::GrowwPush04SupervisorRespawned,
-                "GROWW-PUSH-04",
-                Severity::High,
-            ),
-        ] {
-            assert_eq!(code.code_str(), s);
-            assert_eq!(s.parse::<ErrorCode>(), Ok(code));
-            assert_eq!(code.severity(), sev);
-            assert!(ErrorCode::all().contains(&code));
-            assert_eq!(
-                code.runbook_path(),
-                ".claude/rules/project/groww-order-push-error-codes.md"
-            );
-            // The runbook must exist on disk (cross-ref test parity).
-            let abs = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .parent()
-                .and_then(std::path::Path::parent)
-                .map(|root| root.join(code.runbook_path()))
-                .expect("workspace root");
-            let shown = abs.display().to_string();
-            assert!(abs.exists(), "{s} runbook missing on disk: {shown}");
-            // All four follow the blanket non-Critical derivation.
-            assert!(code.is_auto_triage_safe());
-        }
+    fn test_order_ready_01_contract() {
+        let c = ErrorCode::OrderReady01GateRefused;
+        assert_eq!(c.code_str(), "ORDER-READY-01");
+        assert_eq!("ORDER-READY-01".parse::<ErrorCode>(), Ok(c));
+        assert_eq!(c.severity(), Severity::High);
+        assert!(
+            !c.is_auto_triage_safe(),
+            "operator-only: account/order-path decision"
+        );
+        assert_eq!(
+            c.runbook_path(),
+            ".claude/rules/project/order-readiness-error-codes.md"
+        );
+        assert!(ErrorCode::all().contains(&c));
     }
 
     #[test]
@@ -3094,7 +3074,7 @@ mod tests {
                 || s.starts_with("STORAGE-GAP-")
                 || s.starts_with("DH-")
                 || s.starts_with("DATA-")
-                // Cluster B (2026-07-14): order-readiness gate
+                // Cluster F (2026-07-14): order-readiness gate
                 || s.starts_with("ORDER-READY-")
                 // Wave 1 (PR #393): hot-path / phase2 / prev-close / movers prefixes
                 || s.starts_with("HOT-PATH-")

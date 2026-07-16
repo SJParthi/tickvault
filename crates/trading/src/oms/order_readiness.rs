@@ -23,20 +23,28 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use tokio::task::JoinHandle;
-use tracing::{error, info};
+use tokio::task::{JoinError, JoinHandle};
+use tracing::{error, info, warn};
 
 use tickvault_common::constants::{
     ORDER_READINESS_MAX_AGE_SECS, ORDER_READINESS_PREMARKET_TRIGGER_SECS_OF_DAY_IST,
-    ORDER_READINESS_REFRESH_INTERVAL_SECS, ORDER_TOKEN_HEADROOM_MIN_SECS, SECONDS_PER_DAY,
-    TICK_PERSIST_END_SECS_OF_DAY_IST,
+    ORDER_READINESS_REFRESH_INTERVAL_SECS, ORDER_READINESS_REFRESHER_RESPAWN_BACKOFF_SECS,
+    ORDER_TOKEN_HEADROOM_MIN_SECS, SECONDS_PER_DAY, TICK_PERSIST_END_SECS_OF_DAY_IST,
 };
 use tickvault_common::error_code::ErrorCode;
 
-/// SeqCst everywhere — cold path, single writer (the refresher), multi reader
-/// (the order gates). Writing `last_ok` LAST and reading freshness FIRST means
-/// any torn interleaving can only produce a spurious REFUSAL, never a spurious
-/// pass (R17).
+/// SeqCst everywhere — cold path. The refresher is the primary writer; the
+/// engine's DATA-806 arm is a SECOND writer of `profile_ok` only
+/// (`poison_profile`). Correctness (R17, corrected): freshness (`last_ok`) is
+/// written LAST and read FIRST, and the headroom + its stamp are a SINGLE
+/// packed `AtomicU64` (F-B fix — a reader can never observe an OLD headroom
+/// with a NEW stamp and spuriously PASS near the 4h boundary), so a torn read
+/// can only produce a spurious REFUSAL, never a spurious pass. The one benign
+/// relaxation: a DATA-806 `poison_profile` racing a concurrently-completing OK
+/// refresh is last-writer-wins on `profile_ok`; a poisoned gate may re-open one
+/// probe early, which self-heals on the next probe (R16 — dataPlan does not
+/// truly gate Trading APIs). This is documented, not relied upon for
+/// duplicate-order safety.
 const ORD: Ordering = Ordering::SeqCst;
 
 /// The outcome of one readiness probe (produced by the app-side `ReadinessProbe`).
@@ -69,12 +77,37 @@ pub struct OrderReadinessState {
     last_ok_epoch_s: AtomicU64,
     /// Epoch seconds of the last probe attempt (0 = refresher never ran).
     last_attempt_epoch_s: AtomicU64,
-    /// `seconds_until_expiry()` snapshot from the last probe.
-    token_headroom_secs: AtomicU64,
-    /// Epoch seconds when the headroom snapshot was taken (for per-order decay).
-    headroom_stamped_epoch_s: AtomicU64,
+    /// Packed `(headroom_secs << 32) | stamped_epoch_s` — the `seconds_until_expiry()`
+    /// snapshot AND the epoch it was taken at, stored as ONE atomic so the
+    /// per-order decay pair is always read/written together (F-B fix: no torn
+    /// OLD-headroom + NEW-stamp spurious PASS). Both halves are clamped to
+    /// `u32::MAX`; epoch seconds fit in u32 until 2106 and token headroom (≤24h)
+    /// fits trivially.
+    headroom_packed: AtomicU64,
     /// ORDER-READY-01 gate edge-latch (loud once per refusal episode).
     refusal_latched: AtomicBool,
+}
+
+/// Pack a `(headroom_secs, stamped_epoch_s)` pair into one `u64`; both halves
+/// clamp to `u32::MAX`.
+const fn pack_headroom(headroom_secs: u64, stamped_epoch_s: u64) -> u64 {
+    const U32_MAX: u64 = u32::MAX as u64;
+    let h = if headroom_secs > U32_MAX {
+        U32_MAX
+    } else {
+        headroom_secs
+    };
+    let s = if stamped_epoch_s > U32_MAX {
+        U32_MAX
+    } else {
+        stamped_epoch_s
+    };
+    (h << 32) | s
+}
+
+/// Unpack a packed headroom word into `(headroom_secs, stamped_epoch_s)`.
+const fn unpack_headroom(packed: u64) -> (u64, u64) {
+    (packed >> 32, packed & 0xFFFF_FFFF)
 }
 
 impl Default for OrderReadinessState {
@@ -92,8 +125,7 @@ impl OrderReadinessState {
             profile_ok: AtomicBool::new(false),
             last_ok_epoch_s: AtomicU64::new(0),
             last_attempt_epoch_s: AtomicU64::new(0),
-            token_headroom_secs: AtomicU64::new(0),
-            headroom_stamped_epoch_s: AtomicU64::new(0),
+            headroom_packed: AtomicU64::new(0),
             refusal_latched: AtomicBool::new(false),
         }
     }
@@ -176,8 +208,7 @@ pub fn evaluate_order_readiness(
     if !state.profile_ok.load(ORD) {
         return Err(ReadinessRefusal::ProfileInvalid);
     }
-    let headroom = state.token_headroom_secs.load(ORD);
-    let stamped = state.headroom_stamped_epoch_s.load(ORD);
+    let (headroom, stamped) = unpack_headroom(state.headroom_packed.load(ORD));
     let elapsed = now_epoch_s.saturating_sub(stamped);
     let effective = headroom.saturating_sub(elapsed);
     if effective < ORDER_TOKEN_HEADROOM_MIN_SECS {
@@ -186,6 +217,27 @@ pub fn evaluate_order_readiness(
         });
     }
     Ok(())
+}
+
+/// Strict, delimiter-aware check that a Dhan `activeSegment` string GRANTS the
+/// Derivative segment. Unlike a naive `activeSegment.contains("D")` (which
+/// fail-OPENS on tokens like `"DISABLED"` or `"CURRENCY_D_LEG"`), this splits on
+/// the documented list delimiters and requires an EXACT token match against
+/// `"D"` or `"Derivative"` (case-insensitive on the token, never a substring).
+///
+/// Provided for the app-side seam owner: the `ReadinessProbe` implementation
+/// bridging `TokenManager::pre_market_check()` MUST use this instead of a
+/// `contains` substring test (the fail-OPEN bug flagged in
+/// `token_manager.rs::pre_market_check` — a Cluster D auth-gate follow-up).
+// WIRING-EXEMPT: seam-handoff helper — the app-side probe owns the call site;
+// exercised here by segment_has_derivative unit tests.
+#[must_use]
+pub fn segment_has_derivative(active_segment: &str) -> bool {
+    active_segment
+        .split(|c: char| c == ',' || c == ';' || c == '|' || c.is_whitespace())
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .any(|t| t.eq_ignore_ascii_case("D") || t.eq_ignore_ascii_case("Derivative"))
 }
 
 /// PURE state-mutation core (exhaustively unit-tested). Writes `last_ok` LAST
@@ -199,10 +251,12 @@ pub(crate) fn apply_probe_outcome(
     // Reserve 0 for "never" so a probe exactly at epoch 0 is still "attempted".
     let stamp = now_epoch_s.max(1);
     state.last_attempt_epoch_s.store(stamp, ORD);
+    // Headroom + its stamp as ONE atomic store (F-B: the decay pair is never
+    // torn). Stamped uses the raw `now_epoch_s` (not `stamp`) to preserve the
+    // exact per-order decay base.
     state
-        .token_headroom_secs
-        .store(outcome.token_headroom_secs, ORD);
-    state.headroom_stamped_epoch_s.store(now_epoch_s, ORD);
+        .headroom_packed
+        .store(pack_headroom(outcome.token_headroom_secs, now_epoch_s), ORD);
     state.profile_ok.store(outcome.profile_ok, ORD);
     if outcome.profile_ok {
         // Written LAST — readers that saw this already saw profile_ok=true.
@@ -275,12 +329,76 @@ pub fn next_readiness_probe_wait_secs(now_ist_secs_of_day: u32) -> u64 {
     }
 }
 
+/// Classify how the inner probe-loop task resolved (mirror of the house
+/// `spawn_supervised_*` exit classifiers). `panic`/`cancelled` are only
+/// distinguishable in unwind builds; production uses `panic = "abort"`, so a
+/// panicking probe aborts the process there (WS-GAP-05 honest envelope) and
+/// this classifier's `panic` arm fires only under `cfg(test)`/unwind.
+fn classify_refresher_exit(res: &Result<(), JoinError>) -> &'static str {
+    match res {
+        Ok(()) => "clean_exit",
+        Err(e) if e.is_panic() => "panic",
+        Err(_) => "cancelled",
+    }
+}
+
+/// The inner probe loop: schedule-gated 08:45 IST + 900s cadence. A panicking
+/// app-supplied `probe.probe()` propagates out of this task and is caught by
+/// the supervisor (`supervise_order_readiness_refresher`).
+async fn run_order_readiness_refresher_loop(
+    probe: Arc<dyn ReadinessProbe>,
+    state: Arc<OrderReadinessState>,
+) {
+    loop {
+        let wait =
+            next_readiness_probe_wait_secs(tickvault_common::market_hours::now_ist_secs_of_day());
+        if wait > 0 {
+            tokio::time::sleep(Duration::from_secs(wait)).await;
+            continue;
+        }
+        let _ready = refresh_order_readiness(probe.as_ref(), state.as_ref()).await;
+        tokio::time::sleep(Duration::from_secs(ORDER_READINESS_REFRESH_INTERVAL_SECS)).await;
+    }
+}
+
+/// Supervisor loop: spawn the inner probe loop, and if it EVER resolves (a
+/// panicking probe, an external cancel, or an unexpected clean return) log a
+/// coded `warn!`, count the respawn, back off, and respawn — so the fail-closed
+/// gate never silently stops refreshing (C4 fix; mirrors the house
+/// `spawn_supervised_*` pattern — WS-GAP-05 / DISK-WATCHER-01).
+async fn supervise_order_readiness_refresher(
+    probe: Arc<dyn ReadinessProbe>,
+    state: Arc<OrderReadinessState>,
+) {
+    loop {
+        let inner = tokio::spawn(run_order_readiness_refresher_loop(
+            Arc::clone(&probe),
+            Arc::clone(&state),
+        ));
+        let reason = classify_refresher_exit(&inner.await);
+        warn!(
+            code = ErrorCode::OrderReady01GateRefused.code_str(),
+            stage = "refresher_respawn",
+            reason,
+            "🔷 DHAN — order-readiness refresher task exited; respawning (fail-closed gate stays REFUSING while down)"
+        );
+        metrics::counter!("tv_order_readiness_refresher_respawn_total", "reason" => reason)
+            .increment(1);
+        tokio::time::sleep(Duration::from_secs(
+            ORDER_READINESS_REFRESHER_RESPAWN_BACKOFF_SECS,
+        ))
+        .await;
+    }
+}
+
 /// SEAM HANDOFF: the trading crate ships this fn + tests; the ONE-LINE app-side
 /// spawn (constructing the `Arc<dyn ReadinessProbe>` over `TokenManager` and
 /// installing the state via `OrderManagementSystem::set_order_readiness`)
 /// belongs to the boot-seam owners (PR body + seam memory). Off-window ticks
 /// sleep to the next 08:45 IST; state is untouched off-window (the verdict goes
-/// Stale naturally = correct overnight fail-closure).
+/// Stale naturally = correct overnight fail-closure). The returned task is a
+/// SUPERVISOR: a panicking / exiting probe loop is caught and respawned (C4)
+/// rather than silently disabling the gate.
 // WIRING-EXEMPT: seam handoff — the app-side boot owns the one-line spawn; the
 // trading test suite exercises it via a mock ReadinessProbe.
 // FINANCIAL-TEST-EXEMPT: scheduling loop; the pure schedule math is covered by
@@ -289,19 +407,7 @@ pub fn spawn_order_readiness_refresher(
     probe: Arc<dyn ReadinessProbe>,
     state: Arc<OrderReadinessState>,
 ) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        loop {
-            let wait = next_readiness_probe_wait_secs(
-                tickvault_common::market_hours::now_ist_secs_of_day(),
-            );
-            if wait > 0 {
-                tokio::time::sleep(Duration::from_secs(wait)).await;
-                continue;
-            }
-            let _ready = refresh_order_readiness(probe.as_ref(), state.as_ref()).await;
-            tokio::time::sleep(Duration::from_secs(ORDER_READINESS_REFRESH_INTERVAL_SECS)).await;
-        }
-    })
+    tokio::spawn(supervise_order_readiness_refresher(probe, state))
 }
 
 #[cfg(test)]
@@ -427,6 +533,66 @@ mod tests {
         );
         // At +600s: effective = 14400 -> passes.
         assert_eq!(evaluate_order_readiness(&state, 1_600), Ok(()));
+    }
+
+    /// F-B fix: headroom + its stamp are packed into ONE atomic word, so a
+    /// reader can never observe an OLD headroom paired with a NEW stamp (the
+    /// spurious-PASS-near-boundary scenario). Every observable value is exactly
+    /// one whole pair; pack/unpack roundtrips losslessly within the u32 range.
+    #[test]
+    fn test_headroom_pair_is_atomically_packed_no_torn_mix() {
+        let state = OrderReadinessState::new();
+        // OLD: huge headroom stamped at t=1000.
+        apply_probe_outcome(
+            &state,
+            ProbeOutcome {
+                profile_ok: true,
+                token_headroom_secs: 80_000,
+            },
+            1_000,
+        );
+        assert_eq!(
+            unpack_headroom(state.headroom_packed.load(ORD)),
+            (80_000, 1_000)
+        );
+        // NEW: near-boundary headroom stamped at t=2000. With separate atomics a
+        // torn read could mix (80_000, 2_000) -> effective 80_000 -> spurious
+        // PASS. Packed, the pair is inseparable.
+        apply_probe_outcome(
+            &state,
+            ProbeOutcome {
+                profile_ok: true,
+                token_headroom_secs: 14_401,
+            },
+            2_000,
+        );
+        assert_eq!(
+            unpack_headroom(state.headroom_packed.load(ORD)),
+            (14_401, 2_000)
+        );
+        // At t=2000 with the NEW pair, effective = 14_401 (passes); a decayed
+        // read a second later drops to 14_400 exactly at the boundary.
+        assert_eq!(evaluate_order_readiness(&state, 2_000), Ok(()));
+        assert_eq!(evaluate_order_readiness(&state, 2_001), Ok(()));
+        assert_eq!(
+            evaluate_order_readiness(&state, 2_002),
+            Err(ReadinessRefusal::TokenHeadroomLow {
+                effective_secs: 14_399
+            })
+        );
+        // Lossless pack/unpack roundtrip across the u32 range.
+        for (h, s) in [
+            (0_u64, 0_u64),
+            (14_400, 1_700),
+            (u64::from(u32::MAX), u64::from(u32::MAX)),
+        ] {
+            assert_eq!(unpack_headroom(pack_headroom(h, s)), (h, s));
+        }
+        // Over-range halves clamp to u32::MAX (never wrap).
+        assert_eq!(
+            unpack_headroom(pack_headroom(u64::MAX, u64::MAX)),
+            (u64::from(u32::MAX), u64::from(u32::MAX))
+        );
     }
 
     #[test]
@@ -624,6 +790,73 @@ mod tests {
             handle.await.is_err(),
             "aborted task resolves to a JoinError"
         );
+    }
+
+    /// A probe that panics — used to prove the C4 supervisor catches it.
+    struct PanicProbe;
+    impl ReadinessProbe for PanicProbe {
+        fn probe(&self) -> ProbeFuture<'_> {
+            Box::pin(async { panic!("probe boom") })
+        }
+    }
+
+    /// C4: the supervisor's exit classifier maps a clean return, a panic, and a
+    /// cancel to stable respawn-reason slugs.
+    #[tokio::test]
+    async fn test_classify_refresher_exit_variants() {
+        let clean = tokio::spawn(async {});
+        assert_eq!(classify_refresher_exit(&clean.await), "clean_exit");
+
+        let panicked = tokio::spawn(async { panic!("boom") });
+        assert_eq!(classify_refresher_exit(&panicked.await), "panic");
+
+        let cancelled = tokio::spawn(async {
+            loop {
+                tokio::task::yield_now().await;
+            }
+        });
+        cancelled.abort();
+        assert_eq!(classify_refresher_exit(&cancelled.await), "cancelled");
+    }
+
+    /// C4: a panicking app-supplied probe does NOT kill supervision silently —
+    /// the inner task's panic is caught (JoinError::is_panic) exactly as the
+    /// supervisor observes it, and the fail-closed gate stays REFUSING.
+    #[tokio::test]
+    async fn test_refresher_inner_probe_panic_is_caught_as_panic_exit() {
+        let probe: Arc<dyn ReadinessProbe> = Arc::new(PanicProbe);
+        let state = Arc::new(OrderReadinessState::new());
+        let inner = tokio::spawn({
+            let p = Arc::clone(&probe);
+            let s = Arc::clone(&state);
+            async move {
+                let _ = refresh_order_readiness(p.as_ref(), s.as_ref()).await;
+            }
+        });
+        assert_eq!(classify_refresher_exit(&inner.await), "panic");
+        // Gate never became READY — fail-closed after a probe panic.
+        assert!(evaluate_order_readiness(&state, now_epoch_s()).is_err());
+    }
+
+    // --- strict Derivative-segment check (seam-handoff helper) ---
+
+    #[test]
+    fn test_segment_has_derivative_exact_token_grants() {
+        assert!(segment_has_derivative("Derivative"));
+        assert!(segment_has_derivative("Equity,Derivative,Currency"));
+        assert!(segment_has_derivative("EQ | D | CUR"));
+        assert!(segment_has_derivative("D"));
+        assert!(segment_has_derivative("derivative")); // case-insensitive token
+    }
+
+    #[test]
+    fn test_segment_has_derivative_rejects_fail_open_substrings() {
+        // The naive `contains("D")` would fail-OPEN on all of these.
+        assert!(!segment_has_derivative("DISABLED"));
+        assert!(!segment_has_derivative("Equity,Currency"));
+        assert!(!segment_has_derivative("CURRENCY_D_LEG"));
+        assert!(!segment_has_derivative(""));
+        assert!(!segment_has_derivative("Derivatives")); // not the exact token
     }
 
     #[tokio::test]
