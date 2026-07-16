@@ -61,13 +61,9 @@ pub mod rate_budget;
 
 // Area modules land in their own serial PRs, each behind this same feature:
 //   pub mod api_client;    // Orders        (GROWW-ORD-*)
-//   pub mod smart_orders;  // Smart Orders  (GROWW-OCO-*)
+//   pub mod portfolio;     // Portfolio     (GROWW-PORT-*)
+//   pub mod margin;        // Margin        (GROWW-MARG-*)
+//   pub mod user;          // User + Exceptions (GROWW-READY-*)
 
-pub mod margin; // Margin (GROWW-MARG-*)
-
-/// Portfolio area (`GROWW-PORT-*`) — field-inventory probe (item 6c.2).
-pub mod portfolio;
-
-/// User + Exceptions (readiness) — GROWW-READY-* prefix reserved; readiness
-/// reuses the existing SPOT1M codes per its design (§39.3).
-pub mod user;
+/// Smart Orders (GTT/OCO) area — `GROWW-OCO-*` (§39.3, 2026-07-15).
+pub mod smart_orders;
