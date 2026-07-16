@@ -267,9 +267,10 @@ O/H/L/C/ΣV given 1m bars):
   future drops (`test_first_bar_none_day_adopts_today_only`); burst drain primitive
   (`test_receiver_guard_try_recv_drains_burst`).
 - **Volume semantics:** i64 Σ, negative clamp, u64 conversion clamp
-  (`test_fold_volume_i64_clamp_semantics`).
+  (`test_volume_saturates_never_tears_the_fold` +
+  `test_negative_volume_clamps_to_zero_in_seal`).
 - **Idempotency:** folding the same input twice through fresh engines yields identical
-  seal sets (`test_fold_refold_same_input_identical_seals`).
+  seal sets (`test_refold_same_input_produces_identical_seals`).
 - **Config:** serde default OFF; empty-TOML deserialize disabled; base.toml sets
   enabled=true + catchup_days=35; validate rejects 0 / 371
   (`test_rest_candle_fold_config_*`).
