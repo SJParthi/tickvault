@@ -17,6 +17,12 @@
 > (`gdf-third-feed-scope-2026-07-13.md`); do not sign a "month verdict" spanning the
 > retirement boundary without splitting at 2026-07-13. Tables, blame taxonomy, and the
 > daily 15:45 IST Telegram are UNCHANGED.
+>
+> **⚠ 2026-07-15 dormancy note:** the Groww LIVE machinery this runbook's stall/bridge/
+> sidecar triage sections describe (sidecar, bridge, stall watchdog, lag publisher) was
+> DELETED with the Groww live feed (operator directive 2026-07-15 — REST-only for both
+> brokers). Those sections are HISTORICAL triage for already-captured rows; there is no
+> sidecar to restart anymore.
 
 > **Purpose:** the operator runs Dhan + Groww live in parallel for a month
 > (directive 2026-07-10) and signs a month-end verdict: which feed covered

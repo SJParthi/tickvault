@@ -184,6 +184,24 @@ fn test_config_toml_deserializes_all_sections() {
 }
 
 #[test]
+fn test_config_toml_absent_oms_reconcile_section_is_disabled() {
+    // VALID_CONFIG_TOML carries no [oms_reconcile] section — the loop must
+    // deserialize DISABLED with full defaults (fail-safe), never error.
+    let config: ApplicationConfig =
+        toml::from_str(VALID_CONFIG_TOML).expect("valid TOML must deserialize");
+
+    assert!(
+        !config.oms_reconcile.enabled,
+        "absent [oms_reconcile] section must mean disabled"
+    );
+    assert_eq!(config.oms_reconcile.interval_secs, 300);
+    assert!(config.oms_reconcile.trading_hours_only);
+    config
+        .validate()
+        .expect("defaulted oms_reconcile must pass validation");
+}
+
+#[test]
 fn test_config_toml_round_trip_validates() {
     let config: ApplicationConfig =
         toml::from_str(VALID_CONFIG_TOML).expect("valid TOML must deserialize");
@@ -326,10 +344,8 @@ fn test_config_default_values() {
     let config: ApplicationConfig =
         toml::from_str(VALID_CONFIG_TOML).expect("valid TOML must deserialize");
 
-    // SubscriptionConfig defaults.
-    assert_eq!(config.subscription.feed_mode, "Full");
-    assert!(config.subscription.subscribe_stock_equities);
-    assert_eq!(config.subscription.stock_atm_strikes_above, 25);
+    // (PR-C3 2026-07-14: SubscriptionConfig defaults retired with the
+    // deleted subscription surface — scope-lock amendment §B item 2.)
 
     // StrategyConfig defaults.
     assert_eq!(config.strategy.config_path, "config/strategies.toml");

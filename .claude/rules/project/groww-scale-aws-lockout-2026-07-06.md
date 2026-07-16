@@ -1,5 +1,13 @@
 # Groww Scale AWS Lockout — Operator Lock 2026-07-06
 
+> **⚠ SUPERSEDED 2026-07-15 (Groww live feed deleted — operator Q1, received directly in this session:
+> *"remove the whole Groww live feed; keep only spot 1m and option chain for both brokers; go."*; approval
+> Q2, typos preserved: *"go aehad approv ed dude"*):** the scale machinery this lockout keeps dormant is
+> DELETED OUTRIGHT with the Groww live feed — there is nothing left to hold dormant, and the §4 guard test
+> (`groww_scale_aws_lockout_guard.rs`) retires with it. The runtime is now ZERO live market-data
+> connections — REST-only for both brokers (`no-rest-except-live-feed-2026-06-27.md` §8/§9). Content below
+> retained as historical audit.
+
 > **Authority:** CLAUDE.md > `operator-charter-forever.md` §I > `groww-second-feed-scope-2026-06-19.md` §34 > this file > defaults.
 > **Scope:** PERMANENT. Every PR, every branch, every future Claude/Cowork session.
 > **Operator-locked:** 2026-07-06 (verbatim quotes below).

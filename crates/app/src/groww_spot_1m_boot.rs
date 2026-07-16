@@ -66,19 +66,34 @@
 //! `outcome="empty"` — counted, edge-tracked, forensics-rowed, never
 //! silent (Rule 11).
 //!
-//! ## Rate budget + pacing (the plan's capacity verdict)
-//! Per `docs/groww-ref/15-rate-limits-and-capacity.md` (official limits +
-//! capacity math + the §6 live-probe measurement plan): Groww's Live-Data
+//! ## Rate budget + pacing — the 2026-07-14 burst AUTO-LADDER
+//! (operator approval "approved and go ahead with the recommendation";
+//! contract `no-rest-except-live-feed-2026-06-27.md` §9.7 +
+//! `groww-second-feed-scope-2026-06-19.md` §38.9). Groww's Live-Data
 //! bucket is 10/s + 300/min, TYPE-pooled, shared with bruteX on the ONE
 //! minter token; which bucket `/historical/*` counts against is
-//! UNVERIFIED (Assumed Live Data — `docs/groww-ref/99-UNKNOWNS.md`). That
-//! binds the minute-boundary pacing rule: the 3 symbols are fetched
-//! SEQUENTIALLY, so at most ONE request is in flight at any instant
-//! (ladder re-polls are ≥700 ms apart) — far inside the ≤6 req/s
-//! boundary-burst ceiling. Worst case ~15 requests/minute (3 symbols × 5
-//! ladder rungs) ≈ 5% of the 300/min budget. Every 429 is counted + its
-//! shape captured (timestamp, endpoint, Retry-After presence, sanitized
-//! body) — the live-probe (e) requirement.
+//! UNVERIFIED (Assumed Live Data — `docs/groww-ref/99-UNKNOWNS.md`).
+//! The 4 targets fire CONCURRENTLY as ONE WAVE at a TIER-dependent
+//! post-boundary delay: `two_wave` (the shipped default) fires the spot
+//! wave at close+1,350 ms — more than one rolling second after the chain
+//! leg's close+300 ms wave, so the boundary burst never exceeds 4 req/s;
+//! the probe-gated `seven_concurrent` tier fires it at close+300 ms with
+//! the chain wave (7 req/s). Any Groww-leg HTTP 429 AUTO-DEMOTES the
+//! session (`crate::groww_rest_burst`; a demoted two_wave staggers wave
+//! slots by 350 ms — the ladder rung offsets are measured from each
+//! target's own first attempt, so the stagger propagates into every
+//! re-poll rung wave). Worst case ~20 requests/minute (4 targets × 5
+//! ladder rungs) ≈ 7% of the 300/min budget; the honest vendor-lag
+//! rolling-second worst (two adjacent rung waves) is 8 req/s solo —
+//! const-asserted ≤ the 10/s ceiling in `constants.rs`. Every 429 is
+//! counted + its shape captured (timestamp, endpoint, Retry-After
+//! presence, sanitized body) — the live-probe (e) requirement.
+//!
+//! ## Pre-boundary warm-up (config `[groww_rest_burst] warm_up`)
+//! At minute boundary − 4 s the leg sends ONE unauthenticated GET on its
+//! own client (3 s-bounded, response discarded) so an idle-closed TLS/H2
+//! connection is re-established before the critical window — see
+//! `crate::groww_rest_burst::send_warmup_get` for the no-token rationale.
 //!
 //! ## Token (the minter lock)
 //! The shared Groww access token is read READ-ONLY from SSM via the
@@ -113,20 +128,19 @@ use tracing::{error, info, warn};
 use tickvault_common::config::QuestDbConfig;
 use tickvault_common::constants::{
     GROWW_API_VERSION_HEADER, GROWW_API_VERSION_VALUE, GROWW_CANDLE_INTERVAL_1MIN, GROWW_DATA_DIR,
-    GROWW_HISTORICAL_CANDLES_URL, GROWW_SPOT_1M_FIRE_DELAY_MS, GROWW_SPOT_1M_MAX_BODY_BYTES,
-    GROWW_SPOT_1M_REQUEST_TIMEOUT_SECS, GROWW_SPOT_1M_RETRY_OFFSETS_MS,
+    GROWW_HISTORICAL_CANDLES_URL, GROWW_REST_RUNG_JITTER_STEP_MS, GROWW_REST_WARMUP_LEAD_SECS,
+    GROWW_SPOT_1M_MAX_BODY_BYTES, GROWW_SPOT_1M_REQUEST_TIMEOUT_MS, GROWW_SPOT_1M_RETRY_OFFSETS_MS,
     GROWW_SPOT_1M_SYMBOL_BUDGET_SECS, GROWW_SPOT_1M_SYMBOLS, GROWW_SPOT_1M_TOKEN_REREAD_FLOOR_SECS,
     GROWW_SPOT_1M_VIX_SYMBOL, IST_UTC_OFFSET_SECONDS, SECONDS_PER_DAY,
     SPOT_1M_REST_FIRST_FIRE_SECS_OF_DAY_IST, SPOT_1M_REST_LAST_FIRE_SECS_OF_DAY_IST,
 };
 use tickvault_common::error_code::ErrorCode;
+use tickvault_common::feed::Feed;
 use tickvault_common::sanitize::capture_rest_error_body;
 use tickvault_common::trading_calendar::TradingCalendar;
 use tickvault_core::auth::secret_manager::fetch_groww_access_token;
 use tickvault_core::feed::groww::instruments::stable_index_security_id;
-use tickvault_core::feed::groww::native::watch_reader::{
-    WatchFileDoc, WatchFileKind, parse_watch_file,
-};
+use tickvault_core::feed::groww::watch_reader::{WatchFileDoc, WatchFileKind, parse_watch_file};
 use tickvault_core::instrument::index_extractor::canonicalize_index_symbol;
 use tickvault_core::notification::{NotificationEvent, NotificationService};
 use tickvault_storage::disk_health_watcher::classify_join_exit;
@@ -140,6 +154,13 @@ use tickvault_storage::spot_1m_rest_persistence::{
 };
 
 use crate::dhan_intraday_parse::MinuteCandle;
+// The 2026-07-14 burst auto-ladder: shared tier/demotion state, the
+// tier-dependent wave delay + stagger schedule, and the pre-boundary
+// warm-up sender.
+use crate::groww_rest_burst::{
+    GrowwRestBurstState, intra_wave_stagger_ms, send_warmup_get, spot_wave_fire_delay_ms,
+    wave_sleep_from_now_ms,
+};
 // The session-boundary scheduling primitives + edge tracker + body-cap
 // helpers are REUSED from the Dhan spot leg (they are NSE-session facts and
 // pure state machines — the option_chain_1m_boot precedent).
@@ -186,14 +207,19 @@ pub struct GrowwSpot1mTaskParams {
     pub calendar: Arc<TradingCalendar>,
     /// QuestDB target for the `spot_1m_rest` + `rest_fetch_audit` tables.
     pub questdb: QuestDbConfig,
-    /// Chain-leg sequencing signal (PR-3): the boundary seconds-of-day this
-    /// leg just finished firing, published UNCONDITIONALLY at the END of
-    /// every fire — success OR failure — via `send_replace` (never errors;
-    /// the Dhan seam's exact semantics: the chain must never block on a
-    /// failing spot leg, and its own fallback timer covers a dead/disabled
-    /// one). `None` when the chain leg is disabled — zero publishes, the
-    /// loop stays byte-identical to PR-2.
-    pub minute_done_tx: Option<tokio::sync::watch::Sender<Option<u32>>>,
+    /// The shared 2026-07-14 burst auto-ladder state (tier + session
+    /// demotion flag + warm-up toggle) — one `Arc` across the spot, chain
+    /// and contract legs so a 429 on ANY leg demotes them all. (The PR-3
+    /// spot→chain minute-done signal was RETIRED by the auto-ladder — the
+    /// chain leg fires on its own minute-boundary timer.)
+    pub burst: Arc<GrowwRestBurstState>,
+    /// Order-runtime mark tap (dry-run PR, 2026-07-14; re-homed 2026-07-16
+    /// after the Groww live feed retired): `Some` ONLY when
+    /// `[order_runtime].enabled`. Marks are the OWN-FIRE just-closed-minute
+    /// candle CLOSES, forwarded AFTER the persist flush ACK — backfill,
+    /// sweep and warm-up NEVER produce marks (stale prices must not fill
+    /// paper orders). `None` ⇒ the tap is structurally absent (no-op).
+    pub mark_forwarder: Option<crate::order_runtime::MarkForwarder>,
 }
 
 // ---------------------------------------------------------------------------
@@ -298,7 +324,7 @@ fn vix_target_from_watch_doc(doc: &WatchFileDoc, expected_date: &str) -> Option<
 // TEST-EXEMPT: thin fs-read shim — the parse + match + fail-closed arms are the pure vix_target_from_watch_doc, unit-tested below.
 fn try_resolve_vix_target(trading_date: NaiveDate) -> Option<GrowwSpotTarget> {
     let date = trading_date.format("%Y-%m-%d").to_string();
-    let path = crate::groww_native_shadow::watch_file_path_for(Path::new(GROWW_DATA_DIR), &date);
+    let path = crate::groww_watch_paths::watch_file_path_for(Path::new(GROWW_DATA_DIR), &date);
     let json = std::fs::read_to_string(&path).ok()?;
     let doc = parse_watch_file(&json).ok()?;
     vix_target_from_watch_doc(&doc, &date)
@@ -562,6 +588,80 @@ fn parse_groww_1m_candles(body: &str) -> (Vec<MinuteCandle>, GrowwParseStats) {
     (candles, stats)
 }
 
+/// A 2xx body carrying Groww's FAILURE envelope
+/// (`{"status":"FAILURE","error":{code,message,metadata}}` — wire codes
+/// GA000/GA001/GA003–GA007 per `docs/groww-ref/16-orders-margins-portfolio.md`
+/// §5; the envelope wins over the HTTP status). Detected by the G1 fix
+/// (2026-07-14) so the ladder classifies it as an ERROR rung, never a
+/// benign target-absent. `ga_code` is FORENSICS-ONLY — policy never
+/// branches on its value.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct GrowwGaFailure {
+    /// The GA wire code, bounded ≤16 chars; `"none"` when absent.
+    pub(crate) ga_code: String,
+    /// The raw `error.message` — callers MUST redact via
+    /// `capture_rest_error_body` before logging.
+    pub(crate) message: String,
+}
+
+/// Sniff the Groww FAILURE envelope from a 2xx body. `None` for SUCCESS /
+/// bare-candles / non-JSON bodies (those keep their existing paths). Pure,
+/// panic-free on hostile input (serde_json value walking, bounded fields).
+pub(crate) fn parse_groww_ga_failure(body: &str) -> Option<GrowwGaFailure> {
+    /// GA wire codes are 5 chars (`GA005`); 16 bounds a hostile field.
+    const GA_CODE_MAX_CHARS: usize = 16;
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    if v.get("status").and_then(|s| s.as_str()) != Some("FAILURE") {
+        return None;
+    }
+    let err = v.get("error");
+    // Sanitize BEFORE bounding (2026-07-14 security review): the code
+    // flows into tracing fields, so only `[A-Za-z0-9_-]` survives — no
+    // newlines/ANSI/BiDi/quotes can reach a log line. Empty (absent or
+    // fully filtered) → "none".
+    let ga_code = err
+        .and_then(|e| e.get("code"))
+        .and_then(|c| c.as_str())
+        .map(|c| {
+            c.chars()
+                .filter(|ch| ch.is_ascii_alphanumeric() || *ch == '_' || *ch == '-')
+                .take(GA_CODE_MAX_CHARS)
+                .collect::<String>()
+        })
+        .filter(|c| !c.is_empty())
+        .unwrap_or_else(|| "none".to_string());
+    let message = err
+        .and_then(|e| e.get("message"))
+        .and_then(|m| m.as_str())
+        .unwrap_or_default()
+        .to_string();
+    Some(GrowwGaFailure { ga_code, message })
+}
+
+/// One sweep-time 2xx body's classification (G1, 2026-07-14): the FAILURE
+/// envelope is a FAILED sweep fetch — the single choke point that keeps
+/// the ~15:31 post-session sweep from dressing a broker reject as
+/// "answered 200 without the minute" vendor absence (`named_gap`). Pure.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum SweepBodyVerdict {
+    /// The Groww FAILURE envelope — classify the sweep fetch FAILED
+    /// (outcome `error`, class `"ga_failure"`, the real 200 status).
+    GaFailure(GrowwGaFailure),
+    /// A candle body — proceed to minute selection (absent minutes stay
+    /// honest `named_gap` vendor absence).
+    Candles(Vec<MinuteCandle>, GrowwParseStats),
+}
+
+/// Classify one sweep 2xx body — the sniff runs BEFORE candle parsing,
+/// mirroring the per-minute ladder arm. Pure.
+pub(crate) fn classify_sweep_body(body: &str) -> SweepBodyVerdict {
+    if let Some(ga) = parse_groww_ga_failure(body) {
+        return SweepBodyVerdict::GaFailure(ga);
+    }
+    let (candles, stats) = parse_groww_1m_candles(body);
+    SweepBodyVerdict::Candles(candles, stats)
+}
+
 /// The SHARED candle-tuple parser (PR-4 refactor — one wire parser, two
 /// consumers): identical envelope/row/timestamp semantics to the original
 /// spot parser, PLUS the `oi` element (tuple[6], tolerant: absent/null →
@@ -573,6 +673,15 @@ pub(crate) fn parse_groww_1m_candle_rows(body: &str) -> (Vec<GrowwCandleRow>, Gr
         return (Vec::new(), stats);
     };
     if v.get("status").and_then(|s| s.as_str()) == Some("FAILURE") {
+        // Typed reject, zero malformed. NOTE (G1, 2026-07-14): the spot
+        // leg sniffs this envelope BEFORE calling this parser at BOTH its
+        // fetch sites — the per-minute ladder (`parse_groww_ga_failure`)
+        // and the ~15:31 post-session sweep (`classify_sweep_body`) — and
+        // classifies the fetch as an ERROR, so this empty return is no
+        // longer a spot-leg classification path. The CONTRACT leg
+        // (`groww_contract_1m_boot.rs`) is the ONLY remaining production
+        // consumer that reaches it (verified by grep 2026-07-14; flagged
+        // follow-up).
         return (Vec::new(), stats);
     }
     let candles = v
@@ -804,6 +913,22 @@ fn groww_retry_sleep_deltas_ms() -> [u64; 4] {
         o[2].saturating_sub(o[1]),
         o[3].saturating_sub(o[2]),
     ]
+}
+
+/// The sleep before ladder attempt `attempt` (1-based rung index), with
+/// the HIGH-1 (2026-07-14) per-target rung jitter folded in: the jitter
+/// is added ONCE, before the FIRST rung, which shifts the target's
+/// ENTIRE rung schedule by `rung_jitter_ms` (rung k lands at
+/// `offset_k + jitter` — the Dhan-leg slot-jitter precedent), so the 4
+/// concurrent targets never re-poll in lockstep on a correlated
+/// vendor-lag minute. Applied in ALL tiers. Pure.
+fn rung_sleep_delta_ms(deltas: &[u64; 4], attempt: usize, rung_jitter_ms: u64) -> u64 {
+    let base = deltas[attempt - 1];
+    if attempt == 1 {
+        base.saturating_add(rung_jitter_ms)
+    } else {
+        base
+    }
 }
 
 /// `true` when an SSM re-read of the shared token is allowed — the
@@ -1059,9 +1184,13 @@ enum SymbolFetchOutcome {
     Empty {
         backfill_candle: Option<MinuteCandle>,
     },
-    /// The last attempt (transport / non-2xx) failure, bounded + redacted.
+    /// The last attempt's failure (transport / non-2xx / a 2xx carrying
+    /// the Groww FAILURE envelope — G1, 2026-07-14), bounded + redacted.
+    /// `ga_code` carries the FINAL failure's GA wire code when that
+    /// failure was a 2xx FAILURE envelope — forensics only, never policy.
     Failed {
         reason: String,
+        ga_code: Option<String>,
         backfill_candle: Option<MinuteCandle>,
     },
 }
@@ -1196,9 +1325,14 @@ async fn fetch_minute_with_ladder(
     target_minute_ist_nanos: i64,
     backfill_minute_ist_nanos: Option<i64>,
     minute_close_ms_of_day: i64,
+    rung_jitter_ms: u64,
 ) -> (SymbolFetchOutcome, LadderForensics) {
     let deltas = groww_retry_sleep_deltas_ms();
     let mut last_error: Option<String> = None;
+    // G1 (2026-07-14): the FINAL failure's GA wire code, when that failure
+    // was a 2xx FAILURE envelope. Mirrors `last_error` semantics — a later
+    // clean 2xx or HTTP-level failure clears it. Forensics only.
+    let mut last_ga_code: Option<String> = None;
     let mut backfill_found: Option<MinuteCandle> = None;
     let mut forensics = LadderForensics {
         error_class: "none",
@@ -1206,7 +1340,12 @@ async fn fetch_minute_with_ladder(
     };
     for attempt in 0..=deltas.len() {
         if attempt > 0 {
-            tokio::time::sleep(Duration::from_millis(deltas[attempt - 1])).await;
+            tokio::time::sleep(Duration::from_millis(rung_sleep_delta_ms(
+                &deltas,
+                attempt,
+                rung_jitter_ms,
+            )))
+            .await;
         }
         let started = std::time::Instant::now();
         let result = groww_fetch_once(client, url, query, token).await;
@@ -1217,6 +1356,25 @@ async fn fetch_minute_with_ladder(
         forensics.final_latency_ms = latency_ms;
         match result {
             Ok(body_text) => {
+                // G1 (2026-07-14): a 2xx whose body is the Groww FAILURE
+                // envelope is an ERROR rung, never a benign target-absent —
+                // the envelope wins over the HTTP status
+                // (docs/groww-ref/16 §5). The bounded next rung re-polls
+                // exactly like any non-auth HTTP failure; the GA code is
+                // forensics-only (policy never branches on it — no
+                // short-circuit even on GA005; auth short-circuit stays
+                // HTTP-401/403-only).
+                if let Some(ga) = parse_groww_ga_failure(&body_text) {
+                    forensics.final_http_status = 200;
+                    forensics.error_class = "ga_failure";
+                    let captured = capture_rest_error_body(&ga.message);
+                    last_error = Some(format!(
+                        "2xx FAILURE envelope ga_code={} msg={captured}",
+                        ga.ga_code
+                    ));
+                    last_ga_code = Some(ga.ga_code);
+                    continue;
+                }
                 forensics.final_http_status = 200;
                 forensics.error_class = "none";
                 let (candles, stats) = parse_groww_1m_candles(&body_text);
@@ -1257,6 +1415,7 @@ async fn fetch_minute_with_ladder(
                 // whole ladder ends target-absent.
                 forensics.error_class = "target_absent";
                 last_error = None;
+                last_ga_code = None;
             }
             Err(failure) => {
                 if failure.rate_limited {
@@ -1266,6 +1425,7 @@ async fn fetch_minute_with_ladder(
                 forensics.final_http_status = failure.status;
                 forensics.error_class = error_class_for_status(failure.status);
                 last_error = Some(failure.msg);
+                last_ga_code = None;
                 if failure.auth_rejected {
                     // Item 12: an auth-class reject dooms every further
                     // rung with the same token — abort the ladder NOW; the
@@ -1279,6 +1439,7 @@ async fn fetch_minute_with_ladder(
     let outcome = match last_error {
         Some(reason) => SymbolFetchOutcome::Failed {
             reason,
+            ga_code: last_ga_code,
             backfill_candle: backfill_found,
         },
         None => SymbolFetchOutcome::Empty {
@@ -1308,6 +1469,7 @@ async fn fetch_minute_bounded(
     target_minute_ist_nanos: i64,
     backfill_minute_ist_nanos: Option<i64>,
     minute_close_ms_of_day: i64,
+    rung_jitter_ms: u64,
 ) -> (SymbolFetchOutcome, LadderForensics) {
     match tokio::time::timeout(
         Duration::from_secs(GROWW_SPOT_1M_SYMBOL_BUDGET_SECS),
@@ -1319,6 +1481,7 @@ async fn fetch_minute_bounded(
             target_minute_ist_nanos,
             backfill_minute_ist_nanos,
             minute_close_ms_of_day,
+            rung_jitter_ms,
         ),
     )
     .await
@@ -1331,6 +1494,7 @@ async fn fetch_minute_bounded(
                     reason: format!(
                         "ladder budget exceeded ({GROWW_SPOT_1M_SYMBOL_BUDGET_SECS}s) — peer stalling"
                     ),
+                    ga_code: None,
                     backfill_candle: None,
                 },
                 LadderForensics {
@@ -1427,40 +1591,6 @@ fn build_fetch_audit_row(
     }
 }
 
-/// Forensics rows for the targets SKIPPED after an auth-class reject
-/// short-circuited the fire (hostile round 1 item 12): no request is ever
-/// sent for them with the dead token — outcome `no_token`, class `auth`,
-/// 0/-1 sentinels (no HTTP happened). Pure — unit-tested below.
-fn build_auth_short_circuit_rows(
-    remaining: &[GrowwSpotTarget],
-    target_minute_ist_nanos: i64,
-    trading_date_nanos: i64,
-) -> Vec<RestFetchAuditRow> {
-    let forensics = LadderForensics {
-        attempts: 0,
-        rate_limited_count: 0,
-        final_http_status: 0,
-        final_latency_ms: -1,
-        error_class: "auth",
-        auth_rejected: true,
-    };
-    remaining
-        .iter()
-        .map(|target| {
-            build_fetch_audit_row(
-                target_minute_ist_nanos,
-                trading_date_nanos,
-                target.security_id,
-                target.symbol,
-                &forensics,
-                RestFetchOutcome::NoToken,
-                -1,
-                "auth",
-            )
-        })
-        .collect()
-}
-
 /// Best-effort forensics append: a failure logs (coded) + counts and
 /// RETURNS — the fetch loop, the verdict and the failure edge are never
 /// affected by the forensics leg.
@@ -1517,7 +1647,7 @@ pub async fn run_groww_spot_1m(params: GrowwSpot1mTaskParams) {
     // the exact TLS/resolver churn HTTP-CLIENT-01 §0 condemns); NEVER a
     // `Client::new()` panic fallback.
     let client = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(GROWW_SPOT_1M_REQUEST_TIMEOUT_SECS))
+        .timeout(Duration::from_millis(GROWW_SPOT_1M_REQUEST_TIMEOUT_MS))
         .redirect(reqwest::redirect::Policy::none())
         .build()
     {
@@ -1562,10 +1692,12 @@ pub async fn run_groww_spot_1m(params: GrowwSpot1mTaskParams) {
     let mut first_covered: Option<i64> = None;
     info!(
         core_symbols = GROWW_SPOT_1M_SYMBOLS.len(),
+        tier = params.burst.effective_tier().as_str(),
+        warm_up = params.burst.warm_up_enabled(),
         "groww_spot_1m: per-minute fetch loop armed (fires each minute close \
-         09:16:00-15:30:00 IST, ~0.3-1.3s after the boundary; sequential \
-         target pacing; INDIA VIX joins as the 4th target once \
-         runtime-resolved — 2026-07-13 operator scope)"
+         09:16:00-15:30:00 IST as ONE concurrent wave at the tier delay — \
+         2026-07-14 burst auto-ladder; INDIA VIX joins as the 4th target \
+         once runtime-resolved — 2026-07-13 operator scope)"
     );
 
     loop {
@@ -1602,9 +1734,52 @@ pub async fn run_groww_spot_1m(params: GrowwSpot1mTaskParams) {
             .await;
             return;
         };
-        let sleep_ms =
-            u64::from(fire.saturating_sub(now)).saturating_mul(1_000) + GROWW_SPOT_1M_FIRE_DELAY_MS;
-        tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
+        // 2026-07-14 auto-ladder: the spot wave fires at the TIER delay
+        // (two_wave: close+1,350 ms — more than a rolling second after the
+        // chain wave; seven_concurrent: close+300 ms). The optional
+        // pre-boundary warm-up GET (boundary−4 s, 3 s-bounded,
+        // unauthenticated — see `send_warmup_get`) re-establishes an
+        // idle-closed TLS connection before the critical window.
+        // CRITICAL-1 (2026-07-14 fix round): EVERY wake instant — the
+        // warm-up lead AND the wave itself — is computed from the
+        // MILLISECOND clock (`wave_sleep_from_now_ms`), never by summing
+        // a whole-second boundary gap with the delay: the pre-fix else
+        // branch woke at `fire + frac(now) + delay`, and the two legs'
+        // independent fractional offsets could collapse the load-bearing
+        // 1,050 ms wave separation to ~51 ms.
+        let wave_delay_ms = spot_wave_fire_delay_ms(params.burst.effective_tier());
+        let warmup_lead_ms = GROWW_REST_WARMUP_LEAD_SECS.saturating_mul(1_000);
+        let warmup_sleep_ms = wave_sleep_from_now_ms(
+            fire,
+            -i64::try_from(warmup_lead_ms).unwrap_or(0),
+            ist_millis_of_day_now(),
+        );
+        if params.burst.warm_up_enabled() && warmup_sleep_ms > 0 {
+            tokio::time::sleep(Duration::from_millis(warmup_sleep_ms)).await;
+            if let Some(first) = targets.first() {
+                let warmup_query = groww_candles_query(
+                    &first.groww_symbol,
+                    &first.exchange,
+                    &first.segment,
+                    iter_date,
+                );
+                send_warmup_get(
+                    &client,
+                    GROWW_HISTORICAL_CANDLES_URL,
+                    &warmup_query,
+                    "spot_1m",
+                )
+                .await;
+            }
+        }
+        let remaining_ms = wave_sleep_from_now_ms(
+            fire,
+            i64::try_from(wave_delay_ms).unwrap_or(0),
+            ist_millis_of_day_now(),
+        );
+        if remaining_ms > 0 {
+            tokio::time::sleep(Duration::from_millis(remaining_ms)).await;
+        }
 
         // Staleness gate: a suspend / clock step can wake us far past the
         // boundary. Skip + recompute; every boundary that elapsed while
@@ -1655,13 +1830,6 @@ pub async fn run_groww_spot_1m(params: GrowwSpot1mTaskParams) {
         )
         .await;
         last_fired = Some(fire);
-        // Chain-leg sequencing (PR-3): publish this fire's boundary
-        // UNCONDITIONALLY — success OR failure (the chain must never block
-        // on a failing spot leg; the Dhan seam's semantics). `send_replace`
-        // never errors; no receiver = no cost.
-        if let Some(tx) = &params.minute_done_tx {
-            tx.send_replace(Some(fire));
-        }
         // H2 overrun accounting: boundaries that fully elapsed DURING the
         // fire can never be fetched — count them loudly + feed the edge.
         let after = ist_secs_of_day_now();
@@ -1799,6 +1967,20 @@ async fn fire_one_minute(
 ) {
     let minute_open_secs = fire_secs_of_day.saturating_sub(60);
     let minute_label = format_minute_ist_12h(minute_open_secs);
+    // TRAP-A (2026-07-15, Groww live-feed retirement): per-fire liveness
+    // heartbeat for the re-pointed market-hours liveness alarm
+    // (market-hours-liveness-alarm.tf, treat_missing_data = "breaching").
+    // Set ONCE per per-minute fire, deliberately NOT pre-registered at
+    // boot — the first set at the 09:16:01 IST fire IS the session-start
+    // signal (a pre-registered 0 would satisfy the alarm while the legs
+    // never fire); metrics-exporter-prometheus re-renders the last value
+    // on every scrape thereafter, so a wedged/dead process — or a session
+    // where NO leg ever fired — goes MISSING in-window and pages. HONEST
+    // BOUND (2026-07-15, R1-2): the re-render means legs dying MID-SESSION
+    // after the first fire keep the gauge published — that class is owned
+    // by the legs' own escalation pages, not this alarm. The 1.0 is a
+    // constant marker — only sample PRESENCE matters.
+    metrics::gauge!("tv_rest_1m_fire_heartbeat").set(1.0);
     let trading_date = today_ist();
     let trading_date_nanos = minute_open_ist_nanos(trading_date, 0);
     let target_nanos = minute_open_ist_nanos(trading_date, minute_open_secs);
@@ -1818,6 +2000,9 @@ async fn fire_one_minute(
     let mut tally = MinuteEdgeTally::default();
     let mut implausible_count: usize = 0;
     let mut sample_failure: Option<String> = None;
+    // G1 (2026-07-14): the GA wire code paired with `sample_failure` when
+    // that failure was a 2xx FAILURE envelope — forensics only.
+    let mut sample_ga_code: Option<String> = None;
     // Minutes appended this fire, committed to the tracker ONLY after the
     // flush confirms (a failed flush discards the buffer — never a false
     // watermark advance).
@@ -1826,10 +2011,30 @@ async fn fire_one_minute(
     // data flush ACK, then stamped with the real close_to_persist_ms (a
     // failed flush discards them — the flush_failed rows are the truth).
     let mut held_ok_rows: Vec<RestFetchAuditRow> = Vec::new();
+    // 2026-07-16 REST-era candle derivation: bars staged for the fold-writer
+    // handoff — sent ONLY after the flush ACK confirms persistence.
+    let mut confirmed_bars: Vec<crate::rest_candle_fold::ConfirmedBar> = Vec::new();
+    // Order-runtime mark tap (re-homed 2026-07-16): OWN-FIRE just-closed-
+    // minute closes ONLY, staged here and forwarded AFTER the flush ACK
+    // (persist-confirm choke point — mirrors the fold hook placement). The
+    // BACKFILL branch below and the post-session sweep NEVER stage marks:
+    // a >60s-old repaired price must not fill a paper order (the C11
+    // replay-window lesson applied to the REST legs). Cold path (once per
+    // minute) — the Vec is fine; the forward itself is a lock-free
+    // best-effort try_send that no-ops when the runtime is disabled.
+    let mut staged_marks: Vec<crate::order_runtime::MarkUpdate> = Vec::new();
 
     if let Some(token) = token_cache.ensure_token().await {
+        // 2026-07-14 auto-ladder: the WAVE — all targets fetch
+        // CONCURRENTLY (JoinSet; each task owns cheap handle clones), a
+        // demoted two_wave session staggers slots by 350 ms. The 429
+        // demotion + tier counter are recorded from the collected
+        // forensics below.
+        let tier = params.burst.effective_tier();
+        metrics::counter!("tv_groww_rest_burst_tier_total", "tier" => tier.as_str()).increment(1);
+        let mut wave: tokio::task::JoinSet<(usize, SymbolFetchOutcome, LadderForensics)> =
+            tokio::task::JoinSet::new();
         for (idx, target) in targets.iter().enumerate() {
-            let security_id = target.security_id;
             let query = groww_candles_query(
                 &target.groww_symbol,
                 &target.exchange,
@@ -1837,20 +2042,91 @@ async fn fire_one_minute(
                 trading_date,
             );
             let backfill_nanos = backfill_minute_nanos(
-                tracker.last_persisted(security_id),
+                tracker.last_persisted(target.security_id),
                 target_nanos,
                 session_first_nanos,
             );
-            let (outcome, forensics) = fetch_minute_bounded(
-                client,
-                GROWW_HISTORICAL_CANDLES_URL,
-                &query,
-                &token,
-                target_nanos,
-                backfill_nanos,
-                minute_close_ms,
-            )
-            .await;
+            let wave_client = client.clone();
+            let wave_token = token.clone();
+            // The sequential floor spans a whole per-target budget per
+            // slot (review MEDIUM-1 2026-07-14).
+            let stagger_ms =
+                intra_wave_stagger_ms(tier, idx, GROWW_SPOT_1M_SYMBOL_BUDGET_SECS * 1_000);
+            // HIGH-1 (2026-07-14): deterministic per-target rung jitter
+            // in ALL tiers — slot j shifts its rung schedule by j×150 ms
+            // so correlated vendor-lag re-polls never fire in lockstep.
+            let rung_jitter_ms = (idx as u64).saturating_mul(GROWW_REST_RUNG_JITTER_STEP_MS);
+            wave.spawn(async move {
+                if stagger_ms > 0 {
+                    tokio::time::sleep(Duration::from_millis(stagger_ms)).await;
+                }
+                let (outcome, forensics) = fetch_minute_bounded(
+                    &wave_client,
+                    GROWW_HISTORICAL_CANDLES_URL,
+                    &query,
+                    &wave_token,
+                    target_nanos,
+                    backfill_nanos,
+                    minute_close_ms,
+                    rung_jitter_ms,
+                )
+                .await;
+                (idx, outcome, forensics)
+            });
+        }
+        // Collect the wave back into TARGET ORDER so the persist / audit
+        // / verdict pipeline below stays deterministic.
+        let mut results: Vec<Option<(SymbolFetchOutcome, LadderForensics)>> =
+            (0..targets.len()).map(|_| None).collect();
+        while let Some(joined) = wave.join_next().await {
+            match joined {
+                Ok((idx, outcome, forensics)) => {
+                    if let Some(slot) = results.get_mut(idx) {
+                        *slot = Some((outcome, forensics));
+                    }
+                }
+                Err(join_err) => {
+                    // Unwind builds only (release aborts on panic): the
+                    // lost slot stays None and is synthesized as a Failed
+                    // outcome below — never a silent missing target.
+                    error!(
+                        code = ErrorCode::Spot1m01FetchDegraded.code_str(),
+                        stage = "wave_task_failed",
+                        feed = SPOT_1M_REST_FEED_GROWW,
+                        ?join_err,
+                        "SPOT1M-01: a wave fetch task failed to join — its \
+                         target counts as failed for this minute"
+                    );
+                }
+            }
+        }
+        let mut any_auth_rejected = false;
+        let mut any_rate_limited = false;
+        for (idx, target) in targets.iter().enumerate() {
+            let security_id = target.security_id;
+            let (outcome, forensics) =
+                results
+                    .get_mut(idx)
+                    .and_then(Option::take)
+                    .unwrap_or_else(|| {
+                        (
+                            SymbolFetchOutcome::Failed {
+                                reason: "wave fetch task failed to join".to_string(),
+                                ga_code: None,
+                                backfill_candle: None,
+                            },
+                            LadderForensics {
+                                attempts: 0,
+                                rate_limited_count: 0,
+                                final_http_status: 0,
+                                final_latency_ms: -1,
+                                error_class: "task_failed",
+                                auth_rejected: false,
+                            },
+                        )
+                    });
+            any_auth_rejected |= forensics.auth_rejected;
+            any_rate_limited |= forensics.rate_limited_count > 0;
 
             // Forensics row (success AND failure) — best-effort, the
             // verdict below is computed independently. GAP-11 persist
@@ -1919,13 +2195,17 @@ async fn fire_one_minute(
                 }
                 SymbolFetchOutcome::Failed {
                     reason,
+                    ga_code,
                     backfill_candle,
                 } => {
                     error_count = error_count.saturating_add(1);
                     metrics::counter!("tv_groww_spot1m_fetch_total", "outcome" => "error")
                         .increment(1);
                     if sample_failure.is_none() {
+                        // The ga_code sample stays PAIRED with the failure
+                        // sample it describes (G1, 2026-07-14).
                         sample_failure = Some(format!("{}: {reason}", target.groww_symbol));
+                        sample_ga_code = ga_code;
                     }
                     (None, backfill_candle)
                 }
@@ -1985,6 +2265,31 @@ async fn fire_one_minute(
                         held_ok_rows.push(row);
                     }
                     staged.push((security_id, candle.minute_ts_ist_nanos));
+                    if let Ok(sid_u64) = u64::try_from(security_id) {
+                        confirmed_bars.push(
+                            crate::rest_candle_fold::ConfirmedBar::from_minute_candle(
+                                Feed::Groww,
+                                sid_u64,
+                                tickvault_common::constants::EXCHANGE_SEGMENT_IDX_I,
+                                &candle,
+                            ),
+                        );
+                        // Mark tap: OWN-FIRE close only (this is the just-
+                        // closed target minute; the backfill branch below
+                        // deliberately stages NO mark).
+                        #[allow(clippy::cast_possible_truncation)]
+                        // APPROVED: MarkUpdate carries f32 by contract (the
+                        // wire LTP precision); price-level narrowing only.
+                        staged_marks.push(crate::order_runtime::MarkUpdate {
+                            security_id: sid_u64,
+                            segment_code: tickvault_common::constants::EXCHANGE_SEGMENT_IDX_I,
+                            price: candle.close as f32,
+                        });
+                    } else {
+                        // Round-2 LOW-6: never a silent skip — counted +
+                        // one coalesced warn (defensive; ids are positive).
+                        crate::rest_candle_fold::note_unfoldable_identity(Feed::Groww, security_id);
+                    }
                 }
             }
             if let Some(backfill) = backfill_candle {
@@ -2044,34 +2349,47 @@ async fn fire_one_minute(
                         "none",
                     ));
                     staged.push((security_id, backfill.minute_ts_ist_nanos));
-                }
-            }
-            if forensics.auth_rejected {
-                // Item 12: drop the dead token NOW and short-circuit the
-                // remaining symbols for THIS fire — every further request
-                // with the same rejected token is a doomed 401 (~15 wasted
-                // rejects worst case). The next fire's ensure_token
-                // re-reads SSM at the ≥60s floor (unchanged); NEVER a mint.
-                token_cache.note_auth_rejected();
-                let remaining = &targets[idx + 1..];
-                if !remaining.is_empty() {
-                    error_count = error_count.saturating_add(remaining.len());
-                    warn!(
-                        skipped_symbols = remaining.len(),
-                        "groww_spot_1m: auth-class reject — remaining symbols \
-                         short-circuited for this fire (no doomed requests); \
-                         forensics rows still emitted"
-                    );
-                    for row in
-                        build_auth_short_circuit_rows(remaining, target_nanos, trading_date_nanos)
-                    {
-                        metrics::counter!("tv_groww_spot1m_fetch_total", "outcome" => "error")
-                            .increment(1);
-                        audit_append_best_effort(audit_writer, &row);
+                    if let Ok(sid_u64) = u64::try_from(security_id) {
+                        confirmed_bars.push(
+                            crate::rest_candle_fold::ConfirmedBar::from_minute_candle(
+                                Feed::Groww,
+                                sid_u64,
+                                tickvault_common::constants::EXCHANGE_SEGMENT_IDX_I,
+                                &backfill,
+                            ),
+                        );
+                    } else {
+                        // Round-2 LOW-6: never a silent skip — counted +
+                        // one coalesced warn (defensive; ids are positive).
+                        crate::rest_candle_fold::note_unfoldable_identity(Feed::Groww, security_id);
                     }
                 }
-                break;
             }
+        }
+        if any_auth_rejected {
+            // Item 12 (auto-ladder form): the wave already fired
+            // concurrently, so there are no "remaining" targets to
+            // short-circuit — each target's OWN ladder aborted on its
+            // 401/403 (≤ 4 doomed requests, not 4 × 5). Drop the dead
+            // token so the NEXT fire's ensure_token re-reads SSM at the
+            // ≥60 s floor (unchanged); NEVER a mint.
+            token_cache.note_auth_rejected();
+        }
+        if any_rate_limited && params.burst.note_rate_limited() {
+            // The session's DEMOTION EDGE (exactly once): the burst tier
+            // steps down for every subsequent minute — seven_concurrent →
+            // two_wave, two_wave → staggered two_wave. Boot restores the
+            // configured tier.
+            warn!(
+                code = ErrorCode::Spot1m01FetchDegraded.code_str(),
+                stage = "burst_demoted",
+                feed = SPOT_1M_REST_FEED_GROWW,
+                minute = %minute_label,
+                demoted_to = params.burst.effective_tier().as_str(),
+                "SPOT1M-01: HTTP 429 on the Groww spot wave — burst tier \
+                 auto-demoted for the rest of the session (restart restores \
+                 the configured tier)"
+            );
         }
         let flush_result = writer.flush();
         if let Err(err) = &flush_result {
@@ -2116,6 +2434,19 @@ async fn fire_one_minute(
             // Flush confirmed — advance the per-symbol persisted watermark.
             for (security_id, minute_nanos) in staged {
                 tracker.commit(security_id, minute_nanos);
+            }
+            // 2026-07-16 REST-era candle derivation: the bars are now
+            // persist-CONFIRMED — hand them to the fold writer.
+            crate::rest_candle_fold::send_confirmed_bars(&confirmed_bars);
+            // Order-runtime mark tap: forward the OWN-FIRE closes now that
+            // the flush ACK confirmed persistence (a mark must never
+            // reference a price the audit record does not back). Best-effort
+            // try_send; a full channel drops the mark (counted — the next
+            // minute supersedes it); None ⇒ runtime disabled, zero work.
+            if let Some(forwarder) = params.mark_forwarder.as_ref() {
+                for mark in &staged_marks {
+                    forwarder.mark_forward(mark.security_id, mark.segment_code, mark.price);
+                }
             }
         }
         // GAP-11: the ok rows land ONLY after (and stamped with) the data
@@ -2186,6 +2517,7 @@ async fn fire_one_minute(
         persist_failed,
         tally,
         sample_failure.as_deref(),
+        sample_ga_code.as_deref(),
     );
 }
 
@@ -2205,9 +2537,11 @@ fn record_minute_verdict(
     persist_failed: bool,
     tally: MinuteEdgeTally,
     sample_failure: Option<&str>,
+    sample_ga_code: Option<&str>,
 ) {
     let fully_failed = tally.fully_failed();
     let action = edge.record_minute(fully_failed);
+    let ga_code = sample_ga_code.unwrap_or("none");
     match action {
         EdgeAction::Page { consecutive } => {
             error!(
@@ -2216,6 +2550,7 @@ fn record_minute_verdict(
                 feed = SPOT_1M_REST_FEED_GROWW,
                 consecutive,
                 minute = minute_label,
+                ga_code,
                 sample = sample_failure.unwrap_or("none captured"),
                 "SPOT1M-01: Groww per-minute spot fetch fully failed for \
                  consecutive minutes — paging (edge-triggered)"
@@ -2254,6 +2589,7 @@ fn record_minute_verdict(
                     errors = error_count,
                     empty = empty_count,
                     persist_failed,
+                    ga_code,
                     sample = sample_failure.unwrap_or("none captured"),
                     "SPOT1M-01: Groww per-minute spot fetch degraded for this minute"
                 );
@@ -2319,6 +2655,9 @@ async fn run_post_session_sweep(
     let mut still_missing: u64 = 0;
     let mut pre_boot_named: u64 = 0;
     let mut staged: Vec<(i64, i64)> = Vec::new();
+    // 2026-07-16 REST-era candle derivation: swept bars staged for the
+    // fold-writer handoff — sent ONLY after the flush ACK confirms.
+    let mut confirmed_bars: Vec<crate::rest_candle_fold::ConfirmedBar> = Vec::new();
     let mut persist_failed = false;
     for target in targets {
         let security_id = target.security_id;
@@ -2388,11 +2727,41 @@ async fn run_post_session_sweep(
         );
         let candles =
             match groww_fetch_once(client, GROWW_HISTORICAL_CANDLES_URL, &query, token).await {
-                Ok(body_text) => {
-                    let (candles, stats) = parse_groww_1m_candles(&body_text);
-                    record_parse_stats(stats);
-                    candles
-                }
+                Ok(body_text) => match classify_sweep_body(&body_text) {
+                    // G1 (2026-07-14): a sweep-time 2xx FAILURE envelope is
+                    // a FAILED sweep fetch — never "answered 200 without
+                    // the minute" vendor absence. Honest class + the real
+                    // 200 status + the GA code (forensics only).
+                    SweepBodyVerdict::GaFailure(ga) => {
+                        error!(
+                            code = ErrorCode::Spot1m01FetchDegraded.code_str(),
+                            stage = "sweep_failed",
+                            feed = SPOT_1M_REST_FEED_GROWW,
+                            security_id,
+                            ga_code = %ga.ga_code,
+                            reason = %capture_rest_error_body(&ga.message),
+                            "SPOT1M-01: Groww post-session sweep fetch answered \
+                             2xx with a FAILURE envelope — missing minutes stay \
+                             absent (never dressed as vendor absence)"
+                        );
+                        still_missing = still_missing.saturating_add(missing.len() as u64);
+                        record_named_gaps(
+                            audit_writer,
+                            &missing,
+                            trading_date_nanos,
+                            security_id,
+                            target.symbol,
+                            RestFetchOutcome::Error,
+                            "ga_failure",
+                            200,
+                        );
+                        continue;
+                    }
+                    SweepBodyVerdict::Candles(candles, stats) => {
+                        record_parse_stats(stats);
+                        candles
+                    }
+                },
                 Err(failure) => {
                     error!(
                         code = ErrorCode::Spot1m01FetchDegraded.code_str(),
@@ -2459,6 +2828,18 @@ async fn run_post_session_sweep(
             } else {
                 found_for_sid = found_for_sid.saturating_add(1);
                 staged.push((security_id, *minute_nanos));
+                if let Ok(sid_u64) = u64::try_from(security_id) {
+                    confirmed_bars.push(crate::rest_candle_fold::ConfirmedBar::from_minute_candle(
+                        Feed::Groww,
+                        sid_u64,
+                        tickvault_common::constants::EXCHANGE_SEGMENT_IDX_I,
+                        &candle,
+                    ));
+                } else {
+                    // Round-2 LOW-6: never a silent skip — counted + one
+                    // coalesced warn (defensive; ids are positive).
+                    crate::rest_candle_fold::note_unfoldable_identity(Feed::Groww, security_id);
+                }
             }
         }
         // NAMED GAPS: the finally-unrecovered minutes for this symbol —
@@ -2532,6 +2913,10 @@ async fn run_post_session_sweep(
         for (security_id, minute_nanos) in staged {
             tracker.commit(security_id, minute_nanos);
         }
+        // 2026-07-16 REST-era candle derivation: swept bars are now
+        // persist-CONFIRMED — hand them to the fold writer (out-of-order
+        // swept bars mark their day dirty for a refold).
+        crate::rest_candle_fold::send_confirmed_bars(&confirmed_bars);
     }
     audit_flush_best_effort(audit_writer);
     metrics::counter!("tv_groww_spot1m_sweep_backfilled_total").increment(swept);
@@ -3070,6 +3455,94 @@ mod tests {
         assert_eq!(candles.len(), 1);
     }
 
+    /// G1 (2026-07-14): the FAILURE-envelope sniffer extracts the GA wire
+    /// code + message; absent/empty code → `"none"`; hostile oversized code
+    /// bounded; SUCCESS/bare/non-JSON bodies never sniff (their existing
+    /// empty/ok/malformed paths stay untouched).
+    #[test]
+    fn test_parse_groww_ga_failure_envelope_extracts_code_and_message() {
+        let ga = parse_groww_ga_failure(
+            r#"{"status":"FAILURE","error":{"code":"GA005","message":"not authorised","metadata":{}}}"#,
+        )
+        .expect("FAILURE envelope must sniff");
+        assert_eq!(ga.ga_code, "GA005");
+        assert_eq!(ga.message, "not authorised");
+        // Absent error object / code → "none" (tolerated), empty message.
+        let ga = parse_groww_ga_failure(r#"{"status":"FAILURE"}"#)
+            .expect("codeless FAILURE must still sniff");
+        assert_eq!(ga.ga_code, "none");
+        assert!(ga.message.is_empty());
+        // Empty-string code → "none".
+        let ga = parse_groww_ga_failure(r#"{"status":"FAILURE","error":{"code":""}}"#)
+            .expect("empty-code FAILURE must still sniff");
+        assert_eq!(ga.ga_code, "none");
+        // Hostile oversized code → bounded to 16 chars.
+        let hostile = format!(
+            r#"{{"status":"FAILURE","error":{{"code":"{}"}}}}"#,
+            "X".repeat(500)
+        );
+        let ga = parse_groww_ga_failure(&hostile).expect("hostile FAILURE must still sniff");
+        assert_eq!(ga.ga_code.chars().count(), 16, "ga_code must be bounded");
+        // 2026-07-14 security review: newline / ANSI-ESC / quote / BiDi
+        // characters are FILTERED (allowlist [A-Za-z0-9_-]) BEFORE the
+        // bound — control characters can never reach a tracing field.
+        let ga = parse_groww_ga_failure(
+            "{\"status\":\"FAILURE\",\"error\":{\"code\":\"GA0\\n0\\u001b\\\"5\\u202e\"}}",
+        )
+        .expect("control-char code must still sniff");
+        assert_eq!(ga.ga_code, "GA005", "hostile chars filtered, got {ga:?}");
+        // A code that is ONLY hostile chars filters to empty → "none".
+        let ga = parse_groww_ga_failure(
+            "{\"status\":\"FAILURE\",\"error\":{\"code\":\"\\n\\u001b\\u202e\"}}",
+        )
+        .expect("all-hostile code must still sniff");
+        assert_eq!(ga.ga_code, "none");
+        // SUCCESS / bare-candles / non-JSON bodies never sniff.
+        for body in [
+            r#"{"status":"SUCCESS","payload":{"candles":[]}}"#,
+            r#"{"candles":[]}"#,
+            "not json",
+            "{}",
+        ] {
+            assert!(
+                parse_groww_ga_failure(body).is_none(),
+                "body {body:?} must not sniff as a FAILURE envelope"
+            );
+        }
+    }
+
+    /// G1 (2026-07-14, sweep arm): a sweep-time 2xx FAILURE envelope
+    /// classifies `GaFailure` — NEVER the `Candles` arm whose empty set
+    /// would dress a broker reject as `named_gap` vendor absence. A
+    /// normal candle body (and a genuinely empty SUCCESS body) stays on
+    /// the honest `Candles` path.
+    #[test]
+    fn test_sweep_body_ga_failure_never_classifies_as_vendor_absence() {
+        match classify_sweep_body(
+            r#"{"status":"FAILURE","error":{"code":"GA003","message":"unable to serve"}}"#,
+        ) {
+            SweepBodyVerdict::GaFailure(ga) => {
+                assert_eq!(ga.ga_code, "GA003");
+                assert_eq!(ga.message, "unable to serve");
+            }
+            SweepBodyVerdict::Candles(candles, _) => panic!(
+                "sweep-time FAILURE envelope must classify GaFailure — \
+                 an empty Candles set ({candles:?}) would be dressed as \
+                 named_gap vendor absence"
+            ),
+        }
+        // Real candles + a genuinely-empty SUCCESS body take the honest
+        // Candles path (vendor absence stays named_gap).
+        match classify_sweep_body(r#"{"candles":[[1783914300,1.0,2.0,0.5,1.5,0,null]]}"#) {
+            SweepBodyVerdict::Candles(candles, _) => assert_eq!(candles.len(), 1),
+            SweepBodyVerdict::GaFailure(ga) => panic!("candle body must not sniff: {ga:?}"),
+        }
+        match classify_sweep_body(r#"{"status":"SUCCESS","payload":{"candles":[]}}"#) {
+            SweepBodyVerdict::Candles(candles, _) => assert!(candles.is_empty()),
+            SweepBodyVerdict::GaFailure(ga) => panic!("SUCCESS body must not sniff: {ga:?}"),
+        }
+    }
+
     #[test]
     fn test_parse_groww_1m_candles_malformed_rows_skipped_and_counted() {
         let good_ts: i64 = 1_783_914_300;
@@ -3178,6 +3651,27 @@ mod tests {
         }
     }
 
+    /// HIGH-1 (2026-07-14): the per-target rung jitter is added ONCE,
+    /// before the first rung, shifting the target's whole rung schedule
+    /// by `slot × 150 ms` — rung k reconstructs to `offset_k + jitter`
+    /// for every slot, and slot 0 is byte-identical to the unjittered
+    /// schedule.
+    #[test]
+    fn test_rung_sleep_delta_applies_slot_jitter_to_whole_schedule() {
+        let deltas = groww_retry_sleep_deltas_ms();
+        for slot in 0..GROWW_SPOT_1M_SYMBOLS.len() as u64 + 1 {
+            let jitter = slot * GROWW_REST_RUNG_JITTER_STEP_MS;
+            let mut cumulative = 0u64;
+            for (attempt, offset) in (1..=deltas.len()).zip(GROWW_SPOT_1M_RETRY_OFFSETS_MS.iter()) {
+                cumulative += rung_sleep_delta_ms(&deltas, attempt, jitter);
+                assert_eq!(cumulative, *offset + jitter);
+            }
+        }
+        // Slot 0 (jitter 0) reproduces the raw deltas exactly.
+        assert_eq!(rung_sleep_delta_ms(&deltas, 1, 0), deltas[0]);
+        assert_eq!(rung_sleep_delta_ms(&deltas, 2, 0), deltas[1]);
+    }
+
     #[test]
     fn test_should_reread_token_respects_60s_floor() {
         // Never read → always allowed.
@@ -3247,9 +3741,23 @@ mod tests {
             audit_outcome_for(
                 &SymbolFetchOutcome::Failed {
                     reason: "x".into(),
+                    ga_code: None,
                     backfill_candle: None
                 },
                 &mk_forensics("http_5xx")
+            ),
+            RestFetchOutcome::Error
+        );
+        // G1 (2026-07-14): a 2xx FAILURE-envelope failure is an ERROR
+        // forensics outcome — never Empty, never RateLimited.
+        assert_eq!(
+            audit_outcome_for(
+                &SymbolFetchOutcome::Failed {
+                    reason: "2xx FAILURE envelope ga_code=GA005 msg=denied".into(),
+                    ga_code: Some("GA005".into()),
+                    backfill_candle: None
+                },
+                &mk_forensics("ga_failure")
             ),
             RestFetchOutcome::Error
         );
@@ -3257,6 +3765,7 @@ mod tests {
             audit_outcome_for(
                 &SymbolFetchOutcome::Failed {
                     reason: "429".into(),
+                    ga_code: None,
                     backfill_candle: None
                 },
                 &mk_forensics("rate_limited")
@@ -3471,31 +3980,6 @@ mod tests {
         }
     }
 
-    /// Item 12 (fire-level): the symbols skipped after an auth reject get
-    /// `no_token`/`auth` forensics rows with 0/-1 sentinels — never a
-    /// doomed request, never a silent skip.
-    #[test]
-    fn test_build_auth_short_circuit_rows_names_remaining_symbols() {
-        // 2026-07-13: the short-circuit slice is target-typed now, so a
-        // resolved INDIA VIX target is skipped + forensics-rowed exactly
-        // like the core symbols.
-        let targets = core_spot_targets();
-        let rows = build_auth_short_circuit_rows(&targets[1..], 900, 0);
-        assert_eq!(rows.len(), 2, "two targets remain after the first");
-        for (row, target) in rows.iter().zip(&targets[1..]) {
-            assert_eq!(row.outcome, RestFetchOutcome::NoToken);
-            assert_eq!(row.error_class, "auth");
-            assert_eq!(row.final_http_status, 0, "no HTTP happened");
-            assert_eq!(row.attempts, 0);
-            assert_eq!(row.fetch_latency_ms, -1);
-            assert_eq!(row.close_to_data_ms, -1);
-            assert_eq!(row.ts_ist_nanos, 900);
-            assert_eq!(row.security_id, target.security_id);
-            assert_eq!(row.symbol, target.symbol);
-        }
-        assert!(build_auth_short_circuit_rows(&[], 900, 0).is_empty());
-    }
-
     /// Spawn a one-response-per-connection mock HTTP server; returns the
     /// candles URL pointing at it.
     async fn spawn_mock_candles_server(response: &'static str) -> String {
@@ -3537,7 +4021,7 @@ mod tests {
         let query = groww_candles_query("NSE-NIFTY", "NSE", "CASH", date);
         let token = SecretString::from("test-token");
         let (outcome, forensics) =
-            fetch_minute_with_ladder(&client, &url, &query, &token, 900, None, 0).await;
+            fetch_minute_with_ladder(&client, &url, &query, &token, 900, None, 0, 0).await;
         assert_eq!(
             forensics.attempts, 1,
             "auth reject must abort the ladder on the first rung"
@@ -3548,6 +4032,51 @@ mod tests {
         assert!(
             matches!(outcome, SymbolFetchOutcome::Failed { .. }),
             "got {outcome:?}"
+        );
+    }
+
+    /// G1 (2026-07-14): a 2xx whose body is the Groww FAILURE envelope
+    /// classifies as an ERROR — never a benign `empty` — with the GA code
+    /// extracted as forensics, the FULL bounded ladder run (policy never
+    /// branches on the GA code — no auth short-circuit even on GA005), and
+    /// the forensics outcome mapped to `Error` (not Empty/RateLimited).
+    #[tokio::test]
+    async fn test_ladder_classifies_2xx_ga_failure_as_error_never_empty() {
+        const MOCK_GA_FAILURE: &str = "HTTP/1.1 200 OK\r\nContent-Length: 72\r\n\r\n{\"status\":\"FAILURE\",\"error\":{\"code\":\"GA005\",\"message\":\"not authorised\"}}";
+        let url = spawn_mock_candles_server(MOCK_GA_FAILURE).await;
+        let client = mock_client();
+        let date = NaiveDate::from_ymd_opt(2026, 7, 14).expect("valid date");
+        let query = groww_candles_query("NSE-NIFTY", "NSE", "CASH", date);
+        let token = SecretString::from("test-token");
+        let (outcome, forensics) =
+            fetch_minute_with_ladder(&client, &url, &query, &token, 900, None, 0, 0).await;
+        assert_eq!(
+            forensics.attempts,
+            GROWW_SPOT_1M_RETRY_OFFSETS_MS.len() as u32 + 1,
+            "the full bounded ladder must run — no GA-code policy branch"
+        );
+        assert!(
+            !forensics.auth_rejected,
+            "GA005 must NOT auth-short-circuit"
+        );
+        assert_eq!(forensics.final_http_status, 200);
+        assert_eq!(forensics.error_class, "ga_failure");
+        match &outcome {
+            SymbolFetchOutcome::Failed {
+                reason, ga_code, ..
+            } => {
+                assert_eq!(ga_code.as_deref(), Some("GA005"));
+                assert!(
+                    reason.contains("ga_code=GA005"),
+                    "reason must carry the GA code, got {reason:?}"
+                );
+            }
+            other => panic!("2xx FAILURE envelope must classify Failed, got {other:?}"),
+        }
+        assert_eq!(
+            audit_outcome_for(&outcome, &forensics),
+            RestFetchOutcome::Error,
+            "forensics outcome must be error — never empty"
         );
     }
 
@@ -3577,6 +4106,7 @@ mod tests {
             nse_mock_trading_dates: vec![],
         };
         GrowwSpot1mTaskParams {
+            mark_forwarder: None,
             notifier: NotificationService::disabled(),
             calendar: Arc::new(
                 tickvault_common::trading_calendar::TradingCalendar::from_config(&config)
@@ -3588,9 +4118,12 @@ mod tests {
                 pg_port: 1,
                 ilp_port: 1,
             },
-            // PR-3 rebase reconciliation: the chain leg's minute-done
-            // sequencing sender — None in these fixtures (chain off).
-            minute_done_tx: None,
+            // 2026-07-14 auto-ladder: the shared burst state — the
+            // rate-safe default shape, warm-up off in fixtures.
+            burst: GrowwRestBurstState::new(
+                tickvault_common::config::GrowwRestBurstTier::TwoWave,
+                false,
+            ),
         }
     }
 
@@ -3707,6 +4240,7 @@ mod tests {
             false,
             tally_core_ok(3),
             None,
+            None,
         );
         record_minute_verdict(
             &params,
@@ -3718,6 +4252,7 @@ mod tests {
             false,
             tally_core_ok(2),
             Some("one miss"),
+            None,
         );
         for _ in 0..3 {
             record_minute_verdict(
@@ -3730,6 +4265,7 @@ mod tests {
                 false,
                 tally_core_ok(0),
                 Some("down"),
+                Some("GA003"),
             );
         }
         record_minute_verdict(
@@ -3741,6 +4277,7 @@ mod tests {
             0,
             false,
             tally_core_ok(3),
+            None,
             None,
         );
     }
@@ -3791,6 +4328,7 @@ mod tests {
             target_nanos,
             Some(backfill_nanos),
             0,
+            0,
         )
         .await;
         assert_eq!(forensics.attempts, 1, "found on the first rung");
@@ -3816,6 +4354,7 @@ mod tests {
             &token,
             target_nanos,
             Some(backfill_nanos),
+            0,
             0,
         )
         .await;

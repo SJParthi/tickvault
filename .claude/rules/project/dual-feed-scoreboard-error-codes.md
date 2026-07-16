@@ -1,5 +1,13 @@
 # Dual-Feed Scoreboard — Error Codes (SCOREBOARD-01)
 
+> **⚠ 2026-07-15 dormancy note (Groww live feed retired — operator Q1, received directly in this session:
+> *"remove the whole Groww live feed; keep only spot 1m and option chain for both brokers; go."*):** the
+> Groww LIVE inputs retire with the feed — live lifecycle episode rows, the presence registry, and the live
+> lag histograms stop being produced; the FEED-GAP dangling-close sweep step is REMOVED (its subsystem is
+> deleted — `feed-gap-error-codes.md` retirement banner). The REST-leg digest (§2b) and the episode
+> aggregation over HISTORICAL `ws_event_audit` rows SURVIVE; from 2026-07-15 forward the live
+> episode/presence/lag columns honestly read `feed_off`/absent per the existing round-4/5/6 semantics.
+
 > **Authority:** CLAUDE.md > `operator-charter-forever.md` §C/§F >
 > `groww-second-feed-scope-2026-06-19.md` (the two-feed contract) > this file.
 > **Operator directive (2026-07-10, dual-feed scoreboard):** *"run these two

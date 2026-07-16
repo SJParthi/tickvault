@@ -28,7 +28,7 @@ fn fuzz_tmp() -> PathBuf {
         .unwrap_or(0);
     let p = std::env::temp_dir().join(format!("tv-wal-fuzz-{}-{nanos}", std::process::id()));
     let _ = std::fs::remove_dir_all(&p);
-    std::fs::create_dir_all(&p).expect("create fuzz temp dir");
+    std::fs::create_dir_all(&p).expect("create fuzz temp dir"); // APPROVED: fuzz harness setup — non-production binary (libfuzzer target)
     p
 }
 

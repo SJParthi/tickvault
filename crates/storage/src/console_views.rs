@@ -97,9 +97,9 @@ pub const VIEW_CANDLES_NAMED: &str = "candles_named";
 /// so the name is pinned here).
 pub const NAMED_VIEW_CANDLES_BASE: &str = "candles_1m";
 /// Mirrors `instrument_lifecycle_persistence::QUESTDB_TABLE_INSTRUMENT_LIFECYCLE`.
-/// Hardcoded because that module is `#![cfg(feature = "daily_universe_fetcher")]`
-/// (module-gated) — the DDL builders below must compile feature-free.
-/// Equality is pinned by the feature-gated ratchet test
+/// (Historically hardcoded because that module was feature-gated; the
+/// `daily_universe_fetcher` feature was deleted in PR-C3, 2026-07-14.)
+/// Equality is pinned by the ratchet test
 /// `test_lifecycle_dim_matches_persistence_const`.
 const NAMED_VIEW_LIFECYCLE_DIM: &str = "instrument_lifecycle";
 /// DDL HTTP timeout (same value as every other boot-DDL ensure site).
@@ -197,7 +197,6 @@ pub async fn ensure_named_views(questdb_config: &QuestDbConfig) {
     // warn-fails harmlessly each boot (documented; those builds never
     // write lifecycle rows anyway). The daily-universe cold path's own
     // lifecycle ensure runs too late / conditionally for this call site.
-    #[cfg(feature = "daily_universe_fetcher")]
     crate::instrument_lifecycle_persistence::ensure_instrument_lifecycle_table(questdb_config)
         .await;
 
@@ -530,11 +529,9 @@ mod tests {
         }
     }
 
-    /// Pins the hardcoded lifecycle-table mirror against the gated
-    /// persistence module's canonical constant (the module is
-    /// `#![cfg(feature = "daily_universe_fetcher")]`, so this equality
-    /// check can only compile under the feature).
-    #[cfg(feature = "daily_universe_fetcher")]
+    /// Pins the hardcoded lifecycle-table mirror against the persistence
+    /// module's canonical constant (unconditional since PR-C3, 2026-07-14 —
+    /// the `daily_universe_fetcher` feature was deleted).
     #[test]
     fn test_lifecycle_dim_matches_persistence_const() {
         assert_eq!(

@@ -44,6 +44,27 @@ const TRACKED_PREFIXES: &[&str] = &[
     "STORAGE-GAP-",
     "DH-",
     "DATA-",
+    // §39.3 Portfolio area (2026-07-14): reverse-ratchet the GROWW-PORT-
+    // family so a runbook code without an enum variant fails the build.
+    "GROWW-PORT-",
+    // 2026-07-15 (Groww order fan-out contract stubs): the Smart Orders
+    // (GTT/OCO) family is reverse-tracked the same way, so a digit-shaped
+    // GROWW-OCO- string in rule text always names a real ErrorCode
+    // variant. Starred forms like `GROWW-OCO-*` (the §39.3 area table)
+    // never match: `looks_like_a_code` requires the tail to start with a
+    // digit.
+    "GROWW-OCO-",
+    // Groww order-side margin area (§39.3, 2026-07-15): the reverse-check
+    // now enforces enum variants for every GROWW-MARG-* mentioned in rule
+    // text.
+    "GROWW-MARG-",
+    // Groww orders shared contracts (PR-A0, 2026-07-15) — every GROWW-ORD-NN
+    // referenced in a rule file must have a matching enum variant.
+    "GROWW-ORD-",
+    // REST-era multi-TF candle derivation (operator 2026-07-16) — a
+    // FOLD-NN string in rule text must always name a real ErrorCode
+    // variant (the reverse ratchet for the FOLD- family).
+    "FOLD-",
 ];
 
 /// Codes mentioned in rule files that intentionally don't have an enum
@@ -67,6 +88,27 @@ const REVERSE_CHECK_ALLOWLIST: &[&str] = &[
     "DH-911",
     // `STORAGE-GAP-05` — disk-full pre-flight failed (Wave-4-E2).
     "STORAGE-GAP-05",
+    // C4 sweep (2026-07-15, Dhan live-WS retirement — operator 2026-07-13,
+    // `websocket-connection-scope-lock.md` "2026-07-13 Amendment"):
+    // WS-GAP-05..09 variants RETIRED — their only emit sites (the Dhan
+    // main-feed pool supervisor / tick-gap detector / frame channel /
+    // 429 cooldown / watchdog reconnect-in-place) were deleted in Phases
+    // C2/C3 (#1522/#1569). The rule files retain the code strings as
+    // historical audit per the house banner convention (wave-2-error-codes.md
+    // et al.), so the reverse check allowlists them here — exactly the
+    // DH-911 mechanism. WS-GAP-04 and WS-GAP-10 are NOT listed: their
+    // variants survive (emitted by the retained-dormant
+    // order_update_connection.rs per scope-lock §A.1).
+    "WS-GAP-05",
+    "WS-GAP-06",
+    "WS-GAP-07",
+    "WS-GAP-08",
+    "WS-GAP-09",
+    // `AUTH-GAP-06` — variant RETIRED in the C4 sweep (2026-07-15); the
+    // fast-boot cached-token validation module was deleted 2026-07-14
+    // (dhan-rest-only-noise-lock-2026-07-14.md: "variant retained until
+    // the C4 variant sweep"). Rule-file history retained.
+    "AUTH-GAP-06",
 ];
 
 #[test]

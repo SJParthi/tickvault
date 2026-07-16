@@ -1,7 +1,10 @@
 //! Order-runtime dry-run PR (2026-07-14) — DHAT zero-alloc test for the
-//! Groww-bridge mark-forward tap (`order_runtime::MarkForwarder::mark_forward`).
+//! mark-forward tap (`order_runtime::MarkForwarder::mark_forward`), re-homed
+//! 2026-07-16 to the Groww per-minute REST legs (spot + contract own-fire
+//! persist-confirm choke points) after the live bridge retired with #1581.
 //!
-//! The hot-path contract (per-tick consume seam, groww_bridge.rs):
+//! The tap contract (cold per-minute seam today; the budgets below were
+//! proven at the per-tick seam and are kept as ratchets):
 //!   - DISARMED (the dominant path — no positions, no pending paper orders):
 //!     ONE `Relaxed` atomic load and nothing else — ZERO heap allocation.
 //!   - ARMED + channel FULL (backpressure drop arm): the bounded `try_send`

@@ -42,8 +42,6 @@
 //!
 //! **Feature-gated** under `daily_universe_fetcher` per rule §21.
 
-#![cfg(feature = "daily_universe_fetcher")]
-
 use std::time::Duration;
 
 use anyhow::Context;

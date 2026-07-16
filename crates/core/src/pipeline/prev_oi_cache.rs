@@ -128,7 +128,7 @@ impl PrevOiCache {
         // atomic O(1). For the midnight rollover this is acceptable —
         // the ~1 second window where the cache is partial is during
         // PREMARKET (00:00:00 IST) when no live ticks are flowing.
-        let existing_keys: Vec<CacheKey> = self.inner.keys(&guard).copied().collect();
+        let existing_keys: Vec<CacheKey> = self.inner.keys(&guard).copied().collect(); // APPROVED: cold path — boot loader + IST-midnight rollover only, never per-tick
         for k in &existing_keys {
             self.inner.remove(k, &guard);
         }
@@ -175,7 +175,7 @@ impl PrevOiCache {
             .timeout(Duration::from_secs(PREV_OI_LOAD_TIMEOUT_SECS))
             .build()
             .map_err(LoadError::HttpClient)?;
-        let url = format!("http://{}:{}/exec", config.host, config.http_port);
+        let url = format!("http://{}:{}/exec", config.host, config.http_port); // APPROVED: cold boot/rollover loader, not per-tick
 
         // QuestDB SQL: select the LATEST oi per composite key from
         // prev_day_ohlcv (the 1d historical-only table; carries `oi` as of

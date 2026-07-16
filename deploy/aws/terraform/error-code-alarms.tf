@@ -5,16 +5,19 @@
 #   The CloudWatch-only migration (#O1/#O2/#O3) retired the
 #   Loki -> Alertmanager -> Telegram route with NO replacement, so an `error!`
 #   reached only the log sinks. On 2026-07-06 the 12:00 IST REST-CANARY-01
-#   probe failure produced ZERO pages. These 12 log metric filters + alarms
+#   probe failure produced ZERO pages. These 15 log metric filters + alarms
 #   (8 on 2026-07-06; +AGGREGATOR-DROP-01 on 2026-07-09; +WAL-SUSPEND-01 on
 #   2026-07-10; -REST-CANARY-01 retired + CROSS-VERIFY-1M-01/-02 +
-#   TICK-CONSERVE-01 on 2026-07-14) on
+#   TICK-CONSERVE-01 added, then the two CROSS-VERIFY-1M entries RETIRED
+#   the same day by PR-C3 with their emit module, + the 5 REST-audit
+#   entries, all on 2026-07-14) on
 #   the /tickvault/<env>/app log group (the errors.jsonl stream) restore the
 #   route: error! -> errors.jsonl -> CloudWatch Logs -> filter -> tv_errcode_*
 #   metric -> alarm (<=5 min) -> SNS tv-alerts -> Telegram webhook Lambda.
 #
 # HONEST ALARM COUNT: this file takes the REAL total from 33 -> 41 alarms
-# (45 with the reconnect-storm + feed-stall-restarts + readiness-lambda-errors
+# (45 with the reconnect-storm + feed-stall-restarts [pager retired
+# 2026-07-15 with the Groww live feed] + readiness-lambda-errors
 # + market-hours-gate-errors alarms landing in the same PR). Overage above the
 # 10 free-tier alarms moves $2.30 -> $3.50/mo. The rule-file "10 alarms free
 # tier" claims were already stale pre-PR. (2026-07-09: +2 more alarms —
@@ -56,10 +59,20 @@
 # IST OHLCV mismatch / degraded cross-verify run and a 15:40 IST
 # tick-conservation residual paged NOBODY.
 #
+# 2026-07-14 UPDATE (PR-C3 — Dhan instrument-chain deletion, operator
+# retirement directive 2026-07-13): -2 entries (CROSS-VERIFY-1M-01 +
+# CROSS-VERIFY-1M-02, ~-$0.20/mo) -> the two same-day automation-gaps
+# entries retired WITH their emit module `cross_verify_1m_boot.rs` (the
+# 15:31 IST Dhan live-vs-historical cross-verify has no live side to
+# compare — cross-verify-1m-error-codes.md retirement banner). Final
+# same-day total: 15 filters + 15 alarms. TICK-CONSERVE-01 stays (the
+# 15:40 conservation audit survives).
+#
 # 2026-07-14 UPDATE (REST-pipeline adversarial audit, GAP-01 + GAP-03 —
 # docs/audits/2026-07-14-rest-pipeline-adversarial-audit.md): +5 entries ->
 # 17 filters + 17 alarms (~+$0.50/mo; on top of the same-day REST-CANARY-01
-# retirement and the automation-gaps +3 above). The audit's single biggest systemic
+# retirement and the automation-gaps +3 above; 15 + 15 after the same-day
+# PR-C3 cross-verify retirement). The audit's single biggest systemic
 # weakness: REST-leg paging was app-emitted Telegram ONLY — a dead app
 # notifier (or Telegram bot) silenced AUTH-GAP-05 + SPOT1M/CHAIN entirely.
 # SCOPED sub-filters (a 2026-07-14 extension of the pinned coded shape —
@@ -107,12 +120,12 @@ locals {
   #     caused it is not fixed by the episode aging out.
   #   - dh-906: a discrete per-order reject; OK = aged out, never "orders
   #     working again".
-  #   - cross-verify-1m-01 / cross-verify-1m-02 / tick-conserve-01
-  #     (2026-07-14): daily ONE-SHOT audit findings — the 15:31 IST
-  #     cross-verify fires its mismatch/degraded lines once per run and
+  #   - tick-conserve-01 (2026-07-14): a daily ONE-SHOT audit finding —
   #     the 15:40 IST conservation audit fires its residual once per day;
-  #     the auto-OK ~15 min later can never mean the mismatch/residual was
-  #     fixed. Recovery signal = the NEXT trading day's clean run.
+  #     the auto-OK ~15 min later can never mean the residual was fixed.
+  #     Recovery signal = the NEXT trading day's clean run. (Its two
+  #     same-day siblings cross-verify-1m-01/-02 were retired hours later
+  #     by PR-C3 with their emit module — see the header note.)
   # auth-gap-04 stays ok_recovery = true with a stated ambiguity (round-4):
   # its emit site returns Err from the boot mint path, systemd Restart=always
   # re-boots and re-emits roughly every failing boot cycle (each cycle spans
@@ -168,34 +181,13 @@ locals {
     # was deleted with the lane, so the filter could never match again
     # (dead paging filter). The WsGap07 variant retirement is Phase C
     # variant cleanup.
-    # FEED-STALL-01 (round-3 review fix, 2026-07-06): the ONLY ERROR-level
-    # FEED-STALL-01 emission is the sidecar's own STORM escalation — the 6th+
-    # rapid restart inside a 300s ANCHORED-RESET window
-    # (>STALL_RESTART_STORM_MAX=5, groww_sidecar_supervisor.rs — the window
-    # start resets when it elapses; round-13 correction: NOT a sliding
-    # window, so a burst straddling the anchor can defer the escalation by
-    # up to ~one extra 300s window). Per-restart emissions are warn!-level
-    # and NEVER reach the ERROR-only errors.jsonl sink, so this filter counts
-    # storm-escalation LINES, not restarts. The earlier "Sum >= 3 restarts per
-    # 15 min" tuning could therefore never see 3-5 restarts/15 min (zero ERROR
-    # lines) — a Rule-11 false-OK envelope. Retuned: ONE storm line pages
-    # (threshold 1 per 300s; the Rust detector already debounces at >5
-    # restarts/5 min, so a single self-heal restart still never pages).
-    # Tripwire floor (span math, round-13 — the earlier "~50s" used 300/6
-    # average-rate math): 6 restarts span 5 gaps <= the 300s window, so
-    # cycles <= ~60s can escalate. The
-    # ">=3 restarts per 15 min" pager — counting EVERY restart, warn! + error!
-    # alike — is the separate tv-<env>-feed-stall-restarts counter alarm
-    # (feed-stall-restart-alarm.tf).
-    "feed-stall-01" = {
-      pattern     = "{ $.code = \"FEED-STALL-01\" && $.level = \"ERROR\" }"
-      period      = 300
-      threshold   = 1
-      eval        = 3
-      dta         = 1
-      ok_recovery = true
-      desc        = "FEED-STALL-01 STORM escalation: the Groww sidecar's own storm detector fired (>5 stall-restarts within a 5-min ANCHORED-reset window - the 6th+ rapid restart emits the only ERROR-level FEED-STALL-01 line; per-restart emissions are warn!-level and invisible to this filter). The provider keeps closing the socket at <=~60s/cycle (span math: 6 restarts span 5 gaps <= 300s; anchored-reset, not sliding - a burst straddling the anchor can defer the escalation by up to ~one extra 300s window). A single self-heal restart never pages. The >=3-restarts-per-15-min pager (all restart cadences) is tv-<env>-feed-stall-restarts (feed-stall-restart-alarm.tf). Check credential/entitlement. Runbook: .claude/rules/project/feed-stall-watchdog-error-codes.md"
-    }
+    # RETIRED (2026-07-15 — Groww live-feed retirement): the "feed-stall-01"
+    # entry — its ONLY ERROR-level emit site (the sidecar stall watchdog's
+    # storm escalation in the deleted groww_sidecar_supervisor.rs) died with
+    # the Groww live feed, so the filter could never match again (dead
+    # paging filter; the ws-gap-07 precedent above). The companion
+    # >=3-restarts-per-15-min counter pager was deleted whole in the same PR
+    # (feed-stall-restart-alarm.tf). Variant retirement is the post-C4 sweep.
     "ws-reinject-01" = {
       pattern     = "{ $.code = \"WS-REINJECT-01\" && $.level = \"ERROR\" }"
       period      = 300
@@ -259,36 +251,21 @@ locals {
       ok_recovery = false # 2026-07-10: once-per-episode emitter - the auto-OK ~15 min later only means the datapoint aged out while the table may still be suspended (Rule-11 false-recovery; ws-reinject-01 precedent)
       desc        = "WAL-SUSPEND-01: a QuestDB table's WAL apply is SUSPENDED - ingestion keeps ACKing rows while they silently stop becoming visible/applied (silent data-visibility loss; typical cause = a disk-full episode or a WAL apply error). Operator action: read the table/error_tag/error_message fields in the errors-jsonl stream, fix the underlying cause (df -h /data, QuestDB logs), then run ALTER TABLE <table> RESUME WAL in the QuestDB console - NEVER auto-executed (resuming into a still-broken disk replays the failure). NO recovered/OK page: the code fires once per suspension episode; recovery signal = the falling-edge recovery log + tv_questdb_wal_suspended_tables returning to 0. Runbook: .claude/rules/project/wal-suspension-error-codes.md"
     }
-    # CROSS-VERIFY-1M-01/-02 + TICK-CONSERVE-01 (added 2026-07-14 —
-    # automation-gaps PR-3): the 2026-07-10 automation audit found all
-    # three High post-market audit codes were LOG-SINK-ONLY. Emit sites:
-    # crates/app/src/cross_verify_1m_boot.rs (the 15:31 IST run's
-    # mismatch/degraded arms + the audit-append/final-flush failure arms)
-    # and crates/app/src/tick_conservation_boot.rs (the 15:40 IST
-    # reconciler's Leak arm). All three are daily one-shot audit findings
+    # TICK-CONSERVE-01 (added 2026-07-14 — automation-gaps PR-3): the
+    # 2026-07-10 automation audit found the High post-market audit codes
+    # were LOG-SINK-ONLY. Emit site:
+    # crates/app/src/tick_conservation_boot.rs (the 15:40 IST
+    # reconciler's Leak arm). A daily one-shot audit finding
     # -> ok_recovery = false (the aggregator-drop-01 / ws-reinject-01
     # precedent): the auto-OK ~15 min after the single datapoint ages out
-    # can never mean the mismatch/residual was fixed (Rule-11
-    # false-recovery); the real recovery signal is the NEXT trading day's
-    # clean run.
-    "cross-verify-1m-01" = {
-      pattern     = "{ $.code = \"CROSS-VERIFY-1M-01\" && $.level = \"ERROR\" }"
-      period      = 300
-      threshold   = 1
-      eval        = 3
-      dta         = 1
-      ok_recovery = false # 2026-07-14: daily one-shot audit finding - the mismatched candles do not fix themselves when the episode ages out (Rule-11 false-recovery)
-      desc        = "CROSS-VERIFY-1M-01: post-market 1m cross-verify found OHLCV mismatches between our live candles_1m and Dhan's intraday history (15:31 IST daily run; also fires when a mismatch audit row/flush could not persist). Track the trend, not the absolute count - a stable baseline is sampling noise, a spike or sustained Open/Close drift is real. Open data/cross-verify/cross-verify-1m-<date>.csv + the cross_verify_1m_audit table. NO recovered/OK page: a daily one-shot finding - the auto-OK ~15 min later only means the episode aged out; recovery = the next trading day's clean run. Runbook: .claude/rules/project/cross-verify-1m-error-codes.md"
-    }
-    "cross-verify-1m-02" = {
-      pattern     = "{ $.code = \"CROSS-VERIFY-1M-02\" && $.level = \"ERROR\" }"
-      period      = 300
-      threshold   = 1
-      eval        = 3
-      dta         = 1
-      ok_recovery = false # 2026-07-14: daily one-shot audit finding - the day's coverage gap persists after the episode ages out (Rule-11 false-recovery)
-      desc        = "CROSS-VERIFY-1M-02: post-market 1m cross-verify fetch DEGRADED - Dhan intraday REST errored/rate-limited/empty (or no JWT at run time) for a material fraction of the spot SIDs, so the day's OHLCV parity signal is partial or blind. Check Dhan Data-API health + the captured sample_failure field in the errors-jsonl stream. NO recovered/OK page: the run fires once per day - the auto-OK ~15 min later only means the episode aged out; recovery = the next trading day's clean run. Runbook: .claude/rules/project/cross-verify-1m-error-codes.md"
-    }
+    # can never mean the residual was fixed (Rule-11 false-recovery); the
+    # real recovery signal is the NEXT trading day's clean run.
+    # (The sibling cross-verify-1m-01/-02 entries added by the SAME
+    # automation-gaps PR were RETIRED hours later in PR-C3, 2026-07-14 —
+    # their emit module `cross_verify_1m_boot.rs` was deleted with the
+    # Dhan instrument chain per the 2026-07-13 operator retirement
+    # directive, so the filters could never match again; leaving them
+    # would be dead filters per error_code_paging_filter_drift_guard.rs.)
     "tick-conserve-01" = {
       pattern     = "{ $.code = \"TICK-CONSERVE-01\" && $.level = \"ERROR\" }"
       period      = 300
@@ -445,8 +422,9 @@ resource "aws_cloudwatch_metric_alarm" "error_code" {
   # formats every OK as a green message (it reads only NewStateValue - no
   # OldStateValue filter). Expect up to ~5 one-time green "recovered" pages
   # the apply evening (canonical count, round-14): the 4 ok_recovery=true
-  # codes here (dh-901, auth-gap-04, feed-stall-01; ws-gap-07 retired PR-C2 2026-07-13) +
-  # feed-stall-restarts. Exempt: the reconnect-storm alarm via
+  # codes here (dh-901, auth-gap-04; ws-gap-07 retired PR-C2 2026-07-13;
+  # feed-stall-01 + the feed-stall-restarts counter pager retired
+  # 2026-07-15 with the Groww live feed). Exempt: the reconnect-storm alarm via
   # actions_enabled=false, and BOTH AWS/Lambda Errors watchman alarms
   # (readiness-errors + market-hours-gate-errors) via ok_actions=[]
   # (round-14 — their auto-OK is aged-out, never a fix).

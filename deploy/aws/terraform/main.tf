@@ -1,14 +1,18 @@
-# DLT AWS stack — r8g.large budget envelope (~₹2,919/mo incl GST: 270 hrs,
-# 30 GB EBS, +EIP kept; operator-lock 2026-06-30 in
-# daily-universe-scope-expansion-2026-05-27.md §7 Quote 7, which supersedes
-# the 2026-05-29 m8g.large + 2026-05-27 t4g.large + 2026-05-18 t4g.medium locks).
+# DLT AWS stack — t4g.medium budget envelope (INTERIM ~₹1,471/mo incl GST:
+# 270 hrs, live 50 GB EBS, +EIP kept; operator-lock 2026-07-15 Quote 8 in
+# daily-universe-scope-expansion-2026-05-27.md §7, which supersedes the
+# 2026-06-30 r8g.large [~₹2,919/mo] + 2026-05-29 m8g.large + 2026-05-27
+# t4g.large + 2026-05-18 t4g.medium locks). Header corrected 2026-07-15 —
+# it previously described the superseded r8g.large envelope.
 #
 # Deployed resources:
 #   - VPC with a single public subnet (no NAT to stay under budget)
 #   - Security group: SSH from operator_cidr, no inbound from market
 #   - IAM role: SSM read+write+delete (instance lock) + CloudWatch write +
 #     SNS publish + S3 cold-tier read/write
-#   - EC2 r8g.large (ARM Graviton4, 2 vCPU / 16 GiB) with gp3 30GB root volume
+#   - EC2 t4g.medium (ARM Graviton2, 2 vCPU / 4 GiB — 2026-07-15 downsize lock;
+#     was r8g.large) with a gp3 root volume (var default 20 GB = fresh-provision
+#     intent only; the LIVE box keeps its 50 GB root — gp3 cannot shrink)
 #   - Elastic IP — count-gated on var.enable_eip (DEFAULT false for the 3-month
 #     data-pull: no orders → no Dhan static-IP whitelist need → ~₹430/mo saved.
 #     Flip enable_eip=true before going LIVE with orders; 7-day modify cooldown)
@@ -27,6 +31,10 @@
 # IGNORES instance_type + user_data on aws_instance.tv_app (lifecycle block
 # below) so a merge-triggered apply can NEVER replace/wipe the box. Code deploys
 # happen over SSM (git pull && docker compose up), never via instance replace.
+# 2026-07-15 note (Quote 8): the SAME contract now runs in the DOWN direction —
+# r8g.large → t4g.medium via the guarded .github/workflows/downsize-instance.yml
+# (or the script as the manual fallback); terraform still never touches the
+# live instance type.
 #
 # Stack components NOT deployed (CloudWatch-only migration #O1/#O2/#O3/#O4):
 #   - Grafana / Prometheus / Alertmanager / Valkey — all retired.
@@ -332,8 +340,10 @@ resource "aws_instance" "tv_app" {
   # Stop-protection OFF (operator lock 2026-05-29): the weekday 16:30 IST
   # EventBridge stop cron AND scripts/aws-upgrade-instance.sh BOTH need
   # ec2:StopInstances. `disable_api_stop = true` would silently block the
-  # daily auto-stop → instance runs 24/7 → ~720 hrs/mo → ~₹5,500 bill instead
-  # of the locked ~₹2,919/mo, and would block the in-place r8g.large upgrade.
+  # daily auto-stop → instance runs 24/7 → ~720 hrs/mo → a many-times-over bill
+  # instead of the locked monthly figure (~₹2,919 under the 2026-06-30 r8g.large
+  # lock; ~₹1,471 under the 2026-07-15 t4g.medium lock), and would block the
+  # in-place instance-type flips (up OR down).
   # Stop is reversible (EBS + data survive a stop) so it needs no guard.
   disable_api_termination = true
   disable_api_stop        = false
@@ -374,11 +384,13 @@ resource "aws_instance" "tv_app" {
   # NEVER let `terraform apply` replace or re-type the running box:
   #   - ami:           AMI refresh updates the default for NEW instances only;
   #                    existing instance keeps its AMI (no replace).
-  #   - instance_type: the m8g.large → r8g.large upgrade is done out-of-band by
-  #                    scripts/aws-upgrade-instance.sh at a controlled off-market
-  #                    time. Terraform must not fight that or revert it. The
-  #                    var.instance_type validation still documents the desired
-  #                    r8g.large for any fresh provision.
+  #   - instance_type: instance-type flips (2026-06-30 m8g.large → r8g.large;
+  #                    2026-07-15 r8g.large → t4g.medium downsize) are done
+  #                    out-of-band by scripts/aws-upgrade-instance.sh or the
+  #                    guarded downsize-instance.yml workflow at a controlled
+  #                    off-market time. Terraform must not fight that or revert
+  #                    it. The var.instance_type validation still documents the
+  #                    desired t4g.medium for any fresh provision.
   #   - user_data:     bootstrap-only (see note above); deploys are over SSM.
   #   - root_block_device size/iops/throughput: scripts/aws-upgrade-instance.sh
   #                    bumps these ONLINE (aws ec2 modify-volume, no stop, no data

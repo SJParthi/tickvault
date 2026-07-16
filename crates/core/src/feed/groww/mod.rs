@@ -1,23 +1,14 @@
-//! Groww second feed (native Rust).
+//! Groww feed — REST-leg support modules (watch-set build + shared-master persist).
 //!
-//! Build order (per `.claude/plans/active-plan-groww-second-feed.md`):
-//! - **PR-2 (this):** [`auth`] — obtain a Groww access token from the
-//!   `api_key` + a rotating TOTP code (the prerequisite for the live feed).
-//! - Later PRs: NATS connect + subscribe, protobuf tick decode → the same
-//!   WAL/ring/spill/DLQ chain, 1-minute aggregation → the shared `candles_1m`
-//!   table (tagged `feed='groww'`),
-//!   and the live-1m vs Groww-backtest-1m exact parity check.
-//!
-//! Default OFF — nothing here runs unless `feeds.groww_enabled` is set.
+//! The Groww LIVE WebSocket/NATS feed was RETIRED 2026-07-15 (operator
+//! directive: "remove the whole Groww live feed; keep only spot 1m and
+//! option chain for both brokers"). What remains here serves the per-minute
+//! REST legs and the [groww_universe] daily watch-set rider:
+//! - [`instruments`] — daily Groww master download + watch-set build
+//! - [`watch_reader`] — watch-file parse (VIX resolution for the spot leg)
+//! - [`shared_master_writer`] — feed='groww' master/constituency persist
 //! Reference: `docs/groww-ref/`.
 
-pub mod auth;
 pub mod instruments;
-pub mod native;
-pub mod nats;
-pub mod nkey;
-pub mod parity_1m;
-pub mod proto;
-pub mod shard_cutter;
 pub mod shared_master_writer;
-pub mod subjects;
+pub mod watch_reader;

@@ -27,7 +27,11 @@
 //! Events with a dynamic `feed` field resolve their badge from that field;
 //! an unknown future feed name resolves to `None` and the message renders
 //! exactly as before — never a wrong badge. Non-feed events (QuestDB, boot,
-//! risk, orders, self-test) are byte-identical to before.
+//! risk, self-test) are byte-identical to before. Order-path events
+//! (orders, circuit breaker, rate limit, orphan positions) badge 🔷 DHAN —
+//! Dhan is the only broker with orders (2026-07-14; rendering-only — the
+//! exit-order layer keeps zero Telegram emit sites per
+//! `.claude/rules/project/dhan-exit-order-lockout-2026-07-14.md`).
 //!
 //! # Performance
 //!

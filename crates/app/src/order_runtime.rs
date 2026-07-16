@@ -232,6 +232,24 @@ impl OmsAlertSink for NotifierAlertSink {
                 self.0
                     .notify(NotificationEvent::RateLimitExhausted { limit_type });
             }
+            // Cluster-F alert classes (#1558: readiness refusal / OMS halt /
+            // DH-904 ladder exhaustion / DATA-805 stop-all) are
+            // LOG-SINK-ONLY by contract (order-readiness-error-codes.md §3 +
+            // the Dhan noise lock §2 — no Telegram family row exists for
+            // them). The engine already emits the coded, edge-latched
+            // `error!` at each fire site, so the sink deliberately routes
+            // NOTHING here — a notify() would be an unauthorized new Dhan
+            // page class; a second error! would double-log the same episode.
+            alert @ (OmsAlert::OrderReadinessRefused { .. }
+            | OmsAlert::OmsHalted { .. }
+            | OmsAlert::Dh904LadderExhausted { .. }
+            | OmsAlert::OrderApiStopAll { .. }) => {
+                debug!(
+                    message = %alert.operator_message(),
+                    "cluster-F OMS alert observed by the sink — log-sink-only \
+                     by contract (engine already emitted the coded error)"
+                );
+            }
         }
     }
 }

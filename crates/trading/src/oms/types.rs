@@ -190,6 +190,247 @@ pub struct ModifyOrderRequest {
 }
 
 // ---------------------------------------------------------------------------
+// Exit-Order Execution Layer — engine-level request types (Cluster B, 2026-07-14)
+// ---------------------------------------------------------------------------
+
+/// Engine-level 3-leg bracket request (converted to DhanPlaceSuperOrderRequest).
+#[derive(Debug, Clone)]
+pub struct PlaceSuperOrderRequest {
+    /// Dhan security identifier (matches `PlaceOrderRequest`; wire = `.to_string()`).
+    pub security_id: u64,
+    /// Buy or sell.
+    pub transaction_type: TransactionType,
+    /// Entry-leg order type: LIMIT | MARKET only (validated — super orders
+    /// reject SL/SLM per portal 04:51).
+    pub order_type: OrderType,
+    /// Product type.
+    pub product_type: ProductType,
+    /// Total order quantity.
+    pub quantity: i64,
+    /// Entry price (0.0 required for MARKET — mirrors the plain-order rule;
+    /// live-probe U1).
+    pub price: f64,
+    /// Target exit price (profit booking).
+    pub target_price: f64,
+    /// Stop loss price (risk limit).
+    pub stop_loss_price: f64,
+    /// Trailing SL jump. 0.0 = no trailing; ALWAYS serialized (the wire
+    /// field is non-Option — omission on a modify CANCELS the trail).
+    pub trailing_jump: f64,
+    /// Lot size for risk engine integration.
+    pub lot_size: u32,
+    /// I-P0-03 gate input (engine place-order pattern).
+    pub expiry_date: Option<NaiveDate>,
+}
+
+/// Result of place_super_order: entry-leg order id + parsed leg snapshot.
+#[derive(Debug, Clone)]
+pub struct SuperOrderPlacement {
+    /// Dhan order id of the ENTRY leg (`PAPER-SO-{n}` in dry-run).
+    pub entry_order_id: String,
+    /// Snapshot of every leg returned by the place response.
+    pub legs: Vec<SuperOrderLegSnapshot>,
+}
+
+/// One leg of a freshly placed super order.
+#[derive(Debug, Clone)]
+pub struct SuperOrderLegSnapshot {
+    /// Which leg.
+    pub leg: OrderLeg,
+    /// Dhan order id for this leg.
+    pub order_id: String,
+    /// Raw Dhan status string for this leg (never re-mapped here).
+    pub status_raw: String,
+}
+
+/// Engine-level Forever/OCO request. `oco_leg` None ⇒ SINGLE, Some ⇒ OCO
+/// (price1/triggerPrice1/quantity1 pairing complete BY CONSTRUCTION).
+#[derive(Debug, Clone)]
+pub struct PlaceForeverOcoRequest {
+    /// Dhan security identifier.
+    pub security_id: u64,
+    /// Buy or sell.
+    pub transaction_type: TransactionType,
+    /// CNC | MTF only (validated in exit_rules — 07b §1).
+    pub product_type: ProductType,
+    /// LIMIT | MARKET only.
+    pub order_type: OrderType,
+    /// Order validity.
+    pub validity: OrderValidity,
+    /// First-leg quantity.
+    pub quantity: i64,
+    /// First-leg price.
+    pub price: f64,
+    /// First-leg trigger price.
+    pub trigger_price: f64,
+    /// OCO second leg — None ⇒ SINGLE order flag.
+    pub oco_leg: Option<OcoSecondLeg>,
+    /// I-P0-03 gate input.
+    pub expiry_date: Option<NaiveDate>,
+}
+
+/// The OCO second leg (all three fields required together by construction).
+#[derive(Debug, Clone)]
+pub struct OcoSecondLeg {
+    /// Second-leg price.
+    pub price: f64,
+    /// Second-leg trigger price.
+    pub trigger_price: f64,
+    /// Second-leg quantity.
+    pub quantity: i64,
+}
+
+/// Leg-restricted super-order modify — illegal field/leg combos unrepresentable.
+/// `trailing_jump` is NON-Option on Entry + StopLoss: omitting trailingJump on a
+/// modify CANCELS the trail (07a 2026-07-14 update #2, Verified-live).
+#[derive(Debug, Clone)]
+pub enum ModifySuperOrderLeg {
+    /// ENTRY_LEG modify — all fields (allowed only when the entry is
+    /// PENDING / PART_TRADED / TRANSIT per 07a §3).
+    Entry {
+        /// New entry order type.
+        order_type: OrderType,
+        /// New total quantity.
+        quantity: i64,
+        /// New entry price.
+        price: f64,
+        /// New target price.
+        target_price: f64,
+        /// New stop loss price.
+        stop_loss_price: f64,
+        /// Trailing jump — ALWAYS resent (omission cancels the trail).
+        trailing_jump: f64,
+    },
+    /// TARGET_LEG modify — only targetPrice (minimal body; sending
+    /// trailingJump on a TARGET_LEG modify is doc-unbacked — live-probe U8).
+    Target {
+        /// New target price.
+        target_price: f64,
+    },
+    /// STOP_LOSS_LEG modify — stopLossPrice + trailingJump (always resent).
+    StopLoss {
+        /// New stop loss price.
+        stop_loss_price: f64,
+        /// Trailing jump — ALWAYS resent (omission cancels the trail).
+        trailing_jump: f64,
+    },
+}
+
+/// MPP verify-after-place verdict (orders.md rule 18: never assume filled).
+#[derive(Debug, Clone, PartialEq)]
+pub enum ExecutionVerdict {
+    /// Fully traded.
+    Filled {
+        /// Quantity traded.
+        traded_qty: i64,
+        /// Volume-weighted average fill price.
+        avg_price: f64,
+    },
+    /// Partially traded (in-budget: keep polling; at budget: the engine
+    /// flags `needs_reconciliation` + EXIT-VERIFY-01 — remainder never
+    /// silently forgotten).
+    PartiallyFilled {
+        /// Quantity traded so far.
+        traded_qty: i64,
+        /// Quantity still open.
+        remaining: i64,
+    },
+    /// Still inside the verify budget — caller retries per the ladder.
+    Pending {
+        /// Seconds elapsed since the first probe.
+        elapsed_secs: u64,
+    },
+    /// MPP: MARKET→LIMIT conversion left the order resting past the deadline.
+    PendingAtLimit {
+        /// Seconds elapsed since the first probe.
+        elapsed_secs: u64,
+    },
+    /// Rejected / Cancelled / Expired (also Closed for super orders — the
+    /// engine applies the Closed transition + leg reconcile separately).
+    Terminal {
+        /// The terminal status observed.
+        status: OrderStatus,
+    },
+    /// Dry-run paper only — deliberately distinct so no consumer confuses
+    /// paper for real.
+    SimulatedFilled,
+    /// Fail-closed: unparsable status is NEVER treated as filled.
+    Unknown {
+        /// The raw Dhan status string that failed to parse.
+        raw_status: String,
+    },
+}
+
+/// Tracked 3-leg super order (engine-internal registry; raw leg statuses —
+/// deliberately BYPASSES the ManagedOrder state machine for the top-level
+/// PENDING→TRADED→TRIGGERED→CLOSED walk).
+#[derive(Debug, Clone)]
+pub struct ManagedSuperOrder {
+    /// Entry-leg Dhan order id (`PAPER-SO-{n}` in dry-run).
+    pub entry_order_id: String,
+    /// Our UUID v4 correlation ID.
+    pub correlation_id: String,
+    /// Dhan security identifier.
+    pub security_id: u64,
+    /// Buy or sell.
+    pub transaction_type: TransactionType,
+    /// Total quantity.
+    pub quantity: i64,
+    /// Entry price.
+    pub entry_price: f64,
+    /// Raw entry-leg status string — gates ENTRY_LEG modify/cancel.
+    pub entry_status_raw: String,
+    /// Target-leg state.
+    pub target: LegState,
+    /// Stop-loss-leg state.
+    pub stop_loss: LegState,
+    /// Current trailing jump — the always-resend source.
+    pub trailing_jump: f64,
+    /// Top-level status (parse of list orderStatus; Transit fallback).
+    pub status: OrderStatus,
+    /// Shared 25-modification cap across legs (Assumed A3).
+    pub modification_count: u32,
+    /// Creation timestamp (epoch microseconds).
+    pub created_at_us: i64,
+    /// Last update timestamp (epoch microseconds).
+    pub updated_at_us: i64,
+}
+
+/// State of one exit leg (target or stop loss) of a tracked super order.
+#[derive(Debug, Clone)]
+pub struct LegState {
+    /// Dhan order id for this leg.
+    pub order_id: String,
+    /// Raw Dhan status string for this leg.
+    pub status_raw: String,
+    /// Current price on this leg.
+    pub price: f64,
+}
+
+/// Verify-ladder bookkeeping (separate map — ManagedOrder struct untouched).
+#[derive(Debug, Clone)]
+pub struct VerifyState {
+    /// Probes issued so far (1-indexed ladder position).
+    pub attempts: u32,
+    /// Timestamp of the first probe (epoch microseconds).
+    pub first_probe_us: i64,
+    /// Stable label of the most recent verdict (for metrics/logs).
+    pub last_verdict_label: &'static str,
+}
+
+/// POST /orders/slicing response — portal documents a single object but says
+/// "Sliced orders placed" (plural); SDK returns a list. Tolerate BOTH.
+/// Many FIRST so an array wins the untagged race.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(untagged)]
+pub enum SlicingResponse {
+    /// Array shape (the SDK-observed list of per-slice responses).
+    Many(Vec<DhanPlaceOrderResponse>),
+    /// Single-object shape (the portal-documented schema).
+    One(DhanPlaceOrderResponse),
+}
+
+// ---------------------------------------------------------------------------
 // Dhan REST API request/response types (camelCase JSON)
 // ---------------------------------------------------------------------------
 
@@ -213,7 +454,7 @@ pub struct DhanPlaceOrderRequest {
 }
 
 /// Dhan REST API place order response.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DhanPlaceOrderResponse {
     pub order_id: String,
@@ -919,8 +1160,14 @@ pub struct DhanConditionalTriggerRequest {
     pub dhan_client_id: String,
     /// Trigger condition.
     pub condition: TriggerCondition,
-    /// Orders to execute when condition fires (can be multiple).
+    /// Orders to execute when condition fires (up to 15 per the 2026-07-14
+    /// live portal callout).
     pub orders: Vec<TriggerOrder>,
+    /// Alert ID echo — documented OPTIONAL body field on Modify only
+    /// (PORTAL modify page, 2026-07-14 crawl). Always `None` on Place;
+    /// `skip_serializing_if` keeps Place bodies byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alert_id: Option<String>,
 }
 
 /// Conditional trigger response.
@@ -928,12 +1175,282 @@ pub struct DhanConditionalTriggerRequest {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DhanConditionalTriggerResponse {
-    /// Alert ID.
-    #[serde(default)]
+    /// Alert ID (`null` tolerated — the GET echo family emits explicit
+    /// `null` for unset fields, e.g. the verbatim `"triggeredTime": null`).
+    #[serde(default, deserialize_with = "null_to_default")]
     pub alert_id: String,
     /// Alert status: "ACTIVE", "TRIGGERED", "EXPIRED", "CANCELLED".
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub alert_status: String,
+    /// Creation time — ISO-8601 **UTC `Z`** format ("2019-08-24T14:15:22Z").
+    /// The ONLY UTC timestamps in the trading-API family (everything else is
+    /// IST strings). Convert; NEVER assume IST. GET responses only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_time: Option<String>,
+    /// Trigger time — ISO-8601 UTC `Z`; `null` until the alert triggers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub triggered_time: Option<String>,
+    /// Last traded price — STRING in the doc example ("245.50"), number in
+    /// the OpenAPI yaml. Tolerant either way via [`DhanNumeric`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_price: Option<DhanNumeric>,
+    /// Condition echo on GET responses (string `comparingValue` safe).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub condition: Option<TriggerConditionDetail>,
+    /// Order-leg echo on GET responses — the tolerant [`TriggerOrderDetail`]
+    /// mirror, NEVER the strict request-side [`TriggerOrder`] (one
+    /// non-conforming leg must never brick the whole GET / GET-all parse;
+    /// the OpenAPI yaml marks NO order sub-field required).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orders: Option<Vec<TriggerOrderDetail>>,
+}
+
+// ---------------------------------------------------------------------------
+// Multi Order + Conditional Detail Types — 2026-07-14 (07c §multi + portal/yaml)
+// ---------------------------------------------------------------------------
+
+/// Tolerant Dhan numeric: bare number OR quoted decimal string on the wire
+/// (comparingValue is number-in-request / string-in-response; lastPrice is
+/// string-in-example / number-in-yaml). Round-trips verbatim; never panics.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(untagged)]
+pub enum DhanNumeric {
+    /// Bare JSON number (e.g. `245.5`).
+    Num(f64),
+    /// Quoted decimal string (e.g. `"245.50"`), preserved verbatim.
+    Text(String),
+}
+
+impl DhanNumeric {
+    /// Best-effort f64 view; `None` for unparsable text.
+    pub fn as_f64(&self) -> Option<f64> {
+        match self {
+            Self::Num(value) => Some(*value),
+            Self::Text(text) => text.trim().parse().ok(),
+        }
+    }
+
+    /// Best-effort i64 view; `None` for unparsable text. A fractional value
+    /// truncates toward zero and an out-of-range value saturates (Rust `as`
+    /// casts never panic) — response-echo use only, never a request input.
+    pub fn as_i64(&self) -> Option<i64> {
+        match self {
+            Self::Num(value) => Some(*value as i64),
+            Self::Text(text) => {
+                let trimmed = text.trim();
+                trimmed
+                    .parse::<i64>()
+                    .ok()
+                    .or_else(|| trimmed.parse::<f64>().ok().map(|value| value as i64))
+            }
+        }
+    }
+}
+
+/// Deserializes a possibly-explicit-`null` field into `T::default()`.
+///
+/// `#[serde(default)]` alone tolerates only a MISSING key; the /alerts GET
+/// echo family emits EXPLICIT `null` for unset fields (verbatim doc example:
+/// `"triggeredTime": null`), which would otherwise brick the WHOLE GET /
+/// GET-all parse over one non-conforming leg. Response-only mirrors use this
+/// on every defaulted non-`Option` field.
+fn null_to_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Default + serde::Deserialize<'de>,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
+}
+
+/// Deserializes a quantity echo that may arrive as a bare number, a quoted
+/// decimal string (the family's documented number/string wobble class —
+/// `comparingValue` / `lastPrice`), or explicit `null`. Unparsable text
+/// degrades to 0 — response-only mirror, never a request input.
+fn tolerant_quantity<'de, D>(deserializer: D) -> Result<i64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<DhanNumeric>::deserialize(deserializer)?
+        .and_then(|value| value.as_i64())
+        .unwrap_or_default())
+}
+
+/// Response-only mirror of [`TriggerCondition`] — every field defaulted /
+/// optional, `comparing_value` tolerant (the GET response carries
+/// `"comparingValue": "250.00"` as a STRING; parsing it into the request
+/// struct's `Option<f64>` would fail).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TriggerConditionDetail {
+    /// Comparison type echo.
+    #[serde(default, deserialize_with = "null_to_default")]
+    pub comparison_type: String,
+    /// Exchange segment echo.
+    #[serde(default, deserialize_with = "null_to_default")]
+    pub exchange_segment: String,
+    /// Security ID echo.
+    #[serde(default, deserialize_with = "null_to_default")]
+    pub security_id: String,
+    /// Indicator name echo (TECHNICAL_WITH_* only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub indicator_name: Option<String>,
+    /// Timeframe echo (TECHNICAL_WITH_* only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time_frame: Option<String>,
+    /// Operator echo.
+    #[serde(default, deserialize_with = "null_to_default")]
+    pub operator: String,
+    /// Comparing value — number in the request, STRING in the GET response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comparing_value: Option<DhanNumeric>,
+    /// Second indicator echo (TECHNICAL_WITH_INDICATOR only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comparing_indicator_name: Option<String>,
+    /// Expiry date echo (YYYY-MM-DD).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exp_date: Option<String>,
+    /// Frequency: "ONCE" | yaml-only "ALWAYS" | anything — String tolerates all.
+    #[serde(default, deserialize_with = "null_to_default")]
+    pub frequency: String,
+    /// User note echo.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_note: Option<String>,
+}
+
+/// Response-only mirror of [`TriggerOrder`] — every field defaulted and the
+/// price-family fields tolerant ([`DhanNumeric`]). The GET / GET-all order
+/// echo must be parsed DEFENSIVELY: the OpenAPI yaml marks NO order
+/// sub-field required (an alert created via Dhan's web/app UI can omit the
+/// request-optional `triggerPrice`/`discQuantity`), and the family's
+/// documented number/string wobble (`comparingValue`/`lastPrice`) applies
+/// to the leg's `price` fields too. Parsing the echo with the strict
+/// request-side struct would fail the ENTIRE response — and the whole
+/// account list on GET-all — over ONE such leg.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TriggerOrderDetail {
+    /// "BUY" or "SELL" echo.
+    #[serde(default, deserialize_with = "null_to_default")]
+    pub transaction_type: String,
+    /// Exchange segment echo.
+    #[serde(default, deserialize_with = "null_to_default")]
+    pub exchange_segment: String,
+    /// Product type echo.
+    #[serde(default, deserialize_with = "null_to_default")]
+    pub product_type: String,
+    /// Order type echo.
+    #[serde(default, deserialize_with = "null_to_default")]
+    pub order_type: String,
+    /// Security ID echo.
+    #[serde(default, deserialize_with = "null_to_default")]
+    pub security_id: String,
+    /// Quantity echo — number, quoted decimal string (the family's
+    /// documented wobble class), or explicit `null` all tolerated.
+    #[serde(default, deserialize_with = "tolerant_quantity")]
+    pub quantity: i64,
+    /// Validity echo.
+    #[serde(default, deserialize_with = "null_to_default")]
+    pub validity: String,
+    /// Price — STRING in the doc example ("250.00"); tolerant to a bare
+    /// number (the family's documented wobble class).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub price: Option<DhanNumeric>,
+    /// Disclosed quantity echo (STRING "0" in the doc example).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disc_quantity: Option<DhanNumeric>,
+    /// Trigger price echo — request-optional, so the echo may omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger_price: Option<DhanNumeric>,
+}
+
+/// Multi-order WIRE leg — DISTINCT schema from [`TriggerOrder`] (07c §9.1
+/// traps): `disclosedQuantity` INT (vs `discQuantity` STRING), `price` /
+/// `triggerPrice` FLOAT (vs STRING), plus `sequence` / `correlationId` /
+/// `afterMarketOrder` / `amoTime`. NEVER merge the two structs.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MultiOrderLeg {
+    /// Sequence number "1".."15" — constructor-assigned (STRING on the wire).
+    pub sequence: String,
+    /// User-generated tracking ID (<= 30 chars, `[a-zA-Z0-9 _-]`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub correlation_id: Option<String>,
+    /// "BUY" or "SELL".
+    pub transaction_type: String,
+    /// Exchange segment — constructor-locked to "NSE_EQ"/"BSE_EQ".
+    pub exchange_segment: String,
+    /// Product type.
+    pub product_type: String,
+    /// Order type.
+    pub order_type: String,
+    /// Validity: "DAY" or "IOC".
+    pub validity: String,
+    /// Dhan security ID (STRING).
+    pub security_id: String,
+    /// Quantity.
+    pub quantity: i64,
+    /// After-market-order flag — coupled with `amo_time` by the builder.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_market_order: Option<bool>,
+    /// AMO timing (`AmoTime::as_str()`); coupled with the flag by the builder.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub amo_time: Option<String>,
+    /// Price — FLOAT here, vs STRING on conditional legs.
+    pub price: f64,
+    /// Trigger price — FLOAT here, vs STRING on conditional legs.
+    pub trigger_price: f64,
+    /// Disclosed quantity — INT `disclosedQuantity`, vs STRING `discQuantity`.
+    pub disclosed_quantity: i64,
+}
+// NOTE: yaml marks only sequence/transactionType/exchangeSegment required; our
+// builder always emits full legs, so the remaining fields are concrete (not
+// Option). Documented divergence, request-side only.
+
+/// Place Multi Order request. Endpoint: `POST /v2/alerts/multi/orders`
+/// (PORTAL-only page). Order legs: Equities ONLY, fail-closed (see
+/// `oms::conditional`).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DhanMultiOrderRequest {
+    /// Dhan client ID.
+    pub dhan_client_id: String,
+    /// Order legs (1..=15, builder-enforced).
+    pub orders: Vec<MultiOrderLeg>,
+}
+
+/// Multi-order response — YAML-ONLY schema, UNVERIFIED-LIVE. Parse
+/// tolerantly. `Default` (empty `orders`) is the documented-plausible
+/// BODYLESS-200 arm: the PORTAL page documents NO response body at all
+/// ("200 Successful operation" only), and `place_multi_order` degrades an
+/// empty/whitespace 200 body to this default instead of a `JsonError`
+/// brick — a parse error for an already-placed batch would push callers
+/// toward a double-placing retry.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DhanMultiOrderResponse {
+    /// Per-leg order results (`null` tolerated → empty — a 200 body means
+    /// the legs are ALREADY placed at the broker; a parse brick here would
+    /// hide which legs went live).
+    #[serde(default, deserialize_with = "null_to_default")]
+    pub orders: Vec<MultiOrderLegResult>,
+}
+
+/// One per-leg result in the multi-order response.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MultiOrderLegResult {
+    /// Dhan order ID for this leg — a REJECTED leg plausibly echoes
+    /// `"orderId": null` (yaml-only, UNVERIFIED-LIVE); tolerated as `""`.
+    #[serde(default, deserialize_with = "null_to_default")]
+    pub order_id: String,
+    /// Sequence number echo.
+    #[serde(default, deserialize_with = "null_to_default")]
+    pub sequence: String,
+    /// 10-value yaml enum (TRANSIT PENDING REJECTED CANCELLED PART_TRADED
+    /// TRADED EXPIRED MODIFIED TRIGGERED INACTIVE) — UNVERIFIED-LIVE; kept a
+    /// plain String so unknown values NEVER panic (annexure rule 15).
+    #[serde(default, deserialize_with = "null_to_default")]
+    pub order_status: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -1172,6 +1689,10 @@ pub struct DhanPlaceSuperOrderRequest {
 pub struct DhanModifySuperOrderRequest {
     /// Dhan client ID.
     pub dhan_client_id: String,
+    /// Dhan order ID — REQUIRED in the modify BODY per the portal capture
+    /// (docs/dhan-ref/dhanhq-v2-upstream-2026-07-03/04-super-orders.md:110);
+    /// the URL path alone is doc-non-conformant. NOT Option — always sent.
+    pub order_id: String,
     /// Which leg to modify.
     pub leg_name: String,
     /// Order type (ENTRY_LEG only).
@@ -1222,6 +1743,10 @@ pub struct SuperOrderLegDetail {
     /// Trailing jump value.
     #[serde(default)]
     pub trailing_jump: f64,
+    /// Total quantity for this leg — Dhan's API literally sends the typo
+    /// `totalQuatity` (verified 2026-07-14). Do NOT "fix" the rename.
+    #[serde(default, rename = "totalQuatity")]
+    pub total_quatity: i64,
 }
 
 /// Super order response (includes leg details).
@@ -1241,6 +1766,28 @@ pub struct DhanSuperOrderResponse {
     /// Leg details array (target + stop loss legs).
     #[serde(default)]
     pub leg_details: Vec<SuperOrderLegDetail>,
+    /// Quantity filled so far (list endpoint — the ONLY super read path).
+    #[serde(default)]
+    pub filled_qty: i64,
+    /// Volume-weighted average fill price (wire typing UNVERIFIED-LIVE —
+    /// probe U2; deserialize f64 + default, treat 0 defensively).
+    #[serde(default)]
+    pub average_traded_price: f64,
+    /// Quantity still open.
+    #[serde(default)]
+    pub remaining_quantity: i64,
+    /// Dhan security ID (STRING in response).
+    #[serde(default)]
+    pub security_id: String,
+    /// Transaction type: "BUY" or "SELL".
+    #[serde(default)]
+    pub transaction_type: String,
+    /// Exchange segment (e.g. "NSE_FNO").
+    #[serde(default)]
+    pub exchange_segment: String,
+    /// Dhan OMS error description (rejection diagnostics).
+    #[serde(default)]
+    pub oms_error_description: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -1561,6 +2108,28 @@ pub enum OmsError {
     /// Maximum modifications per order exceeded.
     #[error("max modifications ({max}) exceeded for order {order_id}")]
     MaxModificationsExceeded { order_id: String, max: u32 },
+
+    /// Cluster F: a live order was refused by the order-readiness gate
+    /// (fail-closed on never-probed / stale / invalid profile / token headroom).
+    #[error("order readiness gate refused: {reason} (ORDER-READY-01)")]
+    OrderReadinessRefused { reason: &'static str },
+
+    /// Cluster F: the OMS order path is HALTED (DH-901 post-retry / DH-902 /
+    /// DH-903 / DATA-810). Cleared only by an operator (`clear_order_halt`) or
+    /// a process restart — never by `reset_daily`. Field is `cause` (not
+    /// `source`) because `&'static str` is not an `std::error::Error`.
+    #[error("OMS order path HALTED by {cause} — operator action required")]
+    OrderPathHalted { cause: &'static str },
+
+    /// Cluster F: DATA-805 stop-all cooldown is active — every order-API call is
+    /// refused for the remaining window, then resumes passively.
+    #[error("Dhan DATA-805 stop-all cooldown active ({remaining_secs}s remaining)")]
+    StopAllCooldown { remaining_secs: u64 },
+    /// The /alerts/* client surface is DISARMED (hardcoded default). No HTTP was
+    /// attempted. Arming is #[cfg(test)]-only until a dated operator-quote
+    /// activation PR exists.
+    #[error("alerts surface disarmed: /alerts request '{operation}' refused (dormant surface)")]
+    AlertsSurfaceDisarmed { operation: &'static str },
 }
 
 // ---------------------------------------------------------------------------
@@ -1588,6 +2157,16 @@ pub struct ReconciliationReport {
 
 /// Exchange segment for NSE F&O (the only segment this system trades).
 pub const EXCHANGE_SEGMENT_NSE_FNO: &str = "NSE_FNO";
+
+/// Synthetic `order_status` the api-client stamps when a 2xx super-order
+/// cancel/modify response carried a body that was PRESENT but UNPARSABLE
+/// (the U6 202-no-body tolerance class).
+///
+/// L5 (2026-07-14 hostile review): the engine treats it as
+/// accepted-with-doubt — the local registry apply still runs, but the
+/// tracked entry is flagged `needs_reconciliation` (the mutation may not
+/// actually have applied broker-side).
+pub const SUPER_ORDER_STATUS_ACCEPTED_UNPARSED_BODY: &str = "ACCEPTED_UNPARSED_BODY";
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -2160,12 +2739,41 @@ mod tests {
             OmsError::TokenExpired,
             OmsError::HttpError("connection refused".to_owned()),
             OmsError::JsonError("unexpected token".to_owned()),
+            OmsError::OrderReadinessRefused { reason: "stale" },
+            OmsError::OrderPathHalted { cause: "DH-901" },
+            OmsError::StopAllCooldown { remaining_secs: 42 },
         ];
 
         for err in &all_errors {
             let display = err.to_string();
             assert!(!display.is_empty(), "Display must not be empty for {err:?}");
         }
+    }
+
+    #[test]
+    fn test_display_order_readiness_refused() {
+        let err = OmsError::OrderReadinessRefused {
+            reason: "profile_invalid",
+        };
+        let s = err.to_string();
+        assert!(s.contains("profile_invalid"));
+        assert!(s.contains("ORDER-READY-01"));
+    }
+
+    #[test]
+    fn test_display_order_path_halted() {
+        let err = OmsError::OrderPathHalted { cause: "DH-902" };
+        let s = err.to_string();
+        assert!(s.contains("DH-902"));
+        assert!(s.contains("HALTED"));
+    }
+
+    #[test]
+    fn test_display_stop_all_cooldown() {
+        let err = OmsError::StopAllCooldown { remaining_secs: 17 };
+        let s = err.to_string();
+        assert!(s.contains("17"));
+        assert!(s.contains("805"));
     }
 
     #[test]
@@ -2715,6 +3323,7 @@ mod tests {
     fn test_modify_super_order_target_only_price() {
         let req = DhanModifySuperOrderRequest {
             dhan_client_id: "1".to_string(),
+            order_id: "SO-1".to_string(),
             leg_name: "TARGET_LEG".to_string(),
             order_type: None,
             quantity: None,
@@ -2725,14 +3334,17 @@ mod tests {
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("\"targetPrice\":1650"));
+        // Ruling 2 fix 1: orderId is REQUIRED in the modify body.
+        assert!(json.contains("\"orderId\":\"SO-1\""));
         assert!(!json.contains("quantity")); // Skipped
-        assert!(!json.contains("price\":")); // Skipped (not targetPrice)
+        assert!(!json.contains("\"price\":")); // Skipped (not targetPrice)
     }
 
     #[test]
     fn test_modify_super_order_sl_only_sl_and_trail() {
         let req = DhanModifySuperOrderRequest {
             dhan_client_id: "1".to_string(),
+            order_id: "SO-2".to_string(),
             leg_name: "STOP_LOSS_LEG".to_string(),
             order_type: None,
             quantity: None,
@@ -2915,11 +3527,406 @@ mod tests {
                 disc_quantity: "0".to_string(),
                 trigger_price: "0".to_string(),
             }],
+            alert_id: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("SMA_5"));
         assert!(json.contains("CROSSING_UP"));
         assert!(json.contains("ONCE"));
+        // Place semantics: the optional Modify-only alertId echo must be
+        // ABSENT — Place bodies stay byte-identical to the pre-2026-07-14 shape.
+        assert!(!json.contains("alertId"));
+    }
+
+    #[test]
+    fn test_modify_request_alert_id_absent_when_none() {
+        let req = DhanConditionalTriggerRequest {
+            dhan_client_id: "1".to_string(),
+            condition: TriggerCondition {
+                comparison_type: "PRICE_WITH_VALUE".to_string(),
+                exchange_segment: "NSE_EQ".to_string(),
+                security_id: "1333".to_string(),
+                indicator_name: None,
+                time_frame: None,
+                operator: "GREATER_THAN".to_string(),
+                comparing_value: Some(250.0),
+                comparing_indicator_name: None,
+                exp_date: None,
+                frequency: "ONCE".to_string(),
+                user_note: None,
+            },
+            orders: vec![],
+            alert_id: None,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(
+            !json.contains("alertId"),
+            "None alert_id must serialize away"
+        );
+    }
+
+    #[test]
+    fn test_modify_request_alert_id_present_when_set() {
+        let req = DhanConditionalTriggerRequest {
+            dhan_client_id: "1".to_string(),
+            condition: TriggerCondition {
+                comparison_type: "PRICE_WITH_VALUE".to_string(),
+                exchange_segment: "NSE_EQ".to_string(),
+                security_id: "1333".to_string(),
+                indicator_name: None,
+                time_frame: None,
+                operator: "GREATER_THAN".to_string(),
+                comparing_value: Some(250.0),
+                comparing_indicator_name: None,
+                exp_date: None,
+                frequency: "ONCE".to_string(),
+                user_note: None,
+            },
+            orders: vec![],
+            alert_id: Some("12345".to_string()),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("\"alertId\":\"12345\""));
+    }
+
+    // -----------------------------------------------------------------------
+    // Multi Order + Conditional Detail Types Tests (2026-07-14)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_multi_order_request_serializes_camel_case_exact() {
+        let req = DhanMultiOrderRequest {
+            dhan_client_id: "100".to_string(),
+            orders: vec![MultiOrderLeg {
+                sequence: "1".to_string(),
+                correlation_id: Some("corr-1".to_string()),
+                transaction_type: "BUY".to_string(),
+                exchange_segment: "NSE_EQ".to_string(),
+                product_type: "CNC".to_string(),
+                order_type: "LIMIT".to_string(),
+                validity: "DAY".to_string(),
+                security_id: "1333".to_string(),
+                quantity: 10,
+                after_market_order: Some(true),
+                amo_time: Some("OPEN".to_string()),
+                price: 250.0,
+                trigger_price: 0.0,
+                disclosed_quantity: 0,
+            }],
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("\"dhanClientId\":\"100\""));
+        assert!(json.contains("\"sequence\":\"1\""));
+        assert!(json.contains("\"correlationId\":\"corr-1\""));
+        assert!(json.contains("\"afterMarketOrder\":true"));
+        assert!(json.contains("\"amoTime\":\"OPEN\""));
+        // disclosedQuantity is an INT here (multi wire), never the conditional
+        // leg's STRING `discQuantity` — the §9.1 trap pinned both ways.
+        assert!(json.contains("\"disclosedQuantity\":0"));
+        assert!(!json.contains("discQuantity"));
+        assert!(!json.contains("disc_quantity"));
+        // Prices are bare FLOATS on the multi wire.
+        assert!(json.contains("\"price\":250.0"));
+        assert!(json.contains("\"triggerPrice\":0.0"));
+    }
+
+    #[test]
+    fn test_conditional_vs_multi_price_type_split() {
+        // Same leg data: TriggerOrder emits a STRING price, MultiOrderLeg a number.
+        let conditional_leg = TriggerOrder {
+            transaction_type: "BUY".to_string(),
+            exchange_segment: "NSE_EQ".to_string(),
+            product_type: "CNC".to_string(),
+            order_type: "LIMIT".to_string(),
+            security_id: "1333".to_string(),
+            quantity: 10,
+            validity: "DAY".to_string(),
+            price: "250.00".to_string(),
+            disc_quantity: "0".to_string(),
+            trigger_price: "0".to_string(),
+        };
+        let multi_leg = MultiOrderLeg {
+            sequence: "1".to_string(),
+            correlation_id: None,
+            transaction_type: "BUY".to_string(),
+            exchange_segment: "NSE_EQ".to_string(),
+            product_type: "CNC".to_string(),
+            order_type: "LIMIT".to_string(),
+            validity: "DAY".to_string(),
+            security_id: "1333".to_string(),
+            quantity: 10,
+            after_market_order: None,
+            amo_time: None,
+            price: 250.0,
+            trigger_price: 0.0,
+            disclosed_quantity: 0,
+        };
+        let conditional_json = serde_json::to_string(&conditional_leg).unwrap();
+        let multi_json = serde_json::to_string(&multi_leg).unwrap();
+        assert!(conditional_json.contains("\"price\":\"250.00\"")); // STRING
+        assert!(multi_json.contains("\"price\":250.0")); // FLOAT
+        // AMO fields absent when None (never fabricated).
+        assert!(!multi_json.contains("afterMarketOrder"));
+        assert!(!multi_json.contains("amoTime"));
+    }
+
+    #[test]
+    fn test_multi_order_response_parses_unknown_order_status_modified_inactive_no_panic() {
+        // yaml sample statuses beyond the repo's 9-variant OrderStatus, plus
+        // a fabricated garbage value — all must parse (annexure rule 15).
+        let json = r#"{"orders":[
+            {"orderId":"O1","sequence":"1","orderStatus":"MODIFIED"},
+            {"orderId":"O2","sequence":"2","orderStatus":"INACTIVE"},
+            {"orderId":"O3","sequence":"3","orderStatus":"FROZEN"}
+        ]}"#;
+        let resp: DhanMultiOrderResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.orders.len(), 3);
+        assert_eq!(resp.orders[0].order_status, "MODIFIED");
+        assert_eq!(resp.orders[1].order_status, "INACTIVE");
+        assert_eq!(resp.orders[2].order_status, "FROZEN");
+    }
+
+    #[test]
+    fn test_multi_order_response_empty_object_defaults() {
+        // An empty JSON OBJECT (`{}`) defaults every field. (A truly EMPTY
+        // 200 body — the PORTAL-documented no-body shape — never reaches
+        // serde: `place_multi_order` returns `DhanMultiOrderResponse::default()`
+        // for empty/whitespace bodies; see the api_client.rs sender tests.)
+        let resp: DhanMultiOrderResponse = serde_json::from_str("{}").unwrap();
+        assert!(resp.orders.is_empty());
+        // The bodyless-200 arm's default is the same empty-orders shape.
+        assert!(DhanMultiOrderResponse::default().orders.is_empty());
+    }
+
+    #[test]
+    fn test_trigger_response_detail_fields_roundtrip() {
+        // Full GET-by-ID doc example verbatim (PORTAL export 2026-06-30):
+        // createdTime UTC-Z, triggeredTime null, lastPrice STRING,
+        // condition with STRING comparingValue, orders echo.
+        let json = r#"{
+            "alertId": "12345",
+            "alertStatus": "ACTIVE",
+            "createdTime": "2019-08-24T14:15:22Z",
+            "triggeredTime": null,
+            "lastPrice": "245.50",
+            "condition": { "comparisonType": "TECHNICAL_WITH_VALUE", "exchangeSegment": "NSE_EQ", "securityId": "12345", "indicatorName": "SMA_5", "timeFrame": "DAY", "operator": "CROSSING_UP", "comparingValue": "250.00", "expDate": "2019-08-24", "frequency": "ONCE", "userNote": "Price crossing SMA" },
+            "orders": [ { "transactionType": "BUY", "exchangeSegment": "NSE_EQ", "productType": "CNC", "orderType": "LIMIT", "securityId": "12345", "quantity": 10, "validity": "DAY", "price": "250.00", "discQuantity": "0", "triggerPrice": "0" } ]
+        }"#;
+        let resp: DhanConditionalTriggerResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.alert_id, "12345");
+        assert_eq!(
+            resp.created_time.as_deref(),
+            Some("2019-08-24T14:15:22Z") // UTC-Z — the ONLY UTC in the family
+        );
+        assert!(resp.triggered_time.is_none()); // null until triggered
+        let last_price = resp.last_price.expect("lastPrice present");
+        assert_eq!(last_price, DhanNumeric::Text("245.50".to_string()));
+        let condition = resp.condition.expect("condition echo present");
+        assert_eq!(
+            condition.comparing_value,
+            Some(DhanNumeric::Text("250.00".to_string())) // STRING in response
+        );
+        let orders = resp.orders.expect("orders echo present");
+        assert_eq!(orders.len(), 1);
+        assert_eq!(
+            orders[0].price,
+            Some(DhanNumeric::Text("250.00".to_string())) // STRING in response
+        );
+        assert_eq!(
+            orders[0].disc_quantity,
+            Some(DhanNumeric::Text("0".to_string()))
+        );
+        assert_eq!(
+            orders[0].trigger_price,
+            Some(DhanNumeric::Text("0".to_string()))
+        );
+
+        // Place/Modify 2-field responses stay byte-identical: the five
+        // additive detail fields serialize away when None (golden check).
+        let place: DhanConditionalTriggerResponse =
+            serde_json::from_str(r#"{"alertId":"12345","alertStatus":"ACTIVE"}"#).unwrap();
+        let place_json = serde_json::to_string(&place).unwrap();
+        assert_eq!(place_json, r#"{"alertId":"12345","alertStatus":"ACTIVE"}"#);
+        assert!(!place_json.contains("createdTime"));
+    }
+
+    #[test]
+    fn test_trigger_response_order_echo_tolerates_missing_and_numeric_fields() {
+        // A leg created via Dhan's web/app UI (or another client) can omit
+        // request-optional fields — the OpenAPI yaml marks NO order
+        // sub-field required — and the family's documented number/string
+        // wobble can echo `price` as a bare number. Neither shape may brick
+        // the response parse (tolerance parity with origin/main, where the
+        // whole echo was serde-ignored).
+        let json = r#"{
+            "alertId": "77",
+            "alertStatus": "ACTIVE",
+            "orders": [ { "transactionType": "BUY", "securityId": "1333", "quantity": 5, "price": 250.5 } ]
+        }"#;
+        let resp: DhanConditionalTriggerResponse = serde_json::from_str(json).unwrap();
+        let orders = resp.orders.expect("orders echo present");
+        assert_eq!(orders.len(), 1);
+        assert_eq!(orders[0].price, Some(DhanNumeric::Num(250.5)));
+        assert!(orders[0].trigger_price.is_none()); // omitted, never a failure
+        assert!(orders[0].disc_quantity.is_none());
+        assert_eq!(orders[0].quantity, 5);
+        assert!(orders[0].validity.is_empty()); // defaulted, never required
+
+        // GET-all: one UI-created sparse alert must not fail the WHOLE list.
+        let list_json = r#"[
+            {"alertId":"A1","alertStatus":"ACTIVE",
+             "orders":[{"transactionType":"BUY","securityId":"1333","quantity":1}]},
+            {"alertId":"A2","alertStatus":"ACTIVE"}
+        ]"#;
+        let list: Vec<DhanConditionalTriggerResponse> = serde_json::from_str(list_json).unwrap();
+        assert_eq!(list.len(), 2);
+        assert!(list[0].orders.is_some());
+        assert!(list[1].orders.is_none());
+    }
+
+    #[test]
+    fn test_dhan_numeric_accepts_number_and_string() {
+        let num: DhanNumeric = serde_json::from_str("245.5").unwrap();
+        assert_eq!(num, DhanNumeric::Num(245.5));
+        assert_eq!(num.as_f64(), Some(245.5));
+        let text: DhanNumeric = serde_json::from_str("\"245.50\"").unwrap();
+        assert_eq!(text, DhanNumeric::Text("245.50".to_string()));
+        assert_eq!(text.as_f64(), Some(245.5));
+        // Round-trips verbatim (string stays a string).
+        assert_eq!(serde_json::to_string(&text).unwrap(), "\"245.50\"");
+    }
+
+    #[test]
+    fn test_dhan_numeric_as_f64_unparsable_is_none() {
+        let garbage = DhanNumeric::Text("not-a-number".to_string());
+        assert_eq!(garbage.as_f64(), None);
+        let padded = DhanNumeric::Text("  250.00  ".to_string());
+        assert_eq!(padded.as_f64(), Some(250.0));
+    }
+
+    #[test]
+    fn test_dhan_numeric_as_i64_boundaries() {
+        // Financial boundary sweep: number, integer string, decimal string,
+        // padded, negative, garbage, and saturating extremes — never panics.
+        assert_eq!(DhanNumeric::Num(5.0).as_i64(), Some(5));
+        assert_eq!(DhanNumeric::Num(5.7).as_i64(), Some(5)); // truncates
+        assert_eq!(DhanNumeric::Num(-3.9).as_i64(), Some(-3));
+        assert_eq!(DhanNumeric::Num(f64::MAX).as_i64(), Some(i64::MAX)); // saturates
+        assert_eq!(DhanNumeric::Num(f64::NAN).as_i64(), Some(0)); // saturating cast
+        assert_eq!(DhanNumeric::Text("5".to_string()).as_i64(), Some(5));
+        assert_eq!(DhanNumeric::Text("5.0".to_string()).as_i64(), Some(5));
+        assert_eq!(DhanNumeric::Text(" 42 ".to_string()).as_i64(), Some(42));
+        assert_eq!(DhanNumeric::Text("-7".to_string()).as_i64(), Some(-7));
+        assert_eq!(DhanNumeric::Text("abc".to_string()).as_i64(), None);
+    }
+
+    #[test]
+    fn test_conditional_get_echo_tolerates_explicit_nulls() {
+        // Family-proven wire shape: the verbatim GET doc example carries
+        // `"triggeredTime": null` — explicit `null` on ANY echo field (not
+        // just a missing key, which `#[serde(default)]` alone covers) must
+        // never brick the GET-by-id or GET-all parse over one leg.
+        let json = r#"{
+            "alertId": null,
+            "alertStatus": null,
+            "createdTime": null,
+            "triggeredTime": null,
+            "lastPrice": null,
+            "condition": {
+                "comparisonType": null,
+                "exchangeSegment": null,
+                "securityId": null,
+                "operator": null,
+                "comparingValue": null,
+                "frequency": null
+            },
+            "orders": [ {
+                "transactionType": null,
+                "exchangeSegment": null,
+                "productType": null,
+                "orderType": null,
+                "securityId": null,
+                "quantity": null,
+                "validity": null,
+                "price": null,
+                "discQuantity": null,
+                "triggerPrice": null
+            } ]
+        }"#;
+        let resp: DhanConditionalTriggerResponse = serde_json::from_str(json).unwrap();
+        assert!(resp.alert_id.is_empty());
+        assert!(resp.alert_status.is_empty());
+        let condition = resp.condition.expect("condition echo present");
+        assert!(condition.comparison_type.is_empty());
+        assert!(condition.exchange_segment.is_empty());
+        assert!(condition.security_id.is_empty());
+        assert!(condition.operator.is_empty());
+        assert!(condition.frequency.is_empty());
+        assert!(condition.comparing_value.is_none());
+        let orders = resp.orders.expect("orders echo present");
+        assert_eq!(orders.len(), 1);
+        assert!(orders[0].transaction_type.is_empty());
+        assert_eq!(orders[0].quantity, 0);
+        assert!(orders[0].price.is_none());
+
+        // GET-all: one all-null-echo alert must not fail the WHOLE list.
+        let list_json = r#"[
+            {"alertId":"A1","alertStatus":"ACTIVE"},
+            {"alertId":null,"alertStatus":null,
+             "orders":[{"transactionType":null,"quantity":null}]}
+        ]"#;
+        let list: Vec<DhanConditionalTriggerResponse> = serde_json::from_str(list_json).unwrap();
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0].alert_id, "A1");
+        assert!(list[1].alert_id.is_empty());
+    }
+
+    #[test]
+    fn test_trigger_order_detail_quantity_tolerates_string_and_null() {
+        // The family's documented number/string wobble (`comparingValue` is
+        // number-in-request / string-in-response) applied to quantity: a
+        // string-echoed quantity must not re-brick GET-all.
+        let from_number: TriggerOrderDetail = serde_json::from_str(r#"{"quantity":5}"#).unwrap();
+        assert_eq!(from_number.quantity, 5);
+        let from_string: TriggerOrderDetail = serde_json::from_str(r#"{"quantity":"5"}"#).unwrap();
+        assert_eq!(from_string.quantity, 5);
+        let from_decimal: TriggerOrderDetail =
+            serde_json::from_str(r#"{"quantity":"5.0"}"#).unwrap();
+        assert_eq!(from_decimal.quantity, 5);
+        let from_null: TriggerOrderDetail = serde_json::from_str(r#"{"quantity":null}"#).unwrap();
+        assert_eq!(from_null.quantity, 0);
+        let missing: TriggerOrderDetail = serde_json::from_str("{}").unwrap();
+        assert_eq!(missing.quantity, 0);
+    }
+
+    #[test]
+    fn test_multi_order_response_tolerates_null_order_id_and_null_orders() {
+        // YAML-only response, UNVERIFIED-LIVE: a REJECTED leg plausibly
+        // echoes `"orderId": null`. A 200 body means the legs are ALREADY
+        // placed at the broker — a JSON brick here would hide which legs
+        // went live.
+        let leg: MultiOrderLegResult =
+            serde_json::from_str(r#"{"orderId":null,"sequence":null,"orderStatus":"REJECTED"}"#)
+                .unwrap();
+        assert!(leg.order_id.is_empty());
+        assert!(leg.sequence.is_empty());
+        assert_eq!(leg.order_status, "REJECTED");
+
+        let mixed: DhanMultiOrderResponse = serde_json::from_str(
+            r#"{"orders":[
+                {"orderId":"112111182198","sequence":"1","orderStatus":"TRANSIT"},
+                {"orderId":null,"sequence":"2","orderStatus":null}
+            ]}"#,
+        )
+        .unwrap();
+        assert_eq!(mixed.orders.len(), 2);
+        assert_eq!(mixed.orders[0].order_id, "112111182198");
+        assert!(mixed.orders[1].order_id.is_empty());
+        assert!(mixed.orders[1].order_status.is_empty());
+
+        let null_orders: DhanMultiOrderResponse =
+            serde_json::from_str(r#"{"orders":null}"#).unwrap();
+        assert!(null_orders.orders.is_empty());
     }
 
     // -----------------------------------------------------------------------
@@ -3048,5 +4055,257 @@ mod tests {
         };
         assert_eq!(fill.segment_code, SEGMENT_CODE_UNKNOWN);
         assert_eq!(fill.fill_lots, 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // Exit-Order Execution Layer types (Cluster B, 2026-07-14)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_super_order_leg_detail_total_quatity_typo_rename() {
+        // Dhan's API literally sends `totalQuatity` (missing 'n') — the
+        // rename must match the typo verbatim, and default to 0 when absent.
+        let json = r#"{"orderId":"L-1","legName":"TARGET_LEG","totalQuatity":75}"#;
+        let leg: SuperOrderLegDetail = serde_json::from_str(json).unwrap();
+        assert_eq!(leg.total_quatity, 75);
+
+        let json_missing = r#"{"orderId":"L-2","legName":"STOP_LOSS_LEG"}"#;
+        let leg2: SuperOrderLegDetail = serde_json::from_str(json_missing).unwrap();
+        assert_eq!(leg2.total_quatity, 0);
+
+        // The corrected spelling must NOT populate the field.
+        let json_correct_spelling = r#"{"orderId":"L-3","totalQuantity":99}"#;
+        let leg3: SuperOrderLegDetail = serde_json::from_str(json_correct_spelling).unwrap();
+        assert_eq!(leg3.total_quatity, 0);
+    }
+
+    #[test]
+    fn test_super_order_response_extended_fill_fields() {
+        // Ruling 2 fix 4: without these the verify loop is blind to fills.
+        let json = r#"{"orderId":"SO-9","orderStatus":"TRADED","correlationId":"c9",
+            "filledQty":50,"averageTradedPrice":123.45,"remainingQuantity":25,
+            "securityId":"49081","transactionType":"SELL","exchangeSegment":"NSE_FNO",
+            "omsErrorDescription":"","legDetails":[]}"#;
+        let resp: DhanSuperOrderResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.filled_qty, 50);
+        assert!((resp.average_traded_price - 123.45).abs() < f64::EPSILON);
+        assert_eq!(resp.remaining_quantity, 25);
+        assert_eq!(resp.security_id, "49081");
+        assert_eq!(resp.transaction_type, "SELL");
+        assert_eq!(resp.exchange_segment, "NSE_FNO");
+        assert_eq!(resp.oms_error_description, "");
+    }
+
+    #[test]
+    fn test_super_order_response_extended_fields_default_when_missing() {
+        // Additive `#[serde(default)]` — the pre-fix 4-field body still parses.
+        let json =
+            r#"{"orderId":"SO-9","orderStatus":"PENDING","correlationId":"","legDetails":[]}"#;
+        let resp: DhanSuperOrderResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.filled_qty, 0);
+        assert_eq!(resp.remaining_quantity, 0);
+        assert!(resp.average_traded_price.abs() < f64::EPSILON);
+        assert_eq!(resp.security_id, "");
+        assert_eq!(resp.oms_error_description, "");
+    }
+
+    #[test]
+    fn test_modify_super_order_request_body_carries_order_id_camel_case() {
+        let req = DhanModifySuperOrderRequest {
+            dhan_client_id: "100".to_string(),
+            order_id: "112111182198".to_string(),
+            leg_name: "ENTRY_LEG".to_string(),
+            order_type: Some("LIMIT".to_string()),
+            quantity: Some(75),
+            price: Some(1300.0),
+            target_price: Some(1400.0),
+            stop_loss_price: Some(1250.0),
+            trailing_jump: Some(10.0),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("\"orderId\":\"112111182198\""));
+        assert!(json.contains("\"dhanClientId\":\"100\""));
+        assert!(json.contains("\"legName\":\"ENTRY_LEG\""));
+    }
+
+    #[test]
+    fn test_slicing_response_many_array_shape() {
+        // The SDK-observed shape: a list of per-slice responses.
+        let json = r#"[{"orderId":"S-1","orderStatus":"TRANSIT"},{"orderId":"S-2","orderStatus":"TRANSIT"}]"#;
+        let resp: SlicingResponse = serde_json::from_str(json).unwrap();
+        match resp {
+            SlicingResponse::Many(orders) => {
+                assert_eq!(orders.len(), 2);
+                assert_eq!(orders[0].order_id, "S-1");
+                assert_eq!(orders[1].order_id, "S-2");
+            }
+            SlicingResponse::One(_) => panic!("array must deserialize as Many"),
+        }
+    }
+
+    #[test]
+    fn test_slicing_response_one_object_shape() {
+        // The portal-documented shape: a single response object.
+        let json = r#"{"orderId":"S-1","orderStatus":"TRANSIT"}"#;
+        let resp: SlicingResponse = serde_json::from_str(json).unwrap();
+        match resp {
+            SlicingResponse::One(order) => assert_eq!(order.order_id, "S-1"),
+            SlicingResponse::Many(_) => panic!("single object must deserialize as One"),
+        }
+    }
+
+    #[test]
+    fn test_slicing_response_garbage_is_a_typed_error() {
+        // Neither shape → typed serde error, never a panic.
+        let result: Result<SlicingResponse, _> = serde_json::from_str(r#""not-an-order""#);
+        assert!(result.is_err());
+        let result2: Result<SlicingResponse, _> = serde_json::from_str("42");
+        assert!(result2.is_err());
+    }
+
+    #[test]
+    fn test_place_super_order_request_engine_type_constructs() {
+        let req = PlaceSuperOrderRequest {
+            security_id: 49081,
+            transaction_type: TransactionType::Buy,
+            order_type: OrderType::Limit,
+            product_type: ProductType::Intraday,
+            quantity: 75,
+            price: 100.0,
+            target_price: 110.0,
+            stop_loss_price: 95.0,
+            trailing_jump: 0.0,
+            lot_size: 75,
+            expiry_date: None,
+        };
+        let cloned = req.clone();
+        assert_eq!(cloned.security_id, 49081);
+        assert!(format!("{req:?}").contains("PlaceSuperOrderRequest"));
+    }
+
+    #[test]
+    fn test_place_forever_oco_request_engine_type_constructs() {
+        let req = PlaceForeverOcoRequest {
+            security_id: 1333,
+            transaction_type: TransactionType::Sell,
+            product_type: ProductType::Cnc,
+            order_type: OrderType::Limit,
+            validity: OrderValidity::Day,
+            quantity: 5,
+            price: 1428.0,
+            trigger_price: 1427.0,
+            oco_leg: Some(OcoSecondLeg {
+                price: 1420.0,
+                trigger_price: 1419.0,
+                quantity: 5,
+            }),
+            expiry_date: None,
+        };
+        let cloned = req.clone();
+        assert!(cloned.oco_leg.is_some());
+        assert!(format!("{req:?}").contains("OcoSecondLeg"));
+    }
+
+    #[test]
+    fn test_execution_verdict_variants_are_distinct() {
+        let filled = ExecutionVerdict::Filled {
+            traded_qty: 10,
+            avg_price: 100.0,
+        };
+        assert_ne!(filled, ExecutionVerdict::SimulatedFilled);
+        assert_ne!(
+            ExecutionVerdict::Pending { elapsed_secs: 5 },
+            ExecutionVerdict::PendingAtLimit { elapsed_secs: 5 }
+        );
+        assert_eq!(
+            ExecutionVerdict::Unknown {
+                raw_status: "GARBAGE".to_string()
+            },
+            ExecutionVerdict::Unknown {
+                raw_status: "GARBAGE".to_string()
+            }
+        );
+        assert_ne!(
+            ExecutionVerdict::Terminal {
+                status: OrderStatus::Rejected
+            },
+            ExecutionVerdict::Terminal {
+                status: OrderStatus::Cancelled
+            }
+        );
+    }
+
+    #[test]
+    fn test_modify_super_order_leg_enum_variants_construct() {
+        let entry = ModifySuperOrderLeg::Entry {
+            order_type: OrderType::Limit,
+            quantity: 75,
+            price: 100.0,
+            target_price: 110.0,
+            stop_loss_price: 95.0,
+            trailing_jump: 2.0,
+        };
+        let target = ModifySuperOrderLeg::Target {
+            target_price: 112.0,
+        };
+        let sl = ModifySuperOrderLeg::StopLoss {
+            stop_loss_price: 96.0,
+            trailing_jump: 0.0,
+        };
+        // Type-level leg restriction: Target carries ONLY target_price;
+        // StopLoss/Entry carry a NON-Option trailing_jump (always resent).
+        assert!(format!("{entry:?}").contains("trailing_jump"));
+        assert!(!format!("{target:?}").contains("trailing_jump"));
+        assert!(format!("{sl:?}").contains("trailing_jump"));
+    }
+
+    #[test]
+    fn test_managed_super_order_and_verify_state_construct() {
+        let mso = ManagedSuperOrder {
+            entry_order_id: "PAPER-SO-1".to_string(),
+            correlation_id: "c1".to_string(),
+            security_id: 49081,
+            transaction_type: TransactionType::Buy,
+            quantity: 75,
+            entry_price: 100.0,
+            entry_status_raw: "PENDING".to_string(),
+            target: LegState {
+                order_id: "PAPER-SO-1-TGT".to_string(),
+                status_raw: "PENDING".to_string(),
+                price: 110.0,
+            },
+            stop_loss: LegState {
+                order_id: "PAPER-SO-1-SL".to_string(),
+                status_raw: "PENDING".to_string(),
+                price: 95.0,
+            },
+            trailing_jump: 0.0,
+            status: OrderStatus::Pending,
+            modification_count: 0,
+            created_at_us: 1,
+            updated_at_us: 1,
+        };
+        assert_eq!(mso.clone().target.order_id, "PAPER-SO-1-TGT");
+
+        let vs = VerifyState {
+            attempts: 1,
+            first_probe_us: 42,
+            last_verdict_label: "pending",
+        };
+        assert_eq!(vs.clone().attempts, 1);
+    }
+
+    #[test]
+    fn test_super_order_placement_snapshot_constructs() {
+        let placement = SuperOrderPlacement {
+            entry_order_id: "SO-1".to_string(),
+            legs: vec![SuperOrderLegSnapshot {
+                leg: OrderLeg::TargetLeg,
+                order_id: "SO-1-TGT".to_string(),
+                status_raw: "PENDING".to_string(),
+            }],
+        };
+        assert_eq!(placement.clone().legs.len(), 1);
+        assert_eq!(placement.legs[0].leg, OrderLeg::TargetLeg);
     }
 }

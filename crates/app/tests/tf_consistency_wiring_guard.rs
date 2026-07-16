@@ -91,6 +91,11 @@ fn test_tf_consistency_boot_module_is_not_a_stub() {
         "TfVerify02RunDegraded",     // TF-VERIFY-02 emit site
         "TfConsistencySummary",      // the one-per-run Telegram summary
         "TfConsistencyAborted",      // the supervisor abort page
+        "daily_marker_exists(",      // once-per-day RunCatchUp gate (2026-07-15)
+        "write_daily_marker(",       // marker written on PASS only (G4a, fix round 2)
+        "should_notify_summary(",    // no_data log-only predicate (2026-07-15)
+        "daily_marker_path(",        // G11: the skip line names the exact marker path
+        r#"status_label == "pass""#, // G4a: PASS is the ONLY marker-sealing verdict
     ] {
         assert!(
             src.contains(needle),
@@ -99,6 +104,16 @@ fn test_tf_consistency_boot_module_is_not_a_stub() {
              hollowed into a stub)."
         );
     }
+    // G4a (fix round 2): no_data must NEVER seal the daily marker again —
+    // a trading-day no_data can be a silently-empty discovery dataset
+    // (the PR #1474 blind-since-birth class); marker-sealing it made
+    // every same-day restart read "nothing to check" forever.
+    assert!(
+        !src.contains(r#"status_label == "no_data") "#)
+            && !src.contains(r#"|| status_label == "no_data""#),
+        "the marker write must be gated on PASS only — a no_data disjunct \
+         re-opens the silently-sealed-blind-day hole (G4a)."
+    );
 }
 
 #[test]

@@ -39,7 +39,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use tokio::sync::mpsc;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use tickvault_common::config::QuestDbConfig;
 use tickvault_common::constants::{IST_UTC_OFFSET_NANOS, IST_UTC_OFFSET_SECONDS_I64};
@@ -249,25 +249,36 @@ impl RiskAlertSink for RiskAlertBridge {
 /// (≤300 chars, JWT/credential redaction) BEFORE it can reach a Telegram
 /// body. The ILP `detail` leg was already bounded at append; this closes
 /// the Telegram leg.
+/// `None` = the alert is LOG-SINK-ONLY (the Cluster F taxonomy variants,
+/// merged 2026-07-16): per the 2026-07-14 Dhan noise lock no new Dhan
+/// Telegram page may exist outside the documented §2 set — wiring one needs
+/// a dated noise-lock rule edit first (ORDER-READY-01 paging is a flagged
+/// follow-up in `order-readiness-error-codes.md`).
 #[must_use]
-pub fn map_oms_alert(alert: &OmsAlert) -> NotificationEvent {
+pub fn map_oms_alert(alert: &OmsAlert) -> Option<NotificationEvent> {
     match alert {
         OmsAlert::OrderRejected {
             correlation_id,
             reason,
-        } => NotificationEvent::OrderRejected {
+        } => Some(NotificationEvent::OrderRejected {
             correlation_id: correlation_id.clone(),
             reason: capture_rest_error_body(reason),
-        },
+        }),
         OmsAlert::CircuitBreakerOpened {
             consecutive_failures,
-        } => NotificationEvent::CircuitBreakerOpened {
+        } => Some(NotificationEvent::CircuitBreakerOpened {
             consecutive_failures: *consecutive_failures,
-        },
-        OmsAlert::CircuitBreakerClosed => NotificationEvent::CircuitBreakerClosed,
-        OmsAlert::RateLimitExhausted { limit_type } => NotificationEvent::RateLimitExhausted {
-            limit_type: limit_type.clone(),
-        },
+        }),
+        OmsAlert::CircuitBreakerClosed => Some(NotificationEvent::CircuitBreakerClosed),
+        OmsAlert::RateLimitExhausted { limit_type } => {
+            Some(NotificationEvent::RateLimitExhausted {
+                limit_type: limit_type.clone(),
+            })
+        }
+        OmsAlert::OrderReadinessRefused { .. }
+        | OmsAlert::OmsHalted { .. }
+        | OmsAlert::Dh904LadderExhausted { .. }
+        | OmsAlert::OrderApiStopAll { .. } => None,
     }
 }
 
@@ -496,8 +507,17 @@ struct AlertRowParts {
     detail: String,
 }
 
-fn alert_row_parts(alert: &OmsAlert) -> AlertRowParts {
-    match alert {
+/// `None` = no `order_audit` row for this alert (the Cluster F log-sink-only
+/// variants, merged 2026-07-16): the `OrderAuditEvent` wire-string set is a
+/// DEDUP-keyed stable vocabulary — extending it for alerts whose declared
+/// forensic record is the engine's coded log lines would be a schema change
+/// smuggled through a merge.
+fn alert_row_parts(alert: &OmsAlert) -> Option<AlertRowParts> {
+    Some(match alert {
+        OmsAlert::OrderReadinessRefused { .. }
+        | OmsAlert::OmsHalted { .. }
+        | OmsAlert::Dh904LadderExhausted { .. }
+        | OmsAlert::OrderApiStopAll { .. } => return None,
         OmsAlert::OrderRejected {
             correlation_id,
             reason,
@@ -523,7 +543,7 @@ fn alert_row_parts(alert: &OmsAlert) -> AlertRowParts {
             correlation_id: String::new(),
             detail: format!("limit_type={limit_type}"),
         },
-    }
+    })
 }
 
 /// Append + flush one order_audit row; ledger `appended` increments ONLY
@@ -610,7 +630,22 @@ pub(crate) async fn run_order_side_consumer(
         match msg {
             OrderSideMsg::Alert(alert) => {
                 alerts = alerts.saturating_add(1);
-                let parts = alert_row_parts(&alert);
+                // Cluster F alerts (merge reconciliation 2026-07-16) are
+                // LOG-SINK-ONLY per the 2026-07-14 Dhan noise lock — no new
+                // Dhan Telegram page outside the §2 set without a dated rule
+                // edit, and no new order_audit wire strings (the engine's
+                // coded error!/warn! emit sites are their forensic record;
+                // ORDER-READY-01 paging is a flagged follow-up in
+                // order-readiness-error-codes.md).
+                let Some(parts) = alert_row_parts(&alert) else {
+                    warn!(
+                        alert = ?alert,
+                        "order-side Cluster F alert — log-sink-only per the \
+                         2026-07-14 noise lock (no Telegram page, no audit row; \
+                         the engine's coded log lines carry the forensics)"
+                    );
+                    continue;
+                };
                 if parts.event == OrderAuditEvent::Rejected {
                     rejected = rejected.saturating_add(1);
                 }
@@ -646,8 +681,19 @@ pub(crate) async fn run_order_side_consumer(
                     // Closed is a genuine recovery edge — unpaced.
                     OmsAlert::CircuitBreakerOpened { .. } => Some(PacedAlertKind::CircuitOpen),
                     OmsAlert::CircuitBreakerClosed => None,
+                    // Cluster F variants never reach here (the log-sink-only
+                    // guard above `continue`d) — total match, no panic arm.
+                    OmsAlert::OrderReadinessRefused { .. }
+                    | OmsAlert::OmsHalted { .. }
+                    | OmsAlert::Dh904LadderExhausted { .. }
+                    | OmsAlert::OrderApiStopAll { .. } => None,
                 };
-                let event = map_oms_alert(&alert);
+                let Some(event) = map_oms_alert(&alert) else {
+                    // Unreachable in practice (the guard above already
+                    // `continue`d for Cluster F variants) — fail SOFT, never
+                    // a panic arm (no false page, no dropped legacy alert).
+                    continue;
+                };
                 match paced_kind.map(|k| pacer.record(k, now_secs)) {
                     Some(PaceAction::Suppress) => {
                         info!(
@@ -868,7 +914,7 @@ mod tests {
         });
         assert!(matches!(
             rejected,
-            NotificationEvent::OrderRejected { ref correlation_id, ref reason }
+            Some(NotificationEvent::OrderRejected { ref correlation_id, ref reason })
                 if correlation_id == "c1" && reason == "DH-906"
         ));
         let opened = map_oms_alert(&OmsAlert::CircuitBreakerOpened {
@@ -876,19 +922,37 @@ mod tests {
         });
         assert!(matches!(
             opened,
-            NotificationEvent::CircuitBreakerOpened {
+            Some(NotificationEvent::CircuitBreakerOpened {
                 consecutive_failures: 5
-            }
+            })
         ));
         let closed = map_oms_alert(&OmsAlert::CircuitBreakerClosed);
-        assert!(matches!(closed, NotificationEvent::CircuitBreakerClosed));
+        assert!(matches!(
+            closed,
+            Some(NotificationEvent::CircuitBreakerClosed)
+        ));
         let rate = map_oms_alert(&OmsAlert::RateLimitExhausted {
             limit_type: "per_second".to_string(),
         });
         assert!(matches!(
             rate,
-            NotificationEvent::RateLimitExhausted { ref limit_type } if limit_type == "per_second"
+            Some(NotificationEvent::RateLimitExhausted { ref limit_type }) if limit_type == "per_second"
         ));
+        // Cluster F taxonomy variants (merged 2026-07-16) are LOG-SINK-ONLY
+        // per the 2026-07-14 Dhan noise lock: no Telegram event, no
+        // order_audit row — both mappers return None.
+        let halted = OmsAlert::OmsHalted {
+            cause: "DH-902",
+            detail: "no api access".to_string(),
+        };
+        assert!(map_oms_alert(&halted).is_none());
+        assert!(alert_row_parts(&halted).is_none());
+        let refused = OmsAlert::OrderReadinessRefused {
+            reason: "no_probe",
+            correlation_id: "c9".to_string(),
+        };
+        assert!(map_oms_alert(&refused).is_none());
+        assert!(alert_row_parts(&refused).is_none());
     }
 
     /// The jargon→English mapping is TOTAL — unknown slugs get the
@@ -1124,7 +1188,7 @@ mod tests {
             correlation_id: "c1".to_string(),
             reason: huge,
         });
-        if let NotificationEvent::OrderRejected { reason, .. } = mapped {
+        if let Some(NotificationEvent::OrderRejected { reason, .. }) = mapped {
             assert!(
                 reason.chars().count() <= 300,
                 "reason must be bounded to 300 chars, got {}",

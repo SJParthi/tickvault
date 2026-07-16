@@ -28,12 +28,20 @@ loom = { workspace = true, optional = true }
 
 [features]
 loom = ["dep:loom"]
+# Gate 2 of the Groww order-side live-fire lattice (groww-second-feed-scope
+# §39.2). NON-DEFAULT: a default build excludes the entire
+# crates/trading/src/oms/groww subtree.
+groww_orders = []
 
 [dev-dependencies]
 tickvault-core = { path = "../core" }
 criterion = { workspace = true }
 dhat = { workspace = true }
 proptest = { workspace = true }
+# Cluster F: enable tokio paused-time (`start_paused`) for deterministic,
+# flake-free ladder/cooldown-latch tests — feature-only, no new crate (mirrors
+# crates/api + crates/core dev-deps). Workspace-pinned per cargo rules.
+tokio = { workspace = true, features = ["test-util"] }
 
 [[bench]]
 name = "oms"

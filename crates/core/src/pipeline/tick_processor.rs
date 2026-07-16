@@ -1281,18 +1281,12 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                     }
                 }
 
-                // Wave 2 Item 8 (G4) — record this tick observation in
-                // the global gap detector. O(1) hot-path: single
-                // OnceLock read + one papaya insert. No-op when the
-                // detector is not installed. Latency-hunt 2026-06-10:
-                // reuse `tick_start` (captured ≤1 µs earlier) instead of
-                // a third per-tick clock read (~30 ns measured); the
-                // detector's silence threshold is 30 s.
-                if let Some(seg) =
-                    tickvault_common::types::ExchangeSegment::from_byte(tick.exchange_segment_code)
-                {
-                    super::tick_gap_detector::record_tick_global(tick.security_id, seg, tick_start);
-                }
+                // Tick-gap detector record site DELETED in PR-C3
+                // (2026-07-14, operator Q4-ii 2026-07-13): the Wave-2
+                // Item-8 `record_tick_global` call that lived here fed the
+                // retired per-SID gap detector — this Dhan WS pipeline was
+                // its ONLY producer, so the detector died with the lane.
+                // FEED-level stall detection is FEED-STALL-01.
 
                 // Filter junk ticks: NaN/Infinity, zero/negative LTP,
                 // or epoch timestamps (heartbeat/init frames from Dhan).

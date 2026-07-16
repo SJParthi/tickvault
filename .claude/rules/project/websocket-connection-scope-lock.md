@@ -376,6 +376,22 @@ number reproducible from this repository.
 > line), ready for the day we place orders again. A third supplier (GDF) is being
 > auditioned separately — the wall hooks stay ready for their board.
 
+## 2026-07-15 Amendment — Groww live WS retired; live market-data WS count 1 → 0 (REST-only runtime)
+
+> **Operator directive 2026-07-15 (received directly in this session):** Q1: *"remove the whole Groww live feed; keep only spot 1m and option chain for both brokers; go."*
+> Approval Q2 (typos preserved): *"go aehad approv ed dude"*.
+
+Effects: the Groww live NATS-over-WS feed — the SOLE live market-data feed per the 2026-07-13 amendment —
+is RETIRED. **Total live market-data WebSocket connections: 0.** Market data is REST-only for BOTH brokers:
+the Dhan §8 spot-1m + option-chain pulls and the Groww §9/§38 spot-1m + option-chain (+ bounded contract)
+pulls (`no-rest-except-live-feed-2026-06-27.md`). Order/position live-push channels remain a SEPARATE,
+authorized surface per the operator's 2026-07-15 order-side directive (recorded by the order-side session;
+see the cluster-A rule updates) — market data = per-minute REST pull, order/position events = live push;
+the dormant `order_update_connection.rs` module ruling in §A.1 is UNCHANGED. The GDF lock
+(`gdf-third-feed-scope-2026-07-13.md`) is UNTOUCHED — it is the ONLY path to any future live market-data
+WebSocket. Where the 2026-07-13 amendment's §A table names Groww "THE SOLE LIVE MARKET-DATA FEED", this
+amendment supersedes that row.
+
 ---
 
 ## Trigger (auto-loaded paths)

@@ -19,6 +19,7 @@
 //! active snapshots are meaningless — there are only 4 instruments.
 
 pub mod boot_ordering_gate;
+pub mod chain_snapshot;
 // Candle-engine re-architecture #T1b: `candle_aggregator` (Engine A)
 // DELETED — Engine B (the multi-TF aggregator) is the only candle engine.
 // PR #4 (2026-05-19): `depth_sequence_tracker` module DELETED.
@@ -30,15 +31,14 @@ pub mod prev_close_writer;
 pub mod prev_day_close_stamper;
 pub mod prev_oi_cache;
 pub mod tick_enricher;
-pub mod tick_gap_detector;
+// tick_gap_detector DELETED in PR-C3 (2026-07-14, operator Q4-ii 2026-07-13
+// — websocket-connection-scope-lock.md "2026-07-13 Amendment" §B item 4):
+// fed only by the retired Dhan WS pipeline; WS-GAP-06 retired with it.
 pub mod tick_processor;
 pub mod volume_delta_tracker;
 pub mod volume_monotonicity_guard;
 
 // Candle-engine re-architecture #T1b: `CandleAggregator` re-export retired.
 // PR #4 (2026-05-19): depth_sequence_tracker re-exports retired.
-pub use tick_gap_detector::{
-    SharedTickGapDetector, TICK_GAP_COALESCE_WINDOW_SECS_DEFAULT, TICK_GAP_THRESHOLD_SECS_DEFAULT,
-    TickGapDetector, TickGapKey,
-};
+// PR-C3 (2026-07-14): tick_gap_detector re-exports retired with the module.
 pub use tick_processor::{init_prev_close_cache_dir, run_tick_processor};

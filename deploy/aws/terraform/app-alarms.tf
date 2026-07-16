@@ -75,9 +75,11 @@ locals {
 # + `ws_failed_connections` (tv_websocket_failed_connections_count) watched
 # the deleted main-feed pool watchdog's gauges — no emit site exists, so the
 # alarms could never fire again (permanent missing-data). Removed with their
-# window-gate entries. Groww feed liveness is owned by groww_ws_inactive +
-# groww_stall_restart_storm + the market-hours liveness alarm (re-pointed to
-# the Groww lag gauge in Phase A).
+# window-gate entries. 2026-07-15 (Groww live-feed retirement):
+# groww_ws_inactive + groww_stall_restart_storm ALSO retired — their
+# gauge/counter producers (the Groww bridge + sidecar stall watchdog) were
+# deleted; in-session process liveness is owned by the market-hours liveness
+# alarm, re-pointed to tv_rest_1m_fire_heartbeat.
 # ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
 # 3. Order-update WebSocket down — RETIRED 2026-07-14 (operator Dhan noise
@@ -89,49 +91,13 @@ locals {
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
-# 3b. Groww feed inactive (operator 2026-07-06 — Groww feed-down alerting).
-# `tv_groww_ws_active` is the CONNECTED-level 0/1 gauge from the Groww
-# bridge loop: 1 while the connected episode holds (socket connected +
-# subscribed OR streaming, backed by FRESH sidecar status / tick evidence —
-# a stale status file left by a killed or prior-day sidecar, or a replayed
-# pre-disable tick backlog, can never read 1). Connected-level (not
-# streaming-level) so the pre-open subscribed→first-tick window does not
-# page every morning. REGISTRATION MATCHES THE ORDER-UPDATE PRECEDENT
-# (2026-07-06 boot-grace fix): the gauge is registered only at the FIRST
-# connected episode of the session — the Groww activation chain (CSV
-# pull-until-success → sidecar launch incl. possible venv re-provision →
-# SSM token → NATS connect → subscribe → notifier-slot fill) routinely
-# exceeds any fixed N×60s grace on cold/slow boots, so an honest 0 from the
-# first enabled wake produced a deterministic pre-open false ALARM/OK page
-# pair; MISSING + notBreaching stays silent for a boot chain of ANY length.
-# Once registered, 0/1 publishes every wake (and 0 on disabled wakes), so a
-# mid-session outage, a FAILED disable→re-enable (sidecar auth reject), and
-# a runtime disable all fire honestly. HONEST ENVELOPE: a sidecar DEAD AT
-# BOOT (never connects at all) leaves the metric missing and this alarm
-# silent — that class is paged by the sidecar supervisor's reject Telegrams
-# + the FEED-STALL-01 watchdog, not by this alarm. A session where Groww is
-# never enabled also stays missing, so a deliberate multi-day disable never
-# pages daily.
-# treat_missing_data = notBreaching: metric is missing whenever the box is
-# intentionally stopped (16:30 IST / weekends), during a deploy gap, or for
-# a Groww-disabled session — the same stuck-FIRING fix rationale as
-# ws_pool_all_dead (2026-06-02).
+# 3b. Groww feed inactive — RETIRED 2026-07-15 (Groww live-feed retirement):
+# `tv_groww_ws_active` was written ONLY by the deleted Groww bridge loop, so
+# the alarm could never fire again (permanent missing-data;
+# treat_missing_data=notBreaching made it silently dead, not stuck-FIRING).
+# Process liveness in-session is owned by the market-hours liveness alarm,
+# re-pointed to tv_rest_1m_fire_heartbeat in the same PR.
 # ---------------------------------------------------------------------------
-resource "aws_cloudwatch_metric_alarm" "groww_ws_inactive" {
-  alarm_name          = "tv-${var.environment}-groww-ws-inactive"
-  alarm_description   = "Groww feed lost its connection after being up this session. Groww prices are not flowing. If the feed was deliberately switched off, re-enable it from the feeds page; otherwise recovery is automatic — investigate if this stays firing. (A sidecar that never connected at boot is paged by the Groww reject alerts, not this alarm. A whole-process abort — e.g. a release-build panic — makes this metric go MISSING rather than 0, which stays silent here; that class is paged by the restart/boot Telegram chain.)"
-  comparison_operator = "LessThanThreshold"
-  evaluation_periods  = 2
-  metric_name         = "tv_groww_ws_active"
-  namespace           = local.app_namespace
-  period              = 60
-  statistic           = "Minimum"
-  threshold           = 1
-  treat_missing_data  = "notBreaching"
-  dimensions          = local.app_dimensions
-  alarm_actions       = local.app_alarm_actions
-  ok_actions          = local.app_alarm_ok
-}
 
 # ---------------------------------------------------------------------------
 # 4. QuestDB disconnected — persistence backed up to rescue ring + spill
@@ -153,84 +119,20 @@ resource "aws_cloudwatch_metric_alarm" "questdb_disconnected" {
 }
 
 # ---------------------------------------------------------------------------
-# 5. Many instruments silent — partial feed degradation
+# 5. RETIRED in PR-C3 (2026-07-14): tick-gap-instruments-silent
 #
-# RETUNED 2026-07-06 (silent-feed incident): Dhan degraded ALL day — 29-67 of
-# 776 instruments silent EVERY minute — and the old threshold=100 never
-# crossed, so zero pages. New tuning:
-#   - threshold 40 (fires at >=41), PROVISIONAL. Round-3 correction
-#     2026-07-08 (review finding 4): the first retune shipped 25, BELOW the
-#     codebase's own documented healthy always-silent floor — main.rs's
-#     2026-07-03 D2 note (live-verified) records "~33 illiquid/suspended
-#     SIDs are ALWAYS silent" under the ~775-SID DailyUniverse (NT-15 boot
-#     seeding makes every subscribed SID a tick-gap map key), and this gauge
-#     is set from the SAME scan with NO always-silent exclusion — so 25
-#     would have breached EVERY healthy in-session minute, latched within
-#     ~10-12 min of the 09:20 gate-open, and paged daily (alert-fatigue
-#     inversion of the zero-page incident). 40 clears the ~33 floor with
-#     margin and aligns with the sibling SLO-degraded alarm (freshness
-#     breaches <0.95 at >=39 silent of 776). HONEST COVERAGE LIMIT: the
-#     incident's 29-40-silent minutes are indistinguishable from the
-#     documented healthy floor by count alone — that marginal band is owned
-#     by the SLO-degraded (>=39-silent freshness) + lag-p99 alarms; this
-#     alarm pages on the sustained upper band (>40). PROVISIONAL + one
-#     trading-week soak of the in-session gauge distribution mandated
-#     (mirrors the boundary-storm 2000 soak); ratchet with a dated note.
-#     ABSOLUTE, not %-of-universe: no universe-size denominator exists in CW
-#     (tv_universe_size is kind-labeled and folds under the host-only EMF
-#     dimensions), and the universe is envelope-locked [100, 1200], so
-#     40 = 5.2% of today's ~776 / 3.3% at the 1200 cap. DATED REVISIT:
-#     re-tune if the universe re-scopes toward the 1200 cap.
-#   - M-of-N 10-of-12 at period=60/Maximum (1 datapoint per 60s agent scrape):
-#     a value flapping 39/41/39 neither pages nor lets one clean scrape erase
-#     9 minutes of evidence; a 1-3 min reconnect blip cannot reach 10 breaching
-#     minutes.
-#   - PRE-OPEN PIN (round-4 correction 2026-07-08, final-review findings
-#     1/2/4): the producer (main.rs tick-gap scan) pins the gauge to 0 during
-#     the NSE pre-open/auction window [09:00, 09:15) IST — the 09:08-09:15
-#     matching/buffer freeze makes the boot-seeded ~775 SIDs legitimately
-#     silent (values in the hundreds >> 40), and this alarm's 12-min lookback
-#     (the LONGEST of any gated alarm) at the 09:20 gate-open would otherwise
-#     hold ~7 guaranteed breaching pre-open datapoints (the gate Lambda's
-#     forced-OK does NOT purge datapoints) -> only ~3 open-ramp minutes > 40
-#     needed for a near-daily false page at ~09:21. Exact mirror of the SLO
-#     tick_freshness pre-open pin; ratcheted by
-#     test_tick_gap_silent_gauge_producer_pins_pre_open_to_zero. The mandated
-#     soak week additionally checks the 09:20-09:25 transition band, not just
-#     the steady-state distribution.
-#   - MARKET-HOURS GATE (audit-findings Rule 3, MANDATORY): the gauge is set
-#     only in-session (main.rs tick-gap scan gates on
-#     is_within_trading_session_ist), so the LAST in-session value keeps being
-#     re-scraped 15:30->16:30 IST — a stale post-close value must never page.
-#     Actions OFF by default; the shared market-hours gate Lambda
-#     (market-hours-liveness-alarm.tf) enables them 09:20-15:35 IST Mon-Fri.
-#   - 2026-07-10 §36.7 (FUTIDX all-months): far-month (non-nearest) index
-#     future SIDs are excluded at the GAUGE PRODUCER (main.rs
-#     far_month_future_sids exclusion set) — far monthly serials tick
-#     sparsely by nature and would lift the healthy ~33 always-silent floor
-#     toward this threshold. Threshold 40 and the ~33 floor therefore STAND
-#     unchanged; the excluded SIDs remain seeded in the detector, so the
-#     WS-GAP-06 per-SID log still names a never-ticking month.
+# The `tv-<env>-tick-gap-instruments-silent` alarm was DELETED with its
+# gauge producer — the per-SID tick-gap detector retired per the operator's
+# 2026-07-13 Q4-ii ruling (websocket-connection-scope-lock.md "2026-07-13
+# Amendment" §B item 4: the detector was fed only by the retired Dhan WS
+# lane, so `tv_tick_gap_instruments_silent` would never be written again —
+# keeping the alarm would orphan a dead monitor). Per-SID silence
+# visibility is now the scoreboard presence/coverage columns (15:45 IST);
+# FEED-level stall detection retired 2026-07-15 with the Groww live feed.
+# The 2026-07-06/07-08 retune history (threshold 100 -> 40 PROVISIONAL,
+# pre-open pin, ~33 always-silent floor) is retained in git history.
 # ---------------------------------------------------------------------------
-resource "aws_cloudwatch_metric_alarm" "tick_gap_instruments_silent" {
-  alarm_name          = "tv-${var.environment}-tick-gap-instruments-silent"
-  alarm_description   = "> 40 instruments silent (tick-gap threshold, 30s default) sustained >=10 of 12 min in-market. Partial feed degradation — slow socket or Dhan segment outage. Threshold 40 is PROVISIONAL (2026-07-08: sits above the documented ~33 always-silent healthy floor — main.rs D2 note — with margin; observe one trading week of the in-session gauge distribution + ratchet with a dated note; the 29-40 marginal band is owned by the SLO-degraded + lag-p99 alarms). Actions gated to 09:20-15:35 IST Mon-Fri by the market-hours gate Lambda (the gauge is written in-session only, so its last value goes stale post-close). See WS-GAP-06 runbook."
-  comparison_operator = "GreaterThanThreshold"
-  evaluation_periods  = 12
-  datapoints_to_alarm = 10
-  metric_name         = "tv_tick_gap_instruments_silent"
-  namespace           = local.app_namespace
-  period              = 60
-  statistic           = "Maximum"
-  threshold           = 40
-  treat_missing_data  = "notBreaching"
-  dimensions          = local.app_dimensions
-  # Actions OFF by default; the market-hours gate Lambda flips them ON
-  # 09:20-15:35 IST Mon-Fri (market-hours-liveness-alarm.tf).
-  actions_enabled = false
-  alarm_actions   = local.app_alarm_actions
-  ok_actions      = local.app_alarm_ok
-}
+
 
 # ---------------------------------------------------------------------------
 # 6. JWT token expiring within 4h — must force-renew before SEBI 24h cap
@@ -316,35 +218,17 @@ resource "aws_cloudwatch_metric_alarm" "ticks_dropped" {
 }
 
 # ---------------------------------------------------------------------------
-# 9. Aggregator producing zero seals during market hours
-#
-# MARKET-HOURS-GATED (2026-07-03, 5 AM false-SOS fix): zero seals is the
-# CORRECT, by-design state whenever the market is closed but the app is
-# running (early manual start, 15:30-16:30 IST post-close idle). The prior
-# "operator learns to ignore off-hours fires" stance is exactly the
-# pager-fatigue anti-pattern audit-findings Rule 3 (market-hours-aware)
-# forbids. Actions are OFF by default; the shared market-hours gate Lambda
-# (market-hours-liveness-alarm.tf) enables them 09:20-15:35 IST Mon-Fri
-# only. In-market sensitivity is UNCHANGED (same metric/threshold/periods).
+# 9. Aggregator no-seals alarm — RETIRED 2026-07-15 (Groww live-feed
+# retirement). The alarm's metric, tv_aggregator_seals_emitted_total, lost
+# its LAST live producer with this PR: the Groww bridge's aggregator drain
+# was deleted, and the Dhan broadcast instance has been publisher-less since
+# the 2026-07-13 Dhan live-WS retirement — so the metric can never emit a
+# datapoint again and the alarm (treat_missing_data = notBreaching) was a
+# permanently-dead monitor that the window gate kept arming daily. The
+# dormant seal_routing emit site + the EMF selector row survive this PR;
+# the committed C-phase candle-machinery follow-up owns their full
+# retirement (.claude/plans/active-plan-groww-live-off.md).
 # ---------------------------------------------------------------------------
-resource "aws_cloudwatch_metric_alarm" "aggregator_no_seals" {
-  alarm_name          = "tv-${var.environment}-aggregator-no-seals"
-  alarm_description   = "Aggregator emitted zero seals in the last 5 minutes DURING MARKET HOURS. Actions gated to 09:20-15:35 IST Mon-Fri by the market-hours gate Lambda — off-hours zero-seal is by design and never pages."
-  comparison_operator = "LessThanOrEqualToThreshold"
-  evaluation_periods  = 1
-  metric_name         = "tv_aggregator_seals_emitted_total"
-  namespace           = local.app_namespace
-  period              = 300
-  statistic           = "Sum"
-  threshold           = 0
-  treat_missing_data  = "notBreaching"
-  dimensions          = local.app_dimensions
-  # Actions OFF by default; the market-hours gate Lambda flips them ON
-  # 09:20-15:35 IST Mon-Fri (market-hours-liveness-alarm.tf).
-  actions_enabled = false
-  alarm_actions   = local.app_alarm_actions
-  # No ok_actions — would page on every off-hour transition.
-}
 
 # ---------------------------------------------------------------------------
 # 10. Order rejections — OMS or Dhan-side issue
@@ -481,43 +365,13 @@ resource "aws_cloudwatch_metric_alarm" "disk_watcher_respawn" {
 }
 
 # ---------------------------------------------------------------------------
-# 16b. Groww sidecar stall-restart storm (operator 2026-07-06 — Groww
-# feed-down alerting). `tv_feed_sidecar_stall_restart_total` increments once
-# per FEED-STALL-01 stall-kill (feed alive but silent across the whole
-# subscribed universe during market hours). Per the FEED-STALL-01 runbook a
-# SINGLE restart that recovers is a healthy self-heal (no page); a FLAPPING
-# socket (reconnect→re-drop, the in-process storm escalation is >5 restarts
-# per 300s) means the provider keeps closing the socket — operator must
-# check the credential / entitlement.
-# Shape honesty (corrected 2026-07-06): although the in-process metric is a
-# cumulative session-scoped counter, the CloudWatch agent's Prometheus/EMF
-# pipeline DELTA-CONVERTS counter-type metrics — every datapoint that
-# reaches CloudWatch is the increase since the previous 60s scrape (the
-# first sample is dropped), NEVER the cumulative count. A Maximum-statistic
-# threshold of 3 could therefore never fire on the documented "3+ stall
-# restarts spread across the session" condition (each datapoint is ~1), and
-# a sustained storm throttled by the in-process backoff ladder to >=60s
-# between kills would read 0-1 per scrape and un-fire mid-storm. Sum over a
-# 1-hour window counts the restarts in that window under delta semantics:
-# Sum >= 3 / 3600s fires on 3+ stall restarts within an hour (a single
-# self-healing restart stays silent per the FEED-STALL-01 runbook) and
-# returns to OK an hour after the storm genuinely ends.
+# 16b. Groww sidecar stall-restart storm — RETIRED 2026-07-15 (Groww
+# live-feed retirement): `tv_feed_sidecar_stall_restart_total` was
+# incremented ONLY by the deleted sidecar stall watchdog
+# (groww_sidecar_supervisor.rs), so the alarm could never fire again.
+# The FEED-STALL-01 errcode filter + the feed-stall-restarts counter pager
+# (feed-stall-restart-alarm.tf) were removed in the same PR.
 # ---------------------------------------------------------------------------
-resource "aws_cloudwatch_metric_alarm" "groww_stall_restart_storm" {
-  alarm_name          = "tv-${var.environment}-groww-stall-restart-storm"
-  alarm_description   = "Groww feed keeps stalling — 3+ silent-feed restarts within the last hour (flapping socket = provider-side reject). The system keeps reconnecting automatically; check the Groww credential/entitlement if this fires. See FEED-STALL-01."
-  comparison_operator = "GreaterThanOrEqualToThreshold"
-  evaluation_periods  = 1
-  metric_name         = "tv_feed_sidecar_stall_restart_total"
-  namespace           = local.app_namespace
-  period              = 3600
-  statistic           = "Sum"
-  threshold           = 3
-  treat_missing_data  = "notBreaching"
-  dimensions          = local.app_dimensions
-  alarm_actions       = local.app_alarm_actions
-  ok_actions          = local.app_alarm_ok
-}
 
 # ---------------------------------------------------------------------------
 # Post-close tick anomaly — Dhan stamped a tick at/after 15:30:00 IST.
@@ -549,16 +403,19 @@ resource "aws_cloudwatch_metric_alarm" "late_tick_after_boundary" {
 
 # ---------------------------------------------------------------------------
 # 17. Host memory > 80% — the "time to upgrade" capacity signal.
-# Auto-DETECT, not auto-spend: this alarm tells the operator WHEN the r8g.large
-# 16 GiB box is running hot (e.g. both feeds at ~2K SIDs), so they can decide to
-# run scripts/aws-upgrade-instance.sh to a bigger type AFTER the dated-quote +
-# 4-file lock flip — it never resizes anything itself. Mirrors disk_used_high:
+# Auto-DETECT, not auto-spend: this alarm tells the operator WHEN the box is
+# running hot, so they can decide to run scripts/aws-upgrade-instance.sh to a
+# bigger type AFTER the dated-quote + 4-file lock flip — it never resizes
+# anything itself. 2026-07-15 note (Quote 8 downsize): the box is now
+# t4g.medium 4 GiB (was r8g.large 16 GiB) — this signal is MORE load-bearing
+# post-downsize (§7 Rule 2 headroom is ~0.9–1.7 GB budgeted, Assumed until
+# live-measured; t4g.large 8 GiB is the rip-cord). Mirrors disk_used_high:
 # a CloudWatch Metrics Insights query so we do NOT pin CWAgent mem dimensions.
 # CWAgent already publishes mem_used_percent (user-data.sh.tftpl metrics block).
 # ---------------------------------------------------------------------------
 resource "aws_cloudwatch_metric_alarm" "mem_used_high" {
   alarm_name          = "tv-${var.environment}-mem-used-high"
-  alarm_description   = "Host memory > 80% on r8g.large (16 GiB). Capacity signal — time to consider an instance upgrade. Run scripts/aws-upgrade-instance.sh --to <bigger-type> --ebs-size <GB> --qdb-mem <N>g AFTER the dated-quote + 4-file lock flip (daily-universe-scope-expansion-2026-05-27.md §7 Mechanical Rule 1). Auto-detect only — never auto-upgrades. See docs/runbooks/instance-upgrade.md."
+  alarm_description   = "Host memory > 80% on t4g.medium (4 GiB — 2026-07-15 downsize lock). Capacity signal — time to consider an instance upgrade (t4g.large 8 GiB is the rip-cord). Run scripts/aws-upgrade-instance.sh --to <bigger-type> --ebs-size <GB> --qdb-mem <N>g AFTER the dated-quote + 4-file lock flip (daily-universe-scope-expansion-2026-05-27.md §7 Mechanical Rule 1). Auto-detect only — never auto-upgrades. See docs/runbooks/instance-upgrade.md."
   comparison_operator = "GreaterThanThreshold"
   evaluation_periods  = 3
   threshold           = 80
@@ -579,18 +436,19 @@ resource "aws_cloudwatch_metric_alarm" "mem_used_high" {
 # ---------------------------------------------------------------------------
 
 output "app_cloudwatch_alarms" {
-  description = "15 application-level alarms in THIS file (13 Prometheus-via-CW-agent + 1 disk-used + 1 mem-used Metrics-Insights; PR-C2 2026-07-13 retired 5 Dhan-lane alarms — ws-pool-all-dead, ws-failed-connections, realtime-guarantee-critical, ws-frame-dropped-no-wal, ws-reconnect-gap-high — their emitters died with the Dhan live-WS lane; order-update-ws-inactive RETIRED 2026-07-14 per dhan-rest-only-noise-lock-2026-07-14.md, reconciled through the PR-C2 merge); 3 more silent-feed alarms live in silent-feed-alarms.tf (realtime-guarantee-degraded also retired PR-C2). tick-gap-instruments-silent was RETUNED 2026-07-06 (threshold 100 -> 40 PROVISIONAL, 10-of-12 min, market-hours-gated). Cost note: the PR-C2 retirement REMOVES 6 alarms + 5 selected custom-metric series and the 2026-07-14 noise lock a further alarm + the order-update gauge series from the pre-C2 bill (was ~$7.60/mo overage) — still well inside the $55 budget cap."
+  description = "12 application-level alarms in THIS file (10 Prometheus-via-CW-agent + 1 disk-used + 1 mem-used Metrics-Insights; PR-C2 2026-07-13 retired 5 Dhan-lane alarms; order-update-ws-inactive RETIRED 2026-07-14 per dhan-rest-only-noise-lock-2026-07-14.md; tick-gap-instruments-silent RETIRED in PR-C3 2026-07-14; groww-ws-inactive + groww-stall-restart-storm RETIRED 2026-07-15 — their gauge/counter producers, the Groww bridge + sidecar stall watchdog, were deleted with the Groww live feed); 2 more silent-feed alarms live in silent-feed-alarms.tf (the Groww lag mirror also retired 2026-07-15). Cost note: the 2026-07-15 Groww live retirement removes 3 alarms + the feed-stall-restarts counter pager + 4 EMF series and adds 1 (tv_rest_1m_fire_heartbeat) — dated note in aws-budget.md; still well inside the $55 budget cap."
   value = [
     aws_cloudwatch_metric_alarm.disk_used_high.alarm_name,
     aws_cloudwatch_metric_alarm.mem_used_high.alarm_name,
-    aws_cloudwatch_metric_alarm.groww_ws_inactive.alarm_name,
-    aws_cloudwatch_metric_alarm.groww_stall_restart_storm.alarm_name,
+    # groww_ws_inactive + groww_stall_restart_storm retired 2026-07-15
+    # (Groww live-feed retirement).
     aws_cloudwatch_metric_alarm.questdb_disconnected.alarm_name,
-    aws_cloudwatch_metric_alarm.tick_gap_instruments_silent.alarm_name,
+    # tick_gap_instruments_silent retired in PR-C3 (2026-07-14).
     aws_cloudwatch_metric_alarm.token_remaining_low.alarm_name,
     aws_cloudwatch_metric_alarm.spill_dropped.alarm_name,
     aws_cloudwatch_metric_alarm.dlq_ticks.alarm_name,
-    aws_cloudwatch_metric_alarm.aggregator_no_seals.alarm_name,
+    # aggregator_no_seals retired 2026-07-15 (Groww live-feed retirement —
+    # the seals metric lost its last live producer; see section 9 note).
     aws_cloudwatch_metric_alarm.orders_rejected.alarm_name,
     aws_cloudwatch_metric_alarm.clock_skew_high.alarm_name,
     aws_cloudwatch_metric_alarm.disk_watcher_respawn.alarm_name,

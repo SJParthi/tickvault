@@ -235,20 +235,12 @@ jobs:
       fail-fast: false
       matrix:
         crate: [common, storage, core, trading, api, app]
-        # Crates that define the `daily_universe_fetcher` feature must be
-        # tested WITH it enabled — otherwise the entire daily-universe
-        # subsystem (CSV downloader/parser/extractors + the warm-resubscribe
-        # snapshot) is #[cfg]-excluded and its --lib unit tests run vacuously
-        # (false-OK, charter Rule 11). These `include` entries merge a
-        # `features` arg into the matching crate job; crates without an entry
-        # get an empty `features` string.
-        include:
-          - crate: core
-            features: "--features daily_universe_fetcher"
-          - crate: storage
-            features: "--features daily_universe_fetcher"
-          - crate: app
-            features: "--features daily_universe_fetcher"
+        # PR-C3 (2026-07-14): the `daily_universe_fetcher` feature was
+        # DELETED with the Dhan instrument chain (operator Q3, 2026-07-13 —
+        # websocket-connection-scope-lock.md "2026-07-13 Amendment" §B); the
+        # formerly-gated storage persistence modules are now UN-GATED and
+        # always compiled, so the per-crate `include` feature entries are
+        # gone and every crate tests with default features.
     steps:
       - name: Checkout
         uses: actions/checkout@v7.0.0
@@ -277,6 +269,60 @@ jobs:
         # at 90 s so runaway tests fail fast. Flaky tests get 1 retry
         # before being marked FAIL.
         run: cargo nextest run -p tickvault-${{ matrix.crate }} ${{ matrix.features }} --no-fail-fast --profile ci
+
+  # -------------------------------------------------------------------------
+  # Test (trading, groww_orders) — the NON-DEFAULT feature lane for the Groww
+  # order-side subtree (groww-second-feed-scope §39.2 Gate 2: the
+  # crates/trading/src/oms/groww code, gated by the `groww_orders` cargo
+  # feature, must COMPILE + TEST in CI). The default-features `test` matrix
+  # above builds that subtree OUT entirely (the feature is non-default), so a
+  # regression under `groww_orders` would ship silently until live-fire — this
+  # dedicated lane closes that gap, mirroring the DHAT-Zero-Alloc precedent of
+  # a feature-gated area getting its own lane.
+  #
+  # UNCONDITIONAL by design (merge-gate-lock-2026-07-04.md §5): NO `if:` and
+  # NO path filter. A `skipped` result poisons the All Green fan-in
+  # ('skipped' counts as FAILURE on pull_request events, and the PR-only
+  # skip-allowlist in all-green covers ONLY commit-lint / design-first-wall /
+  # local-runtime-block), so this lane MUST run on every PR + push exactly
+  # like the sibling Test jobs. It is therefore in all-green's `needs:` list.
+  #
+  # Mirrors the sibling `test` job's trading branch verbatim (same runner,
+  # checkout, SHA-pinned toolchain, rust-cache, cargo-nextest, `--no-fail-fast
+  # --profile ci`) — the ONLY delta is `--features groww_orders` and a DISTINCT
+  # cache shared-key so the feature build's target artifacts never thrash the
+  # default-feature `ci-test-trading` cache. Clippy is NOT added here —
+  # workspace clippy lives in Build & Verify.
+  # -------------------------------------------------------------------------
+  test-trading-groww-orders:
+    name: "Test (trading, groww_orders)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7.0.0
+
+      - name: Install Rust toolchain 1.95.0
+        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # SHA-pinned (was @stable, supply-chain hardening 2026-04-25)
+        with:
+          toolchain: '1.95.0'
+
+      - name: Cache cargo registry + build
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-test-trading-groww-orders
+          cache-on-failure: true
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+
+      - name: cargo nextest run -p tickvault-trading --features groww_orders (lib + integration, profile=ci)
+        # Same suite semantics as the sibling Test jobs — unit (lib) AND
+        # integration (tests/) targets; `#[ignore]`d tests are skipped by
+        # nextest; profile `ci` caps per-test wall-clock + retries flakes once.
+        run: cargo nextest run -p tickvault-trading --features groww_orders --no-fail-fast --profile ci
 
   # -------------------------------------------------------------------------
   # Security & Audit — delegated to security-audit.yml workflow.
@@ -556,12 +602,12 @@ jobs:
   # DHAT Zero-Alloc — dedicated lane for the hot-path allocation ratchets
   # (added 2026-07-09, PR #4 of the audit-fix sequence).
   #
-  # WHY: the 15 crates/*/tests/dhat_*.rs targets previously ran in NO
+  # WHY: the 16 crates/*/tests/dhat_*.rs targets previously ran in NO
   # complete CI lane. The feature-UNGATED ones ran inside Test (core/
-  # storage/trading), but the three `#![cfg(feature = "dhat")]`-gated core
-  # targets (dhat_prev_close_writer / dhat_telegram_dispatcher /
-  # dhat_tick_gap_detector) compiled to EMPTY binaries there (Test (core)
-  # enables only daily_universe_fetcher) and the Coverage & Perf job
+  # storage/trading), but the `#![cfg(feature = "dhat")]`-gated core
+  # targets (dhat_prev_close_writer / dhat_telegram_dispatcher / the
+  # PR-C3-deleted dhat_tick_gap_detector) compiled to EMPTY binaries there
+  # (Test (core) runs default features) and the Coverage & Perf job
   # explicitly `--skip dhat_` (DHAT-vs-llvm-cov incompatibility). Proven
   # rot: dhat_tick_gap_detector.rs failed to compile for ~2 weeks
   # (u32→u64 SecurityId-widening fallout, E0308 ×4) and nothing went red.
@@ -576,7 +622,11 @@ jobs:
   # filesystem disagrees with the list below (a new/renamed file must be
   # added to the list). Side 2 — each cargo test step asserts the EXECUTED
   # target count ("Running tests/dhat_" lines) equals its expected count
-  # (11 core / 3 storage / 3 trading / 1 app), so a `--test` flag dropped from a
+  # (10 core / 3 storage / 3 trading / 1 app — PR-C3 2026-07-14 truth-sync
+  # deleted dhat_tick_gap_detector, the moneyness PR added dhat_moneyness,
+  # the Groww live-feed retirement (#1581) deleted dhat_feed_lag_groww:
+  # net 10 core; the order-runtime dry-run PR added the app lane's
+  # dhat_mark_forward: 1 app), so a `--test` flag dropped from a
   # run step (while the file + list entry survive) fails loudly instead of
   # silently un-gating that target (2026-07-09 adversarial-review HIGH).
   #
@@ -603,13 +653,12 @@ jobs:
           crates/app/tests/dhat_mark_forward.rs
           crates/core/tests/dhat_allocation.rs
           crates/core/tests/dhat_feed_consumer.rs
-          crates/core/tests/dhat_feed_lag_groww.rs
           crates/core/tests/dhat_feed_lag_ring.rs
           crates/core/tests/dhat_feed_presence.rs
           crates/core/tests/dhat_instrument_registry.rs
+          crates/core/tests/dhat_moneyness.rs
           crates/core/tests/dhat_prev_close_writer.rs
           crates/core/tests/dhat_telegram_dispatcher.rs
-          crates/core/tests/dhat_tick_gap_detector.rs
           crates/core/tests/dhat_token_handle.rs
           crates/core/tests/dhat_ws_reader_zero_alloc.rs
           crates/storage/tests/dhat_tick_flush_offload.rs
@@ -658,13 +707,12 @@ jobs:
           cargo test -p tickvault-core --features dhat \
             --test dhat_allocation \
             --test dhat_feed_consumer \
-            --test dhat_feed_lag_groww \
             --test dhat_feed_lag_ring \
             --test dhat_feed_presence \
             --test dhat_instrument_registry \
+            --test dhat_moneyness \
             --test dhat_prev_close_writer \
             --test dhat_telegram_dispatcher \
-            --test dhat_tick_gap_detector \
             --test dhat_token_handle \
             --test dhat_ws_reader_zero_alloc \
             2>&1 | tee /tmp/dhat-core.log
@@ -678,8 +726,14 @@ jobs:
           # CI while all 9 tests passed (first live run of this lane,
           # 2026-07-09, job 86196056113).
           ran=$(grep -c 'Running.*tests/dhat_' /tmp/dhat-core.log || true)
-          if [ "$ran" -ne 11 ]; then
-            echo "::error::core DHAT step executed $ran targets, expected 11 — a --test flag was dropped from this step (drift list vs run step mismatch)."
+          # PR-C3 (2026-07-14): 11 -> 10 — dhat_tick_gap_detector deleted
+          # with the tick-gap detector (operator Q4-ii 2026-07-13).
+          # 2026-07-15: 10 -> 9 — dhat_feed_lag_groww deleted with the Groww
+          # live feed.
+          # 2026-07-15 (merge-train reconcile): the moneyness PR re-added one
+          # target (dhat_moneyness): 9 -> 10.
+          if [ "$ran" -ne 10 ]; then
+            echo "::error::core DHAT step executed $ran targets, expected 10 — a --test flag was dropped from this step (drift list vs run step mismatch)."
             exit 1
           fi
 
@@ -779,6 +833,7 @@ jobs:
       - deploy-lint
       - build-and-verify
       - test
+      - test-trading-groww-orders
       - security-and-audit
       - coverage-and-perf
       - repo-guards
