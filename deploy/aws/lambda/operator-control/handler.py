@@ -2,23 +2,34 @@
 
 Open the Function URL in a browser and you get a device-locked mission-control
 page with THREE tabs (2026-07-02 redesign — operator: "webpage looks completely
-messy, too many buttons"):
-  * Overview — box status, ticks hero, ticks/sec sparkline, guarantees shields
-    (greyed to a single "box stopped" banner when the instance is off), feed
-    toggles, a thin AWS strip (spend / alarms / disk, click-to-expand), a
-    per-feed latency comparison card (2026-07-03: one row per feed the app
-    reports — TCP/TLS probe + last-tick age + windowed ticks/sec + subscribed
-    counts, best value per column highlighted; box-wide cards labeled so), and
+messy, too many buttons"; 2026-07-16 REST-only cleanup — operator: "since we
+have deleted and removed everything do we really need all these displaying and
+views in dashboard — it can be removed?" → "approved"):
+  * Overview — box status, the official-minute-candles hero (today's rows in
+    spot_1m_rest + option_chain_1m + option_contract_1m_rest, per table + per
+    feed — the runtime is REST-only since 2026-07-15: every live-feed
+    WebSocket is deleted), the dedup-keys shield (greyed to a single "box
+    stopped" banner when the instance is off), feed toggles with a
+    rest_fetch_audit-sourced per-feed pull line, a thin AWS strip (spend /
+    alarms / disk, click-to-expand), a latency card (QuestDB round-trip +
+    clock skew + the dormant order-placement shield, plus today's per-source
+    "how fast after each minute closed" table from rest_fetch_audit), and
     ONE context-aware Start/Stop instance button.
-  * Data — candles per timeframe, the daily cross-verify result, and the
+  * Data — official minute rows captured today (per table, per feed) and the
     READ-ONLY database console (tables + columns + query grid + CSV download —
     writes blocked server-side).
   * Admin — restart/stop app + QuestDB, a COLLAPSED danger zone (severity
-    picker over the four wipes, each with its own typed confirm token), and
+    picker over the three wipes, each with its own typed confirm token), and
     the device lock.
 The former GitHub + Logs tabs are gone. The `logs` API action is KEPT (the
 tickvault-logs MCP server POSTs {"action":"logs"}); the gh_* actions had no
-caller outside the deleted tab and are removed.
+caller outside the deleted tab and are removed. The live-feed-era panels
+(ticks hero + sparkline, tick-conservation / sub-second / peak-tps shields,
+per-feed WS TCP/TLS probes, the exchange→received lag grid over `ticks`, the
+tick-path histogram shields, the cross-verify card, the groww-only wipe) were
+removed 2026-07-16 — their producers were deleted with the live feeds
+(PRs #1522/#1569/#1581; the cross-verify card had been frozen at a 2026-07-13
+FAIL forever, and the groww wipe rewrote only the frozen legacy tables).
 
 ONE URL, two layers:
   * `GET  /` → serves the portal HTML. PUBLIC shell with ZERO secrets — it just
@@ -35,7 +46,7 @@ SECURITY MODEL (deliberately strict — this can stop a live trading box):
   GitHub tab; Terraform may still set OPERATOR_GITHUB_TOKEN_PARAM — ignored.)
 * Destructive box actions (stop/reboot/restart-app/stop-app) are blocked during
   market hours (09:15-15:30 IST Mon-Fri) unless {"force": true}.
-* DATA-DESTRUCTIVE actions (wipe-questdb/wipe-groww/docker-reset/
+* DATA-DESTRUCTIVE actions (wipe-questdb/docker-reset/
   docker-nuke-bare) are HARD-LOCKED during market hours — refused with 409
   even with {"force": true}. A mid-market wipe destroys data that can never
   be re-fetched (operator incident 2026-07-02 15:05 IST: forced wipe-ALL +
@@ -96,7 +107,9 @@ def _control_secret() -> str:
 
 
 # Destructive box actions blocked during market hours unless force=true.
-_DESTRUCTIVE = {"stop", "reboot", "restart-app", "stop-app", "wipe-questdb", "wipe-groww", "docker-reset", "docker-nuke-bare"}
+# (wipe-groww removed 2026-07-16 — the groww-only wipe control retired with
+# the live feeds; it rewrote only the frozen legacy ticks/candles_* tables.)
+_DESTRUCTIVE = {"stop", "reboot", "restart-app", "stop-app", "wipe-questdb", "docker-reset", "docker-nuke-bare"}
 
 # HARD LOCK — the DATA-DESTRUCTIVE subset of _DESTRUCTIVE: actions that DELETE
 # market data which can NEVER be re-fetched from upstream (Dhan/Groww deliver
@@ -107,7 +120,7 @@ _DESTRUCTIVE = {"stop", "reboot", "restart-app", "stop-app", "wipe-questdb", "wi
 # of feed darkness, upstream ticks unrecoverable). Lifecycle actions
 # (stop / reboot / restart-app / stop-app) deliberately KEEP the force
 # override above so emergencies stay possible.
-_DATA_DESTRUCTIVE = {"wipe-questdb", "wipe-groww", "docker-reset", "docker-nuke-bare"}
+_DATA_DESTRUCTIVE = {"wipe-questdb", "docker-reset", "docker-nuke-bare"}
 
 _DATA_DESTRUCTIVE_LOCK_MSG = (
     "Data-destructive actions are locked during market hours "
@@ -121,17 +134,13 @@ _IST_OFFSET_SECS = 19800  # +05:30
 
 _VIEW_TIMEOUT_SECS = 6.0
 _VIEW_POLL_SECS = 0.4
-# Latency probes run metrics-scrape-T0 + feeds-health-T0 + PARALLEL per-feed
-# TCP/TLS probes (2 samples × --max-time 2, all feeds concurrently) + QuestDB
-# + a 4s window floor + metrics-scrape-T1 + feeds-health-T1 ON the box.
-# Worst case ≈ 3+4+4+3+4+3+4 = 25s; typical ~7-9s. The per-feed lag
-# PERCENTILE block (2026-07-03) runs as ONE background job launched
-# alongside the parallel probes, so it shares the same wait — its own
-# worst case (3s feed-discovery + 3s parallel per-feed aggregates) adds
-# at most ~2s over the probes' 4s, keeping worst ≈ 27s. Lambda timeout
-# is 30s, so 28s leaves margin. Per-curl --max-time bounds every leg —
-# one dead endpoint (or a slow QuestDB) can never hang the whole measure.
-_LATENCY_TIMEOUT_SECS = 28.0
+# The REST-era latency snapshot (2026-07-16) is one metrics scrape (3s) +
+# one QuestDB round-trip probe (3s) + chronyc + one bounded rest_fetch_audit
+# aggregate (4s). Worst case ≈ 10-11s incl. SSM registration; per-curl
+# --max-time bounds every leg — a dead endpoint (or a slow QuestDB) can
+# never hang the whole measure. (The old 28s budget covered the retired
+# per-feed WS probe fan-out + the lag-percentile grid over `ticks`.)
+_LATENCY_TIMEOUT_SECS = 15.0
 
 # Read-only SQL gate: the first keyword must be one of these.
 _SQL_ALLOWED_PREFIXES = ("select", "show", "explain", "with")
@@ -312,48 +321,33 @@ def _ssm_shell_sync(commands: list[str], timeout: float = _VIEW_TIMEOUT_SECS) ->
     return ""
 
 
+# REST-era snapshot (2026-07-16 cleanup): the runtime is REST-only — every
+# live-feed WebSocket is deleted (Dhan 2026-07-13, Groww 2026-07-15), so the
+# old ticks/candles_* counters, the MAX_TPS pill, and the tick-conservation
+# shield inputs all read frozen legacy tables / dead producers. The view now
+# counts the LIVE tables the per-minute REST pulls write: spot_1m_rest,
+# option_chain_1m, option_contract_1m_rest — totals + a per-feed split per
+# table (/exp emits a CSV header + one row per feed — skip the header and
+# ';'-join rows so the labeled-line parser sees ONE line, house convention).
 _VIEW_COMMANDS = [
     "set +e",
     'echo "APP=$(systemctl is-active tickvault 2>/dev/null || echo inactive)"',
     "Q='http://127.0.0.1:9000/exp?query='",
-    'echo "TICKS_TODAY=$(curl -fsS "${Q}SELECT%20count()%20FROM%20ticks%20WHERE%20ts%20IN%20today()" 2>/dev/null | tail -1)"',
-    # Per-feed split of today's ticks (operator portal feed card). /exp emits a
-    # CSV header line + one row per feed ("dhan",123) — skip the header and
-    # join rows with ';' so the labeled-line parser sees ONE line.
-    'echo "TICKS_BY_FEED=$(curl -fsS "${Q}SELECT%20feed%2C%20count()%20FROM%20ticks%20WHERE%20ts%20IN%20today()%20GROUP%20BY%20feed" 2>/dev/null | tail -n +2 | tr \'\\n\' \';\')"',
-    'echo "C1M=$(curl -fsS "${Q}SELECT%20count()%20FROM%20candles_1m%20WHERE%20ts%20IN%20today()" 2>/dev/null | tail -1)"',
-    'echo "C5M=$(curl -fsS "${Q}SELECT%20count()%20FROM%20candles_5m%20WHERE%20ts%20IN%20today()" 2>/dev/null | tail -1)"',
-    'echo "C15M=$(curl -fsS "${Q}SELECT%20count()%20FROM%20candles_15m%20WHERE%20ts%20IN%20today()" 2>/dev/null | tail -1)"',
-    'echo "C60M=$(curl -fsS "${Q}SELECT%20count()%20FROM%20candles_60m%20WHERE%20ts%20IN%20today()" 2>/dev/null | tail -1)"',
-    'echo "C1D=$(curl -fsS "${Q}SELECT%20count()%20FROM%20candles_1d%20WHERE%20ts%20IN%20today()" 2>/dev/null | tail -1)"',
+    'echo "SPOT_TODAY=$(curl -fsS "${Q}SELECT%20count()%20FROM%20spot_1m_rest%20WHERE%20ts%20IN%20today()" 2>/dev/null | tail -1)"',
+    'echo "CHAIN_TODAY=$(curl -fsS "${Q}SELECT%20count()%20FROM%20option_chain_1m%20WHERE%20ts%20IN%20today()" 2>/dev/null | tail -1)"',
+    'echo "CONTRACT_TODAY=$(curl -fsS "${Q}SELECT%20count()%20FROM%20option_contract_1m_rest%20WHERE%20ts%20IN%20today()" 2>/dev/null | tail -1)"',
+    'echo "SPOT_BY_FEED=$(curl -fsS "${Q}SELECT%20feed%2C%20count()%20FROM%20spot_1m_rest%20WHERE%20ts%20IN%20today()%20GROUP%20BY%20feed" 2>/dev/null | tail -n +2 | tr \'\\n\' \';\')"',
+    'echo "CHAIN_BY_FEED=$(curl -fsS "${Q}SELECT%20feed%2C%20count()%20FROM%20option_chain_1m%20WHERE%20ts%20IN%20today()%20GROUP%20BY%20feed" 2>/dev/null | tail -n +2 | tr \'\\n\' \';\')"',
+    'echo "CONTRACT_BY_FEED=$(curl -fsS "${Q}SELECT%20feed%2C%20count()%20FROM%20option_contract_1m_rest%20WHERE%20ts%20IN%20today()%20GROUP%20BY%20feed" 2>/dev/null | tail -n +2 | tr \'\\n\' \';\')"',
     # NOTE: the `=` in `upsertKey=true` MUST be URL-encoded as %3D — it is the
     # ONLY view query carrying a raw `=` inside the ?query= value, which the
     # QuestDB /exp query-string parser mis-handled, returning empty so the
-    # dashboard "Dedup key columns" panel showed "?". Encoded form = a clean
-    # `count` of the 5 upsert-key columns — the REAL `ticks` DEDUP key is
-    # (ts, security_id, segment, capture_seq, feed) per DEDUP_KEY_TICKS in
-    # crates/storage/src/tick_persistence.rs (designated ts is always an
-    # upsertKey column; received_at/payload_hash are stored columns only).
-    'echo "DEDUP_KEYS=$(curl -fsS "${Q}SELECT%20count()%20FROM%20table_columns(%27ticks%27)%20WHERE%20upsertKey%3Dtrue" 2>/dev/null | tail -1)"',
-    'echo "MAX_TPS=$(curl -fsS "${Q}SELECT%20max(c)%20FROM%20(SELECT%20count()%20c%20FROM%20ticks%20WHERE%20ts%20IN%20today()%20GROUP%20BY%20ts,security_id)" 2>/dev/null | tail -1)"',
-    # Tick-conservation shield inputs (audit fix #1, 2026-07-02 — kills the
-    # false-OK ">1 tick/sec == no tick lost" heuristic):
-    #  * CONSERVE — the latest tick_conservation_audit rows (last ~2 days, per
-    #    feed; the 15:40 IST daily audit per
-    #    .claude/rules/project/tick-conservation-audit-error-codes.md). CSV
-    #    header skipped, rows ';'-joined (same convention as TICKS_BY_FEED).
-    #    Table absent on a fresh box → curl -f fails → empty value → the UI
-    #    shows "no audit yet", NEVER a fabricated green.
-    #  * WS_DISC — count of TODAY's in-market socket drops. event_kind
-    #    'disconnected' is the app's own market-hours disconnect class
-    #    (off-hours drops are stamped 'disconnected_off_hours' — see
-    #    crates/common/src/ws_event_types.rs), so this IS the 09:15-15:30 IST
-    #    filter, applied at write time by the app itself. Any such drop means
-    #    upstream ticks in that window never reached the box — the shield can
-    #    never claim green "no tick lost" for today. `=` encoded as %3D per
-    #    the DEDUP_KEYS lesson above.
-    'echo "CONSERVE=$(curl -fsS "${Q}SELECT%20feed%2C%20trading_date_ist%2C%20delivery_residual%2C%20outcome_residual%2C%20partial_coverage%2C%20outcome%20FROM%20tick_conservation_audit%20WHERE%20ts%20%3E%20dateadd(%27d%27%2C%20-2%2C%20now())%20ORDER%20BY%20ts%20DESC%20LIMIT%208" 2>/dev/null | tail -n +2 | tr \'\\n\' \';\')"',
-    'echo "WS_DISC=$(curl -fsS "${Q}SELECT%20count()%20FROM%20ws_event_audit%20WHERE%20ts%20IN%20today()%20AND%20event_kind%3D%27disconnected%27" 2>/dev/null | tail -1)"',
+    # dashboard dedup panel showed "?". Encoded form = a clean `count` of the
+    # 4 upsert-key columns — the REAL `spot_1m_rest` DEDUP key is
+    # (ts, security_id, exchange_segment, feed) per DEDUP_KEY_SPOT_1M_REST in
+    # crates/storage/src/spot_1m_rest_persistence.rs (designated ts is always
+    # an upsertKey column).
+    'echo "DEDUP_KEYS=$(curl -fsS "${Q}SELECT%20count()%20FROM%20table_columns(%27spot_1m_rest%27)%20WHERE%20upsertKey%3Dtrue" 2>/dev/null | tail -1)"',
     'echo "ERRORS_BEGIN"',
     "journalctl -u tickvault -p err -n 5 --no-pager 2>/dev/null | tail -5 || true",
     'echo "ERRORS_END"',
@@ -361,7 +355,7 @@ _VIEW_COMMANDS = [
 
 
 def _parse_feed_counts(raw: str) -> dict:
-    """Parse the TICKS_BY_FEED value — ';'-joined QuestDB CSV rows like
+    """Parse a *_BY_FEED value — ';'-joined QuestDB CSV rows like
     '"dhan",123;"groww",45;' — into {feed: count_str}. Pure. Malformed
     fragments are skipped; an empty/absent value yields {} (the UI then shows
     nothing rather than fabricated zeros)."""
@@ -376,6 +370,14 @@ def _parse_feed_counts(raw: str) -> dict:
         if name and cnt:
             out[name] = cnt
     return out
+
+
+def _sum_counts(vals: list) -> str:
+    """Sum the parseable non-negative integer count strings; "" when NONE
+    parsed (box stopped / QuestDB down) — the hero then shows nothing rather
+    than a fabricated 0. Pure."""
+    nums = [int(str(v).strip()) for v in vals if str(v or "").strip().isdigit()]
+    return str(sum(nums)) if nums else ""
 
 
 def _parse_view(stdout: str) -> dict:
@@ -397,506 +399,85 @@ def _parse_view(stdout: str) -> dict:
         if "=" in line:
             key, _, val = line.partition("=")
             fields[key.strip()] = val.strip()
+    spot = fields.get("SPOT_TODAY", "")
+    chain = fields.get("CHAIN_TODAY", "")
+    contracts = fields.get("CONTRACT_TODAY", "")
     return {
         "app": fields.get("APP", ""),
-        "ticks_today": fields.get("TICKS_TODAY", ""),
-        "ticks_by_feed": _parse_feed_counts(fields.get("TICKS_BY_FEED", "")),
-        "candles": {
-            "1m": fields.get("C1M", ""),
-            "5m": fields.get("C5M", ""),
-            "15m": fields.get("C15M", ""),
-            "60m": fields.get("C60M", ""),
-            "1d": fields.get("C1D", ""),
+        # Official minute candles captured today by the REST pulls — the
+        # three LIVE tables, per table + per feed. See _VIEW_COMMANDS.
+        "rows_today": {"spot": spot, "chain": chain, "contracts": contracts},
+        "rows_today_total": _sum_counts([spot, chain, contracts]),
+        "rows_by_feed": {
+            "spot": _parse_feed_counts(fields.get("SPOT_BY_FEED", "")),
+            "chain": _parse_feed_counts(fields.get("CHAIN_BY_FEED", "")),
+            "contracts": _parse_feed_counts(fields.get("CONTRACT_BY_FEED", "")),
         },
         "dedup_key_columns": fields.get("DEDUP_KEYS", ""),
-        "max_ticks_per_second": fields.get("MAX_TPS", ""),
-        "conservation_rows": _parse_conserve_rows(fields.get("CONSERVE", "")),
-        "ws_disconnects_today": fields.get("WS_DISC", ""),
         "recent_errors": errors,
     }
 
 
-# ------------------------------------------------- tick-conservation shield
-# Audit fix #1 (2026-07-02): the old "No tick lost" shield was a >1-tick/sec
-# LIVENESS heuristic — it showed WORKING ✅ through a mid-market crash-loop
-# where upstream ticks were genuinely lost (a false-OK, banned by
-# audit-findings Rule 11). The shield is now a 3-source honest composite:
-#   a. the 15:40 IST tick_conservation_audit verdict (balanced/leak/partial +
-#      the two residuals) — the end-to-end WAL-vs-processed-vs-outcome proof
-#      (.claude/rules/project/tick-conservation-audit-error-codes.md);
-#   b. TODAY's in-market ws_event_audit 'disconnected' count — any drop means
-#      Dhan-sent ticks in that window never REACHED the box, so green is
-#      impossible for today (the honest capture-at-receipt envelope);
-#   c. live ticks/sec — kept ONLY as a decorating label when a+b are clean.
-# Classification precedence (ratcheted by test_handler.py):
-#   residual (RED) > partial (AMBER) > disconnects-today (AMBER) > balanced
-#   (GREEN) > no-audit/idle/unreachable. A tick rate ALONE can never go green.
-
-# The honest-envelope sentence surfaced as the shield tooltip (task 3).
-_CONSERVATION_ENVELOPE = (
-    "Proves every tick that REACHED the box is stored. Ticks Dhan sent during "
-    "a disconnect window never arrived and are outside this proof."
-)
-
-
-def _parse_conserve_rows(raw: str) -> list:
-    """Parse the CONSERVE value — ';'-joined QuestDB /exp CSV rows like
-    '"dhan","2026-07-01T00:00:00.000000Z",0,0,false,"balanced"' — into a list
-    of dicts. Pure. Malformed fragments are skipped; empty/absent input (table
-    missing on a fresh box, QuestDB down) yields [] — the classifier then
-    reports "no audit yet"/"unreachable", never a fabricated verdict."""
-    rows: list = []
-    for part in (raw or "").split(";"):
-        part = part.strip()
-        if not part:
-            continue
-        cells = [c.strip().strip('"') for c in part.split(",")]
-        if len(cells) != 6:
-            continue
-        feed, tdate, dres, ores, partial, outcome = cells
-        try:
-            drow = {
-                "feed": feed,
-                "date": tdate[:10],  # trading_date_ist → YYYY-MM-DD
-                "delivery_residual": int(dres),
-                "outcome_residual": int(ores),
-                "partial_coverage": partial.lower() == "true",
-                "outcome": outcome.lower(),
-            }
-        except ValueError:
-            continue
-        if drow["feed"] and len(drow["date"]) == 10:
-            rows.append(drow)
-    return rows
-
-
-def _classify_tick_conservation(rows: list, disconnects_raw: str, market_hours: bool, max_tps_raw: str) -> dict:
-    """The shield's state machine (pure — one unit test per state).
-
-    | state        | colour | when                                              |
-    |--------------|--------|---------------------------------------------------|
-    | residual     | RED    | latest audit day has residual>0 or outcome=leak   |
-    | partial      | AMBER  | latest audit day has partial_coverage/partial     |
-    | disconnects  | AMBER  | ≥1 in-market socket drop TODAY (ws_event_audit)   |
-    | balanced     | GREEN  | audit balanced AND zero drops today               |
-    | no_audit     | AMBER  | market open, no audit row yet — NEVER green       |
-    | idle         | grey-ok| market closed, no audit row, QuestDB reachable    |
-    | unreachable  | AMBER  | neither source answered (QuestDB/box down)        |
-
-    Only the latest trading day's rows count (one per feed, newest first —
-    the CONSERVE query is ORDER BY ts DESC). tps decorates the balanced label
-    only; it can no longer produce green by itself (the old false-OK)."""
-    try:
-        disconnects = int(str(disconnects_raw or "").strip())
-    except ValueError:
-        disconnects = None
-    try:
-        tps = int(str(max_tps_raw or "").strip())
-    except ValueError:
-        tps = 0
-
-    latest: list = []
-    if rows:
-        latest_date = max(r["date"] for r in rows)
-        seen_feeds: set = set()
-        for r in rows:  # newest first — keep the latest row per feed
-            if r["date"] == latest_date and r["feed"] not in seen_feeds:
-                seen_feeds.add(r["feed"])
-                latest.append(r)
-
-    def _result(state: str, label: str, good: bool, cls: str) -> dict:
-        return {
-            "state": state,
-            "label": label,
-            "good": good,
-            "cls": cls,
-            "audit_date": latest[0]["date"] if latest else "",
-            "disconnects_today": disconnects,
-            "envelope": _CONSERVATION_ENVELOPE,
-        }
-
-    # 1. RESIDUAL — ticks delivered to the box but unaccounted. Hard red.
-    residual_rows = [
-        r
-        for r in latest
-        if r["delivery_residual"] > 0 or r["outcome_residual"] > 0 or r["outcome"] == "leak"
-    ]
-    if residual_rows:
-        n = sum(max(r["delivery_residual"], 0) + max(r["outcome_residual"], 0) for r in residual_rows)
-        return _result("residual", f"RESIDUAL: {n} ❌ ({latest[0]['date']})", False, "bad")
-    # 2. PARTIAL — the audit could not vouch for the full session (mid-day boot
-    #    / a source missing). Honest "cannot vouch", never a false OK.
-    if any(r["partial_coverage"] or r["outcome"] == "partial" for r in latest):
-        return _result("partial", f"partial coverage ⚠ — mid-day restart ({latest[0]['date']})", False, "warn")
-    # 3. DISCONNECTS TODAY — socket-down evidence outranks yesterday's clean
-    #    audit: upstream ticks in those windows are outside the capture proof.
-    if disconnects is not None and disconnects > 0:
-        return _result(
-            "disconnects",
-            f"{disconnects} disconnect(s) today ⚠ — upstream ticks in those windows are unverifiable",
-            False,
-            "warn",
-        )
-    # 4. BALANCED — audit vouches, zero drops today. Liveness decorates only.
-    if latest:
-        if market_hours and tps > 1:
-            return _result("balanced", f"BALANCED ✅ · capturing ({tps} ticks/sec)", True, "ok")
-        return _result("balanced", f"BALANCED ✅ (audit {latest[0]['date']})", True, "ok")
-    # 5. No audit rows at all.
-    if disconnects is None:
-        # Neither source answered — QuestDB (or the box) is unreachable.
-        return _result("unreachable", "unreachable", False, "warn")
-    if not market_hours:
-        return _result("idle", "idle (market closed)", True, "ok")
-    return _result("no_audit", "no audit yet ⚠ (daily audit runs 15:40 IST)", False, "warn")
-
-
 # ----------------------------------------------------------------- latency snap
-# Measures the REAL per-feed + box-wide latency on the box (operator demand
-# 2026-07-03: dhan + groww run side by side — show "which is extremely faster
-# and more precise" PER FEED, auto-extending to any future feed):
-#  * PER FEED — network RTT to that feed's live edge (TCP connect + TLS
-#    handshake, parallel probes), plus the app's own per-feed reporting from
-#    GET /api/feeds/health (last-tick age, subscribed counts) curled TWICE so
-#    ticks/sec per feed = Δticks_total over the measured window. The feed
-#    LIST is the app's health response — never hardcoded here.
+# REST-era latency (2026-07-16 cleanup — every live-feed WebSocket is deleted,
+# so the old per-feed WS TCP/TLS probes to api-feed.dhan.co /
+# socket-api.groww.in, the exchange→received lag-percentile grid over `ticks`,
+# and the tick-path histogram shields all measured retired edges / dead
+# emitters):
 #  * BOX-WIDE — local QuestDB round-trip (SELECT 1), wall-clock skew vs
-#    chrony, and the app's histograms at :9091/metrics (tick parse+process /
-#    wire->done / order placement). These carry NO feed label in the app
-#    (tick_processor.rs emits them unlabeled), so they are HONESTLY presented
-#    as box-wide — no fake per-feed processing splits.
-#
-# Feed → live-edge host map for the network probe ONLY. The table rows come
-# from the app's /api/feeds/health; a feed reported by the app but missing
-# here still gets its row — its network cells read "endpoint unknown" (never
-# fake numbers). Hosts are code-controlled constants (shell-safe by
-# construction; the app's response is never interpolated into commands).
-#   dhan:  wss://api-feed.dhan.co (main feed, 2-WS lock)
-#   groww: wss://socket-api.groww.in (NATS-over-WSS edge, docs/groww-ref/02)
-_FEED_LIVE_HOSTS = {
-    "dhan": "api-feed.dhan.co",
-    "groww": "socket-api.groww.in",
-}
-_FEED_PROBE_SAMPLES = 2
-_FEED_PROBE_MAX_SECS = 2
-
-# ---- per-feed exchange→received lag percentiles (operator demand 2026-07-03:
-# "p50, p99, so many" PER FEED, like a proper latency dashboard).
-#
-# Source: the box's QuestDB HTTP /exp (CSV) — the same local endpoint the
-# existing portal queries use. Lag = received_at − ts (both IST-aligned
-# TIMESTAMPs on the `ticks` table; direct timestamp subtraction in QuestDB
-# yields MICROSECONDS). Percentiles are computed SERVER-SIDE with QuestDB's
-# approx_percentile(value, q, 3) — HdrHistogram, 3 significant figures,
-# verified against QuestDB docs 2026-07-03 (approx_percentile requires
-# NON-NEGATIVE input, hence the CASE clamp below; clamped rows are counted
-# and shown honestly on the page).
-#
-# REWRITTEN 2026-07-07 (silent-feed hardening item 5 — the 2026-07-06 Dhan
-# degradation exposed two verified defects in the old predicate
-# `ts > dateadd('m', -10, now())`):
-#
-# 1. TIMEBASE BUG (verified latent): `ts` (= Dhan LTT, already IST epoch
-#    seconds, stored directly per data-integrity.md — tick_persistence.rs
-#    build_tick_row_seq) and `received_at` (= Utc::now() +
-#    IST_UTC_OFFSET_NANOS) are stored IST-SHIFTED, while QuestDB's now() is
-#    UTC. Comparing the IST-shifted column against the UTC clock made the
-#    "10-minute" window really ~5h40m — the root cause of the all-day
-#    WAL-replay row conflation in the panel on 2026-07-06. Every predicate
-#    now uses IST_now := dateadd('m', 330, now()) (_pctl_ist_now()).
-#
-# 2. LAG CENSORING (Rule-11 false-OK): an EXCHANGE-time (ts) window
-#    structurally cannot show lag above its own width — any row whose lag
-#    exceeds the window has ts OUTSIDE it. The population is now defined by
-#    RECEIVE time. The two-layer predicate, per feed:
-#      (a) received_at >= IST_now − _PCTL_RECV_WINDOW_SECS (120 s) — the
-#          honest population "rows RECEIVED in the last 2 minutes"
-#          (6K-60K rows at incident tick rates → a stable p99);
-#      (b) received_at < capture_instant + _PCTL_REPLAY_DWELL_SECS (60 s) —
-#          the EXACT replay excluder, applied to feed='dhan' ONLY (round-1
-#          fix 2026-07-07, finding 10). capture_instant := capture_seq
-#          (for dhan: ≈ UTC wall NANOS, stamped ONCE at the original
-#          WS-read instant by ws_frame_spill::next_frame_seq and PRESERVED
-#          through WAL re-injection / spill drains) → ÷1000 to µs →
-#          +19,800,000,000 µs to IST-align with received_at. Frame-WAL
-#          re-injection RE-stamps received_at at dequeue but keeps
-#          capture_seq, so a replayed dhan row shows receipt−capture =
-#          downtime (≥ minutes) and is excluded EVEN INSIDE a live drain
-#          window, while a genuinely-lagged LIVE row (the incident's real
-#          46 s / 199 s) carries a FRESH capture instant and is KEPT — the
-#          panel never censors the very signal it measures. TVW2
-#          spill-drain rows preserve their ORIGINAL received_at (correctly
-#          kept). Excluded rows are COUNTED for dhan (replay_excluded) and
-#          rendered on the page — visible, not silent.
-#          HONEST LIMIT (round-2 fix 2026-07-07, finding 3): SQL has no
-#          process-boundary column, so a LIVE dhan row that dwelt ≥ 60 s
-#          between its WS-read and dequeue (a severe consumer stall — the
-#          frame channel holds ~4 min of frames at ~500 ticks/s, and an
-#          ILP stall can block the consumer that long) is INDISTINGUISHABLE
-#          here from a replay-restamped row: it is excluded from the panel
-#          sample and counted in the SAME column. The in-app lag gauge
-#          (feed_lag_monitor) KEEPS such rows via its process-live-boundary
-#          discriminator, so the CloudWatch lag ALARM still sees
-#          stall-induced lag; only this panel's sample drops them. The
-#          column is therefore labeled "replay/stall rows excluded" —
-#          never plain "replay rows" (that would misattribute live stalls).
-#          WHY NOT groww (honest limitation, was previously misdocumented
-#          as "receipt−capture ≤ 0"): groww's capture_seq is seeded from
-#          the tick's EXCHANGE timestamp in IST nanos (groww_bridge.rs
-#          next_capture_seq(ts_ist_nanos) — replay-STABLE, NOT a receipt
-#          stamp), so receipt−capture equals the positive LAG itself.
-#          Applying the dhan discriminator to groww would (i) censor any
-#          genuine groww lag > 60 s — the exact Rule-11 censoring this
-#          rewrite removes — and (ii) NOT exclude replay-restamped groww
-#          rows anyway. Therefore groww (and any non-dhan feed) gets NO
-#          capture-based excluder and its replay_excluded renders "—"
-#          (n/a): replay-restamped groww rows are NOT distinguishable via
-#          capture_seq — a documented limitation, never a fake 0.
-#      (c) ts > IST_now − _PCTL_TS_PRUNE_HOURS (6 h) — PARTITION PRUNING
-#          ONLY (`ticks` is PARTITION BY HOUR on ts; received_at is NOT the
-#          designated timestamp, so without this bound every query is a
-#          full-table scan). Implied honest ceiling, documented on the page:
-#          a live row lagged MORE than 6 h falls outside the prune window
-#          and is invisible to this panel.
-#
-# Complexity (honest): the Lambda side is O(feeds ≤ cap) fixed-width CSV
-# lines — effectively O(1). The percentile aggregate is LIMIT-bounded to
-# the ≤_PCTL_SAMPLE_CAP NEWEST-RECEIVED rows — ORDER BY received_at DESC
-# (round-1 fix 2026-07-07, finding 2): the population is DEFINED by receive
-# time, and truncating by exchange-ts (the old ORDER BY ts DESC) evicted
-# precisely the MOST-LAGGED rows first whenever the cap bound (~60K dhan
-# rows/120 s at the measured ~500 ticks/s vs the 50K cap — i.e. in ORDINARY
-# operation), which could wipe the p99 tail during a mixed-lag incident —
-# a softer reinstatement of the very censoring this rewrite removes.
-# Ordering by received_at makes the truncation lag-NEUTRAL, and a capped
-# sample is FLAGGED on the page (rows == cap → "sample capped" note).
-# Cost honesty: received_at is NOT the designated timestamp, so this is an
-# O(population-rows) sort inside the 6h-pruned partitions (not a
-# stop-at-cap backward scan) — bounded by the per-curl --max-time; a
-# timeout degrades that feed's row honestly. The companion replay_excluded
-# COUNT (dhan only) is a vectorized filter over the same 6h-pruned
-# partitions (O(pruned rows) — cheap columnar count, same bound).
-# Feed discovery is one DISTINCT over the same 6h prune window (a feed
-# whose ONLY recent rows carry ts older than 6 h — a >6h-old replay with
-# nothing live — is not discovered; documented, not hidden). NO feed name
-# is hardcoded — any future feed in `ticks` gets its row automatically.
-_PCTL_RECV_WINDOW_SECS = 120  # K — receive-recency population window
-_PCTL_TS_PRUNE_HOURS = 6  # partition prune on designated ts (HOUR partitions)
-_PCTL_REPLAY_DWELL_SECS = 60  # receipt−capture dwell ≥ this ⇒ replay-restamped
-_PCTL_IST_OFFSET_MINS = 330  # QuestDB now() is UTC; ts/received_at are IST-shifted
-_PCTL_IST_OFFSET_MICROS = 19_800_000_000  # +05:30 in µs — IST-aligns capture_seq
-_PCTL_SAMPLE_CAP = 50_000
-_PCTL_MAX_FEEDS = 6  # loop bound — keeps the parallel query fan-out finite
-_PCTL_QUERY_MAX_SECS = 3
-_PCTL_QUANTILES = (("p50", "0.5"), ("p90", "0.9"), ("p95", "0.95"), ("p99", "0.99"))
-# Shell-side allowlist for feed tokens read back from the DB before they are
-# interpolated into the per-feed SQL (defense in depth — feed values are our
-# own 'dhan'/'groww' symbols, but NOTHING unvalidated ever enters a query).
-_PCTL_FEED_TOKEN_RE = "^[a-z0-9_-]{1,32}$"
+#    chrony, and the dormant order-placement histogram average (KEPT — the
+#    order path returns with live trading; it reads "—" until then).
+#  * PER (feed, leg) — "how fast after each minute closed": today's ok-pull
+#    count + p50/p99 of close_to_data_ms from rest_fetch_audit for
+#    outcome='ok' rows, one row per (feed, leg) the fetch log carries
+#    (spot_1m / chain_1m / contract_1m, both brokers — never hardcoded).
+#    Percentiles are computed SERVER-SIDE with QuestDB's
+#    approx_percentile(value, q, 3) — HdrHistogram, 3 significant figures,
+#    non-negative input required, which the close_to_data_ms >= 0 filter
+#    satisfies while ALSO excluding the -1 not-measured sentinel rows
+#    (backfilled/swept minutes carry their real >=60s delay and stay in;
+#    only unmeasured rows drop). This mirrors the 15:45 IST scorecard
+#    digest language (dual-feed-scoreboard-error-codes.md §2b).
+_REST_LAT_QUERY_MAX_SECS = 4
 
 
-def _pctl_ist_now() -> str:
-    """QuestDB expression for the IST-shifted wall clock (pure).
+def _rest_latency_sql() -> str:
+    """Today's per-(feed, leg) prompt-pull latency aggregate (pure).
 
-    `ts` and `received_at` are stored IST-SHIFTED (see the timebase note in
-    the block comment above) while QuestDB now() is UTC — every window
-    predicate must compare against IST_now, never bare now()."""
-    return f"dateadd('m', {_PCTL_IST_OFFSET_MINS}, now())"
-
-
-def _pctl_population_where() -> str:
-    """Shared per-feed population predicate, `$f` shell placeholder (pure).
-
-    Predicate roles (see block comment): receive-stamped rows only, the 6h
-    ts PARTITION PRUNE (performance bound, not the population), and the
-    120s RECEIVE-recency window that defines the honest population. The
-    replay excluder is appended by the caller in admitted/excluded form."""
-    ist = _pctl_ist_now()
+    outcome='ok' rows only; `close_to_data_ms >= 0` excludes the -1
+    not-measured sentinel AND satisfies approx_percentile's non-negative
+    input requirement. `ts IN today()` matches the house convention every
+    other view query uses on the IST-stored tables."""
     return (
-        "feed = '$f' and received_at != null "
-        f"and ts > dateadd('h', -{_PCTL_TS_PRUNE_HOURS}, {ist}) "
-        f"and received_at >= dateadd('s', -{_PCTL_RECV_WINDOW_SECS}, {ist})"
+        "select feed, leg, count() ok_rows, "
+        "approx_percentile(close_to_data_ms, 0.5, 3) p50, "
+        "approx_percentile(close_to_data_ms, 0.99, 3) p99 "
+        "from rest_fetch_audit "
+        "where ts in today() and outcome = 'ok' and close_to_data_ms >= 0 "
+        "group by feed, leg order by feed, leg"
     )
-
-
-def _pctl_capture_instant() -> str:
-    """QuestDB expression: the row's ORIGINAL capture instant, IST µs (pure).
-
-    VALID FOR feed='dhan' ONLY: dhan capture_seq ≈ UTC wall NANOS stamped
-    once at the WS-read instant and preserved through WAL re-injection
-    (data-integrity.md TICK-SEQ-01): ÷1000 → µs, +19,800,000,000 µs → IST
-    alignment with received_at. groww capture_seq is EXCHANGE-ts-seeded
-    (IST nanos, groww_bridge.rs), NOT a receipt stamp — never apply this
-    expression to a non-dhan feed (see the block comment, finding 10)."""
-    return f"cast(capture_seq / 1000 + {_PCTL_IST_OFFSET_MICROS} as timestamp)"
-
-
-def _pctl_feeds_sql() -> str:
-    """Feed-discovery SQL: every feed with ticks in the prune window (pure).
-
-    Same IST-timebase fix as the per-feed query, over the same 6h ts
-    partition-prune window (the per-feed query then decides honestly
-    whether anything was RECEIVED in the last 120 s)."""
-    return (
-        "select distinct feed from ticks "
-        f"where ts > dateadd('h', -{_PCTL_TS_PRUNE_HOURS}, {_pctl_ist_now()})"
-    )
-
-
-def _pctl_feed_sql(replay_excluder: bool) -> str:
-    """Per-feed lag-percentile SQL with a `$f` shell placeholder (pure).
-
-    One statement per feed, TWO one-row legs cross-joined into one CSV line:
-      a) ADMITTED leg — count + clamped-negative count + p50/p90/p95/p99
-         (approx, 3 sig figs) + max over the ≤_PCTL_SAMPLE_CAP
-         NEWEST-RECEIVED rows in the last _PCTL_RECV_WINDOW_SECS
-         (`order by received_at desc` — the population's own key; ordering
-         by exchange-ts would evict the MOST-lagged rows first when the
-         cap binds — finding 2). With `replay_excluder` (feed='dhan' only)
-         the leg additionally requires receipt−capture <
-         _PCTL_REPLAY_DWELL_SECS;
-      b) EXCLUDED leg — with `replay_excluder`: the Rule-11 companion
-         count of rows in the SAME population that FAILED the excluder
-         (rendered as "replay/stall rows excluded" — replay-restamped rows
-         PLUS any live rows delayed ≥60 s in-pipeline by a consumer stall,
-         which SQL cannot tell apart; see the HONEST LIMIT note in the
-         block comment); without it: a NULL literal → the parser carries
-         None → the page renders "—" (n/a — such rows are not
-         distinguishable via capture_seq for non-dhan feeds; never a fake
-         verified-0).
-    Lag unit inside SQL = microseconds (direct QuestDB timestamp
-    subtraction); the Lambda converts to ms."""
-    pctls = ", ".join(
-        f"approx_percentile(lag_us, {q}, 3) {name}" for name, q in _PCTL_QUANTILES
-    )
-    where = _pctl_population_where()
-    replay_cut = (
-        f"dateadd('s', {_PCTL_REPLAY_DWELL_SECS}, {_pctl_capture_instant()})"
-    )
-    admit_extra = f"and received_at < {replay_cut} " if replay_excluder else ""
-    excluded_leg = (
-        f"select count() replay_excluded from ticks where {where} "
-        f"and received_at >= {replay_cut}"
-        if replay_excluder
-        else "select cast(null as long) replay_excluded from long_sequence(1)"
-    )
-    return (
-        "select * from ("
-        f"select count() rows, sum(neg) negs, {pctls}, max(lag_us) pmax from ("
-        "select case when received_at - ts < 0 then 0 else received_at - ts end lag_us, "
-        "case when received_at - ts < 0 then 1 else 0 end neg "
-        f"from ticks where {where} "
-        f"{admit_extra}"
-        f"order by received_at desc limit {_PCTL_SAMPLE_CAP})"
-        f") a cross join ({excluded_leg}) b"
-    )
-
-
-def _pctl_commands() -> list[str]:
-    """Shell block for the per-feed percentile grid (pure — static inputs).
-
-    Launched as ONE background job alongside the parallel TCP/TLS probes so
-    it shares their `wait` (no serial wall-clock cost beyond the shared
-    window). Inside: discover feeds (validated against the token allowlist
-    BEFORE interpolation, capped at _PCTL_MAX_FEEDS), fire one bounded
-    aggregate per feed IN PARALLEL, then emit one `PCTL_ROW=<feed>,<csv>`
-    line per feed. A failed query yields an empty CSV tail — the parser
-    degrades that feed honestly instead of fabricating numbers."""
-    exp = "http://127.0.0.1:9000/exp"
-    return [
-        "( PCTL_FEEDS=$(curl -fsS --max-time 3 -G '" + exp + "' "
-        f'--data-urlencode "query={_pctl_feeds_sql()}" 2>/dev/null '
-        "| tail -n +2 | tr -d '\"\\r' "
-        f"| grep -E '{_PCTL_FEED_TOKEN_RE}' | head -{_PCTL_MAX_FEEDS}); "
-        "for f in $PCTL_FEEDS; do "
-        # Feed-aware replay excluder (finding 10): the capture_seq dwell
-        # discriminator is valid for dhan ONLY — groww capture_seq is
-        # exchange-ts-seeded, so the dhan predicate would censor genuine
-        # groww lag >60s AND fail to exclude replay-restamped groww rows.
-        'if [ "$f" = dhan ]; then '
-        f'TVPQ="{_pctl_feed_sql(replay_excluder=True)}"; '
-        f'else TVPQ="{_pctl_feed_sql(replay_excluder=False)}"; fi; '
-        f"( curl -fsS --max-time {_PCTL_QUERY_MAX_SECS} -G '" + exp + "' "
-        '--data-urlencode "query=$TVPQ" 2>/dev/null '
-        "| tail -n +2 | head -1 | tr -d '\"\\r' > /tmp/tv-pctl-$f.txt ) & "
-        "done; wait; "
-        "for f in $PCTL_FEEDS; do "
-        'echo "PCTL_ROW=$f,$(cat /tmp/tv-pctl-$f.txt 2>/dev/null)"; '
-        "rm -f /tmp/tv-pctl-$f.txt; done "
-        ") > /tmp/tv-pctl.out 2>/dev/null &",
-    ]
 
 
 def _latency_commands() -> list[str]:
     """Build the on-box latency snapshot script (pure — static inputs only).
 
-    Windowed-percentile design (operator directive 2026-06-10): scrape the
-    metrics endpoint TWICE — once BEFORE and once AFTER the network probes —
-    and let the Lambda compute p50/p99 + avg from the histogram-bucket DELTAS
-    between the two scrapes. The same T0/T1 bracketing now also wraps TWO
-    /api/feeds/health scrapes so per-feed ticks/sec is a real windowed delta.
-
-    Per-feed TCP/TLS probes run as PARALLEL background jobs (`( … ) &` +
-    `wait`), each curl bounded by --max-time — a single dead feed endpoint
-    costs at most samples×max-time and never delays the other feeds. Probe
-    hosts come exclusively from the static _FEED_LIVE_HOSTS map above (feed
-    names are code-controlled lowercase tokens — safe in paths/markers)."""
-    metrics_curl = (
-        "curl -fsS --max-time 3 http://127.0.0.1:9091/metrics 2>/dev/null | "
-        "grep -E '^tv_(tick_processing|wire_to_done|order_placement|tick_flush)_duration_ns' "
-        "|| echo none"
-    )
-    health_curl = (
-        "curl -fsS --max-time 4 http://127.0.0.1:3001/api/feeds/health 2>/dev/null "
-        "|| echo TV_CURL_FAILED; echo"
-    )
-    cmds = [
+    One metrics scrape (the dormant order-placement histogram only), the
+    QuestDB round-trip probe, the chrony skew read, and ONE bounded
+    rest_fetch_audit aggregate re-emitted as RESTLAT_ROW=<csv> labeled
+    lines. Every curl is --max-time bounded — a dead endpoint can never
+    hang the whole measure."""
+    return [
         "set +e",
-        'echo "T0=$(date +%s.%N)"',
-        'echo "METRICS_T0_BEGIN"',
-        metrics_curl,
-        'echo "METRICS_T0_END"',
-        'echo "FEEDS_T0_BEGIN"',
-        health_curl,
-        'echo "FEEDS_T0_END"',
-    ]
-    samples = " ".join(str(i + 1) for i in range(_FEED_PROBE_SAMPLES))
-    for feed, host in sorted(_FEED_LIVE_HOSTS.items()):
-        cmds.append(
-            f"(for i in {samples}; do "
-            f"curl -o /dev/null -s -w '%{{time_connect}} %{{time_appconnect}}\\n' "
-            f"--max-time {_FEED_PROBE_MAX_SECS} https://{host}/ 2>/dev/null || echo 'x x'; "
-            f"done > /tmp/tv-probe-{feed}.txt 2>/dev/null) &"
-        )
-    # Per-feed lag-percentile job runs CONCURRENTLY with the probes and is
-    # reaped by the same `wait` below (see _pctl_commands for the contract).
-    cmds += _pctl_commands()
-    cmds.append("wait")
-    for feed in sorted(_FEED_LIVE_HOSTS):
-        cmds += [
-            f'echo "PROBE_{feed}_BEGIN"',
-            f"cat /tmp/tv-probe-{feed}.txt 2>/dev/null",
-            f'echo "PROBE_{feed}_END"',
-            f"rm -f /tmp/tv-probe-{feed}.txt",
-        ]
-    cmds += [
-        # The pctl job finished under the shared `wait` above — surface its
-        # PCTL_ROW lines into the labeled stdout stream now.
-        "cat /tmp/tv-pctl.out 2>/dev/null; rm -f /tmp/tv-pctl.out",
+        'echo "METRICS_BEGIN"',
+        "curl -fsS --max-time 3 http://127.0.0.1:9091/metrics 2>/dev/null | "
+        "grep -E '^tv_order_placement_duration_ns' || echo none",
+        'echo "METRICS_END"',
         "echo \"QDB=$(curl -o /dev/null -s -w '%{time_total}' --max-time 3 'http://127.0.0.1:9000/exec?query=SELECT%201' 2>/dev/null)\"",
         "echo \"SKEW=$(chronyc tracking 2>/dev/null | awk '/Last offset/{print $4}')\"",
-        # Floor the window at ~4 s so fast-failing probes (network down →
-        # instant curl errors) still leave a meaningful sample window.
-        "sleep 4",
-        'echo "T1=$(date +%s.%N)"',
-        'echo "METRICS_BEGIN"',
-        metrics_curl,
-        'echo "METRICS_END"',
-        'echo "FEEDS_T1_BEGIN"',
-        health_curl,
-        'echo "FEEDS_T1_END"',
+        f"curl -fsS --max-time {_REST_LAT_QUERY_MAX_SECS} -G 'http://127.0.0.1:9000/exp' "
+        f'--data-urlencode "query={_rest_latency_sql()}" 2>/dev/null '
+        "| tail -n +2 | sed 's/^/RESTLAT_ROW=/'",
     ]
-    return cmds
 
 
 _LATENCY_COMMANDS = _latency_commands()
@@ -912,145 +493,25 @@ def _avg_ns(sum_v: str, count_v: str) -> float | None:
         return None
 
 
-def _parse_bucket_lines(lines: list[str]) -> dict:
-    """Parse Prometheus exposition lines into {metric: {"buckets": {le: count},
-    "sum": float, "count": float}}. Pure. Unparseable lines are skipped."""
-    out: dict = {}
-    for line in lines:
-        bits = line.split()
-        if len(bits) != 2:
-            continue
-        name, raw_val = bits
-        try:
-            val = float(raw_val)
-        except ValueError:
-            continue
-        if "_bucket{" in name:
-            base = name.split("_bucket{", 1)[0]
-            # le label, e.g. tv_x_duration_ns_bucket{le="10000"} or le="+Inf"
-            le_part = name.split('le="', 1)
-            if len(le_part) != 2:
-                continue
-            le_raw = le_part[1].split('"', 1)[0]
-            le = float("inf") if le_raw == "+Inf" else None
-            if le is None:
-                try:
-                    le = float(le_raw)
-                except ValueError:
-                    continue
-            out.setdefault(base, {"buckets": {}, "sum": 0.0, "count": 0.0})
-            out[base]["buckets"][le] = val
-        elif name.endswith("_sum"):
-            base = name[: -len("_sum")]
-            out.setdefault(base, {"buckets": {}, "sum": 0.0, "count": 0.0})
-            out[base]["sum"] = val
-        elif name.endswith("_count"):
-            base = name[: -len("_count")]
-            out.setdefault(base, {"buckets": {}, "sum": 0.0, "count": 0.0})
-            out[base]["count"] = val
-    return out
-
-
-def _bucket_deltas(t0: dict, t1: dict) -> dict | None:
-    """Per-bucket cumulative-count deltas between two scrapes of ONE metric.
-    Returns {"buckets": {le: delta}, "sum": dsum, "count": dcount} or None
-    when the window is empty/invalid (no ticks, or counter reset between
-    scrapes — any negative delta invalidates the whole window). Pure."""
-    if not t0 or not t1:
-        return None
-    d_count = t1.get("count", 0.0) - t0.get("count", 0.0)
-    d_sum = t1.get("sum", 0.0) - t0.get("sum", 0.0)
-    if d_count <= 0 or d_sum < 0:
-        return None
-    deltas: dict = {}
-    for le, c1 in t1.get("buckets", {}).items():
-        c0 = t0.get("buckets", {}).get(le, 0.0)
-        d = c1 - c0
-        if d < 0:
-            return None  # counter reset mid-window — whole window invalid
-        deltas[le] = d
-    if not deltas:
-        return None
-    return {"buckets": deltas, "sum": d_sum, "count": d_count}
-
-
-def _percentile_from_bucket_deltas(deltas: dict | None, q: float) -> float | None:
-    """Quantile (0<q<1) from windowed cumulative-bucket deltas, linear
-    interpolation inside the owning bucket. A quantile landing in the +Inf
-    bucket clamps to the last finite bound (honest 'off the scale'). Pure."""
-    if not deltas:
-        return None
-    total = deltas.get("count", 0.0)
-    if total <= 0:
-        return None
-    target = q * total
-    prev_bound = 0.0
-    prev_cum = 0.0
-    for le in sorted(deltas["buckets"].keys()):
-        cum = deltas["buckets"][le]
-        if cum >= target:
-            if le == float("inf"):
-                return prev_bound  # clamp: off the top of the scale
-            width = cum - prev_cum
-            if width <= 0:
-                return le
-            frac = (target - prev_cum) / width
-            return prev_bound + (le - prev_bound) * frac
-        prev_bound = 0.0 if le == float("inf") else le
-        prev_cum = cum
-    return prev_bound
-
-
-def _feed_comparison_winners(rows: list) -> dict:
-    """column -> feed name holding the STRICTLY best value (pure).
-
-    Lower is better for tcp_ms / tls_ms / last_tick_age_secs; higher is
-    better for ticks_per_sec / subscribed_total. A winner is only declared
-    when at least TWO feeds have a comparable value AND the best is strictly
-    unique — a tie, a single-feed measure, or unknown values yield NO winner
-    (an honest comparison needs something real to compare against)."""
-    lower_better = ("tcp_ms", "tls_ms", "last_tick_age_secs")
-    higher_better = ("ticks_per_sec", "subscribed_total")
-    winners: dict[str, str] = {}
-    for col in lower_better + higher_better:
-        vals: list[tuple[float, str]] = []
-        for r in rows:
-            try:
-                vals.append((float(r.get(col)), str(r.get("feed"))))
-            except (TypeError, ValueError):
-                continue
-        if len(vals) < 2:
-            continue
-        vals.sort(key=lambda x: x[0], reverse=col in higher_better)
-        if vals[0][0] == vals[1][0]:
-            continue  # tie — no single winner
-        winners[col] = vals[0][1]
-    return winners
-
-
-_PCTL_COLS = ("p50_ms", "p90_ms", "p95_ms", "p99_ms", "max_ms")
-
-
-def _parse_pctl_row(raw: str) -> tuple:
-    """Parse one `<feed>,<rows>,<negs>,<p50>,<p90>,<p95>,<p99>,<max>,
-    <replay_excluded>` CSV line (lag values in MICROSECONDS from QuestDB;
-    replay_excluded = the Rule-11 companion count of replay-restamped OR
-    ≥60s-pipeline-stalled rows excluded from the sample — SQL cannot tell
-    the two apart; see the _pctl_feed_sql HONEST LIMIT note) into
-    `(feed, dict)`, or `(None, None)` for anything malformed — a failed
-    on-box query yields an empty tail after the feed name and is skipped,
-    never fabricated. Pure."""
+def _parse_rest_lat_row(raw: str) -> dict | None:
+    """Parse one `<feed>,<leg>,<ok_rows>,<p50>,<p99>` CSV line (latency in
+    MILLISECONDS — close_to_data_ms is stored in ms) into a dict, or None
+    for anything malformed — a failed on-box query yields nothing, never a
+    fabricated row. feed/leg tokens are charset-validated (defense in depth
+    — they are our own symbols, but nothing unvalidated lands in HTML paths
+    beyond esc()). Pure."""
     import re  # noqa: PLC0415
 
-    parts = raw.split(",")
-    if len(parts) != 9:
-        return (None, None)
-    feed = parts[0].strip()
+    parts = [p.strip().strip('"') for p in raw.split(",")]
+    if len(parts) != 5:
+        return None
+    feed, leg = parts[0], parts[1]
     if not re.fullmatch(r"[a-z0-9_-]{1,32}", feed):
-        return (None, None)  # defense in depth — mirror the shell allowlist
+        return None
+    if not re.fullmatch(r"[a-z0-9_-]{1,32}", leg):
+        return None
 
     def _num(s: str) -> float | None:
-        s = s.strip()
         if not s or s.lower() in ("null", "nan"):
             return None
         try:
@@ -1058,185 +519,43 @@ def _parse_pctl_row(raw: str) -> tuple:
         except ValueError:
             return None
 
-    rows = _num(parts[1])
+    rows = _num(parts[2])
     if rows is None or rows < 0:
-        return (None, None)
-    negs = _num(parts[2])
-    out: dict = {"rows": int(rows), "neg_clamped": int(negs) if negs else 0}
-    for key, val in zip(_PCTL_COLS, parts[3:8]):
-        n = _num(val)
-        # µs → ms, 2 decimals (sub-ms resolution matters for the groww share).
-        out[key] = round(n / 1000.0, 2) if n is not None else None
-    # Rule-11 companion: replay-restamped (or ≥60s pipeline-stalled) rows
-    # excluded from the sample — rendered on the page, never a silent
-    # drop. Count, not microseconds.
-    # None (empty/null cell) = NOT APPLICABLE: the replay excluder is
-    # dhan-only (finding 10 — groww capture_seq is exchange-ts-seeded, not
-    # a receipt stamp), so non-dhan feeds emit a NULL leg and render "—"
-    # instead of a false verified-0.
-    excl = _num(parts[8])
-    out["replay_excluded"] = None if excl is None else max(int(excl), 0)
-    return (feed, out)
-
-
-def _feed_percentile_map(pctl_lines: list) -> dict:
-    """feed → percentile dict from the PCTL_ROW payload lines (pure)."""
-    out: dict = {}
-    for raw in pctl_lines:
-        feed, row = _parse_pctl_row(raw)
-        if feed is not None:
-            out[feed] = row
-    return out
-
-
-def _percentile_winners(pctl: dict) -> dict:
-    """column → feed with the STRICTLY lowest lag value (pure).
-
-    Lower is better for every lag column. Same honesty contract as
-    _feed_comparison_winners: a winner needs ≥2 comparable values and a
-    strictly unique best — ties, single-feed measures, and zero-row feeds
-    yield NO winner."""
-    winners: dict = {}
-    for col in _PCTL_COLS:
-        vals = [
-            (row[col], feed)
-            for feed, row in pctl.items()
-            if row.get(col) is not None and row.get("rows", 0) > 0
-        ]
-        if len(vals) < 2:
-            continue
-        vals.sort(key=lambda x: x[0])
-        if vals[0][0] == vals[1][0]:
-            continue  # tie — no single winner
-        winners[col] = vals[0][1]
-    return winners
-
-
-def _feed_latency_rows(health_t0: object, health_t1: object, probes: dict, window: str) -> list:
-    """Join the app's per-feed health rows with the on-box network probes
-    (pure). One output row per feed the APP reports (never hardcoded);
-    probe columns come from _FEED_LIVE_HOSTS-keyed samples — a feed with no
-    host mapping gets endpoint_known=False and blank probe cells. ticks/sec
-    is the Δticks_total between the two health scrapes over the window;
-    None when either scrape is missing or the counter reset (app restart)."""
-
-    def feed_map(payload: object) -> dict:
-        out: dict[str, dict] = {}
-        if isinstance(payload, dict) and isinstance(payload.get("feeds"), list):
-            for r in payload["feeds"]:
-                if isinstance(r, dict) and r.get("feed"):
-                    out[str(r["feed"])] = r
-        return out
-
-    def min_ms(values: list[float]) -> str:
-        vals = [v for v in values if v > 0]
-        return f"{min(vals) * 1000:.1f}" if vals else ""
-
-    t0_rows = feed_map(health_t0)
-    t1_rows = feed_map(health_t1)
-    # T1 is authoritative (post-window state); fall back to T0 when the
-    # second scrape failed so the operator still sees the rows.
-    base = t1_rows or t0_rows
-    rows: list = []
-    for name, r in base.items():
-        samples = probes.get(name, [])
-        tps = None
-        try:
-            w = float(window)
-            delta = float(t1_rows[name].get("ticks_total")) - float(
-                t0_rows[name].get("ticks_total")
-            )
-            if w > 0 and delta >= 0:
-                tps = round(delta / w, 1)
-        except (TypeError, ValueError, KeyError):
-            tps = None
-        rows.append(
-            {
-                "feed": name,
-                "endpoint": _FEED_LIVE_HOSTS.get(name),
-                "endpoint_known": name in _FEED_LIVE_HOSTS,
-                "tcp_ms": min_ms([s[0] for s in samples]),
-                "tls_ms": min_ms([s[1] for s in samples]),
-                "last_tick_age_secs": r.get("last_tick_age_secs"),
-                "ticks_total": r.get("ticks_total"),
-                "ticks_per_sec": tps,
-                "subscribed_total": r.get("subscribed_total"),
-                "verdict": r.get("verdict"),
-                "enabled": r.get("enabled"),
-            }
-        )
-    return rows
+        return None
+    p50, p99 = _num(parts[3]), _num(parts[4])
+    return {
+        "feed": feed,
+        "leg": leg,
+        "ok_rows": int(rows),
+        "p50_ms": round(p50, 1) if p50 is not None else None,
+        "p99_ms": round(p99, 1) if p99 is not None else None,
+    }
 
 
 def _parse_latency(stdout: str) -> dict:
     """Parse the labeled latency snapshot into a structured dict (pure).
 
-    Windowed-percentile design (2026-06-10): the box emits TWO metric
-    scrapes — METRICS_T0 (before the network probes) and METRICS (after).
-    Lifetime averages come from the second scrape (back-compat); the
-    p50/p99 + windowed averages come from the bucket DELTAS between them.
-
-    Per-feed design (2026-07-03): PROBE_<feed>_BEGIN/END blocks carry each
-    feed's TCP/TLS samples, and FEEDS_T0/FEEDS_T1 blocks carry the app's
-    /api/feeds/health JSON at both window edges — joined into one comparison
-    row per feed the app reports, plus a winners map for the green highlight.
-    """
-    probes: dict[str, list[tuple[float, float]]] = {}
+    RESTLAT_ROW lines carry the per-(feed, leg) rest_fetch_audit aggregate;
+    the METRICS block carries the dormant order-placement histogram. Empty
+    stdout (box stopped) degrades to an empty table + blank shields — the
+    page says so honestly instead of fabricating numbers."""
     metrics: dict[str, str] = {}
-    t0_lines: list[str] = []
-    t1_lines: list[str] = []
-    feeds_t0_lines: list[str] = []
-    feeds_t1_lines: list[str] = []
-    pctl_lines: list[str] = []
+    rest_rows: list = []
     fields: dict[str, str] = {}
     mode = ""
-    probe_feed = ""
     for line in (stdout or "").splitlines():
-        if line.startswith("PCTL_ROW="):
-            # Per-feed lag-percentile CSV (2026-07-03) — intercepted BEFORE
-            # the generic K=V branch so multiple rows never clobber a key.
-            pctl_lines.append(line[len("PCTL_ROW=") :])
+        if line.startswith("RESTLAT_ROW="):
+            row = _parse_rest_lat_row(line[len("RESTLAT_ROW=") :])
+            if row is not None:
+                rest_rows.append(row)
             continue
-        if line in ("METRICS_BEGIN", "METRICS_T0_BEGIN", "FEEDS_T0_BEGIN", "FEEDS_T1_BEGIN"):
-            mode = {
-                "METRICS_BEGIN": "METRICS",
-                "METRICS_T0_BEGIN": "T0",
-                "FEEDS_T0_BEGIN": "FEEDS_T0",
-                "FEEDS_T1_BEGIN": "FEEDS_T1",
-            }[line]
+        if line == "METRICS_BEGIN":
+            mode = "METRICS"
             continue
-        if line in ("METRICS_END", "METRICS_T0_END", "FEEDS_T0_END", "FEEDS_T1_END"):
+        if line == "METRICS_END":
             mode = ""
-            continue
-        if line.startswith("PROBE_") and line.endswith("_BEGIN"):
-            probe_feed = line[len("PROBE_") : -len("_BEGIN")]
-            probes.setdefault(probe_feed, [])
-            mode = "PROBE"
-            continue
-        if line.startswith("PROBE_") and line.endswith("_END"):
-            mode = ""
-            probe_feed = ""
-            continue
-        if mode == "PROBE":
-            parts = line.split()
-            if len(parts) == 2:
-                try:
-                    probes[probe_feed].append((float(parts[0]), float(parts[1])))
-                except ValueError:
-                    pass  # 'x x' sentinel — failed sample, honestly skipped
-            continue
-        if mode == "T0":
-            t0_lines.append(line)
-            continue
-        if mode == "FEEDS_T0":
-            feeds_t0_lines.append(line)
-            continue
-        if mode == "FEEDS_T1":
-            feeds_t1_lines.append(line)
             continue
         if mode == "METRICS":
-            # e.g. "tv_tick_processing_duration_ns_sum 1.23e6"
-            t1_lines.append(line)
             bits = line.split()
             if len(bits) == 2:
                 metrics[bits[0]] = bits[1]
@@ -1251,90 +570,18 @@ def _parse_latency(stdout: str) -> dict:
         except (TypeError, ValueError):
             return ""
 
-    def avg(name: str):
-        a = _avg_ns(metrics.get(name + "_sum", ""), metrics.get(name + "_count", ""))
-        return round(a, 1) if a is not None else None
-
-    # Windowed stats from bucket deltas between the two scrapes. None when
-    # the window saw no samples (market closed) or a counter reset — the
-    # dashboard falls back to the lifetime averages in that case.
-    t0 = _parse_bucket_lines(t0_lines)
-    t1 = _parse_bucket_lines(t1_lines)
-
-    def windowed(name: str) -> tuple[float | None, float | None, float | None, float]:
-        d = _bucket_deltas(t0.get(name, {}), t1.get(name, {}))
-        if d is None:
-            return (None, None, None, 0.0)
-        p50 = _percentile_from_bucket_deltas(d, 0.50)
-        p99 = _percentile_from_bucket_deltas(d, 0.99)
-        w_avg = d["sum"] / d["count"] if d["count"] > 0 else None
-        return (
-            round(p50, 1) if p50 is not None else None,
-            round(p99, 1) if p99 is not None else None,
-            round(w_avg, 1) if w_avg is not None else None,
-            d["count"],
-        )
-
-    tick_p50, tick_p99, tick_wavg, tick_wcount = windowed("tv_tick_processing_duration_ns")
-    wire_p50, wire_p99, wire_wavg, _ = windowed("tv_wire_to_done_duration_ns")
-    flush_p50, flush_p99, flush_wavg, _ = windowed("tv_tick_flush_duration_ns")
-
-    def window_secs() -> str:
-        try:
-            return f"{float(fields.get('T1', '')) - float(fields.get('T0', '')):.1f}"
-        except (TypeError, ValueError):
-            return ""
-
-    def health_json(lines: list[str]) -> tuple[object, str]:
-        raw = "\n".join(lines).strip()
-        if not raw or "TV_CURL_FAILED" in raw:
-            return None, _FEED_API_UNREACHABLE
-        try:
-            return json.loads(raw), ""
-        except (json.JSONDecodeError, ValueError):
-            return None, "app API returned invalid JSON"
-
-    health_t0, err_t0 = health_json(feeds_t0_lines)
-    health_t1, err_t1 = health_json(feeds_t1_lines)
-    feed_rows = _feed_latency_rows(health_t0, health_t1, probes, window_secs())
-    pctl_map = _feed_percentile_map(pctl_lines)
-
+    order_avg = _avg_ns(
+        metrics.get("tv_order_placement_duration_ns_sum", ""),
+        metrics.get("tv_order_placement_duration_ns_count", ""),
+    )
     return {
-        # Per-feed comparison (operator demand 2026-07-03): one row per feed
-        # the APP reports, with the on-box probe joined in. Empty + error set
-        # when the app was unreachable on the box — never fabricated rows.
-        "feeds": feed_rows,
-        "feeds_error": "" if feed_rows else (err_t1 or err_t0 or ""),
-        "winners": _feed_comparison_winners(feed_rows),
-        # Per-feed exchange→received lag percentile grid (2026-07-03;
-        # receive-time population + replay exclusion 2026-07-07).
-        # Empty dict = the box returned no PCTL rows (QuestDB down, no rows
-        # received in the window, or query failed) — the page says so
-        # honestly instead of showing fake numbers.
-        "percentiles": pctl_map,
-        "percentile_winners": _percentile_winners(pctl_map),
-        "percentile_recv_window_secs": _PCTL_RECV_WINDOW_SECS,
-        "percentile_ts_prune_hours": _PCTL_TS_PRUNE_HOURS,
-        "percentile_sample_cap": _PCTL_SAMPLE_CAP,
+        # Per-(feed, leg) "how fast after each minute closed" rows. Empty
+        # list = the box returned no rows (stopped box, empty fetch log, or
+        # query failed) — the page says so honestly.
+        "rest_latency": rest_rows,
         "questdb_ms": sec_to_ms(fields.get("QDB", "")),
         "clock_skew_ms": sec_to_ms(fields.get("SKEW", "")),
-        "tick_process_avg_ns": avg("tv_tick_processing_duration_ns"),
-        "wire_to_done_avg_ns": avg("tv_wire_to_done_duration_ns"),
-        "order_place_avg_ns": avg("tv_order_placement_duration_ns"),
-        "tick_count": metrics.get("tv_tick_processing_duration_ns_count", ""),
-        # Windowed precise latencies (operator directive 2026-06-10) —
-        # computed over the probe window (~10 s), None when no live ticks.
-        "window_secs": window_secs(),
-        "tick_window_count": int(tick_wcount),
-        "tick_p50_ns": tick_p50,
-        "tick_p99_ns": tick_p99,
-        "tick_window_avg_ns": tick_wavg,
-        "wire_p50_ns": wire_p50,
-        "wire_p99_ns": wire_p99,
-        "wire_window_avg_ns": wire_wavg,
-        "flush_p50_ns": flush_p50,
-        "flush_p99_ns": flush_p99,
-        "flush_window_avg_ns": flush_wavg,
+        "order_place_avg_ns": round(order_avg, 1) if order_avg is not None else None,
     }
 
 
@@ -1364,72 +611,6 @@ def _parse_storage(stdout: str) -> dict:
         "disk_free_gb": g("DISK_FREE"),
         "disk_pct": f.get("DISK_PCT", ""),
         "db_size_gb": g("DB_SIZE"),
-    }
-
-
-# ------------------------------------------------------------ cross-verify snap
-# The 15:31 IST daily candle check vs the exchange record (visibility
-# directive 2026-06-10). Reads the app's read-only endpoint on the box and
-# re-emits ONLY the summary as labeled lines — the mismatch CSV itself stays
-# on the box (SSM command output is size-capped). Read-only; degrades to
-# blank fields when the box/app is down or no run has happened yet.
-#
-# Security trim 2026-07-04: /api/debug/* is bearer-gated (auth is ALWAYS
-# enabled on a real boot — the app hard-fails without the SSM token), so the
-# probe fetches the SAME token box-side via the instance role and sends it as
-# an Authorization header. The token is resolved at RUN time on the box —
-# the SSM command document text (logged in RunCommand history) carries only
-# the literal `$TVTOK`, never the value, and stdout prints only CV_* lines.
-# Empty/unfetchable token → 401 → curl -f fails → CV_DATE= blank, the same
-# truthful "no data" degrade as a stopped box (audit Rule 11 — never a
-# fabricated PASS, and post-gating never a silently-blank card either).
-#
-# Token-never-in-argv (consolidated from PR #1402, 2026-07-04): the token is
-# passed to curl via a mode-0600 header FILE (`-H @file`, umask 077 + mktemp),
-# NOT curl argv, so it is never visible in `ps`/`/proc/<pid>/cmdline` on the
-# box and arbitrary token bytes cannot break shell quoting. `printf` is a
-# shell BUILTIN (no forked process → no argv exposure) writing the header
-# verbatim; the trap removes the file when the SSM script exits. A failed
-# mktemp/write degrades to the same truthful CV_DATE= blank.
-_CROSS_VERIFY_COMMANDS = [
-    "set +e",
-    "umask 077",
-    'TV_CV_HDR="$(mktemp /tmp/tv-cv-auth.XXXXXX)"',
-    "trap 'rm -f \"$TV_CV_HDR\"' EXIT",
-    (
-        'TVTOK="$(aws ssm get-parameter --name /tickvault/prod/api/bearer-token '
-        "--with-decryption --query Parameter.Value --output text 2>/dev/null || true)\"; "
-        'printf \'Authorization: Bearer %s\\n\' "$TVTOK" > "$TV_CV_HDR" 2>/dev/null; '
-        'curl -fsS --max-time 4 -H "@${TV_CV_HDR}" '
-        "http://127.0.0.1:3001/api/debug/cross-verify/latest 2>/dev/null | "
-        'python3 -c \'import json,sys; d=json.load(sys.stdin); s=d.get("summary") or {}; '
-        'print("CV_DATE="+str(d.get("date",""))); '
-        'print("CV_MISMATCH_ROWS="+str(d.get("mismatch_rows",""))); '
-        'print("CV_INSTRUMENTS="+str(s.get("instruments_checked",""))); '
-        'print("CV_COMPARED="+str(s.get("compared",""))); '
-        'print("CV_MISSING="+str(s.get("missing_ours",""))); '
-        'print("CV_DEGRADED="+str(s.get("degraded","")))\' '
-        "2>/dev/null || echo CV_DATE="
-    ),
-]
-
-
-def _parse_cross_verify(stdout: str) -> dict:
-    """Parse the labeled cross-verify snapshot into a dict (pure). Blank
-    fields mean: box stopped, app down, or no run yet — the card shows a
-    truthful 'no run yet', never a fabricated PASS."""
-    f: dict[str, str] = {}
-    for line in (stdout or "").splitlines():
-        if "=" in line:
-            k, _, v = line.partition("=")
-            f[k.strip()] = v.strip()
-    return {
-        "date": f.get("CV_DATE", ""),
-        "mismatch_rows": f.get("CV_MISMATCH_ROWS", ""),
-        "instruments": f.get("CV_INSTRUMENTS", ""),
-        "compared": f.get("CV_COMPARED", ""),
-        "missing": f.get("CV_MISSING", ""),
-        "degraded": f.get("CV_DEGRADED", ""),
     }
 
 
@@ -1468,8 +649,34 @@ _FEEDS_VIEW_COMMANDS = [
     'echo "FEEDS_HEALTH_BEGIN"',
     "curl -fsS --max-time 8 http://127.0.0.1:3001/api/feeds/health 2>/dev/null || echo TV_CURL_FAILED; echo",
     'echo "FEEDS_HEALTH_END"',
+    # REST-lane pulse per feed (2026-07-16 — the runtime is REST-only; the
+    # old ticks/subscribed counters read frozen registries). Sourced from
+    # rest_fetch_audit (LIVE — written by every feed/leg pair):
+    #  * REST_AUDIT — today's fetch outcomes per (feed, outcome), CSV header
+    #    skipped, rows ';'-joined (the *_BY_FEED house convention).
+    #  * REST_LAT_HOUR — last hour's p50/p99 of close_to_data_ms for
+    #    outcome='ok' rows per feed. `ts` is IST-shifted while QuestDB now()
+    #    is UTC, so the window compares against IST_now =
+    #    dateadd('m', 330, now()) — the 2026-07-07 timebase lesson. The
+    #    close_to_data_ms >= 0 filter drops the -1 not-measured sentinel and
+    #    satisfies approx_percentile's non-negative input requirement.
+    (
+        'echo "REST_AUDIT=$(curl -fsS --max-time 4 -G \'http://127.0.0.1:9000/exp\' '
+        '--data-urlencode "query=select feed, outcome, count() from rest_fetch_audit '
+        'where ts in today() group by feed, outcome" 2>/dev/null '
+        "| tail -n +2 | tr '\\n' ';')\""
+    ),
+    (
+        'echo "REST_LAT_HOUR=$(curl -fsS --max-time 4 -G \'http://127.0.0.1:9000/exp\' '
+        '--data-urlencode "query=select feed, approx_percentile(close_to_data_ms, 0.5, 3), '
+        "approx_percentile(close_to_data_ms, 0.99, 3) from rest_fetch_audit "
+        "where ts > dateadd('h', -1, dateadd('m', 330, now())) "
+        "and outcome = 'ok' and close_to_data_ms >= 0 group by feed\" 2>/dev/null "
+        "| tail -n +2 | tr '\\n' ';')\""
+    ),
 ]
-# Two 8s curls + SSM registration need more than the 6s view window.
+# Two 8s curls + two 4s audit reads + SSM registration need more than the 6s
+# view window.
 _FEEDS_TIMEOUT_SECS = 20.0
 
 
@@ -1487,20 +694,103 @@ def _extract_marked_json(stdout: str, begin: str, end: str) -> tuple[object, str
         return None, "app API returned invalid JSON"
 
 
+def _parse_rest_audit(raw: str) -> dict:
+    """Parse the REST_AUDIT value — ';'-joined `feed,outcome,count` CSV rows —
+    into {feed: {outcome: count_int}}. Pure. Feed/outcome tokens are
+    charset-validated (defense in depth); malformed fragments are skipped so
+    an empty/absent value yields {} — the card then says "no pulls recorded
+    today" instead of fabricated zeros (audit Rule 11)."""
+    import re  # noqa: PLC0415
+
+    out: dict[str, dict[str, int]] = {}
+    for part in (raw or "").split(";"):
+        parts = [p.strip().strip('"') for p in part.strip().split(",")]
+        if len(parts) != 3:
+            continue
+        feed, outcome, cnt = parts
+        if not re.fullmatch(r"[a-z0-9_-]{1,32}", feed):
+            continue
+        if not re.fullmatch(r"[a-z0-9_-]{1,32}", outcome):
+            continue
+        if not cnt.isdigit():
+            continue
+        out.setdefault(feed, {})[outcome] = int(cnt)
+    return out
+
+
+def _parse_rest_lat_hour(raw: str) -> dict:
+    """Parse the REST_LAT_HOUR value — ';'-joined `feed,p50,p99` CSV rows
+    (milliseconds — close_to_data_ms) — into {feed: {p50_ms, p99_ms}}.
+    Pure; malformed fragments skipped, never fabricated."""
+    import re  # noqa: PLC0415
+
+    def _num(s: str) -> float | None:
+        if not s or s.lower() in ("null", "nan"):
+            return None
+        try:
+            return float(s)
+        except ValueError:
+            return None
+
+    out: dict[str, dict] = {}
+    for part in (raw or "").split(";"):
+        parts = [p.strip().strip('"') for p in part.strip().split(",")]
+        if len(parts) != 3:
+            continue
+        feed = parts[0]
+        if not re.fullmatch(r"[a-z0-9_-]{1,32}", feed):
+            continue
+        p50, p99 = _num(parts[1]), _num(parts[2])
+        if p50 is None and p99 is None:
+            continue
+        out[feed] = {
+            "p50_ms": round(p50, 1) if p50 is not None else None,
+            "p99_ms": round(p99, 1) if p99 is not None else None,
+        }
+    return out
+
+
 def _parse_feeds_view(stdout: str) -> dict:
     """Parse the marked feeds-view snapshot (pure). On any failure the matching
     *_error field carries a structured reason and the payload is None — the UI
-    renders the error verbatim instead of defaulting to zeros."""
+    renders the error verbatim instead of defaulting to zeros. The REST-lane
+    pulse (rest_audit / rest_lat_hour, sourced from rest_fetch_audit) rides
+    the same snapshot as labeled lines OUTSIDE the marker blocks."""
     if not (stdout or "").strip():
         return {
             "feeds": None,
             "feeds_error": _BOX_UNREACHABLE,
             "health": None,
             "health_error": _BOX_UNREACHABLE,
+            "rest_audit": {},
+            "rest_lat_hour": {},
         }
     feeds, feeds_error = _extract_marked_json(stdout, "FEEDS_BEGIN", "FEEDS_END")
     health, health_error = _extract_marked_json(stdout, "FEEDS_HEALTH_BEGIN", "FEEDS_HEALTH_END")
-    return {"feeds": feeds, "feeds_error": feeds_error, "health": health, "health_error": health_error}
+    fields: dict[str, str] = {}
+    in_block = False
+    for line in (stdout or "").splitlines():
+        # Skip the marker-delimited JSON blocks — a JSON body containing '='
+        # must never be mistaken for a labeled line.
+        if line in ("FEEDS_BEGIN", "FEEDS_HEALTH_BEGIN"):
+            in_block = True
+            continue
+        if line in ("FEEDS_END", "FEEDS_HEALTH_END"):
+            in_block = False
+            continue
+        if in_block:
+            continue
+        if "=" in line:
+            k, _, v = line.partition("=")
+            fields[k.strip()] = v.strip()
+    return {
+        "feeds": feeds,
+        "feeds_error": feeds_error,
+        "health": health,
+        "health_error": health_error,
+        "rest_audit": _parse_rest_audit(fields.get("REST_AUDIT", "")),
+        "rest_lat_hour": _parse_rest_lat_hour(fields.get("REST_LAT_HOUR", "")),
+    }
 
 
 def _validate_feed_toggle(feed: object, enabled: object) -> str:
@@ -1564,163 +854,6 @@ def _parse_feed_toggle(stdout: str) -> dict:
     if status is None or status == 0:
         return {"app_status": None, "app_response": body, "error": _FEED_API_UNREACHABLE}
     return {"app_status": status, "app_response": body, "error": ""}
-
-
-# --------------------------------------------------------------- groww-only wipe
-# Surgical per-feed wipe (operator demand 2026-07-02: delete every groww row
-# WITHOUT touching dhan data or the SEBI audit tables). QuestDB cannot DELETE
-# rows and groww+dhan share partitions, so removal = a per-table REWRITE:
-#   CREATE <t>_gwipe with the EXACT canonical DDL (mirrored from
-#   crates/storage/src/tick_persistence.rs::TICKS_CREATE_DDL — 19 cols,
-#   TIMESTAMP(ts) PARTITION BY HOUR WAL, DEDUP UPSERT KEYS(ts, security_id,
-#   segment, capture_seq, feed) — and crates/storage/src/shadow_persistence.rs
-#   — 15 cols, timestamp(ts) PARTITION BY DAY, DEDUP UPSERT KEYS(ts,
-#   security_id, segment, feed))
-#   → INSERT the kept rows (feed != 'groww' OR feed IS NULL — NULL-feed rows
-#     are legacy dhan rows and MUST be kept; explicit column lists make the
-#     copy immune to live column-ORDER drift from historical ALTER ADDs)
-#   → VERIFY count(new) == count(old) - count(groww) BEFORE any DROP (WAL
-#     apply is async — poll up to 120s)
-#   → only then DROP old + RENAME new into place.
-# Mid-rewrite failure safety: the ORIGINAL table is NEVER dropped until the
-# copy verified; any failure aborts THAT table (original untouched, temp
-# dropped) and the run ends GROWW-WIPE-PARTIAL — never a fake OK.
-# SCOPE LOCK: market-data tables ONLY (ticks + dynamically-discovered
-# candles_*). The SEBI never-delete tables (instrument lifecycle + every
-# *_audit + index constituency + prev-day OHLCV) are NOT in the target filter.
-# Dhan replay sources (data/ws_wal, spill, dlq, instrument-cache) are NOT
-# removed — only the groww capture dir (capture file + status + bridge
-# flushed-offset snapshot), the proven resurrection vector, BEFORE restart.
-_GROWW_WIPE_PY = """
-import json, time, urllib.request, urllib.parse
-
-BASE = 'http://127.0.0.1:9000/exec?query='
-
-def q(sql, timeout=60):
-    with urllib.request.urlopen(BASE + urllib.parse.quote(sql), timeout=timeout) as r:
-        return json.load(r)
-
-def one(sql):
-    ds = q(sql).get('dataset') or []
-    if not ds or not ds[0] or ds[0][0] is None:
-        return 0
-    return int(ds[0][0])
-
-TICKS_COLS = ['feed','segment','security_id','ltp','open','high','low','close','volume','oi','avg_price','last_trade_qty','total_buy_qty','total_sell_qty','exchange_timestamp','received_at','payload_hash','capture_seq','ts']
-TICKS_TYPES = {'feed':'SYMBOL','segment':'SYMBOL','security_id':'LONG','ltp':'DOUBLE','open':'DOUBLE','high':'DOUBLE','low':'DOUBLE','close':'DOUBLE','volume':'LONG','oi':'LONG','avg_price':'DOUBLE','last_trade_qty':'LONG','total_buy_qty':'LONG','total_sell_qty':'LONG','exchange_timestamp':'LONG','received_at':'TIMESTAMP','payload_hash':'LONG','capture_seq':'LONG','ts':'TIMESTAMP'}
-CANDLE_COLS = ['feed','segment','security_id','ts','open','high','low','close','volume','oi','tick_count','close_pct_from_prev_day','open_pct','change_pct','open_gap_pct']
-CANDLE_TYPES = {'feed':'SYMBOL','segment':'SYMBOL','security_id':'LONG','ts':'TIMESTAMP','open':'DOUBLE','high':'DOUBLE','low':'DOUBLE','close':'DOUBLE','volume':'LONG','oi':'LONG','tick_count':'LONG','close_pct_from_prev_day':'DOUBLE','open_pct':'DOUBLE','change_pct':'DOUBLE','open_gap_pct':'DOUBLE'}
-
-def ddl(new, cols, types, tail):
-    body = ', '.join('%s %s' % (c, types[c]) for c in cols)
-    return 'CREATE TABLE %s (%s) %s' % (new, body, tail)
-
-def rewrite(table, cols, types, tail, dedup_key):
-    new = table + '_gwipe'
-    try:
-        live = [r[0] for r in (q("SELECT * FROM table_columns('%s')" % table).get('dataset') or [])]
-        if sorted(live) != sorted(cols):
-            print('GWIPE-SKIP %s: live schema differs from canonical (live=%s) - original untouched' % (table, ','.join(sorted(live))))
-            return False
-        total = one('SELECT count() FROM %s' % table)
-        groww = one("SELECT count() FROM %s WHERE feed = 'groww'" % table)
-        keep = total - groww
-        if groww == 0:
-            print('GWIPE-CLEAN %s: rows=%d groww=0 (nothing to remove)' % (table, total))
-            return True
-        q('DROP TABLE IF EXISTS %s' % new)
-        q(ddl(new, cols, types, tail))
-        if dedup_key:
-            q('ALTER TABLE %s DEDUP ENABLE UPSERT KEYS(%s)' % (new, dedup_key))
-        collist = ', '.join(cols)
-        q("INSERT INTO %s (%s) SELECT %s FROM %s WHERE feed != 'groww' OR feed IS NULL" % (new, collist, collist, table), timeout=1800)
-        got = -1
-        deadline = time.time() + 120
-        while time.time() < deadline:
-            got = one('SELECT count() FROM %s' % new)
-            if got == keep:
-                break
-            time.sleep(2)
-        if got != keep:
-            print('GWIPE-ABORT %s: copy verify failed (new=%d expected=%d) - ORIGINAL UNTOUCHED, temp dropped' % (table, got, keep))
-            q('DROP TABLE IF EXISTS %s' % new)
-            return False
-    except Exception as exc:
-        print('GWIPE-ABORT %s: %r - ORIGINAL UNTOUCHED' % (table, exc))
-        try:
-            q('DROP TABLE IF EXISTS %s' % new)
-        except Exception:
-            pass
-        return False
-    try:
-        q('DROP TABLE %s' % table)
-        q('RENAME TABLE %s TO %s' % (new, table))
-    except Exception as exc:
-        print('GWIPE-CRITICAL %s: swap failed midway (%r) - dhan rows are SAFE in %s; run manually: RENAME TABLE %s TO %s' % (table, exc, new, new, table))
-        return False
-    print('GWIPE-OK %s: before=%d groww_removed=%d after=%d' % (table, total, groww, keep))
-    return True
-
-names = [r[0] for r in (q('SELECT table_name FROM tables()').get('dataset') or []) if isinstance(r, list) and r]
-targets = (['ticks'] if 'ticks' in names else [])
-targets += sorted(t for t in names if t.startswith('candles_') and not t.endswith('_gwipe'))
-print('GWIPE-TARGETS %d %s' % (len(targets), targets))
-all_ok = bool(targets)
-for t in targets:
-    if t == 'ticks':
-        okr = rewrite(t, TICKS_COLS, TICKS_TYPES, 'TIMESTAMP(ts) PARTITION BY HOUR WAL', 'ts, security_id, segment, capture_seq, feed')
-    else:
-        okr = rewrite(t, CANDLE_COLS, CANDLE_TYPES, 'timestamp(ts) PARTITION BY DAY DEDUP UPSERT KEYS(ts, security_id, segment, feed)', None)
-    all_ok = all_ok and okr
-print('GWIPE-TABLES-%s' % ('OK' if all_ok else 'PARTIAL'))
-"""
-
-
-def _wipe_groww_commands() -> list[str]:
-    """Build the SSM command list for the groww-only surgical wipe. Pure —
-    unit-tested by content assertions without touching boto3. See the block
-    comment above `_GROWW_WIPE_PY` for the full design + safety contract."""
-    data_dir = "/opt/tickvault/data"
-    return [
-        "set +e",
-        # 1. stop the app FIRST: releases QuestDB writers so nothing
-        #    re-appends rows mid-wipe (the groww sidecar was deleted with
-        #    the live feed, 2026-07-15).
-        "systemctl stop tickvault || true",
-        # (2026-07-15: the groww sidecar pkill retired — sidecar deleted with the Groww live feed)
-        # Best-effort safety net: if SSM kills this script mid-run (execution
-        # timeout on an enormous table / manual cancel), restart the app on
-        # the way out so the box is never left silently dead. SIGKILL cannot
-        # be trapped — that residual case is documented for the operator.
-        "trap 'systemctl start tickvault >/dev/null 2>&1 || true' EXIT TERM INT",
-        # 2. remove ONLY the groww capture/replay dir (capture file, status,
-        #    bridge flushed-offset snapshot) — the proven resurrection vector.
-        #    Dhan replay sources (ws_wal/spill/dlq/instrument-cache) KEPT.
-        f"rm -rf {data_dir}/groww 2>/dev/null || true",
-        "echo 'OK: groww capture/status/offset files removed (data/groww) - dhan replay sources untouched'",
-        # 3. surgical per-table rewrite (ticks + every candles_*), verified
-        #    copy-before-drop. Full transcript kept at /tmp/tv-gwipe.log.
-        "python3 - <<'PYGROWW' 2>&1 | tee /tmp/tv-gwipe.log" + _GROWW_WIPE_PY + "PYGROWW",
-        # 4. verify groww counts are 0 BEFORE restarting the app (no live
-        #    writes racing the count).
-        (
-            "sleep 2; "
-            "Q='http://127.0.0.1:9000/exec?query='; "
-            "TG=$(curl -fsS \"${Q}SELECT%20count()%20FROM%20ticks%20WHERE%20feed%20%3D%20%27groww%27\" 2>/dev/null | grep -o '\\[\\[[0-9]*' | grep -o '[0-9]*'); "
-            "CG=$(curl -fsS \"${Q}SELECT%20count()%20FROM%20candles_1m%20WHERE%20feed%20%3D%20%27groww%27\" 2>/dev/null | grep -o '\\[\\[[0-9]*' | grep -o '[0-9]*'); "
-            "echo \"GROWW-WIPE-RESULT ticks_groww=${TG:-?} candles_1m_groww=${CG:-?}\""
-        ),
-        # 5. restart the app — feeds config unchanged (a disabled groww feed
-        #    stays disabled; an enabled one resumes LIVE-only from now).
-        "systemctl start tickvault || true",
-        # 6. honest verdict: COMPLETE only when every table rewrite reported
-        #    OK AND both groww counts read 0. Anything else = PARTIAL.
-        (
-            "if grep -q 'GWIPE-TABLES-OK' /tmp/tv-gwipe.log && [ \"${TG:-1}\" = 0 ] && [ \"${CG:-1}\" = 0 ]; "
-            "then echo GROWW-WIPE-COMPLETE; "
-            "else echo 'GROWW-WIPE-PARTIAL: some tables were not rewritten or groww rows remain (originals kept safe) - inspect the GWIPE lines above'; fi"
-        ),
-    ]
 
 
 # --------------------------------------------------------- deploy provenance
@@ -1960,10 +1093,12 @@ def lambda_handler(event, _context):
             #      restarted after — it recreates schemas + resumes live-only.
             #   4. Honest completion: post-wipe row counts are echoed; the
             #      marker line WIPE-COMPLETE only prints when ticks AND
-            #      candles_1m are both 0 — a partial wipe reads WIPE-PARTIAL,
-            #      never a fake OK.
-            # Audit tables are intentionally preserved (SEBI retention) — the
-            # dynamic list matches ONLY ticks + candles_*.
+            #      candles_1m AND spot_1m_rest are all 0 — a partial wipe
+            #      reads WIPE-PARTIAL, never a fake OK.
+            # SEBI audit tables are intentionally preserved — the dynamic list
+            # matches ONLY ticks + candles_* + prev_day_ohlcv + the four LIVE
+            # REST tables (rest_fetch_audit is per-fetch forensics, not a SEBI
+            # never-delete table).
             if not force:
                 return _resp(409, {"error": 'wipe is destructive — re-send with {"force": true}', "action": action})
             # PR-5 H-1 (2026-07-02 security MEDIUM): server-side token — a
@@ -1998,7 +1133,13 @@ def lambda_handler(event, _context):
                 # 3. discover + truncate EVERY market-data table dynamically
                 #    (ticks + all candles_* — 27 today, future ones included —
                 #    + prev_day_ohlcv, PR-5: a \"fresh start\" previously left
-                #    yesterday's reference rows). python3 is on the box.
+                #    yesterday's reference rows; + the four LIVE REST-era
+                #    tables the per-minute pulls write — spot_1m_rest,
+                #    option_chain_1m, option_contract_1m_rest, rest_fetch_audit
+                #    (2026-07-16: a \"fresh start\" that leaves today's official
+                #    minute candles behind is not fresh; rest_fetch_audit is
+                #    per-fetch forensics, NOT a SEBI never-delete table).
+                #    python3 is on the box.
                 (
                     "python3 - <<'PYWIPE'\n"
                     "import json, urllib.request, urllib.parse\n"
@@ -2006,7 +1147,8 @@ def lambda_handler(event, _context):
                     "q = urllib.parse.quote(\"SELECT table_name FROM tables()\")\n"
                     "rows = json.load(urllib.request.urlopen(base + q, timeout=15)).get('dataset', [])\n"
                     "names = [r[0] for r in rows if isinstance(r, list) and r]\n"
-                    "targets = [t for t in names if t == 'ticks' or t.startswith('candles_') or t == 'prev_day_ohlcv']\n"
+                    "live_rest = {'spot_1m_rest', 'option_chain_1m', 'option_contract_1m_rest', 'rest_fetch_audit'}\n"
+                    "targets = [t for t in names if t == 'ticks' or t.startswith('candles_') or t == 'prev_day_ohlcv' or t in live_rest]\n"
                     "print('WIPE-TARGETS', len(targets), sorted(targets))\n"
                     "for t in targets:\n"
                     "    tq = urllib.parse.quote(f'TRUNCATE TABLE {t}')\n"
@@ -2028,41 +1170,15 @@ def lambda_handler(event, _context):
                     "sleep 3; "
                     "T=$(curl -fsS 'http://127.0.0.1:9000/exec?query=SELECT%20count()%20FROM%20ticks' 2>/dev/null | grep -o '\\[\\[[0-9]*' | grep -o '[0-9]*'); "
                     "C=$(curl -fsS 'http://127.0.0.1:9000/exec?query=SELECT%20count()%20FROM%20candles_1m' 2>/dev/null | grep -o '\\[\\[[0-9]*' | grep -o '[0-9]*'); "
-                    "echo \"WIPE-RESULT ticks=${T:-?} candles_1m=${C:-?}\"; "
-                    "if [ \"${T:-1}\" = 0 ] && [ \"${C:-1}\" = 0 ]; then echo WIPE-COMPLETE; else echo 'WIPE-PARTIAL: rows remain (or count unavailable) — inspect above'; fi"
+                    "S=$(curl -fsS 'http://127.0.0.1:9000/exec?query=SELECT%20count()%20FROM%20spot_1m_rest' 2>/dev/null | grep -o '\\[\\[[0-9]*' | grep -o '[0-9]*'); "
+                    "echo \"WIPE-RESULT ticks=${T:-?} candles_1m=${C:-?} spot_1m_rest=${S:-?}\"; "
+                    "if [ \"${T:-1}\" = 0 ] && [ \"${C:-1}\" = 0 ] && [ \"${S:-1}\" = 0 ]; then echo WIPE-COMPLETE; else echo 'WIPE-PARTIAL: rows remain (or count unavailable) — inspect above'; fi"
                 ),
             ]
             cid = _ssm_shell(cmds)
             return _resp(200, {"ok": True, "action": action, "command_id": cid})
-        if action == "wipe-groww":
-            # DESTRUCTIVE but feed-SCOPED: surgically removes every groww row
-            # from the market-data tables (per-table rewrite — QuestDB cannot
-            # DELETE rows) + the groww capture/offset files, leaving dhan data
-            # byte-identical and the SEBI never-delete tables untouched. In
-            # _DESTRUCTIVE (market-hours-blocked 09:15-15:30 IST unless force).
-            # Three server-side guards, in order:
-            #   1. confirm token — the caller must send {"confirm": "GROWW"}
-            #      (typed by the operator in the UI prompt; a scripted call
-            #      without the token can never fire this accidentally).
-            #   2. box must be RUNNING — the rewrite needs QuestDB + the SSM
-            #      agent live; dispatching to a stopped box would silently
-            #      no-op and mislead the operator.
-            #   3. the command list itself never drops an original table until
-            #      the copied row count verified (see _GROWW_WIPE_PY).
-            if str(payload.get("confirm", "")).strip() != "GROWW":
-                return _resp(
-                    409,
-                    {"error": 'wipe-groww deletes every groww tick+candle — re-send with {"confirm": "GROWW"}', "action": action},
-                )
-            inst = _client("ec2").describe_instances(InstanceIds=[INSTANCE_ID])["Reservations"][0]["Instances"][0]
-            state = inst["State"]["Name"]
-            if state != "running":
-                return _resp(
-                    409,
-                    {"error": f"box is {state} — the groww wipe needs the box RUNNING (start it first)", "action": action},
-                )
-            cid = _ssm_shell(_wipe_groww_commands())
-            return _resp(200, {"ok": True, "action": action, "command_id": cid})
+        # (wipe-groww removed 2026-07-16 — the groww-only wipe retired with the
+        # Groww live feed; a POST now falls through to the unknown-action 400.)
         if action == "docker-reset":
             # MOST DESTRUCTIVE: the FULL DOCKER NUKE — full Docker teardown +
             # fresh rebuild (operator Option B, 2026-06-04; re-demanded verbatim
@@ -2245,14 +1361,6 @@ def lambda_handler(event, _context):
             # avoids a pointless ~6s wait.
             snap = _parse_view(_ssm_shell_sync(_VIEW_COMMANDS) if state == "running" else "")
             mh = _is_market_hours(datetime.datetime.utcnow())
-            # Server-side classification (pure, unit-tested) — the UI renders
-            # the verdict verbatim; it can no longer invent green from a rate.
-            snap["tick_conservation"] = _classify_tick_conservation(
-                snap.get("conservation_rows", []),
-                snap.get("ws_disconnects_today", ""),
-                mh,
-                snap.get("max_ticks_per_second", ""),
-            )
             return _resp(
                 200,
                 {"ok": True, "action": "view", "instance_state": state, "market_hours": mh, **snap},
@@ -2297,11 +1405,9 @@ def lambda_handler(event, _context):
             return _resp(200, {"ok": True, "action": "logs", "raw": out})
         if action == "latency":
             return _resp(200, {"ok": True, "action": "latency", **_parse_latency(_ssm_shell_sync(_LATENCY_COMMANDS, timeout=_LATENCY_TIMEOUT_SECS))})
-        if action == "cross_verify":
-            # READ-ONLY (not in _DESTRUCTIVE): the 15:31 IST daily candle
-            # check vs the exchange record. Bearer auth already enforced by
-            # the top-level _authorized() gate.
-            return _resp(200, {"ok": True, "action": "cross_verify", **_parse_cross_verify(_ssm_shell_sync(_CROSS_VERIFY_COMMANDS))})
+        # (cross_verify removed 2026-07-16 — the 15:31 IST Dhan live-vs-
+        # historical comparer was deleted in PR-C3 2026-07-14; the card showed
+        # a frozen 2026-07-13 FAIL forever. Unknown-action 400 now.)
         if action == "feeds-view":
             # READ-ONLY: current per-feed enabled/lane state + per-feed health,
             # via SSM-curl of the app's local API (SG keeps :3001 closed).
@@ -2459,7 +1565,6 @@ def _console_html() -> str:
   .strip{ display:flex; gap:14px; flex-wrap:wrap; align-items:center; font-size:13px; font-weight:700; }
   .danger-opt{ display:flex; gap:10px; align-items:flex-start; margin:12px 0; cursor:pointer; }
   .danger-opt input{ width:auto; margin-top:3px; }
-  .spark{ width:100%; height:70px; display:block; }
   .ok{ color:var(--grn);} .bad{ color:var(--red);} .warn{ color:var(--amb);} .cy{ color:var(--cyan);}
   .muted{ color:var(--mut); font-size:12px; }
   pre{ background:#070b15; border:1px solid var(--line); border-radius:11px; padding:10px; overflow:auto;
@@ -2510,12 +1615,11 @@ def _console_html() -> str:
     <section data-tab="overview">
       <div class="card">
         <div class="hero">
-          <div class="bignum"><div class="n" id="ticksbig">0</div><div class="c">ticks captured today</div><div class="c" id="feedsplit"></div></div>
+          <div class="bignum"><div class="n" id="ticksbig">0</div><div class="c">official minute rows captured today</div><div class="c" id="feedsplit"></div></div>
           <div class="pills">
             <div class="pill"><div class="v" id="p_inst">—</div><div class="k">instance</div></div>
             <div class="pill"><div class="v" id="p_app">—</div><div class="k">app</div></div>
             <div class="pill"><div class="v" id="p_mkt">—</div><div class="k">market</div></div>
-            <div class="pill"><div class="v" id="p_tps">—</div><div class="k">peak ticks/sec</div></div>
           </div>
         </div>
         <div class="row" style="margin-top:14px">
@@ -2540,64 +1644,34 @@ def _console_html() -> str:
           <div class="muted" style="margin-top:8px">EBS auto-archives partitions &gt;90d to S3, and grows online — so it won't fill. Watch "DB size" climb day-by-day to see your GB/day. (Shows — when the box is stopped.)</div>
         </details>
       </div>
-      <div class="card"><div class="lbl">live ticks/sec — proof no sub-second tick is lost</div>
-        <svg class="spark" id="spark" viewBox="0 0 300 70" preserveAspectRatio="none"></svg></div>
       <div class="card"><div class="lbl">guarantees — live proof read from the box</div>
         <div class="banner" id="stoppedbanner" hidden>⏸ Box stopped (auto-stops 16:30 IST, auto-starts 08:30 Mon–Fri) — guarantees resume on start.</div>
         <div class="shields" id="shields"></div></div>
-      <div class="card"><div class="lbl">feeds — live market-data sources (toggle on/off)</div>
+      <div class="card"><div class="lbl">feeds — per-broker official-candle pulls (toggle on/off)</div>
         <div class="row" style="margin-bottom:10px"><button class="b-blu" onclick="loadFeeds()">🔄 Load feeds</button></div>
         <div id="feeds"><span class="muted">not loaded yet</span></div>
         <div class="muted" id="feedsmsg" style="margin-top:8px"></div>
-        <div class="muted" style="margin-top:6px">Every feed the app reports appears here automatically (a future feed #3 needs zero portal changes). Turning a feed OFF asks for confirmation; disabling Dhan during live trading is refused by the app itself.</div>
+        <div class="muted" style="margin-top:6px">Every feed the app reports appears here automatically (a future feed #3 needs zero portal changes). Turning a feed OFF asks for confirmation; disabling Dhan during live trading is refused by the app itself. The pull line below each feed comes from today's fetch log: how many minute-pulls succeeded / failed / were rate-limited, and how fast the successful pulls landed in the last hour.</div>
       </div>
-      <div class="card"><div class="lbl">latency — measured live on the box, per feed</div>
+      <div class="card"><div class="lbl">latency — how fast each official minute candle arrives after its minute closes</div>
         <div class="row" style="margin-bottom:12px"><button class="b-blu" onclick="loadLatency()">⚡ Measure now</button></div>
-        <div id="latfeeds" style="overflow:auto"></div>
-        <div class="muted" id="latload" style="margin-top:8px"></div>
-        <div class="lbl" style="margin-top:14px">exchange → received lag percentiles, per feed (rows received in the last 120 s)</div>
-        <div id="latpctl" style="overflow:auto"></div>
-        <div class="muted" id="latpctlnote" style="margin-top:8px"></div>
-        <div class="muted" style="margin-top:6px">Lag = exchange timestamp → our receive stamp, per stored tick.
-          Method (honest): approximate percentiles (3-significant-figure histogram, computed inside the database)
-          over the ≤50,000 NEWEST-RECEIVED rows in the last 120 seconds per feed — the population is defined by
-          RECEIVE time (an exchange-time window would structurally hide any lag larger than itself), and the
-          sample bound is ordered by receive time too (ordering by exchange time would evict the most-lagged
-          rows first when the cap binds; a capped sample is flagged below); negative lags
-          are clamped to 0 and counted. Replay honesty (dhan only): dhan rows whose receive stamp lands ≥60 s after
-          the row's original capture instant are EXCLUDED from the sample and counted in the "replay/stall rows
-          excluded" column — that catches restart / WAL-replay re-stamped rows, and can ALSO catch live rows that
-          spent over a minute queued inside the app during a severe pipeline stall (this page cannot tell the two
-          apart; the in-app lag alarm still sees such stall-induced lag). Genuinely lagged LIVE ticks with a fresh
-          capture instant are KEPT. For groww (and any non-dhan feed) that column reads "—": groww's capture sequence is seeded
-          from the exchange timestamp, not a receipt stamp, so replay-restamped groww rows cannot be told apart
-          this way — a documented limitation, never a fake zero.
-          Ceiling: the query scans only the last 6 hours of tick partitions (a performance bound), so a live lag
-          larger than 6 h cannot appear here. dhan caveat: dhan exchange timestamps (LTT) tick in WHOLE SECONDS —
-          a ≥1 s resolution floor, so dhan lag values carry up to ~1 s quantization and can never honestly read 0;
-          never read them as millisecond-precise.
-          groww rows carry receive-stamps; after the next deploy the stamp = capture-at-NIC (capture_ns).
-          Lower is better; best per column is <span class="ok">green</span>. Auto-extends to any future feed
-          (the feed list comes from the database, never hardcoded).</div>
-        <div class="lbl" style="margin-top:14px">box-wide (shared by all feeds)</div>
+        <div id="latrest" style="overflow:auto"></div>
+        <div class="muted" id="latrestnote" style="margin-top:8px"></div>
+        <div class="muted" style="margin-top:6px">One row per (broker, pull type) read from today's fetch log on the box —
+          p50/p99 of "minute closed → data in hand", successful pulls only (approximate percentiles, 3 significant
+          figures, computed inside the database). Late repairs keep their real ≥60 s delay; unmeasured rows are
+          excluded, never faked as fast. "-" = no successful pulls recorded today for that pair.</div>
+        <div class="lbl" style="margin-top:14px">box-wide (shared by all pulls)</div>
         <div class="shields" id="latnet"></div>
-        <div class="shields" id="latproc" style="margin-top:10px"></div>
-        <div class="muted" id="lattick" style="margin-top:10px"></div>
-        <div class="muted" style="margin-top:6px">Takes ~15s (live probe on the box). Every feed the app reports gets a row —
-          best value per column is <span class="ok">green</span>; a feed without a known probe endpoint shows "endpoint unknown" (never fake numbers).
-          Tick processing / DB round-trip / clock skew are box-wide — the app does not split them per feed, so we don't pretend it does.
-          Budgets: tick parse ≤10 ns · full tick process ≤10 µs · order ≤100 ns.</div>
+        <div class="muted" style="margin-top:6px">DB round-trip / clock skew are box-wide. Order placement reads "—"
+          until live trading returns (the order path is dormant by design).</div>
       </div>
     </section>
 
     <!-- DATA -->
     <section data-tab="data" hidden>
-      <div class="card"><div class="lbl">candles sealed today (per timeframe)</div><div id="bars"></div></div>
-      <div class="card"><div class="lbl">cross-verify — daily candle check vs exchange record (3:31 PM IST)</div>
-        <div class="row" style="margin-bottom:10px"><button class="b-blu" onclick="loadCrossVerify()">🔄 Load result</button></div>
-        <div class="shields" id="cvshields"></div>
-        <div class="muted" id="cvnote" style="margin-top:8px"></div>
-      </div>
+      <div class="card"><div class="lbl">official minute rows captured today (per table)</div><div id="bars"></div>
+        <div class="muted" style="margin-top:6px">spot = index minute candles · chain = option-chain snapshots · contracts = per-contract minute candles — all pulled once a minute from the brokers' official records.</div></div>
       <div class="card">
         <div class="lbl">database console &nbsp;<span class="badge unknown">READ-ONLY — writes are blocked server-side</span></div>
         <div class="row" style="margin-bottom:10px"><button class="b-blu" onclick="openQdbConsole()">🗄 Open QuestDB Console</button></div>
@@ -2609,7 +1683,7 @@ def _console_html() -> str:
           </div>
           <div style="flex:2 1 380px;min-width:280px">
             <div class="lbl">query</div>
-            <textarea id="dbsql" spellcheck="false">SELECT * FROM ticks ORDER BY ts DESC LIMIT 50</textarea>
+            <textarea id="dbsql" spellcheck="false">SELECT * FROM spot_1m_rest ORDER BY ts DESC LIMIT 50</textarea>
             <div class="row" style="margin-top:10px">
               <button class="b-blu" onclick="runDbSql()">▶ Run</button>
               <button class="b-ghost" onclick="dbDownloadCsv()">⬇ Download CSV</button></div>
@@ -2635,13 +1709,11 @@ def _console_html() -> str:
       </div>
       <div class="card">
         <details class="fold" id="danger">
-          <summary><span class="lbl" style="display:inline">⚠️ danger zone — destructive data actions (tap to open)</span> <span class="muted" style="font-size:11px">(contains: Wipe GROWW · Wipe ALL · Docker reset · Bare nuke)</span></summary>
+          <summary><span class="lbl" style="display:inline">⚠️ danger zone — destructive data actions (tap to open)</span> <span class="muted" style="font-size:11px">(contains: Wipe ALL · Docker reset · Bare nuke)</span></summary>
           <div class="warn" id="dangerlock" hidden style="margin-top:10px">🔒 Locked until 3:30 PM IST — data-destructive actions are refused during market hours, even with force. A mid-market wipe destroys data that can never be re-fetched.</div>
           <div class="muted" style="margin-top:10px">Pick ONE severity, then Execute. Every action still asks you to type its own confirm word — nothing fires from a mis-click.</div>
-          <label class="danger-opt"><input type="radio" name="danger" value="groww">
-            <span><b>🧹 Wipe GROWW data only</b> — <span class="muted">surgical per-feed wipe: deletes every <b>groww</b> tick &amp; candle from every timeframe table (per-table rewrite — the DB can't delete rows in place) AND the groww capture file + offsets so nothing resurrects. <b>Dhan data untouched. Audit tables kept (SEBI).</b> Box must be RUNNING. Asks you to type GROWW.</span></span></label>
           <label class="danger-opt"><input type="radio" name="danger" value="wipe">
-            <span><b>🗑️ Wipe ALL data → fresh start</b> — <span class="muted">deletes every tick &amp; candle in ALL timeframe tables for BOTH feeds (Dhan + Groww + any future feed) AND their capture/replay files (Groww capture file, Dhan WAL, spill, dlq) so NOTHING resurrects after restart — audit tables kept. Run when the box is RUNNING; next session = fresh data. Asks you to type WIPE.</span></span></label>
+            <span><b>🗑️ Wipe ALL data → fresh start</b> — <span class="muted">deletes every legacy tick &amp; candle table AND today's official minute candles + the fetch log (spot / option-chain / per-contract tables) for BOTH brokers, plus every capture/replay file so NOTHING resurrects after restart — SEBI audit tables kept. Run when the box is RUNNING; next session = fresh data. Asks you to type WIPE.</span></span></label>
           <label class="danger-opt"><input type="radio" name="danger" value="nuke">
             <span><b style="color:#f66">☢ Full Docker nuke — wipes ALL data (QuestDB volumes) + fresh start</b> — <span class="muted">⚠️ NUCLEAR: stops the app, deletes Docker containers + volumes + images (full QuestDB wipe INCLUDING the SEBI-retention audit tables) + prune, then rebuilds QuestDB fresh + restarts the app. Box must be RUNNING. Asks you to type NUKE-DOCKER.</span></span></label>
           <label class="danger-opt"><input type="radio" name="danger" value="erase">
@@ -2661,7 +1733,7 @@ def _console_html() -> str:
 <script>
 const $=id=>document.getElementById(id);
 let TOKEN=localStorage.getItem('tv_token')||'';
-let timer=null, hist=[], lastTicks=0, curTab='overview';
+let timer=null, lastTicks=0, curTab='overview';
 
 function toast(m){ const t=$('toast'); t.textContent=m; t.classList.add('show'); clearTimeout(t._h); t._h=setTimeout(()=>t.classList.remove('show'),2600); }
 function esc(s){ return String(s).replace(/[<>&]/g,c=>({'<':'&lt;','>':'&gt;','&':'&amp;'}[c])); }
@@ -2673,7 +1745,6 @@ function lock(){ TOKEN=''; localStorage.removeItem('tv_token'); $('tok').value='
 
 function tab(name){ curTab=name; document.querySelectorAll('.tab').forEach(t=>t.classList.toggle('active',t.dataset.t===name));
   document.querySelectorAll('section[data-tab]').forEach(s=>s.hidden=s.dataset.tab!==name);
-  if(name==='data' && !$('cvshields').dataset.loaded) loadCrossVerify();
   if(name==='data' && !$('dbtables').dataset.loaded) loadDbTables(); }
 
 async function call(action, extra){ if(!TOKEN){ toast('Locked'); return null; }
@@ -2690,13 +1761,6 @@ async function call(action, extra){ if(!TOKEN){ toast('Locked'); return null; }
 function countUp(el,target){ target=parseInt(String(target).replace(/[^0-9]/g,''),10)||0; const from=lastTicks||0; lastTicks=target;
   const t0=performance.now(),dur=900; function step(t){ const k=Math.min(1,(t-t0)/dur);
     el.textContent=Math.round(from+(target-from)*(1-Math.pow(1-k,3))).toLocaleString(); if(k<1) requestAnimationFrame(step); } requestAnimationFrame(step); }
-
-function drawSpark(){ const w=300,h=70,pad=6,xs=hist.slice(-40),max=Math.max(2,...xs);
-  const pts=xs.map((v,i)=>{ const x=pad+(w-2*pad)*(xs.length<2?0:i/(xs.length-1)); const y=h-pad-(h-2*pad)*(v/max); return x.toFixed(1)+','+y.toFixed(1); });
-  const line=pts.join(' '); const area=pts.length?'M'+pad+','+(h-pad)+' L'+line.replace(/ /g,' L')+' L'+(w-pad)+','+(h-pad)+' Z':'';
-  $('spark').innerHTML='<defs><linearGradient id="g" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#38e1d6" stop-opacity=".5"/><stop offset="1" stop-color="#38e1d6" stop-opacity="0"/></linearGradient></defs>'+
-    (area?'<path d="'+area+'" fill="url(#g)"/>':'')+(pts.length>1?'<polyline points="'+line+'" fill="none" stroke="#38e1d6" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round"/>':'')+
-    (pts.length?'<circle cx="'+pts[pts.length-1].split(',')[0]+'" cy="'+pts[pts.length-1].split(',')[1]+'" r="3.5" fill="#38e1d6"/>':''); }
 
 function bar(name,n,max){ const pct=max>0?Math.max(3,Math.round(100*n/max)):0;
   return '<div class="bar"><div class="name">'+name+'</div><div class="track"><div class="fill" style="width:'+pct+'%"></div></div><div class="num">'+n.toLocaleString()+'</div></div>'; }
@@ -2719,52 +1783,45 @@ async function loadOverview(){ $('refbtn').innerHTML='<span class="spin">🔄</s
   const ib=$('instbtn'); ib.hidden=false;
   if(running){ ib.textContent='■ Stop instance'; ib.className='b-stop'; }
   else{ ib.textContent='▶ Start instance'; ib.className='b-go'; }
-  countUp($('ticksbig'), j.ticks_today||'0');
+  countUp($('ticksbig'), j.rows_today_total||'0');
   $('p_inst').innerHTML='<span class="'+(running?'ok':'bad')+'">'+(j.instance_state||'?')+'</span>';
   $('p_app').innerHTML='<span class="'+(appOk?'ok':'bad')+'">'+(appOk?'up':(j.app||'down'))+'</span>';
   $('p_mkt').innerHTML='<span class="'+(j.market_hours?'warn':'')+'">'+(j.market_hours?'OPEN':'closed')+'</span>';
   // Danger-zone hard-lock label: data-destructive actions are server-refused
   // (409, no force escape) while the market is open — surface that BEFORE a click.
   const dl=$('dangerlock'); if(dl) dl.hidden=!j.market_hours;
-  const tpsN=parseInt(j.max_ticks_per_second,10)||0; $('p_tps').innerHTML='<span class="cy">'+tpsN+'</span>';
-  hist.push(tpsN); if(hist.length>60) hist.shift(); drawSpark();
-  // Per-feed split of today's ticks, e.g. "dhan: 152,340 | groww: 8,102" —
-  // rendered generically from whatever feeds QuestDB reports (no hardcoding).
-  const fb=j.ticks_by_feed||{}, fbKeys=Object.keys(fb).sort();
-  $('feedsplit').textContent = fbKeys.length ? fbKeys.map(k=>k+': '+((parseInt(fb[k],10)||0).toLocaleString())).join(' | ') : '';
-  const c=j.candles||{}, vals=['1m','5m','15m','60m','1d'].map(k=>parseInt(c[k],10)||0), mx=Math.max(1,...vals);
-  $('bars').innerHTML=['1m','5m','15m','60m','1d'].map((k,i)=>bar(k,vals[i],mx)).join('');
-  // Dedup-key check: the real ticks upsert key is 5 columns
-  // (ts, security_id, segment, capture_seq, feed). Three distinct states:
-  //   5 = OK (green) · 0 = DEDUP disabled entirely (RED — duplicate rows will
+  // Per-broker split of today's official minute rows — summed across the
+  // three live tables, rendered generically from whatever feeds QuestDB
+  // reports (no hardcoding; a future broker appears automatically).
+  const perFeed={};
+  Object.values(j.rows_by_feed||{}).forEach(t=>{ Object.keys(t||{}).forEach(f=>{ perFeed[f]=(perFeed[f]||0)+(parseInt(t[f],10)||0); }); });
+  const fbKeys=Object.keys(perFeed).sort();
+  $('feedsplit').textContent = fbKeys.length ? fbKeys.map(k=>k+': '+perFeed[k].toLocaleString()).join(' | ') : '';
+  // Data-tab bars: today's rows per LIVE table (spot / chain / contracts).
+  const rt=j.rows_today||{}, tkeys=['spot','chain','contracts'];
+  const vals=tkeys.map(k=>parseInt(rt[k],10)||0), mx=Math.max(1,...vals);
+  $('bars').innerHTML=tkeys.map((k,i)=>bar(k,vals[i],mx)).join('');
+  // Dedup-key check: the real spot_1m_rest upsert key is 4 columns
+  // (ts, security_id, exchange_segment, feed) per DEDUP_KEY_SPOT_1M_REST.
+  // Three distinct states:
+  //   4 = OK (green) · 0 = DEDUP disabled entirely (RED — duplicate rows will
   //   accumulate) · any other number = schema drift (amber). A fetch failure
   //   (box/QuestDB unreachable) renders "unreachable" (amber), never a fake 0.
-  // Stopped box → ONE calm banner + greyed "—" shields instead of a scatter
-  // of scary per-shield "unreachable" warnings. Gated STRICTLY on
-  // instance_state!=='running' — a RUNNING box with unreachable data keeps
-  // the real unreachable/drift/disabled warnings below.
+  // Stopped box → ONE calm banner + a greyed "—" shield instead of a scary
+  // "unreachable" warning. Gated STRICTLY on instance_state!=='running' — a
+  // RUNNING box with unreachable data keeps the real warnings below.
   $('stoppedbanner').hidden=running;
   if(!running){
-    $('shields').innerHTML=shieldIdle('Dedup key columns')+shieldIdle('Sub-second fix')+
-      shieldIdle('Tick conservation')+shieldIdle('Peak ticks / second');
+    $('shields').innerHTML=shieldIdle('Dedup key columns');
   } else {
   const dkRaw=String(j.dedup_key_columns||'').trim(), dkN=parseInt(dkRaw,10);
-  const dkUnknown=(dkRaw===''||isNaN(dkN)), keysOk=dkN===5;
+  const dkUnknown=(dkRaw===''||isNaN(dkN)), keysOk=dkN===4;
   let dkTxt,dkCls;
   if(dkUnknown){ dkTxt='unreachable'; dkCls='warn'; }
-  else if(dkN===5){ dkTxt='5 ✅'; dkCls='ok'; }
+  else if(dkN===4){ dkTxt='4 ✅'; dkCls='ok'; }
   else if(dkN===0){ dkTxt='0 — DEDUP disabled!'; dkCls='bad'; }
-  else { dkTxt=dkRaw+' — schema drift (expected 5)'; dkCls='warn'; }
-  const capOk=tpsN>1;
-  // Tick-conservation shield: the verdict is computed SERVER-SIDE from the
-  // 15:40 audit + today's ws_event_audit disconnects (audit fix #1 — the old
-  // ">1 tick/sec" liveness false-OK heuristic is gone). The UI renders the
-  // server verdict verbatim; the tooltip states the envelope.
-  const tc=j.tick_conservation||{state:'unreachable',label:'unreachable',good:false,cls:'warn',envelope:''};
-  $('shields').innerHTML=shield('Dedup key columns',dkTxt,keysOk,dkCls)+
-    shield('Sub-second fix',keysOk?'LIVE ✅':(dkUnknown?'unreachable':'OLD ⚠'),keysOk,dkUnknown?'warn':undefined)+
-    shield('Tick conservation',esc(tc.label||'unreachable'),!!tc.good,tc.cls||'warn',tc.envelope||'')+
-    shield('Peak ticks / second',tpsN,capOk);
+  else { dkTxt=dkRaw+' — schema drift (expected 4)'; dkCls='warn'; }
+  $('shields').innerHTML=shield('Dedup key columns',dkTxt,keysOk,dkCls);
   }
   if(!$('feeds').dataset.loaded) loadFeeds();
   if(!$('alarms').dataset.loaded) loadAws();
@@ -2800,8 +1857,19 @@ async function loadFeeds(){ $('feeds').dataset.loaded='1'; $('feeds').innerHTML=
     // re-validates the same charset server-side before any shell command.
     const safeName=String(f.name).toLowerCase().replace(/[^a-z0-9_-]/g,'');
     const h=f.h; const badge=h?('<span class="badge '+vb(h.verdict)+'">'+esc(h.verdict||'?')+'</span>'):'<span class="badge unknown">no health</span>';
-    const detail=h?('<div class="muted">'+esc(h.reason||'')+(h.ticks_total!=null?' · ticks '+esc(String(h.ticks_total)):'')
-      +(h.subscribed_total!=null?' · subscribed '+esc(String(h.subscribed_total)):'')+'</div>'):'';
+    // REST-pull line (2026-07-16): today's fetch-log outcomes + last-hour
+    // prompt-pull latency from rest_fetch_audit — the old ticks/subscribed
+    // counters read frozen live-feed registries and are gone. "failed" =
+    // every non-ok, non-rate-limited outcome (error/empty/no_token/…).
+    const ra=(j.rest_audit||{})[f.name], rl=(j.rest_lat_hour||{})[f.name];
+    let pull;
+    if(ra && Object.keys(ra).length){
+      const ok=ra.ok||0, rlim=ra.rate_limited||0;
+      const failed=Object.keys(ra).filter(k=>k!=='ok'&&k!=='rate_limited').reduce((s,k)=>s+(ra[k]||0),0);
+      pull='pulls today: '+ok.toLocaleString()+' ok · '+failed.toLocaleString()+' failed · '+rlim.toLocaleString()+' rate-limited';
+      if(rl&&(rl.p50_ms!=null||rl.p99_ms!=null)) pull+=' — last hour: p50 '+fmtLagMs(rl.p50_ms)+' / p99 '+fmtLagMs(rl.p99_ms)+' after minute close';
+    } else { pull='no official-candle pulls recorded today'; }
+    const detail='<div class="muted">'+(h&&h.reason?esc(h.reason)+' · ':'')+pull+'</div>';
     return '<div class="pr"><div class="t"><b>'+esc(f.name)+'</b> — <span class="'+(f.enabled?'ok':'bad')+'">'+(f.enabled?'ENABLED':'disabled')+'</span>'
       +' · lane '+(f.lane?'<span class="ok">running</span>':'<span class="warn">not running</span>')+' '+badge+detail+'</div>'
       +'<button class="'+(f.enabled?'b-stop':'b-go')+' mini" onclick="feedToggle(\''+safeName+'\','+(!f.enabled)+')">'+(f.enabled?'⏹ turn OFF':'▶ turn ON')+'</button></div>'; }).join('');
@@ -2886,123 +1954,34 @@ async function loadAws(){ $('alarms').dataset.loaded='1'; $('awsstrip').innerHTM
     shield('Disk used', (j.disk_used_gb?j.disk_used_gb+' GB ('+(j.disk_pct||'')+')':'—'), pctOk)+
     shield('Database size', (j.db_size_gb?j.db_size_gb+' GB':'—'), true); }
 
-// Cross-verify card (3:31 PM IST daily candle check vs exchange record).
-// PASS requires the hardened condition: zero mismatches AND zero missing
-// minutes AND not degraded AND at least one minute actually compared —
-// "nothing compared" must never render as PASS. All string values are
-// rendered through esc() (operator data never lands raw in HTML).
-async function loadCrossVerify(){ $('cvshields').dataset.loaded='1'; $('cvshields').innerHTML='<span class="muted">loading…</span>'; $('cvnote').textContent='';
-  const j=await call('cross_verify'); if(!j){ $('cvshields').innerHTML=''; return; }
-  if(!j.date){ $('cvshields').innerHTML='<span class="muted">no run yet — the check fires at 3:31 PM IST on trading days (box must be running)</span>'; return; }
-  const mis=parseInt(j.mismatch_rows,10)||0, missing=parseInt(j.missing,10)||0, compared=parseInt(j.compared,10)||0;
-  const degraded=String(j.degraded).toLowerCase()==='true';
-  const hasSummary=(j.compared!=null && j.compared!=='');
-  const pass = hasSummary ? (mis===0 && missing===0 && !degraded && compared>0) : false;
-  const good = hasSummary ? pass : (mis===0 && !degraded);
-  const badge = hasSummary ? (pass?'PASS ✅':'FAIL ⚠') : (good?'OK (no summary)':'FAIL ⚠');
-  $('cvshields').innerHTML=
-    shield('Result', badge, good)+
-    shield('Date', esc(j.date||'—'), true)+
-    shield('Instruments', esc(j.instruments||'—'), true)+
-    shield('Minutes compared', esc(j.compared||'—'), !hasSummary||compared>0)+
-    shield('Mismatches', esc(j.mismatch_rows||'0'), mis===0)+
-    shield('Missing minutes', esc(j.missing||'—'), missing===0);
-  $('cvnote').textContent = degraded ? 'Coverage was PARTIAL — the check could not vouch for the full universe.'
-    : (pass ? 'Every 1-minute candle matches the exchange record exactly.'
-    : (hasSummary ? 'Differences found — review which minutes differ from the exchange record.'
-    : 'This run pre-dates the summary artefact — mismatch count shown from the day\'s file.')); }
-
 function fmtNs(n){ if(n==null||n==='') return '—'; n=Number(n); if(n<1000) return n.toFixed(0)+' ns';
   if(n<1e6) return (n/1e3).toFixed(2)+' µs'; if(n<1e9) return (n/1e6).toFixed(2)+' ms'; return (n/1e9).toFixed(2)+' s'; }
 function fmtMs(s){ return (s===''||s==null)?'—':s+' ms'; }
-// Per-feed comparison table (operator demand 2026-07-03). Rendered by
-// ITERATING the server's j.feeds rows — which themselves come from the app's
-// own /api/feeds/health at measure time. NO feed name is hardcoded here, so a
-// future feed #3 gets its row (and honest "endpoint unknown" network cells if
-// the probe map doesn't know it) with zero portal changes. The best value per
-// column (server-computed j.winners — strict best, never on a tie or a
-// single-feed measure) is highlighted green.
-function fmtLagMs(v){ if(v==null) return '—'; v=Number(v);
+function fmtLagMs(v){ if(v==null) return '-'; v=Number(v);
   if(v>=1000) return (v/1000).toFixed(2)+' s'; return v.toFixed(2)+' ms'; }
-async function loadLatency(){ $('latnet').dataset.loaded='1'; $('latnet').innerHTML='<span class="muted">measuring…</span>'; $('latproc').innerHTML='';
-  $('latfeeds').innerHTML='<span class="muted">measuring…</span>'; $('latload').textContent='';
-  $('latpctl').innerHTML='<span class="muted">measuring…</span>'; $('latpctlnote').textContent='';
-  const j=await call('latency'); if(!j){ $('latnet').innerHTML=''; $('latfeeds').innerHTML=''; $('latpctl').innerHTML=''; return; }
-  // Per-feed lag percentile grid — iterates the SERVER's j.percentiles keys
-  // (feeds discovered from the database at measure time, never hardcoded),
-  // so a future feed #3 gets its row with zero portal changes. Best (lowest)
-  // value per column = server-computed j.percentile_winners, green.
-  const p=j.percentiles||{}; const pw=j.percentile_winners||{}; const pf=Object.keys(p).sort();
-  const recvWin=(j.percentile_recv_window_secs||120);
-  if(pf.length){
-    const pcols=[['p50_ms','p50'],['p90_ms','p90'],['p95_ms','p95'],['p99_ms','p99'],['max_ms','max'],['rows','rows in window'],['replay_excluded','replay/stall rows excluded']];
-    let ph='<table><tr><th>feed</th>'+pcols.map(c=>'<th>'+c[1]+'</th>').join('')+'</tr>';
-    pf.forEach(f=>{ const r=p[f]; ph+='<tr><td><b>'+esc(String(f))+'</b></td>';
-      pcols.forEach(c=>{ const k=c[0]; const v=r[k]; let txt;
-        if(k==='rows'||k==='replay_excluded') txt=(v==null)?'—':Number(v).toLocaleString();
-        else txt=(r.rows>0)?fmtLagMs(v):('no rows received in last '+recvWin+' s');
-        ph+='<td class="'+(pw[k]===f?'win':'')+'">'+esc(String(txt))+'</td>'; });
-      ph+='</tr>'; });
-    $('latpctl').innerHTML=ph+'</table>';
-    // Rule-11 companions: what was clamped / excluded / truncated is SHOWN,
-    // never silent.
-    const notes=[];
-    const excl=pf.filter(f=>p[f].replay_excluded>0).map(f=>f+': '+Number(p[f].replay_excluded).toLocaleString());
-    if(excl.length) notes.push('replay-restamped (or >60s pipeline-stalled) rows excluded from this sample ("—" = not measurable for that feed; see the notes below the table) — '+excl.join(' · '));
-    // Sample-cap honesty (finding 2): rows == cap means the newest-received
-    // truncation bound — the percentiles cover only the newest cap rows of
-    // the 120s window (lag-neutral ordering, but still a truncated sample).
-    const pcap=(j.percentile_sample_cap||50000);
-    const capped=pf.filter(f=>p[f].rows>=pcap);
-    if(capped.length) notes.push('sample capped at '+Number(pcap).toLocaleString()+' newest-received rows — '+capped.join(' · '));
-    const clamped=pf.filter(f=>p[f].neg_clamped>0).map(f=>f+': '+Number(p[f].neg_clamped).toLocaleString());
-    if(clamped.length) notes.push('negative lags clamped to 0 in this sample — '+clamped.join(' · '));
-    $('latpctlnote').textContent=notes.join('  |  ');
+// REST-era latency card (2026-07-16). The per-(broker, pull type) table
+// iterates the SERVER's j.rest_latency rows — sourced from today's
+// rest_fetch_audit on the box (feed + leg discovered from the data, never
+// hardcoded), so a future broker/leg gets its row with zero portal changes.
+// "-" = no successful pulls recorded today for that pair (never fake zeros).
+async function loadLatency(){ $('latnet').dataset.loaded='1'; $('latnet').innerHTML='<span class="muted">measuring…</span>';
+  $('latrest').innerHTML='<span class="muted">measuring…</span>'; $('latrestnote').textContent='';
+  const j=await call('latency'); if(!j){ $('latnet').innerHTML=''; $('latrest').innerHTML=''; return; }
+  const rows=Array.isArray(j.rest_latency)?j.rest_latency:[];
+  if(rows.length){
+    let h='<table><tr><th>broker</th><th>pull type</th><th>ok pulls today</th><th>p50 after close</th><th>p99 after close</th></tr>';
+    rows.forEach(r=>{ h+='<tr><td><b>'+esc(String(r.feed))+'</b></td><td>'+esc(String(r.leg))+'</td>'
+      +'<td>'+Number(r.ok_rows||0).toLocaleString()+'</td>'
+      +'<td>'+esc(fmtLagMs(r.p50_ms))+'</td><td>'+esc(fmtLagMs(r.p99_ms))+'</td></tr>'; });
+    $('latrest').innerHTML=h+'</table>';
   } else {
-    $('latpctl').innerHTML='<span class="warn">no lag-percentile data — no rows received in the last '
-      +recvWin+' s (market closed?) or the database query failed on the box</span>';
-  }
-  const feeds=Array.isArray(j.feeds)?j.feeds:[]; const w=j.winners||{};
-  if(feeds.length){
-    const cols=[['tcp_ms','TCP connect'],['tls_ms','+ TLS'],['last_tick_age_secs','last tick age'],['ticks_per_sec','ticks/sec (window)'],['subscribed_total','subscribed']];
-    let h='<table><tr><th>feed</th>'+cols.map(c=>'<th>'+c[1]+'</th>').join('')+'</tr>';
-    feeds.forEach(f=>{
-      h+='<tr><td><b>'+esc(String(f.feed))+'</b></td>';
-      cols.forEach(c=>{ const k=c[0]; const v=f[k]; let txt;
-        if(k==='tcp_ms'||k==='tls_ms') txt=f.endpoint_known?fmtMs(v):'endpoint unknown';
-        else if(k==='last_tick_age_secs') txt=(v==null)?'—':v+' s ago';
-        else if(k==='ticks_per_sec') txt=(v==null)?'—':v+'/s';
-        else txt=(v==null)?'—':Number(v).toLocaleString();
-        h+='<td class="'+(w[k]===f.feed?'win':'')+'">'+esc(String(txt))+'</td>'; });
-      h+='</tr>'; });
-    $('latfeeds').innerHTML=h+'</table>';
-    $('latload').textContent='instrument load — '+feeds.map(f=>String(f.feed)+': '+
-      (f.subscribed_total!=null?Number(f.subscribed_total).toLocaleString()+' subscribed':'no count reported')).join(' · ');
-  } else {
-    $('latfeeds').innerHTML='<span class="warn">'+esc(j.feeds_error||'no per-feed data returned — is the app running?')+'</span>';
+    $('latrest').innerHTML='<span class="warn">no successful pulls recorded today — market closed, box just started, or the fetch log is unreachable</span>';
   }
   const skew=Math.abs(parseFloat(j.clock_skew_ms));
   $('latnet').innerHTML=
     shield('QuestDB round-trip (box-wide)', fmtMs(j.questdb_ms), true)+
-    shield('Clock skew (box-wide)', fmtMs(j.clock_skew_ms), isNaN(skew)||skew<50);
-  // Windowed precise latencies (live ticks during the ~10s probe window).
-  // Falls back to lifetime averages when the window saw no ticks (market closed).
-  const live = j.tick_p50_ns != null;
-  $('latproc').innerHTML = live ? (
-    shield('Per-tick p50 (live)', fmtNs(j.tick_p50_ns), j.tick_p50_ns<10000)+
-    shield('Per-tick p99 (live)', fmtNs(j.tick_p99_ns), j.tick_p99_ns<100000)+
-    shield('Per-tick avg (live)', fmtNs(j.tick_window_avg_ns), j.tick_window_avg_ns<10000)+
-    shield('Wire → done p99 (live)', fmtNs(j.wire_p99_ns), (j.wire_p99_ns||1e12)<100000)+
-    shield('DB batch flush avg', fmtNs(j.flush_window_avg_ns), true)+
-    shield('Order placement', fmtNs(j.order_place_avg_ns), true)
-  ) : (
-    shield('Per-tick process (lifetime)', fmtNs(j.tick_process_avg_ns), (j.tick_process_avg_ns||1e12)<10000)+
-    shield('Wire → done (lifetime)', fmtNs(j.wire_to_done_avg_ns), (j.wire_to_done_avg_ns||1e12)<100000)+
-    shield('Order placement', fmtNs(j.order_place_avg_ns), true)
-  );
-  $('lattick').textContent = live
-    ? ('measured live over '+Number(j.tick_window_count).toLocaleString()+' ticks in a '+(j.window_secs||'~10')+'s window — lifetime avg '+fmtNs(j.tick_process_avg_ns)+' over '+Number(j.tick_count||0).toLocaleString()+' ticks since boot')
-    : (j.tick_count? ('no live ticks in the probe window (market closed?) — lifetime avg over '+Number(j.tick_count).toLocaleString()+' ticks since boot') : 'no ticks measured yet (market closed?)'); }
+    shield('Clock skew (box-wide)', fmtMs(j.clock_skew_ms), isNaN(skew)||skew<50)+
+    shield('Order placement', fmtNs(j.order_place_avg_ns), true); }
 
 // forceId lets each tab keep its own force checkbox next to its own buttons:
 // Overview's instance button uses #force_inst, Admin's app controls use #force.
@@ -3011,26 +1990,19 @@ async function act(action,forceId){ if(!confirm('Run "'+action+'" on the trading
   const j=await call(action,{force}); if(j){ toast('✅ '+action+' sent'); setTimeout(loadOverview,1600); } }
 
 // Danger-zone severity picker → the UNCHANGED per-action functions. Each still
-// asks for its OWN typed confirm token (GROWW / WIPE / NUKE-DOCKER / ERASE) — the
+// asks for its OWN typed confirm token (WIPE / NUKE-DOCKER / ERASE) — the
 // picker only chooses WHICH prompt fires; there is no token bypass path.
 function dangerExecute(){ const sel=document.querySelector('input[name="danger"]:checked');
   if(!sel){ toast('Pick a danger-zone action first'); return; }
-  const fn={groww:wipeGroww, wipe:wipeData, nuke:dockerReset, erase:bareNuke}[sel.value];
+  const fn={wipe:wipeData, nuke:dockerReset, erase:bareNuke}[sel.value];
   if(fn) fn(); else toast('Unknown action'); }
 
 async function wipeData(){
-  if(prompt('This DELETES every tick and candle, then restarts empty. The box must be RUNNING. Type WIPE to confirm:')!=='WIPE'){ toast('cancelled'); return; }
+  if(prompt('This DELETES every stored market-data row — legacy ticks/candles AND the official minute candles + fetch log for BOTH brokers — then restarts empty. The box must be RUNNING. Type WIPE to confirm:')!=='WIPE'){ toast('cancelled'); return; }
   toast('wiping → fresh start…');
   const j=await call('wipe-questdb',{force:true,confirm:'WIPE'});
   if(j&&j.ok){ toast('✅ wipe started — fresh data from next session'); setTimeout(loadOverview,4000); }
   else { toast((j&&j.error)||'wipe failed — is the box running?'); } }
-async function wipeGroww(){
-  if(prompt('🧹 GROWW-ONLY WIPE. Deletes EVERY groww tick + candle (per-table rewrite) and the groww capture/offset files so nothing resurrects. Dhan data is UNTOUCHED; audit tables kept (SEBI). The box must be RUNNING. Type GROWW to confirm:')!=='GROWW'){ toast('cancelled'); return; }
-  toast('🧹 groww-only wipe dispatched → rewriting tables in background…');
-  const j=await call('wipe-groww',{force:$('force').checked,confirm:'GROWW'});
-  if(!(j&&j.ok)){ toast((j&&j.error)||'groww wipe failed — is the box running?'); return; }
-  if(!j.command_id){ toast('⚠️ dispatched but no command id — re-check the groww tick count in ~2 min'); return; }
-  pollNuke(j.command_id,0); }
 async function dockerReset(){
   if(prompt('☢ FULL DOCKER NUKE. Stops the app, DELETES Docker containers + volumes + images (full QuestDB wipe — ALL data INCLUDING the SEBI-retention audit tables) + prune, then rebuilds QuestDB fresh + restarts the app. The box must be RUNNING. Type NUKE-DOCKER to confirm:')!=='NUKE-DOCKER'){ toast('cancelled'); return; }
   if(!confirm('Last check: every table is destroyed, including audit history. Continue?')){ toast('cancelled'); return; }
@@ -3054,9 +2026,7 @@ async function pollNuke(cid,n){
   if(n>40){ toast('⏳ still running after 3+ min — re-check the box manually'); setTimeout(loadOverview,4000); return; }
   const s=await call('command-status',{command_id:cid}); const st=(s&&s.status)||'', out=(s&&s.stdout_tail)||'';
   if(st==='Success'||st==='Failed'||st==='Cancelled'||st==='TimedOut'){
-    if(out.indexOf('GROWW-WIPE-COMPLETE')>=0){ toast('✅ GROWW wipe complete — 0 groww rows left, dhan data intact; app restarting'); }
-    else if(out.indexOf('GROWW-WIPE-PARTIAL')>=0){ toast('🟠 GROWW wipe PARTIAL — some tables not rewritten (originals kept SAFE, nothing lost). Inspect the box output (GWIPE lines).'); }
-    else if(out.indexOf('DOCKER-RESET-FAILED')>=0){ toast('🔴 NUKE FAILED — QuestDB volume still in use, data NOT wiped. Check the box.'); }
+    if(out.indexOf('DOCKER-RESET-FAILED')>=0){ toast('🔴 NUKE FAILED — QuestDB volume still in use, data NOT wiped. Check the box.'); }
     else if(out.indexOf('bare-nuke-complete')>=0){ toast('☢️ BARE NUKE complete — 0 containers, 0 images, 0 volumes. Box is empty + DEAD (redeploy to restart).'); }
     else if(out.indexOf('bare-nuke-PARTIAL')>=0){ toast('🟠 bare nuke PARTIAL — something is still in-use. '+(out.match(/BARE-NUKE-RESULT[^\n]*/)||[''])[0]); }
     else if(out.indexOf('docker-reset-dispatched')>=0){ toast('✅ nuke complete — empty DB; app restarting'); }
