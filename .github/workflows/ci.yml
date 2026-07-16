@@ -529,7 +529,7 @@ jobs:
   repo-guards:
     name: "Repo Guards"
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15 # 2026-07-16: real full-tree scans measured ~3.5 min; headroom for the lambda/console suites
     steps:
       - name: Checkout
         uses: actions/checkout@v7.0.0
@@ -546,8 +546,18 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          ALL_RS=$(find crates -name '*.rs' -not -path '*/target/*' | tr '\n' ' ')
-          bash .claude/hooks/banned-pattern-scanner.sh "$GITHUB_WORKSPACE" $ALL_RS
+          # Scanner contract: $2 is ONE newline-separated file-list string
+          # (iterated via a `while read` here-string). The old
+          # `tr '\n' ' '` + unquoted $ALL_RS word-split the list, so only
+          # the FIRST file reached the scanner as $2 — CI scanned 1 of
+          # ~551 .rs files (2026-07-16 gate-integrity sweep, Critical).
+          ALL_RS=$(find crates -name '*.rs' -not -path '*/target/*' | sort)
+          if [ -z "$ALL_RS" ]; then
+            echo "FATAL: no .rs files found under crates/ — refusing vacuous pass" >&2
+            exit 1
+          fi
+          echo "Scanning $(printf '%s\n' "$ALL_RS" | wc -l) Rust files"
+          bash .claude/hooks/banned-pattern-scanner.sh "$GITHUB_WORKSPACE" "$ALL_RS"
 
       - name: Data integrity guard (price precision, IST timestamp rules)
         shell: bash
@@ -557,8 +567,18 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          ALL_RS=$(find crates -name '*.rs' -not -path '*/target/*' | tr '\n' ' ')
-          bash .claude/hooks/dedup-latency-scanner.sh "$GITHUB_WORKSPACE" $ALL_RS
+          # Scanner contract: $2 is ONE newline-separated file-list string
+          # (iterated via a `while read` here-string). The old
+          # `tr '\n' ' '` + unquoted $ALL_RS word-split the list, so only
+          # the FIRST file reached the scanner as $2 — CI scanned 1 of
+          # ~551 .rs files (2026-07-16 gate-integrity sweep, Critical).
+          ALL_RS=$(find crates -name '*.rs' -not -path '*/target/*' | sort)
+          if [ -z "$ALL_RS" ]; then
+            echo "FATAL: no .rs files found under crates/ — refusing vacuous pass" >&2
+            exit 1
+          fi
+          echo "Scanning $(printf '%s\n' "$ALL_RS" | wc -l) Rust files"
+          bash .claude/hooks/dedup-latency-scanner.sh "$GITHUB_WORKSPACE" "$ALL_RS"
 
       - name: Boot symmetry + state-machine wiring guard (S6-G3+G4)
         shell: bash
