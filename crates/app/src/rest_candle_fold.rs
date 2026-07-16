@@ -671,6 +671,19 @@ pub struct SidDayFold {
     current_day: Option<NaiveDate>,
     /// Minute-open IST secs → last-received bar (last-write-wins).
     day_map: BTreeMap<u32, ConfirmedBar>,
+    /// The NEWEST repair bar deferred since the last refold (2026-07-16
+    /// fix round — same-batch day-roll displaced repair): a repair deferred
+    /// earlier in a batch lives only in the day-map; when a NEW day's first
+    /// bar rolls the map in the SAME batch, the batch-end refold covers the
+    /// NEW day and the old-day repair would be silently dropped until the
+    /// next boot's catch-up. Retaining the newest deferred repair lets the
+    /// roll arm park it for the past-day `/exec` queue instead.
+    pending_repair: Option<ConfirmedBar>,
+    /// A pending repair displaced by a day roll — drained by the batch
+    /// caller via [`Self::take_displaced_repair`] into the bounded
+    /// past-day `/exec` refold queue (the M2 stale-read gate then verifies
+    /// the repair minute is visible before the old day re-emits).
+    displaced_repair: Option<ConfirmedBar>,
 }
 
 impl SidDayFold {
@@ -679,6 +692,8 @@ impl SidDayFold {
             engine: SidFoldState::new(feed, security_id, exchange_segment_code),
             current_day: None,
             day_map: BTreeMap::new(),
+            pending_repair: None,
+            displaced_repair: None,
         }
     }
 
@@ -698,7 +713,19 @@ impl SidDayFold {
             engine,
             current_day: Some(day),
             day_map,
+            pending_repair: None,
+            displaced_repair: None,
         }
+    }
+
+    /// Drains the repair bar displaced by a day roll (if any) — the batch
+    /// caller pushes it onto the past-day `/exec` refold queue so the OLD
+    /// day still heals THIS session (2026-07-16 fix round). Only
+    /// [`apply_bar_batch`] can leave one parked: the single-bar
+    /// [`Self::apply_live_bar`] surface refolds every repair immediately,
+    /// so its pending slot is always empty by roll time.
+    pub fn take_displaced_repair(&mut self) -> Option<ConfirmedBar> {
+        self.displaced_repair.take()
     }
 
     /// Test/forensics accessor: number of bars retained for the current day.
@@ -745,6 +772,15 @@ impl SidDayFold {
                 if bar_date > today {
                     return DeferredBarAction::FutureDated;
                 }
+                // 2026-07-16 fix round (same-batch day-roll displaced
+                // repair): a repair deferred earlier in THIS batch lives
+                // only in the map being cleared — park it so the batch
+                // caller routes its OLD day through the past-day `/exec`
+                // refold queue instead of silently dropping the repair
+                // (which would only heal at the next boot's catch-up).
+                if let Some(displaced) = self.pending_repair.take() {
+                    self.displaced_repair = Some(displaced);
+                }
                 // Day roll: the fold below transition-seals every previous
                 // day's open bucket (a later-day minute is always > the
                 // watermark, so this bar folds in-order); the map restarts
@@ -779,6 +815,15 @@ impl SidDayFold {
                     return DeferredBarAction::DuplicateNoop;
                 }
                 self.day_map.insert(minute_secs, *bar);
+                // Keep the NEWEST deferred repair minute (parity with the
+                // M2 stale-read gate, which requires the newest triggering
+                // minute visible before a past-day refold emits).
+                if self
+                    .pending_repair
+                    .is_none_or(|prev| prev.minute_ts_ist_nanos < bar.minute_ts_ist_nanos)
+                {
+                    self.pending_repair = Some(*bar);
+                }
                 DeferredBarAction::RepairDeferred
             }
             // Unreachable (session-checked above) — defensive.
@@ -791,6 +836,8 @@ impl SidDayFold {
     /// closed (re-emitted DEDUP-idempotently). Round-3: called ONCE per
     /// dirty slot per drained batch — never per repair bar.
     pub fn refold_current_day(&mut self) -> Vec<SealedBucket> {
+        // The refold absorbs every deferred repair still homed in the map.
+        self.pending_repair = None;
         let (engine, sealed) = refold_from_day_map(
             self.engine.feed,
             self.engine.security_id,
@@ -902,6 +949,13 @@ pub fn apply_bar_batch(
             DeferredBarAction::PastDay => out.past_day.push(*bar),
             DeferredBarAction::FutureDated => out.future_dated += 1,
             DeferredBarAction::OutOfSession => out.out_of_session += 1,
+        }
+        // 2026-07-16 fix round: a day roll in THIS batch may have displaced
+        // a just-deferred OLD-day repair from the cleared map — route it to
+        // the past-day `/exec` queue so the old day still heals this
+        // session instead of waiting for the next boot's catch-up.
+        if let Some(displaced) = slot.take_displaced_repair() {
+            out.past_day.push(displaced);
         }
     }
     for (feed, security_id, segment_code) in dirty {
@@ -2755,6 +2809,41 @@ mod tests {
             day1,
             day0.checked_add_days(chrono::Days::new(1)).expect("d+1")
         );
+    }
+
+    #[test]
+    fn test_same_batch_day_roll_take_displaced_repair_routes_to_past_day_queue() {
+        // 2026-07-16 fix round: a batch carrying [old-day repair (deferred),
+        // new-day first bar (rolls the map)] must NOT silently drop the
+        // repair — the displaced OLD-day repair routes to the past-day
+        // /exec queue so the old day heals THIS session, not at next boot.
+        let mut engines: Vec<SidDayFold> = Vec::new();
+        let seed: Vec<ConfirmedBar> = (0..3)
+            .map(|i| bar_at(i, 10.0, 11.0, 9.0, 10.5, 1))
+            .collect();
+        let seeded = apply_bar_batch(&mut engines, &seed, day0_date());
+        assert!(seeded.past_day.is_empty(), "in-order seed queues nothing");
+
+        let repair = bar_at(1, 500.0, 600.0, 50.0, 550.0, 9);
+        let roll = next_day_bar_at(0, 2.0, 2.0, 2.0, 2.0, 1);
+        let outcome = apply_bar_batch(&mut engines, &[repair, roll], day1_date());
+        assert_eq!(
+            outcome.past_day,
+            vec![repair],
+            "the displaced old-day repair must route to the past-day queue"
+        );
+        // The map + engine moved on to the NEW day (the old day heals via
+        // the /exec queue), and nothing is left parked in the slot.
+        assert_eq!(engines[0].current_day(), Some(day1_date()));
+        assert_eq!(engines[0].day_map_len(), 1);
+        assert!(engines[0].take_displaced_repair().is_none());
+
+        // A repair-free day roll displaces nothing (regression guard for
+        // the pending-repair lifetime: cleared by every refold).
+        let mut fresh: Vec<SidDayFold> = Vec::new();
+        apply_bar_batch(&mut fresh, &seed, day0_date());
+        let rolled = apply_bar_batch(&mut fresh, &[roll], day1_date());
+        assert!(rolled.past_day.is_empty(), "clean roll queues nothing");
     }
 
     #[test]

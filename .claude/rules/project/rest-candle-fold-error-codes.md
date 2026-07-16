@@ -230,7 +230,13 @@ old log's "boot catch-up re-derives them" same-session claim was
 circular and is retired). The per-bar live fold is O(21) constant work
 per minute. Release-build panics abort the process (`panic = "abort"`) —
 the respawn arms self-heal in unwind (dev/test) builds only (the
-TICK-FLUSH-01 precedent).
+TICK-FLUSH-01 precedent). Heartbeat liveness bound (2026-07-16 fix round,
+honest): the heartbeat interval is created AFTER the boot catch-up
+completes, so a long paced catch-up (many days × SIDs sleeping on a full
+seal channel) emits ZERO `tv_rest_candle_fold_heartbeat_total` increments
+for its whole duration — a liveness consumer must NOT treat
+catch-up-window silence as task death; the catch-up's own coalesced
+per-feed summary `info!` is the progress signal for that window.
 
 **Delivery boundary (honest — no false-OK):** FOLD-01 is
 **log-sink-only**: NO `error_code_alerts` map entry in
