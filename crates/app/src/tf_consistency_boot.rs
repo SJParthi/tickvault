@@ -3080,7 +3080,7 @@ mod tests {
     /// spot_1m_rest rows must classify Blind (the source check flips
     /// rows_seen); zero + zero stays NoData.
     #[test]
-    fn test_empty_discovery_source_check_blind_vs_nodata() {
+    fn test_empty_candles_with_spot_rows_is_blind_vs_nodata() {
         use RunStatus::{Blind, NoData};
         // Nonzero source rows → the fold is the dead component → Blind.
         assert!(empty_candles_with_spot_rows_is_blind(1));
@@ -3103,7 +3103,7 @@ mod tests {
     /// HIGH-3 companions: the COUNT SQL keeps the hardened read shape
     /// (micros window, feed scope) and the parser is total on garbage.
     #[test]
-    fn test_spot_count_sql_and_parse_count_dataset() {
+    fn test_select_spot_1m_count_sql_and_parse_count_dataset() {
         let day_start_nanos = 1_752_600_600_000_000_000_i64;
         let sql = select_spot_1m_count_sql("dhan", day_start_nanos);
         assert!(sql.starts_with("SELECT count(*) FROM spot_1m_rest"));

@@ -1762,7 +1762,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_receiver_guard_reparks_on_panic_and_respawn_resumes() {
+    async fn test_receiver_guard_take_reparks_on_panic_and_respawn_resumes() {
         // HIGH-2: a panicking incarnation must RE-PARK the receiver during
         // unwind so the respawned incarnation actually receives bars.
         let (tx, rx) = mpsc::channel::<ConfirmedBar>(4);

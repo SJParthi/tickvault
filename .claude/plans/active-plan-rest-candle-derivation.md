@@ -288,7 +288,7 @@ O/H/L/C/ΣV given 1m bars):
   M4 discovery truncation tripwire, M5 call-site guard anchor, M7 real golden
   cross-implementation test)
   - Files: crates/app/src/rest_candle_fold.rs, crates/app/src/tf_consistency_boot.rs, crates/app/src/main.rs, crates/app/tests/rest_candle_fold_wiring_guard.rs, .claude/rules/project/rest-candle-fold-error-codes.md, .claude/rules/project/tf-consistency-error-codes.md
-  - Tests: test_catchup_pace_action_budget_boundaries, test_catchup_day_offsets_newest_first, test_receiver_guard_reparks_on_panic_and_respawn_resumes, test_empty_discovery_source_check_blind_vs_nodata, test_spot_count_sql_and_parse_count_dataset, test_accumulate_capped_streamed_body_cap, test_should_requeue_refold_bounds, test_rows_contain_minute_stale_read_gate, test_volume_saturates_never_tears_the_fold, test_parse_spot_discovery_segment_allowlist_and_truncation, test_golden_fold_agrees_with_tf_consistency_recompute
+  - Tests: test_catchup_pace_action_budget_boundaries, test_catchup_day_offsets_newest_first, test_receiver_guard_take_reparks_on_panic_and_respawn_resumes, test_empty_candles_with_spot_rows_is_blind_vs_nodata, test_select_spot_1m_count_sql_and_parse_count_dataset, test_accumulate_capped_streamed_body_cap, test_should_requeue_refold_bounds, test_rows_contain_minute_stale_read_gate, test_volume_saturates_never_tears_the_fold, test_parse_spot_discovery_segment_allowlist_and_truncation, test_golden_fold_agrees_with_tf_consistency_recompute
 
 ## Scenarios
 
