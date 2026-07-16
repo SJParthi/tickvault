@@ -13,8 +13,9 @@
 > always available in our own questdb right — our entire one month should
 > be stored and fetched from questdb even before premarket"*.
 > **Companion code:** `crates/app/src/rest_candle_fold.rs` (pure fold core
-> + confirmed-bar handoff + boot catch-up + dirty-day refold + supervised
-> task), the persist-confirmed hook sites in
+> + confirmed-bar handoff + boot catch-up + current-day day-map refold +
+> past-day `/exec` refold + supervised task), the persist-confirmed hook
+> sites in
 > `crates/app/src/spot_1m_rest_boot.rs` (Dhan fire + sweep) and
 > `crates/app/src/groww_spot_1m_boot.rs` (Groww fire + sweep), the
 > config-gated spawn in `crates/app/src/main.rs` (shared-infra prefix),
@@ -53,12 +54,32 @@ live path). This is NOT tick synthesis — no row ever touches `ticks`
 permits THIS writer to produce `candles_1d`, sealed at the 15:30 close).
 
 At boot, a catch-up re-folds the last `catchup_days` (default 35 — the
-operator's one-month window + weekend slack) of stored `spot_1m_rest` rows
-per feed through the same engines, so the month of history the operator
-demanded is derived into all 21 TFs even after a fresh clone. Out-of-order
-bars (backfill/sweep repairs) are never folded into live RAM state — the
-affected (feed, SID, segment, day) is marked dirty and a debounced refold
-re-reads that day from QuestDB and re-emits (DEDUP UPSERT heals in place).
+operator's one-month window + weekend slack; today + `catchup_days − 1`
+past days, EXACTLY `catchup_days` days) of stored `spot_1m_rest` rows per
+feed through the same engines, so the month of history the operator
+demanded is derived into all 21 TFs even after a fresh clone — and TODAY's
+rows additionally SEED the live day-map (below), so a mid-session restart
+keeps a complete in-RAM refold source.
+
+**Out-of-order/repair bars (2026-07-16 round-2 HIGH redesign):** every bar
+received for the CURRENT trading day also lands in a per-(feed, SID,
+segment) in-RAM **day-map** (minute → last-received bar, last-write-wins;
+≤375 entries × 8 keys — trivial memory). A current-day repair — an
+out-of-order minute OR a value-UPDATE of an already-folded minute —
+updates the map and synchronously REFOLDS the whole day from the map
+through a fresh engine (microseconds, cold path), swaps the live engine,
+and re-emits every closed bucket (DEDUP UPSERT heals in place). Lossless
+by construction: the map holds every bar the process ever received for
+the day, so the today path performs NO QuestDB read and carries NO
+ILP-ACK → `/exec` WAL-apply visibility race (the round-1 `/exec`
+today-refold — whose presence-only gate missed value-updates and whose
+read could miss bars folded between mark and drain — is RETIRED). Only a
+repair for a day STRICTLY OLDER than the engine's current day (day
+identity is the ENGINE's day, never the wall clock — which kills the
+post-midnight clobber class) takes the bounded, debounced `/exec`
+past-day refold: it emits corrected CLOSED-day seals only, never touches
+a live engine, and keeps the trigger-minute presence gate + bounded
+requeue (the ONLY residual WAL-lag surface).
 
 **FOLD-01** is the typed record of any leg of that machinery degrading —
 never of a healthy fold (which is counters + info lines only).
@@ -76,11 +97,12 @@ field):
 
 | stage | Meaning |
 |---|---|
-| `catchup_query` | a boot catch-up / dirty-day refold `/exec` read failed — HTTP client build failure, transport error, non-2xx, or the STREAMED 8 MiB response cap refused the body (the cap is enforced chunk-by-chunk during the read — a chunked-transfer response without Content-Length can never buffer unbounded). That day/feed is skipped (counted); the next dirty mark or the next boot retries. |
+| `catchup_query` | a boot catch-up / PAST-day refold `/exec` read failed — HTTP client build failure, transport error, non-2xx, or the STREAMED 8 MiB response cap refused the body (the cap is enforced chunk-by-chunk during the read — a chunked-transfer response without Content-Length can never buffer unbounded). That day/feed is skipped (counted); the next dirty mark or the next boot retries. Round-2 LOW-4: this stage (with `reason="no_http_client"`) also covers the drain finding NO HTTP client for the task incarnation — the queued past-day marks are dropped LOUDLY (counted under `dropped{reason="no_http_client"}`; the client is built once at task start and can never appear later, so keeping the marks would spin the debounce forever) and the next boot's catch-up re-derives. |
 | `catchup_parse` | the `/exec` body was unparsable, the explicit row LIMIT was hit (a truncated day is NEVER partially folded — the tf_consistency tripwire discipline), or a poisoned segment value failed the allowlist (skipped, never re-queried). |
 | `discovery_truncated` | the boot catch-up's per-feed instrument discovery hit ITS row LIMIT — a partial instrument set is never trusted; the whole (feed, day) fold pass is skipped LOUDLY (2026-07-16 hostile-review M4). |
-| `refold_stale_read` | a dirty-day refold's `/exec` read did NOT yet contain the triggering repair minute (ILP-flush-ACK → WAL-apply visibility lag) — the refold is NOT emitted (would regress correct candles) and the mark is re-queued, bounded at 5 attempts; this stage fires on the EXHAUSTED arm (2026-07-16 hostile-review M2). |
+| `refold_stale_read` | a PAST-day refold's `/exec` read did NOT yet contain the triggering repair minute (ILP-flush-ACK → WAL-apply visibility lag) — the refold is NOT emitted (would regress correct candles). Round-2 LOW-7 wording: `tv_rest_candle_fold_errors_total{stage="refold_stale_read"}` increments on EVERY failed attempt (each re-queue logs a coalesced `warn!`); the `error!` fires only on the EXHAUSTED arm (5 attempts). Round-2 scope: this stage exists ONLY on the past-day cold path — the current day refolds from the in-RAM day-map with no `/exec` read (2026-07-16 hostile-review M2 + round-2 HIGH). |
 | `seal_send` | a sealed bucket could not be handed to the seal-writer channel (channel full past the boot-path pacing budget / global sender missing), or a confirmed-bar handoff was dropped (fold channel full/closed). |
+| `bad_identity` | (warn-level, once per process — coalesced) a spot-leg handoff carried an identity the fold's SecurityId space cannot represent (negative i64 — defensive); every occurrence is counted under `dropped{reason="bad_identity"}` (round-2 LOW-6 — previously a silent skip at the Groww hook sites). |
 | `volume_saturated` | a TF bucket's volume i64 add saturated at `i64::MAX` — the fold stays ATOMIC (never a torn bucket), the saturated value is emitted honestly, one coalesced warn per (feed, SID, day) (2026-07-16 hostile-review M3). |
 | `receiver_lost` | the fold task started but the shared receiver slot was EMPTY — a previous incarnation failed to re-park it (the RAII guard makes this near-unreachable); the task exits LOUDLY, never a silent clean_exit (2026-07-16 hostile-review HIGH-2). |
 | `sender_install` | main.rs could not install the global fold-bar sender (already installed — a double-spawn class bug); the hook sites would feed a stale channel (LOW, 2026-07-16). |
@@ -116,17 +138,28 @@ field):
   above).
 - `tv_rest_candle_fold_dropped_total{reason}` —
   `channel_full` / `channel_closed` (confirmed-bar handoff),
-  `seal_channel_full` / `no_seal_sender` (seal emission),
+  `seal_channel_full` / `no_seal_sender` (seal emission — round-2 LOW-1: a
+  CLOSED seal channel counts EVERY remaining seal of the slice, never
+  just one),
   `out_of_session` (bars outside [09:15, 15:30) IST — skipped honestly),
-  `bad_identity` (catch-up discovery rows whose SID does not fit the
-  seal-writer's id space — counted + coalesced warn, never silent).
-- `tv_rest_candle_fold_refold_queued_total` — dirty-day marks queued for
-  the debounced refold.
+  `bad_identity` (identities that do not fit the fold's SID space —
+  catch-up discovery rows AND the spot-leg handoff sites; counted +
+  coalesced warn, never silent),
+  `no_http_client` (round-2 LOW-4: past-day marks dropped loudly because
+  the incarnation has no HTTP client).
+- `tv_rest_candle_fold_refold_queued_total` — PAST-day marks queued for
+  the debounced `/exec` refold (the current day never queues — round-2).
+- `tv_rest_candle_fold_day_refolds_total{feed}` — synchronous current-day
+  day-map refolds (one per applied repair bar; each re-emits the day's
+  closed buckets, DEDUP-idempotent — round-2 HIGH).
+- `tv_rest_candle_fold_duplicate_bars_total` — byte-identical redeliveries
+  of a bar already in the day-map (no-op; nothing new to derive).
 - `tv_rest_candle_fold_paced_waits_total` — boot-path seal emissions that
   slept on a full seal channel (the 2026-07-16 HIGH-1 pacing: newest days
-  first, sleep-and-retry the SAME seal up to a bounded per-day budget
-  BEFORE counting any drop — a drop is real backpressure exhaustion, not
-  a burst artifact).
+  first, sleep-and-retry the SAME seal up to a bounded per-(feed, SID,
+  day) budget BEFORE counting any drop — a drop is real backpressure
+  exhaustion, not a burst artifact; round-2 LOW-7: the 60s budget is per
+  `refold_day` call, i.e. per (feed, SID, day)).
 - `tv_rest_candle_fold_volume_saturated_total` — saturating volume adds
   (M3 — the fold never tears).
 - `tv_rest_candle_fold_heartbeat_total` — the DENSE positive progress
@@ -145,13 +178,19 @@ SPOT1M-01 `empty` class) has no 1m bar and therefore leaves its higher-TF
 buckets folding over the bars that DO exist — same-shape-as-source, never
 fabricated. `tick_count`/`oi`/pct columns are honest zeros (documented in
 §0); consumers comparing REST-era vs live-era candles must expect that
-split. The dirty-day refold reads QuestDB, so the ILP-flush-ACK →
-`/exec`-visibility lag (WAL apply) is gated (M2, 2026-07-16): the refold
-verifies the TRIGGERING repair minute is present in the read before
-emitting — a stale read is NEVER emitted (would regress correct candles);
-the mark re-queues with backoff, bounded at 5 attempts, then degrades
-loudly (`refold_stale_read`) and the next boot's catch-up re-derives the
-day. The boot catch-up is flagged O(days × SIDs × rows) COLD work
+split. Current-day repairs refold from the in-RAM day-map — lossless by
+construction, no QuestDB read, no WAL-visibility race (round-2 HIGH). The
+ONLY residual WAL-lag surface is the PAST-day `/exec` refold (a repair
+arriving after the day-map rolled — e.g. a post-midnight sweep), where the
+ILP-flush-ACK → `/exec`-visibility lag (WAL apply) is gated (M2,
+2026-07-16): the refold verifies the TRIGGERING repair minute is present
+in the read before emitting — a stale read is NEVER emitted (would
+regress correct candles); the mark re-queues with backoff, bounded at
+5 attempts, then degrades loudly (`refold_stale_read`) and the next
+boot's catch-up re-derives the day. Past-day refolds emit corrected
+CLOSED-day seals only and never touch a live engine, so a stale past-day
+read can never corrupt open buckets (the round-2 midnight-clobber class
+is structurally dead). The boot catch-up is flagged O(days × SIDs × rows) COLD work
 (~35 days × 4 SIDs × ≤375 rows per feed — bounded, one-shot at boot),
 iterated NEWEST day first (HIGH-1 — under seal-channel backpressure the
 most recent, decision-relevant days are derived first) with paced
@@ -180,6 +219,20 @@ floor for a future CloudWatch filter). Adding a CloudWatch log-filter
 alarm is a flagged follow-up (one map entry + doc paragraph + cost note —
 the SCOREBOARD-01 / FEED-REJECT-01 precedent).
 
+**Retention first-sweep burst (dated honest note, 2026-07-16 round-2
+MEDIUM):** the same PR moves the chain tables (`option_chain_1m` +
+`option_contract_1m_rest`) from the 90-day Standard window into the 35-day
+market-data class, which makes every chain partition aged 36..90 days
+drop-eligible AT ONCE — up to ~110 DAY partitions (~4 GB) in the FIRST
+post-merge sweep. No code change was needed: the sweep is bounded by
+`max_partitions_per_run` (default 200 — the burst fits one run, never
+exceeds the cap), processes partitions strictly serially (one gzip export
+on temp disk at a time; ~minutes of wall clock, off-hours), and stays
+FAIL-CLOSED — a degraded S3 leg means no verified copy ⇒ no drop, so the
+worst case is "nothing freed yet", never data loss. Subsequent sweeps
+return to the ~1-partition/day steady state. (File-local twin note:
+`crates/storage/src/partition_archive.rs::CHAIN_MARKET_DATA_TABLES`.)
+
 ## §2. What a PR that violates this contract looks like (REJECT)
 
 - Routes fold output into `ticks` or synthesizes ticks from bars
@@ -187,9 +240,13 @@ the SCOREBOARD-01 / FEED-REJECT-01 precedent).
 - Hands bars to the fold BEFORE the `spot_1m_rest` flush ACK (an
   unpersisted bar must never derive candles the audit record does not
   back).
-- Folds an out-of-order bar into live RAM state instead of the dirty-day
-  refold (would corrupt open buckets high/low against the ordered-fold
-  contract).
+- Folds an out-of-order bar DIRECTLY into the live engine instead of the
+  day-map refold (would corrupt open buckets high/low against the
+  ordered-fold contract).
+- Re-introduces a `/exec`-based CURRENT-day refold that replaces the live
+  engine (the round-2 HIGH: the WAL-apply read can miss value-updates and
+  race-window bars — the in-RAM day-map is the only legal today source),
+  or routes a past-day `/exec` refold's output into a live engine.
 - Trusts a LIMIT-truncated day (partial fold) instead of degrading loudly.
 - Fabricates `tick_count` / `oi` / pct values on REST-derived seals.
 - Adds per-TF or per-SID metric labels (unbounded label cardinality — the
