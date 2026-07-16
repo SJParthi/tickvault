@@ -164,11 +164,16 @@ ilp_port = 9009
 [partition_retention]
 # STANDARD class (audit / daily-data tables) hot window.
 retention_days = 90
-# HIGH-VOLUME market-data class (ticks + 21 candles_* tables, ~1.2-2 GB/day).
-# 90d of ticks (~135+ GB) can never fit the 30 GB volume; 14d hot on EBS with
-# the verified S3 archive as the durable long-term store (SEBI retention is
-# satisfied by the S3 copy — aws-budget hot-window doctrine).
-market_data_hot_days = 14
+# HIGH-VOLUME market-data class (ticks + 21 candles_* tables + the per-minute
+# chain tables option_chain_1m/option_contract_1m_rest since 2026-07-16).
+# 35d hot on EBS (2026-07-16 operator directive — "our entire one month
+# should be stored and fetched from questdb even before premarket"; was 14),
+# with the verified S3 archive as the durable long-term store (SEBI retention
+# is satisfied by the S3 copy — aws-budget hot-window doctrine). The chain
+# tables moved here from the 90d Standard class the same day (the operator's
+# "option only for the current day" direction — 35d is the smallest clean
+# change; a tighter chain-only knob is a follow-up if disk pressure demands).
+market_data_hot_days = 35
 # Archive->verify->drop leg ON (2026-07-13 disk-pressure remediation).
 # Fail-closed: a partition is dropped ONLY after its S3 copy is row-count-
 # and size-verified. ROLLBACK: set false (or delete the key) to restore the
@@ -588,6 +593,29 @@ enabled = false # stays OFF until the operator's dated flip note (the chain leg 
 strikes_each_side = 2
 
 # ===========================================================================
+# Groww REST burst auto-ladder (operator approval 2026-07-14 — "approved
+# and go ahead with the recommendation"; contract:
+# no-rest-except-live-feed-2026-06-27.md §9.7 +
+# groww-second-feed-scope-2026-06-19.md §38.9). tier selects how the
+# per-minute Groww spot + chain waves fire: "two_wave" (the rate-safe
+# DEFAULT — 3 chain requests at close+300ms, 4 spot at close+1350ms;
+# boundary burst <= 4/s) or "seven_concurrent" (the operator preference —
+# all 7 at close+300ms; flip ONLY after the off-hours rate probe passes,
+# with a fresh dated rule note). Any Groww-leg HTTP 429 steps the session
+# DOWN the demotion ladder (two_wave -> staggered -> fully sequential); a
+# restart restores this configured tier.
+# warm_up = true sends one unauthenticated pre-boundary GET per leg client
+# at boundary-4s (3s-bounded, response discarded) so an idle-closed TLS
+# connection is re-established before the critical window. An ABSENT
+# section = two_wave + warm-up off — still rate-safe: the wave instants
+# are millisecond-precise regardless of the warm-up toggle, so the > 1s
+# two_wave separation always holds (2026-07-14 fix-round wording).
+# ===========================================================================
+[groww_rest_burst]
+tier = "two_wave" # seven_concurrent is probe-gated — dated rule note required to flip
+warm_up = true
+
+# ===========================================================================
 # Daily timeframe-consistency verifier (operator directive 2026-07-13 —
 # "how will you guarantee that all our defined timeframes internally are
 # correct — how do you identify whether any miscalculation or data
@@ -602,6 +630,22 @@ strikes_each_side = 2
 # ===========================================================================
 [tf_consistency]
 enabled = true
+
+# ===========================================================================
+# REST-era multi-TF candle derivation (operator directive 2026-07-16:
+# "why the fuck remaining candles 1m till 1day is not yet generated and
+# populated — resolve these"). Folds persist-confirmed spot_1m_rest 1m bars
+# into all 21 candles_* timeframes via the shared seal-writer channel, plus
+# a boot catch-up over the last `catchup_days` of stored bars (35 = the
+# operator's one-month spot window + weekend slack, 2026-07-16: "our entire
+# one month should be stored and fetched from questdb even before
+# premarket"). NEVER touches `ticks` (live-feed-purity; rule 10 carries the
+# dated candles_1d edit). Serde default is OFF (fail-safe) — this section
+# opts in; `enabled = false` is the rollback switch.
+# ===========================================================================
+[rest_candle_fold]
+enabled = true
+catchup_days = 35
 
 # ===========================================================================
 # Scheduled OMS order-book reconciliation (2026-07-14). Every

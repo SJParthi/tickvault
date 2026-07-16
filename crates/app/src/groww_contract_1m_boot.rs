@@ -157,6 +157,7 @@ use tickvault_storage::rest_fetch_audit_persistence::{
 use crate::groww_option_chain_1m_boot::{
     GrowwChainAnchor, GrowwChainAnchorStore, download_master_bounded,
 };
+use crate::groww_rest_burst::GrowwRestBurstState;
 use crate::groww_spot_1m_boot::{
     GrowwCandleRow, GrowwParseStats, GrowwTokenCache, error_class_for_status, groww_candles_query,
     parse_groww_1m_candle_rows,
@@ -206,6 +207,12 @@ pub struct GrowwContract1mTaskParams {
     pub anchor_store: Option<GrowwChainAnchorStore>,
     /// ATM window half-width from `[groww_contract_1m] strikes_each_side`.
     pub strikes_each_side: u32,
+    /// Shared session-scoped burst-tier state (2026-07-14 auto-ladder).
+    /// This leg keeps its own sequential per-contract min-gap pacing —
+    /// the burst handle exists ONLY so a contract-leg HTTP 429 demotes
+    /// the shared tier for the spot + chain waves too (one Groww rate
+    /// bucket, one demotion signal).
+    pub burst: Arc<GrowwRestBurstState>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1481,6 +1488,22 @@ async fn fire_one_groww_contract_minute(
                             Some(format!("{}: {}", contract.groww_symbol, failure.msg));
                     }
                     auth_rejected = failure.auth_rejected;
+                    // 2026-07-14 auto-ladder: a contract-leg 429 demotes the
+                    // SHARED session burst tier (spot + chain waves included)
+                    // — one Groww rate bucket, one demotion edge (the warn
+                    // fires once per session).
+                    if failure.rate_limited && params.burst.note_rate_limited() {
+                        warn!(
+                            code = ErrorCode::Spot1m01FetchDegraded.code_str(),
+                            stage = "burst_demoted",
+                            feed = "groww",
+                            leg = "contract_1m",
+                            demoted_to = params.burst.effective_tier().as_str(),
+                            "groww_contract_1m: HTTP 429 observed — Groww REST \
+                             burst tier demoted for the rest of the session \
+                             (boot resets to the configured tier)"
+                        );
+                    }
                     let error_class = error_class_for_status(failure.status);
                     let audit_row = build_contract_audit_row(
                         target_minute_nanos,
@@ -2864,6 +2887,10 @@ mod tests {
             chain_minute_done: None,
             anchor_store: None,
             strikes_each_side: 2,
+            burst: GrowwRestBurstState::new(
+                tickvault_common::config::GrowwRestBurstTier::TwoWave,
+                false,
+            ),
         }
     }
 

@@ -58,6 +58,12 @@ pub mod spot_1m_rest_boot;
 // chain for the 3 underlyings via POST /v2/optionchain and persist to the
 // `option_chain_1m` table (CHAIN-01..04).
 pub mod option_chain_1m_boot;
+// Groww REST burst auto-ladder (operator approval 2026-07-14): the shared
+// tier/demotion state + wave schedule for the per-minute Groww REST legs,
+// plus the env-gated off-hours rate probe that gates the
+// seven_concurrent promotion.
+pub mod groww_rate_probe;
+pub mod groww_rest_burst;
 // Groww per-minute spot 1m REST leg (operator grant 2026-07-13 — PR-2 of
 // the Groww per-minute REST plan): the just-closed minute's official Groww
 // 1m OHLCV for the 3 spot indices → `spot_1m_rest` feed='groww' + the
@@ -127,6 +133,12 @@ pub mod dhan_rest_stack;
 /// build loop + the sole persist_groww_instruments caller).
 pub mod groww_universe;
 pub mod groww_watch_paths;
+/// REST-era multi-TF candle derivation (operator directive 2026-07-16):
+/// folds persist-confirmed `spot_1m_rest` 1m bars into all 21 `candles_*`
+/// timeframes via the shared seal-writer channel + boot catch-up over the
+/// stored month. FOLD-01 runbook:
+/// `.claude/rules/project/rest-candle-fold-error-codes.md`.
+pub mod rest_candle_fold;
 /// Shared per-seal routing for BOTH feeds (Dhan + Groww) — the single
 /// `route_seal` body the two `on_seal` call sites invoke (C2, behavior-preserving).
 pub mod seal_routing;

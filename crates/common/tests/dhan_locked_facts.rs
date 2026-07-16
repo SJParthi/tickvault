@@ -35,8 +35,13 @@ use tickvault_common::constants::{
 // 4-IDX_I LOCKED_UNIVERSE we use ONLY 1 main-feed conn + 1 order-update
 // conn forever — no separate depth feeds. The dependent URL constants
 // (`DHAN_TWENTY_DEPTH_WS_BASE_URL`, `DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL`)
-// no longer exist; if depth ever returns, re-open Ticket #5519522 and
-// restore both the constants and these ratchets together.
+// are RETAINED as ORPHANED pub consts in constants.rs — zero consumers
+// anywhere, measured by
+// `dhan_api_coverage.rs::test_depth_ws_url_constants_are_orphaned`
+// (round-8 truth-sync 2026-07-15: this comment previously narrated the
+// constants deleted while both are live declarations on the tree). If
+// depth ever returns (a scope-lock rule edit FIRST), re-open Ticket
+// #5519522 and restore these ratchets alongside the new consumers.
 // ===========================================================================
 
 // ===========================================================================

@@ -160,6 +160,16 @@ pub struct ApplicationConfig {
     /// Absent section ⇒ DISABLED (fail-safe default off).
     #[serde(default)]
     pub tf_consistency: TfConsistencyConfig,
+    /// `[rest_candle_fold]` — REST-era multi-TF candle derivation (operator
+    /// directive 2026-07-16: *"why the fuck remaining candles 1m till 1day
+    /// is not yet generated and populated — resolve these"*). Folds
+    /// persist-confirmed `spot_1m_rest` 1m bars into all 21 `candles_*`
+    /// timeframes via the shared seal-writer channel, with a boot catch-up
+    /// over the last `catchup_days` of stored bars. Cold path only. Absent
+    /// section ⇒ DISABLED (fail-safe default off); `config/base.toml` opts
+    /// in.
+    #[serde(default)]
+    pub rest_candle_fold: RestCandleFoldConfig,
     /// `[groww_contract_1m]` — Groww per-minute PER-CONTRACT 1m candle REST
     /// leg (operator grant 2026-07-13,
     /// `.claude/plans/active-plan-groww-rest-1m.md` PR-4 — the fill-model
@@ -174,6 +184,19 @@ pub struct ApplicationConfig {
     /// section ⇒ DISABLED (fail-safe default off).
     #[serde(default)]
     pub groww_contract_1m: GrowwContract1mConfig,
+    /// `[groww_rest_burst]` — the 2026-07-14 Groww REST burst auto-ladder
+    /// (operator approval "approved and go ahead with the recommendation";
+    /// `no-rest-except-live-feed-2026-06-27.md` §9.7): which burst tier the
+    /// per-minute Groww REST legs fire in (`two_wave` default /
+    /// `seven_concurrent` probe-gated) + the pre-boundary TLS warm-up
+    /// toggle. Absent section ⇒ `two_wave` + warm-up off — rate-safe
+    /// because the wave instants are computed from the millisecond clock
+    /// (`wave_sleep_from_now_ms`), so the > 1 s two_wave separation holds
+    /// with or without the warm-up recompute (LOW-1 wording fix
+    /// 2026-07-14; the pre-CRITICAL-1 whole-second else-branch could
+    /// collapse it).
+    #[serde(default)]
+    pub groww_rest_burst: GrowwRestBurstConfig,
     /// `[groww_universe]` — process-global daily Groww watch-set +
     /// shared-master rider (2026-07-15 Groww live-feed retirement re-home of
     /// the activation watcher's daily build loop): once per IST day, build +
@@ -1105,6 +1128,43 @@ impl Default for CadenceConfig {
     }
 }
 
+/// `[rest_candle_fold]` — REST-era multi-TF candle derivation (operator
+/// directive 2026-07-16). Cold path only — folds persist-confirmed
+/// `spot_1m_rest` 1m bars into the 21 `candles_*` tables through the shared
+/// seal-writer channel; NEVER touches `ticks` (live-feed-purity rules 1-6
+/// stand; rule 10 carries the dated 2026-07-16 candles_1d edit).
+///
+/// Fail-safe shape: `enabled` is `#[serde(default)]` = `false`, so an
+/// absent `[rest_candle_fold]` section (or a TOML written before this PR)
+/// disables the fold entirely. `config/base.toml` explicitly sets
+/// `enabled = true` + `catchup_days = 35` (the operator's one-month spot
+/// window demand, 2026-07-16).
+#[derive(Debug, Clone, Deserialize)]
+pub struct RestCandleFoldConfig {
+    /// Master switch for the REST-era bar-fold candle derivation.
+    /// Default OFF (fail-safe) — `config/base.toml` turns it on explicitly.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Boot catch-up window in IST days: the fold re-derives all 21 TFs
+    /// from the last `catchup_days` calendar days of `spot_1m_rest` rows
+    /// per feed — today plus `catchup_days - 1` past days, EXACTLY
+    /// `catchup_days` days total (round-2 LOW-3: the code matches this
+    /// wording; the old range folded one extra day). Default 35 (one month
+    /// of spot history + weekend slack — the operator's 2026-07-16
+    /// minimum-one-month demand).
+    #[serde(default = "default_rest_candle_fold_catchup_days")]
+    pub catchup_days: u32,
+}
+
+impl Default for RestCandleFoldConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            catchup_days: default_rest_candle_fold_catchup_days(),
+        }
+    }
+}
+
 impl CadenceConfig {
     /// Boot-time validation (range-bail house shape) — rejects any
     /// `[cadence]` section that could compress the structural zero-429
@@ -1281,6 +1341,29 @@ impl CadenceConfig {
     }
 }
 
+/// serde default for [`RestCandleFoldConfig::catchup_days`] — 35 days.
+fn default_rest_candle_fold_catchup_days() -> u32 {
+    35
+}
+
+impl RestCandleFoldConfig {
+    /// Boot-time sanity validation — rejected BEFORE the fold task spawns.
+    /// The window must be ≥1 day and ≤370 (~one year — the envelope bound;
+    /// a larger window is a config typo, not a legitimate ask).
+    ///
+    /// # Errors
+    /// Returns a descriptive error when `catchup_days` is outside `1..=370`.
+    pub fn validate(&self) -> Result<()> {
+        if !(1..=370).contains(&self.catchup_days) {
+            bail!(
+                "rest_candle_fold.catchup_days ({}) must be within 1..=370",
+                self.catchup_days
+            );
+        }
+        Ok(())
+    }
+}
+
 /// `[option_chain_1m]` — per-minute option-chain REST pipeline (operator
 /// grant 2026-07-12; PR-3, the OPTION-CHAIN half). Cold path only — the
 /// WS candle pipeline, tick capture and trading are untouched.
@@ -1448,6 +1531,37 @@ impl Default for GrowwContract1mConfig {
         Self {
             enabled: false,
             strikes_each_side: default_groww_contract_1m_strikes_each_side(),
+        }
+    }
+}
+
+/// The Groww REST burst tier (2026-07-14 auto-ladder — operator approval
+/// "approved and go ahead with the recommendation", relayed via the
+/// coordinator session; contract `no-rest-except-live-feed-2026-06-27.md`
+/// §9.7). Selects how the per-minute Groww spot + chain waves fire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum GrowwRestBurstTier {
+    /// The SHIPPED default: 3 chain requests concurrently at minute close
+    /// + 300 ms, 4 spot requests concurrently at close + 1,350 ms — the
+    /// > 1 s wave separation keeps every rolling second single-wave
+    /// (boundary burst ≤ 4 req/s).
+    #[default]
+    TwoWave,
+    /// The operator-preferred burst — all 7 requests concurrently at
+    /// close + 300 ms. PROBE-GATED: promotion requires the off-hours rate
+    /// probe verdict + a fresh dated note in the §9.7 rule file; a live
+    /// 429 auto-demotes the session back to `two_wave`.
+    SevenConcurrent,
+}
+
+impl GrowwRestBurstTier {
+    /// Static metric-label value (`tv_groww_rest_burst_tier_total{tier}`).
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::TwoWave => "two_wave",
+            Self::SevenConcurrent => "seven_concurrent",
         }
     }
 }
@@ -1656,6 +1770,24 @@ impl Default for DhanMarginGateConfig {
             rest_self_cap_per_sec: default_margin_gate_rest_self_cap_per_sec(),
         }
     }
+}
+
+/// `[groww_rest_burst]` — burst-tier + warm-up selection for the
+/// per-minute Groww REST legs (2026-07-14 auto-ladder). Fail-safe shape:
+/// every field is `#[serde(default)]`, so an absent section (or a TOML
+/// written before this PR) means `two_wave` + warm-up OFF;
+/// `config/base.toml` opts warm-up in explicitly.
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+pub struct GrowwRestBurstConfig {
+    /// The configured burst tier (boot value — a live 429 demotes the
+    /// SESSION, never this config; restart restores it).
+    #[serde(default)]
+    pub tier: GrowwRestBurstTier,
+    /// Pre-boundary TLS warm-up: one unauthenticated GET per leg client at
+    /// minute boundary − 4 s (3 s-bounded, response discarded). Default
+    /// OFF (fail-safe); base.toml turns it on.
+    #[serde(default)]
+    pub warm_up: bool,
 }
 
 impl DhanMarginGateConfig {
@@ -2228,12 +2360,16 @@ pub struct PartitionRetentionConfig {
     #[serde(default = "default_retention_days")]
     pub retention_days: u32,
     /// Hot window in days for the HIGH-VOLUME market-data class (`ticks` +
-    /// the 21 `candles_*` tables, ~1.2–2 GB/day combined). 90 days of ticks
-    /// (~135+ GB) can never fit the 30 GB volume — the hot window must be
-    /// shorter, with S3 as the durable long-term store (aws-budget.md §5
-    /// hot-window-on-EBS doctrine; SEBI retention satisfied by the S3 copy).
-    /// Only consulted when `archive_enabled = true`; clamped to a hard
-    /// MIN_HOT_DAYS=2 floor at use (today + yesterday are untouchable).
+    /// the 21 `candles_*` tables + the per-minute chain tables since
+    /// 2026-07-16). 90 days of ticks (~135+ GB) can never fit the volume —
+    /// the hot window must be shorter, with S3 as the durable long-term
+    /// store (aws-budget.md §5 hot-window-on-EBS doctrine; SEBI retention
+    /// satisfied by the S3 copy). Default 35 since 2026-07-16 (was 14) —
+    /// the operator's minimum-one-month spot window demand ("our entire
+    /// one month should be stored and fetched from questdb even before
+    /// premarket"). Only consulted when `archive_enabled = true`; clamped
+    /// to a hard MIN_HOT_DAYS=2 floor at use (today + yesterday are
+    /// untouchable).
     #[serde(default = "default_market_data_hot_days")]
     pub market_data_hot_days: u32,
     /// Master gate for the archive→verify→drop leg. serde default FALSE so
@@ -2272,11 +2408,12 @@ const fn default_retention_days() -> u32 {
     90
 }
 
-/// Default market-data hot window: 14 days. Inert unless `archive_enabled`;
-/// safe-by-default because the archive→verify→drop flow is fail-closed
-/// (no verified S3 copy ⇒ no drop).
+/// Default market-data hot window: 35 days (2026-07-16 operator directive
+/// — one month of spot history + weekend slack; was 14). Inert unless
+/// `archive_enabled`; safe-by-default because the archive→verify→drop flow
+/// is fail-closed (no verified S3 copy ⇒ no drop).
 const fn default_market_data_hot_days() -> u32 {
-    14
+    35
 }
 
 /// Default per-run archive bound: 200 partitions. At ~8–24 hourly ticks
@@ -3059,6 +3196,11 @@ impl ApplicationConfig {
             }
         }
 
+        // 2026-07-16 REST-era candle derivation: the boot catch-up window
+        // must be a sane 1..=370-day envelope — rejected at boot, BEFORE
+        // the fold task spawns.
+        self.rest_candle_fold.validate()?;
+
         Ok(())
     }
 }
@@ -3312,7 +3454,8 @@ mod tests {
         let cfg: PartitionRetentionConfig =
             toml::from_str("retention_days = 90").expect("legacy section must parse");
         assert_eq!(cfg.retention_days, 90);
-        assert_eq!(cfg.market_data_hot_days, 14);
+        // 2026-07-16: default raised 14 → 35 (operator one-month spot window).
+        assert_eq!(cfg.market_data_hot_days, 35);
         assert!(!cfg.archive_enabled, "archive leg must default OFF");
         assert!(cfg.archive_bucket.is_empty(), "bucket must default derived");
         assert_eq!(cfg.max_partitions_per_run, 200);
@@ -3324,7 +3467,8 @@ mod tests {
         // `default -> true` mutants and pins the instant-rollback contract
         // (delete the key ⇒ detach-only legacy behaviour).
         assert!(!PartitionRetentionConfig::default().archive_enabled);
-        assert_eq!(default_market_data_hot_days(), 14);
+        // 2026-07-16: default raised 14 → 35 (operator one-month spot window).
+        assert_eq!(default_market_data_hot_days(), 35);
         assert_eq!(default_max_partitions_per_run(), 200);
         let cfg: PartitionRetentionConfig =
             toml::from_str("").expect("empty section must parse via defaults");
@@ -3334,13 +3478,47 @@ mod tests {
     #[test]
     fn test_partition_retention_full_section_parses() {
         let cfg: PartitionRetentionConfig = toml::from_str(
-            "retention_days = 90\nmarket_data_hot_days = 14\narchive_enabled = true\narchive_bucket = \"tv-prod-cold\"\nmax_partitions_per_run = 50\n",
+            "retention_days = 90\nmarket_data_hot_days = 35\narchive_enabled = true\narchive_bucket = \"tv-prod-cold\"\nmax_partitions_per_run = 50\n",
         )
         .expect("full section must parse");
         assert!(cfg.archive_enabled);
         assert_eq!(cfg.archive_bucket, "tv-prod-cold");
-        assert_eq!(cfg.market_data_hot_days, 14);
+        assert_eq!(cfg.market_data_hot_days, 35);
         assert_eq!(cfg.max_partitions_per_run, 50);
+    }
+
+    // =======================================================================
+    // [rest_candle_fold] — RestCandleFoldConfig pins (rest-candle plan Item 2)
+    // =======================================================================
+
+    #[test]
+    fn test_rest_candle_fold_config_default_off() {
+        // Fail-safe pin: the fold is OFF unless a config explicitly turns
+        // it on — `Default` and the serde default (absent keys) must agree.
+        assert!(!RestCandleFoldConfig::default().enabled);
+        assert_eq!(RestCandleFoldConfig::default().catchup_days, 35);
+        let cfg: RestCandleFoldConfig = toml::from_str("")
+            .expect("empty [rest_candle_fold] section must parse via serde defaults");
+        assert!(!cfg.enabled, "absent enabled key must deserialize to false");
+        assert_eq!(cfg.catchup_days, 35, "serde catchup_days default is 35");
+    }
+
+    #[test]
+    fn test_rest_candle_fold_config_validate_bounds() {
+        // The 1..=370 catch-up envelope: both edges accepted, both
+        // neighbours rejected (a 0/371 window is a config typo, not a
+        // legitimate ask).
+        let cfg = |catchup_days: u32| RestCandleFoldConfig {
+            enabled: true,
+            catchup_days,
+        };
+        assert!(cfg(1).validate().is_ok(), "lower edge 1 must be accepted");
+        assert!(
+            cfg(370).validate().is_ok(),
+            "upper edge 370 must be accepted"
+        );
+        assert!(cfg(0).validate().is_err(), "0 must be rejected");
+        assert!(cfg(371).validate().is_err(), "371 must be rejected");
     }
 
     // =======================================================================
@@ -3630,7 +3808,9 @@ mod tests {
             option_chain_1m: OptionChain1mConfig::default(),
             groww_spot_1m: GrowwSpot1mConfig::default(),
             groww_option_chain_1m: GrowwOptionChain1mConfig::default(),
+            groww_rest_burst: GrowwRestBurstConfig::default(),
             tf_consistency: TfConsistencyConfig::default(),
+            rest_candle_fold: RestCandleFoldConfig::default(),
             groww_contract_1m: GrowwContract1mConfig::default(),
             groww_universe: GrowwUniverseConfig::default(),
             groww_orders: GrowwOrdersConfig::default(),
@@ -5337,6 +5517,73 @@ mod tests {
             .expect("explicit values must round-trip");
         assert!(on.groww_option_chain_1m.enabled);
         assert!(!on.groww_option_chain_1m.probe_and_report);
+    }
+
+    /// 2026-07-14 Groww REST burst auto-ladder: the `[groww_rest_burst]`
+    /// section is fail-safe — absent/empty sections default to the
+    /// rate-safe `two_wave` tier with warm-up OFF; explicit values (incl.
+    /// the probe-gated `seven_concurrent` flip shape) round-trip; an
+    /// unknown tier string is a loud config error, never a silent default.
+    #[test]
+    fn test_groww_rest_burst_config_defaults_and_round_trips() {
+        use figment::Figment;
+        use figment::providers::{Format, Toml};
+
+        let d = GrowwRestBurstConfig::default();
+        assert_eq!(d.tier, GrowwRestBurstTier::TwoWave);
+        assert!(!d.warm_up, "warm-up must default OFF (base.toml opts in)");
+        assert_eq!(GrowwRestBurstTier::TwoWave.as_str(), "two_wave");
+        assert_eq!(
+            GrowwRestBurstTier::SevenConcurrent.as_str(),
+            "seven_concurrent"
+        );
+
+        #[derive(Deserialize)]
+        struct Wrapper {
+            #[serde(default)]
+            groww_rest_burst: GrowwRestBurstConfig,
+        }
+        let missing: Wrapper = Figment::new()
+            .merge(Toml::string("[other]\nx = 1\n"))
+            .extract()
+            .expect("missing [groww_rest_burst] must default, not error");
+        assert_eq!(missing.groww_rest_burst.tier, GrowwRestBurstTier::TwoWave);
+        assert!(!missing.groww_rest_burst.warm_up);
+        let empty: Wrapper = Figment::new()
+            .merge(Toml::string("[groww_rest_burst]\n"))
+            .extract()
+            .expect("empty [groww_rest_burst] must default, not error");
+        assert_eq!(empty.groww_rest_burst.tier, GrowwRestBurstTier::TwoWave);
+        assert!(!empty.groww_rest_burst.warm_up);
+        let base_shape: Wrapper = Figment::new()
+            .merge(Toml::string(
+                "[groww_rest_burst]\ntier = \"two_wave\"\nwarm_up = true\n",
+            ))
+            .extract()
+            .expect("the base.toml shape must round-trip");
+        assert_eq!(
+            base_shape.groww_rest_burst.tier,
+            GrowwRestBurstTier::TwoWave
+        );
+        assert!(base_shape.groww_rest_burst.warm_up);
+        let seven: Wrapper = Figment::new()
+            .merge(Toml::string(
+                "[groww_rest_burst]\ntier = \"seven_concurrent\"\n",
+            ))
+            .extract()
+            .expect("the probe-gated promotion shape must round-trip");
+        assert_eq!(
+            seven.groww_rest_burst.tier,
+            GrowwRestBurstTier::SevenConcurrent
+        );
+        // A typo'd tier is refused loudly — never silently two_wave.
+        let bad: Result<Wrapper, _> = Figment::new()
+            .merge(Toml::string("[groww_rest_burst]\ntier = \"seven\"\n"))
+            .extract();
+        assert!(
+            bad.is_err(),
+            "an unknown tier string must be a config error"
+        );
     }
 
     /// Daily timeframe-consistency verifier (operator 2026-07-13): the

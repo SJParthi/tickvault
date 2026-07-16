@@ -408,6 +408,13 @@ pub enum ErrorCode {
     /// 814: Invalid request.
     Data814InvalidRequest,
 
+    /// ORDER-READY-01 — a live order was refused by the order-readiness gate:
+    /// fail-closed on never-probed / stale / invalid profile / token headroom /
+    /// OMS halt. Pre-live plumbing while `dry_run` is hardcoded true — the
+    /// refusal IS the protection; unreachable in prod today (WS-GAP-10 /
+    /// DHAN-LANE-03 class of fail-closed gate). Severity::High.
+    OrderReady01GateRefused,
+
     /// Wave 5 Item 26 L1 — volume monotonicity breach at runtime. The Dhan
     /// volume field at bytes 22-25 of the Quote/Full packet is cumulative
     /// since session open per Ticket #5525125 (verified via the live Mon
@@ -900,6 +907,23 @@ pub enum ErrorCode {
     /// 2026-07-14 default (no CloudWatch filter). Severity::Medium,
     /// auto-triage-safe.
     FeedGap01EpisodeDegraded,
+    /// FOLD-01 (REST-era multi-TF candle derivation, operator directive
+    /// 2026-07-16) — a leg of the bar-fold candle writer DEGRADED: the boot
+    /// catch-up / dirty-day refold `/exec` query or parse failed
+    /// (`stage="catchup_query"` / `"catchup_parse"` — incl. the LIMIT
+    /// truncation tripwire and a segment-allowlist refusal), a sealed
+    /// bucket could not be handed to the seal-writer channel or a
+    /// confirmed-bar handoff was dropped (`stage="seal_send"`), or the
+    /// supervised fold task died and was respawned
+    /// (`stage="task_respawn"`). Every degrade is RE-DERIVABLE: the
+    /// `candles_*` DEDUP key (`ts, security_id, segment, feed`) makes the
+    /// dirty-day refold and the next boot's catch-up idempotent repairs —
+    /// no market data is lost (the `spot_1m_rest` source rows stand).
+    /// Cold path only; log-sink-only delivery (no CloudWatch filter — see
+    /// the runbook's delivery-boundary paragraph). Severity::High,
+    /// auto-triage-safe (the degrade already happened; catch-up/refold
+    /// self-heal — the operator inspects).
+    RestCandleFold01Degraded,
 
     // -----------------------------------------------------------------------
     // 🔷 DHAN exit-order execution layer (Cluster B, 2026-07-14).
@@ -1258,6 +1282,8 @@ impl ErrorCode {
             Self::Data812InvalidDateFormat => "DATA-812",
             Self::Data813InvalidSecurityId => "DATA-813",
             Self::Data814InvalidRequest => "DATA-814",
+            // Cluster F (2026-07-14) — order-readiness gate
+            Self::OrderReady01GateRefused => "ORDER-READY-01",
             // Wave 5 Item 13 — prev-close routing
             Self::PrevClose03BootRoutingAssertion => "PREVCLOSE-03",
             // F2 (Wave-5 #504e follow-up) — PrevDayCache boot loader
@@ -1327,6 +1353,8 @@ impl ErrorCode {
             Self::TfVerify02RunDegraded => "TF-VERIFY-02",
             // Feed gap-episode forensics (Groww hardening PR-3, 2026-07-14)
             Self::FeedGap01EpisodeDegraded => "FEED-GAP-01",
+            // REST-era multi-TF candle derivation (operator 2026-07-16)
+            Self::RestCandleFold01Degraded => "FOLD-01",
             Self::ExitOrder01ExecutionDegraded => "EXIT-ORDER-01",
             Self::ExitVerify01Degraded => "EXIT-VERIFY-01",
             // Groww Portfolio area contract stubs (§39.3, 2026-07-14)
@@ -1426,6 +1454,11 @@ impl ErrorCode {
             | Self::RiskGapPositionPnl
             | Self::InstrumentP0ExpiryAtGate4
             | Self::Data807TokenExpired
+            // ORDER-READY-01 (2026-07-14): High, not Critical — the refusal IS
+            // the protection (no live order is sent), the path is unreachable
+            // today (dry_run hardcoded true), and it self-heals on the next OK
+            // profile probe. Same class as WS-GAP-10 / DHAN-LANE-03.
+            | Self::OrderReady01GateRefused
             | Self::Boot01QuestDbSlow
             | Self::Volume01MonotonicityBreach
             | Self::AggregatorLate01
@@ -1523,6 +1556,13 @@ impl ErrorCode {
             // run could not vouch for it); never a halt — the live candle
             // pipeline is untouched and reruns are DEDUP-idempotent.
             Self::TfVerify01MismatchFound | Self::TfVerify02RunDegraded => Severity::High,
+            // FOLD-01 (REST-era candle derivation, operator 2026-07-16) —
+            // a fold leg degraded (catch-up query/parse, seal handoff, task
+            // respawn). High: operator eyes required — a silent fold degrade
+            // would starve the candles_* tables the operator demanded; never
+            // a halt (cold path; refold/catch-up are DEDUP-idempotent
+            // repairs and spot_1m_rest source rows stand). LOG-SINK-ONLY.
+            Self::RestCandleFold01Degraded => Severity::High,
             // EXIT-ORDER-01 / EXIT-VERIFY-01 (Cluster B, 2026-07-14) — the
             // exit-order layer degraded / the MPP verify ladder exhausted
             // without a clean fill. High: operator eyes on every occurrence
@@ -1764,6 +1804,9 @@ impl ErrorCode {
             | Self::Data812InvalidDateFormat
             | Self::Data813InvalidSecurityId
             | Self::Data814InvalidRequest => ".claude/rules/dhan/annexure-enums.md",
+            Self::OrderReady01GateRefused => {
+                ".claude/rules/project/order-readiness-error-codes.md"
+            }
             Self::PrevClose03BootRoutingAssertion
             | Self::Volume01MonotonicityBreach => ".claude/rules/project/wave-5-error-codes.md",
             Self::AggregatorDrop01
@@ -1865,6 +1908,10 @@ impl ErrorCode {
             Self::FeedGap01EpisodeDegraded => {
                 ".claude/rules/project/feed-gap-error-codes.md"
             }
+            // REST-era multi-TF candle derivation (operator 2026-07-16)
+            Self::RestCandleFold01Degraded => {
+                ".claude/rules/project/rest-candle-fold-error-codes.md"
+            }
             // 🔷 DHAN exit-order execution layer (Cluster B, 2026-07-14)
             Self::ExitOrder01ExecutionDegraded | Self::ExitVerify01Degraded => {
                 ".claude/rules/project/dhan-exit-order-lockout-2026-07-14.md"
@@ -1963,6 +2010,11 @@ impl ErrorCode {
                 // would re-stamp rows and could mask the evidence (the
                 // Futidx02 precedent).
                 | Self::TfVerify01MismatchFound
+                // ORDER-READY-01 (Cluster F, 2026-07-14): restoring
+                // dataPlan/segment/token is an operator/broker ACCOUNT decision
+                // (CHAIN-01 precedent); no auto-triage action may ever touch the
+                // ORDER path, so this is severity-independently operator-only.
+                | Self::OrderReady01GateRefused
                 // GROWW-PORT-03 (§39.3, 2026-07-14): NO — severity-independent
                 // override arm (FUTIDX-02 precedent: data-comparability
                 // divergence is never auto-actioned). The operator judges
@@ -2048,6 +2100,7 @@ impl ErrorCode {
             Self::Data812InvalidDateFormat,
             Self::Data813InvalidSecurityId,
             Self::Data814InvalidRequest,
+            Self::OrderReady01GateRefused,
             Self::HotPath01SyncFsFailed,
             Self::HotPath02WriterQueueDrop,
             // PR #5 (2026-05-19): Phase201DispatchFailed + Phase202EmitGuardDropped retired.
@@ -2151,6 +2204,8 @@ impl ErrorCode {
             Self::TfVerify02RunDegraded,
             // Feed gap-episode forensics (Groww hardening PR-3, 2026-07-14)
             Self::FeedGap01EpisodeDegraded,
+            // REST-era multi-TF candle derivation (operator 2026-07-16)
+            Self::RestCandleFold01Degraded,
             // 🔷 DHAN exit-order execution layer (Cluster B, 2026-07-14)
             Self::ExitOrder01ExecutionDegraded,
             Self::ExitVerify01Degraded,
@@ -2553,9 +2608,18 @@ mod tests {
         // 2026-07-15 (merge of #1587 fan-out stubs + main's #1578
         // GROWW-ORD contracts): both families coexist — 129 base + 14
         // (PORT/OCO/MARG) + 10 (ORD) = 153, mechanically recounted.
-        // 2026-07-16 (rebase onto post-#1540 main): + CADENCE-01/02/03
-        // (cadence scheduler, operator directive 2026-07-14) => 156.
-        assert_eq!(ErrorCode::all().len(), 156);
+        // 2026-07-14 (Cluster F, merged 2026-07-16): ORDER-READY-01
+        // (order-readiness gate) => 154.
+        // 2026-07-16 (REST-era candle derivation, operator directive):
+        // +1 FOLD-01 (RestCandleFold01Degraded — bar-fold writer degrade;
+        // log-sink-only, High, auto-triage-safe) => 155 (both 153->154
+        // bumps — Cluster F + FOLD-01 — landed concurrently; mechanically
+        // recounted at this merge).
+        // 2026-07-16 (merge of origin/main into cadence-scheduler-v2):
+        // + CADENCE-01/02/03 (cadence scheduler, operator directive
+        // 2026-07-14) on top of main's 155 => 158, mechanically recounted
+        // against the merged all() vec at this merge.
+        assert_eq!(ErrorCode::all().len(), 158);
     }
 
     #[test]
@@ -2930,6 +2994,23 @@ mod tests {
     }
 
     #[test]
+    fn test_order_ready_01_contract() {
+        let c = ErrorCode::OrderReady01GateRefused;
+        assert_eq!(c.code_str(), "ORDER-READY-01");
+        assert_eq!("ORDER-READY-01".parse::<ErrorCode>(), Ok(c));
+        assert_eq!(c.severity(), Severity::High);
+        assert!(
+            !c.is_auto_triage_safe(),
+            "operator-only: account/order-path decision"
+        );
+        assert_eq!(
+            c.runbook_path(),
+            ".claude/rules/project/order-readiness-error-codes.md"
+        );
+        assert!(ErrorCode::all().contains(&c));
+    }
+
+    #[test]
     fn test_ws_reinject_01_aborted_contract() {
         let code = ErrorCode::WsReinject01Aborted;
         // Wire-format string + roundtrip via FromStr.
@@ -2971,6 +3052,8 @@ mod tests {
                 || s.starts_with("STORAGE-GAP-")
                 || s.starts_with("DH-")
                 || s.starts_with("DATA-")
+                // Cluster F (2026-07-14): order-readiness gate
+                || s.starts_with("ORDER-READY-")
                 // Wave 1 (PR #393): hot-path / phase2 / prev-close / movers prefixes
                 || s.starts_with("HOT-PATH-")
                 || s.starts_with("PHASE2-")
@@ -3015,6 +3098,8 @@ mod tests {
                 || s.starts_with("WS-REINJECT-")
                 // Operator 2026-06-10: daily end-to-end tick-conservation audit
                 || s.starts_with("TICK-CONSERVE-")
+                // Operator 2026-07-16: REST-era multi-TF candle derivation
+                || s.starts_with("FOLD-")
                 // C4 sweep (2026-07-15): the SLO- / REST-CANARY- /
                 // INSTR-FETCH- / CROSS-VERIFY-1M- / NTM-CONSTITUENCY- /
                 // PREVDAY- / DHAN-LANE- family prefixes were REMOVED from

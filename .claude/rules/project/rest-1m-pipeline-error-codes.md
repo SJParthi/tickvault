@@ -113,6 +113,18 @@ honored trivially at one request per underlying per minute + a defensive
 row to `option_chain_1m` (DEDUP `(ts, underlying_security_id,
 exchange_segment, expiry, strike, leg, feed)`).
 
+**2026-07-14 — the GROWW legs' sequencing is now the AUTO-LADDER (Dhan
+unchanged):** the paragraph above continues to describe the DHAN chain leg
+verbatim. The GROWW spot + chain legs no longer sequence chain-after-spot —
+they fire in rate-safe CONCURRENT burst waves on their own minute-boundary
+timers (`two_wave` default / probe-gated `seven_concurrent`, 429
+auto-demote, optional pre-boundary warm-up, env-gated off-hours rate
+probe). Operator authorization 2026-07-14 ("approved and go ahead with the
+recommendation", relayed via the coordinator session); full contract in
+`no-rest-except-live-feed-2026-06-27.md` §9.7 +
+`groww-second-feed-scope-2026-06-19.md` §38.9; the new stage strings
+(`burst_demoted`) + counters are documented in §1/§2c below.
+
 ## §1. SPOT1M-01 — per-minute spot fetch degraded
 
 **Severity:** High. **Auto-triage safe:** Yes (the degrade already
@@ -284,6 +296,36 @@ under the `tv_groww_spot1m_*` prefix (`fetch_total{outcome}`,
 `ts_form_total{form}` — the UNVERIFIED-LIVE timestamp wire-format probe).
 The typed pages are the Groww-specific `GrowwSpot1mFetchDegraded` /
 `GrowwSpot1mFetchRecovered` Telegram events (same 3-minute edge).
+
+**2026-07-14 auto-ladder update (operator "approved and go ahead with the
+recommendation", relayed via the coordinator session —
+`no-rest-except-live-feed-2026-06-27.md` §9.7 /
+`groww-second-feed-scope-2026-06-19.md` §38.9):** the Groww spot targets
+now fetch CONCURRENTLY per fire (the sequential loop + the old auth
+short-circuit skip rows are gone — every target gets a REAL forensics
+row), at a TIER-dependent post-boundary delay (`two_wave` default:
+close+1,350 ms; probe-gated `seven_concurrent`: close+300 ms), with a
+deterministic per-target RUNG jitter (slot × 150 ms, ALL tiers — the
+same-day fix-round HIGH-1: the 4 ladders never re-poll in lockstep on a
+correlated vendor-lag minute). New SPOT1M-01 stages:
+`stage="burst_demoted"` (`warn!`-level, edge-latched ONCE PER DEMOTION
+LEVEL — a live Groww-leg HTTP 429 steps the session one shape down the
+`two_wave → staggered → fully-sequential` ladder (fix-round MEDIUM-1;
+`seven_concurrent` enters at the top); counter
+`tv_groww_rest_burst_demoted_total{level}`; the contract leg's demotion
+edge emits the same stage with `leg="contract_1m"`) and
+`stage="wave_task_failed"` (`error!`-level, unwind builds only — release
+aborts on panic: a wave fetch task failed to JOIN; the lost target is
+synthesized as a Failed outcome for the minute, never a silent missing
+target — fix-round MEDIUM-3 documentation). New counters:
+`tv_groww_rest_burst_tier_total{tier}` (which shape fired) +
+`tv_groww_rest_warmup_total{leg, outcome}` (the pre-boundary
+unauthenticated TLS warm-up GET — best-effort, never coded/paged) +
+`tv_groww_rate_probe_requests_total{outcome}` /
+`tv_groww_rate_probe_rate_limited_total` (the env-gated off-hours rate
+probe — log-lines only, refused inside the [08:30, 16:00) IST wall-clock
+blackout on ANY day, writes no tables). Everything else in the spot
+taxonomy (ladder, backfill, sweep, edges, forensics) is unchanged.
 
 **2026-07-13 scope note — the Groww spot leg covers 4 indices (INDIA VIX
 added, SPOT ONLY; `groww-second-feed-scope-2026-06-19.md` §38.7):** the
@@ -625,11 +667,25 @@ that underlying degrades for the day, coded + counted by
 `stage="strikes_truncated"` (a hostile/oversized chain body hit the
 strike cap — truncated + counted, never unbounded). `stage="token_read"`
 lives on the shared token cache (`tv_groww_chain1m_token_read_failed_total`
-— re-read paced ≥60 s, NEVER minted). Sequencing mirrors the Dhan leg:
+— re-read paced ≥60 s, NEVER minted). ~~Sequencing mirrors the Dhan leg:
 the chain fires on the spot leg's watch signal after every spot fire,
 bounded by the ~2.5 s fallback timer; one request per underlying per
 minute, sequential, with a defensive 1 s min-gap (Groww documents no
-chain-specific rate rule). Groww counters mirror the Dhan names under the
+chain-specific rate rule).~~ **SUPERSEDED 2026-07-14 (the auto-ladder —
+`no-rest-except-live-feed-2026-06-27.md` §9.7):** the Groww chain leg
+fires on its OWN minute-boundary timer at close+300 ms — no spot signal,
+no fallback timer, no min-gap; the 3 underlyings fetch CONCURRENTLY
+within the wave (a demoted `two_wave` session adds a 350 ms intra-wave
+stagger; a FURTHER 429 drops to fully-sequential-within-wave — one whole
+per-underlying budget per slot, the fix-round MEDIUM-1 ladder floor).
+New CHAIN-02 stages: `stage="burst_demoted"` (`warn!`-level, edge-latched
+once per demotion level — a chain-leg HTTP 429 stepped the session's
+burst tier down; `tv_groww_rest_burst_demoted_total{level}`) and
+`stage="wave_task_failed"` (`error!`-level, unwind builds only — a wave
+fetch task failed to join; that underlying counts as failed for the
+minute, never silent — fix-round MEDIUM-3 documentation); the boot
+probe's inter-call pacing keeps its own 1 s spacing. Groww counters
+mirror the Dhan names under the
 `tv_groww_chain1m_*` prefix (`fetch_total{outcome}`, `close_to_data_ms`,
 `fetch_duration_ms`, `strikes_per_chain`, `legs_per_chain`,
 `payload_bytes`, `rate_limited_total`, `boundary_skipped_total`,
@@ -666,9 +722,10 @@ OVERLAP: a persist-failed minute with ok ≥ 1 can legitimately count
 toward BOTH edges (the M1 persist gate makes the escalation edge count
 it fully-failed while an empty sibling counts here) — two DISTINCT
 signals: persistence broken + vendor not serving one underlying. An
-auth-aborted fire (401 short-circuit — a global token condition, even
-after an earlier underlying succeeded) is a tracker HOLD: neither
-counts nor resets. At
+auth-aborted fire (any 401 in the wave — a global token condition, even
+when a sibling underlying succeeded in the same wave; under the §9.7
+auto-ladder there is no sequential short-circuit, the HOLD is applied
+after the wave) is a tracker HOLD: neither counts nor resets. At
 `GROWW_CHAIN_1M_UNDERLYING_NOT_SERVED_THRESHOLD` (10) consecutive
 counted minutes: ONE `error!(code = CHAIN-02,
 stage = "underlying_not_served", feed = "groww", underlying,

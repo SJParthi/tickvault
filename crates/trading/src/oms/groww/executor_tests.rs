@@ -702,3 +702,809 @@ fn ladder_delays_follow_the_2_5_10_30_60_then_60_schedule() {
     assert_eq!(ladder_delay_for_step(5), 60);
     assert_eq!(ladder_delay_for_step(99), 60);
 }
+
+// ---------------------------------------------------------------------------
+// Smart Orders (GTT/OCO) — executor integration (2026-07-16 directive)
+// ---------------------------------------------------------------------------
+
+use crate::oms::groww::smart_orders::{
+    GrowwCreateOcoReq, GttOrderLeg, OcoStopLossLeg, OcoTargetLeg, SmartModifyBody,
+    SmartModifyFields, SmartOrderCreate, SmartOrderError, SmartOrderGates, SmartOrderListPayload,
+    SmartOrderListQuery, SmartOrderPayload, SmartOrderStatus, SmartOrderType, StopLossLegOrderType,
+    TargetLegOrderType,
+};
+
+fn smart_gates_on() -> SmartOrderGates {
+    SmartOrderGates {
+        smart_orders_read: true,
+        smart_orders_write: true,
+        live_fire_requested: true, // inert without GROWW_ORDER_LIVE_FIRE
+        max_order_quantity: 100,
+        sibling_cancel_deadline_secs: 30,
+        reconcile_poll_secs: 15,
+    }
+}
+
+fn oco_create() -> SmartOrderCreate {
+    SmartOrderCreate::Oco(GrowwCreateOcoReq {
+        reference_id: "PLACEHOLDER0000".to_owned(),
+        smart_order_type: SmartOrderType::Oco,
+        segment: GrowwSegment::Fno,
+        trading_symbol: "NIFTY26JUL28500CE".to_owned(),
+        quantity: 75,
+        net_position_quantity: 75,
+        transaction_type: GrowwTransactionType::Sell,
+        target: OcoTargetLeg {
+            trigger_price: 12_200,
+            order_type: TargetLegOrderType::Limit,
+            price: Some(12_150),
+        },
+        stop_loss: OcoStopLossLeg {
+            trigger_price: 9_800,
+            order_type: StopLossLegOrderType::SlM,
+            price: None,
+        },
+        product_type: GrowwProduct::Nrml,
+        exchange: GrowwExchange::Nse,
+        duration: GrowwValidity::Day,
+    })
+}
+
+fn paper_smart_exec(tag: &str) -> GrowwOrderExecutor<NullTransport> {
+    let mut exec = GrowwOrderExecutor::new_paper(open_ledger(tag), cfg());
+    exec.set_smart_gates(smart_gates_on());
+    exec
+}
+
+#[tokio::test]
+async fn smart_place_paper_tracks_a_synthetic_id() {
+    let mut exec = paper_smart_exec("sm-place");
+    let out = exec
+        .place_smart_order(oco_create(), DATE, NOW_MS, true)
+        .await
+        .unwrap();
+    let PlaceResult::PaperAccepted { order_id } = out else {
+        panic!("expected PaperAccepted, got {out:?}");
+    };
+    assert!(order_id.starts_with("PAPER-TV"));
+    let book = exec.smart_book();
+    let guard = book.lock().await;
+    let t = guard.get(&order_id).expect("tracked");
+    assert_eq!(t.status, SmartOrderStatus::Active);
+    assert_eq!(t.smart_order_type, SmartOrderType::Oco);
+    assert_eq!(t.quantity, 75);
+}
+
+#[tokio::test]
+async fn smart_place_refused_when_write_gate_closed_or_market_closed() {
+    // Default gates = disabled() — fail-closed without set_smart_gates.
+    let mut exec = GrowwOrderExecutor::new_paper(open_ledger("sm-gate"), cfg());
+    let out = exec
+        .place_smart_order(oco_create(), DATE, NOW_MS, true)
+        .await;
+    assert!(matches!(
+        out,
+        Err(ExecError::Smart(SmartOrderError::WriteGateClosed))
+    ));
+    // Market closed refuses BEFORE the gate (session guard first).
+    let mut exec = paper_smart_exec("sm-closed");
+    let out = exec
+        .place_smart_order(oco_create(), DATE, NOW_MS, false)
+        .await;
+    assert!(matches!(out, Err(ExecError::MarketClosed)));
+}
+
+#[tokio::test]
+async fn smart_place_validation_uses_the_smart_gate_quantity_cap() {
+    let mut exec = GrowwOrderExecutor::new_paper(open_ledger("sm-qty"), cfg());
+    let mut gates = smart_gates_on();
+    gates.max_order_quantity = 10; // below the 75 requested
+    exec.set_smart_gates(gates);
+    let out = exec
+        .place_smart_order(oco_create(), DATE, NOW_MS, true)
+        .await;
+    assert!(matches!(
+        out,
+        Err(ExecError::Smart(SmartOrderError::QuantityRefused {
+            quantity: 75,
+            max: 10
+        }))
+    ));
+}
+
+#[tokio::test]
+async fn smart_place_refused_at_the_tracked_open_cap() {
+    let mut exec = paper_smart_exec("sm-cap");
+    let cap = tickvault_common::constants::GROWW_ORDER_MAX_TRACKED_OPEN_ORDERS;
+    for _ in 0..cap {
+        exec.place_smart_order(oco_create(), DATE, NOW_MS, true)
+            .await
+            .unwrap();
+    }
+    let out = exec
+        .place_smart_order(oco_create(), DATE, NOW_MS, true)
+        .await;
+    assert!(matches!(
+        out,
+        Err(ExecError::Smart(SmartOrderError::TrackedCapExceeded { .. }))
+    ));
+}
+
+#[tokio::test]
+async fn smart_modify_paper_applies_the_matrix_then_updates_the_book() {
+    let mut exec = paper_smart_exec("sm-mod");
+    let PlaceResult::PaperAccepted { order_id } = exec
+        .place_smart_order(oco_create(), DATE, NOW_MS, true)
+        .await
+        .unwrap()
+    else {
+        panic!("paper place");
+    };
+    // An OCO-immutable field is the typed GROWW-OCO-04 refusal, pre-HTTP.
+    let out = exec
+        .modify_smart_order(
+            &order_id,
+            SmartModifyFields {
+                trigger_price: Some(1),
+                ..Default::default()
+            },
+            DATE,
+            NOW_MS,
+            true,
+        )
+        .await;
+    assert!(matches!(
+        out,
+        Err(ExecError::Smart(SmartOrderError::ImmutableField {
+            smart_order_type: "OCO",
+            ..
+        }))
+    ));
+    // A legal OCO modify (quantity) is applied to the tracked book.
+    let out = exec
+        .modify_smart_order(
+            &order_id,
+            SmartModifyFields {
+                quantity: Some(50),
+                ..Default::default()
+            },
+            DATE,
+            NOW_MS,
+            true,
+        )
+        .await
+        .unwrap();
+    assert_eq!(out, MutationResult::Accepted);
+    let book = exec.smart_book();
+    let guard = book.lock().await;
+    let t = guard.get(&order_id).expect("tracked");
+    assert_eq!(t.quantity, 50);
+    assert_eq!(t.modifications, 1);
+}
+
+#[tokio::test]
+async fn smart_mutations_refuse_unknown_terminal_and_implausible_ids() {
+    let mut exec = paper_smart_exec("sm-elig");
+    let out = exec
+        .cancel_smart_order("gtt_missing", DATE, NOW_MS, true)
+        .await;
+    assert!(matches!(
+        out,
+        Err(ExecError::Smart(SmartOrderError::UnknownSmartOrder { .. }))
+    ));
+    let out = exec
+        .modify_smart_order(
+            "../etc",
+            SmartModifyFields {
+                quantity: Some(1),
+                ..Default::default()
+            },
+            DATE,
+            NOW_MS,
+            true,
+        )
+        .await;
+    assert!(matches!(
+        out,
+        Err(ExecError::Smart(SmartOrderError::ImplausibleSmartOrderId))
+    ));
+    // Cancel then cancel again — the second is AlreadyTerminal.
+    let PlaceResult::PaperAccepted { order_id } = exec
+        .place_smart_order(oco_create(), DATE, NOW_MS, true)
+        .await
+        .unwrap()
+    else {
+        panic!("paper place");
+    };
+    let out = exec
+        .cancel_smart_order(&order_id, DATE, NOW_MS, true)
+        .await
+        .unwrap();
+    assert_eq!(out, MutationResult::Accepted);
+    {
+        let book = exec.smart_book();
+        let guard = book.lock().await;
+        assert_eq!(
+            guard.get(&order_id).expect("tracked").status,
+            SmartOrderStatus::Cancelled
+        );
+    }
+    let out = exec.cancel_smart_order(&order_id, DATE, NOW_MS, true).await;
+    assert!(matches!(
+        out,
+        Err(ExecError::Smart(SmartOrderError::AlreadyTerminal { .. }))
+    ));
+}
+
+#[tokio::test]
+async fn smart_reconcile_is_read_gated_and_paper_is_a_no_op() {
+    // Read gate closed (gates default-disabled).
+    let mut exec = GrowwOrderExecutor::new_paper(open_ledger("sm-rec-gate"), cfg());
+    let out = exec
+        .reconcile_smart_orders(NOW_MS, true, &HashMap::new())
+        .await;
+    assert!(matches!(
+        out,
+        Err(ExecError::Smart(SmartOrderError::ReadGateClosed))
+    ));
+    // Outside market hours refuses even with the gate on.
+    let mut exec = paper_smart_exec("sm-rec-hours");
+    let out = exec
+        .reconcile_smart_orders(NOW_MS, false, &HashMap::new())
+        .await;
+    assert!(matches!(
+        out,
+        Err(ExecError::Smart(SmartOrderError::ReadGateClosed))
+    ));
+    // The paper lane returns an empty report (PAPER- ids have no broker side).
+    let out = exec
+        .reconcile_smart_orders(NOW_MS, true, &HashMap::new())
+        .await
+        .unwrap();
+    assert_eq!(out.polled, 0);
+    assert!(out.findings.is_empty());
+}
+
+// -- live-lane smart paths against the scripted transport --------------------
+
+#[derive(Default)]
+struct SmartScriptState {
+    create: VecDeque<TransportOutcome<SmartOrderPayload>>,
+    modify: VecDeque<TransportOutcome<SmartOrderPayload>>,
+    cancel: VecDeque<TransportOutcome<SmartOrderPayload>>,
+    get: VecDeque<TransportOutcome<SmartOrderPayload>>,
+}
+
+#[derive(Default)]
+struct SmartScriptedTransport {
+    st: StdMutex<SmartScriptState>,
+    create_refs: StdMutex<Vec<String>>,
+}
+
+impl OrderTransport for SmartScriptedTransport {
+    async fn create_order(
+        &self,
+        _req: &GrowwCreateOrderReq,
+        _token: &SecretString,
+        _receipt: &IntentReceipt,
+    ) -> TransportOutcome<GrowwMutationRespPayload> {
+        TransportOutcome::Ambiguous(AmbiguityReason::Timeout)
+    }
+    async fn modify_order(
+        &self,
+        _req: &GrowwModifyOrderReq,
+        _token: &SecretString,
+        _receipt: &IntentReceipt,
+    ) -> TransportOutcome<GrowwMutationRespPayload> {
+        TransportOutcome::Ambiguous(AmbiguityReason::Timeout)
+    }
+    async fn cancel_order(
+        &self,
+        _req: &GrowwCancelOrderReq,
+        _token: &SecretString,
+        _receipt: &IntentReceipt,
+    ) -> TransportOutcome<GrowwMutationRespPayload> {
+        TransportOutcome::Ambiguous(AmbiguityReason::Timeout)
+    }
+    async fn get_status_by_id(
+        &self,
+        _id: &str,
+        _segment: GrowwSegment,
+        _token: &SecretString,
+    ) -> TransportOutcome<GrowwOrderStatusPayload> {
+        TransportOutcome::Ambiguous(AmbiguityReason::Timeout)
+    }
+    async fn get_status_by_reference(
+        &self,
+        _r: &str,
+        _segment: GrowwSegment,
+        _token: &SecretString,
+    ) -> TransportOutcome<GrowwOrderStatusPayload> {
+        TransportOutcome::Ambiguous(AmbiguityReason::Timeout)
+    }
+    async fn get_order_detail(
+        &self,
+        _id: &str,
+        _segment: GrowwSegment,
+        _token: &SecretString,
+    ) -> TransportOutcome<GrowwOrderDetailPayload> {
+        TransportOutcome::Ambiguous(AmbiguityReason::Timeout)
+    }
+    async fn list_orders(
+        &self,
+        _segment: GrowwSegment,
+        _page: u32,
+        _page_size: u32,
+        _token: &SecretString,
+    ) -> TransportOutcome<Vec<GrowwOrderDetailPayload>> {
+        TransportOutcome::Success(Vec::new())
+    }
+    async fn get_trades(
+        &self,
+        _id: &str,
+        _segment: GrowwSegment,
+        _page: u32,
+        _page_size: u32,
+        _token: &SecretString,
+    ) -> TransportOutcome<Vec<GrowwTradeRow>> {
+        TransportOutcome::Success(Vec::new())
+    }
+}
+
+impl crate::oms::groww::api_client::SmartOrderTransport for SmartScriptedTransport {
+    async fn create_smart_order(
+        &self,
+        req: &SmartOrderCreate,
+        _token: &SecretString,
+        _receipt: &IntentReceipt,
+    ) -> TransportOutcome<SmartOrderPayload> {
+        self.create_refs
+            .lock()
+            .unwrap()
+            .push(req.reference_id().to_owned());
+        self.st
+            .lock()
+            .unwrap()
+            .create
+            .pop_front()
+            .unwrap_or(TransportOutcome::Ambiguous(AmbiguityReason::Timeout))
+    }
+    async fn modify_smart_order(
+        &self,
+        _smart_order_id: &str,
+        _body: &SmartModifyBody,
+        _token: &SecretString,
+        _receipt: &IntentReceipt,
+    ) -> TransportOutcome<SmartOrderPayload> {
+        self.st
+            .lock()
+            .unwrap()
+            .modify
+            .pop_front()
+            .unwrap_or(TransportOutcome::Ambiguous(AmbiguityReason::Timeout))
+    }
+    async fn cancel_smart_order(
+        &self,
+        _segment: GrowwSegment,
+        _smart_order_type: SmartOrderType,
+        _smart_order_id: &str,
+        _token: &SecretString,
+        _receipt: &IntentReceipt,
+    ) -> TransportOutcome<SmartOrderPayload> {
+        self.st
+            .lock()
+            .unwrap()
+            .cancel
+            .pop_front()
+            .unwrap_or(TransportOutcome::Ambiguous(AmbiguityReason::Timeout))
+    }
+    async fn get_smart_order(
+        &self,
+        _segment: GrowwSegment,
+        _smart_order_type: SmartOrderType,
+        _smart_order_id: &str,
+        _token: &SecretString,
+    ) -> TransportOutcome<SmartOrderPayload> {
+        self.st
+            .lock()
+            .unwrap()
+            .get
+            .pop_front()
+            .unwrap_or(TransportOutcome::Ambiguous(AmbiguityReason::Timeout))
+    }
+    async fn list_smart_orders(
+        &self,
+        _query: &SmartOrderListQuery,
+        _token: &SecretString,
+    ) -> TransportOutcome<SmartOrderListPayload> {
+        TransportOutcome::Ambiguous(AmbiguityReason::Timeout)
+    }
+}
+
+fn smart_payload(id: &str, status: &str) -> TransportOutcome<SmartOrderPayload> {
+    let json = format!(r#"{{"smart_order_id":"{id}","status":"{status}"}}"#);
+    TransportOutcome::Success(serde_json::from_str(&json).expect("payload"))
+}
+
+fn live_smart_exec(st: SmartScriptState, tag: &str) -> GrowwOrderExecutor<SmartScriptedTransport> {
+    let mut exec = GrowwOrderExecutor::new_live_for_test(
+        SmartScriptedTransport {
+            st: StdMutex::new(st),
+            create_refs: StdMutex::new(Vec::new()),
+        },
+        SecretString::from("test-token"),
+        cfg(),
+        open_ledger(tag),
+    );
+    exec.set_smart_gates(smart_gates_on());
+    exec
+}
+
+#[tokio::test]
+async fn smart_live_place_success_adopts_the_broker_id() {
+    let st = SmartScriptState {
+        create: VecDeque::from([smart_payload("oco_live1", "ACTIVE")]),
+        ..Default::default()
+    };
+    let mut exec = live_smart_exec(st, "sm-live-ok");
+    let out = exec
+        .place_smart_order(oco_create(), DATE, NOW_MS, true)
+        .await
+        .unwrap();
+    assert_eq!(
+        out,
+        PlaceResult::Accepted {
+            order_id: "oco_live1".to_owned()
+        }
+    );
+    let book = exec.smart_book();
+    assert!(book.lock().await.contains("oco_live1"));
+    // The executor overwrote the reference id with a fresh TV… id.
+    let refs = exec.transport.create_refs.lock().unwrap().clone();
+    assert_eq!(refs.len(), 1);
+    assert!(refs[0].starts_with("TV"));
+}
+
+#[tokio::test]
+async fn smart_live_place_reject_and_ambiguity_fail_closed() {
+    // Definitive reject → Rejected with the GA code.
+    let st = SmartScriptState {
+        create: VecDeque::from([TransportOutcome::Rejected {
+            http_status: 400,
+            ga_code: Some("GA001".to_owned()),
+            message: Some("bad".to_owned()),
+        }]),
+        ..Default::default()
+    };
+    let mut exec = live_smart_exec(st, "sm-live-rej");
+    let out = exec
+        .place_smart_order(oco_create(), DATE, NOW_MS, true)
+        .await
+        .unwrap();
+    assert_eq!(
+        out,
+        PlaceResult::Rejected {
+            ga_code: Some("GA001".to_owned())
+        }
+    );
+    // Ambiguity is UNRESOLVABLE (no by-reference lookup on this surface):
+    // fail-closed Unresolved, no retry, no adoption.
+    let st = SmartScriptState::default(); // empty queue -> Timeout ambiguous
+    let mut exec = live_smart_exec(st, "sm-live-amb");
+    let out = exec
+        .place_smart_order(oco_create(), DATE, NOW_MS, true)
+        .await
+        .unwrap();
+    assert_eq!(out, PlaceResult::Unresolved);
+    assert_eq!(
+        exec.transport.create_refs.lock().unwrap().len(),
+        1,
+        "never re-sent (the double-send class)"
+    );
+    let book = exec.smart_book();
+    assert_eq!(book.lock().await.open_count(), 0);
+}
+
+#[tokio::test]
+async fn smart_live_cancel_adopts_the_cancelled_echo() {
+    let st = SmartScriptState {
+        create: VecDeque::from([smart_payload("gtt_live1", "ACTIVE")]),
+        cancel: VecDeque::from([smart_payload("gtt_live1", "CANCELLED")]),
+        ..Default::default()
+    };
+    let mut exec = live_smart_exec(st, "sm-live-can");
+    let gtt = SmartOrderCreate::Gtt(crate::oms::groww::smart_orders::GrowwCreateGttReq {
+        reference_id: "PLACEHOLDER0000".to_owned(),
+        smart_order_type: SmartOrderType::Gtt,
+        segment: GrowwSegment::Cash,
+        trading_symbol: "RELIANCE".to_owned(),
+        quantity: 10,
+        trigger_price: 398_500,
+        trigger_direction: crate::oms::groww::smart_orders::TriggerDirection::Up,
+        order: GttOrderLeg {
+            order_type: GrowwOrderType::Market,
+            price: None,
+            transaction_type: GrowwTransactionType::Sell,
+        },
+        child_legs: None,
+        product_type: GrowwProduct::Cnc,
+        exchange: GrowwExchange::Nse,
+        duration: GrowwValidity::Day,
+    });
+    exec.place_smart_order(gtt, DATE, NOW_MS, true)
+        .await
+        .unwrap();
+    let out = exec
+        .cancel_smart_order("gtt_live1", DATE, NOW_MS, true)
+        .await
+        .unwrap();
+    assert_eq!(out, MutationResult::Accepted);
+    let book = exec.smart_book();
+    assert_eq!(
+        book.lock().await.get("gtt_live1").expect("tracked").status,
+        SmartOrderStatus::Cancelled
+    );
+}
+
+// -- adversarial round 1 fixes ------------------------------------------------
+
+#[tokio::test]
+async fn smart_live_place_implausible_ack_id_is_unresolved_never_adopted() {
+    // Finding 3: a 2xx SUCCESS echoing an IMPLAUSIBLE broker id must never
+    // enter the book (it would later be spliced into a URL path).
+    let st = SmartScriptState {
+        create: VecDeque::from([smart_payload("..%2Fevil", "ACTIVE")]),
+        ..Default::default()
+    };
+    let mut exec = live_smart_exec(st, "sm-live-badid");
+    let out = exec
+        .place_smart_order(oco_create(), DATE, NOW_MS, true)
+        .await
+        .unwrap();
+    assert_eq!(out, PlaceResult::Unresolved);
+    let book = exec.smart_book();
+    assert_eq!(
+        book.lock().await.open_count(),
+        0,
+        "implausible id never adopted"
+    );
+}
+
+#[tokio::test]
+async fn smart_modify_already_terminal_carries_the_raw_status() {
+    // Finding 7: the AlreadyTerminal refusal names the REAL terminal status
+    // (FAILED here), never a mislabeled catch-all.
+    let st = SmartScriptState {
+        create: VecDeque::from([smart_payload("oco_term1", "ACTIVE")]),
+        ..Default::default()
+    };
+    let mut exec = live_smart_exec(st, "sm-live-term");
+    exec.place_smart_order(oco_create(), DATE, NOW_MS, true)
+        .await
+        .unwrap();
+    {
+        let book = exec.smart_book();
+        book.lock()
+            .await
+            .get_mut("oco_term1")
+            .expect("tracked")
+            .status = SmartOrderStatus::Failed;
+    }
+    let err = exec
+        .modify_smart_order(
+            "oco_term1",
+            SmartModifyFields {
+                quantity: Some(25),
+                ..Default::default()
+            },
+            DATE,
+            NOW_MS,
+            true,
+        )
+        .await
+        .unwrap_err();
+    match err {
+        ExecError::Smart(SmartOrderError::AlreadyTerminal { status, .. }) => {
+            assert_eq!(status, "FAILED", "raw terminal label, never COMPLETED");
+        }
+        other => panic!("expected AlreadyTerminal, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn smart_live_cancel_backward_echo_is_parked_not_adopted() {
+    // Finding 8: a cancel-success echo carrying a BACKWARD status must be
+    // parked by the FSM, never blindly assigned.
+    let st = SmartScriptState {
+        create: VecDeque::from([smart_payload("oco_back1", "ACTIVE")]),
+        cancel: VecDeque::from([smart_payload("oco_back1", "ACTIVE")]),
+        ..Default::default()
+    };
+    let mut exec = live_smart_exec(st, "sm-live-back");
+    exec.place_smart_order(oco_create(), DATE, NOW_MS, true)
+        .await
+        .unwrap();
+    {
+        let book = exec.smart_book();
+        book.lock()
+            .await
+            .get_mut("oco_back1")
+            .expect("tracked")
+            .status = SmartOrderStatus::Triggered;
+    }
+    let out = exec
+        .cancel_smart_order("oco_back1", DATE, NOW_MS, true)
+        .await
+        .unwrap();
+    assert_eq!(out, MutationResult::Accepted);
+    let book = exec.smart_book();
+    assert_eq!(
+        book.lock().await.get("oco_back1").expect("tracked").status,
+        SmartOrderStatus::Triggered,
+        "backward echo parked — reconcile owns the divergence"
+    );
+}
+
+#[tokio::test]
+async fn smart_budget_denial_terminalizes_the_intent() {
+    // Finding 10: a budget-denied smart mutation must NOT leave a
+    // forever-open Recorded intent (it would block the order's
+    // mutation-in-flight index until restart).
+    let dir = temp_ledger_dir("sm-budget");
+    let ledger = IntentLedger::open(&dir, DATE).expect("ledger open");
+    let mut exec = GrowwOrderExecutor::new_live_for_test(
+        SmartScriptedTransport {
+            st: StdMutex::new(SmartScriptState {
+                // Enough scripted ACKs for every send that passes the budget.
+                create: VecDeque::from(
+                    (0..12)
+                        .map(|i| smart_payload(&format!("oco_b{i}"), "ACTIVE"))
+                        .collect::<Vec<_>>(),
+                ),
+                ..Default::default()
+            }),
+            create_refs: StdMutex::new(Vec::new()),
+        },
+        SecretString::from("test-token"),
+        cfg(),
+        ledger,
+    );
+    exec.set_smart_gates(smart_gates_on());
+    let mut denied = false;
+    for _ in 0..12 {
+        match exec
+            .place_smart_order(oco_create(), DATE, NOW_MS, true)
+            .await
+        {
+            Err(ExecError::RateBudgetExceeded(_)) => {
+                denied = true;
+                break;
+            }
+            Ok(_) => {}
+            Err(other) => panic!("unexpected error: {other:?}"),
+        }
+    }
+    assert!(
+        denied,
+        "the 5/sec mutation self-cap must deny within 12 rapid places"
+    );
+    drop(exec);
+    // Replay the ledger file: every SmartPlace intent must be TERMINAL —
+    // the denied one as resolved_not_landed, the sent ones as acked.
+    let file = std::fs::read_dir(&dir)
+        .expect("dir")
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| p.extension().is_some_and(|x| x == "ndjson"))
+        .expect("ledger file");
+    let buf = std::fs::read(&file).expect("read ledger");
+    let replay = crate::oms::groww::intent_ledger::replay_bytes(&buf).expect("replay");
+    let mut not_landed = 0_usize;
+    for s in replay.intents.values() {
+        assert_eq!(s.kind, IntentKind::SmartPlace);
+        assert!(
+            s.last_phase.is_terminal(),
+            "no forever-open intent after budget denial (got {:?})",
+            s.last_phase
+        );
+        if s.last_phase == IntentPhase::ResolvedNotLanded {
+            not_landed += 1;
+        }
+    }
+    assert_eq!(
+        not_landed, 1,
+        "exactly the denied place is resolved_not_landed"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// -- adversarial round 2, HIGH: reconcile GET id-mismatch is never adopted ----
+
+#[tokio::test]
+async fn smart_reconcile_foreign_id_echo_never_terminalizes_tracked_order() {
+    // A status GET response carrying a DIFFERENT smart_order_id than the one
+    // requested must be counted/degraded and dropped — never classified or
+    // applied (a foreign COMPLETED echo would silently terminalize a live OCO
+    // and silence the OCO-02 double-fill guard).
+    let st = SmartScriptState {
+        create: VecDeque::from([smart_payload("oco_hi1", "TRIGGERED")]),
+        // The GET returns a FOREIGN id with a terminal status.
+        get: VecDeque::from([smart_payload("oco_FOREIGN", "COMPLETED")]),
+        ..Default::default()
+    };
+    let mut exec = live_smart_exec(st, "sm-reconcile-idmm");
+    exec.place_smart_order(oco_create(), DATE, NOW_MS, true)
+        .await
+        .unwrap();
+    // Arm the episode: the tracked order is TRIGGERED (live, non-terminal).
+    {
+        let book = exec.smart_book();
+        let mut g = book.lock().await;
+        let t = g.get_mut("oco_hi1").expect("tracked");
+        t.status = SmartOrderStatus::Triggered;
+        t.triggered_at_ms = Some(NOW_MS);
+    }
+    let report = exec
+        .reconcile_smart_orders(NOW_MS + 1_000, true, &HashMap::new())
+        .await
+        .unwrap();
+    // Degraded with id_mismatch; the foreign payload never became a finding.
+    assert!(
+        report.degraded.contains(&"id_mismatch"),
+        "id mismatch must degrade the pass: {report:?}"
+    );
+    assert!(
+        report.findings.is_empty(),
+        "a mismatched payload must never be classified: {report:?}"
+    );
+    // The tracked order stays TRIGGERED (live) — NOT terminalized.
+    let book = exec.smart_book();
+    let g = book.lock().await;
+    let t = g.get("oco_hi1").expect("still tracked");
+    assert_eq!(
+        t.status,
+        SmartOrderStatus::Triggered,
+        "foreign COMPLETED echo must NOT terminalize the live OCO"
+    );
+}
+
+// -- round 3, finding 1: cancel-success foreign-id echo is never adopted ------
+
+#[tokio::test]
+async fn smart_cancel_foreign_id_echo_never_adopted() {
+    // Symmetric to the reconcile-GET guard: a cancel-success response carrying
+    // a DIFFERENT smart_order_id than the one cancelled must skip FSM adoption
+    // (a foreign COMPLETED/CANCELLED echo could otherwise terminalize the wrong
+    // tracked order). The mutation still Accepts (our cancel was acked); the
+    // echo is degrade-logged (OCO-05), never applied.
+    let st = SmartScriptState {
+        create: VecDeque::from([smart_payload("oco_fc1", "ACTIVE")]),
+        // Cancel echo returns a FOREIGN id with a terminal status.
+        cancel: VecDeque::from([smart_payload("oco_FOREIGN", "COMPLETED")]),
+        ..Default::default()
+    };
+    let mut exec = live_smart_exec(st, "sm-cancel-idmm");
+    exec.place_smart_order(oco_create(), DATE, NOW_MS, true)
+        .await
+        .unwrap();
+    {
+        let book = exec.smart_book();
+        book.lock()
+            .await
+            .get_mut("oco_fc1")
+            .expect("tracked")
+            .status = SmartOrderStatus::Triggered;
+    }
+    let out = exec
+        .cancel_smart_order("oco_fc1", DATE, NOW_MS, true)
+        .await
+        .unwrap();
+    assert_eq!(out, MutationResult::Accepted);
+    // The tracked order keeps its live status — the foreign echo never adopted.
+    let book = exec.smart_book();
+    assert_eq!(
+        book.lock().await.get("oco_fc1").expect("tracked").status,
+        SmartOrderStatus::Triggered,
+        "foreign cancel echo must NOT terminalize the tracked order"
+    );
+}

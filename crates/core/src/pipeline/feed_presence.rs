@@ -302,7 +302,7 @@ impl FeedPresenceRegistry {
         Self {
             enabled: AtomicBool::new(enabled),
             process_start_ist_nanos,
-            maps: std::array::from_fn(|_| papaya::HashMap::new()),
+            maps: std::array::from_fn(|_| papaya::HashMap::new()), // APPROVED: cold construction (once per process); papaya map, not std HashMap
             bits: std::array::from_fn(|_| word_plane()),
             slots: Mutex::new(SlotTable::default()),
             unregistered_folds: std::array::from_fn(|_| AtomicU64::new(0)),
@@ -380,7 +380,7 @@ impl FeedPresenceRegistry {
         let guard = self.maps[fi].pin();
         for reg in regs {
             let key = match &reg.pairing {
-                Some(p) => SlotKey::Paired(p.clone()),
+                Some(p) => SlotKey::Paired(p.clone()), // APPROVED: cold-path registration (once per feed per day), never the tick thread
                 None => SlotKey::Local(
                     u8::try_from(fi).unwrap_or(u8::MAX),
                     reg.security_id,
@@ -399,7 +399,7 @@ impl FeedPresenceRegistry {
                 table.meta.push(SlotMeta {
                     canonical_security_id: i64::try_from(reg.security_id).unwrap_or(i64::MAX),
                     segment_label: reg.segment_label,
-                    symbol: reg.symbol.clone(),
+                    symbol: reg.symbol.clone(), // APPROVED: cold-path registration, never the tick thread
                     canonical_from_dhan: matches!(feed, Feed::Dhan),
                     registered_day: [None; Feed::COUNT],
                 });
@@ -414,7 +414,7 @@ impl FeedPresenceRegistry {
             if matches!(feed, Feed::Dhan) && !meta.canonical_from_dhan {
                 meta.canonical_security_id = i64::try_from(reg.security_id).unwrap_or(i64::MAX);
                 meta.segment_label = reg.segment_label;
-                meta.symbol = reg.symbol.clone();
+                meta.symbol = reg.symbol.clone(); // APPROVED: cold-path registration, never the tick thread
                 meta.canonical_from_dhan = true;
             }
             // Fresh day for this (slot, feed): clear its 6 words so a
@@ -471,7 +471,7 @@ impl FeedPresenceRegistry {
             .slots
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut slots_out = Vec::new();
+        let mut slots_out = Vec::new(); // APPROVED: cold-path drain_day — once per scoreboard run, never per-tick
         // Feed::COUNT-sized (never hand-counted — the NTM 2-role→3-role
         // boot-panic lesson pinned in `feed.rs`; PR-D review round 1 LOW).
         let mut union = [[0u64; PRESENCE_WORDS_PER_SLOT]; Feed::COUNT];
@@ -540,7 +540,7 @@ impl FeedPresenceRegistry {
             slots_out.push(SlotCoverage {
                 canonical_security_id: meta.canonical_security_id,
                 segment_label: meta.segment_label,
-                symbol: meta.symbol.clone(),
+                symbol: meta.symbol.clone(), // APPROVED: cold-path drain_day — once per scoreboard run, never per-tick
                 mapped,
                 dhan_registered: dhan_day,
                 groww_registered: groww_day,
