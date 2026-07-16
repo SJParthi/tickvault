@@ -39,32 +39,37 @@ lane as close to each minute close T as the brokers' rate rules allow:
   parallel. Every fire still passes the per-(underlying, expiry) CAS
   min-spacing gate (≥3000 ms, monotonic domain) — in-cycle retries re-fire
   at burst + 3s, each a different key, so retries are concurrent too.
-  CONSERVATIVE combined-denial behavior (R2, 2026-07-15): a chain fire
-  deferred by the 1s COMBINED per-second budget re-fires only after the
-  FULL 3s chain spacing — the already-acquired CAS spacing slots stay
-  CONSUMED on a combined denial (the carried retry instant is the MAX of
-  both constraints) — a deliberate conservative-safe trade (the slower
-  re-fire can never violate the broker window), never a violation.
+  TWO-BUCKET budget model (the 2026-07-16 all-7 correction — §0b): chain
+  fires are governed SOLELY by that per-key gate (the option-chain API's
+  OWN budget); they neither consult nor consume the Data-API COMBINED
+  ring, so the R2 (2026-07-15) combined-denial arm is SUPERSEDED for
+  chains — a chain fire can no longer be deferred by the combined budget
+  at all.
 - **Dhan spots** (operator spec addition 2026-07-15; second-bucket packing
-  per the 2026-07-16 shape) fire as 4 single-symbol calls assigned to
-  1000ms SECOND BUCKETS by `spot_second_buckets(shape, tier)` — shape 0
-  bases the 2 decision-critical spots (NIFTY, BANKNIFTY) in the BURST
-  second beside the chains and SENSEX + INDIA VIX in the next second (the
-  honest 5+2 packing of the operator's "all 7 first second" under the
-  broker's 5/sec cap); shape 1 bases all 4 in second 2. The 2026-07-15
-  ADAPTIVE CONCURRENCY tiers then cap spots-per-second at 4/3/2/1, greedy
-  overflow spilling to later buckets (both brokers' candle endpoints are
-  single-symbol-per-request — never one batched HTTP request). Every fire
-  passes the spot ROLLING-1000ms-WINDOW gate (≤ `spot_window_cap`, default
-  4, hard-bounded 1..=5 — Dhan's 5/sec cap). Since verifier L1 (2026-07-15) EVERY Dhan fire —
-  chain, spot AND expiry-list — additionally records into ONE COMBINED
-  rolling-1000ms window (cap 5, Dhan's Data-API per-second hard budget)
-  inside `DhanGates`, checked-then-recorded atomically, so a chain fire +
-  a full spot group (+ an expiry fire) can never jointly exceed 5 Dhan
+  per the 2026-07-16 shape + the same-day all-7 correction) fire as 4
+  single-symbol calls assigned to 1000ms SECOND BUCKETS by
+  `spot_second_buckets(shape, tier)` — shape 0 bases ALL 4 spots in the
+  BURST second beside the 3 chains (the operator's literal "all 7
+  parallel at first second"; cap-legal under the two-bucket model — 4
+  spot fires ≤ the Data-API 5/sec bucket, the 3 chains in the
+  option-chain API's own per-key budget); shape 1 bases all 4 in the
+  second after the burst. The 2026-07-15 ADAPTIVE CONCURRENCY tiers then
+  cap spots-per-second at 4/3/2/1, greedy overflow spilling to later
+  buckets (both brokers' candle endpoints are single-symbol-per-request —
+  never one batched HTTP request). Every fire passes the spot
+  ROLLING-1000ms-WINDOW gate (≤ `spot_window_cap`, default 4,
+  hard-bounded 1..=5 — Dhan's 5/sec cap). Since verifier L1 (2026-07-15),
+  RE-SCOPED by the 2026-07-16 all-7 correction: every Dhan SPOT and
+  EXPIRY-LIST fire additionally records into ONE COMBINED rolling-1000ms
+  window (cap 5, Dhan's Data-API per-second hard budget) inside
+  `DhanGates`, checked-then-recorded atomically — CHAIN fires are
+  EXCLUDED (their budget is the per-(underlying, expiry) gate), so a full
+  spot group + an expiry fire can never jointly exceed 5 Data-API
   requests in any rolling second (the replay ledger asserts the COMBINED
-  cap, not just the per-class floors). Degrade one step after 2 CONSECUTIVE spot-dirty
-  (rate-limited) cycles; recover one step after 3 consecutive clean cycles
-  (both config-keyed, Assumed pending operator confirm).
+  spot+expiry cap plus the per-key chain floors). Degrade one step after
+  2 CONSECUTIVE spot-dirty (rate-limited) cycles; recover one step after
+  3 consecutive clean cycles (both config-keyed, Assumed pending operator
+  confirm).
 - **Groww** fires per its fallback-shape ladder (operator verbatim
   2026-07-16 two-rung prescription + the retained choice-3 last resort —
   §0b): rung 0 (default) = all 7 requests in parallel at T+0 (gate-free
@@ -77,11 +82,15 @@ lane as close to each minute close T as the brokers' rate rules allow:
   NEVER blocks the Groww data-complete predicate (coordinator-confirmed
   2026-07-15 — VIX stays advisory).
 - **Shape ladder** (2026-07-16 — replaces the retired pre-close anchor-shift
-  failure ladder): rung 0 ⇄ 1 between the primary 5+2 packing and the split
-  fallback, driven by the SAME streak thresholds the concurrency ladders use
-  (degrade after 2 CONSECUTIVE dirty cycles, recover after 3 consecutive
-  clean — dirty = RateLimited / Timeout / Transport arming classes);
-  RateLimited is NEVER blind-retried.
+  failure ladder; arming re-scoped by the same-day correction): rung 0 ⇄ 1
+  between the all-7 primary and the split fallback, driven by the SAME
+  streak thresholds the concurrency ladders use (degrade after 2
+  CONSECUTIVE dirty cycles — the operator's "tried that multiple times" —
+  recover after 3 consecutive clean; dirty = ≥1 RateLimited in the cycle,
+  the SOLE arming class — Timeout / Transport / Empty / QueueDelay NEVER
+  reshape); a RateLimited leg KEEPS its ONE bounded in-cycle retry
+  (through the gates, after per-key spacing) — never more than the
+  bounded budget, never a blind storm.
 - **Decision** per (lane, cycle minute): exactly-once latch, Decided XOR
   Skipped, spot provenance own → cross-source → chain-embedded, honest-skip at
   the lane cutoff. Dry-run day 1: both lanes run the `DryRunLoggingExecutor`
@@ -163,11 +172,41 @@ session — preserve exactly, do not paraphrase):**
 > applicable for different option [underlyings], clearly precisely
 > applicable for one and only same option chain expiry."
 
+**The same-day RULING CORRECTIONS (2026-07-16, relayed via the coordinator
+session — verbatim, superseding the first implementation pass):**
+
+Correction 1 — the Dhan primary is ALL 7 CONCURRENT (the interim "honest
+5+2 packing" reading is RETIRED as the primary):
+
+> "i clearly told you for dhan also as the primary all 7 parallel at first
+> second one and only when it fails or rate limited alone only then this
+> option chain first second and spot second."
+
+All-7 is cap-legal via the TWO-BUCKET budget model: the 4 spot fires sit
+in the Data-API 5/sec bucket (4 ≤ 5, enforced by the COMBINED
+spot+expiry rolling ring); the 3 chain fires sit in the option-chain
+API's OWN per-(underlying, expiry) budget (different underlyings
+explicitly concurrent per the directive) — the burst breaches NEITHER.
+The combined ring is therefore RE-SCOPED to spot + expiry-list fires
+ONLY; chain fires are governed solely by the per-key ≥3s CAS gate.
+
+Correction 2 — demotion is RATE-LIMIT-ONLY, after MULTIPLE attempts:
+
+> "see that too instantly dont commit — one and only when you tried that
+> multiple times and gets rate limited alone alone fallback."
+
+`RateLimited` is the SOLE ladder-arming class (Timeout / Transport /
+Empty / QueueDelay never reshape); "multiple times" = the existing
+2-consecutive-dirty-cycles trigger; and a rate-limited leg KEEPS its one
+bounded in-cycle retry (through the gates, after per-key spacing) —
+reversing the first pass's "429 is never blind-retried in-cycle" rule.
+One retry per leg per cycle, never more.
+
 **The new slot tables (all instants relative to each minute close T):**
 
 | Broker | Rung | Second 1 | Second 2 | Second 3 |
 |---|---|---|---|---|
-| Dhan | 0 (primary) | 3 chains CONCURRENT + NIFTY & BANKNIFTY spots (5 fires — the honest packing of "all 7 first second" under Dhan's 5/sec cap) | SENSEX + INDIA VIX spots | — |
+| Dhan | 0 (primary) | ALL 7 CONCURRENT — 3 chains + all 4 spots (the operator's "all 7 parallel at first second"; two-bucket cap-legal) | — | — |
 | Dhan | 1 (fallback) | 3 chains concurrent | ALL 4 spots | — |
 | Groww | 0 (primary) | all 7 requests parallel at T+0 | — | — |
 | Groww | 1 (fallback) | 3 chains at :01 | all 4 spots at :02 | — |
@@ -190,9 +229,11 @@ min-spacing gate (the directive: the 3s rule binds the SAME chain expiry
 only), and the lender-aware cross-fill freshness widening
 (CADENCE-XFILL-RUNG-1 — every fire is post-close, so the plain base
 T−5000 floor suffices; coordinator addendum item 3). KEPT as THE binding
-Dhan enforcement: the per-(underlying, expiry) ≥3s gate, the combined
-rolling-1000ms cap-5 window, the expiry-wave :30 mid-minute anchor + the
-1-per-rolling-second expiry spacing, and the QueueDelay non-arming rule.
+Dhan enforcement: the per-(underlying, expiry) ≥3s gate (the SOLE chain
+budget per the all-7 correction), the combined rolling-1000ms cap-5
+window (RE-SCOPED to spot + expiry-list fires only), the expiry-wave :30
+mid-minute anchor + the 1-per-rolling-second expiry spacing, and the
+QueueDelay non-arming rule.
 The `ladder_shift` stage + `tv_cadence_ladder_rung` gauge +
 `tv_cadence_ladder_shifts_total` counter are replaced by
 `dhan_shape_shift` / `tv_cadence_dhan_shape_step` /
@@ -248,7 +289,7 @@ EXCEPT `rate_limited`, which fires per-request by design (see below):
 | stage | Meaning |
 |---|---|
 | `fetch_failed` | ≥1 chain/spot request on the lane ended Timeout / Transport / Auth / Malformed AFTER the retry budget (Dhan: no in-cycle retry admitted / the retry itself failed; Groww: the fallback attempt failed) with the cell still missing — never a first-attempt-then-retried-OK blip, and never the Empty class (that has its own stages below) |
-| `rate_limited` | a broker 429 arrived DESPITE the gates — per-request (rare by construction; every occurrence is a gate-bug signal worth its own line), arms the ladder, NEVER blind-retried |
+| `rate_limited` | a broker 429 arrived DESPITE the gates — per-request (rare by construction; every occurrence is a gate-bug signal worth its own line), arms the shape ladder (the SOLE arming class per the 2026-07-16 correction) and keeps its ONE bounded in-cycle retry through the gates — never more than the bounded budget, never a blind storm |
 | `spot_empty` | a spot leg returned 2xx-without-data (the Dhan 200-empty saga class; EITHER lane — dry-run returns Empty on every fire by design, see the dry-run note below); does NOT arm the ladder |
 | `chain_empty` | a chain leg returned 2xx-without-usable-data (EITHER lane); does NOT arm the ladder — kept distinct from `fetch_failed` so a 200-empty is never misread as a transport failure |
 | `groww_fallback` | the Groww T+800 verdict found failed burst legs — the sequential fallback engaged |
@@ -257,7 +298,7 @@ EXCEPT `rate_limited`, which fires per-request by design (see below):
 | `moneyness_unknown` | ≥1 underlying's fold classified Unknown (spot unusable / rows unclassifiable / registry snapshot refused by the decide-time guard: unconfirmed publish, wrong minute, stale, or the boot sentinel) |
 | `queue_delay` | a fetch was refused by the SHARED `dhan_data_api_limiter`'s queue deadline (SELF-INFLICTED pacing — our own defense-in-depth limiter, not the broker; F1(iii) 2026-07-15). Stage-tagged distinctly, NEVER folded into `fetch_failed`, NEVER arms any ladder |
 | `expiry_unresolved` | TWO emission points share this stage: (a) the per-cycle coalesced flag — ≥1 chain request was stamped `expiry_yyyymmdd = None` (the day-locked store has no policy date yet; the scheduler NEVER guesses — the executor impl may fall back to its warmup expiry; ALWAYS present in dry-run, where every expiry-list fetch returns Empty); (b) the resolution loop's EDGE-LATCHED deadline page — ONE `error!` per (broker, underlying) per IST day the instant `expiry_deadline_secs_of_day_ist` (default 08:55) passes unresolved; the lanes run degraded meanwhile and the background retry continues at `expiry_retry_interval_ms` until session end (the deadline gates the PAGE, never the attempts, and a post-deadline BOOT requires ≥2 consecutive failed waves before the page — E4, 2026-07-15; R3, 2026-07-15: waves count REAL dispatched attempts per pair only — a disabled-lane or gate-deferred iteration never advances the threshold). FALLING EDGE (E3, 2026-07-15): a LATER successful resolution for a pair whose page HAD fired emits one coded recovery `info!` (`stage = "expiry_resolved_late"` on the same CADENCE-01 code — no new variant) + `tv_cadence_expiry_resolved_late_total{broker, underlying}`, at most once per pair per day (first write wins) |
-| `expiry_disagreement` | both brokers resolved the day's policy expiry for one underlying and the dates DIFFER — **Dhan WINS for keying BOTH lanes** (exchange-sourced expirylist authority); edge-latched ONCE per (underlying, day); both raw dates ride the payload + the store's provenance view (`tv_cadence_expiry_disagreement_total{underlying}`) |
+| `expiry_disagreement` | both brokers resolved the day's policy expiry for one underlying and the dates DIFFER — **Dhan WINS for keying BOTH lanes** (exchange-sourced expirylist authority); edge-latched ONCE per (underlying, day); both raw dates ride the payload + the store's provenance view (`tv_cadence_expiry_disagreement_total{underlying}`). SINCE 2026-07-16 (R6) the same edge ALSO dispatches the REAL typed `CadenceExpiryDisagreement` HIGH Telegram page (authority: `dhan-rest-only-noise-lock-2026-07-14.md` §2.2) — the ONE cadence signal that pages directly today |
 | `expiry_rate_limited` | an expiry-list fetch returned a broker 429 (verifier L2, 2026-07-15 — was `debug!`-only): one coded `warn!` per occurrence + `tv_cadence_expiry_rate_limited_total{broker}`; never blind-retried in-wave — the next `expiry_retry_interval_ms` wave re-attempts THROUGH the gates. Dhan expiry fires pass `DhanGates::try_acquire_expiry` (the L1 COMBINED 5-per-rolling-second budget + a 1-per-rolling-second expiry spacing) BEFORE dispatch, so a Dhan expiry 429 despite the gates is a gate-bug / shared-budget-co-tenant signal; a gate deferral skips the fire to the next wave (`tv_cadence_expiry_gate_deferred_total{broker}` — a deferral, never a violation). Groww expiry fires stay ungated by design (no Groww rate rule) |
 | `ladder_exhausted` | the failure ladder hit its max rung (5) — edge-latched ONCE per episode, re-armed by a clean cycle |
 
@@ -339,7 +380,7 @@ self-corrected or self-reported; the operator inspects trends).
 
 | stage | Meaning |
 |---|---|
-| `dhan_shape_shift` | the 2026-07-16 Dhan SHAPE ladder moved a rung (0 = primary 5+2 packing ⇄ 1 = split fallback; `tv_cadence_dhan_shape_shifts_total{direction}` — `up` = degraded toward the fallback, `down` = recovered; the NEXT cycle uses the new shape). Replaces the retired `ladder_shift` anchor-shift stage |
+| `dhan_shape_shift` | the 2026-07-16 Dhan SHAPE ladder moved a rung (0 = the all-7 primary ⇄ 1 = split fallback; `tv_cadence_dhan_shape_shifts_total{direction}` — `up` = degraded toward the fallback, `down` = recovered; the NEXT cycle uses the new shape; armed by RateLimited ONLY after 2 consecutive dirty cycles). Replaces the retired `ladder_shift` anchor-shift stage |
 | `spot_concurrency_shift` | the 2026-07-15 Dhan spot concurrency ladder moved a step (`tv_cadence_spot_concurrency_shifts_total{direction}`; `up` = degraded toward less concurrency, `down` = recovered toward step 0 — the NEXT cycle uses the new grouping) |
 | `groww_shape_shift` | the 2026-07-15 Groww three-choice fallback-shape ladder moved a choice (`tv_cadence_groww_shape_shifts_total{direction}`; same direction convention — the NEXT cycle uses the new wave shape) |
 | `late_wake` | a cycle wake fired ≥1000 ms after its target instant (scheduler starvation / suspend) — the cycle proceeds with the remaining slots |
@@ -360,10 +401,11 @@ self-corrected or self-reported; the operator inspects trends).
    bug — capture the panic backtrace in `data/logs/errors.jsonl.*`. Release
    builds abort on panic (`panic = "abort"`) — the respawn arms are
    unwind-build self-heal paths, the TICK-FLUSH-01 honesty note.
-4. `gate_deferred_nominal` — do NOT widen spacings; the 2026-07-16 burst
-   packing is validated cap-legal at boot (`dhan_burst_offset_ms` band +
-   the 5+2 packing ≤ the combined cap by construction), so a live
-   occurrence implies a runtime retry interleaving bug — file it.
+4. `gate_deferred_nominal` — do NOT widen spacings; the 2026-07-16 all-7
+   burst is validated cap-legal at boot (`dhan_burst_offset_ms` band +
+   the two-bucket split: 4 nominal spots ≤ the combined spot+expiry cap,
+   chains per-key only — by construction), so a live occurrence implies a
+   runtime retry interleaving bug — file it.
 
 **Honest-envelope note — `tv_cadence_gate_deferred_total` is TREND-ONLY
 (verifier F5, dated 2026-07-15):** the deferred counter has NO alarm, and the
@@ -426,10 +468,10 @@ existing floors — never fight them, never bypass them:
    expiry-LESS fire is strictly MORE conservative (subsumption, pinned by
    `test_cadence_gate_expiryless_fire_subsumes_expiry_stamp`).
 3. **Type self-inflicted pacing-queue deadline misses as
-   `CadenceFetchError::QueueDelay`** — NEVER `Timeout`. A queue delay is
-   SELF-INFLICTED pacing (our own machinery — e.g. a legacy-path shared
-   limiter, an executor-internal queue), not a broker signal: it is
-   stage-tagged distinctly
+   `CadenceFetchError::QueueDelay`** — NEVER `Timeout`.
+   A queue delay is SELF-INFLICTED pacing (our own machinery — e.g. a
+   legacy-path shared limiter, an executor-internal queue), not a broker
+   signal: it is stage-tagged distinctly
    (`queue_delay`), excluded from `fetch_failed`, and NON-ARMING for every
    ladder (`failure_arms_ladder` refuses it — implemented NOW with the
    variant, tested in `ladder.rs`; arming on it would let our own
@@ -527,17 +569,18 @@ double-count the production pin.)
 > "100% inside the tested envelope, with ratcheted regression coverage: the
 > zero-429 property is STRUCTURAL — every Dhan chain fire (primary, retry, at
 > either shape rung) passes its pure per-(underlying, expiry) CAS
-> min-spacing gate, every Dhan spot fire passes the rolling-1000ms-window
-> gate (≤ `spot_window_cap` per sliding second), and EVERY Dhan fire passes
-> the combined cap-5 rolling-second ring (the 2026-07-16 binding
-> cadence-lane pacing), all in the MONOTONIC domain, or defers; the
-> deterministic replay proptest
+> min-spacing gate (the SOLE chain budget under the 2026-07-16 two-bucket
+> model), and every Dhan spot + expiry-list fire passes both the
+> rolling-1000ms spot window (≤ `spot_window_cap` per sliding second) and
+> the combined cap-5 spot+expiry rolling-second ring (the 2026-07-16
+> binding cadence-lane Data-API pacing), all in the MONOTONIC domain, or
+> defers; the deterministic replay proptest
 > (`crates/core/tests/cadence_zero_429_replay.rs`) drives 64-cycle days through
 > skew/jitter/failure/restart permutations — INCLUDING every (Dhan shape
 > rung × concurrency tier × Groww shape) transition — and asserts zero
 > per-(underlying, expiry) spacing violations, never
-> more than `spot_window_cap` spot fires (nor 5 combined Dhan fires) in ANY
-> rolling 1000ms window,
+> more than `spot_window_cap` spot fires (nor 5 combined spot+expiry Dhan
+> fires) in ANY rolling 1000ms window,
 > zero nominal-slot denials, exactly 1 decision per (lane, cycle),
 > exactly-once snapshot publication per successful chain fetch, and a
 > non-vacuous 64-full-cycle activity floor. The 'no DECIDED outcome past the
@@ -551,7 +594,8 @@ double-count the production pin.)
 > NOT claimed:
 > that the BROKER never 429s — a shared-budget co-tenant (BruteX) or a
 > broker-side tightening can still produce one, which is typed
-> `rate_limited`, arms the ladder, and is never blind-retried; that dry-run
+> `rate_limited`, arms the ladder (the sole arming class), and gets ONE
+> bounded in-cycle retry through the gates — never a storm; that dry-run
 > emits decisions — the `DryRunLoggingExecutor` returns Empty by design and
 > every dry-run minute honest-skips; that the wall-clock targets are exact —
 > `late_wake`/`boundary_skipped` are measured and coalesced, never hidden. The
