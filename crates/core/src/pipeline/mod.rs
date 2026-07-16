@@ -19,6 +19,7 @@
 //! active snapshots are meaningless — there are only 4 instruments.
 
 pub mod boot_ordering_gate;
+pub mod chain_day_store;
 pub mod chain_snapshot;
 // Candle-engine re-architecture #T1b: `candle_aggregator` (Engine A)
 // DELETED — Engine B (the multi-TF aggregator) is the only candle engine.
