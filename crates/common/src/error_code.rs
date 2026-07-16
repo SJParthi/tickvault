@@ -2615,7 +2615,11 @@ mod tests {
         // log-sink-only, High, auto-triage-safe) => 155 (both 153->154
         // bumps — Cluster F + FOLD-01 — landed concurrently; mechanically
         // recounted at this merge).
-        assert_eq!(ErrorCode::all().len(), 155);
+        // 2026-07-16 (RAM residency stores, PR-2 of the same directive):
+        // +1 RAMSTORE-01 (RamStore01Degraded — spot/chain RAM store
+        // degrade; log-sink-only, High, auto-triage-safe) => 156
+        // (mechanically recounted at this rebase onto main's 155).
+        assert_eq!(ErrorCode::all().len(), 156);
     }
 
     #[test]
