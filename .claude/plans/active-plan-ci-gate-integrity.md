@@ -124,6 +124,9 @@ so a revert must be paired with an issue re-flagging the Critical finding.
 - [x] Review round-2 fixes: fail-closed merge-base arm at all three sites (no full-tree fallback), pre-tool-dispatch harness timeout 300s + budget-honesty header note, secret-scan divisor ALL_COUNT/2, message + plan truthfulness
   - Files: .claude/hooks/pre-push-gate.sh, .claude/hooks/pre-pr-gate.sh, scripts/git-hooks/pre-push, .claude/settings.json, .claude/plans/active-plan-ci-gate-integrity.md
   - Tests: bash -n on all three scripts, JSON validity, push-range list-build replication
+- [x] Approve main's #[allow(async_fn_in_trait)] (from merged #1602) exposed by the now-honest scanner
+  - Files: crates/trading/src/oms/groww/api_client.rs
+  - Tests: N/A (comment-only APPROVED token, scanner contract)
 
 ## Per-Item Guarantee Matrix
 
