@@ -207,11 +207,13 @@ impl TfRing {
             _ => false,
         };
         if self.bars.is_empty() {
-            for bar in bars {
-                if self.bars.len() == self.capacity {
-                    out.dropped_over_window += bars.len() - out.recorded;
-                    return out;
-                }
+            // Empty-ring overflow keeps the NEWEST `capacity` bars and
+            // drops the OLDEST prefix (PR-2 round-1 LOW fix): eviction
+            // direction must match the ring's front-eviction semantics —
+            // stale history never displaces newer bars.
+            let skip = bars.len().saturating_sub(self.capacity);
+            out.dropped_over_window = skip;
+            for bar in &bars[skip..] {
                 self.bars.push_back(*bar);
                 out.recorded += 1;
             }
@@ -651,6 +653,33 @@ mod tests {
                 .map(|b| b.close),
             Some(555.0)
         );
+    }
+
+    #[test]
+    fn test_spot_bar_store_record_day_block_empty_ring_overflow_keeps_newest() {
+        // PR-2 round-1 LOW: a block LARGER than capacity into an EMPTY
+        // ring must keep the NEWEST `capacity` bars and drop the OLDEST
+        // prefix — never the old keep-oldest/drop-newest direction.
+        let store = SpotBarStore::new(1);
+        let cap = bars_per_day(TfIndex::M30) as usize; // 13
+        let mut bars = Vec::with_capacity(cap + 2);
+        for i in 0..(cap as u32 + 2) {
+            bars.push(bar(OPEN0 + i * 1_800, f64::from(i)));
+        }
+        let out = store.record_day_block(key(), TfIndex::M30, &bars);
+        assert_eq!(out.recorded, cap, "exactly capacity bars recorded");
+        assert_eq!(out.dropped_over_window, 2, "the 2 OLDEST bars dropped");
+        // The oldest two are absent; the newest survives.
+        assert!(store.bar_at(key(), TfIndex::M30, OPEN0).is_none());
+        assert!(store.bar_at(key(), TfIndex::M30, OPEN0 + 1_800).is_none());
+        assert_eq!(
+            store
+                .bar_at(key(), TfIndex::M30, OPEN0 + (cap as u32 + 1) * 1_800)
+                .map(|b| b.close),
+            Some(f64::from(cap as u32 + 1)),
+            "the NEWEST bar must be resident"
+        );
+        assert_eq!(store.stats().dropped_over_window, 2);
     }
 
     #[test]
