@@ -1,14 +1,16 @@
 //! Source-scan ratchet (Z+ L4 PREVENT / L5 AUDIT) pinning that the
 //! judge-locked cadence scheduler (2026-07-14; CADENCE-01/02/03) is wired
-//! into BOTH main.rs boot paths and that the boot module keeps its
+//! into the main.rs boot path and that the boot module keeps its
 //! config gate + once-per-process guard + dry-run executors.
 //!
-//! The dual-spawn topology mirrors `spawn_tf_consistency_tasks` (the
-//! 2026-07-10 hostile-review CRITICAL): the FAST crash-recovery arm
-//! `return run_shutdown_fast(...)`s and never reaches the process-global
-//! prefix, so the scheduler must be spawned on BOTH arms (the
-//! once-per-process AtomicBool inside `spawn_cadence_scheduler` makes the
-//! dual spawn safe).
+//! PR-C2 re-shape (2026-07-13, operator retirement directive —
+//! websocket-connection-scope-lock.md "2026-07-13 Amendment", adopted at
+//! the 2026-07-16 rebase onto post-#1540 main): the FAST crash-recovery
+//! arm (and its `return run_shutdown_fast(` exit) DIED with the Dhan
+//! live-WS lane, so the tf_consistency-precedent dual-spawn shape
+//! collapses to the single process-global prefix call. The
+//! dual-spawn-safe once-guard inside `spawn_cadence_scheduler` is
+//! unchanged (defense-in-depth, exactly like the tf_consistency guard).
 //!
 //! Mirrors the codebase's `*_wiring_guard` pattern
 //! (`tf_consistency_wiring_guard.rs`, `spot_1m_rest_wiring_guard.rs`).
@@ -23,44 +25,19 @@ fn app_src(rel: &str) -> String {
     fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
 }
 
-/// Byte offset of the CODE-form fast-arm return (see
-/// `tf_consistency_wiring_guard.rs` for the doc-comment anchor rationale).
-fn fast_arm_return_offset(src: &str) -> usize {
-    src.find("return run_shutdown_fast(\n")
-        .expect("main.rs must contain the FAST-arm `return run_shutdown_fast(` call")
-}
-
 #[test]
-fn test_spawn_cadence_scheduler_is_wired_into_both_main_boot_paths() {
+fn test_spawn_cadence_scheduler_is_wired_into_main_boot_path() {
     let src = app_src("src/main.rs");
     // The fn is DEFINED in cadence_boot.rs, so every main.rs mention is a
-    // call site. Exactly two: fast arm + process-global prefix.
+    // call site. Exactly one on the single boot path (PR-C2 — the FAST
+    // crash-recovery arm is deleted; the tf_consistency guard precedent).
     let call_count = src.matches("spawn_cadence_scheduler(").count();
     assert_eq!(
-        call_count, 2,
-        "main.rs must call spawn_cadence_scheduler(...) EXACTLY twice \
-         (fast crash-recovery arm + process-global prefix — the \
-         tf_consistency dual-spawn precedent); found {call_count}."
-    );
-
-    let fast_return = fast_arm_return_offset(&src);
-    let first = src
-        .find("spawn_cadence_scheduler(")
-        .expect("first call site must exist");
-    let last = src
-        .rfind("spawn_cadence_scheduler(")
-        .expect("second call site must exist");
-    assert!(
-        first < fast_return,
-        "one spawn_cadence_scheduler call must precede the FAST-arm \
-         `return run_shutdown_fast(` (byte {fast_return}), else a \
-         crash-restart boot never spawns the scheduler; first call at \
-         byte {first}."
-    );
-    assert!(
-        last > fast_return,
-        "one spawn_cadence_scheduler call must follow the FAST-arm return \
-         (the process-global prefix site); last call at byte {last}."
+        call_count, 1,
+        "main.rs must call spawn_cadence_scheduler(...) EXACTLY once \
+         (the single process-global boot prefix since PR-C2); found \
+         {call_count} — zero kills the scheduler; two would rely on the \
+         once-guard instead of the boot shape."
     );
 }
 
@@ -82,7 +59,8 @@ fn test_spawn_cadence_scheduler_threads_config_calendar_feed_runtime() {
         checked += 1;
         from = abs + 1;
     }
-    assert_eq!(checked, 2, "expected exactly 2 call sites to check");
+    // PR-C2 (2026-07-13): single call site on the single boot path.
+    assert_eq!(checked, 1, "expected exactly 1 call site to check");
 }
 
 #[test]
