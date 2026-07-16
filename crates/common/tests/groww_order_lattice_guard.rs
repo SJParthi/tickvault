@@ -90,6 +90,12 @@ fn test_gate1_groww_orders_config_defaults_all_off() {
         cfg.max_order_quantity, 0,
         "max_order_quantity must default 0 (refuse-all) pending the PR-0′ operator answer"
     );
+    // Order-push Stage A (2026-07-16): the receive-only push channel ships
+    // dark by default.
+    assert!(
+        !cfg.order_push_enabled,
+        "order_push_enabled must default off (Gate 1)"
+    );
 }
 
 #[test]
@@ -111,6 +117,8 @@ fn test_gate1_base_toml_groww_orders_keys_all_false() {
         "smart_orders_read",
         "smart_orders_write",
         "paper_enabled",
+        // Order-push Stage A (2026-07-16): the push channel ships dark.
+        "order_push_enabled",
     ] {
         let false_line = format!("{key} = false");
         let true_line = format!("{key} = true");

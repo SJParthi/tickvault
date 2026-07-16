@@ -40,6 +40,13 @@ pub enum WsType {
     /// cleanly, and re-using a Dhan label (`main_feed`/`order_update`) would
     /// silently mix two brokers in operator filters. Pairs with `feed='groww'`.
     GrowwBridge,
+    /// The Groww order/position PUSH channel (Stage A, 2026-07-16) — the
+    /// receive-only NATS-over-WS order/position-update session. A distinct
+    /// `ws_type` keeps the broker + purpose meaning of the SYMBOL honest:
+    /// `where ws_type='groww_order_update'` reads cleanly and never mixes
+    /// with the Dhan `order_update` label or the retired market-data
+    /// `groww_bridge` rows. Pairs with `feed='groww'`.
+    GrowwOrderUpdate,
 }
 
 impl WsType {
@@ -52,19 +59,21 @@ impl WsType {
             Self::Depth200 => "depth_200",
             Self::OrderUpdate => "order_update",
             Self::GrowwBridge => "groww_bridge",
+            Self::GrowwOrderUpdate => "groww_order_update",
         }
     }
 
     /// All variants — lets tests assert exhaustiveness + wire-label uniqueness
     /// without drifting from the enum.
     #[must_use]
-    pub const fn all() -> [WsType; 5] {
+    pub const fn all() -> [WsType; 6] {
         [
             Self::MainFeed,
             Self::Depth20,
             Self::Depth200,
             Self::OrderUpdate,
             Self::GrowwBridge,
+            Self::GrowwOrderUpdate,
         ]
     }
 }
@@ -192,7 +201,8 @@ mod tests {
                 "depth_20",
                 "depth_200",
                 "order_update",
-                "groww_bridge"
+                "groww_bridge",
+                "groww_order_update"
             ]
         );
         // No two variants share a wire label.
@@ -227,7 +237,7 @@ mod tests {
     fn test_all_arrays_match_variant_counts() {
         // If a variant is added, `all()` must be updated — these pin the count so
         // a new WS type / event kind cannot silently escape the audit schema.
-        assert_eq!(WsType::all().len(), 5);
+        assert_eq!(WsType::all().len(), 6);
         assert_eq!(WsEventKind::all().len(), 7);
     }
 

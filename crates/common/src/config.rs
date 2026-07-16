@@ -1119,6 +1119,12 @@ pub struct GrowwOrdersConfig {
     /// hardcoded.
     #[serde(default)]
     pub max_order_quantity: i64,
+    /// Receive-only order/position PUSH channel (Stage A, 2026-07-16) —
+    /// paper-mode observability of broker-pushed order/position updates.
+    /// Default OFF. Places NO order; a config value alone can never fire
+    /// a mutation (the §39.2 lattice is untouched).
+    #[serde(default)]
+    pub order_push_enabled: bool,
 }
 
 fn default_groww_oco_reconcile_poll_secs() -> u64 {
@@ -1147,6 +1153,7 @@ impl Default for GrowwOrdersConfig {
             oco_sibling_cancel_deadline_secs: default_groww_oco_sibling_cancel_deadline_secs(),
             paper_enabled: false,
             max_order_quantity: 0,
+            order_push_enabled: false,
         }
     }
 }
@@ -3201,6 +3208,12 @@ mod tests {
             cfg.max_order_quantity, 0,
             "max_order_quantity must default 0 (refuse-all) pending the operator's 0-vs-1 answer"
         );
+        // Order-push Stage A (2026-07-16): the receive-only push channel
+        // defaults off.
+        assert!(
+            !cfg.order_push_enabled,
+            "order_push_enabled must default off (Gate 1) — the push channel is dark by default"
+        );
     }
 
     /// PR-0 / Smart Orders area (2026-07-15): an ABSENT `[groww_orders]`
@@ -3209,7 +3222,7 @@ mod tests {
     /// `#[serde(default…)]` attribute — which would make an absent field a
     /// hard deserialize ERROR (the two OCO cadences) or silently zero a u64 —
     /// fails the build. (`GrowwOrdersConfig` derives no `PartialEq`, so the
-    /// eleven fields are compared explicitly against `Default`.)
+    /// twelve fields are compared explicitly against `Default`.)
     #[test]
     fn test_groww_orders_config_absent_section_serde_parity() {
         let parsed: GrowwOrdersConfig = toml::from_str("")
@@ -3229,6 +3242,7 @@ mod tests {
         );
         assert_eq!(parsed.paper_enabled, def.paper_enabled);
         assert_eq!(parsed.max_order_quantity, def.max_order_quantity);
+        assert_eq!(parsed.order_push_enabled, def.order_push_enabled);
     }
 
     // -----------------------------------------------------------------------
