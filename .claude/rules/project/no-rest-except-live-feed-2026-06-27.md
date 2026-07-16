@@ -563,3 +563,6 @@ measure (the chain leg is serving normally — 735/735 on 2026-07-14).
 
 Covered by the §6 trigger list (the `charts/intraday`, `optionchain`,
 `spot_1m_rest`, `option_chain_1m` strings already activate this file).
+(2026-07-16, operator directive events 38df2073 + 157f7cd0) SUPERSEDED wording: "on the existing feed connection (no new connection)" predates the 2026-07-15 Groww live-feed retirement. There is no live Groww feed connection anymore, so the authorized order/position/trade PUSH channel opens ONE NEW dedicated NATS-over-WS connection (`wss://socket-api.groww.in`, order/position/trade events only). Config `order_push_enabled`, module `oms/groww/push/`, codes GROWW-PUSH-01..04.
+
+(2026-07-16) RE-KEPT as live-feed-AUTH class for the order-push channel — `POST api.groww.in/v1/api/apex/v1/socket/token/create/` mints the per-session NATS user JWT the order channel needs (operator: "use the socket-token the Groww channel needs"). The ACCESS-token minter lock (groww-shared-token-minter-2026-07-02.md) is UNTOUCHED: the access token stays SSM read-only, never minted by TickVault.
