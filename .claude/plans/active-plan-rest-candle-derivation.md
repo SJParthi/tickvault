@@ -334,7 +334,7 @@ O/H/L/C/ΣV given 1m bars):
   - Tests: (docs only)
 - [x] Item 1 — Fold module: pure core + global sender + catch-up + refold + supervised task
   - Files: crates/app/src/rest_candle_fold.rs, crates/app/src/lib.rs
-  - Tests: test_golden_fold_agrees_with_tf_consistency_recompute, test_fold_seals_m1_every_bar_and_final_partials_at_close, test_fold_out_of_order_and_out_of_session, test_fold_refold_same_input_identical_seals, test_fold_volume_i64_clamp_semantics, test_catchup_sql_shapes_and_parse
+  - Tests: test_golden_fold_agrees_with_tf_consistency_recompute, test_single_bar_folds_into_all_21_tfs_and_m1_seals, test_final_session_minute_seals_everything_including_d1, test_out_of_order_bar_is_refused_not_folded, test_out_of_session_bar_is_skipped, test_refold_same_input_produces_identical_seals, test_volume_saturates_never_tears_the_fold, test_spot_bars_sql_shape, test_parse_spot_bars_and_truncation_tripwire, test_parse_spot_bars_float_volume_fallback (truth-synced 2026-07-16 fix round — the pre-impl placeholder names are retired)
 - [x] Item 2 — Config: RestCandleFoldConfig (serde default OFF) + validate + base.toml opt-in
   - Files: crates/common/src/config.rs, config/base.toml
   - Tests: test_rest_candle_fold_config_default_off, test_rest_candle_fold_config_validate_bounds
@@ -389,6 +389,21 @@ O/H/L/C/ΣV given 1m bars):
     test_note_unfoldable_identity_counts_and_never_panics,
     test_parse_spot_bars_float_volume_fallback,
     test_catchup_day_offsets_newest_first
+
+- [x] Item 11 — Post-verify fix round (2026-07-16): the two Item-2 config pin
+  tests land for real (they were promised names, now real code); same-batch
+  day-roll displaced-repair routing — a batch carrying [old-day repair, new-day
+  first bar] parks the just-deferred repair at the roll and routes its OLD day
+  into the past-day /exec dirty queue instead of silently dropping it with the
+  cleared map; heartbeat catch-up-window liveness note in the rule file's
+  honest envelope (the heartbeat is created AFTER boot catch-up — catch-up
+  silence is not death)
+  - Files: crates/common/src/config.rs, crates/app/src/rest_candle_fold.rs,
+    .claude/rules/project/rest-candle-fold-error-codes.md,
+    .claude/plans/active-plan-rest-candle-derivation.md
+  - Tests: test_rest_candle_fold_config_default_off,
+    test_rest_candle_fold_config_validate_bounds,
+    test_same_batch_day_roll_routes_displaced_repair_to_past_day_queue
 
 ## Scenarios
 
