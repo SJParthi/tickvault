@@ -41,7 +41,8 @@
 //!     strike DOUBLE, leg SYMBOL, contract_security_id LONG,
 //!     last_price DOUBLE, iv DOUBLE, delta DOUBLE, theta DOUBLE,
 //!     gamma DOUBLE, vega DOUBLE, oi LONG, volume LONG, previous_oi LONG,
-//!     underlying_spot DOUBLE, fetched_at TIMESTAMP
+//!     underlying_spot DOUBLE, fetched_at TIMESTAMP,
+//!     rho DOUBLE, close_to_data_ms LONG, moneyness SYMBOL
 //! ) timestamp(ts) PARTITION BY DAY
 //!   DEDUP UPSERT KEYS(ts, underlying_security_id, exchange_segment,
 //!                     expiry, strike, leg, feed);
@@ -151,6 +152,14 @@ pub struct OptionChain1mRow {
     pub underlying_spot: f64,
     /// Retrieval wall-clock instant, IST nanoseconds.
     pub fetched_at_ist_nanos: i64,
+    /// Write-time moneyness classification (`"ITM"`/`"ATM"`/`"OTM"`/
+    /// `"UNKNOWN"` — `tickvault_common::moneyness::Moneyness::as_str()`,
+    /// the ONLY producer of these labels). AUDIT MIRROR ONLY: the RAM
+    /// chain snapshot is the decision source of truth (operator directive
+    /// 2026-07-14); this column exists so `WHERE moneyness='ATM'` is a
+    /// precomputed filter, never a query-time recompute. NOT in the DEDUP
+    /// key (label column — the `contract_security_id` precedent).
+    pub moneyness: &'static str,
 }
 
 /// The idempotent `CREATE TABLE` DDL for `option_chain_1m`. Pure.
@@ -181,7 +190,8 @@ pub fn option_chain_1m_create_ddl() -> String {
             underlying_spot        DOUBLE, \
             fetched_at             TIMESTAMP, \
             rho                    DOUBLE, \
-            close_to_data_ms       LONG\
+            close_to_data_ms       LONG, \
+            moneyness              SYMBOL\
         ) timestamp(ts) PARTITION BY DAY \
         DEDUP UPSERT KEYS({DEDUP_KEY_OPTION_CHAIN_1M});"
     )
@@ -195,7 +205,7 @@ pub fn option_chain_1m_create_ddl() -> String {
 /// EXISTS` at the next boot (nullable — the Dhan rows simply leave them
 /// NULL until the Dhan leg ever stamps them). Pure.
 #[must_use]
-pub fn option_chain_1m_columns() -> [(&'static str, &'static str); 23] {
+pub fn option_chain_1m_columns() -> [(&'static str, &'static str); 24] {
     [
         ("trading_date_ist", "TIMESTAMP"),
         ("underlying_security_id", "LONG"),
@@ -228,6 +238,16 @@ pub fn option_chain_1m_columns() -> [(&'static str, &'static str); 23] {
         // both NULL (the Dhan emit path is untouched).
         ("rho", "DOUBLE"),
         ("close_to_data_ms", "LONG"),
+        // Moneyness classification (2026-07-14, operator directive relayed
+        // via the coordinator session — moneyness is CRITICAL and MANDATORY,
+        // computed at WRITE time; the RAM chain snapshot is the decision
+        // surface, this column is the write-only AUDIT MIRROR so
+        // `WHERE moneyness='ATM'` is a precomputed filter, never a
+        // query-time recompute). Values: ITM/ATM/OTM/UNKNOWN (4-value
+        // SYMBOL). Additive + nullable; rows written by earlier builds stay
+        // NULL FOREVER (never backfilled). NOT in the DEDUP key (label
+        // column — the contract_security_id precedent).
+        ("moneyness", "SYMBOL"),
     ]
 }
 
@@ -487,6 +507,11 @@ impl OptionChain1mWriter {
             .context("underlying_symbol")?
             .symbol("leg", r.leg)
             .context("leg")?
+            // Moneyness audit-mirror stamp (2026-07-14) — a SYMBOL tag,
+            // written UNCONDITIONALLY on BOTH feeds (UNKNOWN covers every
+            // unclassifiable case, so it is never absent).
+            .symbol("moneyness", r.moneyness)
+            .context("moneyness")?
             .column_ts(
                 "trading_date_ist",
                 TimestampNanos::new(r.trading_date_ist_nanos),
@@ -633,6 +658,8 @@ mod tests {
             previous_oi: 402_220,
             underlying_spot: 25_642.8,
             fetched_at_ist_nanos: 1_770_000_961_042_000_000,
+            // 25650 CE @ spot 25642.8, Rs.50 grid → the grid-rounded ATM.
+            moneyness: "ATM",
         }
     }
 
@@ -762,6 +789,55 @@ mod tests {
         assert!(
             !dhan_line.contains("close_to_data_ms="),
             "Dhan must not stamp close_to_data_ms: {dhan_line}"
+        );
+    }
+
+    /// The 2026-07-14 moneyness audit-mirror stamp: a SYMBOL tag (ILP
+    /// tags-before-fields — it must sit in the tag section, before the
+    /// first space), written on BOTH feeds' append paths.
+    #[test]
+    fn test_chain1m_append_row_stamps_moneyness_symbol() {
+        // Dhan path (plain append_row).
+        let mut dhan = OptionChain1mWriter::for_test();
+        dhan.append_row(&sample_row()).expect("append must succeed");
+        let dhan_line = dhan.buffer_utf8();
+        let dhan_tags = dhan_line.split(' ').next().unwrap_or_default();
+        assert!(
+            dhan_tags.contains(",moneyness=ATM"),
+            "moneyness must be an ILP TAG (before the first field) on the \
+             Dhan line: {dhan_line}"
+        );
+
+        // Groww path (append_row_ext) stamps the SAME tag.
+        let mut groww = OptionChain1mWriter::for_test_with_feed(
+            OPTION_CHAIN_1M_FEED_GROWW,
+            OPTION_CHAIN_1M_SOURCE_GROWW_CHAIN,
+        );
+        groww
+            .append_row_ext(&sample_row(), 5.1802, 1_042)
+            .expect("ext append must succeed");
+        let groww_line = groww.buffer_utf8();
+        let groww_tags = groww_line.split(' ').next().unwrap_or_default();
+        assert!(
+            groww_tags.contains(",moneyness=ATM"),
+            "moneyness must be an ILP TAG on the Groww line: {groww_line}"
+        );
+
+        // The DDL manifest carries the column as SYMBOL (self-heal covers
+        // live tables created by earlier builds).
+        assert!(
+            option_chain_1m_columns()
+                .iter()
+                .any(|&(col, ty)| col == "moneyness" && ty == "SYMBOL"),
+            "moneyness must be a SYMBOL column in the manifest"
+        );
+        // NEVER in the DEDUP key (label column).
+        assert!(
+            !DEDUP_KEY_OPTION_CHAIN_1M
+                .split([',', ' '])
+                .map(str::trim)
+                .any(|tok| tok == "moneyness"),
+            "moneyness must never enter the DEDUP key"
         );
     }
 

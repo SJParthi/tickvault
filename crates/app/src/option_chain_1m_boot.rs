@@ -75,7 +75,7 @@ use std::time::Duration;
 use chrono::{DateTime, Duration as ChronoDuration, NaiveDate};
 use secrecy::ExposeSecret;
 use serde_json::{Value, json};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use tickvault_common::config::QuestDbConfig;
 use tickvault_common::constants::{
@@ -87,11 +87,19 @@ use tickvault_common::constants::{
     SECONDS_PER_DAY, SPOT_1M_REST_CONSECUTIVE_FAIL_PAGE_THRESHOLD,
 };
 use tickvault_common::error_code::ErrorCode;
+use tickvault_common::feed::Feed;
+use tickvault_common::moneyness::{
+    Moneyness, OptionLeg, atm_strike_paise, classify_moneyness_paise, observed_finest_step_paise,
+    price_to_paise_guarded, strike_step_paise,
+};
 use tickvault_common::sanitize::{capture_rest_error_body, redact_url_params};
 use tickvault_common::trading_calendar::TradingCalendar;
 use tickvault_common::url_join::join_api_url;
 use tickvault_core::auth::token_manager::TokenHandle;
 use tickvault_core::notification::{NotificationEvent, NotificationService};
+use tickvault_core::pipeline::chain_snapshot::{
+    ChainMoneynessSnapshot, ChainUnderlying, SnapshotRow, publish_chain_snapshot,
+};
 use tickvault_storage::disk_health_watcher::classify_join_exit;
 use tickvault_storage::option_chain_1m_persistence::{
     OPTION_CHAIN_1M_FEED_DHAN, OPTION_CHAIN_1M_LEG_CE, OPTION_CHAIN_1M_LEG_PE,
@@ -453,6 +461,251 @@ pub fn parse_option_chain(body: &str) -> Option<ParsedChain> {
     // Bounded by MAX_STRIKES_PER_CHAIN (400) — the cast can never clip.
     chain.strike_count = u32::try_from(strikes_kept).unwrap_or(u32::MAX);
     Some(chain)
+}
+
+// ---------------------------------------------------------------------------
+// Moneyness classification glue (2026-07-14, operator directive relayed via
+// the coordinator session) — shared by BOTH chain legs (the Groww leg
+// imports these). ALL strike/price ARITHMETIC lives in
+// `tickvault_common::moneyness` — this file only CALLS it, so the
+// parse-only strike ratchet
+// (`ratchet_chain1m_strike_is_parse_only_never_computed`) stands.
+// ---------------------------------------------------------------------------
+
+/// The classified output of ONE underlying's chain fire: the once-per-
+/// (underlying, minute) anchor pair (two-step API — the grid ATM is
+/// computed ONCE, never per row), the per-leg classes aligned with the
+/// parse order, the RAM snapshot rows, and the observability inputs.
+/// Cold-path (per-minute scheduled fire) — the Vecs are the same
+/// allocation class as the parsed chain itself.
+pub struct ChainClassification {
+    /// Guarded spot in paise (0 = missing/invalid → every row UNKNOWN).
+    pub spot_paise: i64,
+    /// Grid-rounded ATM strike in paise (0 = unresolvable this minute).
+    pub atm_paise: i64,
+    /// Per-leg classes, index-aligned with the input leg order (the
+    /// persist loop zips over this).
+    pub row_moneyness: Vec<Moneyness>,
+    /// RAM snapshot rows (built BEFORE the persist loop so a persist
+    /// failure can never degrade the RAM decision surface).
+    pub snap_rows: Vec<SnapshotRow>,
+    /// Sorted + deduped positive strike paise — the observed-step
+    /// cross-check input.
+    pub strike_paise_sorted: Vec<i64>,
+    /// Rows that classified UNKNOWN (→ `tv_moneyness_unknown_total`).
+    pub unknown_rows: u64,
+    /// TRUE when some listed strike sits paise-exactly ON the computed
+    /// grid ATM (absence → `tv_moneyness_atm_absent_total`).
+    pub saw_grid_atm: bool,
+}
+
+/// Classify every leg of one chain fire — `legs` yields
+/// `(strike_rupees, leg_label, ltp_rupees)` tuples straight off the
+/// parsed chain. A missing/invalid spot (Dhan's silent 0.0 default, the
+/// Groww `underlying_ltp_missing` flag mapped to 0.0 by the caller)
+/// yields UNKNOWN for every row — fail-soft, never a dropped row.
+pub fn classify_chain_legs<'a>(
+    underlying_symbol: &str,
+    spot_rupees: f64,
+    legs: impl Iterator<Item = (f64, &'a str, f64)>,
+) -> ChainClassification {
+    let spot_paise = price_to_paise_guarded(spot_rupees).unwrap_or(0);
+    let atm_paise = strike_step_paise(underlying_symbol)
+        .and_then(|step| atm_strike_paise(spot_paise, step))
+        .unwrap_or(0);
+    let (lo, hi) = legs.size_hint();
+    let cap = hi.unwrap_or(lo);
+    let mut cls = ChainClassification {
+        spot_paise,
+        atm_paise,
+        row_moneyness: Vec::with_capacity(cap),
+        snap_rows: Vec::with_capacity(cap),
+        strike_paise_sorted: Vec::with_capacity(cap),
+        unknown_rows: 0,
+        saw_grid_atm: false,
+    };
+    for (strike_rupees, leg_label, ltp_rupees) in legs {
+        let strike_paise = price_to_paise_guarded(strike_rupees).unwrap_or(0);
+        let m = classify_moneyness_paise(leg_label, strike_paise, spot_paise, atm_paise);
+        if m == Moneyness::Unknown {
+            cls.unknown_rows = cls.unknown_rows.saturating_add(1);
+        }
+        if strike_paise > 0 {
+            cls.strike_paise_sorted.push(strike_paise);
+            if strike_paise == atm_paise {
+                cls.saw_grid_atm = true;
+            }
+        }
+        if let Some(leg_kind) = OptionLeg::parse(leg_label) {
+            cls.snap_rows.push(SnapshotRow {
+                strike_paise,
+                ltp_paise: price_to_paise_guarded(ltp_rupees).unwrap_or(0),
+                leg: leg_kind,
+                moneyness: m,
+            });
+        }
+        cls.row_moneyness.push(m);
+    }
+    cls.strike_paise_sorted.sort_unstable();
+    cls.strike_paise_sorted.dedup();
+    cls
+}
+
+/// Day-keyed edge latches for the two moneyness advisory warns — ONE
+/// coalesced warn per (feed instance, underlying slot, trading day) per
+/// kind (the contract leg's `anchor_stale` episode-latch precedent; a new
+/// trading day re-arms). Each chain run loop owns one instance, so the
+/// Dhan and Groww feeds latch independently. Bounded residual (accepted):
+/// the latches are task-local state, so a supervisor RESPAWN of the run
+/// loop resets them — at most one extra warn pair per respawn per day.
+#[derive(Default)]
+pub struct MoneynessWarnLatches {
+    step_drift: [Option<NaiveDate>; CHAIN_1M_UNDERLYINGS.len()],
+    atm_absent: [Option<NaiveDate>; CHAIN_1M_UNDERLYINGS.len()],
+}
+
+impl MoneynessWarnLatches {
+    /// True at most once per (slot, trading day) for the step-drift warn.
+    pub fn should_fire_step_drift(&mut self, slot: usize, day: NaiveDate) -> bool {
+        Self::fire(&mut self.step_drift, slot, day)
+    }
+
+    /// True at most once per (slot, trading day) for the atm-absent warn.
+    pub fn should_fire_atm_absent(&mut self, slot: usize, day: NaiveDate) -> bool {
+        Self::fire(&mut self.atm_absent, slot, day)
+    }
+
+    fn fire(slots: &mut [Option<NaiveDate>], slot: usize, day: NaiveDate) -> bool {
+        match slots.get_mut(slot) {
+            Some(entry) if *entry != Some(day) => {
+                *entry = Some(day);
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+/// Post-classification observability for one chain fire (shared by both
+/// chain legs): the UNKNOWN-row counter, the atm-absent detection (no
+/// row lies on the computed grid-ATM strike that minute — a degenerate
+/// strike==spot row may still label ATM; never a promoted substitute),
+/// and the once-per-chain observed-step cross-check (min positive
+/// adjacent strike diff vs the directive const step — advisory ONLY,
+/// never changes a classification). Warns are edge-latched per
+/// (feed, underlying, day) on the EXISTING CHAIN-02 code with new stages
+/// — log-sink-only, no page, no new ErrorCode.
+#[allow(clippy::too_many_arguments)] // APPROVED: shared observability sink for both chain legs — a struct would be pure ceremony (spot precedent)
+pub fn record_chain_moneyness_observability(
+    feed_label: &'static str,
+    underlying_symbol: &str,
+    slot: usize,
+    trading_date: NaiveDate,
+    minute_label: &str,
+    cls: &ChainClassification,
+    latches: &mut MoneynessWarnLatches,
+) {
+    if cls.unknown_rows > 0 {
+        metrics::counter!("tv_moneyness_unknown_total", "feed" => feed_label)
+            .increment(cls.unknown_rows);
+    }
+    // ATM-absent: strikes parsed + ATM resolvable, but NO listed strike
+    // sits on the computed grid ATM (vendor hole / spot outside the
+    // listed range / stale const step). The classifier never promotes a
+    // substitute — the absence is counted + warned instead.
+    if !cls.strike_paise_sorted.is_empty() && cls.atm_paise > 0 && !cls.saw_grid_atm {
+        metrics::counter!("tv_moneyness_atm_absent_total", "feed" => feed_label).increment(1);
+        if latches.should_fire_atm_absent(slot, trading_date) {
+            warn!(
+                code = ErrorCode::Chain02FetchDegraded.code_str(),
+                stage = "moneyness_atm_absent",
+                feed = feed_label,
+                symbol = underlying_symbol,
+                atm_paise = cls.atm_paise,
+                spot_paise = cls.spot_paise,
+                minute = %minute_label,
+                "CHAIN-02: computed grid ATM strike is not among the \
+                 minute's listed strikes — no row lies on the computed \
+                 grid-ATM strike this minute (a degenerate strike==spot \
+                 row may still label ATM; never a promoted substitute); \
+                 ITM/OTM are unaffected"
+            );
+        }
+    }
+    // Observed-step cross-check (once per chain fire, cold path).
+    if let (Some(observed), Some(expected)) = (
+        observed_finest_step_paise(&cls.strike_paise_sorted),
+        strike_step_paise(underlying_symbol),
+    ) && observed != expected
+    {
+        metrics::counter!("tv_moneyness_step_drift_total", "feed" => feed_label).increment(1);
+        if latches.should_fire_step_drift(slot, trading_date) {
+            warn!(
+                code = ErrorCode::Chain02FetchDegraded.code_str(),
+                stage = "moneyness_step_drift",
+                feed = feed_label,
+                symbol = underlying_symbol,
+                expected_step_paise = expected,
+                observed_step_paise = observed,
+                minute = %minute_label,
+                "CHAIN-02: observed finest adjacent strike step diverges \
+                 from the directive const step — ATM labels may be \
+                 misplaced until the const table is reviewed (ITM/OTM are \
+                 immune to a wrong-but-VALID positive even step; a \
+                 missing/odd/zero step fail-closes the minute to UNKNOWN \
+                 instead; a single off-grid stray strike also fires this — \
+                 vendor-data-weirdness signal, documented)"
+            );
+        }
+    }
+}
+
+/// Build + publish the RAM chain-moneyness snapshot for one fire (cold
+/// path — the DECISION SOURCE OF TRUTH; the DB `moneyness` column is the
+/// write-only audit mirror). Consumes the classification (moves the
+/// snapshot rows). Shared by both chain legs; the contract leg
+/// deliberately does NOT publish (the chain snapshot one watch-signal
+/// earlier the same minute is its strict superset with a fresher spot).
+pub fn publish_chain_moneyness_snapshot(
+    feed: Feed,
+    underlying_symbol: &str,
+    minute_ts_ist_nanos: i64,
+    fetched_at_ist_nanos: i64,
+    underlying_spot: f64,
+    expiry_ist_nanos: i64,
+    cls: ChainClassification,
+) {
+    let Some(underlying) = ChainUnderlying::from_symbol(underlying_symbol) else {
+        // Unreachable for the pinned 3-underlying sets — never a panic,
+        // and never a fully silent drop (hostile-review round 1).
+        debug!(
+            symbol = underlying_symbol,
+            "chain moneyness snapshot publish skipped — symbol outside the \
+             pinned ChainUnderlying set"
+        );
+        return;
+    };
+    debug!(
+        feed = feed.as_str(),
+        symbol = underlying_symbol,
+        minute_ts_ist_nanos,
+        atm_paise = cls.atm_paise,
+        rows = cls.snap_rows.len(),
+        spot_missing = cls.spot_paise == 0,
+        "chain moneyness snapshot published (RAM decision surface)"
+    );
+    publish_chain_snapshot(ChainMoneynessSnapshot {
+        feed,
+        underlying,
+        minute_ts_ist_nanos,
+        fetched_at_ist_nanos,
+        underlying_spot,
+        underlying_spot_paise: cls.spot_paise,
+        atm_strike_paise: cls.atm_paise,
+        expiry_ist_nanos,
+        spot_missing: cls.spot_paise == 0,
+        rows: cls.snap_rows,
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -1306,6 +1559,7 @@ async fn fire_one_chain_minute(
     audit_writer: &mut RestFetchAuditWriter,
     edge: &mut FailureEdge,
     health: &mut ChainServingHealth,
+    moneyness_latches: &mut MoneynessWarnLatches,
     fire_secs_of_day: u32,
 ) -> MinuteVerdict {
     let minute_open_secs = fire_secs_of_day.saturating_sub(60);
@@ -1535,7 +1789,20 @@ async fn fire_one_chain_minute(
                         );
                         i64::MAX
                     });
-                    for leg in &chain.legs {
+                    // Moneyness (2026-07-14): classify ONCE per leg — the
+                    // grid ATM is computed ONCE per (underlying, minute)
+                    // inside common (two-step API); the RAM snapshot rows
+                    // are built BEFORE the persist loop so a persist
+                    // failure can never degrade the RAM decision surface.
+                    // Dhan has NO vendor missing-spot flag (val_f64
+                    // defaults an absent last_price to 0.0) — the guarded
+                    // conversion maps that to UNKNOWN for every row.
+                    let cls = classify_chain_legs(
+                        target.symbol,
+                        chain.underlying_spot,
+                        chain.legs.iter().map(|l| (l.strike, l.leg, l.last_price)),
+                    );
+                    for (leg, leg_moneyness) in chain.legs.iter().zip(cls.row_moneyness.iter()) {
                         let row = OptionChain1mRow {
                             ts_ist_nanos: target_minute_nanos,
                             trading_date_ist_nanos: trading_date_nanos,
@@ -1556,6 +1823,7 @@ async fn fire_one_chain_minute(
                             previous_oi: leg.previous_oi,
                             underlying_spot: chain.underlying_spot,
                             fetched_at_ist_nanos: fetched_at,
+                            moneyness: leg_moneyness.as_str(),
                         };
                         if let Err(err) = writer.append_row(&row) {
                             persist_failed = true;
@@ -1613,6 +1881,28 @@ async fn fire_one_chain_minute(
                             "none",
                         ));
                     }
+                    // Moneyness observability (counters + day-latched
+                    // advisory warns) THEN the RAM snapshot publish — the
+                    // decision source of truth, independent of any
+                    // persist outcome above.
+                    record_chain_moneyness_observability(
+                        Feed::Dhan.as_str(),
+                        target.symbol,
+                        idx,
+                        trading_date,
+                        &minute_label,
+                        &cls,
+                        moneyness_latches,
+                    );
+                    publish_chain_moneyness_snapshot(
+                        Feed::Dhan,
+                        target.symbol,
+                        target_minute_nanos,
+                        fetched_at,
+                        chain.underlying_spot,
+                        expiry_nanos,
+                        cls,
+                    );
                 }
                 ChainFetchOutcome::Empty => {
                     empty_count = empty_count.saturating_add(1);
@@ -2199,6 +2489,7 @@ pub async fn run_option_chain_1m(
     // — same lifetime as the FailureEdge: this run, which is per trading
     // day; a mid-day supervisor respawn restarts the streaks.
     let mut health = ChainServingHealth::default();
+    let mut moneyness_latches = MoneynessWarnLatches::default();
     let mut last_fired: Option<u32> = None;
     let mut last_request_ms: Vec<Option<i64>> = vec![None; targets.len()];
     let mut spot_rx = params.spot_minute_done.clone();
@@ -2288,6 +2579,7 @@ pub async fn run_option_chain_1m(
             &mut audit_writer,
             &mut edge,
             &mut health,
+            &mut moneyness_latches,
             fire,
         )
         .await;
@@ -2392,6 +2684,192 @@ pub fn spawn_supervised_option_chain_1m(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- moneyness glue (2026-07-14) -----------------------------------------
+
+    /// The two-step classification over a realistic parsed chain: ATM is
+    /// computed ONCE (grid rounding — the 2026-04-21 live capture
+    /// numbers), every leg classifies, the snapshot rows align, and the
+    /// observability inputs (unknown count, grid-ATM presence, sorted
+    /// distinct strikes) come out right.
+    #[test]
+    fn test_classify_chain_legs_realistic_chain() {
+        let legs = [
+            (24_500.0, "CE", 120.0),
+            (24_500.0, "PE", 55.0),
+            (24_550.0, "CE", 98.0),
+            (24_550.0, "PE", 80.0),
+            (24_600.0, "CE", 71.0),
+            (24_600.0, "PE", 130.0),
+        ];
+        let cls = classify_chain_legs("NIFTY", 24_536.40, legs.iter().copied());
+        assert_eq!(cls.spot_paise, 2_453_640);
+        assert_eq!(cls.atm_paise, 2_455_000, "grid ATM = the captured 24550");
+        assert_eq!(
+            cls.row_moneyness,
+            vec![
+                Moneyness::Itm, // 24500 CE
+                Moneyness::Otm, // 24500 PE
+                Moneyness::Atm, // 24550 CE
+                Moneyness::Atm, // 24550 PE
+                Moneyness::Otm, // 24600 CE
+                Moneyness::Itm, // 24600 PE
+            ]
+        );
+        assert_eq!(cls.unknown_rows, 0);
+        assert!(cls.saw_grid_atm);
+        assert_eq!(cls.snap_rows.len(), 6);
+        assert_eq!(cls.snap_rows[2].moneyness, Moneyness::Atm);
+        assert_eq!(cls.snap_rows[0].ltp_paise, 12_000);
+        // Sorted + deduped distinct strikes (3, not 6).
+        assert_eq!(
+            cls.strike_paise_sorted,
+            vec![2_450_000, 2_455_000, 2_460_000]
+        );
+        assert_eq!(
+            tickvault_common::moneyness::observed_finest_step_paise(&cls.strike_paise_sorted),
+            Some(5_000)
+        );
+    }
+
+    /// The Dhan silent-absent spot (0.0) classifies every row UNKNOWN —
+    /// fail-soft, rows still counted; no grid ATM exists.
+    #[test]
+    fn test_classify_chain_legs_missing_spot_all_unknown() {
+        let legs = [(24_500.0, "CE", 120.0), (24_550.0, "PE", 80.0)];
+        let cls = classify_chain_legs("NIFTY", 0.0, legs.iter().copied());
+        assert_eq!(cls.spot_paise, 0);
+        assert_eq!(cls.atm_paise, 0);
+        assert_eq!(cls.unknown_rows, 2);
+        assert!(!cls.saw_grid_atm);
+        assert_eq!(cls.row_moneyness, vec![Moneyness::Unknown; 2]);
+        // Snapshot rows still exist (leg labels valid) with UNKNOWN class.
+        assert_eq!(cls.snap_rows.len(), 2);
+        assert!(
+            cls.snap_rows
+                .iter()
+                .all(|r| r.moneyness == Moneyness::Unknown)
+        );
+        // Unknown underlying degrades identically.
+        let cls2 = classify_chain_legs("FINNIFTY", 24_536.40, legs.iter().copied());
+        assert_eq!(cls2.atm_paise, 0);
+        assert_eq!(cls2.unknown_rows, 2);
+    }
+
+    /// The day-keyed warn latches: at most ONE fire per (slot, day) per
+    /// kind, independent slots + kinds, re-armed by a new trading day.
+    #[test]
+    fn test_moneyness_warn_latches_once_per_slot_day() {
+        let mut latches = MoneynessWarnLatches::default();
+        let d1 = NaiveDate::from_ymd_opt(2026, 7, 14).expect("valid date");
+        let d2 = NaiveDate::from_ymd_opt(2026, 7, 15).expect("valid date");
+        assert!(latches.should_fire_step_drift(0, d1));
+        assert!(
+            !latches.should_fire_step_drift(0, d1),
+            "latched for the day"
+        );
+        assert!(latches.should_fire_step_drift(1, d1), "slots independent");
+        assert!(latches.should_fire_atm_absent(0, d1), "kinds independent");
+        assert!(!latches.should_fire_atm_absent(0, d1));
+        assert!(latches.should_fire_step_drift(0, d2), "new day re-arms");
+        // Out-of-range slot never fires (defensive — pinned 3 underlyings).
+        assert!(!latches.should_fire_step_drift(99, d1));
+    }
+
+    /// The observability sink never panics on any classification shape
+    /// (counters + latched warns only — pure metrics/log side effects).
+    #[test]
+    fn test_record_chain_moneyness_observability_smoke() {
+        let day = NaiveDate::from_ymd_opt(2026, 7, 14).expect("valid date");
+        let mut latches = MoneynessWarnLatches::default();
+        // Healthy chain: no drift, ATM present, zero unknown.
+        let healthy = classify_chain_legs(
+            "NIFTY",
+            24_536.40,
+            [(24_500.0, "CE", 1.0), (24_550.0, "CE", 1.0)]
+                .iter()
+                .copied(),
+        );
+        record_chain_moneyness_observability(
+            "dhan",
+            "NIFTY",
+            0,
+            day,
+            "9:16 AM",
+            &healthy,
+            &mut latches,
+        );
+        // ATM-absent + drift + unknown all at once (spot far off the
+        // listed range, one off-grid stray, one bad leg label).
+        let degraded = classify_chain_legs(
+            "NIFTY",
+            20_000.0,
+            [
+                (24_500.0, "CE", 1.0),
+                (24_500.5, "CE", 1.0),
+                (24_550.0, "XX", 1.0),
+            ]
+            .iter()
+            .copied(),
+        );
+        assert!(!degraded.saw_grid_atm);
+        assert_eq!(degraded.unknown_rows, 1);
+        record_chain_moneyness_observability(
+            "dhan",
+            "NIFTY",
+            0,
+            day,
+            "9:16 AM",
+            &degraded,
+            &mut latches,
+        );
+        // Second call the same day: counters still bump, warns latched.
+        record_chain_moneyness_observability(
+            "dhan",
+            "NIFTY",
+            0,
+            day,
+            "9:16 AM",
+            &degraded,
+            &mut latches,
+        );
+    }
+
+    /// The RAM publish half: a published classification is readable
+    /// lock-free from the process-global registry (the decision surface),
+    /// and an unknown underlying is a no-op (never a panic).
+    #[test]
+    fn test_publish_chain_moneyness_snapshot_roundtrip() {
+        use tickvault_core::pipeline::chain_snapshot::load_chain_snapshot;
+        let cls = classify_chain_legs(
+            "BANKNIFTY",
+            48_143.25,
+            [(48_100.0, "CE", 250.0), (48_200.0, "CE", 180.0)]
+                .iter()
+                .copied(),
+        );
+        publish_chain_moneyness_snapshot(
+            Feed::Dhan,
+            "BANKNIFTY",
+            1_770_000_900_000_000_000,
+            1_770_000_901_500_000_000,
+            48_143.25,
+            1_770_508_800_000_000_000,
+            cls,
+        );
+        let snap = load_chain_snapshot(Feed::Dhan, ChainUnderlying::Banknifty);
+        assert!(!snap.is_empty_sentinel());
+        assert_eq!(snap.minute_ts_ist_nanos, 1_770_000_900_000_000_000);
+        assert_eq!(snap.atm_strike_paise, 4_810_000, "grid ATM 48100");
+        assert!(!snap.spot_missing);
+        assert_eq!(snap.rows.len(), 2);
+        assert_eq!(snap.rows[0].moneyness, Moneyness::Atm);
+        assert_eq!(snap.rows[1].moneyness, Moneyness::Otm);
+        // Unknown underlying: dropped silently (unreachable for the
+        // pinned sets), never a panic, no slot disturbed.
+        let cls2 = classify_chain_legs("FINNIFTY", 1.0, std::iter::empty());
+        publish_chain_moneyness_snapshot(Feed::Dhan, "FINNIFTY", 1, 1, 1.0, 1, cls2);
+    }
 
     // ---- request bodies (PascalCase, INTEGER scrip) --------------------------
 
