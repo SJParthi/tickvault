@@ -236,9 +236,11 @@ pub struct CycleSlots {
     pub spot_step: u8,
     /// Dhan spot slots (NIFTY / BANKNIFTY / SENSEX / INDIA VIX order),
     /// per the SECOND-BUCKET assignment `spot_second_buckets(dhan_shape,
-    /// spot_step)`: shape 0 bases NIFTY+BANKNIFTY in the burst second and
-    /// SENSEX+VIX in the next; shape 1 bases all 4 in second 2; the tier
-    /// step caps per-second spot counts, greedy overflow spilling to
+    /// spot_step)`: shape 0 bases ALL 4 spots in the burst second beside
+    /// the 3 chains (base `[0, 0, 0, 0]` — the operator's "all 7 parallel
+    /// at first second"; supersedes the interim 5+2 base wording,
+    /// 2026-07-16 all-7 correction); shape 1 bases all 4 in second 2; the
+    /// tier step caps per-second spot counts, greedy overflow spilling to
     /// later 1000ms buckets. Base clamped ≥ T + `spot_min_post_close_ms`
     /// (the just-closed candle cannot exist pre-close).
     pub dhan_spot_slots_ms: [i64; 4],

@@ -212,12 +212,17 @@ pub struct ApplicationConfig {
     #[serde(default)]
     pub exit_orders: ExitOrdersConfig,
     /// `[cadence]` — broker-agnostic fetch-cadence + decision-timing
-    /// scheduler (operator cadence directive 2026-07-14, judge-locked
-    /// design rev-8 — `crates/core/src/cadence/`). Dry-run decision-timing
-    /// skeleton: per-minute Dhan (:55 pre-close serialized chains + :03
-    /// post-close spots) + Groww (:00 post-close 7-parallel burst) with
-    /// structural zero-429 gates, a Dhan failure ladder, and event-driven
-    /// per-lane decisions. This PR ships NO REST caller — the dry-run
+    /// scheduler (operator cadence directive 2026-07-14, reshaped by the
+    /// 2026-07-16 post-close burst directive — `crates/core/src/cadence/`;
+    /// supersedes the rev-8 pre-close schedule — 2026-07-16). Dry-run
+    /// decision-timing skeleton: per minute close T, BOTH lanes fire
+    /// POST-CLOSE — primary (rung 0) = ALL 7 requests concurrent in the
+    /// burst second (3 chains + 4 spots; Dhan at T +
+    /// `dhan_burst_offset_ms`, Groww at T+0); fallback (rung 1) = chains
+    /// in second 1, all 4 spots in second 2. Demotion is
+    /// RateLimited-ONLY after 2 consecutive dirty cycles (operator
+    /// Correction 2); structural zero-429 gates + event-driven per-lane
+    /// decisions throughout. This PR ships NO REST caller — the dry-run
     /// executors log fires and return Empty. Absent section ⇒ DISABLED
     /// (fail-safe default off).
     #[serde(default)]
@@ -932,7 +937,11 @@ pub struct CadenceConfig {
     pub spot_min_post_close_ms: i64,
     /// Maximum in-cycle retries per failed request (Assumed — default 1).
     /// Retries fire ONLY through the gates and only when landing before
-    /// the lane cutoff; a RateLimited is NEVER retried in-cycle.
+    /// the lane cutoff. A RateLimited leg KEEPS its one bounded in-cycle
+    /// retry (through the gates, after the per-key spacing) — one of the
+    /// operator's "multiple attempts" before any shape demotion
+    /// (2026-07-16 Correction 2; supersedes the earlier "a RateLimited is
+    /// NEVER retried in-cycle" wording, which was the exact inverse).
     #[serde(default = "default_cadence_in_cycle_retry_max")]
     pub in_cycle_retry_max: u32,
     /// Dhan lane staleness cutoff, ms after T (Assumed — default 15000:

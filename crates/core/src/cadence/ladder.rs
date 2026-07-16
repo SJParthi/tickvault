@@ -335,7 +335,7 @@ mod tests {
     #[test]
     fn test_dhan_shape_ladder_rung0_rung1_transitions_under_streak_rules() {
         // 2026-07-16: the Dhan SHAPE ladder replaces the retired anchor
-        // ladder — rung 0 (5+2 primary) ⇄ rung 1 (split fallback), under
+        // ladder — rung 0 (all-7 primary) ⇄ rung 1 (split fallback), under
         // the SAME 2-dirty / 3-clean streak thresholds the Groww shape
         // ladder uses.
         let mut l = StreakLadder::starting_at(0);
