@@ -169,6 +169,36 @@ schema, no data migration, no Rust surface — nothing else to unwind.
   - Files: n/a (verification)
   - Tests: cargo test -p tickvault-common --test deploy_provenance_guard
 
+- [x] Item 6 — Review round 1 fixes (3-reviewer consolidated findings,
+  2026-07-16): M1 feeds-view SSM budget 20s → 28s (> the 24s worst-case
+  `--max-time` sum, drift-proof test parses the commands); M2 wipe verify
+  gate rebuilt — all FOUR live REST tables verified, missing/erroring counts
+  default to 0 (absent = wiped; the `:-1` default made every post-nuke wipe
+  read WIPE-PARTIAL forever), TRUNCATE-FAILED stays the loud failure path;
+  M3 feed-toggle confirm dialog reworded to REST-lane truth (official-candle
+  pulls, no "live feed"/"Ticks"); M4 honest hero + bars — '—' instead of an
+  animated fabricated 0 when counts are unreadable; M5 `_FEEDS_VIEW_COMMANDS`
+  pinned (rest_fetch_audit today-window, IST `dateadd('m', 330, now())`
+  timebase, outcome='ok', `close_to_data_ms >= 0` sentinel exclusion); M6
+  README rewritten for the REST-only portal (150 tests); L1 comment-stripped
+  retired-WS-host resurrection scan; L2 dead artifacts removed (td.win CSS,
+  shield() tip param, latrestnote); L3 stale comments reworded (cross-verify
+  card reference, wipe-groww test comment); L4 feeds-card "failed" bucket
+  excludes skipped/boundary_skipped (never-attempted minutes); L5 confirm-map
+  literal corrected to NUKE-DOCKER.
+  - Files: deploy/aws/lambda/operator-control/handler.py,
+    deploy/aws/lambda/operator-control/test_handler.py,
+    deploy/aws/lambda/operator-control/README.md
+  - Tests: test_feeds_timeout_budget_exceeds_curl_max_time_sum,
+    test_wipe_questdb_truncates_live_rest_tables_too,
+    test_disable_asks_for_confirmation,
+    test_hero_never_renders_fabricated_zero,
+    test_bars_render_dash_for_unreadable_counts,
+    test_rest_audit_curl_targets_todays_fetch_log,
+    test_rest_lat_hour_curl_ist_timebase_ok_filter_and_sentinel,
+    test_retired_ws_probe_hosts_absent_from_code,
+    test_failed_bucket_excludes_never_attempted_minutes
+
 ## Scenarios
 
 | # | Scenario | Expected |

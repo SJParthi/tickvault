@@ -616,8 +616,8 @@ def _parse_storage(stdout: str) -> dict:
 
 # ------------------------------------------------------------------- feeds card
 # Feed enable/disable from the portal (the app's :3001 is closed in the SG —
-# reachable ONLY via SSM RunShellScript curling 127.0.0.1, same mechanism as
-# the cross-verify card above). Contract read from crates/api (2026-07-02):
+# reachable ONLY via SSM RunShellScript curling 127.0.0.1).
+# Contract read from crates/api (2026-07-02):
 #   GET  /api/feeds        -> {"dhan_enabled": bool, "groww_enabled": bool,
 #                              "dhan_lane_running": bool, "groww_lane_running": bool}
 #   GET  /api/feeds/health -> {"market_open": bool, "feeds": [{"feed", "verdict",
@@ -675,9 +675,14 @@ _FEEDS_VIEW_COMMANDS = [
         "| tail -n +2 | tr '\\n' ';')\""
     ),
 ]
-# Two 8s curls + two 4s audit reads + SSM registration need more than the 6s
-# view window.
-_FEEDS_TIMEOUT_SECS = 20.0
+# Budget arithmetic (review fix M1, 2026-07-16): the snapshot's curls are
+# --max-time bounded at 8s + 8s (app /api/feeds + /api/feeds/health) +
+# 4s + 4s (the two rest_fetch_audit reads) = 24s worst case, PLUS SSM
+# registration/poll overhead → 28s. The budget MUST exceed the sum of every
+# --max-time in _FEEDS_VIEW_COMMANDS (drift-proof test parses them) — a
+# budget below the worst case made a slow-but-RUNNING box read as the FALSE
+# "box unreachable (SSM offline or instance stopped)".
+_FEEDS_TIMEOUT_SECS = 28.0
 
 
 def _extract_marked_json(stdout: str, begin: str, end: str) -> tuple[object, str]:
@@ -1091,10 +1096,17 @@ def lambda_handler(event, _context):
             #   3. The app is STOPPED first (releases writers + drops
             #      in-memory bars so nothing re-seals stale candles) and
             #      restarted after — it recreates schemas + resumes live-only.
-            #   4. Honest completion: post-wipe row counts are echoed; the
-            #      marker line WIPE-COMPLETE only prints when ticks AND
-            #      candles_1m AND spot_1m_rest are all 0 — a partial wipe
-            #      reads WIPE-PARTIAL, never a fake OK.
+            #   4. Honest completion (review fix M2, 2026-07-16): post-wipe
+            #      counts are echoed for the legacy pair (ticks, candles_1m)
+            #      AND all FOUR live REST tables; WIPE-COMPLETE prints only
+            #      when every readable count is 0. A missing/erroring count
+            #      defaults to 0, NOT 1 — on the REST-only runtime nothing
+            #      recreates the legacy tables after a docker-reset/bare-nuke
+            #      + redeploy (their ensure-DDL has no caller), so the old
+            #      `${X:-1}` default made EVERY later successful wipe read
+            #      WIPE-PARTIAL forever. An absent table means nothing left =
+            #      wiped; a live-table TRUNCATE error is surfaced by its own
+            #      loud per-table TRUNCATE-FAILED line above, never masked.
             # SEBI audit tables are intentionally preserved — the dynamic list
             # matches ONLY ticks + candles_* + prev_day_ohlcv + the four LIVE
             # REST tables (rest_fetch_audit is per-fetch forensics, not a SEBI
@@ -1162,17 +1174,25 @@ def lambda_handler(event, _context):
                 # 4. re-enable + restart the app — recreates schemas, LIVE-only.
                 "systemctl enable tickvault || true",
                 "systemctl start tickvault || true",
-                # 5. honest verification: both counts must be 0 (QuestDB may
-                #    need a moment; count right after truncate, before live
-                #    ticks resume mid-market is inherently racy off-hours only —
-                #    wipe is market-hours-blocked, so 0 is the honest baseline).
+                # 5. honest verification (review fix M2, 2026-07-16): every
+                #    readable count — the legacy pair AND all FOUR live REST
+                #    tables — must be 0. A missing/erroring count defaults to
+                #    0 (absent table = nothing left = wiped): nothing
+                #    recreates ticks/candles_1m on the REST-only runtime, so
+                #    the old `${X:-1}` default turned every post-nuke wipe
+                #    into a permanent false WIPE-PARTIAL; and a live table we
+                #    JUST truncated failing its count query is a probe error,
+                #    not surviving rows — the per-table TRUNCATE-FAILED lines
+                #    above are the loud failure signal. Counting right after
+                #    truncate is safe off-hours only — wipe is
+                #    market-hours-blocked, so 0 is the honest baseline.
                 (
                     "sleep 3; "
-                    "T=$(curl -fsS 'http://127.0.0.1:9000/exec?query=SELECT%20count()%20FROM%20ticks' 2>/dev/null | grep -o '\\[\\[[0-9]*' | grep -o '[0-9]*'); "
-                    "C=$(curl -fsS 'http://127.0.0.1:9000/exec?query=SELECT%20count()%20FROM%20candles_1m' 2>/dev/null | grep -o '\\[\\[[0-9]*' | grep -o '[0-9]*'); "
-                    "S=$(curl -fsS 'http://127.0.0.1:9000/exec?query=SELECT%20count()%20FROM%20spot_1m_rest' 2>/dev/null | grep -o '\\[\\[[0-9]*' | grep -o '[0-9]*'); "
-                    "echo \"WIPE-RESULT ticks=${T:-?} candles_1m=${C:-?} spot_1m_rest=${S:-?}\"; "
-                    "if [ \"${T:-1}\" = 0 ] && [ \"${C:-1}\" = 0 ] && [ \"${S:-1}\" = 0 ]; then echo WIPE-COMPLETE; else echo 'WIPE-PARTIAL: rows remain (or count unavailable) — inspect above'; fi"
+                    "qc() { curl -fsS \"http://127.0.0.1:9000/exec?query=SELECT%20count()%20FROM%20$1\" 2>/dev/null | grep -o '\\[\\[[0-9]*' | grep -o '[0-9]*'; }; "
+                    "T=$(qc ticks); C=$(qc candles_1m); S=$(qc spot_1m_rest); O=$(qc option_chain_1m); K=$(qc option_contract_1m_rest); A=$(qc rest_fetch_audit); "
+                    "echo \"WIPE-RESULT ticks=${T:-?} candles_1m=${C:-?} spot_1m_rest=${S:-?} option_chain_1m=${O:-?} option_contract_1m_rest=${K:-?} rest_fetch_audit=${A:-?}\"; "
+                    "if [ \"${T:-0}\" = 0 ] && [ \"${C:-0}\" = 0 ] && [ \"${S:-0}\" = 0 ] && [ \"${O:-0}\" = 0 ] && [ \"${K:-0}\" = 0 ] && [ \"${A:-0}\" = 0 ]; then echo WIPE-COMPLETE; "
+                    "else echo 'WIPE-PARTIAL: rows remain — inspect the counts + TRUNCATE-FAILED lines above'; fi"
                 ),
             ]
             cid = _ssm_shell(cmds)
@@ -1571,7 +1591,6 @@ def _console_html() -> str:
        font-size:11.5px; white-space:pre-wrap; max-height:300px; }
   table{ width:100%; border-collapse:collapse; font-size:12px; } th,td{ text-align:left; padding:6px 8px; border-bottom:1px solid var(--line); }
   th{ color:var(--mut); font-weight:600; }
-  td.win{ color:var(--grn); font-weight:800; } /* best-per-column in the per-feed latency table */
   .pr{ display:flex; align-items:center; gap:10px; padding:10px 0; border-bottom:1px solid var(--line); flex-wrap:wrap; }
   .pr .t{ flex:1 1 200px; } .pr .num{ color:var(--mut); font-weight:700; margin-right:6px; }
   .badge{ font-size:11px; font-weight:800; padding:3px 9px; border-radius:20px; }
@@ -1656,7 +1675,6 @@ def _console_html() -> str:
       <div class="card"><div class="lbl">latency — how fast each official minute candle arrives after its minute closes</div>
         <div class="row" style="margin-bottom:12px"><button class="b-blu" onclick="loadLatency()">⚡ Measure now</button></div>
         <div id="latrest" style="overflow:auto"></div>
-        <div class="muted" id="latrestnote" style="margin-top:8px"></div>
         <div class="muted" style="margin-top:6px">One row per (broker, pull type) read from today's fetch log on the box —
           p50/p99 of "minute closed → data in hand", successful pulls only (approximate percentiles, 3 significant
           figures, computed inside the database). Late repairs keep their real ≥60 s delay; unmeasured rows are
@@ -1762,13 +1780,13 @@ function countUp(el,target){ target=parseInt(String(target).replace(/[^0-9]/g,''
   const t0=performance.now(),dur=900; function step(t){ const k=Math.min(1,(t-t0)/dur);
     el.textContent=Math.round(from+(target-from)*(1-Math.pow(1-k,3))).toLocaleString(); if(k<1) requestAnimationFrame(step); } requestAnimationFrame(step); }
 
-function bar(name,n,max){ const pct=max>0?Math.max(3,Math.round(100*n/max)):0;
-  return '<div class="bar"><div class="name">'+name+'</div><div class="track"><div class="fill" style="width:'+pct+'%"></div></div><div class="num">'+n.toLocaleString()+'</div></div>'; }
+// n === null means "count unreadable" — the bar renders '—' with an empty
+// track instead of a fabricated 0 (Rule 11, review fix M4).
+function bar(name,n,max){ const miss=(n==null); const pct=(!miss&&max>0)?Math.max(3,Math.round(100*n/max)):0;
+  return '<div class="bar"><div class="name">'+name+'</div><div class="track"><div class="fill" style="width:'+pct+'%"></div></div><div class="num">'+(miss?'—':n.toLocaleString())+'</div></div>'; }
 // Optional 4th arg picks the value colour explicitly: 'ok' green, 'warn' amber,
 // 'bad' red — so a critical state (red) is distinguishable from drift (amber).
-// Optional 5th arg `tip` renders a hover tooltip (title attribute) — used by
-// the Tick-conservation shield to state its honest envelope.
-function shield(t,s,good,cls,tip){ return '<div class="shield '+(good?'good':'bad')+'"'+(tip?' title="'+esc(tip).replace(/"/g,'&quot;')+'"':'')+'><div class="ttl">'+t+'</div><div class="st '+(cls||(good?'ok':'warn'))+'">'+s+'</div></div>'; }
+function shield(t,s,good,cls){ return '<div class="shield '+(good?'good':'bad')+'"><div class="ttl">'+t+'</div><div class="st '+(cls||(good?'ok':'warn'))+'">'+s+'</div></div>'; }
 // Greyed "box stopped" shield: neither good nor bad — the box is off, so the
 // guarantee is neither proven nor violated. Used ONLY when instance_state is
 // not 'running' (a RUNNING box with unreachable data keeps the REAL warnings).
@@ -1783,7 +1801,11 @@ async function loadOverview(){ $('refbtn').innerHTML='<span class="spin">🔄</s
   const ib=$('instbtn'); ib.hidden=false;
   if(running){ ib.textContent='■ Stop instance'; ib.className='b-stop'; }
   else{ ib.textContent='▶ Start instance'; ib.className='b-go'; }
-  countUp($('ticksbig'), j.rows_today_total||'0');
+  // Honest hero (Rule 11, review fix M4): rows_today_total === "" means the
+  // box/QuestDB was unreachable — render '—' and skip the count-up, never an
+  // animated fabricated 0 (the _sum_counts docstring contract).
+  if(j.rows_today_total==null||j.rows_today_total===''){ $('ticksbig').textContent='—'; lastTicks=0; }
+  else countUp($('ticksbig'), j.rows_today_total);
   $('p_inst').innerHTML='<span class="'+(running?'ok':'bad')+'">'+(j.instance_state||'?')+'</span>';
   $('p_app').innerHTML='<span class="'+(appOk?'ok':'bad')+'">'+(appOk?'up':(j.app||'down'))+'</span>';
   $('p_mkt').innerHTML='<span class="'+(j.market_hours?'warn':'')+'">'+(j.market_hours?'OPEN':'closed')+'</span>';
@@ -1798,8 +1820,11 @@ async function loadOverview(){ $('refbtn').innerHTML='<span class="spin">🔄</s
   const fbKeys=Object.keys(perFeed).sort();
   $('feedsplit').textContent = fbKeys.length ? fbKeys.map(k=>k+': '+perFeed[k].toLocaleString()).join(' | ') : '';
   // Data-tab bars: today's rows per LIVE table (spot / chain / contracts).
+  // An unreadable count (empty value — box/QuestDB unreachable) renders '—',
+  // never a fabricated 0 bar (Rule 11, review fix M4).
   const rt=j.rows_today||{}, tkeys=['spot','chain','contracts'];
-  const vals=tkeys.map(k=>parseInt(rt[k],10)||0), mx=Math.max(1,...vals);
+  const vals=tkeys.map(k=>String(rt[k]==null?'':rt[k]).trim()===''?null:(parseInt(rt[k],10)||0));
+  const mx=Math.max(1,...vals.map(v=>v||0));
   $('bars').innerHTML=tkeys.map((k,i)=>bar(k,vals[i],mx)).join('');
   // Dedup-key check: the real spot_1m_rest upsert key is 4 columns
   // (ts, security_id, exchange_segment, feed) per DEDUP_KEY_SPOT_1M_REST.
@@ -1860,12 +1885,15 @@ async function loadFeeds(){ $('feeds').dataset.loaded='1'; $('feeds').innerHTML=
     // REST-pull line (2026-07-16): today's fetch-log outcomes + last-hour
     // prompt-pull latency from rest_fetch_audit — the old ticks/subscribed
     // counters read frozen live-feed registries and are gone. "failed" =
-    // every non-ok, non-rate-limited outcome (error/empty/no_token/…).
+    // every non-ok, non-rate-limited outcome (error/empty/no_token/…) —
+    // EXCEPT skipped/boundary_skipped, which are minutes the leg never
+    // attempted (trading-day gate / missed boundaries), not pull failures
+    // (review fix L4; no_token IS a failure and stays counted).
     const ra=(j.rest_audit||{})[f.name], rl=(j.rest_lat_hour||{})[f.name];
     let pull;
     if(ra && Object.keys(ra).length){
       const ok=ra.ok||0, rlim=ra.rate_limited||0;
-      const failed=Object.keys(ra).filter(k=>k!=='ok'&&k!=='rate_limited').reduce((s,k)=>s+(ra[k]||0),0);
+      const failed=Object.keys(ra).filter(k=>k!=='ok'&&k!=='rate_limited'&&k!=='skipped'&&k!=='boundary_skipped').reduce((s,k)=>s+(ra[k]||0),0);
       pull='pulls today: '+ok.toLocaleString()+' ok · '+failed.toLocaleString()+' failed · '+rlim.toLocaleString()+' rate-limited';
       if(rl&&(rl.p50_ms!=null||rl.p99_ms!=null)) pull+=' — last hour: p50 '+fmtLagMs(rl.p50_ms)+' / p99 '+fmtLagMs(rl.p99_ms)+' after minute close';
     } else { pull='no official-candle pulls recorded today'; }
@@ -1876,7 +1904,7 @@ async function loadFeeds(){ $('feeds').dataset.loaded='1'; $('feeds').innerHTML=
   const errs=[j.feeds_error,j.health_error].filter(Boolean).join(' · ');
   if(errs) $('feedsmsg').textContent=errs; }
 async function feedToggle(feed,enabled){
-  if(!enabled && !confirm('Turn OFF the "'+feed+'" live feed? Ticks from '+feed+' stop until you turn it back on.')){ toast('cancelled'); return; }
+  if(!enabled && !confirm('Turn OFF "'+feed+'"? Its official-candle pulls (spot + option chain) stop until you turn it back on.')){ toast('cancelled'); return; }
   toast((enabled?'enabling ':'disabling ')+feed+'…');
   const j=await call('feed-toggle',{feed:feed,enabled:enabled}); if(!j) return;
   if(j.ok){ toast('✅ '+feed+' '+(enabled?'enabled':'disabled')); }
@@ -1965,7 +1993,7 @@ function fmtLagMs(v){ if(v==null) return '-'; v=Number(v);
 // hardcoded), so a future broker/leg gets its row with zero portal changes.
 // "-" = no successful pulls recorded today for that pair (never fake zeros).
 async function loadLatency(){ $('latnet').dataset.loaded='1'; $('latnet').innerHTML='<span class="muted">measuring…</span>';
-  $('latrest').innerHTML='<span class="muted">measuring…</span>'; $('latrestnote').textContent='';
+  $('latrest').innerHTML='<span class="muted">measuring…</span>';
   const j=await call('latency'); if(!j){ $('latnet').innerHTML=''; $('latrest').innerHTML=''; return; }
   const rows=Array.isArray(j.rest_latency)?j.rest_latency:[];
   if(rows.length){
