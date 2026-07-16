@@ -588,6 +588,29 @@ enabled = false # stays OFF until the operator's dated flip note (the chain leg 
 strikes_each_side = 2
 
 # ===========================================================================
+# Groww REST burst auto-ladder (operator approval 2026-07-14 — "approved
+# and go ahead with the recommendation"; contract:
+# no-rest-except-live-feed-2026-06-27.md §9.7 +
+# groww-second-feed-scope-2026-06-19.md §38.9). tier selects how the
+# per-minute Groww spot + chain waves fire: "two_wave" (the rate-safe
+# DEFAULT — 3 chain requests at close+300ms, 4 spot at close+1350ms;
+# boundary burst <= 4/s) or "seven_concurrent" (the operator preference —
+# all 7 at close+300ms; flip ONLY after the off-hours rate probe passes,
+# with a fresh dated rule note). Any Groww-leg HTTP 429 steps the session
+# DOWN the demotion ladder (two_wave -> staggered -> fully sequential); a
+# restart restores this configured tier.
+# warm_up = true sends one unauthenticated pre-boundary GET per leg client
+# at boundary-4s (3s-bounded, response discarded) so an idle-closed TLS
+# connection is re-established before the critical window. An ABSENT
+# section = two_wave + warm-up off — still rate-safe: the wave instants
+# are millisecond-precise regardless of the warm-up toggle, so the > 1s
+# two_wave separation always holds (2026-07-14 fix-round wording).
+# ===========================================================================
+[groww_rest_burst]
+tier = "two_wave" # seven_concurrent is probe-gated — dated rule note required to flip
+warm_up = true
+
+# ===========================================================================
 # Daily timeframe-consistency verifier (operator directive 2026-07-13 —
 # "how will you guarantee that all our defined timeframes internally are
 # correct — how do you identify whether any miscalculation or data
