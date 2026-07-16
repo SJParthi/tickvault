@@ -106,7 +106,7 @@ impl PrevDayCloseStamper {
     /// 00:00:00 so the new day's first tick re-stamps.
     pub fn clear_for_new_day(&self) {
         let guard = self.inner.guard();
-        let keys: Vec<StamperKey> = self.inner.keys(&guard).copied().collect();
+        let keys: Vec<StamperKey> = self.inner.keys(&guard).copied().collect(); // APPROVED: cold-path daily reset at IST midnight, never per-tick
         for k in keys {
             self.inner.remove(&k, &guard);
         }

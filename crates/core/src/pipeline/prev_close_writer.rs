@@ -1,6 +1,6 @@
 //! Async PrevClose cache writer (Wave 1 Item 0.a).
 //!
-//! Replaces the previous inline `std::fs::write(...) + std::fs::rename(...)`
+//! Replaces the previous inline synchronous filesystem write + rename
 //! call on the tick hot path with a dedicated writer task fed by a bounded
 //! `tokio::sync::mpsc::channel(CHANNEL_CAPACITY)`. The hot path's only cost
 //! is a single non-blocking `try_send` of a `bytes::Bytes` payload.
@@ -170,6 +170,7 @@ pub fn try_enqueue_global(bytes: Bytes) -> EnqueueOutcome {
 // Tests
 // ---------------------------------------------------------------------------
 
+// O(1) EXEMPT: begin — test-only module, no production hot path
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 // APPROVED: test-only — unwrap on temp_dir + read_to_string is canonical Rust.
@@ -297,3 +298,4 @@ mod tests {
         ));
     }
 }
+// O(1) EXEMPT: end
