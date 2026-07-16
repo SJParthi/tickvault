@@ -89,6 +89,7 @@ pub const fn bars_per_day(tf: TfIndex) -> u32 {
 /// Σ [`bars_per_day`] over all 21 TFs — the per-slot per-day bar count
 /// (1,279; pinned by `test_bars_per_day_session_math`).
 #[must_use]
+// TEST-EXEMPT: pure Σ over bars_per_day — pinned by test_bars_per_day_session_math + the capacity-envelope tests.
 pub fn total_bars_per_day_all_tfs() -> u32 {
     let mut total = 0u32;
     for tf in TfIndex::ALL {
@@ -297,6 +298,7 @@ impl SpotBarStore {
 
     /// The configured ring depth in trading days.
     #[must_use]
+    // TEST-EXEMPT: trivial config accessor — exercised throughout the store tests (depth/capacity assertions).
     pub fn spot_days(&self) -> u32 {
         self.spot_days
     }
