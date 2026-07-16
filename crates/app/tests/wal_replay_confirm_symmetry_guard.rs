@@ -80,3 +80,12 @@ fn both_paths_gate_confirm_on_a_reinjection_clean_flag() {
         );
     }
 }
+
+// Section C (the order-runtime dry-run PR's rest-stack conditional-confirm
+// pin) was REMOVED 2026-07-14 on the merge with main's #1532 Dhan noise
+// lock: the dhan-OFF REST stack no longer drains or confirms order-update
+// WAL segments at all (socket-free shape — the whole capture/drain/confirm
+// surface is gated behind a fresh dated operator quote per
+// dhan-rest-only-noise-lock-2026-07-14 §3). The two main.rs sites above are
+// the complete confirm surface again; the stack's WAL-free shape is pinned
+// by `test_rest_stack_wires_order_runtime` in dhan_rest_stack.rs.

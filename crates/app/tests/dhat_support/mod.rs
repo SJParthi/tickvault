@@ -34,7 +34,6 @@
 //!     absorbed: one-time lazy init (the long-sanctioned warm-up semantic —
 //!     every test here already warms up explicitly) and cross-thread
 //!     phantom noise (the flake this helper exists to absorb).
-//!
 //! Budgets are RATCHETS and are not changed by this helper.
 
 /// Measure `workload` between `dhat::HeapStats` snapshots, retrying up to

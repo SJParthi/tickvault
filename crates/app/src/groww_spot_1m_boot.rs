@@ -213,6 +213,13 @@ pub struct GrowwSpot1mTaskParams {
     /// spot→chain minute-done signal was RETIRED by the auto-ladder — the
     /// chain leg fires on its own minute-boundary timer.)
     pub burst: Arc<GrowwRestBurstState>,
+    /// Order-runtime mark tap (dry-run PR, 2026-07-14; re-homed 2026-07-16
+    /// after the Groww live feed retired): `Some` ONLY when
+    /// `[order_runtime].enabled`. Marks are the OWN-FIRE just-closed-minute
+    /// candle CLOSES, forwarded AFTER the persist flush ACK — backfill,
+    /// sweep and warm-up NEVER produce marks (stale prices must not fill
+    /// paper orders). `None` ⇒ the tap is structurally absent (no-op).
+    pub mark_forwarder: Option<crate::order_runtime::MarkForwarder>,
 }
 
 // ---------------------------------------------------------------------------
@@ -2007,6 +2014,15 @@ async fn fire_one_minute(
     // 2026-07-16 REST-era candle derivation: bars staged for the fold-writer
     // handoff — sent ONLY after the flush ACK confirms persistence.
     let mut confirmed_bars: Vec<crate::rest_candle_fold::ConfirmedBar> = Vec::new();
+    // Order-runtime mark tap (re-homed 2026-07-16): OWN-FIRE just-closed-
+    // minute closes ONLY, staged here and forwarded AFTER the flush ACK
+    // (persist-confirm choke point — mirrors the fold hook placement). The
+    // BACKFILL branch below and the post-session sweep NEVER stage marks:
+    // a >60s-old repaired price must not fill a paper order (the C11
+    // replay-window lesson applied to the REST legs). Cold path (once per
+    // minute) — the Vec is fine; the forward itself is a lock-free
+    // best-effort try_send that no-ops when the runtime is disabled.
+    let mut staged_marks: Vec<crate::order_runtime::MarkUpdate> = Vec::new();
 
     if let Some(token) = token_cache.ensure_token().await {
         // 2026-07-14 auto-ladder: the WAVE — all targets fetch
@@ -2258,6 +2274,17 @@ async fn fire_one_minute(
                                 &candle,
                             ),
                         );
+                        // Mark tap: OWN-FIRE close only (this is the just-
+                        // closed target minute; the backfill branch below
+                        // deliberately stages NO mark).
+                        #[allow(clippy::cast_possible_truncation)]
+                        // APPROVED: MarkUpdate carries f32 by contract (the
+                        // wire LTP precision); price-level narrowing only.
+                        staged_marks.push(crate::order_runtime::MarkUpdate {
+                            security_id: sid_u64,
+                            segment_code: tickvault_common::constants::EXCHANGE_SEGMENT_IDX_I,
+                            price: candle.close as f32,
+                        });
                     } else {
                         // Round-2 LOW-6: never a silent skip — counted +
                         // one coalesced warn (defensive; ids are positive).
@@ -2411,6 +2438,16 @@ async fn fire_one_minute(
             // 2026-07-16 REST-era candle derivation: the bars are now
             // persist-CONFIRMED — hand them to the fold writer.
             crate::rest_candle_fold::send_confirmed_bars(&confirmed_bars);
+            // Order-runtime mark tap: forward the OWN-FIRE closes now that
+            // the flush ACK confirmed persistence (a mark must never
+            // reference a price the audit record does not back). Best-effort
+            // try_send; a full channel drops the mark (counted — the next
+            // minute supersedes it); None ⇒ runtime disabled, zero work.
+            if let Some(forwarder) = params.mark_forwarder.as_ref() {
+                for mark in &staged_marks {
+                    forwarder.mark_forward(mark.security_id, mark.segment_code, mark.price);
+                }
+            }
         }
         // GAP-11: the ok rows land ONLY after (and stamped with) the data
         // flush ACK — discarded on a failed flush.
@@ -4069,6 +4106,7 @@ mod tests {
             nse_mock_trading_dates: vec![],
         };
         GrowwSpot1mTaskParams {
+            mark_forwarder: None,
             notifier: NotificationService::disabled(),
             calendar: Arc::new(
                 tickvault_common::trading_calendar::TradingCalendar::from_config(&config)

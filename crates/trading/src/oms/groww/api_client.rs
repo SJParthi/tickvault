@@ -411,7 +411,7 @@ pub trait OrderTransport {
 /// executor stays generic (no `dyn`). All five endpoints return the tolerant
 /// all-`Option` [`SmartOrderPayload`] family — the cancel/modify echoes are
 /// documented subsets of the full object.
-#[allow(async_fn_in_trait)] // executor is generic (no dyn); futures awaited inline.
+#[allow(async_fn_in_trait)] // APPROVED: executor is generic (no dyn); futures awaited inline.
 pub trait SmartOrderTransport {
     /// `POST /v1/order-advance/create` (GTT or OCO body).
     async fn create_smart_order(
