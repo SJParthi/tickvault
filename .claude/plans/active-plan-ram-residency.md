@@ -79,7 +79,7 @@ path, no new market-data fetch:
      documented: one hook site covering both legs beats two duplicated hooks; the
      wiring guard pins both legs' calls INTO the helper plus the helper's hook).
    - **Boot rehydration:** today's `option_chain_1m` rows via bounded hardened `/exec`
-     reads (PR-1's read discipline: micros WHERE window, explicit LIMIT tripwire,
+     reads (PR-1's read discipline: micros WHERE window, explicit LIMIT+1 tripwire,
      streamed 8 MiB cap, redirect-none client, timeouts) — CHUNKED per
      (feed, underlying, 30-min session window) so no single response can approach the
      cap (≤ ~78 bounded queries worst case, cold boot path, honestly flagged
@@ -88,10 +88,16 @@ path, no new market-data fetch:
 3. **Observability:** gauges `tv_ram_store_spot_bars_resident{feed}`,
    `tv_ram_store_spot_days_depth{feed}` (minimum depth across the feed's slots — the
    guaranteed depth, never the best case), `tv_ram_store_chain_minutes_resident{feed}`,
+   `tv_ram_store_spot_dropped_over_window` (counter-style monotonic gauge — the spot
+   store's lifetime over-window drop total, published by the stats task; round-1 HIGH
+   fix — the spot ring core itself is emit-free by design),
    `tv_ram_store_estimated_bytes`; dense heartbeat `tv_ram_store_heartbeat_total` (one
    increment per 60 s stats tick — flatline = dead task); counters
-   `tv_ram_store_dropped_total{reason}` + `tv_ram_store_errors_total{stage}` +
-   `tv_ram_store_rehydrate_minutes_total{feed}`. New ErrorCode `RamStore01Degraded`
+   `tv_ram_store_dropped_total{reason}` (chain-only: `row_cap` / `day_drop` /
+   `minute_cap`) + `tv_ram_store_errors_total{stage}` (`rehydrate_query` /
+   `rehydrate_parse` / `rehydrate_truncated` / `task_respawn`) +
+   `tv_ram_store_rehydrate_minutes_total{feed}` (stored minutes INCLUDING
+   row-cap-truncated ones). New ErrorCode `RamStore01Degraded`
    (`RAMSTORE-01`, Severity::High, auto-triage-safe, LOG-SINK-ONLY — delivery boundary
    documented in the rule file) with stage taxonomy
    `install` / `rehydrate_query` / `rehydrate_parse` / `rehydrate_truncated` /
@@ -100,7 +106,9 @@ path, no new market-data fetch:
    crossref directions stay green).
 4. **Config:** `[market_ram_store]` → `MarketRamStoreConfig { enabled (serde default
    FALSE — fail-safe), spot_days (default 35, validated 1..=370), chain_row_cap
-   (default 1_000, validated 1..=10_000) }`; `config/base.toml` opts in with
+   (default 1_000, validated 200..=5_000 — round-1 fix: the rehydrate window LIMIT
+   derives from the cap, so a foot-gun tiny value would make every window permanently
+   hit its truncation tripwire) }`; `config/base.toml` opts in with
    `enabled = true`, `spot_days = 35`, `chain_row_cap = 1000`. A `spot_days` below
    `rest_candle_fold.catchup_days` is legal (the ring simply holds less than catch-up
    offers) — noted with a boot log line, never a hard error. Disabled = honest boot
@@ -120,14 +128,28 @@ path, no new market-data fetch:
 - A middle-insert (a bucket never emitted before, older than the ring tail) is bounded
   by the ring length and structurally rare — handled, counted via stats, never a panic.
 - Ring at capacity: push_back evicts front (oldest); push_front of an over-window bar
-  drops the incoming bar.
+  drops the incoming bar. Empty-ring overflow (a day block LARGER than capacity into an
+  empty ring) keeps the NEWEST `capacity` bars and drops the OLDEST prefix (round-1
+  fix — eviction direction matches front-eviction, never keep-oldest/drop-newest).
 - Chain day roll: first snapshot of a NEWER day clears the slot map; an OLDER-day
   (stale) publish is dropped + counted (`day_drop`) — never clears the live day.
 - Chain boot sentinel (`minute_ts == 0`) is never recorded.
 - Over-cap chain snapshot (> `chain_row_cap` rows) is truncated loudly (kept prefix,
   counted, coded warn once per (feed, underlying, day)).
-- Rehydrate LIMIT hit → that window is skipped LOUDLY (`rehydrate_truncated`), never a
-  partially-trusted window; rehydrated minutes never overwrite live-published minutes.
+- Rehydrate truncation tripwire is LIMIT+1 (round-1 fix): the query fetches one extra
+  row, so an EXACT-boundary window (`len == limit`) is legitimately complete — only
+  `len > limit` flags `rehydrate_truncated` and skips the window LOUDLY, never a
+  partially-trusted window; rehydrated minutes never overwrite live-published minutes;
+  row-cap-truncated rehydrated minutes still count in
+  `tv_ram_store_rehydrate_minutes_total` (stored, loud via `reason="row_cap"`).
+- Chain pre-open stale day (round-1 honesty): the store clears only on a NEWER-day
+  publish — an overnight-surviving process serves the PRIOR session pre-open until the
+  first ~09:16 publish; the read surface exposes `ChainDayStore::day()` so any future
+  consumer gates on today (the §38.8 freshness gate). No clock-based clearing.
+- Catch-up GiveUp divergence (round-1 honesty note on the hook doc): the RAM day-block
+  hook records the fold output unconditionally while the paced seal emission can
+  GiveUp — RAM may transiently hold bars `candles_*` dropped until the next boot's
+  catch-up re-folds from the durable `spot_1m_rest` source.
 - Disabled config → no global installs; all hooks no-op; byte-identical behavior.
 - Mid-session restart: spots re-fill from PR-1's catch-up; chain re-fills from the
   bounded rehydrate — the morning is back in RAM within the boot cold path.
@@ -182,14 +204,19 @@ chain publishes; they never write any table.
 ## Observability
 
 - Gauges: `tv_ram_store_spot_bars_resident{feed}`, `tv_ram_store_spot_days_depth{feed}`,
-  `tv_ram_store_chain_minutes_resident{feed}`, `tv_ram_store_estimated_bytes` —
-  refreshed by the 60 s stats task; the operator's "is the month actually in RAM?"
-  question becomes a gauge read.
+  `tv_ram_store_chain_minutes_resident{feed}`,
+  `tv_ram_store_spot_dropped_over_window` (counter-style monotonic — the spot store's
+  lifetime over-window drop total; round-1 HIGH fix),
+  `tv_ram_store_estimated_bytes` — refreshed by the 60 s stats task; the operator's
+  "is the month actually in RAM?" question becomes a gauge read.
 - Dense heartbeat: `tv_ram_store_heartbeat_total` (per stats tick — alarm-ready,
   metrics-local today per the delivery boundary).
-- Counters: `tv_ram_store_dropped_total{reason}` (stale_day / over_window /
-  chain_row_cap / sentinel), `tv_ram_store_errors_total{stage}`,
-  `tv_ram_store_rehydrate_minutes_total{feed}`, `tv_ram_store_task_respawn_total{reason}`.
+- Counters (the EXACT emitted names — round-1 sync): `tv_ram_store_dropped_total{reason}`
+  with reasons `row_cap` / `day_drop` / `minute_cap` (chain store only),
+  `tv_ram_store_errors_total{stage}` with stages `rehydrate_query` / `rehydrate_parse` /
+  `rehydrate_truncated` / `task_respawn` (task deaths ride the `task_respawn` stage —
+  there is NO separate `tv_ram_store_task_respawn_total`),
+  `tv_ram_store_rehydrate_minutes_total{feed}` (stored minutes incl. truncated).
 - Every degrade is `error!`/`warn!` with `code = ErrorCode::RamStore01Degraded.code_str()`
   (tag-guard discipline). LOG-SINK-ONLY delivery (no CloudWatch entry) — documented in
   the rule file with the paging drift guard untouched.
@@ -207,10 +234,10 @@ chain publishes; they never write any table.
   - Tests: error_code_rule_file_crossref, triage_rules_full_coverage_guard, test_code_str_follows_expected_prefix_pattern
 - [x] Item 3 — `SpotBarStore` (rings + upsert + day-block + reads + stats + global)
   - Files: crates/trading/src/in_mem/spot_bar_store.rs, crates/trading/src/in_mem/mod.rs
-  - Tests: test_spot_bar_store_append_sealed_and_bar_at_roundtrip, test_spot_bar_store_upsert_by_ts_replaces_in_place, test_spot_bar_store_wraparound_evicts_oldest, test_spot_bar_store_record_day_block_prepends_newest_to_oldest, test_spot_bar_store_latest_n_returns_newest_first, test_spot_bar_store_depth_days_counts_distinct_days, test_spot_bar_store_stats_and_estimated_bytes, test_estimated_capacity_bytes_under_40mb_envelope, test_bars_per_day_session_math, test_install_spot_bar_store_first_wins
+  - Tests: test_spot_bar_store_append_sealed_and_bar_at_roundtrip, test_spot_bar_store_upsert_by_ts_replaces_in_place, test_spot_bar_store_wraparound_evicts_oldest, test_spot_bar_store_record_day_block_prepends_newest_to_oldest, test_spot_bar_store_record_day_block_empty_ring_overflow_keeps_newest, test_spot_bar_store_latest_n_returns_newest_first, test_spot_bar_store_depth_days_counts_distinct_days, test_spot_bar_store_stats_and_estimated_bytes, test_estimated_capacity_bytes_under_40mb_envelope, test_bars_per_day_session_math, test_install_spot_bar_store_first_wins
 - [x] Item 4 — `ChainDayStore` (minute map + day roll + caps + rehydrate insert + stats + global)
   - Files: crates/core/src/pipeline/chain_day_store.rs, crates/core/src/pipeline/mod.rs
-  - Tests: test_chain_day_store_record_live_and_minute_snapshot_roundtrip, test_chain_day_store_day_roll_clears_previous_day, test_chain_day_store_stale_older_day_publish_dropped, test_chain_day_store_row_cap_truncates_loudly, test_chain_day_store_record_rehydrated_never_overwrites_live, test_chain_day_store_latest_minutes_and_minutes_resident, test_chain_day_store_stats_estimated_bytes_under_120mb, test_install_chain_day_store_first_wins, test_chain_day_store_sentinel_never_recorded
+  - Tests: test_chain_day_store_record_live_and_minute_snapshot_roundtrip, test_chain_day_store_day_roll_clears_previous_day, test_chain_day_store_stale_older_day_publish_dropped, test_chain_day_store_row_cap_truncates_loudly, test_chain_day_store_record_rehydrated_never_overwrites_live, test_chain_day_store_latest_minutes_and_minutes_resident, test_chain_day_store_day_exposes_resident_day, test_chain_day_store_stats_estimated_bytes_under_120mb, test_install_chain_day_store_first_wins, test_chain_day_store_sentinel_never_recorded
 - [x] Item 5 — Fold emit hooks (emit_seals upsert + refold_day day-block) + chain publish hook
   - Files: crates/app/src/rest_candle_fold.rs, crates/app/src/option_chain_1m_boot.rs
   - Tests: test_ram_hook_catchup_equals_live_fold_ring, ram_store_wiring_guard (hook pins)
