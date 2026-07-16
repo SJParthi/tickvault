@@ -252,13 +252,11 @@ impl ChainDayStore {
             );
             return ChainRecordOutcome::DroppedMinuteCap;
         }
-        if live {
-            inner.minutes.insert(minute, Arc::new(snapshot));
-        } else if is_new_minute {
-            inner.minutes.insert(minute, Arc::new(snapshot));
-        } else {
+        if !live && !is_new_minute {
+            // Rehydration never overwrites a live-published minute.
             return ChainRecordOutcome::KeptExistingLive;
         }
+        inner.minutes.insert(minute, Arc::new(snapshot));
         if truncated {
             ChainRecordOutcome::RecordedTruncated
         } else {
@@ -278,10 +276,8 @@ impl ChainDayStore {
         let inner = self.slots[slot_index(feed, underlying)]
             .read()
             .unwrap_or_else(PoisonError::into_inner);
-        inner
-            .minutes
-            .get(&minute_ts_ist_nanos)
-            .map(|arc| Arc::clone(arc)) // O(1) EXEMPT: Arc refcount bump on a cold read path, not a data copy
+        // Arc refcount bump on a cold read path, not a data copy.
+        inner.minutes.get(&minute_ts_ist_nanos).map(Arc::clone)
     }
 
     /// The newest `n` stored minutes for a slot, NEWEST FIRST (cold read;

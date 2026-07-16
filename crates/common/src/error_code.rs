@@ -2588,7 +2588,10 @@ mod tests {
         // 2026-07-16 (REST-era candle derivation, operator directive):
         // +1 FOLD-01 (RestCandleFold01Degraded — bar-fold writer degrade;
         // log-sink-only, High, auto-triage-safe) => 154.
-        assert_eq!(ErrorCode::all().len(), 154);
+        // 2026-07-16 (RAM residency stores, PR-2 of the same directive):
+        // +1 RAMSTORE-01 (RamStore01Degraded — spot/chain RAM store
+        // degrade; log-sink-only, High, auto-triage-safe) => 155.
+        assert_eq!(ErrorCode::all().len(), 155);
     }
 
     #[test]
