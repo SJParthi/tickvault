@@ -179,6 +179,22 @@ pub enum RetentionClass {
 /// class. 35 days is the smallest clean change (one existing knob covers
 /// ticks + candles + chain); tightening chain further toward current-day is
 /// a follow-up knob if disk pressure demands it.
+///
+/// **First-sweep burst (dated honest note, 2026-07-16 round-2 MEDIUM):**
+/// the 90 → 35 day move makes every chain partition aged 36..90 days
+/// drop-eligible AT ONCE — up to ~55 DAY partitions × 2 tables ≈ 110
+/// partitions (~4 GB) in the FIRST post-merge sweep. Bounded by design,
+/// no code change: (a) `max_partitions_per_run` (default 200) caps the
+/// worklist, so the burst fits one run but can never exceed the cap;
+/// (b) each partition is processed STRICTLY serially through
+/// export → upload → verify → audit → drop, so temp-disk holds ONE gzip
+/// export at a time under `data/tmp/partition-archive/` and the
+/// wall-clock cost is ~110 sequential export+upload round-trips (a
+/// minutes-class one-time run, off-hours); (c) the leg stays FAIL-CLOSED
+/// — a degraded S3 leg (upload/verify failure) keeps every affected
+/// partition on disk (no verified copy ⇒ no drop), so the worst case of
+/// a bad first sweep is "nothing freed yet", never data loss. Subsequent
+/// sweeps return to the ~1-partition/day steady state.
 const CHAIN_MARKET_DATA_TABLES: [&str; 2] = [
     crate::option_chain_1m_persistence::OPTION_CHAIN_1M_TABLE,
     crate::option_contract_1m_rest_persistence::OPTION_CONTRACT_1M_REST_TABLE,
