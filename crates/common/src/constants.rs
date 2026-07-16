@@ -1799,10 +1799,11 @@ const _: () = assert!(
 
 /// The Dhan spot ROLLING-WINDOW length (operator spot-concurrency ladder
 /// addition 2026-07-15) — the structural window the spot gate counts
-/// authorizations over, AND the spacing between the concurrency ladder's
-/// consecutive group anchors (`:03.0 / :04.0 / :05.0 / :06.0`). 1000ms
-/// because the Dhan Data-API budget is expressed per second (5/sec hard
-/// cap — `dhan/api-introduction.md` rule 7).
+/// authorizations over, AND the spacing between consecutive Dhan burst
+/// SECOND buckets (2026-07-16 shape: second 1 / second 2 / greedy
+/// overflow seconds). 1000ms because the Dhan Data-API budget is
+/// expressed per second (5/sec hard cap — `dhan/api-introduction.md`
+/// rule 7).
 pub const CADENCE_SPOT_WINDOW_MS: i64 = 1_000;
 
 /// Hard ceiling for `[cadence] spot_window_cap` — the Dhan Data-API hard
@@ -1819,14 +1820,12 @@ pub const CADENCE_SPOT_WINDOW_CAP_CEILING: u32 = 5;
 pub const CADENCE_GROWW_WAVE_STEP_MS: i64 = 1_000;
 
 /// Hard floor for `[cadence] chain_min_spacing_ms` — Dhan's option-chain
-/// rule is 1 unique request every 3 seconds (`dhan/option-chain.md` rule 4;
-/// the cadence gates apply it per-underlying AND globally, the strictest
-/// interpretation).
+/// rule is 1 unique request every 3 seconds per SAME (underlying, expiry)
+/// (`dhan/option-chain.md` rule 4; the 2026-07-16 operator directive
+/// pins it as per-(underlying, expiry) ONLY — different underlyings are
+/// explicitly concurrent, so the retired GLOBAL chain gate is gone and
+/// the cadence gates apply this floor per key).
 pub const CADENCE_CHAIN_MIN_SPACING_FLOOR_MS: i64 = 3_000;
-
-/// Hard ceiling for `[cadence] dhan_ladder_max_rungs` — rung 5 puts the
-/// earliest chain pre-fire at T−10s (:50), the operator-locked floor.
-pub const CADENCE_LADDER_MAX_RUNGS_CEILING: u8 = 5;
 
 // ---------------------------------------------------------------------------
 // Option-chain 1m REST pipeline (operator grant 2026-07-12 — PR-3, the

@@ -45,8 +45,8 @@ use super::expiry::{
 };
 use super::gate::{DhanGates, GateVerdict};
 use super::ladder::{
-    CycleVerdict, GROWW_SHAPE_MAX_STEP, LadderState, SPOT_CONCURRENCY_MAX_STEP, StreakLadder,
-    StreakShift, failure_arms_ladder, may_retry_in_cycle, min_spot_step_for_cap, next_rung,
+    DHAN_SHAPE_MAX_STEP, GROWW_SHAPE_MAX_STEP, SPOT_CONCURRENCY_MAX_STEP, StreakLadder,
+    StreakShift, failure_arms_ladder, may_retry_in_cycle, min_spot_step_for_cap,
 };
 use super::schedule::{
     CADENCE_RETRY_LATENCY_ALLOWANCE_MS, CycleSlots, build_cycle_slots, next_joinable_boundary,
@@ -346,9 +346,15 @@ where
         )))
     });
 
-    let mut ladder = LadderState::default();
+    // The Dhan SHAPE ladder (operator directive 2026-07-16): rung 0 =
+    // the primary 5+2 burst packing (chains + 2 decision-critical spots
+    // in the burst second, remaining 2 spots the next second); rung 1 =
+    // the split fallback (chains in second 1, ALL 4 spots in second 2).
+    // Same streak thresholds as the concurrency ladders; dirty =
+    // arming-rule failure classes (RateLimited / Timeout / Transport).
+    let mut dhan_shape_ladder = StreakLadder::starting_at(0);
     // The adaptive concurrency ladders (operator spec addition 2026-07-15;
-    // day-scoped like the anchor rung). The Dhan spot ladder starts at
+    // day-scoped like the shape rung). The Dhan spot ladder starts at
     // the STRUCTURAL floor for the configured window cap (a cap below 4
     // cannot admit the full step-0 simultaneous group).
     let spot_step_floor = min_spot_step_for_cap(cfg.spot_window_cap);
@@ -359,7 +365,7 @@ where
     let mut current_date = clock.ist_date();
     let mut exhausted_episode = false;
     let mut lanes_parked = false;
-    metrics::gauge!("tv_cadence_ladder_rung").set(f64::from(ladder.rung));
+    metrics::gauge!("tv_cadence_dhan_shape_step").set(f64::from(dhan_shape_ladder.step));
     metrics::gauge!("tv_cadence_spot_concurrency_step").set(f64::from(spot_ladder.step));
     metrics::gauge!("tv_cadence_groww_shape_step").set(f64::from(groww_ladder.step));
 
@@ -368,13 +374,13 @@ where
         let today = clock.ist_date();
         if today != current_date {
             current_date = today;
-            if ladder.rung != 0 {
+            if dhan_shape_ladder.step != 0 {
                 info!(
-                    from_rung = ladder.rung,
-                    "cadence: day-start ladder reset to rung 0"
+                    from_step = dhan_shape_ladder.step,
+                    "cadence: day-start Dhan shape ladder reset to rung 0"
                 );
             }
-            ladder = LadderState::default();
+            dhan_shape_ladder = StreakLadder::starting_at(0);
             spot_ladder = StreakLadder::starting_at(spot_step_floor);
             groww_ladder = StreakLadder::starting_at(0);
             exhausted_episode = false;
@@ -389,7 +395,7 @@ where
             // illegal_fsm_move channels fire for a routine pattern
             // (hostile-review round 1, CAD-NEW-1/CONC-1, 2026-07-15).
             latch = DecisionLatch::new();
-            metrics::gauge!("tv_cadence_ladder_rung").set(0.0);
+            metrics::gauge!("tv_cadence_dhan_shape_step").set(0.0);
             metrics::gauge!("tv_cadence_spot_concurrency_step").set(f64::from(spot_ladder.step));
             metrics::gauge!("tv_cadence_groww_shape_step").set(0.0);
         }
@@ -426,7 +432,7 @@ where
         let now_ms = clock.ist_ms_of_day();
         let is_trading = deps.calendar.is_trading_day(today);
         let boundary = if is_trading {
-            next_joinable_boundary(now_ms, last_boundary, ladder.rung, &cfg)
+            next_joinable_boundary(now_ms, last_boundary, &cfg)
         } else {
             None
         };
@@ -461,7 +467,7 @@ where
 
         let slots = build_cycle_slots(
             boundary,
-            ladder.rung,
+            dhan_shape_ladder.step,
             spot_ladder.step,
             groww_ladder.step,
             &cfg,
@@ -478,17 +484,17 @@ where
             shutdown_fut.as_mut(),
         )
         .await;
-        let (verdict, dhan_spot_dirty, groww_dirty) = match outcome {
+        let (dhan_dirty, dhan_spot_dirty, groww_dirty) = match outcome {
             CycleRun::Shutdown => return LoopExit::Shutdown,
             // The IST calendar date changed mid-cycle (suspend across
             // midnight) — the cycle was dropped with no partial emit; the
             // loop top re-reads the date and resets the day state.
             CycleRun::Abandoned => continue,
             CycleRun::Verdict {
-                ladder: v,
+                dhan_dirty,
                 dhan_spot_dirty,
                 groww_dirty,
-            } => (v, dhan_spot_dirty, groww_dirty),
+            } => (dhan_dirty, dhan_spot_dirty, groww_dirty),
         };
         // Adaptive concurrency bookkeeping (2026-07-15): the spot/shape
         // ladders fold their own rate-limit dirty flags — degrade after
@@ -525,53 +531,50 @@ where
             );
         }
         metrics::gauge!("tv_cadence_groww_shape_step").set(f64::from(groww_ladder.step));
-        // Ladder bookkeeping (day-scoped, design §3/§7).
-        let effective_verdict =
-            if verdict == CycleVerdict::DhanFailed && ladder.rung == cfg.dhan_ladder_max_rungs {
-                CycleVerdict::FloorExhausted
-            } else {
-                verdict
-            };
-        let new_rung = next_rung(ladder.rung, effective_verdict, cfg.dhan_ladder_max_rungs);
-        if new_rung != ladder.rung {
-            let direction = if new_rung > ladder.rung { "up" } else { "down" };
-            metrics::counter!("tv_cadence_ladder_shifts_total", "direction" => direction)
-                .increment(1);
-            error!(
-                code = ErrorCode::Cadence03SchedulerDegraded.code_str(),
-                stage = "ladder_shift",
-                from_rung = ladder.rung,
-                to_rung = new_rung,
-                direction,
-                "CADENCE-03: Dhan failure ladder shifted (the NEXT cycle's \
-                 anchor moves by one step)"
+        // Dhan SHAPE ladder bookkeeping (day-scoped; operator directive
+        // 2026-07-16): a dirty cycle while ALREADY at the split-fallback
+        // rung is the exhausted edge (cross-source steady state) —
+        // checked BEFORE the streak advance so the shift cycle itself
+        // never double-fires the edge.
+        let dhan_at_max_before = dhan_shape_ladder.step == DHAN_SHAPE_MAX_STEP;
+        if let Some(shift) = dhan_shape_ladder.advance(
+            dhan_dirty,
+            cfg.concurrency_degrade_after_dirty_cycles,
+            cfg.concurrency_recover_after_clean_cycles,
+            0,
+            DHAN_SHAPE_MAX_STEP,
+        ) {
+            log_concurrency_shift(
+                "dhan_shape_shift",
+                "tv_cadence_dhan_shape_shifts_total",
+                shift,
+                dhan_shape_ladder.step,
             );
         }
-        if effective_verdict == CycleVerdict::FloorExhausted {
+        metrics::gauge!("tv_cadence_dhan_shape_step").set(f64::from(dhan_shape_ladder.step));
+        if dhan_dirty && dhan_at_max_before {
             if !exhausted_episode {
                 exhausted_episode = true;
                 metrics::counter!("tv_cadence_ladder_exhausted_total").increment(1);
                 error!(
                     code = ErrorCode::Cadence01LaneDegraded.code_str(),
                     stage = "ladder_exhausted",
-                    rung = new_rung,
-                    "CADENCE-01: Dhan ladder floor exhausted — cross-source \
-                     steady state until the first clean Dhan cycle \
-                     (edge-latched per episode)"
+                    step = dhan_shape_ladder.step,
+                    "CADENCE-01: Dhan shape ladder floor exhausted — \
+                     cross-source steady state until the first clean Dhan \
+                     cycle (edge-latched per episode)"
                 );
             }
-        } else if effective_verdict == CycleVerdict::Clean {
+        } else if !dhan_dirty {
             exhausted_episode = false;
         }
-        ladder.rung = new_rung;
-        metrics::gauge!("tv_cadence_ladder_rung").set(f64::from(ladder.rung));
     }
 }
 
-/// Log + count one adaptive-concurrency ladder shift (2026-07-15 —
-/// CADENCE-03 self-corrected machinery signal, the anchor `ladder_shift`
-/// mirror; `direction` follows the anchor convention: `up` = degraded
-/// toward less concurrency, `down` = recovered toward step 0).
+/// Log + count one streak-ladder shift (2026-07-15 concurrency ladders +
+/// the 2026-07-16 Dhan shape ladder — CADENCE-03 self-corrected
+/// machinery signal; `direction`: `up` = degraded toward the fallback
+/// shape / less concurrency, `down` = recovered toward step 0).
 fn log_concurrency_shift(
     stage: &'static str,
     counter_name: &'static str,
@@ -588,8 +591,8 @@ fn log_concurrency_shift(
         stage = stage,
         to_step,
         direction,
-        "CADENCE-03: adaptive concurrency ladder shifted (the NEXT cycle \
-         uses the new spot grouping / Groww fallback shape)"
+        "CADENCE-03: cadence streak ladder shifted (the NEXT cycle uses \
+         the new Dhan shape / spot grouping / Groww fallback shape)"
     );
 }
 
@@ -752,8 +755,9 @@ async fn run_expiry_resolution_loop<C, D, G>(
         }
         // R1 (2026-07-15): in the cycle-burst era, retry waves anchor at
         // mid-minute (:30 — `next_expiry_wave_instant_ms`), maximally far
-        // from the Dhan :55–:05 burst region and the Groww :00–:03
-        // waves, so a vendor-outage retry cadence can never invade the
+        // from the post-close burst region (2026-07-16: every Dhan +
+        // Groww fire packs into T+0..≈T+5s of each minute, retries by
+        // ≈T+15s), so a vendor-outage retry cadence can never invade the
         // burst window and evict a NOMINAL fire from the combined
         // per-second budget (a false `gate_deferred_nominal` should-never
         // page every outage minute). The L2 expiry gate stays the
@@ -767,7 +771,7 @@ async fn run_expiry_resolution_loop<C, D, G>(
         // (belt (a)) ever drifts, the LAST pre-era wake of a >60s
         // interval clamps its FIRST in-era wake to the :30 anchor
         // instead of sleeping straight into the session-entry burst
-        // window (65s @ 09:14:58 → 09:16:03, the spot-group instant).
+        // window (65s @ 09:14:58 → 09:16:03, inside the burst grid).
         let now_ms_of_day = clock.ist_ms_of_day();
         let anchor_mid_minute = super::schedule::expiry_wave_anchor_active(
             now_ms_of_day,
@@ -1037,11 +1041,12 @@ enum CycleRun {
     /// the ms-of-day domain wrapped): the cycle is dropped with no
     /// partial emit and no ladder verdict; the day loop resets.
     Abandoned,
-    /// The whole-cycle verdicts: the anchor-ladder verdict plus the
-    /// per-broker rate-limit dirty flags feeding the 2026-07-15 adaptive
-    /// concurrency ladders.
+    /// The whole-cycle dirty flags: `dhan_dirty` (arming-rule failure
+    /// classes) feeds the 2026-07-16 Dhan SHAPE ladder; the per-broker
+    /// rate-limit flags feed the 2026-07-15 adaptive concurrency
+    /// ladders.
     Verdict {
-        ladder: CycleVerdict,
+        dhan_dirty: bool,
         dhan_spot_dirty: bool,
         groww_dirty: bool,
     },
@@ -1360,7 +1365,7 @@ where
     arm_lane(&mut cycle.groww);
     if cycle.dhan.resolved && cycle.groww.resolved {
         return CycleRun::Verdict {
-            ladder: CycleVerdict::Clean,
+            dhan_dirty: false,
             dhan_spot_dirty: false,
             groww_dirty: false,
         };
@@ -1449,7 +1454,7 @@ where
                 // CONC-NEW-1 (hostile round 1, 2026-07-15): while the
                 // cycle is PRISTINE (no event popped yet — the day's
                 // FIRST cycle is entered near IST midnight and waits
-                // ~9h for its 09:15:55 anchor), re-observe the runtime
+                // ~9h for its 09:16:01 burst), re-observe the runtime
                 // lane toggles every wake chunk and RE-ARM the cycle
                 // from the fresh flags on any change: lanes re-armed +
                 // the event list rebuilt, so a pre-fire `/api/feeds`
@@ -1527,13 +1532,8 @@ where
     if cycle.groww.enabled {
         cycle.groww.fsm(CadenceEvent::Rollover);
     }
-    let verdict = if cycle.dhan.enabled && cycle.dhan.arming_failure {
-        CycleVerdict::DhanFailed
-    } else {
-        CycleVerdict::Clean
-    };
     CycleRun::Verdict {
-        ladder: verdict,
+        dhan_dirty: cycle.dhan.enabled && cycle.dhan.arming_failure,
         dhan_spot_dirty: cycle.dhan_spot_dirty,
         groww_dirty: cycle.groww_dirty,
     }
@@ -1600,7 +1600,7 @@ struct CycleState {
     /// dispatched, no completion possible — so the timer arm may safely
     /// RE-ARM the whole cycle from freshly re-read lane enable flags
     /// (the day's first cycle is entered near IST midnight and waits
-    /// ~9h for its anchor; the entry snapshot alone froze the
+    /// ~9h for its burst; the entry snapshot alone froze the
     /// `/api/feeds` toggles for that whole window).
     dispatched_any: bool,
 }
@@ -2650,11 +2650,11 @@ fn finalize_if_complete<C: CadenceClock>(
             return;
         }
         // Rung 2: cross-source fill from the other lane's same-cycle data
-        // (freshness-checked against the LENDER-aware floor — the base
-        // T − 5000 widened to the Dhan lender's rung-shifted earliest
-        // chain pre-fire, CADENCE-XFILL-RUNG-1 2026-07-15; valid up to
+        // (freshness-checked against the plain base floor T − 5000 —
+        // every fire is post-close since the 2026-07-16 shape change, so
+        // the retired lender-aware widening is unnecessary; valid up to
         // AND INCLUDING the cutoff).
-        let floor = cross_fill_freshness_floor_ms(slots, other.asm.feed);
+        let floor = cross_fill_freshness_floor_ms(slots);
         let (spots, chains) = lane
             .asm
             .cross_fill_from(&other.asm, floor, now_wall, cutoff);

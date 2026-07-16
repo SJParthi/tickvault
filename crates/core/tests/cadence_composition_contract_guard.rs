@@ -29,7 +29,11 @@ const GLOBAL_INIT_NEEDLE: &str = "pub fn init_global_dhan_gates";
 /// checks match OTHER sections of the rule file too. These sentences are
 /// VERBATIM from the §3b contract body and appear nowhere else in it.
 const CONTRACT_BODY_NEEDLES: [&str; 3] = [
-    "Route every Dhan call through the shared `dhan_data_api_limiter`",
+    // Ruling A (2026-07-16): the cadence lane's binding pacing is the
+    // combined cap-5 ring, NOT the shared 3 rps limiter (which stays the
+    // authority for the LEGACY per-minute paths) — the contract sentence
+    // flipped accordingly, in lockstep with §3b of the rule file.
+    "Cadence fires do NOT route through the shared `dhan_data_api_limiter`",
     "Record/consult the PROCESS-GLOBAL gate registry",
     "A queue delay is SELF-INFLICTED pacing",
 ];

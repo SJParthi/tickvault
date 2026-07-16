@@ -830,14 +830,16 @@ async fn test_cadence_expiry_resolver_stamps_requests_when_resolved() {
 
 #[tokio::test(start_paused = true)]
 async fn test_dhan_spot_ladder_rate_limit_mid_ladder_degrades_then_recovers() {
-    // The 2026-07-15 Dhan spot CONCURRENCY ladder end-to-end, driven by
-    // rate limits MID-SPOT-LADDER: cycles 1-2 every spot leg 429s
-    // (spot-dirty ×2 consecutive → degrade one step) so cycle 3 runs
-    // step 1 ([[3],[1]] — group anchors 1000ms apart; cycle 3 stays
-    // dirty so the SECOND group is observable — a clean step-1 cycle
-    // resolves on the first group's data and honestly skips the rest);
+    // The 2026-07-15 Dhan spot CONCURRENCY ladder end-to-end under the
+    // 2026-07-16 shape, driven by rate limits MID-SPOT-LADDER: cycles
+    // 1-2 every spot leg 429s (dirty ×2 consecutive → BOTH the spot
+    // tier AND the Dhan shape ladder degrade one step — a 429 is an
+    // arming class) so cycle 3 runs shape 1 + step 1 (buckets
+    // [1,1,1,2]: three spots together in second 2, the 4th one window
+    // later; cycle 3 stays dirty so the overflow bucket is observable);
     // cycles 4-6 are fully clean (×3 consecutive → recover) so cycle 7
-    // is back at step 0 (all 4 SIMULTANEOUS single-symbol calls).
+    // is back at shape 0 + step 0 (the 5+2 packing: NIFTY+BANKNIFTY in
+    // the burst second, SENSEX+VIX the next).
     fn chain_ok(_req: &ChainFetchRequest, _p: usize) -> Result<ChainFetchOk, CadenceFetchError> {
         Ok(ChainFetchOk {
             underlying_spot: Some(24_500.0),
@@ -894,34 +896,45 @@ async fn test_dhan_spot_ladder_rate_limit_mid_ladder_degrades_then_recovers() {
         v.sort_unstable();
         v
     };
-    // Cycle 1 (step 0, dirty): all 4 spots fired at ONE instant (a
-    // 429'd leg is never blind-retried, so exactly 4 calls).
+    // Cycle 1 (shape 0, step 0, dirty): the 5+2 packing — 2 spots in
+    // the burst second, 2 the next (a 429'd leg is never blind-retried,
+    // so exactly 4 calls).
     let c1 = spot_instants(FIRST_CYCLE_MINUTE);
     assert_eq!(c1.len(), 4, "cycle 1: 4 spot singles, no 429 retries");
-    assert!(c1[3] - c1[0] <= SLOT_TOLERANCE_MS, "step 0 = simultaneous");
-    // Cycle 3 (step 1 after 2 consecutive spot-dirty cycles; itself
-    // dirty so the lane never resolves early): groups [[3],[1]] — three
-    // together, the 4th one full window later.
+    assert!(c1[1] - c1[0] <= SLOT_TOLERANCE_MS, "burst-second spot pair");
+    assert!(
+        c1[3] - c1[2] <= SLOT_TOLERANCE_MS,
+        "second-bucket spot pair"
+    );
+    assert!(
+        (c1[2] - c1[0] - 1_000).abs() <= SLOT_TOLERANCE_MS,
+        "shape 0 = 5+2 packing: second pair one 1000ms bucket later (got +{})",
+        c1[2] - c1[0]
+    );
+    // Cycle 3 (shape 1 + step 1 after 2 consecutive dirty cycles;
+    // itself dirty so the lane never resolves early): buckets
+    // [1,1,1,2] — three together in second 2, the 4th one full window
+    // later.
     let c3 = spot_instants(FIRST_CYCLE_MINUTE + 120);
     assert_eq!(c3.len(), 4, "cycle 3: 4 spot singles, no 429 retries");
     assert!(
         c3[2] - c3[0] <= SLOT_TOLERANCE_MS,
-        "step 1 first group of 3"
+        "shape 1 + step 1: first group of 3"
     );
     assert!(
         (c3[3] - c3[0] - 1_000).abs() <= SLOT_TOLERANCE_MS,
-        "step 1 second group exactly one 1000ms window later (got +{})",
+        "step-1 overflow bucket exactly one 1000ms window later (got +{})",
         c3[3] - c3[0]
     );
-    // Cycle 7 (step 0 again after 3 consecutive clean cycles 4-6):
-    // recovered to the full simultaneous group (all 4 dispatch at the
-    // group anchor before any completion lands).
+    // Cycle 7 (shape 0 + step 0 again after 3 consecutive clean cycles
+    // 4-6): recovered to the primary 5+2 packing.
     let c7 = spot_instants(FIRST_CYCLE_MINUTE + 360);
     assert_eq!(c7.len(), 4, "cycle 7: 4 spot singles (clean)");
+    assert!(c7[1] - c7[0] <= SLOT_TOLERANCE_MS, "recovered burst pair");
     assert!(
-        c7[3] - c7[0] <= SLOT_TOLERANCE_MS,
-        "recovered to step 0 = simultaneous (span {})",
-        c7[3] - c7[0]
+        (c7[2] - c7[0] - 1_000).abs() <= SLOT_TOLERANCE_MS,
+        "recovered to shape 0 = 5+2 packing (second pair +{})",
+        c7[2] - c7[0]
     );
 }
 
@@ -1736,8 +1749,9 @@ const PRE_ANCHOR_WALL_MS: i64 = (9 * 3600 + 14 * 60) * 1_000;
 
 #[tokio::test(start_paused = true)]
 async fn test_pristine_cycle_observes_disable_before_first_fire() {
-    // Disable the Dhan lane ~10s after run_cycle entry, ~105s BEFORE its
-    // first fire (the 09:15:55 chain anchor). Pre-fix the entry snapshot
+    // Disable the Dhan lane ~10s after run_cycle entry, ~110s BEFORE its
+    // first fire (the 09:16:00 Groww burst / 09:16:01 Dhan burst).
+    // Pre-fix the entry snapshot
     // fired the full Dhan cycle anyway; post-fix the pristine re-arm
     // drops the lane within one ~5s wake chunk — ZERO Dhan requests.
     let log = Arc::new(Mutex::new(Vec::new()));
@@ -1771,8 +1785,8 @@ async fn test_pristine_cycle_observes_disable_before_first_fire() {
         date: NaiveDate::from_ymd_opt(2026, 7, 14).expect("valid date"),
     });
     let task = tokio::spawn(run_cadence_loop(clock, deps));
-    // ~10s in (pristine — first fire is at +115s), the operator disables
-    // the Dhan lane.
+    // ~10s in (pristine — the first fire is at +120s), the operator
+    // disables the Dhan lane.
     for _ in 0..10 {
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     }
@@ -1901,11 +1915,11 @@ async fn test_pristine_cycle_observes_enable_before_first_fire() {
 
 #[tokio::test(start_paused = true)]
 async fn test_midcycle_disable_stops_not_yet_dispatched_fires() {
-    // Dispatch-time re-read: with fires already dispatched (the 3 chain
-    // primaries), a disable at wall T+2.5s must stop every LATER fire —
-    // the T+3s spot group and every retry — within the same cycle.
-    // Pre-fix the whole cycle kept firing (8 spot requests from a
-    // disabled lane).
+    // Dispatch-time re-read: with the burst second already dispatched
+    // (3 chain primaries + the 2 decision-critical spots), a disable at
+    // wall T+1.5s must stop every LATER fire — the T+2s second spot
+    // bucket and every retry — within the same cycle. Pre-fix the whole
+    // cycle kept firing (8 spot requests from a disabled lane).
     let log = Arc::new(Mutex::new(Vec::new()));
     let exec = Arc::new(RecordingExecutor {
         log: Arc::clone(&log),
@@ -1937,10 +1951,11 @@ async fn test_midcycle_disable_stops_not_yet_dispatched_fires() {
         date: NaiveDate::from_ymd_opt(2026, 7, 14).expect("valid date"),
     });
     let task = tokio::spawn(run_cadence_loop(clock, deps));
-    // Chains fire at elapsed 5_000 / 8_000 / 12_000 (wall :55/:58/:02);
-    // the spot group fires at 13_000 (wall :03). Disable at 12_500 —
-    // after the last chain primary, before any spot dispatch.
-    for _ in 0..12 {
+    // The burst second fires at elapsed 11_000 (wall T+1s: 3 chains +
+    // the NIFTY/BANKNIFTY spots); the SENSEX/VIX bucket fires at 12_000
+    // (T+2s). Disable at 11_500 — after the burst second, before the
+    // second spot bucket.
+    for _ in 0..11 {
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     }
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -1987,10 +2002,11 @@ async fn test_midcycle_disable_stops_not_yet_dispatched_fires() {
         "the 3 chain primaries dispatched BEFORE the disable must have fired"
     );
     assert_eq!(
-        dhan_spots, 0,
+        dhan_spots, 2,
         "a mid-cycle disable must stop every not-yet-dispatched fire \
-         (CONC-NEW-1 dispatch-time re-read): 8 = the frozen entry snapshot \
-         firing the whole spot group + retries from a disabled lane"
+         (CONC-NEW-1 dispatch-time re-read): only the 2 burst-second \
+         spots fired; 8 = the frozen entry snapshot firing the whole \
+         spot grid + retries from a disabled lane"
     );
     assert!(
         calls.iter().any(|c| matches!(

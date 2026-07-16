@@ -955,6 +955,25 @@ Scope boundary (honest): the boot-time prev-day fetch and the 15:31 bulk
 cross-verify keep their own pacing cells (disjoint windows; not in the
 operator's enumerated scope — unifying them is a flagged follow-up).
 
+**2026-07-16 — CADENCE-LANE CARVE-OUT (coordinator ruling A; the operator's
+same-day burst directive, verbatim):** *"for both dhan and groww trigger
+everything precisely parallelly entire 7 request instantly at the first
+second... one and only when it fails then split it: first second pull
+option chain for both dhan and groww and second second make it as spot...
+1 request per 3 second is nowhere applicable for different option
+[underlyings], clearly precisely applicable for one and only same option
+chain expiry."* That directive supersedes this section's 3-rps pacing FOR
+THE CADENCE SCHEDULER LANE ONLY (`crates/core/src/cadence/` — dry-run
+today, zero REST calls until its executors land): cadence fires are
+governed by the cadence gates' combined rolling-1000ms cap-5 ring (= the
+annexure's documented 5/sec Data-API budget) and are deliberately NOT
+routed through this limiter — routing them here would re-serialize the
+operator's mandated burst. **This limiter REMAINS the pacing authority for
+every LEGACY per-minute path enumerated above** (spot-1m fires + ladder +
+sweep + probes, option-chain fires + expirylist). Contract + slot tables:
+`cadence-error-codes.md` §0b/§3b (the composition-contract sentence is
+source-scan-ratcheted by `cadence_composition_contract_guard.rs`).
+
 ## §2g. 2026-07-14 — moneyness audit column + RAM-first classification
 
 **Operator directive (2026-07-14, relayed verbatim via the coordinator

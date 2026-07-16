@@ -11,11 +11,13 @@
 
 > **Honest 100% claim (envelope-qualified per operator-charter §F):**
 > 100% inside the tested envelope, with ratcheted regression coverage:
-> zero-429 is a STRUCTURAL property of the monotonic CAS gates (per-UL +
-> global chain gates 3000ms, dhan spot ROLLING-1000ms-WINDOW gate ≤
-> spot_window_cap — 2026-07-15 gate change) proven by the
+> zero-429 is a STRUCTURAL property of the monotonic CAS gates
+> (per-(underlying, expiry) chain gate 3000ms, dhan spot
+> ROLLING-1000ms-WINDOW gate ≤ spot_window_cap, the combined cap-5
+> rolling-second ring — the 2026-07-16 binding cadence-lane pacing per
+> coordinator ruling A) proven by the
 > deterministic replay proptest across 64-cycle permutations of skew,
-> jitter, GC pauses, latencies, failures, ladder walks (anchor rung +
+> jitter, GC pauses, latencies, failures, ladder walks (Dhan shape rung +
 > concurrency step + Groww shape) and restarts;
 > the decide-path read is DHAT-pinned zero-alloc/O(1); default-OFF
 > config gate means byte-identical behavior until the operator flips
@@ -154,6 +156,46 @@ counter. Unnumbered: `dhan_spot_start_offset_ms` +
 `groww_anchor_offset_ms` range-validated in `validate()`. ONE-SOURCE-OF-
 TRUTH DELEGATION (pending) recorded in the rule file naming the 3
 duplicate expiry-selection sites to be delegated to the policy module.
+
+**2026-07-16 POST-CLOSE BURST RESHAPE (operator directive 2026-07-16,
+relayed via the coordinator; verbatim quote + full contract in
+`cadence-error-codes.md` §0b):** the Dhan lane moves ENTIRELY POST-CLOSE
+and the pre-close machinery retires. The new cadence per minute close T:
+
+| Broker | Rung | Second 1 (T+1s Dhan / T+0 Groww) | Second 2 | Second 3 |
+|---|---|---|---|---|
+| Dhan | 0 (primary) | 3 chains CONCURRENT + NIFTY & BANKNIFTY spots (the honest 5+2 packing of "all 7 first second" under the 5/sec cap) | SENSEX + INDIA VIX spots | — |
+| Dhan | 1 (fallback) | 3 chains concurrent | ALL 4 spots | — |
+| Groww | 0 (primary) | all 7 parallel at T+0 | — | — |
+| Groww | 1 (fallback) | chains :01 | all 4 spots :02 | — |
+| Groww | 2 (retained last resort — coordinator addendum item 1) | chains :01 | core spots :02 | VIX alone :03 |
+
+RETIRED: the :55/:58/:02 pre-close chain instants
+(`dhan_chain_offsets_ms`), the T+3s spot anchor
+(`dhan_spot_start_offset_ms`), the anchor-shift failure ladder
+(`LadderState`/`CycleVerdict`/`next_rung`/`dhan_ladder_step_ms`/
+`dhan_ladder_max_rungs`/`recovery_mode`), the GLOBAL 3s chain gate (the
+directive: the 3s rule binds the SAME chain expiry only — different
+underlyings are explicitly concurrent), and the lender-aware cross-fill
+floor widening (CADENCE-XFILL-RUNG-1 — plain base T−5000 now; addendum
+item 3). REPLACED BY: `dhan_burst_offset_ms` (default 1000) + a Dhan
+SHAPE `StreakLadder` (rung 0⇄1, same 2-dirty/3-clean streaks as the
+concurrency ladders, dirty = arming failure classes; stage
+`dhan_shape_shift`, gauge `tv_cadence_dhan_shape_step`, counter
+`tv_cadence_dhan_shape_shifts_total`; the `ladder_exhausted` CADENCE-01
+edge keeps firing on a dirty cycle AT the fallback rung). The spot tiers
+compose with the shape via the pure `spot_second_buckets(shape, tier)`
+per-second-group bucket math (addendum item 4), proptested per
+(shape × tier × failure) permutation in the replay proof. PACING
+(coordinator ruling A): cadence fires are governed by the combined cap-5
+ring — NOT routed through the shared 3 rps `dhan_data_api_limiter`
+(which stays the authority for the legacy per-minute paths; mirrored
+dated note in `rest-1m-pipeline-error-codes.md` §2f). COEXISTENCE
+(coordinator ruling B): `AppConfig::validate()` fail-closes cadence
+enabled + a broker lane active + that broker's per-minute capture legs
+enabled (mutual exclusion, tested both directions); full subsumption is
+the flagged follow-up. Decisions unchanged (event-driven, Groww 6000ms /
+Dhan 15000ms cutoffs, exactly-once latch, VIX advisory).
 
 ## Edge Cases
 

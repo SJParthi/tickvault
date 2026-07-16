@@ -9,9 +9,8 @@ use serde::Deserialize;
 
 use crate::constants::{
     CADENCE_CHAIN_MIN_SPACING_FLOOR_MS, CADENCE_GROWW_WAVE_STEP_MS,
-    CADENCE_LADDER_MAX_RUNGS_CEILING, CADENCE_SPOT_WINDOW_CAP_CEILING, CADENCE_SPOT_WINDOW_MS,
-    DHAN_DATA_API_DEFAULT_TARGET_RPS, DHAN_DATA_API_RPS_CEILING, DHAN_DATA_API_RPS_FLOOR,
-    SEBI_MAX_ORDERS_PER_SECOND,
+    CADENCE_SPOT_WINDOW_CAP_CEILING, CADENCE_SPOT_WINDOW_MS, DHAN_DATA_API_DEFAULT_TARGET_RPS,
+    DHAN_DATA_API_RPS_CEILING, DHAN_DATA_API_RPS_FLOOR, SEBI_MAX_ORDERS_PER_SECOND,
 };
 use crate::trading_calendar::TradingCalendar;
 
@@ -892,24 +891,22 @@ pub struct CadenceConfig {
     /// a fresh dated operator quote.
     #[serde(default)]
     pub enabled: bool,
-    /// Dhan chain slot offsets relative to the minute-close instant T, in
-    /// milliseconds (negative = pre-close). Default `[-5000, -2000, 2000]`
-    /// = the operator's :55 NIFTY / :58 BANKNIFTY / :02 SENSEX serialized
-    /// chain schedule. Validated strictly ascending with pairwise gaps
-    /// ≥ `chain_min_spacing_ms`.
-    #[serde(default = "default_cadence_dhan_chain_offsets_ms")]
-    pub dhan_chain_offsets_ms: Vec<i64>,
-    /// Dhan spot leg anchor offset from T, ms. Default 3000 (:03 — 1s
-    /// after the SENSEX chain slot; the just-closed candle cannot exist
-    /// pre-close).
-    #[serde(default = "default_cadence_dhan_spot_start_offset_ms")]
-    pub dhan_spot_start_offset_ms: i64,
+    /// The Dhan BURST second offset from the minute-close instant T, ms
+    /// (operator directive 2026-07-16 — ALL fires are POST-close now).
+    /// Default 1000 (second 1): shape rung 0 fires 3 chains + the 2
+    /// decision-critical spots (NIFTY, BANKNIFTY) here and the remaining
+    /// 2 spots one window later; rung 1 fires the 3 chains here and all
+    /// 4 spots one window later. Validated > 0 and feasible against the
+    /// Dhan lane cutoff (the deepest spot bucket must land inside it).
+    #[serde(default = "default_cadence_dhan_burst_offset_ms")]
+    pub dhan_burst_offset_ms: i64,
     /// The Dhan spot ROLLING-1000ms-WINDOW gate cap (operator
     /// spot-concurrency ladder addition 2026-07-15): at most this many
     /// spot authorizations in ANY sliding 1000ms window. Default 4 (the
-    /// full simultaneous step-0 group); validated 1..=5 (the Dhan
+    /// full step-0 per-second spot group); validated 1..=5 (the Dhan
     /// Data-API hard cap is 5/sec). A cap below 4 structurally floors
-    /// the concurrency ladder's step so no group exceeds the cap.
+    /// the concurrency ladder's step so no SECOND BUCKET's spot count
+    /// exceeds the cap.
     #[serde(default = "default_cadence_spot_window_cap")]
     pub spot_window_cap: u32,
     /// Adaptive-concurrency degrade threshold (Assumed — default 2,
@@ -925,32 +922,21 @@ pub struct CadenceConfig {
     /// current step (never permanently stuck from a one-off 429).
     #[serde(default = "default_cadence_concurrency_recover_after_clean_cycles")]
     pub concurrency_recover_after_clean_cycles: u32,
-    /// Ladder clamp: a rung-shifted spot slot never lands earlier than
-    /// T + this, ms. Default 300 — the proven house
-    /// `SPOT_1M_REST_FIRE_DELAY_MS` post-close fire delay.
+    /// Post-close clamp: a spot second-bucket base never lands earlier
+    /// than T + this, ms. Default 300 — the proven house
+    /// `SPOT_1M_REST_FIRE_DELAY_MS` post-close fire delay (structurally
+    /// inert at the default burst offset of 1000).
     #[serde(default = "default_cadence_spot_min_post_close_ms")]
     pub spot_min_post_close_ms: i64,
-    /// Failure-ladder step: each failing cycle shifts the NEXT cycle's
-    /// Dhan anchor this much earlier, ms. Default 1000 (:55 → :54 → …).
-    #[serde(default = "default_cadence_dhan_ladder_step_ms")]
-    pub dhan_ladder_step_ms: i64,
-    /// Failure-ladder floor: maximum rung (default 5 — earliest chain
-    /// pre-fire :50). Validated ≤ 5.
-    #[serde(default = "default_cadence_dhan_ladder_max_rungs")]
-    pub dhan_ladder_max_rungs: u8,
     /// Maximum in-cycle retries per failed request (Assumed — default 1).
     /// Retries fire ONLY through the gates and only when landing before
     /// the lane cutoff; a RateLimited is NEVER retried in-cycle.
     #[serde(default = "default_cadence_in_cycle_retry_max")]
     pub in_cycle_retry_max: u32,
-    /// Ladder recovery mode (Assumed — the only legal value today is
-    /// `"step_back_one"`: one rung back per fully-clean cycle, hysteresis
-    /// against a flapping vendor).
-    #[serde(default = "default_cadence_recovery_mode")]
-    pub recovery_mode: String,
     /// Dhan lane staleness cutoff, ms after T (Assumed — default 15000:
-    /// primary ~T+4.5s + one full retry round ending :11 + gate waits).
-    /// Past it ⇒ HONEST-SKIP + CADENCE-02, never a late decision.
+    /// the burst completes by ~T+2s, the chain retry grid by ~T+4s, and
+    /// the deepest spot spill + spot retries well inside :15). Past it ⇒
+    /// HONEST-SKIP + CADENCE-02, never a late decision.
     #[serde(default = "default_cadence_dhan_lane_cutoff_ms")]
     pub dhan_lane_cutoff_ms: i64,
     /// Groww lane anchor offset from T, ms. Default 0 (T+0 post-close
@@ -976,9 +962,12 @@ pub struct CadenceConfig {
     /// a frozen Groww lane). Validated > `groww_burst_timeout_ms`.
     #[serde(default = "default_cadence_groww_lane_cutoff_ms")]
     pub groww_lane_cutoff_ms: i64,
-    /// Minimum spacing enforced by BOTH the per-underlying and the GLOBAL
-    /// chain gates, ms. Default 3000 (Dhan's 1-unique-request-per-3s rule,
-    /// strictest interpretation). Validated ≥ 3000.
+    /// Minimum spacing enforced by the per-(underlying, expiry) chain
+    /// gates, ms. Default 3000 (Dhan's 1-unique-request-per-3s rule —
+    /// per the 2026-07-16 operator directive it applies to the SAME
+    /// (underlying, expiry) key ONLY; different underlyings fire
+    /// concurrently and the retired GLOBAL chain gate is gone).
+    /// Validated ≥ 3000.
     #[serde(default = "default_cadence_chain_min_spacing_ms")]
     pub chain_min_spacing_ms: i64,
     /// Pre-market expiry-resolution retry cadence, ms (operator spec
@@ -1000,15 +989,10 @@ pub struct CadenceConfig {
     pub expiry_deadline_secs_of_day_ist: u32,
 }
 
-/// Serde default for [`CadenceConfig::dhan_chain_offsets_ms`] — the
-/// operator's :55 / :58 / :02 chain schedule.
-fn default_cadence_dhan_chain_offsets_ms() -> Vec<i64> {
-    vec![-5_000, -2_000, 2_000]
-}
-
-/// Serde default for [`CadenceConfig::dhan_spot_start_offset_ms`] — :03.
-fn default_cadence_dhan_spot_start_offset_ms() -> i64 {
-    3_000
+/// Serde default for [`CadenceConfig::dhan_burst_offset_ms`] — second 1
+/// (the operator's 2026-07-16 "first second" burst).
+fn default_cadence_dhan_burst_offset_ms() -> i64 {
+    1_000
 }
 
 /// Serde default for [`CadenceConfig::spot_window_cap`] — 4 (the full
@@ -1035,26 +1019,9 @@ fn default_cadence_spot_min_post_close_ms() -> i64 {
     300
 }
 
-/// Serde default for [`CadenceConfig::dhan_ladder_step_ms`] — 1s per rung.
-fn default_cadence_dhan_ladder_step_ms() -> i64 {
-    1_000
-}
-
-/// Serde default for [`CadenceConfig::dhan_ladder_max_rungs`] — the :50
-/// floor.
-fn default_cadence_dhan_ladder_max_rungs() -> u8 {
-    CADENCE_LADDER_MAX_RUNGS_CEILING
-}
-
 /// Serde default for [`CadenceConfig::in_cycle_retry_max`] — 1 (Assumed).
 fn default_cadence_in_cycle_retry_max() -> u32 {
     1
-}
-
-/// Serde default for [`CadenceConfig::recovery_mode`] — step-back-one
-/// (Assumed; unanimous designer choice).
-fn default_cadence_recovery_mode() -> String {
-    "step_back_one".to_string()
 }
 
 /// Serde default for [`CadenceConfig::dhan_lane_cutoff_ms`] — 15s
@@ -1107,18 +1074,14 @@ impl Default for CadenceConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            dhan_chain_offsets_ms: default_cadence_dhan_chain_offsets_ms(),
-            dhan_spot_start_offset_ms: default_cadence_dhan_spot_start_offset_ms(),
+            dhan_burst_offset_ms: default_cadence_dhan_burst_offset_ms(),
             spot_window_cap: default_cadence_spot_window_cap(),
             concurrency_degrade_after_dirty_cycles:
                 default_cadence_concurrency_degrade_after_dirty_cycles(),
             concurrency_recover_after_clean_cycles:
                 default_cadence_concurrency_recover_after_clean_cycles(),
             spot_min_post_close_ms: default_cadence_spot_min_post_close_ms(),
-            dhan_ladder_step_ms: default_cadence_dhan_ladder_step_ms(),
-            dhan_ladder_max_rungs: default_cadence_dhan_ladder_max_rungs(),
             in_cycle_retry_max: default_cadence_in_cycle_retry_max(),
-            recovery_mode: default_cadence_recovery_mode(),
             dhan_lane_cutoff_ms: default_cadence_dhan_lane_cutoff_ms(),
             groww_anchor_offset_ms: 0,
             groww_burst_timeout_ms: default_cadence_groww_burst_timeout_ms(),
@@ -1138,14 +1101,13 @@ impl CadenceConfig {
     /// spawns.
     ///
     /// # Errors
-    /// Returns a descriptive error for the first violation found: chain
-    /// gaps under 3s, a spot window cap outside 1..=5, out-of-range spot
-    /// anchor / expiry knobs, negative clamps, non-positive
-    /// cutoffs/timeouts, rungs above the :50 floor, an unknown recovery
-    /// mode, a Groww cutoff at/below the burst verdict, a lane cutoff
-    /// at/above one minute, or chain offsets outside the feasible band
-    /// (last nominal slot at/after the Dhan cutoff, or a worst-case
-    /// ladder-shifted pre-fire anchor crossing a full minute back).
+    /// Returns a descriptive error for the first violation found: a
+    /// chain spacing under the 3s per-(underlying, expiry) floor, a spot
+    /// window cap outside 1..=5, out-of-range burst-offset / expiry
+    /// knobs, negative clamps, non-positive cutoffs/timeouts, a Groww
+    /// cutoff at/below the burst verdict, a lane cutoff at/above one
+    /// minute, or a burst schedule outside the feasible band (nominal
+    /// burst / deepest spot bucket at/after the Dhan cutoff).
     pub fn validate(&self) -> Result<()> {
         if self.chain_min_spacing_ms < CADENCE_CHAIN_MIN_SPACING_FLOOR_MS {
             bail!(
@@ -1154,20 +1116,15 @@ impl CadenceConfig {
                 CADENCE_CHAIN_MIN_SPACING_FLOOR_MS
             );
         }
-        if self.dhan_chain_offsets_ms.len() != 3 {
+        // 2026-07-16: the burst is a POST-close fire (second 1 of the
+        // minute) — a non-positive offset would race the close (and a
+        // T+0 burst would collide with the Groww anchor semantics of
+        // next_joinable_boundary's strictly-in-future rule).
+        if self.dhan_burst_offset_ms <= 0 {
             bail!(
-                "cadence.dhan_chain_offsets_ms must carry exactly 3 slots (one per chain underlying: NIFTY/BANKNIFTY/SENSEX), got {:?}",
-                self.dhan_chain_offsets_ms
+                "cadence.dhan_burst_offset_ms ({}) must be > 0 (the 2026-07-16 shape is fully POST-close — the burst is second 1 of the minute)",
+                self.dhan_burst_offset_ms
             );
-        }
-        for pair in self.dhan_chain_offsets_ms.windows(2) {
-            if pair[1].saturating_sub(pair[0]) < self.chain_min_spacing_ms {
-                bail!(
-                    "cadence.dhan_chain_offsets_ms must ascend with pairwise gaps >= chain_min_spacing_ms ({}ms), got {:?}",
-                    self.chain_min_spacing_ms,
-                    self.dhan_chain_offsets_ms
-                );
-            }
         }
         if self.spot_window_cap == 0 || self.spot_window_cap > CADENCE_SPOT_WINDOW_CAP_CEILING {
             bail!(
@@ -1191,69 +1148,26 @@ impl CadenceConfig {
                 self.spot_min_post_close_ms
             );
         }
-        // Range-validate the spot anchor (verifier fix package,
-        // 2026-07-15): a negative anchor would target pre-close spots
-        // (the clamp would silently rewrite every slot — refuse the
-        // degenerate config instead), and an anchor whose DEEPEST
-        // concurrency-ladder group (step 3 = base + 3 windows) lands
-        // at/after the Dhan cutoff could never fire its tail legs.
-        if self.dhan_spot_start_offset_ms < 0 {
+        // Feasibility of the deepest spot second-bucket (CAD-NEW-3 +
+        // SEC-CAD-1 class, re-derived for the 2026-07-16 shape): the
+        // spot base is max(burst, T + spot_min_post_close_ms) and the
+        // deepest bucket (shape 1 x tier 3) sits base + 4 windows — a
+        // nominal spot fire at/after the Dhan cutoff sorts AFTER the
+        // DhanCutoff event, so the cutoff skip resolves the lane FIRST
+        // and the fire is silently discarded on the resolved-lane guard
+        // EVERY cycle, with the coded errors pointing at broker slowness
+        // instead of the degenerate schedule. Refused at boot.
+        let deepest_spot_bucket_ms = self
+            .dhan_burst_offset_ms
+            .max(self.spot_min_post_close_ms)
+            .saturating_add(4_i64.saturating_mul(CADENCE_SPOT_WINDOW_MS));
+        if deepest_spot_bucket_ms >= self.dhan_lane_cutoff_ms {
             bail!(
-                "cadence.dhan_spot_start_offset_ms ({}) must be >= 0 (the just-closed candle cannot exist pre-close)",
-                self.dhan_spot_start_offset_ms
-            );
-        }
-        let deepest_spot_group_ms = self
-            .dhan_spot_start_offset_ms
-            .saturating_add(3_i64.saturating_mul(CADENCE_SPOT_WINDOW_MS));
-        if deepest_spot_group_ms >= self.dhan_lane_cutoff_ms {
-            bail!(
-                "cadence.dhan_spot_start_offset_ms ({}) is too late: the deepest concurrency-ladder group (base + 3 windows = {}ms past T) must land strictly before dhan_lane_cutoff_ms ({})",
-                self.dhan_spot_start_offset_ms,
-                deepest_spot_group_ms,
-                self.dhan_lane_cutoff_ms
-            );
-        }
-        // Hostile-review round 4 (SEC-CAD-1, 2026-07-16): the post-close
-        // clamp knob is the ONE spot-schedule input the check above does
-        // not cover — build_cycle_slots computes
-        // spot_base = max(anchor - shift, T + spot_min_post_close_ms), so
-        // a large spot_min_post_close_ms (e.g. 20000 vs the 15000 Dhan
-        // cutoff) clamps ALL nominal spot slots past the cutoff: the
-        // DhanCutoff event resolves the lane first and every later-popping
-        // nominal DhanSpot action is silently discarded on the
-        // resolved-lane guard — the lane honest-skips `cutoff` every
-        // minute with the coded errors pointing at broker slowness instead
-        // of the degenerate schedule (the exact CAD-NEW-3 class). Mirror
-        // of the anchor feasibility check above on the clamp side.
-        let deepest_clamped_spot_group_ms = self
-            .spot_min_post_close_ms
-            .saturating_add(3_i64.saturating_mul(CADENCE_SPOT_WINDOW_MS));
-        if deepest_clamped_spot_group_ms >= self.dhan_lane_cutoff_ms {
-            bail!(
-                "cadence.spot_min_post_close_ms ({}) is too late: the post-close clamp's deepest concurrency-ladder group (clamp + 3 windows = {}ms past T) must land strictly before dhan_lane_cutoff_ms ({}) — a clamped nominal spot fire at/after the cutoff is silently discarded once the cutoff skip resolves the lane",
+                "cadence.dhan_burst_offset_ms ({}) / spot_min_post_close_ms ({}) are too late: the deepest spot second-bucket (max(burst, clamp) + 4 windows = {}ms past T) must land strictly before dhan_lane_cutoff_ms ({}) — a nominal fire at/after the cutoff is silently discarded once the cutoff skip resolves the lane",
+                self.dhan_burst_offset_ms,
                 self.spot_min_post_close_ms,
-                deepest_clamped_spot_group_ms,
+                deepest_spot_bucket_ms,
                 self.dhan_lane_cutoff_ms
-            );
-        }
-        if self.dhan_ladder_step_ms <= 0 {
-            bail!(
-                "cadence.dhan_ladder_step_ms ({}) must be > 0",
-                self.dhan_ladder_step_ms
-            );
-        }
-        if self.dhan_ladder_max_rungs > CADENCE_LADDER_MAX_RUNGS_CEILING {
-            bail!(
-                "cadence.dhan_ladder_max_rungs ({}) must be <= {} (the :50 floor)",
-                self.dhan_ladder_max_rungs,
-                CADENCE_LADDER_MAX_RUNGS_CEILING
-            );
-        }
-        if self.recovery_mode != "step_back_one" {
-            bail!(
-                "cadence.recovery_mode ({:?}) — the only legal value today is \"step_back_one\"",
-                self.recovery_mode
             );
         }
         if self.dhan_lane_cutoff_ms <= 0 || self.groww_lane_cutoff_ms <= 0 {
@@ -1275,44 +1189,13 @@ impl CadenceConfig {
                 self.groww_lane_cutoff_ms
             );
         }
-        // Hostile-review round 1 (CAD-NEW-3, 2026-07-15): a nominal chain
-        // slot at/after the Dhan cutoff sorts AFTER the DhanCutoff event —
-        // the cutoff skip resolves the lane FIRST and the runner's
-        // resolved-lane guard then silently discards the chain fire on
-        // EVERY cycle of the day (that underlying's mandated chain never
-        // dispatches, with the coded errors pointing at broker slowness
-        // instead of the degenerate schedule). Mirror of the spot-anchor
-        // feasibility check above.
-        if let Some(&last_chain_offset) = self.dhan_chain_offsets_ms.last()
-            && last_chain_offset >= self.dhan_lane_cutoff_ms
-        {
+        // The nominal chain burst itself must land strictly before the
+        // Dhan cutoff (CAD-NEW-3 mirror for the post-close shape).
+        if self.dhan_burst_offset_ms >= self.dhan_lane_cutoff_ms {
             bail!(
-                "cadence.dhan_chain_offsets_ms last slot ({}) must land strictly before dhan_lane_cutoff_ms ({}) — a nominal chain fire at/after the cutoff is silently discarded once the cutoff skip resolves the lane",
-                last_chain_offset,
+                "cadence.dhan_burst_offset_ms ({}) must land strictly before dhan_lane_cutoff_ms ({}) — a nominal chain fire at/after the cutoff is silently discarded once the cutoff skip resolves the lane",
+                self.dhan_burst_offset_ms,
                 self.dhan_lane_cutoff_ms
-            );
-        }
-        // CAD-NEW-3/CAD-SEC-1 lower bound: the anchor failure-ladder
-        // shifts the FIRST chain slot earlier by up to
-        // max_rungs * step_ms; a worst-case pre-fire anchor that crosses
-        // a full minute back lands in the PREVIOUS cycle, making
-        // next_joinable_boundary skip boundaries (or never find one) —
-        // a quietly-parked scheduler with no error at all. Refused.
-        let worst_prefire_ms = self
-            .dhan_chain_offsets_ms
-            .first()
-            .copied()
-            .unwrap_or(0)
-            .saturating_sub(
-                i64::from(self.dhan_ladder_max_rungs).saturating_mul(self.dhan_ladder_step_ms),
-            );
-        if worst_prefire_ms <= -60_000 {
-            bail!(
-                "cadence.dhan_chain_offsets_ms first slot ({}) shifted by the deepest failure-ladder rung ({} rungs x {}ms) reaches {}ms past T — the worst-case pre-fire anchor must stay strictly within the previous minute (> -60000ms)",
-                self.dhan_chain_offsets_ms.first().copied().unwrap_or(0),
-                self.dhan_ladder_max_rungs,
-                self.dhan_ladder_step_ms,
-                worst_prefire_ms
             );
         }
         if self.groww_burst_timeout_ms <= 0 || self.groww_request_timeout_ms <= 0 {
@@ -3125,6 +3008,34 @@ impl ApplicationConfig {
         // (fail-closed; the default cadence.enabled=false section is always
         // valid, so today's boot is unaffected).
         self.cadence.validate()?;
+
+        // CAPTURE-LEG MUTUAL EXCLUSION (coordinator ruling B, 2026-07-16
+        // — SUBSUME, NEVER SHARE, interim fail-closed path): the cadence
+        // scheduler and the legacy per-minute RECORD-capture legs would
+        // place DOUBLE demand on the same broker rate budgets if both ran
+        // for one broker — no double demand is ever legal. Enabling the
+        // cadence for a broker lane requires that lane's legacy legs to
+        // stand down FIRST; full subsumption (the cadence feeding the
+        // capture tables) is the flagged follow-up PR. base.toml today
+        // (legacy legs on, cadence off) stays valid.
+        if self.cadence.enabled {
+            if self.feeds.dhan_enabled
+                && (self.spot_1m_rest.enabled || self.option_chain_1m.enabled)
+            {
+                bail!(
+                    "cadence.enabled with the Dhan lane active requires the legacy Dhan per-minute legs to stand down first: set [spot_1m_rest].enabled = false and [option_chain_1m].enabled = false (no double demand on the Dhan Data-API budget is ever legal — coordinator ruling B, 2026-07-16)"
+                );
+            }
+            if self.feeds.groww_enabled
+                && (self.groww_spot_1m.enabled
+                    || self.groww_option_chain_1m.enabled
+                    || self.groww_contract_1m.enabled)
+            {
+                bail!(
+                    "cadence.enabled with the Groww lane active requires the legacy Groww per-minute legs to stand down first: set [groww_spot_1m].enabled = false, [groww_option_chain_1m].enabled = false and [groww_contract_1m].enabled = false (no double demand on the shared Groww rate budget is ever legal — coordinator ruling B, 2026-07-16)"
+                );
+            }
+        }
 
         Ok(())
     }
@@ -5460,17 +5371,13 @@ mod tests {
             !d.enabled,
             "cadence must default OFF (fail-safe; the operator flips it)"
         );
-        // The judge-locked cadence table (design rev-8 §9).
-        assert_eq!(d.dhan_chain_offsets_ms, vec![-5_000, -2_000, 2_000]);
-        assert_eq!(d.dhan_spot_start_offset_ms, 3_000);
+        // The locked cadence table (2026-07-16 post-close shape).
+        assert_eq!(d.dhan_burst_offset_ms, 1_000);
         assert_eq!(d.spot_window_cap, 4);
         assert_eq!(d.concurrency_degrade_after_dirty_cycles, 2);
         assert_eq!(d.concurrency_recover_after_clean_cycles, 3);
         assert_eq!(d.spot_min_post_close_ms, 300);
-        assert_eq!(d.dhan_ladder_step_ms, 1_000);
-        assert_eq!(d.dhan_ladder_max_rungs, 5);
         assert_eq!(d.in_cycle_retry_max, 1);
-        assert_eq!(d.recovery_mode, "step_back_one");
         assert_eq!(d.dhan_lane_cutoff_ms, 15_000);
         assert_eq!(d.groww_anchor_offset_ms, 0);
         assert_eq!(d.groww_burst_timeout_ms, 800);
@@ -5500,7 +5407,7 @@ mod tests {
             .extract()
             .expect("empty [cadence] must default, not error");
         assert!(!empty.cadence.enabled);
-        assert_eq!(empty.cadence.dhan_chain_offsets_ms, d.dhan_chain_offsets_ms);
+        assert_eq!(empty.cadence.dhan_burst_offset_ms, d.dhan_burst_offset_ms);
         assert_eq!(empty.cadence.spot_window_cap, d.spot_window_cap);
         assert_eq!(
             empty.cadence.concurrency_degrade_after_dirty_cycles,
@@ -5590,27 +5497,18 @@ mod tests {
         );
     }
 
-    /// Cadence validate(): chain slot offsets whose pairwise gap
-    /// undercuts the 3s chain rule are rejected — as is a
-    /// `chain_min_spacing_ms` below the 3000ms floor itself.
+    /// Cadence validate(): the per-(underlying, expiry) 3s chain rule's
+    /// spacing floor cannot be configured away (2026-07-16: the rule is
+    /// per-key ONLY — different underlyings are explicitly concurrent,
+    /// so there is no offsets vector and no global gate anymore), and
+    /// the burst offset must be a genuine POST-close second.
     #[test]
-    fn test_cadence_config_validate_rejects_sub_3s_chain_gaps() {
-        // :55 / :57 — a 2s gap undercuts the 3s rule.
+    fn test_cadence_config_validate_rejects_sub_3s_chain_spacing() {
+        // The spacing floor itself cannot be configured away.
         let mut cfg = CadenceConfig {
-            dhan_chain_offsets_ms: vec![-5_000, -3_000, 2_000],
+            chain_min_spacing_ms: 2_999,
             ..CadenceConfig::default()
         };
-        let err = cfg.validate().unwrap_err();
-        assert!(
-            err.to_string().contains("dhan_chain_offsets_ms"),
-            "unexpected error: {err}"
-        );
-        // Non-ascending offsets are equally rejected (negative gap).
-        cfg.dhan_chain_offsets_ms = vec![-2_000, -5_000, 2_000];
-        assert!(cfg.validate().is_err());
-        // The spacing floor itself cannot be configured away.
-        cfg.dhan_chain_offsets_ms = default_cadence_dhan_chain_offsets_ms();
-        cfg.chain_min_spacing_ms = 2_999;
         let err = cfg.validate().unwrap_err();
         assert!(
             err.to_string().contains("chain_min_spacing_ms"),
@@ -5620,24 +5518,28 @@ mod tests {
         cfg.chain_min_spacing_ms = 3_000;
         cfg.groww_lane_cutoff_ms = 800;
         assert!(cfg.validate().is_err());
-        // An unknown recovery mode is refused (only step_back_one ships).
+        // The burst is a POST-close fire: 0 and negative are refused.
         cfg.groww_lane_cutoff_ms = 6_000;
-        cfg.recovery_mode = "reset_to_zero".to_string();
+        cfg.dhan_burst_offset_ms = 0;
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("dhan_burst_offset_ms"),
+            "unexpected error: {err}"
+        );
+        cfg.dhan_burst_offset_ms = -1_000;
         assert!(cfg.validate().is_err());
-        // Rungs above the :50 floor are refused.
-        cfg.recovery_mode = "step_back_one".to_string();
-        cfg.dhan_ladder_max_rungs = 6;
-        assert!(cfg.validate().is_err());
+        cfg.dhan_burst_offset_ms = 1_000;
+        assert!(cfg.validate().is_ok());
     }
 
-    /// Cadence validate(): hostile-review round 1 bounds (CAD-NEW-3 +
-    /// CAD-SEC-1, 2026-07-15) — lane cutoffs must resolve inside one
-    /// minute, the LAST nominal chain slot must land strictly before the
-    /// Dhan cutoff (else its fire is silently discarded once the cutoff
-    /// skip resolves the lane), and the worst-case ladder-shifted
-    /// pre-fire anchor must stay strictly within the previous minute.
+    /// Cadence validate(): the cutoff-ceiling + burst-feasibility bounds
+    /// (CAD-NEW-3 / CAD-SEC-1 classes re-derived for the 2026-07-16
+    /// post-close shape) — lane cutoffs must resolve inside one minute,
+    /// and the nominal burst must land strictly before the Dhan cutoff
+    /// (else its fires are silently discarded once the cutoff skip
+    /// resolves the lane).
     #[test]
-    fn test_cadence_config_validate_chain_offset_band_and_cutoff_ceiling() {
+    fn test_cadence_config_validate_burst_band_and_cutoff_ceiling() {
         // A Dhan cutoff at/above one minute makes every cycle overrun.
         let mut cfg = CadenceConfig {
             dhan_lane_cutoff_ms: 120_000,
@@ -5656,96 +5558,63 @@ mod tests {
         assert!(cfg.validate().is_err());
         cfg.groww_lane_cutoff_ms = 6_000;
         assert!(cfg.validate().is_ok());
-        // A nominal chain slot at/after the Dhan cutoff (CAD-NEW-3:
-        // -5000/-2000/16000 with the 15000 cutoff put the SENSEX chain
-        // fire past the cutoff — silently discarded every cycle).
-        cfg.dhan_chain_offsets_ms = vec![-5_000, -2_000, 16_000];
+        // A nominal burst at/after the Dhan cutoff is silently discarded
+        // every cycle (the CAD-NEW-3 class) — refused, exact boundary
+        // included; the deepest-spot-bucket bound trips first (burst +
+        // 4 windows).
+        cfg.dhan_burst_offset_ms = 16_000;
         let err = cfg.validate().unwrap_err();
         assert!(
             err.to_string()
                 .contains("strictly before dhan_lane_cutoff_ms"),
             "unexpected error: {err}"
         );
-        cfg.dhan_chain_offsets_ms = vec![-5_000, -2_000, 15_000];
+        cfg.dhan_burst_offset_ms = 15_000;
         assert!(
             cfg.validate().is_err(),
-            "a slot exactly AT the cutoff is equally discarded"
+            "a burst exactly AT the cutoff is equally discarded"
         );
-        cfg.dhan_chain_offsets_ms = vec![-5_000, -2_000, 14_999];
-        assert!(cfg.validate().is_ok(), "just inside the cutoff is legal");
-        // A huge-negative offsets vector passes the pairwise-gap check but
-        // pushes the ladder-shifted pre-fire anchor into cycles PAST the
-        // previous minute — the scheduler would quietly park (CAD-SEC-1).
-        cfg.dhan_chain_offsets_ms = vec![-4_000_000, -3_997_000, -3_994_000];
-        let err = cfg.validate().unwrap_err();
-        assert!(
-            err.to_string().contains("previous minute"),
-            "unexpected error: {err}"
-        );
-        // The boundary case: first slot - 5 rungs * 1000ms == -60000
-        // exactly reaches the previous boundary — refused; one ms inside
-        // is legal.
-        cfg.dhan_chain_offsets_ms = vec![-55_000, -50_000, -45_000];
-        assert!(cfg.validate().is_err(), "-55000 - 5000 == -60000 refused");
-        cfg.dhan_chain_offsets_ms = vec![-54_999, -50_000, -45_000];
-        assert!(cfg.validate().is_ok(), "-54999 - 5000 == -59999 legal");
+        // Just inside the cutoff still fails the DEEPEST-spot-bucket
+        // bound (14999 + 4000 >= 15000); a burst whose whole spill fits
+        // is legal (10999 + 4000 < 15000).
+        cfg.dhan_burst_offset_ms = 14_999;
+        assert!(cfg.validate().is_err(), "deepest bucket past the cutoff");
+        cfg.dhan_burst_offset_ms = 10_999;
+        assert!(cfg.validate().is_ok(), "whole spill inside the cutoff");
         // The shipped defaults sit comfortably inside the band.
         assert!(CadenceConfig::default().validate().is_ok());
     }
 
-    /// Cadence validate(): the 2026-07-15 range checks — the spot anchor
-    /// must be non-negative with its DEEPEST concurrency-ladder group
-    /// strictly inside the Dhan cutoff; a large negative Groww anchor is
-    /// rejected (pre-existing >= 0 rule, pinned here per the verifier's
-    /// unnumbered finding); the expiry knobs are bounded sane.
+    /// Cadence validate(): the deepest-spot-bucket feasibility bound
+    /// covers BOTH schedule inputs of the 2026-07-16 shape — the burst
+    /// offset AND the post-close clamp (build_cycle_slots takes
+    /// max(burst, T + spot_min_post_close_ms) as the spot base, deepest
+    /// bucket = base + 4 windows); a large negative Groww anchor is
+    /// rejected; the expiry knobs are bounded sane.
     #[test]
-    fn test_cadence_config_validate_rejects_out_of_range_spot_anchor_and_expiry_knobs() {
-        // Negative spot anchor (pre-close target) is refused.
+    fn test_cadence_config_validate_rejects_out_of_range_burst_clamp_and_expiry_knobs() {
+        // A clamp that pushes the deepest bucket to/past the cutoff is
+        // refused (SEC-CAD-1 class: 11000 + 4000 >= 15000 — silently
+        // discarded on the resolved-lane guard otherwise).
         let mut cfg = CadenceConfig {
-            dhan_spot_start_offset_ms: -1,
+            spot_min_post_close_ms: 20_000,
             ..CadenceConfig::default()
         };
-        let err = cfg.validate().unwrap_err();
-        assert!(
-            err.to_string().contains("dhan_spot_start_offset_ms"),
-            "unexpected error: {err}"
-        );
-        // An anchor whose deepest group (base + 3 windows) reaches the
-        // cutoff is refused (12000 + 3000 >= 15000).
-        cfg.dhan_spot_start_offset_ms = 12_000;
-        let err = cfg.validate().unwrap_err();
-        assert!(
-            err.to_string().contains("deepest concurrency-ladder group"),
-            "unexpected error: {err}"
-        );
-        // The boundary just inside is legal (11999 + 3000 < 15000).
-        cfg.dhan_spot_start_offset_ms = 11_999;
-        assert!(cfg.validate().is_ok());
-        // SEC-CAD-1 (round 4, 2026-07-16): the post-close CLAMP knob is
-        // bound the same way — build_cycle_slots takes
-        // max(anchor - shift, T + spot_min_post_close_ms), so a clamp of
-        // 20000 vs the 15000 cutoff would push ALL nominal spot slots
-        // past the cutoff (silently discarded on the resolved-lane
-        // guard). Refused; the exact-cutoff boundary is refused too; one
-        // ms inside is legal.
-        cfg.dhan_spot_start_offset_ms = 3_000;
-        cfg.spot_min_post_close_ms = 20_000;
         let err = cfg.validate().unwrap_err();
         assert!(
             err.to_string().contains("spot_min_post_close_ms"),
             "unexpected error: {err}"
         );
-        cfg.spot_min_post_close_ms = 12_000;
+        cfg.spot_min_post_close_ms = 11_000;
         assert!(
             cfg.validate().is_err(),
-            "clamp deepest group exactly AT the cutoff (12000 + 3000 == 15000) is equally discarded"
+            "clamp deepest bucket exactly AT the cutoff (11000 + 4000 == 15000) is equally discarded"
         );
-        cfg.spot_min_post_close_ms = 11_999;
+        cfg.spot_min_post_close_ms = 10_999;
         assert!(cfg.validate().is_ok(), "just inside the cutoff is legal");
         cfg.spot_min_post_close_ms = 300;
         // A LARGE NEGATIVE Groww anchor is rejected (the burst is a
         // post-close fire — a pre-close burst would race the close).
-        cfg.dhan_spot_start_offset_ms = 3_000;
         cfg.groww_anchor_offset_ms = -60_000;
         let err = cfg.validate().unwrap_err();
         assert!(
@@ -6049,6 +5918,75 @@ mod tests {
         // And the valid default passes end-to-end.
         let config = make_valid_config();
         assert!(config.validate().is_ok());
+    }
+
+    /// CAPTURE-LEG MUTUAL EXCLUSION (coordinator ruling B, 2026-07-16 —
+    /// SUBSUME, NEVER SHARE, interim fail-closed path): enabling the
+    /// cadence for a broker lane while that lane's legacy per-minute
+    /// RECORD-capture legs are still enabled is a validation ERROR (no
+    /// double demand on one broker's rate budget is ever legal); cadence
+    /// on with the legs off is legal; cadence off with the legs on (the
+    /// base.toml shape today) stays legal.
+    #[test]
+    fn test_application_config_validate_cadence_capture_leg_mutual_exclusion() {
+        // Cadence ON + Dhan lane active + a legacy Dhan leg ON → error.
+        let mut config = make_valid_config();
+        config.cadence.enabled = true;
+        config.feeds.dhan_enabled = true;
+        config.spot_1m_rest.enabled = true;
+        config.option_chain_1m.enabled = false;
+        let err = config.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("spot_1m_rest"),
+            "error must name the standing Dhan leg, got: {err}"
+        );
+        config.spot_1m_rest.enabled = false;
+        config.option_chain_1m.enabled = true;
+        assert!(config.validate().is_err(), "chain leg alone also refuses");
+        // Cadence ON + Groww lane active + a legacy Groww leg ON → error.
+        let mut config = make_valid_config();
+        config.cadence.enabled = true;
+        config.feeds.groww_enabled = true;
+        config.spot_1m_rest.enabled = false;
+        config.option_chain_1m.enabled = false;
+        for flip in 0..3 {
+            config.groww_spot_1m.enabled = flip == 0;
+            config.groww_option_chain_1m.enabled = flip == 1;
+            config.groww_contract_1m.enabled = flip == 2;
+            let err = config.validate().unwrap_err();
+            assert!(
+                err.to_string().contains("Groww"),
+                "error must name the Groww lane, got: {err}"
+            );
+        }
+        // Cadence ON + all legs OFF → ok (the stand-down shape).
+        config.groww_spot_1m.enabled = false;
+        config.groww_option_chain_1m.enabled = false;
+        config.groww_contract_1m.enabled = false;
+        assert!(config.validate().is_ok(), "cadence on + legs off is legal");
+        // Cadence OFF + legs ON (today's base.toml shape) → ok.
+        let mut config = make_valid_config();
+        config.cadence.enabled = false;
+        config.spot_1m_rest.enabled = true;
+        config.option_chain_1m.enabled = true;
+        config.groww_spot_1m.enabled = true;
+        assert!(
+            config.validate().is_ok(),
+            "cadence off + legacy legs on is today's valid shape"
+        );
+        // A DISABLED lane's legs never block the OTHER lane's cadence:
+        // Groww lane off ⇒ its legs are inert for the exclusion.
+        let mut config = make_valid_config();
+        config.cadence.enabled = true;
+        config.feeds.dhan_enabled = true;
+        config.feeds.groww_enabled = false;
+        config.spot_1m_rest.enabled = false;
+        config.option_chain_1m.enabled = false;
+        config.groww_spot_1m.enabled = true;
+        assert!(
+            config.validate().is_ok(),
+            "an inactive lane's legs do not double-demand"
+        );
     }
 
     /// A missing `[feeds]` section must fall back to the safe default

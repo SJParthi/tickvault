@@ -688,58 +688,61 @@ rest_self_cap_per_sec = 5
 [exit_orders]
 enabled = false
 
-# Judge-locked cadence scheduler (2026-07-14): per-minute chain + spot fire
-# timing with structural zero-429 gates (pure CAS min-spacing, monotonic
-# domain), backward failure ladder, and event-driven per-(lane, minute)
-# moneyness decisions. SHIPS DISABLED: day 1 both lanes run the dry-run
-# logging executor (fires logged, Empty returned, NO REST call — decisions
-# honest-skip). Flipping `enabled = true` needs the real broker executors
-# (a later PR) + the dated rule-file note per
+# Cadence scheduler (judge-locked 2026-07-14; reshaped by the operator
+# directive 2026-07-16): per-minute POST-CLOSE burst fire timing with
+# structural zero-429 gates (pure CAS per-(underlying, expiry) spacing +
+# the combined rolling-second cap, monotonic domain), streak-driven shape
+# ladders, and event-driven per-(lane, minute) moneyness decisions.
+# SHIPS DISABLED: day 1 both lanes run the dry-run logging executor
+# (fires logged, Empty returned, NO REST call — decisions honest-skip).
+# Flipping `enabled = true` needs the real broker executors (a later PR)
+# + the dated rule-file note per
 # `.claude/rules/project/cadence-error-codes.md`.
 [cadence]
 enabled = false
-# Dhan chain fire offsets vs each minute close T, ms (the operator's
-# :55/:58/:02 — exactly 3, one per underlying, pairwise gaps validated
-# >= chain_min_spacing_ms).
-dhan_chain_offsets_ms = [-5000, -2000, 2000]
-# Dhan spot group anchor at T+3000 (:03). The 2026-07-15 adaptive
-# concurrency ladder groups the 4 single-symbol spot calls per step —
-# step 0 fires all 4 SIMULTANEOUSLY at :03.0; degraded steps split
-# 3+1 / 2+2 / fully sequential across 1000ms-spaced group anchors (both
-# brokers' candle endpoints are single-symbol-per-request — a true
-# multi-symbol batch does not exist).
-dhan_spot_start_offset_ms = 3000
+# The Dhan post-close burst second (operator 2026-07-16 "all 7 first
+# second", packed honestly under the broker's 5/sec cap): at T + this,
+# ALL 3 chains fire concurrently (the 3s rule is per-(underlying, expiry)
+# only) plus the 2 decision-critical spots (NIFTY, BANKNIFTY); the
+# remaining 2 spots (SENSEX, INDIA VIX) fire the NEXT second. The shape
+# ladder's rung 1 fallback splits instead: chains in second 1, ALL 4
+# spots in second 2.
+dhan_burst_offset_ms = 1000
 # Rolling-1000ms-window spot gate: at most this many spot requests in ANY
-# sliding second (1..=5 — Dhan's hard cap is 5/sec; the shared 3 rps
-# dhan_data_api_limiter still smooths a 4-simultaneous burst to ~3/sec —
-# the window gate is the STRUCTURAL ceiling, the limiter defense-in-depth).
+# sliding second (1..=5 — Dhan's hard cap is 5/sec; the combined
+# rolling-second ring is THE binding cadence-lane pacing per the
+# 2026-07-16 coordinator ruling — cadence fires do NOT route through the
+# shared 3 rps dhan_data_api_limiter, which stays for the legacy paths).
 spot_window_cap = 4
-# Adaptive-concurrency streaks (BOTH Assumed — operator confirm pending):
-# degrade one step after this many CONSECUTIVE spot-dirty (rate-limited)
-# cycles; recover one step after this many consecutive fully-clean cycles.
-# The same streaks drive the Groww three-choice fallback-shape ladder.
+# Streak thresholds shared by ALL cadence ladders (the 2026-07-16 Dhan
+# shape rung 0⇄1, the 2026-07-15 spot-concurrency tiers and the Groww
+# fallback-shape ladder; BOTH Assumed — operator confirm pending):
+# degrade one step after this many CONSECUTIVE dirty cycles; recover one
+# step after this many consecutive fully-clean cycles.
 concurrency_degrade_after_dirty_cycles = 2
 concurrency_recover_after_clean_cycles = 3
-# Ladder rung clamp: spots never fire earlier than T + this (house 300ms).
+# Spot clamp: spots never fire earlier than T + this (house 300ms —
+# structurally inert at the default 1000ms burst offset).
 spot_min_post_close_ms = 300
-# Failure ladder: chains shift wholesale -1000ms per rung, max 5 rungs.
-dhan_ladder_step_ms = 1000
-dhan_ladder_max_rungs = 5
 # At most one in-cycle retry per failed request (RateLimited never retried).
 in_cycle_retry_max = 1
-recovery_mode = "step_back_one"
 # Lane staleness cutoffs past T: older data is stale for a next-minute fill.
 dhan_lane_cutoff_ms = 15000
 groww_lane_cutoff_ms = 6000
-# Groww three-choice fallback-shape ladder (operator verbatim 2026-07-15):
-# choice 1 (default) = all 7 requests in parallel at T+0; choice 2 = :01
-# all 3 chains / :02 ALL 4 spots (VIX included); choice 3 (last resort) =
-# :01 chains / :02 core spots / :03 VIX alone. Verdict = last wave + the
-# burst timeout; 1500ms per request on the sequential fallback.
+# Groww fallback-shape ladder (operator verbatim 2026-07-16 two-rung
+# prescription + the retained choice-3 last resort): rung 0 (default) =
+# all 7 requests in parallel at T+0; rung 1 = :01 all 3 chains / :02 ALL
+# 4 spots (VIX included); rung 2 (kept beyond the operator's two-rung
+# prescription as the last resort — dated note in
+# cadence-error-codes.md) = :01 chains / :02 core spots / :03 VIX alone.
+# Verdict = last wave + the burst timeout; 1500ms per request on the
+# sequential fallback.
 groww_anchor_offset_ms = 0
 groww_burst_timeout_ms = 800
 groww_request_timeout_ms = 1500
-# The structural zero-429 floor: per-underlying AND global chain gates.
+# The structural zero-429 floor: the per-(underlying, expiry) chain gate
+# (the 2026-07-16 directive: the broker's 3s rule applies to the SAME
+# chain expiry only — different underlyings fire concurrently).
 chain_min_spacing_ms = 3000
 # Pre-market expiry resolution (operator spec 2026-07-15): bounded retry
 # interval per (broker, underlying) expiry-list fetch until the IST
