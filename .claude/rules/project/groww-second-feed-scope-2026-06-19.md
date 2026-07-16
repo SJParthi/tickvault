@@ -1076,3 +1076,8 @@ the operator must update THIS §39 first with a fresh dated quote.
 > (read-only, only during shop hours), but he physically CANNOT send a single
 > real order until YOU, on a dated day, open all four locks yourself. Until then
 > the counter is built, tested, and completely silent.
+## §39.x — 2026-07-16: Groww order/position/trade PUSH channel authorized
+
+Operator Parthiban, 2026-07-16 (events 38df2073-eecb-43cf-876d-a4a809dde269 + 157f7cd0-dfdf-4c4e-b93a-9f9aff3317c2): the Groww order/position/trade-update PUSH channel is authorized under the same 4-gate live-fire lattice discipline (§39.2) — ONE NEW dedicated NATS-over-WS connection (`wss://socket-api.groww.in`), order/position/trade events ONLY, receive-only PAPER mode, `GROWW_ORDER_LIVE_FIRE` stays false. Names: config `order_push_enabled` under `[groww_orders]` (serde default OFF), module tree `crates/trading/src/oms/groww/push/`, error codes GROWW-PUSH-01..04, `WsType::GrowwOrderUpdate`. Access token stays SSM read-only (minter lock untouched); the per-session socket-token mint is the KEEP-class live-feed-AUTH call. No live orders.
+
+(2026-07-16) The transport building blocks (nats/nkey/proto/socket_token/connect) are restored from `dd7eaa5e^` into `crates/trading/src/oms/groww/push/` for the ORDER/POSITION channel — this is NOT a §35 shadow-client (market-data) revival.
