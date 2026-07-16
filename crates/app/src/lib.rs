@@ -197,6 +197,10 @@ pub mod api_token_rotation;
 pub mod exit_execution;
 pub mod index_constituency_boot;
 pub mod observability;
+/// Shared OMS wiring (TokenHandle→TokenProvider adapter + pinned-timeout
+/// HTTP client builder) — extracted from `trading_pipeline` 2026-07-14 so
+/// the two OMS construction sites can never drift.
+pub mod oms_wiring;
 /// Cluster-C order-side observability (2026-07-14): OmsAlertSink /
 /// RiskAlertSink bridges → Telegram + the rebuilt SEBI order_audit /
 /// pnl_audit tables via one bounded mpsc(1024) consumer task; daily

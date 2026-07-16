@@ -197,6 +197,16 @@ pub struct ApplicationConfig {
     /// section ⇒ DISABLED (fail-safe default off).
     #[serde(default)]
     pub groww_contract_1m: GrowwContract1mConfig,
+    /// `[order_runtime]` — the dry-run ORDER RUNTIME (cluster A, operator
+    /// directive 2026-07-14 — `.claude/plans/active-plan-order-runtime-dryrun.md`):
+    /// one supervised single-owner task owning OMS (dry_run hard-true) +
+    /// RiskEngine, spawned ONLY from the dhan_rest_stack (dhan-OFF arm),
+    /// consuming order-update events + Groww marks, with the next-mark paper
+    /// filler, the local reconcile invariant, and the once-daily paper
+    /// self-test. Absent section ⇒ DISABLED — byte-identical dormant boot
+    /// (discard drain, no WAL capture). `config/base.toml` opts in.
+    #[serde(default)]
+    pub order_runtime: OrderRuntimeConfig,
     /// `[groww_rest_burst]` — the 2026-07-14 Groww REST burst auto-ladder
     /// (operator approval "approved and go ahead with the recommendation";
     /// `no-rest-except-live-feed-2026-06-27.md` §9.7): which burst tier the
@@ -3921,6 +3931,7 @@ mod tests {
             rest_candle_fold: RestCandleFoldConfig::default(),
             market_ram_store: MarketRamStoreConfig::default(),
             groww_contract_1m: GrowwContract1mConfig::default(),
+            order_runtime: OrderRuntimeConfig::default(),
             groww_universe: GrowwUniverseConfig::default(),
             groww_orders: GrowwOrdersConfig::default(),
             dhan_margin_gate: DhanMarginGateConfig::default(),

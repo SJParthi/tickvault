@@ -22,7 +22,9 @@ use tickvault_common::constants::{
     DATA_805_STOP_ALL_COOLDOWN_SECS, DH901_ROTATE_RETRY_DELAY_SECS, DH904_MAX_RETRY_ATTEMPTS,
 };
 use tickvault_common::error_code::ErrorCode;
-use tickvault_common::order_types::{OrderStatus, OrderType, OrderUpdate, OrderValidity};
+use tickvault_common::order_types::{
+    OrderStatus, OrderType, OrderUpdate, OrderValidity, TransactionType,
+};
 use tickvault_common::sanitize::capture_rest_error_body;
 
 use super::api_client::OrderApiClient;
@@ -37,11 +39,11 @@ use super::state_machine::{is_valid_transition, parse_order_status};
 use super::types::{
     DhanForeverOrderRequest, DhanModifyOrderRequest, DhanModifySuperOrderRequest,
     DhanPlaceOrderRequest, DhanPlaceSuperOrderRequest, DhanSuperOrderResponse,
-    EXCHANGE_SEGMENT_NSE_FNO, ExecutionVerdict, LegState, MAX_MODIFICATIONS_PER_ORDER,
+    EXCHANGE_SEGMENT_NSE_FNO, ExecutionVerdict, FillEvent, LegState, MAX_MODIFICATIONS_PER_ORDER,
     ManagedOrder, ManagedSuperOrder, ModifyOrderRequest, ModifySuperOrderLeg, OmsError, OrderLeg,
     PlaceForeverOcoRequest, PlaceOrderRequest, PlaceSuperOrderRequest, ReconciliationReport,
-    SUPER_ORDER_STATUS_ACCEPTED_UNPARSED_BODY, SlicingResponse, SuperOrderLegSnapshot,
-    SuperOrderPlacement, VerifyState,
+    SEGMENT_CODE_UNKNOWN, SUPER_ORDER_STATUS_ACCEPTED_UNPARSED_BODY, SlicingResponse,
+    SuperOrderLegSnapshot, SuperOrderPlacement, VerifyState, parse_segment_chars,
 };
 
 // ---------------------------------------------------------------------------
@@ -1296,6 +1298,28 @@ impl OrderManagementSystem {
         let mut skipped_local_terminal: u64 = 0;
         for update in updates {
             if let Some(order) = self.orders.get_mut(&update.order_id) {
+                // C8 (fix-round 2026-07-14, honest envelope): an UPWARD
+                // traded_qty correction here raises the delta baseline
+                // WITHOUT emitting a FillEvent — the missed fill can never
+                // reach `record_fill` afterwards (any later WS redelivery
+                // computes delta 0). Loud until the pre-live follow-up
+                // (reconcile-emitted FillEvents) lands — see
+                // `.claude/rules/project/order-runtime-dryrun.md` §3.
+                // Fires for terminal AND non-terminal orders (the terminal
+                // guard below still applies the fill fields, so the swallow
+                // class is identical).
+                if update.traded_qty > order.traded_qty {
+                    error!(
+                        code = ErrorCode::OmsGapReconciliation.code_str(),
+                        order_id = %update.order_id,
+                        local_qty = order.traded_qty,
+                        broker_qty = update.traded_qty,
+                        "OMS-GAP-02: reconcile corrected traded_qty UPWARD — the \
+                         missed fill delta is SWALLOWED (no FillEvent); the risk \
+                         book diverges from the broker until manually corrected \
+                         (pre-live follow-up: reconcile-emitted fills)"
+                    );
+                }
                 if order.is_terminal() {
                     let status_suppressed = order.status != update.status;
                     order.traded_qty = update.traded_qty;

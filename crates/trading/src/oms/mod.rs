@@ -53,7 +53,7 @@ pub mod groww;
 
 // Re-export key types for ergonomic use.
 pub use api_client::OrderApiClient;
-pub use engine::{OrderManagementSystem, TokenProvider};
+pub use engine::{OmsAlert, OmsAlertSink, OrderManagementSystem, TokenProvider};
 pub use error_taxonomy::{BrokerCooldownLatch, DhanErrorClass, OrderEndpoint, OrderErrorPolicy};
 pub use exit_rules::ExitCommand;
 pub use margin_gate::{MarginGate, MarginSnapshot, MarginVerdict};
@@ -63,7 +63,8 @@ pub use order_readiness::{
 };
 pub use rate_limiter::OrderRateLimiter;
 pub use types::{
-    ExecutionVerdict, ManagedOrder, ManagedSuperOrder, ModifyOrderRequest, ModifySuperOrderLeg,
-    OcoSecondLeg, OmsError, OrderIntent, PlaceForeverOcoRequest, PlaceOrderRequest,
-    PlaceSuperOrderRequest, ReconciliationReport, SlicingResponse, SuperOrderPlacement,
+    ExecutionVerdict, FillEvent, ManagedOrder, ManagedSuperOrder, ModifyOrderRequest,
+    ModifySuperOrderLeg, OcoSecondLeg, OmsError, OrderIntent, PlaceForeverOcoRequest,
+    PlaceOrderRequest, PlaceSuperOrderRequest, ReconciliationReport, SEGMENT_CODE_UNKNOWN,
+    SlicingResponse, SuperOrderPlacement, parse_segment_chars,
 };

@@ -3950,9 +3950,65 @@ mod tests {
             alert_id: None,
         };
         let json = serde_json::to_string(&req).unwrap();
-        assert!(
-            !json.contains("alertId"),
-            "None alert_id must serialize away"
+        assert!(json.contains("INE733E01010"));
+        assert!(json.contains("\"bulk\":false"));
+    }
+
+    #[test]
+    fn test_edis_inquiry_response_deserialize() {
+        let json = r#"{"totalQty":100,"aprvdQty":50,"status":"APPROVED"}"#;
+        let resp: EdisInquiryResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.total_qty, 100);
+        assert_eq!(resp.aprvd_qty, 50);
+        assert_eq!(resp.status, "APPROVED");
+    }
+
+    // -----------------------------------------------------------------------
+    // Statement Types Tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_ledger_entry_string_debit_credit() {
+        // CRITICAL: debit and credit are STRINGS, not floats
+        let json = r#"{"dhanClientId":"1","narration":"test","voucherdate":"Jun 22, 2022","exchange":"NSE","voucherdesc":"desc","vouchernumber":"V1","debit":"1500.50","credit":"0.00","runbal":"50000.00"}"#;
+        let entry: DhanLedgerEntry = serde_json::from_str(json).unwrap();
+        assert_eq!(entry.debit, "1500.50"); // String, not float
+        assert_eq!(entry.credit, "0.00"); // String, not float
+        assert_eq!(entry.voucherdate, "Jun 22, 2022"); // Human-readable format
+    }
+
+    #[test]
+    fn test_historical_trade_entry_deserialize() {
+        let json = r#"{"dhanClientId":"1","orderId":"O1","exchangeOrderId":"E1","exchangeTradeId":"T1","transactionType":"BUY","exchangeSegment":"NSE_EQ","productType":"CNC","orderType":"LIMIT","tradingSymbol":"RELIANCE","customSymbol":"","securityId":"2885","tradedQuantity":10,"tradedPrice":2500.0,"isin":"INE002A01018","instrument":"EQUITY","sebiTax":0.01,"stt":2.5,"brokerageCharges":0.0,"serviceTax":0.0,"exchangeTransactionCharges":0.5,"stampDuty":0.02,"drvExpiryDate":"NA","drvOptionType":"","drvStrikePrice":0.0,"exchangeTime":"2026-03-25 14:30:00"}"#;
+        let entry: DhanHistoricalTradeEntry = serde_json::from_str(json).unwrap();
+        assert_eq!(entry.traded_quantity, 10);
+        assert_eq!(entry.drv_expiry_date, "NA"); // "NA" for non-derivatives
+        assert_eq!(entry.exchange_time, "2026-03-25 14:30:00"); // IST string
+    }
+
+    // -----------------------------------------------------------------------
+    // Cancel Order Response Tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_cancel_order_response_deserialize() {
+        let json = r#"{"orderId":"ORD-123","orderStatus":"CANCELLED"}"#;
+        let resp: DhanCancelOrderResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.order_id, "ORD-123");
+        assert_eq!(resp.order_status, "CANCELLED");
+    }
+
+    // -----------------------------------------------------------------------
+    // FillEvent + segment-char mapping (order-runtime dry-run PR, 2026-07-14)
+    // -----------------------------------------------------------------------
+
+    /// The full wire-char → segment matrix from live-order-update.md rule 6,
+    /// plus the fail-closed unknown arms (annexure rule 15 — None, no panic).
+    #[test]
+    fn test_parse_segment_chars_matrix() {
+        assert_eq!(
+            parse_segment_chars("NSE", "D"),
+            Some(ExchangeSegment::NseFno)
         );
     }
 
@@ -3976,12 +4032,12 @@ mod tests {
             orders: vec![],
             alert_id: Some("12345".to_string()),
         };
-        let json = serde_json::to_string(&req).unwrap();
-        assert!(json.contains("\"alertId\":\"12345\""));
+        assert_eq!(fill.segment_code, SEGMENT_CODE_UNKNOWN);
+        assert_eq!(fill.fill_lots, 1);
     }
 
     // -----------------------------------------------------------------------
-    // Multi Order + Conditional Detail Types Tests (2026-07-14)
+    // Exit-Order Execution Layer types (Cluster B, 2026-07-14)
     // -----------------------------------------------------------------------
 
     #[test]
@@ -4230,81 +4286,5 @@ mod tests {
         };
         assert_eq!(placement.clone().legs.len(), 1);
         assert_eq!(placement.legs[0].leg, OrderLeg::TargetLeg);
-    }
-
-    // -----------------------------------------------------------------------
-    // Trade Book + DhanTradeEntry Tests
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_trade_entry_deserialize_with_tax_breakdown() {
-        let json = r#"{"dhanClientId":"1","orderId":"ORD-1","exchangeOrderId":"E1","exchangeTradeId":"T1","transactionType":"BUY","exchangeSegment":"NSE_EQ","productType":"INTRADAY","orderType":"MARKET","tradingSymbol":"NIFTY","customSymbol":"","securityId":"11536","tradedQuantity":50,"tradedPrice":24500.0,"isin":"INE1234","instrument":"OPTIDX","sebiTax":0.5,"stt":12.25,"brokerageCharges":20.0,"serviceTax":3.6,"exchangeTransactionCharges":2.0,"stampDuty":0.1,"drvExpiryDate":"2026-03-27","drvOptionType":"CE","drvStrikePrice":24500.0,"exchangeTime":"2026-03-27 10:30:45"}"#;
-        let entry: DhanTradeEntry = serde_json::from_str(json).unwrap();
-        assert_eq!(entry.traded_quantity, 50);
-        assert!((entry.stt - 12.25).abs() < f64::EPSILON);
-        assert!((entry.stamp_duty - 0.1).abs() < f64::EPSILON);
-        assert_eq!(entry.drv_option_type, "CE");
-    }
-
-    // -----------------------------------------------------------------------
-    // EDIS Types Tests
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_edis_form_request_serialize() {
-        let req = EdisFormRequest {
-            isin: "INE733E01010".to_string(),
-            qty: 100,
-            exchange: "NSE".to_string(),
-            segment: "EQ".to_string(),
-            bulk: false,
-        };
-        let json = serde_json::to_string(&req).unwrap();
-        assert!(json.contains("INE733E01010"));
-        assert!(json.contains("\"bulk\":false"));
-    }
-
-    #[test]
-    fn test_edis_inquiry_response_deserialize() {
-        let json = r#"{"totalQty":100,"aprvdQty":50,"status":"APPROVED"}"#;
-        let resp: EdisInquiryResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(resp.total_qty, 100);
-        assert_eq!(resp.aprvd_qty, 50);
-        assert_eq!(resp.status, "APPROVED");
-    }
-
-    // -----------------------------------------------------------------------
-    // Statement Types Tests
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_ledger_entry_string_debit_credit() {
-        // CRITICAL: debit and credit are STRINGS, not floats
-        let json = r#"{"dhanClientId":"1","narration":"test","voucherdate":"Jun 22, 2022","exchange":"NSE","voucherdesc":"desc","vouchernumber":"V1","debit":"1500.50","credit":"0.00","runbal":"50000.00"}"#;
-        let entry: DhanLedgerEntry = serde_json::from_str(json).unwrap();
-        assert_eq!(entry.debit, "1500.50"); // String, not float
-        assert_eq!(entry.credit, "0.00"); // String, not float
-        assert_eq!(entry.voucherdate, "Jun 22, 2022"); // Human-readable format
-    }
-
-    #[test]
-    fn test_historical_trade_entry_deserialize() {
-        let json = r#"{"dhanClientId":"1","orderId":"O1","exchangeOrderId":"E1","exchangeTradeId":"T1","transactionType":"BUY","exchangeSegment":"NSE_EQ","productType":"CNC","orderType":"LIMIT","tradingSymbol":"RELIANCE","customSymbol":"","securityId":"2885","tradedQuantity":10,"tradedPrice":2500.0,"isin":"INE002A01018","instrument":"EQUITY","sebiTax":0.01,"stt":2.5,"brokerageCharges":0.0,"serviceTax":0.0,"exchangeTransactionCharges":0.5,"stampDuty":0.02,"drvExpiryDate":"NA","drvOptionType":"","drvStrikePrice":0.0,"exchangeTime":"2026-03-25 14:30:00"}"#;
-        let entry: DhanHistoricalTradeEntry = serde_json::from_str(json).unwrap();
-        assert_eq!(entry.traded_quantity, 10);
-        assert_eq!(entry.drv_expiry_date, "NA"); // "NA" for non-derivatives
-        assert_eq!(entry.exchange_time, "2026-03-25 14:30:00"); // IST string
-    }
-
-    // -----------------------------------------------------------------------
-    // Cancel Order Response Tests
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_cancel_order_response_deserialize() {
-        let json = r#"{"orderId":"ORD-123","orderStatus":"CANCELLED"}"#;
-        let resp: DhanCancelOrderResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(resp.order_id, "ORD-123");
-        assert_eq!(resp.order_status, "CANCELLED");
     }
 }

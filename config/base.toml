@@ -632,6 +632,24 @@ warm_up = true
 enabled = true
 
 # ===========================================================================
+# Order runtime (dry-run) — cluster A, operator directive 2026-07-14
+# (.claude/plans/active-plan-order-runtime-dryrun.md). One supervised task
+# owning the paper OMS + RiskEngine, spawned from the Dhan REST-only stack:
+# order-update events reach the book, Groww marks drive mark-to-market P&L
+# + the next-mark paper filler, the daily-loss halt finally has real
+# inputs, and a once-daily gated self-test proves the chain end-to-end.
+# NO real orders ever (the OMS is hard dry-run). An ABSENT section =
+# disabled (fail-safe); `enabled = false` is the rollback switch — it
+# restores the exact pre-PR dormant shape (discard drain, no WAL capture).
+# ===========================================================================
+[order_runtime]
+enabled = true
+paper_fill = true
+self_test = true
+reconcile_interval_secs = 300
+mark_channel_capacity = 8192
+
+# ===========================================================================
 # REST-era multi-TF candle derivation (operator directive 2026-07-16:
 # "why the fuck remaining candles 1m till 1day is not yet generated and
 # populated — resolve these"). Folds persist-confirmed spot_1m_rest 1m bars
@@ -706,9 +724,6 @@ paper_enabled = false
 # max_order_quantity: fail-closed cap; 0 = refuse-all (pending the operator's
 # 0-vs-1 answer). A larger requested qty is refused before any HTTP (GROWW-ORD-09).
 max_order_quantity = 0
-# order_push_enabled: receive-only order/position PUSH channel (Stage A,
-# 2026-07-16) — paper-mode observability only; places no order.
-order_push_enabled = false
 
 # ===========================================================================
 # 🔷 DHAN pre-trade margin gate (operator directive 2026-07-14, relayed via
