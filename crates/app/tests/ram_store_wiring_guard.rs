@@ -141,6 +141,15 @@ fn fold_emit_paths_call_the_ram_hooks() {
         "refold_day must record the day into RAM at EXACTLY two sites \
          (the today exit + the past-day force-seal exit)"
     );
+    // PR-2 round-1 LOW: the day_seals ACCUMULATION sites feed those record
+    // hooks — deleting either compiles green and silently empties the
+    // catch-up's RAM day blocks (in-loop folds + past-day force-seal tail).
+    assert_eq!(
+        count_occurrences(prod, "day_seals.extend_from_slice(&sealed)"),
+        2,
+        "refold_day must accumulate seals into day_seals at EXACTLY two \
+         sites (the in-loop fold + the past-day force-seal tail)"
+    );
 
     // Both hooks resolve the process-global store (no-op when disabled).
     assert!(
@@ -221,6 +230,10 @@ fn ram_store_boot_module_keeps_load_bearing_pieces() {
         "tv_ram_store_chain_minutes_resident",
         "tv_ram_store_estimated_bytes",
         "tv_ram_store_heartbeat_total",
+        // PR-2 round-1 HIGH: the spot store's over-window drop total must
+        // stay PUBLISHED (counter-style gauge from the 60s stats task) —
+        // dropping it regresses spot drops to an unpublished stat.
+        "tv_ram_store_spot_dropped_over_window",
     ] {
         assert!(
             prod.contains(gauge),

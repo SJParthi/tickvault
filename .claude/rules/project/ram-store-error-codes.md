@@ -69,13 +69,25 @@ inspects, never manually rebuilds RAM).
 
 | stage | Meaning |
 |---|---|
-| `install` | a store install was refused (duplicate install attempt — first-wins; defensive, loud) |
-| `rehydrate_query` | a chain-rehydrate `/exec` window query failed (transport / non-2xx / oversize body) — that window is skipped; remaining windows still run |
-| `rehydrate_parse` | a chain-rehydrate window's dataset failed to parse — skipped loudly |
-| `rehydrate_truncated` | a chain-rehydrate window hit its explicit LIMIT — a partial window is NEVER trusted; skipped loudly (raise the bound in a reviewed PR, never silently) |
-| `chain_truncated` | a live-published chain snapshot exceeded `chain_row_cap` rows and was truncated (kept prefix, counted — a hostile/runaway snapshot can never grow RAM unbounded) |
-| `day_drop` | a STALE older-day chain publish arrived after the day rolled — dropped, never allowed to clear the live day |
-| `task_respawn` | the supervised stats/rehydrate task died and was respawned (house `classify_join_exit` pattern; release builds abort per `panic = "abort"` — the honest TICK-FLUSH-01 envelope) |
+| `install` | a store install was refused (duplicate install attempt — first-wins; defensive, loud). `error!`-only — the one stage with NO companion counter |
+| `rehydrate_query` | a chain-rehydrate `/exec` window query failed (transport / non-2xx / oversize body / client build) — that window is skipped; remaining windows still run. Counter: `tv_ram_store_errors_total{stage="rehydrate_query"}` |
+| `rehydrate_parse` | a chain-rehydrate window's dataset failed to parse — skipped loudly. Counter: `tv_ram_store_errors_total{stage="rehydrate_parse"}` |
+| `rehydrate_truncated` | a chain-rehydrate window returned MORE than its trusted bound (the query fetches LIMIT+1, so an exact-boundary window is legitimately complete — only `len > limit` flags; PR-2 round-1 fix) — a partial window is NEVER trusted; skipped loudly. Counter: `tv_ram_store_errors_total{stage="rehydrate_truncated"}` |
+| `chain_truncated` | TWO consequences, split by the drop-counter reason (PR-2 round-1 doc fix): (a) a published chain snapshot exceeded `chain_row_cap` rows → TRUNCATED, prefix kept, minute still resident (`tv_ram_store_dropped_total{reason="row_cap"}`); (b) the 405-minute per-slot cap refused a whole NEW minute → the FULL minute is dropped, nothing kept (`tv_ram_store_dropped_total{reason="minute_cap"}`). Both `warn!`, both counted — a hostile/runaway publisher can never grow RAM unbounded |
+| `day_drop` | a STALE older-day chain publish arrived after the day rolled — dropped, never allowed to clear the live day. Counter: `tv_ram_store_dropped_total{reason="day_drop"}` |
+| `task_respawn` | the supervised stats/rehydrate task died (stats: respawned; rehydrate: one-shot, reported only) — house `classify_join_exit` pattern; release builds abort per `panic = "abort"` (the honest TICK-FLUSH-01 envelope). Counter: `tv_ram_store_errors_total{stage="task_respawn"}` |
+
+**Metric surface (the EXACT emitted names — grep-verified both directions):**
+
+| Metric | Kind | Labels / values |
+|---|---|---|
+| `tv_ram_store_dropped_total` | counter | `reason` = `row_cap` \| `day_drop` \| `minute_cap` (CHAIN store only) |
+| `tv_ram_store_spot_dropped_over_window` | gauge (counter-style, monotonic) | none — the SPOT store's lifetime over-window drop total, published by the 60s stats task (the spot store itself is a pure emit-free ring core) |
+| `tv_ram_store_errors_total` | counter | `stage` = `rehydrate_query` \| `rehydrate_parse` \| `rehydrate_truncated` \| `task_respawn` |
+| `tv_ram_store_rehydrate_minutes_total` | counter | `feed`; counts STORED rehydrated minutes INCLUDING row-cap-truncated ones (PR-2 round-1 — the truncation is separately loud via `reason="row_cap"`) |
+| `tv_ram_store_spot_bars_resident` / `tv_ram_store_spot_days_depth` / `tv_ram_store_chain_minutes_resident` | gauges | `feed` |
+| `tv_ram_store_estimated_bytes` | gauge | none |
+| `tv_ram_store_heartbeat_total` | counter | none — dense 60s heartbeat |
 
 **Triage:**
 1. `mcp__tickvault-logs__tail_errors` — find `RAMSTORE-01`; the `stage`
@@ -92,9 +104,22 @@ inspects, never manually rebuilds RAM).
    depth across the feed's slots — the guaranteed depth),
    `tv_ram_store_spot_bars_resident{feed}`,
    `tv_ram_store_chain_minutes_resident{feed}`,
+   `tv_ram_store_spot_dropped_over_window` (spot-side lifetime drop
+   total — a climbing value means blocks older than the retained window
+   are being offered, correct eviction),
    `tv_ram_store_estimated_bytes`. A flatlining
    `tv_ram_store_heartbeat_total` means the stats task is dead
    (`task_respawn` self-heals in unwind builds; release = restart).
+
+**Honest envelope — chain pre-open stale day (PR-2 round-1):** the chain
+store holds the LATEST PUBLISHED IST day and clears ONLY on a newer-day
+publish (deliberately NO clock-based clearing — simple + deterministic).
+An overnight-surviving process therefore serves the PRIOR session's
+minutes pre-open, until the first ~09:16 publish rolls the day. Any
+future consumer MUST check `ChainDayStore::day(feed, underlying)` against
+today's IST epoch-day before trusting a read (the §38.8
+decision-freshness gate); every returned snapshot also carries its own
+`minute_ts_ist_nanos` (day-derivable via `epoch_day_of_ist_nanos`).
 
 **Honest envelope:** RAM depth is bounded by CAPTURED history —
 `spot_1m_rest` holds only ~1-2 days as of 2026-07-16, so the rings reach
@@ -122,8 +147,11 @@ follow-up (one map entry + a cost note — the SCOREBOARD-01 precedent).
 
 **Source:**
 - `crates/common/src/error_code.rs::ErrorCode::RamStore01Degraded`
-- `crates/trading/src/in_mem/spot_bar_store.rs` (ring core — pure, no emit
-  sites; drops are counted via `tv_ram_store_dropped_total{reason}`)
+- `crates/trading/src/in_mem/spot_bar_store.rs` (ring core — pure, NO emit
+  sites by design; its lifetime over-window drop total is published by the
+  60s stats task as the counter-style gauge
+  `tv_ram_store_spot_dropped_over_window` — the chain-only
+  `tv_ram_store_dropped_total{reason}` never carries spot drops)
 - `crates/core/src/pipeline/chain_day_store.rs` (`chain_truncated` /
   `day_drop` emit sites)
 - `crates/app/src/market_ram_store_boot.rs` (`install` / `rehydrate_*` /
