@@ -61,25 +61,39 @@ demanded is derived into all 21 TFs even after a fresh clone — and TODAY's
 rows additionally SEED the live day-map (below), so a mid-session restart
 keeps a complete in-RAM refold source.
 
-**Out-of-order/repair bars (2026-07-16 round-2 HIGH redesign):** every bar
-received for the CURRENT trading day also lands in a per-(feed, SID,
-segment) in-RAM **day-map** (minute → last-received bar, last-write-wins;
-≤375 entries × 8 keys — trivial memory). A current-day repair — an
-out-of-order minute OR a value-UPDATE of an already-folded minute —
-updates the map and synchronously REFOLDS the whole day from the map
-through a fresh engine (microseconds, cold path), swaps the live engine,
-and re-emits every closed bucket (DEDUP UPSERT heals in place). Lossless
-by construction: the map holds every bar the process ever received for
-the day, so the today path performs NO QuestDB read and carries NO
-ILP-ACK → `/exec` WAL-apply visibility race (the round-1 `/exec`
-today-refold — whose presence-only gate missed value-updates and whose
-read could miss bars folded between mark and drain — is RETIRED). Only a
-repair for a day STRICTLY OLDER than the engine's current day (day
-identity is the ENGINE's day, never the wall clock — which kills the
-post-midnight clobber class) takes the bounded, debounced `/exec`
-past-day refold: it emits corrected CLOSED-day seals only, never touches
-a live engine, and keeps the trigger-minute presence gate + bounded
-requeue (the ONLY residual WAL-lag surface).
+**Out-of-order/repair bars (2026-07-16 round-2 HIGH redesign; round-3
+burst coalescing):** every bar received for the CURRENT trading day also
+lands in a per-(feed, SID, segment) in-RAM **day-map** (minute →
+last-received bar, last-write-wins; ≤375 entries × 8 keys — trivial
+memory). A current-day repair — an out-of-order minute OR a value-UPDATE
+of an already-folded minute — updates the map; the consumer loop drains
+each arriving burst as ONE batch and refolds every dirty slot ONCE per
+batch from its map through a fresh engine (microseconds, cold path — a
+mid-day-outage sweep of N repairs costs one refold per slot, never N
+full-day refolds), swaps the live engine, and re-emits every closed
+bucket (DEDUP UPSERT heals in place). Lossless for bars received
+IN-PROCESS THIS INCARNATION: the map holds every such bar, so the today
+REPAIR path performs NO QuestDB read and adds no ILP-ACK → `/exec`
+WAL-apply visibility race of its own (the round-1 `/exec` today-refold —
+whose presence-only gate missed value-updates and whose read could miss
+bars folded between mark and drain — is RETIRED). Honest crash-restart
+residual (round-3 doc-honesty): the boot catch-up's TODAY seed IS an
+`/exec` read — a minute persisted seconds before a crash-restart can be
+WAL-invisible to that seed and stays out of the derived candles until
+the NEXT boot's catch-up; the 15:40 IST tf-verify (Blind/mismatch) is
+the pager for that window. A bar dated AFTER the wall-clock IST today
+NEVER rolls the live day forward (the BOUNDARY-01 future-skew class —
+dropped + counted `reason="future_dated"`, ONE coalesced coded error per
+drained batch); with no current day yet (failed/empty catch-up) only a
+TODAY-dated first bar is adopted — a past-dated first bar routes to the
+past-day queue (a 1-bar adopted refold would force-seal + DEDUP-clobber
+a previously-correct closed day). Only a repair for a day STRICTLY OLDER
+than the engine's current day (day identity is the ENGINE's day, never
+rolled past the wall clock — which kills the post-midnight clobber
+class) takes the bounded, debounced `/exec` past-day refold: it emits
+corrected CLOSED-day seals only, never touches a live engine, and keeps
+the trigger-minute presence gate + bounded requeue (the only residual
+SAME-SESSION WAL-lag surface).
 
 **FOLD-01** is the typed record of any leg of that machinery degrading —
 never of a healthy fold (which is counters + info lines only).
@@ -101,7 +115,8 @@ field):
 | `catchup_parse` | the `/exec` body was unparsable, the explicit row LIMIT was hit (a truncated day is NEVER partially folded — the tf_consistency tripwire discipline), or a poisoned segment value failed the allowlist (skipped, never re-queried). |
 | `discovery_truncated` | the boot catch-up's per-feed instrument discovery hit ITS row LIMIT — a partial instrument set is never trusted; the whole (feed, day) fold pass is skipped LOUDLY (2026-07-16 hostile-review M4). |
 | `refold_stale_read` | a PAST-day refold's `/exec` read did NOT yet contain the triggering repair minute (ILP-flush-ACK → WAL-apply visibility lag) — the refold is NOT emitted (would regress correct candles). Round-2 LOW-7 wording: `tv_rest_candle_fold_errors_total{stage="refold_stale_read"}` increments on EVERY failed attempt (each re-queue logs a coalesced `warn!`); the `error!` fires only on the EXHAUSTED arm (5 attempts). Round-2 scope: this stage exists ONLY on the past-day cold path — the current day refolds from the in-RAM day-map with no `/exec` read (2026-07-16 hostile-review M2 + round-2 HIGH). |
-| `seal_send` | a sealed bucket could not be handed to the seal-writer channel (channel full past the boot-path pacing budget / global sender missing), or a confirmed-bar handoff was dropped (fold channel full/closed). |
+| `seal_send` | a sealed bucket could not be handed to the seal-writer channel (channel full past the boot-path pacing budget / global sender missing), or a confirmed-bar handoff was dropped (fold channel full/closed). Round-3: a CLOSED seal channel (seal-writer gone — shutdown/teardown) is labeled DISTINCTLY (`dropped{reason="seal_channel_closed"}`) on both the live and paced paths, never conflated with backpressure. |
+| `future_dated` | (round-3 — the BOUNDARY-01 future-skew class) a live bar's IST date is AFTER the wall-clock IST today — it can never roll the live day forward; dropped + counted (`dropped{reason="future_dated"}`), ONE coalesced coded error per drained batch (≤1/minute at the legs' fire cadence). |
 | `bad_identity` | (warn-level, once per process — coalesced) a spot-leg handoff carried an identity the fold's SecurityId space cannot represent (negative i64 — defensive); every occurrence is counted under `dropped{reason="bad_identity"}` (round-2 LOW-6 — previously a silent skip at the Groww hook sites). |
 | `volume_saturated` | a TF bucket's volume i64 add saturated at `i64::MAX` — the fold stays ATOMIC (never a torn bucket), the saturated value is emitted honestly, one coalesced warn per (feed, SID, day) (2026-07-16 hostile-review M3). |
 | `receiver_lost` | the fold task started but the shared receiver slot was EMPTY — a previous incarnation failed to re-park it (the RAII guard makes this near-unreachable); the task exits LOUDLY, never a silent clean_exit (2026-07-16 hostile-review HIGH-2). |
@@ -138,10 +153,13 @@ field):
   above).
 - `tv_rest_candle_fold_dropped_total{reason}` —
   `channel_full` / `channel_closed` (confirmed-bar handoff),
-  `seal_channel_full` / `no_seal_sender` (seal emission — round-2 LOW-1: a
-  CLOSED seal channel counts EVERY remaining seal of the slice, never
-  just one),
+  `seal_channel_full` / `seal_channel_closed` / `no_seal_sender` (seal
+  emission — round-2 LOW-1: a CLOSED seal channel counts EVERY remaining
+  seal of the slice, never just one; round-3: closed is its OWN reason on
+  both the live and paced paths — shutdown, not backpressure),
   `out_of_session` (bars outside [09:15, 15:30) IST — skipped honestly),
+  `future_dated` (round-3: a bar dated after the wall-clock IST today —
+  never rolls the live day forward; the BOUNDARY-01 future-skew class),
   `bad_identity` (identities that do not fit the fold's SID space —
   catch-up discovery rows AND the spot-leg handoff sites; counted +
   coalesced warn, never silent),
@@ -149,11 +167,15 @@ field):
   the incarnation has no HTTP client).
 - `tv_rest_candle_fold_refold_queued_total` — PAST-day marks queued for
   the debounced `/exec` refold (the current day never queues — round-2).
-- `tv_rest_candle_fold_day_refolds_total{feed}` — synchronous current-day
-  day-map refolds (one per applied repair bar; each re-emits the day's
-  closed buckets, DEDUP-idempotent — round-2 HIGH).
-- `tv_rest_candle_fold_duplicate_bars_total` — byte-identical redeliveries
-  of a bar already in the day-map (no-op; nothing new to derive).
+- `tv_rest_candle_fold_day_refolds_total{feed}` — current-day day-map
+  refolds, one per DIRTY SLOT per drained repair batch (round-3 burst
+  coalescing: N repairs in one batch cost one refold per slot, never N;
+  each refold re-emits the day's closed buckets, DEDUP-idempotent —
+  round-2 HIGH).
+- `tv_rest_candle_fold_duplicate_bars_total` — value-identical
+  redeliveries (`PartialEq` compare — a NaN field compares unequal and
+  falls through to a harmless idempotent refold) of a bar already in the
+  day-map (no-op; nothing new to derive).
 - `tv_rest_candle_fold_paced_waits_total` — boot-path seal emissions that
   slept on a full seal channel (the 2026-07-16 HIGH-1 pacing: newest days
   first, sleep-and-retry the SAME seal up to a bounded per-(feed, SID,
@@ -178,9 +200,15 @@ SPOT1M-01 `empty` class) has no 1m bar and therefore leaves its higher-TF
 buckets folding over the bars that DO exist — same-shape-as-source, never
 fabricated. `tick_count`/`oi`/pct columns are honest zeros (documented in
 §0); consumers comparing REST-era vs live-era candles must expect that
-split. Current-day repairs refold from the in-RAM day-map — lossless by
-construction, no QuestDB read, no WAL-visibility race (round-2 HIGH). The
-ONLY residual WAL-lag surface is the PAST-day `/exec` refold (a repair
+split. Current-day repairs refold from the in-RAM day-map — lossless for
+bars received in-process THIS INCARNATION, no QuestDB read on the repair
+path (round-2 HIGH; round-3: one refold per dirty slot per drained
+batch). Honest crash-restart residual (round-3): the boot catch-up's
+TODAY seed IS an `/exec` read — a minute persisted seconds before a
+crash-restart can be WAL-invisible to that seed and stays out of the
+derived candles until the NEXT boot's catch-up; the 15:40 IST tf-verify
+(Blind/mismatch) is the pager for that window. The remaining
+SAME-SESSION WAL-lag surface is the PAST-day `/exec` refold (a repair
 arriving after the day-map rolled — e.g. a post-midnight sweep), where the
 ILP-flush-ACK → `/exec`-visibility lag (WAL apply) is gated (M2,
 2026-07-16): the refold verifies the TRIGGERING repair minute is present
