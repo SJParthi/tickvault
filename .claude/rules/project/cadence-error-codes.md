@@ -288,17 +288,28 @@ behavior ACTIVATES only when the real broker executors land and
 supersession fires a request today.
 
 **Capture-leg coexistence (coordinator ruling B, 2026-07-16 — SUBSUME,
-NEVER SHARE, via the INTERIM mutual exclusion):** no double demand against
-a broker's budget is ever legal. `AppConfig::validate()` fail-closes a
-config that enables the cadence scheduler for a broker lane WHILE that
-broker's per-minute capture legs are enabled (Dhan lane × `[spot_1m_rest]`
-/ `[option_chain_1m]`; Groww lane × `[groww_spot_1m]` /
-`[groww_option_chain_1m]` / `[groww_contract_1m]`) — pinned both
-directions by
+NEVER SHARE, via the INTERIM mutual exclusion; hardened same day by
+RS3):** no double demand against a broker's budget is ever legal.
+`AppConfig::validate()` fail-closes a config that enables the cadence
+scheduler while ANY per-minute capture leg is enabled (`[spot_1m_rest]` /
+`[option_chain_1m]` / `[groww_spot_1m]` / `[groww_option_chain_1m]` /
+`[groww_contract_1m]`) — **keyed on the LEG configs ALONE, deliberately
+NOT on `feeds.*_enabled` (RS3, 2026-07-16 — supersedes the first-pass
+per-lane key):** the cadence lanes activate on the RUNTIME feed atomics
+(one toggle away from the boot flags) while the legacy legs spawn on
+their OWN config gates regardless of the feed flags, so the original
+boot-time key admitted cadence=ON + feed=OFF + legs=ON — one runtime
+`/api/feeds` enable away from reconstructing the double demand (today
+both enable directions happen to be unconditionally 409'd at the API —
+the PR-C2/S2b retired-lane refusals — but those exist for unrelated
+reasons and must not be this invariant's only wall; a handler-side
+re-check was rejected as unreachable dead code behind those 409s plus a
+config-plumbing cascade into the api crate). Pinned both directions,
+including the feed-flag-irrelevance arms, by
 `test_application_config_validate_cadence_capture_leg_mutual_exclusion`.
-Flipping `[cadence] enabled = true` therefore REQUIRES standing the
-corresponding legs down first; full subsumption (the cadence lane feeding
-the legs' tables) is the flagged follow-up.
+Flipping `[cadence] enabled = true` therefore REQUIRES standing ALL the
+legs down first; full subsumption (the cadence lane feeding the legs'
+tables) is the flagged follow-up.
 
 ## §1. CADENCE-01 — a broker lane degraded inside a cycle
 
