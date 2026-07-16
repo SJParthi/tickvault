@@ -105,17 +105,9 @@ const REVERSE_CHECK_ALLOWLIST: &[&str] = &[
     // (dhan-rest-only-noise-lock-2026-07-14.md: "variant retained until
     // the C4 variant sweep"). Rule-file history retained.
     "AUTH-GAP-06",
-    // DESIGN-FIRST STAGE 0 stubs (2026-07-16, Groww order/position PUSH
-    // channel — operator "implement and integrate everything", thread event
-    // f25b4dec). `groww-order-push-error-codes.md` documents these 4 codes
-    // BEFORE their `GrowwPush0*` ErrorCode variants land, which happens in
-    // Stage A of `.claude/plans/active-plan-groww-order-position-push.md`
-    // (the same mechanism as the DH-911 / Wave-4 reserved stubs). Each is
-    // REMOVED from this allowlist when Stage A adds its variant.
-    "GROWW-PUSH-01",
-    "GROWW-PUSH-02",
-    "GROWW-PUSH-03",
-    "GROWW-PUSH-04",
+    // GROWW-PUSH-01..04 (Stage 0 stubs, 2026-07-16) were REMOVED from this
+    // allowlist when Stage A landed their `GrowwPush0*` ErrorCode variants
+    // (the documented Stage-A obligation of the Stage-0 entry).
 ];
 
 #[test]

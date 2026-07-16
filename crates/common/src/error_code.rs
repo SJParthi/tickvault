@@ -1106,6 +1106,27 @@ pub enum ErrorCode {
     /// in-flight mutation stays ambiguous with the ladder clock paused.
     /// Severity::High, auto-triage-safe.
     GrowwOrd10AuthStale,
+    /// GROWW-PUSH-01 (order-push Stage A, 2026-07-16) — the order/position
+    /// push channel's NATS-over-WS connect / reconnect failed at the
+    /// transport level (auth-class CONNECT rejects are GROWW-PUSH-02).
+    /// Bounded backoff reconnect self-heals. Severity::High,
+    /// auto-triage-safe.
+    GrowwPush01ConnectFailed,
+    /// GROWW-PUSH-02 (order-push Stage A, 2026-07-16) — the per-session
+    /// socket-token mint or the NATS CONNECT was auth-rejected: the access
+    /// token is RE-READ from SSM at floor pacing, NEVER minted
+    /// (token-minter lock 2026-07-02). Severity::High, auto-triage-safe.
+    GrowwPush02AuthFailed,
+    /// GROWW-PUSH-03 (order-push Stage A, 2026-07-16) — a push frame /
+    /// protobuf payload failed decode or arrived on an unknown subject:
+    /// counted + skipped, never a panic (annexure rule 15 discipline).
+    /// Severity::Medium, auto-triage-safe.
+    GrowwPush03DecodeFailed,
+    /// GROWW-PUSH-04 (order-push Stage A, 2026-07-16) — the supervised
+    /// push-channel task died and was respawned (the WS-GAP-05 /
+    /// FEED-SUPERVISOR-01 house pattern). Severity::High,
+    /// auto-triage-safe.
+    GrowwPush04SupervisorRespawned,
 }
 
 impl ErrorCode {
@@ -1314,6 +1335,11 @@ impl ErrorCode {
             Self::GrowwOrd08AuditWriteFailed => "GROWW-ORD-08",
             Self::GrowwOrd09QuantityRefused => "GROWW-ORD-09",
             Self::GrowwOrd10AuthStale => "GROWW-ORD-10",
+            // Groww order/position push channel (Stage A, 2026-07-16)
+            Self::GrowwPush01ConnectFailed => "GROWW-PUSH-01",
+            Self::GrowwPush02AuthFailed => "GROWW-PUSH-02",
+            Self::GrowwPush03DecodeFailed => "GROWW-PUSH-03",
+            Self::GrowwPush04SupervisorRespawned => "GROWW-PUSH-04",
         }
     }
 
@@ -1586,6 +1612,15 @@ impl ErrorCode {
             | Self::GrowwOrd06LedgerWriteFailed
             | Self::GrowwOrd09QuantityRefused
             | Self::GrowwOrd10AuthStale => Severity::High,
+            // GROWW-PUSH-01/02/04 (order-push Stage A, 2026-07-16). High:
+            // connect / auth / supervisor-respawn degrades on the push
+            // channel — self-healing, but the operator must see them.
+            Self::GrowwPush01ConnectFailed
+            | Self::GrowwPush02AuthFailed
+            | Self::GrowwPush04SupervisorRespawned => Severity::High,
+            // GROWW-PUSH-03 (2026-07-16): a decode failure is counted +
+            // skipped — bounded visibility degrade. Medium.
+            Self::GrowwPush03DecodeFailed => Severity::Medium,
             // Medium: broker 429 (co-tenant hypothesis) / open-set status /
             // best-effort order_audit write failure.
             Self::GrowwOrd05RateLimited
@@ -1846,6 +1881,14 @@ impl ErrorCode {
             | Self::GrowwOrd09QuantityRefused
             | Self::GrowwOrd10AuthStale => {
                 ".claude/rules/project/groww-orders-error-codes.md"
+            }
+            // Groww order/position push channel (Stage A, 2026-07-16) — one
+            // runbook for the whole GROWW-PUSH-* family.
+            Self::GrowwPush01ConnectFailed
+            | Self::GrowwPush02AuthFailed
+            | Self::GrowwPush03DecodeFailed
+            | Self::GrowwPush04SupervisorRespawned => {
+                ".claude/rules/project/groww-order-push-error-codes.md"
             }
         }
     }
@@ -2117,6 +2160,11 @@ impl ErrorCode {
             Self::GrowwOrd08AuditWriteFailed,
             Self::GrowwOrd09QuantityRefused,
             Self::GrowwOrd10AuthStale,
+            // Groww order/position push channel (Stage A, 2026-07-16)
+            Self::GrowwPush01ConnectFailed,
+            Self::GrowwPush02AuthFailed,
+            Self::GrowwPush03DecodeFailed,
+            Self::GrowwPush04SupervisorRespawned,
         ]
     }
 }
@@ -2521,7 +2569,11 @@ mod tests {
         // 2026-07-15 (merge of #1587 fan-out stubs + main's #1578
         // GROWW-ORD contracts): both families coexist — 129 base + 14
         // (PORT/OCO/MARG) + 10 (ORD) = 153, mechanically recounted.
-        assert_eq!(ErrorCode::all().len(), 153);
+        // 2026-07-16 (Groww order-push Stage A): bumped 153 -> 157 for
+        // GROWW-PUSH-01..04 (connect-failed / auth-failed / decode-failed
+        // / supervisor-respawned) — receive-only push-channel
+        // observability, all log-sink-only.
+        assert_eq!(ErrorCode::all().len(), 157);
     }
 
     #[test]
@@ -2863,6 +2915,55 @@ mod tests {
     }
 
     #[test]
+    fn test_groww_push_codes_contract() {
+        // Groww order/position push channel (Stage A, 2026-07-16):
+        // severities + the blanket non-Critical auto-triage derivation
+        // (deliberately NO severity-independent override — every degrade
+        // self-heals via reconnect / re-read / respawn).
+        for (code, s, sev) in [
+            (
+                ErrorCode::GrowwPush01ConnectFailed,
+                "GROWW-PUSH-01",
+                Severity::High,
+            ),
+            (
+                ErrorCode::GrowwPush02AuthFailed,
+                "GROWW-PUSH-02",
+                Severity::High,
+            ),
+            (
+                ErrorCode::GrowwPush03DecodeFailed,
+                "GROWW-PUSH-03",
+                Severity::Medium,
+            ),
+            (
+                ErrorCode::GrowwPush04SupervisorRespawned,
+                "GROWW-PUSH-04",
+                Severity::High,
+            ),
+        ] {
+            assert_eq!(code.code_str(), s);
+            assert_eq!(s.parse::<ErrorCode>(), Ok(code));
+            assert_eq!(code.severity(), sev);
+            assert!(ErrorCode::all().contains(&code));
+            assert_eq!(
+                code.runbook_path(),
+                ".claude/rules/project/groww-order-push-error-codes.md"
+            );
+            // The runbook must exist on disk (cross-ref test parity).
+            let abs = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .and_then(std::path::Path::parent)
+                .map(|root| root.join(code.runbook_path()))
+                .expect("workspace root");
+            let shown = abs.display().to_string();
+            assert!(abs.exists(), "{s} runbook missing on disk: {shown}");
+            // All four follow the blanket non-Critical derivation.
+            assert!(code.is_auto_triage_safe());
+        }
+    }
+
+    #[test]
     fn test_ws_reinject_01_aborted_contract() {
         let code = ErrorCode::WsReinject01Aborted;
         // Wire-format string + roundtrip via FromStr.
@@ -2998,7 +3099,9 @@ mod tests {
                 // Groww orders shared contracts (PR-A0, 2026-07-15). Does NOT
                 // auto-accept via any other GROWW-* arm (GROWW-MASTER-/SCALE-/
                 // NATIVE- are enumerated separately) — this arm is required.
-                || s.starts_with("GROWW-ORD-");
+                || s.starts_with("GROWW-ORD-")
+                // Groww order/position push channel (Stage A, 2026-07-16).
+                || s.starts_with("GROWW-PUSH-");
             assert!(has_known_prefix, "unexpected code prefix: {s}");
         }
     }
