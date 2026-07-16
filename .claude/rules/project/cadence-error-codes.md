@@ -281,7 +281,10 @@ broker cap), NOT routed through the shared `dhan_data_api_limiter`; the
 3 rps self-tuner remains the pacing authority for the LEGACY per-minute
 paths (`rest-1m-pipeline-error-codes.md` §2f carries the mirrored dated
 note). The shape ladder's DH-904/429 demotion is the guard if the broker
-disagrees with the packing. HONEST NOTE: day 1 both lanes run the
+disagrees with the packing. The limiter bypass is rule-text-only today —
+a code-side limiter-free source scan (asserting no cadence executor
+routes through `dhan_data_api_limiter`) lands with the executor PR
+(flagged follow-up). HONEST NOTE: day 1 both lanes run the
 `DryRunLoggingExecutor` (zero REST calls), so the live rung-0 burst
 behavior ACTIVATES only when the real broker executors land and
 `[cadence] enabled` flips per the §4 governance — nothing about this
