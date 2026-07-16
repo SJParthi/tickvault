@@ -25,13 +25,18 @@ metrics = { workspace = true }
 papaya = { workspace = true }
 parking_lot = { workspace = true }
 loom = { workspace = true, optional = true }
+# Order-push Stage B (2026-07-16): NATS-over-WS transport deps for the gated
+# `oms/groww/push` module — optional, pulled in ONLY by `groww_orders`.
+aws-lc-rs = { workspace = true, optional = true }
+tokio-tungstenite = { workspace = true, optional = true }
 
 [features]
 loom = ["dep:loom"]
 # Gate 2 of the Groww order-side live-fire lattice (groww-second-feed-scope
 # §39.2). NON-DEFAULT: a default build excludes the entire
-# crates/trading/src/oms/groww subtree.
-groww_orders = []
+# crates/trading/src/oms/groww subtree. Order-push Stage B adds the transport
+# deps (ed25519 nkey signing + the WS client for Stage C).
+groww_orders = ["dep:aws-lc-rs", "dep:tokio-tungstenite"]
 
 [dev-dependencies]
 tickvault-core = { path = "../core" }
@@ -53,4 +58,4 @@ name = "bar_cache_lookup"
 harness = false
 
 [package.metadata.cargo-machete]
-ignored = ["anyhow", "chrono", "chrono-tz", "tickvault-common", "governor", "jaeckel", "loom", "metrics", "secrecy", "serde", "thiserror", "tokio", "tracing", "uuid"]
+ignored = ["anyhow", "aws-lc-rs", "chrono", "chrono-tz", "tickvault-common", "governor", "jaeckel", "loom", "metrics", "secrecy", "serde", "thiserror", "tokio", "tokio-tungstenite", "tracing", "uuid"]
