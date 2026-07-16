@@ -33,6 +33,8 @@ use tickvault_common::error_code::ErrorCode;
 use super::dh904_backoff::compute_dh904_backoff;
 use super::error_taxonomy::{self, OrderEndpoint, OrderErrorPolicy};
 
+use super::types::{DhanMultiOrderRequest, DhanMultiOrderResponse};
+
 use super::types::{
     DhanConditionalTriggerRequest, DhanConditionalTriggerResponse, DhanConvertPositionRequest,
     DhanExitAllResponse, DhanForeverOrderRequest, DhanForeverOrderResponse,
@@ -41,8 +43,7 @@ use super::types::{
     DhanPlaceSuperOrderRequest, DhanPositionResponse, DhanSuperOrderResponse, DhanTradeEntry,
     EdisFormRequest, EdisInquiryResponse, FundLimitResponse, KillSwitchResponse,
     MarginCalculatorRequest, MarginCalculatorResponse, MultiMarginRequest, MultiMarginResponse,
-    OmsError, OrderLeg, PnlExitRequest, PnlExitResponse, PnlExitStatusResponse,
-    SUPER_ORDER_STATUS_ACCEPTED_UNPARSED_BODY, SlicingResponse,
+    OmsError, PnlExitRequest, PnlExitResponse, PnlExitStatusResponse,
 };
 
 // ---------------------------------------------------------------------------
@@ -5585,6 +5586,78 @@ mod tests {
 
     // --- Multi Order + alerts gate (2026-07-14) ---
 
+    /// Starts a one-shot TCP mock server that CAPTURES the raw request bytes
+    /// (request line + headers + body) and hands them back over a oneshot
+    /// channel, then answers with the given status and body. Round-4 review:
+    /// `start_mock_server` discards the request bytes, so nothing observed a
+    /// sender's actual HTTP method/path — a `.post` → `.get` verb regression
+    /// on a live-order endpoint shipped with every test green. (Renamed from
+    /// `start_capturing_mock_server` at the 2026-07-16 merge with main, which
+    /// landed an independent same-named helper: this variant reads until the
+    /// full Content-Length body arrived and delivers via a oneshot channel.)
+    #[allow(clippy::arithmetic_side_effects)] // APPROVED: test-only head/content-length arithmetic
+    async fn start_oneshot_capturing_mock_server(
+        status: u16,
+        body: &str,
+    ) -> (
+        String,
+        tokio::task::JoinHandle<()>,
+        tokio::sync::oneshot::Receiver<String>,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base_url = format!("http://127.0.0.1:{}", addr.port());
+        let body = body.to_string();
+        let (captured_tx, captured_rx) = tokio::sync::oneshot::channel();
+
+        let handle = tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut request = Vec::new();
+                let mut buf = [0u8; 4096];
+                // Read until the head AND the Content-Length body arrived —
+                // reqwest may split head/body across writes.
+                loop {
+                    let Ok(read_len) = stream.read(&mut buf).await else {
+                        break;
+                    };
+                    if read_len == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buf[..read_len]);
+                    let text = String::from_utf8_lossy(&request);
+                    if let Some(head_end) = text.find("\r\n\r\n") {
+                        let content_length = text
+                            .lines()
+                            .find_map(|line| {
+                                let lower = line.to_ascii_lowercase();
+                                lower
+                                    .strip_prefix("content-length:")
+                                    .map(|value| value.trim().parse::<usize>().unwrap_or(0))
+                            })
+                            .unwrap_or(0);
+                        if request.len() >= head_end + 4 + content_length {
+                            break;
+                        }
+                    }
+                }
+                let _ = captured_tx.send(String::from_utf8_lossy(&request).into_owned());
+                let response = format!(
+                    "HTTP/1.1 {} Status\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    status,
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+
+        (base_url, handle, captured_rx)
+    }
+
     /// Builds a minimal one-leg multi-order request for the mock tests.
     fn sample_multi_order_request() -> DhanMultiOrderRequest {
         use super::super::conditional::{
@@ -5740,7 +5813,11 @@ mod tests {
     }
 
     #[test]
-    fn test_url_construction_multi_order_uses_alerts_multi_path() {
+    fn test_url_expression_multi_order_constant_joins_alerts_multi_path() {
+        // Pins the CONSTANT expression only (base + DHAN_ALERTS_MULTI_ORDERS_PATH).
+        // The SENDER's actual method/path is observed at wire level by
+        // test_place_multi_order_wire_sends_post_to_alerts_multi_path below
+        // (round-4: the old name claimed sender behavior it never touched).
         let client = make_test_client("https://api.dhan.co/v2");
         let url = format!(
             "{}{}",
@@ -5748,6 +5825,48 @@ mod tests {
             constants::DHAN_ALERTS_MULTI_ORDERS_PATH
         );
         assert_eq!(url, "https://api.dhan.co/v2/alerts/multi/orders");
+    }
+
+    #[tokio::test]
+    async fn test_place_multi_order_wire_sends_post_to_alerts_multi_path() {
+        // Round-4 review: observe the SENDER's actual request line — the
+        // plain mock discards request bytes, so a `.post` → `.get` verb
+        // regression on this live-order endpoint previously shipped with
+        // every test green (the digest §1 contract is POST
+        // /v2/alerts/multi/orders).
+        let (url, handle, captured_rx) =
+            start_oneshot_capturing_mock_server(200, r#"{"orders":[]}"#).await;
+        let mut client = make_test_client(&url);
+        client.arm_alerts_gate_for_test();
+        let req = sample_multi_order_request();
+        let result = client.place_multi_order("jwt", &req).await;
+        assert!(
+            result.is_ok(),
+            "capturing-mock call must succeed: {result:?}"
+        );
+        let captured = captured_rx.await.expect("mock must capture the request");
+        let request_line = captured
+            .lines()
+            .next()
+            .expect("captured request must carry a request line");
+        assert_eq!(
+            request_line, "POST /alerts/multi/orders HTTP/1.1",
+            "place_multi_order must send POST to the constant-backed \
+             /alerts/multi/orders path"
+        );
+        let captured_lower = captured.to_ascii_lowercase();
+        assert!(
+            captured_lower.contains("access-token: jwt"),
+            "the access-token header must ride the request:\n{captured}"
+        );
+        let (_, wire_body) = captured
+            .split_once("\r\n\r\n")
+            .expect("captured request must carry a head/body separator");
+        assert!(
+            wire_body.contains("\"dhanClientId\"") && wire_body.contains("\"sequence\":\"1\""),
+            "the JSON body must carry camelCase keys + the stamped sequence: {wire_body}"
+        );
+        handle.abort();
     }
 
     #[tokio::test]
