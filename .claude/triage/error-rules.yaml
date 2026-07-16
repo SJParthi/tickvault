@@ -2683,6 +2683,69 @@ rules:
       the ~06:00 IST daily reset this self-heals; a sustained rate means
       the minter is stale (cross-check the shared-token minter runbook).
 
+  # CADENCE-01 = a cadence broker lane degraded inside a cycle (fetch
+  # failures / 429-despite-gates / empty spots / fallback provenance /
+  # unknown moneyness / ladder exhausted). The scheduler self-heals by
+  # construction: the next minute boundary re-fires, the failure ladder
+  # walks the anchor earlier, and RateLimited is never blind-retried.
+  # Escalate so the operator reads the coalesced per-cycle stage list —
+  # a sustained rate_limited stage is a gate-bug / shared-budget signal
+  # worth human eyes, never an auto-fix.
+  - name: cadence-01-lane-degraded-escalate
+    match:
+      code: CADENCE-01
+    action: escalate
+    runbook_path: .claude/rules/project/cadence-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 600
+    justification: >-
+      CADENCE-01 = cadence lane degraded this cycle (coalesced). The
+      ladder + next-boundary re-fire already self-heal; the operator
+      inspects the stage taxonomy per the runbook (rate_limited despite
+      the structural gates = shared-budget co-tenant or broker
+      tightening — a spacing constant must never be auto-touched).
+
+  # CADENCE-02 = a (lane, cycle-minute) decision honest-skipped (cutoff /
+  # both sources dead / all-Unknown moneyness). The skip IS the
+  # fail-closed action — no decision on missing/stale data; nothing to
+  # undo, nothing to restart. Escalate for visibility (Rule 11: a skip is
+  # never rendered OK); a RUN of skips points at the broker surface and
+  # the capture legs' own codes for the same window.
+  - name: cadence-02-decision-skipped-escalate
+    match:
+      code: CADENCE-02
+    action: escalate
+    runbook_path: .claude/rules/project/cadence-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 600
+    justification: >-
+      CADENCE-02 = cadence decision honest-skipped. The skip is the
+      fail-closed design outcome (exactly-once latch, never a late
+      decision); dry-run boots skip EVERY minute by design (the
+      DryRunLoggingExecutor returns Empty). Operator correlates a skip
+      run with CADENCE-01 stages + SPOT1M-01/CHAIN-02 per the runbook.
+
+  # CADENCE-03 = scheduler machinery degraded (ladder shift / late wake /
+  # boundary skipped / skew clamped / runner respawn / nominal gate
+  # deferral). Every arm already self-corrected or self-reported; the
+  # supervised runner respawns itself (release panics abort the process —
+  # the TICK-FLUSH-01 honesty note). Escalate so trends (host pressure,
+  # respawn storms, the should-never gate_deferred_nominal) reach the
+  # operator; nothing here is auto-fixable.
+  - name: cadence-03-scheduler-degraded-escalate
+    match:
+      code: CADENCE-03
+    action: escalate
+    runbook_path: .claude/rules/project/cadence-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 600
+    justification: >-
+      CADENCE-03 = cadence scheduler machinery degraded. late_wake /
+      boundary_skipped trends correlate with host pressure (PROC-01,
+      RESOURCE-01..03); a respawn storm is a real bug needing the panic
+      backtrace; gate_deferred_nominal is a schedule/gate consistency
+      bug to file — never widen spacings as a reaction.
+
   # FOLD-01 = the REST-era bar-fold candle derivation degraded (catch-up
   # query/parse, seal/bar handoff drop, or a supervised-task respawn).
   # Escalate (not auto_restart): every degrade is RE-DERIVABLE — the
@@ -2704,23 +2767,3 @@ rules:
       idempotently); escalate so the operator reads the stage field and
       cross-checks QuestDB /exec (catchup_*) or the seal-writer chain
       (seal_send) per the runbook instead of any auto-action.
-
-  # RAMSTORE-01 = a RAM residency store leg degraded (chain rehydrate
-  # query/parse/truncation, live row-cap truncation, stale-day drop, or a
-  # supervised stats/rehydrate task respawn). Escalate (not auto_restart):
-  # QuestDB remains the durable truth — a RAM degrade re-fills via PR-1's
-  # boot catch-up + the bounded chain rehydrate at the next boot; the
-  # operator inspects the stage + the depth gauges per the runbook.
-  - name: ramstore-01-ram-residency-degraded-escalate
-    match:
-      code: RAMSTORE-01
-    action: escalate
-    runbook_path: .claude/rules/project/ram-store-error-codes.md
-    confidence: 1.0
-    cooldown_secs: 600
-    justification: >-
-      RAMSTORE-01 = the RAM residency machinery degraded, never market-data
-      loss (the candles_* / option_chain_1m DEDUP rows stand and RAM
-      re-fills at the next boot). Escalate so the operator reads the stage
-      field and the tv_ram_store_* depth gauges per the runbook instead of
-      any auto-action.
