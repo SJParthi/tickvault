@@ -179,6 +179,15 @@ impl FeedRuntimeState {
         Arc::clone(&self.dhan)
     }
 
+    /// Cadence 2026-07-14: a clone of the shared Groww enable atomic (the
+    /// `dhan_flag` mirror), for core consumers that cannot depend on this
+    /// crate (the cadence runner's level-triggered per-cycle lane gate).
+    /// The SAME atomic the API toggle flips.
+    #[must_use]
+    pub fn groww_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.groww)
+    }
+
     /// PR-E: boot wiring marks the Dhan main-feed lane as spawned.
     pub fn mark_dhan_lane_running(&self) {
         self.dhan_lane_running.store(true, Ordering::Relaxed);
@@ -614,6 +623,21 @@ mod tests {
             "toggling Dhan off is observed on the shared flag"
         );
         state.set_enabled(Feed::Dhan, true);
+        assert!(flag.load(Ordering::Relaxed), "re-enable observed too");
+    }
+
+    #[test]
+    fn test_groww_flag_shares_the_same_atomic_the_toggle_flips() {
+        // The cadence runner's Groww lane gate MUST be the very atomic the
+        // API toggle flips (the dhan_flag mirror).
+        let state = FeedRuntimeState::default();
+        let flag = state.groww_flag();
+        state.set_enabled(Feed::Groww, false);
+        assert!(
+            !flag.load(Ordering::Relaxed),
+            "toggling Groww off is observed on the shared flag"
+        );
+        state.set_enabled(Feed::Groww, true);
         assert!(flag.load(Ordering::Relaxed), "re-enable observed too");
     }
 

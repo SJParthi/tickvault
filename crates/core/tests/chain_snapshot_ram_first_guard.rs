@@ -197,6 +197,31 @@ fn production_region(content: &str) -> &str {
     content.split("#[cfg(test)]").next().unwrap_or(content)
 }
 
+/// TRH-NEW-1 (hostile round 1, 2026-07-15): strip `fn` DEFINITION lines so
+/// a definition can never satisfy a CALL-site needle. The Dhan chain leg
+/// DEFINES `publish_chain_moneyness_snapshot(` in its own production region
+/// (`option_chain_1m_boot.rs`), so the bare needle matched the `pub fn`
+/// signature line and the wiring assertion stayed green even with the
+/// actual production CALL deleted — the exact vacuous-pass class this
+/// guard documents itself as defending against (audit Rule 11). A call
+/// site never starts a line with a visibility/`async`/`fn` keyword
+/// sequence, so filtering signature lines keeps every real call visible.
+fn without_fn_definitions(region: &str) -> String {
+    region
+        .lines()
+        .filter(|line| {
+            let t = line.trim_start();
+            let t = t
+                .strip_prefix("pub(crate) ")
+                .or_else(|| t.strip_prefix("pub "))
+                .unwrap_or(t);
+            let t = t.strip_prefix("async ").unwrap_or(t);
+            !t.starts_with("fn ")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Wiring half: all three boot legs must keep CALLING the classification
 /// surface, both chain legs must keep PUBLISHING the RAM snapshot, and the
 /// contract leg (DB-audit-only by design) must NOT publish one. Scans the
@@ -217,22 +242,26 @@ fn boot_legs_keep_moneyness_wiring() {
         ("option_chain_1m_boot.rs", &dhan_chain),
         ("groww_option_chain_1m_boot.rs", &groww_chain),
     ] {
-        let prod = production_region(content);
+        // TRH-NEW-1: the scan sees CALL SITES only — fn definition lines
+        // are stripped so a leg that DEFINES the needle in its own
+        // production region (the Dhan leg) cannot pass vacuously.
+        let prod = without_fn_definitions(production_region(content));
         assert!(
             prod.contains("classify_chain_legs("),
             "{name} must classify every chain leg via \
              classify_chain_legs() in PRODUCTION code (the #[cfg(test)] \
-             region cannot satisfy this) — the shared common-math glue"
+             region and fn DEFINITION lines cannot satisfy this) — the \
+             shared common-math glue"
         );
         assert!(
             prod.contains("publish_chain_moneyness_snapshot("),
             "{name} must publish the RAM chain snapshot after classification \
-             in PRODUCTION code — the decision surface future strategy \
-             consumers read"
+             in PRODUCTION code (a fn DEFINITION line cannot satisfy this) — \
+             the decision surface future strategy consumers read"
         );
     }
 
-    let contract_prod = production_region(&groww_contract);
+    let contract_prod = without_fn_definitions(production_region(&groww_contract));
     assert!(
         contract_prod.contains("classify_moneyness_for("),
         "groww_contract_1m_boot.rs must classify each contract row via \
@@ -270,5 +299,36 @@ fn production_region_split_excludes_test_only_code() {
     assert!(
         production_region(no_test_module).contains("classify_chain_legs("),
         "a file with no #[cfg(test)] marker scans in full"
+    );
+}
+
+/// TRH-NEW-1 self-test: a fn DEFINITION line must be invisible to the
+/// call-site scan (in every visibility/async spelling the boot legs use),
+/// while a real call site must stay visible — so the wiring assertions
+/// above can never be satisfied by the needle's own definition.
+#[test]
+fn fn_definition_lines_cannot_satisfy_call_needles() {
+    for def in [
+        "pub fn publish_chain_moneyness_snapshot(\n    feed: Feed,\n) {\n}\n",
+        "fn publish_chain_moneyness_snapshot(x: u32) {}\n",
+        "pub(crate) fn publish_chain_moneyness_snapshot() {}\n",
+        "pub async fn publish_chain_moneyness_snapshot(\n) {}\n",
+        "pub fn classify_chain_legs<'a>(\n    underlying: &str,\n) {}\n",
+    ] {
+        assert!(
+            !without_fn_definitions(def).contains("publish_chain_moneyness_snapshot(")
+                && !without_fn_definitions(def).contains("classify_chain_legs("),
+            "a fn signature line must be invisible to the call-site scan: {def:?}"
+        );
+    }
+    let call_site = "    publish_chain_moneyness_snapshot(\n        Feed::Dhan,\n    );\n";
+    assert!(
+        without_fn_definitions(call_site).contains("publish_chain_moneyness_snapshot("),
+        "a real call site must stay visible to the scan"
+    );
+    let let_call = "    let cls = classify_chain_legs(\n        \"NIFTY\",\n    );\n";
+    assert!(
+        without_fn_definitions(let_call).contains("classify_chain_legs("),
+        "a let-bound call site must stay visible to the scan"
     );
 }

@@ -1802,6 +1802,44 @@ const _: () = assert!(
 );
 
 // ---------------------------------------------------------------------------
+// Cadence scheduler validation floors (operator cadence directive
+// 2026-07-14, judge-locked design rev-8 — `crates/core/src/cadence/`).
+// Consumed by `CadenceConfig::validate` in `config.rs`. The cadence
+// SCHEDULE numbers themselves are `[cadence]` config keys (serde defaults);
+// these are the non-negotiable validation FLOORS.
+// ---------------------------------------------------------------------------
+
+/// The Dhan spot ROLLING-WINDOW length (operator spot-concurrency ladder
+/// addition 2026-07-15) — the structural window the spot gate counts
+/// authorizations over, AND the spacing between consecutive Dhan burst
+/// SECOND buckets (2026-07-16 shape: second 1 / second 2 / greedy
+/// overflow seconds). 1000ms because the Dhan Data-API budget is
+/// expressed per second (5/sec hard cap — `dhan/api-introduction.md`
+/// rule 7).
+pub const CADENCE_SPOT_WINDOW_MS: i64 = 1_000;
+
+/// Hard ceiling for `[cadence] spot_window_cap` — the Dhan Data-API hard
+/// cap is 5 requests/sec (`dhan/api-introduction.md` rule 7); the shipped
+/// default is 4 (one full simultaneous spot group under the cap, leaving
+/// one slot of headroom for the co-tenant budget note in
+/// `no-rest-except-live-feed-2026-06-27.md` §9.3).
+pub const CADENCE_SPOT_WINDOW_CAP_CEILING: u32 = 5;
+
+/// Spacing between consecutive Groww fallback-shape WAVE anchors
+/// (coordinator-relayed operator three-choice ladder, 2026-07-15):
+/// choice 2 fires `:01` chains / `:02` spots; choice 3 fires `:01`
+/// chains / `:02` core spots / `:03` VIX alone.
+pub const CADENCE_GROWW_WAVE_STEP_MS: i64 = 1_000;
+
+/// Hard floor for `[cadence] chain_min_spacing_ms` — Dhan's option-chain
+/// rule is 1 unique request every 3 seconds per SAME (underlying, expiry)
+/// (`dhan/option-chain.md` rule 4; the 2026-07-16 operator directive
+/// pins it as per-(underlying, expiry) ONLY — different underlyings are
+/// explicitly concurrent, so the retired GLOBAL chain gate is gone and
+/// the cadence gates apply this floor per key).
+pub const CADENCE_CHAIN_MIN_SPACING_FLOOR_MS: i64 = 3_000;
+
+// ---------------------------------------------------------------------------
 // Option-chain 1m REST pipeline (operator grant 2026-07-12 — PR-3, the
 // OPTION-CHAIN half). The 3 underlyings are the [`CHAIN_1M_UNDERLYINGS`]
 // subset below (NOT the full [`SPOT_1M_REST_INDICES`] set since the
