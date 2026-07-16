@@ -1,6 +1,6 @@
 # Implementation Plan: REST-Era Multi-TF Candle Derivation (bar-fold writer)
 
-**Status:** APPROVED
+**Status:** VERIFIED
 **Date:** 2026-07-16
 **Approved by:** Parthiban (operator directive 2026-07-16, verbatim quotes below)
 
@@ -77,7 +77,7 @@ O/H/L/C/ΣV given 1m bars):
    lag `/exec` visibility (QuestDB WAL apply) — a refold that misses it is repaired by a
    later refold or the next boot catch-up; never silent loss (counters + coded logs).
 5. **Config:** `[rest_candle_fold]` → `RestCandleFoldConfig { enabled (serde default
-   FALSE — fail-safe), catchup_days (default 35, validated 1..=120) }`; `config/base.toml`
+   FALSE — fail-safe), catchup_days (default 35, validated 1..=370 — headroom so a future retention widening never needs a validation-bound edit) }`; `config/base.toml`
    opts in with `enabled = true`, `catchup_days = 35`.
 6. **Retention (the month-hot ruling + the 30 GB disk constraint,
    `scratchpad/retention-truth.md`):** `market_data_hot_days` default + base.toml 14 → 35
