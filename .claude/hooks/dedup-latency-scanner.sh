@@ -46,8 +46,11 @@ scan_pattern() {
     # NOT hot: core/src/auth/, core/src/instrument/, core/src/notification/,
     # core/src/historical/ (cold path); trading/src/oms/ (order management is
     # network-I/O-bound, not per-tick latency-critical — documented exclusion).
+    # Dead-file alternatives removed truthfully: groww_bridge.rs (deleted
+    # 2026-07-15 with the Groww live feed) + tick_persistence.rs /
+    # tick_row_builder.rs (deleted 2026-07-17, stage-2 dead-WS sweep PR #1631).
     if [ "$is_hot_path" = "true" ]; then
-      if ! echo "$file" | grep -qE '^crates/core/src/parser/|^crates/core/src/pipeline/|^crates/core/src/websocket/|^crates/trading/|^crates/storage/src/tick_persistence\.rs$|^crates/storage/src/tick_row_builder\.rs$|^crates/storage/src/ws_frame_spill\.rs$|^crates/app/src/groww_bridge\.rs$'; then
+      if ! echo "$file" | grep -qE '^crates/core/src/parser/|^crates/core/src/pipeline/|^crates/core/src/websocket/|^crates/trading/|^crates/storage/src/ws_frame_spill\.rs$'; then
         continue
       fi
       # OMS is order management — I/O-bound, not latency-critical
