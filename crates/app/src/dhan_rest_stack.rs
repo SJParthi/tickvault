@@ -754,16 +754,70 @@ async fn run_dhan_rest_stack(params: DhanRestStackParams) {
     let config = &params.config;
 
     // -----------------------------------------------------------------------
-    // Phase 5a (the PR-C1/Q4-i functional-dormant ORDER-UPDATE WS spawn)
-    // RETIRED 2026-07-14 — operator Dhan noise lock
-    // (dhan-rest-only-noise-lock-2026-07-14.md; scope-lock §A.1 records the
-    // superseding quote). The dormant socket protected nothing while
-    // dry_run=true (events counted-then-DISCARDED, no WAL, no OMS) and was
-    // this stack's only HIGH-page noise source (WS-GAP-10) against a
-    // demonstrably RST-flaky Dhan endpoint. The core module
-    // `order_update_connection.rs` stays DORMANT for the live-trading
-    // re-wire (fresh dated quote required in the scope-lock file first).
+    // Phase 5a — the PAPER-MODE order-update push channel (operator
+    // directive 2026-07-16; governance authorization on PR #1597 —
+    // `.claude/plans/active-plan-dhan-order-update-rewire.md`). History:
+    // the PR-C1/Q4-i functional-dormant spawn was RETIRED 2026-07-14
+    // (operator Dhan noise lock — dhan-rest-only-noise-lock-2026-07-14.md;
+    // scope-lock §A.1); the 2026-07-16 directive re-wires the DORMANT core
+    // module (`order_update_connection.rs`, unchanged) as a RECEIVE-ONLY,
+    // config-gated (`[dhan_order_push] enabled`, default OFF) push channel:
+    // the socket's order events land as `order_audit` rows
+    // `feed='dhan'`/`mode='paper'` via the supervised consumer in
+    // `dhan_order_push_observability.rs`. Noise-lock compliance: NO
+    // NotificationService is handed to the connection (Telegram-silent on
+    // every path); durable frame capture stays gated behind the live
+    // re-arm quote, so the frame-capture argument is `None` (the runtime's
+    // WAL-free shape is untouched). No live orders; `dry_run` untouched.
+    // DISABLED (default): nothing spawns — byte-identical boot.
     // -----------------------------------------------------------------------
+    if config.dhan_order_push.enabled {
+        let (order_push_sender, first_push_rx) =
+            tokio::sync::broadcast::channel::<tickvault_common::order_types::OrderUpdate>(
+                crate::dhan_order_push_observability::DHAN_ORDER_PUSH_CHANNEL_CAPACITY,
+            );
+        // Consumer FIRST (consumer-before-producer): the first receiver is
+        // created at channel construction, so no update can slip past an
+        // unsubscribed channel.
+        let _order_push_consumer =
+            crate::dhan_order_push_observability::spawn_dhan_order_push_consumer(
+                config.questdb.clone(),
+                order_push_sender.clone(),
+                first_push_rx,
+            );
+        // The 2026-07-14 Dhan noise lock stands: this socket pages NOTHING —
+        // NO NotificationService is handed to the connection.
+        let order_push_notifier: Option<Arc<NotificationService>> = None;
+        // Positional args of the dormant core module's entrypoint, in
+        // order: url, client id, token handle, order sender, calendar,
+        // then the five gated/absent seams as `None` — durable frame
+        // capture (live re-arm territory), auth signal, auth latch, the
+        // Telegram notifier (noise lock), the ws lifecycle audit sender
+        // (not cheaply reachable in this stack — the shared consumer
+        // helper lives with the main.rs producer sites; wiring it here is
+        // a follow-up, honestly absent rather than half-wired), and the
+        // runtime feed flag (this channel is config-gated instead).
+        tokio::spawn(tickvault_core::websocket::run_order_update_connection(
+            config.dhan.order_update_websocket_url.clone(),
+            client_id.clone(),
+            Arc::clone(&token_handle),
+            order_push_sender,
+            Arc::clone(&params.calendar),
+            None,
+            None,
+            None,
+            order_push_notifier,
+            None,
+            None,
+        ));
+        info!(
+            "Dhan REST-only stack: PAPER-MODE order-update push channel spawned \
+             (receive-only; order events recorded as paper order_audit rows; \
+             Telegram-silent per the 2026-07-14 Dhan noise lock; no live orders)"
+        );
+    } else {
+        info!("dhan order push disabled (config)");
+    }
     // Phase 5b (order-runtime dry-run PR, 2026-07-14 — SOCKET-FREE shape):
     // the config-gated DRY-RUN ORDER RUNTIME. Under the noise lock this
     // stack opens NO Dhan WebSocket and performs NO order-update frame
@@ -1311,17 +1365,19 @@ mod tests {
         assert!(dhan_rest_lock_park_due(u64::MAX), "saturated domain end");
     }
 
-    /// 2026-07-14 operator Dhan noise lock (NEGATIVE ratchet — replaces the
-    /// PR-C1 `test_rest_stack_spawns_order_update_ws_functional_dormant`
-    /// positive pins): the production region must NOT spawn the order-update
-    /// WS nor the REST canary. Re-introducing either requires a fresh dated
-    /// operator quote in `dhan-rest-only-noise-lock-2026-07-14.md` (and the
-    /// scope-lock §A.1 for the order-update spawn) FIRST — this test makes
-    /// the code half of that protocol build-failing. Production-region split
-    /// at the test-module marker so these needle literals can never trip
-    /// themselves.
+    /// 2026-07-14 operator Dhan noise lock ratchet, AMENDED 2026-07-16 (the
+    /// order-update rewire — governance on PR #1597): the production region
+    /// must NOT regain the retired dormant-events counter, the retired
+    /// `OrderUpdateAuthenticated` Telegram wiring, or the retired REST
+    /// canary spawn. The order-update WS SPAWN itself is re-authorized
+    /// 2026-07-16 as the PAPER-MODE push channel and is now pinned
+    /// POSITIVELY: gated on `[dhan_order_push] enabled` (default OFF),
+    /// exactly ONE spawn call, and Telegram-silent (the `None` notifier
+    /// binding stub-guard — the noise lock still owns the page surface).
+    /// Production-region split at the test-module marker so these needle
+    /// literals can never trip themselves.
     #[test]
-    fn test_rest_stack_spawns_no_order_update_ws_and_no_canary() {
+    fn test_rest_stack_order_update_push_gated_and_no_canary() {
         let own_src = include_str!("dhan_rest_stack.rs");
         // H1 fix-round 2026-07-14: the canonical production-region helper
         // (blanks the test MODULE only — robust to future mid-file
@@ -1330,9 +1386,8 @@ mod tests {
             .expect("dhan_rest_stack.rs must keep its test module"); // APPROVED: test
         let prod = prod.as_str();
         for needle in [
-            // The retired Q4-i order-update spawn (module stays dormant in
-            // core; only the SPAWN is banned here).
-            "run_order_update_connection(",
+            // The retired Q4-i dormant-events counter + Telegram wiring
+            // stay retired (only the paper-mode spawn is re-authorized).
             "tv_order_update_dormant_events_total",
             "NotificationEvent::OrderUpdateAuthenticated",
             // The retired REST canary spawn.
@@ -1341,11 +1396,34 @@ mod tests {
             assert!(
                 !prod.contains(needle),
                 "dhan_rest_stack.rs production region REGAINED `{needle}` — the \
-                 2026-07-14 operator Dhan noise lock retired this spawn; a \
+                 2026-07-14 operator Dhan noise lock retired this surface; a \
                  re-introduction needs a fresh dated rule-file quote FIRST \
                  (dhan-rest-only-noise-lock-2026-07-14.md §3)"
             );
         }
+        // Positive pins (2026-07-16 rewire): the paper-mode push spawn.
+        for needle in [
+            // The config gate the spawn must live behind (default OFF).
+            "if config.dhan_order_push.enabled {",
+            // Consumer-before-producer: the supervised paper consumer.
+            "crate::dhan_order_push_observability::spawn_dhan_order_push_consumer(",
+            // Telegram-silent stub-guard: the notifier arg is a NAMED None
+            // binding, never a NotificationService.
+            "let order_push_notifier: Option<Arc<NotificationService>> = None;",
+        ] {
+            assert!(
+                prod.contains(needle),
+                "dhan_rest_stack.rs production region lost `{needle}` — the \
+                 2026-07-16 paper-mode order-update push wiring regressed"
+            );
+        }
+        // The WS spawn exists EXACTLY once in the production region.
+        let spawns = prod.matches("run_order_update_connection(").count();
+        assert_eq!(
+            spawns, 1,
+            "dhan_rest_stack.rs production region must contain EXACTLY ONE \
+             run_order_update_connection spawn (Phase 5a, config-gated); found {spawns}"
+        );
     }
 
     /// Order-runtime dry-run PR (2026-07-14, SOCKET-FREE shape after the
