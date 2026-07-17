@@ -1240,7 +1240,8 @@ fn ist_secs_of_day_now() -> u32 {
 }
 
 /// IST milliseconds-of-day from the wall clock (close→data latency math).
-fn ist_millis_of_day_now() -> i64 {
+/// `pub(crate)` since 2026-07-17: shared with `crate::dhan_cadence_executor`.
+pub(crate) fn ist_millis_of_day_now() -> i64 {
     let now_ist_ms = chrono::Utc::now()
         .timestamp_millis()
         .saturating_add(i64::from(IST_UTC_OFFSET_SECONDS) * MILLIS_PER_SEC);
@@ -1248,7 +1249,8 @@ fn ist_millis_of_day_now() -> i64 {
 }
 
 /// IST calendar date for "now" (the orphan-watchdog helper).
-fn today_ist() -> NaiveDate {
+/// `pub(crate)` since 2026-07-17: shared with `crate::dhan_cadence_executor`.
+pub(crate) fn today_ist() -> NaiveDate {
     let utc = DateTime::from_timestamp(chrono::Utc::now().timestamp(), 0).unwrap_or_default();
     (utc + ChronoDuration::seconds(i64::from(IST_UTC_OFFSET_SECONDS))).date_naive()
 }
@@ -1342,9 +1344,40 @@ fn dhan_failed_audit_class(forensics: &DhanLadderForensics) -> (RestFetchOutcome
 /// A 2xx response body + its `Content-Type` header value (2026-07-14
 /// raw-body discriminator: the header names WHAT Dhan is serving when the
 /// body carries zero candles — JSON envelope vs HTML shell vs empty).
-struct FetchedBody {
-    text: String,
-    content_type: String,
+/// `pub(crate)` since 2026-07-17: the cadence executor
+/// (`crate::dhan_cadence_executor`) consumes the limiter-free inner fetch.
+pub(crate) struct FetchedBody {
+    pub(crate) text: String,
+    pub(crate) content_type: String,
+}
+
+/// One UNPACED attempt's typed failure (2026-07-17 cadence-executor
+/// refactor): carries the REAL `StatusCode` (`None` = the send leg never
+/// got a response), the 429 verdict, and the parsed `Retry-After` hint in
+/// milliseconds (`None` = absent/HTTP-date form) so the cadence lane can
+/// map broker pacing hints without touching the legacy limiter. `msg` is
+/// the bounded secret-redacted capture (DHAN-REST-400 discipline).
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct SpotFetchUnpacedFailure {
+    pub(crate) status: Option<u16>,
+    pub(crate) rate_limited: bool,
+    pub(crate) retry_after_ms: Option<i64>,
+    pub(crate) msg: String,
+}
+
+/// Upper clamp on a parsed `Retry-After` hint: a hostile/absurd header can
+/// never propagate more than 60s into `RateLimited { retry_after_ms }`
+/// consumers (the cadence demotion/backoff arms).
+pub const RETRY_AFTER_HINT_CAP_MS: i64 = 60_000;
+
+/// Pure: parse an HTTP `Retry-After` header value in its delta-seconds
+/// form into milliseconds, clamped to [`RETRY_AFTER_HINT_CAP_MS`]. The
+/// HTTP-date form (and any other unparsable value) returns `None` —
+/// callers treat an unparsable hint as absent, never a guess.
+#[must_use]
+pub fn retry_after_header_ms(value: &str) -> Option<i64> {
+    let secs: i64 = value.trim().parse().ok()?;
+    (secs >= 0).then(|| secs.saturating_mul(1000).min(RETRY_AFTER_HINT_CAP_MS))
 }
 
 // ---------------------------------------------------------------------------
@@ -1430,26 +1463,23 @@ async fn read_body_capped(mut resp: reqwest::Response) -> Result<String, String>
     String::from_utf8(buf).map_err(|_| "body not valid UTF-8".to_string())
 }
 
-/// One intraday REST round-trip → the raw 2xx body text (parsed by the
-/// caller via [`parse_intraday_columnar_for_minute`] — a malformed body
-/// parses to no candles and rides the ladder like an empty one). `Err`
-/// carries status + token-redacted URL + ≤300-char secret-redacted body
-/// (the DHAN-REST-400 capture discipline). Bodies (success AND error) are
-/// read through the streamed cap.
-async fn spot_1m_fetch_once(
+/// One intraday REST round-trip → the raw 2xx body text — the UNPACED
+/// inner (2026-07-17 cadence-executor refactor): NO limiter acquire, NO
+/// `record_429` — pacing/tuning is the CALLER's responsibility. The legacy
+/// per-minute legs call the [`spot_1m_fetch_once`] wrapper below (which
+/// routes through the shared Dhan Data-API limiter, unchanged behavior);
+/// the cadence executor calls THIS fn directly because the cadence lane's
+/// pacing authority is the gate registry, never the limiter
+/// (`cadence-error-codes.md` §0b/§3b item 1). `Err` carries the REAL
+/// status + 429 verdict + parsed `Retry-After` hint + token-redacted URL +
+/// ≤300-char secret-redacted body (the DHAN-REST-400 capture discipline).
+/// Bodies (success AND error) are read through the streamed cap.
+pub(crate) async fn spot_1m_fetch_once_unpaced(
     client: &reqwest::Client,
     url: &str,
     jwt: &str,
     body: &serde_json::Value,
-) -> Result<FetchedBody, FetchFailure> {
-    // 2026-07-14 operator pacing directive: EVERY spot-1m Data-API request
-    // (per-minute fires, ladder re-polls, the 15:33:30 sweep, the #1524
-    // diagnostic probes — they all funnel through this fn) waits for a
-    // permit from the shared process-wide limiter; overflow spills into
-    // the next second(s), never drops.
-    crate::dhan_data_api_limiter::shared_dhan_data_api_limiter()
-        .acquire()
-        .await;
+) -> Result<FetchedBody, SpotFetchUnpacedFailure> {
     let resp = client
         .post(url)
         .header("access-token", jwt)
@@ -1457,22 +1487,28 @@ async fn spot_1m_fetch_once(
         .json(body)
         .send()
         .await
-        .map_err(|e| FetchFailure {
+        .map_err(|e| SpotFetchUnpacedFailure {
+            status: None,
             rate_limited: false,
+            retry_after_ms: None,
             msg: format!("send: {}", redact_url_params(&e.to_string())),
         })?;
     let status = resp.status();
     if !status.is_success() {
         let rate_limited = status == reqwest::StatusCode::TOO_MANY_REQUESTS;
-        if rate_limited {
-            // Feed the self-tuner from the REAL StatusCode (never a
-            // substring scan) — enough of these inside the rolling window
-            // steps the shared limiter down to the 2 rps floor.
-            crate::dhan_data_api_limiter::shared_dhan_data_api_limiter().record_429();
-        }
+        // Retry-After BEFORE the body read consumes the response — the
+        // delta-seconds form only; an HTTP-date (or absent) header reads
+        // `None`, never a guessed backoff.
+        let retry_after_ms = resp
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(retry_after_header_ms);
         let error_body = read_body_capped(resp).await.unwrap_or_default();
-        return Err(FetchFailure {
+        return Err(SpotFetchUnpacedFailure {
+            status: Some(status.as_u16()),
             rate_limited,
+            retry_after_ms,
             msg: format!(
                 "http {status} url={} body={}",
                 redact_url_params(url),
@@ -1489,11 +1525,46 @@ async fn spot_1m_fetch_once(
         .and_then(|v| v.to_str().ok())
         .unwrap_or_default()
         .to_string();
-    let text = read_body_capped(resp).await.map_err(|msg| FetchFailure {
-        rate_limited: false,
-        msg,
-    })?;
+    let text = read_body_capped(resp)
+        .await
+        .map_err(|msg| SpotFetchUnpacedFailure {
+            status: Some(status.as_u16()),
+            rate_limited: false,
+            retry_after_ms: None,
+            msg,
+        })?;
     Ok(FetchedBody { text, content_type })
+}
+
+/// The LEGACY paced wrapper — behavior-preserving for the per-minute
+/// fires, ladder re-polls, the 15:33:30 sweep, and the #1524 diagnostic
+/// probes (they all funnel through this fn): waits for a permit from the
+/// shared process-wide limiter (2026-07-14 operator pacing directive;
+/// overflow spills into the next second(s), never drops), delegates to
+/// the unpaced inner, and feeds the self-tuner on a REAL 429.
+async fn spot_1m_fetch_once(
+    client: &reqwest::Client,
+    url: &str,
+    jwt: &str,
+    body: &serde_json::Value,
+) -> Result<FetchedBody, FetchFailure> {
+    crate::dhan_data_api_limiter::shared_dhan_data_api_limiter()
+        .acquire()
+        .await;
+    spot_1m_fetch_once_unpaced(client, url, jwt, body)
+        .await
+        .map_err(|failure| {
+            if failure.rate_limited {
+                // Feed the self-tuner from the REAL StatusCode (never a
+                // substring scan) — enough of these inside the rolling
+                // window steps the shared limiter down to the 2 rps floor.
+                crate::dhan_data_api_limiter::shared_dhan_data_api_limiter().record_429();
+            }
+            FetchFailure {
+                rate_limited: failure.rate_limited,
+                msg: failure.msg,
+            }
+        })
 }
 
 /// Bounded in-minute re-poll ladder for ONE index: first attempt at the
@@ -2061,7 +2132,9 @@ fn record_skipped_boundaries(
 /// Build one `spot_1m_rest` row from a parsed candle. The `close_to_data_ms`
 /// stamp is the caller's HONEST retrieval delay (own-fire latency, or the
 /// > 60 s real delay for a backfilled minute).
-fn build_spot_1m_row(
+// `pub(crate)` since 2026-07-17: shared with `crate::dhan_cadence_executor`
+// (the cadence lane persists through the SAME row builder — one shape).
+pub(crate) fn build_spot_1m_row(
     candle: &MinuteCandle,
     security_id: SecurityId,
     symbol: &'static str,
@@ -2119,8 +2192,8 @@ fn spot_1m_symbol_for_sid(security_id: SecurityId) -> &'static str {
 /// LAST-written error_class wins for that key. The outcome-level truth is
 /// unaffected (`outcome` IS in-key — transition rows with distinct
 /// outcomes both survive).
-#[allow(clippy::too_many_arguments)] // APPROVED: private forensics builder — a struct would be pure ceremony
-fn build_dhan_fetch_audit_row(
+#[allow(clippy::too_many_arguments)] // APPROVED: crate-private forensics builder — a struct would be pure ceremony
+pub(crate) fn build_dhan_fetch_audit_row(
     target_minute_ist_nanos: i64,
     trading_date_nanos: i64,
     security_id: SecurityId,
@@ -2157,7 +2230,10 @@ fn build_dhan_fetch_audit_row(
 /// affected by the forensics leg. Dhan emit sites stay field-less on the
 /// SPOT1M codes per the rule-file convention (grep-split by
 /// `feed="groww"`).
-fn audit_append_best_effort(audit_writer: &mut RestFetchAuditWriter, row: &RestFetchAuditRow) {
+pub(crate) fn audit_append_best_effort(
+    audit_writer: &mut RestFetchAuditWriter,
+    row: &RestFetchAuditRow,
+) {
     if let Err(err) = audit_writer.append_row(row) {
         metrics::counter!("tv_rest_fetch_audit_persist_errors_total", "stage" => "audit_append")
             .increment(1);
@@ -2172,7 +2248,7 @@ fn audit_append_best_effort(audit_writer: &mut RestFetchAuditWriter, row: &RestF
 }
 
 /// Best-effort forensics flush (same never-affects-the-loop contract).
-fn audit_flush_best_effort(audit_writer: &mut RestFetchAuditWriter) {
+pub(crate) fn audit_flush_best_effort(audit_writer: &mut RestFetchAuditWriter) {
     if let Err(err) = audit_writer.flush() {
         metrics::counter!("tv_rest_fetch_audit_persist_errors_total", "stage" => "audit_flush")
             .increment(1);
@@ -3281,6 +3357,155 @@ async fn run_post_session_sweep(
     }
 }
 
+/// Pure schedule decision for the CADENCE-ERA one-shot post-session sweep
+/// (2026-07-17 review fix S7): from `now` (IST seconds of day) return
+/// `Some(wait_secs)` when today's sweep instant is still reachable
+/// (wait 0 = fire now — a boot between 15:33:30 and the 16:30 box stop
+/// sweeps immediately), or `None` when the process woke past the 16:30
+/// IST box-stop bound (firing into teardown helps nobody; the next boot's
+/// sweep covers the day only if re-run manually — DEDUP-idempotent).
+#[must_use]
+pub(crate) fn cadence_sweep_wait_secs(now_secs_of_day: u32) -> Option<u32> {
+    const BOX_STOP_SECS_OF_DAY_IST: u32 = 16 * 3600 + 30 * 60;
+    if now_secs_of_day >= BOX_STOP_SECS_OF_DAY_IST {
+        return None;
+    }
+    Some(SPOT_1M_REST_SWEEP_FIRE_SECS_OF_DAY_IST.saturating_sub(now_secs_of_day))
+}
+
+/// 2026-07-17 (cadence review fix S7): the legacy 15:33:30 IST
+/// post-session repair sweep died with the leg loops (the RS3
+/// stand-down), so a cadence per-minute miss would otherwise become a
+/// PERMANENT `spot_1m_rest` gap. This ONE-SHOT task — spawned from
+/// `cadence_boot` on the Dhan lane — reuses the EXACT legacy sweep body
+/// (`sweep_sids_above_watermark` + the PACED `spot_1m_fetch_once`;
+/// post-session, limiter pacing is fine and deliberate): at ~15:33:30 IST
+/// on a trading day it re-fetches the day window ONCE per SID and
+/// backfills every session minute still missing (DEDUP-idempotent
+/// appends; fold handoff only after the flush ACK, inside the sweep
+/// body). A FRESH `PersistTracker` (empty watermarks) makes the sweep
+/// cover the WHOLE session — the per-minute authors are the cadence
+/// executors, whose state this task deliberately does NOT duplicate; the
+/// re-appends UPSERT in place (the legacy mid-session-restart envelope).
+/// One-shot per process — the prod box stops at 16:30 IST daily, so one
+/// fire per boot IS one fire per trading day on the prod schedule.
+pub(crate) async fn run_cadence_post_session_sweep(
+    calendar: Arc<TradingCalendar>,
+    questdb: QuestDbConfig,
+    rest_api_base_url: String,
+) {
+    let Some(wait) = cadence_sweep_wait_secs(ist_secs_of_day_now()) else {
+        info!(
+            "spot_1m_rest: cadence post-session sweep spawned past the \
+             16:30 IST box-stop bound — skipping (manual re-run stays \
+             DEDUP-idempotent)"
+        );
+        return;
+    };
+    if wait > 0 {
+        tokio::time::sleep(Duration::from_secs(u64::from(wait))).await;
+    }
+    // Same-day defense (the legacy sweep's exact gate): a suspend across
+    // midnight or a non-trading day skips rather than stamping the wrong
+    // trading date.
+    let woke = ist_secs_of_day_now();
+    if woke < SPOT_1M_REST_LAST_FIRE_SECS_OF_DAY_IST || !calendar.is_trading_day_today() {
+        warn!(
+            woke_at_secs = woke,
+            "spot_1m_rest: cadence post-session sweep woke outside today's \
+             session (midnight wrap / non-trading day) — skipping"
+        );
+        return;
+    }
+    let url = join_api_url(&rest_api_base_url, DHAN_CHARTS_INTRADAY_PATH);
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(SPOT_1M_REST_REQUEST_TIMEOUT_SECS))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+    {
+        Ok(c) => c,
+        Err(err) => {
+            error!(
+                code = ErrorCode::Spot1m01FetchDegraded.code_str(),
+                stage = "client_build",
+                ?err,
+                "SPOT1M-01: cadence post-session sweep HTTP client build \
+                 failed — the day's repair sweep is skipped"
+            );
+            return;
+        }
+    };
+    // Token at fire time from the process-global manager (the cadence
+    // executor precedent — never boot-captured).
+    let jwt: Option<secrecy::SecretString> =
+        tickvault_core::auth::token_manager::global_token_manager().and_then(|manager| {
+            manager
+                .token_handle()
+                .load()
+                .as_ref()
+                .as_ref()
+                .map(|state| state.access_token().clone())
+        });
+    let Some(jwt) = jwt else {
+        error!(
+            code = ErrorCode::Spot1m01FetchDegraded.code_str(),
+            stage = "sweep_failed",
+            "SPOT1M-01: no access token at cadence post-session sweep time \
+             — missing minutes stay absent (DEDUP-idempotent manual re-run \
+             remains possible)"
+        );
+        return;
+    };
+    let trading_date = today_ist();
+    let trading_date_nanos = minute_open_ist_nanos(trading_date, 0);
+    let session_first =
+        minute_open_ist_nanos(trading_date, SPOT_1M_REST_FIRST_FIRE_SECS_OF_DAY_IST - 60);
+    let session_last =
+        minute_open_ist_nanos(trading_date, SPOT_1M_REST_LAST_FIRE_SECS_OF_DAY_IST - 60);
+    let mut writer = Spot1mRestWriter::new(&questdb);
+    let mut audit_writer = RestFetchAuditWriter::new(&questdb);
+    let mut tracker = PersistTracker::default();
+    // Target list: `sweep_sids_above_watermark` iterates the FULL
+    // `SPOT_1M_REST_INDICES` (4 SIDs INCLUDING INDIA VIX, const-asserted
+    // len==4 in constants.rs) — the cadence sweep therefore already
+    // repairs VIX minutes; no separate VIX arm is needed (fix round 2
+    // factual note: the "3-SID list" review premise was wrong).
+    let stats = sweep_sids_above_watermark(
+        &client,
+        &url,
+        &mut writer,
+        &mut tracker,
+        &jwt,
+        trading_date,
+        trading_date_nanos,
+        session_first,
+        session_last,
+        "sweep_failed",
+        Some(&mut audit_writer),
+    )
+    .await;
+    metrics::counter!("tv_spot1m_sweep_backfilled_total").increment(stats.swept);
+    metrics::counter!("tv_spot1m_sweep_still_missing_total").increment(stats.still_missing);
+    if stats.still_missing > 0 || stats.persist_failed {
+        error!(
+            code = ErrorCode::Spot1m01FetchDegraded.code_str(),
+            stage = "sweep_incomplete",
+            swept = stats.swept,
+            still_missing = stats.still_missing,
+            persist_failed = stats.persist_failed,
+            "SPOT1M-01: cadence post-session sweep left session minutes \
+             absent — the day's table stays short (DEDUP-idempotent manual \
+             re-run remains possible)"
+        );
+    } else {
+        info!(
+            swept = stats.swept,
+            "spot_1m_rest: cadence post-session sweep complete — every \
+             session minute is persisted"
+        );
+    }
+}
+
 /// 2026-07-13 VIX companion: feed one fired minute's per-SID served
 /// verdicts into the [`SidServedTracker`] and emit the edge-latched
 /// per-SID page / recovery ping + the per-counted-minute counter
@@ -3782,6 +4007,52 @@ mod tests {
         assert!(!accumulation_within_cap(cap, 1, cap));
         // Overflow-safe (saturating add, never wraps to a small value).
         assert!(!accumulation_within_cap(usize::MAX, usize::MAX, cap));
+    }
+
+    // ---- Retry-After parse (2026-07-17 cadence-executor refactor) ------------
+
+    #[test]
+    fn test_cadence_sweep_wait_secs_schedule_decision() {
+        // Before the 15:33:30 fire instant: wait exactly to the instant.
+        assert_eq!(
+            cadence_sweep_wait_secs(SPOT_1M_REST_SWEEP_FIRE_SECS_OF_DAY_IST - 90),
+            Some(90)
+        );
+        // At/after the instant but before the 16:30 box stop: fire NOW.
+        assert_eq!(
+            cadence_sweep_wait_secs(SPOT_1M_REST_SWEEP_FIRE_SECS_OF_DAY_IST),
+            Some(0)
+        );
+        assert_eq!(cadence_sweep_wait_secs(16 * 3600), Some(0));
+        // At/past the 16:30 IST box stop: unusable — skip.
+        assert_eq!(cadence_sweep_wait_secs(16 * 3600 + 30 * 60), None);
+        assert_eq!(cadence_sweep_wait_secs(23 * 3600), None);
+        // Midnight boot waits the whole morning to the fire instant.
+        assert_eq!(
+            cadence_sweep_wait_secs(0),
+            Some(SPOT_1M_REST_SWEEP_FIRE_SECS_OF_DAY_IST)
+        );
+    }
+
+    #[test]
+    fn test_retry_after_header_ms_parses_delta_seconds_only() {
+        // Delta-seconds form → milliseconds.
+        assert_eq!(retry_after_header_ms("3"), Some(3_000));
+        assert_eq!(retry_after_header_ms(" 10 "), Some(10_000));
+        assert_eq!(retry_after_header_ms("0"), Some(0));
+        // Negative / garbage / HTTP-date forms → None (never a guess).
+        assert_eq!(retry_after_header_ms("-1"), None);
+        assert_eq!(retry_after_header_ms(""), None);
+        assert_eq!(retry_after_header_ms("Wed, 21 Oct 2026 07:28:00 GMT"), None);
+        // Saturating multiply + clamp — a hostile huge value never panics
+        // and never propagates past the 60s hint cap.
+        assert_eq!(
+            retry_after_header_ms(&i64::MAX.to_string()),
+            Some(RETRY_AFTER_HINT_CAP_MS)
+        );
+        assert_eq!(retry_after_header_ms("61"), Some(RETRY_AFTER_HINT_CAP_MS));
+        // At/below the cap passes through unclamped.
+        assert_eq!(retry_after_header_ms("60"), Some(60_000));
     }
 
     // ---- fire_is_fresh -----------------------------------------------------
