@@ -22,7 +22,6 @@ registry_get             = 50           # <50ns  — matches registry/get_hit, r
 token_handle             = 50           # <50ns  — matches token_handle/load (arc-swap hot-path read)
 f32_to_f64_clean         = 50           # <50ns  — matches f32_to_f64_clean/* (storage precision conversion)
 ws_reader_frame_handle   = 5000         # <5μs  — STAGE-D P7.6: counter bump + WAL append + dispatch per frame. Generous ceiling because WAL append includes one heap alloc + one crossbeam try_send; measured ~1-3μs in criterion, budget gives 2× headroom for noisy CI runners.
-phase2_compute_subscriptions = 1000000  # <1ms  — Plan item Q (2026-04-23): cold-path 09:13 dispatcher computes ATM±24 for 4 depth underlyings × 200-strike option chains. Measured ~4.3μs; 1ms budget gives ~230× headroom so accidental O(n²) regressions fail CI without being tight enough to flake on noisy runners.
 # tick_gap_record_tick_steady_state / tick_gap_scan_gaps_full_universe budgets
 # removed in PR-C3 (2026-07-14) with the deleted tick-gap detector
 # (operator Q4-ii 2026-07-13).
@@ -35,16 +34,9 @@ feed_presence_record = 100               # <100ns — HOT PATH presence fold (sc
 feed_lag_p99_window = 5000000            # <5ms — COLD path: publisher p99 over a full 32,768-sample window via select_nth_unstable. Honestly O(N-window), NOT O(1) — runs on the supervised 10s task off the tick thread (cold-budget class; the former tick_gap_scan_gaps_full_universe peer budget retired in PR-C3, 2026-07-14).
 
 # Moneyness classification (2026-07-14, operator directive) — one key, two benches.
-moneyness = 50                           # <50ns — matches moneyness/classify (2-arm label parse + three integer compares, zero-alloc) AND moneyness/snapshot_read (one lock-free arc-swap load — the token_handle/load class). DHAT-ratcheted by dhat_moneyness.rs. Key checked bidirectionally against every other budget key and bench name (incl. should_emit_snapshot — neither string contains the other); repo-wide grep for "moneyness" was zero hits before this feature.
+moneyness = 50                           # <50ns — matches moneyness/classify (2-arm label parse + three integer compares, zero-alloc) AND moneyness/snapshot_read (one lock-free arc-swap load — the token_handle/load class). DHAT-ratcheted by dhat_moneyness.rs. Key checked bidirectionally against every other budget key and bench name (incl. the since-removed should_emit_snapshot key, deleted 2026-07-17 as an orphaned budget — neither string contained the other); repo-wide grep for "moneyness" was zero hits before this feature.
 
-# Phase 12-runtime (2026-04-28) — Movers 22-TF primitives
-compute_swap_delta_150_30_overlap   = 50000   # <50µs — depth-20 dynamic top-150 set diff with 30-entry crossover (typical per-minute case).
-compute_swap_delta_full_overlap     = 50000   # <50µs — full 150 overlap (no-op delta path).
-compute_swap_delta_zero_overlap     = 50000   # <50µs — full 150-vs-150 swap (worst case).
-compute_next_tick_secs              = 50      # <50ns — pure integer arithmetic.
-compute_lag_secs                    = 50      # <50ns — saturating sub.
-should_emit_snapshot                = 50      # <50ns — single integer compare.
-parse_questdb_dataset_json_150_rows = 1000000 # <1ms — JSON parsing for 150-row payload (option_movers worst case).
+# 2026-07-17: removed 9 orphaned budget keys (phase2_compute_subscriptions, compute_swap_delta_*, compute_next_tick_secs, compute_lag_secs, should_emit_snapshot, parse_questdb_dataset_json_150_rows, cascade_fanout_feed_sealed_1s_bar) — their benches were deleted with the movers/depth/live-feed retirements; bench-gate silently ignored budget keys with no matching bench (Rule-11 dead-gate class).
 
 # B6 (2026-07-03) — operator-gated TRUE-COMPUTE per-tick budget.
 # Bench: composite/quote_tick_compute_only (crates/core/benches/
@@ -69,8 +61,6 @@ composite_quote_tick_full_chain = 10000  # <10µs full per-tick chain p50 (measu
 # Trading crate — OMS
 oms_state_transition     = 100          # <100ns — matches oms/state_transition
 
-# Trading crate — 28-TF CascadeFanout (Phase 3 9-box closure)
-cascade_fanout_feed_sealed_1s_bar = 5000  # <5µs per call. 28 × papaya pin/get + uncontended mutex ≈ 1.7µs measured; 3× headroom for noisy CI runners. At ~24K seals/sec peak this caps fanout work at ~12% of one core.
 
 # Trading crate — Wave 7-A4 BarCache RAM-first hot-path READ side
 bar_cache_lookup         = 100          # <100ns per call. papaya pin + get + Copy of CompactBar (56 B). Source-site docstring claims ~30ns measured; 3× headroom for noisy CI runners. Companion to dhat_bar_cache_lookup.rs (zero-alloc) — together they pin the W7-A4 §6 "100% code performance" guarantee row. At ~4,200 lookups/sec sustained + ~99K reads/sec minute-boundary burst this budget caps lookup work at ~10% of one core.
