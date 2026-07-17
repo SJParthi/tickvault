@@ -219,6 +219,7 @@ pub mod shadow_seal_columns;
 // Per-minute spot 1m REST pipeline (operator grant 2026-07-12, PR-2 — the
 // SPOT half; SPOT1M-02): the `spot_1m_rest` table DDL + ILP-over-HTTP writer.
 pub mod spot_1m_rest_persistence;
+pub mod spot_crossverify_persistence;
 // Per-minute option-chain REST pipeline (operator grant 2026-07-12, PR-3 —
 // the OPTION-CHAIN half; CHAIN-03): the `option_chain_1m` table DDL +
 // ILP-over-HTTP writer.
