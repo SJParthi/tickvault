@@ -48,6 +48,16 @@ classified (IDX_I volume is 0). Results land in:
 The subsystem is COLD-PATH, config-gated, best-effort — never on the tick hot
 path, never on any order / recovery / REST-capture path.
 
+
+**Honest join caveat (UNPROVEN-live):** the join key is derived by
+stripping a leading `NSE-`/`BSE-` exchange prefix, THEN
+`canonicalize_index_symbol` (§31.1 / §37.4). The unit tests prove ONLY the
+canonical-join CONTRACT (`NSE-NIFTY`/`BSE-SENSEX` → the same key as the bare
+`NIFTY`/`SENSEX`). Whether the RUNTIME stored symbol forms actually match —
+the Dhan `spot_1m_rest.symbol` written for SID 13/25/51 vs the Groww
+`NSE-NIFTY`/`BSE-SENSEX` — is UNPROVEN and MUST be confirmed on the first
+live boot; a form mismatch there surfaces LOUDLY as an all-Blind day, never
+a silent clean.
 ## §1. SPOT-XVERIFY-01 — cross-broker OHLC divergence found
 
 **Severity:** High. **Auto-triage safe:** **No** — severity-independent

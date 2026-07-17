@@ -303,16 +303,22 @@ pub fn compare_day(
     let noise_max = diffs.last().copied().unwrap_or(0);
 
     let rows_seen = !dhan.is_empty() || !groww.is_empty();
-    let outcome = if minutes_compared == 0 {
-        if rows_seen {
-            SpotXverifyOutcome::Blind
+    let outcome = if minutes_compared > 0 {
+        if cells_diverged > 0 || missing_dhan > 0 || missing_groww > 0 {
+            SpotXverifyOutcome::Diverged
         } else {
-            SpotXverifyOutcome::NoData
+            SpotXverifyOutcome::Clean
         }
-    } else if cells_diverged > 0 || missing_dhan > 0 || missing_groww > 0 {
+    } else if missing_dhan > 0 && missing_groww > 0 {
+        // Both feeds contributed distinct IN-SESSION minutes with zero overlap:
+        // a genuine divergence, never a silent Blind (each feed is missing the
+        // other's minutes). One-sided in-session coverage (only one of the two
+        // > 0) stays Blind — we could not compare.
         SpotXverifyOutcome::Diverged
+    } else if rows_seen {
+        SpotXverifyOutcome::Blind
     } else {
-        SpotXverifyOutcome::Clean
+        SpotXverifyOutcome::NoData
     };
 
     DayComparison {
@@ -494,13 +500,32 @@ pub fn parse_spot_dataset(body: &str, limit: usize) -> Result<(Vec<SpotRow>, boo
     Ok((out, truncated))
 }
 
+/// Canonicalize a spot-index symbol into the cross-feed join key: strip a
+/// leading `NSE-` / `BSE-` exchange prefix (case-insensitive), THEN
+/// [`canonicalize_index_symbol`] (§31.1 / §37.4 — strip the prefix, THEN
+/// canonicalize). The Groww spot leg stores the underlying as the
+/// `groww_symbol` (`NSE-NIFTY` / `BSE-SENSEX`) while the Dhan spot leg stores
+/// the bare canonical form (`NIFTY` / `SENSEX`); the shared
+/// `canonicalize_index_symbol` alone does NOT strip the exchange prefix, so
+/// without this bridge the two feeds' rows never join and every day reads
+/// Blind.
+#[must_use]
+fn canonicalize_spot_index_symbol(symbol: &str) -> String {
+    let upper = symbol.trim().to_ascii_uppercase();
+    let bare = upper
+        .strip_prefix("NSE-")
+        .or_else(|| upper.strip_prefix("BSE-"))
+        .map_or(upper.as_str(), str::trim);
+    canonicalize_index_symbol(bare)
+}
+
 /// Build the canonical (index, minute) → bar map from parsed rows (last wins
 /// on a duplicate key; bad-price rows skipped).
 #[must_use]
 pub fn rows_to_bar_map(rows: &[SpotRow]) -> BTreeMap<(String, i64), OhlcBar> {
     let mut map = BTreeMap::new();
     for r in rows {
-        let canonical = canonicalize_index_symbol(&r.symbol);
+        let canonical = canonicalize_spot_index_symbol(&r.symbol);
         if let Some(bar) = parse_bar(r.open, r.high, r.low, r.close, r.volume) {
             map.insert((canonical, r.ts_nanos), bar);
         }
@@ -1201,11 +1226,33 @@ mod tests {
 
     #[test]
     fn canonicalize_joins_cross_feed_index_names() {
-        // A real alias: the Groww "NSE-NIFTY" form and a Dhan "NIFTY 50"
-        // form both canonicalize to the same identity.
-        let a = canonicalize_index_symbol("NSE-NIFTY");
-        let b = canonicalize_index_symbol("NIFTY 50");
-        assert_eq!(a, b, "cross-feed NIFTY aliases must join: {a} vs {b}");
+        // The Groww spot leg stores the `groww_symbol` (`NSE-NIFTY`); the Dhan
+        // spot leg stores the bare canonical `NIFTY` (SPOT_1M_REST_INDICES).
+        // Both must land on the SAME join key — strip the exchange prefix,
+        // THEN canonicalize (§31.1 / §37.4). Bare `canonicalize_index_symbol`
+        // does NOT strip the prefix, which is the bug this bridges.
+        let groww = canonicalize_spot_index_symbol("NSE-NIFTY");
+        let dhan = canonicalize_spot_index_symbol("NIFTY");
+        assert_eq!(
+            groww, dhan,
+            "cross-feed NIFTY forms must join: {groww} vs {dhan}"
+        );
+        assert_eq!(groww, "NIFTY");
+        // SENSEX crosses the BSE- prefix; BANKNIFTY the NSE- prefix.
+        assert_eq!(
+            canonicalize_spot_index_symbol("BSE-SENSEX"),
+            canonicalize_spot_index_symbol("SENSEX"),
+        );
+        assert_eq!(
+            canonicalize_spot_index_symbol("NSE-BANKNIFTY"),
+            canonicalize_spot_index_symbol("BANKNIFTY"),
+        );
+        // The raw shared fn (no strip) would NOT join these — proving the
+        // bridge is load-bearing.
+        assert_ne!(
+            canonicalize_index_symbol("NSE-NIFTY"),
+            canonicalize_index_symbol("NIFTY"),
+        );
     }
 
     #[test]
