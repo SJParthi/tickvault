@@ -117,6 +117,14 @@ pub mod dhan_intraday_parse;
 /// TokenManager → renewal + mid-session watchdog → REST canary +
 /// spot_1m_rest + option_chain_1m — WITHOUT any WebSocket lane.
 pub mod dhan_rest_stack;
+/// Groww order/position PUSH channel — Stage D app consumer (2026-07-17,
+/// operator-authorized paper-mode receive-only build): bridges trading-side
+/// `BrokerOrderEvent`s from the supervised push runner into `order_audit`
+/// forensic rows (`feed='groww'`). Gated on the non-default `groww_orders`
+/// cargo feature (§39.2 Gate 2) AND the runtime
+/// `[groww_orders] order_push_enabled` flag (Gate 1, default OFF).
+#[cfg(feature = "groww_orders")]
+pub mod groww_order_observability;
 /// `[groww_universe]` process-global daily Groww watch-set + shared-master
 /// rider (2026-07-15 live-feed retirement re-home of the activation daily
 /// build loop + the sole persist_groww_instruments caller).
