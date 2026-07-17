@@ -329,6 +329,43 @@ async fn test_dhan_sustained_empty_only_cycles_never_demote() {
     assert_dhan_shape0_every_cycle(&calls, 4, "Empty");
 }
 
+#[tokio::test(start_paused = true)]
+async fn test_dhan_sustained_queue_delay_only_cycles_never_demote() {
+    // 2026-07-17 review fix: RUNNER-LEVEL proof that QueueDelay — a
+    // SELF-INFLICTED pacing refusal, never a broker signal (F1(iii),
+    // 2026-07-15) — never arms the shape ladder. 4 cycles ≥ 2× the
+    // 2-dirty demotion streak; QueueDelay is retryable (shared bounded
+    // in-cycle retry budget), so the 8-fire shape-0 signature applies.
+    fn queue_delay_err() -> CadenceFetchError {
+        CadenceFetchError::QueueDelay
+    }
+    let calls = run_lane(queue_delay_err, None, true, false, 4).await;
+    assert_dhan_shape0_every_cycle(&calls, 4, "QueueDelay");
+}
+
+/// Groww-lane core assertion: across EVERY observed cycle the 7 NOMINAL
+/// wave requests stay CONCURRENT at T+0 (the choice-1 signature) — a
+/// demotion to choice 2 would split the wave (chains :01 / spots :02).
+fn assert_groww_choice1_every_cycle(calls: &[RecordedCall], cycles: u32, class: &str) {
+    for n in 0..cycles {
+        let minute = FIRST_CYCLE_MINUTE + 60 * n;
+        let inst = all_instants(calls, minute);
+        assert!(
+            inst.len() >= 7,
+            "Groww {class} cycle {}: at least the 7 nominal wave requests (got {})",
+            n + 1,
+            inst.len()
+        );
+        assert!(
+            inst[6] - inst[0] <= SLOT_TOLERANCE_MS,
+            "Groww {class} cycle {}: choice 1 held — all 7 nominal requests \
+             concurrent at T+0 ({class} is NON-ARMING); spread {}ms",
+            n + 1,
+            inst[6] - inst[0]
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // (iii) Groww lane: sustained non-429 failures hold choice 1 (all-7 at T+0)
 // ---------------------------------------------------------------------------
@@ -343,21 +380,29 @@ async fn test_groww_sustained_timeout_only_cycles_never_demote() {
     // fires all 7 nominal requests concurrently at T+0 — pinned for
     // every cycle.
     let calls = run_lane(timeout_err, Some(timeout_err), false, true, 4).await;
-    for n in 0..4_u32 {
-        let minute = FIRST_CYCLE_MINUTE + 60 * n;
-        let inst = all_instants(&calls, minute);
-        assert!(
-            inst.len() >= 7,
-            "Groww cycle {}: at least the 7 nominal wave requests (got {})",
-            n + 1,
-            inst.len()
-        );
-        assert!(
-            inst[6] - inst[0] <= SLOT_TOLERANCE_MS,
-            "Groww cycle {}: choice 1 held — all 7 nominal requests \
-             concurrent at T+0 (Timeout is NON-ARMING); spread {}ms",
-            n + 1,
-            inst[6] - inst[0]
-        );
+    assert_groww_choice1_every_cycle(&calls, 4, "Timeout");
+}
+
+#[tokio::test(start_paused = true)]
+async fn test_groww_sustained_transport_only_cycles_never_demote() {
+    // 2026-07-17 review fix: the Groww proof covered Timeout only —
+    // Transport is a distinct non-arming class and gets its own
+    // never-demote pin (both legs fail every cycle, fully dirty).
+    fn transport_err() -> CadenceFetchError {
+        CadenceFetchError::Transport
     }
+    let calls = run_lane(transport_err, Some(transport_err), false, true, 4).await;
+    assert_groww_choice1_every_cycle(&calls, 4, "Transport");
+}
+
+#[tokio::test(start_paused = true)]
+async fn test_groww_sustained_empty_only_cycles_never_demote() {
+    // 2026-07-17 review fix: Empty (2xx-without-data) is the third
+    // non-arming class — sustained fully-dirty Empty cycles must hold
+    // choice 1 forever.
+    fn empty_err() -> CadenceFetchError {
+        CadenceFetchError::Empty
+    }
+    let calls = run_lane(empty_err, Some(empty_err), false, true, 4).await;
+    assert_groww_choice1_every_cycle(&calls, 4, "Empty");
 }
