@@ -1365,14 +1365,19 @@ pub(crate) struct SpotFetchUnpacedFailure {
     pub(crate) msg: String,
 }
 
+/// Upper clamp on a parsed `Retry-After` hint: a hostile/absurd header can
+/// never propagate more than 60s into `RateLimited { retry_after_ms }`
+/// consumers (the cadence demotion/backoff arms).
+pub const RETRY_AFTER_HINT_CAP_MS: i64 = 60_000;
+
 /// Pure: parse an HTTP `Retry-After` header value in its delta-seconds
-/// form into milliseconds. The HTTP-date form (and any other unparsable
-/// value) returns `None` — callers treat an unparsable hint as absent,
-/// never a guess.
+/// form into milliseconds, clamped to [`RETRY_AFTER_HINT_CAP_MS`]. The
+/// HTTP-date form (and any other unparsable value) returns `None` —
+/// callers treat an unparsable hint as absent, never a guess.
 #[must_use]
 pub fn retry_after_header_ms(value: &str) -> Option<i64> {
     let secs: i64 = value.trim().parse().ok()?;
-    (secs >= 0).then(|| secs.saturating_mul(1000))
+    (secs >= 0).then(|| secs.saturating_mul(1000).min(RETRY_AFTER_HINT_CAP_MS))
 }
 
 // ---------------------------------------------------------------------------
@@ -3867,8 +3872,15 @@ mod tests {
         assert_eq!(retry_after_header_ms("-1"), None);
         assert_eq!(retry_after_header_ms(""), None);
         assert_eq!(retry_after_header_ms("Wed, 21 Oct 2026 07:28:00 GMT"), None);
-        // Saturating multiply — a hostile huge value never panics.
-        assert_eq!(retry_after_header_ms(&i64::MAX.to_string()), Some(i64::MAX));
+        // Saturating multiply + clamp — a hostile huge value never panics
+        // and never propagates past the 60s hint cap.
+        assert_eq!(
+            retry_after_header_ms(&i64::MAX.to_string()),
+            Some(RETRY_AFTER_HINT_CAP_MS)
+        );
+        assert_eq!(retry_after_header_ms("61"), Some(RETRY_AFTER_HINT_CAP_MS));
+        // At/below the cap passes through unclamped.
+        assert_eq!(retry_after_header_ms("60"), Some(60_000));
     }
 
     // ---- fire_is_fresh -----------------------------------------------------
