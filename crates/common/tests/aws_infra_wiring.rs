@@ -531,6 +531,36 @@ fn test_deploy_aws_workflow_has_market_hours_guard() {
 }
 
 #[test]
+fn test_deploy_aws_workflow_green_defer_gate() {
+    // Green-defer contract (2026-07-17, PR #1618): an in-window MAIN-BRANCH
+    // push run exits GREEN with deploy_allowed=false (deferred no-op — the
+    // 15:46 IST after-close cron delivers the SHA); the deploy job must be
+    // gated on that output, and the defer arm must stay scoped to
+    // push-to-main only (tags/dispatch keep the loud red block).
+    let content =
+        std::fs::read_to_string(workspace_root().join(".github/workflows/deploy-aws.yml"))
+            .expect("deploy-aws.yml must be readable"); // APPROVED: test
+    assert!(
+        content.contains("needs.guard_market_hours.outputs.deploy_allowed == 'true'"),
+        "deploy-aws.yml deploy job must gate on guard_market_hours' deploy_allowed output"
+    );
+    assert!(
+        content.contains(
+            r#"elif [ "${{ github.event_name }}" = "push" ] && [ "$GITHUB_REF" = "refs/heads/main" ]; then"#
+        ),
+        "deploy-aws.yml green-defer arm must be scoped to push events on refs/heads/main only"
+    );
+    assert!(
+        content.contains(r#"echo "deploy_allowed=false" >> "$GITHUB_OUTPUT""#),
+        "deploy-aws.yml defer arm must write deploy_allowed=false (green deferred no-op)"
+    );
+    assert!(
+        content.contains(r#"echo "deploy_allowed=true" >> "$GITHUB_OUTPUT""#),
+        "deploy-aws.yml must write deploy_allowed=true on the allowed path"
+    );
+}
+
+#[test]
 fn test_deploy_aws_workflow_uses_oidc() {
     let content =
         std::fs::read_to_string(workspace_root().join(".github/workflows/deploy-aws.yml"))
