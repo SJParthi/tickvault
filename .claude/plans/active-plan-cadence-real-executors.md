@@ -113,18 +113,20 @@ so rows from either path remain idempotent and queryable either way.
 
 ## Plan Items
 
-- [ ] Dhan real executor (`DhanCadenceExecutor` — fetch + persist + fold
+- [x] Dhan real executor (`DhanCadenceExecutor` — fetch + persist + fold
       handoff + snapshot publish + audit + heartbeat)
   - Files: crates/app/src/dhan_cadence_executor.rs (tickvault-app)
-  - Tests: test_dhan_executor_status_to_fetch_error_mapping,
-    test_dhan_executor_persist_before_fold_handoff,
-    test_dhan_executor_no_token_maps_auth
-- [ ] Groww real executor (`GrowwCadenceExecutor` — same responsibilities,
+  - Tests: test_cadence_map_spot_failure_taxonomy,
+    test_cadence_map_chain_failure_taxonomy,
+    test_cadence_fold_handoff_only_after_flush_ack_source_order,
+    test_cadence_no_token_at_fire_time_maps_to_auth
+- [x] Groww real executor (`GrowwCadenceExecutor` — same responsibilities,
       Groww endpoints/identity)
   - Files: crates/app/src/groww_cadence_executor.rs (tickvault-app)
-  - Tests: test_groww_executor_status_to_fetch_error_mapping,
-    test_groww_executor_empty_never_rate_limited,
-    test_groww_executor_persist_before_fold_handoff
+  - Tests: test_groww_cadence_map_spot_failure_taxonomy,
+    test_groww_cadence_map_chain_failure_taxonomy,
+    test_groww_cadence_fold_handoff_only_after_flush_ack_source_order,
+    test_groww_cadence_no_token_at_fire_time_maps_to_auth
 - [x] Limiter-free `*_unpaced` inner-fetcher extraction from the legacy
       per-minute legs (done — commit 0bccc2ff)
   - Files: crates/app/src/spot_1m_rest_boot.rs,
@@ -132,35 +134,40 @@ so rows from either path remain idempotent and queryable either way.
     crates/app/src/groww_spot_1m_boot.rs,
     crates/app/src/groww_option_chain_1m_boot.rs (tickvault-app)
   - Tests: existing leg unit suites (unchanged paced wrappers)
-- [ ] Fold handoff + heartbeat wiring in both executors (post-flush-ACK
+- [x] Fold handoff + heartbeat wiring in both executors (post-flush-ACK
       confirmed-bar send; `tv_rest_1m_fire_heartbeat` per fire)
   - Files: crates/app/src/dhan_cadence_executor.rs,
     crates/app/src/groww_cadence_executor.rs (tickvault-app)
-  - Tests: test_executor_fold_handoff_requires_flush_ack,
-    test_executor_sets_fire_heartbeat
-- [ ] Boot wiring: `cadence_boot.rs` constructs real executors for both
+  - Tests: test_cadence_spot_fire_sets_rest_1m_heartbeat_gauge,
+    test_groww_cadence_spot_fire_sets_rest_1m_heartbeat_gauge
+- [x] Boot wiring: `cadence_boot.rs` constructs real executors for both
       lanes, `dry_run: false`, fire-time token resolution
   - Files: crates/app/src/cadence_boot.rs (tickvault-app)
-  - Tests: test_cadence_boot_constructs_real_executors,
-    test_cadence_boot_fire_time_token_resolution
-- [ ] Config flip + validate tests (`[cadence] enabled = true`, 4 legacy leg
+  - Tests: test_cadence_boot_module_gate_guard_and_real_executors,
+    test_cadence_base_toml_enabled_and_legacy_legs_stood_down
+- [x] Config flip + validate tests (`[cadence] enabled = true`, 4 legacy leg
       configs disabled; mutual-exclusion validation both directions)
   - Files: config/base.toml, crates/common/src/config.rs (tickvault-common)
-  - Tests: test_application_config_validate_cadence_on_legs_off_passes,
-    test_application_config_validate_cadence_on_any_leg_on_fails
-- [ ] Wiring-guard lockstep updates for the new spawn/executor shape
+  - Tests: test_application_config_validate_cadence_capture_leg_mutual_exclusion
+    (both directions: cadence-on + all-legs-off passes; cadence-on + any
+    leg on fails)
+- [x] Wiring-guard lockstep updates for the new spawn/executor shape
   - Files: crates/app/tests/cadence_boot_wiring_guard.rs (tickvault-app)
   - Tests: cadence_boot_wiring_guard (updated pins)
-- [ ] RS5 limiter-free source-scan ratchet (no cadence executor routes
+- [x] RS5 limiter-free source-scan ratchet (no cadence executor routes
       through `dhan_data_api_limiter`)
-  - Files: crates/core/tests/cadence_composition_contract_guard.rs
-    (tickvault-core)
-  - Tests: test_cadence_executors_never_route_through_dhan_data_api_limiter
-- [ ] Runner-level fallback-proof test (demote/recover cycle semantics,
+  - Files: crates/app/tests/cadence_executor_purity_guard.rs (tickvault-app
+    — landed as a NEW app-crate guard: the core composition guard reads
+    core files only)
+  - Tests: test_cadence_executors_never_touch_limiter_or_gates
+- [x] Runner-level fallback-proof test (demote/recover cycle semantics,
       non-arming classes)
-  - Files: crates/core/tests/cadence_runner_fallback_proof.rs
-    (tickvault-core)
-  - Tests: test_rate_limited_two_cycles_demotes_then_three_clean_recovers,
-    test_timeout_transport_empty_never_demote
+  - Files: crates/core/tests/cadence_fallback_proof.rs (tickvault-core;
+    the RateLimited demote/recover arcs were already runner-pinned in
+    cadence_runner_dry_run.rs — inventory in the new file's header)
+  - Tests: test_dhan_sustained_timeout_only_cycles_never_demote,
+    test_dhan_sustained_transport_only_cycles_never_demote,
+    test_dhan_sustained_empty_only_cycles_never_demote,
+    test_groww_sustained_timeout_only_cycles_never_demote
 
 Guarantee matrices: per .claude/rules/project/per-wave-guarantee-matrix.md (cross-referenced).
