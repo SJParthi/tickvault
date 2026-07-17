@@ -2787,6 +2787,58 @@ async fn build_shared_infra(
     // --- Health registry (drives /health + /api/feeds/health) ---
     let health_status: SharedHealthStatus = std::sync::Arc::new(SystemHealthStatus::new());
 
+    // BOOT-03 (Wave-2-C Item 7.3): clock-skew boot gate. Wall-clock drift
+    // vs a trusted source (chronyc PRIMARY, QuestDB now() FALLBACK) that
+    // exceeds CLOCK_SKEW_HALT_THRESHOLD_SECS can silently split/merge trading
+    // days in QuestDB DEDUP keys — so HALT boot. Runs on every boot path
+    // before the seal-writer starts. QuestDB is up by here (ensure_infra_running
+    // above). A probe that CANNOT run (no chrony + QuestDB unreachable) degrades
+    // and PROCEEDS — a dev box without chrony must still boot (per
+    // test_enforce_clock_skew_at_boot_unavailable_does_not_halt).
+    match infra::enforce_clock_skew_at_boot(
+        &config.questdb,
+        tickvault_common::constants::CLOCK_SKEW_HALT_THRESHOLD_SECS,
+    )
+    .await
+    {
+        Ok(sample) => {
+            info!(
+                skew_secs = sample.skew_secs,
+                source = sample.source,
+                "BOOT-03: clock-skew gate passed"
+            );
+        }
+        Err(infra::ClockSkewError::ThresholdExceeded {
+            skew_secs,
+            threshold_secs,
+            source,
+        }) => {
+            error!(
+                code = tickvault_common::error_code::ErrorCode::Boot03ClockSkewExceeded.code_str(),
+                skew_secs,
+                threshold_secs,
+                source,
+                "BOOT-03: wall-clock skew exceeds threshold — REFUSING BOOT"
+            );
+            notifier.notify(NotificationEvent::BootClockSkewExceeded {
+                skew_secs,
+                threshold_secs,
+                source: source.to_string(),
+            });
+            return Err(anyhow::anyhow!(
+                "BOOT-03 clock skew {skew_secs:+.3}s exceeds threshold {threshold_secs:.2}s"
+            ));
+        }
+        Err(unavailable) => {
+            // Both probes failed (no chrony + QuestDB now() unreachable) —
+            // degrade, do NOT halt. Dev boxes without chrony still boot.
+            warn!(
+                error = %unavailable,
+                "BOOT-03: clock-skew probe unavailable — proceeding without the gate"
+            );
+        }
+    }
+
     // --- Seal-writer (installs the process-wide global_seal_sender) ---
     spawn_seal_writer_loop(&config.questdb);
 
