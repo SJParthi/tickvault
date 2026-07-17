@@ -40,6 +40,7 @@ pub mod brutex_crossverify_boot;
 // executors both lanes day 1 — no REST caller). Runbook:
 // `.claude/rules/project/cadence-error-codes.md`.
 pub mod cadence_boot;
+pub(crate) mod cadence_escalation;
 /// Real Dhan cadence executor — limiter-free, gate-pacing honored (the runner
 /// pre-acquires gates; this executor issues ONE bounded request per call).
 pub mod dhan_cadence_executor;

@@ -90,6 +90,10 @@ pub fn spawn_cadence_scheduler(
     let dhan_executor = match DhanCadenceExecutor::new(
         &config.dhan.rest_api_base_url,
         &config.questdb,
+        // Escalation/recovery Telegram sink (fix round 2026-07-17): the
+        // executors own the SPOT1M-01/CHAIN-02 escalation edges now that
+        // the legacy per-minute loops stand down.
+        Some(Arc::clone(notifier)),
     ) {
         Ok(exec) => Arc::new(exec),
         Err(err) => {
@@ -104,7 +108,10 @@ pub fn spawn_cadence_scheduler(
             return None;
         }
     };
-    let groww_executor = match GrowwCadenceExecutor::new(&config.questdb) {
+    let groww_executor = match GrowwCadenceExecutor::new(
+        &config.questdb,
+        Some(Arc::clone(notifier)),
+    ) {
         Ok(exec) => Arc::new(exec),
         Err(err) => {
             metrics::counter!("tv_http_client_build_failed_total", "site" => "cadence_groww_executor")

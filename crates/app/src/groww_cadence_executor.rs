@@ -27,6 +27,8 @@
 //!   ACROSS the download deliberately, serializing concurrent fires so
 //!   one master download per day happens, not three.
 
+use std::sync::Arc;
+
 use chrono::NaiveDate;
 use tickvault_common::config::QuestDbConfig;
 use tickvault_common::constants::{
@@ -40,6 +42,7 @@ use tickvault_core::cadence::executor::{
 };
 use tickvault_core::feed::groww::instruments::{GrowwInstrumentRow, stable_index_security_id};
 use tickvault_core::instrument::index_extractor::canonicalize_index_symbol;
+use tickvault_core::notification::NotificationService;
 use tickvault_core::pipeline::chain_snapshot::ChainUnderlying;
 use tickvault_storage::option_chain_1m_persistence::{
     OPTION_CHAIN_1M_FEED_GROWW, OPTION_CHAIN_1M_SOURCE_GROWW_CHAIN, OptionChain1mRow,
@@ -55,6 +58,7 @@ use tickvault_storage::spot_1m_rest_persistence::{
 use tokio::sync::Mutex;
 use tracing::{debug, error, warn};
 
+use crate::cadence_escalation::{EscalationLeg, LaneEscalation, emit_edge_action};
 use crate::dhan_cadence_executor::{date_to_yyyymmdd, deadline_remaining_ms, yyyymmdd_to_date};
 use crate::groww_option_chain_1m_boot::{
     GrowwChainFetchFailure, build_chain_audit_row, chain_audit_append_best_effort,
@@ -209,6 +213,13 @@ pub struct GrowwCadenceExecutor {
     /// underlying) — the lock is held across the master download so
     /// concurrent fires serialize onto ONE download per day.
     expiry_cache: Mutex<Option<(NaiveDate, [Vec<u32>; 3])>>,
+    /// Escalation-edge tally (fix round 2026-07-17): the legacy
+    /// SPOT1M-01/CHAIN-02 3-consecutive-fully-failed-minutes paging edge,
+    /// minute-bucketed executor-side (persist failure = failed minute).
+    escalation: Mutex<LaneEscalation>,
+    /// Typed Telegram sink for the escalation/recovery events (`None` in
+    /// tests — the coded `error!` lines still fire).
+    notifier: Option<Arc<NotificationService>>,
 }
 
 impl GrowwCadenceExecutor {
@@ -216,7 +227,10 @@ impl GrowwCadenceExecutor {
     /// (HTTP-CLIENT-01 class — the caller degrades loudly; NEVER a
     /// `Client::new()` panic fallback).
     // TEST-EXEMPT: thin constructor — client build is covered upstream; the fetch behavior is exercised via the mapping/ordering tests below.
-    pub fn new(questdb: &QuestDbConfig) -> Result<Self, String> {
+    pub fn new(
+        questdb: &QuestDbConfig,
+        notifier: Option<Arc<NotificationService>>,
+    ) -> Result<Self, String> {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(
                 GROWW_CADENCE_HTTP_TIMEOUT_SECS,
@@ -240,6 +254,8 @@ impl GrowwCadenceExecutor {
             token_cache: Mutex::new(GrowwTokenCache::new()),
             moneyness_latches: Mutex::new(MoneynessWarnLatches::default()),
             expiry_cache: Mutex::new(None),
+            escalation: Mutex::new(LaneEscalation::default()),
+            notifier,
         })
     }
 
@@ -261,6 +277,19 @@ impl GrowwCadenceExecutor {
             token_cache: Mutex::new(token_cache),
             moneyness_latches: Mutex::new(MoneynessWarnLatches::default()),
             expiry_cache: Mutex::new(None),
+            escalation: Mutex::new(LaneEscalation::default()),
+            notifier: None,
+        }
+    }
+
+    /// Record one leg outcome into the lane escalation tally; when the
+    /// outcome rolls the minute bucket, emit the FINALIZED minute's edge
+    /// action (the legacy SPOT1M-01/CHAIN-02 escalation/recovery contract
+    /// — fix round 2026-07-17).
+    async fn record_leg_outcome(&self, leg: EscalationLeg, minute_secs: u32, ok: bool) {
+        let finalized = self.escalation.lock().await.record(leg, minute_secs, ok);
+        if let Some((minute, action)) = finalized {
+            emit_edge_action(Feed::Groww, leg, minute, action, self.notifier.as_ref());
         }
     }
 
@@ -286,6 +315,9 @@ impl GrowwCadenceExecutor {
 impl CadenceExecutor for GrowwCadenceExecutor {
     // TEST-EXEMPT: live-HTTP orchestration — every decision leg (identity map, deadline math, failure taxonomy, fold-after-ACK ordering) is a pure fn / source-order ratchet unit-tested below; the HTTP inner is the tested legacy fetch fn.
     async fn fetch_spot(&self, req: SpotFetchRequest) -> Result<SpotSnapshot, CadenceFetchError> {
+        let escalation_minute_secs = req.cycle_minute_ist;
+        let mut escalation_persist_ok = true;
+        let result = async {
         let trading_date = today_ist();
         let Some(target) = Self::spot_target_for(req.target, trading_date) else {
             // Unresolved VIX (counted above) — an honest Empty, never a
@@ -567,75 +599,152 @@ impl CadenceExecutor for GrowwCadenceExecutor {
             }
             audit_flush_best_effort(&mut audit);
         }
+        escalation_persist_ok = flush_ok;
         Ok(SpotSnapshot {
             price: candle.close,
             source_minute_ist: req.cycle_minute_ist,
             received_at_epoch_ms: chrono::Utc::now().timestamp_millis(),
         })
+        }
+        .await;
+        // Escalation edge (fix round 2026-07-17): a persist failure counts
+        // as a FAILED minute (fetch-ok-but-lost is not ok — the M1 rule).
+        self.record_leg_outcome(
+            EscalationLeg::Spot,
+            escalation_minute_secs,
+            result.is_ok() && escalation_persist_ok,
+        )
+        .await;
+        result
     }
 
     // TEST-EXEMPT: live-HTTP orchestration — decision legs are pure fns unit-tested below; parse/classify/publish/persist are the tested legacy building blocks.
     async fn fetch_chain(&self, req: ChainFetchRequest) -> Result<ChainFetchOk, CadenceFetchError> {
-        let Some((slot, underlying, exchange, groww_symbol)) = groww_chain_identity(req.underlying)
-        else {
-            return Err(CadenceFetchError::Malformed);
-        };
-        let Some(remaining_ms) =
-            deadline_remaining_ms(req.deadline_epoch_ms, chrono::Utc::now().timestamp_millis())
-        else {
-            return Err(CadenceFetchError::Timeout);
-        };
-        // The runner NEVER guesses an expiry; with no day-locked winner
-        // the fire is an honest Empty (non-arming).
-        let Some(expiry_date) = req.expiry_yyyymmdd.and_then(yyyymmdd_to_date) else {
-            debug!(
-                underlying,
-                expiry = ?req.expiry_yyyymmdd,
-                "groww cadence chain fire without a resolved expiry — Empty"
-            );
-            return Err(CadenceFetchError::Empty);
-        };
-        let trading_date = today_ist();
-        let trading_date_nanos = minute_open_ist_nanos(trading_date, 0);
-        let target_nanos = minute_open_ist_nanos(trading_date, req.cycle_minute_ist);
-        let security_id = stable_index_security_id(groww_symbol);
-        // The pinned symbol is &'static — reuse the const entry so the
-        // audit row's `symbol: &'static str` holds.
-        let symbol: &'static str = underlying;
-        let token = {
-            let mut cache = self.token_cache.lock().await;
-            cache.ensure_token().await
-        };
-        let Some(token) = token else {
-            let mut audit = self.audit_writer.lock().await;
-            chain_audit_append_best_effort(
-                &mut audit,
-                &build_chain_audit_row(
-                    target_nanos,
-                    trading_date_nanos,
-                    security_id,
-                    symbol,
-                    0,
-                    0,
-                    -1,
-                    -1,
-                    0,
-                    RestFetchOutcome::NoToken,
-                    "no_token",
-                ),
-            );
-            chain_audit_flush_best_effort(&mut audit);
-            return Err(CadenceFetchError::Auth);
-        };
-        let url = groww_chain_url(exchange, underlying);
-        let expiry_str = expiry_date.format("%Y-%m-%d").to_string();
-        let fetched = tokio::time::timeout(
-            std::time::Duration::from_millis(remaining_ms),
-            groww_chain_fetch_once(&self.client, &url, &expiry_str, &token),
-        )
-        .await;
-        let body_text = match fetched {
-            Err(_elapsed) => {
+        let escalation_minute_secs = req.cycle_minute_ist;
+        let mut escalation_persist_ok = true;
+        let result = async {
+            let Some((slot, underlying, exchange, groww_symbol)) =
+                groww_chain_identity(req.underlying)
+            else {
+                return Err(CadenceFetchError::Malformed);
+            };
+            let Some(remaining_ms) =
+                deadline_remaining_ms(req.deadline_epoch_ms, chrono::Utc::now().timestamp_millis())
+            else {
+                return Err(CadenceFetchError::Timeout);
+            };
+            // The runner NEVER guesses an expiry; with no day-locked winner
+            // the fire is an honest Empty (non-arming).
+            let Some(expiry_date) = req.expiry_yyyymmdd.and_then(yyyymmdd_to_date) else {
+                debug!(
+                    underlying,
+                    expiry = ?req.expiry_yyyymmdd,
+                    "groww cadence chain fire without a resolved expiry — Empty"
+                );
+                return Err(CadenceFetchError::Empty);
+            };
+            let trading_date = today_ist();
+            let trading_date_nanos = minute_open_ist_nanos(trading_date, 0);
+            let target_nanos = minute_open_ist_nanos(trading_date, req.cycle_minute_ist);
+            let security_id = stable_index_security_id(groww_symbol);
+            // The pinned symbol is &'static — reuse the const entry so the
+            // audit row's `symbol: &'static str` holds.
+            let symbol: &'static str = underlying;
+            let token = {
+                let mut cache = self.token_cache.lock().await;
+                cache.ensure_token().await
+            };
+            let Some(token) = token else {
+                let mut audit = self.audit_writer.lock().await;
+                chain_audit_append_best_effort(
+                    &mut audit,
+                    &build_chain_audit_row(
+                        target_nanos,
+                        trading_date_nanos,
+                        security_id,
+                        symbol,
+                        0,
+                        0,
+                        -1,
+                        -1,
+                        0,
+                        RestFetchOutcome::NoToken,
+                        "no_token",
+                    ),
+                );
+                chain_audit_flush_best_effort(&mut audit);
+                return Err(CadenceFetchError::Auth);
+            };
+            let url = groww_chain_url(exchange, underlying);
+            let expiry_str = expiry_date.format("%Y-%m-%d").to_string();
+            let fetched = tokio::time::timeout(
+                std::time::Duration::from_millis(remaining_ms),
+                groww_chain_fetch_once(&self.client, &url, &expiry_str, &token),
+            )
+            .await;
+            let body_text = match fetched {
+                Err(_elapsed) => {
+                    let mut audit = self.audit_writer.lock().await;
+                    chain_audit_append_best_effort(
+                        &mut audit,
+                        &build_chain_audit_row(
+                            target_nanos,
+                            trading_date_nanos,
+                            security_id,
+                            symbol,
+                            1,
+                            0,
+                            -1,
+                            -1,
+                            0,
+                            RestFetchOutcome::Error,
+                            "timeout",
+                        ),
+                    );
+                    chain_audit_flush_best_effort(&mut audit);
+                    return Err(CadenceFetchError::Timeout);
+                }
+                Ok(Err(failure)) => {
+                    if failure.auth_rejected {
+                        self.token_cache.lock().await.note_auth_rejected();
+                    }
+                    let mapped = map_groww_chain_failure(&failure);
+                    debug!(
+                        underlying,
+                        outcome = mapped.as_str(),
+                        msg = %failure.msg,
+                        "groww cadence chain fetch failed (runner owns retry/ladder)"
+                    );
+                    let audit_outcome = if failure.rate_limited {
+                        RestFetchOutcome::RateLimited
+                    } else {
+                        RestFetchOutcome::Error
+                    };
+                    let mut audit = self.audit_writer.lock().await;
+                    chain_audit_append_best_effort(
+                        &mut audit,
+                        &build_chain_audit_row(
+                            target_nanos,
+                            trading_date_nanos,
+                            security_id,
+                            symbol,
+                            1,
+                            i64::from(failure.status),
+                            -1,
+                            -1,
+                            i64::from(failure.rate_limited),
+                            audit_outcome,
+                            chain_error_class_for_status(failure.status),
+                        ),
+                    );
+                    chain_audit_flush_best_effort(&mut audit);
+                    return Err(mapped);
+                }
+                Ok(Ok(text)) => text,
+            };
+            let Some(chain) =
+                crate::groww_option_chain_1m_boot::parse_groww_option_chain(&body_text)
+            else {
                 let mut audit = self.audit_writer.lock().await;
                 chain_audit_append_best_effort(
                     &mut audit,
@@ -645,32 +754,33 @@ impl CadenceExecutor for GrowwCadenceExecutor {
                         security_id,
                         symbol,
                         1,
-                        0,
+                        200,
                         -1,
                         -1,
                         0,
                         RestFetchOutcome::Error,
-                        "timeout",
+                        "parse",
                     ),
                 );
                 chain_audit_flush_best_effort(&mut audit);
-                return Err(CadenceFetchError::Timeout);
-            }
-            Ok(Err(failure)) => {
-                if failure.auth_rejected {
-                    self.token_cache.lock().await.note_auth_rejected();
-                }
-                let mapped = map_groww_chain_failure(&failure);
-                debug!(
-                    underlying,
-                    outcome = mapped.as_str(),
-                    msg = %failure.msg,
-                    "groww cadence chain fetch failed (runner owns retry/ladder)"
-                );
-                let audit_outcome = if failure.rate_limited {
-                    RestFetchOutcome::RateLimited
+                return Err(CadenceFetchError::Malformed);
+            };
+            if chain.legs.is_empty() {
+                // The 2026-07-14 empty-vs-drift split: entries our extraction
+                // dropped = an ERROR (leg_shape_drift), a literally-empty map
+                // = an honest Empty.
+                let (audit_outcome, class, mapped) = if chain.strikes_seen > 0 {
+                    (
+                        RestFetchOutcome::Error,
+                        "leg_shape_drift",
+                        CadenceFetchError::Malformed,
+                    )
                 } else {
-                    RestFetchOutcome::Error
+                    (
+                        RestFetchOutcome::Empty,
+                        "empty_chain",
+                        CadenceFetchError::Empty,
+                    )
                 };
                 let mut audit = self.audit_writer.lock().await;
                 chain_audit_append_best_effort(
@@ -681,237 +791,189 @@ impl CadenceExecutor for GrowwCadenceExecutor {
                         security_id,
                         symbol,
                         1,
-                        i64::from(failure.status),
+                        200,
                         -1,
                         -1,
-                        i64::from(failure.rate_limited),
+                        0,
                         audit_outcome,
-                        chain_error_class_for_status(failure.status),
+                        class,
                     ),
                 );
                 chain_audit_flush_best_effort(&mut audit);
                 return Err(mapped);
             }
-            Ok(Ok(text)) => text,
-        };
-        let Some(chain) = crate::groww_option_chain_1m_boot::parse_groww_option_chain(&body_text)
-        else {
-            let mut audit = self.audit_writer.lock().await;
-            chain_audit_append_best_effort(
-                &mut audit,
-                &build_chain_audit_row(
-                    target_nanos,
-                    trading_date_nanos,
-                    security_id,
-                    symbol,
-                    1,
-                    200,
-                    -1,
-                    -1,
-                    0,
-                    RestFetchOutcome::Error,
-                    "parse",
-                ),
-            );
-            chain_audit_flush_best_effort(&mut audit);
-            return Err(CadenceFetchError::Malformed);
-        };
-        if chain.legs.is_empty() {
-            // The 2026-07-14 empty-vs-drift split: entries our extraction
-            // dropped = an ERROR (leg_shape_drift), a literally-empty map
-            // = an honest Empty.
-            let (audit_outcome, class, mapped) = if chain.strikes_seen > 0 {
-                (
-                    RestFetchOutcome::Error,
-                    "leg_shape_drift",
-                    CadenceFetchError::Malformed,
-                )
+            let close_to_data_ms =
+                (ist_millis_of_day_now() - (i64::from(req.cycle_minute_ist) + 60) * 1000).max(0);
+            // A vendor-omitted underlying_ltp maps to 0.0 for classification
+            // (every row UNKNOWN — fail-soft, never a dropped row).
+            let moneyness_spot = if chain.underlying_ltp_missing {
+                0.0
             } else {
-                (
-                    RestFetchOutcome::Empty,
-                    "empty_chain",
-                    CadenceFetchError::Empty,
-                )
+                chain.underlying_ltp
             };
-            let mut audit = self.audit_writer.lock().await;
-            chain_audit_append_best_effort(
-                &mut audit,
-                &build_chain_audit_row(
-                    target_nanos,
-                    trading_date_nanos,
-                    security_id,
-                    symbol,
-                    1,
-                    200,
-                    -1,
-                    -1,
-                    0,
-                    audit_outcome,
-                    class,
-                ),
-            );
-            chain_audit_flush_best_effort(&mut audit);
-            return Err(mapped);
-        }
-        let close_to_data_ms =
-            (ist_millis_of_day_now() - (i64::from(req.cycle_minute_ist) + 60) * 1000).max(0);
-        // A vendor-omitted underlying_ltp maps to 0.0 for classification
-        // (every row UNKNOWN — fail-soft, never a dropped row).
-        let moneyness_spot = if chain.underlying_ltp_missing {
-            0.0
-        } else {
-            chain.underlying_ltp
-        };
-        // Classify ONCE per fire; the RAM snapshot rows are built BEFORE
-        // the persist loop (the legacy Found-arm ordering).
-        let cls = classify_chain_legs(
-            underlying,
-            moneyness_spot,
-            chain.legs.iter().map(|l| (l.strike, l.leg, l.ltp)),
-        );
-        {
-            let mut latches = self.moneyness_latches.lock().await;
-            let minute_label = format!(
-                "{:02}:{:02}",
-                req.cycle_minute_ist / 3600,
-                (req.cycle_minute_ist % 3600) / 60
-            );
-            record_chain_moneyness_observability(
-                OPTION_CHAIN_1M_FEED_GROWW,
+            // Classify ONCE per fire; the RAM snapshot rows are built BEFORE
+            // the persist loop (the legacy Found-arm ordering).
+            let cls = classify_chain_legs(
                 underlying,
-                slot,
-                trading_date,
-                &minute_label,
-                &cls,
-                &mut latches,
+                moneyness_spot,
+                chain.legs.iter().map(|l| (l.strike, l.leg, l.ltp)),
             );
-        }
-        let expiry_nanos = minute_open_ist_nanos(expiry_date, 0);
-        let fetched_at = fetched_at_ist_nanos_now();
-        let mut persist_failed = false;
-        {
-            let mut writer = self.chain_writer.lock().await;
-            for (leg, leg_moneyness) in chain.legs.iter().zip(cls.row_moneyness.iter()) {
-                let row = OptionChain1mRow {
-                    ts_ist_nanos: target_nanos,
-                    trading_date_ist_nanos: trading_date_nanos,
-                    underlying_security_id: security_id,
-                    underlying_symbol: symbol,
-                    expiry_ist_nanos: expiry_nanos,
-                    strike: leg.strike,
-                    leg: leg.leg,
-                    contract_security_id: 0,
-                    last_price: leg.ltp,
-                    iv: leg.iv,
-                    delta: leg.delta,
-                    theta: leg.theta,
-                    gamma: leg.gamma,
-                    vega: leg.vega,
-                    oi: leg.oi,
-                    volume: leg.volume,
-                    previous_oi: 0,
-                    // RAW vendor value (0.0 = omitted — the
-                    // underlying_ltp_missing forensics convention).
-                    underlying_spot: chain.underlying_ltp,
-                    fetched_at_ist_nanos: fetched_at,
-                    moneyness: leg_moneyness.as_str(),
-                };
-                if let Err(err) = writer.append_row_ext(&row, leg.rho, close_to_data_ms) {
+            {
+                let mut latches = self.moneyness_latches.lock().await;
+                let minute_label = format!(
+                    "{:02}:{:02}",
+                    req.cycle_minute_ist / 3600,
+                    (req.cycle_minute_ist % 3600) / 60
+                );
+                record_chain_moneyness_observability(
+                    OPTION_CHAIN_1M_FEED_GROWW,
+                    underlying,
+                    slot,
+                    trading_date,
+                    &minute_label,
+                    &cls,
+                    &mut latches,
+                );
+            }
+            let expiry_nanos = minute_open_ist_nanos(expiry_date, 0);
+            let fetched_at = fetched_at_ist_nanos_now();
+            let mut persist_failed = false;
+            {
+                let mut writer = self.chain_writer.lock().await;
+                for (leg, leg_moneyness) in chain.legs.iter().zip(cls.row_moneyness.iter()) {
+                    let row = OptionChain1mRow {
+                        ts_ist_nanos: target_nanos,
+                        trading_date_ist_nanos: trading_date_nanos,
+                        underlying_security_id: security_id,
+                        underlying_symbol: symbol,
+                        expiry_ist_nanos: expiry_nanos,
+                        strike: leg.strike,
+                        leg: leg.leg,
+                        contract_security_id: 0,
+                        last_price: leg.ltp,
+                        iv: leg.iv,
+                        delta: leg.delta,
+                        theta: leg.theta,
+                        gamma: leg.gamma,
+                        vega: leg.vega,
+                        oi: leg.oi,
+                        volume: leg.volume,
+                        previous_oi: 0,
+                        // RAW vendor value (0.0 = omitted — the
+                        // underlying_ltp_missing forensics convention).
+                        underlying_spot: chain.underlying_ltp,
+                        fetched_at_ist_nanos: fetched_at,
+                        moneyness: leg_moneyness.as_str(),
+                    };
+                    if let Err(err) = writer.append_row_ext(&row, leg.rho, close_to_data_ms) {
+                        persist_failed = true;
+                        metrics::counter!(
+                            "tv_groww_chain1m_persist_errors_total", "stage" => "append"
+                        )
+                        .increment(1);
+                        error!(
+                            code = ErrorCode::Chain03PersistFailed.code_str(),
+                            stage = "append",
+                            feed = OPTION_CHAIN_1M_FEED_GROWW,
+                            underlying,
+                            ?err,
+                            "CHAIN-03: cadence groww option_chain_1m row append failed"
+                        );
+                        break;
+                    }
+                }
+                if !persist_failed && let Err(err) = writer.flush() {
                     persist_failed = true;
-                    metrics::counter!(
-                        "tv_groww_chain1m_persist_errors_total", "stage" => "append"
-                    )
-                    .increment(1);
+                    metrics::counter!("tv_groww_chain1m_persist_errors_total", "stage" => "flush")
+                        .increment(1);
                     error!(
                         code = ErrorCode::Chain03PersistFailed.code_str(),
-                        stage = "append",
+                        stage = "flush",
                         feed = OPTION_CHAIN_1M_FEED_GROWW,
-                        underlying,
                         ?err,
-                        "CHAIN-03: cadence groww option_chain_1m row append failed"
-                    );
-                    break;
-                }
-            }
-            if !persist_failed && let Err(err) = writer.flush() {
-                persist_failed = true;
-                metrics::counter!("tv_groww_chain1m_persist_errors_total", "stage" => "flush")
-                    .increment(1);
-                error!(
-                    code = ErrorCode::Chain03PersistFailed.code_str(),
-                    stage = "flush",
-                    feed = OPTION_CHAIN_1M_FEED_GROWW,
-                    ?err,
-                    "CHAIN-03: cadence groww option_chain_1m ILP flush failed — \
+                        "CHAIN-03: cadence groww option_chain_1m ILP flush failed — \
                      pending rows discarded (poisoned-buffer defense)"
-                );
-            }
-        }
-        {
-            let mut audit = self.audit_writer.lock().await;
-            if persist_failed {
-                chain_audit_append_best_effort(
-                    &mut audit,
-                    &build_chain_audit_row(
-                        target_nanos,
-                        trading_date_nanos,
-                        security_id,
-                        symbol,
-                        1,
-                        200,
-                        -1,
-                        -1,
-                        0,
-                        RestFetchOutcome::NamedGap,
-                        "persist_failed",
-                    ),
-                );
-            } else {
-                for row in stamp_held_ok_rows(
-                    vec![build_chain_audit_row(
-                        target_nanos,
-                        trading_date_nanos,
-                        security_id,
-                        symbol,
-                        1,
-                        200,
-                        -1,
-                        close_to_data_ms,
-                        0,
-                        RestFetchOutcome::Ok,
-                        "none",
-                    )],
-                    true,
-                    trading_date_nanos,
-                    ist_millis_of_day_now(),
-                ) {
-                    chain_audit_append_best_effort(&mut audit, &row);
+                    );
                 }
             }
-            chain_audit_flush_best_effort(&mut audit);
+            {
+                let mut audit = self.audit_writer.lock().await;
+                if persist_failed {
+                    chain_audit_append_best_effort(
+                        &mut audit,
+                        &build_chain_audit_row(
+                            target_nanos,
+                            trading_date_nanos,
+                            security_id,
+                            symbol,
+                            1,
+                            200,
+                            -1,
+                            -1,
+                            0,
+                            RestFetchOutcome::NamedGap,
+                            "persist_failed",
+                        ),
+                    );
+                } else {
+                    for row in stamp_held_ok_rows(
+                        vec![build_chain_audit_row(
+                            target_nanos,
+                            trading_date_nanos,
+                            security_id,
+                            symbol,
+                            1,
+                            200,
+                            -1,
+                            close_to_data_ms,
+                            0,
+                            RestFetchOutcome::Ok,
+                            "none",
+                        )],
+                        true,
+                        trading_date_nanos,
+                        ist_millis_of_day_now(),
+                    ) {
+                        chain_audit_append_best_effort(&mut audit, &row);
+                    }
+                }
+                chain_audit_flush_best_effort(&mut audit);
+            }
+            let underlying_spot = (!chain.underlying_ltp_missing
+                && chain.underlying_ltp.is_finite()
+                && chain.underlying_ltp > 0.0)
+                .then_some(chain.underlying_ltp);
+            // Publish is persist-independent (the RAM decision surface is
+            // never degraded by a QuestDB outage).
+            publish_chain_moneyness_snapshot(
+                Feed::Groww,
+                underlying,
+                target_nanos,
+                fetched_at,
+                moneyness_spot,
+                expiry_nanos,
+                cls,
+            );
+            metrics::counter!("tv_groww_chain1m_fetch_total", "outcome" => "ok").increment(1);
+            #[allow(clippy::cast_precision_loss)] // APPROVED: histogram sample only
+            metrics::histogram!("tv_groww_chain1m_close_to_data_ms")
+                .record(close_to_data_ms as f64);
+            escalation_persist_ok = !persist_failed;
+            Ok(ChainFetchOk {
+                underlying_spot,
+                published_to_registry: true,
+            })
         }
-        let underlying_spot = (!chain.underlying_ltp_missing
-            && chain.underlying_ltp.is_finite()
-            && chain.underlying_ltp > 0.0)
-            .then_some(chain.underlying_ltp);
-        // Publish is persist-independent (the RAM decision surface is
-        // never degraded by a QuestDB outage).
-        publish_chain_moneyness_snapshot(
-            Feed::Groww,
-            underlying,
-            target_nanos,
-            fetched_at,
-            moneyness_spot,
-            expiry_nanos,
-            cls,
-        );
-        metrics::counter!("tv_groww_chain1m_fetch_total", "outcome" => "ok").increment(1);
-        #[allow(clippy::cast_precision_loss)] // APPROVED: histogram sample only
-        metrics::histogram!("tv_groww_chain1m_close_to_data_ms").record(close_to_data_ms as f64);
-        Ok(ChainFetchOk {
-            underlying_spot,
-            published_to_registry: true,
-        })
+        .await;
+        // Escalation edge (fix round 2026-07-17): persist failure = failed
+        // minute (the M1 rule).
+        self.record_leg_outcome(
+            EscalationLeg::Chain,
+            escalation_minute_secs,
+            result.is_ok() && escalation_persist_ok,
+        )
+        .await;
+        result
     }
 
     // TEST-EXEMPT: live-HTTP orchestration — the master-derived expiry extraction is the pure fn `groww_option_expiries` unit-tested below; the download inner is the tested legacy bounded fn.

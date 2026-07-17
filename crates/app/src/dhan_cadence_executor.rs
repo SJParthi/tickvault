@@ -34,6 +34,8 @@
 //! after the cadence spawn; a missing manager/token maps to
 //! [`CadenceFetchError::Auth`]). The JWT is never logged.
 
+use std::sync::Arc;
+
 use chrono::NaiveDate;
 use secrecy::ExposeSecret;
 use tickvault_common::config::QuestDbConfig;
@@ -50,7 +52,10 @@ use tickvault_core::cadence::executor::{
     CadenceExecutor, CadenceFetchError, ChainFetchOk, ChainFetchRequest, ExpiryListRequest,
     SpotFetchRequest, SpotSnapshot, SpotTarget,
 };
+use tickvault_core::notification::NotificationService;
 use tickvault_core::pipeline::chain_snapshot::ChainUnderlying;
+
+use crate::cadence_escalation::{EscalationLeg, LaneEscalation, emit_edge_action};
 use tickvault_storage::option_chain_1m_persistence::{
     OPTION_CHAIN_1M_FEED_DHAN, OptionChain1mRow, OptionChain1mWriter,
 };
@@ -179,6 +184,13 @@ pub struct DhanCadenceExecutor {
     chain_writer: Mutex<OptionChain1mWriter>,
     audit_writer: Mutex<RestFetchAuditWriter>,
     moneyness_latches: Mutex<MoneynessWarnLatches>,
+    /// Escalation-edge tally (fix round 2026-07-17): the legacy
+    /// SPOT1M-01/CHAIN-02 3-consecutive-fully-failed-minutes paging edge,
+    /// minute-bucketed executor-side (persist failure = failed minute).
+    escalation: Mutex<LaneEscalation>,
+    /// Typed Telegram sink for the escalation/recovery events (`None` in
+    /// tests — the coded `error!` lines still fire).
+    notifier: Option<Arc<NotificationService>>,
 }
 
 impl DhanCadenceExecutor {
@@ -186,7 +198,11 @@ impl DhanCadenceExecutor {
     /// (HTTP-CLIENT-01 class — the caller degrades loudly; NEVER a
     /// `Client::new()` panic fallback).
     // TEST-EXEMPT: thin constructor — client build + join_api_url are covered upstream; the fetch behavior is exercised via the mapping/ordering tests below.
-    pub fn new(rest_api_base_url: &str, questdb: &QuestDbConfig) -> Result<Self, String> {
+    pub fn new(
+        rest_api_base_url: &str,
+        questdb: &QuestDbConfig,
+        notifier: Option<Arc<NotificationService>>,
+    ) -> Result<Self, String> {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(
                 DHAN_CADENCE_HTTP_TIMEOUT_SECS,
@@ -203,7 +219,20 @@ impl DhanCadenceExecutor {
             chain_writer: Mutex::new(OptionChain1mWriter::new(questdb)),
             audit_writer: Mutex::new(RestFetchAuditWriter::new(questdb)),
             moneyness_latches: Mutex::new(MoneynessWarnLatches::default()),
+            escalation: Mutex::new(LaneEscalation::default()),
+            notifier,
         })
+    }
+
+    /// Record one leg outcome into the lane escalation tally; when the
+    /// outcome rolls the minute bucket, emit the FINALIZED minute's edge
+    /// action (the legacy SPOT1M-01/CHAIN-02 escalation/recovery contract
+    /// — fix round 2026-07-17).
+    async fn record_leg_outcome(&self, leg: EscalationLeg, minute_secs: u32, ok: bool) {
+        let finalized = self.escalation.lock().await.record(leg, minute_secs, ok);
+        if let Some((minute, action)) = finalized {
+            emit_edge_action(Feed::Dhan, leg, minute, action, self.notifier.as_ref());
+        }
     }
 
     /// Fire-time auth resolution — JWT + client-id from the global token
@@ -230,79 +259,110 @@ impl DhanCadenceExecutor {
 impl CadenceExecutor for DhanCadenceExecutor {
     // TEST-EXEMPT: live-HTTP orchestration — every decision leg (identity map, deadline math, failure taxonomy, fold-after-ACK ordering) is a pure fn / source-order ratchet unit-tested below; the HTTP inner is the tested unpaced fn.
     async fn fetch_spot(&self, req: SpotFetchRequest) -> Result<SpotSnapshot, CadenceFetchError> {
-        let Some((security_id, symbol)) = dhan_spot_identity(req.target) else {
-            // Unreachable for the pinned 4-target enum — never a panic.
-            return Err(CadenceFetchError::Malformed);
-        };
-        let Some(remaining_ms) =
-            deadline_remaining_ms(req.deadline_epoch_ms, chrono::Utc::now().timestamp_millis())
-        else {
-            return Err(CadenceFetchError::Timeout);
-        };
-        let trading_date = today_ist();
-        let trading_date_nanos = minute_open_ist_nanos(trading_date, 0);
-        let target_nanos = minute_open_ist_nanos(trading_date, req.cycle_minute_ist);
-        // Spot needs no client-id header — only the JWT.
-        let jwt = match Self::auth_at_fire_time() {
-            Ok((jwt, _client_id)) => jwt,
-            Err(e) => {
-                let mut audit = self.audit_writer.lock().await;
-                audit_append_best_effort(
-                    &mut audit,
-                    &build_dhan_fetch_audit_row(
-                        target_nanos,
-                        trading_date_nanos,
-                        security_id,
-                        symbol,
-                        0,
-                        0,
-                        RestFetchOutcome::NoToken,
-                        -1,
-                        "no_token",
-                    ),
-                );
-                audit_flush_best_effort(&mut audit);
-                return Err(e);
-            }
-        };
-        let body = spot_1m_day_request_body(&security_id.to_string(), trading_date);
-        let fetched = tokio::time::timeout(
-            std::time::Duration::from_millis(remaining_ms),
-            spot_1m_fetch_once_unpaced(
-                &self.client,
-                &self.intraday_url,
-                jwt.expose_secret(),
-                &body,
-            ),
-        )
-        .await;
-        let fetch_verdict = match fetched {
-            Err(_elapsed) => Err((
-                CadenceFetchError::Timeout,
-                RestFetchOutcome::Error,
-                "timeout",
-            )),
-            Ok(Err(failure)) => {
-                let mapped = map_spot_failure(&failure);
-                debug!(
-                    target = symbol,
-                    outcome = mapped.as_str(),
-                    msg = %failure.msg,
-                    "dhan cadence spot fetch failed (runner owns retry/ladder)"
-                );
-                if failure.rate_limited {
-                    Err((mapped, RestFetchOutcome::RateLimited, "rate_limited"))
-                } else {
-                    Err((mapped, RestFetchOutcome::Error, "error"))
+        let escalation_minute_secs = req.cycle_minute_ist;
+        let mut escalation_persist_ok = true;
+        let result = async {
+            let Some((security_id, symbol)) = dhan_spot_identity(req.target) else {
+                // Unreachable for the pinned 4-target enum — never a panic.
+                return Err(CadenceFetchError::Malformed);
+            };
+            let Some(remaining_ms) =
+                deadline_remaining_ms(req.deadline_epoch_ms, chrono::Utc::now().timestamp_millis())
+            else {
+                return Err(CadenceFetchError::Timeout);
+            };
+            let trading_date = today_ist();
+            let trading_date_nanos = minute_open_ist_nanos(trading_date, 0);
+            let target_nanos = minute_open_ist_nanos(trading_date, req.cycle_minute_ist);
+            // Spot needs no client-id header — only the JWT.
+            let jwt = match Self::auth_at_fire_time() {
+                Ok((jwt, _client_id)) => jwt,
+                Err(e) => {
+                    let mut audit = self.audit_writer.lock().await;
+                    audit_append_best_effort(
+                        &mut audit,
+                        &build_dhan_fetch_audit_row(
+                            target_nanos,
+                            trading_date_nanos,
+                            security_id,
+                            symbol,
+                            0,
+                            0,
+                            RestFetchOutcome::NoToken,
+                            -1,
+                            "no_token",
+                        ),
+                    );
+                    audit_flush_best_effort(&mut audit);
+                    return Err(e);
                 }
-            }
-            Ok(Ok(body)) => Ok(body),
-        };
-        let fetched_body = match fetch_verdict {
-            Ok(body) => body,
-            Err((mapped, audit_outcome, class)) => {
-                let rate_limited_count =
-                    i64::from(matches!(audit_outcome, RestFetchOutcome::RateLimited));
+            };
+            let body = spot_1m_day_request_body(&security_id.to_string(), trading_date);
+            let fetched = tokio::time::timeout(
+                std::time::Duration::from_millis(remaining_ms),
+                spot_1m_fetch_once_unpaced(
+                    &self.client,
+                    &self.intraday_url,
+                    jwt.expose_secret(),
+                    &body,
+                ),
+            )
+            .await;
+            let fetch_verdict = match fetched {
+                Err(_elapsed) => Err((
+                    CadenceFetchError::Timeout,
+                    RestFetchOutcome::Error,
+                    "timeout",
+                )),
+                Ok(Err(failure)) => {
+                    let mapped = map_spot_failure(&failure);
+                    debug!(
+                        target = symbol,
+                        outcome = mapped.as_str(),
+                        msg = %failure.msg,
+                        "dhan cadence spot fetch failed (runner owns retry/ladder)"
+                    );
+                    if failure.rate_limited {
+                        Err((mapped, RestFetchOutcome::RateLimited, "rate_limited"))
+                    } else {
+                        Err((mapped, RestFetchOutcome::Error, "error"))
+                    }
+                }
+                Ok(Ok(body)) => Ok(body),
+            };
+            let fetched_body = match fetch_verdict {
+                Ok(body) => body,
+                Err((mapped, audit_outcome, class)) => {
+                    let rate_limited_count =
+                        i64::from(matches!(audit_outcome, RestFetchOutcome::RateLimited));
+                    let mut audit = self.audit_writer.lock().await;
+                    audit_append_best_effort(
+                        &mut audit,
+                        &build_dhan_fetch_audit_row(
+                            target_nanos,
+                            trading_date_nanos,
+                            security_id,
+                            symbol,
+                            1,
+                            rate_limited_count,
+                            audit_outcome,
+                            -1,
+                            class,
+                        ),
+                    );
+                    audit_flush_best_effort(&mut audit);
+                    return Err(mapped);
+                }
+            };
+            let (candle, _backfill, stats) =
+                parse_intraday_columnar_for_minutes(&fetched_body.text, target_nanos, None);
+            let Some(candle) = candle else {
+                // 2xx without the target minute — the honest empty split:
+                // zero-candle body vs a body serving the day with a LAG.
+                let class = match stats {
+                    Some((rows, _)) if rows > 0 => "empty_stale",
+                    _ => "empty_no_rows",
+                };
                 let mut audit = self.audit_writer.lock().await;
                 audit_append_best_effort(
                     &mut audit,
@@ -312,251 +372,259 @@ impl CadenceExecutor for DhanCadenceExecutor {
                         security_id,
                         symbol,
                         1,
-                        rate_limited_count,
-                        audit_outcome,
+                        0,
+                        RestFetchOutcome::Empty,
                         -1,
                         class,
                     ),
                 );
                 audit_flush_best_effort(&mut audit);
-                return Err(mapped);
-            }
-        };
-        let (candle, _backfill, stats) =
-            parse_intraday_columnar_for_minutes(&fetched_body.text, target_nanos, None);
-        let Some(candle) = candle else {
-            // 2xx without the target minute — the honest empty split:
-            // zero-candle body vs a body serving the day with a LAG.
-            let class = match stats {
-                Some((rows, _)) if rows > 0 => "empty_stale",
-                _ => "empty_no_rows",
+                return Err(CadenceFetchError::Empty);
             };
-            let mut audit = self.audit_writer.lock().await;
-            audit_append_best_effort(
-                &mut audit,
-                &build_dhan_fetch_audit_row(
-                    target_nanos,
-                    trading_date_nanos,
+            let close_to_data_ms =
+                (ist_millis_of_day_now() - (i64::from(req.cycle_minute_ist) + 60) * 1000).max(0);
+            // The per-fire liveness heartbeat (feeds the market-hours-liveness
+            // alarm) — success-gated (fix round 2026-07-17): set ONLY after a
+            // successful vendor fetch carrying the target row. An all-failing
+            // session must leave the gauge unset so
+            // tv-<env>-market-hours-liveness-missing pages (~09:25 IST);
+            // mid-session death after first success remains the pre-existing
+            // documented residual. Never pre-registered at boot: the first
+            // in-session set IS the signal.
+            metrics::gauge!("tv_rest_1m_fire_heartbeat").set(1.0);
+            // Persist → flush ACK → fold handoff (STRICT ordering: an
+            // unpersisted bar must never derive candles — the fold contract).
+            let flush_ok = {
+                let mut writer = self.spot_writer.lock().await;
+                let row = build_spot_1m_row(
+                    &candle,
                     security_id,
                     symbol,
-                    1,
-                    0,
-                    RestFetchOutcome::Empty,
-                    -1,
-                    class,
-                ),
-            );
-            audit_flush_best_effort(&mut audit);
-            return Err(CadenceFetchError::Empty);
-        };
-        let close_to_data_ms =
-            (ist_millis_of_day_now() - (i64::from(req.cycle_minute_ist) + 60) * 1000).max(0);
-        // The per-fire liveness heartbeat (feeds the market-hours-liveness
-        // alarm) — success-gated (fix round 2026-07-17): set ONLY after a
-        // successful vendor fetch carrying the target row. An all-failing
-        // session must leave the gauge unset so
-        // tv-<env>-market-hours-liveness-missing pages (~09:25 IST);
-        // mid-session death after first success remains the pre-existing
-        // documented residual. Never pre-registered at boot: the first
-        // in-session set IS the signal.
-        metrics::gauge!("tv_rest_1m_fire_heartbeat").set(1.0);
-        // Persist → flush ACK → fold handoff (STRICT ordering: an
-        // unpersisted bar must never derive candles — the fold contract).
-        let flush_ok = {
-            let mut writer = self.spot_writer.lock().await;
-            let row = build_spot_1m_row(
-                &candle,
-                security_id,
-                symbol,
-                trading_date_nanos,
-                close_to_data_ms,
-            );
-            if let Err(err) = writer.append_row(&row) {
-                metrics::counter!("tv_spot1m_persist_errors_total", "stage" => "append")
-                    .increment(1);
-                error!(
-                    code = ErrorCode::Spot1m02PersistFailed.code_str(),
-                    stage = "append",
-                    security_id,
-                    ?err,
-                    "SPOT1M-02: cadence spot_1m_rest row append failed"
+                    trading_date_nanos,
+                    close_to_data_ms,
                 );
-                false
-            } else {
-                match writer.flush() {
-                    Ok(()) => true,
-                    Err(err) => {
-                        metrics::counter!("tv_spot1m_persist_errors_total", "stage" => "flush")
-                            .increment(1);
-                        error!(
-                            code = ErrorCode::Spot1m02PersistFailed.code_str(),
-                            stage = "flush",
-                            ?err,
-                            "SPOT1M-02: cadence spot_1m_rest ILP flush failed — \
+                if let Err(err) = writer.append_row(&row) {
+                    metrics::counter!("tv_spot1m_persist_errors_total", "stage" => "append")
+                        .increment(1);
+                    error!(
+                        code = ErrorCode::Spot1m02PersistFailed.code_str(),
+                        stage = "append",
+                        security_id,
+                        ?err,
+                        "SPOT1M-02: cadence spot_1m_rest row append failed"
+                    );
+                    false
+                } else {
+                    match writer.flush() {
+                        Ok(()) => true,
+                        Err(err) => {
+                            metrics::counter!("tv_spot1m_persist_errors_total", "stage" => "flush")
+                                .increment(1);
+                            error!(
+                                code = ErrorCode::Spot1m02PersistFailed.code_str(),
+                                stage = "flush",
+                                ?err,
+                                "SPOT1M-02: cadence spot_1m_rest ILP flush failed — \
                              pending rows discarded (poisoned-buffer defense)"
-                        );
-                        false
+                            );
+                            false
+                        }
                     }
                 }
-            }
-        };
-        if flush_ok {
-            // ONLY after the flush ACK — the sole candles_*/RAM-store feed
-            // on the cadence runtime.
-            crate::rest_candle_fold::send_confirmed_bars(&[
-                crate::rest_candle_fold::ConfirmedBar::from_minute_candle(
-                    Feed::Dhan,
-                    security_id,
-                    EXCHANGE_SEGMENT_IDX_I,
-                    &candle,
-                ),
-            ]);
-        }
-        metrics::counter!("tv_spot1m_fetch_total", "outcome" => "ok").increment(1);
-        #[allow(clippy::cast_precision_loss)] // APPROVED: histogram sample only
-        metrics::histogram!("tv_spot1m_close_to_data_ms").record(close_to_data_ms as f64);
-        {
-            let mut audit = self.audit_writer.lock().await;
+            };
             if flush_ok {
-                for row in stamp_held_ok_rows(
-                    vec![build_dhan_fetch_audit_row(
-                        candle.minute_ts_ist_nanos,
-                        trading_date_nanos,
+                // ONLY after the flush ACK — the sole candles_*/RAM-store feed
+                // on the cadence runtime.
+                crate::rest_candle_fold::send_confirmed_bars(&[
+                    crate::rest_candle_fold::ConfirmedBar::from_minute_candle(
+                        Feed::Dhan,
                         security_id,
-                        symbol,
-                        1,
-                        0,
-                        RestFetchOutcome::Ok,
-                        close_to_data_ms,
-                        "none",
-                    )],
-                    true,
-                    trading_date_nanos,
-                    ist_millis_of_day_now(),
-                ) {
-                    audit_append_best_effort(&mut audit, &row);
-                }
-            } else {
-                // Fetched-but-lost — a persist failure, never dressed as
-                // vendor absence.
-                audit_append_best_effort(
-                    &mut audit,
-                    &build_dhan_fetch_audit_row(
-                        candle.minute_ts_ist_nanos,
-                        trading_date_nanos,
-                        security_id,
-                        symbol,
-                        1,
-                        0,
-                        RestFetchOutcome::NamedGap,
-                        -1,
-                        "persist_failed",
+                        EXCHANGE_SEGMENT_IDX_I,
+                        &candle,
                     ),
-                );
+                ]);
             }
-            audit_flush_best_effort(&mut audit);
+            metrics::counter!("tv_spot1m_fetch_total", "outcome" => "ok").increment(1);
+            #[allow(clippy::cast_precision_loss)] // APPROVED: histogram sample only
+            metrics::histogram!("tv_spot1m_close_to_data_ms").record(close_to_data_ms as f64);
+            {
+                let mut audit = self.audit_writer.lock().await;
+                if flush_ok {
+                    for row in stamp_held_ok_rows(
+                        vec![build_dhan_fetch_audit_row(
+                            candle.minute_ts_ist_nanos,
+                            trading_date_nanos,
+                            security_id,
+                            symbol,
+                            1,
+                            0,
+                            RestFetchOutcome::Ok,
+                            close_to_data_ms,
+                            "none",
+                        )],
+                        true,
+                        trading_date_nanos,
+                        ist_millis_of_day_now(),
+                    ) {
+                        audit_append_best_effort(&mut audit, &row);
+                    }
+                } else {
+                    // Fetched-but-lost — a persist failure, never dressed as
+                    // vendor absence.
+                    audit_append_best_effort(
+                        &mut audit,
+                        &build_dhan_fetch_audit_row(
+                            candle.minute_ts_ist_nanos,
+                            trading_date_nanos,
+                            security_id,
+                            symbol,
+                            1,
+                            0,
+                            RestFetchOutcome::NamedGap,
+                            -1,
+                            "persist_failed",
+                        ),
+                    );
+                }
+                audit_flush_best_effort(&mut audit);
+            }
+            escalation_persist_ok = flush_ok;
+            Ok(SpotSnapshot {
+                price: candle.close,
+                source_minute_ist: req.cycle_minute_ist,
+                received_at_epoch_ms: chrono::Utc::now().timestamp_millis(),
+            })
         }
-        Ok(SpotSnapshot {
-            price: candle.close,
-            source_minute_ist: req.cycle_minute_ist,
-            received_at_epoch_ms: chrono::Utc::now().timestamp_millis(),
-        })
+        .await;
+        // Escalation edge (fix round 2026-07-17): a persist failure counts
+        // as a FAILED minute (fetch-ok-but-lost is not ok — the M1 rule).
+        self.record_leg_outcome(
+            EscalationLeg::Spot,
+            escalation_minute_secs,
+            result.is_ok() && escalation_persist_ok,
+        )
+        .await;
+        result
     }
 
     // TEST-EXEMPT: live-HTTP orchestration — decision legs are pure fns unit-tested below; parse/classify/publish/persist are the tested legacy building blocks.
     async fn fetch_chain(&self, req: ChainFetchRequest) -> Result<ChainFetchOk, CadenceFetchError> {
-        let Some((slot, security_id, symbol)) = dhan_chain_identity(req.underlying) else {
-            return Err(CadenceFetchError::Malformed);
-        };
-        let Some(remaining_ms) =
-            deadline_remaining_ms(req.deadline_epoch_ms, chrono::Utc::now().timestamp_millis())
-        else {
-            return Err(CadenceFetchError::Timeout);
-        };
-        // The runner NEVER guesses an expiry; with no day-locked winner
-        // the fire is an honest Empty (non-arming) — this executor keeps
-        // no warmup fallback of its own.
-        let Some(expiry_date) = req.expiry_yyyymmdd.and_then(yyyymmdd_to_date) else {
-            debug!(
-                symbol,
-                expiry = ?req.expiry_yyyymmdd,
-                "dhan cadence chain fire without a resolved expiry — Empty"
-            );
-            return Err(CadenceFetchError::Empty);
-        };
-        let trading_date = today_ist();
-        let trading_date_nanos = minute_open_ist_nanos(trading_date, 0);
-        let target_nanos = minute_open_ist_nanos(trading_date, req.cycle_minute_ist);
-        let (jwt, client_id) = match Self::auth_at_fire_time() {
-            Ok(pair) => pair,
-            Err(e) => {
-                let mut audit = self.audit_writer.lock().await;
-                chain_audit_append_best_effort(
-                    &mut audit,
-                    &build_dhan_chain_audit_row(
-                        target_nanos,
-                        trading_date_nanos,
-                        security_id,
-                        symbol,
-                        0,
-                        0,
-                        -1,
-                        RestFetchOutcome::NoToken,
-                        "no_token",
-                    ),
-                );
-                chain_audit_flush_best_effort(&mut audit);
-                return Err(e);
-            }
-        };
-        let expiry_str = expiry_date.format("%Y-%m-%d").to_string();
-        let body = chain_request_body(security_id, &expiry_str);
-        let fetched = tokio::time::timeout(
-            std::time::Duration::from_millis(remaining_ms),
-            chain_fetch_once_unpaced(
-                &self.client,
-                &self.chain_url,
-                jwt.expose_secret(),
-                &client_id,
-                &body,
-            ),
-        )
-        .await;
-        let body_text = match fetched {
-            Err(_elapsed) => {
-                let mut audit = self.audit_writer.lock().await;
-                chain_audit_append_best_effort(
-                    &mut audit,
-                    &build_dhan_chain_audit_row(
-                        target_nanos,
-                        trading_date_nanos,
-                        security_id,
-                        symbol,
-                        1,
-                        0,
-                        -1,
-                        RestFetchOutcome::Error,
-                        "timeout",
-                    ),
-                );
-                chain_audit_flush_best_effort(&mut audit);
+        let escalation_minute_secs = req.cycle_minute_ist;
+        let mut escalation_persist_ok = true;
+        let result = async {
+            let Some((slot, security_id, symbol)) = dhan_chain_identity(req.underlying) else {
+                return Err(CadenceFetchError::Malformed);
+            };
+            let Some(remaining_ms) =
+                deadline_remaining_ms(req.deadline_epoch_ms, chrono::Utc::now().timestamp_millis())
+            else {
                 return Err(CadenceFetchError::Timeout);
-            }
-            Ok(Err(failure)) => {
-                let mapped = map_chain_failure(&failure);
+            };
+            // The runner NEVER guesses an expiry; with no day-locked winner
+            // the fire is an honest Empty (non-arming) — this executor keeps
+            // no warmup fallback of its own.
+            let Some(expiry_date) = req.expiry_yyyymmdd.and_then(yyyymmdd_to_date) else {
                 debug!(
                     symbol,
-                    outcome = mapped.as_str(),
-                    msg = %failure.msg,
-                    "dhan cadence chain fetch failed (runner owns retry/ladder)"
+                    expiry = ?req.expiry_yyyymmdd,
+                    "dhan cadence chain fire without a resolved expiry — Empty"
                 );
-                let (audit_outcome, class) = if failure.rate_limited {
-                    (RestFetchOutcome::RateLimited, "rate_limited")
-                } else if failure.entitlement {
-                    (RestFetchOutcome::Error, "entitlement")
-                } else {
-                    (RestFetchOutcome::Error, "error")
-                };
+                return Err(CadenceFetchError::Empty);
+            };
+            let trading_date = today_ist();
+            let trading_date_nanos = minute_open_ist_nanos(trading_date, 0);
+            let target_nanos = minute_open_ist_nanos(trading_date, req.cycle_minute_ist);
+            let (jwt, client_id) = match Self::auth_at_fire_time() {
+                Ok(pair) => pair,
+                Err(e) => {
+                    let mut audit = self.audit_writer.lock().await;
+                    chain_audit_append_best_effort(
+                        &mut audit,
+                        &build_dhan_chain_audit_row(
+                            target_nanos,
+                            trading_date_nanos,
+                            security_id,
+                            symbol,
+                            0,
+                            0,
+                            -1,
+                            RestFetchOutcome::NoToken,
+                            "no_token",
+                        ),
+                    );
+                    chain_audit_flush_best_effort(&mut audit);
+                    return Err(e);
+                }
+            };
+            let expiry_str = expiry_date.format("%Y-%m-%d").to_string();
+            let body = chain_request_body(security_id, &expiry_str);
+            let fetched = tokio::time::timeout(
+                std::time::Duration::from_millis(remaining_ms),
+                chain_fetch_once_unpaced(
+                    &self.client,
+                    &self.chain_url,
+                    jwt.expose_secret(),
+                    &client_id,
+                    &body,
+                ),
+            )
+            .await;
+            let body_text = match fetched {
+                Err(_elapsed) => {
+                    let mut audit = self.audit_writer.lock().await;
+                    chain_audit_append_best_effort(
+                        &mut audit,
+                        &build_dhan_chain_audit_row(
+                            target_nanos,
+                            trading_date_nanos,
+                            security_id,
+                            symbol,
+                            1,
+                            0,
+                            -1,
+                            RestFetchOutcome::Error,
+                            "timeout",
+                        ),
+                    );
+                    chain_audit_flush_best_effort(&mut audit);
+                    return Err(CadenceFetchError::Timeout);
+                }
+                Ok(Err(failure)) => {
+                    let mapped = map_chain_failure(&failure);
+                    debug!(
+                        symbol,
+                        outcome = mapped.as_str(),
+                        msg = %failure.msg,
+                        "dhan cadence chain fetch failed (runner owns retry/ladder)"
+                    );
+                    let (audit_outcome, class) = if failure.rate_limited {
+                        (RestFetchOutcome::RateLimited, "rate_limited")
+                    } else if failure.entitlement {
+                        (RestFetchOutcome::Error, "entitlement")
+                    } else {
+                        (RestFetchOutcome::Error, "error")
+                    };
+                    let mut audit = self.audit_writer.lock().await;
+                    chain_audit_append_best_effort(
+                        &mut audit,
+                        &build_dhan_chain_audit_row(
+                            target_nanos,
+                            trading_date_nanos,
+                            security_id,
+                            symbol,
+                            1,
+                            i64::from(failure.status.unwrap_or(0)),
+                            -1,
+                            audit_outcome,
+                            class,
+                        ),
+                    );
+                    chain_audit_flush_best_effort(&mut audit);
+                    return Err(mapped);
+                }
+                Ok(Ok(text)) => text,
+            };
+            let Some(chain) = parse_option_chain(&body_text) else {
                 let mut audit = self.audit_writer.lock().await;
                 chain_audit_append_best_effort(
                     &mut audit,
@@ -566,199 +634,191 @@ impl CadenceExecutor for DhanCadenceExecutor {
                         security_id,
                         symbol,
                         1,
-                        i64::from(failure.status.unwrap_or(0)),
+                        200,
                         -1,
-                        audit_outcome,
-                        class,
+                        RestFetchOutcome::Error,
+                        "error",
                     ),
                 );
                 chain_audit_flush_best_effort(&mut audit);
-                return Err(mapped);
+                return Err(CadenceFetchError::Malformed);
+            };
+            if chain.legs.is_empty() {
+                let mut audit = self.audit_writer.lock().await;
+                chain_audit_append_best_effort(
+                    &mut audit,
+                    &build_dhan_chain_audit_row(
+                        target_nanos,
+                        trading_date_nanos,
+                        security_id,
+                        symbol,
+                        1,
+                        200,
+                        -1,
+                        RestFetchOutcome::Empty,
+                        "empty_chain",
+                    ),
+                );
+                chain_audit_flush_best_effort(&mut audit);
+                return Err(CadenceFetchError::Empty);
             }
-            Ok(Ok(text)) => text,
-        };
-        let Some(chain) = parse_option_chain(&body_text) else {
-            let mut audit = self.audit_writer.lock().await;
-            chain_audit_append_best_effort(
-                &mut audit,
-                &build_dhan_chain_audit_row(
-                    target_nanos,
-                    trading_date_nanos,
-                    security_id,
-                    symbol,
-                    1,
-                    200,
-                    -1,
-                    RestFetchOutcome::Error,
-                    "error",
-                ),
-            );
-            chain_audit_flush_best_effort(&mut audit);
-            return Err(CadenceFetchError::Malformed);
-        };
-        if chain.legs.is_empty() {
-            let mut audit = self.audit_writer.lock().await;
-            chain_audit_append_best_effort(
-                &mut audit,
-                &build_dhan_chain_audit_row(
-                    target_nanos,
-                    trading_date_nanos,
-                    security_id,
-                    symbol,
-                    1,
-                    200,
-                    -1,
-                    RestFetchOutcome::Empty,
-                    "empty_chain",
-                ),
-            );
-            chain_audit_flush_best_effort(&mut audit);
-            return Err(CadenceFetchError::Empty);
-        }
-        let close_to_data_ms =
-            (ist_millis_of_day_now() - (i64::from(req.cycle_minute_ist) + 60) * 1000).max(0);
-        // Classify ONCE per fire; the RAM snapshot rows are built BEFORE
-        // the persist loop so a persist failure can never degrade the RAM
-        // decision surface (the legacy Found-arm ordering).
-        let cls = classify_chain_legs(
-            symbol,
-            chain.underlying_spot,
-            chain.legs.iter().map(|l| (l.strike, l.leg, l.last_price)),
-        );
-        {
-            let mut latches = self.moneyness_latches.lock().await;
-            let minute_label = format!(
-                "{:02}:{:02}",
-                req.cycle_minute_ist / 3600,
-                (req.cycle_minute_ist % 3600) / 60
-            );
-            record_chain_moneyness_observability(
-                OPTION_CHAIN_1M_FEED_DHAN,
+            let close_to_data_ms =
+                (ist_millis_of_day_now() - (i64::from(req.cycle_minute_ist) + 60) * 1000).max(0);
+            // Classify ONCE per fire; the RAM snapshot rows are built BEFORE
+            // the persist loop so a persist failure can never degrade the RAM
+            // decision surface (the legacy Found-arm ordering).
+            let cls = classify_chain_legs(
                 symbol,
-                slot,
-                trading_date,
-                &minute_label,
-                &cls,
-                &mut latches,
+                chain.underlying_spot,
+                chain.legs.iter().map(|l| (l.strike, l.leg, l.last_price)),
             );
-        }
-        let expiry_nanos = minute_open_ist_nanos(expiry_date, 0);
-        let fetched_at = fetched_at_ist_nanos_now();
-        let underlying_sid = i64::try_from(security_id).unwrap_or(i64::MAX);
-        let mut persist_failed = false;
-        {
-            let mut writer = self.chain_writer.lock().await;
-            for (leg, leg_moneyness) in chain.legs.iter().zip(cls.row_moneyness.iter()) {
-                let row = OptionChain1mRow {
-                    ts_ist_nanos: target_nanos,
-                    trading_date_ist_nanos: trading_date_nanos,
-                    underlying_security_id: underlying_sid,
-                    underlying_symbol: symbol,
-                    expiry_ist_nanos: expiry_nanos,
-                    strike: leg.strike,
-                    leg: leg.leg,
-                    contract_security_id: leg.contract_security_id,
-                    last_price: leg.last_price,
-                    iv: leg.implied_volatility,
-                    delta: leg.delta,
-                    theta: leg.theta,
-                    gamma: leg.gamma,
-                    vega: leg.vega,
-                    oi: leg.oi,
-                    volume: leg.volume,
-                    previous_oi: leg.previous_oi,
-                    underlying_spot: chain.underlying_spot,
-                    fetched_at_ist_nanos: fetched_at,
-                    moneyness: leg_moneyness.as_str(),
-                };
-                if let Err(err) = writer.append_row(&row) {
+            {
+                let mut latches = self.moneyness_latches.lock().await;
+                let minute_label = format!(
+                    "{:02}:{:02}",
+                    req.cycle_minute_ist / 3600,
+                    (req.cycle_minute_ist % 3600) / 60
+                );
+                record_chain_moneyness_observability(
+                    OPTION_CHAIN_1M_FEED_DHAN,
+                    symbol,
+                    slot,
+                    trading_date,
+                    &minute_label,
+                    &cls,
+                    &mut latches,
+                );
+            }
+            let expiry_nanos = minute_open_ist_nanos(expiry_date, 0);
+            let fetched_at = fetched_at_ist_nanos_now();
+            let underlying_sid = i64::try_from(security_id).unwrap_or(i64::MAX);
+            let mut persist_failed = false;
+            {
+                let mut writer = self.chain_writer.lock().await;
+                for (leg, leg_moneyness) in chain.legs.iter().zip(cls.row_moneyness.iter()) {
+                    let row = OptionChain1mRow {
+                        ts_ist_nanos: target_nanos,
+                        trading_date_ist_nanos: trading_date_nanos,
+                        underlying_security_id: underlying_sid,
+                        underlying_symbol: symbol,
+                        expiry_ist_nanos: expiry_nanos,
+                        strike: leg.strike,
+                        leg: leg.leg,
+                        contract_security_id: leg.contract_security_id,
+                        last_price: leg.last_price,
+                        iv: leg.implied_volatility,
+                        delta: leg.delta,
+                        theta: leg.theta,
+                        gamma: leg.gamma,
+                        vega: leg.vega,
+                        oi: leg.oi,
+                        volume: leg.volume,
+                        previous_oi: leg.previous_oi,
+                        underlying_spot: chain.underlying_spot,
+                        fetched_at_ist_nanos: fetched_at,
+                        moneyness: leg_moneyness.as_str(),
+                    };
+                    if let Err(err) = writer.append_row(&row) {
+                        persist_failed = true;
+                        metrics::counter!("tv_chain1m_persist_errors_total", "stage" => "append")
+                            .increment(1);
+                        error!(
+                            code = ErrorCode::Chain03PersistFailed.code_str(),
+                            stage = "append",
+                            symbol,
+                            ?err,
+                            "CHAIN-03: cadence option_chain_1m row append failed"
+                        );
+                        break;
+                    }
+                }
+                if !persist_failed && let Err(err) = writer.flush() {
                     persist_failed = true;
-                    metrics::counter!("tv_chain1m_persist_errors_total", "stage" => "append")
+                    metrics::counter!("tv_chain1m_persist_errors_total", "stage" => "flush")
                         .increment(1);
                     error!(
                         code = ErrorCode::Chain03PersistFailed.code_str(),
-                        stage = "append",
-                        symbol,
+                        stage = "flush",
                         ?err,
-                        "CHAIN-03: cadence option_chain_1m row append failed"
-                    );
-                    break;
-                }
-            }
-            if !persist_failed && let Err(err) = writer.flush() {
-                persist_failed = true;
-                metrics::counter!("tv_chain1m_persist_errors_total", "stage" => "flush")
-                    .increment(1);
-                error!(
-                    code = ErrorCode::Chain03PersistFailed.code_str(),
-                    stage = "flush",
-                    ?err,
-                    "CHAIN-03: cadence option_chain_1m ILP flush failed — \
+                        "CHAIN-03: cadence option_chain_1m ILP flush failed — \
                      pending rows discarded (poisoned-buffer defense)"
-                );
-            }
-        }
-        {
-            let mut audit = self.audit_writer.lock().await;
-            if persist_failed {
-                chain_audit_append_best_effort(
-                    &mut audit,
-                    &build_dhan_chain_audit_row(
-                        target_nanos,
-                        trading_date_nanos,
-                        security_id,
-                        symbol,
-                        1,
-                        200,
-                        -1,
-                        RestFetchOutcome::NamedGap,
-                        "persist_failed",
-                    ),
-                );
-            } else {
-                for row in stamp_held_ok_rows(
-                    vec![build_dhan_chain_audit_row(
-                        target_nanos,
-                        trading_date_nanos,
-                        security_id,
-                        symbol,
-                        1,
-                        200,
-                        close_to_data_ms,
-                        RestFetchOutcome::Ok,
-                        "none",
-                    )],
-                    true,
-                    trading_date_nanos,
-                    ist_millis_of_day_now(),
-                ) {
-                    chain_audit_append_best_effort(&mut audit, &row);
+                    );
                 }
             }
-            chain_audit_flush_best_effort(&mut audit);
+            {
+                let mut audit = self.audit_writer.lock().await;
+                if persist_failed {
+                    chain_audit_append_best_effort(
+                        &mut audit,
+                        &build_dhan_chain_audit_row(
+                            target_nanos,
+                            trading_date_nanos,
+                            security_id,
+                            symbol,
+                            1,
+                            200,
+                            -1,
+                            RestFetchOutcome::NamedGap,
+                            "persist_failed",
+                        ),
+                    );
+                } else {
+                    for row in stamp_held_ok_rows(
+                        vec![build_dhan_chain_audit_row(
+                            target_nanos,
+                            trading_date_nanos,
+                            security_id,
+                            symbol,
+                            1,
+                            200,
+                            close_to_data_ms,
+                            RestFetchOutcome::Ok,
+                            "none",
+                        )],
+                        true,
+                        trading_date_nanos,
+                        ist_millis_of_day_now(),
+                    ) {
+                        chain_audit_append_best_effort(&mut audit, &row);
+                    }
+                }
+                chain_audit_flush_best_effort(&mut audit);
+            }
+            // The embedded underlying spot BEFORE `cls` moves into publish
+            // (Dhan val_f64 defaults an absent last_price to 0.0 → None).
+            let underlying_spot = (chain.underlying_spot.is_finite()
+                && chain.underlying_spot > 0.0)
+                .then_some(chain.underlying_spot);
+            // Publish is persist-independent (the RAM decision surface is
+            // never degraded by a QuestDB outage).
+            publish_chain_moneyness_snapshot(
+                Feed::Dhan,
+                symbol,
+                target_nanos,
+                fetched_at,
+                chain.underlying_spot,
+                expiry_nanos,
+                cls,
+            );
+            metrics::counter!("tv_chain1m_fetch_total", "outcome" => "ok").increment(1);
+            #[allow(clippy::cast_precision_loss)] // APPROVED: histogram sample only
+            metrics::histogram!("tv_chain1m_close_to_data_ms").record(close_to_data_ms as f64);
+            escalation_persist_ok = !persist_failed;
+            Ok(ChainFetchOk {
+                underlying_spot,
+                published_to_registry: true,
+            })
         }
-        // The embedded underlying spot BEFORE `cls` moves into publish
-        // (Dhan val_f64 defaults an absent last_price to 0.0 → None).
-        let underlying_spot = (chain.underlying_spot.is_finite() && chain.underlying_spot > 0.0)
-            .then_some(chain.underlying_spot);
-        // Publish is persist-independent (the RAM decision surface is
-        // never degraded by a QuestDB outage).
-        publish_chain_moneyness_snapshot(
-            Feed::Dhan,
-            symbol,
-            target_nanos,
-            fetched_at,
-            chain.underlying_spot,
-            expiry_nanos,
-            cls,
-        );
-        metrics::counter!("tv_chain1m_fetch_total", "outcome" => "ok").increment(1);
-        #[allow(clippy::cast_precision_loss)] // APPROVED: histogram sample only
-        metrics::histogram!("tv_chain1m_close_to_data_ms").record(close_to_data_ms as f64);
-        Ok(ChainFetchOk {
-            underlying_spot,
-            published_to_registry: true,
-        })
+        .await;
+        // Escalation edge (fix round 2026-07-17): persist failure = failed
+        // minute (the M1 rule).
+        self.record_leg_outcome(
+            EscalationLeg::Chain,
+            escalation_minute_secs,
+            result.is_ok() && escalation_persist_ok,
+        )
+        .await;
+        result
     }
 
     // TEST-EXEMPT: live-HTTP orchestration — mapping/parse legs are pure fns tested below + in option_chain_1m_boot.
