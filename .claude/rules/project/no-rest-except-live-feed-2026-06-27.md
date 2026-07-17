@@ -540,6 +540,15 @@ that they are ENABLED classes, permanently.
   2026-07-14 empty-class split + one-shot probes). A vendor not serving
   data is a measured degrade, never a reason to call the leg "disabled".
 
+**2026-07-17 truth-sync:** the statement above ('Both legs are enabled = true
+in config/base.toml and running in prod') describes the pre-cadence state. As
+of 2026-07-17 the four legacy per-minute leg sections are `enabled = false` in
+base.toml and the SAME pulls fire from the cadence scheduler lane
+(`[cadence] enabled = true`, real broker executors — see
+`cadence-error-codes.md` §0c). Endpoints, SIDs, tables, DEDUP keys and budgets
+are unchanged; only the fire-timing owner moved. The §8/§9 grants continue to
+govern the cadence executors' calls.
+
 ## §11.3 What stays REMOVED (explicit, per Quote 2)
 
 **`POST /v2/marketfeed/quote` and `POST /v2/marketfeed/ltp` REMAIN REMOVED**

@@ -241,22 +241,22 @@ pub struct GrowwSpot1mTaskParams {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct GrowwSpotTarget {
     /// The Groww candles identity (`groww_symbol`, e.g. `NSE-NIFTY`).
-    groww_symbol: String,
+    pub(crate) groww_symbol: String,
     /// Human symbol persisted on rows (`NIFTY` / ... / `INDIA VIX`).
-    symbol: &'static str,
+    pub(crate) symbol: &'static str,
     /// Groww exchange (`NSE` / `BSE`).
-    exchange: String,
+    pub(crate) exchange: String,
     /// Groww segment (`CASH` for indices).
-    segment: String,
+    pub(crate) segment: String,
     /// The live-lane canonical Groww index id
     /// ([`stable_index_security_id`] of the groww_symbol).
-    security_id: i64,
+    pub(crate) security_id: i64,
     /// `true` for the 3 §38 core indices; `false` for INDIA VIX.
-    core: bool,
+    pub(crate) core: bool,
 }
 
 /// The 3 CORE targets from the const table. Pure.
-fn core_spot_targets() -> Vec<GrowwSpotTarget> {
+pub(crate) fn core_spot_targets() -> Vec<GrowwSpotTarget> {
     GROWW_SPOT_1M_SYMBOLS
         .iter()
         .map(
@@ -322,7 +322,7 @@ fn vix_target_from_watch_doc(doc: &WatchFileDoc, expected_date: &str) -> Option<
 /// (counted + warned once by the caller; the 3 core targets are never
 /// blocked). Cold path, at most one small file read per minute.
 // TEST-EXEMPT: thin fs-read shim — the parse + match + fail-closed arms are the pure vix_target_from_watch_doc, unit-tested below.
-fn try_resolve_vix_target(trading_date: NaiveDate) -> Option<GrowwSpotTarget> {
+pub(crate) fn try_resolve_vix_target(trading_date: NaiveDate) -> Option<GrowwSpotTarget> {
     let date = trading_date.format("%Y-%m-%d").to_string();
     let path = crate::groww_watch_paths::watch_file_path_for(Path::new(GROWW_DATA_DIR), &date);
     let json = std::fs::read_to_string(&path).ok()?;
@@ -572,7 +572,7 @@ pub(crate) struct GrowwCandleRow {
 /// defensively (both forms). Malformed bodies/rows parse to empty/skipped
 /// + counted — never a panic (typed-degrade discipline). `volume` may be
 /// null (indices) → 0; non-finite prices skip the row. Pure.
-fn parse_groww_1m_candles(body: &str) -> (Vec<MinuteCandle>, GrowwParseStats) {
+pub(crate) fn parse_groww_1m_candles(body: &str) -> (Vec<MinuteCandle>, GrowwParseStats) {
     let (rows, stats) = parse_groww_1m_candle_rows(body);
     let candles = rows
         .into_iter()
@@ -1198,12 +1198,12 @@ enum SymbolFetchOutcome {
 /// One attempt's typed failure — classification from the REAL
 /// `StatusCode`, never a substring scan.
 #[derive(Clone, Debug, PartialEq)]
-struct FetchFailure {
+pub(crate) struct FetchFailure {
     /// HTTP status (0 = the request never got a response).
-    status: u16,
-    rate_limited: bool,
-    auth_rejected: bool,
-    msg: String,
+    pub(crate) status: u16,
+    pub(crate) rate_limited: bool,
+    pub(crate) auth_rejected: bool,
+    pub(crate) msg: String,
 }
 
 /// Per-ladder forensics for the `rest_fetch_audit` row: attempts actually
@@ -1247,7 +1247,7 @@ async fn read_body_capped(mut resp: reqwest::Response) -> Result<String, String>
 /// `Authorization` header — never in the URL, never logged). A 429
 /// additionally records the live-probe (e) shape: endpoint + Retry-After
 /// presence + sanitized body, via one bounded `warn!` per occurrence.
-async fn groww_fetch_once(
+pub(crate) async fn groww_fetch_once(
     client: &reqwest::Client,
     url: &str,
     query: &[(&'static str, String); 6],
@@ -1518,7 +1518,7 @@ async fn fetch_minute_bounded(
 /// `close_to_data_ms` stamp is the caller's HONEST retrieval delay
 /// (own-fire latency, or the > 60 s real delay for a backfilled/swept
 /// minute).
-fn build_groww_spot_1m_row(
+pub(crate) fn build_groww_spot_1m_row(
     candle: &MinuteCandle,
     security_id: i64,
     symbol: &'static str,
@@ -1594,7 +1594,10 @@ fn build_fetch_audit_row(
 /// Best-effort forensics append: a failure logs (coded) + counts and
 /// RETURNS — the fetch loop, the verdict and the failure edge are never
 /// affected by the forensics leg.
-fn audit_append_best_effort(audit_writer: &mut RestFetchAuditWriter, row: &RestFetchAuditRow) {
+pub(crate) fn audit_append_best_effort(
+    audit_writer: &mut RestFetchAuditWriter,
+    row: &RestFetchAuditRow,
+) {
     if let Err(err) = audit_writer.append_row(row) {
         metrics::counter!("tv_rest_fetch_audit_persist_errors_total", "stage" => "audit_append")
             .increment(1);
@@ -1610,7 +1613,7 @@ fn audit_append_best_effort(audit_writer: &mut RestFetchAuditWriter, row: &RestF
 }
 
 /// Best-effort forensics flush (same never-affects-the-loop contract).
-fn audit_flush_best_effort(audit_writer: &mut RestFetchAuditWriter) {
+pub(crate) fn audit_flush_best_effort(audit_writer: &mut RestFetchAuditWriter) {
     if let Err(err) = audit_writer.flush() {
         metrics::counter!("tv_rest_fetch_audit_persist_errors_total", "stage" => "audit_flush")
             .increment(1);
