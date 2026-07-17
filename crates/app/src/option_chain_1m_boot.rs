@@ -764,7 +764,8 @@ fn today_ist() -> NaiveDate {
 }
 
 /// Retrieval wall-clock instant as IST nanoseconds.
-fn fetched_at_ist_nanos_now() -> i64 {
+/// `pub(crate)` since 2026-07-17: shared with `crate::dhan_cadence_executor`.
+pub(crate) fn fetched_at_ist_nanos_now() -> i64 {
     chrono::Utc::now()
         .timestamp_nanos_opt()
         .unwrap_or(0)
@@ -814,25 +815,40 @@ async fn read_body_capped(mut resp: reqwest::Response) -> Result<String, String>
     String::from_utf8(buf).map_err(|_| "body not valid UTF-8".to_string())
 }
 
+/// One UNPACED attempt's typed failure (2026-07-17 cadence-executor
+/// refactor): the REAL status (`None` = the send leg never got a
+/// response), the 429 verdict, the parsed `Retry-After` hint in
+/// milliseconds, and the entitlement classification — so the cadence lane
+/// can map broker outcomes without touching the legacy limiter. `msg` is
+/// the bounded secret-redacted capture (DHAN-REST-400 discipline).
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ChainFetchUnpacedFailure {
+    pub(crate) status: Option<u16>,
+    pub(crate) rate_limited: bool,
+    pub(crate) retry_after_ms: Option<i64>,
+    pub(crate) entitlement: bool,
+    pub(crate) msg: String,
+}
+
 /// One option-chain-family REST round-trip (chain OR expirylist — they
-/// share headers + auth + classification) → the raw 2xx body text. `Err`
-/// carries the entitlement verdict + status + token-redacted URL +
-/// ≤300-char secret-redacted body.
-async fn chain_fetch_once(
+/// share headers + auth + classification) → the raw 2xx body text — the
+/// UNPACED inner (2026-07-17 cadence-executor refactor): NO limiter
+/// acquire, NO `record_429` — pacing/tuning is the CALLER's
+/// responsibility. The legacy per-minute legs call the
+/// [`chain_fetch_once`] wrapper below (which routes through the shared
+/// Dhan Data-API limiter, unchanged behavior); the cadence executor calls
+/// THIS fn directly because the cadence lane's pacing authority is the
+/// gate registry, never the limiter (`cadence-error-codes.md` §0b/§3b
+/// item 1). `Err` carries the entitlement verdict + status + 429 verdict
+/// + parsed `Retry-After` hint + token-redacted URL + ≤300-char
+/// secret-redacted body.
+pub(crate) async fn chain_fetch_once_unpaced(
     client: &reqwest::Client,
     url: &str,
     jwt: &str,
     client_id: &str,
     body: &Value,
-) -> Result<String, ChainFetchFailure> {
-    // 2026-07-14 operator pacing directive: the option-chain API routes
-    // through the SAME shared Dhan Data-API limiter as the spot leg
-    // (per-minute chain fires + expirylist warmup/probe all funnel
-    // through this fn). The 1-unique-per-3s per-underlying min-gap stays
-    // LAYERED ON TOP, unchanged.
-    crate::dhan_data_api_limiter::shared_dhan_data_api_limiter()
-        .acquire()
-        .await;
+) -> Result<String, ChainFetchUnpacedFailure> {
     let resp = client
         .post(url)
         .header("access-token", jwt)
@@ -843,7 +859,10 @@ async fn chain_fetch_once(
         .json(body)
         .send()
         .await
-        .map_err(|e| ChainFetchFailure {
+        .map_err(|e| ChainFetchUnpacedFailure {
+            status: None,
+            rate_limited: false,
+            retry_after_ms: None,
             entitlement: false,
             // Same secret-redact + 300-char bound as body captures — a
             // reqwest send error can echo the URL/peer text unbounded.
@@ -851,13 +870,20 @@ async fn chain_fetch_once(
         })?;
     let status = resp.status();
     if !status.is_success() {
-        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            // Feed the shared self-tuner from the REAL StatusCode — chain
-            // 429s and spot 429s tune ONE pacing decision.
-            crate::dhan_data_api_limiter::shared_dhan_data_api_limiter().record_429();
-        }
+        let rate_limited = status == reqwest::StatusCode::TOO_MANY_REQUESTS;
+        // Retry-After BEFORE the body read consumes the response — the
+        // delta-seconds form only; an HTTP-date (or absent) header reads
+        // `None`, never a guessed backoff.
+        let retry_after_ms = resp
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(crate::spot_1m_rest_boot::retry_after_header_ms);
         let error_body = read_body_capped(resp).await.unwrap_or_default();
-        return Err(ChainFetchFailure {
+        return Err(ChainFetchUnpacedFailure {
+            status: Some(status.as_u16()),
+            rate_limited,
+            retry_after_ms,
             entitlement: is_entitlement_reject(status.as_u16(), &error_body),
             msg: format!(
                 "http {status} url={} body={}",
@@ -868,9 +894,42 @@ async fn chain_fetch_once(
     }
     read_body_capped(resp)
         .await
-        .map_err(|msg| ChainFetchFailure {
+        .map_err(|msg| ChainFetchUnpacedFailure {
+            status: Some(status.as_u16()),
+            rate_limited: false,
+            retry_after_ms: None,
             entitlement: false,
             msg,
+        })
+}
+
+/// The LEGACY paced wrapper — behavior-preserving for the per-minute
+/// chain fires + expirylist warmup/probe (2026-07-14 operator pacing
+/// directive: the option-chain API routes through the SAME shared Dhan
+/// Data-API limiter as the spot leg; the 1-unique-per-3s per-underlying
+/// min-gap stays LAYERED ON TOP, unchanged): waits for a permit, delegates
+/// to the unpaced inner, and feeds the shared self-tuner on a REAL 429 —
+/// chain 429s and spot 429s tune ONE pacing decision.
+async fn chain_fetch_once(
+    client: &reqwest::Client,
+    url: &str,
+    jwt: &str,
+    client_id: &str,
+    body: &Value,
+) -> Result<String, ChainFetchFailure> {
+    crate::dhan_data_api_limiter::shared_dhan_data_api_limiter()
+        .acquire()
+        .await;
+    chain_fetch_once_unpaced(client, url, jwt, client_id, body)
+        .await
+        .map_err(|failure| {
+            if failure.rate_limited {
+                crate::dhan_data_api_limiter::shared_dhan_data_api_limiter().record_429();
+            }
+            ChainFetchFailure {
+                entitlement: failure.entitlement,
+                msg: failure.msg,
+            }
         })
 }
 
@@ -1495,8 +1554,8 @@ struct ChainServingHealth {
 /// sentinel (measured only into the `tv_chain1m_fetch_duration_ms`
 /// histogram — threading it out of the ladder is out of scope, stated
 /// honestly). Pure.
-#[allow(clippy::too_many_arguments)] // APPROVED: private forensics builder — a struct would be pure ceremony
-fn build_dhan_chain_audit_row(
+#[allow(clippy::too_many_arguments)] // APPROVED: crate-private forensics builder — a struct would be pure ceremony
+pub(crate) fn build_dhan_chain_audit_row(
     target_minute_ist_nanos: i64,
     trading_date_nanos: i64,
     security_id: u64,
@@ -1533,7 +1592,7 @@ fn build_dhan_chain_audit_row(
 /// verdict and the failure edge are never affected by the forensics leg.
 /// Dhan emit sites stay field-less on the CHAIN codes per the rule-file
 /// convention (grep-split by `feed="groww"`).
-fn chain_audit_append_best_effort(
+pub(crate) fn chain_audit_append_best_effort(
     audit_writer: &mut RestFetchAuditWriter,
     row: &RestFetchAuditRow,
 ) {
@@ -1551,7 +1610,7 @@ fn chain_audit_append_best_effort(
 }
 
 /// Best-effort forensics flush (same never-affects-the-loop contract).
-fn chain_audit_flush_best_effort(audit_writer: &mut RestFetchAuditWriter) {
+pub(crate) fn chain_audit_flush_best_effort(audit_writer: &mut RestFetchAuditWriter) {
     if let Err(err) = audit_writer.flush() {
         metrics::counter!("tv_rest_fetch_audit_persist_errors_total", "stage" => "audit_flush")
             .increment(1);

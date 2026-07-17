@@ -57,6 +57,11 @@ const CONFIG_KEY: &str = "config.dhan_data_api.target_rps";
 #[test]
 fn ratchet_spot_fetch_once_routes_through_shared_limiter() {
     let src = read_app_src("src/spot_1m_rest_boot.rs");
+    // The PACED wrapper: acquires the shared permit and feeds the
+    // classified rate-limited verdict to the self-tuner. Since the
+    // cadence refactor the REAL StatusCode classification lives in the
+    // `*_unpaced` inner — the wrapper consumes its typed
+    // `failure.rate_limited` flag (never a substring scan).
     let body = fn_body(&src, "async fn spot_1m_fetch_once(");
     assert!(
         body.contains(ACQUIRE) && body.contains(".acquire()"),
@@ -65,14 +70,25 @@ fn ratchet_spot_fetch_once_routes_through_shared_limiter() {
          (fires, ladder re-polls, sweep, diagnostic probes) funnels through"
     );
     assert!(
-        body.contains(RECORD_429) && body.contains("TOO_MANY_REQUESTS"),
-        "spot_1m_fetch_once must feed REAL StatusCode 429s to the self-tuner"
+        body.contains(RECORD_429) && body.contains("failure.rate_limited"),
+        "spot_1m_fetch_once must feed the typed rate_limited verdict to \
+         the self-tuner (the wrapper half of the 429→tuner chain)"
+    );
+    // The UNPACED inner: the sole place the rate-limited flag is derived —
+    // from the REAL StatusCode, never a substring scan.
+    let inner = fn_body(&src, "async fn spot_1m_fetch_once_unpaced(");
+    assert!(
+        inner.contains("TOO_MANY_REQUESTS"),
+        "spot_1m_fetch_once_unpaced must classify 429 from the REAL \
+         StatusCode::TOO_MANY_REQUESTS (the inner half of the chain)"
     );
 }
 
 #[test]
 fn ratchet_chain_fetch_once_routes_through_shared_limiter() {
     let src = read_app_src("src/option_chain_1m_boot.rs");
+    // Same two-half pin as the spot leg: paced wrapper acquires + feeds
+    // the typed verdict; unpaced inner derives it from the REAL status.
     let body = fn_body(&src, "async fn chain_fetch_once(");
     assert!(
         body.contains(ACQUIRE) && body.contains(".acquire()"),
@@ -81,8 +97,15 @@ fn ratchet_chain_fetch_once_routes_through_shared_limiter() {
          option-chain API through the SAME limiter)"
     );
     assert!(
-        body.contains(RECORD_429) && body.contains("TOO_MANY_REQUESTS"),
-        "chain_fetch_once must feed REAL StatusCode 429s to the self-tuner"
+        body.contains(RECORD_429) && body.contains("failure.rate_limited"),
+        "chain_fetch_once must feed the typed rate_limited verdict to the \
+         self-tuner (the wrapper half of the 429→tuner chain)"
+    );
+    let inner = fn_body(&src, "async fn chain_fetch_once_unpaced(");
+    assert!(
+        inner.contains("TOO_MANY_REQUESTS"),
+        "chain_fetch_once_unpaced must classify 429 from the REAL \
+         StatusCode::TOO_MANY_REQUESTS (the inner half of the chain)"
     );
 }
 
