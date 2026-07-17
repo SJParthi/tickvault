@@ -647,6 +647,7 @@ async fn read_feed_map(
 /// Run the comparator for one trading day. Best-effort — ensures tables,
 /// reads both feeds, compares, writes findings + the daily row, emits the
 /// coded logs + counters, and returns the summary for the Telegram card.
+// TEST-EXEMPT: live-deps async orchestrator (compare/parse/SQL/schedule decisions are pure fns unit-tested below); wiring pinned by crates/app/tests/spot_crossverify_wiring_guard.rs — the run_tf_consistency precedent.
 pub async fn run_spot_crossverify(
     questdb_config: &QuestDbConfig,
     date: NaiveDate,
@@ -1253,6 +1254,106 @@ mod tests {
             canonicalize_index_symbol("NSE-NIFTY"),
             canonicalize_index_symbol("NIFTY"),
         );
+    }
+
+    #[test]
+    fn test_compare_day_mixed_scenario_counts_each_category_exactly_once() {
+        let mut d = BTreeMap::new();
+        let mut g = BTreeMap::new();
+        // Minute 1: clean on both feeds.
+        d.insert(nifty(33_360), bar(100.0, 101.0, 99.0, 100.5));
+        g.insert(nifty(33_360), bar(100.0, 101.0, 99.0, 100.5));
+        // Minute 2: low diverges by 2 paise.
+        d.insert(nifty(33_420), bar(100.0, 101.0, 99.00, 100.5));
+        g.insert(nifty(33_420), bar(100.0, 101.0, 99.02, 100.5));
+        // Minute 3: dhan-only (missing on groww).
+        d.insert(nifty(33_480), bar(100.0, 101.0, 99.0, 100.5));
+        // Minute 4: out-of-session (pre-open) on both.
+        d.insert(nifty(32_400), bar(100.0, 101.0, 99.0, 100.5));
+        g.insert(nifty(32_400), bar(100.0, 199.0, 99.0, 100.5));
+        let cmp = compare_day(&d, &g, DAY0, 0);
+        assert_eq!(cmp.outcome, SpotXverifyOutcome::Diverged);
+        assert_eq!(cmp.indices, 1);
+        assert_eq!(cmp.minutes_compared, 2); // clean + diverged minutes
+        assert_eq!(cmp.cells_diverged, 1);
+        assert_eq!(cmp.missing_groww, 1);
+        assert_eq!(cmp.missing_dhan, 0);
+        assert_eq!(cmp.out_of_session, 1);
+        assert_eq!(cmp.findings.len(), 3); // diverged + missing + out-of-session
+        assert_eq!(cmp.noise_max, 2);
+        // Pure: same inputs ⇒ same result.
+        assert_eq!(cmp, compare_day(&d, &g, DAY0, 0));
+    }
+
+    #[test]
+    fn test_decide_spot_xverify_start_sleep_is_exact_seconds_until_trigger() {
+        // One second before the 15:47:00 IST trigger ⇒ sleep exactly 1s.
+        assert_eq!(
+            decide_spot_xverify_start(SPOT_XVERIFY_TRIGGER_SECS_OF_DAY_IST - 1, true, false),
+            SpotXverifyStart::SleepThenRun(1)
+        );
+        // Midnight on a trading day ⇒ sleep the full trigger offset.
+        assert_eq!(
+            decide_spot_xverify_start(0, true, false),
+            SpotXverifyStart::SleepThenRun(u64::from(SPOT_XVERIFY_TRIGGER_SECS_OF_DAY_IST))
+        );
+        // Force wins even before the trigger on a trading day.
+        assert_eq!(
+            decide_spot_xverify_start(100, true, true),
+            SpotXverifyStart::RunNow
+        );
+        // Past the trigger on a NON-trading day (not forced) ⇒ still skipped.
+        assert_eq!(
+            decide_spot_xverify_start(SPOT_XVERIFY_TRIGGER_SECS_OF_DAY_IST + 1, false, false),
+            SpotXverifyStart::SkipNonTradingDay
+        );
+    }
+
+    #[test]
+    fn test_spot_xverify_forced_refusal_date_today_behaves_like_bare_now() {
+        // NOW + DATE=today targets today ⇒ the pre-trigger refusal applies.
+        assert!(spot_xverify_forced_refusal(true, true, true, 100).is_some());
+        // NOW + DATE=today on a non-trading day ⇒ refused with a reason.
+        assert!(spot_xverify_forced_refusal(true, true, false, 60_000).is_some());
+        // AT the trigger second exactly ⇒ allowed (refusal is strictly <).
+        assert!(
+            spot_xverify_forced_refusal(true, true, true, SPOT_XVERIFY_TRIGGER_SECS_OF_DAY_IST)
+                .is_none()
+        );
+        // A PAST-day backfill never consults today's clock or calendar.
+        assert!(spot_xverify_forced_refusal(true, false, false, 0).is_none());
+    }
+
+    #[test]
+    fn test_select_spot_1m_sql_window_is_micros_of_the_ist_day() {
+        // day_start = 1 day in nanos ⇒ WHERE window in MICROS, [start, +24h).
+        let day_start_nanos = 86_400i64 * 1_000_000_000;
+        let sql = select_spot_1m_sql("groww", day_start_nanos);
+        assert!(sql.contains("ts >= 86400000000"), "start micros: {sql}");
+        assert!(sql.contains("ts < 172800000000"), "end micros: {sql}");
+        assert!(sql.contains("feed = 'groww'"));
+        // Micros→nanos projection so the join key is nanos like the bar maps.
+        assert!(sql.contains("(ts / 1) * 1000 AS ts_nanos"));
+        assert!(sql.contains("ORDER BY ts ASC"));
+    }
+
+    #[test]
+    fn test_parse_spot_dataset_skips_bad_rows_and_errors_on_missing_dataset() {
+        // One good row + one row with a non-numeric price + one non-array row:
+        // only the good row survives; no truncation below the limit.
+        let body = r#"{"dataset":[
+            [60000000000,"NIFTY",100.0,101.0,99.0,100.5,7],
+            [60060000000,"NIFTY","bad",101.0,99.0,100.5,0],
+            {"not":"a row"}
+        ]}"#;
+        let (rows, trunc) = parse_spot_dataset(body, 10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(!trunc);
+        assert_eq!(rows[0].symbol, "NIFTY");
+        assert_eq!(rows[0].ts_nanos, 60_000_000_000);
+        assert_eq!(rows[0].volume, 7);
+        // A JSON body without a dataset is a typed error, never a panic.
+        assert!(parse_spot_dataset(r#"{"columns":[]}"#, 10).is_err());
     }
 
     #[test]
