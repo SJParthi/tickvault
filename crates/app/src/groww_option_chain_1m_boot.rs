@@ -402,7 +402,7 @@ pub fn parse_groww_option_chain(body: &str) -> Option<GrowwParsedChain> {
 
 /// Bounded failure slug for the forensics row — NEVER raw body text. Pure.
 #[must_use]
-fn chain_error_class_for_status(status: u16) -> &'static str {
+pub(crate) fn chain_error_class_for_status(status: u16) -> &'static str {
     match status {
         0 => "transport",
         401 | 403 => "auth",
@@ -457,12 +457,12 @@ fn fetched_at_ist_nanos_now() -> i64 {
 /// `StatusCode`, never a substring scan; `msg` is the bounded
 /// secret-redacted capture (DHAN-REST-400 discipline).
 #[derive(Clone, Debug, PartialEq)]
-struct GrowwChainFetchFailure {
+pub(crate) struct GrowwChainFetchFailure {
     /// HTTP status (0 = the request never got a response).
-    status: u16,
-    rate_limited: bool,
-    auth_rejected: bool,
-    msg: String,
+    pub(crate) status: u16,
+    pub(crate) rate_limited: bool,
+    pub(crate) auth_rejected: bool,
+    pub(crate) msg: String,
 }
 
 /// Read a response body with the [`GROWW_CHAIN_1M_MAX_BODY_BYTES`] cap
@@ -498,7 +498,7 @@ async fn read_body_capped(mut resp: reqwest::Response) -> Result<String, String>
 /// logged); `expiry_date` travels as a query param. A 429 records the
 /// live-probe (e) shape (endpoint + Retry-After presence + sanitized
 /// body) via one bounded `warn!` per occurrence.
-async fn groww_chain_fetch_once(
+pub(crate) async fn groww_chain_fetch_once(
     client: &reqwest::Client,
     url: &str,
     expiry_date: &str,
@@ -667,7 +667,7 @@ fn chain_audit_outcome(found: bool, empty: bool, rate_limited: bool) -> RestFetc
 /// Build one `rest_fetch_audit` row for a chain fetch — leg `chain_1m`,
 /// attempts=1 when a request ran (no in-minute ladder), 0 otherwise. Pure.
 #[allow(clippy::too_many_arguments)] // APPROVED: private forensics builder — a struct would be pure ceremony (spot precedent)
-fn build_chain_audit_row(
+pub(crate) fn build_chain_audit_row(
     target_minute_ist_nanos: i64,
     trading_date_nanos: i64,
     security_id: i64,
@@ -702,7 +702,7 @@ fn build_chain_audit_row(
 /// Best-effort forensics append: a failure logs (coded, CHAIN-03) + counts
 /// and RETURNS — the fetch loop, the verdict and the failure edge are
 /// never affected by the forensics leg.
-fn chain_audit_append_best_effort(
+pub(crate) fn chain_audit_append_best_effort(
     audit_writer: &mut RestFetchAuditWriter,
     row: &RestFetchAuditRow,
 ) {
@@ -721,7 +721,7 @@ fn chain_audit_append_best_effort(
 }
 
 /// Best-effort forensics flush (same never-affects-the-loop contract).
-fn chain_audit_flush_best_effort(audit_writer: &mut RestFetchAuditWriter) {
+pub(crate) fn chain_audit_flush_best_effort(audit_writer: &mut RestFetchAuditWriter) {
     if let Err(err) = audit_writer.flush() {
         metrics::counter!("tv_rest_fetch_audit_persist_errors_total", "stage" => "audit_flush")
             .increment(1);
