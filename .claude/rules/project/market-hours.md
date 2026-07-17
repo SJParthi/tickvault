@@ -70,6 +70,13 @@ this note is now its rule-file home) changes FAILURE MODE, not substance:
   `conclusion == "success"` — a green deferred run (deploy job skipped, B9
   never executed) is ignored, so the 15:46 IST cron redeploys main HEAD. It
   is therefore immune to green-but-not-deployed runs, and a green deferred
-  run counting as "covered" in catchup is correct, not masking.
+  run counting as "covered" in catchup is correct, not masking. Independent
+  ground-truth backstop: the deploy-watchdog Lambda's `binary_is_stale`
+  check (handler.py) separately compares the SSM param
+  `/tickvault/prod/deploy/binary-git-sha` — written only after a
+  verified-healthy binary swap — against main HEAD on the box-start firing
+  and publishes `tv_binary_main_sha_mismatch`, which the 24h
+  `tv-<env>-binary-sha-stale` alarm pages on — so even a cron-miss on a
+  deferred SHA surfaces within a day.
 - **Immediate in-window delivery** remains available ONLY via the loud
   `workflow_dispatch` with `confirm_market_hours=yes` — kept by design.
