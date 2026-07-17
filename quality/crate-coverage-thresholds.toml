@@ -31,6 +31,18 @@ default = 63.0
 common  = 99.5
 core    = 90.2
 trading = 96.9
-storage = 91.2
+# storage: 91.2 -> 90.1 (2026-07-17, stage-2 dead-WS sweep, PR #1631).
+# TRUTHFUL RE-BASELINE, not a ratchet bypass: the sweep deleted ~12K LoC of
+# heavily-unit-tested DEAD tick-chain code from crates/storage
+# (tick_persistence.rs, tick_flush_worker.rs, tick_row_builder.rs,
+# tick_spill_drain.rs + 15 dead test/bench targets), mechanically lowering the
+# crate's covered/total ratio. Measured on the PR merge ref: 90.26%
+# (CI run 29590767611, Coverage & Perf job 87920295139 — the deleted test
+# files exercised ONLY the deleted modules, verified via origin/main imports:
+# no surviving storage module lost a test). Floor per the standing formula:
+# measured 90.26 rounded down to one decimal (90.2) minus 0.1 = 90.1.
+# The deleted code no longer exists to cover; the ratchet (up-only) resumes
+# from this honest floor. Flagged in the PR #1631 body for coordinator review.
+storage = 90.1
 api     = 98.6
 app     = 63.3
