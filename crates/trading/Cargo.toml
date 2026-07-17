@@ -51,9 +51,9 @@ harness = false
 name = "obi"
 harness = false
 
-[[bench]]
-name = "bar_cache_lookup"
-harness = false
+# bar_cache_lookup bench DELETED with the dead `in_mem::bar_cache` module
+# (dead live-WS sweep stage 1, 2026-07-17); its `bar_cache_lookup` budget
+# key was removed from quality/benchmark-budgets.toml in the same PR.
 
 [package.metadata.cargo-machete]
 ignored = ["anyhow", "chrono", "chrono-tz", "tickvault-common", "governor", "jaeckel", "loom", "metrics", "secrecy", "serde", "thiserror", "tokio", "tracing", "uuid"]
