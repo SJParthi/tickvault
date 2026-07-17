@@ -386,8 +386,13 @@ summary file and drives the above flow.
       Depth WebSockets are forbidden forever per
       `.claude/rules/project/websocket-connection-scope-lock.md`; the
       detector module and its DHAT + loom ratchets were deleted too.
-- [x] **Phase 10.3** — Tick-loss chaos test shipped:
-      `crates/storage/tests/chaos_zero_tick_loss.rs`.
+- [~] **Phase 10.3** — Tick-loss chaos test shipped 2026-05, then RETIRED
+      2026-07-17 (stage-2 dead-WS sweep): `chaos_zero_tick_loss.rs` was
+      deleted with its subject — the dead tick writer
+      (`tick_persistence.rs`) had zero production callers after the
+      live-WS retirements (Dhan 2026-07-13, Groww 2026-07-15). The
+      candle-side chaos coverage (seal ring → spill → DLQ) remains in the
+      surviving `chaos_*` suites.
 - [~] **Phase 11** — WS + QuestDB + Valkey resilience SLA ALERT GUARD
       partially retired: the Prometheus-side `resilience_sla_alert_guard.rs`
       was deleted with the Alertmanager + Prometheus removals (#O2 / #O3).
