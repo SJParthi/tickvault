@@ -82,6 +82,11 @@ publish path is unchanged (DB audit column only).
   backfilled (at-write observation).
 - DEDUP re-append (backfill/sweep repair): latest-run-wins on the label
   column, exactly like close_to_data_ms.
+- Half-paise divergence: the depth derives from `price_to_paise_guarded`
+  (rounded paise) while the persisted `strike` DOUBLE is the raw parsed
+  f64 — a sub-paise strike would make `moneyness_depth` differ from
+  (stored strike − stored spot) by < 1 paise; real NSE strikes are
+  whole-paise, so the divergence is nil in practice.
 
 ## Failure Modes
 
@@ -97,6 +102,11 @@ publish path is unchanged (DB audit column only).
   the existing CHAIN-02 stages.
 
 ## Test Plan
+
+Testing-scope honesty: `crates/common` was touched, so the canonical
+scope per testing-scope.md is WORKSPACE escalation — run locally as the
+block-scoped suites below (disk constraint on the dev box); the full
+workspace battery is covered by CI on the PR.
 
 Block-scoped per testing-scope.md:
 - tickvault-common moneyness suite: 28 passed (4 new).

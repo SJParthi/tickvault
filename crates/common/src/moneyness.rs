@@ -405,6 +405,13 @@ pub fn classify_moneyness_for(
 /// missing-vendor-spot 0.0 case etc.). Overflow is unreachable via the
 /// guarded conversion (paise ≤ 1e9) but fail-closes for raw i64 callers.
 ///
+/// ## Half-paise divergence note (audit-column consistency)
+/// The depth derives from [`price_to_paise_guarded`] (ROUNDED paise)
+/// while the persisted `strike` DOUBLE column is the raw parsed f64 — a
+/// sub-paise strike would make the stored `moneyness_depth` differ from
+/// (stored strike − stored spot) by < 1 paise. Real NSE strikes are
+/// whole-paise, so the divergence is nil in practice.
+///
 /// # Performance
 /// O(1): one 2-arm label parse + one checked subtraction. Zero allocation.
 #[inline]

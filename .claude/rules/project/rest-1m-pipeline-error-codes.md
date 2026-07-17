@@ -1138,6 +1138,12 @@ green. The RAM `ChainMoneynessSnapshot` publish path is UNCHANGED (no
 depth field — the DB column is audit-only; a RAM consumer needing depth
 computes it from the snapshot's own paise fields via the same fn). The
 `option_contract_1m_rest` table is NOT touched by this change.
+Half-paise divergence note: the depth derives from
+`price_to_paise_guarded` (rounded paise) while the persisted `strike`
+DOUBLE is the raw parsed f64 — a sub-paise strike would make
+`moneyness_depth` differ from (stored strike − stored spot) by < 1
+paise; real NSE strikes are whole-paise, so the divergence is nil in
+practice.
 
 ## §3. Delivery boundary (honest — no false-OK)
 
