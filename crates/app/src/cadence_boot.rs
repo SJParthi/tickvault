@@ -146,6 +146,21 @@ pub fn spawn_cadence_scheduler(
             .await;
         }));
     }
+    // 2026-07-17 (review fix S7): the legacy 15:33:30 IST post-session
+    // repair sweep died with the leg loops — without it a cadence
+    // per-minute miss is a PERMANENT spot_1m_rest gap. One-shot Dhan-lane
+    // sweep task reusing the legacy sweep body + PACED fetch (post-session
+    // — limiter pacing is fine). Groww residual: the Groww sweep needs the
+    // leg's target resolution + token cache; not wired here.
+    if config.cadence.dhan_lane {
+        drop(tokio::spawn(
+            crate::spot_1m_rest_boot::run_cadence_post_session_sweep(
+                Arc::clone(trading_calendar),
+                config.questdb.clone(),
+                config.dhan.rest_api_base_url.clone(),
+            ),
+        ));
+    }
     let shutdown = Arc::new(Notify::new());
     // Park the handle for the teardown path (F2, 2026-07-15).
     drop(CADENCE_SHUTDOWN.set(Arc::clone(&shutdown)));

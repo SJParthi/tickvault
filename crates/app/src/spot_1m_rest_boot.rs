@@ -3357,6 +3357,150 @@ async fn run_post_session_sweep(
     }
 }
 
+/// Pure schedule decision for the CADENCE-ERA one-shot post-session sweep
+/// (2026-07-17 review fix S7): from `now` (IST seconds of day) return
+/// `Some(wait_secs)` when today's sweep instant is still reachable
+/// (wait 0 = fire now — a boot between 15:33:30 and the 16:30 box stop
+/// sweeps immediately), or `None` when the process woke past the 16:30
+/// IST box-stop bound (firing into teardown helps nobody; the next boot's
+/// sweep covers the day only if re-run manually — DEDUP-idempotent).
+#[must_use]
+pub(crate) fn cadence_sweep_wait_secs(now_secs_of_day: u32) -> Option<u32> {
+    const BOX_STOP_SECS_OF_DAY_IST: u32 = 16 * 3600 + 30 * 60;
+    if now_secs_of_day >= BOX_STOP_SECS_OF_DAY_IST {
+        return None;
+    }
+    Some(SPOT_1M_REST_SWEEP_FIRE_SECS_OF_DAY_IST.saturating_sub(now_secs_of_day))
+}
+
+/// 2026-07-17 (cadence review fix S7): the legacy 15:33:30 IST
+/// post-session repair sweep died with the leg loops (the RS3
+/// stand-down), so a cadence per-minute miss would otherwise become a
+/// PERMANENT `spot_1m_rest` gap. This ONE-SHOT task — spawned from
+/// `cadence_boot` on the Dhan lane — reuses the EXACT legacy sweep body
+/// (`sweep_sids_above_watermark` + the PACED `spot_1m_fetch_once`;
+/// post-session, limiter pacing is fine and deliberate): at ~15:33:30 IST
+/// on a trading day it re-fetches the day window ONCE per SID and
+/// backfills every session minute still missing (DEDUP-idempotent
+/// appends; fold handoff only after the flush ACK, inside the sweep
+/// body). A FRESH `PersistTracker` (empty watermarks) makes the sweep
+/// cover the WHOLE session — the per-minute authors are the cadence
+/// executors, whose state this task deliberately does NOT duplicate; the
+/// re-appends UPSERT in place (the legacy mid-session-restart envelope).
+/// One-shot per process — the prod box stops at 16:30 IST daily, so one
+/// fire per boot IS one fire per trading day on the prod schedule.
+pub(crate) async fn run_cadence_post_session_sweep(
+    calendar: Arc<TradingCalendar>,
+    questdb: QuestDbConfig,
+    rest_api_base_url: String,
+) {
+    let Some(wait) = cadence_sweep_wait_secs(ist_secs_of_day_now()) else {
+        info!(
+            "spot_1m_rest: cadence post-session sweep spawned past the \
+             16:30 IST box-stop bound — skipping (manual re-run stays \
+             DEDUP-idempotent)"
+        );
+        return;
+    };
+    if wait > 0 {
+        tokio::time::sleep(Duration::from_secs(u64::from(wait))).await;
+    }
+    // Same-day defense (the legacy sweep's exact gate): a suspend across
+    // midnight or a non-trading day skips rather than stamping the wrong
+    // trading date.
+    let woke = ist_secs_of_day_now();
+    if woke < SPOT_1M_REST_LAST_FIRE_SECS_OF_DAY_IST || !calendar.is_trading_day_today() {
+        warn!(
+            woke_at_secs = woke,
+            "spot_1m_rest: cadence post-session sweep woke outside today's \
+             session (midnight wrap / non-trading day) — skipping"
+        );
+        return;
+    }
+    let url = join_api_url(&rest_api_base_url, DHAN_CHARTS_INTRADAY_PATH);
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(SPOT_1M_REST_REQUEST_TIMEOUT_SECS))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+    {
+        Ok(c) => c,
+        Err(err) => {
+            error!(
+                code = ErrorCode::Spot1m01FetchDegraded.code_str(),
+                stage = "client_build",
+                ?err,
+                "SPOT1M-01: cadence post-session sweep HTTP client build \
+                 failed — the day's repair sweep is skipped"
+            );
+            return;
+        }
+    };
+    // Token at fire time from the process-global manager (the cadence
+    // executor precedent — never boot-captured).
+    let jwt: Option<secrecy::SecretString> =
+        tickvault_core::auth::token_manager::global_token_manager().and_then(|manager| {
+            manager
+                .token_handle()
+                .load()
+                .as_ref()
+                .as_ref()
+                .map(|state| state.access_token().clone())
+        });
+    let Some(jwt) = jwt else {
+        error!(
+            code = ErrorCode::Spot1m01FetchDegraded.code_str(),
+            stage = "sweep_failed",
+            "SPOT1M-01: no access token at cadence post-session sweep time \
+             — missing minutes stay absent (DEDUP-idempotent manual re-run \
+             remains possible)"
+        );
+        return;
+    };
+    let trading_date = today_ist();
+    let trading_date_nanos = minute_open_ist_nanos(trading_date, 0);
+    let session_first =
+        minute_open_ist_nanos(trading_date, SPOT_1M_REST_FIRST_FIRE_SECS_OF_DAY_IST - 60);
+    let session_last =
+        minute_open_ist_nanos(trading_date, SPOT_1M_REST_LAST_FIRE_SECS_OF_DAY_IST - 60);
+    let mut writer = Spot1mRestWriter::new(&questdb);
+    let mut audit_writer = RestFetchAuditWriter::new(&questdb);
+    let mut tracker = PersistTracker::default();
+    let stats = sweep_sids_above_watermark(
+        &client,
+        &url,
+        &mut writer,
+        &mut tracker,
+        &jwt,
+        trading_date,
+        trading_date_nanos,
+        session_first,
+        session_last,
+        "sweep_failed",
+        Some(&mut audit_writer),
+    )
+    .await;
+    metrics::counter!("tv_spot1m_sweep_backfilled_total").increment(stats.swept);
+    metrics::counter!("tv_spot1m_sweep_still_missing_total").increment(stats.still_missing);
+    if stats.still_missing > 0 || stats.persist_failed {
+        error!(
+            code = ErrorCode::Spot1m01FetchDegraded.code_str(),
+            stage = "sweep_incomplete",
+            swept = stats.swept,
+            still_missing = stats.still_missing,
+            persist_failed = stats.persist_failed,
+            "SPOT1M-01: cadence post-session sweep left session minutes \
+             absent — the day's table stays short (DEDUP-idempotent manual \
+             re-run remains possible)"
+        );
+    } else {
+        info!(
+            swept = stats.swept,
+            "spot_1m_rest: cadence post-session sweep complete — every \
+             session minute is persisted"
+        );
+    }
+}
+
 /// 2026-07-13 VIX companion: feed one fired minute's per-SID served
 /// verdicts into the [`SidServedTracker`] and emit the edge-latched
 /// per-SID page / recovery ping + the per-counted-minute counter
@@ -3861,6 +4005,29 @@ mod tests {
     }
 
     // ---- Retry-After parse (2026-07-17 cadence-executor refactor) ------------
+
+    #[test]
+    fn test_cadence_sweep_wait_secs_schedule_decision() {
+        // Before the 15:33:30 fire instant: wait exactly to the instant.
+        assert_eq!(
+            cadence_sweep_wait_secs(SPOT_1M_REST_SWEEP_FIRE_SECS_OF_DAY_IST - 90),
+            Some(90)
+        );
+        // At/after the instant but before the 16:30 box stop: fire NOW.
+        assert_eq!(
+            cadence_sweep_wait_secs(SPOT_1M_REST_SWEEP_FIRE_SECS_OF_DAY_IST),
+            Some(0)
+        );
+        assert_eq!(cadence_sweep_wait_secs(16 * 3600), Some(0));
+        // At/past the 16:30 IST box stop: unusable — skip.
+        assert_eq!(cadence_sweep_wait_secs(16 * 3600 + 30 * 60), None);
+        assert_eq!(cadence_sweep_wait_secs(23 * 3600), None);
+        // Midnight boot waits the whole morning to the fire instant.
+        assert_eq!(
+            cadence_sweep_wait_secs(0),
+            Some(SPOT_1M_REST_SWEEP_FIRE_SECS_OF_DAY_IST)
+        );
+    }
 
     #[test]
     fn test_retry_after_header_ms_parses_delta_seconds_only() {
