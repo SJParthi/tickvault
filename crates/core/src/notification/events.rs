@@ -686,6 +686,20 @@ pub enum NotificationEvent {
         detail: String,
     },
 
+    /// The two brokers' contract lists DISAGREE on today's option expiry
+    /// date for one underlying (cadence scheduler, coordinator ruling
+    /// 2026-07-16): Dhan's exchange-sourced date WINS and keys BOTH
+    /// lanes' option-chain timing; both raw dates stay recorded for
+    /// provenance. Edge-latched — one HIGH page per underlying per day.
+    CadenceExpiryDisagreement {
+        /// The underlying index name (NIFTY / BANKNIFTY / SENSEX).
+        underlying: String,
+        /// Dhan's resolved expiry date (ISO) — the winner.
+        dhan_date: String,
+        /// Groww's resolved expiry date (ISO).
+        groww_date: String,
+    },
+
     /// The boot-time Groww option-chain probe verdict (pipeline switched
     /// OFF, probe-and-report ON): one Info ping carrying the MEASURED
     /// result — whether the chain answered, how many strikes, how fast, or
@@ -3022,6 +3036,29 @@ impl NotificationEvent {
                      re-pulled — nothing is made up."
                 )
             }
+            Self::CadenceExpiryDisagreement {
+                underlying,
+                dhan_date,
+                groww_date,
+            } => {
+                let underlying = html_escape(underlying);
+                let dhan_date = html_escape(dhan_date);
+                let groww_date = html_escape(groww_date);
+                format!(
+                    "\u{26a0}\u{fe0f} <b>Dhan and Groww disagree on the \
+                     {underlying} option expiry date</b>\n\
+                     Dhan says {dhan_date}, Groww says {groww_date} — for \
+                     today the DHAN date wins, and BOTH brokers' option-chain \
+                     timing now uses Dhan's date. Both answers stay recorded.\n\
+                     What to do RIGHT NOW:\n\
+                     1. Nothing urgent — the system already picked the Dhan \
+                     date (the exchange-sourced list).\n\
+                     2. Glance at the {underlying} option expiry in the Groww \
+                     app once today. If Groww's list was just stale this \
+                     clears tomorrow; if it repeats daily, the two brokers' \
+                     contract lists genuinely differ and need a look."
+                )
+            }
             Self::GrowwChain1mExpiryUnresolved { detail } => {
                 let detail = html_escape(detail);
                 format!(
@@ -4119,6 +4156,7 @@ impl NotificationEvent {
                 "GrowwChain1mUnderlyingServedRecovered"
             }
             Self::GrowwChain1mExpiryUnresolved { .. } => "GrowwChain1mExpiryUnresolved",
+            Self::CadenceExpiryDisagreement { .. } => "CadenceExpiryDisagreement",
             Self::GrowwChain1mProbeVerdict { .. } => "GrowwChain1mProbeVerdict",
             Self::GrowwContract1mFetchDegraded { .. } => "GrowwContract1mFetchDegraded",
             Self::GrowwContract1mFetchRecovered { .. } => "GrowwContract1mFetchRecovered",
@@ -4589,6 +4627,7 @@ impl NotificationEvent {
             // One page per day when an underlying's chain recording could
             // not start (never a guessed expiry) — actionable, not fatal.
             Self::GrowwChain1mExpiryUnresolved { .. } => Severity::High,
+            Self::CadenceExpiryDisagreement { .. } => Severity::High,
             // The probe is informational either way — nothing was expected
             // to record while the pipeline is switched off.
             Self::GrowwChain1mProbeVerdict { .. } => Severity::Info,
@@ -8369,6 +8408,34 @@ mod tests {
         assert!(msg.contains("12 empty"), "got: {msg}");
         // No false-OK: recovery never claims the missing minutes came back.
         assert!(msg.contains("nothing is made up"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_cadence_expiry_disagreement_is_high_names_both_brokers_dhan_wins() {
+        // R6 (2026-07-16): the cadence expiry cross-broker disagreement
+        // page — both brokers named, both dates shown, Dhan wins, plain
+        // English (10 commandments), hostile input HTML-escaped.
+        let event = NotificationEvent::CadenceExpiryDisagreement {
+            underlying: "BANKNIFTY".to_string(),
+            dhan_date: "2026-07-28".to_string(),
+            groww_date: "2026-07-30<script>".to_string(),
+        };
+        assert_eq!(event.topic(), "CadenceExpiryDisagreement");
+        assert_eq!(event.severity(), Severity::High);
+        let msg = event.to_message();
+        assert!(
+            msg.contains("Dhan and Groww disagree on the BANKNIFTY option expiry"),
+            "got: {msg}"
+        );
+        assert!(msg.contains("Dhan says 2026-07-28"), "got: {msg}");
+        assert!(msg.contains("DHAN date wins"), "got: {msg}");
+        assert!(
+            msg.contains("BOTH brokers"),
+            "must say both lanes now use Dhan's date: {msg}"
+        );
+        // Hostile date input is HTML-escaped, never raw.
+        assert!(!msg.contains("<script>"), "got: {msg}");
+        assert!(msg.contains("&lt;script&gt;"), "got: {msg}");
     }
 
     #[test]

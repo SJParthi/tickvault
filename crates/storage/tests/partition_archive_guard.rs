@@ -50,7 +50,8 @@ fn archive_enabled_default_is_false_in_code() {
     );
     // The class windows keep their documented defaults.
     assert_eq!(cfg.retention_days, 90);
-    assert_eq!(cfg.market_data_hot_days, 14);
+    // 2026-07-16: default raised 14 → 35 (operator one-month spot window).
+    assert_eq!(cfg.market_data_hot_days, 35);
 }
 
 #[test]
@@ -77,8 +78,10 @@ fn base_toml_enables_archive_with_market_data_window() {
         section
             .get("market_data_hot_days")
             .and_then(toml::Value::as_integer),
-        Some(14),
-        "base.toml must pin the market-data hot window (ticks + candles_*)"
+        Some(35),
+        "base.toml must pin the market-data hot window (ticks + candles_* + \
+         the per-minute chain tables — 35d since the 2026-07-16 operator \
+         one-month directive)"
     );
     assert_eq!(
         section

@@ -164,11 +164,16 @@ ilp_port = 9009
 [partition_retention]
 # STANDARD class (audit / daily-data tables) hot window.
 retention_days = 90
-# HIGH-VOLUME market-data class (ticks + 21 candles_* tables, ~1.2-2 GB/day).
-# 90d of ticks (~135+ GB) can never fit the 30 GB volume; 14d hot on EBS with
-# the verified S3 archive as the durable long-term store (SEBI retention is
-# satisfied by the S3 copy — aws-budget hot-window doctrine).
-market_data_hot_days = 14
+# HIGH-VOLUME market-data class (ticks + 21 candles_* tables + the per-minute
+# chain tables option_chain_1m/option_contract_1m_rest since 2026-07-16).
+# 35d hot on EBS (2026-07-16 operator directive — "our entire one month
+# should be stored and fetched from questdb even before premarket"; was 14),
+# with the verified S3 archive as the durable long-term store (SEBI retention
+# is satisfied by the S3 copy — aws-budget hot-window doctrine). The chain
+# tables moved here from the 90d Standard class the same day (the operator's
+# "option only for the current day" direction — 35d is the smallest clean
+# change; a tighter chain-only knob is a follow-up if disk pressure demands).
+market_data_hot_days = 35
 # Archive->verify->drop leg ON (2026-07-13 disk-pressure remediation).
 # Fail-closed: a partition is dropped ONLY after its S3 copy is row-count-
 # and size-verified. ROLLBACK: set false (or delete the key) to restore the
@@ -627,6 +632,56 @@ warm_up = true
 enabled = true
 
 # ===========================================================================
+# Order runtime (dry-run) — cluster A, operator directive 2026-07-14
+# (.claude/plans/active-plan-order-runtime-dryrun.md). One supervised task
+# owning the paper OMS + RiskEngine, spawned from the Dhan REST-only stack:
+# order-update events reach the book, Groww marks drive mark-to-market P&L
+# + the next-mark paper filler, the daily-loss halt finally has real
+# inputs, and a once-daily gated self-test proves the chain end-to-end.
+# NO real orders ever (the OMS is hard dry-run). An ABSENT section =
+# disabled (fail-safe); `enabled = false` is the rollback switch — it
+# restores the exact pre-PR dormant shape (discard drain, no WAL capture).
+# ===========================================================================
+[order_runtime]
+enabled = true
+paper_fill = true
+self_test = true
+reconcile_interval_secs = 300
+mark_channel_capacity = 8192
+
+# ===========================================================================
+# REST-era multi-TF candle derivation (operator directive 2026-07-16:
+# "why the fuck remaining candles 1m till 1day is not yet generated and
+# populated — resolve these"). Folds persist-confirmed spot_1m_rest 1m bars
+# into all 21 candles_* timeframes via the shared seal-writer channel, plus
+# a boot catch-up over the last `catchup_days` of stored bars (35 = the
+# operator's one-month spot window + weekend slack, 2026-07-16: "our entire
+# one month should be stored and fetched from questdb even before
+# premarket"). NEVER touches `ticks` (live-feed-purity; rule 10 carries the
+# dated candles_1d edit). Serde default is OFF (fail-safe) — this section
+# opts in; `enabled = false` is the rollback switch.
+# ===========================================================================
+[rest_candle_fold]
+enabled = true
+catchup_days = 35
+
+# ===========================================================================
+# RAM residency stores (operator directive 2026-07-16, PR-2 of the
+# data-completeness build): the month-deep SPOT bar rings (fed by the
+# rest_candle_fold emit path — zero new QuestDB reads) + the current-day
+# CHAIN minute ring (fed by the chain legs' publish path, boot-rehydrated
+# from today's option_chain_1m rows via bounded /exec windows). Cold path
+# only; reads are the FUTURE strategy read contract (§28 boundary — no
+# strategy consumer ships). An ABSENT section = disabled (fail-safe);
+# `enabled = false` is the rollback switch. RAMSTORE-01 runbook:
+# .claude/rules/project/ram-store-error-codes.md
+# ===========================================================================
+[market_ram_store]
+enabled = true
+spot_days = 35
+chain_row_cap = 1000
+
+# ===========================================================================
 # Scheduled OMS order-book reconciliation (2026-07-14). Every
 # `interval_secs` during the NSE session the trading pipeline reconciles
 # OMS state against the Dhan order book (the OMS-GAP-02 machinery gains a
@@ -710,3 +765,73 @@ rest_self_cap_per_sec = 5
 # ===========================================================================
 [exit_orders]
 enabled = false
+
+# Cadence scheduler (judge-locked 2026-07-14; reshaped by the operator
+# directive 2026-07-16): per-minute POST-CLOSE burst fire timing with
+# structural zero-429 gates (pure CAS per-(underlying, expiry) spacing +
+# the combined rolling-second cap, monotonic domain), streak-driven shape
+# ladders, and event-driven per-(lane, minute) moneyness decisions.
+# SHIPS DISABLED: day 1 both lanes run the dry-run logging executor
+# (fires logged, Empty returned, NO REST call — decisions honest-skip).
+# Flipping `enabled = true` needs the real broker executors (a later PR)
+# + the dated rule-file note per
+# `.claude/rules/project/cadence-error-codes.md`.
+[cadence]
+enabled = false
+# The Dhan post-close burst second (operator 2026-07-16 "all 7 parallel
+# at first second" — the same-day correction): at T + this, ALL 7
+# requests fire concurrently — 3 chains (the 3s rule is per-(underlying,
+# expiry) only, so different underlyings are concurrent in the
+# option-chain API's OWN budget) + all 4 spots (the Data-API bucket,
+# 4 <= 5). The shape ladder's rung 1 fallback splits instead: chains in
+# second 1, ALL 4 spots in second 2.
+dhan_burst_offset_ms = 1000
+# Rolling-1000ms-window spot gate: at most this many spot requests in ANY
+# sliding second (1..=5 — Dhan's Data-API hard cap is 5/sec; the combined
+# spot+expiry rolling-second ring is THE binding cadence-lane pacing per
+# the 2026-07-16 coordinator ruling — cadence fires do NOT route through
+# the shared 3 rps dhan_data_api_limiter, which stays for the legacy
+# paths, and chain fires are governed solely by the per-key 3s gate).
+spot_window_cap = 4
+# Streak thresholds shared by ALL cadence ladders (the 2026-07-16 Dhan
+# shape rung 0⇄1, the 2026-07-15 spot-concurrency tiers and the Groww
+# fallback-shape ladder; BOTH Assumed — operator confirm pending):
+# degrade one step after this many CONSECUTIVE dirty cycles; recover one
+# step after this many consecutive fully-clean cycles.
+concurrency_degrade_after_dirty_cycles = 2
+concurrency_recover_after_clean_cycles = 3
+# Spot clamp: spots never fire earlier than T + this (house 300ms —
+# structurally inert at the default 1000ms burst offset).
+spot_min_post_close_ms = 300
+# At most one in-cycle retry per failed request, through the gates. A
+# RateLimited leg KEEPS its one bounded in-cycle retry (after the per-key
+# spacing) — one of the operator's "multiple attempts" before any shape
+# demotion (2026-07-16 Correction 2; supersedes the earlier "RateLimited
+# never retried" wording, which was the exact inverse).
+in_cycle_retry_max = 1
+# Lane staleness cutoffs past T: older data is stale for a next-minute fill.
+dhan_lane_cutoff_ms = 15000
+groww_lane_cutoff_ms = 6000
+# Groww fallback-shape ladder (operator verbatim 2026-07-16 two-rung
+# prescription + the retained choice-3 last resort): rung 0 (default) =
+# all 7 requests in parallel at T+0; rung 1 = :01 all 3 chains / :02 ALL
+# 4 spots (VIX included); rung 2 (kept beyond the operator's two-rung
+# prescription as the last resort — dated note in
+# cadence-error-codes.md) = :01 chains / :02 core spots / :03 VIX alone.
+# Verdict = last wave + the burst timeout; 1500ms per request on the
+# sequential fallback.
+groww_anchor_offset_ms = 0
+groww_burst_timeout_ms = 800
+groww_request_timeout_ms = 1500
+# The structural zero-429 floor: the per-(underlying, expiry) chain gate
+# (the 2026-07-16 directive: the broker's 3s rule applies to the SAME
+# chain expiry only — different underlyings fire concurrently).
+chain_min_spacing_ms = 3000
+# Pre-market expiry resolution (operator spec 2026-07-15): bounded retry
+# interval per (broker, underlying) expiry-list fetch until the IST
+# deadline; past the deadline ONE edge-latched CADENCE-01
+# `expiry_unresolved` page per pair episode while background retry
+# continues to session end (the deadline gates the PAGE, never attempts).
+expiry_retry_interval_ms = 60000
+# 08:55:00 IST = 32100 seconds of day (validated within [0, 86400)).
+expiry_deadline_secs_of_day_ist = 32100

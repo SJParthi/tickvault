@@ -36,9 +36,11 @@ pub mod circuit_breaker;
 pub mod conditional;
 pub mod dh904_backoff;
 pub mod engine;
+pub mod error_taxonomy;
 pub mod exit_rules;
 pub mod idempotency;
 pub mod margin_gate;
+pub mod order_readiness;
 pub mod rate_limiter;
 pub mod reconciliation;
 pub mod state_machine;
@@ -51,12 +53,18 @@ pub mod groww;
 
 // Re-export key types for ergonomic use.
 pub use api_client::OrderApiClient;
-pub use engine::{OrderManagementSystem, TokenProvider};
+pub use engine::{OmsAlert, OmsAlertSink, OrderManagementSystem, TokenProvider};
+pub use error_taxonomy::{BrokerCooldownLatch, DhanErrorClass, OrderEndpoint, OrderErrorPolicy};
 pub use exit_rules::ExitCommand;
 pub use margin_gate::{MarginGate, MarginSnapshot, MarginVerdict};
+pub use order_readiness::{
+    OrderReadinessState, ProbeOutcome, ReadinessProbe, ReadinessRefusal, segment_has_derivative,
+    spawn_order_readiness_refresher,
+};
 pub use rate_limiter::OrderRateLimiter;
 pub use types::{
-    ExecutionVerdict, ManagedOrder, ManagedSuperOrder, ModifyOrderRequest, ModifySuperOrderLeg,
-    OcoSecondLeg, OmsError, OrderIntent, PlaceForeverOcoRequest, PlaceOrderRequest,
-    PlaceSuperOrderRequest, ReconciliationReport, SlicingResponse, SuperOrderPlacement,
+    ExecutionVerdict, FillEvent, ManagedOrder, ManagedSuperOrder, ModifyOrderRequest,
+    ModifySuperOrderLeg, OcoSecondLeg, OmsError, OrderIntent, PlaceForeverOcoRequest,
+    PlaceOrderRequest, PlaceSuperOrderRequest, ReconciliationReport, SEGMENT_CODE_UNKNOWN,
+    SlicingResponse, SuperOrderPlacement, parse_segment_chars,
 };

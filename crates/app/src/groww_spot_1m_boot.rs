@@ -135,6 +135,7 @@ use tickvault_common::constants::{
     SPOT_1M_REST_FIRST_FIRE_SECS_OF_DAY_IST, SPOT_1M_REST_LAST_FIRE_SECS_OF_DAY_IST,
 };
 use tickvault_common::error_code::ErrorCode;
+use tickvault_common::feed::Feed;
 use tickvault_common::sanitize::capture_rest_error_body;
 use tickvault_common::trading_calendar::TradingCalendar;
 use tickvault_core::auth::secret_manager::fetch_groww_access_token;
@@ -212,6 +213,13 @@ pub struct GrowwSpot1mTaskParams {
     /// spot→chain minute-done signal was RETIRED by the auto-ladder — the
     /// chain leg fires on its own minute-boundary timer.)
     pub burst: Arc<GrowwRestBurstState>,
+    /// Order-runtime mark tap (dry-run PR, 2026-07-14; re-homed 2026-07-16
+    /// after the Groww live feed retired): `Some` ONLY when
+    /// `[order_runtime].enabled`. Marks are the OWN-FIRE just-closed-minute
+    /// candle CLOSES, forwarded AFTER the persist flush ACK — backfill,
+    /// sweep and warm-up NEVER produce marks (stale prices must not fill
+    /// paper orders). `None` ⇒ the tap is structurally absent (no-op).
+    pub mark_forwarder: Option<crate::order_runtime::MarkForwarder>,
 }
 
 // ---------------------------------------------------------------------------
@@ -2003,6 +2011,18 @@ async fn fire_one_minute(
     // data flush ACK, then stamped with the real close_to_persist_ms (a
     // failed flush discards them — the flush_failed rows are the truth).
     let mut held_ok_rows: Vec<RestFetchAuditRow> = Vec::new();
+    // 2026-07-16 REST-era candle derivation: bars staged for the fold-writer
+    // handoff — sent ONLY after the flush ACK confirms persistence.
+    let mut confirmed_bars: Vec<crate::rest_candle_fold::ConfirmedBar> = Vec::new();
+    // Order-runtime mark tap (re-homed 2026-07-16): OWN-FIRE just-closed-
+    // minute closes ONLY, staged here and forwarded AFTER the flush ACK
+    // (persist-confirm choke point — mirrors the fold hook placement). The
+    // BACKFILL branch below and the post-session sweep NEVER stage marks:
+    // a >60s-old repaired price must not fill a paper order (the C11
+    // replay-window lesson applied to the REST legs). Cold path (once per
+    // minute) — the Vec is fine; the forward itself is a lock-free
+    // best-effort try_send that no-ops when the runtime is disabled.
+    let mut staged_marks: Vec<crate::order_runtime::MarkUpdate> = Vec::new();
 
     if let Some(token) = token_cache.ensure_token().await {
         // 2026-07-14 auto-ladder: the WAVE — all targets fetch
@@ -2245,6 +2265,31 @@ async fn fire_one_minute(
                         held_ok_rows.push(row);
                     }
                     staged.push((security_id, candle.minute_ts_ist_nanos));
+                    if let Ok(sid_u64) = u64::try_from(security_id) {
+                        confirmed_bars.push(
+                            crate::rest_candle_fold::ConfirmedBar::from_minute_candle(
+                                Feed::Groww,
+                                sid_u64,
+                                tickvault_common::constants::EXCHANGE_SEGMENT_IDX_I,
+                                &candle,
+                            ),
+                        );
+                        // Mark tap: OWN-FIRE close only (this is the just-
+                        // closed target minute; the backfill branch below
+                        // deliberately stages NO mark).
+                        #[allow(clippy::cast_possible_truncation)]
+                        // APPROVED: MarkUpdate carries f32 by contract (the
+                        // wire LTP precision); price-level narrowing only.
+                        staged_marks.push(crate::order_runtime::MarkUpdate {
+                            security_id: sid_u64,
+                            segment_code: tickvault_common::constants::EXCHANGE_SEGMENT_IDX_I,
+                            price: candle.close as f32,
+                        });
+                    } else {
+                        // Round-2 LOW-6: never a silent skip — counted +
+                        // one coalesced warn (defensive; ids are positive).
+                        crate::rest_candle_fold::note_unfoldable_identity(Feed::Groww, security_id);
+                    }
                 }
             }
             if let Some(backfill) = backfill_candle {
@@ -2304,6 +2349,20 @@ async fn fire_one_minute(
                         "none",
                     ));
                     staged.push((security_id, backfill.minute_ts_ist_nanos));
+                    if let Ok(sid_u64) = u64::try_from(security_id) {
+                        confirmed_bars.push(
+                            crate::rest_candle_fold::ConfirmedBar::from_minute_candle(
+                                Feed::Groww,
+                                sid_u64,
+                                tickvault_common::constants::EXCHANGE_SEGMENT_IDX_I,
+                                &backfill,
+                            ),
+                        );
+                    } else {
+                        // Round-2 LOW-6: never a silent skip — counted +
+                        // one coalesced warn (defensive; ids are positive).
+                        crate::rest_candle_fold::note_unfoldable_identity(Feed::Groww, security_id);
+                    }
                 }
             }
         }
@@ -2375,6 +2434,19 @@ async fn fire_one_minute(
             // Flush confirmed — advance the per-symbol persisted watermark.
             for (security_id, minute_nanos) in staged {
                 tracker.commit(security_id, minute_nanos);
+            }
+            // 2026-07-16 REST-era candle derivation: the bars are now
+            // persist-CONFIRMED — hand them to the fold writer.
+            crate::rest_candle_fold::send_confirmed_bars(&confirmed_bars);
+            // Order-runtime mark tap: forward the OWN-FIRE closes now that
+            // the flush ACK confirmed persistence (a mark must never
+            // reference a price the audit record does not back). Best-effort
+            // try_send; a full channel drops the mark (counted — the next
+            // minute supersedes it); None ⇒ runtime disabled, zero work.
+            if let Some(forwarder) = params.mark_forwarder.as_ref() {
+                for mark in &staged_marks {
+                    forwarder.mark_forward(mark.security_id, mark.segment_code, mark.price);
+                }
             }
         }
         // GAP-11: the ok rows land ONLY after (and stamped with) the data
@@ -2583,6 +2655,9 @@ async fn run_post_session_sweep(
     let mut still_missing: u64 = 0;
     let mut pre_boot_named: u64 = 0;
     let mut staged: Vec<(i64, i64)> = Vec::new();
+    // 2026-07-16 REST-era candle derivation: swept bars staged for the
+    // fold-writer handoff — sent ONLY after the flush ACK confirms.
+    let mut confirmed_bars: Vec<crate::rest_candle_fold::ConfirmedBar> = Vec::new();
     let mut persist_failed = false;
     for target in targets {
         let security_id = target.security_id;
@@ -2753,6 +2828,18 @@ async fn run_post_session_sweep(
             } else {
                 found_for_sid = found_for_sid.saturating_add(1);
                 staged.push((security_id, *minute_nanos));
+                if let Ok(sid_u64) = u64::try_from(security_id) {
+                    confirmed_bars.push(crate::rest_candle_fold::ConfirmedBar::from_minute_candle(
+                        Feed::Groww,
+                        sid_u64,
+                        tickvault_common::constants::EXCHANGE_SEGMENT_IDX_I,
+                        &candle,
+                    ));
+                } else {
+                    // Round-2 LOW-6: never a silent skip — counted + one
+                    // coalesced warn (defensive; ids are positive).
+                    crate::rest_candle_fold::note_unfoldable_identity(Feed::Groww, security_id);
+                }
             }
         }
         // NAMED GAPS: the finally-unrecovered minutes for this symbol —
@@ -2826,6 +2913,10 @@ async fn run_post_session_sweep(
         for (security_id, minute_nanos) in staged {
             tracker.commit(security_id, minute_nanos);
         }
+        // 2026-07-16 REST-era candle derivation: swept bars are now
+        // persist-CONFIRMED — hand them to the fold writer (out-of-order
+        // swept bars mark their day dirty for a refold).
+        crate::rest_candle_fold::send_confirmed_bars(&confirmed_bars);
     }
     audit_flush_best_effort(audit_writer);
     metrics::counter!("tv_groww_spot1m_sweep_backfilled_total").increment(swept);
@@ -4015,6 +4106,7 @@ mod tests {
             nse_mock_trading_dates: vec![],
         };
         GrowwSpot1mTaskParams {
+            mark_forwarder: None,
             notifier: NotificationService::disabled(),
             calendar: Arc::new(
                 tickvault_common::trading_calendar::TradingCalendar::from_config(&config)

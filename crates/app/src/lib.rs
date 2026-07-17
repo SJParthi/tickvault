@@ -35,6 +35,11 @@ pub mod brutex_crossverify_compare;
 // 15:50 IST I/O shell — S3 CSV fetch, QuestDB reads, compare orchestration,
 // persistence, Telegram summary + supervised spawn (Unit 7).
 pub mod brutex_crossverify_boot;
+// Judge-locked cadence scheduler boot wiring (2026-07-14): config-gated
+// dual-spawn of the supervised per-minute fire scheduler (dry-run
+// executors both lanes day 1 — no REST caller). Runbook:
+// `.claude/rules/project/cadence-error-codes.md`.
+pub mod cadence_boot;
 // Phase 0 Item 20 (wired 2026-06-13): supervised 15:25 IST orphan-position
 // watchdog — daily open-position safety gate (alert-only in sandbox/dry-run).
 pub mod orphan_position_watchdog_boot;
@@ -128,6 +133,17 @@ pub mod dhan_rest_stack;
 /// build loop + the sole persist_groww_instruments caller).
 pub mod groww_universe;
 pub mod groww_watch_paths;
+/// RAM residency stores boot (operator directive 2026-07-16, PR-2):
+/// installs the month-deep spot bar rings + current-day chain minute ring,
+/// runs the bounded chain-day rehydrate, and publishes the depth gauges.
+/// RAMSTORE-01 runbook: `.claude/rules/project/ram-store-error-codes.md`.
+pub mod market_ram_store_boot;
+/// REST-era multi-TF candle derivation (operator directive 2026-07-16):
+/// folds persist-confirmed `spot_1m_rest` 1m bars into all 21 `candles_*`
+/// timeframes via the shared seal-writer channel + boot catch-up over the
+/// stored month. FOLD-01 runbook:
+/// `.claude/rules/project/rest-candle-fold-error-codes.md`.
+pub mod rest_candle_fold;
 /// Shared per-seal routing for BOTH feeds (Dhan + Groww) — the single
 /// `route_seal` body the two `on_seal` call sites invoke (C2, behavior-preserving).
 pub mod seal_routing;
@@ -181,11 +197,20 @@ pub mod api_token_rotation;
 pub mod exit_execution;
 pub mod index_constituency_boot;
 pub mod observability;
+/// Shared OMS wiring (TokenHandle→TokenProvider adapter + pinned-timeout
+/// HTTP client builder) — extracted from `trading_pipeline` 2026-07-14 so
+/// the two OMS construction sites can never drift.
+pub mod oms_wiring;
 /// Cluster-C order-side observability (2026-07-14): OmsAlertSink /
 /// RiskAlertSink bridges → Telegram + the rebuilt SEBI order_audit /
 /// pnl_audit tables via one bounded mpsc(1024) consumer task; daily
 /// OnEod heartbeat + counters-vs-rows reconcile (OMS-GAP-02 on mismatch).
 pub mod order_observability;
+/// Order runtime (dry-run) — cluster A, operator directive 2026-07-14
+/// (`.claude/plans/active-plan-order-runtime-dryrun.md`): the single-owner
+/// supervised task owning the paper OMS + RiskEngine on the dhan-off prod
+/// profile, spawned ONLY from `dhan_rest_stack` Phase 5a.
+pub mod order_runtime;
 pub mod subsystem_memory;
 pub mod trading_pipeline;
 /// C3 (2026-07-03): bounded, chunked, backpressured STAGE-C.2b WAL frame

@@ -63,6 +63,13 @@ notify = { workspace = true }
 # (same pattern as crates/core + crates/api dev-deps).
 tokio = { workspace = true, features = ["test-util"] }
 
+# Order-runtime dry-run PR (2026-07-14): DHAT zero-alloc ratchet + Criterion
+# budget evidence for the mark-forward hot-path tap (re-homed 2026-07-16 to
+# the Groww REST legs after the live bridge retired). Both are existing
+# workspace pins (no new dependency roots).
+criterion = { workspace = true }
+dhat = { workspace = true }
+
 [features]
 # PR-C3 (2026-07-14): the `daily_universe_fetcher` feature (and its sha2
 # optional dep) was DELETED with the Dhan instrument-download chain
@@ -70,6 +77,10 @@ tokio = { workspace = true, features = ["test-util"] }
 # formerly-gated SEBI persistence modules in `tickvault-storage` are now
 # compiled unconditionally.
 default = []
+
+[[bench]]
+name = "order_gate"
+harness = false
 
 [package.metadata.cargo-machete]
 ignored = ["chrono-tz", "clap", "signal-hook"]

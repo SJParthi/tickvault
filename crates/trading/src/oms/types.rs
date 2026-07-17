@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use tickvault_common::order_types::{
     OrderStatus, OrderType, OrderValidity, ProductType, TransactionType,
 };
+use tickvault_common::types::ExchangeSegment;
 
 // ---------------------------------------------------------------------------
 // Managed Order — internal OMS representation
@@ -75,6 +76,61 @@ impl ManagedOrder {
                 | OrderStatus::Expired
                 | OrderStatus::Closed
         )
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Fill Event — the OMS → RiskEngine fill bridge (order-runtime dry-run PR,
+// 2026-07-14). Returned by `handle_order_update` when an update carries a
+// POSITIVE executed-quantity delta, so the caller can feed
+// `RiskEngine::record_fill` — closing the silent-stuck-position hole
+// (record_fill previously had ZERO production callers; audit Rule 13).
+// ---------------------------------------------------------------------------
+
+/// Sentinel `segment_code` used when the update's exchange/segment characters
+/// do not map to a known [`ExchangeSegment`] (annexure rule 15 — never panic
+/// on unknown codes). Consumers treat this as "segment unknown".
+pub const SEGMENT_CODE_UNKNOWN: u8 = u8::MAX;
+
+/// A fill delta extracted from a WebSocket order update.
+///
+/// `fill_lots` is SIGNED: positive = buy, negative = sell — the sign comes
+/// from the tracked [`ManagedOrder::transaction_type`] (authoritative; the
+/// wire `TxnType` is serde-default and may be empty). The delta is computed
+/// INSIDE the engine from old vs new `traded_qty`, so a duplicate /
+/// same-status re-delivery yields delta 0 → no event (double-count-safe).
+#[derive(Debug, Clone, PartialEq)]
+pub struct FillEvent {
+    /// Instrument the fill belongs to (from the tracked `ManagedOrder`).
+    pub security_id: u64,
+    /// Numeric `ExchangeSegment` code (I-P1-11 composite-identity carrier);
+    /// [`SEGMENT_CODE_UNKNOWN`] when the update's chars are unmappable.
+    pub segment_code: u8,
+    /// Executed lots in this delta. Positive = buy, negative = sell.
+    pub fill_lots: i32,
+    /// Volume-weighted average fill price from the update
+    /// (`AvgTradedPrice`) — the same field the engine copies into the
+    /// tracked order.
+    pub avg_price: f64,
+    /// Contract lot size (from the tracked order; 0 is normalized to 1).
+    pub lot_size: u32,
+    /// The tracked order id (`PAPER-n` in dry-run, Dhan order id live).
+    pub order_id: String,
+}
+
+/// Maps the order-update wire `(Exchange, Segment)` character pair to a
+/// typed [`ExchangeSegment`] (live-order-update.md rule 6: `Segment` is a
+/// single char — `E`=Equity, `D`=Derivatives, `I`=Index). Unknown pairs
+/// return `None` — never panic (annexure rule 15).
+#[must_use]
+pub fn parse_segment_chars(exchange: &str, segment: &str) -> Option<ExchangeSegment> {
+    match (exchange, segment) {
+        ("NSE", "D") => Some(ExchangeSegment::NseFno),
+        ("BSE", "D") => Some(ExchangeSegment::BseFno),
+        ("NSE", "E") => Some(ExchangeSegment::NseEquity),
+        ("BSE", "E") => Some(ExchangeSegment::BseEquity),
+        (_, "I") => Some(ExchangeSegment::IdxI),
+        _ => None,
     }
 }
 
@@ -2053,6 +2109,22 @@ pub enum OmsError {
     #[error("max modifications ({max}) exceeded for order {order_id}")]
     MaxModificationsExceeded { order_id: String, max: u32 },
 
+    /// Cluster F: a live order was refused by the order-readiness gate
+    /// (fail-closed on never-probed / stale / invalid profile / token headroom).
+    #[error("order readiness gate refused: {reason} (ORDER-READY-01)")]
+    OrderReadinessRefused { reason: &'static str },
+
+    /// Cluster F: the OMS order path is HALTED (DH-901 post-retry / DH-902 /
+    /// DH-903 / DATA-810). Cleared only by an operator (`clear_order_halt`) or
+    /// a process restart — never by `reset_daily`. Field is `cause` (not
+    /// `source`) because `&'static str` is not an `std::error::Error`.
+    #[error("OMS order path HALTED by {cause} — operator action required")]
+    OrderPathHalted { cause: &'static str },
+
+    /// Cluster F: DATA-805 stop-all cooldown is active — every order-API call is
+    /// refused for the remaining window, then resumes passively.
+    #[error("Dhan DATA-805 stop-all cooldown active ({remaining_secs}s remaining)")]
+    StopAllCooldown { remaining_secs: u64 },
     /// The /alerts/* client surface is DISARMED (hardcoded default). No HTTP was
     /// attempted. Arming is #[cfg(test)]-only until a dated operator-quote
     /// activation PR exists.
@@ -2667,12 +2739,41 @@ mod tests {
             OmsError::TokenExpired,
             OmsError::HttpError("connection refused".to_owned()),
             OmsError::JsonError("unexpected token".to_owned()),
+            OmsError::OrderReadinessRefused { reason: "stale" },
+            OmsError::OrderPathHalted { cause: "DH-901" },
+            OmsError::StopAllCooldown { remaining_secs: 42 },
         ];
 
         for err in &all_errors {
             let display = err.to_string();
             assert!(!display.is_empty(), "Display must not be empty for {err:?}");
         }
+    }
+
+    #[test]
+    fn test_display_order_readiness_refused() {
+        let err = OmsError::OrderReadinessRefused {
+            reason: "profile_invalid",
+        };
+        let s = err.to_string();
+        assert!(s.contains("profile_invalid"));
+        assert!(s.contains("ORDER-READY-01"));
+    }
+
+    #[test]
+    fn test_display_order_path_halted() {
+        let err = OmsError::OrderPathHalted { cause: "DH-902" };
+        let s = err.to_string();
+        assert!(s.contains("DH-902"));
+        assert!(s.contains("HALTED"));
+    }
+
+    #[test]
+    fn test_display_stop_all_cooldown() {
+        let err = OmsError::StopAllCooldown { remaining_secs: 17 };
+        let s = err.to_string();
+        assert!(s.contains("17"));
+        assert!(s.contains("805"));
     }
 
     #[test]
@@ -3902,6 +4003,58 @@ mod tests {
         let resp: DhanCancelOrderResponse = serde_json::from_str(json).unwrap();
         assert_eq!(resp.order_id, "ORD-123");
         assert_eq!(resp.order_status, "CANCELLED");
+    }
+
+    // -----------------------------------------------------------------------
+    // FillEvent + segment-char mapping (order-runtime dry-run PR, 2026-07-14)
+    // -----------------------------------------------------------------------
+
+    /// The full wire-char → segment matrix from live-order-update.md rule 6,
+    /// plus the fail-closed unknown arms (annexure rule 15 — None, no panic).
+    #[test]
+    fn test_parse_segment_chars_matrix() {
+        assert_eq!(
+            parse_segment_chars("NSE", "D"),
+            Some(ExchangeSegment::NseFno)
+        );
+        assert_eq!(
+            parse_segment_chars("BSE", "D"),
+            Some(ExchangeSegment::BseFno)
+        );
+        assert_eq!(
+            parse_segment_chars("NSE", "E"),
+            Some(ExchangeSegment::NseEquity)
+        );
+        assert_eq!(
+            parse_segment_chars("BSE", "E"),
+            Some(ExchangeSegment::BseEquity)
+        );
+        // Indices: any exchange with segment "I" maps to IDX_I (both NSE and
+        // BSE indices live in the IDX_I segment per annexure rule 2).
+        assert_eq!(parse_segment_chars("NSE", "I"), Some(ExchangeSegment::IdxI));
+        assert_eq!(parse_segment_chars("BSE", "I"), Some(ExchangeSegment::IdxI));
+        // Unknown / empty / currency / commodity → None, never panic.
+        assert_eq!(parse_segment_chars("", ""), None);
+        assert_eq!(parse_segment_chars("NSE", "C"), None);
+        assert_eq!(parse_segment_chars("MCX", "M"), None);
+        assert_eq!(parse_segment_chars("NSE", "X"), None);
+    }
+
+    #[test]
+    fn test_fill_event_carries_segment_sentinel_for_unknown() {
+        // The engine maps a None from parse_segment_chars to the sentinel;
+        // pin the sentinel value so downstream consumers can rely on it.
+        assert_eq!(SEGMENT_CODE_UNKNOWN, u8::MAX);
+        let fill = FillEvent {
+            security_id: 13,
+            segment_code: SEGMENT_CODE_UNKNOWN,
+            fill_lots: 1,
+            avg_price: 100.0,
+            lot_size: 1,
+            order_id: "PAPER-1".to_string(),
+        };
+        assert_eq!(fill.segment_code, SEGMENT_CODE_UNKNOWN);
+        assert_eq!(fill.fill_lots, 1);
     }
 
     // -----------------------------------------------------------------------

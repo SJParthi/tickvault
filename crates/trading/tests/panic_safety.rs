@@ -198,6 +198,9 @@ fn no_panic_oms_error_display_all_variants() {
         OmsError::TokenExpired,
         OmsError::HttpError(String::new()),
         OmsError::JsonError(String::new()),
+        OmsError::OrderReadinessRefused { reason: "" },
+        OmsError::OrderPathHalted { cause: "" },
+        OmsError::StopAllCooldown { remaining_secs: 0 },
     ];
 
     for err in errors {
