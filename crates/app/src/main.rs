@@ -29,6 +29,11 @@
 // cosmetic markdown-rendering nicety with zero runtime/behavior impact.
 #![allow(clippy::doc_lazy_continuation)]
 #![allow(clippy::doc_overindented_list_items)]
+// Match the lib.rs restriction-lint blanket for the binary crate root:
+// no unwrap/expect/print/dbg in production code.
+#![cfg_attr(not(test), deny(clippy::unwrap_used))]
+#![cfg_attr(not(test), deny(clippy::expect_used))]
+#![deny(clippy::print_stdout, clippy::print_stderr, clippy::dbg_macro)]
 
 // Modules are declared in lib.rs for coverage instrumentation.
 use tickvault_app::boot_helpers::{
@@ -336,6 +341,8 @@ async fn main() -> Result<()> {
     // rustls 0.23+ requires an explicit CryptoProvider. Both tokio-tungstenite
     // (WSS to Dhan) and reqwest (HTTPS to Dhan REST) depend on rustls.
     // Using aws-lc-rs as the provider (already in the dependency tree).
+    // APPROVED: bootstrap — TLS mandatory, install cannot fail-soft
+    #[allow(clippy::expect_used)]
     rustls::crypto::aws_lc_rs::default_provider()
         .install_default()
         .expect("failed to install rustls CryptoProvider — cannot proceed without TLS"); // APPROVED: bootstrap — TLS mandatory, failure is fatal
