@@ -366,7 +366,7 @@ const LEGACY_EXTRA_CANDLE_MATVIEW_NAMES: [&str; 5] = [
 /// SEBI 5-year retention obligation and must never be auto-dropped; the
 /// other audit tables were already retired with their own boot wiring in
 /// #T2. This list is ONLY the instrument / misc / greeks tables.
-const RETIRED_QUESTDB_TABLES: [&str; 12] = [
+const RETIRED_QUESTDB_TABLES: [&str; 14] = [
     // #T3 — instrument tables
     "fno_underlyings",
     "derivative_contracts",
@@ -382,6 +382,9 @@ const RETIRED_QUESTDB_TABLES: [&str; 12] = [
     "pcr_snapshots",
     "dhan_option_chain_raw",
     "greeks_verification",
+    // dead REST-era feed tables (drop-sweep 2026-07-17)
+    "deep_market_depth",
+    "movers_1s",
 ];
 
 /// Idempotently drop every legacy QuestDB object so the live schema
@@ -815,8 +818,8 @@ mod tests {
     }
 
     #[test]
-    fn test_retired_questdb_tables_count_is_twelve_and_unique() {
-        assert_eq!(RETIRED_QUESTDB_TABLES.len(), 12);
+    fn test_retired_questdb_tables_count_is_fourteen_and_unique() {
+        assert_eq!(RETIRED_QUESTDB_TABLES.len(), 14);
         let mut seen = std::collections::HashSet::new();
         for table in RETIRED_QUESTDB_TABLES {
             assert!(seen.insert(table), "duplicate retired table: {table}");

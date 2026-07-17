@@ -2072,6 +2072,50 @@ rules:
       re-run once the underlying condition (BruteX producer publish, S3
       reachability, QuestDB health per BOOT-01/02) is fixed.
 
+  # SPOT-XVERIFY-01 (spot cross-verify comparator) = the daily 15:47 IST
+  # Dhan-vs-Groww spot 1m cross-verify found >=1 divergent / missing cell.
+  # Escalate — NOT auto-triage safe (severity-independent is_auto_triage_safe
+  # override, the BRUTEX-XVERIFY-01 / FUTIDX-02 precedent): a data-
+  # comparability signal is never auto-actioned; the operator decides which
+  # capture chain drifted. Both feeds re-produce tomorrow; the audit rows are
+  # the durable record — never hand-patch either table.
+  - name: spot-xverify-01-divergence-found-escalate
+    match:
+      code: SPOT-XVERIFY-01
+    action: escalate
+    runbook_path: .claude/rules/project/spot-crossverify-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 600
+    justification: >-
+      SPOT-XVERIFY-01 = the daily Dhan-vs-Groww spot 1-minute cross-verify
+      found divergent / missing cells. Data-comparability signal — never
+      auto-actioned (severity-independent is_auto_triage_safe override): the
+      operator inspects spot_crossverify_cell_audit (field/kind breakdown)
+      and the day's per-feed spot 1m REST health to decide which capture
+      chain drifted. Track the trend, not the absolute count.
+
+  # SPOT-XVERIFY-02 (spot cross-verify comparator) = a leg of the daily run
+  # degraded (questdb read/write, join/parse, wall-clock cap, keep-better
+  # suppression). The degrade is honestly stamped (partial/no_data/blind/
+  # degraded — never a false clean); the run is DEDUP-idempotent and the
+  # keep-better guard protects a measured day, so escalate = the operator
+  # re-runs after fixing the underlying QuestDB condition.
+  - name: spot-xverify-02-run-degraded-escalate
+    match:
+      code: SPOT-XVERIFY-02
+    action: escalate
+    runbook_path: .claude/rules/project/spot-crossverify-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 600
+    justification: >-
+      SPOT-XVERIFY-02 = the daily spot cross-verify run degraded on one leg
+      (QuestDB read/write, join/parse, wall-clock cap, keep-better
+      suppression). Best-effort cold-path forensic compare — feeds/capture/
+      trading are unaffected; escalate so the operator knows the day is
+      partial/no_data/blind/degraded and can backfill via the DEDUP-
+      idempotent re-run once the underlying QuestDB condition (per
+      BOOT-01/02) is fixed.
+
   # -----------------------------------------------------------------------
   # Per-minute spot 1m REST pipeline (operator grant 2026-07-12, PR-2)
   # -----------------------------------------------------------------------
