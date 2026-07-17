@@ -748,7 +748,8 @@ fn today_ist() -> NaiveDate {
 }
 
 /// Retrieval wall-clock instant as IST nanoseconds.
-fn fetched_at_ist_nanos_now() -> i64 {
+/// `pub(crate)` since 2026-07-17: shared with `crate::dhan_cadence_executor`.
+pub(crate) fn fetched_at_ist_nanos_now() -> i64 {
     chrono::Utc::now()
         .timestamp_nanos_opt()
         .unwrap_or(0)
@@ -1537,8 +1538,8 @@ struct ChainServingHealth {
 /// sentinel (measured only into the `tv_chain1m_fetch_duration_ms`
 /// histogram — threading it out of the ladder is out of scope, stated
 /// honestly). Pure.
-#[allow(clippy::too_many_arguments)] // APPROVED: private forensics builder — a struct would be pure ceremony
-fn build_dhan_chain_audit_row(
+#[allow(clippy::too_many_arguments)] // APPROVED: crate-private forensics builder — a struct would be pure ceremony
+pub(crate) fn build_dhan_chain_audit_row(
     target_minute_ist_nanos: i64,
     trading_date_nanos: i64,
     security_id: u64,
@@ -1575,7 +1576,7 @@ fn build_dhan_chain_audit_row(
 /// verdict and the failure edge are never affected by the forensics leg.
 /// Dhan emit sites stay field-less on the CHAIN codes per the rule-file
 /// convention (grep-split by `feed="groww"`).
-fn chain_audit_append_best_effort(
+pub(crate) fn chain_audit_append_best_effort(
     audit_writer: &mut RestFetchAuditWriter,
     row: &RestFetchAuditRow,
 ) {
@@ -1593,7 +1594,7 @@ fn chain_audit_append_best_effort(
 }
 
 /// Best-effort forensics flush (same never-affects-the-loop contract).
-fn chain_audit_flush_best_effort(audit_writer: &mut RestFetchAuditWriter) {
+pub(crate) fn chain_audit_flush_best_effort(audit_writer: &mut RestFetchAuditWriter) {
     if let Err(err) = audit_writer.flush() {
         metrics::counter!("tv_rest_fetch_audit_persist_errors_total", "stage" => "audit_flush")
             .increment(1);

@@ -1240,7 +1240,8 @@ fn ist_secs_of_day_now() -> u32 {
 }
 
 /// IST milliseconds-of-day from the wall clock (close→data latency math).
-fn ist_millis_of_day_now() -> i64 {
+/// `pub(crate)` since 2026-07-17: shared with `crate::dhan_cadence_executor`.
+pub(crate) fn ist_millis_of_day_now() -> i64 {
     let now_ist_ms = chrono::Utc::now()
         .timestamp_millis()
         .saturating_add(i64::from(IST_UTC_OFFSET_SECONDS) * MILLIS_PER_SEC);
@@ -1248,7 +1249,8 @@ fn ist_millis_of_day_now() -> i64 {
 }
 
 /// IST calendar date for "now" (the orphan-watchdog helper).
-fn today_ist() -> NaiveDate {
+/// `pub(crate)` since 2026-07-17: shared with `crate::dhan_cadence_executor`.
+pub(crate) fn today_ist() -> NaiveDate {
     let utc = DateTime::from_timestamp(chrono::Utc::now().timestamp(), 0).unwrap_or_default();
     (utc + ChronoDuration::seconds(i64::from(IST_UTC_OFFSET_SECONDS))).date_naive()
 }
@@ -2125,7 +2127,9 @@ fn record_skipped_boundaries(
 /// Build one `spot_1m_rest` row from a parsed candle. The `close_to_data_ms`
 /// stamp is the caller's HONEST retrieval delay (own-fire latency, or the
 /// > 60 s real delay for a backfilled minute).
-fn build_spot_1m_row(
+// `pub(crate)` since 2026-07-17: shared with `crate::dhan_cadence_executor`
+// (the cadence lane persists through the SAME row builder — one shape).
+pub(crate) fn build_spot_1m_row(
     candle: &MinuteCandle,
     security_id: SecurityId,
     symbol: &'static str,
@@ -2183,8 +2187,8 @@ fn spot_1m_symbol_for_sid(security_id: SecurityId) -> &'static str {
 /// LAST-written error_class wins for that key. The outcome-level truth is
 /// unaffected (`outcome` IS in-key — transition rows with distinct
 /// outcomes both survive).
-#[allow(clippy::too_many_arguments)] // APPROVED: private forensics builder — a struct would be pure ceremony
-fn build_dhan_fetch_audit_row(
+#[allow(clippy::too_many_arguments)] // APPROVED: crate-private forensics builder — a struct would be pure ceremony
+pub(crate) fn build_dhan_fetch_audit_row(
     target_minute_ist_nanos: i64,
     trading_date_nanos: i64,
     security_id: SecurityId,
@@ -2221,7 +2225,10 @@ fn build_dhan_fetch_audit_row(
 /// affected by the forensics leg. Dhan emit sites stay field-less on the
 /// SPOT1M codes per the rule-file convention (grep-split by
 /// `feed="groww"`).
-fn audit_append_best_effort(audit_writer: &mut RestFetchAuditWriter, row: &RestFetchAuditRow) {
+pub(crate) fn audit_append_best_effort(
+    audit_writer: &mut RestFetchAuditWriter,
+    row: &RestFetchAuditRow,
+) {
     if let Err(err) = audit_writer.append_row(row) {
         metrics::counter!("tv_rest_fetch_audit_persist_errors_total", "stage" => "audit_append")
             .increment(1);
@@ -2236,7 +2243,7 @@ fn audit_append_best_effort(audit_writer: &mut RestFetchAuditWriter, row: &RestF
 }
 
 /// Best-effort forensics flush (same never-affects-the-loop contract).
-fn audit_flush_best_effort(audit_writer: &mut RestFetchAuditWriter) {
+pub(crate) fn audit_flush_best_effort(audit_writer: &mut RestFetchAuditWriter) {
     if let Err(err) = audit_writer.flush() {
         metrics::counter!("tv_rest_fetch_audit_persist_errors_total", "stage" => "audit_flush")
             .increment(1);
