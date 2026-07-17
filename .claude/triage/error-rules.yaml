@@ -1688,29 +1688,9 @@ rules:
       (NATS reject, subscribe failure, SDK decode error, SSM/boto3 failure)
       instead of only the fixed Telegram wording.
 
-  # WS-REINJECT-01 = the boot-time STAGE-C.2b WAL re-injection aborted — the
-  # frame-channel consumer (tick processor) was dead (channel closed) or
-  # wedged (per-send timeout). The undelivered remainder stays durably staged
-  # in the WAL replaying/ directory and re-replays next boot, so the abort
-  # self-heals across a restart — but a dead/wedged consumer at boot needs
-  # operator eyes (cross-check WS-GAP-07 / BOOT-01 / PROC-01).
-  - name: ws-reinject-01-aborted-escalate
-    match:
-      code: WS-REINJECT-01
-    action: escalate
-    runbook_path: .claude/rules/project/ws-reinject-error-codes.md
-    confidence: 1.0
-    cooldown_secs: 300
-    justification: >-
-      WS-REINJECT-01 = the bounded chunked-backpressure WAL re-injection
-      (C3 fix for the 2026-07-03 dropped=1,127,801 storm) aborted because the
-      tick-processor consumer was dead or made zero progress for the per-send
-      timeout. No frame is silently lost — the remainder stays staged in
-      replaying/ for re-replay next boot and confirm_replayed() is skipped —
-      but the underlying consumer death/wedge (WS-GAP-07 / QuestDB /
-      host-pressure class) needs operator root-cause. Escalate (Telegram +
-      draft Issue) with a 5-min cooldown; the next boot's replay self-heals
-      the data path.
+  # 2026-07-17 (evidence-audit Fix PR C): rule `ws-reinject-01-aborted-escalate` retired — the
+  # WS-REINJECT-01 ErrorCode variant was deleted with its orphaned emitter (wal_reinject.rs had
+  # zero production callers; main.rs count-residuals + confirm_replayed are the retained coverage).
 
   # HTTP-CLIENT-01 = reqwest ClientBuilder::build() failed at a storage
   # HTTP-client site (TLS backend / resolver init / fd exhaustion). The site
