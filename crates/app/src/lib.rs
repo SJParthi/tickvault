@@ -40,6 +40,14 @@ pub mod brutex_crossverify_boot;
 // executors both lanes day 1 — no REST caller). Runbook:
 // `.claude/rules/project/cadence-error-codes.md`.
 pub mod cadence_boot;
+pub(crate) mod cadence_escalation;
+/// Real Dhan cadence executor — limiter-free, gate-pacing honored (the runner
+/// pre-acquires gates; this executor issues ONE bounded request per call).
+pub mod dhan_cadence_executor;
+/// Real Groww cadence executor — the Groww twin (gate-free lane by
+/// construction; ONE bounded request per call; token = shared-minter SSM
+/// READ-ONLY, never minted).
+pub mod groww_cadence_executor;
 // Phase 0 Item 20 (wired 2026-06-13): supervised 15:25 IST orphan-position
 // watchdog — daily open-position safety gate (alert-only in sandbox/dry-run).
 pub mod orphan_position_watchdog_boot;

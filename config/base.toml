@@ -469,7 +469,7 @@ compare_volume           = false    # groww live volume is always 0
 # (fail-safe); `enabled = false` is the rollback switch.
 # ===========================================================================
 [spot_1m_rest]
-enabled = true
+enabled = false # stood down 2026-07-17 — the cadence scheduler's real executors own the Dhan spot pulls (RS3 mutual exclusion)
 # 2026-07-14 serving-delay diagnostics rider: LOG-ONLY one-shot probes
 # (first session fire after boot + once at ~11:00 IST; ≤6 bounded extra
 # requests/day, ~300ms apart, inside the Data-API budget) that log the
@@ -522,7 +522,7 @@ target_rps = 3
 # canary if `enabled` is ever rolled back).
 # ===========================================================================
 [option_chain_1m]
-enabled = true  # entitlement proven live 2026-07-13 08:31:49 IST (§8.7)
+enabled = false # stood down 2026-07-17 — the cadence scheduler's real executors own the Dhan chain pulls (RS3; entitlement remains proven live 2026-07-13, §8.7)
 probe_and_report = true
 
 # ===========================================================================
@@ -538,7 +538,7 @@ probe_and_report = true
 # section = disabled (fail-safe); `enabled = false` is the rollback switch.
 # ===========================================================================
 [groww_spot_1m]
-enabled = true
+enabled = false # stood down 2026-07-17 — the cadence scheduler's real executors own the Groww spot pulls (RS3)
 
 # ===========================================================================
 # [groww_universe] — process-global daily Groww watch-set + shared-master
@@ -567,7 +567,7 @@ enabled = true
 # nothing) — flip enabled = true only after the probe passes.
 # ===========================================================================
 [groww_option_chain_1m]
-enabled = true # flipped 2026-07-13 after the live probe PASSED (groww-second-feed-scope §38.6); serde default stays OFF
+enabled = false # stood down 2026-07-17 — the cadence scheduler's real executors own the Groww chain pulls (RS3; probe PASSED 2026-07-13, §38.6)
 probe_and_report = true # inert while enabled; the rollback canary (the Dhan §8.7 precedent)
 
 # ===========================================================================
@@ -797,7 +797,13 @@ enabled = false
 # + the dated rule-file note per
 # `.claude/rules/project/cadence-error-codes.md`.
 [cadence]
-enabled = false
+enabled = true # flipped 2026-07-17 — REAL broker executors both lanes (the legacy per-minute legs stand down above per the RS3 mutual exclusion)
+# Broker lane gates (fix round 2026-07-17): the cadence REST lanes are
+# deliberately INDEPENDENT of the retired live-WS flags
+# feeds.dhan_enabled/groww_enabled (false in prod, runtime enable 409'd).
+# Config + restart to change — no runtime toggle.
+dhan_lane = true
+groww_lane = true
 # The Dhan post-close burst second (operator 2026-07-16 "all 7 parallel
 # at first second" — the same-day correction): at T + this, ALL 7
 # requests fire concurrently — 3 chains (the 3s rule is per-(underlying,

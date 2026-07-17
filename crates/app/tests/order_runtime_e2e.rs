@@ -164,3 +164,78 @@ async fn order_runtime_e2e_orphan_updates_and_mark_drain() {
 
     supervisor.abort();
 }
+
+/// Fix F (2026-07-17 respawn flap): the mark producers are DAY-SCOPED — the
+/// Groww per-minute REST legs' supervisors exit at day completion (~15:31
+/// IST, after the post-session sweep) and drop the last `MarkForwarder`
+/// clones, closing the mark mpsc for the rest of the process lifetime. The
+/// runtime must treat that close as a steady state: disarm the mark arm and
+/// KEEP LOOPING. Pre-fix, Arm 2 `return`ed on the closed channel; the
+/// supervisor classified the exit `clean_exit` and respawned an inner that
+/// re-read the SAME closed channel and exited again within milliseconds — a
+/// permanent respawn flap (escalating to the 300s backoff cap) that reset
+/// the paper book on every step, observed live from 15:31 IST 2026-07-17
+/// through post-close and again from the fresh 16:08 deploy.
+///
+/// The observable contract: after the mark sender drops, the inner task must
+/// stay alive — the order-update broadcast keeps its ONE receiver, so
+/// `send()` keeps succeeding (with the bug, the dead inner drops its
+/// receiver and `send()` errors during the respawn backoff window).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn order_runtime_e2e_mark_channel_close_does_not_exit_the_loop() {
+    let config = Arc::new(load_base_config());
+    let calendar = Arc::new(
+        TradingCalendar::from_config(&config.trading)
+            .expect("base.toml trading calendar must build"),
+    );
+    let notifier = NotificationService::disabled();
+
+    let (order_update_sender, first_rx) = tokio::sync::broadcast::channel::<OrderUpdate>(256);
+    let (mark_tx, mark_rx) = tokio::sync::mpsc::channel::<MarkUpdate>(64);
+    let marks_wanted = Arc::new(AtomicBool::new(false));
+    let auth_notify = Arc::new(tokio::sync::Notify::new());
+    let token_handle: tickvault_core::auth::token_manager::TokenHandle =
+        Arc::new(arc_swap::ArcSwap::from_pointee(None));
+
+    let supervisor = spawn_order_runtime(OrderRuntimeParams {
+        config,
+        notifier,
+        calendar,
+        order_update_sender: order_update_sender.clone(),
+        first_order_update_rx: first_rx,
+        mark_rx,
+        marks_wanted: Arc::clone(&marks_wanted),
+        token_handle,
+        client_id: "1106656882".to_string(),
+        auth_notify,
+    });
+
+    // Prove the runtime is up first (the receiver is alive).
+    order_update_sender
+        .send(orphan_traded_update("P"))
+        .expect("runtime receiver must be alive before the mark-channel close");
+
+    // Day end: the last day-scoped mark producer drops its sender.
+    drop(mark_tx);
+
+    // Pre-fix the inner task observed the close and returned within
+    // milliseconds, dropping its broadcast receiver (the supervisor then sat
+    // in its 5s respawn backoff with ZERO receivers). Post-fix the inner
+    // disarms the mark arm and keeps looping — sends keep succeeding.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    for _ in 0..3 {
+        assert!(
+            order_update_sender.send(orphan_traded_update("P")).is_ok(),
+            "order-update send failed after the mark channel closed — the \
+             runtime inner task exited (the clean_exit respawn flap)"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        !supervisor.is_finished(),
+        "the order-runtime supervisor must stay alive after the mark \
+         channel closes"
+    );
+
+    supervisor.abort();
+}

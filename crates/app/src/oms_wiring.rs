@@ -67,6 +67,7 @@ impl TokenProvider for TokenHandleBridge {
 pub fn build_oms_http_client() -> Result<reqwest::Client, HttpClientBuildError> {
     let built = client_from_build_result(
         reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
             .timeout(std::time::Duration::from_secs(
                 tickvault_common::constants::OMS_HTTP_TIMEOUT_SECS,
             ))
@@ -115,5 +116,25 @@ mod tests {
     fn test_build_oms_http_client_constructs() {
         let client = build_oms_http_client();
         assert!(client.is_ok(), "normal-env build must succeed: {client:?}");
+    }
+
+    /// Source-scan ratchet (the GrowwOrderApiClient
+    /// `ratchet_client_builder_has_no_redirects_and_oversize_caps`
+    /// precedent): the OMS HTTP client builder — the shared client every
+    /// vendor-facing OMS REST call rides — must pin
+    /// `reqwest::redirect::Policy::none()`. The token is header-carried,
+    /// so an unpinned redirect could re-send the `access-token` header to
+    /// a redirect target; the house pattern on all vendor-facing clients
+    /// is an explicit no-redirect pin. Scans the PRODUCTION region only
+    /// (everything before the tests module) so this test's own literals
+    /// can never satisfy it vacuously.
+    #[test]
+    fn ratchet_oms_http_client_builder_pins_redirect_policy_none() {
+        let src = include_str!("oms_wiring.rs");
+        let prod = &src[..src.find("mod tests").expect("tests module")];
+        assert!(
+            prod.contains(".redirect(reqwest::redirect::Policy::none())"),
+            "build_oms_http_client must pin redirect Policy::none() on the builder"
+        );
     }
 }

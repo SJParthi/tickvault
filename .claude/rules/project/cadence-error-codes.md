@@ -320,6 +320,70 @@ Flipping `[cadence] enabled = true` therefore REQUIRES standing ALL the
 legs down first; full subsumption (the cadence lane feeding the legs'
 tables) is the flagged follow-up.
 
+## §0c. 2026-07-17 — real broker executors live; legacy per-minute legs stood down (technical truth-sync)
+
+Dated factual notes on what the code/config does as of 2026-07-17:
+
+- The `DryRunLoggingExecutor` is replaced in `crates/app/src/cadence_boot.rs` by
+  real executors: `crates/app/src/dhan_cadence_executor.rs` +
+  `crates/app/src/groww_cadence_executor.rs`, reusing the legacy legs'
+  limiter-free `*_unpaced` fetch inners (`spot_1m_fetch_once_unpaced` /
+  `chain_fetch_once_unpaced` and the Groww twins; RS5 purity ratchet:
+  `crates/app/tests/cadence_executor_purity_guard.rs`).
+- `config/base.toml` now sets `[cadence] enabled = true` with the four legacy
+  per-minute leg sections (`[spot_1m_rest]`, `[option_chain_1m]`,
+  `[groww_spot_1m]`, `[groww_option_chain_1m]`) `enabled = false`, satisfying
+  the §0b RS3 mutual exclusion (`AppConfig::validate` fail-closes
+  cadence+any-leg).
+- Lane gating: the cadence lanes are seeded from NEW `[cadence] dhan_lane` /
+  `groww_lane` config bools (serde default true) — deliberately INDEPENDENT of
+  the retired `feeds.dhan_enabled`/`groww_enabled` live-WS flags (both false in
+  prod; runtime enable 409'd), which would otherwise park both lanes.
+  Config+restart to change; no runtime lane toggle.
+- Paging/liveness on the cadence path: `tv_rest_1m_fire_heartbeat` is
+  PERSIST-gated (fix round 2 — set only inside the spot flush-ACK guard, the
+  M1 fetch-ok-but-lost-is-not-ok rule; an all-failing session, fetch OR
+  persist, leaves it unset so the market-hours-liveness alarm pages ~09:25
+  IST; mid-session death after first success remains the pre-existing
+  residual). The SPOT1M-01 / CHAIN-02 `stage="escalation"` coded edges + the
+  EXISTING typed Telegram events (Spot1mFetchDegraded/Recovered,
+  ChainFetchDegraded/Recovered + Groww twins) are re-emitted from the executor
+  path via `crates/app/src/cadence_escalation.rs` (3 consecutive fully-failed
+  minutes per lane/leg, minute-finalize-on-rollover — pages lag one minute;
+  the session's last minute never finalizes; edge state is run-scoped). No new
+  NotificationEvent/ErrorCode/terraform surface. The Groww SPOT escalation
+  edge keys on the 3 CORE indices only — INDIA VIX outcomes are excluded
+  from its fully-failed tally (the legacy `groww_spot_1m_boot.rs`
+  `MinuteEdgeTally` / rest-1m §1-item-5 semantics: core-all-failed pages
+  even when VIX alone succeeded), while the Dhan spot edge stays
+  4-SID-keyed incl. VIX, mirroring its legacy `ok_count`.
+- Not-served pagers (fix round 2): the per-SID / per-underlying detectors run
+  executor-side through the SAME `cadence_escalation.rs` minute buckets,
+  REUSING the legacy trackers (`SidServedTracker` + both
+  `UnderlyingServedTracker`s) and the EXISTING typed events
+  (`Spot1mSidNotServed/ServedRecovered`,
+  `Chain1mUnderlyingNotServed/ServedRecovered` + the Groww chain twins);
+  thresholds unchanged (10 counted minutes, counted only with sibling
+  success; auth/entitlement holds the whole minute; the bounded in-cycle
+  retry replaces the first pass). The Groww SPOT leg has NO per-SID detector
+  — the legacy leg had only the VIX arms (mirrored, not invented).
+- IST day roll (fix round 2): the escalation tallies, edge latches and
+  not-served streaks all reset when a lane observes a NEWER IST day (one info
+  line per lane) — a process surviving IST midnight no longer wedges on the
+  secs-of-day minute keys.
+- Honest residuals: the legacy in-minute re-poll ladder, backfill,
+  `batch_catchup` and serving-delay diagnostics do not run on the cadence path
+  (single bounded retry per leg per minute) — a minute both attempts miss
+  stays absent from `spot_1m_rest` unless the Dhan post-session sweep repairs
+  it; the GROWW post-session sweep is NOT wired (Groww minutes both attempts
+  miss stay named gaps); QuestDB flush degradation costs up to ~10s per fire
+  serialized behind the writer Mutex (`block_in_place` — runtime workers
+  unblocked; late snapshots honest-skip). The sweep and the other
+  once-per-process structures are SINGLE-DAY scoped — one fire per boot,
+  which IS one per trading day on the prod schedule (the box restarts
+  daily); a multi-day dev process gets day-2 sweep coverage only after a
+  restart.
+
 ## §1. CADENCE-01 — a broker lane degraded inside a cycle
 
 **Severity:** High. **Auto-triage safe:** Yes (the cycle already ended; the
