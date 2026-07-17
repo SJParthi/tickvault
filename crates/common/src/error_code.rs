@@ -809,6 +809,26 @@ pub enum ErrorCode {
     /// Severity::High, auto-triage-safe (the degrade already happened —
     /// the operator inspects; the next trading day re-runs).
     BrutexXverify02RunDegraded,
+    /// SPOT-XVERIFY-01 (Dhan↔Groww spot cross-broker comparator) — the
+    /// 15:47 IST run found ≥1 divergent OHLC cell (or a minute present in
+    /// only one feed) between our stored `spot_1m_rest` rows `feed='dhan'`
+    /// vs `feed='groww'` for the same (trading day, minute, canonical
+    /// index). Neither feed is ground truth — a divergence-TREND signal.
+    /// Severity::High; NOT auto-triage-safe (severity-independent override
+    /// — the operator judges which capture is wrong; the FUTIDX-02
+    /// precedent). Fires ONE coalesced emission per run, never per row.
+    SpotXverify01MismatchFound,
+    /// SPOT-XVERIFY-02 (Dhan↔Groww spot cross-broker comparator) — the
+    /// 15:47 IST run itself DEGRADED: the QuestDB `/exec` read failed, a
+    /// query truncated at its row cap, the response exceeded the body cap,
+    /// the DDL ensure failed, the forensic ILP write was rejected, or the
+    /// run budget elapsed. The day is stamped `no_data` / `blind` /
+    /// `degraded` — never a fabricated clean verdict (Rule 11).
+    /// Best-effort cold path: the live feeds, tick capture and trading are
+    /// NEVER affected; DEDUP-idempotent tables let a healthy re-run backfill.
+    /// Severity::High, auto-triage-safe (the degrade already happened —
+    /// the operator inspects; the next trading day re-runs).
+    SpotXverify02RunDegraded,
     /// SPOT1M-01 (per-minute REST pipeline PR-2, operator grant 2026-07-12)
     /// — the per-minute spot 1m REST fetch degraded: a whole minute failed
     /// for one/all of the 3 IDX_I spot indices (transport error, non-2xx,
@@ -1358,6 +1378,9 @@ impl ErrorCode {
             // BruteX↔TickVault daily cross-verify (2026-07-12)
             Self::BrutexXverify01DivergenceFound => "BRUTEX-XVERIFY-01",
             Self::BrutexXverify02RunDegraded => "BRUTEX-XVERIFY-02",
+            // Dhan↔Groww spot cross-broker comparator
+            Self::SpotXverify01MismatchFound => "SPOT-XVERIFY-01",
+            Self::SpotXverify02RunDegraded => "SPOT-XVERIFY-02",
             // Per-minute spot 1m REST pipeline (operator grant 2026-07-12)
             Self::Spot1m01FetchDegraded => "SPOT1M-01",
             Self::Spot1m02PersistFailed => "SPOT1M-02",
@@ -1567,6 +1590,12 @@ impl ErrorCode {
             // divergence / degraded run. Loud (Telegram High), never a
             // halt; the live feeds + tick capture are unaffected.
             Self::BrutexXverify01DivergenceFound | Self::BrutexXverify02RunDegraded => {
+                Severity::High
+            }
+            // SPOT-XVERIFY-01/02 (Dhan↔Groww spot cross-broker comparator)
+            // — divergence found / run degraded. Loud (Telegram High),
+            // never a halt; both live feeds + tick capture are unaffected.
+            Self::SpotXverify01MismatchFound | Self::SpotXverify02RunDegraded => {
                 Severity::High
             }
             // TF-VERIFY-01/02 (operator 2026-07-13) — the daily
@@ -1916,6 +1945,10 @@ impl ErrorCode {
             Self::BrutexXverify01DivergenceFound | Self::BrutexXverify02RunDegraded => {
                 ".claude/rules/project/brutex-crossverify-error-codes.md"
             }
+            // Dhan↔Groww spot cross-broker comparator
+            Self::SpotXverify01MismatchFound | Self::SpotXverify02RunDegraded => {
+                ".claude/rules/project/spot-crossverify-error-codes.md"
+            }
             // Per-minute spot 1m REST pipeline (operator grant 2026-07-12)
             Self::Spot1m01FetchDegraded | Self::Spot1m02PersistFailed => {
                 ".claude/rules/project/rest-1m-pipeline-error-codes.md"
@@ -2029,6 +2062,11 @@ impl ErrorCode {
             Self::Futidx02CrossFeedExpiryMismatch
                 | Self::WalSuspend01TableSuspended
                 | Self::BrutexXverify01DivergenceFound
+                // SPOT-XVERIFY-01 (Dhan↔Groww spot cross-broker
+                // comparator): a cross-broker OHLC divergence is a
+                // data-comparability VERDICT — the operator judges which
+                // capture is wrong; the FUTIDX-02 precedent.
+                | Self::SpotXverify01MismatchFound
                 // CHAIN-01 (PR-3, 2026-07-12): restoring the option-chain
                 // Data-API entitlement is an operator/broker ACCOUNT
                 // decision — never auto-actioned despite High severity.
@@ -2221,6 +2259,9 @@ impl ErrorCode {
             // BruteX↔TickVault daily cross-verify (2026-07-12)
             Self::BrutexXverify01DivergenceFound,
             Self::BrutexXverify02RunDegraded,
+            // Dhan↔Groww spot cross-broker comparator
+            Self::SpotXverify01MismatchFound,
+            Self::SpotXverify02RunDegraded,
             // Per-minute spot 1m REST pipeline (operator grant 2026-07-12)
             Self::Spot1m01FetchDegraded,
             Self::Spot1m02PersistFailed,
