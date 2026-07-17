@@ -25,6 +25,18 @@
   - Files: crates/common/src/error_code.rs (variant, code_str, severity arm, runbook arm, all(), catalogue count 161→160, prefix allowlist, dedicated contract test), crates/common/tests/error_code_rule_file_crossref.rs (REVERSE_CHECK_ALLOWLIST)
   - Tests: test_all_list_length_matches_catalogue_size, test_code_str_follows_expected_prefix_pattern, every_error_code_variant_appears_in_a_rule_file, every_rule_file_code_has_an_enum_variant
 
+## Per-Item Guarantee Matrix
+
+See `per-wave-guarantee-matrix.md` (`.claude/rules/project/`) — all 15 rows of
+the 100% Guarantee Matrix and all 7 rows of the Resilience Demand Matrix apply
+to every item in this plan. This PR is deletion-only (a dead paging filter +
+its orphaned emit path): the rows are satisfied by the build-failing ratchets
+named in the Test Plan (catalogue count, prefix pattern, bidirectional
+crossref, paging drift guard, triage rules guard), and no row is weakened —
+no new tick-drop path, no hot-path change, DEDUP/WAL/recovery chains
+untouched. Honest envelope: 100% inside the tested envelope, with ratcheted
+regression coverage — no stronger claim is made.
+
 ## Design
 
 The 2026-07-17 coordinator evidence audit found the `ws-reinject-01` CloudWatch

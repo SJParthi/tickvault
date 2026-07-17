@@ -355,7 +355,8 @@ fn global_ring() -> &'static FeedLagRing {
     DHAN_LAG_RING.get_or_init(|| {
         // Live-boundary stamp (cold, once per process). The tick processor
         // spawns BEFORE the WAL reinject await and the WS pool spawns
-        // AFTER it (ratcheted in wal_reinject.rs), so this init runs no
+        // AFTER it (was ratcheted in the now-retired wal_reinject module,
+        // deleted 2026-07-17, evidence-audit Fix PR C), so this init runs no
         // later than the first observed frame: boot-replayed frames
         // (captured by a previous process) always predate the boundary,
         // and live frames (captured after the WS pool spawns) always

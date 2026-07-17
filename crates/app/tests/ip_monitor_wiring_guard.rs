@@ -14,8 +14,9 @@
 //! fully-unit-tested but un-spawned, pending the live-trading re-wire
 //! into `dhan_rest_stack` (which owns the order-update WS + the future
 //! order path) — tracked follow-up alongside the other retained-dormant
-//! modules (fast_boot_validation.rs, wal_reinject.rs,
-//! daily_universe_boot.rs). Re-wiring it MUST restore the
+//! modules (fast_boot_validation.rs, daily_universe_boot.rs;
+//! wal_reinject.rs left this list 2026-07-17 — deleted outright,
+//! evidence-audit Fix PR C). Re-wiring it MUST restore the
 //! `for_runtime(verified_ip, dry_run)` halt gate this guard pinned.
 
 #[test]
