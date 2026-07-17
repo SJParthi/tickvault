@@ -113,6 +113,9 @@ const REVERSE_CHECK_ALLOWLIST: &[&str] = &[
     // (dhan-rest-only-noise-lock-2026-07-14.md: "variant retained until
     // the C4 variant sweep"). Rule-file history retained.
     "AUTH-GAP-06",
+    // GROWW-PUSH-01..04 (Stage 0 stubs, 2026-07-16) were REMOVED from this
+    // allowlist when Stage A landed their `GrowwPush0*` ErrorCode variants
+    // (the documented Stage-A obligation of the Stage-0 entry).
 ];
 
 #[test]

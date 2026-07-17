@@ -77,6 +77,11 @@ dhat = { workspace = true }
 # formerly-gated SEBI persistence modules in `tickvault-storage` are now
 # compiled unconditionally.
 default = []
+# Groww order-side (§39.2 Gate 2 — non-default): pulls the trading-side
+# order/position PUSH channel + the common-side gate/config surface so the
+# Stage D app consumer (`groww_order_observability`) can compile. NEVER in
+# `default` — a default build carries no Groww order code.
+groww_orders = ["tickvault-trading/groww_orders", "tickvault-common/groww_orders"]
 
 [[bench]]
 name = "order_gate"

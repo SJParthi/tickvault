@@ -18,7 +18,10 @@
 //! scope (NIFTY/BANKNIFTY/SENSEX/INDIA VIX) ranked gainers/losers/most-
 //! active snapshots are meaningless — there are only 4 instruments.
 
-pub mod boot_ordering_gate;
+// Dead live-WS sweep stage 1 (2026-07-17, operator directive via
+// coordinator): `boot_ordering_gate` + `first_seen_set` DELETED — both
+// had ZERO production callers (only comments referenced them since the
+// PR-C2 Dhan live-WS lane deletion 2026-07-13).
 pub mod chain_day_store;
 pub mod chain_snapshot;
 // Candle-engine re-architecture #T1b: `candle_aggregator` (Engine A)
@@ -27,7 +30,6 @@ pub mod chain_snapshot;
 pub mod feed_consumer;
 pub mod feed_lag_monitor;
 pub mod feed_presence;
-pub mod first_seen_set;
 pub mod prev_close_writer;
 pub mod prev_day_close_stamper;
 pub mod prev_oi_cache;

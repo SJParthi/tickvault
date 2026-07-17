@@ -656,6 +656,20 @@ reconcile_interval_secs = 300
 mark_channel_capacity = 8192
 
 # ===========================================================================
+# 🔷 DHAN order-update WS paper-mode push channel (operator directive
+# 2026-07-16; governance on PR #1597 —
+# .claude/plans/active-plan-dhan-order-update-rewire.md). RECEIVE-ONLY:
+# when enabled, the Dhan REST stack opens the order-update WebSocket
+# (Telegram-silent per the 2026-07-14 Dhan noise lock) and records each
+# order event as an order_audit row feed='dhan' mode='paper'. NO live
+# orders; dry_run untouched. Ships OFF — flipping to true is the
+# operator's paper-mode observability opt-in; an ABSENT section =
+# disabled (fail-safe).
+# ===========================================================================
+[dhan_order_push]
+enabled = false
+
+# ===========================================================================
 # REST-era multi-TF candle derivation (operator directive 2026-07-16:
 # "why the fuck remaining candles 1m till 1day is not yet generated and
 # populated — resolve these"). Folds persist-confirmed spot_1m_rest 1m bars
@@ -730,6 +744,9 @@ paper_enabled = false
 # max_order_quantity: fail-closed cap; 0 = refuse-all (pending the operator's
 # 0-vs-1 answer). A larger requested qty is refused before any HTTP (GROWW-ORD-09).
 max_order_quantity = 0
+# order_push_enabled: receive-only order/position PUSH channel (Stage A,
+# 2026-07-16) — paper-mode observability only; places no order.
+order_push_enabled = false
 
 # ===========================================================================
 # 🔷 DHAN pre-trade margin gate (operator directive 2026-07-14, relayed via

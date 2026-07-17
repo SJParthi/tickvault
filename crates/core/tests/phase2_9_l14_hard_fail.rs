@@ -8,32 +8,22 @@
 //! systemd / docker restart policy handles the recovery loop. The
 //! `TICKVAULT_BOOT_DRY_RUN` env var lets tests exercise the branch
 //! without killing the runner.
-
-use std::path::PathBuf;
-
-fn workspace_root() -> PathBuf {
-    let me = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    me.parent()
-        .expect("tickvault root")
-        .parent()
-        .expect("workspace root")
-        .to_path_buf()
-        .join("crates")
-}
-
-fn read_main() -> String {
-    let p = workspace_root().join("app/src/main.rs");
-    std::fs::read_to_string(&p).unwrap_or_else(|err| panic!("read {p:?}: {err}"))
-}
+//!
+//! RETIRED SUITE (dead live-WS sweep stage 1, 2026-07-17 — operator
+//! directive via coordinator): the last surviving test,
+//! `h1_l14_refusal_calls_process_exit`, died with the module it pinned —
+//! `crates/core/src/pipeline/boot_ordering_gate.rs` was DELETED (zero
+//! production callers since the PR-C2 lane deletion; the L14
+//! `try_authorize_subscribe` wiring left main.rs on 2026-07-13). Its
+//! surviving assertion had degraded to a generic "main.rs contains
+//! `std::process::exit(1)`" scan that no longer pinned anything
+//! L14-specific. The tombstone below keeps the retirement record
+//! greppable (the `ip_monitor_wiring_guard.rs` pattern).
 
 #[test]
-fn h1_l14_refusal_calls_process_exit() {
-    let src = read_main();
-    assert!(
-        src.contains("std::process::exit(1)"),
-        "main.rs must call std::process::exit(1) when boot_ordering_gate.try_authorize_subscribe \
-         returns false (Phase 2.9 H1 fix — binary-level L14 enforcement)"
-    );
+fn phase2_9_l14_suite_retired_with_boot_ordering_gate() {
+    // Tombstone: the module-level doc above records why every assertion in
+    // this suite retired and what a future re-wire would have to restore.
 }
 
 // RETIRED (PR-C2, 2026-07-13 — Dhan live-WS lane deletion, operator

@@ -62,8 +62,10 @@ composite_quote_tick_full_chain = 10000  # <10µs full per-tick chain p50 (measu
 oms_state_transition     = 100          # <100ns — matches oms/state_transition
 
 
-# Trading crate — Wave 7-A4 BarCache RAM-first hot-path READ side
-bar_cache_lookup         = 100          # <100ns per call. papaya pin + get + Copy of CompactBar (56 B). Source-site docstring claims ~30ns measured; 3× headroom for noisy CI runners. Companion to dhat_bar_cache_lookup.rs (zero-alloc) — together they pin the W7-A4 §6 "100% code performance" guarantee row. At ~4,200 lookups/sec sustained + ~99K reads/sec minute-boundary burst this budget caps lookup work at ~10% of one core.
+# Trading crate — Wave 7-A4 BarCache budget key RETIRED (dead live-WS sweep
+# stage 1, 2026-07-17): the `in_mem::bar_cache` module, its Criterion bench
+# and dhat_bar_cache_lookup.rs were deleted (zero production callers — its
+# only writer was the feed-blind bar_cache_loader boot union, recon GAP-1).
 
 # Trading crate — OBI (Order Book Imbalance)
 obi_compute              = 1000         # <1μs = 1000ns — matches obi_compute_20_levels, obi_compute_with_wall (measured: ~297ns)

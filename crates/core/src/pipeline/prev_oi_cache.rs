@@ -202,9 +202,11 @@ impl PrevOiCache {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
             // Phase 2.8 H4 fix (security/hostile review): on failure
-            // we do NOT mark loaded=true. Without that flag the
-            // BootOrderingGate stays in `AwaitingOiCache`, which the
-            // caller logs as ERROR + Telegram. Treating this as
+            // we do NOT mark loaded=true, so the caller sees the
+            // failed load and logs ERROR + Telegram. (The
+            // `BootOrderingGate`/`AwaitingOiCache` machinery this
+            // comment used to name was deleted 2026-07-17 — dead
+            // live-WS sweep stage 1.) Treating this as
             // "loaded with empty cache" was the False-OK class bug
             // flagged by the adversarial review — operator never
             // saw a signal that QuestDB prev_day_ohlcv failed to load.
