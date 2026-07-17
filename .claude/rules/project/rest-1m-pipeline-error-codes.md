@@ -862,7 +862,16 @@ ALTER-ADD self-heal for the Groww leg: `rho` (Groww supplies it; Dhan
 does not) and `close_to_data_ms` (per-row latency stamp — the ONLY
 freshness signal, since Groww's chain response carries NO timestamp).
 Dhan rows leave both NULL (the Dhan `option_chain_1m` emit path is
-untouched — `rho`/`close_to_data_ms` are Groww-leg columns). The Groww
+untouched — `rho`/`close_to_data_ms` are Groww-leg columns).
+**2026-07-17 correction:** the "Dhan rows leave both NULL" era ended —
+the Dhan chain leg now populates `close_to_data_ms` (the already-measured
+minute-close → chain-retrieved latency, previously histogram-only, is
+persisted per row via the same `append_row_ext` shape the Groww leg
+uses); `rho` remains NULL on Dhan FOREVER — the Dhan option-chain
+response carries no rho (greeks are delta/theta/gamma/vega only, per
+`docs/dhan-ref/06-option-chain.md` /
+`.claude/rules/dhan/option-chain.md` rule 10; grep-verified against the
+Dhan leg's response parser, which extracts exactly those four). The Groww
 leg's `rest_fetch_audit` forensics failures reuse the SPOT1M-02 stage
 names `audit_append` / `audit_flush` but are coded CHAIN-03 with
 `leg='chain_1m'` context — a forensics write failure NEVER affects the
@@ -1107,6 +1116,29 @@ banned-pattern scanner keeps its RAM-first category, all 3 boot legs keep
 the classify/publish wiring, and the contract leg (DB-audit-only) never
 publishes a snapshot.
 
+**2026-07-17 — `moneyness_depth` DOUBLE companion column (`option_chain_1m`,
+BOTH feeds):** the SYMBOL classification gains a signed numeric distance
+column, `moneyness_depth` DOUBLE (rupees), stamped at WRITE time by both
+chain legs. Leg-normalized sign convention: NEGATIVE = ITM-direction,
+POSITIVE = OTM-direction, 0 = strike exactly at spot — CE depth =
+strike − spot, PE depth = spot − strike (so sign semantics are identical
+for both legs; consistency with the SYMBOL classification is
+test-pinned: `classify == Itm ⇒ depth < 0`, `Otm ⇒ depth > 0`). NULL
+(ILP-sparse, never written) when the leg label is unparsable, the
+strike/spot fail the ≥1-paise positivity guards, or the row is otherwise
+UNKNOWN-class — the same never-fabricate rule as the SYMBOL column. NOT
+in the DEDUP key (label column; latest-run-wins on a DEDUP re-append,
+exactly like `close_to_data_ms`); pre-existing rows read NULL forever
+(ALTER-ADD self-heal, never backfilled). ALL depth arithmetic lives in
+`crates/common/src/moneyness.rs` (`moneyness_depth_paise` — integer
+paise, checked arithmetic; `depth_paise_to_rupees` at the write
+boundary), so the boot legs stay parse-only and the
+`ratchet_chain1m_strike_is_parse_only_never_computed` ratchet stays
+green. The RAM `ChainMoneynessSnapshot` publish path is UNCHANGED (no
+depth field — the DB column is audit-only; a RAM consumer needing depth
+computes it from the snapshot's own paise fields via the same fn). The
+`option_contract_1m_rest` table is NOT touched by this change.
+
 ## §3. Delivery boundary (honest — no false-OK)
 
 **2026-07-14 UPDATE (REST-audit GAP-03 —
@@ -1217,4 +1249,5 @@ This rule activates when editing:
   `tv_groww_spot1m_fetch_total`, `GROWW_CHAIN_1M_UNDERLYINGS`,
   `tv_groww_chain1m_fetch_total`, `option_contract_1m_rest`,
   `GROWW_CONTRACT_1M_MAX_PER_MINUTE`, `tv_groww_contract1m_fetch_total`,
-  `moneyness`, `classify_moneyness`, `tv_moneyness_`, or `chain_snapshot`
+  `moneyness`, `moneyness_depth`, `classify_moneyness`, `tv_moneyness_`, or
+  `chain_snapshot`
