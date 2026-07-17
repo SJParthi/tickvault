@@ -46,6 +46,37 @@ const FORBIDDEN: [&str; 8] = [
     "MinSpacingGate",
 ];
 
+/// Forbidden CALL needles — the PACED legacy wrappers. An executor calling
+/// `spot_1m_fetch_once(` / `chain_fetch_once(` reaches the shared limiter
+/// through one hop of indirection with ZERO of the `FORBIDDEN` needles in
+/// its own source (the wrappers do the `shared_dhan_data_api_limiter()`
+/// acquire internally), so the paced wrapper names are banned too. Matched
+/// with an IDENTIFIER-BOUNDARY check (the char before the match must not be
+/// `[A-Za-z0-9_]`) so the LEGAL calls survive: `spot_1m_fetch_once_unpaced(`
+/// / `chain_fetch_once_unpaced(` (different suffix — no substring match) and
+/// the Groww executor's limiter-free `groww_chain_fetch_once(` (contains
+/// `chain_fetch_once(` but preceded by `_`).
+const FORBIDDEN_PACED_CALLS: [&str; 2] = ["spot_1m_fetch_once(", "chain_fetch_once("];
+
+/// `haystack.contains(needle)` restricted to matches NOT preceded by an
+/// identifier character — a call-site match, never a longer-identifier
+/// suffix match.
+fn contains_call(haystack: &str, needle: &str) -> bool {
+    let mut from = 0;
+    while let Some(pos) = haystack[from..].find(needle) {
+        let abs = from + pos;
+        let preceded_by_ident = abs > 0 && {
+            let b = haystack.as_bytes()[abs - 1];
+            b.is_ascii_alphanumeric() || b == b'_'
+        };
+        if !preceded_by_ident {
+            return true;
+        }
+        from = abs + 1;
+    }
+    false
+}
+
 fn app_src(rel: &str) -> String {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(rel);
     fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
@@ -89,6 +120,17 @@ fn test_cadence_executors_never_touch_limiter_or_gates() {
                  .claude/rules/project/cadence-error-codes.md §0b/§3b."
             );
         }
+        for needle in FORBIDDEN_PACED_CALLS {
+            assert!(
+                !contains_call(&stripped, needle),
+                "{rel} calls the PACED legacy wrapper `{needle}` — that \
+                 wrapper acquires the shared dhan_data_api_limiter \
+                 internally, so the call reaches the limiter through one \
+                 hop of indirection. The cadence executors must call the \
+                 `*_unpaced` inners only (coordinator ruling A, 2026-07-16; \
+                 .claude/rules/project/cadence-error-codes.md §0b/§3b)."
+            );
+        }
     }
 }
 
@@ -118,4 +160,37 @@ fn test_comment_stripper_self_check() {
     // And a CODE needle survives stripping (would be caught).
     let code = "let g = global_dhan_gates(); // fine\n";
     assert!(strip_line_comments(code).contains("global_dhan_gates"));
+}
+
+#[test]
+fn test_contains_call_identifier_boundary_self_check() {
+    // A bare call matches.
+    assert!(contains_call(
+        "let r = chain_fetch_once(client);",
+        "chain_fetch_once("
+    ));
+    // Match at position 0 matches.
+    assert!(contains_call("chain_fetch_once(x)", "chain_fetch_once("));
+    // A longer-identifier suffix does NOT match (the Groww executor's
+    // legal limiter-free `groww_chain_fetch_once(`).
+    assert!(!contains_call(
+        "groww_chain_fetch_once(client, url)",
+        "chain_fetch_once("
+    ));
+    // The `*_unpaced` inner never matches the paced needle (different
+    // suffix — no substring at all).
+    assert!(!contains_call(
+        "spot_1m_fetch_once_unpaced(client)",
+        "spot_1m_fetch_once("
+    ));
+    // Non-ident separators before the match still match (method-position /
+    // path-position calls).
+    assert!(contains_call(
+        "x = (chain_fetch_once(a));",
+        "chain_fetch_once("
+    ));
+    assert!(contains_call(
+        "crate::spot_1m_rest_boot::spot_1m_fetch_once(a)",
+        "spot_1m_fetch_once("
+    ));
 }
