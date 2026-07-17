@@ -12,8 +12,8 @@
 # the push-range file count, and the FULL-TREE scans run server-side in the
 # ci.yml Repo Guards job on every PR/push):
 #   1. cargo fmt --check          [fast: ~2s]
-#   2. Banned pattern scan        [push-scoped; timeout 60s + count/2]
-#   3. Secret scan                [push-scoped; timeout 60s + count/2]
+#   2. Banned pattern scan        [push-scoped; timeout 60s + count/2, cap 120s]
+#   3. Secret scan                [push-scoped; timeout 60s + count/2, cap 120s]
 #   4. Test count guard (ratchet) [fast: ~1s]
 #   5. Data integrity guard       [fast: ~2s, pattern scan]
 #   6. Pub fn test guard          [fast: ~3s, pattern scan]
@@ -129,7 +129,14 @@ echo "  [2/8] Banned pattern scan..." >&2
 # FULL-TREE scan runs server-side in ci.yml Repo Guards on every PR/push.
 PUSH_BASE=$(git merge-base origin/main HEAD 2>/dev/null || true)
 if [ -n "$PUSH_BASE" ]; then
-  CHANGED_ALL=$(git diff --name-only "$PUSH_BASE"..HEAD 2>/dev/null || true)
+  # fail-closed (final review B-MED): a git-diff failure (partial clone
+  # offline, corrupt object) must never masquerade as "no changes" → PASS
+  CHANGED_ALL=$(git diff --name-only "$PUSH_BASE"..HEAD 2>/dev/null)
+  DIFF_EXIT=$?
+  if [ "$DIFF_EXIT" -ne 0 ]; then
+    echo "  FAIL: git diff failed (exit $DIFF_EXIT) — cannot enumerate push range; refusing to skip scans" >&2
+    exit 2
+  fi
 else
   # fail-closed (review r2 F1): a degraded clone (missing origin/main) must
   # never fall back to a full-tree scan — that re-creates the killed-hook
@@ -145,6 +152,9 @@ if [ "$RS_COUNT" -eq 0 ]; then
 elif [ -x "$HOOKS_DIR/banned-pattern-scanner.sh" ]; then
   # measured ~0.3s/file worst-case (2026-07-16) — count/2 gives 2x headroom
   BANNED_TIMEOUT=$(( 60 + RS_COUNT / 2 ))
+  # cap keeps worst-case hook wall-clock inside the 300s dispatch budget; a
+  # slow scan then 124-BLOCKS (fail-closed) instead of being killed fail-open
+  [ "$BANNED_TIMEOUT" -gt 120 ] && BANNED_TIMEOUT=120
   BANNED_OUT=$(timeout "$BANNED_TIMEOUT" "$HOOKS_DIR/banned-pattern-scanner.sh" "$CWD" "$CHANGED_RS" 2>&1)
   BANNED_EXIT=$?
   if [ "$BANNED_EXIT" -eq 124 ]; then
@@ -171,6 +181,9 @@ elif [ -x "$HOOKS_DIR/secret-scanner.sh" ]; then
   # hard floor 60s; findings always block
   SECRET_TIMEOUT=$(( ${TICKVAULT_SECRET_SCAN_TIMEOUT_SECS:-60} + ALL_COUNT / 2 ))
   [ "$SECRET_TIMEOUT" -lt 60 ] && SECRET_TIMEOUT=60
+  # cap keeps worst-case hook wall-clock inside the 300s dispatch budget; a
+  # slow scan then 124-BLOCKS (fail-closed) instead of being killed fail-open
+  [ "$SECRET_TIMEOUT" -gt 120 ] && SECRET_TIMEOUT=120
   SECRET_OUT=$(timeout "$SECRET_TIMEOUT" "$HOOKS_DIR/secret-scanner.sh" "$CWD" "$CHANGED_ALL" 2>&1)
   SECRET_EXIT=$?
   if [ "$SECRET_EXIT" -eq 124 ]; then

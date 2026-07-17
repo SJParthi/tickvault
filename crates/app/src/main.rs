@@ -517,8 +517,9 @@ async fn main() -> Result<()> {
     // before any REST-leg spawn. `[order_runtime].enabled = false` → all
     // three slots stay empty/None and every downstream path is
     // byte-identical. The receiver is stashed in a take-once slot for the
-    // Dhan REST-only stack's Phase 5a (`spawn_dhan_rest_stack` — the
-    // runtime's single spawn site); the forwarder now rides into the Groww
+    // Dhan REST-only stack's Phase 5b (`spawn_dhan_rest_stack` — the
+    // runtime's single spawn site; 2026-07-17 correction: Phase 5a is the
+    // RETIRED order-update WS slot); the forwarder now rides into the Groww
     // per-minute REST legs (spot + contract — the live-tick bridge tap died
     // with the retired Groww live feed): marks are the OWN-FIRE just-closed
     // 1m candle closes, forwarded at each leg's persist-confirm choke point.

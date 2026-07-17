@@ -299,7 +299,8 @@ pub struct OrderRuntimeConfig {
     /// invariant check. Validation floor: ≥ 60.
     #[serde(default = "default_order_runtime_reconcile_interval_secs")]
     pub reconcile_interval_secs: u64,
-    /// Bounded mark-forward channel capacity (Groww bridge → runtime).
+    /// Bounded mark-forward channel capacity (the Groww per-minute REST
+    /// legs → runtime; re-homed 2026-07-16 after #1581).
     /// Validation range: [256, 65536].
     #[serde(default = "default_order_runtime_mark_channel_capacity")]
     pub mark_channel_capacity: usize,
@@ -1442,6 +1443,102 @@ impl RestCandleFoldConfig {
             bail!(
                 "rest_candle_fold.catchup_days ({}) must be within 1..=370",
                 self.catchup_days
+            );
+        }
+        Ok(())
+    }
+}
+
+/// `[market_ram_store]` — RAM residency stores (operator directive
+/// 2026-07-16; PR-2 of the data-completeness build). Two process-RAM
+/// stores populated by EXISTING data flows:
+///
+/// - the SPOT month-deep bar rings
+///   (`tickvault_trading::in_mem::spot_bar_store`) — per (feed, sid, tf)
+///   rings of sealed bars, capacity `spot_days` × session bars/day,
+///   written at the rest_candle_fold emit choke points (live seals +
+///   refold re-emits + the boot catch-up — so pre-market rehydration is
+///   PR-1's existing catch-up, ZERO new QuestDB reads for spots);
+/// - the CHAIN current-day minute ring
+///   (`tickvault_core::pipeline::chain_day_store`) — per (feed,
+///   underlying) minute → published moneyness snapshot, current IST day
+///   only, boot-rehydrated from today's `option_chain_1m` rows via
+///   bounded hardened `/exec` windows.
+///
+/// Fail-safe shape: `enabled` is `#[serde(default)]` = `false`, so an
+/// absent `[market_ram_store]` section disables both stores entirely
+/// (every hook is a checked no-op). `config/base.toml` explicitly sets
+/// `enabled = true`, `spot_days = 35`, `chain_row_cap = 1000`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct MarketRamStoreConfig {
+    /// Master switch for BOTH RAM residency stores.
+    /// Default OFF (fail-safe) — `config/base.toml` turns it on explicitly.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Spot ring depth in trading days per (feed, sid, tf) ring. Default 35
+    /// (the operator's minimum-one-month spot demand + weekend slack —
+    /// matches `rest_candle_fold.catchup_days`). A value BELOW
+    /// `rest_candle_fold.catchup_days` is legal (the ring simply retains
+    /// less than the catch-up offers — noted with a boot log line, never a
+    /// hard error).
+    #[serde(default = "default_market_ram_store_spot_days")]
+    pub spot_days: u32,
+    /// Hard per-minute row cap for the chain day store (rows = strike-leg
+    /// snapshot rows per published minute per (feed, underlying)). Default
+    /// 1_000 — above the structural 800-row publish bound
+    /// (`MAX_STRIKES_PER_CHAIN` 400 × 2 legs), so truncation fires only on
+    /// a hostile/runaway snapshot, LOUDLY (counted + coded warn).
+    /// Validated 200..=5_000 (PR-2 round-1): the chain-rehydrate window
+    /// LIMIT is derived from this cap, so a foot-gun tiny value would make
+    /// every rehydrate window hit its LIMIT tripwire — permanently
+    /// truncated, never rehydrating. Values in 200..800 are legal but can
+    /// still flag genuinely full chains' windows truncated (visible,
+    /// never silent).
+    #[serde(default = "default_market_ram_store_chain_row_cap")]
+    pub chain_row_cap: u32,
+}
+
+impl Default for MarketRamStoreConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            spot_days: default_market_ram_store_spot_days(),
+            chain_row_cap: default_market_ram_store_chain_row_cap(),
+        }
+    }
+}
+
+/// serde default for [`MarketRamStoreConfig::spot_days`] — 35 days.
+fn default_market_ram_store_spot_days() -> u32 {
+    35
+}
+
+/// serde default for [`MarketRamStoreConfig::chain_row_cap`] — 1_000 rows.
+fn default_market_ram_store_chain_row_cap() -> u32 {
+    1_000
+}
+
+impl MarketRamStoreConfig {
+    /// Boot-time sanity validation — rejected BEFORE any store installs.
+    ///
+    /// # Errors
+    /// Returns a descriptive error when `spot_days` is outside `1..=370`
+    /// (the same ~one-year envelope bound as `rest_candle_fold.catchup_days`)
+    /// or `chain_row_cap` is outside `200..=5_000` (floor: the chain
+    /// rehydrate's window LIMIT derives from the cap — a tiny value would
+    /// make EVERY rehydrate window permanently hit its truncation
+    /// tripwire; ceiling: bounds worst-case resident chain bytes).
+    pub fn validate(&self) -> Result<()> {
+        if !(1..=370).contains(&self.spot_days) {
+            bail!(
+                "market_ram_store.spot_days ({}) must be within 1..=370",
+                self.spot_days
+            );
+        }
+        if !(200..=5_000).contains(&self.chain_row_cap) {
+            bail!(
+                "market_ram_store.chain_row_cap ({}) must be within 200..=5000",
+                self.chain_row_cap
             );
         }
         Ok(())
@@ -3304,16 +3401,6 @@ impl ApplicationConfig {
                 );
             }
         }
-
-        // 2026-07-16 REST-era candle derivation: the boot catch-up window
-        // must be a sane 1..=370-day envelope — rejected at boot, BEFORE
-        // the fold task spawns.
-        self.rest_candle_fold.validate()?;
-
-        // 2026-07-16 RAM residency stores (PR-2): spot ring depth + chain
-        // per-minute row cap must be sane — rejected at boot, BEFORE any
-        // store installs.
-        self.market_ram_store.validate()?;
 
         // 2026-07-16 REST-era candle derivation: the boot catch-up window
         // must be a sane 1..=370-day envelope — rejected at boot, BEFORE

@@ -2767,3 +2767,23 @@ rules:
       idempotently); escalate so the operator reads the stage field and
       cross-checks QuestDB /exec (catchup_*) or the seal-writer chain
       (seal_send) per the runbook instead of any auto-action.
+
+  # RAMSTORE-01 = a RAM residency store leg degraded (chain rehydrate
+  # query/parse/truncation, live row-cap truncation, stale-day drop, or a
+  # supervised stats/rehydrate task respawn). Escalate (not auto_restart):
+  # QuestDB remains the durable truth — a RAM degrade re-fills via PR-1's
+  # boot catch-up + the bounded chain rehydrate at the next boot; the
+  # operator inspects the stage + the depth gauges per the runbook.
+  - name: ramstore-01-ram-residency-degraded-escalate
+    match:
+      code: RAMSTORE-01
+    action: escalate
+    runbook_path: .claude/rules/project/ram-store-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 600
+    justification: >-
+      RAMSTORE-01 = the RAM residency machinery degraded, never market-data
+      loss (the candles_* / option_chain_1m DEDUP rows stand and RAM
+      re-fills at the next boot). Escalate so the operator reads the stage
+      field and the tv_ram_store_* depth gauges per the runbook instead of
+      any auto-action.
