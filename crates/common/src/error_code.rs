@@ -2699,7 +2699,9 @@ mod tests {
         // 2026-07-16 merge note: RAMSTORE-01 (this branch, 156) + main's
         // CADENCE-01/02/03 (158) coexist — 155 base + 1 + 3 = 159,
         // mechanically recounted against the merged all() vec.
-        assert_eq!(ErrorCode::all().len(), 159);
+        // 2026-07-17 (spot cross-broker comparator): +2 SPOT-XVERIFY-01/02
+        // (SpotXverify01MismatchFound + SpotXverify02RunDegraded) => 161.
+        assert_eq!(ErrorCode::all().len(), 161);
     }
 
     #[test]
@@ -3210,6 +3212,8 @@ mod tests {
                 || s.starts_with("SCOREBOARD-")
                 // BruteX↔TickVault daily cross-verify (2026-07-12).
                 || s.starts_with("BRUTEX-XVERIFY-")
+                // Dhan↔Groww spot cross-broker comparator (2026-07-17).
+                || s.starts_with("SPOT-XVERIFY-")
                 // Per-minute spot 1m REST pipeline (operator grant 2026-07-12).
                 || s.starts_with("SPOT1M-")
                 // Per-minute option-chain REST pipeline (PR-3, 2026-07-12).
