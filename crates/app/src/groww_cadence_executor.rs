@@ -58,7 +58,9 @@ use tickvault_storage::spot_1m_rest_persistence::{
 use tokio::sync::Mutex;
 use tracing::{debug, error, warn};
 
-use crate::cadence_escalation::{EscalationLeg, LaneEscalation, emit_edge_action};
+use crate::cadence_escalation::{
+    EscalationLeg, LaneEscalation, emit_edge_action, flush_off_worker,
+};
 use crate::dhan_cadence_executor::{date_to_yyyymmdd, deadline_remaining_ms, yyyymmdd_to_date};
 use crate::groww_option_chain_1m_boot::{
     GrowwChainFetchFailure, build_chain_audit_row, chain_audit_append_best_effort,
@@ -354,7 +356,7 @@ impl CadenceExecutor for GrowwCadenceExecutor {
                     "no_token",
                 ),
             );
-            audit_flush_best_effort(&mut audit);
+            flush_off_worker(|| audit_flush_best_effort(&mut audit));
             return Err(CadenceFetchError::Auth);
         };
         let query = groww_candles_query(
@@ -386,7 +388,7 @@ impl CadenceExecutor for GrowwCadenceExecutor {
                         "timeout",
                     ),
                 );
-                audit_flush_best_effort(&mut audit);
+                flush_off_worker(|| audit_flush_best_effort(&mut audit));
                 return Err(CadenceFetchError::Timeout);
             }
             Ok(Err(failure)) => {
@@ -425,7 +427,7 @@ impl CadenceExecutor for GrowwCadenceExecutor {
                         class,
                     ),
                 );
-                audit_flush_best_effort(&mut audit);
+                flush_off_worker(|| audit_flush_best_effort(&mut audit));
                 return Err(mapped);
             }
             Ok(Ok(body)) => body,
@@ -449,7 +451,7 @@ impl CadenceExecutor for GrowwCadenceExecutor {
                     "ga_failure",
                 ),
             );
-            audit_flush_best_effort(&mut audit);
+            flush_off_worker(|| audit_flush_best_effort(&mut audit));
             return Err(CadenceFetchError::Transport);
         }
         let (candles, _stats) = parse_groww_1m_candles(&body);
@@ -474,7 +476,7 @@ impl CadenceExecutor for GrowwCadenceExecutor {
                     "empty",
                 ),
             );
-            audit_flush_best_effort(&mut audit);
+            flush_off_worker(|| audit_flush_best_effort(&mut audit));
             return Err(CadenceFetchError::Empty);
         };
         let close_to_data_ms =
@@ -512,7 +514,7 @@ impl CadenceExecutor for GrowwCadenceExecutor {
                 );
                 false
             } else {
-                match writer.flush() {
+                match flush_off_worker(|| writer.flush()) {
                     Ok(()) => true,
                     Err(err) => {
                         metrics::counter!(
@@ -597,7 +599,7 @@ impl CadenceExecutor for GrowwCadenceExecutor {
                     ),
                 );
             }
-            audit_flush_best_effort(&mut audit);
+            flush_off_worker(|| audit_flush_best_effort(&mut audit));
         }
         escalation_persist_ok = flush_ok;
         Ok(SpotSnapshot {
@@ -672,7 +674,7 @@ impl CadenceExecutor for GrowwCadenceExecutor {
                         "no_token",
                     ),
                 );
-                chain_audit_flush_best_effort(&mut audit);
+                flush_off_worker(|| chain_audit_flush_best_effort(&mut audit));
                 return Err(CadenceFetchError::Auth);
             };
             let url = groww_chain_url(exchange, underlying);
@@ -701,7 +703,7 @@ impl CadenceExecutor for GrowwCadenceExecutor {
                             "timeout",
                         ),
                     );
-                    chain_audit_flush_best_effort(&mut audit);
+                    flush_off_worker(|| chain_audit_flush_best_effort(&mut audit));
                     return Err(CadenceFetchError::Timeout);
                 }
                 Ok(Err(failure)) => {
@@ -737,7 +739,7 @@ impl CadenceExecutor for GrowwCadenceExecutor {
                             chain_error_class_for_status(failure.status),
                         ),
                     );
-                    chain_audit_flush_best_effort(&mut audit);
+                    flush_off_worker(|| chain_audit_flush_best_effort(&mut audit));
                     return Err(mapped);
                 }
                 Ok(Ok(text)) => text,
@@ -762,7 +764,7 @@ impl CadenceExecutor for GrowwCadenceExecutor {
                         "parse",
                     ),
                 );
-                chain_audit_flush_best_effort(&mut audit);
+                flush_off_worker(|| chain_audit_flush_best_effort(&mut audit));
                 return Err(CadenceFetchError::Malformed);
             };
             if chain.legs.is_empty() {
@@ -799,7 +801,7 @@ impl CadenceExecutor for GrowwCadenceExecutor {
                         class,
                     ),
                 );
-                chain_audit_flush_best_effort(&mut audit);
+                flush_off_worker(|| chain_audit_flush_best_effort(&mut audit));
                 return Err(mapped);
             }
             let close_to_data_ms =
@@ -882,7 +884,7 @@ impl CadenceExecutor for GrowwCadenceExecutor {
                         break;
                     }
                 }
-                if !persist_failed && let Err(err) = writer.flush() {
+                if !persist_failed && let Err(err) = flush_off_worker(|| writer.flush()) {
                     persist_failed = true;
                     metrics::counter!("tv_groww_chain1m_persist_errors_total", "stage" => "flush")
                         .increment(1);
@@ -937,7 +939,7 @@ impl CadenceExecutor for GrowwCadenceExecutor {
                         chain_audit_append_best_effort(&mut audit, &row);
                     }
                 }
-                chain_audit_flush_best_effort(&mut audit);
+                flush_off_worker(|| chain_audit_flush_best_effort(&mut audit));
             }
             let underlying_spot = (!chain.underlying_ltp_missing
                 && chain.underlying_ltp.is_finite()

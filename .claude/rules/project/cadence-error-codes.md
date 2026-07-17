@@ -320,6 +320,44 @@ Flipping `[cadence] enabled = true` therefore REQUIRES standing ALL the
 legs down first; full subsumption (the cadence lane feeding the legs'
 tables) is the flagged follow-up.
 
+## §0c. 2026-07-17 — real broker executors live; legacy per-minute legs stood down (technical truth-sync)
+
+Dated factual notes on what the code/config does as of 2026-07-17:
+
+- The `DryRunLoggingExecutor` is replaced in `crates/app/src/cadence_boot.rs` by
+  real executors: `crates/app/src/dhan_cadence_executor.rs` +
+  `crates/app/src/groww_cadence_executor.rs`, reusing the legacy legs'
+  limiter-free `*_unpaced` fetch inners (`spot_1m_fetch_once_unpaced` /
+  `chain_fetch_once_unpaced` and the Groww twins; RS5 purity ratchet:
+  `crates/app/tests/cadence_executor_purity_guard.rs`).
+- `config/base.toml` now sets `[cadence] enabled = true` with the four legacy
+  per-minute leg sections (`[spot_1m_rest]`, `[option_chain_1m]`,
+  `[groww_spot_1m]`, `[groww_option_chain_1m]`) `enabled = false`, satisfying
+  the §0b RS3 mutual exclusion (`AppConfig::validate` fail-closes
+  cadence+any-leg).
+- Lane gating: the cadence lanes are seeded from NEW `[cadence] dhan_lane` /
+  `groww_lane` config bools (serde default true) — deliberately INDEPENDENT of
+  the retired `feeds.dhan_enabled`/`groww_enabled` live-WS flags (both false in
+  prod; runtime enable 409'd), which would otherwise park both lanes.
+  Config+restart to change; no runtime lane toggle.
+- Paging/liveness on the cadence path: `tv_rest_1m_fire_heartbeat` is
+  success-gated (set only on a successful vendor fetch — an all-failing session
+  leaves it unset so the market-hours-liveness alarm pages ~09:25 IST;
+  mid-session death after first success remains the pre-existing residual).
+  The SPOT1M-01 / CHAIN-02 `stage="escalation"` coded edges + the EXISTING
+  typed Telegram events (Spot1mFetchDegraded/Recovered,
+  ChainFetchDegraded/Recovered + Groww twins) are re-emitted from the executor
+  path via `crates/app/src/cadence_escalation.rs` (3 consecutive fully-failed
+  minutes per lane/leg, minute-finalize-on-rollover — pages lag one minute;
+  the session's last minute never finalizes; edge state is run-scoped). No new
+  NotificationEvent/ErrorCode/terraform surface.
+- Honest residuals: the legacy in-minute re-poll ladder, backfill,
+  `batch_catchup` and serving-delay diagnostics do not run on the cadence path
+  (single bounded retry per leg per minute) — a minute both attempts miss
+  stays absent from `spot_1m_rest` unless repaired post-session; QuestDB flush
+  degradation costs up to ~10s per fire serialized behind the writer Mutex
+  (`block_in_place` — runtime workers unblocked; late snapshots honest-skip).
+
 ## §1. CADENCE-01 — a broker lane degraded inside a cycle
 
 **Severity:** High. **Auto-triage safe:** Yes (the cycle already ended; the

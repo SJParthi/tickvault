@@ -36,6 +36,23 @@ use tracing::{error, info};
 
 pub(crate) use crate::spot_1m_rest_boot::{EdgeAction, FailureEdge, format_minute_ist_12h};
 
+/// Runs a blocking questdb-rs ILP `flush()` (conf-pinned 5s request_timeout
+/// per attempt) without pinning a tokio runtime worker: on the multi-thread
+/// runtime the closure runs under `tokio::task::block_in_place` — the
+/// seal-writer house pattern (`crates/storage/src/seal_writer_loop.rs`),
+/// sibling tasks migrate while the sync HTTP flush blocks. Current-thread
+/// runtimes (the `#[tokio::test]` harness) call directly, because
+/// `block_in_place` panics there.
+pub(crate) fn flush_off_worker<T>(f: impl FnOnce() -> T) -> T {
+    if tokio::runtime::Handle::current().runtime_flavor()
+        == tokio::runtime::RuntimeFlavor::MultiThread
+    {
+        tokio::task::block_in_place(f)
+    } else {
+        f()
+    }
+}
+
 /// Which cadence leg an outcome belongs to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum EscalationLeg {

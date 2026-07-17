@@ -19,8 +19,12 @@
 //!   [`crate::rest_candle_fold::send_confirmed_bars`] (the ONLY feed for
 //!   `candles_*` + the RAM store once the legacy legs are off) → return
 //!   the [`SpotSnapshot`]. A persist failure is LOUD (SPOT1M-02) but the
-//!   snapshot still returns — the RAM decision surface is never blinded
-//!   by a QuestDB outage; the unpersisted bar is NEVER folded.
+//!   snapshot still returns; the unpersisted bar is NEVER folded. Honest
+//!   bound: a QuestDB outage costs up to ~5s data-flush + ~5s audit-flush
+//!   per fire, serialized behind the writer Mutex — later fires' snapshots
+//!   can land past the decision ceiling and honest-skip decisions
+//!   (fail-closed), while `block_in_place` keeps the runtime workers
+//!   unblocked during the sync flush wait.
 //! - `fetch_chain`: fetch → parse → classify moneyness → persist rows →
 //!   publish the RAM chain snapshot (publish is persist-independent, the
 //!   legacy Found-arm ordering) → return [`ChainFetchOk`] with the
@@ -55,7 +59,9 @@ use tickvault_core::cadence::executor::{
 use tickvault_core::notification::NotificationService;
 use tickvault_core::pipeline::chain_snapshot::ChainUnderlying;
 
-use crate::cadence_escalation::{EscalationLeg, LaneEscalation, emit_edge_action};
+use crate::cadence_escalation::{
+    EscalationLeg, LaneEscalation, emit_edge_action, flush_off_worker,
+};
 use tickvault_storage::option_chain_1m_persistence::{
     OPTION_CHAIN_1M_FEED_DHAN, OptionChain1mRow, OptionChain1mWriter,
 };
@@ -293,7 +299,7 @@ impl CadenceExecutor for DhanCadenceExecutor {
                             "no_token",
                         ),
                     );
-                    audit_flush_best_effort(&mut audit);
+                    flush_off_worker(|| audit_flush_best_effort(&mut audit));
                     return Err(e);
                 }
             };
@@ -350,7 +356,7 @@ impl CadenceExecutor for DhanCadenceExecutor {
                             class,
                         ),
                     );
-                    audit_flush_best_effort(&mut audit);
+                    flush_off_worker(|| audit_flush_best_effort(&mut audit));
                     return Err(mapped);
                 }
             };
@@ -378,7 +384,7 @@ impl CadenceExecutor for DhanCadenceExecutor {
                         class,
                     ),
                 );
-                audit_flush_best_effort(&mut audit);
+                flush_off_worker(|| audit_flush_best_effort(&mut audit));
                 return Err(CadenceFetchError::Empty);
             };
             let close_to_data_ms =
@@ -415,7 +421,7 @@ impl CadenceExecutor for DhanCadenceExecutor {
                     );
                     false
                 } else {
-                    match writer.flush() {
+                    match flush_off_worker(|| writer.flush()) {
                         Ok(()) => true,
                         Err(err) => {
                             metrics::counter!("tv_spot1m_persist_errors_total", "stage" => "flush")
@@ -486,7 +492,7 @@ impl CadenceExecutor for DhanCadenceExecutor {
                         ),
                     );
                 }
-                audit_flush_best_effort(&mut audit);
+                flush_off_worker(|| audit_flush_best_effort(&mut audit));
             }
             escalation_persist_ok = flush_ok;
             Ok(SpotSnapshot {
@@ -552,7 +558,7 @@ impl CadenceExecutor for DhanCadenceExecutor {
                             "no_token",
                         ),
                     );
-                    chain_audit_flush_best_effort(&mut audit);
+                    flush_off_worker(|| chain_audit_flush_best_effort(&mut audit));
                     return Err(e);
                 }
             };
@@ -586,7 +592,7 @@ impl CadenceExecutor for DhanCadenceExecutor {
                             "timeout",
                         ),
                     );
-                    chain_audit_flush_best_effort(&mut audit);
+                    flush_off_worker(|| chain_audit_flush_best_effort(&mut audit));
                     return Err(CadenceFetchError::Timeout);
                 }
                 Ok(Err(failure)) => {
@@ -619,7 +625,7 @@ impl CadenceExecutor for DhanCadenceExecutor {
                             class,
                         ),
                     );
-                    chain_audit_flush_best_effort(&mut audit);
+                    flush_off_worker(|| chain_audit_flush_best_effort(&mut audit));
                     return Err(mapped);
                 }
                 Ok(Ok(text)) => text,
@@ -640,7 +646,7 @@ impl CadenceExecutor for DhanCadenceExecutor {
                         "error",
                     ),
                 );
-                chain_audit_flush_best_effort(&mut audit);
+                flush_off_worker(|| chain_audit_flush_best_effort(&mut audit));
                 return Err(CadenceFetchError::Malformed);
             };
             if chain.legs.is_empty() {
@@ -659,7 +665,7 @@ impl CadenceExecutor for DhanCadenceExecutor {
                         "empty_chain",
                     ),
                 );
-                chain_audit_flush_best_effort(&mut audit);
+                flush_off_worker(|| chain_audit_flush_best_effort(&mut audit));
                 return Err(CadenceFetchError::Empty);
             }
             let close_to_data_ms =
@@ -732,7 +738,7 @@ impl CadenceExecutor for DhanCadenceExecutor {
                         break;
                     }
                 }
-                if !persist_failed && let Err(err) = writer.flush() {
+                if !persist_failed && let Err(err) = flush_off_worker(|| writer.flush()) {
                     persist_failed = true;
                     metrics::counter!("tv_chain1m_persist_errors_total", "stage" => "flush")
                         .increment(1);
@@ -782,7 +788,7 @@ impl CadenceExecutor for DhanCadenceExecutor {
                         chain_audit_append_best_effort(&mut audit, &row);
                     }
                 }
-                chain_audit_flush_best_effort(&mut audit);
+                flush_off_worker(|| chain_audit_flush_best_effort(&mut audit));
             }
             // The embedded underlying spot BEFORE `cls` moves into publish
             // (Dhan val_f64 defaults an absent last_price to 0.0 → None).
