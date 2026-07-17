@@ -19,6 +19,14 @@ use tickvault_common::error_code::ErrorCode;
 pub const SPOT_XVERIFY_CELL_AUDIT_TABLE: &str = "spot_crossverify_cell_audit";
 /// QuestDB table — one row per run (the daily trend + keep-better target).
 pub const SPOT_XVERIFY_DAILY_TABLE: &str = "spot_crossverify_daily";
+/// The `feed` in-key wire value (operator override 2026-06-28 — feed in the
+/// DEDUP key of EVERY persisted table). These tables are inherently
+/// CROSS-FEED (each row spans a Dhan cell vs a Groww cell; `kind` names
+/// which side is missing), so a single-feed label would be dishonest — the
+/// honest constant names the comparison scope. Constant ⇒ a no-op in dedup
+/// terms (one row per logical key), it satisfies the feed-in-key guard
+/// without falsely tagging a cross-feed row as `dhan`.
+pub const SPOT_XVERIFY_FEED_SCOPE: &str = "dhan_x_groww";
 
 /// Cell-audit DEDUP key. Designated `ts` FIRST (2026-04-28 regression rule);
 /// `exchange_segment` in-key (I-P1-11 + dedup_segment_meta_guard); `field` +
@@ -28,12 +36,12 @@ pub const SPOT_XVERIFY_DAILY_TABLE: &str = "spot_crossverify_daily";
 /// an audit key). Deterministic run `ts` (target day 15:47:00 IST) ⇒ reruns
 /// UPSERT in place.
 pub const DEDUP_KEY_SPOT_XVERIFY_CELL_AUDIT: &str =
-    "ts, trading_date_ist, index_name, exchange_segment, minute_ts_ist, kind, field";
+    "ts, trading_date_ist, feed, index_name, exchange_segment, minute_ts_ist, kind, field";
 
 /// Daily DEDUP key — `outcome` in-key so a measured verdict is never erased
 /// by a later blind rerun (the brutex/tf keep-better precedent; the caller's
 /// keep-better guard additionally suppresses a downgrade).
-pub const DEDUP_KEY_SPOT_XVERIFY_DAILY: &str = "ts, trading_date_ist, outcome";
+pub const DEDUP_KEY_SPOT_XVERIFY_DAILY: &str = "ts, trading_date_ist, feed, outcome";
 
 const QUESTDB_DDL_TIMEOUT_SECS: u64 = 10;
 
@@ -153,6 +161,7 @@ pub fn spot_xverify_cell_audit_create_ddl() -> String {
         "CREATE TABLE IF NOT EXISTS {SPOT_XVERIFY_CELL_AUDIT_TABLE} (\
             ts               TIMESTAMP, \
             trading_date_ist TIMESTAMP, \
+            feed             SYMBOL, \
             index_name       SYMBOL, \
             exchange_segment SYMBOL, \
             minute_ts_ist    TIMESTAMP, \
@@ -175,6 +184,7 @@ pub fn spot_xverify_daily_create_ddl() -> String {
         "CREATE TABLE IF NOT EXISTS {SPOT_XVERIFY_DAILY_TABLE} (\
             ts               TIMESTAMP, \
             trading_date_ist TIMESTAMP, \
+            feed             SYMBOL, \
             indices          LONG, \
             minutes_compared LONG, \
             mismatches       LONG, \
@@ -225,6 +235,7 @@ pub async fn ensure_spot_crossverify_tables(questdb_config: &QuestDbConfig) {
     ];
     for (col, ty) in [
         ("trading_date_ist", "TIMESTAMP"),
+        ("feed", "SYMBOL"),
         ("index_name", "SYMBOL"),
         ("exchange_segment", "SYMBOL"),
         ("minute_ts_ist", "TIMESTAMP"),
@@ -242,6 +253,7 @@ pub async fn ensure_spot_crossverify_tables(questdb_config: &QuestDbConfig) {
     }
     for (col, ty) in [
         ("trading_date_ist", "TIMESTAMP"),
+        ("feed", "SYMBOL"),
         ("indices", "LONG"),
         ("minutes_compared", "LONG"),
         ("mismatches", "LONG"),
@@ -382,6 +394,8 @@ impl SpotXverifyAuditWriter {
         self.buffer
             .table(SPOT_XVERIFY_CELL_AUDIT_TABLE)
             .context("table")?
+            .symbol("feed", SPOT_XVERIFY_FEED_SCOPE)
+            .context("feed")?
             .symbol("index_name", f.index_name.as_str())
             .context("index_name")?
             .symbol("exchange_segment", f.exchange_segment.as_str())
@@ -421,6 +435,8 @@ impl SpotXverifyAuditWriter {
         self.buffer
             .table(SPOT_XVERIFY_DAILY_TABLE)
             .context("table")?
+            .symbol("feed", SPOT_XVERIFY_FEED_SCOPE)
+            .context("feed")?
             .symbol("outcome", r.outcome.as_str())
             .context("outcome")?
             .column_ts(
@@ -532,6 +548,7 @@ mod tests {
         for tok in [
             "ts",
             "trading_date_ist",
+            "feed",
             "index_name",
             "exchange_segment",
             "minute_ts_ist",
@@ -549,6 +566,7 @@ mod tests {
             assert!(ddl.contains(tok), "cell DDL missing {tok}: {ddl}");
         }
         // dedup_segment_meta_guard + I-P1-11 + phase-0 rule 3.
+        assert!(DEDUP_KEY_SPOT_XVERIFY_CELL_AUDIT.contains("feed"));
         assert!(DEDUP_KEY_SPOT_XVERIFY_CELL_AUDIT.contains("exchange_segment"));
         assert!(DEDUP_KEY_SPOT_XVERIFY_CELL_AUDIT.contains("field"));
         assert!(DEDUP_KEY_SPOT_XVERIFY_CELL_AUDIT.contains("kind"));
@@ -560,6 +578,7 @@ mod tests {
         let ddl = spot_xverify_daily_create_ddl();
         assert!(ddl.contains("DEDUP UPSERT KEYS"));
         assert!(ddl.contains("outcome"));
+        assert!(DEDUP_KEY_SPOT_XVERIFY_DAILY.contains("feed"));
         assert!(DEDUP_KEY_SPOT_XVERIFY_DAILY.ends_with("outcome"));
         assert!(DEDUP_KEY_SPOT_XVERIFY_DAILY.starts_with("ts,"));
     }
