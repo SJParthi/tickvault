@@ -294,18 +294,23 @@ impl GrowwCadenceExecutor {
     /// `stage="underlying_not_served"` pager on the CHAIN leg; the Groww
     /// SPOT leg deliberately passes `target = None` — the legacy leg had
     /// only the VIX-specific arms, no per-SID detector).
+    /// `core = false` marks the INDIA VIX target: the Groww SPOT
+    /// escalation edge keys on the 3 CORE indices only (the legacy
+    /// `groww_spot_1m_boot.rs::MinuteEdgeTally` semantics — a VIX success
+    /// must never mask core-all-failed, a VIX-only failure never pages).
     async fn record_leg_outcome(
         &self,
         leg: EscalationLeg,
         minute_secs: u32,
         ok: bool,
+        core: bool,
         target: Option<(&'static str, SecurityId, TargetOutcome)>,
     ) {
         let today = today_ist();
         let (rolled_from, finalized, not_served) = {
             let mut esc = self.escalation.lock().await;
             let rolled_from = esc.roll_day_if_needed(today);
-            let finalized = esc.record(leg, minute_secs, ok);
+            let finalized = esc.record(leg, minute_secs, ok, core);
             let not_served = target.and_then(|(symbol, sid, outcome)| {
                 esc.record_target(leg, minute_secs, symbol, sid, outcome)
             });
@@ -646,11 +651,14 @@ impl CadenceExecutor for GrowwCadenceExecutor {
         // Escalation edge (fix round 2026-07-17): a persist failure counts
         // as a FAILED minute (fetch-ok-but-lost is not ok — the M1 rule).
         // No per-SID not-served verdict on the Groww spot leg (the legacy
-        // leg had only the VIX arms — no invented semantics).
+        // leg had only the VIX arms — no invented semantics). The edge is
+        // CORE-keyed: an INDIA VIX outcome is excluded from the tally (the
+        // legacy `MinuteEdgeTally` semantics — hostile round 3, MEDIUM).
         self.record_leg_outcome(
             EscalationLeg::Spot,
             escalation_minute_secs,
             result.is_ok() && escalation_persist_ok,
+            !matches!(req.target, SpotTarget::IndiaVix),
             None,
         )
         .await;
@@ -1034,6 +1042,7 @@ impl CadenceExecutor for GrowwCadenceExecutor {
             EscalationLeg::Chain,
             escalation_minute_secs,
             result.is_ok() && escalation_persist_ok,
+            true,
             target,
         )
         .await;
