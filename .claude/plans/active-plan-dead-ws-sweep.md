@@ -121,3 +121,26 @@ counter in main.rs are all untouched.
 - [x] Truthful guard/comment updates
   - Files: crates/core/tests/phase2_9_l14_hard_fail.rs, crates/app/tests/ip_monitor_wiring_guard.rs, crates/app/src/boot_helpers.rs, crates/core/src/pipeline/feed_lag_monitor.rs, crates/trading/tests/dhat_multi_tf_consume_tick.rs
   - Tests: scoped crate suites
+
+## Per-Item Guarantee Matrix
+
+See `per-wave-guarantee-matrix.md` — the canonical 15-row 100% Guarantee
+Matrix and the 7-row Resilience Demand Matrix both apply to every item in
+this plan. Deletion-PR mapping (honest, per row class):
+
+- Coverage / testing / checks rows: proven by the scoped crate suites
+  (core / trading / app green; 2 pre-existing env failures reproduced on
+  pristine origin/main) + the common lockstep guards
+  (error_code_paging_filter_drift_guard 9/9, crossref 3/3) + fmt/clippy
+  clean — no new logic, no new pub fn, no new emit site.
+- Monitoring / logging / alerting rows: retirement-only — the dead
+  ws-reinject-01 filter is retired with dated notes at every lockstep
+  surface; no new failure mode, so no new alert is owed.
+- Resilience rows (Zero ticks lost, WS, QuestDB, O(1), dedup, real-time
+  proof): no tick-drop path, hot-path file, storage table, DEDUP key, or
+  aggregator code is touched — the deleted modules had zero production
+  callers, so every resilience envelope is byte-identical before/after.
+- Rows genuinely inapplicable to a deletion-only PR (new audit table,
+  new bench, new scenario) are N/A per the z-plus-defense-doctrine
+  "when Z+ conflicts with speed" table — recorded here, never silently
+  skipped.
