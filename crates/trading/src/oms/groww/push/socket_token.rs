@@ -27,7 +27,7 @@ use tracing::info;
 /// `tickvault_common::constants::GROWW_SOCKET_TOKEN_URL` was deleted with the
 /// Groww live feed 2026-07-15 and is deliberately NOT re-added to
 /// constants.rs — the push transport is the const's only consumer.
-pub const GROWW_SOCKET_TOKEN_URL: &str = "https://api.groww.in/v1/api/apex/v1/socket/token/create/";
+pub const GROWW_SOCKET_TOKEN_URL: &str = "https://api.groww.in/v1/api/apex/v1/socket/token/create/"; // APPROVED: wheel-canonical mint endpoint — byte-identity to growwapi-1.5.0 is load-bearing (deliberately not config)
 
 /// The ONLY host the mint call may talk to. The bounded one-hop redirect
 /// follow below refuses any Location that leaves this host (or downgrades
