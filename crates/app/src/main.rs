@@ -1653,6 +1653,16 @@ async fn main() -> Result<()> {
         &notifier,
     );
 
+    // Post-close Dhan↔Groww spot_1m_rest cross-broker OHLC comparator
+    // (SPOT-XVERIFY-01/02) — PROCESS-GLOBAL, config-gated (`[spot_crossverify]
+    // enabled`), 15:47 IST, DEDUP-idempotent. See
+    // `spot_crossverify_boot::spawn_spot_crossverify_tasks`.
+    tickvault_app::spot_crossverify_boot::spawn_spot_crossverify_tasks(
+        &config,
+        &trading_calendar,
+        &notifier,
+    );
+
     // Judge-locked cadence scheduler — PROCESS-GLOBAL like the verifier
     // above (2026-07-14): per-minute chain + spot fire timing with
     // structural zero-429 gates, failure ladder, and event-driven dry-run
