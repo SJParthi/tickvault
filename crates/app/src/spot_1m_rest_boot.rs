@@ -1342,9 +1342,35 @@ fn dhan_failed_audit_class(forensics: &DhanLadderForensics) -> (RestFetchOutcome
 /// A 2xx response body + its `Content-Type` header value (2026-07-14
 /// raw-body discriminator: the header names WHAT Dhan is serving when the
 /// body carries zero candles — JSON envelope vs HTML shell vs empty).
-struct FetchedBody {
-    text: String,
-    content_type: String,
+/// `pub(crate)` since 2026-07-17: the cadence executor
+/// (`crate::dhan_cadence_executor`) consumes the limiter-free inner fetch.
+pub(crate) struct FetchedBody {
+    pub(crate) text: String,
+    pub(crate) content_type: String,
+}
+
+/// One UNPACED attempt's typed failure (2026-07-17 cadence-executor
+/// refactor): carries the REAL `StatusCode` (`None` = the send leg never
+/// got a response), the 429 verdict, and the parsed `Retry-After` hint in
+/// milliseconds (`None` = absent/HTTP-date form) so the cadence lane can
+/// map broker pacing hints without touching the legacy limiter. `msg` is
+/// the bounded secret-redacted capture (DHAN-REST-400 discipline).
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct SpotFetchUnpacedFailure {
+    pub(crate) status: Option<u16>,
+    pub(crate) rate_limited: bool,
+    pub(crate) retry_after_ms: Option<i64>,
+    pub(crate) msg: String,
+}
+
+/// Pure: parse an HTTP `Retry-After` header value in its delta-seconds
+/// form into milliseconds. The HTTP-date form (and any other unparsable
+/// value) returns `None` — callers treat an unparsable hint as absent,
+/// never a guess.
+#[must_use]
+pub fn retry_after_header_ms(value: &str) -> Option<i64> {
+    let secs: i64 = value.trim().parse().ok()?;
+    (secs >= 0).then(|| secs.saturating_mul(1000))
 }
 
 // ---------------------------------------------------------------------------
@@ -1430,26 +1456,23 @@ async fn read_body_capped(mut resp: reqwest::Response) -> Result<String, String>
     String::from_utf8(buf).map_err(|_| "body not valid UTF-8".to_string())
 }
 
-/// One intraday REST round-trip → the raw 2xx body text (parsed by the
-/// caller via [`parse_intraday_columnar_for_minute`] — a malformed body
-/// parses to no candles and rides the ladder like an empty one). `Err`
-/// carries status + token-redacted URL + ≤300-char secret-redacted body
-/// (the DHAN-REST-400 capture discipline). Bodies (success AND error) are
-/// read through the streamed cap.
-async fn spot_1m_fetch_once(
+/// One intraday REST round-trip → the raw 2xx body text — the UNPACED
+/// inner (2026-07-17 cadence-executor refactor): NO limiter acquire, NO
+/// `record_429` — pacing/tuning is the CALLER's responsibility. The legacy
+/// per-minute legs call the [`spot_1m_fetch_once`] wrapper below (which
+/// routes through the shared Dhan Data-API limiter, unchanged behavior);
+/// the cadence executor calls THIS fn directly because the cadence lane's
+/// pacing authority is the gate registry, never the limiter
+/// (`cadence-error-codes.md` §0b/§3b item 1). `Err` carries the REAL
+/// status + 429 verdict + parsed `Retry-After` hint + token-redacted URL +
+/// ≤300-char secret-redacted body (the DHAN-REST-400 capture discipline).
+/// Bodies (success AND error) are read through the streamed cap.
+pub(crate) async fn spot_1m_fetch_once_unpaced(
     client: &reqwest::Client,
     url: &str,
     jwt: &str,
     body: &serde_json::Value,
-) -> Result<FetchedBody, FetchFailure> {
-    // 2026-07-14 operator pacing directive: EVERY spot-1m Data-API request
-    // (per-minute fires, ladder re-polls, the 15:33:30 sweep, the #1524
-    // diagnostic probes — they all funnel through this fn) waits for a
-    // permit from the shared process-wide limiter; overflow spills into
-    // the next second(s), never drops.
-    crate::dhan_data_api_limiter::shared_dhan_data_api_limiter()
-        .acquire()
-        .await;
+) -> Result<FetchedBody, SpotFetchUnpacedFailure> {
     let resp = client
         .post(url)
         .header("access-token", jwt)
@@ -1457,22 +1480,28 @@ async fn spot_1m_fetch_once(
         .json(body)
         .send()
         .await
-        .map_err(|e| FetchFailure {
+        .map_err(|e| SpotFetchUnpacedFailure {
+            status: None,
             rate_limited: false,
+            retry_after_ms: None,
             msg: format!("send: {}", redact_url_params(&e.to_string())),
         })?;
     let status = resp.status();
     if !status.is_success() {
         let rate_limited = status == reqwest::StatusCode::TOO_MANY_REQUESTS;
-        if rate_limited {
-            // Feed the self-tuner from the REAL StatusCode (never a
-            // substring scan) — enough of these inside the rolling window
-            // steps the shared limiter down to the 2 rps floor.
-            crate::dhan_data_api_limiter::shared_dhan_data_api_limiter().record_429();
-        }
+        // Retry-After BEFORE the body read consumes the response — the
+        // delta-seconds form only; an HTTP-date (or absent) header reads
+        // `None`, never a guessed backoff.
+        let retry_after_ms = resp
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(retry_after_header_ms);
         let error_body = read_body_capped(resp).await.unwrap_or_default();
-        return Err(FetchFailure {
+        return Err(SpotFetchUnpacedFailure {
+            status: Some(status.as_u16()),
             rate_limited,
+            retry_after_ms,
             msg: format!(
                 "http {status} url={} body={}",
                 redact_url_params(url),
@@ -1489,11 +1518,46 @@ async fn spot_1m_fetch_once(
         .and_then(|v| v.to_str().ok())
         .unwrap_or_default()
         .to_string();
-    let text = read_body_capped(resp).await.map_err(|msg| FetchFailure {
-        rate_limited: false,
-        msg,
-    })?;
+    let text = read_body_capped(resp)
+        .await
+        .map_err(|msg| SpotFetchUnpacedFailure {
+            status: Some(status.as_u16()),
+            rate_limited: false,
+            retry_after_ms: None,
+            msg,
+        })?;
     Ok(FetchedBody { text, content_type })
+}
+
+/// The LEGACY paced wrapper — behavior-preserving for the per-minute
+/// fires, ladder re-polls, the 15:33:30 sweep, and the #1524 diagnostic
+/// probes (they all funnel through this fn): waits for a permit from the
+/// shared process-wide limiter (2026-07-14 operator pacing directive;
+/// overflow spills into the next second(s), never drops), delegates to
+/// the unpaced inner, and feeds the self-tuner on a REAL 429.
+async fn spot_1m_fetch_once(
+    client: &reqwest::Client,
+    url: &str,
+    jwt: &str,
+    body: &serde_json::Value,
+) -> Result<FetchedBody, FetchFailure> {
+    crate::dhan_data_api_limiter::shared_dhan_data_api_limiter()
+        .acquire()
+        .await;
+    spot_1m_fetch_once_unpaced(client, url, jwt, body)
+        .await
+        .map_err(|failure| {
+            if failure.rate_limited {
+                // Feed the self-tuner from the REAL StatusCode (never a
+                // substring scan) — enough of these inside the rolling
+                // window steps the shared limiter down to the 2 rps floor.
+                crate::dhan_data_api_limiter::shared_dhan_data_api_limiter().record_429();
+            }
+            FetchFailure {
+                rate_limited: failure.rate_limited,
+                msg: failure.msg,
+            }
+        })
 }
 
 /// Bounded in-minute re-poll ladder for ONE index: first attempt at the
@@ -3782,6 +3846,22 @@ mod tests {
         assert!(!accumulation_within_cap(cap, 1, cap));
         // Overflow-safe (saturating add, never wraps to a small value).
         assert!(!accumulation_within_cap(usize::MAX, usize::MAX, cap));
+    }
+
+    // ---- Retry-After parse (2026-07-17 cadence-executor refactor) ------------
+
+    #[test]
+    fn test_retry_after_header_ms_parses_delta_seconds_only() {
+        // Delta-seconds form → milliseconds.
+        assert_eq!(retry_after_header_ms("3"), Some(3_000));
+        assert_eq!(retry_after_header_ms(" 10 "), Some(10_000));
+        assert_eq!(retry_after_header_ms("0"), Some(0));
+        // Negative / garbage / HTTP-date forms → None (never a guess).
+        assert_eq!(retry_after_header_ms("-1"), None);
+        assert_eq!(retry_after_header_ms(""), None);
+        assert_eq!(retry_after_header_ms("Wed, 21 Oct 2026 07:28:00 GMT"), None);
+        // Saturating multiply — a hostile huge value never panics.
+        assert_eq!(retry_after_header_ms(&i64::MAX.to_string()), Some(i64::MAX));
     }
 
     // ---- fire_is_fresh -----------------------------------------------------
