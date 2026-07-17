@@ -8,10 +8,12 @@
 # catch before the push (banned patterns, secrets, formatting). This avoids
 # 5-10 minutes of redundant local work that CI will repeat server-side.
 #
-# Gate order (all fast, <35s total):
+# Gate order (push-scoped, ~35s typical; scans 2-3 scale their timeout with
+# the push-range file count, and the FULL-TREE scans run server-side in the
+# ci.yml Repo Guards job on every PR/push):
 #   1. cargo fmt --check          [fast: ~2s]
-#   2. Banned pattern scan        [fast: ~2s]
-#   3. Secret scan                [fast: ~1s]
+#   2. Banned pattern scan        [push-scoped; timeout 60s + count/2, cap 120s]
+#   3. Secret scan                [push-scoped; timeout 60s + count/2, cap 120s]
 #   4. Test count guard (ratchet) [fast: ~1s]
 #   5. Data integrity guard       [fast: ~2s, pattern scan]
 #   6. Pub fn test guard          [fast: ~3s, pattern scan]
@@ -20,6 +22,10 @@
 #
 # Heavy gates (clippy, test, audit, deny, coverage, loom) are CI-only.
 # Branch protection blocks merge if any CI check fails.
+#
+# NOTE: the harness dispatch budget bounds this hook's wall-clock; very large
+# pushes (hundreds of changed files) may exceed it — CI Repo Guards remains
+# the full authority.
 #
 # On success, writes state file for pre-PR gate optimization.
 
@@ -114,28 +120,81 @@ else
   echo "  PASS: cargo fmt" >&2
 fi
 
-# Gate 2: Banned pattern scan (full workspace)
+# Gate 2: Banned pattern scan (push-scoped)
 echo "  [2/8] Banned pattern scan..." >&2
-ALL_RS=$(find crates -name '*.rs' -not -path '*/target/*' 2>/dev/null | tr '\n' ' ')
-if [ -n "$ALL_RS" ] && [ -x "$HOOKS_DIR/banned-pattern-scanner.sh" ]; then
-  if ! timeout 60 "$HOOKS_DIR/banned-pattern-scanner.sh" "$CWD" "$ALL_RS" > /dev/null 2>&1; then
-    echo "  FAIL: Banned patterns in workspace." >&2
+# 2026-07-16 gate-integrity fix (operator-approved): the scanners take ONE
+# newline-separated file list ($2) — the old space-joined form made their
+# read-loop see a single bogus mega-filename and scan ZERO files. Local
+# gates scan the PUSH RANGE (fast — fits the harness hook budget); the
+# FULL-TREE scan runs server-side in ci.yml Repo Guards on every PR/push.
+PUSH_BASE=$(git merge-base origin/main HEAD 2>/dev/null || true)
+if [ -n "$PUSH_BASE" ]; then
+  # fail-closed (final review B-MED): a git-diff failure (partial clone
+  # offline, corrupt object) must never masquerade as "no changes" → PASS
+  CHANGED_ALL=$(git diff --name-only "$PUSH_BASE"..HEAD 2>/dev/null)
+  DIFF_EXIT=$?
+  if [ "$DIFF_EXIT" -ne 0 ]; then
+    echo "  FAIL: git diff failed (exit $DIFF_EXIT) — cannot enumerate push range; refusing to skip scans" >&2
+    exit 2
+  fi
+else
+  # fail-closed (review r2 F1): a degraded clone (missing origin/main) must
+  # never fall back to a full-tree scan — that re-creates the killed-hook
+  # fail-open on exactly the clones where the range cannot be proven.
+  echo "  FAIL: cannot resolve push range (origin/main missing) — run: git fetch origin main" >&2
+  exit 2
+fi
+CHANGED_RS=$(printf '%s\n' "$CHANGED_ALL" | grep -E '^crates/.*\.rs$' || true)
+RS_COUNT=$(printf '%s\n' "$CHANGED_RS" | sed '/^$/d' | wc -l | tr -d ' ')
+ALL_COUNT=$(printf '%s\n' "$CHANGED_ALL" | sed '/^$/d' | wc -l | tr -d ' ')
+if [ "$RS_COUNT" -eq 0 ]; then
+  echo "  PASS: Banned pattern scan (no .rs changes in push range; full tree scanned in CI)" >&2
+elif [ -x "$HOOKS_DIR/banned-pattern-scanner.sh" ]; then
+  # measured ~0.3s/file worst-case (2026-07-16) — count/2 gives 2x headroom
+  BANNED_TIMEOUT=$(( 60 + RS_COUNT / 2 ))
+  # cap keeps worst-case hook wall-clock inside the 300s dispatch budget; a
+  # slow scan then 124-BLOCKS (fail-closed) instead of being killed fail-open
+  [ "$BANNED_TIMEOUT" -gt 120 ] && BANNED_TIMEOUT=120
+  BANNED_OUT=$(timeout "$BANNED_TIMEOUT" "$HOOKS_DIR/banned-pattern-scanner.sh" "$CWD" "$CHANGED_RS" 2>&1)
+  BANNED_EXIT=$?
+  if [ "$BANNED_EXIT" -eq 124 ]; then
+    echo "  FAIL: Banned pattern scan timed out (${BANNED_TIMEOUT}s) — blocking push" >&2
+    FAILED=1
+  elif [ "$BANNED_EXIT" -ne 0 ]; then
+    echo "$BANNED_OUT" | tail -20 >&2
+    echo "  FAIL: Banned patterns in push range ($RS_COUNT .rs file(s) scanned)." >&2
     FAILED=1
   else
-    echo "  PASS: Banned pattern scan" >&2
+    echo "  PASS: Banned pattern scan ($RS_COUNT .rs file(s) in push range)" >&2
   fi
 else
   echo "  SKIP: Scanner not available" >&2
 fi
 
-# Gate 3: Secret scan
+# Gate 3: Secret scan (push-scoped — the scanner filters extensions internally,
+# so scanning ALL changed files is a superset of the old .rs-only list)
 echo "  [3/8] Secret scan..." >&2
-if [ -x "$HOOKS_DIR/secret-scanner.sh" ]; then
-  if ! timeout 30 "$HOOKS_DIR/secret-scanner.sh" "$CWD" "$ALL_RS" > /dev/null 2>&1; then
-    echo "  FAIL: Secrets detected in workspace." >&2
+if [ "$ALL_COUNT" -eq 0 ]; then
+  echo "  PASS: Secret scan (no changed files in push range; CI scans changed files per PR, weekly sweep covers the full tree)" >&2
+elif [ -x "$HOOKS_DIR/secret-scanner.sh" ]; then
+  # env base (default 60s) + count/2 (measured ~0.3-0.5s/file — /8 under-allowed);
+  # hard floor 60s; findings always block
+  SECRET_TIMEOUT=$(( ${TICKVAULT_SECRET_SCAN_TIMEOUT_SECS:-60} + ALL_COUNT / 2 ))
+  [ "$SECRET_TIMEOUT" -lt 60 ] && SECRET_TIMEOUT=60
+  # cap keeps worst-case hook wall-clock inside the 300s dispatch budget; a
+  # slow scan then 124-BLOCKS (fail-closed) instead of being killed fail-open
+  [ "$SECRET_TIMEOUT" -gt 120 ] && SECRET_TIMEOUT=120
+  SECRET_OUT=$(timeout "$SECRET_TIMEOUT" "$HOOKS_DIR/secret-scanner.sh" "$CWD" "$CHANGED_ALL" 2>&1)
+  SECRET_EXIT=$?
+  if [ "$SECRET_EXIT" -eq 124 ]; then
+    echo "  FAIL: Secret scan timed out (${SECRET_TIMEOUT}s) — blocking push" >&2
+    FAILED=1
+  elif [ "$SECRET_EXIT" -ne 0 ]; then
+    echo "$SECRET_OUT" | tail -20 >&2
+    echo "  FAIL: Secrets detected in push range ($ALL_COUNT file(s) scanned)." >&2
     FAILED=1
   else
-    echo "  PASS: Secret scan" >&2
+    echo "  PASS: Secret scan ($ALL_COUNT file(s) in push range)" >&2
   fi
 else
   echo "  SKIP: secret-scanner.sh not available" >&2
