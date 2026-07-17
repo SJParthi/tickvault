@@ -25,7 +25,7 @@ paths:
 ## Deep Reference
 Read `docs/standards/market-hours.md` ONLY when implementing time-dependent logic or SEBI compliance.
 
-## 2026-07-17 Update — deploy market-hours guard: red block → GREEN deferred no-op (push events only)
+## 2026-07-17 Update — deploy market-hours guard: red block → GREEN deferred no-op (main-branch push runs only)
 
 The 2026-06-03 deploy market-hours lock (operator verbatim: *"only between 9 am
 till 3.45 pm it should not happen"* — the `guard_market_hours` job in
@@ -38,11 +38,19 @@ this note is now its rule-file home) changes FAILURE MODE, not substance:
   without the explicit `workflow_dispatch` + `confirm_market_hours=yes`
   override. The deferred path deploys NOTHING (the Deploy-to-EC2 job is
   skipped via the guard's new `deploy_allowed` output).
-- **What changed:** an in-window run for a NON-dispatch event (push to main —
-  a merge) now exits the guard GREEN as a deferred no-op (`deploy_allowed=false`
+- **What changed:** an in-window run for a BRANCH PUSH TO MAIN (a merge) now
+  exits the guard GREEN as a deferred no-op (`deploy_allowed=false`
   + a `::notice::` naming the deferred SHA) instead of `exit 1` red. An
   in-window `workflow_dispatch` WITHOUT the override keeps the loud red
   `exit 1` — an explicit human/dispatcher action gets honest failure feedback.
+- **Honest scope — the green defer covers MAIN-BRANCH PUSH runs only.** Three
+  residual RED shapes remain by design: (i) an in-window catchup DISPATCH
+  after a bot merge still exits 1 red (coverage still lands via the 15:46 IST
+  after-close cron); (ii) the swap-time re-gate (`market_hours_swap_abort`)
+  still reds a run whose build crosses 09:00 IST; (iii) in-window TAG pushes
+  (`v*.*.*`) still block red — deliberately, BECAUSE the after-close cron
+  compares/dispatches main HEAD only, so a green tag deferral (possibly on a
+  non-HEAD commit) would be a silent never-deploy.
 - **Authority:** the operator's zero-touch mandate (relayed via the
   coordinator session 2026-07-17). The failure it fixes: every market-hours
   merge produced a red push-triggered deploy run, and `postmerge-catchup.yml`
@@ -51,5 +59,13 @@ this note is now its rule-file home) changes FAILURE MODE, not substance:
   up by `deploy-aws-after-close.yml`'s 15:46 IST cron: its compare accepts as
   "last deployed" only runs whose B9 "Record deployed binary git SHA" step
   actually executed, and the skipped deploy job leaves that step `skipped`.
+- **Division of authority (do NOT "fix" postmerge-catchup back):**
+  `postmerge-catchup.yml` backfills RUN EXISTENCE only — its any-status probe
+  is deliberate (it prevents 30-min re-dispatch storms and covers the
+  out-of-window bot-merge delivery case). The DEPLOYMENT authority is
+  `deploy-aws-after-close.yml`'s B9 SSM compare
+  (`/tickvault/prod/deploy/binary-git-sha` vs main HEAD), which is immune to
+  green-but-not-deployed runs. A green deferred run counting as "covered" in
+  catchup is therefore correct, not masking.
 - **Immediate in-window delivery** remains available ONLY via the loud
   `workflow_dispatch` with `confirm_market_hours=yes` — kept by design.
