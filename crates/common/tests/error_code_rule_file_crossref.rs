@@ -113,6 +113,15 @@ const REVERSE_CHECK_ALLOWLIST: &[&str] = &[
     // (dhan-rest-only-noise-lock-2026-07-14.md: "variant retained until
     // the C4 variant sweep"). Rule-file history retained.
     "AUTH-GAP-06",
+    // `WS-REINJECT-01` — variant RETIRED 2026-07-17 (evidence-audit
+    // Fix PR C): its only emitter, the orphaned `wal_reinject.rs`
+    // module, had zero production callers (main.rs replaced STAGE-C.2b
+    // re-injection with count-residuals + confirm_replayed) and was
+    // deleted with its dead paging filter. The rule file
+    // (ws-reinject-error-codes.md) retains the code string as
+    // historical audit per the house banner convention — exactly the
+    // WS-GAP-05..09 mechanism.
+    "WS-REINJECT-01",
     // GROWW-PUSH-01..04 (Stage 0 stubs, 2026-07-16) were REMOVED from this
     // allowlist when Stage A landed their `GrowwPush0*` ErrorCode variants
     // (the documented Stage-A obligation of the Stage-0 entry).

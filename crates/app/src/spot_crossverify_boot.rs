@@ -43,12 +43,18 @@ pub const SPOT_XVERIFY_RUN_BUDGET_SECS: u64 = 600;
 const SPOT_XVERIFY_HTTP_TIMEOUT_SECS: u64 = 15;
 /// 8 MiB `/exec` response cap (the TF_VERIFY_MAX_RESPONSE_BYTES shape).
 pub const SPOT_XVERIFY_MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
-/// Row LIMIT — ~4 indices × 375 minutes headroom. `returned == limit` = the
-/// truncation tripwire (degraded, never a silent partial).
+/// Row CAP — 4 indices × 375 minutes = exactly 1,500 on a healthy full
+/// day. The query asks for `cap + 1` (the house LIMIT+1 probe) and only
+/// `returned > cap` flags truncation — honest at ANY cap size: a dataset
+/// that exactly fills the cap is complete, not truncated (the old
+/// `returned >= limit` check false-flagged every healthy full day
+/// PARTIAL at zero headroom). Fix E, 2026-07-17.
 pub const SPOT_XVERIFY_ROW_LIMIT: usize = 1_500;
 /// Max cell-audit rows written per run (a pathological day is bounded).
 pub const SPOT_XVERIFY_MAX_AUDIT_ROWS_PER_RUN: usize = 10_000;
-const SPOT_XVERIFY_TOP_DETAIL_MAX: usize = 10;
+/// ≤3 example lines on the Telegram card (Fix E — commandment 8: one
+/// message = one decision; the full list lives in the audit table).
+const SPOT_XVERIFY_TOP_DETAIL_MAX: usize = 3;
 
 const NANOS_PER_SEC: i64 = 1_000_000_000;
 const MICROS_PER_SEC: i64 = 1_000_000;
@@ -337,6 +343,108 @@ pub fn compare_day(
 }
 
 // ---------------------------------------------------------------------------
+// Severity gating (pure) — operator Fix E, 2026-07-17
+// ---------------------------------------------------------------------------
+
+/// `true` when a DIVERGED day is pure cross-broker sampling NOISE — Info,
+/// not a High page. Gate (operator-approved Fix E): the day pages High
+/// ONLY when (a) an OPEN or CLOSE field diverged (open/close are anchored
+/// prices — both brokers seal the same minute boundary, so a drift there
+/// is a real feed problem, unlike high/low which depend on WHICH
+/// intra-minute instant each broker sampled), (b) any single delta
+/// exceeds `noise_threshold_paise` (`[spot_crossverify]` knob, default
+/// ₹20), or (c) any minute is missing on one broker. A degraded /
+/// partial / blind / truncated run is never noise. COUNTS stay exact —
+/// this gates the Telegram severity only. Pure.
+#[must_use]
+pub fn is_noise_only_divergence(
+    cmp: &DayComparison,
+    degraded: bool,
+    truncated: bool,
+    noise_threshold_paise: i64,
+) -> bool {
+    cmp.outcome == SpotXverifyOutcome::Diverged
+        && !degraded
+        && !truncated
+        && cmp.minutes_compared > 0
+        && cmp.missing_dhan == 0
+        && cmp.missing_groww == 0
+        && cmp.cells_diverged > 0
+        && cmp.noise_max <= noise_threshold_paise
+        && !cmp.findings.iter().any(|f| {
+            f.kind == SpotXverifyCellKind::Diverged && (f.field == "open" || f.field == "close")
+        })
+}
+
+/// Render one diverged finding as a plain-English Telegram example line —
+/// broker named, rupees not paise, 12-hour IST time (the 10 Telegram
+/// commandments). Pure.
+#[must_use]
+pub fn format_finding_line(f: &CellFinding, day_start_nanos: i64) -> String {
+    let secs = secs_of_day(f.minute_nanos, day_start_nanos);
+    let (h24, m) = ((secs / 3600).rem_euclid(24), (secs / 60).rem_euclid(60));
+    let (h12, ampm) = match h24 {
+        0 => (12, "AM"),
+        1..=11 => (h24, "AM"),
+        12 => (12, "PM"),
+        _ => (h24 - 12, "PM"),
+    };
+    // APPROVED: cold-path display-only paise→rupee division.
+    #[allow(clippy::cast_precision_loss)]
+    let diff_rupees = f.diff_paise as f64 / 100.0;
+    match f.kind {
+        SpotXverifyCellKind::Diverged => format!(
+            "{} {}: Dhan \u{20b9}{:.2} vs Groww \u{20b9}{:.2} \
+             (\u{20b9}{diff_rupees:.2} apart) at {h12}:{m:02} {ampm}",
+            f.index_name, f.field, f.dhan_value, f.groww_value
+        ),
+        SpotXverifyCellKind::MissingDhan => format!(
+            "{}: Dhan has no price at {h12}:{m:02} {ampm} (Groww \u{20b9}{:.2})",
+            f.index_name, f.groww_value
+        ),
+        SpotXverifyCellKind::MissingGroww => format!(
+            "{}: Groww has no price at {h12}:{m:02} {ampm} (Dhan \u{20b9}{:.2})",
+            f.index_name, f.dhan_value
+        ),
+        SpotXverifyCellKind::OutOfSession => format!(
+            "{}: a price outside market hours at {h12}:{m:02} {ampm}",
+            f.index_name
+        ),
+    }
+}
+
+/// The ≤3 WORST example lines for the Telegram card: diverged findings
+/// sorted biggest-delta-first, then missing-minute findings — bounded,
+/// plain English, never the whole list (commandment 8). Pure.
+#[must_use]
+pub fn worst_example_lines(findings: &[CellFinding], day_start_nanos: i64) -> Vec<String> {
+    let mut diverged: Vec<&CellFinding> = findings
+        .iter()
+        .filter(|f| f.kind == SpotXverifyCellKind::Diverged)
+        .collect();
+    diverged.sort_by(|a, b| b.diff_paise.cmp(&a.diff_paise));
+    let mut out: Vec<String> = Vec::new();
+    for f in diverged {
+        if out.len() >= SPOT_XVERIFY_TOP_DETAIL_MAX {
+            break;
+        }
+        out.push(format_finding_line(f, day_start_nanos));
+    }
+    for f in findings.iter().filter(|f| {
+        matches!(
+            f.kind,
+            SpotXverifyCellKind::MissingDhan | SpotXverifyCellKind::MissingGroww
+        )
+    }) {
+        if out.len() >= SPOT_XVERIFY_TOP_DETAIL_MAX {
+            break;
+        }
+        out.push(format_finding_line(f, day_start_nanos));
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
 // Scheduling (pure)
 // ---------------------------------------------------------------------------
 
@@ -427,11 +535,14 @@ fn day_bounds_micros(day_start_ist_nanos: i64) -> (i64, i64) {
 #[must_use]
 pub fn select_spot_1m_sql(feed: &str, day_start_ist_nanos: i64) -> String {
     let (start, end) = day_bounds_micros(day_start_ist_nanos);
+    // LIMIT+1 probe: ask for one row PAST the cap so `rows > cap` is the
+    // only truncation signal — exactly-cap days are complete, never PARTIAL.
+    let probe_limit = SPOT_XVERIFY_ROW_LIMIT + 1;
     format!(
         "SELECT (ts / 1) * 1000 AS ts_nanos, symbol, open, high, low, close, volume \
          FROM spot_1m_rest \
          WHERE feed = '{feed}' AND exchange_segment = 'IDX_I' \
-         AND ts >= {start} AND ts < {end} ORDER BY ts ASC LIMIT {SPOT_XVERIFY_ROW_LIMIT}"
+         AND ts >= {start} AND ts < {end} ORDER BY ts ASC LIMIT {probe_limit}"
     )
 }
 
@@ -457,8 +568,12 @@ fn row_i64(cols: &[serde_json::Value], idx: usize) -> Option<i64> {
     })
 }
 
-/// Parse the per-feed `spot_1m_rest` dataset. `truncated` = the dataset hit
-/// the query's LIMIT (the tripwire — never a silent partial compare).
+/// Parse the per-feed `spot_1m_rest` dataset. `limit` is the row CAP (the
+/// query asks for `cap + 1` — the LIMIT+1 probe); `truncated` fires ONLY
+/// when the dataset carries MORE than the cap, so a healthy exactly-cap
+/// day (4 indices × 375 minutes = 1,500 rows) is complete, never a false
+/// PARTIAL. When truncated, only the first `cap` rows are returned (the
+/// probe row never enters the compare).
 ///
 /// # Errors
 /// Malformed body (not JSON / no dataset). Individual bad rows are skipped.
@@ -469,7 +584,8 @@ pub fn parse_spot_dataset(body: &str, limit: usize) -> Result<(Vec<SpotRow>, boo
         .get("dataset")
         .and_then(|d| d.as_array())
         .ok_or_else(|| "missing dataset".to_string())?;
-    let truncated = rows.len() >= limit;
+    let truncated = rows.len() > limit;
+    let rows = &rows[..rows.len().min(limit)];
     let mut out = Vec::with_capacity(rows.len());
     for r in rows {
         let Some(cols) = r.as_array() else { continue };
@@ -585,6 +701,12 @@ pub struct SpotXverifySummaryData {
     pub degraded: bool,
     pub truncated: bool,
     pub status_label: String,
+    /// Fix E severity gating: `true` = every divergence is high/low-only
+    /// sampling skew within the noise band, nothing missing, coverage
+    /// complete → Info trend line, never a High page.
+    pub noise_only: bool,
+    /// The day's biggest single delta in paise (0 when nothing diverged).
+    pub noise_max_paise: i64,
     pub top_detail: Vec<String>,
 }
 
@@ -651,6 +773,7 @@ async fn read_feed_map(
 pub async fn run_spot_crossverify(
     questdb_config: &QuestDbConfig,
     date: NaiveDate,
+    noise_threshold_paise: i64,
 ) -> SpotXverifySummaryData {
     ensure_spot_crossverify_tables(questdb_config).await;
 
@@ -691,6 +814,8 @@ pub async fn run_spot_crossverify(
                 degraded: true,
                 truncated: false,
                 status_label: "blind".to_string(),
+                noise_only: false,
+                noise_max_paise: 0,
                 top_detail: Vec::new(),
             };
         }
@@ -737,18 +862,9 @@ pub async fn run_spot_crossverify(
     };
 
     let mismatches = cmp.cells_diverged;
-    let mut top_detail: Vec<String> = Vec::new();
-    for f in cmp.findings.iter().take(SPOT_XVERIFY_TOP_DETAIL_MAX) {
-        top_detail.push(format!(
-            "{} {} {}: dhan={:.2} groww={:.2} ({}p)",
-            f.index_name,
-            f.kind.as_str(),
-            f.field,
-            f.dhan_value,
-            f.groww_value,
-            f.diff_paise
-        ));
-    }
+    // ≤3 WORST plain-English example lines (Fix E — rupees, broker named,
+    // 12-hour IST time; worst delta first, then missing minutes).
+    let top_detail = worst_example_lines(&cmp.findings, day_start);
 
     // Persist cell findings (bounded) + the daily row.
     let mut writer = SpotXverifyAuditWriter::new(questdb_config);
@@ -836,6 +952,8 @@ pub async fn run_spot_crossverify(
         degraded,
         truncated,
         status_label,
+        noise_only: is_noise_only_divergence(&cmp, degraded, truncated, noise_threshold_paise),
+        noise_max_paise: cmp.noise_max,
         top_detail,
     }
 }
@@ -872,6 +990,7 @@ pub fn spawn_spot_crossverify_tasks(
         return;
     }
     let qcfg = config.questdb.clone();
+    let noise_threshold_paise = config.spot_crossverify.noise_threshold_paise;
     let calendar = std::sync::Arc::clone(trading_calendar);
     let inner: tokio::task::JoinHandle<Result<Option<(SpotXverifySummaryData, bool)>, String>> =
         tokio::spawn(async move {
@@ -949,7 +1068,7 @@ pub fn spawn_spot_crossverify_tasks(
                 }
             }
             let target = date_override.unwrap_or(today_ist);
-            let summary = run_spot_crossverify(&qcfg, target).await;
+            let summary = run_spot_crossverify(&qcfg, target, noise_threshold_paise).await;
             Ok(Some((summary, force_now)))
         });
 
@@ -970,6 +1089,8 @@ pub fn spawn_spot_crossverify_tasks(
                         degraded: s.degraded,
                         truncated: s.truncated,
                         status_label: s.status_label,
+                        noise_only: s.noise_only,
+                        noise_max_paise: s.noise_max_paise,
                         top_detail: s.top_detail,
                     });
                 } else {
@@ -1211,17 +1332,27 @@ mod tests {
         assert!(sql.contains("feed = 'dhan'"));
         assert!(sql.contains("exchange_segment = 'IDX_I'"));
         assert!(sql.contains("FROM spot_1m_rest"));
-        assert!(sql.contains(&format!("LIMIT {SPOT_XVERIFY_ROW_LIMIT}")));
+        // The house LIMIT+1 probe: the query asks for cap+1 so an
+        // exactly-cap healthy day is complete, never a false PARTIAL.
+        assert!(sql.contains(&format!("LIMIT {}", SPOT_XVERIFY_ROW_LIMIT + 1)));
+        assert!(!sql.contains(&format!("LIMIT {SPOT_XVERIFY_ROW_LIMIT} ")));
     }
 
     #[test]
     fn parse_dataset_truncation_tripwire() {
+        // Fix E LIMIT+1 probe: exactly-cap rows = COMPLETE (the 2026-07-17
+        // false-PARTIAL fix — 4 indices × 375 minutes lands exactly on the
+        // cap); cap+1 rows = truncated, and the probe row is dropped.
         let body = r#"{"dataset":[[1,"NIFTY",1.0,2.0,0.5,1.5,0]]}"#;
         let (rows, trunc) = parse_spot_dataset(body, 1).unwrap();
         assert_eq!(rows.len(), 1);
-        assert!(trunc); // returned == limit
-        let (_, trunc2) = parse_spot_dataset(body, 10).unwrap();
-        assert!(!trunc2);
+        assert!(!trunc, "exactly cap rows is a complete dataset");
+        let two = r#"{"dataset":[[1,"NIFTY",1.0,2.0,0.5,1.5,0],[2,"NIFTY",1.0,2.0,0.5,1.5,0]]}"#;
+        let (rows2, trunc2) = parse_spot_dataset(two, 1).unwrap();
+        assert!(trunc2, "cap+1 rows flags truncation");
+        assert_eq!(rows2.len(), 1, "the probe row never enters the compare");
+        let (_, trunc3) = parse_spot_dataset(body, 10).unwrap();
+        assert!(!trunc3);
         assert!(parse_spot_dataset("not json", 10).is_err());
     }
 
@@ -1283,6 +1414,113 @@ mod tests {
         assert_eq!(cmp.noise_max, 2);
         // Pure: same inputs ⇒ same result.
         assert_eq!(cmp, compare_day(&d, &g, DAY0, 0));
+    }
+
+    /// Fix E severity gating: high/low-only skew within the noise band is
+    /// noise_only (Info); an OPEN or CLOSE divergence, a single delta past
+    /// the band, missing minutes, or a degraded/truncated run never is.
+    #[test]
+    fn test_is_noise_only_divergence_gating() {
+        let mk = |d_bar: OhlcBar, g_bar: OhlcBar| {
+            let mut d = BTreeMap::new();
+            let mut g = BTreeMap::new();
+            d.insert(nifty(33_360), d_bar);
+            g.insert(nifty(33_360), g_bar);
+            compare_day(&d, &g, DAY0, 0)
+        };
+        // (1) high-only skew of 2 paise, band ₹20 → noise_only.
+        let hl = mk(
+            bar(100.0, 101.02, 99.0, 100.5),
+            bar(100.0, 101.0, 99.0, 100.5),
+        );
+        assert!(is_noise_only_divergence(&hl, false, false, 2_000));
+        // ... but degraded / truncated coverage is never noise.
+        assert!(!is_noise_only_divergence(&hl, true, false, 2_000));
+        assert!(!is_noise_only_divergence(&hl, false, true, 2_000));
+        // (2) an OPEN divergence is a real drift → High even at 1 paise.
+        let open = mk(
+            bar(100.01, 101.0, 99.0, 100.5),
+            bar(100.0, 101.0, 99.0, 100.5),
+        );
+        assert!(!is_noise_only_divergence(&open, false, false, 2_000));
+        // ... and CLOSE likewise.
+        let close = mk(
+            bar(100.0, 101.0, 99.0, 100.51),
+            bar(100.0, 101.0, 99.0, 100.5),
+        );
+        assert!(!is_noise_only_divergence(&close, false, false, 2_000));
+        // (3) a single high/low delta PAST the band → High (₹25 > ₹20).
+        let big = mk(
+            bar(100.0, 126.0, 99.0, 100.5),
+            bar(100.0, 101.0, 99.0, 100.5),
+        );
+        assert!(!is_noise_only_divergence(&big, false, false, 2_000));
+        // (3b) Fix E review round 1: the band is INCLUSIVE — a delta of
+        // EXACTLY the threshold (₹20.00 == 2000 paise) is still noise
+        // (`noise_max <= threshold`); one paise more is not.
+        let boundary = mk(
+            bar(100.0, 121.0, 99.0, 100.5),
+            bar(100.0, 101.0, 99.0, 100.5),
+        );
+        assert!(
+            is_noise_only_divergence(&boundary, false, false, 2_000),
+            "delta == threshold must stay noise (inclusive <= convention)"
+        );
+        assert!(
+            !is_noise_only_divergence(&boundary, false, false, 1_999),
+            "one paise past the band must page High"
+        );
+        // (4) a missing minute on one broker → never noise.
+        let mut d = BTreeMap::new();
+        let mut g = BTreeMap::new();
+        d.insert(nifty(33_360), bar(100.0, 101.02, 99.0, 100.5));
+        g.insert(nifty(33_360), bar(100.0, 101.0, 99.0, 100.5));
+        d.insert(nifty(33_420), bar(100.0, 101.0, 99.0, 100.5));
+        let miss = compare_day(&d, &g, DAY0, 0);
+        assert!(!is_noise_only_divergence(&miss, false, false, 2_000));
+        // (5) a clean day is not "noise" (nothing diverged at all).
+        let clean = mk(
+            bar(100.0, 101.0, 99.0, 100.5),
+            bar(100.0, 101.0, 99.0, 100.5),
+        );
+        assert!(!is_noise_only_divergence(&clean, false, false, 2_000));
+    }
+
+    /// The Telegram example lines are plain English — rupees, broker
+    /// named, 12-hour IST time, worst delta first, bounded at 3.
+    #[test]
+    fn test_worst_example_lines_and_format_finding_line() {
+        let mut d = BTreeMap::new();
+        let mut g = BTreeMap::new();
+        // 10:32 AM = 10*3600 + 32*60 = 37_920 secs of day.
+        d.insert(nifty(37_920), bar(100.0, 115.60, 99.0, 100.5));
+        g.insert(nifty(37_920), bar(100.0, 101.00, 99.0, 100.5));
+        // 2:31 PM = 52_260 secs — a smaller low skew.
+        d.insert(nifty(52_260), bar(100.0, 101.0, 99.00, 100.5));
+        g.insert(nifty(52_260), bar(100.0, 101.0, 99.02, 100.5));
+        // A Groww-missing minute at 3:29 PM = 55_740.
+        d.insert(nifty(55_740), bar(100.0, 101.0, 99.0, 100.5));
+        let cmp = compare_day(&d, &g, DAY0, 0);
+        let lines = worst_example_lines(&cmp.findings, DAY0);
+        assert!(lines.len() <= 3, "bounded at 3 example lines: {lines:?}");
+        // Worst delta first, rupees not paise, 12-hour time, brokers named.
+        assert!(
+            lines[0].contains("NIFTY high: Dhan \u{20b9}115.60 vs Groww \u{20b9}101.00"),
+            "{lines:?}"
+        );
+        assert!(
+            lines[0].contains("(\u{20b9}14.60 apart) at 10:32 AM"),
+            "{lines:?}"
+        );
+        assert!(lines[1].contains("at 2:31 PM"), "{lines:?}");
+        assert!(
+            lines[2].contains("Groww has no price at 3:29 PM"),
+            "{lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|l| l.contains('p') && l.contains("(0p")),
+            "no paise jargon: {lines:?}"
+        );
     }
 
     #[test]

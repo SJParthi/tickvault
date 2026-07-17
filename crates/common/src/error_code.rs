@@ -234,21 +234,15 @@ pub enum ErrorCode {
     /// durable-loss signal — previously this arm returned silently.
     /// Severity::Critical.
     WsSpill02FrameDropped,
-    /// WS-REINJECT-01: the boot-time STAGE-C.2b WAL re-injection ABORTED —
-    /// a backpressured `send().await` into the pool frame channel either
-    /// returned `SendError` (tick-processor consumer dropped) or exceeded
-    /// the bounded per-send timeout (`WAL_REINJECT_SEND_TIMEOUT_SECS` —
-    /// consumer wedged). The injector STOPS, counts the remaining frames
-    /// as aborted, and the re-injection is NOT marked clean, so
-    /// `confirm_replayed()` is skipped and the staged WAL segments
-    /// re-replay next boot — no frame is silently lost (durable WAL
-    /// floor). Replaces the pre-2026-07-03 silent `try_send` drop storm
-    /// (dropped=1,127,801 at 10:35 IST — everything past
-    /// `FRAME_CHANNEL_CAPACITY` dropped, the WAL never confirmed, and the
-    /// replay re-grew every restart). Severity::High — the abort
-    /// self-heals via next boot's replay; a dead consumer usually means
-    /// the process is restarting anyway.
-    WsReinject01Aborted,
+    // 2026-07-17 (evidence-audit Fix PR C): `WsReinject01Aborted`
+    // (WS-REINJECT-01) RETIRED — its only emitter, the orphaned
+    // `crates/app/src/wal_reinject.rs` module, had zero production
+    // callers (the STAGE-C.2b re-injection call sites died with the Dhan
+    // live-WS lane; main.rs count-residuals + `confirm_replayed()` are
+    // the retained coverage) and was deleted with its dead paging filter.
+    // Rule file `ws-reinject-error-codes.md` retained as historical audit
+    // (the C4-sweep house pattern); code string reverse-crossref
+    // allowlisted.
     /// TICK-FLUSH-01: the off-thread tick ILP flush worker died (panic or a
     /// fatal return) and the supervisor respawned it — mirrors WS-SPILL-01
     /// (WAL writer) and WS-GAP-05 (pool supervisor). Self-healing: the
@@ -1290,7 +1284,6 @@ impl ErrorCode {
             Self::DiskWatcher01Respawned => "DISK-WATCHER-01",
             Self::WsSpill01WriterRespawn => "WS-SPILL-01",
             Self::WsSpill02FrameDropped => "WS-SPILL-02",
-            Self::WsReinject01Aborted => "WS-REINJECT-01",
             Self::TickFlush01WorkerRespawn => "TICK-FLUSH-01",
             Self::WalSuspend01TableSuspended => "WAL-SUSPEND-01",
             Self::Proc01OomKillDetected => "PROC-01",
@@ -1543,10 +1536,6 @@ impl ErrorCode {
             | Self::WsGap10OrderUpdateOutage
             // WS-SPILL-01 — WAL writer respawned (flapping writer = disk dying)
             | Self::WsSpill01WriterRespawn
-            // WS-REINJECT-01 — boot WAL re-injection aborted (consumer dead/
-            // wedged); frames stay staged in replaying/ — self-heals on the
-            // next boot's replay, but the operator must see a dead consumer
-            | Self::WsReinject01Aborted
             // TICK-FLUSH-01 — off-thread tick flush worker respawned (B6);
             // flapping = QuestDB ILP / host degrading
             | Self::TickFlush01WorkerRespawn
@@ -1841,8 +1830,6 @@ impl ErrorCode {
             Self::WsSpill01WriterRespawn | Self::WsSpill02FrameDropped => {
                 ".claude/rules/project/ws-frame-spill-error-codes.md"
             }
-            // C3 (2026-07-03): bounded chunked backpressure WAL re-injection
-            Self::WsReinject01Aborted => ".claude/rules/project/ws-reinject-error-codes.md",
             // B6 (2026-07-03): off-thread tick ILP flush worker
             Self::TickFlush01WorkerRespawn => {
                 ".claude/rules/project/tick-flush-worker-error-codes.md"
@@ -2224,7 +2211,6 @@ impl ErrorCode {
             Self::DiskWatcher01Respawned,
             Self::WsSpill01WriterRespawn,
             Self::WsSpill02FrameDropped,
-            Self::WsReinject01Aborted,
             Self::TickFlush01WorkerRespawn,
             Self::WalSuspend01TableSuspended,
             Self::Proc01OomKillDetected,
@@ -2749,13 +2735,15 @@ mod tests {
         // mechanically recounted against the merged all() vec.
         // 2026-07-17 (spot cross-broker comparator): +2 SPOT-XVERIFY-01/02
         // (SpotXverify01MismatchFound + SpotXverify02RunDegraded) => 161.
-        // 2026-07-17 merge note (merge of origin/main into
-        // order-sockets-v2): this branch's GROWW-PUSH-01..04 (4 —
-        // connect-failed / auth-failed / decode-failed /
+        // 2026-07-17 merge note (order-sockets-v2): +4 GROWW-PUSH-01..04
+        // (connect-failed / auth-failed / decode-failed /
         // supervisor-respawned, receive-only push-channel observability,
-        // all log-sink-only) + main's 161 coexist — 161 + 4 = 165,
-        // mechanically recounted against the merged all() vec.
-        assert_eq!(ErrorCode::all().len(), 165);
+        // all log-sink-only) => 165.
+        // 2026-07-17 (evidence-audit Fix PR C — the post-sibling-merge
+        // variant sweep): -1 WS-REINJECT-01 (WsReinject01Aborted RETIRED —
+        // its only emitter, the orphaned wal_reinject.rs module, had zero
+        // production callers; deleted with its dead paging filter) => 164.
+        assert_eq!(ErrorCode::all().len(), 164);
     }
 
     #[test]
@@ -3196,35 +3184,6 @@ mod tests {
     }
 
     #[test]
-    fn test_ws_reinject_01_aborted_contract() {
-        let code = ErrorCode::WsReinject01Aborted;
-        // Wire-format string + roundtrip via FromStr.
-        assert_eq!(code.code_str(), "WS-REINJECT-01");
-        assert_eq!("WS-REINJECT-01".parse::<ErrorCode>(), Ok(code));
-        // High (abort self-heals via next boot's WAL re-replay) and
-        // therefore auto-triage-safe.
-        assert_eq!(code.severity(), Severity::High);
-        assert!(code.is_auto_triage_safe());
-        // Runbook points at the dedicated rule file and exists on disk.
-        assert_eq!(
-            code.runbook_path(),
-            ".claude/rules/project/ws-reinject-error-codes.md"
-        );
-        let abs = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .and_then(std::path::Path::parent)
-            .map(|root| root.join(code.runbook_path()))
-            .expect("workspace root");
-        let shown = abs.display().to_string();
-        assert!(
-            abs.exists(),
-            "WS-REINJECT-01 runbook missing on disk: {shown}"
-        );
-        // Listed in the catalogue.
-        assert!(ErrorCode::all().contains(&code));
-    }
-
-    #[test]
     fn test_code_str_follows_expected_prefix_pattern() {
         for code in ErrorCode::all() {
             let s = code.code_str();
@@ -3279,8 +3238,6 @@ mod tests {
                 || s.starts_with("DISK-WATCHER-")
                 // zero-tick-loss 2026-06-09: WAL frame-spill writer hardening
                 || s.starts_with("WS-SPILL-")
-                // C3 2026-07-03: bounded chunked-backpressure WAL re-injection
-                || s.starts_with("WS-REINJECT-")
                 // Operator 2026-06-10: daily end-to-end tick-conservation audit
                 || s.starts_with("TICK-CONSERVE-")
                 // Operator 2026-07-16: REST-era multi-TF candle derivation
@@ -3293,6 +3250,9 @@ mod tests {
                 // this allowlist with their last variants — a future variant
                 // reusing a retired family must consciously re-add its
                 // prefix here (never silently).
+                // 2026-07-17 (evidence-audit Fix PR C): the WS-REINJECT-
+                // prefix was likewise REMOVED with its only variant
+                // (`WsReinject01Aborted` — orphaned emit path deleted).
                 // PR-A 2026-06-28: Groww shared-master persist
                 || s.starts_with("GROWW-MASTER-")
                 // §34 (2026-07-03): Groww multi-connection auto-scale ladder

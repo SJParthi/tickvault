@@ -2458,6 +2458,9 @@ pub struct RestFetchLiteRow {
     pub close_to_data_ms: i64,
     /// 429 attempts inside this fetch's ladder.
     pub rate_limited_count: i64,
+    /// The row's error-class slug (`pre_boot` splits restart-window rows
+    /// out of "never recovered" — Fix E, 2026-07-17); empty when absent.
+    pub error_class: String,
 }
 
 /// One (feed, leg) day aggregate for the scorecard digest. `-1` = that
@@ -2474,8 +2477,12 @@ pub struct RestLegDaySummary {
     /// non-named-gap outcome: empty / error / rate_limited / no_token /
     /// skipped).
     pub failed_fetches: i64,
-    /// Finally-unrecovered minutes (`outcome='named_gap'`).
+    /// Finally-unrecovered minutes (`outcome='named_gap'`, every class
+    /// EXCEPT `pre_boot` — Fix E, 2026-07-17).
     pub named_gaps: i64,
+    /// `named_gap` rows classed `pre_boot` — minutes from before this
+    /// process started (audit bookkeeping, never a pull failure).
+    pub pre_boot_gaps: i64,
     /// Sum of 429 attempts across the day's fetches.
     pub rate_limited_hits: i64,
     /// Ok rows retrieved ≥ [`REST_LEG_LATE_RECOVERY_MS`] after close —
@@ -2498,8 +2505,8 @@ pub struct RestLegDaySummary {
 pub fn build_rest_fetch_audit_day_sql(target_ist_day: u64) -> String {
     let (start, end) = day_bounds_micros(target_ist_day);
     format!(
-        "select feed, leg, outcome, close_to_data_ms, rate_limited_count \
-         from rest_fetch_audit where ts >= {start} and ts < {end}"
+        "select feed, leg, outcome, close_to_data_ms, rate_limited_count, \
+         error_class from rest_fetch_audit where ts >= {start} and ts < {end}"
     )
 }
 
@@ -2540,6 +2547,11 @@ pub fn parse_rest_fetch_audit_lite(body: &str) -> Option<Vec<RestFetchLiteRow>> 
             outcome: outcome.to_string(),
             close_to_data_ms: cols[3].as_i64().unwrap_or(-1),
             rate_limited_count: cols[4].as_i64().unwrap_or(0),
+            error_class: cols
+                .get(5)
+                .and_then(|c| c.as_str())
+                .unwrap_or_default()
+                .to_string(),
         });
     }
     Some(out)
@@ -2621,6 +2633,7 @@ pub fn aggregate_rest_leg_day(
                     ok_fetches: 0,
                     failed_fetches: 0,
                     named_gaps: 0,
+                    pre_boot_gaps: 0,
                     rate_limited_hits: 0,
                     late_recovered: 0,
                     close_p50_ms: SCOREBOARD_UNAVAILABLE_SENTINEL,
@@ -2645,6 +2658,11 @@ pub fn aggregate_rest_leg_day(
                         prompt.push(r.close_to_data_ms);
                     }
                 }
+            }
+            // Fix E: `pre_boot`-classed rows are restart-window
+            // bookkeeping, never "never recovered" pull failures.
+            "named_gap" if r.error_class == "pre_boot" => {
+                s.pre_boot_gaps = s.pre_boot_gaps.saturating_add(1);
             }
             "named_gap" => s.named_gaps = s.named_gaps.saturating_add(1),
             _ => s.failed_fetches = s.failed_fetches.saturating_add(1),
@@ -2671,6 +2689,7 @@ pub fn aggregate_rest_leg_day(
             ok_fetches: SCOREBOARD_UNAVAILABLE_SENTINEL,
             failed_fetches: SCOREBOARD_UNAVAILABLE_SENTINEL,
             named_gaps: SCOREBOARD_UNAVAILABLE_SENTINEL,
+            pre_boot_gaps: SCOREBOARD_UNAVAILABLE_SENTINEL,
             rate_limited_hits: SCOREBOARD_UNAVAILABLE_SENTINEL,
             late_recovered: 0,
             close_p50_ms: SCOREBOARD_UNAVAILABLE_SENTINEL,
@@ -2753,6 +2772,7 @@ pub fn build_rest_leg_score_lines(
                 ok_fetches: s.ok_fetches,
                 failed_fetches: s.failed_fetches,
                 named_gaps: s.named_gaps,
+                pre_boot_gaps: s.pre_boot_gaps,
                 rate_limited_hits: s.rate_limited_hits,
                 late_recovered: s.late_recovered,
                 close_p50_ms: s.close_p50_ms,
@@ -2766,6 +2786,7 @@ pub fn build_rest_leg_score_lines(
                 ok_fetches: sent,
                 failed_fetches: sent,
                 named_gaps: sent,
+                pre_boot_gaps: sent,
                 rate_limited_hits: sent,
                 late_recovered: sent,
                 close_p50_ms: sent,
@@ -6883,6 +6904,7 @@ mod tests {
             outcome: outcome.to_string(),
             close_to_data_ms: close_ms,
             rate_limited_count: rl,
+            error_class: String::new(),
         }
     }
 
@@ -7099,6 +7121,7 @@ mod tests {
                 ok_fetches: 1_496,
                 failed_fetches: 4,
                 named_gaps: 0,
+                pre_boot_gaps: 0,
                 rate_limited_hits: 0,
                 late_recovered: 2,
                 close_p50_ms: 1_400,
@@ -7112,6 +7135,7 @@ mod tests {
                 ok_fetches: 10,
                 failed_fetches: 0,
                 named_gaps: 0,
+                pre_boot_gaps: 0,
                 rate_limited_hits: 0,
                 late_recovered: 0,
                 close_p50_ms: 900,
@@ -7159,6 +7183,7 @@ mod tests {
             ok_fetches: 1_496,
             failed_fetches: 4,
             named_gaps: 0,
+            pre_boot_gaps: 0,
             rate_limited_hits: 0,
             late_recovered: 2,
             close_p50_ms: 1_400,
@@ -7186,6 +7211,7 @@ mod tests {
                     ok_fetches: 5,
                     failed_fetches: 0,
                     named_gaps: 0,
+                    pre_boot_gaps: 0,
                     rate_limited_hits: 0,
                     late_recovered: 0,
                     close_p50_ms: 900,
@@ -7217,6 +7243,7 @@ mod tests {
             ok_fetches: -1,
             failed_fetches: -1,
             named_gaps: -1,
+            pre_boot_gaps: -1,
             rate_limited_hits: -1,
             late_recovered: -1,
             close_p50_ms: 1_100,
@@ -7244,6 +7271,7 @@ mod tests {
             ok_fetches: 735,
             failed_fetches: 0,
             named_gaps: 0,
+            pre_boot_gaps: 0,
             rate_limited_hits: 0,
             late_recovered: 0,
             close_p50_ms: 1_100,

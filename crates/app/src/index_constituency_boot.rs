@@ -131,7 +131,9 @@ mod tests {
     // order against. The F14 main.rs source-order ratchet + the F13 bound
     // pin SURVIVE below (the MigrationGate contract is unchanged).
 
-    /// F14 ratchet (source-scan on main.rs, wal_reinject ordering pattern),
+    /// F14 ratchet (source-scan on main.rs — the now-retired `wal_reinject`
+    /// ordering-ratchet pattern; that module was deleted 2026-07-17,
+    /// evidence-audit Fix PR C),
     /// retuned 2026-07-15 (Groww live-feed deletion): the activation watcher
     /// died with the live lane; the surviving gate consumer is the
     /// `[groww_universe]` daily rider (persist_groww_instruments), so the

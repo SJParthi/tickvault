@@ -854,6 +854,112 @@ fn pre_boot_gap_minutes(
     out
 }
 
+/// Bounded pre-boot dedup read cap per SID (Fix E, 2026-07-17) — a session
+/// holds at most 375 minutes, so 400 gives honest headroom; the query asks
+/// for `cap + 1` (the house LIMIT+1 probe) and `rows > cap` = a corrupt /
+/// untrustworthy set, treated as a read failure (fail-open naming).
+pub const GROWW_SPOT1M_PRE_BOOT_READ_CAP: usize = 400;
+
+/// The pre-boot dedup query (Fix E): which minutes of THIS (feed='groww',
+/// SID, day pre-boot window) did a PREDECESSOR process already persist to
+/// `spot_1m_rest`? Micros WHERE literals (the only representation legal in
+/// an embedded QuestDB TIMESTAMP comparison), nanos-projected key —
+/// mirrors the spot cross-verify reader's shape. Pure.
+#[must_use]
+pub fn select_pre_boot_persisted_sql(
+    security_id: i64,
+    window_start_nanos: i64,
+    window_end_nanos: i64,
+) -> String {
+    let start = window_start_nanos / 1_000;
+    let end = window_end_nanos / 1_000;
+    let probe_limit = GROWW_SPOT1M_PRE_BOOT_READ_CAP + 1;
+    format!(
+        "SELECT DISTINCT (ts / 1) * 1000 AS ts_nanos FROM spot_1m_rest \
+         WHERE feed = '{SPOT_1M_REST_FEED_GROWW}' AND security_id = {security_id} \
+         AND ts >= {start} AND ts < {end} LIMIT {probe_limit}"
+    )
+}
+
+/// Parse the [`select_pre_boot_persisted_sql`] response into the persisted
+/// minute set. LIMIT+1 hardened: MORE than `cap` rows = an untrustworthy
+/// set (`Err` — the caller fails OPEN and names every gap). Pure.
+///
+/// # Errors
+/// Malformed body / missing dataset / over-cap row count.
+pub fn parse_pre_boot_persisted_minutes(
+    body: &str,
+    cap: usize,
+) -> Result<std::collections::HashSet<i64>, String> {
+    let v: serde_json::Value =
+        serde_json::from_str(body).map_err(|e| format!("malformed JSON: {e}"))?;
+    let rows = v
+        .get("dataset")
+        .and_then(|d| d.as_array())
+        .ok_or_else(|| "missing dataset".to_string())?;
+    if rows.len() > cap {
+        return Err(format!(
+            "{} rows exceed the {cap}-row pre-boot dedup cap — set untrusted",
+            rows.len()
+        ));
+    }
+    let mut out = std::collections::HashSet::with_capacity(rows.len());
+    for r in rows {
+        if let Some(ts) = r.as_array().and_then(|c| c.first()).and_then(|c| {
+            c.as_i64().or_else(|| {
+                // APPROVED: cold-path float-to-i64 column fallback precedent
+                #[allow(clippy::cast_possible_truncation)]
+                c.as_f64().map(|f| f as i64)
+            })
+        }) {
+            out.insert(ts);
+        }
+    }
+    Ok(out)
+}
+
+/// Fix E: only TRULY-ABSENT pre-boot minutes get named — a minute a
+/// predecessor process already persisted (its `ok` row lands alongside in
+/// the DEDUP-keyed audit) is NOT a gap and must not be re-named. Pure.
+#[must_use]
+pub fn filter_unpersisted_minutes(
+    gap_minutes_nanos: &[i64],
+    persisted_nanos: &std::collections::HashSet<i64>,
+) -> Vec<i64> {
+    gap_minutes_nanos
+        .iter()
+        .copied()
+        .filter(|m| !persisted_nanos.contains(m))
+        .collect()
+}
+
+/// Read the predecessor-persisted minute set for one SID's pre-boot window
+/// (Fix E dedup). ONE bounded local-QuestDB `/exec` GET per SID per sweep
+/// (≤4/day); any failure (transport / non-2xx / parse / over-cap) is an
+/// `Err` the caller fails OPEN on — a failed dedup read must never hide a
+/// real gap.
+async fn read_pre_boot_persisted_minutes(
+    client: &reqwest::Client,
+    questdb: &QuestDbConfig,
+    security_id: i64,
+    window_start_nanos: i64,
+    window_end_nanos: i64,
+) -> Result<std::collections::HashSet<i64>, String> {
+    let url = format!("http://{}:{}/exec", questdb.host, questdb.http_port);
+    let sql = select_pre_boot_persisted_sql(security_id, window_start_nanos, window_end_nanos);
+    let resp = client
+        .get(&url)
+        .query(&[("query", sql.as_str())])
+        .send()
+        .await
+        .map_err(|e| format!("send: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("http {}", resp.status()));
+    }
+    let body = resp.text().await.map_err(|e| format!("read: {e}"))?;
+    parse_pre_boot_persisted_minutes(&body, GROWW_SPOT1M_PRE_BOOT_READ_CAP)
+}
+
 /// `true` when a vendor candle's OHLC is implausible — any non-positive
 /// O/H/L/C or `high < low` (hostile round 1 item 9). The row is STILL
 /// persisted verbatim (we mirror the vendor), but never silently: the
@@ -2669,7 +2775,40 @@ async fn run_post_session_sweep(
         // forensics row per minute, NO fetch (§38 forbids a bulk
         // backfill). A whole-session blind run (never fired) names every
         // session minute and skips the fetch-sweep entirely.
-        let pre_boot = pre_boot_gap_minutes(first_covered, session_first, session_last);
+        // Fix E (2026-07-17): a PREDECESSOR process's persisted minutes
+        // are NOT gaps — one bounded dedup read per SID excludes them, so
+        // only truly-absent minutes get named (kills the restart-day
+        // 1,088-artifact class). A failed/over-cap read fails OPEN to the
+        // old name-everything behavior + one coded warn — a broken dedup
+        // read must never hide a real gap.
+        let mut pre_boot = pre_boot_gap_minutes(first_covered, session_first, session_last);
+        if let Some(last) = pre_boot.last().copied() {
+            match read_pre_boot_persisted_minutes(
+                client,
+                &params.questdb,
+                security_id,
+                session_first,
+                last.saturating_add(NANOS_PER_MINUTE),
+            )
+            .await
+            {
+                Ok(persisted) => {
+                    pre_boot = filter_unpersisted_minutes(&pre_boot, &persisted);
+                }
+                Err(reason) => {
+                    warn!(
+                        code = ErrorCode::Spot1m01FetchDegraded.code_str(),
+                        stage = "pre_boot_dedup_read",
+                        feed = SPOT_1M_REST_FEED_GROWW,
+                        security_id,
+                        %reason,
+                        "SPOT1M-01: pre-boot dedup read failed — naming every \
+                         pre-boot minute as before (fail-open; a failed read \
+                         must never hide a real gap)"
+                    );
+                }
+            }
+        }
         if !pre_boot.is_empty() {
             pre_boot_named = pre_boot_named.saturating_add(pre_boot.len() as u64);
             metrics::counter!("tv_groww_spot1m_pre_boot_gap_total")
@@ -3906,6 +4045,53 @@ mod tests {
         let covered = first_covered_minute(session_first, session_first);
         assert_eq!(covered, session_first);
         assert!(pre_boot_gap_minutes(Some(covered), session_first, session_last).is_empty());
+    }
+
+    /// Fix E pre-boot dedup: predecessor-persisted minutes are EXCLUDED
+    /// from naming; only truly-absent minutes stay; an over-cap dataset is
+    /// an `Err` (fail-open — the caller names everything + one coded warn).
+    #[test]
+    fn test_pre_boot_dedup_excludes_predecessor_persisted_minutes() {
+        // The dedup query shape: feed-scoped, SID-scoped, micros window,
+        // LIMIT+1 probe.
+        let sql = select_pre_boot_persisted_sql(4_611, 2_000_000_000, 5_000_000_000);
+        assert!(sql.contains("feed = 'groww'"), "{sql}");
+        assert!(sql.contains("security_id = 4611"), "{sql}");
+        assert!(sql.contains("ts >= 2000000 AND ts < 5000000"), "{sql}");
+        assert!(
+            sql.contains(&format!("LIMIT {}", GROWW_SPOT1M_PRE_BOOT_READ_CAP + 1)),
+            "{sql}"
+        );
+
+        // Parse + filter: minutes 1 and 3 persisted by a predecessor →
+        // only minute 2 remains a nameable gap.
+        let body = r#"{"dataset":[[60000000000],[180000000000]]}"#;
+        let persisted =
+            parse_pre_boot_persisted_minutes(body, GROWW_SPOT1M_PRE_BOOT_READ_CAP).expect("parses");
+        let gaps = [60_000_000_000_i64, 120_000_000_000, 180_000_000_000];
+        assert_eq!(
+            filter_unpersisted_minutes(&gaps, &persisted),
+            vec![120_000_000_000],
+            "predecessor-persisted minutes are not gaps"
+        );
+
+        // Read-failure arms fail OPEN (caller keeps the old naming): a
+        // malformed body and an over-cap set are both `Err`.
+        assert!(parse_pre_boot_persisted_minutes("not json", 400).is_err());
+        assert!(parse_pre_boot_persisted_minutes(r#"{"no":"dataset"}"#, 400).is_err());
+        let over = format!(
+            r#"{{"dataset":[{}]}}"#,
+            (0..3)
+                .map(|i| format!("[{i}]"))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        assert!(
+            parse_pre_boot_persisted_minutes(&over, 2).is_err(),
+            "over-cap set is untrusted (fail-open)"
+        );
+        // Exactly-cap is trusted (the LIMIT+1 probe).
+        assert!(parse_pre_boot_persisted_minutes(&over, 3).is_ok());
     }
 
     /// Item 9: non-positive O/H/L/C or high<low flags; a normal candle
