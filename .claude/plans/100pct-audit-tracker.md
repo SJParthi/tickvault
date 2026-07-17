@@ -99,9 +99,9 @@ once the CloudWatch alarms land. -->
 | Dimension | Category | Target | Proof artifact |
 |---|---|---|---|
 | security_id uniqueness (`(security_id, segment)`) | P | Composite key everywhere | `.claude/rules/project/security-id-uniqueness.md` + planner/registry/dedup tests |
-| Tick DEDUP includes segment | P | `DEDUP_KEY_TICKS` contains segment | `crates/storage/tests/dedup_segment_meta_guard.rs` |
+| Tick DEDUP includes segment | P | RETIRED 2026-07-17 (stage-2 dead-WS sweep): the `ticks` writer + `DEDUP_KEY_TICKS` were deleted (table read-only); the contract binds any future writer | `crates/storage/tests/dedup_segment_meta_guard.rs` |
 | Derivative DEDUP includes underlying | P | `DEDUP_KEY_DERIVATIVE_CONTRACTS` contains underlying_symbol | Same |
-| Price precision f32→f64 | P | `f32_to_f64_clean()` | `crates/storage/src/tick_persistence.rs` |
+| Price precision f32→f64 | P | `f32_to_f64_clean()` | `crates/common/src/price_precision.rs` (re-homed; the storage copy died with `tick_persistence.rs`, 2026-07-17) |
 | IEEE 754 widening artifacts | P | 0 | `crates/storage/tests/f32_precision_regression.rs` |
 | Live-feed purity (no backfill→ticks) | P | 3-layer enforcement | `crates/storage/tests/live_feed_purity_guard.rs` |
 | Instrument registry composite index | P | `(SecurityId, ExchangeSegment)` | `crates/common/src/instrument_registry.rs` tests |

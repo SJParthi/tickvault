@@ -28,12 +28,22 @@ use std::path::Path;
 /// common 99.57 | api 98.71 | trading 97.02 | storage 91.35 | core 90.38 |
 /// app 63.43, each floored ~0.1 below measured). Lowering a TOML value
 /// below its pin fails this test; raising it is always allowed.
+///
+/// storage pin 91.2 -> 90.1 (2026-07-17, stage-2 dead-WS sweep, PR #1631):
+/// TRUTHFUL RE-BASELINE, not a ratchet bypass — the sweep deleted ~12K LoC
+/// of heavily-unit-tested DEAD tick-chain code from crates/storage, which
+/// mechanically lowered the crate's covered/total ratio to a measured
+/// 90.26% (CI run 29590767611). Every deleted storage test exercised ONLY
+/// the deleted modules (verified via origin/main imports), so no surviving
+/// code lost coverage. New floor per the standing formula: 90.2 - 0.1 =
+/// 90.1. This edit is exactly the visible-review act this test exists to
+/// force; the up-only ratchet resumes from 90.1.
 const PINNED_DEFAULT_FLOOR: f64 = 63.0;
 const PINNED_CRATE_FLOORS: &[(&str, f64)] = &[
     ("common", 99.5),
     ("core", 90.2),
     ("trading", 96.9),
-    ("storage", 91.2),
+    ("storage", 90.1),
     ("api", 98.6),
     ("app", 63.3),
 ];

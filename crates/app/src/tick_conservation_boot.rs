@@ -29,6 +29,18 @@
 //! chain). Missing sources or a mid-session boot → `partial` (honest "cannot
 //! vouch", never a false OK — audit-findings Rule 11).
 //!
+//! Stage-2 dead-WS sweep (2026-07-17): the processor outcome counters this
+//! auditor scrapes (`tv_ticks_processed_total` / `tv_ticks_persisted_total`
+//! / the filter counters / `tv_ticks_dropped_total`) were emitted by the
+//! now-DELETED Dhan tick chain (`tick_processor.rs` + `tick_persistence.rs`)
+//! — no live producer writes new WAL LiveFeed frames or `ticks` rows either.
+//! On a post-sweep boot the scrape finds none of those counters, so
+//! `identity_complete()` is false and every run honestly records `partial`
+//! (never a fabricated `balanced` / false residual). The audit + its table
+//! are KEPT per the stage-2 task constraint (the historical WAL/DB record
+//! remains reconcilable); retiring the daily run itself is an operator
+//! decision deferred with the dashboard/alarm PR.
+//!
 //! Runbook: `.claude/rules/project/tick-conservation-audit-error-codes.md`.
 
 use std::path::Path;

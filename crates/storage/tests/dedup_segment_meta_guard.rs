@@ -166,9 +166,13 @@ fn every_dedup_key_is_listed_here_for_auditing() {
     // (both segment-paired per I-P1-11), so the threshold rose from 2 to 4
     // as anticipated. Cluster-C (2026-07-14) rebuilt `DEDUP_KEY_PNL_AUDIT`
     // (pnl_audit_persistence.rs — segment-paired per I-P1-11), raising the
-    // observed count further; the assert stays `>= 4`. Current set touching
-    // `security_id`:
-    //   DEDUP_KEY_TICKS (tick_persistence.rs),
+    // observed count further; the assert stays `>= 4`.
+    // Stage-2 dead-WS sweep (2026-07-17): `DEDUP_KEY_TICKS` died with the
+    // deleted `tick_persistence.rs` (the dead Dhan tick chain — no live
+    // writer remained after the Dhan lane 2026-07-13 + Groww live feed
+    // 2026-07-15 retirements). The `ticks` TABLE itself stays in QuestDB
+    // read-only (SEBI retention — never dropped); only the writer-side
+    // constant is gone. Current set touching `security_id`:
     //   DEDUP_KEY_CANDLES (shadow_persistence.rs),
     //   DEDUP_KEY_INSTRUMENT_LIFECYCLE (instrument_lifecycle_persistence.rs),
     //   DEDUP_KEY_INSTRUMENT_LIFECYCLE_AUDIT (instrument_lifecycle_persistence.rs),
@@ -185,9 +189,9 @@ fn every_dedup_key_is_listed_here_for_auditing() {
     assert!(
         keys_with_security_id.len() >= 4,
         "expected at least 4 DEDUP_KEY_* constants touching security_id \
-         (DEDUP_KEY_TICKS, DEDUP_KEY_CANDLES, DEDUP_KEY_INSTRUMENT_LIFECYCLE, \
-         DEDUP_KEY_INSTRUMENT_LIFECYCLE_AUDIT), got {}: {:?}. A decrease \
-         means a table was removed — verify the removal was intentional.",
+         (DEDUP_KEY_CANDLES, DEDUP_KEY_INSTRUMENT_LIFECYCLE, \
+         DEDUP_KEY_INSTRUMENT_LIFECYCLE_AUDIT, DEDUP_KEY_PNL_AUDIT), got {}: {:?}. \
+         A decrease means a table was removed — verify the removal was intentional.",
         keys_with_security_id.len(),
         keys_with_security_id,
     );
@@ -276,8 +280,11 @@ fn every_audit_dedup_key_must_include_designated_timestamp_ts() {
 // `every_persisted_table_dedup_key_must_include_feed` below (operator override
 // 2026-06-28 — see that test). This subset is retained as the live-feed
 // market-data core; both guards now require `feed` on all of these.
+// Stage-2 dead-WS sweep (2026-07-17): `DEDUP_KEY_TICKS` removed from this
+// subset — its declaration site (`tick_persistence.rs`) was deleted with the
+// dead Dhan tick chain (no live `ticks` writer remains; the table is
+// read-only, SEBI-retained). The surviving three keys stay pinned.
 const FEED_KEYED_MARKET_DATA_KEYS: &[&str] = &[
-    "DEDUP_KEY_TICKS",
     "DEDUP_KEY_CANDLES",
     "DEDUP_KEY_PREV_DAY_OHLCV",
     "DEDUP_KEY_WS_EVENT_AUDIT",
@@ -374,13 +381,18 @@ fn every_persisted_table_dedup_key_must_include_feed() {
 // Self-tests for the helpers
 // ============================================================================
 
+// Stage-2 dead-WS sweep (2026-07-17): the self-test previously anchored on
+// `DEDUP_KEY_TICKS` (tick_persistence.rs), which was deleted with the dead
+// Dhan tick chain. Re-pointed to `DEDUP_KEY_CANDLES` (shadow_persistence.rs
+// — the LIVE seal-chain key) so the scanner's discovery is still proven
+// non-vacuous against a real declaration.
 #[test]
-fn self_test_collect_finds_ticks_dedup_key() {
+fn self_test_collect_finds_candles_dedup_key() {
     let decls = collect_dedup_key_declarations();
     let names: Vec<&str> = decls.iter().map(|(_, _, n, _)| n.as_str()).collect();
     assert!(
-        names.contains(&"DEDUP_KEY_TICKS"),
-        "DEDUP_KEY_TICKS must be discovered by the scanner. Names: {:?}",
+        names.contains(&"DEDUP_KEY_CANDLES"),
+        "DEDUP_KEY_CANDLES must be discovered by the scanner. Names: {:?}",
         names
     );
 }

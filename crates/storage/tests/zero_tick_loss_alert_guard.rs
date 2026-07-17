@@ -2,29 +2,33 @@
 //!
 //! Parthiban's explicit top-priority requirement: "zero ticks loss and
 //! nowhere websocket should get disconnected or reconnect not even a
-//! single tick should be missed". The three-tier buffer (ring -> disk
-//! spill -> recovery) in `tick_persistence.rs` delivers this at the code
-//! level.
+//! single tick should be missed".
 //!
 //! 2026-05-20 (#O3 — observability → CloudWatch-only): the four
 //! Prometheus-alert-rule assertions were removed when the Prometheus
-//! container + `tickvault-alerts.yml` were retired. The operator-facing
-//! early-warning signal moves to AWS CloudWatch Alarms over the same
-//! `tv_*` metrics (the app still exposes them on `/metrics`). The
-//! source-scan assertions below stay valid — they pin that the metrics
-//! are still EMITTED, which CloudWatch needs.
+//! container + `tickvault-alerts.yml` were retired.
 //!
-//! Pinned assertions:
+//! Stage-2 dead-WS sweep (2026-07-17): `tick_persistence.rs` (the ticks
+//! ring→spill→DLQ writer) was DELETED with the dead Dhan tick chain — no
+//! live feed writes `ticks` anymore (Dhan lane retired 2026-07-13, Groww
+//! live feed retired 2026-07-15; runtime is REST-only). The two source
+//! scans that pinned its `ticks_dropped_total` / `tv_spill_dropped_total`
+//! emit sites are RETIRED below (their subject file is gone; the emitters
+//! no longer exist — the CloudWatch alarm on those series is a dead
+//! monitor whose terraform/EMF retirement belongs to the dashboard PR).
+//! The zero-loss chain that SURVIVES is the WAL frame spill
+//! (`ws_frame_spill.rs`, KEEP — `tv_ticks_lost_total` + WS-SPILL-01/02)
+//! and the seal chain's ring→spill→DLQ (`shadow_persistence.rs`,
+//! AGGREGATOR-DROP-01), each pinned by its own guards.
 //!
-//! 1. `tv_ticks_dropped_total` metric is emitted from `tick_persistence.rs`.
-//! 2. `tv_spill_dropped_total` is emitted with `reason` labels.
-//! 3. `TICK_BUFFER_CAPACITY` stays >= 100_000.
-//! 4. `observability-architecture.md` documents the zero-tick-loss chain.
+//! Surviving pinned assertions:
+//!
+//! 1. `TICK_BUFFER_CAPACITY` stays >= 100_000 (still consumed by the live
+//!    seal ring — `crates/trading/src/candles/seal_ring.rs`).
+//! 2. `observability-architecture.md` documents the zero-tick-loss chain.
 
 use std::fs;
 use std::path::{Path, PathBuf};
-
-const TICK_PERSISTENCE_SOURCE: &str = "crates/storage/src/tick_persistence.rs";
 
 fn workspace_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -39,40 +43,19 @@ fn load_text(rel: &str) -> String {
     fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
 }
 
-#[test]
-fn tick_persistence_emits_dropped_counter_field() {
-    let text = load_text(TICK_PERSISTENCE_SOURCE);
-    // The struct field name used for the counter.
-    assert!(
-        text.contains("ticks_dropped_total"),
-        "tick_persistence.rs no longer tracks `ticks_dropped_total` — zero-tick-loss metric pipeline is broken"
-    );
-}
-
-/// Wave 1 Item 0.b — `tv_spill_dropped_total` counter MUST be emitted
-/// at the spill-path drop sites (open-failure + write-failure). Without
-/// it, operators cannot distinguish "spill is fine" from "spill is
-/// dropping ticks because of a slow disk".
-#[test]
-fn tick_persistence_emits_spill_dropped_total_with_reason_label() {
-    let text = load_text(TICK_PERSISTENCE_SOURCE);
-    assert!(
-        text.contains("tv_spill_dropped_total"),
-        "Wave 1 Item 0.b regression: tick_persistence.rs no longer emits \
-         `tv_spill_dropped_total` — operator visibility into spill-path \
-         drop reasons is broken."
-    );
-    assert!(
-        text.contains("\"reason\" => \"open_failed\""),
-        "Wave 1 Item 0.b regression: spill-path open-failure drop site \
-         must label the metric with `reason=\"open_failed\"`"
-    );
-    assert!(
-        text.contains("\"reason\" => \"write_failed\""),
-        "Wave 1 Item 0.b regression: spill-path write-failure drop site \
-         must label the metric with `reason=\"write_failed\"`"
-    );
-}
+// RETIRED (stage-2 dead-WS sweep, 2026-07-17):
+// `tick_persistence_emits_dropped_counter_field` and
+// `tick_persistence_emits_spill_dropped_total_with_reason_label` pinned the
+// `ticks_dropped_total` / `tv_spill_dropped_total{reason}` emit sites inside
+// `crates/storage/src/tick_persistence.rs` — that file was DELETED with the
+// dead Dhan tick chain (zero production callers of its writer since the
+// PR-C2/C3 lane deletion + the 2026-07-15 Groww live-feed retirement), so
+// the metrics have NO emitter left to pin. Honest consequence: the
+// `tv-<env>-ticks-dropped` alarm class over those series is now a dead
+// monitor — its terraform/EMF retirement is the dashboard PR's scope (per
+// the stage-2 task boundary). The surviving durable-capture guards are
+// `ws_frame_spill.rs`'s WS-SPILL-01/02 (`tv_ticks_lost_total`) and the seal
+// chain's AGGREGATOR-DROP-01 pins.
 
 #[test]
 fn tick_persistence_buffer_capacity_is_at_least_one_lakh() {

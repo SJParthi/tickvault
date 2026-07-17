@@ -1,5 +1,18 @@
 # Off-Thread Tick ILP Flush Worker — Error Codes (TICK-FLUSH-01)
 
+> **⚠ RETIRED 2026-07-17 (stage-2 dead-WS sweep — the dead Dhan tick chain
+> deleted):** `crates/storage/src/tick_flush_worker.rs` and its owner
+> `crates/storage/src/tick_persistence.rs` (plus `tick_row_builder.rs` /
+> `tick_spill_drain.rs`) are DELETED — the tick writer had ZERO production
+> callers after the Dhan live-WS lane retirement (2026-07-13, PR-C2/C3) and
+> the Groww live-feed retirement (2026-07-15); the runtime is REST-only and
+> nothing writes the `ticks` table anymore (the table stays in QuestDB,
+> SEBI-retained, read-only). The `ErrorCode::TickFlush01WorkerRespawn`
+> variant is RETAINED (no ErrorCode deletions in this sweep — crossref keeps
+> both directions green); its emit sites are gone, so `TICK-FLUSH-01` can
+> never fire again. The Trigger paths below match no live code. Content
+> retained as historical audit per house convention.
+
 > **Authority:** CLAUDE.md > `operator-charter-forever.md` §C/§F > this file.
 > **Operator directive (B6, 2026-07-03, verbatim):** *"The per-tick histogram
 > folds the amortized 1-in-1000 sync ILP flush into compute (p50 30µs true
