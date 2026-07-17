@@ -985,12 +985,38 @@ pub struct TfConsistencyConfig {
 /// `[spot_crossverify]` section (or a TOML written before this PR) disables
 /// the comparator entirely (fail-safe); `config/base.toml` explicitly sets
 /// `enabled = true`.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct SpotCrossverifyConfig {
     /// Master switch for the daily 15:47 IST spot cross-broker comparator.
     /// Default OFF (fail-safe) — `config/base.toml` turns it on explicitly.
     #[serde(default)]
     pub enabled: bool,
+    /// Severity-gating noise band in PAISE (operator Fix E, 2026-07-17):
+    /// a divergence run pages High ONLY when an OPEN/CLOSE field diverged,
+    /// a minute is missing on one broker, or any single delta exceeds
+    /// this knob; high/low-only skew within it is Info (a trend line).
+    /// Default 2000 paise = ₹20 — index-level cross-broker sampling skew
+    /// on 20,000–85,000-point indices routinely reaches a few rupees on
+    /// high/low (the two brokers sample the same prices at slightly
+    /// different instants); ₹20 is ~0.02–0.1% of index value — far above
+    /// observed timing noise, far below any real feed drift. The exact
+    /// 0-paise COMPARE is untouched — counts stay exact; only the
+    /// Telegram severity is gated.
+    #[serde(default = "default_spot_xverify_noise_threshold_paise")]
+    pub noise_threshold_paise: i64,
+}
+
+impl Default for SpotCrossverifyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            noise_threshold_paise: default_spot_xverify_noise_threshold_paise(),
+        }
+    }
+}
+
+fn default_spot_xverify_noise_threshold_paise() -> i64 {
+    2_000
 }
 
 /// `[cadence]` — broker-agnostic fetch-cadence + decision-timing scheduler
@@ -5940,6 +5966,12 @@ mod tests {
         assert!(
             !SpotCrossverifyConfig::default().enabled,
             "spot_crossverify must default OFF (fail-safe; base.toml opts in)"
+        );
+        assert_eq!(
+            SpotCrossverifyConfig::default().noise_threshold_paise,
+            2_000,
+            "the severity-gating noise band defaults to 2000 paise = \u{20b9}20 \
+             (Fix E, 2026-07-17 — see the field doc for the rationale)"
         );
 
         #[derive(Deserialize)]

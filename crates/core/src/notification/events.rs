@@ -583,7 +583,14 @@ pub enum NotificationEvent {
         /// Stable verdict: `clean` / `diverged` / `partial` / `no_data` /
         /// `blind` / `degraded`.
         status_label: String,
-        /// Up to 10 plain-English worst offenders.
+        /// Fix E severity gating (operator 2026-07-17): `true` = every
+        /// divergence is high/low-only sampling skew within the
+        /// `[spot_crossverify] noise_threshold_paise` band, nothing
+        /// missing, full coverage → Info trend line, never a High page.
+        noise_only: bool,
+        /// The day's biggest single delta in paise (0 = nothing diverged).
+        noise_max_paise: i64,
+        /// Up to 3 plain-English worst offenders (rupees, 12-hour IST).
         top_detail: Vec<String>,
     },
 
@@ -2912,20 +2919,30 @@ impl NotificationEvent {
                 degraded,
                 truncated,
                 status_label,
+                noise_only,
+                noise_max_paise,
                 top_detail,
             } => {
+                // The honest frame rides EVERY arm (operator Fix E).
+                const HONEST_FRAME: &str = "Neither broker is the single source of truth — \
+                     watch the trend over days, not one number.";
+                // APPROVED: display-only paise→rupee division on a cold path.
+                #[allow(clippy::cast_precision_loss)]
+                let biggest_rupees = *noise_max_paise as f64 / 100.0;
                 if status_label == "clean" {
                     format!(
                         "\u{2705} Spot cross-check 3:47 PM \u{b7} {trading_date_ist} — \
                          \u{1f537} Dhan vs \u{1f7e2} Groww: {minutes_compared} minutes \
-                         across {indices} indices, all prices match."
+                         across {indices} indices, all prices match.\n\
+                         {HONEST_FRAME}"
                     )
                 } else if status_label == "no_data" {
                     format!(
                         "\u{1f515} <b>Spot cross-check @ 3:47 PM IST — nothing to compare</b>\n\
                          Day: {trading_date_ist}\n\
                          Neither Dhan nor Groww recorded index prices today \
-                         (feeds off). Not a pass and not a failure."
+                         (feeds off). Not a pass and not a failure.\n\
+                         {HONEST_FRAME}"
                     )
                 } else if *minutes_compared == 0 {
                     format!(
@@ -2935,39 +2952,63 @@ impl NotificationEvent {
                          none overlapped. This is not a pass.\n\
                          What to do RIGHT NOW:\n\
                          1. Check the database is up and reachable.\n\
-                         2. Confirm BOTH brokers' minute prices recorded today."
+                         2. Confirm BOTH brokers' minute prices recorded today.\n\
+                         {HONEST_FRAME}"
+                    )
+                } else if *noise_only {
+                    // Fix E: pure high/low sampling skew inside the noise
+                    // band, nothing missing, full coverage — a NORMAL day.
+                    format!(
+                        "\u{2705} <b>Spot cross-check 3:47 PM \u{b7} {trading_date_ist}</b>\n\
+                         \u{1f537} Dhan and \u{1f7e2} Groww prices agree closely today: \
+                         {mismatches} tiny timing differences out of {minutes_compared} \
+                         minutes — NORMAL.\n\
+                         Biggest gap: \u{20b9}{biggest_rupees:.2} (inside the normal band). \
+                         Open and close prices matched everywhere.\n\
+                         {HONEST_FRAME}"
                     )
                 } else {
                     let coverage_note = if *degraded {
-                        "\nCoverage was PARTIAL — some data could not be read."
+                        "\nSome of the day's data could not be read — the numbers \
+                         above cover only what was readable."
                     } else {
                         ""
                     };
                     let truncated_note = if *truncated {
-                        "\nCounts exceed the stored detail — totals are exact."
+                        "\nMore minutes than the check can load — the loaded part \
+                         is compared exactly; the rest was not checked."
                     } else {
                         ""
                     };
                     let mut detail_block = String::new();
-                    for line in top_detail.iter().take(10) {
+                    for line in top_detail.iter().take(3) {
                         detail_block.push('\n');
                         detail_block.push_str("• ");
                         detail_block.push_str(&html_escape(line));
                     }
+                    let lead = if *mismatches > 0 && !top_detail.is_empty() {
+                        format!(
+                            "\u{1f198} <b>Real price drift between \u{1f537} Dhan and \
+                             \u{1f7e2} Groww \u{b7} {trading_date_ist}</b>\n\
+                             Worst: {}",
+                            html_escape(&top_detail[0])
+                        )
+                    } else {
+                        format!(
+                            "\u{1f198} <b>Spot cross-check 3:47 PM \u{b7} {trading_date_ist} — \
+                             \u{1f537} Dhan vs \u{1f7e2} Groww needs a look</b>"
+                        )
+                    };
                     format!(
-                        "\u{26a0}\u{fe0f} <b>Spot cross-check @ 3:47 PM IST — \
-                         NEEDS ATTENTION</b>\n\
-                         Day: {trading_date_ist} \u{2014} \u{1f537} Dhan vs \u{1f7e2} Groww\n\
+                        "{lead}\n\
                          Indices: {indices} | Minutes compared: {minutes_compared}\n\
-                         Price differences: {mismatches}\n\
-                         Missing on Dhan: {missing_dhan} | Missing on Groww: {missing_groww}\n\
+                         Price differences: {mismatches} (biggest \
+                         \u{20b9}{biggest_rupees:.2})\n\
+                         Minutes missing on Dhan: {missing_dhan} | on Groww: \
+                         {missing_groww}\n\
                          Outside market hours: {out_of_session}\
                          {coverage_note}{truncated_note}{detail_block}\n\
-                         Neither broker is the source of truth — both sample \
-                         the same prices at slightly different moments. Track \
-                         the TREND: a steady small count is normal skew; a \
-                         spike or a drift in the open/close price is a real \
-                         problem on one broker's side."
+                         {HONEST_FRAME}"
                     )
                 }
             }
@@ -4730,9 +4771,17 @@ impl NotificationEvent {
             }
             Self::TfConsistencyAborted { .. } => Severity::High,
             // Spot cross-broker comparator (2026-07-17): clean/no_data are
-            // Info; a divergence/partial/blind is High (audit Rule 11).
-            Self::SpotCrossverifySummary { status_label, .. } => {
-                if status_label == "clean" || status_label == "no_data" {
+            // Info; Fix E gating — a diverged day whose every delta is
+            // high/low-only sampling skew inside the noise band with full
+            // coverage is Info too (a trend line, not a page). Open/close
+            // drift, a delta past the band, missing minutes, or degraded /
+            // partial / blind coverage stay High (audit Rule 11).
+            Self::SpotCrossverifySummary {
+                status_label,
+                noise_only,
+                ..
+            } => {
+                if status_label == "clean" || status_label == "no_data" || *noise_only {
                     Severity::Info
                 } else {
                     Severity::High
