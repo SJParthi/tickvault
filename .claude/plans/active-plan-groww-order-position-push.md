@@ -204,10 +204,18 @@ session is the probe), order-push ENTITLEMENT (UNPROBED), or any order placement
   - Files: `crates/trading/src/oms/groww/push/{order_mapper,position,runner}.rs`,
     `crates/trading/src/oms/groww/events.rs`
   - Tests: OrderDetailUpdateDto→BrokerOrderEvent mapper, respawn classify
-- [ ] Stage D — app wiring (order-audit consumer + main.rs spawn + app feature)
+- [x] Stage D — app wiring (order-audit consumer + main.rs spawn + app feature)
   - Files: `crates/app/src/groww_order_observability.rs`, `crates/app/src/main.rs`,
     `crates/app/src/lib.rs`, `crates/app/Cargo.toml`
   - Tests: sink try_send drop (GROWW-ORD-08), OrderAuditRow mapping
+  - Implementation note: the app-side bounded-queue `sink_drop` carries
+    `GROWW-PUSH-03` (`GrowwPush03DecodeFailed`, `stage = "sink_drop"`) per the
+    Stage D contract documented on `GrowwPushEventSink` in
+    `oms/groww/events.rs` (the runbook assigns no dedicated code for the
+    app-side queue drop); consumer PERSIST failures carry `GROWW-ORD-08`
+    (`GrowwOrd08AuditWriteFailed`, `stage = "append"`/`"flush"` — the
+    groww-orders runbook §8 assignment); consumer task death respawns under
+    `GROWW-PUSH-04` (`component = "audit_consumer"`).
 
 ## Scenarios
 

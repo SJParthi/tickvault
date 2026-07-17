@@ -144,15 +144,25 @@ fn test_gate1_base_toml_groww_orders_keys_all_false() {
 
 #[test]
 fn test_gate2_groww_orders_feature_present_and_never_default() {
-    for manifest in ["crates/common/Cargo.toml", "crates/trading/Cargo.toml"] {
+    // Per-manifest expected declaration. common stays the empty gate; the
+    // trading feature pulls EXACTLY the three Stage B/C optional transport
+    // deps (order-push 2026-07-16 — pinned verbatim so a new dep cannot
+    // ride the feature unreviewed; anything else fails this ratchet).
+    for (manifest, expected) in [
+        ("crates/common/Cargo.toml", "groww_orders = []"),
+        (
+            "crates/trading/Cargo.toml",
+            "groww_orders = [\"dep:aws-lc-rs\", \"dep:tokio-tungstenite\", \"dep:futures-util\"]",
+        ),
+    ] {
         let body = read(manifest);
         assert!(
             body.contains("[features]"),
             "{manifest} must declare a [features] section (Gate 2)."
         );
         assert!(
-            body.contains("groww_orders = []"),
-            "{manifest} must declare the `groww_orders = []` feature (Gate 2)."
+            body.contains(expected),
+            "{manifest} must declare the `{expected}` feature verbatim (Gate 2)."
         );
         // The feature must NEVER be enabled by default: no `default = [...]`
         // line may name it (a default build must exclude all Groww order code).
