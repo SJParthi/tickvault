@@ -1100,6 +1100,11 @@ jobs:
         # tv-<env>-app-log-ingestion-silent alarm (log-retention.tf) is the
         # continuous in-session counterpart to this one-shot deploy check.
         # IAM: logs:FilterLogEvents on the app log group ARN (oidc.tf).
+        #
+        # 2026-07-17: instance-state guard — the hourly budget-guard stop raced
+        # this smoke (run 29592612833) and fired a false "shipper dead" page; a
+        # stopped box now short-circuits to a notice, and the true-positive page
+        # prescribes the zero-touch re-deploy path instead of manual SSM.
         if: env.DEPLOY_SKIP_REASON == ''
         run: |
           set +e
@@ -1114,6 +1119,14 @@ jobs:
           FOUND=0
           for i in $(seq 1 12); do
             sleep 25
+            # 2026-07-17 instance-state guard: a budget-guard / scheduled stop
+            # racing this window makes a zero-event verdict meaningless — break
+            # early to the moot arm instead of burning the remaining polls.
+            STATE=$(aws ec2 describe-instances --region "$REGION" --instance-ids "$IID" --query 'Reservations[0].Instances[0].State.Name' --output text 2>/dev/null || echo unknown)
+            if [ "$STATE" != "running" ]; then
+              echo "::notice::LOG-INGESTION-SMOKE moot — instance state is $STATE (budget guard / scheduled stop raced the smoke window); no shipper verdict possible, no page."
+              exit 0
+            fi
             COUNT=$(aws logs filter-log-events \
               --region "$REGION" \
               --log-group-name /tickvault/prod/app \
@@ -1128,6 +1141,14 @@ jobs:
             echo "LOG-INGESTION-SMOKE OK: fresh app log events reached CloudWatch group /tickvault/prod/app (~$((i * 25))s after readiness) — the log shipper is alive on the new config."
             exit 0
           fi
+          # 2026-07-17 instance-state guard (pre-page re-check): covers a stop
+          # landing between the last poll and this publish — a stopped box gets
+          # a notice, never a false "shipper dead" page.
+          STATE=$(aws ec2 describe-instances --region "$REGION" --instance-ids "$IID" --query 'Reservations[0].Instances[0].State.Name' --output text 2>/dev/null || echo unknown)
+          if [ "$STATE" != "running" ]; then
+            echo "::notice::LOG-INGESTION-SMOKE moot — instance state is $STATE (budget guard / scheduled stop raced the smoke window); no shipper verdict possible, no page."
+            exit 0
+          fi
           echo "::warning::LOG-INGESTION-SMOKE: no fresh app log events in /tickvault/prod/app stream ${IID}/app within ~5 min of readiness — the CloudWatch agent is likely not shipping (glob/config mismatch or dead agent). The deploy itself is VERIFIED HEALTHY; NOT rolling back. Check the on-box === CWAGENT STATUS === / === APP LOG DIR === dumps above."
           SHORT_SHA="${GITHUB_SHA:0:7}"
           IST_TIME="$(TZ='Asia/Kolkata' date +'%I:%M %p IST')"
@@ -1135,7 +1156,7 @@ jobs:
             --region "$REGION" \
             --topic-arn arn:aws:sns:${REGION}:${{ steps.acct.outputs.id }}:tv-prod-alerts \
             --subject "⚠️ tickvault deployed but its logs are NOT reaching CloudWatch" \
-            --message "⚠️ New code went LIVE at ${IST_TIME} (version ${SHORT_SHA}) and the app is running fine — but its logs are NOT arriving in CloudWatch. Same signature as the 06 Jul incident: the log shipper on the box looks dead. Trading is unaffected. What you need to do RIGHT NOW: 1. Open the box (SSM session). 2. Check the CloudWatch agent status. 3. Restart the agent if it is stopped or misconfigured. Run: ${{ github.run_id }}" \
+            --message "⚠️ New code went LIVE at ${IST_TIME} (version ${SHORT_SHA}) and the app is running fine — but its logs are NOT arriving in CloudWatch. Trading is unaffected. Automated remediation: re-dispatch deploy-aws.yml on main — its CloudWatch-agent step reinstalls, re-enables and restarts the shipper (no manual SSM needed). Same signature as the 06 Jul incident only if the box was RUNNING throughout this check. Run: ${{ github.run_id }}" \
           || echo "::warning::LOG-INGESTION-SMOKE: the SNS page also failed — operator must rely on this run log + the market-hours ingestion-silent alarm."
           exit 0
 
