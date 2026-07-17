@@ -68,6 +68,13 @@
 # same-day total: 15 filters + 15 alarms. TICK-CONSERVE-01 stays (the
 # 15:40 conservation audit survives).
 #
+# 2026-07-17 UPDATE (dead live-WS sweep stage 1): -1 entry (WS-REINJECT-01,
+# ~-$0.10/mo) -> its ONLY emit site (crates/app/src/wal_reinject.rs,
+# retained un-consumed since PR-C2 "pending the Phase C module cleanup")
+# was deleted in that cleanup — a filter with no possible emit site is a
+# dead filter per the paging drift guard. New total: 14 filters + 14
+# alarms. FEED-STALL-01's earlier retirement pattern followed.
+#
 # 2026-07-14 UPDATE (REST-pipeline adversarial audit, GAP-01 + GAP-03 —
 # docs/audits/2026-07-14-rest-pipeline-adversarial-audit.md): +5 entries ->
 # 17 filters + 17 alarms (~+$0.50/mo; on top of the same-day REST-CANARY-01
@@ -112,10 +119,8 @@ locals {
   # false-recovery). ok_recovery = false suppresses that misleading OK for:
   #   (rest-canary-01 was in this list until its 2026-07-14 retirement
   #   with the canary module - operator Dhan noise lock.)
-  #   - ws-reinject-01: emitted exactly ONCE per boot (wal_reinject.rs abort
-  #     arm); the condition -- frames staged in WAL replaying/ with a
-  #     dead/wedged consumer -- persists until the NEXT boot. OK ~15 min
-  #     later cannot mean recovered.
+  #   (ws-reinject-01 was in this list until its 2026-07-17 retirement
+  #   with the wal_reinject module - dead live-WS sweep stage 1.)
   #   - proc-01: a discrete kernel OOM-kill event; the memory pressure that
   #     caused it is not fixed by the episode aging out.
   #   - dh-906: a discrete per-order reject; OK = aged out, never "orders
@@ -188,15 +193,13 @@ locals {
     # paging filter; the ws-gap-07 precedent above). The companion
     # >=3-restarts-per-15-min counter pager was deleted whole in the same PR
     # (feed-stall-restart-alarm.tf). Variant retirement is the post-C4 sweep.
-    "ws-reinject-01" = {
-      pattern     = "{ $.code = \"WS-REINJECT-01\" && $.level = \"ERROR\" }"
-      period      = 300
-      threshold   = 1
-      eval        = 3
-      dta         = 1
-      ok_recovery = false # round-4: emitted exactly ONCE per boot; the staged-WAL condition persists until the NEXT boot - auto-OK would be a Rule-11 false recovery
-      desc        = "WS-REINJECT-01: boot WAL re-injection ABORTED - consumer dead/wedged; frames stay staged in WAL replaying/ and re-replay next boot. NO recovered/OK page: the code fires once per boot and the condition persists until the next boot, so the auto-OK ~15 min later only means the single datapoint aged out - recovery is the NEXT boot's clean replay. Runbook: .claude/rules/project/ws-reinject-error-codes.md"
-    }
+    # RETIRED (2026-07-17 — dead live-WS sweep stage 1): the "ws-reinject-01"
+    # entry — its ONLY emit site (crates/app/src/wal_reinject.rs, retained
+    # un-consumed since PR-C2 "pending the Phase C module cleanup") was
+    # deleted in that cleanup, so the filter could never match again (dead
+    # paging filter; the ws-gap-07 / feed-stall-01 precedent above). The
+    # WsReinject01Aborted variant retirement is the post-sibling-merge
+    # variant sweep.
     "proc-01" = {
       pattern     = "{ $.code = \"PROC-01\" && $.level = \"ERROR\" }"
       period      = 300

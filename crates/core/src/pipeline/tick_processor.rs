@@ -828,8 +828,10 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
     // legacy `append_tick` path which writes default lifecycle
     // values (compatible with spill replay + tests). The boot driver
     // (`crates/app/src/main.rs`) is responsible for loading the
-    // `prev_oi_cache` and marking the `BootOrderingGate` ready
-    // before attaching the enricher here — see L14.
+    // `prev_oi_cache` before attaching the enricher here. (The
+    // `BootOrderingGate` this comment used to name was deleted
+    // 2026-07-17 — dead live-WS sweep stage 1; the load-then-attach
+    // ordering obligation is unchanged.)
     tick_enricher: Option<std::sync::Arc<TickEnricher>>,
     // Operator lock 2026-06-01 §30: `(security_id, exchange_segment_code)`
     // pairs EXEMPT from the [09:00, 15:30) IST persist window (GIFT Nifty
