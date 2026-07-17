@@ -835,8 +835,54 @@ impl CadenceExecutor for DhanCadenceExecutor {
         let Some((_slot, security_id, symbol)) = dhan_chain_identity(req.underlying) else {
             return Err(CadenceFetchError::Malformed);
         };
+        let result = self
+            .fetch_expiry_list_inner(req.deadline_epoch_ms, security_id, symbol)
+            .await;
+        if let Err(err) = &result {
+            // Forensics symmetry (2026-07-17 review fix): the spot/chain
+            // fires each leave a rest_fetch_audit row per failure — the
+            // expiry-list leg previously left NONE. Reuse the chain-leg
+            // row shape (leg='chain_1m', attempts=1) with the DISTINCT
+            // error_class `expirylist_failed`; the expiry fetch is not
+            // minute-scoped, so the row keys on the fire instant's IST
+            // minute (best-effort, never affects the returned error).
+            let now_minute_secs = u32::try_from(ist_millis_of_day_now() / 60_000).unwrap_or(0) * 60;
+            let trading_date = today_ist();
+            let outcome = match err {
+                CadenceFetchError::RateLimited { .. } => RestFetchOutcome::RateLimited,
+                CadenceFetchError::Auth => RestFetchOutcome::NoToken,
+                _ => RestFetchOutcome::Error,
+            };
+            let row = build_dhan_chain_audit_row(
+                minute_open_ist_nanos(trading_date, now_minute_secs),
+                minute_open_ist_nanos(trading_date, 0),
+                security_id,
+                symbol,
+                1,
+                0,
+                -1,
+                outcome,
+                "expirylist_failed",
+            );
+            let mut audit = self.audit_writer.lock().await;
+            chain_audit_append_best_effort(&mut audit, &row);
+            flush_off_worker(|| chain_audit_flush_best_effort(&mut audit));
+        }
+        result
+    }
+}
+
+impl DhanCadenceExecutor {
+    /// The expiry-list fetch body — split out so the trait method can
+    /// stamp the failure-forensics row on every `Err` path (2026-07-17).
+    async fn fetch_expiry_list_inner(
+        &self,
+        deadline_epoch_ms: i64,
+        security_id: u64,
+        symbol: &'static str,
+    ) -> Result<Vec<u32>, CadenceFetchError> {
         let Some(remaining_ms) =
-            deadline_remaining_ms(req.deadline_epoch_ms, chrono::Utc::now().timestamp_millis())
+            deadline_remaining_ms(deadline_epoch_ms, chrono::Utc::now().timestamp_millis())
         else {
             return Err(CadenceFetchError::Timeout);
         };
