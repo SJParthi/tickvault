@@ -10,6 +10,18 @@
 > **Ground truth:** `docs/architecture/aws-indices-only-locked-architecture.md` §5 (instance lock 2026-05-18) and the 2026-05-20 CloudWatch-only decision below.
 > **Scope:** Any file touching AWS deployment, infrastructure, Docker config, or cost-impacting changes.
 
+## COST NOTE 2026-07-17 — dead live-WS sweep stage 1 (−~$0.10/mo)
+
+The stage-1 zero-wiring dead-module sweep (operator directive 2026-07-17
+via coordinator) removed the `ws-reinject-01` errcode log-filter alarm
+(−1 alarm ≈ −$0.10/mo, Verified against the terraform diff in this PR):
+its ONLY emit site (`crates/app/src/wal_reinject.rs`, retained un-consumed
+since PR-C2 "pending the Phase C module cleanup") was deleted in that
+cleanup, so the filter could never match again (the ws-gap-07 /
+feed-stall-01 dead-filter precedent). Dated notes in
+`error-code-alarms.tf` + `observability-architecture.md`. No other
+alarm/metric/dashboard change in this sweep.
+
 ## COST NOTE 2026-07-15 — Groww live-feed retirement (Trap-A lockstep; net reduction)
 
 The Groww live feed (sidecar + bridge + stall watchdog + lag publisher) is

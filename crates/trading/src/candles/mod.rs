@@ -18,11 +18,11 @@
 //! - `seal_ring` — `SealRing` + `BufferedSeal` ring buffer.
 //! - `pct_stamping` — seal-time prev-day pct stamping primitives.
 //! - `heartbeat` — per-minute aggregator heartbeat counters.
-//! - `boundary_calc` — cold-path boundary-timer pure-function
-//!   primitives (IST-midnight math, missed-boundary detection).
+//! - `boundary_calc` — DELETED (dead live-WS sweep stage 1, 2026-07-17,
+//!   operator directive via coordinator): the cold-path boundary-timer
+//!   pure-function primitives had zero callers anywhere.
 
 pub mod aggregator_cell;
-pub mod boundary_calc;
 pub mod heartbeat;
 pub mod multi_tf_aggregator;
 pub mod pct_stamping;

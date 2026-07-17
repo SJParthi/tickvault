@@ -353,10 +353,13 @@ static DHAN_LAG_RING: OnceLock<FeedLagRing> = OnceLock::new();
 
 fn global_ring() -> &'static FeedLagRing {
     DHAN_LAG_RING.get_or_init(|| {
-        // Live-boundary stamp (cold, once per process). The tick processor
-        // spawns BEFORE the WAL reinject await and the WS pool spawns
-        // AFTER it (ratcheted in wal_reinject.rs), so this init runs no
-        // later than the first observed frame: boot-replayed frames
+        // Live-boundary stamp (cold, once per process). Historical
+        // ordering contract: the tick processor spawned BEFORE the WAL
+        // reinject await and the WS pool AFTER it (was ratcheted in
+        // wal_reinject.rs — module deleted 2026-07-17, dead live-WS sweep
+        // stage 1, after its call sites died with the lane on 2026-07-13),
+        // so this init ran no later than the first observed frame:
+        // boot-replayed frames
         // (captured by a previous process) always predate the boundary,
         // and live frames (captured after the WS pool spawns) always
         // postdate it. A frame captured in the tiny gap before the stamp
