@@ -148,7 +148,6 @@ const DHAN_REST_STACK_ALREADYHELD_PATIENCE_SECS: u64 = 300;
 /// ~125s generateAccessToken cooldown — see
 /// [`dhan_rest_token_backoff_secs`].
 const DHAN_REST_STACK_TOKEN_RETRY_FLOOR_SECS: u64 = 130;
-
 /// Process-global once-guard: the REST-only stack must never be brought up
 /// twice (N stacks = N heartbeats + N renewal loops + N spot/chain
 /// families). First caller wins; later calls log INFO and return `None`.
@@ -191,6 +190,17 @@ pub struct DhanRestStackParams {
     /// Runtime feed-state — receives `set_live_token_manager` so the token
     /// gauges read this stack's manager.
     pub feed_runtime: Arc<FeedRuntimeState>,
+    /// The runtime's mark receiver, stashed by main.rs and taken ONCE at
+    /// spawn (a `Receiver` is not `Clone`; the slot keeps the params struct
+    /// constructible on every boot arm). `None` inside = already taken or
+    /// runtime disabled.
+    pub mark_rx_slot: Arc<
+        std::sync::Mutex<Option<tokio::sync::mpsc::Receiver<crate::order_runtime::MarkUpdate>>>,
+    >,
+    /// Shared mark-gate flag (the `Relaxed` load the Groww per-minute REST
+    /// legs take at each mark forward; 2026-07-17 truth-sync — the
+    /// live-bridge per-tick load died with #1581).
+    pub marks_wanted: Arc<AtomicBool>,
     /// Shared /health state (PR-C2, 2026-07-13): the stack owns the token
     /// block writer (`token_remaining_secs` + `token_valid`) — the lane's
     /// `spawn_token_health_writer` died with the lane, and without a writer
@@ -744,16 +754,143 @@ async fn run_dhan_rest_stack(params: DhanRestStackParams) {
     let config = &params.config;
 
     // -----------------------------------------------------------------------
-    // Phase 5a (the PR-C1/Q4-i functional-dormant ORDER-UPDATE WS spawn)
-    // RETIRED 2026-07-14 — operator Dhan noise lock
-    // (dhan-rest-only-noise-lock-2026-07-14.md; scope-lock §A.1 records the
-    // superseding quote). The dormant socket protected nothing while
-    // dry_run=true (events counted-then-DISCARDED, no WAL, no OMS) and was
-    // this stack's only HIGH-page noise source (WS-GAP-10) against a
-    // demonstrably RST-flaky Dhan endpoint. The core module
-    // `order_update_connection.rs` stays DORMANT for the live-trading
-    // re-wire (fresh dated quote required in the scope-lock file first).
+    // Phase 5a — the PAPER-MODE order-update push channel (operator
+    // directive 2026-07-16; governance authorization on PR #1597 —
+    // `.claude/plans/active-plan-dhan-order-update-rewire.md`). History:
+    // the PR-C1/Q4-i functional-dormant spawn was RETIRED 2026-07-14
+    // (operator Dhan noise lock — dhan-rest-only-noise-lock-2026-07-14.md;
+    // scope-lock §A.1); the 2026-07-16 directive re-wires the DORMANT core
+    // module (`order_update_connection.rs`, unchanged) as a RECEIVE-ONLY,
+    // config-gated (`[dhan_order_push] enabled`, default OFF) push channel:
+    // the socket's order events land as `order_audit` rows
+    // `feed='dhan'`/`mode='paper'` via the supervised consumer in
+    // `dhan_order_push_observability.rs`. Noise-lock compliance: NO
+    // NotificationService is handed to the connection (Telegram-silent on
+    // every path); durable frame capture stays gated behind the live
+    // re-arm quote, so the frame-capture argument is `None` (the runtime's
+    // WAL-free shape is untouched). No live orders; `dry_run` untouched.
+    // DISABLED (default): nothing spawns — byte-identical boot.
     // -----------------------------------------------------------------------
+    if config.dhan_order_push.enabled {
+        let (order_push_sender, first_push_rx) =
+            tokio::sync::broadcast::channel::<tickvault_common::order_types::OrderUpdate>(
+                crate::dhan_order_push_observability::DHAN_ORDER_PUSH_CHANNEL_CAPACITY,
+            );
+        // Consumer FIRST (consumer-before-producer): the first receiver is
+        // created at channel construction, so no update can slip past an
+        // unsubscribed channel.
+        let _order_push_consumer =
+            crate::dhan_order_push_observability::spawn_dhan_order_push_consumer(
+                config.questdb.clone(),
+                order_push_sender.clone(),
+                first_push_rx,
+            );
+        // The 2026-07-14 Dhan noise lock stands: this socket pages NOTHING —
+        // NO NotificationService is handed to the connection.
+        let order_push_notifier: Option<Arc<NotificationService>> = None;
+        // Positional args of the dormant core module's entrypoint, in
+        // order: url, client id, token handle, order sender, calendar,
+        // then the five gated/absent seams as `None` — durable frame
+        // capture (live re-arm territory), auth signal, auth latch, the
+        // Telegram notifier (noise lock), the ws lifecycle audit sender
+        // (not cheaply reachable in this stack — the shared consumer
+        // helper lives with the main.rs producer sites; wiring it here is
+        // a follow-up, honestly absent rather than half-wired), and the
+        // runtime feed flag (this channel is config-gated instead).
+        tokio::spawn(tickvault_core::websocket::run_order_update_connection(
+            config.dhan.order_update_websocket_url.clone(),
+            client_id.clone(),
+            Arc::clone(&token_handle),
+            order_push_sender,
+            Arc::clone(&params.calendar),
+            None,
+            None,
+            None,
+            order_push_notifier,
+            None,
+            None,
+        ));
+        info!(
+            "Dhan REST-only stack: PAPER-MODE order-update push channel spawned \
+             (receive-only; order events recorded as paper order_audit rows; \
+             Telegram-silent per the 2026-07-14 Dhan noise lock; no live orders)"
+        );
+    } else {
+        info!("dhan order push disabled (config)");
+    }
+    // Phase 5b (order-runtime dry-run PR, 2026-07-14 — SOCKET-FREE shape):
+    // the config-gated DRY-RUN ORDER RUNTIME. Under the noise lock this
+    // stack opens NO Dhan WebSocket and performs NO order-update frame
+    // capture or boot drain — the runtime's order-update broadcast channel
+    // is created locally with ZERO producers (paper fills are synthesized
+    // INSIDE the runtime via `oms.handle_order_update`, never through this
+    // channel), and its auth-notify seam never fires (the timer-driven
+    // reconcile scheduler covers the boot reconcile). The live re-arm
+    // follow-up — the socket spawn + durable frame capture/drain + the two
+    // CloudWatch order-update alarms #1532 deleted — re-attaches producers
+    // to EXACTLY this seam, and requires the operator's fresh dated quote
+    // in dhan-rest-only-noise-lock-2026-07-14 §3 / scope-lock §A.1 FIRST.
+    // Placed AFTER the family claim above so a broken lane/stack
+    // mutual-exclusion invariant can never produce a SECOND runtime
+    // (dual-OMS split-brain, design F8; the spawn-site guard pins this as
+    // the sole call site). DISABLED (default): nothing spawns — the stack
+    // is byte-identical to the post-#1532 noise-lock shape.
+    // -----------------------------------------------------------------------
+    if config.order_runtime.enabled {
+        // Stack-local broadcast channel (capacity mirrors the legacy 256).
+        // The construction receiver IS the runtime's first receiver — there
+        // is no earlier producer to order against (no socket, no drain).
+        let (order_update_sender, first_order_update_rx) =
+            tokio::sync::broadcast::channel::<tickvault_common::order_types::OrderUpdate>(256);
+        // The auth seam: never notified today (no socket) — the runtime's
+        // one-shot reconcile-on-auth arm idles by construction; kept so the
+        // gated live re-arm wires the socket's auth signal into the SAME
+        // params field instead of growing a second seam.
+        let auth_signal = Arc::new(tokio::sync::Notify::new());
+        // Take the mark receiver ONCE from the boot slot (poisoning-safe
+        // — the slot is written once by main.rs before this task spawns).
+        let mark_rx = params
+            .mark_rx_slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        let mark_rx = match mark_rx {
+            Some(rx) => rx,
+            None => {
+                // Structurally unreachable (once-guarded spawn + the slot
+                // is filled on every enabled boot): degrade to a mark-less
+                // runtime — the leaked sender keeps the dummy channel open
+                // so the mark arm just idles.
+                error!(
+                    "order runtime: mark receiver slot was EMPTY at spawn — running \
+                     mark-less (paper fills defer until marks return; investigate the \
+                     boot wiring)"
+                );
+                let (dummy_tx, rx) = tokio::sync::mpsc::channel(1);
+                std::mem::forget(dummy_tx);
+                rx
+            }
+        };
+        let _order_runtime_supervisor =
+            crate::order_runtime::spawn_order_runtime(crate::order_runtime::OrderRuntimeParams {
+                config: Arc::clone(&params.config),
+                notifier: params.notifier.clone(),
+                calendar: Arc::clone(&params.calendar),
+                order_update_sender,
+                first_order_update_rx,
+                mark_rx,
+                marks_wanted: Arc::clone(&params.marks_wanted),
+                token_handle: Arc::clone(&token_handle),
+                client_id: client_id.clone(),
+                auth_notify: auth_signal,
+            });
+        info!(
+            "Dhan REST-only stack: DRY-RUN order runtime spawned (socket-free — \
+             paper fills + Groww marks + daily-loss halt + reconcile heartbeat; \
+             NO Dhan WebSocket and NO order-event frame capture, per the \
+             2026-07-14 operator Dhan noise lock)"
+        );
+    }
 
     // REST-health canary (DHAN-REST-400) DELETED 2026-07-14 (operator Dhan
     // noise lock): the spot-1m + option-chain legs self-detect a dead REST
@@ -1228,25 +1365,29 @@ mod tests {
         assert!(dhan_rest_lock_park_due(u64::MAX), "saturated domain end");
     }
 
-    /// 2026-07-14 operator Dhan noise lock (NEGATIVE ratchet — replaces the
-    /// PR-C1 `test_rest_stack_spawns_order_update_ws_functional_dormant`
-    /// positive pins): the production region must NOT spawn the order-update
-    /// WS nor the REST canary. Re-introducing either requires a fresh dated
-    /// operator quote in `dhan-rest-only-noise-lock-2026-07-14.md` (and the
-    /// scope-lock §A.1 for the order-update spawn) FIRST — this test makes
-    /// the code half of that protocol build-failing. Production-region split
-    /// at the test-module marker so these needle literals can never trip
-    /// themselves.
+    /// 2026-07-14 operator Dhan noise lock ratchet, AMENDED 2026-07-16 (the
+    /// order-update rewire — governance on PR #1597): the production region
+    /// must NOT regain the retired dormant-events counter, the retired
+    /// `OrderUpdateAuthenticated` Telegram wiring, or the retired REST
+    /// canary spawn. The order-update WS SPAWN itself is re-authorized
+    /// 2026-07-16 as the PAPER-MODE push channel and is now pinned
+    /// POSITIVELY: gated on `[dhan_order_push] enabled` (default OFF),
+    /// exactly ONE spawn call, and Telegram-silent (the `None` notifier
+    /// binding stub-guard — the noise lock still owns the page surface).
+    /// Production-region split at the test-module marker so these needle
+    /// literals can never trip themselves.
     #[test]
-    fn test_rest_stack_spawns_no_order_update_ws_and_no_canary() {
+    fn test_rest_stack_order_update_push_gated_and_no_canary() {
         let own_src = include_str!("dhan_rest_stack.rs");
-        let (prod, _) = own_src
-            .split_once("#[cfg(test)]")
-            .expect("dhan_rest_stack.rs must keep its test module marker");
+        // H1 fix-round 2026-07-14: the canonical production-region helper
+        // (blanks the test MODULE only — robust to future mid-file
+        // #[cfg(test)] attrs, unlike a naive split_once).
+        let prod = tickvault_common::source_scan::production_region(own_src)
+            .expect("dhan_rest_stack.rs must keep its test module"); // APPROVED: test
+        let prod = prod.as_str();
         for needle in [
-            // The retired Q4-i order-update spawn (module stays dormant in
-            // core; only the SPAWN is banned here).
-            "run_order_update_connection(",
+            // The retired Q4-i dormant-events counter + Telegram wiring
+            // stay retired (only the paper-mode spawn is re-authorized).
             "tv_order_update_dormant_events_total",
             "NotificationEvent::OrderUpdateAuthenticated",
             // The retired REST canary spawn.
@@ -1255,11 +1396,122 @@ mod tests {
             assert!(
                 !prod.contains(needle),
                 "dhan_rest_stack.rs production region REGAINED `{needle}` — the \
-                 2026-07-14 operator Dhan noise lock retired this spawn; a \
+                 2026-07-14 operator Dhan noise lock retired this surface; a \
                  re-introduction needs a fresh dated rule-file quote FIRST \
                  (dhan-rest-only-noise-lock-2026-07-14.md §3)"
             );
         }
+        // Positive pins (2026-07-16 rewire): the paper-mode push spawn.
+        for needle in [
+            // The config gate the spawn must live behind (default OFF).
+            "if config.dhan_order_push.enabled {",
+            // Consumer-before-producer: the supervised paper consumer.
+            "crate::dhan_order_push_observability::spawn_dhan_order_push_consumer(",
+            // Telegram-silent stub-guard: the notifier arg is a NAMED None
+            // binding, never a NotificationService.
+            "let order_push_notifier: Option<Arc<NotificationService>> = None;",
+        ] {
+            assert!(
+                prod.contains(needle),
+                "dhan_rest_stack.rs production region lost `{needle}` — the \
+                 2026-07-16 paper-mode order-update push wiring regressed"
+            );
+        }
+        // The WS spawn exists EXACTLY once in the production region.
+        let spawns = prod.matches("run_order_update_connection(").count();
+        assert_eq!(
+            spawns, 1,
+            "dhan_rest_stack.rs production region must contain EXACTLY ONE \
+             run_order_update_connection spawn (Phase 5a, config-gated); found {spawns}"
+        );
+    }
+
+    /// Order-runtime dry-run PR (2026-07-14, SOCKET-FREE shape after the
+    /// same-day operator Dhan noise lock): the stack wires the config-gated
+    /// DRY-RUN ORDER RUNTIME in Phase 5b — WITHOUT any Dhan WebSocket and
+    /// WITHOUT order-update frame capture/drain (both gated behind a fresh
+    /// dated operator quote per dhan-rest-only-noise-lock-2026-07-14 §3 /
+    /// scope-lock §A.1; the negative ratchet above owns the socket ban).
+    /// Positive pins (production-region split so the needle literals can
+    /// never satisfy themselves):
+    ///   - the runtime spawn exists, EXACTLY once, inside the
+    ///     `[order_runtime].enabled` gate (disabled boots stay byte-identical
+    ///     to the post-#1532 noise-lock shape);
+    ///   - ordering: family-claim (lane/stack exclusion tripwire) < the
+    ///     enabled gate < the runtime spawn;
+    ///   - the mark receiver is taken from the boot slot (the Groww-bridge
+    ///     tap feeds the runtime through main.rs's take-once slot);
+    ///   - WAL-free shape: no `wal_spill:` argument, no confirm/drain
+    ///     helpers — the stack must stay out of the frame-capture business
+    ///     until the live re-arm quote lands.
+    #[test]
+    fn test_rest_stack_wires_order_runtime() {
+        let own_src = include_str!("dhan_rest_stack.rs");
+        let prod = tickvault_common::source_scan::production_region(own_src)
+            .expect("dhan_rest_stack.rs must keep its test module"); // APPROVED: test
+        let prod = prod.as_str();
+        // Positive pins.
+        for needle in [
+            // The config gate the spawn must live behind.
+            "if config.order_runtime.enabled {",
+            // Stack-local broadcast channel (the runtime's only order-update
+            // seam; zero producers until the gated live re-arm).
+            "broadcast::channel::<tickvault_common::order_types::OrderUpdate>",
+            // The runtime spawn itself.
+            "crate::order_runtime::spawn_order_runtime(",
+            // The mark bridge: taken ONCE from main.rs's boot slot.
+            ".mark_rx_slot",
+        ] {
+            assert!(
+                prod.contains(needle),
+                "dhan_rest_stack.rs production region lost `{needle}` — the \
+                 socket-free order-runtime Phase 5b wiring regressed"
+            );
+        }
+        // WAL-free shape pins: the stack must NOT touch the frame-capture /
+        // drain / confirm surface (gated live re-arm territory).
+        for banned in [
+            "wal_spill:",
+            "ws_frame_spill",
+            "confirm_replayed(",
+            "drain_replayed_order_updates_to_broadcast(",
+        ] {
+            assert!(
+                !prod.contains(banned),
+                "dhan_rest_stack.rs production region REGAINED `{banned}` — \
+                 order-update frame capture/drain is gated behind a fresh dated \
+                 operator quote (dhan-rest-only-noise-lock-2026-07-14 §3); the \
+                 socket-free stack must stay WAL-free"
+            );
+        }
+        // Runtime spawn is EXACTLY once (the spawn-site guard pins the rest
+        // of the workspace; this pins the stack itself).
+        let spawns = prod
+            .matches("crate::order_runtime::spawn_order_runtime(")
+            .count();
+        assert_eq!(
+            spawns, 1,
+            "dhan_rest_stack.rs production region must contain EXACTLY ONE \
+             spawn_order_runtime call (Phase 5b); found {spawns}"
+        );
+        // Ordering law: family-claim (lane/stack exclusion tripwire) < the
+        // enabled gate < the runtime spawn — a runtime spawned before the
+        // claim could double-run against the lane's OMS.
+        let claim_call = prod
+            .find("if !claim_post_market_task_family_once()")
+            .expect("family-claim call present"); // APPROVED: test
+        let gate = prod
+            .find("if config.order_runtime.enabled {")
+            .expect("enabled gate present (asserted above)"); // APPROVED: test
+        let runtime_spawn = prod
+            .find("crate::order_runtime::spawn_order_runtime(")
+            .expect("order-runtime spawn present (asserted above)"); // APPROVED: test
+        assert!(
+            claim_call < gate && gate < runtime_spawn,
+            "Phase 5b ordering law broken (claim@{claim_call} < gate@{gate} < \
+             runtime@{runtime_spawn} required) — the runtime must spawn AFTER \
+             the lane/stack family claim, inside the enabled gate"
+        );
     }
 
     /// Source-scan pin of the #1499-mirrored spot→chain contract

@@ -290,7 +290,7 @@ make questdb                         # localhost:9000 (QuestDB web console)
 #![deny(clippy::print_stdout, clippy::print_stderr, clippy::dbg_macro)]
 ```
 
-**Pre-push gates (12, all fast, ~35s total):**
+**Pre-push gates (12, push-scoped, ~35s typical; full-tree scans run in CI Repo Guards):**
 1. `cargo fmt --check`
 2. Banned pattern scan
 3. Secret scan

@@ -102,6 +102,13 @@ pub(crate) const DAY_PARTITIONED_TABLES: &[&str] = &[
     // partitioning as cross_verify_1m_audit / feed_scoreboard_daily.
     "brutex_crossverify_cell_audit",
     "brutex_crossverify_daily",
+    // SPOT-XVERIFY-01/02 (2026-07-16, revival of the cross-broker OHLC parity
+    // signal): one row per divergent/missing cell / one row per trading-day
+    // summary — same SEBI-audit class + DAY partitioning as brutex_crossverify_*
+    // above; `feed` is in both DEDUP keys (label `dhan_x_groww`: an inherently
+    // cross-feed comparison row).
+    "spot_crossverify_cell_audit",
+    "spot_crossverify_daily",
     // SPOT1M-01/02 (2026-07-12, per-minute REST pipeline PR-2): one row per
     // fetched (minute, index) — ~1,125 rows/day (375 min × 3 IDX_I SIDs),
     // trivial disk; same DAY partitioning + retention class as the

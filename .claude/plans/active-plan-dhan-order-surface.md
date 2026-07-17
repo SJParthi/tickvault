@@ -52,16 +52,29 @@ tables deleted 2026-05-20, both date-based live-order gates expired
 One supervised single-owner tokio task (NEW
 `crates/app/src/order_runtime.rs`, ~600 prod LoC) owning
 `OrderManagementSystem` (dry_run hard-true) + `RiskEngine`, spawned
-ONLY from `crates/app/src/dhan_rest_stack.rs` Phase 5a (the dhan-OFF
+ONLY from `crates/app/src/dhan_rest_stack.rs` Phase 5a *(shipped as
+**Phase 5b** — 2026-07-17 truth-sync, post-#1562 audit: Phase 5a is the
+RETIRED order-update WS spawn slot per the noise lock, so the runtime
+spawn landed as 5b)* (the dhan-OFF
 arm) replacing the discard drain — structural dual-OMS exclusion: the
 rest stack is the dhan-off arm; `trading_pipeline` (which owns its own
 OMS+Risk) is dhan-ON only. Config-gated `[order_runtime]` (serde
 default OFF = byte-identical boot; `config/base.toml` opts in). The 12
 normative resolutions from the judge synthesis:
 
-1. **Module + spawn ordering law** (dhan_rest_stack Phase 5a):
-   `broadcast::channel` → `order_update_sender.subscribe()` →
-   `spawn_order_runtime(..)` →
+1. **Module + spawn ordering law** (dhan_rest_stack Phase 5a) —
+   *⚠ PARTIALLY CUT 2026-07-14 (the operator Dhan noise lock,
+   `dhan-rest-only-noise-lock-2026-07-14.md` §3 + scope-lock §A.1 —
+   annotated 2026-07-17, post-#1562 audit): the WAL drain, the
+   conditional `confirm_replayed`, and the
+   `run_order_update_connection(.., wal_spill: Some(..))` socket spawn
+   below were REMOVED from the shipped scope; re-arming any of them
+   without a fresh dated operator quote in the noise-lock file first is
+   FORBIDDEN. What shipped (as Phase 5b): `broadcast::channel` →
+   `subscribe()` → `spawn_order_runtime(..)` with ZERO producers.*
+   Original (retained for the gated live re-arm spec —
+   `order-runtime-dryrun.md` §2): `broadcast::channel` →
+   `order_update_sender.subscribe()` → `spawn_order_runtime(..)` →
    `drain_replayed_order_updates_to_broadcast(..)` → conditional
    `confirm_replayed` → `run_order_update_connection(.., wal_spill:
    Some(..))`. NOT spawned from `crates/app/src/main.rs`, NOT on the
@@ -171,28 +184,28 @@ gate contract (design-only, held for the operator's REST grant —
 
 Cluster A (this session's PR; Files/Tests per the judge-approved final design):
 
-- [ ] A1 — order_runtime.rs actor: supervised single-owner task, select! arms (order-update / marks / reconcile / 16:00 reset / 15:30 sweep / self-test), NotifierAlertSink
+- [x] A1 — order_runtime.rs actor: supervised single-owner task, select! arms (order-update / marks / reconcile / 16:00 reset / 15:30 sweep / self-test), NotifierAlertSink — merged via PR #1562 (checkbox ticked 2026-07-17, post-merge follow-up)
   - Files: crates/app/src/order_runtime.rs, crates/app/src/oms_wiring.rs
   - Tests: test_traded_update_reaches_risk_engine_net_lots_nonzero, test_alert_sink_event_mapping, test_halt_fires_risk_halt_once_per_episode, prop_fill_mirror_matches_risk_net_lots
-- [ ] A2 — FillEvent widening of handle_order_update (+ 4-line trading_pipeline graft)
+- [x] A2 — FillEvent widening of handle_order_update (+ 4-line trading_pipeline graft) — merged via PR #1562
   - Files: crates/trading/src/oms/engine.rs, crates/trading/src/oms/types.rs, crates/trading/src/oms/mod.rs, crates/app/src/trading_pipeline.rs
   - Tests: test_same_status_refresh_applies_delta_not_cumulative, test_duplicate_update_zero_delta_skipped, test_partial_lot_remainder_floors_and_errors, test_fill_sign_from_managed_order_transaction_type, test_segment_char_parse_matrix
-- [ ] A3 — ticks→update_market_price gate (marks_wanted AtomicBool + MarkUpdate try_send tap at the groww_bridge seam; channel plumbed in main.rs)
-  - Files: crates/app/src/groww_bridge.rs, crates/app/src/main.rs
+- [x] A3 — ticks→update_market_price gate (marks_wanted AtomicBool + MarkUpdate try_send tap) — merged via PR #1562. *Seam re-home note (2026-07-17): the planned `groww_bridge.rs` consume seam died with the Groww live feed (#1581, 2026-07-15); the tap shipped at the Groww per-minute REST legs' persist-confirm choke points (`groww_spot_1m_boot.rs` + `groww_contract_1m_boot.rs`), ≤4 spot + ~30 contract marks/min*
+  - Files: crates/app/src/groww_spot_1m_boot.rs, crates/app/src/groww_contract_1m_boot.rs, crates/app/src/main.rs (originally planned: crates/app/src/groww_bridge.rs — deleted 2026-07-15)
   - Tests: test_marks_wanted_false_skips_send, test_mark_channel_full_drops_counted_never_blocks, dhat_mark_forward (0 alloc / 10K), Criterion order_gate/mark_forward ≤ 50ns
-- [ ] A4 — WAL drain + conditional confirm in dhan_rest_stack Phase 5a (ordering law; wal_spill capture restored)
-  - Files: crates/app/src/dhan_rest_stack.rs, crates/app/tests/wal_replay_confirm_symmetry_guard.rs
-  - Tests: test_confirm_decision_matrix (4 arms), test_rest_stack_wires_order_runtime, ratchet_order_runtime_spawned_only_from_rest_stack
-- [ ] A5 — reconcile scheduler with honest dry-run heartbeat + local Σfills==net_lots invariant
+- [x] A4 — WAL drain + conditional confirm in dhan_rest_stack Phase 5a — **CUT 2026-07-14, not implemented** (resolved-by-supersession; ticked 2026-07-17 so the cut is recorded, never silently skipped): the operator Dhan noise lock (`dhan-rest-only-noise-lock-2026-07-14.md` §3 + scope-lock §A.1) removed the order-update WAL drain/confirm AND the `run_order_update_connection(.., wal_spill: Some(..))` socket spawn from the shipped scope. The retained live re-arm spec lives in `order-runtime-dryrun.md` §2 — re-arming needs a fresh dated operator quote in the noise-lock file FIRST
+  - Files: (none shipped — see the §2 re-arm spec)
+  - Tests: test_rest_stack_wires_order_runtime + test_rest_stack_spawns_no_order_update_ws_and_no_canary pin the shipped socket-free/WAL-free shape; ratchet_order_runtime_spawned_only_from_rest_stack shipped
+- [x] A5 — reconcile scheduler with honest dry-run heartbeat + local Σfills==net_lots invariant — merged via PR #1562
   - Files: crates/app/src/order_runtime.rs
   - Tests: test_dry_run_reconcile_classified_heartbeat_not_ok, test_local_reconcile_divergence_errors
-- [ ] A6 — paper filler + once-daily gated self-test + orphan-fill loudness
+- [x] A6 — paper filler + once-daily gated self-test + orphan-fill loudness — merged via PR #1562
   - Files: crates/app/src/order_runtime.rs
   - Tests: test_paper_fill_deferred_until_finite_positive_mark, test_terminal_order_never_refilled, test_selftest_single_cycle_latched, test_selftest_refused_on_holiday_and_off_hours, test_orphan_fill_update_warns_and_counts, test_source_n_filtered_empty_tolerated, order_runtime_e2e (crates/app/tests/)
-- [ ] A7 — risk P&L lot_size fix + evaluate_daily_loss_halt + trigger_halt code field + sid-segment tripwire
+- [x] A7 — risk P&L lot_size fix + evaluate_daily_loss_halt + trigger_halt code field + sid-segment tripwire — merged via PR #1562
   - Files: crates/trading/src/risk/engine.rs, crates/app/src/order_runtime.rs
   - Tests: test_unrealized_pnl_multiplies_lot_size, test_evaluate_daily_loss_halt_boundary, test_sid_segment_collision_skips_and_errors, test_daily_reset_clears_book_mirror_tripwire_flag_atomically
-- [ ] A8 — config section + rule files (order-runtime-dryrun.md; dated notes in ws-reinject-error-codes.md + websocket-connection-scope-lock.md)
+- [x] A8 — config section + rule files (order-runtime-dryrun.md; dated notes in ws-reinject-error-codes.md + websocket-connection-scope-lock.md) — merged via PR #1562
   - Files: crates/common/src/config.rs, config/base.toml, .claude/rules/project/order-runtime-dryrun.md, .claude/rules/project/ws-reinject-error-codes.md
   - Tests: config validation unit tests (interval ≥ 60, capacity bounds), serde-default-off test
 
@@ -201,6 +214,88 @@ Other clusters (checked off by their owning sessions' PRs, all referencing THIS 
 - [ ] C1 — order_audit-family QuestDB persistence revival (feed-in-key DEDUP)
   - Files: crates/storage/src/ (new *_audit_persistence.rs modules)
   - Tests: TBD by owning session (8-element template ratchets)
+- [x] CT1 — Conditional & Multi Order surface (dhanhq v2 /alerts family): typed constructors +
+      `POST /alerts/multi/orders` wrapper, dormant behind the hardcoded alerts gate,
+      Equities/Indices fail-closed segment lock
+  - Gate: `alerts_gate_armed: bool = false` inside `OrderApiClient::new()` (house Lock-1 mirror:
+    hardcoded default + #[cfg(test)]-only `arm_alerts_gate_for_test`); ALL SIX /alerts senders
+    (5 existing Phase-6 fns + new `place_multi_order`) call `require_alerts_gate` FIRST and
+    refuse with the NEW additive `OmsError::AlertsSurfaceDisarmed{operation}` before any
+    URL/socket work. Zero engine.rs / app-crate / config edits. Ratcheted by NEW
+    `crates/trading/tests/conditional_gate_guard.rs` (7 source-scan tests incl. scanner
+    self-test, production-region #[cfg(test)] split, single-choke-point path grep,
+    zero-production-caller dormancy pin).
+  - Types (types.rs additive): `MultiOrderLeg`/`DhanMultiOrderRequest`/`DhanMultiOrderResponse`/
+    `MultiOrderLegResult` (DISTINCT schema: float prices + int disclosedQuantity + sequence/
+    correlationId/AMO vs the conditional legs' string prices + discQuantity), `DhanNumeric`
+    (number-or-string tolerance), `TriggerConditionDetail` (response-only, string-comparingValue
+    safe), `TriggerOrderDetail` (response-only order-leg echo mirror — all-defaulted,
+    DhanNumeric prices; review round 1 fix 2026-07-14: the echo was initially typed with the
+    strict request-side `TriggerOrder`, which would brick a GET/GET-all on one sparse leg),
+    GET-detail fields (createdTime/triggeredTime UTC-Z + lastPrice + condition + orders,
+    all #[serde(default)] additive), modify-body optional `alert_id`.
+  - Constructors (NEW crates/trading/src/oms/conditional.rs, pure): `ConditionalSegment`
+    {NSE_EQ, BSE_EQ, IDX_I} (condition, docs-verbatim) + `ConditionalLegSegment` {NSE_EQ, BSE_EQ}
+    (legs — IDX_I not orderable, F&O fail-closed per the family support note; widening needs an
+    operator quote + .claude/rules/dhan/conditional-trigger.md edit FIRST); `TriggerIndicatorName`
+    (21 wire values), `AmoTime`, `TriggerConditionSpec` (4 variants = mandatory-field matrix
+    unrepresentable-wrong), `ConditionalBuildError`; `build_trigger_condition`,
+    `build_trigger_order`, `build_conditional_trigger_request`, `with_alert_id`,
+    `build_multi_order_request` (1..=15 legs via DHAN_CONDITIONAL_MAX_ORDERS_PER_REQUEST,
+    auto-stamped "1".."N" sequences, paise-integer price inputs — exact string formatting for
+    conditional legs, capped paise→f64 for multi legs).
+  - Ledger + docs: dhan_api_coverage conditional 5→6, rest_paths/constants 16→17→19, totals
+    re-derived (review round 1 fix 2026-07-14: the 2 LIVE option-chain constants — §8 rebuild,
+    app-crate scheduled pull — were absent and falsely narrated "no longer implemented";
+    review round 3 fix 2026-07-14: the 53/57 path-side arithmetic was irreproducible — the
+    inline set is now MEASURED by a source scan of api_client.rs' production region and
+    pinned as 19 templates incl. get_positions' inline /positions, websocket_count corrected
+    4→2 per the file's own two-WS test; round-8 truth-sync: the 2 depth WS URL constants are
+    orphan-PINNED, not implemented — honest grand totals 37 unique path templates + 2 live WS
+    = 39 implemented, + 2 orphaned depth WS constants + 4 intentionally skipped = 45 known,
+    over 41 per-method REST operations); `DHAN_ALERTS_MULTI_ORDERS_PATH` constant + the constants.rs
+    slash-test array; NEW `.claude/rules/dhan/conditional-trigger.md` (closes the CLAUDE.md
+    index drift; 18 mechanical rules incl. the multi-order divergence traps, UTC-Z, bare-array
+    GET-all, ONCE-vs-ALWAYS, no-CONFIRM); dated `2026-07-14 Upstream Update (2)` append to
+    `docs/dhan-ref/07c-conditional-trigger.md`. ZERO ErrorCode, ZERO NotificationEvent, ZERO
+    Telegram (noise lock).
+  - Honest envelope: multi endpoint response schema yaml-only UNVERIFIED-LIVE; rate bucket
+    Assumed (Order class); atomicity + quantity-on-modify undocumented; everything dormant —
+    dry_run true, zero production callers (ratcheted), no boot task.
+  - Files: crates/trading/src/oms/types.rs, crates/trading/src/oms/conditional.rs (NEW),
+    crates/trading/src/oms/api_client.rs, crates/trading/src/oms/mod.rs,
+    crates/common/src/constants.rs, crates/common/tests/dhan_api_coverage.rs,
+    crates/trading/tests/conditional_gate_guard.rs (NEW),
+    .claude/rules/dhan/conditional-trigger.md (NEW), docs/dhan-ref/07c-conditional-trigger.md
+  - Tests: test_alerts_gate_defaults_disarmed_in_constructor, test_alerts_gate_arm_is_cfg_test_only,
+    test_every_alerts_sender_checks_gate_first, test_no_production_caller_of_alerts_sender_fns,
+    test_leg_segment_enums_are_fail_closed, test_alerts_paths_single_choke_point,
+    test_gate_guard_scanner_self_test, test_place_multi_order_success,
+    test_place_multi_order_blocked_when_gate_disarmed_no_socket,
+    test_place_multi_order_rate_limited_429, test_place_multi_order_dhan_error_400_records_metric,
+    test_place_multi_order_malformed_json_error, test_url_expression_multi_order_constant_joins_alerts_multi_path (renamed round-4 — the old test_url_construction_* name claimed sender behavior; the sender's actual POST + path is now wire-observed by test_place_multi_order_wire_sends_post_to_alerts_multi_path via the round-4 request-capturing mock),
+    test_existing_conditional_fns_blocked_when_gate_disarmed, test_arm_alerts_gate_for_test_arms_gate,
+    test_multi_order_request_serializes_camel_case_exact, test_conditional_vs_multi_price_type_split,
+    test_multi_order_response_parses_unknown_order_status_modified_inactive_no_panic,
+    test_trigger_response_detail_fields_roundtrip, test_dhan_numeric_accepts_number_and_string,
+    test_modify_request_alert_id_absent_when_none, test_build_trigger_condition_all_four_comparison_types_serialize_mandatory_fields,
+    test_build_trigger_order_price_boundary_zero_market_ok_limit_zero_rejected,
+    test_build_trigger_order_quantity_boundary_zero_negative_i32_max_edge,
+    test_build_trigger_order_disclosed_quantity_boundary_30pct_edge,
+    test_build_conditional_trigger_request_leg_count_boundary_0_1_15_16,
+    test_build_multi_order_request_boundary_15_legs_max_16_rejected_zero_rejected,
+    test_build_multi_order_request_assigns_sequences_one_to_n,
+    test_build_multi_order_request_correlation_id_boundary_30_max_31_rejected_and_charset,
+    proptest_build_multi_order_request_never_panics_on_arbitrary_spec
+    + review-hardening tests (rounds 1-9: tolerant echo mirrors, gate-site census —
+    comment-blanking / destructuring-assignment / mut-borrow arms + anchored /alerts
+    allowlist, dhan-client-id + security-id content validation, slashless family needles,
+    wire-observed multi-order POST, bodyless-200 tolerance, orphan pins + extractor
+    self-test). Branch-added test-fn inventory: 7 conditional_gate_guard.rs source-scan
+    tests (scanner internals hardened across all 9 rounds), 11 api_client.rs
+    multi-order/gate tests, 23 conditional.rs constructor tests (incl. the proptest),
+    14 types.rs wire-shape tests, 3 dhan_api_coverage.rs orphan/extractor tests —
+    58 total.
 - [ ] D1 — orphan-watchdog re-homing + expired date-gate re-arm (PR #1545)
   - Files: crates/app/src/main.rs, crates/trading/src/oms/engine.rs, crates/common/src/constants.rs
   - Tests: TBD by cluster D session (watchdog wiring source-scan guard)
@@ -387,6 +482,27 @@ adding one records the cost note per `aws-budget.md`.
 | `crates/trading/src/risk/engine.rs` | Cluster A this round (lot_size fix + halt extraction); E2's margin gate REBASES after A merges | `check_order` gains OrderIntent in E2 only |
 | `crates/app/src/groww_bridge.rs` tick seam | Cluster A | marks tap (one guarded try_send block) |
 | Storage order-audit writers (`crates/storage/src/`) | Cluster C | A emits via a seam C fills in; A ships without tables (flagged follow-up) |
+| `oms/{api_client.rs error/ladder additions, error_taxonomy.rs, order_readiness.rs}` + engine gate wiring (outside :256-277 / :549-660) | Cluster F (branch claude/dhan-order-error-taxonomy) | consumption-side classifier; SANDBOX + handle_order_update regions untouched; ~35 legacy api_client error sites byte-identical |
+| `crates/trading/src/oms/conditional.rs` (+ the api_client.rs conditional-family block :575-780 and the types.rs conditional/multi sections) | Cluster CT (this item) | New module — no other cluster touches it; api_client edits confined to the /alerts family block + end-appends; mod.rs gains one additive line |
 
 Build-lead: the cluster A session. Conflicts on any seam: the
 non-owner rebases; never a force-merge over an owner's in-flight PR.
+
+## Cluster F — Dhan order-path error taxonomy + readiness gate (branch claude/dhan-order-error-taxonomy, PR #1558)
+
+Cluster F claimed by #1558 (Dhan order-path error taxonomy + readiness gate).
+This cluster was ABSENT from the original umbrella (A/C/D/E only); the letter
+"B" was reserved by the order-side ALERTING PR (`claude/dhan-order-alerting`),
+so this block is relabeled B→F and moved to a distinct anchor to avoid a
+textual + semantic collision with that B block. build-lead (Cluster A) is the
+letter registrar — please confirm.
+
+- [x] F1 — order-path DH/DATA error taxonomy + per-endpoint retry matrix + 805 STOP-ALL latch + DH-904 ladder wiring
+  - Files: crates/trading/src/oms/error_taxonomy.rs, api_client.rs, mod.rs, crates/common/src/constants.rs
+  - Tests: ratchet_dh904_ladder_constants_and_wiring, ratchet_stop_all_cooldown_is_60s_per_annexure_rule_12, prop_classify_never_panics_and_is_deterministic_on_arbitrary_status_and_body
+- [x] F2 — order-readiness gate (profile/token headroom, fail-closed, live-path-only) + supervised probe refresher (boot spawn = seam handoff)
+  - Files: crates/trading/src/oms/order_readiness.rs, engine.rs, types.rs
+  - Tests: test_place_order_live_refused_when_no_readiness_installed_zero_http_zero_token_fetch, test_place_order_dry_run_ignores_readiness_gate_byte_identical, test_evaluate_order_readiness_stale_boundary_2100_passes_2101_refuses
+- [x] F3 — ORDER-READY-01 ErrorCode + rule file + OmsAlert 🔷 DHAN attribution
+  - Files: crates/common/src/error_code.rs, .claude/rules/project/order-readiness-error-codes.md, engine.rs
+  - Tests: test_order_ready_01_contract, test_all_oms_alert_operator_messages_start_with_dhan_badge

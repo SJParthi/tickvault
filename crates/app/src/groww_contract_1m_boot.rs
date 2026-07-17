@@ -157,6 +157,7 @@ use tickvault_storage::rest_fetch_audit_persistence::{
 use crate::groww_option_chain_1m_boot::{
     GrowwChainAnchor, GrowwChainAnchorStore, download_master_bounded,
 };
+use crate::groww_rest_burst::GrowwRestBurstState;
 use crate::groww_spot_1m_boot::{
     GrowwCandleRow, GrowwParseStats, GrowwTokenCache, error_class_for_status, groww_candles_query,
     parse_groww_1m_candle_rows,
@@ -206,6 +207,20 @@ pub struct GrowwContract1mTaskParams {
     pub anchor_store: Option<GrowwChainAnchorStore>,
     /// ATM window half-width from `[groww_contract_1m] strikes_each_side`.
     pub strikes_each_side: u32,
+    /// Shared session-scoped burst-tier state (2026-07-14 auto-ladder).
+    /// This leg keeps its own sequential per-contract min-gap pacing —
+    /// the burst handle exists ONLY so a contract-leg HTTP 429 demotes
+    /// the shared tier for the spot + chain waves too (one Groww rate
+    /// bucket, one demotion signal).
+    pub burst: Arc<GrowwRestBurstState>,
+    /// Order-runtime mark tap (dry-run PR, 2026-07-14; re-homed 2026-07-16
+    /// after the Groww live feed retired): `Some` ONLY when
+    /// `[order_runtime].enabled`. Marks are the OWN-FIRE just-closed-minute
+    /// contract-candle CLOSES (the option-leg mark of the fill model),
+    /// forwarded AFTER the persist flush ACK — the one-minute-lookback
+    /// backfill NEVER produces marks (stale prices must not fill paper
+    /// orders). `None` ⇒ the tap is structurally absent (no-op).
+    pub mark_forwarder: Option<crate::order_runtime::MarkForwarder>,
 }
 
 // ---------------------------------------------------------------------------
@@ -650,6 +665,22 @@ pub fn contract_min_gap_wait_ms(last_request_ms_of_day: Option<i64>, now_ms_of_d
 #[must_use]
 fn contract_ohlc_implausible(c: &GrowwCandleRow) -> bool {
     c.open <= 0.0 || c.high <= 0.0 || c.low <= 0.0 || c.close <= 0.0 || c.high < c.low
+}
+
+/// Numeric `ExchangeSegment` code for a contract-leg segment string —
+/// the mark tap's segment identity (annexure rule 2 numeric codes). The
+/// contract book only ever constructs "NSE_FNO"/"BSE_FNO"; anything else
+/// maps to the fail-closed unknown sentinel (never a guessed code).
+/// (2026-07-17 splice fix, post-#1562 audit: this fn had been inserted
+/// BETWEEN `select_candle_row`'s doc + `#[must_use]` and its `fn`,
+/// stealing both — the doc/attribute now sit back on their owner below.)
+#[must_use]
+fn contract_segment_code(segment: &'static str) -> u8 {
+    match segment {
+        "NSE_FNO" => tickvault_common::constants::EXCHANGE_SEGMENT_NSE_FNO,
+        "BSE_FNO" => tickvault_common::constants::EXCHANGE_SEGMENT_BSE_FNO,
+        _ => tickvault_trading::oms::SEGMENT_CODE_UNKNOWN,
+    }
 }
 
 /// The target-minute candle row from a parsed body (first match wins;
@@ -1160,6 +1191,14 @@ async fn fire_one_groww_contract_minute(
     // (token, segment, underlying, minute) commits staged until the flush
     // ACKs (the underlying rides along for the flush-failed forensics).
     let mut staged_commits: Vec<(i64, &'static str, &'static str, i64)> = Vec::new();
+    // Order-runtime mark tap (re-homed 2026-07-16): OWN-FIRE just-closed-
+    // minute contract closes ONLY, staged here and forwarded AFTER the
+    // flush ACK (persist-confirm choke point). The one-minute-lookback
+    // BACKFILL branch below deliberately stages NO mark — a >60s-old
+    // repaired price must not fill a paper order. Cold path (once per
+    // minute); the forward is a lock-free best-effort try_send that no-ops
+    // when the runtime is disabled.
+    let mut staged_marks: Vec<crate::order_runtime::MarkUpdate> = Vec::new();
 
     if selection.selected.is_empty() {
         // Nothing selectable this minute (no anchors / empty books) — the
@@ -1386,6 +1425,19 @@ async fn fire_one_groww_contract_minute(
                                         contract.underlying,
                                         target_minute_nanos,
                                     ));
+                                    // Mark tap: OWN-FIRE target-minute close
+                                    // only (the backfill arm stages none).
+                                    if let Ok(tok_u64) = u64::try_from(contract.token) {
+                                        #[allow(clippy::cast_possible_truncation)]
+                                        // APPROVED: MarkUpdate carries f32 by
+                                        // contract (wire LTP precision);
+                                        // price-level narrowing only.
+                                        staged_marks.push(crate::order_runtime::MarkUpdate {
+                                            security_id: tok_u64,
+                                            segment_code: contract_segment_code(contract.segment),
+                                            price: candle.close as f32,
+                                        });
+                                    }
                                     let audit_row = build_contract_audit_row(
                                         target_minute_nanos,
                                         trading_date_nanos,
@@ -1481,6 +1533,22 @@ async fn fire_one_groww_contract_minute(
                             Some(format!("{}: {}", contract.groww_symbol, failure.msg));
                     }
                     auth_rejected = failure.auth_rejected;
+                    // 2026-07-14 auto-ladder: a contract-leg 429 demotes the
+                    // SHARED session burst tier (spot + chain waves included)
+                    // — one Groww rate bucket, one demotion edge (the warn
+                    // fires once per session).
+                    if failure.rate_limited && params.burst.note_rate_limited() {
+                        warn!(
+                            code = ErrorCode::Spot1m01FetchDegraded.code_str(),
+                            stage = "burst_demoted",
+                            feed = "groww",
+                            leg = "contract_1m",
+                            demoted_to = params.burst.effective_tier().as_str(),
+                            "groww_contract_1m: HTTP 429 observed — Groww REST \
+                             burst tier demoted for the rest of the session \
+                             (boot resets to the configured tier)"
+                        );
+                    }
                     let error_class = error_class_for_status(failure.status);
                     let audit_row = build_contract_audit_row(
                         target_minute_nanos,
@@ -1547,6 +1615,15 @@ async fn fire_one_groww_contract_minute(
                 // Flush ACKed — commit the staged watermarks.
                 for (tok, seg, _underlying, minute) in staged_commits.drain(..) {
                     tracker.commit(tok, seg, minute);
+                }
+                // Order-runtime mark tap: forward the OWN-FIRE closes now
+                // that the flush ACK confirmed persistence. Best-effort
+                // try_send (a full channel drops the mark — counted; the
+                // next minute supersedes it); None ⇒ runtime disabled.
+                if let Some(forwarder) = params.mark_forwarder.as_ref() {
+                    for mark in &staged_marks {
+                        forwarder.mark_forward(mark.security_id, mark.segment_code, mark.price);
+                    }
                 }
             }
             Err(err) => {
@@ -2851,6 +2928,7 @@ mod tests {
             nse_mock_trading_dates: vec![],
         };
         GrowwContract1mTaskParams {
+            mark_forwarder: None,
             notifier: NotificationService::disabled(),
             calendar: Arc::new(
                 TradingCalendar::from_config(&cfg).expect("synthetic calendar builds"),
@@ -2864,6 +2942,10 @@ mod tests {
             chain_minute_done: None,
             anchor_store: None,
             strikes_each_side: 2,
+            burst: GrowwRestBurstState::new(
+                tickvault_common::config::GrowwRestBurstTier::TwoWave,
+                false,
+            ),
         }
     }
 

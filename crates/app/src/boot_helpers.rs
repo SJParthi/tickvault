@@ -373,6 +373,7 @@ const CLOCK_DRIFT_HTTP_TIMEOUT_SECS: u64 = 5;
 const CLOCK_DRIFT_REFERENCE_URL: &str = "https://www.google.com";
 
 /// Checks system clock against an HTTP server's Date header (cold path, boot only).
+// TEST-EXEMPT: live HTTP HEAD against an external public time reference (boot-only cold path, fail-soft Option) — no pure core to unit-test without egress; the BOOT-03 gate consuming it is wired in main.rs.
 pub async fn check_clock_drift() -> Option<i64> {
     let local_now = chrono::Utc::now();
     let client = reqwest::Client::builder()

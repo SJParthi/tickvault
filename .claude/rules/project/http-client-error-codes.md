@@ -63,6 +63,7 @@ The site logs `error!(code = "HTTP-CLIENT-01", ...)`, increments
 | `tick_gap_check` | one best-effort post-recovery gap check skipped |
 | `named_views_ensure` | analyst console views (ticks_named/candles_named) DDL skipped this boot (idempotent — next boot re-runs; read-only projections, no data path affected, no duplicate-row window) |
 | `wal_suspension_probe` | one 60s WAL-suspension probe tick skipped (W2 PR#6, 2026-07-10 — WAL-SUSPEND-01 watcher; next tick retries; probe-failed counter also rises) |
+| `oms_wiring` | (app crate, 2026-07-17 — post-#1562 audit) the shared OMS HTTP client (`crates/app/src/oms_wiring.rs::build_oms_http_client`) could not be built. Order runtime: the (re)spawn attempt returns before OMS construction — the supervisor's escalating-backoff respawn (5s→300s cap) retries; the paper book for that incarnation never opens (loud, never a panic). Trading pipeline (Dhan-lane-gated, dormant today): the pipeline task exits before OMS construction with its own consequence-line `error!`; a dhan-lane restart retries the spawn |
 
 **Triage:**
 1. `tv_http_client_build_failed_total{site}` — which site(s) and at what rate.
@@ -123,6 +124,44 @@ not per-emission.
   scheme separators in string literals) as code, not a comment start, and
   self-tests that property.
 
+### 2026-07-17 Update — the #1562 app-crate panic fallback closed (`oms_wiring` site)
+
+The post-merge hostile audit of PR #1562's delta found the C2 incident class
+REINTRODUCED in the app crate: `crates/app/src/oms_wiring.rs::
+build_oms_http_client()` ended in `.build().unwrap_or_default()` —
+`reqwest::Client::default()` delegates to `Client::new()`, which PANICS under
+exactly the fd/TLS/resolver pressure that makes the builder's `Err` arm
+reachable; with the workspace release profile's `panic = "abort"` that was a
+WHOLE-PROCESS abort at every order-runtime (re)spawn (`[order_runtime]`
+`enabled = true` in base.toml), killing the REST capture legs for a dry-run
+client that never issues HTTP. The storage-crate ratchet scans only
+`crates/storage/src`, so the app-crate copy escaped it. Fixed same-day:
+
+- `build_oms_http_client()` now returns
+  `Result<reqwest::Client, HttpClientBuildError>` through the SAME
+  `client_from_build_result` core the storage sites use (promoted `pub` —
+  one HTTP-CLIENT-01 implementation, one proxy-credential redaction path),
+  emitting `error!(code = "HTTP-CLIENT-01", site = "oms_wiring", ...)` +
+  `tv_http_client_build_failed_total{site="oms_wiring"}` on failure.
+- BOTH production callers degrade per the §1 site-table row:
+  `order_runtime.rs::run_order_runtime` returns (supervisor backoff
+  respawn retries); `trading_pipeline.rs` exits before OMS construction
+  with its own coded consequence line. Never a panic-class fallback.
+- New app-crate ratchet `crates/app/tests/http_client_fallback_guard.rs`
+  mirrors the storage guard, scoped to the OMS wiring surface
+  (`oms_wiring.rs` + both callers, production regions), plus an
+  oms_wiring-only `unwrap_or_default` ban (the exact #1562 regression
+  shape) and a typed-degrade stub-guard.
+
+**Flagged follow-up (same class, NOT owned by this fix):**
+`crates/app/src/infra.rs::liveness_client` (~:815-833) carries a
+pre-existing `unwrap_or_else(|err| { ...; reqwest::Client::new() })`
+fallback — a panic-class fallback on the liveness-probe surface that the
+storage guard's `unwrap_or_else(|_| Client` needle misses (the `|err|`
+binding form). It predates #1562 and was not a confirmed audit finding;
+migrating it to the typed `HttpClientBuildError` path (its own site label)
+is a flagged follow-up.
+
 ---
 
 ## §2. Trigger / auto-load
@@ -131,5 +170,7 @@ This rule activates when editing:
 - `crates/common/src/error_code.rs` (any `HttpClient01*` variant)
 - `crates/storage/src/http_client.rs`
 - `crates/storage/src/boot_probe.rs`
+- `crates/app/src/oms_wiring.rs` (the `oms_wiring` site, 2026-07-17)
 - Any file containing `HTTP-CLIENT-01`, `HttpClient01`, `shared_probe_client`,
-  `HttpClientBuildError`, or `tv_http_client_build_failed_total`
+  `HttpClientBuildError`, `build_oms_http_client`, or
+  `tv_http_client_build_failed_total`

@@ -15,7 +15,13 @@
 #   1. preflight job — skips entire workflow if AWS_ROLE_ARN / AWS_ACCESS_KEY_ID
 #      bootstrap secrets are absent (charter §C "100% no false-OK PR checks").
 #   2. guard_market_hours job — blocks deploy during 09:00-15:45 IST Mon-Fri
-#      unless workflow_dispatch with confirm_market_hours=yes.
+#      unless workflow_dispatch with confirm_market_hours=yes. Since
+#      2026-07-17 an in-window MAIN-BRANCH push run defers GREEN
+#      (deploy_allowed=false, no-op; the 15:46 IST after-close cron delivers
+#      it) instead of dying red; an in-window dispatch without the override
+#      AND an in-window TAG push still fail red (the after-close cron
+#      delivers main HEAD only, so a green tag deferral would silently
+#      never deploy).
 #   3. concurrency.group serializes deploys; never two at once.
 #   4. Existing rollback path triggers on failed smoke test.
 #
@@ -269,13 +275,54 @@ jobs:
           path: dist/
           retention-days: 7
 
+      - name: Configure AWS credentials for failure notify (OIDC preferred, keys fallback)
+        # 2026-07-16 gate-integrity sweep: failure-path only — the build job
+        # needs AWS creds solely to publish the SNS page below. Mirror of the
+        # deploy job's credential step (same action + inputs) so it works both
+        # pre- and post-OIDC-migration.
+        if: failure()
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ vars.AWS_REGION || 'ap-south-1' }}
+          role-session-name: tv-github-build-notify-${{ github.run_id }}
+
+      - name: Resolve AWS account id for failure notify
+        # Mirror of the deploy job's `id: acct` step — derives the account id
+        # from the live credentials so the SNS topic ARN needs no secret.
+        if: failure()
+        id: acct_build
+        run: echo "id=$(aws sts get-caller-identity --query Account --output text)" >> "$GITHUB_OUTPUT"
+
+      - name: Notify Telegram on build failure
+        # 2026-07-16 gate-integrity sweep: a BUILD-job failure previously paged
+        # nobody — the only failure notifier lived in the deploy job, so a
+        # compile error / size-cap breach / artifact-upload failure stayed
+        # silent until the ~24h stale-binary-sha watchdog. Mirror of the
+        # deploy job's "Notify Telegram on failure" step.
+        if: failure()
+        run: |
+          SHORT_SHA="${GITHUB_SHA:0:7}"
+          IST_TIME="$(TZ='Asia/Kolkata' date +'%I:%M %p IST')"
+          MSG="🆘 Build FAILED at ${IST_TIME} (version ${SHORT_SHA}) — the new code never reached the box; it keeps running the previous version. What you need to do RIGHT NOW: open the run, read the build error, fix and push. Run: ${{ github.run_id }}"
+          aws sns publish \
+            --region ${{ vars.AWS_REGION || 'ap-south-1' }} \
+            --topic-arn arn:aws:sns:${{ vars.AWS_REGION || 'ap-south-1' }}:${{ steps.acct_build.outputs.id }}:tv-prod-alerts \
+            --subject "🆘 tickvault build FAILED" \
+            --message "$MSG"
+
   guard_market_hours:
     name: Market-hours guard
     runs-on: ubuntu-24.04
     needs: [preflight, build]
     if: needs.preflight.outputs.bootstrap_ready == 'true'
+    outputs:
+      deploy_allowed: ${{ steps.window.outputs.deploy_allowed }}
     steps:
       - name: Check current IST time against market window
+        id: window
         run: |
           # No-deploy band 09:00-15:45 IST = 03:30-10:15 UTC (operator lock
           # 2026-06-03: "only between 9 am till 3.45 pm it should not happen").
@@ -291,20 +338,68 @@ jobs:
           if [ "$UTC_DOW" -le 5 ] && [ "$UTC_TIME_NUM" -ge 330 ] && [ "$UTC_TIME_NUM" -lt 1015 ]; then
             if [ "${{ github.event.inputs.confirm_market_hours }}" = "yes" ]; then
               echo "WARNING: deploying during market hours with explicit override"
-            else
+            elif [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+              # An explicit human/dispatcher action asked for an in-window
+              # deploy WITHOUT the override — keep the loud red signal so the
+              # asker learns immediately that nothing was deployed.
               echo "BLOCK: deploying during 09:00-15:45 IST is forbidden without override."
               echo "Re-run with confirm_market_hours=yes if this is an emergency fix."
+              exit 1
+            elif [ "${{ github.event_name }}" = "push" ] && [ "$GITHUB_REF" = "refs/heads/main" ]; then
+              # ZERO-TOUCH FIX 2026-07-17 (operator mandate, relayed via the
+              # coordinator session): a branch push to main (a merge) inside
+              # the band previously died RED here — and postmerge-catchup.yml
+              # counts ANY run (any color) as coverage for the SHA, so prod
+              # ran stale code until a human dispatched manually. A push run
+              # cannot possibly carry the confirm_market_hours override, so
+              # red is not actionable feedback — it just masks the SHA.
+              # Defer GREEN instead: deploy_allowed=false skips the
+              # Deploy-to-EC2 job entirely (NOTHING is deployed — the
+              # 2026-06-03 lock's substance is unchanged), which leaves the
+              # B9 "Record deployed binary git SHA" step `skipped`, so
+              # deploy-aws-after-close.yml's 15:46 IST cron — which accepts
+              # as "last deployed" only runs whose B9 step actually executed
+              # — sees main != last-deployed and redeploys this commit right
+              # after the close. For MAIN-BRANCH PUSH runs: nothing red,
+              # nothing manual, nothing stale past 15:46 IST. Residual RED
+              # shapes (deliberate, hostile-review 2026-07-17): (i) an
+              # in-window catchup DISPATCH after a bot merge still exits 1
+              # red above (coverage still lands via the 15:46 IST cron);
+              # (ii) the swap-time re-gate (market_hours_swap_abort) still
+              # reds a run whose build crosses 09:00 IST; (iii) in-window
+              # TAG pushes still block red below (the after-close cron
+              # delivers main HEAD only).
+              echo "deploy_allowed=false" >> "$GITHUB_OUTPUT"
+              echo "::notice::Deploy of ${{ github.sha }} deferred: inside 09:00-15:45 IST market window; the after-close redeploy cron (15:46 IST, deploy-aws-after-close.yml) will deliver it. Immediate delivery remains available via workflow_dispatch with confirm_market_hours=yes."
+              exit 0
+            else
+              # HOSTILE-REVIEW FIX 2026-07-17: the green defer above is
+              # scoped to a branch push to main ONLY — the after-close cron
+              # compares/dispatches MAIN HEAD only, so a green-deferred
+              # in-window TAG push (v*.*.*, possibly on a non-HEAD commit)
+              # would be a SILENT never-deploy. Tags and any other in-window
+              # non-override shape keep the original loud red block.
+              echo "BLOCK: deploying during 09:00-15:45 IST is forbidden without override."
+              echo "This event (${{ github.event_name }} on $GITHUB_REF) cannot be green-deferred: the after-close cron redeploys main HEAD only."
               exit 1
             fi
           else
             echo "OK: outside the 09:00-15:45 IST no-deploy band, deploy can proceed"
           fi
+          echo "deploy_allowed=true" >> "$GITHUB_OUTPUT"
 
   deploy:
     name: Deploy to EC2
     runs-on: ubuntu-24.04
     needs: [preflight, build, guard_market_hours]
-    if: needs.preflight.outputs.bootstrap_ready == 'true'
+    # deploy_allowed gate (2026-07-17): on an in-window MAIN-BRANCH push run
+    # the guard now exits GREEN with deploy_allowed=false (deferred no-op)
+    # instead of red — this condition is what actually skips the deploy in
+    # that case. Every other path is unchanged: out-of-window and override
+    # runs emit deploy_allowed=true; an in-window dispatch WITHOUT the
+    # override, and an in-window TAG push, still fail the guard job red,
+    # which skips this job via `needs` exactly as before.
+    if: needs.preflight.outputs.bootstrap_ready == 'true' && needs.guard_market_hours.outputs.deploy_allowed == 'true'
     environment: prod
     steps:
       - name: Checkout (for deploy scripts)

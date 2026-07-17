@@ -529,7 +529,7 @@ jobs:
   repo-guards:
     name: "Repo Guards"
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15 # 2026-07-16: real full-tree scans measured ~3.5 min; headroom for the lambda/console suites
     steps:
       - name: Checkout
         uses: actions/checkout@v7.0.0
@@ -546,8 +546,18 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          ALL_RS=$(find crates -name '*.rs' -not -path '*/target/*' | tr '\n' ' ')
-          bash .claude/hooks/banned-pattern-scanner.sh "$GITHUB_WORKSPACE" $ALL_RS
+          # Scanner contract: $2 is ONE newline-separated file-list string
+          # (iterated via a `while read` here-string). The old
+          # `tr '\n' ' '` + unquoted $ALL_RS word-split the list, so only
+          # the FIRST file reached the scanner as $2 — CI scanned 1 of
+          # ~551 .rs files (2026-07-16 gate-integrity sweep, Critical).
+          ALL_RS=$(find crates -name '*.rs' -not -path '*/target/*' | sort)
+          if [ -z "$ALL_RS" ]; then
+            echo "FATAL: no .rs files found under crates/ — refusing vacuous pass" >&2
+            exit 1
+          fi
+          echo "Scanning $(printf '%s\n' "$ALL_RS" | wc -l) Rust files"
+          bash .claude/hooks/banned-pattern-scanner.sh "$GITHUB_WORKSPACE" "$ALL_RS"
 
       - name: Data integrity guard (price precision, IST timestamp rules)
         shell: bash
@@ -557,8 +567,18 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          ALL_RS=$(find crates -name '*.rs' -not -path '*/target/*' | tr '\n' ' ')
-          bash .claude/hooks/dedup-latency-scanner.sh "$GITHUB_WORKSPACE" $ALL_RS
+          # Scanner contract: $2 is ONE newline-separated file-list string
+          # (iterated via a `while read` here-string). The old
+          # `tr '\n' ' '` + unquoted $ALL_RS word-split the list, so only
+          # the FIRST file reached the scanner as $2 — CI scanned 1 of
+          # ~551 .rs files (2026-07-16 gate-integrity sweep, Critical).
+          ALL_RS=$(find crates -name '*.rs' -not -path '*/target/*' | sort)
+          if [ -z "$ALL_RS" ]; then
+            echo "FATAL: no .rs files found under crates/ — refusing vacuous pass" >&2
+            exit 1
+          fi
+          echo "Scanning $(printf '%s\n' "$ALL_RS" | wc -l) Rust files"
+          bash .claude/hooks/dedup-latency-scanner.sh "$GITHUB_WORKSPACE" "$ALL_RS"
 
       - name: Boot symmetry + state-machine wiring guard (S6-G3+G4)
         shell: bash
@@ -622,9 +642,12 @@ jobs:
   # filesystem disagrees with the list below (a new/renamed file must be
   # added to the list). Side 2 — each cargo test step asserts the EXECUTED
   # target count ("Running tests/dhat_" lines) equals its expected count
-  # (11 core / 3 storage / 3 trading — PR-C3 2026-07-14 truth-sync; the
-  # deleted dhat_tick_gap_detector left core at 10. The moneyness PR
-  # re-added one target (dhat_moneyness): 10 -> 11), so a `--test` flag dropped from a
+  # (11 core / 3 storage / 3 trading / 1 app — PR-C3 2026-07-14 truth-sync
+  # deleted dhat_tick_gap_detector (core 11 -> 10); the Groww live-feed
+  # retirement (#1581) deleted dhat_feed_lag_groww (10 -> 9); the moneyness
+  # PR re-added dhat_moneyness (9 -> 10); the cadence PR (#1608) added
+  # dhat_cadence_decide (10 -> 11); the order-runtime dry-run PR added the
+  # app lane's dhat_mark_forward: 1 app), so a `--test` flag dropped from a
   # run step (while the file + list entry survive) fails loudly instead of
   # silently un-gating that target (2026-07-09 adversarial-review HIGH).
   #
@@ -648,7 +671,9 @@ jobs:
           set -euo pipefail
           actual=$(ls crates/*/tests/dhat_*.rs | LC_ALL=C sort)
           expected=$(LC_ALL=C sort <<'EOF'
+          crates/app/tests/dhat_mark_forward.rs
           crates/core/tests/dhat_allocation.rs
+          crates/core/tests/dhat_cadence_decide.rs
           crates/core/tests/dhat_feed_consumer.rs
           crates/core/tests/dhat_feed_lag_ring.rs
           crates/core/tests/dhat_feed_presence.rs
@@ -703,6 +728,7 @@ jobs:
           set -euo pipefail
           cargo test -p tickvault-core --features dhat \
             --test dhat_allocation \
+            --test dhat_cadence_decide \
             --test dhat_feed_consumer \
             --test dhat_feed_lag_ring \
             --test dhat_feed_presence \
@@ -729,8 +755,10 @@ jobs:
           # live feed.
           # 2026-07-15 (merge-train reconcile): the moneyness PR re-added one
           # target (dhat_moneyness): 9 -> 10.
-          if [ "$ran" -ne 10 ]; then
-            echo "::error::core DHAT step executed $ran targets, expected 10 — a --test flag was dropped from this step (drift list vs run step mismatch)."
+          # 2026-07-16 (cadence rebase onto post-#1540 main): the cadence PR
+          # adds dhat_cadence_decide: 10 -> 11.
+          if [ "$ran" -ne 11 ]; then
+            echo "::error::core DHAT step executed $ran targets, expected 11 — a --test flag was dropped from this step (drift list vs run step mismatch)."
             exit 1
           fi
 
@@ -769,6 +797,29 @@ jobs:
           ran=$(grep -c 'Running.*tests/dhat_' /tmp/dhat-trading.log || true)
           if [ "$ran" -ne 3 ]; then
             echo "::error::trading DHAT step executed $ran targets, expected 3 — a --test flag was dropped from this step."
+            exit 1
+          fi
+
+      # Added 2026-07-14 (order-runtime dry-run PR): the app crate's first
+      # dhat target — the order-runtime mark-forward tap (fed by the Groww
+      # per-minute REST legs since 2026-07-16; #1581 retired the
+      # live-bridge source). Feature-UNGATED
+      # (house pattern), so Test (app) also runs it; this lane is the
+      # allocation-ratchet authority per the header note above.
+      - name: DHAT (app)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p tickvault-app \
+            --test dhat_mark_forward \
+            2>&1 | tee /tmp/dhat-app.log
+          if grep -q 'running 0 tests' /tmp/dhat-app.log; then
+            echo "::error::an app dhat target ran ZERO tests — vacuous green. Rule 11: no false-OK."
+            exit 1
+          fi
+          ran=$(grep -c 'Running.*tests/dhat_' /tmp/dhat-app.log || true)
+          if [ "$ran" -ne 1 ]; then
+            echo "::error::app DHAT step executed $ran targets, expected 1 — a --test flag was dropped from this step."
             exit 1
           fi
 

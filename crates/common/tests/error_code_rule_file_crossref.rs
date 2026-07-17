@@ -61,6 +61,14 @@ const TRACKED_PREFIXES: &[&str] = &[
     // Groww orders shared contracts (PR-A0, 2026-07-15) — every GROWW-ORD-NN
     // referenced in a rule file must have a matching enum variant.
     "GROWW-ORD-",
+    // REST-era multi-TF candle derivation (operator 2026-07-16) — a
+    // FOLD-NN string in rule text must always name a real ErrorCode
+    // variant (the reverse ratchet for the FOLD- family).
+    "FOLD-",
+    // RAM residency stores (PR-2, 2026-07-16) — a RAMSTORE-NN string in
+    // rule text must always name a real ErrorCode variant (the FOLD-
+    // precedent; PR-2 round-1 review fix).
+    "RAMSTORE-",
 ];
 
 /// Codes mentioned in rule files that intentionally don't have an enum

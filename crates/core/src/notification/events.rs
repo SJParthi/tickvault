@@ -558,6 +558,43 @@ pub enum NotificationEvent {
         detail: String,
     },
 
+    /// Daily 15:47 IST Dhan↔Groww spot cross-broker comparator summary
+    /// (operator 2026-07-17; SPOT-XVERIFY-01/02). Neither feed is ground
+    /// truth — a divergence-TREND signal.
+    SpotCrossverifySummary {
+        /// The trading day compared, `YYYY-MM-DD` IST.
+        trading_date_ist: String,
+        /// Indices seen across both feeds.
+        indices: u64,
+        /// Minutes present on BOTH feeds and compared.
+        minutes_compared: u64,
+        /// Field-cells where Dhan and Groww OHLC disagree beyond tolerance.
+        mismatches: u64,
+        /// Minutes present in Groww only (Dhan absent).
+        missing_dhan: u64,
+        /// Minutes present in Dhan only (Groww absent).
+        missing_groww: u64,
+        /// Rows outside [09:15, 15:30) IST — recorded, not classified.
+        out_of_session: u64,
+        /// True when any query/flush/budget leg degraded.
+        degraded: bool,
+        /// True when findings exceeded the stored-detail cap.
+        truncated: bool,
+        /// Stable verdict: `clean` / `diverged` / `partial` / `no_data` /
+        /// `blind` / `degraded`.
+        status_label: String,
+        /// Up to 10 plain-English worst offenders.
+        top_detail: Vec<String>,
+    },
+
+    /// The daily spot cross-verify TASK died before producing its summary.
+    /// High so the absent verdict is impossible to miss. NOT fired on
+    /// graceful shutdown/cancellation.
+    SpotCrossverifyAborted {
+        /// Plain-English description of how the task died.
+        detail: String,
+    },
+
     /// Per-minute spot 1m REST pipeline (operator grant 2026-07-12): the
     /// per-minute pull of the just-closed minute's official index candle
     /// has fully failed (no index succeeded) for several minutes in a row.
@@ -684,6 +721,20 @@ pub enum NotificationEvent {
         /// Plain-English detail naming the affected underlyings / cause
         /// (already secret-redacted + bounded at the emit site).
         detail: String,
+    },
+
+    /// The two brokers' contract lists DISAGREE on today's option expiry
+    /// date for one underlying (cadence scheduler, coordinator ruling
+    /// 2026-07-16): Dhan's exchange-sourced date WINS and keys BOTH
+    /// lanes' option-chain timing; both raw dates stay recorded for
+    /// provenance. Edge-latched — one HIGH page per underlying per day.
+    CadenceExpiryDisagreement {
+        /// The underlying index name (NIFTY / BANKNIFTY / SENSEX).
+        underlying: String,
+        /// Dhan's resolved expiry date (ISO) — the winner.
+        dhan_date: String,
+        /// Groww's resolved expiry date (ISO).
+        groww_date: String,
     },
 
     /// The boot-time Groww option-chain probe verdict (pipeline switched
@@ -2850,6 +2901,88 @@ impl NotificationEvent {
                      2. Restart the app to re-arm tomorrow's check."
                 )
             }
+            Self::SpotCrossverifySummary {
+                trading_date_ist,
+                indices,
+                minutes_compared,
+                mismatches,
+                missing_dhan,
+                missing_groww,
+                out_of_session,
+                degraded,
+                truncated,
+                status_label,
+                top_detail,
+            } => {
+                if status_label == "clean" {
+                    format!(
+                        "\u{2705} Spot cross-check 3:47 PM \u{b7} {trading_date_ist} — \
+                         \u{1f537} Dhan vs \u{1f7e2} Groww: {minutes_compared} minutes \
+                         across {indices} indices, all prices match."
+                    )
+                } else if status_label == "no_data" {
+                    format!(
+                        "\u{1f515} <b>Spot cross-check @ 3:47 PM IST — nothing to compare</b>\n\
+                         Day: {trading_date_ist}\n\
+                         Neither Dhan nor Groww recorded index prices today \
+                         (feeds off). Not a pass and not a failure."
+                    )
+                } else if *minutes_compared == 0 {
+                    format!(
+                        "\u{1f198} <b>Spot cross-check @ 3:47 PM IST — BLIND</b>\n\
+                         Day: {trading_date_ist}\n\
+                         Compared NOTHING — one broker had prices, the other \
+                         none overlapped. This is not a pass.\n\
+                         What to do RIGHT NOW:\n\
+                         1. Check the database is up and reachable.\n\
+                         2. Confirm BOTH brokers' minute prices recorded today."
+                    )
+                } else {
+                    let coverage_note = if *degraded {
+                        "\nCoverage was PARTIAL — some data could not be read."
+                    } else {
+                        ""
+                    };
+                    let truncated_note = if *truncated {
+                        "\nCounts exceed the stored detail — totals are exact."
+                    } else {
+                        ""
+                    };
+                    let mut detail_block = String::new();
+                    for line in top_detail.iter().take(10) {
+                        detail_block.push('\n');
+                        detail_block.push_str("• ");
+                        detail_block.push_str(&html_escape(line));
+                    }
+                    format!(
+                        "\u{26a0}\u{fe0f} <b>Spot cross-check @ 3:47 PM IST — \
+                         NEEDS ATTENTION</b>\n\
+                         Day: {trading_date_ist} \u{2014} \u{1f537} Dhan vs \u{1f7e2} Groww\n\
+                         Indices: {indices} | Minutes compared: {minutes_compared}\n\
+                         Price differences: {mismatches}\n\
+                         Missing on Dhan: {missing_dhan} | Missing on Groww: {missing_groww}\n\
+                         Outside market hours: {out_of_session}\
+                         {coverage_note}{truncated_note}{detail_block}\n\
+                         Neither broker is the source of truth — both sample \
+                         the same prices at slightly different moments. Track \
+                         the TREND: a steady small count is normal skew; a \
+                         spike or a drift in the open/close price is a real \
+                         problem on one broker's side."
+                    )
+                }
+            }
+            Self::SpotCrossverifyAborted { detail } => {
+                let detail = html_escape(detail);
+                format!(
+                    "\u{26a0}\u{fe0f} <b>Daily spot cross-check did NOT run</b>\n\
+                     The 3:47 PM IST check comparing Dhan vs Groww index prices \
+                     died before finishing.\n\
+                     Reason: {detail}\n\
+                     What to do RIGHT NOW:\n\
+                     1. Check the app is still running.\n\
+                     2. Restart the app to re-arm tomorrow's check."
+                )
+            }
             Self::Spot1mFetchDegraded {
                 consecutive_failed_minutes,
                 minute_ist,
@@ -3020,6 +3153,29 @@ impl NotificationEvent {
                      again after {empty_minutes} empty minute(s). The \
                      minutes that were missed stay blank in the record until \
                      re-pulled — nothing is made up."
+                )
+            }
+            Self::CadenceExpiryDisagreement {
+                underlying,
+                dhan_date,
+                groww_date,
+            } => {
+                let underlying = html_escape(underlying);
+                let dhan_date = html_escape(dhan_date);
+                let groww_date = html_escape(groww_date);
+                format!(
+                    "\u{26a0}\u{fe0f} <b>Dhan and Groww disagree on the \
+                     {underlying} option expiry date</b>\n\
+                     Dhan says {dhan_date}, Groww says {groww_date} — for \
+                     today the DHAN date wins, and BOTH brokers' option-chain \
+                     timing now uses Dhan's date. Both answers stay recorded.\n\
+                     What to do RIGHT NOW:\n\
+                     1. Nothing urgent — the system already picked the Dhan \
+                     date (the exchange-sourced list).\n\
+                     2. Glance at the {underlying} option expiry in the Groww \
+                     app once today. If Groww's list was just stale this \
+                     clears tomorrow; if it repeats daily, the two brokers' \
+                     contract lists genuinely differ and need a look."
                 )
             }
             Self::GrowwChain1mExpiryUnresolved { detail } => {
@@ -4106,6 +4262,8 @@ impl NotificationEvent {
             Self::CrossVerify1mAborted { .. } => "CrossVerify1mAborted",
             Self::TfConsistencySummary { .. } => "TfConsistencySummary",
             Self::TfConsistencyAborted { .. } => "TfConsistencyAborted",
+            Self::SpotCrossverifySummary { .. } => "SpotCrossverifySummary",
+            Self::SpotCrossverifyAborted { .. } => "SpotCrossverifyAborted",
             Self::Spot1mFetchDegraded { .. } => "Spot1mFetchDegraded",
             Self::Spot1mFetchRecovered { .. } => "Spot1mFetchRecovered",
             Self::GrowwSpot1mFetchDegraded { .. } => "GrowwSpot1mFetchDegraded",
@@ -4119,6 +4277,7 @@ impl NotificationEvent {
                 "GrowwChain1mUnderlyingServedRecovered"
             }
             Self::GrowwChain1mExpiryUnresolved { .. } => "GrowwChain1mExpiryUnresolved",
+            Self::CadenceExpiryDisagreement { .. } => "CadenceExpiryDisagreement",
             Self::GrowwChain1mProbeVerdict { .. } => "GrowwChain1mProbeVerdict",
             Self::GrowwContract1mFetchDegraded { .. } => "GrowwContract1mFetchDegraded",
             Self::GrowwContract1mFetchRecovered { .. } => "GrowwContract1mFetchRecovered",
@@ -4570,6 +4729,16 @@ impl NotificationEvent {
                 }
             }
             Self::TfConsistencyAborted { .. } => Severity::High,
+            // Spot cross-broker comparator (2026-07-17): clean/no_data are
+            // Info; a divergence/partial/blind is High (audit Rule 11).
+            Self::SpotCrossverifySummary { status_label, .. } => {
+                if status_label == "clean" || status_label == "no_data" {
+                    Severity::Info
+                } else {
+                    Severity::High
+                }
+            }
+            Self::SpotCrossverifyAborted { .. } => Severity::High,
             // Per-minute spot 1m REST pipeline (2026-07-12): the degraded
             // page is the edge-triggered escalation (3 consecutive fully-
             // failed minutes); the recovery is a positive Info ping.
@@ -4589,6 +4758,7 @@ impl NotificationEvent {
             // One page per day when an underlying's chain recording could
             // not start (never a guessed expiry) — actionable, not fatal.
             Self::GrowwChain1mExpiryUnresolved { .. } => Severity::High,
+            Self::CadenceExpiryDisagreement { .. } => Severity::High,
             // The probe is informational either way — nothing was expected
             // to record while the pipeline is switched off.
             Self::GrowwChain1mProbeVerdict { .. } => Severity::Info,
@@ -4754,6 +4924,11 @@ impl NotificationEvent {
             // not coalesced into a batching window — the exact
             // CrossVerify1mSummary rationale above.
             Self::TfConsistencySummary { .. } => DispatchPolicy::Immediate,
+            // Spot cross-broker comparator (2026-07-17): the once-per-day
+            // 15:47 IST post-close summary must arrive AT 15:47, not
+            // coalesced — the TfConsistencySummary rationale above.
+            Self::SpotCrossverifySummary { .. } => DispatchPolicy::Immediate,
+            Self::SpotCrossverifyAborted { .. } => DispatchPolicy::Immediate,
             // Dual-feed scorecard (2026-07-10): the once-per-day 15:45 IST
             // digest must arrive AT 15:45 (post-close = off-hours, so the
             // default Info routing would coalesce it) — same rationale as
@@ -8369,6 +8544,34 @@ mod tests {
         assert!(msg.contains("12 empty"), "got: {msg}");
         // No false-OK: recovery never claims the missing minutes came back.
         assert!(msg.contains("nothing is made up"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_cadence_expiry_disagreement_is_high_names_both_brokers_dhan_wins() {
+        // R6 (2026-07-16): the cadence expiry cross-broker disagreement
+        // page — both brokers named, both dates shown, Dhan wins, plain
+        // English (10 commandments), hostile input HTML-escaped.
+        let event = NotificationEvent::CadenceExpiryDisagreement {
+            underlying: "BANKNIFTY".to_string(),
+            dhan_date: "2026-07-28".to_string(),
+            groww_date: "2026-07-30<script>".to_string(),
+        };
+        assert_eq!(event.topic(), "CadenceExpiryDisagreement");
+        assert_eq!(event.severity(), Severity::High);
+        let msg = event.to_message();
+        assert!(
+            msg.contains("Dhan and Groww disagree on the BANKNIFTY option expiry"),
+            "got: {msg}"
+        );
+        assert!(msg.contains("Dhan says 2026-07-28"), "got: {msg}");
+        assert!(msg.contains("DHAN date wins"), "got: {msg}");
+        assert!(
+            msg.contains("BOTH brokers"),
+            "must say both lanes now use Dhan's date: {msg}"
+        );
+        // Hostile date input is HTML-escaped, never raw.
+        assert!(!msg.contains("<script>"), "got: {msg}");
+        assert!(msg.contains("&lt;script&gt;"), "got: {msg}");
     }
 
     #[test]

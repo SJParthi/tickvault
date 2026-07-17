@@ -408,6 +408,13 @@ pub enum ErrorCode {
     /// 814: Invalid request.
     Data814InvalidRequest,
 
+    /// ORDER-READY-01 — a live order was refused by the order-readiness gate:
+    /// fail-closed on never-probed / stale / invalid profile / token headroom /
+    /// OMS halt. Pre-live plumbing while `dry_run` is hardcoded true — the
+    /// refusal IS the protection; unreachable in prod today (WS-GAP-10 /
+    /// DHAN-LANE-03 class of fail-closed gate). Severity::High.
+    OrderReady01GateRefused,
+
     /// Wave 5 Item 26 L1 — volume monotonicity breach at runtime. The Dhan
     /// volume field at bytes 22-25 of the Quote/Full packet is cumulative
     /// since session open per Ticket #5525125 (verified via the live Mon
@@ -802,6 +809,26 @@ pub enum ErrorCode {
     /// Severity::High, auto-triage-safe (the degrade already happened —
     /// the operator inspects; the next trading day re-runs).
     BrutexXverify02RunDegraded,
+    /// SPOT-XVERIFY-01 (Dhan↔Groww spot cross-broker comparator) — the
+    /// 15:47 IST run found ≥1 divergent OHLC cell (or a minute present in
+    /// only one feed) between our stored `spot_1m_rest` rows `feed='dhan'`
+    /// vs `feed='groww'` for the same (trading day, minute, canonical
+    /// index). Neither feed is ground truth — a divergence-TREND signal.
+    /// Severity::High; NOT auto-triage-safe (severity-independent override
+    /// — the operator judges which capture is wrong; the FUTIDX-02
+    /// precedent). Fires ONE coalesced emission per run, never per row.
+    SpotXverify01MismatchFound,
+    /// SPOT-XVERIFY-02 (Dhan↔Groww spot cross-broker comparator) — the
+    /// 15:47 IST run itself DEGRADED: the QuestDB `/exec` read failed, a
+    /// query truncated at its row cap, the response exceeded the body cap,
+    /// the DDL ensure failed, the forensic ILP write was rejected, or the
+    /// run budget elapsed. The day is stamped `no_data` / `blind` /
+    /// `degraded` — never a fabricated clean verdict (Rule 11).
+    /// Best-effort cold path: the live feeds, tick capture and trading are
+    /// NEVER affected; DEDUP-idempotent tables let a healthy re-run backfill.
+    /// Severity::High, auto-triage-safe (the degrade already happened —
+    /// the operator inspects; the next trading day re-runs).
+    SpotXverify02RunDegraded,
     /// SPOT1M-01 (per-minute REST pipeline PR-2, operator grant 2026-07-12)
     /// — the per-minute spot 1m REST fetch degraded: a whole minute failed
     /// for one/all of the 3 IDX_I spot indices (transport error, non-2xx,
@@ -900,6 +927,41 @@ pub enum ErrorCode {
     /// 2026-07-14 default (no CloudWatch filter). Severity::Medium,
     /// auto-triage-safe.
     FeedGap01EpisodeDegraded,
+    /// FOLD-01 (REST-era multi-TF candle derivation, operator directive
+    /// 2026-07-16) — a leg of the bar-fold candle writer DEGRADED: the boot
+    /// catch-up / dirty-day refold `/exec` query or parse failed
+    /// (`stage="catchup_query"` / `"catchup_parse"` — incl. the LIMIT
+    /// truncation tripwire and a segment-allowlist refusal), a sealed
+    /// bucket could not be handed to the seal-writer channel or a
+    /// confirmed-bar handoff was dropped (`stage="seal_send"`), or the
+    /// supervised fold task died and was respawned
+    /// (`stage="task_respawn"`). Every degrade is RE-DERIVABLE: the
+    /// `candles_*` DEDUP key (`ts, security_id, segment, feed`) makes the
+    /// dirty-day refold and the next boot's catch-up idempotent repairs —
+    /// no market data is lost (the `spot_1m_rest` source rows stand).
+    /// Cold path only; log-sink-only delivery (no CloudWatch filter — see
+    /// the runbook's delivery-boundary paragraph). Severity::High,
+    /// auto-triage-safe (the degrade already happened; catch-up/refold
+    /// self-heal — the operator inspects).
+    RestCandleFold01Degraded,
+    /// RAMSTORE-01 (RAM residency stores, operator directive 2026-07-16 —
+    /// PR-2 of the data-completeness build) — a leg of the RAM residency
+    /// machinery DEGRADED: the chain day-store boot rehydrate `/exec` query
+    /// or parse failed (`stage="rehydrate_query"` / `"rehydrate_parse"` /
+    /// `"rehydrate_truncated"` — the LIMIT tripwire), a published chain
+    /// snapshot exceeded the per-minute row cap and was truncated loudly
+    /// (`stage="chain_truncated"`), a stale older-day chain publish was
+    /// dropped (`stage="day_drop"`), a store install was refused
+    /// (`stage="install"`), or the supervised stats/rehydrate task died and
+    /// was respawned (`stage="task_respawn"`). Every degrade is
+    /// RE-DERIVABLE: QuestDB remains the durable truth (`candles_*` +
+    /// `option_chain_1m` DEDUP rows stand) and the next boot re-fills RAM
+    /// via PR-1's catch-up + the bounded chain rehydrate — no market data
+    /// is ever lost from a RAM degrade. Cold path only; log-sink-only
+    /// delivery (no CloudWatch filter — see the runbook's delivery-boundary
+    /// paragraph). Severity::High, auto-triage-safe (the degrade already
+    /// happened; rehydrate/live-fill self-heal — the operator inspects).
+    RamStore01Degraded,
 
     // -----------------------------------------------------------------------
     // 🔷 DHAN exit-order execution layer (Cluster B, 2026-07-14).
@@ -1127,6 +1189,50 @@ pub enum ErrorCode {
     /// FEED-SUPERVISOR-01 house pattern). Severity::High,
     /// auto-triage-safe.
     GrowwPush04SupervisorRespawned,
+
+    // -----------------------------------------------------------------------
+    // Cadence scheduler (operator cadence directive 2026-07-14, judge-locked
+    // design rev-8 — `crates/core/src/cadence/`; reshaped POST-CLOSE by the
+    // 2026-07-16 operator directive, cadence-error-codes.md §0b: the rev-8
+    // ":55 pre-close serialized" Dhan schedule is RETIRED). Dry-run
+    // decision-timing skeleton: per-minute post-close fetch cadence on BOTH
+    // lanes (Dhan all-7 burst primary / split fallback; Groww all-7 at T+0)
+    // with structural zero-429 gates, shape ladder, event-driven per-lane
+    // decisions. DEFAULT-OFF. See cadence-error-codes.md.
+    // -----------------------------------------------------------------------
+    /// CADENCE-01: a cadence lane DEGRADED this cycle — a non-Empty fetch
+    /// failure ended terminal after the retry budget
+    /// (`stage="fetch_failed"`), a 429 arrived despite the gates
+    /// (`stage="rate_limited"` — also a gate-bug signal), a spot returned
+    /// 200-empty (`stage="spot_empty"`, either lane), a chain returned
+    /// 200-empty (`stage="chain_empty"`, either lane), the Groww burst
+    /// fell back (`stage="groww_fallback"`), a lane borrowed the other
+    /// broker's data after its own path exhausted (`stage="cross_fill"`),
+    /// a spot resolved from the chain-embedded price
+    /// (`stage="chain_embedded_spot"`), moneyness classified Unknown
+    /// (`stage="moneyness_unknown"`), or the failure ladder exhausted its
+    /// floor (`stage="ladder_exhausted"`, edge-latched per episode). ONE
+    /// coalesced emission per (lane, cycle), never per-request.
+    /// Severity::High, auto-triage-safe (the next cycle re-attempts; the
+    /// ladder + cross-fill are the self-corrections).
+    Cadence01LaneDegraded,
+    /// CADENCE-02: a cadence lane's decision was HONEST-SKIPPED — the lane
+    /// was incomplete at its cutoff (`stage="cutoff"`), both brokers were
+    /// dead (`stage="both_sources_dead"`), or every underlying classified
+    /// Unknown (`stage="all_unknown"`). Exactly one per (lane, cycle);
+    /// never a late decision, never a decision on missing/stale data.
+    /// Severity::High, auto-triage-safe (the skip IS the fail-closed
+    /// action; the operator inspects the stage at leisure).
+    Cadence02DecisionSkipped,
+    /// CADENCE-03: the cadence scheduler itself DEGRADED — the failure
+    /// ladder shifted a rung (`stage="ladder_shift"`), a wake landed late
+    /// past a slot (`stage="late_wake"`), one or more minute boundaries
+    /// were skipped (`stage="boundary_skipped"`), a clock skew was clamped
+    /// (`stage="skew_clamped"`), the supervised runner respawned
+    /// (`stage="respawn"`), or a gate deferred a NOMINAL slot
+    /// (`stage="gate_deferred_nominal"` — a should-never scheduling-math
+    /// signal). Severity::Medium, auto-triage-safe.
+    Cadence03SchedulerDegraded,
 }
 
 impl ErrorCode {
@@ -1235,6 +1341,8 @@ impl ErrorCode {
             Self::Data812InvalidDateFormat => "DATA-812",
             Self::Data813InvalidSecurityId => "DATA-813",
             Self::Data814InvalidRequest => "DATA-814",
+            // Cluster F (2026-07-14) — order-readiness gate
+            Self::OrderReady01GateRefused => "ORDER-READY-01",
             // Wave 5 Item 13 — prev-close routing
             Self::PrevClose03BootRoutingAssertion => "PREVCLOSE-03",
             // F2 (Wave-5 #504e follow-up) — PrevDayCache boot loader
@@ -1291,6 +1399,9 @@ impl ErrorCode {
             // BruteX↔TickVault daily cross-verify (2026-07-12)
             Self::BrutexXverify01DivergenceFound => "BRUTEX-XVERIFY-01",
             Self::BrutexXverify02RunDegraded => "BRUTEX-XVERIFY-02",
+            // Dhan↔Groww spot cross-broker comparator
+            Self::SpotXverify01MismatchFound => "SPOT-XVERIFY-01",
+            Self::SpotXverify02RunDegraded => "SPOT-XVERIFY-02",
             // Per-minute spot 1m REST pipeline (operator grant 2026-07-12)
             Self::Spot1m01FetchDegraded => "SPOT1M-01",
             Self::Spot1m02PersistFailed => "SPOT1M-02",
@@ -1304,6 +1415,10 @@ impl ErrorCode {
             Self::TfVerify02RunDegraded => "TF-VERIFY-02",
             // Feed gap-episode forensics (Groww hardening PR-3, 2026-07-14)
             Self::FeedGap01EpisodeDegraded => "FEED-GAP-01",
+            // REST-era multi-TF candle derivation (operator 2026-07-16)
+            Self::RestCandleFold01Degraded => "FOLD-01",
+            // RAM residency stores (operator 2026-07-16, PR-2)
+            Self::RamStore01Degraded => "RAMSTORE-01",
             Self::ExitOrder01ExecutionDegraded => "EXIT-ORDER-01",
             Self::ExitVerify01Degraded => "EXIT-VERIFY-01",
             // Groww Portfolio area contract stubs (§39.3, 2026-07-14)
@@ -1340,6 +1455,10 @@ impl ErrorCode {
             Self::GrowwPush02AuthFailed => "GROWW-PUSH-02",
             Self::GrowwPush03DecodeFailed => "GROWW-PUSH-03",
             Self::GrowwPush04SupervisorRespawned => "GROWW-PUSH-04",
+            // Cadence scheduler (operator directive 2026-07-14)
+            Self::Cadence01LaneDegraded => "CADENCE-01",
+            Self::Cadence02DecisionSkipped => "CADENCE-02",
+            Self::Cadence03SchedulerDegraded => "CADENCE-03",
         }
     }
 
@@ -1404,6 +1523,11 @@ impl ErrorCode {
             | Self::RiskGapPositionPnl
             | Self::InstrumentP0ExpiryAtGate4
             | Self::Data807TokenExpired
+            // ORDER-READY-01 (2026-07-14): High, not Critical — the refusal IS
+            // the protection (no live order is sent), the path is unreachable
+            // today (dry_run hardcoded true), and it self-heals on the next OK
+            // profile probe. Same class as WS-GAP-10 / DHAN-LANE-03.
+            | Self::OrderReady01GateRefused
             | Self::Boot01QuestDbSlow
             | Self::Volume01MonotonicityBreach
             | Self::AggregatorLate01
@@ -1494,6 +1618,12 @@ impl ErrorCode {
             Self::BrutexXverify01DivergenceFound | Self::BrutexXverify02RunDegraded => {
                 Severity::High
             }
+            // SPOT-XVERIFY-01/02 (Dhan↔Groww spot cross-broker comparator)
+            // — divergence found / run degraded. Loud (Telegram High),
+            // never a halt; both live feeds + tick capture are unaffected.
+            Self::SpotXverify01MismatchFound | Self::SpotXverify02RunDegraded => {
+                Severity::High
+            }
             // TF-VERIFY-01/02 (operator 2026-07-13) — the daily
             // timeframe-consistency verifier found a TF-vs-1m divergence /
             // ran degraded. High: operator eyes required on every occurrence
@@ -1501,6 +1631,21 @@ impl ErrorCode {
             // run could not vouch for it); never a halt — the live candle
             // pipeline is untouched and reruns are DEDUP-idempotent.
             Self::TfVerify01MismatchFound | Self::TfVerify02RunDegraded => Severity::High,
+            // FOLD-01 (REST-era candle derivation, operator 2026-07-16) —
+            // a fold leg degraded (catch-up query/parse, seal handoff, task
+            // respawn). High: operator eyes required — a silent fold degrade
+            // would starve the candles_* tables the operator demanded; never
+            // a halt (cold path; refold/catch-up are DEDUP-idempotent
+            // repairs and spot_1m_rest source rows stand). LOG-SINK-ONLY.
+            Self::RestCandleFold01Degraded => Severity::High,
+            // RAMSTORE-01 (RAM residency stores, operator 2026-07-16 PR-2)
+            // — a RAM-store leg degraded (chain rehydrate query/parse,
+            // row-cap truncation, stale-day drop, task respawn). High:
+            // operator eyes required — a silently-thin RAM store would
+            // undermine the operator's "believe it is in RAM" demand; never
+            // a halt (cold path; QuestDB stays the durable truth and the
+            // next boot re-fills). LOG-SINK-ONLY.
+            Self::RamStore01Degraded => Severity::High,
             // EXIT-ORDER-01 / EXIT-VERIFY-01 (Cluster B, 2026-07-14) — the
             // exit-order layer degraded / the MPP verify ladder exhausted
             // without a clean fill. High: operator eyes on every occurrence
@@ -1533,6 +1678,13 @@ impl ErrorCode {
             | Self::GrowwMarg02PersistFailed
             | Self::GrowwMarg03SnapshotStaleGateClosed
             | Self::GrowwMarg04EntryRejectedInsufficient => Severity::High,
+            // CADENCE-01/02 (operator 2026-07-14) — a cadence lane degraded
+            // this cycle / a lane decision was honest-skipped. High:
+            // operator eyes on every occurrence (a skip means no decision
+            // input for the minute; a degrade means a broker leg is
+            // failing); never a halt — the record-capture legs and tick
+            // capture are untouched, the next cycle re-attempts.
+            Self::Cadence01LaneDegraded | Self::Cadence02DecisionSkipped => Severity::High,
             // Medium: data pipeline correctness
             // PR #6b (2026-05-19): I-P0-01/02/04/05 retired with their modules.
             Self::InstrumentP1CrossSegmentCollision
@@ -1626,6 +1778,11 @@ impl ErrorCode {
             Self::GrowwOrd05RateLimited
             | Self::GrowwOrd07UnknownStatus
             | Self::GrowwOrd08AuditWriteFailed => Severity::Medium,
+            // CADENCE-03 (operator 2026-07-14): the cadence scheduler
+            // degraded (ladder shift / late wake / boundary skip / respawn)
+            // — self-correcting scheduling telemetry, never data loss;
+            // the lane-level consequences page via CADENCE-01/02. Medium.
+            Self::Cadence03SchedulerDegraded => Severity::Medium,
             // Low: trading-day / Dhan other
             // PR #6a (2026-05-19): I-P1-01 (DailyScheduler) + I-P1-02 (DeltaFieldCoverage) retired
             Self::InstrumentP2TradingDayGuard
@@ -1739,6 +1896,9 @@ impl ErrorCode {
             | Self::Data812InvalidDateFormat
             | Self::Data813InvalidSecurityId
             | Self::Data814InvalidRequest => ".claude/rules/dhan/annexure-enums.md",
+            Self::OrderReady01GateRefused => {
+                ".claude/rules/project/order-readiness-error-codes.md"
+            }
             Self::PrevClose03BootRoutingAssertion
             | Self::Volume01MonotonicityBreach => ".claude/rules/project/wave-5-error-codes.md",
             Self::AggregatorDrop01
@@ -1820,6 +1980,10 @@ impl ErrorCode {
             Self::BrutexXverify01DivergenceFound | Self::BrutexXverify02RunDegraded => {
                 ".claude/rules/project/brutex-crossverify-error-codes.md"
             }
+            // Dhan↔Groww spot cross-broker comparator
+            Self::SpotXverify01MismatchFound | Self::SpotXverify02RunDegraded => {
+                ".claude/rules/project/spot-crossverify-error-codes.md"
+            }
             // Per-minute spot 1m REST pipeline (operator grant 2026-07-12)
             Self::Spot1m01FetchDegraded | Self::Spot1m02PersistFailed => {
                 ".claude/rules/project/rest-1m-pipeline-error-codes.md"
@@ -1840,6 +2004,12 @@ impl ErrorCode {
             Self::FeedGap01EpisodeDegraded => {
                 ".claude/rules/project/feed-gap-error-codes.md"
             }
+            // REST-era multi-TF candle derivation (operator 2026-07-16)
+            Self::RestCandleFold01Degraded => {
+                ".claude/rules/project/rest-candle-fold-error-codes.md"
+            }
+            // RAM residency stores (operator 2026-07-16, PR-2)
+            Self::RamStore01Degraded => ".claude/rules/project/ram-store-error-codes.md",
             // 🔷 DHAN exit-order execution layer (Cluster B, 2026-07-14)
             Self::ExitOrder01ExecutionDegraded | Self::ExitVerify01Degraded => {
                 ".claude/rules/project/dhan-exit-order-lockout-2026-07-14.md"
@@ -1890,6 +2060,12 @@ impl ErrorCode {
             | Self::GrowwPush04SupervisorRespawned => {
                 ".claude/rules/project/groww-order-push-error-codes.md"
             }
+            // Cadence scheduler (operator directive 2026-07-14)
+            Self::Cadence01LaneDegraded
+            | Self::Cadence02DecisionSkipped
+            | Self::Cadence03SchedulerDegraded => {
+                ".claude/rules/project/cadence-error-codes.md"
+            }
         }
     }
 
@@ -1929,6 +2105,11 @@ impl ErrorCode {
             Self::Futidx02CrossFeedExpiryMismatch
                 | Self::WalSuspend01TableSuspended
                 | Self::BrutexXverify01DivergenceFound
+                // SPOT-XVERIFY-01 (Dhan↔Groww spot cross-broker
+                // comparator): a cross-broker OHLC divergence is a
+                // data-comparability VERDICT — the operator judges which
+                // capture is wrong; the FUTIDX-02 precedent.
+                | Self::SpotXverify01MismatchFound
                 // CHAIN-01 (PR-3, 2026-07-12): restoring the option-chain
                 // Data-API entitlement is an operator/broker ACCOUNT
                 // decision — never auto-actioned despite High severity.
@@ -1940,6 +2121,11 @@ impl ErrorCode {
                 // would re-stamp rows and could mask the evidence (the
                 // Futidx02 precedent).
                 | Self::TfVerify01MismatchFound
+                // ORDER-READY-01 (Cluster F, 2026-07-14): restoring
+                // dataPlan/segment/token is an operator/broker ACCOUNT decision
+                // (CHAIN-01 precedent); no auto-triage action may ever touch the
+                // ORDER path, so this is severity-independently operator-only.
+                | Self::OrderReady01GateRefused
                 // GROWW-PORT-03 (§39.3, 2026-07-14): NO — severity-independent
                 // override arm (FUTIDX-02 precedent: data-comparability
                 // divergence is never auto-actioned). The operator judges
@@ -2025,6 +2211,7 @@ impl ErrorCode {
             Self::Data812InvalidDateFormat,
             Self::Data813InvalidSecurityId,
             Self::Data814InvalidRequest,
+            Self::OrderReady01GateRefused,
             Self::HotPath01SyncFsFailed,
             Self::HotPath02WriterQueueDrop,
             // PR #5 (2026-05-19): Phase201DispatchFailed + Phase202EmitGuardDropped retired.
@@ -2115,6 +2302,9 @@ impl ErrorCode {
             // BruteX↔TickVault daily cross-verify (2026-07-12)
             Self::BrutexXverify01DivergenceFound,
             Self::BrutexXverify02RunDegraded,
+            // Dhan↔Groww spot cross-broker comparator
+            Self::SpotXverify01MismatchFound,
+            Self::SpotXverify02RunDegraded,
             // Per-minute spot 1m REST pipeline (operator grant 2026-07-12)
             Self::Spot1m01FetchDegraded,
             Self::Spot1m02PersistFailed,
@@ -2128,6 +2318,10 @@ impl ErrorCode {
             Self::TfVerify02RunDegraded,
             // Feed gap-episode forensics (Groww hardening PR-3, 2026-07-14)
             Self::FeedGap01EpisodeDegraded,
+            // REST-era multi-TF candle derivation (operator 2026-07-16)
+            Self::RestCandleFold01Degraded,
+            // RAM residency stores (operator 2026-07-16, PR-2)
+            Self::RamStore01Degraded,
             // 🔷 DHAN exit-order execution layer (Cluster B, 2026-07-14)
             Self::ExitOrder01ExecutionDegraded,
             Self::ExitVerify01Degraded,
@@ -2165,6 +2359,10 @@ impl ErrorCode {
             Self::GrowwPush02AuthFailed,
             Self::GrowwPush03DecodeFailed,
             Self::GrowwPush04SupervisorRespawned,
+            // Cadence scheduler (operator directive 2026-07-14)
+            Self::Cadence01LaneDegraded,
+            Self::Cadence02DecisionSkipped,
+            Self::Cadence03SchedulerDegraded,
         ]
     }
 }
@@ -2528,52 +2726,36 @@ mod tests {
         // recomputed-from-1m value — coalesced per (feed, date) pass,
         // manual triage) + TF-VERIFY-02 (the daily run degraded —
         // client/query/truncation/flush/budget stage taxonomy) => 148.
-        // 2026-07-14 (Groww hardening PR-3): FEED-GAP-01 (gap-episode
-        // forensics degraded — annotation-only side record) => 149.
-        // 2026-07-14 (🔷 DHAN exit-order layer, Cluster B WP1): bumped
-        // 149 -> 151 for EXIT-ORDER-01 (exit engine call degraded —
-        // validation refusal / Dhan API error / post-fill ENTRY_LEG cancel
-        // refused / slicing anomaly) + EXIT-VERIFY-01 (MPP verify ladder
-        // exhausted with PendingAtLimit / partial-at-budget / Unknown —
-        // fail-closed, never assumed filled). Both log-sink-only.
-        // 2026-07-15 (C4 sweep — Dhan live-WS retirement, operator
-        // 2026-07-13): DROPPED 151 -> 129. The 22 zero-emit-site variants
-        // retained through Phases A/B/C1/C2/C3 were deleted:
-        // INSTR-FETCH-01..04, NTM-CONSTITUENCY-01, PREVDAY-01,
-        // CROSS-VERIFY-1M-01/-02, DHAN-LANE-01..04, WS-GAP-05..09,
-        // AUTH-GAP-06, REST-CANARY-01, SLO-01/02/03 (WS-GAP-04 +
-        // WS-GAP-10 survive — emitted by the retained-dormant
-        // order_update_connection.rs; main's FEED-GAP-01 landed
-        // mid-flight making the pre-merge base 149, and the exit-order
-        // pair #1566 landed during the merge train making it 151 —
-        // hence 151 -> 129, not 148 -> 126).
-        // 2026-07-15 (Groww order fan-out contract stubs): bumped
-        // 129 -> 143. Groww Portfolio 6c.1 contract stubs (§39.3,
-        // 2026-07-14): +4 for GROWW-PORT-01 (snapshot fetch degraded) +
-        // GROWW-PORT-02 (persist failed, best-effort) + GROWW-PORT-03
-        // (recon residual confirmed — manual triage, FUTIDX-02 precedent)
-        // + GROWW-PORT-04 (foreign position — never auto-exited). Plus
-        // +5 GROWW-OCO-01..05 (smart-order placement/sibling-cancel-
-        // unverified/reconcile/modify/poller). All log-sink-only contract
-        // stubs; zero emit sites until the area code PRs land.
-        // 2026-07-15 (Groww margin area, §39.3 slot #4): GROWW-MARG-01..05
-        // (fetch degrade / audit persist / stale-gate-closed /
-        // entry-rejected [manual triage override] / calc divergence) => +5.
-        // 2026-07-15 (Groww orders shared contracts PR-A0, rebased onto
-        // the C4-sweep base of 129): bumped 129 -> 139 for
-        // GROWW-ORD-01..10 (mutation-rejected / ambiguous-outcome /
-        // ambiguity-unresolved [Critical] / reconcile-mismatch [High,
-        // manual triage] / rate-limited / ledger-write-failed /
-        // unknown-status / audit-write-failed / quantity-refused /
-        // auth-stale) — all log-sink-only.
         // 2026-07-15 (merge of #1587 fan-out stubs + main's #1578
         // GROWW-ORD contracts): both families coexist — 129 base + 14
         // (PORT/OCO/MARG) + 10 (ORD) = 153, mechanically recounted.
-        // 2026-07-16 (Groww order-push Stage A): bumped 153 -> 157 for
-        // GROWW-PUSH-01..04 (connect-failed / auth-failed / decode-failed
-        // / supervisor-respawned) — receive-only push-channel
-        // observability, all log-sink-only.
-        assert_eq!(ErrorCode::all().len(), 157);
+        // 2026-07-14 (Cluster F, merged 2026-07-16): ORDER-READY-01
+        // (order-readiness gate) => 154.
+        // 2026-07-16 (REST-era candle derivation, operator directive):
+        // +1 FOLD-01 (RestCandleFold01Degraded — bar-fold writer degrade;
+        // log-sink-only, High, auto-triage-safe) => 155 (both 153->154
+        // bumps — Cluster F + FOLD-01 — landed concurrently; mechanically
+        // recounted at this merge).
+        // 2026-07-16 (RAM residency stores, PR-2 of the same directive):
+        // +1 RAMSTORE-01 (RamStore01Degraded — spot/chain RAM store
+        // degrade; log-sink-only, High, auto-triage-safe) => 156
+        // (mechanically recounted at this rebase onto main's 155).
+        // 2026-07-16 (merge of origin/main into cadence-scheduler-v2):
+        // + CADENCE-01/02/03 (cadence scheduler, operator directive
+        // 2026-07-14) on top of main's 155 => 158, mechanically recounted
+        // against the merged all() vec at this merge.
+        // 2026-07-16 merge note: RAMSTORE-01 (this branch, 156) + main's
+        // CADENCE-01/02/03 (158) coexist — 155 base + 1 + 3 = 159,
+        // mechanically recounted against the merged all() vec.
+        // 2026-07-17 (spot cross-broker comparator): +2 SPOT-XVERIFY-01/02
+        // (SpotXverify01MismatchFound + SpotXverify02RunDegraded) => 161.
+        // 2026-07-17 merge note (merge of origin/main into
+        // order-sockets-v2): this branch's GROWW-PUSH-01..04 (4 —
+        // connect-failed / auth-failed / decode-failed /
+        // supervisor-respawned, receive-only push-channel observability,
+        // all log-sink-only) + main's 161 coexist — 161 + 4 = 165,
+        // mechanically recounted against the merged all() vec.
+        assert_eq!(ErrorCode::all().len(), 165);
     }
 
     #[test]
@@ -2617,6 +2799,39 @@ mod tests {
             "GROWW-SCALE-05 runbook missing on disk: {shown}"
         );
         assert!(ErrorCode::all().contains(&code));
+    }
+
+    #[test]
+    fn test_cadence_codes_contract() {
+        // Cadence scheduler (operator directive 2026-07-14, judge-locked
+        // design rev-8): 3 variants, rich stage taxonomy per the house
+        // SPOT1M-01/CHAIN-02 pattern.
+        let c1 = ErrorCode::Cadence01LaneDegraded;
+        assert_eq!(c1.code_str(), "CADENCE-01");
+        assert_eq!("CADENCE-01".parse::<ErrorCode>(), Ok(c1));
+        assert_eq!(c1.severity(), Severity::High);
+        // The ladder + cross-fill are the self-corrections — auto-triage
+        // may inspect.
+        assert!(c1.is_auto_triage_safe());
+
+        let c2 = ErrorCode::Cadence02DecisionSkipped;
+        assert_eq!(c2.code_str(), "CADENCE-02");
+        assert_eq!("CADENCE-02".parse::<ErrorCode>(), Ok(c2));
+        assert_eq!(c2.severity(), Severity::High);
+        // The skip IS the fail-closed action (design §0 ErrorCodes ruling).
+        assert!(c2.is_auto_triage_safe());
+
+        let c3 = ErrorCode::Cadence03SchedulerDegraded;
+        assert_eq!(c3.code_str(), "CADENCE-03");
+        assert_eq!("CADENCE-03".parse::<ErrorCode>(), Ok(c3));
+        assert_eq!(c3.severity(), Severity::Medium);
+        assert!(c3.is_auto_triage_safe());
+        for code in [c1, c2, c3] {
+            assert_eq!(
+                code.runbook_path(),
+                ".claude/rules/project/cadence-error-codes.md"
+            );
+        }
     }
 
     #[test]
@@ -2964,6 +3179,23 @@ mod tests {
     }
 
     #[test]
+    fn test_order_ready_01_contract() {
+        let c = ErrorCode::OrderReady01GateRefused;
+        assert_eq!(c.code_str(), "ORDER-READY-01");
+        assert_eq!("ORDER-READY-01".parse::<ErrorCode>(), Ok(c));
+        assert_eq!(c.severity(), Severity::High);
+        assert!(
+            !c.is_auto_triage_safe(),
+            "operator-only: account/order-path decision"
+        );
+        assert_eq!(
+            c.runbook_path(),
+            ".claude/rules/project/order-readiness-error-codes.md"
+        );
+        assert!(ErrorCode::all().contains(&c));
+    }
+
+    #[test]
     fn test_ws_reinject_01_aborted_contract() {
         let code = ErrorCode::WsReinject01Aborted;
         // Wire-format string + roundtrip via FromStr.
@@ -3005,6 +3237,8 @@ mod tests {
                 || s.starts_with("STORAGE-GAP-")
                 || s.starts_with("DH-")
                 || s.starts_with("DATA-")
+                // Cluster F (2026-07-14): order-readiness gate
+                || s.starts_with("ORDER-READY-")
                 // Wave 1 (PR #393): hot-path / phase2 / prev-close / movers prefixes
                 || s.starts_with("HOT-PATH-")
                 || s.starts_with("PHASE2-")
@@ -3049,6 +3283,10 @@ mod tests {
                 || s.starts_with("WS-REINJECT-")
                 // Operator 2026-06-10: daily end-to-end tick-conservation audit
                 || s.starts_with("TICK-CONSERVE-")
+                // Operator 2026-07-16: REST-era multi-TF candle derivation
+                || s.starts_with("FOLD-")
+                // Operator 2026-07-16 (PR-2): RAM residency stores
+                || s.starts_with("RAMSTORE-")
                 // C4 sweep (2026-07-15): the SLO- / REST-CANARY- /
                 // INSTR-FETCH- / CROSS-VERIFY-1M- / NTM-CONSTITUENCY- /
                 // PREVDAY- / DHAN-LANE- family prefixes were REMOVED from
@@ -3077,6 +3315,8 @@ mod tests {
                 || s.starts_with("SCOREBOARD-")
                 // BruteX↔TickVault daily cross-verify (2026-07-12).
                 || s.starts_with("BRUTEX-XVERIFY-")
+                // Dhan↔Groww spot cross-broker comparator (2026-07-17).
+                || s.starts_with("SPOT-XVERIFY-")
                 // Per-minute spot 1m REST pipeline (operator grant 2026-07-12).
                 || s.starts_with("SPOT1M-")
                 // Per-minute option-chain REST pipeline (PR-3, 2026-07-12).
@@ -3101,7 +3341,9 @@ mod tests {
                 // NATIVE- are enumerated separately) — this arm is required.
                 || s.starts_with("GROWW-ORD-")
                 // Groww order/position push channel (Stage A, 2026-07-16).
-                || s.starts_with("GROWW-PUSH-");
+                || s.starts_with("GROWW-PUSH-")
+                // Operator 2026-07-14: broker-agnostic fetch-cadence scheduler
+                || s.starts_with("CADENCE-");
             assert!(has_known_prefix, "unexpected code prefix: {s}");
         }
     }

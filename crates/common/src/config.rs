@@ -8,8 +8,9 @@ use chrono::NaiveTime;
 use serde::Deserialize;
 
 use crate::constants::{
-    DHAN_DATA_API_DEFAULT_TARGET_RPS, DHAN_DATA_API_RPS_CEILING, DHAN_DATA_API_RPS_FLOOR,
-    SEBI_MAX_ORDERS_PER_SECOND,
+    CADENCE_CHAIN_MIN_SPACING_FLOOR_MS, CADENCE_GROWW_WAVE_STEP_MS,
+    CADENCE_SPOT_WINDOW_CAP_CEILING, CADENCE_SPOT_WINDOW_MS, DHAN_DATA_API_DEFAULT_TARGET_RPS,
+    DHAN_DATA_API_RPS_CEILING, DHAN_DATA_API_RPS_FLOOR, SEBI_MAX_ORDERS_PER_SECOND,
 };
 use crate::trading_calendar::TradingCalendar;
 
@@ -159,6 +160,36 @@ pub struct ApplicationConfig {
     /// Absent section ⇒ DISABLED (fail-safe default off).
     #[serde(default)]
     pub tf_consistency: TfConsistencyConfig,
+    /// `[spot_crossverify]` — daily 15:47 IST Dhan↔Groww `spot_1m_rest`
+    /// cross-broker OHLC comparator (operator 2026-07-17). Compares stored
+    /// `feed='dhan'` vs `feed='groww'` IDX_I rows minute-by-minute; findings
+    /// land in `spot_crossverify_cell_audit` + `spot_crossverify_daily` + one
+    /// Telegram summary. Cold path only. Absent section ⇒ DISABLED.
+    #[serde(default)]
+    pub spot_crossverify: SpotCrossverifyConfig,
+    /// `[rest_candle_fold]` — REST-era multi-TF candle derivation (operator
+    /// directive 2026-07-16: *"why the fuck remaining candles 1m till 1day
+    /// is not yet generated and populated — resolve these"*). Folds
+    /// persist-confirmed `spot_1m_rest` 1m bars into all 21 `candles_*`
+    /// timeframes via the shared seal-writer channel, with a boot catch-up
+    /// over the last `catchup_days` of stored bars. Cold path only. Absent
+    /// section ⇒ DISABLED (fail-safe default off); `config/base.toml` opts
+    /// in.
+    #[serde(default)]
+    pub rest_candle_fold: RestCandleFoldConfig,
+    /// `[market_ram_store]` — RAM residency stores (operator directive
+    /// 2026-07-16: *"how can i believe you that you have all these already
+    /// available in our in-memory app RAM — especially for the current day
+    /// and even in the future last one month data should be entirely in
+    /// memory app RAM"*): the month-deep spot bar rings (fed by the
+    /// rest_candle_fold emit path — zero new QuestDB reads) + the
+    /// current-day chain minute ring (fed by the chain legs' publish path,
+    /// rehydrated at boot from `option_chain_1m`). Cold path only. Absent
+    /// section ⇒ DISABLED (fail-safe default off); `config/base.toml` opts
+    /// in. RAMSTORE-01 runbook:
+    /// `.claude/rules/project/ram-store-error-codes.md`.
+    #[serde(default)]
+    pub market_ram_store: MarketRamStoreConfig,
     /// `[groww_contract_1m]` — Groww per-minute PER-CONTRACT 1m candle REST
     /// leg (operator grant 2026-07-13,
     /// `.claude/plans/active-plan-groww-rest-1m.md` PR-4 — the fill-model
@@ -173,6 +204,39 @@ pub struct ApplicationConfig {
     /// section ⇒ DISABLED (fail-safe default off).
     #[serde(default)]
     pub groww_contract_1m: GrowwContract1mConfig,
+    /// `[order_runtime]` — the dry-run ORDER RUNTIME (cluster A, operator
+    /// directive 2026-07-14 — `.claude/plans/active-plan-order-runtime-dryrun.md`):
+    /// one supervised single-owner task owning OMS (dry_run hard-true) +
+    /// RiskEngine, spawned ONLY from the dhan_rest_stack (dhan-OFF arm),
+    /// consuming order-update events + Groww marks, with the next-mark paper
+    /// filler, the local reconcile invariant, and the once-daily paper
+    /// self-test. Absent section ⇒ DISABLED — byte-identical dormant boot
+    /// (discard drain, no WAL capture). `config/base.toml` opts in.
+    #[serde(default)]
+    pub order_runtime: OrderRuntimeConfig,
+    /// `[dhan_order_push]` — 🔷 DHAN order-update WS paper-mode push channel
+    /// (operator directive 2026-07-16, governance on PR #1597 —
+    /// `.claude/plans/active-plan-dhan-order-update-rewire.md`): when
+    /// enabled, the dhan_rest_stack re-wires the dormant order-update WS
+    /// module RECEIVE-ONLY (notifier `None` per the Dhan noise lock) and a
+    /// supervised consumer records each order event as an `order_audit` row
+    /// `feed='dhan'`/`mode='paper'`. No live orders; `dry_run` untouched.
+    /// Absent section ⇒ DISABLED (fail-safe default off).
+    #[serde(default)]
+    pub dhan_order_push: DhanOrderPushConfig,
+    /// `[groww_rest_burst]` — the 2026-07-14 Groww REST burst auto-ladder
+    /// (operator approval "approved and go ahead with the recommendation";
+    /// `no-rest-except-live-feed-2026-06-27.md` §9.7): which burst tier the
+    /// per-minute Groww REST legs fire in (`two_wave` default /
+    /// `seven_concurrent` probe-gated) + the pre-boundary TLS warm-up
+    /// toggle. Absent section ⇒ `two_wave` + warm-up off — rate-safe
+    /// because the wave instants are computed from the millisecond clock
+    /// (`wave_sleep_from_now_ms`), so the > 1 s two_wave separation holds
+    /// with or without the warm-up recompute (LOW-1 wording fix
+    /// 2026-07-14; the pre-CRITICAL-1 whole-second else-branch could
+    /// collapse it).
+    #[serde(default)]
+    pub groww_rest_burst: GrowwRestBurstConfig,
     /// `[groww_universe]` — process-global daily Groww watch-set +
     /// shared-master rider (2026-07-15 Groww live-feed retirement re-home of
     /// the activation watcher's daily build loop): once per IST day, build +
@@ -210,6 +274,84 @@ pub struct ApplicationConfig {
     /// behavior only (the engine's hardcoded `dry_run` blocks live POSTs).
     #[serde(default)]
     pub exit_orders: ExitOrdersConfig,
+    /// `[cadence]` — broker-agnostic fetch-cadence + decision-timing
+    /// scheduler (operator cadence directive 2026-07-14, reshaped by the
+    /// 2026-07-16 post-close burst directive — `crates/core/src/cadence/`;
+    /// supersedes the rev-8 pre-close schedule — 2026-07-16). Dry-run
+    /// decision-timing skeleton: per minute close T, BOTH lanes fire
+    /// POST-CLOSE — primary (rung 0) = ALL 7 requests concurrent in the
+    /// burst second (3 chains + 4 spots; Dhan at T +
+    /// `dhan_burst_offset_ms`, Groww at T+0); fallback (rung 1) = chains
+    /// in second 1, all 4 spots in second 2. Demotion is
+    /// RateLimited-ONLY after 2 consecutive dirty cycles (operator
+    /// Correction 2); structural zero-429 gates + event-driven per-lane
+    /// decisions throughout. This PR ships NO REST caller — the dry-run
+    /// executors log fires and return Empty. Absent section ⇒ DISABLED
+    /// (fail-safe default off).
+    #[serde(default)]
+    pub cadence: CadenceConfig,
+}
+
+/// `[order_runtime]` — dry-run order-runtime configuration (2026-07-14).
+///
+/// Fail-safe shape: every field `#[serde(default)]`-driven; an absent
+/// section (or a TOML written before this PR) keeps the current dormant
+/// boot byte-identical.
+#[derive(Debug, Clone, Deserialize)]
+pub struct OrderRuntimeConfig {
+    /// Master switch. Default OFF (fail-safe) — `config/base.toml` turns it
+    /// on explicitly so the machinery RUNS in prod.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Next-mark paper filler (effective only while the OMS is dry-run —
+    /// a pending `PAPER-n` order fills at the next Groww mark for its sid).
+    #[serde(default = "default_order_runtime_paper_fill")]
+    pub paper_fill: bool,
+    /// Once-daily gated end-to-end paper self-test (place → fill → P&L →
+    /// close → flat), [09:20, 15:00) IST trading days, latched once per day.
+    #[serde(default = "default_order_runtime_self_test")]
+    pub self_test: bool,
+    /// Reconcile scheduler cadence (seconds). Dry-run cycles are HONEST
+    /// heartbeats ("broker reconcile SKIPPED") + the local Σfills==net_lots
+    /// invariant check. Validation floor: ≥ 60.
+    #[serde(default = "default_order_runtime_reconcile_interval_secs")]
+    pub reconcile_interval_secs: u64,
+    /// Bounded mark-forward channel capacity (the Groww per-minute REST
+    /// legs → runtime; re-homed 2026-07-16 after #1581).
+    /// Validation range: [256, 65536].
+    #[serde(default = "default_order_runtime_mark_channel_capacity")]
+    pub mark_channel_capacity: usize,
+}
+
+fn default_order_runtime_paper_fill() -> bool {
+    true
+}
+
+fn default_order_runtime_self_test() -> bool {
+    true
+}
+
+fn default_order_runtime_reconcile_interval_secs() -> u64 {
+    300
+}
+
+fn default_order_runtime_mark_channel_capacity() -> usize {
+    8_192
+}
+
+impl Default for OrderRuntimeConfig {
+    /// Manual impl so `Default` matches the serde field defaults exactly
+    /// (the Spot1mRestConfig precedent — an empty `[order_runtime]` section
+    /// and an ABSENT section must deserialize identically).
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            paper_fill: default_order_runtime_paper_fill(),
+            self_test: default_order_runtime_self_test(),
+            reconcile_interval_secs: default_order_runtime_reconcile_interval_secs(),
+            mark_channel_capacity: default_order_runtime_mark_channel_capacity(),
+        }
+    }
 }
 
 /// `[feeds]` — pluggable market-data feed selection (operator lock
@@ -848,6 +990,612 @@ pub struct TfConsistencyConfig {
     pub enabled: bool,
 }
 
+/// `[spot_crossverify]` — daily Dhan↔Groww `spot_1m_rest` cross-broker OHLC
+/// comparator (operator 2026-07-17; SPOT-XVERIFY-01/02). An absent
+/// `[spot_crossverify]` section (or a TOML written before this PR) disables
+/// the comparator entirely (fail-safe); `config/base.toml` explicitly sets
+/// `enabled = true`.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct SpotCrossverifyConfig {
+    /// Master switch for the daily 15:47 IST spot cross-broker comparator.
+    /// Default OFF (fail-safe) — `config/base.toml` turns it on explicitly.
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+/// `[cadence]` — broker-agnostic fetch-cadence + decision-timing scheduler
+/// (operator cadence directive 2026-07-14, judge-locked design rev-8).
+/// Every timing below is a TARGET on the IST millis-of-day clock; the
+/// monotonic CAS gates in `crates/core/src/cadence/gate.rs` are the hard
+/// zero-429 floor. All defaults are the judge-locked operator numbers;
+/// the ones marked (Assumed) in the design await operator confirmation and
+/// are operator-flippable here without code changes.
+///
+/// Fail-safe shape: `enabled` is `#[serde(default)]` = `false` and every
+/// other field carries the judge-locked serde default, so an absent
+/// `[cadence]` section (or a TOML written before this PR) disables the
+/// scheduler entirely and deserializes the full locked cadence table.
+///
+/// Level-trigger note (verifier F8, dated 2026-07-15; hardened by
+/// CONC-NEW-1, hostile round 1 2026-07-15): the per-LANE enable flags
+/// the runner consults (the `/api/feeds` toggle atomics — NOT keys in
+/// this section) are snapshotted at cycle entry, RE-OBSERVED every ~5s
+/// wake chunk while the cycle is still PRISTINE (no fire dispatched —
+/// the day's first cycle is entered near IST midnight and waits hours
+/// for its anchor), and re-checked at every dispatch/completion
+/// instant. A disable therefore stops every not-yet-dispatched fire
+/// within one ~5s wake chunk; already-in-flight requests complete
+/// audit-only. An enable joins the CURRENT cycle when nothing has fired
+/// yet, else the next minute boundary. Stated plainly in
+/// `.claude/rules/project/cadence-error-codes.md` too.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CadenceConfig {
+    /// Master switch — DEFAULT OFF (fail-safe). Flipping the DEFAULT needs
+    /// a fresh dated operator quote.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Cadence DHAN lane gate — DEFAULT TRUE. Gates the cadence
+    /// scheduler's Dhan broker lane and is deliberately INDEPENDENT of
+    /// `feeds.dhan_enabled` (the RETIRED live-WS flag, false in prod):
+    /// the cadence lanes are REST pulls, not the live feed. Config +
+    /// restart to change; there is NO runtime toggle for it.
+    #[serde(default = "default_cadence_lane_enabled")]
+    pub dhan_lane: bool,
+    /// Cadence GROWW lane gate — DEFAULT TRUE. Same contract as
+    /// `dhan_lane`: independent of `feeds.groww_enabled` (the retired
+    /// live-WS flag); config + restart only, no runtime toggle.
+    #[serde(default = "default_cadence_lane_enabled")]
+    pub groww_lane: bool,
+    /// The Dhan BURST second offset from the minute-close instant T, ms
+    /// (operator directive 2026-07-16 — ALL fires are POST-close now).
+    /// Default 1000 (second 1): shape rung 0 fires ALL 7 requests here
+    /// concurrently (3 chains + 4 spots — the operator's same-day all-7
+    /// correction; the spots in the Data-API bucket, the chains in the
+    /// option-chain API's own per-key budget); rung 1 fires the 3
+    /// chains here and all 4 spots one window later. Validated > 0 and
+    /// feasible against the Dhan lane cutoff (the deepest spot bucket
+    /// must land inside it).
+    #[serde(default = "default_cadence_dhan_burst_offset_ms")]
+    pub dhan_burst_offset_ms: i64,
+    /// The Dhan spot ROLLING-1000ms-WINDOW gate cap (operator
+    /// spot-concurrency ladder addition 2026-07-15): at most this many
+    /// spot authorizations in ANY sliding 1000ms window. Default 4 (the
+    /// full step-0 per-second spot group); validated 1..=5 (the Dhan
+    /// Data-API hard cap is 5/sec). A cap below 4 structurally floors
+    /// the concurrency ladder's step so no SECOND BUCKET's spot count
+    /// exceeds the cap.
+    #[serde(default = "default_cadence_spot_window_cap")]
+    pub spot_window_cap: u32,
+    /// Adaptive-concurrency degrade threshold (Assumed — default 2,
+    /// flagged for operator confirm): the Dhan spot-concurrency ladder
+    /// AND the Groww fallback-shape ladder degrade ONE step only after
+    /// this many CONSECUTIVE rate-limited-dirty cycles ("continuous",
+    /// never a one-off 429).
+    #[serde(default = "default_cadence_concurrency_degrade_after_dirty_cycles")]
+    pub concurrency_degrade_after_dirty_cycles: u32,
+    /// Adaptive-concurrency recovery threshold (Assumed — default 3,
+    /// flagged for operator confirm): both ladders climb back UP one
+    /// step after this many consecutive fully-clean cycles at the
+    /// current step (never permanently stuck from a one-off 429).
+    #[serde(default = "default_cadence_concurrency_recover_after_clean_cycles")]
+    pub concurrency_recover_after_clean_cycles: u32,
+    /// Post-close clamp: a spot second-bucket base never lands earlier
+    /// than T + this, ms. Default 300 — the proven house
+    /// `SPOT_1M_REST_FIRE_DELAY_MS` post-close fire delay (structurally
+    /// inert at the default burst offset of 1000).
+    #[serde(default = "default_cadence_spot_min_post_close_ms")]
+    pub spot_min_post_close_ms: i64,
+    /// Maximum in-cycle retries per failed request (Assumed — default 1).
+    /// Retries fire ONLY through the gates and only when landing before
+    /// the lane cutoff. A RateLimited leg KEEPS its one bounded in-cycle
+    /// retry (through the gates, after the per-key spacing) — one of the
+    /// operator's "multiple attempts" before any shape demotion
+    /// (2026-07-16 Correction 2; supersedes the earlier "a RateLimited is
+    /// NEVER retried in-cycle" wording, which was the exact inverse).
+    #[serde(default = "default_cadence_in_cycle_retry_max")]
+    pub in_cycle_retry_max: u32,
+    /// Dhan lane staleness cutoff, ms after T (Assumed — default 15000:
+    /// the burst completes by ~T+2s, the chain retry grid by ~T+4s, and
+    /// the deepest spot spill + spot retries well inside :15). Past it ⇒
+    /// HONEST-SKIP + CADENCE-02, never a late decision.
+    #[serde(default = "default_cadence_dhan_lane_cutoff_ms")]
+    pub dhan_lane_cutoff_ms: i64,
+    /// Groww lane anchor offset from T, ms. Default 0 (T+0 post-close
+    /// burst).
+    #[serde(default)]
+    pub groww_anchor_offset_ms: i64,
+    /// Groww burst-failure verdict instant, ms after the burst anchor
+    /// (Assumed — default 800): a leg FAILED iff it completed Err by
+    /// here; every failed leg gets ONE sequential fallback refetch. A
+    /// leg still IN FLIGHT here is SKIPPED (F4, 2026-07-15 — never a
+    /// duplicate concurrent same-leg request); if its original request
+    /// later completes Err before the lane cutoff, its one fallback
+    /// attempt dispatches IMMEDIATELY at that completion (the L3
+    /// DEFERRED per-leg fallback, 2026-07-15).
+    #[serde(default = "default_cadence_groww_burst_timeout_ms")]
+    pub groww_burst_timeout_ms: i64,
+    /// Per-request bound on every individual Groww request incl. fallback
+    /// fetches, ms (Assumed — default 1500).
+    #[serde(default = "default_cadence_groww_request_timeout_ms")]
+    pub groww_request_timeout_ms: i64,
+    /// Groww lane staleness cutoff, ms after T (Assumed — default 6000:
+    /// admits the fallback path AND Dhan's ~T+4.5s completion cross-filling
+    /// a frozen Groww lane). Validated > `groww_burst_timeout_ms`.
+    #[serde(default = "default_cadence_groww_lane_cutoff_ms")]
+    pub groww_lane_cutoff_ms: i64,
+    /// Minimum spacing enforced by the per-(underlying, expiry) chain
+    /// gates, ms. Default 3000 (Dhan's 1-unique-request-per-3s rule —
+    /// per the 2026-07-16 operator directive it applies to the SAME
+    /// (underlying, expiry) key ONLY; different underlyings fire
+    /// concurrently and the retired GLOBAL chain gate is gone).
+    /// Validated ≥ 3000.
+    #[serde(default = "default_cadence_chain_min_spacing_ms")]
+    pub chain_min_spacing_ms: i64,
+    /// Pre-market expiry-resolution retry cadence, ms (operator spec
+    /// 2026-07-15): the boot phase re-attempts each unresolved
+    /// (broker, underlying) expiry-list fetch at this interval — from
+    /// scheduler start on a trading day until the SESSION END (15:30
+    /// IST), never giving up mid-day. Default 60_000. Validated > 0.
+    #[serde(default = "default_cadence_expiry_retry_interval_ms")]
+    pub expiry_retry_interval_ms: i64,
+    /// Pre-market expiry-resolution PAGE deadline, IST seconds-of-day
+    /// (operator spec 2026-07-15): past this instant each still-unresolved
+    /// (broker, underlying) fires ONE edge-latched CADENCE-01
+    /// `expiry_unresolved` page per episode while the background retry
+    /// continues at the same cadence. The deadline gates the PAGE, not
+    /// the attempts — a boot AFTER it (e.g. a 10:00 restart) still
+    /// resolves immediately on first success. Default 32_100 (08:55 IST).
+    /// Validated < 86_400.
+    #[serde(default = "default_cadence_expiry_deadline_secs_of_day_ist")]
+    pub expiry_deadline_secs_of_day_ist: u32,
+}
+
+/// Serde default for [`CadenceConfig::dhan_lane`] /
+/// [`CadenceConfig::groww_lane`] — both lanes ON when the scheduler is
+/// enabled (the lanes are independent of the retired live-WS feed flags).
+fn default_cadence_lane_enabled() -> bool {
+    true
+}
+
+/// Serde default for [`CadenceConfig::dhan_burst_offset_ms`] — second 1
+/// (the operator's 2026-07-16 "first second" burst).
+fn default_cadence_dhan_burst_offset_ms() -> i64 {
+    1_000
+}
+
+/// Serde default for [`CadenceConfig::spot_window_cap`] — 4 (the full
+/// step-0 simultaneous spot group, one under the Dhan 5/sec hard cap).
+fn default_cadence_spot_window_cap() -> u32 {
+    4
+}
+
+/// Serde default for [`CadenceConfig::concurrency_degrade_after_dirty_cycles`]
+/// — 2 (Assumed — flagged for operator confirm).
+fn default_cadence_concurrency_degrade_after_dirty_cycles() -> u32 {
+    2
+}
+
+/// Serde default for [`CadenceConfig::concurrency_recover_after_clean_cycles`]
+/// — 3 (Assumed — flagged for operator confirm).
+fn default_cadence_concurrency_recover_after_clean_cycles() -> u32 {
+    3
+}
+
+/// Serde default for [`CadenceConfig::spot_min_post_close_ms`] — the house
+/// 300ms post-close fire delay.
+fn default_cadence_spot_min_post_close_ms() -> i64 {
+    300
+}
+
+/// Serde default for [`CadenceConfig::in_cycle_retry_max`] — 1 (Assumed).
+fn default_cadence_in_cycle_retry_max() -> u32 {
+    1
+}
+
+/// Serde default for [`CadenceConfig::dhan_lane_cutoff_ms`] — 15s
+/// (Assumed).
+fn default_cadence_dhan_lane_cutoff_ms() -> i64 {
+    15_000
+}
+
+/// Serde default for [`CadenceConfig::groww_burst_timeout_ms`] — 800ms
+/// (Assumed).
+fn default_cadence_groww_burst_timeout_ms() -> i64 {
+    800
+}
+
+/// Serde default for [`CadenceConfig::groww_request_timeout_ms`] — 1500ms
+/// (Assumed).
+fn default_cadence_groww_request_timeout_ms() -> i64 {
+    1_500
+}
+
+/// Serde default for [`CadenceConfig::groww_lane_cutoff_ms`] — 6s
+/// (Assumed).
+fn default_cadence_groww_lane_cutoff_ms() -> i64 {
+    6_000
+}
+
+/// Serde default for [`CadenceConfig::chain_min_spacing_ms`] — Dhan's
+/// 1-unique-request-per-3s option-chain rule.
+fn default_cadence_chain_min_spacing_ms() -> i64 {
+    3_000
+}
+
+/// Serde default for [`CadenceConfig::expiry_retry_interval_ms`] — one
+/// bounded expiry-list attempt per minute (operator spec 2026-07-15).
+fn default_cadence_expiry_retry_interval_ms() -> i64 {
+    60_000
+}
+
+/// Serde default for [`CadenceConfig::expiry_deadline_secs_of_day_ist`]
+/// — 08:55 IST (operator spec 2026-07-15; the pre-market page deadline).
+fn default_cadence_expiry_deadline_secs_of_day_ist() -> u32 {
+    8 * 3600 + 55 * 60
+}
+
+impl Default for CadenceConfig {
+    /// Manual impl so `Default` matches the serde field defaults exactly
+    /// (the `Spot1mRestConfig` precedent — a derived `Default` would zero
+    /// every timing while an empty `[cadence]` section deserializes the
+    /// full judge-locked cadence table).
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            dhan_lane: default_cadence_lane_enabled(),
+            groww_lane: default_cadence_lane_enabled(),
+            dhan_burst_offset_ms: default_cadence_dhan_burst_offset_ms(),
+            spot_window_cap: default_cadence_spot_window_cap(),
+            concurrency_degrade_after_dirty_cycles:
+                default_cadence_concurrency_degrade_after_dirty_cycles(),
+            concurrency_recover_after_clean_cycles:
+                default_cadence_concurrency_recover_after_clean_cycles(),
+            spot_min_post_close_ms: default_cadence_spot_min_post_close_ms(),
+            in_cycle_retry_max: default_cadence_in_cycle_retry_max(),
+            dhan_lane_cutoff_ms: default_cadence_dhan_lane_cutoff_ms(),
+            groww_anchor_offset_ms: 0,
+            groww_burst_timeout_ms: default_cadence_groww_burst_timeout_ms(),
+            groww_request_timeout_ms: default_cadence_groww_request_timeout_ms(),
+            groww_lane_cutoff_ms: default_cadence_groww_lane_cutoff_ms(),
+            chain_min_spacing_ms: default_cadence_chain_min_spacing_ms(),
+            expiry_retry_interval_ms: default_cadence_expiry_retry_interval_ms(),
+            expiry_deadline_secs_of_day_ist: default_cadence_expiry_deadline_secs_of_day_ist(),
+        }
+    }
+}
+
+/// `[rest_candle_fold]` — REST-era multi-TF candle derivation (operator
+/// directive 2026-07-16). Cold path only — folds persist-confirmed
+/// `spot_1m_rest` 1m bars into the 21 `candles_*` tables through the shared
+/// seal-writer channel; NEVER touches `ticks` (live-feed-purity rules 1-6
+/// stand; rule 10 carries the dated 2026-07-16 candles_1d edit).
+///
+/// Fail-safe shape: `enabled` is `#[serde(default)]` = `false`, so an
+/// absent `[rest_candle_fold]` section (or a TOML written before this PR)
+/// disables the fold entirely. `config/base.toml` explicitly sets
+/// `enabled = true` + `catchup_days = 35` (the operator's one-month spot
+/// window demand, 2026-07-16).
+#[derive(Debug, Clone, Deserialize)]
+pub struct RestCandleFoldConfig {
+    /// Master switch for the REST-era bar-fold candle derivation.
+    /// Default OFF (fail-safe) — `config/base.toml` turns it on explicitly.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Boot catch-up window in IST days: the fold re-derives all 21 TFs
+    /// from the last `catchup_days` calendar days of `spot_1m_rest` rows
+    /// per feed — today plus `catchup_days - 1` past days, EXACTLY
+    /// `catchup_days` days total (round-2 LOW-3: the code matches this
+    /// wording; the old range folded one extra day). Default 35 (one month
+    /// of spot history + weekend slack — the operator's 2026-07-16
+    /// minimum-one-month demand).
+    #[serde(default = "default_rest_candle_fold_catchup_days")]
+    pub catchup_days: u32,
+}
+
+impl Default for RestCandleFoldConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            catchup_days: default_rest_candle_fold_catchup_days(),
+        }
+    }
+}
+
+impl CadenceConfig {
+    /// Boot-time validation (range-bail house shape) — rejects any
+    /// `[cadence]` section that could compress the structural zero-429
+    /// spacing floors or produce a degenerate schedule, BEFORE the runner
+    /// spawns.
+    ///
+    /// # Errors
+    /// Returns a descriptive error for the first violation found: a
+    /// chain spacing under the 3s per-(underlying, expiry) floor, a spot
+    /// window cap outside 1..=5, out-of-range burst-offset / expiry
+    /// knobs, negative clamps, non-positive cutoffs/timeouts, a Groww
+    /// cutoff at/below the burst verdict, a lane cutoff at/above one
+    /// minute, or a burst schedule outside the feasible band (nominal
+    /// burst / deepest spot bucket at/after the Dhan cutoff).
+    pub fn validate(&self) -> Result<()> {
+        if self.chain_min_spacing_ms < CADENCE_CHAIN_MIN_SPACING_FLOOR_MS {
+            bail!(
+                "cadence.chain_min_spacing_ms ({}) must be >= {} (Dhan's 1-unique-request-per-3s option-chain rule)",
+                self.chain_min_spacing_ms,
+                CADENCE_CHAIN_MIN_SPACING_FLOOR_MS
+            );
+        }
+        // 2026-07-16: the burst is a POST-close fire (second 1 of the
+        // minute) — a non-positive offset would race the close (and a
+        // T+0 burst would collide with the Groww anchor semantics of
+        // next_joinable_boundary's strictly-in-future rule).
+        if self.dhan_burst_offset_ms <= 0 {
+            bail!(
+                "cadence.dhan_burst_offset_ms ({}) must be > 0 (the 2026-07-16 shape is fully POST-close — the burst is second 1 of the minute)",
+                self.dhan_burst_offset_ms
+            );
+        }
+        if self.spot_window_cap == 0 || self.spot_window_cap > CADENCE_SPOT_WINDOW_CAP_CEILING {
+            bail!(
+                "cadence.spot_window_cap ({}) must be in 1..={} (the Dhan Data-API hard cap is 5/sec)",
+                self.spot_window_cap,
+                CADENCE_SPOT_WINDOW_CAP_CEILING
+            );
+        }
+        if self.concurrency_degrade_after_dirty_cycles == 0
+            || self.concurrency_recover_after_clean_cycles == 0
+        {
+            bail!(
+                "cadence concurrency-ladder thresholds must be >= 1 (degrade_after_dirty {}, recover_after_clean {})",
+                self.concurrency_degrade_after_dirty_cycles,
+                self.concurrency_recover_after_clean_cycles
+            );
+        }
+        if self.spot_min_post_close_ms < 0 {
+            bail!(
+                "cadence.spot_min_post_close_ms ({}) must be >= 0 (a spot can never fire pre-close)",
+                self.spot_min_post_close_ms
+            );
+        }
+        // Feasibility of the deepest spot second-bucket (CAD-NEW-3 +
+        // SEC-CAD-1 class, re-derived for the 2026-07-16 shape): the
+        // spot base is max(burst, T + spot_min_post_close_ms) and the
+        // deepest bucket (shape 1 x tier 3) sits base + 4 windows — a
+        // nominal spot fire at/after the Dhan cutoff sorts AFTER the
+        // DhanCutoff event, so the cutoff skip resolves the lane FIRST
+        // and the fire is silently discarded on the resolved-lane guard
+        // EVERY cycle, with the coded errors pointing at broker slowness
+        // instead of the degenerate schedule. Refused at boot.
+        let deepest_spot_bucket_ms = self
+            .dhan_burst_offset_ms
+            .max(self.spot_min_post_close_ms)
+            .saturating_add(4_i64.saturating_mul(CADENCE_SPOT_WINDOW_MS));
+        if deepest_spot_bucket_ms >= self.dhan_lane_cutoff_ms {
+            bail!(
+                "cadence.dhan_burst_offset_ms ({}) / spot_min_post_close_ms ({}) are too late: the deepest spot second-bucket (max(burst, clamp) + 4 windows = {}ms past T) must land strictly before dhan_lane_cutoff_ms ({}) — a nominal fire at/after the cutoff is silently discarded once the cutoff skip resolves the lane",
+                self.dhan_burst_offset_ms,
+                self.spot_min_post_close_ms,
+                deepest_spot_bucket_ms,
+                self.dhan_lane_cutoff_ms
+            );
+        }
+        if self.dhan_lane_cutoff_ms <= 0 || self.groww_lane_cutoff_ms <= 0 {
+            bail!(
+                "cadence lane cutoffs must be > 0 (dhan {}, groww {})",
+                self.dhan_lane_cutoff_ms,
+                self.groww_lane_cutoff_ms
+            );
+        }
+        // Hostile-review round 1 (CAD-SEC-1, 2026-07-15): a lane cutoff
+        // at/above one minute makes EVERY cycle structurally overrun its
+        // boundary (run_cycle only breaks once the cutoff event pops), so
+        // each cycle fires a should-never boundary_skipped error and the
+        // cadence silently halves — refused as a degenerate schedule.
+        if self.dhan_lane_cutoff_ms >= 60_000 || self.groww_lane_cutoff_ms >= 60_000 {
+            bail!(
+                "cadence lane cutoffs must be < 60000ms — one cycle must resolve inside its own minute (dhan {}, groww {})",
+                self.dhan_lane_cutoff_ms,
+                self.groww_lane_cutoff_ms
+            );
+        }
+        // The nominal chain burst itself must land strictly before the
+        // Dhan cutoff (CAD-NEW-3 mirror for the post-close shape).
+        if self.dhan_burst_offset_ms >= self.dhan_lane_cutoff_ms {
+            bail!(
+                "cadence.dhan_burst_offset_ms ({}) must land strictly before dhan_lane_cutoff_ms ({}) — a nominal chain fire at/after the cutoff is silently discarded once the cutoff skip resolves the lane",
+                self.dhan_burst_offset_ms,
+                self.dhan_lane_cutoff_ms
+            );
+        }
+        if self.groww_burst_timeout_ms <= 0 || self.groww_request_timeout_ms <= 0 {
+            bail!(
+                "cadence groww timeouts must be > 0 (burst {}, request {})",
+                self.groww_burst_timeout_ms,
+                self.groww_request_timeout_ms
+            );
+        }
+        if self.groww_anchor_offset_ms < 0 {
+            bail!(
+                "cadence.groww_anchor_offset_ms ({}) must be >= 0 (the burst is a POST-close fire)",
+                self.groww_anchor_offset_ms
+            );
+        }
+        // The WORST fallback shape (choice 3: waves :01/:02/:03) must
+        // still reach its verdict strictly inside the lane cutoff — else
+        // the shape ladder's last resort could never resolve.
+        let worst_shape_verdict_ms = self
+            .groww_anchor_offset_ms
+            .saturating_add(3_i64.saturating_mul(CADENCE_GROWW_WAVE_STEP_MS))
+            .saturating_add(self.groww_burst_timeout_ms);
+        if self.groww_lane_cutoff_ms <= worst_shape_verdict_ms {
+            bail!(
+                "cadence.groww_lane_cutoff_ms ({}) must exceed the worst fallback shape's verdict instant ({}ms past T = anchor + 3 waves + burst timeout) — the choice-3 fallback needs room inside the cutoff",
+                self.groww_lane_cutoff_ms,
+                worst_shape_verdict_ms
+            );
+        }
+        // NO-OVERLAP-INTO-NEXT-BURST structural bound: the worst shape's
+        // verdict plus a fully-sequential 7-leg fallback (each leg bounded
+        // by the per-request timeout) must complete strictly before the
+        // NEXT minute's burst anchor — fallback waves can never double-fire
+        // across the boundary.
+        let worst_groww_tail_ms = worst_shape_verdict_ms
+            .saturating_add(7_i64.saturating_mul(self.groww_request_timeout_ms));
+        if worst_groww_tail_ms >= 60_000 {
+            bail!(
+                "cadence groww worst-case cycle tail ({}ms = worst shape verdict + 7 sequential fallback legs) must end strictly before the next minute's burst (60000ms)",
+                worst_groww_tail_ms
+            );
+        }
+        // Expiry-resolution boot phase knobs (operator spec 2026-07-15).
+        if self.expiry_retry_interval_ms <= 0 {
+            bail!(
+                "cadence.expiry_retry_interval_ms ({}) must be > 0 (the bounded pre-market retry cadence)",
+                self.expiry_retry_interval_ms
+            );
+        }
+        // R3-F1 belt (a), 2026-07-15: the in-session retry waves anchor
+        // at the :30-of-minute instant on a per-minute grid, so the
+        // interval must not exceed one minute — a slower interval lets
+        // the LAST pre-session wake sleep the PLAIN interval straight
+        // into the first session cycle's burst window (e.g. 65s @
+        // 09:14:58 -> 09:16:03, the spot-group instant -> one false
+        // gate_deferred_nominal page at session entry). Belt (b) — the
+        // runner-side transitional-wave clamp
+        // (`expiry_wave_anchor_active`) — survives validation drift.
+        if self.expiry_retry_interval_ms > 60_000 {
+            bail!(
+                "cadence.expiry_retry_interval_ms ({}) must be <= 60000 (one minute): retry waves anchor on the per-minute :30 grid, and a slower interval would sleep a transitional wave into the session-entry burst window",
+                self.expiry_retry_interval_ms
+            );
+        }
+        if self.expiry_deadline_secs_of_day_ist >= 86_400 {
+            bail!(
+                "cadence.expiry_deadline_secs_of_day_ist ({}) must be < 86400 (an IST seconds-of-day instant)",
+                self.expiry_deadline_secs_of_day_ist
+            );
+        }
+        Ok(())
+    }
+}
+
+/// serde default for [`RestCandleFoldConfig::catchup_days`] — 35 days.
+fn default_rest_candle_fold_catchup_days() -> u32 {
+    35
+}
+
+impl RestCandleFoldConfig {
+    /// Boot-time sanity validation — rejected BEFORE the fold task spawns.
+    /// The window must be ≥1 day and ≤370 (~one year — the envelope bound;
+    /// a larger window is a config typo, not a legitimate ask).
+    ///
+    /// # Errors
+    /// Returns a descriptive error when `catchup_days` is outside `1..=370`.
+    pub fn validate(&self) -> Result<()> {
+        if !(1..=370).contains(&self.catchup_days) {
+            bail!(
+                "rest_candle_fold.catchup_days ({}) must be within 1..=370",
+                self.catchup_days
+            );
+        }
+        Ok(())
+    }
+}
+
+/// `[market_ram_store]` — RAM residency stores (operator directive
+/// 2026-07-16; PR-2 of the data-completeness build). Two process-RAM
+/// stores populated by EXISTING data flows:
+///
+/// - the SPOT month-deep bar rings
+///   (`tickvault_trading::in_mem::spot_bar_store`) — per (feed, sid, tf)
+///   rings of sealed bars, capacity `spot_days` × session bars/day,
+///   written at the rest_candle_fold emit choke points (live seals +
+///   refold re-emits + the boot catch-up — so pre-market rehydration is
+///   PR-1's existing catch-up, ZERO new QuestDB reads for spots);
+/// - the CHAIN current-day minute ring
+///   (`tickvault_core::pipeline::chain_day_store`) — per (feed,
+///   underlying) minute → published moneyness snapshot, current IST day
+///   only, boot-rehydrated from today's `option_chain_1m` rows via
+///   bounded hardened `/exec` windows.
+///
+/// Fail-safe shape: `enabled` is `#[serde(default)]` = `false`, so an
+/// absent `[market_ram_store]` section disables both stores entirely
+/// (every hook is a checked no-op). `config/base.toml` explicitly sets
+/// `enabled = true`, `spot_days = 35`, `chain_row_cap = 1000`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct MarketRamStoreConfig {
+    /// Master switch for BOTH RAM residency stores.
+    /// Default OFF (fail-safe) — `config/base.toml` turns it on explicitly.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Spot ring depth in trading days per (feed, sid, tf) ring. Default 35
+    /// (the operator's minimum-one-month spot demand + weekend slack —
+    /// matches `rest_candle_fold.catchup_days`). A value BELOW
+    /// `rest_candle_fold.catchup_days` is legal (the ring simply retains
+    /// less than the catch-up offers — noted with a boot log line, never a
+    /// hard error).
+    #[serde(default = "default_market_ram_store_spot_days")]
+    pub spot_days: u32,
+    /// Hard per-minute row cap for the chain day store (rows = strike-leg
+    /// snapshot rows per published minute per (feed, underlying)). Default
+    /// 1_000 — above the structural 800-row publish bound
+    /// (`MAX_STRIKES_PER_CHAIN` 400 × 2 legs), so truncation fires only on
+    /// a hostile/runaway snapshot, LOUDLY (counted + coded warn).
+    /// Validated 200..=5_000 (PR-2 round-1): the chain-rehydrate window
+    /// LIMIT is derived from this cap, so a foot-gun tiny value would make
+    /// every rehydrate window hit its LIMIT tripwire — permanently
+    /// truncated, never rehydrating. Values in 200..800 are legal but can
+    /// still flag genuinely full chains' windows truncated (visible,
+    /// never silent).
+    #[serde(default = "default_market_ram_store_chain_row_cap")]
+    pub chain_row_cap: u32,
+}
+
+impl Default for MarketRamStoreConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            spot_days: default_market_ram_store_spot_days(),
+            chain_row_cap: default_market_ram_store_chain_row_cap(),
+        }
+    }
+}
+
+/// serde default for [`MarketRamStoreConfig::spot_days`] — 35 days.
+fn default_market_ram_store_spot_days() -> u32 {
+    35
+}
+
+/// serde default for [`MarketRamStoreConfig::chain_row_cap`] — 1_000 rows.
+fn default_market_ram_store_chain_row_cap() -> u32 {
+    1_000
+}
+
+impl MarketRamStoreConfig {
+    /// Boot-time sanity validation — rejected BEFORE any store installs.
+    ///
+    /// # Errors
+    /// Returns a descriptive error when `spot_days` is outside `1..=370`
+    /// (the same ~one-year envelope bound as `rest_candle_fold.catchup_days`)
+    /// or `chain_row_cap` is outside `200..=5_000` (floor: the chain
+    /// rehydrate's window LIMIT derives from the cap — a tiny value would
+    /// make EVERY rehydrate window permanently hit its truncation
+    /// tripwire; ceiling: bounds worst-case resident chain bytes).
+    pub fn validate(&self) -> Result<()> {
+        if !(1..=370).contains(&self.spot_days) {
+            bail!(
+                "market_ram_store.spot_days ({}) must be within 1..=370",
+                self.spot_days
+            );
+        }
+        if !(200..=5_000).contains(&self.chain_row_cap) {
+            bail!(
+                "market_ram_store.chain_row_cap ({}) must be within 200..=5000",
+                self.chain_row_cap
+            );
+        }
+        Ok(())
+    }
+}
+
 /// `[option_chain_1m]` — per-minute option-chain REST pipeline (operator
 /// grant 2026-07-12; PR-3, the OPTION-CHAIN half). Cold path only — the
 /// WS candle pipeline, tick capture and trading are untouched.
@@ -977,6 +1725,26 @@ pub struct GrowwUniverseConfig {
     pub enabled: bool,
 }
 
+/// `[dhan_order_push]` — 🔷 DHAN order-update WS paper-mode push channel
+/// (operator directive 2026-07-16; governance authorization on PR #1597).
+/// Receive-only observability wiring: the dhan_rest_stack spawns the
+/// dormant `order_update_connection` module with `notifier: None` (the
+/// 2026-07-14 Dhan noise lock — no Telegram) plus a supervised consumer
+/// mapping order updates to `order_audit` rows `feed='dhan'`/`mode='paper'`.
+/// No live orders; `dry_run` untouched.
+///
+/// Fail-safe shape: `enabled` is `#[serde(default)]` = `false`, so an absent
+/// `[dhan_order_push]` section (or a TOML written before this PR) disables
+/// the channel entirely. `config/base.toml` ships the section with
+/// `enabled = false` (the house fail-safe pattern).
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct DhanOrderPushConfig {
+    /// Master switch for the paper-mode order-update push channel.
+    /// Default OFF (fail-safe).
+    #[serde(default)]
+    pub enabled: bool,
+}
+
 /// serde default for [`GrowwContract1mConfig::strikes_each_side`] — the
 /// pinned [`crate::constants::GROWW_CONTRACT_1M_DEFAULT_STRIKES_EACH_SIDE`].
 fn default_groww_contract_1m_strikes_each_side() -> u32 {
@@ -1015,6 +1783,37 @@ impl Default for GrowwContract1mConfig {
         Self {
             enabled: false,
             strikes_each_side: default_groww_contract_1m_strikes_each_side(),
+        }
+    }
+}
+
+/// The Groww REST burst tier (2026-07-14 auto-ladder — operator approval
+/// "approved and go ahead with the recommendation", relayed via the
+/// coordinator session; contract `no-rest-except-live-feed-2026-06-27.md`
+/// §9.7). Selects how the per-minute Groww spot + chain waves fire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum GrowwRestBurstTier {
+    /// The SHIPPED default: 3 chain requests concurrently at minute close
+    /// + 300 ms, 4 spot requests concurrently at close + 1,350 ms — the
+    /// > 1 s wave separation keeps every rolling second single-wave
+    /// (boundary burst ≤ 4 req/s).
+    #[default]
+    TwoWave,
+    /// The operator-preferred burst — all 7 requests concurrently at
+    /// close + 300 ms. PROBE-GATED: promotion requires the off-hours rate
+    /// probe verdict + a fresh dated note in the §9.7 rule file; a live
+    /// 429 auto-demotes the session back to `two_wave`.
+    SevenConcurrent,
+}
+
+impl GrowwRestBurstTier {
+    /// Static metric-label value (`tv_groww_rest_burst_tier_total{tier}`).
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::TwoWave => "two_wave",
+            Self::SevenConcurrent => "seven_concurrent",
         }
     }
 }
@@ -1230,6 +2029,24 @@ impl Default for DhanMarginGateConfig {
             rest_self_cap_per_sec: default_margin_gate_rest_self_cap_per_sec(),
         }
     }
+}
+
+/// `[groww_rest_burst]` — burst-tier + warm-up selection for the
+/// per-minute Groww REST legs (2026-07-14 auto-ladder). Fail-safe shape:
+/// every field is `#[serde(default)]`, so an absent section (or a TOML
+/// written before this PR) means `two_wave` + warm-up OFF;
+/// `config/base.toml` opts warm-up in explicitly.
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+pub struct GrowwRestBurstConfig {
+    /// The configured burst tier (boot value — a live 429 demotes the
+    /// SESSION, never this config; restart restores it).
+    #[serde(default)]
+    pub tier: GrowwRestBurstTier,
+    /// Pre-boundary TLS warm-up: one unauthenticated GET per leg client at
+    /// minute boundary − 4 s (3 s-bounded, response discarded). Default
+    /// OFF (fail-safe); base.toml turns it on.
+    #[serde(default)]
+    pub warm_up: bool,
 }
 
 impl DhanMarginGateConfig {
@@ -1802,12 +2619,16 @@ pub struct PartitionRetentionConfig {
     #[serde(default = "default_retention_days")]
     pub retention_days: u32,
     /// Hot window in days for the HIGH-VOLUME market-data class (`ticks` +
-    /// the 21 `candles_*` tables, ~1.2–2 GB/day combined). 90 days of ticks
-    /// (~135+ GB) can never fit the 30 GB volume — the hot window must be
-    /// shorter, with S3 as the durable long-term store (aws-budget.md §5
-    /// hot-window-on-EBS doctrine; SEBI retention satisfied by the S3 copy).
-    /// Only consulted when `archive_enabled = true`; clamped to a hard
-    /// MIN_HOT_DAYS=2 floor at use (today + yesterday are untouchable).
+    /// the 21 `candles_*` tables + the per-minute chain tables since
+    /// 2026-07-16). 90 days of ticks (~135+ GB) can never fit the volume —
+    /// the hot window must be shorter, with S3 as the durable long-term
+    /// store (aws-budget.md §5 hot-window-on-EBS doctrine; SEBI retention
+    /// satisfied by the S3 copy). Default 35 since 2026-07-16 (was 14) —
+    /// the operator's minimum-one-month spot window demand ("our entire
+    /// one month should be stored and fetched from questdb even before
+    /// premarket"). Only consulted when `archive_enabled = true`; clamped
+    /// to a hard MIN_HOT_DAYS=2 floor at use (today + yesterday are
+    /// untouchable).
     #[serde(default = "default_market_data_hot_days")]
     pub market_data_hot_days: u32,
     /// Master gate for the archive→verify→drop leg. serde default FALSE so
@@ -1846,11 +2667,12 @@ const fn default_retention_days() -> u32 {
     90
 }
 
-/// Default market-data hot window: 14 days. Inert unless `archive_enabled`;
-/// safe-by-default because the archive→verify→drop flow is fail-closed
-/// (no verified S3 copy ⇒ no drop).
+/// Default market-data hot window: 35 days (2026-07-16 operator directive
+/// — one month of spot history + weekend slack; was 14). Inert unless
+/// `archive_enabled`; safe-by-default because the archive→verify→drop flow
+/// is fail-closed (no verified S3 copy ⇒ no drop).
 const fn default_market_data_hot_days() -> u32 {
-    14
+    35
 }
 
 /// Default per-run archive bound: 200 partitions. At ~8–24 hourly ticks
@@ -2399,6 +3221,24 @@ impl ApplicationConfig {
             bail!("instrument.csv_download_timeout_secs must be > 0");
         }
 
+        // Order runtime (2026-07-14): the reconcile cadence has a 60s floor
+        // (a tighter loop is pointless in dry-run and a REST hammer live),
+        // and the mark channel must stay bounded within a sane envelope.
+        if self.order_runtime.enabled {
+            if self.order_runtime.reconcile_interval_secs < 60 {
+                bail!(
+                    "order_runtime.reconcile_interval_secs ({}) must be >= 60",
+                    self.order_runtime.reconcile_interval_secs
+                );
+            }
+            if !(256..=65_536).contains(&self.order_runtime.mark_channel_capacity) {
+                bail!(
+                    "order_runtime.mark_channel_capacity ({}) must be in [256, 65536]",
+                    self.order_runtime.mark_channel_capacity
+                );
+            }
+        }
+
         // Instrument: build window start must be before end.
         // `window_start` and `window_end` already parsed above — no redundant re-parse.
         if window_start >= window_end {
@@ -2588,6 +3428,60 @@ impl ApplicationConfig {
         // bounds always; freeze-limit + review-date sanity when enabled —
         // rejected at boot, BEFORE the trading pipeline spawns.
         self.exit_orders.validate()?;
+        // Cadence scheduler (operator 2026-07-14): the structural zero-429
+        // spacing floors are validated at boot, BEFORE the runner spawns
+        // (fail-closed; the default cadence.enabled=false section is always
+        // valid, so today's boot is unaffected).
+        self.cadence.validate()?;
+
+        // CAPTURE-LEG MUTUAL EXCLUSION (coordinator ruling B, 2026-07-16
+        // — SUBSUME, NEVER SHARE, interim fail-closed path): the cadence
+        // scheduler and the legacy per-minute RECORD-capture legs would
+        // place DOUBLE demand on the same broker rate budgets if both ran
+        // for one broker — no double demand is ever legal. Enabling the
+        // cadence requires the legacy legs to stand down FIRST — base.toml
+        // flipped to that shape 2026-07-17 (cadence ON, the four legacy
+        // legs OFF) with the real broker executors; the cadence executors
+        // now feed the capture tables directly (the subsumption).
+        //
+        // RS3 (2026-07-16): keyed on the LEG configs ALONE — deliberately
+        // NOT on `feeds.*_enabled`. The cadence lanes activate on the
+        // RUNTIME feed atomics (one toggle away from the boot flags),
+        // while the legacy legs spawn on their OWN config gates
+        // regardless of the feed flags — so the earlier boot-time key on
+        // `feeds.*_enabled` admitted cadence=ON + feed=OFF + legs=ON, one
+        // runtime feed enable away from reconstructing the forbidden
+        // double demand. (Today both enable directions happen to be
+        // unconditionally 409'd at the API — the PR-C2/S2b retired-lane
+        // refusals — but those refusals exist for unrelated reasons and
+        // must not be this invariant's only wall.) Fail-closed at the
+        // root: cadence + ANY legacy leg of the same broker is refused,
+        // whatever the feed flags say.
+        if self.cadence.enabled {
+            if self.spot_1m_rest.enabled || self.option_chain_1m.enabled {
+                bail!(
+                    "cadence.enabled requires the legacy Dhan per-minute legs to stand down first: set [spot_1m_rest].enabled = false and [option_chain_1m].enabled = false (no double demand on the Dhan Data-API budget is ever legal — coordinator ruling B, 2026-07-16; keyed on the leg configs alone since RS3, regardless of feeds.dhan_enabled)"
+                );
+            }
+            if self.groww_spot_1m.enabled
+                || self.groww_option_chain_1m.enabled
+                || self.groww_contract_1m.enabled
+            {
+                bail!(
+                    "cadence.enabled requires the legacy Groww per-minute legs to stand down first: set [groww_spot_1m].enabled = false, [groww_option_chain_1m].enabled = false and [groww_contract_1m].enabled = false (no double demand on the shared Groww rate budget is ever legal — coordinator ruling B, 2026-07-16; keyed on the leg configs alone since RS3, regardless of feeds.groww_enabled)"
+                );
+            }
+        }
+
+        // 2026-07-16 REST-era candle derivation: the boot catch-up window
+        // must be a sane 1..=370-day envelope — rejected at boot, BEFORE
+        // the fold task spawns.
+        self.rest_candle_fold.validate()?;
+
+        // 2026-07-16 RAM residency stores (PR-2): spot ring depth + chain
+        // per-minute row cap must be sane — rejected at boot, BEFORE any
+        // store installs.
+        self.market_ram_store.validate()?;
 
         Ok(())
     }
@@ -2842,7 +3736,8 @@ mod tests {
         let cfg: PartitionRetentionConfig =
             toml::from_str("retention_days = 90").expect("legacy section must parse");
         assert_eq!(cfg.retention_days, 90);
-        assert_eq!(cfg.market_data_hot_days, 14);
+        // 2026-07-16: default raised 14 → 35 (operator one-month spot window).
+        assert_eq!(cfg.market_data_hot_days, 35);
         assert!(!cfg.archive_enabled, "archive leg must default OFF");
         assert!(cfg.archive_bucket.is_empty(), "bucket must default derived");
         assert_eq!(cfg.max_partitions_per_run, 200);
@@ -2854,7 +3749,8 @@ mod tests {
         // `default -> true` mutants and pins the instant-rollback contract
         // (delete the key ⇒ detach-only legacy behaviour).
         assert!(!PartitionRetentionConfig::default().archive_enabled);
-        assert_eq!(default_market_data_hot_days(), 14);
+        // 2026-07-16: default raised 14 → 35 (operator one-month spot window).
+        assert_eq!(default_market_data_hot_days(), 35);
         assert_eq!(default_max_partitions_per_run(), 200);
         let cfg: PartitionRetentionConfig =
             toml::from_str("").expect("empty section must parse via defaults");
@@ -2864,13 +3760,102 @@ mod tests {
     #[test]
     fn test_partition_retention_full_section_parses() {
         let cfg: PartitionRetentionConfig = toml::from_str(
-            "retention_days = 90\nmarket_data_hot_days = 14\narchive_enabled = true\narchive_bucket = \"tv-prod-cold\"\nmax_partitions_per_run = 50\n",
+            "retention_days = 90\nmarket_data_hot_days = 35\narchive_enabled = true\narchive_bucket = \"tv-prod-cold\"\nmax_partitions_per_run = 50\n",
         )
         .expect("full section must parse");
         assert!(cfg.archive_enabled);
         assert_eq!(cfg.archive_bucket, "tv-prod-cold");
-        assert_eq!(cfg.market_data_hot_days, 14);
+        assert_eq!(cfg.market_data_hot_days, 35);
         assert_eq!(cfg.max_partitions_per_run, 50);
+    }
+
+    // =======================================================================
+    // [rest_candle_fold] — RestCandleFoldConfig pins (rest-candle plan Item 2)
+    // =======================================================================
+
+    #[test]
+    fn test_rest_candle_fold_config_default_off() {
+        // Fail-safe pin: the fold is OFF unless a config explicitly turns
+        // it on — `Default` and the serde default (absent keys) must agree.
+        assert!(!RestCandleFoldConfig::default().enabled);
+        assert_eq!(RestCandleFoldConfig::default().catchup_days, 35);
+        let cfg: RestCandleFoldConfig = toml::from_str("")
+            .expect("empty [rest_candle_fold] section must parse via serde defaults");
+        assert!(!cfg.enabled, "absent enabled key must deserialize to false");
+        assert_eq!(cfg.catchup_days, 35, "serde catchup_days default is 35");
+    }
+
+    #[test]
+    fn test_rest_candle_fold_config_validate_bounds() {
+        // The 1..=370 catch-up envelope: both edges accepted, both
+        // neighbours rejected (a 0/371 window is a config typo, not a
+        // legitimate ask).
+        let cfg = |catchup_days: u32| RestCandleFoldConfig {
+            enabled: true,
+            catchup_days,
+        };
+        assert!(cfg(1).validate().is_ok(), "lower edge 1 must be accepted");
+        assert!(
+            cfg(370).validate().is_ok(),
+            "upper edge 370 must be accepted"
+        );
+        assert!(cfg(0).validate().is_err(), "0 must be rejected");
+        assert!(cfg(371).validate().is_err(), "371 must be rejected");
+    }
+
+    // =======================================================================
+    // [market_ram_store] — MarketRamStoreConfig pins (ram-residency plan
+    // Item 1, operator directive 2026-07-16)
+    // =======================================================================
+
+    #[test]
+    fn test_market_ram_store_config_default_off() {
+        // Fail-safe: Default AND an empty-TOML deserialize are BOTH
+        // disabled with the documented depth/cap defaults — an absent
+        // [market_ram_store] section installs nothing.
+        assert!(!MarketRamStoreConfig::default().enabled);
+        assert_eq!(MarketRamStoreConfig::default().spot_days, 35);
+        assert_eq!(MarketRamStoreConfig::default().chain_row_cap, 1_000);
+        let cfg: MarketRamStoreConfig =
+            toml::from_str("").expect("an empty [market_ram_store] section must deserialize");
+        assert!(!cfg.enabled, "serde default must be OFF (fail-safe)");
+        assert_eq!(cfg.spot_days, 35);
+        assert_eq!(cfg.chain_row_cap, 1_000);
+    }
+
+    #[test]
+    fn test_market_ram_store_config_validate_bounds() {
+        // spot_days shares the 1..=370 envelope with
+        // rest_candle_fold.catchup_days; chain_row_cap is 200..=5_000
+        // (PR-2 round-1: a foot-gun tiny cap would make every chain
+        // rehydrate window permanently hit its LIMIT tripwire).
+        let cfg = |spot_days: u32, chain_row_cap: u32| MarketRamStoreConfig {
+            enabled: true,
+            spot_days,
+            chain_row_cap,
+        };
+        assert!(
+            cfg(1, 200).validate().is_ok(),
+            "lower edges must be accepted"
+        );
+        assert!(
+            cfg(370, 5_000).validate().is_ok(),
+            "upper edges must be accepted"
+        );
+        assert!(cfg(0, 1_000).validate().is_err(), "spot_days 0 rejected");
+        assert!(
+            cfg(371, 1_000).validate().is_err(),
+            "spot_days 371 rejected"
+        );
+        assert!(
+            cfg(35, 199).validate().is_err(),
+            "chain_row_cap 199 rejected (rehydrate-tripwire floor)"
+        );
+        assert!(cfg(35, 0).validate().is_err(), "chain_row_cap 0 rejected");
+        assert!(
+            cfg(35, 5_001).validate().is_err(),
+            "chain_row_cap 5001 rejected"
+        );
     }
 
     // =======================================================================
@@ -3160,12 +4145,19 @@ mod tests {
             option_chain_1m: OptionChain1mConfig::default(),
             groww_spot_1m: GrowwSpot1mConfig::default(),
             groww_option_chain_1m: GrowwOptionChain1mConfig::default(),
+            groww_rest_burst: GrowwRestBurstConfig::default(),
             tf_consistency: TfConsistencyConfig::default(),
+            spot_crossverify: SpotCrossverifyConfig::default(),
+            rest_candle_fold: RestCandleFoldConfig::default(),
+            market_ram_store: MarketRamStoreConfig::default(),
             groww_contract_1m: GrowwContract1mConfig::default(),
+            order_runtime: OrderRuntimeConfig::default(),
+            dhan_order_push: DhanOrderPushConfig::default(),
             groww_universe: GrowwUniverseConfig::default(),
             groww_orders: GrowwOrdersConfig::default(),
             dhan_margin_gate: DhanMarginGateConfig::default(),
             exit_orders: ExitOrdersConfig::default(),
+            cadence: CadenceConfig::default(),
         }
     }
 
@@ -4875,6 +5867,73 @@ mod tests {
         assert!(!on.groww_option_chain_1m.probe_and_report);
     }
 
+    /// 2026-07-14 Groww REST burst auto-ladder: the `[groww_rest_burst]`
+    /// section is fail-safe — absent/empty sections default to the
+    /// rate-safe `two_wave` tier with warm-up OFF; explicit values (incl.
+    /// the probe-gated `seven_concurrent` flip shape) round-trip; an
+    /// unknown tier string is a loud config error, never a silent default.
+    #[test]
+    fn test_groww_rest_burst_config_defaults_and_round_trips() {
+        use figment::Figment;
+        use figment::providers::{Format, Toml};
+
+        let d = GrowwRestBurstConfig::default();
+        assert_eq!(d.tier, GrowwRestBurstTier::TwoWave);
+        assert!(!d.warm_up, "warm-up must default OFF (base.toml opts in)");
+        assert_eq!(GrowwRestBurstTier::TwoWave.as_str(), "two_wave");
+        assert_eq!(
+            GrowwRestBurstTier::SevenConcurrent.as_str(),
+            "seven_concurrent"
+        );
+
+        #[derive(Deserialize)]
+        struct Wrapper {
+            #[serde(default)]
+            groww_rest_burst: GrowwRestBurstConfig,
+        }
+        let missing: Wrapper = Figment::new()
+            .merge(Toml::string("[other]\nx = 1\n"))
+            .extract()
+            .expect("missing [groww_rest_burst] must default, not error");
+        assert_eq!(missing.groww_rest_burst.tier, GrowwRestBurstTier::TwoWave);
+        assert!(!missing.groww_rest_burst.warm_up);
+        let empty: Wrapper = Figment::new()
+            .merge(Toml::string("[groww_rest_burst]\n"))
+            .extract()
+            .expect("empty [groww_rest_burst] must default, not error");
+        assert_eq!(empty.groww_rest_burst.tier, GrowwRestBurstTier::TwoWave);
+        assert!(!empty.groww_rest_burst.warm_up);
+        let base_shape: Wrapper = Figment::new()
+            .merge(Toml::string(
+                "[groww_rest_burst]\ntier = \"two_wave\"\nwarm_up = true\n",
+            ))
+            .extract()
+            .expect("the base.toml shape must round-trip");
+        assert_eq!(
+            base_shape.groww_rest_burst.tier,
+            GrowwRestBurstTier::TwoWave
+        );
+        assert!(base_shape.groww_rest_burst.warm_up);
+        let seven: Wrapper = Figment::new()
+            .merge(Toml::string(
+                "[groww_rest_burst]\ntier = \"seven_concurrent\"\n",
+            ))
+            .extract()
+            .expect("the probe-gated promotion shape must round-trip");
+        assert_eq!(
+            seven.groww_rest_burst.tier,
+            GrowwRestBurstTier::SevenConcurrent
+        );
+        // A typo'd tier is refused loudly — never silently two_wave.
+        let bad: Result<Wrapper, _> = Figment::new()
+            .merge(Toml::string("[groww_rest_burst]\ntier = \"seven\"\n"))
+            .extract();
+        assert!(
+            bad.is_err(),
+            "an unknown tier string must be a config error"
+        );
+    }
+
     /// Daily timeframe-consistency verifier (operator 2026-07-13): the
     /// `[tf_consistency]` section is fail-safe DEFAULT-OFF — via `Default`,
     /// via a missing section, and via an empty section — and the explicit
@@ -4912,6 +5971,473 @@ mod tests {
             .extract()
             .expect("explicit enabled = true must round-trip");
         assert!(on.tf_consistency.enabled);
+    }
+
+    /// Daily spot cross-broker comparator (operator 2026-07-17): the
+    /// `[spot_crossverify]` section is fail-safe DEFAULT-OFF — via `Default`,
+    /// via a missing section, and via an empty section — and the explicit
+    /// base.toml opt-in round-trips.
+    #[test]
+    fn test_spot_crossverify_config_default_off_and_round_trip() {
+        use figment::Figment;
+        use figment::providers::{Format, Toml};
+
+        assert!(
+            !SpotCrossverifyConfig::default().enabled,
+            "spot_crossverify must default OFF (fail-safe; base.toml opts in)"
+        );
+
+        #[derive(Deserialize)]
+        struct Wrapper {
+            #[serde(default)]
+            spot_crossverify: SpotCrossverifyConfig,
+        }
+        let missing: Wrapper = Figment::new()
+            .merge(Toml::string("[other]\nx = 1\n"))
+            .extract()
+            .expect("missing [spot_crossverify] must default, not error");
+        assert!(!missing.spot_crossverify.enabled);
+        let empty: Wrapper = Figment::new()
+            .merge(Toml::string("[spot_crossverify]\n"))
+            .extract()
+            .expect("empty [spot_crossverify] must default, not error");
+        assert!(!empty.spot_crossverify.enabled);
+        let on: Wrapper = Figment::new()
+            .merge(Toml::string("[spot_crossverify]\nenabled = true\n"))
+            .extract()
+            .expect("explicit enabled = true must round-trip");
+        assert!(on.spot_crossverify.enabled);
+    }
+
+    /// Order runtime (2026-07-14, cluster A): the `[order_runtime]` section
+    /// is FAIL-SAFE default OFF — an absent section, an empty section, and
+    /// an older TOML all deserialize to disabled with the pinned field
+    /// defaults (paper_fill/self_test ON, 300s reconcile, 8192 marks);
+    /// explicit values round-trip.
+    #[test]
+    fn test_order_runtime_config_defaults_off() {
+        use figment::Figment;
+        use figment::providers::{Format, Toml};
+
+        let d = OrderRuntimeConfig::default();
+        assert!(!d.enabled, "order_runtime must default OFF (fail-safe)");
+        assert!(d.paper_fill);
+        assert!(d.self_test);
+        assert_eq!(d.reconcile_interval_secs, 300);
+        assert_eq!(d.mark_channel_capacity, 8_192);
+
+        #[derive(Deserialize)]
+        struct Wrapper {
+            #[serde(default)]
+            order_runtime: OrderRuntimeConfig,
+        }
+        // Missing section entirely → disabled, never an error.
+        let missing: Wrapper = Figment::new()
+            .merge(Toml::string("[other]\nx = 1\n"))
+            .extract()
+            .expect("missing [order_runtime] must default, not error");
+        assert!(!missing.order_runtime.enabled);
+        // Empty section (no keys) → the SAME defaults as Default (the
+        // Spot1mRestConfig manual-Default precedent).
+        let empty: Wrapper = Figment::new()
+            .merge(Toml::string("[order_runtime]\n"))
+            .extract()
+            .expect("empty [order_runtime] must default, not error");
+        assert!(!empty.order_runtime.enabled);
+        assert!(empty.order_runtime.paper_fill);
+        assert_eq!(empty.order_runtime.reconcile_interval_secs, 300);
+        assert_eq!(empty.order_runtime.mark_channel_capacity, 8_192);
+        // Explicit ON (the base.toml shape) round-trips.
+        let on: Wrapper = Figment::new()
+            .merge(Toml::string(
+                "[order_runtime]\nenabled = true\npaper_fill = false\n\
+                 self_test = false\nreconcile_interval_secs = 120\n\
+                 mark_channel_capacity = 4096\n",
+            ))
+            .extract()
+            .expect("explicit values must round-trip");
+        assert!(on.order_runtime.enabled);
+        assert!(!on.order_runtime.paper_fill);
+        assert!(!on.order_runtime.self_test);
+        assert_eq!(on.order_runtime.reconcile_interval_secs, 120);
+        assert_eq!(on.order_runtime.mark_channel_capacity, 4_096);
+    }
+
+    /// Dhan order-update push (2026-07-16): the `[dhan_order_push]` section
+    /// is FAIL-SAFE default OFF — `Default`, a missing section, and an
+    /// empty section all deserialize to disabled; explicit `enabled = true`
+    /// round-trips.
+    #[test]
+    fn dhan_order_push_config_defaults_off() {
+        use figment::Figment;
+        use figment::providers::{Format, Toml};
+
+        let d = DhanOrderPushConfig::default();
+        assert!(!d.enabled, "dhan_order_push must default OFF (fail-safe)");
+
+        #[derive(Deserialize)]
+        struct Wrapper {
+            #[serde(default)]
+            dhan_order_push: DhanOrderPushConfig,
+        }
+        // Missing section entirely → disabled, never an error.
+        let missing: Wrapper = Figment::new()
+            .merge(Toml::string("[other]\nx = 1\n"))
+            .extract()
+            .expect("missing [dhan_order_push] must default, not error");
+        assert!(!missing.dhan_order_push.enabled);
+        // Empty section (no keys) → disabled.
+        let empty: Wrapper = Figment::new()
+            .merge(Toml::string("[dhan_order_push]\n"))
+            .extract()
+            .expect("empty [dhan_order_push] must default, not error");
+        assert!(!empty.dhan_order_push.enabled);
+        // Explicit ON round-trips.
+        let on: Wrapper = Figment::new()
+            .merge(Toml::string("[dhan_order_push]\nenabled = true\n"))
+            .extract()
+            .expect("explicit enabled = true must round-trip");
+        assert!(on.dhan_order_push.enabled);
+    }
+
+    /// Order runtime validation: the 60s reconcile floor + the bounded
+    /// [256, 65536] mark-channel envelope apply ONLY when enabled (a
+    /// disabled section is never rejected — rollback safety).
+    #[test]
+    fn test_order_runtime_config_validation() {
+        let mut config = make_valid_config();
+        config.order_runtime.enabled = true;
+        config.order_runtime.reconcile_interval_secs = 59;
+        assert!(
+            config.validate().is_err(),
+            "reconcile interval < 60 must be rejected when enabled"
+        );
+        config.order_runtime.reconcile_interval_secs = 60;
+        config.order_runtime.mark_channel_capacity = 255;
+        assert!(
+            config.validate().is_err(),
+            "mark channel capacity < 256 must be rejected when enabled"
+        );
+        config.order_runtime.mark_channel_capacity = 65_537;
+        assert!(
+            config.validate().is_err(),
+            "mark channel capacity > 65536 must be rejected when enabled"
+        );
+        config.order_runtime.mark_channel_capacity = 8_192;
+        assert!(config.validate().is_ok(), "sane enabled config validates");
+        // Disabled: even out-of-range values never block boot (rollback).
+        config.order_runtime.enabled = false;
+        config.order_runtime.reconcile_interval_secs = 1;
+        config.order_runtime.mark_channel_capacity = 1;
+        assert!(
+            config.validate().is_ok(),
+            "a DISABLED order_runtime section is never rejected"
+        );
+    }
+
+    /// Cadence scheduler (operator 2026-07-14): the `[cadence]` section is
+    /// fail-safe DEFAULT-OFF (the design's ratchet
+    /// `!CadenceConfig::default().enabled`) — via `Default`, via a missing
+    /// section, and via an empty section — and every field of the empty
+    /// section deserializes to the judge-locked cadence table.
+    #[test]
+    fn test_cadence_config_default_off() {
+        use figment::Figment;
+        use figment::providers::{Format, Toml};
+
+        let d = CadenceConfig::default();
+        assert!(
+            !d.enabled,
+            "cadence must default OFF (fail-safe; the operator flips it)"
+        );
+        // The broker lane gates DEFAULT TRUE and are deliberately
+        // independent of the retired feeds.dhan_enabled/groww_enabled
+        // live-WS flags (fix round 2026-07-17).
+        assert!(d.dhan_lane, "cadence dhan_lane must default true");
+        assert!(d.groww_lane, "cadence groww_lane must default true");
+        // The locked cadence table (2026-07-16 post-close shape).
+        assert_eq!(d.dhan_burst_offset_ms, 1_000);
+        assert_eq!(d.spot_window_cap, 4);
+        assert_eq!(d.concurrency_degrade_after_dirty_cycles, 2);
+        assert_eq!(d.concurrency_recover_after_clean_cycles, 3);
+        assert_eq!(d.spot_min_post_close_ms, 300);
+        assert_eq!(d.in_cycle_retry_max, 1);
+        assert_eq!(d.dhan_lane_cutoff_ms, 15_000);
+        assert_eq!(d.groww_anchor_offset_ms, 0);
+        assert_eq!(d.groww_burst_timeout_ms, 800);
+        assert_eq!(d.groww_request_timeout_ms, 1_500);
+        assert_eq!(d.groww_lane_cutoff_ms, 6_000);
+        assert_eq!(d.chain_min_spacing_ms, 3_000);
+        // The 2026-07-15 pre-market expiry-resolution knobs.
+        assert_eq!(d.expiry_retry_interval_ms, 60_000);
+        assert_eq!(d.expiry_deadline_secs_of_day_ist, 32_100); // 08:55 IST
+        assert!(d.validate().is_ok(), "the shipped defaults must validate");
+
+        #[derive(Deserialize)]
+        struct Wrapper {
+            #[serde(default)]
+            cadence: CadenceConfig,
+        }
+        // Missing section entirely → disabled, never an error.
+        let missing: Wrapper = Figment::new()
+            .merge(Toml::string("[other]\nx = 1\n"))
+            .extract()
+            .expect("missing [cadence] must default, not error");
+        assert!(!missing.cadence.enabled);
+        // Empty section (no keys) → disabled + the full locked table via
+        // the field-level serde defaults (must equal `Default`).
+        let empty: Wrapper = Figment::new()
+            .merge(Toml::string("[cadence]\n"))
+            .extract()
+            .expect("empty [cadence] must default, not error");
+        assert!(!empty.cadence.enabled);
+        assert!(empty.cadence.dhan_lane, "empty [cadence] => dhan_lane true");
+        assert!(
+            empty.cadence.groww_lane,
+            "empty [cadence] => groww_lane true"
+        );
+        assert_eq!(empty.cadence.dhan_burst_offset_ms, d.dhan_burst_offset_ms);
+        assert_eq!(empty.cadence.spot_window_cap, d.spot_window_cap);
+        assert_eq!(
+            empty.cadence.concurrency_degrade_after_dirty_cycles,
+            d.concurrency_degrade_after_dirty_cycles
+        );
+        assert_eq!(empty.cadence.groww_lane_cutoff_ms, d.groww_lane_cutoff_ms);
+        // Explicit ON round-trips.
+        let on: Wrapper = Figment::new()
+            .merge(Toml::string("[cadence]\nenabled = true\n"))
+            .extract()
+            .expect("explicit enabled = true must round-trip");
+        assert!(on.cadence.enabled);
+    }
+
+    /// Cadence validate(): the spot ROLLING-1000ms-WINDOW cap is bounded
+    /// 1..=5 (the Dhan Data-API hard cap is 5/sec) and the shared
+    /// concurrency-ladder streak thresholds must be >= 1 — the structural
+    /// zero-429 spot floor (operator spot-concurrency ladder 2026-07-15).
+    #[test]
+    fn test_cadence_config_validate_rejects_bad_spot_window_cap() {
+        let mut cfg = CadenceConfig {
+            spot_window_cap: 0,
+            ..CadenceConfig::default()
+        };
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("spot_window_cap"),
+            "unexpected error: {err}"
+        );
+        cfg.spot_window_cap = 6;
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("spot_window_cap"),
+            "unexpected error: {err}"
+        );
+        // The whole legal range 1..=5 validates (a cap below 4 floors the
+        // concurrency ladder's step in `cadence::ladder` — never rejected
+        // here).
+        for cap in 1..=5u32 {
+            cfg.spot_window_cap = cap;
+            assert!(cfg.validate().is_ok(), "cap {cap} must be legal");
+        }
+        // The streak thresholds are Assumed operator knobs — but 0 would
+        // degrade/recover EVERY cycle (never "continuous"); refused.
+        cfg.spot_window_cap = 4;
+        cfg.concurrency_degrade_after_dirty_cycles = 0;
+        assert!(cfg.validate().is_err());
+        cfg.concurrency_degrade_after_dirty_cycles = 2;
+        cfg.concurrency_recover_after_clean_cycles = 0;
+        assert!(cfg.validate().is_err());
+    }
+
+    /// Cadence validate(): the Groww three-choice fallback-shape ladder's
+    /// structural bounds — the worst shape's verdict must fit inside the
+    /// lane cutoff, and the worst-case cycle tail (verdict + 7 sequential
+    /// fallback legs) must end strictly before the NEXT minute's burst
+    /// (the no-overlap-into-next-burst bound, coordinator 2026-07-15).
+    #[test]
+    fn test_cadence_config_validate_groww_shape_no_overlap_bounds() {
+        // The shipped defaults: worst verdict 0+3000+800 = 3800 < 6000
+        // cutoff; worst tail 3800 + 7*1500 = 14300 < 60000.
+        let d = CadenceConfig::default();
+        assert!(d.validate().is_ok());
+        // A cutoff at/below the choice-3 verdict is degenerate.
+        let mut cfg = CadenceConfig {
+            groww_lane_cutoff_ms: 3_800,
+            ..CadenceConfig::default()
+        };
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("worst fallback shape"),
+            "unexpected error: {err}"
+        );
+        // A negative burst anchor (pre-close) is refused.
+        cfg.groww_lane_cutoff_ms = 6_000;
+        cfg.groww_anchor_offset_ms = -1;
+        assert!(cfg.validate().is_err());
+        // A request timeout that lets the sequential fallback spill into
+        // the next minute's burst is refused (7 legs * 8100ms > 56.2s
+        // after the choice-3 verdict).
+        cfg.groww_anchor_offset_ms = 0;
+        cfg.groww_request_timeout_ms = 8_100;
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("next minute's burst"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// Cadence validate(): the per-(underlying, expiry) 3s chain rule's
+    /// spacing floor cannot be configured away (2026-07-16: the rule is
+    /// per-key ONLY — different underlyings are explicitly concurrent,
+    /// so there is no offsets vector and no global gate anymore), and
+    /// the burst offset must be a genuine POST-close second.
+    #[test]
+    fn test_cadence_config_validate_rejects_sub_3s_chain_spacing() {
+        // The spacing floor itself cannot be configured away.
+        let mut cfg = CadenceConfig {
+            chain_min_spacing_ms: 2_999,
+            ..CadenceConfig::default()
+        };
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("chain_min_spacing_ms"),
+            "unexpected error: {err}"
+        );
+        // A Groww cutoff at/below the burst verdict is degenerate.
+        cfg.chain_min_spacing_ms = 3_000;
+        cfg.groww_lane_cutoff_ms = 800;
+        assert!(cfg.validate().is_err());
+        // The burst is a POST-close fire: 0 and negative are refused.
+        cfg.groww_lane_cutoff_ms = 6_000;
+        cfg.dhan_burst_offset_ms = 0;
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("dhan_burst_offset_ms"),
+            "unexpected error: {err}"
+        );
+        cfg.dhan_burst_offset_ms = -1_000;
+        assert!(cfg.validate().is_err());
+        cfg.dhan_burst_offset_ms = 1_000;
+        assert!(cfg.validate().is_ok());
+    }
+
+    /// Cadence validate(): the cutoff-ceiling + burst-feasibility bounds
+    /// (CAD-NEW-3 / CAD-SEC-1 classes re-derived for the 2026-07-16
+    /// post-close shape) — lane cutoffs must resolve inside one minute,
+    /// and the nominal burst must land strictly before the Dhan cutoff
+    /// (else its fires are silently discarded once the cutoff skip
+    /// resolves the lane).
+    #[test]
+    fn test_cadence_config_validate_burst_band_and_cutoff_ceiling() {
+        // A Dhan cutoff at/above one minute makes every cycle overrun.
+        let mut cfg = CadenceConfig {
+            dhan_lane_cutoff_ms: 120_000,
+            ..CadenceConfig::default()
+        };
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("< 60000ms"),
+            "unexpected error: {err}"
+        );
+        cfg.dhan_lane_cutoff_ms = 60_000;
+        assert!(cfg.validate().is_err(), "exactly 60000 is degenerate");
+        // Same ceiling on the Groww side.
+        cfg.dhan_lane_cutoff_ms = 15_000;
+        cfg.groww_lane_cutoff_ms = 60_000;
+        assert!(cfg.validate().is_err());
+        cfg.groww_lane_cutoff_ms = 6_000;
+        assert!(cfg.validate().is_ok());
+        // A nominal burst at/after the Dhan cutoff is silently discarded
+        // every cycle (the CAD-NEW-3 class) — refused, exact boundary
+        // included; the deepest-spot-bucket bound trips first (burst +
+        // 4 windows).
+        cfg.dhan_burst_offset_ms = 16_000;
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("strictly before dhan_lane_cutoff_ms"),
+            "unexpected error: {err}"
+        );
+        cfg.dhan_burst_offset_ms = 15_000;
+        assert!(
+            cfg.validate().is_err(),
+            "a burst exactly AT the cutoff is equally discarded"
+        );
+        // Just inside the cutoff still fails the DEEPEST-spot-bucket
+        // bound (14999 + 4000 >= 15000); a burst whose whole spill fits
+        // is legal (10999 + 4000 < 15000).
+        cfg.dhan_burst_offset_ms = 14_999;
+        assert!(cfg.validate().is_err(), "deepest bucket past the cutoff");
+        cfg.dhan_burst_offset_ms = 10_999;
+        assert!(cfg.validate().is_ok(), "whole spill inside the cutoff");
+        // The shipped defaults sit comfortably inside the band.
+        assert!(CadenceConfig::default().validate().is_ok());
+    }
+
+    /// Cadence validate(): the deepest-spot-bucket feasibility bound
+    /// covers BOTH schedule inputs of the 2026-07-16 shape — the burst
+    /// offset AND the post-close clamp (build_cycle_slots takes
+    /// max(burst, T + spot_min_post_close_ms) as the spot base, deepest
+    /// bucket = base + 4 windows); a large negative Groww anchor is
+    /// rejected; the expiry knobs are bounded sane.
+    #[test]
+    fn test_cadence_config_validate_rejects_out_of_range_burst_clamp_and_expiry_knobs() {
+        // A clamp that pushes the deepest bucket to/past the cutoff is
+        // refused (SEC-CAD-1 class: 11000 + 4000 >= 15000 — silently
+        // discarded on the resolved-lane guard otherwise).
+        let mut cfg = CadenceConfig {
+            spot_min_post_close_ms: 20_000,
+            ..CadenceConfig::default()
+        };
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("spot_min_post_close_ms"),
+            "unexpected error: {err}"
+        );
+        cfg.spot_min_post_close_ms = 11_000;
+        assert!(
+            cfg.validate().is_err(),
+            "clamp deepest bucket exactly AT the cutoff (11000 + 4000 == 15000) is equally discarded"
+        );
+        cfg.spot_min_post_close_ms = 10_999;
+        assert!(cfg.validate().is_ok(), "just inside the cutoff is legal");
+        cfg.spot_min_post_close_ms = 300;
+        // A LARGE NEGATIVE Groww anchor is rejected (the burst is a
+        // post-close fire — a pre-close burst would race the close).
+        cfg.groww_anchor_offset_ms = -60_000;
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("groww_anchor_offset_ms"),
+            "unexpected error: {err}"
+        );
+        // Expiry knobs: a non-positive retry interval and a deadline
+        // outside the seconds-of-day domain are refused.
+        cfg.groww_anchor_offset_ms = 0;
+        cfg.expiry_retry_interval_ms = 0;
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("expiry_retry_interval_ms"),
+            "unexpected error: {err}"
+        );
+        // R3-F1 belt (a): a burst-window-capable interval (> one
+        // minute) is refused — 65s @ a 09:14:58 wake would land the
+        // last pre-era wave at 09:16:03, the spot-group instant.
+        cfg.expiry_retry_interval_ms = 65_000;
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("expiry_retry_interval_ms"),
+            "unexpected error: {err}"
+        );
+        // The one-minute ceiling itself (the base.toml default) is legal.
+        cfg.expiry_retry_interval_ms = 60_000;
+        cfg.expiry_deadline_secs_of_day_ist = 86_400;
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("expiry_deadline_secs_of_day_ist"),
+            "unexpected error: {err}"
+        );
+        cfg.expiry_deadline_secs_of_day_ist = 32_100;
+        assert!(cfg.validate().is_ok());
     }
 
     /// PR-4 (Groww contract leg): the `[groww_contract_1m]` section is
@@ -5181,6 +6707,95 @@ mod tests {
         // And the valid default passes end-to-end.
         let config = make_valid_config();
         assert!(config.validate().is_ok());
+    }
+
+    /// CAPTURE-LEG MUTUAL EXCLUSION (coordinator ruling B, 2026-07-16 —
+    /// SUBSUME, NEVER SHARE, interim fail-closed path; RS3 hardening
+    /// same day): enabling the cadence while ANY legacy per-minute
+    /// RECORD-capture leg is still enabled is a validation ERROR (no
+    /// double demand on one broker's rate budget is ever legal) —
+    /// REGARDLESS of `feeds.*_enabled`, because the cadence lanes key on
+    /// the RUNTIME feed atomics while the legacy legs spawn on their own
+    /// config gates, so the boot-time feed flags bound neither side.
+    /// Cadence on with the legs off is legal; cadence off with the legs
+    /// on (the base.toml shape today) stays legal.
+    #[test]
+    fn test_application_config_validate_cadence_capture_leg_mutual_exclusion() {
+        // Cadence ON + a legacy Dhan leg ON → error (feed flag irrelevant).
+        let mut config = make_valid_config();
+        config.cadence.enabled = true;
+        config.feeds.dhan_enabled = true;
+        config.spot_1m_rest.enabled = true;
+        config.option_chain_1m.enabled = false;
+        let err = config.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("spot_1m_rest"),
+            "error must name the standing Dhan leg, got: {err}"
+        );
+        config.spot_1m_rest.enabled = false;
+        config.option_chain_1m.enabled = true;
+        assert!(config.validate().is_err(), "chain leg alone also refuses");
+        // Cadence ON + a legacy Groww leg ON → error (feed flag irrelevant).
+        let mut config = make_valid_config();
+        config.cadence.enabled = true;
+        config.feeds.groww_enabled = true;
+        config.spot_1m_rest.enabled = false;
+        config.option_chain_1m.enabled = false;
+        for flip in 0..3 {
+            config.groww_spot_1m.enabled = flip == 0;
+            config.groww_option_chain_1m.enabled = flip == 1;
+            config.groww_contract_1m.enabled = flip == 2;
+            let err = config.validate().unwrap_err();
+            assert!(
+                err.to_string().contains("Groww"),
+                "error must name the Groww lane, got: {err}"
+            );
+        }
+        // Cadence ON + all legs OFF → ok (the stand-down shape).
+        config.groww_spot_1m.enabled = false;
+        config.groww_option_chain_1m.enabled = false;
+        config.groww_contract_1m.enabled = false;
+        assert!(config.validate().is_ok(), "cadence on + legs off is legal");
+        // Cadence OFF + legs ON (the pre-2026-07-17 base.toml shape —
+        // still a legal permutation) → ok.
+        let mut config = make_valid_config();
+        config.cadence.enabled = false;
+        config.spot_1m_rest.enabled = true;
+        config.option_chain_1m.enabled = true;
+        config.groww_spot_1m.enabled = true;
+        assert!(
+            config.validate().is_ok(),
+            "cadence off + legacy legs on stays a valid permutation"
+        );
+        // RS3 (2026-07-16): a boot-time-DISABLED feed lane's legs DO
+        // block the cadence now — the pre-RS3 key on `feeds.*_enabled`
+        // admitted cadence=ON + feed=OFF + legs=ON, which sat one
+        // runtime /api/feeds enable away from reconstructing the
+        // forbidden double demand (the cadence lanes key on the RUNTIME
+        // atomics, not the boot flags). Fail-closed at the root.
+        let mut config = make_valid_config();
+        config.cadence.enabled = true;
+        config.feeds.dhan_enabled = true;
+        config.feeds.groww_enabled = false;
+        config.spot_1m_rest.enabled = false;
+        config.option_chain_1m.enabled = false;
+        config.groww_spot_1m.enabled = true;
+        let err = config.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("Groww"),
+            "RS3: a runtime-reachable lane's legs must refuse regardless \
+             of the boot feed flag, got: {err}"
+        );
+        // Same in the Dhan direction: feeds.dhan_enabled=false does not
+        // exempt the Dhan legs from the exclusion.
+        let mut config = make_valid_config();
+        config.cadence.enabled = true;
+        config.feeds.dhan_enabled = false;
+        config.spot_1m_rest.enabled = true;
+        assert!(
+            config.validate().is_err(),
+            "RS3: Dhan legs refuse with feeds.dhan_enabled=false too"
+        );
     }
 
     /// A missing `[feeds]` section must fall back to the safe default

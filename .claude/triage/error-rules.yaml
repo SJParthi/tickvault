@@ -175,6 +175,23 @@ rules:
       auto-reset — the operator must diagnose whether the underlying
       issue is authentication, rate limiting, or a bad order payload.
 
+  # -----------------------------------------------------------------------
+  # Cluster B — live order refused by the fail-closed order-readiness gate
+  # -----------------------------------------------------------------------
+
+  - name: order-ready-01-gate-refused-escalate
+    match:
+      code: ORDER-READY-01
+    action: escalate
+    runbook_path: .claude/rules/project/order-readiness-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 0
+    justification: >-
+      A live order was refused by the fail-closed readiness gate (no probe,
+      stale probe, invalid Dhan dataPlan/segment, or low token headroom).
+      Never auto-action — the operator must confirm the Dhan data plan,
+      Derivative segment and token before orders are re-enabled.
+
   # =======================================================================
   # MILESTONE 2 — full ErrorCode coverage (48 new rules, total 54 codes)
   #
@@ -2055,6 +2072,50 @@ rules:
       re-run once the underlying condition (BruteX producer publish, S3
       reachability, QuestDB health per BOOT-01/02) is fixed.
 
+  # SPOT-XVERIFY-01 (spot cross-verify comparator) = the daily 15:47 IST
+  # Dhan-vs-Groww spot 1m cross-verify found >=1 divergent / missing cell.
+  # Escalate — NOT auto-triage safe (severity-independent is_auto_triage_safe
+  # override, the BRUTEX-XVERIFY-01 / FUTIDX-02 precedent): a data-
+  # comparability signal is never auto-actioned; the operator decides which
+  # capture chain drifted. Both feeds re-produce tomorrow; the audit rows are
+  # the durable record — never hand-patch either table.
+  - name: spot-xverify-01-divergence-found-escalate
+    match:
+      code: SPOT-XVERIFY-01
+    action: escalate
+    runbook_path: .claude/rules/project/spot-crossverify-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 600
+    justification: >-
+      SPOT-XVERIFY-01 = the daily Dhan-vs-Groww spot 1-minute cross-verify
+      found divergent / missing cells. Data-comparability signal — never
+      auto-actioned (severity-independent is_auto_triage_safe override): the
+      operator inspects spot_crossverify_cell_audit (field/kind breakdown)
+      and the day's per-feed spot 1m REST health to decide which capture
+      chain drifted. Track the trend, not the absolute count.
+
+  # SPOT-XVERIFY-02 (spot cross-verify comparator) = a leg of the daily run
+  # degraded (questdb read/write, join/parse, wall-clock cap, keep-better
+  # suppression). The degrade is honestly stamped (partial/no_data/blind/
+  # degraded — never a false clean); the run is DEDUP-idempotent and the
+  # keep-better guard protects a measured day, so escalate = the operator
+  # re-runs after fixing the underlying QuestDB condition.
+  - name: spot-xverify-02-run-degraded-escalate
+    match:
+      code: SPOT-XVERIFY-02
+    action: escalate
+    runbook_path: .claude/rules/project/spot-crossverify-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 600
+    justification: >-
+      SPOT-XVERIFY-02 = the daily spot cross-verify run degraded on one leg
+      (QuestDB read/write, join/parse, wall-clock cap, keep-better
+      suppression). Best-effort cold-path forensic compare — feeds/capture/
+      trading are unaffected; escalate so the operator knows the day is
+      partial/no_data/blind/degraded and can backfill via the DEDUP-
+      idempotent re-run once the underlying QuestDB condition (per
+      BOOT-01/02) is fixed.
+
   # -----------------------------------------------------------------------
   # Per-minute spot 1m REST pipeline (operator grant 2026-07-12, PR-2)
   # -----------------------------------------------------------------------
@@ -2728,3 +2789,108 @@ rules:
       GROWW-PUSH-04 = push-channel supervisor respawned the task. The
       respawn already self-healed; a sustained respawn rate is a real bug
       — the operator captures the backtrace per the runbook.
+
+  # CADENCE-01 = a cadence broker lane degraded inside a cycle (fetch
+  # failures / 429-despite-gates / empty spots / fallback provenance /
+  # unknown moneyness / ladder exhausted). The scheduler self-heals by
+  # construction: the next minute boundary re-fires, the failure ladder
+  # walks the anchor earlier, and RateLimited is never blind-retried.
+  # Escalate so the operator reads the coalesced per-cycle stage list —
+  # a sustained rate_limited stage is a gate-bug / shared-budget signal
+  # worth human eyes, never an auto-fix.
+  - name: cadence-01-lane-degraded-escalate
+    match:
+      code: CADENCE-01
+    action: escalate
+    runbook_path: .claude/rules/project/cadence-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 600
+    justification: >-
+      CADENCE-01 = cadence lane degraded this cycle (coalesced). The
+      ladder + next-boundary re-fire already self-heal; the operator
+      inspects the stage taxonomy per the runbook (rate_limited despite
+      the structural gates = shared-budget co-tenant or broker
+      tightening — a spacing constant must never be auto-touched).
+
+  # CADENCE-02 = a (lane, cycle-minute) decision honest-skipped (cutoff /
+  # both sources dead / all-Unknown moneyness). The skip IS the
+  # fail-closed action — no decision on missing/stale data; nothing to
+  # undo, nothing to restart. Escalate for visibility (Rule 11: a skip is
+  # never rendered OK); a RUN of skips points at the broker surface and
+  # the capture legs' own codes for the same window.
+  - name: cadence-02-decision-skipped-escalate
+    match:
+      code: CADENCE-02
+    action: escalate
+    runbook_path: .claude/rules/project/cadence-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 600
+    justification: >-
+      CADENCE-02 = cadence decision honest-skipped. The skip is the
+      fail-closed design outcome (exactly-once latch, never a late
+      decision); dry-run boots skip EVERY minute by design (the
+      DryRunLoggingExecutor returns Empty). Operator correlates a skip
+      run with CADENCE-01 stages + SPOT1M-01/CHAIN-02 per the runbook.
+
+  # CADENCE-03 = scheduler machinery degraded (ladder shift / late wake /
+  # boundary skipped / skew clamped / runner respawn / nominal gate
+  # deferral). Every arm already self-corrected or self-reported; the
+  # supervised runner respawns itself (release panics abort the process —
+  # the TICK-FLUSH-01 honesty note). Escalate so trends (host pressure,
+  # respawn storms, the should-never gate_deferred_nominal) reach the
+  # operator; nothing here is auto-fixable.
+  - name: cadence-03-scheduler-degraded-escalate
+    match:
+      code: CADENCE-03
+    action: escalate
+    runbook_path: .claude/rules/project/cadence-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 600
+    justification: >-
+      CADENCE-03 = cadence scheduler machinery degraded. late_wake /
+      boundary_skipped trends correlate with host pressure (PROC-01,
+      RESOURCE-01..03); a respawn storm is a real bug needing the panic
+      backtrace; gate_deferred_nominal is a schedule/gate consistency
+      bug to file — never widen spacings as a reaction.
+
+  # FOLD-01 = the REST-era bar-fold candle derivation degraded (catch-up
+  # query/parse, seal/bar handoff drop, or a supervised-task respawn).
+  # Escalate (not auto_restart): every degrade is RE-DERIVABLE — the
+  # spot_1m_rest source rows stand and the dirty-day refold + next boot's
+  # catch-up re-emit DEDUP-idempotently; the operator inspects the stage
+  # (QuestDB /exec health vs seal-writer backpressure vs a fold bug) per
+  # the runbook. Log-sink-only delivery — the 15:40 IST tf-consistency
+  # verifier is the end-to-end "are the candles there?" signal.
+  - name: fold-01-rest-candle-derivation-degraded-escalate
+    match:
+      code: FOLD-01
+    action: escalate
+    runbook_path: .claude/rules/project/rest-candle-fold-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 600
+    justification: >-
+      FOLD-01 = a leg of the REST-era candle fold degraded. No market data
+      is lost (the spot_1m_rest rows stand; refold/catch-up repair
+      idempotently); escalate so the operator reads the stage field and
+      cross-checks QuestDB /exec (catchup_*) or the seal-writer chain
+      (seal_send) per the runbook instead of any auto-action.
+
+  # RAMSTORE-01 = a RAM residency store leg degraded (chain rehydrate
+  # query/parse/truncation, live row-cap truncation, stale-day drop, or a
+  # supervised stats/rehydrate task respawn). Escalate (not auto_restart):
+  # QuestDB remains the durable truth — a RAM degrade re-fills via PR-1's
+  # boot catch-up + the bounded chain rehydrate at the next boot; the
+  # operator inspects the stage + the depth gauges per the runbook.
+  - name: ramstore-01-ram-residency-degraded-escalate
+    match:
+      code: RAMSTORE-01
+    action: escalate
+    runbook_path: .claude/rules/project/ram-store-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 600
+    justification: >-
+      RAMSTORE-01 = the RAM residency machinery degraded, never market-data
+      loss (the candles_* / option_chain_1m DEDUP rows stand and RAM
+      re-fills at the next boot). Escalate so the operator reads the stage
+      field and the tv_ram_store_* depth gauges per the runbook instead of
+      any auto-action.
