@@ -1477,9 +1477,9 @@ mod tests {
     fn test_worst_example_lines_and_format_finding_line() {
         let mut d = BTreeMap::new();
         let mut g = BTreeMap::new();
-        // 10:32 AM = 10*3600 + 32*60 = 38_520 secs of day.
-        d.insert(nifty(38_520), bar(100.0, 115.60, 99.0, 100.5));
-        g.insert(nifty(38_520), bar(100.0, 101.00, 99.0, 100.5));
+        // 10:32 AM = 10*3600 + 32*60 = 37_920 secs of day.
+        d.insert(nifty(37_920), bar(100.0, 115.60, 99.0, 100.5));
+        g.insert(nifty(37_920), bar(100.0, 101.00, 99.0, 100.5));
         // 2:31 PM = 52_260 secs — a smaller low skew.
         d.insert(nifty(52_260), bar(100.0, 101.0, 99.00, 100.5));
         g.insert(nifty(52_260), bar(100.0, 101.0, 99.02, 100.5));

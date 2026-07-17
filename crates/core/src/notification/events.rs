@@ -1706,6 +1706,10 @@ pub struct RestLegScoreLine {
     /// Minutes that NEVER got repaired (post-close sweep included);
     /// `-1` = not recorded.
     pub named_gaps: i64,
+    /// `named_gap` rows classed `pre_boot` — minutes from before this
+    /// app start (bookkeeping, NOT pull failures; rendered separately
+    /// from "never recovered" — Fix E, 2026-07-17); `-1` = not recorded.
+    pub pre_boot_gaps: i64,
     /// How many rate-limit rejections the day's pulls hit; `-1` unknown.
     pub rate_limited_hits: i64,
     /// Pulls repaired LATE (retrieved ≥60s after the minute closed — a
@@ -8834,6 +8838,7 @@ mod tests {
             ok_fetches: -1,
             failed_fetches: -1,
             named_gaps: -1,
+            pre_boot_gaps: -1,
             rate_limited_hits: -1,
             late_recovered: -1,
             close_p50_ms: -1,
@@ -9229,6 +9234,7 @@ mod tests {
                 ok_fetches: 700,
                 failed_fetches: 33,
                 named_gaps: 2,
+                pre_boot_gaps: 0,
                 ..rest_line("Groww", "spot candles")
             },
             RestLegScoreLine {
@@ -9517,6 +9523,7 @@ mod tests {
                 ok_fetches: 10,
                 failed_fetches: 2,
                 named_gaps: 1,
+                pre_boot_gaps: 0,
                 ..rest_line("Groww", "spot candles")
             },
             rest_line("Groww", "option chain"), // all -1: skipped
@@ -9628,6 +9635,7 @@ mod tests {
             close_p99_ms: 1800,
             close_samples: 350,
             named_gaps: 3,
+            pre_boot_gaps: 0,
             ..rest_line("Dhan", "spot candles")
         }];
         assert_eq!(
