@@ -94,6 +94,13 @@ needing another rule-file edit.
 
 **Source:** `crates/core/src/pipeline/first_seen_set.rs`
 
+> **2026-07-17 note (dead live-WS sweep stage 1):** the source module
+> `first_seen_set.rs` is DELETED — it had ZERO production callers (only
+> comments referenced it since the PR-C2 Dhan live-WS lane deletion,
+> 2026-07-13). The `PrevClose02` variant was already emitter-less
+> ("reserved") and is RETAINED pending the post-sibling-merge variant
+> sweep; this file keeps satisfying the cross-ref test.
+
 ## PREVOI-01 — prev_oi cache empty at boot
 
 **Trigger:** PR #450 commit 6 (2026-05-03) wires the boot-time

@@ -214,6 +214,16 @@ pub struct ApplicationConfig {
     /// (discard drain, no WAL capture). `config/base.toml` opts in.
     #[serde(default)]
     pub order_runtime: OrderRuntimeConfig,
+    /// `[dhan_order_push]` — 🔷 DHAN order-update WS paper-mode push channel
+    /// (operator directive 2026-07-16, governance on PR #1597 —
+    /// `.claude/plans/active-plan-dhan-order-update-rewire.md`): when
+    /// enabled, the dhan_rest_stack re-wires the dormant order-update WS
+    /// module RECEIVE-ONLY (notifier `None` per the Dhan noise lock) and a
+    /// supervised consumer records each order event as an `order_audit` row
+    /// `feed='dhan'`/`mode='paper'`. No live orders; `dry_run` untouched.
+    /// Absent section ⇒ DISABLED (fail-safe default off).
+    #[serde(default)]
+    pub dhan_order_push: DhanOrderPushConfig,
     /// `[groww_rest_burst]` — the 2026-07-14 Groww REST burst auto-ladder
     /// (operator approval "approved and go ahead with the recommendation";
     /// `no-rest-except-live-feed-2026-06-27.md` §9.7): which burst tier the
@@ -1715,6 +1725,26 @@ pub struct GrowwUniverseConfig {
     pub enabled: bool,
 }
 
+/// `[dhan_order_push]` — 🔷 DHAN order-update WS paper-mode push channel
+/// (operator directive 2026-07-16; governance authorization on PR #1597).
+/// Receive-only observability wiring: the dhan_rest_stack spawns the
+/// dormant `order_update_connection` module with `notifier: None` (the
+/// 2026-07-14 Dhan noise lock — no Telegram) plus a supervised consumer
+/// mapping order updates to `order_audit` rows `feed='dhan'`/`mode='paper'`.
+/// No live orders; `dry_run` untouched.
+///
+/// Fail-safe shape: `enabled` is `#[serde(default)]` = `false`, so an absent
+/// `[dhan_order_push]` section (or a TOML written before this PR) disables
+/// the channel entirely. `config/base.toml` ships the section with
+/// `enabled = false` (the house fail-safe pattern).
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct DhanOrderPushConfig {
+    /// Master switch for the paper-mode order-update push channel.
+    /// Default OFF (fail-safe).
+    #[serde(default)]
+    pub enabled: bool,
+}
+
 /// serde default for [`GrowwContract1mConfig::strikes_each_side`] — the
 /// pinned [`crate::constants::GROWW_CONTRACT_1M_DEFAULT_STRIKES_EACH_SIDE`].
 fn default_groww_contract_1m_strikes_each_side() -> u32 {
@@ -1888,6 +1918,12 @@ pub struct GrowwOrdersConfig {
     /// hardcoded.
     #[serde(default)]
     pub max_order_quantity: i64,
+    /// Receive-only order/position PUSH channel (Stage A, 2026-07-16) —
+    /// paper-mode observability of broker-pushed order/position updates.
+    /// Default OFF. Places NO order; a config value alone can never fire
+    /// a mutation (the §39.2 lattice is untouched).
+    #[serde(default)]
+    pub order_push_enabled: bool,
 }
 
 fn default_groww_oco_reconcile_poll_secs() -> u64 {
@@ -1916,6 +1952,7 @@ impl Default for GrowwOrdersConfig {
             oco_sibling_cancel_deadline_secs: default_groww_oco_sibling_cancel_deadline_secs(),
             paper_enabled: false,
             max_order_quantity: 0,
+            order_push_enabled: false,
         }
     }
 }
@@ -4115,6 +4152,7 @@ mod tests {
             market_ram_store: MarketRamStoreConfig::default(),
             groww_contract_1m: GrowwContract1mConfig::default(),
             order_runtime: OrderRuntimeConfig::default(),
+            dhan_order_push: DhanOrderPushConfig::default(),
             groww_universe: GrowwUniverseConfig::default(),
             groww_orders: GrowwOrdersConfig::default(),
             dhan_margin_gate: DhanMarginGateConfig::default(),
@@ -4162,6 +4200,12 @@ mod tests {
             cfg.max_order_quantity, 0,
             "max_order_quantity must default 0 (refuse-all) pending the operator's 0-vs-1 answer"
         );
+        // Order-push Stage A (2026-07-16): the receive-only push channel
+        // defaults off.
+        assert!(
+            !cfg.order_push_enabled,
+            "order_push_enabled must default off (Gate 1) — the push channel is dark by default"
+        );
     }
 
     /// PR-0 / Smart Orders area (2026-07-15): an ABSENT `[groww_orders]`
@@ -4170,7 +4214,7 @@ mod tests {
     /// `#[serde(default…)]` attribute — which would make an absent field a
     /// hard deserialize ERROR (the two OCO cadences) or silently zero a u64 —
     /// fails the build. (`GrowwOrdersConfig` derives no `PartialEq`, so the
-    /// eleven fields are compared explicitly against `Default`.)
+    /// twelve fields are compared explicitly against `Default`.)
     #[test]
     fn test_groww_orders_config_absent_section_serde_parity() {
         let parsed: GrowwOrdersConfig = toml::from_str("")
@@ -4190,6 +4234,7 @@ mod tests {
         );
         assert_eq!(parsed.paper_enabled, def.paper_enabled);
         assert_eq!(parsed.max_order_quantity, def.max_order_quantity);
+        assert_eq!(parsed.order_push_enabled, def.order_push_enabled);
     }
 
     // -----------------------------------------------------------------------
@@ -6016,6 +6061,43 @@ mod tests {
         assert!(!on.order_runtime.self_test);
         assert_eq!(on.order_runtime.reconcile_interval_secs, 120);
         assert_eq!(on.order_runtime.mark_channel_capacity, 4_096);
+    }
+
+    /// Dhan order-update push (2026-07-16): the `[dhan_order_push]` section
+    /// is FAIL-SAFE default OFF — `Default`, a missing section, and an
+    /// empty section all deserialize to disabled; explicit `enabled = true`
+    /// round-trips.
+    #[test]
+    fn dhan_order_push_config_defaults_off() {
+        use figment::Figment;
+        use figment::providers::{Format, Toml};
+
+        let d = DhanOrderPushConfig::default();
+        assert!(!d.enabled, "dhan_order_push must default OFF (fail-safe)");
+
+        #[derive(Deserialize)]
+        struct Wrapper {
+            #[serde(default)]
+            dhan_order_push: DhanOrderPushConfig,
+        }
+        // Missing section entirely → disabled, never an error.
+        let missing: Wrapper = Figment::new()
+            .merge(Toml::string("[other]\nx = 1\n"))
+            .extract()
+            .expect("missing [dhan_order_push] must default, not error");
+        assert!(!missing.dhan_order_push.enabled);
+        // Empty section (no keys) → disabled.
+        let empty: Wrapper = Figment::new()
+            .merge(Toml::string("[dhan_order_push]\n"))
+            .extract()
+            .expect("empty [dhan_order_push] must default, not error");
+        assert!(!empty.dhan_order_push.enabled);
+        // Explicit ON round-trips.
+        let on: Wrapper = Figment::new()
+            .merge(Toml::string("[dhan_order_push]\nenabled = true\n"))
+            .extract()
+            .expect("explicit enabled = true must round-trip");
+        assert!(on.dhan_order_push.enabled);
     }
 
     /// Order runtime validation: the 60s reconcile floor + the bounded

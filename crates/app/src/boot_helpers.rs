@@ -531,9 +531,9 @@ mod tests {
         assert_eq!(secs_until_close_seal_ist(0), 55_805);
     }
 
-    /// Wiring ratchet (source-scan, repo style — mirrors the
-    /// now-retired `wal_reinject` ratchet pattern; that module was
-    /// deleted 2026-07-17, evidence-audit Fix PR C):
+    /// Wiring ratchet (source-scan, repo style — the pattern the deleted
+    /// `wal_reinject` ratchets established; that module retired 2026-07-17,
+    /// dead live-WS sweep stage 1):
     /// the close-time force-seal task MUST stay spawned in
     /// `spawn_engine_b_aggregator` (main.rs Task 3b) with (a) the
     /// `compute_close_seal_sleep` trigger, (b) the trading-day calendar

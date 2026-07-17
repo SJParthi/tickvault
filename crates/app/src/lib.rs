@@ -18,7 +18,11 @@
 #![allow(clippy::doc_lazy_continuation)]
 #![allow(clippy::doc_overindented_list_items)]
 
-pub mod bar_cache_loader;
+// Dead live-WS sweep stage 1 (2026-07-17, operator directive via
+// coordinator): `bar_cache_loader` module DELETED — zero production
+// callers (its only reference was this declaration); it read the retired
+// tick-fed candle shadow tables with a feed-blind union (feed-separation
+// recon GAP-1), and its in-RAM `BarCache` consumer died with it.
 // W2 PR#5 (2026-07-10, audit follow-up row 15): holiday-calendar
 // coverage-horizon staleness watchdog - pages the operator BEFORE the
 // calendar runs off its year-end cliff into un-listed holidays.
@@ -131,12 +135,26 @@ pub mod dhan_data_api_limiter;
 /// Dhan live-WS retirement (the spot-1m legs must outlive the cross-verify
 /// module the Phase C deletion PRs remove). Pure move, zero behavior change.
 pub mod dhan_intraday_parse;
+/// 🔷 DHAN order-update PAPER-MODE push consumer (operator directive
+/// 2026-07-16; governance on PR #1597): receive-only broadcast consumer
+/// mapping order updates to `order_audit` rows `feed='dhan'`/`mode='paper'`.
+/// Spawned by `dhan_rest_stack` Phase 5a under `[dhan_order_push] enabled`
+/// (default OFF).
+pub mod dhan_order_push_observability;
 /// Dhan REST-only auth bootstrap (Phase A of the Dhan-live-feed removal,
 /// operator directive 2026-07-13): with `feeds.dhan_enabled = false` this
 /// brings up the RETAINED Dhan REST surface — dual-instance lock →
 /// TokenManager → renewal + mid-session watchdog → REST canary +
 /// spot_1m_rest + option_chain_1m — WITHOUT any WebSocket lane.
 pub mod dhan_rest_stack;
+/// Groww order/position PUSH channel — Stage D app consumer (2026-07-17,
+/// operator-authorized paper-mode receive-only build): bridges trading-side
+/// `BrokerOrderEvent`s from the supervised push runner into `order_audit`
+/// forensic rows (`feed='groww'`). Gated on the non-default `groww_orders`
+/// cargo feature (§39.2 Gate 2) AND the runtime
+/// `[groww_orders] order_push_enabled` flag (Gate 1, default OFF).
+#[cfg(feature = "groww_orders")]
+pub mod groww_order_observability;
 /// `[groww_universe]` process-global daily Groww watch-set + shared-master
 /// rider (2026-07-15 live-feed retirement re-home of the activation daily
 /// build loop + the sole persist_groww_instruments caller).
@@ -223,12 +241,14 @@ pub mod order_observability;
 pub mod order_runtime;
 pub mod subsystem_memory;
 pub mod trading_pipeline;
-// 2026-07-17 (evidence-audit Fix PR C): `pub mod wal_reinject;` RETIRED —
-// the C3 (2026-07-03) bounded STAGE-C.2b re-injection module was ORPHANED
-// (zero production callers; its main.rs call sites died with the Dhan
-// live-WS lane, and main.rs now count-residuals + `confirm_replayed()`
-// instead). Deleted with its dead WS-REINJECT-01 paging filter — see
-// `.claude/rules/project/ws-reinject-error-codes.md` (RETIRED banner).
+// Dead live-WS sweep stage 1 (2026-07-17, operator directive via
+// coordinator): `wal_reinject` module DELETED — its own PR-C2 comments
+// recorded it "retained un-consumed pending the Phase C module cleanup";
+// both STAGE-C.2b re-injection call sites died with the Dhan live-WS lane
+// (2026-07-13), and main.rs drains residual LiveFeed WAL frames loudly at
+// boot instead. The WS-REINJECT-01 paging filter was retired in lockstep
+// (error-code-alarms.tf dated note); the `WsReinject01Aborted` variant is
+// retained pending the post-sibling-merge variant sweep.
 /// Shared `ws_event_audit` channel + consumer helper — relocated from the
 /// main.rs binary in Phase C1 (2026-07-13) so the lib-side `dhan_rest_stack`
 /// (which owns the functional-dormant order-update WS per operator ruling

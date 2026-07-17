@@ -122,6 +122,9 @@ const REVERSE_CHECK_ALLOWLIST: &[&str] = &[
     // historical audit per the house banner convention — exactly the
     // WS-GAP-05..09 mechanism.
     "WS-REINJECT-01",
+    // GROWW-PUSH-01..04 (Stage 0 stubs, 2026-07-16) were REMOVED from this
+    // allowlist when Stage A landed their `GrowwPush0*` ErrorCode variants
+    // (the documented Stage-A obligation of the Stage-0 entry).
 ];
 
 #[test]

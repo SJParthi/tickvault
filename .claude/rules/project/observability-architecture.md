@@ -49,9 +49,10 @@ DH-901, DH-906 (term-match tripwire — no coded emit site
 exists yet), AUTH-GAP-04 (the Groww stall-storm entry left this list
 2026-07-15 — its only ERROR-level emit site, the deleted sidecar stall
 watchdog, died with the Groww live feed; see "Retired paging entries" below),
-(WS-REINJECT-01 left this list 2026-07-17 — its only emit site, the
-orphaned `wal_reinject.rs` module, had zero production callers; see
-"Retired paging entries" below), PROC-01, **AGGREGATOR-DROP-01 (added 2026-07-09** — the
+(the WAL re-injection-abort entry left this list 2026-07-17 — its only
+emit site, the un-consumed `wal_reinject.rs` helper, was deleted in the
+dead live-WS sweep stage 1; see "Retired paging entries" below), PROC-01,
+**AGGREGATOR-DROP-01 (added 2026-07-09** — the
 audit found the Severity::Critical sealed-candle-drop code, the ONLY
 silent-data-loss path for sealed candles, paged nobody; it also gains a
 redundant counter-side pager on `tv_seal_writer_drain_total{kind="dropped"}`
@@ -123,14 +124,13 @@ filter+alarm AND the `tv-<env>-feed-stall-restarts` counter alarm
 (`feed-stall-restart-alarm.tf`) were RETIRED 2026-07-15 with the Groww live
 feed — their emit sites (the stall watchdog + sidecar supervisor) were
 deleted, so neither could ever fire again (dated notes in both tf files).
-The `ws-reinject-01` filter+alarm was RETIRED 2026-07-17 (evidence-audit
-Fix PR C) — its only emit site, the orphaned `wal_reinject.rs` module, had
-ZERO production callers (the STAGE-C.2b re-injection call sites died with
-the Dhan live-WS lane; main.rs count-residuals + `confirm_replayed()` are
-the retained coverage), so the filter could never match again; the module,
-the `WsReinject01Aborted` variant, and the tf map entry were removed in the
-same PR (dated notes in `error-code-alarms.tf`; rule file
-`ws-reinject-error-codes.md` retained as historical audit).
+The `ws-reinject-01` filter+alarm was RETIRED 2026-07-17 (dead live-WS
+sweep stage 1) — its only emit site, `crates/app/src/wal_reinject.rs`
+(retained un-consumed since PR-C2 "pending the Phase C module cleanup"),
+was deleted in that cleanup, so the filter could never match again; the tf
+map entry was removed in the same PR (dated note in
+`error-code-alarms.tf`; the `WsReinject01Aborted` variant retirement is
+the post-sibling-merge variant sweep).
 
 > Removed from the filtered+alarmed set: the Dhan REST canary code
 > (RETIRED 2026-07-14 with its module + both spawn sites + the

@@ -15,8 +15,8 @@
 //! into `dhan_rest_stack` (which owns the order-update WS + the future
 //! order path) — tracked follow-up alongside the other retained-dormant
 //! modules (fast_boot_validation.rs, daily_universe_boot.rs;
-//! wal_reinject.rs left this list 2026-07-17 — deleted outright,
-//! evidence-audit Fix PR C). Re-wiring it MUST restore the
+//! wal_reinject.rs left this list 2026-07-17 — deleted in the dead
+//! live-WS sweep stage 1). Re-wiring it MUST restore the
 //! `for_runtime(verified_ip, dry_run)` halt gate this guard pinned.
 
 #[test]

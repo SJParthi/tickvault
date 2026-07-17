@@ -68,6 +68,13 @@
 # same-day total: 15 filters + 15 alarms. TICK-CONSERVE-01 stays (the
 # 15:40 conservation audit survives).
 #
+# 2026-07-17 UPDATE (dead live-WS sweep stage 1): -1 entry (WS-REINJECT-01,
+# ~-$0.10/mo) -> its ONLY emit site (crates/app/src/wal_reinject.rs,
+# retained un-consumed since PR-C2 "pending the Phase C module cleanup")
+# was deleted in that cleanup — a filter with no possible emit site is a
+# dead filter per the paging drift guard. New total: 14 filters + 14
+# alarms. FEED-STALL-01's earlier retirement pattern followed.
+#
 # 2026-07-14 UPDATE (REST-pipeline adversarial audit, GAP-01 + GAP-03 —
 # docs/audits/2026-07-14-rest-pipeline-adversarial-audit.md): +5 entries ->
 # 17 filters + 17 alarms (~+$0.50/mo; on top of the same-day REST-CANARY-01
@@ -112,11 +119,8 @@ locals {
   # false-recovery). ok_recovery = false suppresses that misleading OK for:
   #   (rest-canary-01 was in this list until its 2026-07-14 retirement
   #   with the canary module - operator Dhan noise lock.)
-  #   (ws-reinject-01 was in this list until its 2026-07-17 retirement —
-  #   evidence-audit Fix PR C: its only emitter, the orphaned
-  #   wal_reinject.rs module, had zero production callers, so the filter
-  #   could never match again — a dead paging filter per the drift guard;
-  #   the ws-gap-07 / feed-stall-01 precedent.)
+  #   (ws-reinject-01 was in this list until its 2026-07-17 retirement
+  #   with the wal_reinject module - dead live-WS sweep stage 1.)
   #   - proc-01: a discrete kernel OOM-kill event; the memory pressure that
   #     caused it is not fixed by the episode aging out.
   #   - dh-906: a discrete per-order reject; OK = aged out, never "orders
@@ -189,14 +193,13 @@ locals {
     # paging filter; the ws-gap-07 precedent above). The companion
     # >=3-restarts-per-15-min counter pager was deleted whole in the same PR
     # (feed-stall-restart-alarm.tf). Variant retirement is the post-C4 sweep.
-    # 2026-07-17 (evidence-audit Fix PR C): the "ws-reinject-01" entry was
-    # RETIRED — its only emit site, the orphaned wal_reinject.rs module,
-    # had ZERO production callers (the STAGE-C.2b re-injection call sites
-    # died with the Dhan live-WS lane; main.rs count-residuals +
-    # confirm_replayed are the retained coverage), so the filter could
-    # never match again (dead paging filter; the ws-gap-07 /
-    # feed-stall-01 / cross-verify-1m precedent). Module + WsReinject01Aborted
-    # variant deleted in the same PR; rule file retained as historical audit.
+    # RETIRED (2026-07-17 — dead live-WS sweep stage 1): the "ws-reinject-01"
+    # entry — its ONLY emit site (crates/app/src/wal_reinject.rs, retained
+    # un-consumed since PR-C2 "pending the Phase C module cleanup") was
+    # deleted in that cleanup, so the filter could never match again (dead
+    # paging filter; the ws-gap-07 / feed-stall-01 precedent above). The
+    # WsReinject01Aborted variant retirement is the post-sibling-merge
+    # variant sweep.
     "proc-01" = {
       pattern     = "{ $.code = \"PROC-01\" && $.level = \"ERROR\" }"
       period      = 300
