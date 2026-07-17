@@ -1029,6 +1029,26 @@ fn default_spot_xverify_noise_threshold_paise() -> i64 {
     2_000
 }
 
+impl SpotCrossverifyConfig {
+    /// Boot-time validation (Fix E review round 1, 2026-07-17): the noise
+    /// band must stay inside 0..=10_000 paise (₹0..=₹100). A negative value
+    /// is nonsense; an absurdly large one would demote ALL real drift to
+    /// Info (a silent-page hole) — both rejected at boot.
+    ///
+    /// # Errors
+    /// Returns a descriptive error when `noise_threshold_paise` is outside
+    /// the legal range.
+    pub fn validate(&self) -> Result<()> {
+        if !(0..=10_000).contains(&self.noise_threshold_paise) {
+            bail!(
+                "spot_crossverify.noise_threshold_paise ({}) must be within 0..=10000",
+                self.noise_threshold_paise
+            );
+        }
+        Ok(())
+    }
+}
+
 /// `[cadence]` — broker-agnostic fetch-cadence + decision-timing scheduler
 /// (operator cadence directive 2026-07-14, judge-locked design rev-8).
 /// Every timing below is a TARGET on the IST millis-of-day clock; the
@@ -3440,6 +3460,11 @@ impl ApplicationConfig {
         // both rejected at boot, BEFORE any REST task spawns.
         self.dhan_data_api.validate()?;
         self.spot_1m_rest.validate()?;
+
+        // Fix E (2026-07-17): the spot cross-verify severity noise band
+        // must stay inside 0..=10_000 paise — an absurd value would demote
+        // all real drift to Info.
+        self.spot_crossverify.validate()?;
 
         // 2026-07-14: scheduled OMS reconcile cadence must stay inside the
         // 60..=3600s envelope — rejected at boot, BEFORE the pipeline spawns.
@@ -5997,6 +6022,28 @@ mod tests {
             .extract()
             .expect("explicit enabled = true must round-trip");
         assert!(on.tf_consistency.enabled);
+    }
+
+    /// Fix E review round 1 (2026-07-17): the noise-band knob is
+    /// range-checked 0..=10_000 paise at boot — a negative or absurdly
+    /// large value (which would demote ALL real drift to Info) is rejected;
+    /// the boundaries themselves are legal.
+    #[test]
+    fn test_spot_crossverify_noise_threshold_validate_range() {
+        let mut cfg = SpotCrossverifyConfig::default();
+        assert!(cfg.validate().is_ok(), "default (2000) must validate");
+        cfg.noise_threshold_paise = 0;
+        assert!(cfg.validate().is_ok(), "0 (exact-match gating) is legal");
+        cfg.noise_threshold_paise = 10_000;
+        assert!(cfg.validate().is_ok(), "10_000 boundary is legal");
+        cfg.noise_threshold_paise = -1;
+        assert!(cfg.validate().is_err(), "negative must be rejected");
+        cfg.noise_threshold_paise = 10_001;
+        assert!(
+            cfg.validate().is_err(),
+            "an absurd band (> \u{20b9}100) must be rejected — it would \
+             demote all real drift to Info"
+        );
     }
 
     /// Daily spot cross-broker comparator (operator 2026-07-17): the

@@ -1455,6 +1455,21 @@ mod tests {
             bar(100.0, 101.0, 99.0, 100.5),
         );
         assert!(!is_noise_only_divergence(&big, false, false, 2_000));
+        // (3b) Fix E review round 1: the band is INCLUSIVE — a delta of
+        // EXACTLY the threshold (₹20.00 == 2000 paise) is still noise
+        // (`noise_max <= threshold`); one paise more is not.
+        let boundary = mk(
+            bar(100.0, 121.0, 99.0, 100.5),
+            bar(100.0, 101.0, 99.0, 100.5),
+        );
+        assert!(
+            is_noise_only_divergence(&boundary, false, false, 2_000),
+            "delta == threshold must stay noise (inclusive <= convention)"
+        );
+        assert!(
+            !is_noise_only_divergence(&boundary, false, false, 1_999),
+            "one paise past the band must page High"
+        );
         // (4) a missing minute on one broker → never noise.
         let mut d = BTreeMap::new();
         let mut g = BTreeMap::new();

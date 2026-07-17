@@ -1923,6 +1923,7 @@ fn compact_leg_label(leg: &str) -> &str {
 fn render_pulls_per_leg(rest_legs: &[RestLegScoreLine], feed: &str) -> Option<String> {
     let mut parts: Vec<String> = Vec::new();
     let mut gaps = 0i64;
+    let mut pre_boot = 0i64;
     // R2 (fix round 3): the verdict mark is three-state and never
     // fabricated — ✅ only when EVERY rendered leg is FULLY counted
     // (ok >= 0 AND failed >= 0) and failure-free; ⚠️ when any counted
@@ -1972,6 +1973,12 @@ fn render_pulls_per_leg(rest_legs: &[RestLegScoreLine], feed: &str) -> Option<St
         if l.named_gaps > 0 {
             gaps = gaps.saturating_add(l.named_gaps);
         }
+        if l.pre_boot_gaps > 0 {
+            // Fix E round 1: pre-boot gaps are bookkeeping (minutes from
+            // before this app start), never pull failures — summed here so
+            // they render, but they never flip the failure mark.
+            pre_boot = pre_boot.saturating_add(l.pre_boot_gaps);
+        }
     }
     if parts.is_empty() {
         return None;
@@ -1990,6 +1997,9 @@ fn render_pulls_per_leg(rest_legs: &[RestLegScoreLine], feed: &str) -> Option<St
     };
     if gaps > 0 {
         seg.push_str(&format!("; {gaps} never recovered \u{26a0}\u{fe0f}"));
+    }
+    if pre_boot > 0 {
+        seg.push_str(&format!("; {pre_boot} from before app start"));
     }
     Some(seg)
 }
@@ -2968,7 +2978,7 @@ impl NotificationEvent {
                          {mismatches} tiny timing differences out of {minutes_compared} \
                          minutes — NORMAL.\n\
                          Biggest gap: \u{20b9}{biggest_rupees:.2} (inside the normal band). \
-                         Open and close prices matched everywhere.\n\
+                         Open and close prices showed no real drift.\n\
                          {HONEST_FRAME}"
                     )
                 } else {
@@ -2984,13 +2994,16 @@ impl NotificationEvent {
                     } else {
                         ""
                     };
+                    // Fix E round 1: the lead already shows the worst line —
+                    // skip it in the example block (no duplicated line).
+                    let lead_used_worst = *mismatches > 0 && !top_detail.is_empty();
                     let mut detail_block = String::new();
-                    for line in top_detail.iter().take(3) {
+                    for line in top_detail.iter().skip(usize::from(lead_used_worst)).take(3) {
                         detail_block.push('\n');
                         detail_block.push_str("• ");
                         detail_block.push_str(&html_escape(line));
                     }
-                    let lead = if *mismatches > 0 && !top_detail.is_empty() {
+                    let lead = if lead_used_worst {
                         format!(
                             "\u{1f198} <b>Real price drift between \u{1f537} Dhan and \
                              \u{1f7e2} Groww \u{b7} {trading_date_ist}</b>\n\
@@ -3003,8 +3016,32 @@ impl NotificationEvent {
                              \u{1f537} Dhan vs \u{1f7e2} Groww needs a look</b>"
                         )
                     };
+                    // Fix E round 1: name WHICH gate paged, derived from the
+                    // same fields the severity gate used.
+                    let mut gates: Vec<&str> = Vec::new();
+                    if *missing_dhan > 0 || *missing_groww > 0 {
+                        gates.push("minutes missing on one broker");
+                    }
+                    if top_detail
+                        .iter()
+                        .any(|l| l.contains(" open:") || l.contains(" close:"))
+                    {
+                        gates.push("open/close price drift");
+                    }
+                    if gates.is_empty() {
+                        if *degraded || *truncated {
+                            gates.push("incomplete coverage");
+                        } else if *mismatches > 0 {
+                            gates.push("a price gap beyond the normal band");
+                        }
+                    }
+                    let why_note = if gates.is_empty() {
+                        String::new()
+                    } else {
+                        format!("\nWhy this pages: {}", gates.join(" + "))
+                    };
                     format!(
-                        "{lead}\n\
+                        "{lead}{why_note}\n\
                          Indices: {indices} | Minutes compared: {minutes_compared}\n\
                          Price differences: {mismatches} (biggest \
                          \u{20b9}{biggest_rupees:.2})\n\
@@ -3249,17 +3286,18 @@ impl NotificationEvent {
                         "\u{2705} <b>Groww option chain check PASSED</b>\n\
                          Today's one-time check pulled the Groww option chain \
                          successfully. Measured: {detail}\n\
-                         Recording is currently switched OFF. To start \
-                         recording it minute-by-minute: turn ON the Groww \
-                         option chain setting and restart the app."
+                         Minute-by-minute recording is handled by the \
+                         minute-cadence engine — when that engine is on, \
+                         chains record automatically; nothing else to do."
                     )
                 } else {
                     format!(
                         "\u{1f514} <b>Groww option chain check did NOT pass</b>\n\
                          Today's one-time check could not pull a usable Groww \
                          option chain. Measured: {detail}\n\
-                         Nothing is broken — recording is switched off and \
-                         stays off. Tomorrow's start checks again."
+                         Nothing is broken — tomorrow's start checks again. \
+                         If the minute-cadence engine is on, its own alerts \
+                         will say whether chain recording is affected."
                     )
                 }
             }
@@ -3380,9 +3418,9 @@ impl NotificationEvent {
             Self::ChainEntitlementConfirmed => "\u{2705} <b>Option chain data IS available on \
                  this account</b>\n\
                  Today's one-time check confirmed Dhan WILL serve option \
-                 chain data. Recording is currently switched OFF.\n\
-                 To start recording it minute-by-minute: turn ON the option \
-                 chain setting and restart the app."
+                 chain data. Minute-by-minute recording is handled by the \
+                 minute-cadence engine — when that engine is on, chains \
+                 record automatically; nothing else to do."
                 .to_string(),
             Self::ChainExpirylistFailed { detail } => {
                 let detail = html_escape(detail);
@@ -8654,7 +8692,10 @@ mod tests {
         let msg = passed.to_message();
         assert!(msg.contains("PASSED"), "got: {msg}");
         assert!(msg.contains("102 strikes"), "got: {msg}");
-        assert!(msg.contains("switched OFF"), "honest state: {msg}");
+        // Fix E round 1 (2026-07-17): the cadence engine records chains —
+        // never claim recording is OFF; point at the engine instead.
+        assert!(msg.contains("minute-cadence engine"), "honest state: {msg}");
+        assert!(!msg.contains("switched OFF"), "stale OFF claim: {msg}");
 
         let failed = NotificationEvent::GrowwChain1mProbeVerdict {
             ok: false,
@@ -8665,6 +8706,94 @@ mod tests {
         assert!(msg.contains("did NOT pass"), "got: {msg}");
         assert!(!msg.contains("<b>hostile</b>"), "escaped: {msg}");
         assert!(msg.contains("Nothing is broken"), "got: {msg}");
+    }
+
+    // -----------------------------------------------------------------------
+    // SpotCrossverifySummary render/severity pins (Fix E review round 1,
+    // 2026-07-17)
+    // -----------------------------------------------------------------------
+
+    fn spot_xverify_summary(
+        noise_only: bool,
+        top_detail: Vec<String>,
+        missing_dhan: u64,
+    ) -> NotificationEvent {
+        NotificationEvent::SpotCrossverifySummary {
+            trading_date_ist: "2026-07-17".to_string(),
+            indices: 4,
+            minutes_compared: 375,
+            mismatches: 3,
+            missing_dhan,
+            missing_groww: 0,
+            out_of_session: 0,
+            degraded: false,
+            truncated: false,
+            status_label: "diverged".to_string(),
+            noise_only,
+            noise_max_paise: 250,
+            top_detail,
+        }
+    }
+
+    /// (a) A noise-only diverged day is Info with a green mark and the
+    /// honest frame — a trend line, never a page. Wording is
+    /// tolerance-aware (Fix E round 1): never "matched everywhere".
+    #[test]
+    fn test_spot_crossverify_summary_noise_only_is_info_with_honest_frame() {
+        let ev = spot_xverify_summary(true, vec![], 0);
+        assert_eq!(ev.severity(), Severity::Info);
+        let msg = ev.to_message();
+        assert!(msg.contains('\u{2705}'), "got: {msg}");
+        assert!(
+            msg.contains("Neither broker is the single source of truth"),
+            "honest frame missing: {msg}"
+        );
+        assert!(!msg.contains("matched everywhere"), "got: {msg}");
+        assert!(msg.contains("no real drift"), "got: {msg}");
+    }
+
+    /// (b) A diverged NON-noise day (open/close drift in the worst lines)
+    /// is High with the \u{1f198} mark, names WHICH gate paged, carries the
+    /// honest frame, and renders the worst line exactly ONCE (Fix E round
+    /// 1 — the lead and the example block must not duplicate it).
+    #[test]
+    fn test_spot_crossverify_summary_real_drift_is_high_and_names_gate() {
+        let worst = "NIFTY close: Dhan \u{20b9}100.00 vs Groww \u{20b9}90.00 \
+             (\u{20b9}10.00 apart) at 10:32 AM";
+        let ev = spot_xverify_summary(
+            false,
+            vec![worst.to_string(), "NIFTY high: second line".to_string()],
+            0,
+        );
+        assert_eq!(ev.severity(), Severity::High);
+        let msg = ev.to_message();
+        assert!(msg.contains('\u{1f198}'), "got: {msg}");
+        assert!(msg.contains("open/close price drift"), "gate name: {msg}");
+        assert!(
+            msg.contains("Neither broker is the single source of truth"),
+            "honest frame missing: {msg}"
+        );
+        assert_eq!(
+            msg.matches("(\u{20b9}10.00 apart) at 10:32 AM").count(),
+            1,
+            "worst line must render exactly once: {msg}"
+        );
+        assert!(
+            msg.contains("second line"),
+            "remaining examples kept: {msg}"
+        );
+    }
+
+    /// The missing-minutes gate is named when one broker has holes.
+    #[test]
+    fn test_spot_crossverify_summary_names_missing_minute_gate() {
+        let ev = spot_xverify_summary(false, vec![], 2);
+        assert_eq!(ev.severity(), Severity::High);
+        let msg = ev.to_message();
+        assert!(
+            msg.contains("minutes missing on one broker"),
+            "gate name: {msg}"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -8765,12 +8894,13 @@ mod tests {
         assert_eq!(event.severity(), Severity::Info);
         let msg = event.to_message();
         assert!(msg.contains("IS available"), "got: {msg}");
-        // Plain-English action (10 commandments — no config-key jargon in
-        // the Telegram body; the exact key lives in the probe's log line).
-        assert!(msg.contains("turn ON the option"), "got: {msg}");
+        // Plain-English body (10 commandments — no config-key jargon; the
+        // exact key lives in the probe's log line). Fix E round 1
+        // (2026-07-17): the cadence engine records chains — never claim
+        // recording is switched OFF.
+        assert!(msg.contains("minute-cadence engine"), "got: {msg}");
         assert!(!msg.contains("option_chain_1m"), "got: {msg}");
-        // Honest: recording is NOT running yet.
-        assert!(msg.contains("switched OFF"), "got: {msg}");
+        assert!(!msg.contains("switched OFF"), "stale OFF claim: {msg}");
     }
 
     // -----------------------------------------------------------------------
@@ -9523,7 +9653,9 @@ mod tests {
                 ok_fetches: 10,
                 failed_fetches: 2,
                 named_gaps: 1,
-                pre_boot_gaps: 0,
+                // Fix E round 1: pre-boot gaps render beside "never
+                // recovered" as bookkeeping (no warning mark).
+                pre_boot_gaps: 2,
                 ..rest_line("Groww", "spot candles")
             },
             rest_line("Groww", "option chain"), // all -1: skipped
@@ -9537,7 +9669,7 @@ mod tests {
             render_pulls_per_leg(&legs, "Groww"),
             Some(
                 "pulls spot 10/12, contracts 5 ok \u{26a0}\u{fe0f}; \
-                 1 never recovered \u{26a0}\u{fe0f}"
+                 1 never recovered \u{26a0}\u{fe0f}; 2 from before app start"
                     .to_string()
             )
         );
