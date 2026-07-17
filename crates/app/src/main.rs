@@ -3503,23 +3503,13 @@ mod tests {
     // MECHANICAL ENFORCEMENT: Timestamp consistency across all paths
     // ===================================================================
 
-    #[test]
-    fn test_tick_persistence_no_ist_offset_on_exchange_timestamp() {
-        // Ticks from Dhan WebSocket have IST epoch seconds.
-        // The tick persistence writer must NOT add IST offset to exchange_timestamp.
-        // Only received_at (from Utc::now()) gets the offset.
-        let source = include_str!("../../storage/src/tick_persistence.rs");
-        // The designated ts column uses exchange_timestamp directly
-        assert!(
-            source.contains("i64::from(tick.exchange_timestamp).saturating_mul(1_000_000_000)"),
-            "tick ts must use exchange_timestamp directly (IST epoch, no offset)"
-        );
-        // received_at adds IST offset
-        assert!(
-            source.contains("received_at_nanos.saturating_add(IST_UTC_OFFSET_NANOS)"),
-            "received_at must add IST_UTC_OFFSET_NANOS (UTC → IST)"
-        );
-    }
+    // Stage-2 dead-WS sweep (2026-07-17):
+    // `test_tick_persistence_no_ist_offset_on_exchange_timestamp` RETIRED —
+    // its subject (`crates/storage/src/tick_persistence.rs`, the live-tick
+    // ILP writer) was deleted with the dead Dhan tick chain, so there is no
+    // tick `ts` write site left to pin. The WebSocket-timestamp rule itself
+    // (`data-integrity.md` — NEVER add +5:30 to an exchange-timestamp `ts`)
+    // still binds any future tick writer, which must re-add this ratchet.
 
     // Candle-engine re-architecture #T1b: `test_live_candle_no_ist_offset`
     // removed — Engine A (`LiveCandleWriter` / `compute_live_candle_nanos`

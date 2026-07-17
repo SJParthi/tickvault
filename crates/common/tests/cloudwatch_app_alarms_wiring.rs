@@ -191,11 +191,44 @@ fn test_every_alarm_metric_has_a_rust_emit_site() {
         !names.is_empty(),
         "ratchet self-check: app-alarms.tf produced 0 metric_name entries — parser broken"
     );
+    // DEAD-MONITOR allowlist (stage-2 dead-WS sweep, 2026-07-17): these 4
+    // alarm metrics' ONLY emit sites lived in the deleted dead Dhan tick
+    // chain (tick_persistence.rs ring/spill/DLQ counters + the aggregator
+    // late-tick arm fed by the deleted tick_processor.rs). The alarms in
+    // app-alarms.tf are now DEAD MONITORS (their series stopped the day the
+    // live feeds retired — 2026-07-13/15 — the code deletion changes no
+    // runtime behavior). Terraform retirement is deliberately DEFERRED to
+    // the dashboard PR per the sweep's task scope; entries here MUST be
+    // removed in lockstep when that PR deletes the alarms.
+    let dead_monitor_pending_tf_retirement: &[&str] = &[
+        "tv_spill_dropped_total",
+        "tv_dlq_ticks_total",
+        "tv_ticks_dropped_total",
+        "tv_late_tick_after_boundary_total",
+    ];
     let mut missing = Vec::new();
     for name in &names {
+        if dead_monitor_pending_tf_retirement.contains(&name.as_str()) {
+            continue;
+        }
         if !is_metric_emitted(name) {
             missing.push(name.clone());
         }
+    }
+    // Anti-drift: every allowlist entry must still BE an alarm metric in
+    // app-alarms.tf AND still have no emit site — a stale entry (alarm
+    // deleted by the dashboard PR, or an emit site reborn) fails loudly.
+    for stale in dead_monitor_pending_tf_retirement {
+        assert!(
+            names.iter().any(|n| n == stale),
+            "dead-monitor allowlist entry `{stale}` is no longer an alarm metric in \
+             app-alarms.tf — remove it from this allowlist (dashboard-PR lockstep)."
+        );
+        assert!(
+            !is_metric_emitted(stale),
+            "dead-monitor allowlist entry `{stale}` has a live emit site again — \
+             remove it from this allowlist."
+        );
     }
     assert!(
         missing.is_empty(),

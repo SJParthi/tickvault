@@ -1,9 +1,10 @@
-# Implementation Plan: Dead Live-WS Deletion Sweep — Stage 1 (zero-wiring modules)
+# Implementation Plan: Dead Live-WS Deletion Sweep — Stages 1+2 (zero-wiring modules; the dead tick chain)
 
 **Status:** APPROVED
 **Date:** 2026-07-17
 **Approved by:** operator directive 2026-07-17 via coordinator (dead live-WS
-deletion sweep, stage 1 = the zero-wiring slice of the recon's PR sequencing;
+deletion sweep; stage 1 = the zero-wiring slice of the recon's PR sequencing,
+stage 2 = the dead Dhan TICK CHAIN per the coordinator's stage-2 dispatch;
 recon manifests: `recon-dead-ws.md` + `recon-feed-separation.md`, session
 scratchpad, main @ 2a97fac)
 
@@ -41,8 +42,40 @@ variants (`WsReinject01Aborted`, `PrevClose02` retained), `WAL_REINJECT_*`
 constants, `crates/common/src/{error_code,config,constants}.rs`,
 `crates/common/src/instrument_registry.rs` (DEFERRED — 1,695 LoC + common
 lib.rs churn + I-P1-11 guard + core proptest/dhat/bench/budget-key edits =
-its own stage), the whole tick pipeline/storage chain (stage 2), the
-aggregator (stage 4), and every DO-NOT-TOUCH item in the recon §2 table.
+its own stage), the aggregator (stage 4), and every DO-NOT-TOUCH item in
+the recon §2 table.
+
+### Stage 2 — the dead Dhan TICK CHAIN (branch `claude/dead-ws-sweep-2`)
+
+Stage 2 deletes the tick pipeline + tick storage chain orphaned by the
+Dhan live-WS retirement (2026-07-13) + Groww live-feed retirement
+(2026-07-15) — every module re-verified zero-production-callers with `rg`
+on this branch before removal. Touched crates: **tickvault-core**
+(`src/pipeline`), **tickvault-storage** (`src/`), **tickvault-app**
+(doc/guard truth-sync only), **tickvault-common** (test-file edits only —
+`metrics_catalog.rs`, `price_precision_wiring.rs`,
+`bench_budget_elements_guard.rs`; NO src edits, NO ErrorCode deletions).
+
+Deleted production modules (12): core pipeline `tick_processor.rs`,
+`feed_consumer.rs`, `tick_enricher.rs`, `prev_day_close_stamper.rs`,
+`prev_oi_cache.rs`, `volume_delta_tracker.rs`,
+`volume_monotonicity_guard.rs`, `prev_close_writer.rs`; storage
+`tick_persistence.rs`, `tick_flush_worker.rs`, `tick_row_builder.rs`,
+`tick_spill_drain.rs` — with their mod decls/re-exports, dead
+tests/benches/dhat targets (incl. the 3 storage + 2 core dhat targets),
+`[[bench]]` rows, benchmark-budget keys (`f32_to_f64_clean`,
+`composite_quote_tick_*`), and the ci.yml DHAT lane rows/counts.
+
+KEEP constraints honored: the SEAL chain (seal_*, shadow_persistence,
+shadow_candle_writer, generic_candle_writer) untouched; `ws_frame_spill.rs`
+untouched; the 15:40 TICK-CONSERVE-01 audit KEPT (truthful dated note in
+`tick_conservation_boot.rs` — the scraped processor counters are gone, so
+runs honestly record `partial`); `feed_lag_monitor.rs` KEPT (live
+consumers in main.rs + feed_scoreboard_boot.rs); `parser/` binary half +
+`instrument_registry.rs` deferred (stage 3); the 21-TF aggregator +
+`dhat_multi_tf_consume_tick` compiling (stage 4). Terraform/EMF/alarm
+retirement for dead tick monitors (`tv_ticks_dropped_total` etc.) is
+DEFERRED to the dashboard PR.
 
 ## Edge Cases
 
@@ -59,6 +92,19 @@ aggregator (stage 4), and every DO-NOT-TOUCH item in the recon §2 table.
   (tokens between "Filtered+alarmed codes" and "Everything else"): the
   retired code string was removed from that paragraph and only named in
   the "Retired paging entries" paragraph (outside the parse window).
+- Stage 2: the api crate's `tick_persistence` HEALTH-FIELD label
+  (`SubsystemInfo.tick_persistence` in health.rs/state.rs/dashboard_page)
+  is an unrelated string, NOT a compile dependency — left untouched.
+- Stage 2: source-scan guards that read deleted files were tombstoned
+  truthfully (dated comment) or re-pointed to a SURVIVING subject —
+  never left as a vacuous pass: `dedup_segment_meta_guard` (feed-key list
+  3 entries + candles-keyed self-test), `zero_tick_loss_alert_guard`
+  (capacity + doc pins kept), `price_2dp_guard` (seal-row pin kept),
+  `price_precision_wiring` (cross-crate ban + module pin kept),
+  `chaos_cascade_triple_failure` (LEG 2 retired; WAL + token legs kept).
+- Stage 2: ci.yml DHAT drift list AND per-crate `--test` steps AND the
+  expected-count asserts (core 11→9; storage step retired at 0 targets)
+  all updated in lockstep — any one alone fails CI loudly.
 
 ## Failure Modes
 
@@ -87,6 +133,13 @@ aggregator (stage 4), and every DO-NOT-TOUCH item in the recon §2 table.
   `ip_monitor_wiring_guard.rs` / `boot_helpers.rs` /
   `feed_lag_monitor.rs` stale doc-comments corrected factually; no
   unrelated assertion weakened.
+- Stage 2 scoped suites: `cargo test -p tickvault-storage`,
+  `cargo test -p tickvault-core`, `cargo test -p tickvault-app`, PLUS
+  `cargo test -p tickvault-common` (its TEST files were edited —
+  metrics_catalog / price_precision_wiring / bench_budget_elements_guard;
+  common src untouched, but the edited guards must be run).
+- Stage 2 hooks: banned-pattern scanner + plan-gate + per-item
+  guarantee-check all PASS before push.
 
 ## Rollback
 
@@ -121,6 +174,15 @@ counter in main.rs are all untouched.
 - [x] Truthful guard/comment updates
   - Files: crates/core/tests/phase2_9_l14_hard_fail.rs, crates/app/tests/ip_monitor_wiring_guard.rs, crates/app/src/boot_helpers.rs, crates/core/src/pipeline/feed_lag_monitor.rs, crates/trading/tests/dhat_multi_tf_consume_tick.rs
   - Tests: scoped crate suites
+- [x] Stage 2: delete the dead tick chain (8 core pipeline + 4 storage modules) with mod decls + re-exports
+  - Files: crates/core/src/pipeline/tick_processor.rs, crates/core/src/pipeline/feed_consumer.rs, crates/core/src/pipeline/tick_enricher.rs, crates/core/src/pipeline/prev_day_close_stamper.rs, crates/core/src/pipeline/prev_oi_cache.rs, crates/core/src/pipeline/volume_delta_tracker.rs, crates/core/src/pipeline/volume_monotonicity_guard.rs, crates/core/src/pipeline/prev_close_writer.rs, crates/storage/src/tick_persistence.rs, crates/storage/src/tick_flush_worker.rs, crates/storage/src/tick_row_builder.rs, crates/storage/src/tick_spill_drain.rs, crates/core/src/pipeline/mod.rs, crates/storage/src/lib.rs
+  - Tests: cargo check + scoped crate suites (deletion — no new tests)
+- [x] Stage 2: delete dead tests/benches/dhat targets + Cargo.toml [[bench]] rows + budget keys + ci.yml DHAT lane rows
+  - Files: crates/core/tests (phase2_*/phase3_* chain tests, dhat_feed_consumer.rs, dhat_prev_close_writer.rs, feed_consumer_convergence_guard.rs, tick_processor_alloc_meta_guard.rs), crates/storage/tests (chaos_* tick suite, dhat_tick_*.rs, dedup_uniqueness_proptest.rs), crates/core/benches/full_tick_processing.rs, crates/core/benches/prev_close_writer.rs, crates/storage/benches/tick_persistence.rs, crates/core/Cargo.toml, crates/storage/Cargo.toml, quality/benchmark-budgets.toml, .github/workflows/ci.yml
+  - Tests: ci.yml drift-check semantics preserved (count asserts updated in lockstep)
+- [x] Stage 2: truthful guard tombstones/re-points + counter-catalog truth-sync
+  - Files: crates/storage/tests/dedup_segment_meta_guard.rs, crates/storage/tests/zero_tick_loss_alert_guard.rs, crates/storage/tests/price_2dp_guard.rs, crates/storage/tests/o1_per_feed_doc_guard.rs, crates/storage/tests/live_feed_purity_guard.rs, crates/core/tests/chaos_cascade_triple_failure.rs, crates/app/tests/wave_2c_item7_boot_race_and_clock_skew.rs, crates/common/tests/price_precision_wiring.rs, crates/common/tests/metrics_catalog.rs, crates/common/tests/bench_budget_elements_guard.rs, crates/app/src/tick_conservation_boot.rs
+  - Tests: scoped crate suites (storage/core/app/common)
 
 ## Per-Item Guarantee Matrix
 

@@ -217,9 +217,10 @@ check_cargo_test P "Live-feed purity (no backfill→ticks)" \
 
 # 2026-06-14 de-stale: instrument_uniqueness_guard.rs was superseded by
 # dedup_uniqueness_proptest.rs (the composite-key uniqueness property guard).
-check_cargo_test P "Composite-key uniqueness proptest" \
-    tickvault-storage dedup_uniqueness_proptest \
-    "crates/storage/tests/dedup_uniqueness_proptest.rs"
+# Stage-2 dead-WS sweep (2026-07-17): dedup_uniqueness_proptest.rs RETIRED —
+# its subjects (tick_persistence::{tick_dedup_key, tick_payload_hash}) were
+# deleted with the dead Dhan tick chain. Composite-key dedup for the
+# SURVIVING tables stays pinned by dedup_segment_meta_guard (checked above).
 
 # =============================================================================
 # AUTONOMOUS OPS (M1-M4, P)

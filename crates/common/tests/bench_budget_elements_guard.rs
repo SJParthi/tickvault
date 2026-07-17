@@ -61,19 +61,11 @@ fn bench_gate_divides_median_by_element_count() {
     );
 }
 
-/// B6 ratchet (2026-07-03): the operator's 10µs TRUE-COMPUTE gate for the
-/// per-tick hot path. The budget key matches the Criterion bench
-/// `composite/quote_tick_compute_only` (crates/core/benches/
-/// full_tick_processing.rs) via bench-gate's bidirectional-substring
-/// lookup. Removing or loosening this row silently drops the operator's
-/// B6 latency gate.
-#[test]
-fn budgets_toml_pins_compute_only_10us_gate() {
-    let toml = read("quality/benchmark-budgets.toml");
-    assert!(
-        toml.contains("composite_quote_tick_compute_only = 10000"),
-        "benchmark-budgets.toml MUST pin the B6 true-compute budget row \
-         `composite_quote_tick_compute_only = 10000` (10µs) so bench-gate \
-         enforces the operator's per-tick compute gate."
-    );
-}
+// RETIRED (stage-2 dead-WS sweep, 2026-07-17):
+// `budgets_toml_pins_compute_only_10us_gate` pinned the B6
+// `composite_quote_tick_compute_only = 10000` budget row — its Criterion
+// bench (crates/core/benches/full_tick_processing.rs) measured the deleted
+// tick chain and was deleted with it, so the row was removed from
+// benchmark-budgets.toml (dated comment there). The surviving hot-path
+// budgets (dispatch_frame/pipeline/feed_lag/feed_presence/moneyness) keep
+// their own bench-gate enforcement.

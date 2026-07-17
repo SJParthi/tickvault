@@ -5,7 +5,7 @@
 //!
 //! | Test name                                              | Scope |
 //! |--------------------------------------------------------|-------|
-//! | test_tick_processor_waits_for_questdb_ready            | 7.1   |
+//! | test_boot_probe_deadline_exceeded_surfaces_boot_02     | 7.1   |
 //! | test_boot_probe_emits_critical_on_clock_skew_gt_2s     | 7.3   |
 //! | test_boot_probe_passes_at_skew_below_threshold         | 7.3   |
 //! | test_clock_skew_threshold_constant_is_2s               | 7.3   |
@@ -37,26 +37,25 @@ fn unreachable_questdb_config() -> QuestDbConfig {
     }
 }
 
-/// Item 7.1 — tick processor must NOT begin consuming the SPSC ring
-/// until `wait_for_questdb_ready` returns. We assert the contract at
-/// the `wait_for_questdb_ready` boundary because the processor's gate
-/// is just a thin call on top of it: we drive a 2s deadline against
-/// an unreachable QuestDB and assert the elapsed time is ≥ 2s (so the
-/// tick processor was still gated, not consuming) and the returned
-/// error is `BootProbeError::DeadlineExceeded` carrying BOOT-02.
+/// Item 7.1 — `wait_for_questdb_ready` must gate its caller for the full
+/// configured deadline against an unreachable QuestDB and surface BOOT-02.
+/// (Stage-2 dead-WS sweep, 2026-07-17: the original caller under test —
+/// the tick processor's boot gate — was deleted with the dead Dhan tick
+/// chain; the probe contract itself is LIVE, consumed by the boot path and
+/// the storage probes, so the boundary assertion is kept and renamed.)
 #[tokio::test]
-async fn test_tick_processor_waits_for_questdb_ready() {
+async fn test_boot_probe_deadline_exceeded_surfaces_boot_02() {
     let cfg = unreachable_questdb_config();
     let started = std::time::Instant::now();
     let result = tickvault_storage::boot_probe::wait_for_questdb_ready(&cfg, 2).await;
     let elapsed = started.elapsed();
     assert!(
         result.is_err(),
-        "tick processor's gate must NOT return Ok on an unreachable QuestDB"
+        "the boot gate must NOT return Ok on an unreachable QuestDB"
     );
     assert!(
         elapsed >= Duration::from_secs(2),
-        "tick processor must wait at least the configured deadline ({:?})",
+        "the boot gate must wait at least the configured deadline ({:?})",
         elapsed
     );
     let err = result.err().unwrap();

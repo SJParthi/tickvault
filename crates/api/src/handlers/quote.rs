@@ -131,8 +131,9 @@ async fn query_latest_tick(
     base_url: &str,
     security_id: u64,
 ) -> Option<QuoteResponse> {
-    // Query the columns that ACTUALLY EXIST in the `ticks` DDL
-    // (`crates/storage/src/tick_persistence.rs::TICKS_CREATE_DDL`):
+    // Query the columns that ACTUALLY EXIST in the `ticks` table
+    // (schema created by the retired tick writer — the table is read-only
+    // since the stage-2 dead-WS sweep, 2026-07-17; SEBI-retained rows):
     // `feed`, `segment` (SYMBOL string — NOT a numeric code), `ltp`,
     // `last_trade_qty`, `volume`, `oi`, `open`/`high`/`low`/`close`, `ts`.
     // `LATEST ON ts PARTITION BY security_id` returns the single freshest row

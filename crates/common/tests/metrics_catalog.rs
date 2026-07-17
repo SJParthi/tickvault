@@ -61,15 +61,14 @@ const REQUIRED_METRICS: &[(&str, &str)] = &[
     // --- Zero-Tick-Loss SLA (Parthiban 2026-04-20) ---
     (
         "tv_ticks_lost_total",
-        "Explicit zero-tick-loss SLA counter. Incremented from THREE sites: \
-         (1) `ws_frame_spill::append` when the WAL spill channel is full \
-         (source=\"spill_drop_critical\"); (2) `tick_persistence::write_to_dlq` \
-         when both ring buffer and disk spill failed (source=\"dlq_fallback\"); \
-         (3) `ws_frame_spill::append` when the WAL writer thread is dead at the \
-         append instant (source=\"spill_writer_dead\", WS-SPILL-02). \
-         MUST be 0 in production. Labelled by `source` and `ws_type` so \
-         Grafana heatmaps can attribute losses per WebSocket. \
-         CI assertion: asserted == 0 in `zero_tick_loss_sla_guard` tests.",
+        "Explicit zero-tick-loss SLA counter. Incremented from TWO sites \
+         (both in `ws_frame_spill`): (1) `append` when the WAL spill channel \
+         is full (source=\"spill_drop_critical\"); (2) `append` when the WAL \
+         writer thread is dead at the append instant \
+         (source=\"spill_writer_dead\", WS-SPILL-02). The former third site — \
+         `tick_persistence::write_to_dlq` (source=\"dlq_fallback\") — died \
+         with the deleted tick chain (stage-2 dead-WS sweep, 2026-07-17). \
+         MUST be 0 in production. Labelled by `source` and `ws_type`.",
     ),
     (
         "tv_wal_replay_recovered_total",
@@ -102,16 +101,13 @@ const REQUIRED_METRICS: &[(&str, &str)] = &[
          (write_record|flush|open_segment|no_segment). MUST be 0 in production.",
     ),
     // --- Session 1 (A2 dead-letter queue) ---
-    (
-        "tv_dlq_ticks_total",
-        "Ticks that failed BOTH ring buffer AND disk spill and were \
-         written to the NDJSON dead-letter queue. MUST be 0 in production.",
-    ),
-    (
-        "tv_spill_disk_available_mb",
-        "Free disk space on the spill directory, updated on every \
-         open_spill_file call.",
-    ),
+    // RETIRED (stage-2 dead-WS sweep, 2026-07-17): `tv_dlq_ticks_total` +
+    // `tv_spill_disk_available_mb` were emitted by the deleted tick chain
+    // (`tick_persistence.rs` ring→spill→DLQ + its spill-file opener) — no
+    // live `ticks` writer remains (Dhan lane retired 2026-07-13, Groww live
+    // feed retired 2026-07-15). The surviving DLQ/disk metrics are the SEAL
+    // chain's (`tv_seal_writer_drain_total{kind=rescued_dlq}`,
+    // `tv_spill_dir_free_bytes` from disk_health_watcher.rs).
     // --- Session 2 A5 (graceful unsubscribe) + A4 (pool circuit breaker) ---
     // RETIRED (PR-C2, 2026-07-13 — Dhan live-WS lane deletion, operator
     // retirement directive per websocket-connection-scope-lock.md

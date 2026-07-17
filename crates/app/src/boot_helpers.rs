@@ -289,7 +289,6 @@ pub fn create_log_file_writer() -> Option<std::fs::File> {
 ///
 /// | Target | Reason |
 /// |---|---|
-/// | `tickvault_storage::tick_persistence` | tick flush noise |
 /// | `tickvault_core::auth::secret_manager` | per-secret SSM fetch debug |
 /// | `aws_config::profile::credentials` | already suppressed at `warn` for credential leak |
 /// | `aws_smithy_http_client` / `aws_smithy_runtime` | HTTP request/response noise |
@@ -303,9 +302,11 @@ pub fn create_log_file_writer() -> Option<std::fs::File> {
 pub fn build_app_log_filter_directive(base_level: &str) -> String {
     // Order matters: later entries win when they overlap. We start with
     // the user's base level and then layer per-target downgrades on top.
+    // Stage-2 dead-WS sweep (2026-07-17): the
+    // `tickvault_storage::tick_persistence=info` downgrade retired — the
+    // module was deleted with the dead Dhan tick chain.
     format!(
         "{base},\
-         tickvault_storage::tick_persistence=info,\
          tickvault_core::auth::secret_manager=info,\
          aws_config::profile::credentials=warn,\
          aws_smithy_http_client=warn,\
@@ -676,8 +677,9 @@ mod tests {
         let d = build_app_log_filter_directive("debug");
         assert!(d.starts_with("debug,"));
         // The whole point: even with `debug` as the base, the chatty
-        // targets must be downgraded.
-        assert!(d.contains("tickvault_storage::tick_persistence=info"));
+        // targets must be downgraded. (tick_persistence removed from the
+        // directive in the stage-2 dead-WS sweep, 2026-07-17.)
+        assert!(d.contains("tickvault_core::auth::secret_manager=info"));
         assert!(d.contains("aws_config::profile::credentials=warn"));
     }
 

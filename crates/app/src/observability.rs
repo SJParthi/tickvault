@@ -148,16 +148,16 @@ pub fn build_category_targets(cat: LogCategory) -> &'static [&'static str] {
         // movers infrastructure was retired in PR #539.
         LogCategory::LiveTicks => &[
             "tickvault_core::websocket",
-            "tickvault_core::pipeline::tick_processor",
             // tick_gap_detector target retired in PR-C3 (2026-07-14).
+            // Stage-2 dead-WS sweep (2026-07-17): tick_processor /
+            // volume_monotonicity_guard / tick_persistence /
+            // tick_spill_drain targets retired — the modules were deleted
+            // with the dead Dhan tick chain.
             "tickvault_core::pipeline::depth_sequence_tracker",
-            "tickvault_core::pipeline::volume_monotonicity_guard",
             "tickvault_core::pipeline::mover_classifier",
             "tickvault_core::pipeline::movers_window",
             "tickvault_core::pipeline::option_movers",
             "tickvault_core::pipeline::top_movers",
-            "tickvault_storage::tick_persistence",
-            "tickvault_storage::tick_spill_drain",
         ],
         // PR-D (2026-05-26): LogCategory::Historical variant retired
         // alongside the deleted Dhan historical fetch chain.
@@ -1487,8 +1487,10 @@ mod tests {
     fn test_build_category_targets_live_ticks_covers_websocket_and_pipeline() {
         let targets = build_category_targets(LogCategory::LiveTicks);
         assert!(targets.contains(&"tickvault_core::websocket"));
-        assert!(targets.contains(&"tickvault_core::pipeline::tick_processor"));
-        assert!(targets.contains(&"tickvault_storage::tick_persistence"));
+        // Stage-2 dead-WS sweep (2026-07-17): the tick_processor /
+        // tick_persistence targets retired with the deleted tick chain.
+        assert!(!targets.contains(&"tickvault_core::pipeline::tick_processor"));
+        assert!(!targets.contains(&"tickvault_storage::tick_persistence"));
     }
 
     #[test]
