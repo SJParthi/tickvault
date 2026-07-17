@@ -2727,6 +2727,69 @@ rules:
       the ~06:00 IST daily reset this self-heals; a sustained rate means
       the minter is stale (cross-check the shared-token minter runbook).
 
+  # -----------------------------------------------------------------------
+  # Groww order/position PUSH channel (Stage A, 2026-07-16)
+  # -----------------------------------------------------------------------
+
+  # GROWW-PUSH-01 = the push channel's NATS-over-WS connect / reconnect
+  # failed at the transport level. Bounded backoff reconnect self-heals;
+  # receive-only observability — no order path is affected.
+  - name: groww-push-01-connect-failed-escalate
+    match:
+      code: GROWW-PUSH-01
+    action: escalate
+    runbook_path: .claude/rules/project/groww-order-push-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 600
+    justification: >-
+      GROWW-PUSH-01 = push-channel connect/reconnect failed. The bounded
+      backoff ladder already self-heals; the operator inspects whether the
+      provider is rejecting the session — nothing is safe to auto-fix.
+
+  # GROWW-PUSH-02 = the per-session socket-token mint or the NATS CONNECT
+  # was auth-rejected. The access token is RE-READ from SSM at floor
+  # pacing, NEVER minted (token-minter lock 2026-07-02).
+  - name: groww-push-02-auth-failed-escalate
+    match:
+      code: GROWW-PUSH-02
+    action: escalate
+    runbook_path: .claude/rules/project/groww-order-push-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 600
+    justification: >-
+      GROWW-PUSH-02 = push-channel auth rejected. At the ~06:00 IST daily
+      token reset this self-heals via the SSM re-read; a sustained rate
+      means the shared minter Lambda is stale — never minted from here.
+
+  # GROWW-PUSH-03 = a push frame / protobuf payload failed decode or
+  # arrived on an unknown subject: counted + skipped, never a panic.
+  - name: groww-push-03-decode-failed-escalate
+    match:
+      code: GROWW-PUSH-03
+    action: escalate
+    runbook_path: .claude/rules/project/groww-order-push-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 600
+    justification: >-
+      GROWW-PUSH-03 = push frame decode failure. A low rate is schema
+      drift on optional fields (forward-skipped by design); a high rate
+      means the wire schema changed — a reviewed parser update, never an
+      auto-fix.
+
+  # GROWW-PUSH-04 = the supervised push-channel task died and was
+  # respawned (WS-GAP-05 / FEED-SUPERVISOR-01 house pattern).
+  - name: groww-push-04-supervisor-respawned-escalate
+    match:
+      code: GROWW-PUSH-04
+    action: escalate
+    runbook_path: .claude/rules/project/groww-order-push-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 600
+    justification: >-
+      GROWW-PUSH-04 = push-channel supervisor respawned the task. The
+      respawn already self-healed; a sustained respawn rate is a real bug
+      — the operator captures the backtrace per the runbook.
+
   # CADENCE-01 = a cadence broker lane degraded inside a cycle (fetch
   # failures / 429-despite-gates / empty spots / fallback provenance /
   # unknown moneyness / ladder exhausted). The scheduler self-heals by
