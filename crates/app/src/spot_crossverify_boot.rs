@@ -74,8 +74,9 @@ static SPOT_XVERIFY_SPAWNED: AtomicBool = AtomicBool::new(false);
 // ---------------------------------------------------------------------------
 
 /// One minute bar in INTEGER PAISE (comparison key; nothing is written back
-/// rounded).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// rounded). No `Eq` — the retained rupee cells are `f64`; paise fields are
+/// the integer comparison key, `PartialEq` suffices.
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct OhlcBar {
     pub open_paise: i64,
     pub high_paise: i64,
