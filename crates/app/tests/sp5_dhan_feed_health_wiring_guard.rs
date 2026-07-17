@@ -20,19 +20,6 @@
 
 use std::path::PathBuf;
 
-fn read_app_main() -> String {
-    let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    path.push("src/main.rs");
-    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
-}
-
-fn read_tick_processor() -> String {
-    let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    path.pop(); // crates/app -> crates
-    path.push("core/src/pipeline/tick_processor.rs");
-    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
-}
-
 // RETIRED (PR-C2, 2026-07-13 — Dhan live-WS lane deletion, operator
 // retirement directive per websocket-connection-scope-lock.md "2026-07-13
 // Amendment" §B): `test_pool_watchdog_sets_dhan_connected` and
@@ -41,33 +28,16 @@ fn read_tick_processor() -> String {
 // feed-health plumbing — the pool watchdog, both boot arms, and the Dhan
 // tick-processor spawn are DELETED with the lane. /api/feeds/health now
 // honestly reports the Dhan MARKET-DATA feed as not-running (config-off,
-// retired); the retained tick_processor.rs / ws_frame_spill.rs record-site
-// pins below survive (the modules are retained pending Phase C).
-
-/// The tick processor must record the Dhan tick at the heartbeat block using the
-/// WALL-CLOCK receipt time converted to IST nanos (`+ IST_UTC_OFFSET_NANOS`).
-/// Recording raw UTC nanos would read ~5.5h in the future → permanent false-fresh.
-#[test]
-fn test_tick_processor_records_dhan_with_ist_offset() {
-    let src = read_tick_processor();
-    assert!(
-        src.contains(
-            "feed_health: Option<std::sync::Arc<tickvault_common::feed_health::FeedHealthRegistry>>"
-        ),
-        "SP5 regression: run_tick_processor no longer takes the feed-health registry."
-    );
-    assert!(
-        src.contains("fh.record_tick(") && src.contains("tickvault_common::feed::Feed::Dhan"),
-        "SP5 regression: run_tick_processor accepts the registry but never records \
-         a Dhan tick — Dhan freshness can't reach /api/feeds/health."
-    );
-    assert!(
-        src.contains("saturating_add(tickvault_common::constants::IST_UTC_OFFSET_NANOS)"),
-        "SP5 clock regression: the Dhan record must convert UTC received_at to IST \
-         nanos via saturating_add(IST_UTC_OFFSET_NANOS) so the endpoint's age math \
-         (which uses IST now) is consistent. Raw UTC = permanent false-fresh."
-    );
-}
+// retired).
+//
+// RETIRED (stage-2 dead-WS sweep, 2026-07-17):
+// `test_tick_processor_records_dhan_with_ist_offset` pinned the Dhan
+// `record_tick` site inside `tick_processor.rs` — that file was DELETED
+// with the dead Dhan tick chain (the PR-C2 "retained pending Phase C"
+// caveat above is resolved by deletion), so there is no Dhan freshness
+// record-site left to pin. The surviving SP5.1 pin below covers the
+// ws_frame_spill drop-dimension record-site, which is live (the WAL is
+// KEEP).
 
 /// SP5.1: the drops dimension is now WIRED at the storage terminal-loss site.
 /// A dropped Dhan live-feed frame records `record_drops(Feed::Dhan)` in the

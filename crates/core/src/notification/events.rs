@@ -1585,6 +1585,8 @@ pub enum NotificationEvent {
     // (`run_tick_processor` has no notifier) for an Info-severity event that is
     // already counted — a hot-path risk for marginal value. The correct,
     // hot-path-safe alert is a CloudWatch alarm on the existing counter.
+    // (Stage-2 dead-WS sweep, 2026-07-17: the counter's emit site died with
+    // the deleted tick_processor.rs — the paragraph above is historical.)
 
     // RETIRED 2026-06-28: OptionChainFetchFailed / OptionChainCacheFallback /
     // OptionChainStaleHalt / OptionChainConfigInvalid deleted with the entire

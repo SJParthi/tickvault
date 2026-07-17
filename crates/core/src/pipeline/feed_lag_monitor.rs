@@ -914,40 +914,17 @@ mod tests {
         assert_eq!(scratch.as_slice(), &[3 * NANOS_PER_SEC as u64]);
     }
 
-    #[test]
-    fn test_record_dhan_tick_producer_sites_wired_into_tick_processor() {
-        // Round-3 fix (2026-07-08, review finding 2): the lag pipeline has
-        // TWO wiring halves — the PUBLISHER (main.rs, pinned by the
-        // secret_manager.rs 2-call-site ratchet) and the PRODUCER (the two
-        // `record_dhan_tick` calls at the Dhan Ticker/Quote + Full persist
-        // sites in tick_processor.rs). The producer half had NO pin: a
-        // future tick_processor refactor dropping either call keeps every
-        // existing guard green (the gauge! emit lives in this module;
-        // pub-fn-wiring is satisfied by the dhat/bench call sites) while the
-        // ring starves below MIN_LAG_SAMPLES, the publisher publishes
-        // NOTHING, and the lag alarm reads notBreaching forever — the exact
-        // silent dark-gauge class of the 2026-07-06 incident. Exactly 2
-        // non-comment producer call sites, one per Dhan persist path.
-        let tick_processor = include_str!("tick_processor.rs");
-        let producer_call_sites = tick_processor
-            .lines()
-            .filter(|l| {
-                let t = l.trim_start();
-                !t.starts_with("//")
-                    && !t.starts_with("///")
-                    && t.contains("feed_lag_monitor::record_dhan_tick(")
-            })
-            .count();
-        assert_eq!(
-            producer_call_sites, 2,
-            "tick_processor.rs must call `feed_lag_monitor::record_dhan_tick(` at \
-             EXACTLY 2 non-comment sites (the Ticker/Quote persist arm + the \
-             Full-packet persist arm); found {producer_call_sites}. Dropping a \
-             producer site silently starves the lag ring below MIN_LAG_SAMPLES — \
-             the publisher then publishes nothing and the lag alarm reads \
-             notBreaching on missing data (the 2026-07-06 dark-gauge class)."
-        );
-    }
+    // RETIRED (stage-2 dead-WS sweep, 2026-07-17):
+    // `test_record_dhan_tick_producer_sites_wired_into_tick_processor`
+    // pinned the two `record_dhan_tick` producer call sites in
+    // `tick_processor.rs` — that file was DELETED with the dead Dhan tick
+    // chain, so the Dhan lag ring now has ZERO producers by design and the
+    // day-lag drain honestly measures nothing for Dhan (the scoreboard's
+    // lag keep-better semantics already render "not measured"). The module
+    // itself is KEPT: `reset_day_lag_histogram` (main.rs midnight tasks)
+    // and `day_lag_summary` (the 15:45 scoreboard drain) are live
+    // consumers. A future live feed must re-add a producer-site ratchet
+    // with its own dated note (the 2026-07-06 dark-gauge lesson stands).
 
     #[test]
     fn test_record_dhan_tick_smoke_on_global_ring() {

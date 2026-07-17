@@ -4067,7 +4067,6 @@ dependencies = [
  "loom",
  "memmap2",
  "metrics",
- "metrics-exporter-prometheus",
  "papaya",
  "proptest",
  "reqwest",

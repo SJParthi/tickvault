@@ -198,8 +198,12 @@ fi
 # ─────────────────────────────────────────────
 echo "  [9/9] S6 invariants — DEDUP + depth + Bible lockdown..." >&2
 INVARIANT_FAILED=0
-for INV_TEST in dedup_uniqueness_proptest:tickvault-storage \
-                bible_deletion_lockdown:tickvault-common; do
+# Stage-2 dead-WS sweep (2026-07-17): `dedup_uniqueness_proptest` RETIRED —
+# its subjects (`tick_persistence::{tick_dedup_key, tick_payload_hash}`) were
+# deleted with the dead Dhan tick chain. Composite-key dedup discipline for
+# the SURVIVING tables stays pinned by `dedup_segment_meta_guard` (runs in
+# the storage test suite + CI).
+for INV_TEST in bible_deletion_lockdown:tickvault-common; do
   TEST_NAME="${INV_TEST%%:*}"
   CRATE="${INV_TEST##*:}"
   INV_OUT=$(timeout 60 cargo test -p "$CRATE" --test "$TEST_NAME" 2>&1)
@@ -213,7 +217,7 @@ done
 if [ "$INVARIANT_FAILED" -ne 0 ]; then
   FAILED=1
 else
-  echo "  PASS: 2 commit-time invariants green (depth_invariants_proptest retired with PR #4)" >&2
+  echo "  PASS: 1 commit-time invariant green (depth_invariants_proptest retired with PR #4; dedup_uniqueness_proptest retired with the stage-2 dead-WS sweep 2026-07-17)" >&2
 fi
 
 # ─────────────────────────────────────────────

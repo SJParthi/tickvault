@@ -8,10 +8,13 @@
 //!      (`WsFrameSpill`). Each append MUST return `Spilled` (never `Dropped`),
 //!      and `replay_all` MUST recover every frame, in order, on the next boot.
 //!
-//!   2. **QuestDB down** — the tick-persistence ILP writer is pointed at a
-//!      dead endpoint, so no row can reach QuestDB. Every tick MUST cascade
-//!      through the ring → disk-spill → DLQ absorption chain with ZERO
-//!      permanently-dropped ticks (`ticks_dropped_total() == 0`).
+//!   2. **QuestDB down** — RETIRED (stage-2 dead-WS sweep, 2026-07-17):
+//!      this leg exercised `TickPersistenceWriter`'s ring → disk-spill → DLQ
+//!      absorption, deleted with the dead Dhan tick chain (no live `ticks`
+//!      writer remains; runtime is REST-only). The surviving QuestDB-outage
+//!      absorption chain is the SEAL writer's ring→spill→DLQ, chaos-covered
+//!      by `crates/storage/tests/chaos_rescue_ring_overflow.rs` +
+//!      `chaos_questdb_docker_pause.rs`.
 //!
 //!   3. **Auth token expiry** — the JWT is past its expiry instant. The
 //!      recovery primitives that drive `force_renewal_if_stale` MUST signal
@@ -22,15 +25,15 @@
 //!      — deleted with the Dhan live-WS lane; the surviving order-update
 //!      backoff ladder is unit-tested in `order_update_connection.rs`.)
 //!
-//! The unifying, asserted invariant across all three legs is **ZERO durable
-//! loss**: every captured frame survives the WAL belt, every tick survives
-//! the ring→spill→DLQ belt, and each recovery primitive engages.
+//! The unifying, asserted invariant across the surviving legs is **ZERO
+//! durable loss**: every captured frame survives the WAL belt, and each
+//! recovery primitive engages.
 //!
 //! This test lives in `crates/core/tests/` (not `crates/storage/`) because the
-//! token + reconnect recovery primitives are owned by `tickvault-core`, while
-//! `tickvault-storage` (WAL + tick persistence) is a `tickvault-core`
-//! dependency — so all three legs are reachable here and every one is a REAL
-//! public-API call (no source-scan stand-ins).
+//! token recovery primitives are owned by `tickvault-core`, while
+//! `tickvault-storage` (the WAL) is a `tickvault-core` dependency — so the
+//! surviving legs are reachable here and every one is a REAL public-API call
+//! (no source-scan stand-ins).
 //!
 //! NON-Docker, deterministic, bounded waits only — runs in well under 5 s on a
 //! cold laptop. A `#[ignore]` Docker-backed variant mirrors `chaos_zero_tick_loss.rs`
@@ -45,17 +48,11 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use tickvault_common::config::QuestDbConfig;
-use tickvault_common::constants::TICK_BUFFER_CAPACITY;
-use tickvault_common::tick_types::ParsedTick;
 use tickvault_core::auth::types::{DhanAuthResponseData, TokenState};
-use tickvault_storage::tick_persistence::TickPersistenceWriter;
 use tickvault_storage::ws_frame_spill::{AppendOutcome, WsFrameSpill, WsType, replay_all};
 
-/// Number of frames/ticks pushed through both durable belts within the
-/// simultaneous-failure window. Deliberately well below `TICK_BUFFER_CAPACITY`
-/// (100,000) so the tick ring never even needs to overflow to disk — the
-/// strongest form of "zero loss" is "zero drop AND nothing forced to spill".
+/// Number of frames pushed through the WAL belt within the
+/// simultaneous-failure window.
 const N: usize = 5_000;
 
 /// A unique temp dir per tag + process, removed first so a stale run can't
@@ -72,47 +69,6 @@ fn chaos_tmp(tag: &str) -> PathBuf {
     let _ = std::fs::remove_dir_all(&p);
     std::fs::create_dir_all(&p).expect("create cascade temp dir");
     p
-}
-
-/// `QuestDbConfig` pointing at a dead, unused high port so every ILP connection
-/// attempt fails immediately (no network delay) — this is the "QuestDB down"
-/// leg. Identical strategy to `tick_resilience::test_config`.
-fn dead_questdb_config() -> QuestDbConfig {
-    QuestDbConfig {
-        host: "127.0.0.1".to_string(),
-        ilp_port: 19_009, // closed port → connect fails fast
-        http_port: 19_000,
-        pg_port: 18_812,
-    }
-}
-
-/// Minimal NSE_EQ tick (Greeks NaN, non-F&O default), monotonic per `i` so the
-/// stream is distinguishable. Mirrors `tick_resilience::make_tick`.
-fn make_tick(id: u64, price: f32) -> ParsedTick {
-    ParsedTick {
-        security_id: id,
-        exchange_segment_code: 1, // NSE_EQ
-        last_traded_price: price,
-        last_trade_quantity: 100,
-        exchange_timestamp: 1_700_000_000_u32.saturating_add(id as u32),
-        received_at_nanos: 0,
-        average_traded_price: price,
-        volume: 1000,
-        total_sell_quantity: 500,
-        total_buy_quantity: 500,
-        day_open: price,
-        day_close: price,
-        day_high: price,
-        day_low: price,
-        open_interest: 0,
-        oi_day_high: 0,
-        oi_day_low: 0,
-        iv: f64::NAN,
-        delta: f64::NAN,
-        gamma: f64::NAN,
-        theta: f64::NAN,
-        vega: f64::NAN,
-    }
 }
 
 /// Bounded poll on `persisted_count()` — never an unbounded sleep. Returns the
@@ -160,7 +116,6 @@ fn expired_token() -> TokenState {
 #[test]
 fn cascade_01_triple_failure_loses_zero_durable_data() {
     let wal_dir = chaos_tmp("wal");
-    let spill_dir = chaos_tmp("spill");
 
     // ---- LEG 3 (set up first; it gates the live window) -------------------
     // "Auth token expired": a real expired TokenState + the reconnect-backoff
@@ -178,17 +133,10 @@ fn cascade_01_triple_failure_loses_zero_durable_data() {
         "LEG 3: an expired token MUST signal 'engage renewal' (needs_refresh)"
     );
 
-    // ---- LEG 2: "QuestDB down" -------------------------------------------
-    // Disconnected ILP writer pointed at a dead port → every flush fails →
-    // ticks cascade ring → spill → DLQ. Per-test spill dir avoids parallel
-    // races on the shared default path.
-    let config = dead_questdb_config();
-    let mut tick_writer = TickPersistenceWriter::new_disconnected(&config);
-    tick_writer.set_spill_dir_for_test(spill_dir.clone());
-    assert!(
-        !tick_writer.is_connected(),
-        "LEG 2 setup: tick writer must be disconnected (QuestDB down)"
-    );
+    // ---- LEG 2: "QuestDB down" — RETIRED (stage-2 dead-WS sweep,
+    // 2026-07-17): the `TickPersistenceWriter` belt was deleted with the
+    // dead Dhan tick chain; the seal chain's QuestDB-outage absorption is
+    // chaos-covered in crates/storage/tests/. ---------------------------
 
     // ---- LEG 1: "WebSocket drop" -----------------------------------------
     // The downstream consumer is gone, but the WS read loop keeps capturing
@@ -196,8 +144,7 @@ fn cascade_01_triple_failure_loses_zero_durable_data() {
     let spill = WsFrameSpill::new(&wal_dir).expect("WsFrameSpill::new");
 
     // ---- The simultaneous-failure window ---------------------------------
-    // Within ONE logical window, feed N frames through the WAL belt AND N ticks
-    // through the persistence belt. All three failures are active concurrently.
+    // Feed N frames through the WAL belt while the failures are active.
     let mut wal_dropped = 0u64;
     for i in 0..N {
         // LEG 1 — capture the raw frame (16-byte ticker-sized payload, first 4
@@ -207,15 +154,7 @@ fn cascade_01_triple_failure_loses_zero_durable_data() {
         if spill.append(WsType::LiveFeed, frame) == AppendOutcome::Dropped {
             wal_dropped += 1;
         }
-
-        // LEG 2 — persist the parsed tick (QuestDB down → ring buffer).
-        let tick = make_tick(i as u64, 100.0 + (i % 1000) as f32);
-        tick_writer
-            .append_tick(&tick)
-            .expect("append_tick must return Ok even with QuestDB down");
     }
-    // A flush attempt during the outage must also not drop or panic.
-    let _ = tick_writer.flush_if_needed();
 
     // ======================================================================
     // INVARIANT 1 — LEG 1: zero WS-frame loss; WAL replay recovers all N in
@@ -262,33 +201,9 @@ fn cascade_01_triple_failure_loses_zero_durable_data() {
         );
     }
 
-    // ======================================================================
-    // INVARIANT 2 — LEG 2: zero permanently-dropped ticks. The ring buffer
-    // (well below capacity at N=5,000) absorbed everything during the QuestDB
-    // outage; nothing reached the DLQ. Proves "QuestDB down" lost zero ticks.
-    // ======================================================================
-    assert_eq!(
-        tick_writer.ticks_dropped_total(),
-        0,
-        "LEG 2: ZERO ticks may be permanently dropped during the QuestDB outage"
-    );
-    assert_eq!(
-        tick_writer.dlq_ticks_total(),
-        0,
-        "LEG 2: no tick should reach the DLQ — the ring buffer has ample room \
-         ({N} << {TICK_BUFFER_CAPACITY})"
-    );
-    assert_eq!(
-        tick_writer.buffered_tick_count(),
-        N,
-        "LEG 2: every tick must be held in the durable ring buffer ({N})"
-    );
-    assert_eq!(
-        tick_writer.ticks_spilled_total(),
-        0,
-        "LEG 2: with {N} ticks far below capacity, none should even need disk \
-         spill — the ring alone proves zero loss"
-    );
+    // INVARIANT 2 — LEG 2: RETIRED (stage-2 dead-WS sweep, 2026-07-17) —
+    // the `ticks_dropped_total()/dlq_ticks_total()/buffered_tick_count()`
+    // accounting died with the deleted TickPersistenceWriter.
 
     // ======================================================================
     // INVARIANT 3 — LEG 3: the auth-recovery primitives engage. The expired
@@ -304,7 +219,6 @@ fn cascade_01_triple_failure_loses_zero_durable_data() {
 
     // ---- Cleanup ----------------------------------------------------------
     let _ = std::fs::remove_dir_all(&wal_dir);
-    let _ = std::fs::remove_dir_all(&spill_dir);
 }
 
 /// Guard: the three legs are independent — exercising the WAL + tick belts in
@@ -332,26 +246,10 @@ fn cascade_01_legs_are_independent_zero_loss_each() {
     let recovered = replay_all(&wal_dir).expect("replay");
     assert_eq!(recovered.len(), 1_000, "WAL belt replay must recover all");
 
-    // Tick belt alone (QuestDB down).
-    let spill_dir = chaos_tmp("indep-spill");
-    let config = dead_questdb_config();
-    let mut tick_writer = TickPersistenceWriter::new_disconnected(&config);
-    tick_writer.set_spill_dir_for_test(spill_dir.clone());
-    for i in 0..1_000u32 {
-        tick_writer
-            .append_tick(&make_tick(u64::from(i), 250.0 + i as f32))
-            .expect("append_tick ok while disconnected");
-    }
-    assert_eq!(tick_writer.ticks_dropped_total(), 0, "tick belt zero drops");
-    assert_eq!(tick_writer.dlq_ticks_total(), 0, "tick belt zero DLQ");
-    assert_eq!(
-        tick_writer.buffered_tick_count(),
-        1_000,
-        "tick belt rings all 1,000"
-    );
+    // Tick belt alone — RETIRED (stage-2 dead-WS sweep, 2026-07-17): the
+    // TickPersistenceWriter belt was deleted with the dead Dhan tick chain.
 
     let _ = std::fs::remove_dir_all(&wal_dir);
-    let _ = std::fs::remove_dir_all(&spill_dir);
 }
 
 // ---------------------------------------------------------------------------

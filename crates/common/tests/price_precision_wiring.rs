@@ -136,21 +136,16 @@ fn test_common_price_precision_module_exists() {
     );
 }
 
-#[test]
-fn test_storage_tick_persistence_delegates_to_common() {
-    // After 2026-05-25, the storage-local f32_to_f64_clean is a thin
-    // wrapper that forwards to tickvault_common. Pin that — if a
-    // future PR re-introduces a divergent impl, the two crates would
-    // silently drift and the ratchet would not catch it.
-    let body = fs::read_to_string(workspace_root().join("crates/storage/src/tick_persistence.rs"))
-        .unwrap_or_default(); // APPROVED: test
-    assert!(
-        body.contains("tickvault_common::price_precision::f32_to_f64_clean"),
-        "Z+ data-integrity ratchet: storage::tick_persistence::f32_to_f64_clean \
-         must delegate to tickvault_common::price_precision to keep one source \
-         of truth for f32→f64 conversion across storage + trading + core."
-    );
-}
+// RETIRED (stage-2 dead-WS sweep, 2026-07-17):
+// `test_storage_tick_persistence_delegates_to_common` pinned the
+// storage-local `f32_to_f64_clean` thin wrapper inside
+// `crates/storage/src/tick_persistence.rs` — that file was DELETED with
+// the dead Dhan tick chain, so there is no storage-local wrapper left to
+// drift. The single source of truth is unchanged:
+// `tickvault_common::price_precision::f32_to_f64_clean` (pinned above by
+// `test_common_price_precision_module_exists`), and every surviving
+// consumer imports it from common directly (the cross-crate `f64::from`
+// ban above still ratchets the whole workspace).
 
 #[test]
 fn test_banned_pattern_hook_covers_trading_and_core_paths() {

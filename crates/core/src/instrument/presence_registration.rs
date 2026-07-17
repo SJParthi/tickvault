@@ -39,20 +39,11 @@ mod tests {
         assert_eq!(day.map(ist_day_from_date), Some(20_644));
     }
 
-    /// Wiring ratchet: the two Dhan persist arms in tick_processor.rs must
-    /// fold presence (mirror of the feed_lag producer-site ratchet). Kept
-    /// through PR-C3: `feed_presence` + the tick-processor fold survive the
-    /// Dhan chain deletion (they serve WAL-replay + any future feed's
-    /// frames routed through the shared processor).
-    #[test]
-    fn test_dhan_presence_fold_sites_wired_into_tick_processor() {
-        let src = include_str!("../pipeline/tick_processor.rs");
-        let needle = "feed_presence::record_presence(";
-        let count = src.matches(needle).count();
-        assert_eq!(
-            count, 2,
-            "tick_processor.rs must fold presence at BOTH Dhan persist arms \
-             (Ticker/Quote + Full) — found {count} call(s)"
-        );
-    }
+    // Stage-2 dead-WS sweep (2026-07-17): the
+    // `test_dhan_presence_fold_sites_wired_into_tick_processor` ratchet is
+    // RETIRED — its subject (`tick_processor.rs`, the presence-fold
+    // producer) was deleted with the dead Dhan tick chain, so there is no
+    // Dhan persist arm left to pin. `feed_presence` itself survives (the
+    // Groww registration + 15:45 scoreboard drain path); a future live feed
+    // re-adds a producer-site ratchet with its own dated note.
 }
