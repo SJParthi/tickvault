@@ -175,7 +175,6 @@ pub struct DhanCadenceExecutor {
     intraday_url: String,
     chain_url: String,
     expirylist_url: String,
-    client_id: String,
     spot_writer: Mutex<Spot1mRestWriter>,
     chain_writer: Mutex<OptionChain1mWriter>,
     audit_writer: Mutex<RestFetchAuditWriter>,
@@ -187,11 +186,7 @@ impl DhanCadenceExecutor {
     /// (HTTP-CLIENT-01 class — the caller degrades loudly; NEVER a
     /// `Client::new()` panic fallback).
     // TEST-EXEMPT: thin constructor — client build + join_api_url are covered upstream; the fetch behavior is exercised via the mapping/ordering tests below.
-    pub fn new(
-        rest_api_base_url: &str,
-        client_id: String,
-        questdb: &QuestDbConfig,
-    ) -> Result<Self, String> {
+    pub fn new(rest_api_base_url: &str, questdb: &QuestDbConfig) -> Result<Self, String> {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(
                 DHAN_CADENCE_HTTP_TIMEOUT_SECS,
@@ -204,7 +199,6 @@ impl DhanCadenceExecutor {
             intraday_url: join_api_url(rest_api_base_url, DHAN_CHARTS_INTRADAY_PATH),
             chain_url: join_api_url(rest_api_base_url, DHAN_OPTION_CHAIN_PATH),
             expirylist_url: join_api_url(rest_api_base_url, DHAN_OPTION_CHAIN_EXPIRYLIST_PATH),
-            client_id,
             spot_writer: Mutex::new(Spot1mRestWriter::new(questdb)),
             chain_writer: Mutex::new(OptionChain1mWriter::new(questdb)),
             audit_writer: Mutex::new(RestFetchAuditWriter::new(questdb)),
@@ -212,21 +206,24 @@ impl DhanCadenceExecutor {
         })
     }
 
-    /// Fire-time JWT resolution — the global token manager registered by
-    /// `dhan_rest_stack` Phase 2 (or the boot lane). `Err(Auth)` when the
-    /// manager is not registered yet or no token state exists; the JWT is
-    /// NEVER logged.
-    fn jwt_at_fire_time() -> Result<secrecy::SecretString, CadenceFetchError> {
+    /// Fire-time auth resolution — JWT + client-id from the global token
+    /// manager registered by `dhan_rest_stack` Phase 2 (or the boot lane).
+    /// `Err(Auth)` when the manager is not registered yet or no token
+    /// state exists; the JWT is NEVER logged. Resolving the client-id
+    /// HERE (not at construction) keeps the cadence spawn free of any
+    /// boot-ordering dependency on the SSM credential fetch.
+    fn auth_at_fire_time() -> Result<(secrecy::SecretString, String), CadenceFetchError> {
         let Some(manager) = global_token_manager() else {
             debug!("dhan cadence executor: no global token manager at fire time");
             return Err(CadenceFetchError::Auth);
         };
         let guard = manager.token_handle().load();
-        guard
+        let jwt = guard
             .as_ref()
             .as_ref()
             .map(|state| state.access_token().clone())
-            .ok_or(CadenceFetchError::Auth)
+            .ok_or(CadenceFetchError::Auth)?;
+        Ok((jwt, manager.client_id_string()))
     }
 }
 
@@ -250,8 +247,9 @@ impl CadenceExecutor for DhanCadenceExecutor {
         let trading_date = today_ist();
         let trading_date_nanos = minute_open_ist_nanos(trading_date, 0);
         let target_nanos = minute_open_ist_nanos(trading_date, req.cycle_minute_ist);
-        let jwt = match Self::jwt_at_fire_time() {
-            Ok(jwt) => jwt,
+        // Spot needs no client-id header — only the JWT.
+        let jwt = match Self::auth_at_fire_time() {
+            Ok((jwt, _client_id)) => jwt,
             Err(e) => {
                 let mut audit = self.audit_writer.lock().await;
                 audit_append_best_effort(
@@ -485,8 +483,8 @@ impl CadenceExecutor for DhanCadenceExecutor {
         let trading_date = today_ist();
         let trading_date_nanos = minute_open_ist_nanos(trading_date, 0);
         let target_nanos = minute_open_ist_nanos(trading_date, req.cycle_minute_ist);
-        let jwt = match Self::jwt_at_fire_time() {
-            Ok(jwt) => jwt,
+        let (jwt, client_id) = match Self::auth_at_fire_time() {
+            Ok(pair) => pair,
             Err(e) => {
                 let mut audit = self.audit_writer.lock().await;
                 chain_audit_append_best_effort(
@@ -515,7 +513,7 @@ impl CadenceExecutor for DhanCadenceExecutor {
                 &self.client,
                 &self.chain_url,
                 jwt.expose_secret(),
-                &self.client_id,
+                &client_id,
                 &body,
             ),
         )
@@ -772,7 +770,7 @@ impl CadenceExecutor for DhanCadenceExecutor {
         else {
             return Err(CadenceFetchError::Timeout);
         };
-        let jwt = Self::jwt_at_fire_time()?;
+        let (jwt, client_id) = Self::auth_at_fire_time()?;
         let body = expirylist_request_body(security_id);
         let fetched = tokio::time::timeout(
             std::time::Duration::from_millis(remaining_ms),
@@ -780,7 +778,7 @@ impl CadenceExecutor for DhanCadenceExecutor {
                 &self.client,
                 &self.expirylist_url,
                 jwt.expose_secret(),
-                &self.client_id,
+                &client_id,
                 &body,
             ),
         )
@@ -948,7 +946,7 @@ mod tests {
         // fire-time resolution maps to Auth — never a panic, never a sent
         // request.
         assert!(matches!(
-            DhanCadenceExecutor::jwt_at_fire_time(),
+            DhanCadenceExecutor::auth_at_fire_time(),
             Err(CadenceFetchError::Auth)
         ));
     }

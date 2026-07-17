@@ -3360,10 +3360,10 @@ impl ApplicationConfig {
         // scheduler and the legacy per-minute RECORD-capture legs would
         // place DOUBLE demand on the same broker rate budgets if both ran
         // for one broker — no double demand is ever legal. Enabling the
-        // cadence requires the legacy legs to stand down FIRST; full
-        // subsumption (the cadence feeding the capture tables) is the
-        // flagged follow-up PR. base.toml today (legacy legs on, cadence
-        // off) stays valid.
+        // cadence requires the legacy legs to stand down FIRST — base.toml
+        // flipped to that shape 2026-07-17 (cadence ON, the four legacy
+        // legs OFF) with the real broker executors; the cadence executors
+        // now feed the capture tables directly (the subsumption).
         //
         // RS3 (2026-07-16): keyed on the LEG configs ALONE — deliberately
         // NOT on `feeds.*_enabled`. The cadence lanes activate on the
@@ -6585,7 +6585,8 @@ mod tests {
         config.groww_option_chain_1m.enabled = false;
         config.groww_contract_1m.enabled = false;
         assert!(config.validate().is_ok(), "cadence on + legs off is legal");
-        // Cadence OFF + legs ON (today's base.toml shape) → ok.
+        // Cadence OFF + legs ON (the pre-2026-07-17 base.toml shape —
+        // still a legal permutation) → ok.
         let mut config = make_valid_config();
         config.cadence.enabled = false;
         config.spot_1m_rest.enabled = true;
@@ -6593,7 +6594,7 @@ mod tests {
         config.groww_spot_1m.enabled = true;
         assert!(
             config.validate().is_ok(),
-            "cadence off + legacy legs on is today's valid shape"
+            "cadence off + legacy legs on stays a valid permutation"
         );
         // RS3 (2026-07-16): a boot-time-DISABLED feed lane's legs DO
         // block the cadence now — the pre-RS3 key on `feeds.*_enabled`

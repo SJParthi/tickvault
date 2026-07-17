@@ -5,12 +5,21 @@
 //! this from BOTH boot paths — the FAST crash-recovery arm returns before
 //! the process-global prefix ever runs, so both must own the spawn).
 //!
-//! Day 1 BOTH lanes run the [`DryRunLoggingExecutor`]: every fire is a
-//! structured `info!` returning `Empty` — the timing machinery is proven
-//! end-to-end in the logs, decisions honest-skip, and NO REST call is
-//! made. The real broker executors (and the dated rule-file
-//! re-authorization for the cadence decision-path fires) land in a LATER
-//! PR (`dhan_cadence_executor.rs`). Runbook:
+//! Since 2026-07-17 BOTH lanes run the REAL broker executors
+//! ([`crate::dhan_cadence_executor::DhanCadenceExecutor`] +
+//! [`crate::groww_cadence_executor::GrowwCadenceExecutor`]) — one bounded
+//! request per fire, runner-owned pacing/retry/ladder, persist-then-fold
+//! spot bars, RAM chain-snapshot publish. The RS3 mutual exclusion
+//! (config.rs) guarantees the legacy per-minute legs are OFF whenever the
+//! scheduler is ON, so the executors are the SOLE authors of the
+//! `spot_1m_rest` / `option_chain_1m` rows — which is why THIS spawn owns
+//! the ensure-DDL for those tables + `rest_fetch_audit` (previously the
+//! legacy legs' boot duty). Fire-time-token safety: the Dhan executor
+//! resolves JWT + client-id from the global `TokenManager` AT FIRE TIME
+//! (registered by `dhan_rest_stack` Phase 2, which may complete AFTER
+//! this spawn — a pre-registration fire is an honest `Auth` error, never
+//! a blocked boot); the Groww executor reads the shared-minter SSM token
+//! at fire time (never minted). Runbook:
 //! `.claude/rules/project/cadence-error-codes.md`.
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -18,14 +27,17 @@ use std::sync::{Arc, OnceLock};
 
 use tickvault_api::feed_state::FeedRuntimeState;
 use tickvault_common::config::ApplicationConfig;
+use tickvault_common::error_code::ErrorCode;
 use tickvault_common::trading_calendar::TradingCalendar;
 use tickvault_core::cadence::{
-    CadenceRunnerDeps, DryRunLoggingExecutor, global_expiry_store, init_global_dhan_gates,
-    spawn_supervised_cadence_runner,
+    CadenceRunnerDeps, global_expiry_store, init_global_dhan_gates, spawn_supervised_cadence_runner,
 };
 use tickvault_core::notification::NotificationService;
 use tokio::sync::Notify;
-use tracing::info;
+use tracing::{error, info};
+
+use crate::dhan_cadence_executor::DhanCadenceExecutor;
+use crate::groww_cadence_executor::GrowwCadenceExecutor;
 
 /// Once-per-process guard: the fast crash-recovery arm and the
 /// process-global prefix both call [`spawn_cadence_scheduler`]; only the
@@ -51,7 +63,7 @@ pub fn notify_cadence_shutdown() {
     }
 }
 
-/// Spawn the supervised cadence runner (dry-run executors, both lanes).
+/// Spawn the supervised cadence runner (REAL broker executors, both lanes).
 /// Disabled config = one `info!` + return — a disabled boot is
 /// byte-identical to today. Returns the shutdown handle the caller may
 /// notify at graceful teardown (`None` when disabled or already spawned);
@@ -68,9 +80,61 @@ pub fn spawn_cadence_scheduler(
         info!("cadence: disabled by [cadence] config — nothing spawned");
         return None;
     }
+    // Build the REAL broker executors BEFORE the once-guard so a client
+    // build failure (HTTP-CLIENT-01 class) leaves the guard un-tripped —
+    // the OTHER boot path can still succeed. Fail loud, never a
+    // `Client::new()` panic fallback.
+    let dhan_executor = match DhanCadenceExecutor::new(
+        &config.dhan.rest_api_base_url,
+        &config.questdb,
+    ) {
+        Ok(exec) => Arc::new(exec),
+        Err(err) => {
+            metrics::counter!("tv_http_client_build_failed_total", "site" => "cadence_dhan_executor")
+                .increment(1);
+            error!(
+                code = ErrorCode::HttpClient01BuildFailed.code_str(),
+                site = "cadence_dhan_executor",
+                %err,
+                "HTTP-CLIENT-01: Dhan cadence executor client build failed — cadence scheduler NOT spawned this attempt"
+            );
+            return None;
+        }
+    };
+    let groww_executor = match GrowwCadenceExecutor::new(&config.questdb) {
+        Ok(exec) => Arc::new(exec),
+        Err(err) => {
+            metrics::counter!("tv_http_client_build_failed_total", "site" => "cadence_groww_executor")
+                .increment(1);
+            error!(
+                code = ErrorCode::HttpClient01BuildFailed.code_str(),
+                site = "cadence_groww_executor",
+                %err,
+                "HTTP-CLIENT-01: Groww cadence executor client build failed — cadence scheduler NOT spawned this attempt"
+            );
+            return None;
+        }
+    };
     if CADENCE_SPAWNED.swap(true, Ordering::SeqCst) {
         // The other boot path already spawned it this process.
         return None;
+    }
+    // The scheduler's executors are the SOLE authors of these tables under
+    // the RS3 mutual exclusion (legacy legs OFF) — the ensure-DDL duty
+    // moves here (idempotent CREATE + ALTER ADD COLUMN IF NOT EXISTS; a
+    // failed ensure degrades per HTTP-CLIENT-01's documented
+    // duplicate-row-window envelope, never blocks the spawn).
+    {
+        let questdb = config.questdb.clone();
+        drop(tokio::spawn(async move {
+            tickvault_storage::spot_1m_rest_persistence::ensure_spot_1m_rest_table(&questdb).await;
+            tickvault_storage::option_chain_1m_persistence::ensure_option_chain_1m_table(&questdb)
+                .await;
+            tickvault_storage::rest_fetch_audit_persistence::ensure_rest_fetch_audit_table(
+                &questdb,
+            )
+            .await;
+        }));
     }
     let shutdown = Arc::new(Notify::new());
     // Park the handle for the teardown path (F2, 2026-07-15).
@@ -90,10 +154,10 @@ pub fn spawn_cadence_scheduler(
     let deps = CadenceRunnerDeps {
         config: config.cadence.clone(),
         calendar: Arc::clone(trading_calendar),
-        // Day-1 dry-run: both lanes log fires and return Empty — prices
-        // are NEVER synthesized (judge ruling, design §0).
-        dhan_executor: Arc::new(DryRunLoggingExecutor),
-        groww_executor: Arc::new(DryRunLoggingExecutor),
+        // REAL broker executors both lanes (2026-07-17): one bounded
+        // request per fire, runner-owned pacing/retry/ladder.
+        dhan_executor,
+        groww_executor,
         // Level-triggered lane gates: the SAME atomics the /api/feeds
         // toggle flips (dhan_flag/groww_flag), read per cycle per lane.
         dhan_enabled: feed_runtime.dhan_flag(),
@@ -102,17 +166,14 @@ pub fn spawn_cadence_scheduler(
         // production read facade — chains are stamped from the WINNING
         // (Dhan-preferred) policy date; unresolved days carry the
         // coalesced `expiry_unresolved` stage (the scheduler never
-        // guesses). Under the dry-run executors every expiry-list fetch
-        // returns Empty, so the store stays honestly unresolved.
+        // guesses).
         expiry_resolver: Arc::clone(&expiry_store)
             as Arc<dyn tickvault_core::cadence::ExpiryResolver>,
         expiry_store: Some(expiry_store),
         gates,
-        // F10 (2026-07-15): the wired executors ARE the dry-run loggers —
-        // Empty-shaped skips/degrades log at info! (dry_run=true), never
-        // the High coded error! storm. Flip to false with the REAL
-        // executor PR.
-        dry_run: true,
+        // F10 (2026-07-15) semantics: false since the REAL executor PR
+        // (2026-07-17) — skips/degrades keep their coded error! levels.
+        dry_run: false,
         // R6 (2026-07-16): the typed Telegram sink for the expiry
         // cross-broker disagreement page (`CadenceExpiryDisagreement`,
         // edge-latched once per underlying per day).
@@ -123,10 +184,10 @@ pub fn spawn_cadence_scheduler(
     // reaches it via the parked Notify (notify_cadence_shutdown).
     drop(spawn_supervised_cadence_runner(deps));
     info!(
-        "cadence: supervised runner spawned (dry-run executors both lanes; \
-         post-close all-7 burst at T+1s — 3 chains + 4 spots concurrent, \
-         shape/concurrency-laddered on rate limits; Groww all-7 at T+0, \
-         wave shape-laddered)"
+        "cadence: supervised runner spawned (REAL broker executors both \
+         lanes; post-close all-7 burst at T+1s — 3 chains + 4 spots \
+         concurrent, shape/concurrency-laddered on rate limits; Groww \
+         all-7 at T+0, wave shape-laddered)"
     );
     Some(shutdown)
 }
