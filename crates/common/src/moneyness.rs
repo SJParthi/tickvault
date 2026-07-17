@@ -370,6 +370,83 @@ pub fn classify_moneyness_for(
     }
 }
 
+/// Signed moneyness DEPTH in paise — the numeric companion to the
+/// ITM/ATM/OTM label (operator-confirmed gap, 2026-07-17): how far the
+/// strike sits from the spot, LEG-NORMALIZED so the sign reads the same
+/// for both legs:
+///
+/// - **negative = ITM-direction**, **positive = OTM-direction**,
+///   **0 = strike paise-exactly at the spot**;
+/// - CE: `depth = strike − spot` (CE is ITM when strike < spot → negative ✓);
+/// - PE: `depth = spot − strike` (PE is ITM when strike > spot → negative ✓).
+///
+/// This matches [`classify_moneyness_paise`]'s direction convention
+/// (decision-table rows 7–10: CE strike<spot = ITM, PE strike>spot = ITM),
+/// so for any valid inputs `classify == Itm ⇒ depth < 0` and
+/// `classify == Otm ⇒ depth > 0` (consistency-pinned in the tests below).
+/// ATM-labeled rows STILL carry their signed distance — the grid-rounded
+/// ATM strike can sit a nonzero distance from the spot (the label
+/// semantics are untouched; depth is the companion number, never a
+/// re-classification).
+///
+/// ## Decision table
+///
+/// | # | Guard state | leg | Result |
+/// |---|---|---|---|
+/// | 1 | leg not "CE"/"PE" | — | `None` |
+/// | 2 | `strike_paise < 1` or `spot_paise < 1` | any | `None` |
+/// | 3 | i64 overflow on the subtraction | any | `None` (checked, never a panic — structurally unreachable once row 2 holds: both operands ≥ 1 bound the result by ±(`i64::MAX` − 1)) |
+/// | 4 | ok | CE | `Some(strike_paise − spot_paise)` |
+/// | 5 | ok | PE | `Some(spot_paise − strike_paise)` |
+///
+/// The `< 1` guards mirror [`classify_moneyness_paise`]'s operand guards:
+/// callers feed [`price_to_paise_guarded`] outputs (0 = invalid/missing),
+/// so a moneyness=UNKNOWN row carries `None` depth by construction (the
+/// missing-vendor-spot 0.0 case etc.). Overflow is unreachable via the
+/// guarded conversion (paise ≤ 1e9) but fail-closes for raw i64 callers.
+///
+/// ## Half-paise divergence note (audit-column consistency)
+/// The depth derives from [`price_to_paise_guarded`] (ROUNDED paise)
+/// while the persisted `strike` DOUBLE column is the raw parsed f64 — a
+/// sub-paise strike would make the stored `moneyness_depth` differ from
+/// (stored strike − stored spot) by < 1 paise. Real NSE strikes are
+/// whole-paise, so the divergence is nil in practice.
+///
+/// # Performance
+/// O(1): one 2-arm label parse + one checked subtraction. Zero allocation.
+#[inline]
+#[must_use]
+pub fn moneyness_depth_paise(leg: &str, strike_paise: i64, spot_paise: i64) -> Option<i64> {
+    let leg = OptionLeg::parse(leg)?;
+    if strike_paise < 1 || spot_paise < 1 {
+        return None;
+    }
+    match leg {
+        OptionLeg::Ce => strike_paise.checked_sub(spot_paise),
+        OptionLeg::Pe => spot_paise.checked_sub(strike_paise),
+    }
+}
+
+/// Paise → rupees conversion for the signed-depth DOUBLE audit column
+/// (`option_chain_1m.moneyness_depth`). The integer-paise core
+/// ([`moneyness_depth_paise`]) stays the testable arithmetic; this is the
+/// display/storage conversion only.
+///
+/// # Performance
+/// O(1), zero allocation.
+#[inline]
+#[must_use]
+pub fn depth_paise_to_rupees(depth_paise: i64) -> f64 {
+    // Guarded-conversion callers are bounded ±1e9 paise, far inside f64's
+    // exact-integer range; a raw extreme i64 loses only sub-paise precision
+    // on a DOUBLE display column — never a panic.
+    // APPROVED: bounded paise→rupees display conversion (see the note above)
+    #[allow(clippy::cast_precision_loss)]
+    {
+        depth_paise as f64 / 100.0
+    }
+}
+
 /// Observed finest grid step over a SORTED slice of distinct strike paise:
 /// the minimum positive adjacent difference. `None` when fewer than 2
 /// distinct values. Advisory ONLY — the call sites compare it against the
@@ -810,6 +887,117 @@ mod tests {
             observed_finest_step_paise(&[2_570_000, 2_570_050, 2_575_000]),
             Some(50)
         );
+    }
+
+    // -- Signed moneyness depth (2026-07-17) ---------------------------------
+
+    #[test]
+    fn test_moneyness_depth_paise_ce_pe_sign_convention() {
+        // CE ITM (strike < spot) → negative.
+        assert_eq!(
+            moneyness_depth_paise("CE", 2_450_000, 2_453_640),
+            Some(-3_640)
+        );
+        // CE OTM (strike > spot) → positive.
+        assert_eq!(
+            moneyness_depth_paise("CE", 2_460_000, 2_453_640),
+            Some(6_360)
+        );
+        // PE ITM (strike > spot) → negative.
+        assert_eq!(
+            moneyness_depth_paise("PE", 2_460_000, 2_453_640),
+            Some(-6_360)
+        );
+        // PE OTM (strike < spot) → positive.
+        assert_eq!(
+            moneyness_depth_paise("PE", 2_450_000, 2_453_640),
+            Some(3_640)
+        );
+        // Strike paise-exactly at the spot → Some(0), both legs.
+        assert_eq!(moneyness_depth_paise("CE", 2_453_640, 2_453_640), Some(0));
+        assert_eq!(moneyness_depth_paise("PE", 2_453_640, 2_453_640), Some(0));
+        // The ATM-labeled grid strike still carries its signed distance:
+        // the 2026-04-21 capture (spot 24536.40, grid ATM 24550.00) → CE
+        // depth +13.60 rupees = +1360 paise (label ATM, depth nonzero).
+        assert_eq!(
+            moneyness_depth_paise("CE", 2_455_000, 2_453_640),
+            Some(1_360)
+        );
+    }
+
+    #[test]
+    fn test_moneyness_depth_paise_guards_and_overflow_boundary() {
+        // Unknown / miscased legs → None (mirrors the classifier).
+        for bad_leg in ["", "XX", "ce", "Ce", "CALL", "PUT"] {
+            assert_eq!(
+                moneyness_depth_paise(bad_leg, 2_455_000, 2_453_640),
+                None,
+                "leg {bad_leg:?} must yield None"
+            );
+        }
+        // Zero / negative operands → None (the price_to_paise_guarded
+        // invalid sentinel — a moneyness=UNKNOWN row carries NULL depth).
+        assert_eq!(moneyness_depth_paise("CE", 0, 2_453_640), None);
+        assert_eq!(moneyness_depth_paise("CE", 2_455_000, 0), None);
+        assert_eq!(moneyness_depth_paise("PE", -1, 2_453_640), None);
+        assert_eq!(moneyness_depth_paise("PE", 2_455_000, -1), None);
+        // Structural totality at the i64 extremes: with BOTH operands ≥ 1
+        // the subtraction result is bounded by ±(i64::MAX − 1), so
+        // checked_sub can never overflow — the widest possible legal pairs
+        // still compute Some (the checked form is pure defense-in-depth,
+        // never a panic path).
+        assert_eq!(moneyness_depth_paise("PE", i64::MAX, 1), Some(1 - i64::MAX));
+        assert_eq!(moneyness_depth_paise("CE", 1, i64::MAX), Some(1 - i64::MAX));
+        assert_eq!(moneyness_depth_paise("CE", i64::MAX, 1), Some(i64::MAX - 1));
+        assert_eq!(moneyness_depth_paise("PE", 1, i64::MAX), Some(i64::MAX - 1));
+    }
+
+    #[test]
+    fn test_depth_paise_to_rupees_conversion() {
+        assert!((depth_paise_to_rupees(1_360) - 13.60).abs() < 1e-9);
+        assert!((depth_paise_to_rupees(-3_640) - (-36.40)).abs() < 1e-9);
+        assert!((depth_paise_to_rupees(0) - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_moneyness_depth_sign_is_consistent_with_classification() {
+        // For a spread of valid (leg, strike, spot, atm) inputs:
+        // classify==Itm ⇒ depth<0 and classify==Otm ⇒ depth>0; ATM rows
+        // are excluded from the sign assertion but MUST still be Some.
+        let spots = [2_453_640_i64, 4_814_325, 8_105_000, 5_000, 2_455_000];
+        let step = 5_000_i64;
+        for &spot_paise in &spots {
+            let Some(atm_paise) = atm_strike_paise(spot_paise, step) else {
+                continue;
+            };
+            for k in -10_i64..=10 {
+                let strike_paise = atm_paise + k * step;
+                if strike_paise < 1 {
+                    continue;
+                }
+                for leg in ["CE", "PE"] {
+                    let class = classify_moneyness_paise(leg, strike_paise, spot_paise, atm_paise);
+                    let depth = moneyness_depth_paise(leg, strike_paise, spot_paise);
+                    match class {
+                        Moneyness::Itm => assert!(
+                            depth.is_some_and(|d| d < 0),
+                            "{leg} ITM strike={strike_paise} spot={spot_paise} must have depth<0, got {depth:?}"
+                        ),
+                        Moneyness::Otm => assert!(
+                            depth.is_some_and(|d| d > 0),
+                            "{leg} OTM strike={strike_paise} spot={spot_paise} must have depth>0, got {depth:?}"
+                        ),
+                        Moneyness::Atm => assert!(
+                            depth.is_some(),
+                            "{leg} ATM strike={strike_paise} spot={spot_paise} must still carry Some depth"
+                        ),
+                        Moneyness::Unknown => {
+                            unreachable!("valid guarded inputs can never classify UNKNOWN")
+                        }
+                    }
+                }
+            }
+        }
     }
 
     // -- Property suite --------------------------------------------------------

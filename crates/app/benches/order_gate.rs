@@ -1,9 +1,13 @@
 //! Order-runtime dry-run PR (2026-07-14) — Criterion benchmarks for the
-//! Groww-bridge mark-forward tap (`order_runtime::MarkForwarder`).
+//! order-runtime mark-forward tap (`order_runtime::MarkForwarder`).
+//! 2026-07-17 truth-sync: the mark source is the Groww per-minute REST
+//! legs' persist-confirm points (re-homed 2026-07-16 — the live-bridge
+//! per-tick source died with #1581); the hot-path-grade budgets are KEPT
+//! as ratchets so a future higher-rate source needs no re-budget.
 //!
 //! Three targets, budget key `order_gate_mark_forward` in
 //! `quality/benchmark-budgets.toml` (substring-matches all three ids):
-//!   - `order_gate/mark_forward_disarmed` — the DOMINANT per-tick path
+//!   - `order_gate/mark_forward_disarmed` — the DOMINANT per-mark path
 //!     (no positions / no pending paper orders): one `Relaxed` load.
 //!   - `order_gate/mark_forward_armed_full` — the backpressure drop arm:
 //!     bounded `try_send` against a full channel + static-key counter.
@@ -23,7 +27,7 @@ use criterion::{Criterion, criterion_group, criterion_main};
 use tickvault_app::order_runtime::MarkForwarder;
 
 fn bench_mark_forward(c: &mut Criterion) {
-    // Disarmed: the dominant per-tick cost — a single Relaxed load.
+    // Disarmed: the dominant per-mark cost — a single Relaxed load.
     {
         let (tx, _rx) = tokio::sync::mpsc::channel(64);
         let forwarder = MarkForwarder {
