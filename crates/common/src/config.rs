@@ -299,7 +299,8 @@ pub struct OrderRuntimeConfig {
     /// invariant check. Validation floor: ≥ 60.
     #[serde(default = "default_order_runtime_reconcile_interval_secs")]
     pub reconcile_interval_secs: u64,
-    /// Bounded mark-forward channel capacity (Groww bridge → runtime).
+    /// Bounded mark-forward channel capacity (the Groww per-minute REST
+    /// legs → runtime; re-homed 2026-07-16 after #1581).
     /// Validation range: [256, 65536].
     #[serde(default = "default_order_runtime_mark_channel_capacity")]
     pub mark_channel_capacity: usize,

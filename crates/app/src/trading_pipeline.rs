@@ -226,7 +226,21 @@ async fn run_trading_pipeline(
 
     // Initialize OMS (always starts in dry_run mode by default). Client via
     // the SHARED pinned-timeout builder (oms_wiring — 2026-07-14 extraction).
-    let oms_http_client = crate::oms_wiring::build_oms_http_client();
+    // HTTP-CLIENT-01 degrade (post-#1562 audit, 2026-07-17): a builder
+    // failure exits the pipeline BEFORE OMS construction (coded error! +
+    // counter fire inside build_oms_http_client; this arm adds the
+    // pipeline-scoped consequence line) — never the pre-fix
+    // `.unwrap_or_default()` panic-class fallback.
+    let Ok(oms_http_client) = crate::oms_wiring::build_oms_http_client() else {
+        error!(
+            code = tickvault_common::error_code::ErrorCode::HttpClient01BuildFailed.code_str(),
+            site = "oms_wiring",
+            "trading pipeline exiting before OMS construction — the OMS HTTP \
+             client could not be built (HTTP-CLIENT-01); a dhan-lane restart \
+             retries the pipeline spawn"
+        );
+        return;
+    };
     let api_client = OrderApiClient::new(
         oms_http_client,
         config.rest_api_base_url,

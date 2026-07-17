@@ -209,7 +209,8 @@ pub mod order_observability;
 /// Order runtime (dry-run) — cluster A, operator directive 2026-07-14
 /// (`.claude/plans/active-plan-order-runtime-dryrun.md`): the single-owner
 /// supervised task owning the paper OMS + RiskEngine on the dhan-off prod
-/// profile, spawned ONLY from `dhan_rest_stack` Phase 5a.
+/// profile, spawned ONLY from `dhan_rest_stack` Phase 5b (2026-07-17
+/// correction — Phase 5a is the RETIRED order-update WS spawn slot).
 pub mod order_runtime;
 pub mod subsystem_memory;
 pub mod trading_pipeline;

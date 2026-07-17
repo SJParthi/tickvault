@@ -20,7 +20,9 @@
 //!   re-attaches the socket + WAL producers to this SAME channel,
 //! - the RiskEngine fed by [`FillEvent`]s (the widened `handle_order_update`
 //!   return) and by Groww marks (the zero-alloc [`MarkForwarder`] tap at the
-//!   groww_bridge consume seam → bounded mpsc → `update_market_price`),
+//!   Groww per-minute REST legs' persist-confirm seam — re-homed 2026-07-16,
+//!   the live-bridge per-tick source died with #1581; 2026-07-17 truth-sync
+//!   — → bounded mpsc → `update_market_price`),
 //! - the next-mark PAPER FILLER (a pending `PAPER-n` order fills at the next
 //!   mark for its sid — fill-once, terminal orders never re-fill, finite>0
 //!   mark required, else deferred + counted),
@@ -119,13 +121,16 @@ const ORDER_UPDATE_LAG_ERROR_THRESHOLD: u64 = 1_000;
 const HOUSEKEEPING_TICK_SECS: u64 = 1;
 
 // ---------------------------------------------------------------------------
-// Mark forwarding (the Groww bridge hot-path tap)
+// Mark forwarding (the Groww per-minute REST-leg tap — re-homed 2026-07-16)
 // ---------------------------------------------------------------------------
 
 /// A mark-to-market price update. `Copy`, 16 bytes — sent from the Groww
-/// bridge per-tick path via a lock-free `try_send` (no await; the disarmed
-/// and drop arms are strictly zero-alloc — accepted sends carry tokio
-/// mpsc's AMORTIZED block-reuse alloc profile, see [`MarkForwarder`]).
+/// per-minute REST legs at each persist-confirm choke point (own-fire
+/// just-closed 1m candle closes: ≤4 spot indices + the bounded ~30-contract
+/// selection per minute; 2026-07-17 truth-sync — the "per-tick" live-bridge
+/// source died with #1581) via a lock-free `try_send` (no await; the
+/// disarmed and drop arms are strictly zero-alloc — accepted sends carry
+/// tokio mpsc's AMORTIZED block-reuse alloc profile, see [`MarkForwarder`]).
 #[derive(Clone, Copy, Debug)]
 pub struct MarkUpdate {
     /// Feed-native security id (Groww exchange_token space; bit-62 indices).
@@ -136,12 +141,15 @@ pub struct MarkUpdate {
     pub price: f32,
 }
 
-/// The hot-path side of the mark bridge, cloned into the Groww bridge.
+/// The hot-path-grade side of the mark bridge, cloned into the Groww
+/// per-minute REST legs (spot + contract; 2026-07-17 truth-sync — was
+/// "cloned into the Groww bridge" before the #1581 retirement).
 ///
 /// Dominant path (no positions, no pending paper orders): ONE `Relaxed`
 /// atomic load and nothing else. When armed, a bounded `try_send` of a
-/// `Copy` struct — a full channel DROPS the mark (counted; the next tick
-/// supersedes it — prices are idempotent, positions stay exact).
+/// `Copy` struct — a full channel DROPS the mark (counted; the NEXT MINUTE
+/// CLOSE supersedes it, ~60s — prices are idempotent, positions stay
+/// exact; the honest recovery latency is a minute, not "the next tick").
 ///
 /// # Alloc honesty (HP-1, mirrors the DHAT file's own wording)
 /// The DISARMED and ARMED+FULL (drop) arms are strictly zero-alloc
@@ -160,8 +168,10 @@ pub struct MarkForwarder {
 
 impl MarkForwarder {
     /// Forward one mark if the runtime wants marks. Lock-free, never
-    /// blocks, never awaits — safe at the per-tick consume seam (alloc
-    /// profile per the struct-level honesty note).
+    /// blocks, never awaits — hot-path-grade by design so a future
+    /// higher-rate mark source needs no redesign (today's callers are the
+    /// per-minute REST legs' persist-confirm points; alloc profile per the
+    /// struct-level honesty note).
     #[inline]
     pub fn mark_forward(&self, security_id: u64, segment_code: u8, price: f32) {
         if !self.marks_wanted.load(Ordering::Relaxed) {
@@ -285,7 +295,8 @@ pub struct OrderRuntimeParams {
     /// producer exists in the socket-free shape; the gated live re-arm's
     /// socket/WAL drain must keep subscribing BEFORE any producer starts).
     pub first_order_update_rx: broadcast::Receiver<OrderUpdate>,
-    /// Bounded mark channel (Groww bridge tap → this runtime).
+    /// Bounded mark channel (the Groww per-minute REST legs' tap → this
+    /// runtime; re-homed 2026-07-16).
     pub mark_rx: mpsc::Receiver<MarkUpdate>,
     /// Shared arm flag (the hot-path gate half of the mark bridge).
     pub marks_wanted: Arc<AtomicBool>,
@@ -657,8 +668,10 @@ struct BookState {
     mirror: HashMap<u64, i64>,
     /// First-seen segment code per sid (the I-P1-11 tripwire). Footprint
     /// (HP-6): while armed, EVERY sid the tap forwards gets an entry — the
-    /// map is bounded by the Groww watch universe (~770 sids ≈ tens of KB)
-    /// and cleared at the daily reset.
+    /// mark source is the Groww per-minute REST legs (≤4 spot indices + the
+    /// bounded ~30-contract selection per minute; 2026-07-17 truth-sync of
+    /// the stale "~770-sid watch universe" live-bridge bound), so the map
+    /// stays trivially small and is cleared at the daily reset.
     tripwire: HashMap<u64, u8>,
     /// HP-3/E3 edge latch: sids whose divergence has already fired the
     /// coded `error!` this episode (cleared at the daily reset). The
@@ -816,8 +829,18 @@ async fn run_order_runtime(
 ) {
     let config = &ctx.config;
     // ---- Construction (the proven trading_pipeline template) ----
+    // HTTP-CLIENT-01 degrade (post-#1562 audit, 2026-07-17): a builder
+    // failure (fd/TLS/resolver pressure) SKIPS this spawn attempt — the
+    // coded error! + counter fire inside build_oms_http_client, and the
+    // supervisor's escalating-backoff respawn retries once pressure
+    // subsides. Never a panic/abort for a dry-run client that issues no
+    // HTTP (the pre-fix `.unwrap_or_default()` aborted the WHOLE process,
+    // REST capture legs included, under `panic = "abort"`).
+    let Ok(http_client) = build_oms_http_client() else {
+        return;
+    };
     let api_client = OrderApiClient::new(
-        build_oms_http_client(),
+        http_client,
         config.dhan.rest_api_base_url.clone(),
         ctx.client_id.clone(),
     );

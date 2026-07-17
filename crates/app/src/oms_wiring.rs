@@ -9,7 +9,9 @@
 
 use secrecy::{ExposeSecret, SecretString};
 
+use tickvault_common::error_code::ErrorCode;
 use tickvault_core::auth::token_manager::TokenHandle;
+use tickvault_storage::http_client::{HttpClientBuildError, client_from_build_result};
 use tickvault_trading::oms::{OmsError, TokenProvider};
 
 /// Bridges the core crate's `TokenHandle` (arc-swap) to the trading crate's
@@ -41,23 +43,54 @@ impl TokenProvider for TokenHandleBridge {
 }
 
 /// Builds the OMS REST client with the pinned `OMS_HTTP_*` timeouts
-/// (Phase 0 Item 22a — 5s request / connect, pooled idle). Falls back to
-/// the reqwest default client if the builder fails (cold path; the
-/// dry-run OMS never issues HTTP anyway).
-#[must_use]
-pub fn build_oms_http_client() -> reqwest::Client {
-    reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(
-            tickvault_common::constants::OMS_HTTP_TIMEOUT_SECS,
-        ))
-        .connect_timeout(std::time::Duration::from_secs(
-            tickvault_common::constants::OMS_HTTP_CONNECT_TIMEOUT_SECS,
-        ))
-        .pool_idle_timeout(std::time::Duration::from_secs(
-            tickvault_common::constants::OMS_HTTP_POOL_IDLE_TIMEOUT_SECS,
-        ))
-        .build()
-        .unwrap_or_default()
+/// (Phase 0 Item 22a — 5s request / connect, pooled idle).
+///
+/// HTTP-CLIENT-01 discipline (post-#1562 audit fix, 2026-07-17): the old
+/// `.unwrap_or_default()` tail invoked `reqwest::Client::default()` ==
+/// `Client::new()`, which PANICS under exactly the fd/TLS/resolver
+/// pressure that makes the builder's `Err` arm reachable — with the
+/// workspace release profile's `panic = "abort"`, a whole-process abort
+/// at every order-runtime (re)spawn, for a dry-run client that never
+/// issues HTTP. A builder failure now degrades through the storage
+/// crate's typed [`HttpClientBuildError`] core (userinfo-redacted): this
+/// fn logs ONE coded `error!` + increments
+/// `tv_http_client_build_failed_total{site="oms_wiring"}` (static label)
+/// and returns `Err`; callers DEGRADE loudly — `run_order_runtime` skips
+/// the spawn attempt (the supervisor's backoff respawn retries),
+/// `run_trading_pipeline` exits before OMS construction. Never a panic.
+/// Runbook: `.claude/rules/project/http-client-error-codes.md`.
+///
+/// # Errors
+///
+/// Returns [`HttpClientBuildError`] when `ClientBuilder::build()` fails
+/// (TLS backend init, DNS resolver init, fd exhaustion).
+pub fn build_oms_http_client() -> Result<reqwest::Client, HttpClientBuildError> {
+    let built = client_from_build_result(
+        reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(
+                tickvault_common::constants::OMS_HTTP_TIMEOUT_SECS,
+            ))
+            .connect_timeout(std::time::Duration::from_secs(
+                tickvault_common::constants::OMS_HTTP_CONNECT_TIMEOUT_SECS,
+            ))
+            .pool_idle_timeout(std::time::Duration::from_secs(
+                tickvault_common::constants::OMS_HTTP_POOL_IDLE_TIMEOUT_SECS,
+            ))
+            .build(),
+    );
+    if let Err(err) = &built {
+        tracing::error!(
+            code = ErrorCode::HttpClient01BuildFailed.code_str(),
+            site = "oms_wiring",
+            error = %err,
+            "HTTP-CLIENT-01: OMS HTTP client build failed — the caller degrades \
+             loudly (order runtime: spawn attempt skipped, supervisor backoff \
+             retries; trading pipeline: exits before OMS construction); never a \
+             panic-class client fallback"
+        );
+        metrics::counter!("tv_http_client_build_failed_total", "site" => "oms_wiring").increment(1);
+    }
+    built
 }
 
 #[cfg(test)]
@@ -73,11 +106,14 @@ mod tests {
         assert!(matches!(bridge.get_access_token(), Err(OmsError::NoToken)));
     }
 
-    /// The shared client builder must produce a client (pinned timeouts are
-    /// asserted at the constants level by
-    /// `test_oms_http_timeout_is_pinned_at_5s`).
+    /// The shared client builder must produce a client on a healthy host
+    /// (pinned timeouts are asserted at the constants level by
+    /// `test_oms_http_timeout_is_pinned_at_5s`); the Err arm is the typed
+    /// HTTP-CLIENT-01 degrade, exercised via `client_from_build_result`'s
+    /// own unit tests in `tickvault_storage::http_client`.
     #[test]
     fn test_build_oms_http_client_constructs() {
-        let _client = build_oms_http_client();
+        let client = build_oms_http_client();
+        assert!(client.is_ok(), "normal-env build must succeed: {client:?}");
     }
 }
