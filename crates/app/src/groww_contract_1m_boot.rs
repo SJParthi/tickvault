@@ -667,13 +667,14 @@ fn contract_ohlc_implausible(c: &GrowwCandleRow) -> bool {
     c.open <= 0.0 || c.high <= 0.0 || c.low <= 0.0 || c.close <= 0.0 || c.high < c.low
 }
 
-/// The target-minute candle row from a parsed body (first match wins;
-/// duplicates counted by the caller). Pure.
-#[must_use]
 /// Numeric `ExchangeSegment` code for a contract-leg segment string —
 /// the mark tap's segment identity (annexure rule 2 numeric codes). The
 /// contract book only ever constructs "NSE_FNO"/"BSE_FNO"; anything else
 /// maps to the fail-closed unknown sentinel (never a guessed code).
+/// (2026-07-17 splice fix, post-#1562 audit: this fn had been inserted
+/// BETWEEN `select_candle_row`'s doc + `#[must_use]` and its `fn`,
+/// stealing both — the doc/attribute now sit back on their owner below.)
+#[must_use]
 fn contract_segment_code(segment: &'static str) -> u8 {
     match segment {
         "NSE_FNO" => tickvault_common::constants::EXCHANGE_SEGMENT_NSE_FNO,
@@ -682,6 +683,9 @@ fn contract_segment_code(segment: &'static str) -> u8 {
     }
 }
 
+/// The target-minute candle row from a parsed body (first match wins;
+/// duplicates counted by the caller). Pure.
+#[must_use]
 fn select_candle_row(rows: &[GrowwCandleRow], minute_nanos: i64) -> Option<GrowwCandleRow> {
     rows.iter()
         .find(|r| r.minute_ts_ist_nanos == minute_nanos)

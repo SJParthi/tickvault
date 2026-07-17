@@ -197,7 +197,9 @@ pub struct DhanRestStackParams {
     pub mark_rx_slot: Arc<
         std::sync::Mutex<Option<tokio::sync::mpsc::Receiver<crate::order_runtime::MarkUpdate>>>,
     >,
-    /// Shared mark-gate flag (the Groww bridge's per-tick `Relaxed` load).
+    /// Shared mark-gate flag (the `Relaxed` load the Groww per-minute REST
+    /// legs take at each mark forward; 2026-07-17 truth-sync — the
+    /// live-bridge per-tick load died with #1581).
     pub marks_wanted: Arc<AtomicBool>,
     /// Shared /health state (PR-C2, 2026-07-13): the stack owns the token
     /// block writer (`token_remaining_secs` + `token_valid`) — the lane's
