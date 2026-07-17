@@ -60,7 +60,8 @@ use tickvault_core::notification::NotificationService;
 use tickvault_core::pipeline::chain_snapshot::ChainUnderlying;
 
 use crate::cadence_escalation::{
-    EscalationLeg, LaneEscalation, emit_edge_action, flush_off_worker,
+    EscalationLeg, LaneEscalation, TargetOutcome, emit_edge_action, emit_not_served,
+    flush_off_worker, target_outcome_of,
 };
 use tickvault_storage::option_chain_1m_persistence::{
     OPTION_CHAIN_1M_FEED_DHAN, OptionChain1mRow, OptionChain1mWriter,
@@ -225,7 +226,7 @@ impl DhanCadenceExecutor {
             chain_writer: Mutex::new(OptionChain1mWriter::new(questdb)),
             audit_writer: Mutex::new(RestFetchAuditWriter::new(questdb)),
             moneyness_latches: Mutex::new(MoneynessWarnLatches::default()),
-            escalation: Mutex::new(LaneEscalation::default()),
+            escalation: Mutex::new(LaneEscalation::new(Feed::Dhan)),
             notifier,
         })
     }
@@ -233,11 +234,32 @@ impl DhanCadenceExecutor {
     /// Record one leg outcome into the lane escalation tally; when the
     /// outcome rolls the minute bucket, emit the FINALIZED minute's edge
     /// action (the legacy SPOT1M-01/CHAIN-02 escalation/recovery contract
-    /// — fix round 2026-07-17).
-    async fn record_leg_outcome(&self, leg: EscalationLeg, minute_secs: u32, ok: bool) {
-        let finalized = self.escalation.lock().await.record(leg, minute_secs, ok);
+    /// — fix round 2026-07-17) PLUS the previous minute's per-target
+    /// NOT-SERVED verdicts (fix round 2 — the legacy
+    /// `stage="sid_not_served"` / `stage="underlying_not_served"` pagers,
+    /// reused trackers/events, thresholds unchanged). `target` = the
+    /// fetch-level per-target verdict; `None` = per-target HOLD (never
+    /// recorded — e.g. a self-inflicted QueueDelay).
+    async fn record_leg_outcome(
+        &self,
+        leg: EscalationLeg,
+        minute_secs: u32,
+        ok: bool,
+        target: Option<(&'static str, SecurityId, TargetOutcome)>,
+    ) {
+        let (finalized, not_served) = {
+            let mut esc = self.escalation.lock().await;
+            let finalized = esc.record(leg, minute_secs, ok);
+            let not_served = target.and_then(|(symbol, sid, outcome)| {
+                esc.record_target(leg, minute_secs, symbol, sid, outcome)
+            });
+            (finalized, not_served)
+        };
         if let Some((minute, action)) = finalized {
             emit_edge_action(Feed::Dhan, leg, minute, action, self.notifier.as_ref());
+        }
+        if let Some((minute, emits)) = not_served {
+            emit_not_served(Feed::Dhan, leg, minute, &emits, self.notifier.as_ref());
         }
     }
 
@@ -504,10 +526,16 @@ impl CadenceExecutor for DhanCadenceExecutor {
         .await;
         // Escalation edge (fix round 2026-07-17): a persist failure counts
         // as a FAILED minute (fetch-ok-but-lost is not ok — the M1 rule).
+        // Not-served verdict (fix round 2): FETCH-level per-SID, the
+        // legacy 4-SID detector incl. INDIA VIX.
+        let target = target_outcome_of(&result).and_then(|outcome| {
+            dhan_spot_identity(req.target).map(|(sid, symbol)| (symbol, sid, outcome))
+        });
         self.record_leg_outcome(
             EscalationLeg::Spot,
             escalation_minute_secs,
             result.is_ok() && escalation_persist_ok,
+            target,
         )
         .await;
         result
@@ -817,11 +845,24 @@ impl CadenceExecutor for DhanCadenceExecutor {
         }
         .await;
         // Escalation edge (fix round 2026-07-17): persist failure = failed
-        // minute (the M1 rule).
+        // minute (the M1 rule). Not-served verdict (fix round 2):
+        // FETCH-level per-underlying — an UNRESOLVED-expiry Empty is a
+        // per-target HOLD (an expiry-resolution failure is never a
+        // vendor-not-serving verdict; the legacy expiry_unresolved arm
+        // never fed the sink).
+        let expiry_unresolved = req.expiry_yyyymmdd.and_then(yyyymmdd_to_date).is_none();
+        let target = if expiry_unresolved && matches!(result, Err(CadenceFetchError::Empty)) {
+            None
+        } else {
+            target_outcome_of(&result).and_then(|outcome| {
+                dhan_chain_identity(req.underlying).map(|(_, sid, symbol)| (symbol, sid, outcome))
+            })
+        };
         self.record_leg_outcome(
             EscalationLeg::Chain,
             escalation_minute_secs,
             result.is_ok() && escalation_persist_ok,
+            target,
         )
         .await;
         result

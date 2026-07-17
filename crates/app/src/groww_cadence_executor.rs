@@ -36,6 +36,7 @@ use tickvault_common::constants::{
 };
 use tickvault_common::error_code::ErrorCode;
 use tickvault_common::feed::Feed;
+use tickvault_common::types::SecurityId;
 use tickvault_core::cadence::executor::{
     CadenceExecutor, CadenceFetchError, ChainFetchOk, ChainFetchRequest, ExpiryListRequest,
     SpotFetchRequest, SpotSnapshot, SpotTarget,
@@ -59,7 +60,8 @@ use tokio::sync::Mutex;
 use tracing::{debug, error, warn};
 
 use crate::cadence_escalation::{
-    EscalationLeg, LaneEscalation, emit_edge_action, flush_off_worker,
+    EscalationLeg, LaneEscalation, TargetOutcome, emit_edge_action, emit_not_served,
+    flush_off_worker, target_outcome_of,
 };
 use crate::dhan_cadence_executor::{date_to_yyyymmdd, deadline_remaining_ms, yyyymmdd_to_date};
 use crate::groww_option_chain_1m_boot::{
@@ -256,7 +258,7 @@ impl GrowwCadenceExecutor {
             token_cache: Mutex::new(GrowwTokenCache::new()),
             moneyness_latches: Mutex::new(MoneynessWarnLatches::default()),
             expiry_cache: Mutex::new(None),
-            escalation: Mutex::new(LaneEscalation::default()),
+            escalation: Mutex::new(LaneEscalation::new(Feed::Groww)),
             notifier,
         })
     }
@@ -279,7 +281,7 @@ impl GrowwCadenceExecutor {
             token_cache: Mutex::new(token_cache),
             moneyness_latches: Mutex::new(MoneynessWarnLatches::default()),
             expiry_cache: Mutex::new(None),
-            escalation: Mutex::new(LaneEscalation::default()),
+            escalation: Mutex::new(LaneEscalation::new(Feed::Groww)),
             notifier: None,
         }
     }
@@ -287,11 +289,31 @@ impl GrowwCadenceExecutor {
     /// Record one leg outcome into the lane escalation tally; when the
     /// outcome rolls the minute bucket, emit the FINALIZED minute's edge
     /// action (the legacy SPOT1M-01/CHAIN-02 escalation/recovery contract
-    /// — fix round 2026-07-17).
-    async fn record_leg_outcome(&self, leg: EscalationLeg, minute_secs: u32, ok: bool) {
-        let finalized = self.escalation.lock().await.record(leg, minute_secs, ok);
+    /// — fix round 2026-07-17) PLUS the previous minute's per-target
+    /// NOT-SERVED verdicts (fix round 2 — the legacy Groww
+    /// `stage="underlying_not_served"` pager on the CHAIN leg; the Groww
+    /// SPOT leg deliberately passes `target = None` — the legacy leg had
+    /// only the VIX-specific arms, no per-SID detector).
+    async fn record_leg_outcome(
+        &self,
+        leg: EscalationLeg,
+        minute_secs: u32,
+        ok: bool,
+        target: Option<(&'static str, SecurityId, TargetOutcome)>,
+    ) {
+        let (finalized, not_served) = {
+            let mut esc = self.escalation.lock().await;
+            let finalized = esc.record(leg, minute_secs, ok);
+            let not_served = target.and_then(|(symbol, sid, outcome)| {
+                esc.record_target(leg, minute_secs, symbol, sid, outcome)
+            });
+            (finalized, not_served)
+        };
         if let Some((minute, action)) = finalized {
             emit_edge_action(Feed::Groww, leg, minute, action, self.notifier.as_ref());
+        }
+        if let Some((minute, emits)) = not_served {
+            emit_not_served(Feed::Groww, leg, minute, &emits, self.notifier.as_ref());
         }
     }
 
@@ -611,10 +633,13 @@ impl CadenceExecutor for GrowwCadenceExecutor {
         .await;
         // Escalation edge (fix round 2026-07-17): a persist failure counts
         // as a FAILED minute (fetch-ok-but-lost is not ok — the M1 rule).
+        // No per-SID not-served verdict on the Groww spot leg (the legacy
+        // leg had only the VIX arms — no invented semantics).
         self.record_leg_outcome(
             EscalationLeg::Spot,
             escalation_minute_secs,
             result.is_ok() && escalation_persist_ok,
+            None,
         )
         .await;
         result
@@ -968,11 +993,25 @@ impl CadenceExecutor for GrowwCadenceExecutor {
         }
         .await;
         // Escalation edge (fix round 2026-07-17): persist failure = failed
-        // minute (the M1 rule).
+        // minute (the M1 rule). Not-served verdict (fix round 2):
+        // FETCH-level per-underlying — an UNRESOLVED-expiry Empty is a
+        // per-target HOLD (an expiry-resolution failure is never a
+        // vendor-not-serving verdict; the legacy expiry_unresolved arm
+        // never fed the sink).
+        let expiry_unresolved = req.expiry_yyyymmdd.and_then(yyyymmdd_to_date).is_none();
+        let target = if expiry_unresolved && matches!(result, Err(CadenceFetchError::Empty)) {
+            None
+        } else {
+            target_outcome_of(&result).and_then(|outcome| {
+                groww_chain_identity(req.underlying)
+                    .map(|(_, underlying, _, _)| (underlying, 0, outcome))
+            })
+        };
         self.record_leg_outcome(
             EscalationLeg::Chain,
             escalation_minute_secs,
             result.is_ok() && escalation_persist_ok,
+            target,
         )
         .await;
         result
