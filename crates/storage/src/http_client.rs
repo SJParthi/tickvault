@@ -108,7 +108,18 @@ fn redact_userinfo(msg: &str) -> String {
 /// builder-failure path is deterministically unit-testable (a real
 /// `reqwest` builder failure needs fd/TLS exhaustion, which tests cannot
 /// safely induce).
-pub(crate) fn client_from_build_result<E: fmt::Display>(
+///
+/// Promoted `pub(crate)` → `pub` 2026-07-17 (post-#1562 audit): the app
+/// crate's `oms_wiring::build_oms_http_client` reuses this SAME redaction +
+/// typed-error core instead of duplicating it (one HTTP-CLIENT-01
+/// implementation, one redaction path).
+///
+/// # Errors
+///
+/// Returns [`HttpClientBuildError`] carrying the redacted `Display` string
+/// whenever `res` is `Err` — never panics, never falls back to the
+/// panic-class `Client::new()`.
+pub fn client_from_build_result<E: fmt::Display>(
     res: Result<Client, E>,
 ) -> Result<Client, HttpClientBuildError> {
     res.map_err(|e| HttpClientBuildError {

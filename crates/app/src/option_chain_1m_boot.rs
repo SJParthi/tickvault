@@ -89,8 +89,8 @@ use tickvault_common::constants::{
 use tickvault_common::error_code::ErrorCode;
 use tickvault_common::feed::Feed;
 use tickvault_common::moneyness::{
-    Moneyness, OptionLeg, atm_strike_paise, classify_moneyness_paise, observed_finest_step_paise,
-    price_to_paise_guarded, strike_step_paise,
+    Moneyness, OptionLeg, atm_strike_paise, classify_moneyness_paise, depth_paise_to_rupees,
+    moneyness_depth_paise, observed_finest_step_paise, price_to_paise_guarded, strike_step_paise,
 };
 use tickvault_common::sanitize::{capture_rest_error_body, redact_url_params};
 use tickvault_common::trading_calendar::TradingCalendar;
@@ -486,6 +486,15 @@ pub struct ChainClassification {
     /// Per-leg classes, index-aligned with the input leg order (the
     /// persist loop zips over this).
     pub row_moneyness: Vec<Moneyness>,
+    /// Per-leg signed moneyness DEPTH in rupees (2026-07-17), index-
+    /// aligned with `row_moneyness`: negative = ITM-direction, positive =
+    /// OTM-direction for BOTH legs (CE: strike−spot; PE: spot−strike).
+    /// `None` = unclassifiable (unparsable leg / guarded-invalid values —
+    /// the persisted column lands NULL). ALL arithmetic lives in
+    /// `tickvault_common::moneyness::moneyness_depth_paise` (integer
+    /// paise) — this file only calls it, per the parse-only strike
+    /// ratchet.
+    pub row_depth: Vec<Option<f64>>,
     /// RAM snapshot rows (built BEFORE the persist loop so a persist
     /// failure can never degrade the RAM decision surface).
     pub snap_rows: Vec<SnapshotRow>,
@@ -519,6 +528,7 @@ pub fn classify_chain_legs<'a>(
         spot_paise,
         atm_paise,
         row_moneyness: Vec::with_capacity(cap),
+        row_depth: Vec::with_capacity(cap),
         snap_rows: Vec::with_capacity(cap),
         strike_paise_sorted: Vec::with_capacity(cap),
         unknown_rows: 0,
@@ -527,6 +537,11 @@ pub fn classify_chain_legs<'a>(
     for (strike_rupees, leg_label, ltp_rupees) in legs {
         let strike_paise = price_to_paise_guarded(strike_rupees).unwrap_or(0);
         let m = classify_moneyness_paise(leg_label, strike_paise, spot_paise, atm_paise);
+        // Signed depth (2026-07-17) — computed in common's integer-paise
+        // home from the SAME guarded operands; None (→ NULL) whenever the
+        // leg/strike/spot fail the classifier's own guards.
+        let depth_rupees =
+            moneyness_depth_paise(leg_label, strike_paise, spot_paise).map(depth_paise_to_rupees);
         if m == Moneyness::Unknown {
             cls.unknown_rows = cls.unknown_rows.saturating_add(1);
         }
@@ -545,6 +560,7 @@ pub fn classify_chain_legs<'a>(
             });
         }
         cls.row_moneyness.push(m);
+        cls.row_depth.push(depth_rupees);
     }
     cls.strike_paise_sorted.sort_unstable();
     cls.strike_paise_sorted.dedup();
@@ -1873,7 +1889,12 @@ async fn fire_one_chain_minute(
                         chain.underlying_spot,
                         chain.legs.iter().map(|l| (l.strike, l.leg, l.last_price)),
                     );
-                    for (leg, leg_moneyness) in chain.legs.iter().zip(cls.row_moneyness.iter()) {
+                    for ((leg, leg_moneyness), leg_depth) in chain
+                        .legs
+                        .iter()
+                        .zip(cls.row_moneyness.iter())
+                        .zip(cls.row_depth.iter())
+                    {
                         let row = OptionChain1mRow {
                             ts_ist_nanos: target_minute_nanos,
                             trading_date_ist_nanos: trading_date_nanos,
@@ -1895,8 +1916,15 @@ async fn fire_one_chain_minute(
                             underlying_spot: chain.underlying_spot,
                             fetched_at_ist_nanos: fetched_at,
                             moneyness: leg_moneyness.as_str(),
+                            moneyness_depth: *leg_depth,
                         };
-                        if let Err(err) = writer.append_row(&row) {
+                        // 2026-07-17: the Dhan leg persists the already-
+                        // measured close→data latency per row (rho stays
+                        // None — the Dhan response carries no rho:
+                        // delta/theta/gamma/vega only, option-chain.md
+                        // rule 10).
+                        if let Err(err) = writer.append_row_ext(&row, None, Some(close_to_data_ms))
+                        {
                             persist_failed = true;
                             underlying_append_failed = true;
                             metrics::counter!(

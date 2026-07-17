@@ -647,6 +647,55 @@ mod tests {
     }
 
     #[test]
+    fn test_spot_xverify_cell_audit_create_ddl_is_idempotent_and_embeds_full_dedup_key() {
+        let ddl = spot_xverify_cell_audit_create_ddl();
+        // Idempotent CREATE — safe to run on every boot, never a drop.
+        assert!(
+            ddl.starts_with(&format!(
+                "CREATE TABLE IF NOT EXISTS {SPOT_XVERIFY_CELL_AUDIT_TABLE} ("
+            )),
+            "cell DDL must be an idempotent CREATE for the named table: {ddl}"
+        );
+        // The FULL dedup clause is embedded verbatim (not a rephrased copy).
+        assert!(
+            ddl.contains(&format!(
+                "DEDUP UPSERT KEYS({DEDUP_KEY_SPOT_XVERIFY_CELL_AUDIT})"
+            )),
+            "cell DDL must embed the exact DEDUP key constant: {ddl}"
+        );
+        assert!(!ddl.contains("DROP"), "cell DDL must never drop: {ddl}");
+    }
+
+    #[test]
+    fn test_spot_xverify_daily_create_ddl_is_idempotent_and_embeds_full_dedup_key() {
+        let ddl = spot_xverify_daily_create_ddl();
+        assert!(
+            ddl.starts_with(&format!(
+                "CREATE TABLE IF NOT EXISTS {SPOT_XVERIFY_DAILY_TABLE} ("
+            )),
+            "daily DDL must be an idempotent CREATE for the named table: {ddl}"
+        );
+        assert!(
+            ddl.contains(&format!(
+                "DEDUP UPSERT KEYS({DEDUP_KEY_SPOT_XVERIFY_DAILY})"
+            )),
+            "daily DDL must embed the exact DEDUP key constant: {ddl}"
+        );
+        // Every summary column the writer appends exists in the schema.
+        for col in [
+            "indices",
+            "minutes_compared",
+            "mismatches",
+            "missing_dhan",
+            "missing_groww",
+            "out_of_session",
+        ] {
+            assert!(ddl.contains(&format!("{col} ")), "daily DDL missing {col}");
+        }
+        assert!(!ddl.contains("DROP"), "daily DDL must never drop: {ddl}");
+    }
+
+    #[test]
     fn ilp_conf_uses_http_not_tcp() {
         let cfg = QuestDbConfig {
             host: "tv-questdb".to_string(),

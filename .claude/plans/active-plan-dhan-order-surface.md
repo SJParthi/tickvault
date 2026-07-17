@@ -52,16 +52,29 @@ tables deleted 2026-05-20, both date-based live-order gates expired
 One supervised single-owner tokio task (NEW
 `crates/app/src/order_runtime.rs`, ~600 prod LoC) owning
 `OrderManagementSystem` (dry_run hard-true) + `RiskEngine`, spawned
-ONLY from `crates/app/src/dhan_rest_stack.rs` Phase 5a (the dhan-OFF
+ONLY from `crates/app/src/dhan_rest_stack.rs` Phase 5a *(shipped as
+**Phase 5b** — 2026-07-17 truth-sync, post-#1562 audit: Phase 5a is the
+RETIRED order-update WS spawn slot per the noise lock, so the runtime
+spawn landed as 5b)* (the dhan-OFF
 arm) replacing the discard drain — structural dual-OMS exclusion: the
 rest stack is the dhan-off arm; `trading_pipeline` (which owns its own
 OMS+Risk) is dhan-ON only. Config-gated `[order_runtime]` (serde
 default OFF = byte-identical boot; `config/base.toml` opts in). The 12
 normative resolutions from the judge synthesis:
 
-1. **Module + spawn ordering law** (dhan_rest_stack Phase 5a):
-   `broadcast::channel` → `order_update_sender.subscribe()` →
-   `spawn_order_runtime(..)` →
+1. **Module + spawn ordering law** (dhan_rest_stack Phase 5a) —
+   *⚠ PARTIALLY CUT 2026-07-14 (the operator Dhan noise lock,
+   `dhan-rest-only-noise-lock-2026-07-14.md` §3 + scope-lock §A.1 —
+   annotated 2026-07-17, post-#1562 audit): the WAL drain, the
+   conditional `confirm_replayed`, and the
+   `run_order_update_connection(.., wal_spill: Some(..))` socket spawn
+   below were REMOVED from the shipped scope; re-arming any of them
+   without a fresh dated operator quote in the noise-lock file first is
+   FORBIDDEN. What shipped (as Phase 5b): `broadcast::channel` →
+   `subscribe()` → `spawn_order_runtime(..)` with ZERO producers.*
+   Original (retained for the gated live re-arm spec —
+   `order-runtime-dryrun.md` §2): `broadcast::channel` →
+   `order_update_sender.subscribe()` → `spawn_order_runtime(..)` →
    `drain_replayed_order_updates_to_broadcast(..)` → conditional
    `confirm_replayed` → `run_order_update_connection(.., wal_spill:
    Some(..))`. NOT spawned from `crates/app/src/main.rs`, NOT on the
@@ -171,28 +184,28 @@ gate contract (design-only, held for the operator's REST grant —
 
 Cluster A (this session's PR; Files/Tests per the judge-approved final design):
 
-- [ ] A1 — order_runtime.rs actor: supervised single-owner task, select! arms (order-update / marks / reconcile / 16:00 reset / 15:30 sweep / self-test), NotifierAlertSink
+- [x] A1 — order_runtime.rs actor: supervised single-owner task, select! arms (order-update / marks / reconcile / 16:00 reset / 15:30 sweep / self-test), NotifierAlertSink — merged via PR #1562 (checkbox ticked 2026-07-17, post-merge follow-up)
   - Files: crates/app/src/order_runtime.rs, crates/app/src/oms_wiring.rs
   - Tests: test_traded_update_reaches_risk_engine_net_lots_nonzero, test_alert_sink_event_mapping, test_halt_fires_risk_halt_once_per_episode, prop_fill_mirror_matches_risk_net_lots
-- [ ] A2 — FillEvent widening of handle_order_update (+ 4-line trading_pipeline graft)
+- [x] A2 — FillEvent widening of handle_order_update (+ 4-line trading_pipeline graft) — merged via PR #1562
   - Files: crates/trading/src/oms/engine.rs, crates/trading/src/oms/types.rs, crates/trading/src/oms/mod.rs, crates/app/src/trading_pipeline.rs
   - Tests: test_same_status_refresh_applies_delta_not_cumulative, test_duplicate_update_zero_delta_skipped, test_partial_lot_remainder_floors_and_errors, test_fill_sign_from_managed_order_transaction_type, test_segment_char_parse_matrix
-- [ ] A3 — ticks→update_market_price gate (marks_wanted AtomicBool + MarkUpdate try_send tap at the groww_bridge seam; channel plumbed in main.rs)
-  - Files: crates/app/src/groww_bridge.rs, crates/app/src/main.rs
+- [x] A3 — ticks→update_market_price gate (marks_wanted AtomicBool + MarkUpdate try_send tap) — merged via PR #1562. *Seam re-home note (2026-07-17): the planned `groww_bridge.rs` consume seam died with the Groww live feed (#1581, 2026-07-15); the tap shipped at the Groww per-minute REST legs' persist-confirm choke points (`groww_spot_1m_boot.rs` + `groww_contract_1m_boot.rs`), ≤4 spot + ~30 contract marks/min*
+  - Files: crates/app/src/groww_spot_1m_boot.rs, crates/app/src/groww_contract_1m_boot.rs, crates/app/src/main.rs (originally planned: crates/app/src/groww_bridge.rs — deleted 2026-07-15)
   - Tests: test_marks_wanted_false_skips_send, test_mark_channel_full_drops_counted_never_blocks, dhat_mark_forward (0 alloc / 10K), Criterion order_gate/mark_forward ≤ 50ns
-- [ ] A4 — WAL drain + conditional confirm in dhan_rest_stack Phase 5a (ordering law; wal_spill capture restored)
-  - Files: crates/app/src/dhan_rest_stack.rs, crates/app/tests/wal_replay_confirm_symmetry_guard.rs
-  - Tests: test_confirm_decision_matrix (4 arms), test_rest_stack_wires_order_runtime, ratchet_order_runtime_spawned_only_from_rest_stack
-- [ ] A5 — reconcile scheduler with honest dry-run heartbeat + local Σfills==net_lots invariant
+- [x] A4 — WAL drain + conditional confirm in dhan_rest_stack Phase 5a — **CUT 2026-07-14, not implemented** (resolved-by-supersession; ticked 2026-07-17 so the cut is recorded, never silently skipped): the operator Dhan noise lock (`dhan-rest-only-noise-lock-2026-07-14.md` §3 + scope-lock §A.1) removed the order-update WAL drain/confirm AND the `run_order_update_connection(.., wal_spill: Some(..))` socket spawn from the shipped scope. The retained live re-arm spec lives in `order-runtime-dryrun.md` §2 — re-arming needs a fresh dated operator quote in the noise-lock file FIRST
+  - Files: (none shipped — see the §2 re-arm spec)
+  - Tests: test_rest_stack_wires_order_runtime + test_rest_stack_spawns_no_order_update_ws_and_no_canary pin the shipped socket-free/WAL-free shape; ratchet_order_runtime_spawned_only_from_rest_stack shipped
+- [x] A5 — reconcile scheduler with honest dry-run heartbeat + local Σfills==net_lots invariant — merged via PR #1562
   - Files: crates/app/src/order_runtime.rs
   - Tests: test_dry_run_reconcile_classified_heartbeat_not_ok, test_local_reconcile_divergence_errors
-- [ ] A6 — paper filler + once-daily gated self-test + orphan-fill loudness
+- [x] A6 — paper filler + once-daily gated self-test + orphan-fill loudness — merged via PR #1562
   - Files: crates/app/src/order_runtime.rs
   - Tests: test_paper_fill_deferred_until_finite_positive_mark, test_terminal_order_never_refilled, test_selftest_single_cycle_latched, test_selftest_refused_on_holiday_and_off_hours, test_orphan_fill_update_warns_and_counts, test_source_n_filtered_empty_tolerated, order_runtime_e2e (crates/app/tests/)
-- [ ] A7 — risk P&L lot_size fix + evaluate_daily_loss_halt + trigger_halt code field + sid-segment tripwire
+- [x] A7 — risk P&L lot_size fix + evaluate_daily_loss_halt + trigger_halt code field + sid-segment tripwire — merged via PR #1562
   - Files: crates/trading/src/risk/engine.rs, crates/app/src/order_runtime.rs
   - Tests: test_unrealized_pnl_multiplies_lot_size, test_evaluate_daily_loss_halt_boundary, test_sid_segment_collision_skips_and_errors, test_daily_reset_clears_book_mirror_tripwire_flag_atomically
-- [ ] A8 — config section + rule files (order-runtime-dryrun.md; dated notes in ws-reinject-error-codes.md + websocket-connection-scope-lock.md)
+- [x] A8 — config section + rule files (order-runtime-dryrun.md; dated notes in ws-reinject-error-codes.md + websocket-connection-scope-lock.md) — merged via PR #1562
   - Files: crates/common/src/config.rs, config/base.toml, .claude/rules/project/order-runtime-dryrun.md, .claude/rules/project/ws-reinject-error-codes.md
   - Tests: config validation unit tests (interval ≥ 60, capacity bounds), serde-default-off test
 

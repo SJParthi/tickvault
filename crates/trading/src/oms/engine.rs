@@ -1340,6 +1340,24 @@ impl OrderManagementSystem {
                     continue;
                 }
                 order.status = update.status;
+                // ⚠ MANDATORY PRE-LIVE FOLLOW-UP (post-#1562 audit,
+                // 2026-07-17 — order-runtime-dryrun.md §3): this
+                // non-terminal arm copies traded_qty UNCONDITIONALLY in
+                // BOTH directions and then clears needs_reconciliation.
+                // The M2 comment above declares the broker GET snapshot
+                // can be STALER than local state, so a stale snapshot
+                // silently LOWERS the fill-delta baseline (the C8 error!
+                // covers only the UPWARD direction) — a later WS
+                // (re)delivery of the true cumulative then computes a
+                // positive qty_delta in extract_fill_delta → a SECOND
+                // FillEvent for fills already booked → RiskEngine
+                // double-count (contradicting the "double-count-safe"
+                // contract). Reachable in LIVE mode only (dry-run returns
+                // above before corrections). Fix directions (order-side
+                // owner): refuse the downward copy on non-terminal orders
+                // (symmetric with the C2 WS-side monotone guard), or emit
+                // the correction as a FillEvent. No dry_run=false flip
+                // without one of them.
                 order.traded_qty = update.traded_qty;
                 order.avg_traded_price = update.avg_traded_price;
                 order.needs_reconciliation = false;
