@@ -63,9 +63,13 @@ this note is now its rule-file home) changes FAILURE MODE, not substance:
   `postmerge-catchup.yml` backfills RUN EXISTENCE only — its any-status probe
   is deliberate (it prevents 30-min re-dispatch storms and covers the
   out-of-window bot-merge delivery case). The DEPLOYMENT authority is
-  `deploy-aws-after-close.yml`'s B9 SSM compare
-  (`/tickvault/prod/deploy/binary-git-sha` vs main HEAD), which is immune to
-  green-but-not-deployed runs. A green deferred run counting as "covered" in
-  catchup is therefore correct, not masking.
+  `deploy-aws-after-close.yml`'s compare step: it walks the GitHub API's
+  recent successful deploy-aws runs on main and accepts a run as the last
+  REAL deploy only if its B9 "Record deployed binary git SHA" step (the one
+  that stamps `/tickvault/prod/deploy/binary-git-sha`) has
+  `conclusion == "success"` — a green deferred run (deploy job skipped, B9
+  never executed) is ignored, so the 15:46 IST cron redeploys main HEAD. It
+  is therefore immune to green-but-not-deployed runs, and a green deferred
+  run counting as "covered" in catchup is correct, not masking.
 - **Immediate in-window delivery** remains available ONLY via the loud
   `workflow_dispatch` with `confirm_market_hours=yes` — kept by design.
