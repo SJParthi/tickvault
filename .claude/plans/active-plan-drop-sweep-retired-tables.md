@@ -69,8 +69,11 @@ table is introduced.
 ## Guarantee Matrix
 
 See `.claude/rules/project/per-wave-guarantee-matrix.md`. All 15 rows of the
-100% guarantee matrix and all 7 rows of the resilience demand matrix apply to
-this single item; every applicable row is covered by the two inline guard
-tests (code/testing/extreme-check coverage), the audit-exclusion guard
-(uniqueness + SEBI protection), and the confined single-file diff (no hot-path,
-no new tick-drop path, composite-key/DEDUP untouched).
+guarantee matrix and all 7 rows of the resilience-demand matrix apply to this
+single item — a 100% guarantee inside the tested envelope, with ratcheted
+regression coverage (the two inline `RETIRED_QUESTDB_TABLES` guard tests + the
+keep/audit-exclusion guard); no runtime path is touched. Every applicable row
+is covered by the two inline guard tests (code/testing/extreme-check coverage),
+the audit-exclusion guard (uniqueness + SEBI protection), and the confined
+single-file diff (no hot-path, no new tick-drop path, composite-key/DEDUP
+untouched).
