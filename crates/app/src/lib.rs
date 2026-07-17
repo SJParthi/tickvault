@@ -135,6 +135,12 @@ pub mod dhan_data_api_limiter;
 /// Dhan live-WS retirement (the spot-1m legs must outlive the cross-verify
 /// module the Phase C deletion PRs remove). Pure move, zero behavior change.
 pub mod dhan_intraday_parse;
+/// 🔷 DHAN order-update PAPER-MODE push consumer (operator directive
+/// 2026-07-16; governance on PR #1597): receive-only broadcast consumer
+/// mapping order updates to `order_audit` rows `feed='dhan'`/`mode='paper'`.
+/// Spawned by `dhan_rest_stack` Phase 5a under `[dhan_order_push] enabled`
+/// (default OFF).
+pub mod dhan_order_push_observability;
 /// Dhan REST-only auth bootstrap (Phase A of the Dhan-live-feed removal,
 /// operator directive 2026-07-13): with `feeds.dhan_enabled = false` this
 /// brings up the RETAINED Dhan REST surface — dual-instance lock →
