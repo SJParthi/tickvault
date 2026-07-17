@@ -583,7 +583,14 @@ pub enum NotificationEvent {
         /// Stable verdict: `clean` / `diverged` / `partial` / `no_data` /
         /// `blind` / `degraded`.
         status_label: String,
-        /// Up to 10 plain-English worst offenders.
+        /// Fix E severity gating (operator 2026-07-17): `true` = every
+        /// divergence is high/low-only sampling skew within the
+        /// `[spot_crossverify] noise_threshold_paise` band, nothing
+        /// missing, full coverage → Info trend line, never a High page.
+        noise_only: bool,
+        /// The day's biggest single delta in paise (0 = nothing diverged).
+        noise_max_paise: i64,
+        /// Up to 3 plain-English worst offenders (rupees, 12-hour IST).
         top_detail: Vec<String>,
     },
 
@@ -1699,6 +1706,10 @@ pub struct RestLegScoreLine {
     /// Minutes that NEVER got repaired (post-close sweep included);
     /// `-1` = not recorded.
     pub named_gaps: i64,
+    /// `named_gap` rows classed `pre_boot` — minutes from before this
+    /// app start (bookkeeping, NOT pull failures; rendered separately
+    /// from "never recovered" — Fix E, 2026-07-17); `-1` = not recorded.
+    pub pre_boot_gaps: i64,
     /// How many rate-limit rejections the day's pulls hit; `-1` unknown.
     pub rate_limited_hits: i64,
     /// Pulls repaired LATE (retrieved ≥60s after the minute closed — a
@@ -1912,6 +1923,7 @@ fn compact_leg_label(leg: &str) -> &str {
 fn render_pulls_per_leg(rest_legs: &[RestLegScoreLine], feed: &str) -> Option<String> {
     let mut parts: Vec<String> = Vec::new();
     let mut gaps = 0i64;
+    let mut pre_boot = 0i64;
     // R2 (fix round 3): the verdict mark is three-state and never
     // fabricated — ✅ only when EVERY rendered leg is FULLY counted
     // (ok >= 0 AND failed >= 0) and failure-free; ⚠️ when any counted
@@ -1961,6 +1973,12 @@ fn render_pulls_per_leg(rest_legs: &[RestLegScoreLine], feed: &str) -> Option<St
         if l.named_gaps > 0 {
             gaps = gaps.saturating_add(l.named_gaps);
         }
+        if l.pre_boot_gaps > 0 {
+            // Fix E round 1: pre-boot gaps are bookkeeping (minutes from
+            // before this app start), never pull failures — summed here so
+            // they render, but they never flip the failure mark.
+            pre_boot = pre_boot.saturating_add(l.pre_boot_gaps);
+        }
     }
     if parts.is_empty() {
         return None;
@@ -1979,6 +1997,9 @@ fn render_pulls_per_leg(rest_legs: &[RestLegScoreLine], feed: &str) -> Option<St
     };
     if gaps > 0 {
         seg.push_str(&format!("; {gaps} never recovered \u{26a0}\u{fe0f}"));
+    }
+    if pre_boot > 0 {
+        seg.push_str(&format!("; {pre_boot} from before app start"));
     }
     Some(seg)
 }
@@ -2912,20 +2933,30 @@ impl NotificationEvent {
                 degraded,
                 truncated,
                 status_label,
+                noise_only,
+                noise_max_paise,
                 top_detail,
             } => {
+                // The honest frame rides EVERY arm (operator Fix E).
+                const HONEST_FRAME: &str = "Neither broker is the single source of truth — \
+                     watch the trend over days, not one number.";
+                // APPROVED: display-only paise→rupee division on a cold path.
+                #[allow(clippy::cast_precision_loss)]
+                let biggest_rupees = *noise_max_paise as f64 / 100.0;
                 if status_label == "clean" {
                     format!(
                         "\u{2705} Spot cross-check 3:47 PM \u{b7} {trading_date_ist} — \
                          \u{1f537} Dhan vs \u{1f7e2} Groww: {minutes_compared} minutes \
-                         across {indices} indices, all prices match."
+                         across {indices} indices, all prices match.\n\
+                         {HONEST_FRAME}"
                     )
                 } else if status_label == "no_data" {
                     format!(
                         "\u{1f515} <b>Spot cross-check @ 3:47 PM IST — nothing to compare</b>\n\
                          Day: {trading_date_ist}\n\
                          Neither Dhan nor Groww recorded index prices today \
-                         (feeds off). Not a pass and not a failure."
+                         (feeds off). Not a pass and not a failure.\n\
+                         {HONEST_FRAME}"
                     )
                 } else if *minutes_compared == 0 {
                     format!(
@@ -2935,39 +2966,90 @@ impl NotificationEvent {
                          none overlapped. This is not a pass.\n\
                          What to do RIGHT NOW:\n\
                          1. Check the database is up and reachable.\n\
-                         2. Confirm BOTH brokers' minute prices recorded today."
+                         2. Confirm BOTH brokers' minute prices recorded today.\n\
+                         {HONEST_FRAME}"
+                    )
+                } else if *noise_only {
+                    // Fix E: pure high/low sampling skew inside the noise
+                    // band, nothing missing, full coverage — a NORMAL day.
+                    format!(
+                        "\u{2705} <b>Spot cross-check 3:47 PM \u{b7} {trading_date_ist}</b>\n\
+                         \u{1f537} Dhan and \u{1f7e2} Groww prices agree closely today: \
+                         {mismatches} tiny timing differences out of {minutes_compared} \
+                         minutes — NORMAL.\n\
+                         Biggest gap: \u{20b9}{biggest_rupees:.2} (inside the normal band). \
+                         Open and close prices showed no real drift.\n\
+                         {HONEST_FRAME}"
                     )
                 } else {
                     let coverage_note = if *degraded {
-                        "\nCoverage was PARTIAL — some data could not be read."
+                        "\nSome of the day's data could not be read — the numbers \
+                         above cover only what was readable."
                     } else {
                         ""
                     };
                     let truncated_note = if *truncated {
-                        "\nCounts exceed the stored detail — totals are exact."
+                        "\nMore minutes than the check can load — the loaded part \
+                         is compared exactly; the rest was not checked."
                     } else {
                         ""
                     };
+                    // Fix E round 1: the lead already shows the worst line —
+                    // skip it in the example block (no duplicated line).
+                    let lead_used_worst = *mismatches > 0 && !top_detail.is_empty();
                     let mut detail_block = String::new();
-                    for line in top_detail.iter().take(10) {
+                    for line in top_detail.iter().skip(usize::from(lead_used_worst)).take(3) {
                         detail_block.push('\n');
                         detail_block.push_str("• ");
                         detail_block.push_str(&html_escape(line));
                     }
+                    let lead = if lead_used_worst {
+                        format!(
+                            "\u{1f198} <b>Real price drift between \u{1f537} Dhan and \
+                             \u{1f7e2} Groww \u{b7} {trading_date_ist}</b>\n\
+                             Worst: {}",
+                            html_escape(&top_detail[0])
+                        )
+                    } else {
+                        format!(
+                            "\u{1f198} <b>Spot cross-check 3:47 PM \u{b7} {trading_date_ist} — \
+                             \u{1f537} Dhan vs \u{1f7e2} Groww needs a look</b>"
+                        )
+                    };
+                    // Fix E round 1: name WHICH gate paged, derived from the
+                    // same fields the severity gate used.
+                    let mut gates: Vec<&str> = Vec::new();
+                    if *missing_dhan > 0 || *missing_groww > 0 {
+                        gates.push("minutes missing on one broker");
+                    }
+                    if top_detail
+                        .iter()
+                        .any(|l| l.contains(" open:") || l.contains(" close:"))
+                    {
+                        gates.push("open/close price drift");
+                    }
+                    if gates.is_empty() {
+                        if *degraded || *truncated {
+                            gates.push("incomplete coverage");
+                        } else if *mismatches > 0 {
+                            gates.push("a price gap beyond the normal band");
+                        }
+                    }
+                    let why_note = if gates.is_empty() {
+                        String::new()
+                    } else {
+                        format!("\nWhy this pages: {}", gates.join(" + "))
+                    };
                     format!(
-                        "\u{26a0}\u{fe0f} <b>Spot cross-check @ 3:47 PM IST — \
-                         NEEDS ATTENTION</b>\n\
-                         Day: {trading_date_ist} \u{2014} \u{1f537} Dhan vs \u{1f7e2} Groww\n\
+                        "{lead}{why_note}\n\
                          Indices: {indices} | Minutes compared: {minutes_compared}\n\
-                         Price differences: {mismatches}\n\
-                         Missing on Dhan: {missing_dhan} | Missing on Groww: {missing_groww}\n\
+                         Price differences: {mismatches} (biggest \
+                         \u{20b9}{biggest_rupees:.2})\n\
+                         Minutes missing on Dhan: {missing_dhan} | on Groww: \
+                         {missing_groww}\n\
                          Outside market hours: {out_of_session}\
                          {coverage_note}{truncated_note}{detail_block}\n\
-                         Neither broker is the source of truth — both sample \
-                         the same prices at slightly different moments. Track \
-                         the TREND: a steady small count is normal skew; a \
-                         spike or a drift in the open/close price is a real \
-                         problem on one broker's side."
+                         {HONEST_FRAME}"
                     )
                 }
             }
@@ -3204,17 +3286,18 @@ impl NotificationEvent {
                         "\u{2705} <b>Groww option chain check PASSED</b>\n\
                          Today's one-time check pulled the Groww option chain \
                          successfully. Measured: {detail}\n\
-                         Recording is currently switched OFF. To start \
-                         recording it minute-by-minute: turn ON the Groww \
-                         option chain setting and restart the app."
+                         Minute-by-minute recording is handled by the \
+                         minute-cadence engine — when that engine is on, \
+                         chains record automatically; nothing else to do."
                     )
                 } else {
                     format!(
                         "\u{1f514} <b>Groww option chain check did NOT pass</b>\n\
                          Today's one-time check could not pull a usable Groww \
                          option chain. Measured: {detail}\n\
-                         Nothing is broken — recording is switched off and \
-                         stays off. Tomorrow's start checks again."
+                         Nothing is broken — tomorrow's start checks again. \
+                         If the minute-cadence engine is on, its own alerts \
+                         will say whether chain recording is affected."
                     )
                 }
             }
@@ -3335,9 +3418,9 @@ impl NotificationEvent {
             Self::ChainEntitlementConfirmed => "\u{2705} <b>Option chain data IS available on \
                  this account</b>\n\
                  Today's one-time check confirmed Dhan WILL serve option \
-                 chain data. Recording is currently switched OFF.\n\
-                 To start recording it minute-by-minute: turn ON the option \
-                 chain setting and restart the app."
+                 chain data. Minute-by-minute recording is handled by the \
+                 minute-cadence engine — when that engine is on, chains \
+                 record automatically; nothing else to do."
                 .to_string(),
             Self::ChainExpirylistFailed { detail } => {
                 let detail = html_escape(detail);
@@ -4730,9 +4813,17 @@ impl NotificationEvent {
             }
             Self::TfConsistencyAborted { .. } => Severity::High,
             // Spot cross-broker comparator (2026-07-17): clean/no_data are
-            // Info; a divergence/partial/blind is High (audit Rule 11).
-            Self::SpotCrossverifySummary { status_label, .. } => {
-                if status_label == "clean" || status_label == "no_data" {
+            // Info; Fix E gating — a diverged day whose every delta is
+            // high/low-only sampling skew inside the noise band with full
+            // coverage is Info too (a trend line, not a page). Open/close
+            // drift, a delta past the band, missing minutes, or degraded /
+            // partial / blind coverage stay High (audit Rule 11).
+            Self::SpotCrossverifySummary {
+                status_label,
+                noise_only,
+                ..
+            } => {
+                if status_label == "clean" || status_label == "no_data" || *noise_only {
                     Severity::Info
                 } else {
                     Severity::High
@@ -8601,7 +8692,10 @@ mod tests {
         let msg = passed.to_message();
         assert!(msg.contains("PASSED"), "got: {msg}");
         assert!(msg.contains("102 strikes"), "got: {msg}");
-        assert!(msg.contains("switched OFF"), "honest state: {msg}");
+        // Fix E round 1 (2026-07-17): the cadence engine records chains —
+        // never claim recording is OFF; point at the engine instead.
+        assert!(msg.contains("minute-cadence engine"), "honest state: {msg}");
+        assert!(!msg.contains("switched OFF"), "stale OFF claim: {msg}");
 
         let failed = NotificationEvent::GrowwChain1mProbeVerdict {
             ok: false,
@@ -8612,6 +8706,94 @@ mod tests {
         assert!(msg.contains("did NOT pass"), "got: {msg}");
         assert!(!msg.contains("<b>hostile</b>"), "escaped: {msg}");
         assert!(msg.contains("Nothing is broken"), "got: {msg}");
+    }
+
+    // -----------------------------------------------------------------------
+    // SpotCrossverifySummary render/severity pins (Fix E review round 1,
+    // 2026-07-17)
+    // -----------------------------------------------------------------------
+
+    fn spot_xverify_summary(
+        noise_only: bool,
+        top_detail: Vec<String>,
+        missing_dhan: u64,
+    ) -> NotificationEvent {
+        NotificationEvent::SpotCrossverifySummary {
+            trading_date_ist: "2026-07-17".to_string(),
+            indices: 4,
+            minutes_compared: 375,
+            mismatches: 3,
+            missing_dhan,
+            missing_groww: 0,
+            out_of_session: 0,
+            degraded: false,
+            truncated: false,
+            status_label: "diverged".to_string(),
+            noise_only,
+            noise_max_paise: 250,
+            top_detail,
+        }
+    }
+
+    /// (a) A noise-only diverged day is Info with a green mark and the
+    /// honest frame — a trend line, never a page. Wording is
+    /// tolerance-aware (Fix E round 1): never "matched everywhere".
+    #[test]
+    fn test_spot_crossverify_summary_noise_only_is_info_with_honest_frame() {
+        let ev = spot_xverify_summary(true, vec![], 0);
+        assert_eq!(ev.severity(), Severity::Info);
+        let msg = ev.to_message();
+        assert!(msg.contains('\u{2705}'), "got: {msg}");
+        assert!(
+            msg.contains("Neither broker is the single source of truth"),
+            "honest frame missing: {msg}"
+        );
+        assert!(!msg.contains("matched everywhere"), "got: {msg}");
+        assert!(msg.contains("no real drift"), "got: {msg}");
+    }
+
+    /// (b) A diverged NON-noise day (open/close drift in the worst lines)
+    /// is High with the \u{1f198} mark, names WHICH gate paged, carries the
+    /// honest frame, and renders the worst line exactly ONCE (Fix E round
+    /// 1 — the lead and the example block must not duplicate it).
+    #[test]
+    fn test_spot_crossverify_summary_real_drift_is_high_and_names_gate() {
+        let worst = "NIFTY close: Dhan \u{20b9}100.00 vs Groww \u{20b9}90.00 \
+             (\u{20b9}10.00 apart) at 10:32 AM";
+        let ev = spot_xverify_summary(
+            false,
+            vec![worst.to_string(), "NIFTY high: second line".to_string()],
+            0,
+        );
+        assert_eq!(ev.severity(), Severity::High);
+        let msg = ev.to_message();
+        assert!(msg.contains('\u{1f198}'), "got: {msg}");
+        assert!(msg.contains("open/close price drift"), "gate name: {msg}");
+        assert!(
+            msg.contains("Neither broker is the single source of truth"),
+            "honest frame missing: {msg}"
+        );
+        assert_eq!(
+            msg.matches("(\u{20b9}10.00 apart) at 10:32 AM").count(),
+            1,
+            "worst line must render exactly once: {msg}"
+        );
+        assert!(
+            msg.contains("second line"),
+            "remaining examples kept: {msg}"
+        );
+    }
+
+    /// The missing-minutes gate is named when one broker has holes.
+    #[test]
+    fn test_spot_crossverify_summary_names_missing_minute_gate() {
+        let ev = spot_xverify_summary(false, vec![], 2);
+        assert_eq!(ev.severity(), Severity::High);
+        let msg = ev.to_message();
+        assert!(
+            msg.contains("minutes missing on one broker"),
+            "gate name: {msg}"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -8712,12 +8894,13 @@ mod tests {
         assert_eq!(event.severity(), Severity::Info);
         let msg = event.to_message();
         assert!(msg.contains("IS available"), "got: {msg}");
-        // Plain-English action (10 commandments — no config-key jargon in
-        // the Telegram body; the exact key lives in the probe's log line).
-        assert!(msg.contains("turn ON the option"), "got: {msg}");
+        // Plain-English body (10 commandments — no config-key jargon; the
+        // exact key lives in the probe's log line). Fix E round 1
+        // (2026-07-17): the cadence engine records chains — never claim
+        // recording is switched OFF.
+        assert!(msg.contains("minute-cadence engine"), "got: {msg}");
         assert!(!msg.contains("option_chain_1m"), "got: {msg}");
-        // Honest: recording is NOT running yet.
-        assert!(msg.contains("switched OFF"), "got: {msg}");
+        assert!(!msg.contains("switched OFF"), "stale OFF claim: {msg}");
     }
 
     // -----------------------------------------------------------------------
@@ -8785,6 +8968,7 @@ mod tests {
             ok_fetches: -1,
             failed_fetches: -1,
             named_gaps: -1,
+            pre_boot_gaps: -1,
             rate_limited_hits: -1,
             late_recovered: -1,
             close_p50_ms: -1,
@@ -9180,6 +9364,7 @@ mod tests {
                 ok_fetches: 700,
                 failed_fetches: 33,
                 named_gaps: 2,
+                pre_boot_gaps: 0,
                 ..rest_line("Groww", "spot candles")
             },
             RestLegScoreLine {
@@ -9468,6 +9653,9 @@ mod tests {
                 ok_fetches: 10,
                 failed_fetches: 2,
                 named_gaps: 1,
+                // Fix E round 1: pre-boot gaps render beside "never
+                // recovered" as bookkeeping (no warning mark).
+                pre_boot_gaps: 2,
                 ..rest_line("Groww", "spot candles")
             },
             rest_line("Groww", "option chain"), // all -1: skipped
@@ -9481,7 +9669,7 @@ mod tests {
             render_pulls_per_leg(&legs, "Groww"),
             Some(
                 "pulls spot 10/12, contracts 5 ok \u{26a0}\u{fe0f}; \
-                 1 never recovered \u{26a0}\u{fe0f}"
+                 1 never recovered \u{26a0}\u{fe0f}; 2 from before app start"
                     .to_string()
             )
         );
@@ -9579,6 +9767,7 @@ mod tests {
             close_p99_ms: 1800,
             close_samples: 350,
             named_gaps: 3,
+            pre_boot_gaps: 0,
             ..rest_line("Dhan", "spot candles")
         }];
         assert_eq!(

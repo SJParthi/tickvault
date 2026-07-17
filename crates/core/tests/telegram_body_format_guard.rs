@@ -61,6 +61,7 @@ fn rest_leg(feed_name: &str, ok: i64, failed: i64) -> RestLegScoreLine {
         ok_fetches: ok,
         failed_fetches: failed,
         named_gaps: -1,
+        pre_boot_gaps: -1,
         rate_limited_hits: -1,
         late_recovered: -1,
         close_p50_ms: -1,
