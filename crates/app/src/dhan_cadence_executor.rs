@@ -421,15 +421,6 @@ impl CadenceExecutor for DhanCadenceExecutor {
             };
             let close_to_data_ms =
                 (ist_millis_of_day_now() - (i64::from(req.cycle_minute_ist) + 60) * 1000).max(0);
-            // The per-fire liveness heartbeat (feeds the market-hours-liveness
-            // alarm) — success-gated (fix round 2026-07-17): set ONLY after a
-            // successful vendor fetch carrying the target row. An all-failing
-            // session must leave the gauge unset so
-            // tv-<env>-market-hours-liveness-missing pages (~09:25 IST);
-            // mid-session death after first success remains the pre-existing
-            // documented residual. Never pre-registered at boot: the first
-            // in-session set IS the signal.
-            metrics::gauge!("tv_rest_1m_fire_heartbeat").set(1.0);
             // Persist → flush ACK → fold handoff (STRICT ordering: an
             // unpersisted bar must never derive candles — the fold contract).
             let flush_ok = {
@@ -471,6 +462,16 @@ impl CadenceExecutor for DhanCadenceExecutor {
                 }
             };
             if flush_ok {
+                // The per-fire liveness heartbeat (feeds the
+                // market-hours-liveness alarm) — PERSIST-gated (fix round 2,
+                // the M1 fetch-ok-but-lost-is-not-ok rule): set ONLY after
+                // the spot_1m_rest flush ACK. An all-failing session (fetch
+                // OR persist) leaves the gauge unset so
+                // tv-<env>-market-hours-liveness-missing pages (~09:25 IST);
+                // mid-session death after first success remains the
+                // pre-existing documented residual. Never pre-registered at
+                // boot: the first in-session set IS the signal.
+                metrics::gauge!("tv_rest_1m_fire_heartbeat").set(1.0);
                 // ONLY after the flush ACK — the sole candles_*/RAM-store feed
                 // on the cadence runtime.
                 crate::rest_candle_fold::send_confirmed_bars(&[
@@ -1143,12 +1144,14 @@ mod tests {
 
     #[test]
     fn test_cadence_spot_fire_sets_rest_1m_heartbeat_gauge() {
-        // Deliverable-4 pin, SUCCESS-GATED since the 2026-07-17 fix
-        // round: the tv_rest_1m_fire_heartbeat gauge (the
-        // market-hours-liveness alarm's liveness signal) is set ONLY
-        // after a successful vendor fetch carrying the target row — an
-        // all-failing session must leave the gauge unset so the alarm
-        // pages (~09:25 IST), never a fire-time false-green.
+        // Deliverable-4 pin, PERSIST-GATED since the 2026-07-17 fix
+        // round 2 (the M1 fetch-ok-but-lost-is-not-ok rule): the
+        // tv_rest_1m_fire_heartbeat gauge (the market-hours-liveness
+        // alarm's liveness signal) is set ONLY inside the `if flush_ok`
+        // guard — after the spot_1m_rest flush ACK, before the fold
+        // handoff. An all-failing session (fetch OR persist) must leave
+        // the gauge unset so the alarm pages (~09:25 IST), never a
+        // fire-time or fetch-time false-green.
         let src = include_str!("dhan_cadence_executor.rs");
         let prod = src.split("#[cfg(test)]").next().unwrap_or_default();
         let fetch_spot_pos = prod
@@ -1161,19 +1164,20 @@ mod tests {
             hb_pos > fetch_spot_pos,
             "heartbeat is set inside fetch_spot"
         );
-        // Success-gated: AFTER the empty-target failure branch (the last
-        // fetch-outcome return before the success path) and BEFORE the
-        // persist leg — i.e. exactly at the successful-fetch point.
-        let empty_pos = prod
-            .find("return Err(CadenceFetchError::Empty);")
-            .expect("empty-target branch present");
-        let persist_pos = prod
-            .find("// Persist → flush ACK")
-            .expect("persist ordering comment present");
+        // Persist-gated: AFTER the flush verdict + the flush_ok guard
+        // open, BEFORE the fold handoff inside the same guard.
+        let flush_pos = prod
+            .find("writer.flush()")
+            .expect("spot flush site present");
+        let guard_pos = prod.find("if flush_ok {").expect("flush_ok guard present");
+        let handoff_pos = prod
+            .find("send_confirmed_bars(")
+            .expect("fold handoff present");
         assert!(
-            empty_pos < hb_pos && hb_pos < persist_pos,
-            "heartbeat must be success-gated: after the empty-target \
-             branch, before the persist leg (never fire-time)"
+            flush_pos < guard_pos && guard_pos < hb_pos && hb_pos < handoff_pos,
+            "heartbeat must be persist-gated: inside the flush_ok guard \
+             after the flush ACK, before the fold handoff (never \
+             fetch-time, never fire-time)"
         );
     }
 }

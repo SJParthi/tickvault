@@ -3465,6 +3465,11 @@ pub(crate) async fn run_cadence_post_session_sweep(
     let mut writer = Spot1mRestWriter::new(&questdb);
     let mut audit_writer = RestFetchAuditWriter::new(&questdb);
     let mut tracker = PersistTracker::default();
+    // Target list: `sweep_sids_above_watermark` iterates the FULL
+    // `SPOT_1M_REST_INDICES` (4 SIDs INCLUDING INDIA VIX, const-asserted
+    // len==4 in constants.rs) — the cadence sweep therefore already
+    // repairs VIX minutes; no separate VIX arm is needed (fix round 2
+    // factual note: the "3-SID list" review premise was wrong).
     let stats = sweep_sids_above_watermark(
         &client,
         &url,

@@ -514,15 +514,6 @@ impl CadenceExecutor for GrowwCadenceExecutor {
         };
         let close_to_data_ms =
             (ist_millis_of_day_now() - (i64::from(req.cycle_minute_ist) + 60) * 1000).max(0);
-        // The per-fire liveness heartbeat (feeds the market-hours-liveness
-        // alarm) — success-gated (fix round 2026-07-17): set ONLY after a
-        // successful vendor fetch carrying the target row. An all-failing
-        // session must leave the gauge unset so
-        // tv-<env>-market-hours-liveness-missing pages (~09:25 IST);
-        // mid-session death after first success remains the pre-existing
-        // documented residual. Never pre-registered at boot: the first
-        // in-session set IS the signal.
-        metrics::gauge!("tv_rest_1m_fire_heartbeat").set(1.0);
         // Persist → flush ACK → fold handoff (STRICT ordering: an
         // unpersisted bar must never derive candles — the fold contract).
         let flush_ok = {
@@ -568,6 +559,16 @@ impl CadenceExecutor for GrowwCadenceExecutor {
             }
         };
         if flush_ok {
+            // The per-fire liveness heartbeat (feeds the
+            // market-hours-liveness alarm) — PERSIST-gated (fix round 2,
+            // the M1 fetch-ok-but-lost-is-not-ok rule): set ONLY after the
+            // spot_1m_rest flush ACK. An all-failing session (fetch OR
+            // persist) leaves the gauge unset so
+            // tv-<env>-market-hours-liveness-missing pages (~09:25 IST);
+            // mid-session death after first success remains the
+            // pre-existing documented residual. Never pre-registered at
+            // boot: the first in-session set IS the signal.
+            metrics::gauge!("tv_rest_1m_fire_heartbeat").set(1.0);
             // ONLY after the flush ACK — the sole Groww candles_*/RAM-store
             // feed on the cadence runtime.
             if let Ok(sid_u64) = u64::try_from(security_id) {
@@ -1278,11 +1279,13 @@ mod tests {
         );
     }
 
-    /// Source-order ratchet, SUCCESS-GATED since the 2026-07-17 fix
-    /// round: the liveness heartbeat is set ONLY after a successful
-    /// vendor fetch carrying the target row — an all-failing session
-    /// must leave the gauge unset so the market-hours-liveness alarm
-    /// pages, never a fire-time false-green.
+    /// Source-order ratchet, PERSIST-GATED since the 2026-07-17 fix
+    /// round 2 (the M1 fetch-ok-but-lost-is-not-ok rule): the liveness
+    /// heartbeat is set ONLY inside the `if flush_ok` guard — after the
+    /// spot_1m_rest flush ACK, before the fold handoff. An all-failing
+    /// session (fetch OR persist) must leave the gauge unset so the
+    /// market-hours-liveness alarm pages, never a fetch-time or
+    /// fire-time false-green.
     #[test]
     fn test_groww_cadence_spot_fire_sets_rest_1m_heartbeat_gauge() {
         let src = include_str!("groww_cadence_executor.rs");
@@ -1292,15 +1295,17 @@ mod tests {
         let prod = src.split(marker).next().unwrap_or_default();
         let fetch_pos = prod.find("async fn fetch_spot").unwrap_or_default();
         let heartbeat_pos = prod.find("tv_rest_1m_fire_heartbeat").unwrap_or_default();
-        let empty_pos = prod
-            .find("return Err(CadenceFetchError::Empty);")
-            .unwrap_or_default();
-        let persist_pos = prod.find("// Persist → flush ACK").unwrap_or_default();
-        assert!(fetch_pos > 0 && heartbeat_pos > 0 && empty_pos > 0 && persist_pos > 0);
+        let flush_pos = prod.find("writer.flush()").unwrap_or_default();
+        let gate_pos = prod.find("if flush_ok {").unwrap_or_default();
+        let handoff_pos = prod.find("send_confirmed_bars(").unwrap_or_default();
+        assert!(fetch_pos > 0 && heartbeat_pos > 0 && flush_pos > 0 && gate_pos > 0);
         assert!(
-            fetch_pos < heartbeat_pos && empty_pos < heartbeat_pos && heartbeat_pos < persist_pos,
-            "the heartbeat gauge must be success-gated: inside fetch_spot, \
-             after the failure branches, before the persist leg"
+            fetch_pos < heartbeat_pos
+                && flush_pos < gate_pos
+                && gate_pos < heartbeat_pos
+                && heartbeat_pos < handoff_pos,
+            "the heartbeat gauge must be persist-gated: inside fetch_spot's \
+             flush_ok guard after the flush ACK, before the fold handoff"
         );
     }
 }
