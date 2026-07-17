@@ -1023,6 +1023,18 @@ pub struct CadenceConfig {
     /// a fresh dated operator quote.
     #[serde(default)]
     pub enabled: bool,
+    /// Cadence DHAN lane gate — DEFAULT TRUE. Gates the cadence
+    /// scheduler's Dhan broker lane and is deliberately INDEPENDENT of
+    /// `feeds.dhan_enabled` (the RETIRED live-WS flag, false in prod):
+    /// the cadence lanes are REST pulls, not the live feed. Config +
+    /// restart to change; there is NO runtime toggle for it.
+    #[serde(default = "default_cadence_lane_enabled")]
+    pub dhan_lane: bool,
+    /// Cadence GROWW lane gate — DEFAULT TRUE. Same contract as
+    /// `dhan_lane`: independent of `feeds.groww_enabled` (the retired
+    /// live-WS flag); config + restart only, no runtime toggle.
+    #[serde(default = "default_cadence_lane_enabled")]
+    pub groww_lane: bool,
     /// The Dhan BURST second offset from the minute-close instant T, ms
     /// (operator directive 2026-07-16 — ALL fires are POST-close now).
     /// Default 1000 (second 1): shape rung 0 fires ALL 7 requests here
@@ -1127,6 +1139,13 @@ pub struct CadenceConfig {
     pub expiry_deadline_secs_of_day_ist: u32,
 }
 
+/// Serde default for [`CadenceConfig::dhan_lane`] /
+/// [`CadenceConfig::groww_lane`] — both lanes ON when the scheduler is
+/// enabled (the lanes are independent of the retired live-WS feed flags).
+fn default_cadence_lane_enabled() -> bool {
+    true
+}
+
 /// Serde default for [`CadenceConfig::dhan_burst_offset_ms`] — second 1
 /// (the operator's 2026-07-16 "first second" burst).
 fn default_cadence_dhan_burst_offset_ms() -> i64 {
@@ -1212,6 +1231,8 @@ impl Default for CadenceConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            dhan_lane: default_cadence_lane_enabled(),
+            groww_lane: default_cadence_lane_enabled(),
             dhan_burst_offset_ms: default_cadence_dhan_burst_offset_ms(),
             spot_window_cap: default_cadence_spot_window_cap(),
             concurrency_degrade_after_dirty_cycles:
@@ -6046,6 +6067,11 @@ mod tests {
             !d.enabled,
             "cadence must default OFF (fail-safe; the operator flips it)"
         );
+        // The broker lane gates DEFAULT TRUE and are deliberately
+        // independent of the retired feeds.dhan_enabled/groww_enabled
+        // live-WS flags (fix round 2026-07-17).
+        assert!(d.dhan_lane, "cadence dhan_lane must default true");
+        assert!(d.groww_lane, "cadence groww_lane must default true");
         // The locked cadence table (2026-07-16 post-close shape).
         assert_eq!(d.dhan_burst_offset_ms, 1_000);
         assert_eq!(d.spot_window_cap, 4);
@@ -6082,6 +6108,11 @@ mod tests {
             .extract()
             .expect("empty [cadence] must default, not error");
         assert!(!empty.cadence.enabled);
+        assert!(empty.cadence.dhan_lane, "empty [cadence] => dhan_lane true");
+        assert!(
+            empty.cadence.groww_lane,
+            "empty [cadence] => groww_lane true"
+        );
         assert_eq!(empty.cadence.dhan_burst_offset_ms, d.dhan_burst_offset_ms);
         assert_eq!(empty.cadence.spot_window_cap, d.spot_window_cap);
         assert_eq!(

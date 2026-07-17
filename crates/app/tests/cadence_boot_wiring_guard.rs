@@ -98,10 +98,13 @@ fn test_cadence_boot_module_gate_guard_and_real_executors() {
         "ensure_spot_1m_rest_table",
         "ensure_option_chain_1m_table",
         "ensure_rest_fetch_audit_table",
-        // Level-triggered lane gates: the SAME atomics the API toggle
-        // flips (dhan_flag/groww_flag).
-        "feed_runtime.dhan_flag()",
-        "feed_runtime.groww_flag()",
+        // Lane gates seeded from [cadence] dhan_lane/groww_lane (fix
+        // round 2026-07-17, CRITICAL): the cadence REST lanes must be
+        // INDEPENDENT of the retired live-WS feed flags — on shipped
+        // config (feeds.* = false, runtime enable 409'd) the old
+        // feed_runtime gating parked both lanes forever.
+        "AtomicBool::new(config.cadence.dhan_lane)",
+        "AtomicBool::new(config.cadence.groww_lane)",
         // The supervised runner spawn.
         "spawn_supervised_cadence_runner",
         // Real executors = real coded degrade levels (F10 semantics).
@@ -120,6 +123,18 @@ fn test_cadence_boot_module_gate_guard_and_real_executors() {
         "cadence_boot.rs must no longer reference DryRunLoggingExecutor \
          (real broker executors both lanes since 2026-07-17)."
     );
+    // The retired live-WS runtime flags must never gate the cadence
+    // lanes again (fix round 2026-07-17): feeds.dhan_enabled /
+    // feeds.groww_enabled are FALSE in shipped config and runtime
+    // enable is 409'd — gating on them means zero market-data capture.
+    for banned in ["dhan_flag()", "groww_flag()"] {
+        assert!(
+            !src.contains(banned),
+            "cadence_boot.rs must NOT gate the cadence lanes on the \
+             retired live-WS flag `{banned}` — use the [cadence] \
+             dhan_lane/groww_lane config-seeded atomics instead."
+        );
+    }
 }
 
 #[test]

@@ -73,7 +73,10 @@ pub fn notify_cadence_shutdown() {
 pub fn spawn_cadence_scheduler(
     config: &ApplicationConfig,
     trading_calendar: &Arc<TradingCalendar>,
-    feed_runtime: &Arc<FeedRuntimeState>,
+    // Retained in the signature for call-site stability; the cadence
+    // lanes deliberately no longer gate on the retired live-WS feed
+    // flags (fix round 2026-07-17) — see the deps wiring below.
+    _feed_runtime: &Arc<FeedRuntimeState>,
     notifier: &Arc<NotificationService>,
 ) -> Option<Arc<Notify>> {
     if !config.cadence.enabled {
@@ -158,10 +161,15 @@ pub fn spawn_cadence_scheduler(
         // request per fire, runner-owned pacing/retry/ladder.
         dhan_executor,
         groww_executor,
-        // Level-triggered lane gates: the SAME atomics the /api/feeds
-        // toggle flips (dhan_flag/groww_flag), read per cycle per lane.
-        dhan_enabled: feed_runtime.dhan_flag(),
-        groww_enabled: feed_runtime.groww_flag(),
+        // Lane gates seeded from `[cadence] dhan_lane`/`groww_lane`
+        // (fix round 2026-07-17, CRITICAL): the cadence REST lanes are
+        // deliberately INDEPENDENT of the RETIRED live-WS feed flags
+        // (feeds.dhan_enabled/groww_enabled are FALSE in shipped config
+        // and runtime enable is 409'd — gating on feed_runtime parked
+        // both lanes forever = zero market-data capture). Config +
+        // restart to change; no runtime toggle.
+        dhan_enabled: Arc::new(AtomicBool::new(config.cadence.dhan_lane)),
+        groww_enabled: Arc::new(AtomicBool::new(config.cadence.groww_lane)),
         // ExpiryResolver seam (2026-07-15): the day-locked store IS the
         // production read facade — chains are stamped from the WINNING
         // (Dhan-preferred) policy date; unresolved days carry the
