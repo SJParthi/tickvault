@@ -29,6 +29,7 @@
 
 use std::sync::Arc;
 
+use chrono::NaiveDate;
 use tickvault_common::error_code::ErrorCode;
 use tickvault_common::feed::Feed;
 use tickvault_common::types::SecurityId;
@@ -218,6 +219,13 @@ pub(crate) struct NotServedEmit {
 #[derive(Debug)]
 pub(crate) struct LaneEscalation {
     feed: Feed,
+    /// The IST trading day the tally/streak state belongs to (fix round 2,
+    /// MED — the cross-midnight wedge): every minute key is SECS-OF-DAY,
+    /// so a process surviving IST midnight would see day-2 minutes as
+    /// STALE (smaller than day-1's last key) and silently ignore the whole
+    /// new day. On a NEWER observed day the lane resets tallies + edges +
+    /// not-served streaks (fresh day). `None` until the first outcome.
+    day: Option<NaiveDate>,
     spot: LegTally,
     chain: LegTally,
     spot_targets: MinuteTargets,
@@ -242,6 +250,7 @@ impl LaneEscalation {
     pub(crate) fn new(feed: Feed) -> Self {
         Self {
             feed,
+            day: None,
             spot: LegTally::default(),
             chain: LegTally::default(),
             spot_targets: MinuteTargets::default(),
@@ -249,6 +258,35 @@ impl LaneEscalation {
             dhan_spot_served: SidServedTracker::default(),
             dhan_chain_served: DhanChainServedTracker::default(),
             groww_chain_served: GrowwChainServedTracker::default(),
+        }
+    }
+
+    /// Observe the CURRENT IST day before recording outcomes. On the
+    /// FIRST observation the day is adopted (no roll). On a NEWER day the
+    /// whole lane state resets — both legs' tallies (fresh [`FailureEdge`]
+    /// latches), the open per-target minute buckets (day-1's last minute
+    /// never finalizes across the roll — the documented last-minute
+    /// envelope), and all three not-served streak trackers — and the OLD
+    /// day is returned so the caller logs ONE info line. An OLDER
+    /// observed day (backward clock skew) is ignored, state kept.
+    pub(crate) fn roll_day_if_needed(&mut self, today: NaiveDate) -> Option<NaiveDate> {
+        match self.day {
+            None => {
+                self.day = Some(today);
+                None
+            }
+            Some(cur) if today > cur => {
+                self.spot = LegTally::default();
+                self.chain = LegTally::default();
+                self.spot_targets = MinuteTargets::default();
+                self.chain_targets = MinuteTargets::default();
+                self.dhan_spot_served = SidServedTracker::default();
+                self.dhan_chain_served = DhanChainServedTracker::default();
+                self.groww_chain_served = GrowwChainServedTracker::default();
+                self.day = Some(today);
+                Some(cur)
+            }
+            Some(_) => None,
         }
     }
 
@@ -1055,5 +1093,60 @@ mod tests {
             );
         }
         assert_eq!(pages, 1, "the Groww chain lane pages at the threshold");
+    }
+
+    #[test]
+    fn test_ist_day_roll_resets_tallies_edges_and_streaks() {
+        // Drives BOTH edges (escalation + not-served) through one full day:
+        // each pages exactly once. Returns (edge_pages, not_served_pages).
+        fn drive_day(lane: &mut LaneEscalation) -> (u32, u32) {
+            let mut edge_pages = 0u32;
+            let mut ns_pages = 0u32;
+            for i in 0..=NS_T {
+                if let Some((_, EdgeAction::Page { .. })) =
+                    lane.record(EscalationLeg::Spot, minute(i), false)
+                {
+                    edge_pages += 1;
+                }
+                if let Some((_, emits)) = rec_spot(lane, i, "NIFTY", 13, TargetOutcome::NotServed)
+                    && page_for(&emits, "NIFTY").is_some()
+                {
+                    ns_pages += 1;
+                }
+                rec_spot(lane, i, "BANKNIFTY", 25, TargetOutcome::Served);
+            }
+            (edge_pages, ns_pages)
+        }
+
+        let day1 = NaiveDate::from_ymd_opt(2026, 7, 16).expect("valid date");
+        let day2 = NaiveDate::from_ymd_opt(2026, 7, 17).expect("valid date");
+        let mut lane = LaneEscalation::new(Feed::Dhan);
+        // First observation ADOPTS the day (no roll); re-observing is a no-op.
+        assert_eq!(lane.roll_day_if_needed(day1), None);
+        assert_eq!(lane.roll_day_if_needed(day1), None);
+
+        assert_eq!(drive_day(&mut lane), (1, 1), "day 1 pages once per edge");
+
+        // Backward clock skew is IGNORED — state kept.
+        assert_eq!(
+            lane.roll_day_if_needed(NaiveDate::from_ymd_opt(2026, 7, 15).expect("valid date")),
+            None
+        );
+        // The IST day rolls: the OLD day is returned exactly once and the
+        // whole lane resets (tallies + edge latches + not-served streaks).
+        assert_eq!(lane.roll_day_if_needed(day2), Some(day1));
+        assert_eq!(lane.roll_day_if_needed(day2), None);
+
+        // Day-2 outcomes reuse the SAME secs-of-day minute keys and are
+        // recorded FRESH (the cross-midnight stale-key wedge is dead), and
+        // both edges page AGAIN only after a full fresh threshold — a
+        // carried latch would stay silent, a carried streak would page
+        // early, an un-reset MinuteTargets/LegTally would treat every
+        // day-2 minute as stale and never record at all.
+        assert_eq!(
+            drive_day(&mut lane),
+            (1, 1),
+            "day 2 pages once per edge again"
+        );
     }
 }

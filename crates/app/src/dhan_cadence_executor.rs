@@ -69,7 +69,7 @@ use tickvault_storage::option_chain_1m_persistence::{
 use tickvault_storage::rest_fetch_audit_persistence::{RestFetchAuditWriter, RestFetchOutcome};
 use tickvault_storage::spot_1m_rest_persistence::Spot1mRestWriter;
 use tokio::sync::Mutex;
-use tracing::{debug, error};
+use tracing::{debug, error, info};
 
 use crate::option_chain_1m_boot::{
     ChainFetchUnpacedFailure, MoneynessWarnLatches, build_dhan_chain_audit_row,
@@ -247,14 +247,24 @@ impl DhanCadenceExecutor {
         ok: bool,
         target: Option<(&'static str, SecurityId, TargetOutcome)>,
     ) {
-        let (finalized, not_served) = {
+        let today = today_ist();
+        let (rolled_from, finalized, not_served) = {
             let mut esc = self.escalation.lock().await;
+            let rolled_from = esc.roll_day_if_needed(today);
             let finalized = esc.record(leg, minute_secs, ok);
             let not_served = target.and_then(|(symbol, sid, outcome)| {
                 esc.record_target(leg, minute_secs, symbol, sid, outcome)
             });
-            (finalized, not_served)
+            (rolled_from, finalized, not_served)
         };
+        if let Some(old_day) = rolled_from {
+            info!(
+                old_day = %old_day,
+                new_day = %today,
+                "dhan cadence escalation: IST day rolled — escalation edges + \
+                 not-served streaks reset for the fresh day"
+            );
+        }
         if let Some((minute, action)) = finalized {
             emit_edge_action(Feed::Dhan, leg, minute, action, self.notifier.as_ref());
         }

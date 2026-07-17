@@ -57,7 +57,7 @@ use tickvault_storage::spot_1m_rest_persistence::{
     Spot1mRestWriter,
 };
 use tokio::sync::Mutex;
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::cadence_escalation::{
     EscalationLeg, LaneEscalation, TargetOutcome, emit_edge_action, emit_not_served,
@@ -301,14 +301,25 @@ impl GrowwCadenceExecutor {
         ok: bool,
         target: Option<(&'static str, SecurityId, TargetOutcome)>,
     ) {
-        let (finalized, not_served) = {
+        let today = today_ist();
+        let (rolled_from, finalized, not_served) = {
             let mut esc = self.escalation.lock().await;
+            let rolled_from = esc.roll_day_if_needed(today);
             let finalized = esc.record(leg, minute_secs, ok);
             let not_served = target.and_then(|(symbol, sid, outcome)| {
                 esc.record_target(leg, minute_secs, symbol, sid, outcome)
             });
-            (finalized, not_served)
+            (rolled_from, finalized, not_served)
         };
+        if let Some(old_day) = rolled_from {
+            info!(
+                feed = "groww",
+                old_day = %old_day,
+                new_day = %today,
+                "groww cadence escalation: IST day rolled — escalation edges + \
+                 not-served streaks reset for the fresh day"
+            );
+        }
         if let Some((minute, action)) = finalized {
             emit_edge_action(Feed::Groww, leg, minute, action, self.notifier.as_ref());
         }
