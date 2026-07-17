@@ -879,7 +879,12 @@ impl CadenceExecutor for GrowwCadenceExecutor {
             let mut persist_failed = false;
             {
                 let mut writer = self.chain_writer.lock().await;
-                for (leg, leg_moneyness) in chain.legs.iter().zip(cls.row_moneyness.iter()) {
+                for ((leg, leg_moneyness), leg_depth) in chain
+                    .legs
+                    .iter()
+                    .zip(cls.row_moneyness.iter())
+                    .zip(cls.row_depth.iter())
+                {
                     let row = OptionChain1mRow {
                         ts_ist_nanos: target_nanos,
                         trading_date_ist_nanos: trading_date_nanos,
@@ -903,8 +908,14 @@ impl CadenceExecutor for GrowwCadenceExecutor {
                         underlying_spot: chain.underlying_ltp,
                         fetched_at_ist_nanos: fetched_at,
                         moneyness: leg_moneyness.as_str(),
+                        // Signed depth (2026-07-17 merge) — classified from
+                        // the GUARDED moneyness_spot above; None (→ NULL)
+                        // whenever that spot / the strike were invalid.
+                        moneyness_depth: *leg_depth,
                     };
-                    if let Err(err) = writer.append_row_ext(&row, leg.rho, close_to_data_ms) {
+                    if let Err(err) =
+                        writer.append_row_ext(&row, Some(leg.rho), Some(close_to_data_ms))
+                    {
                         persist_failed = true;
                         metrics::counter!(
                             "tv_groww_chain1m_persist_errors_total", "stage" => "append"
