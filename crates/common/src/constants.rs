@@ -3292,40 +3292,14 @@ pub const DHAN_REST_STACK_TOKEN_SWEEP_INTERVAL_SECS: u64 = 900;
 /// - ZERO frame loss guarantee — backpressure, never drop.
 pub const FRAME_CHANNEL_CAPACITY: usize = 131_072;
 
-/// WAL re-injection chunk size (STAGE-C.2b boot recovery — COLD path).
-///
-/// The boot-time WAL replay re-injects recovered frames into the pool's
-/// frame channel with backpressured `send().await` (never `try_send`,
-/// never drop). Every `WAL_REINJECT_CHUNK_SIZE` delivered frames the
-/// injector calls `tokio::task::yield_now()` so the live WS read loop and
-/// the tick processor get scheduled — a 1M+ frame replay must never
-/// monopolize the runtime. Must stay well under
-/// [`FRAME_CHANNEL_CAPACITY`] (131,072) so one chunk can always fit the
-/// channel and per-chunk progress is guaranteed while the consumer drains.
-pub const WAL_REINJECT_CHUNK_SIZE: usize = 8_192;
-
-/// Per-send stall timeout for the WAL re-injection (seconds).
-///
-/// Each backpressured `send().await` during STAGE-C.2b re-injection is
-/// wrapped in `tokio::time::timeout`. A healthy tick processor drains the
-/// frame channel continuously, so 30 seconds of ZERO progress on a single
-/// send means the consumer is wedged or dead — the injector aborts
-/// (WS-REINJECT-01), leaving the remaining frames staged in the WAL
-/// `replaying/` directory for re-replay next boot. Fail-closed: an abort
-/// keeps the re-injection NOT-clean so `confirm_replayed()` never
-/// archives a partially delivered replay (durable WAL floor preserved).
-pub const WAL_REINJECT_SEND_TIMEOUT_SECS: u64 = 30;
-
-/// Emit a WAL re-injection progress `info!` every this many delivered chunks.
-///
-/// 16 chunks × [`WAL_REINJECT_CHUNK_SIZE`] (8,192) = every ~131,072 frames —
-/// one progress line per channel-capacity's worth of replay. A pathologically
-/// large WAL (1M+ frames) drains inline before `notify_systemd_ready`, so an
-/// operator tailing logs during a long boot sees periodic
-/// `WAL re-injection progress` lines instead of a silent multi-second stall
-/// (boot wall-clock scales linearly with WAL backlog size by design —
-/// zero-drop trade-off; systemd tolerates it via `TimeoutStartSec=infinity`).
-pub const WAL_REINJECT_PROGRESS_LOG_CHUNKS: u64 = 16;
+// 2026-07-17 (evidence-audit Fix PR C — WS-REINJECT-01 retirement): the
+// WAL_REINJECT_CHUNK_SIZE / WAL_REINJECT_SEND_TIMEOUT_SECS /
+// WAL_REINJECT_PROGRESS_LOG_CHUNKS constants were DELETED with their sole
+// consumer, the orphaned `crates/app/src/wal_reinject.rs` module (the
+// STAGE-C.2b re-injection call sites died with the Dhan live-WS lane;
+// main.rs count-residuals + `confirm_replayed()` are the retained
+// coverage). See `.claude/rules/project/ws-reinject-error-codes.md`
+// (RETIRED banner).
 
 /// Power-of-two exponent for the tick deduplication ring buffer.
 ///

@@ -223,10 +223,12 @@ pub mod order_observability;
 pub mod order_runtime;
 pub mod subsystem_memory;
 pub mod trading_pipeline;
-/// C3 (2026-07-03): bounded, chunked, backpressured STAGE-C.2b WAL frame
-/// re-injection — replaces the raw try_send loop that dropped 1,127,801
-/// frames + kept the WAL unconfirmed (self-feeding re-replay storm).
-pub mod wal_reinject;
+// 2026-07-17 (evidence-audit Fix PR C): `pub mod wal_reinject;` RETIRED —
+// the C3 (2026-07-03) bounded STAGE-C.2b re-injection module was ORPHANED
+// (zero production callers; its main.rs call sites died with the Dhan
+// live-WS lane, and main.rs now count-residuals + `confirm_replayed()`
+// instead). Deleted with its dead WS-REINJECT-01 paging filter — see
+// `.claude/rules/project/ws-reinject-error-codes.md` (RETIRED banner).
 /// Shared `ws_event_audit` channel + consumer helper — relocated from the
 /// main.rs binary in Phase C1 (2026-07-13) so the lib-side `dhan_rest_stack`
 /// (which owns the functional-dormant order-update WS per operator ruling

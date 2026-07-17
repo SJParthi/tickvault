@@ -112,10 +112,11 @@ locals {
   # false-recovery). ok_recovery = false suppresses that misleading OK for:
   #   (rest-canary-01 was in this list until its 2026-07-14 retirement
   #   with the canary module - operator Dhan noise lock.)
-  #   - ws-reinject-01: emitted exactly ONCE per boot (wal_reinject.rs abort
-  #     arm); the condition -- frames staged in WAL replaying/ with a
-  #     dead/wedged consumer -- persists until the NEXT boot. OK ~15 min
-  #     later cannot mean recovered.
+  #   (ws-reinject-01 was in this list until its 2026-07-17 retirement —
+  #   evidence-audit Fix PR C: its only emitter, the orphaned
+  #   wal_reinject.rs module, had zero production callers, so the filter
+  #   could never match again — a dead paging filter per the drift guard;
+  #   the ws-gap-07 / feed-stall-01 precedent.)
   #   - proc-01: a discrete kernel OOM-kill event; the memory pressure that
   #     caused it is not fixed by the episode aging out.
   #   - dh-906: a discrete per-order reject; OK = aged out, never "orders
@@ -188,15 +189,14 @@ locals {
     # paging filter; the ws-gap-07 precedent above). The companion
     # >=3-restarts-per-15-min counter pager was deleted whole in the same PR
     # (feed-stall-restart-alarm.tf). Variant retirement is the post-C4 sweep.
-    "ws-reinject-01" = {
-      pattern     = "{ $.code = \"WS-REINJECT-01\" && $.level = \"ERROR\" }"
-      period      = 300
-      threshold   = 1
-      eval        = 3
-      dta         = 1
-      ok_recovery = false # round-4: emitted exactly ONCE per boot; the staged-WAL condition persists until the NEXT boot - auto-OK would be a Rule-11 false recovery
-      desc        = "WS-REINJECT-01: boot WAL re-injection ABORTED - consumer dead/wedged; frames stay staged in WAL replaying/ and re-replay next boot. NO recovered/OK page: the code fires once per boot and the condition persists until the next boot, so the auto-OK ~15 min later only means the single datapoint aged out - recovery is the NEXT boot's clean replay. Runbook: .claude/rules/project/ws-reinject-error-codes.md"
-    }
+    # 2026-07-17 (evidence-audit Fix PR C): the "ws-reinject-01" entry was
+    # RETIRED — its only emit site, the orphaned wal_reinject.rs module,
+    # had ZERO production callers (the STAGE-C.2b re-injection call sites
+    # died with the Dhan live-WS lane; main.rs count-residuals +
+    # confirm_replayed are the retained coverage), so the filter could
+    # never match again (dead paging filter; the ws-gap-07 /
+    # feed-stall-01 / cross-verify-1m precedent). Module + WsReinject01Aborted
+    # variant deleted in the same PR; rule file retained as historical audit.
     "proc-01" = {
       pattern     = "{ $.code = \"PROC-01\" && $.level = \"ERROR\" }"
       period      = 300

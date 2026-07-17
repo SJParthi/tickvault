@@ -1,5 +1,20 @@
 # Bounded WAL Frame Re-Injection — Error Codes (WS-REINJECT-01)
 
+> **⚠ RETIRED 2026-07-17 (evidence-audit Fix PR C):** the WS-REINJECT-01
+> paging surface is RETIRED — its only emit site, the orphaned
+> `crates/app/src/wal_reinject.rs` module, had ZERO production callers
+> (the STAGE-C.2b re-injection call sites died with the Dhan live-WS lane;
+> the main.rs boot path now COUNT-RESIDUALS the staged WAL frames +
+> `confirm_replayed()` instead — the `tv_ws_frame_wal_reinjected_dropped_total`
+> counters are the retained coverage). The module, the
+> `ErrorCode::WsReinject01Aborted` variant, the `WAL_REINJECT_*` constants,
+> and the `ws-reinject-01` CloudWatch filter/alarm entry
+> (`error-code-alarms.tf`) were all deleted in the same PR — a filter with
+> no possible emit site is a dead filter per the paging drift guard (the
+> ws-gap-07 / feed-stall-01 / cross-verify-1m precedent). The code string
+> is reverse-crossref allowlisted; content below retained as historical
+> audit per the house banner convention.
+
 > **Authority:** CLAUDE.md > `operator-charter-forever.md` §C/§F > this file.
 > **Companion code:** `crates/app/src/wal_reinject.rs` (`reinject_wal_frames` /
 > `ReinjectOutcome`), the two STAGE-C.2b call sites in `crates/app/src/main.rs`
