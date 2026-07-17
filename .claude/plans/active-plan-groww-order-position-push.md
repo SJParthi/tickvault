@@ -4,7 +4,7 @@
 **Date:** 2026-07-16
 **Approved by:** Parthiban (operator), direct in-thread confirmation 2026-07-16 (thread event `f25b4dec-16b3-4a85-825a-85d2187b8011`): "implement and integrate everything" + "make it automated". Scope: BUILD + INTEGRATE the Groww order/position push channels, DEFAULT-OFF; live order-fire stays a separate future dated flip; the retired live market-data feed is untouched.
 **Crates touched:** `common`, `trading`, `app` (STAGE 0 = docs only; no `crates/*/src/*.rs` logic change).
-**Shared contract:** `/tmp/claude-0/-home-user-tickvault/e148fc19-1297-5a25-ada5-86d4f1af09ad/scratchpad/push-contract.md`
+**Shared contract:** recorded in this plan + the rule-file authorization notes (`.claude/rules/project/groww-order-push-error-codes.md` and the three scope-lock edits).
 **Runbook:** `.claude/rules/project/groww-order-push-error-codes.md` (GROWW-PUSH-01..04).
 **Deferred-spec producer:** this build is the producer the `groww-order-audit-consumer-spec` was waiting on.
 
