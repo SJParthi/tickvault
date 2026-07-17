@@ -46,19 +46,20 @@
 //! next day's first push does NOT re-allocate). Drain is `O(N)` over
 //! the keys; happens once per trading day off the hot path.
 
-pub mod bar_cache;
+// Dead live-WS sweep stage 1 (2026-07-17, operator directive via
+// coordinator): `bar_cache` (in-RAM bar cache — its only writer was the
+// deleted feed-blind `bar_cache_loader` boot union, feed-separation recon
+// GAP-1) and `pct_change_cache` (its only documented caller was the dead
+// `tick_processor::on_tick`) DELETED — zero production callers of either.
 pub mod consumer;
 pub mod day_ohlc_tracker;
-pub mod pct_change_cache;
 pub mod prev_day_cache;
 pub mod reset_scheduler;
 pub mod spot_bar_store;
 pub mod tick_storage;
 
-pub use bar_cache::{BarCache, CompactBar, bar_cache_clear_before_threshold};
 pub use consumer::run_tick_storage_consumer;
 pub use day_ohlc_tracker::{DayOhlc, DayOhlcTracker};
-pub use pct_change_cache::{PctChange, PctChangeCache};
 pub use prev_day_cache::PrevDayCache;
 pub use reset_scheduler::{run_tick_storage_daily_reset, secs_until_next_market_open_ist};
 pub use tick_storage::{DEFAULT_PER_INSTRUMENT_CAPACITY, TickStorage};
