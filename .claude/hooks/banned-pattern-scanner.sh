@@ -132,18 +132,20 @@ scan_prod_code() {
 #   crates/core/src/pipeline/               — tick processor + enricher + guards (per tick)
 #   crates/core/src/websocket/              — WS read loop + subscription path
 #   crates/trading/                         — candles aggregator + indicator + strategy + risk + in_mem
-#   crates/storage/src/tick_persistence.rs  — per-tick ILP append
-#   crates/storage/src/tick_row_builder.rs  — per-tick ILP row build
 #   crates/storage/src/ws_frame_spill.rs    — per-frame WAL append
 # (crates/app/src/groww_bridge.rs — the per-tick Groww NDJSON consume path — was
 #  DELETED 2026-07-15 with the Groww live feed; its alternative is removed below.)
+# (crates/storage/src/tick_persistence.rs + tick_row_builder.rs — the per-tick
+#  ILP append/row-build chain — were DELETED 2026-07-17 in the stage-2 dead-WS
+#  sweep (PR #1631); their alternatives are removed below per the zero-match
+#  guard in hot-path-scanner-selftest.sh.)
 # Cold path within core (auth/, instrument/, notification/, historical/) is NOT hot path.
 # Cold path within trading (oms/) — order placement is network-I/O-bound, not
 # per-tick latency-critical (pre-existing documented exclusion, kept).
 # NOTE: keep this regex a flat '|'-separated list of alternatives with NO
 # nested groups — hot-path-scanner-selftest.sh splits it on '|' to verify
 # every alternative matches at least one real file.
-HOT_PATH_INCLUDE_REGEX='^crates/core/src/parser/|^crates/core/src/pipeline/|^crates/core/src/websocket/|^crates/trading/|^crates/storage/src/tick_persistence\.rs$|^crates/storage/src/tick_row_builder\.rs$|^crates/storage/src/ws_frame_spill\.rs$'
+HOT_PATH_INCLUDE_REGEX='^crates/core/src/parser/|^crates/core/src/pipeline/|^crates/core/src/websocket/|^crates/trading/|^crates/storage/src/ws_frame_spill\.rs$'
 HOT_PATH_EXCLUDE_REGEX='^crates/trading/src/oms/'
 
 scan_hot_path() {
@@ -440,7 +442,13 @@ scan_prod_code 'pub mod backfill' \
 #
 # Hot-path files (start narrow — extend as the spill async wrapper
 # Item 0.b lands in a follow-up):
-#   - crates/core/src/pipeline/tick_processor.rs
+#   - crates/core/src/pipeline/  (the canonical hot-path dir)
+# 2026-07-17 (stage-2 dead-WS sweep, PR #1631): the original sole target
+# `crates/core/src/pipeline/tick_processor.rs` was DELETED with the dead
+# tick chain — a single-file target would leave this scan vacuous. The
+# scope is re-pointed at the surviving pipeline dir (already the canonical
+# hot-path dir in HOT_PATH_INCLUDE_REGEX; verified zero sync-fs hits at
+# re-point time), preserving the Wave-1 no-sync-fs-on-hot-path guard.
 # Test files / boot init / drain task internals are exempt
 # because they run on the blocking pool or once-only at boot.
 
@@ -451,7 +459,7 @@ scan_hot_path_sync_fs() {
   local target_files
 
   target_files=$(echo "$files" | grep -E \
-    '^crates/core/src/pipeline/tick_processor\.rs$' \
+    '^crates/core/src/pipeline/' \
     || true)
   if [ -z "$target_files" ]; then
     return
@@ -508,7 +516,7 @@ scan_hot_path_sync_fs() {
 }
 
 scan_hot_path_sync_fs 'std::fs::write\b' \
-  'Wave 1 Item 0.a: std::fs::write on hot path — use prev_close_writer::try_enqueue_global or add // HOT-PATH-EXEMPT: above the call' \
+  'Wave 1 Item 0.a: std::fs::write on hot path — use tokio::fs / spawn_blocking (prev_close_writer deleted 2026-07-17, stage-2 sweep) or add // HOT-PATH-EXEMPT: above the call' \
   "$STAGED_FILES"
 scan_hot_path_sync_fs 'std::fs::rename\b' \
   'Wave 1 Item 0.a: std::fs::rename on hot path — owned by the async writer task or add // HOT-PATH-EXEMPT:' \
@@ -616,8 +624,15 @@ scan_movers_orphan_ddl "$STAGED_FILES"
 # RAM-first migration):
 #   - crates/trading/src/strategy/*.rs
 #   - crates/trading/src/indicator/*.rs
-#   - crates/trading/src/oms/risk_check.rs
-#   - crates/core/src/pipeline/tick_processor.rs
+#   - crates/trading/src/risk/*.rs
+# 2026-07-17 (stage-2 dead-WS sweep, PR #1631) truth-sync: the
+# `crates/core/src/pipeline/tick_processor.rs` alternative is removed
+# (file DELETED with the dead tick chain), and the phantom
+# `crates/trading/src/oms/risk_check.rs` (NEVER existed on main — the
+# 2026-07-05 phantom-path bug class) is re-pointed at the REAL risk
+# modules `crates/trading/src/risk/` (verified zero query hits at
+# re-point time), matching the documented RAM-first intent
+# (aws-budget.md: no SELECT in indicator/strategy/risk paths).
 #
 # Exempt: `// HOT-PATH-EXEMPT: <reason>` on the preceding line, or
 # the SELECT/exec/query call lives inside a `tokio::task::spawn_blocking`
@@ -634,7 +649,7 @@ scan_ram_first_hot_path() {
   local target_files
 
   target_files=$(echo "$files" | grep -E \
-    '^crates/trading/src/strategy/.*\.rs$|^crates/trading/src/indicator/.*\.rs$|^crates/trading/src/oms/risk_check\.rs$|^crates/core/src/pipeline/tick_processor\.rs$' \
+    '^crates/trading/src/strategy/.*\.rs$|^crates/trading/src/indicator/.*\.rs$|^crates/trading/src/risk/.*\.rs$' \
     || true)
   if [ -z "$target_files" ]; then
     return
