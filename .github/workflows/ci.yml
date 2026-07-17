@@ -801,7 +801,9 @@ jobs:
           fi
 
       # Added 2026-07-14 (order-runtime dry-run PR): the app crate's first
-      # dhat target — the Groww-bridge mark-forward tap. Feature-UNGATED
+      # dhat target — the order-runtime mark-forward tap (fed by the Groww
+      # per-minute REST legs since 2026-07-16; #1581 retired the
+      # live-bridge source). Feature-UNGATED
       # (house pattern), so Test (app) also runs it; this lane is the
       # allocation-ratchet authority per the header note above.
       - name: DHAT (app)

@@ -54,7 +54,7 @@ fn dhat_mark_forward_hot_arms_zero_allocation() {
     // ONE profiler per process (dhat constraint; house pattern = one #[test]
     // per dhat file) — both hot arms measured sequentially under it.
 
-    // ---- Arm A: DISARMED (the dominant per-tick path) -----------------
+    // ---- Arm A: DISARMED (the dominant per-mark path) -----------------
     // One-time construction OUTSIDE the measured windows.
     let (disarmed_tx, _disarmed_rx) = tokio::sync::mpsc::channel(64);
     let disarmed = MarkForwarder {
@@ -98,7 +98,7 @@ fn dhat_mark_forward_hot_arms_zero_allocation() {
         a_bytes <= BUDGET_BYTES && a_blocks <= BUDGET_BLOCKS,
         "mark_forward DISARMED arm allocated {a_bytes} bytes / {a_blocks} blocks \
          over 10,000 calls (budget {BUDGET_BYTES} B / {BUDGET_BLOCKS} blocks) — the \
-         per-tick gate must stay a single Relaxed load"
+         mark gate must stay a single Relaxed load"
     );
 
     let (b_bytes, b_blocks) = dhat_support::measure_with_phantom_retry(

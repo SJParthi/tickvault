@@ -14,7 +14,11 @@
 > (§2 below is the retained live re-arm spec).
 > **Companion code:** `crates/app/src/order_runtime.rs` (the single-owner
 > actor), `crates/app/src/oms_wiring.rs`, `crates/app/src/dhan_rest_stack.rs`
-> Phase 5b, the `groww_bridge.rs` mark tap,
+> Phase 5b, the mark tap *(2026-07-17 truth-sync: originally the
+> `groww_bridge.rs` per-tick tap — that file died with the Groww live feed
+> (#1581, 2026-07-15); the marks were re-homed 2026-07-16 to the Groww
+> per-minute REST legs' persist-confirm seam in `groww_spot_1m_boot.rs` +
+> `groww_contract_1m_boot.rs`)*,
 > `crates/trading/src/oms/{engine,types}.rs` (`FillEvent`),
 > `crates/trading/src/risk/engine.rs` (`evaluate_daily_loss_halt`).
 > **Companion plan:** `.claude/plans/active-plan-order-runtime-dryrun.md`.
@@ -42,7 +46,10 @@ producers to this same channel). It consumes
 the order-update broadcast (Source=P filter), bridges fills into the risk
 book via the widened `handle_order_update → Result<Option<FillEvent>, _>`,
 consumes Groww marks through a bounded mpsc fed by an
-`Arc<AtomicBool>`-gated per-tick tap, synthesizes next-mark paper fills,
+`Arc<AtomicBool>`-gated tap *(2026-07-17 truth-sync: "per-tick" at ship
+time — since the 2026-07-16 re-home the tap sits at the Groww per-minute
+REST legs' persist-confirm choke points, ≤4 spot + ~30 contract marks per
+minute)*, synthesizes next-mark paper fills,
 evaluates the mark-to-market daily-loss halt, runs an honest reconcile
 heartbeat ("broker reconcile SKIPPED — dry-run" + the REAL local
 Σfills==net_lots invariant), sweeps pending paper orders at 15:30 IST,
@@ -136,6 +143,27 @@ MUST therefore include a cross-feed id MAPPING leg (contract identity per
 `futidx-4-error-codes.md` §2 — never native-id equality). No
 `dry_run = false` flip without BOTH halves.
 
+**Third pre-live landmine, same follow-up class (post-#1562 audit,
+2026-07-17 — ⚠ MANDATORY PRE-LIVE FOLLOW-UP):** the OMS reconcile's
+non-terminal fill-drift arm (`crates/trading/src/oms/engine.rs::reconcile`,
+the `order.traded_qty = update.traded_qty;` copy after the status refresh)
+adopts the broker snapshot's `traded_qty` UNCONDITIONALLY — including
+DOWNWARD, when a stale/lagging REST snapshot reports FEWER filled lots
+than the WS-side updates already recorded. A downward copy lowers the
+fill-delta baseline, so a later WS redelivery of the same fill computes a
+POSITIVE delta again and emits a SECOND `FillEvent` — the RiskEngine
+double-counts the fill (position + P&L corruption class). The C2 WS-side
+path already carries a monotone guard; the reconcile arm does not.
+Fix directions (choose one, live-mode work — do NOT invent semantics in
+dry-run): (a) refuse the downward copy on non-terminal orders
+(symmetric with the C2 WS-side monotone guard) + coded OMS-GAP-02
+divergence log, or (b) adopt it but emit the correcting `FillEvent` so
+the risk book stays consistent. UNREACHABLE TODAY: the dry-run path
+returns before any broker REST reconcile (engine.rs ~:1271), so the
+hazard is live-mode-only. The hazard site carries a matching in-code
+comment block. **No `dry_run = false` flip without one of the fix
+directions landed.**
+
 ## §4. Scope guard — EXPLICITLY OUT (a violating PR is REJECTED)
 
 1. Strategy/indicator activation — §28 boundary; the runtime never
@@ -145,7 +173,9 @@ MUST therefore include a cross-feed id MAPPING leg (contract identity per
    hard-true (ratcheted by `ratchet_order_runtime_is_dry_run_hardcoded`);
    no config flag can flip it.
 3. A second spawn site (main.rs / fast arm / trading_pipeline /
-   groww_bridge) — dual-OMS split-brain; ratcheted by
+   groww_bridge *(deleted 2026-07-15 with the Groww live feed — the ban
+   row stands for any successor mark-source module)*) — dual-OMS
+   split-brain; ratcheted by
    `ratchet_order_runtime_spawned_only_from_rest_stack`.
 4. `order_audit` / `pnl_audit` QuestDB tables — flagged follow-up (this PR
    adds NO tables).
@@ -162,11 +192,15 @@ MUST therefore include a cross-feed id MAPPING leg (contract identity per
 > book via an in-engine delta computation that is double-count-safe on
 > same-status refreshes and duplicate updates (unit-pinned); unrealized
 > P&L now multiplies lot_size (the pre-existing understatement bug is
-> fixed + finiteness-guarded); the Groww per-tick tap costs ONE Relaxed
+> fixed + finiteness-guarded); the Groww mark tap costs ONE Relaxed
 > load when disarmed (DHAT ≤1KiB/8 blocks over 10K calls; Criterion
-> budget `order_gate_mark_forward` ≤100ns). NOT claimed: marks are
-> BEST-EFFORT (a full channel drops the mark, counted — the next tick
-> supersedes it; positions stay exact); the broker-side reconcile is
+> budget `order_gate_mark_forward` ≤100ns — hot-path-grade by design;
+> 2026-07-17 truth-sync: the tap fires from the per-minute REST legs
+> since the 2026-07-16 re-home, not per live tick). NOT claimed: marks
+> are BEST-EFFORT (a full channel drops the mark, counted — the NEXT
+> MINUTE CLOSE supersedes it, ~60s; 2026-07-17 truth-sync of the stale
+> "the next tick supersedes it" claim — the honest recovery latency is
+> a minute, not a tick; positions stay exact); the broker-side reconcile is
 > SKIPPED in dry-run (the heartbeat says so honestly — the REAL invariant
 > checked is the local Σfills==net_lots mirror); a runtime respawn starts
 > a FRESH paper book (in-RAM state; replayed updates surface as loud

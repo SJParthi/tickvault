@@ -78,14 +78,18 @@ bar_cache_lookup         = 100          # <100ns per call. papaya pin + get + Co
 # Trading crate — OBI (Order Book Imbalance)
 obi_compute              = 1000         # <1μs = 1000ns — matches obi_compute_20_levels, obi_compute_with_wall (measured: ~297ns)
 
-# App crate — order-runtime dry-run PR (2026-07-14): the Groww-bridge
-# mark-forward tap (per-tick gate into the dry-run order runtime).
+# App crate — order-runtime dry-run PR (2026-07-14): the mark-forward gate
+# into the dry-run order runtime. 2026-07-17 truth-sync: the mark SOURCE is
+# the Groww per-minute REST legs' persist-confirm points (re-homed
+# 2026-07-16 — the live-bridge per-tick source died with #1581); the gate
+# KEEPS its hot-path-grade budget so a future higher-rate source needs no
+# re-budget.
 # Substring-matches order_gate/mark_forward_{disarmed,armed_full,armed_accept}.
 # Disarmed (the dominant path) is a single Relaxed load (~1ns); the armed
 # arms are one bounded try_send of a 16-byte Copy struct (drop arm counts a
 # static-key counter). 100ns covers all three with CI-runner headroom.
 # Companion zero-alloc evidence: crates/app/tests/dhat_mark_forward.rs.
-order_gate_mark_forward  = 100          # <100ns — HOT PATH per-tick mark gate
+order_gate_mark_forward  = 100          # <100ns — hot-path-grade mark gate
 
 # Common crate
 is_trading_day           = 50           # <50ns  — matches calendar/is_trading_day
