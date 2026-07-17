@@ -888,6 +888,17 @@ async fn run_order_runtime(
         std::time::Instant::now() + Duration::from_secs(ORDER_RUNTIME_BOOT_RECONCILE_DELAY_SECS);
     let mut last_reset_epoch: i64 = i64::MIN;
     let mut last_close_sweep_day: i64 = i64::MIN;
+    // Fix F (2026-07-17 respawn flap): the mark producers are DAY-SCOPED —
+    // the Groww per-minute REST legs' supervisors exit at day completion
+    // ("day complete — supervisor exiting", ~15:31 IST after the
+    // post-session sweep) and drop the last MarkForwarder clones, CLOSING
+    // the mark mpsc for the rest of the process lifetime. That is a
+    // legitimate steady state, not a death — this flag disarms Arm 2 once
+    // the close is observed so the loop keeps running (pre-fix the arm
+    // `return`ed, and the supervisor's clean_exit respawn re-read the same
+    // closed channel instantly: a permanent flap that reset the paper book
+    // at every backoff step from 15:31 through post-close).
+    let mut mark_channel_open = true;
     let mut housekeeping = tokio::time::interval(Duration::from_secs(HOUSEKEEPING_TICK_SECS));
     housekeeping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -946,11 +957,19 @@ async fn run_order_runtime(
                 }
             }
 
-            // ---- Arm 2: marks (batch-drained, bounded) ----
-            mark = mark_rx.recv() => {
+            // ---- Arm 2: marks (batch-drained, bounded; disarmed after the
+            // day-scoped producers close the channel — Fix F) ----
+            mark = mark_rx.recv(), if mark_channel_open => {
                 let Some(first) = mark else {
-                    warn!("order runtime: mark channel closed");
-                    return;
+                    warn!(
+                        "order runtime: mark channel closed (day-scoped mark \
+                         producers finished) — mark arm disarmed; the runtime \
+                         stays live (order updates, reconcile, 15:30 sweep and \
+                         16:00 reset keep running; marks resume at the next \
+                         process boot)"
+                    );
+                    mark_channel_open = false;
+                    continue;
                 };
                 let mut processed = 0usize;
                 let mut next = Some(first);
