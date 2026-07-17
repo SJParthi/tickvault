@@ -292,12 +292,27 @@ impl LaneEscalation {
 
     /// Record one outcome; returns the finalize action for the previous
     /// minute when this outcome rolled the bucket.
+    ///
+    /// `core = false` marks a non-core target (INDIA VIX). On the GROWW
+    /// SPOT leg a non-core outcome is EXCLUDED from the tally entirely —
+    /// the legacy edge keys on the 3 CORE indices only
+    /// (`groww_spot_1m_boot.rs::MinuteEdgeTally`, :386-416 + rest-1m
+    /// §1-item-5: core-all-failed pages even when VIX alone succeeded; a
+    /// VIX-only failure never pages). Every other (feed, leg) counts ALL
+    /// targets — the legacy DHAN spot edge counted the full 4-SID set
+    /// incl. INDIA VIX (`spot_1m_rest_boot.rs` `ok_count` over
+    /// `SPOT_1M_REST_INDICES` at :2363/:2553 feeding
+    /// `minute_fully_failed` at :3592).
     pub(crate) fn record(
         &mut self,
         leg: EscalationLeg,
         minute_secs: u32,
         ok: bool,
+        core: bool,
     ) -> Option<(u32, EdgeAction)> {
+        if !core && matches!((self.feed, leg), (Feed::Groww, EscalationLeg::Spot)) {
+            return None;
+        }
         match leg {
             EscalationLeg::Spot => self.spot.record(minute_secs, ok),
             EscalationLeg::Chain => self.chain.record(minute_secs, ok),
@@ -740,12 +755,18 @@ mod tests {
     #[test]
     fn test_first_minute_never_finalizes_until_rollover() {
         let mut lane = LaneEscalation::new(Feed::Dhan);
-        assert_eq!(lane.record(EscalationLeg::Spot, minute(0), false), None);
-        assert_eq!(lane.record(EscalationLeg::Spot, minute(0), false), None);
+        assert_eq!(
+            lane.record(EscalationLeg::Spot, minute(0), false, true),
+            None
+        );
+        assert_eq!(
+            lane.record(EscalationLeg::Spot, minute(0), false, true),
+            None
+        );
         // Rollover finalizes minute 0 (fully failed → below threshold →
         // EdgeAction::None).
         assert_eq!(
-            lane.record(EscalationLeg::Spot, minute(1), false),
+            lane.record(EscalationLeg::Spot, minute(1), false, true),
             Some((minute(0), EdgeAction::None))
         );
     }
@@ -759,7 +780,7 @@ mod tests {
         let mut paged = 0u32;
         for i in 0..=t {
             if let Some((_, EdgeAction::Page { consecutive })) =
-                lane.record(EscalationLeg::Spot, minute(i), false)
+                lane.record(EscalationLeg::Spot, minute(i), false, true)
             {
                 paged += 1;
                 assert_eq!(consecutive, t);
@@ -769,7 +790,7 @@ mod tests {
         assert_eq!(paged, 1, "rising edge pages exactly once");
         // Further failed minutes stay silent (already paged this episode).
         assert_eq!(
-            lane.record(EscalationLeg::Spot, minute(t + 1), false),
+            lane.record(EscalationLeg::Spot, minute(t + 1), false, true),
             Some((minute(t), EdgeAction::None))
         );
     }
@@ -779,17 +800,17 @@ mod tests {
         let mut lane = LaneEscalation::new(Feed::Dhan);
         let t = SPOT_1M_REST_CONSECUTIVE_FAIL_PAGE_THRESHOLD;
         for i in 0..=t {
-            lane.record(EscalationLeg::Spot, minute(i), false);
+            lane.record(EscalationLeg::Spot, minute(i), false, true);
         }
         // Minute t succeeds (ok outcome), finalized by minute t+1's first
         // outcome → Recover.
         let mut lane2 = LaneEscalation::new(Feed::Dhan);
         for i in 0..=t {
-            lane2.record(EscalationLeg::Spot, minute(i), false);
+            lane2.record(EscalationLeg::Spot, minute(i), false, true);
         }
         // overwrite minute t as an OK minute
-        lane2.record(EscalationLeg::Spot, minute(t), true);
-        let fin = lane2.record(EscalationLeg::Spot, minute(t + 1), false);
+        lane2.record(EscalationLeg::Spot, minute(t), true, true);
+        let fin = lane2.record(EscalationLeg::Spot, minute(t + 1), false, true);
         match fin {
             Some((m, EdgeAction::Recover { failed_minutes })) => {
                 assert_eq!(m, minute(t));
@@ -801,7 +822,7 @@ mod tests {
         let mut paged_again = false;
         for i in (t + 2)..=(2 * t + 2) {
             if let Some((_, EdgeAction::Page { .. })) =
-                lane2.record(EscalationLeg::Spot, minute(i), false)
+                lane2.record(EscalationLeg::Spot, minute(i), false, true)
             {
                 paged_again = true;
             }
@@ -812,12 +833,12 @@ mod tests {
     #[test]
     fn test_mixed_minute_with_one_ok_is_not_fully_failed() {
         let mut lane = LaneEscalation::new(Feed::Dhan);
-        lane.record(EscalationLeg::Spot, minute(0), false);
-        lane.record(EscalationLeg::Spot, minute(0), true);
-        lane.record(EscalationLeg::Spot, minute(0), false);
+        lane.record(EscalationLeg::Spot, minute(0), false, true);
+        lane.record(EscalationLeg::Spot, minute(0), true, true);
+        lane.record(EscalationLeg::Spot, minute(0), false, true);
         // Finalize: ok > 0 → not fully failed → None (no episode).
         assert_eq!(
-            lane.record(EscalationLeg::Spot, minute(1), false),
+            lane.record(EscalationLeg::Spot, minute(1), false, true),
             Some((minute(0), EdgeAction::None))
         );
     }
@@ -825,14 +846,17 @@ mod tests {
     #[test]
     fn test_stale_older_minute_outcome_is_ignored() {
         let mut lane = LaneEscalation::new(Feed::Dhan);
-        lane.record(EscalationLeg::Spot, minute(2), false);
+        lane.record(EscalationLeg::Spot, minute(2), false, true);
         // A late completion for an already-rolled minute neither counts
         // nor finalizes anything.
-        assert_eq!(lane.record(EscalationLeg::Spot, minute(1), true), None);
+        assert_eq!(
+            lane.record(EscalationLeg::Spot, minute(1), true, true),
+            None
+        );
         // The current bucket is untouched: rollover still finalizes
         // minute 2 as fully failed (attempts 1, ok 0).
         assert_eq!(
-            lane.record(EscalationLeg::Spot, minute(3), false),
+            lane.record(EscalationLeg::Spot, minute(3), false, true),
             Some((minute(2), EdgeAction::None))
         );
     }
@@ -840,13 +864,112 @@ mod tests {
     #[test]
     fn test_legs_are_independent() {
         let mut lane = LaneEscalation::new(Feed::Dhan);
-        lane.record(EscalationLeg::Spot, minute(0), false);
+        lane.record(EscalationLeg::Spot, minute(0), false, true);
         // A chain outcome for minute 1 must NOT finalize the spot bucket.
-        assert_eq!(lane.record(EscalationLeg::Chain, minute(1), true), None);
         assert_eq!(
-            lane.record(EscalationLeg::Spot, minute(1), true),
+            lane.record(EscalationLeg::Chain, minute(1), true, true),
+            None
+        );
+        assert_eq!(
+            lane.record(EscalationLeg::Spot, minute(1), true, true),
             Some((minute(0), EdgeAction::None))
         );
+    }
+
+    #[test]
+    fn test_groww_spot_edge_is_core_keyed_vix_ok_never_masks_core_all_failed() {
+        // Legacy contract: groww_spot_1m_boot.rs::MinuteEdgeTally (:386-416)
+        // keys the Groww spot escalation edge on the 3 CORE indices ONLY —
+        // core-all-failed pages even when INDIA VIX alone succeeded.
+        let mut lane = LaneEscalation::new(Feed::Groww);
+        let t = SPOT_1M_REST_CONSECUTIVE_FAIL_PAGE_THRESHOLD;
+        let mut paged = 0u32;
+        for i in 0..=t {
+            if let Some((_, EdgeAction::Page { consecutive })) =
+                lane.record(EscalationLeg::Spot, minute(i), false, true)
+            {
+                paged += 1;
+                assert_eq!(consecutive, t);
+                assert_eq!(i, t, "page fires when the t-th failed minute finalizes");
+            }
+            lane.record(EscalationLeg::Spot, minute(i), false, true);
+            lane.record(EscalationLeg::Spot, minute(i), false, true);
+            // INDIA VIX succeeds every minute — a structural no-op on the
+            // Groww spot tally (its ok=true must NOT keep ok >= 1).
+            assert_eq!(
+                lane.record(EscalationLeg::Spot, minute(i), true, false),
+                None,
+                "a VIX outcome never feeds the Groww spot tally"
+            );
+        }
+        assert_eq!(
+            paged, 1,
+            "core-all-failed pages even when VIX alone succeeded"
+        );
+    }
+
+    #[test]
+    fn test_groww_spot_vix_only_failed_minutes_never_count_or_finalize() {
+        // Legacy contract (groww_spot_1m_boot.rs + rest-1m §1-item-5): a
+        // VIX-only failure is non-edge; a VIX outcome must not even roll /
+        // finalize the core minute bucket.
+        let mut lane = LaneEscalation::new(Feed::Groww);
+        // Core minute 0 fails on all 3 targets.
+        for _ in 0..3 {
+            lane.record(EscalationLeg::Spot, minute(0), false, true);
+        }
+        // A VIX outcome for minute 1 arrives FIRST — excluded: it neither
+        // finalizes minute 0 nor opens minute 1.
+        assert_eq!(
+            lane.record(EscalationLeg::Spot, minute(1), false, false),
+            None
+        );
+        // The first CORE outcome of minute 1 is still the finalizer.
+        assert_eq!(
+            lane.record(EscalationLeg::Spot, minute(1), true, true),
+            Some((minute(0), EdgeAction::None))
+        );
+        // A long run of VIX-only failures (core all ok) never pages.
+        for i in 2..40u32 {
+            for _ in 0..3 {
+                if let Some((_, action)) = lane.record(EscalationLeg::Spot, minute(i), true, true) {
+                    assert_eq!(action, EdgeAction::None, "VIX-only failure never pages");
+                }
+            }
+            assert_eq!(
+                lane.record(EscalationLeg::Spot, minute(i), false, false),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn test_dhan_spot_edge_counts_all_four_sids_including_vix() {
+        // Legacy contract MIRRORED, not invented: the Dhan spot leg's
+        // `ok_count` sums ALL `SPOT_1M_REST_INDICES` arms (4 SIDs incl.
+        // INDIA VIX 21) into `minute_fully_failed`
+        // (spot_1m_rest_boot.rs :2363/:2553 → :3592) — so on the DHAN lane
+        // a VIX-only success keeps the minute NOT fully failed, and the
+        // `core` flag is deliberately ignored.
+        let mut lane = LaneEscalation::new(Feed::Dhan);
+        let t = SPOT_1M_REST_CONSECUTIVE_FAIL_PAGE_THRESHOLD;
+        for i in 0..=(t + 2) {
+            for _ in 0..3 {
+                if let Some((_, action)) = lane.record(EscalationLeg::Spot, minute(i), false, true)
+                {
+                    assert_eq!(
+                        action,
+                        EdgeAction::None,
+                        "a Dhan minute with a VIX-only success is never fully failed"
+                    );
+                }
+            }
+            // INDIA VIX succeeds — on the DHAN lane a non-core outcome COUNTS.
+            assert_eq!(
+                lane.record(EscalationLeg::Spot, minute(i), true, false),
+                None
+            );
+        }
     }
 
     const NS_T: u32 = tickvault_common::constants::SPOT_1M_REST_SID_NOT_SERVED_THRESHOLD;
@@ -1104,7 +1227,7 @@ mod tests {
             let mut ns_pages = 0u32;
             for i in 0..=NS_T {
                 if let Some((_, EdgeAction::Page { .. })) =
-                    lane.record(EscalationLeg::Spot, minute(i), false)
+                    lane.record(EscalationLeg::Spot, minute(i), false, true)
                 {
                     edge_pages += 1;
                 }

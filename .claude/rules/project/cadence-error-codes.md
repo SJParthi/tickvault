@@ -351,7 +351,12 @@ Dated factual notes on what the code/config does as of 2026-07-17:
   path via `crates/app/src/cadence_escalation.rs` (3 consecutive fully-failed
   minutes per lane/leg, minute-finalize-on-rollover — pages lag one minute;
   the session's last minute never finalizes; edge state is run-scoped). No new
-  NotificationEvent/ErrorCode/terraform surface.
+  NotificationEvent/ErrorCode/terraform surface. The Groww SPOT escalation
+  edge keys on the 3 CORE indices only — INDIA VIX outcomes are excluded
+  from its fully-failed tally (the legacy `groww_spot_1m_boot.rs`
+  `MinuteEdgeTally` / rest-1m §1-item-5 semantics: core-all-failed pages
+  even when VIX alone succeeded), while the Dhan spot edge stays
+  4-SID-keyed incl. VIX, mirroring its legacy `ok_count`.
 - Not-served pagers (fix round 2): the per-SID / per-underlying detectors run
   executor-side through the SAME `cadence_escalation.rs` minute buckets,
   REUSING the legacy trackers (`SidServedTracker` + both
