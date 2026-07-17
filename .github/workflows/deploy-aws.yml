@@ -15,7 +15,10 @@
 #   1. preflight job — skips entire workflow if AWS_ROLE_ARN / AWS_ACCESS_KEY_ID
 #      bootstrap secrets are absent (charter §C "100% no false-OK PR checks").
 #   2. guard_market_hours job — blocks deploy during 09:00-15:45 IST Mon-Fri
-#      unless workflow_dispatch with confirm_market_hours=yes.
+#      unless workflow_dispatch with confirm_market_hours=yes. Since
+#      2026-07-17 an in-window PUSH run defers GREEN (deploy_allowed=false,
+#      no-op; the 15:46 IST after-close cron delivers it) instead of dying
+#      red; an in-window dispatch without the override still fails red.
 #   3. concurrency.group serializes deploys; never two at once.
 #   4. Existing rollback path triggers on failed smoke test.
 #
@@ -312,8 +315,11 @@ jobs:
     runs-on: ubuntu-24.04
     needs: [preflight, build]
     if: needs.preflight.outputs.bootstrap_ready == 'true'
+    outputs:
+      deploy_allowed: ${{ steps.window.outputs.deploy_allowed }}
     steps:
       - name: Check current IST time against market window
+        id: window
         run: |
           # No-deploy band 09:00-15:45 IST = 03:30-10:15 UTC (operator lock
           # 2026-06-03: "only between 9 am till 3.45 pm it should not happen").
@@ -329,20 +335,51 @@ jobs:
           if [ "$UTC_DOW" -le 5 ] && [ "$UTC_TIME_NUM" -ge 330 ] && [ "$UTC_TIME_NUM" -lt 1015 ]; then
             if [ "${{ github.event.inputs.confirm_market_hours }}" = "yes" ]; then
               echo "WARNING: deploying during market hours with explicit override"
-            else
+            elif [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+              # An explicit human/dispatcher action asked for an in-window
+              # deploy WITHOUT the override — keep the loud red signal so the
+              # asker learns immediately that nothing was deployed.
               echo "BLOCK: deploying during 09:00-15:45 IST is forbidden without override."
               echo "Re-run with confirm_market_hours=yes if this is an emergency fix."
               exit 1
+            else
+              # ZERO-TOUCH FIX 2026-07-17 (operator mandate, relayed via the
+              # coordinator session): a push-triggered (merge) run inside the
+              # band previously died RED here — and postmerge-catchup.yml
+              # counts ANY run (any color) as coverage for the SHA, so prod
+              # ran stale code until a human dispatched manually. A push run
+              # cannot possibly carry the confirm_market_hours override, so
+              # red is not actionable feedback — it just masks the SHA.
+              # Defer GREEN instead: deploy_allowed=false skips the
+              # Deploy-to-EC2 job entirely (NOTHING is deployed — the
+              # 2026-06-03 lock's substance is unchanged), which leaves the
+              # B9 "Record deployed binary git SHA" step `skipped`, so
+              # deploy-aws-after-close.yml's 15:46 IST cron — which accepts
+              # as "last deployed" only runs whose B9 step actually executed
+              # — sees main != last-deployed and redeploys this commit right
+              # after the close. Nothing red, nothing manual, nothing stale
+              # past 15:46 IST.
+              echo "deploy_allowed=false" >> "$GITHUB_OUTPUT"
+              echo "::notice::Deploy of ${{ github.sha }} deferred: inside 09:00-15:45 IST market window; the after-close redeploy cron (15:46 IST, deploy-aws-after-close.yml) will deliver it. Immediate delivery remains available via workflow_dispatch with confirm_market_hours=yes."
+              exit 0
             fi
           else
             echo "OK: outside the 09:00-15:45 IST no-deploy band, deploy can proceed"
           fi
+          echo "deploy_allowed=true" >> "$GITHUB_OUTPUT"
 
   deploy:
     name: Deploy to EC2
     runs-on: ubuntu-24.04
     needs: [preflight, build, guard_market_hours]
-    if: needs.preflight.outputs.bootstrap_ready == 'true'
+    # deploy_allowed gate (2026-07-17): on an in-window PUSH run the guard now
+    # exits GREEN with deploy_allowed=false (deferred no-op) instead of red —
+    # this condition is what actually skips the deploy in that case. Every
+    # other path is unchanged: out-of-window and override runs emit
+    # deploy_allowed=true; an in-window dispatch WITHOUT the override still
+    # fails the guard job red, which skips this job via `needs` exactly as
+    # before.
+    if: needs.preflight.outputs.bootstrap_ready == 'true' && needs.guard_market_hours.outputs.deploy_allowed == 'true'
     environment: prod
     steps:
       - name: Checkout (for deploy scripts)

@@ -24,3 +24,32 @@ paths:
 
 ## Deep Reference
 Read `docs/standards/market-hours.md` ONLY when implementing time-dependent logic or SEBI compliance.
+
+## 2026-07-17 Update — deploy market-hours guard: red block → GREEN deferred no-op (push events only)
+
+The 2026-06-03 deploy market-hours lock (operator verbatim: *"only between 9 am
+till 3.45 pm it should not happen"* — the `guard_market_hours` job in
+`.github/workflows/deploy-aws.yml`, 09:00–15:45 IST = 03:30–10:15 UTC Mon–Fri;
+until today the lock had no dedicated rule file — it lived in the workflow
+comment + the ratchet `crates/common/tests/aws_infra_wiring.rs::test_deploy_aws_workflow_has_market_hours_guard`;
+this note is now its rule-file home) changes FAILURE MODE, not substance:
+
+- **The lock's substance is UNCHANGED:** nothing deploys inside the window
+  without the explicit `workflow_dispatch` + `confirm_market_hours=yes`
+  override. The deferred path deploys NOTHING (the Deploy-to-EC2 job is
+  skipped via the guard's new `deploy_allowed` output).
+- **What changed:** an in-window run for a NON-dispatch event (push to main —
+  a merge) now exits the guard GREEN as a deferred no-op (`deploy_allowed=false`
+  + a `::notice::` naming the deferred SHA) instead of `exit 1` red. An
+  in-window `workflow_dispatch` WITHOUT the override keeps the loud red
+  `exit 1` — an explicit human/dispatcher action gets honest failure feedback.
+- **Authority:** the operator's zero-touch mandate (relayed via the
+  coordinator session 2026-07-17). The failure it fixes: every market-hours
+  merge produced a red push-triggered deploy run, and `postmerge-catchup.yml`
+  counts ANY run (any color) as coverage for the SHA — so prod ran stale code
+  until someone manually dispatched. The deferred green run is provably picked
+  up by `deploy-aws-after-close.yml`'s 15:46 IST cron: its compare accepts as
+  "last deployed" only runs whose B9 "Record deployed binary git SHA" step
+  actually executed, and the skipped deploy job leaves that step `skipped`.
+- **Immediate in-window delivery** remains available ONLY via the loud
+  `workflow_dispatch` with `confirm_market_hours=yes` — kept by design.

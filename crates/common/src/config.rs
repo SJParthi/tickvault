@@ -160,6 +160,13 @@ pub struct ApplicationConfig {
     /// Absent section ⇒ DISABLED (fail-safe default off).
     #[serde(default)]
     pub tf_consistency: TfConsistencyConfig,
+    /// `[spot_crossverify]` — daily 15:47 IST Dhan↔Groww `spot_1m_rest`
+    /// cross-broker OHLC comparator (operator 2026-07-17). Compares stored
+    /// `feed='dhan'` vs `feed='groww'` IDX_I rows minute-by-minute; findings
+    /// land in `spot_crossverify_cell_audit` + `spot_crossverify_daily` + one
+    /// Telegram summary. Cold path only. Absent section ⇒ DISABLED.
+    #[serde(default)]
+    pub spot_crossverify: SpotCrossverifyConfig,
     /// `[rest_candle_fold]` — REST-era multi-TF candle derivation (operator
     /// directive 2026-07-16: *"why the fuck remaining candles 1m till 1day
     /// is not yet generated and populated — resolve these"*). Folds
@@ -969,6 +976,19 @@ pub struct TfConsistencyConfig {
     /// Master switch for the daily 15:40 IST timeframe-consistency
     /// verifier. Default OFF (fail-safe) — `config/base.toml` turns it on
     /// explicitly.
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+/// `[spot_crossverify]` — daily Dhan↔Groww `spot_1m_rest` cross-broker OHLC
+/// comparator (operator 2026-07-17; SPOT-XVERIFY-01/02). An absent
+/// `[spot_crossverify]` section (or a TOML written before this PR) disables
+/// the comparator entirely (fail-safe); `config/base.toml` explicitly sets
+/// `enabled = true`.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct SpotCrossverifyConfig {
+    /// Master switch for the daily 15:47 IST spot cross-broker comparator.
+    /// Default OFF (fail-safe) — `config/base.toml` turns it on explicitly.
     #[serde(default)]
     pub enabled: bool,
 }
@@ -4076,6 +4096,7 @@ mod tests {
             groww_option_chain_1m: GrowwOptionChain1mConfig::default(),
             groww_rest_burst: GrowwRestBurstConfig::default(),
             tf_consistency: TfConsistencyConfig::default(),
+            spot_crossverify: SpotCrossverifyConfig::default(),
             rest_candle_fold: RestCandleFoldConfig::default(),
             market_ram_store: MarketRamStoreConfig::default(),
             groww_contract_1m: GrowwContract1mConfig::default(),
@@ -5898,6 +5919,42 @@ mod tests {
             .extract()
             .expect("explicit enabled = true must round-trip");
         assert!(on.tf_consistency.enabled);
+    }
+
+    /// Daily spot cross-broker comparator (operator 2026-07-17): the
+    /// `[spot_crossverify]` section is fail-safe DEFAULT-OFF — via `Default`,
+    /// via a missing section, and via an empty section — and the explicit
+    /// base.toml opt-in round-trips.
+    #[test]
+    fn test_spot_crossverify_config_default_off_and_round_trip() {
+        use figment::Figment;
+        use figment::providers::{Format, Toml};
+
+        assert!(
+            !SpotCrossverifyConfig::default().enabled,
+            "spot_crossverify must default OFF (fail-safe; base.toml opts in)"
+        );
+
+        #[derive(Deserialize)]
+        struct Wrapper {
+            #[serde(default)]
+            spot_crossverify: SpotCrossverifyConfig,
+        }
+        let missing: Wrapper = Figment::new()
+            .merge(Toml::string("[other]\nx = 1\n"))
+            .extract()
+            .expect("missing [spot_crossverify] must default, not error");
+        assert!(!missing.spot_crossverify.enabled);
+        let empty: Wrapper = Figment::new()
+            .merge(Toml::string("[spot_crossverify]\n"))
+            .extract()
+            .expect("empty [spot_crossverify] must default, not error");
+        assert!(!empty.spot_crossverify.enabled);
+        let on: Wrapper = Figment::new()
+            .merge(Toml::string("[spot_crossverify]\nenabled = true\n"))
+            .extract()
+            .expect("explicit enabled = true must round-trip");
+        assert!(on.spot_crossverify.enabled);
     }
 
     /// Order runtime (2026-07-14, cluster A): the `[order_runtime]` section

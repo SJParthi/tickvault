@@ -631,6 +631,12 @@ warm_up = true
 [tf_consistency]
 enabled = true
 
+# Daily 15:47 IST Dhan↔Groww spot_1m_rest cross-broker OHLC comparator
+# (SPOT-XVERIFY-01/02, operator 2026-07-17). serde default is OFF; base.toml
+# opts in (the fail-safe shape).
+[spot_crossverify]
+enabled = true
+
 # ===========================================================================
 # Order runtime (dry-run) — cluster A, operator directive 2026-07-14
 # (.claude/plans/active-plan-order-runtime-dryrun.md). One supervised task

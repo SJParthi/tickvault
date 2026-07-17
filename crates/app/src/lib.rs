@@ -89,6 +89,7 @@ pub mod feed_scoreboard_boot;
 // recompute every higher-TF candle (2m..4h) from the stored 1m rows and
 // compare against the persisted TF tables — Dhan verifies TODAY, Groww
 // verifies the PREVIOUS trading day (TF-VERIFY-01/02).
+pub mod spot_crossverify_boot;
 pub mod tf_consistency_boot;
 pub mod tick_conservation_boot;
 // PR #8a (2026-05-19) — Slice 1: 09:15:00 IST `DayOhlcTracker::arm_sid()`
