@@ -437,6 +437,21 @@ fn reconcile_window_ok(secs_of_day: u32) -> bool {
         .contains(&secs_of_day)
 }
 
+/// 15:30 IST close-sweep gate: inside [15:30, 16:00) IST, once per IST day,
+/// TRADING DAYS ONLY — mirrors the reconcile scheduler's trading-day gate
+/// (E5 sibling): a weekend/holiday housekeeping tick must never fire the
+/// close sweep.
+fn close_sweep_due(
+    secs_of_day: u32,
+    today: i64,
+    last_sweep_day: i64,
+    is_trading_day: bool,
+) -> bool {
+    is_trading_day
+        && (TICK_PERSIST_END_SECS_OF_DAY_IST..DAILY_RESET_SECS_OF_DAY_IST).contains(&secs_of_day)
+        && last_sweep_day != today
+}
+
 /// Self-test window gate: [09:20, 15:00) IST (F17).
 fn self_test_window_ok(secs_of_day: u32) -> bool {
     (SELF_TEST_WINDOW_START_SECS_OF_DAY_IST..SELF_TEST_WINDOW_END_SECS_OF_DAY_IST)
@@ -873,6 +888,17 @@ async fn run_order_runtime(
         std::time::Instant::now() + Duration::from_secs(ORDER_RUNTIME_BOOT_RECONCILE_DELAY_SECS);
     let mut last_reset_epoch: i64 = i64::MIN;
     let mut last_close_sweep_day: i64 = i64::MIN;
+    // Fix F (2026-07-17 respawn flap): the mark producers are DAY-SCOPED —
+    // the Groww per-minute REST legs' supervisors exit at day completion
+    // ("day complete — supervisor exiting", ~15:31 IST after the
+    // post-session sweep) and drop the last MarkForwarder clones, CLOSING
+    // the mark mpsc for the rest of the process lifetime. That is a
+    // legitimate steady state, not a death — this flag disarms Arm 2 once
+    // the close is observed so the loop keeps running (pre-fix the arm
+    // `return`ed, and the supervisor's clean_exit respawn re-read the same
+    // closed channel instantly: a permanent flap that reset the paper book
+    // at every backoff step from 15:31 through post-close).
+    let mut mark_channel_open = true;
     let mut housekeeping = tokio::time::interval(Duration::from_secs(HOUSEKEEPING_TICK_SECS));
     housekeeping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -931,11 +957,19 @@ async fn run_order_runtime(
                 }
             }
 
-            // ---- Arm 2: marks (batch-drained, bounded) ----
-            mark = mark_rx.recv() => {
+            // ---- Arm 2: marks (batch-drained, bounded; disarmed after the
+            // day-scoped producers close the channel — Fix F) ----
+            mark = mark_rx.recv(), if mark_channel_open => {
                 let Some(first) = mark else {
-                    warn!("order runtime: mark channel closed");
-                    return;
+                    warn!(
+                        "order runtime: mark channel closed (day-scoped mark \
+                         producers finished) — mark arm disarmed; the runtime \
+                         stays live (order updates, reconcile, 15:30 sweep and \
+                         16:00 reset keep running; marks resume at the next \
+                         process boot)"
+                    );
+                    mark_channel_open = false;
+                    continue;
                 };
                 let mut processed = 0usize;
                 let mut next = Some(first);
@@ -984,10 +1018,14 @@ async fn run_order_runtime(
                 risk.evaluate_daily_loss_halt();
 
                 // 15:30 IST close sweep: cancel pending paper orders.
-                if (TICK_PERSIST_END_SECS_OF_DAY_IST..DAILY_RESET_SECS_OF_DAY_IST)
-                    .contains(&secs_of_day)
-                    && last_close_sweep_day != today
-                {
+                // Trading-day gated like the reconcile scheduler above —
+                // no weekend/holiday sweep firings (2026-07-17 audit, LOW).
+                if close_sweep_due(
+                    secs_of_day,
+                    today,
+                    last_close_sweep_day,
+                    ctx.calendar.is_trading_day_today(),
+                ) {
                     last_close_sweep_day = today;
                     market_close_sweep(&mut oms, &mut book).await;
                     republish_marks_wanted(&ctx.marks_wanted, &oms, &risk, &self_test);
@@ -2139,6 +2177,27 @@ mod tests {
         let t = 1_784_073_600_i64;
         assert_eq!(ist_secs_of_day(t), 19_800);
         assert_eq!(ist_day_number(t), 20_649);
+    }
+
+    #[test]
+    fn test_close_sweep_due_skips_non_trading_day() {
+        let in_window = TICK_PERSIST_END_SECS_OF_DAY_IST; // 15:30:00 IST
+        // In-window, un-latched, trading day → the sweep fires.
+        assert!(close_sweep_due(in_window, 100, i64::MIN, true));
+        // NON-trading day (weekend/holiday) → NEVER fires, even in-window
+        // with the once-per-day latch un-armed (the 2026-07-17 audit gap).
+        assert!(!close_sweep_due(in_window, 100, i64::MIN, false));
+        assert!(!close_sweep_due(in_window + 60, 100, 99, false));
+        // Already swept today → latched off.
+        assert!(!close_sweep_due(in_window, 100, 100, true));
+        // Outside [15:30, 16:00) IST → not due.
+        assert!(!close_sweep_due(in_window - 1, 100, i64::MIN, true));
+        assert!(!close_sweep_due(
+            DAILY_RESET_SECS_OF_DAY_IST,
+            100,
+            i64::MIN,
+            true
+        ));
     }
 
     // -------------------------------------------------------------------
