@@ -29,6 +29,11 @@
 // cosmetic markdown-rendering nicety with zero runtime/behavior impact.
 #![allow(clippy::doc_lazy_continuation)]
 #![allow(clippy::doc_overindented_list_items)]
+// Match the lib.rs restriction-lint blanket for the binary crate root:
+// no unwrap/expect/print/dbg in production code.
+#![cfg_attr(not(test), deny(clippy::unwrap_used))]
+#![cfg_attr(not(test), deny(clippy::expect_used))]
+#![deny(clippy::print_stdout, clippy::print_stderr, clippy::dbg_macro)]
 
 // Modules are declared in lib.rs for coverage instrumentation.
 use tickvault_app::boot_helpers::{
@@ -336,6 +341,8 @@ async fn main() -> Result<()> {
     // rustls 0.23+ requires an explicit CryptoProvider. Both tokio-tungstenite
     // (WSS to Dhan) and reqwest (HTTPS to Dhan REST) depend on rustls.
     // Using aws-lc-rs as the provider (already in the dependency tree).
+    // APPROVED: bootstrap — TLS mandatory, install cannot fail-soft
+    #[allow(clippy::expect_used)]
     rustls::crypto::aws_lc_rs::default_provider()
         .install_default()
         .expect("failed to install rustls CryptoProvider — cannot proceed without TLS"); // APPROVED: bootstrap — TLS mandatory, failure is fatal
@@ -1653,6 +1660,16 @@ async fn main() -> Result<()> {
         &notifier,
     );
 
+    // Post-close Dhan↔Groww spot_1m_rest cross-broker OHLC comparator
+    // (SPOT-XVERIFY-01/02) — PROCESS-GLOBAL, config-gated (`[spot_crossverify]
+    // enabled`), 15:47 IST, DEDUP-idempotent. See
+    // `spot_crossverify_boot::spawn_spot_crossverify_tasks`.
+    tickvault_app::spot_crossverify_boot::spawn_spot_crossverify_tasks(
+        &config,
+        &trading_calendar,
+        &notifier,
+    );
+
     // Judge-locked cadence scheduler — PROCESS-GLOBAL like the verifier
     // above (2026-07-14): per-minute chain + spot fire timing with
     // structural zero-429 gates, failure ladder, and event-driven dry-run
@@ -2776,6 +2793,58 @@ async fn build_shared_infra(
 
     // --- Health registry (drives /health + /api/feeds/health) ---
     let health_status: SharedHealthStatus = std::sync::Arc::new(SystemHealthStatus::new());
+
+    // BOOT-03 (Wave-2-C Item 7.3): clock-skew boot gate. Wall-clock drift
+    // vs a trusted source (chronyc PRIMARY, QuestDB now() FALLBACK) that
+    // exceeds CLOCK_SKEW_HALT_THRESHOLD_SECS can silently split/merge trading
+    // days in QuestDB DEDUP keys — so HALT boot. Runs on every boot path
+    // before the seal-writer starts. QuestDB is up by here (ensure_infra_running
+    // above). A probe that CANNOT run (no chrony + QuestDB unreachable) degrades
+    // and PROCEEDS — a dev box without chrony must still boot (per
+    // test_enforce_clock_skew_at_boot_unavailable_does_not_halt).
+    match infra::enforce_clock_skew_at_boot(
+        &config.questdb,
+        tickvault_common::constants::CLOCK_SKEW_HALT_THRESHOLD_SECS,
+    )
+    .await
+    {
+        Ok(sample) => {
+            info!(
+                skew_secs = sample.skew_secs,
+                source = sample.source,
+                "BOOT-03: clock-skew gate passed"
+            );
+        }
+        Err(infra::ClockSkewError::ThresholdExceeded {
+            skew_secs,
+            threshold_secs,
+            source,
+        }) => {
+            error!(
+                code = tickvault_common::error_code::ErrorCode::Boot03ClockSkewExceeded.code_str(),
+                skew_secs,
+                threshold_secs,
+                source,
+                "BOOT-03: wall-clock skew exceeds threshold — REFUSING BOOT"
+            );
+            notifier.notify(NotificationEvent::BootClockSkewExceeded {
+                skew_secs,
+                threshold_secs,
+                source: source.to_string(),
+            });
+            return Err(anyhow::anyhow!(
+                "BOOT-03 clock skew {skew_secs:+.3}s exceeds threshold {threshold_secs:.2}s"
+            ));
+        }
+        Err(unavailable) => {
+            // Both probes failed (no chrony + QuestDB now() unreachable) —
+            // degrade, do NOT halt. Dev boxes without chrony still boot.
+            warn!(
+                error = %unavailable,
+                "BOOT-03: clock-skew probe unavailable — proceeding without the gate"
+            );
+        }
+    }
 
     // --- Seal-writer (installs the process-wide global_seal_sender) ---
     spawn_seal_writer_loop(&config.questdb);
