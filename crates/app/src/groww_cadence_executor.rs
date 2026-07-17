@@ -286,9 +286,6 @@ impl GrowwCadenceExecutor {
 impl CadenceExecutor for GrowwCadenceExecutor {
     // TEST-EXEMPT: live-HTTP orchestration — every decision leg (identity map, deadline math, failure taxonomy, fold-after-ACK ordering) is a pure fn / source-order ratchet unit-tested below; the HTTP inner is the tested legacy fetch fn.
     async fn fetch_spot(&self, req: SpotFetchRequest) -> Result<SpotSnapshot, CadenceFetchError> {
-        // The per-fire liveness heartbeat (feeds the market-hours-liveness
-        // alarm) — set at FIRE time like the legacy leg, success or not.
-        metrics::gauge!("tv_rest_1m_fire_heartbeat").set(1.0);
         let trading_date = today_ist();
         let Some(target) = Self::spot_target_for(req.target, trading_date) else {
             // Unresolved VIX (counted above) — an honest Empty, never a
@@ -450,6 +447,15 @@ impl CadenceExecutor for GrowwCadenceExecutor {
         };
         let close_to_data_ms =
             (ist_millis_of_day_now() - (i64::from(req.cycle_minute_ist) + 60) * 1000).max(0);
+        // The per-fire liveness heartbeat (feeds the market-hours-liveness
+        // alarm) — success-gated (fix round 2026-07-17): set ONLY after a
+        // successful vendor fetch carrying the target row. An all-failing
+        // session must leave the gauge unset so
+        // tv-<env>-market-hours-liveness-missing pages (~09:25 IST);
+        // mid-session death after first success remains the pre-existing
+        // documented residual. Never pre-registered at boot: the first
+        // in-session set IS the signal.
+        metrics::gauge!("tv_rest_1m_fire_heartbeat").set(1.0);
         // Persist → flush ACK → fold handoff (STRICT ordering: an
         // unpersisted bar must never derive candles — the fold contract).
         let flush_ok = {
@@ -1158,9 +1164,11 @@ mod tests {
         );
     }
 
-    /// Source-order ratchet: the per-fire liveness heartbeat is set at
-    /// the TOP of `fetch_spot`, BEFORE the identity lookup — success or
-    /// not, every fire feeds the market-hours-liveness alarm.
+    /// Source-order ratchet, SUCCESS-GATED since the 2026-07-17 fix
+    /// round: the liveness heartbeat is set ONLY after a successful
+    /// vendor fetch carrying the target row — an all-failing session
+    /// must leave the gauge unset so the market-hours-liveness alarm
+    /// pages, never a fire-time false-green.
     #[test]
     fn test_groww_cadence_spot_fire_sets_rest_1m_heartbeat_gauge() {
         let src = include_str!("groww_cadence_executor.rs");
@@ -1170,11 +1178,15 @@ mod tests {
         let prod = src.split(marker).next().unwrap_or_default();
         let fetch_pos = prod.find("async fn fetch_spot").unwrap_or_default();
         let heartbeat_pos = prod.find("tv_rest_1m_fire_heartbeat").unwrap_or_default();
-        let identity_pos = prod.find("Self::spot_target_for(").unwrap_or_default();
-        assert!(fetch_pos > 0 && heartbeat_pos > 0 && identity_pos > 0);
+        let empty_pos = prod
+            .find("return Err(CadenceFetchError::Empty);")
+            .unwrap_or_default();
+        let persist_pos = prod.find("// Persist → flush ACK").unwrap_or_default();
+        assert!(fetch_pos > 0 && heartbeat_pos > 0 && empty_pos > 0 && persist_pos > 0);
         assert!(
-            fetch_pos < heartbeat_pos && heartbeat_pos < identity_pos,
-            "the heartbeat gauge must be the first act of fetch_spot"
+            fetch_pos < heartbeat_pos && empty_pos < heartbeat_pos && heartbeat_pos < persist_pos,
+            "the heartbeat gauge must be success-gated: inside fetch_spot, \
+             after the failure branches, before the persist leg"
         );
     }
 }

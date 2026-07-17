@@ -230,11 +230,6 @@ impl DhanCadenceExecutor {
 impl CadenceExecutor for DhanCadenceExecutor {
     // TEST-EXEMPT: live-HTTP orchestration — every decision leg (identity map, deadline math, failure taxonomy, fold-after-ACK ordering) is a pure fn / source-order ratchet unit-tested below; the HTTP inner is the tested unpaced fn.
     async fn fetch_spot(&self, req: SpotFetchRequest) -> Result<SpotSnapshot, CadenceFetchError> {
-        // The per-fire liveness heartbeat (feeds the market-hours-liveness
-        // alarm) — set at FIRE time like the legacy leg, success or not;
-        // deliberately never pre-registered at boot: the first in-session
-        // set IS the signal.
-        metrics::gauge!("tv_rest_1m_fire_heartbeat").set(1.0);
         let Some((security_id, symbol)) = dhan_spot_identity(req.target) else {
             // Unreachable for the pinned 4-target enum — never a panic.
             return Err(CadenceFetchError::Malformed);
@@ -356,6 +351,15 @@ impl CadenceExecutor for DhanCadenceExecutor {
         };
         let close_to_data_ms =
             (ist_millis_of_day_now() - (i64::from(req.cycle_minute_ist) + 60) * 1000).max(0);
+        // The per-fire liveness heartbeat (feeds the market-hours-liveness
+        // alarm) — success-gated (fix round 2026-07-17): set ONLY after a
+        // successful vendor fetch carrying the target row. An all-failing
+        // session must leave the gauge unset so
+        // tv-<env>-market-hours-liveness-missing pages (~09:25 IST);
+        // mid-session death after first success remains the pre-existing
+        // documented residual. Never pre-registered at boot: the first
+        // in-session set IS the signal.
+        metrics::gauge!("tv_rest_1m_fire_heartbeat").set(1.0);
         // Persist → flush ACK → fold handoff (STRICT ordering: an
         // unpersisted bar must never derive candles — the fold contract).
         let flush_ok = {
@@ -976,10 +980,12 @@ mod tests {
 
     #[test]
     fn test_cadence_spot_fire_sets_rest_1m_heartbeat_gauge() {
-        // Deliverable-4 pin: the cadence spot fire path sets the
-        // tv_rest_1m_fire_heartbeat gauge (the market-hours-liveness
-        // alarm's per-fire liveness signal) at FIRE time — before any
-        // fetch outcome branch.
+        // Deliverable-4 pin, SUCCESS-GATED since the 2026-07-17 fix
+        // round: the tv_rest_1m_fire_heartbeat gauge (the
+        // market-hours-liveness alarm's liveness signal) is set ONLY
+        // after a successful vendor fetch carrying the target row — an
+        // all-failing session must leave the gauge unset so the alarm
+        // pages (~09:25 IST), never a fire-time false-green.
         let src = include_str!("dhan_cadence_executor.rs");
         let prod = src.split("#[cfg(test)]").next().unwrap_or_default();
         let fetch_spot_pos = prod
@@ -992,12 +998,19 @@ mod tests {
             hb_pos > fetch_spot_pos,
             "heartbeat is set inside fetch_spot"
         );
-        let identity_pos = prod
-            .find("dhan_spot_identity(req.target)")
-            .expect("identity lookup present");
+        // Success-gated: AFTER the empty-target failure branch (the last
+        // fetch-outcome return before the success path) and BEFORE the
+        // persist leg — i.e. exactly at the successful-fetch point.
+        let empty_pos = prod
+            .find("return Err(CadenceFetchError::Empty);")
+            .expect("empty-target branch present");
+        let persist_pos = prod
+            .find("// Persist → flush ACK")
+            .expect("persist ordering comment present");
         assert!(
-            hb_pos < identity_pos,
-            "heartbeat is set at fire time, before any outcome branch"
+            empty_pos < hb_pos && hb_pos < persist_pos,
+            "heartbeat must be success-gated: after the empty-target \
+             branch, before the persist leg (never fire-time)"
         );
     }
 }
