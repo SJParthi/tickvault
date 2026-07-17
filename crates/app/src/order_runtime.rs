@@ -437,6 +437,21 @@ fn reconcile_window_ok(secs_of_day: u32) -> bool {
         .contains(&secs_of_day)
 }
 
+/// 15:30 IST close-sweep gate: inside [15:30, 16:00) IST, once per IST day,
+/// TRADING DAYS ONLY — mirrors the reconcile scheduler's trading-day gate
+/// (E5 sibling): a weekend/holiday housekeeping tick must never fire the
+/// close sweep.
+fn close_sweep_due(
+    secs_of_day: u32,
+    today: i64,
+    last_sweep_day: i64,
+    is_trading_day: bool,
+) -> bool {
+    is_trading_day
+        && (TICK_PERSIST_END_SECS_OF_DAY_IST..DAILY_RESET_SECS_OF_DAY_IST).contains(&secs_of_day)
+        && last_sweep_day != today
+}
+
 /// Self-test window gate: [09:20, 15:00) IST (F17).
 fn self_test_window_ok(secs_of_day: u32) -> bool {
     (SELF_TEST_WINDOW_START_SECS_OF_DAY_IST..SELF_TEST_WINDOW_END_SECS_OF_DAY_IST)
@@ -984,10 +999,14 @@ async fn run_order_runtime(
                 risk.evaluate_daily_loss_halt();
 
                 // 15:30 IST close sweep: cancel pending paper orders.
-                if (TICK_PERSIST_END_SECS_OF_DAY_IST..DAILY_RESET_SECS_OF_DAY_IST)
-                    .contains(&secs_of_day)
-                    && last_close_sweep_day != today
-                {
+                // Trading-day gated like the reconcile scheduler above —
+                // no weekend/holiday sweep firings (2026-07-17 audit, LOW).
+                if close_sweep_due(
+                    secs_of_day,
+                    today,
+                    last_close_sweep_day,
+                    ctx.calendar.is_trading_day_today(),
+                ) {
                     last_close_sweep_day = today;
                     market_close_sweep(&mut oms, &mut book).await;
                     republish_marks_wanted(&ctx.marks_wanted, &oms, &risk, &self_test);
@@ -2139,6 +2158,27 @@ mod tests {
         let t = 1_784_073_600_i64;
         assert_eq!(ist_secs_of_day(t), 19_800);
         assert_eq!(ist_day_number(t), 20_649);
+    }
+
+    #[test]
+    fn test_close_sweep_due_skips_non_trading_day() {
+        let in_window = TICK_PERSIST_END_SECS_OF_DAY_IST; // 15:30:00 IST
+        // In-window, un-latched, trading day → the sweep fires.
+        assert!(close_sweep_due(in_window, 100, i64::MIN, true));
+        // NON-trading day (weekend/holiday) → NEVER fires, even in-window
+        // with the once-per-day latch un-armed (the 2026-07-17 audit gap).
+        assert!(!close_sweep_due(in_window, 100, i64::MIN, false));
+        assert!(!close_sweep_due(in_window + 60, 100, 99, false));
+        // Already swept today → latched off.
+        assert!(!close_sweep_due(in_window, 100, 100, true));
+        // Outside [15:30, 16:00) IST → not due.
+        assert!(!close_sweep_due(in_window - 1, 100, i64::MIN, true));
+        assert!(!close_sweep_due(
+            DAILY_RESET_SECS_OF_DAY_IST,
+            100,
+            i64::MIN,
+            true
+        ));
     }
 
     // -------------------------------------------------------------------
