@@ -1647,6 +1647,24 @@ async fn main() -> Result<()> {
         order_runtime_mark_forwarder,
     );
 
+    // Groww order/position PUSH channel — Stage D (operator-authorized
+    // paper-mode receive-only build, 2026-07-17): the supervised
+    // NATS-over-WS push runner fanning full-fidelity order events into the
+    // bounded order_audit sink. Gated BOTH on the non-default
+    // `groww_orders` cargo feature (§39.2 Gate 2 — a default build carries
+    // no Groww order code) AND the runtime `[groww_orders]
+    // order_push_enabled` flag (Gate 1, default OFF).
+    #[cfg(feature = "groww_orders")]
+    {
+        if config.groww_orders.order_push_enabled {
+            tickvault_app::groww_order_observability::spawn_groww_order_push(&config.questdb);
+        } else {
+            info!(
+                "groww order push disabled (config) — receive-only order/position channel not spawned"
+            );
+        }
+    }
+
     // Daily 15:40 IST timeframe-consistency verifier — PROCESS-GLOBAL like
     // the conservation audit + scoreboard above (operator 2026-07-13):
     // recompute every higher-TF candle (2m..4h) from the stored 1m rows and

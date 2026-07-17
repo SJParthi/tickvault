@@ -4126,10 +4126,12 @@ name = "tickvault-trading"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "aws-lc-rs",
  "chrono",
  "chrono-tz",
  "criterion",
  "dhat",
+ "futures-util",
  "governor",
  "loom",
  "metrics",
@@ -4145,6 +4147,7 @@ dependencies = [
  "tickvault-common",
  "tickvault-core",
  "tokio",
+ "tokio-tungstenite",
  "toml 1.1.2+spec-1.1.0",
  "tracing",
  "uuid",
