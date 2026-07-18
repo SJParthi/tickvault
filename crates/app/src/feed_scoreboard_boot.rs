@@ -62,12 +62,10 @@ use tickvault_storage::feed_episode_audit_persistence::{
     FeedEpisodeAuditRow, FeedEpisodeAuditWriter, ensure_feed_episode_audit_table,
 };
 use tickvault_storage::feed_scoreboard_persistence::{
-    CoverageSource, FeedCoverageDailyRow, FeedScoreboardDailyRow, FeedScoreboardWriter,
-    LAG_FLOOR_MS_DHAN, LAG_FLOOR_MS_GROWW, SCOREBOARD_SESSION_MINUTES,
-    SCOREBOARD_UNAVAILABLE_SENTINEL, ScoreboardOutcome, ensure_feed_scoreboard_tables,
+    CoverageSource, FeedScoreboardDailyRow, FeedScoreboardWriter, LAG_FLOOR_MS_DHAN,
+    LAG_FLOOR_MS_GROWW, SCOREBOARD_SESSION_MINUTES, SCOREBOARD_UNAVAILABLE_SENTINEL,
+    ScoreboardOutcome, ensure_feed_scoreboard_tables,
 };
-
-use tickvault_core::pipeline::feed_presence::{FeedPresenceTotals, PresenceDrain, SlotCoverage};
 
 use crate::tick_conservation_boot::parse_questdb_count;
 
@@ -1044,128 +1042,15 @@ pub fn apply_minute_overlap_and_feed_off_sentinels(
     }
 }
 
-/// Step 5d (scoreboard PR-D): fold one day's drained presence-registry
-/// coverage into the per-feed numbers — flipping `unique_win_minutes` /
-/// `both_minutes` from the SQL minute-set approximation to REAL
-/// per-instrument tick presence and filling the per-instrument columns
-/// (`mapped_instruments` / `unmapped_instruments` /
-/// `covered_instrument_minutes`). `coverage_source` stamps `in_memory`
-/// when the registry covered the full session, `mixed` on a mid-day
-/// restart or late registration (the pre-restart / pre-registration
-/// window is invisible to the registry — the restart-day partial floor
-/// already stamps such a day partial).
-///
-/// **The feed-level unique_win/both flip is GATED on
-/// `covers_full_session`** (PR-D review round 1, HIGH): on a restart day
-/// the two feeds' registries recover the pre-restart window through
-/// DIFFERENT mechanisms (Dhan WAL re-injection vs Groww NDJSON re-tail /
-/// offset-resume) — a cross-feed ASYMMETRIC window whose recovered
-/// minutes would fabricate "unique wins" for whichever feed replayed
-/// more. The step-5c SQL minute sets (same [09:15, 15:30) window, read
-/// from the durable full-day `ticks` table) are symmetric and strictly
-/// more complete on such a day, so they STAND on `mixed` days; only the
-/// per-instrument OWN-feed columns (mapped/unmapped/covered) take the
-/// registry's partial measurement.
-///
-/// The feed-off discipline is PRESERVED and now matches this doc (PR-D
-/// review round 1, LOW): a feed-off feed's OWN row is untouched (its
-/// registry measured nothing — a 'measured' coverage_source label on it
-/// would be a false-OK), and a feed whose PARTNER was off keeps the `-1`
-/// comparison sentinels (exclusive-vs-nothing is not a measurement —
-/// round 5, 2026-07-10). Pure.
-pub fn apply_presence_coverage(
-    feed_numbers: &mut BTreeMap<&'static str, FeedDayNumbers>,
-    drain: &PresenceDrain,
-    feed_off: &BTreeMap<&'static str, bool>,
-) {
-    let source = if drain.covers_full_session {
-        CoverageSource::InMemory
-    } else {
-        CoverageSource::Mixed
-    };
-    let totals: [(&str, &FeedPresenceTotals); 2] = [("dhan", &drain.dhan), ("groww", &drain.groww)];
-    for (label, t) in totals {
-        if feed_off.get(label).copied().unwrap_or(false) {
-            // The OFF feed's own row is untouched — its registry measured
-            // nothing for the day; stamping 'in_memory'/'mixed' zeros on
-            // it would present an un-measurement as a measurement.
-            continue;
-        }
-        let Some(n) = feed_numbers.get_mut(label) else {
-            continue;
-        };
-        n.mapped_instruments = t.mapped_instruments;
-        n.unmapped_instruments = t.unmapped_instruments;
-        n.covered_instrument_minutes = t.covered_instrument_minutes;
-        n.coverage_source = source;
-        let partner = if label == "dhan" { "groww" } else { "dhan" };
-        if feed_off.get(partner).copied().unwrap_or(false) {
-            // Partner off — the comparison sentinels stand.
-            n.unique_win_minutes = SCOREBOARD_UNAVAILABLE_SENTINEL;
-            n.both_minutes = SCOREBOARD_UNAVAILABLE_SENTINEL;
-        } else if drain.covers_full_session {
-            n.unique_win_minutes = t.unique_win_minutes;
-            n.both_minutes = t.both_minutes;
-        }
-        // else: mixed — the symmetric full-day SQL minute-set values
-        // stamped by step 5c stand for the two comparison columns.
-    }
-}
-
-/// PR-D fix round 1 (review HIGH): a HALF-REGISTERED registry must never
-/// persist a one-sided verdict. Returns the label of a feed whose drained
-/// union is EMPTY (zero streaming minutes) while the hot fold PROVABLY saw
-/// that feed's ticks this session (`unregistered_folds > 0`) — i.e. the
-/// feed streamed but its registration never landed (the init-ordering /
-/// CSV-retry-ladder class). The caller then DISCARDS the whole drain
-/// (keeping the SQL minute-set approximation for the day) with a coded
-/// SCOREBOARD-01 log — never a fabricated "partner won every minute" row.
-/// Pure.
-#[must_use]
-pub fn presence_drain_one_sided_feed(d: &PresenceDrain) -> Option<&'static str> {
-    [("dhan", &d.dhan), ("groww", &d.groww)]
-        .into_iter()
-        .find(|(_, t)| t.streaming_minutes == 0 && t.unregistered_folds > 0)
-        .map(|(label, _)| label)
-}
-
-/// Step 8b (scoreboard PR-D): build the per-instrument
-/// `feed_coverage_daily` rows from one day's drained slots. `feed` column:
-/// `'cross'` for mapped pairs, `'dhan'`/`'groww'` for singletons; singleton
-/// comparison columns carry the drain's `-1` sentinels. Pure.
-#[must_use]
-pub fn build_coverage_detail_rows(
-    slots: &[SlotCoverage],
-    ts_ist_nanos: i64,
-    trading_date_ist_nanos: i64,
-    covers_full_session: bool,
-    row_partial: bool,
-) -> Vec<FeedCoverageDailyRow> {
-    slots
-        .iter()
-        .map(|slot| FeedCoverageDailyRow {
-            ts_ist_nanos,
-            trading_date_ist_nanos,
-            security_id: slot.canonical_security_id,
-            exchange_segment: slot.segment_label.to_string(),
-            feed: if slot.mapped {
-                "cross".to_string()
-            } else if slot.dhan_registered {
-                "dhan".to_string()
-            } else {
-                "groww".to_string()
-            },
-            symbol_name: slot.symbol.clone(),
-            dhan_minutes: slot.dhan_minutes,
-            groww_minutes: slot.groww_minutes,
-            dhan_only_minutes: slot.dhan_only_minutes,
-            groww_only_minutes: slot.groww_only_minutes,
-            both_minutes: slot.both_minutes,
-            mapped: slot.mapped,
-            partial_coverage: row_partial || !covers_full_session,
-        })
-        .collect()
-}
+// Scoreboard PR-D presence-coverage fold — RETIRED 2026-07-18 (stage-4
+// dead-producer sweep): `apply_presence_coverage`,
+// `presence_drain_one_sided_feed` and `build_coverage_detail_rows` were
+// deleted with the in-memory presence registry
+// (crates/core/src/pipeline/feed_presence.rs) — producer-less since the
+// live feeds retired (Dhan 2026-07-13, Groww 2026-07-15). The
+// `coverage_source` schema, the rank table and the 6d coverage keep-better
+// survive so historical `in_memory`/`mixed` rows stay protected; new runs
+// stamp the honest `sql_backfill` approximation.
 
 /// Per-feed episode tally from the day's `feed_episode_audit` rows.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -3582,83 +3467,14 @@ pub async fn run_feed_scoreboard(
     //     month verdict's headline sum).
     apply_minute_overlap_and_feed_off_sentinels(&mut feed_numbers, &minute_sets, &feed_off);
 
-    // 5d. Per-instrument presence drain (scoreboard PR-D): on SAME-DAY runs
-    //     the in-memory presence registry (fed by the hot-path folds at the
-    //     same sites as the lag rings) supplies REAL per-instrument
-    //     coverage — the feed-level unique_win/both flip from the SQL
-    //     minute-set approximation to registry truth, and the
-    //     mapped/unmapped/covered columns fill in. `None` (fold disabled /
-    //     fresh post-close process / past-day backfill) keeps the SQL
-    //     numbers + sentinels, honestly — and the coverage keep-better
-    //     (6d) protects a measured existing row from being erased.
-    //     The drain is **flagged O(slots × 12 words)** — cold, once here.
-    let presence = if is_same_day_run {
-        tickvault_core::pipeline::feed_presence::drain_day(target_ist_day)
-    } else {
-        None
-    };
-    // PR-D fix round 1 (review HIGH): refuse a ONE-SIDED drain — a feed
-    // whose union is empty while its unregistered-fold counter proves it
-    // streamed this session never got its registration (init-ordering /
-    // CSV-retry-ladder class). Persisting that drain would fabricate a
-    // "partner won every minute" verdict; discard it and let the SQL
-    // minute-set approximation stand for the day.
-    let presence = presence.and_then(|d| {
-        if let Some(feed) = presence_drain_one_sided_feed(&d) {
-            error!(
-                code = ErrorCode::Scoreboard01AggregationDegraded.code_str(),
-                stage = "presence_one_sided",
-                feed,
-                unregistered_folds = if feed == "dhan" {
-                    d.dhan.unregistered_folds
-                } else {
-                    d.groww.unregistered_folds
-                },
-                "SCOREBOARD-01: presence registry is one-sided — {feed} \
-                 streamed ticks this session but its registration never \
-                 landed (empty union + unregistered folds). Discarding the \
-                 drain; the SQL minute-set approximation stands for the day."
-            );
-            None
-        } else {
-            Some(d)
-        }
-    });
-    if let Some(ref d) = presence {
-        apply_presence_coverage(&mut feed_numbers, d, &feed_off);
-        // Rule 11: unmapped instruments + unregistered folds are NAMED /
-        // counted, never silently dropped. Bounded sample of unmapped
-        // symbols (≤ 20) so a vendor-master pairing drift is diagnosable
-        // from the day's logs.
-        let unmapped_sample: Vec<&str> = d
-            .slots
-            .iter()
-            .filter(|slot| !slot.mapped)
-            .take(20)
-            .map(|slot| slot.symbol.as_str())
-            .collect();
-        info!(
-            dhan_mapped = d.dhan.mapped_instruments,
-            dhan_unmapped = d.dhan.unmapped_instruments,
-            groww_mapped = d.groww.mapped_instruments,
-            groww_unmapped = d.groww.unmapped_instruments,
-            dhan_unregistered_folds = d.dhan.unregistered_folds,
-            groww_unregistered_folds = d.groww.unregistered_folds,
-            covers_full_session = d.covers_full_session,
-            ?unmapped_sample,
-            "feed_scoreboard: presence registry drained — per-instrument \
-             coverage is registry truth this run"
-        );
-        if d.overflow_dropped > 0 {
-            error!(
-                code = ErrorCode::Scoreboard01AggregationDegraded.code_str(),
-                stage = "presence_overflow",
-                overflow_dropped = d.overflow_dropped,
-                "SCOREBOARD-01: presence slot table overflowed this session — \
-                 per-instrument coverage is a floor, not a truth"
-            );
-        }
-    }
+    // 5d. Per-instrument presence drain — RETIRED 2026-07-18 (stage-4
+    //     dead-producer sweep): the in-memory presence registry was deleted
+    //     (zero record/register producers on the REST-only runtime), so
+    //     there is no drain. The coverage path degrades HONESTLY to the
+    //     step-5c SQL minute-set approximation — `coverage_source` stays
+    //     `sql_backfill` ("`None` ... keeps the SQL numbers + sentinels,
+    //     honestly") and the 6d coverage keep-better still protects
+    //     historical registry-derived rows from lower-ranked reruns.
 
     // 6. Fold the episode tallies in (when the aggregate answered).
     if let Some(ref tallies) = tallies {
@@ -3746,13 +3562,11 @@ pub async fn run_feed_scoreboard(
     let existing_coverage: Option<BTreeMap<String, ExistingDailyCoverage>> = existing_daily_body
         .as_deref()
         .and_then(parse_existing_daily_coverage);
-    let mut coverage_kept_existing = false;
     for feed in tickvault_common::feed::Feed::ALL {
         let label = feed.as_str();
         if let Some(n) = feed_numbers.get_mut(label) {
             let existing = existing_coverage.as_ref().and_then(|m| m.get(label));
             if fold_existing_coverage_keep_better(n, existing) {
-                coverage_kept_existing = true;
                 error!(
                     code = ErrorCode::Scoreboard01AggregationDegraded.code_str(),
                     stage = "coverage_regression",
@@ -4060,52 +3874,18 @@ pub async fn run_feed_scoreboard(
     //     clobber the 15:45 run's real per-instrument rows at the same
     //     DEDUP key (and, on a one-lane re-registration, ADD phantom
     //     singleton rows under a flipped feed key).
-    if coverage_detail_rows && coverage_kept_existing && presence.is_some() {
+    // 8b. Per-instrument `feed_coverage_daily` detail rows — RETIRED
+    //     2026-07-18 (stage-4 dead-producer sweep): the presence registry
+    //     (their ONLY source) is deleted, so no detail row can ever be
+    //     built again. The `[scoreboard] coverage_detail_rows` config gate
+    //     is inert (logged below); the table + storage writer stay for the
+    //     historical rows (SEBI/forensic — trackA table policy).
+    if coverage_detail_rows {
         info!(
-            "feed_scoreboard: per-instrument coverage detail rows SKIPPED — \
-             this run's drain is lower-fidelity than the day's existing row \
-             (6d coverage keep-better fired); the existing detail rows stand"
+            "feed_scoreboard: per-instrument coverage detail rows retired \
+             2026-07-18 (presence registry deleted) — the config gate is \
+             inert; coverage_source degrades to sql_backfill"
         );
-    }
-    if coverage_detail_rows
-        && !coverage_kept_existing
-        && let Some(ref d) = presence
-    {
-        let rows = build_coverage_detail_rows(
-            &d.slots,
-            row_ts_ist_nanos,
-            trading_date_ist_nanos,
-            d.covers_full_session,
-            row_partial,
-        );
-        let mut appended = 0usize;
-        for row in &rows {
-            if let Err(err) = writer.append_coverage_row(row) {
-                error!(
-                    code = ErrorCode::Scoreboard01AggregationDegraded.code_str(),
-                    stage = "coverage_append",
-                    security_id = row.security_id,
-                    ?err,
-                    "SCOREBOARD-01: coverage detail row append failed"
-                );
-            } else {
-                appended += 1;
-            }
-        }
-        if let Err(err) = writer.flush() {
-            error!(
-                code = ErrorCode::Scoreboard01AggregationDegraded.code_str(),
-                stage = "coverage_flush",
-                ?err,
-                "SCOREBOARD-01: coverage detail rows flush failed (QuestDB \
-                 down?) — the DEDUP-idempotent re-run backfills"
-            );
-        } else {
-            info!(
-                rows = appended,
-                "feed_scoreboard: per-instrument coverage detail rows written"
-            );
-        }
     }
 
     metrics::counter!("tv_feed_scoreboard_runs_total", "outcome" => outcome.as_str()).increment(1);
@@ -6603,170 +6383,6 @@ mod tests {
         assert!(scoreboard_trigger_after_auto_stop(58_500), "16:15:00");
         assert!(scoreboard_trigger_after_auto_stop(61_200), "17:00");
         assert_eq!(SCOREBOARD_TRIGGER_AUTO_STOP_WARN_SECS, 58_500);
-    }
-
-    // ---- Scoreboard PR-D: presence-registry coverage integration ----
-
-    fn presence_drain_fixture(covers_full_session: bool) -> PresenceDrain {
-        let slot = |sid: i64, mapped: bool, d: i64, g: i64, d_only: i64, g_only: i64, both: i64| {
-            SlotCoverage {
-                canonical_security_id: sid,
-                segment_label: "NSE_EQ",
-                symbol: format!("S{sid}"),
-                mapped,
-                dhan_registered: true,
-                groww_registered: mapped,
-                dhan_minutes: d,
-                groww_minutes: g,
-                dhan_only_minutes: d_only,
-                groww_only_minutes: g_only,
-                both_minutes: both,
-            }
-        };
-        PresenceDrain {
-            slots: vec![
-                slot(2885, true, 370, 372, 3, 5, 367),
-                slot(777, false, 12, 0, -1, -1, -1),
-            ],
-            dhan: FeedPresenceTotals {
-                registered_instruments: 2,
-                mapped_instruments: 1,
-                unmapped_instruments: 1,
-                covered_instrument_minutes: 382,
-                streaming_minutes: 373,
-                unique_win_minutes: 4,
-                both_minutes: 369,
-                unregistered_folds: 0,
-            },
-            groww: FeedPresenceTotals {
-                registered_instruments: 1,
-                mapped_instruments: 1,
-                unmapped_instruments: 0,
-                covered_instrument_minutes: 372,
-                streaming_minutes: 372,
-                unique_win_minutes: 3,
-                both_minutes: 369,
-                unregistered_folds: 7,
-            },
-            covers_full_session,
-            overflow_dropped: 0,
-        }
-    }
-
-    #[test]
-    fn test_apply_presence_coverage_flips_to_registry_truth() {
-        let mut nums: BTreeMap<&'static str, FeedDayNumbers> = BTreeMap::new();
-        nums.insert("dhan", FeedDayNumbers::unavailable());
-        nums.insert("groww", FeedDayNumbers::unavailable());
-        // SQL minute sets said something else — registry truth must win.
-        if let Some(n) = nums.get_mut("dhan") {
-            n.unique_win_minutes = 99;
-        }
-        let both_on: BTreeMap<&'static str, bool> =
-            [("dhan", false), ("groww", false)].into_iter().collect();
-        apply_presence_coverage(&mut nums, &presence_drain_fixture(true), &both_on);
-        let d = nums["dhan"];
-        assert_eq!(d.unique_win_minutes, 4);
-        assert_eq!(d.both_minutes, 369);
-        assert_eq!(d.mapped_instruments, 1);
-        assert_eq!(d.unmapped_instruments, 1);
-        assert_eq!(d.covered_instrument_minutes, 382);
-        assert_eq!(d.coverage_source, CoverageSource::InMemory);
-        assert_eq!(nums["groww"].unique_win_minutes, 3);
-    }
-
-    #[test]
-    fn test_apply_presence_coverage_mixed_day_keeps_sql_unique_win_both() {
-        // PR-D fix round 1 (review HIGH): on a partial-session drain
-        // ('mixed' — mid-day restart / late registration) the registry
-        // window is cross-feed ASYMMETRIC (WAL re-injection vs NDJSON
-        // re-tail), so the feed-level unique_win/both flip is REFUSED —
-        // the symmetric full-day step-5c SQL values stand; only the
-        // per-instrument own-feed columns take the registry measurement.
-        let mut nums: BTreeMap<&'static str, FeedDayNumbers> = BTreeMap::new();
-        nums.insert("dhan", FeedDayNumbers::unavailable());
-        nums.insert("groww", FeedDayNumbers::unavailable());
-        if let Some(n) = nums.get_mut("dhan") {
-            n.unique_win_minutes = 99; // the step-5c SQL value
-            n.both_minutes = 200;
-        }
-        let both_on: BTreeMap<&'static str, bool> =
-            [("dhan", false), ("groww", false)].into_iter().collect();
-        apply_presence_coverage(&mut nums, &presence_drain_fixture(false), &both_on);
-        let d = nums["dhan"];
-        assert_eq!(d.coverage_source, CoverageSource::Mixed);
-        assert_eq!(d.unique_win_minutes, 99, "SQL value stands on mixed");
-        assert_eq!(d.both_minutes, 200, "SQL value stands on mixed");
-        // The own-feed per-instrument columns still take the (partial)
-        // registry measurement.
-        assert_eq!(d.mapped_instruments, 1);
-        assert_eq!(d.covered_instrument_minutes, 382);
-    }
-
-    #[test]
-    fn test_presence_drain_one_sided_feed_detection() {
-        // PR-D fix round 1 (review HIGH): a feed with an EMPTY union that
-        // provably streamed (unregistered folds) marks the drain one-sided.
-        let mut d = presence_drain_fixture(true);
-        assert_eq!(presence_drain_one_sided_feed(&d), None, "healthy drain");
-        d.dhan.streaming_minutes = 0;
-        d.dhan.unregistered_folds = 12_345;
-        assert_eq!(presence_drain_one_sided_feed(&d), Some("dhan"));
-        // A genuinely silent feed (zero union, zero folds) is NOT
-        // one-sided — "the partner won" is then a real measurement.
-        d.dhan.unregistered_folds = 0;
-        assert_eq!(presence_drain_one_sided_feed(&d), None);
-        // And the Groww side mirrors.
-        let mut d = presence_drain_fixture(true);
-        d.groww.streaming_minutes = 0;
-        d.groww.unregistered_folds = 1;
-        assert_eq!(presence_drain_one_sided_feed(&d), Some("groww"));
-    }
-
-    #[test]
-    fn test_apply_presence_coverage_respects_partner_feed_off_sentinels() {
-        // Round-5 lesson preserved: exclusive-vs-nothing is not a
-        // measurement — the surviving feed keeps the -1 comparison
-        // sentinels even when the registry measured minutes.
-        let mut nums: BTreeMap<&'static str, FeedDayNumbers> = BTreeMap::new();
-        nums.insert("dhan", FeedDayNumbers::unavailable());
-        nums.insert("groww", FeedDayNumbers::unavailable());
-        let groww_off: BTreeMap<&'static str, bool> =
-            [("dhan", false), ("groww", true)].into_iter().collect();
-        apply_presence_coverage(&mut nums, &presence_drain_fixture(true), &groww_off);
-        assert_eq!(
-            nums["dhan"].unique_win_minutes, SCOREBOARD_UNAVAILABLE_SENTINEL,
-            "partner off — no competitive win"
-        );
-        assert_eq!(nums["dhan"].both_minutes, SCOREBOARD_UNAVAILABLE_SENTINEL);
-        // The per-instrument OWN-feed columns still carry the measurement.
-        assert_eq!(nums["dhan"].covered_instrument_minutes, 382);
-        // PR-D fix round 1 (review LOW — the doc/code mismatch): the OFF
-        // feed's OWN row is genuinely untouched — no registry zeros, no
-        // 'in_memory' stamp on a day its registry measured nothing.
-        assert_eq!(nums["groww"], FeedDayNumbers::unavailable());
-    }
-
-    #[test]
-    fn test_build_coverage_detail_rows_feed_labels_and_partial_flag() {
-        let d = presence_drain_fixture(true);
-        let rows = build_coverage_detail_rows(&d.slots, 1_000, 500, true, false);
-        assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].feed, "cross");
-        assert!(rows[0].mapped);
-        assert_eq!(rows[0].dhan_only_minutes, 3);
-        assert_eq!(rows[0].both_minutes, 367);
-        assert!(!rows[0].partial_coverage);
-        // Dhan-only singleton: feed='dhan', sentinel comparison columns.
-        assert_eq!(rows[1].feed, "dhan");
-        assert!(!rows[1].mapped);
-        assert_eq!(rows[1].dhan_only_minutes, -1);
-        // A partial-session registry stamps every row partial.
-        let rows = build_coverage_detail_rows(&d.slots, 1_000, 500, false, false);
-        assert!(rows.iter().all(|r| r.partial_coverage));
-        // A partial RUN stamps them too.
-        let rows = build_coverage_detail_rows(&d.slots, 1_000, 500, true, true);
-        assert!(rows.iter().all(|r| r.partial_coverage));
     }
 
     #[test]

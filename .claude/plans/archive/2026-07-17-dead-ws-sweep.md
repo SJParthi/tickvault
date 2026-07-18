@@ -1,12 +1,14 @@
-# Implementation Plan: Dead Live-WS Deletion Sweep — Stages 1+2 (zero-wiring modules; the dead tick chain)
+# Implementation Plan: Dead Live-WS Deletion Sweep — Stages 1+2+3 (zero-wiring modules; the dead tick chain; the publisher-less tick aggregator)
 
 **Status:** APPROVED
 **Date:** 2026-07-17
 **Approved by:** operator directive 2026-07-17 via coordinator (dead live-WS
 deletion sweep; stage 1 = the zero-wiring slice of the recon's PR sequencing,
-stage 2 = the dead Dhan TICK CHAIN per the coordinator's stage-2 dispatch;
-recon manifests: `recon-dead-ws.md` + `recon-feed-separation.md`, session
-scratchpad, main @ 2a97fac)
+stage 2 = the dead Dhan TICK CHAIN per the coordinator's stage-2 dispatch,
+stage 3 = the publisher-less 21-TF TICK aggregator + main.rs drivers per the
+coordinator's stage-3 dispatch (base = main @ 0f5aa760, stages 1 #1625 + 2
+#1631 merged); recon manifests: `recon-dead-ws.md` +
+`recon-feed-separation.md`, session scratchpad, main @ 2a97fac)
 
 ## Design
 
@@ -77,6 +79,43 @@ consumers in main.rs + feed_scoreboard_boot.rs); `parser/` binary half +
 retirement for dead tick monitors (`tv_ticks_dropped_total` etc.) is
 DEFERRED to the dashboard PR.
 
+### Stage 3 — the publisher-less 21-TF TICK aggregator (branch `claude/dead-ws-sweep-3`)
+
+Stage 3 deletes the tick-consuming 21-TF aggregator and its main.rs driver
+tasks — with both live feeds retired (Dhan 2026-07-13, Groww 2026-07-15) no
+tick publisher exists; the ONLY seal producer is `rest_candle_fold`
+(FOLD-01) feeding `global_seal_sender()` directly. Touched crates:
+**tickvault-trading** (`src/candles`), **tickvault-app** (`src/main.rs`,
+`src/lib.rs`, `src/boot_helpers.rs`, `src/tf_consistency_boot.rs`,
+`src/seal_routing.rs` deleted), **tickvault-storage** (test deletion only —
+`aggregator_lag_loud_guard.rs`), **tickvault-common** (TEST-file edits only —
+`cloudwatch_app_alarms_wiring.rs`, `aws_infra_wiring.rs`; NO src edits, NO
+ErrorCode deletions), plus deploy/ terraform + agent configs + the
+grafana-cloud dashboard JSON.
+
+Deleted production modules (4): trading `aggregator_cell.rs`,
+`heartbeat.rs`, `multi_tf_aggregator.rs`; app `seal_routing.rs` — with
+`LiveCandleState` EXTRACTED to its own surviving module
+(`live_candle_state.rs`, load-bearing as the `BufferedSeal` payload for the
+PROTECTED storage seal chain). main.rs: `spawn_engine_b_aggregator` (~505
+lines — per-tick consume + Task 3 midnight force-seal + Task 3b close-time
+force-seal + Task 4 watermark catch-up + heartbeat) deleted;
+`build_shared_infra` narrowed. Dead-monitor lockstep retirement: the
+`boundary_catchup_storm_dhan` alarm + window-gate entry (gate 4→3) +
+dashboard widgets/ARN + the second [host,feed] EMF declaration + the 2 dead
+main-list EMF names (`tv_aggregator_seals_emitted_total`,
+`tv_aggregator_close_pct_nonzero_total`; selector 19→17 names) — all with
+dated tf notes + aws-budget COST NOTE (stage-3, ≈ −$0.70/mo). ErrorCode
+variants RETAINED (AggregatorLate01, Boundary01CatchupSeal,
+AggregatorHb01Heartbeat, AggregatorLag01TickLagDropped) with factual
+EMIT-SITES-DELETED banners in `wave-6-error-codes.md`; AGGREGATOR-DROP-01 /
+AGGREGATOR-SEAL-01 untouched (live fold-path emit sites). PROTECTED and
+untouched: the storage seal chain, `rest_candle_fold.rs`,
+`ws_frame_spill.rs`, `order_update_connection.rs`, the Groww push subtree,
+the AGGREGATOR-DROP-01 errcode alarm + seal-drop counter alarm. Cluster D
+(feed_lag/feed_presence + their IST-midnight resets) DEFERRED to its own
+stage (resets must be RELOCATED, not deleted).
+
 ## Edge Cases
 
 - A deleted module re-exported symbols (`BarCache`, `CompactBar`,
@@ -105,6 +144,24 @@ DEFERRED to the dashboard PR.
 - Stage 2: ci.yml DHAT drift list AND per-crate `--test` steps AND the
   expected-count asserts (core 11→9; storage step retired at 0 targets)
   all updated in lockstep — any one alone fails CI loudly.
+- Stage 3: `LiveCandleState` is a deleted-module's struct but a LIVE
+  `BufferedSeal` payload — extracted to `live_candle_state.rs` instead of
+  deleted (the PROTECTED seal chain + rest_candle_fold keep compiling
+  unchanged).
+- Stage 3: the d2_stage2_hoist_guard negative pin uses the paren-suffixed
+  needle `spawn_engine_b_aggregator(` so the retirement comments in main.rs
+  cannot self-trip the scan.
+- Stage 3: `GROWW_CATCHUP_MARGIN_SECS` (tf_consistency_boot.rs) lost its
+  aggregator-side twin const — frozen locally at the historical value 60
+  with its own pin test (the tf-verify tail-carve-out semantics are
+  unchanged).
+- Stage 3: the silent-feed-alarms.tf OUTPUT still referenced the deleted
+  boundary-catchup resource — fixed in the same slice (terraform would
+  otherwise fail to plan).
+- Stage 3: EMF selector name-count pin (19→17) + alarm-count pin (11→10) +
+  the drift-guard union test all updated in lockstep with the agent-config
+  edits (reference cloudwatch-agent.json stays byte-in-sync with
+  user-data.sh.tftpl).
 
 ## Failure Modes
 
@@ -140,6 +197,13 @@ DEFERRED to the dashboard PR.
   common src untouched, but the edited guards must be run).
 - Stage 2 hooks: banned-pattern scanner + plan-gate + per-item
   guarantee-check all PASS before push.
+- Stage 3 scoped suites: `cargo test -p tickvault-trading`,
+  `cargo test -p tickvault-app`, `cargo test -p tickvault-storage`, PLUS
+  `cargo test -p tickvault-common` (its TEST files were edited —
+  cloudwatch_app_alarms_wiring / aws_infra_wiring; common src untouched).
+- Stage 3 hooks: fmt + clippy + banned-pattern scanner + plan-gate +
+  per-item guarantee-check + test-count baseline correction (pre-approved
+  for deletion sweeps) all PASS before push.
 
 ## Rollback
 
@@ -183,6 +247,16 @@ counter in main.rs are all untouched.
 - [x] Stage 2: truthful guard tombstones/re-points + counter-catalog truth-sync
   - Files: crates/storage/tests/dedup_segment_meta_guard.rs, crates/storage/tests/zero_tick_loss_alert_guard.rs, crates/storage/tests/price_2dp_guard.rs, crates/storage/tests/o1_per_feed_doc_guard.rs, crates/storage/tests/live_feed_purity_guard.rs, crates/core/tests/chaos_cascade_triple_failure.rs, crates/app/tests/wave_2c_item7_boot_race_and_clock_skew.rs, crates/common/tests/price_precision_wiring.rs, crates/common/tests/metrics_catalog.rs, crates/common/tests/bench_budget_elements_guard.rs, crates/app/src/tick_conservation_boot.rs
   - Tests: scoped crate suites (storage/core/app/common)
+
+- [x] Stage 3: delete the tick aggregator modules + extract LiveCandleState + main.rs driver surgery
+  - Files: crates/trading/src/candles/aggregator_cell.rs, crates/trading/src/candles/heartbeat.rs, crates/trading/src/candles/multi_tf_aggregator.rs, crates/trading/src/candles/live_candle_state.rs, crates/trading/src/candles/mod.rs, crates/trading/src/candles/pct_stamping.rs, crates/trading/src/candles/tf_index.rs, crates/app/src/main.rs, crates/app/src/lib.rs, crates/app/src/seal_routing.rs, crates/app/src/boot_helpers.rs, crates/app/src/tf_consistency_boot.rs
+  - Tests: cargo check + scoped crate suites (deletion — no new production tests; the GROWW_CATCHUP_MARGIN_SECS freeze pin added)
+- [x] Stage 3: delete dead aggregator tests/dhat + re-pin surviving guards + ci.yml DHAT lane
+  - Files: crates/trading/tests/groww_one_candle_engine_golden.rs, crates/trading/tests/dhat_multi_tf_consume_tick.rs, crates/trading/tests/aggregator_daily_universe_scale_guard.rs, crates/trading/tests/seal_no_fetch_guard.rs, crates/app/tests/aggregation_task_wiring_guard.rs, crates/app/tests/close_pct_realtime_proof_guard.rs, crates/app/tests/seal_routing_convergence_guard.rs, crates/app/tests/d2_stage2_hoist_guard.rs, crates/app/tests/per_feed_boot_isolation_guard.rs, crates/storage/tests/aggregator_lag_loud_guard.rs, .github/workflows/ci.yml
+  - Tests: scoped crate suites; ci.yml DHAT count 2→1 in lockstep
+- [x] Stage 3: dead-monitor lockstep retirement (terraform + EMF + dashboards + docs + cost note)
+  - Files: deploy/aws/terraform/silent-feed-alarms.tf, deploy/aws/terraform/market-hours-liveness-alarm.tf, deploy/aws/terraform/dashboard.tf, deploy/aws/terraform/app-alarms.tf, deploy/aws/terraform/user-data.sh.tftpl, deploy/aws/cloudwatch-agent.json, deploy/grafana-cloud/tickvault-operator-dashboard.json, crates/common/tests/cloudwatch_app_alarms_wiring.rs, crates/common/tests/aws_infra_wiring.rs, .claude/rules/project/wave-6-error-codes.md, .claude/rules/project/aws-budget.md
+  - Tests: cloudwatch_app_alarms_wiring (15 passed), aws_infra_wiring (35 passed)
 
 ## Per-Item Guarantee Matrix
 

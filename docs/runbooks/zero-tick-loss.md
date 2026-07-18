@@ -1,5 +1,8 @@
 # Runbook — Zero-tick-loss breach
 
+> **⚠ RETIRED 2026-07-18 (stage-4 dead-producer sweep):** the tick ring→spill→DLQ chain this runbook pages on (`tick_persistence.rs`) was DELETED in the stage-2 dead-WS sweep (2026-07-17) — the runtime is REST-only and nothing writes the `ticks` table anymore. The `tv_spill_dropped_total` / `tv_dlq_ticks_total` / `tv_ticks_dropped_total` metrics have ZERO emit sites and their CloudWatch alarms were deleted from `app-alarms.tf` (2026-07-18). The candle-side seal chain keeps its own pagers (seal-drop-alarm.tf + AGGREGATOR-DROP-01). Content below retained as historical audit.
+
+
 **When it fires:** `TicksDropped`, `TickBufferActive`,
 `TickDiskSpillActive`, `TickDataLoss`, `STORAGE-GAP-01`,
 `BroadcastLagTickLoss`, `WebSocketBackpressure`.
@@ -138,20 +141,25 @@ is full. Causes:
 
 - tick_processor stuck on a slow ILP write — fix QuestDB pressure
 - tick_processor panicked — restart the app
-- Channel capacity misconfigured — check `TICK_BUFFER_CAPACITY` (must
-  be ≥ 100_000 per `zero_tick_loss_alert_guard`)
+- Channel capacity misconfigured — _(historical: `TICK_BUFFER_CAPACITY` +
+  its `zero_tick_loss_alert_guard` were deleted 2026-07-18 with the tick
+  rescue ring; the live bound is `SEAL_BUFFER_CAPACITY` = 200_000, ratcheted
+  in `crates/trading/src/candles/seal_ring.rs`)_
 
 ## Never do these
 
 - **Never delete `data/spill/*.bin` without draining them first.** The
   files represent ticks not yet in QuestDB. Deleting = SEBI violation.
-- **Never lower `TICK_BUFFER_CAPACITY` below 100K.** The
-  `zero_tick_loss_alert_guard` blocks this at the unit-test level.
-- **Never disable the tick-loss early-warning alerts.** Since the
-  CloudWatch-only migration (#O3, 2026-05-20) these are AWS CloudWatch
-  Alarms over the same `tv_tick_buffer_size` / `tv_spill_*` metrics; the
-  `zero_tick_loss_alert_guard` now pins that those metrics are still
-  EMITTED — build fails if the emission is removed.
+- **Never lower `SEAL_BUFFER_CAPACITY` below 200K.** The seal_ring.rs
+  lib ratchet (`test_seal_buffer_capacity_constant_is_locked_value`) blocks
+  this at the unit-test level _(2026-07-18: re-pointed from the deleted
+  tick-ring constant + guard)_.
+- **Never disable the loss pagers.** Today these are the AGGREGATOR-DROP-01
+  routes — the `tv-<env>-errcode-aggregator-drop-01` log-filter alarm + the
+  `tv-<env>-seal-writer-dropped` counter alarm — pinned by
+  `seal_drop_paging_wiring_guard.rs` _(2026-07-18: the tick-side alarms +
+  the `zero_tick_loss_alert_guard` emission pins were deleted with the dead
+  tick chain, stage-4 sweep)_.
 
 ## Preventive measures
 
@@ -169,10 +177,12 @@ is full. Causes:
   Groww 2026-07-15); nothing writes the `ticks` table anymore. The
   candle-side absorption chain (seal ring → spill → DLQ) lives on in the
   seal/shadow writers and is what this runbook's tiers map to today.
-- `crates/common/src/constants.rs` — `TICK_BUFFER_CAPACITY`
-- `crates/storage/tests/zero_tick_loss_alert_guard.rs` — pinned invariants
-  (post #O3 it pins metric emission; the Prometheus alert-rule assertions +
-  `tickvault-alerts.yml` were retired in the CloudWatch-only migration)
+- `crates/trading/src/candles/seal_ring.rs` — `SEAL_BUFFER_CAPACITY` +
+  its lib ratchets _(2026-07-18: `TICK_BUFFER_CAPACITY` was deleted from
+  constants.rs with the tick rescue ring)_
+- `zero_tick_loss_alert_guard` — DELETED 2026-07-18 (stage-4 dead-producer
+  sweep) with the tick rescue ring; its role is covered by the seal_ring.rs
+  ratchets + the AGGREGATOR-DROP-01 pagers
 - `scripts/auto-fix-clear-spill.sh` — drain helper
 - CloudWatch operator-health dashboard — the buffer/spill/DLQ tiers (the
   local Grafana `operator-health.json` panels 8/9/10 were retired in #O1,

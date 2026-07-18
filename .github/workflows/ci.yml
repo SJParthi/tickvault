@@ -463,7 +463,7 @@ jobs:
           set -euo pipefail
           cargo llvm-cov clean --workspace
           # DHAT zero-alloc tests (dhat_instrument_registry / dhat_token_handle /
-          # dhat_feed_lag_ring) assert EXACT heap-allocation counts. Under
+          # dhat_moneyness) assert EXACT heap-allocation counts. Under
           # llvm-cov the coverage instrumentation ITSELF adds allocations, so
           # those assertions fail (exit 101) and abort the whole coverage run —
           # this is why "Coverage & Perf" was RED on main for days and never
@@ -682,14 +682,11 @@ jobs:
           crates/app/tests/dhat_mark_forward.rs
           crates/core/tests/dhat_allocation.rs
           crates/core/tests/dhat_cadence_decide.rs
-          crates/core/tests/dhat_feed_lag_ring.rs
-          crates/core/tests/dhat_feed_presence.rs
           crates/core/tests/dhat_instrument_registry.rs
           crates/core/tests/dhat_moneyness.rs
           crates/core/tests/dhat_telegram_dispatcher.rs
           crates/core/tests/dhat_token_handle.rs
           crates/core/tests/dhat_ws_reader_zero_alloc.rs
-          crates/trading/tests/dhat_multi_tf_consume_tick.rs
           crates/trading/tests/dhat_risk_engine.rs
           EOF
           )
@@ -733,8 +730,6 @@ jobs:
           cargo test -p tickvault-core --features dhat \
             --test dhat_allocation \
             --test dhat_cadence_decide \
-            --test dhat_feed_lag_ring \
-            --test dhat_feed_presence \
             --test dhat_instrument_registry \
             --test dhat_moneyness \
             --test dhat_telegram_dispatcher \
@@ -761,8 +756,12 @@ jobs:
           # adds dhat_cadence_decide: 10 -> 11.
           # 2026-07-17 (stage-2 dead-WS sweep): dhat_feed_consumer +
           # dhat_prev_close_writer deleted with the dead tick chain: 11 -> 9.
-          if [ "$ran" -ne 9 ]; then
-            echo "::error::core DHAT step executed $ran targets, expected 9 — a --test flag was dropped from this step (drift list vs run step mismatch)."
+          # 2026-07-17 (dashboard tidy): dhat_feed_lag_ring deleted with the
+          # Dhan-lag publisher chain (run_dhan_lag_publisher/FeedLagRing): 9 -> 8.
+          # 2026-07-18 (stage-4 dead-producer sweep): dhat_feed_presence
+          # deleted with the producer-less presence registry: 8 -> 7.
+          if [ "$ran" -ne 7 ]; then
+            echo "::error::core DHAT step executed $ran targets, expected 7 — a --test flag was dropped from this step (drift list vs run step mismatch)."
             exit 1
           fi
 
@@ -778,9 +777,10 @@ jobs:
         run: |
           set -euo pipefail
           # dhat_bar_cache_lookup DELETED with the dead in_mem::bar_cache
-          # module (dead live-WS sweep stage 1, 2026-07-17) — target count 3→2.
+          # module (dead live-WS sweep stage 1, 2026-07-17); dhat_multi_tf_
+          # consume_tick DELETED with the tick aggregator (stage-3 sweep,
+          # 2026-07-17) — target count 3→2→1.
           cargo test -p tickvault-trading \
-            --test dhat_multi_tf_consume_tick \
             --test dhat_risk_engine \
             2>&1 | tee /tmp/dhat-trading.log
           if grep -q 'running 0 tests' /tmp/dhat-trading.log; then
@@ -788,8 +788,8 @@ jobs:
             exit 1
           fi
           ran=$(grep -c 'Running.*tests/dhat_' /tmp/dhat-trading.log || true)
-          if [ "$ran" -ne 2 ]; then
-            echo "::error::trading DHAT step executed $ran targets, expected 2 — a --test flag was dropped from this step."
+          if [ "$ran" -ne 1 ]; then
+            echo "::error::trading DHAT step executed $ran targets, expected 1 — a --test flag was dropped from this step."
             exit 1
           fi
 

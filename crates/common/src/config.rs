@@ -409,12 +409,17 @@ pub struct ScoreboardConfig {
     #[serde(default = "default_scoreboard_enabled")]
     pub telegram_enabled: bool,
     /// Populate the per-instrument `feed_coverage_daily` detail rows
-    /// (~1.5K/day). Consumed by PR-4 (presence registry); the table +
-    /// flag ship in PR-A so the config surface is stable.
+    /// (~1.5K/day). INERT since 2026-07-18 (stage-4 dead-producer sweep):
+    /// the presence registry — the rows' only source — was deleted, so no
+    /// detail row can be built; the field is retained so existing config
+    /// files keep parsing (the table + historical rows stay).
     #[serde(default = "default_scoreboard_enabled")]
     pub coverage_detail_rows: bool,
-    /// Hot-path per-tick presence fold (PR-4). `false` ⇒ coverage via SQL
-    /// totals only; per-instrument unique-wins "unavailable".
+    /// Hot-path per-tick presence fold. INERT since 2026-07-18 (stage-4
+    /// dead-producer sweep): the presence registry was deleted (its
+    /// record/register producers died with the live feeds), so nothing
+    /// reads this flag anymore; retained so existing config files keep
+    /// parsing. Coverage is the SQL approximation (`sql_backfill`).
     #[serde(default = "default_scoreboard_enabled")]
     pub presence_fold_enabled: bool,
     /// Groww exchange→receipt lag histogram fold (PR-3). Until it ships,
