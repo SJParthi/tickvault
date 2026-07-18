@@ -56,7 +56,7 @@ use lambda_runtime::Error;
 use serde_json::{Value, json};
 use tracing::{error, info, warn};
 
-pub const TELEGRAM_API_BASE: &str = "https://api.telegram.org";
+pub const TELEGRAM_API_BASE: &str = "https://api.telegram.org"; // APPROVED: infrastructure constant — the Telegram Bot API base (Lambda-side, python webhook parity)
 pub const TELEGRAM_TIMEOUT_SECONDS: u64 = 8;
 
 /// Warm-container duplicate-OK guard (judge contract, robustness graft):
@@ -618,7 +618,7 @@ where
         // Cheap rate-limit cushion. Telegram allows ~30 msg/sec per bot;
         // if 5+ alarms fire in the same SNS batch we don't want to flirt
         // with their throttle. Python parity: `time.sleep(0.05)`.
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::time::sleep(Duration::from_millis(50)).await; // APPROVED: python-parity throttle cushion (time.sleep(0.05)) — cold Lambda path, not the tick hot path
     }
     json!({"sent": sent, "failures": failures, "records": records_len})
 }

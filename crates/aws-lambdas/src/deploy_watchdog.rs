@@ -72,7 +72,7 @@ const MISMATCH_METRIC_NAMESPACE: &str = "Tickvault/Prod";
 const MISMATCH_METRIC_NAME: &str = "tv_binary_main_sha_mismatch";
 const MISMATCH_METRIC_HOST: &str = "tickvault-prod";
 
-const GITHUB_API_BASE: &str = "https://api.github.com";
+const GITHUB_API_BASE: &str = "https://api.github.com"; // APPROVED: infrastructure constant — the GitHub REST API base (Lambda-side, python watchdog parity)
 const GITHUB_TIMEOUT_SECONDS: u64 = 10;
 
 // ------------------------------------------------------------------------
