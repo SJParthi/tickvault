@@ -619,7 +619,7 @@ pub fn build_static_query(params: &Map<String, Value>) -> String {
 /// Injected dependencies — the Python monkeypatch seams (`_control_secret`
 /// and `_invoke_back`) made explicit. The live impl is [`LiveDeps`];
 /// tests inject fakes.
-#[allow(async_fn_in_trait)] // Send-ness resolves at the concrete call sites
+#[allow(async_fn_in_trait)] // APPROVED: handler is generic over the trait (no dyn); futures awaited inline, so Send-ness resolves at the concrete call sites.
 pub trait FrontDeps {
     /// Python `_control_secret()` — SSM runtime read, 60s cache,
     /// fail-closed to `""` on any error.
@@ -898,7 +898,8 @@ pub async fn handle_core<D: FrontDeps>(event: &Value, now_epoch: i128, deps: &mu
 static SECRET_CACHE: Mutex<Option<(String, Instant)>> = Mutex::new(None);
 
 /// Python `_SECRET_TTL_SECS = 60.0`.
-const SECRET_TTL: Duration = Duration::from_secs(60);
+const SECRET_TTL_SECS: u64 = 60;
+const SECRET_TTL: Duration = Duration::from_secs(SECRET_TTL_SECS);
 
 /// The live dependency set — real SSM + Lambda clients. UNPROVEN until
 /// deploy: both legs run only in a live Lambda invoke; the pure logic they
