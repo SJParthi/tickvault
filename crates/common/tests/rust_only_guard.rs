@@ -76,7 +76,6 @@ const TRACKED_PY_ALLOWLIST: &[&str] = &[
     ".claude/skills/dhanhq/scripts/validate_order.py",
     "deploy/aws/lambda/budget-killswitch/handler.py",
     "deploy/aws/lambda/budget-killswitch/test_handler.py",
-    "deploy/aws/lambda/claude-triage/handler.py",
     "deploy/aws/lambda/deploy-watchdog/handler.py",
     "deploy/aws/lambda/deploy-watchdog/test_handler.py",
     "deploy/aws/lambda/hard-stop-guard/handler.py",
@@ -93,24 +92,10 @@ const TRACKED_PY_ALLOWLIST: &[&str] = &[
     "deploy/aws/lambda/start-watchdog/test_handler.py",
     "deploy/aws/lambda/telegram-webhook/handler.py",
     "deploy/aws/lambda/telegram-webhook/test_handler.py",
-    "docs/dhan-ref/dhan_validation.py",
     "docs/incidents/2026-07-06-questdb-console-shell-hang/raw_socket_probe.py",
     "docs/incidents/2026-07-06-questdb-console-shell-hang/repro_backlambda.py",
-    "scripts/depth200-live-viewer.py",
-    "scripts/depth200-quick-test.py",
-    "scripts/depth_200_bridge.py",
-    "scripts/dhan-200-depth-repro/check_depth_200.py",
-    "scripts/dhan-200-depth-repro/check_depth_200_url_compare.py",
-    "scripts/dhan-200-depth-repro/repro.py",
-    "scripts/dhan-200depth-matrix.py",
-    "scripts/dhan-200depth-paste-and-run.py",
-    "scripts/dhan-200depth-support-template.py",
-    "scripts/dhan-official-200depth.py",
     "scripts/mcp-servers/tickvault-logs/server.py",
-    "scripts/mcp-servers/tickvault-logs/test_cloudwatch_logs.py",
     "scripts/mcp-servers/tickvault-logs/test_placeholder_fallback.py",
-    "scripts/test-dhan-200depth.py",
-    "scripts/test_depth_200_bridge.py",
 ];
 
 /// Files (non-`.py`, non-docs) that carry a python invocation on a
@@ -122,9 +107,6 @@ const INVOCATION_SITE_ALLOWLIST: &[&str] = &[
     ".mcp.json",
     "Makefile",
     "scripts/bench-gate.sh",
-    "scripts/binary-size-gate.sh",
-    "scripts/depth200-run-all.sh",
-    "scripts/dhan-200-depth-repro/check_questdb.sh",
     "scripts/validate-automation.sh",
 ];
 
