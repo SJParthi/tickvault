@@ -171,9 +171,6 @@ pub mod market_ram_store_boot;
 /// stored month. FOLD-01 runbook:
 /// `.claude/rules/project/rest-candle-fold-error-codes.md`.
 pub mod rest_candle_fold;
-/// Shared per-seal routing for BOTH feeds (Dhan + Groww) — the single
-/// `route_seal` body the two `on_seal` call sites invoke (C2, behavior-preserving).
-pub mod seal_routing;
 /// Pure shutdown classifier (Telegram cleanliness overhaul, 2026-07-15):
 /// signal kind × runtime source × IST clock × trading calendar →
 /// `ShutdownClass`. Fails toward ExternalStop (loud) on any doubt.
