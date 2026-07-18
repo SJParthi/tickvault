@@ -74,8 +74,6 @@ const TRACKED_PY_ALLOWLIST: &[&str] = &[
     ".claude/skills/dhanhq/scripts/resolve_security.py",
     ".claude/skills/dhanhq/scripts/trade_logger.py",
     ".claude/skills/dhanhq/scripts/validate_order.py",
-    "deploy/aws/lambda/budget-killswitch/handler.py",
-    "deploy/aws/lambda/budget-killswitch/test_handler.py",
     "deploy/aws/lambda/deploy-watchdog/handler.py",
     "deploy/aws/lambda/deploy-watchdog/test_handler.py",
     "deploy/aws/lambda/hard-stop-guard/handler.py",
