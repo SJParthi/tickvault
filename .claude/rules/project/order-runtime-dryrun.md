@@ -263,7 +263,17 @@ self-test, no strategy), so option marks match zero positions and
 restore nothing today; they pre-wire option-leg unrealized P&L for
 future option orders. Same day, order_observability.rs stopped
 hardcoding `feed:"dhan"` on order_audit/pnl_audit rows —
-`OrderSideWiring` carries the lane's feed discriminant.)* The Fix-F
+`OrderSideWiring` carries the lane's feed discriminant. Honest
+envelope: option-contract marks resolve only while the book expiry —
+the flat nearest ≥ today from the Groww master — equals the cadence
+fire's day-locked policy expiry, true today for NIFTY/SENSEX by
+construction and for BANKNIFTY under the Assumed no-weeklies
+monthly-only regime; on any divergence day (weeklies returning, or a
+cross-broker `expiry_disagreement` Dhan-wins override re-keying the
+Groww fire) 100% of the affected underlying's option marks are
+counted-unresolved (`tv_cadence_option_mark_unresolved_total`,
+fail-closed, never misattributed) until the cadence §3e book
+delegation lands.)* The Fix-F
 closed-channel warn now
 distinguishes never-any-mark ("mark channel closed before any mark
 arrived — no live mark producer is configured") from the benign
