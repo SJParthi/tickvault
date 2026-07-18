@@ -29,6 +29,10 @@ aws-sdk-cloudwatch = { workspace = true }
 aws-sdk-costexplorer = { workspace = true }
 
 [[bin]]
+name = "start-watchdog"
+path = "src/bin/start_watchdog.rs"
+
+[[bin]]
 name = "budget-killswitch"
 path = "src/bin/budget_killswitch.rs"
 
