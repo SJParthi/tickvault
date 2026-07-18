@@ -55,7 +55,7 @@ The site logs `error!(code = "HTTP-CLIENT-01", ...)`, increments
 | Site label | What degrades |
 |---|---|
 | `boot_probe` | one QuestDB readiness probe invocation returns `BootProbeError::ClientBuild` (typed) — the every-5s/10s scheduler retries next tick |
-| `instrument_fetch_audit_ensure` | fetch-audit DDL skipped this boot (idempotent — next boot re-runs) |
+| `instrument_fetch_audit_ensure` | **RETIRED 2026-07-18** (dead-code sweep batch 1, zero callers since PR-C3): the emit site — `instrument_fetch_audit_persistence.rs`, whose fetch-audit DDL leg lost its last caller when the Phase-C instrument chain died — was deleted; the `instrument_fetch_audit` TABLE stays (SEBI forensic, partition-manager sweep string). No src site carries this label anymore |
 | `shadow_ensure_tables` | candle-table DDL skipped this boot (idempotent) |
 | `shadow_drop_legacy` | legacy candle cleanup skipped (marker not written — next boot retries) |
 | `lifecycle_ensure` / `lifecycle_audit_ensure` | lifecycle DDL skipped this boot (idempotent) |

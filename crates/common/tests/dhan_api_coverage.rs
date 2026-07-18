@@ -1068,7 +1068,7 @@ fn collect_workspace_src_files(dir: &Path, out: &mut Vec<PathBuf>) {
 /// mechanical pinned constants→consumer existence in either direction
 /// until this test.) FULL-LINE comment lines are excluded — several
 /// modules legitimately MENTION the retired endpoint in doc comments
-/// (tick_types.rs, prev_day_ohlcv_persistence.rs, …); a comment cannot
+/// (tick_types.rs, …); a comment cannot
 /// send HTTP. A trailing-comment mention on a code line would over-count
 /// and fail LOUDLY — the conservative direction for an orphan pin.
 #[test]
