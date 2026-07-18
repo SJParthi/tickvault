@@ -21,13 +21,7 @@
               "source_labels": ["host"],
               "label_matcher": "^tickvault-prod$",
               "dimensions": [["host"]],
-              "metric_selectors": ["^(tv_questdb_disconnected_seconds|tv_token_remaining_seconds|tv_spill_dropped_total|tv_dlq_ticks_total|tv_ticks_dropped_total|tv_aggregator_seals_emitted_total|tv_aggregator_close_pct_nonzero_total|tv_orders_rejected_total|tv_boot_completed|tv_clock_skew_seconds|tv_disk_watcher_respawn_total|tv_late_tick_after_boundary_total|tv_process_rss_bytes|tv_subsystem_memory_estimated_bytes|tv_dhan_exchange_lag_p99_seconds|tv_dhan_lag_samples_excluded_total|tv_rest_1m_fire_heartbeat|tv_daily_pnl|tv_order_fill_lag_seconds)$"]
-            },
-            {
-              "source_labels": ["host"],
-              "label_matcher": "^tickvault-prod$",
-              "dimensions": [["host", "feed"]],
-              "metric_selectors": ["^tv_boundary_catchup_total$"]
+              "metric_selectors": ["^(tv_questdb_disconnected_seconds|tv_token_remaining_seconds|tv_spill_dropped_total|tv_dlq_ticks_total|tv_ticks_dropped_total|tv_orders_rejected_total|tv_boot_completed|tv_clock_skew_seconds|tv_disk_watcher_respawn_total|tv_late_tick_after_boundary_total|tv_process_rss_bytes|tv_subsystem_memory_estimated_bytes|tv_dhan_exchange_lag_p99_seconds|tv_dhan_lag_samples_excluded_total|tv_rest_1m_fire_heartbeat|tv_daily_pnl|tv_order_fill_lag_seconds)$"]
             }
           ]
         }
