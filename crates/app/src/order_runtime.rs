@@ -902,9 +902,12 @@ async fn run_order_runtime(
     // 2026-07-18: distinguishes the legit day-complete close from a
     // producer-less boot (the PR #1624 class — every mark_forward call
     // site config-dead, sole sender dropped at boot, channel closed
-    // before the first mark). Wording-only: control flow is identical
+    // before the first mark) AND, since the MED-1 fold-in, from an
+    // abnormal MID-SESSION producer death (coded OMS-GAP-02 below).
+    // Extended bool -> u64 count (count > 0 == saw-any-mark) so the
+    // abnormal-death error can name N. Control flow is identical
     // (Fix F's disarm-and-continue stands; no clean_exit respawn flap).
-    let mut saw_any_mark = false;
+    let mut marks_seen: u64 = 0;
     let mut housekeeping = tokio::time::interval(Duration::from_secs(HOUSEKEEPING_TICK_SECS));
     housekeeping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -967,7 +970,29 @@ async fn run_order_runtime(
             // day-scoped producers close the channel — Fix F) ----
             mark = mark_rx.recv(), if mark_channel_open => {
                 let Some(first) = mark else {
-                    if saw_any_mark {
+                    let saw_any_mark = marks_seen > 0;
+                    // MED-1 (2026-07-18): a close AFTER marks flowed but
+                    // BEFORE the 15:30 IST close boundary (the same
+                    // TICK_PERSIST_END_SECS_OF_DAY_IST the close-sweep /
+                    // reconcile scheduling already uses) is neither the
+                    // benign ~15:31 day-complete exit nor a producer-less
+                    // boot — the mark producer died abnormally mid-session.
+                    let in_session = ist_secs_of_day(chrono::Utc::now().timestamp())
+                        < TICK_PERSIST_END_SECS_OF_DAY_IST;
+                    if saw_any_mark && in_session {
+                        metrics::counter!("tv_order_runtime_mark_producer_lost_total")
+                            .increment(1);
+                        error!(
+                            code = ErrorCode::OmsGapReconciliation.code_str(),
+                            marks_seen,
+                            "OMS-GAP-02: mark channel closed MID-SESSION after \
+                             {marks_seen} marks — the mark producer died \
+                             abnormally; paper fills and P&L marks are frozen \
+                             for the rest of the session (order updates, \
+                             reconcile, 15:30 sweep and 16:00 reset keep \
+                             running; marks resume at the next process boot)"
+                        );
+                    } else if saw_any_mark {
                         warn!(
                             "order runtime: mark channel closed (day-scoped mark \
                              producers finished) — mark arm disarmed; the runtime \
@@ -989,7 +1014,6 @@ async fn run_order_runtime(
                     mark_channel_open = false;
                     continue;
                 };
-                saw_any_mark = true;
                 let mut processed = 0usize;
                 let mut next = Some(first);
                 while let Some(m) = next {
@@ -1003,6 +1027,7 @@ async fn run_order_runtime(
                     }
                     next = mark_rx.try_recv().ok();
                 }
+                marks_seen = marks_seen.saturating_add(processed as u64);
                 // Mark-to-market halt evaluation after the batch (≤1/sec by
                 // the batching + the housekeeping tick backstop).
                 risk.evaluate_daily_loss_halt();
