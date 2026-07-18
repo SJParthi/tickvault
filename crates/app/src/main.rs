@@ -552,24 +552,13 @@ async fn main() -> Result<()> {
                 std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             )
         };
-    // ── per-instrument presence registry init — PROCESS-GLOBAL boot prefix ──
-    // Scoreboard PR-D fix round 1 (review HIGH; 2026-07-15: the Groww
-    // activation watcher this originally ordered against retired with the
-    // Groww live feed — init stays the single process-global site): init
-    // MUST precede any registration producer AND both boot arms'
-    // `load_instruments` — `feed_presence::register_instruments` is a
-    // GLOBAL.get() free fn that silently no-ops pre-init, so the previous
-    // fast-arm init site (~1,000 lines after its load_instruments)
-    // deterministically skipped the Dhan universe registration on every
-    // crash-recovery boot, and the Groww watcher could register after a
-    // later init — a same-day 15:45 drain of that half-registered registry
-    // persisted a false one-sided "Groww won every minute" verdict. ONE
-    // init site (the process-global-prefix pattern the lag publisher +
-    // ts-pin migration already use); ordering pinned by the
-    // `test_feed_presence_is_wired_into_main` source-order ratchet.
-    tickvault_core::pipeline::feed_presence::init_feed_presence(
-        config.scoreboard.enabled && config.scoreboard.presence_fold_enabled,
-    );
+    // ── per-instrument presence registry — RETIRED 2026-07-18 (stage-4
+    // dead-producer sweep): the registry
+    // (crates/core/src/pipeline/feed_presence.rs) was deleted — its
+    // record/register producers died with the live feeds (Dhan 2026-07-13,
+    // Groww 2026-07-15), so the boot init armed a registry nothing could
+    // ever feed. Scoreboard coverage degrades honestly to the SQL
+    // minute-set approximation (coverage_source = sql_backfill).
     // ── index_constituency ts-pin migration — PROCESS-GLOBAL boot prefix ──
     // F13/F14 hardening (2026-07-05): the one-shot, marker-gated TRUNCATE
     // migration runs here — BEFORE the [groww_universe] daily rider and regardless
@@ -2165,9 +2154,9 @@ fn spawn_seal_writer_loop(questdb_config: &tickvault_common::config::QuestDbConf
 ///    scorecard DAY lag distribution at every IST midnight (Scoreboard PR-C;
 ///    a Saturday midnight must still clear Friday's distribution before
 ///    Monday's scorecard row). Cold, O(96).
-/// 2. `feed_presence::reset_daily(Feed::Dhan)` — clears the presence bitsets
-///    at the same boundary (Scoreboard PR-D; belt-and-braces — the day-keyed
-///    clear at registration is the backstop). Cold, O(slots × 6).
+/// 2. (RETIRED 2026-07-18, stage-4) `feed_presence::reset_daily` — the
+///    presence registry was deleted with its producer-less module; only the
+///    day-lag reset remains.
 ///
 /// Honest note: both writers are dormant on the REST-only runtime (the live
 /// feeds are retired), so these resets are currently no-op hygiene — kept so
@@ -2183,11 +2172,10 @@ fn spawn_scoreboard_midnight_reset_task() {
             tickvault_core::pipeline::feed_lag_monitor::reset_day_lag_histogram(
                 tickvault_common::feed::Feed::Dhan,
             );
-            tickvault_core::pipeline::feed_presence::reset_daily(
-                tickvault_common::feed::Feed::Dhan,
-            );
             tracing::info!(
-                "scoreboard IST-midnight resets fired (day lag histogram + presence bitsets)"
+                "scoreboard IST-midnight reset fired (day lag histogram; the \
+                 presence-bitset reset retired 2026-07-18 with the deleted \
+                 presence registry)"
             );
         }
     });

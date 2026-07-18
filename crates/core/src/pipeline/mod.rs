@@ -8,7 +8,9 @@
 //! decision surface), `feed_lag_monitor` (day-lag histograms only since
 //! 2026-07-17 — the Dhan lag ring/publisher half was deleted with the dead
 //! Dhan-lag chain; live consumers: the scoreboard day-lag drain + the
-//! midnight histogram reset), and `feed_presence`.
+//! midnight histogram reset). `feed_presence` was DELETED 2026-07-18
+//! (stage-4 dead-producer sweep — its record/register producers died with
+//! the live feeds; the scoreboard degrades to its SQL coverage fallback).
 //!
 //! ## Movers retirement
 //!
@@ -41,4 +43,3 @@ pub mod chain_snapshot;
 // `reset_day_lag_histogram` + the scoreboard's `day_lag_summary` drain are
 // live consumers.
 pub mod feed_lag_monitor;
-pub mod feed_presence;

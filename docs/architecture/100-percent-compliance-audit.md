@@ -57,7 +57,7 @@ Every demand → mechanical proof → who fails the build.
 
 | # | Operator demand | Honest envelope | Mechanical proof |
 |---|---|---|---|
-| 1 | Zero ticks lost | **Bounded zero loss inside chaos envelope**: 100K-tick rescue ring (right-sized for 4 SIDs × 20 ticks/sec peak = 83 min buffer) → NDJSON spill → DLQ NDJSON. Beyond envelope, DLQ catches every payload as recoverable text. | `crates/storage/tests/zero_tick_loss_alert_guard.rs` + `chaos_zero_tick_loss.rs` + 4 Prometheus alerts pinned |
+| 1 | Zero data lost | **Bounded zero loss inside chaos envelope**: 200,000-seal ring (`SEAL_BUFFER_CAPACITY`) → NDJSON spill → DLQ. Beyond envelope, DLQ catches every payload as recoverable text. _(2026-07-18: the 100K tick rescue ring + `zero_tick_loss_alert_guard.rs` + `chaos_zero_tick_loss.rs` were DELETED with the dead tick chain, stage-2/4 sweeps)_ | `seal_ring.rs` lib ratchets + AGGREGATOR-DROP-01 pagers (`seal_drop_paging_wiring_guard.rs`) |
 | 2 | WS never disconnect | SEBI 24h JWT mandates ≥1 reconnect/day BY LAW (cannot promise "never"). **What we promise:** DETECT ≤5s, reconnect with `SubscribeRxGuard` preserving subscriptions, sleep-until-open post-close (WS-GAP-04), pool-slot supervised respawn within ~5s on unexpected clean exits (WS-GAP-05, W2#8). Plus: chaos-tested 65h Fri 16:00 → Mon 09:00 sleep/wake. | `ws_sleep_resilience.rs` + `SubscribeRxGuard` + `run_supervised_pool_slot` (W2#8) |
 | 3 | Never slow/locked/hanged | DHAT ≤4 alloc blocks / 8KB across 10K calls; Criterion p99 ≤100ns enqueue; tick-gap >30s fires coalesced Telegram. **Local hot path <1ms decision-to-wire.** Dhan-side ACK is 5–30ms (we do not control). | `dhat_*.rs` zero-alloc tests + Criterion benches + `tick_gap_detector.rs` |
 | 4 | QuestDB never fail | QuestDB is a third-party process; we cannot prevent its failures. **What we promise:** ABSORB via 3-tier rescue→spill→DLQ + schema self-heal via `ALTER ADD COLUMN IF NOT EXISTS`. CW alarm fires within 30s. | `chaos_questdb_docker_pause.rs` + `ensure_*_table` self-heal + `tv-questdb-disconnected-30s` alarm |
@@ -73,7 +73,7 @@ Operator says: "never miss / never disconnect / never fail / never slow." Below:
 
 | Operator says "never" | Physical truth | What we promise instead | Where it lives |
 |---|---|---|---|
-| "Not even a single tick missed" | Network packet loss is physically possible | Bounded zero-loss inside 83-min envelope (100K rescue ring); beyond that DLQ catches | `TICK_BUFFER_CAPACITY` constant + ratchet |
+| "Not even a single tick missed" | Network packet loss is physically possible | Bounded zero loss for the candle chain: 200K seal ring → spill → DLQ _(2026-07-18: the tick rescue ring + `TICK_BUFFER_CAPACITY` were deleted with the dead tick writer)_ | `SEAL_BUFFER_CAPACITY` constant + `seal_ring.rs` ratchet |
 | "WebSocket never disconnects" | SEBI 24h JWT forces reconnect; TCP RST can happen | Detect ≤5s, reconnect with sub preservation, ≤30s end-to-end RTO | `disaster-recovery.md` §5/§6 |
 | "QuestDB never fails" | Third-party process | Absorb via 3-tier + alarm within 30s | §2 row 4 |
 | "Never slow / locked / hanged" | OS scheduler can preempt | Hot-path DHAT bounded + Criterion p99 budgets + tick-gap detector >30s alarm | §2 row 3 |

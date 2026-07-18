@@ -167,6 +167,58 @@
     green); observability-architecture.md paging list grep-verified — NO
     lag/scoreboard entry exists, so no rule-file paging edit owed
 
+### Stage-4 — dead-producer observability sweep (2026-07-18)
+
+- [x] S1: retire the 4 dead-tick alarm chains (tv_spill_dropped_total,
+  tv_dlq_ticks_total, tv_ticks_dropped_total,
+  tv_late_tick_after_boundary_total) — zero emit sites since the stage-2
+  tick-chain deletion 2026-07-17; delete the 4 app-alarms.tf resources,
+  remove the 4 names from BOTH EMF selector copies (byte-identical), empty
+  the stage-2 dead-monitor allowlist, re-pin alarm count 9→5 + EMF 15→11,
+  factual dated notes in guarantees.md / zero-tick-loss runbook /
+  operator docs / aws-budget.md COST NOTE 2026-07-18.
+  - Files: deploy/aws/terraform/app-alarms.tf, deploy/aws/cloudwatch-agent.json,
+    deploy/aws/terraform/user-data.sh.tftpl,
+    crates/common/tests/cloudwatch_app_alarms_wiring.rs,
+    deploy/grafana-cloud/tickvault-operator-dashboard.json,
+    docs/architecture/guarantees.md, docs/runbooks/zero-tick-loss.md,
+    .claude/rules/project/aws-budget.md
+  - Tests: test_every_alarm_metric_has_a_rust_emit_site,
+    test_app_alarms_count_is_twenty_two (pin 5),
+    test_emf_metric_selectors_name_count_is_pinned (pin 11),
+    cw_agent_selector_lockstep_guard (4 tests)
+- [x] S2: delete the producer-less feed-presence registry
+  (feed_presence.rs + presence_registration.rs + dhat_feed_presence.rs +
+  bench + budget + config flag + main.rs/scoreboard wiring); the
+  scoreboard coverage path degrades honestly to its existing sql_backfill
+  arm; ci.yml DHAT lane drift list + count updated.
+  - Files: crates/core/src/pipeline/feed_presence.rs (delete),
+    crates/core/src/instrument/presence_registration.rs (delete),
+    crates/core/tests/dhat_feed_presence.rs (delete),
+    crates/core/benches/feed_presence.rs (delete), crates/app/src/main.rs,
+    crates/app/src/feed_scoreboard_boot.rs, crates/common/src/config.rs,
+    config/base.toml, .github/workflows/ci.yml,
+    quality/benchmark-budgets.toml,
+    crates/core/src/auth/secret_manager.rs
+  - Tests: feed_scoreboard_boot unit tests, bench_budget guard,
+    cargo test -p tickvault-core --features dhat --no-run
+- [x] S3: MED-2 — delete the consumer-less TICK_BUFFER_CAPACITY orphan
+  (constants.rs, minimal flagged edit) + zero_tick_loss_alert_guard.rs
+  (its seal-ring rationale is factually false) +
+  chaos_burst_indices_only.rs; re-point every honest-100% template line
+  at the LIVE envelope (SEAL_BUFFER_CAPACITY 200_000, ratcheted by
+  seal_ring.rs) and rewrite wave4_section8_wording_guard.rs in lockstep.
+  - Files: crates/common/src/constants.rs,
+    crates/storage/tests/zero_tick_loss_alert_guard.rs (delete),
+    crates/storage/tests/chaos_burst_indices_only.rs (delete),
+    crates/common/tests/wave4_section8_wording_guard.rs,
+    .claude/rules/project/operator-charter-forever.md,
+    .claude/rules/project/per-wave-guarantee-matrix.md,
+    .claude/rules/project/wave-4-shared-preamble.md (+ sibling rule lines)
+  - Tests: wave4_section8_wording_guard (rewritten),
+    seal_ring.rs::test_seal_buffer_capacity_constant_is_locked_value,
+    constants.rs unit tests
+
 ## Design
 
 **Track A (tickvault-storage + tickvault-app + scripts).** The runtime is
