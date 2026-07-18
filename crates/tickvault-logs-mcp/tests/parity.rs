@@ -163,8 +163,11 @@ const SERVER_PY_PINNED_COMMIT: &str = "c1e5991fb4c743dac38ea8c54d1e87ddcbca99ae"
 const SERVER_PY_REL: &str = "scripts/mcp-servers/tickvault-logs/server.py";
 
 /// Resolve the python reference server: the working-tree copy when one
-/// exists (a previous materialization — the path is gitignored
-/// post-cutover), else `git show <pin>:<path>` written as a runtime
+/// exists AND is byte-identical to the pinned blob (a previous
+/// materialization — the path is gitignored post-cutover; verified via
+/// blob-OID compare per the 2026-07-18 R1 LOW-1 finding, so a future pin
+/// bump can never silently parity against a stale copy), else
+/// `git show <pin>:<path>` written as a runtime
 /// artifact at the SAME path so the python child's
 /// `Path(__file__)`-derived repo root stays the REAL repo root (sessions
 /// A–D grep/doctor/git against the live tree). On a shallow CI clone the
@@ -173,9 +176,6 @@ const SERVER_PY_REL: &str = "scripts/mcp-servers/tickvault-logs/server.py";
 fn materialize_server_py() -> PathBuf {
     let root = repo_root();
     let path = root.join(SERVER_PY_REL);
-    if path.is_file() {
-        return path;
-    }
     let git = |args: &[&str]| {
         Command::new("git")
             .arg("-C")
@@ -185,6 +185,59 @@ fn materialize_server_py() -> PathBuf {
             .unwrap_or_else(|e| panic!("run git {args:?}: {e}"))
     };
     let spec = format!("{SERVER_PY_PINNED_COMMIT}:{SERVER_PY_REL}");
+    // The needle check runs on BOTH paths (reused-verified and fresh) —
+    // 2026-07-18 hostile-review R1 LOW-1.
+    let assert_needle = |bytes: &[u8], ctx: &str| {
+        let needle: &[u8] = b"_run_stdio_loop";
+        assert!(
+            bytes.windows(needle.len()).any(|w| w == needle),
+            "{ctx} server.py lacks _run_stdio_loop — wrong object at {spec}?"
+        );
+    };
+    if path.is_file() {
+        // 2026-07-18 hostile-review R1 LOW-1: a pre-existing working-tree
+        // copy (gitignored runtime artifact) is reused ONLY when
+        // byte-identical to the pinned blob — after a future pin bump, a
+        // stale copy must never silently parity against the OLD baseline.
+        // Compare the pinned blob OID against `git hash-object <file>`;
+        // on mismatch, delete and re-materialize from the pin.
+        let mut oid_out = git(&["rev-parse", &spec]);
+        if !oid_out.status.success() {
+            // Shallow clone: same fetch-retry as the `git show` path below.
+            let _ = git(&["fetch", "--depth=1", "origin", SERVER_PY_PINNED_COMMIT]);
+            oid_out = git(&["rev-parse", &spec]);
+        }
+        assert!(
+            oid_out.status.success(),
+            "cannot resolve pinned blob {spec} to verify the working-tree \
+             server.py (the parity gate must not silently reuse an \
+             unverified copy): {}",
+            String::from_utf8_lossy(&oid_out.stderr)
+        );
+        let pinned_oid = String::from_utf8_lossy(&oid_out.stdout).trim().to_string();
+        let hash_out = Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .arg("hash-object")
+            .arg(&path)
+            .output()
+            .unwrap_or_else(|e| panic!("run git hash-object {}: {e}", path.display()));
+        assert!(
+            hash_out.status.success(),
+            "git hash-object {} failed (the parity gate must not silently \
+             reuse an unverified copy): {}",
+            path.display(),
+            String::from_utf8_lossy(&hash_out.stderr)
+        );
+        let actual_oid = String::from_utf8_lossy(&hash_out.stdout).trim().to_string();
+        if actual_oid == pinned_oid {
+            let bytes = std::fs::read(&path).expect("read verified working-tree server.py");
+            assert_needle(&bytes, "reused working-tree");
+            return path;
+        }
+        // Stale copy from an OLD pin (or a hand-edit): never reuse it.
+        std::fs::remove_file(&path).expect("remove stale materialized server.py");
+    }
     let mut out = git(&["show", &spec]);
     if !out.status.success() {
         // Shallow clone (CI checkout fetch-depth=1): fetch the pinned
@@ -199,11 +252,7 @@ fn materialize_server_py() -> PathBuf {
         String::from_utf8_lossy(&out.stderr)
     );
     let bytes = out.stdout;
-    let needle: &[u8] = b"_run_stdio_loop";
-    assert!(
-        bytes.windows(needle.len()).any(|w| w == needle),
-        "materialized server.py lacks _run_stdio_loop — wrong object at {spec}?"
-    );
+    assert_needle(&bytes, "materialized");
     std::fs::create_dir_all(path.parent().expect("server.py parent")).expect("mkdir server.py dir");
     // Temp-then-rename: a concurrent invocation must never see a torn file.
     let tmp = root.join(format!("{SERVER_PY_REL}.tmp{}", std::process::id()));
