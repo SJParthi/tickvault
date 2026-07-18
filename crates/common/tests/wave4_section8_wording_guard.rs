@@ -48,6 +48,11 @@ use std::path::PathBuf;
 
 const PREAMBLE_PATH: &str = "../../.claude/rules/project/wave-4-shared-preamble.md";
 const MATRIX_PATH: &str = "../../.claude/rules/project/per-wave-guarantee-matrix.md";
+// 2026-07-18 (stage-4 review MEDIUM-1): the operator charter's §C 7-row
+// matrix row 1 + §F honest-100% template were re-pointed to the live
+// seal-ring envelope in the same sweep — pin them here so they cannot
+// silently regress to the retired tick-ring wording.
+const CHARTER_PATH: &str = "../../.claude/rules/project/operator-charter-forever.md";
 
 fn read(rel: &str) -> String {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(rel);
@@ -73,7 +78,11 @@ fn section8_does_not_claim_unproven_70h_chaos() {
 
 #[test]
 fn section8_keeps_seal_ring_claim_with_evidence_pointer() {
-    for (label, path) in [("preamble", PREAMBLE_PATH), ("matrix", MATRIX_PATH)] {
+    for (label, path) in [
+        ("preamble", PREAMBLE_PATH),
+        ("matrix", MATRIX_PATH),
+        ("charter", CHARTER_PATH),
+    ] {
         let text = read(path);
         // 2026-07-18 (stage-4 sweep): the honest-100% template cites the
         // LIVE seal-ring envelope. The claim must cite the constant +

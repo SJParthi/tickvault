@@ -3872,14 +3872,11 @@ const _: () = assert!(
 /// late-arriving tick within the 60s grace lands in its true bar.
 pub const BAR_FINAL_SEAL_OFFSET_SECS: u64 = 60;
 
-/// Soft anomaly threshold — if a tick arrives with `exchange_ts` more
-/// than `LATE_TICK_ANOMALY_THRESHOLD_MS` BEHIND the local wall-clock
-/// receive time, it is counted by `tv_late_tick_after_boundary_total`
-/// (the `LastTickAfterBoundary` Telegram variant was retired 2026-06-12 —
-/// redundant with that counter; the per-tick hot path must not carry a
-/// notifier). Helps operators spot Dhan-side ingestion lag or clock skew
-/// without halting tick acceptance.
-pub const LATE_TICK_ANOMALY_THRESHOLD_MS: u64 = 30_000;
+// `LATE_TICK_ANOMALY_THRESHOLD_MS` DELETED 2026-07-18 (stage-4 dead-producer
+// sweep, review LOW-3): its doc claimed present-tense counting by
+// `tv_late_tick_after_boundary_total`, whose emit site died with the dead
+// tick chain (stage-2 sweep 2026-07-17); the constant had zero production
+// consumers (doc + pin test only).
 
 // Compile-time consistency: BAR_FINAL_SEAL_OFFSET_SECS must equal
 // WS_GRACE_AFTER_CLOSE_SECS — they're two views of the same 60s
@@ -5222,12 +5219,6 @@ mod tests {
     #[test]
     fn test_bar_final_seal_offset_matches_grace() {
         assert_eq!(BAR_FINAL_SEAL_OFFSET_SECS, WS_GRACE_AFTER_CLOSE_SECS);
-    }
-
-    /// Constant pin — late-tick anomaly threshold.
-    #[test]
-    fn test_late_tick_anomaly_threshold_ms_pinned_at_30000() {
-        assert_eq!(LATE_TICK_ANOMALY_THRESHOLD_MS, 30_000);
     }
 
     /// Plan §8 row 1: a tick stamped `exchange_ts = 15:29:59.586` must

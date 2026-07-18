@@ -89,7 +89,7 @@ The `.mcp.json` `tickvault-logs` entry is loaded automatically — same MCP tool
 
 | Demand | Honest envelope (the truth) | Per-item proof |
 |---|---|---|
-| Zero ticks lost | Bounded zero loss inside chaos envelope: 100K-tick rescue ring → NDJSON spill → DLQ NDJSON catches every payload | item must not introduce new tick-drop path |
+| Zero data loss | Bounded zero loss inside chaos envelope: 200,000-seal ring buffer capacity (`SEAL_BUFFER_CAPACITY`, ratcheted by `seal_ring.rs`) → NDJSON spill → DLQ *(2026-07-18: the tick rescue ring + its capacity constant were deleted with the dead tick writer — the seal chain is the live absorption tier)* | item must not introduce new seal-drop path |
 | WS never disconnects | SEBI 24h JWT forces ≥1 reconnect/day BY LAW. DETECT ≤5s, reconnect with `SubscribeRxGuard`, sleep-until-open post-close. | item must not break `SubscribeRxGuard` or pool watchdog |
 | Never slow/locked/hanged | DHAT ≤4 alloc blocks/8KB across 10K calls; Criterion p99 ≤100ns enqueue; tick-gap >30s coalesced Telegram; core_affinity Core 0 | item must not add hot-path allocation |
 | QuestDB never fails | ABSORB via 3-tier rescue→spill→DLQ + schema self-heal via `ALTER ADD COLUMN IF NOT EXISTS` | item must not break self-heal |
