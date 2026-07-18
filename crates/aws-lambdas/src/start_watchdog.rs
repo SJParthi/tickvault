@@ -335,14 +335,14 @@ If you do NOT get a 'tickvault started' message by 8:40 AM, the \
             return Ok(json!({"mode": "stop_check", "state": state, "alerted": false}));
         }
         let stop_trigger = at_utc_time(now, STOP_TRIGGER_UTC_HOUR, STOP_TRIGGER_UTC_MINUTE);
-        if let Some(lt) = launch_time {
-            if lt >= stop_trigger {
-                info!(
-                    launch_time = %lt,
-                    "stop_check — running but launched after 16:30 IST: manual evening session, leaving it alone"
-                );
-                return Ok(json!({"mode": "stop_check", "state": state, "alerted": false}));
-            }
+        if let Some(lt) = launch_time
+            && lt >= stop_trigger
+        {
+            info!(
+                launch_time = %lt,
+                "stop_check — running but launched after 16:30 IST: manual evening session, leaving it alone"
+            );
+            return Ok(json!({"mode": "stop_check", "state": state, "alerted": false}));
         }
         let Some(_) = launch_time else {
             // Can't prove it isn't a manual session — page, don't stop.
@@ -415,29 +415,29 @@ on the portal, or run \
             return Ok(json!({"mode": "curfew_check", "state": state, "stopped": false}));
         }
         let keep_alive_until = read_keep_alive_until(ssm, &env.keep_alive_param).await;
-        if let Some(until) = keep_alive_until {
-            if now < until {
-                info!(
-                    keep_alive_until = %until,
-                    "curfew_check — keep-alive override active; leaving the box alone"
-                );
-                return Ok(json!({
-                    "mode": "curfew_check", "state": state, "stopped": false,
-                    "skipped": "keep_alive"
-                }));
-            }
+        if let Some(until) = keep_alive_until
+            && now < until
+        {
+            info!(
+                keep_alive_until = %until,
+                "curfew_check — keep-alive override active; leaving the box alone"
+            );
+            return Ok(json!({
+                "mode": "curfew_check", "state": state, "stopped": false,
+                "skipped": "keep_alive"
+            }));
         }
-        if let Some(lt) = launch_time {
-            if now.signed_duration_since(lt) < Duration::minutes(CURFEW_START_GRACE_MINUTES) {
-                info!(
-                    launch_time = %lt,
-                    grace_minutes = CURFEW_START_GRACE_MINUTES,
-                    "curfew_check — fresh manual start, grace window"
-                );
-                return Ok(json!({
-                    "mode": "curfew_check", "state": state, "stopped": false, "skipped": "grace"
-                }));
-            }
+        if let Some(lt) = launch_time
+            && now.signed_duration_since(lt) < Duration::minutes(CURFEW_START_GRACE_MINUTES)
+        {
+            info!(
+                launch_time = %lt,
+                grace_minutes = CURFEW_START_GRACE_MINUTES,
+                "curfew_check — fresh manual start, grace window"
+            );
+            return Ok(json!({
+                "mode": "curfew_check", "state": state, "stopped": false, "skipped": "grace"
+            }));
         }
         let now_ist = format_ist_12h(now);
         let Some(_) = launch_time else {
@@ -509,27 +509,28 @@ with no keep-alive, and my stop attempt FAILED. Press \
         let in_window = now.hour() == START_TRIGGER_UTC_HOUR;
         let deadline = at_utc_time(now, START_TRIGGER_UTC_HOUR, START_TRIGGER_UTC_MINUTE)
             + Duration::minutes(LATE_START_GRACE_MINUTES);
-        if let Some(lt) = launch_time {
-            if in_window && lt > deadline {
-                let launched_ist = format_ist_12h(lt);
-                publish(
-                    sns,
-                    env,
-                    "08:30 auto-start FAILED — box was started late",
-                    &format!(
-                        "⚠️ The box is running now, but it only came up at {launched_ist} IST — \
+        if let Some(lt) = launch_time
+            && in_window
+            && lt > deadline
+        {
+            let launched_ist = format_ist_12h(lt);
+            publish(
+                sns,
+                env,
+                "08:30 auto-start FAILED — box was started late",
+                &format!(
+                    "⚠️ The box is running now, but it only came up at {launched_ist} IST — \
 the scheduled 8:30 AM start did NOT work and something (or someone) \
 started it later. Trading is OK for today. Investigate why the 8:30 \
 start failed: AWS console → Systems Manager → Automation executions \
 for AWS-StartEC2Instance, and the EventBridge rule's FailedInvocations."
-                    ),
-                )
-                .await?;
-                error!(launch_time = %lt, "check — running but launched LATE — paged");
-                return Ok(json!({
-                    "mode": "check", "state": state, "alerted": true, "self_started": false
-                }));
-            }
+                ),
+            )
+            .await?;
+            error!(launch_time = %lt, "check — running but launched LATE — paged");
+            return Ok(json!({
+                "mode": "check", "state": state, "alerted": true, "self_started": false
+            }));
         }
         info!("check OK — instance is running; staying silent");
         return Ok(json!({
