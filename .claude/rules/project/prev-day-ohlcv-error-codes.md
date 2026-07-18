@@ -1,3 +1,9 @@
+---
+paths:
+  - "crates/common/src/error_code.rs"
+  - "crates/app/src/prev_day_ohlcv_boot.rs"
+---
+
 # Boot-Time Previous-Day OHLCV Fetch — Error Codes (PREVDAY-01)
 
 > **Authority:** CLAUDE.md > `operator-charter-forever.md` §C > this file.

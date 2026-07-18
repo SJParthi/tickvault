@@ -1,3 +1,14 @@
+---
+paths:
+  - "deploy/docker/docker-compose.yml"
+  - "deploy/aws/**"
+  - "scripts/aws-*"
+  - "crates/app/src/infra.rs"
+  - "crates/trading/src/candles/seal_ring.rs"
+  - "crates/trading/src/indicator/**"
+  - "crates/trading/src/strategy/**"
+---
+
 # AWS Budget Enforcement — t4g.medium LOCKED ~₹1,022/mo
 
 > **⚠ SUPERSEDED 2026-05-27 by [`daily-universe-scope-expansion-2026-05-27.md`](./daily-universe-scope-expansion-2026-05-27.md):** instance upgraded t4g.medium → t4g.large (8 GiB), bill ~₹1,022/mo → ~₹1,514/mo, cron 08:00 → 08:30 IST. Contents below retained as 2026-05-18 historical audit; current effective contract lives in the superseding file.

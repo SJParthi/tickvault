@@ -187,7 +187,7 @@ questdb-init: ## Create all QuestDB tables + materialized views (idempotent)
 
 health: ## Check app health endpoint
 	@echo "❤️  Health check:"
-	@curl -s http://localhost:$(APP_PORT)/health 2>/dev/null | python3 -m json.tool 2>/dev/null || echo "  ⚠️  App not running (http://localhost:$(APP_PORT)/health)"
+	@curl -s http://localhost:$(APP_PORT)/health 2>/dev/null | jq -e . 2>/dev/null || echo "  ⚠️  App not running (http://localhost:$(APP_PORT)/health)"
 
 status: ## Full system status (Docker + App + QuestDB)
 	@echo ""

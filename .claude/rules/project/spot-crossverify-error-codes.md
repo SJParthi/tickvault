@@ -1,3 +1,11 @@
+---
+paths:
+  - "crates/common/src/error_code.rs"
+  - "crates/common/src/config.rs"
+  - "crates/app/src/spot_crossverify_boot.rs"
+  - "crates/storage/src/spot_crossverify_persistence.rs"
+---
+
 # Post-Close Dhan↔Groww Spot Cross-Broker Comparator — Error Codes (SPOT-XVERIFY-01 / SPOT-XVERIFY-02)
 
 > **Authority:** CLAUDE.md > `operator-charter-forever.md` §C/§F >

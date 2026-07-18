@@ -1,3 +1,10 @@
+---
+paths:
+  - "crates/common/src/error_code.rs"
+  - "crates/storage/src/tick_flush_worker.rs"
+  - "crates/storage/src/tick_persistence.rs"
+---
+
 # Off-Thread Tick ILP Flush Worker — Error Codes (TICK-FLUSH-01)
 
 > **⚠ RETIRED 2026-07-17 (stage-2 dead-WS sweep — the dead Dhan tick chain

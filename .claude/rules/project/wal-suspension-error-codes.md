@@ -1,3 +1,10 @@
+---
+paths:
+  - "crates/storage/src/wal_suspension_watcher.rs"
+  - "crates/common/src/error_code.rs"
+  - "deploy/aws/terraform/error-code-alarms.tf"
+---
+
 # QuestDB Per-Table WAL-Suspension Probe — Error Codes (WAL-SUSPEND-01)
 
 > **Authority:** CLAUDE.md > `operator-charter-forever.md` §C/§F > this file.

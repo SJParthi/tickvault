@@ -245,3 +245,43 @@ fn mcp_server_reads_config_file_before_env_vars() {
         );
     }
 }
+
+// 2026-07-18 (rust-only phase 2c, pre-cutover): the Rust MCP port
+// consumes the SAME committed config file through the SAME profile keys.
+// ADDITIVE twin of `mcp_server_reads_config_file_before_env_vars` — the
+// python pin above stays untouched during the parallel-run window.
+#[test]
+fn rust_mcp_port_reads_config_file_before_env_vars() {
+    // The URL profile keys are consulted at the tool call sites
+    // (tools.rs passes them into config::endpoint_url); the logs keys
+    // are consulted inside the resolver (config.rs). Scan both.
+    let root = repo_root();
+    let mut src = String::new();
+    for rel in [
+        "crates/tickvault-logs-mcp/src/config.rs",
+        "crates/tickvault-logs-mcp/src/tools.rs",
+    ] {
+        let path = root.join(rel);
+        src.push_str(
+            &std::fs::read_to_string(&path)
+                .unwrap_or_else(|_| panic!("Rust MCP port source missing at {}", path.display())),
+        );
+    }
+    for kind in [
+        "questdb_url",
+        "tickvault_api_url",
+        "logs_source",
+        "logs_dir_local",
+    ] {
+        assert!(
+            src.contains(&format!("\"{kind}\"")),
+            "Rust MCP port must reference profile key '{kind}' \
+             (endpoint_url/logs resolver parity with server.py)"
+        );
+    }
+    // And the canonical committed-config filename itself.
+    assert!(
+        src.contains("claude-mcp-endpoints.toml"),
+        "Rust MCP port must load config/claude-mcp-endpoints.toml"
+    );
+}

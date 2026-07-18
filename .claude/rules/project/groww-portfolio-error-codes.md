@@ -1,3 +1,11 @@
+---
+paths:
+  - "crates/common/src/error_code.rs"
+  - "crates/common/src/portfolio_types.rs"
+  - "crates/trading/src/oms/groww/portfolio.rs"
+  - "crates/storage/src/broker_portfolio_persistence.rs"
+---
+
 # Groww Portfolio Snapshot Surface — Error Codes (GROWW-PORT-01..04)
 
 > **Authority:** CLAUDE.md > `operator-charter-forever.md` §C/§F >

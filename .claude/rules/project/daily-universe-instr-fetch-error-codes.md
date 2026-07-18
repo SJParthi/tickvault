@@ -1,3 +1,11 @@
+---
+paths:
+  - "crates/common/src/error_code.rs"
+  - "crates/app/src/main.rs"
+  - "crates/storage/src/instrument_lifecycle_persistence.rs"
+  - "crates/storage/src/instrument_fetch_audit_persistence.rs"
+---
+
 # Daily Universe — INSTR-FETCH Error Codes (Sub-PR #9)
 
 > **Authority:** CLAUDE.md > `operator-charter-forever.md` §C > this file.

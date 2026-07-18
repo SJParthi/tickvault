@@ -136,3 +136,6 @@ tasks). NOT claimed: that either broker is ground truth (the §37
 doctrine — the honest frame now rides every Telegram arm), or that the
 ₹20 noise threshold is exchange-verified (operator-tunable config with a
 documented rationale; the trend counters remain exact either way).
+
+---
+**Archived 2026-07-18** — every plan item verified on `origin/main` via PR #1630 (merge commit `2a78010c`, merged 2026-07-17); item 5 (probe-ping reword) landed simplified in the same PR's round-1 review commit (unconditional minute-cadence wording, no `cadence_recording` bool — test-pinned). Archived per coordinator ruling 2026-07-18 (rust-only purge PR 2b-0, V7 plan-cap slot).
