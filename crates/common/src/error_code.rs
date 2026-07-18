@@ -956,6 +956,25 @@ pub enum ErrorCode {
     /// paragraph). Severity::High, auto-triage-safe (the degrade already
     /// happened; rehydrate/live-fill self-heal — the operator inspects).
     RamStore01Degraded,
+    /// ORDER-EVT-01 (full-fidelity order/position push-event capture,
+    /// design 2026-07-18) — a persist leg of the `order_update_events` /
+    /// `position_update_events` forensic writers DEGRADED: the boot-time
+    /// ensure-DDL client build or DDL failed (`stage="ensure_client_build"`
+    /// / `"ensure_ddl"` — the HTTP-CLIENT-01-class duplicate-row window
+    /// until a later ensure succeeds), an ILP append was rejected
+    /// (`stage="append"`), the ILP-over-HTTP flush was refused by the
+    /// per-request server ACK (`stage="flush"` — pending rows DISCARDED,
+    /// the poisoned-buffer defense), or a producer's bounded-sink send was
+    /// refused (`stage="sink_drop"` — the event's capture row is LOST,
+    /// counted; the push read loops are never blocked). Best-effort
+    /// forensics: a degrade loses capture rows for the window ONLY — the
+    /// 11-field decision seam, the order_audit path, and the push
+    /// transports are unaffected. Cold path only; log-sink-only delivery
+    /// (no CloudWatch filter, no Telegram — the noise-lock posture; see
+    /// the runbook's delivery-boundary paragraph). Severity::High,
+    /// auto-triage-safe (the degrade already happened; DEDUP-idempotent
+    /// re-appends and the next event self-heal — the operator inspects).
+    OrderEvt01PersistFailed,
 
     // -----------------------------------------------------------------------
     // 🔷 DHAN exit-order execution layer (Cluster B, 2026-07-14).
@@ -1412,6 +1431,7 @@ impl ErrorCode {
             Self::RestCandleFold01Degraded => "FOLD-01",
             // RAM residency stores (operator 2026-07-16, PR-2)
             Self::RamStore01Degraded => "RAMSTORE-01",
+            Self::OrderEvt01PersistFailed => "ORDER-EVT-01",
             Self::ExitOrder01ExecutionDegraded => "EXIT-ORDER-01",
             Self::ExitVerify01Degraded => "EXIT-VERIFY-01",
             // Groww Portfolio area contract stubs (§39.3, 2026-07-14)
@@ -1635,6 +1655,7 @@ impl ErrorCode {
             // a halt (cold path; QuestDB stays the durable truth and the
             // next boot re-fills). LOG-SINK-ONLY.
             Self::RamStore01Degraded => Severity::High,
+            Self::OrderEvt01PersistFailed => Severity::High,
             // EXIT-ORDER-01 / EXIT-VERIFY-01 (Cluster B, 2026-07-14) — the
             // exit-order layer degraded / the MPP verify ladder exhausted
             // without a clean fill. High: operator eyes on every occurrence
@@ -1997,6 +2018,9 @@ impl ErrorCode {
             }
             // RAM residency stores (operator 2026-07-16, PR-2)
             Self::RamStore01Degraded => ".claude/rules/project/ram-store-error-codes.md",
+            Self::OrderEvt01PersistFailed => {
+                ".claude/rules/project/order-update-events-error-codes.md"
+            }
             // 🔷 DHAN exit-order execution layer (Cluster B, 2026-07-14)
             Self::ExitOrder01ExecutionDegraded | Self::ExitVerify01Degraded => {
                 ".claude/rules/project/dhan-exit-order-lockout-2026-07-14.md"
@@ -2308,6 +2332,7 @@ impl ErrorCode {
             Self::RestCandleFold01Degraded,
             // RAM residency stores (operator 2026-07-16, PR-2)
             Self::RamStore01Degraded,
+            Self::OrderEvt01PersistFailed,
             // 🔷 DHAN exit-order execution layer (Cluster B, 2026-07-14)
             Self::ExitOrder01ExecutionDegraded,
             Self::ExitVerify01Degraded,
@@ -2743,7 +2768,11 @@ mod tests {
         // variant sweep): -1 WS-REINJECT-01 (WsReinject01Aborted RETIRED —
         // its only emitter, the orphaned wal_reinject.rs module, had zero
         // production callers; deleted with its dead paging filter) => 164.
-        assert_eq!(ErrorCode::all().len(), 164);
+        // 2026-07-18 (full-fidelity order/position push-event capture):
+        // +1 ORDER-EVT-01 (OrderEvt01PersistFailed — order_update_events /
+        // position_update_events forensic-writer degrade; log-sink-only,
+        // High, auto-triage-safe) => 165.
+        assert_eq!(ErrorCode::all().len(), 165);
     }
 
     #[test]
@@ -3198,6 +3227,8 @@ mod tests {
                 || s.starts_with("DATA-")
                 // Cluster F (2026-07-14): order-readiness gate
                 || s.starts_with("ORDER-READY-")
+                // Full-fidelity order/position push-event capture (2026-07-18).
+                || s.starts_with("ORDER-EVT-")
                 // Wave 1 (PR #393): hot-path / phase2 / prev-close / movers prefixes
                 || s.starts_with("HOT-PATH-")
                 || s.starts_with("PHASE2-")

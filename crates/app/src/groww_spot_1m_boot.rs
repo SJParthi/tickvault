@@ -4304,8 +4304,27 @@ mod tests {
     // 63.3% floor — REAL tests over the runner arms; the floor is never
     // touched) --------------------------------------------------------------
 
-    /// Deterministic params: TODAY is stamped an NSE holiday, so
-    /// `is_trading_day_today()` is `false` regardless of the real weekday;
+    /// Weekend-proof synthetic-holiday date: today when Mon-Fri, else the
+    /// following Monday. `TradingCalendar::from_config` REJECTS
+    /// weekend-dated NSE holidays ("falls on a weekend"), so a fixture
+    /// stamping raw wall-clock today panicked every Sat/Sun CI run.
+    /// `is_trading_day_today()` stays `false` either way: on a weekday
+    /// today IS the holiday; on a weekend today is a weekend.
+    /// Deterministic (pure function of the IST wall-clock date).
+    fn next_weekday_ist() -> NaiveDate {
+        let mut d = today_ist();
+        while matches!(
+            chrono::Datelike::weekday(&d),
+            chrono::Weekday::Sat | chrono::Weekday::Sun
+        ) {
+            d = d.succ_opt().expect("valid date");
+        }
+        d
+    }
+
+    /// Deterministic params: the NEXT WEEKDAY is stamped an NSE holiday
+    /// (today on Mon-Fri, Monday on a weekend), so `is_trading_day_today()`
+    /// is `false` regardless of the real weekday;
     /// QuestDB points at reserved port 1 (fast refused connections — the
     /// ensure-DDL degrade arms run for real, nothing live is touched).
     fn test_params() -> GrowwSpot1mTaskParams {
@@ -4319,7 +4338,7 @@ mod tests {
             timezone: "Asia/Kolkata".to_string(),
             max_orders_per_second: 10,
             nse_holidays: vec![NseHolidayEntry {
-                date: today_ist().format("%Y-%m-%d").to_string(),
+                date: next_weekday_ist().format("%Y-%m-%d").to_string(),
                 name: "coverage-test holiday".to_string(),
             }],
             muhurat_trading_dates: vec![],

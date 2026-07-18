@@ -45,6 +45,11 @@ pub mod brutex_crossverify_boot;
 // `.claude/rules/project/cadence-error-codes.md`.
 pub mod cadence_boot;
 pub(crate) mod cadence_escalation;
+// Boot-time candle-table DDL + retired-object sweep (Track A, 2026-07-18):
+// re-homes the pre-#1522 drop-legacy → ensure-candles → named-views chain
+// behind a bounded quiet probe; awaited from `build_shared_infra` BEFORE
+// the seal-writer spawn (the fresh-volume no-DEDUP fix).
+pub mod candle_ddl_boot;
 /// Real Dhan cadence executor — limiter-free, gate-pacing honored (the runner
 /// pre-acquires gates; this executor issues ONE bounded request per call).
 pub mod dhan_cadence_executor;
@@ -236,6 +241,12 @@ pub mod order_observability;
 /// profile, spawned ONLY from `dhan_rest_stack` Phase 5b (2026-07-17
 /// correction — Phase 5a is the RETIRED order-update WS spawn slot).
 pub mod order_runtime;
+/// Full-fidelity order/position PUSH-event capture consumer
+/// (ORDER-EVT-01, 2026-07-18 — `order_update_events` /
+/// `position_update_events`): config-gated (`[order_update_events]`)
+/// supervised drain of the two capture channels into the storage writers.
+/// ADDITIVE forensic lane beside the lossy `order_audit` lane.
+pub mod order_update_events_boot;
 pub mod subsystem_memory;
 pub mod trading_pipeline;
 // Dead live-WS sweep stage 1 (2026-07-17, operator directive via

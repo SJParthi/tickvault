@@ -1650,6 +1650,24 @@ async fn main() -> Result<()> {
         order_runtime_mark_forwarder.clone(),
     );
 
+    // Full-fidelity order/position PUSH-event capture (ORDER-EVT-01,
+    // 2026-07-18 — `.claude/rules/project/order-update-events-error-codes.md`):
+    // config-gated (`[order_update_events]`) supervised consumer draining
+    // the two capture channels into the NEW order_update_events /
+    // position_update_events tables. ADDITIVE forensic lane — the lossy
+    // 11-field order_audit lane and the hint lane are untouched. The Dhan
+    // sender rides into DhanRestStackParams below; the pair feeds
+    // GrowwPushCapture under the groww_orders feature.
+    let (order_update_events_tx, position_update_events_tx) =
+        tickvault_app::order_update_events_boot::spawn_order_update_events_capture(
+            &config.order_update_events,
+            &config.questdb,
+        );
+    #[cfg(not(feature = "groww_orders"))]
+    // The position producer is groww_orders-only — without the feature the
+    // sender drops here (the consumer handles the closed side gracefully).
+    let _ = position_update_events_tx;
+
     // Groww order/position PUSH channel — Stage D (operator-authorized
     // paper-mode receive-only build, 2026-07-17): the supervised
     // NATS-over-WS push runner fanning full-fidelity order events into the
@@ -1660,7 +1678,25 @@ async fn main() -> Result<()> {
     #[cfg(feature = "groww_orders")]
     {
         if config.groww_orders.order_push_enabled {
-            tickvault_app::groww_order_observability::spawn_groww_order_push(&config.questdb);
+            // The ADDITIVE capture lane rides only when [order_update_events]
+            // is enabled; disabled ⇒ the push runner runs capture-free.
+            let capture = match (
+                order_update_events_tx.clone(),
+                position_update_events_tx.clone(),
+            ) {
+                (Some(orders), Some(positions)) => {
+                    tickvault_trading::oms::groww::push::order_events::GrowwPushCapture::new(
+                        orders, positions,
+                    )
+                }
+                _ => {
+                    tickvault_trading::oms::groww::push::order_events::GrowwPushCapture::disabled()
+                }
+            };
+            tickvault_app::groww_order_observability::spawn_groww_order_push(
+                &config.questdb,
+                capture,
+            );
         } else {
             info!(
                 "groww order push disabled (config) — receive-only order/position channel not spawned"
@@ -1897,6 +1933,10 @@ async fn main() -> Result<()> {
             // with the lane).
             mark_rx_slot: std::sync::Arc::clone(&order_runtime_mark_rx_slot),
             marks_wanted: std::sync::Arc::clone(&order_runtime_marks_wanted),
+            // ORDER-EVT-01 (2026-07-18): the full-fidelity capture sender the
+            // Phase 5a paper consumer publishes each Dhan order push into.
+            // None = the [order_update_events] capture lane is disabled.
+            order_update_events_tx: order_update_events_tx.clone(),
             // PR-C2: the stack owns the /health token-block writer.
             health: health_status.clone(),
         },
@@ -2399,6 +2439,16 @@ async fn build_shared_infra(
             );
         }
     }
+
+    // --- Candle DDL + retired-object sweep (Track A, 2026-07-18) ---
+    // AWAITED INLINE, BEFORE the seal-writer spawn: the 21 `candles_<tf>`
+    // tables must be ensured WITH `DEDUP ENABLE UPSERT KEYS` before the
+    // REST-era bar-fold's first seal can reach ILP, or a fresh QuestDB
+    // volume auto-creates them WITHOUT DEDUP (silent duplicate-row window
+    // — the bug the PR-C2/#1581 lane deletions left behind). Bounded by
+    // the module's 60s quiet-probe; a down QuestDB skips the DDL loudly.
+    // Ordering pinned by crates/app/tests/ensure_ddl_boot_wiring_guard.rs.
+    tickvault_app::candle_ddl_boot::run_candle_ddl_at_boot(&config.questdb).await;
 
     // --- Seal-writer (installs the process-wide global_seal_sender) ---
     spawn_seal_writer_loop(&config.questdb);

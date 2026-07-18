@@ -715,6 +715,19 @@ pub const fn position_exchange_name(v: i32) -> Option<&'static str> {
     })
 }
 
+/// `EquityAsset` (POSITION file — `SymbolInfo.underlyingAssetType`) name for
+/// a raw value. Vocabulary verbatim from the wheel descriptor
+/// (`docs/groww-ref/18-order-position-proto.md`):
+/// `EQUITY_ASSET_STOCKS = 0, EQUITY_ASSET_INDICES = 1`.
+#[must_use]
+pub const fn underlying_asset_name(v: i32) -> Option<&'static str> {
+    Some(match v {
+        0 => "EQUITY_ASSET_STOCKS",
+        1 => "EQUITY_ASSET_INDICES",
+        _ => return None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1109,6 +1122,14 @@ mod tests {
         assert_eq!(position_exchange_name(6), Some("US"));
         assert_eq!(position_exchange_name(7), None);
         assert_eq!(position_exchange_name(-1), None);
+    }
+
+    #[test]
+    fn test_underlying_asset_name_known_and_negative_unknown() {
+        assert_eq!(underlying_asset_name(0), Some("EQUITY_ASSET_STOCKS"));
+        assert_eq!(underlying_asset_name(1), Some("EQUITY_ASSET_INDICES"));
+        assert_eq!(underlying_asset_name(2), None);
+        assert_eq!(underlying_asset_name(-1), None);
     }
 
     #[test]
