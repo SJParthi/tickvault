@@ -36,10 +36,14 @@ pub enum PositionHandleOutcome {
 /// Never panics, never persists directly, never propagates an error — a
 /// decode failure is coded + counted and the caller continues with the next
 /// frame; the capture publish is `try_send` best-effort (never blocking).
+///
+/// `ts_ist_nanos` is a LAZY receipt-stamp closure invoked ONLY when the
+/// capture channel is live — a disabled capture pays zero record-build cost
+/// and zero `SystemTime` reads per frame (review round 1 HIGH).
 pub fn handle_position_payload(
     payload: &[u8],
     capture: &GrowwPushCapture,
-    ts_ist_nanos: i64,
+    ts_ist_nanos: impl FnOnce() -> i64,
 ) -> PositionHandleOutcome {
     match decode_position_detail(payload) {
         Ok(detail) => {
@@ -61,7 +65,12 @@ pub fn handle_position_payload(
                 symbol_isin,
                 "groww push: position update received (decode+count; full-fidelity capture via order_update_events consumer)"
             );
-            capture.publish_position(build_groww_position_event_record(&detail, ts_ist_nanos));
+            // Record CONSTRUCTION (and the receipt-stamp read) is gated on a
+            // live capture channel — disabled capture = zero build cost.
+            if capture.positions_enabled() {
+                capture
+                    .publish_position(build_groww_position_event_record(&detail, ts_ist_nanos()));
+            }
             PositionHandleOutcome::Counted
         }
         Err(e) => {
@@ -97,7 +106,7 @@ mod tests {
     #[test]
     fn test_handle_position_payload_counts_a_valid_frame() {
         assert_eq!(
-            handle_position_payload(&valid_position_bytes(), &GrowwPushCapture::disabled(), 1),
+            handle_position_payload(&valid_position_bytes(), &GrowwPushCapture::disabled(), || 1),
             PositionHandleOutcome::Counted
         );
     }
@@ -108,7 +117,7 @@ mod tests {
         let (pos_tx, mut pos_rx) = tokio::sync::mpsc::channel(4);
         let capture = GrowwPushCapture::new(order_tx, pos_tx);
         assert_eq!(
-            handle_position_payload(&valid_position_bytes(), &capture, 77),
+            handle_position_payload(&valid_position_bytes(), &capture, || 77),
             PositionHandleOutcome::Counted
         );
         let rec = pos_rx.recv().await.unwrap_or_else(|| {
@@ -122,7 +131,7 @@ mod tests {
     fn empty_payload_decodes_to_default_and_counts() {
         // proto3: an empty body is a valid all-default message.
         assert_eq!(
-            handle_position_payload(&[], &GrowwPushCapture::disabled(), 1),
+            handle_position_payload(&[], &GrowwPushCapture::disabled(), || 1),
             PositionHandleOutcome::Counted
         );
     }
@@ -132,7 +141,7 @@ mod tests {
         // Length-delimited field claiming 100 bytes with only 1 present.
         let bytes = [0x0A, 0x64, 0x00];
         assert_eq!(
-            handle_position_payload(&bytes, &GrowwPushCapture::disabled(), 1),
+            handle_position_payload(&bytes, &GrowwPushCapture::disabled(), || 1),
             PositionHandleOutcome::DecodeFailed
         );
     }
@@ -142,7 +151,7 @@ mod tests {
         // field 1, wire type 7 (unknown).
         let bytes = [0x0F, 0x01];
         assert_eq!(
-            handle_position_payload(&bytes, &GrowwPushCapture::disabled(), 1),
+            handle_position_payload(&bytes, &GrowwPushCapture::disabled(), || 1),
             PositionHandleOutcome::DecodeFailed
         );
     }

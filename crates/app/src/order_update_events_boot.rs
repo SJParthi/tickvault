@@ -25,6 +25,8 @@
 //! - **Cold path.** A handful of events per session; no tick-path
 //!   involvement anywhere.
 
+use std::collections::HashMap;
+use std::path::Path;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -33,7 +35,12 @@ use tickvault_common::broker_order_events::{
     ORDER_UPDATE_EVENTS_CHANNEL_CAPACITY, OrderUpdateEventRecord, PositionUpdateEventRecord,
 };
 use tickvault_common::config::{OrderUpdateEventsConfig, QuestDbConfig};
+use tickvault_common::constants::{GROWW_DATA_DIR, IST_UTC_OFFSET_SECONDS_I64};
 use tickvault_common::error_code::ErrorCode;
+use tickvault_common::feed::Feed;
+use tickvault_core::feed::groww::watch_reader::{
+    WatchFileDoc, WatchFileEntry, WatchFileKind, parse_watch_file,
+};
 use tickvault_storage::order_update_events_persistence::{
     OrderUpdateEventsWriter, ensure_order_update_events_table,
 };
@@ -41,10 +48,27 @@ use tickvault_storage::position_update_events_persistence::{
     PositionUpdateEventsWriter, ensure_position_update_events_table,
 };
 use tokio::sync::mpsc;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 /// Supervisor respawn backoff (the house 5s).
 const CONSUMER_RESPAWN_BACKOFF_SECS: u64 = 5;
+
+/// The record builders' honest "unresolvable" security-id sentinel
+/// (`broker_order_events.rs`: "`-1` ONLY when unresolvable").
+const UNRESOLVED_SECURITY_ID: i64 = -1;
+
+/// Bounded + sanitized broker identity for LOG interpolation (the
+/// `order_runtime.rs::log_safe_id` house pattern) — strips control/BiDi
+/// chars and caps the length so a crafted multi-KB vendor `order_id` /
+/// `symbol_isin` cannot amplify `errors.log` (review round 1 SECURITY
+/// MEDIUM-2; cold error-path alloc is fine). The PERSISTED values are
+/// separately ILP-sanitized + bounded by the storage writers.
+fn log_safe_id(raw: &str) -> String {
+    tickvault_common::sanitize::sanitize_audit_string(raw)
+        .chars()
+        .take(64)
+        .collect()
+}
 
 /// Shared receiver slot the RAII guard re-parks into (the
 /// `rest_candle_fold` HIGH-2 pattern: without the re-park, a respawned
@@ -103,6 +127,214 @@ fn blocking_flush<T>(flush: impl FnOnce() -> T) -> T {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Best-effort Groww security-id resolution (review round 1 Fix 5 — hostile #1)
+// ---------------------------------------------------------------------------
+
+/// Per-day Groww security-id lookup built from the day's watch file — the
+/// SAME id space the Groww lane persists everywhere else (stocks: the
+/// numeric `exchange_token`; indices: `stable_index_security_id` — both
+/// already RESOLVED by the watch BUILDER (`instruments.rs`); this consumer
+/// only indexes the builder's output, it never re-derives an id).
+struct GrowwSecurityIdIndex {
+    /// Uppercased ISIN → `(security_id, exchange_segment slug)`.
+    by_isin: HashMap<String, (i64, String)>,
+    /// Uppercased display/contract symbol (`symbol_name` / `index_name`) →
+    /// `(security_id, exchange_segment slug)`.
+    by_symbol: HashMap<String, (i64, String)>,
+}
+
+/// House segment slug for a watch entry (the I-P1-11 shared-table
+/// vocabulary: `IDX_I` / `NSE_EQ` / `BSE_EQ` / `NSE_FNO` / `BSE_FNO`);
+/// an unrecognized combo falls back raw-preserving (`<EXCH>_<SEG>`),
+/// never a guess.
+fn groww_watch_segment_slug(entry: &WatchFileEntry) -> String {
+    if entry.kind == WatchFileKind::IndexValue {
+        return "IDX_I".to_owned();
+    }
+    match (entry.exchange.as_str(), entry.segment.as_str()) {
+        ("NSE", "CASH") => "NSE_EQ".to_owned(),
+        ("BSE", "CASH") => "BSE_EQ".to_owned(),
+        ("NSE", "FNO") => "NSE_FNO".to_owned(),
+        ("BSE", "FNO") => "BSE_FNO".to_owned(),
+        (exchange, segment) => format!("{exchange}_{segment}"),
+    }
+}
+
+/// Build the per-day lookup from a parsed watch file. Pure; first entry
+/// wins on a duplicate key (the watch builder already dedups identities —
+/// a duplicate here would be vendor-master corruption, kept deterministic).
+fn build_groww_security_id_index(doc: &WatchFileDoc) -> GrowwSecurityIdIndex {
+    let mut by_isin: HashMap<String, (i64, String)> = HashMap::new();
+    let mut by_symbol: HashMap<String, (i64, String)> = HashMap::new();
+    for entry in &doc.entries {
+        let slug = groww_watch_segment_slug(entry);
+        if let Some(isin) = entry.isin.as_deref() {
+            let key = isin.trim().to_ascii_uppercase();
+            if !key.is_empty() {
+                by_isin
+                    .entry(key)
+                    .or_insert_with(|| (entry.security_id, slug.clone()));
+            }
+        }
+        for symbol in [entry.symbol_name.as_deref(), entry.index_name.as_deref()]
+            .into_iter()
+            .flatten()
+        {
+            let key = symbol.trim().to_ascii_uppercase();
+            if !key.is_empty() {
+                by_symbol
+                    .entry(key)
+                    .or_insert_with(|| (entry.security_id, slug.clone()));
+            }
+        }
+    }
+    GrowwSecurityIdIndex { by_isin, by_symbol }
+}
+
+impl GrowwSecurityIdIndex {
+    /// Resolve the FIRST candidate that hits — each candidate is tried
+    /// against the ISIN map (exact identity) then the symbol map
+    /// (display/contract fallback). Pure; `None` = honest unresolved
+    /// (the record's `-1` stands, never fabricated).
+    fn resolve(&self, candidates: &[&str]) -> Option<(i64, String)> {
+        for candidate in candidates {
+            let key = candidate.trim().to_ascii_uppercase();
+            if key.is_empty() {
+                continue;
+            }
+            if let Some((id, slug)) = self.by_isin.get(&key).or_else(|| self.by_symbol.get(&key)) {
+                return Some((*id, slug.clone()));
+            }
+        }
+        None
+    }
+}
+
+/// Today's IST date (`YYYY-MM-DD`) — the watch-file naming key.
+fn today_ist_date_string() -> String {
+    (chrono::Utc::now() + chrono::TimeDelta::seconds(IST_UTC_OFFSET_SECONDS_I64))
+        .date_naive()
+        .format("%Y-%m-%d")
+        .to_string()
+}
+
+/// Read + parse + index today's watch file. Thin fs shim over the pure
+/// reader (`parse_watch_file`) + pure index build.
+// TEST-EXEMPT: thin fs-read shim — parse/index/resolve are pure and unit-tested below.
+fn load_groww_watch_index(date: &str) -> Result<GrowwSecurityIdIndex, String> {
+    let path = crate::groww_watch_paths::watch_file_path_for(Path::new(GROWW_DATA_DIR), date);
+    let json =
+        std::fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    let doc = parse_watch_file(&json).map_err(|e| e.to_string())?;
+    Ok(build_groww_security_id_index(&doc))
+}
+
+/// LAZY per-IST-day watch-index cache. Best-effort by contract: the daily
+/// watch build lands asynchronously AFTER boot (the `[groww_universe]`
+/// rider), so the load is attempted on the FIRST Groww record that needs
+/// resolution — not at spawn, where a miss would be a guaranteed boot-race
+/// false warn. An absent/unparseable file logs ONE coalesced `warn!` per
+/// IST day and leaves records at the honest `-1` (re-attempted per
+/// unresolved record — bounded by the handful of push events per session,
+/// cold path).
+struct GrowwIdResolver {
+    date: String,
+    index: Option<GrowwSecurityIdIndex>,
+    warned: bool,
+}
+
+impl GrowwIdResolver {
+    fn new() -> Self {
+        Self {
+            date: String::new(),
+            index: None,
+            warned: false,
+        }
+    }
+
+    /// The index for today's watch file, loading it on first need (and
+    /// re-loading after an IST day roll). `None` = file absent/unusable —
+    /// warned once per day, records stay `-1`.
+    fn index_for_today(&mut self) -> Option<&GrowwSecurityIdIndex> {
+        let today = today_ist_date_string();
+        if today != self.date {
+            self.date = today;
+            self.index = None;
+            self.warned = false;
+        }
+        if self.index.is_none() {
+            match load_groww_watch_index(&self.date) {
+                Ok(index) => {
+                    info!(
+                        date = %self.date,
+                        isin_keys = index.by_isin.len(),
+                        symbol_keys = index.by_symbol.len(),
+                        "order_update_events: Groww watch-file id index loaded \
+                         (best-effort security_id resolution active)"
+                    );
+                    self.index = Some(index);
+                }
+                Err(reason) => {
+                    if !self.warned {
+                        self.warned = true;
+                        warn!(
+                            date = %self.date,
+                            reason = %reason,
+                            "order_update_events: Groww watch file unavailable — \
+                             push-event security_id stays the honest -1 for the day \
+                             (best-effort resolution; coalesced once per day)"
+                        );
+                    }
+                }
+            }
+        }
+        self.index.as_ref()
+    }
+}
+
+/// Best-effort enrich a Groww ORDER record whose builder left the honest
+/// `-1`: candidates in identity order — `contract_id` (ISIN for equity /
+/// contract symbol for F&O) then `symbol`. On a hit BOTH `security_id`
+/// and `exchange_segment` are set from the watch entry (the same-id-space
+/// contract); a miss leaves the record untouched.
+fn resolve_groww_order_identity(
+    record: &mut OrderUpdateEventRecord,
+    resolver: &mut GrowwIdResolver,
+) {
+    if record.feed != Feed::Groww || record.security_id != UNRESOLVED_SECURITY_ID {
+        return;
+    }
+    let Some(index) = resolver.index_for_today() else {
+        return;
+    };
+    if let Some((id, slug)) = index.resolve(&[&record.contract_id, &record.symbol]) {
+        record.security_id = id;
+        record.exchange_segment = slug;
+    }
+}
+
+/// Best-effort enrich a Groww POSITION record (same contract as the order
+/// leg): candidates — `symbol_isin` (the wire identity), `contract_id`,
+/// then `symbol`.
+fn resolve_groww_position_identity(
+    record: &mut PositionUpdateEventRecord,
+    resolver: &mut GrowwIdResolver,
+) {
+    if record.feed != Feed::Groww || record.security_id != UNRESOLVED_SECURITY_ID {
+        return;
+    }
+    let Some(index) = resolver.index_for_today() else {
+        return;
+    };
+    if let Some((id, slug)) =
+        index.resolve(&[&record.symbol_isin, &record.contract_id, &record.symbol])
+    {
+        record.security_id = id;
+        record.exchange_segment = slug;
+    }
+}
+
 /// Append + flush one ORDER capture record (cold path, per-record flush —
 /// a handful of events per session). Failures are coded + counted; a
 /// failed flush DISCARDS the pending buffer (poisoned-buffer defense —
@@ -115,7 +347,7 @@ fn persist_order_record(writer: &mut OrderUpdateEventsWriter, record: &OrderUpda
             stage = "append",
             channel = "order",
             feed = record.feed.as_str(),
-            order_id = %record.order_id,
+            order_id = %log_safe_id(&record.order_id),
             ?err,
             "order_update_events: ILP append failed — capture row lost for this event \
              (forensic lane only; the order_audit lane and order paths are unaffected)"
@@ -130,7 +362,7 @@ fn persist_order_record(writer: &mut OrderUpdateEventsWriter, record: &OrderUpda
             stage = "flush",
             channel = "order",
             feed = record.feed.as_str(),
-            order_id = %record.order_id,
+            order_id = %log_safe_id(&record.order_id),
             discarded,
             ?err,
             "order_update_events: ILP flush refused — pending capture rows discarded \
@@ -152,7 +384,7 @@ fn persist_position_record(
             stage = "append",
             channel = "position",
             feed = record.feed.as_str(),
-            symbol_isin = %record.symbol_isin,
+            symbol_isin = %log_safe_id(&record.symbol_isin),
             ?err,
             "position_update_events: ILP append failed — capture row lost for this event \
              (forensic lane only; no order path is affected)"
@@ -167,7 +399,7 @@ fn persist_position_record(
             stage = "flush",
             channel = "position",
             feed = record.feed.as_str(),
-            symbol_isin = %record.symbol_isin,
+            symbol_isin = %log_safe_id(&record.symbol_isin),
             discarded,
             ?err,
             "position_update_events: ILP flush refused — pending capture rows discarded \
@@ -207,6 +439,7 @@ async fn run_order_update_events_consumer(
     let mut position_writer = PositionUpdateEventsWriter::new(&questdb);
     let mut order_open = order_guard.is_some();
     let mut position_open = position_guard.is_some();
+    let mut groww_resolver = GrowwIdResolver::new();
 
     loop {
         tokio::select! {
@@ -217,7 +450,10 @@ async fn run_order_update_events_consumer(
                 }
             }, if order_open => {
                 match record {
-                    Some(r) => persist_order_record(&mut order_writer, &r),
+                    Some(mut r) => {
+                        resolve_groww_order_identity(&mut r, &mut groww_resolver);
+                        persist_order_record(&mut order_writer, &r);
+                    }
                     None => order_open = false,
                 }
             }
@@ -228,7 +464,10 @@ async fn run_order_update_events_consumer(
                 }
             }, if position_open => {
                 match record {
-                    Some(r) => persist_position_record(&mut position_writer, &r),
+                    Some(mut r) => {
+                        resolve_groww_position_identity(&mut r, &mut groww_resolver);
+                        persist_position_record(&mut position_writer, &r);
+                    }
                     None => position_open = false,
                 }
             }
@@ -405,6 +644,143 @@ mod tests {
             .await
             .expect("consumer must exit once both channels close")
             .expect("consumer task must not panic");
+    }
+
+    fn watch_doc() -> WatchFileDoc {
+        WatchFileDoc {
+            trading_date_ist: "2026-07-18".to_owned(),
+            entries: vec![
+                WatchFileEntry {
+                    exchange: "NSE".to_owned(),
+                    segment: "CASH".to_owned(),
+                    exchange_token: "2885".to_owned(),
+                    kind: WatchFileKind::Ltp,
+                    security_id: 2885,
+                    index_name: None,
+                    symbol_name: Some("RELIANCE".to_owned()),
+                    isin: Some("INE002A01018".to_owned()),
+                },
+                WatchFileEntry {
+                    exchange: "NSE".to_owned(),
+                    segment: "CASH".to_owned(),
+                    exchange_token: "NIFTY".to_owned(),
+                    kind: WatchFileKind::IndexValue,
+                    security_id: 4_611_686_018_427_387_917,
+                    index_name: Some("NSE-NIFTY".to_owned()),
+                    symbol_name: Some("Nifty 50".to_owned()),
+                    isin: None,
+                },
+                WatchFileEntry {
+                    exchange: "BSE".to_owned(),
+                    segment: "FNO".to_owned(),
+                    exchange_token: "71001".to_owned(),
+                    kind: WatchFileKind::Ltp,
+                    security_id: 71001,
+                    index_name: None,
+                    symbol_name: Some("BSE-SENSEX-31Jul26-FUT".to_owned()),
+                    isin: None,
+                },
+            ],
+        }
+    }
+
+    /// Fix 5 pure core: ISIN candidates resolve to the stock's numeric
+    /// exchange-token id + the house `NSE_EQ` slug (case/whitespace
+    /// tolerant).
+    #[test]
+    fn test_groww_index_resolves_by_isin() {
+        let index = build_groww_security_id_index(&watch_doc());
+        assert_eq!(
+            index.resolve(&["ine002a01018"]),
+            Some((2885, "NSE_EQ".to_owned()))
+        );
+        assert_eq!(
+            index.resolve(&["  INE002A01018  "]),
+            Some((2885, "NSE_EQ".to_owned()))
+        );
+    }
+
+    /// Symbol fallback: display names (`symbol_name`), index names
+    /// (`index_name` → `IDX_I` + the stable index id), and FNO contract
+    /// symbols (`BSE_FNO`) all resolve; a miss is an honest `None` and
+    /// empty candidates are skipped.
+    #[test]
+    fn test_groww_index_resolves_by_symbol_and_misses_honestly() {
+        let index = build_groww_security_id_index(&watch_doc());
+        assert_eq!(
+            index.resolve(&["", "RELIANCE"]),
+            Some((2885, "NSE_EQ".to_owned())),
+            "empty candidates are skipped; symbol fallback hits"
+        );
+        assert_eq!(
+            index.resolve(&["NSE-NIFTY"]),
+            Some((4_611_686_018_427_387_917, "IDX_I".to_owned()))
+        );
+        assert_eq!(
+            index.resolve(&["bse-sensex-31jul26-fut"]),
+            Some((71001, "BSE_FNO".to_owned()))
+        );
+        assert_eq!(index.resolve(&["UNKNOWN-THING"]), None);
+        assert_eq!(index.resolve(&[]), None);
+    }
+
+    /// Fix 5 record enrichment: a Groww order record with the honest `-1`
+    /// gains BOTH `security_id` and `exchange_segment` on a hit; a Dhan
+    /// record and an already-resolved Groww record are never touched.
+    #[test]
+    fn test_resolve_groww_order_identity_mutates_only_unresolved_groww() {
+        let mut resolver = GrowwIdResolver {
+            date: today_ist_date_string(),
+            index: Some(build_groww_security_id_index(&watch_doc())),
+            warned: false,
+        };
+
+        // Groww + unresolved → enriched via contract_id (ISIN).
+        let mut groww = order_record();
+        groww.feed = Feed::Groww;
+        groww.security_id = UNRESOLVED_SECURITY_ID;
+        groww.contract_id = "INE002A01018".to_owned();
+        groww.exchange_segment = "CASH".to_owned();
+        resolve_groww_order_identity(&mut groww, &mut resolver);
+        assert_eq!(groww.security_id, 2885);
+        assert_eq!(groww.exchange_segment, "NSE_EQ");
+
+        // Dhan record: untouched even with a matching symbol.
+        let mut dhan = order_record();
+        dhan.security_id = UNRESOLVED_SECURITY_ID;
+        dhan.symbol = "RELIANCE".to_owned();
+        let before = dhan.exchange_segment.clone();
+        resolve_groww_order_identity(&mut dhan, &mut resolver);
+        assert_eq!(dhan.security_id, UNRESOLVED_SECURITY_ID);
+        assert_eq!(dhan.exchange_segment, before);
+
+        // Groww record already carrying a real id: untouched.
+        let mut resolved = order_record();
+        resolved.feed = Feed::Groww;
+        resolved.security_id = 42;
+        resolved.symbol = "RELIANCE".to_owned();
+        resolve_groww_order_identity(&mut resolved, &mut resolver);
+        assert_eq!(resolved.security_id, 42);
+    }
+
+    /// A miss (unknown identity) leaves the honest `-1` + the builder's
+    /// segment label untouched — never fabricated.
+    #[test]
+    fn test_resolve_groww_order_identity_miss_keeps_honest_minus_one() {
+        let mut resolver = GrowwIdResolver {
+            date: today_ist_date_string(),
+            index: Some(build_groww_security_id_index(&watch_doc())),
+            warned: false,
+        };
+        let mut groww = order_record();
+        groww.feed = Feed::Groww;
+        groww.security_id = UNRESOLVED_SECURITY_ID;
+        groww.contract_id = "INE_UNKNOWN".to_owned();
+        groww.symbol = "NOT-IN-WATCH".to_owned();
+        groww.exchange_segment = "FNO".to_owned();
+        resolve_groww_order_identity(&mut groww, &mut resolver);
+        assert_eq!(groww.security_id, UNRESOLVED_SECURITY_ID);
+        assert_eq!(groww.exchange_segment, "FNO");
     }
 
     /// `config/base.toml` OPTS IN to the capture lane (the serde default

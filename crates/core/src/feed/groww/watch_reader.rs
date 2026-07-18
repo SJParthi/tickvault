@@ -40,6 +40,15 @@ pub struct WatchFileEntry {
     /// resolution matches on. Missing field → `None`.
     #[serde(default)]
     pub symbol_name: Option<String>,
+    /// Writer-side cold-path provenance: the constituent ISIN this stock
+    /// resolved from (`None` for indices/derivatives — no ISIN). The writer
+    /// (`instruments.rs::WatchEntry`) has serialized it for stocks since
+    /// PR-A; read since 2026-07-18 so the ORDER-EVT-01 capture consumer can
+    /// best-effort resolve a push event's `security_id` by ISIN (review
+    /// round 1 Fix 5). Missing field → `None` (additive JSON — old files
+    /// parse unchanged).
+    #[serde(default)]
+    pub isin: Option<String>,
 }
 
 /// Mirror of the writer's `WatchKind` (`#[serde(rename_all = "snake_case")]`).
@@ -116,6 +125,7 @@ mod tests {
         // provenance keys still parse — the optional fields read None.
         assert_eq!(doc.entries[2].index_name, None);
         assert_eq!(doc.entries[2].symbol_name, None);
+        assert_eq!(doc.entries[0].isin, None);
 
         assert_eq!(doc.entries[0].security_id, 2885);
         assert_eq!(doc.entries[0].kind, WatchFileKind::Ltp);
@@ -175,6 +185,11 @@ mod tests {
         assert_eq!(doc.entries[0].symbol_name.as_deref(), Some("TEST"));
         assert_eq!(doc.entries[1].index_name.as_deref(), Some("BSE-SENSEX"));
         assert_eq!(doc.entries[1].symbol_name, None);
+        // 2026-07-18 (ORDER-EVT-01 Fix 5): the writer's stock ISIN now
+        // round-trips so the capture consumer can resolve security_id by
+        // ISIN; index entries without one read None.
+        assert_eq!(doc.entries[0].isin.as_deref(), Some("INE000A01001"));
+        assert_eq!(doc.entries[1].isin, None);
         assert_eq!(doc.entries.len(), 2);
         assert_eq!(doc.entries[0].exchange_token, "1234");
         assert_eq!(doc.entries[0].kind, WatchFileKind::Ltp);

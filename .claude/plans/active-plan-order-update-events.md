@@ -135,7 +135,10 @@ common, storage, trading, app.
   `.claude/rules/project/order-update-events-error-codes.md`) on every
   persist-leg failure with a `stage` field
   (`ensure_client_build`/`ensure_ddl`/`append`/`flush`/`sink_drop`).
-- Static-label counters: `tv_order_update_events_rows_total{feed,kind}`,
+- Static-label counters: `tv_order_update_events_rows_total{feed}` +
+  `tv_position_update_events_rows_total{feed}` (per-table row counters —
+  the `{feed,kind}` single-counter shape drafted here was superseded at
+  implementation; review round 1 Fix 8 truth-sync),
   `tv_order_update_events_persist_errors_total{stage}`,
   `tv_order_update_events_dropped_total{reason}`,
   `tv_order_update_events_rows_discarded_total`,

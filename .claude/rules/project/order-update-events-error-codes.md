@@ -116,6 +116,28 @@ arrive only when the gated producers run: Groww needs the non-default
 the `[dhan_order_push]` re-arm (base.toml `false`; the scope-lock §A.1
 spawn retirement stands — NO socket is spawned by this subsystem).
 
+**Redaction (2026-07-18, review round 1):** Dhan ClientId is deliberately
+NOT persisted (house redaction class; account-constant, zero forensic
+value — dated decision 2026-07-18). The builder omits it from
+`detail_raw` and the completeness test pins the ABSENCE.
+
+**Best-effort Groww security_id resolution (2026-07-18, review round 1
+Fix 5):** the app consumer LAZILY loads the day's Groww watch file
+(`data/groww/groww-watch-<date>.json` — the SAME builder product the
+Groww lane subscribes from; `parse_watch_file` reused, never a
+hand-rolled format) on the FIRST Groww record needing resolution, and
+enriches a `security_id = -1` record by ISIN/contract-id then
+display/contract symbol, using the SAME id space the Groww lane persists
+everywhere else (stocks: numeric `exchange_token`; indices:
+`stable_index_security_id` — the ids come from the watch BUILDER, never
+re-derived). On a hit `exchange_segment` is set to the house slug
+(`IDX_I`/`NSE_EQ`/`BSE_EQ`/`NSE_FNO`/`BSE_FNO`). Honest envelope: the
+watch file lands asynchronously after boot, an absent/unparseable file
+logs ONE coalesced `warn!` per IST day and rows keep the honest `-1`
+(re-resolved on later events once the file lands); an identity outside
+the day's watch set (a manually-traded contract) stays `-1` — never
+fabricated, never cross-feed-guessed.
+
 **Delivery boundary (honest — no false-OK):** ORDER-EVT-01 is
 **log-sink-only**: NO `error_code_alerts` map entry in
 `deploy/aws/terraform/error-code-alarms.tf` and NO mention in
@@ -142,8 +164,10 @@ mkt_type SYMBOL, series SYMBOL, good_till_days_date SYMBOL, ref_ltp
 DOUBLE, tick_size DOUBLE, multiplier INT, instrument SYMBOL,
 broker_create_time STRING, broker_update_time STRING, exchange_time
 STRING, exchange_ts_ms LONG, contract_id SYMBOL, gui_order_id SYMBOL,
-stage_trail STRING (sanitized ≤2000), detail_raw STRING (sanitized
-≤2000).
+stage_trail STRING (ILP-sanitized ≤1024), detail_raw STRING
+(ILP-sanitized ≤1024 = `MAX_AUDIT_STR_LEN`, the `sanitize_ilp_string`
+internal bound — the originally-declared 2000 was dead, review round 1
+LOW-1).
 `const DEDUP_KEY_ORDER_UPDATE_EVENTS = "ts, trading_date_ist, feed, order_id, event_seq"`.
 
 **`position_update_events`** (PARTITION BY DAY, same class): ts
@@ -155,7 +179,8 @@ underlying_id SYMBOL, nse_market_lot LONG, bse_market_lot LONG,
 underlying_asset_type SYMBOL, freeze_qty LONG, nse_credit_qty DOUBLE,
 nse_credit_price DOUBLE, nse_debit_qty DOUBLE, nse_debit_price DOUBLE,
 bse_credit_qty DOUBLE, bse_credit_price DOUBLE, bse_debit_qty DOUBLE,
-bse_debit_price DOUBLE, detail_raw STRING (sanitized ≤2000).
+bse_debit_price DOUBLE, detail_raw STRING (ILP-sanitized ≤1024 =
+`MAX_AUDIT_STR_LEN`).
 `const DEDUP_KEY_POSITION_UPDATE_EVENTS = "ts, trading_date_ist, feed, symbol_isin, event_seq"`.
 
 ## §3. Trigger / auto-load

@@ -29,7 +29,7 @@ use tracing::{error, warn};
 use tickvault_common::broker_order_events::PositionUpdateEventRecord;
 use tickvault_common::config::QuestDbConfig;
 use tickvault_common::error_code::ErrorCode;
-use tickvault_common::sanitize::sanitize_audit_string;
+use tickvault_common::sanitize::{MAX_AUDIT_STR_LEN, sanitize_ilp_string, sanitize_ilp_symbol};
 
 /// QuestDB table name — one row per received position push event.
 pub const POSITION_UPDATE_EVENTS_TABLE: &str = "position_update_events";
@@ -42,7 +42,12 @@ pub const DEDUP_KEY_POSITION_UPDATE_EVENTS: &str =
     "ts, trading_date_ist, feed, symbol_isin, event_seq";
 
 /// `detail_raw` column hard cap — the bounded full-fidelity remainder.
-pub const POSITION_UPDATE_EVENTS_DETAIL_MAX_CHARS: usize = 2000;
+///
+/// Equal to [`MAX_AUDIT_STR_LEN`] (1024) BY CONSTRUCTION: the ILP STRING
+/// sanitiser (`sanitize_ilp_string`) caps internally at that length, so a
+/// larger declared cap here would be dead (review round 1 LOW-1 — the
+/// originally-declared 2000 was unreachable). One honest bound, one source.
+pub const POSITION_UPDATE_EVENTS_DETAIL_MAX_CHARS: usize = MAX_AUDIT_STR_LEN;
 
 /// Sentinel for a SYMBOL value that is empty/not-applicable at row time
 /// (empty ILP tag values are invalid in classic line protocol; `symbol_isin`
@@ -315,16 +320,25 @@ impl PositionUpdateEventsWriter {
         };
         // Never write an empty ILP SYMBOL value — map to the "n/a" house
         // sentinel (checked AFTER sanitize, so a hostile all-control-char
-        // input cannot sneak an empty tag through either).
+        // input cannot sneak an empty tag through either). SYMBOL values go
+        // through the ILP TAG sanitiser (`sanitize_ilp_symbol` — strips the
+        // tag delimiters `,`/`=` + control chars, 256-byte cap); the SQL
+        // sanitiser (`sanitize_audit_string`) is the WRONG choke point for
+        // ILP (quote-doubling would corrupt stored text — review round 1
+        // SECURITY MEDIUM-1).
         let symbol_or_na = |value: &str| -> String {
-            let sanitized = sanitize_audit_string(value);
+            let sanitized = sanitize_ilp_symbol(value);
             if sanitized.is_empty() {
                 POSITION_UPDATE_EVENTS_SYMBOL_NA.to_string()
             } else {
-                sanitized
+                sanitized.into_owned()
             }
         };
-        let detail_raw: String = sanitize_audit_string(&r.detail_raw)
+        // STRING (field) value goes through the ILP STRING sanitiser —
+        // preserves `,`/`=`/`'`/`;`/`"` verbatim (questdb-rs escapes the
+        // genuinely ILP-special chars itself), strips control/BiDi, and
+        // caps internally at MAX_AUDIT_STR_LEN.
+        let detail_raw: String = sanitize_ilp_string(&r.detail_raw)
             .chars()
             .take(POSITION_UPDATE_EVENTS_DETAIL_MAX_CHARS)
             .collect();
@@ -619,8 +633,8 @@ mod tests {
         }
     }
 
-    /// `detail_raw` bounded ≤2000 — a hostile broker string can never bloat
-    /// a row.
+    /// `detail_raw` bounded ≤`MAX_AUDIT_STR_LEN` (1024) — a hostile broker
+    /// string can never bloat a row.
     #[test]
     fn test_append_position_update_event_detail_cap() {
         let mut w = PositionUpdateEventsWriter::for_test();
@@ -637,7 +651,7 @@ mod tests {
             .expect("detail_raw present");
         assert!(
             field.matches('d').count() <= POSITION_UPDATE_EVENTS_DETAIL_MAX_CHARS,
-            "detail_raw must be capped at 2000"
+            "detail_raw must be capped at MAX_AUDIT_STR_LEN"
         );
     }
 
