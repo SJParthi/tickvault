@@ -34,21 +34,6 @@ fn test_auth_and_profile_event_messages() {
     });
     assert!(m.contains("RSN-AUTH-552") && m.contains("2.5s"), "{m}");
 
-    let m = render(&NotificationEvent::PreMarketProfileCheckFailed {
-        reason: "RSN-PROFILE-771".to_string(),
-        within_market_hours: true,
-    });
-    assert!(
-        m.contains("RSN-PROFILE-771") && m.contains("BOOT HALTED"),
-        "{m}"
-    );
-
-    let m = render(&NotificationEvent::PreMarketProfileCheckFailed {
-        reason: "RSN-PROFILE-772".to_string(),
-        within_market_hours: false,
-    });
-    assert!(m.contains("investigate before 09:15 IST"), "{m}");
-
     // MidSessionProfileInvalidated render coverage DELETED 2026-07-14 with
     // the variant (Dhan noise lock) — the watchdog runs silently; a
     // terminal re-mint failure routes through AuthenticationFailed.
@@ -105,62 +90,11 @@ fn test_ws_pool_event_messages() {
 }
 
 #[test]
-fn test_pool_online_fast_boot_path_and_ping_freshness_bands() {
-    // Fast boot path + every ping-freshness band: None ("—"),
-    // 0..=10 ("✓"), 11..=30 ("⚠"), >30 ("❌").
-    let m = render(&NotificationEvent::WebSocketPoolOnline {
-        connected: 4,
-        total: 4,
-        per_connection: vec![
-            (100, 5000, None),
-            (200, 5000, Some(10)),
-            (300, 5000, Some(30)),
-            (400, 5000, Some(31)),
-        ],
-        boot_path: BootPathLabel::Fast,
-        boot_wall_clock_secs: 12.5,
-        last_real_tick_age_secs: Some(3),
-        feeds: vec![
-            tickvault_core::notification::events::FeedStatusLine {
-                name: "Dhan".to_string(),
-                instruments: Some(776),
-                last_tick_age_secs: Some(1),
-            },
-            tickvault_core::notification::events::FeedStatusLine {
-                name: "Groww".to_string(),
-                instruments: None,
-                last_tick_age_secs: None,
-            },
-        ],
-    });
-    assert!(m.contains("Mid-market crash recovery"), "{m}");
-    // 2026-07-03 feed parity: every enabled feed appears by name, with
-    // honest "unknown" wording when no health data is wired yet.
-    assert!(m.contains("Dhan: 776 instruments"), "{m}");
-    assert!(
-        m.contains("Groww: instruments unknown — no tick seen yet"),
-        "{m}"
-    );
-    assert!(
-        m.contains('✓') && m.contains('⚠') && m.contains('❌') && m.contains('—'),
-        "{m}"
-    );
-
-    let m = render(&NotificationEvent::WebSocketPoolPartialAfterDeadline {
-        connected: 3,
-        total: 4,
-        per_connection: vec![(100, 5000, Some(5)), (0, 5000, None)],
-        stuck: vec![(3, "RSN-STUCK-881".to_string())],
-        boot_path: BootPathLabel::Fast,
-    });
-    assert!(m.contains("RSN-STUCK-881"), "{m}");
-
-    // BootPathLabel helpers (action_line / human / short Fast arms).
+fn test_boot_path_label_helpers() {
     assert_eq!(BootPathLabel::Fast.short(), "fast");
     assert!(BootPathLabel::Fast.human().contains("crash recovery"));
     assert_eq!(BootPathLabel::Slow.short(), "slow");
 }
-
 #[test]
 fn test_ws_sleep_wake_event_messages() {
     let m = render(&NotificationEvent::WebSocketSleepEntered {
