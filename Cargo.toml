@@ -185,6 +185,13 @@ aws-sdk-s3 = { version = "=1.138.0", default-features = false, features = ["beha
 aws-sdk-ec2 = { version = "=1.238.0", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
 aws-sdk-cloudwatch = { version = "=1.119.0", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
 aws-sdk-costexplorer = { version = "=1.121.0", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
+# rust-only phase 2b-2 wave 2 (2026-07-18): hard-stop-guard needs
+# events:DisableRule. 1.110.0 is the eventbridge release whose aws-smithy-*
+# requirements (runtime ^1.12.0 / runtime-api ^1.13.0 / types ^1.6.1) match
+# the Cargo.lock smithy family EXACTLY — verified against the crates.io
+# sparse index 2026-07-18; same single-smithy-family rationale + `=` pin
+# deviation as the sibling aws-sdk pins above.
+aws-sdk-eventbridge = { version = "=1.110.0", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
 # Lambda runtime for the provided.al2023 bootstrap bins (tokio ^1.46 — the
 # workspace 1.52.3 pin satisfies it). cargo-lambda is a BUILD tool installed
 # in CI, never a dependency.

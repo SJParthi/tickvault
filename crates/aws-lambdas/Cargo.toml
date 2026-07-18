@@ -27,6 +27,7 @@ aws-sdk-ssm = { workspace = true }
 aws-sdk-ec2 = { workspace = true }
 aws-sdk-cloudwatch = { workspace = true }
 aws-sdk-costexplorer = { workspace = true }
+aws-sdk-eventbridge = { workspace = true }
 
 [[bin]]
 name = "start-watchdog"
@@ -47,3 +48,7 @@ path = "src/bin/boot_heartbeat_gate.rs"
 [[bin]]
 name = "market-hours-liveness-gate"
 path = "src/bin/market_hours_liveness_gate.rs"
+
+[[bin]]
+name = "hard-stop-guard"
+path = "src/bin/hard_stop_guard.rs"
