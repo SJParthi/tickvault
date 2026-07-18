@@ -299,7 +299,8 @@ constants `INDEX_CONSTITUENCY_BASE_URL` / `GROWW_INSTRUMENT_CSV_URL` /
 
 > "100% inside the tested envelope, with ratcheted regression coverage: Groww capture
 > keeps the full bounded zero-tick-loss chain (WAL-before-broadcast → ring → NDJSON spill
-> → DLQ, `TICK_BUFFER_CAPACITY` ratcheted); the Dhan REST stack keeps lock-before-mint +
+> → DLQ; ring constant retired 2026-07-18 with the dead tick chain — the live absorption
+> tier is the 200,000-seal ring, `SEAL_BUFFER_CAPACITY`/`seal_ring.rs`); the Dhan REST stack keeps lock-before-mint +
 > RESILIENCE-03 (`dual-instance-lock-2026-07-04.md` §3.5); the retirement is
 > config-reversible until Phase C deletes the code, and irreversible-without-a-fresh-quote
 > after. NOT claimed: (a) any Dhan live tick capture — by design, per Q1/Q2 there is NONE;

@@ -202,7 +202,7 @@
     crates/core/src/auth/secret_manager.rs
   - Tests: feed_scoreboard_boot unit tests, bench_budget guard,
     cargo test -p tickvault-core --features dhat --no-run
-- [ ] S3: MED-2 — delete the consumer-less TICK_BUFFER_CAPACITY orphan
+- [x] S3: MED-2 — delete the consumer-less TICK_BUFFER_CAPACITY orphan
   (constants.rs, minimal flagged edit) + zero_tick_loss_alert_guard.rs
   (its seal-ring rationale is factually false) +
   chaos_burst_indices_only.rs; re-point every honest-100% template line

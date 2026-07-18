@@ -55,8 +55,8 @@ But we CAN mechanically guarantee:
 | Alarm fires when DLQ catches ticks (`tv_dlq_ticks_total`) *(RETIRED 2026-07-18, stage-4 dead-producer sweep: the alarm + its metric's emit sites are deleted — the tick ring/spill/DLQ chain died with the stage-2 dead-WS sweep 2026-07-17; the seal-side pagers in seal-drop-alarm.tf remain the loss monitors.)* | same tf (`tv-${env}-dlq-ticks`) | same guard |
 | Every alarm metric is published by the CW agent (EMF filter) | `deploy/aws/terraform/user-data.sh.tftpl` | `cloudwatch_app_alarms_wiring.rs::test_every_alarm_metric_is_in_emf_filter_list` |
 | Every alarm metric has a real Rust emit-site (no dead alarms) | crates/ (`counter!`/`gauge!`) | `cloudwatch_app_alarms_wiring.rs::test_every_alarm_metric_has_a_rust_emit_site` |
-| `ticks_dropped_total` counter field still emitted from storage | `crates/storage/src/tick_persistence.rs` | `crates/storage/tests/zero_tick_loss_alert_guard.rs` |
-| `TICK_BUFFER_CAPACITY >= 100,000` (absorbs market bursts) | `crates/common/src/constants.rs` | `zero_tick_loss_alert_guard.rs` |
+| `ticks_dropped_total` counter emission *(RETIRED 2026-07-18, stage-4 sweep: `tick_persistence.rs` was deleted in the stage-2 dead-WS sweep — zero emit sites remain; `zero_tick_loss_alert_guard.rs` deleted with it)* | — | — |
+| `SEAL_BUFFER_CAPACITY = 200,000` (absorbs the IST-midnight seal burst) | `crates/trading/src/candles/seal_ring.rs` | `seal_ring.rs::test_seal_buffer_capacity_constant_is_locked_value` |
 | QuestDB outage drops zero ticks (disconnected writer) | `crates/storage/tests/chaos_questdb_full_session.rs` | `chaos_questdb_full_session_zero_tick_loss` (run 2026-06-02: 0 lost) |
 | Disk-full → DLQ NDJSON catches every tick | `crates/storage/tests/chaos_disk_full.rs` | `chaos_disk_full_triggers_dlq` (`#[ignore]` — run 2026-06-02: 0 lost) |
 | SIGKILL mid-batch → spill replay loses zero ticks | `crates/storage/tests/chaos_sigkill_replay.rs` | `chaos_sigkill_spill_replay_zero_loss` (`#[ignore]` — run 2026-06-02: 0 lost) |

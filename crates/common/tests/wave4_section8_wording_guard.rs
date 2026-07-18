@@ -20,10 +20,19 @@
 //! a 5M ring buffered ~130 hours for a feed that needs minutes.
 //! Wording in both rule files updated to "100,000-tick" in tandem.
 //!
+//! 2026-07-18 (stage-4 dead-producer sweep): the tick rescue ring +
+//! `TICK_BUFFER_CAPACITY` + `zero_tick_loss_alert_guard.rs` were DELETED
+//! (their sole consumer, `tick_persistence.rs`, died in the stage-2
+//! dead-WS sweep 2026-07-17). The honest-100% templates in both rule
+//! files now cite the LIVE absorption tier — the 200,000-seal ring
+//! (`SEAL_BUFFER_CAPACITY`, `crates/trading/src/candles/seal_ring.rs`,
+//! ratcheted by `test_seal_buffer_capacity_constant_is_locked_value`)
+//! — and this guard pins that wording in lockstep.
+//!
 //! After investigation:
-//! - `TICK_BUFFER_CAPACITY = 100_000` exists in
-//!   `crates/common/src/constants.rs` and is ratcheted by
-//!   `crates/storage/tests/zero_tick_loss_alert_guard.rs`.
+//! - `SEAL_BUFFER_CAPACITY = 200_000` exists in
+//!   `crates/trading/src/candles/seal_ring.rs` and is ratcheted there by
+//!   `test_seal_buffer_capacity_constant_is_locked_value`.
 //! - The 65h Fri 16:00 → Mon 09:00 IST weekend sleep/wake test
 //!   exists at `crates/core/tests/ws_sleep_resilience.rs:93,173`.
 //!   The literal "70h" wording was off by 5 hours; the real chaos
@@ -63,28 +72,44 @@ fn section8_does_not_claim_unproven_70h_chaos() {
 }
 
 #[test]
-fn section8_keeps_rescue_ring_claim_with_evidence_pointer() {
+fn section8_keeps_seal_ring_claim_with_evidence_pointer() {
     for (label, path) in [("preamble", PREAMBLE_PATH), ("matrix", MATRIX_PATH)] {
         let text = read(path);
-        // 2026-05-20: rescue ring rightsized 5M → 100K for the 4-SID
-        // indices-only universe. The claim must cite the constant +
-        // ratchet test so future readers can verify the proof.
+        // 2026-07-18 (stage-4 sweep): the honest-100% template cites the
+        // LIVE seal-ring envelope. The claim must cite the constant +
+        // its in-file ratchet test so future readers can verify the proof.
         assert!(
-            text.contains("100,000-tick ring buffer capacity"),
-            "{label} ({path}) must keep the proven 100,000-tick ring \
-             buffer capacity claim (rightsized 5M → 100K 2026-05-20 for \
-             the 4-SID indices-only universe per aws-budget.md)."
+            text.contains("200,000-seal ring buffer capacity"),
+            "{label} ({path}) must keep the proven 200,000-seal ring \
+             buffer capacity claim (the live absorption tier per the L-C1 \
+             design lock in seal_ring.rs)."
         );
         assert!(
-            text.contains("`TICK_BUFFER_CAPACITY`"),
-            "{label} ({path}) must cite the TICK_BUFFER_CAPACITY constant \
+            text.contains("`SEAL_BUFFER_CAPACITY`"),
+            "{label} ({path}) must cite the SEAL_BUFFER_CAPACITY constant \
              so reviewers can verify the proof."
         );
         assert!(
-            text.contains("zero_tick_loss_alert_guard.rs"),
-            "{label} ({path}) must cite the ratchet test that pins the \
-             100,000 value."
+            text.contains("seal_ring.rs"),
+            "{label} ({path}) must cite the seal_ring.rs ratchet that pins \
+             the 200,000 value."
         );
+        // The retired tick-ring wording must never regress back in — the
+        // constant + guard it cited were deleted 2026-07-18.
+        for banned in [
+            "TICK_BUFFER_CAPACITY",
+            "zero_tick_loss_alert_guard.rs",
+            "100,000-tick ring buffer",
+            "100K-tick rescue ring",
+        ] {
+            assert!(
+                !text.contains(banned),
+                "{label} ({path}) contains retired tick-ring phrase \
+                 {banned:?} — the tick rescue ring + its constant + guard \
+                 were deleted 2026-07-18 (stage-4 dead-producer sweep); \
+                 cite SEAL_BUFFER_CAPACITY / seal_ring.rs instead."
+            );
+        }
     }
 }
 

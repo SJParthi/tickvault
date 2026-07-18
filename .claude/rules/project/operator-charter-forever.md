@@ -140,7 +140,7 @@ When ANY PR body / commit message / Telegram message / docs writes "100% guarant
 
 > "100% inside the tested envelope, with ratcheted regression coverage:
 > ≤60s QuestDB outage absorbed by rescue→spill→DLQ;
-> ≤100,000-tick ring buffer capacity (constant `TICK_BUFFER_CAPACITY`, ratcheted by `zero_tick_loss_alert_guard.rs`);
+> ≤200,000-seal ring buffer capacity (constant `SEAL_BUFFER_CAPACITY`, ratcheted by `seal_ring.rs`) → NDJSON spill → DLQ;
 > bench-gated O(1) hot path;
 > composite-key uniqueness;
 > chaos-tested 65h Fri 16:00 IST → Mon 09:00 IST weekend sleep/wake.

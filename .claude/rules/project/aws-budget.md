@@ -436,7 +436,7 @@ This rule activates when editing files matching:
 - `deploy/aws/*`
 - `scripts/aws-*`
 - `crates/app/src/infra.rs`
-- `crates/common/src/constants.rs` (`TICK_BUFFER_CAPACITY`)
+- `crates/trading/src/candles/seal_ring.rs` (`SEAL_BUFFER_CAPACITY` — seal ring RAM budget)
 - `crates/trading/src/indicator/*` (RAM-first guard)
 - `crates/trading/src/strategy/*` (RAM-first guard)
-- Any file containing `t4g.medium`, `t4g`, `c7i`, `c8g`, `mem_limit`, `EBS`, `gp3`, `instance_type`, `aws_region`, `TICK_BUFFER_CAPACITY`
+- Any file containing `t4g.medium`, `t4g`, `c7i`, `c8g`, `mem_limit`, `EBS`, `gp3`, `instance_type`, `aws_region`, `SEAL_BUFFER_CAPACITY`

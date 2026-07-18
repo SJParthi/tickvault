@@ -458,8 +458,8 @@ When any PR / commit message / Telegram body invokes "100% guarantee" for the da
 > "100% inside the tested envelope, with ratcheted regression coverage:
 > infinite retry on instrument CSV fetch with escalating Telegram (Info→High→Critical at attempts 4/11/21);
 > app boot BLOCKS until fresh CSV in hand — never proceeds with stale, partial, or corrupt data;
-> ≤20-second tick burst absorbed via 100K-tick rescue ring (constant `TICK_BUFFER_CAPACITY`, ratcheted by `zero_tick_loss_alert_guard.rs`);
-> beyond 20s, NDJSON spill → DLQ catches every payload as recoverable text;
+> seal bursts absorbed via the 200,000-seal ring (constant `SEAL_BUFFER_CAPACITY`, ratcheted by `seal_ring.rs`) → NDJSON spill → DLQ catches every payload as recoverable text
+> (the tick rescue ring + its constant were retired 2026-07-18 with the dead tick chain — stage-4 sweep);
 > all 21 timeframes RAM-resident for today + yesterday across the current universe (~770 SIDs, Groww-only runtime; app cap ~1.5 GB per §7 Rule 2, ~0.9–1.7 GB budgeted headroom on the t4g.medium 4 GiB host — headroom Assumed until live-measured; wording updated 2026-07-15 per Quote 8, was "~3.2 GB working set, ~7.8 GB headroom on the r8g.large 16 GiB host");
 > `instrument_lifecycle` table is SEBI-compliant — NO DELETEs ever, only state transitions to `expired_*` SYMBOLs preserved in `(security_id, exchange_segment)` composite-key history per I-P1-11;
 > daily lifecycle reconciler captures every appearance, disappearance, rename, segment-move, split — logged to `instrument_lifecycle_audit` forensic chain with 5-year SEBI retention."
